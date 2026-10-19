@@ -79,9 +79,19 @@ that fits both handle types.
 ## `MnnvlMemory`
 
 ```python
-memory = MnnvlMemory(mapping, size)        # collective over the mapping's group
+MnnvlMemory.initialize()
+MnnvlMemory.set_comm_from_config(mapping, MnnvlConfig(comm_backend=backend))  # optional
+memory = MnnvlMemory(mapping, size)
 workspace = memory.as_torch_strided_tensor(torch.uint8)  # [group_size, size], row i = rank i
 ```
+
+The group comes from the `Mapping`, not from the constructor: the first
+allocation splits the communicator into the ranks with the same PP and CP rank,
+ordered by TP rank, i.e. the TP group, which contains the MoE EP group. The
+communicator is MPI unless `set_comm_from_config` supplies another
+`CommBackend`, and it is cached on the class, so every later allocation of the
+process uses the same group. `size` is the bytes per rank and must be equal on
+all ranks; the memory lives on the current CUDA device.
 
 `open_mnnvl_memory` checks that every rank asks for the same size, rounds it
 up to the granularity, reserves a new address range when the current one is
@@ -93,10 +103,21 @@ and `address_refcnt` counts the allocations of each reservation.
 ## `SymmDeviceMemory`
 
 ```python
-memory = SymmDeviceMemory(buf_size, group_size, group_rank, device_idx, comm_backend)
-memory.get_unicast_ptr(i)                  # rank i's buffer
-memory.get_multicast_ptr()                 # stores reach every rank's buffer
+memory = SymmDeviceMemory(
+    buf_size,                 # bytes per rank, equal on all ranks
+    group_size, group_rank,   # this rank's place in the group
+    device_idx,               # the CUDA device to allocate on
+    comm_backend,             # CommBackend of the group; MPI if None
+    enable_multicast=True,
+    allocate_signal_pads=True,
+)
+memory.get_unicast_ptr(i)     # rank i's buffer
+memory.get_multicast_ptr()    # stores reach every rank's buffer
 ```
+
+Each instance names its group explicitly: `comm_backend` is the group, and
+`group_size` and `group_rank` must match its size and this rank's rank in it.
+Instances over different backends are independent.
 
 After `allocate_mnnvl_handles`, the unicast buffers are mapped back to back in
 the instance's reservation. With multicast enabled, rank 0 creates the
