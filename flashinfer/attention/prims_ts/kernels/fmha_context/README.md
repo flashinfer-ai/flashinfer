@@ -396,9 +396,10 @@ runtime tensors alive until every graph using that plan is destroyed.
   `torch.float8_e4m3fn` V, and a Sage plan's `torch.int8` Q/K with
   `torch.float8_e4m3fn` V.
 - Sage attention covers only the contiguous dense fixed-length
-  `head_dim=128` path with E4M3 or INT8 Q/K, E4M3 V and a 16-bit output;
-  causal and variable-window masks, packed or paged storage and left windows
-  are rejected at plan time. INT8 Q/K need the INT8 tcgen05 MMA of SM100a.
+  `head_dim=128` path; causal and variable-window masks, packed or paged
+  storage and left windows are rejected at plan time. The recipe, the scale
+  tensors and the decode kernel's coverage are in
+  [Sage attention](../../README.md#sage-attention).
 - Re-plan either wrapper after changing a static capacity, head or dtype
   geometry, mask, window, or default scale; page size and explicit metadata
   promises are also static for paged plans. Request tensors and metadata may
@@ -425,4 +426,5 @@ output state.
 ```bash
 pytest -q tests/attention/test_attention_ts_context.py
 pytest -q tests/attention/test_attention_ts_features.py
+pytest -q tests/attention/test_attention_ts_context_sage.py
 ```

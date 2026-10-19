@@ -310,68 +310,49 @@ rescaled; 0 rescales on every new maximum.
 
 ## Sage attention
 
-Sage attention runs the contiguous decode kernel on 8-bit Q, K and V with
-dequantization scales, in the dense and block-sparse modes of
-`BlockSparseTSWrapper` and `block_sparse_attention`. The plan fixes the recipe
-with `sage_config=SageAttentionConfig(...)`; every run supplies the scales as
-`sage=SageAttentionParams(...)`. The contiguous context kernel runs the FP8
-recipe on dense fixed-length plans of `BatchPrefillTSWrapper`
-(`plan(..., sage=SageAttentionConfig(...))`, `run(..., sage=SageAttentionParams(...))`;
-see [Context plans](#context-plans)):
+Sage attention runs attention on 8-bit Q, K and V with dequantization scales
+on two kernels: the contiguous decode kernel, in the dense and block-sparse
+modes of `BlockSparseTSWrapper` and `block_sparse_attention`, and the
+contiguous context kernel, on dense fixed-length plans of
+`BatchPrefillTSWrapper`. The plan fixes the recipe with a
+`SageAttentionConfig` (`sage_config=` for the block-sparse APIs, `sage=` for
+`BatchPrefillTSWrapper.plan`); every run supplies the scales as
+`sage=SageAttentionParams(...)`:
 
 ```text
 S[r][c] = sfQ[blkQ(r)] * sfK[blkK(c)] * (Q8 . K8^T)[r][c]
-P       = softmax_row(S), quantized to E4M3 as C * p with C = 448 * 2**-h
+P       = softmax_row(S), quantized to E4M3 as C * p
 O[r][d] = sfV[d] * (sum_c P8[r][c] * V8[c][d]) / (C * l[r])  (+ v_mean[d])
 ```
 
-`h` is the plan's `softmax_rescale_threshold_log2` (default 8) on Q64/KV256
-tiles and block-sparse plans, and 0 elsewhere. The context kernel keeps its
-lazy correction, which lets `p` reach `2**8`, and stores P as `p` itself
-(`C = 1`).
-
+`C` is the kernel's P scale ([Kernels and features](#kernels-and-features)).
 FlashInfer does not quantize: the 8-bit tensors and scales come from the
 caller, for example TensorRT-LLM's `sageQuant`. `v_mean` adds a per-channel
-mean back after normalization, for callers that quantized `V - v_mean`. Every
-scale must be finite and positive; the kernel does not check the values.
+mean back after normalization, for callers that quantized `V - v_mean`.
+
+### Recipe and scale tensors
+
+Both kernels take the same recipe and scale tensors, and both wrappers check
+the recipe at plan time (`validate_sage_recipe`). The defaults are
+TensorRT-LLM's production recipe.
 
 | Input | Supported values |
 | --- | --- |
-| Q/K dtype | Matching `torch.float8_e4m3fn`, or `torch.int8` on SM100a/B200 only |
-| V dtype (`v_data_type`) | `torch.float8_e4m3fn`; it defaults to the K dtype, so INT8 plans set it |
-| Output dtype | `torch.bfloat16` (default) or `torch.float16` |
-| `q_block_size` | Power of two no larger than the Q tile; default 1 |
+| Q/K dtype | One dtype: `torch.float8_e4m3fn`, or `torch.int8` on SM100a/B200 only |
+| V dtype (`v_data_type`; context `v_dtype`) | `torch.float8_e4m3fn`; it defaults to the K dtype, so INT8 plans set it |
+| Output dtype | `torch.bfloat16` (the block-sparse default) or `torch.float16` |
+| `q_block_size` | Power of two; default 1. The decode kernel also bounds it by its Q tile |
 | `k_block_size` | 1, 4, 16, 32, 64, 128 or 256; default 16 |
-| `k_summary_block_size` | K block size of proxy summary scales; default `k_block_size` |
+| `k_summary_block_size` | One of the `k_block_size` values, for proxy summary scales; default `k_block_size` |
 | `v_mean` | Whether every run supplies `v_mean`; default `False` |
-| Geometry | `head_dim=128`; a Q64/KV256 or Q128/KV128 Keeps tile, which needs a `kv_block_size` multiple of 64 and at least 64 grouped Q rows (`q_block_size * Hq / Hkv`) |
-
-The block-size fields belong to `SageAttentionConfig`; the defaults are
-TensorRT-LLM's production recipe. Masks and scheduling follow the 16-bit
-plans. Every run first launches a small kernel that gathers the plan's scales
-into one buffer in the order the attention kernel reads them: the K scales
-per 64-token atom, the Q scales per Q-tile row and the V scales (and means)
-per KV head; attention reads that buffer alone. A block-sparse run's route
-prepare follows it as a programmatic dependent launch, starting while the
-scale kernel drains and acquiring it before exiting, so the attention launch
-that follows in stream order finds both the scales and the routes complete.
-The paged block-sparse APIs do not support Sage attention.
-
-With the default threshold, FP8 P is quantized at `C = 448 * 2**-8 = 1.75`:
-the E4M3 grid of P moves down by the threshold, so probabilities far below the
-anchor round to subnormals or zero. Rows whose largest scores arrive first,
-such as an attention sink in the leading blocks, lose the most. A smaller
-threshold trades rescales back for range; 0 keeps exact anchors and
-`C = 448`.
-
-### Scale tensors
 
 All scales are contiguous, 16-byte-aligned `torch.float32` tensors on the run
-device; a validating `run()` checks them against the plan. Q and K scales use
-the trtllm-gen flat layout: within one head, sequence `b` of `[B, S, H, D]`
-starts at slot `b * S // blk + b` and token `t` uses slot `t // blk` inside
-it, so one head owns `flat_scale_numel(B, S, blk) == ceil(B * S / blk) + B - 1`
-slots.
+device; a validating `run()` checks them against the plan. Every scale must
+be finite and positive; the kernels do not check the values. Q and K scales
+use the trtllm-gen flat layout: within one head, sequence `b` of
+`[B, S, H, D]` starts at slot `b * S // blk + b` and token `t` uses slot
+`t // blk` inside it, so one head owns
+`flat_scale_numel(B, S, blk) == ceil(B * S / blk) + B - 1` slots.
 
 | Field | Shape |
 | --- | --- |
@@ -387,43 +368,54 @@ quantized as one more K sequence of `ceil(Skv / kv_block_size)` tokens with
 the per-block V means in E4M3 and shares `v_scale` (built from `V - v_mean`
 when a mean is used).
 
-On B200 both recipes run faster than BF16 on the same plan; the gain depends
-on the shape, and K blocks of 4 and 1 tokens cost more than 16-token blocks.
+Every run first launches a small kernel that gathers the plan's scales into
+one buffer in the order the attention kernel reads them: the K scales per
+64-token atom, the Q scales per Q-tile row and the V scales (and means) per
+KV head; attention reads that buffer alone. A block-sparse run's route
+prepare follows it as a programmatic dependent launch, starting while the
+scale kernel drains and acquiring it before exiting, so the attention launch
+that follows in stream order finds both the scales and the routes complete.
 
-### Context plans
+### Kernels and features
 
-`BatchPrefillTSWrapper.plan(..., sage=SageAttentionConfig(...))` runs the
-same quantization recipe on the dense, fixed-length `[B, S, H, D]` context
-path. The scale tensors and their flat layout are those of the table above;
-`k_summary_block_size` and `k_summary_scale` have no role, since the context
-kernel has no routes. Every `run(..., sage=SageAttentionParams(...))` first
-launches the scale prepare on the current stream, then attention.
+Each kernel obtains a K tile's scales by a transport (`SageKTransport`) and
+applies them by a score scaling (`SageScoreScaling`), both chosen by the K
+block size. `BLOCK` scaling keeps the scores raw and folds `sfQ * sfK` into
+each block's maximum and exp2 multiplier; `DEQUANTIZED` scaling multiplies
+the scores in place in the max pass, which costs more per score.
 
-| Input | Supported values |
-| --- | --- |
-| Q/K dtype | Matching `torch.float8_e4m3fn`, or `torch.int8` on SM100a/B200 only |
-| V dtype (`v_dtype`) | `torch.float8_e4m3fn`; it defaults to the K dtype, so INT8 plans set it |
-| Output dtype | `torch.bfloat16` or `torch.float16` |
-| `q_block_size`, `k_block_size`, `v_mean` | As for the decode kernel |
-| Geometry | `head_dim=128`, `mask_type="dense"`, fixed `packed=False` storage, `window_left=-1` |
+| | Decode kernel | Context kernel |
+| --- | --- | --- |
+| APIs | `BlockSparseTSWrapper`, `block_sparse_attention` | `BatchPrefillTSWrapper` |
+| K/V storage | Contiguous; the paged block-sparse APIs do not support Sage | Contiguous fixed-length `[B, S, H, D]` (`packed=False`) |
+| Geometry | `head_dim=128`; a Q64/KV256 or Q128/KV128 Keeps tile, which needs a `kv_block_size` multiple of 64 and at least 64 grouped Q rows (`q_block_size * Hq / Hkv`) | `head_dim=128`; 128-token Q tiles of one Q head |
+| Masks and routes | Dense and causal masks; exact and proxy block-sparse routes (BSR or bitmask) | `mask_type="dense"` and `window_left=-1`; no routes, so `k_summary_block_size` is unused |
+| Split-KV | Rejected: only the direct output store applies `sfV` and `v_mean` | No split-KV launch |
+| K transport | `RING` for every K block size: the load warp stages each K tile's scales in shared memory | `GLOBAL` for 4-token and coarser blocks: the softmax loads them before the score wait; `RING` for 1-token blocks |
+| Score scaling | `BLOCK` for 4-token and coarser blocks; `DEQUANTIZED` for 1-token blocks | `BLOCK` per 16-column block for 16-token and coarser blocks; `DEQUANTIZED` for 4- and 1-token blocks |
+| P scale `C` | `448 * 2**-h`, with `h` the plan's `softmax_rescale_threshold_log2` (default 8) on Q64/KV256 tiles and block-sparse plans, and 0 elsewhere | 1: the lazy correction lets `p` reach `2**8` |
 
-With 16-token or coarser K blocks the softmax reads the K scales straight
-from the prepared buffer and scales each 16-column block's maximum and exp2
-multiplier. Finer blocks dequantize the scores in place, which costs more:
-4-token blocks load the tile's multipliers before the score wait, and for
-1-token blocks the load warp stages each tile's scales in shared memory. On
-one dense layer (B=2, S=75600, 40 heads, D=128, attention kernel only,
-GPC-clock Mcycles per call) the context kernel measured:
+Masks and scheduling otherwise follow each kernel's 16-bit plans. In the
+decode kernel the default threshold quantizes FP8 P at
+`C = 448 * 2**-8 = 1.75`: the E4M3 grid of P moves down by the threshold, so
+probabilities far below the anchor round to subnormals or zero. Rows whose
+largest scores arrive first, such as an attention sink in the leading blocks,
+lose the most. A smaller threshold trades rescales back for range; 0 keeps
+exact anchors and `C = 448`.
+
+### Performance
+
+One dense layer (B=2, S=75600, 40 heads, D=128) with per-token Q scales,
+smoothed K and per-channel V scales with a V mean, attention kernel only, in
+Mcycles per call at the GPC clock (GB300: nsys GPU metrics; B200: ncu
+`sm__cycles_elapsed.max`). The Sage rows list K blocks of 16, 4 and 1 tokens.
 
 | Plan | GB300 | B200 |
 | --- | ---: | ---: |
-| Per-tensor FP8 (no Sage) | 162 | 261 |
-| Sage, 16-token K blocks | 169 | 252 |
-| Sage, 4-token K blocks | 202 | 278 |
-| Sage, 1-token K blocks | 204 | 300 |
-
-The decode kernel's dense Sage plan on the same layer takes 202, 220 and 260
-Mcycles on GB300 for the three block sizes.
+| Context, per-tensor FP8 (no Sage) | 162 | 213 |
+| Context, Sage FP8 | 169 / 202 / 204 | 223 / 251 / 244 |
+| Context, Sage INT8 | not supported | 229 / 264 / 277 |
+| Decode (Q64/KV256), Sage FP8 | 202 / 220 / 260 | 274 / 288 / 317 |
 
 ### Example
 
@@ -531,5 +523,6 @@ pytest -q \
   tests/attention/test_attention_ts_block_sparse.py \
   tests/attention/test_attention_ts_features.py \
   tests/attention/test_attention_ts_mla_decode.py \
-  tests/attention/test_attention_ts_sage.py
+  tests/attention/test_attention_ts_sage.py \
+  tests/attention/test_attention_ts_context_sage.py
 ```
