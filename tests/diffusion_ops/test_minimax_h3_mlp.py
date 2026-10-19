@@ -96,11 +96,9 @@ from flashinfer.diffusion_ops.minimax_h3_mlp import (
     nvfp4_a_scale_workspace_bytes,
     nvfp4_y_scale_workspace_bytes,
 )
-from flashinfer.diffusion_ops.minimax_h3_out_proj import (
-    _reference_from_operands,
-    _weight_scale_tiles,
-)
+from flashinfer.diffusion_ops.minimax_h3_out_proj import _weight_scale_tiles
 from flashinfer.utils import get_compute_capability
+from tests.test_helpers.minimax_h3_out_proj_reference import _reference_from_operands
 
 ATOL = 1e-2
 RTOL = 1e-2

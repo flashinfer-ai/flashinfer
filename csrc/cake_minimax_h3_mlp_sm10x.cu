@@ -15,8 +15,9 @@
  */
 // clang-format off
 // MiniMax-H3 full MLP block (RMSNorm + indexed AdaLN + FC1 + SwiGLU + FC2 + indexed gate + residual)
-// for sm_100a (Blackwell, compute capability 10.0).  Generated device code; three operator variants
-// share one translation unit, each a chain of three launches on the current stream:
+// for sm_100a and sm_103a (Blackwell, compute capability 10.0 and 10.3; one translation unit compiled
+// once per target, MINIMAX_H3_SM_MINOR naming the minor).  Generated device code; three operator
+// variants share one translation unit, each a chain of three launches on the current stream:
 //
 //   a   = BF16(BF16(RMSNorm_fp32(x, x_norm_weight, eps)) * BF16(1 + adaln_scale[idx]) + adaln_shift[idx])
 //         adaln_scale / adaln_shift / gate are bf16 [rows, 5376] tables read as base + idx * row_stride
@@ -6151,6 +6152,16 @@ kernel_minimax_h3_mlp_fc2_e2m1(const __grid_constant__ CUtensorMap A, const __gr
 
 #include "tvm_ffi_utils.h"
 
+// The one 10.x minor this build serves: 0 for sm_100a, 3 for sm_103a.  The JIT builder passes
+// it next to the matching -gencode (the device code above already branches on __CUDA_ARCH__
+// wherever 10.0 and 10.3 differ), so one translation unit compiled once per target replaces
+// the former per-target copies while each module keeps its exact-capability check.
+#ifndef MINIMAX_H3_SM_MINOR
+#error "define MINIMAX_H3_SM_MINOR (0 for sm_100a, 3 for sm_103a) to match the -gencode target"
+#endif
+static_assert(MINIMAX_H3_SM_MINOR == 0 || MINIMAX_H3_SM_MINOR == 3,
+              "MINIMAX_H3_SM_MINOR must be 0 (sm_100a) or 3 (sm_103a)");
+
 namespace {
 
 constexpr int64_t kHidden = 5376;       // x / a / out columns, fc2_weight rows
@@ -6509,8 +6520,9 @@ void ConfigureKernels() {
   status = cudaGetDeviceProperties(&properties, device);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "failed to query CUDA device properties: " << cudaGetErrorString(status);
-  TVM_FFI_CHECK(properties.major == 10 && properties.minor == 0, RuntimeError)
-      << "this MiniMax-H3 MLP build targets compute capability 10.0 exactly (tcgen05 + TMEM + 2-CTA MMA)";
+  TVM_FFI_CHECK(properties.major == 10 && properties.minor == MINIMAX_H3_SM_MINOR, RuntimeError)
+      << "this MiniMax-H3 MLP build targets compute capability 10." << MINIMAX_H3_SM_MINOR
+      << " exactly (tcgen05 + TMEM + 2-CTA MMA)";
   TVM_FFI_CHECK(properties.multiProcessorCount >= 2 * kCtaGroup, RuntimeError)
       << "MiniMax-H3 MLP requires at least " << 2 * kCtaGroup << " SMs";
   OptInSmem(kernel_minimax_h3_norm_adaln_bf16, kNormBf16Smem, "norm bf16");
