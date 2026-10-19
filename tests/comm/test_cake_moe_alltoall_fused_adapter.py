@@ -67,13 +67,13 @@ def test_each_target_loads_its_own_module(monkeypatch):
         (
             "sm100a",
             "moe_ep_cake_alltoall_sm100a",
-            "mnnvl_moe_alltoall_sm100.cu",
+            "cake_moe_alltoall_sm100.cu",
             "compute_100a,code=sm_100a",
         ),
         (
             "sm103a",
             "moe_ep_cake_alltoall_sm103a",
-            "mnnvl_moe_alltoall_sm103.cu",
+            "cake_moe_alltoall_sm103.cu",
             "compute_103a,code=sm_103a",
         ),
     ],
@@ -286,8 +286,8 @@ def test_bf16_vector_routes_and_stage_grid_keep_exact_boundaries():
 
     generated_root = Path(__file__).resolve().parents[2] / "csrc/generated/moe_alltoall"
     for generated_name in (
-        "mnnvl_moe_alltoall_sm100.cu",
-        "mnnvl_moe_alltoall_sm103.cu",
+        "cake_moe_alltoall_sm100.cu",
+        "cake_moe_alltoall_sm103.cu",
     ):
         generated_source = (generated_root / generated_name).read_text()
         normalized_generated_source = " ".join(generated_source.split())
@@ -484,8 +484,8 @@ def test_fused_quantized_combine_routes_mirror_the_cake_host_rule():
 
     generated_root = repo_root / "csrc/generated/moe_alltoall"
     for generated_name in (
-        "mnnvl_moe_alltoall_sm100.cu",
-        "mnnvl_moe_alltoall_sm103.cu",
+        "cake_moe_alltoall_sm100.cu",
+        "cake_moe_alltoall_sm103.cu",
     ):
         generated = " ".join((generated_root / generated_name).read_text().split())
         for top_k in _FUSED_QUANTIZED_COMBINE_TOP_K:

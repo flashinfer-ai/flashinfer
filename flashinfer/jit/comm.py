@@ -308,8 +308,8 @@ def gen_ulysses_a2a_module() -> JitSpec:
 CakeAlltoAllTarget = Literal["sm100a", "sm103a"]
 
 _CAKE_ALLTOALL_GENERATED_SOURCE = {
-    "sm100a": "mnnvl_moe_alltoall_sm100.cu",
-    "sm103a": "mnnvl_moe_alltoall_sm103.cu",
+    "sm100a": "cake_moe_alltoall_sm100.cu",
+    "sm103a": "cake_moe_alltoall_sm103.cu",
 }
 _CAKE_ALLTOALL_NVCC_FLAGS = {
     "sm100a": sm100a_nvcc_flags,
