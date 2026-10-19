@@ -36,11 +36,14 @@ from ..trace.templates.norm import (
     fused_add_rmsnorm_quant_trace,
     fused_add_rmsnorm_trace,
     fused_rmsnorm_silu_trace,
+    gated_residual_next_rmsnorm_trace_dispatch,
+    gated_residual_rmsnorm_trace,
     gemma_fused_add_rmsnorm_trace,
     gemma_rmsnorm_trace,
     layernorm_quant_trace,
     layernorm_trace,
     rmsnorm_quant_trace,
+    rmsnorm_sigmoid_gate_trace,
     rmsnorm_trace,
 )
 from ..utils import (
@@ -73,6 +76,29 @@ if not _USE_CUDA_NORM:
     except (ImportError, AttributeError):
         # nvidia-cutlass-dsl not installed or incompatible version
         _USE_CUDA_NORM = True
+
+try:
+    from .kernels.gated_residual_rmsnorm import (
+        gated_residual_rmsnorm as _gated_residual_rmsnorm_cute,
+    )
+    from .kernels.gated_residual_next_rmsnorm import (
+        gated_residual_next_rmsnorm as _gated_residual_next_rmsnorm_cute,
+    )
+    from .kernels.rmsnorm_sigmoid_gate import (
+        rmsnorm_sigmoid_gate as _rmsnorm_sigmoid_gate_cute,
+        supports_rmsnorm_sigmoid_gate,
+    )
+
+    _HAS_CUTE_DSL_FUSED_NORM = True
+except (ImportError, AttributeError):
+    _HAS_CUTE_DSL_FUSED_NORM = False
+
+    def supports_rmsnorm_sigmoid_gate(
+        dtype: torch.dtype,
+        head_dim: int,
+        device: torch.device | str | None = None,
+    ) -> bool:
+        return False
 
 
 @functools.cache
@@ -139,6 +165,480 @@ def _normalize_scale_tensor(
     return scale.contiguous()
 
 
+_GATED_RESIDUAL_HIDDEN_SIZE = 8192
+_GATED_RESIDUAL_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
+_FUSED_NORM_ALIGNMENT = 16
+_DUAL_NORM_ALIGNMENT = 32
+
+
+def _fused_norm_arch_supported(device: torch.device) -> bool:
+    cap = torch.cuda.get_device_capability(device)
+    return cap in _GATED_RESIDUAL_COMPUTE_CAPABILITIES and _cute_dsl_supports_arch(*cap)
+
+
+def _is_aligned(tensor: torch.Tensor, alignment: int = _FUSED_NORM_ALIGNMENT) -> bool:
+    return tensor.data_ptr() % alignment == 0
+
+
+def supports_gated_residual_rmsnorm(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+) -> bool:
+    """Return whether tensors satisfy the SM100/SM103/SM107 fused-kernel contract."""
+    tensors = (branch, residual, alpha, beta)
+    return (
+        _HAS_CUTE_DSL_FUSED_NORM
+        and branch.ndim == 2
+        and branch.shape[1] == _GATED_RESIDUAL_HIDDEN_SIZE
+        and residual.shape == branch.shape
+        and (weight is None or weight.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,))
+        and alpha.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,)
+        and beta.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,)
+        and branch.dtype == torch.bfloat16
+        and (weight is None or weight.dtype == torch.bfloat16)
+        and residual.dtype == torch.float32
+        and alpha.dtype == torch.float32
+        and beta.dtype == torch.float32
+        and all(
+            tensor.is_cuda
+            and tensor.is_contiguous()
+            and tensor.device == branch.device
+            and _is_aligned(tensor)
+            for tensor in tensors
+        )
+        and (
+            weight is None
+            or (
+                weight.is_cuda
+                and weight.is_contiguous()
+                and weight.device == branch.device
+                and _is_aligned(weight)
+            )
+        )
+        and _fused_norm_arch_supported(branch.device)
+    )
+
+
+def supports_gated_residual_next_rmsnorm(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    next_weight: torch.Tensor,
+    alpha: Union[torch.Tensor, float],
+    beta: torch.Tensor,
+    *,
+    post_weight: Optional[torch.Tensor] = None,
+) -> bool:
+    """Return whether inputs satisfy the SM100/SM103/SM107 two-norm kernel contract."""
+    tensors: tuple[torch.Tensor, ...] = (branch, residual, next_weight, beta)
+    if isinstance(alpha, torch.Tensor):
+        if (
+            alpha.shape != (_GATED_RESIDUAL_HIDDEN_SIZE,)
+            or alpha.dtype != torch.float32
+        ):
+            return False
+        tensors += (alpha,)
+    elif not isinstance(alpha, (int, float)):
+        return False
+    if post_weight is not None:
+        tensors += (post_weight,)
+    return (
+        _HAS_CUTE_DSL_FUSED_NORM
+        and branch.ndim == 2
+        and branch.shape[1] == _GATED_RESIDUAL_HIDDEN_SIZE
+        and residual.shape == branch.shape
+        and next_weight.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,)
+        and (
+            post_weight is None
+            or (
+                post_weight.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,)
+                and post_weight.dtype == torch.bfloat16
+            )
+        )
+        and beta.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,)
+        and branch.dtype == torch.bfloat16
+        and residual.dtype == torch.float32
+        and next_weight.dtype == torch.bfloat16
+        and beta.dtype == torch.float32
+        and all(
+            tensor.is_cuda
+            and tensor.is_contiguous()
+            and tensor.device == branch.device
+            and _is_aligned(tensor, _DUAL_NORM_ALIGNMENT)
+            for tensor in tensors
+        )
+        and _fused_norm_arch_supported(branch.device)
+    )
+
+
+@flashinfer_api(trace=gated_residual_next_rmsnorm_trace_dispatch)
+def gated_residual_next_rmsnorm(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    next_weight: torch.Tensor,
+    alpha: Union[torch.Tensor, float],
+    beta: torch.Tensor,
+    post_eps: float = 1e-6,
+    next_eps: float = 1e-6,
+    next_gain_center: float = 0.0,
+    residual_out: Optional[torch.Tensor] = None,
+    ffn_input: Optional[torch.Tensor] = None,
+    *,
+    post_weight: Optional[torch.Tensor] = None,
+    post_gain_center: float = 0.0,
+    enable_pdl: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Gated residual RMSNorm plus the next RMSNorm in one launch, for hidden size 8192.
+
+    This computes ``residual_out = alpha * residual + beta * RMSNorm(branch)``
+    in FP32. It then computes ``ffn_input = RMSNorm(residual_out) *
+    (next_weight + next_gain_center)`` and rounds only that output to BF16.
+    When ``post_weight`` is supplied, ``branch`` is multiplied by
+    ``post_weight + post_gain_center`` in FP32 before its RMSNorm.
+    The optimized implementation supports contiguous hidden-size-8192 tensors
+    on SM100, SM103, and SM107 GPUs.
+
+    Parameters
+    ----------
+    branch : torch.Tensor
+        Two-dimensional BF16 branch tensor.
+    residual : torch.Tensor
+        FP32 residual stream with the same shape as ``branch``.
+    next_weight : torch.Tensor
+        BF16 weight for the second RMSNorm, with shape ``(8192,)``.
+    alpha : Union[torch.Tensor, float]
+        FP32 stream gate with shape ``(8192,)``, or a scalar coefficient.
+        Use ``1.0`` for an ungated stream. Scalar values specialize the kernel
+        without allocating or loading an alpha tensor.
+    beta : torch.Tensor
+        FP32 branch gate with shape ``(8192,)``.
+    post_eps, next_eps : float
+        Epsilons for the branch and residual-stream RMSNorms.
+    next_gain_center : float
+        Constant added to ``next_weight`` in FP32.
+    residual_out : Optional[torch.Tensor]
+        Optional FP32 destination with the same shape as ``residual``.
+    ffn_input : Optional[torch.Tensor]
+        Optional BF16 destination with the same shape as ``branch``.
+    post_weight : Optional[torch.Tensor]
+        Optional BF16 input scale for the first RMSNorm, with shape ``(8192,)``.
+    post_gain_center : float
+        Constant added to ``post_weight`` in FP32; unused when it is ``None``.
+    enable_pdl : bool
+        Whether to enable programmatic dependent launch. Defaults to ``True``;
+        pass ``False`` to disable it.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        The FP32 residual stream and BF16 normalized FFN input.
+    """
+    if not supports_gated_residual_next_rmsnorm(
+        branch, residual, next_weight, alpha, beta, post_weight=post_weight
+    ):
+        raise ValueError(
+            "tensors do not satisfy the gated_residual_next_rmsnorm contract"
+        )
+    if residual_out is None:
+        residual_out = torch.empty_like(residual)
+    if ffn_input is None:
+        ffn_input = torch.empty_like(branch)
+    outputs = (
+        ("residual_out", residual_out, torch.float32),
+        ("ffn_input", ffn_input, torch.bfloat16),
+    )
+    for name, output, dtype in outputs:
+        if (
+            output.shape != branch.shape
+            or output.dtype != dtype
+            or output.device != branch.device
+            or not output.is_contiguous()
+            or not _is_aligned(output, _DUAL_NORM_ALIGNMENT)
+        ):
+            raise ValueError(
+                f"{name} must match branch shape, expected dtype, device, and layout"
+            )
+    # Scalar specializations never read the alpha tensor argument; reuse beta
+    # to preserve the tensor ABI without allocating a constant gate vector.
+    if isinstance(alpha, torch.Tensor):
+        alpha_tensor, alpha_scalar = alpha, None
+    else:
+        alpha_tensor, alpha_scalar = beta, float(alpha)
+    _gated_residual_next_rmsnorm_impl(
+        branch,
+        residual,
+        next_weight,
+        alpha_tensor,
+        beta,
+        residual_out,
+        ffn_input,
+        post_eps,
+        next_eps,
+        next_gain_center,
+        post_weight,
+        post_gain_center,
+        alpha_scalar,
+        enable_pdl,
+    )
+    return residual_out, ffn_input
+
+
+@register_custom_op(
+    "flashinfer::gated_residual_next_rmsnorm",
+    mutates_args=("residual_out", "ffn_input"),
+)
+def _gated_residual_next_rmsnorm_impl(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    next_weight: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    residual_out: torch.Tensor,
+    ffn_input: torch.Tensor,
+    post_eps: float,
+    next_eps: float,
+    next_gain_center: float,
+    post_weight: Optional[torch.Tensor],
+    post_gain_center: float,
+    alpha_scalar: Optional[float] = None,
+    enable_pdl: bool = True,
+) -> None:
+    if enable_pdl:
+        enable_pdl = device_support_pdl(branch.device)
+    _gated_residual_next_rmsnorm_cute(
+        branch,
+        residual,
+        alpha,
+        beta,
+        next_weight,
+        post_eps,
+        next_eps,
+        next_gain_center,
+        residual_out,
+        ffn_input,
+        post_weight,
+        post_gain_center,
+        enable_pdl,
+        alpha_scalar,
+    )
+
+
+@register_fake_op("flashinfer::gated_residual_next_rmsnorm")
+def _gated_residual_next_rmsnorm_fake(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    next_weight: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    residual_out: torch.Tensor,
+    ffn_input: torch.Tensor,
+    post_eps: float,
+    next_eps: float,
+    next_gain_center: float,
+    post_weight: Optional[torch.Tensor],
+    post_gain_center: float,
+    alpha_scalar: Optional[float] = None,
+    enable_pdl: bool = True,
+) -> None:
+    return None
+
+
+@flashinfer_api(trace=gated_residual_rmsnorm_trace)
+def gated_residual_rmsnorm(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    eps: float = 1e-6,
+    gain_center: float = 0.0,
+    out: Optional[torch.Tensor] = None,
+    *,
+    enable_pdl: bool = True,
+) -> torch.Tensor:
+    r"""Gated residual RMSNorm for hidden size 8192: blend a normalized branch into the stream.
+
+    The operation is ``alpha * residual + beta * RMSNorm(branch)``. When
+    ``weight`` is supplied, ``weight + gain_center`` is applied to ``branch``
+    before its RMS reduction. When it is ``None``, the branch is unweighted.
+
+    This optimized implementation currently supports contiguous BF16 tensors
+    with hidden size 8192 on SM100, SM103, and SM107 GPUs.
+
+    Parameters
+    ----------
+    branch, residual : torch.Tensor
+        Two-dimensional BF16 and FP32 tensors, respectively, with shape
+        ``(rows, 8192)``.
+    weight : Optional[torch.Tensor]
+        Optional BF16 pre-normalization weight with shape ``(8192,)``.
+    alpha, beta : torch.Tensor
+        FP32 gate tensors with shape ``(8192,)``.
+    eps : float
+        Epsilon added to the RMS denominator.
+    gain_center : float
+        Constant added to ``weight`` in FP32.
+    out : Optional[torch.Tensor]
+        Optional FP32 output tensor with the same shape and layout as ``residual``.
+    enable_pdl : bool
+        Whether to enable programmatic dependent launch. Defaults to ``True``;
+        pass ``False`` to disable it.
+
+    Returns
+    -------
+    torch.Tensor
+        The fused result.
+    """
+    if not supports_gated_residual_rmsnorm(branch, residual, weight, alpha, beta):
+        raise ValueError("tensors do not satisfy the gated_residual_rmsnorm contract")
+    if out is not None and (
+        out.shape != branch.shape
+        or out.dtype != residual.dtype
+        or out.device != branch.device
+        or not out.is_contiguous()
+        or not _is_aligned(out)
+    ):
+        raise ValueError("out must match branch shape, dtype, device, and layout")
+    if out is None:
+        out = torch.empty_like(residual)
+    kernel_weight = branch.reshape(-1)[:_GATED_RESIDUAL_HIDDEN_SIZE]
+    if weight is not None:
+        kernel_weight = weight
+    _gated_residual_rmsnorm_impl(
+        branch,
+        residual,
+        kernel_weight,
+        alpha,
+        beta,
+        out,
+        eps,
+        gain_center,
+        weight is not None,
+        enable_pdl,
+    )
+    return out
+
+
+@register_custom_op("flashinfer::gated_residual_rmsnorm", mutates_args=("out",))
+def _gated_residual_rmsnorm_impl(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+    gain_center: float,
+    apply_weight_before_norm: bool,
+    enable_pdl: bool = True,
+) -> None:
+    if enable_pdl:
+        enable_pdl = device_support_pdl(branch.device)
+    _gated_residual_rmsnorm_cute(
+        branch,
+        residual,
+        weight,
+        alpha,
+        beta,
+        eps,
+        gain_center,
+        int(apply_weight_before_norm),
+        out,
+        enable_pdl,
+    )
+
+
+@register_fake_op("flashinfer::gated_residual_rmsnorm")
+def _gated_residual_rmsnorm_fake(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+    gain_center: float,
+    apply_weight_before_norm: bool,
+    enable_pdl: bool = True,
+) -> None:
+    return None
+
+
+@flashinfer_api(trace=rmsnorm_sigmoid_gate_trace)
+def rmsnorm_sigmoid_gate(
+    input: torch.Tensor,
+    gate: torch.Tensor,
+    eps: float = 1e-5,
+    *,
+    enable_pdl: bool = True,
+) -> None:
+    r"""Per-head RMSNorm and sigmoid gate, in place, for head dim 64.
+
+    The last dimension is normalized independently, multiplied by
+    ``sigmoid(gate)``, and written back to ``input``. The optimized kernel
+    supports contiguous BF16 head rows of width 64 on SM100, SM103, and SM107 GPUs.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        BF16 tensor of shape ``(rows, 64)`` or ``(rows, heads, 64)``, normalized
+        in place. The last dimension must be contiguous, heads must be packed,
+        and the row stride must be a multiple of 8 elements.
+    gate : torch.Tensor
+        BF16 gate tensor with the same shape and layout constraints as ``input``.
+    eps : float
+        Epsilon added to the RMS denominator.
+    enable_pdl : bool
+        Whether to enable programmatic dependent launch. Defaults to ``True``;
+        pass ``False`` to disable it.
+    """
+    if input.ndim not in (2, 3) or gate.shape != input.shape:
+        raise ValueError("input and gate must have matching 2-D or 3-D shapes")
+    if not supports_rmsnorm_sigmoid_gate(
+        input.dtype, input.shape[-1], device=input.device
+    ):
+        raise ValueError("tensors do not satisfy the rmsnorm_sigmoid_gate contract")
+    if (
+        gate.dtype != torch.bfloat16
+        or not gate.is_cuda
+        or gate.device != input.device
+        or input.stride(-1) != 1
+        or gate.stride(-1) != 1
+        or input.stride(0) % 8 != 0
+        or gate.stride(0) % 8 != 0
+        or (input.ndim == 3 and input.stride(1) != input.shape[-1])
+        or (gate.ndim == 3 and gate.stride(1) != gate.shape[-1])
+        or not _is_aligned(input)
+        or not _is_aligned(gate)
+    ):
+        raise ValueError("tensors do not satisfy the rmsnorm_sigmoid_gate contract")
+    _rmsnorm_sigmoid_gate_impl(input, gate, eps, enable_pdl)
+
+
+@register_custom_op("flashinfer::rmsnorm_sigmoid_gate", mutates_args=("input",))
+def _rmsnorm_sigmoid_gate_impl(
+    input: torch.Tensor,
+    gate: torch.Tensor,
+    eps: float,
+    enable_pdl: bool = True,
+) -> None:
+    if enable_pdl:
+        enable_pdl = device_support_pdl(input.device)
+    _rmsnorm_sigmoid_gate_cute(input, gate, eps, enable_pdl=enable_pdl)
+
+
+@register_fake_op("flashinfer::rmsnorm_sigmoid_gate")
+def _rmsnorm_sigmoid_gate_fake(
+    input: torch.Tensor,
+    gate: torch.Tensor,
+    eps: float,
+    enable_pdl: bool = True,
+) -> None:
+    return None
+
+
 @flashinfer_api(trace=rmsnorm_trace)
 def rmsnorm(
     input: torch.Tensor,
@@ -160,10 +660,10 @@ def rmsnorm(
     eps: float
         Epsilon for numerical stability.
     out: Optional[torch.Tensor]
-        The output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor, if specified, the kernel will update this tensor in place.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
 
     Returns
     -------
@@ -239,7 +739,7 @@ def rmsnorm_quant(
         Epsilon for numerical stability.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
 
     """
     scale = _normalize_scale_tensor(scale, input)
@@ -294,7 +794,7 @@ def fused_add_rmsnorm(
         Epsilon for numerical stability.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
     """
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
@@ -355,7 +855,7 @@ def fused_add_rmsnorm_quant(
         Epsilon for numerical stability.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
     """
     scale = _normalize_scale_tensor(scale, input)
     if enable_pdl is None or enable_pdl:
@@ -481,10 +981,10 @@ def gemma_rmsnorm(
     eps: float
         Epsilon for numerical stability.
     out: Optional[torch.Tensor]
-        The output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor, if specified, the kernel will update this tensor in place.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
 
     Returns
     -------
@@ -562,7 +1062,7 @@ def gemma_fused_add_rmsnorm(
         Epsilon for numerical stability.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
     """
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
@@ -596,6 +1096,7 @@ def layernorm(
     eps: float = 1e-6,
 ) -> torch.Tensor:
     r"""Layer normalization.
+
     Parameters
     ----------
     input: torch.Tensor
@@ -658,9 +1159,9 @@ def layernorm_quant(
         Gemma tensor, shape (hidden_size,). Need to be float32.
     beta: torch.Tensor
         Beta tensor, shape (hidden_size,). Need to be float32.
-    scale: torch.Tensor
-        Scale factor for quantization, shape (1,). The normalized output is
-        divided by this scale before the fp8 cast.
+    scale: Union[float, torch.Tensor]
+        Scale factor for quantization; a tensor scale must have shape ``(1,)``.
+        The normalized output is divided by this scale before the fp8 cast.
     eps: float
         Epsilon for numerical stability.
     enable_pdl: bool

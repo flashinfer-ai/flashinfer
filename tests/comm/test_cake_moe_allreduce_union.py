@@ -13,10 +13,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-CPU-only tests for the Cake MoE all-reduce union export (SM100 and SM103, world sizes 2, 4, 8)."""
+CPU-only routing tests for the Cake MoE all-reduce union (SM100 and SM103, world sizes 2, 4, 8)."""
 
 from __future__ import annotations
 
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -31,325 +32,275 @@ _PDL = (False, True)
 _SM100 = (10, 0)
 _SM103 = (10, 3)
 _SM120 = (12, 0)
-# Exported architectures and the compute capability each one serves.
 _ARCHES = {"sm_100a": _SM100, "sm_103a": _SM103}
-
 _WIDE = union.SPECIALIZATION_WIDE_MLP
-# World size 4 on SM100 keeps exactly the reviewed route set: the bfloat16
-# classes keep a generic program (their T=1 / T=64 rows run wide_mlp; the
-# no-PDL T=1 row additionally runs the reviewed single-CTA geometry), the
-# float16 classes run wide_mlp for every token count (the resident and
-# owner-forward shapes compose with it).
-_SM100_WS4_ROUTE_KEYS = {
-    ("sm_100a", 4, "bfloat16", False, union.SPECIALIZATION_GENERIC),
-    ("sm_100a", 4, "bfloat16", True, union.SPECIALIZATION_GENERIC),
-    (
-        "sm_100a",
-        4,
-        "bfloat16",
-        False,
-        f"{_WIDE}_{union.SPECIALIZATION_T1_E8_SERIAL_CLEAR}_{union.SPECIALIZATION_CTA1}",
-    ),
-    ("sm_100a", 4, "bfloat16", True, _WIDE),
-    (
-        "sm_100a",
-        4,
-        "float16",
-        False,
-        f"{_WIDE}_{union.SPECIALIZATION_T64_E12_RESIDENT}",
-    ),
-    ("sm_100a", 4, "float16", False, _WIDE),
-    (
-        "sm_100a",
-        4,
-        "float16",
-        True,
-        f"{_WIDE}_{union.SPECIALIZATION_T128_E16_OWNER_FORWARD}",
-    ),
-    ("sm_100a", 4, "float16", True, _WIDE),
-}
-# Cooperative (resident-grid) shape specializations of the union (alone or
-# composed with the wide_mlp schedule).
-_COOPERATIVE_SPECIALIZATIONS = {
-    union.SPECIALIZATION_T64_E12_RESIDENT,
-    union.SPECIALIZATION_T128_E16_OWNER_FORWARD,
-    f"{_WIDE}_{union.SPECIALIZATION_T64_E12_RESIDENT}",
-    f"{_WIDE}_{union.SPECIALIZATION_T128_E16_OWNER_FORWARD}",
-}
-# Every (arch, world size) carries one generic route per (dtype, launch_with_pdl)
-# pair plus reviewed specializations drawn from this allow-list.  Extend a set
-# when a new specialization is reviewed for that scope.  On SM103 the
-# ``sm103_t1`` schedule variant applies at T=1 and composes with the
-# world-size-4 shape specializations (serial clear at BF16/T1/E8/no-PDL).
-_EXTRA_SPECIALIZATIONS = {
-    ("sm_100a", 2): frozenset({_WIDE, f"{_WIDE}_{union.SPECIALIZATION_CTA1}"}),
-    ("sm_100a", 4): {key[4] for key in _SM100_WS4_ROUTE_KEYS}
-    - {union.SPECIALIZATION_GENERIC},
-    ("sm_100a", 8): frozenset({union.SPECIALIZATION_SM100_WS8_MID}),
-    ("sm_103a", 2): frozenset({union.SPECIALIZATION_SM103_T1, _WIDE}),
-    ("sm_103a", 4): frozenset(
-        {
-            f"{union.SPECIALIZATION_SM103_T1}_{union.SPECIALIZATION_T1_E8_SERIAL_CLEAR}",
-            _WIDE,
-            f"{_WIDE}_{union.SPECIALIZATION_T64_E12_RESIDENT}",
-            f"{_WIDE}_{union.SPECIALIZATION_T128_E16_OWNER_FORWARD}",
-        }
-    ),
-    ("sm_103a", 8): frozenset(
-        {union.SPECIALIZATION_SM103_T1, union.SPECIALIZATION_SM103_WS8_MID}
-    ),
-}
-
-
-def _raw_pointers(world_size: int) -> set[str]:
-    return {
-        "workspace_control",
-        *(f"workspace_payload_{peer}" for peer in range(world_size)),
-    }
-
-
-def _module_scopes() -> dict[str, tuple[str, int]]:
-    """Map every routed module to the (arch, world size) of the route that lists it."""
-
-    scopes: dict[str, tuple[str, int]] = {}
-    for (
-        arch,
-        world_size,
-        _dtype,
-        _pdl,
-        _specialization,
-    ), names in union.ROUTES.items():
-        for name in names:
-            assert scopes.setdefault(name, (arch, world_size)) == (arch, world_size)
-    return scopes
+_GENERIC = union.SPECIALIZATION_GENERIC
 
 
 def _route_keys(arch: str, world_size: int) -> set[tuple[str, int, str, bool, str]]:
     return {key for key in union.ROUTES if key[0] == arch and key[1] == world_size}
 
 
-def test_module_inventory_is_verified_source_only() -> None:
-    assert union.MODULES
-    scopes = _module_scopes()
-    # Every module is reachable through a route and every route names a module.
-    assert set(scopes) == set(union.MODULES)
-    for name, record in union.MODULES.items():
-        arch, world_size = scopes[name]
-        assert record["arch"] == arch and arch in _ARCHES
-        assert name.startswith("cake_") and record["cache_name"].startswith("cake_")
-        assert record["cache_name"].endswith(f"_{arch}")
-        assert record["kernel_symbol"].startswith("kernel_cake_")
-        assert record["ffi_entry"] == "run"
-        assert record["compile_flags"] == ["--use_fast_math"]
-        for relative in record["sources"]:
-            assert relative.startswith(f"csrc/{union.SOURCE_PACKAGE}/{arch}/")
-        paths = union.verified_sources(name)
-        assert len(paths) == 2 and all(path.suffix == ".cu" for path in paths)
-        kinds = [kind for kind, _key in record["arg_plan"]]
-        assert set(kinds) <= {"buffer", "raw_pointer", "parameter", "grid"}
-        assert record["arg_plan"][-3:] == [
-            ("grid", "grid_x"),
-            ("grid", "grid_y"),
-            ("grid", "grid_z"),
-        ]
-        assert {
-            key for kind, key in record["arg_plan"] if kind == "raw_pointer"
-        } == _raw_pointers(world_size)
-        assert ("buffer", "workspace_tensor") in record["arg_plan"]
-        launch = record["launch"]
-        block = tuple(launch["block"])
-        cluster = tuple(launch["cluster"])
-        # One 7168-wide token is covered by 896 threads (16 B per thread): four
-        # 224-thread CTAs in a cluster, or one 896-thread CTA where the T=1
-        # geometry probe measured the single-CTA build faster.
-        assert cluster[1:] == (1, 1) and cluster[0] in {1, 4}
-        assert block[1:] == (1, 1) and block[0] * cluster[0] == 896
-        residency = launch["persistent_ctas_per_sm"]
-        assert isinstance(residency, int) and residency >= 1
-        if launch["cooperative"]:
-            assert residency == 1
-        if cluster[0] == 1:
-            assert record["arch"] == "sm_100a" and world_size in {2, 4}
-            assert not launch["cooperative"] and launch["persistent_ctas_per_sm"] == 1
+def _kernel_names(route: union.Route) -> tuple[str, ...]:
+    return (route.kernel,) if isinstance(route.kernel, str) else tuple(route.kernel)
+
+
+def test_every_route_names_a_kernel_of_its_world_size_and_dtype() -> None:
+    assert tuple(union.WORLD_SIZES) == _WORLD_SIZES
+    assert {(key[0], key[1]) for key in union.ROUTES} == {
+        (arch, world_size) for arch in _ARCHES for world_size in _WORLD_SIZES
+    }
+    used: set[str] = set()
+    for (arch, world_size, dtype, pdl, _spec), route in union.ROUTES.items():
+        assert arch in _ARCHES and dtype in _DTYPES and pdl in _PDL
+        names = _kernel_names(route)
+        if isinstance(route.kernel, tuple):
+            # Rank-specialised routes carry one kernel per rank.
+            assert len(names) == world_size and len(set(names)) == world_size
+        for name in names:
+            kernel = union.KERNELS[name]
+            assert kernel.dtype == dtype and kernel.world_size == world_size
+            # One 7168-wide token is covered by 896 threads: four 224-thread
+            # CTAs in a cluster, or one 896-thread CTA.
+            assert kernel.block * kernel.cluster == 896 and kernel.cluster in {1, 4}
+        used |= set(names)
+        assert route.persistent_ctas_per_sm >= 1
+        if route.cooperative:
+            assert route.persistent_ctas_per_sm == 1
+            assert route.max_persistent_clusters is None
+        if _spec in {_GENERIC, _WIDE}:
+            # The persistent programs serve up to 2048 tokens; a cooperative
+            # one-cluster-per-token grid cannot be co-resident at that size.
+            assert route.cooperative is False
+    # Every kernel is reachable through a route.
+    assert used == set(union.KERNELS)
+
+
+def test_kernel_sources_exist_and_define_their_symbol() -> None:
+    launcher = union._source_dir() / union.LAUNCHER_SOURCE
+    assert launcher.is_file()
+    for name in union.KERNELS:
+        path = union.kernel_source(name)
+        assert path.is_file(), path
+        text = path.read_text()
+        symbol = union.kernel_symbol(name)
+        assert re.search(r"\bvoid\s+" + re.escape(symbol) + r"\(", text), symbol
+        # The device text takes the rank at runtime and reads every workspace
+        # address from the device pointer table.
+        assert "world_rank" in text
+
+
+def _class_program(arch: str, world_size: int, dtype: str, pdl: bool) -> str:
+    return (
+        _WIDE
+        if (arch, world_size, dtype, pdl) in set(union._WIDE_MLP_CLASSES)
+        else _GENERIC
+    )
+
+
+def test_every_class_has_one_program_for_unreviewed_token_counts() -> None:
+    classes = set(union._WIDE_MLP_CLASSES)
+    for arch in _ARCHES:
+        for world_size in _WORLD_SIZES:
+            keys = _route_keys(arch, world_size)
+            for dtype in _DTYPES:
+                for pdl in _PDL:
+                    if (arch, world_size, dtype, pdl) in classes:
+                        assert (arch, world_size, dtype, pdl, _WIDE) in keys
+                        assert (arch, world_size, dtype, pdl, _GENERIC) not in keys
+                    else:
+                        assert (arch, world_size, dtype, pdl, _GENERIC) in keys
+
+
+def test_specialization_rules_are_sorted_disjoint_token_ranges_naming_exported_routes() -> (
+    None
+):
+    for (
+        arch,
+        world_size,
+        dtype,
+        pdl,
+        experts,
+    ), ranges in union._SPECIALIZATION_RULES.items():
+        assert (
+            arch in _ARCHES
+            and world_size in _WORLD_SIZES
+            and dtype in _DTYPES
+            and pdl in _PDL
+        )
+        assert isinstance(experts, int) and experts >= 1
+        assert len(ranges) >= 1
+        previous_hi = 0
+        for token_lo, token_hi, spec in ranges:
+            # Inclusive, non-empty, sorted and disjoint ranges.
+            assert 1 <= token_lo <= token_hi
+            assert token_lo > previous_hi
+            previous_hi = token_hi
+            # A rule names a specialization other than its class program, and that
+            # specialization has an exported route.
+            assert spec != _class_program(arch, world_size, dtype, pdl)
+            assert (arch, world_size, dtype, pdl, spec) in union.ROUTES
+
+
+def test_every_route_is_a_class_program_or_named_by_a_rule() -> None:
+    named: set[tuple[str, int, str, bool, str]] = set()
+    for (
+        arch,
+        world_size,
+        dtype,
+        pdl,
+        _experts,
+    ), ranges in union._SPECIALIZATION_RULES.items():
+        named |= {(arch, world_size, dtype, pdl, spec) for _lo, _hi, spec in ranges}
+    for arch, world_size, dtype, pdl, spec in union.ROUTES:
+        if spec == _class_program(arch, world_size, dtype, pdl):
+            continue
+        assert (arch, world_size, dtype, pdl, spec) in named, (
+            arch,
+            world_size,
+            dtype,
+            pdl,
+            spec,
+        )
 
 
 def test_exported_architectures_are_sm100_and_sm103() -> None:
     assert tuple(union.ARCHES) == tuple(_ARCHES)
-    capability_arches = {capability: arch for arch, capability in _ARCHES.items()}
-    assert capability_arches == union.ARCH_BY_CAPABILITY
+    assert {
+        capability: arch for arch, capability in _ARCHES.items()
+    } == union.ARCH_BY_CAPABILITY
     assert set(union.exported_arches()) == set(_ARCHES)
     for arch, capability in _ARCHES.items():
         assert union.arch_for_capability(capability) == arch
     assert union.arch_for_capability(_SM120) is None
 
 
-def test_routes_cover_exactly_the_reviewed_specializations() -> None:
-    assert tuple(union.WORLD_SIZES) == _WORLD_SIZES
-    assert {(key[0], key[1]) for key in union.ROUTES} == {
-        (arch, world_size) for arch in _ARCHES for world_size in _WORLD_SIZES
-    }
-    assert {key[2] for key in union.ROUTES} <= set(_DTYPES)
-    assert {key[3] for key in union.ROUTES} <= set(_PDL)
-    assert _route_keys("sm_100a", 4) == _SM100_WS4_ROUTE_KEYS
-    classes = set(union._WIDE_MLP_CLASSES)
-    assert all(len(key) == 4 for key in classes)
-    for arch in _ARCHES:
-        for world_size in _WORLD_SIZES:
-            keys = _route_keys(arch, world_size)
-            for dtype in _DTYPES:
-                for pdl in _PDL:
-                    # Every (dtype, PDL) class has one persistent program for
-                    # unreviewed token counts: generic, or wide_mlp for a
-                    # promoted class (which then exports no generic program).
-                    if (arch, world_size, dtype, pdl) in classes:
-                        assert (arch, world_size, dtype, pdl, _WIDE) in keys
-                        assert (
-                            arch,
-                            world_size,
-                            dtype,
-                            pdl,
-                            union.SPECIALIZATION_GENERIC,
-                        ) not in keys
-                    else:
-                        assert (
-                            arch,
-                            world_size,
-                            dtype,
-                            pdl,
-                            union.SPECIALIZATION_GENERIC,
-                        ) in keys
-            extra = {key[4] for key in keys} - {union.SPECIALIZATION_GENERIC}
-            assert extra <= _EXTRA_SPECIALIZATIONS[(arch, world_size)]
-    for (_arch, world_size, _dtype, pdl, specialization), names in union.ROUTES.items():
-        assert len(names) == world_size
-        launches = [union.MODULES[name]["launch"] for name in names]
-        for launch in launches:
-            assert launch["use_pdl"] is pdl
-            # One route launches every rank the same way.
-            assert launch["cooperative"] is launches[0]["cooperative"]
-            assert tuple(launch["block"]) == tuple(launches[0]["block"])
-            assert (
-                launch["persistent_ctas_per_sm"]
-                == launches[0]["persistent_ctas_per_sm"]
-            )
-        if specialization in {union.SPECIALIZATION_GENERIC, _WIDE}:
-            # The persistent programs serve up to 2048 tokens; a one-cluster-per-token
-            # cooperative grid cannot be co-resident at that size.
-            assert launches[0]["cooperative"] is False
-        if world_size == 4:
-            assert launches[0]["cooperative"] is (
-                specialization in _COOPERATIVE_SPECIALIZATIONS
-            )
-        if specialization.endswith(union.SPECIALIZATION_T128_E16_OWNER_FORWARD):
-            # Owner forwarding is rank-specialized: one physical module per rank.
-            assert len(set(names)) == world_size
-        # The single-CTA geometry is a named specialization: exactly the routes
-        # whose name carries the suffix launch one-CTA clusters.
-        single_cta = specialization.endswith(union.SPECIALIZATION_CTA1)
-        for launch in launches:
-            assert (tuple(launch["cluster"])[0] == 1) is single_cta
-
-
 @pytest.mark.parametrize(
     "arch,world_size,dtype_name,pdl,tokens,experts,expected",
     [
-        # SM100 world size 4: bfloat16 keeps generic except its reviewed T=1 (serial
-        # clear) and T=64 rows; float16 is a wide_mlp class for every token count.
-        (
-            "sm_100a",
-            4,
-            "bfloat16",
-            False,
-            1,
-            8,
-            f"{_WIDE}_{union.SPECIALIZATION_T1_E8_SERIAL_CLEAR}_{union.SPECIALIZATION_CTA1}",
-        ),
-        ("sm_100a", 4, "bfloat16", True, 1, 8, union.SPECIALIZATION_GENERIC),
-        ("sm_100a", 4, "bfloat16", True, 64, 8, _WIDE),
-        ("sm_100a", 4, "bfloat16", True, 64, 12, union.SPECIALIZATION_GENERIC),
-        ("sm_100a", 4, "float16", False, 1, 8, _WIDE),
-        (
-            "sm_100a",
-            4,
-            "float16",
-            False,
-            64,
-            12,
-            f"{_WIDE}_{union.SPECIALIZATION_T64_E12_RESIDENT}",
-        ),
-        ("sm_100a", 4, "float16", True, 64, 12, _WIDE),
-        ("sm_100a", 4, "float16", False, 512, 8, _WIDE),
-        (
-            "sm_100a",
-            4,
-            "float16",
-            True,
-            128,
-            16,
-            f"{_WIDE}_{union.SPECIALIZATION_T128_E16_OWNER_FORWARD}",
-        ),
-        ("sm_100a", 4, "bfloat16", False, 128, 16, union.SPECIALIZATION_GENERIC),
-        ("sm_100a", 4, "bfloat16", False, 512, 8, union.SPECIALIZATION_GENERIC),
-        ("sm_100a", 4, "bfloat16", True, 2048, 12, union.SPECIALIZATION_GENERIC),
-        # The world-size-4 reviewed shapes do not leak into other world sizes;
-        # every SM100 two-rank class runs wide_mlp (no generic program) and the
-        # bfloat16 no-PDL T=1 row runs its single-CTA wide_mlp build.
-        ("sm_100a", 2, "bfloat16", False, 1, 8, f"{_WIDE}_{union.SPECIALIZATION_CTA1}"),
-        ("sm_100a", 2, "float16", False, 64, 12, _WIDE),
-        ("sm_100a", 2, "float16", True, 128, 16, _WIDE),
-        ("sm_100a", 2, "bfloat16", True, 2048, 12, _WIDE),
-        ("sm_100a", 2, "bfloat16", True, 512, 8, _WIDE),
-        ("sm_100a", 8, "bfloat16", False, 1, 8, union.SPECIALIZATION_GENERIC),
-        ("sm_100a", 8, "float16", True, 1, 8, union.SPECIALIZATION_GENERIC),
-        ("sm_100a", 8, "float16", False, 2048, 12, union.SPECIALIZATION_GENERIC),
-        ("sm_100a", 8, "bfloat16", True, 2048, 16, union.SPECIALIZATION_GENERIC),
-        # SM103: the T=1 schedule variant is reviewed at every world size and
-        # composes with the world-size-4 serial clear; the SM100 world-size-4
-        # shape specializations apply on SM103 too.
-        ("sm_103a", 2, "bfloat16", False, 1, 8, union.SPECIALIZATION_SM103_T1),
-        (
-            "sm_103a",
-            4,
-            "bfloat16",
-            False,
-            1,
-            8,
-            f"{union.SPECIALIZATION_SM103_T1}_{union.SPECIALIZATION_T1_E8_SERIAL_CLEAR}",
-        ),
-        ("sm_103a", 8, "bfloat16", False, 1, 8, union.SPECIALIZATION_SM103_T1),
-        # SM103 wide_mlp classes (bfloat16 without PDL at two and four ranks, float16 at
-        # four ranks) and reviewed rows inside mixed classes.
-        (
-            "sm_103a",
-            4,
-            "float16",
-            False,
-            64,
-            12,
-            f"{_WIDE}_{union.SPECIALIZATION_T64_E12_RESIDENT}",
-        ),
-        (
-            "sm_103a",
-            4,
-            "float16",
-            True,
-            128,
-            16,
-            f"{_WIDE}_{union.SPECIALIZATION_T128_E16_OWNER_FORWARD}",
-        ),
-        ("sm_103a", 4, "float16", True, 1024, 16, _WIDE),
-        ("sm_103a", 4, "bfloat16", False, 256, 8, _WIDE),
-        ("sm_103a", 4, "bfloat16", True, 256, 12, _WIDE),
-        ("sm_103a", 4, "bfloat16", True, 2048, 12, union.SPECIALIZATION_GENERIC),
-        ("sm_103a", 2, "bfloat16", False, 64, 8, _WIDE),
-        ("sm_103a", 2, "bfloat16", True, 64, 8, _WIDE),
-        ("sm_103a", 2, "bfloat16", True, 128, 16, union.SPECIALIZATION_GENERIC),
-        ("sm_103a", 2, "float16", True, 128, 16, _WIDE),
-        ("sm_103a", 2, "float16", True, 2048, 16, union.SPECIALIZATION_GENERIC),
-        ("sm_103a", 8, "float16", False, 2048, 8, union.SPECIALIZATION_GENERIC),
-        ("sm_103a", 8, "bfloat16", True, 64, 8, union.SPECIALIZATION_GENERIC),
-        # Reviewed SM103 shapes do not leak into SM100 and vice versa.
-        ("sm_100a", 2, "bfloat16", False, 1, 8, f"{_WIDE}_{union.SPECIALIZATION_CTA1}"),
+        # Rendered by the exporter: both ends of every token-range rule, one
+        # token count per class outside its rules, and the reviewed token counts
+        # of the S7 exact-shape decisions (kept rows at their specialization,
+        # dropped rows at their class program).
+        ("sm_100a", 2, "bfloat16", False, 1, 8, "wide_mlp_cta1"),
+        ("sm_100a", 2, "bfloat16", False, 32, 8, "wide_mlp_cta1"),
+        ("sm_100a", 2, "bfloat16", False, 512, 8, "wide_mlp"),
+        ("sm_100a", 2, "bfloat16", True, 192, 12, "pipe2_u4"),
+        ("sm_100a", 2, "bfloat16", True, 256, 12, "pipe2_u4"),
+        ("sm_100a", 2, "bfloat16", True, 384, 12, "pipe2_u4"),
+        ("sm_100a", 2, "bfloat16", True, 512, 8, "wide_mlp"),
+        ("sm_100a", 2, "bfloat16", True, 1536, 12, "pipe2_u4_b5"),
+        ("sm_100a", 2, "bfloat16", True, 2048, 12, "pipe2_u4_b5"),
+        ("sm_100a", 2, "float16", False, 512, 8, "wide_mlp"),
+        ("sm_100a", 2, "float16", False, 1536, 8, "pipe2_u4_b5"),
+        ("sm_100a", 2, "float16", False, 2048, 8, "pipe2_u4_b5"),
+        ("sm_100a", 2, "float16", True, 512, 8, "wide_mlp"),
+        ("sm_100a", 2, "float16", True, 1536, 16, "pipe2_u4_b5"),
+        ("sm_100a", 2, "float16", True, 2048, 16, "pipe2_u4_b5"),
+        ("sm_100a", 4, "bfloat16", False, 1, 8, "wide_mlp_t1_e8_serial_clear_cta1"),
+        ("sm_100a", 4, "bfloat16", False, 32, 8, "wide_mlp_t1_e8_serial_clear_cta1"),
+        ("sm_100a", 4, "bfloat16", False, 96, 16, "clrfirst"),
+        ("sm_100a", 4, "bfloat16", False, 128, 16, "clrfirst"),
+        ("sm_100a", 4, "bfloat16", False, 192, 16, "clrfirst"),
+        ("sm_100a", 4, "bfloat16", False, 512, 8, "generic"),
+        ("sm_100a", 4, "bfloat16", True, 32, 8, "wide_mlp"),
+        ("sm_100a", 4, "bfloat16", True, 64, 8, "wide_mlp"),
+        ("sm_100a", 4, "bfloat16", True, 96, 8, "wide_mlp"),
+        ("sm_100a", 4, "bfloat16", True, 512, 8, "generic"),
+        ("sm_100a", 4, "bfloat16", True, 1536, 12, "pipe2_u4_b5"),
+        ("sm_100a", 4, "bfloat16", True, 2048, 12, "pipe2_u4_b5"),
+        ("sm_100a", 4, "float16", False, 32, 12, "wide_mlp_t64_e12_resident"),
+        ("sm_100a", 4, "float16", False, 64, 12, "wide_mlp_t64_e12_resident"),
+        ("sm_100a", 4, "float16", False, 96, 12, "wide_mlp_t64_e12_resident"),
+        ("sm_100a", 4, "float16", False, 512, 8, "wide_mlp"),
+        ("sm_100a", 4, "float16", False, 1536, 8, "pipe2_u4_b5"),
+        ("sm_100a", 4, "float16", False, 2048, 8, "pipe2_u4_b5"),
+        ("sm_100a", 4, "float16", True, 128, 16, "wide_mlp"),
+        ("sm_100a", 4, "float16", True, 512, 8, "wide_mlp"),
+        ("sm_100a", 4, "float16", True, 1536, 16, "pipe2_u4_b5"),
+        ("sm_100a", 4, "float16", True, 2048, 16, "pipe2_u4_b5"),
+        ("sm_100a", 8, "bfloat16", False, 128, 16, "generic"),
+        ("sm_100a", 8, "bfloat16", True, 32, 8, "sm100_ws8_mid"),
+        ("sm_100a", 8, "bfloat16", True, 64, 8, "sm100_ws8_mid"),
+        ("sm_100a", 8, "bfloat16", True, 96, 8, "sm100_ws8_mid"),
+        ("sm_100a", 8, "bfloat16", True, 512, 8, "generic"),
+        ("sm_100a", 8, "bfloat16", True, 1536, 12, "pipe1_u4_b5"),
+        ("sm_100a", 8, "bfloat16", True, 2048, 12, "pipe1_u4_b5"),
+        ("sm_100a", 8, "float16", False, 64, 12, "generic"),
+        ("sm_100a", 8, "float16", False, 512, 8, "generic"),
+        ("sm_100a", 8, "float16", False, 1536, 8, "pipe1_u4_b5"),
+        ("sm_100a", 8, "float16", False, 2048, 8, "pipe1_u4_b5"),
+        ("sm_100a", 8, "float16", True, 128, 16, "generic"),
+        ("sm_100a", 8, "float16", True, 512, 8, "generic"),
+        ("sm_100a", 8, "float16", True, 1536, 16, "pipe1_u4_b5"),
+        ("sm_100a", 8, "float16", True, 2048, 16, "pipe1_u4_b5"),
+        ("sm_103a", 2, "bfloat16", False, 1, 8, "wide_mlp"),
+        ("sm_103a", 2, "bfloat16", False, 512, 8, "wide_mlp"),
+        ("sm_103a", 2, "bfloat16", True, 32, 8, "wide_mlp"),
+        ("sm_103a", 2, "bfloat16", True, 64, 8, "wide_mlp"),
+        ("sm_103a", 2, "bfloat16", True, 96, 8, "wide_mlp"),
+        ("sm_103a", 2, "bfloat16", True, 512, 8, "generic"),
+        ("sm_103a", 2, "bfloat16", True, 1536, 12, "pipe1_u4_b5"),
+        ("sm_103a", 2, "bfloat16", True, 2048, 12, "pipe1_u4_b5"),
+        ("sm_103a", 2, "float16", False, 512, 8, "generic"),
+        ("sm_103a", 2, "float16", False, 1536, 8, "pipe1_u4_b5"),
+        ("sm_103a", 2, "float16", False, 2048, 8, "pipe1_u4_b5"),
+        ("sm_103a", 2, "float16", True, 96, 16, "wide_mlp"),
+        ("sm_103a", 2, "float16", True, 128, 16, "wide_mlp"),
+        ("sm_103a", 2, "float16", True, 192, 16, "wide_mlp"),
+        ("sm_103a", 2, "float16", True, 512, 8, "generic"),
+        ("sm_103a", 2, "float16", True, 1536, 16, "pipe1_u4_b5"),
+        ("sm_103a", 2, "float16", True, 2048, 16, "pipe1_u4_b5"),
+        ("sm_103a", 4, "bfloat16", False, 1, 8, "sm103_t1_t1_e8_serial_clear"),
+        ("sm_103a", 4, "bfloat16", False, 32, 8, "sm103_t1_t1_e8_serial_clear"),
+        ("sm_103a", 4, "bfloat16", False, 512, 8, "wide_mlp"),
+        ("sm_103a", 4, "bfloat16", True, 32, 8, "wide_mlp"),
+        ("sm_103a", 4, "bfloat16", True, 64, 8, "wide_mlp"),
+        ("sm_103a", 4, "bfloat16", True, 96, 8, "wide_mlp"),
+        ("sm_103a", 4, "bfloat16", True, 192, 12, "wide_mlp"),
+        ("sm_103a", 4, "bfloat16", True, 256, 12, "wide_mlp"),
+        ("sm_103a", 4, "bfloat16", True, 384, 12, "wide_mlp"),
+        ("sm_103a", 4, "bfloat16", True, 512, 8, "generic"),
+        ("sm_103a", 4, "bfloat16", True, 1536, 12, "pipe2_u4_b5"),
+        ("sm_103a", 4, "bfloat16", True, 2048, 12, "pipe2_u4_b5"),
+        ("sm_103a", 4, "float16", False, 32, 12, "wide_mlp_t64_e12_resident"),
+        ("sm_103a", 4, "float16", False, 64, 12, "wide_mlp_t64_e12_resident"),
+        ("sm_103a", 4, "float16", False, 96, 12, "wide_mlp_t64_e12_resident"),
+        ("sm_103a", 4, "float16", False, 512, 8, "wide_mlp"),
+        ("sm_103a", 4, "float16", False, 1536, 8, "pipe2_u4_b5"),
+        ("sm_103a", 4, "float16", False, 2048, 8, "pipe2_u4_b5"),
+        ("sm_103a", 4, "float16", True, 128, 16, "wide_mlp"),
+        ("sm_103a", 4, "float16", True, 512, 8, "wide_mlp"),
+        ("sm_103a", 4, "float16", True, 1536, 16, "pipe2_u4_b5"),
+        ("sm_103a", 4, "float16", True, 2048, 16, "pipe2_u4_b5"),
+        ("sm_103a", 8, "bfloat16", False, 1, 8, "sm103_t1"),
+        ("sm_103a", 8, "bfloat16", False, 32, 8, "sm103_t1"),
+        ("sm_103a", 8, "bfloat16", False, 96, 16, "push_g"),
+        ("sm_103a", 8, "bfloat16", False, 128, 16, "push_g"),
+        ("sm_103a", 8, "bfloat16", False, 192, 8, "pipe1"),
+        ("sm_103a", 8, "bfloat16", False, 192, 16, "push_g"),
+        ("sm_103a", 8, "bfloat16", False, 256, 8, "pipe1"),
+        ("sm_103a", 8, "bfloat16", False, 384, 8, "pipe1"),
+        ("sm_103a", 8, "bfloat16", False, 512, 8, "generic"),
+        ("sm_103a", 8, "bfloat16", True, 32, 8, "push_g"),
+        ("sm_103a", 8, "bfloat16", True, 64, 8, "push_g"),
+        ("sm_103a", 8, "bfloat16", True, 96, 8, "push_g"),
+        ("sm_103a", 8, "bfloat16", True, 256, 12, "generic"),
+        ("sm_103a", 8, "bfloat16", True, 512, 8, "generic"),
+        ("sm_103a", 8, "bfloat16", True, 1536, 12, "pipe1_u4_b5"),
+        ("sm_103a", 8, "bfloat16", True, 2048, 12, "pipe1_u4_b5"),
+        ("sm_103a", 8, "float16", False, 32, 12, "push_g"),
+        ("sm_103a", 8, "float16", False, 64, 12, "push_g"),
+        ("sm_103a", 8, "float16", False, 96, 12, "push_g"),
+        ("sm_103a", 8, "float16", False, 512, 8, "generic"),
+        ("sm_103a", 8, "float16", False, 1536, 8, "pipe1_u4_b5"),
+        ("sm_103a", 8, "float16", False, 2048, 8, "pipe1_u4_b5"),
+        ("sm_103a", 8, "float16", True, 96, 16, "push_g"),
+        ("sm_103a", 8, "float16", True, 128, 16, "push_g"),
+        ("sm_103a", 8, "float16", True, 192, 16, "push_g"),
+        ("sm_103a", 8, "float16", True, 512, 8, "generic"),
+        ("sm_103a", 8, "float16", True, 1536, 16, "pipe1_u4_b5"),
+        ("sm_103a", 8, "float16", True, 2048, 16, "pipe1_u4_b5"),
     ],
 )
 def test_select_specialization_rules(
@@ -359,7 +310,7 @@ def test_select_specialization_rules(
         union.select_specialization(arch, world_size, dtype_name, pdl, tokens, experts)
         == expected
     )
-    names = union.route_module_names(
+    key, route = union.route_for(
         arch=arch,
         world_size=world_size,
         dtype_name=dtype_name,
@@ -367,96 +318,64 @@ def test_select_specialization_rules(
         token_num=tokens,
         active_experts=experts,
     )
-    assert names == union.ROUTES[(arch, world_size, dtype_name, pdl, expected)]
-    assert len(names) == world_size
-    assert (
-        union.route_module_name(
-            arch=arch,
-            world_size=world_size,
-            dtype_name=dtype_name,
-            launch_with_pdl=pdl,
-            token_num=tokens,
-            active_experts=experts,
-            world_rank=world_size - 1,
-        )
-        == names[world_size - 1]
-    )
+    assert key == (arch, world_size, dtype_name, pdl, expected)
+    assert route is union.ROUTES[key]
+    for rank in range(world_size):
+        name = union.route_kernel(route, rank, world_size)
+        assert union.KERNELS[name].world_size == world_size
+        assert union.KERNELS[name].dtype == dtype_name
     with pytest.raises(ValueError):
-        union.route_module_name(
-            arch=arch,
-            world_size=world_size,
-            dtype_name=dtype_name,
-            launch_with_pdl=pdl,
-            token_num=tokens,
-            active_experts=experts,
-            world_rank=world_size,
-        )
+        union.route_kernel(route, world_size, world_size)
 
 
-@pytest.mark.parametrize("world_size", _WORLD_SIZES)
-def test_sm100_ws8_mid_rows_are_exactly_the_reviewed_ones(world_size: int) -> None:
-    mid = {
-        key
-        for key, kind in union._REVIEWED_SPECIALIZATIONS.items()
-        if kind == union.SPECIALIZATION_SM100_WS8_MID
-    }
-    if world_size != 8:
-        assert not {key for key in mid if key[1] == world_size}
-        return
-    assert mid == {
-        ("sm_100a", 8, "bfloat16", True, 64, 8),
-        ("sm_100a", 8, "float16", False, 64, 12),
-        ("sm_100a", 8, "bfloat16", False, 128, 16),
-        ("sm_100a", 8, "float16", True, 128, 16),
-    }
+def test_pdl_is_a_launch_flag_not_a_kernel() -> None:
+    """The same kernel serves both launch_with_pdl values of a route."""
+    for (arch, world_size, dtype, pdl, spec), route in union.ROUTES.items():
+        twin = union.ROUTES.get((arch, world_size, dtype, not pdl, spec))
+        if twin is not None:
+            assert _kernel_names(twin) == _kernel_names(route)
 
 
 @pytest.mark.parametrize("world_size", _WORLD_SIZES)
 @pytest.mark.parametrize("capability", sorted(_ARCHES.values()))
-def test_route_scope_is_sm100_sm103_with_allreduce_output(
+def test_route_scope_is_sm100_sm103_at_world_sizes_2_4_8(
     world_size: int, capability: tuple[int, int]
 ) -> None:
-    assert union.route_applies(
-        world_size=world_size, device_capability=capability, emit_moe_allreduce=True
-    )
-    assert not union.route_applies(
-        world_size=world_size, device_capability=capability, emit_moe_allreduce=False
-    )
-    assert not union.route_applies(
-        world_size=world_size, device_capability=_SM120, emit_moe_allreduce=True
-    )
+    # The all-reduce output is runtime-optional in every union kernel, so the
+    # scope is the exported (architecture, world size) set alone.
+    assert union.route_applies(world_size=world_size, device_capability=capability)
+    assert not union.route_applies(world_size=world_size, device_capability=_SM120)
 
 
 @pytest.mark.parametrize("world_size", (1, 3, 16))
 def test_route_scope_rejects_unexported_world_sizes(world_size: int) -> None:
     for arch, capability in _ARCHES.items():
         assert not union.route_applies(
-            world_size=world_size, device_capability=capability, emit_moe_allreduce=True
+            world_size=world_size, device_capability=capability
         )
         with pytest.raises(ValueError):
-            union.route_module_names(
+            union.route_for(
                 arch=arch,
                 world_size=world_size,
                 dtype_name="float16",
                 launch_with_pdl=False,
-                token_num=1,
+                token_num=64,
                 active_experts=8,
             )
 
 
 def test_launch_grid_rule() -> None:
-    # SM-bounded persistent grid at one CTA per SM, then at k resident CTAs per SM
-    # (four-CTA clusters).
     assert union.launch_grid_x(1, False, 148, 1, 4) == 4
     assert union.launch_grid_x(2048, False, 148, 1, 4) == 148
     assert union.launch_grid_x(1, False, 148, 4, 4) == 4
     assert union.launch_grid_x(64, False, 148, 4, 4) == 256
     assert union.launch_grid_x(2048, False, 148, 4, 4) == 592
     assert union.launch_grid_x(2048, False, 148, 5, 4) == 740
-    # Single-CTA modules (the reviewed T=1 rows) launch one CTA per token.
+    assert union.launch_grid_x(2048, False, 148, 5, 4, 175) == 700
+    assert union.launch_grid_x(64, False, 148, 5, 4, 175) == 256
+    assert union.launch_grid_x(2048, False, 148, 4, 4, 175) == 592
     assert union.launch_grid_x(1, False, 148, 1, 1) == 1
     assert union.launch_grid_x(64, False, 148, 1, 1) == 64
-    # Resident-grid (cooperative) modules launch one cluster per token.
     assert union.launch_grid_x(64, True, 148, 1, 4) == 256
     assert union.launch_grid_x(128, True, 148, 1, 4) == 512
     with pytest.raises(ValueError):
@@ -467,77 +386,68 @@ def test_launch_grid_rule() -> None:
         union.launch_grid_x(64, False, 148, 0, 4)
     with pytest.raises(ValueError):
         union.launch_grid_x(64, False, 148, 1, 0)
-    for record in union.MODULES.values():
-        launch = record["launch"]
-        cluster_ctas = int(launch["cluster"][0])
+    with pytest.raises(ValueError):
+        union.launch_grid_x(64, False, 148, 5, 4, 0)
+    with pytest.raises(ValueError):
+        union.launch_grid_x(64, True, 148, 1, 4, 175)
+    for route in union.ROUTES.values():
+        cluster = union.KERNELS[_kernel_names(route)[0]].cluster
         grid = union.launch_grid_x(
             2048,
-            launch["cooperative"],
+            route.cooperative,
             148,
-            launch["persistent_ctas_per_sm"],
-            cluster_ctas,
+            route.persistent_ctas_per_sm,
+            cluster,
+            route.max_persistent_clusters,
         )
-        assert grid % cluster_ctas == 0 and grid > 0
+        assert grid > 0 and grid % cluster == 0
 
 
-@pytest.mark.parametrize("world_size", _WORLD_SIZES)
-def test_workspace_pointer_registry_round_trip(world_size: int) -> None:
-    entries = 3 * world_size + 1
-    table = torch.arange(1, entries + 1, dtype=torch.int64)
-    pointers = [int(value) * 4096 for value in range(1, entries + 1)]
-    union.register_workspace_pointers(table, pointers)
-    assert union.workspace_pointers(table, world_size) == tuple(pointers)
-    unregistered = torch.arange(101, 101 + entries, dtype=torch.int64)
-    assert union.workspace_pointers(unregistered, world_size) == tuple(
-        range(101, 101 + entries)
-    )
+def test_compile_flags_bind_the_launcher_to_one_kernel_per_architecture() -> None:
+    for name, kernel in union.KERNELS.items():
+        defines = union.kernel_defines(name)
+        assert f"-DCAKE_UNION_KERNEL={union.kernel_symbol(name)}" in defines
+        assert f"-DCAKE_UNION_WORLD_SIZE={kernel.world_size}" in defines
+        assert f"-DCAKE_UNION_BLOCK={kernel.block}" in defines
+        assert f"-DCAKE_UNION_CLUSTER={kernel.cluster}" in defines
+        ctype = "__half" if kernel.dtype == "float16" else "__nv_bfloat16"
+        assert f"-DCAKE_UNION_DTYPE={ctype}" in defines
+    name = next(iter(union.KERNELS))
+    for arch, gencode in (
+        ("sm_100a", "-gencode=arch=compute_100a,code=sm_100a"),
+        ("sm_103a", "-gencode=arch=compute_103a,code=sm_103a"),
+    ):
+        flags = union.compile_flags(name, arch)
+        assert gencode in flags and "--use_fast_math" in flags
+        assert set(union.kernel_defines(name)) <= set(flags)
     with pytest.raises(ValueError):
-        union.workspace_pointers(
-            torch.zeros(entries - 1, dtype=torch.int64), world_size
-        )
-    with pytest.raises(ValueError):
-        union.register_workspace_pointers(table, pointers[:-1])
-
-
-def _arguments(world_size: int, *, emit_allreduce: bool) -> dict:
-    tokens, hidden, experts = 1, 8, 2
-    dtype = torch.float16
-    return {
-        "world_size": world_size,
-        "world_rank": 1,
-        "token_num": tokens,
-        "hidden_dim": hidden,
-        "workspace_ptrs": torch.zeros(3 * world_size + 1, dtype=torch.int64),
-        "launch_with_pdl": True,
-        "residual_in": torch.zeros(tokens, hidden, dtype=dtype),
-        "rms_gamma": torch.ones(hidden, dtype=dtype),
-        "rms_eps": 1e-5,
-        "scale_factor": 1.0,
-        "moe_reduction_device_num_experts": experts,
-        "moe_reduction_scale_input": torch.ones(experts, tokens, dtype=torch.float32),
-        "moe_reduction_active_experts_token_input": torch.zeros(
-            experts, tokens, hidden, dtype=dtype
-        ),
-        "moe_reduction_token_input": torch.zeros(tokens, hidden, dtype=dtype),
-        "layout_code": None,
-        "moe_allreduce_out": torch.empty(tokens, hidden, dtype=dtype)
-        if emit_allreduce
-        else None,
-        "residual_out": torch.empty(tokens, hidden, dtype=dtype),
-        "norm_out": torch.empty(tokens, hidden, dtype=dtype),
-        "quant_out": None,
-        "scale_out": None,
-        "weight_bias": 1.0,
-    }
+        union.compile_flags(name, "sm_120a")
 
 
 def _union_arguments(world_size: int) -> dict:
-    """The public arguments narrowed to ``run_cake_moe_allreduce_union``'s signature."""
-
-    arguments = _arguments(world_size, emit_allreduce=True)
-    for public_only in ("layout_code", "quant_out", "scale_out"):
-        del arguments[public_only]
-    return arguments
+    tokens = 4
+    hidden = union.HIDDEN_DIM
+    activation = torch.empty(2, tokens, hidden, dtype=torch.float16)
+    return dict(
+        world_size=world_size,
+        world_rank=0,
+        token_num=tokens,
+        hidden_dim=hidden,
+        workspace_ptrs=torch.zeros(3 * world_size + 1, dtype=torch.int64),
+        launch_with_pdl=False,
+        residual_in=activation[0],
+        rms_gamma=activation[0, 0],
+        rms_eps=1e-6,
+        scale_factor=1.0,
+        moe_reduction_device_num_experts=2,
+        moe_reduction_scale_input=torch.empty(2, tokens),
+        moe_reduction_active_experts_token_input=activation,
+        moe_reduction_token_input=activation[1],
+        moe_allreduce_out=torch.empty_like(activation[0]),
+        residual_out=torch.empty_like(activation[0]),
+        norm_out=torch.empty_like(activation[0]),
+        weight_bias=None,
+    )
 
 
 def test_run_rejects_unexported_world_sizes_before_touching_the_device() -> None:
@@ -545,13 +455,111 @@ def test_run_rejects_unexported_world_sizes_before_touching_the_device() -> None
         union.run_cake_moe_allreduce_union(backend="cake", **_union_arguments(16))
     with pytest.raises(ValueError):
         union.run_cake_moe_allreduce_union(backend="trtllm", **_union_arguments(4))
+    arguments = _union_arguments(4)
+    arguments["workspace_ptrs"] = torch.zeros(3, dtype=torch.int64)
+    with pytest.raises(ValueError):
+        union.run_cake_moe_allreduce_union(backend="cake", **arguments)
+
+
+def test_run_passes_an_absent_allreduce_output_to_the_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``moe_allreduce_out=None`` reaches the launcher as the loader-owned scratch tensor (every
+    union kernel stores the all-reduce output); the public ``scale_factor`` is not a launcher
+    argument (the union kernels emit no quant output)."""
+
+    (arch, world_size, dtype_name, pdl, _spec), route = sorted(union.ROUTES.items())[0]
+    dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[dtype_name]
+    runs: list[tuple] = []
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(union, "_device_arch", lambda index: arch)
+    monkeypatch.setattr(union, "_sm_count", lambda index: 148)
+    monkeypatch.setattr(
+        union,
+        "route_for",
+        lambda **kwargs: ((arch, world_size, dtype_name, pdl, _spec), route),
+    )
+    monkeypatch.setattr(
+        union,
+        "load",
+        lambda name, arch: SimpleNamespace(run=lambda *args: runs.append(args)),
+    )
+    tokens = 4
+    activation = torch.empty(2, tokens, union.HIDDEN_DIM, dtype=dtype)
+    arguments = dict(
+        backend="cake",
+        world_size=world_size,
+        world_rank=0,
+        token_num=tokens,
+        hidden_dim=union.HIDDEN_DIM,
+        workspace_ptrs=torch.zeros(3 * world_size + 1, dtype=torch.int64),
+        launch_with_pdl=pdl,
+        residual_in=activation[0],
+        rms_gamma=activation[0, 0],
+        rms_eps=1e-6,
+        scale_factor=1.0,
+        moe_reduction_device_num_experts=2,
+        moe_reduction_scale_input=torch.empty(2, tokens),
+        moe_reduction_active_experts_token_input=activation,
+        moe_reduction_token_input=activation[1],
+        moe_allreduce_out=None,
+        residual_out=torch.empty_like(activation[0]),
+        norm_out=torch.empty_like(activation[0]),
+        weight_bias=None,
+    )
+
+    union.run_cake_moe_allreduce_union(**arguments)
+    allreduce_out = torch.empty_like(activation[0])
+    union.run_cake_moe_allreduce_union(
+        **{**arguments, "moe_allreduce_out": allreduce_out}
+    )
+
+    assert len(runs) == 2
+    absent, present = runs
+    assert present[5] is allreduce_out
+    scratch = union.scratch_allreduce_output(activation.device, dtype, tokens)
+    assert absent[5].data_ptr() == scratch.data_ptr() and absent[5].shape == (
+        tokens,
+        union.HIDDEN_DIM,
+    )
+    assert absent[6] is arguments["residual_out"] and absent[7] is arguments["norm_out"]
+    assert absent[8] is arguments["workspace_ptrs"]
+    assert len(absent) == 17 and 1.0 not in absent[9:]
+
+
+def _arguments(world_size: int, *, emit_allreduce: bool) -> dict:
+    tokens = 4
+    hidden = union.HIDDEN_DIM
+    activation = torch.empty(2, tokens, hidden, dtype=torch.float16)
+    return dict(
+        world_size=world_size,
+        world_rank=1,
+        token_num=tokens,
+        hidden_dim=hidden,
+        workspace_ptrs=torch.zeros(3 * world_size + 1, dtype=torch.int64),
+        launch_with_pdl=True,
+        residual_in=activation[0],
+        rms_gamma=activation[0, 0],
+        rms_eps=1e-6,
+        scale_factor=1.0,
+        moe_reduction_device_num_experts=2,
+        moe_reduction_scale_input=torch.empty(2, tokens),
+        moe_reduction_active_experts_token_input=activation,
+        moe_reduction_token_input=activation[1],
+        layout_code=None,
+        moe_allreduce_out=torch.empty_like(activation[0]) if emit_allreduce else None,
+        residual_out=torch.empty_like(activation[0]),
+        norm_out=torch.empty_like(activation[0]),
+        quant_out=None,
+        scale_out=None,
+        weight_bias=1.0,
+    )
 
 
 def _isolate_backends(
     monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
-) -> tuple[list, list]:
+) -> list[dict]:
     union_calls: list[dict] = []
-    legacy_calls: list[tuple] = []
     monkeypatch.setattr(trtllm_ar, "_validate_cake_moe_allreduce", lambda **kwargs: 0)
     monkeypatch.setattr(
         torch.cuda, "get_device_capability", lambda device=None: capability
@@ -563,17 +571,10 @@ def _isolate_backends(
     )
     monkeypatch.setattr(
         trtllm_ar,
-        "get_cake_moe_allreduce_module",
-        lambda device_index: SimpleNamespace(
-            run_reduction=lambda *args: legacy_calls.append(args)
-        ),
-    )
-    monkeypatch.setattr(
-        trtllm_ar,
         "get_trtllm_comm_module",
         lambda: pytest.fail("TRT-LLM module must not load for backend='cake'"),
     )
-    return union_calls, legacy_calls
+    return union_calls
 
 
 @pytest.mark.parametrize("world_size", _WORLD_SIZES)
@@ -581,12 +582,11 @@ def _isolate_backends(
 def test_cake_backend_routes_sm100_sm103_with_allreduce_output_to_the_union(
     monkeypatch: pytest.MonkeyPatch, world_size: int, capability: tuple[int, int]
 ) -> None:
-    union_calls, legacy_calls = _isolate_backends(monkeypatch, capability)
+    union_calls = _isolate_backends(monkeypatch, capability)
     arguments = _arguments(world_size, emit_allreduce=True)
 
     trtllm_ar.trtllm_moe_allreduce_fusion(**arguments, backend="cake")
 
-    assert legacy_calls == []
     assert len(union_calls) == 1
     call = union_calls[0]
     assert call["backend"] == "cake"
@@ -598,45 +598,115 @@ def test_cake_backend_routes_sm100_sm103_with_allreduce_output_to_the_union(
     assert call["launch_with_pdl"] is True and call["weight_bias"] == 1.0
 
 
-_LEGACY_SCOPE_CASES = [
-    pytest.param(
-        world_size, capability, False, id=f"tp{world_size}-{arch}-no-allreduce-output"
-    )
-    for world_size in _WORLD_SIZES
-    for arch, capability in _ARCHES.items()
-]
-
-
-@pytest.mark.parametrize("world_size,capability,emit_allreduce", _LEGACY_SCOPE_CASES)
-def test_cake_backend_keeps_the_legacy_bundle_outside_the_union_scope(
-    monkeypatch: pytest.MonkeyPatch,
-    world_size: int,
-    capability: tuple[int, int],
-    emit_allreduce: bool,
+@pytest.mark.parametrize("world_size", _WORLD_SIZES)
+@pytest.mark.parametrize("capability", sorted(_ARCHES.values()))
+def test_cake_backend_routes_calls_without_allreduce_output_to_the_union(
+    monkeypatch: pytest.MonkeyPatch, world_size: int, capability: tuple[int, int]
 ) -> None:
-    union_calls, legacy_calls = _isolate_backends(monkeypatch, capability)
-    arguments = _arguments(world_size, emit_allreduce=emit_allreduce)
+    # A call without ``moe_allreduce_out`` runs the same union kernels; the
+    # loader substitutes its scratch tensor inside ``run_cake_moe_allreduce_union``.
+    union_calls = _isolate_backends(monkeypatch, capability)
+    arguments = _arguments(world_size, emit_allreduce=False)
 
     trtllm_ar.trtllm_moe_allreduce_fusion(**arguments, backend="cake")
 
-    assert union_calls == []
-    assert len(legacy_calls) == 1 and len(legacy_calls[0]) == 18
-    assert legacy_calls[0][0] == world_size
+    assert len(union_calls) == 1
+    call = union_calls[0]
+    assert call["world_size"] == world_size
+    assert call["moe_allreduce_out"] is None
+    assert call["residual_out"] is arguments["residual_out"]
+    assert call["norm_out"] is arguments["norm_out"]
+    assert callable(union.scratch_allreduce_output)
 
 
-@pytest.mark.parametrize("world_size", _WORLD_SIZES)
-def test_workspace_creation_registers_the_pointer_table(
-    monkeypatch: pytest.MonkeyPatch, world_size: int
-) -> None:
-    registered: list[tuple] = []
-    monkeypatch.setattr(
-        union,
-        "register_workspace_pointers",
-        lambda tensor, pointers: registered.append((tensor, tuple(pointers))),
-    )
-    entries = 3 * world_size + 1
-    table = torch.arange(entries, dtype=torch.int64)
-    trtllm_ar.register_cake_moe_allreduce_workspace_pointers(
-        table, list(range(entries))
-    )
-    assert registered == [(table, tuple(range(entries)))]
+def test_scratch_allreduce_output_is_cached_per_device_and_dtype_and_grows() -> None:
+    union._scratch_allreduce_outputs.clear()
+    union._retired_scratch_allreduce_outputs.clear()
+    device = torch.device("cpu")
+    try:
+        first = union.scratch_allreduce_output(device, torch.float16, 4)
+        assert first.shape == (4, union.HIDDEN_DIM)
+        assert first.dtype == torch.float16 and first.is_contiguous()
+        # A smaller request is a view of the same allocation.
+        smaller = union.scratch_allreduce_output(device, torch.float16, 2)
+        assert smaller.data_ptr() == first.data_ptr()
+        assert smaller.shape == (2, union.HIDDEN_DIM) and smaller.is_contiguous()
+        # A larger request grows the cached tensor once (to at least twice the
+        # previous capacity) and retires the replaced tensor instead of freeing it.
+        grown = union.scratch_allreduce_output(device, torch.float16, 5)
+        assert grown.shape == (5, union.HIDDEN_DIM)
+        assert grown.data_ptr() != first.data_ptr()
+        assert (
+            union._scratch_allreduce_outputs[("cpu", None, torch.float16)].shape[0] == 8
+        )
+        assert [t.data_ptr() for t in union._retired_scratch_allreduce_outputs] == [
+            first.data_ptr()
+        ]
+        grown = union.scratch_allreduce_output(device, torch.float16, 8)
+        assert grown.shape == (8, union.HIDDEN_DIM)
+        assert len(union._retired_scratch_allreduce_outputs) == 1
+        assert union.scratch_allreduce_output(device, torch.float16, 8).data_ptr() == (
+            grown.data_ptr()
+        )
+        # Each dtype keeps its own scratch.
+        other = union.scratch_allreduce_output(device, torch.bfloat16, 8)
+        assert other.dtype == torch.bfloat16 and other.data_ptr() != grown.data_ptr()
+        assert set(union._scratch_allreduce_outputs) == {
+            ("cpu", None, torch.float16),
+            ("cpu", None, torch.bfloat16),
+        }
+    finally:
+        union._scratch_allreduce_outputs.clear()
+        union._retired_scratch_allreduce_outputs.clear()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA graph capture needs a GPU"
+)
+def test_scratch_allreduce_output_retains_addresses_recorded_by_captured_graphs() -> (
+    None
+):
+    union._scratch_allreduce_outputs.clear()
+    union._retired_scratch_allreduce_outputs.clear()
+    device = torch.device("cuda", torch.cuda.current_device())
+    try:
+        warm = union.scratch_allreduce_output(device, torch.bfloat16, 4)
+        recorded = warm.data_ptr()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+            # Large enough cache: the capture records the cached tensor's address.
+            captured = union.scratch_allreduce_output(device, torch.bfloat16, 2)
+            assert captured.data_ptr() == recorded
+            captured.fill_(1.0)
+            # Too small: the fresh tensor belongs to the graph's pool and is not cached.
+            private = union.scratch_allreduce_output(device, torch.bfloat16, 64)
+            assert private.data_ptr() != recorded
+        torch.cuda.current_stream().wait_stream(stream)
+        assert (
+            union._scratch_allreduce_outputs[
+                (device.type, device.index, torch.bfloat16)
+            ].data_ptr()
+            == recorded
+        )
+        # An eager call that grows the cache must keep the recorded storage alive.
+        grown = union.scratch_allreduce_output(device, torch.bfloat16, 16)
+        assert grown.data_ptr() != recorded
+        assert [t.data_ptr() for t in union._retired_scratch_allreduce_outputs] == [
+            recorded
+        ]
+        canary = torch.zeros((4, union.HIDDEN_DIM), dtype=torch.bfloat16, device=device)
+        assert canary.data_ptr() != recorded
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.count_nonzero(canary).item() == 0
+    finally:
+        union._scratch_allreduce_outputs.clear()
+        union._retired_scratch_allreduce_outputs.clear()
+
+
+def test_workspace_creation_has_no_pointer_registry() -> None:
+    assert not hasattr(trtllm_ar, "register_cake_moe_allreduce_workspace_pointers")
+    assert not hasattr(union, "register_workspace_pointers")
+    assert not hasattr(union, "workspace_pointers")

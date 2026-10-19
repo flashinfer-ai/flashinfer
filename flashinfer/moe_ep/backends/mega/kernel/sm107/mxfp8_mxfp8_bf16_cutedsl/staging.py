@@ -6,7 +6,11 @@ import torch
 
 
 def _data_dtype(kind: str) -> torch.dtype:
-    return torch.float8_e4m3fn if kind == "mxfp8_e4m3" else torch.float8_e5m2
+    if kind in ("mxfp8_e4m3", "mxfp4_mxfp8"):
+        return torch.float8_e4m3fn
+    if kind == "mxfp8_e5m2":
+        return torch.float8_e5m2
+    raise ValueError(f"unsupported MXFP8 activation kind {kind!r}")
 
 
 def stage_mega_moe_inputs(

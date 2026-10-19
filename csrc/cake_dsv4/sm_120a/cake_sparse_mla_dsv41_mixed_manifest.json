@@ -1,0 +1,1563 @@
+{
+  "arch": "sm_120a",
+  "binding_params": [
+    "q",
+    "kv_cache",
+    "indices",
+    "extra_kv_cache",
+    "extra_indices",
+    "topk_length",
+    "extra_topk_length",
+    "attn_sink",
+    "output",
+    "out_lse",
+    "mid_out",
+    "mid_lse",
+    "page_size",
+    "page_stride_bytes",
+    "extra_page_size",
+    "extra_page_stride_bytes",
+    "chunks_per_block",
+    "decode_body",
+    "merge_body",
+    "hb_major",
+    "sm_scale",
+    "lse_scale",
+    "enable_pdl"
+  ],
+  "candidates_per_chunk": 64,
+  "decode_kernels": [
+    {
+      "dual": false,
+      "heads": 8,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_h8_single_default.cu",
+      "tiles": 1,
+      "variant": "default"
+    },
+    {
+      "dual": true,
+      "heads": 8,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_h8_dual_default.cu",
+      "tiles": 1,
+      "variant": "default"
+    },
+    {
+      "dual": true,
+      "heads": 8,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_h8_dual_ip.cu",
+      "tiles": 1,
+      "variant": "ip"
+    },
+    {
+      "dual": true,
+      "heads": 8,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_pw_h8_fold.cu",
+      "tiles": 1,
+      "variant": "sa+ip"
+    },
+    {
+      "dual": true,
+      "heads": 8,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_pw_h8_fold.cu",
+      "tiles": 1,
+      "variant": "sa+ip+pw"
+    },
+    {
+      "dual": true,
+      "heads": 8,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_lq_el_pw_h8_fold.cu",
+      "tiles": 1,
+      "variant": "sa+lq+el"
+    },
+    {
+      "dual": true,
+      "heads": 8,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_lq_el_pw_h8_fold.cu",
+      "tiles": 1,
+      "variant": "sa+pw+lq+el"
+    },
+    {
+      "dual": true,
+      "heads": 8,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_h8_dual_sa_tl_ip_e2m1_nomul.cu",
+      "tiles": 1,
+      "variant": "sa+tl+ip+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 8,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_h8_dual_sa_tl_ip_ew_ra.cu",
+      "tiles": 1,
+      "variant": "sa+tl+ip+ew+ra"
+    },
+    {
+      "dual": false,
+      "heads": 16,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_h16_single_default.cu",
+      "tiles": 1,
+      "variant": "default"
+    },
+    {
+      "dual": true,
+      "heads": 16,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_h16_dual_default.cu",
+      "tiles": 1,
+      "variant": "default"
+    },
+    {
+      "dual": true,
+      "heads": 16,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_ip_pw_h16_fold.cu",
+      "tiles": 1,
+      "variant": "ip"
+    },
+    {
+      "dual": true,
+      "heads": 16,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_h16_dual_ip_e2m1_nomul.cu",
+      "tiles": 1,
+      "variant": "ip+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 16,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_ip_pw_h16_fold.cu",
+      "tiles": 1,
+      "variant": "ip+pw"
+    },
+    {
+      "dual": true,
+      "heads": 16,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_ra_sa_lq_el_pw_h16_fold.cu",
+      "tiles": 1,
+      "variant": "ra+sa+lq+el+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 16,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_ra_sa_lq_el_pw_h16_fold.cu",
+      "tiles": 1,
+      "variant": "ra+sa+pw+lq+el+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 16,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_pw_h16_fold.cu",
+      "tiles": 1,
+      "variant": "sa+ip"
+    },
+    {
+      "dual": true,
+      "heads": 16,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_pw_h16_fold.cu",
+      "tiles": 1,
+      "variant": "sa+ip+pw"
+    },
+    {
+      "dual": true,
+      "heads": 16,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_lq_el_pw_h16_fold.cu",
+      "tiles": 1,
+      "variant": "sa+lq+el"
+    },
+    {
+      "dual": true,
+      "heads": 16,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_lq_el_pw_h16_fold.cu",
+      "tiles": 1,
+      "variant": "sa+pw+lq+el"
+    },
+    {
+      "dual": true,
+      "heads": 16,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_tl_ip_el_nomul_h16_fold.cu",
+      "tiles": 1,
+      "variant": "sa+tl+ip+el"
+    },
+    {
+      "dual": true,
+      "heads": 16,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_tl_ip_el_nomul_h16_fold.cu",
+      "tiles": 1,
+      "variant": "sa+tl+ip+el+e2m1_nomul"
+    },
+    {
+      "dual": false,
+      "heads": 32,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_single_default_heads_h32_64_96_128_fold.cu",
+      "tiles": 2,
+      "variant": "default"
+    },
+    {
+      "dual": true,
+      "heads": 32,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_default_heads_h32_64_96_128_fold.cu",
+      "tiles": 2,
+      "variant": "default"
+    },
+    {
+      "dual": true,
+      "heads": 32,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_h32_dual_ip.cu",
+      "tiles": 2,
+      "variant": "ip"
+    },
+    {
+      "dual": true,
+      "heads": 32,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_ra_sa_lq_el_pw_h32_fold.cu",
+      "tiles": 2,
+      "variant": "ra+sa+lq+el"
+    },
+    {
+      "dual": true,
+      "heads": 32,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_ra_sa_lq_el_pw_h32_fold.cu",
+      "tiles": 2,
+      "variant": "ra+sa+pw+lq+el"
+    },
+    {
+      "dual": true,
+      "heads": 32,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_el_heads_pw_h32_64_128_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+el+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 32,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_ew_ra_pw_h32_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+ew+ra"
+    },
+    {
+      "dual": true,
+      "heads": 32,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_ew_ra_el_heads_pw_h32_64_128_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+ew+ra+el+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 32,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_el_heads_pw_h32_64_128_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+pw+el+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 32,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_ew_ra_pw_h32_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+pw+ew+ra"
+    },
+    {
+      "dual": true,
+      "heads": 32,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_ew_ra_el_heads_pw_h32_64_128_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+pw+ew+ra+el+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 32,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_lq_el_pw_h32_fold.cu",
+      "tiles": 2,
+      "variant": "sa+lq+el+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 32,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_lq_el_pw_h32_fold.cu",
+      "tiles": 2,
+      "variant": "sa+pw+lq+el+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 32,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_h32_dual_t1.cu",
+      "tiles": 1,
+      "variant": "t1"
+    },
+    {
+      "dual": true,
+      "heads": 32,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_tl_ip_pw_h32_fold.cu",
+      "tiles": 2,
+      "variant": "tl+ip"
+    },
+    {
+      "dual": true,
+      "heads": 32,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_tl_ip_e2f_heads_h32_64_96_128_fold.cu",
+      "tiles": 2,
+      "variant": "tl+ip+e2f"
+    },
+    {
+      "dual": true,
+      "heads": 32,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_h32_dual_tl_ip_e2m1_nomul.cu",
+      "tiles": 2,
+      "variant": "tl+ip+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 32,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_tl_ip_pw_h32_fold.cu",
+      "tiles": 2,
+      "variant": "tl+ip+pw"
+    },
+    {
+      "dual": false,
+      "heads": 48,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_single_default_heads_h48_80_112_fold.cu",
+      "tiles": 2,
+      "variant": "default"
+    },
+    {
+      "dual": true,
+      "heads": 48,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_default_heads_h48_80_112_fold.cu",
+      "tiles": 2,
+      "variant": "default"
+    },
+    {
+      "dual": true,
+      "heads": 48,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_tl_ip_e2f_heads_h48_80_112_fold.cu",
+      "tiles": 2,
+      "variant": "tl+ip+e2f"
+    },
+    {
+      "dual": false,
+      "heads": 64,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_single_default_heads_h32_64_96_128_fold.cu",
+      "tiles": 2,
+      "variant": "default"
+    },
+    {
+      "dual": false,
+      "heads": 64,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_single_ip_pw_h64_fold.cu",
+      "tiles": 2,
+      "variant": "ip"
+    },
+    {
+      "dual": false,
+      "heads": 64,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_single_ip_pw_h64_fold.cu",
+      "tiles": 2,
+      "variant": "ip+pw"
+    },
+    {
+      "dual": false,
+      "heads": 64,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_single_lq_t1_pw_h64_fold.cu",
+      "tiles": 1,
+      "variant": "lq+t1"
+    },
+    {
+      "dual": false,
+      "heads": 64,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_single_lq_t1_pw_h64_fold.cu",
+      "tiles": 1,
+      "variant": "pw+lq+t1"
+    },
+    {
+      "dual": false,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_single_sa_lq_t1_pw_h64_fold.cu",
+      "tiles": 1,
+      "variant": "sa+lq+t1"
+    },
+    {
+      "dual": false,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_single_sa_lq_t1_pw_h64_fold.cu",
+      "tiles": 1,
+      "variant": "sa+pw+lq+t1"
+    },
+    {
+      "dual": false,
+      "heads": 64,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_h64_single_t1.cu",
+      "tiles": 1,
+      "variant": "t1"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_default_heads_h32_64_96_128_fold.cu",
+      "tiles": 2,
+      "variant": "default"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_ip_el_pw_h64_fold.cu",
+      "tiles": 2,
+      "variant": "ip+el"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_ip_el_pw_h64_fold.cu",
+      "tiles": 2,
+      "variant": "ip+pw+el"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_lq_el_pw_h64_fold.cu",
+      "tiles": 2,
+      "variant": "lq+el"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_lq_el_pw_h64_fold.cu",
+      "tiles": 2,
+      "variant": "pw+lq+el"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_pw_h64_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_el_pw_h64_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+el"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_el_heads_pw_h32_64_128_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+el+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_ew_ra_pw_h64_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+ew+ra+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_ew_ra_el_heads_pw_h32_64_128_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+ew+ra+el+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_pw_h64_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+pw+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_el_pw_h64_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+pw+el"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_el_heads_pw_h32_64_128_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+pw+el+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_ew_ra_pw_h64_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+pw+ew+ra+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_ew_ra_el_heads_pw_h32_64_128_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+pw+ew+ra+el+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_lq_t1_pw_nomul_h64_fold.cu",
+      "tiles": 1,
+      "variant": "sa+lq+t1"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_lq_t1_pw_nomul_h64_fold.cu",
+      "tiles": 1,
+      "variant": "sa+lq+t1+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_lq_t1_el_ew_ra_pw_h64_fold.cu",
+      "tiles": 1,
+      "variant": "sa+lq+t1+el+ew+ra"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_lq_t1_pw_nomul_h64_fold.cu",
+      "tiles": 1,
+      "variant": "sa+pw+lq+t1"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_lq_t1_pw_nomul_h64_fold.cu",
+      "tiles": 1,
+      "variant": "sa+pw+lq+t1+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_lq_t1_el_ew_ra_pw_h64_fold.cu",
+      "tiles": 1,
+      "variant": "sa+pw+lq+t1+el+ew+ra"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_h64_dual_sa_tl_ip_el_e2m1_nomul.cu",
+      "tiles": 2,
+      "variant": "sa+tl+ip+el+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_h64_dual_tl_ip.cu",
+      "tiles": 2,
+      "variant": "tl+ip"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_tl_ip_e2f_heads_h32_64_96_128_fold.cu",
+      "tiles": 2,
+      "variant": "tl+ip+e2f"
+    },
+    {
+      "dual": false,
+      "heads": 80,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_single_default_heads_h48_80_112_fold.cu",
+      "tiles": 2,
+      "variant": "default"
+    },
+    {
+      "dual": true,
+      "heads": 80,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_default_heads_h48_80_112_fold.cu",
+      "tiles": 2,
+      "variant": "default"
+    },
+    {
+      "dual": true,
+      "heads": 80,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_tl_ip_e2f_heads_h48_80_112_fold.cu",
+      "tiles": 2,
+      "variant": "tl+ip+e2f"
+    },
+    {
+      "dual": false,
+      "heads": 96,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_single_default_heads_h32_64_96_128_fold.cu",
+      "tiles": 2,
+      "variant": "default"
+    },
+    {
+      "dual": true,
+      "heads": 96,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_default_heads_h32_64_96_128_fold.cu",
+      "tiles": 2,
+      "variant": "default"
+    },
+    {
+      "dual": true,
+      "heads": 96,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_tl_ip_e2f_heads_h32_64_96_128_fold.cu",
+      "tiles": 2,
+      "variant": "tl+ip+e2f"
+    },
+    {
+      "dual": false,
+      "heads": 112,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_single_default_heads_h48_80_112_fold.cu",
+      "tiles": 2,
+      "variant": "default"
+    },
+    {
+      "dual": true,
+      "heads": 112,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_default_heads_h48_80_112_fold.cu",
+      "tiles": 2,
+      "variant": "default"
+    },
+    {
+      "dual": true,
+      "heads": 112,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_tl_ip_e2f_heads_h48_80_112_fold.cu",
+      "tiles": 2,
+      "variant": "tl+ip+e2f"
+    },
+    {
+      "dual": false,
+      "heads": 128,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_single_default_heads_h32_64_96_128_fold.cu",
+      "tiles": 2,
+      "variant": "default"
+    },
+    {
+      "dual": true,
+      "heads": 128,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_default_heads_h32_64_96_128_fold.cu",
+      "tiles": 2,
+      "variant": "default"
+    },
+    {
+      "dual": true,
+      "heads": 128,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_ip_pw_h128_fold.cu",
+      "tiles": 2,
+      "variant": "ip+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 128,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_ip_pw_h128_fold.cu",
+      "tiles": 2,
+      "variant": "ip+pw+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 128,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_pw_nomul_h128_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip"
+    },
+    {
+      "dual": true,
+      "heads": 128,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_pw_nomul_h128_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 128,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_el_heads_pw_h32_64_128_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+el+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 128,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_ew_ra_el_heads_pw_h32_64_128_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+ew+ra+el+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 128,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_pw_nomul_h128_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+pw"
+    },
+    {
+      "dual": true,
+      "heads": 128,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_pw_nomul_h128_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+pw+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 128,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_el_heads_pw_h32_64_128_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+pw+el+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 128,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_ew_ra_el_heads_pw_h32_64_128_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+pw+ew+ra+el+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 128,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_tl_ip_e2f_heads_h32_64_96_128_fold.cu",
+      "tiles": 2,
+      "variant": "tl+ip+e2f"
+    }
+  ],
+  "decode_params": [
+    "q",
+    "kv_cache",
+    "indices",
+    "extra_kv_cache",
+    "extra_indices",
+    "topk_length",
+    "extra_topk_length",
+    "attn_sink",
+    "output",
+    "out_lse",
+    "mid_out",
+    "mid_lse",
+    "topk",
+    "extra_topk",
+    "page_size",
+    "page_stride_bytes",
+    "extra_page_size",
+    "extra_page_stride_bytes",
+    "scratch_split_stride",
+    "chunks_per_block",
+    "sm_scale",
+    "lse_scale",
+    "write_direct",
+    "hb_major"
+  ],
+  "dispatch": {
+    "fallback_dual_two_tile_variant": "tl+ip+e2f",
+    "pow2_page_only_parts": [
+      "pw"
+    ],
+    "rules": [
+      {
+        "buckets": {
+          "t32": "sa+pw+lq+t1+mo2",
+          "t8": "ip+pw"
+        },
+        "dual": false,
+        "heads": 64,
+        "ragged": false,
+        "sm_count": 48
+      },
+      {
+        "buckets": {
+          "t128": "ip",
+          "t32": "ip",
+          "t8": "sa+tl+ip+ew+ra"
+        },
+        "dual": true,
+        "heads": 8,
+        "ragged": false,
+        "sm_count": 48
+      },
+      {
+        "buckets": {
+          "t128": "ip",
+          "t32": "ip+pw",
+          "t8": "sa+tl+ip+el"
+        },
+        "dual": true,
+        "heads": 16,
+        "ragged": false,
+        "sm_count": 48
+      },
+      {
+        "buckets": {
+          "t128": "tl+ip+pw",
+          "t32": "ip",
+          "t8": "sa+ip+pw+el+e2m1_nomul+mo2"
+        },
+        "dual": true,
+        "heads": 32,
+        "ragged": false,
+        "sm_count": 48
+      },
+      {
+        "buckets": {
+          "t1": "sa+pw+lq+t1+e2m1_nomul",
+          "t128": "sa+ip+pw+e2m1_nomul",
+          "t32": "tl+ip",
+          "t64": "sa+ip+pw+e2m1_nomul",
+          "t8": "ip+pw+el"
+        },
+        "dual": true,
+        "heads": 64,
+        "ragged": false,
+        "sm_count": 48
+      },
+      {
+        "buckets": {
+          "t128": "sa+ip+pw+e2m1_nomul",
+          "t32": "sa+ip+pw+e2m1_nomul",
+          "t8": "sa+ip+pw"
+        },
+        "dual": true,
+        "heads": 128,
+        "ragged": false,
+        "sm_count": 48
+      },
+      {
+        "buckets": {
+          "t128": "sa+pw+lq+t1",
+          "t32": "t1",
+          "t8": "pw+lq+t1"
+        },
+        "dual": false,
+        "heads": 64,
+        "ragged": false,
+        "sm_count": 170
+      },
+      {
+        "buckets": {
+          "t128": "sa+tl+ip+e2m1_nomul",
+          "t32": "ip+mo2",
+          "t8": "sa+pw+lq+el+mo2"
+        },
+        "dual": true,
+        "heads": 8,
+        "ragged": false,
+        "sm_count": 170
+      },
+      {
+        "buckets": {
+          "t128": "sa+tl+ip+el+e2m1_nomul+mo2",
+          "t32": "ip+e2m1_nomul",
+          "t8": "sa+pw+lq+el+mo2"
+        },
+        "dual": true,
+        "heads": 16,
+        "ragged": false,
+        "sm_count": 170
+      },
+      {
+        "buckets": {
+          "t128": "sa+ip+pw+ew+ra+el+e2m1_nomul+mo2",
+          "t32": "tl+ip+e2m1_nomul",
+          "t8": "t1"
+        },
+        "dual": true,
+        "heads": 32,
+        "ragged": false,
+        "sm_count": 170
+      },
+      {
+        "buckets": {
+          "t1": "sa+pw+lq+t1+mo2",
+          "t128": "sa+ip+pw+ew+ra+el+e2m1_nomul",
+          "t32": "sa+ip+pw+ew+ra+el+e2m1_nomul",
+          "t64": "sa+ip+pw+e2m1_nomul",
+          "t8": "pw+lq+el"
+        },
+        "dual": true,
+        "heads": 64,
+        "ragged": false,
+        "sm_count": 170
+      },
+      {
+        "buckets": {
+          "t128": "ip+pw+e2m1_nomul",
+          "t32": "sa+ip+pw+ew+ra+el+e2m1_nomul+mo2",
+          "t8": "sa+ip+pw+ew+ra+el+e2m1_nomul"
+        },
+        "dual": true,
+        "heads": 128,
+        "ragged": false,
+        "sm_count": 170
+      },
+      {
+        "buckets": {
+          "t128": "sa+pw+lq+t1",
+          "t8": "sa+pw+lq+t1"
+        },
+        "dual": false,
+        "heads": 64,
+        "ragged": false,
+        "sm_count": 188
+      },
+      {
+        "buckets": {
+          "t128": "sa+ip+pw",
+          "t32": "mo2",
+          "t8": "sa+pw+lq+el"
+        },
+        "dual": true,
+        "heads": 8,
+        "ragged": false,
+        "sm_count": 188
+      },
+      {
+        "buckets": {
+          "t128": "sa+ip+pw",
+          "t32": "ip+mo2",
+          "t8": "ra+sa+pw+lq+el+e2m1_nomul+mo2"
+        },
+        "dual": true,
+        "heads": 16,
+        "ragged": false,
+        "sm_count": 188
+      },
+      {
+        "buckets": {
+          "t128": "sa+ip+pw+ew+ra+mo2",
+          "t32": "sa+pw+lq+el+e2m1_nomul+mo2",
+          "t8": "ra+sa+pw+lq+el"
+        },
+        "dual": true,
+        "heads": 32,
+        "ragged": false,
+        "sm_count": 188
+      },
+      {
+        "buckets": {
+          "t1": "sa+pw+lq+t1+el+ew+ra",
+          "t128": "sa+ip+pw+el+e2m1_nomul",
+          "t32": "tl+ip",
+          "t64": "sa+ip+pw+ew+ra+e2m1_nomul",
+          "t8": "sa+tl+ip+el+e2m1_nomul+mo2"
+        },
+        "dual": true,
+        "heads": 64,
+        "ragged": false,
+        "sm_count": 188
+      },
+      {
+        "buckets": {
+          "t128": "ip+pw+e2m1_nomul",
+          "t32": "ip+pw+e2m1_nomul",
+          "t8": "sa+ip+pw+el+e2m1_nomul"
+        },
+        "dual": true,
+        "heads": 128,
+        "ragged": false,
+        "sm_count": 188
+      },
+      {
+        "buckets": {
+          "t32": "sa+ip+pw+el"
+        },
+        "dual": true,
+        "heads": 64,
+        "ragged": true,
+        "sm_count": 48
+      },
+      {
+        "buckets": {
+          "t32": "sa+tl+ip+el+e2m1_nomul"
+        },
+        "dual": true,
+        "heads": 64,
+        "ragged": true,
+        "sm_count": 170
+      },
+      {
+        "buckets": {
+          "t32": "sa+ip+pw+el+e2m1_nomul"
+        },
+        "dual": true,
+        "heads": 64,
+        "ragged": true,
+        "sm_count": 188
+      }
+    ],
+    "token_buckets": [
+      [
+        4,
+        "t1"
+      ],
+      [
+        16,
+        "t8"
+      ],
+      [
+        48,
+        "t32"
+      ],
+      [
+        96,
+        "t64"
+      ],
+      [
+        null,
+        "t128"
+      ]
+    ],
+    "unified_memory_sm_count": 48
+  },
+  "entry": "cake_sparse_mla_sm120_dsv41_mixed_decode",
+  "extra_bytes_per_token": 288,
+  "extra_candidates_per_chunk": 64,
+  "extra_data_bytes": 256,
+  "extra_scale_bytes": 32,
+  "generated_at": "2026-10-06T06:32:27Z",
+  "generator": "sm120-dsv41-mixed-sparse-mla-flashinfer-export",
+  "head_counts": [
+    8,
+    16,
+    32,
+    48,
+    64,
+    80,
+    96,
+    112,
+    128
+  ],
+  "head_dim": 512,
+  "heads_per_block": 16,
+  "identity": "6068eeda992eda7c40d9e2e98e08b3fa0efd58fea794d0d10f4f3c82318f0bbb",
+  "kernel_commit": "cf9aa7cac3630bf088a58dd41620f166dd79ea47",
+  "main_bytes_per_token": 528,
+  "main_data_bytes": 512,
+  "main_scale_bytes": 16,
+  "max_chunks_per_block": 16,
+  "merge_kernels": [
+    {
+      "heads": 8,
+      "source": "cake_sparse_mla_dsv41_mixed_merge_default_heads_h8_16_32_48_64_80_96_112_128_fold.cu",
+      "variant": "default"
+    },
+    {
+      "heads": 8,
+      "source": "cake_sparse_mla_dsv41_mixed_merge_mo2_heads_h8_16_32_64_128_fold.cu",
+      "variant": "mo2"
+    },
+    {
+      "heads": 16,
+      "source": "cake_sparse_mla_dsv41_mixed_merge_default_heads_h8_16_32_48_64_80_96_112_128_fold.cu",
+      "variant": "default"
+    },
+    {
+      "heads": 16,
+      "source": "cake_sparse_mla_dsv41_mixed_merge_mo2_heads_h8_16_32_64_128_fold.cu",
+      "variant": "mo2"
+    },
+    {
+      "heads": 32,
+      "source": "cake_sparse_mla_dsv41_mixed_merge_default_heads_h8_16_32_48_64_80_96_112_128_fold.cu",
+      "variant": "default"
+    },
+    {
+      "heads": 32,
+      "source": "cake_sparse_mla_dsv41_mixed_merge_mo2_heads_h8_16_32_64_128_fold.cu",
+      "variant": "mo2"
+    },
+    {
+      "heads": 48,
+      "source": "cake_sparse_mla_dsv41_mixed_merge_default_heads_h8_16_32_48_64_80_96_112_128_fold.cu",
+      "variant": "default"
+    },
+    {
+      "heads": 64,
+      "source": "cake_sparse_mla_dsv41_mixed_merge_default_heads_h8_16_32_48_64_80_96_112_128_fold.cu",
+      "variant": "default"
+    },
+    {
+      "heads": 64,
+      "source": "cake_sparse_mla_dsv41_mixed_merge_mo2_heads_h8_16_32_64_128_fold.cu",
+      "variant": "mo2"
+    },
+    {
+      "heads": 80,
+      "source": "cake_sparse_mla_dsv41_mixed_merge_default_heads_h8_16_32_48_64_80_96_112_128_fold.cu",
+      "variant": "default"
+    },
+    {
+      "heads": 96,
+      "source": "cake_sparse_mla_dsv41_mixed_merge_default_heads_h8_16_32_48_64_80_96_112_128_fold.cu",
+      "variant": "default"
+    },
+    {
+      "heads": 112,
+      "source": "cake_sparse_mla_dsv41_mixed_merge_default_heads_h8_16_32_48_64_80_96_112_128_fold.cu",
+      "variant": "default"
+    },
+    {
+      "heads": 128,
+      "source": "cake_sparse_mla_dsv41_mixed_merge_default_heads_h8_16_32_48_64_80_96_112_128_fold.cu",
+      "variant": "default"
+    },
+    {
+      "heads": 128,
+      "source": "cake_sparse_mla_dsv41_mixed_merge_mo2_heads_h8_16_32_64_128_fold.cu",
+      "variant": "mo2"
+    }
+  ],
+  "merge_params": [
+    "mid_out",
+    "mid_lse",
+    "attn_sink",
+    "output",
+    "out_lse",
+    "num_splits",
+    "scratch_split_stride",
+    "lse_scale",
+    "hb_major"
+  ],
+  "precisions": [
+    "bf16"
+  ],
+  "sources": [
+    "cake_sparse_mla_dsv41_mixed_binding.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_default_heads_h32_64_96_128_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_default_heads_h48_80_112_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_ip_el_pw_h64_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_ip_pw_h128_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_ip_pw_h16_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_lq_el_pw_h64_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_ra_sa_lq_el_pw_h16_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_ra_sa_lq_el_pw_h32_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_sa_ip_el_heads_pw_h32_64_128_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_sa_ip_el_pw_h64_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_sa_ip_ew_ra_el_heads_pw_h32_64_128_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_sa_ip_ew_ra_pw_h32_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_sa_ip_ew_ra_pw_h64_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_sa_ip_pw_h16_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_sa_ip_pw_h64_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_sa_ip_pw_h8_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_sa_ip_pw_nomul_h128_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_sa_lq_el_pw_h16_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_sa_lq_el_pw_h32_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_sa_lq_el_pw_h8_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_sa_lq_t1_el_ew_ra_pw_h64_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_sa_lq_t1_pw_nomul_h64_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_sa_tl_ip_el_nomul_h16_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_tl_ip_e2f_heads_h32_64_96_128_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_tl_ip_e2f_heads_h48_80_112_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_dual_tl_ip_pw_h32_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_h16_dual_default.cu",
+    "cake_sparse_mla_dsv41_mixed_h16_dual_ip_e2m1_nomul.cu",
+    "cake_sparse_mla_dsv41_mixed_h16_single_default.cu",
+    "cake_sparse_mla_dsv41_mixed_h32_dual_ip.cu",
+    "cake_sparse_mla_dsv41_mixed_h32_dual_t1.cu",
+    "cake_sparse_mla_dsv41_mixed_h32_dual_tl_ip_e2m1_nomul.cu",
+    "cake_sparse_mla_dsv41_mixed_h64_dual_sa_tl_ip_el_e2m1_nomul.cu",
+    "cake_sparse_mla_dsv41_mixed_h64_dual_tl_ip.cu",
+    "cake_sparse_mla_dsv41_mixed_h64_single_t1.cu",
+    "cake_sparse_mla_dsv41_mixed_h8_dual_default.cu",
+    "cake_sparse_mla_dsv41_mixed_h8_dual_ip.cu",
+    "cake_sparse_mla_dsv41_mixed_h8_dual_sa_tl_ip_e2m1_nomul.cu",
+    "cake_sparse_mla_dsv41_mixed_h8_dual_sa_tl_ip_ew_ra.cu",
+    "cake_sparse_mla_dsv41_mixed_h8_single_default.cu",
+    "cake_sparse_mla_dsv41_mixed_merge_default_heads_h8_16_32_48_64_80_96_112_128_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_merge_mo2_heads_h8_16_32_64_128_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_single_default_heads_h32_64_96_128_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_single_default_heads_h48_80_112_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_single_ip_pw_h64_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_single_lq_t1_pw_h64_fold.cu",
+    "cake_sparse_mla_dsv41_mixed_single_sa_lq_t1_pw_h64_fold.cu"
+  ],
+  "tree_commit": "36469765801271d729d8c1c309ff9b840129c653",
+  "two_tile_head_counts": [
+    32,
+    48,
+    64,
+    80,
+    96,
+    112,
+    128
+  ],
+  "value_dim": 512,
+  "variants": [
+    {
+      "decode": "default",
+      "merge": "default",
+      "name": "default"
+    },
+    {
+      "decode": "ip",
+      "merge": "default",
+      "name": "ip"
+    },
+    {
+      "decode": "ip+e2m1_nomul",
+      "merge": "default",
+      "name": "ip+e2m1_nomul"
+    },
+    {
+      "decode": "ip+el",
+      "merge": "default",
+      "name": "ip+el"
+    },
+    {
+      "decode": "ip",
+      "merge": "mo2",
+      "name": "ip+mo2"
+    },
+    {
+      "decode": "ip+pw",
+      "merge": "default",
+      "name": "ip+pw"
+    },
+    {
+      "decode": "ip+pw+e2m1_nomul",
+      "merge": "default",
+      "name": "ip+pw+e2m1_nomul"
+    },
+    {
+      "decode": "ip+pw+el",
+      "merge": "default",
+      "name": "ip+pw+el"
+    },
+    {
+      "decode": "lq+el",
+      "merge": "default",
+      "name": "lq+el"
+    },
+    {
+      "decode": "lq+t1",
+      "merge": "default",
+      "name": "lq+t1"
+    },
+    {
+      "decode": "default",
+      "merge": "mo2",
+      "name": "mo2"
+    },
+    {
+      "decode": "pw+lq+el",
+      "merge": "default",
+      "name": "pw+lq+el"
+    },
+    {
+      "decode": "pw+lq+t1",
+      "merge": "default",
+      "name": "pw+lq+t1"
+    },
+    {
+      "decode": "ra+sa+lq+el",
+      "merge": "default",
+      "name": "ra+sa+lq+el"
+    },
+    {
+      "decode": "ra+sa+lq+el+e2m1_nomul",
+      "merge": "mo2",
+      "name": "ra+sa+lq+el+e2m1_nomul+mo2"
+    },
+    {
+      "decode": "ra+sa+pw+lq+el",
+      "merge": "default",
+      "name": "ra+sa+pw+lq+el"
+    },
+    {
+      "decode": "ra+sa+pw+lq+el+e2m1_nomul",
+      "merge": "mo2",
+      "name": "ra+sa+pw+lq+el+e2m1_nomul+mo2"
+    },
+    {
+      "decode": "sa+ip",
+      "merge": "default",
+      "name": "sa+ip"
+    },
+    {
+      "decode": "sa+ip+e2m1_nomul",
+      "merge": "default",
+      "name": "sa+ip+e2m1_nomul"
+    },
+    {
+      "decode": "sa+ip+el",
+      "merge": "default",
+      "name": "sa+ip+el"
+    },
+    {
+      "decode": "sa+ip+el+e2m1_nomul",
+      "merge": "default",
+      "name": "sa+ip+el+e2m1_nomul"
+    },
+    {
+      "decode": "sa+ip+el+e2m1_nomul",
+      "merge": "mo2",
+      "name": "sa+ip+el+e2m1_nomul+mo2"
+    },
+    {
+      "decode": "sa+ip+ew+ra+e2m1_nomul",
+      "merge": "default",
+      "name": "sa+ip+ew+ra+e2m1_nomul"
+    },
+    {
+      "decode": "sa+ip+ew+ra+el+e2m1_nomul",
+      "merge": "default",
+      "name": "sa+ip+ew+ra+el+e2m1_nomul"
+    },
+    {
+      "decode": "sa+ip+ew+ra+el+e2m1_nomul",
+      "merge": "mo2",
+      "name": "sa+ip+ew+ra+el+e2m1_nomul+mo2"
+    },
+    {
+      "decode": "sa+ip+ew+ra",
+      "merge": "mo2",
+      "name": "sa+ip+ew+ra+mo2"
+    },
+    {
+      "decode": "sa+ip+pw",
+      "merge": "default",
+      "name": "sa+ip+pw"
+    },
+    {
+      "decode": "sa+ip+pw+e2m1_nomul",
+      "merge": "default",
+      "name": "sa+ip+pw+e2m1_nomul"
+    },
+    {
+      "decode": "sa+ip+pw+el",
+      "merge": "default",
+      "name": "sa+ip+pw+el"
+    },
+    {
+      "decode": "sa+ip+pw+el+e2m1_nomul",
+      "merge": "default",
+      "name": "sa+ip+pw+el+e2m1_nomul"
+    },
+    {
+      "decode": "sa+ip+pw+el+e2m1_nomul",
+      "merge": "mo2",
+      "name": "sa+ip+pw+el+e2m1_nomul+mo2"
+    },
+    {
+      "decode": "sa+ip+pw+ew+ra+e2m1_nomul",
+      "merge": "default",
+      "name": "sa+ip+pw+ew+ra+e2m1_nomul"
+    },
+    {
+      "decode": "sa+ip+pw+ew+ra+el+e2m1_nomul",
+      "merge": "default",
+      "name": "sa+ip+pw+ew+ra+el+e2m1_nomul"
+    },
+    {
+      "decode": "sa+ip+pw+ew+ra+el+e2m1_nomul",
+      "merge": "mo2",
+      "name": "sa+ip+pw+ew+ra+el+e2m1_nomul+mo2"
+    },
+    {
+      "decode": "sa+ip+pw+ew+ra",
+      "merge": "mo2",
+      "name": "sa+ip+pw+ew+ra+mo2"
+    },
+    {
+      "decode": "sa+lq+el",
+      "merge": "default",
+      "name": "sa+lq+el"
+    },
+    {
+      "decode": "sa+lq+el+e2m1_nomul",
+      "merge": "mo2",
+      "name": "sa+lq+el+e2m1_nomul+mo2"
+    },
+    {
+      "decode": "sa+lq+el",
+      "merge": "mo2",
+      "name": "sa+lq+el+mo2"
+    },
+    {
+      "decode": "sa+lq+t1",
+      "merge": "default",
+      "name": "sa+lq+t1"
+    },
+    {
+      "decode": "sa+lq+t1+e2m1_nomul",
+      "merge": "default",
+      "name": "sa+lq+t1+e2m1_nomul"
+    },
+    {
+      "decode": "sa+lq+t1+el+ew+ra",
+      "merge": "default",
+      "name": "sa+lq+t1+el+ew+ra"
+    },
+    {
+      "decode": "sa+lq+t1",
+      "merge": "mo2",
+      "name": "sa+lq+t1+mo2"
+    },
+    {
+      "decode": "sa+pw+lq+el",
+      "merge": "default",
+      "name": "sa+pw+lq+el"
+    },
+    {
+      "decode": "sa+pw+lq+el+e2m1_nomul",
+      "merge": "mo2",
+      "name": "sa+pw+lq+el+e2m1_nomul+mo2"
+    },
+    {
+      "decode": "sa+pw+lq+el",
+      "merge": "mo2",
+      "name": "sa+pw+lq+el+mo2"
+    },
+    {
+      "decode": "sa+pw+lq+t1",
+      "merge": "default",
+      "name": "sa+pw+lq+t1"
+    },
+    {
+      "decode": "sa+pw+lq+t1+e2m1_nomul",
+      "merge": "default",
+      "name": "sa+pw+lq+t1+e2m1_nomul"
+    },
+    {
+      "decode": "sa+pw+lq+t1+el+ew+ra",
+      "merge": "default",
+      "name": "sa+pw+lq+t1+el+ew+ra"
+    },
+    {
+      "decode": "sa+pw+lq+t1",
+      "merge": "mo2",
+      "name": "sa+pw+lq+t1+mo2"
+    },
+    {
+      "decode": "sa+tl+ip+e2m1_nomul",
+      "merge": "default",
+      "name": "sa+tl+ip+e2m1_nomul"
+    },
+    {
+      "decode": "sa+tl+ip+el",
+      "merge": "default",
+      "name": "sa+tl+ip+el"
+    },
+    {
+      "decode": "sa+tl+ip+el+e2m1_nomul",
+      "merge": "default",
+      "name": "sa+tl+ip+el+e2m1_nomul"
+    },
+    {
+      "decode": "sa+tl+ip+el+e2m1_nomul",
+      "merge": "mo2",
+      "name": "sa+tl+ip+el+e2m1_nomul+mo2"
+    },
+    {
+      "decode": "sa+tl+ip+ew+ra",
+      "merge": "default",
+      "name": "sa+tl+ip+ew+ra"
+    },
+    {
+      "decode": "t1",
+      "merge": "default",
+      "name": "t1"
+    },
+    {
+      "decode": "tl+ip",
+      "merge": "default",
+      "name": "tl+ip"
+    },
+    {
+      "decode": "tl+ip+e2f",
+      "merge": "default",
+      "name": "tl+ip+e2f"
+    },
+    {
+      "decode": "tl+ip+e2m1_nomul",
+      "merge": "default",
+      "name": "tl+ip+e2m1_nomul"
+    },
+    {
+      "decode": "tl+ip+pw",
+      "merge": "default",
+      "name": "tl+ip+pw"
+    }
+  ]
+}

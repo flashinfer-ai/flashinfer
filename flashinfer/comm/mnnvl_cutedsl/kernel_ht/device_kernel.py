@@ -33,6 +33,7 @@ from ..cute_dsl_primitives import (
     ldmc_bf16x8,
     load_global_bf16_as_f32,
     load_global_u32x4_address,
+    load_global_u32x4,
     load_shared_u32x4,
     packed_negative_zero_bf16x8,
     packed_u32x4_to_bf16x8,
@@ -42,6 +43,7 @@ from ..cute_dsl_primitives import (
     store_global_u32x4,
     store_shared_u32x4,
 )
+from ..static_fp8_epilogue import store_rmsnorm_output
 
 SMEM_ALIGNMENT = 1024
 
@@ -178,11 +180,12 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
                 )
         else:
             self.reduction_shards_per_rms_warp = 0
-        if self.packs_per_reduction_shard % self.reduction_threads:
-            raise ValueError("the reduction shard must divide evenly across threads")
-        self.reduction_vectors_per_thread = (
-            self.packs_per_reduction_shard // self.reduction_threads
+        self.reduction_has_tail = (
+            self.packs_per_reduction_shard % self.reduction_threads != 0
         )
+        self.reduction_vectors_per_thread = (
+            self.packs_per_reduction_shard + self.reduction_threads - 1
+        ) // self.reduction_threads
 
     @cute.jit
     def _rms_arrive_and_wait(self, rms_group: Int32) -> None:
@@ -226,6 +229,8 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
         prenorm_mailbox: cute.Tensor,
         residual_output: cute.Tensor,
         norm_output: cute.Tensor,
+        norm_output_bf16: cute.Tensor | None,
+        output_scale: cute.Tensor | None,
         ready_counter_peer_addresses: cute.Tensor,
         ready_counters: cute.Tensor,
         processed_counters: cute.Tensor,
@@ -264,6 +269,8 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
             prenorm_mailbox,
             residual_output,
             norm_output,
+            norm_output_bf16,
+            output_scale,
             ready_counter_peer_addresses,
             ready_counters,
             processed_counters,
@@ -292,6 +299,8 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
         prenorm_mailbox: cute.Tensor,
         residual_output: cute.Tensor,
         norm_output: cute.Tensor,
+        norm_output_bf16: cute.Tensor | None,
+        output_scale: cute.Tensor | None,
         ready_counter_peer_addresses: cute.Tensor,
         ready_counters: cute.Tensor,
         processed_counters: cute.Tensor,
@@ -699,14 +708,12 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
                             ):
                                 pack = rms_pack_base + item * rms_pack_stride
                                 linear_pack = token_pack + pack
-                                store_global_u32x4(
-                                    Int64(
-                                        (
-                                            norm_output.iterator
-                                            + linear_pack * VEC_BF16
-                                        ).toint()
-                                    ),
+                                store_rmsnorm_output(
                                     norm_packed[item],
+                                    norm_output,
+                                    Int64(linear_pack * VEC_BF16),
+                                    output_scale,
+                                    norm_output_bf16,
                                 )
                     copy_wave += rms_wave_stride * self.rms_pipeline_stages
                     copy_token = copy_wave * self.tp + cta_slot
@@ -840,11 +847,12 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
                     for item in cutlass.range_constexpr(self.rms_vectors_per_thread):
                         pack = rms_pack_base + item * rms_pack_stride
                         linear_pack = token_pack + pack
-                        store_global_u32x4(
-                            Int64(
-                                (norm_output.iterator + linear_pack * VEC_BF16).toint()
-                            ),
+                        store_rmsnorm_output(
                             norm_packed[item],
+                            norm_output,
+                            Int64(linear_pack * VEC_BF16),
+                            output_scale,
+                            norm_output_bf16,
                         )
                     copy_wave += self.cta_groups * self.rms_token_groups
                     copy_token = copy_wave * self.tp + cta_slot
@@ -947,25 +955,34 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
                     output_address = (
                         prenorm_mailbox_multicast_address + (token_pack + pack) * 16
                     )
-                    reduced_packed = ldmc_bf16x8(input_address)
+                    valid = None
+                    if cutlass.const_expr(self.reduction_has_tail):
+                        valid = Int32(
+                            reduction_tid + item * self.reduction_threads
+                            < self.packs_per_reduction_shard
+                        )
+                    reduced_packed = ldmc_bf16x8(input_address, valid)
                     reduced_values = packed_u32x4_to_bf16x8(reduced_packed).to(Float32)
                     if cutlass.const_expr(self.add_residual):
-                        residual_values = packed_u32x4_to_bf16x8(
-                            load_global_u32x4_address(
-                                Int64(
-                                    (
-                                        residual_source.iterator
-                                        + (token_pack + pack) * VEC_BF16
-                                    ).toint()
-                                )
-                            )
-                        ).to(Float32)
+                        residual_packed = load_global_u32x4(
+                            residual_source.iterator + (token_pack + pack) * VEC_BF16,
+                            valid,
+                        )
+                        residual_values = packed_u32x4_to_bf16x8(residual_packed).to(
+                            Float32
+                        )
                         reduced_values = reduced_values + residual_values
                     reduced_packed = bf16x8_to_packed_u32x4(reduced_values.to(BFloat16))
                     values.append(sanitize_negative_zero_u32x4(reduced_packed))
                     addresses.append(output_address)
                 for item in cutlass.range_constexpr(self.reduction_vectors_per_thread):
-                    stmc_bf16x8(addresses[item], values[item])
+                    valid = None
+                    if cutlass.const_expr(self.reduction_has_tail):
+                        valid = Int32(
+                            reduction_tid + item * self.reduction_threads
+                            < self.packs_per_reduction_shard
+                        )
+                    stmc_bf16x8(addresses[item], values[item], valid)
                 if reduction_tid == 0:
                     cute.arch.store(
                         (processed_counters.iterator + processed_index).llvm_ptr,

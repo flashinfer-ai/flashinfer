@@ -3,23 +3,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Literal, Optional, Tuple
+
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass
 class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
-    """Kernel params for ``kernel_src.sm107.next_cutedsl_megamoe.sm107_block_scaled_mega_moe``.
+    """Configure Rubin inference with NVFP4 activations and weights.
 
-    The Rubin inference block-scaled swap-AB fused dispatch + FC1 + SwiGLU +
-    FC2 + combine mega kernel (``BlockScaledSwapAbMegaMoeKernel``) at quant
-    kind nvfp4: nvfp4 activations x nvfp4 weights -> bf16 output, sf_vec_size
-    16 (FP8-E4M3 block scales), gate/up interleave 16.  The per-expert
-    fc1_alpha / fc2_alpha / fc1_norm_const dequant scalars are identically 1
-    (weights and activations quantize with norm_const=1.0), so they are
-    omitted from the kernel ABI.
+    The kernel fuses dispatch, FC1, activation, FC2, and combine with BF16 output.
+    It uses E4M3 scales per 16 values and 16-row gate/up stripes. SwiGLU is the default;
+    SiTU requires both positive, finite beta parameters.
+
+    input_norm_const controls BF16 input staging. Per-expert alpha tensors
+    correct GEMM accumulators; fc1_norm_const scales intermediate quantization.
     """
 
-    intermediate_size: int  # post-SwiGLU width; FC1 GEMM N is 2*intermediate_size
+    intermediate_size: int  # width after activation; FC1 N is 2*intermediate_size
     top_k: int
     kernel_name: str = "sm107_nvfp4_nvfp4_bf16_cutedsl"
     gate_up_clamp: Optional[float] = None
@@ -45,3 +47,14 @@ class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # is unsupported because the kernel fixes its knobs at construction.
     knobs: dict | str | None = None
     max_sm_count: Optional[int] = None
+    activation: Literal["swiglu", "situ"] = "swiglu"
+    situ_beta: Optional[float] = None
+    situ_linear_beta: Optional[float] = None
+    input_norm_const: float = 1.0
+    fc1_alpha: Optional["torch.Tensor"] = None
+    fc2_alpha: Optional["torch.Tensor"] = None
+    fc1_norm_const: Optional["torch.Tensor"] = None
+    # GenPhase requires cluster (4, 1), fc2_use_bulk=True, and <=1024 tokens/rank.
+    kernel_variant: Literal["inference", "genphase"] = "inference"
+    # Quantizes the FC2 return payload; the operator still returns BF16.
+    combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"

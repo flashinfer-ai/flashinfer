@@ -216,6 +216,7 @@ _MLIR_VALUE_FIELDS = (
     "fc2_output_sf",
     "fc2_done_counter",
     "token_back_schedule_counter",
+    "dispatch_route_extent",
     "nvlink_barrier_signal",
     "nvlink_barrier_counter",
     "grid_sync_counter",
@@ -279,6 +280,7 @@ class TokenCommArgs:
         token_back_schedule_counter: cute.Pointer = None,
         combine_sf: cute.Tensor = None,
         fc2_output_sf: cute.Tensor = None,
+        dispatch_route_extent: cute.Tensor = None,
     ):
         self.input_token_buffer = input_token_buffer
         self.input_sf_buffer = input_sf_buffer
@@ -299,6 +301,7 @@ class TokenCommArgs:
         self.fc2_output_sf = fc2_output_sf
         self.fc2_done_counter = fc2_done_counter
         self.token_back_schedule_counter = token_back_schedule_counter
+        self.dispatch_route_extent = dispatch_route_extent
         self.nvlink_barrier_signal = nvlink_barrier_signal
         self.nvlink_barrier_counter = nvlink_barrier_counter
         self.grid_sync_counter = grid_sync_counter
@@ -511,13 +514,14 @@ class TokenInPullTokenBackPush:
     def extra_smem_storage_class(self) -> type:
         hidden_bytes = self.hidden_bytes
         num_total_experts = self.num_total_experts
+        smem_count_slots = max(num_total_experts, self.num_dispatch_warps)
 
         if self.token_back_standalone:
 
             @cute.struct
             class TokenCommStorage:
                 pull_mbar: cute.struct.MemRange[Int64, self.num_dispatch_warps]
-                smem_expert_count: cute.struct.MemRange[Int32, num_total_experts]
+                smem_expert_count: cute.struct.MemRange[Int32, smem_count_slots]
                 pull_buffer: cute.struct.Align[
                     cute.struct.MemRange[Uint8, self.num_dispatch_warps * hidden_bytes],
                     16,
@@ -535,7 +539,7 @@ class TokenInPullTokenBackPush:
         @cute.struct
         class TokenCommStorage:
             pull_mbar: cute.struct.MemRange[Int64, self.num_dispatch_warps]
-            smem_expert_count: cute.struct.MemRange[Int32, num_total_experts]
+            smem_expert_count: cute.struct.MemRange[Int32, smem_count_slots]
             pull_buffer: cute.struct.Align[
                 cute.struct.MemRange[Uint8, self.num_dispatch_warps * hidden_bytes], 16
             ]
@@ -599,7 +603,81 @@ class TokenInPullTokenBackPush:
             _iket.range_pop()
 
     @cute.jit
+    def _find_dispatch_route_extent(
+        self, token_comm_storage, topk_idx, publication, sm_idx, warp_idx, lane_idx,
+        *, num_tokens,
+    ):
+        thread_idx = warp_idx * Int32(self.warp_threads) + lane_idx
+        if sm_idx == Int32(0):
+            last = Int32(0)
+            route = thread_idx
+            while route < Int32(num_tokens * self.num_topk):
+                expert = topk_idx[route // self.num_topk, route % self.num_topk]
+                if expert >= 0:
+                    last = route + Int32(1)
+                route += Int32(self.num_dispatch_threads)
+            warp_last = cute.arch.warp_redux_sync(last, "max")
+            # Histogram initialization starts only after the extent is ready.
+            extents = token_comm_storage.smem_expert_count.data_ptr()
+            if lane_idx == Int32(0):
+                (extents + warp_idx).store(Int32(warp_last))
+            cute.arch.barrier(
+                barrier_id=self.dispatch_intra_cta_bar_id,
+                number_of_threads=self.num_dispatch_threads,
+            )
+            if thread_idx == Int32(0):
+                extent = Int32(0)
+                for warp in cutlass.range_constexpr(self.num_dispatch_warps):
+                    value = (extents + warp).load()
+                    if value > extent:
+                        extent = value
+                publication[0] = extent
+                cute.arch.atomic_add(
+                    publication.iterator + 1, Int32(1), sem="release", scope="gpu"
+                )
+        # Ready is reset with the local counters only after every warp role
+        # drains. Extent is last-valid-route+1, so holes keep their route IDs.
+        while (
+            cute.arch.load(publication.iterator + 1, Int32, sem="acquire", scope="gpu")
+            != Int32(1)
+        ):
+            pass
+        return cute.arch.load(publication.iterator, Int32, sem="relaxed", scope="gpu")
+
+    @cute.jit
     def dispatch_prep(
+        self, token_comm_storage, topk_idx, expert_send_count, src_token_topk_idx,
+        peer_rank_ptr_mapper, sm_idx, warp_idx, lane_idx,
+        *, local_rank, num_tokens, num_sms, route_extent=None,
+    ):
+        if cutlass.const_expr(route_extent is None):
+            self._dispatch_prep_impl(
+                token_comm_storage, topk_idx, expert_send_count, src_token_topk_idx,
+                peer_rank_ptr_mapper, sm_idx, warp_idx, lane_idx,
+                local_rank=local_rank, num_tokens=num_tokens, num_sms=num_sms,
+                scan_tokens=num_tokens, active_ctas=num_sms,
+            )
+        else:
+            extent = self._find_dispatch_route_extent(
+                token_comm_storage, topk_idx, route_extent, sm_idx, warp_idx, lane_idx,
+                num_tokens=num_tokens,
+            )
+            scan_tokens = (extent + Int32(self.num_topk - 1)) // Int32(self.num_topk)
+            tokens_per_cta = (32 // self.num_topk) * self.num_dispatch_warps
+            active_ctas = (
+                scan_tokens + Int32(tokens_per_cta - 1)
+            ) // Int32(tokens_per_cta)
+            active_ctas = cutlass.min(Int32(num_sms), cutlass.max(Int32(1), active_ctas))
+            if sm_idx < active_ctas:
+                self._dispatch_prep_impl(
+                    token_comm_storage, topk_idx, expert_send_count, src_token_topk_idx,
+                    peer_rank_ptr_mapper, sm_idx, warp_idx, lane_idx,
+                    local_rank=local_rank, num_tokens=num_tokens, num_sms=num_sms,
+                    scan_tokens=scan_tokens, active_ctas=active_ctas,
+                )
+
+    @cute.jit
+    def _dispatch_prep_impl(
         self,
         token_comm_storage,
         topk_idx,
@@ -613,6 +691,8 @@ class TokenInPullTokenBackPush:
         local_rank,
         num_tokens,
         num_sms,
+        scan_tokens,
+        active_ctas,
     ):
         thread_idx_in_dispatch = Int32(warp_idx * self.warp_threads + lane_idx)
         smem_count_ptr = token_comm_storage.smem_expert_count.data_ptr()
@@ -627,9 +707,7 @@ class TokenInPullTokenBackPush:
 
         tokens_per_warp: cutlass.Constexpr[int] = 32 // self.num_topk
         active_lanes: cutlass.Constexpr[int] = tokens_per_warp * self.num_topk
-        num_dispatch_warps_per_grid: cutlass.Constexpr[int] = (
-            num_sms * self.num_dispatch_warps
-        )
+        num_dispatch_warps_per_grid = active_ctas * self.num_dispatch_warps
 
         base_token_for_warp = (
             sm_idx * self.num_dispatch_warps + warp_idx
@@ -637,10 +715,10 @@ class TokenInPullTokenBackPush:
         grid_token_stride = num_dispatch_warps_per_grid * tokens_per_warp
 
         t = base_token_for_warp
-        while t < num_tokens:
+        while t < scan_tokens:
             token_offset_in_warp = lane_idx // self.num_topk
             token_global = t + token_offset_in_warp
-            if lane_idx < active_lanes and token_global < num_tokens:
+            if lane_idx < active_lanes and token_global < scan_tokens:
                 topk_slot = lane_idx % self.num_topk
                 expert_id = Int32(topk_idx[token_global, topk_slot])
                 if expert_id >= Int32(0):
@@ -658,6 +736,11 @@ class TokenInPullTokenBackPush:
             number_of_threads=self.num_dispatch_threads,
         )
 
+        # The high word counts completion from the full launch grid. CTA0
+        # accounts for skipped CTAs, including experts with zero live routes.
+        completion_count = Int64(1) + Int64(sm_idx == Int32(0)) * Int64(
+            num_sms - active_ctas
+        )
         for offset in cutlass.range_constexpr(
             0,
             self.num_total_experts,
@@ -667,7 +750,7 @@ class TokenInPullTokenBackPush:
             if expert_id < Int32(self.num_total_experts):
                 slot_ptr = smem_count_ptr + expert_id
                 local_count = (slot_ptr).load()
-                delta = (Int64(1) << Int64(32)) | (
+                delta = (completion_count << Int64(32)) | (
                     Int64(local_count) & Int64(0xFFFFFFFF)
                 )
                 old_packed = cute.arch.atomic_add(
@@ -684,10 +767,10 @@ class TokenInPullTokenBackPush:
         )
 
         t = base_token_for_warp
-        while t < num_tokens:
+        while t < scan_tokens:
             token_offset_in_warp = lane_idx // self.num_topk
             token_global = t + token_offset_in_warp
-            if lane_idx < active_lanes and token_global < num_tokens:
+            if lane_idx < active_lanes and token_global < scan_tokens:
                 topk_slot = lane_idx % self.num_topk
                 expert_id = Int32(topk_idx[token_global, topk_slot])
                 if expert_id >= Int32(0):
@@ -1588,6 +1671,7 @@ class TokenInPullTokenBackPush:
             local_rank=token_comm_args.local_rank,
             num_tokens=token_comm_args.input_token_buffer.shape[0],
             num_sms=token_comm_args.sm_count,
+            route_extent=token_comm_args.dispatch_route_extent,
         )
 
         if iket_active:
@@ -1741,6 +1825,14 @@ class TokenInPullTokenBackPush:
         if iket_active:
             _iket.range_pop()
 
+    def use_single_cta_tail_reset(self, shared_zero_i32_count: int) -> bool:
+        """Bound CTA0's shared clear; retain distributed reset under NCU."""
+        return (
+            self.world_size > 1
+            and shared_zero_i32_count * 4 <= 16384
+            and os.environ.get("MEGA_USE_NCU", "0") != "1"
+        )
+
     @cute.jit
     def tail_reset_counters(
         self,
@@ -1750,33 +1842,52 @@ class TokenInPullTokenBackPush:
         cta_linear_id,
         local_warp_idx,
         lane_idx,
+        single_cta: cutlass.Constexpr[bool] = False,
+        preserve_grid_phase: cutlass.Constexpr[bool] = False,
     ):
         """Per-lane 4B (Int32) bulk-zero of one accumulating-counter prefix.
 
         ``target_zero_tensor`` is an Int32 view over a workspace's front counter
         region (megamoe_kernel front-places every counter that must restart at 0
         each launch; data buffers and the phase-flip ``nvlink_barrier_signal`` sit
-        after the prefix and are untouched). The zeroing is spread across all
-        dispatch threads grid-wide. kernel_tail calls this twice:
+        after the prefix and are untouched). The shared clear may be owned by
+        CTA0; other clears are spread across dispatch threads grid-wide.
+        kernel_tail calls this twice:
           * SHARED prefix (expert_recv_count / _sum) BETWEEN the two nvlink
             barriers, so the final barrier publishes the zeros cross-rank -- needed
             when the next launch is another MegaMoE reusing the shared workspace
             with no intervening rank sync;
-          * LOCAL prefix (l1_arrival / expert_send / grid_sync / nvlink_barrier /
+          * LOCAL prefix (l1_arrival / expert_send / grid_sync /
             fc1_done [+ fc2_done / token_back_schedule / load_balance]) AFTER the
             last barrier -- rank-local (next kernel sees it via stream order) and
-            grid_sync/nvlink barrier counters stay live until that last barrier.
+            grid_sync stays live until that last barrier. The NVLink phase
+            counter is outside both prefixes and persists across launches.
         Only the FIRST launch relies on a caller-zeroed workspace.
         """
-        thread_linear = (
-            cta_linear_id * Int32(self.num_dispatch_warps) + local_warp_idx
-        ) * Int32(self.warp_threads) + lane_idx
-        stride = Int32(token_comm_args.sm_count * self.num_dispatch_threads)
+        if cutlass.const_expr(single_cta):
+            thread_linear = local_warp_idx * Int32(self.warp_threads) + lane_idx
+            stride = Int32(self.num_dispatch_threads)
+        else:
+            thread_linear = (
+                cta_linear_id * Int32(self.num_dispatch_warps) + local_warp_idx
+            ) * Int32(self.warp_threads) + lane_idx
+            stride = Int32(token_comm_args.sm_count * self.num_dispatch_threads)
 
         count = cute.size(target_zero_tensor)
         i = thread_linear
         while i < Int32(count):
-            target_zero_tensor[i] = Int32(0)
+            if cutlass.const_expr(preserve_grid_phase):
+                # Omitting one join changes the final phase. Clearing it here
+                # could hide the completion bit from another CTA's last poll.
+                address = (target_zero_tensor.iterator + i).toint()
+                grid_begin = token_comm_args.grid_sync_counter.iterator.toint()
+                grid_end = grid_begin + Int64(
+                    cute.size(token_comm_args.grid_sync_counter) * 4
+                )
+                if (address < grid_begin) | (address >= grid_end):
+                    target_zero_tensor[i] = Int32(0)
+            else:
+                target_zero_tensor[i] = Int32(0)
             i = i + stride
 
     @cute.jit
@@ -1801,6 +1912,11 @@ class TokenInPullTokenBackPush:
         ):
             cta_linear_id = self._cta_linear_id()
             local_warp_idx = Int32(warp_idx) - Int32(self.dispatch_warp_start)
+            single_cta_reset = cutlass.const_expr(
+                self.use_single_cta_tail_reset(
+                    cute.size(token_comm_args.shared_zero_prefix)
+                )
+            )
             # Per-launch nvlink barrier count must be a multiple of 4 so the
             # sense-reversing signal self-cancels back to its start state. The
             # launch already does 1 (dispatch_barrier) + 2 below (drain + publish,
@@ -1840,13 +1956,31 @@ class TokenInPullTokenBackPush:
             )
             # Shared counters between the barriers: the slot=0 barrier below
             # publishes these zeros cross-rank for a back-to-back MegaMoE relaunch.
-            self.tail_reset_counters(
-                token_comm_args,
-                token_comm_args.shared_zero_prefix,
-                cta_linear_id=cta_linear_id,
-                local_warp_idx=local_warp_idx,
-                lane_idx=lane_idx,
-            )
+            if cutlass.const_expr(single_cta_reset):
+                if cta_linear_id == Int32(0):
+                    self.tail_reset_counters(
+                        token_comm_args,
+                        token_comm_args.shared_zero_prefix,
+                        cta_linear_id=cta_linear_id,
+                        local_warp_idx=local_warp_idx,
+                        lane_idx=lane_idx,
+                        single_cta=True,
+                    )
+                    # Publish every clearing warp before warp 0 notifies peers.
+                    # The drain barrier above already joined the entire grid.
+                    cute.arch.fence_acq_rel_sys()
+                    cute.arch.barrier(
+                        barrier_id=self.dispatch_intra_cta_bar_id,
+                        number_of_threads=self.num_dispatch_threads,
+                    )
+            else:
+                self.tail_reset_counters(
+                    token_comm_args,
+                    token_comm_args.shared_zero_prefix,
+                    cta_linear_id=cta_linear_id,
+                    local_warp_idx=local_warp_idx,
+                    lane_idx=lane_idx,
+                )
             self.nvlink_barrier(
                 token_comm_args.nvlink_barrier_signal,
                 token_comm_args.nvlink_barrier_counter,
@@ -1856,7 +1990,7 @@ class TokenInPullTokenBackPush:
                 local_warp_idx,
                 lane_idx,
                 num_sms=token_comm_args.sm_count,
-                prologue_grid_sync=True,
+                prologue_grid_sync=not single_cta_reset,
                 epilogue_grid_sync=True,
             )
             # Local counters last: rank-local, and grid_sync/nvlink_barrier
@@ -1867,4 +2001,5 @@ class TokenInPullTokenBackPush:
                 cta_linear_id=cta_linear_id,
                 local_warp_idx=local_warp_idx,
                 lane_idx=lane_idx,
+                preserve_grid_phase=single_cta_reset,
             )

@@ -23,6 +23,7 @@ import torch
 from ..jit.cpp_ext import is_cuda_version_at_least
 from ..jit.cake_kda_packed_t1 import (
     CakeKDAPackedT1Target,
+    CakeKDAPackedT1Variant,
     get_cake_kda_packed_t1_module,
     select_cake_kda_packed_t1_variant,
 )
@@ -35,6 +36,31 @@ from ..utils import get_compute_capability
 _HEADS = 12
 _HEAD_DIM = 128
 _MIXED_WIDTH = 3 * _HEADS * _HEAD_DIM
+
+# Qualified variants that run faster from the native sm_107a compile than from the
+# SM100-family cubin on compute capability 10.7 (same kernel source; the output and
+# state pool are bitwise identical). Every other variant keeps the family target.
+_SM107_NATIVE_VARIANTS: frozenset[str] = frozenset(
+    {
+        "cpasync_tile64_register_pipeline_early_publish",
+        "cpasync_tile64_register_pipeline_early_publish_bulk1",
+    }
+)
+
+# Variants that store the two output rows a thread group owns as one 32-bit
+# BF16x2 word.  They need a 4-byte-aligned output base; otherwise the band's
+# scalar-publish body of the same schedule runs (same output bits).
+_PAIR_PUBLISH_FALLBACK: dict[CakeKDAPackedT1Variant, CakeKDAPackedT1Variant] = {
+    "cpasync_tile128_register_pipeline_pair_publish": (
+        "cpasync_tile128_register_pipeline"
+    ),
+}
+
+
+def _output_pair_store_aligned(output_view: torch.Tensor) -> bool:
+    """Whether the contiguous output view can take 32-bit BF16x2 pair stores."""
+
+    return int(output_view.data_ptr()) % 4 == 0
 
 
 def _target_for_device(device: torch.device) -> CakeKDAPackedT1Target:
@@ -53,11 +79,33 @@ def _target_for_device(device: torch.device) -> CakeKDAPackedT1Target:
                 "packed KDA T=1 on compute capability 10.3 requires CUDA 12.9 or newer"
             )
         return "sm100f"
+    if compute_capability == (10, 7):
+        if not is_cuda_version_at_least("13.0"):
+            raise RuntimeError(
+                "packed KDA T=1 on compute capability 10.7 requires CUDA 13.0 or newer"
+            )
+        return "sm100f"
     raise RuntimeError(
-        "packed KDA T=1 requires compute capability 10.0 "
-        "or 10.3 in the SM100 family; got "
+        "packed KDA T=1 requires compute capability 10.0, 10.3 or 10.7 "
+        "in the SM100 family; got "
         f"{compute_capability[0]}.{compute_capability[1]}"
     )
+
+
+def _target_for_variant(device: torch.device, variant: str) -> CakeKDAPackedT1Target:
+    """Select the target for a qualified Cake variant.
+
+    Compute capability 10.7 compiles the variants in ``_SM107_NATIVE_VARIANTS``
+    natively for sm_107a; everything else uses ``_target_for_device``.
+    """
+
+    target = _target_for_device(device)
+    if variant in _SM107_NATIVE_VARIANTS and get_compute_capability(device) == (
+        10,
+        7,
+    ):
+        return "sm107a"
+    return target
 
 
 def _optimized_alignment_flags(
@@ -144,14 +192,21 @@ def run_packed_kda_decode(
     )
     optimized_variant = select_cake_kda_packed_t1_variant(
         batch,
+        compute_capability=get_compute_capability(mixed_qkv.device),
         state_aligned=state_aligned,
         aux_vec4_aligned=aux_vec4_aligned,
     )
+    if optimized_variant in _PAIR_PUBLISH_FALLBACK and not _output_pair_store_aligned(
+        output_view
+    ):
+        optimized_variant = _PAIR_PUBLISH_FALLBACK[optimized_variant]
     if optimized_variant is None:
         legacy_variant = _legacy_variant_for_batch(batch)
         module = get_flash_kda_packed_t1_module(legacy_variant, target)
     else:
-        module = get_cake_kda_packed_t1_module(optimized_variant, target)
+        module = get_cake_kda_packed_t1_module(
+            optimized_variant, _target_for_variant(mixed_qkv.device, optimized_variant)
+        )
     module.run(
         mixed_qkv,
         raw_gate,

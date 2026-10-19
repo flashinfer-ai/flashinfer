@@ -105,6 +105,32 @@ class _BatchMLAModuleProxy:
 
 BatchPrefillPagedKVStrideMode = Literal["runtime", "equal", "independent"]
 BatchPrefillModuleSurface = Literal["full", "paged"]
+BatchAttentionKVStrideMode = Literal["runtime", "equal", "independent"]
+
+
+def _validate_batch_attention_stride_mode(
+    paged_kv_stride_mode: BatchAttentionKVStrideMode,
+) -> None:
+    if paged_kv_stride_mode not in ("runtime", "equal", "independent"):
+        raise ValueError(
+            "paged_kv_stride_mode must be one of 'runtime', 'equal', or "
+            f"'independent', got {paged_kv_stride_mode!r}"
+        )
+
+
+def _get_batch_attention_module_uri(
+    base_uri: str, paged_kv_stride_mode: BatchAttentionKVStrideMode
+) -> str:
+    _validate_batch_attention_stride_mode(paged_kv_stride_mode)
+    return (
+        base_uri
+        + {
+            "runtime": "",
+            "equal": "_kv_stride_equal",
+            "independent": "_kv_stride_independent",
+        }[paged_kv_stride_mode]
+    )
+
 
 _BATCH_PREFILL_MODULE_URI_SUFFIX = {
     ("runtime", "full"): "",
@@ -334,6 +360,7 @@ def get_single_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_token_head_sf: bool = False,
 ) -> str:
     return (
         f"single_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -344,7 +371,9 @@ def get_single_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}"
+        + ("_token_head_sf" if use_token_head_sf else "")
+        + ("_sm90" if backend == "fa3" else "")
     )
 
 
@@ -390,6 +419,7 @@ def get_batch_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_token_head_sf: bool = False,
 ) -> str:
     return (
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -401,7 +431,9 @@ def get_batch_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}"
+        + ("_token_head_sf" if use_token_head_sf else "")
+        + ("_sm90" if backend == "fa3" else "")
     )
 
 
@@ -506,6 +538,7 @@ def gen_single_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_token_head_sf: bool = False,
 ) -> JitSpec:
     uri = get_single_prefill_uri(
         backend,
@@ -518,6 +551,7 @@ def gen_single_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_token_head_sf,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -533,7 +567,9 @@ def gen_single_prefill_module(
             "maybe_k_cache_sf",
             "maybe_v_cache_sf",
         ]
-        additional_tensor_dtypes = ["uint8_t", "float", "uint8_t", "uint8_t"]
+        # FP8 token-head scale is a float32 tensor; NVFP4 (or no scale) is packed uint8.
+        sf_dtype = "float" if use_token_head_sf else "uint8_t"
+        additional_tensor_dtypes = ["uint8_t", "float", sf_dtype, sf_dtype]
         additional_scalar_names = [
             "logits_soft_cap",
             "sm_scale",
@@ -587,6 +623,7 @@ def gen_single_prefill_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
+        use_token_head_sf=use_token_head_sf,
     )
 
 
@@ -982,6 +1019,7 @@ def _gen_batch_prefill_module(
     *,
     paged_kv_stride_mode: BatchPrefillPagedKVStrideMode,
     module_surface: BatchPrefillModuleSurface,
+    use_token_head_sf: bool = False,
 ) -> JitSpec:
     base_uri = get_batch_prefill_uri(
         backend,
@@ -995,6 +1033,7 @@ def _gen_batch_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_token_head_sf,
     )
     uri = _get_batch_prefill_module_uri(
         base_uri, backend, paged_kv_stride_mode, module_surface
@@ -1024,6 +1063,8 @@ def _gen_batch_prefill_module(
             "maybe_k_cache_sf",
             "maybe_v_cache_sf",
         ]
+        # FP8 token-head scale is a float32 tensor; NVFP4 (or no scale) is packed uint8.
+        sf_dtype = "float" if use_token_head_sf else "uint8_t"
         additional_tensor_dtypes = [
             "uint8_t",
             "int32_t",
@@ -1031,8 +1072,8 @@ def _gen_batch_prefill_module(
             "uint32_t",
             "uint16_t",
             "uint16_t",
-            "uint8_t",
-            "uint8_t",
+            sf_dtype,
+            sf_dtype,
         ]  # NOTE(Zihao): int32_t should follow dtype_idx
         additional_scalar_names = [
             "logits_soft_cap",
@@ -1099,6 +1140,7 @@ def _gen_batch_prefill_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
+        use_token_head_sf=use_token_head_sf,
         paged_kv_stride_mode=paged_kv_stride_mode,
         module_surface=module_surface,
     )
@@ -1116,6 +1158,7 @@ def gen_batch_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_token_head_sf: bool = False,
 ) -> JitSpec:
     """Generate the public full batch-prefill module with runtime stride dispatch."""
     return _gen_batch_prefill_module(
@@ -1130,6 +1173,7 @@ def gen_batch_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_token_head_sf=use_token_head_sf,
         paged_kv_stride_mode="runtime",
         module_surface="full",
     )
@@ -1147,6 +1191,7 @@ def _gen_batch_prefill_primary_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_token_head_sf: bool = False,
 ) -> JitSpec:
     """Generate the internal full FA2 primary with equal-stride paged kernels."""
     return _gen_batch_prefill_module(
@@ -1161,6 +1206,7 @@ def _gen_batch_prefill_primary_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_token_head_sf=use_token_head_sf,
         paged_kv_stride_mode="equal",
         module_surface="full",
     )
@@ -1178,6 +1224,7 @@ def _gen_batch_prefill_independent_full_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_token_head_sf: bool = False,
 ) -> JitSpec:
     """Generate the feasibility-only full FA2 independent-stride module."""
     return _gen_batch_prefill_module(
@@ -1192,6 +1239,7 @@ def _gen_batch_prefill_independent_full_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_token_head_sf=use_token_head_sf,
         paged_kv_stride_mode="independent",
         module_surface="full",
     )
@@ -1209,6 +1257,7 @@ def _gen_batch_prefill_independent_paged_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_token_head_sf: bool = False,
 ) -> JitSpec:
     """Generate the internal paged-only FA2 independent-stride module."""
     return _gen_batch_prefill_module(
@@ -1223,6 +1272,7 @@ def _gen_batch_prefill_independent_paged_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_token_head_sf=use_token_head_sf,
         paged_kv_stride_mode="independent",
         module_surface="paged",
     )
@@ -1432,7 +1482,7 @@ def gen_batch_prefill_attention_sink_module(
     )
 
 
-def gen_batch_attention_module(
+def _gen_batch_attention_module(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
@@ -1442,6 +1492,8 @@ def gen_batch_attention_module(
     pos_encoding_mode: int,
     use_logits_soft_cap: bool,
     use_profiler: bool,
+    *,
+    paged_kv_stride_mode: BatchAttentionKVStrideMode,
 ):
     uri = get_batch_attention_uri(
         dtype_q,
@@ -1454,6 +1506,7 @@ def gen_batch_attention_module(
         use_logits_soft_cap,
         use_profiler,
     )
+    uri = _get_batch_attention_module_uri(uri, paged_kv_stride_mode)
 
     additional_tensor_names: List[str] = ["maybe_k_cache_sf", "maybe_v_cache_sf"]
     additional_tensor_dtypes: List[str] = ["uint8_t", "uint8_t"]
@@ -1462,7 +1515,7 @@ def gen_batch_attention_module(
     variant_name = f"StandardAttention<{str(use_logits_soft_cap).lower()}>"
     variant_decl = "#include<flashinfer/attention/variants.cuh>"
 
-    return gen_customize_batch_attention_module(
+    return _gen_customize_batch_attention_module(
         uri,
         dtype_q,
         dtype_kv,
@@ -1479,6 +1532,85 @@ def gen_batch_attention_module(
         pos_encoding_mode=pos_encoding_mode,
         use_logits_soft_cap=use_logits_soft_cap,
         use_profiler=use_profiler,
+        paged_kv_stride_mode=paged_kv_stride_mode,
+    )
+
+
+def gen_batch_attention_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_logits_soft_cap: bool,
+    use_profiler: bool,
+):
+    """Generate the public compatibility module with runtime stride dispatch."""
+    return _gen_batch_attention_module(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_logits_soft_cap,
+        use_profiler,
+        paged_kv_stride_mode="runtime",
+    )
+
+
+def _gen_batch_attention_primary_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_logits_soft_cap: bool,
+    use_profiler: bool,
+):
+    """Generate the default equal-stride persistent attention primary."""
+    return _gen_batch_attention_module(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_logits_soft_cap,
+        use_profiler,
+        paged_kv_stride_mode="equal",
+    )
+
+
+def _gen_batch_attention_independent_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_logits_soft_cap: bool,
+    use_profiler: bool,
+):
+    """Generate the persistent attention module loaded lazily for unequal strides."""
+    return _gen_batch_attention_module(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_logits_soft_cap,
+        use_profiler,
+        paged_kv_stride_mode="independent",
     )
 
 
@@ -1522,12 +1654,13 @@ def _append_nvfp4_sf_stride_setter(
     additional_params_setter: str,
     additional_tensor_names: List[str],
     params_expr: str = "params",
+    stride_func_name: str = "GetFP4ScaleStrides",
 ) -> str:
     stride_setters = []
     if "maybe_k_cache_sf" in additional_tensor_names:
         stride_setters.append(
             "if (maybe_k_cache_sf) { const auto& sf_tensor = maybe_k_cache_sf.value(); "
-            "auto sf_strides = GetFP4ScaleStrides(sf_tensor, kv_layout); "
+            f"auto sf_strides = {stride_func_name}(sf_tensor, kv_layout); "
             f"{params_expr}.k_sf_stride_page = sf_strides.stride_page; "
             f"{params_expr}.k_sf_stride_n = sf_strides.stride_n; "
             f"{params_expr}.k_sf_stride_h = sf_strides.stride_h; }}"
@@ -1535,7 +1668,7 @@ def _append_nvfp4_sf_stride_setter(
     if "maybe_v_cache_sf" in additional_tensor_names:
         stride_setters.append(
             "if (maybe_v_cache_sf) { const auto& sf_tensor = maybe_v_cache_sf.value(); "
-            "auto sf_strides = GetFP4ScaleStrides(sf_tensor, kv_layout); "
+            f"auto sf_strides = {stride_func_name}(sf_tensor, kv_layout); "
             f"{params_expr}.v_sf_stride_page = sf_strides.stride_page; "
             f"{params_expr}.v_sf_stride_n = sf_strides.stride_n; "
             f"{params_expr}.v_sf_stride_h = sf_strides.stride_h; }}"
@@ -1656,6 +1789,7 @@ def gen_customize_single_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    use_token_head_sf: bool = False,
 ) -> JitSpec:
     kwargs = {
         "variant_decl": variant_decl,
@@ -1669,6 +1803,7 @@ def gen_customize_single_prefill_module(
         "use_sliding_window": str(use_sliding_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
         "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
+        "use_token_head_sf": str(use_token_head_sf).lower(),
     }
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")
@@ -1911,6 +2046,7 @@ def gen_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    use_token_head_sf: bool = False,
     paged_kv_stride_mode: BatchPrefillPagedKVStrideMode = "runtime",
     module_surface: BatchPrefillModuleSurface = "full",
 ) -> JitSpec:
@@ -1925,6 +2061,18 @@ def gen_customize_batch_prefill_module(
         if missing_sf_tensors:
             raise ValueError(
                 "NVFP4 KV paged prefill JIT modules require scale-factor tensors "
+                f"{missing_sf_tensors}; pass maybe_k_cache_sf and maybe_v_cache_sf "
+                "as additional tensors."
+            )
+    if use_token_head_sf:
+        missing_sf_tensors = [
+            name
+            for name in ("maybe_k_cache_sf", "maybe_v_cache_sf")
+            if name not in additional_tensor_names
+        ]
+        if missing_sf_tensors:
+            raise ValueError(
+                "FP8 token-head-scale prefill JIT modules require scale-factor tensors "
                 f"{missing_sf_tensors}; pass maybe_k_cache_sf and maybe_v_cache_sf "
                 "as additional tensors."
             )
@@ -1943,6 +2091,7 @@ def gen_customize_batch_prefill_module(
         "use_sliding_window": str(use_sliding_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
         "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
+        "use_token_head_sf": str(use_token_head_sf).lower(),
         "paged_kv_stride_mode": paged_kv_stride_mode,
         "same_kv_strides_values": {
             "runtime": ["true", "false"],
@@ -1963,7 +2112,11 @@ def gen_customize_batch_prefill_module(
             )
         )
         additional_params_setter = _append_nvfp4_sf_stride_setter(
-            additional_params_setter, additional_tensor_names
+            additional_params_setter,
+            additional_tensor_names,
+            stride_func_name="GetFP8ScaleStrides"
+            if use_token_head_sf
+            else "GetFP4ScaleStrides",
         )
 
         with open(
@@ -2254,6 +2407,49 @@ def gen_customize_batch_attention_module(
     use_logits_soft_cap: bool = False,
     use_profiler: bool = False,
 ):
+    """Generate a custom runtime-dispatched module under the caller's unchanged URI."""
+    return _gen_customize_batch_attention_module(
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        idtype,
+        head_dim_qk,
+        head_dim_vo,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode=pos_encoding_mode,
+        use_logits_soft_cap=use_logits_soft_cap,
+        use_profiler=use_profiler,
+        paged_kv_stride_mode="runtime",
+    )
+
+
+def _gen_customize_batch_attention_module(
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    idtype: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_logits_soft_cap: bool = False,
+    use_profiler: bool = False,
+    *,
+    paged_kv_stride_mode: BatchAttentionKVStrideMode,
+):
+    _validate_batch_attention_stride_mode(paged_kv_stride_mode)
     kwargs = {
         "variant_decl": variant_decl,
         "variant_name": variant_name,
@@ -2265,6 +2461,12 @@ def gen_customize_batch_attention_module(
         "head_dim_vo": head_dim_vo,
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
+        "paged_kv_stride_mode": paged_kv_stride_mode,
+        "equal_kv_strides_values": {
+            "runtime": ["false", "true"],
+            "equal": ["true"],
+            "independent": ["false"],
+        }[paged_kv_stride_mode],
     }
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     (additional_params_decl, additional_func_params, _) = generate_additional_params(

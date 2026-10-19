@@ -17,6 +17,7 @@ limitations under the License.
 """Cake SM90 VSA (``backend="cake"`` on Hopper): planning, numerics, lifetime, API."""
 
 
+import contextlib
 import warnings
 
 import pytest
@@ -25,7 +26,6 @@ import torch
 from flashinfer.cake_vsa_sm90 import (
     MAX_NSPLIT,
     PLAN_HALFWORDS,
-    REFERENCE_CLUSTER_CAPACITY_H100_SXM,
     CLUSTER_VARIANTS,
     PLAN_META_SPLIT,
     PLAN_META_UNSPLIT,
@@ -44,6 +44,8 @@ from flashinfer.cake_vsa_sm90 import (
     META_SEQ_OFF,
     META_WORDS,
     OWN_WORDS,
+    POOL_MIN_TILES,
+    POOL_ROUNDS,
     _schedule_feasible,
     plan_small,
     plan_vsa_sm90,
@@ -52,7 +54,17 @@ from flashinfer.cake_vsa_sm90 import (
 )
 
 
-CAP = REFERENCE_CLUSTER_CAPACITY_H100_SXM  # measured co-resident cluster capacity of the 132-SM H100 SXM
+# Measured co-resident cluster capacity ``{csize: clusters}`` of the 132-SM H100
+# SXM (``cuOccupancyMaxActiveClusters`` at one CTA per SM).  Planning resolves
+# the live device's table through ``cluster_capacity``; these tests pin this one.
+REFERENCE_CLUSTER_CAPACITY_H100_SXM: dict[int, int] = {
+    2: 66,
+    3: 39,
+    4: 30,
+    6: 17,
+    8: 15,
+}
+CAP = REFERENCE_CLUSTER_CAPACITY_H100_SXM
 
 
 def _random_mask(h, mb, nb, capacity, seed=0, ragged=True, device="cpu"):
@@ -190,7 +202,10 @@ def test_cluster_one_wave_uses_the_device_capacity():
         cluster_variant_for([8] * 16, sms=132, cluster_capacity={2: 66})
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
+    reason="thread block clusters need a Hopper or newer GPU",
+)
 def test_cluster_capacity_resolves_from_the_driver():
     cap = cluster_capacity(torch.cuda.current_device())
     sms = torch.cuda.get_device_properties(0).multi_processor_count
@@ -276,7 +291,7 @@ def test_plan_small_layout_and_padding():
         plan_small(_random_mask(2, 128, 32, 6, ragged=False))
 
 
-@pytest.mark.parametrize("kmax", [1, 3, 4, 6])
+@pytest.mark.parametrize("kmax", [4, 6])
 def test_plan_small_split_slices_cover_each_selection_once(kmax):
     mask = _random_mask(1, 16, 64, 16, seed=5, ragged=True)
     plan = plan_small(mask, kmax=kmax, split=True)
@@ -301,18 +316,114 @@ def test_plan_small_split_slices_cover_each_selection_once(kmax):
     )
     assert plan["max_nsplit"] == max(r["nsplit"] for r in rows) <= MAX_NSPLIT
     with pytest.raises(ValueError, match="slices"):
-        plan_small(torch.ones((1, 1, 64), dtype=torch.bool), kmax=1, split=True)
+        plan_small(torch.ones((1, 1, 200), dtype=torch.bool), kmax=4, split=True)
+
+
+def test_split_variants_are_the_shipped_ones():
+    """Only the KMAX 4 and 6 split-KV kernels ship: ``split_kmax`` never names
+    another variant and ``plan_small`` refuses to plan one.  The retired KMAX 1
+    split was the planner's choice only on a band of ragged masks whose grid
+    sits at the sliced-route edge (``2 * tiles`` within two of the SM count)
+    with one outlier selection; those masks now run the persistent kernel."""
+    for counts in ([2], [3] * 8, [7] * 65 + [13], [7] * 64 + [25], [9] * 40):
+        assert split_kmax(counts) in (4, 6)
+        # no shipped variant fits one wave: small_route falls through
+        with contextlib.suppress(ValueError):
+            assert split_kmax(counts, sms=132) in (4, 6)
+    for kmax in (1, 3):
+        with pytest.raises(ValueError, match="split-KV variant"):
+            plan_small(_random_mask(1, 4, 8, 6, seed=3), kmax=kmax, split=True)
+    # 66 tiles, 65 x 7 blocks + one 13-block selection: KMAX 3/4/6 exceed one wave
+    # of 132 SMs, no cluster variant holds 66 tiles -> persistent kernel.
+    mask = torch.zeros((6, 11, 16), dtype=torch.bool)
+    mask[:, :, :7] = True
+    mask[5, 10, :13] = True
+    assert small_route(mask, sms=132, cluster_capacity=CAP) is None
+
+
+def test_stage_table_builds_every_stage_from_the_shared_launcher():
+    from flashinfer.jit import cake_vsa_sm90 as sm90_jit
+
+    sm90_jit.gen_cake_vsa_sm90_module.cache_clear()
+    try:
+        assert len(sm90_jit.STAGES) == 14
+        for stage in sm90_jit.STAGES:
+            row = sm90_jit._STAGES[stage]
+            # Building the spec re-hashes both sources against the table pins.
+            spec = sm90_jit.gen_cake_vsa_sm90_module(stage)
+            assert [source.name for source in spec.sources] == [
+                f"{row.module}_kernel.cu",
+                "cake_vsa_sm90_binding.cu",
+            ]
+            defines = dict(
+                flag[2:].split("=", 1)
+                for flag in spec.extra_cuda_cflags
+                if flag.startswith("-DCAKE_VSA_SM90_")
+            )
+            assert defines == {
+                "CAKE_VSA_SM90_KERNEL": f"kernel_{row.module}",
+                "CAKE_VSA_SM90_SHIM_NAMESPACE": f"cake_host_shim_{row.shim}",
+                "CAKE_VSA_SM90_THREADS": f"{row.threads}u",
+                "CAKE_VSA_SM90_SMEM_BYTES": f"{row.smem_bytes}u",
+                "CAKE_VSA_SM90_CLUSTER_X": str(row.cluster_x),
+                "CAKE_VSA_SM90_ABI": str(row.abi),
+            }
+        with pytest.raises(ValueError, match="unknown Cake SM90 VSA stage"):
+            sm90_jit.gen_cake_vsa_sm90_module("small_k1s")
+    finally:
+        sm90_jit.gen_cake_vsa_sm90_module.cache_clear()
+
+
+def test_stage_table_geometry_matches_the_stage_names():
+    from flashinfer.jit.cake_vsa_sm90 import _STAGES
+
+    for stage, row in _STAGES.items():
+        if stage.startswith("attention"):
+            assert (row.abi, row.cluster_x, row.threads) == (3, 1, 384)
+        elif stage.endswith("s"):
+            assert (row.abi, row.cluster_x, row.threads) == (2, 1, 256)
+        elif "c" in stage[len("small_k") :]:
+            assert (row.abi, row.cluster_x) == (1, int(stage.rsplit("c", 1)[1]))
+            assert row.threads == 256
+        else:
+            assert (row.abi, row.cluster_x) == (1, 1)
+            assert row.threads == (128 if stage == "small_k1" else 256)
+        assert row.smem_bytes <= 232448
+
+
+def _tile_rows(plan):
+    """Per-CTA plan rows: the static rows ``c * stride + i`` (the first row's
+    META_NTILES word = static count), plus, in the queue layout, a round-robin
+    preview of the pool rows (from ``g * stride``, handed out at run time) and
+    a check of the all-zero sentinel rows that follow them."""
+    meta = plan["meta"]
+    g, stride, n_pool = plan["num_ctas"], plan["tile_stride"], len(plan["pool"])
+    out = []
+    for c in range(g):
+        n_static = int(meta[c * stride, META_NTILES])
+        assert 1 <= n_static <= stride
+        assert all(
+            int(meta[c * stride + i, META_NTILES]) == int(plan["queue"])
+            for i in range(1, n_static)
+        )
+        out.append([c * stride + i for i in range(n_static)])
+    if not plan["queue"]:
+        assert n_pool == 0 and meta.shape[0] == plan["num_rows"] == g * stride
+        return out
+    assert n_pool > 0 and meta.shape[0] == plan["num_rows"] == g * stride + n_pool + g
+    assert all(int(meta[g * stride + j, META_NTILES]) == 1 for j in range(n_pool))
+    assert not meta[g * stride + n_pool :].any(), "sentinel rows must be all zero"
+    for c in range(g):
+        out[c].extend(g * stride + j for j in range(c, n_pool, g))
+    return out
 
 
 def _decode_tiles(plan):
     """Yield (head, qb0, qb1, mode, positions[(blk_a, blk_b)], owns[2]) per tile."""
     meta = plan["meta"].numpy().view("uint32")
-    stride = plan["tile_stride"]
-    for c in range(plan["num_ctas"]):
-        n_tiles = int(meta[c * stride, META_NTILES])
-        assert 1 <= n_tiles <= stride
-        for i in range(n_tiles):
-            row = meta[c * stride + i]
+    for rows in _tile_rows(plan):
+        for r in rows:
+            row = meta[r]
             head, qb0, qb1, mode = (int(x) for x in row[:4])
             n_seq = int(row[META_NSEQ])
             words = row[META_SEQ_OFF : META_SEQ_OFF + n_seq]
@@ -404,17 +515,23 @@ def test_plan_rejects_unsupported_masks():
 
 def _cta_tiles(plan):
     """Per-CTA lists of (head, positions) read back from the plan rows."""
+    meta = plan["meta"]
+    return [
+        [(int(meta[r, 0]), int(meta[r, META_NSEQ])) for r in rows]
+        for rows in _tile_rows(plan)
+    ]
+
+
+def _static_tiles(plan):
+    """Per-CTA (head, positions) of the static rows only (the pool is run-time)."""
     meta, stride = plan["meta"], plan["tile_stride"]
-    out = []
-    for c in range(plan["num_ctas"]):
-        n = int(meta[c * stride, META_NTILES])
-        out.append(
-            [
-                (int(meta[c * stride + i, 0]), int(meta[c * stride + i, META_NSEQ]))
-                for i in range(n)
-            ]
-        )
-    return out
+    return [
+        [
+            (int(meta[c * stride + i, 0]), int(meta[c * stride + i, META_NSEQ]))
+            for i in range(int(meta[c * stride, META_NTILES]))
+        ]
+        for c in range(plan["num_ctas"])
+    ]
 
 
 def test_plan_ragged_tile_order_balances_when_kv_fits_l2():
@@ -438,9 +555,57 @@ def test_plan_ragged_tile_order_stays_head_major_above_l2_budget():
     # tiles arrive in head order (the concurrently running CTAs share a head).
     mask = _random_mask(8, 64, 512, 16, ragged=True)
     plan = plan_vsa_sm90(mask, mode="split", sms=132)
-    for tiles in _cta_tiles(plan):
+    assert not plan["queue"] and plan["pool"] == []  # ragged: static kernel
+    for tiles in _static_tiles(plan):
         heads = [h for h, _ in tiles]
         assert heads == sorted(heads)
+
+
+def test_plan_queue_layout_for_long_uniform_plans(monkeypatch):
+    """A uniform plan with >= POOL_MIN_TILES tiles per CTA takes the queue kernel:
+    every CTA's list minus its last POOL_ROUNDS tiles stays static (list-schedule
+    order), the removed tiles form the pool in round order, one all-zero sentinel
+    row per CTA follows; below the threshold the layout is the static one."""
+    import flashinfer.cake_vsa_sm90 as module
+
+    mask = _topk_mask(7, 512, 512, 64)  # 1792 pair tiles = 14 x 128
+    plan = plan_vsa_sm90(mask, mode="pair", sms=132)
+    lists = plan["tile_lists"]
+    g, stride = plan["num_ctas"], plan["tile_stride"]
+    assert plan["queue"] and g == 128 and stride == 14 - POOL_ROUNDS
+    assert len(plan["pool"]) == g * POOL_ROUNDS
+    assert plan["num_rows"] == g * stride + len(plan["pool"]) + g
+    meta = plan["meta"]
+    assert all(int(meta[c * stride, META_NTILES]) == stride for c in range(g))
+    for c, lst in enumerate(lists):
+        for i, t in enumerate(lst[:stride]):
+            assert int(meta[c * stride + i, 0]) == t // 256  # natural (head) order
+    pool_heads = [int(meta[g * stride + j, 0]) for j in range(len(plan["pool"]))]
+    assert pool_heads == [
+        lists[c][i] // 256 for i in range(stride, 14) for c in range(g)
+    ]
+    assert sum(len(t) for t in _cta_tiles(plan)) == 1792
+    monkeypatch.setattr(module, "POOL_MIN_TILES", 15)
+    static = plan_vsa_sm90(mask, mode="pair", sms=132)
+    assert not static["queue"] and static["tile_stride"] == 14
+    assert static["num_rows"] == 128 * 14 and static["tile_lists"] == lists
+    assert all(int(static["meta"][c * 14, META_NTILES]) == 14 for c in range(128))
+
+
+def test_plan_queue_threshold_and_tiny_tile_exception(monkeypatch):
+    """8 tiles per CTA of 16 positions keep the static kernel (measured 1 % slower on the
+    CuTe route with the queue); the tiny-tile exception is off by default."""
+    import flashinfer.cake_vsa_sm90 as module
+
+    big = _topk_mask(16, 64, 256, 16)  # split, 1024 tiles = 8 x 128
+    plan = plan_vsa_sm90(big, sms=132)
+    assert plan["num_ctas"] == 128 and min(map(len, plan["tile_lists"])) == 8
+    assert not plan["queue"]
+    tiny = _topk_mask(8, 128, 128, 2)  # split, 1024 tiles of <= 2 positions
+    assert not plan_vsa_sm90(tiny, sms=132)["queue"]
+    monkeypatch.setattr(module, "POOL_SMALL_TILE_POS", 4)
+    assert plan_vsa_sm90(tiny, sms=132)["queue"]
+    assert not plan_vsa_sm90(big, sms=132)["queue"]
 
 
 def test_plan_mode_selection_prefers_split_below_full_occupancy():
@@ -549,7 +714,7 @@ def test_small_and_persistent_routes_agree(h, mb, nb, capacity, scale):
         (1, 16, 16, 16, None, False),  # the benchmark's h1-m1024-k16 row
         (1, 16, 64, 16, 0.5, True),
         (2, 8, 64, 64, None, True),  # 64 blocks -> up to 11 slices at KMAX 6
-        (1, 1, 2, 2, 1e-7, False),  # two slices of one block
+        (1, 1, 8, 6, 1e-7, False),  # one query block, two slices of KMAX 4
         (3, 5, 10, 9, 0.0, True),
         (3, 5, 10, 9, -0.125, True),
     ],
@@ -946,6 +1111,50 @@ def test_plan_stream_and_graph_lifetime():
                 wrapper.run(q, k, v)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
+    reason="cake (SM90) VSA requires Hopper compute capability 9.0",
+)
+def test_queue_kernel_matches_the_static_kernel_bit_exact(monkeypatch):
+    """The queue kernel only moves tiles between CTAs: its output is bit-identical
+    to the static kernel's on the same plan, its queue words return to zero after
+    every launch, and a captured graph replays it."""
+    import flashinfer.cake_vsa_sm90 as module
+
+    h, mb, nb = (
+        8,
+        528,
+        64,
+    )  # 2112 pair tiles: 15-16 per CTA on 132 SMs (>= POOL_MIN_TILES)
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    mask = _topk_mask(h, mb, nb, 8).cuda()
+    rows = torch.full((h, mb), 64, dtype=torch.int32, device="cuda")
+    cols = torch.full((h, nb), 64, dtype=torch.int32, device="cuda")
+    q, k, v = _inputs(h, mb, nb)
+    queued = CakeVsaSm90Plan("cuda", mask, rows, cols, h, h, 128, route="persistent")
+    if not queued.queue:
+        pytest.skip(f"{sms} SMs: fewer than {POOL_MIN_TILES} tiles per CTA")
+    out = torch.empty((h * mb * 64, 1, 128), device="cuda", dtype=q.dtype)
+    first = queued.run(q, k, v, out=out).clone()
+    torch.cuda.synchronize()
+    assert int(queued.dbg[62:64].abs().sum()) == 0
+    monkeypatch.setattr(module, "POOL_MIN_TILES", 10**9)
+    static = CakeVsaSm90Plan("cuda", mask, rows, cols, h, h, 128, route="persistent")
+    assert not static.queue and static.num_ctas == queued.num_ctas
+    torch.testing.assert_close(static.run(q, k, v), first, atol=0, rtol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        queued.run(q, k, v, out=out)
+    for _ in range(3):
+        out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out.view_as(q), first, atol=0, rtol=0)
+        assert int(queued.dbg[62:64].abs().sum()) == 0
+    reference = _reference(q, k, v, mask, 128**-0.5).float()
+    torch.testing.assert_close(first.float(), reference, atol=1e-2, rtol=1e-2)
+
+
 def _topk_mask(h, mb, nb, k, seed=42):
     g = torch.Generator(device="cpu").manual_seed(seed)
     idx = torch.rand((h, mb, nb), generator=g).topk(k, dim=-1).indices
@@ -1050,15 +1259,14 @@ def test_plan_odd_block_of_a_pair_plan_runs_alone_on_warpgroup_0():
 
 
 @requires_hopper
-@pytest.mark.parametrize("backend", ["cake", "cake_cute"])
-def test_odd_single_block_tile_never_stores_from_the_idle_warpgroup(backend):
+def test_odd_single_block_tile_never_stores_from_the_idle_warpgroup():
     # On a mode-2 tile both warpgroups address the same 64 output rows; the
     # idle warpgroup's accumulator is 0 x rcp(0) = NaN and its store must not
     # happen (it raced the owner's store).  NaN-filled output, many runs.
     mask = _odd_single_block_mask().cuda()
     torch.manual_seed(11)
     q, k, v = _inputs(2, 129, 1024)
-    wrapper = _wrapper(mask, backend=backend)
+    wrapper = _wrapper(mask)
     expected = _reference(q, k, v, mask, 128**-0.5)
     for _ in range(20):
         out = torch.full(
@@ -1069,3 +1277,34 @@ def test_odd_single_block_tile_never_stores_from_the_idle_warpgroup(backend):
             "an output row was never written or holds NaN"
         )
         torch.testing.assert_close(actual.float(), expected, atol=0.01, rtol=0.01)
+
+
+@requires_hopper
+def test_backend_cake_cute_is_an_alias_of_cake():
+    """``backend="cake_cute"`` (the name of the removed CuTe DSL build) plans and
+    runs the ``cake`` kernels: same stage, bit-identical output, same DPS ABI."""
+    from flashinfer.sparse import VariableBlockSparseAttentionWrapper
+
+    h, mb, nb = 2, 16, 16
+    mask = _topk_mask(h, mb, nb, 12).cuda()
+    rows = torch.full((h, mb), 64, dtype=torch.int32, device="cuda")
+    cols = torch.full((h, nb), 64, dtype=torch.int32, device="cuda")
+    wrappers = {}
+    for backend in ("cake", "cake_cute"):
+        wrapper = VariableBlockSparseAttentionWrapper(
+            torch.empty(0, device="cuda", dtype=torch.uint8), backend=backend
+        )
+        wrapper.plan(
+            mask, rows, cols, h, h, 128, q_data_type=torch.bfloat16, non_blocking=False
+        )
+        wrappers[backend] = wrapper
+    plan_a = wrappers["cake"]._cake_vsa_sm90_plan
+    plan_b = wrappers["cake_cute"]._cake_vsa_sm90_plan
+    for name in ("small_kmax", "small_split", "small_cluster", "num_ctas"):
+        assert getattr(plan_a, name) == getattr(plan_b, name), name
+    q, k, v = _inputs(h, mb, nb)
+    out = torch.empty((h * mb * 64, 1, 128), device="cuda", dtype=torch.bfloat16)
+    expected = wrappers["cake"].run(q, k, v, enable_pdl=False)
+    actual = wrappers["cake_cute"].run(q, k, v, out=out, enable_pdl=False)
+    assert actual.data_ptr() == out.data_ptr() and actual.shape == q.shape
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)

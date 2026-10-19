@@ -427,7 +427,8 @@ def alphamoe_nvfp4_aligned_moe(
     ----------
     hidden_states : torch.Tensor
         Packed E2M1 activations ``[M, K / 2]``. The innermost stride must be 1;
-        row-strided views are supported.
+        row-strided views require a positive row stride of at least ``K / 2``
+        that is divisible by 16, and a 16-byte-aligned data pointer.
     hidden_states_scale : torch.Tensor
         Linear E4M3 scales ``[M, K / 16]``.
     gemm1_weights : torch.Tensor
@@ -925,6 +926,72 @@ def alphamoe_nvfp4_routed_moe(
     weighted route sum is written directly (the prior contents of ``out`` are
     ignored, so no zero fill is needed); the result equals the seeded path on a
     zero output bit for bit.
+
+    Parameters
+    ----------
+    hidden_states : torch.Tensor
+        Packed E2M1 activations ``[M, K / 2]``. The innermost stride must be 1;
+        row-strided views are supported.
+    hidden_states_scale : torch.Tensor
+        Linear E4M3 scales ``[M, K / 16]``.
+    gemm1_weights : torch.Tensor
+        Packed gate/up weights ``[E, N, K / 2]`` with ``N`` divisible by 256.
+    gemm1_weights_scale : torch.Tensor
+        Linear E4M3 scales ``[E, N, K / 16]``.
+    gemm2_weights : torch.Tensor
+        Packed down weights ``[E, K, N / 4]``.
+    gemm2_weights_scale : torch.Tensor
+        Linear E4M3 scales ``[E, K, N / 32]``.
+    output1_scale_gate_scalar : torch.Tensor
+        Contiguous FP32 per-expert gate dequantization scales ``[E]``.
+    output1_scale_scalar : torch.Tensor
+        Contiguous FP32 per-expert up-projection scales ``[E]``.
+    output2_scale_scalar : torch.Tensor
+        Contiguous FP32 per-expert down-projection scales ``[E]``.
+    sorted_token_ids : torch.Tensor
+        Caller-owned contiguous int32 storage for aligned-plan entries. It must
+        hold at least ``expert_ids.numel() * block_m`` entries.
+    expert_ids : torch.Tensor
+        Caller-owned contiguous int32 storage for expert ids in the aligned plan.
+    num_tokens_post_padded : torch.Tensor
+        Caller-owned one-element int32 tensor receiving the valid plan extent.
+    topk_weights : torch.Tensor
+        FP32 route weights ``[M, top_k]``.
+    out : torch.Tensor
+        Contiguous BF16 output ``[M, K]``. It is updated in place and returned.
+    topk_ids : torch.Tensor
+        Contiguous int32 routed expert ids ``[M, top_k]`` used to build the plan.
+    cumsum_buffer : torch.Tensor
+        Caller-owned contiguous int32 routing workspace with at least ``E + 2`` entries.
+    top_k : int
+        Routes per token.
+    block_m : int
+        Routing-plan block size, at least 8 and divisible by 8.
+    routed_scaling_factor : float
+        Finite scalar applied to each routed contribution.
+    w1_scale_prepared, w2_scale_prepared : Optional[torch.Tensor]
+        Immutable prepared scale panels from :func:`prepare_nvfp4_w1_scales` and
+        :func:`prepare_nvfp4_w2_scales`.
+    w1_data_prepared : Optional[torch.Tensor]
+        Immutable W1 panels from :func:`prepare_nvfp4_w1_data` for eligible routes.
+    w1_gate_up_data_prepared, w1_gate_up_scale_prepared : Optional[torch.Tensor]
+        Immutable adjacent gate/up panels from :func:`prepare_nvfp4_w1_gate_up_data`
+        and :func:`prepare_nvfp4_w1_gate_up_scales` for the M512 route.
+    w1_scale_prepared_interleaved : Optional[torch.Tensor]
+        Immutable interleaved W1 scales from :func:`prepare_nvfp4_w1_scales_interleaved`.
+    w2_data_prepared : Optional[torch.Tensor]
+        Immutable W2 panels from :func:`prepare_nvfp4_w2_data` for eligible routes.
+    w2_data_prepared_k256, w2_scale_prepared_k256 : Optional[torch.Tensor]
+        Immutable K256 W2 data and scale panels from
+        :func:`prepare_nvfp4_w2_data_k256` and :func:`prepare_nvfp4_w2_scales_k256`.
+    accumulate : bool
+        If ``True``, add routed contributions to the existing ``out`` values;
+        otherwise overwrite ``out`` with the routed sum.
+
+    Returns
+    -------
+    torch.Tensor
+        The same ``out`` tensor after routed accumulation.
     """
     _check_alphamoe_nvfp4_supported(
         hidden_states,
@@ -1587,6 +1654,37 @@ def _alphamoe_complete_route_id(
     m, packed_k = hidden_states.shape
     e, n, _ = gemm1_weights.shape
     k = packed_k * 2
+    if (n, k, e, top_k, block_m) == (256, 7168, 256, 8, 8):
+        # I=128 source geometry (N = 2*128, K = 7168). Only the eight-token route-9 fast chain is admitted
+        # (in-kernel-aligned prepared-W1 up + persistent BF16-route down + no-seed finalize): its kernels are
+        # runtime-generic in N/K (grid.y = N/128 panels, intermediate_blocks_total = N/256 = 1, K = 7168) and the
+        # host launcher admits blocks == 1 for this geometry. Requires every route-9 carrier; otherwise route 0.
+        if (
+            m == 8
+            and w1_scale_prepared is not None
+            and w1_data_prepared is not None
+            and w1_scale_prepared_interleaved is not None
+            and w2_scale_prepared is not None
+            and w1_scale_prepared.dtype == torch.uint8
+            and w1_scale_prepared.is_contiguous()
+            and w1_scale_prepared.device == gemm1_weights_scale.device
+            and tuple(gemm1_weights_scale.shape) == (e, n, k // 16)
+            and tuple(w1_scale_prepared.shape) == (e * (n // 128) * (k // 256), 16, 128)
+            and w1_scale_prepared.data_ptr() % 16 == 0
+            and all(
+                scale.data_ptr() % 4 == 0
+                for scale in (
+                    hidden_states_scale,
+                    gemm1_weights_scale,
+                    gemm2_weights_scale,
+                )
+            )
+            and is_alphamoe_nvfp4_alignment_seed_supported(
+                topk_ids, e + 1, block_m, out, True
+            )
+        ):
+            return 9
+        return 0
     if (n, k, e, top_k, block_m) != (1024, 6144, 256, 8, 8):
         return 0
     if (m == 1 or (m == 8 and _m8_split_k_route_enabled())) and (
@@ -1646,9 +1744,29 @@ def _alphamoe_complete_route_id(
     ):
         return 9
     if m == 128:
+        if (
+            w1_data_prepared is not None
+            and w2_data_prepared is not None
+            and w2_data_prepared_k256 is not None
+            and w2_scale_prepared_k256 is not None
+            and out.data_ptr() % 16 == 0
+        ):
+            # Route 19: route 10 with the self-routing up kernel c336sr (static expert-major CTA map, no c327 launch); same operands as route 10.
+            return 19
         if w1_data_prepared is not None and w2_data_prepared is not None:
             return 10 if out.data_ptr() % 16 == 0 else 11
         return 3
+    if (
+        m == 512
+        and w1_data_prepared is not None
+        and w2_data_prepared_k256 is not None
+        and w2_scale_prepared_k256 is not None
+        and out.data_ptr() % 16 == 0
+    ):
+        # Route 18: route 17 (route 12 with the K-256 prepared W2 panels, c358nd down) with the self-routing up kernel c340sr
+        # (static expert-major CTA map, no c376 launch); same operands as route 17, which stays reachable only through an
+        # explicit route id.
+        return 18
     if m == 512:
         if w1_data_prepared is not None and w2_data_prepared is not None:
             return 12 if out.data_ptr() % 16 == 0 else 13
@@ -1830,14 +1948,14 @@ def _alphamoe_try_complete_routed(
         )
         route_dtype = (
             torch.bfloat16
-            if route_id in (4, 5, 6, 9, 10, 11, 12, 13, 14, 15)
+            if route_id in (4, 5, 6, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19)
             else torch.float32
         )
         allocate_routes = torch.zeros if route_id == 7 else torch.empty
         route_accumulator = allocate_routes(
             (m * top_k, k), dtype=route_dtype, device=out.device
         )
-        if route_id in (2, 3, 9, 10, 11, 12, 13, 14, 15):
+        if route_id in (2, 3, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19):
             route_experts = torch.empty(
                 (m * top_k,), dtype=torch.int32, device=out.device
             )
@@ -1883,6 +2001,8 @@ def _alphamoe_try_complete_routed(
         merge_counters,
         w2_data_prepared,
         accumulate,
+        w2_data_prepared_k256,
+        w2_scale_prepared_k256,
     )
     return True
 
@@ -2308,6 +2428,8 @@ def alphamoe_nvfp4_routed_moe_deferred(
         w1_scale_prepared_interleaved,
         merge_counters,
         w2_data_prepared,
+        w2_data_prepared_k256,
+        w2_scale_prepared_k256,
     )
     return AlphaMoeNvfp4DeferredOutput(
         route_id,

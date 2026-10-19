@@ -33,7 +33,21 @@ from flashinfer.cute_dsl import is_cute_dsl_available
 from flashinfer.testing.utils import dequantize_fp8, quantize_fp8
 from flashinfer.utils import get_compute_capability
 
-pytestmark = pytest.mark.solo
+# Peak host RSS 124-200 GiB in 9 of 35 flashinfer-ci nightly runs (2026-10),
+# from JIT-building the blockscale GEMM module when no earlier file in the job
+# built it; 2-4 GiB otherwise.
+pytestmark = pytest.mark.node_exclusive
+
+# Representative cuTile subset: every shape is a fresh tileiras JIT.
+_CUTILE_GEMM_SHAPES = {
+    (m, n, k) for m in (128, 512, 8192) for n in (256, 4096) for k in (128, 8192)
+}
+_CUTILE_GROUP_GEMM_SHAPES = {
+    (m, n, k, g)
+    for m in (4, 128, 512, 4096)
+    for (n, k) in ((128, 128), (4096, 8192))
+    for g in (1, 8)
+}
 
 
 @pytest.mark.parametrize("m", [128, 256, 512, 4096, 8192])
@@ -93,25 +107,18 @@ def test_fp8_groupwise_gemm(
     scale_major_mode,
     backend,
 ):
-    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if not torch.cuda.is_available():
+        pytest.skip("gemm_fp8_nt_groupwise requires CUDA")
+    major, minor = get_compute_capability(torch.device("cuda"))
+    cc = major * 10 + minor
+    if not gemm_fp8_nt_groupwise.is_backend_supported(backend, cc):
+        pytest.skip(f"gemm_fp8_nt_groupwise backend {backend} does not support SM{cc}")
     if backend == "trtllm":
-        if compute_capability[0] != 10:
-            pytest.skip(
-                "gemm_fp8_nt_groupwise is only supported on SM100, SM103, SM107 in trtllm backend."
-            )
         if scale_major_mode != "MN":
             pytest.skip("trtllm only supports MN scale_major_mode")
         if k < 256:
             pytest.skip("k < 256")
-    if backend == "cutlass" and compute_capability[0] not in [10, 11, 12]:
-        pytest.skip(
-            "gemm_fp8_nt_groupwise with cutlass backend is only supported on SM100/103/107, SM110, and SM120/121 GPUs."
-        )
     if backend == "cutile":
-        if compute_capability[0] not in [10, 11, 12]:
-            pytest.skip(
-                "gemm_fp8_nt_groupwise with cuTile backend is only supported on SM100+ GPUs."
-            )
         if scale_major_mode != "K":
             pytest.skip(
                 "gemm_fp8_nt_groupwise with cuTile backend currently supports scale_major_mode='K' only."
@@ -120,6 +127,8 @@ def test_fp8_groupwise_gemm(
             pytest.skip(
                 "cuda-tile / tileiras compiler not available in this environment."
             )
+        if (m, n, k) not in _CUTILE_GEMM_SHAPES:
+            pytest.skip("cuTile: reduced shape grid (one tileiras JIT per shape)")
     torch.random.manual_seed(0)
     tile_size = 128
     out_dtype = torch.bfloat16
@@ -162,12 +171,24 @@ def test_fp8_groupwise_gemm(
 @pytest.mark.parametrize("n", [128, 256])
 @pytest.mark.parametrize("k", [256])
 @pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
-def test_fp8_groupwise_gemm_small_batch_size(m, n, k, scale_major_mode):
+@pytest.mark.parametrize("backend", ["cutlass", "cutile"])
+def test_fp8_groupwise_gemm_small_batch_size(m, n, k, scale_major_mode, backend):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
         pytest.skip(
             "Small-batch gemm_fp8_nt_groupwise dispatch is only relevant on SM100/103."
         )
+    cc = compute_capability[0] * 10 + compute_capability[1]
+    if not gemm_fp8_nt_groupwise.is_backend_supported(backend, cc):
+        pytest.skip(f"gemm_fp8_nt_groupwise backend {backend} does not support SM{cc}")
+    if backend == "cutile":
+        # M below BLOCK_M: partial M tile and the BLOCK_M <= M config prune.
+        if scale_major_mode != "K":
+            pytest.skip("cuTile supports scale_major_mode='K' only.")
+        if not is_cuda_tile_available():
+            pytest.skip(
+                "cuda-tile / tileiras compiler not available in this environment."
+            )
     torch.random.manual_seed(0)
     tile_size = 128
     out_dtype = torch.bfloat16
@@ -198,7 +219,7 @@ def test_fp8_groupwise_gemm_small_batch_size(m, n, k, scale_major_mode):
         b_scale,
         scale_major_mode,
         out_dtype=out_dtype,
-        backend="cutlass",
+        backend=backend,
     )
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
 
@@ -246,6 +267,8 @@ def test_fp8_groupwise_group_gemm(
             pytest.skip(
                 "cuda-tile / tileiras compiler not available in this environment."
             )
+        if (m, n, k, group_size) not in _CUTILE_GROUP_GEMM_SHAPES:
+            pytest.skip("cuTile: reduced shape grid (one tileiras JIT per shape)")
     torch.random.manual_seed(0)
     tile_size = 128
 
@@ -386,6 +409,7 @@ def test_fp8_groupwise_group_gemm_cutile_tma_fast_path(
         (128, 0, 4, 256),  # zero-length group in the middle
         (0, 256, 128, 4),  # zero-length leading group
         (4, 128, 256, 0),  # zero-length trailing group
+        (300, 0, 260, 500),  # avg >= 256: cuTile BLOCK_M=128 partial tiles spill
     ],
 )
 @pytest.mark.parametrize("n", [256])
@@ -531,8 +555,10 @@ def _assert_fp8_groupwise_group_cute_dsl(
     group_counts, n, k, use_non_default_stream=False, use_out=False
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability not in [(10, 0), (10, 3)]:
-        pytest.skip("The contiguous grouped CuTe-DSL kernel requires SM100 or SM103")
+    if compute_capability not in [(10, 0), (10, 3), (10, 7)]:
+        pytest.skip(
+            "The contiguous grouped CuTe-DSL kernel requires SM100, SM103 or SM107"
+        )
     if not is_cute_dsl_available():
         pytest.skip("nvidia-cutlass-dsl is not available")
 
@@ -613,8 +639,8 @@ def test_fp8_groupwise_group_cute_dsl_partial_final_m(group_counts, n, k, use_ou
 
 def _require_grouped_cute_dsl(device="cuda"):
     """Skip unsupported environments before importing the optional kernel."""
-    if get_compute_capability(torch.device(device)) not in [(10, 0), (10, 3)]:
-        pytest.skip("Requires SM100 or SM103")
+    if get_compute_capability(torch.device(device)) not in [(10, 0), (10, 3), (10, 7)]:
+        pytest.skip("Requires SM100, SM103 or SM107")
     if not is_cute_dsl_available():
         pytest.skip("nvidia-cutlass-dsl is not available")
 
@@ -973,17 +999,31 @@ def test_grouped_cute_dsl_concurrent_cache_miss(monkeypatch, k):
 @pytest.mark.parametrize("nk", [(128, 512), (512, 128), (4096, 7168), (7168, 2048)])
 @pytest.mark.parametrize("group_size", [1, 4, 8, 64, 128, 256])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("backend", ["deepgemm", "cake"])
 def test_fp8_groupwise_batch_deepgemm_masked(
     m,
     nk,
     group_size,
     out_dtype,
+    backend,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
         pytest.skip(
             "batch_deepgemm_fp8_nt_groupwise is only supported on SM100, SM103, SM107."
         )
+    cc = compute_capability[0] * 10 + compute_capability[1]
+    if not batch_deepgemm_fp8_nt_groupwise.is_backend_supported(backend, cc):
+        pytest.skip(
+            f"batch_deepgemm_fp8_nt_groupwise backend {backend} does not support SM{cc}"
+        )
+    if backend == "cake":
+        from flashinfer.gemm.cake_batch_deepgemm_fp8 import (
+            is_batch_deepgemm_fp8_nt_groupwise_cake_available,
+        )
+
+        if not is_batch_deepgemm_fp8_nt_groupwise_cake_available(torch.device("cuda")):
+            pytest.skip("no generated Cake batch DeepGEMM program for this device")
     torch.random.manual_seed(0)
     n, k = nk
     a = torch.randn((group_size, m, k), device="cuda", dtype=torch.float32)
@@ -1009,6 +1049,7 @@ def test_fp8_groupwise_batch_deepgemm_masked(
         masked_m,
         expected_m,
         out_dtype=out_dtype,
+        backend=backend,
     )
     for i in range(group_size):
         torch.testing.assert_close(
@@ -1029,9 +1070,12 @@ def test_gemm_fp8_nt_groupwise_cutile_out_dtypes(m, n, k, out_dtype):
     fp32 store, but matching the function-level contract avoids divergence
     from the other backends.
     """
-    compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] not in [10, 11, 12]:
-        pytest.skip("cuTile fp8 backend requires SM100+ GPUs.")
+    if not torch.cuda.is_available():
+        pytest.skip("gemm_fp8_nt_groupwise requires CUDA")
+    major, minor = get_compute_capability(torch.device("cuda"))
+    cc = major * 10 + minor
+    if not gemm_fp8_nt_groupwise.is_backend_supported("cutile", cc):
+        pytest.skip(f"gemm_fp8_nt_groupwise backend cutile does not support SM{cc}")
     if not is_cuda_tile_available():
         pytest.skip("cuda-tile / tileiras compiler not available in this environment.")
 
@@ -1069,9 +1113,12 @@ def test_gemm_fp8_nt_groupwise_cutile_out_dtypes(m, n, k, out_dtype):
 
 def test_gemm_fp8_nt_groupwise_cutile_rejects_mn_scale_major():
     """The v1 cuTile fp8 path only supports K-major scales; MN-major must raise."""
-    compute_capability = get_compute_capability(torch.device("cuda"))
-    if compute_capability[0] not in [10, 11, 12]:
-        pytest.skip("cuTile fp8 backend requires SM100+ GPUs.")
+    if not torch.cuda.is_available():
+        pytest.skip("gemm_fp8_nt_groupwise requires CUDA")
+    major, minor = get_compute_capability(torch.device("cuda"))
+    cc = major * 10 + minor
+    if not gemm_fp8_nt_groupwise.is_backend_supported("cutile", cc):
+        pytest.skip(f"gemm_fp8_nt_groupwise backend cutile does not support SM{cc}")
     if not is_cuda_tile_available():
         pytest.skip("cuda-tile / tileiras compiler not available in this environment.")
 
@@ -1110,4 +1157,6 @@ if __name__ == "__main__":
     test_fp8_groupwise_gemm(8192, 8192, 8192, "K", backend="cutlass")
     test_fp8_groupwise_group_gemm(4, 128, 256, 2, "MN", torch.bfloat16)
     test_fp8_groupwise_group_deepgemm(256, (128, 512), 4, torch.bfloat16)
-    test_fp8_groupwise_batch_deepgemm_masked(256, (128, 512), 8, torch.bfloat16)
+    test_fp8_groupwise_batch_deepgemm_masked(
+        256, (128, 512), 8, torch.bfloat16, "deepgemm"
+    )

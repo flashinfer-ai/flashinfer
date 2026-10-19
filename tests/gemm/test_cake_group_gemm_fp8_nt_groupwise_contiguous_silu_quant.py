@@ -1,6 +1,8 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the generated SM100a fused grouped FP8 gate_up GEMM + SwiGLU + FP8 quantization program."""
+"""Tests for the generated Blackwell fused grouped FP8 gate_up GEMM + SwiGLU + FP8 quantization programs."""
+
+import random
 
 import pytest
 import torch
@@ -31,6 +33,9 @@ from flashinfer.gemm.cake_grouped_fp8_fused_silu_quant import (
     small_m_gemm_backend,
     tail_launch_grid,
 )
+from flashinfer.jit.gemm.cake_grouped_fp8_fused_silu_quant import (
+    SUPPORTED_COMPUTE_CAPABILITIES,
+)
 from flashinfer.quantization import per_token_group_quant_8bit
 
 GROUP_SIZE = 128
@@ -44,8 +49,10 @@ def _require_generated_program():
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     device = torch.device("cuda")
-    if torch.cuda.get_device_capability(device) != (10, 0):
-        pytest.skip("generated fused grouped FP8 gate_up programs target SM100a only")
+    if torch.cuda.get_device_capability(device) not in SUPPORTED_COMPUTE_CAPABILITIES:
+        pytest.skip(
+            "generated fused grouped FP8 gate_up programs target SM100a and SM103a"
+        )
     if not is_group_gemm_fp8_nt_groupwise_contiguous_silu_quant_prepared_available(
         device
     ):
@@ -330,10 +337,11 @@ def test_prepared_matches_torch_reference_chain(group_counts, n2, k, arbitrary_s
     )
     m = sum(group_counts)
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-    # validate_indices=True hands the routing to the routing-aware rule: large rows whose odd-tail units exceed the
-    # SMs the pair grid leaves free take the GEMM + (wide) act route instead of the fused route
+    # validate_indices=True hands the routing to the routing-aware rule: large rows take the route the fitted makespan
+    # model picks (pair + tail, mixed schedule or GEMM + wide act) unless the legacy odd-tail rule's route is within
+    # ROUTE_MODEL_MARGIN of it
     expected_route = select_route(
-        m, n2, sm_count=sm_count, group_blocks=routing_blocks(group_counts)
+        m, n2, sm_count=sm_count, group_blocks=routing_blocks(group_counts), k=k
     )
     assert prepared.route == expected_route
     # GEMM + act kernel, or pair kernel + PDL tail kernel; the mixed-schedule route is one kernel
@@ -402,7 +410,7 @@ def test_prepared_matches_flashinfer_chain(group_counts, n2, k, arbitrary_scales
         pytest.param([256] * 16, 2048, 4096, FUSED_ROUTE, id="fused_wide"),
         pytest.param([256] * 8, 256, 512, FUSED_ROUTE, id="fused_at_threshold"),
         pytest.param([256] * 4 + [128, 100], 512, 1024, ACT_ROUTE, id="small_m"),
-        # routing-aware rule: the expected route is whatever the measured odd-tail crossover selects
+        # routing-aware rule: the expected route is whatever the makespan-model rule selects
         pytest.param(
             [256, 0, 512, 0, 384, 640, 128, 384, 256, 0, 128, 128, 384, 384, 512, 0],
             2048,
@@ -446,13 +454,13 @@ def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     m = sum(group_counts)
     blocks = routing_blocks(group_counts)
-    # without the routing the plan is shape-only; with it the routing-aware rule applies
-    shape_route, _ = launch_plan(m, n2, sm_count=sm_count)
-    assert shape_route == select_route(m, n2, sm_count=sm_count)
+    # without the routing the plan is shape-only; with it (and K) the routing-aware rule applies
+    shape_route, _ = launch_plan(m, n2, sm_count=sm_count, k=k)
+    assert shape_route == select_route(m, n2, sm_count=sm_count, k=k)
     if expected_route is not None:
         assert shape_route == expected_route
-    route, grid = launch_plan(m, n2, sm_count=sm_count, group_blocks=blocks)
-    assert route == select_route(m, n2, sm_count=sm_count, group_blocks=blocks)
+    route, grid = launch_plan(m, n2, sm_count=sm_count, group_blocks=blocks, k=k)
+    assert route == select_route(m, n2, sm_count=sm_count, group_blocks=blocks, k=k)
     if m < SMALL_M_MAX:
         assert route == ACT_ROUTE
     prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
@@ -463,7 +471,7 @@ def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
         a, b, a_scale, b_scale, m_indices
     )
     assert (unvalidated.route, unvalidated.grid) == launch_plan(
-        m, n2, sm_count=sm_count
+        m, n2, sm_count=sm_count, k=k
     )
     if route == FUSED_ROUTE:
         assert grid[0] % 2 == 0 and grid[0] <= 128
@@ -473,7 +481,7 @@ def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
     elif route == FUSED_MIXED_ROUTE:
         pair_tiles, odd_units = fused_tile_counts(n2, blocks)
         clusters = mixed_clusters(pair_tiles, odd_units, sm_count=sm_count)
-        assert pair_tiles > clusters and pair_tiles % clusters
+        assert clusters >= 1  # one cluster per pair tile or solo unit up to the cap
         assert grid == (2 * clusters, 1, 1) and grid[0] <= 128
         assert prepared.tail_grid is None
         assert set(prepared.stage_grids) == {"main"}
@@ -510,8 +518,10 @@ def test_routing_blocks_and_fused_tile_counts():
         == ACT_ROUTE
     )
     assert select_route(4096, 2048, sm_count=148) == FUSED_ROUTE
-    # measured B200 rule: odd-tail units beyond the 20 SMs the 128-CTA pair grid leaves free -> GEMM + act
-    wide = dict(sm_count=148)
+    # B200 rule at the model's calibration geometry (2H = 2048, K = 4096): the fitted makespan model ranks pair + tail,
+    # mixed schedule and GEMM + act, guarded by the legacy odd-tail rule (units beyond the 20 SMs the 128-CTA pair grid
+    # leaves free leave the pair + tail route)
+    wide = dict(sm_count=148, k=4096)
     assert (
         select_route(4096, 2048, group_blocks=routing_blocks([256] * 16), **wide)
         == FUSED_ROUTE
@@ -520,8 +530,8 @@ def test_routing_blocks_and_fused_tile_counts():
         [128, 384] + [256] * 14
     )  # 16 odd-tail units <= 20 free SMs
     assert select_route(4096, 2048, group_blocks=two_odd, **wide) == FUSED_ROUTE
-    # diverted wide rows: the mixed-schedule route when the pair tiles outnumber the 64 clusters without dividing
-    # evenly (random_aligned: 96 pair tiles + 64 solo units), else the wide act kernel (>= ACT_WIDE_MIN_ITEMS items)
+    # diverted wide rows: the mixed-schedule route (random_aligned: 96 pair tiles + 64 solo units over 64 clusters,
+    # mixed_tail: 80 + 96), as under the legacy rule
     assert fused_tile_counts(2048, blocks) == (96, 64)
     assert mixed_clusters(96, 64, sm_count=148) == 64
     assert select_route(4096, 2048, group_blocks=blocks, **wide) == FUSED_MIXED_ROUTE
@@ -532,41 +542,65 @@ def test_routing_blocks_and_fused_tile_counts():
     assert (
         select_route(4096, 2048, group_blocks=mixed_tail, **wide) == FUSED_MIXED_ROUTE
     )
-    all_odd = routing_blocks(
-        [384] * 8 + [128] * 8
-    )  # 64 pair tiles = one per cluster: nothing to balance
+    # all_odd (64 pair tiles = one per cluster) and all_one_block (no pair tile at all) left the legacy rule's
+    # round-10 envelope on the GEMM + wide act route; the makespan model sends them to the mixed schedule (measured
+    # 0.97x and 0.87x the act route on B200)
+    all_odd = routing_blocks([384] * 8 + [128] * 8)
     assert fused_tile_counts(2048, all_odd) == (64, 128)
-    assert select_route(4096, 2048, group_blocks=all_odd, **wide) == ACT_WIDE_ROUTE
+    assert select_route(4096, 2048, group_blocks=all_odd, **wide) == FUSED_MIXED_ROUTE
+    all_one_block = routing_blocks([128] * 16)
+    assert fused_tile_counts(2048, all_one_block) == (0, 128)
     assert (
-        select_route(2048, 2048, group_blocks=routing_blocks([128] * 16), **wide)
-        == ACT_WIDE_ROUTE
-    )  # no pair tile at all
+        select_route(2048, 2048, group_blocks=all_one_block, **wide)
+        == FUSED_MIXED_ROUTE
+    )
+    # the margin guard keeps the legacy route where the model is within 5 % of its pick: twelve odd experts at
+    # M = 3072 stay on the wide act route; the four-odd M = 8192 routing goes back to pair + tail (legacy: mixed)
+    twelve_odd_3072 = routing_blocks([384] * 6 + [128] * 6 + [0] * 4)
+    assert fused_tile_counts(2048, twelve_odd_3072) == (48, 96)
+    assert (
+        select_route(3072, 2048, group_blocks=twelve_odd_3072, **wide) == ACT_WIDE_ROUTE
+    )
+    four_odd_8192 = routing_blocks([640, 640, 384, 384] + [512] * 12)
+    assert fused_tile_counts(2048, four_odd_8192) == (240, 32)
+    assert select_route(8192, 2048, group_blocks=four_odd_8192, **wide) == FUSED_ROUTE
     assert {FUSED_ROUTE, FUSED_MIXED_ROUTE} == FUSED_ROUTES
     assert act_items(2048, 2048) == ACT_WIDE_MIN_ITEMS
-    # 16 odd-tail units fit on the 20 SMs the pair grid leaves free: the problem stays fused
+    # outside the calibration geometry the legacy rule applies unchanged: 16 odd-tail units (<= 20 free SMs) stay on
+    # the pair + tail route, 32 units below the item threshold take the one-warp-per-group act kernel
     assert (
-        select_route(2048, 256, group_blocks=routing_blocks([128] * 16), **wide)
+        select_route(2048, 256, group_blocks=all_one_block, sm_count=148, k=512)
         == FUSED_ROUTE
     )
-    # a diverted problem (32 units) below the item threshold keeps the one-warp-per-group act kernel
     assert act_items(2048, 512) < ACT_WIDE_MIN_ITEMS
     assert (
-        select_route(2048, 512, group_blocks=routing_blocks([128] * 16), **wide)
+        select_route(2048, 512, group_blocks=all_one_block, sm_count=148, k=1024)
         == ACT_ROUTE
     )
-    # grids: the mixed-schedule route on the wide random_aligned row, the two act routes on all_odd and a small row
+    # without K (existing callers) or at another K the same routing keeps the legacy route
+    assert (
+        select_route(4096, 2048, group_blocks=all_odd, sm_count=148) == ACT_WIDE_ROUTE
+    )
+    assert (
+        select_route(4096, 2048, group_blocks=all_odd, sm_count=148, k=2048)
+        == ACT_WIDE_ROUTE
+    )
+    # grids: the mixed-schedule route on the wide random_aligned row and on all_one_block (solo units only), the two
+    # act routes on the twelve-odd M = 3072 row and a small row
     _, mixed_grid = launch_plan(4096, 2048, group_blocks=blocks, **wide)
     assert mixed_grid == (
         128,
         1,
         1,
     )  # 64 clusters of two CTAs (160 units capped at the 128-CTA grid)
-    _, wide_grid = launch_plan(4096, 2048, group_blocks=all_odd, **wide)
+    _, solo_grid = launch_plan(2048, 2048, group_blocks=all_one_block, **wide)
+    assert solo_grid == (128, 1, 1)  # 128 solo units capped at the 64 clusters
+    _, wide_grid = launch_plan(3072, 2048, group_blocks=twelve_odd_3072, **wide)
     assert wide_grid == (
         1480,
         1,
         1,
-    )  # ceil(32768 / 16) = 2048 warps-of-four capped at 10 CTAs x 148 SMs
+    )  # ceil(24576 / 16) = 1536 warps-of-four capped at 10 CTAs x 148 SMs
     _, small_grid = launch_plan(
         1024, 2048, group_blocks=routing_blocks([128] * 8), **wide
     )
@@ -589,10 +623,7 @@ def test_cuda_graph_replay_after_first_launch(group_counts, n2, k):
     prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         a, b, a_scale, b_scale, m_indices
     )
-    prepared.launch()  # initializes the private descriptor storage
-    torch.cuda.synchronize()
-    eager_q = prepared.out_q.clone()
-    eager_s = prepared.out_s.clone()
+    # Tensor maps travel by value: the very first launch is captured, no eager warm-up launch.
     stream = torch.cuda.Stream(device=device)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
@@ -602,12 +633,179 @@ def test_cuda_graph_replay_after_first_launch(group_counts, n2, k):
     torch.cuda.synchronize()
     graph.replay()
     torch.cuda.synchronize()
+    replay_q = prepared.out_q.clone()
+    replay_s = prepared.out_s.clone()
+    prepared.launch()
+    torch.cuda.synchronize()
     # the replay reproduces the eager launch bit for bit (same kernels, same inputs) ...
-    assert torch.equal(prepared.out_q.view(torch.uint8), eager_q.view(torch.uint8))
-    assert torch.equal(prepared.out_s, eager_s)
+    assert torch.equal(prepared.out_q.view(torch.uint8), replay_q.view(torch.uint8))
+    assert torch.equal(prepared.out_s, replay_s)
     # ... and matches the chain where the chain can run
     ref_q, ref_s = _chain_or_skip(a, b, a_scale, b_scale, m_indices)
     _assert_matches(prepared.out_q, prepared.out_s, ref_q, ref_s)
+
+
+def _random_aligned_counts(rng, groups, max_blocks):
+    """Random rows per expert under the routing contract: 128-row multiples (empties allowed) and
+    one optional partial final block; the total never exceeds ``max_blocks`` blocks."""
+    blocks = [0] * groups
+    for _ in range(rng.randint(1, max_blocks)):
+        blocks[rng.randrange(groups)] += 1
+    counts = [b * 128 for b in blocks]
+    last = max(i for i, c in enumerate(counts) if c)
+    counts[last] -= rng.choice(
+        (0, 0, rng.randint(1, 127))
+    )  # partial final block on some rows
+    return counts
+
+
+RANDOM_TOKEN_CASES = [
+    pytest.param(
+        seed,
+        groups,
+        max_blocks,
+        n2,
+        k,
+        id=f"s{seed}_g{groups}_b{max_blocks}_n{n2}_k{k}",
+    )
+    for seed, groups, max_blocks, n2, k in (
+        (1, 4, 8, 256, 512),
+        (2, 8, 16, 512, 1024),
+        (3, 16, 24, 2048, 4096),
+        (4, 16, 40, 2048, 4096),
+        (5, 16, 64, 2048, 4096),
+        (6, 6, 12, 768, 2048),
+        (7, 32, 64, 1024, 1024),
+        (8, 16, 33, 2048, 4096),
+    )
+]
+
+
+@pytest.mark.parametrize("seed,groups,max_blocks,n2,k", RANDOM_TOKEN_CASES)
+def test_random_token_counts_match_torch_reference(seed, groups, max_blocks, n2, k):
+    device = torch.device("cuda")
+    rng = random.Random(seed)
+    group_counts = _random_aligned_counts(rng, groups, max_blocks)
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        group_counts,
+        n2,
+        k,
+        seed=670 + seed,
+        device=device,
+        arbitrary_scales=bool(seed % 2),
+    )
+    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, validate_indices=True
+    )
+    out_q, out_s = prepared.launch()
+    torch.cuda.synchronize()
+    g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, m_indices))
+    _assert_quantizes_reference(out_q, out_s, g, u)
+
+
+@pytest.mark.parametrize(
+    "group_counts,n2,k",
+    [
+        pytest.param([256] * 16, 2048, 4096, id="uniform"),
+        pytest.param([384] * 8 + [128] * 8, 2048, 4096, id="all_odd"),
+        pytest.param([128] * 16, 2048, 4096, id="all_one_block"),
+        pytest.param([128, 128, 100], 256, 1024, id="small_m_partial_tail"),
+    ],
+)
+def test_group_counts_route_without_device_work(group_counts, n2, k):
+    """Caller-supplied rows per expert select the routing-aware route without touching m_indices."""
+    device = torch.device("cuda")
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        group_counts, n2, k, seed=668, device=device
+    )
+    validated = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, validate_indices=True
+    )
+    from_counts = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, group_counts=group_counts
+    )
+    assert (from_counts.route, from_counts.grid, from_counts.stage_grids) == (
+        validated.route,
+        validated.grid,
+        validated.stage_grids,
+    )
+    both = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        m_indices,
+        group_counts=group_counts,
+        validate_indices=True,
+    )
+    assert both.route == validated.route
+    out_q, out_s = from_counts.launch()
+    torch.cuda.synchronize()
+    g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, m_indices))
+    _assert_quantizes_reference(out_q, out_s, g, u)
+
+
+def test_caller_owned_outputs_and_workspace():
+    device = torch.device("cuda")
+    group_counts, n2, k = [128, 128, 100], 256, 1024
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        group_counts, n2, k, seed=669, device=device
+    )
+    m, h = sum(group_counts), n2 // 2
+    out_q = torch.empty((m, h), dtype=torch.float8_e4m3fn, device=device)
+    out_s = torch.empty((m, h // GROUP_SIZE), dtype=torch.float32, device=device)
+    workspace = torch.empty((m, n2), dtype=torch.bfloat16, device=device)
+    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, out_q=out_q, out_s=out_s, workspace=workspace
+    )
+    assert prepared.route in ACT_ROUTES
+    q, s = prepared.launch()
+    torch.cuda.synchronize()
+    assert q.data_ptr() == out_q.data_ptr() and s.data_ptr() == out_s.data_ptr()
+    g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, m_indices))
+    _assert_quantizes_reference(out_q, out_s, g, u)
+    torch.testing.assert_close(
+        workspace.float(),
+        _reference_gemm(a, b, a_scale, b_scale, m_indices).float(),
+        atol=3e-2,
+        rtol=3e-2,
+    )
+
+
+def test_re_preparing_per_step_retains_no_device_memory():
+    """A new routing per step re-prepares the launch on the fused routes; nothing accumulates."""
+    device = torch.device("cuda")
+    rng = random.Random(671)
+    n2, k, groups = 256, 512, 8
+    b = torch.randn((groups, n2, k), device=device).to(torch.float8_e4m3fn)
+    b_scale = torch.ones((groups, n2 // 128, k // 128), device=device)
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    baseline = torch.cuda.memory_allocated(device)
+    for _ in range(12):
+        counts = _random_aligned_counts(rng, groups, 32)
+        counts = [
+            c - c % 128 for c in counts
+        ]  # fused routes: whole blocks, M >= SMALL_M_MAX
+        while sum(counts) < SMALL_M_MAX:
+            counts[rng.randrange(groups)] += 128
+        m = sum(counts)
+        a = torch.randn((m, k), device=device).to(torch.float8_e4m3fn)
+        a_scale = torch.ones((m, k // 128), device=device)
+        m_indices = torch.repeat_interleave(
+            torch.arange(groups, dtype=torch.int32, device=device),
+            torch.tensor(counts, dtype=torch.int64, device=device),
+        ).contiguous()
+        prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+            a, b, a_scale, b_scale, m_indices, group_counts=counts
+        )
+        assert prepared.route in FUSED_ROUTES
+        out_q, out_s = prepared.launch()
+        torch.cuda.synchronize()
+        assert torch.isfinite(out_s).all()
+        del prepared, out_q, out_s, a, a_scale, m_indices
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated(device) == baseline
 
 
 def test_rejects_invalid_inputs():
@@ -642,6 +840,20 @@ def test_rejects_invalid_inputs():
     with pytest.raises(ValueError, match="multiple of 128 rows"):
         prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
             a, b, a_scale, b_scale, unaligned, validate_indices=True
+        )
+    with pytest.raises(ValueError, match="group_counts must"):
+        prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+            a, b, a_scale, b_scale, m_indices, group_counts=[100, 156]
+        )
+    with pytest.raises(ValueError, match="disagree with m_indices"):
+        prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            m_indices,
+            group_counts=[256, 0],
+            validate_indices=True,
         )
     with pytest.raises(ValueError, match="M must be at most 8192"):
         big_a, big_b, big_as, big_bs, big_idx = _make_inputs(

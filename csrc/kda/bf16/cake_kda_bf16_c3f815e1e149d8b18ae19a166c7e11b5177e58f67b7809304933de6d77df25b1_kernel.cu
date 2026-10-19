@@ -13,6 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#ifndef CAKE_KDA_KERNEL_SYMBOL
+// Fused-M128 KDA prefill body shared by several exported modules. The loader
+// compiles it once per module with -DCAKE_KDA_KERNEL_SYMBOL=<that module's
+// kernel symbol> and one -DCAKE_KDA_<FLAG>=0/1 per flag guarded below; the
+// #if blocks then expand to exactly that module's former generated source.
+#error "CAKE_KDA_KERNEL_SYMBOL must name the module's kernel symbol"
+#endif
+#ifndef CAKE_KDA_PAIR_PACKED_BETA
+#error "CAKE_KDA_PAIR_PACKED_BETA must be 0 or 1"
+#endif
 
 typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
@@ -115,11 +125,20 @@ static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap ali
 #define SMEM_SMEM_GATE_STAGE_BYTES 16384
 #define SMEM_SMEM_GATE_STRIDE 41984
 #define SMEM_SMEM_BETA_RAW_OFF 41984
+#if CAKE_KDA_PAIR_PACKED_BETA
+#define SMEM_SMEM_BETA_RAW_STAGE_BYTES 816
+#else
 #define SMEM_SMEM_BETA_RAW_STAGE_BYTES 512
+#endif  // CAKE_KDA_PAIR_PACKED_BETA
 #define SMEM_SMEM_BETA_RAW_STRIDE 41984
 #define SMEM_SMEM_BETA_RAW_ALL_OFF 41984
+#if CAKE_KDA_PAIR_PACKED_BETA
+#define SMEM_SMEM_BETA_RAW_ALL_STAGE_BYTES 168752
+#define SMEM_SMEM_BETA_RAW_ALL_STRIDE 168752
+#else
 #define SMEM_SMEM_BETA_RAW_ALL_STAGE_BYTES 168448
 #define SMEM_SMEM_BETA_RAW_ALL_STRIDE 168448
+#endif  // CAKE_KDA_PAIR_PACKED_BETA
 #define SMEM_SMEM_INV_WORK_OFF 32384
 #define SMEM_SMEM_INV_WORK_STAGE_BYTES 4096
 #define SMEM_SMEM_INV_WORK_STRIDE 41984
@@ -141,16 +160,32 @@ static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap ali
 #define SMEM_SMEM_GT_ALL_OFF 31744
 #define SMEM_SMEM_GT_ALL_STAGE_BYTES 168448
 #define SMEM_SMEM_GT_ALL_STRIDE 168448
+#if CAKE_KDA_PAIR_PACKED_BETA
+#define SMEM_SMEM_PREP_BETA_ALL_OFF 42800
+#else
 #define SMEM_SMEM_PREP_BETA_ALL_OFF 42500
+#endif  // CAKE_KDA_PAIR_PACKED_BETA
 #define SMEM_SMEM_PREP_BETA_ALL_STAGE_BYTES 168064
 #define SMEM_SMEM_PREP_BETA_ALL_STRIDE 168064
+#if CAKE_KDA_PAIR_PACKED_BETA
+#define SMEM_SMEM_PREP_BETA_BF16_ALL_OFF 42800
+#else
 #define SMEM_SMEM_PREP_BETA_BF16_ALL_OFF 42500
+#endif  // CAKE_KDA_PAIR_PACKED_BETA
 #define SMEM_SMEM_PREP_BETA_BF16_ALL_STAGE_BYTES 168000
 #define SMEM_SMEM_PREP_BETA_BF16_ALL_STRIDE 168000
+#if CAKE_KDA_PAIR_PACKED_BETA
+#define SMEM_SMEM_PREP_BETA_U32_ALL_OFF 42800
+#else
 #define SMEM_SMEM_PREP_BETA_U32_ALL_OFF 42500
+#endif  // CAKE_KDA_PAIR_PACKED_BETA
 #define SMEM_SMEM_PREP_BETA_U32_ALL_STAGE_BYTES 168000
 #define SMEM_SMEM_PREP_BETA_U32_ALL_STRIDE 168000
+#if CAKE_KDA_PAIR_PACKED_BETA
+#define SMEM_SMEM_GATE_RATE_ALL_OFF 42928
+#else
 #define SMEM_SMEM_GATE_RATE_ALL_OFF 42628
+#endif  // CAKE_KDA_PAIR_PACKED_BETA
 #define SMEM_SMEM_GATE_RATE_ALL_STAGE_BYTES 167940
 #define SMEM_SMEM_GATE_RATE_ALL_STRIDE 167940
 #define SMEM_SMEM_GATE_BIAS_ALL_OFF 227408
@@ -1163,7 +1198,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(1024) void
-kernel_cake_kda_bf16_c3f815e1e149d8b18ae19a166c7e11b5177e58f67b7809304933de6d77df25b1(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma, __nv_bfloat16* __restrict__ k, CakeTensorMap const* k_tma, __nv_bfloat16* __restrict__ v, CakeTensorMap const* v_tma, __nv_bfloat16* __restrict__ g, CakeTensorMap const* g_tma, __nv_bfloat16* __restrict__ beta, CakeTensorMap const* beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, CakeTensorMap const* out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound, unsigned long long state_indices_addr, unsigned long long state_checkpoints_addr, unsigned long long checkpoint_cu_starts_addr, long long beta_token_stride, long long state_slot_stride, int use_state_indices, int checkpoint_every_n_tokens, long long* __restrict__ cu_chunk_offsets, __nv_bfloat16* __restrict__ chunk_state, unsigned int* __restrict__ state_checkpoint_needed, __nv_bfloat16* __restrict__ tape_qd, __nv_bfloat16* __restrict__ tape_kd, __nv_bfloat16* __restrict__ tape_kr, __nv_bfloat16* __restrict__ tape_j, float* __restrict__ tape_restore_factor, __nv_bfloat16* __restrict__ tape_e, __nv_bfloat16* __restrict__ tape_x, __nv_bfloat16* __restrict__ tape_r, float* __restrict__ norm_inv_out, __nv_bfloat16* __restrict__ decay_out, float* __restrict__ beta_active_out, float* __restrict__ initial_state_f32, unsigned int* __restrict__ zero_workspace, int zero_words, int num_sequences, CakeTensorMap const* state_checkpoints_tma, float* __restrict__ final_state_f32, long long g_token_stride, long long q_stride_m3, long long k_stride_m3, long long v_stride_m3)
+CAKE_KDA_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma, __nv_bfloat16* __restrict__ k, CakeTensorMap const* k_tma, __nv_bfloat16* __restrict__ v, CakeTensorMap const* v_tma, __nv_bfloat16* __restrict__ g, CakeTensorMap const* g_tma, __nv_bfloat16* __restrict__ beta, CakeTensorMap const* beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, CakeTensorMap const* out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound, unsigned long long state_indices_addr, unsigned long long state_checkpoints_addr, unsigned long long checkpoint_cu_starts_addr, long long beta_token_stride, long long state_slot_stride, int use_state_indices, int checkpoint_every_n_tokens, long long* __restrict__ cu_chunk_offsets, __nv_bfloat16* __restrict__ chunk_state, unsigned int* __restrict__ state_checkpoint_needed, __nv_bfloat16* __restrict__ tape_qd, __nv_bfloat16* __restrict__ tape_kd, __nv_bfloat16* __restrict__ tape_kr, __nv_bfloat16* __restrict__ tape_j, float* __restrict__ tape_restore_factor, __nv_bfloat16* __restrict__ tape_e, __nv_bfloat16* __restrict__ tape_x, __nv_bfloat16* __restrict__ tape_r, float* __restrict__ norm_inv_out, __nv_bfloat16* __restrict__ decay_out, float* __restrict__ beta_active_out, float* __restrict__ initial_state_f32, unsigned int* __restrict__ zero_workspace, int zero_words, int num_sequences, CakeTensorMap const* state_checkpoints_tma, float* __restrict__ final_state_f32, long long g_token_stride, long long q_stride_m3, long long k_stride_m3, long long v_stride_m3)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1171,8 +1206,12 @@ kernel_cake_kda_bf16_c3f815e1e149d8b18ae19a166c7e11b5177e58f67b7809304933de6d77d
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
     asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
     smem = make_warp_uniform(smem);
+#else
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int mbar_base = smem;
     #define qk_full_addr (mbar_base + 0)
@@ -1258,6 +1297,16 @@ kernel_cake_kda_bf16_c3f815e1e149d8b18ae19a166c7e11b5177e58f67b7809304933de6d77d
     const int smem_gt_prefix_all_addr = smem + 41472;
     float* smem_gt_all = reinterpret_cast<float*>(smem_raw + 31744);
     const int smem_gt_all_addr = smem + 31744;
+#if CAKE_KDA_PAIR_PACKED_BETA
+    float* smem_prep_beta_all = reinterpret_cast<float*>(smem_raw + 42800);
+    const int smem_prep_beta_all_addr = smem + 42800;
+    __nv_bfloat16* smem_prep_beta_bf16_all = reinterpret_cast<__nv_bfloat16*>(smem_raw + 42800);
+    const int smem_prep_beta_bf16_all_addr = smem + 42800;
+    unsigned int* smem_prep_beta_u32_all = reinterpret_cast<unsigned int*>(smem_raw + 42800);
+    const int smem_prep_beta_u32_all_addr = smem + 42800;
+    float* smem_gate_rate_all = reinterpret_cast<float*>(smem_raw + 42928);
+    const int smem_gate_rate_all_addr = smem + 42928;
+#else
     float* smem_prep_beta_all = reinterpret_cast<float*>(smem_raw + 42500);
     const int smem_prep_beta_all_addr = smem + 42500;
     __nv_bfloat16* smem_prep_beta_bf16_all = reinterpret_cast<__nv_bfloat16*>(smem_raw + 42500);
@@ -1266,6 +1315,7 @@ kernel_cake_kda_bf16_c3f815e1e149d8b18ae19a166c7e11b5177e58f67b7809304933de6d77d
     const int smem_prep_beta_u32_all_addr = smem + 42500;
     float* smem_gate_rate_all = reinterpret_cast<float*>(smem_raw + 42628);
     const int smem_gate_rate_all_addr = smem + 42628;
+#endif  // CAKE_KDA_PAIR_PACKED_BETA
     float* smem_gate_bias_all = reinterpret_cast<float*>(smem_raw + 227408);
     const int smem_gate_bias_all_addr = smem + 227408;
     unsigned int* smem_state_decay_diag_raw = reinterpret_cast<unsigned int*>(smem_raw + 1024);
@@ -2295,10 +2345,18 @@ kernel_cake_kda_bf16_c3f815e1e149d8b18ae19a166c7e11b5177e58f67b7809304933de6d77d
                 if (chunk_is_full_1 != 0) {
                     if (prep_local_warp == 0) {
                         if (elect_sync()) {
+#if CAKE_KDA_PAIR_PACKED_BETA
+                            mbarrier_arrive_expect_tx(gate_raw_full_addr + (prep_stage) * 8, 9008);
+#else
                             mbarrier_arrive_expect_tx(gate_raw_full_addr + (prep_stage) * 8, 8704);
+#endif  // CAKE_KDA_PAIR_PACKED_BETA
                             tma_3d_gmem2smem(smem_g_raw_addr + prep_stage * 41984, g_tma, 0, head_idx_3, (int)(bos_3 + (long long)(chunk_idx_2 * 32)), gate_raw_full_addr + (prep_stage) * 8);
                             {
+#if CAKE_KDA_PAIR_PACKED_BETA
+                                tma_2d_gmem2smem(smem_beta_raw_addr + prep_stage * 41984, beta_tma, ((1) ? 0 : head_idx_3 / 8 * 8), (int)(((1) ? (bos_3 + (long long)(chunk_idx_2 * 32)) / 2 : bos_3 + (long long)(chunk_idx_2 * 32))), gate_raw_full_addr + (prep_stage) * 8);
+#else
                                 tma_2d_gmem2smem(smem_beta_raw_addr + prep_stage * 41984, beta_tma, ((0) ? 0 : head_idx_3 / 8 * 8), (int)(((0) ? (bos_3 + (long long)(chunk_idx_2 * 32)) / 2 : bos_3 + (long long)(chunk_idx_2 * 32))), gate_raw_full_addr + (prep_stage) * 8);
+#endif  // CAKE_KDA_PAIR_PACKED_BETA
                             }
                             mbarrier_arrive_expect_tx(qk_raw_full_addr + (prep_stage) * 8, 16384);
                             tma_4d_gmem2smem(smem_kd_addr + prep_stage * 41984, k_tma, 0, (int)(bos_3 + (long long)(chunk_idx_2 * 32)), head_idx_3, 0, qk_raw_full_addr + (prep_stage) * 8);
@@ -2309,6 +2367,12 @@ kernel_cake_kda_bf16_c3f815e1e149d8b18ae19a166c7e11b5177e58f67b7809304933de6d77d
                         {
                             float beta_logit = 0.0f;
                             {
+#if CAKE_KDA_PAIR_PACKED_BETA
+                                int beta_start_parity = (int)bos_3 & 1;
+                                __nv_bfloat16 beta_pair_value = smem_beta_raw_all[stage_bf16 + (beta_start_parity + lane) * 12 + head_idx_3];
+                                float _cvt_f32_0 = __bfloat162float(beta_pair_value);
+                                beta_logit = _cvt_f32_0;
+#else
                                 unsigned int beta_raw_pair[1];
                                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&beta_raw_pair[0])) : "r"(smem_beta_raw_addr + prep_stage * 41984 + (unsigned int)(lane * 16) + (unsigned int)(head_idx_3 % 8 / 2 * 4)));
                                 float beta_raw_pair_f32[2];
@@ -2326,6 +2390,7 @@ kernel_cake_kda_bf16_c3f815e1e149d8b18ae19a166c7e11b5177e58f67b7809304933de6d77d
                                 if (head_idx_3 % 2 != 0) {
                                     beta_logit = beta_raw_pair_f32[1];
                                 }
+#endif  // CAKE_KDA_PAIR_PACKED_BETA
                             }
                             float _tanh_approx_1;
                             asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_1) : "f"(beta_logit * 0.5f));

@@ -17,14 +17,14 @@ def gen_tinygemm2_module() -> JitSpec:
 
 
 def gen_tinygemm2_sm100_module() -> JitSpec:
-    """Generate the JIT spec for the SM100/SM103 generated tinygemm2 variants.
+    """Generate the JIT spec for the SM100/SM103 generated tinygemm2 kernel.
 
-    ``csrc/tinygemm2_sm100.cu`` is a single translation unit
-    holding all four frozen generated variants (deep/shallow pipeline ring x
-    PDL on/off) plus their TVM-FFI binding, mirroring the incumbent
-    ``csrc/tinygemm2.cu`` layout. The variants are generated Loom schedules
-    that exactly port the TensorRT-LLM tinygemm2 kernel with bit-identical
-    outputs.
+    ``csrc/tinygemm2_sm100.cu`` is a single translation unit holding one
+    kernel template instantiated six ways (pipeline ring depth 4/8/16 x PDL
+    off/on) plus its TVM-FFI binding, mirroring the incumbent
+    ``csrc/tinygemm2.cu`` layout. The kernel is a generated port of the
+    TensorRT-LLM tinygemm2 kernel with bit-identical outputs; the ring depth
+    is selected inside the binding from the problem shape.
     """
     return gen_jit_spec(
         "tinygemm2_sm100",

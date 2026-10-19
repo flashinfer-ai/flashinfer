@@ -334,15 +334,15 @@ def _quantize_and_pack(
         # the kernel index the scale tensor out of bounds → illegal memory access.
         if per_token_activation:
             from flashinfer.quantization.nvfp4_quantization_utils import (
-                current_nvfp4_4over6_config,
                 make_nvfp4_global_scale,
+                resolve_nvfp4_4over6,
             )
             from flashinfer.tllm_enums import SfLayout
 
             global_scale = make_nvfp4_global_scale(
                 flat,
                 per_token_activation=True,
-                nvfp4_4over6_config=current_nvfp4_4over6_config(),
+                nvfp4_4over6_config=resolve_nvfp4_4over6(),
             )
             hidden_states_q, hidden_states_scale, per_token_scale = nvfp4_quantize(
                 flat,
@@ -388,6 +388,10 @@ def _quantize_and_pack(
             hidden_states_scale = hidden_states_scale.view(torch.uint8).reshape(
                 flat.shape[0], flat.shape[1] // 32
             )
+        if pair[0] is QuantFormat.MXFP4:
+            # W4A8 packs carry UE8M0 bytes in float8 storage. CuTe reinterprets
+            # them as uint8; TRT-LLM requires the float8 view.
+            hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn)
     elif activation is QuantFormat.BF16:
         # BF16 and both W4A16 encodings consume the dispatched activations.
         hidden_states_q = flat
