@@ -20,11 +20,12 @@ import json
 import os
 import re
 import shutil
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 from . import env as jit_env
-from .core import JitSpec, get_tmpdir, logger
+from .core import JitSpec, _record_jit_build, get_tmpdir, logger
 
 _META_FILENAME = "meta.json"
 
@@ -56,9 +57,108 @@ def _get_cute_dsl_version() -> str:
     return ";".join(stack) if stack else "unknown"
 
 
+def cute_dsl_strict_cache_key() -> bool:
+    """Whether cache keys also cover the in-package import closure of key files."""
+    return os.environ.get("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", "0") == "1"
+
+
+# The flashinfer package directory; only imports resolving inside it are followed.
+_PACKAGE_DIR = Path(__file__).resolve().parents[1]
+_TOP_LEVEL_INIT = _PACKAGE_DIR / "__init__.py"
+
+
+def _resolve_package_module(parts: Sequence[str]) -> Optional[Path]:
+    """File of the dotted flashinfer module ``parts`` (first part ``flashinfer``)."""
+    if not parts or parts[0] != _PACKAGE_DIR.name:
+        return None
+    base = _PACKAGE_DIR.joinpath(*parts[1:])
+    for candidate in (base.with_suffix(".py"), base / "__init__.py"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+@functools.cache
+def _direct_package_imports(path: Path) -> tuple:
+    """Flashinfer source files ``path`` imports, including function-local imports.
+
+    Parent-package ``__init__`` files are not followed unless named by the
+    import itself: a kernel module depends on what it imports, not on
+    everything its package re-exports, and following them would pull in the
+    whole package and defeat cache reuse.
+    """
+    import ast
+
+    rel = path.relative_to(_PACKAGE_DIR.parent).with_suffix("")
+    package = list(rel.parts[:-1])  # same for ``__init__`` and plain modules
+    tree = ast.parse(path.read_bytes(), filename=str(path))
+    found = set()
+    for node in ast.walk(tree):
+        resolved_files = []
+        if isinstance(node, ast.Import):
+            resolved_files = [
+                _resolve_package_module(alias.name.split(".")) for alias in node.names
+            ]
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                if node.level - 1 > len(package):
+                    continue
+                base = package[: len(package) - (node.level - 1)]
+            else:
+                base = []
+            module = base + (node.module.split(".") if node.module else [])
+            for alias in node.names:
+                # ``from pkg import submodule`` depends on the submodule only;
+                # any other name is defined by ``pkg`` itself.
+                submodule = _resolve_package_module(module + [alias.name])
+                resolved_files.append(
+                    submodule
+                    if submodule is not None
+                    else _resolve_package_module(module)
+                )
+        for resolved in resolved_files:
+            # The top-level ``__init__`` re-exports the whole public API and
+            # defines no kernels; following it would key every kernel on
+            # every file in the package.
+            if resolved is not None and resolved not in (path, _TOP_LEVEL_INIT):
+                found.add(resolved)
+    return tuple(sorted(found))
+
+
+@functools.cache
+def _package_import_closure(path: Path) -> tuple:
+    """``path`` plus every flashinfer source file it transitively imports."""
+    seen = {path}
+    stack = [path]
+    while stack:
+        for dep in _direct_package_imports(stack.pop()):
+            if dep not in seen:
+                seen.add(dep)
+                stack.append(dep)
+    return tuple(sorted(seen))
+
+
+def _expand_key_files(paths: tuple) -> tuple:
+    """Key files plus, in strict mode, their in-package import closures.
+
+    Callers list the files whose content should invalidate their kernels,
+    typically just ``__file__``; helpers those files import are easy to
+    miss. Strict mode keeps a long-lived shared cache (CI) from serving a
+    kernel compiled before such a helper changed.
+    """
+    if not cute_dsl_strict_cache_key():
+        return paths
+    expanded = set(str(p) for p in paths)
+    for p in paths:
+        resolved = Path(p).resolve()
+        if resolved.suffix == ".py" and resolved.is_relative_to(_PACKAGE_DIR):
+            expanded.update(str(dep) for dep in _package_import_closure(resolved))
+    return tuple(expanded)
+
+
 def _hash_source_files(paths: tuple) -> str:
     sha = hashlib.sha256()
-    for path in sorted(str(p) for p in paths):
+    for path in sorted(str(p) for p in _expand_key_files(paths)):
         sha.update(path.encode())
         with open(path, "rb") as f:
             sha.update(f.read())
@@ -95,6 +195,8 @@ class JitSpecCuteDsl(JitSpec):
     whole module); instances of the same op family share a module directory
     and its module-level ``meta.json``.
     """
+
+    toolchain = "cute_dsl"
 
     def __init__(
         self,
@@ -195,7 +297,9 @@ class JitSpecCuteDsl(JitSpec):
         """
         from filelock import FileLock
 
+        started = time.perf_counter()
         self._compiled_kernel = self.compile_fn()
+        _record_jit_build(self.toolchain, self.name, time.perf_counter() - started)
         with FileLock(self.lock_path, thread_local=False):
             if (
                 self.module_dir.exists()
@@ -318,7 +422,7 @@ def build_and_load_cute_dsl_kernel(
     # file from the hash: a weakened key could serve stale artifacts.
     try:
         source_sha256 = _hash_source_files(tuple(extra_key_files))
-    except (OSError, TypeError) as e:
+    except (OSError, TypeError, SyntaxError) as e:  # SyntaxError: strict-key parse
         logger.warning(
             f"Cannot hash CuTe-DSL kernel sources for {module_name}/{kernel_name} "
             f"({e}); bypassing the disk cache for this kernel."

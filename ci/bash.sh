@@ -81,6 +81,62 @@ else
     echo "Shared pip cache disabled or not writable; downloads will not be reused"
 fi
 
+# Keep content-keyed kernel compile caches across the jobs of this runner, so
+# tests stop recompiling every CuTe-DSL, TIRx, KDA PTX and Triton kernel per
+# job. One directory per runner: a runner runs one job at a time, so no two
+# checkouts ever share a directory concurrently. GPU jobs only.
+# CI_COMPILE_CACHE_DIR="" opts out.
+#
+# What is deliberately not kept:
+# - nvcc modules: a fresh checkout makes every source newer than its .so, so
+#   ninja rebuilds them anyway. They are pruned instead of taking disk.
+# - Tuning results (*/autotune): tests must tune from scratch.
+# - The CuTe-DSL compiler's own file cache (CUTE_DSL_CACHE_DIR), whose key
+#   is not under FlashInfer's control. FlashInfer's CuTe-DSL cache is kept,
+#   with FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1 so a kernel is also keyed on
+#   the in-package helpers it imports, not only on its own file.
+# - The TRT-LLM DeepGEMM cache (~/.tensorrt_llm/cache), keyed on shapes only.
+prune_compile_cache() {
+    local cache_dir=$1
+    [ -d "${cache_dir}" ] || return 0
+    # Containers may write as root, so the runner user may need sudo.
+    local rm_cmd=(rm -rf)
+    if [ ! -w "${cache_dir}" ] || find "${cache_dir}" ! -user "$(id -u)" -print -quit 2>/dev/null | grep -q .; then
+        rm_cmd=(sudo -n rm -rf)
+    fi
+    # GNU find/xargs (CI runners); elsewhere this quietly prunes nothing.
+    {
+        find "${cache_dir}" -path '*/cached_ops/*' -name build.ninja -printf '%h\0'
+        find "${cache_dir}" -type d \( -name autotune \
+            -o -path '*/.cache/flashinfer/*/*/generated' \) -prune -printf '%p\0'
+        find "${cache_dir}" -name flashinfer_jit.log -printf '%p\0'
+    } 2>/dev/null | xargs -0 -r "${rm_cmd[@]}" 2>/dev/null || true
+}
+
+COMPILE_CACHE_DIR=""
+if [[ ${USE_GPU} == "true" ]]; then
+    : "${CI_COMPILE_CACHE_DIR=${HOME:-/tmp}/.cache/flashinfer-ci/compile/${RUNNER_NAME:-local}}"
+    if [ -n "${CI_COMPILE_CACHE_DIR}" ] && mkdir -p "${CI_COMPILE_CACHE_DIR}" 2>/dev/null; then
+        COMPILE_CACHE_DIR=${CI_COMPILE_CACHE_DIR}
+        prune_compile_cache "${COMPILE_CACHE_DIR}"
+        CACHE_MB=$(du -sm "${COMPILE_CACHE_DIR}" 2>/dev/null | cut -f1)
+        echo "Compile cache: ${COMPILE_CACHE_DIR} (${CACHE_MB:-0} MB)"
+        if [ "${CACHE_MB:-0}" -gt "${CI_COMPILE_CACHE_MAX_MB:-40960}" ]; then
+            echo "Clearing compile cache: ${CACHE_MB} MB exceeds ${CI_COMPILE_CACHE_MAX_MB:-40960} MB"
+            rm -rf "${COMPILE_CACHE_DIR:?}" 2>/dev/null \
+                || sudo -n rm -rf "${COMPILE_CACHE_DIR:?}" 2>/dev/null || true
+            mkdir -p "${COMPILE_CACHE_DIR}" 2>/dev/null || true
+        fi
+        DOCKER_VOLUMNS="${DOCKER_VOLUMNS} -v ${COMPILE_CACHE_DIR}:/compile-cache"
+        DOCKER_ENV="${DOCKER_ENV} -e FLASHINFER_WORKSPACE_BASE=/compile-cache/flashinfer"
+        DOCKER_ENV="${DOCKER_ENV} -e FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1"
+        DOCKER_ENV="${DOCKER_ENV} -e CUTE_DSL_CACHE_DIR=/tmp/cute-dsl-cache"
+        DOCKER_ENV="${DOCKER_ENV} -e TRITON_CACHE_DIR=/compile-cache/triton"
+    else
+        echo "Compile cache disabled or not writable; kernels will not be reused"
+    fi
+fi
+
 # Use nvidia-docker if the container is GPU.
 if [[ ${USE_GPU} == "true" ]]; then
     # Keep CPU-only sharding infrastructure tests out of GPU CI collection.
@@ -124,3 +180,10 @@ ${DOCKER_BINARY} run --rm --pid=host \
     ${DOCKER_EXTRA_PARAMS[@]} \
     ${DOCKER_IMAGE_NAME} \
     ${COMMAND[@]}
+DOCKER_STATUS=$?
+
+# Drop what the next job would rebuild anyway before the runner sits idle.
+if [ -n "${COMPILE_CACHE_DIR}" ]; then
+    prune_compile_cache "${COMPILE_CACHE_DIR}"
+fi
+exit "${DOCKER_STATUS}"

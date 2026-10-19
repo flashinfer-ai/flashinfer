@@ -469,6 +469,9 @@ jobs:
               exit 1
               ;;
           esac
+          # Per-build compile times, summarized by the next step.
+          mkdir -p junit
+          CI_BASH_ARGS=(-e FLASHINFER_JIT_BUILD_LOG /workspace/junit/jit-builds.jsonl)
           TEST_RUNNER_ARGS=()
           if [ "${MATRIX_KIND}" = "h100" ]; then
             TEST_RUNNER_ARGS+=(--workers-per-gpu 2)
@@ -485,9 +488,20 @@ jobs:
             # to unit_test_runner.py, whose parser takes the scope as an option (or the
             # TEST_PATH env var, which ci/bash.sh does not forward into the container).
             # Bare paths fail argument-preflight with "unrecognized arguments".
-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}" --test-path "${TEST_TARGETS[@]}"
+            bash ci/bash.sh "${DOCKER_IMAGE}" "${CI_BASH_ARGS[@]}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}" --test-path "${TEST_TARGETS[@]}"
           else
-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}"
+            bash ci/bash.sh "${DOCKER_IMAGE}" "${CI_BASH_ARGS[@]}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}"
+          fi
+
+      - name: Summarize JIT build times
+        if: always() && matrix.kind != 'aot'
+        run: |
+          if command -v python3 >/dev/null; then
+            python3 scripts/summarize_jit_builds.py junit/jit-builds.jsonl || true
+            python3 scripts/summarize_jit_builds.py --markdown \
+              junit/jit-builds.jsonl >> "${GITHUB_STEP_SUMMARY}" || true
+          else
+            echo "::warning::python3 unavailable on runner; JIT build summary skipped"
           fi
 
       - name: Make JUnit XML readable
@@ -507,6 +521,7 @@ jobs:
             junit/**/*.telemetry.json
             junit/**/*.meta.json
             junit/**/*.memory.csv
+            junit/jit-builds.jsonl
           if-no-files-found: warn
           retention-days: 30
 
