@@ -457,9 +457,10 @@ def _moe_core_impl(
     activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
     is_mxfp8 = x.dtype == torch.float8_e4m3fn
     if weight_dtype is None:
+        # The localized (W4A4-only) path passes w1_weight=None; its shards are FP4.
         weight_dtype = (
             "float8_e4m3fn"
-            if w1_weight.dtype == torch.float8_e4m3fn
+            if w1_weight is not None and w1_weight.dtype == torch.float8_e4m3fn
             else "float4_e2m1fn"
         )
     if weight_dtype not in ("float4_e2m1fn", "float8_e4m3fn"):
