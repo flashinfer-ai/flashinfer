@@ -5,8 +5,8 @@ allocates a buffer of the same size, and every rank maps every peer's buffer
 into its own virtual address space, so a kernel reads and writes peer memory
 with plain loads and stores.
 
-<p align="center"><img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog18_symmetric_memory.png" alt="Symmetric memory across GPUs" width="600"/></p>
-<p align="center"><em>Symmetric memory registration across GPUs. (Image courtesy: <a href="https://developer.nvidia.com/blog/enabling-fast-inference-and-resilient-training-with-nccl-2-27/">NVIDIA NCCL 2.27 Blog</a>)</em></p>
+<p align="center"><img src="./media/symmetric_memory.png" alt="Symmetric memory across GPUs" width="600"/></p>
+<p align="center"><em>Symmetric memory registration across GPUs. (Image source: <a href="https://developer.nvidia.com/blog/enabling-fast-inference-and-resilient-training-with-nccl-2-27/">NVIDIA NCCL 2.27 blog</a>)</em></p>
 
 Two classes in [`flashinfer/comm/mnnvl.py`](../../flashinfer/comm/mnnvl.py)
 provide it:
