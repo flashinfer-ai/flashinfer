@@ -27,14 +27,12 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64
 
 from .config import flat_scale_slot
-from .layout import _SageScaleLayout
-
-Constexpr = cutlass.Constexpr
+from .layout import _SageKSection, _SageQSection, _SageScaleLayout, _SageVSection
 
 
 @cute.jit
 def sage_sequence_words(
-    layout: Constexpr[_SageScaleLayout],
+    layout: cutlass.Constexpr[_SageScaleLayout],
     *,
     batch_idx: Int32,
     kv_head_idx: Int32,
@@ -46,14 +44,17 @@ def sage_sequence_words(
 
 
 @cute.jit
-def sage_section_word(sequence_words: Int32, section: Constexpr) -> Int32:
+def sage_section_word(
+    sequence_words: Int32,
+    section: cutlass.Constexpr[_SageKSection | _SageQSection | _SageVSection],
+) -> Int32:
     """Return the first word of one section of a sequence's prepared scales."""
     return sequence_words + Int32(section.word_offset)
 
 
 @cute.jit
 def sage_q_word(
-    layout: Constexpr[_SageScaleLayout],
+    layout: cutlass.Constexpr[_SageScaleLayout],
     *,
     sequence_words: Int32,
     q_tile_idx: Int32,
@@ -61,7 +62,9 @@ def sage_q_word(
 ) -> Int32:
     """Return the ``sfQ`` word of row ``row_idx`` of Q tile ``q_tile_idx``.
 
-    Each kernel numbers its Q tiles with ``_SageQSection.tile_index``.
+    ``q_tile_idx`` numbers the tiles as ``_SageQSection`` lays them out: the
+    decode kernel's grouped Q CTA, or the context kernel's
+    ``tile_index(local_head, token_tile)``.
     """
     q_rows = layout.q_rows
     return (

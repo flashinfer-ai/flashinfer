@@ -38,7 +38,6 @@ from .layout import (
     _FLOAT4_WORDS,
     _SAGE_ATOM_TOKENS,
     _SageKSection,
-    _SageQSection,
     _SageScaleLayout,
 )
 
@@ -198,23 +197,6 @@ def _write_k_float4(
 
 
 @cute.jit
-def _q_row_token_and_head(
-    q_rows: cutlass.Constexpr[_SageQSection],
-    tile_idx: cutlass.Int32,
-    row: cutlass.Int32,
-) -> tuple[cutlass.Int32, cutlass.Int32]:
-    """Return the token and local Q head of row ``row`` of Q tile ``tile_idx``.
-
-    The row order is the section's (``_SageQSection.row_token_and_head``);
-    the token is clamped to the sequence's last token.
-    """
-
-    token, local_head = q_rows.row_token_and_head(tile_idx, row)
-    last_token = cutlass.Int32(q_rows.seq_len_q - 1)
-    return cute.math.min(token, last_token), local_head
-
-
-@cute.jit
 def _write_q_float4(
     q_scale: cute.Tensor,
     scales: cute.Tensor,
@@ -229,7 +211,8 @@ def _write_q_float4(
 
     ``float4_in_section`` places the float4 in the sequence's Q rows. Row
     ``r`` of the tile takes the Q scale of the token and Q head the section's
-    row order maps it to (``_q_row_token_and_head``).
+    row order maps it to (``_SageQSection.row_token_and_head``);
+    ``load_flat_scale`` gives a token past the sequence's end the last token's.
     """
 
     q_rows = layout.q_rows
@@ -243,8 +226,8 @@ def _write_q_float4(
         cutlass.Float32, _FLOAT4_WORDS, space=cutlass.AddressSpace.rmem
     )
     for elem in cutlass.range_constexpr(_FLOAT4_WORDS):
-        q_token_idx, local_head_idx = _q_row_token_and_head(
-            q_rows, tile_idx, first_row + cutlass.Int32(elem)
+        q_token_idx, local_head_idx = q_rows.row_token_and_head(
+            tile_idx, first_row + cutlass.Int32(elem)
         )
         words[elem] = load_flat_scale(
             q_scale.iterator.toint(),

@@ -27,7 +27,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TypeVar
 
 import torch
 
@@ -52,10 +51,6 @@ def _validate_int8_qk_device(q_dtype: torch.dtype, device_index: int) -> None:
 
 
 SAGE_K_BLOCK_SIZES = (1, 4, 16, 32, 64, 128, 256)
-# Sage scale slots of the contiguous attention adapter, in ABI order.
-SAGE_ADAPTER_SLOTS = ("q_scale", "k_scale", "k_summary_scale", "v_scale", "v_mean")
-
-_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -119,15 +114,6 @@ def log2_block_size(block_size: int) -> int:
     if not is_power_of_two(block_size):
         raise ValueError(f"block size must be a power of two, got {block_size}")
     return block_size.bit_length() - 1
-
-
-def sage_adapter_slots(values: Mapping[str, _T | None]) -> tuple[_T | None, ...]:
-    """Arrange Sage values named by scale into the adapter slots.
-
-    An absent name leaves its slot ``None``, which the adapter binds as a null
-    pointer.
-    """
-    return tuple(values.get(name) for name in SAGE_ADAPTER_SLOTS)
 
 
 def flat_scale_slot(batch_idx, token_idx, seq_len, log2_block: int):
@@ -276,19 +262,3 @@ def validate_sage_params(
         _validate_scale_tensor(
             getattr(params, name), name, expected_shape=expected_shape, device=device
         )
-
-
-__all__ = [
-    "SAGE_ADAPTER_SLOTS",
-    "SAGE_K_BLOCK_SIZES",
-    "SageAttentionConfig",
-    "SageAttentionParams",
-    "flat_scale_numel",
-    "flat_scale_slot",
-    "is_power_of_two",
-    "log2_block_size",
-    "sage_adapter_slots",
-    "sage_scale_shapes",
-    "validate_sage_params",
-    "validate_sage_recipe",
-]

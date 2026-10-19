@@ -31,7 +31,6 @@ host-side modules only; kernels import ``prepare``, ``index`` and
 """
 
 from .config import (
-    SAGE_ADAPTER_SLOTS,
     SAGE_K_BLOCK_SIZES,
     SageAttentionConfig,
     SageAttentionParams,
@@ -39,14 +38,12 @@ from .config import (
     flat_scale_slot,
     is_power_of_two,
     log2_block_size,
-    sage_adapter_slots,
     sage_scale_shapes,
     validate_sage_params,
     validate_sage_recipe,
 )
 
 __all__ = [
-    "SAGE_ADAPTER_SLOTS",
     "SAGE_K_BLOCK_SIZES",
     "SageAttentionConfig",
     "SageAttentionParams",
@@ -54,7 +51,6 @@ __all__ = [
     "flat_scale_slot",
     "is_power_of_two",
     "log2_block_size",
-    "sage_adapter_slots",
     "sage_scale_shapes",
     "validate_sage_params",
     "validate_sage_recipe",

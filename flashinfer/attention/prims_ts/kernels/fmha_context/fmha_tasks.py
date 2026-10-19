@@ -2256,6 +2256,10 @@ def create_softmax_task(
     sage_scaling = tmem_sp.cfg.sage_score_scaling
     if use_sage and not p_in_smem:
         raise ValueError("Sage attention requires P in SMEM")
+    if sage_transport is SageKTransport.RING and sage_scaling is SageScoreScaling.BLOCK:
+        # The P pass of block-scaled scores reuses the max pass's words, and
+        # a ring stage is released after the max pass.
+        raise ValueError("block-scaled Sage scores load their sfK words directly")
     if sage_transport is SageKTransport.RING:
         if smem_sage_k is None:
             raise ValueError("this Sage K block size requires the sfK ring")
@@ -2363,11 +2367,10 @@ def create_softmax_task(
                 return skr.open_stage()
 
             def sage_row_max(row_max: Any, k_words: Any, section: FmhaStage) -> Any:
-                """Row max of the dequantized scores and the tile's ``sfK`` words.
+                """Row max of the dequantized scores.
 
                 A ring stage's words are read after the score wait and the
-                stage is released after the max pass
-                (``read_staged_sage_k_words``)."""
+                stage is released after the max pass (``SmemSageKScalesResource``)."""
                 if sage_transport is SageKTransport.RING:
                     k_words = sp.read_staged_sage_k_words(sage_k_stage_words=k_words)
                 if sage_scaling is SageScoreScaling.BLOCK:
@@ -2386,7 +2389,7 @@ def create_softmax_task(
                     )
                 if sage_transport is SageKTransport.RING:
                     skr.release()
-                return maxima, k_words
+                return maxima
 
             # Reserve a stats slot before the first softmax result is published.
             vec.acquire()
@@ -2396,7 +2399,7 @@ def create_softmax_task(
                 sp.wait()
                 # Compute row max and publish vec.
                 if use_sage:
-                    (old_row_max, row_max), sage_k_words = sage_row_max(
+                    old_row_max, row_max = sage_row_max(
                         row_max, sage_k_words, FmhaStage.Loop
                     )
                 elif tmem_sp.uses_variable_window:
@@ -2674,7 +2677,7 @@ def create_softmax_task(
                     sage_k_words = start_sage_k_words(FmhaStage.Tail)
                 sp.wait()
                 if use_sage:
-                    (old_row_max, row_max), sage_k_words = sage_row_max(
+                    old_row_max, row_max = sage_row_max(
                         row_max, sage_k_words, FmhaStage.Tail
                     )
                 else:

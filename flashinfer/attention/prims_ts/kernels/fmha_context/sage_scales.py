@@ -14,20 +14,17 @@
 
 """Sage attention scale addressing for the context softmax and epilogue.
 
-The Sage prepare writes one FP32 buffer per plan before attention
-(``_SageScaleLayout``): per sequence ``s = b * Hkv + h`` the K-token atoms
-(one atom of ``sfK`` words per 64 tokens), the Q rows (one ``sfQ`` word per
-row of each 128-token Q tile of each Q head of the KV head, in the softmax
-lane order) and the V rows (``sfV`` and, with a V mean, ``v_mean`` per
-channel). The helpers here turn work-tile coordinates into words of that
-buffer and move the words the kernel reads:
+The Sage prepare writes one FP32 buffer per plan before attention, laid out
+as ``_SageScaleLayout`` describes; a context Q tile holds 128 tokens of one Q
+head. The helpers here turn work-tile coordinates into words of that buffer
+and move the words the kernel reads:
 
 * ``load_sage_q_scale`` reads a softmax lane's ``sfQ`` word once per work
   tile (``sage.index`` holds the word arithmetic both kernels share);
 * ``load_sage_k_tile`` reads one K tile's ``sfK`` atoms from the tile's
   address (``sage_k_section_address`` gives the sequence's first atom) for
-  the softmax lanes or the load warp's shared-memory staging;
-  ``sage_k_transport`` says which of the two the plan's K block size takes
+  the softmax lanes; ``sage_k_transport`` says whether the plan's K block
+  size takes that path or the load warp's ring (``SmemSageKScalesResource``),
   and ``sage_score_scaling`` how the softmax applies the words;
   ``prefetch_sage_k_tile`` warms L1 with the next tile's atoms one tile ahead
   of direct loads;

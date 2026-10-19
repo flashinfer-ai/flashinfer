@@ -1771,10 +1771,12 @@ def _context_sage_layout(geometry: _ContextPlanGeometry) -> _SageScaleLayout:
     return _SageScaleLayout(
         seq_len_kv=geometry.max_seq_len_k,
         k_block_size=sage.k_block_size,
+        # No summaries: their block sizes follow the K blocks, so recipes that
+        # differ only in k_summary_block_size share one layout and compilation.
         num_summaries=0,
-        k_summary_block_size=sage.k_summary_block_size,
+        k_summary_block_size=sage.k_block_size,
         k_tokens_block_size=sage.k_block_size,
-        summaries_block_size=sage.k_summary_block_size,
+        summaries_block_size=sage.k_block_size,
         seq_len_q=geometry.max_seq_len_q,
         q_block_size=sage.q_block_size,
         heads_q_per_kv=geometry.num_qo_heads // geometry.num_kv_heads,

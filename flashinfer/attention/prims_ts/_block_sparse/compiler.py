@@ -23,8 +23,8 @@ import torch
 
 from flashinfer.utils import ceil_div
 
-from .common import _num_sparse_pattern_heads
-from ..sage.config import sage_adapter_slots, sage_scale_shapes
+from .common import _num_sparse_pattern_heads, sage_adapter_slots
+from ..sage.config import sage_scale_shapes
 from .config import _BlockSparseCompileKey, _make_block_sparse_config
 
 

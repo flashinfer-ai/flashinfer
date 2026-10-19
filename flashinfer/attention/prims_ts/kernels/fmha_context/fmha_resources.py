@@ -1983,8 +1983,11 @@ class SmemSageKScalesResource(MemoryResource):
     with lane-parallel 16-byte ``cp.async`` copies; the pipeline's
     ``AsyncLoad`` commit completes the stage once they land. Both softmax
     groups wait the stage before their score wait, take its shared-memory
-    offset from ``open_stage``, read the words after the score wait and
-    release the stage after their max pass.
+    offset from ``open_stage``, read the words after the score wait
+    (``TmemSPResource.read_staged_sage_k_words``) and release the stage after
+    their max pass: a release orders every read before it, so an earlier one
+    would keep all the words in registers while the scores load instead of
+    letting the compiler place each read next to its use.
     """
 
     cfg: Constexpr[FmhaConfig] = field(init=False, default=None)
@@ -2759,7 +2762,6 @@ class TmemSPResource(MemoryResource):
     sage_q_scale: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     sage_k_first_atom: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     sage_k_words: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
-    sage_k_stage_words: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     # INT32 scores: the first instance owns the seed MMA's constant operand
     # tile and the second reads it.
     score_seed_owner: Optional["TmemSPResource"] = field(init=False, default=None)
@@ -2847,11 +2849,6 @@ class TmemSPResource(MemoryResource):
                 cfg.sage_k_tile_words if cfg.use_sage_attention else 1
             ),
             docs="Sage ``sfK`` of each word of the current K tile.",
-        )
-        self.sage_k_stage_words = TaskLocalVariable(
-            dtype=Int32,
-            default=Int32(0),
-            docs="Shared-memory byte offset of the current K tile's staged ``sfK`` words.",
         )
         self._alloc = TmemAllocation(
             f"tmem_sp_q{q_half}",
@@ -3536,10 +3533,23 @@ class TmemSPResource(MemoryResource):
         The global transport (``SageKTransport.GLOBAL``), scheduled before
         the wait for the tile's scores: the wait and the TMEM load then hide
         the load latency, which the compiler would otherwise expose by
-        sinking the loads next to their first use.
+        sinking the loads next to their first use. ``section=Tail`` loads the
+        tile the schedule materializes after the loop, which has no next tile.
         """
-        words = self._load_sage_k_tile_words(stage_info, sage_k_first_atom, section)
-        return self._sage_k_words_vector(words)
+        layout = self.cfg.sage_scale_layout
+        if cutlass.const_expr(section == FmhaStage.Loop):
+            kv_tile_idx = stage_info.loop_offset
+        else:
+            kv_tile_idx = stage_info.loop_end
+        tile_bytes = Int64(sage_k_tile_bytes(layout))
+        tile_address = sage_k_first_atom + Int64(kv_tile_idx) * tile_bytes
+        words = load_sage_k_tile(layout, tile_address)
+        if cutlass.const_expr(section == FmhaStage.Loop):
+            prefetch_sage_k_tile(layout, tile_address + tile_bytes)
+        values: tuple[Any, ...] = ()
+        for word_idx in cutlass.range_constexpr(self.cfg.sage_k_tile_words):
+            values += (Float32(words[word_idx]),)
+        return cutlass.Vector.from_elements(values, Float32)
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=sage_k_words)
     @cute.jit
@@ -3548,13 +3558,9 @@ class TmemSPResource(MemoryResource):
     ) -> cutlass.Vector:
         """Read the current K tile's ``sfK`` words from its waited ring stage.
 
-        The ring transport (``SageKTransport.RING``): ``sage_k_stage_words``
-        is the stage's shared-memory byte offset
-        (``SmemSageKScalesResource.open_stage``); one float4 load per four
-        words. The caller releases the stage after the max pass: a release
-        orders every read before it, so an earlier one would keep all the
-        words in registers while the scores load instead of letting the
-        compiler place each read next to its use.
+        The ring transport (``SageKTransport.RING``, protocol on
+        ``SmemSageKScalesResource``): ``sage_k_stage_words`` is the stage's
+        shared-memory byte offset; one float4 load per four words.
         """
         tile_words = self.cfg.sage_k_tile_words
         stage = cutlass.Array(
@@ -3568,44 +3574,6 @@ class TmemSPResource(MemoryResource):
             loaded = stage.load(base, vector_size=_FLOAT4_WORDS, alignment=16)
             for elem in cutlass.range_constexpr(_FLOAT4_WORDS):
                 values += (Float32(loaded[elem]),)
-        return cutlass.Vector.from_elements(values, Float32)
-
-    @cute.jit
-    def _sage_k_tile_address(
-        self, stage_info: StageInfo, sage_k_first_atom: Int64, section: FmhaStage
-    ) -> Int64:
-        """Return the address of the current K tile's ``sfK`` atoms.
-
-        ``section=Tail`` addresses the tile the schedule materializes after
-        the loop.
-        """
-        if cutlass.const_expr(section == FmhaStage.Loop):
-            kv_tile_idx = stage_info.loop_offset
-        else:
-            kv_tile_idx = stage_info.loop_end
-        tile_bytes = Int64(sage_k_tile_bytes(self.cfg.sage_scale_layout))
-        return sage_k_first_atom + Int64(kv_tile_idx) * tile_bytes
-
-    @cute.jit
-    def _load_sage_k_tile_words(
-        self, stage_info: StageInfo, sage_k_first_atom: Int64, section: FmhaStage
-    ) -> cutlass.Array:
-        """Load the current K tile's ``sfK`` words and prefetch the next tile's (the tail has none)."""
-        layout = self.cfg.sage_scale_layout
-        tile_address = self._sage_k_tile_address(stage_info, sage_k_first_atom, section)
-        words = load_sage_k_tile(layout, tile_address)
-        if cutlass.const_expr(section == FmhaStage.Loop):
-            prefetch_sage_k_tile(
-                layout, tile_address + Int64(sage_k_tile_bytes(layout))
-            )
-        return words
-
-    @cute.jit
-    def _sage_k_words_vector(self, sage_k_words: cutlass.Array) -> cutlass.Vector:
-        """Return the tile's ``sfK`` words as a vector."""
-        values: tuple[Any, ...] = ()
-        for word_idx in cutlass.range_constexpr(self.cfg.sage_k_tile_words):
-            values += (Float32(sage_k_words[word_idx]),)
         return cutlass.Vector.from_elements(values, Float32)
 
     @cute.jit

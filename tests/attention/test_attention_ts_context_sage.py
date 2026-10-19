@@ -153,7 +153,8 @@ def _reference(q, k, v, params: SageAttentionParams, *, config, sm_scale: float)
     return output
 
 
-# The three K block sizes select the three Sage softmax modes.
+# The three K block sizes cover every K transport and score scaling the
+# context kernel selects.
 _INT8_K_BLOCK_SIZES = (16, 4, 1)
 
 

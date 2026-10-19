@@ -15,12 +15,10 @@
 """Names for how a Sage softmax obtains and applies the ``sfK`` scales.
 
 Each attention kernel picks one transport and one scaling per plan and keeps
-its own choice, resources and code; the names are shared so that the same
-mechanism reads the same in both kernels. The decode kernel stages every K
-tile's words in its ring and scales blocks of ``k_block_size`` columns, or
-dequantizes one-token blocks. The context kernel loads the words of
-four-token and coarser blocks from global memory and stages one-token blocks
-in its ring, and scales 16-column blocks or dequantizes finer ones.
+its own selection, resources and code (the context kernel's
+``sage_k_transport`` and ``sage_score_scaling`` in
+``kernels/fmha_context/sage_scales.py``, the decode kernel's
+``FmhaDecodeConfig.sage_score_scaling``); only the names are shared.
 """
 
 import enum

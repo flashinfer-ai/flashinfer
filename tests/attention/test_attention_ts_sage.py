@@ -38,8 +38,10 @@ from flashinfer.attention.prims_ts import (
 from flashinfer.attention.prims_ts._block_sparse import config as sparse_config
 from flashinfer.attention.prims_ts.sage.config import validate_sage_recipe
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_constants import (
+    E4M3_MAX,
     SOFTMAX_RESCALE_THRESHOLD_LOG2,
 )
+from flashinfer.attention.prims_ts.sage.layout import _SageQSection
 
 from tests.attention.test_attention_ts_block_sparse import (
     _HEAD_DIM,
@@ -511,6 +513,8 @@ def _reference(
     """
 
     headroom = _anchor_headroom_log2(case)
+    # The decode kernel's P scale.
+    p_scale = E4M3_MAX * 2.0**-headroom
     q_real = dequantize(q, params.q_scale, case.sage.q_block_size)
     k_real = dequantize(k, params.k_scale, case.sage.k_block_size)
     if summaries is not None:
@@ -565,7 +569,11 @@ def _reference(
                         ~visible.unsqueeze(1), float("-inf")
                     )
                     streams[stream] = fold(
-                        streams.get(stream), logits, values.float(), headroom
+                        streams.get(stream),
+                        logits,
+                        values.float(),
+                        headroom,
+                        p_scale=p_scale,
                     )
                 if not streams:
                     continue
@@ -802,6 +810,35 @@ def test_sage_plan_rejects_unsupported_recipes(
     )
     with pytest.raises(error, match=match):
         BlockSparseTSWrapper().plan(**{**arguments, **overrides})
+
+
+@pytest.mark.parametrize("heads_interleaved", (True, False), ids=("decode", "context"))
+def test_sage_q_rows_round_trip(heads_interleaved: bool) -> None:
+    """A kernel's Q tile numbering and the prepare's row decoding agree.
+
+    Each (token, Q head) goes to the tile ``tile_index`` gives and to the row
+    of the documented order: token-major over the heads of a decode tile, the
+    token alone in a context tile of one head. ``row_token_and_head`` must
+    decode that tile and row back.
+    """
+
+    rows = _SageQSection(
+        seq_len_q=300,
+        q_block_size=2,
+        heads_q_per_kv=4,
+        tokens_per_tile=16 if heads_interleaved else 128,
+        word_offset=0,
+        heads_interleaved=heads_interleaved,
+    )
+    for head in range(rows.heads_q_per_kv):
+        for token in range(rows.seq_len_q):
+            token_tile, token_in_tile = divmod(token, rows.tokens_per_tile)
+            row = token_in_tile
+            if heads_interleaved:
+                row = token_in_tile * rows.heads_q_per_kv + head
+            tile = rows.tile_index(head, token_tile)
+            assert 0 <= tile < rows.tiles and 0 <= row < rows.rows_per_tile
+            assert rows.row_token_and_head(tile, row) == (token, head)
 
 
 @pytest.mark.parametrize(

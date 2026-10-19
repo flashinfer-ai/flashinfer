@@ -18,8 +18,8 @@ Every scale reaches the kernel from the buffer the Sage prepare writes
 before attention (``_SageScaleLayout``), in the order the kernel reads it:
 ``sfQ`` as one word per row of each Q tile, ``sfK`` as one atom of words per
 64 K tokens, ``sfV`` and ``v_mean`` as one row per sequence. The prepare
-resolves the flat layout (``flat_scale_slot`` and ``load_flat_scale`` of
-:mod:`flashinfer.attention.prims_ts.sage`) and gives Q
+resolves the flat layout (``sage.config.flat_scale_slot`` and
+``sage.index.load_flat_scale``) and gives Q
 rows past the valid row count and K tokens past the sequence end the last
 valid scale, so masked scores keep a finite scale and exponentiate to zero.
 Each softmax lane loads its row's ``sfQ`` word once per work tile

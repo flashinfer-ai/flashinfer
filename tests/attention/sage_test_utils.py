@@ -24,9 +24,6 @@ import math
 import pytest
 import torch
 
-from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_constants import (
-    E4M3_MAX,
-)
 from flashinfer.attention.prims_ts.sage.config import _INT8_QK_COMPUTE_CAPABILITIES
 
 FP8 = torch.float8_e4m3fn
@@ -108,18 +105,16 @@ def fold(
     logits: torch.Tensor,
     values: torch.Tensor,
     headroom: float,
-    p_scale: float | None = None,
+    *,
+    p_scale: float,
 ):
     """Fold one set of columns into an online-softmax stream ``(anchor, sum, acc)``.
 
     The stream keeps its anchor while the columns raise the row maximum by at
     most ``headroom`` binades, as the kernel does. The row sum takes FP32
-    probabilities; the PV operand quantizes them to E4M3 at ``p_scale`` times
-    their ratio to the anchor, by default ``E4M3_MAX * 2**-headroom``.
+    probabilities; the PV operand quantizes them to E4M3 at ``p_scale`` (the
+    kernel's P scale) times their ratio to the anchor.
     """
-
-    if p_scale is None:
-        p_scale = E4M3_MAX * 2.0**-headroom
 
     if state is None:
         total = torch.zeros(logits.shape[:-1], device="cuda")
