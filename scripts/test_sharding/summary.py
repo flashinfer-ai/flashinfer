@@ -93,6 +93,7 @@ class RunSummary(TypedDict):
     schema_version: int
     complete: bool
     gpu_name: str
+    lane_id: str
     planned_nodes: int
     finalized_nodes: int
     pending_nodes: list[str]
@@ -581,6 +582,7 @@ def publish_summary_under_lock(junit_dir: Path, plan: Plan) -> RunSummary:
         "schema_version": 4,
         "complete": not scan.pending,
         "gpu_name": _detect_gpu_name(),
+        "lane_id": _detect_lane_id(),
         "planned_nodes": len(plan.nodes),
         "finalized_nodes": len(scan.rows),
         "pending_nodes": sorted(scan.pending, key=lambda value: value.encode("utf-8")),
@@ -728,6 +730,25 @@ def _detect_gpu_name() -> str:
         )
         return "unknown"
     return name
+
+
+def _detect_lane_id() -> str:
+    """Build a composite lane identifier from CI environment variables.
+
+    Format: ``{script} - {gpu_name}@{cuda}``, e.g.
+    ``task_run_unit_tests.sh - H100@cu124``.  Falls back to ``gpu_name``
+    alone when the other variables are unavailable.
+    """
+    gpu = _detect_gpu_name()
+    script = os.environ.get("CI_TEST_SCRIPT", "") or ""
+    cuda = os.environ.get("CI_MATRIX_CUDA", "") or ""
+    if script and cuda:
+        return f"{script} - {gpu}@{cuda}"
+    if script:
+        return f"{script} - {gpu}"
+    if cuda:
+        return f"{gpu}@{cuda}"
+    return gpu
 
 
 @lru_cache(maxsize=1)

@@ -251,13 +251,13 @@ def _changed_test_files_from_list(path: str) -> list[str]:
 def _load_summary(path: str, lane_name: str | None = None) -> tuple[str, list[dict]]:
     """Load a run-summary.json and return (lane_name, sources).
 
-    The lane name comes from the ``gpu_name`` field in the summary (written by
-    the test runner).  All current summaries include this field.
+    The lane name comes from the ``lane_id`` field (v4+) with a fallback to
+    ``gpu_name`` for older summaries.
     """
     with open(path, encoding="utf-8") as fh:
         data = json.load(fh)
     if lane_name is None:
-        lane_name = data.get("gpu_name", "unknown") or "unknown"
+        lane_name = data.get("lane_id") or data.get("gpu_name", "unknown") or "unknown"
     sources = data.get("sources", [])
     return lane_name, sources
 
