@@ -190,14 +190,15 @@ that writes the registry verifies the record against them before it is frozen.
 
 ## Layout of this package
 
-* `cake_jit.py` -- registry written by the generated-program export: one
-  record per program (`PROGRAMS`: role, the architecture-free `library` stem,
-  architectures, launch geometry), the program of every dispatch key per
-  architecture (`PROGRAM_KEYS`), the per-architecture dispatch policy
-  (`POLICY`), the argument plan per role, and the loader glue
+* `cake_jit.py` -- registry (exporter output, trimmed by hand here pending
+  exporter support): one record per program (`PROGRAMS`: role, the
+  architecture-free `library` stem, architectures), the program of every
+  dispatch key per architecture (`PROGRAM_KEYS`), the per-architecture
+  dispatch policy (`POLICY`), the argument plan per role, and the loader glue
   (`library_name(program, arch)` = the `build.json` entry `<library>_<arch>`,
-  `load_program(program, arch)` through `cake_build.load_library`,
-  `specs_for_arch(arch)` for JIT warm-up).
+  `load_program(program, arch)` through `cake_build.load_library`).  The
+  launch geometry of a program (block, cluster, dynamic shared memory) is
+  fixed in its binding.
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
   FlashInfer package and this package's build manifest (schema `cake-build/1`),
   the only record of what the package compiles: one entry per program and

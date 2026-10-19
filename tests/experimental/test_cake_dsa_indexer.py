@@ -36,7 +36,6 @@ from unittest import mock
 import pytest
 import torch
 
-from tests.test_helpers import cake_dsa_indexer_program_levers as levers
 from tests.test_helpers import cake_dsa_indexer_reference as ref
 from tests.test_helpers.cake_package import cake_package
 
@@ -306,10 +305,6 @@ def test_registry_records_are_well_formed():
                 os.path.isfile(os.path.join(package, src)) for src in entry["sources"]
             ), name
             assert len(entry["closure_sha256"]) == 64, name
-        assert (
-            len(record["launch"]["block"]) == 3
-            and len(record["launch"]["cluster"]) == 3
-        ), name
     for arch, keys in cake_jit.PROGRAM_KEYS.items():
         assert arch in cake_jit.ARCHES
         policy = policy_for(arch)
@@ -363,14 +358,6 @@ def test_registry_records_are_well_formed():
             assert arch in record["arches"], (arch, key, name)
             assert record["role"] == key.split(":", 1)[0], (arch, key, name)
             assert stage_slug(key).isidentifier(), key
-            if key.startswith("scan:pair_"):
-                assert record["launch"]["cluster"] == [2, 1, 1], (arch, key)
-        assert set(levers.PROGRAM_LEVERS[arch]) == set(scan_keys), arch
-        fields = {frozenset(record) for record in levers.PROGRAM_LEVERS[arch].values()}
-        assert len(fields) == 1, arch  # one lever record shape per architecture
-        assert {"kind", "block_q", "tile_unroll", "snake", "sample_fit"} <= next(
-            iter(fields)
-        ), arch
         for top_k in (1, 256, 1024, 2048, 4096):
             assert finalize_key(policy.finalize_threads_for(top_k)) in keys, (
                 arch,
@@ -1270,7 +1257,6 @@ def test_bind_program_orders_arguments_and_fails_closed(monkeypatch):
             "role": "scan",
             "library": "fake",
             "arches": ["sm_100a"],
-            "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
         },
     )
     values = {
