@@ -44,6 +44,11 @@ _LARGE_C7_TOKENS = (8192, 16384)
 # this set would launch the separate single-token quantization + router kernel
 # before the FC1 (four kernels, the "m1" selector).
 _M1_FUSED_ARCHES = ("sm_100a", "sm_103a")
+# Architectures whose 8- and 16-token routes run the FC1 + FC2 programs with evict_first cache
+# hints on their weight-stream TMA loads (the "n8_feature_ef_f2e" / "n8_w2a_m16_ef_f2e"
+# selectors) -- sm_100a today; sm_103a keeps "n8_feature" / "n8_w2a_m16".  Same stage lists
+# and launch arguments as the routes they supersede.
+_SMALL_L2POLICY_ARCHES = ("sm_100a",)
 # Architectures whose 8192- and 16384-token route runs the FC2 that stores an
 # 8-bit per-tile partial with per-tile FP32 scales and the finalize that
 # consumes it (eight kernels) -- both today; an architecture outside this set
@@ -62,13 +67,20 @@ _MID_Q8I_TOKENS = (4096,)
 # other large row keeps the production routing kernels (256 pairs per CTA).
 _LARGE_P1024_ARCHES = ("sm_100a",)
 _LARGE_P1024_TOKENS = (16384,)
+# Architectures and token counts whose large route fuses the quantization with the
+# routing-table reset and runs the 512-pairs-per-CTA privatized histogram / block-
+# reserved scatter (seven launches; the "large_q8i_p512fh2qr" selector) -- the
+# 8192-token row of sm_100a today.
+_LARGE_P512FH2QR_ARCHES = ("sm_100a",)
+_LARGE_P512FH2QR_TOKENS = (8192,)
 # The 512- and 1024-token routes launch the routing kernel as one thread-block
 # cluster of this many CTAs (the kernel declares the matching cluster size).
 _ROUTE_MC_CLUSTER = 8
 # Routed (token, expert-slot) pairs one CTA of the routing histogram and
 # scatter kernels handles: 256 for the production kernels, 1024 for the
-# per-CTA privatized kernels of the "large_q8i_p1024" selector.
-_ROUTE_PAIRS_PER_CTA = {"large_q8i_p1024": 1024}
+# per-CTA privatized kernels of the "large_q8i_p1024" selector, 512 for those of
+# the "large_q8i_p512fh2qr" selector.
+_ROUTE_PAIRS_PER_CTA = {"large_q8i_p1024": 1024, "large_q8i_p512fh2qr": 512}
 # FC2 device-workfeed pools. The 16-token route runs an FC2 program built for
 # two resident CTAs per SM (__launch_bounds__(512, 2)), so its pool holds
 # 2 * SM // (_H // 128) rows (280 CTAs on a 148-SM part); the 32..256-token
@@ -107,6 +119,10 @@ _FUSED = ("quant", "fused_router", "fc1", "fc2", "finalize")
 _QUANT_ROUTE = ("quant_route", "fc1", "fc2", "finalize")
 _M1_FUSED = ("fc1", "fc2", "finalize")
 _LARGE = _GENERIC[:5] + ("sfb_shuffle",) + _GENERIC[5:]
+# The seven-stage large route whose quantization and routing-table reset run in
+# one launch (blocks below num_tokens quantize, the trailing blocks reset; the
+# "large_q8i_p512fh2qr" selector).
+_QR_GENERIC = ("quant_reset",) + _GENERIC[2:]
 
 
 def _generic(tile_n, fc1=None, fc2=None, finalize=None, extra=None, stages=_GENERIC):
@@ -156,6 +172,26 @@ _SELECTORS = {
             "quant_route": "quant_route:s2b",
             "fc1": "fc1:n8_s3b",
             "fc2": "fc2:n8_w2a_s4",
+            "finalize": "finalize:feature",
+        },
+        "sm2",
+    ),
+    "n8_feature_ef_f2e": (
+        _QUANT_ROUTE,
+        {
+            "quant_route": "quant_route:s2b",
+            "fc1": "fc1:n8_persistent_ef",
+            "fc2": "fc2:n8_workfeed_f2e",
+            "finalize": "finalize:feature",
+        },
+        "sm",
+    ),
+    "n8_w2a_m16_ef_f2e": (
+        _QUANT_ROUTE,
+        {
+            "quant_route": "quant_route:s2b",
+            "fc1": "fc1:n8_persistent_ef",
+            "fc2": "fc2:n8_w2a_s4_f2e",
             "finalize": "finalize:feature",
         },
         "sm2",
@@ -221,6 +257,21 @@ _SELECTORS = {
         ),
         None,
     ),
+    "large_q8i_p512fh2qr": (
+        _QR_GENERIC,
+        _generic(
+            128,
+            fc2="fc2:n128_q8i",
+            finalize="finalize:n128_q8i",
+            extra={
+                "quant_reset": "quant_reset:n128_p512fh2qr",
+                "route_histogram": "route_histogram:n128_p512f",
+                "route_scatter": "route_scatter:n128_p512fh2",
+            },
+            stages=_QR_GENERIC,
+        ),
+        None,
+    ),
     8: (_GENERIC, _generic(8), None),
     16: (_GENERIC, _generic(16), None),
     32: (_GENERIC, _generic(32), None),
@@ -247,9 +298,9 @@ def _selector(arch, num_tokens):
     if num_tokens == 1:
         return "m1_s2a" if arch in _M1_FUSED_ARCHES else "m1"
     if num_tokens in _N8_W2A_M16_TOKENS:
-        return "n8_w2a_m16"
+        return "n8_w2a_m16_ef_f2e" if arch in _SMALL_L2POLICY_ARCHES else "n8_w2a_m16"
     if num_tokens == 8:
-        return "n8_feature"
+        return "n8_feature_ef_f2e" if arch in _SMALL_L2POLICY_ARCHES else "n8_feature"
     if num_tokens in _FORCED_TILE_N16_TOKENS:
         return "m64_claim8"
     if num_tokens in _N32_CLAIM8_TOKENS:
@@ -259,6 +310,8 @@ def _selector(arch, num_tokens):
             return "mid_q8i"
         return "mid_work5fd"
     if num_tokens in _LARGE_C7_TOKENS:
+        if arch in _LARGE_P512FH2QR_ARCHES and num_tokens in _LARGE_P512FH2QR_TOKENS:
+            return "large_q8i_p512fh2qr"
         if arch in _LARGE_P1024_ARCHES and num_tokens in _LARGE_P1024_TOKENS:
             return "large_q8i_p1024"
         return "large_q8i" if arch in _LARGE_Q8I_ARCHES else "large_c7"
@@ -453,6 +506,7 @@ class _Slot:
 # else in a stage's argument plan is fixed at prepare time.
 _CALL_ARGS = {
     "quant": {"x": "x", "qx": "qx"},
+    "quant_reset": {"x": "x", "qx": "qx"},
     "quant_route": {
         "x": "x",
         "qx": "qx",
@@ -532,6 +586,20 @@ def _stage_constants(stage, views, prepared, num_tokens):
             packed=views["x_packed"],
             scales=views["x_scales"],
             M=num_tokens,
+        )
+    if stage == "quant_reset":
+        # One launch: blocks 0..num_tokens-1 run the quantization body, the trailing
+        # ceil(reset_items / 256) blocks the routing-table reset body (no counter).
+        reset_items = max(_E, max_tiles * tile_n + 1)
+        return dict(
+            grid=(num_tokens + (reset_items + 255) // 256, 1, 1),
+            packed=views["x_packed"],
+            scales=views["x_scales"],
+            M=num_tokens,
+            num_experts=_E,
+            max_tiles=max_tiles,
+            tile_n=tile_n,
+            **route_views,
         )
     if stage == "quant_route":
         values = dict(
@@ -664,7 +732,15 @@ def _stage_constants(stage, views, prepared, num_tokens):
             values.update(C_tma=partial, C=partial, partial_scale=partial_scale)
         return values
     if stage == "finalize":
-        feature = selector in ("m1", "m1_s2a", "n8_feature", "n8_w2a_m16", "m64_claim8")
+        feature = selector in (
+            "m1",
+            "m1_s2a",
+            "n8_feature",
+            "n8_feature_ef_f2e",
+            "n8_w2a_m16",
+            "n8_w2a_m16_ef_f2e",
+            "m64_claim8",
+        )
         vec = 2 if tile_n == 8 else 8
         values = dict(
             grid=(

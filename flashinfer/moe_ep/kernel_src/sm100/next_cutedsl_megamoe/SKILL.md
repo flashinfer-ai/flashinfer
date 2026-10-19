@@ -50,3 +50,21 @@ with `preprocess_genphase_weights`, and construct a relauncher with
 `sm100_genphase_mega_launch_thunk`. Native checks select `sm_100a` or `sm_103a`
 before the DSL imports. Do not change default backend selection as part of a
 source-layout edit.
+
+## Configuration selection
+
+The explicit GenPhase backend resolves tile, cluster and grouped schedule from
+an exact workload cache or host-side heuristics. `knobs="auto"` runs collective
+tuning before capture; explicit fields constrain the candidates. Keep selection
+in the backend and `shim/{tuning,knob_cache,autotune}.py`, without inspecting
+device routing during forward. Bump the cache implementation revision when the
+kernel or tuning behavior changes. Retuning must preserve staging/output
+pointers, and auto workspaces must remain unpooled.
+Caller-supplied candidates must contain exactly all GenPhase knob keys; reject
+incomplete or unknown key sets on all ranks before starting any trial, so cache
+publication cannot fail on rank 0 while peers wait at the final barrier.
+
+Reuse `tests/moe_ep/test_mega_workspace_knobs.py` for candidate, constraint,
+cache and host API contracts, and the existing MXFP8 multirank test for native
+auto/cache/graph validation. See `docs/design_docs/moe_ep_runbook.md` for the
+offline CLI and live-token profile workflow.

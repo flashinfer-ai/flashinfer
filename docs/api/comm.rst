@@ -154,6 +154,58 @@ memory do not support this lifecycle.
 
     .. automethod:: __init__
 
+Cake NVFP4-Transport AllReduce
+------------------------------
+
+``cake_fp4_allreduce`` sums ``[rows, 6144]`` bfloat16 activations over a two-
+or four-rank NCCL process group through NVFP4 records: every rank quantises
+its rows (E2M1 values, one E4M3 scale per 16 values, one float32 row scale),
+pushes them into Lamport receive windows of its peers and decodes the gathered
+records in rank order with float32 accumulation, so the result is bitwise
+identical on every rank.  World size 2 runs a one-shot exchange, world size 4
+a two-shot exchange whose owner ranks reduce, re-encode and all-gather (one of
+three phase-B schedules is chosen per call from the rows each CTA owns).
+``cake_fp4_allreduce_nvfp4`` accepts pre-quantised ``[rows, 3456]`` records
+with one static scale per rank.
+
+A ``CakeFp4AllReduceWorkspace`` is created collectively on every rank of the
+group with the same family (``"allreduce"`` or ``"rmsnorm"``), input format
+(``"bf16"`` or ``"nvfp4"``) and row capacity; it shares the receive windows
+through CUDA IPC, arms their sentinels and publishes the peer window table.
+Calls accept any row count up to the capacity (a multiple of 4 for world size
+4), perform no allocation when the output buffers are given and no host
+synchronisation, so they can be captured into CUDA graphs; the
+``launch_with_pdl`` flag issues the kernel as a programmatic dependent launch.
+The programs are exact-architecture builds for SM100 (B200), SM103 (B300) and
+SM107;
+the build targets follow ``FLASHINFER_CUDA_ARCH_LIST`` when set, else the
+visible devices.
+
+``cake_fp4_allreduce_rmsnorm`` (family ``"rmsnorm"``, world size 2) fuses the
+exchange with the residual add and a Gemma RMSNorm: ``z = sum + residual`` in
+float32, ``residual_out = bf16(z)``, ``rinv = rsqrt(mean(z^2) + eps)`` from the
+float32 sum of squares and ``y = bf16(z) * rinv * (weight_bias + weight)``,
+with ``eps`` and ``weight_bias`` as runtime scalars of the
+``CakeFp4AllReduceFusedNormSpec``.  The spec selects the output: bfloat16
+``y``, or ``y`` quantised to NVFP4 (packed E2M1 values and 128x4-swizzled E4M3
+block scales for a caller-supplied float32 global scale -- the layout and
+arithmetic of ``fp4_quantize``) or to MXFP8 (E4M3 values and swizzled UE8M0
+scales, as ``mxfp8_quantize``).  ``cake_fp4_allreduce_rmsnorm_nvfp4`` takes
+pre-quantised records with the same epilogue.  Both return a
+``CakeFp4AllReduceFusedNormResult``.
+
+.. autosummary::
+    :toctree: ../generated
+
+    CakeFp4AllReduceWorkspace
+    CakeFp4AllReduceFusedNormOutput
+    CakeFp4AllReduceFusedNormSpec
+    CakeFp4AllReduceFusedNormResult
+    cake_fp4_allreduce
+    cake_fp4_allreduce_nvfp4
+    cake_fp4_allreduce_rmsnorm
+    cake_fp4_allreduce_rmsnorm_nvfp4
+
 FP8 Quantized AllReduce
 -----------------------
 
@@ -517,6 +569,55 @@ the current receive slot (``layout="bshd"``: ``(q, k, v)`` each
 ``[B, S_global, H_local, D]``; ``layout="fused"``: one
 ``[B, S_global, H_local, 3 * D]`` payload) and stay valid until the slot is
 reused ``num_slots`` calls later; pass ``out=`` for an owned copy.
+
+Per call the Cake backend launches, by default on every architecture, the
+producer build with the folded cross-rank rendezvous (a rendezvous warp of
+CTA 0 runs the NVLink barrier of the call's phase and releases the stores
+through a rank-local arrive flag: one extra warp per CTA on SM100 / SM103, the
+idle TMA warp on SM90) on the caller's stream and the wait kernel on the
+consumer stream: two launches.  ``fold_barrier=False`` (or the environment
+variable ``FLASHINFER_QKV_EXCHANGE_FOLD_BARRIER=0``) selects the three-launch
+path instead: the barrier kernel, the plain producer and the wait kernel; both
+paths are delivered on every architecture.  Both paths store identical bits;
+``describe()`` reports the resolved path (``fold_barrier``) and its launch
+count (``launches_per_call``).
+
+The producer build is selected per architecture and world size
+(``cake_qkv_norm_rope_exchange_overlap.PRODUCER_VARIANT_DEFAULT_BY_ARCH_WORLD``
+of the JIT loader): on SM100 a group of 8 ranks runs the build with wide
+operand loads and bulk row stores (``bulk_ow256``), a group of 4 ranks the
+build with wide operand loads (``ow256``); on SM103 groups of 8 and 4 ranks run
+``ow256``; groups of 2 ranks and SM90 run the baseline build.  Every build
+stores identical bits; the wide-load builds require 32-byte-aligned ``cos_sin``
+and norm-weight tensors (a misaligned view raises and names the opt-out).  The
+environment variable ``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT`` (``auto`` /
+``shipped`` / a delivered build name) overrides the selection per session,
+rank-uniformly; the baseline build stays delivered beside every variant, and a
+build that is not delivered for the session's tile width raises and names the
+delivered ones.  The host plan's group scaling follows the same keying
+(``cake_qkv_exchange_plan.GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD``): on SM100
+groups of 4 and 2 ranks and on SM103 every group size double the token-tile
+group of a grouped row whose hidden size is at least 6144 (the tile order
+changes, every destination element is still written once); SM100 groups of 8
+ranks and SM90 keep the baseline plan.  ``FLASHINFER_QKV_EXCHANGE_GROUP_M_SCALE``
+(``auto`` / ``1`` / ``2`` / ``4``) overrides it per session, rank-uniformly.
+
+Per-architecture row-count gates shape each call's host plan: on SM100 and
+SM103 a call with at most 4096 rows per rank publishes one readiness word per
+destination, and a call with at least 16384 rows per rank launches the producer
+once per destination run of its tile table (the first launch carrying the
+folded rendezvous); on SM90 a call with at least 16384 rows per rank runs the
+persistent producer grid over every SM (no reserved SMs) and the other two gates
+are off.  The environment variable ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES``
+(``auto`` / ``off`` /
+``words_capacity_small_m=N,reserved_sms_large_m=N,per_dest_large_m=N``)
+overrides them per session, rank-uniformly; ``describe()`` reports the resolved
+build (``producer_variant``), scale (``group_m_scale``) and gates
+(``shape_gates``) with their sources, and every prepared row's verdict
+(``prepared_row_plans``, including its ``reserved_sms``).  The gates change
+neither the tile table nor the stored bits.  The largest 2-rank shape of the
+evaluation grid (``S_global = 131072``, ``hidden = 8192``) is not supported on
+an 80 GB H100: its operands and receive slots exceed the device memory.
 
 The session is prepared eagerly (symmetric slots, readiness pad, barrier
 flags, JIT programs, the tile plan of ``max_tokens`` rows) and a prepared call

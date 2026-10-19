@@ -94,6 +94,12 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
+// UMMA shared-memory descriptor address mask: 14 bits on SM100a/SM103a, 15 bits on SM107a.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1070)
+#define CAKE_MOK_UMMA_ADDR_MASK 0x7FFF
+#else
+#define CAKE_MOK_UMMA_ADDR_MASK 0x3FFF
+#endif
 
 __device__ __forceinline__ uint32_t elect_sync() {
     uint32_t pred = 0;
@@ -979,8 +985,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                                 for (int idx_1 = 0; idx_1 < iterations; idx_1++) {
                                     mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_1) * 8, 98304);
                                     mbarrier_wait(gemm_arrived_addr + (ring_1) * 8, phase_bits_2 >> (unsigned int)ring_1 & 1);
-                                    int _mma_a_lo_0 = (((a_smem_addr) >> 4) & 0x3FFF) + (ring_1) * 1024;
-                                    int _mma_b_lo_0 = (((b_smem_addr) >> 4) & 0x3FFF) + (ring_1) * 1024;
+                                    int _mma_a_lo_0 = (((a_smem_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_1) * 1024;
+                                    int _mma_b_lo_0 = (((b_smem_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_1) * 1024;
                                     asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -1015,8 +1021,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
             "tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
             "}\n"
             :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"(tmem_accumulator), "r"(((idx_1 == 0) ? 0 : 1)));
-                                    int _mma_a_lo_1 = (((a_smem_addr) >> 4) & 0x3FFF) + (ring_1) * 1024;
-                                    int _mma_b_lo_1 = (((b_hi_addr) >> 4) & 0x3FFF) + (ring_1) * 1024;
+                                    int _mma_a_lo_1 = (((a_smem_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_1) * 1024;
+                                    int _mma_b_lo_1 = (((b_hi_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_1) * 1024;
                                     asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -5705,8 +5711,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                                 for (int idx_3 = 0; idx_3 < iterations_1; idx_3++) {
                                     mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_3) * 8, 98304);
                                     mbarrier_wait(gemm_arrived_addr + (ring_3) * 8, phase_bits_3 >> (unsigned int)ring_3 & 1);
-                                    int _mma_a_lo_2 = (((a_smem_addr) >> 4) & 0x3FFF) + (ring_3) * 1024;
-                                    int _mma_b_lo_2 = (((b_smem_addr) >> 4) & 0x3FFF) + (ring_3) * 1024;
+                                    int _mma_a_lo_2 = (((a_smem_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_3) * 1024;
+                                    int _mma_b_lo_2 = (((b_smem_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_3) * 1024;
                                     asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -5741,8 +5747,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
             "tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
             "}\n"
             :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"(tmem_accumulator), "r"(((idx_3 == 0) ? 0 : 1)));
-                                    int _mma_a_lo_3 = (((a_smem_addr) >> 4) & 0x3FFF) + (ring_3) * 1024;
-                                    int _mma_b_lo_3 = (((b_hi_addr) >> 4) & 0x3FFF) + (ring_3) * 1024;
+                                    int _mma_a_lo_3 = (((a_smem_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_3) * 1024;
+                                    int _mma_b_lo_3 = (((b_hi_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_3) * 1024;
                                     asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -6062,8 +6068,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                                     for (int idx_5 = 0; idx_5 < iterations_2; idx_5++) {
                                         mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_5) * 8, 98304);
                                         mbarrier_wait(gemm_arrived_addr + (ring_5) * 8, phase_bits_4 >> (unsigned int)ring_5 & 1);
-                                        int _mma_a_lo_4 = (((a_smem_addr) >> 4) & 0x3FFF) + (ring_5) * 1024;
-                                        int _mma_b_lo_4 = (((b_smem_addr) >> 4) & 0x3FFF) + (ring_5) * 1024;
+                                        int _mma_a_lo_4 = (((a_smem_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_5) * 1024;
+                                        int _mma_b_lo_4 = (((b_smem_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_5) * 1024;
                                         asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -6098,8 +6104,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
             "tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
             "}\n"
             :: "r"(_mma_a_lo_4), "r"(_mma_b_lo_4), "r"(tmem_accumulator), "r"(((idx_5 == 0) ? 0 : 1)));
-                                        int _mma_a_lo_5 = (((a_smem_addr) >> 4) & 0x3FFF) + (ring_5) * 1024;
-                                        int _mma_b_lo_5 = (((b_hi_addr) >> 4) & 0x3FFF) + (ring_5) * 1024;
+                                        int _mma_a_lo_5 = (((a_smem_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_5) * 1024;
+                                        int _mma_b_lo_5 = (((b_hi_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_5) * 1024;
                                         asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -10800,8 +10806,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
                                     for (int idx_7 = 0; idx_7 < iterations_3; idx_7++) {
                                         mbarrier_arrive_expect_tx(gemm_arrived_addr + (ring_7) * 8, 98304);
                                         mbarrier_wait(gemm_arrived_addr + (ring_7) * 8, phase_bits_5 >> (unsigned int)ring_7 & 1);
-                                        int _mma_a_lo_6 = (((a_smem_addr) >> 4) & 0x3FFF) + (ring_7) * 1024;
-                                        int _mma_b_lo_6 = (((b_smem_addr) >> 4) & 0x3FFF) + (ring_7) * 1024;
+                                        int _mma_a_lo_6 = (((a_smem_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_7) * 1024;
+                                        int _mma_b_lo_6 = (((b_smem_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_7) * 1024;
                                         asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
@@ -10836,8 +10842,8 @@ kernel_cake_mok_forward_clamped(const __grid_constant__ CUtensorMap x_shared, co
             "tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
             "}\n"
             :: "r"(_mma_a_lo_6), "r"(_mma_b_lo_6), "r"(tmem_accumulator), "r"(((idx_7 == 0) ? 0 : 1)));
-                                        int _mma_a_lo_7 = (((a_smem_addr) >> 4) & 0x3FFF) + (ring_7) * 1024;
-                                        int _mma_b_lo_7 = (((b_hi_addr) >> 4) & 0x3FFF) + (ring_7) * 1024;
+                                        int _mma_a_lo_7 = (((a_smem_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_7) * 1024;
+                                        int _mma_b_lo_7 = (((b_hi_addr) >> 4) & CAKE_MOK_UMMA_ADDR_MASK) + (ring_7) * 1024;
                                         asm volatile(
             "{\n\t"
             ".reg .pred p0, p1;\n\t"
