@@ -20,11 +20,6 @@ provide it:
 | Multicast | No | Optional: one multicast object bound to every rank's buffer, mapped at `get_multicast_ptr()` |
 | Extras | — | A signal pad after each rank's buffer; Lamport initialization for the one-shot all-reduce |
 
-Both classes are ports of the TensorRT-LLM classes of the same names, one from
-the MoE all-to-all and one from the all-reduce, which is why they manage
-addresses differently. They share how the physical memory is created and how
-its handles cross ranks, described next.
-
 ## Allocating and sharing the physical memory
 
 Each rank backs its buffer with `cuMemCreate` and exports a shareable handle;
