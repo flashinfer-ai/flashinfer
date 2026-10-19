@@ -81,6 +81,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 # Cake-exported packages (flashinfer-ai/flashinfer#6553): the generated csrc tree plus the
 # build manifest (build.json) their cake_build loader reads; prebuilt aot/ libraries never ship.
 "flashinfer.cake_rmsnorm_train_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_causal_conv1d_train_backend" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_dsa_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_kda_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_lm_head_loss" = ["csrc/**", "build.json"]

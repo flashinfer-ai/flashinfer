@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check the build manifests of the Cake-exported packages (flashinfer-ai/flashinfer#6553).
 
-Seven packages ship generated CUDA sources under ``csrc/`` together with a build
+Eight packages ship generated CUDA sources under ``csrc/`` together with a build
 manifest ``build.json`` (schema ``cake-build/1``) -- the only record of what to
 compile -- and a byte-identical ``cake_build.py`` loader that loads the prebuilt
 library under ``aot/`` when present and otherwise JIT-builds the manifest entry
@@ -223,14 +223,20 @@ class Package:
     refs: Callable[[Path, str], set[str]]
 
 
-# dsa_train, kda_train, dsa_indexer and the rmsnorm backend are read with the generic walker (a mapping
+# dsa_train, kda_train, dsa_indexer, the rmsnorm and the causal conv1d backends are read with the generic walker (a mapping
 # carrying ``library`` under an ``arches`` / ``arch`` scope).  Their exporters' registry shapes
-# fit it: a record carries ``arches`` and either ``library`` itself (dsa_indexer PROGRAMS, rmsnorm
-# MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
+# fit it: a record carries ``arches`` and either ``library`` itself (dsa_indexer PROGRAMS, rmsnorm and
+# causal conv1d MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
 PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.cake_rmsnorm_train_backend",
         "flashinfer/cake_rmsnorm_train_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.cake_causal_conv1d_train_backend",
+        "flashinfer/cake_causal_conv1d_train_backend",
         "cake_jit.py",
         refs_generic,
     ),
