@@ -21,7 +21,11 @@ limitations under the License.
 # ``(num_tokens, num_heads)`` by ``flashinfer.mla_kv_pack._plan_head_group`` --
 # and every program serves every token count and head count (both are runtime
 # launch arguments) on both exact targets, compiled with the exact flag set of
-# the device it runs on.  ``MODULES`` and ``ROUTES`` are written by the Cake
+# the device it runs on.  Every program compiles the one shared kernel source,
+# which takes its head group, launch bounds and kernel symbol from
+# ``-DHEAD_GROUP`` / ``-DLAUNCH_MIN_BLOCKS`` / ``-DCAKE_KERNEL_SYMBOL``, plus
+# the one shared binding, which reads the same kernel symbol.  ``MODULES``
+# and ``ROUTES`` are written by the Cake
 # export; the empty tables are the source-only placeholder and every route
 # lookup fails until they are filled.
 
@@ -52,15 +56,19 @@ _TARGET_BY_CAPABILITY: dict[tuple[int, int], ConcatMlaKvQuantFp8Target] = {
 GENERATED_DIR = "cake_concat_mla_kv_quant_fp8"
 
 # program name -> {"sources": [kernel, binding] (relative to the csrc family
-# directory), "template", "ffi_entry", "compile_flags", "arg_plan",
-# "launch_block", "cluster", "dynamic_smem_bytes", "use_pdl", "head_group",
-# "min_blocks", "closure": {target: sealed closure identity}}.
+# directory; both are shared by every program: the kernel takes the
+# program's "head_group" / "min_blocks" / "kernel_symbol" from -DHEAD_GROUP /
+# -DLAUNCH_MIN_BLOCKS / -DCAKE_KERNEL_SYMBOL and the binding reads the same
+# kernel symbol), "kernel_symbol", "template", "ffi_entry", "compile_flags",
+# "arg_plan", "launch_block", "cluster", "dynamic_smem_bytes", "use_pdl",
+# "head_group", "min_blocks", "closure": {target: sealed closure identity}}.
 MODULES: dict[str, dict[str, Any]] = {
-    "cake_concat_mla_kv_quant_fp8_75d7ea09e4023fab4fa8": {
+    "cake_concat_mla_kv_quant_fp8_1712b79cb9ea6b77a0a5": {
         "sources": [
-            "cake_concat_mla_kv_quant_fp8_75d7ea09e4023fab4fa8_kernel.cu",
-            "cake_concat_mla_kv_quant_fp8_75d7ea09e4023fab4fa8_binding.cu",
+            "cake_concat_mla_kv_quant_fp8_kernel.cu",
+            "cake_concat_mla_kv_quant_fp8_binding.cu",
         ],
+        "kernel_symbol": "kernel_cake_concat_mla_kv_quant_fp8_1712b79cb9ea6b77a0a5",
         "template": "concat_mla_kv_quant_fp8_hg4",
         "head_group": 4,
         "min_blocks": 3,
@@ -85,48 +93,16 @@ MODULES: dict[str, dict[str, Any]] = {
         "dynamic_smem_bytes": 0,
         "use_pdl": False,
         "closure": {
-            "sm100a": "4d0fc9fbd52203dda988e955e25c3f00cbf5d48d5795a6545baea1c9db7f1efe",
-            "sm103a": "b47d84102a29aac63b18ab4d7a1e6e6b3f9cc01a3233df2dd381df7abe79f4d5",
+            "sm100a": "94db401974c36f16b537c0d37876a0ecce7afd54d1e43b5dd7fe63f17b2df73c",
+            "sm103a": "816e3d914c4ee8bce94cd90c0dbf4797fbe7abba0d62d7e4095eb6cd13df8d38",
         },
     },
-    "cake_concat_mla_kv_quant_fp8_8dea7038f02767ca1cbf": {
+    "cake_concat_mla_kv_quant_fp8_8369f9eb1d5046fc3c6e": {
         "sources": [
-            "cake_concat_mla_kv_quant_fp8_8dea7038f02767ca1cbf_kernel.cu",
-            "cake_concat_mla_kv_quant_fp8_8dea7038f02767ca1cbf_binding.cu",
+            "cake_concat_mla_kv_quant_fp8_kernel.cu",
+            "cake_concat_mla_kv_quant_fp8_binding.cu",
         ],
-        "template": "concat_mla_kv_quant_fp8_hg2",
-        "head_group": 2,
-        "min_blocks": 6,
-        "ffi_entry": "run",
-        "compile_flags": [],
-        "arg_plan": [
-            ["buffer", "kv_nope"],
-            ["buffer", "k_pe"],
-            ["buffer", "key"],
-            ["buffer", "value"],
-            ["parameter", "num_tokens"],
-            ["parameter", "num_heads"],
-            ["parameter", "head_pairs"],
-            ["parameter", "warps_per_token"],
-            ["parameter", "k_pe_row_stride"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "launch_block": [256, 1, 1],
-        "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 0,
-        "use_pdl": False,
-        "closure": {
-            "sm100a": "9df116f7f74bc719948c7f303c2632d5bf6772eec411f377f5ebb902a1006376",
-            "sm103a": "018e27f2fa192ab283ce601a329778ca40935f306099201a865a68a3a298a47b",
-        },
-    },
-    "cake_concat_mla_kv_quant_fp8_982430f4a5a8e3e38334": {
-        "sources": [
-            "cake_concat_mla_kv_quant_fp8_982430f4a5a8e3e38334_kernel.cu",
-            "cake_concat_mla_kv_quant_fp8_982430f4a5a8e3e38334_binding.cu",
-        ],
+        "kernel_symbol": "kernel_cake_concat_mla_kv_quant_fp8_8369f9eb1d5046fc3c6e",
         "template": "concat_mla_kv_quant_fp8_hg3",
         "head_group": 3,
         "min_blocks": 3,
@@ -151,15 +127,50 @@ MODULES: dict[str, dict[str, Any]] = {
         "dynamic_smem_bytes": 0,
         "use_pdl": False,
         "closure": {
-            "sm100a": "862a5678fb5712efe82bfef2b9e3ae701306a21d2c8707e805ae7df7b238358e",
-            "sm103a": "afce15ae436f6c8a95f754f14f5e8cbb004f8fa5182a40584f77fba2f3c464f2",
+            "sm100a": "47689c2b681a23aaabe30e1819dd5ea93048a6ab5192959d20b29256767e2912",
+            "sm103a": "a78d0de59e0b8f303e8c647886f90bbd2881331438c509a5779e25b6160c9082",
         },
     },
-    "cake_concat_mla_kv_quant_fp8_bff13b38c6c98eb5c9a9": {
+    "cake_concat_mla_kv_quant_fp8_9cfd884b43857a2eec41": {
         "sources": [
-            "cake_concat_mla_kv_quant_fp8_bff13b38c6c98eb5c9a9_kernel.cu",
-            "cake_concat_mla_kv_quant_fp8_bff13b38c6c98eb5c9a9_binding.cu",
+            "cake_concat_mla_kv_quant_fp8_kernel.cu",
+            "cake_concat_mla_kv_quant_fp8_binding.cu",
         ],
+        "kernel_symbol": "kernel_cake_concat_mla_kv_quant_fp8_9cfd884b43857a2eec41",
+        "template": "concat_mla_kv_quant_fp8_hg2",
+        "head_group": 2,
+        "min_blocks": 6,
+        "ffi_entry": "run",
+        "compile_flags": [],
+        "arg_plan": [
+            ["buffer", "kv_nope"],
+            ["buffer", "k_pe"],
+            ["buffer", "key"],
+            ["buffer", "value"],
+            ["parameter", "num_tokens"],
+            ["parameter", "num_heads"],
+            ["parameter", "head_pairs"],
+            ["parameter", "warps_per_token"],
+            ["parameter", "k_pe_row_stride"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch_block": [256, 1, 1],
+        "cluster": [1, 1, 1],
+        "dynamic_smem_bytes": 0,
+        "use_pdl": False,
+        "closure": {
+            "sm100a": "cc026f5ccca4ddb29487002dfd039248acae40f04cfbfa5e065f6b4189d11b3b",
+            "sm103a": "00d01692655bf3fc5b2ddeee86bb945ee18c2235ce423c87104d8c273a5e84c0",
+        },
+    },
+    "cake_concat_mla_kv_quant_fp8_a04b64d621ce6106c82c": {
+        "sources": [
+            "cake_concat_mla_kv_quant_fp8_kernel.cu",
+            "cake_concat_mla_kv_quant_fp8_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_concat_mla_kv_quant_fp8_a04b64d621ce6106c82c",
         "template": "concat_mla_kv_quant_fp8_hg1",
         "head_group": 1,
         "min_blocks": 8,
@@ -184,17 +195,17 @@ MODULES: dict[str, dict[str, Any]] = {
         "dynamic_smem_bytes": 0,
         "use_pdl": False,
         "closure": {
-            "sm100a": "a07ec972d38808df8add4e8cf3f825fda151f18b61bcccd0f79c4d5e9c9daf7c",
-            "sm103a": "c3f2ba98842df276e8d7b5a5aae7d106d16421f8db1f04e9e4686921b8b5227d",
+            "sm100a": "670b2191b6ddd85a6e882a2b434967128e76450054b233aac1f4ff8e3a330c98",
+            "sm103a": "4ba16239e6d9c78797ef51d1d9617aa7a14fc3c7bf56a9e54696acac10fae177",
         },
     },
 }
 # "hg<head_group>" -> {"module": program name}.
 ROUTES: dict[str, dict[str, Any]] = {
-    "hg1": {"module": "cake_concat_mla_kv_quant_fp8_bff13b38c6c98eb5c9a9"},
-    "hg2": {"module": "cake_concat_mla_kv_quant_fp8_8dea7038f02767ca1cbf"},
-    "hg3": {"module": "cake_concat_mla_kv_quant_fp8_982430f4a5a8e3e38334"},
-    "hg4": {"module": "cake_concat_mla_kv_quant_fp8_75d7ea09e4023fab4fa8"},
+    "hg1": {"module": "cake_concat_mla_kv_quant_fp8_a04b64d621ce6106c82c"},
+    "hg2": {"module": "cake_concat_mla_kv_quant_fp8_9cfd884b43857a2eec41"},
+    "hg3": {"module": "cake_concat_mla_kv_quant_fp8_8369f9eb1d5046fc3c6e"},
+    "hg4": {"module": "cake_concat_mla_kv_quant_fp8_1712b79cb9ea6b77a0a5"},
 }
 
 
@@ -258,6 +269,7 @@ def _route(head_group: int) -> dict[str, Any]:
         ) from exc
 
 
+@functools.cache
 def concat_mla_kv_quant_fp8_route_record(
     device: torch.device, head_group: int
 ) -> dict[str, Any]:
@@ -265,7 +277,8 @@ def concat_mla_kv_quant_fp8_route_record(
 
     ``module`` is the generated program record plus its ``name``; the public
     operation binds the launch arguments from its ``arg_plan`` and passes the
-    host-planned grid.
+    host-planned grid.  Memoised per ``(device, head_group)``: the exact-target
+    capability query and the record copy run once per entry, not per call.
     """
     target = concat_mla_kv_quant_fp8_target(device)
     route = _route(head_group)
@@ -291,7 +304,13 @@ def gen_concat_mla_kv_quant_fp8_module(
     spec = gen_jit_spec(
         name=f"cake_concat_mla_kv_quant_fp8_{target}_hg{int(head_group)}_{record['closure'][target][:20]}",
         sources=[csrc / source for source in record["sources"]],
-        extra_cuda_cflags=[*_TARGET_FLAGS[target], *record["compile_flags"]],
+        extra_cuda_cflags=[
+            *_TARGET_FLAGS[target],
+            *record["compile_flags"],
+            f"-DCAKE_KERNEL_SYMBOL={record['kernel_symbol']}",
+            f"-DHEAD_GROUP={record['head_group']}",
+            f"-DLAUNCH_MIN_BLOCKS={record['min_blocks']}",
+        ],
         extra_include_paths=[csrc, csrc.parent, _get_include_dir()],
         needs_device_linking=True,
     )
@@ -309,12 +328,6 @@ def load_concat_mla_kv_quant_fp8_build(
     target: ConcatMlaKvQuantFp8Target, head_group: int
 ):
     return gen_concat_mla_kv_quant_fp8_module(target, head_group).build_and_load()
-
-
-def load_concat_mla_kv_quant_fp8_module(device: torch.device, head_group: int):
-    return load_concat_mla_kv_quant_fp8_build(
-        concat_mla_kv_quant_fp8_target(device), head_group
-    )
 
 
 def gen_concat_mla_kv_quant_fp8_aot_modules(
@@ -342,6 +355,5 @@ __all__ = [
     "gen_concat_mla_kv_quant_fp8_module",
     "head_groups",
     "load_concat_mla_kv_quant_fp8_build",
-    "load_concat_mla_kv_quant_fp8_module",
     "route_key",
 ]

@@ -60,7 +60,7 @@ Host contract (flashinfer#4671 hardening)
 * **Workspace.** One caller-owned ``workspace_buffer`` is carved
   deterministically (:func:`cake_dsv4_workspace_layout`)::
 
-      [0,      1024)          reserved (formerly the TMA descriptor slab; see below)
+      [0,      1024)          reserved (formerly the TMA descriptor slab)
       [1024,   1024 + 256 KiB) split-merge counters, uint32[65536]
       [P,      P + O_bytes)    partial_O  bf16 [T * H * S * 512]  (P = 1024 + 256 KiB;
                                O_bytes = 0 when the route runs one split)
@@ -99,34 +99,6 @@ Host contract (flashinfer#4671 hardening)
   (replays stay self-contained, nothing is registered). The kernels do not
   depend on any other host state. :func:`cake_dsv4_workspace_reset` zeroes
   and registers explicitly.
-* **Descriptor storage.** The SM103 bindings that read their TMA descriptors
-  from device memory (``tma_workspace_bytes`` in their registration; the SM100
-  twins pass descriptors by value and use none of this) take a private,
-  host-retained 1 KiB tensor per launch and write the descriptors of the call
-  into it when they differ from what it holds, in stream order and never
-  inside CUDA Graph capture. The host keeps a pool of such tensors per
-  (variant, device) (:func:`_descriptor_storage`) keyed by the *descriptor
-  set* = the TMA source geometry (pointer, shape, strides, dtype of ``Q`` and
-  the KV caches). Rules:
-
-  1. A set launched eagerly becomes a *live* entry; at most
-     :data:`_DESCRIPTOR_POOL_CAPACITY` live entries exist per pool, and a new
-     set beyond that takes the least recently used live entry's storage (the
-     binding rewrites it before the launch). A live hit does no device write.
-  2. A set launched under graph capture must be live at that moment (prepare
-     it with one eager call on the same tensors); it then becomes a *captured*
-     entry, which is never evicted or reassigned for the process lifetime
-     because its graph may replay at any time. Eviction applies to live
-     entries only.
-  3. A set that is not live when a capture reaches it raises before any
-     allocation or binding call.
-  4. One lock covers the pool bookkeeping, the bindings' descriptor checks
-     and the launch enqueues of a call; a launch on another stream than the
-     storage's last reader waits for that stream first.
-
-  Successive calls through one workspace (the layers of a model) therefore do
-  not collide, and a stream of fresh query tensors does not grow memory
-  without bound. Nothing else allocates device memory.
 
 NVFP4 cache route (``kv_cache_format="nvfp4"``)
 ---------------------------------------------------------
@@ -152,14 +124,15 @@ and the tile64 member (``t64``, 64 heads per CTA); a one-tile row with
 ``H <= 64`` whose grid gives 2 or 4 CTAs per work item runs the H64 tile member
 (``tile_h64``: 64-row Q boxes, same grid and output as ``tile``). The one-tile
 members run ``o_chunks`` CTAs per work item; the split merge runs on
-``merge_heads_per_cta`` heads per CTA. Each (member, retrace knobs) pair is one
-registered variant (``_nvfp4_variant_name``: ``nvfp4_decode_persistent``,
-``nvfp4_decode_cluster``, ``nvfp4_decode_t64_n64_oc1``,
-``nvfp4_decode_pv_n{16,32}_oc1``, ``nvfp4_decode_swap_n{16,32}_oc{1,2,4}``,
-``nvfp4_decode_tile_oc{1,2,4}``, ``nvfp4_decode_tile_h64_oc{2,4}``) plus
-``nvfp4_merge``, bound through the same
+``merge_heads_per_cta`` heads per CTA. Each member is one registered variant
+(``_nvfp4_variant_name``: ``nvfp4_decode_persistent``, ``nvfp4_decode_cluster``,
+``nvfp4_decode_t64_n64_oc1``, ``nvfp4_decode_pv``, ``nvfp4_decode_swap``,
+``nvfp4_decode_tile``, ``nvfp4_decode_tile_h64``) plus ``nvfp4_merge``; the
+templated members take their retrace knobs (``tile_n``: heads on the MMA N side,
+``o_chunks``: CTAs per work item) as launch arguments and their launcher switches
+over the explicit instantiations of the kernel unit. All are bound through the same
 registration machinery as the BF16/FP8 routes from the generated sources under
-``csrc/cake_dsv4/sm_100a`` and ``csrc/cake_dsv4/sm_103a``; a plan that selects
+``csrc/cake_dsv4/{sm_100a,sm_103a,common}``; a plan that selects
 an unexported variant raises ``NotImplementedError``. Splits write
 ``partial_O [T, H, S, 512]`` BF16 and ``partial_lse [T, H, S]`` FP32 into the
 workspace; the final base-2 LSE lives in an extra ``lse`` region appended
@@ -168,12 +141,11 @@ after ``partial_lse`` (:func:`cake_dsv4_workspace_layout` ``with_lse=True``).
 
 from __future__ import annotations
 
-import collections
 import functools
 import threading
 import weakref
 from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping, Optional, Sequence, Union
+from typing import Any, Literal, Mapping, Optional, Union
 
 import torch
 
@@ -382,18 +354,6 @@ class SparseMetadata:
     @property
     def compressed_width(self) -> int:
         return self.sparse_topk - _SWA_WIDTH
-
-    @property
-    def legacy_combined_table(self) -> Optional[torch.Tensor]:
-        """Combined ``[T, sparse_topk]`` table for bindings that predate the split ABI.
-
-        Only a combined table without an explicit length offset can be handed
-        to a binding that still declares the pre-hardening ``sparse_indices``
-        argument; separate tables and offsets need regenerated bindings.
-        """
-        if self.separate_tables or self.sparse_topk_lens_offset != 0:
-            return None
-        return self.swa_indices
 
 
 def _flat_index_span(table: torch.Tensor) -> torch.Tensor:
@@ -774,113 +734,6 @@ def _counters(raw: torch.Tensor, merge_groups: int) -> torch.Tensor:
     return raw[_COUNTER_OFFSET : _COUNTER_OFFSET + merge_groups * 4].view(torch.uint32)
 
 
-# Descriptor storage pools (see the module docstring, "Descriptor storage").
-# Bound on the storages a pool hands to eager launches; descriptor sets that
-# were launched under CUDA Graph capture are retained separately for the
-# process lifetime because their graphs keep reading them.
-_DESCRIPTOR_POOL_CAPACITY = 4096
-_descriptor_lock = threading.Lock()
-_descriptor_pools: dict[tuple[str, str, torch.device], "_DescriptorPool"] = {}
-
-
-@dataclass
-class _DescriptorStorage:
-    tensor: torch.Tensor
-    # Stream of the last launch that read this storage; a launch on another
-    # stream waits for it before the binding may rewrite the descriptors.
-    stream: Optional[torch.cuda.Stream]
-
-
-@dataclass
-class _DescriptorPool:
-    """Descriptor storages of one variant module on one device."""
-
-    # descriptor set -> storage, least recently used first; reassignable
-    live: "collections.OrderedDict[tuple, _DescriptorStorage]"
-    # descriptor sets launched under graph capture: never reassigned
-    captured: dict[tuple, _DescriptorStorage]
-    # storages released by a capacity change, reused before allocating
-    spare: list[_DescriptorStorage]
-
-
-def _new_descriptor_storage(device: torch.device) -> _DescriptorStorage:
-    backing = torch.empty(
-        _DESCRIPTOR_SLAB_BYTES + _ALIGN, dtype=torch.uint8, device=device
-    )
-    offset = (-backing.data_ptr()) % _ALIGN
-    return _DescriptorStorage(backing[offset : offset + _DESCRIPTOR_SLAB_BYTES], None)
-
-
-def _descriptor_storage(
-    variant: str,
-    arch: str,
-    num_bytes: int,
-    sources: Sequence[tuple[str, torch.Tensor]],
-    *,
-    capturing: bool,
-) -> torch.Tensor:
-    """Private descriptor storage for ``variant`` over these TMA source tensors.
-
-    A descriptor set is a pure function of each source tensor's pointer, shape,
-    strides and dtype, so that geometry is the key. The pool of one variant on
-    one device hands out at most :data:`_DESCRIPTOR_POOL_CAPACITY` storages to
-    eager launches: a hit reuses the storage whose bytes the binding already
-    holds, a miss takes a fresh storage until the pool is full and the least
-    recently used one afterwards (the binding rewrites its descriptors in
-    stream order before the launch). A set launched under CUDA Graph capture
-    moves to the pool's retained part and is never reassigned, so replays keep
-    reading the descriptors they captured; a set that is not resident when a
-    capture reaches it is an error, because the binding cannot initialize
-    descriptors inside a capture. The caller holds :data:`_descriptor_lock`
-    from this lookup through the launch, so a storage is never reassigned
-    between the binding's descriptor check and the launch that reads it.
-    """
-    if num_bytes > _DESCRIPTOR_SLAB_BYTES:
-        raise ValueError(
-            f"CAKE DSv4 variant needs {num_bytes} TMA descriptor bytes; the "
-            f"descriptor storage holds {_DESCRIPTOR_SLAB_BYTES}"
-        )
-    device = sources[0][1].device if sources else torch.device("cpu")
-    key = tuple(
-        (name, t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype)
-        for name, t in sources
-    )
-    stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
-    pool = _descriptor_pools.get((variant, arch, device))
-    if pool is None:
-        pool = _DescriptorPool(collections.OrderedDict(), {}, [])
-        _descriptor_pools[variant, arch, device] = pool
-    storage = pool.captured.get(key)
-    if storage is not None:
-        return storage.tensor
-    storage = pool.live.get(key)
-    if capturing:
-        if storage is None:
-            raise RuntimeError(
-                f"CAKE DSv4 {variant}: the TMA descriptors for these query / "
-                "KV-cache tensors have not been initialised and the current "
-                "stream is capturing a CUDA graph; run one eager call with the "
-                "same tensors (pointers, shapes and strides) before capture"
-            )
-        del pool.live[key]
-        pool.captured[key] = storage
-        return storage.tensor
-    if storage is not None:
-        pool.live.move_to_end(key)
-    else:
-        capacity = max(1, int(_DESCRIPTOR_POOL_CAPACITY))
-        while len(pool.live) >= capacity:
-            pool.spare.append(pool.live.popitem(last=False)[1])
-        storage = pool.spare.pop() if pool.spare else _new_descriptor_storage(device)
-        pool.live[key] = storage
-    if stream is not None and storage.stream is not None and storage.stream != stream:
-        # Order this launch (and a descriptor rewrite the binding may issue
-        # on this stream) after the last launch that read the storage.
-        stream.wait_stream(storage.stream)
-    storage.stream = stream
-    return storage.tensor
-
-
 def _workspace_owner(workspace: torch.Tensor) -> torch.Tensor:
     """The tensor whose lifetime owns ``workspace``'s storage (its ``_base`` or itself)."""
     base = workspace._base
@@ -992,8 +845,6 @@ _TENSOR_VALUE_NAMES = frozenset(
         "swa_indices",
         "compressed_indices",
         "sparse_topk_lens",
-        # Pre-hardening combined table; bound only for combined metadata.
-        "sparse_indices",
         # NVFP4 cache route (two independent tables over two uint8 pools).
         "q_rows",
         "main_cache",
@@ -1043,17 +894,13 @@ _SCALAR_VALUE_NAMES = frozenset(
         "main_page_stride",
         "extra_page_stride",
         "heads_per_cta",
+        # Retrace knobs of the templated NVFP4 members (runtime instantiation switch).
+        "tile_n",
+        "o_chunks",
         *_FLOAT_SCALAR_VALUE_NAMES,
     }
 )
 _GRID_NAMES = ("grid_x", "grid_y", "grid_z")
-_DESCRIPTOR_WORKSPACE_NAME = "tma_descriptor_workspace"
-_RETIRED_ARG_REASONS: Mapping[str, str] = {
-    "completion_base": (
-        "host-side split-merge generation state was removed; the kernel resets "
-        "partition_arrivals itself"
-    ),
-}
 # Producers whose generated ABI reads request boundaries from cum_seq_lens_q
 # only; run_cake_dsv4 synthesizes the dense offsets for them.
 _RAGGED_ONLY_ROUTES = frozenset(
@@ -1103,15 +950,6 @@ def _fp8_h64_m64_program(sparse_topk: int) -> str:
     return "fp8_h64_prefill_source_persistent_m64_multi_tile"
 
 
-_UNAVAILABLE_HINTS: Mapping[str, str] = {
-    "sparse_indices": (
-        "this binding predates the split-table metadata ABI and only accepts a "
-        "combined sparse_indices table with sparse_topk_lens_offset == 0; "
-        "regenerate the bindings for separate tables or length offsets"
-    ),
-}
-
-
 def canonical_arg_name(kind: str, name: str) -> str:
     """Map a registration ``arg_plan`` entry onto the host value vocabulary."""
     if kind == "tma_buffer":
@@ -1128,8 +966,6 @@ def is_bindable_arg(kind: str, name: str) -> bool:
         return canonical in _TENSOR_VALUE_NAMES
     if kind == "parameter":
         return canonical in _SCALAR_VALUE_NAMES
-    if kind == "workspace":
-        return name == _DESCRIPTOR_WORKSPACE_NAME
     if kind == "grid":
         return name in _GRID_NAMES
     return False
@@ -1142,7 +978,6 @@ def _bind_argument(
     *,
     variant: str,
     grid: Mapping[str, int],
-    descriptor_slab: Optional[torch.Tensor],
 ) -> Any:
     if kind == "grid":
         if name not in grid:
@@ -1150,22 +985,11 @@ def _bind_argument(
                 f"CAKE DSv4 {variant} has an unknown grid argument: {name}"
             )
         return grid[name]
-    if kind == "workspace":
-        if name != _DESCRIPTOR_WORKSPACE_NAME or descriptor_slab is None:
-            raise ValueError(
-                f"CAKE DSv4 {variant} has an unresolved workspace argument: {name}"
-            )
-        return descriptor_slab
     if kind not in ("buffer", "tma_buffer", "parameter"):
         raise ValueError(
             f"CAKE DSv4 {variant} has an unknown argument kind {kind!r} for {name}"
         )
     canonical = canonical_arg_name(kind, name)
-    if canonical in _RETIRED_ARG_REASONS:
-        raise ValueError(
-            f"CAKE DSv4 {variant} binds the retired argument {name!r}: "
-            f"{_RETIRED_ARG_REASONS[canonical]}; regenerate the bindings"
-        )
     if canonical not in values:
         raise ValueError(
             f"CAKE DSv4 {variant} argument {name!r} ({kind}) has no host value; "
@@ -1173,8 +997,9 @@ def _bind_argument(
         )
     value = values[canonical]
     if value is None:
-        hint = _UNAVAILABLE_HINTS.get(canonical, "it is not available for this call")
-        raise ValueError(f"CAKE DSv4 {variant} argument {name!r}: {hint}")
+        raise ValueError(
+            f"CAKE DSv4 {variant} argument {name!r}: it is not available for this call"
+        )
     if kind == "parameter":
         if canonical in _FLOAT_SCALAR_VALUE_NAMES:
             if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -1232,37 +1057,16 @@ def _prepare_variant(
     """Bind the generated ABI by name through the registration ``arg_plan``.
 
     Two-stage routes prepare the producer and the reducer before launching
-    either, so no Python-side binding sits between the two kernels. The caller
-    holds :data:`_descriptor_lock` from the first preparation through the last
-    launch of the call.
+    either, so no Python-side binding sits between the two kernels.
     """
     from ..jit.cake_dsv4 import get_cake_dsv4_spec
 
     contract = get_cake_dsv4_spec(variant, arch=arch)
-    plan = contract["arg_plan"]
     grid_values = _grid_values(grid)
-
-    def bind(kind, name, storage=None):
-        return _bind_argument(
-            values,
-            kind,
-            name,
-            variant=variant,
-            grid=grid_values,
-            descriptor_slab=storage,
-        )
-
-    tma_bytes = int(contract.get("tma_workspace_bytes", 0) or 0)
-    storage = None
-    if tma_bytes:
-        sources = [
-            (name, bind(kind, name)) for kind, name in plan if kind == "tma_buffer"
-        ]
-        device = sources[0][1].device if sources else torch.device("cpu")
-        storage = _descriptor_storage(
-            variant, arch, tma_bytes, sources, capturing=_is_capturing(device)
-        )
-    bound = [bind(kind, name, storage) for kind, name in plan]
+    bound = [
+        _bind_argument(values, kind, name, variant=variant, grid=grid_values)
+        for kind, name in contract["arg_plan"]
+    ]
     return _PreparedLaunch(_variant_module(variant, arch=arch), bound)
 
 
@@ -1274,8 +1078,7 @@ def _launch_variant(
     values: Mapping[str, Any],
 ):
     """Prepare and launch one variant (single-launch convenience)."""
-    with _descriptor_lock:
-        return _prepare_variant(variant, arch=arch, grid=grid, values=values)()
+    return _prepare_variant(variant, arch=arch, grid=grid, values=values)()
 
 
 # --------------------------------------------------------------------------- #
@@ -1318,6 +1121,14 @@ def _route(
         ):
             return "fp8_h64_source_exact"
         if max_q_len >= 257:
+            if num_heads in (16, 32, 64):
+                # The single-CTA M64 persistent body (num_heads runtime, heads
+                # past num_heads predicated) beats the low-head prefill
+                # producer on every 16/32/64-head prefill row of the DSv4
+                # contract on GB300: 2.1-5.2x on the 512-8192-token rows
+                # (widths 128-1024, single and dual caches), with the same
+                # oracle.  Two programs, selected by the item width.
+                return _fp8_h64_m64_program(sparse_topk)
             return "fp8_lowhead_prefill"
         if (
             num_heads in (8, 16)
@@ -2087,7 +1898,6 @@ def run_cake_dsv4(
         "bmm1_scale": scale1,
         "bmm2_scale": scale2,
         **meta.kernel_kwargs(),
-        "sparse_indices": meta.legacy_combined_table,
         "num_heads": num_heads,
         "num_head_tiles": _ceil_div(num_heads, 64),
         "has_sinks": has_sinks,
@@ -2118,33 +1928,25 @@ def run_cake_dsv4(
             f"({num_heads} heads, {plan.num_splits} splits); size it with "
             "get_cake_dsv4_workspace_bytes() or cake_dsv4_workspace_requirement()"
         )
-    # One host-side critical section per call: descriptor-pool bookkeeping,
-    # the bindings' descriptor checks and the launch enqueues (see
-    # _descriptor_storage).
-    with _descriptor_lock:
-        if rows_per_launch >= num_query_tokens:
-            _dispatch_route(
-                route,
-                _Launcher(
-                    arch=arch, workspace=workspace_buffer, raw=raw, values=values
-                ),
-            )
-        else:
-            if request_offsets is None:
-                request_offsets = _dense_query_offsets(
-                    batch_size, max_q_len, device=device
-                )
-            _dispatch_row_tiles(
-                route,
-                arch=arch,
-                workspace=workspace_buffer,
-                raw=raw,
-                values=values,
-                meta=meta,
-                plan=plan,
-                rows_per_launch=rows_per_launch,
-                request_offsets=request_offsets,
-            )
+    if rows_per_launch >= num_query_tokens:
+        _dispatch_route(
+            route,
+            _Launcher(arch=arch, workspace=workspace_buffer, raw=raw, values=values),
+        )
+    else:
+        if request_offsets is None:
+            request_offsets = _dense_query_offsets(batch_size, max_q_len, device=device)
+        _dispatch_row_tiles(
+            route,
+            arch=arch,
+            workspace=workspace_buffer,
+            raw=raw,
+            values=values,
+            meta=meta,
+            plan=plan,
+            rows_per_launch=rows_per_launch,
+            request_offsets=request_offsets,
+        )
     return out
 
 
@@ -2174,7 +1976,6 @@ def _dispatch_row_tiles(
     total = values["num_query_tokens"]
     num_heads = values["num_heads"]
     num_offsets = int(request_offsets.numel())
-    legacy = values["sparse_indices"]
     for first in range(0, total, rows_per_launch):
         rows = min(rows_per_launch, total - first)
         stop = first + rows
@@ -2185,7 +1986,6 @@ def _dispatch_row_tiles(
             swa_indices=_flat_index_span(meta.swa_indices[first:stop]),
             compressed_indices=_flat_index_span(meta.compressed_indices[first:stop]),
             sparse_topk_lens=meta.sparse_topk_lens[first:stop],
-            sparse_indices=None if legacy is None else legacy[first:stop],
             num_query_tokens=rows,
             total_work_items=rows,
         )
@@ -2445,62 +2245,35 @@ class NVFP4Plan:
 
     @property
     def variant(self) -> str:
-        return _nvfp4_variant_name(
-            self.member, tile_n=self.tile_n, o_chunks=self.o_chunks
-        )
+        return _nvfp4_variant_name(self.member)
 
 
-# Retrace knobs each member's generated program is specialised on, in variant-name order (Cake
-# flashinfer_blackwell_sparse_mla_dsv4_nvfp4_program.MEMBER_VARIANT_KNOBS).
-_NVFP4_VARIANT_KNOBS: Mapping[str, tuple[str, ...]] = {
-    "persistent": (),
-    "cluster": (),
-    "t64": ("tile_n", "o_chunks"),
-    "pv": ("tile_n", "o_chunks"),
-    "swap": ("tile_n", "o_chunks"),
-    "tile": ("o_chunks",),
-    "tile_h64": ("o_chunks",),
+# Registered program of each family member (Cake flashinfer_blackwell_sparse_mla_dsv4_nvfp4_program).  The
+# templated members (pv, swap, tile, tile_h64) take their retrace knobs -- ``tile_n`` (heads on the MMA N side)
+# and ``o_chunks`` (CTAs per work item) -- as launch arguments of one program each; its launcher switches over
+# the explicit instantiations of the kernel unit (swap: n{16,32} x oc{1,2,4}, tile: oc{1,2,4}, tile_h64:
+# oc{2,4}, pv: n{16,32}).  The standalone tile64 program keeps its exported knob suffix.
+_NVFP4_MEMBER_VARIANTS: Mapping[str, str] = {
+    "persistent": _NVFP4_VARIANT_PERSISTENT,
+    "cluster": _NVFP4_VARIANT_CLUSTER,
+    "t64": "nvfp4_decode_t64_n64_oc1",
+    "pv": "nvfp4_decode_pv",
+    "swap": "nvfp4_decode_swap",
+    "tile": "nvfp4_decode_tile",
+    "tile_h64": "nvfp4_decode_tile_h64",
 }
-_NVFP4_KNOB_TAGS = {"tile_n": "n", "o_chunks": "oc"}
 
 
-def _nvfp4_variant_name(
-    member: str, *, tile_n: Optional[int] = None, o_chunks: int = 1
-) -> str:
-    """Registered variant name of a member's physical program:
-    ``nvfp4_decode_<member>[_n<tile_n>][_oc<o_chunks>]`` (the merge is ``nvfp4_merge``)."""
-    if member not in _NVFP4_VARIANT_KNOBS:
+def _nvfp4_variant_name(member: str) -> str:
+    """Registered variant name of a member's program (the merge is ``nvfp4_merge``)."""
+    if member not in _NVFP4_MEMBER_VARIANTS:
         raise ValueError(f"unknown NVFP4 family member {member!r}")
-    values = {"tile_n": tile_n, "o_chunks": o_chunks}
-    tags = []
-    for knob in _NVFP4_VARIANT_KNOBS[member]:
-        if values[knob] is None:
-            raise ValueError(f"{member}: variant knob {knob} is required")
-        tags.append(f"_{_NVFP4_KNOB_TAGS[knob]}{int(values[knob])}")
-    return "nvfp4_decode_" + member + "".join(tags)
+    return _NVFP4_MEMBER_VARIANTS[member]
 
 
 # Every decode variant a plan can select (the host names them statically so the export can check that each
-# generated program is bindable): persistent, cluster, t64 n64, pv n16 / n32, swap n{16,32} x oc{1,2,4},
-# tile oc{1,2,4}, tile_h64 oc{2,4} (the H64 tile member has no 1-CTA form).
-_NVFP4_DECODE_VARIANTS = (
-    _NVFP4_VARIANT_PERSISTENT,
-    _NVFP4_VARIANT_CLUSTER,
-    "nvfp4_decode_t64_n64_oc1",
-    "nvfp4_decode_pv_n16_oc1",
-    "nvfp4_decode_pv_n32_oc1",
-    "nvfp4_decode_swap_n16_oc1",
-    "nvfp4_decode_swap_n16_oc2",
-    "nvfp4_decode_swap_n16_oc4",
-    "nvfp4_decode_swap_n32_oc1",
-    "nvfp4_decode_swap_n32_oc2",
-    "nvfp4_decode_swap_n32_oc4",
-    "nvfp4_decode_tile_oc1",
-    "nvfp4_decode_tile_oc2",
-    "nvfp4_decode_tile_oc4",
-    "nvfp4_decode_tile_h64_oc2",
-    "nvfp4_decode_tile_h64_oc4",
-)
+# generated program is bindable).
+_NVFP4_DECODE_VARIANTS = tuple(_NVFP4_MEMBER_VARIANTS.values())
 _NVFP4_VARIANTS = (*_NVFP4_DECODE_VARIANTS, _NVFP4_VARIANT_MERGE)
 
 
@@ -2707,7 +2480,7 @@ def _nvfp4_plan(
         merge_heads_per_cta=_nvfp4_merge_heads_per_cta(tokens, heads, sms),
     )
     # the persistent member's own split rule: enough CTAs to cover the SMs
-    p_splits, p_tiles = _nvfp4_split_shape(
+    _, p_tiles = _nvfp4_split_shape(
         total_tiles, max(1, min(total_tiles, _ceil_div(sms, tokens * num_head_tiles)))
     )
     if heads > _NVFP4_PV_MAX_HEADS:
@@ -2770,12 +2543,12 @@ def _nvfp4_plan(
             o_chunks=_nvfp4_swap_o_chunks(tokens * total_tiles * num_head_tiles, sms),
             **common,
         )
-    return NVFP4Plan(
-        num_head_tiles=num_head_tiles,
-        num_splits=p_splits,
-        tiles_per_split=p_tiles,
-        member="persistent",
-        **common,
+    # Unreachable: a one-tile pv split (pv_tiles == 1) implies p_tiles == 1
+    # (sweep over sm_count 1..264 x total_tiles 1..12 x T 1..4096: 0 hits).
+    raise RuntimeError(
+        f"CAKE DSv4 NVFP4 plan has no member for H={heads}, T={tokens}, "
+        f"{total_tiles} tiles on {sms} SMs (pv tiles {pv_tiles}, persistent "
+        f"tiles {p_tiles})"
     )
 
 
@@ -3139,6 +2912,8 @@ def run_cake_dsv4_nvfp4(
         "extra_page_stride": int(extra_page_stride),
         "has_sinks": int(sinks is not None),
         "heads_per_cta": plan.merge_heads_per_cta,
+        "tile_n": plan.tile_n,
+        "o_chunks": plan.o_chunks,
         "lse_partial_scale": float(lse_partial_scale),
         "lse_scale": lse_scale,
     }
@@ -3152,10 +2927,7 @@ def run_cake_dsv4_nvfp4(
     if num_splits > 1:
         # Split merge: one CTA per (token, heads_per_cta heads) over partial_O / partial_lse.
         launches.append(launcher.variant(_NVFP4_VARIANT_MERGE, grid=plan.merge_grid))
-    # One host-side critical section per call, as for the BF16 / FP8 routes
-    # (descriptor-pool bookkeeping, descriptor checks, launch enqueues).
-    with _descriptor_lock:
-        launcher.run(*launches)
+    launcher.run(*launches)
     return out
 
 

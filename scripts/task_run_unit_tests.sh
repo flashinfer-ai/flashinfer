@@ -145,6 +145,12 @@ main() {
             2>/dev/null || echo 0)
         if [[ "${TEST_PATH:-}" == *moe_ep* ]] && [ "${cuda_major}" -ge 13 ]; then
             FI_SRC="$(pwd)" bash docker/install/build_flashinfer_ep_pytorch.sh
+            # The installer's exports do not reach this shell. Non-root jobs
+            # need the wheel's NCCL library ahead of the image's system copy.
+            local nccl_wheel_lib
+            nccl_wheel_lib=$(python -c \
+                'import nvidia.nccl, os; print(os.path.join(list(nvidia.nccl.__path__)[0], "lib"))')
+            export LD_LIBRARY_PATH="${nccl_wheel_lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
         fi
 
         echo "=========================================="

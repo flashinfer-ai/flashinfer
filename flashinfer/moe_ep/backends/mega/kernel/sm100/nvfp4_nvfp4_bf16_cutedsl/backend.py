@@ -417,7 +417,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             # so the candidate sweep stays in lockstep (see shim/autotune.py).
             from ......kernel_src.sm100.cutedsl_megamoe import autotune_nvfp4_mega_moe
 
-            autotune_nvfp4_mega_moe(
+            self._autotune_winner = autotune_nvfp4_mega_moe(
                 output,
                 transformed_weights[0],
                 transformed_weights[1],

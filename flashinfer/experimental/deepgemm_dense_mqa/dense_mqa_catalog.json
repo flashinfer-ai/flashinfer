@@ -5,210 +5,130 @@
   ],
   "paged_routes": {
     "paged:fp8:h32:p64:n1": {
-      "block_q": null,
-      "clean_logits": "raw",
-      "kv_alignment": null,
-      "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_612058e94772738350cc",
-            "sm_103a": "cake_deepgemm_dense_mqa_612058e94772738350cc"
-          }
+          "cake_deepgemm_dense_mqa_612058e94772738350cc"
         ]
       ]
     },
     "paged:fp8:h32:p64:n1:dyn": {
-      "block_q": null,
-      "clean_logits": "raw",
-      "kv_alignment": null,
-      "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_0a4b8e7bba5a8abe5097",
-            "sm_103a": "cake_deepgemm_dense_mqa_0a4b8e7bba5a8abe5097"
-          }
+          "cake_deepgemm_dense_mqa_0a4b8e7bba5a8abe5097"
         ]
       ]
     },
     "paged:fp8:h32:p64:n2": {
-      "block_q": null,
-      "clean_logits": "raw",
-      "kv_alignment": null,
-      "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_51c2cf11a140a553a710",
-            "sm_103a": "cake_deepgemm_dense_mqa_51c2cf11a140a553a710"
-          }
+          "cake_deepgemm_dense_mqa_51c2cf11a140a553a710"
         ]
       ]
     },
     "paged:fp8:h32:p64:n2:dyn": {
-      "block_q": null,
-      "clean_logits": "raw",
-      "kv_alignment": null,
-      "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_c1f40b60181a38a9b7fe",
-            "sm_103a": "cake_deepgemm_dense_mqa_c1f40b60181a38a9b7fe"
-          }
+          "cake_deepgemm_dense_mqa_c1f40b60181a38a9b7fe"
         ]
       ]
     },
     "paged:fp8:h64:p32:n1": {
-      "block_q": null,
-      "clean_logits": "raw",
-      "kv_alignment": null,
-      "num_heads": 64,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_80397d206cee0f8252fc",
-            "sm_103a": "cake_deepgemm_dense_mqa_80397d206cee0f8252fc"
-          }
+          "cake_deepgemm_dense_mqa_80397d206cee0f8252fc"
         ]
       ]
     },
     "paged:fp8:h64:p32:n1:dyn": {
-      "block_q": null,
-      "clean_logits": "raw",
-      "kv_alignment": null,
-      "num_heads": 64,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_0d5696ee5c439684ea28",
-            "sm_103a": "cake_deepgemm_dense_mqa_0d5696ee5c439684ea28"
-          }
+          "cake_deepgemm_dense_mqa_0d5696ee5c439684ea28"
         ]
       ]
     },
     "paged:fp8:h64:p32:n2": {
-      "block_q": null,
-      "clean_logits": "raw",
-      "kv_alignment": null,
-      "num_heads": 64,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_420b335e9786eb5a28c2",
-            "sm_103a": "cake_deepgemm_dense_mqa_420b335e9786eb5a28c2"
-          }
+          "cake_deepgemm_dense_mqa_420b335e9786eb5a28c2"
         ]
       ]
     },
     "paged:fp8:h64:p32:n2:dyn": {
-      "block_q": null,
-      "clean_logits": "raw",
-      "kv_alignment": null,
-      "num_heads": 64,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_a26c4ef6c57b381b5a9b",
-            "sm_103a": "cake_deepgemm_dense_mqa_a26c4ef6c57b381b5a9b"
-          }
+          "cake_deepgemm_dense_mqa_a26c4ef6c57b381b5a9b"
         ]
       ]
     },
     "paged:fp8:h64:p64:n1": {
-      "block_q": null,
-      "clean_logits": "raw",
-      "kv_alignment": null,
-      "num_heads": 64,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_d651b932a515e61e0351",
-            "sm_103a": "cake_deepgemm_dense_mqa_d651b932a515e61e0351"
-          }
+          "cake_deepgemm_dense_mqa_d651b932a515e61e0351"
         ]
       ]
     },
     "paged:fp8:h64:p64:n1:dyn": {
-      "block_q": null,
-      "clean_logits": "raw",
-      "kv_alignment": null,
-      "num_heads": 64,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_3a8b2f8c715da3853f6c",
-            "sm_103a": "cake_deepgemm_dense_mqa_3a8b2f8c715da3853f6c"
-          }
+          "cake_deepgemm_dense_mqa_3a8b2f8c715da3853f6c"
         ]
       ]
     },
     "paged:fp8:h64:p64:n2": {
-      "block_q": null,
-      "clean_logits": "raw",
-      "kv_alignment": null,
-      "num_heads": 64,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_25af43b93d8c7a529af0",
-            "sm_103a": "cake_deepgemm_dense_mqa_25af43b93d8c7a529af0"
-          }
+          "cake_deepgemm_dense_mqa_25af43b93d8c7a529af0"
         ]
       ]
     },
     "paged:fp8:h64:p64:n2:dyn": {
-      "block_q": null,
-      "clean_logits": "raw",
-      "kv_alignment": null,
-      "num_heads": 64,
+      "sequence": null,
+      "stages": [
+        [
+          "logits",
+          "cake_deepgemm_dense_mqa_bb7cdb92494fbb9d6d9d"
+        ]
+      ]
+    },
+    "paged:fp8:h64:p64:n2:hyb8c4": {
       "sequence": null,
       "stages": [
         [
           "logits",
           {
-            "sm_100a": "cake_deepgemm_dense_mqa_bb7cdb92494fbb9d6d9d",
-            "sm_103a": "cake_deepgemm_dense_mqa_bb7cdb92494fbb9d6d9d"
+            "sm_100a": "cake_deepgemm_dense_mqa_3efedb7902fcab353ba1"
           }
         ]
       ]
     },
     "paged:fp8:h64:p64:n4": {
-      "block_q": null,
-      "clean_logits": "raw",
-      "kv_alignment": null,
-      "num_heads": 64,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_b2253be6241d71881582",
-            "sm_103a": "cake_deepgemm_dense_mqa_b2253be6241d71881582"
-          }
+          "cake_deepgemm_dense_mqa_a3577011967507014e99"
         ]
       ]
     }
@@ -272,6 +192,11 @@
     },
     "fused_q128_max_kv": 131072,
     "fused_q1_max_kv": 1048576,
+    "fused_qle128_max_kv": 4352,
+    "fused_qle2048_max_kv": {
+      "sm_100a": 34048,
+      "sm_103a": 65536
+    },
     "fused_scan32_max_kv": 1048576,
     "fused_scan768_max_kv": 8192,
     "fused_scan_ceilings": [
@@ -283,34 +208,21 @@
       64
     ],
     "kv_alignment": {
-      "32": 256,
-      "64": 1
+      "fp4": {
+        "32": 256,
+        "64": 256
+      },
+      "fp8": {
+        "32": 256,
+        "64": 1
+      }
     },
     "max_q_blocks": 29046,
-    "max_q_tokens": 116184,
     "metadata_tier_blocks": [
       4,
       32,
       512,
       null
-    ],
-    "metadata_tiers": [
-      [
-        "le16",
-        16
-      ],
-      [
-        "le128",
-        128
-      ],
-      [
-        "le2048",
-        2048
-      ],
-      [
-        "any",
-        116184
-      ]
     ],
     "paged": {
       "admission": {
@@ -335,8 +247,18 @@
               32768
             ]
           ],
-          "paged:fp8:h32:p64:n2": [],
-          "paged:fp8:h32:p64:n2:dyn": [],
+          "paged:fp8:h32:p64:n2": [
+            [
+              16,
+              5376
+            ]
+          ],
+          "paged:fp8:h32:p64:n2:dyn": [
+            [
+              148,
+              32768
+            ]
+          ],
           "paged:fp8:h64:p32:n1": [
             [
               16,
@@ -357,8 +279,18 @@
               32768
             ]
           ],
-          "paged:fp8:h64:p32:n2": [],
-          "paged:fp8:h64:p32:n2:dyn": [],
+          "paged:fp8:h64:p32:n2": [
+            [
+              16,
+              5376
+            ]
+          ],
+          "paged:fp8:h64:p32:n2:dyn": [
+            [
+              148,
+              32768
+            ]
+          ],
           "paged:fp8:h64:p64:n1": [
             [
               16,
@@ -398,7 +330,7 @@
             ],
             [
               512,
-              42752
+              170496
             ],
             [
               null,
@@ -409,6 +341,24 @@
             [
               null,
               null
+            ]
+          ],
+          "paged:fp8:h64:p64:n2:hyb8c4": [
+            [
+              16,
+              null
+            ],
+            [
+              64,
+              32768
+            ],
+            [
+              512,
+              170496
+            ],
+            [
+              null,
+              8192
             ]
           ]
         },
@@ -437,7 +387,12 @@
               32768
             ]
           ],
-          "paged:fp8:h32:p64:n2": [],
+          "paged:fp8:h32:p64:n2": [
+            [
+              16,
+              5376
+            ]
+          ],
           "paged:fp8:h32:p64:n2:dyn": [
             [
               152,
@@ -468,8 +423,18 @@
               32768
             ]
           ],
-          "paged:fp8:h64:p32:n2": [],
-          "paged:fp8:h64:p32:n2:dyn": [],
+          "paged:fp8:h64:p32:n2": [
+            [
+              16,
+              5376
+            ]
+          ],
+          "paged:fp8:h64:p32:n2:dyn": [
+            [
+              152,
+              32768
+            ]
+          ],
           "paged:fp8:h64:p64:n1": [
             [
               64,
@@ -523,8 +488,8 @@
         }
       },
       "admission_reason": {
-        "sm_100a": "h64:p64 n1 admitted through the measured b512 (static) and b256 (dyn) long-context rows and n2 through b512 at 42624 context after two nine-session tables on two GPUs; b512 n2 above 42624 context withheld (both tables above 1.00 but under the row floors); h64:p32:n2 and h32:p64:n2 (static and dyn) withheld (b16 ctx4k rows floor-bound or failing the second table)",
-        "sm_103a": "h64:p64 n1/n2 admitted through the measured b512 (static) and b256 (dyn) long-context rows after two nine-session tables on two GPUs; h32:p64:n1 and h64:p32:n1 measured at batch <= 16 only, large-batch rules mirrored from h64:p64:n1; h32:p64:n2 dyn admitted through 32768 context at batch <= 152; h64:p32:n2 (static and dyn) and the static h32:p64:n2 route withheld (b16 ctx4k row floor-bound on both GPUs; static rows unmeasured)"
+        "sm_100a": "h64:p64 n1 admitted through the measured b512 (static) and b256 (dyn) long-context rows and n2 through b512 at 170304 context after two nine-session tables on two GPUs (the b512 n2 128k rows joined in round 3 after two static-program tables on two GPUs each); h64:p32:n2 and h32:p64:n2 admitted on the static program inside the batch <= 16 / context <= 5376 window (their static-preferred window) and on the dynamic route through 32768 context at batch <= 148 after two nine-session tables; the b256 n2 rows at 43008..169728 context are served by the static program's hyb8c4 text (route paged:fp8:h64:p64:n2:hyb8c4, the static route's rules) after it cleared two nine-session tables on two GPUs",
+        "sm_103a": "h64:p64 n1/n2 admitted through the measured b512 (static) and b256 (dyn) long-context rows after two nine-session tables on two GPUs; h32:p64:n1 and h64:p32:n1 measured at batch <= 16 only, large-batch rules mirrored from h64:p64:n1; h64:p32:n2 and h32:p64:n2 admitted on the static program inside the batch <= 16 / context <= 5376 window (their static-preferred window) and on the dynamic route through 32768 context at batch <= 152 after two nine-session tables"
       },
       "block_kv": [
         32,
@@ -540,9 +505,49 @@
           "paged:fp8:h64:p64:n1": "paged:fp8:h64:p64:n1:dyn",
           "paged:fp8:h64:p64:n2": "paged:fp8:h64:p64:n2:dyn"
         },
+        "sched_state": {
+          "paged:fp8:h64:p64:n2:hyb8c4": {
+            "base_words": 2,
+            "max_sms": 256,
+            "words_per_sm": 1
+          }
+        },
         "state": "sched_counters",
+        "static_window_routes": {
+          "sm_100a": {
+            "paged:fp8:h64:p64:n2": [
+              [
+                [
+                  256,
+                  256,
+                  43008,
+                  169728
+                ],
+                "paged:fp8:h64:p64:n2:hyb8c4"
+              ]
+            ]
+          }
+        },
         "static_windows": {
           "sm_100a": {
+            "paged:fp8:h32:p64:n2": [
+              [
+                16,
+                5376
+              ]
+            ],
+            "paged:fp8:h64:p32:n1": [
+              [
+                16,
+                5376
+              ]
+            ],
+            "paged:fp8:h64:p32:n2": [
+              [
+                16,
+                5376
+              ]
+            ],
             "paged:fp8:h64:p64:n1": [
               [
                 1,
@@ -577,10 +582,39 @@
               [
                 64,
                 3840
+              ],
+              [
+                148,
+                148,
+                5376
+              ],
+              [
+                256,
+                256,
+                43008,
+                169728
               ]
             ]
           },
           "sm_103a": {
+            "paged:fp8:h32:p64:n2": [
+              [
+                16,
+                5376
+              ]
+            ],
+            "paged:fp8:h64:p32:n1": [
+              [
+                16,
+                5376
+              ]
+            ],
+            "paged:fp8:h64:p32:n2": [
+              [
+                16,
+                5376
+              ]
+            ],
             "paged:fp8:h64:p64:n1": [
               [
                 1,
@@ -615,6 +649,11 @@
               [
                 64,
                 3840
+              ],
+              [
+                152,
+                152,
+                5376
               ]
             ]
           }
@@ -633,6 +672,28 @@
         "4": 1
       },
       "split_kv": 256
+    },
+    "single_launch_precedence": {
+      "sm_100a": {
+        "le128": [
+          "qle",
+          "le_class"
+        ],
+        "le2048": [
+          "qle",
+          "le_class"
+        ]
+      },
+      "sm_103a": {
+        "le128": [
+          "qle",
+          "le_class"
+        ],
+        "le2048": [
+          "qle",
+          "le_class"
+        ]
+      }
     }
   },
   "programs": {
@@ -730,14 +791,8 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "585f65cd2e8b45fbddaf71fb2413e4535c18e0ec120ce7e0f2eb6bf7b65203d1"
-      },
       "compile_flags": [
         "--ptxas-options=--register-usage-level=10"
-      ],
-      "definitions": [
-        "SM_COUNT"
       ],
       "ffi_entry": "run",
       "kind": "module",
@@ -815,17 +870,13 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "46214faa0e584ac5cb036ea4e3724382c087b17e207a818d7db8ad8405d8aa3e",
-        "sm_103a": "a672028a2c8a2fcd5c2b786e74ef799a78929b45c612ffd917d307838aadc062"
-      },
       "compile_flags": [
         "--use_fast_math"
       ],
-      "definitions": [
-        "SM_COUNT"
-      ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_NEXT_N": 1
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
@@ -905,14 +956,7 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "8020c17e4a18747c715c383aae4203fb38d485acc882b852c79af075d6262825",
-        "sm_103a": "b58faca8e012ce96c3342e69d595892ca8908102618133a61fc9511b804589b0"
-      },
       "compile_flags": [],
-      "definitions": [
-        "SM_COUNT"
-      ],
       "ffi_entry": "run",
       "kind": "module",
       "role": "kernel",
@@ -989,17 +1033,14 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "5fd316851ae83b71f2f7de67c4bfac845741945422331c701649bee279c2db89",
-        "sm_103a": "385bb2cc609468e4bbd2d46e1a5a3f911aa9321bebcb9218866e438ae574bfdb"
-      },
       "compile_flags": [
         "--use_fast_math"
       ],
-      "definitions": [
-        "SM_COUNT"
-      ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_BLOCK_KV": 32,
+        "K_NEXT_N": 1
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
@@ -1102,14 +1143,8 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_103a": "5fb5c19f72cd1e948243bf1c27efc37492fd13b787ff7bddaa91342d6e6dcd0b"
-      },
       "compile_flags": [
         "--ptxas-options=--register-usage-level=10"
-      ],
-      "definitions": [
-        "SM_COUNT"
       ],
       "ffi_entry": "run",
       "kind": "module",
@@ -1159,14 +1194,7 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "4cf6ab1b016ed693aad48836652649d08453b53c19630cc2a03f08f12b0b55fb",
-        "sm_103a": "15bf12b23ca5ed46f41552c44bcde8b5b7b06410ed5644913025bb859a582712"
-      },
       "compile_flags": [],
-      "definitions": [
-        "SM_COUNT"
-      ],
       "ffi_entry": "run",
       "kind": "module",
       "role": "kernel",
@@ -1243,22 +1271,19 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "df99d1cdebc2d0a7e9b761e8234dde7bde059377ec19ae0c3db261c115b8fc4e",
-        "sm_103a": "0f175066c4423cd98b125e072d179489f015ee8ffdd90da6d08d96e46bde8b90"
-      },
       "compile_flags": [
         "--use_fast_math"
       ],
-      "definitions": [
-        "SM_COUNT"
-      ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_BLOCK_KV": 64,
+        "K_NEXT_N": 2
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_25af43b93d8c7a529af0_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_25af43b93d8c7a529af0_binding.cu"
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_80397d206cee0f8252fc_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_80397d206cee0f8252fc_binding.cu"
       ],
       "standalone": true
     },
@@ -1356,14 +1381,8 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "c667ad8f134a37483c315187cdb42a03d85de7e23f800f3851d6d4ecc926111f"
-      },
       "compile_flags": [
         "--ptxas-options=--register-usage-level=10"
-      ],
-      "definitions": [
-        "SM_COUNT"
       ],
       "ffi_entry": "run",
       "kind": "module",
@@ -1413,14 +1432,7 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "d8a44780a1915d7468a0283705d1337159af55810e33d425399a361a828e1575",
-        "sm_103a": "909fea9d79ab5a01e8c90f3eb18fa9aab3605fcb4ef73d513973f3878a807978"
-      },
       "compile_flags": [],
-      "definitions": [
-        "SM_COUNT"
-      ],
       "ffi_entry": "run",
       "kind": "module",
       "role": "kernel",
@@ -1525,15 +1537,8 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "c4443373de6e23adb8c20e4339dbf2f37dd6c6c993e85c29bfb0b66f11a26ea9",
-        "sm_103a": "07683e367f1462a5326ac7f8e4f24673fd9f007e1339893d4494eadb035b8cc2"
-      },
       "compile_flags": [
         "--ptxas-options=--register-usage-level=10"
-      ],
-      "definitions": [
-        "SM_COUNT"
       ],
       "ffi_entry": "run",
       "kind": "module",
@@ -1611,22 +1616,19 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "51b9aad82e36b9606c8ea5adec1cbec6967cd1f4ada0fbf7c5d2446179ce0e50",
-        "sm_103a": "7d2f7b4175220d4b3dc46aad82e59100b27cbeb3e92deee60b71b0df48221b39"
-      },
       "compile_flags": [
         "--use_fast_math"
       ],
-      "definitions": [
-        "SM_COUNT"
-      ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_BLOCK_KV": 64,
+        "K_NEXT_N": 1
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_3a8b2f8c715da3853f6c_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_3a8b2f8c715da3853f6c_binding.cu"
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0d5696ee5c439684ea28_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0d5696ee5c439684ea28_binding.cu"
       ],
       "standalone": true
     },
@@ -1725,15 +1727,8 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "e42f1b91c07201d8abebe0c9c32e291ec6e0563a0f810d59c48d01a48cfa19a6",
-        "sm_103a": "09135fdd9176f57f5b6fedeed10a37c7e27218ea962b188c0413b681be3e867e"
-      },
       "compile_flags": [
         "--ptxas-options=--register-usage-level=10"
-      ],
-      "definitions": [
-        "SM_COUNT"
       ],
       "ffi_entry": "run",
       "kind": "module",
@@ -1741,6 +1736,84 @@
       "sources": [
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_3e56843a8c9823ef8193_kernel.cu",
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_3e56843a8c9823ef8193_binding.cu"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_dense_mqa_3efedb7902fcab353ba1": {
+      "arches": [
+        "sm_100a"
+      ],
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "KV"
+        ],
+        [
+          "tma_buffer",
+          "KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "Logits"
+        ],
+        [
+          "buffer",
+          "context_lens"
+        ],
+        [
+          "buffer",
+          "block_table"
+        ],
+        [
+          "parameter",
+          "block_table_stride"
+        ],
+        [
+          "parameter",
+          "batch_size"
+        ],
+        [
+          "parameter",
+          "num_sms"
+        ],
+        [
+          "parameter",
+          "stride_logits"
+        ],
+        [
+          "buffer",
+          "sched_counters"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kind": "module",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_3efedb7902fcab353ba1_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_3efedb7902fcab353ba1_binding.cu"
       ],
       "standalone": true
     },
@@ -1811,22 +1884,126 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "3a856b8444dba2376103f9e5aeacd2ef9c4f9c6e06cb296f5e41047064182f21",
-        "sm_103a": "9d635560f57aaa98cc6cb349b8fb395b6bb9b73c642381389d3552e6b53ee850"
-      },
       "compile_flags": [
         "--use_fast_math"
       ],
-      "definitions": [
-        "SM_COUNT"
+      "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_BLOCK_KV": 32,
+        "K_NEXT_N": 2
+      },
+      "kind": "module",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_80397d206cee0f8252fc_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_80397d206cee0f8252fc_binding.cu"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_dense_mqa_4be5b4aaa1f52069837c": {
+      "arches": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "Q_scales_alias"
+        ],
+        [
+          "tma_buffer",
+          "KV"
+        ],
+        [
+          "tma_buffer",
+          "KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "Logits"
+        ],
+        [
+          "buffer",
+          "ScheduleMeta"
+        ],
+        [
+          "buffer",
+          "CandidateValues"
+        ],
+        [
+          "buffer",
+          "CandidateIndices"
+        ],
+        [
+          "buffer",
+          "CandidateCounts"
+        ],
+        [
+          "buffer",
+          "ScoreThresholds"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_start"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_end"
+        ],
+        [
+          "parameter",
+          "seq_len"
+        ],
+        [
+          "parameter",
+          "seq_len_kv"
+        ],
+        [
+          "parameter",
+          "stride_logits"
+        ],
+        [
+          "parameter",
+          "num_q_blocks"
+        ],
+        [
+          "parameter",
+          "num_kv_splits"
+        ],
+        [
+          "parameter",
+          "candidate_capacity"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--ptxas-options=--register-usage-level=10"
       ],
       "ffi_entry": "run",
       "kind": "module",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_420b335e9786eb5a28c2_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_420b335e9786eb5a28c2_binding.cu"
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_4be5b4aaa1f52069837c_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_4be5b4aaa1f52069837c_binding.cu"
       ],
       "standalone": true
     },
@@ -1897,22 +2074,18 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "196c1f4b8615f81f1fbf28a5321e4e1fe9507acd6ea845dc798b0fcc97b8c2b5",
-        "sm_103a": "677f8038fc610f188f7372f7d1558d19fb7a8a023e69226dcb5f63ab2c7ec707"
-      },
       "compile_flags": [
         "--use_fast_math"
       ],
-      "definitions": [
-        "SM_COUNT"
-      ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_NEXT_N": 2
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_51c2cf11a140a553a710_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_51c2cf11a140a553a710_binding.cu"
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_612058e94772738350cc_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_612058e94772738350cc_binding.cu"
       ],
       "standalone": true
     },
@@ -2010,14 +2183,8 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_103a": "9fa79907b82ef61d5f32f9a502aa0c6ebfcce4a9c3833ffe6f1651b0d7e7dab4"
-      },
       "compile_flags": [
         "--ptxas-options=--register-usage-level=10"
-      ],
-      "definitions": [
-        "SM_COUNT"
       ],
       "ffi_entry": "run",
       "kind": "module",
@@ -2095,17 +2262,13 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "b42510c69b60ef87af04f0efbd341836a73b282741a19d7d7e94008bce0133d3",
-        "sm_103a": "e8af006e6955f75177016a1e662decf0c8fad72e1382ed7a1c041edd4f001688"
-      },
       "compile_flags": [
         "--use_fast_math"
       ],
-      "definitions": [
-        "SM_COUNT"
-      ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_NEXT_N": 1
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
@@ -2114,7 +2277,7 @@
       ],
       "standalone": true
     },
-    "cake_deepgemm_dense_mqa_6146eed402e5946aabe4": {
+    "cake_deepgemm_dense_mqa_63c7e49139b05539648a": {
       "arches": [
         "sm_100a",
         "sm_103a"
@@ -2185,18 +2348,122 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {},
       "compile_flags": [],
-      "definitions": [
-        "SM_COUNT"
+      "ffi_entry": "run",
+      "kind": "module",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_63c7e49139b05539648a_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_63c7e49139b05539648a_binding.cu"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_dense_mqa_751b62ec1e448a4b7794": {
+      "arches": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "Q_scales_alias"
+        ],
+        [
+          "tma_buffer",
+          "KV"
+        ],
+        [
+          "tma_buffer",
+          "KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "Logits"
+        ],
+        [
+          "buffer",
+          "ScheduleMeta"
+        ],
+        [
+          "buffer",
+          "CandidateValues"
+        ],
+        [
+          "buffer",
+          "CandidateIndices"
+        ],
+        [
+          "buffer",
+          "CandidateCounts"
+        ],
+        [
+          "buffer",
+          "ScoreThresholds"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_start"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_end"
+        ],
+        [
+          "parameter",
+          "seq_len"
+        ],
+        [
+          "parameter",
+          "seq_len_kv"
+        ],
+        [
+          "parameter",
+          "stride_logits"
+        ],
+        [
+          "parameter",
+          "num_q_blocks"
+        ],
+        [
+          "parameter",
+          "num_kv_splits"
+        ],
+        [
+          "parameter",
+          "candidate_capacity"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--ptxas-options=--register-usage-level=10"
       ],
       "ffi_entry": "run",
       "kind": "module",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_6146eed402e5946aabe4_kernel.cu"
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_751b62ec1e448a4b7794_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_751b62ec1e448a4b7794_binding.cu"
       ],
-      "standalone": false
+      "standalone": true
     },
     "cake_deepgemm_dense_mqa_7972d1c7b9410a9cb713": {
       "arches": [
@@ -2237,14 +2504,7 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "c08e231a8d917c9134955505290abb23bd9da739c21d5c54970dd34e456c49a9",
-        "sm_103a": "b6a6191bcb2417857b259442b2abb0b91757fac725eb53463ca6aeee06fd2ff2"
-      },
       "compile_flags": [],
-      "definitions": [
-        "SM_COUNT"
-      ],
       "ffi_entry": "run",
       "kind": "module",
       "role": "kernel",
@@ -2321,110 +2581,19 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "1e5c825b8e94973fd72b03aecd2604055d49afbf9815059b1f335e10a757696e",
-        "sm_103a": "4271f882b85e8db3c8228060c782898d2cc005dae7f28c60a749fbb82776fb99"
-      },
       "compile_flags": [
         "--use_fast_math"
       ],
-      "definitions": [
-        "SM_COUNT"
-      ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_BLOCK_KV": 32,
+        "K_NEXT_N": 1
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_80397d206cee0f8252fc_kernel.cu",
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_80397d206cee0f8252fc_binding.cu"
-      ],
-      "standalone": true
-    },
-    "cake_deepgemm_dense_mqa_91cbeec64695cc5dd3f0": {
-      "arches": [
-        "sm_100a",
-        "sm_103a"
-      ],
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "Q"
-        ],
-        [
-          "tma_buffer",
-          "KV"
-        ],
-        [
-          "tma_buffer",
-          "Weights"
-        ],
-        [
-          "tma_buffer",
-          "SF_Q"
-        ],
-        [
-          "tma_buffer",
-          "SF_KV"
-        ],
-        [
-          "buffer",
-          "Logits"
-        ],
-        [
-          "buffer",
-          "cu_seq_len_k_start"
-        ],
-        [
-          "buffer",
-          "cu_seq_len_k_end"
-        ],
-        [
-          "parameter",
-          "seq_len"
-        ],
-        [
-          "parameter",
-          "seq_len_kv"
-        ],
-        [
-          "parameter",
-          "stride_logits"
-        ],
-        [
-          "parameter",
-          "num_q_blocks"
-        ],
-        [
-          "buffer",
-          "ScheduleMeta"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": {
-        "sm_100a": "3255f147a2d7ebdc024d9871a7f23ef86a3757589c836e83922c54e8b5b5dd48",
-        "sm_103a": "e01cda31804a484df3f414ecea482ee0f387a12cfe7c5dce79d6b9ea4459a10c"
-      },
-      "compile_flags": [],
-      "definitions": [
-        "SM_COUNT"
-      ],
-      "ffi_entry": "run",
-      "kind": "module",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_91cbeec64695cc5dd3f0_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_91cbeec64695cc5dd3f0_binding.cu"
       ],
       "standalone": true
     },
@@ -2523,15 +2692,8 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "23459e61eba9bc32b02632ff9bdb71afcd1a72cb1ea029c7a9e44c4b9e599685",
-        "sm_103a": "51d413eb766076ea1d809611e124b7407954a7b90aa3c81bc1f6e9751d7f87ec"
-      },
       "compile_flags": [
         "--ptxas-options=--register-usage-level=10"
-      ],
-      "definitions": [
-        "SM_COUNT"
       ],
       "ffi_entry": "run",
       "kind": "module",
@@ -2637,15 +2799,8 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "124b5d85a80fb3553c5c8b6145e260e4f04df1b812dee2506fb53160cac16709",
-        "sm_103a": "42b5e59be30f09a426a3185e8c9e40648c4d0522005d1596fe95844845801324"
-      },
       "compile_flags": [
         "--ptxas-options=--register-usage-level=10"
-      ],
-      "definitions": [
-        "SM_COUNT"
       ],
       "ffi_entry": "run",
       "kind": "module",
@@ -2723,22 +2878,98 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "0b195f2cc3bbff9e9f87ce6cb3515f20cbc1cf6f35d6bedf750d09aeda434c3f",
-        "sm_103a": "928d176e1d8cadff3e601c067842cd4440a12fd0d9296a4d78583fd5e98fac42"
-      },
       "compile_flags": [
         "--use_fast_math"
       ],
-      "definitions": [
-        "SM_COUNT"
+      "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_BLOCK_KV": 32,
+        "K_NEXT_N": 2
+      },
+      "kind": "module",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0d5696ee5c439684ea28_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0d5696ee5c439684ea28_binding.cu"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_dense_mqa_a3577011967507014e99": {
+      "arches": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "KV"
+        ],
+        [
+          "tma_buffer",
+          "KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "Logits"
+        ],
+        [
+          "buffer",
+          "context_lens"
+        ],
+        [
+          "buffer",
+          "block_table"
+        ],
+        [
+          "parameter",
+          "block_table_stride"
+        ],
+        [
+          "parameter",
+          "batch_size"
+        ],
+        [
+          "parameter",
+          "num_sms"
+        ],
+        [
+          "parameter",
+          "stride_logits"
+        ],
+        [
+          "buffer",
+          "sched_counters"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kind": "module",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_a26c4ef6c57b381b5a9b_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_a26c4ef6c57b381b5a9b_binding.cu"
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_a3577011967507014e99_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_a3577011967507014e99_binding.cu"
       ],
       "standalone": true
     },
@@ -2837,15 +3068,8 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "c2b037431dddd0e6a3f07f6c505f9bdc60a8625c23855529c72ac5a974f183d9",
-        "sm_103a": "e0967af80a6fc3e11e44b108fcf79b64f901aaf8b8347f07af4ed45a963c18a3"
-      },
       "compile_flags": [
         "--ptxas-options=--register-usage-level=10"
-      ],
-      "definitions": [
-        "SM_COUNT"
       ],
       "ffi_entry": "run",
       "kind": "module",
@@ -2853,92 +3077,6 @@
       "sources": [
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_b0661fcddef8eb9062da_kernel.cu",
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_b0661fcddef8eb9062da_binding.cu"
-      ],
-      "standalone": true
-    },
-    "cake_deepgemm_dense_mqa_b2253be6241d71881582": {
-      "arches": [
-        "sm_100a",
-        "sm_103a"
-      ],
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "Q"
-        ],
-        [
-          "tma_buffer",
-          "KV"
-        ],
-        [
-          "tma_buffer",
-          "KV_scales"
-        ],
-        [
-          "tma_buffer",
-          "Weights"
-        ],
-        [
-          "buffer",
-          "Logits"
-        ],
-        [
-          "buffer",
-          "context_lens"
-        ],
-        [
-          "buffer",
-          "block_table"
-        ],
-        [
-          "parameter",
-          "block_table_stride"
-        ],
-        [
-          "parameter",
-          "batch_size"
-        ],
-        [
-          "parameter",
-          "num_sms"
-        ],
-        [
-          "parameter",
-          "stride_logits"
-        ],
-        [
-          "buffer",
-          "sched_counters"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": {
-        "sm_100a": "28775cdecd0783e21e042a938ee6e41e42f2b1c02fc2ce4404ab468a8d04356d",
-        "sm_103a": "928acec447574e00e833938aa11fb6a10ad212c56a61c5788eb4ee25f15250c9"
-      },
-      "compile_flags": [
-        "--use_fast_math"
-      ],
-      "definitions": [
-        "SM_COUNT"
-      ],
-      "ffi_entry": "run",
-      "kind": "module",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_b2253be6241d71881582_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_b2253be6241d71881582_binding.cu"
       ],
       "standalone": true
     },
@@ -3009,22 +3147,19 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "050d64aff78e5ca786ac43152594aee50de18d28149cad76e03a375bfc2aa0ab",
-        "sm_103a": "61fb75898965207f61c2ca189807f8169825d5235eff2c365be705c3dc78f3df"
-      },
       "compile_flags": [
         "--use_fast_math"
       ],
-      "definitions": [
-        "SM_COUNT"
-      ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_BLOCK_KV": 64,
+        "K_NEXT_N": 2
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_bb7cdb92494fbb9d6d9d_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_bb7cdb92494fbb9d6d9d_binding.cu"
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0d5696ee5c439684ea28_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0d5696ee5c439684ea28_binding.cu"
       ],
       "standalone": true
     },
@@ -3095,22 +3230,99 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "371bfdbd5db608ac1fd173abb38dd37ba1ba28ea3b31247a5c7f4a1f80a87581",
-        "sm_103a": "cd877b7013005269d4c5cdadd73c6c518ad97f7c6710052a44b5eb7aeadf3d97"
-      },
       "compile_flags": [
         "--use_fast_math"
       ],
-      "definitions": [
-        "SM_COUNT"
+      "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_NEXT_N": 2
+      },
+      "kind": "module",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0a4b8e7bba5a8abe5097_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0a4b8e7bba5a8abe5097_binding.cu"
       ],
+      "standalone": true
+    },
+    "cake_deepgemm_dense_mqa_ce277dbbcb88744d25c8": {
+      "arches": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "KV"
+        ],
+        [
+          "tma_buffer",
+          "Weights"
+        ],
+        [
+          "tma_buffer",
+          "SF_Q"
+        ],
+        [
+          "tma_buffer",
+          "SF_KV"
+        ],
+        [
+          "buffer",
+          "Logits"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_start"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_end"
+        ],
+        [
+          "parameter",
+          "seq_len"
+        ],
+        [
+          "parameter",
+          "seq_len_kv"
+        ],
+        [
+          "parameter",
+          "stride_logits"
+        ],
+        [
+          "parameter",
+          "num_q_blocks"
+        ],
+        [
+          "buffer",
+          "ScheduleMeta"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [],
       "ffi_entry": "run",
       "kind": "module",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_c1f40b60181a38a9b7fe_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_c1f40b60181a38a9b7fe_binding.cu"
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_ce277dbbcb88744d25c8_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_ce277dbbcb88744d25c8_binding.cu"
       ],
       "standalone": true
     },
@@ -3181,22 +3393,19 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "b0b89863545cdda425a0b1fe52c5cc894c08323a9331087d15f38b6a65a0f833",
-        "sm_103a": "2cc820726d75284313cc79e5b03a3db99be4084a3e86aecfbef51db03b260d23"
-      },
       "compile_flags": [
         "--use_fast_math"
       ],
-      "definitions": [
-        "SM_COUNT"
-      ],
       "ffi_entry": "run",
+      "fixed_definitions": {
+        "K_BLOCK_KV": 64,
+        "K_NEXT_N": 1
+      },
       "kind": "module",
       "role": "kernel",
       "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_d651b932a515e61e0351_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_d651b932a515e61e0351_binding.cu"
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_80397d206cee0f8252fc_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_80397d206cee0f8252fc_binding.cu"
       ],
       "standalone": true
     },
@@ -3295,15 +3504,8 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "c5ad9f72c75963730f15abc001b02d1b63daddfc73a4dce5c966508cb5ccce25",
-        "sm_103a": "1dec19b8506a479ced3182a72059512ef9b00ff96e4907b0d52d043ee334ba14"
-      },
       "compile_flags": [
         "--ptxas-options=--register-usage-level=10"
-      ],
-      "definitions": [
-        "SM_COUNT"
       ],
       "ffi_entry": "run",
       "kind": "module",
@@ -3353,14 +3555,7 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "c2d8dbeb2a6e5be41e7ec7278d412866f8f27e165d8c497c7c245faf5850a13b",
-        "sm_103a": "406fccbbd0b71eb6e299d2d88b62a17390b7d73f2f642b8c0595d8f5383c067c"
-      },
       "compile_flags": [],
-      "definitions": [
-        "SM_COUNT"
-      ],
       "ffi_entry": "run",
       "kind": "module",
       "role": "kernel",
@@ -3409,108 +3604,13 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "59dd0bf2406f32a48f1411b6e343b7ded37967597870bbd1a4eba04ca5240810",
-        "sm_103a": "ae5e8ca1c1712f4977d09dfcc1a75ac72e198add2365372d550a0f8e8be61cf6"
-      },
       "compile_flags": [],
-      "definitions": [
-        "SM_COUNT"
-      ],
       "ffi_entry": "run",
       "kind": "module",
       "role": "kernel",
       "sources": [
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_e0868d26b805c9fd31d2_kernel.cu",
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_e0868d26b805c9fd31d2_binding.cu"
-      ],
-      "standalone": true
-    },
-    "cake_deepgemm_dense_mqa_e457e48306777214f669": {
-      "arches": [
-        "sm_100a",
-        "sm_103a"
-      ],
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "Q"
-        ],
-        [
-          "tma_buffer",
-          "KV"
-        ],
-        [
-          "tma_buffer",
-          "Weights"
-        ],
-        [
-          "tma_buffer",
-          "SF_Q"
-        ],
-        [
-          "tma_buffer",
-          "SF_KV"
-        ],
-        [
-          "buffer",
-          "Logits"
-        ],
-        [
-          "buffer",
-          "cu_seq_len_k_start"
-        ],
-        [
-          "buffer",
-          "cu_seq_len_k_end"
-        ],
-        [
-          "parameter",
-          "seq_len"
-        ],
-        [
-          "parameter",
-          "seq_len_kv"
-        ],
-        [
-          "parameter",
-          "stride_logits"
-        ],
-        [
-          "parameter",
-          "num_q_blocks"
-        ],
-        [
-          "buffer",
-          "ScheduleMeta"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "closure_sha256": {
-        "sm_100a": "c753f91f741ceb7b3cc6537f0488e18e3213150b4bcf01555962aa64bfd7f0b8",
-        "sm_103a": "1e2dbbebdc34fe30a17e8c1275f238488bdf650d4f43310ac588d8e9c6c6f883"
-      },
-      "compile_flags": [],
-      "definitions": [
-        "SM_COUNT"
-      ],
-      "ffi_entry": "run",
-      "kind": "module",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_e457e48306777214f669_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_e457e48306777214f669_binding.cu"
       ],
       "standalone": true
     },
@@ -3609,15 +3709,8 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "0b5774a503fbd53d64f26e7f5736232a09588e4a45393fd831284904c9dc917e",
-        "sm_103a": "0df7a996092c2e08d1f06de444b8c86f3ca8bffc808179082e84fc67fbc874f7"
-      },
       "compile_flags": [
         "--ptxas-options=--register-usage-level=10"
-      ],
-      "definitions": [
-        "SM_COUNT"
       ],
       "ffi_entry": "run",
       "kind": "module",
@@ -3723,15 +3816,8 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "a2640dc2fc0890bb843290298381084911c46de9a3345ef415d0768c57da5d40",
-        "sm_103a": "112beb52a7b041b2b7c3b4d2ed67684b20a53da4ed2221c9fb3ec1cb21566a6f"
-      },
       "compile_flags": [
         "--ptxas-options=--register-usage-level=10"
-      ],
-      "definitions": [
-        "SM_COUNT"
       ],
       "ffi_entry": "run",
       "kind": "module",
@@ -3837,15 +3923,8 @@
           "grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "b7a6d96252fff2d4a7c86d9db3fb151397413a41640a731be2288b2feee0ebef",
-        "sm_103a": "28d82869444229065aef2d9a8e3445a2b8983f0ae6a5752ebd76fab8a030774c"
-      },
       "compile_flags": [
         "--ptxas-options=--register-usage-level=10"
-      ],
-      "definitions": [
-        "SM_COUNT"
       ],
       "ffi_entry": "run",
       "kind": "module",
@@ -3959,14 +4038,7 @@
           "logits.grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "b2beded04434abcbc4afa8ba3e8d1b7c0553f033684c1587c3f118332f899665",
-        "sm_103a": "105cd31ed2de3ede1ce3c14cc7a035ef70a4259d686619ab07a58aae0515ae12"
-      },
       "compile_flags": [],
-      "definitions": [
-        "SM_COUNT"
-      ],
       "ffi_entry": "cake_deepgemm_dense_mqa_seq_2b7c649a3b24c6394b5a",
       "kind": "sequence",
       "role": "sequence",
@@ -4084,14 +4156,7 @@
           "logits.grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "471b7d84e5dfe5eae92fc6fe7f57507151407108c1364417e34a630e72122657",
-        "sm_103a": "d959f1ec2e82ad9aaf2e23ba88b23dd0b5678ca536107225455240055930bbcf"
-      },
       "compile_flags": [],
-      "definitions": [
-        "SM_COUNT"
-      ],
       "ffi_entry": "cake_deepgemm_dense_mqa_seq_789d7585104792562e36",
       "kind": "sequence",
       "role": "sequence",
@@ -4209,14 +4274,7 @@
           "logits.grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "cf76d0c47dd537dea00e085cfdaaea16fb4d1953a3c0b3069c1c8e10e0ff48b8",
-        "sm_103a": "0fd4269c053710437d4f94ee7e1f68ddb2379bf3bb13d946733402ad30bc95e6"
-      },
       "compile_flags": [],
-      "definitions": [
-        "SM_COUNT"
-      ],
       "ffi_entry": "cake_deepgemm_dense_mqa_seq_a58fe37a98a67715e084",
       "kind": "sequence",
       "role": "sequence",
@@ -4334,14 +4392,7 @@
           "logits.grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "d9d22cce10283f0994fd01c27d5c1910aebaeeb3b39822518ccae29d0852886d",
-        "sm_103a": "ad7356dd74e0e432d5721abfc8d7d800b2c900678c2d24bdcff07b4d34b25675"
-      },
       "compile_flags": [],
-      "definitions": [
-        "SM_COUNT"
-      ],
       "ffi_entry": "cake_deepgemm_dense_mqa_seq_aac1cf431a9fe8c1016a",
       "kind": "sequence",
       "role": "sequence",
@@ -4459,14 +4510,7 @@
           "logits.grid_z"
         ]
       ],
-      "closure_sha256": {
-        "sm_100a": "9d2de94ec0e60c7e3d1bbc42719f6df05cf2329c564507e51befc4a2953b8cec",
-        "sm_103a": "727ce9372aa31b50e25990b24e8366faae70b93b9735cbab709b6c08b64afcdc"
-      },
       "compile_flags": [],
-      "definitions": [
-        "SM_COUNT"
-      ],
       "ffi_entry": "cake_deepgemm_dense_mqa_seq_c39decbf2de45b6ecb82",
       "kind": "sequence",
       "role": "sequence",
@@ -4486,294 +4530,240 @@
     "fp4:any": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": "cake_deepgemm_dense_mqa_seq_a58fe37a98a67715e084",
-      "stages": [
-        [
-          "metadata",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_dbcc196f04f54f228c05",
-            "sm_103a": "cake_deepgemm_dense_mqa_dbcc196f04f54f228c05"
-          }
-        ],
-        [
-          "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_6146eed402e5946aabe4",
-            "sm_103a": "cake_deepgemm_dense_mqa_6146eed402e5946aabe4"
-          }
-        ]
-      ]
+      "stages": []
     },
     "fp4:le1024:short": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_e457e48306777214f669",
-            "sm_103a": "cake_deepgemm_dense_mqa_e457e48306777214f669"
-          }
+          "cake_deepgemm_dense_mqa_ce277dbbcb88744d25c8"
         ]
       ]
     },
     "fp4:le128": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": "cake_deepgemm_dense_mqa_seq_789d7585104792562e36",
-      "stages": [
-        [
-          "metadata",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_7972d1c7b9410a9cb713",
-            "sm_103a": "cake_deepgemm_dense_mqa_7972d1c7b9410a9cb713"
-          }
-        ],
-        [
-          "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_6146eed402e5946aabe4",
-            "sm_103a": "cake_deepgemm_dense_mqa_6146eed402e5946aabe4"
-          }
-        ]
-      ]
+      "stages": []
     },
     "fp4:le16": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": "cake_deepgemm_dense_mqa_seq_c39decbf2de45b6ecb82",
-      "stages": [
-        [
-          "metadata",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_23fd530901062703f5d1",
-            "sm_103a": "cake_deepgemm_dense_mqa_23fd530901062703f5d1"
-          }
-        ],
-        [
-          "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_6146eed402e5946aabe4",
-            "sm_103a": "cake_deepgemm_dense_mqa_6146eed402e5946aabe4"
-          }
-        ]
-      ]
+      "stages": []
     },
     "fp4:le2048": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": "cake_deepgemm_dense_mqa_seq_aac1cf431a9fe8c1016a",
-      "stages": [
-        [
-          "metadata",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_e0868d26b805c9fd31d2",
-            "sm_103a": "cake_deepgemm_dense_mqa_e0868d26b805c9fd31d2"
-          }
-        ],
-        [
-          "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_6146eed402e5946aabe4",
-            "sm_103a": "cake_deepgemm_dense_mqa_6146eed402e5946aabe4"
-          }
-        ]
-      ]
+      "stages": []
     },
     "fp4:le32:short": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_91cbeec64695cc5dd3f0",
-            "sm_103a": "cake_deepgemm_dense_mqa_91cbeec64695cc5dd3f0"
-          }
+          "cake_deepgemm_dense_mqa_63c7e49139b05539648a"
         ]
       ]
     },
     "fp4:q1": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": "cake_deepgemm_dense_mqa_seq_2b7c649a3b24c6394b5a",
-      "stages": [
-        [
-          "metadata",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_2c9f274eb5a2741c7895",
-            "sm_103a": "cake_deepgemm_dense_mqa_2c9f274eb5a2741c7895"
-          }
-        ],
-        [
-          "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_6146eed402e5946aabe4",
-            "sm_103a": "cake_deepgemm_dense_mqa_6146eed402e5946aabe4"
-          }
-        ]
-      ]
+      "stages": []
     },
     "fp4:q1:short": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_0ad2c368d6fd4693236d",
-            "sm_103a": "cake_deepgemm_dense_mqa_0ad2c368d6fd4693236d"
-          }
+          "cake_deepgemm_dense_mqa_0ad2c368d6fd4693236d"
         ]
       ]
     },
     "fp8:full:any": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 1,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "metadata",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_dbcc196f04f54f228c05",
-            "sm_103a": "cake_deepgemm_dense_mqa_dbcc196f04f54f228c05"
-          }
+          "cake_deepgemm_dense_mqa_dbcc196f04f54f228c05"
         ],
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_f796231b06aa3ce8860b",
-            "sm_103a": "cake_deepgemm_dense_mqa_f796231b06aa3ce8860b"
-          }
+          "cake_deepgemm_dense_mqa_f796231b06aa3ce8860b"
         ]
       ]
     },
     "fp8:full:le128": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "metadata",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_7972d1c7b9410a9cb713",
-            "sm_103a": "cake_deepgemm_dense_mqa_7972d1c7b9410a9cb713"
-          }
+          "cake_deepgemm_dense_mqa_7972d1c7b9410a9cb713"
         ],
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_f796231b06aa3ce8860b",
-            "sm_103a": "cake_deepgemm_dense_mqa_f796231b06aa3ce8860b"
-          }
+          "cake_deepgemm_dense_mqa_f796231b06aa3ce8860b"
         ]
       ]
     },
     "fp8:full:le16": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "metadata",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_23fd530901062703f5d1",
-            "sm_103a": "cake_deepgemm_dense_mqa_23fd530901062703f5d1"
-          }
+          "cake_deepgemm_dense_mqa_23fd530901062703f5d1"
         ],
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_f796231b06aa3ce8860b",
-            "sm_103a": "cake_deepgemm_dense_mqa_f796231b06aa3ce8860b"
-          }
+          "cake_deepgemm_dense_mqa_f796231b06aa3ce8860b"
         ]
       ]
     },
     "fp8:full:le2048": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 1,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "metadata",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_e0868d26b805c9fd31d2",
-            "sm_103a": "cake_deepgemm_dense_mqa_e0868d26b805c9fd31d2"
-          }
+          "cake_deepgemm_dense_mqa_e0868d26b805c9fd31d2"
         ],
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_f796231b06aa3ce8860b",
-            "sm_103a": "cake_deepgemm_dense_mqa_f796231b06aa3ce8860b"
-          }
+          "cake_deepgemm_dense_mqa_f796231b06aa3ce8860b"
         ]
       ]
     },
     "fp8:full:le32:short": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_d928b7322c3819144a52",
-            "sm_103a": "cake_deepgemm_dense_mqa_d928b7322c3819144a52"
-          }
+          "cake_deepgemm_dense_mqa_d928b7322c3819144a52"
         ]
       ]
     },
     "fp8:full:le768:short": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_97fcf15832343046dcbe",
-            "sm_103a": "cake_deepgemm_dense_mqa_97fcf15832343046dcbe"
-          }
+          "cake_deepgemm_dense_mqa_97fcf15832343046dcbe"
         ]
       ]
     },
     "fp8:h64:full:any": {
       "block_q": 2,
       "clean_logits": "raw",
-      "kv_alignment": 1,
+      "kv_alignment": {
+        "sm_100a": 1,
+        "sm_103a": 1
+      },
+      "kv_min": 1,
       "num_heads": 64,
       "sequence": null,
       "stages": [
@@ -4789,7 +4779,11 @@
     "fp8:h64:full:le1024": {
       "block_q": 2,
       "clean_logits": "raw",
-      "kv_alignment": 1,
+      "kv_alignment": {
+        "sm_100a": 1,
+        "sm_103a": 1
+      },
+      "kv_min": 1,
       "num_heads": 64,
       "sequence": null,
       "stages": [
@@ -4805,7 +4799,11 @@
     "fp8:h64:full:le64": {
       "block_q": 2,
       "clean_logits": "raw",
-      "kv_alignment": 1,
+      "kv_alignment": {
+        "sm_100a": 1,
+        "sm_103a": 1
+      },
+      "kv_min": 1,
       "num_heads": 64,
       "sequence": null,
       "stages": [
@@ -4821,7 +4819,11 @@
     "fp8:h64:full:le8": {
       "block_q": 2,
       "clean_logits": "raw",
-      "kv_alignment": 1,
+      "kv_alignment": {
+        "sm_100a": 1,
+        "sm_103a": 1
+      },
+      "kv_min": 1,
       "num_heads": 64,
       "sequence": null,
       "stages": [
@@ -4837,23 +4839,28 @@
     "fp8:h64:full:short": {
       "block_q": 2,
       "clean_logits": "raw",
-      "kv_alignment": 1,
+      "kv_alignment": {
+        "sm_100a": 1,
+        "sm_103a": 1
+      },
+      "kv_min": 1,
       "num_heads": 64,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_b0661fcddef8eb9062da",
-            "sm_103a": "cake_deepgemm_dense_mqa_b0661fcddef8eb9062da"
-          }
+          "cake_deepgemm_dense_mqa_b0661fcddef8eb9062da"
         ]
       ]
     },
     "fp8:h64:partial:any": {
       "block_q": 2,
       "clean_logits": "raw",
-      "kv_alignment": 1,
+      "kv_alignment": {
+        "sm_100a": 1,
+        "sm_103a": 1
+      },
+      "kv_min": 1,
       "num_heads": 64,
       "sequence": null,
       "stages": [
@@ -4869,7 +4876,11 @@
     "fp8:h64:partial:le1024": {
       "block_q": 2,
       "clean_logits": "raw",
-      "kv_alignment": 1,
+      "kv_alignment": {
+        "sm_100a": 1,
+        "sm_103a": 1
+      },
+      "kv_min": 1,
       "num_heads": 64,
       "sequence": null,
       "stages": [
@@ -4885,7 +4896,11 @@
     "fp8:h64:partial:le64": {
       "block_q": 2,
       "clean_logits": "raw",
-      "kv_alignment": 1,
+      "kv_alignment": {
+        "sm_100a": 1,
+        "sm_103a": 1
+      },
+      "kv_min": 1,
       "num_heads": 64,
       "sequence": null,
       "stages": [
@@ -4901,7 +4916,11 @@
     "fp8:h64:partial:le8": {
       "block_q": 2,
       "clean_logits": "raw",
-      "kv_alignment": 1,
+      "kv_alignment": {
+        "sm_100a": 1,
+        "sm_103a": 1
+      },
+      "kv_min": 1,
       "num_heads": 64,
       "sequence": null,
       "stages": [
@@ -4917,23 +4936,28 @@
     "fp8:h64:partial:short": {
       "block_q": 2,
       "clean_logits": "raw",
-      "kv_alignment": 1,
+      "kv_alignment": {
+        "sm_100a": 1,
+        "sm_103a": 1
+      },
+      "kv_min": 1,
       "num_heads": 64,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_eddf29ae1ce1c6a62246",
-            "sm_103a": "cake_deepgemm_dense_mqa_eddf29ae1ce1c6a62246"
-          }
+          "cake_deepgemm_dense_mqa_eddf29ae1ce1c6a62246"
         ]
       ]
     },
     "fp8:h64:q1": {
       "block_q": 2,
       "clean_logits": "raw",
-      "kv_alignment": 1,
+      "kv_alignment": {
+        "sm_100a": 1,
+        "sm_103a": 1
+      },
+      "kv_min": 1,
       "num_heads": 64,
       "sequence": null,
       "stages": [
@@ -4949,182 +4973,210 @@
     "fp8:partial:any": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "metadata",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_dbcc196f04f54f228c05",
-            "sm_103a": "cake_deepgemm_dense_mqa_dbcc196f04f54f228c05"
-          }
+          "cake_deepgemm_dense_mqa_dbcc196f04f54f228c05"
         ],
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_3e56843a8c9823ef8193",
-            "sm_103a": "cake_deepgemm_dense_mqa_3e56843a8c9823ef8193"
-          }
+          "cake_deepgemm_dense_mqa_3e56843a8c9823ef8193"
         ]
       ]
     },
     "fp8:partial:le128": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "metadata",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_7972d1c7b9410a9cb713",
-            "sm_103a": "cake_deepgemm_dense_mqa_7972d1c7b9410a9cb713"
-          }
+          "cake_deepgemm_dense_mqa_7972d1c7b9410a9cb713"
         ],
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_3e56843a8c9823ef8193",
-            "sm_103a": "cake_deepgemm_dense_mqa_3e56843a8c9823ef8193"
-          }
+          "cake_deepgemm_dense_mqa_3e56843a8c9823ef8193"
         ]
       ]
     },
     "fp8:partial:le16": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "metadata",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_23fd530901062703f5d1",
-            "sm_103a": "cake_deepgemm_dense_mqa_23fd530901062703f5d1"
-          }
+          "cake_deepgemm_dense_mqa_23fd530901062703f5d1"
         ],
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_3e56843a8c9823ef8193",
-            "sm_103a": "cake_deepgemm_dense_mqa_3e56843a8c9823ef8193"
-          }
+          "cake_deepgemm_dense_mqa_3e56843a8c9823ef8193"
         ]
       ]
     },
     "fp8:partial:le2048": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "metadata",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_e0868d26b805c9fd31d2",
-            "sm_103a": "cake_deepgemm_dense_mqa_e0868d26b805c9fd31d2"
-          }
+          "cake_deepgemm_dense_mqa_e0868d26b805c9fd31d2"
         ],
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_3e56843a8c9823ef8193",
-            "sm_103a": "cake_deepgemm_dense_mqa_3e56843a8c9823ef8193"
-          }
+          "cake_deepgemm_dense_mqa_3e56843a8c9823ef8193"
         ]
       ]
     },
     "fp8:partial:le32:short": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_f27e5332ba291057767c",
-            "sm_103a": "cake_deepgemm_dense_mqa_f27e5332ba291057767c"
-          }
+          "cake_deepgemm_dense_mqa_f27e5332ba291057767c"
         ]
       ]
     },
     "fp8:partial:le768:short": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_2e080c04d067985f0445",
-            "sm_103a": "cake_deepgemm_dense_mqa_2e080c04d067985f0445"
-          }
+          "cake_deepgemm_dense_mqa_2e080c04d067985f0445"
         ]
       ]
     },
     "fp8:q1": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "metadata",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_2c9f274eb5a2741c7895",
-            "sm_103a": "cake_deepgemm_dense_mqa_2c9f274eb5a2741c7895"
-          }
+          "cake_deepgemm_dense_mqa_2c9f274eb5a2741c7895"
         ],
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_3e56843a8c9823ef8193",
-            "sm_103a": "cake_deepgemm_dense_mqa_3e56843a8c9823ef8193"
-          }
+          "cake_deepgemm_dense_mqa_3e56843a8c9823ef8193"
         ]
       ]
     },
     "fp8:q128:short": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_d928b7322c3819144a52",
-            "sm_103a": "cake_deepgemm_dense_mqa_d928b7322c3819144a52"
-          }
+          "cake_deepgemm_dense_mqa_d928b7322c3819144a52"
         ]
       ]
     },
     "fp8:q1:short": {
       "block_q": 4,
       "clean_logits": "fused",
-      "kv_alignment": 256,
+      "kv_alignment": {
+        "sm_100a": 256,
+        "sm_103a": 256
+      },
+      "kv_min": 256,
       "num_heads": 32,
       "sequence": null,
       "stages": [
         [
           "logits",
-          {
-            "sm_100a": "cake_deepgemm_dense_mqa_967ac77037a22551b1fa",
-            "sm_103a": "cake_deepgemm_dense_mqa_967ac77037a22551b1fa"
-          }
+          "cake_deepgemm_dense_mqa_967ac77037a22551b1fa"
+        ]
+      ]
+    },
+    "fp8:qle128:short": {
+      "block_q": 4,
+      "clean_logits": "fused",
+      "kv_alignment": {
+        "sm_100a": 1,
+        "sm_103a": 1
+      },
+      "kv_min": 1,
+      "num_heads": 32,
+      "sequence": null,
+      "stages": [
+        [
+          "logits",
+          "cake_deepgemm_dense_mqa_751b62ec1e448a4b7794"
+        ]
+      ]
+    },
+    "fp8:qle2048:short": {
+      "block_q": 4,
+      "clean_logits": "fused",
+      "kv_alignment": {
+        "sm_100a": 1,
+        "sm_103a": 1
+      },
+      "kv_min": 1,
+      "num_heads": 32,
+      "sequence": null,
+      "stages": [
+        [
+          "logits",
+          "cake_deepgemm_dense_mqa_4be5b4aaa1f52069837c"
         ]
       ]
     }
   },
-  "schema": "dense_mqa.v9"
+  "schema": "dense_mqa.v10"
 }

@@ -178,8 +178,8 @@ class BatchMLAPagedAttentionWrapper:
     representation.
 
     See :ref:`MLA Page Layout <mla-page-layout>` for the paged KV-cache layout
-    and the `FlashInfer MLA blog post
-    <http://flashinfer.ai/2025/02/10/flashinfer-deepseek-mla.html>`_ for the
+    and the `FlashInfer 0.2 release post
+    <https://flashinfer.ai/2024/12/16/flashinfer-v02-release.html#fused-multi-head-latent-attention-mla-decoding-kernel>`_ for the
     computation and Matrix Absorption background.
     """
 

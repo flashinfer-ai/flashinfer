@@ -41,7 +41,7 @@ tuned answer cannot be used.
 import os
 import warnings
 from functools import lru_cache
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -410,6 +410,16 @@ TUNE_SURVIVORS = 48
 TUNE_RANK_ROUNDS = 3
 
 
+def _round_order(n: int, round_index: int) -> Iterable[int]:
+    """Candidate indices for one ranking round; odd rounds run backward.
+
+    In one fixed order the first copy-engine candidate always followed the last
+    SM candidate, so every sample carried that switch and the minimum kept it.
+    Depends only on its arguments, so every rank launches in the same order.
+    """
+    return reversed(range(n)) if round_index % 2 else range(n)
+
+
 def reduce_timings(times: "torch.Tensor", group) -> "torch.Tensor":
     """Make every rank rank the candidates identically.
 
@@ -612,9 +622,9 @@ class PcieIpcAllReduceRunner(TunableRunner):
         Cardinality is the hazard. Every rank must issue exactly these launches
         in exactly this order; an early return between the first launch and the
         verdict reduction leaves peers spinning inside a kernel this rank never
-        issued, with no timeout. Hence: barrier first, every buffer allocated
-        before the loop, and a loop body that does not allocate, synchronise
-        with the host, or branch.
+        issued, with no timeout. Hence: a barrier before the first collective
+        launch, every persistent buffer allocated before it, and nothing between
+        it and the reductions that branches on anything rank-local.
         """
         inp = inputs[0]
         ws = self._ws
@@ -663,7 +673,10 @@ class PcieIpcAllReduceRunner(TunableRunner):
         # loads its module, which shows up as an order-of-magnitude outlier and
         # would demote whichever candidate happened to be that variant's first.
         # Per variant, not per candidate: block and thread counts do not pull in
-        # a new module.
+        # a new module. These are collective launches already, so the barrier
+        # goes in front of them: a rank that failed before this point leaves its
+        # peers waiting in NCCL, which can be aborted, rather than in a kernel.
+        dist.barrier(group=ws.group)
         seen_variants = set()
         for config in configs:
             if config.variant not in seen_variants:
@@ -672,7 +685,8 @@ class PcieIpcAllReduceRunner(TunableRunner):
 
         dist.barrier(group=ws.group)
         for r in range(TUNE_RANK_ROUNDS):
-            for i, config in enumerate(configs):
+            for i in _round_order(len(configs), r):
+                config = configs[i]
                 # A kernel that leaves part of the payload unwritten would
                 # otherwise show the previous candidate's correct result.
                 out.fill_(float("nan"))

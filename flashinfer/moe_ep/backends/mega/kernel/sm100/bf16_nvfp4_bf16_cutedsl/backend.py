@@ -48,7 +48,6 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         self._kernel_config = config
         self.supports_unfinalized_output = not config.do_finalize
         self._autotune_pending = config.knobs == "auto"
-        self._autotune_winner: dict | None = None
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
         return bf16_cutedsl_runtime_requirements(bootstrap)
