@@ -450,7 +450,9 @@ It does not enable disk persistence.
 keys and compatibility rules; ``records()`` returns a copy for lookups such as
 capacity fallback. Returning a ``TuningResult`` does not publish a record.
 ``context.publish()`` keeps the record in memory and writes it to the active
-managed store when tuning is enabled. With ``autotune_v2()``, that store is
+managed store when ambient tuning is enabled and the operation is not in
+``skip_ops``. ``force_tune`` does not override these write controls.
+With ``autotune_v2()``, that store is
 attached automatically and remains available after context exit.
 ``persistent_cache=False`` keeps records in memory. Protocols must also honor
 ``context.disk_cache_enabled`` for any compatibility-file I/O. Results use the

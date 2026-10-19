@@ -154,8 +154,10 @@ skipped, so a protocol can coordinate its fallback or cache decision.
 
 `TuningContext.records()` reads the active store's protocol records.
 `context.publish()` keeps a record in memory and writes it to that store when
-tuning is enabled. Returning a `TuningResult` does not publish it. Replay imports
-remain in memory. No JSON filename is required.
+ambient tuning is enabled and the operation is not in `skip_ops`.
+`force_tune` can request a fresh search but does not override these write
+controls. Returning a `TuningResult` does not publish it. Replay imports remain
+in memory. No JSON filename is required.
 
 Protocol results use the same `entries/` files, writer and preload as runner
 tactics. Their structural key is `("__protocol__", namespace, record_key)`;

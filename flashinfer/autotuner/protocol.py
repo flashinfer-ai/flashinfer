@@ -104,16 +104,20 @@ class TuningContext:
         return self.tuner.get_protocol_records(self.namespace)
 
     def lookup(self, key: str) -> Any:
+        """Return a copy of one record, or None if absent or skipped."""
         if self.skipped:
             return None
         return self.tuner.get_protocol_record(self.namespace, key)
 
     def publish(self, key: str, value: Any) -> None:
+        """Cache a result in memory; disk writes follow ambient tuning controls."""
         if self.skipped:
             return
-        self.tuner.publish_protocol_record(
-            self.namespace, key, value, persist=self.tuning_enabled
+        persist = (
+            self.tuner.is_tuning_mode
+            and self.namespace not in self.tuner._effective_skip_ops
         )
+        self.tuner.publish_protocol_record(self.namespace, key, value, persist=persist)
 
 
 @dataclass(frozen=True)

@@ -1,4 +1,5 @@
 import json
+from contextlib import nullcontext
 
 import pytest
 
@@ -60,6 +61,51 @@ def test_explicit_search_overrides_cache_and_disabled_mode():
         )
     assert tuner.stats.tuned_op_total_configs["test.protocol"] == 8
     assert not tuner.is_tuning_mode
+
+
+@pytest.mark.parametrize(
+    "mode,skipped,persist",
+    [
+        ("tune", False, True),
+        ("replay", False, False),
+        ("serving", False, False),
+        ("tune", True, False),
+    ],
+)
+def test_forced_search_preserves_ambient_persistence(
+    managed, tmp_path, mode, skipped, persist
+):
+    from flashinfer import autotune_v2
+    from flashinfer.autotune_cache import autotune_v2_reload
+
+    previous = {"tile": [32, 64]}
+    with autotune_v2():
+        managed.protocol_context("test.protocol").publish("shape", previous)
+    path = next(tmp_path.glob("v2/*/entries/*.json"))
+    original = path.read_bytes()
+    protocol = RecordingProtocol()
+    scope = (
+        nullcontext()
+        if mode == "serving"
+        else autotune_v2(mode=mode, skip_ops={"test.protocol"} if skipped else set())
+    )
+    with scope:
+        assert (
+            managed.choose_with_protocol("test.protocol", protocol, force_tune=True)
+            == "tuned"
+        )
+        context = protocol.contexts[-1]
+        assert context.tuning_enabled
+        assert not context.skipped
+        selected = context.lookup("shape")
+        assert selected["tile"] == [128, 256]
+    assert managed.stats.tuned_op_total_configs["test.protocol"] == 4
+    if not persist:
+        assert path.read_bytes() == original
+    autotune_v2_reload()
+    assert managed.protocol_context("test.protocol").lookup("shape") == (
+        selected if persist else previous
+    )
 
 
 def test_protocol_scope_restores_after_nested_context_exception():
