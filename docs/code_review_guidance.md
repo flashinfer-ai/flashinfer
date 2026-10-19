@@ -38,7 +38,7 @@ bugs there. See [Kernel review](#kernel-review).
    standard.
 7. **Triggering CI.** When you start CI on a PR, scope it to the test paths the change
    touches: `@flashinfer-bot run tests/<dir-or-file> [tests/...]` (public) / `/bot run tests/<dir-or-file> [tests/...]` (internal), whitespace-separated paths
-   under `tests/`. A bare `run` starts the full suite, which is expensive; it needs a reason
+   under `tests/`. `run all` starts the full suite, which is expensive; it needs a reason
    (final pre-merge check of a cross-cutting change), not habit.
 
 **Out of scope:** backwards-compatibility / API-breakage auditing — delegated to a GitHub
