@@ -1,5 +1,9 @@
 # Symmetric Memory over NVLink
 
+**Scope**: `MnnvlMemory` and `SymmDeviceMemory` in `flashinfer/comm/mnnvl.py`:
+how they allocate and share memory, their lifecycle and checkpoint/restore, and
+how the NVLink one-sided all-to-all gates CFT on the handle type.
+
 FlashInfer's NVLink collectives work on symmetric memory: every rank of a group
 allocates a buffer of the same size, and every rank maps every peer's buffer
 into its own virtual address space, so a kernel reads and writes peer memory
