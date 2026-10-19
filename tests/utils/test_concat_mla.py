@@ -445,6 +445,60 @@ def test_cake_concat_mla_k_jit_target_isolated(
     assert not any(forbidden_compute in flag for flag in spec.extra_cuda_cflags)
 
 
+@pytest.mark.parametrize(
+    ("tokens", "element_bytes", "target", "expected"),
+    [
+        (1, 2, "sm107a", 2),
+        (2, 1, "sm107a", 2),
+        (2, 2, "sm107a", 6),
+        (70, 2, "sm107a", 6),
+        (71, 2, "sm107a", 3),
+        (141, 2, "sm107a", 3),
+        (142, 2, "sm107a", 2),
+        (213, 2, "sm107a", 1),
+        (4096, 2, "sm107a", 1),
+        (2, 2, "sm103a", 1),
+        (2, 2, "sm100f", 1),
+    ],
+)
+def test_cake_concat_mla_k_split_rule(tokens, element_bytes, target, expected):
+    from flashinfer.jit import cake_concat_mla_k
+
+    assert (
+        cake_concat_mla_k.cake_concat_mla_k_split_ctas(tokens, element_bytes, target)
+        == expected
+    )
+
+
+def test_cake_concat_mla_k_modules_are_selected_per_target():
+    from flashinfer.jit import cake_concat_mla_k
+
+    spec = cake_concat_mla_k.get_cake_concat_mla_k_module_spec()
+    assert set(spec.modules) == {"sm_103a", "sm_107a"}
+    shared = spec.module_for("sm103a")
+    assert spec.module_for("sm100f") is shared
+    assert spec.module_for("sm103a", 6) is shared
+    # The split module serves only launches with grid_y > 1 on the split arch.
+    assert spec.module_for("sm107a") is shared
+    assert spec.module_for("sm107a", 1) is shared
+    split = spec.module_for("sm107a", 2)
+    assert spec.module_for("sm107a", 6) is split
+    assert split is not shared and split.module_ident != shared.module_ident
+    assert split.device_path != shared.device_path
+    assert "gridDim.y" in split.device_path.read_text()
+    assert "gridDim.y" not in shared.device_path.read_text()
+    assert cake_concat_mla_k.get_cake_concat_mla_k_uri("sm103a").startswith(
+        shared.module_ident
+    )
+    assert cake_concat_mla_k.get_cake_concat_mla_k_uri("sm107a").startswith(
+        shared.module_ident
+    )
+    assert cake_concat_mla_k.get_cake_concat_mla_k_uri("sm107a", split=True).startswith(
+        split.module_ident
+    )
+    assert spec.split_rule["module"].startswith("split module when split_ctas > 1")
+
+
 def test_cake_concat_mla_k_rejects_unsupported_arch(monkeypatch):
     _require_cake_concat_mla_k()
     k, k_nope, k_rope = _make_cake_tensors(1, torch.bfloat16, "contiguous", False)

@@ -133,7 +133,7 @@ wrapper.run(...)   # live indexer IDs and request metadata; graph hot path
 ```
 
 `plan` binds the single caller-owned byte workspace and fixes
-`batch_size`, `seq_len_q`, head geometry, `block_topk`,
+`batch_size`, `group_size`, head geometry, `block_topk`,
 `max_seq_len_kv`, dtypes, and packed-versus-fixed Q layout. The first eager
 `run` binds the live tensor ABI, compiles the selected kernels, and
 initializes split-KV state. Capture only later `run` calls. One wrapper
@@ -141,9 +141,11 @@ revision owns mutable route and split-KV scratch, so unordered concurrent runs
 need distinct wrappers.
 
 Packed prefill uses `q[total_q, Hq, D]`, `qo_indptr`, and
-`use_packed_q=True`; planned `seq_len_q` is the maximum request-safe route
+`use_packed_q=True`; planned `group_size` is the maximum request-safe route
 length. Fixed MTP decode uses `q[B, Nq, G, Hq, D]` without `qo_indptr`,
-where planned `batch_size = B * Nq` and `seq_len_q = G`. Q lengths need not
+where planned `batch_size = B * Nq` and `group_size = G`. The default
+`group_size=1` disables query grouping; pass a larger G explicitly for either
+layout, using the same value for workspace sizing and planning. Q lengths need not
 be divisible by a suggested group: packed mode permits a shorter final route,
 while fixed mode may append consecutive semantic dummy rows and discard their
 outputs.
@@ -157,11 +159,18 @@ independent of packed/fixed Q and must match workspace sizing and planning.
 metadata plus disjoint attention scratch. The model's per-request
 `max_seq_len_kv`, rather than the global physical page-pool capacity, bounds
 the plan. Each group and pattern head forms at most
-`G * (block_topk + 1)` selected/tail candidates, sorts and unique-reduces
-them in one CTA, and ORs per-query membership bits. It processes only candidate
-IDs, with no full-context bitmap or scan. Shared patterns prepare one row per
+`G * (block_topk + 1)` selected/tail candidates and ORs per-query membership
+bits in one CTA. A shared byte/bit map forms the sorted union when its footprint
+fits without adding CTA waves; otherwise bounded radix sort is used. This
+temporary map is sized by model context, not physical cache capacity, and adds
+no caller-owned workspace. Shared patterns prepare one row per
 group; independent patterns prepare one per group and KV head. G1 resolves
 selected blocks and the causal tail inside attention, without a metadata launch.
+
+Eligible prepared FP8 G2–G8/page-4 Keeps routes store query-oriented membership
+words internally, with eight query slots and complete tail tiles reserved in
+the workspace. Unused slots and tail bits are zero. Standalone metadata outputs
+retain four membership bytes per Int32 word; the public plan/run API is unchanged.
 
 Nonsplit sparse grids larger than one service wave use the common CLC
 persistent scheduler. Each work item resolves its own request, query group and
@@ -173,25 +182,29 @@ groups. `split_kv=False` disables splitting, not persistent scheduling.
 The production specialization supports D64/D128/D256, matching FP16/BF16
 Q/K/V/output, or FP8 E4M3 Q/K/V with FP16/BF16 output. It is causal and
 non-windowed, uses KV128 for Q1--Q8, and requires
-`seq_len_q * (Hq / Hkv) <= TileQ128`. Groups exceeding 64 token/head rows
+`group_size * (Hq / Hkv) <= TileQ128`. Groups exceeding 64 token/head rows
 use TileQ128; per-fragment query membership still occupies one byte.
 The pure-host
 `suggest_q_token_kv_block_sparse_group_size` helper takes a caller-cached SM
 count and prefers the largest legal group that can fill one service wave using
 independent routes plus useful split-KV work. It falls back toward Q1 when a
 large union would leave SMs idle. The helper never queries device properties
-or reads tensors.
+or reads tensors. Its `seq_len_q` input is the actual per-request query
+length, distinct from the suggested `group_size`.
 
 `q_token_kv_block_sparse_attention_with_paged_kv_cache` is the eager
 plan-plus-run convenience API and is not graph-capturable. Shared argument
 spellings intentionally match paged block-sparse attention: `q`,
 `paged_kv_cache`, `kv_block_size`, `mask_type`,
-`sm_scale`, `seq_len_q`, and `max_seq_len_kv`. The optional runtime
+`sm_scale`, and `max_seq_len_kv`. Query grouping is specified separately with
+`group_size`, not a sequence-length argument. The optional runtime
 `v_scale` applies the value-cache dequantization scale and defaults to one.
 The convenience API infers physical page size from `paged_kv_cache`; only
 the prepared wrapper's `plan` takes `page_size` explicitly.
 
 On SM90 and newer, the combined route-builder and attention launch use PDL.
+Metadata releases at entry so the attention prologue can overlap it; the
+attention dependency wait still covers all metadata stores.
 Attention initializes its independent resources before acquiring immediately
 ahead of the first metadata-dependent read. Split-KV attention releases its
 reducer only after producer completion and TMEM teardown; the reducer

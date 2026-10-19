@@ -45,10 +45,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define THREADS 256
 
 #include <math_constants.h>
-
 extern "C" {
 
-__global__ __launch_bounds__(256) void
+__global__ __launch_bounds__(THREADS) void
 kernel_cake_mok_zero(uint16_t* __restrict__ gate, uint16_t* __restrict__ up, uint16_t* __restrict__ down, int* __restrict__ counts, long long elements)
 {
     const int tid = threadIdx.x;

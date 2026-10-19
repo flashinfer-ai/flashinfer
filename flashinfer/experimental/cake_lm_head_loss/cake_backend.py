@@ -52,8 +52,7 @@ Contract
   tokens (a batch smaller than ``C`` is one chunk).  :func:`memory_report`
   states the peak temporary bytes separately from the model weights, the
   required outputs and the FP32 gradient accumulators.
-* Valid-row compaction (``compact_rows``, default on unless
-  ``FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS=0``): when some labels are
+* Valid-row compaction (``compact_rows``, default on): when some labels are
   ``-100`` the chunk loop runs over the valid rows only -- the row index
   ``idx = (labels >= 0).nonzero()`` is formed once per call (one device
   synchronization for the count, one for the index), each chunk's rows of
@@ -66,18 +65,18 @@ Contract
   whenever the chunk's K-slice count agrees; the ``loss`` and ``dW``
   reductions run over different chunk boundaries, hence differ by FP32
   rounding.  All rows valid: the uncompacted path (no gather, no scatter).
-* Fused dX finalize (default on unless ``FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE=0``):
-  the K-slice slabs of a sliced dX GEMM are added into ``dX_acc`` by one
+* Fused dX finalize (``dx_finalize``, default on): the K-slice slabs of a sliced dX GEMM are added into ``dX_acc`` by one
   fixed-order kernel (``slab_sum``) instead of the host's chain of in-place
   ``add_`` launches, and a compacted call's dX output boundary writes the
   ``[T, H]`` BF16 ``dX`` in one pass (``scale_cast_scatter_bf16``: ``bf16(g *
   dX_acc[compact row])`` on the valid rows, exact zeros elsewhere, addressed by
   the inclusive int32 scan of the valid-row mask) instead of the flat cast, the
   zero fill and the ``index_copy_``.  The same FP32 operations in the same
-  order: ``dX`` is bitwise the previous path's (``0`` restores that path).
-* dW side stream (``FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM``: ``auto`` (default)
-  = calls of three or more chunks, ``1`` = every multi-chunk call, ``0`` =
-  never): each chunk's weight-gradient accumulate GEMM is launched on a
+  order: ``dX`` is bitwise the previous path's (``dx_finalize=False`` restores
+  that path).
+* dW side stream (``dw_stream``: ``None`` / ``"auto"`` (default) = calls of
+  three or more chunks, ``True`` = every multi-chunk call, ``False`` = never):
+  each chunk's weight-gradient accumulate GEMM is launched on a
   per-device side stream forked after the chunk's ``row_grad`` (``dz`` ready)
   and joined before the next chunk reuses the chunk buffer and before the call
   returns, so its CTAs fill the tail wave of the chunk's dX GEMM instead of
@@ -87,9 +86,8 @@ Contract
   ``dX`` / ``dW`` are bitwise the single-stream path's.  Two-chunk calls pay
   the join without an overlap gain and a one-chunk call defers its only
   accumulate to the backward, hence the ``auto`` rule (:func:`dw_side_stream`).
-* Hidden valid-row count (default on unless
-  ``FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT=0``; ``cake`` backend only): a
-  compacted call forms its valid-row index on the device (``labels >= 0`` ->
+* Hidden valid-row count (``hidden_count``, default on; ``cake`` backend
+  only): a compacted call forms its valid-row index on the device (``labels >= 0`` ->
   inclusive int32 ``cumsum`` -> ``searchsorted``), gathers chunk 0's rows of
   ``X`` with the ``gather_rows_bf16`` kernel and runs chunk 0's logits GEMM in
   its device-count form (``gemm_logits_mcnt`` / ``gemm_logits_nostats_mcnt``:
@@ -102,8 +100,8 @@ Contract
   weight gradient stay the input view); every row ignored: zeros without a
   further launch; otherwise the compacted plan over the counted rows with
   chunk 0's gather and GEMM skipped.  The same kernels per row, so ``loss`` /
-  ``logp`` / ``dX`` / ``dW`` are bitwise the shipped path's (``0`` restores
-  it).  Calls the device-count GEMM cannot serve -- an ``X`` that needs a
+  ``logp`` / ``dX`` / ``dW`` are bitwise the shipped path's
+  (``hidden_count=False`` restores it).  Calls the device-count GEMM cannot serve -- an ``X`` that needs a
   contiguous copy or whose base is not 16-byte aligned, a program without the
   kernels -- take the shipped path.
 * ``deterministic=True`` (the only mode this backend serves): fixed sequential
@@ -129,6 +127,14 @@ slots the current tensors, freshly allocated outputs and per-call scratch into
 the remembered argument plans and launches.  A call without rows (``T == 0``)
 returns loss 0, an empty ``logp`` and zero gradients without binding or
 launching anything.
+
+Every switch of this module (``compact_rows``, ``fuse_dw_cast``,
+``dx_finalize``, ``dw_stream``, ``hidden_count``, ``gemm_tuning``) is a keyword
+argument of the entry points that it affects, ``None`` selecting the documented
+default (the ``*_default()`` functions); the binding cache is configured through
+:meth:`BindingCache.configure`.  This module reads no environment variable.
+FlashInfer's public wrapper (``flashinfer.chunked_lm_head``) owns the A/B
+environment variables of these switches and passes the resolved values down.
 """
 
 from __future__ import annotations
@@ -136,13 +142,11 @@ from __future__ import annotations
 import ast
 import contextlib
 import functools
-import json
 import math
-import os
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 import torch
 
@@ -347,8 +351,8 @@ K_SLICE_PENALTY = 0.01  # wave-efficiency score penalty per extra slab (the kern
 #   DW_BLOCK_MAX_ROWS rows runs the weight-gradient accumulate and the fp32 fused cast with column blocks of
 #   DW_BLOCK_GROUPS[arch] tiles (:func:`dw_block_variant`; the bf16 cast keeps the 1-D raster).  Bitwise: a permutation
 #   of the same tiles.
-# ``gemm_tuning`` (:func:`prepare_lm_head_loss`; ``$FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING`` as JSON for the eager
-# entry points) pins knobs explicitly per GEMM -- ``{"logits": {"group_m": 16}, "dx": {"tile_n": 256, "k_slices": 2},
+# ``gemm_tuning`` (a keyword of :func:`prepare_lm_head_loss` and of the eager / autograd entry points; ``None`` = no
+# explicit knob) pins knobs explicitly per GEMM -- ``{"logits": {"group_m": 16}, "dx": {"tile_n": 256, "k_slices": 2},
 # "dw": {"group_m": 32, "group_n": 0}}``; a knob given as ``None`` pins the default -- and wins over the rule for the
 # knobs it names.  A form the record does not register fails closed (``NotImplementedError``).
 RASTER_RULE_MIN_HIDDEN = 7168  # first H whose [rows_c, H] BF16 operand panel no longer stays L2-resident at rows_c >= 2049
@@ -395,7 +399,6 @@ DX_WIDE_MIN_EFF = {
 }  # wave-efficiency floor of a one-slice 512-wide dX launch below RASTER_RULE_MIN_HIDDEN, per architecture; below it the
 #    256-wide cluster form runs the chunk (absent = the wide tile stays)
 DX_K_SLICES_MAX = 4
-GEMM_TUNING_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING"
 _TUNING_KNOBS = {
     "logits": ("group_m",),
     "dx": ("k_slices", "tile_n", "stages"),
@@ -609,17 +612,8 @@ def dx_tile_rule(
 
 
 def gemm_tuning_default() -> dict[str, dict[str, Any]]:
-    """The explicit GEMM knobs of ``$FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING`` (a JSON object; unset / empty = none)."""
-    raw = os.environ.get(GEMM_TUNING_ENV, "").strip()
-    if not raw:
-        return {}
-    try:
-        value = json.loads(raw)
-    except ValueError as exc:
-        raise ValueError(
-            f"${GEMM_TUNING_ENV} must be a JSON object of GEMM knobs: {exc}"
-        ) from exc
-    return _resolve_gemm_tuning(value)
+    """Default of ``gemm_tuning`` (``{}``): no explicit GEMM knob, the per-chunk instance rules choose every form."""
+    return {}
 
 
 def _resolve_gemm_tuning(gemm_tuning) -> dict[str, dict[str, Any]]:
@@ -1160,64 +1154,75 @@ def _dx_reduce(values: dict[str, Any]) -> None:
 
 # --------------------------------------------------------------------------- valid-row compaction
 
-COMPACT_ROWS_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS"  # "0" turns the compaction off (the before / after switch)
+# The switches below are keyword arguments of the entry points (``None`` = the documented default, the constant each
+# ``*_default()`` returns); this module reads no environment variable.  FlashInfer's public wrapper
+# (``flashinfer.chunked_lm_head``) owns the A/B environment variables of these switches and passes the resolved values
+# down.
 
 
 def compact_rows_default() -> bool:
-    """Default of ``compact_rows``: chunk over the valid rows only unless ``$FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS`` is ``0``."""
-    return os.environ.get(COMPACT_ROWS_ENV, "1") != "0"
-
-
-FUSE_DW_CAST_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST"  # "0" turns the fused weight-gradient cast off
+    """Default of ``compact_rows`` (``True``): chunk over the valid rows only when some labels are ignored."""
+    return True
 
 
 def fuse_dw_cast_default() -> bool:
-    """Default of ``fuse_dw_cast``: the last chunk's weight-gradient GEMM runs in the backward with the upstream scale and
-    the output cast fused into its epilogue (:data:`DW_CAST_STAGES`) unless ``$FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST``
-    is ``0`` (then every chunk accumulates into the FP32 ``dW_acc`` and ``scale_cast`` casts it; bitwise the same ``dW``)."""
-    return os.environ.get(FUSE_DW_CAST_ENV, "1") != "0"
+    """Default of ``fuse_dw_cast`` (``True``): the last chunk's weight-gradient GEMM runs in the backward with the upstream
+    scale and the output cast fused into its epilogue (:data:`DW_CAST_STAGES`); ``False`` accumulates every chunk into
+    the FP32 ``dW_acc`` and casts it with ``scale_cast`` (bitwise the same ``dW``)."""
+    return True
 
 
 def _resolve_fuse(fuse_dw_cast) -> bool:
     return fuse_dw_cast_default() if fuse_dw_cast is None else bool(fuse_dw_cast)
 
 
-DX_FINALIZE_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE"  # "0" turns the fused dX finalize off (the before / after switch)
-
-
 def dx_finalize_default() -> bool:
-    """Default of ``dx_finalize``: the K-slice slabs of a sliced dX GEMM are added by the ``slab_sum`` kernel and a
-    compacted call's ``dX`` output is written by the ``scale_cast_scatter_bf16`` kernel (:data:`DX_FINALIZE_STAGES`)
-    unless ``$FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE`` is ``0`` (then the host adds the slabs with in-place ``add_``
-    launches and casts, zero-fills and ``index_copy_``-scatters the compact rows; bitwise the same ``dX``).  Read once
-    per forward; the backward follows the forward's choice through the saved valid-row mask."""
-    return os.environ.get(DX_FINALIZE_ENV, "1") != "0"
+    """Default of ``dx_finalize`` (``True``): the K-slice slabs of a sliced dX GEMM are added by the ``slab_sum`` kernel
+    and a compacted call's ``dX`` output is written by the ``scale_cast_scatter_bf16`` kernel
+    (:data:`DX_FINALIZE_STAGES`); ``False`` adds the slabs with in-place ``add_`` launches on the host and casts,
+    zero-fills and ``index_copy_``-scatters the compact rows (bitwise the same ``dX``).  Resolved once per forward; the
+    backward follows the forward's choice through the saved valid-row mask."""
+    return True
 
 
 def _resolve_dx_finalize(dx_finalize) -> bool:
     return dx_finalize_default() if dx_finalize is None else bool(dx_finalize)
 
 
-DW_STREAM_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM"  # "0" never, "1" every multi-chunk call, "auto" (default)
+DW_STREAM_MODES = (
+    "0",
+    "1",
+    "auto",
+)  # the normalised ``dw_stream`` modes: never / every multi-chunk call / the chunk rule (:func:`dw_stream_mode`)
 DW_STREAM_MIN_CHUNKS = 3  # the side stream pays one cross-stream join per chunk and overlaps only the chunks before a deferred last one
 _DW_STREAMS: dict[
     int, tuple
 ] = {}  # device index -> (side stream, fork event); not a tensor, outside every workspace / binding
 
 
-def dw_stream_mode() -> str:
-    """``$FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM`` as ``"0"`` (never), ``"1"`` (every multi-chunk call) or ``"auto"``
-    (the default: calls of at least :data:`DW_STREAM_MIN_CHUNKS` chunks, :func:`dw_side_stream`)."""
-    value = os.environ.get(DW_STREAM_ENV, "auto").strip().lower()
-    if value in ("0", "false", "off", "no"):
-        return "0"
-    if value in ("1", "true", "on", "yes"):
-        return "1"
-    return "auto"
+def dw_stream_mode(dw_stream: Optional[Union[bool, str]] = None) -> str:
+    """The ``dw_stream`` keyword as its mode: ``"0"`` (never), ``"1"`` (every multi-chunk call) or ``"auto"`` (the
+    default: calls of at least :data:`DW_STREAM_MIN_CHUNKS` chunks, :func:`dw_side_stream`).  ``None`` and ``"auto"``
+    select the default, ``True`` / ``"1"`` every multi-chunk call, ``False`` / ``"0"`` never; any other value is a
+    ``ValueError``.  A pure normaliser of the keyword (idempotent on a mode); nothing is read from the environment."""
+    if dw_stream is None:
+        return "auto"
+    if isinstance(dw_stream, bool):
+        return "1" if dw_stream else "0"
+    if isinstance(dw_stream, str):
+        value = dw_stream.strip().lower()
+        if value in DW_STREAM_MODES:
+            return value
+    raise ValueError(
+        f"dw_stream must be None, True, False or one of {DW_STREAM_MODES}, got {dw_stream!r}"
+    )
 
 
-def dw_side_stream(num_chunks: int) -> bool:
-    """Whether a call of ``num_chunks`` chunks launches each chunk's weight-gradient accumulate GEMM on the per-device
+def dw_side_stream(
+    num_chunks: int, dw_stream: Optional[Union[bool, str]] = None
+) -> bool:
+    """Whether a call of ``num_chunks`` chunks under the ``dw_stream`` keyword (or its mode, :func:`dw_stream_mode`;
+    ``None`` = the ``auto`` rule) launches each chunk's weight-gradient accumulate GEMM on the per-device
     side stream: forked right after the chunk's ``row_grad`` (``dz`` is ready; the accumulate depends on it alone, not
     on the dX GEMM launched next) and joined before the next chunk touches the chunk buffer and before the call returns,
     so the accumulate's CTAs fill the tail wave of the chunk's dX GEMM instead of queueing behind it (GLM-class 4096-row
@@ -1233,7 +1238,7 @@ def dw_side_stream(num_chunks: int) -> bool:
     n = int(num_chunks)
     if n <= 1:
         return False
-    mode = dw_stream_mode()
+    mode = dw_stream_mode(dw_stream)
     if mode == "0":
         return False
     if mode == "1":
@@ -1252,17 +1257,13 @@ def _dw_stream(index: int) -> tuple:
     return pair
 
 
-HIDDEN_COUNT_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT"  # "0" turns the hidden valid-row count off (the before / after switch)
-
-
 def hidden_count_default() -> bool:
-    """Default of the hidden valid-row count (``cake`` backend, compacted calls): the valid-row index is formed on the
+    """Default of ``hidden_count`` (``True``; ``cake`` backend, compacted calls): the valid-row index is formed on the
     device and chunk 0's row gather (:data:`HIDDEN_COUNT_STAGE`) and logits GEMM (its ``_mcnt`` variant, the stores
     bounded by the count read from device memory) are launched before the count reaches the host through a pinned cell
-    and a CUDA event (:func:`_hidden_count_begin`) unless ``$FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT`` is ``0`` (then
-    :func:`valid_rows` counts and indexes on the host before the first launch; bitwise the same outputs).  Read once per
-    call."""
-    return os.environ.get(HIDDEN_COUNT_ENV, "1") != "0"
+    and a CUDA event (:func:`_hidden_count_begin`); ``False`` counts and indexes on the host before the first launch
+    (:func:`valid_rows`; bitwise the same outputs).  Resolved once per call."""
+    return True
 
 
 def compaction_index(
@@ -2694,15 +2695,18 @@ def _ffi_stream_context(index: int):
     return tvm_ffi.use_raw_stream(device, raw)
 
 
-def side_stream_schedule(plan: Plan, keys: tuple) -> Optional[tuple]:
-    """Side-stream placement of :func:`dw_side_stream` over a launch-key sequence: ``None`` when the plan has no ``dW``,
-    too few chunks for the rule, or the sequence has no per-chunk accumulate (the loss entry's cast keys); else the
+def side_stream_schedule(
+    plan: Plan, keys: tuple, dw_stream: Optional[Union[bool, str]] = None
+) -> Optional[tuple]:
+    """Side-stream placement of :func:`dw_side_stream` over a launch-key sequence under the ``dw_stream`` keyword (or
+    its mode; ``None`` = the ``auto`` rule): ``None`` when the plan has no ``dW``, the mode or the rule says no, or the
+    sequence has no per-chunk accumulate (the loss entry's cast keys); else the
     positions ``(joins, forks, sides)`` -- the first key of every chunk after the first and the first key after the last
     chunk's keys (the caller's stream waits for the side stream: the chunk buffer is about to be reused / read), each
     chunk's ``row_grad`` key (the fork event is recorded after it) and the per-chunk ``dW`` accumulate keys (launched
     on the side stream after it waited for the fork).  A deferred last chunk's cast GEMM and the flat casts stay on
     the caller's stream; the sequence always ends with a join."""
-    if not (plan.need_dw and dw_side_stream(plan.num_chunks)):
+    if not (plan.need_dw and dw_side_stream(plan.num_chunks, dw_stream)):
         return None
     chunk_keys = [
         (pos, stage, index)
@@ -2729,12 +2733,17 @@ def side_stream_schedule(plan: Plan, keys: tuple) -> Optional[tuple]:
 
 
 def _run_keys(
-    plan: Plan, device_index: int, keys: tuple, run_key: Callable[[Any], None]
+    plan: Plan,
+    device_index: int,
+    keys: tuple,
+    run_key: Callable[[Any], None],
+    dw_stream: Optional[Union[bool, str]] = None,
 ) -> None:
-    """Run the launch keys in order on the caller's stream; with the placement of :func:`side_stream_schedule` the
-    per-chunk ``dW`` accumulates go to the side stream.  The generated launches take tvm-ffi's environment stream, so a
-    side launch enters its own stream context and the caller's context is re-entered afterwards (no nesting)."""
-    schedule = side_stream_schedule(plan, keys)
+    """Run the launch keys in order on the caller's stream; with the placement of :func:`side_stream_schedule` under
+    ``dw_stream`` the per-chunk ``dW`` accumulates go to the side stream.  The generated launches take tvm-ffi's
+    environment stream, so a side launch enters its own stream context and the caller's context is re-entered afterwards
+    (no nesting)."""
+    schedule = side_stream_schedule(plan, keys, dw_stream)
     if schedule is None:
         with _ffi_stream_context(device_index):
             for key in keys:
@@ -3333,6 +3342,11 @@ class LmHeadLossRunner:
     forms (:meth:`scatter` restores ``[T]``), ``dlogp`` stays the caller's
     ``[T]`` tensor (gathered per step).  Label values decide the compaction,
     so a runner must be re-prepared when the set of ignored rows changes.
+
+    ``dw_stream`` is the mode of the dW side stream the launches use (:func:`dw_stream_mode`: ``"auto"`` = the
+    :data:`DW_STREAM_MIN_CHUNKS` rule, ``"1"`` every multi-chunk call, ``"0"`` never; the ``dw_stream`` keyword of
+    :func:`prepare_lm_head_loss`); it may be reassigned between steps (a CUDA graph records the mode it was captured
+    under).
     """
 
     backend: str
@@ -3348,6 +3362,7 @@ class LmHeadLossRunner:
     layout: dict = field(default_factory=dict, repr=False)
     memory: dict = field(default_factory=dict, repr=False)
     engine: Optional[ReferenceEngine] = field(default=None, repr=False)
+    dw_stream: str = "auto"
     _tma_prepared: bool = False
 
     @property
@@ -3425,7 +3440,7 @@ class LmHeadLossRunner:
                 else:
                     self.launches[key]()
 
-            _run_keys(self.plan, self.device_index, keys, run_key)
+            _run_keys(self.plan, self.device_index, keys, run_key, self.dw_stream)
         else:
             for key in keys:
                 host = HOST_STAGES.get(key[0])
@@ -3573,6 +3588,7 @@ def prepare_lm_head_loss(
     gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
     dx_finalize: Optional[bool] = None,
     dx_cast: bool = True,
+    dw_stream: Optional[Union[bool, str]] = None,
 ) -> LmHeadLossRunner:
     """Validate one binding and prepare its launches.
 
@@ -3611,6 +3627,12 @@ def prepare_lm_head_loss(
     ``dx_acc`` for the caller to finalize (:func:`finalize_dx`: the fused dX
     finalize of a compacted :func:`backward_logprob`); ``dx_out`` is then
     neither bound nor allocated.
+
+    ``dw_stream`` (default ``None`` = ``"auto"``, :func:`dw_stream_mode`): the
+    dW side stream of the runner's launches -- ``None`` / ``"auto"`` for plans
+    of :data:`DW_STREAM_MIN_CHUNKS` chunks or more, ``True`` for every
+    multi-chunk plan, ``False`` never (bitwise the same outputs; the runner's
+    ``dw_stream`` attribute holds the mode).
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
@@ -3618,6 +3640,7 @@ def prepare_lm_head_loss(
     record = None
     module_name = None
     tuning = _resolve_gemm_tuning(gemm_tuning)
+    stream_mode = dw_stream_mode(dw_stream)
     if backend == "cake":
         if not X.is_cuda:
             raise ValueError("the cake backend needs CUDA tensors")
@@ -3879,6 +3902,7 @@ def prepare_lm_head_loss(
         layout=layout,
         memory=memory,
         engine=engine,
+        dw_stream=stream_mode,
     )
 
 
@@ -3886,26 +3910,7 @@ def prepare_lm_head_loss(
 # Binding cache of the eager entry points (cake backend)
 # ---------------------------------------------------------------------------
 
-BINDING_CACHE_ENV = (
-    "FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE"  # "0" disables the cache at import
-)
-BINDING_CACHE_CAPACITY_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY"
-BINDING_CACHE_DEFAULT_CAPACITY = 64
-
-
-def binding_cache_capacity() -> int:
-    raw = os.environ.get(BINDING_CACHE_CAPACITY_ENV)
-    if raw is None or not raw.strip():
-        return BINDING_CACHE_DEFAULT_CAPACITY
-    try:
-        capacity = int(raw)
-    except ValueError:
-        capacity = 0
-    if capacity < 1:
-        raise ValueError(
-            f"{BINDING_CACHE_CAPACITY_ENV} must be a positive integer, got {raw!r}"
-        )
-    return capacity
+BINDING_CACHE_DEFAULT_CAPACITY = 64  # bindings :data:`BINDING_CACHE` keeps by default (:meth:`BindingCache.configure`)
 
 
 def _meta(t: Optional[torch.Tensor]):
@@ -3940,7 +3945,7 @@ def forward_binding_key(
     input plus every option that shapes the argument plans; ``valid_rows`` is the
     compacted row count (a label-dependent fact of the plan; ``None`` = uncompacted);
     ``fuse_dw_cast`` the resolved weight-gradient form; ``gemm_tuning`` the explicit
-    GEMM knobs (``None`` = the environment's, :func:`gemm_tuning_default`);
+    GEMM knobs (``None`` = none, :func:`gemm_tuning_default`);
     ``dx_finalize`` the resolved dX finalize form (the slab reduction's launches differ);
     ``hidden_count`` whether chunk 0's gather and logits GEMM ran before the plan
     (the remembered sequence starts at chunk 0's row kernels)."""
@@ -4143,7 +4148,7 @@ class _Binding:
         if plan.compact:
             t["row_index"] = row_index
 
-    def _launch(self, keys: tuple, t: dict[str, Any]) -> None:
+    def _launch(self, keys: tuple, t: dict[str, Any], dw_stream: str = "auto") -> None:
         def run_key(key) -> None:
             host = HOST_STAGES.get(key[0])
             if host is not None:
@@ -4157,11 +4162,21 @@ class _Binding:
                 launch.prepare(*arguments)
             launch.entry(*arguments)
 
-        _run_keys(self.plan, self.device_index, keys, run_key)
+        _run_keys(self.plan, self.device_index, keys, run_key, dw_stream)
 
     def forward(
-        self, X, W, labels, infer_logp, loss_weights, row_index=None, hidden=None
+        self,
+        X,
+        W,
+        labels,
+        infer_logp,
+        loss_weights,
+        row_index=None,
+        hidden=None,
+        dw_stream: str = "auto",
     ):
+        """One forward through the remembered launches; ``dw_stream`` is the call's dW side-stream mode
+        (:func:`dw_stream_mode`), a launch placement outside the binding."""
         p, plan = self.plan.problem, self.plan
         T, H, V = (
             plan.rows,
@@ -4201,7 +4216,7 @@ class _Binding:
                 t["dw_acc"] = torch.empty(
                     (V, H), dtype=torch.float32, device=self.device
                 )
-        self._launch(self.forward_order, t)
+        self._launch(self.forward_order, t, dw_stream)
         if p.entry == "loss":
             return (
                 t["loss"],
@@ -4212,7 +4227,17 @@ class _Binding:
             )
         return t["logp"], t["lse"]
 
-    def backward_logprob(self, X, W, labels, lse, dlogp, row_index=None, hidden=None):
+    def backward_logprob(
+        self,
+        X,
+        W,
+        labels,
+        lse,
+        dlogp,
+        row_index=None,
+        hidden=None,
+        dw_stream: str = "auto",
+    ):
         p, plan = self.plan.problem, self.plan
         T, H, V = plan.rows, p.hidden, p.vocab
         self._check_hidden(hidden)
@@ -4241,7 +4266,7 @@ class _Binding:
                     (V, H), dtype=torch.float32, device=self.device
                 )
             t["dw_out"] = torch.empty((V, H), dtype=torch.bfloat16, device=self.device)
-        self._launch(self.backward_order, t)
+        self._launch(self.backward_order, t, dw_stream)
         dx = (
             t.get("dx_out") if plan.dx_cast else t.get("dx_acc")
         )  # dx_cast=False: the caller finalizes the accumulator
@@ -4267,18 +4292,43 @@ def _deferred_operands(plan: Plan, t: dict[str, Any]) -> tuple:
 
 
 class BindingCache:
-    """Remembered input bindings of the eager entry points (least recently used, bounded)."""
+    """Remembered input bindings of the eager entry points (least recently used, bounded).
+
+    ``capacity`` (default :data:`BINDING_CACHE_DEFAULT_CAPACITY`, 64 bindings) bounds what is kept; ``enabled=False``
+    bypasses the cache (every call validates and binds).  :meth:`configure` changes both at runtime."""
 
     def __init__(self, capacity: Optional[int] = None, enabled: bool = True):
-        self.capacity = binding_cache_capacity() if capacity is None else int(capacity)
-        if self.capacity < 1:
-            raise ValueError(
-                "BindingCache needs a capacity of at least one binding (use enabled=False to bypass it)"
-            )
-        self.enabled = bool(enabled)
+        self.capacity = BINDING_CACHE_DEFAULT_CAPACITY
+        self.enabled = True
         self.hits = 0
         self.misses = 0
         self._bindings: OrderedDict[tuple, _Binding] = OrderedDict()
+        self.configure(enabled=enabled, capacity=capacity)
+
+    def configure(
+        self, *, enabled: Optional[bool] = None, capacity: Optional[int] = None
+    ) -> "BindingCache":
+        """Apply ``capacity`` (a positive integer; the least recently used bindings above it are evicted) and / or
+        ``enabled`` (``False`` bypasses the cache and drops the remembered bindings); ``None`` leaves a setting as it
+        is.  Returns the cache."""
+        if capacity is not None:
+            if (
+                isinstance(capacity, bool)
+                or not isinstance(capacity, int)
+                or capacity < 1
+            ):
+                raise ValueError(
+                    "BindingCache needs a capacity of at least one binding (a positive integer; use enabled=False "
+                    f"to bypass it), got {capacity!r}"
+                )
+            self.capacity = capacity
+            while len(self._bindings) > self.capacity:
+                self._bindings.popitem(last=False)
+        if enabled is not None:
+            self.enabled = bool(enabled)
+            if not self.enabled:
+                self._bindings.clear()
+        return self
 
     def __len__(self) -> int:
         return len(self._bindings)
@@ -4310,7 +4360,9 @@ class BindingCache:
         return binding
 
 
-BINDING_CACHE = BindingCache(enabled=os.environ.get(BINDING_CACHE_ENV, "1") != "0")
+# Enabled, 64 bindings.  ``flashinfer.chunked_lm_head`` applies its environment variables through
+# :meth:`BindingCache.configure` when it is imported; this module reads none.
+BINDING_CACHE = BindingCache()
 
 
 # ---------------------------------------------------------------------------
@@ -4348,6 +4400,8 @@ class ForwardResult:
     x_last: Optional[torch.Tensor] = None
     x_src: Optional[torch.Tensor] = None
     x_idx: Optional[torch.Tensor] = None
+    # the explicit GEMM knobs the forward ran with (``{}`` = none); the deferred weight gradient's GEMM takes its knobs
+    gemm_tuning: Optional[dict] = None
 
     def backward(self, grad=None, *, grad_weight_dtype=torch.bfloat16, backend=None):
         """``(dX, dW)`` of this forward through :func:`backward_loss` (``grad`` = the upstream scalar, ``None`` = 1)."""
@@ -4368,6 +4422,7 @@ class ForwardResult:
             x_src=self.x_src,
             x_idx=self.x_idx,
             row_valid=self.row_valid,
+            gemm_tuning=self.gemm_tuning,
         )
 
 
@@ -4379,8 +4434,13 @@ def _empty_forward(
     need_dw: bool,
     row_index: Optional[torch.Tensor] = None,
     row_valid: Optional[torch.Tensor] = None,
+    fuse_dw_cast: Optional[bool] = None,
+    dx_finalize: Optional[bool] = None,
 ) -> ForwardResult:
-    """Zeros without binding or launching: ``T == 0``, or every row ignored (``row_index`` empty)."""
+    """Zeros without binding or launching: ``T == 0``, or every row ignored (``row_index`` empty).
+
+    ``fuse_dw_cast`` / ``dx_finalize`` are the call's switches (``None`` = the documented default), so the memory
+    report records the form the caller asked for, as a launched call's would."""
     device = X.device
     T = int(problem.num_rows)
     memory = memory_report(
@@ -4394,6 +4454,8 @@ def _empty_forward(
         grad_weight_dtype=problem.grad_weight_dtype,
         return_logp=True,
         valid_rows=None if row_index is None else 0,
+        fuse_dw_cast=fuse_dw_cast,
+        dx_finalize=dx_finalize,
     )
     zeros = torch.zeros((T,), dtype=torch.float32, device=device)
     if problem.entry == "loss":
@@ -4427,6 +4489,10 @@ def _resolve_compact(compact_rows) -> bool:
     return compact_rows_default() if compact_rows is None else bool(compact_rows)
 
 
+def _resolve_hidden_count(hidden_count) -> bool:
+    return hidden_count_default() if hidden_count is None else bool(hidden_count)
+
+
 def _hidden_count(
     problem: Problem,
     X: torch.Tensor,
@@ -4436,10 +4502,12 @@ def _hidden_count(
     backend: str,
     compact: bool,
     stats: bool,
+    hidden_count: bool,
 ) -> Optional[_HiddenCount]:
-    """The hidden valid-row count prologue of a compacted ``cake`` call when the switch is on and the call is eligible
-    (:func:`hidden_count_eligible`); ``None`` = the shipped :func:`valid_rows` path."""
-    if not (compact and backend == "cake" and hidden_count_default()):
+    """The hidden valid-row count prologue of a compacted ``cake`` call when the switch (``hidden_count``, resolved by
+    the caller) is on and the call is eligible (:func:`hidden_count_eligible`); ``None`` = the shipped
+    :func:`valid_rows` path."""
+    if not (compact and backend == "cake" and hidden_count):
         return None
     module_name, record = record_for(X.device, problem.hidden, problem.vocab)
     if not hidden_count_eligible(problem, X, record, module_name, stats=stats):
@@ -4466,6 +4534,10 @@ def forward_loss(
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
     fuse_dw_cast: Optional[bool] = None,
+    dx_finalize: Optional[bool] = None,
+    dw_stream: Optional[Union[bool, str]] = None,
+    hidden_count: Optional[bool] = None,
+    gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
 ) -> ForwardResult:
     """Forward of the loss entry: ``loss`` (FP32 scalar), ``logp`` (FP32 ``[T]``) and the
     FP32 gradient accumulators ``dx_acc`` / ``dw_acc`` of the trainable inputs.
@@ -4483,10 +4555,17 @@ def forward_loss(
     the last chunk's weight-gradient GEMM is deferred to :func:`backward_loss`
     (``dw_acc`` holds the chunks before it, ``None`` for a one-chunk call; the
     result carries that chunk's operands ``dz_last`` / ``x_last`` / ``x_src`` /
-    ``x_idx``).  The fused dX finalize (:func:`dx_finalize_default`, read once
-    here) adds a sliced dX GEMM's slabs with the ``slab_sum`` kernel and, on a
-    compacted call, keeps the valid-row mask (``row_valid``) for
-    :func:`backward_loss`'s one-pass scatter of ``dX``.
+    ``x_idx``).  ``dx_finalize`` (default :func:`dx_finalize_default`, resolved
+    once here) adds a sliced dX GEMM's slabs with the ``slab_sum`` kernel and, on
+    a compacted call, keeps the valid-row mask (``row_valid``) for
+    :func:`backward_loss`'s one-pass scatter of ``dX``.  ``dw_stream`` (default
+    ``None`` = ``"auto"``, :func:`dw_stream_mode`) places each chunk's
+    weight-gradient accumulate on the per-device side stream (``True`` every
+    multi-chunk call, ``False`` never, ``"auto"`` calls of
+    :data:`DW_STREAM_MIN_CHUNKS` chunks or more).  ``hidden_count`` (default
+    :func:`hidden_count_default`) runs a compacted call's valid-row count on the
+    device.  ``gemm_tuning`` (default :func:`gemm_tuning_default`) pins GEMM
+    knobs explicitly; the result carries it for the deferred weight gradient.
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
@@ -4503,15 +4582,31 @@ def forward_loss(
         deterministic=deterministic,
         entry="loss",
     )
+    stream_mode = dw_stream_mode(dw_stream)
+    tuning = _resolve_gemm_tuning(gemm_tuning)
     T = problem.num_rows
     if T == 0:
-        return _empty_forward(problem, X, need_dx=need_dx, need_dw=need_dw)
+        return _empty_forward(
+            problem,
+            X,
+            need_dx=need_dx,
+            need_dw=need_dw,
+            fuse_dw_cast=fuse_dw_cast,
+            dx_finalize=dx_finalize,
+        )
     fused_dx = bool(
-        need_dx and dx_finalize_default()
-    )  # read once per call; the backward follows it through row_valid
+        need_dx and _resolve_dx_finalize(dx_finalize)
+    )  # resolved once per call; the backward follows it through row_valid
     compact = _resolve_compact(compact_rows)
     hc = _hidden_count(
-        problem, X, W, labels, backend=backend, compact=compact, stats=True
+        problem,
+        X,
+        W,
+        labels,
+        backend=backend,
+        compact=compact,
+        stats=True,
+        hidden_count=_resolve_hidden_count(hidden_count),
     )
     if hc is not None:
         # the hidden valid-row count: chunk 0's gather and logits GEMM are queued; the count arrives through the pinned cell
@@ -4529,6 +4624,8 @@ def forward_loss(
             need_dw=need_dw,
             row_index=row_index,
             row_valid=row_valid,
+            fuse_dw_cast=fuse_dw_cast,
+            dx_finalize=fused_dx,
         )
     valid_count = None if row_index is None else int(row_index.numel())
     fuse = bool(need_dw and _resolve_fuse(fuse_dw_cast))
@@ -4552,6 +4649,7 @@ def forward_loss(
             entry="loss",
             valid_rows=valid_count,
             fuse_dw_cast=fuse,
+            gemm_tuning=tuning,
             dx_finalize=fused_dx,
             hidden_count=hc is not None,
             **common,
@@ -4559,7 +4657,7 @@ def forward_loss(
         binding = cache.lookup(key)
         if binding is not None:
             loss, logp, dx_acc, dw_acc, deferred = binding.forward(
-                X, W, labels, infer_logp, loss_weights, row_index, hc
+                X, W, labels, infer_logp, loss_weights, row_index, hc, stream_mode
             )
             dz_last, x_last, x_src, x_idx = deferred
             return ForwardResult(
@@ -4576,6 +4674,7 @@ def forward_loss(
                 x_last=x_last,
                 x_src=x_src,
                 x_idx=x_idx,
+                gemm_tuning=tuning,
             )
     runner = prepare_lm_head_loss(
         X,
@@ -4586,7 +4685,9 @@ def forward_loss(
         backend=backend,
         compact_rows=False if row_index is None else row_index,
         fuse_dw_cast=fuse,
+        gemm_tuning=tuning,
         dx_finalize=fused_dx,
+        dw_stream=stream_mode,
         **common,
     )
     if backend == "cake":
@@ -4599,7 +4700,7 @@ def forward_loss(
         if key is not None:
             cache.remember(key, binding)
         loss, logp, dx_acc, dw_acc, deferred = binding.forward(
-            X, W, labels, infer_logp, loss_weights, row_index, hc
+            X, W, labels, infer_logp, loss_weights, row_index, hc, stream_mode
         )
         memory = binding.memory
     else:
@@ -4622,6 +4723,7 @@ def forward_loss(
         x_last=x_last,
         x_src=x_src,
         x_idx=x_idx,
+        gemm_tuning=tuning,
     )
 
 
@@ -4806,7 +4908,7 @@ def finalize_dx(
     (``row_index`` None): :func:`scale_cast`, already one pass over every row.  Compacted rows with the forward's
     valid-row mask (``row_valid``: the fused dX finalize): the inclusive int32 scan -- one ``cumsum``, issued here
     behind the backward's queued GEMMs -- and one :func:`scale_cast_scatter` launch.  Compacted rows without the mask
-    (the forward ran with ``FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE=0``): the flat cast, then :func:`scatter_rows`
+    (the forward ran with ``dx_finalize=False``): the flat cast, then :func:`scatter_rows`
     (zero fill + ``index_copy_``).  All three produce the same bits."""
     if row_index is None:
         return scale_cast(acc, grad, torch.bfloat16, backend=backend)
@@ -4834,11 +4936,14 @@ def dw_cast(
     out_dtype: torch.dtype,
     *,
     backend: str = "cake",
+    gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
 ) -> torch.Tensor:
     """The deferred last chunk's weight gradient as a new tensor: ``cast(g * (dw_acc + dz_last^T @ x_rows))``, or
     ``cast(g * dz_last^T @ x_rows)`` when ``dw_acc`` is ``None`` (a one-chunk call), through the fused GEMM
     (:data:`DW_CAST_STAGES`); ``dw_acc`` is read, never written (repeatable).  ``dz_last`` BF16 ``[rows, V]``
-    contiguous, ``x_rows`` BF16 ``[rows, H]`` with a 16-byte row pitch (else copied), ``g`` = ``grad`` (``None`` = 1)."""
+    contiguous, ``x_rows`` BF16 ``[rows, H]`` with a 16-byte row pitch (else copied), ``g`` = ``grad`` (``None`` = 1).
+    ``gemm_tuning`` (default :func:`gemm_tuning_default`): the call's explicit GEMM knobs, whose ``dw`` entry pins this
+    GEMM's form (the forward's knobs, ``ForwardResult.gemm_tuning``)."""
     if out_dtype not in GRAD_WEIGHT_DTYPES:
         raise ValueError("the cast produces bfloat16 or float32")
     if (
@@ -4885,7 +4990,7 @@ def dw_cast(
     # the last chunk's form and scalars: the raster / block rules of the record's architecture on this chunk's rows, or
     # the explicit knobs (the block rule and knob apply to the fp32 cast only; the bf16 cast keeps the 1-D raster)
     fp32 = out_dtype == torch.float32
-    dw_tuning = _resolve_gemm_tuning(None).get("dw", {})
+    dw_tuning = _resolve_gemm_tuning(gemm_tuning).get("dw", {})
     raster = raster_variant(H, int(rows), record["arch"])
     group_m = (
         dw_tuning["group_m"]
@@ -4964,6 +5069,7 @@ def backward_loss(
     x_src: Optional[torch.Tensor] = None,
     x_idx: Optional[torch.Tensor] = None,
     row_valid: Optional[torch.Tensor] = None,
+    gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Backward of the loss entry from the saved accumulators: ``(dX, dW)`` = ``bf16(g * dX_acc)``,
     ``cast(g * dW_acc)``; the accumulators are read, never written (repeatable).  A compacted forward
@@ -4974,7 +5080,9 @@ def backward_loss(
     :meth:`ForwardResult.backward` passes everything.  ``row_valid`` (``ForwardResult.row_valid``, the
     valid-row mask of a compacted forward that ran with the fused dX finalize) selects the one-pass
     scale-cast-scatter of the compact rows (:func:`finalize_dx`); without it the compact rows are cast,
-    then scattered into a zero BF16 ``[T, H]``.  Both give the same bits."""
+    then scattered into a zero BF16 ``[T, H]``.  Both give the same bits.  ``gemm_tuning`` (default
+    :func:`gemm_tuning_default`; ``ForwardResult.gemm_tuning``): the forward's explicit GEMM knobs, which pin the
+    deferred weight-gradient GEMM's form (:func:`dw_cast`)."""
     dx = None
     if dx_acc is not None:
         if row_index is not None and num_rows is None:
@@ -4991,7 +5099,15 @@ def backward_loss(
             x_last = torch.index_select(
                 x_src, 0, x_idx
             )  # the compacted chunk's rows, gathered again
-        dw = dw_cast(dz_last, x_last, dw_acc, grad, grad_weight_dtype, backend=backend)
+        dw = dw_cast(
+            dz_last,
+            x_last,
+            dw_acc,
+            grad,
+            grad_weight_dtype,
+            backend=backend,
+            gemm_tuning=gemm_tuning,
+        )
     else:
         dw = (
             None
@@ -5010,9 +5126,14 @@ def forward_logprob(
     deterministic: bool = True,
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
+    hidden_count: Optional[bool] = None,
+    gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
 ) -> ForwardResult:
     """Forward of the log-probability entry: ``logp`` (FP32 ``[T]``, 0 on ignored rows) plus the saved statistic
-    ``lse`` (compacted: the ``[T_v]`` rows of ``row_index``, exactly what :func:`backward_logprob` expects back)."""
+    ``lse`` (compacted: the ``[T_v]`` rows of ``row_index``, exactly what :func:`backward_logprob` expects back).
+    ``compact_rows`` (default :func:`compact_rows_default`), ``hidden_count`` (default :func:`hidden_count_default`)
+    and ``gemm_tuning`` (default :func:`gemm_tuning_default`) as in :func:`forward_loss`; this forward has no weight
+    gradient, so it takes no ``fuse_dw_cast`` / ``dx_finalize`` / ``dw_stream``."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     problem = validate_lm_head_inputs(
@@ -5023,12 +5144,20 @@ def forward_logprob(
         deterministic=deterministic,
         entry="logprob",
     )
+    tuning = _resolve_gemm_tuning(gemm_tuning)
     T = problem.num_rows
     if T == 0:
         return _empty_forward(problem, X, need_dx=False, need_dw=False)
     compact = _resolve_compact(compact_rows)
     hc = _hidden_count(
-        problem, X, W, labels, backend=backend, compact=compact, stats=True
+        problem,
+        X,
+        W,
+        labels,
+        backend=backend,
+        compact=compact,
+        stats=True,
+        hidden_count=_resolve_hidden_count(hidden_count),
     )
     if hc is not None:
         row_index = hc.row_index()
@@ -5056,6 +5185,7 @@ def forward_logprob(
             grad_weight_dtype=torch.bfloat16,
             entry="logprob",
             valid_rows=valid_rows,
+            gemm_tuning=tuning,
             hidden_count=hc is not None,
         )
         binding = cache.lookup(key)
@@ -5081,6 +5211,7 @@ def forward_logprob(
         entry="logprob",
         backend=backend,
         compact_rows=False if row_index is None else row_index,
+        gemm_tuning=tuning,
     )
     if hc is not None:
         # the hidden valid-row count: chunk 0's logits already sit in the prologue's buffers, so the first call launches
@@ -5121,6 +5252,10 @@ def backward_logprob(
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
     fuse_dw_cast: Optional[bool] = None,
+    dx_finalize: Optional[bool] = None,
+    dw_stream: Optional[Union[bool, str]] = None,
+    hidden_count: Optional[bool] = None,
+    gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Backward of the log-probability entry: recompute each chunk's logits, ``dz = dlogp_t *
     (1[v = y_t] - softmax)`` (ignored rows zero), then ``dX`` (BF16) and ``dW`` (BF16) through
@@ -5129,7 +5264,11 @@ def backward_logprob(
     forward's), ``lse`` is then the forward's compact ``[T_v]`` statistic and ``dX`` comes back
     scattered to ``[T, H]``; every row ignored returns zeros without launching.  ``fuse_dw_cast``
     (default :func:`fuse_dw_cast_default`): the last chunk's weight-gradient GEMM writes the final BF16
-    ``dW`` from its epilogue (the scale is 1 here)."""
+    ``dW`` from its epilogue (the scale is 1 here).  ``dx_finalize`` (default :func:`dx_finalize_default`,
+    resolved once here): a compacted backward writes ``dX`` in one pass from the accumulator.  ``dw_stream``
+    (default ``None`` = ``"auto"``, :func:`dw_stream_mode`), ``hidden_count`` (default
+    :func:`hidden_count_default`) and ``gemm_tuning`` (default :func:`gemm_tuning_default`) as in
+    :func:`forward_loss`."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     problem = validate_lm_head_inputs(
@@ -5140,13 +5279,24 @@ def backward_logprob(
         deterministic=deterministic,
         entry="logprob",
     )
+    stream_mode = dw_stream_mode(dw_stream)
+    tuning = _resolve_gemm_tuning(gemm_tuning)
     if not (need_dx or need_dw):
         return None, None
     T, H, V = problem.num_rows, problem.hidden, problem.vocab
-    fused_dx = bool(need_dx and dx_finalize_default())  # read once per call
+    fused_dx = bool(
+        need_dx and _resolve_dx_finalize(dx_finalize)
+    )  # resolved once per call
     compact = bool(T and _resolve_compact(compact_rows))
     hc = _hidden_count(
-        problem, X, W, labels, backend=backend, compact=compact, stats=False
+        problem,
+        X,
+        W,
+        labels,
+        backend=backend,
+        compact=compact,
+        stats=False,
+        hidden_count=_resolve_hidden_count(hidden_count),
     )
     if hc is not None:
         # the hidden valid-row count: chunk 0's gather and its recompute GEMM (no statistics) are queued
@@ -5195,12 +5345,15 @@ def backward_logprob(
             need_dw=need_dw,
             valid_rows=valid_count,
             fuse_dw_cast=fuse,
+            gemm_tuning=tuning,
             dx_finalize=fused_dx,
             hidden_count=hc is not None,
         )
         binding = cache.lookup(key)
         if binding is not None:
-            dx, dw = binding.backward_logprob(X, W, labels, lse, dlogp, row_index, hc)
+            dx, dw = binding.backward_logprob(
+                X, W, labels, lse, dlogp, row_index, hc, stream_mode
+            )
             return finish_dx(dx), dw
     runner = prepare_lm_head_loss(
         X,
@@ -5216,15 +5369,19 @@ def backward_logprob(
         backend=backend,
         compact_rows=False if row_index is None else row_index,
         fuse_dw_cast=fuse,
+        gemm_tuning=tuning,
         dx_finalize=fused_dx,
         dx_cast=dx_cast,
+        dw_stream=stream_mode,
     )
     if hc is not None:
         binding = _Binding.from_runner(runner, hc)
         del runner
         if key is not None:
             cache.remember(key, binding)
-        dx, dw = binding.backward_logprob(X, W, labels, lse, dlogp, row_index, hc)
+        dx, dw = binding.backward_logprob(
+            X, W, labels, lse, dlogp, row_index, hc, stream_mode
+        )
         return finish_dx(dx), dw
     dx, dw = runner.backward()
     if key is not None:
@@ -5257,6 +5414,10 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
         backend,
         compact_rows,
         fuse_dw_cast,
+        dx_finalize,
+        dw_stream,
+        hidden_count,
+        gemm_tuning,
     ):
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
         result = forward_loss(
@@ -5275,6 +5436,10 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
             backend=backend,
             compact_rows=compact_rows,
             fuse_dw_cast=fuse_dw_cast,
+            dx_finalize=dx_finalize,
+            dw_stream=dw_stream,
+            hidden_count=hidden_count,
+            gemm_tuning=gemm_tuning,
         )
         ctx.set_materialize_grads(False)
         ctx.dx_acc, ctx.dw_acc = (
@@ -5295,6 +5460,8 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
         )  # the fused dX finalize's valid-row mask (None otherwise)
         ctx.grad_weight_dtype = grad_weight_dtype
         ctx.backend = backend
+        # the forward's resolved GEMM knobs: the deferred weight-gradient GEMM takes them
+        ctx.gemm_tuning = result.gemm_tuning
         ctx.empty = X.shape[0] == 0 or (
             result.row_index is not None and result.row_index.numel() == 0
         )
@@ -5303,7 +5470,7 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_loss, grad_logp=None):
-        none = (None,) * 14
+        none = (None,) * 18
         if grad_loss is None:
             return none
         if ctx.empty:  # T == 0 or every row ignored: zero gradients without binding or launching a program
@@ -5340,6 +5507,7 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
             x_src=x_src,
             x_idx=x_idx,
             row_valid=ctx.row_valid,
+            gemm_tuning=ctx.gemm_tuning,
         )
         return (dx, dw) + none[2:]
 
@@ -5358,10 +5526,19 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
         backend,
         compact_rows,
         fuse_dw_cast,
+        dx_finalize,
+        dw_stream,
+        hidden_count,
+        gemm_tuning,
     ):
-        compact = _resolve_compact(
-            compact_rows
-        )  # resolved once: the backward recomputes the same valid-row index
+        # every switch is resolved (and validated) once here, before any launch: the backward recomputes the same
+        # valid-row index under the same switches, the forward and the backward bind with the same GEMM knobs
+        compact = _resolve_compact(compact_rows)
+        fuse = _resolve_fuse(fuse_dw_cast)
+        fused_dx = _resolve_dx_finalize(dx_finalize)
+        stream_mode = dw_stream_mode(dw_stream)
+        hidden = _resolve_hidden_count(hidden_count)
+        tuning = _resolve_gemm_tuning(gemm_tuning)
         result = forward_logprob(
             X,
             W,
@@ -5370,6 +5547,8 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
             deterministic=deterministic,
             backend=backend,
             compact_rows=compact,
+            hidden_count=hidden,
+            gemm_tuning=tuning,
         )
         ctx.set_materialize_grads(False)
         ctx.save_for_backward(X, W, labels, result.lse)
@@ -5379,13 +5558,17 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
             backend,
             compact,
         )
-        ctx.fuse_dw_cast = _resolve_fuse(fuse_dw_cast)
+        ctx.fuse_dw_cast = fuse
+        ctx.dx_finalize = fused_dx
+        ctx.dw_stream = stream_mode
+        ctx.hidden_count = hidden
+        ctx.gemm_tuning = tuning
         return result.logp
 
     @staticmethod
     def backward(ctx, dlogp):
         if dlogp is None:
-            return (None,) * 8
+            return (None,) * 12
         X, W, labels, lse = ctx.saved_tensors
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
         dx, dw = backward_logprob(
@@ -5401,8 +5584,12 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
             backend=ctx.backend,
             compact_rows=ctx.compact,
             fuse_dw_cast=ctx.fuse_dw_cast,
+            dx_finalize=ctx.dx_finalize,
+            dw_stream=ctx.dw_stream,
+            hidden_count=ctx.hidden_count,
+            gemm_tuning=ctx.gemm_tuning,
         )
-        return (dx, dw) + (None,) * 6
+        return (dx, dw) + (None,) * 10
 
 
 def chunked_lm_head_loss(
@@ -5421,6 +5608,10 @@ def chunked_lm_head_loss(
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
     fuse_dw_cast: Optional[bool] = None,
+    dx_finalize: Optional[bool] = None,
+    dw_stream: Optional[Union[bool, str]] = None,
+    hidden_count: Optional[bool] = None,
+    gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
 ):
     """Differentiable chunked LM-head + loss (see the module docstring); returns the FP32 scalar
     ``loss`` and, with ``return_logp``, the detached FP32 ``logp [T]``.
@@ -5430,16 +5621,33 @@ def chunked_lm_head_loss(
     this entry through ``W.grad`` for a BF16 ``W``.  Use ``forward_loss(...,
     need_dw=True)`` + ``backward_loss(dx_acc, dw_acc, g, grad_weight_dtype=
     torch.float32, row_index=result.row_index, num_rows=result.num_rows)`` for
-    an FP32 weight gradient.  ``compact_rows`` (default
-    :func:`compact_rows_default`): chunk over the valid rows only; the ``dX``
-    rows of ignored tokens are exact zeros either way.  ``fuse_dw_cast`` (default
-    :func:`fuse_dw_cast_default`): the last chunk's weight-gradient GEMM runs in
-    the backward with the upstream scale and the cast fused into its epilogue
-    (bitwise the same ``dW``, one pass over ``dW`` fewer; a one-chunk call
-    keeps no FP32 ``dW`` accumulator).  The fused dX finalize
-    (``FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE``, on unless ``0``) adds a
-    sliced dX GEMM's slabs with one kernel and writes a compacted call's
-    ``[T, H]`` ``dX`` in one pass (bitwise the same ``dX``).
+    an FP32 weight gradient.
+
+    The switches, each a keyword whose ``None`` (the default) selects the
+    documented default -- this module reads no environment variable:
+
+    * ``compact_rows`` (default ``True``, :func:`compact_rows_default`): chunk
+      over the valid rows only; the ``dX`` rows of ignored tokens are exact
+      zeros either way.
+    * ``fuse_dw_cast`` (default ``True``, :func:`fuse_dw_cast_default`): the last
+      chunk's weight-gradient GEMM runs in the backward with the upstream scale
+      and the cast fused into its epilogue (bitwise the same ``dW``, one pass
+      over ``dW`` fewer; a one-chunk call keeps no FP32 ``dW`` accumulator).
+    * ``dx_finalize`` (default ``True``, :func:`dx_finalize_default`): a sliced
+      dX GEMM's slabs are added with one kernel and a compacted call's
+      ``[T, H]`` ``dX`` is written in one pass (bitwise the same ``dX``).
+    * ``dw_stream`` (default ``None`` = ``"auto"``, :func:`dw_stream_mode`):
+      each chunk's weight-gradient accumulate GEMM on the per-device side
+      stream -- ``"auto"`` for calls of :data:`DW_STREAM_MIN_CHUNKS` chunks or
+      more, ``True`` every multi-chunk call, ``False`` never (bitwise the same
+      outputs).
+    * ``hidden_count`` (default ``True``, :func:`hidden_count_default`): a
+      compacted call counts its valid rows on the device and queues chunk 0's
+      gather and logits GEMM before the count reaches the host (bitwise the
+      same outputs).
+    * ``gemm_tuning`` (default ``None`` = ``{}``, :func:`gemm_tuning_default`):
+      explicit per-GEMM knobs, e.g. ``{"dx": {"tile_n": 256}}``, winning over
+      the per-chunk rules for the knobs they name.
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
@@ -5466,6 +5674,10 @@ def chunked_lm_head_loss(
         backend,
         compact_rows,
         fuse_dw_cast,
+        dx_finalize,
+        dw_stream,
+        hidden_count,
+        gemm_tuning,
     )
     return (loss, logp.detach()) if return_logp else loss
 
@@ -5480,9 +5692,15 @@ def chunked_lm_head_logprob(
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
     fuse_dw_cast: Optional[bool] = None,
+    dx_finalize: Optional[bool] = None,
+    dw_stream: Optional[Union[bool, str]] = None,
+    hidden_count: Optional[bool] = None,
+    gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
 ) -> torch.Tensor:
-    """Differentiable FP32 ``logp [T]`` (0 on ignored rows) for arbitrary downstream losses;
-    ``compact_rows`` / ``fuse_dw_cast`` as in :func:`chunked_lm_head_loss`."""
+    """Differentiable FP32 ``logp [T]`` (0 on ignored rows) for arbitrary downstream losses.  The switches
+    ``compact_rows`` / ``fuse_dw_cast`` / ``dx_finalize`` / ``dw_stream`` / ``hidden_count`` / ``gemm_tuning`` and
+    their defaults (``None`` = the documented default) as in :func:`chunked_lm_head_loss`; every switch is resolved
+    once in the forward and the backward recomputes under the same values."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     return ChunkedLmHeadLogprobFunction.apply(
@@ -5494,4 +5712,8 @@ def chunked_lm_head_logprob(
         backend,
         compact_rows,
         fuse_dw_cast,
+        dx_finalize,
+        dw_stream,
+        hidden_count,
+        gemm_tuning,
     )

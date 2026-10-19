@@ -77,10 +77,22 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
     return u;
 }
 
+// Shared by every record that names this translation unit in its sources: the record's
+// compile_flags select the lever arms below (-DCAKE_LEVER_DPF=<n>; the guarded defaults are this
+// file's own values) and rename the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>; every
+// JIT library of the family exports a distinct kernel); the defaults name this file's own
+// program.
+#ifndef CAKE_LEVER_DPF
+#define CAKE_LEVER_DPF 0
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_kimi_k3_fp8_projection_88eaaccbac79ef8cf184
+#endif
+
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_kimi_k3_fp8_projection_88eaaccbac79ef8cf184(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap SFW, const __grid_constant__ CUtensorMap SFX, __nv_bfloat16* __restrict__ out, float* __restrict__ partials, unsigned int* __restrict__ counters, int M, int n_tiles, int n_valid, int ldo, int num_k_iters, int sf_k_tiles, int split, int tok_per_cta, int total_work, int store_vec, __nv_bfloat16* __restrict__ x, int K, const __grid_constant__ CUtensorMap XB)
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap SFW, const __grid_constant__ CUtensorMap SFX, __nv_bfloat16* __restrict__ out, float* __restrict__ partials, unsigned int* __restrict__ counters, int M, int n_tiles, int n_valid, int ldo, int num_k_iters, int sf_k_tiles, int split, int tok_per_cta, int total_work, int store_vec, __nv_bfloat16* __restrict__ x, int K, const __grid_constant__ CUtensorMap XB)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -130,6 +142,13 @@ kernel_cake_kimi_k3_fp8_projection_88eaaccbac79ef8cf184(const __grid_constant__ 
     const int smem_sfxres1_addr = smem + SMEM_SMEM_SFXRES1_OFF;
     uint8_t* smem_epi = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_EPI_OFF);
     const int smem_epi_addr = smem + SMEM_SMEM_EPI_OFF;
+#if CAKE_LEVER_DPF == 1
+    asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&W))) : "memory");
+    asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&X))) : "memory");
+    asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&SFW))) : "memory");
+    asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&SFX))) : "memory");
+    asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&XB))) : "memory");
+#endif
 
     // Mbarrier init (5 pipeline groups, 0 ordered-sequence groups, 10 barriers)
     // Mbarriers at smem_raw[0..80)

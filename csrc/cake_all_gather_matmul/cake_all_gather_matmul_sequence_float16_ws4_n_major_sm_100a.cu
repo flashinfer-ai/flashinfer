@@ -18,8 +18,14 @@
 // 'float16_ws4_n_major_sm_100a': NVLink barrier, bridge event, per-peer push copies with a
 // per-chunk readiness epoch (or, for small padded M, the SM push kernel
 // chained to the barrier and the main kernel through programmatic dependent
-// launch), tcgen05 main kernel. The tensor-map encoders below are the
-// generated main launcher's; the kernels are the route's device units.
+// launch), tcgen05 main kernel. The main kernel computes 256-wide output
+// tiles; a class that ships the 128-wide twin (kHasMainN128) runs the twin
+// when the adapter's table-driven rule selects block_n = 128 for the call; a
+// class that ships the CTA-pair twin (kHasMainCg2: tcgen05.mma.cta_group::2
+// over a cluster of two CTAs) runs it, launched with the cluster-dimension
+// attribute on an even grid, when the rule selects main_cg2 = 1 for the call.
+// The tensor-map encoders below are the generated main launchers'; the
+// kernels are the route's device units.
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -45,6 +51,10 @@ extern "C" __global__ void kernel_cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9(
 extern "C" __global__ void kernel_cake_all_gather_matmul_8dea171063652cd775f8(
     int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int> pg_flags);
 extern "C" __global__ void kernel_cake_all_gather_matmul_40242e9c64d6e66af6f5(
+    unsigned int* __restrict__ inp, long long* __restrict__ payload_peers,
+    long long* __restrict__ signal_peers, unsigned int* __restrict__ counters,
+    unsigned int ready_target, int rank, int rows, int chunk_rows, int num_chunks);
+extern "C" __global__ void kernel_cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3(
     unsigned int* __restrict__ inp, long long* __restrict__ payload_peers,
     long long* __restrict__ signal_peers, unsigned int* __restrict__ counters,
     unsigned int ready_target, int rank, int rows, int chunk_rows, int num_chunks);
@@ -236,10 +246,62 @@ inline CUtensorMap EncodeTma_B(const TensorView& t) {
   return tm;
 }
 
+// Tensor-map encoders of the 128-wide main twin, which reads B through
+// n128::EncodeTma_B: its K-major B box differs from the N256 main's (64 x 128
+// rows); its N-major box is identical and keeps the one code path. A class
+// without the twin renders no n128 block, so n128 is opened first with a
+// using-directive nominating the sibling namespace n128_absent: qualified
+// lookup of n128::EncodeTma_B reaches that stand-in only when n128 itself
+// declares no EncodeTma_B, and no call reaches it (resolve_call admits
+// block_n = 128 only with the twin). A sibling rather than a nested namespace
+// because a using-directive shows the nominated names to unqualified lookup
+// as if declared in the nearest namespace enclosing both; from inside the
+// twin's block that is the sequence namespace, not n128, so an unqualified
+// EncodeTma_B(...) written there is never ambiguous with the twin's own.
+namespace n128_absent {
+inline CUtensorMap EncodeTma_B(const TensorView&) {
+  TVM_FFI_THROW(RuntimeError) << "this route ships no 128-wide main";
+  return CUtensorMap{};
+}
+}  // namespace n128_absent
+namespace n128 {
+using namespace n128_absent;
+}  // namespace n128
+
+// Tensor-map encoders of the CTA-pair main twin, which reads B through
+// cg2::EncodeTma_B (each CTA of the pair loads 128 B columns per stage, so its
+// K-major box is the 128-wide twin's 64 x 128; its N-major box is identical to
+// the N256 main's) and A through the N256 main's maps. Same stand-in pattern
+// as n128 above: a class without the twin renders no cg2 block, and no call
+// reaches the stand-in (resolve_call admits main_cg2 = 1 only with the twin).
+namespace cg2_absent {
+inline CUtensorMap EncodeTma_B(const TensorView&) {
+  TVM_FFI_THROW(RuntimeError) << "this route ships no CTA-pair main";
+  return CUtensorMap{};
+}
+}  // namespace cg2_absent
+namespace cg2 {
+using namespace cg2_absent;
+}  // namespace cg2
+
 constexpr int64_t kK = 8192;
 constexpr int64_t kBlockM = 128;
 constexpr int64_t kChunkRows = 2432;
 constexpr int64_t kBlockN = 256;
+// Whether the route class ships the 128-wide main twin: block_n = 128 is admitted
+// only then (N itself stays a multiple of kBlockN, the public contract).
+constexpr bool kHasMainN128 = false;
+// Whether the route class ships the CTA-pair twin of the N256 main: main_cg2 = 1 is
+// admitted only then, at block_n = kBlockN. The twin is launched with the cluster
+// dimensions of its source build (the pair) and, when the build asked for it, the
+// SPREAD cluster scheduling policy, on an even grid of at most two CTAs per pair tile.
+constexpr bool kHasMainCg2 = false;
+constexpr unsigned kMainCg2ClusterX = 1u;
+constexpr unsigned kMainCg2ClusterY = 1u;
+constexpr unsigned kMainCg2ClusterZ = 1u;
+constexpr bool kMainCg2Spread = false;
+static_assert(!kHasMainCg2 || (kMainCg2ClusterX == 2u && kMainCg2ClusterY == 1u && kMainCg2ClusterZ == 1u),
+              "the CTA-pair main launches clusters of two CTAs along x");
 // The main program is the arrival-ordered persistent schedule (one CTA per SM,
 // grid chosen by the API); both push transports land a peer's chunks in order,
 // so the remote tile order is peer-major (0).
@@ -253,11 +315,32 @@ constexpr int64_t kSmPushColsPerRow = 16;
 constexpr int64_t sm_push_max_cols(int64_t padded_rows) {
   return kSmPushColsIntercept - kSmPushColsPerRow * padded_rows;
 }
+// Per-architecture SM push bands of this sequence's world size (the exported route
+// table): a call of exactly kSmPushBandRows[i] padded rows with N <= kSmPushBandCols[i]
+// also takes the SM push route (a trailing 0 entry keeps an empty table well-formed).
+constexpr int kSmPushBandCount = 0;
+constexpr int64_t kSmPushBandRows[kSmPushBandCount + 1] = {0};
+constexpr int64_t kSmPushBandCols[kSmPushBandCount + 1] = {0};
+constexpr bool sm_push_band(int64_t padded_rows, int64_t cols) {
+  for (int i = 0; i < kSmPushBandCount; ++i) {
+    if (kSmPushBandRows[i] == padded_rows && cols <= kSmPushBandCols[i]) return true;
+  }
+  return false;
+}
+// The SM push route rule of this sequence (world size >= 4 is this module's kWorldSize):
+// the base rule or one of the bands; the Python backend selects the entry by the same rule
+// and RunPush refuses a call outside it.
+constexpr bool uses_sm_push(int64_t padded_rows, int64_t cols) {
+  return (padded_rows <= kSmPushMaxRows && cols <= sm_push_max_cols(padded_rows)) ||
+         sm_push_band(padded_rows, cols);
+}
 constexpr int64_t kWorldSize = 4;
 constexpr bool kMainBeforePushes = true;
 constexpr unsigned kBarrierThreads = 32u;
 constexpr unsigned kMainThreads = 192u;
 constexpr unsigned kMainDynamicSmem = 197632u;
+constexpr unsigned kMainN128DynamicSmem = 0u;
+constexpr unsigned kMainCg2DynamicSmem = 0u;
 
 // A tensor map is a pure function of the source's address, extents and
 // strides, so the encoder output is cached on that key: the bound weight and
@@ -348,35 +431,91 @@ inline void launch_barrier(int64_t phase, int32_t world, int32_t rank,
       << " barrier failed: " << cudaGetErrorString(status);
 }
 
-inline void launch_main(const CUtensorMap& a_local, const CUtensorMap& a_scratch,
-                        const CUtensorMap& b, void* c, void* scratch_payload,
-                        unsigned int* ready, uint32_t ready_target, int32_t rank, int32_t m,
-                        int32_t scratch_pitch, int32_t signal_rows, int32_t n_tiles,
-                        int32_t remote_order, dim3 grid, cudaStream_t stream,
-                        bool programmatic_launch) {
+// One main program of the route: the kernel computing BlockN-wide output tiles
+// and its dynamic smem footprint. The N256 main, its N128 twin and its CTA-pair
+// twin are distinct symbols with distinct footprints, so each instantiation
+// raises its own kernel's max dynamic smem attribute once (one function-local
+// flag per symbol; a flag shared by two would leave the second at the default
+// limit). For a class without a twin that twin's entry names the N256 main with
+// a 0-byte footprint and is never reached: it throws before its static would
+// lower that kernel's dynamic smem limit.
+struct MainProgram {
+  const void* kernel;
+  unsigned dynamic_smem;
+};
+
+template <int64_t BlockN, bool Cg2 = false>
+inline MainProgram main_program() {
+  static_assert(BlockN == kBlockN || BlockN == 128, "the route has 256- and 128-wide mains only");
+  static_assert(!Cg2 || BlockN == kBlockN, "the CTA-pair main exists at the public width only");
+  MainProgram program{};
+  if constexpr (Cg2) {
+    if constexpr (!kHasMainCg2) {
+      TVM_FFI_THROW(RuntimeError) << "this route ships no CTA-pair main";
+    }
+    program.kernel = reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_f0cbdce7150397ae0989);
+    program.dynamic_smem = kMainCg2DynamicSmem;
+  } else if constexpr (BlockN == 128) {
+    if constexpr (!kHasMainN128) {
+      TVM_FFI_THROW(RuntimeError) << "this route ships no 128-wide main";
+    }
+    program.kernel = reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_f0cbdce7150397ae0989);
+    program.dynamic_smem = kMainN128DynamicSmem;
+  } else {
+    program.kernel = reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_f0cbdce7150397ae0989);
+    program.dynamic_smem = kMainDynamicSmem;
+  }
+  static const bool smem_ready =
+      CakeSetMaxDynamicSmem(program.kernel, static_cast<int>(program.dynamic_smem));
+  (void)smem_ready;
+  return program;
+}
+
+inline void launch_main(const void* kernel, unsigned dynamic_smem, const CUtensorMap& a_local,
+                        const CUtensorMap& a_scratch, const CUtensorMap& b, void* c,
+                        void* scratch_payload, unsigned int* ready, uint32_t ready_target,
+                        int32_t rank, int32_t m, int32_t scratch_pitch, int32_t signal_rows,
+                        int32_t n_tiles, int32_t remote_order, dim3 grid, cudaStream_t stream,
+                        bool programmatic_launch, bool cluster_pair) {
   CUtensorMap p_a_local = a_local;
   CUtensorMap p_a_scratch = a_scratch;
   CUtensorMap p_b = b;
   void* kargs[] = {&p_a_local, &p_a_scratch, &p_b,          &c, &scratch_payload,
                    &ready,     &ready_target, &rank, &m, &scratch_pitch,
                    &signal_rows, &n_tiles, &remote_order};
-  static const bool smem_ready = CakeSetMaxDynamicSmem(
-      reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_f0cbdce7150397ae0989), static_cast<int>(kMainDynamicSmem));
-  (void)smem_ready;
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = dim3(kMainThreads, 1u, 1u);
-  config.dynamicSmemBytes = kMainDynamicSmem;
+  config.dynamicSmemBytes = dynamic_smem;
   config.stream = stream;
+  cudaLaunchAttribute attributes[3]{};
+  unsigned num_attrs = 0u;
   // SM push route: the main grid may dispatch as soon as the push grid is
   // resident (it gates every remote chunk on its readiness epoch).
-  cudaLaunchAttribute attribute{};
-  attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attribute.val.programmaticStreamSerializationAllowed = 1;
-  config.attrs = programmatic_launch ? &attribute : nullptr;
-  config.numAttrs = programmatic_launch ? 1u : 0u;
-  cudaError_t status =
-      cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_f0cbdce7150397ae0989), kargs);
+  if (programmatic_launch) {
+    attributes[num_attrs].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attributes[num_attrs].val.programmaticStreamSerializationAllowed = 1;
+    ++num_attrs;
+  }
+  // CTA-pair main: the grid launches as clusters of the source build's dimensions
+  // (two CTAs along x), placed by the SPREAD policy when the build asked for it,
+  // as the source launcher does.
+  if (cluster_pair) {
+    attributes[num_attrs].id = cudaLaunchAttributeClusterDimension;
+    attributes[num_attrs].val.clusterDim.x = kMainCg2ClusterX;
+    attributes[num_attrs].val.clusterDim.y = kMainCg2ClusterY;
+    attributes[num_attrs].val.clusterDim.z = kMainCg2ClusterZ;
+    ++num_attrs;
+    if (kMainCg2Spread) {
+      attributes[num_attrs].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
+      attributes[num_attrs].val.clusterSchedulingPolicyPreference =
+          cudaClusterSchedulingPolicySpread;
+      ++num_attrs;
+    }
+  }
+  config.attrs = num_attrs ? attributes : nullptr;
+  config.numAttrs = num_attrs;
+  cudaError_t status = cudaLaunchKernelExC(&config, kernel, kargs);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "cudaLaunchKernelExC for the main kernel failed: " << cudaGetErrorString(status);
 }
@@ -391,6 +530,8 @@ struct Call {
   uint32_t ready_target;
   int64_t padded_rows;
   int64_t cols;
+  int64_t block_n;
+  bool cg2;
   int64_t chunk_rows;
   int64_t num_chunks;
   dim3 grid;
@@ -401,8 +542,8 @@ inline Call resolve_call(const TensorView& inp, const TensorView& scratch, const
                          const TensorView& out, const TensorView& ready,
                          const tvm::ffi::Shape& flag_peers, int64_t rank, int64_t rows,
                          int64_t pitch, int64_t phase, int64_t ready_target, int64_t grid_x,
-                         int64_t grid_y, int64_t grid_z, int64_t main_stream,
-                         int64_t comm_stream) {
+                         int64_t grid_y, int64_t grid_z, int64_t block_n, int64_t main_cg2,
+                         int64_t main_stream, int64_t comm_stream) {
   Call call;
   call.dev = inp.device();
   check_cuda_tensor(inp, "A_local");
@@ -464,6 +605,46 @@ inline Call resolve_call(const TensorView& inp, const TensorView& scratch, const
   call.num_chunks = (call.padded_rows + call.chunk_rows - 1) / call.chunk_rows;
   TVM_FFI_CHECK(call.padded_rows <= pitch, ValueError)
       << "the workspace holds " << pitch << " rows per peer, the call needs " << call.padded_rows;
+  // The main tile width of the call: kBlockN, or 128 when the class ships the
+  // twin and the adapter's rule selected it; the persistent grid never exceeds
+  // the output tile count at that width.
+  TVM_FFI_CHECK(block_n == kBlockN || (block_n == 128 && kHasMainN128), ValueError)
+      << "block_n=" << block_n << " is not a main tile width of this route (" << kBlockN
+      << (kHasMainN128 ? " or 128)" : "; it ships no 128-wide main)");
+  TVM_FFI_CHECK(call.cols % block_n == 0, ValueError)
+      << "N=" << call.cols << " must be a multiple of the main tile width block_n=" << block_n;
+  // The form of the main program: 0 = the one-CTA program of the call's width; 1 = the
+  // CTA-pair twin (admitted only when the class ships it, at the public width), whose
+  // even grid launches at most one cluster of two CTAs per pair tile (per peer and N
+  // tile, ceil(M tiles / 2) pairs per readiness chunk; the odd CTA of an odd chunk's
+  // last pair idles).
+  TVM_FFI_CHECK(main_cg2 == 0 || main_cg2 == 1, ValueError)
+      << "main_cg2=" << main_cg2 << " must be 0 (one-CTA main) or 1 (CTA-pair main)";
+  TVM_FFI_CHECK(main_cg2 == 0 || kHasMainCg2, ValueError)
+      << "main_cg2=1 selects the CTA-pair main, which this route does not ship";
+  TVM_FFI_CHECK(main_cg2 == 0 || block_n == kBlockN, ValueError)
+      << "main_cg2=1 needs block_n=" << kBlockN << ", got block_n=" << block_n;
+  if (main_cg2 == 1) {
+    const int64_t first_tiles_m = call.chunk_rows / kBlockM;
+    const int64_t last_tiles_m = call.padded_rows / kBlockM - (call.num_chunks - 1) * first_tiles_m;
+    const int64_t pair_tiles = kWorldSize *
+                               ((call.num_chunks - 1) * ((first_tiles_m + 1) / 2) +
+                                (last_tiles_m + 1) / 2) *
+                               (call.cols / kBlockN);
+    TVM_FFI_CHECK(grid_x % 2 == 0 && grid_y == 1 && grid_z == 1, ValueError)
+        << "the CTA-pair main needs an even grid_x and grid_y = grid_z = 1, got (" << grid_x
+        << ", " << grid_y << ", " << grid_z << ")";
+    TVM_FFI_CHECK(grid_x <= 2 * pair_tiles, ValueError)
+        << "grid_x=" << grid_x << " exceeds the " << (2 * pair_tiles) << " CTAs of the "
+        << pair_tiles << " pair tiles of the call";
+  } else {
+    const int64_t total_tiles = kWorldSize * (call.padded_rows / kBlockM) * (call.cols / block_n);
+    TVM_FFI_CHECK(grid_x <= total_tiles, ValueError)
+        << "grid_x=" << grid_x << " exceeds the " << total_tiles
+        << " output tiles of the call at block_n=" << block_n;
+  }
+  call.block_n = block_n;
+  call.cg2 = main_cg2 == 1;
   call.grid = dim3(static_cast<uint32_t>(grid_x), static_cast<uint32_t>(grid_y),
                    static_cast<uint32_t>(grid_z));
   return call;
@@ -475,16 +656,28 @@ inline void launch_main_for(const Call& call, const TensorView& inp, const Tenso
   static thread_local TensorMapCache<4> a_local_cache;
   static thread_local TensorMapCache<2> a_scratch_cache;
   static thread_local TensorMapCache<2> b_cache;
+  // The N128 twin reads B through its own map (its K-major box is 64 x 128; the
+  // N-major map is identical): the two B maps never share a cache, since a
+  // K-major N256 map handed to the twin hangs under PDL instead of failing.
+  static thread_local TensorMapCache<2> b128_cache;
+  // The CTA-pair twin likewise (each CTA loads 128 B columns per stage).
+  static thread_local TensorMapCache<2> b_cg2_cache;
+  const bool n128_main = call.block_n == 128;
   const CUtensorMap& a_local = a_local_cache.get(inp, EncodeTma_A_local);
   const CUtensorMap& a_scratch = a_scratch_cache.get(scratch, EncodeTma_A_scratch);
-  const CUtensorMap& b = b_cache.get(weight, EncodeTma_B);
+  const CUtensorMap& b = call.cg2      ? b_cg2_cache.get(weight, cg2::EncodeTma_B)
+                         : n128_main ? b128_cache.get(weight, n128::EncodeTma_B)
+                                     : b_cache.get(weight, EncodeTma_B);
+  const MainProgram program = call.cg2      ? main_program<kBlockN, true>()
+                              : n128_main ? main_program<128>()
+                                          : main_program<kBlockN>();
   // One readiness signal per push chunk; the output tile count along N comes
-  // from the caller-owned output ([world * rows, N]).
-  launch_main(a_local, a_scratch, b, out.data_ptr(), scratch.data_ptr(),
-              static_cast<unsigned int*>(ready.data_ptr()), call.ready_target, call.rank,
-              call.rows, call.pitch, static_cast<int32_t>(call.chunk_rows),
-              static_cast<int32_t>(out.size(1) / kBlockN), kRemoteOrder, call.grid,
-              call.main_stream, programmatic_launch);
+  // from the caller-owned output ([world * rows, N]) at the call's tile width.
+  launch_main(program.kernel, program.dynamic_smem, a_local, a_scratch, b, out.data_ptr(),
+              scratch.data_ptr(), static_cast<unsigned int*>(ready.data_ptr()), call.ready_target,
+              call.rank, call.rows, call.pitch, static_cast<int32_t>(call.chunk_rows),
+              static_cast<int32_t>(out.size(1) / call.block_n), kRemoteOrder, call.grid,
+              call.main_stream, programmatic_launch, call.cg2);
 }
 
 // Copy-engine route: barrier(phase); comm waits main; for every peer, for
@@ -497,11 +690,12 @@ inline void launch_main_for(const Call& call, const TensorView& inp, const Tenso
 void Run(TensorView inp, TensorView scratch, TensorView weight, TensorView out, TensorView ready,
          tvm::ffi::Shape flag_peers, tvm::ffi::Shape peer_scratch, tvm::ffi::Shape peer_signals,
          int64_t rank, int64_t rows, int64_t pitch, int64_t phase, int64_t ready_target,
-         int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t main_stream,
-         int64_t comm_stream) {
+         int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t block_n, int64_t main_cg2,
+         int64_t main_stream, int64_t comm_stream) {
   tvm::ffi::CUDADeviceGuard device_guard(inp.device().device_id);
   Call call = resolve_call(inp, scratch, weight, out, ready, flag_peers, rank, rows, pitch, phase,
-                           ready_target, grid_x, grid_y, grid_z, main_stream, comm_stream);
+                           ready_target, grid_x, grid_y, grid_z, block_n, main_cg2, main_stream,
+                           comm_stream);
   TVM_FFI_CHECK(peer_scratch.size() == kWorldSize - 1 && peer_signals.size() == kWorldSize - 1,
                 ValueError)
       << "peer scratch and signal tables need exactly " << (kWorldSize - 1) << " entries";
@@ -549,9 +743,81 @@ void Run(TensorView inp, TensorView scratch, TensorView weight, TensorView out, 
 }
 
 constexpr unsigned kPushThreads = 128u;
+// The SM push launch is chosen per call: this sequence's launch rows first (below), else from the
+// per-peer payload of the padded local shard (padded rows x K x element bytes). Below
+// kPushPayloadThresholdBytes a call takes the 32-CTA launch: kPushCtasPerPeer CTAs per remote peer
+// of the push program that keeps one 16-byte vector in flight per lane. At or above it a call
+// takes the wide launch: kPushWideCtasPerPeer CTAs per peer of the push program that keeps eight
+// vectors in flight per lane (fewer CTAs leave most SMs to the main grid, which then starts at the
+// barrier, while the deeper memory-level parallelism keeps the NVLink egress; measured faster only
+// on the large payloads). Both programs write the same 16-byte vectors to the same addresses and
+// the readiness ticket chain counts gridDim.x CTAs at runtime, so the outputs are identical
+// whichever launch a call takes.
 constexpr unsigned kPushCtasPerPeer = 32u;
+constexpr unsigned kPushWideCtasPerPeer = 8u;
+constexpr int64_t kPushPayloadThresholdBytes = 4194304;
+// The SM push launch rows of this sequence's world size and architecture (the exported
+// per-architecture table): a call of exactly kPushLaunchRowRows[i] padded rows launches
+// kPushLaunchRowCtas[i] CTAs per peer of the wide program (kPushLaunchRowWide[i]) or of the
+// one-vector program, whatever its payload (a trailing 0 entry keeps an empty table well-formed).
+constexpr int kPushLaunchRowCount = 0;
+constexpr int64_t kPushLaunchRowRows[kPushLaunchRowCount + 1] = {0};
+constexpr unsigned kPushLaunchRowCtas[kPushLaunchRowCount + 1] = {0u};
+constexpr bool kPushLaunchRowWide[kPushLaunchRowCount + 1] = {false};
+constexpr int push_launch_row(int64_t padded_rows) {
+  for (int i = 0; i < kPushLaunchRowCount; ++i) {
+    if (kPushLaunchRowRows[i] == padded_rows) return i;
+  }
+  return -1;
+}
+// Preferred shared-memory carveout of both push kernels (cudaFuncAttributePreferredSharedMemoryCarveout;
+// -1 = driver default). The push kernels use no shared memory, but their CTAs land on the SMs before
+// the main grid dispatches (programmatic dependent launch) and an SM's L1/shared split is fixed while
+// any CTA is resident: with the driver default a 192 KiB main CTA cannot land on an SM hosting a push
+// CTA until it drains. The maximum-shared preference lets the main CTAs co-reside with the push CTAs.
+constexpr int kPushCarveout = -1;
 
-// SM push route (padded M <= kSmPushMaxRows, N <= sm_push_max_cols(padded M)):
+// Set one push kernel's carveout once for every device that accepts it: a function attribute is
+// per device and one process may serve several devices through RunPush, so this mirrors the
+// per-device form CakeSetMaxDynamicSmem uses for the main kernel (cudaGetKernel +
+// cudaKernelSetAttributeForDevice over cudaGetDeviceCount) instead of a current-device-only
+// attribute call. The attribute calls are not stream operations, so the static-once form of the
+// caller is graph-capture safe.
+inline void set_push_carveout_for(const void* function, const char* label) {
+  cudaKernel_t kernel = nullptr;
+  cudaError_t status = cudaGetKernel(&kernel, function);
+  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
+      << "cudaGetKernel for the " << label << " failed: " << cudaGetErrorString(status);
+  int device_count = 0;
+  status = cudaGetDeviceCount(&device_count);
+  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
+      << "cudaGetDeviceCount for the " << label << " carveout failed: " << cudaGetErrorString(status);
+  int configured = 0;
+  for (int device = 0; device < device_count; ++device) {
+    if (cudaKernelSetAttributeForDevice(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, kPushCarveout, device) == cudaSuccess) {
+      ++configured;
+    } else {
+      (void)cudaGetLastError();
+    }
+  }
+  TVM_FFI_CHECK(configured > 0, RuntimeError)
+      << "no CUDA device accepts PreferredSharedMemoryCarveout=" << kPushCarveout << " for the "
+      << label;
+}
+
+// Both push kernels carry the same carveout; function-local static initialization in RunPush
+// serializes the first call.
+inline bool set_push_carveout() {
+  if constexpr (kPushCarveout < 0) {
+    return true;
+  }
+  set_push_carveout_for(reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_40242e9c64d6e66af6f5), "peer push");
+  set_push_carveout_for(reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3), "wide peer push");
+  return true;
+}
+
+// SM push route (uses_sm_push(padded M, N): padded M <= kSmPushMaxRows with
+// N <= sm_push_max_cols(padded M), or one of this sequence's SM push bands):
 // barrier(phase); the push kernel
 // (launched with the programmatic-dependent-launch attribute: its grid is
 // dispatched while the barrier rendezvous is in flight and waits in hardware
@@ -560,15 +826,18 @@ constexpr unsigned kPushCtasPerPeer = 32u;
 // chunk's epoch (one launch for all peers, no communication stream); the main
 // kernel follows on the same stream with the same attribute (the push grid
 // triggers its dispatch once every push CTA is resident; the GEMM gates each
-// remote chunk on its epoch, so no second barrier is needed).
+// remote chunk on its epoch, so no second barrier is needed). The main kernel
+// is the one of the call's block_n and main_cg2, as on the copy-engine route.
 void RunPush(TensorView inp, TensorView scratch, TensorView weight, TensorView out,
              TensorView ready, tvm::ffi::Shape flag_peers, TensorView payload_peers,
              TensorView signal_peers, TensorView counters, int64_t rank, int64_t rows,
              int64_t pitch, int64_t phase, int64_t ready_target, int64_t grid_x, int64_t grid_y,
-             int64_t grid_z, int64_t main_stream, int64_t comm_stream) {
+             int64_t grid_z, int64_t block_n, int64_t main_cg2, int64_t main_stream,
+             int64_t comm_stream) {
   tvm::ffi::CUDADeviceGuard device_guard(inp.device().device_id);
   Call call = resolve_call(inp, scratch, weight, out, ready, flag_peers, rank, rows, pitch, phase,
-                           ready_target, grid_x, grid_y, grid_z, main_stream, comm_stream);
+                           ready_target, grid_x, grid_y, grid_z, block_n, main_cg2, main_stream,
+                           comm_stream);
   check_cuda_tensor(payload_peers, "payload_peers");
   check_dtype(payload_peers, DLDataType{kDLInt, 64, 1}, "payload_peers");
   check_contiguous(payload_peers, "payload_peers");
@@ -586,12 +855,11 @@ void RunPush(TensorView inp, TensorView scratch, TensorView weight, TensorView o
       << "push tables need exactly " << (kWorldSize - 1) << " entries";
   TVM_FFI_CHECK(counters.numel() >= (kWorldSize - 1) * call.num_chunks, ValueError)
       << "push counters need at least " << ((kWorldSize - 1) * call.num_chunks) << " words";
-  TVM_FFI_CHECK(call.padded_rows <= kSmPushMaxRows, ValueError)
-      << "the SM push route serves at most " << kSmPushMaxRows << " padded rows, got "
-      << call.padded_rows;
-  TVM_FFI_CHECK(call.cols <= sm_push_max_cols(call.padded_rows), ValueError)
-      << "the SM push route serves at most N=" << sm_push_max_cols(call.padded_rows) << " at "
-      << call.padded_rows << " padded rows, got N=" << call.cols;
+  TVM_FFI_CHECK(uses_sm_push(call.padded_rows, call.cols), ValueError)
+      << "the SM push route serves at most " << kSmPushMaxRows << " padded rows with N <= "
+      << sm_push_max_cols(call.padded_rows) << " at " << call.padded_rows
+      << " padded rows, or one of its " << kSmPushBandCount << " SM push bands; got "
+      << call.padded_rows << " padded rows, N=" << call.cols;
 
   launch_barrier(phase, static_cast<int32_t>(kWorldSize), call.rank, call.flags, call.main_stream);
   {
@@ -606,8 +874,23 @@ void RunPush(TensorView inp, TensorView scratch, TensorView weight, TensorView o
     int32_t v_num_chunks = static_cast<int32_t>(call.num_chunks);
     void* kargs[] = {&p_inp,  &p_payload, &p_signal,     &p_counters,  &v_ready_target,
                      &v_rank, &v_rows,    &v_chunk_rows, &v_num_chunks};
+    static const bool carveout_ready = set_push_carveout();
+    (void)carveout_ready;
+    // The launch of this call: this sequence's launch row of exactly the call's padded rows when
+    // it lists one, else the per-peer payload of the padded shard; the row or the payload selects
+    // the grid and the push program (both take the same arguments).
+    const int64_t push_payload_bytes =
+        call.padded_rows * kK * static_cast<int64_t>(inp.dtype().bits / 8);
+    const int launch_row = push_launch_row(call.padded_rows);
+    const bool wide_push = launch_row >= 0 ? kPushLaunchRowWide[launch_row]
+                                           : push_payload_bytes >= kPushPayloadThresholdBytes;
+    const unsigned push_ctas_per_peer =
+        launch_row >= 0 ? kPushLaunchRowCtas[launch_row]
+                        : (wide_push ? kPushWideCtasPerPeer : kPushCtasPerPeer);
+    const void* push_kernel = wide_push ? reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3)
+                                        : reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_40242e9c64d6e66af6f5);
     cudaLaunchConfig_t config{};
-    config.gridDim = dim3(kPushCtasPerPeer, static_cast<uint32_t>(kWorldSize - 1), 1u);
+    config.gridDim = dim3(push_ctas_per_peer, static_cast<uint32_t>(kWorldSize - 1), 1u);
     config.blockDim = dim3(kPushThreads, 1u, 1u);
     config.dynamicSmemBytes = 0u;
     config.stream = call.main_stream;
@@ -616,8 +899,7 @@ void RunPush(TensorView inp, TensorView scratch, TensorView weight, TensorView o
     attribute.val.programmaticStreamSerializationAllowed = 1;
     config.attrs = &attribute;
     config.numAttrs = 1u;
-    cudaError_t status =
-        cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_40242e9c64d6e66af6f5), kargs);
+    cudaError_t status = cudaLaunchKernelExC(&config, push_kernel, kargs);
     TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
         << "cudaLaunchKernelExC for the peer push failed: " << cudaGetErrorString(status);
   }

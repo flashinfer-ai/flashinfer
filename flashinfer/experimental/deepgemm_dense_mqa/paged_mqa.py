@@ -19,10 +19,18 @@ carry a second, dynamic-scheduler program (route suffix ``:dyn``, served for
 ``batch <= policy.paged.dynamic_scheduler.max_batch``) whose CTAs claim chunks
 of the (request, KV split) walk through an atomic counter instead of the static
 equal-split partition; its logits are bit-identical to the static program's.
-Both programs bind a per-plan scheduler state ``sched_counters`` (u32[2]),
-allocated zeroed by the plan; the dynamic program's last CTA resets it at the
-end of every launch, so repeated runs and CUDA-graph replays need no memset
-(a launch that does not run to completion leaves it dirty: re-create the plan). Output: FP32 ``[B * next_n,
+Inside an architecture's static-preferred window (``policy.paged.dynamic_scheduler
+.static_windows``) the static program is served instead, and a window may name a
+TEXT of that program (``static_window_routes``: route suffix ``:<text>``, e.g.
+``:hyb8c4`` = the static program with a hybrid tail pool that balances the last
+few percent of every CTA's work), served only on the architectures whose table
+names it; its logits are bit-identical to the static program's as well.
+Every program binds a per-plan scheduler state ``sched_counters`` (u32[2];
+``sched_state`` publishes the larger state a text route's program binds, one
+word per SM for the hybrid texts), allocated zeroed by the plan; the dynamic and
+hybrid programs' last CTA resets it at the end of every launch, so repeated runs
+and CUDA-graph replays need no memset (a launch that does not run to completion
+leaves it dirty: re-create the plan). Output: FP32 ``[B * next_n,
 paged_logits_stride(max_context_len)]`` with DeepGEMM's ``clean_logits=False``
 semantics (inside every KV split a row touches, positions at or past the row's
 length are ``-inf``; cells beyond the row's last split are untouched);
@@ -40,7 +48,6 @@ from .dense_mqa import (
 )
 
 FUSED_ROW_BYTES = HEAD_DIM + 4  # one FP8 row + its FP32 scale
-LOGITS_DTYPES = ("float32",)
 
 
 def paged_policy():
@@ -72,41 +79,174 @@ def paged_next_n_atoms(next_n):
     return int(rule[key])
 
 
+def _static_window(arch, route, window):
+    """One ``static_windows`` entry as ``(min_batch, max_batch, min_context_len, max_context_len)``
+    (``None`` = unbounded): the two-field form ``[max_batch, max_context_len]`` is the box from batch 1
+    and context 1, the three-field form ``[min_batch, max_batch, max_context_len]`` carries an explicit
+    lower batch bound, the four-field form ``[min_batch, max_batch, min_context_len, max_context_len]``
+    an explicit context lower bound as well (catalog v10). Any other shape is a catalog error, raised
+    here rather than read as no window."""
+    min_ctx = 1
+    if len(window) == 2:
+        min_batch, (max_batch, max_ctx) = 1, window
+    elif len(window) == 3:
+        min_batch, max_batch, max_ctx = window
+    elif len(window) == 4:
+        min_batch, max_batch, min_ctx, max_ctx = window
+        if not isinstance(min_ctx, int) or min_ctx < 2:
+            raise ValueError(
+                f"static window {window!r} of {route} on {arch}: min_context_len must be an int >= 2"
+            )
+    else:
+        raise ValueError(
+            f"static window {window!r} of {route} on {arch}: expected "
+            "[max_batch, max_context_len], [min_batch, max_batch, max_context_len] or "
+            "[min_batch, max_batch, min_context_len, max_context_len]"
+        )
+    if not isinstance(min_batch, int) or min_batch < 1:
+        raise ValueError(
+            f"static window {window!r} of {route} on {arch}: min_batch must be a positive int"
+        )
+    return (
+        min_batch,
+        None if max_batch is None else int(max_batch),
+        min_ctx,
+        None if max_ctx is None else int(max_ctx),
+    )
+
+
 def paged_dynamic_scheduler():
     """``policy.paged.dynamic_scheduler``: ``max_batch`` and the static route -> dynamic route map (empty when the
-    catalog ships no dynamic-scheduler program)."""
+    catalog ships no dynamic-scheduler program), and the per-architecture static-preferred windows."""
     entry = paged_policy().get("dynamic_scheduler") or {}
     return dict(
         max_batch=int(entry.get("max_batch", 0)),
         routes={str(k): str(v) for k, v in (entry.get("routes") or {}).items()},
-        # arch -> static route -> [(max_batch, max_context_len), ...]: calls inside a window take the STATIC
-        # program although batch <= max_batch (the small-grid rule; None = unbounded)
+        # arch -> static route -> [(min_batch, max_batch, min_context_len, max_context_len), ...]: calls inside a
+        # window take the STATIC program although batch <= max_batch (the small-grid rule and the power-capped
+        # long-context rule; None = unbounded; a two-field catalog entry is a box from batch 1 and context 1, a
+        # three-field entry carries its lower batch bound, a four-field entry a context lower bound as well --
+        # ``_static_window``)
         static_windows={
             str(arch): {
-                str(route): [
-                    (
-                        None if max_batch is None else int(max_batch),
-                        None if max_ctx is None else int(max_ctx),
-                    )
-                    for max_batch, max_ctx in windows
-                ]
+                str(route): [_static_window(arch, route, window) for window in windows]
                 for route, windows in (table or {}).items()
             }
             for arch, table in (entry.get("static_windows") or {}).items()
         },
+        # arch -> static route -> [((min_batch, max_batch, min_context_len, max_context_len), route), ...]: inside such a
+        # window the named TEXT route of the static program is served instead of the static route (catalog v10, the
+        # window-selected texts; a window absent here keeps the static route)
+        static_window_routes={
+            str(arch): {
+                str(route): [_static_window_route(arch, route, pair) for pair in pairs]
+                for route, pairs in (table or {}).items()
+            }
+            for arch, table in (entry.get("static_window_routes") or {}).items()
+        },
+        # route -> (base_words, words_per_sm, max_sms): the scheduler-state words a route's program binds when they are not
+        # the default two (``paged_sched_state_words``)
+        sched_state={
+            str(route): _sched_state(route, record)
+            for route, record in (entry.get("sched_state") or {}).items()
+        },
     )
+
+
+def _static_window_route(arch, static_route, pair):
+    """One ``static_window_routes`` entry ``[window, route]`` as ``(parsed window, route)``; any other shape is a catalog
+    error, raised here."""
+    if not (
+        isinstance(pair, (list, tuple))
+        and len(pair) == 2
+        and isinstance(pair[1], str)
+        and pair[1]
+    ):
+        raise ValueError(
+            f"static window route {pair!r} of {static_route} on {arch}: expected [window, route]"
+        )
+    window, route = pair
+    if not route.startswith(static_route + ":"):
+        raise ValueError(
+            f"static window route {route!r} of {static_route} on {arch} is not a text route of that static route"
+        )
+    return _static_window(arch, static_route, window), route
+
+
+def _sched_state(route, record):
+    """One ``sched_state`` record as ``(base_words, words_per_sm, max_sms)``; every field a positive int (``words_per_sm``
+    may be 0), any other shape is a catalog error, raised here."""
+    try:
+        base, per_sm, max_sms = (
+            int(record["base_words"]),
+            int(record["words_per_sm"]),
+            int(record["max_sms"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(
+            f"sched_state of {route}: expected base_words, words_per_sm and max_sms ints, got {record!r}"
+        ) from None
+    if base < 1 or per_sm < 0 or max_sms < 1:
+        raise ValueError(f"sched_state of {route}: out-of-range fields {record!r}")
+    return base, per_sm, max_sms
+
+
+def paged_static_window_route(arch, static_route, batch, max_context_len):
+    """The window-selected TEXT route of ``static_route`` on ``arch`` for a call inside a window that names one
+    (``policy.paged.dynamic_scheduler.static_window_routes``), ``None`` when no admitting window names a route (the static
+    route itself). Two admitting windows naming different routes is a catalog error, raised. Host-only."""
+    pairs = (
+        paged_dynamic_scheduler()["static_window_routes"]
+        .get(str(arch), {})
+        .get(static_route, [])
+    )
+    batch, max_context_len = int(batch), int(max_context_len)
+    routes = {
+        route
+        for (min_batch, max_batch, min_ctx, max_ctx), route in pairs
+        if min_batch <= batch
+        and (max_batch is None or batch <= max_batch)
+        and min_ctx <= max_context_len
+        and (max_ctx is None or max_context_len <= max_ctx)
+    }
+    if len(routes) > 1:
+        raise ValueError(
+            f"static windows of {static_route} on {arch} name {sorted(routes)} for batch {batch}, "
+            f"max_context_len {max_context_len}: one route per call"
+        )
+    return routes.pop() if routes else None
+
+
+def paged_sched_state_words(route_name, num_sms):
+    """Words of the scheduler state ``sched_counters`` a route's program binds for a ``num_sms``-CTA launch: the catalog's
+    ``sched_state`` record (``base_words + words_per_sm * num_sms``, ``num_sms <= max_sms``) or the default 2."""
+    record = paged_dynamic_scheduler()["sched_state"].get(route_name)
+    if record is None:
+        return 2
+    base, per_sm, max_sms = record
+    if int(num_sms) > max_sms:
+        raise ValueError(
+            f"paged MQA route {route_name} serves at most {max_sms} CTAs (num_sms {num_sms})"
+        )
+    return base + per_sm * int(num_sms)
 
 
 def paged_static_preferred(arch, static_route, batch, max_context_len):
     """True when ``policy.paged.dynamic_scheduler.static_windows[arch][static_route]`` has a window with
-    ``batch <= max_batch`` and ``max_context_len <= max_ctx`` (``None`` = unbounded). Host-only."""
-    static_windows = paged_dynamic_scheduler()["static_windows"]
-    windows = static_windows.get(str(arch), {}).get(static_route, [])
+    ``min_batch <= batch <= max_batch`` and ``min_ctx <= max_context_len <= max_ctx`` (``None`` = unbounded; a
+    two-field catalog entry starts at batch 1, a two- or three-field entry at context 1). Host-only."""
+    windows = (
+        paged_dynamic_scheduler()["static_windows"]
+        .get(str(arch), {})
+        .get(static_route, [])
+    )
     batch, max_context_len = int(batch), int(max_context_len)
     return any(
-        (max_batch is None or batch <= max_batch)
+        min_batch <= batch
+        and (max_batch is None or batch <= max_batch)
+        and min_ctx <= max_context_len
         and (max_ctx is None or max_context_len <= max_ctx)
-        for max_batch, max_ctx in windows
+        for min_batch, max_batch, min_ctx, max_ctx in windows
     )
 
 
@@ -114,7 +254,6 @@ def paged_route_name(
     num_heads,
     block_kv,
     next_n,
-    logits_dtype="float32",
     *,
     batch=None,
     max_context_len=None,
@@ -123,12 +262,10 @@ def paged_route_name(
     """Logical paged route of a problem (host-known scalars only). With ``batch`` (the call's request count)
     the dynamic-scheduler route is returned when the catalog carries one for the geometry and
     ``batch <= policy.paged.dynamic_scheduler.max_batch`` -- except inside the architecture's static-preferred
-    windows (``static_windows``; applied only when ``arch`` and ``max_context_len`` are given); without
-    ``batch`` the static route."""
-    if logits_dtype not in LOGITS_DTYPES:
-        raise ValueError(f"logits_dtype must be one of {LOGITS_DTYPES}")
-    suffix = "" if logits_dtype == "float32" else f":{logits_dtype}"
-    static = f"paged:fp8:h{int(num_heads)}:p{int(block_kv)}:n{int(next_n)}{suffix}"
+    windows (``static_windows``; applied only when ``arch`` and ``max_context_len`` are given), where the static
+    route -- or the TEXT route the window names (``static_window_routes``) -- is returned; without ``batch`` the
+    static route."""
+    static = f"paged:fp8:h{int(num_heads)}:p{int(block_kv)}:n{int(next_n)}"
     if batch is None:
         return static
     dynamic = paged_dynamic_scheduler()
@@ -138,7 +275,11 @@ def paged_route_name(
             and max_context_len is not None
             and paged_static_preferred(arch, static, batch, max_context_len)
         ):
-            return static
+            # the window may name a text of the static program -> its own route (catalog v10)
+            return (
+                paged_static_window_route(arch, static, batch, max_context_len)
+                or static
+            )
         return dynamic["routes"][static]
     return static
 
@@ -178,7 +319,6 @@ def paged_route_available(
     num_heads,
     block_kv,
     next_n,
-    logits_dtype="float32",
     *,
     arch=None,
     batch=None,
@@ -191,7 +331,7 @@ def paged_route_available(
         if num_heads not in paged_heads() or block_kv not in paged_block_sizes():
             return False
         paged_next_n_atoms(next_n)
-        route = paged_route_name(num_heads, block_kv, next_n, logits_dtype)
+        route = paged_route_name(num_heads, block_kv, next_n)
     except ValueError:
         return False
     if route not in _catalog()["paged_routes"]:
@@ -206,7 +346,6 @@ def paged_route_available(
         num_heads,
         block_kv,
         next_n,
-        logits_dtype,
         batch=batch,
         max_context_len=max_context_len,
         arch=arch,
@@ -334,12 +473,16 @@ class PagedMqaPlan:
     ``max_context_len`` and raises ``ValueError`` outside them; the export
     protocol passes False to validate every exported shape.
 
-    The route is ``paged_route_name(H, block_kv, next_n, batch=B)``: the
-    dynamic-scheduler program for ``B <= policy.paged.dynamic_scheduler.max_batch``
-    when the geometry ships one, else the static program. ``plan.sched_counters``
-    (u32[2]) is the scheduler state bound to every launch of this plan: zeroed
-    here, reset by the dynamic program itself at the end of each launch (graph
-    replays included), never read by the static program.
+    The route is ``paged_route_name(H, block_kv, next_n, batch=B,
+    max_context_len=, arch=)``: the dynamic-scheduler program for ``B <=
+    policy.paged.dynamic_scheduler.max_batch`` when the geometry ships one, else
+    the static program -- or, inside the device's static-preferred windows, the
+    static program or the text of it the window names. ``plan.sched_counters``
+    (``paged_sched_state_words`` words: u32[2], one more per SM for a hybrid
+    text) is the scheduler state bound to every launch of this plan: zeroed
+    here, reset by the dynamic and hybrid programs themselves at the end of each
+    launch (graph replays included), never read by the module-default static
+    program.
     """
 
     def __init__(
@@ -354,7 +497,6 @@ class PagedMqaPlan:
         schedule_meta=None,
         output=None,
         sm_count=None,
-        logits_dtype="float32",
         enforce_admission=True,
     ):
         import torch
@@ -415,15 +557,14 @@ class PagedMqaPlan:
             or max_context_len > int(block_table.shape[1]) * block_kv
         ):
             raise ValueError("max_context_len must be in 1..S * block_kv")
-        if not paged_route_available(num_heads, block_kv, next_n, logits_dtype):
+        if not paged_route_available(num_heads, block_kv, next_n):
             raise ValueError(
-                f"no exported paged MQA route for {num_heads} heads, page {block_kv}, next_n {next_n}, {logits_dtype}"
+                f"no exported paged MQA route for {num_heads} heads, page {block_kv}, next_n {next_n}"
             )
         route_name = paged_route_name(
             num_heads,
             block_kv,
             next_n,
-            logits_dtype,
             batch=batch,
             max_context_len=max_context_len,
             arch=arch,
@@ -444,7 +585,11 @@ class PagedMqaPlan:
         self.max_context_len = max_context_len
         self.route_name = route_name
         self.route = _catalog()["paged_routes"][self.route_name]
-        self.sched_counters = torch.zeros(2, dtype=torch.uint32, device=q.device)
+        self.sched_counters = torch.zeros(
+            paged_sched_state_words(route_name, num_sms),
+            dtype=torch.uint32,
+            device=q.device,
+        )
         stride = paged_logits_stride(max_context_len)
         if output is None:
             output = torch.empty(

@@ -28,6 +28,7 @@ def _kernel(
     xsf: cute.Tensor,
     weights: cute.Tensor,
     weight_sf: cute.Tensor,
+    alpha: cute.Tensor,
     ids: cute.Tensor,
     mid: cute.Tensor,
     mid_sf: cute.Tensor,
@@ -51,6 +52,9 @@ def _kernel(
     xp = cute.recast_ptr(x.iterator, dtype=cutlass.Uint32)
     wp = cute.recast_ptr(weights.iterator, dtype=cutlass.Uint32)
     ws = cute.recast_ptr(weight_sf.iterator, dtype=cutlass.Uint8)
+    sf_storage_bytes = weight_sf.element_type.width // 8
+    sf_gate_stride = weight_sf.stride[0] * sf_storage_bytes
+    sf_expert_stride = weight_sf.stride[1] * sf_storage_bytes
     branches = 2 if gated else 1
     accum = cute.make_rmem_tensor((4, branches), cutlass.Float32)
     accum.fill(0.0)
@@ -85,7 +89,8 @@ def _kernel(
                 for o in cutlass.range_constexpr(4):
                     for branch in cutlass.range_constexpr(branches):
                         sw = ws[
-                            (branch * experts + expert) * i * cols
+                            branch * sf_gate_stride
+                            + expert * sf_expert_stride
                             + _sf_index(row + o, col, cols)
                         ]
                         dot = (
@@ -101,6 +106,10 @@ def _kernel(
         if cutlass.const_expr(gated):
             gate = cute.arch.warp_reduction_sum(accum[o, 1])
         if lane == 0:
+            if expert >= 0 and expert < experts:
+                up = _mul(up, alpha[expert])
+                if cutlass.const_expr(gated):
+                    gate = _mul(gate, alpha[expert])
             value = apply_activation(up, gate, activation)
             shared[warp * 4 + o] = value.to(cutlass.BFloat16).to(cutlass.Float32)
     cute.arch.sync_threads()
@@ -121,8 +130,10 @@ def _kernel(
 
 
 @cute.jit
-def _launch(x, xsf, weights, weight_sf, ids, mid, mid_sf, stream):
-    _kernel(x, xsf, weights, weight_sf, ids, mid, mid_sf, _ACTIVATION, _GATED).launch(
+def _launch(x, xsf, weights, weight_sf, alpha, ids, mid, mid_sf, stream):
+    _kernel(
+        x, xsf, weights, weight_sf, alpha, ids, mid, mid_sf, _ACTIVATION, _GATED
+    ).launch(
         grid=(cute.size(mid) // 32, 1, 1),
         block=(256, 1, 1),
         stream=stream,

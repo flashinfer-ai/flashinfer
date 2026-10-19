@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import math
+import pathlib
 import re
 
 import pytest
@@ -37,9 +38,9 @@ from flashinfer.experimental.kimi_k3_fp8_projection.cake_backend import (
     quant_units,
     required_kernel_keys,
     swizzle_sf_128x4,
-    unswizzle_sf_128x4,
 )
 from flashinfer.experimental.kimi_k3_fp8_projection.cake_jit import (
+    ARG_PLANS,
     KERNELS,
     MODULES,
     decode_kernel_key,
@@ -61,8 +62,6 @@ from flashinfer.gemm import (
 ATOL = 1e-2
 RTOL = 1e-2
 SM_COUNT = 148
-# Measured SM counts of the dispatch tables (round 7): B200 148, GB300 152.
-SM_COUNTS = {"sm_100a": 148, "sm_103a": 152}
 # Representative rows (tp, module, M): every route of the dispatch (fused decode incl.
 # resident token tiles, quantization launch + decode, quantization launch + GEMM) and
 # the correctness-only row counts of the contract (partial tiles, > 256 rows, padded
@@ -93,6 +92,15 @@ GPU_ROWS = [
     ("tp8", "q_proj", 1000, 0),
     # 16-byte row stride (6288) with a column edge (6284) that is not: register epilogue, padding untouched
     ("tp8", "in_proj_qkvgfab", 1000, 4),
+    # round 11 (CAKE-985): rows whose table cells carry the round-10 / round-11 GEMM program tokens, so the composed
+    # program key below is exercised on a GPU: ``_pdlb`` on the aligned (TMA-store) view of the sm_103a 50,28,1024 cell,
+    # ``_st`` (sm_100a 12,1,2048) / ``_gs`` (sm_103a 12,1,2048 and 96,1,2048), ``_cs<S>`` (sm_103a 5,28,2048) and ``_g64``
+    # (sm_103a 144,6,16384); on the other architecture each row resolves to that table's own form.
+    ("tp8", "in_proj_qkvgfab", 1000, 0),
+    ("tp8", "f_b", 2048, 0),
+    ("tp1", "f_b", 2048, 0),
+    ("tp8", "kv_a", 2048, 0),
+    ("tp8", "q_b", 16384, 0),
     ("tp8", "q_b", 4096, 0),
     ("tp1", "o_proj", 4097, 4),
     (
@@ -102,8 +110,9 @@ GPU_ROWS = [
         0,
     ),  # narrow-N large-M row: tabulated fused decode route above DECODE_MAX_M
     ("tp1", "b_proj", 4097, 4),
-    # Round 6 continuation 12 (lever SKO): tabulated ``gemm_sk`` rows inside the stream-K wave window -- the TMA-store
-    # instance on the aligned view and the staged register instance on the 8-byte-aligned padded row stride
+    # The former ordered stream-K cells (round 6 continuation 12; sm_100a carries the prefetched / fix-up forms there
+    # now) -- the TMA-store instance on the aligned view and the staged register instance on the 8-byte-aligned
+    # padded row stride
     ("tp8", "q_proj", 4096, 0),
     ("tp1", "o_proj", 4096, 4),
     # Round 6 continuation 17/18 (lever SKF): tabulated ``gemm_skf`` rows (fractional wave) -- the fix-up stream-K
@@ -142,6 +151,16 @@ def per_block_cast_to_fp8(w):
     sf = amax / E4M3_MAX
     q = (wv.float() * (1.0 / sf)).to(torch.float8_e4m3fn).view(n, k)
     return q, sf.view(n // BLOCK, k // BLOCK)
+
+
+def unswizzle_sf_128x4(sf_swizzled, R, C):
+    """Inverse of ``cb.swizzle_sf_128x4`` -> ``[R, C]``."""
+    Rp = -(-R // cb.SF_TILE_ROWS) * cb.SF_TILE_ROWS
+    Cp = -(-C // 4) * 4
+    v = sf_swizzled.reshape(Rp // cb.SF_TILE_ROWS, Cp // 4, 32, 4, 4).permute(
+        0, 3, 2, 1, 4
+    )
+    return v.reshape(Rp, Cp)[:R, :C]
 
 
 def make_weight(n_valid, K, device, seed):
@@ -238,20 +257,294 @@ def test_weight_scale_tiles_bn_layout():
     t192 = cb.weight_scale_tiles_bn(sf, K, 192)
     assert t192.numel() == n_tiles * ks * 2 * cb.SF_TILE_BYTES
     flat = t192.view(n_tiles, ks, 2, cb.SF_TILE_BYTES).permute(0, 2, 1, 3).reshape(-1)
-    per_row = cb.unswizzle_sf_128x4(flat, n_tiles * 256, ks * 4)
+    per_row = unswizzle_sf_128x4(flat, n_tiles * 256, ks * 4)
     rows = sf.repeat_interleave(128, dim=0).repeat_interleave(4, dim=1)
     for t in range(n_tiles):
         expect = torch.zeros((256, ks * 4), dtype=torch.uint8)
         lo, hi = t * 192, min(t * 192 + 192, n_pad)
         expect[: hi - lo, : rows.shape[1]] = rows[lo:hi]
         assert torch.equal(per_row[t * 256 : (t + 1) * 256], expect), t
+    # Round 10 (CAKE-985 S3): the 384-wide pair tile lays each tile's rows across three 128-lane blocks (the last tile of
+    # the 768-row storage holds rows 768..767 -> zeros past N_pad); the SFB view is 12 rows of 128 B per (tile, K set).
+    n_tiles384 = -(-n_pad // 384)
+    t384 = cb.weight_scale_tiles_bn(sf, K, 384)
+    assert t384.numel() == n_tiles384 * ks * 3 * cb.SF_TILE_BYTES
+    assert (
+        cb.weight_scale_sf_rows(384) == 12
+        and cb.weight_scale_sf_rows(192) == cb.weight_scale_sf_rows(256) == 8
+    )
+    flat = (
+        t384.view(n_tiles384, ks, 3, cb.SF_TILE_BYTES).permute(0, 2, 1, 3).reshape(-1)
+    )
+    per_row = unswizzle_sf_128x4(flat, n_tiles384 * 384, ks * 4)
+    for t in range(n_tiles384):
+        expect = torch.zeros((384, ks * 4), dtype=torch.uint8)
+        lo, hi = t * 384, min(t * 384 + 384, n_pad)
+        expect[: hi - lo, : rows.shape[1]] = rows[lo:hi]
+        assert torch.equal(per_row[t * 384 : (t + 1) * 384], expect), t
     with pytest.raises(ValueError):
         cb.weight_scale_tiles_bn(sf, K, 100)
+    with pytest.raises(ValueError):
+        cb.weight_scale_tiles_bn(sf, K, 512)
+
+
+def test_n384_cell_rules_and_g64_stems():
+    """Round 10 (CAKE-985 S3): ``gemm_n384_cell_conflicts`` names the keys a ``gemm_bn`` 384 cell cannot carry (the Cake
+    launcher's rule), ``_g64_stem`` places the raster token after the bn token and refuses the register epilogue; round 11
+    (CAKE-985 T1a): ``gemm_pdlb`` joins the 384-wide conflicts, ``_pdlb_stem`` closes the stem with the token and refuses
+    the register epilogue and the 384-wide programs, ``_entry_gemm_pdlb`` reads the cell key as 0 / 1; round 11 (CAKE-985
+    T2-e): ``gemm_static`` joins the 384-wide conflicts, ``_st_stem`` takes the _cs<S> slot of the plain _n192_k128 stems,
+    ``gemm_static_cell_conflicts`` names the keys a static cell cannot carry."""
+    assert cb.gemm_n384_cell_conflicts(None) == []
+    assert (
+        cb.gemm_n384_cell_conflicts(
+            {
+                "route": "gemm",
+                "gemm_bn": 384,
+                "gemm_bk": 128,
+                "gemm_gm": 64,
+                "quant_units": 4,
+            }
+        )
+        == []
+    )
+    assert cb.gemm_n384_cell_conflicts({"gemm_bn": 384, "gemm_bk": 256}) == ["gemm_bk"]
+    assert cb.gemm_n384_cell_conflicts(
+        {"gemm_bn": 384, "gemm_pf": 2, "gemm_skf": 2, "gemm_ts_slots": 4}
+    ) == ["gemm_pf", "gemm_skf", "gemm_ts_slots"]
+    assert cb._g64_stem("gemm_tstore") == "gemm_tstore_g64"
+    assert cb._g64_stem("gemm_rstaged_n192_k128") == "gemm_rstaged_n192_g64_k128"
+    assert cb._g64_stem("gemm_tstore_n384_k128") == "gemm_tstore_n384_g64_k128"
+    with pytest.raises(ValueError, match="register epilogue"):
+        cb._g64_stem("gemm")
+    # round 11 (CAKE-985 T1a, _pdlb): the last stem token, before ``_pf<D>``; no register-epilogue or 384-wide form
+    assert "gemm_pdlb" in cb.GEMM_N384_CELL_CONFLICTS
+    assert cb.gemm_n384_cell_conflicts({"gemm_bn": 384, "gemm_pdlb": 1}) == [
+        "gemm_pdlb"
+    ]
+    assert cb.gemm_n384_cell_conflicts({"gemm_bn": 384, "gemm_pdlb": 0}) == []
+    assert cb._pdlb_stem("gemm_tstore") == "gemm_tstore_pdlb"
+    assert cb._pdlb_stem("gemm_rstaged_n192_k128") == "gemm_rstaged_n192_k128_pdlb"
+    assert (
+        cb._pdlb_stem("gemm_tstore_n192_k128_cs2") == "gemm_tstore_n192_k128_cs2_pdlb"
+    )
+    assert (
+        cb._pdlb_stem("gemm_tstore_n192_k128_skf") == "gemm_tstore_n192_k128_skf_pdlb"
+    )
+    assert (
+        cb._pdlb_stem("gemm_rstaged_n192_g64_k128") == "gemm_rstaged_n192_g64_k128_pdlb"
+    )
+    assert cb.gemm_kernel_key(cb._pdlb_stem("gemm_tstore"), 2) == "gemm_tstore_pdlb_pf2"
+    for stem in ("gemm", "gemm_n192", "gemm_tstore_n384_k128"):
+        with pytest.raises(ValueError, match="no _pdlb form"):
+            cb._pdlb_stem(stem)
+    assert cb._entry_gemm_pdlb({"route": "gemm", "gemm_pdlb": 1}) is True
+    assert cb._entry_gemm_pdlb({"route": "gemm", "gemm_pdlb": 0}) is False
+    assert cb._entry_gemm_pdlb({"route": "gemm"}) is False
+    with pytest.raises(ValueError, match="gemm_pdlb"):
+        cb._entry_gemm_pdlb({"route": "gemm", "gemm_pdlb": 2})
+    # round 11 (CAKE-985 T2-e, _st): the static one-tile form takes the _cs<S> slot of the plain _n192_k128 TMA-store /
+    # staged-register stems; no 384-wide, register-epilogue, stream-K, cluster split-K or _pdlb composition
+    assert "gemm_static" in cb.GEMM_N384_CELL_CONFLICTS
+    assert cb.gemm_n384_cell_conflicts({"gemm_bn": 384, "gemm_static": 1}) == [
+        "gemm_static"
+    ]
+    assert cb._st_stem("gemm_tstore_n192_k128") == "gemm_tstore_n192_k128_st"
+    assert cb._st_stem("gemm_rstaged_n192_g64_k128") == "gemm_rstaged_n192_g64_k128_st"
+    for stem in (
+        "gemm_n192_k128",
+        "gemm_tstore",
+        "gemm_tstore_n192",
+        "gemm_tstore_k128",
+        "gemm_tstore_n384_k128",
+        "gemm_tstore_n192_k128_cs2",
+        "gemm_tstore_n192_k128_skf",
+    ):
+        assert not cb._st_eligible(stem), stem
+        with pytest.raises(ValueError, match="no _st form"):
+            cb._st_stem(stem)
+    with pytest.raises(ValueError, match="no _pdlb form"):
+        cb._pdlb_stem("gemm_tstore_n192_k128_st")
+    assert cb._entry_gemm_static({"route": "gemm", "gemm_static": 1}) is True
+    assert cb._entry_gemm_static({"route": "gemm", "gemm_static": 0}) is False
+    assert cb._entry_gemm_static({"route": "gemm"}) is False
+    with pytest.raises(ValueError, match="gemm_static"):
+        cb._entry_gemm_static({"route": "gemm", "gemm_static": 2})
+    assert cb.gemm_static_cell_conflicts(None) == ["gemm_bn", "gemm_bk"]
+    assert (
+        cb.gemm_static_cell_conflicts(
+            {
+                "route": "gemm",
+                "gemm_bn": 192,
+                "gemm_bk": 128,
+                "gemm_static": 1,
+                "gemm_gm": 64,
+                "quant_units": 4,
+            }
+        )
+        == []
+    )
+    assert cb.gemm_static_cell_conflicts(
+        {"gemm_bn": 192, "gemm_bk": 128, "gemm_cs": 2, "gemm_pdlb": 1}
+    ) == [
+        "gemm_cs",
+        "gemm_pdlb",
+    ]
+    assert cb.gemm_static_cell_conflicts(
+        {
+            "gemm_bn": 192,
+            "gemm_bk": 128,
+            "gemm_pf": 2,
+            "gemm_skf": 2,
+            "gemm_ts_slots": 4,
+        }
+    ) == [
+        "gemm_pf",
+        "gemm_skf",
+        "gemm_ts_slots",
+    ]
+    assert cb.gemm_static_cell_conflicts({"gemm_bn": 256, "gemm_bk": 128}) == [
+        "gemm_bn"
+    ]
+    # round 11 (CAKE-985 T6, _gs): the static grid-stride form takes the same slot of the plain _k128 / _n192_k128 TMA-store stems;
+    # exclusive with _st, no 384-wide, staged-register, register-epilogue, stream-K, cluster split-K, stage or _pdlb composition
+    assert (
+        "gemm_gs" in cb.GEMM_N384_CELL_CONFLICTS
+        and "gemm_gs" in cb.GEMM_STATIC_CELL_CONFLICTS
+    )
+    assert "gemm_static" in cb.GEMM_GS_CELL_CONFLICTS
+    assert cb.gemm_n384_cell_conflicts({"gemm_bn": 384, "gemm_gs": 1}) == ["gemm_gs"]
+    assert cb.gemm_static_cell_conflicts(
+        {"gemm_bn": 192, "gemm_bk": 128, "gemm_gs": 1}
+    ) == ["gemm_gs"]
+    for stem, expected in (
+        ("gemm_tstore_k128", "gemm_tstore_k128_gs"),
+        ("gemm_tstore_n192_k128", "gemm_tstore_n192_k128_gs"),
+        ("gemm_tstore_g64_k128", "gemm_tstore_g64_k128_gs"),
+        ("gemm_tstore_n192_g64_k128", "gemm_tstore_n192_g64_k128_gs"),
+    ):
+        assert cb._gs_eligible(stem) and cb._gs_stem(stem) == expected, stem
+    for stem in (
+        "gemm_k128",
+        "gemm_rstaged_k128",
+        "gemm_rstaged_n192_k128",
+        "gemm_tstore",
+        "gemm_tstore_n192",
+        "gemm_tstore_n384_k128",
+        "gemm_tstore_n192_k128_cs2",
+        "gemm_tstore_n192_k128_st",
+        "gemm_tstore_k128_s2_ts4",
+        "gemm_tstore_k128_skf",
+    ):
+        assert not cb._gs_eligible(stem), stem
+        with pytest.raises(ValueError, match="no _gs form"):
+            cb._gs_stem(stem)
+    with pytest.raises(ValueError, match="no _pdlb form"):
+        cb._pdlb_stem("gemm_tstore_k128_gs")
+    assert cb._entry_gemm_gs({"route": "gemm", "gemm_gs": 1}) is True
+    assert cb._entry_gemm_gs({"route": "gemm", "gemm_gs": 0}) is False
+    assert cb._entry_gemm_gs({"route": "gemm"}) is False
+    with pytest.raises(ValueError, match="gemm_gs"):
+        cb._entry_gemm_gs({"route": "gemm", "gemm_gs": 2})
+    assert cb.gemm_gs_cell_conflicts(None) == ["gemm_bk"]
+    assert (
+        cb.gemm_gs_cell_conflicts(
+            {
+                "route": "gemm",
+                "gemm_bk": 128,
+                "gemm_gs": 1,
+                "gemm_gm": 64,
+                "quant_units": 4,
+            }
+        )
+        == []
+    )
+    assert (
+        cb.gemm_gs_cell_conflicts(
+            {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128, "gemm_gs": 1}
+        )
+        == []
+    )
+    assert cb.gemm_gs_cell_conflicts(
+        {"gemm_bn": 192, "gemm_bk": 128, "gemm_static": 1, "gemm_pdlb": 1}
+    ) == ["gemm_pdlb", "gemm_static"]
+    assert cb.gemm_gs_cell_conflicts({"gemm_bn": 384, "gemm_bk": 128}) == ["gemm_bn"]
+    assert cb.gemm_gs_cell_conflicts(
+        {"gemm_bk": 128, "gemm_pf": 2, "gemm_skf": 2, "gemm_ts_slots": 4}
+    ) == ["gemm_pf", "gemm_skf", "gemm_ts_slots"]
+    # the launched pairs P' = min(T, sm_count // 2): the T6 prototype launches (kv_b 1024 / 16384 at bn 192 / 256) and a one-tile launch
+    assert cb._gs_pairs(148, 8, 128) == 74 and cb._gs_pairs(152, 8, 128) == 76
+    assert cb._gs_pairs(148, 128, 96) == 74 and cb._gs_pairs(152, 128, 96) == 76
+    assert (
+        cb._gs_pairs(148, 8, 12) == 48 and cb._gs_pairs(152, 8, 16) == 64
+    )  # tp8:kv_b:1024 (m_tiles 8): bn 256 / 192, T <= resident pairs -> P' = T
+    with pytest.raises(ValueError, match="at least one pair tile"):
+        cb._gs_pairs(148, 0, 3)
+
+
+def test_sk_bindings_carry_no_split_scalars(monkeypatch):
+    """Round 11 (CAKE-985 T6, ``_gs``): the stream-K hand-off bindings of a GEMM launch are the two workspace tensors only;
+    the split scalars (``sk_pairs`` / ``sk_rem`` / ``sk_ksplit`` / ``sk_dp``) come from the stage arguments
+    (``_sk_scalar_kwargs``) alone.  The call-bound dictionary is applied over the stage arguments, so a scalar binding would
+    shadow them: the grid-stride programs read their launched pairs P' from ``sk_pairs`` with no hand-off area, and a zero
+    binding launched them with no tiles (the FIN tip-3 FI target test found the ``_gs`` rows' output unwritten)."""
+    import types
+
+    monkeypatch.setattr(
+        cb,
+        "_sk_dummy",
+        lambda device: (
+            torch.zeros((64,), dtype=torch.float32),
+            torch.zeros((128,), dtype=torch.uint32),
+        ),
+    )
+    # the largest hand-off area of the classes below: the fix-up form's partial slots behind the flags
+    sf = torch.zeros((cb.GEMM_SK_FLAG_BYTES + 4096,), dtype=torch.uint8)
+    device = torch.device("cpu")
+    tensors = {"sk_partials", "sk_flags"}
+    assert tensors <= cb._CALL_ARGS
+    plain = types.SimpleNamespace(
+        gemm_skf=None,
+        gemm_skp=None,
+        gemm_gs=False,
+        gemm_gs_pairs=0,
+        counters_offset=0,
+    )
+    gs = types.SimpleNamespace(
+        gemm_skf=None,
+        gemm_skp=None,
+        gemm_gs=True,
+        gemm_gs_pairs=76,
+        counters_offset=0,
+    )
+    skf = types.SimpleNamespace(
+        gemm_skf=types.SimpleNamespace(
+            pairs=74, total=5, slots=2, first=3, partial_bytes=4096
+        ),
+        gemm_skp=None,
+        gemm_gs=False,
+        gemm_gs_pairs=0,
+        counters_offset=0,
+    )
+    for plan in (plain, gs, skf):
+        bound = cb._sk_launch_kwargs(plan, sf, device)
+        scalars = cb._sk_scalar_kwargs(plan)
+        assert set(bound) == tensors, sorted(bound)
+        assert not (set(bound) & set(scalars)), sorted(set(bound) & set(scalars))
+        assert set(scalars) >= {"sk_pairs", "sk_rem", "sk_ksplit", "sk_dp"}
+    assert cb._sk_scalar_kwargs(plain) == dict(
+        sk_pairs=0, sk_rem=0, sk_ksplit=0, sk_dp=0
+    )
+    assert cb._sk_scalar_kwargs(gs) == dict(sk_pairs=76, sk_rem=0, sk_ksplit=0, sk_dp=0)
+    assert cb._sk_scalar_kwargs(skf) == dict(
+        sk_pairs=74, sk_rem=5, sk_ksplit=2, sk_dp=3
+    )
+    with pytest.raises(ValueError, match="stream-K partial area"):
+        cb._sk_launch_kwargs(skf, sf[:64], device)
 
 
 def test_padding_and_k_sets():
     assert n_padded(12) == 256 and n_padded(6284) == 6400 and n_padded(1536) == 1536
-    assert cb.n_padded_128(12) == 128 and cb.n_padded_128(6284) == 6400
     assert (
         k_sets(128) == 2
         and k_sets(512) == 4
@@ -343,6 +636,9 @@ def test_decode_config_rules(arch):
         assert cfg.tiles == n_tiles128 * -(-bucket // cfg.tok)
         # Round 6 (lever M): at the bucket's M every N tile's m tiles fill whole clusters; one cluster item per N tile.
         assert cfg.mc == int(entry.get("mc", 1)) and cfg.pf == int(entry.get("pf", 0))
+        # Round 8 (lever PW; adopted round 11 C20 on the sm_103a 192,2,64 cell): the first-item W-stream L2 prefetch depth is a
+        # table key of any decode row (no constraint); it names the ``_pw<D>`` program and changes no launch argument.
+        assert cfg.pw == int(entry.get("pw", 0))
         # Round-6 next loop (lever PX): the BF16 token-tile L2 prefetch applies to fused, non-resident rows only.
         assert cfg.pfx == (
             int(entry.get("pfx", 0)) if (cfg.fused and not cfg.resident) else 0
@@ -400,6 +696,9 @@ def test_decode_config_rules(arch):
         # Round 6: ``_mc<C>`` / ``_pf<D>`` close the key (after the cluster split-K field); strip them for the older checks.
         assert (f"_mc{cfg.mc}" in cfg.kernel_key) == (cfg.mc > 1)
         assert (f"_pf{cfg.pf}" in cfg.kernel_key) == (cfg.pf > 0)
+        assert (f"_pw{cfg.pw}" in cfg.kernel_key) == (
+            cfg.pw > 0
+        )  # round 8 (lever PW): ``_pw<D>`` after ``_pf<D>``, before ``_px<D>``
         assert (f"_px{cfg.pfx}" in cfg.kernel_key) == (cfg.pfx > 0)
         assert (f"_pi{cfg.pfi}" in cfg.kernel_key) == (cfg.pfi > 0)
         # Round 7 (lever XP): the parallel-issue DSM exchange closes the key; cluster split-K rows only.
@@ -412,7 +711,7 @@ def test_decode_config_rules(arch):
         # Round 8: the epilogue-chunk and cluster split-K tokens (``_c<N>``, ``_cs<N>[a]``) follow ``_q`` as well (the
         # 14-CTA fused cells adopted narrow lanes), so they are stripped before the ``_q`` suffix check below.
         core_key = re.sub(
-            r"(_c\d+)?(_cs\d+a?)?(_mc\d+)?(_pf\d+)?(_px\d+)?(_dpf)?(_pi\d+)?(_xp)?$",
+            r"(_c\d+)?(_cs\d+a?)?(_mc\d+)?(_pf\d+)?(_pw\d+)?(_px\d+)?(_dpf)?(_pi\d+)?(_xp)?$",
             "",
             cfg.kernel_key,
         )
@@ -596,8 +895,9 @@ def test_decode_config_round6_continuation_rules(arch):
     # Round 8 (knob-catalog sweep, passes 1-5) adopted further bit-exact tstore cells on both GPUs, and pass 14 adopted
     # ``tstore`` on the 24,2,512 cell of both architectures (27 / 29); see the Cake design record, round 8 (R8-14 and
     # the pass records).  Round 9 (K2, rule-5 packets): the sm_103a 5,28,512 cell moved to a 3-CTA cluster split-K route,
-    # which has no TMA-store epilogue, so its ``tstore`` flag is 0 (27 / 28).
-    assert n_tstore == {"sm_100a": 27, "sm_103a": 28}[arch]
+    # which has no TMA-store epilogue, so its ``tstore`` flag is 0 (27 / 28).  Round 10 (S1): the sm_103a 5,28,2048 cell
+    # moved to the cluster split-K GEMM route (``gemm_cs`` 2), leaving the decode table (27 / 27).
+    assert n_tstore == {"sm_100a": 27, "sm_103a": 27}[arch]
     # Round-6 next loop (lever PX-S): eight small fused buckets per architecture prefetch their BF16 token tile one stage
     # ahead of its TMA load (``pfx: 1`` -> the ``_px1`` program); a prefetch changes no data path and no launch argument.
     n_pfx = 0
@@ -734,7 +1034,411 @@ def test_decode_config_round6_continuation_rules(arch):
     narrow = {k: e for k, e in decode_table(arch).items() if "gemm_bn" in e}
     # round 7 adds measured 192-wide cells on the 512 / 1024 / 2048 buckets; the round-6 kv_a cells stay
     assert {"5,28,16384", "5,28,4096"} <= set(narrow)
-    assert all(e["route"] == "gemm" and e["gemm_bn"] == 192 for e in narrow.values())
+    assert all(
+        e["route"] == "gemm" and e["gemm_bn"] in (192, 384) for e in narrow.values()
+    )
+    # Round 10 (CAKE-985 S3, the 128 x 384 pair tile, ``gemm_bn`` 384): the exact ``gemm_bn`` cell sets of the table.
+    # 96,28,512 (tp1 q_proj, N = 12288) adopted the 384-wide TMA-store form on both GPUs after R8-3 confirms on the
+    # cell's contract row tp1:q_proj:512 (tree 7d77cb55, node alone: B200 step b0e67e6c quiet 1.0322, shared 1.0322 /
+    # 1.0322; GB300 step beac25b1 quiet 1.0370, shared 1.0370 / 1.0362; bit-exact, Tier A); 48,28,1024 (tp8 fused_qkvg,
+    # N = 6144) adopted it on sm_103a only (GB300 step 89f144ca quiet 1.0604, shared 1.0751 / 1.0734; Tier A' vs the
+    # fix-up stream-K record, rule-5 packet PASS step a0095eec) while sm_100a keeps its 192 + pf1 record cell (the 384
+    # arms read 0.966 there); 12,28,4096 (tp8 q_proj, N = 1536) adopted it on sm_103a only (GB300 step 2ceb0c33, node
+    # alone: quiet 1.0357, shared 1.0349 / 1.0356; bit-exact vs the ordered stream-K record, Tier A) while sm_100a (the
+    # 384 arms read 1.0065 there) replaced its ordered stream-K record with the prefetched stream-K form (round 10
+    # S2, ``gemm_skp`` 4; the ``skp_rows`` block below).  A 384 cell carries none of
+    # ``gemm_pf`` / ``gemm_sk`` / ``gemm_skf`` / ``gemm_sks`` / ``gemm_skp`` (the last: lever SKP, the FIN merge rule)
+    # (``gemm_n384_cell_conflicts``: the instance implies ``gemm_bk`` 128, the plain CLC schedule, no weight prefetch).
+    n192 = {k for k, e in narrow.items() if e["gemm_bn"] == 192}
+    n384 = {k for k, e in narrow.items() if e["gemm_bn"] == 384}
+    n192_common = {
+        "12,1,16384",  # round 11 C25 (CAKE-985 T7, FIN tip 8): gemm_bn 192 on both GPUs after the C24 staging-slot fix
+        "12,1,2048",
+        "12,1,4096",
+        "12,28,16384",
+        "12,28,2048",
+        "17,28,16384",
+        "192,2,1024",
+        "192,2,256",
+        "24,2,1024",
+        "24,2,2048",
+        "48,28,4096",
+        "48,28,512",
+        "5,28,16384",
+        "5,28,4096",
+        "50,28,1024",
+        "50,28,512",
+        "96,1,2048",
+        "96,1,512",
+        "96,28,256",
+    }
+    # round 10 S1: sm_103a 5,28,2048 (tp1/tp8:kv_a:2048) left the decode table for the 192-wide cluster split-K
+    # GEMM cell (``gemm_cs`` 2, ``gemm_bk`` 128), so it is a 192-wide cell there only.  Round 10 S6: the sm_103a
+    # 50,28,512 cell (tp8:in_proj_qkvgfab:512) adopted ``gemm_bn`` 192 next to its ``gemm_bk`` 128 (GB300 node alone,
+    # confirm step 88ce5919: quiet 1.053, shared 1.060 / 1.059, bit-exact, Tier A) -- the ``gemm_rstaged_n192_k128``
+    # program the sm_100a cell has launched since round 8 (the 8-byte-aligned 6284-column edge keeps the staged-register
+    # epilogue), so the cell is 192-wide on both architectures now.
+    # Round 11 T7 pass 1 (CAKE-985): the sm_100a 17,28,16384 cell (tp1:fused_qkv_a:16384) adopted ``gemm_bn`` 192 +
+    # ``gemm_bk`` 128 (B200 node alone, R8-3 confirm step 7da46b38: quiet 1.0153, shared 1.0168 / 1.0169, bit-exact, Tier A)
+    # -- the ``gemm_tstore_n192_k128`` program of its sm_103a twin (there since round 9, with ``gemm_skf`` 1), so the cell is
+    # 192-wide on both architectures now.
+    # Round 11 T3 (CAKE-985 U-T3-1): the OOB-safe admissibility rule (``gemm_n192_admissible``: every 32-row B box of the partial
+    # last tile stored or fully out of range) admits the 192-wide tile on the o_proj rows (7168 columns); the sm_103a cells
+    # 56,48,512 / 56,6,512 / 56,48,1024 adopted ``gemm_bn`` 192 (GB300 node alone, R8-3 step b2c9faab: quiet 1.0826 / 1.0233,
+    # shared 1.0907, 1.0921 / 1.0181, 1.0197; S5 step 91f753b8: 1.0703 x3; all bit-exact, Tier A).  Round 11 T4-U2: the sm_103a
+    # 96,28,16384 cell (tp1:q_proj:16384) is a new 384-wide cell (R8-3 step 2eb3a4c0: quiet 1.0193, shared 1.0173 / 1.0182,
+    # bit-exact) with a record-default sm_100a twin.
+    # Round 11 C17 (CAKE-985 T3, Tier A'): the sm_100a 56,48,1024 cell (tp1:o_proj:1024) carries ``gemm_bn`` 192 next to its
+    # ``gemm_bk`` 128 + ``gemm_skf`` 1 (B200 node alone, R8-3 step cb326b20 on tree 5d76afd2: quiet 1.0651, shared 1.0675 / 1.0675,
+    # controls in band; rule-5 refined 5(a) packet PASS step acc7795e), program ``gemm_tstore_n192_k128_skf`` -- the program the
+    # 5,28,16384 cell launches on both GPUs, so no new instance.
+    assert (
+        n192
+        == n192_common
+        | {
+            "sm_100a": {"48,28,1024", "56,48,1024"},
+            "sm_103a": {
+                "24,2,4096",
+                "5,28,2048",
+                "50,28,4096",
+                "56,48,512",
+                "56,6,512",
+                "56,48,1024",
+                "12,28,4096",
+            },
+        }[arch]
+    )
+    # Round 11 T4-U2 (C11): the sm_100a 384,28,16384 (tp1:fused_qkvg:16384) and 386,28,16384 (tp1:in_proj_qkvgfab:16384) cells
+    # are new 384-wide cells (B200 node alone, power-capped rows, R8-3 step fcb28e62: quiet 1.0208 / 1.0131, shared 1.0282, 1.0237 /
+    # 1.0203, 1.0195, bit-exact, Tier A) with record-default sm_103a twins (the GB300 arms read below the bar there).  Round 11
+    # T4-U2 (C12): the sm_103a 56,48,16384 cell (tp1:o_proj:16384) is a new 384-wide cell (GB300 node alone, R8-3 re-confirm step
+    # 895173e9: quiet 1.0363, shared 1.0332 / 1.0349, controls in band, bit-exact, Tier A) with a record-default sm_100a twin.
+    # Round 11 T3 screen2 (C13): the sm_103a 12,28,4096 cell (tp8:q_proj:4096, N = 1536 = 8 x 192) left the 384-wide tile for
+    # ``gemm_bn`` 192 + ``gemm_bk`` 128 (GB300 node alone, R8-3 step 4ae5004a on tree 16a5ad81: quiet 1.0208, shared 1.0208 /
+    # 1.0215, controls in band, bit-exact, Tier A), so it is a 192-wide cell on sm_103a now (sm_100a keeps ``gemm_skp`` 4).
+    assert (
+        n384
+        == {
+            "sm_100a": {"96,28,512", "384,28,16384", "386,28,16384"},
+            "sm_103a": {"96,28,512", "48,28,1024", "96,28,16384", "56,48,16384"},
+        }[arch]
+    )
+    for key in sorted(n384):
+        cell = narrow[key]
+        assert cell["route"] == "gemm" and cell["gemm_bn"] == 384
+        assert not any(
+            cell.get(k)
+            for k in ("gemm_pf", "gemm_sk", "gemm_skf", "gemm_sks", "gemm_skp")
+        )
+        assert cb.gemm_n384_cell_conflicts(cell) == []
+    assert cb.gemm_block_n(512, 96, 28, arch, 12288, 12288) == 384
+    assert (
+        cb.gemm_block_n(384, 96, 28, arch, 12288, 12288) == 384
+    )  # the 512 bucket (M 257-512) is one cell
+    assert (
+        cb.gemm_block_n(1024, 48, 28, arch, 6144, 6144)
+        == {"sm_100a": 192, "sm_103a": 384}[arch]
+    )
+    assert (
+        cb.gemm_block_n(4096, 12, 28, arch, 1536, 1536)
+        == {"sm_100a": 256, "sm_103a": 192}[arch]
+    )  # round 11 C13: the sm_103a cell is 192-wide (was 384 since round 10 S3)
+    # round 10 S6: the 192 storage-fit rule passes on the tp8 in_proj_qkvgfab edge (33 x 192 = 6336 <= 6400 stored
+    # columns) on both GPUs, and the cell's staged-register 192-wide 128-K program is in both plans
+    assert cb.gemm_block_n(512, 50, 28, arch, 6284, 6400) == 192
+    assert "gemm_rstaged_n192_k128" in required
+    # round 11 (CAKE-985 T3, U-T3-1): ``gemm_n192_admissible`` -- the storage-fit way in is untouched, and the OOB-safe rule
+    # (``n_valid % 32 == 0 and n_pad == n_tiles128 x 128``: every 32-row B box of the partial last tile is stored or fully
+    # out of range) admits the N = 7168 o_proj families (38 x 192 = 7296 > 7168 stored rows) and the N = 49376 tp1 in_proj
+    # family (258 x 192 = 49536 > 49408); a valid edge off the 32-row boundary or an inconsistent padding stays refused.  No
+    # cell of those families carries ``gemm_bn`` yet, so the rule alone selects no new program on either host.
+    assert cb.gemm_n192_admissible(6284, 6400, 50)
+    assert cb.gemm_n192_admissible(576, 768, 5)
+    assert cb.gemm_n192_admissible(7168, 7168, 56) and cb.gemm_n192_admissible(
+        49376, 49408, 386
+    )
+    assert not cb.gemm_n192_admissible(7160, 7168, 56)
+    assert not cb.gemm_n192_admissible(250, 256, 2)
+    assert not cb.gemm_n192_admissible(7168, 7232, 56)
+    # Round 11 T3 adoption (C8 810285f1): the sm_103a cells 56,48,512 / 56,6,512 / 56,48,1024 carry ``gemm_bn`` 192 (GB300
+    # node alone, R8-3 step b2c9faab / S5 step 91f753b8, bit-exact); every other cell of those families stays 256-wide -- the
+    # B200 screen (step c55c988b) read 0.73 / 0.89 / not bit-exact there -- except the 384-wide T4-U2 cells of these families
+    # (the ``n384`` inventory above): sm_100a 386,28,16384 (C11) and sm_103a 56,48,16384 (C12), neither of them 192-wide.
+    # Round 11 C17: the sm_100a 56,48,1024 cell joined them (Tier A', R8-3 step cb326b20 + packet step acc7795e; see above).
+    n192_o_proj = {
+        "sm_100a": {"56,48,1024"},
+        "sm_103a": {"56,48,512", "56,6,512", "56,48,1024"},
+    }[arch]
+    n384_in_proj = {"sm_100a": {"386,28,16384"}, "sm_103a": {"56,48,16384"}}[arch]
+    assert {
+        k
+        for k, e in decode_table(arch).items()
+        if k.startswith(("56,6,", "56,48,", "386,28,")) and e.get("gemm_bn") == 192
+    } == n192_o_proj
+    assert {
+        k
+        for k, e in decode_table(arch).items()
+        if k.startswith(("56,6,", "56,48,", "386,28,")) and e.get("gemm_bn") == 384
+    } == n384_in_proj
+    assert (
+        not {
+            k
+            for k, e in decode_table(arch).items()
+            if k.startswith(("56,6,", "56,48,", "386,28,")) and "gemm_bn" in e
+        }
+        - n192_o_proj
+        - n384_in_proj
+    )
+    for bucket, n_tiles128, num_k_iters in (
+        (512, 56, 6),
+        (512, 56, 48),
+        (1024, 56, 48),
+        (2048, 56, 48),
+        (16384, 56, 48),
+    ):
+        key = f"{n_tiles128},{num_k_iters},{bucket}"
+        assert cb.gemm_block_n(bucket, n_tiles128, num_k_iters, arch, 7168, 7168) == (
+            192 if key in n192_o_proj else 384 if key in n384_in_proj else 256
+        )
+    # round 10 S6 / S5 v2 (CAKE-985): the GEMM-cell adoptions of the FIN confirms, all bit-exact (Tier A).  sm_103a (GB300
+    # 964581 node alone): 192,2,2048 (tp1:kv_b:2048, gemm_bk 128; R8-3 confirm step 856eec52: quiet 1.0164, shared 1.0229 /
+    # 1.0218; a new cell, so sm_100a reads the 256-K default for the key), 96,1,4096 (tp1:f_b:4096, gemm_bk 128; re-run
+    # step 6bb7e8f4: quiet 1.0167, shared 1.0292 / 1.0278; K = 128 is one 128-K block, so the key's K index stays
+    # ceil(128 / 256) = 1 and the cell's program is the ``gemm_tstore_k128_s2_ts4`` form next to its r9 G1 stage / slot keys
+    # -- the program the sm_100a cell has launched since round 9) and 144,6,256 (tp1:q_b:256, gemm_bk 128; S5 v2
+    # interleaved confirm step e752af34: 1.025 / 1.0273 / 1.0273).  sm_100a (B200 2226889 exclusive node): 144,6,256
+    # (gemm_bk 128; S5 v2 step d89bcdb7: 1.0261 / 1.0240 / 1.0239, so the cell is 128-K on both GPUs now) and 24,2,16384
+    # (tp8:kv_b:16384, gemm_stages 2 / gemm_ts_slots 4 -- the r9 K6 arm G1 pair; R8-3 confirm step 9cd4283a: quiet 1.0242,
+    # shared 1.0271 / 1.0280 -- then gemm_bk 128 too, adoption 5: node-alone R8-3 confirm step 30e8940b on B200 2228368,
+    # quiet 1.026, shared 1.029 / 1.028, so the cell launches the ``gemm_tstore_k128_s2_ts4`` program the sm_103a twin has
+    # launched since round 9).  No new program: the ``_k128`` and
+    # ``_s2_ts4`` TMA-store forms are in both plans already.
+    # Round 11 C17 (CAKE-985 T7): the sm_100a 192,2,2048 cell adopted ``gemm_bk`` 128 too (B200 node alone, R8-3 step cb326b20 on
+    # tree 5d76afd2: quiet 1.0157, shared 1.0168 / 1.0178, controls in band, bit-exact, Tier A), so both GPUs launch
+    # ``gemm_tstore_k128`` / ``gemm_rstaged_k128`` there now.
+    assert cb.gemm_block_k(2048, 192, 2, arch) == 128
+    assert cb.gemm_block_k(4096, 96, 1, arch) == 128 and cb.gemm_stages_ts_slots(
+        4096, 96, 1, arch
+    ) == (2, 4)
+    assert cb.gemm_block_k(256, 144, 6, arch) == 128
+    assert cb.gemm_stages_ts_slots(16384, 24, 2, arch) == (2, 4)
+    # round 11 C18 (CAKE-985 T7 pass 3): the sm_103a 96,1,512 cell (tp1:f_b:512, gemm_bn 192, 256-K) carries the stage / slot pair
+    # too (GB300 S5 v2 step d6567748; program gemm_tstore_n192_s2_ts4); the sm_100a cell keeps gemm_bn 192 + gemm_bk 128
+    assert (
+        cb.gemm_stages_ts_slots(512, 96, 1, arch)
+        == {"sm_100a": (3, 1), "sm_103a": (2, 4)}[arch]
+    )
+    assert cb.gemm_block_k(512, 96, 1, arch) == {"sm_100a": 128, "sm_103a": 256}[arch]
+    # round 11 C25 (CAKE-985 T7, FIN tip 8): the 12,1,16384 cell (tp8:f_b:16384, 256-K, gemm_stages 2 / gemm_ts_slots 4 since
+    # round 9) adopted gemm_bn 192 on BOTH GPUs once the FIN tip-7 fix C24 (TMA-store staging-slot wait covers the 192-wide
+    # drain) made the n192 x s2_ts4 composition exact: S5 v2 on the fixed tree, node alone, bit-exact -- B200 step ee27c6e0
+    # 1.02372 / 1.02367 / 1.02372, GB300 step fc1e9fd3 1.01575 / 1.01772 / 1.01575; program gemm_tstore_n192_s2_ts4
+    assert cb.gemm_stages_ts_slots(16384, 12, 1, arch) == (2, 4)
+    assert cb.gemm_block_n(16384, 12, 1, arch, 1536, 1536) == 192
+    # round 11 C20 (CAKE-985 T7 pass 4; GB300 S5 v2 step 23316854 on tree 66fec20d, mode ab 3 x 1000, all bit-exact, Tier A): the sm_103a
+    # 1,28,2048 cell (tp1/tp8 b_proj:2048 + f_a:2048) runs 16 quantizing warps (``qwarps`` 16 -> ``_w16`` right after ``_fused``: the same
+    # 8-lane units and per-128-block reduction split over twice the warps; 1.04054 x3 / 1.04027 x3, aa 1.0) and the sm_103a 192,2,64 cell
+    # (tp1:kv_b:64) prefetches its first work item's W stream two stages deep before the PDL wait (``pw`` 2 -> ``_pw2`` in the ``_pf<D>``
+    # slot; 1.02326 / 1.01938 / 1.01938).  sm_100a keeps the 192,2,64 cell.  ``decode:t64_p2_fused_r2_xh_q8_cs4_xp`` leaves the sm_103a plan
+    # (the 1,28,2048 cell was its only sm_103a producer); ``decode:t64_p4_tso`` stays (144,6,64 / 24,2,256 / 384,28,64) next to the new
+    # ``_pw2`` pair (the register twin ``decode:t64_p4_pw2`` reaches the export plan through the coverage row ``tp1_kv_b_m64_fb``).
+    # round 11 C21 (CAKE-985 T7 pass 4; B200 exclusive node, S5 v2 step 65837e54 on tree 66fec20d, mode ab 3 x 1000, 1965 MHz): the sm_100a
+    # 1,28,2048 cell runs 16 quantizing warps too (tp1:b_proj 1.04015 / 1.03797 / 1.04017, tp1:f_a 1.04 / 1.03895 / 1.04206, tp8:b_proj 1.03797 /
+    # 1.03797 / 1.03593, tp8:f_a 1.04 / 1.04007 / 1.04, aa 0.998-1.002, bit-exact, Tier A), so the ``_w16`` program is in both plans and the plain
+    # ``decode:t64_p2_fused_r2_xh_q8_cs4_xp`` is in neither (each GPU's 1,28,2048 cell was its only producer).
+    cfg_2048 = decode_config(2048, 1, 28, arch, SM_COUNT)
+    assert (
+        cfg_2048.qwarps,
+        cfg_2048.qlanes,
+        cfg_2048.xb_stages,
+        cfg_2048.xbh,
+        cfg_2048.csplit,
+        cfg_2048.xp,
+    ) == (16, 8, 2, True, 4, True)
+    assert cfg_2048.kernel_key == "decode:t64_p2_fused_w16_r2_xh_q8_cs4_xp"
+    assert "decode:t64_p2_fused_r2_xh_q8_cs4_xp" not in required
+    assert "decode:t64_p2_fused_w16_r2_xh_q8_cs4_xp" in required
+    cfg_kvb64 = decode_config(64, 192, 2, arch, SM_COUNT)
+    assert (
+        cfg_kvb64.tok,
+        cfg_kvb64.split,
+        cfg_kvb64.fused,
+        cfg_kvb64.tstore,
+        cfg_kvb64.pw,
+    ) == (64, 1, False, True, {"sm_100a": 0, "sm_103a": 2}[arch])
+    assert (
+        cfg_kvb64.kernel_key
+        == {"sm_100a": "decode:t64_p4", "sm_103a": "decode:t64_p4_pw2"}[arch]
+    )
+    assert (
+        cfg_kvb64.kernel_key_for(True)
+        == {"sm_100a": "decode:t64_p4_tso", "sm_103a": "decode:t64_p4_pw2_tso"}[arch]
+    )
+    assert {"decode:t64_p4", "decode:t64_p4_tso"} <= required
+    assert ({"decode:t64_p4_pw2", "decode:t64_p4_pw2_tso"} <= required) == (
+        arch == "sm_103a"
+    )
+    assert (
+        cb.gemm_block_k(16384, 24, 2, arch) == 128
+    )  # round 10 adoption 5: 128-K on both GPUs
+    # Round 11 T6 (CAKE-985): the static grid-stride ``_gs`` cells (``gemm_gs`` 1 next to ``gemm_bk`` 128; TMA-store rows only, the
+    # staged-register rows keep the ``_k128`` program).  C14 (sm_103a, GB300 S5 v2 step a5e13a03): 96,1,2048 / 12,1,4096 / 24,2,1024 /
+    # 24,2,2048 on the 192-wide form.  C17 (sm_100a, B200 node alone, R8-3 step cb326b20 + S5 v2 step 76fc5ec4 on tree 5d76afd2, all
+    # bit-exact, Tier A): the same four cells plus 17,28,2048 (tp1/tp8:fused_qkv_a:2048), 56,6,2048 (tp8:o_proj:2048), 24,2,4096
+    # (tp8:kv_b:4096) and 56,6,512 (tp8:o_proj:512) on the 256-wide form -- ``gemm_tstore_k128_gs`` was an sm_100a program only until
+    # C20.  C20 (sm_103a, T6-U3e; GB300 node alone, form-change screen step d20d3aa8 + S5 v2 step 5f04d5ef on tree 69baa8e0, bit-exact,
+    # Tier A): 12,1,2048 (tp8:f_b:2048; gemm_bn 192 + gemm_bk 128 + gemm_gs 1, 1.02041 x3, the no-GS counterpart 1.0 x3) and 18,6,2048
+    # (tp8:q_b:2048; gemm_bk 128 + gemm_gs 1 next to its quant_units 2, 1.01643 x3, the counterpart 1.00932 x3) left their round-7
+    # ``gemm_pf`` 2 behind, so ``gemm_tstore_k128_gs`` is in both plans now and ``gemm_tstore_n192_pf2`` is an sm_100a program only
+    # (12,28,2048 / 48,28,512); ``gemm_tstore_pf2`` stays on sm_103a through 144,6,512 / 144,6,1024 / 144,6,2048 / 17,28,2048 / 386,28,512 /
+    # 56,6,2048 / 56,6,4096.
+    # C19: the sm_100a 192,2,512 cell (tp1:kv_b:512) joined on the 256-wide form and left its round-7 ``gemm_pf`` 2 behind (the
+    # ``_gs`` form has no prefetch composition; B200 node alone, T6 U3d screen step 5f247cc4 on tree 6f3dbb1f, S5 v2 step 4c54d65e
+    # on tree 66fec20d: 1.01987 / 1.01762 / 1.01762, aa 1.0 x3, bit-exact, Tier A; gemm_tstore_pf2 -> gemm_tstore_k128_gs).
+    # ``gemm_tstore_pf2`` stays in both plans: sm_100a 144,6,512 / 144,6,1024 / 56,48,512 and the sm_103a pf-2 256-wide cells.
+    gs_rows = {k for k, e in decode_table(arch).items() if e.get("gemm_gs")}
+    assert (
+        gs_rows
+        == {
+            "sm_100a": {
+                "17,28,2048",
+                "56,6,2048",
+                "96,1,2048",
+                "12,1,4096",
+                "24,2,1024",
+                "24,2,2048",
+                "24,2,4096",
+                "56,6,512",
+                "192,2,512",
+            },
+            "sm_103a": {
+                "96,1,2048",
+                "12,1,4096",
+                "24,2,1024",
+                "24,2,2048",
+                "12,1,2048",
+                "18,6,2048",
+            },
+        }[arch]
+    )
+    assert (
+        cb.gemm_prefetch_distance(512, 192, 2, arch) == 0
+        and cb.gemm_block_k(512, 192, 2, arch) == 128
+    )  # both GPUs: 128-K, no prefetch
+    assert "gemm_tstore_pf2" in required
+    assert all(
+        e["route"] == "gemm"
+        and e.get("gemm_bk") == 128
+        and cb.gemm_gs_cell_conflicts(e) == []
+        for e in (decode_table(arch)[k] for k in gs_rows)
+    )
+    assert "gemm_tstore_n192_k128_gs" in required
+    assert (
+        "gemm_tstore_k128_gs" in required
+    )  # C20: both GPUs (sm_103a through 18,6,2048)
+    # C20 pins: both cells are 128-K without prefetch on sm_103a; sm_100a keeps 12,1,2048 on gemm_bk 128 + gemm_static 1 (no prefetch) and
+    # 18,6,2048 on the record defaults (256-K, no prefetch)
+    assert (
+        cb.gemm_prefetch_distance(2048, 12, 1, arch) == 0
+        and cb.gemm_block_k(2048, 12, 1, arch) == 128
+    )
+    assert (
+        cb.gemm_prefetch_distance(2048, 18, 6, arch) == 0
+        and cb.gemm_block_k(2048, 18, 6, arch) == {"sm_100a": 256, "sm_103a": 128}[arch]
+    )
+    assert ("gemm_tstore_n192_pf2" in required) == (arch == "sm_100a")
+    # Round 11 C22 (CAKE-985 T7 pass 4, Tier A): the sm_100a 56,48,1024 cell (tp1:o_proj:1024) prefetches its W tiles one stage ahead
+    # too (``gemm_pf`` 1 next to its ``gemm_bn`` 192 + ``gemm_bk`` 128 + ``gemm_skf`` 1; B200 node alone, R8-3 confirm step ab7a66fd on
+    # tree 66fec20d: quiet 1.0195, shared 1.0188 / 1.0181, controls in band, bit-exact; 70.112 -> 68.816 us) -- program
+    # ``gemm_tstore_n192_k128_skf_pf1`` (Cake symbol ``kimi_k3_fp8_proj_gemm_tstore_pf1_n192_k128_skf``), new to the sm_100a plan; the
+    # sm_103a cell has prefetched there since round 11 T7 pass 2 (``gemm_tstore_n192_k128_pf1``); the staged-register twin is unchanged.
+    assert (
+        cb.gemm_prefetch_distance(1024, 56, 48, arch) == 1
+        and cb.gemm_block_k(1024, 56, 48, arch) == 128
+    )
+    assert ("gemm_tstore_n192_k128_skf_pf1" in required) == (arch == "sm_100a")
+    # Round 11 C23 (CAKE-985 T7 passes 3/4, Tier A by construction): the sm_100a 18,6,64 cell (tp8:q_b:64) prefetches its first work
+    # item's W stream two stages deep before the PDL wait (``pw`` 2; B200 S5 v2 interleaved confirms t7p3 step c6c3991a 1.02336 / 1.02336 /
+    # 1.02351 and t7p4 step 65837e54 1.02381 x3 on tree 66fec20d, aa 1.0, bit-exact, symbols stable; 7.14 -> 6.72 us) -- program
+    # ``decode:t16_p4_pw2`` replaces ``decode:t16_p4`` in the sm_100a plan (this cell is its only producer); the sm_103a cell is unchanged.
+    cfg_qb64 = decode_config(64, 18, 6, arch, SM_COUNT)
+    assert (
+        cfg_qb64.tok,
+        cfg_qb64.split,
+        cfg_qb64.fused,
+        cfg_qb64.tstore,
+        cfg_qb64.pw,
+    ) == (16, 1, False, False, {"sm_100a": 2, "sm_103a": 0}[arch])
+    assert (
+        cfg_qb64.kernel_key
+        == {"sm_100a": "decode:t16_p4_pw2", "sm_103a": "decode:t16_p4"}[arch]
+    )
+    assert ("decode:t16_p4_pw2" in required) == (arch == "sm_100a")
+    assert ("decode:t16_p4" in required) == (arch == "sm_103a")
+    assert cb.gemm_k128_cell_epilogues(192, 2, 2048) == (
+        True,
+        True,
+    )  # the 2048 bucket holds an 8-byte-stride row
+    assert cb.gemm_k128_cell_epilogues(96, 1, 4096) == (
+        True,
+        False,
+    ) and cb.gemm_k128_cell_epilogues(144, 6, 256) == (True, False)
+    assert cb.gemm_k128_cell_epilogues(24, 2, 16384) == (
+        True,
+        True,
+    )  # the 16384 bucket too; its staged rows keep the untokened program
+    assert {
+        "gemm_tstore_k128",
+        "gemm_tstore_k128_s2_ts4",
+        "gemm_tstore_s2_ts4",
+    } <= required
+    # round 10 S5 v2, full3 (CAKE-985): the sm_103a 18,6,4096 cell (tp8:q_b:4096, gemm_bk 128 since round 9) prefetches its W
+    # tiles one stage ahead (``gemm_pf`` 1; GB300 node alone, step 19f5ae7d: 1.0168 x3, aa 1.0, bit-exact; the full1 confirm
+    # e752af34 read 1.0142 / 1.0168 / 1.0134, borderline).  Its program ``gemm_tstore_k128_pf1`` (Cake symbol
+    # ``kimi_k3_fp8_proj_gemm_tstore_pf1_k128``) is a new instance of the sm_103a plan; sm_100a keeps its plain cell there.
+    # Round 11 T7 pass 1 (CAKE-985): the sm_100a cell prefetches too (``gemm_pf`` 1 on its 256-K program; B200 node alone,
+    # R8-3 confirm step 7da46b38: quiet 1.009, shared 1.0167 / 1.0167, bit-exact, Tier A) -- ``gemm_tstore_pf1``, the program
+    # the sm_100a 144,6,4096 cell has launched since round 8; the ``gemm_bk`` 128 arm of the same pass failed its confirm.
+    # Round 11 T7 pass 2 (C15): the sm_100a cell adopted ``gemm_bk`` 128 next to its ``gemm_pf`` 1 after all (B200 node alone,
+    # R8-3 confirm step 3e09b4fa on tree 16a5ad81: quiet 1.0168, shared 1.0185 / 1.0185, controls in band, bit-exact, Tier A),
+    # so both GPUs launch ``gemm_tstore_k128_pf1`` there now; ``gemm_tstore_pf1`` stays in the plan for the 144,6,4096 cell.
+    q_b_4096 = decode_table(arch)["18,6,4096"]
+    assert (q_b_4096.get("gemm_pf", 0), q_b_4096.get("gemm_bk", 256)) == (1, 128)
+    assert cb.gemm_k128_cell_epilogues(18, 6, 4096) == (True, False)
+    assert "gemm_tstore_k128_pf1" in required
+    assert "gemm_tstore_pf1" in required
+    # round 10 S5 v2 (CAKE-985), the sm_100a decode-cell adoptions (B200 2226889 exclusive node, step d89bcdb7, Tier A
+    # bit-exact): 1,28,1024 (the fused 6-CTA cluster split-K cell of the tp*:{b_proj,f_a}:1024 rows) prefetches its W tiles
+    # one stage ahead into L2 (table key ``pf`` 1 = the env knob LOOM_KIMI_DECODE_PF; ``_pf1`` after ``_cs6``; 1.0266 /
+    # 1.0242-1.0266 / 1.0264 on tp1:b_proj / tp1:f_a / tp8:b_proj), and 5,28,512 (the 3-CTA cluster split-K kv_a cell) pins
+    # the quantization launch width ``quant_units`` 2 (1.0185-1.0209 on tp1 / tp8:kv_a:512; the decode program is unchanged)
+    # -- the width the sm_103a cell has carried since round 9 (its ``acc_bufs`` 2 companion was not confirmed on sm_100a and
+    # is not adopted).
+    cs6_1024 = decode_config(1024, 1, 28, arch, SM_COUNT)
+    assert (cs6_1024.fused, cs6_1024.csplit, cs6_1024.pf, cs6_1024.pfi) == (
+        True,
+        6,
+        {"sm_100a": 1, "sm_103a": 0}[arch],
+        0,
+    )
+    assert ("_pf1" in cs6_1024.kernel_key) == (arch == "sm_100a")
+    assert cb.table_quant_units(512, 5, 28, arch) == 2
+    assert (
+        cb.decode_table_entry(512, 5, 28, arch).get("acc_bufs")
+        == {"sm_100a": None, "sm_103a": 2}[arch]
+    )
+    sm_100a_fused_qkvg_1024 = decode_table("sm_100a")["48,28,1024"]
+    assert (
+        sm_100a_fused_qkvg_1024["gemm_bn"] == 192
+        and sm_100a_fused_qkvg_1024.get("gemm_pf") == 1
+    )
+    # the 384-wide programs the adopted cells launch: always the ``_k128`` TMA-store form on these 16-byte-aligned
+    # column edges; the staged-register form only where the cell's bucket carries 8-byte-stride correctness rows
+    assert "gemm_tstore_n384_k128" in required
+    assert ("gemm_rstaged_n384_k128" in required) == any(
+        cb.gemm_k128_cell_epilogues(*(int(v) for v in key.split(",")))[1]
+        for key in n384
+    )
     for M in (4096, 4097, 16384):
         assert cb.gemm_block_n(M, 5, 28, arch, 576, 768) == 192
     # round 7: M = 257 follows the kv_a 512 cell (the decode route, so the GEMM tile width is the default)
@@ -748,57 +1452,85 @@ def test_decode_config_round6_continuation_rules(arch):
     assert cb.gemm_block_n(4096, 96, 28, arch, 12288, 12288) == 256
     # the narrow tile is refused when its padded N would read past the stored 256-padded rows
     assert cb.gemm_block_n(4096, 5, 28, arch, 250, 256) == 256
-    assert {"gemm_tstore_n192", "gemm_rstaged_n192"} <= required
-    # Round 6 continuation 12 (lever SKO): the tabulated ``gemm_sk`` rows launch the ordered stream-K instance when the
-    # launch has one full wave of CTA pairs plus at most half a wave of tail tiles: the head pair of each tail tile runs
-    # the first K half and hands its FP32 partial to the tail pair, which continues the same accumulation (bit-exact).
-    # A cell whose ordered form was replaced keeps the flag as ``gemm_sk: 0`` next to its new form (round 9: the sm_100a
-    # 56,48,4096 cell moved to the fix-up form), so the flag is read for truth, as the host does.
-    sk_rows = {k: e for k, e in decode_table(arch).items() if e.get("gemm_sk")}
-    # round 7 adds measured stream-K cells on the 512 / 1024 / 2048 buckets; every cell's window opens at its bucket.
-    # Round 8 (R8-19): the sm_103a 56,48,4096 selection is pruned -- on the 152-SM part the 448-tile launch leaves a
-    # 68-tile fractional wave (more than half a wave), so the ordered window never opened there (a plain cell); the
-    # sm_100a cell carries exactly one stream-K form (ordered until round 9's third-wave adoption, fix-up after it).
-    assert {"12,28,4096", "96,28,512"} <= set(sk_rows)
+    # Round 11 C17 (CAKE-985): sm_100a keeps no 192-wide 256-K cell without prefetch (96,1,2048 / 24,2,1024 / 24,2,2048 took
+    # ``gemm_bk`` 128 + ``gemm_gs`` 1; 12,28,2048 / 48,28,512 / 48,28,1024 prefetch, so their TMA-store rows launch the ``_pf<D>``
+    # form), and the mirror lists the plain ``gemm_tstore_n192`` only for a cell without prefetch / stream-K lever (export-plan
+    # parity: ``required_kernel_keys``).  Round 11 C18 (CAKE-985 T7 pass 3): sm_103a 96,1,512 (tp1:f_b:512, its last such cell)
+    # adopted ``gemm_stages`` 2 / ``gemm_ts_slots`` 4 (GB300 node alone, S5 v2 step d6567748 on tree cea637bf: 1.02827 / 1.03191 /
+    # 1.02827, aa 1.0 x3, bit-exact, Tier A) and launches ``gemm_tstore_n192_s2_ts4`` -- a new program of the sm_103a plan -- so the
+    # plain 192-wide TMA-store program is in neither plan now (12,28,2048 / 56,6,512 prefetch; 12,1,2048 prefetched until C20 moved it
+    # to the ``_gs`` form on gemm_bk 128).  The staged-register
+    # 192-wide program stays on both GPUs (the 8-byte-stride rows of the 192-wide 256-K cells).
+    assert "gemm_rstaged_n192" in required
+    assert "gemm_tstore_n192" not in required
+    # Round 11 C25 (CAKE-985 T7, FIN tip 8): 12,1,16384 (tp8:f_b:16384) adopted ``gemm_bn`` 192 on both GPUs after the C24
+    # staging-slot fix (B200 S5 v2 step ee27c6e0 1.02372 / 1.02367 / 1.02372; GB300 step fc1e9fd3 1.01575 / 1.01772 / 1.01575;
+    # bit-exact, Tier A), so ``gemm_tstore_n192_s2_ts4`` is in BOTH plans now (sm_103a since C18 through 96,1,512).
+    assert "gemm_tstore_n192_s2_ts4" in required
+    # The ordered stream-K form (table key ``gemm_sk``, round 6 continuation 12) is no longer planned: no cell asks for
+    # it on either architecture (a cell may still carry the flag as 0 next to another form; it is read for truth),
+    # and ``required_kernel_keys`` names no ``_sk`` / ``_sks<n>`` / ``_skf4`` / ``_skf8`` program (none is registered).
+    assert not any(e.get("gemm_sk") for e in decode_table(arch).values())
     o_proj_4096 = decode_table(arch).get("56,48,4096", {})
-    assert (bool(o_proj_4096.get("gemm_sk")) != bool(o_proj_4096.get("gemm_skf"))) == (
-        arch == "sm_100a"
-    )
-    assert all(e["route"] == "gemm" and e["gemm_sk"] == 1 for e in sk_rows.values())
-    sm_count = SM_COUNTS[arch]
-    for key in sk_rows:
+    assert bool(o_proj_4096.get("gemm_skf")) == (arch == "sm_100a")
+    assert not any(re.search(r"_sk(s\d+|f[48])?(_|$)", k) for k in required)
+    # Round 10 (CAKE-985 S2, lever SKP): the tabulated ``gemm_skp`` rows launch the prefetched stream-K instance
+    # (``_skp`` / ``_skp4`` / ``_skp8`` by the cell's slot bound) when the geometry admits a plan.  The sm_100a 12,28,4096
+    # cell (tp8 q_proj, N = 1536) replaced its ordered stream-K record (``gemm_sk`` 1 / ``gemm_sk_ksplit`` 16) with
+    # ``gemm_skp`` 4 after the exclusive-node R8-3 confirm (B200 step 32b8cc76: quiet 1.031, shared 1.029 / 1.029; Tier
+    # A-prime -- exact FP32 partial sums in a fixed cross-CTA order, rule-5 packet c942d29f PASS; synccheck 991d1ba3 /
+    # racecheck c5bb1bff clean); the sm_103a cell carries the 384-wide tile instead (no ``_skp`` form of it).  The key
+    # is exclusive with ``gemm_sk`` / ``gemm_skf`` / ``gemm_sks`` and with ``gemm_bn`` 384 on one cell
+    # (``gemm_stream_k_prefetch`` refuses such a cell; the Cake loader refuses such a table).
+    skp_rows = {k: e for k, e in decode_table(arch).items() if e.get("gemm_skp")}
+    assert set(skp_rows) == {"sm_100a": {"12,28,4096"}, "sm_103a": set()}[arch]
+    for key, cell in skp_rows.items():
         n_tiles128, num_k_iters, bucket = (int(v) for v in key.split(","))
-        plan = cb.gemm_stream_k_plan(
-            bucket,
-            n_tiles128,
-            num_k_iters,
-            arch,
-            sm_count,
-            cb._m_tiles(bucket),
-            n_tiles128 // 2,
+        assert cell["route"] == "gemm" and cell["gemm_skp"] in cb.GEMM_SKP_SLOT_FORMS
+        assert not any(
+            cell.get(k) for k in ("gemm_sk", "gemm_sk_ksplit", "gemm_skf", "gemm_sks")
+        )
+        assert int(cell.get("gemm_bn", cb.BLOCK_N)) != 384
+        assert (
+            cb.gemm_stream_k_prefetch(bucket, n_tiles128, num_k_iters, arch)
+            == cell["gemm_skp"]
+        )
+    # tp8:q_proj:4096 on B200 (148 SMs = 74 resident pairs): 16 m pairs x 6 n tiles = 96 CTA-pair tiles = one full wave
+    # + 22 tail tiles -> regime F with S = min(74 // 22, cap + 1, 28 // 3) = 3 pieces per tail tile (two contributor
+    # slots, cuts 0 / 9 / 18 / 28), the 74 data-parallel tiles through the CLC ring first (grid 148 CTAs, finishers
+    # after dp_cap = 1 tile), 88 flags and 22 x 2 x 256 KiB of partials; the 1-slot form admits no plan there (S would
+    # be 2, the ordered form's domain), so the cell's program is ``gemm_tstore_skp4``.  sm_103a reads no key: plain.
+    q_proj_4096 = cb.gemm_stream_k_prefetch_plan(
+        4096, 12, 28, arch, 148, cb._m_tiles(4096), 6, 256
+    )
+    if arch == "sm_100a":
+        assert q_proj_4096 is not None and q_proj_4096.program_suffix == "_skp4"
+        assert (
+            q_proj_4096.regime,
+            q_proj_4096.pairs,
+            q_proj_4096.first,
+            q_proj_4096.sk_tiles,
+        ) == ("F", 74, 74, 22)
+        assert (
+            q_proj_4096.S,
+            q_proj_4096.slots,
+            q_proj_4096.inst_slots,
+            q_proj_4096.dp_cap,
+        ) == (3, 2, 4, 1)
+        assert (q_proj_4096.grid, q_proj_4096.cuts, q_proj_4096.flag_count) == (
+            148,
+            (0, 9, 18, 28),
+            88,
         )
         assert (
-            plan is not None
-            and plan.pairs == sm_count // 2
-            and plan.grid == 2 * plan.dp
+            q_proj_4096.partial_bytes == 22 * 2 * cb.gemm_skf_tile_bytes(256)
+            and q_proj_4096.makespan == 38
         )
-        expected_ks = (
-            int(sk_rows[key].get("gemm_sk_ksplit", 0)) or (num_k_iters + 1) // 2
-        )
-        assert 0 < plan.rem <= plan.pairs - plan.rem and plan.ksplit == expected_ks
-        assert 2 <= plan.ksplit <= num_k_iters - 2
-        assert plan.dp + plan.rem == (cb._m_tiles(bucket) // 2) * (n_tiles128 // 2)
-    # 96 tiles over 74 pairs: 22 tail tiles, head 16 of 28 K iterations (table key gemm_sk_ksplit, continuation 13); below one wave or untabulated: plain schedule
-    assert cb.gemm_stream_k_plan(4096, 12, 28, arch, 148, cb._m_tiles(4096), 6) == (
-        cb.StreamKPlan(74, 22, 16, 74, 148) if "12,28,4096" in sk_rows else None
+    else:
+        assert q_proj_4096 is None
+    assert {k for k in required if "_skp" in k} == (
+        {"gemm_tstore_skp4"} if arch == "sm_100a" else set()
     )
-    # 448 tiles over 74 pairs: 6 full waves (888 CTAs, one pair per data-parallel tile) + 4 tail tiles, head 28 of 48 (table key gemm_sk_ksplit)
-    assert cb.gemm_stream_k_plan(4096, 56, 48, arch, 148, cb._m_tiles(4096), 28) == (
-        cb.StreamKPlan(74, 4, 28, 444, 888) if "56,48,4096" in sk_rows else None
-    )
-    assert cb.gemm_stream_k_plan(2048, 12, 28, arch, 148, cb._m_tiles(2048), 6) is None
-    assert cb.gemm_stream_k_plan(4096, 96, 28, arch, 148, cb._m_tiles(4096), 48) is None
-    assert "gemm_tstore_sk" in required and "gemm_rstaged_sk" not in required
     # Round 6 continuation 17/18 (lever SKF): the tabulated ``gemm_skf`` rows launch the fix-up stream-K instance when
     # the launch has a fractional wave: the last full wave plus the fraction (118 / 119 tiles x 28 K iterations) is cut
     # into 74 equal K ranges; the pair finishing a tile adds the other contributors' FP32 partials in ordinal order
@@ -833,8 +1565,9 @@ def test_decode_config_round6_continuation_rules(arch):
             74, 3304, 1, 74, 118, 148, 118 * cb.gemm_skf_tile_bytes(192)
         )
     )
-    assert cb.gemm_skf_tile_bytes(256) == cb.GEMM_SK_TILE_BYTES
-    # untabulated shapes, the ordered-form rows and whole waves keep the plain / ordered schedule
+    assert cb.gemm_skf_tile_bytes(256) == 256 * 1024
+    assert cb.gemm_skf_tile_bytes(192) == 192 * 1024
+    # untabulated shapes and whole waves keep the plain schedule
     assert (
         cb.gemm_stream_k_fixup_plan(4096, 5, 28, arch, 148, cb._m_tiles(4096), 3, 192)
         is None
@@ -941,6 +1674,22 @@ def test_decode_kernel_key_round8_suffixes():
     assert (
         decode_kernel_key(64, 3, False, False, csplit=2, dpf=True, xp=True)
         == "decode:t64_p3_cs2_dpf_xp"
+    )
+    # Round 8 (lever PW; adopted round 11 C20 on the sm_103a 192,2,64 cell): ``_pw<D>`` follows ``_pf<D>`` and precedes ``_px<D>`` /
+    # ``_tso`` (the Cake symbol order); the register twin drops ``_tso`` alone; omitted at 0, so every earlier key is unchanged.
+    assert (
+        decode_kernel_key(64, 4, False, False, pw=2, tstore=True)
+        == "decode:t64_p4_pw2_tso"
+    )
+    assert decode_kernel_key(64, 4, False, False, pw=2) == "decode:t64_p4_pw2"
+    assert (
+        decode_kernel_key(
+            128, 3, False, False, mc=2, pf=1, pw=2, tstore=True, dpf=True, pfi=1
+        )
+        == "decode:t128_p3_mc2_pf1_pw2_tso_dpf_pi1"
+    )
+    assert (
+        decode_kernel_key(64, 4, False, False, pw=0, tstore=True) == "decode:t64_p4_tso"
     )
 
 
@@ -1052,6 +1801,7 @@ def test_required_kernel_keys_are_registered_when_programs_exist(arch):
         for key in required:
             name, defines = kernel_program(arch, key)
             assert arch in MODULES[name]["arches"]
+            assert MODULES[name]["arg_plan"] in ARG_PLANS
             if key.startswith("quant:"):
                 quant_programs.add(name)
                 assert dict(defines) == {
@@ -1067,6 +1817,110 @@ def test_required_kernel_keys_are_registered_when_programs_exist(arch):
         assert set(KERNELS) == set().union(
             *(required_kernel_keys(a, SM_COUNT) for a in ARCHES)
         )
+
+
+_PROGRAM_KERNEL_FLAG = "-DCAKE_PROGRAM_KERNEL="
+_PROGRAM_KERNEL_DEFAULT = re.compile(r"^#define CAKE_PROGRAM_KERNEL (\w+)$", re.M)
+
+
+def test_shared_kernel_sources_keep_distinct_symbols():
+    # Lever twins build from one kernel translation unit: the record whose source it is defines
+    # the symbol through the file's ``CAKE_PROGRAM_KERNEL`` default, every other record names its
+    # own symbol on the compile line. All programs of one architecture load into one process, so
+    # every record must still produce ``kernel_<record>``.
+    csrc = pathlib.Path(cb.__file__).resolve().parent / "csrc"
+    symbols = {}
+    for name, record in MODULES.items():
+        kernel_source = record["sources"][0]
+        assert kernel_source.endswith("_kernel.cu"), (name, kernel_source)
+        text = (csrc / kernel_source).read_text()
+        flags = [
+            f for f in record["compile_flags"] if f.startswith(_PROGRAM_KERNEL_FLAG)
+        ]
+        defaults = _PROGRAM_KERNEL_DEFAULT.findall(text)
+        if name in kernel_source:
+            # A shared launcher needs the record's symbol on the compile line even
+            # when the kernel source is the record's own; the kernel source then
+            # sees a define equal to its default or defines the symbol literally.
+            symbol = defaults[0] if defaults else f"kernel_{name}"
+            assert f"{symbol}(" in text or "CAKE_PROGRAM_KERNEL(" in text, name
+            assert flags in ([], [f"{_PROGRAM_KERNEL_FLAG}{symbol}"]), (name, flags)
+        else:
+            assert len(flags) == 1 and len(defaults) == 1, (name, flags, defaults)
+            symbol = flags[0][len(_PROGRAM_KERNEL_FLAG) :]
+        assert symbol == f"kernel_{name}", (name, symbol)
+        symbols[name] = symbol
+    assert len(set(symbols.values())) == len(MODULES)
+
+
+_PROGRAM_SHIM_FLAG = "-DCAKE_PROGRAM_SHIM="
+_PROGRAM_SHIM_DEFAULT = re.compile(r"^#define CAKE_PROGRAM_SHIM (\w+)$", re.M)
+_LAUNCHER_NAMESPACE = re.compile(r"^namespace (\w+) \{$", re.M)
+
+
+def _check_conditions(text):
+    # The condition of every TVM_FFI_CHECK( in ``text`` as the preprocessor
+    # stringizes it: balanced parentheses, string literals skipped, multi-line aware.
+    conditions = []
+    for match in re.finditer(r"\bTVM_FFI_CHECK\(", text):
+        start = match.end()
+        depth, quoted, i = 1, False, start
+        while depth and i < len(text):
+            char = text[i]
+            if quoted:
+                if char == "\\":
+                    i += 1
+                elif char == '"':
+                    quoted = False
+            elif char == '"':
+                quoted = True
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            i += 1
+        assert depth == 0, text[start : start + 80]
+        conditions.append(text[start : i - 1])
+    return conditions
+
+
+def test_shared_launcher_sources_keep_distinct_namespaces():
+    # Programs whose exported launcher text differs only in the kernel symbol and the
+    # host-shim namespace build one launcher translation unit: the record whose source
+    # it is selects both through the file's defaults, every other record names its own
+    # on the compile line. Every record must still export its entry points from its own
+    # namespace and declare / launch its own kernel symbol.
+    csrc = pathlib.Path(cb.__file__).resolve().parent / "csrc"
+    namespaces = {}
+    for name, record in MODULES.items():
+        binding_source = record["sources"][1]
+        assert binding_source.endswith("_binding.cu"), (name, binding_source)
+        text = (csrc / binding_source).read_text()
+        assert _LAUNCHER_NAMESPACE.findall(text) == ["CAKE_PROGRAM_SHIM"], name
+        assert 'extern "C" __global__ void CAKE_PROGRAM_KERNEL(' in text, name
+        # TVM_FFI_CHECK stringizes its condition unexpanded: the kernel symbol reaches a
+        # check condition only through the expanding wrapper.
+        for condition in _check_conditions(text):
+            assert "CAKE_PROGRAM_KERNEL" not in condition, (name, condition)
+        shim_defaults = _PROGRAM_SHIM_DEFAULT.findall(text)
+        assert len(shim_defaults) == 1, (name, shim_defaults)
+        shim_flags = [
+            f for f in record["compile_flags"] if f.startswith(_PROGRAM_SHIM_FLAG)
+        ]
+        kernel_flags = [
+            f for f in record["compile_flags"] if f.startswith(_PROGRAM_KERNEL_FLAG)
+        ]
+        assert len(shim_flags) <= 1 and len(kernel_flags) <= 1, (name, record)
+        namespace = shim_flags[0][len(_PROGRAM_SHIM_FLAG) :] if shim_flags else None
+        if name in binding_source:
+            assert namespace in (None, shim_defaults[0]), (name, namespace)
+            namespace = shim_defaults[0]
+        else:
+            assert namespace is not None, (name, record["compile_flags"])
+            assert kernel_flags == [f"{_PROGRAM_KERNEL_FLAG}kernel_{name}"], name
+        assert re.fullmatch(r"cake_host_shim_[0-9a-f]{16}", namespace), name
+        namespaces[name] = namespace
+    assert len(set(namespaces.values())) == len(MODULES)
 
 
 # ---------------------------------------------------------------------------
@@ -1085,7 +1939,13 @@ def _require_program():
     if arch is None:
         pytest.skip("the Kimi-K3 FP8 projection requires an SM100/SM103 GPU")
     device = torch.device("cuda", 0)
-    if not cb.generated_program_available(device):
+    facts = cb.device_facts(device)
+    if not (
+        MODULES
+        and route_available(
+            facts.arch, required_kernel_keys(facts.arch, facts.sm_count)
+        )
+    ):
         pytest.skip(
             f"no generated Kimi-K3 FP8 projection program registered for {arch}"
         )
@@ -1138,6 +1998,21 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
         expected_kernel = (
             "gemm_tstore" if aligned else ("gemm_rstaged" if staged else "gemm")
         )
+        if plan.gemm_cs is not None:
+            # Round 10 (CAKE-985 S1, lever _cs<S>): a tabulated ``gemm_cs`` cell launches the cluster split-K program of
+            # the 192-wide 128-K TMA-store / staged-register epilogue (one cluster of 2S CTAs per output tile); round 11
+            # (T1a): its ``_pdlb`` form first when the cell carries ``gemm_pdlb``.  No other token composes with it.
+            assert expected_kernel in ("gemm_tstore", "gemm_rstaged")
+            assert cb.gemm_cluster_split(
+                M, _prepared.n_tiles128, _prepared.num_k_iters, plan.arch
+            )
+            cs_stem = expected_kernel + "_n192_k128" + plan.gemm_cs.program_suffix
+            assert plan.kernels[-1] in (cb._pdlb_stem(cs_stem), cs_stem)
+            assert plan.gemm_pdlb == plan.kernels[-1].endswith("_pdlb")
+            assert (plan.gemm_bn, plan.gemm_bk) == (192, 128)
+            assert plan.gemm_n_tiles == -(-_prepared.n_valid // 192)
+            assert runner.launch_count == 2 and plan.kernels[0].startswith("quant:u")
+            return
         # Round 6 (lever L5): the tabulated ``gemm_bn`` rows launch the 192-wide instance of the same epilogue over
         # ceil(n_valid / 192) N tiles; lever GP adds the prefetch distance of the tabulated aligned rows.
         bn = cb.gemm_block_n(
@@ -1148,17 +2023,26 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
             _prepared.n_valid,
             _prepared.n_pad,
         )
+        # Round 10 (CAKE-985 S3): the tabulated ``gemm_bn`` 384 rows launch the 128 x 384 pair-tile instance of the
+        # TMA-store / staged-register epilogues (``_n384_k128``: always the 128-K ring, no weight prefetch and no stage /
+        # slot / stream-K token, as ``gemm_n384_cell_conflicts`` enforces); the predicated register epilogue keeps 256.
+        n384 = bn == cb.GEMM_BLOCK_N_WIDE and expected_kernel != "gemm"
+        wide = "_n192" if bn == 192 else ("_n384" if n384 else "")
         gpf = (
             cb.gemm_prefetch_distance(
                 M, _prepared.n_tiles128, _prepared.num_k_iters, plan.arch
             )
-            if aligned
+            if aligned and not n384
             else 0
         )
         # Round 8 (lever L8): the tabulated ``gemm_bk`` rows launch the ``_k128`` form (128-K operand hand-off, same output
         # bits) of the TMA-store / staged-register epilogues; the plain register program has no such form.
         bk = (
-            cb.gemm_block_k(M, _prepared.n_tiles128, _prepared.num_k_iters, plan.arch)
+            128
+            if n384
+            else cb.gemm_block_k(
+                M, _prepared.n_tiles128, _prepared.num_k_iters, plan.arch
+            )
             if expected_kernel in ("gemm_tstore", "gemm_rstaged")
             else cb.BLOCK_K
         )
@@ -1174,23 +2058,92 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
             else (cb.GEMM_NUM_STAGES, cb.GEMM_TS_SLOTS)
         )
         isfx = cb.gemm_instance_suffix(stages, slots)
-        # Round 6 continuation 12 (lever SKO): the tabulated ``gemm_sk`` rows inside the stream-K wave window launch the
-        # ``_sk`` instance over 2 x dp CTAs with the hand-off area behind the activation scale tiles.
-        sk = cb.gemm_stream_k_plan(
-            M,
-            _prepared.n_tiles128,
-            _prepared.num_k_iters,
-            plan.arch,
-            plan.sm_count,
-            cb._m_tiles(M),
-            plan.gemm_n_tiles,
+        # Round 10 (CAKE-985 S3, lever _g64): the tabulated ``gemm_gm`` 64 rows launch the raster-group form of the TMA-store
+        # / staged-register programs (the token sits after the bn token, before ``_k128``; same output bits).
+        ggm = (
+            cb.gemm_group_m(M, _prepared.n_tiles128, _prepared.num_k_iters, plan.arch)
+            if expected_kernel != "gemm"
+            else cb.GEMM_GROUP_M
         )
-        sk_key = cb.gemm_kernel_key(
-            expected_kernel + ("_n192" if bn == 192 else "") + k128 + isfx + "_sk", gpf
+        g64 = "_g64" if ggm == 64 else ""
+        # Round 11 (CAKE-985 T1a, lever _pdlb): the tabulated ``gemm_pdlb`` rows launch the PDL-wait-after-weights form of
+        # the TMA-store / staged-register programs of the two-launch route (never the 384-wide program); the token closes
+        # the stem, after the stream-K suffix and before ``_pf<D>``.
+        pdlb = (
+            cb.gemm_pdlb(M, _prepared.n_tiles128, _prepared.num_k_iters, plan.arch)
+            if expected_kernel != "gemm" and not n384
+            else False
         )
-        if sk is not None and not cb.route_available(plan.arch, (sk_key,)):
-            sk = None  # only the TMA-store stream-K program ships: other views keep the plain program
-        assert plan.gemm_sk == sk
+        n_tiles_bn = _prepared.n_tiles if bn == 256 else -(-_prepared.n_valid // bn)
+        # Round 11 (CAKE-985 T2-e, lever _st): the tabulated ``gemm_static`` rows launch the static one-tile form of the
+        # plain 192-wide 128-K TMA-store / staged-register programs (the token takes the ``_cs<S>`` slot, after ``_k128``).
+        static = (
+            cb.gemm_static_tile(
+                M,
+                _prepared.n_tiles128,
+                _prepared.num_k_iters,
+                plan.arch,
+                plan.sm_count,
+                cb._m_tiles(M),
+                n_tiles_bn,
+                bn,
+            )
+            if expected_kernel != "gemm" and not n384
+            else False
+        )
+        # Round 11 (CAKE-985 T6, lever _gs): the tabulated ``gemm_gs`` rows launch the static grid-stride form of the plain
+        # 128-K TMA-store program at bn 192 / 256 (same slot as ``_st``; TMA-store stems of the two-launch route only).
+        gs_pairs = (
+            cb.gemm_gs_launch_pairs(
+                M,
+                _prepared.n_tiles128,
+                _prepared.num_k_iters,
+                plan.arch,
+                plan.sm_count,
+                cb._m_tiles(M),
+                n_tiles_bn,
+                bk == 128
+                and bn in (192, 256)
+                and not isfx
+                and not gpf
+                and not pdlb
+                and not static,
+            )
+            if expected_kernel == "gemm_tstore" and not n384
+            else 0
+        )
+        stem = expected_kernel + wide + g64 + k128
+        slot = (
+            "_st"
+            if static and cb._st_eligible(stem)
+            else "_gs"
+            if gs_pairs and cb._gs_eligible(stem)
+            else ""
+        )
+        stem = stem + slot + isfx
+        # Round 10 (CAKE-985 S2, lever SKP): the tabulated ``gemm_skp`` rows launch the prefetched stream-K instance
+        # (``_skp`` / ``_skp4`` / ``_skp8`` by the cell's slot bound) when the geometry admits a plan; TMA-store stems
+        # only, before the fix-up form (the Cake launcher precedence).
+        skp = (
+            cb.gemm_stream_k_prefetch_plan(
+                M,
+                _prepared.n_tiles128,
+                _prepared.num_k_iters,
+                plan.arch,
+                plan.sm_count,
+                cb._m_tiles(M),
+                plan.gemm_n_tiles,
+                bn,
+            )
+            if expected_kernel == "gemm_tstore"
+            else None
+        )
+        skp_key = cb.gemm_kernel_key(
+            stem + (skp.program_suffix if skp is not None else ""), gpf
+        )
+        if skp is not None and not cb.route_available(plan.arch, (skp_key,)):
+            skp = None
+        assert plan.gemm_skp == skp
         # Round 6 continuation 17/18 (lever SKF): the tabulated ``gemm_skf`` rows with a fractional wave launch the
         # ``_skf`` TMA-store instance (grid = 2 x the data-parallel tiles before the SK region, or one wave)
         skf = (
@@ -1204,43 +2157,47 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
                 plan.gemm_n_tiles,
                 bn,
             )
-            if sk is None and expected_kernel == "gemm_tstore"
+            if skp is None and expected_kernel == "gemm_tstore"
             else None
         )
-        skf_key = cb.gemm_kernel_key(
-            expected_kernel + ("_n192" if bn == 192 else "") + k128 + isfx + "_skf", gpf
-        )
+        skf_key = cb.gemm_kernel_key(stem + "_skf", gpf)
         if skf is not None and not cb.route_available(plan.arch, (skf_key,)):
             skf = None
         assert plan.gemm_skf == skf
-        assert plan.kernels[-1] == cb.gemm_kernel_key(
-            expected_kernel
-            + ("_n192" if bn == 192 else "")
-            + k128
-            + isfx
-            + ("_sk" if sk is not None else "_skf" if skf is not None else ""),
-            gpf,
+        full_stem = stem + (
+            skp.program_suffix if skp is not None else "_skf" if skf is not None else ""
         )
+        # the ``_pdlb`` form first, then the record-order program when it is not registered (route_plan's fallback)
+        expected_key = cb.gemm_kernel_key(full_stem, gpf)
+        if pdlb:
+            pdlb_key = cb.gemm_kernel_key(cb._pdlb_stem(full_stem), gpf)
+            if cb.route_available(plan.arch, (pdlb_key,)):
+                expected_key = pdlb_key
+        assert plan.kernels[-1] == expected_key
+        launched = expected_key.split("_pf")[0]
+        assert plan.gemm_pdlb == launched.endswith("_pdlb")
+        assert plan.gemm_static == launched.endswith("_st")
+        assert plan.gemm_gs == launched.endswith("_gs")
+        assert plan.gemm_gm == (64 if "_g64" in launched else cb.GEMM_GROUP_M)
         assert (plan.gemm_bn, plan.gemm_n_tiles, plan.gemm_bk) == (
             bn,
-            _prepared.n_tiles if bn == 256 else -(-_prepared.n_valid // 192),
+            n_tiles_bn,
             bk,
         )
         assert (plan.gemm_stages, plan.gemm_ts_slots) == (stages, slots)
+        # The prefetched stream-K instance launches its persistent CTA-pair grid (``skp.grid`` = 2 pairs, regime U,
+        # or 2 x the data-parallel tiles, regime F), like the ordered / fix-up forms launch theirs; round 11 (CAKE-985 T6,
+        # lever _gs): the static grid-stride form launches 2 P' CTAs (P' = min(T, sm_count // 2), its ``sk_pairs`` scalar).
+        assert plan.gemm_gs_pairs == (gs_pairs if plan.gemm_gs else 0)
         assert plan.grids[-1] == (
-            sk.grid
-            if sk is not None
+            skp.grid
+            if skp is not None
             else skf.grid
             if skf is not None
+            else cb.CTA_GROUP * gs_pairs
+            if plan.gemm_gs
             else cb._gemm_grid(cb._m_tiles(M), plan.gemm_n_tiles)
         )
-        if sk is not None:
-            assert (
-                _workspace_sf_numel(runner)
-                >= plan.counters_offset
-                + cb.GEMM_SK_FLAG_BYTES
-                + sk.rem * cb.GEMM_SK_TILE_BYTES
-            )
         if skf is not None:
             assert (
                 _workspace_sf_numel(runner)
@@ -1477,7 +2434,7 @@ def test_launcher_receipts_keep_placeholder_output_descriptor():
             "q_proj",
             4096,
             0,
-        ),  # quant:u4 + ordered stream-K TMA-store GEMM (gemm_sk cell)
+        ),  # quant:u4 + TMA-store GEMM (sm_100a: the prefetched stream-K form; sm_103a: the 192-wide 128-K tile)
         (
             "tp8",
             "kv_a",

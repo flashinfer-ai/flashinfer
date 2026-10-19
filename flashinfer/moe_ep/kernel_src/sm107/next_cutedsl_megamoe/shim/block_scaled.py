@@ -52,6 +52,8 @@ _KIND_TABLE: dict = {
 
 TransformedBlockScaledWeights = Tuple[torch.Tensor, torch.Tensor]
 
+_SCALAR_NAMES = ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
+
 
 def _require_sm107() -> None:
     cc = torch.cuda.get_device_capability()
@@ -364,15 +366,38 @@ class Sm107BlockScaledMoeConfig:
         if self.kernel_variant == "genphase":
             if self.padded_tokens_per_rank > 1024:
                 raise ValueError("GenPhase supports at most 1024 tokens per rank.")
+            n64_decode = (
+                self.cluster_shape_mn in ((2, 1), (4, 1))
+                and tiler == (256, 64, 128)
+                and (
+                    self.quant_kind == "mxfp8_e4m3"
+                    or (
+                        self.quant_kind == "mxfp4_mxfp8"
+                        and self.cluster_shape_mn == (4, 1)
+                    )
+                )
+            )
             if (
-                self.cluster_shape_mn != (4, 1)
-                or self.fallback_cluster_shape_mn is not None
-            ):
-                raise ValueError("GenPhase requires uniform cluster_shape_mn=(4, 1).")
+                self.cluster_shape_mn != (4, 1) and not n64_decode
+            ) or self.fallback_cluster_shape_mn is not None:
+                raise ValueError(
+                    "GenPhase requires uniform cluster (4, 1), or an admitted N64 decode geometry at (2, 1) or (4, 1)."
+                )
             if not self.fc2_use_bulk:
                 raise ValueError("GenPhase requires fc2_use_bulk=True.")
-            if tiler[1] not in (128, 256):
-                raise ValueError("GenPhase requires tile N 128 or 256.")
+            if tiler[1] not in (128, 256) and not n64_decode:
+                raise ValueError(
+                    "GenPhase requires tile N 128 or 256, or an admitted N64 decode geometry."
+                )
+            if n64_decode and self.world_size > 1 and mode == "phase_interleave":
+                # EP1 phase-interleave coverage does not establish multirank
+                # liveness: an EP2 dense/replay case stalls with this geometry.
+                # Reject before allocation or compilation; autotune applies
+                # this same config validation through is_valid_sm107.
+                raise ValueError(
+                    "GenPhase N64 with world_size > 1 requires grouped scheduling; "
+                    "multirank phase_interleave is not qualified."
+                )
             if tiler[2] != 2 * instruction_k:
                 raise ValueError(
                     f"GenPhase {self.quant_kind} requires tile K {2 * instruction_k} "
@@ -466,8 +491,9 @@ class Sm107BlockScaledSymmBuffer:
             (tokens, cfg.num_topk), -1, dtype=torch.int32, device="cuda"
         )
         # Stable local-expert pointers allow per-call scaling updates in graphs.
-        # Defaults and overrides are copied on every backend staging call.
-        for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+        # Per-call tensors are bound as launch arguments (bind_scalars); other
+        # values and defaults are copied in by the backend staging call.
+        for name in _SCALAR_NAMES:
             setattr(
                 self,
                 name,
@@ -542,6 +568,9 @@ class Sm107BlockScaledSymmBuffer:
         ] = None
         self._staged_tokens: Optional[int] = None
         self._destroyed = False
+        # Per-call NVFP4 epilogue scalars bound straight into the launch (no copy
+        # into the workspace tensors); a missing name = the workspace's own tensor.
+        self._bound_scalars: dict = {}
 
     @staticmethod
     def _build_kernel(cfg: Sm107BlockScaledMoeConfig):
@@ -655,6 +684,24 @@ class Sm107BlockScaledSymmBuffer:
     def staged_tokens(self) -> Optional[int]:
         return self._staged_tokens
 
+    def bind_scalars(self, values: dict) -> None:
+        """Bind per-call NVFP4 scalar tensors (``fc1_alpha`` / ``fc2_alpha`` /
+        ``fc1_norm_const``: contiguous fp32 ``[experts_per_rank]`` CUDA tensors) as
+        the launch arguments, instead of copying them into the workspace tensors
+        every call. ``None`` (or a missing name) selects the workspace tensor.
+        The tensors must stay alive while launches (or captured graphs) use them."""
+        bound = {}
+        for name in _SCALAR_NAMES:
+            value = values.get(name)
+            if value is not None:
+                bound[name] = value
+        self._bound_scalars = bound
+
+    def _scalar_tensor(self, name: str):
+        bound = getattr(self, "_bound_scalars", None) or {}
+        value = bound.get(name)
+        return value if value is not None else getattr(self, name)
+
     def _peer_mapper(self):
         from sources.communication.nvlink_domain.symmetric_buffer import (
             SymmetricBufferHost,
@@ -688,8 +735,8 @@ class Sm107BlockScaledSymmBuffer:
             "peer_rank_ptr_mapper_host": self._peer_mapper(),
             "stream": _cu_stream(stream),
             **{
-                name: _to_cute(getattr(self, name), assumed_align=4)
-                for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
+                name: _to_cute(self._scalar_tensor(name), assumed_align=4)
+                for name in _SCALAR_NAMES
                 if self.config.quant_kind == "nvfp4"
             },
         }
@@ -716,6 +763,13 @@ class Sm107BlockScaledSymmBuffer:
             transformed_l1[1].data_ptr(),
             transformed_l2[0].data_ptr(),
             transformed_l2[1].data_ptr(),
+            # Bound per-call scalars: a new tensor re-binds the launch arguments
+            # (host-only, no recompile).
+            *(
+                self._scalar_tensor(name).data_ptr()
+                for name in _SCALAR_NAMES
+                if self.config.quant_kind == "nvfp4"
+            ),
             torch.cuda.current_stream().cuda_stream,
         )
         if self._compiled is None or self._launch_key != key:
@@ -733,7 +787,7 @@ class Sm107BlockScaledSymmBuffer:
         if self.config.reduce_topk_in_kernel:
             # red.add accumulation base: zero the output every launch.
             self.output_activation.zero_()
-        else:
+        elif not getattr(self.kernel, "masks_invalid_combine_slots", False):
             # Invalid routes do not write a combine slot. Clear those slots on
             # every launch so a masked route cannot reuse an earlier result.
             invalid = (self.topk_idx < 0) | (
@@ -761,6 +815,7 @@ class Sm107BlockScaledSymmBuffer:
         self._launch_weights = None
         self._pre_reduced_activation = None
         self._pre_reduced_activation_sf = None
+        self._bound_scalars = {}
         for name in ("x", "x_sf", "topk_weights", "shared_workspace"):
             comm.free_sym_tensor(getattr(self, name, None))
             setattr(self, name, None)

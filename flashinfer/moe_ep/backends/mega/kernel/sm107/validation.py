@@ -20,6 +20,12 @@ def make_workspace_config(
     tuning = {name: getattr(k, name) for name in KNOB_KEYS if hasattr(k, name)}
     tuning["reduce_topk_in_kernel"] = k.in_kernel_fc2_reduce
     tuning.update(overrides)
+    if k.max_sm_count is not None:
+        # An SM budget (e.g. to leave SMs to a concurrent shared-expert MLP on a
+        # side stream) needs a uniform cluster launch: the mixed-CGA fallback
+        # occupancy is resolved from the hardware probe, so cached / heuristic
+        # knobs that name a fallback cluster are launched uniformly instead.
+        tuning["fallback_cluster_shape_mn"] = None
     for name in (
         "mma_tiler_mnk",
         "cluster_shape_mn",

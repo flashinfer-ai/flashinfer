@@ -161,6 +161,9 @@ def _workspace():
     ws.device = torch.device("cpu")
     ws._destroyed = False
     ws._compiled = mock.Mock()
+    # Model a kernel that requires launch-side clearing. Native masked BF16
+    # reducers opt out via this capability; quantized combine still clears.
+    ws.kernel = SimpleNamespace(masks_invalid_combine_slots=False)
     ws._launch_key = None
     ws._launch_kwargs = None
     ws._runtime_kwargs = mock.Mock(side_effect=lambda a, b: {"weights": (a, b)})

@@ -110,6 +110,7 @@ def _get_binding_cu(
 #define CAKE_KDA_PACKED_T1_THREADS 32
 #define CAKE_KDA_PACKED_T1_SMEM_BYTES 0
 #define CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 0
+#define CAKE_KDA_PACKED_T1_PAIR_PUBLISH 0
 #define CAKE_KDA_PACKED_T1_LEGACY_ABI 1
 
 #include "cake_kda_packed_t1_binding.cuh"

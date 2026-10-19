@@ -30,7 +30,7 @@ from ..utils import register_custom_op, register_fake_op, supported_compute_capa
 MINIMAX_H3_HIDDEN = 5376
 MINIMAX_H3_FFN = 14336
 MINIMAX_H3_FC1_ROWS = 2 * MINIMAX_H3_FFN  # [gate rows; up rows] of the fused FC1 weight
-MINIMAX_H3_ADALN_ROWS = 9
+MINIMAX_H3_ADALN_ROWS = 9  # the fused norm/AdaLN kernels index a fixed 9-row table
 MINIMAX_H3_EPS = 1.0e-5
 MINIMAX_H3_MAX_ROWS = 1 << 24
 MINIMAX_H3_SF_BLOCK = 16
@@ -442,7 +442,8 @@ def minimax_h3_fc1_swiglu_fp8(
     x_norm_weight : torch.Tensor
         ``bfloat16`` ``[5376]`` RMSNorm weight.
     adaln_scale, adaln_shift : torch.Tensor
-        ``bfloat16`` ``[9, 5376]`` AdaLN tables.
+        ``bfloat16`` ``[9, 5376]`` AdaLN tables (``MINIMAX_H3_ADALN_ROWS`` rows: the fused kernels
+        index a fixed 9-row table).
     adaln_index : torch.Tensor
         ``int32`` ``[M]`` table row per activation row.
     fc1_weight_q, fc1_weight_scale : torch.Tensor
