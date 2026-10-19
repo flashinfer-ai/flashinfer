@@ -104,3 +104,71 @@ print("OK")
 """
     )
     assert out.startswith("OK")
+
+
+def test_every_vendored_module_imports_without_cudnn_and_nothing_dangles():
+    """Every module of the vendored tree imports with the ``cudnn`` package blocked and no GPU -- a module-level import of a path
+    outside the closure would raise here.  The GEMM kernel templates (``kernel_templates/sm*.py``) are rendered by the compiler, never
+    imported (their geometry names are injected before the JIT), so they are the one documented exception.  What the exporter prunes
+    stays pruned: the ``gemm`` package exports nothing lazily (patch P5), and the arch-family facades are the sm100 tree on any device
+    (patch P6: one family vendored, no template of another one registered)."""
+    pytest.importorskip("cutlass")
+    out = _run_isolated(
+        _BLOCK_CUDNN
+        + """
+import importlib, pkgutil, re
+import flashinfer.experimental.qwen_3_5_block._cudnn_frost as v
+names = [v.__name__] + [m.name for m in pkgutil.walk_packages(v.__path__, v.__name__ + ".")]
+rendered = re.compile(r"\\.kernel_templates\\.sm\\d+_")
+failed = []
+for name in names:
+    if rendered.search(name):
+        continue
+    try:
+        importlib.import_module(name)
+    except Exception as exc:  # noqa: BLE001
+        failed.append(f"{name}: {type(exc).__name__}: {exc}")
+assert not failed, "\\n".join(failed)
+leaked = sorted(k for k in sys.modules if (k == "cudnn" and sys.modules[k] is not None) or k.startswith("cudnn."))
+assert not leaked, leaked
+gemm = importlib.import_module(v.__name__ + ".gemm")
+assert gemm.__all__ == [] and not gemm._LAZY_EXPORTS, gemm.__all__
+try:
+    gemm.swiglu_mlp
+except AttributeError:
+    pass
+else:
+    raise AssertionError("gemm.swiglu_mlp resolved to something")
+arch_family = importlib.import_module(v.__name__ + ".gemm.frost.arch_family")
+registry = importlib.import_module(v.__name__ + ".gemm.frost.kernel_registry")
+assert arch_family.FAMILIES == ("sm100",) and arch_family.family_for_arch(120) == "sm100" and arch_family.active_family() == "sm100"
+assert {t.family for t in registry.TEMPLATES} == {"sm100"} and not any(t.file.startswith("sm120_") for t in registry.TEMPLATES)
+compiler = importlib.import_module(v.__name__ + ".gemm.frost.compiler")
+codegen = importlib.import_module(v.__name__ + ".gemm.frost.epilogue_codegen")
+assert compiler.__name__ == v.__name__ + ".gemm.frost.sm100.compiler", compiler.__name__
+assert codegen.__name__ == v.__name__ + ".gemm.frost.sm100.epilogue_codegen", codegen.__name__
+print("OK", len(names))
+"""
+    )
+    assert out.startswith("OK")
+
+
+def test_vendored_arch_family_pin_on_an_absent_family_is_refused_by_name():
+    """``CUDNN_FRONTEND_GEMM_ARCH_FAMILY`` names a family the vendored tree does not carry: the facade import is a ``ValueError``
+    naming the vendored family, never a ``ModuleNotFoundError`` for the missing package."""
+    pytest.importorskip("cutlass")
+    out = _run_isolated(
+        _BLOCK_CUDNN
+        + """
+import importlib, os
+os.environ["CUDNN_FRONTEND_GEMM_ARCH_FAMILY"] = "sm120"
+try:
+    importlib.import_module("flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.compiler")
+except ValueError as exc:
+    assert "sm120" in str(exc) and "sm100" in str(exc), exc
+else:
+    raise AssertionError("the sm120 pin was not refused")
+print("OK")
+"""
+    )
+    assert out.startswith("OK")

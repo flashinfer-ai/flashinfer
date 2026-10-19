@@ -18,9 +18,10 @@ read live when a cuDNN Frontend install is importable, else from the recorded co
   alone (they resolve inside the vendored tree).  No regular expression touches anything that is not an import statement; the
   ONE string-literal site that importlib resolves at runtime (``engines/manifest.py``'s ``("cudnn._gemm_validate", ...)``
   family references) is rewritten by locating ``ast.Constant`` nodes in that one named file.
-* Four declared PATCHES (P0-P3, listed in VENDOR.md): P0-P2, exact text, make the copy importable without the nanobind
+* Six declared PATCHES (P0-P3, P5-P6, listed in VENDOR.md): P0-P2, exact text, make the copy importable without the nanobind
   extension; P3, context-anchored regular expressions that name nothing themselves, rewords the comment / docstring lines that
-  named internal hosts or internal file paths; everything else is byte-identical to the commit, SPDX headers included.
+  named internal hosts or internal file paths; P5-P6, exact text, prune what the vendored subset does not carry (the lazy exports
+  outside the closure, the sm120 arch family); everything else is byte-identical to the commit, SPDX headers included.
 * The one file vendored from OUTSIDE ``python/cudnn`` (``EXTRA_FILES``) is pinned by digest like every closure file: ``closure.json``
   carries its blob's sha256 (``extra_files``, written by ``build_closure.py``) and the exporter stops when the blob moved.
 * The generated files (the package root, the shim ``_compiled_module.py``, ``VENDOR.md``, ``VENDOR_MANIFEST.json``) carry a
@@ -60,6 +61,13 @@ GEN_HEADER = "# Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0
 #     shim instead.
 # P3 (REGEX_PATCHES below): comment / docstring lines that name an internal host or an internal file path, or use internal
 #     workflow vocabulary, are reworded (the sentence stays, the name goes).  No code changes.
+# P5: gemm/__init__.py's lazy-export table names two modules outside the closure (cudnn.gemm.mhc_projection_bwd, cudnn.gemm.ops):
+#     importlib would resolve them against whatever `cudnn` package is installed, never the vendored tree.  The table is emptied
+#     (`__all__` with it), so an absent name is an AttributeError by name.
+# P6: the vendored tree carries the sm100 arch family only.  arch_family.py serves it for every device (a pin on another family
+#     through CUDNN_FRONTEND_GEMM_ARCH_FAMILY is refused by name, never a ModuleNotFoundError at the facade import), and
+#     kernel_registry.py drops the sm120 template registrations (their template files are not vendored, and their block-quant
+#     gate imported the sm120 compiler).
 PATCHES = {
     "gated_attention_block/__init__.py": [
         (
@@ -83,6 +91,51 @@ PATCHES = {
             "P2",
             '_pybind_module = importlib.import_module(module_name, package="cudnn")\n',
             "from . import _compiled_module as _pybind_module  # [vendor.py P2] the shim, not the nanobind extension\n",
+        ),
+    ],
+    "gemm/__init__.py": [
+        (
+            "P5",
+            "_LAZY_EXPORTS = {\n"
+            '    "MhcProjectionBackward": ("cudnn.gemm.mhc_projection_bwd", "MhcProjectionBackward"),\n'
+            '    "mhc_projection_backward": ("cudnn.gemm.mhc_projection_bwd", "mhc_projection_backward"),\n'
+            '    "moe_grouped_matmul": ("cudnn.gemm.ops", "moe_grouped_matmul"),\n'
+            '    "situ_mlp": ("cudnn.gemm.ops", "situ_mlp"),\n'
+            '    "swiglu_mlp": ("cudnn.gemm.ops", "swiglu_mlp"),\n'
+            '    "swiglu_moe": ("cudnn.gemm.ops", "swiglu_moe"),\n'
+            "}\n",
+            "_LAZY_EXPORTS: dict = {}  # [vendor.py P5] the lazy exports (mhc_projection_bwd, ops) lie outside the vendored closure\n",
+        ),
+    ],
+    "gemm/frost/arch_family.py": [
+        (
+            "P6",
+            'FAMILIES: tuple[str, ...] = ("sm100", "sm120")\n',
+            'FAMILIES: tuple[str, ...] = ("sm100",)  # [vendor.py P6] the vendored tree carries the sm100 family only\n',
+        ),
+        (
+            "P6",
+            "def family_for_arch(arch: int | None) -> str:\n"
+            '    """The per-arch tree that serves SM ``arch``: ``sm120`` for SM 12.x, the\n'
+            '    :data:`DEFAULT_FAMILY` for everything else, ``None`` included."""\n'
+            "    if arch is not None and 120 <= arch < 130:\n"
+            '        return "sm120"\n'
+            "    return DEFAULT_FAMILY\n",
+            "def family_for_arch(arch: int | None) -> str:\n"
+            '    """[vendor.py P6] The vendored tree carries one per-arch tree, :data:`DEFAULT_FAMILY`:\n'
+            "    it serves every SM ``arch`` (``None`` included); a device outside its range is\n"
+            '    declined, by name, by the kernels\' own device gates."""\n'
+            "    return DEFAULT_FAMILY\n",
+        ),
+    ],
+    "gemm/frost/kernel_registry.py": [
+        (
+            "P6",
+            "        template_cls=Sm120KernelTemplate,\n    ),\n)\n",
+            "        template_cls=Sm120KernelTemplate,\n    ),\n)\n"
+            "# [vendor.py P6] the vendored tree carries the sm100 arch family only: the sm120 registrations above are dropped (their\n"
+            "# template files are not vendored, and their block-quant gate imports the sm120 compiler).\n"
+            "TEMPLATES = tuple(t for t in TEMPLATES if t.family in arch_family.FAMILIES)\n",
         ),
     ],
 }
@@ -615,6 +668,13 @@ def gen_vendor_md(
         + ", ".join(f"`{f}` ({len(ps)})" for f, ps in REGEX_PATCHES.items())
         + f" | {sum(len(ps) for ps in REGEX_PATCHES.values())} comment / docstring lines that named an internal host or an internal file path, or used internal workflow vocabulary, are reworded "
         "(the sentence stays, the name goes; the context-anchored patterns and the replacements are `REGEX_PATCHES` in `vendor.py`); no code changes; dropped at the next re-vendor once the upstream files are scrubbed |\n",
+        "| P5 | `gemm/__init__.py` | the lazy-export table (`_LAZY_EXPORTS`, and `__all__` with it) is emptied: its six entries named `cudnn.gemm.mhc_projection_bwd` and `cudnn.gemm.ops`, "
+        "modules outside the closure that `importlib.import_module` would have resolved against whatever `cudnn` package is installed, never the vendored tree; an absent name is "
+        "an `AttributeError` by name |\n",
+        '| P6 | `gemm/frost/arch_family.py` (2), `gemm/frost/kernel_registry.py` (1) | the vendored tree carries the sm100 arch family only: `FAMILIES = ("sm100",)` and `family_for_arch` '
+        "serve it for every device (the `compiler` / `epilogue_codegen` facades become the sm100 modules on any GPU and on no GPU; a `CUDNN_FRONTEND_GEMM_ARCH_FAMILY` pin on another "
+        "family is refused by name, never a `ModuleNotFoundError` at the facade import), and `TEMPLATES` drops the sm120 registrations (their template files are not vendored, and their "
+        "block-quant gate imported the sm120 compiler) |\n",
         '| string sites | `engines/manifest.py` | the `("cudnn._gemm_validate", "validate_graph")`-style module references importlib resolves at runtime are rewritten to the vendored path (the same rule renames that module\'s logger, `logging.getLogger("cudnn.engines.manifest")`, into the vendored namespace) |\n',
         "## Excluded (not in the closure; a lazily imported excluded path raises `ModuleNotFoundError` at the call site, never silently)\n",
         "".join(f"- `{k}`: {v}\n" for k, v in closure["excluded"].items()),
