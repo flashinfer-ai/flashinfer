@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """CUDA-graph capture of the three forms: plan outside capture, the FIRST run captured with no eager warm-up under
 ``set_sync_debug_mode("error")``, the replay bitwise the eager run; on decode also a replay over new lengths / tables / slots /
-inputs; ``prepare`` under capture refused typed."""
+inputs; ``prepare`` under capture refused typed; the functional decode captured through the plan cache replays bitwise after
+the LRU evicted its plan (the plan retained, ``clear_plan_cache()`` the release)."""
 
 import pytest
 import torch
@@ -363,3 +364,125 @@ def test_prefill_first_run_captured_replays_bitwise_eager():
     c = cosine(replayed, ref.out)
     print(f"[prefill replay] vs oracle cos {c:.6f}")
     assert torch.isfinite(replayed.float()).all() and c > 0.999
+
+
+def test_functional_decode_captured_survives_plan_cache_eviction():
+    """The plan-cache lifetime under capture: bucket A's functional decode is captured (a cache hit), then 33 more buckets go
+    through the same entry point (A's plan evicted from the 32-entry LRU) and storage of the workspace's size is allocated and
+    filled with garbage; A's replay is bitwise its eager run, the garbage untouched, A's plan and workspace alive (retained) and
+    no live allocation overlaps the workspace the graph still addresses; the bucket's next call revives that plan; with the graph
+    gone, ``clear_plan_cache()`` releases both."""
+    import gc
+    import weakref
+
+    from flashinfer.experimental.qwen_3_5_block import api
+    from flashinfer.qwen_3_5_block import (
+        Qwen35BlockGeometry,
+        qwen_3_5_block_bf16_decode,
+    )
+
+    api.clear_plan_cache()
+    g = Qwen35BlockGeometry(d_model=2560, num_qo_heads=24, num_kv_heads=2)
+    case = PagedCase(
+        g,
+        (300, 1000, 77),
+        (2, 2, 2),
+        page_size=16,
+        layout="NHD",
+        seed=9,
+        table_width=70,
+    )
+    out = torch.full(
+        (case.t, g.d_model), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    w = (case.hidden_states, case.rope_cos, case.rope_sin, case.weights, case.w_o)
+    args = dict(geometry=g, q_len_per_req=2, out=out, **case.decode_args())
+    qwen_3_5_block_bf16_decode(
+        *w, **args
+    )  # the warm-up: bucket A's plan compiles (a miss, outside capture)
+    torch.cuda.synchronize()
+    eager = out.clone()
+    case.check_out(eager, label="functional decode, eager")
+    ((key_a, plan_a),) = api._PLANS.items()
+    ws_ptr, ws_size = plan_a._workspace.data_ptr(), plan_a.workspace_size
+    refs = weakref.ref(plan_a), weakref.ref(plan_a._workspace)
+    del plan_a
+
+    def overlaps(t):
+        return (
+            t.data_ptr() < ws_ptr + ws_size
+            and ws_ptr < t.data_ptr() + t.numel() * t.element_size()
+        )
+
+    out.fill_(float("nan"))
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            prev = torch.cuda.get_sync_debug_mode()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                qwen_3_5_block_bf16_decode(*w, **args)  # the cache hit under capture
+            finally:
+                torch.cuda.set_sync_debug_mode(prev)
+        torch.cuda.synchronize()
+        assert torch.isnan(out).all(), "the capture launched work"
+        assert len(api._PLANS) == 1 and key_a in api._PLANS, (
+            "the capture must be a hit on bucket A's cached plan"
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, eager), (
+            "the replay before the churn differs from the eager run"
+        )
+        # the churn: PLAN_CACHE_SIZE + 1 further buckets of the same step (distinct logical KV bounds are distinct buckets)
+        scratch = torch.empty_like(out)
+        for i in range(api.PLAN_CACHE_SIZE + 1):
+            qwen_3_5_block_bf16_decode(
+                *w, **{**args, "out": scratch, "max_seq_len": 1000 + i}
+            )
+        torch.cuda.synchronize()
+        assert len(api._PLANS) == api.PLAN_CACHE_SIZE and key_a not in api._PLANS, (
+            "the churn must evict bucket A"
+        )
+        gc.collect()
+        assert refs[0]() is not None and refs[1]() is not None, (
+            "the eviction freed the plan / workspace a captured graph still addresses"
+        )
+        garbage = [
+            torch.full((ws_size,), 255, dtype=torch.uint8, device="cuda")
+            for _ in range(4)
+        ]
+        for t in garbage + [p._workspace for p in api._PLANS.values()]:
+            assert not overlaps(t), (
+                "an allocation overlaps the workspace of the captured plan: it was freed"
+            )
+        out.fill_(float("nan"))
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, eager), (
+            "the replay after the churn differs from the eager run"
+        )
+        assert all(bool((t == 255).all()) for t in garbage), (
+            "the replay wrote into storage it no longer owns"
+        )
+        assert [k for k, _ in api._RETAINED] == [key_a] and api._RETAINED[0][1] is refs[
+            0
+        ]()
+        # the bucket asked for again: the retained plan itself, back in the LRU (no second compile, no second workspace)
+        out.fill_(float("nan"))
+        qwen_3_5_block_bf16_decode(*w, **args)
+        torch.cuda.synchronize()
+        assert torch.equal(out, eager)
+        assert api._PLANS.get(key_a) is refs[0]() and not api._RETAINED
+        assert refs[0]()._workspace.data_ptr() == ws_ptr
+    finally:
+        graph.reset()
+    # the documented release: with the graph gone, clear_plan_cache() frees the retained plan and its workspace
+    api.clear_plan_cache()
+    gc.collect()
+    assert refs[0]() is None and refs[1]() is None, (
+        "clear_plan_cache() must be the release of a captured plan"
+    )

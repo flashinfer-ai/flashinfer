@@ -7,7 +7,8 @@ A :class:`Qwen35BlockPlan` is one compiled declaration of the vendored ``GatedAt
 query length); ``prepare`` builds it outside CUDA-graph capture (it JIT-compiles the kernels and allocates the
 workspace), ``run`` launches it -- the first ``run`` after ``prepare`` may already be captured.  The functional entry
 points keep a small LRU of plans keyed on exactly the facts a plan compiles in, so a serving stack's shape buckets map
-onto plans without any host-side bookkeeping of its own.
+onto plans without any host-side bookkeeping of its own; a plan a CUDA graph was captured over outlives its eviction (the
+graph baked its workspace) and is released by ``clear_plan_cache`` only.
 """
 
 from __future__ import annotations
@@ -107,8 +108,13 @@ def configure_vendored_tree() -> Dict[str, Any]:
     }
 
 
+def _capturing() -> bool:
+    """Whether the current stream is in CUDA-graph capture: one driver query, no synchronization (False without a CUDA runtime)."""
+    return bool(torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+
+
 def _check_not_capturing(what: str) -> None:
-    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+    if _capturing():
         raise RuntimeError(
             f"qwen_3_5_block: {what} compiles kernels and allocates and cannot run under CUDA-graph capture; "
             "plan outside the capture (one plan per shape bucket), then capture run()"
@@ -410,6 +416,9 @@ class Qwen35BlockPlan:
     #: plan of at most ``SMALL_CAPACITY`` tokens the out projection runs the small-capacity GEMM tile, whose token rows are the
     #: kernel's epilogue-vector axis (see :func:`_out_projection_row_granularity`).
     live_rows_multiple: int = 1
+    #: set once a CUDA graph is captured over this plan (the graph baked the workspace's address): the functional entry points'
+    #: LRU then retains the plan past its eviction instead of freeing it -- see ``cached_plan`` / ``clear_plan_cache``
+    _captured: bool = field(default=False, repr=False)
 
     @property
     def num_tokens(self) -> int:
@@ -593,6 +602,8 @@ class Qwen35BlockPlan:
     ) -> torch.Tensor:
         """Launch the plan on the current CUDA stream (capturable; see the README's capture rules).  Returns ``out``."""
         g, dev, dt = self.geometry, self.device, self.dtype
+        if not self._captured and _capturing():
+            self._captured = True  # a graph bakes this plan's workspace: the plan LRU must not free it at eviction
         _check_weights(weights, w_o, g, dt, dev)
         b = self._bind(
             hidden_states=hidden_states,
@@ -1076,15 +1087,60 @@ def _out_projection_row_granularity(
 
 
 # --------------------------------------------------------------------------- the plan LRU behind the functional entry points
+#
+# A functional entry point takes its plan from ``_PLANS``, an LRU of ``PLAN_CACHE_SIZE`` shape buckets.  A plan owns its workspace,
+# so evicting one frees device memory -- unless a CUDA graph was captured over it: the graph baked the workspace's address and the
+# block's buffers, and a replay after the free would write into memory the allocator has since handed to something else, silently.
+# Such a plan is marked ``_captured`` (under the lock, at the lookup the capture goes through) and moves to ``_RETAINED`` at its
+# eviction instead, where it lives until ``clear_plan_cache()``; a retained bucket asked for again is revived into the LRU (the same
+# plan and workspace: no second compile, no second workspace per bucket).  Invariant: a captured plan is in ``_PLANS`` or
+# ``_RETAINED`` until ``clear_plan_cache()``.  A bucket WITHOUT a cached plan cannot be built under capture (``prepare`` compiles
+# and allocates), so the lookup refuses it there, typed, instead of letting ``prepare`` fail deeper.
 
 _PLANS: "collections.OrderedDict[tuple, Qwen35BlockPlan]" = collections.OrderedDict()
+_RETAINED: "list[tuple[tuple, Qwen35BlockPlan]]" = []
 _PLANS_LOCK = threading.Lock()
 PLAN_CACHE_SIZE = 32
 
 
 def clear_plan_cache() -> None:
+    """Drop every plan of the functional entry points -- the LRU's and the retained ones captured graphs ran -- and with them
+    their workspaces.  The ONLY release of a retained plan: call it once no CUDA graph captured over a functional-entry plan can
+    replay any more (after ``graph.reset()``, at model teardown), never while one may; under capture it is refused."""
+    if _capturing():
+        raise RuntimeError(
+            "qwen_3_5_block: clear_plan_cache() releases the workspaces captured graphs replay into and cannot run under CUDA-graph capture"
+        )
     with _PLANS_LOCK:
         _PLANS.clear()
+        _RETAINED.clear()
+
+
+def _insert_plan(key: tuple, plan: Qwen35BlockPlan) -> Qwen35BlockPlan:
+    """Under ``_PLANS_LOCK``: ``plan`` into the LRU at its fresh end, then evict past the bound -- a captured plan into ``_RETAINED``.
+    Two threads that filled one bucket at once: the first writer's plan stays (a graph may already run it), the other is kept
+    only when captured; the plan the bucket holds is returned."""
+    cached = _PLANS.get(key)
+    if cached is not None and cached is not plan:
+        if plan._captured:
+            _RETAINED.append((key, plan))
+        plan = cached
+    _PLANS[key] = plan
+    _PLANS.move_to_end(key)
+    while len(_PLANS) > PLAN_CACHE_SIZE:
+        k, evicted = _PLANS.popitem(last=False)
+        if evicted._captured:
+            _RETAINED.append((k, evicted))
+    return plan
+
+
+def _revive_plan(key: tuple) -> Optional[Qwen35BlockPlan]:
+    """Under ``_PLANS_LOCK``: the retained plan of ``key`` back into the LRU (and out of ``_RETAINED``), or None."""
+    for i, (k, plan) in enumerate(_RETAINED):
+        if k == key:
+            del _RETAINED[i]
+            return _insert_plan(key, plan)
+    return None
 
 
 def cached_plan(
@@ -1101,7 +1157,10 @@ def cached_plan(
     dtype=torch.bfloat16,
     **kw,
 ) -> Qwen35BlockPlan:
-    """The plan of the functional entry points: an LRU keyed on exactly what a plan compiles in."""
+    """The plan of the functional entry points: an LRU keyed on exactly what a plan compiles in.
+
+    Under CUDA-graph capture only a bucket already cached is served (its plan is then retained past eviction, see above); a cold
+    bucket raises a typed ``RuntimeError`` naming the remedy -- one eager call outside the capture warms it."""
     dev = _device_of(device)
     k, v = kv_views(
         kv_cache, kv_layout, geometry=geometry, page_size=page_size, dtype=dtype
@@ -1127,11 +1186,23 @@ def cached_plan(
         kw.get("max_query_len"),
         kw.get("decode_split_kv"),
     )
+    capturing = _capturing()
     with _PLANS_LOCK:
         plan = _PLANS.get(key)
         if plan is not None:
             _PLANS.move_to_end(key)
+        else:
+            plan = _revive_plan(key)
+        if plan is not None:
+            if capturing:
+                plan._captured = True  # marked under the lock: an eviction racing this capture retains the plan
             return plan
+    if capturing:
+        raise RuntimeError(
+            "qwen_3_5_block: this shape bucket has no cached plan, and CUDA-graph capture cannot build one (a plan compiles kernels "
+            "and allocates its workspace); warm the bucket outside the capture -- one eager call of the same entry point -- or run "
+            "an explicit plan (prepare_qwen_3_5_block_bf16 / Qwen35BlockWrapper), then capture"
+        )
     plan = prepare(
         form,
         geometry=geometry,
@@ -1146,10 +1217,7 @@ def cached_plan(
         **kw,
     )
     with _PLANS_LOCK:
-        _PLANS[key] = plan
-        while len(_PLANS) > PLAN_CACHE_SIZE:
-            _PLANS.popitem(last=False)
-    return plan
+        return _insert_plan(key, plan)
 
 
 def _rows_of(hidden_states, name="hidden_states") -> Tuple[int, int, int]:
