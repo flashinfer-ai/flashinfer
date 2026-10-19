@@ -1046,9 +1046,32 @@ def _resolve_cake_stepfun_reserved_sms(explicit: Optional[int]) -> int:
     return value
 
 
+def _cake_stepfun_backend_config(backend: Any) -> "CakeStepFunConfig":
+    """The :class:`CakeStepFunConfig` of a ``MoEConfig.backend`` value.
+
+    Accepts the config itself or a :class:`BackendOptions` whose only candidate is
+    a :class:`CakeStepFunConfig`, the binding :class:`MoELayer` gives every runner
+    (``replace(config, backend=BackendOptions(candidates=(backend_cfg,)))``).
+    Raises ``TypeError`` naming the value otherwise (several candidates, or none of
+    that type): the knobs of a multi-candidate option list are not resolvable here.
+    """
+    if isinstance(backend, CakeStepFunConfig):
+        return backend
+    if isinstance(backend, BackendOptions) and len(backend) == 1:
+        (candidate,) = tuple(backend)
+        if isinstance(candidate, CakeStepFunConfig):
+            return candidate
+    raise TypeError(
+        "_resolve_cake_stepfun_knobs expects a CakeStepFunConfig backend or a "
+        f"BackendOptions whose only candidate is one, got {backend!r}."
+    )
+
+
 def _resolve_cake_stepfun_knobs(config: "MoEConfig") -> Dict[str, Any]:
     """Resolve the Cake StepFun backend knobs of ``config`` once (``check_support``).
 
+    ``config.backend`` is the :class:`CakeStepFunConfig` or the single-candidate
+    :class:`BackendOptions` holding it (:func:`_cake_stepfun_backend_config`).
     Returns ``{"full_path": True, "reserved_sms": int, "global_scale_inv": float}``.
     ``full_path`` resolves through :func:`_resolve_cake_stepfun_full_path`; ``False``
     raises ``NotImplementedError``: the FC1-only hybrid of flashinfer-ai/flashinfer#6046
@@ -1058,12 +1081,7 @@ def _resolve_cake_stepfun_knobs(config: "MoEConfig") -> Dict[str, Any]:
     must resolve to ``None``: only the ``e4m3_max = 448`` requantization unit is
     exported, so ``global_scale_inv`` is always ``1 / (448 * 6)``.
     """
-    backend = config.backend
-    if not isinstance(backend, CakeStepFunConfig):
-        raise TypeError(
-            f"_resolve_cake_stepfun_knobs expects a CakeStepFunConfig backend, got "
-            f"{backend!r}."
-        )
+    backend = _cake_stepfun_backend_config(config.backend)
     full_path = _resolve_cake_stepfun_full_path(backend.full_path)
     if not full_path:  # the variable stays; 0 names the removed hybrid and raises
         raise NotImplementedError(

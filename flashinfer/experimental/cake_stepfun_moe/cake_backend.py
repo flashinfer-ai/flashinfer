@@ -238,10 +238,10 @@ def route_tile(num_tokens: int) -> int:
 
 
 def exported_tiles(stage: str, family: str) -> tuple[int, ...]:
-    """Ascending tiles the package exports for ``family`` in ``stage`` (``fc1`` / ``fc2``)."""
+    """Ascending tiles the package exports for ``family`` in ``stage`` (``fc1`` / ``fc2``);
+    ``()`` for a family the export does not ship (any other ``stage`` is a ``ValueError``)."""
     if stage not in ("fc1", "fc2"):
         raise ValueError(f"exported_tiles: stage must be 'fc1' or 'fc2', got {stage!r}")
-    _family_facts(family)
     return tuple(
         sorted(
             {
