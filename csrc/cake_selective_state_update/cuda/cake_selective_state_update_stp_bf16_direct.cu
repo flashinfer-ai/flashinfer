@@ -490,6 +490,7 @@ kernel_cake_selective_state_update_stp_bf16_direct(CakeTensorMap const* state_tm
                         asm volatile("st.shared.b32 [%0], %1;" :: "r"(s_state_addr + (unsigned int)(state_index * 2)), "r"((state_values_bf16[0])));
                     }
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    __syncwarp();
                     if (elect_sync()) {
                         mbarrier_arrive(state_updated_addr + (stage) * 8);
                     }
