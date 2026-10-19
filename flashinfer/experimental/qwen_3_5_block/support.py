@@ -4,7 +4,12 @@
 
 Imports torch and FlashInfer's own probes only -- never the kernels, the CuTe DSL or the vendored cuDNN Frontend tree --
 so a serving stack's init-time dispatch question (:func:`qwen_3_5_block_support`) costs nothing when the answer is no.
-The per-form decline table is read from the vendored tree only once every lighter gate has passed.
+The per-form decline table is read from the vendored tree only once every lighter gate has passed, and the geometry rules this
+module mirrors from that tree are re-read against it then (:func:`check_vendored_rules`).
+
+ONE geometry gate, :meth:`Qwen35BlockGeometry.unsupported_reason`, serves both callers -- the probe and ``api.prepare`` (through
+:func:`require_served`) -- so a geometry the probe advertises is one every form's declaration admits, and a geometry it declines is
+a typed ``NotImplementedError`` at plan time before any vendored code runs.
 """
 
 from __future__ import annotations
@@ -38,8 +43,78 @@ DECODE_MAX_ROWS = (
 )
 DTYPES: Tuple[torch.dtype, ...] = (torch.bfloat16,)
 KV_CACHE_DTYPES: Tuple[torch.dtype, ...] = (torch.bfloat16,)
-# The forced 256-wide projection GEMM tile: every projected width must be a multiple of it.
+# The forced 256-wide projection GEMM tile: every projected width must be a multiple of it (the adapter's capture-safe route runs
+# the vendored GEMM on that tile only; ``kernels/proj_gemm.py`` ``_forced_tile_config``).
 _PROJ_TILE = 256
+
+# The rope_dim envelope: the INTERSECTION of the two renderings stage (1) has in the vendored tree, so one geometry verdict holds
+# for every form and every row bucket.  The serving forms declare ``fuse_norm_rope=True``, and the vendored declaration LOWERS the
+# DECODE form to the unfused chain at decode row counts (``batch x q_len <= kernels.proj_gemm.SMALL_M_MAX``), so both rules bind:
+#   * the fused norm + RoPE projection fork (``_cudnn_frost/gated_attention_block/api.py``, ``_FusedQkvProjection.check_support``):
+#     ``rope_dim`` a positive multiple of ``2 * _SUBTILE_N`` = 64 and below ``d_head`` -- each rotate_half pair spans whole epilogue
+#     subtiles;
+#   * the norm + RoPE kernels of the lowered chain (``_cudnn_frost/gated_attention_block/kernels/qk_norm_rope{,_tma}.py``,
+#     ``validate_shape``): ``rope_dim`` a multiple of ``2 * ELEMS_PER_ACCESS`` = 16 whose quotient is a power of two (the
+#     rotate_half partner is a whole-lane butterfly shuffle) and within the lanes one head row spans (the stage takes the TMA kernel
+#     where its tiling holds and the LDG kernel otherwise, so the LDG bound -- a warp of 16-byte accesses, 256 elements at
+#     head_dim 256 -- is the chain's).
+# Served at head_dim 256: 64 (Qwen3.5's value) and 128.  The constants are the vendored tree's, mirrored here so the init-time probe
+# stays free of the kernels and the DSL; :func:`check_vendored_rules` re-reads them from the tree wherever it is imported (the
+# probe's vendored read, ``api.prepare``) and ``test_admission.py`` pins the gate against the real stage checks, so a re-vendor
+# that moves a rule fails loudly instead of advertising what the tree declines.
+_ROPE_SUBTILE_PAIR = 64  # 2 * _FusedQkvProjection._SUBTILE_N: the fused fork rotates whole epilogue-subtile pairs
+_ROPE_ACCESS_ELEMS = (
+    8  # ELEMS_PER_ACCESS of both norm + RoPE kernels: bf16 elements per 16-byte access
+)
+_ROPE_ROW_LANES = 32  # kernels/qk_norm_rope.py lanes_per_row: a head row spans at most one warp of accesses
+
+
+def _rope_fork_ok(rope_dim: int, head_dim: int) -> bool:
+    """The fused norm + RoPE projection fork's rule."""
+    return rope_dim % _ROPE_SUBTILE_PAIR == 0 and 0 < rope_dim < head_dim
+
+
+def _rope_chain_ok(rope_dim: int, head_dim: int) -> bool:
+    """The lowered chain's norm + RoPE kernels' rule (the LDG kernel's, the one the stage falls back to)."""
+    pair = 2 * _ROPE_ACCESS_ELEMS
+    lanes = min(_ROPE_ROW_LANES, head_dim // _ROPE_ACCESS_ELEMS)
+    half = rope_dim // pair
+    return (
+        rope_dim % pair == 0
+        and half > 0
+        and half & (half - 1) == 0
+        and rope_dim <= lanes * _ROPE_ACCESS_ELEMS
+    )
+
+
+#: the rope_dim values the block serves at ``HEAD_DIM`` (both stage-(1) renderings admit them): ``(64, 128)``
+ROPE_DIMS: Tuple[int, ...] = tuple(
+    r
+    for r in range(2, HEAD_DIM + 1, 2)
+    if _rope_fork_ok(r, HEAD_DIM) and _rope_chain_ok(r, HEAD_DIM)
+)
+
+
+def rope_dim_reason(rope_dim: int, head_dim: int = HEAD_DIM) -> Optional[str]:
+    """Why the kernels do not serve this ``rope_dim`` at this ``head_dim`` (``None`` = served): the fused projection fork's rule,
+    then the lowered decode chain's -- the two renderings of stage (1) a geometry has to pass (see the module constants)."""
+    served = f"the Qwen 3.5 block serves rope_dim in {ROPE_DIMS} at head_dim {HEAD_DIM}"
+    if not _rope_fork_ok(rope_dim, head_dim):
+        return (
+            f"rope_dim must be a positive multiple of {_ROPE_SUBTILE_PAIR} below head_dim={head_dim} (the fused norm + RoPE "
+            f"projection rotates whole epilogue-subtile pairs); got rope_dim={rope_dim}; {served}"
+        )
+    if not _rope_chain_ok(rope_dim, head_dim):
+        pair = 2 * _ROPE_ACCESS_ELEMS
+        bound = (
+            min(_ROPE_ROW_LANES, head_dim // _ROPE_ACCESS_ELEMS) * _ROPE_ACCESS_ELEMS
+        )
+        return (
+            f"rope_dim must be {pair} x a power of two and at most {bound} (the norm + RoPE kernels of the lowered decode chain "
+            f"shuffle the rotate_half partner across whole lanes); got rope_dim={rope_dim}; {served}"
+        )
+    return None
+
 
 _VENDORED = Path(__file__).resolve().parent / "_cudnn_frost"
 
@@ -48,7 +123,9 @@ _VENDORED = Path(__file__).resolve().parent / "_cudnn_frost"
 class Qwen35BlockGeometry:
     """The sub-layer's shape at THIS tensor-parallel rank (Qwen3.5-397B at TP 1: ``d_model=4096, num_qo_heads=32,
     num_kv_heads=2``; ``24 / 2`` at ``d_model=2560`` for the 27B-class shards).  ``is_causal`` with the bottom-right
-    diagonal, no window and no soft-cap are fixed, not parameters."""
+    diagonal, no window and no soft-cap are fixed, not parameters.  The constructor checks the FORM of the fields (positive
+    ints, whole GQA groups, an even ``rope_dim`` within the head); :meth:`unsupported_reason` is the kernels' envelope
+    (``head_dim`` 256, ``d_model`` a multiple of the projection tile, ``rope_dim`` in :data:`ROPE_DIMS`)."""
 
     d_model: int
     num_qo_heads: int
@@ -107,7 +184,7 @@ class Qwen35BlockGeometry:
             return f"the Qwen 3.5 block kernels serve head_dim={HEAD_DIM} only (the Rubin d256 flavor); got head_dim={self.head_dim}"
         if self.d_model % _PROJ_TILE:
             return f"d_model must be a multiple of {_PROJ_TILE} (the forced projection GEMM tile); got d_model={self.d_model}"
-        return None
+        return rope_dim_reason(self.rope_dim, self.head_dim)
 
     def frost(self):
         """The vendored cuDNN Frontend geometry (imports the vendored tree)."""
@@ -256,6 +333,8 @@ class Qwen35BlockSupport:
     decode_max_rows: int = DECODE_MAX_ROWS
     dtypes: Tuple[torch.dtype, ...] = DTYPES
     kv_cache_dtypes: Tuple[torch.dtype, ...] = KV_CACHE_DTYPES
+    #: the rope_dim values served at head_dim 256 (appended; the geometry gate's envelope)
+    rope_dims: Tuple[int, ...] = ROPE_DIMS
 
     def form(self, name: str) -> Qwen35BlockFormSupport:
         if name not in FORMS:
@@ -269,6 +348,7 @@ def _frost_form_table(
     """The vendored tree's own envelope for the two paged forms (imports the vendored tree: called after the light gates passed)."""
     from ._cudnn_frost.gated_attention_block import GatedAttentionBlockFwd
 
+    check_vendored_rules()  # the mirrored geometry rules against the tree's: a drift is a loud refusal, never a false verdict
     env = GatedAttentionBlockFwd.serving_envelope(
         geometry.frost(), dtype, torch.device(device), device_cc=SUPPORTED_CC
     )
@@ -302,10 +382,17 @@ def qwen_3_5_block_support(
     else:
         try:
             table = _frost_form_table(geometry, dtype, device)
+            prefill_reason = None
         except Exception as exc:  # noqa: BLE001 - the probe reports, never raises
             why = f"the vendored cuDNN Frontend tree could not answer: {type(exc).__name__}: {exc}"
             table = {name: (False, why, {}) for name in ("extend", "decode")}
-        forms["prefill"] = Qwen35BlockFormSupport("prefill", True, None)
+            prefill_reason = why
+        # The dense prefill form has no row in the vendored envelope (its declaration meets no table row the gates above did not
+        # already settle: the device, the DSL, the dtype, head_dim, d_model and rope_dim are the geometry gate's), so it is served
+        # exactly when the vendored tree answered -- never advertised when the tree could not be read.
+        forms["prefill"] = Qwen35BlockFormSupport(
+            "prefill", prefill_reason is None, prefill_reason
+        )
         for name in ("extend", "decode"):
             served, reason, declines = table[name]
             forms[name] = Qwen35BlockFormSupport(name, bool(served), reason, declines)
@@ -324,6 +411,75 @@ def qwen_3_5_block_support(
         decode=forms["decode"],
         source=source(),
     )
+
+
+def _passes(check, *args) -> bool:
+    try:
+        check(*args)
+    except (ValueError, NotImplementedError):
+        return False
+    return True
+
+
+@functools.lru_cache(maxsize=1)
+def check_vendored_rules() -> Dict[str, Any]:
+    """Re-read the geometry rules this module mirrors from the vendored tree (imports it) and refuse a drift.
+
+    A re-vendor that moves a rule must fail HERE, loudly -- before the probe advertises, or ``prepare`` declines, a geometry the
+    tree reads the other way.  Compared: the fused fork's tile constants (``_FusedQkvProjection._TILE_N`` = head_dim, ``2 *
+    _SUBTILE_N`` = the rope_dim pair), the lowered chain's rope rule as BEHAVIOUR (the TMA and the LDG norm + RoPE kernels'
+    ``validate_shape`` over every even ``rope_dim`` up to the head dim, at a geometry the TMA tiling fits), the decode row cap,
+    the validated page sizes and the target cc.  Once per process (the probe's vendored read, ``api.prepare``); returns the
+    tree's constants.  Raises ``RuntimeError`` naming every drifted fact."""
+    from ._cudnn_frost.gated_attention_block import api as vendored
+    from ._cudnn_frost.gated_attention_block.kernels import (
+        qk_norm_rope,
+        qk_norm_rope_tma,
+    )
+
+    fork = vendored._FusedQkvProjection
+    facts: Dict[str, Any] = {
+        "head_dim": int(fork._TILE_N),
+        "rope_subtile_pair": 2 * int(fork._SUBTILE_N),
+        "rope_access_elems": int(qk_norm_rope.ELEMS_PER_ACCESS),
+        "rope_row_lanes": int(qk_norm_rope.lanes_per_row(HEAD_DIM)),
+        "decode_max_rows": int(vendored.DECODE_MAX_ROWS),
+        "page_sizes": tuple(int(p) for p in vendored.SERVING_PAGE_SIZES),
+        "supported_cc": tuple(int(x) for x in vendored._SM107_CC),
+    }
+    mirrored: Dict[str, Any] = {
+        "head_dim": HEAD_DIM,
+        "rope_subtile_pair": _ROPE_SUBTILE_PAIR,
+        "rope_access_elems": _ROPE_ACCESS_ELEMS,
+        "rope_row_lanes": _ROPE_ROW_LANES,
+        "decode_max_rows": DECODE_MAX_ROWS,
+        "page_sizes": PAGE_SIZES,
+        "supported_cc": SUPPORTED_CC,
+    }
+    drift = [
+        f"{k}: support.py has {mirrored[k]!r}, the vendored tree {facts[k]!r}"
+        for k in facts
+        if mirrored[k] != facts[k]
+    ]
+    # The chain's rule as the stage applies it: the TMA kernel where its tiling holds (32 / 2 heads, 16-row tiles, the stage's
+    # thread count), else the LDG kernel -- so a rope_dim is served by the chain iff one of the two validators takes it.
+    threads = int(vendored._QK_NORM_ROPE_THREADS)
+    tile_rows = int(vendored._QK_NORM_ROPE_TILE_ROWS)
+    for rope in range(2, HEAD_DIM + 1, 2):
+        tree = _passes(
+            qk_norm_rope_tma.validate_shape, HEAD_DIM, rope, 32, 2, tile_rows, threads
+        ) or _passes(qk_norm_rope.validate_shape, HEAD_DIM, rope, threads)
+        if tree != _rope_chain_ok(rope, HEAD_DIM):
+            drift.append(
+                f"rope_dim={rope}: the lowered chain's norm + RoPE kernels {'take' if tree else 'decline'} it, support.py reads the other way"
+            )
+    if drift:
+        raise RuntimeError(
+            "qwen_3_5_block: the geometry rules support.py mirrors differ from the vendored cuDNN Frontend tree's; the gate "
+            "(Qwen35BlockGeometry.unsupported_reason) must be re-derived with the re-vendored tree: "
+            + "; ".join(drift)
+        )
+    return facts
 
 
 def require_served(

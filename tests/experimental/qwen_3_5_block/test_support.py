@@ -43,6 +43,37 @@ def test_geometry_validation():
     )
 
 
+def test_geometry_rope_dim_envelope_is_the_shared_gate():
+    """The rope_dim rule the probe and prepare share: 64 and 128 at head_dim 256; 32 / 256 are the fused projection's declines, 192
+    the lowered decode chain's, 16 both -- every one a typed reason naming the value and the served set, none a ValueError."""
+    from flashinfer.qwen_3_5_block import Qwen35BlockGeometry
+    from flashinfer.experimental.qwen_3_5_block import support
+
+    assert support.ROPE_DIMS == (64, 128)
+    for rope in support.ROPE_DIMS:
+        assert (
+            Qwen35BlockGeometry(
+                d_model=4096, num_qo_heads=32, num_kv_heads=2, rope_dim=rope
+            ).unsupported_reason()
+            is None
+        )
+    for rope in (16, 32, 192, 256):
+        reason = Qwen35BlockGeometry(
+            d_model=4096, num_qo_heads=32, num_kv_heads=2, rope_dim=rope
+        ).unsupported_reason()
+        assert reason is not None and f"rope_dim={rope}" in reason, (rope, reason)
+        assert "(64, 128)" in reason
+    assert "fused norm + RoPE projection" in support.rope_dim_reason(32)
+    assert "lowered decode chain" in support.rope_dim_reason(192)
+    # head_dim is judged first: a 128-dim head names the head dim, not the RoPE rule
+    assert (
+        "head_dim=256"
+        in Qwen35BlockGeometry(
+            d_model=4096, num_qo_heads=32, num_kv_heads=2, head_dim=128, rope_dim=64
+        ).unsupported_reason()
+    )
+
+
 def test_support_probe_on_cpu_never_raises_and_names_the_device():
     from flashinfer.qwen_3_5_block import Qwen35BlockGeometry, qwen_3_5_block_support
 
@@ -63,9 +94,20 @@ def test_support_probe_on_cpu_never_raises_and_names_the_device():
         and sup.decode_max_rows == 32
     )
     assert sup.dtypes == (torch.bfloat16,) and sup.cutedsl_required == "4.8.0"
+    assert sup.rope_dims == (64, 128)
     assert (
         "bfloat16"
         in qwen_3_5_block_support(torch.device("cpu"), g, dtype=torch.float16).reason
+    )
+    # the geometry gate speaks before the device: a declined rope_dim is the reason on every device, for every form
+    rope32 = qwen_3_5_block_support(
+        torch.device("cpu"),
+        Qwen35BlockGeometry(d_model=2560, num_qo_heads=24, num_kv_heads=2, rope_dim=32),
+    )
+    assert not rope32.served and "rope_dim=32" in rope32.reason
+    assert all(
+        not rope32.form(f).served and rope32.form(f).reason == rope32.reason
+        for f in ("prefill", "extend", "decode")
     )
     assert (
         "head_dim=256"
