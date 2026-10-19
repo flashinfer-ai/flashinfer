@@ -50,13 +50,14 @@ overrides it -- ``auto``, ``shipped`` (the baseline build) or a delivered build
 name; rank-uniform, checked collectively): SM100 groups of 8 ranks run the
 ``bulk_ow256`` build (wide operand loads, bulk row stores), SM100 groups of 4
 ranks and SM103 groups of 8 or 4 ranks the ``ow256`` build (wide operand loads),
-groups of 2 ranks and SM90 the baseline build.  Every build stores identical
-bits; the wide-load builds require 32-byte-aligned ``cos_sin`` and norm-weight
-bases (:meth:`CakeQkvExchangeSession._validate` refuses a misaligned view and
-names the opt-out).  Wherever a variant is the default, the baseline build of
-the same tile width is delivered too, so the opt-out always launches a
-delivered program; a build that is not delivered for the session's tile width
-raises and names the delivered ones.
+SM107 groups of 4 ranks the ``bulk`` build (bulk row stores), groups of 2 ranks
+and SM90 the baseline build.  Every build stores identical bits; the wide-load
+builds require 32-byte-aligned ``cos_sin`` and norm-weight bases
+(:meth:`CakeQkvExchangeSession._validate` refuses a misaligned view and names
+the opt-out).  Wherever a variant is the default, the baseline build of the
+same tile width is delivered too, so the opt-out always launches a delivered
+program; a build that is not delivered for the session's tile width raises and
+names the delivered ones.
 
 Group scaling (``plans.GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD``, resolved once per
 session by :func:`resolve_group_m_scale`: the default of the architecture and
