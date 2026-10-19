@@ -505,6 +505,51 @@ def test_decode_separate_cache_write_launch():
     assert (case.kv_cache[0] == 0).all(), "the NULL page must never be written"
 
 
+def test_vendored_cache_write_launcher_pins_every_operand_to_one_device():
+    """The vendored ``kernels/cache_write.py`` launcher (the ``_CacheWrite`` stage's kernel; patch P4): every operand on the
+    sources' CUDA device, typed and named, before any launch -- a CPU ``slot_mapping`` used to pass the dtype / rank / length checks
+    and reach the kernel as a host address.  The block's own execute preflight pins the pools and the slot mapping to ``h``'s device,
+    so the route was guarded; this is the launcher's standalone contract.  The well-formed launch still runs.  The vendored
+    recipe is compiled OUTSIDE a plan, so the adapter's cache redirection is applied first: the compiled-plan entry lands under
+    FlashInfer's cache root like every plan's, never under the tree's own default (``XDG_CACHE_HOME``)."""
+    from flashinfer.experimental.qwen_3_5_block import api as _api
+    from flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.cache_write import (
+        compile_cache_write,
+        run_cache_write,
+    )
+
+    _api.configure_vendored_tree()
+    dev = torch.device("cuda", 0)
+    r = compile_cache_write(
+        dtype=torch.bfloat16,
+        h=2,
+        d=256,
+        page_size=16,
+        slot_dtype=torch.int32,
+        two_operands=True,
+    )
+    src = torch.ones(8, 2, 256, device=dev, dtype=torch.bfloat16)
+    pool = torch.zeros(2, 2, 16, 256, device=dev, dtype=torch.bfloat16)
+    slot = torch.arange(8, device=dev, dtype=torch.int32)
+    s = torch.cuda.current_stream(dev).cuda_stream
+    with pytest.raises(ValueError, match="slot_mapping must live on"):
+        run_cache_write(r, src, src, pool, pool, slot.cpu(), stream=s)
+    with pytest.raises(ValueError, match="pool_b must live on"):
+        run_cache_write(r, src, src, pool, pool.cpu(), slot, stream=s)
+    with pytest.raises(ValueError, match="src_b must be on"):
+        run_cache_write(r, src, src.cpu(), pool, pool, slot, stream=s)
+    with pytest.raises(ValueError, match="src_a must be a CUDA tensor"):
+        run_cache_write(r, src.cpu(), src, pool, pool, slot, stream=s)
+    assert (pool == 0).all(), "a refused launch must not write"
+    run_cache_write(r, src, src, pool, pool, slot, stream=s)
+    torch.cuda.synchronize(dev)
+    assert (
+        (pool[0, :, :8] == 1).all()
+        and (pool[0, :, 8:] == 0).all()
+        and (pool[1] == 0).all()
+    )
+
+
 def test_run_time_declines_are_typed_and_named():
     """Every malformed operand of a run is a ``ValueError`` naming it, host-side, before any launch."""
     g = _geometry("24_2")

@@ -163,10 +163,11 @@ The backend is a subset of the cuDNN Frontend Python package vendored byte-faith
 (99 files: the block's forward and its serving launches -- the fused norm + RoPE projection fork and the lowered small-M decode
 chain's norm + RoPE pass and cache write --, the FROST SDPA adapter and its SM107 prefill / decode tiles and SM100 split combine,
 the FROST GEMM compiler and its kernel templates, the `tile_dsl` helpers; every file keeps its NVIDIA SPDX header, MIT or
-Apache-2.0), with only the import roots rewritten and six declared, exact-text patches (P0-P2 replace the nanobind extension's
-seams, P3 rewords fourteen comment lines that named internal hosts, file paths or workflow vocabulary, P5-P6 prune what the subset
-does not carry -- the `gemm` package's lazy exports and the sm120 arch family; all listed in `_cudnn_frost/VENDOR.md`; per-file
-digests in `_cudnn_frost/VENDOR_MANIFEST.json`). Pinned revision: cuDNN Frontend
+Apache-2.0), with only the import roots rewritten and seven declared, exact-text patches (P0-P2 replace the nanobind extension's
+seams, P3 rewords fourteen comment lines that named internal hosts, file paths or workflow vocabulary, P4 carries the cache-write
+launcher's one-device check ahead of its upstream landing, P5-P6 prune what the subset does not carry -- the `gemm` package's lazy
+exports and the sm120 arch family; all listed in `_cudnn_frost/VENDOR.md`; per-file digests in `_cudnn_frost/VENDOR_MANIFEST.json`).
+Pinned revision: cuDNN Frontend
 `aba744cd6` (1.32.0, with the Rubin decode levers: the 64-column decode tile, the decode-grid split combine and its lean group
 walk, the lowered small-M decode chain); `qwen_3_5_block_support(...).source` reports it at runtime. The deployed process never imports the
 `cudnn` package nor the cuDNN library: the one native piece of that route, the SDPA launch binder, is served in Python

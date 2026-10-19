@@ -349,10 +349,18 @@ def run_cache_write(r: CacheWriteRecipe, src_a, src_b, pool_a, pool_b, slot, *, 
     t = int(src_a.shape[0])
     if src_b is not None and int(src_b.shape[0]) != t:
         raise ValueError(f"src_a and src_b must carry the same T, got {t} and {int(src_b.shape[0])}")
-    check_pool(pool_a, "pool_a", h=r.h, page_size=r.page_size, d=r.d, dtype=r.dtype)
+    # Every operand on ONE CUDA device, src_a's (the kernel reads them through device pointers): a CPU slot_mapping -- a serving
+    # stack's `torch.tensor(slots, dtype=torch.int32)` with no device= -- passed the dtype / rank / length checks and the kernel
+    # dereferenced a host address, an illegal-address fault that is sticky for the process; `is_cuda` alone cannot tell a tensor on
+    # ANOTHER GPU from a local one, so the pools and the slot mapping are compared against src_a's device by name.
+    if not src_a.is_cuda:
+        raise ValueError(f"src_a must be a CUDA tensor (the kernel reads every operand through a device pointer), got device {src_a.device}")
+    if src_b is not None and src_b.device != src_a.device:
+        raise ValueError(f"src_b must be on {src_a.device} with src_a, got {src_b.device}")
+    check_pool(pool_a, "pool_a", h=r.h, page_size=r.page_size, d=r.d, dtype=r.dtype, device=src_a.device)
     if pool_b is not None:
-        check_pool(pool_b, "pool_b", h=r.h, page_size=r.page_size, d=r.d, dtype=r.dtype)
-    check_slot_mapping(slot, "slot_mapping", t=t)
+        check_pool(pool_b, "pool_b", h=r.h, page_size=r.page_size, d=r.d, dtype=r.dtype, device=src_a.device)
+    check_slot_mapping(slot, "slot_mapping", t=t, device=src_a.device)
     if slot.dtype != r.slot_dtype:
         raise ValueError(f"slot_mapping is {slot.dtype} but this artifact was compiled for {r.slot_dtype}; the slot dtype is fixed per artifact")
     n_rows = t * r.h

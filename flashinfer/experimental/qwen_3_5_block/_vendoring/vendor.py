@@ -18,10 +18,11 @@ read live when a cuDNN Frontend install is importable, else from the recorded co
   alone (they resolve inside the vendored tree).  No regular expression touches anything that is not an import statement; the
   ONE string-literal site that importlib resolves at runtime (``engines/manifest.py``'s ``("cudnn._gemm_validate", ...)``
   family references) is rewritten by locating ``ast.Constant`` nodes in that one named file.
-* Six declared PATCHES (P0-P3, P5-P6, listed in VENDOR.md): P0-P2, exact text, make the copy importable without the nanobind
+* Seven declared PATCHES (P0-P6, listed in VENDOR.md): P0-P2, exact text, make the copy importable without the nanobind
   extension; P3, context-anchored regular expressions that name nothing themselves, rewords the comment / docstring lines that
-  named internal hosts or internal file paths; P5-P6, exact text, prune what the vendored subset does not carry (the lazy exports
-  outside the closure, the sm120 arch family); everything else is byte-identical to the commit, SPDX headers included.
+  named internal hosts or internal file paths; P4, exact text, carries a fix ahead of its upstream landing (dropped at the
+  re-vendor that follows it); P5-P6, exact text, prune what the vendored subset does not carry (the lazy exports outside the
+  closure, the sm120 arch family); everything else is byte-identical to the commit, SPDX headers included.
 * The one file vendored from OUTSIDE ``python/cudnn`` (``EXTRA_FILES``) is pinned by digest like every closure file: ``closure.json``
   carries its blob's sha256 (``extra_files``, written by ``build_closure.py``) and the exporter stops when the blob moved.
 * The generated files (the package root, the shim ``_compiled_module.py``, ``VENDOR.md``, ``VENDOR_MANIFEST.json``) carry a
@@ -61,6 +62,11 @@ GEN_HEADER = "# Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0
 #     shim instead.
 # P3 (REGEX_PATCHES below): comment / docstring lines that name an internal host or an internal file path, or use internal
 #     workflow vocabulary, are reworded (the sentence stays, the name goes).  No code changes.
+# P4: the cache-write launcher (`run_cache_write`) pins every operand to ONE CUDA device, the sources' -- the host contract of every
+#     other block launcher (`_check_one_cuda_device` in kernels/quantize.py): a CPU `slot_mapping` passed the dtype / rank / length
+#     checks and the kernel dereferenced a host address.  The block's own execute preflight already pins the pools and the slot
+#     mapping to `h`'s device, so the route was guarded; the launcher's standalone contract was not.  A fix carried AHEAD of its
+#     upstream landing (the same hunk, no vendor marker): dropped at the re-vendor that follows it.
 # P5: gemm/__init__.py's lazy-export table names two modules outside the closure (cudnn.gemm.mhc_projection_bwd, cudnn.gemm.ops):
 #     importlib would resolve them against whatever `cudnn` package is installed, never the vendored tree.  The table is emptied
 #     (`__all__` with it), so an absent name is an AttributeError by name.
@@ -91,6 +97,27 @@ PATCHES = {
             "P2",
             '_pybind_module = importlib.import_module(module_name, package="cudnn")\n',
             "from . import _compiled_module as _pybind_module  # [vendor.py P2] the shim, not the nanobind extension\n",
+        ),
+    ],
+    "gated_attention_block/kernels/cache_write.py": [
+        (
+            "P4",
+            '    check_pool(pool_a, "pool_a", h=r.h, page_size=r.page_size, d=r.d, dtype=r.dtype)\n'
+            "    if pool_b is not None:\n"
+            '        check_pool(pool_b, "pool_b", h=r.h, page_size=r.page_size, d=r.d, dtype=r.dtype)\n'
+            '    check_slot_mapping(slot, "slot_mapping", t=t)\n',
+            "    # Every operand on ONE CUDA device, src_a's (the kernel reads them through device pointers): a CPU slot_mapping -- a serving\n"
+            "    # stack's `torch.tensor(slots, dtype=torch.int32)` with no device= -- passed the dtype / rank / length checks and the kernel\n"
+            "    # dereferenced a host address, an illegal-address fault that is sticky for the process; `is_cuda` alone cannot tell a tensor on\n"
+            "    # ANOTHER GPU from a local one, so the pools and the slot mapping are compared against src_a's device by name.\n"
+            "    if not src_a.is_cuda:\n"
+            '        raise ValueError(f"src_a must be a CUDA tensor (the kernel reads every operand through a device pointer), got device {src_a.device}")\n'
+            "    if src_b is not None and src_b.device != src_a.device:\n"
+            '        raise ValueError(f"src_b must be on {src_a.device} with src_a, got {src_b.device}")\n'
+            '    check_pool(pool_a, "pool_a", h=r.h, page_size=r.page_size, d=r.d, dtype=r.dtype, device=src_a.device)\n'
+            "    if pool_b is not None:\n"
+            '        check_pool(pool_b, "pool_b", h=r.h, page_size=r.page_size, d=r.d, dtype=r.dtype, device=src_a.device)\n'
+            '    check_slot_mapping(slot, "slot_mapping", t=t, device=src_a.device)\n',
         ),
     ],
     "gemm/__init__.py": [
@@ -668,6 +695,10 @@ def gen_vendor_md(
         + ", ".join(f"`{f}` ({len(ps)})" for f, ps in REGEX_PATCHES.items())
         + f" | {sum(len(ps) for ps in REGEX_PATCHES.values())} comment / docstring lines that named an internal host or an internal file path, or used internal workflow vocabulary, are reworded "
         "(the sentence stays, the name goes; the context-anchored patterns and the replacements are `REGEX_PATCHES` in `vendor.py`); no code changes; dropped at the next re-vendor once the upstream files are scrubbed |\n",
+        "| P4 | `gated_attention_block/kernels/cache_write.py` | `run_cache_write` pins every operand to ONE CUDA device, the sources' (`src_a.is_cuda`, `src_b` on it, the pools and "
+        "`slot_mapping` compared against it through the contract helpers' `device=`): a CPU `slot_mapping` passed the dtype / rank / length checks and the kernel dereferenced a host "
+        "address.  The block's execute preflight already pins the pools and the slot mapping to `h`'s device (the route was guarded); this is the launcher's standalone contract.  "
+        "A fix carried ahead of its upstream landing -- the same hunk, no vendor marker -- dropped at the re-vendor that follows it |\n",
         "| P5 | `gemm/__init__.py` | the lazy-export table (`_LAZY_EXPORTS`, and `__all__` with it) is emptied: its six entries named `cudnn.gemm.mhc_projection_bwd` and `cudnn.gemm.ops`, "
         "modules outside the closure that `importlib.import_module` would have resolved against whatever `cudnn` package is installed, never the vendored tree; an absent name is "
         "an `AttributeError` by name |\n",
