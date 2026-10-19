@@ -24,7 +24,7 @@ from typing import ClassVar
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Boolean, Float32, Int32, Uint32
+from cutlass import Boolean, Float32, Int32, Uint32
 from cutlass.experimental import primitives as prims
 
 from cutlass.experimental.task_scheduling.enums import WorkAttr
@@ -43,12 +43,12 @@ from cutlass.experimental.task_scheduling.resources import (
 
 from ...._block_sparse.prepared import _PREPARED_ROUTE_IS_FULL_FLAG
 from ..fmha_decode_config import CAUSAL, FmhaDecodeConfig
-from ..fmha_decode_constants import (
+from ...int32_scores import (
     INT32_SCORE_BIAS,
-    INT32_SCORE_SEED_MMA_K,
-    INT32_SCORE_SEED_TILE_LBO,
-    INT32_SCORE_SEED_TILE_SBO,
-    INT32_SCORE_SEED_TILE_WORDS,
+    fill_score_seed_tile,
+    issue_score_seed_mma,
+    score_seed_tile_bytes,
+    score_seed_words,
 )
 from ...tcgen05_compat import tcgen05_ld_32x32b_max, tcgen05_mma_ws
 from ...placeholder_helpers import (
@@ -352,22 +352,16 @@ class TmemSResource(DecodeGenResourceBase):
         return allocations
 
     def _seed_mma_tile_bytes(self) -> int:
-        """Return the byte size of the seeding MMA's shared operand tile.
-
-        A reads the first M rows and B the first N rows of the same tile.
-        """
+        """Return the byte size of the seeding MMA's operand tile."""
         _, mma_m, mma_n = _qk_mma_operand_contract_for_config(self.cfg)
-        return max(mma_m, mma_n) * INT32_SCORE_SEED_MMA_K * 2
+        return score_seed_tile_bytes(mma_m, mma_n)
 
     @cute.jit
     def _seed_mma_tile_words(self, context: ResourceContext) -> cutlass.Array:
-        """Return the seeding MMA's operand tile as a 32-bit SMEM array."""
+        """Return the seeding MMA's operand tile; the second instance reads the first's."""
         owner = self if self.score_seed_owner is None else self.score_seed_owner
-        return cutlass.Array(
-            context.smem_base.data_ptr() + owner._seed_alloc.offset,
-            dtype=Uint32,
-            shape=(owner._seed_mma_tile_bytes() // 4,),
-            addrspace=3,
+        return score_seed_words(
+            context.smem_base, owner._seed_alloc.offset, owner._seed_mma_tile_bytes()
         )
 
     @cute.jit
@@ -385,26 +379,15 @@ class TmemSResource(DecodeGenResourceBase):
 
     @cute.jit
     def fill_score_seed_tiles(self, context: ResourceContext) -> None:
-        """Fill the seeding MMA's constant operand tile with the whole CTA.
-
-        The fence makes the generic-proxy stores visible to the tensor core.
-        """
+        """Fill the seeding MMA's constant operand tile with the whole CTA."""
         assert self.score_seed_owner is None, "only the owning instance fills the tile"
-        words = self._seed_mma_tile_words(context)
-        num_words = self._seed_mma_tile_bytes() // 4
-        num_threads = self.cfg.threads_per_cta
         tidx, _, _ = cute.arch.thread_idx()
-        even_word, odd_word = INT32_SCORE_SEED_TILE_WORDS
-        for round_idx in cutlass.range_constexpr(
-            (num_words + num_threads - 1) // num_threads
-        ):
-            word_idx = tidx + Int32(round_idx * num_threads)
-            if word_idx < Int32(num_words):
-                word = Uint32(even_word)
-                if (word_idx & Int32(1)) != Int32(0):
-                    word = Uint32(odd_word)
-                words[word_idx] = word
-        cute.arch.fence_view_async_shared()
+        fill_score_seed_tile(
+            self._seed_mma_tile_words(context),
+            self._seed_mma_tile_bytes() // 4,
+            tidx,
+            self.cfg.threads_per_cta,
+        )
 
     def get_tmem_requirements(self) -> list[TmemAllocation]:
         """Allocate TMEM S score columns for QK MMA output."""
@@ -643,51 +626,20 @@ class TmemSResource(DecodeGenResourceBase):
 
     @cute.jit
     def _seed_scores(self, stage_info: StageInfo, stage_slot_offset: Int32) -> None:
-        """Write ``INT32_SCORE_BIAS`` into the acquired S slot with one BF16 MMA step.
-
-        The step reads the constant operand tile and no accumulator; the INT8
-        K steps accumulate onto the seed's bit pattern in issue order.
-        """
+        """Write ``INT32_SCORE_BIAS`` into the acquired S slot before its K steps."""
         cfg = self.cfg
         assert cfg.uses_int32_scores
         # The bias binade relies on ``|score| <= 2**21``, which holds for
         # 128-wide INT8 dot products.
         assert cfg.headdim == 128
-        if prims.elect_sync():
-            tmem_col = self._qk_tmem_col(stage_info, stage_slot_offset)
-            _, mma_m, mma_n = _qk_mma_operand_contract_for_config(cfg)
-            tile_desc = prims.Tcgen05SmemDesc.build(
-                self._seed_mma_tile_words(stage_info.context),
-                leading_byte_offset=INT32_SCORE_SEED_TILE_LBO,
-                stride_byte_offset=INT32_SCORE_SEED_TILE_SBO,
-                layout=prims.Tcgen05SmemSwizzle.NONE,
-            )
-            idesc = prims.Tcgen05InstrDesc.build(
-                c_dtype=Float32,
-                a_dtype=BFloat16,
-                b_dtype=BFloat16,
-                n_dim=mma_n,
-                m_dim=mma_m,
-            )
-            if cutlass.const_expr(cfg.uses_ws_2x2_datapath):
-                tcgen05_mma_ws(
-                    prims.Tcgen05MMAKind.F16,
-                    tmem_col,
-                    tile_desc,
-                    tile_desc,
-                    idesc,
-                    False,
-                )
-            else:
-                prims.tcgen05_mma(
-                    prims.Tcgen05MMAKind.F16,
-                    prims.CTAGroup.CTA_1,
-                    tmem_col,
-                    tile_desc,
-                    tile_desc,
-                    idesc,
-                    False,
-                )
+        _, mma_m, mma_n = _qk_mma_operand_contract_for_config(cfg)
+        issue_score_seed_mma(
+            self._qk_tmem_col(stage_info, stage_slot_offset),
+            self._seed_mma_tile_words(stage_info.context),
+            mma_m,
+            mma_n,
+            ws=cfg.uses_ws_2x2_datapath,
+        )
 
     @producer_work
     @cute.jit

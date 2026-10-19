@@ -2890,7 +2890,7 @@ def test_attention_ts_context_public_plan_rejects_unsupported_arch(monkeypatch):
         (
             "dtype",
             NotImplementedError,
-            "supports torch.float16, torch.bfloat16, and torch.float8_e4m3fn",
+            "supports torch.float16, torch.bfloat16, torch.float8_e4m3fn",
         ),
         ("head-dim", NotImplementedError, "supports head_dim"),
         ("head-ratio", ValueError, "Q head count must be divisible"),

@@ -36,9 +36,7 @@ from flashinfer.attention.prims_ts import (
     block_sparse_attention,
 )
 from flashinfer.attention.prims_ts._block_sparse import config as sparse_config
-from flashinfer.attention.prims_ts._block_sparse.plan import (
-    _INT8_QK_COMPUTE_CAPABILITIES,
-)
+from flashinfer.attention.prims_ts.sage import _INT8_QK_COMPUTE_CAPABILITIES
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_constants import (
     E4M3_MAX,
     SOFTMAX_RESCALE_THRESHOLD_LOG2,
@@ -275,23 +273,48 @@ def _random_qk(shape, dtype: torch.dtype) -> torch.Tensor:
     return values.to(dtype)
 
 
+def _random_qk_scales(
+    num_qo_heads: int,
+    num_kv_heads: int,
+    batch_size: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+    q_block_size: int,
+    k_block_size: int,
+    qk_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Random positive Q and K scales; INT8 scales shrink by ``_INT8_STD``."""
+    unit = 1.0 / _INT8_STD if qk_dtype == torch.int8 else 1.0
+    q_scale = _random_scales(
+        num_qo_heads, batch_size, seq_len_q, q_block_size, 0.1 * unit, 0.4 * unit
+    )
+    k_scale = _random_scales(
+        num_kv_heads, batch_size, seq_len_kv, k_block_size, 0.5 * unit, 2.0 * unit
+    )
+    return q_scale, k_scale
+
+
 def _random_inputs(case: _SageCase):
     """Random 8-bit Q/K, E4M3 V, proxy summaries and positive scales."""
 
-    unit = 1.0 / _INT8_STD if case.qk_dtype == torch.int8 else 1.0
     batch, hq, hkv = case.batch_size, case.num_qo_heads, case.num_kv_heads
     q = _random_qk((batch, case.seq_len_q, hq, _HEAD_DIM), case.qk_dtype)
     k = _random_qk((batch, case.seq_len_kv, hkv, _HEAD_DIM), case.qk_dtype)
     v = torch.randn(k.shape, device="cuda").to(_FP8)
-    q_scale = _random_scales(
-        hq, batch, case.seq_len_q, case.sage.q_block_size, 0.1 * unit, 0.4 * unit
+    q_scale, k_scale = _random_qk_scales(
+        hq,
+        hkv,
+        batch,
+        case.seq_len_q,
+        case.seq_len_kv,
+        case.sage.q_block_size,
+        case.sage.k_block_size,
+        case.qk_dtype,
     )
     if case.tiny_q_scales:
         second_batch = _scale_slots(batch, case.seq_len_q, case.sage.q_block_size)[1]
         q_scale[:, second_batch] *= 1e-8
-    k_scale = _random_scales(
-        hkv, batch, case.seq_len_kv, case.sage.k_block_size, 0.5 * unit, 2.0 * unit
-    )
+    unit = 1.0 / _INT8_STD if case.qk_dtype == torch.int8 else 1.0
     params = SageAttentionParams(
         q_scale=q_scale / _SCALE_SHIFT,
         k_scale=k_scale * _SCALE_SHIFT,

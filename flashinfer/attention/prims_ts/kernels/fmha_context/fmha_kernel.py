@@ -1327,6 +1327,7 @@ def build_context_task_manager(
             smem_p=smem_p1,
             sage_scales=sage_scales,
             num_kv_heads=num_kv_heads,
+            score_seed_owner=tmem_sp0,
             name="tmem_sp1",
         )
         tmem_vec1 = TmemStatsResource(
@@ -1924,6 +1925,7 @@ def _kv_ring_smem_budget_bytes(
     sage_k_bytes = 0
     if cfg.sage_stages_k_scales:
         sage_k_bytes = cfg.sage_k_scale_stages * cfg.sage_k_tile_bytes
+    score_seed_bytes = cfg.score_seed_tile_bytes if cfg.uses_int32_scores else 0
     control_bytes = (2 * cutlass.Int32.width + cutlass.Int64.width) // 8
     if is_clc_dynamic:
         control_bytes = (control_bytes + 15) // 16 * 16 + cutlass.Int128.width // 8
@@ -1941,6 +1943,7 @@ def _kv_ring_smem_budget_bytes(
         + (stats_bytes + 15) // 16 * 16
         + (page_offsets_bytes + 15) // 16 * 16
         + (sage_k_bytes + 15) // 16 * 16
+        + (score_seed_bytes + 127) // 128 * 128
         + (control_bytes + 7) // 8 * 8
         + fixed_barrier_stages * _PIPELINE_BARRIER_BYTES_PER_STAGE
     )
@@ -2216,7 +2219,7 @@ def _check_sage_attention(cfg: FmhaConfig) -> None:
         raise ValueError("Sage attention requires the dense query-paired D128 schedule")
     if not cfg.p_in_smem:
         raise ValueError(
-            "Sage attention requires E4M3 Q/K/V with a 16-bit output (P in SMEM)"
+            "Sage attention requires E4M3 V with a 16-bit output (P in SMEM)"
         )
     if (
         layout.headdim != cfg.pv_mma_tiler[1]
@@ -2955,6 +2958,7 @@ class FmhaTs:
             or d != 128
             or d_v != 128
             or q_dtype.width not in (8, 16)
+            or q_dtype == cutlass.Int8
         ):
             raise ValueError(
                 "two-CTA UMMA requires the non-persistent dense contiguous "

@@ -69,8 +69,8 @@ alignment, value, aliasing, and lifetime obligation in the runtime contract.
 | Mask | Dense or bottom-right causal; fixed contiguous also supports variable-window bounds |
 | Sliding window | Positive causal left window; `window_left=-1` disables it |
 | Scheduling | Automatic nonpersistent, static-persistent, or CLC-persistent selection; no public tuning knob |
-| Accumulation | FP32 QK/PV and softmax state |
-| Sage attention | Contiguous dense fixed-length plans with `head_dim=128`, `torch.float8_e4m3fn` Q/K/V and a 16-bit output: `plan(sage=SageAttentionConfig(...))`, `run(sage=SageAttentionParams(...))`; see [Sage attention](../../README.md#sage-attention) |
+| Accumulation | FP32 QK/PV and softmax state; INT8 Q/K accumulate INT32 scores that the softmax reads as FP32 |
+| Sage attention | Contiguous dense fixed-length plans with `head_dim=128`, `torch.float8_e4m3fn` or `torch.int8` (SM100a only) Q/K, `torch.float8_e4m3fn` V and a 16-bit output: `plan(sage=SageAttentionConfig(...))`, `run(sage=SageAttentionParams(...))`; see [Sage attention](../../README.md#sage-attention) |
 
 The established equal-dimension paths have accuracy and performance signoff
 on SM100a/B200. The 192/128 extension has been validated on SM103/GB300;
@@ -392,12 +392,13 @@ runtime tensors alive until every graph using that plan is destroyed.
 - Positive windows are restricted to even-ratio GQA because the kernel pairs
   query heads that share a K/V head.
 - Attention sinks and custom masks are not exposed. Q and K must share one
-  dtype; the only mixed combination is `torch.bfloat16` Q/K with
+  dtype; the mixed combinations are `torch.bfloat16` Q/K with
+  `torch.float8_e4m3fn` V, and a Sage plan's `torch.int8` Q/K with
   `torch.float8_e4m3fn` V.
 - Sage attention covers only the contiguous dense fixed-length
-  `head_dim=128` path with E4M3 Q/K/V and a 16-bit output; causal and
-  variable-window masks, packed or paged storage, left windows and INT8 Q/K
-  are rejected at plan time.
+  `head_dim=128` path with E4M3 or INT8 Q/K, E4M3 V and a 16-bit output;
+  causal and variable-window masks, packed or paged storage and left windows
+  are rejected at plan time. INT8 Q/K need the INT8 tcgen05 MMA of SM100a.
 - Re-plan either wrapper after changing a static capacity, head or dtype
   geometry, mask, window, or default scale; page size and explicit metadata
   promises are also static for paged plans. Request tensors and metadata may

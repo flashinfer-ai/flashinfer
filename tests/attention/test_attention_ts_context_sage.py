@@ -15,14 +15,17 @@ from flashinfer.attention.prims_ts import (
 )
 from flashinfer.utils import get_compute_capability
 from tests.attention.test_attention_ts_sage import (
+    _REQUIRES_INT8_QK_GPU,
     _dequantize,
     _fold,
     _ieee_float32_references,  # noqa: F401
-    _random_scales,
+    _random_qk,
+    _random_qk_scales,
     _reference_sage_scales,
 )
 
 _FP8 = torch.float8_e4m3fn
+_INT8 = torch.int8
 _HEAD_DIM = 128
 # The context kernel folds one 128-token K tile per online-softmax step and
 # keeps its exponent anchor while a tile raises the row maximum by at most
@@ -65,6 +68,18 @@ def _plan(
     return wrapper
 
 
+def _qk_dtype_options(qk_dtype: torch.dtype) -> dict:
+    """Plan keywords of a Q/K dtype; INT8 Q/K keep E4M3 V."""
+    if qk_dtype == _INT8:
+        return dict(q_dtype=_INT8, k_dtype=_INT8, v_dtype=_FP8)
+    return dict(q_dtype=qk_dtype, k_dtype=qk_dtype)
+
+
+def _dtype_id(value):
+    """Id the dtype column of a parametrized case; other columns keep pytest's."""
+    return str(value).removeprefix("torch.") if isinstance(value, torch.dtype) else None
+
+
 def _random_params(
     config: SageAttentionConfig,
     *,
@@ -73,15 +88,23 @@ def _random_params(
     seq_len_kv: int,
     num_qo_heads: int,
     num_kv_heads: int,
+    qk_dtype: torch.dtype = _FP8,
 ) -> SageAttentionParams:
+    """Random positive scales for ``qk_dtype`` Q/K and E4M3 V."""
+    q_scale, k_scale = _random_qk_scales(
+        num_qo_heads,
+        num_kv_heads,
+        batch_size,
+        seq_len_q,
+        seq_len_kv,
+        config.q_block_size,
+        config.k_block_size,
+        qk_dtype,
+    )
     v_rows = (batch_size, num_kv_heads, _HEAD_DIM)
     return SageAttentionParams(
-        q_scale=_random_scales(
-            num_qo_heads, batch_size, seq_len_q, config.q_block_size, 0.1, 0.4
-        ),
-        k_scale=_random_scales(
-            num_kv_heads, batch_size, seq_len_kv, config.k_block_size, 0.5, 2.0
-        ),
+        q_scale=q_scale,
+        k_scale=k_scale,
         v_scale=torch.empty(v_rows, device="cuda").uniform_(0.25, 1.0),
         v_mean=torch.randn(v_rows, device="cuda") if config.v_mean else None,
     )
@@ -130,17 +153,30 @@ def _reference(q, k, v, params: SageAttentionParams, *, config, sm_scale: float)
     return output
 
 
+# The three K block sizes select the three Sage softmax modes.
+_INT8_K_BLOCK_SIZES = (16, 4, 1)
+
+
 @_REQUIRES_CONTEXT_SAGE_GPU
 @pytest.mark.parametrize(
     "batch_size, seq_len_q, seq_len_kv, num_qo_heads, num_kv_heads, "
-    "q_block_size, k_block_size, v_mean",
+    "q_block_size, k_block_size, v_mean, qk_dtype",
     [
-        (1, 1024, 1024, 8, 8, 1, 16, False),
-        (2, 300, 1004, 8, 4, 2, 16, True),
-        (1, 256, 4096, 4, 4, 128, 64, True),
-        (2, 300, 1004, 8, 4, 2, 4, True),
-        (1, 512, 1000, 4, 4, 1, 1, False),
+        (1, 1024, 1024, 8, 8, 1, 16, False, _FP8),
+        (2, 300, 1004, 8, 4, 2, 16, True, _FP8),
+        (1, 256, 4096, 4, 4, 128, 64, True, _FP8),
+        (2, 300, 1004, 8, 4, 2, 4, True, _FP8),
+        (1, 512, 1000, 4, 4, 1, 1, False, _FP8),
+        *(
+            pytest.param(*case, _INT8, marks=_REQUIRES_INT8_QK_GPU)
+            for case in (
+                (1, 1024, 1024, 8, 8, 1, 16, False),
+                (2, 300, 1004, 8, 4, 2, 4, True),
+                (1, 512, 1000, 4, 4, 1, 1, False),
+            )
+        ),
     ],
+    ids=_dtype_id,
 )
 @torch.no_grad()
 def test_context_sage_matches_dequantized_reference(
@@ -152,6 +188,7 @@ def test_context_sage_matches_dequantized_reference(
     q_block_size,
     k_block_size,
     v_mean,
+    qk_dtype,
 ) -> None:
     """Sage context attention matches FP32 attention on the dequantized inputs."""
     torch.manual_seed(0)
@@ -166,21 +203,63 @@ def test_context_sage_matches_dequantized_reference(
         num_kv_heads=num_kv_heads,
     )
     sm_scale = _HEAD_DIM**-0.5
-    wrapper = _plan(sage=config, sm_scale=sm_scale, **shape)
-    params = _random_params(config, **shape)
-    q = torch.randn((batch_size, seq_len_q, num_qo_heads, _HEAD_DIM), device="cuda").to(
-        _FP8
+    wrapper = _plan(
+        sage=config, sm_scale=sm_scale, **_qk_dtype_options(qk_dtype), **shape
     )
-    k = torch.randn(
-        (batch_size, seq_len_kv, num_kv_heads, _HEAD_DIM), device="cuda"
-    ).to(_FP8)
-    v = torch.randn_like(k.float()).to(_FP8)
+    params = _random_params(config, qk_dtype=qk_dtype, **shape)
+    q = _random_qk((batch_size, seq_len_q, num_qo_heads, _HEAD_DIM), qk_dtype)
+    k = _random_qk((batch_size, seq_len_kv, num_kv_heads, _HEAD_DIM), qk_dtype)
+    v = torch.randn(k.shape, device="cuda").to(_FP8)
     actual = wrapper.run(q, k, v, sage=params)
     torch.cuda.synchronize()
     assert actual.dtype == torch.bfloat16
     assert torch.isfinite(actual).all()
     expected = _reference(q, k, v, params, config=config, sm_scale=sm_scale)
     torch.testing.assert_close(actual.float(), expected, rtol=8e-3, atol=2e-3)
+
+
+@_REQUIRES_CONTEXT_SAGE_GPU
+@_REQUIRES_INT8_QK_GPU
+@pytest.mark.parametrize("k_block_size", _INT8_K_BLOCK_SIZES)
+@torch.no_grad()
+def test_context_int8_extreme_scores_stay_in_the_bias_binade(k_block_size) -> None:
+    """INT8 scores of +-2**21 keep their exact biased float form in every softmax mode."""
+    torch.manual_seed(0)
+    config = SageAttentionConfig(q_block_size=1, k_block_size=k_block_size)
+    shape = dict(
+        batch_size=1, seq_len_q=256, seq_len_kv=1000, num_qo_heads=2, num_kv_heads=2
+    )
+    sm_scale = _HEAD_DIM**-0.5
+    wrapper = _plan(sage=config, sm_scale=sm_scale, **_qk_dtype_options(_INT8), **shape)
+    params = _random_params(config, qk_dtype=_INT8, **shape)
+    q = _random_qk((1, 256, 2, _HEAD_DIM), _INT8)
+    k = _random_qk((1, 1000, 2, _HEAD_DIM), _INT8)
+    # Query token 5 against key tokens 300 and 700 gives the extreme dot
+    # products +2**21 and -128 * 127 * 128; their scales keep the logits
+    # near +-2 so both stay visible in the softmax.
+    q[:, 5] = -128
+    k[:, 300] = -128
+    k[:, 700] = 127
+    params.q_scale[:, 5] = 2.0**-14
+    params.k_scale[:, 300 // k_block_size] = 2.0**-6
+    params.k_scale[:, 700 // k_block_size] = 2.0**-6
+    v = torch.randn(k.shape, device="cuda").to(_FP8)
+    actual = wrapper.run(q, k, v, sage=params)
+    torch.cuda.synchronize()
+    assert torch.isfinite(actual).all()
+    expected = _reference(q, k, v, params, config=config, sm_scale=sm_scale)
+    torch.testing.assert_close(actual.float(), expected, rtol=8e-3, atol=2e-3)
+
+
+@_REQUIRES_CONTEXT_SAGE_GPU
+def test_context_int8_qk_plans_only_on_sm100(monkeypatch: pytest.MonkeyPatch) -> None:
+    """INT8 Q/K need the INT8 tcgen05 MMA, which only SM100 has."""
+    shape = dict(
+        batch_size=1, seq_len_q=256, seq_len_kv=256, num_qo_heads=2, num_kv_heads=2
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: (10, 3))
+    with pytest.raises(NotImplementedError, match="SM100a"):
+        _plan(sage=SageAttentionConfig(), **_qk_dtype_options(_INT8), **shape)
 
 
 @_REQUIRES_CONTEXT_SAGE_GPU
@@ -233,8 +312,12 @@ def test_context_sage_plan_rejects_unsupported_recipes() -> None:
     config = SageAttentionConfig()
     with pytest.raises(NotImplementedError, match="float16 or bfloat16 output"):
         _plan(sage=config, out_dtype=_FP8, **shape)
-    with pytest.raises(NotImplementedError, match="float8_e4m3fn Q, K and V"):
+    with pytest.raises(NotImplementedError, match="float8_e4m3fn or int8 Q/K"):
         _plan(sage=config, q_dtype=torch.bfloat16, k_dtype=torch.bfloat16, **shape)
+    with pytest.raises(NotImplementedError, match="require a Sage recipe"):
+        _plan(sage=None, **_qk_dtype_options(_INT8), **shape)
+    with pytest.raises(NotImplementedError, match="with float8_e4m3fn V"):
+        _plan(sage=config, q_dtype=_INT8, k_dtype=_INT8, v_dtype=_INT8, **shape)
     with pytest.raises(NotImplementedError, match="dense, fixed-length"):
         _plan(sage=config, mask_type="causal", **shape)
     with pytest.raises(TypeError, match="SageAttentionConfig"):

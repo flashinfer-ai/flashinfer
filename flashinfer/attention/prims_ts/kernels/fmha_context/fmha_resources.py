@@ -88,6 +88,13 @@ from cutlass.cutlass_dsl import Boolean, Constexpr, dsl_user_op, if_generate
 
 from ..placeholder_helpers import _placeholder_smem_array, _placeholder_tmem_ptr
 from ..tcgen05_compat import tcgen05_ld_32x32b_max
+from ..int32_scores import (
+    INT32_SCORE_BIAS,
+    fill_score_seed_tile,
+    issue_score_seed_mma,
+    score_seed_tile_bytes,
+    score_seed_words,
+)
 from ...sage import _FLOAT4_WORDS, _SageScaleLayout
 from .helpers import (
     bottom_right_window_left_bound,
@@ -322,6 +329,8 @@ class FmhaConfig:
     k_dtype: type | None = None
     v_dtype: type | None = None
     o_dtype: type | None = None
+    # The dtype the softmax reads S as. INT8 Q/K accumulate INT32 scores onto
+    # ``INT32_SCORE_BIAS``, whose words are the same FP32 values.
     qk_acc_dtype: type | None = None
     pv_acc_dtype: type | None = None
 
@@ -813,7 +822,23 @@ class FmhaConfig:
         return (
             self.uses_ldtm_stat
             and self.sage_softmax_mode is SageSoftmaxMode.BLOCK_SCALED
+            and not self.uses_int32_scores
         )
+
+    @property
+    def uses_int32_scores(self) -> bool:
+        """Return whether QK accumulates INT8 Q/K into INT32 scores on a float bias.
+
+        A Sage recipe's INT8 Q/K accumulate onto the bit pattern of
+        ``INT32_SCORE_BIAS``, so the softmax reads the scores as FP32 and
+        removes the bias where it applies ``sfK``.
+        """
+        return self.q_dtype == cutlass.Int8
+
+    @property
+    def score_seed_tile_bytes(self) -> int:
+        """Return the bytes of the BF16 operand tile that seeds INT32 scores."""
+        return score_seed_tile_bytes(self.qk_mma_tiler[0], self.qk_mma_tiler[1])
 
     @property
     def sage_k_tile_words(self) -> int:
@@ -2736,6 +2761,10 @@ class TmemSPResource(MemoryResource):
     )
     sage_k_words: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     sage_k_stage_words: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    # INT32 scores: the first instance owns the seed MMA's constant operand
+    # tile and the second reads it.
+    score_seed_owner: Optional["TmemSPResource"] = field(init=False, default=None)
+    _seed_alloc: Constexpr[Optional[SmemAllocation]] = field(init=False, default=None)
     tmem_addr_cached: TmemAddr | None = field(init=False, default=None)
     # Precomputed TMEM pointers/addresses (set by auxiliary work). Avoids
     # per-iteration inttoptr + address math.
@@ -2781,11 +2810,13 @@ class TmemSPResource(MemoryResource):
         smem_p: Optional[SmemPResource] = None,
         sage_scales: cute.Pointer | None = None,
         num_kv_heads: int | Int32 = 0,
+        score_seed_owner: Optional["TmemSPResource"] = None,
         **kwargs: Any,
     ) -> None:
         """Bind S/P TMEM offsets, Q peer index, and optional varlen metadata."""
         super().__init__(pipeline_config=pipeline_config, **kwargs)
         self.cfg = cfg
+        self.score_seed_owner = score_seed_owner
         self.tmem_s_offset = tmem_s_offset
         self.tmem_p_offset = tmem_p_offset
         self.q_half = q_half
@@ -2905,6 +2936,37 @@ class TmemSPResource(MemoryResource):
     def get_tmem_requirements(self) -> list[TmemAllocation]:
         """Return the TMEM allocation for this S/P ping-pong resource."""
         return [self._alloc]
+
+    def get_smem_requirements(self) -> list[SmemAllocation]:
+        """Allocate the INT32 score seed tile; the second instance shares the first's."""
+        if not self.cfg.uses_int32_scores or self.score_seed_owner is not None:
+            return []
+        if self._seed_alloc is None:
+            self._seed_alloc = SmemAllocation(
+                f"{self.name}_score_seed",
+                self.cfg.score_seed_tile_bytes,
+                alignment=128,
+            )
+        return [self._seed_alloc]
+
+    @cute.jit
+    def _score_seed_words(self, context: Any) -> cutlass.Array:
+        """Return the seed MMA's operand tile; the second instance reads the first's."""
+        owner = self if self.score_seed_owner is None else self.score_seed_owner
+        return score_seed_words(
+            context.smem_base, owner._seed_alloc.offset, self.cfg.score_seed_tile_bytes
+        )
+
+    @producer_work
+    @cute.jit
+    def seed_scores(self, stage_info: StageInfo) -> None:
+        """Write ``INT32_SCORE_BIAS`` into the acquired S stage before its K wait."""
+        issue_score_seed_mma(
+            self.tmem_ptr_s_cached.subview(self._stage_col_offset(stage_info)),
+            self._score_seed_words(stage_info.context),
+            self.cfg.qk_mma_tiler[0],
+            self.cfg.qk_mma_tiler[1],
+        )
 
     @property
     def loop_offset_sensitive(self) -> bool:
@@ -3084,7 +3146,13 @@ class TmemSPResource(MemoryResource):
                 self._stage_col_offset(stage_info)
             )
 
-            if cutlass.const_expr(self.cfg.q_dtype.width == 8):
+            acc_format = (
+                cutlass.Int32 if self.cfg.uses_int32_scores else cutlass.Float32
+            )
+            if cutlass.const_expr(self.cfg.uses_int32_scores):
+                mma_kind = prims.Tcgen05MMAKind.INT8
+                ab_format = cutlass.Int8
+            elif cutlass.const_expr(self.cfg.q_dtype.width == 8):
                 mma_kind = prims.Tcgen05MMAKind.F8F6F4
                 # E4M3 operands use the Float16 encoding handle.
                 ab_format = cutlass.Float16
@@ -3096,7 +3164,7 @@ class TmemSPResource(MemoryResource):
                     ab_format = cutlass.Float16
 
             idesc_qk = prims.Tcgen05InstrDesc.build(
-                c_dtype=cutlass.Float32,
+                c_dtype=acc_format,
                 a_dtype=ab_format,
                 b_dtype=ab_format,
                 n_dim=self.cfg.qk_mma_tiler[1],
@@ -3142,9 +3210,11 @@ class TmemSPResource(MemoryResource):
             desc_q_base_ = freeze_smem_descriptor(desc_q_base)
             desc_k_base_ = freeze_smem_descriptor(desc_k_base)
 
-            scale_d = False
+            # INT32 scores accumulate onto the seeded bias; FP32 scores
+            # overwrite S with the first K phase.
+            scale_d = self.cfg.uses_int32_scores
             if cutlass.const_expr(self.cfg.stage_kv_by_head_dim):
-                scale_d = head_dim_stage_idx != 0
+                scale_d = scale_d or head_dim_stage_idx != 0
             for tma_iter in cutlass.range_constexpr(num_tma_iters_qk):
                 q_tma_iter = head_dim_stage_idx * num_tma_iters_qk + tma_iter
                 q_tma_iter_offset = chunk_bytes_q * q_tma_iter
@@ -3237,6 +3307,17 @@ class TmemSPResource(MemoryResource):
     @cute.jit
     def init_mma_state(self, stage_info: StageInfo) -> None:
         self._init_function_state(stage_info)
+        if cutlass.const_expr(
+            self.cfg.uses_int32_scores and self.score_seed_owner is None
+        ):
+            # The MMA task is one warp; it fills the tile it will read.
+            tidx, _, _ = cute.arch.thread_idx()
+            fill_score_seed_tile(
+                self._score_seed_words(stage_info.context),
+                self.cfg.score_seed_tile_bytes // 4,
+                tidx % Int32(32),
+                32,
+            )
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
@@ -3588,8 +3669,12 @@ class TmemSPResource(MemoryResource):
         """Return the tile's dequantized maximum from its raw 16-column block maxima."""
         scaled_block_maxima: tuple[Any, ...] = ()
         for block_idx in cutlass.range_constexpr(self.cfg.sage_score_blocks):
+            block_max = block_maxima[block_idx]
+            if cutlass.const_expr(self.cfg.uses_int32_scores):
+                # Exact: biased scores have unit spacing.
+                block_max = block_max - Float32(INT32_SCORE_BIAS)
             scaled_block_maxima += (
-                block_maxima[block_idx] * Float32(sage_k_block_scales[block_idx]),
+                block_max * Float32(sage_k_block_scales[block_idx]),
             )
         tile_max = cutlass.Vector.from_elements(
             scaled_block_maxima, self.cfg.qk_acc_dtype
@@ -3803,6 +3888,9 @@ class TmemSPResource(MemoryResource):
         )
         p_scale_log2 = Float32(self.cfg.pv_p_scale_log2)
         minus_row_max_scale = (Float32(0.0) - row_max) * scale + p_scale_log2
+        # The exp2 addend of a score pair; a block-scaled INT32 plan folds
+        # the score bias into it per block.
+        addend_pair = (minus_row_max_scale, minus_row_max_scale)
         if cutlass.const_expr(sage_q_scale is not None and not block_scaled):
             scale = scale_softmax_log2 * sage_q_scale
         if cutlass.const_expr(chunk_hi < num_chunks):
@@ -3827,13 +3915,23 @@ class TmemSPResource(MemoryResource):
                         chunk_idx * blocks_per_chunk + elem_idx // SAGE_SCORE_BLOCK_COLS
                     )
                     scale = Float32(sage_k_block_scales[block_idx]) * sage_q_scale_log2
+                    if cutlass.const_expr(self.cfg.uses_int32_scores):
+                        # One rounding per block instead of one per score; it
+                        # stays below half a quantized score step.
+                        addend_pair = cute.arch.fma_packed_f32x2(
+                            (Float32(-INT32_SCORE_BIAS), Float32(-INT32_SCORE_BIAS)),
+                            (scale, scale),
+                            (minus_row_max_scale, minus_row_max_scale),
+                            rnd="rn",
+                            ftz=False,
+                        )
                 fma_pair = cute.arch.fma_packed_f32x2(
                     (
                         s_data[chunk_idx][elem_idx],
                         s_data[chunk_idx][elem_idx + 1],
                     ),
                     (scale, scale),
-                    (minus_row_max_scale, minus_row_max_scale),
+                    addend_pair,
                     rnd="rn",
                     ftz=False,
                 )
@@ -4395,24 +4493,60 @@ class TmemSPResource(MemoryResource):
         pairs. ``sfQ`` is not applied here: the max pass folds it into the
         tile maximum and the P pass into the exp2 scale, which saves one
         multiply per word; the lazy correction sees dequantized row maxima.
+        INT32 scores drop their bias here: words that cover several tokens
+        fold ``-bias * sfK`` into one FMA per score pair (one rounding per
+        word, below half a quantized score step), one-token words subtract
+        it first, exactly, which is cheaper than a product per word.
         """
         cfg = self.cfg
         tmem_x = cfg.tmem_x_load_s
         num_chunks = cfg.qk_mma_tiler[1] // tmem_x
         tokens_per_word = cfg.sage_scale_layout.k_tokens.tokens_per_word
+        folds_bias = cfg.uses_int32_scores and tokens_per_word > 1
+        subtracts_bias = cfg.uses_int32_scores and not folds_bias
+        if cutlass.const_expr(cfg.uses_int32_scores):
+            minus_bias_pair = (Float32(-INT32_SCORE_BIAS), Float32(-INT32_SCORE_BIAS))
+        if cutlass.const_expr(folds_bias):
+            bias_words: tuple[Any, ...] = ()
+            for word_idx in cutlass.range_constexpr(0, cfg.sage_k_tile_words, 2):
+                bias_words += cute.arch.mul_packed_f32x2(
+                    (
+                        Float32(sage_k_words[word_idx]),
+                        Float32(sage_k_words[word_idx + 1]),
+                    ),
+                    minus_bias_pair,
+                    rnd="rn",
+                    ftz=False,
+                )
         for chunk_idx in cutlass.range_constexpr(num_chunks):
             scaled: tuple[Any, ...] = ()
             for elem_idx in cutlass.range_constexpr(0, tmem_x, 2):
                 col = chunk_idx * tmem_x + elem_idx
-                scaled += cute.arch.mul_packed_f32x2(
-                    (s_data[chunk_idx][elem_idx], s_data[chunk_idx][elem_idx + 1]),
-                    (
-                        Float32(sage_k_words[col // tokens_per_word]),
-                        Float32(sage_k_words[(col + 1) // tokens_per_word]),
-                    ),
-                    rnd="rn",
-                    ftz=False,
+                words = (col // tokens_per_word, (col + 1) // tokens_per_word)
+                score_pair = (
+                    s_data[chunk_idx][elem_idx],
+                    s_data[chunk_idx][elem_idx + 1],
                 )
+                word_pair = (
+                    Float32(sage_k_words[words[0]]),
+                    Float32(sage_k_words[words[1]]),
+                )
+                if cutlass.const_expr(folds_bias):
+                    scaled += cute.arch.fma_packed_f32x2(
+                        score_pair,
+                        word_pair,
+                        (bias_words[words[0]], bias_words[words[1]]),
+                        rnd="rn",
+                        ftz=False,
+                    )
+                else:
+                    if cutlass.const_expr(subtracts_bias):
+                        score_pair = cute.arch.add_packed_f32x2(
+                            score_pair, minus_bias_pair, rnd="rn", ftz=False
+                        )
+                    scaled += cute.arch.mul_packed_f32x2(
+                        score_pair, word_pair, rnd="rn", ftz=False
+                    )
             s_data[chunk_idx] = cutlass.Vector.from_elements(scaled, cfg.qk_acc_dtype)
         return s_data
 

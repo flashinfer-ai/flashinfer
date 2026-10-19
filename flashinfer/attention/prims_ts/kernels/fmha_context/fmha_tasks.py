@@ -1305,6 +1305,11 @@ def create_mma_task(
             return sk.k_desc()
         return sk.k_stage_desc()
 
+    def seed_scores(sp):
+        """Seed an acquired S stage with the INT32 score bias before its K wait."""
+        if smem_q.cfg.uses_int32_scores:
+            sp.seed_scores()
+
     def qk_mma_stages(sk, sp, desc_q_base, section, *, descriptors=None):
         """Issue all K slices, loading descriptors once and reusing them for Q1."""
         stages = []
@@ -1397,6 +1402,7 @@ def create_mma_task(
                     if not smem_q.cfg.stats_via_smem:
                         vd0.acquire()
                     sp0.acquire()
+                    seed_scores(sp0)
                 qk_mma_slice(
                     sp0, desc_q0_base, desc_k, FmhaStage.Head, head_dim_stage_idx
                 )
@@ -1410,6 +1416,7 @@ def create_mma_task(
                     if not smem_q.cfg.stats_via_smem:
                         vd1.acquire()
                     sp1.acquire()
+                    seed_scores(sp1)
                 qk_mma_slice(
                     sp1, desc_q1_base, desc_k, FmhaStage.Head, head_dim_stage_idx
                 )
@@ -1469,6 +1476,7 @@ def create_mma_task(
                 # waits on its group's P tile instead. The tail drains no SP slot.
                 with domain_loop(loop_start, loop_end, loop_step):
                     sp0.acquire()
+                    seed_scores(sp0)
                     k_descriptors = qk_mma_stages(sk, sp0, desc_q0_base, FmhaStage.Loop)
                     sp0.commit()
                     to.acquire()
@@ -1482,6 +1490,7 @@ def create_mma_task(
                     )
                     to.commit()
                     sp1.acquire()
+                    seed_scores(sp1)
                     qk_mma_stages(
                         sk, sp1, desc_q1_base, FmhaStage.Loop, descriptors=k_descriptors
                     )

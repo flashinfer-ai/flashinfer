@@ -58,6 +58,7 @@ from .sage import (
     _SageScaleLayout,
     sage_scale_shapes,
     validate_sage_params,
+    _validate_int8_qk_device,
 )
 
 
@@ -403,14 +404,26 @@ def _dtype_key(dtype: torch.dtype) -> str:
         torch.float16: "float16",
         torch.bfloat16: "bfloat16",
         torch.float8_e4m3fn: "float8_e4m3fn",
+        torch.int8: "int8",
     }
     try:
         return keys[dtype]
     except KeyError as error:
         raise NotImplementedError(
             "attention-ts context supports torch.float16, torch.bfloat16, "
-            f"and torch.float8_e4m3fn; got {dtype}"
+            f"torch.float8_e4m3fn, and torch.int8 Q/K; got {dtype}"
         ) from error
+
+
+def _v_dtype_follows_qk(q_dtype: torch.dtype, v_dtype: torch.dtype) -> bool:
+    """Whether V may take ``v_dtype`` next to ``q_dtype`` Q/K.
+
+    V matches Q/K except on the QK-BF16/PV-FP8 path and under a Sage recipe's
+    Int8 Q/K, which keep E4M3 V.
+    """
+    return v_dtype == q_dtype or (
+        q_dtype in (torch.bfloat16, torch.int8) and v_dtype == torch.float8_e4m3fn
+    )
 
 
 def _validate_qkv_dtype(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
@@ -424,12 +437,10 @@ def _validate_qkv_dtype(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> No
             "attention-ts context requires Q and K to use the same dtype; "
             f"got Q {q.dtype} and K {k.dtype}"
         )
-    # V may keep its own dtype only for the supported QK-BF16/PV-FP8 path.
-    qk_bf16_pv_fp8 = q.dtype == torch.bfloat16 and v.dtype == torch.float8_e4m3fn
-    if v.dtype != q.dtype and not qk_bf16_pv_fp8:
+    if not _v_dtype_follows_qk(q.dtype, v.dtype):
         raise NotImplementedError(
             "attention-ts context requires Q, K, and V to use the same dtype "
-            "except for QK-BF16/PV-FP8; "
+            "except for QK-BF16/PV-FP8 and Int8 Q/K with E4M3 V; "
             f"got Q {q.dtype}, K {k.dtype}, and V {v.dtype}"
         )
 
@@ -438,6 +449,8 @@ def _validate_output_dtype(output_dtype: torch.dtype) -> None:
     if not isinstance(output_dtype, torch.dtype):
         raise TypeError("out_dtype must be a torch.dtype")
     _dtype_key(output_dtype)
+    if output_dtype == torch.int8:
+        raise NotImplementedError("attention-ts context does not write an int8 output")
 
 
 def _validate_context_dtype_pair(
@@ -452,22 +465,20 @@ def _validate_context_dtype_pair(
         (q_dtype, "q_dtype"),
         (k_dtype, "k_dtype"),
         (v_dtype, "v_dtype"),
-        (output_dtype, "out_dtype"),
     ):
         if not isinstance(dtype, torch.dtype):
             raise TypeError(f"{name} must be a torch.dtype")
         _dtype_key(dtype)
+    _validate_output_dtype(output_dtype)
     if k_dtype != q_dtype:
         raise NotImplementedError(
             "attention-ts context requires Q and K to use the same dtype; "
             f"got q_dtype={q_dtype} and k_dtype={k_dtype}"
         )
-    if v_dtype != q_dtype and not (
-        q_dtype == torch.bfloat16 and v_dtype == torch.float8_e4m3fn
-    ):
+    if not _v_dtype_follows_qk(q_dtype, v_dtype):
         raise NotImplementedError(
             "attention-ts context requires Q, K, and V to use the same dtype "
-            "except for QK-BF16/PV-FP8; "
+            "except for QK-BF16/PV-FP8 and Int8 Q/K with E4M3 V; "
             f"got q_dtype={q_dtype} and v_dtype={v_dtype}"
         )
 
@@ -489,14 +500,16 @@ def _validate_paged_dtype_pair(
         if not isinstance(dtype, torch.dtype):
             raise TypeError(f"{name} must be a torch.dtype")
         _dtype_key(dtype)
+        if dtype == torch.int8:
+            raise NotImplementedError(
+                "attention-ts paged context does not support int8 tensors"
+            )
     if k_dtype != q_dtype:
         raise NotImplementedError(
             "attention-ts paged context requires Q and K to use the same "
             f"dtype; got q_dtype={q_dtype} and k_dtype={k_dtype}"
         )
-    if v_dtype != q_dtype and not (
-        q_dtype == torch.bfloat16 and v_dtype == torch.float8_e4m3fn
-    ):
+    if not _v_dtype_follows_qk(q_dtype, v_dtype):
         raise NotImplementedError(
             "attention-ts paged context requires Q, K, and V to use the same "
             "dtype except for QK-BF16/PV-FP8; "
@@ -1325,6 +1338,7 @@ def _resolve_context_plan_geometry(
         else _validate_static_extent(head_dim_vo, "head_dim_vo")
     )
     device, device_index = _resolve_cuda_device(device)
+    _validate_int8_qk_device(qk_dtype, device_index)
 
     _validate_padded_data_extent(
         batch_size * max_seq_len_q, "batch_size * max_seq_len_q"
@@ -1382,6 +1396,11 @@ def _resolve_context_plan_geometry(
     )
     if sage is not None:
         _validate_context_sage_config(geometry, sage)
+    elif qk_dtype == torch.int8:
+        raise NotImplementedError(
+            "int8 Q/K require a Sage recipe (sage=SageAttentionConfig(...)) that "
+            "dequantizes them"
+        )
     return geometry
 
 
@@ -1504,6 +1523,7 @@ def _make_context_scheduler_probe(
         torch.float16: cutlass.Float16,
         torch.bfloat16: cutlass.BFloat16,
         torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+        torch.int8: cutlass.Int8,
     }
     probe = _make_context_kernel(
         device_index=geometry.device_index,
@@ -1637,7 +1657,7 @@ def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
         and geometry.mask_type == "dense"
         and not geometry.packed
         and not geometry.head_paired
-        and torch.finfo(geometry.qk_dtype).bits in (8, 16)
+        and geometry.qk_dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         and not (
             geometry.batch_size > _CUDA_GRID_YZ_MAX
             or geometry.num_qo_heads > _CUDA_GRID_YZ_MAX
@@ -1718,8 +1738,8 @@ def _validate_context_sage_config(
     """Reject a Sage recipe the contiguous context kernel does not run.
 
     Sage attention covers the dense, fixed-length, query-paired D128 path with
-    E4M3 Q/K/V and a 16-bit output: the recipe quantizes Q/K/V and P, so an
-    FP8 output would discard the precision it keeps.
+    E4M3 or Int8 Q/K, E4M3 V and a 16-bit output: the recipe quantizes Q/K/V
+    and P, so an FP8 output would discard the precision it keeps.
     """
 
     if not isinstance(sage, SageAttentionConfig):
@@ -1731,12 +1751,12 @@ def _validate_context_sage_config(
     if geometry.head_dim != 128 or geometry.head_dim_vo not in (None, 128):
         raise NotImplementedError("Sage attention requires head_dim 128")
     if (
-        geometry.qk_dtype != torch.float8_e4m3fn
+        geometry.qk_dtype not in (torch.float8_e4m3fn, torch.int8)
         or geometry.pv_dtype != torch.float8_e4m3fn
     ):
         raise NotImplementedError(
-            "Sage attention requires float8_e4m3fn Q, K and V; "
-            f"got q/k {geometry.qk_dtype} and v {geometry.pv_dtype}"
+            "Sage attention requires float8_e4m3fn or int8 Q/K with "
+            f"float8_e4m3fn V; got q/k {geometry.qk_dtype} and v {geometry.pv_dtype}"
         )
     if geometry.output_dtype not in (torch.float16, torch.bfloat16):
         raise NotImplementedError(
@@ -1949,6 +1969,7 @@ def _get_compiled_context(
         "float16": cutlass.Float16,
         "bfloat16": cutlass.BFloat16,
         "float8_e4m3fn": cutlass.Float8E4M3FN,
+        "int8": cutlass.Int8,
     }
     input_qk_dtype = dtype_map[qk_dtype_key]
     input_pv_dtype = dtype_map[pv_dtype_key]

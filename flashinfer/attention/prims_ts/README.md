@@ -401,7 +401,8 @@ launches the scale prepare on the current stream, then attention.
 
 | Input | Supported values |
 | --- | --- |
-| Q/K/V dtype | `torch.float8_e4m3fn` for all three |
+| Q/K dtype | Matching `torch.float8_e4m3fn`, or `torch.int8` on SM100a/B200 only |
+| V dtype (`v_dtype`) | `torch.float8_e4m3fn`; it defaults to the K dtype, so INT8 plans set it |
 | Output dtype | `torch.bfloat16` or `torch.float16` |
 | `q_block_size`, `k_block_size`, `v_mean` | As for the decode kernel |
 | Geometry | `head_dim=128`, `mask_type="dense"`, fixed `packed=False` storage, `window_left=-1` |
