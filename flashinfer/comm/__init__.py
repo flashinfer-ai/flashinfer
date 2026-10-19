@@ -176,6 +176,12 @@ from .all_gather_matmul import all_gather_matmul as all_gather_matmul
 from .all_gather_matmul import (
     prepare_all_gather_matmul as prepare_all_gather_matmul,
 )
+from .fp8_rowwise_gemm_allreduce import (
+    fp8_rowwise_gemm_allreduce as fp8_rowwise_gemm_allreduce,
+)
+from .fp8_rowwise_gemm_allreduce import (
+    prepare_fp8_rowwise_gemm_allreduce as prepare_fp8_rowwise_gemm_allreduce,
+)
 from .cake_fused_norm_combine import (
     CakeFusedNormCombineWorkspace as CakeFusedNormCombineWorkspace,
 )

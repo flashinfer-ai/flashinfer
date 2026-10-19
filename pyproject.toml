@@ -81,7 +81,9 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 # Cake-exported packages (flashinfer-ai/flashinfer#6553): the generated csrc tree plus the
 # build manifest (build.json) their cake_build loader reads; prebuilt aot/ libraries never ship.
 "flashinfer.cake_rmsnorm_train_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_causal_conv1d_train_backend" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_dsa_train" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake_kda_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_lm_head_loss" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_mok_bf16" = ["csrc/*.cu", "csrc/*/*.cu", "csrc/*.h", "sources.json", "build.json", "README.md"]
 "flashinfer.experimental.nvfp4_attention" = ["csrc/**"]
@@ -93,6 +95,8 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.experimental.cake_dsa_indexer" = ["csrc/**", "build.json"]
 # Generated sources for the experimental exact-SM100a/SM103a Kimi-K3 attention-residual (AttnRes) backend, compiled on demand.
 "flashinfer.experimental.cake_kimi_k3_attn_res" = ["csrc/**"]
+# Generated sources for the experimental exact-SM100a/SM103a Kimi-K3 FP8 projection backend, compiled on demand.
+"flashinfer.experimental.kimi_k3_fp8_projection" = ["csrc/**"]
 # Route catalog of the experimental SM120 paged MQA-logits export, read at runtime next to its module.
 "flashinfer.experimental.deepgemm_sm120_paged_mqa_logits" = ["*.json"]
 # Route catalog of the experimental SM100/SM103 dense and paged MQA-logits export, read at runtime
