@@ -5539,7 +5539,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
 
     backend_key = "trtllm_fp4_routed"
     supports_per_token_scale = True
-    supported_routing_modes = (
+    supported_routing_modes: tuple[RoutingInputMode, ...] = (
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
@@ -5944,7 +5944,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
     """
 
     backend_key = "trtllm_fp8_block"
-    supported_routing_modes = (
+    supported_routing_modes: tuple[RoutingInputMode, ...] = (
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
@@ -6306,7 +6306,7 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
     """
 
     backend_key = "trtllm_fp8_per_tensor"
-    supported_routing_modes = (
+    supported_routing_modes: tuple[RoutingInputMode, ...] = (
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
@@ -6915,11 +6915,13 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
     supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
         SwiGLUStep,
     )
-    supported_routing_modes = (
+    supported_routing_modes: tuple[RoutingInputMode, ...] = (
         RoutingInputMode.FromLogits,
         RoutingInputMode.UnpackedPrecomputed,
     )
     supports_fused_shared_experts = False
+    # Assigned by the ``Trtllm*Runner`` ``__init__`` of the per-precision subclass.
+    _num_local_experts: int
     # The Cake family a subclass serves; NVFP4 resolves its per-token variant
     # from the configuration (``family()``).
     cake_family: ClassVar[str] = ""

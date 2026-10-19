@@ -649,7 +649,7 @@ def _bind(
     cluster = [int(c) for c in record["launch"]["cluster"]]
     if len(grid) != 3:
         raise ValueError(f"{stage} {program}: grid must have three entries, got {grid}")
-    grid = tuple(int(g) for g in grid)
+    grid = (int(grid[0]), int(grid[1]), int(grid[2]))
     for axis, (extent, span) in enumerate(zip(grid, cluster, strict=True)):
         if extent <= 0:
             raise ValueError(
@@ -1177,7 +1177,13 @@ def _routing_grid(
     unit = _unit(program)
     rule = unit["grid_rule"]
     if rule == "fixed":
-        grid = tuple(int(g) for g in unit["grid"])
+        fixed = [int(g) for g in unit["grid"]]
+        if len(fixed) != 3:
+            raise ValueError(
+                f"routing program {program}: fixed grid must have three entries, "
+                f"got {unit['grid']}"
+            )
+        grid = (fixed[0], fixed[1], fixed[2])
     elif rule == "coop_sms":
         sms = sm_count(device)
         if isinstance(reserved_sms, bool) or not isinstance(reserved_sms, int):
