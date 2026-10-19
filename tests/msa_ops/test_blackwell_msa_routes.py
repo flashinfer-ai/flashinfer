@@ -72,9 +72,9 @@ def _derive(route):
             q_dtype=_DTYPES[q_dtype], k_dtype=_DTYPES[kv_dtype], paged=layout == "paged"
         )
     if kind == "long_bf16_reverse":
-        layout, gqa, *direct = fields
+        layout, gqa = fields
         return backend._long_prefill_route(
-            paged=layout == "paged", group_size=int(gqa[3:]), direct_group=bool(direct)
+            paged=layout == "paged", group_size=int(gqa[3:])
         )
     if kind == "decode_fp8_q1":
         (schedule,) = fields

@@ -73,18 +73,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 218112,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "e3f3415c054ecd74809d95c34147a1d1a0529475744cc75c527e80b28b7b6b40",
     },
     "cake_blackwell_msa_044ebdf2b23464ba3049": {
         "sources": [
@@ -127,18 +116,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 203776,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "b26bc5c6cfa9b841ce7533ed9cf827eff18d71516c51d62e5d50c0e9a70e7d11",
     },
     "cake_blackwell_msa_04f607bad91a7de6910b": {
         "sources": [
@@ -181,18 +159,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 205824,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "4f349f06d06f936a5477eaa96d069cde1aab1320d3d296de9120aadb0ed9945b",
     },
     "cake_blackwell_msa_077434d0c6f2e2ac8a55": {
         "sources": [
@@ -253,18 +220,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 215680,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "c7d9b0ed25c9b06367c43a3c6ef74d72540f4cc6852290bef1b1a0c0eaf88e38",
     },
     "cake_blackwell_msa_0d391c271a9e1dd7de1b": {
         "sources": [
@@ -293,18 +249,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 216704,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "670086cb75f8489ad42c8118281d23cda6671ae1a46c8b1dec2201ff55198e76",
     },
     "cake_blackwell_msa_0e42bddc8e39e77775dc": {
         "sources": [
@@ -347,18 +292,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 205824,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "8ff73dca671ffddef45faca89c2af62b0c114413719ea44dc2ccf50c57aac1d6",
     },
     "cake_blackwell_msa_1befeb7dca7d89f3cfe0": {
         "sources": [
@@ -401,18 +335,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 201728,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "6b6b2bd4c0e88b5b6bd36a8e2dfedd2480f5f84e54d59811286dffbb6f861304",
     },
     "cake_blackwell_msa_2448a5362a514c775e1c": {
         "sources": [
@@ -473,18 +396,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 216704,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "116f6c757d34673326bbec9e4c71a134661fc409b8ab23f5677b0b59919f71dd",
     },
     "cake_blackwell_msa_249de81529722ce8f3bb": {
         "sources": [
@@ -535,18 +447,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 148480,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "8c57f900432cbbabec1b275218f7e0b55f45e1f20bf09195554d0fe831adce9d",
     },
     "cake_blackwell_msa_270296b5b4d459acf326": {
         "sources": [
@@ -607,18 +508,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 215680,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "001d6e6242f8fad92a2f9722cc084188459f05f78831fb3633196b12244f583d",
     },
     "cake_blackwell_msa_2722338b9f9f22a3f32c": {
         "sources": [
@@ -647,18 +537,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "dynamic_smem_bytes": 40960,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": True,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "793935decf78e36e9b3f5d591f982a13360132dedcfd340dc9f5c51dca444cb6",
     },
     "cake_blackwell_msa_2949bc72ee78a52859c9": {
         "sources": [
@@ -685,18 +564,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 216704,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "f3e061b531ba9b04a47ee4a311583aa0e225d6059dc079433a0bc4334b6913fe",
     },
     "cake_blackwell_msa_39657d215e82b0d3aa39": {
         "sources": [
@@ -739,18 +607,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 212992,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "dce6235b3fbbda829533d341275329ae2a7dc87951b8a3b12975695c5de7ca54",
     },
     "cake_blackwell_msa_4fca3487da07d952e083": {
         "sources": [
@@ -787,18 +644,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 216064,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a"],
-        "closure_sha256": "1bef8a05ff00ff46426ae70f2ec212ae5ed1ad9a54e9bdbbe5d82361ac306725",
     },
     "cake_blackwell_msa_5848221d6bba8237cc0c": {
         "sources": [
@@ -859,18 +705,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 216704,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "a3c64ebf86d2ce1c4902abd87860b8fe3743bbbcc5b8eff7098d99eae7b3cdb8",
     },
     "cake_blackwell_msa_67fbde298dbcafee2cc0": {
         "sources": [
@@ -931,18 +766,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 216704,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "5fb6bf82038593af12be3c5c5558f19090b350bd3b0381874f7d1429ec6fc225",
     },
     "cake_blackwell_msa_711d5eeebecfcde61503": {
         "sources": [
@@ -971,18 +795,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "dynamic_smem_bytes": 40960,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": True,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "87a5acb06101f38b34618a2229d805a08d1da964607b796d6b1ae9c2b4e17665",
     },
     "cake_blackwell_msa_74572ca8a8bc44c5f461": {
         "sources": [
@@ -1025,18 +838,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 201728,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "4313e109351efab4858c31a92cf88e54334eafe9d44ab3b5ee7e2bd319183d11",
     },
     "cake_blackwell_msa_8828a5c33a15158853e5": {
         "sources": [
@@ -1079,18 +881,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 201728,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "aa96d17eb0fe9da60769e9f090659c79d989dca2b204d9d209e58b80914ba1e0",
     },
     "cake_blackwell_msa_89539a2a0a479c9002e5": {
         "sources": [
@@ -1119,18 +910,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "dynamic_smem_bytes": 75648,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "3c1813bed39a6eae209ad7633e4075aa0525bc0800f5331f9320f87cde58234a",
     },
     "cake_blackwell_msa_9c2eacf905b06a86fca3": {
         "sources": [
@@ -1173,18 +953,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 212992,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "ba122870bbaf7bb7cfc5e938461e15fde49c16d47fb7d8cc605031b5ca0f81f0",
     },
     "cake_blackwell_msa_c14b5fe5d3aa9f47ab07": {
         "sources": [
@@ -1213,18 +982,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "dynamic_smem_bytes": 75520,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a"],
-        "closure_sha256": "f479139fcf1b783c12a067c985c6a372d91e354f396e78f314157912460c48c6",
     },
     "cake_blackwell_msa_c3da0a7883053ffdf6fe": {
         "sources": [
@@ -1275,18 +1033,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 148480,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "19c93645a92ad1052eb3ab24e27b11855cbb2c021d9fa1bca5c4d8679385f356",
     },
     "cake_blackwell_msa_c6ed8357874024ae9789": {
         "sources": [
@@ -1329,18 +1076,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 201728,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "46b4d0e65349d69f9ab19c3a0bab82ffbae8e38f76984625a8345834364f5534",
     },
     "cake_blackwell_msa_cc96ea7befd47c2a0b22": {
         "sources": [
@@ -1383,18 +1119,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 218112,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "08c41dc73339ad2958a438e37d0f3128ec165db6d08b01c2a57334a5f18e788a",
     },
     "cake_blackwell_msa_d03b9d08c1e9314fbc4a": {
         "sources": [
@@ -1416,18 +1141,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "dynamic_smem_bytes": 33792,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "648352dc9d7865254fd03284f992983feb344b49b2e42c064fe90ada1d75fa53",
     },
     "cake_blackwell_msa_d24af147efd25f98362a": {
         "sources": [
@@ -1478,18 +1192,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 148480,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "ef1c44b58d2c122c70d65ac29f6e981578ec7105a7d704e70e99f412d4821ac1",
     },
     "cake_blackwell_msa_dcb5380b7118cf9060dc": {
         "sources": [
@@ -1550,18 +1253,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 216704,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "02e7928d9bbad790547ad761f51b3fcd777d7bae059ec9d0d71d2553a5b909be",
     },
     "cake_blackwell_msa_e9c87303e5be2b03a12c": {
         "sources": [
@@ -1604,18 +1296,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 203776,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "a035c683579cabae2f8bc5a8ba38f09e1d01e0723f79ce4057f9caafda102e14",
     },
     "cake_blackwell_msa_f35ca4f807d8df7077ed": {
         "sources": [
@@ -1644,18 +1325,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "dynamic_smem_bytes": 75648,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_103a"],
-        "closure_sha256": "d95170953a971467dee03b18d51b7a8d06ba54f850eaf13f9f99caf0b5ce119e",
     },
     "cake_blackwell_msa_f756fe7c24c2f8829427": {
         "sources": [
@@ -1684,18 +1354,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [256, 1, 1],
-            "dynamic_smem_bytes": 85632,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "1819d86b33c1df81a7e19645d0f2bda05db2eec290b62941df0ecb01d3054de9",
     },
     "cake_blackwell_msa_ff7e88ac3fcd0da0d185": {
         "sources": [
@@ -1732,18 +1391,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {
-            "block": [512, 1, 1],
-            "dynamic_smem_bytes": 216064,
-            "cluster": [1, 1, 1],
-            "cooperative": False,
-            "use_pdl": False,
-            "persistent_ctas_per_sm": 1,
-            "max_persistent_clusters": None,
-            "cluster_scheduling_policy": "spread",
-        },
         "arches": ["sm_103a"],
-        "closure_sha256": "e58265cb137828e77ff6ea418e109f085da6ceb259e90804c1dbe2238f4ca3a1",
     },
 }
 
@@ -1760,8 +1408,6 @@ ROUTES: dict[str, dict[str, str]] = {
         "decode_uniform_fp8:paged:main": "cake_blackwell_msa_4fca3487da07d952e083",
         "long_bf16_reverse:flat:gqa16:main": "cake_blackwell_msa_249de81529722ce8f3bb",
         "long_bf16_reverse:flat:gqa16:reduce": "cake_blackwell_msa_2722338b9f9f22a3f32c",
-        "long_bf16_reverse:paged:gqa16:direct_group:main": "cake_blackwell_msa_d24af147efd25f98362a",
-        "long_bf16_reverse:paged:gqa16:direct_group:reduce": "cake_blackwell_msa_2722338b9f9f22a3f32c",
         "long_bf16_reverse:paged:gqa16:main": "cake_blackwell_msa_d24af147efd25f98362a",
         "long_bf16_reverse:paged:gqa16:reduce": "cake_blackwell_msa_2722338b9f9f22a3f32c",
         "long_bf16_reverse:paged:gqa8:main": "cake_blackwell_msa_c3da0a7883053ffdf6fe",
