@@ -22,6 +22,7 @@ to a cubin with ``nvcc`` and embedded into the rendered host shim.
 
 from __future__ import annotations
 
+import bisect
 import functools
 import hashlib
 import json
@@ -29,6 +30,7 @@ import os
 import re
 import subprocess
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
@@ -356,33 +358,229 @@ def _power_of_two_log2(value: int) -> int:
     return value.bit_length() - 1 if value > 0 and value & (value - 1) == 0 else -1
 
 
-def _cake_gdn_prefill_grid_x(
-    total_tiles: int, sm_count: int, dvsplit: bool, bound_tokens: int
-) -> int:
-    """Persistent CTA count for ``total_tiles`` work tiles on ``sm_count`` SMs.
+# Host grid rule of the persistent non-CP prefill kernel.  The constants and the decision mirror the Cake
+# generator's grid rule (one source of truth; the exporter's mirror test keeps the copies identical).  Every
+# role of the kernel enumerates ``range(bid, total_tiles, gridDim.x)`` and the tiles are sequence-major
+# (tile ``t`` is sequence ``t // heads``, head ``t % heads``).  Costs are modelled in 64-token-chunk units
+# from host integers only; the kernel binary is unchanged by the grid.  The model is evaluated per sequence
+# (never per tile), so the eager launch path pays a few microseconds per call.
+SHORT_GRID = 128
+# Per-tile fixed cost (prologue, seed, final-state readout) in 64-token chunk units.
+TILE_OVERHEAD_CHUNKS = 4
+# Extra cost of a freshly dispatched CTA over a persistent tile boundary (fitted on the
+# measured Hq16/Hv32 rows: the model is within -1.5 .. +3.1 points of the measured gain).
+DISPATCH_OVERHEAD_CHUNKS = 1
+# One CTA per tile only when the modelled critical path shrinks by at least this.
+RAGGED_MIN_GAIN_PERCENT = 4
 
-    Mirrors the Cake generator program's ``_select_persistent_grid_ctas``
-    exactly; the exporter's mirror test keeps the copies identical.  ``bound_tokens`` is an
-    upper bound on the longest sequence (exact from ``cu_seqlens_cpu``, else
-    the ``max_seqlen`` hint, else the packed token count); it is part of the
-    contract signature and validated by the caller, but the rule below does
-    not depend on it, so a loose bound never changes the grid and the host
-    shim's ``0 < grid_x <= total_tiles`` holds for every input.  DV-split
-    launches and at most 128 tiles take one CTA per tile up to the SM count;
-    otherwise the residency cap G in {128, sm_count} with the smaller per-CTA
-    tile quantum ceil(total_tiles / G) wins and ties keep 128 (grid A/B:
-    1024-tile rows 9-10 % faster on 152 CTAs, 512/256-tile rows ~2 % faster
-    on 128).  The launch (``gdn_prefill.py``) and the variant
-    resolver below (the gate-stream rule) share this one copy.
-    """
 
-    if dvsplit or total_tiles <= 128:
+def _prefill_residency_grid(total_tiles: int, sm_count: int, dvsplit: bool) -> int:
+    """The residency rule: one CTA per tile up to the SM count for DV-split launches or at most
+    128 tiles; otherwise the cap G in {128, sm_count} with the smaller per-CTA tile quantum
+    ceil(total_tiles / G) wins and ties keep 128."""
+
+    if dvsplit or total_tiles <= SHORT_GRID:
         return min(sm_count, total_tiles)
-    g_short = min(128, total_tiles)
+    g_short = min(SHORT_GRID, total_tiles)
     g_sm = min(sm_count, total_tiles)
     if -(-total_tiles // g_sm) < -(-total_tiles // g_short):
         return g_sm
     return g_short
+
+
+def _prefill_tile_chunks(seq_len: int) -> int:
+    """The kernel's chunk count for one sequence: ``2 * ceil(seq_len / 128)`` 64-token chunks
+    (0 for an empty one)."""
+
+    return 2 * (-(-max(int(seq_len), 0) // 128))
+
+
+def _prefill_seq_costs(seq_lens: Sequence[int]) -> list[int]:
+    """One entry per sequence: the cost of each of its tiles (its chunks plus the per-tile
+    overhead); the ``heads`` tiles of a sequence share it."""
+
+    return [_prefill_tile_chunks(length) + TILE_OVERHEAD_CHUNKS for length in seq_lens]
+
+
+def _prefill_strided_critical_path(
+    seq_costs: Sequence[int], heads: int, grid: int
+) -> int:
+    """Persistent schedule: CTA ``b`` runs tiles ``b, b + grid, ...`` back to back; the longest CTA.
+
+    The ``heads`` tiles of sequence ``s`` are the index range ``[s * heads, (s + 1) * heads)``:
+    every CTA gets ``heads // grid`` of them and the ``heads % grid`` residues from
+    ``(s * heads) % grid`` on (wrapping at ``grid``) one more.  The per-CTA sums are therefore a
+    sweep over the 2S range endpoints instead of a pass over the tiles; the maximum of the
+    piecewise-constant sum sits at an endpoint.
+    """
+
+    full, part = divmod(heads, grid)
+    base = full * sum(seq_costs)
+    if part == 0:
+        return base
+    events = []
+    for index, cost in enumerate(seq_costs):
+        start = (index * heads) % grid
+        end = start + part
+        events.append((start, cost))
+        if end <= grid:
+            events.append((end, -cost))
+        else:
+            events.append((0, cost))
+            events.append((end - grid, -cost))
+    events.sort()
+    best = level = 0
+    i, n = 0, len(events)
+    while i < n:
+        pos = events[i][0]
+        while i < n and events[i][0] == pos:
+            level += events[i][1]
+            i += 1
+        if level > best:
+            best = level
+    return base + best
+
+
+def _prefill_dispatch_critical_path(
+    seq_costs: Sequence[int], heads: int, sm_count: int
+) -> int:
+    """One CTA per tile: the tiles are dispatched in index order, one resident CTA per SM, each
+    SM takes the next CTA when free, and every CTA pays ``DISPATCH_OVERHEAD_CHUNKS`` on top of
+    its tile cost -- the makespan of the in-order list schedule on ``min(sm_count, tiles)``
+    machines.
+
+    Exact and group-wise.  The machines' free times are a sorted run-length multiset; a tile
+    starts at the smallest free time.  The ``heads`` equal-cost tiles of one sequence are taken
+    in chunks: the smallest free times within ``p`` (the tile's processing time) of the smallest
+    one.  The completions of such a chunk, all at least ``smallest + p``, cannot precede any
+    start of the chunk, so the chunk reproduces the per-tile schedule exactly (a tie gives the
+    same values either way); its completions are merged back as runs.  A batch of S sequences
+    costs O(S) chunks unless the free times are spread wider than ``p``.
+    """
+
+    total = heads * len(seq_costs)
+    machines = max(1, min(sm_count, total))
+    vals = [0]
+    cnts = [machines]
+    finish = 0
+    for cost in seq_costs:
+        p = cost + DISPATCH_OVERHEAD_CHUNKS
+        need = heads
+        while need:
+            limit = vals[0] + p
+            taken_v: list[int] = []
+            taken_n: list[int] = []
+            i = 0
+            while need and i < len(vals) and vals[i] <= limit:
+                n = cnts[i]
+                taken_v.append(vals[i])
+                if n <= need:
+                    taken_n.append(n)
+                    need -= n
+                    i += 1
+                else:
+                    taken_n.append(need)
+                    cnts[i] = n - need
+                    need = 0
+            if i:
+                del vals[:i]
+                del cnts[:i]
+            done = taken_v[-1] + p
+            if done > finish:
+                finish = done
+            for v, n in zip(taken_v, taken_n, strict=True):
+                w = v + p
+                j = bisect.bisect_left(vals, w)
+                if j < len(vals) and vals[j] == w:
+                    cnts[j] += n
+                else:
+                    vals.insert(j, w)
+                    cnts.insert(j, n)
+    return finish
+
+
+@functools.lru_cache(maxsize=4096)
+def _cake_gdn_prefill_grid_x(
+    total_tiles: int,
+    sm_count: int,
+    dvsplit: bool,
+    bound_tokens: int,
+    host_seq_lens: tuple[int, ...] | None = None,
+) -> int:
+    """Persistent CTA count for ``total_tiles`` work tiles on ``sm_count`` SMs.
+
+    Mirrors the Cake generator's grid rule exactly; the exporter's mirror test keeps the
+    copies identical.  Host integers only: nothing is read back from the device and the
+    kernel binary is unchanged by the grid.  The launch (``gdn_prefill.py``) and the variant
+    resolver below (the gate-stream rule) share this one copy.
+
+    The residency rule (``_prefill_residency_grid``): DV-split launches and at most 128
+    tiles take one CTA per tile up to the SM count; otherwise the cap G in {128, sm_count}
+    with the smaller per-CTA tile quantum ceil(total_tiles / G) wins and ties keep 128
+    (grid A/B: 1024-tile rows 9-10 % faster on 152 CTAs, 512/256-tile rows ~2 % faster
+    on 128).
+
+    The ragged-batch route: ``host_seq_lens`` (the per-sequence token counts in
+    ``cu_seqlens`` order, known only from ``cu_seqlens_cpu``) lets the rule model both
+    schedules in 64-token-chunk units.  The persistent schedule runs tile ``t`` on CTA
+    ``t % grid`` (``_prefill_strided_critical_path``), so a ragged full-DV batch can chain
+    a long tile and further tiles on one CTA while other CTAs idle; with one CTA per tile
+    the hardware dispatches the CTAs in index order onto the free SMs
+    (``_prefill_dispatch_critical_path``).  The rule launches ``total_tiles`` CTAs when the
+    modelled critical path shrinks by at least ``RAGGED_MIN_GAIN_PERCENT``; the grid may
+    then exceed the SM count (one resident CTA per SM).  Equal-length batches never route:
+    with one cost c per tile the strided path is rounds(grid) * c and the dispatched one
+    ceil(tiles / M) * (c + 1), and rounds(grid) <= ceil(tiles / M) by the choice of the
+    residency grid, so they return the residency grid without a model.  Slightly ragged
+    and long-last batches keep the residency grid, as do DV-split launches, batches whose
+    residency grid already gives one CTA per tile and length lists that do not divide
+    ``total_tiles``; without ``host_seq_lens`` the residency rule decides.
+
+    Cost: O(S) for a batch of S sequences in the common case -- the per-sequence costs, the
+    strided path as an endpoint sweep, then exact bounds on the dispatched makespan (at
+    least the longest tile and the work per machine; at most the work per machine plus the
+    longest tile's share of the other machines, the list-scheduling bound) that settle most
+    batches; only the rest run the group-wise dispatch simulation.  The result is memoised
+    on its arguments (``host_seq_lens`` must be a tuple), so the other layers of a step pay
+    a lookup.
+
+    ``bound_tokens`` is an upper bound on the longest sequence (exact from
+    ``cu_seqlens_cpu``, else the ``max_seqlen`` hint, else the packed token count); it is
+    part of the contract signature and validated by the caller, but the rule does not
+    depend on it, so a loose bound never changes the grid.  The result is the residency
+    grid or ``total_tiles``, so the host shim's ``0 < grid_x <= total_tiles`` holds for
+    every input.
+
+    The launch calls this rule with the device's SM count, the resolver with the
+    architecture's nominal active-cluster count.  Near the gain margin the two can differ
+    on a device that exposes fewer SMs than the nominal count (a GB300 with 152 of the
+    nominal 160): the launch grid is authoritative for the workspace; the resolver only
+    picks the body.
+    """
+
+    grid = _prefill_residency_grid(total_tiles, sm_count, dvsplit)
+    if dvsplit or host_seq_lens is None or grid >= total_tiles:
+        return grid
+    num_seqs = len(host_seq_lens)
+    if num_seqs == 0 or total_tiles % num_seqs:
+        return grid
+    costs = _prefill_seq_costs(host_seq_lens)
+    if min(costs) == max(costs):
+        return grid
+    heads = total_tiles // num_seqs
+    strided = _prefill_strided_critical_path(costs, heads, grid)
+    machines = max(1, min(sm_count, total_tiles))
+    longest = max(costs) + DISPATCH_OVERHEAD_CHUNKS
+    work = heads * (sum(costs) + num_seqs * DISPATCH_OVERHEAD_CHUNKS)
+    gain = strided * (100 - RAGGED_MIN_GAIN_PERCENT)
+    if gain < max(longest, -(-work // machines)) * 100:
+        return grid
+    if gain * machines >= (work + longest * (machines - 1)) * 100:
+        return total_tiles
+    dispatch = _prefill_dispatch_critical_path(costs, heads, sm_count)
+    if gain >= dispatch * 100:
+        return total_tiles
+    return grid
 
 
 # Mirror of the Cake program rule ``gate_stream_flat_default`` (exporter ``_prefill_plan``), same constants: the
@@ -615,6 +813,7 @@ def select_cake_gdn_prefill_variant(
     checkpoint_every_n_tokens: int,
     use_state_indices: bool,
     gates_present: bool,
+    host_seq_lens: tuple[int, ...] | None = None,
 ) -> CakeGDNRoute:
     """Resolve host-visible non-CP metadata to one frozen GDN non-CP variant.
 
@@ -636,6 +835,17 @@ def select_cake_gdn_prefill_variant(
     (BF16 I/O and state, heads (4, 4, 8), interval 64, indexed initial and
     final state, DV-split); ``cu_seqlens`` / ``checkpoint_cu_starts``
     consistency is a caller precondition the kernel guards on the device.
+
+    ``host_seq_lens`` is the optional host copy of the per-sequence lengths
+    (a tuple in ``cu_seqlens`` order -- the resolver is memoised, so it must
+    be hashable), derived from ``cu_seqlens_cpu`` only.  It enables the
+    ragged-batch launch grid of ``_cake_gdn_prefill_grid_x`` so the
+    gate-stream twin follows the routed grid.  The resolver evaluates the
+    grid rule with the architecture's nominal active-cluster count while
+    the launch uses the device's SM count; near the gain margin the two can
+    differ on a device that exposes fewer SMs than the nominal count (a
+    GB300 with 152 of the nominal 160) -- the launch grid is authoritative
+    for the workspace, the resolver only picks the body.
     """
 
     if arch not in _ARCH_ACTIVE_CLUSTERS:
@@ -783,10 +993,13 @@ def select_cake_gdn_prefill_variant(
         and num_o_heads == min_heads
     )
     # Mirror of the Cake program rule ``gate_stream_flat_default`` (exporter ``_prefill_plan``): the launch grid
-    # from the architecture's active-cluster count (the same host-static count that decides ``dvsplit``), then the
-    # ``_gatestream_full`` twin for the full-DV stateful bases whose CTAs own several short tiles.
+    # from the architecture's active-cluster count (the same host-static count that decides ``dvsplit``) and
+    # the host sequence lengths when the caller gave them (the ragged-batch route), then the
+    # ``_gatestream_full`` twin for the full-DV stateful bases whose CTAs own several short tiles.  The launch
+    # evaluates the same rule with the device's SM count; near the gain margin the two can differ (a GB300
+    # exposing 152 of the nominal 160 SMs) and the launch grid is authoritative for the workspace.
     grid_x = _cake_gdn_prefill_grid_x(
-        total_tiles, _ARCH_ACTIVE_CLUSTERS[arch], dvsplit, max_seq_len
+        total_tiles, _ARCH_ACTIVE_CLUSTERS[arch], dvsplit, max_seq_len, host_seq_lens
     )
     gate_stream_full = (
         not single_chunk
