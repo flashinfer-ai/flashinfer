@@ -412,6 +412,48 @@ def test_registry_records_are_well_formed():
         assert cake_jit.PROGRAMS[keys[MERGE_KEY]]["role"] == "merge"
 
 
+_PROGRAM_KERNEL_FLAG = "-DCAKE_PROGRAM_KERNEL="
+_PROGRAM_KERNEL_DEFAULT = "#define CAKE_PROGRAM_KERNEL "
+
+
+def test_shared_kernel_sources_keep_distinct_symbols():
+    # Scan lever twins build one kernel translation unit: the program whose source it
+    # is names its symbol through the file's ``CAKE_PROGRAM_KERNEL`` default, every
+    # other entry names its own symbol on the compile line.  All libraries of one
+    # architecture load into one process, so every entry must still produce
+    # ``kernel_<program>``.
+    package = cake_jit.__file__.rsplit("/", 1)[0]
+    symbols = {}
+    for entry in cake_build.manifest()["libraries"]:
+        name, arch = entry["name"], entry["arch"]
+        assert name.endswith(f"_{arch}"), name
+        program = name[: -len(arch) - 1]
+        kernel_source = entry["sources"][0]
+        assert kernel_source.endswith("_kernel.cu"), (name, kernel_source)
+        with open(os.path.join(package, kernel_source)) as source:
+            defaults = [
+                line[len(_PROGRAM_KERNEL_DEFAULT) :].strip()
+                for line in source
+                if line.startswith(_PROGRAM_KERNEL_DEFAULT)
+            ]
+        flags = [f for f in entry["nvcc_flags"] if f.startswith(_PROGRAM_KERNEL_FLAG)]
+        assert len(flags) <= 1 and len(defaults) <= 1, (name, flags, defaults)
+        if program in kernel_source:
+            # the file's own program: a default, when present, names its own symbol
+            assert defaults in ([], [f"kernel_{program}"]), (name, defaults)
+        else:
+            # another program's translation unit: the symbol comes from the compile line
+            assert flags, (name, kernel_source)
+        if flags:
+            symbol = flags[0][len(_PROGRAM_KERNEL_FLAG) :]
+        else:
+            symbol = defaults[0] if defaults else f"kernel_{program}"
+        assert symbol == f"kernel_{program}", (name, symbol)
+        symbols.setdefault(program, set()).add(symbol)
+    assert set(symbols) == set(cake_jit.PROGRAMS)
+    assert len({s for group in symbols.values() for s in group}) == len(symbols)
+
+
 def test_policy_record_round_trip_and_validation():
     record = NARROW_PAIR_POLICY.record()
     assert tuple(record) == POLICY_FIELDS
