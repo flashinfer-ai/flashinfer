@@ -1037,8 +1037,8 @@ def gen_all_modules(
             gen_dcp_alltoall_module,
             gen_dcp_lse_reduce_module,
             gen_moe_ep_cake_module,
-            gen_moe_ep_nvlink_one_sided_module,
-            gen_moe_ep_nvlink_two_sided_module,
+            gen_nvlink_one_sided_alltoall_module,
+            gen_nvlink_two_sided_alltoall_module,
             gen_pcie_ipc_ag_rs_module,
             gen_pcie_ipc_comm_module,
             gen_trtllm_comm_module,
@@ -1046,7 +1046,7 @@ def gen_all_modules(
             gen_vllm_comm_module,
         )
 
-        jit_specs.append(gen_moe_ep_nvlink_two_sided_module())
+        jit_specs.append(gen_nvlink_two_sided_alltoall_module())
         if (
             has_sm90
             or has_sm100
@@ -1092,7 +1092,7 @@ def gen_all_modules(
         # NVLink one-sided MoE all-to-all behind flashinfer.moe_ep. The fence path
         # needs SM90+; the CFT path compiles only for SM100+ and traps elsewhere.
         if has_sm90 or has_sm100 or has_sm100f or has_sm103 or has_sm107:
-            jit_specs.append(gen_moe_ep_nvlink_one_sided_module())
+            jit_specs.append(gen_nvlink_one_sided_alltoall_module())
         jit_specs.append(gen_vllm_comm_module())
         # No architecture gate: the kernels use only plain PTX loads/stores
         # and CUDA IPC, and target PCIe machines without NVLink, which is

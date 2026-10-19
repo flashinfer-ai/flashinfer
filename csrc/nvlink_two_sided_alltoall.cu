@@ -17,11 +17,11 @@
 
 #include <tvm/ffi/container/tuple.h>
 
-#include "moe_ep_nvlink_two_sided_alltoall.cuh"
-#include "moe_ep_nvlink_two_sided_prepare.cuh"
+#include "nvlink_two_sided_alltoall.cuh"
+#include "nvlink_two_sided_prepare.cuh"
 #include "tvm_ffi_utils.h"
 
-using namespace flashinfer::moe_ep_nvlink_two_sided;
+using namespace flashinfer::nvlink_two_sided;
 
 using tvm::ffi::Optional;
 using tvm::ffi::Tuple;
@@ -52,9 +52,9 @@ void moeCommOp(TensorView input, TensorView sendRankCumSum, TensorView sendIndic
 
   TVM_FFI_ICHECK(epRank >= 0 && epRank < epSize) << "epRank must be in the range [0, epSize)";
 
-  flashinfer::moe_ep_nvlink_two_sided::MoeEpWorldInfo worldInfo = {static_cast<int>(epSize),
-                                                                   static_cast<int>(epRank)};
-  flashinfer::moe_ep_nvlink_two_sided::SendRecvDataInfo sendRecvDataInfo;
+  flashinfer::nvlink_two_sided::MoeEpWorldInfo worldInfo = {static_cast<int>(epSize),
+                                                            static_cast<int>(epRank)};
+  flashinfer::nvlink_two_sided::SendRecvDataInfo sendRecvDataInfo;
 
   size_t eltSize = get_element_size(input);
   size_t eltCountPerU64 = sizeof(uint64_t) / eltSize;
@@ -63,7 +63,7 @@ void moeCommOp(TensorView input, TensorView sendRankCumSum, TensorView sendIndic
   sendRecvDataInfo.vectorSizeInU64 = input.size(1) / eltCountPerU64;
   sendRecvDataInfo.DoPreCompute();
 
-  flashinfer::moe_ep_nvlink_two_sided::SendRecvDispls sendDispls, recvDispls;
+  flashinfer::nvlink_two_sided::SendRecvDispls sendDispls, recvDispls;
   sendDispls.dataPtr = static_cast<uint64_t*>(input.data_ptr());
   sendDispls.rankCountCumSum = static_cast<int*>(sendRankCumSum.data_ptr());
   sendDispls.rankLocalIndices = static_cast<int*>(sendIndices.data_ptr());
@@ -74,24 +74,24 @@ void moeCommOp(TensorView input, TensorView sendRankCumSum, TensorView sendIndic
   recvDispls.rankLocalIndices = static_cast<int*>(recvIndices.data_ptr());
   recvDispls.vectorStrideInU64 = output.stride(0) / eltCountPerU64;
 
-  flashinfer::moe_ep_nvlink_two_sided::MoeCommWorkspace workspace;
+  flashinfer::nvlink_two_sided::MoeCommWorkspace workspace;
   workspace.workspacePtr = static_cast<uint64_t*>(allWorkspaces.data_ptr());
   workspace.rankStrideInU64 = allWorkspaces.stride(0);
 
   auto stream = get_current_stream();
 
-  flashinfer::moe_ep_nvlink_two_sided::moeAllToAll(worldInfo, sendRecvDataInfo, sendDispls,
-                                                   recvDispls, workspace, stream);
+  flashinfer::nvlink_two_sided::moeAllToAll(worldInfo, sendRecvDataInfo, sendDispls, recvDispls,
+                                            workspace, stream);
 }
 
 int64_t getWorkspaceSizePerRank(int64_t epSize) {
   int epSize32 = static_cast<int>(epSize);
-  return flashinfer::moe_ep_nvlink_two_sided::getMoeCommWorkspaceSize(epSize32);
+  return flashinfer::nvlink_two_sided::getMoeCommWorkspaceSize(epSize32);
 }
 
 int64_t getPrepareWorkspaceSizePerRank(int64_t epSize) {
   int epSize32 = static_cast<int>(epSize);
-  return flashinfer::moe_ep_nvlink_two_sided::moe_prepare::getMoePrepareWorkspaceSize(epSize32);
+  return flashinfer::nvlink_two_sided::moe_prepare::getMoePrepareWorkspaceSize(epSize32);
 }
 
 void moePrepareOp(TensorView expertsIds, Optional<TensorView> scales,
@@ -183,13 +183,13 @@ void moePrepareOp(TensorView expertsIds, Optional<TensorView> scales,
     gatheredExpertStaticsPtr = static_cast<int*>(gatheredExpertStatics.value().data_ptr());
   }
 
-  flashinfer::moe_ep_nvlink_two_sided::moe_prepare::MoeCommWorkspace workspace;
+  flashinfer::nvlink_two_sided::moe_prepare::MoeCommWorkspace workspace;
   workspace.workspacePtr = static_cast<uint64_t*>(allWorkspaces.data_ptr());
   workspace.rankStrideInU64 = allWorkspaces.stride(0);
 
   auto stream = get_current_stream();
 
-  flashinfer::moe_ep_nvlink_two_sided::moe_prepare::computeCountAndIndice(
+  flashinfer::nvlink_two_sided::moe_prepare::computeCountAndIndice(
       static_cast<int*>(expertsIds.data_ptr()), static_cast<int*>(sendRankCountCumSum.data_ptr()),
       static_cast<int*>(recvRankCountCumSum.data_ptr()),
       static_cast<int*>(sendRankIndices.data_ptr()),
@@ -197,11 +197,11 @@ void moePrepareOp(TensorView expertsIds, Optional<TensorView> scales,
       static_cast<int*>(recvRankIndices.data_ptr()), workspace, tokenCount, maxTokenCountPerRank,
       topK, slotCount, epRank, epSize, stream);
 
-  flashinfer::moe_ep_nvlink_two_sided::moe_prepare::computeCumsum(
+  flashinfer::nvlink_two_sided::moe_prepare::computeCumsum(
       static_cast<int*>(sendRankCountCumSum.data_ptr()),
       static_cast<int*>(recvRankCountCumSum.data_ptr()), epRank, epSize, stream);
 
-  flashinfer::moe_ep_nvlink_two_sided::moe_prepare::moveIndice(
+  flashinfer::nvlink_two_sided::moe_prepare::moveIndice(
       static_cast<int*>(sendRankCountCumSum.data_ptr()),
       static_cast<int*>(recvRankCountCumSum.data_ptr()),
       static_cast<int*>(sendRankIndices.data_ptr()),
@@ -212,7 +212,7 @@ void moePrepareOp(TensorView expertsIds, Optional<TensorView> scales,
       static_cast<int*>(gatherRecvRankIndices.data_ptr()), epRank, epSize, maxTokenCountPerRank,
       stream);
 
-  flashinfer::moe_ep_nvlink_two_sided::moe_prepare::allToAllMetadata(
+  flashinfer::nvlink_two_sided::moe_prepare::allToAllMetadata(
       static_cast<int*>(expertsIds.data_ptr()),
       static_cast<int*>(preparedLocalExpertIds.data_ptr()), scalesPtr, preparedLocalScalesPtr,
       localExpertStaticsPtr, gatheredExpertStaticsPtr, workspace,

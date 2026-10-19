@@ -84,10 +84,10 @@ from .comm import gen_vllm_comm_module as gen_vllm_comm_module
 from .comm import gen_pcie_ipc_comm_module as gen_pcie_ipc_comm_module
 from .comm import gen_moe_ep_cake_module as gen_moe_ep_cake_module
 from .comm import (
-    gen_moe_ep_nvlink_one_sided_module as gen_moe_ep_nvlink_one_sided_module,
+    gen_nvlink_one_sided_alltoall_module as gen_nvlink_one_sided_alltoall_module,
 )
 from .comm import (
-    gen_moe_ep_nvlink_two_sided_module as gen_moe_ep_nvlink_two_sided_module,
+    gen_nvlink_two_sided_alltoall_module as gen_nvlink_two_sided_alltoall_module,
 )
 from .comm import gen_dcp_alltoall_module as gen_dcp_alltoall_module
 from .dsv3_optimizations import (

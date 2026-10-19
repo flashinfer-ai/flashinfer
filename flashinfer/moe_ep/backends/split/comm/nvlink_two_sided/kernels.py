@@ -16,11 +16,11 @@ import torch
 
 
 @functools.cache
-def get_nvlink_two_sided_module() -> Any:
+def get_nvlink_two_sided_alltoall_module() -> Any:
     """Build (on first use) and load the JIT module backing ``NVLinkTwoSidedAlltoAll``."""
-    from ......jit.comm import gen_moe_ep_nvlink_two_sided_module
+    from ......jit.comm import gen_nvlink_two_sided_alltoall_module
 
-    return gen_moe_ep_nvlink_two_sided_module().build_and_load()
+    return gen_nvlink_two_sided_alltoall_module().build_and_load()
 
 
 def set_max_usable_sm_count(max_sm_count: int) -> None:
@@ -28,18 +28,22 @@ def set_max_usable_sm_count(max_sm_count: int) -> None:
     that several ranks can share one GPU. Must precede the first
     :func:`comm_workspace_size_per_rank` or :func:`alltoallv`, which fix the
     channel count."""
-    get_nvlink_two_sided_module().set_moe_max_usable_sm_count(max_sm_count)
+    get_nvlink_two_sided_alltoall_module().set_moe_max_usable_sm_count(max_sm_count)
 
 
 def comm_workspace_size_per_rank(ep_size: int) -> int:
     """Bytes per rank of the FIFO workspace used by :func:`alltoallv`."""
-    return get_nvlink_two_sided_module().get_moe_commworkspace_size_per_rank(ep_size)
+    return get_nvlink_two_sided_alltoall_module().get_moe_commworkspace_size_per_rank(
+        ep_size
+    )
 
 
 def prepare_workspace_size_per_rank(ep_size: int) -> int:
     """Bytes per rank of the workspace used by :func:`prepare`."""
-    return get_nvlink_two_sided_module().get_moe_prepare_workspace_size_per_rank(
-        ep_size
+    return (
+        get_nvlink_two_sided_alltoall_module().get_moe_prepare_workspace_size_per_rank(
+            ep_size
+        )
     )
 
 
@@ -62,7 +66,7 @@ def alltoallv(
     ``workspace`` is the ``[ep_size, words_per_rank]`` ``uint64`` FIFO
     workspace of :func:`comm_workspace_size_per_rank` bytes per rank.
     """
-    get_nvlink_two_sided_module().moe_comm(
+    get_nvlink_two_sided_alltoall_module().moe_comm(
         input,
         send_rank_cum_sum,
         send_indices,
@@ -140,7 +144,7 @@ def prepare(
         else torch.empty((ep_size, expert_count), **attrs)
     )
 
-    get_nvlink_two_sided_module().moe_prepare(
+    get_nvlink_two_sided_alltoall_module().moe_prepare(
         expert_ids,
         scales,
         expert_statistics,

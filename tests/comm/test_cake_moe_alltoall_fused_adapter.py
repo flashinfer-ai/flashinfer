@@ -158,7 +158,7 @@ def test_aot_registers_each_exact_mnnvl_moe_target(monkeypatch):
     monkeypatch.setattr(aot, "gen_attention", lambda *args: ())
     monkeypatch.setattr(aot, "gen_cudnn_fmha_module", lambda: spec("cudnn"))
     monkeypatch.setattr(
-        jit_comm, "gen_moe_ep_nvlink_two_sided_module", lambda: spec("two_sided")
+        jit_comm, "gen_nvlink_two_sided_alltoall_module", lambda: spec("two_sided")
     )
     monkeypatch.setattr(jit_comm, "gen_vllm_comm_module", lambda: spec("vllm"))
     monkeypatch.setattr(jit_comm, "gen_pcie_ipc_comm_module", lambda: spec("pcie"))

@@ -93,7 +93,7 @@ kind, and both paths hand the inner kernel the same `SplitKernelContext`:
 |---|---|---|---|
 | `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back; optional CFT counted writes over the NVLink fabric (SM100+, CUDA 13.4+, driver 615+); up to 256 ranks. Kernels follow TensorRT-LLM's (`kernels/moe/communication/`) |
 | `cake` | `CakeAlltoAllConfig` | `MoEEpCommunication` | One-sided put/get like `nvlink_one_sided`, running generated Cake kernels (`cake/kernels.py`, `csrc/cake_moe_alltoall*`); SM100/SM103 only |
-| `nvlink_two_sided` | `NVLinkTwoSidedConfig` | `MoEEpCommunication` | MNNVL FIFO channels, all-to-all-v (`nvlink_two_sided/kernels.py`, `csrc/moe_ep_nvlink_two_sided_*`); `num_experts % 4 == 0` |
+| `nvlink_two_sided` | `NVLinkTwoSidedConfig` | `MoEEpCommunication` | MNNVL FIFO channels, all-to-all-v (`nvlink_two_sided/kernels.py`, `csrc/nvlink_two_sided_*`); `num_experts % 4 == 0` |
 | `nccl_ep` | `NcclEpConfig` | Fleet/Handle | see below |
 | `nixl_ep` | `NvepConfig` | Fleet/Handle | see below |
 

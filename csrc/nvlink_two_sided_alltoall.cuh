@@ -26,7 +26,7 @@
 
 namespace flashinfer {
 
-namespace moe_ep_nvlink_two_sided {
+namespace nvlink_two_sided {
 
 #ifdef __CUDACC__
 #define ALIGN_256 __align__(256)
@@ -533,5 +533,5 @@ void setMaxUsableSmCount(int smCount) {
   AllToAllChannelCommunicatorBase::setMaxUsableSmCount(smCount);
 }
 
-}  // namespace moe_ep_nvlink_two_sided
+}  // namespace nvlink_two_sided
 }  // namespace flashinfer

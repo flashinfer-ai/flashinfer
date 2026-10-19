@@ -21,7 +21,7 @@
 
 #define DEBUG_PIPELINE 0
 
-namespace flashinfer::moe_ep_nvlink_two_sided {
+namespace flashinfer::nvlink_two_sided {
 
 namespace moe_prepare {
 
@@ -125,4 +125,4 @@ size_t getMoePrepareWorkspaceSize(int epSize);
 
 }  // namespace moe_prepare
 
-}  // namespace flashinfer::moe_ep_nvlink_two_sided
+}  // namespace flashinfer::nvlink_two_sided

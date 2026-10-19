@@ -583,7 +583,9 @@ def fake_one_sided(monkeypatch):
         probe["probed"] += 1
         return probe["reason"]
 
-    monkeypatch.setattr(one_sided, "get_nvlink_one_sided_module", lambda: module)
+    monkeypatch.setattr(
+        one_sided, "get_nvlink_one_sided_alltoall_module", lambda: module
+    )
     monkeypatch.setattr(
         one_sided, "layout_constants", lambda: SimpleNamespace(**_ONE_SIDED_LAYOUT)
     )

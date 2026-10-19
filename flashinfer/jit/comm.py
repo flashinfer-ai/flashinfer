@@ -30,13 +30,13 @@ from itertools import product
 from typing import Any, Dict, List, Literal, Tuple
 
 
-def gen_moe_ep_nvlink_two_sided_module() -> JitSpec:
+def gen_nvlink_two_sided_alltoall_module() -> JitSpec:
     """NVLink two-sided MoE all-to-all behind ``flashinfer.moe_ep.NVLinkTwoSidedAlltoAll``."""
     return gen_jit_spec(
-        "moe_ep_nvlink_two_sided_alltoall",
+        "nvlink_two_sided_alltoall",
         [
-            jit_env.FLASHINFER_CSRC_DIR / "moe_ep_nvlink_two_sided_alltoall.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "moe_ep_nvlink_two_sided_prepare.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "nvlink_two_sided_alltoall.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "nvlink_two_sided_prepare.cu",
         ],
     )
 
@@ -367,7 +367,7 @@ def gen_moe_ep_cake_module(target: CakeAlltoAllTarget) -> JitSpec:
     )
 
 
-def gen_moe_ep_nvlink_one_sided_module() -> JitSpec:
+def gen_nvlink_one_sided_alltoall_module() -> JitSpec:
     """NVLink one-sided MoE all-to-all behind ``flashinfer.moe_ep.NVLinkOneSidedAlltoAll``.
 
     Includes the CFT counted-write path, which is compiled in when the CUDA
@@ -380,9 +380,9 @@ def gen_moe_ep_nvlink_one_sided_module() -> JitSpec:
     # sm100f fallback; the driver rejects that fallback for these kernels on SM107.
     nvcc_flags = current_compilation_context.get_nvcc_flags_list()
     return gen_jit_spec(
-        "moe_ep_nvlink_one_sided_alltoall",
+        "nvlink_one_sided_alltoall",
         [
-            jit_env.FLASHINFER_CSRC_DIR / "moe_ep_nvlink_one_sided_alltoall.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "nvlink_one_sided_alltoall.cu",
             nv_internal
             / "tensorrt_llm"
             / "kernels"
