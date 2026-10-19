@@ -2540,10 +2540,12 @@ NOPE_DELTA_ARGS = (
 )
 NOPE_SLOT_WIDTHS = (1, 64, 67, 256, 512, 1024, 2177)
 NOPE_LARGE_TESTS_ENV = "FLASHINFER_CAKE_DSA_NOPE_LARGE_TESTS"
-# Fixed rel-L2 table of the iid 4k x 4k, K_slots 2176 configuration (the frozen rope-path figures of the same
-# geometry times a 2 % noise band) and the element-wise output tolerance of the NoPE acceptance.
+# Fixed rel-L2 table of the iid 4k x 4k, K_slots 2176 configuration and the element-wise output tolerance of the
+# NoPE acceptance.  out and dkv: the frozen rope-path figures of the same geometry times a 2 % noise band.  dq: the
+# FP64-emulated BF16 rounding floor measured on the same geometry and inputs at scale 1/16 (0.2231 %) times the same
+# 2 % band -- the rope-path dq figure (0.2154 %) lies below that floor and cannot bound this kernel.
 NOPE_GATE_OUT = 0.002013 * 1.02
-NOPE_GATE_DQ = 0.002154 * 1.02
+NOPE_GATE_DQ = 0.002231 * 1.02
 NOPE_GATE_DKV = 0.002319 * 1.02
 NOPE_OUT_ATOL = 1e-2
 NOPE_OUT_RTOL = 1e-2
@@ -3202,6 +3204,36 @@ def test_nope_key_pass_policy_plans_with_2048_bytes_per_key():
         KeyPassPolicy.from_record(record)
 
 
+def test_nope_bwd_launch_grid_mirrors_the_kernel_rule():
+    """The persistent grid of the NoPE main stages: ``min(num_queries, SMs)`` (at least one CTA) while the launch's
+    FP32 dkv window ``num_kv x 2048 B`` is within 64 MiB, a CTA per token beyond it; every value is <= num_queries
+    (legal for the kernel's token loop) except the never-launched zero-token non-resident case, which mirrors the rule."""
+    grid = cake_backend.nope_bwd_launch_grid
+    assert cake_backend.NOPE_PERSISTENT_DKV_BYTES == 64 << 20
+    assert cake_backend.NOPE_DKV_BYTES_PER_KEY == 2048
+    window = (
+        cake_backend.NOPE_PERSISTENT_DKV_BYTES // cake_backend.NOPE_DKV_BYTES_PER_KEY
+    )
+    assert window == 32768
+    for sms in (132, 148, 160):
+        assert grid(4096, window, sms) == sms  # the 64 MiB window itself is resident
+        assert grid(4096, window + 1, sms) == 4096  # one key more: a CTA per token
+        assert grid(100, window, sms) == 100  # fewer tokens than SMs
+        assert grid(sms, 128, sms) == sms
+        assert grid(1, 128, sms) == 1
+        assert grid(0, 128, sms) == 1  # resident: never below one CTA
+        # the kernel's rule past the window at zero tokens; the host never launches zero tokens
+        assert grid(0, window + 1, sms) == 0
+        assert grid(4736, 65536, sms) == 4736  # a 128 MiB window
+        assert grid(32768, 262144, sms) == 32768
+    # chunk ranges of a multi-pass backward: each launch counts its own tokens against the same key window
+    policy = KeyPassPolicy.from_record(cake_jit.record(NOPE_PROGRAM))
+    chunk = policy.token_chunk(2176)
+    chunks = policy.token_chunks(chunk + 128, 2176)
+    assert [grid(n, 65536, 148) for _b, n in chunks] == [chunk, 128]
+    assert [grid(n, 4096, 148) for _b, n in chunks] == [148, 128]
+
+
 def test_nope_binding_keys_are_tagged_and_cover_geometry_scale_lengths_and_dkv_options():
     q, kv, idx = _nope_host_inputs()
     scale = NOPE_SOFTMAX_SCALE
@@ -3712,6 +3744,64 @@ def test_nope_plan_multi_pass_backward_launch_order(monkeypatch):
         ("nope_bwd_compact", 0, 1),
         ("nope_bwd_main_pass", 0, 1),
     )
+
+
+def test_nope_plan_main_stage_grids_follow_the_persistent_rule(monkeypatch):
+    """The main stages (single pass and every key-pass chunk) launch with ``nope_bwd_launch_grid`` over the launch's
+    token count and the launch's key count; the delta / compaction / cast grids are the generated ones.  The SM count
+    is read once per device (cached) and stubbed to 4 here."""
+    calls = []
+    record = _stand_in_nope_program(monkeypatch, calls)
+    index = torch.cuda.current_device()
+    real = torch.cuda.get_device_properties(index).multi_processor_count
+    cake_backend._SM_COUNTS.pop(index, None)
+    assert (
+        cake_backend._sm_count(index) == real and cake_backend._SM_COUNTS[index] == real
+    )
+    monkeypatch.setattr(cake_backend, "_sm_count", lambda device_index: 4)
+    window = (
+        cake_backend.NOPE_PERSISTENT_DKV_BYTES // cake_backend.NOPE_DKV_BYTES_PER_KEY
+    )
+    T, K = 8, 5
+    out, lse, o_lo = _saved_outputs(T)
+
+    def grids(stage):
+        return [c[1]["grid_x"] for c in calls if c[0] == stage]
+
+    for S, expect in ((64, 4), (window, 4), (window + 1, T)):
+        q, kv, idx, dout = _nope_device_inputs(T, S, K, seed=S)
+        calls.clear()
+        backward_nope(q, kv, idx, out, o_lo, lse, dout)
+        assert grids("nope_bwd_main_natural") == [expect], S
+        assert grids("nope_bwd_delta") == [T * 8]
+        calls.clear()
+        backward_nope(q, kv, idx, out, o_lo, lse, dout, dkv_direct=False)
+        assert grids("nope_bwd_main") == [expect], S
+        assert grids("nope_bwd_cast") == [-(-S * 16 // 256)]
+    # two token chunks (chunk + 128 tokens) x two passes: per chunk min(tokens, 4) on a resident window, the chunk's
+    # token count beyond it; the compaction keeps ceil(tokens / 4)
+    chunk = cake_backend._record_token_chunk(record, K)
+    T2 = chunk + 128
+    out2, lse2, o_lo2 = _saved_outputs(T2)
+    for S, expect in ((64, [4, 4, 4, 4]), (window + 1, [chunk, chunk, 128, 128])):
+        q, kv, idx, dout = _nope_device_inputs(T2, S, K, seed=S)
+        runner = prepare_dsa_nope_train(
+            q,
+            kv,
+            idx,
+            dout=dout,
+            out=out2,
+            lse=lse2,
+            o_lo=o_lo2,
+            key_passes=2,
+            dkv_direct=False,
+        )
+        calls.clear()
+        runner.backward()
+        assert grids("nope_bwd_main_pass") == expect, S
+        assert grids("nope_bwd_compact") == [-(-chunk // 4)] * 2 + [32] * 2
+        del q, kv, idx, dout, runner
+    cake_backend.BINDING_CACHE.clear()
 
 
 def test_nope_prepared_runner_binds_outputs_scratch_and_zero_fill(monkeypatch):

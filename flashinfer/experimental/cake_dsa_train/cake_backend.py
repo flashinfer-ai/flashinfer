@@ -482,6 +482,41 @@ def _device_index(device: Optional[torch.device]) -> int:
     return int(device.index)
 
 
+# The NoPE main stages run a persistent token loop: CTA ``b`` takes tokens ``b, b + grid, ...`` of the launch's
+# ``num_queries`` tokens (``token = token_base + token_step * (blockIdx.x + k * gridDim.x)``), so every grid
+# <= ``num_queries`` is legal.  One persistent CTA per SM overlaps each token's prologue / epilogue with its
+# predecessor's tail and measured 0.5-19 % faster than a CTA per token while the launch's FP32 dkv window
+# (``num_kv`` x 2048 B) is within 64 MiB; beyond it the CTAs' token drift widens the set of keys live in L2
+# (3-9 % slower at 268-553 MB windows), so those launches keep a CTA per token.
+NOPE_PERSISTENT_DKV_BYTES = 64 << 20
+NOPE_DKV_BYTES_PER_KEY = 2048
+
+
+def nope_bwd_launch_grid(num_queries: int, num_kv_in_pass: int, sm_count: int) -> int:
+    """Grid (x) of a NoPE main-stage launch over ``num_queries`` tokens whose key pass covers ``num_kv_in_pass``
+    keys -- the kernel's own rule, mirrored: one persistent CTA per SM (``min(num_queries, sm_count)``, at least one)
+    while the pass's FP32 dkv window (``num_kv_in_pass`` x 2048 B) is within :data:`NOPE_PERSISTENT_DKV_BYTES`, else
+    a CTA per token (``num_queries``).  The host never launches zero tokens (the empty paths return before planning).
+    """
+    if int(num_kv_in_pass) * NOPE_DKV_BYTES_PER_KEY <= NOPE_PERSISTENT_DKV_BYTES:
+        return max(1, min(int(num_queries), int(sm_count)))
+    return int(num_queries)
+
+
+_SM_COUNTS: dict[int, int] = {}
+
+
+def _sm_count(device_index: int) -> int:
+    """Streaming multiprocessors of CUDA device ``device_index``, read once per device."""
+    count = _SM_COUNTS.get(device_index)
+    if count is None:
+        count = int(
+            torch.cuda.get_device_properties(device_index).multi_processor_count
+        )
+        _SM_COUNTS[device_index] = count
+    return count
+
+
 def arch_for(device: Optional[torch.device] = None) -> Optional[str]:
     """Architecture tag of ``device`` (``None`` when unsupported or without CUDA)."""
     if not torch.cuda.is_available():
@@ -1314,12 +1349,18 @@ class _Launch:
 
 
 def _stage_entry(
-    stage: str, arch: str, scalars: dict, program: str = cake_jit.PROGRAM
+    stage: str,
+    arch: str,
+    scalars: dict,
+    program: str = cake_jit.PROGRAM,
+    grid: Optional[tuple[int, int, int]] = None,
 ) -> _StageEntry:
-    """Resolve ``stage`` of ``program`` for ``arch``: the generated launcher, its grid and the entry of the loaded module."""
-    grid = cake_launch.GRID[stage](
-        scalars["num_queries"], scalars["num_kv"], scalars["topk"]
-    )
+    """Resolve ``stage`` of ``program`` for ``arch``: the generated launcher, its grid (``grid`` replaces the generated
+    rule: the NoPE main stages' persistent grid, :func:`nope_bwd_launch_grid`) and the entry of the loaded module."""
+    if grid is None:
+        grid = cake_launch.GRID[stage](
+            scalars["num_queries"], scalars["num_kv"], scalars["topk"]
+        )
     record = cake_jit.record(program)
     cluster = record[stage]["launch"]["cluster"]
     if any(g % c for g, c in zip(grid, cluster, strict=True)):
@@ -3091,7 +3132,7 @@ def _plan_nope(
             dst_row_stride if accumulate else D_LATENT,
             dkv_dst_map is not None,
         ),
-        token_base=0,  # one CTA per token, token = blockIdx.x
+        token_base=0,  # token = token_base + token_step * (blockIdx.x + k * gridDim.x): the persistent loop
         token_step=1,
         num_tokens=T,  # compaction: the whole row; a multi-pass backward overrides it per token chunk
     )
@@ -3135,17 +3176,26 @@ def _plan_nope(
     if backward:
         main_stage = natural if direct else main
         pass_stages = (compact, pass_natural if direct else main_pass)
+        # the main stages' persistent grid (nope_bwd_launch_grid): the launch's token count is ``num_queries`` --
+        # the whole row, or the chunk's tokens -- and its key window the launch's ``num_kv``
+        sm_count = _sm_count(_device_index(device))
         entries[delta] = _stage_entry(delta, arch, scalars, program)
         backward_order.append(delta)
         if passes == 1:
-            entries[main_stage] = _stage_entry(main_stage, arch, scalars, program)
+            grid = (nope_bwd_launch_grid(T, S, sm_count), 1, 1)
+            entries[main_stage] = _stage_entry(main_stage, arch, scalars, program, grid)
             backward_order.append(main_stage)
         else:
             for chunk_index, (_base, num_tokens) in enumerate(token_chunks):
                 chunk_scalars = dict(scalars, num_queries=int(num_tokens))
+                grid = (nope_bwd_launch_grid(int(num_tokens), S, sm_count), 1, 1)
                 for stage in pass_stages:
                     entries[(stage, chunk_index)] = _stage_entry(
-                        stage, arch, chunk_scalars, program
+                        stage,
+                        arch,
+                        chunk_scalars,
+                        program,
+                        None if stage == compact else grid,
                     )
                 for index in range(passes):
                     backward_order += [
