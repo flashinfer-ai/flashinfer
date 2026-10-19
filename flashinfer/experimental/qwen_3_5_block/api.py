@@ -752,6 +752,9 @@ def prepare(
     g = geometry.frost()
     dm, rope = geometry.d_model, geometry.rope_dim
     Fwd = _frost_block()
+    # The geometry gate require_served ran mirrors the vendored tree's rules; with the tree imported, re-read them -- a re-vendor that
+    # moved a rule fails here, loudly, like the capture-safe hook below, never as a plan the gate and the tree read differently.
+    _support.check_vendored_rules()
 
     def mk(*shape):
         return torch.empty(*shape, dtype=dtype, device=dev)

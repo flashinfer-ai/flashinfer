@@ -104,8 +104,9 @@ def qwen_3_5_block_support(
     -------
     Qwen35BlockSupport
         ``served``, ``reason``, the device and CuTe DSL facts, the served ``forms``, one record per form with the typed
-        declines it can raise at plan time, the validated page sizes and layouts, the decode envelope, and ``source``
-        (the vendored cuDNN Frontend commit / version the kernels come from).
+        declines it can raise at plan time, the validated page sizes and layouts, the decode envelope, the served
+        ``rope_dims``, and ``source`` (the vendored cuDNN Frontend commit / version the kernels come from).  The geometry
+        verdict is the one ``prepare_qwen_3_5_block_bf16`` applies (one shared gate), so a served geometry prepares on every form.
     """
     from .experimental.qwen_3_5_block import support as _impl
 

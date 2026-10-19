@@ -110,17 +110,27 @@ out = qwen_3_5_block_bf16_extend(hidden_states, cos, sin, weights, w_o, geometry
 
 | condition | exception |
 |---|---|
-| not cc 10.7; `nvidia-cutlass-dsl` absent, below 4.8.0 or without the Rubin target; f16 / fp8 on the bf16 entry; `head_dim != 256`, `d_model % 256`, more than 32 decode rows | `NotImplementedError` naming the device / version / feature (and `qwen_3_5_block_support` reports it without raising) |
+| not cc 10.7; `nvidia-cutlass-dsl` absent, below 4.8.0 or without the Rubin target; f16 / fp8 on the bf16 entry; `head_dim != 256`, `d_model % 256`, `rope_dim` not 64 / 128, more than 32 decode rows | `NotImplementedError` naming the device / version / feature (and `qwen_3_5_block_support` reports it without raising) |
 | a malformed tensor (dtype, rank, shape, strides, alignment, device), a page size off the contract, a call outside the plan's capacities, a token count off the small-capacity plans' multiple | `ValueError` naming the operand and the expected form |
 | `prepare` / `plan` under capture | `RuntimeError` naming the remedy |
 
 No silent fallback: an unserved case never runs a slower path.
 
+The probe and the plans share ONE geometry gate (`Qwen35BlockGeometry.unsupported_reason`: `head_dim`, `d_model`, `rope_dim`),
+so a geometry `qwen_3_5_block_support` advertises is one every form's declaration admits in every row bucket, and a geometry it
+declines is the same typed `NotImplementedError` from `prepare_*` / `plan` before any vendored code runs. The gate's constants are
+the vendored tree's (the fused projection's epilogue subtile, the norm + RoPE kernels' lane shuffle, the decode row cap, the
+page sizes); the first probe on a served device and the first plan re-read them from the tree and refuse a drift loudly, and
+`tests/experimental/qwen_3_5_block/test_admission.py` pins the gate against the tree's own stage checks.
+
 ## Requirements and limits
 
 - SM107 (Rubin, cc 10.7) only; `nvidia-cutlass-dsl >= 4.8.0` (the first wheel with the `sm_107a` target; the repository-wide
   floor is unchanged -- the kernels gate at runtime and decline by version); torch with CUDA 13; `cuda-python`.
-- bf16 activations, weights and pools; `head_dim = 256`; `d_model % 256 == 0`; GQA groups as the Qwen3.5 shards have them
+- bf16 activations, weights and pools; `head_dim = 256`; `d_model % 256 == 0`; `rope_dim` 64 (the Qwen3.5 value) or 128
+  (`qwen_3_5_block_support(...).rope_dims`: the fused norm + RoPE projection rotates whole 64-column epilogue-subtile pairs below
+  the head dim, and the norm + RoPE kernels of the lowered decode chain shuffle 16 x a power-of-two elements -- 32 / 256 fail the
+  first rule, 192 the second); GQA groups as the Qwen3.5 shards have them
   (32 / 2, 24 / 2, 16 / 1, 8 / 1, 4 / 1 ...); the decode envelope `q_len_per_req <= 4` claimed (the packed 16- / 32-column decode
   tile), up to 32 routed and declared -- the 64-column tile in one or two token units, the paged prefill tile with the group packed
   where the step fills the part (`batch x num_kv_heads >= 64`), the unpacked tile past a group's packed routes;
