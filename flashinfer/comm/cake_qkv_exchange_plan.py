@@ -36,7 +36,7 @@ H_local, D]`` planes for Q, K, V) or ``"fused"`` (one ``[B, S_global, H_local,
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import torch
 
@@ -91,6 +91,28 @@ PAIR_MIN_M = 4096
 PAIR_MIN_GROUPS = 4
 PAIR_ARCHES: tuple[str, ...] = ("sm_100a", "sm_103a")
 LAYOUTS: tuple[str, ...] = ("bshd", "fused")
+# Row-count gates of the host plan (``rows = batch * s_local`` of a call: the token
+# rows this rank projects).  ``words_capacity_small_m``: a call with ``rows <= T``
+# publishes one readiness word per destination (``words_capacity_per_dest = 1``:
+# the wait kernel scans ``world_size`` words instead of one per 128-row tile and
+# destination); ``per_dest_large_m``: a call with ``rows >= T`` launches the
+# producer once per destination run of its tile table (the first launch carries
+# the folded rendezvous, the later ones are the plain producer, stream-ordered
+# behind it) instead of one persistent grid.  ``0`` = the gate never fires.  Both
+# gates are inclusive at their threshold and change neither the tile table nor
+# the stored bits.  Measured per architecture: SM100 / SM103 ship both gates, SM90
+# keeps the ungated plan; ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` (see the Cake
+# backend) overrides a session's gates in either direction.
+SHAPE_GATE_NAMES: tuple[str, ...] = ("words_capacity_small_m", "per_dest_large_m")
+SHAPE_GATE_OFF = 0
+SHAPE_GATE_DEFAULT_BY_ARCH: dict[str, dict[str, int]] = {
+    "sm_90a": {
+        "words_capacity_small_m": SHAPE_GATE_OFF,
+        "per_dest_large_m": SHAPE_GATE_OFF,
+    },
+    "sm_100a": {"words_capacity_small_m": 4096, "per_dest_large_m": 16384},
+    "sm_103a": {"words_capacity_small_m": 4096, "per_dest_large_m": 16384},
+}
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -602,6 +624,104 @@ def words_capacity_for_rows(max_rows: int) -> int:
     return min(DEFAULT_WORDS_CAPACITY_PER_DEST, ceil_div(int(max_rows), BLOCK_M))
 
 
+def default_shape_gates(arch: str) -> dict[str, int]:
+    """The shipped row-count gates of ``arch`` (:data:`SHAPE_GATE_DEFAULT_BY_ARCH`; a copy); an unknown architecture
+    is an error."""
+
+    try:
+        return dict(SHAPE_GATE_DEFAULT_BY_ARCH[arch])
+    except KeyError:
+        raise ValueError(
+            f"no shape gates for architecture {arch!r}; known: {tuple(SHAPE_GATE_DEFAULT_BY_ARCH)}"
+        ) from None
+
+
+def check_shape_gates(gates: Mapping[str, Any]) -> dict[str, int]:
+    """Validate a gate table: exactly :data:`SHAPE_GATE_NAMES`, each an int ``>= 0`` (``0`` = off)."""
+
+    if set(gates) != set(SHAPE_GATE_NAMES):
+        raise ValueError(
+            f"shape gates must name exactly {SHAPE_GATE_NAMES}, got {tuple(gates)}"
+        )
+    checked: dict[str, int] = {}
+    for name in SHAPE_GATE_NAMES:
+        value = gates[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"shape gate {name} must be an int >= 0 (0 = off), got {value!r}"
+            )
+        checked[name] = int(value)
+    return checked
+
+
+@dataclass(frozen=True)
+class ShapeGateVerdict:
+    """The row-count gates of one call (``rows = batch * s_local``): which fired and what they select.
+    ``words_capacity_per_dest`` is ``1`` when the small-row gate fired, else ``None`` (the session's capacity
+    stands); ``producer_launches`` is ``"per_dest"`` or ``"persistent"``."""
+
+    rows: int
+    gates: dict[str, int]
+    words_capacity_per_dest: Optional[int]
+    producer_launches: str
+
+    @property
+    def fired(self) -> tuple[str, ...]:
+        fired = []
+        if self.words_capacity_per_dest is not None:
+            fired.append("words_capacity_small_m")
+        if self.producer_launches == "per_dest":
+            fired.append("per_dest_large_m")
+        return tuple(fired)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "rows": self.rows,
+            "gates": dict(self.gates),
+            "fired": list(self.fired),
+            "words_capacity_per_dest": self.words_capacity_per_dest,
+            "producer_launches": self.producer_launches,
+        }
+
+
+def gate_rows(gates: Mapping[str, Any], rows: int) -> ShapeGateVerdict:
+    """Resolve the row-count gates on one call's ``rows`` (inclusive thresholds; a gate at ``0`` never fires)."""
+
+    checked = check_shape_gates(gates)
+    if isinstance(rows, bool) or not isinstance(rows, int) or rows < 1:
+        raise ValueError(f"rows must be a positive int, got {rows!r}")
+    small, large = checked["words_capacity_small_m"], checked["per_dest_large_m"]
+    return ShapeGateVerdict(
+        rows=int(rows),
+        gates=checked,
+        words_capacity_per_dest=1 if small and rows <= small else None,
+        producer_launches="per_dest" if large and rows >= large else "persistent",
+    )
+
+
+def dest_parts(plan: TilePlan) -> tuple[tuple[int, int], ...]:
+    """Contiguous ``(start, stop)`` runs of the plan's table that share one destination, in table order; lockstep pad
+    rows (``dest = -1``) stay with the run they pad.  Covers the table exactly once -- the launches of a
+    ``per_dest`` call."""
+
+    dests = [int(value) for value in plan.tiles[:, TILE_FIELDS.index("dest")].tolist()]
+    if not dests:
+        raise ValueError("dest_parts: empty tile table")
+    parts: list[tuple[int, int]] = []
+    start, current = 0, dests[0]
+    for index, dest in enumerate(dests):
+        if dest == -1 or dest == current:
+            continue
+        parts.append((start, index))
+        start, current = index, dest
+    parts.append((start, len(dests)))
+    if sum(stop - start for start, stop in parts) != len(dests) or parts[0][0] != 0:
+        raise AssertionError(
+            f"dest_parts {parts} do not cover the {len(dests)}-row table"
+        )
+    return tuple(parts)
+
+
 __all__ = [
     "BLOCK_K",
     "BLOCK_M",
@@ -615,14 +735,22 @@ __all__ = [
     "PAIR_LOCKSTEP",
     "PAIR_MIN_GROUPS",
     "PAIR_MIN_M",
+    "SHAPE_GATE_DEFAULT_BY_ARCH",
+    "SHAPE_GATE_NAMES",
+    "SHAPE_GATE_OFF",
     "TILE_FIELDS",
     "TILE_ORDERS",
     "Geometry",
     "Policy",
+    "ShapeGateVerdict",
     "TilePlan",
     "block_n_for",
     "ceil_div",
+    "check_shape_gates",
     "chunk_plan",
+    "default_shape_gates",
+    "dest_parts",
+    "gate_rows",
     "heads_divisibility_error",
     "pair_geometry",
     "plan_for",

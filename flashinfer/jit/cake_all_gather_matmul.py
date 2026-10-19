@@ -21,9 +21,11 @@ architectures (``PROGRAMS`` records its launch block and dynamic shared memory;
 sequence module per (world size, dtype, weight layout, architecture)
 (``SEQUENCES``): the route's device units together with the rendered one-call
 launcher ``run`` (barrier, bridge event, copy-engine pushes with their
-readiness epochs, main kernel with cached tensor maps) and, on the routes with
-a shape of at most ``SM_PUSH_MAX_ROWS`` padded rows, ``run_push``. The main kernels are tcgen05 code, so a
-sequence is compiled for its exact architecture (``sm_100a`` or ``sm_103a``).
+readiness epochs, main kernel with cached tensor maps) and ``run_push`` for
+the calls ``uses_sm_push`` routes through the SM push kernel (the base rule
+plus the architecture's ``SM_PUSH_BANDS_BY_ARCH`` bands). The main kernels are
+tcgen05 code, so a sequence is compiled for its exact architecture
+(``sm_100a`` or ``sm_103a``).
 A route whose (world size, dtype, weight layout) class is listed in
 ``N128_CLASSES`` for the device's architecture also compiles the 128-wide main
 twin (``main_n128``) into its sequence module; ``main_block_n`` selects that
@@ -31,6 +33,16 @@ twin per call from the frozen wave rule (``SM_COUNT_BY_ARCH`` and the
 per-architecture wave cap ``N128_MAX_WAVES_BY_ARCH``) and the table, and the
 launcher receives the chosen ``block_n``. ``N`` stays a positive multiple of
 ``BLOCK_N`` (256) either way.
+A route whose class is listed in ``CG2_CLASSES`` for the device's architecture
+also compiles the CTA-pair twin of the N256 main (``main_cg2``:
+``tcgen05.mma.cta_group::2`` over a cluster of two CTAs, each loading its own
+128 A rows and 128 B columns per stage); ``main_form`` selects it per N256 call
+from the frozen region table (``CG2_REGIONS``: per class a padded-row range and
+a column cap, measured per architecture) and the delivered-class
+table, ``main_grid`` sizes its even grid of
+CTA pairs, and the launcher receives the chosen form as the positional
+``main_cg2`` flag and launches the twin with the cluster-dimension attribute
+``CG2_CLUSTER_DIMS``.
 The tables are filled by the exporter from the program bundle; the loader never
 hashes sources or interprets argument plans.
 """
@@ -48,6 +60,22 @@ from .core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
 # Filled mechanically from the program bundle.
 PROGRAMS: dict[str, dict[str, Any]] = {
+    "cake_all_gather_matmul_06c1f7cb4aa36c5918bd": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_06c1f7cb4aa36c5918bd_kernel.cu",
+        ],
+        "arches": ["sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_18bb325baf7347c5f496": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_18bb325baf7347c5f496_kernel.cu",
+        ],
+        "arches": ["sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
     "cake_all_gather_matmul_21d7e2b21b372ffeab36": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_21d7e2b21b372ffeab36_kernel.cu",
@@ -222,7 +250,9 @@ ROUTES: dict[str, str] = {
     "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
     "main_bfloat16_ws2_k_major": "cake_all_gather_matmul_bb046ade8e857469f0c6",
     "main_bfloat16_ws2_n_major": "cake_all_gather_matmul_c27adeb3c14305afd206",
+    "main_bfloat16_ws2_n_major_cg2": "cake_all_gather_matmul_06c1f7cb4aa36c5918bd",
     "main_bfloat16_ws4_k_major": "cake_all_gather_matmul_a01c4436c21e679aaed9",
+    "main_bfloat16_ws4_k_major_cg2": "cake_all_gather_matmul_18bb325baf7347c5f496",
     "main_bfloat16_ws4_k_major_n128": "cake_all_gather_matmul_52f3fc23159650a89719",
     "main_bfloat16_ws4_n_major": "cake_all_gather_matmul_dba24f495a33b1a179e7",
     "main_bfloat16_ws8_k_major": "cake_all_gather_matmul_a55baa3bdb6ce5b39f7e",
@@ -311,6 +341,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c27adeb3c14305afd206_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_06c1f7cb4aa36c5918bd_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_n_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
@@ -323,6 +354,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
             "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
             "main": "cake_all_gather_matmul_c27adeb3c14305afd206",
+            "main_cg2": "cake_all_gather_matmul_06c1f7cb4aa36c5918bd",
         },
     },
     "bfloat16_ws4_k_major_sm_100a": {
@@ -356,6 +388,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a01c4436c21e679aaed9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_52f3fc23159650a89719_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_18bb325baf7347c5f496_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_k_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
@@ -369,6 +402,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
             "main": "cake_all_gather_matmul_a01c4436c21e679aaed9",
             "main_n128": "cake_all_gather_matmul_52f3fc23159650a89719",
+            "main_cg2": "cake_all_gather_matmul_18bb325baf7347c5f496",
         },
     },
     "bfloat16_ws4_n_major_sm_100a": {
@@ -784,6 +818,33 @@ N128_CLASSES: dict[str, list[list[Any]]] = {
 # architecture).
 SM_COUNT_BY_ARCH: dict[str, int] = {"sm_100a": 148, "sm_103a": 148}
 N128_MAX_WAVES_BY_ARCH: dict[str, int] = {"sm_100a": 2, "sm_103a": 1}
+# Per-architecture SM push bands ``[world_size, padded_rows, max_cols]`` beyond
+# the base rule of ``uses_sm_push`` (copied from the kernel module; an arch
+# outside the table is an error, never the base rule alone).
+SM_PUSH_BANDS_BY_ARCH: dict[str, list[list[int]]] = {
+    "sm_100a": [],
+    "sm_103a": [[8, 1024, 1619]],
+}
+# Classes ``[world_size, dtype, b_layout]`` with a delivered ``_cg2`` main (the
+# CTA-pair twin of the N256 main), per architecture; ``main_form`` selects the
+# twin only inside this table.
+CG2_CLASSES: dict[str, list[list[Any]]] = {
+    "sm_100a": [],
+    "sm_103a": [[2, "bfloat16", "n_major"], [4, "bfloat16", "k_major"]],
+}
+# Frozen input of the pair selection rule, copied from the kernel module: the
+# measured regions of the twin per architecture, one ``[world_size, dtype,
+# b_layout, min_padded_rows, max_padded_rows, max_cols]`` entry per class with a
+# region (an architecture without one lists nothing); an N256 call runs the twin
+# iff its class has an entry and ``min_padded_rows <= ceil128(rows) <=
+# max_padded_rows`` and ``N <= max_cols``.
+CG2_REGIONS: dict[str, list[list[Any]]] = {
+    "sm_100a": [],
+    "sm_103a": [
+        [2, "bfloat16", "n_major", 2048, 5760, 2048],
+        [4, "bfloat16", "k_major", 1024, 1536, 6058],
+    ],
+}
 
 SOURCE_PACKAGE = "cake_all_gather_matmul"
 # The kernels are tcgen05 / TMEM code; one source serves both capabilities,
@@ -804,9 +865,16 @@ BLOCK_N = 256
 # Tile widths of the delivered main programs: the public N256 program and the
 # ``_n128`` twin ``main_block_n`` selects per call.
 MAIN_BLOCK_NS: tuple[int, ...] = (256, 128)
-# Rows pushed per peer chunk; the main kernel consumes chunk ``c`` of a peer
-# after the matching readiness word reaches the launch epoch.
-CHUNK_ROWS = 19 * BLOCK_M
+# Forms of the delivered N256 main: the one-CTA program (``cg1``) and its
+# CTA-pair twin (``cg2``, ``tcgen05.mma.cta_group::2``) ``main_form`` selects per
+# call; the twin launches clusters of ``CG2_CLUSTER_DIMS`` CTAs (the pair).
+MAIN_FORMS: tuple[str, ...] = ("cg1", "cg2")
+CG2_CLUSTER_DIMS: tuple[int, int, int] = (2, 1, 1)
+# Rows pushed per peer chunk (19 * BLOCK_M); the main kernel consumes chunk
+# ``c`` of a peer after the matching readiness word reaches the launch epoch.
+# A literal: the export's route contract runs the loader's literals and pure
+# functions in a scratch namespace, and ``chunk_plan`` (the pair tiles) reads it.
+CHUNK_ROWS = 2432
 # Physical layouts of the logical ``[K, N]`` weight, each with its own main
 # kernel: ``n_major`` = contiguous ``[K, N]``; ``k_major`` = the ``w.t()`` view
 # of a contiguous ``[N, K]`` parameter.
@@ -820,9 +888,10 @@ MAIN_THREADS = 192
 # ``PUSH_WIDE_CTAS_PER_PEER`` CTAs of the ``peer_push_wide`` program
 # (``PUSH_WIDE_UNROLL``). ``PUSH_CARVEOUT`` is both push functions' preferred
 # shared-memory carveout (-1 = driver default). ``SM_PUSH_MAX_ROWS``: padded
-# local rows up to which the SM push replaces the copy-engine pushes (every
-# world size, dtype and architecture). All mirror the Cake export adapter; the
-# host sequence compiles the launch constants in and chooses per call itself.
+# local rows up to which the base rule routes a ws4/ws8 call through the SM
+# push (``SM_PUSH_BANDS_BY_ARCH`` adds per-architecture bands beyond it). All
+# mirror the Cake export adapter; the host sequence compiles the launch
+# constants and its bands in and chooses per call itself.
 PUSH_CTAS_PER_PEER = 32
 PUSH_UNROLL = 1
 PUSH_WIDE_CTAS_PER_PEER = 8
@@ -885,6 +954,12 @@ def _check_block_n(block_n: int) -> int:
     return block_n
 
 
+def _check_form(form: str) -> str:
+    if type(form) is not str or form not in MAIN_FORMS:
+        raise ValueError(f"form must be one of {MAIN_FORMS}, got {form!r}")
+    return form
+
+
 def main_tiles(rows: int, n: int, *, world_size: int, block_n: int) -> int:
     """Output tiles of one call: ``world_size * ceil128(rows) / 128 * n / block_n``."""
 
@@ -908,6 +983,44 @@ def _n128_classes(arch: str) -> frozenset[tuple[int, str, str]]:
         (int(world_size), str(dtype_name), str(b_layout))
         for world_size, dtype_name, b_layout in N128_CLASSES[arch]
     )
+
+
+def _cg2_classes(arch: str) -> frozenset[tuple[int, str, str]]:
+    """``(world_size, dtype, b_layout)`` classes with a delivered ``_cg2`` main on
+    ``arch`` (the emitted table holds them as three-element lists)."""
+
+    if arch not in CG2_CLASSES:
+        raise ValueError(
+            f"CG2_CLASSES has no entry for arch {arch!r} (known: {sorted(CG2_CLASSES)})"
+        )
+    return frozenset(
+        (int(world_size), str(dtype_name), str(b_layout))
+        for world_size, dtype_name, b_layout in CG2_CLASSES[arch]
+    )
+
+
+def _cg2_region(
+    arch: str, world_size: int, dtype_name: str, b_layout: str
+) -> tuple[int, int, int] | None:
+    """``(min_padded_rows, max_padded_rows, max_cols)`` of the pair twin's measured
+    region of one class on ``arch`` (the emitted ``CG2_REGIONS`` table), or
+    ``None`` when the class has none there; an unknown arch raises."""
+
+    if arch not in CG2_REGIONS:
+        raise ValueError(
+            f"CG2_REGIONS has no entry for arch {arch!r} (known: {sorted(CG2_REGIONS)})"
+        )
+    key = (int(world_size), str(dtype_name), str(b_layout))
+    hits = [
+        (int(min_rows), int(max_rows), int(max_cols))
+        for ws, dtype, layout, min_rows, max_rows, max_cols in CG2_REGIONS[arch]
+        if (int(ws), str(dtype), str(layout)) == key
+    ]
+    if len(hits) > 1:
+        raise ValueError(
+            f"CG2_REGIONS[{arch!r}] lists the class {key} {len(hits)} times"
+        )
+    return hits[0] if hits else None
 
 
 def main_block_n(
@@ -950,6 +1063,59 @@ def main_block_n(
     return 128 if (qualify and cap and max_waves > 0 and delivered) else 256
 
 
+def main_form(
+    rows: int,
+    n: int,
+    *,
+    world_size: int,
+    arch: str,
+    dtype_name: str,
+    b_layout: str,
+    block_n: int,
+) -> str:
+    """Form (``"cg1"`` or ``"cg2"``) of the main program for one call.
+
+    The CTA-pair twin (``cg2``) is selected for an N256 call whose
+    ``(world_size, dtype_name, b_layout)`` class has a measured region on
+    ``arch`` (``CG2_REGIONS``) and a delivered ``_cg2`` program there
+    (``CG2_CLASSES``), when ``min_padded_rows <= ceil128(rows) <=
+    max_padded_rows`` and ``n <= max_cols`` of that region. A 128-wide call, a
+    class without a region and a call outside its region run the one-CTA
+    program. The rule mirrors the kernel module's ``main_form`` with its frozen
+    region table; an unknown arch raises, never defaults."""
+
+    if arch not in CG2_REGIONS:
+        raise ValueError(
+            f"main_form has no pair-form regions for arch {arch!r} "
+            f"(known: {sorted(CG2_REGIONS)})"
+        )
+    if _check_block_n(block_n) != 256:
+        return "cg1"
+    main_tiles(rows, n, world_size=world_size, block_n=256)
+    delivered = (int(world_size), str(dtype_name), str(b_layout)) in _cg2_classes(arch)
+    region = _cg2_region(arch, world_size, dtype_name, b_layout)
+    if region is None:
+        return "cg1"
+    min_rows, max_rows, max_cols = region
+    qualify = min_rows <= padded_rows(rows) <= max_rows and int(n) <= max_cols
+    return "cg2" if (qualify and delivered) else "cg1"
+
+
+def main_pair_tiles(rows: int, n: int, *, world_size: int) -> int:
+    """Pair tiles of one call of the CTA-pair main: per peer and N tile, the
+    chunks' ``ceil(M tiles / 2)`` pairs summed over the readiness chunks (the
+    odd-rank CTA of the last pair of an odd chunk idles)."""
+
+    main_tiles(rows, n, world_size=world_size, block_n=256)
+    padded, chunk_rows, num_chunks = chunk_plan(rows)
+    first_tiles_m = chunk_rows // BLOCK_M
+    last_tiles_m = (padded - (num_chunks - 1) * chunk_rows) // BLOCK_M
+    pairs_per_peer = (num_chunks - 1) * ((first_tiles_m + 1) // 2) + (
+        last_tiles_m + 1
+    ) // 2
+    return int(world_size) * pairs_per_peer * (int(n) // 256)
+
+
 def main_grid(
     rows: int,
     n: int,
@@ -957,14 +1123,24 @@ def main_grid(
     world_size: int,
     sm_count: int,
     block_n: int = 256,
+    form: str = "cg1",
 ) -> tuple[int, int, int]:
     """Launch grid of the persistent main kernel: one CTA per SM, bounded by the
     total output tile count (``world_size * ceil128(rows) / 128 * N / block_n``),
-    each CTA striding over the arrival-ordered tile list."""
+    each CTA striding over the arrival-ordered tile list. The CTA-pair twin
+    (``form="cg2"``) launches an even grid of ``2 * min(pair_tiles, SMs / 2)``
+    CTAs, each cluster striding over the pair-tile list."""
 
     if int(world_size) <= 0 or int(sm_count) <= 0:
         message = "the persistent main grid needs a positive world_size and sm_count"
         raise ValueError(message)
+    if _check_form(form) == "cg2":
+        if _check_block_n(block_n) != 256:
+            raise ValueError(
+                f"the CTA-pair main exists at block_n=256 only, got {block_n}"
+            )
+        pair_tiles = main_pair_tiles(rows, n, world_size=world_size)
+        return (2 * max(1, min(pair_tiles, int(sm_count) // 2)), 1, 1)
     total_tiles = main_tiles(rows, n, world_size=world_size, block_n=block_n)
     return (max(1, min(total_tiles, int(sm_count))), 1, 1)
 
@@ -975,16 +1151,56 @@ def sm_push_max_cols(padded_rows: int) -> int:
     return SM_PUSH_COLS_INTERCEPT - SM_PUSH_COLS_PER_ROW * int(padded_rows)
 
 
-def uses_sm_push(*, rows: int, world_size: int, cols: int) -> bool:
+def sm_push_bands(arch: str) -> tuple[tuple[int, int, int], ...]:
+    """``SM_PUSH_BANDS_BY_ARCH[arch]`` as ``(world_size, padded_rows, max_cols)`` triples; an arch
+    outside the table is an error, never an empty default."""
+
+    if arch not in SM_PUSH_BANDS_BY_ARCH:
+        raise ValueError(
+            f"SM_PUSH_BANDS_BY_ARCH has no SM push bands for arch {arch!r} (known: {sorted(SM_PUSH_BANDS_BY_ARCH)})"
+        )
+    return tuple(
+        (int(band[0]), int(band[1]), int(band[2]))
+        for band in SM_PUSH_BANDS_BY_ARCH[arch]
+    )
+
+
+def uses_sm_push(*, rows: int, world_size: int, cols: int, arch: str) -> bool:
     """Padded local rows up to ``SM_PUSH_MAX_ROWS`` with ``N`` up to ``sm_push_max_cols`` push
     through the SM kernel instead of the copy engines at world sizes 4 and 8 (a single peer
     saturates neither route; a wider GEMM overlaps the copy-engine pushes but would wait behind
-    the SM push; the copy engine wins in both cases)."""
+    the SM push; the copy engine wins in both cases), and so does a call in a band of
+    ``SM_PUSH_BANDS_BY_ARCH[arch]`` (its world size, exactly its padded rows, ``N <= max_cols``).
+    The rule mirrors the kernel module's ``uses_sm_push``; ``arch`` is validated on every call."""
 
+    bands = sm_push_bands(arch)
+    world_size = int(world_size)
     padded = padded_rows(rows)
-    if int(world_size) < 4 or padded > SM_PUSH_MAX_ROWS:
-        return False
-    return int(cols) <= sm_push_max_cols(padded)
+    cols = int(cols)
+    if (
+        world_size >= 4
+        and padded <= SM_PUSH_MAX_ROWS
+        and cols <= sm_push_max_cols(padded)
+    ):
+        return True
+    return any(
+        world_size == band_world_size and padded == band_rows and cols <= band_max_cols
+        for band_world_size, band_rows, band_max_cols in bands
+    )
+
+
+def sm_push_reachable(*, world_size: int, cols: int, arch: str) -> bool:
+    """Whether some row count of a ``(world_size, N)`` group takes the SM push route on ``arch``:
+    the base rule at its widest ceiling (128 padded rows) or a band of the architecture. The
+    backend resolves a group's SM push tables at prepare time by this predicate, so a captured
+    call allocates nothing."""
+
+    if uses_sm_push(rows=BLOCK_M, world_size=world_size, cols=cols, arch=arch):
+        return True
+    return any(
+        int(world_size) == band_world_size and int(cols) <= band_max_cols
+        for band_world_size, _band_rows, band_max_cols in sm_push_bands(arch)
+    )
 
 
 def push_payload_bytes(padded_rows: int, dtype_bytes: int) -> int:
@@ -1040,26 +1256,35 @@ def barrier_program(phase: int) -> str:
 
 
 def _main_route_key(
-    world_size: int, dtype_name: str, b_layout: str, block_n: int
+    world_size: int, dtype_name: str, b_layout: str, block_n: int, form: str = "cg1"
 ) -> str:
-    """``ROUTES`` key of one main program (``_n128`` suffix for the 128-wide twin)."""
+    """``ROUTES`` key of one main program (``_n128`` suffix for the 128-wide twin,
+    ``_cg2`` for the CTA-pair twin of the N256 main)."""
 
     width = "" if _check_block_n(block_n) == 256 else f"_n{block_n}"
-    return f"main_{dtype_name}_ws{int(world_size)}_{b_layout}{width}"
+    if _check_form(form) == "cg2" and block_n != 256:
+        raise ValueError(f"the CTA-pair main exists at block_n=256 only, got {block_n}")
+    pair = "" if form == "cg1" else f"_{form}"
+    return f"main_{dtype_name}_ws{int(world_size)}_{b_layout}{width}{pair}"
 
 
 def main_program(
-    world_size: int, dtype_name: str, b_layout: str, block_n: int = 256
+    world_size: int,
+    dtype_name: str,
+    b_layout: str,
+    block_n: int = 256,
+    form: str = "cg1",
 ) -> str:
     """The main program of one route at tile width ``block_n`` (256, or the delivered
-    ``_n128`` twin); a class without that program raises ``ValueError``."""
+    ``_n128`` twin) and form (``cg1``, or the delivered ``_cg2`` CTA-pair twin);
+    a class without that program raises ``ValueError``."""
 
-    key = _main_route_key(world_size, dtype_name, b_layout, block_n)
+    key = _main_route_key(world_size, dtype_name, b_layout, block_n, form)
     if key not in ROUTES:
         raise ValueError(
             f"no all-gather matmul main program is delivered for {key!r} "
             f"(world_size={int(world_size)}, dtype={dtype_name}, "
-            f"b_layout={b_layout}, block_n={block_n})"
+            f"b_layout={b_layout}, block_n={block_n}, form={form})"
         )
     return ROUTES[key]
 
@@ -1106,7 +1331,8 @@ def sequence_name(world_size: int, dtype_name: str, b_layout: str, arch: str) ->
 def sequence_programs(sequence: str) -> tuple[str, ...]:
     """Programs whose device units the sequence module compiles (route order: both
     barrier phases, both SM push programs, the N256 main, then the ``_n128`` main
-    when the row's ``programs`` carry ``main_n128``)."""
+    when the row's ``programs`` carry ``main_n128``, then the ``_cg2`` main when
+    they carry ``main_cg2``)."""
 
     row = SEQUENCES[sequence]
     programs = [
@@ -1118,6 +1344,8 @@ def sequence_programs(sequence: str) -> tuple[str, ...]:
     ]
     if "main_n128" in row["programs"]:
         programs.append(row["programs"]["main_n128"])
+    if "main_cg2" in row["programs"]:
+        programs.append(row["programs"]["main_cg2"])
     return tuple(programs)
 
 
@@ -1163,6 +1391,9 @@ __all__ = [
     "BLOCK_M",
     "BLOCK_N",
     "CAPABILITY_ARCH",
+    "CG2_CLASSES",
+    "CG2_CLUSTER_DIMS",
+    "CG2_REGIONS",
     "CHUNK_ROWS",
     "COMPILE_FLAGS",
     "PUSH_CARVEOUT",
@@ -1171,11 +1402,13 @@ __all__ = [
     "PUSH_UNROLL",
     "PUSH_WIDE_CTAS_PER_PEER",
     "PUSH_WIDE_UNROLL",
+    "SM_PUSH_BANDS_BY_ARCH",
     "SM_PUSH_MAX_ROWS",
     "SM_PUSH_COLS_INTERCEPT",
     "SM_PUSH_COLS_PER_ROW",
     "K",
     "MAIN_BLOCK_NS",
+    "MAIN_FORMS",
     "MAIN_THREADS",
     "N128_CLASSES",
     "N128_MAX_WAVES_BY_ARCH",
@@ -1194,7 +1427,9 @@ __all__ = [
     "launch_block",
     "load",
     "main_block_n",
+    "main_form",
     "main_grid",
+    "main_pair_tiles",
     "main_program",
     "main_tiles",
     "padded_rows",
@@ -1204,7 +1439,9 @@ __all__ = [
     "push_payload_bytes",
     "sequence_name",
     "sequence_programs",
+    "sm_push_bands",
     "sm_push_max_cols",
+    "sm_push_reachable",
     "spec",
     "uses_sm_push",
     "weight_layout",

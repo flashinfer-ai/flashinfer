@@ -162,7 +162,9 @@ def _cake_gdn_unit_gates(
 # ``cu_seqlens_cpu`` is the optional host copy engines
 # already hold (vLLM ``query_start_loc_cpu``, the prefix sums of SGLang's
 # ``extend_seq_lens_cpu``): it tightens the host validation and the launch
-# bound without a synchronization.
+# bound and enables the ragged-batch launch grid (one CTA per tile when the
+# host model of the persistent schedule predicts a shorter critical path for
+# the given lengths), all without a synchronization.
 
 
 def _cake_gdn_prefill_host_offsets(
@@ -222,18 +224,31 @@ def _cake_gdn_prefill_host_offsets(
 
 
 def _cake_gdn_prefill_grid_x(
-    total_tiles: int, sm_count: int, dvsplit: bool, bound_tokens: int
+    total_tiles: int,
+    sm_count: int,
+    dvsplit: bool,
+    bound_tokens: int,
+    host_seq_lens: Optional[Sequence[int]] = None,
 ) -> int:
     """Persistent CTA count for ``total_tiles`` work tiles on ``sm_count`` SMs.
 
     One copy of the host-known grid rule lives in ``flashinfer/jit/cake_gdn.py``
     (the variant resolver's gate-stream rule reads the same grid); it mirrors
-    the Cake program's ``_select_persistent_grid_ctas`` exactly and the
-    exporter's mirror test keeps the copies identical.
+    the Cake generator's grid rule exactly and the exporter's mirror test keeps
+    the copies identical.  ``host_seq_lens`` -- the per-sequence lengths known
+    only from ``cu_seqlens_cpu`` -- enables the ragged-batch route (one CTA per
+    tile when the host model predicts a shorter critical path); without it the
+    residency rule decides.  ``bound_tokens`` never changes the grid.  The rule
+    costs O(S) host work for S sequences and is memoised (the lengths go in
+    as a tuple).
     """
 
     return _cake_gdn._cake_gdn_prefill_grid_x(
-        total_tiles, sm_count, dvsplit, bound_tokens
+        total_tiles,
+        sm_count,
+        dvsplit,
+        bound_tokens,
+        None if host_seq_lens is None else tuple(host_seq_lens),
     )
 
 
@@ -335,7 +350,9 @@ def _run_cake_gdn_prefill(
     ``max_seqlen`` is an upper bound on the longest sequence (validated by the
     public entry); ``cu_seqlens_cpu`` is the optional host copy of
     ``cu_seqlens``.  The launch bound is the exact maximum from the host copy
-    when given, else ``max_seqlen``, else the packed token count.
+    when given, else ``max_seqlen``, else the packed token count; the host
+    copy's per-sequence lengths also drive the ragged-batch launch grid (the
+    variant resolver and the launch read the same lengths).
     """
 
     if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
@@ -566,12 +583,20 @@ def _run_cake_gdn_prefill(
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         use_state_indices=state_indices is not None,
         gates_present=gates_present,
+        host_seq_lens=seq_lens,
     )
     entry = _cake_gdn.load_cake_gdn_kernel(route.variant_name, arch)
     dvsplit = route.route_id.endswith(".dvsplit")
     total_tiles = num_seqs * num_o_heads * (2 if dvsplit else 1)
+    # The device's SM count and, with ``cu_seqlens_cpu``, the host sequence
+    # lengths: the rule the resolver evaluated with the architecture's nominal
+    # count; this grid is authoritative for the workspace.
     grid_x = _cake_gdn_prefill_grid_x(
-        total_tiles, _cake_gdn_sm_count(device_index), dvsplit, bound_tokens
+        total_tiles,
+        _cake_gdn_sm_count(device_index),
+        dvsplit,
+        bound_tokens,
+        seq_lens,
     )
 
     empty_i32 = _cake_gdn_sentinel(device_index, torch.int32)
@@ -1189,9 +1214,10 @@ def chunk_gated_delta_rule(
         ``ceil(total_seq_len / num_seqs)``; pass the exact maximum so the band
         decision matches the Cake dispatcher's. ``backend="cake_gdn"`` without
         CP uses the same bound (or the exact maximum from ``cu_seqlens_cpu``)
-        to select its kernel variant and persistent grid; a loose bound is
-        always correct and only affects the grid size and whether the
-        single-chunk kernel is eligible.
+        to select its kernel variant; a loose bound is always correct and only
+        affects whether the single-chunk kernel is eligible.  The persistent
+        grid does not depend on the bound: it follows the per-sequence lengths
+        of ``cu_seqlens_cpu`` when given (see below), else the residency rule.
     gate_domain : {"linear", "log"}
         Domain of precomputed ``g``: linear alpha (default) or natural-log
         alpha. ``None`` still means no decay. Ignored when use_gate_in_kernel
@@ -1215,10 +1241,16 @@ def chunk_gated_delta_rule(
         without CP and ignored by every other route. When given, the Cake
         route validates it on the host (non-decreasing, first entry ``0``,
         last entry ``total_seq_len``; a mismatch raises before any launch),
-        takes the exact longest sequence as the bound for variant selection
-        and the persistent grid, and checks the checkpoint count exactly.
+        takes the exact longest sequence as the bound for variant selection,
+        checks the checkpoint count exactly, and enables the ragged-batch
+        launch grid: from the per-sequence lengths the host models the
+        persistent kernel's strided tile assignment against one CTA per tile
+        and launches one CTA per tile when the modelled critical path shrinks
+        by at least 4 % (same kernel binary, bitwise identical outputs);
+        equal-length batches keep the residency grid.
         When omitted the route still reads nothing back from the device: the
-        bound is ``max_seqlen`` (or ``total_seq_len``) and ``cu_seqlens`` is
+        bound is ``max_seqlen`` (or ``total_seq_len``), the persistent grid
+        follows the residency rule alone and ``cu_seqlens`` is
         resolved by the kernel at every launch, which clamps every offset
         into ``[0, total_seq_len]`` and treats a non-monotonic pair as an
         empty sequence -- a documented no-op, never an out-of-bounds access

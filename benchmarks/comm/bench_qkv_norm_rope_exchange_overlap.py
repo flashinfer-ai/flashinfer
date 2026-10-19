@@ -305,6 +305,8 @@ def build_arms(group, device, rank, world_size, hidden, rows, args):
         "fused_fold_barrier": fused_info.get("fold_barrier"),
         "fused_fold_barrier_requested": fused_info.get("fold_barrier_requested"),
         "fused_launches_per_call": fused_info.get("launches_per_call"),
+        "fused_shape_gates": fused_info.get("shape_gates"),
+        "fused_prepared_row_plans": fused_info.get("prepared_row_plans"),
         "ulysses_backend": comm_in.backend,
         "b3_schedule": list(schedule),
     }
