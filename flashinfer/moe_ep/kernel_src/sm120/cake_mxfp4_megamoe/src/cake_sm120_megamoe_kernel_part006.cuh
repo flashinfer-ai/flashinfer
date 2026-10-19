@@ -597,28 +597,18 @@ static_assert(!((MOE_CODEC_OVF_BLOCKS_LL) < (16)), "parametric guard: comparison
 static_assert(!((MOE_CODEC_OVF_BLOCKS_LL) > (256)), "parametric guard: comparison >");
 static_assert(!(((((MOE_RANKS_LL * 2) * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) * ((((MOE_HIDDEN_LL / 64) * 2) + ((MOE_HIDDEN_LL / 64) * 96)) + (MOE_CODEC_OVF_BLOCKS_LL * 128))) + ((MOE_MAX_ROWS_LL * MOE_TOPK_LL) * 4))) + 262144)) >= (9223372036854775808)), "parametric guard: comparison >=");
 static_assert(!(((MOE_MAX_ROWS_LL * MOE_HIDDEN_LL)) >= (4294967296)), "parametric guard: comparison >=");
-#if (MOE_SW_POLICY_EP == 8 && ((MOE_INSTANCE == 0 && (MOE_SW_ROLE_WARP_FOLD == 1 && (MOE_SHARED_EXPERT == 1 && (MOE_SW_TB_SCR_GLOBAL == 1 || (MOE_SW_TB_SCR_GLOBAL == 0 && MOE_SW_PAD_MULTI_PASS == 0))))) || (MOE_INSTANCE == 2 && (MOE_SW_ROLE_WARP_FOLD == 1 && (MOE_SHARED_EXPERT == 1 && (MOE_SW_TB_SCR_GLOBAL == 1 || (MOE_SW_TB_SCR_GLOBAL == 0 && MOE_SW_PAD_MULTI_PASS == 0))))))) // moe-select
-static_assert((MOE_RANKS_LL) == (8), "parametric guard: comparison ==");
-static_assert(((MOE_MAX_ROWS_LL / 128)) > (0), "parametric guard: comparison >");
-#elif (MOE_SW_POLICY_EP == 8 && ((MOE_INSTANCE == 0 && (MOE_SW_TB_SCR_GLOBAL == 1 || (MOE_SW_TB_SCR_GLOBAL == 0 && (MOE_SW_ROLE_WARP_FOLD == 1 && MOE_SW_PAD_MULTI_PASS == 0)))) || (MOE_INSTANCE == 2 && (MOE_SW_TB_SCR_GLOBAL == 1 || (MOE_SW_TB_SCR_GLOBAL == 0 && (MOE_SW_ROLE_WARP_FOLD == 1 && MOE_SW_PAD_MULTI_PASS == 0)))))) // moe-select
-static_assert((MOE_RANKS_LL) == (8), "parametric guard: comparison ==");
-#elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 1 && (MOE_SW_WIDE_RANKS == 1 && MOE_SHARED_EXPERT == 1)) || (MOE_INSTANCE == 3 && (MOE_SW_WIDE_RANKS == 1 && MOE_SHARED_EXPERT == 1)))) // moe-select
+#if (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 1 && (MOE_SW_WIDE_RANKS == 1 && MOE_SHARED_EXPERT == 1)) || (MOE_INSTANCE == 3 && (MOE_SW_WIDE_RANKS == 1 && MOE_SHARED_EXPERT == 1)))) // moe-select
 static_assert(((MOE_MAX_ROWS_LL / 64)) > (0), "parametric guard: comparison >");
 static_assert(((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + (MOE_MAX_ROWS_LL / 64))) < (16777216), "parametric guard: comparison <");
 #elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 1 && MOE_SW_WIDE_RANKS == 1) || (MOE_INSTANCE == 3 && MOE_SW_WIDE_RANKS == 1))) // moe-select
 static_assert(((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + 0)) < (16777216), "parametric guard: comparison <");
 #elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 1 && MOE_SHARED_EXPERT == 1)) || (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 1 && MOE_SHARED_EXPERT == 1)))) // moe-select
-static_assert(!((MOE_RANKS_LL) == (8)), "parametric guard: comparison ==");
 static_assert(((MOE_MAX_ROWS_LL / 128)) > (0), "parametric guard: comparison >");
 static_assert(((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 128) - 1) / 128) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + (MOE_MAX_ROWS_LL / 128))) < (16777216), "parametric guard: comparison <");
 #elif MOE_SW_WIDE_RANKS == 1 // moe-select
-static_assert(!((MOE_RANKS_LL) == (8)), "parametric guard: comparison ==");
 static_assert(((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 128) - 1) / 128) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + 0)) < (16777216), "parametric guard: comparison <");
 #elif ((MOE_INSTANCE == 0 && MOE_SHARED_EXPERT == 1) || (MOE_INSTANCE == 2 && MOE_SHARED_EXPERT == 1)) // moe-select
-static_assert(!((MOE_RANKS_LL) == (8)), "parametric guard: comparison ==");
 static_assert(((MOE_MAX_ROWS_LL / 128)) > (0), "parametric guard: comparison >");
-#elif (MOE_INSTANCE == 0 || MOE_INSTANCE == 2) // moe-select
-static_assert(!((MOE_RANKS_LL) == (8)), "parametric guard: comparison ==");
 #elif MOE_SHARED_EXPERT == 1 // moe-select
 static_assert(((MOE_MAX_ROWS_LL / 64)) > (0), "parametric guard: comparison >");
 #else // moe-select
