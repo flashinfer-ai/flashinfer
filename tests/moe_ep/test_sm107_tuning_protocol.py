@@ -18,6 +18,9 @@ from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
     tuning_protocol,
 )
 from tests.moe_ep.test_sm107_block_scaled_config import _BACKENDS
+from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_state import (
+    AutoTuningState,
+)
 
 
 @pytest.mark.parametrize("config_cls,backend_cls,name", _BACKENDS)
@@ -63,7 +66,10 @@ def state(monkeypatch, tmp_path):
         world_size=1,
     )
     workspace = SimpleNamespace(
-        config=cfg, staged_tokens=lambda: 4, install_tuned_knobs=Mock()
+        config=cfg,
+        staged_tokens=lambda: 4,
+        install_tuned_knobs=Mock(),
+        _tuning_state=AutoTuningState(),
     )
     sweep = Mock(return_value=({"fc2_use_bulk": False}, 1.0, 1))
     monkeypatch.setattr(native, "_sweep_sm107_block_scaled_mega_moe", sweep)
@@ -213,7 +219,7 @@ def test_native_import_and_explicit_search(state):
     state.sweep.assert_not_called()
     assert state.tuner.get_protocol_records(tuning_protocol.NAMESPACE)
     # A search that leaves the source workspace unchanged can run after capture.
-    state.workspace._autotune_graph_captured = True
+    state.workspace._tuning_state.graph_captured = True
     for _ in range(2):
         assert native.autotune_sm107_block_scaled_mega_moe(
             None, None, None, state.workspace, candidates=[{"fc2_use_bulk": False}]
@@ -331,7 +337,6 @@ def test_automatic_workspace_returns_to_initial_knobs(
     state, monkeypatch, tmp_path, fallback
 ):
     from flashinfer.moe_ep.backends.mega.kernel.sm107 import automatic
-    from flashinfer.moe_ep.core.kernel.base import MegaKernelBackend
     from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
 
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
@@ -345,12 +350,12 @@ def test_automatic_workspace_returns_to_initial_knobs(
     workspace.config = dataclasses.replace(workspace.config, fc2_use_bulk=True)
 
     def select():
-        automatic.maybe_tune(backend, workspace, (None, None), None, 4)
+        automatic.prepare_auto_configuration(backend, workspace, (None, None), None, 4)
 
     with autotune_v2():
         select()
-    assert workspace._autotune_winner == {"fc2_use_bulk": False}
-    assert MegaKernelBackend.get_tuned_knobs(backend) == workspace._autotune_winner
+    assert workspace._tuning_state.winner == {"fc2_use_bulk": False}
+    assert automatic.get_tuned_knobs(workspace) == workspace._tuning_state.winner
     options = (
         {"cache_root": str(tmp_path / "empty")}
         if fallback == "empty_store"
@@ -359,23 +364,23 @@ def test_automatic_workspace_returns_to_initial_knobs(
     with autotune_v2(mode="replay", **options):
         select()
         assert (
-            workspace._autotune_cache_identity
+            workspace._tuning_state.cache_identity
             == automatic.tuning_context().cache_identity
         )
-    assert workspace._autotune_winner is None
+    assert workspace._tuning_state.winner is None
     with pytest.raises(RuntimeError, match="no completed automatic tuning result"):
-        MegaKernelBackend.get_tuned_knobs(backend)
-    assert workspace._autotune_tuned_identity is None
-    initial = workspace._autotune_initial_knobs
+        automatic.get_tuned_knobs(workspace)
+    assert workspace._tuning_state.tuned_identity is None
+    initial = workspace._tuning_state.initial_knobs
     assert initial["fc2_use_bulk"] is True
     workspace.install_tuned_knobs.assert_called_with(initial, None, None)
     with autotune_v2(mode="replay"):
         select()
-    assert workspace._autotune_winner == {"fc2_use_bulk": False}
-    assert MegaKernelBackend.get_tuned_knobs(backend) == workspace._autotune_winner
+    assert workspace._tuning_state.winner == {"fc2_use_bulk": False}
+    assert automatic.get_tuned_knobs(workspace) == workspace._tuning_state.winner
     state.sweep.assert_called_once()
     if fallback == "skip_ops":
-        workspace._autotune_graph_captured = True
+        workspace._tuning_state.graph_captured = True
         with (
             autotune_v2(skip_ops={tuning_protocol.NAMESPACE}),
             pytest.raises(RuntimeError, match="skip_ops requires fallback"),
@@ -394,18 +399,81 @@ def test_capture_cannot_accept_a_cache_change_without_selection(state, monkeypat
         ep_comm_group=None,
     )
     workspace = state.workspace
-    automatic.maybe_tune(backend, workspace, (None, None), None, 4)
-    previous = workspace._autotune_cache_identity
+    automatic.prepare_auto_configuration(backend, workspace, (None, None), None, 4)
+    previous = workspace._tuning_state.cache_identity
     state.tuner.clear_cache()
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     with pytest.raises(RuntimeError, match="Warm up Rubin automatic selection"):
-        automatic.needs_replacement(backend, workspace)
+        automatic.coordinate_workspace_replacement(backend, workspace)
     # Explicit handles stay pinned and cannot claim a lookup from the new store.
-    workspace._autotune_graph_captured = True
-    automatic.maybe_tune(backend, workspace, (None, None), None, 4)
-    assert workspace._autotune_cache_identity == previous
+    workspace._tuning_state.graph_captured = True
+    automatic.prepare_auto_configuration(backend, workspace, (None, None), None, 4)
+    assert workspace._tuning_state.cache_identity == previous
     state.sweep.assert_not_called()
+
+
+@pytest.mark.parametrize("change", ["store", "policy"])
+def test_replay_winner_invalidates_previous_tuning_identity(
+    state, monkeypatch, tmp_path, change
+):
+    from flashinfer.autotune_cache import MeasurementPolicy
+    from flashinfer.moe_ep.backends.mega.kernel.sm107 import automatic
+    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
+    monkeypatch.setattr(
+        package,
+        "sm107_candidates",
+        lambda *a, **k: [{"fc2_use_bulk": False}, {"fc2_use_bulk": True}],
+    )
+    backend = SimpleNamespace(
+        _kernel_config=SimpleNamespace(knobs="auto", in_kernel_fc2_reduce=False),
+        ep_world_size=1,
+        ep_comm_group=None,
+    )
+    first = state.workspace
+    second = SimpleNamespace(
+        config=first.config,
+        staged_tokens=lambda: 4,
+        _tuning_state=AutoTuningState(),
+    )
+    for workspace in (first, second):
+
+        def install(knobs, *weights, workspace=workspace):
+            workspace.config = dataclasses.replace(workspace.config, **knobs)
+
+        workspace.install_tuned_knobs = Mock(side_effect=install)
+
+    def select(workspace):
+        automatic.prepare_auto_configuration(backend, workspace, (None, None), None, 4)
+
+    options = (
+        {"cache_root": tmp_path / "other"}
+        if change == "store"
+        else {"measurement_policy": MeasurementPolicy(execution_mode="eager")}
+    )
+    state.sweep.side_effect = [
+        ({"fc2_use_bulk": False}, 1.0, 1),
+        ({"fc2_use_bulk": True}, 1.0, 1),
+    ]
+    with autotune_v2():
+        select(first)
+    with autotune_v2(**options):
+        select(second)
+    with autotune_v2(mode="replay", **options):
+        select(first)
+        assert first.config.fc2_use_bulk is True
+    with autotune_v2():
+        # A captured workspace would need replacement for this same transition.
+        first._tuning_state.graph_captured = True
+        assert automatic.coordinate_workspace_replacement(backend, first)
+        first._tuning_state.graph_captured = False
+        select(first)
+        assert first.config.fc2_use_bulk is False
+        assert automatic.get_tuned_knobs(first) == {"fc2_use_bulk": False}
+        assert not automatic.needs_selection(first, automatic.tuning_context())
+    assert state.sweep.call_count == 2
 
 
 def test_invalid_cached_resources_are_a_miss_before_bucket_selection(
@@ -496,6 +564,7 @@ def _subgroup_worker(rank, rendezvous):
                     config=cfg,
                     staged_tokens=lambda: rank * 4,
                     install_tuned_knobs=Mock(),
+                    _tuning_state=AutoTuningState(),
                 )
                 protocol = tuning_protocol.RubinTuningProtocol(
                     None,
@@ -545,6 +614,30 @@ def _subgroup_worker(rank, rendezvous):
 
                 with pytest.raises(RuntimeError, match="candidate compilation failed"):
                     native._prepare_collectively(prepare, 2, group)
+
+                from flashinfer.moe_ep.backends.mega.kernel.sm107 import automatic
+
+                backend = SimpleNamespace(
+                    _kernel_config=SimpleNamespace(knobs="auto"),
+                    ep_world_size=2,
+                    ep_comm_group=group,
+                )
+                with autotune_v2(mode="replay", persistent_cache=False):
+                    workspace._tuning_state.graph_captured = True
+                    workspace._tuning_state.winner = {"fc2_use_bulk": False}
+                    workspace._tuning_state.cache_identity = (
+                        automatic.tuning_context().cache_identity
+                    )
+                    assert not automatic.coordinate_workspace_replacement(
+                        backend, workspace
+                    )
+                    # The settled peer must still participate after another
+                    # rank invalidates its process-local cache.
+                    if rank == 1:
+                        tuner.clear_cache()
+                    assert automatic.coordinate_workspace_replacement(
+                        backend, workspace
+                    )
             dist.barrier()
         finally:
             dist.destroy_process_group()

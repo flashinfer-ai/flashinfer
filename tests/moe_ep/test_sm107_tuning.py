@@ -179,7 +179,12 @@ def fake_trials(monkeypatch):
         fail = False
 
         def __init__(self, cfg):
+            from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_state import (
+                AutoTuningState,
+            )
+
             self.config = cfg
+            self._tuning_state = AutoTuningState()
             self.x = torch.zeros(4, 128, device="cuda")
             self.x_sf = torch.zeros(4, 4, device="cuda")
             self.topk_idx = torch.zeros(4, 2, device="cuda", dtype=torch.int32)

@@ -36,10 +36,12 @@ class MoEEpMegaWorkspace:
     """Capacity-profile handle owned by one MegaMoE layer.
 
     Create handles with :meth:`MoEEpMegaLayer.create_workspace`; do not
-    construct them directly. The selected workspace keeps stable addresses
-    until :meth:`destroy` or layer destruction. A stable returned-output
-    address additionally requires ``return_workspace_view=True`` on a backend
-    that supports output views.
+    construct them directly. Fixed workspaces keep stable addresses until
+    destruction. Automatic selection can replace output and scratch storage
+    before capture; reacquire output views after selection. Once captured, an
+    explicit handle keeps its configuration and addresses until destruction.
+    A stable returned-output address additionally requires
+    ``return_workspace_view=True`` on a backend that supports output views.
 
     Creation and destruction are EP collectives. Before destroying a handle,
     callers must synchronize all work and retire every CUDA graph that uses it.
@@ -230,6 +232,8 @@ class MoEEpMegaLayer(nn.Module):
         ``live_tokens=None`` selects full capacity, even when the layer has a
         different default tuning profile. Handles retain their compiled tactics
         and stable addresses.
+        Automatic handles do not accept ``live_tokens``; pass the intended
+        workload to ``warmup`` for automatic selection.
         Call collectively with matching arguments on all EP ranks before
         capture.
         """
@@ -255,6 +259,11 @@ class MoEEpMegaLayer(nn.Module):
         if live_tokens is not None and not self._kernel.supports_live_token_tuning:
             raise MoEEpConfigError("This backend does not support live-token tuning")
         automatic = automatic and knobs is None
+        if automatic and live_tokens is not None:
+            raise MoEEpConfigError(
+                "live_tokens selects an offline profile; automatic workspaces use "
+                "the batch passed to warmup() instead"
+            )
         profile_key = (max_tokens_per_rank, live_tokens)
         if not automatic and any(
             (handle.max_tokens_per_rank, handle.live_tokens) == profile_key
@@ -373,7 +382,11 @@ class MoEEpMegaLayer(nn.Module):
 
     @property
     def output_buffer(self) -> torch.Tensor:
-        """Stable zero-copy output owned by the default workspace."""
+        """Zero-copy output owned by the current default workspace.
+
+        Reacquire after automatic selection or default-workspace replacement.
+        Captured graphs keep writing to their original workspace's output.
+        """
         _, backend_workspace, kernel = self._resolve_workspace(None)
         return kernel.workspace_output(backend_workspace)
 
@@ -476,9 +489,13 @@ class MoEEpMegaLayer(nn.Module):
             _, warmed_workspace, _ = self._resolve_workspace(workspace)
             self._forward_signatures.pop(id(warmed_workspace), None)
 
-    def get_tuned_knobs(self) -> dict[str, Any]:
+    def get_tuned_knobs(
+        self, *, workspace: MoEEpMegaWorkspace | None = None
+    ) -> dict[str, Any]:
         """Return the selected knobs after a successful ``knobs="auto"`` warmup.
 
+        ``workspace=None`` selects the default workspace. Pass an explicit
+        handle to inspect that handle's result independently of other workspaces.
         The returned dictionary is a copy and can be passed as ``knobs`` when
         constructing a fixed layer with the same kernel configuration and
         capacity. This call does not allocate, tune or read a cache file.
@@ -486,7 +503,13 @@ class MoEEpMegaLayer(nn.Module):
         """
         if self._destroyed:
             raise MoEEpConfigError("MegaMoE layer has been destroyed")
-        return self._kernel.get_tuned_knobs()
+        handle = workspace if workspace is not None else self._default_workspace_handle
+        if handle is not None:
+            _, backend_workspace, kernel = self._resolve_workspace(handle)
+        else:
+            # Introspection must not trigger lazy workspace allocation.
+            backend_workspace, kernel = self._workspace, self._kernel
+        return kernel.get_tuned_knobs(backend_workspace)
 
     def _resolve_quantize_input(self, t: "MoEEpTensors") -> bool:
         if not self._mega_config.quantize_input:
@@ -574,7 +597,9 @@ class MoEEpMegaLayer(nn.Module):
         if backend_workspace is None:
             backend_workspace = self._ensure_workspace()
             validation_key = id(backend_workspace)
-        if workspace is None and kernel.needs_workspace_replacement(backend_workspace):
+        if workspace is None and kernel.coordinate_workspace_replacement(
+            backend_workspace
+        ):
             replacement = kernel.prepare_workspace(self._bootstrap, fleet_params)
             if self._default_workspace_handle is None:
                 self._retired_tuning_workspaces.append(backend_workspace)

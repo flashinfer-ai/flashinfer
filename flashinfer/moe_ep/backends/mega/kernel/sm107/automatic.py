@@ -1,9 +1,27 @@
 """Automatic tuning shared by the Rubin MegaMoE backend adapters."""
 
-from typing import Any
+from __future__ import annotations
+
+from copy import deepcopy
+from typing import TYPE_CHECKING, Any, TypeAlias
+
+if TYPE_CHECKING:
+    import torch
+
+    from flashinfer.autotuner import TuningContext
+    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.block_scaled import (
+        Sm107BlockScaledSymmBuffer,
+        TransformedBlockScaledWeights,
+    )
+    from .mxfp8_mxfp8_bf16_cutedsl.backend import Sm107Mxfp8BlockScaledMegaKernelBackend
+    from .nvfp4_nvfp4_bf16_cutedsl.backend import Sm107Nvfp4BlockScaledMegaKernelBackend
+
+    RubinBackend: TypeAlias = (
+        Sm107Mxfp8BlockScaledMegaKernelBackend | Sm107Nvfp4BlockScaledMegaKernelBackend
+    )
 
 
-def tuning_context():
+def tuning_context() -> TuningContext:
     from flashinfer.autotuner import AutoTuner
     from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
         NAMESPACE,
@@ -15,19 +33,21 @@ def tuning_context():
     return context
 
 
-def needs_selection(workspace, context):
-    if context.tuning_enabled:
-        return getattr(workspace, "_autotune_tuned_identity", None) != tuning_identity(
-            context
-        )
-    if getattr(workspace, "_autotune_cache_identity", None) != context.cache_identity:
+def needs_selection(
+    workspace: Sm107BlockScaledSymmBuffer, context: TuningContext
+) -> bool:
+    state = workspace._tuning_state
+    if state.cache_identity != context.cache_identity:
         return True
-    return getattr(workspace, "_autotune_winner", None) is None and getattr(
-        workspace, "_autotune_lookup_scope", None
-    ) != (context.scope, context.cache_identity)
+    if context.tuning_enabled:
+        return state.tuned_identity != tuning_identity(context)
+    return state.winner is None and state.lookup_scope != (
+        context.scope,
+        context.cache_identity,
+    )
 
 
-def tuning_identity(context):
+def tuning_identity(context: TuningContext) -> tuple:
     from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_measurement import (
         measurement_settings,
     )
@@ -35,33 +55,34 @@ def tuning_identity(context):
     return context.cache_identity, measurement_settings(context)
 
 
-def needs_replacement(backend, workspace):
+def coordinate_workspace_replacement(
+    backend: RubinBackend, workspace: Sm107BlockScaledSymmBuffer
+) -> bool:
+    """Agree on replacement before any rank allocates new symmetric storage."""
     import torch
 
     if backend._kernel_config.knobs != "auto":
         return False
     context = tuning_context()
+    state = workspace._tuning_state
     if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-        if (
-            getattr(workspace, "_autotune_cache_identity", None)
-            != context.cache_identity
-        ):
+        if state.cache_identity != context.cache_identity:
             raise RuntimeError(
                 "Warm up Rubin automatic selection after changing the cache "
                 "or measurement policy, before CUDA graph capture."
             )
         return False
-    if not getattr(workspace, "_autotune_graph_captured", False):
+    if not state.graph_captured:
         return False
     replace = needs_selection(workspace, context) and (
-        context.tuning_enabled
-        or getattr(workspace, "_autotune_cache_identity", None)
-        != context.cache_identity
+        context.tuning_enabled or state.cache_identity != context.cache_identity
     )
     if backend.ep_world_size > 1:
         import torch.distributed as dist
 
-        decisions = [None] * backend.ep_world_size
+        # A rank-local cache invalidation can require replacement on a peer.
+        # Even a locally settled workspace must participate in this decision.
+        decisions = [(False, False)] * backend.ep_world_size
         dist.all_gather_object(
             decisions, (context.tuning_enabled, replace), group=backend.ep_comm_group
         )
@@ -71,14 +92,31 @@ def needs_replacement(backend, workspace):
     return replace
 
 
-def maybe_tune(
-    backend: Any, workspace: Any, weights: Any, output: Any, num_tokens: int
+def get_tuned_knobs(workspace: Sm107BlockScaledSymmBuffer | None) -> dict[str, Any]:
+    if workspace is None or workspace._tuning_state.winner is None:
+        raise RuntimeError(
+            "MegaMoE has no completed automatic tuning result for this workspace; "
+            "warm it up with knobs='auto' in an autotune_v2() context first"
+        )
+    return deepcopy(workspace._tuning_state.winner)
+
+
+def prepare_auto_configuration(
+    backend: RubinBackend,
+    workspace: Sm107BlockScaledSymmBuffer,
+    weights: tuple[TransformedBlockScaledWeights, TransformedBlockScaledWeights],
+    output: torch.Tensor | None,
+    num_tokens: int,
 ) -> None:
+    """Select and install cached or tuned knobs, or restore the initial fallback.
+
+    Selection is collective across EP ranks and can replace scratch and output
+    storage before capture. Captured explicit workspaces retain their storage.
+    """
     if backend._kernel_config.knobs != "auto":
         return
     context = tuning_context()
     if not needs_selection(workspace, context):
-        backend._autotune_winner = getattr(workspace, "_autotune_winner", None)
         return
     from .....kernel_src.sm107.next_cutedsl_megamoe import (
         KNOB_KEYS,
@@ -87,10 +125,9 @@ def maybe_tune(
     )
 
     cfg = workspace.config
-    if not hasattr(workspace, "_autotune_initial_knobs"):
-        workspace._autotune_initial_knobs = {
-            name: getattr(cfg, name) for name in KNOB_KEYS
-        }
+    state = workspace._tuning_state
+    if state.initial_knobs is None:
+        state.initial_knobs = {name: getattr(cfg, name) for name in KNOB_KEYS}
     candidates = sm107_candidates(
         cfg.quant_kind,
         kernel_variant=cfg.kernel_variant,
@@ -109,15 +146,10 @@ def maybe_tune(
         install_winner=True,
         allow_nondeterministic=backend._kernel_config.in_kernel_fc2_reduce,
     )
-    if winner is not None:
-        workspace._autotune_winner = winner
-        if context.tuning_enabled:
-            workspace._autotune_tuned_identity = tuning_identity(context)
-    elif getattr(workspace, "_autotune_graph_captured", False):
+    if winner is None and state.graph_captured:
         # Captured explicit handles retain their prepared configuration.
-        backend._autotune_winner = getattr(workspace, "_autotune_winner", None)
         return
-    elif getattr(workspace, "_autotune_winner", None) is not None:
+    if winner is None and state.winner is not None:
         from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
             _prepare_collectively,
         )
@@ -125,12 +157,15 @@ def maybe_tune(
         # A miss in another store must not relabel the previous store's winner.
         _prepare_collectively(
             lambda: workspace.install_tuned_knobs(
-                workspace._autotune_initial_knobs, weights[0], weights[1]
+                state.initial_knobs, weights[0], weights[1]
             ),
             backend.ep_world_size,
             backend.ep_comm_group if backend.ep_world_size > 1 else None,
         )
-        workspace._autotune_winner = None
-        workspace._autotune_tuned_identity = None
-    workspace._autotune_cache_identity = context.cache_identity
-    backend._autotune_winner = getattr(workspace, "_autotune_winner", None)
+    state.record_selection(
+        winner,
+        context.cache_identity,
+        tuning_identity(context)
+        if winner is not None and context.tuning_enabled
+        else None,
+    )

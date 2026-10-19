@@ -326,7 +326,7 @@ def test_execution_uses_selected_backend_and_clears_destroyed_state(
         "compute_unfinalized",
         "set_compile_tokens_per_rank",
         "workspace_output",
-        "needs_workspace_replacement",
+        "coordinate_workspace_replacement",
     )
     for name in methods:
         monkeypatch.setattr(
@@ -337,7 +337,7 @@ def test_execution_uses_selected_backend_and_clears_destroyed_state(
                 handle._kernel,
                 name,
                 mock.Mock(return_value=False)
-                if name == "needs_workspace_replacement"
+                if name == "coordinate_workspace_replacement"
                 else mock.Mock(),
             )
 

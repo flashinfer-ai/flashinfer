@@ -116,6 +116,9 @@ matching measurement provenance; an older record without it triggers a search.
 Every selected winner is also written to the configured MegaMoE file, including on a
 FlashInfer cache hit. Disabling the MegaMoE file with
 `FLASHINFER_MOE_EP_KNOB_CACHE=off` does not disable FlashInfer's cache.
+The installed winner and its cache identity belong to the workspace. Returning
+to an earlier store or policy reselects from that store if a different winner
+has since been installed.
 
 Compatibility uses the existing MegaMoE backend revision, standard FlashInfer
 v2 environment metadata, and numerical, device and resource checks. Python
@@ -156,7 +159,8 @@ if tracing is unavailable on any rank, as in the framework's ordinary profiler.
 
 Tune before CUDA graph capture. Automatic workspaces are private to their
 layer. Winner installation retains staged inputs and transformed weights and
-replaces kernel scratch and compiled state. Once captured, a workspace cannot
+can replace output buffers, kernel scratch and compiled state. Reacquire borrowed
+output views after selection. Once captured, a workspace cannot
 install another winner. A later Python forward that needs selection replaces
 the default workspace before staging inputs and keeps the old storage alive
 until layer destruction. Existing graphs continue to use their original
@@ -164,6 +168,9 @@ workspace. The replacement shares transformed weights and needs its own graph
 capture. Tuning and graph replay must run sequentially.
 Repeated capture and replacement can retain more than two workspaces. Use
 explicit handles when old workspaces need to be released before layer destruction.
+For a captured default workspace, each subsequent Python forward coordinates
+replacement across the EP group, even when this rank needs no change. A peer
+may have invalidated its local cache. CUDA graph replay does not run this check.
 
 For explicit lifetime control, use `layer.create_workspace(capacity)` on an
 automatic layer. Each handle has independent storage and selection state, even
@@ -173,6 +180,11 @@ addresses after capture; later tuning requires another handle. Destroy a handle
 collectively only after retiring its referencing graphs and synchronizing all
 work that uses it. A store/policy switch or `autotune_v2_reload()` invalidates
 the automatic selection's local identity.
+Automatic handles reject the offline `live_tokens` profile hint. Their lookup
+uses the actual batch passed to warmup, taking the maximum live count across
+EP ranks. `layer.get_tuned_knobs(workspace=handle)` returns that handle's selected
+configuration; omitting `workspace` returns the default workspace's result.
+Neither getter allocates or performs selection.
 Warm up again before capture after changing the cache or measurement policy.
 If the new store has no compatible winner and tuning is disabled, an uncaptured
 workspace returns to its initial configuration instead of keeping the old

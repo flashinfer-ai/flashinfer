@@ -165,7 +165,7 @@ def test_rubin_auto_persistence_and_capture(
         tuner.clear_cache()
         with autotune(False):
             layer.forward(tensors)
-        assert getattr(layer._workspace, "_autotune_winner", None) is None and not calls
+        assert layer._workspace._tuning_state.winner is None and not calls
         workspace = layer._workspace
         buffers = {
             n: getattr(workspace, n).data_ptr()
@@ -189,10 +189,7 @@ def test_rubin_auto_persistence_and_capture(
 
         with tuning():
             layer.warmup(tensors)
-        assert (
-            len(calls) == 1
-            and getattr(layer._workspace, "_autotune_winner", None) is not None
-        )
+        assert len(calls) == 1 and layer._workspace._tuning_state.winner is not None
         assert all(getattr(workspace, n).data_ptr() == p for n, p in buffers.items())
         assert layer._workspace is not workspace
         assert workspace in layer._retired_tuning_workspaces
@@ -200,7 +197,7 @@ def test_rubin_auto_persistence_and_capture(
             getattr(layer._workspace, n).data_ptr() != p for n, p in buffers.items()
         )
         workspace = layer._workspace
-        assert layer.get_tuned_knobs() == workspace._autotune_winner
+        assert layer.get_tuned_knobs() == workspace._tuning_state.winner
         assert workspace.config.reduce_topk_in_kernel == ikr
 
         def reference():
@@ -230,7 +227,7 @@ def test_rubin_auto_persistence_and_capture(
                 iter(tuner.get_protocol_records(tuning_protocol.NAMESPACE).values())
             )
             alternative = next(
-                c for c in candidates if c != layer._workspace._autotune_winner
+                c for c in candidates if c != layer._workspace._tuning_state.winner
             )
             knob_cache.write_record(
                 {**record, "knobs": knob_cache._knobs_to_json(alternative)}
@@ -245,17 +242,17 @@ def test_rubin_auto_persistence_and_capture(
         layers.append(cached)
         with autotune(False):
             cached.warmup(tensors)
+        assert len(calls) == 1 and cached._workspace._tuning_state.winner is not None
         assert (
-            len(calls) == 1
-            and getattr(cached._workspace, "_autotune_winner", None) is not None
+            cached._workspace._tuning_state.winner
+            == layer._workspace._tuning_state.winner
         )
-        assert cached._workspace._autotune_winner == layer._workspace._autotune_winner
         if rank == 0:
             records = knob_cache._load_entries(str(native_path))
             assert len(records) == 1
             assert (
                 knob_cache._knobs_from_json(records[0]["knobs"])
-                == cached._workspace._autotune_winner
+                == cached._workspace._tuning_state.winner
             )
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -310,17 +307,20 @@ def test_rubin_auto_persistence_and_capture(
                 measurement_policy=policy,
             ):
                 layer.warmup(tensors)
-            assert layer._workspace._autotune_winner is None
+            assert layer._workspace._tuning_state.winner is None
             with pytest.raises(
                 RuntimeError, match="no completed automatic tuning result"
             ):
                 layer.get_tuned_knobs()
-            for name, value in layer._workspace._autotune_initial_knobs.items():
+            for name, value in layer._workspace._tuning_state.initial_knobs.items():
                 assert getattr(layer._workspace.config, name) == value
             assert_reference(layer.forward(tensors), reference(), kind)
         with tuning("replay"):
             layer.warmup(tensors)
-        assert layer._workspace._autotune_winner == cached._workspace._autotune_winner
+        assert (
+            layer._workspace._tuning_state.winner
+            == cached._workspace._tuning_state.winner
+        )
         assert len(calls) == 1
         with autotune_v2(
             cache_root=cache_root,
@@ -328,12 +328,12 @@ def test_rubin_auto_persistence_and_capture(
             skip_ops={tuning_protocol.NAMESPACE},
         ):
             layer.warmup(tensors)
-            assert layer._workspace._autotune_winner is None
+            assert layer._workspace._tuning_state.winner is None
             with pytest.raises(
                 RuntimeError, match="no completed automatic tuning result"
             ):
                 layer.get_tuned_knobs()
-            for name, value in layer._workspace._autotune_initial_knobs.items():
+            for name, value in layer._workspace._tuning_state.initial_knobs.items():
                 assert getattr(layer._workspace.config, name) == value
         assert len(calls) == 1
         old_graph.replay()

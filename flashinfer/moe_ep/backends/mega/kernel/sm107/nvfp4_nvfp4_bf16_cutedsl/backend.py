@@ -35,6 +35,9 @@ from .weights import (
 
 if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
+    from ......kernel_src.sm107.next_cutedsl_megamoe.shim.block_scaled import (
+        Sm107BlockScaledSymmBuffer,
+    )
 
 
 @register_mega_kernel("sm107_nvfp4_nvfp4_bf16_cutedsl")
@@ -49,10 +52,19 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         super().__init__(config)
         self._kernel_config = config
 
-    def needs_workspace_replacement(self, workspace):
-        from ..automatic import needs_replacement
+    def coordinate_workspace_replacement(
+        self, workspace: Sm107BlockScaledSymmBuffer
+    ) -> bool:
+        from ..automatic import coordinate_workspace_replacement
 
-        return needs_replacement(self, workspace)
+        return coordinate_workspace_replacement(self, workspace)
+
+    def get_tuned_knobs(
+        self, workspace: Sm107BlockScaledSymmBuffer | None = None
+    ) -> dict[str, Any]:
+        from ..automatic import get_tuned_knobs
+
+        return get_tuned_knobs(workspace)
 
     @classmethod
     def kernel_name(cls) -> str:
@@ -321,9 +333,11 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
                     "compute() called before stage_inputs(); no token count is staged."
                 )
 
-        from ..automatic import maybe_tune
+        from ..automatic import prepare_auto_configuration
 
-        maybe_tune(self, workspace, transformed_weights, output, num_tokens)
+        prepare_auto_configuration(
+            self, workspace, transformed_weights, output, num_tokens
+        )
         view = sm107_block_scaled_mega_moe(
             output,
             transformed_weights[0],

@@ -1000,6 +1000,13 @@ def test_auto_handles_and_default_replacement_retain_old_storage():
     layer, transformed, _ = _make_layer()
     layer._megakernel_config = SimpleNamespace(knobs="auto")
     layer._kernel.supports_auto_workspaces = True
+    layer._kernel.supports_live_token_tuning = True
+    with (
+        mock.patch.object(layer._kernel, "prepare_workspace") as allocate,
+        pytest.raises(ValueError, match="live_tokens selects an offline profile"),
+    ):
+        layer.create_workspace(64, live_tokens=8)
+    allocate.assert_not_called()
     first, first_raw, _, _ = _create_workspace(layer, 64)
     second, second_raw, _, _ = _create_workspace(layer, 64)
     assert first_raw is not second_raw
@@ -1010,7 +1017,7 @@ def test_auto_handles_and_default_replacement_retain_old_storage():
     with (
         mock.patch.object(layer._kernel, "validate_forward"),
         mock.patch.object(
-            layer._kernel, "needs_workspace_replacement", return_value=True
+            layer._kernel, "coordinate_workspace_replacement", return_value=True
         ),
         mock.patch.object(layer._kernel, "prepare_workspace", return_value=replacement),
         mock.patch.object(layer._kernel, "destroy") as destroy,
@@ -1038,7 +1045,7 @@ def test_default_replacement_keeps_implicit_workspace_until_layer_destroy(dummy_
     with (
         mock.patch.object(layer._kernel, "validate_forward"),
         mock.patch.object(
-            layer._kernel, "needs_workspace_replacement", return_value=True
+            layer._kernel, "coordinate_workspace_replacement", return_value=True
         ),
         mock.patch.object(layer._kernel, "prepare_workspace", return_value=replacement),
         mock.patch.object(layer._kernel, "destroy") as destroy,

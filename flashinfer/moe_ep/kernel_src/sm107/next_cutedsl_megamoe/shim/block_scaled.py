@@ -36,6 +36,7 @@ from flashinfer.moe_ep._compat import deprecated_aliases
 from . import comm
 from .dependencies import require_sm107_dsl
 from .kernel_helpers import Mxfp8BlockSize, Nvfp4BlockSize, swizzled_flat_sf_size
+from .tuning_state import AutoTuningState
 
 Sm107QuantKind = Literal["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
 Sm107TokenBackMode = Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
@@ -517,6 +518,7 @@ class Sm107BlockScaledSymmBuffer:
         self._allocate_execution_state()
         self._staged_tokens: Optional[int] = None
         self._destroyed = False
+        self._tuning_state = AutoTuningState()
 
     def _allocate_execution_state(self) -> None:
         cfg, kernel = self.config, self.kernel
@@ -804,7 +806,7 @@ class Sm107BlockScaledSymmBuffer:
     ) -> None:
         """Compile on first use, then launch the fused mega kernel."""
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            self._autotune_graph_captured = True
+            self._tuning_state.graph_captured = True
         self.prepare(transformed_l1, transformed_l2)
         if self.config.reduce_topk_in_kernel:
             # red.add accumulation base: zero the output every launch.
@@ -838,12 +840,17 @@ class Sm107BlockScaledSymmBuffer:
         self.shared_workspace = None
         self.local_workspace = None
 
-    def install_tuned_knobs(self, knobs, transformed_l1, transformed_l2) -> None:
-        """Replace kernel scratch before capture, retaining staged inputs."""
+    def install_tuned_knobs(
+        self,
+        knobs: dict[str, Any],
+        transformed_l1: TransformedBlockScaledWeights,
+        transformed_l2: TransformedBlockScaledWeights,
+    ) -> None:
+        """Replace output and scratch before capture, retaining staged inputs."""
         import dataclasses
 
         comm.ensure_not_capturing("SM107 tuning winner installation")
-        if self._destroyed or getattr(self, "_autotune_graph_captured", False):
+        if self._destroyed or self._tuning_state.graph_captured:
             raise RuntimeError("cannot tune a destroyed or captured SM107 workspace")
         config = dataclasses.replace(self.config, **knobs)
         if config != self.config:

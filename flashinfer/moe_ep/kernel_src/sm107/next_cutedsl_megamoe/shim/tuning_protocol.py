@@ -7,6 +7,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+from typing import TYPE_CHECKING, Any
 
 from flashinfer.autotuner import TuningContext, TuningResult
 from flashinfer.jit.core import logger
@@ -20,8 +21,13 @@ from .autotune import (
 )
 from .tuning_measurement import measurement_settings
 
+if TYPE_CHECKING:
+    import torch
+    from torch.distributed import ProcessGroup
+
+    from .block_scaled import Sm107BlockScaledSymmBuffer, TransformedBlockScaledWeights
+
 NAMESPACE = "moe_ep.sm107.cutedsl.native.v1"
-_UNCHECKED = object()
 
 
 def validate_context(context: TuningContext) -> None:
@@ -41,19 +47,19 @@ class RubinTuningProtocol:
 
     def __init__(
         self,
-        y,
-        l1,
-        l2,
-        workspace,
+        y: torch.Tensor | None,
+        l1: TransformedBlockScaledWeights,
+        l2: TransformedBlockScaledWeights,
+        workspace: Sm107BlockScaledSymmBuffer,
         *,
-        num_tokens=None,
-        candidates=None,
-        warmup_iters=3,
-        timed_iters=10,
-        process_group=None,
-        install_winner=False,
-        allow_nondeterministic=None,
-    ):
+        num_tokens: int | None = None,
+        candidates: list[dict[str, Any]] | None = None,
+        warmup_iters: int = 3,
+        timed_iters: int = 10,
+        process_group: ProcessGroup | None = None,
+        install_winner: bool = False,
+        allow_nondeterministic: bool | None = None,
+    ) -> None:
         self.y, self.l1, self.l2 = y, l1, l2
         self.workspace = workspace
         self.cfg = workspace.config
@@ -190,6 +196,7 @@ class RubinTuningProtocol:
 
         validate_context(context)
         workspace, cfg = self.workspace, self.cfg
+        state = workspace._tuning_state
         policy = context.measurement_policy
         policy_fields = policy.manifest_fields() if policy is not None else {}
         measurement = measurement_settings(context)
@@ -198,23 +205,21 @@ class RubinTuningProtocol:
         )
         if (
             context.skipped
-            and (capturing or getattr(workspace, "_autotune_graph_captured", False))
-            and getattr(workspace, "_autotune_winner", None) is not None
+            and (capturing or state.graph_captured)
+            and state.winner is not None
         ):
             raise RuntimeError(
                 "skip_ops requires fallback preparation before capture; "
                 "use a new workspace for a captured explicit handle."
             )
         if capturing:
-            workspace._autotune_graph_captured = True
+            state.graph_captured = True
             if context.tuning_enabled:
                 raise RuntimeError(
                     "Warm up pending Rubin autotuning before CUDA graph capture."
                 )
             return TuningResult(None)
-        if self.install_winner and getattr(
-            workspace, "_autotune_graph_captured", False
-        ):
+        if self.install_winner and state.graph_captured:
             if context.tuning_enabled:
                 raise RuntimeError(
                     "Rubin autotuning cannot replace a captured workspace; "
@@ -222,8 +227,7 @@ class RubinTuningProtocol:
                 )
             return TuningResult(None)
         if not context.tuning_enabled and (
-            getattr(workspace, "_autotune_lookup_scope", _UNCHECKED)
-            == (context.scope, context.cache_identity)
+            state.lookup_scope == (context.scope, context.cache_identity)
         ):
             return TuningResult(None)
         if cfg.world_size > 1 and (
@@ -256,7 +260,7 @@ class RubinTuningProtocol:
                 "EP ranks disagree on Rubin tuning geometry, candidates or controls"
             )
         if context.skipped:
-            workspace._autotune_lookup_scope = (context.scope, context.cache_identity)
+            state.lookup_scope = (context.scope, context.cache_identity)
             return TuningResult(None)
         counts = self._gather(self.num_tokens)
         if any(
@@ -298,7 +302,7 @@ class RubinTuningProtocol:
         cache_hit = record is not None
         if record is None:
             if not context.tuning_enabled:
-                workspace._autotune_lookup_scope = (
+                state.lookup_scope = (
                     context.scope,
                     context.cache_identity,
                 )
