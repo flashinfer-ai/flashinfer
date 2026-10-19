@@ -543,14 +543,18 @@ def _validate_device(device: torch.device) -> int:
 
 
 def _default_exp2_fma_pairs(device_index: int, cfg) -> int:
-    """FMA-pipe exp2 pairs per 16-pair softmax chunk on SM100 with 16-bit V.
+    """FMA-pipe exp2 pairs per 16-pair softmax chunk on SM100.
 
-    Measured on B200. The paired D128 dense path is MUFU bound and takes 4.
+    Measured on B200. The paired D128 dense path is MUFU bound: with 16-bit V
+    it takes 4, and with 8-bit V and P in SMEM, fixed-length plans take 3.
+    Packed and paged 8-bit plans spend the FMA pipe on their masks and take 0.
     Single-QKV dense takes 2. Causal is issue bound and takes 0. Callers can
     set cfg.exp2_fma_pairs to any value on any path."""
-    if torch.cuda.get_device_capability(device_index) != (10, 0):
+    if torch.cuda.get_device_capability(device_index) != (10, 0) or cfg.is_causal:
         return 0
-    if cfg.v_dtype.width != 16 or cfg.is_causal:
+    if cfg.v_dtype.width == 8:
+        return 0 if cfg.has_varlen or cfg.single_qkv_instance else 3
+    if cfg.v_dtype.width != 16:
         return 0
     if cfg.pv_half_overlap:
         return 4
