@@ -71,10 +71,10 @@ outcome on all of them instead of leaving the others blocked in a collective.
 Each caller passes a callback, `make_prop(handle_type)`, that returns the
 allocation properties and size for a handle type; `allocate_mnnvl_handles`
 calls it for each type it attempts, since the handle type is part of the
-properties. `SymmDeviceMemory` sizes its buffer
-there, including the multicast granularity. `MnnvlMemory` must place the
-allocation in its address reservation before the handle type is settled, so it
-sizes allocations with a granularity that fits both handle types.
+properties. `SymmDeviceMemory` sizes its buffer there, including the multicast
+granularity. `MnnvlMemory` must place the allocation in its address reservation
+before the handle type is settled, so it sizes allocations with a granularity
+that fits both handle types.
 
 ## `MnnvlMemory`
 
