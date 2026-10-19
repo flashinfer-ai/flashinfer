@@ -552,16 +552,24 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
       return optionsA.mTileN > optionsB.mTileN;
     }
 
-    // Tier 2+: When previous comparators are the same, and when the number of estimated CTAs is on
-    // the larger side, prefer persistent tile scheduler.
+    // Tier 2+: When previous comparators are the same, rank by tile scheduler.
+    // With more CTAs than SMs prefer StaticPersistent, whose grid is fixed by the SM count
+    // and whose work is sized on device, so a token dimension that is only a host-side upper bound
+    // costs no idle-CTA drain; only after prefer the dynamic Persistent scheduler.
+    // With fewer CTAs than SMs the static grid is cheapest.
     if (optionsA.mTileScheduler != optionsB.mTileScheduler) {
       auto options = bmm.getOptionsFromConfigAndData(configs[idx0], gemmData);
       auto numCtas = bmm.getNumCtas(options, gemmData.mProblemDimensions.mMaxNumCtasInTokenDim);
-      if (numCtas > multiProcessorCount) {
-        return optionsA.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
-      } else {
-        return optionsB.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
-      }
+      auto schedulerRank = [&](batchedGemm::gemm::TileScheduler scheduler) {
+        using batchedGemm::gemm::TileScheduler;
+        if (numCtas > multiProcessorCount) {
+          return scheduler == TileScheduler::StaticPersistent ? 0
+                 : scheduler == TileScheduler::Persistent     ? 1
+                                                              : 2;
+        }
+        return scheduler == TileScheduler::Static ? 0 : 1;
+      };
+      return schedulerRank(optionsA.mTileScheduler) < schedulerRank(optionsB.mTileScheduler);
     }
 
     return false;
