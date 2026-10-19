@@ -395,7 +395,11 @@ def topk_select_sm90(
 
 
 def _as_packed_kv(
-    k: torch.Tensor, v: torch.Tensor, head_dim: Optional[int] = None
+    k: torch.Tensor,
+    v: torch.Tensor,
+    head_dim: Optional[int] = None,
+    *,
+    require_dense: bool = False,
 ) -> torch.Tensor:
     """Recover the (num_pages, Hkv, page, 2*D) cache the SM90 decode kernel reads.
 
@@ -428,14 +432,23 @@ def _as_packed_kv(
             "(v must be the second half of k's last dim); separate allocations "
             "would need a full-cache copy per call"
         )
-    # Tokens inside a page must be 2*d apart: that spacing IS the interleaving
-    # the packed view relies on. The page stride is left free -- a per-layer
-    # cache is a view into a pool, so it is legitimately larger than dense.
+    # Cake reads the actual page/head strides, including views into pools.
+    # All routes still require K and V to be interleaved within each token.
     if k.stride(2) != 2 * d:
         raise NotImplementedError(
             f"SM90 MSA needs K and V interleaved per token (stride {2 * d} "
             f"between tokens of a page), got {k.stride(2)}"
         )
+    if require_dense:
+        # CuTe _views() reconstructs every stride from the shape and ignores
+        # the tensor's page/head strides, so its packed layout must be dense.
+        want = ((k.shape[1] * _BLK_KV * 2 * d), (_BLK_KV * 2 * d), (2 * d), 1)
+        got = tuple(k.stride())
+        if got != want:
+            raise NotImplementedError(
+                "SM90 MSA reads the paged cache with a dense packed layout; needs "
+                f"strides {want} for shape {tuple(k.shape)}, got {got}"
+            )
     # Preserve k's storage offset: a per-layer KV cache is a view into a pool, so
     # hardcoding 0 would silently read the wrong memory rather than fail.
     base = k.as_strided(
@@ -563,7 +576,7 @@ def sparse_prefill_sm90(
             f"SM90 MSA prefill indexes per-sequence metadata with a fixed extent "
             f"of {_MAX_BATCH} sequences, got {int(page_table.shape[0])}"
         )
-    kv = _as_packed_kv(k, v, q.shape[-1])
+    kv = _as_packed_kv(k, v, q.shape[-1], require_dense=True)
     q = _fold_scales(q, v_global_scale, softmax_scale, q.shape[-1])
     cu = cu_seqlens_q.to(torch.int32).contiguous()
     sk = seqused_k.to(torch.int32).contiguous()
