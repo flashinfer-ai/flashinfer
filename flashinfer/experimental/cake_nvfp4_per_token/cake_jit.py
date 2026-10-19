@@ -38,9 +38,10 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # exporter's closure digest of each architecture the program is built for
 # (SHA-256 over the exported translation units and the shared headers; the
 # JIT library of that architecture is named by its first 20 hex digits) and,
-# where a record differs from the family default, the digest of the program
-# whose kernel translation unit it builds (``kernel``; default: its own
-# ``<digest>_kernel.cu``) and its extra nvcc flags (``compile_flags``;
+# where a record differs from the family default, the digests of the programs
+# whose kernel and host binding translation units it builds (``kernel`` /
+# ``binding``; default: its own ``<digest>_kernel.cu`` and
+# ``<digest>_binding.cu``) and its extra nvcc flags (``compile_flags``;
 # default: none).  ``MODULES`` expands the rows into one record per module
 # name: ``sources`` (the kernel and host binding translation units under
 # ``csrc/``; one source pair serves every architecture in ``arches``, the
@@ -71,21 +72,25 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # ``DEFINITIONS`` maps a logical kernel key to the compile-line definitions
 # (``-D<name>=<value>``) its program is built with; keys absent from it build
 # with none.  ``ARG_PLANS``, the rows, the ``KERNELS`` tables and
-# ``DEFINITIONS`` are populated by the generated-program export; do not edit
-# them by hand.  Two hand-maintained exceptions, pending regeneration by the
-# export: a row whose kernel source is another record's translation unit (a
-# program that differs from it only by output dtype, TMA cache-hint
-# policies, raster group, quantizer CTA shape, folded output scale or store
-# policy) names that program in ``kernel`` and carries in ``compile_flags``
-# the knob values (``-DCAKE_<knob>=<value>``) and ``-DCAKE_PROGRAM_KERNEL`` /
-# ``-DCAKE_PROGRAM_SHIM`` naming its own kernel symbol and host-shim
-# namespace (the shared kernel source carries the matching guarded defaults
-# and ``#if`` arms); and the row form itself -- the named argument plans, the
-# sparse rows, the shared ``KERNELS`` table and the two builders -- is a hand
-# fold of the exported per-record literal.  The shared headers
-# ``csrc/cake_nvfp4_per_token/cake_nvfp4_per_token_device_common.cuh``
+# ``DEFINITIONS`` are populated by the generated-program export.  The rows
+# and the sources they name are exporter output hand-folded here pending
+# exporter support: a row whose kernel or host binding source is another
+# program's translation unit (a program that differs from it only by
+# output dtype, TMA cache-hint policies, raster group, quantizer CTA shape,
+# folded output scale or store policy, or only by its kernel symbol and
+# host-shim namespace) names that program in ``kernel`` / ``binding`` and
+# carries in ``compile_flags`` the knob values (``-DCAKE_<knob>=<value>``)
+# and ``-DCAKE_PROGRAM_KERNEL`` / ``-DCAKE_PROGRAM_SHIM`` naming its own
+# kernel symbol and host-shim namespace; every shared source carries
+# ``#ifndef`` defaults for the program it was exported for and ``#if``
+# arms for the knobs.  The row form itself -- the named argument plans,
+# the sparse rows, the shared ``KERNELS`` table and the two builders -- is
+# the same hand fold of the exported per-record literal.  The shared
+# headers ``csrc/cake_nvfp4_per_token/cake_nvfp4_per_token_device_common.cuh``
 # (device helpers) and ``cake_nvfp4_per_token_host_common.cuh`` (launch
-# helpers) are included by every program.
+# helpers and, included again from inside each GEMM binding's namespace,
+# the TMA descriptor encoders every GEMM binding carried) are included by
+# every program.
 ARG_PLANS: dict[str, list[list[str]]] = {
     "quant": [
         ["buffer", "x"],
@@ -165,8 +170,10 @@ _SOURCE_PREFIX = "cake_nvfp4_per_token/cake_nvfp4_per_token_"
 _PROGRAMS: dict[str, dict[str, Any]] = {
     "062311ac440fbaf37629": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_BLOCK=512u",
             "-DCAKE_Q_MIN_BLOCKS=1",
             "-DCAKE_Q_BPT=3",
             "-DCAKE_Q_WORDS=24",
@@ -189,6 +196,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "0d13de6f1682e55c1373": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_BPT=1",
             "-DCAKE_Q_WORDS=8",
@@ -211,6 +219,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "139c3fab2a0249e02c3e": {
         "kernel": "a6fc65c9fcae34137fec",
+        "binding": "a6fc65c9fcae34137fec",
         "compile_flags": [
             "-DCAKE_RASTER_GROUP=8",
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_139c3fab2a0249e02c3e",
@@ -297,8 +306,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "2126ed4021a5df3e8461": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_BLOCK=512u",
             "-DCAKE_Q_MIN_BLOCKS=1",
             "-DCAKE_Q_BPT=1",
             "-DCAKE_Q_WORDS=8",
@@ -348,6 +359,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "2e26ffc7ce8d8fa6f128": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_FOLD=1",
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_2e26ffc7ce8d8fa6f128",
@@ -381,6 +393,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "34e066f626b4be154822": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_MIN_BLOCKS=4",
             "-DCAKE_Q_BPT=1",
@@ -413,8 +426,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "3bebdf16f8b8ec303083": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_BLOCK=512u",
             "-DCAKE_Q_MIN_BLOCKS=1",
             "-DCAKE_Q_BPT=3",
             "-DCAKE_Q_WORDS=24",
@@ -431,8 +446,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "3c0a0335f02050ebb60e": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_BLOCK=512u",
             "-DCAKE_Q_MIN_BLOCKS=1",
             "-DCAKE_Q_BPT=1",
             "-DCAKE_Q_WORDS=8",
@@ -461,6 +478,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "455c60a5c10aa2bcece8": {
         "kernel": "18fd61a4a764c2d1ab3e",
+        "binding": "18fd61a4a764c2d1ab3e",
         "compile_flags": [
             "-DCAKE_RASTER_GROUP=16",
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_455c60a5c10aa2bcece8",
@@ -488,8 +506,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "48485b687a58cef62559": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_BLOCK=512u",
             "-DCAKE_Q_MIN_BLOCKS=2",
             "-DCAKE_Q_BPT=3",
             "-DCAKE_Q_WORDS=24",
@@ -506,8 +526,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "4a4ae65a3551bedbc110": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_BLOCK=512u",
             "-DCAKE_Q_MIN_BLOCKS=2",
             "-DCAKE_Q_BPT=3",
             "-DCAKE_Q_WORDS=24",
@@ -523,6 +545,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "4d85976d6c18ce148ca4": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_BPT=1",
             "-DCAKE_Q_WORDS=8",
@@ -537,6 +560,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "53e1454ac0d533cefcda": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_MIN_BLOCKS=1",
             "-DCAKE_Q_BPT=1",
@@ -565,6 +589,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "5872000a0bd8bd391059": {
         "kernel": "288adcab31da85191a26",
+        "binding": "288adcab31da85191a26",
         "compile_flags": [
             "-DCAKE_A_POLICY=0",
             "-DCAKE_B_POLICY=0x12F0000000000000ULL",
@@ -578,8 +603,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "58eeece815f48fd1d43a": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_BLOCK=512u",
             "-DCAKE_Q_MIN_BLOCKS=1",
             "-DCAKE_Q_BPT=1",
             "-DCAKE_Q_WORDS=8",
@@ -595,6 +622,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "5d8bea1558154053d314": {
         "kernel": "18fd61a4a764c2d1ab3e",
+        "binding": "18fd61a4a764c2d1ab3e",
         "compile_flags": [
             "-DCAKE_RASTER_GROUP=8",
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_5d8bea1558154053d314",
@@ -608,6 +636,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "64313df7982791417a2b": {
         "kernel": "18fd61a4a764c2d1ab3e",
+        "binding": "45fc8d20d916671c5f36",
         "compile_flags": [
             "-DCAKE_OUT_F16=1",
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_64313df7982791417a2b",
@@ -621,6 +650,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "6659f7757bcb7bae97b1": {
         "kernel": "a1674da021d7fdb5e3d0",
+        "binding": "1fa625dd627403d62d62",
         "compile_flags": [
             "-DCAKE_OUT_F16=1",
             "-DCAKE_A_POLICY=0",
@@ -648,6 +678,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "6717875e66a6fcec8341": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_BPT=7",
             "-DCAKE_Q_WORDS=56",
@@ -677,8 +708,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "684d5b4c9c173753e179": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_BLOCK=512u",
             "-DCAKE_Q_MIN_BLOCKS=1",
             "-DCAKE_Q_BPT=4",
             "-DCAKE_Q_WORDS=32",
@@ -694,6 +727,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "6864d70ab56de3ba8bfd": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_MIN_BLOCKS=4",
             "-DCAKE_Q_BPT=5",
@@ -711,8 +745,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "68ee524b89f5e289133c": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=128",
+            "-DCAKE_Q_BLOCK=128u",
             "-DCAKE_Q_MIN_BLOCKS=5",
             "-DCAKE_Q_BPT=8",
             "-DCAKE_Q_WORDS=64",
@@ -729,8 +765,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "69f8274b12662366ecb8": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_BLOCK=512u",
             "-DCAKE_Q_MIN_BLOCKS=1",
             "-DCAKE_Q_BPT=1",
             "-DCAKE_Q_WORDS=8",
@@ -754,6 +792,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "6fed99e520aa239db6c9": {
         "kernel": "a1674da021d7fdb5e3d0",
+        "binding": "a1674da021d7fdb5e3d0",
         "compile_flags": [
             "-DCAKE_RASTER_GROUP=8",
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_6fed99e520aa239db6c9",
@@ -767,6 +806,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "72a49b93eb629736017a": {
         "kernel": "a6fc65c9fcae34137fec",
+        "binding": "1de51aa8fd0339bfc55c",
         "compile_flags": [
             "-DCAKE_OUT_F16=1",
             "-DCAKE_RASTER_GROUP=8",
@@ -781,6 +821,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "75d30269a025a195653c": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_MIN_BLOCKS=4",
             "-DCAKE_Q_BPT=5",
@@ -797,8 +838,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "7652be76af016751909c": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_BLOCK=512u",
             "-DCAKE_Q_MIN_BLOCKS=1",
             "-DCAKE_Q_WARPS=16",
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_7652be76af016751909c",
@@ -812,6 +855,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "78452434e3ec2d8f5e13": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_MIN_BLOCKS=2",
             "-DCAKE_Q_BPT=4",
@@ -841,8 +885,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "7a07511bc4c0c0f06089": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_BLOCK=512u",
             "-DCAKE_Q_MIN_BLOCKS=2",
             "-DCAKE_Q_WARPS=16",
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_7a07511bc4c0c0f06089",
@@ -856,6 +902,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "7abdeaf1ad1dc7c64ef4": {
         "kernel": "dd3a532430c9f881f75d",
+        "binding": "dd3a532430c9f881f75d",
         "compile_flags": [
             "-DCAKE_RASTER_GROUP=8",
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_7abdeaf1ad1dc7c64ef4",
@@ -875,6 +922,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "83fec50b7af0311f8244": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_BPT=7",
             "-DCAKE_Q_WORDS=56",
@@ -890,8 +938,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "8499e042c80c6cf6a00f": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=128",
+            "-DCAKE_Q_BLOCK=128u",
             "-DCAKE_Q_MIN_BLOCKS=8",
             "-DCAKE_Q_BPT=4",
             "-DCAKE_Q_WORDS=32",
@@ -909,6 +959,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "8c27d1a9b8f95d84ea63": {
         "kernel": "a6fc65c9fcae34137fec",
+        "binding": "a6fc65c9fcae34137fec",
         "compile_flags": [
             "-DCAKE_A_POLICY=0",
             "-DCAKE_B_POLICY=0x12F0000000000000ULL",
@@ -923,6 +974,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "8c70d72aaecb580a5783": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_MIN_BLOCKS=4",
             "-DCAKE_STORE_EVICT_LAST=1",
@@ -937,6 +989,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "8cf7856e23c713904d31": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_MIN_BLOCKS=4",
             "-DCAKE_STORE_EVICT_LAST=1",
@@ -951,6 +1004,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "9069465975d6f1ca6311": {
         "kernel": "a6fc65c9fcae34137fec",
+        "binding": "1de51aa8fd0339bfc55c",
         "compile_flags": [
             "-DCAKE_OUT_F16=1",
             "-DCAKE_A_POLICY=0",
@@ -966,6 +1020,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "90f233fd2ad0ca2fdd38": {
         "kernel": "a1674da021d7fdb5e3d0",
+        "binding": "a1674da021d7fdb5e3d0",
         "compile_flags": [
             "-DCAKE_A_POLICY=0",
             "-DCAKE_B_POLICY=0x12F0000000000000ULL",
@@ -1000,6 +1055,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "942b39aa9ca66fb980e8": {
         "kernel": "07b0189c8953c02acff3",
+        "binding": "93b60320bbfa3449a921",
         "compile_flags": [
             "-DCAKE_OUT_F16=1",
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_942b39aa9ca66fb980e8",
@@ -1013,6 +1069,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "96e142849dcfaaf7c1a4": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_MIN_BLOCKS=4",
             "-DCAKE_Q_BPT=1",
@@ -1029,8 +1086,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "98778736f957e3baf9cd": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_BLOCK=512u",
             "-DCAKE_Q_MIN_BLOCKS=2",
             "-DCAKE_Q_BPT=4",
             "-DCAKE_Q_WORDS=32",
@@ -1047,8 +1106,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "98c1d7945ad0dcb98963": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=128",
+            "-DCAKE_Q_BLOCK=128u",
             "-DCAKE_Q_MIN_BLOCKS=8",
             "-DCAKE_Q_WARPS=4",
             "-DCAKE_FOLD=1",
@@ -1064,8 +1125,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "996c7fd21642f288f697": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=128",
+            "-DCAKE_Q_BLOCK=128u",
             "-DCAKE_Q_MIN_BLOCKS=5",
             "-DCAKE_Q_BPT=8",
             "-DCAKE_Q_WORDS=64",
@@ -1097,6 +1160,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "a6cf54d2fb100c00ad63": {
         "kernel": "18fd61a4a764c2d1ab3e",
+        "binding": "45fc8d20d916671c5f36",
         "compile_flags": [
             "-DCAKE_OUT_F16=1",
             "-DCAKE_RASTER_GROUP=8",
@@ -1118,6 +1182,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "aa069aa70914114fa1c5": {
         "kernel": "288adcab31da85191a26",
+        "binding": "1bc4fe20d5d1fa219ea4",
         "compile_flags": [
             "-DCAKE_OUT_F16=1",
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_aa069aa70914114fa1c5",
@@ -1130,6 +1195,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "aa08d05b7a61e9ea3498": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_MIN_BLOCKS=4",
             "-DCAKE_FOLD=1",
@@ -1145,6 +1211,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "aa2933408365d2cd4269": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_MIN_BLOCKS=4",
             "-DCAKE_Q_BPT=4",
@@ -1162,8 +1229,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "ab2e761d5b22bebc40e7": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_BLOCK=512u",
             "-DCAKE_Q_MIN_BLOCKS=2",
             "-DCAKE_Q_BPT=4",
             "-DCAKE_Q_WORDS=32",
@@ -1206,8 +1275,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "b6b2ef866ed5f8f91335": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=128",
+            "-DCAKE_Q_BLOCK=128u",
             "-DCAKE_Q_MIN_BLOCKS=8",
             "-DCAKE_Q_BPT=4",
             "-DCAKE_Q_WORDS=32",
@@ -1231,6 +1302,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "c253402ceb2f05cb709c": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_MIN_BLOCKS=2",
             "-DCAKE_Q_BPT=4",
@@ -1247,6 +1319,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "c5d78751c560c3d11f7c": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_MIN_BLOCKS=4",
             "-DCAKE_Q_BPT=4",
@@ -1287,6 +1360,11 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         },
     },
     "d0fe858e838021c309d5": {
+        "binding": "318ddeeecf4e9addca1e",
+        "compile_flags": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_d0fe858e838021c309d5",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_3aebf8f11c710b7c",
+        ],
         "arg_plan": "quant",
         "closure_sha256": {
             "sm_100a": "0d54304ad6ea34ffd42e224316171c379e364a5e474946dd6babdccd45c639d8",
@@ -1308,8 +1386,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "d4316f7bb385939a95f9": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_BLOCK=512u",
             "-DCAKE_Q_MIN_BLOCKS=1",
             "-DCAKE_Q_WARPS=16",
             "-DCAKE_FOLD=1",
@@ -1351,6 +1431,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "dcd89b2e097fbee53eb7": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_MIN_BLOCKS=1",
             "-DCAKE_Q_BPT=1",
@@ -1374,6 +1455,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "df3fe3e881a30df9d6c8": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_MIN_BLOCKS=4",
             "-DCAKE_FOLD=1",
@@ -1389,8 +1471,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "e101e3ffad576f12a678": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_BLOCK=512u",
             "-DCAKE_Q_MIN_BLOCKS=1",
             "-DCAKE_Q_BPT=4",
             "-DCAKE_Q_WORDS=32",
@@ -1407,6 +1491,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "e3cc580e3d59b4530e6c": {
         "kernel": "07b0189c8953c02acff3",
+        "binding": "07b0189c8953c02acff3",
         "compile_flags": [
             "-DCAKE_A_POLICY=0x12F0000000000000ULL",
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_e3cc580e3d59b4530e6c",
@@ -1439,6 +1524,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "e98c42f779ed53e68b30": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_FOLD=1",
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_e98c42f779ed53e68b30",
@@ -1466,6 +1552,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "f53911591c205d67bcce": {
         "kernel": "a1674da021d7fdb5e3d0",
+        "binding": "1fa625dd627403d62d62",
         "compile_flags": [
             "-DCAKE_OUT_F16=1",
             "-DCAKE_RASTER_GROUP=8",
@@ -1480,6 +1567,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "f7ff78ec5855b9b22ea7": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_f7ff78ec5855b9b22ea7",
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_a39c7e44083b7975",
@@ -1492,8 +1580,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "f876d047b54150469a71": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_BLOCK=512u",
             "-DCAKE_Q_MIN_BLOCKS=2",
             "-DCAKE_Q_WARPS=16",
             "-DCAKE_FOLD=1",
@@ -1508,8 +1598,10 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "fa93c77677bea4179924": {
         "kernel": "266051f22af995b10bc8",
+        "binding": "266051f22af995b10bc8",
         "compile_flags": [
             "-DCAKE_Q_THREADS=128",
+            "-DCAKE_Q_BLOCK=128u",
             "-DCAKE_Q_MIN_BLOCKS=8",
             "-DCAKE_Q_WARPS=4",
             "-DCAKE_STORE_EVICT_LAST=1",
@@ -1524,6 +1616,7 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "fbbc792eeaea807c03ac": {
         "kernel": "dd3a532430c9f881f75d",
+        "binding": "dd3a532430c9f881f75d",
         "compile_flags": [
             "-DCAKE_A_POLICY=0",
             "-DCAKE_B_POLICY=0x12F0000000000000ULL",
@@ -1707,7 +1800,7 @@ def _module(digest: str, row: dict[str, Any]) -> dict[str, Any]:
     return {
         "sources": [
             f"{_SOURCE_PREFIX}{row.get('kernel', digest)}_kernel.cu",
-            f"{_SOURCE_PREFIX}{digest}_binding.cu",
+            f"{_SOURCE_PREFIX}{row.get('binding', digest)}_binding.cu",
         ],
         "arches": [arch for arch, table in KERNELS.items() if name in table.values()],
         "compile_flags": list(row.get("compile_flags", ())),

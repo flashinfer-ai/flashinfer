@@ -333,7 +333,7 @@ _TMA_POLICY = {"L": "0x14F0000000000000ULL", "F": "0x12F0000000000000ULL", None:
 
 
 def _knobs_of_key(key):
-    """Knob values a shared kernel source must see for ``key`` (its name grammar)."""
+    """Knob values the shared sources must see for ``key`` (its name grammar)."""
     m = re.match(r"quant:t(\d+)_b(\d+)_mb(\d+)_(bf16|f16)(_fold)?(_sl)?", key)
     if m:
         threads, blocks, min_blocks = (int(g) for g in m.groups()[:3])
@@ -343,6 +343,7 @@ def _knobs_of_key(key):
             "CAKE_Q_BPT": str(blocks),
             "CAKE_Q_WORDS": str(8 * blocks),
             "CAKE_Q_WARPS": str(threads // 32),
+            "CAKE_Q_BLOCK": f"{threads}u",
             "CAKE_FOLD": "1" if m.group(5) else "0",
             "CAKE_STORE_EVICT_LAST": "1" if m.group(6) else "0",
         }
@@ -398,7 +399,10 @@ def test_shared_kernel_sources_keep_distinct_symbols_and_knobs():
             for f in record["compile_flags"]
             if f.startswith("-DCAKE_") and not f.startswith("-DCAKE_PROGRAM_")
         )
-        assert set(given) <= set(declared), (name, given, declared)
+        # CAKE_Q_BLOCK is the launch-block knob of the shared bf16 quantizer
+        # binding, not of the kernel source; its value must be the kernel's
+        # thread count with the unsigned suffix (pinned by _knobs_of_key).
+        assert set(given) <= set(declared) | {"CAKE_Q_BLOCK"}, (name, given, declared)
         effective = {**declared, **given}
         keys = {k for table in KERNELS.values() for k, n in table.items() if n == name}
         for key in keys if effective else ():
@@ -433,6 +437,99 @@ def test_generated_sources_are_declared_as_package_data():
         "csrc/cake_nvfp4_per_token/cake_nvfp4_per_token_host_common.cuh",
     }
     assert needed <= shipped, sorted(needed - shipped)
+
+
+_PROGRAM_SHIM_FLAG = "-DCAKE_PROGRAM_SHIM="
+_PROGRAM_SHIM_DEFAULT = re.compile(r"^#define CAKE_PROGRAM_SHIM (\w+)$", re.M)
+_PROGRAM_EXPORT_LINE = "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_PROGRAM_SHIM::Run);"
+_BINDING_NAMESPACE = re.compile(r"^namespace (\w+) \{$", re.M)
+
+
+def _check_conditions(text):
+    # The condition of every TVM_FFI_CHECK( in ``text`` as the preprocessor
+    # stringizes it: balanced parentheses, string literals skipped, multi-line.
+    conditions = []
+    for match in re.finditer(r"\bTVM_FFI_CHECK\(", text):
+        start = match.end()
+        depth, quoted, i = 1, False, start
+        while depth and i < len(text):
+            char = text[i]
+            if quoted:
+                if char == "\\":
+                    i += 1
+                elif char == '"':
+                    quoted = False
+            elif char == '"':
+                quoted = True
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            i += 1
+        assert depth == 0, text[start : start + 80]
+        conditions.append(text[start : i - 1])
+    return conditions
+
+
+def test_shared_binding_sources_keep_distinct_namespaces():
+    # Programs whose exported binding text differs only in the kernel symbol and
+    # the host-shim namespace (the bf16 quantizer: also in the CTA width) build
+    # one binding translation unit: the record whose source it is selects both
+    # through the file's defaults, every other record names its own on the
+    # compile line.  Every record must still export ``run`` from its own
+    # namespace, declare and launch its own kernel symbol, and give the binding
+    # only knob values its kernel source declares, plus the launch-block knob of
+    # the shared bf16 quantizer binding, which must spell the kernel's thread
+    # count.
+    csrc = Path(cb.__file__).resolve().parent / "csrc"
+    namespaces = {}
+    for name, record in MODULES.items():
+        binding_source = record["sources"][1]
+        assert binding_source.endswith("_binding.cu"), (name, binding_source)
+        text = (csrc / binding_source).read_text()
+        assert _BINDING_NAMESPACE.findall(text) == ["CAKE_PROGRAM_SHIM"], name
+        assert 'extern "C" __global__ void CAKE_PROGRAM_KERNEL(' in text, name
+        assert _PROGRAM_EXPORT_LINE in text, name
+        # TVM_FFI_CHECK stringizes its condition unexpanded: a kernel symbol in
+        # a check condition would be spelt as the macro name in the message.
+        for condition in _check_conditions(text):
+            assert "CAKE_PROGRAM_" not in condition, (name, condition)
+        shim_defaults = _PROGRAM_SHIM_DEFAULT.findall(text)
+        assert len(shim_defaults) == 1, (name, shim_defaults)
+        shim_flags = [
+            f for f in record["compile_flags"] if f.startswith(_PROGRAM_SHIM_FLAG)
+        ]
+        kernel_flags = [
+            f for f in record["compile_flags"] if f.startswith(_PROGRAM_KERNEL_FLAG)
+        ]
+        assert len(shim_flags) <= 1 and len(kernel_flags) <= 1, (name, record)
+        namespace = shim_flags[0][len(_PROGRAM_SHIM_FLAG) :] if shim_flags else None
+        if name in binding_source:
+            assert namespace in (None, shim_defaults[0]), (name, namespace)
+            namespace = shim_defaults[0]
+        else:
+            assert namespace is not None, (name, record["compile_flags"])
+            assert kernel_flags == [f"{_PROGRAM_KERNEL_FLAG}kernel_{name}"], name
+        assert re.fullmatch(r"cake_host_shim_[0-9a-f]{16}", namespace), name
+        namespaces[name] = namespace
+        kernel_text = (csrc / record["sources"][0]).read_text()
+        binding_knobs = {
+            knob: value
+            for knob, value in _KNOB_DEFAULT.findall(text)
+            if not knob.startswith("CAKE_PROGRAM_")
+        }
+        kernel_knobs = dict(_KNOB_DEFAULT.findall(kernel_text))
+        assert set(binding_knobs) <= set(kernel_knobs) | {"CAKE_Q_BLOCK"}, name
+        if "CAKE_Q_BLOCK" in binding_knobs:
+            given = dict(
+                f[2:].split("=", 1)
+                for f in record["compile_flags"]
+                if f.startswith("-DCAKE_Q_")
+            )
+            threads = given.get("CAKE_Q_THREADS", kernel_knobs["CAKE_Q_THREADS"])
+            block = given.get("CAKE_Q_BLOCK", binding_knobs["CAKE_Q_BLOCK"])
+            assert block == f"{threads}u", (name, block, threads)
+    assert len(set(namespaces.values())) == len(MODULES)
 
 
 # ---------------------------------------------------------------------------

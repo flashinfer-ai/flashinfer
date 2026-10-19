@@ -70,17 +70,21 @@ Generated sources live flat under `csrc/cake_nvfp4_per_token/` (architecture-neu
 `*_kernel.cu` / `*_binding.cu` sources whose per-architecture lowering is selected by
 `__CUDA_ARCH__` guards, plus the shared `*_common.cuh` headers) and are registered in
 `cake_jit.py` (`MODULES`, `KERNELS`) by the Cake generated-program export (see the
-two hand-maintained exceptions below).
+hand-fold note below).
 
-One hand-maintained exception, pending regeneration by the export: a program that
-differs from a sibling only by its output dtype, TMA cache-hint policies, raster group,
-quantizer CTA shape, folded output scale or store policy shares the sibling's kernel
-source and selects those values (`-DCAKE_*`) and its own kernel symbol
-(`-DCAKE_PROGRAM_KERNEL`) on the compile line; the shared kernel sources carry the
-matching guarded defaults and `#if` arms.
-
-The registry's row form is a second hand fold, also pending regeneration by the
-export: `cake_jit.py` keeps the exported per-program data as sparse `_PROGRAMS` rows,
-the four named argument plans of `ARG_PLANS` and one `KERNELS` table shared by both
-architectures plus the per-architecture additions, and expands them into `MODULES`
-and `KERNELS` at import.
+Hand-fold note: the kernel and binding sources under `csrc/` and the registry rows in
+`cake_jit.py` are exporter output hand-folded here pending exporter support. A program
+that differs from a sibling only by constant knobs (output dtype, TMA cache-hint
+policies, raster group, quantizer CTA shape, folded output scale, store policy) or only
+by its kernel symbol and host-shim namespace builds the sibling's translation unit,
+selected by its own `-D` flags (`-DCAKE_PROGRAM_KERNEL` / `-DCAKE_PROGRAM_SHIM` and the
+`-DCAKE_*` knob values; the `kernel` / `binding` row fields and `compile_flags` in
+`cake_jit.py`), and every shared source carries `#ifndef` defaults for the program it
+was exported for. The five TMA descriptor encoders every GEMM binding carried sit once
+per distinct text in `cake_nvfp4_per_token_host_common.cuh`, which each GEMM binding
+includes a second time from inside its namespace with `CAKE_TMA_A` / `_B` / `_SFA` /
+`_SFB` / `_OUT` selecting its variants, so the preprocessed binding is the exported
+text. The registry keeps the exported per-program data as sparse `_PROGRAMS` rows, the
+four named argument plans of `ARG_PLANS` and one `KERNELS` table shared by both
+architectures plus the per-architecture additions, and expands them into `MODULES` and
+`KERNELS` at import.
