@@ -123,6 +123,7 @@ class MsaSparseAttn:
         accs1,
         acc_o,
         l_i,
+        m_i,
         qpos,
         cbase,
         slog2,
@@ -152,7 +153,21 @@ class MsaSparseAttn:
                     acc_s.iterator + 2 * i,
                     cute.make_layout((2, PG // 8), stride=(1, 4)),
                 )
-                pv = cute.math.exp2(rs.load() * slog2, fastmath=True)
+                sv = rs.load() * slog2
+                # The tile max must be shared by the four lanes holding a row: the PV
+                # gemm sums their P into one output row, so a per-lane offset would
+                # scale parts of the same row differently.
+                tmax = sv.reduce(cute.ReductionOp.MAX, f32(-NEG), 0)
+                tmax = cute.arch.warp_reduction_max(tmax, threads_in_group=4)
+                mnew = cute.arch.fmax(m_i[i], tmax)
+                corr = cute.arch.exp2(m_i[i] - mnew)
+                l_i[i] = l_i[i] * corr
+                for jj in cutlass.range_constexpr(D // 8):
+                    e = 4 * jj + 2 * i
+                    acc_o[e] = (acc_o[e].to(f32) * corr).to(acc_o.element_type)
+                    acc_o[e + 1] = (acc_o[e + 1].to(f32) * corr).to(acc_o.element_type)
+                m_i[i] = mnew
+                pv = cute.math.exp2(sv - mnew, fastmath=True)
                 rs.store(pv)
                 l_i[i] = l_i[i] + pv.reduce(cute.ReductionOp.ADD, f32(0.0), 0)
 
@@ -395,8 +410,10 @@ class MsaSparseAttn:
         pv_mma.set(warpgroup.Field.ACCUMULATE, True)
 
         l_i = cute.make_rmem_tensor(cute.make_layout(2), f32)
+        m_i = cute.make_rmem_tensor(cute.make_layout(2), f32)
         for i in cutlass.range_constexpr(2):
             l_i[i] = f32(0.0)
+            m_i[i] = f32(-NEG)
 
         cbase = cutlass.Int32(2 * (lane % 4))
         slog2 = f32(self.scale_log2)
@@ -427,7 +444,20 @@ class MsaSparseAttn:
         cv8 = cute.make_rmem_tensor(cute.make_layout((1, 16, 1)), f8)
         cv16 = cute.make_rmem_tensor(cute.make_layout((1, 16)), f16)
         a1 = (tidx, mbar, tSrQ, tSrK, acc_s, srcT, dstT, cv8, cv16)
-        a2t = (pv_mma, meta, tOrV, acc_s, accs0, accs1, acc_o, l_i, qpos, cbase, slog2)
+        a2t = (
+            pv_mma,
+            meta,
+            tOrV,
+            acc_s,
+            accs0,
+            accs1,
+            acc_o,
+            l_i,
+            m_i,
+            qpos,
+            cbase,
+            slog2,
+        )
         a2b = (tidx, warp, srcT, dstT, cv8, cv16)
 
         # j runs to nblk-2, so block j+1 always exists: no predicate on the refills.
@@ -912,8 +942,10 @@ class MsaSparseAttnFp8:
         pv_mma.set(warpgroup.Field.ACCUMULATE, True)
 
         l_i = cute.make_rmem_tensor(cute.make_layout(2), f32)
+        m_i = cute.make_rmem_tensor(cute.make_layout(2), f32)
         for i in cutlass.range_constexpr(2):
             l_i[i] = f32(0.0)
+            m_i[i] = f32(-NEG)
 
         cbase = cutlass.Int32(2 * (lane % 4))
         slog2 = f32(self.scale_log2)
@@ -946,6 +978,7 @@ class MsaSparseAttnFp8:
             acc_s,
             acc_o,
             l_i,
+            m_i,
             qpos,
             cbase,
             slog2,
@@ -1007,6 +1040,7 @@ def _blk(
     acc_s,
     acc_o,
     l_i,
+    m_i,
     qpos,
     cbase,
     slog2,
@@ -1059,7 +1093,21 @@ def _blk(
             rs = cute.make_tensor(
                 acc_s.iterator + 2 * i, cute.make_layout((2, PG // 8), stride=(1, 4))
             )
-            pv = cute.math.exp2(rs.load() * slog2, fastmath=True)
+            sv = rs.load() * slog2
+            # The tile max must be shared by the four lanes holding a row: the PV
+            # gemm sums their P into one output row, so a per-lane offset would
+            # scale parts of the same row differently.
+            tmax = sv.reduce(cute.ReductionOp.MAX, f32(-NEG), 0)
+            tmax = cute.arch.warp_reduction_max(tmax, threads_in_group=4)
+            mnew = cute.arch.fmax(m_i[i], tmax)
+            corr = cute.arch.exp2(m_i[i] - mnew)
+            l_i[i] = l_i[i] * corr
+            for jj in cutlass.range_constexpr(D // 8):
+                e = 4 * jj + 2 * i
+                acc_o[e] = (acc_o[e].to(f32) * corr).to(acc_o.element_type)
+                acc_o[e + 1] = (acc_o[e + 1].to(f32) * corr).to(acc_o.element_type)
+            m_i[i] = mnew
+            pv = cute.math.exp2(sv - mnew, fastmath=True)
             rs.store(pv)
             l_i[i] = l_i[i] + pv.reduce(cute.ReductionOp.ADD, f32(0.0), 0)
 
@@ -1170,13 +1218,16 @@ def run(q, kv, q2k_indices, cu_seqlens_q, page_table, seqused_k, prefix_lens, ou
                     stream,
                 )
                 _CACHE[(hq, hkv)] = fn
-        plan = (fn, vshape, Tq, Npg, Nb, Mpg, kv.dtype, kv.device)
+        plan = (fn, vshape, Tq, Npg, Nb, Mpg)
         _PLAN[sig] = plan
-    fn, vshape, Tq, Npg, Nb, Mpg, dt, dev = plan
+    fn, vshape, Tq, Npg, Nb, Mpg = plan
     if vshape is None:
         fn(pq, pkv, pidx, pcu, ppt, ppfx, po, Tq, Npg, Nb, Mpg, stream)
     else:
-        vt = torch.empty(vshape, dtype=dt, device=dev)
+        # The plan is keyed on shapes alone, so the dtype and device of the
+        # first call must not be cached: the same shapes on a second GPU
+        # would otherwise allocate the transpose on the wrong device.
+        vt = torch.empty(vshape, dtype=kv.dtype, device=kv.device)
         fn(
             pq,
             pkv,
