@@ -1001,6 +1001,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         use_wfp4afp8_humming: bool = False,
         profile_ids: Optional[List[int]] = None,
         workspace_buffer: Optional[torch.Tensor] = None,
+        num_active_tokens: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
@@ -1103,6 +1104,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             input,
             token_selected_experts,
             token_final_scales,
+            num_active_tokens,
             fc1_expert_weights,
             fc1_expert_biases,
             fc2_expert_weights,
@@ -1181,6 +1183,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         use_wfp4afp8_humming: bool = False,
         profile_ids: Optional[List[int]] = None,
         workspace_buffer: Optional[torch.Tensor] = None,
+        num_active_tokens: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         seq_len = input.shape[0]
         hidden_size = fc2_expert_weights.shape[1]
@@ -1314,6 +1317,7 @@ def cutlass_fused_moe(
     situ_beta: Optional[torch.Tensor] = None,
     situ_linear_beta: Optional[torch.Tensor] = None,
     backend: str = "cutlass",
+    num_active_tokens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -1418,6 +1422,14 @@ def cutlass_fused_moe(
 
     output : Optional[torch.Tensor] = None
         The output tensor, if not provided, will be allocated internally.
+
+    num_active_tokens : Optional[torch.Tensor] = None
+        Device int32 scalar: the number of leading rows of ``input`` that hold tokens. Rows at or
+        beyond it are ignored by the expert routing (their ``token_selected_experts`` may be
+        stale) and are not written to ``output``, and the finalize runs a persistent grid sized
+        by the SM count instead of one block per row. Use it when a CUDA graph is captured over a
+        fixed-size buffer whose live prefix changes from step to step. ``None`` treats every row
+        as live. Not supported in ``min_latency_mode``.
 
     enable_alltoall : bool = False
         Whether to enable all-to-all communication for expert outputs. Defaults to False.
@@ -1610,6 +1622,13 @@ def cutlass_fused_moe(
             output, output_shape, output_dtype, input.device, "output"
         )
 
+    if num_active_tokens is not None:
+        if min_latency_mode:
+            raise ValueError("num_active_tokens is not supported in min_latency_mode")
+        check_shape_dtype_device(
+            num_active_tokens, (1,), torch.int32, input.device, "num_active_tokens"
+        )
+
     with torch.cuda.device(input.device):
         return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
             output,
@@ -1649,6 +1668,7 @@ def cutlass_fused_moe(
             use_wfp4afp8_humming=use_wfp4afp8_humming,
             profile_ids=profile_ids,
             workspace_buffer=workspace_buffer,
+            num_active_tokens=num_active_tokens,
         )
 
 

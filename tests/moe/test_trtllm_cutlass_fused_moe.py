@@ -4388,3 +4388,55 @@ def test_vectorized_kernel_rejects_misaligned_input():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("num_rows,num_active", [(128, 50), (512, 300)])
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_num_active_tokens(num_rows, num_active, output_dtype):
+    """Rows at or beyond ``num_active_tokens`` are ignored (stale routing ids included) and left
+    untouched in the output, while the live rows match the unbounded kernel. (128, 50) takes the
+    fused single-block prologue, (512, 300) the three-step one; fp32 output converts on store."""
+    torch.manual_seed(0)
+    hidden, inter, num_experts, top_k, ep_size, ep_rank = 256, 256, 8, 2, 2, 1
+    local = num_experts // ep_size  # experts [4, 8) are local on ep_rank 1
+    x = torch.randn(num_rows, hidden, dtype=torch.bfloat16, device="cuda") / 5
+    w31 = torch.randn(local, 2 * inter, hidden, dtype=torch.bfloat16, device="cuda") / 5
+    w2 = torch.randn(local, hidden, inter, dtype=torch.bfloat16, device="cuda") / 5
+    router_logits = torch.randn(
+        num_rows, num_experts, dtype=torch.float32, device="cuda"
+    )
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    selected_experts = selected_experts.to(torch.int32)
+    # Stale rows beyond the live prefix point at a local expert; they must not be read.
+    selected_experts[num_active:] = ep_rank * local
+    kwargs = dict(quant_scales=None, ep_size=ep_size, ep_rank=ep_rank)
+
+    reference = fused_moe.cutlass_fused_moe(
+        x[:num_active].contiguous(),
+        selected_experts[:num_active].contiguous(),
+        routing_weights[:num_active].contiguous(),
+        w31,
+        w2,
+        torch.bfloat16,
+        **kwargs,
+    )[0]
+
+    out = torch.full((num_rows, hidden), 7.0, dtype=output_dtype, device="cuda")
+    num_active_tokens = torch.tensor([num_active], dtype=torch.int32, device="cuda")
+    fused_moe.cutlass_fused_moe(
+        x,
+        selected_experts,
+        routing_weights,
+        w31,
+        w2,
+        output_dtype,
+        output=out,
+        num_active_tokens=num_active_tokens,
+        **kwargs,
+    )
+
+    torch.testing.assert_close(
+        out[:num_active].to(torch.bfloat16), reference, rtol=1e-2, atol=1e-2
+    )
+    assert torch.equal(out[num_active:], torch.full_like(out[num_active:], 7.0))
