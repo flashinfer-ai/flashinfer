@@ -2,19 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Loader of the standalone MoK CUDA libraries.
 
-``sources.json`` maps every kernel role to one or more variants.  A variant
-lists the exact targets it was generated for (``arches``), the argument plan of
-its entry (``arguments``) and the architecture-free stem of its library
-(``library``, ``cake_mok_<role>``).  ``build.json`` -- read by
-:mod:`cake_build` -- names the per-architecture build ``<library>_<arch>``
-(``cake_mok_<role>_<arch>``) and is the only record of what to compile
-(translation units, digests, nvcc flags).  Kernels whose generated code
-does not depend on the target share one variant, while kernels with
-target-specific schedules (for example the MXFP8 tile width, which follows the
-tensor-memory capacity) carry one variant per target group.  The variant is
-selected by the device compute capability; its library is the prebuilt one
-under ``aot/`` when the package ships it, else FlashInfer's JIT build of the
-``build.json`` entry.
+``sources.json`` maps every kernel role to one record: the targets it is
+generated for (``arches``), the argument names of its entry (``arguments``)
+and the architecture-free stem of its library (``library``,
+``cake_mok_<role>``).  ``build.json`` -- read by :mod:`cake_build` -- names
+the per-architecture build ``<library>_<arch>`` (``cake_mok_<role>_<arch>``)
+and is the only record of what to compile (translation units, digests, nvcc
+flags; kernels with target-specific schedules, for example the MXFP8 tile
+width that follows the tensor-memory capacity, list a different kernel source
+per target there).  The build is selected by the device compute capability;
+its library is the prebuilt one under ``aot/`` when the package ships it, else
+FlashInfer's JIT build of the ``build.json`` entry.
 """
 
 from __future__ import annotations
@@ -38,7 +36,7 @@ _TARGETS = {
 class _Kernel:
     def __init__(self, module, arguments):
         self._run = module.run
-        self._arguments = tuple(name for _, name in arguments)
+        self._arguments = tuple(arguments)
 
     def launch(self, *, grid, **arguments):
         arguments.update(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
@@ -64,14 +62,12 @@ def _registry():
 
 
 def variant(role, capability):
-    """The ``sources.json`` record of kernel ``role`` generated for a device of
-    ``capability``: ``{"arches": [...], "arguments": [[kind, name], ...],
-    "library": "cake_mok_<role>"}``."""
+    """The ``sources.json`` record of kernel ``role``, checked to be generated
+    for a device of ``capability``: ``{"library": "cake_mok_<role>",
+    "arches": [...], "arguments": [name, ...]}``."""
     arch = _target(capability)
-    record = next(
-        (v for v in _registry()[role]["variants"] if arch in v["arches"]), None
-    )
-    if record is None:
+    record = _registry()[role]
+    if arch not in record["arches"]:
         raise RuntimeError(f"MoK kernel {role!r} has no generated {arch} variant")
     return record
 
@@ -94,9 +90,3 @@ def load_kernel(role):
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Prepare the MoK backend before CUDA Graph capture")
     return _load(role, torch.cuda.current_device())
-
-
-def specs_for_arch(arch):
-    """JIT specs of every ``build.json`` entry of ``arch`` without a prebuilt library (the
-    ``flashinfer.jit.build_jit_specs`` warm-up)."""
-    return cake_build.jit_specs(arch)

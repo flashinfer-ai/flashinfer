@@ -206,13 +206,12 @@ def refs_moe_grouped_gemm(package_dir: Path, loader: str) -> set[str]:
 
 
 def refs_mok_bf16(package_dir: Path, loader: str) -> set[str]:
-    """``sources.json``: role -> variants[{arches, arguments, library}]."""
+    """``sources.json``: role -> {library, arches, arguments}."""
     registry = json.loads((package_dir / loader).read_text())
     return {
-        f"{variant['library']}_{arch}"
-        for role in registry.values()
-        for variant in role["variants"]
-        for arch in variant["arches"]
+        f"{record['library']}_{arch}"
+        for record in registry.values()
+        for arch in record["arches"]
     }
 
 

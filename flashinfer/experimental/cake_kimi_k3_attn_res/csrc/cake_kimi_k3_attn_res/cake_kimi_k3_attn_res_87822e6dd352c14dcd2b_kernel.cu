@@ -69,10 +69,14 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_TOTAL 129536
 #define THREADS 288
 #if __CUDA_ARCH__ == 1000
+#ifndef NUM_BLOCKS
 #define NUM_BLOCKS 7
+#endif
 #define DEFER_TMEM_STORE_WAIT 1
 #else
+#ifndef NUM_BLOCKS
 #define NUM_BLOCKS 2
+#endif
 #define DEFER_TMEM_STORE_WAIT 0
 #endif
 #define EARLY_CONSUMED_RELEASE 0
@@ -224,10 +228,18 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
     return __nv_bfloat162(raw);
 }
 
+// Shared by every record that names this translation unit in its sources: the record's
+// compile_flags may set NUM_BLOCKS (-DNUM_BLOCKS=<K>; the define above is guarded) and
+// rename the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>; every JIT library of
+// the family exports a distinct kernel); the defaults name this file's own program.
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_kimi_k3_attn_res_87822e6dd352c14dcd2b
+#endif
+
 extern "C" {
 
 __global__ __launch_bounds__(288, LAUNCH_MIN_BLOCKS) void
-kernel_cake_kimi_k3_attn_res_87822e6dd352c14dcd2b(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ prefix, __nv_bfloat16* __restrict__ delta, __nv_bfloat16* __restrict__ blocks, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ qk_weight, __nv_bfloat16* __restrict__ output_norm_weight, unsigned long long blocks_m_stride, unsigned long long blocks_k_stride, float eps, float output_norm_eps, int M)
+CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ prefix, __nv_bfloat16* __restrict__ delta, __nv_bfloat16* __restrict__ blocks, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ qk_weight, __nv_bfloat16* __restrict__ output_norm_weight, unsigned long long blocks_m_stride, unsigned long long blocks_k_stride, float eps, float output_norm_eps, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);

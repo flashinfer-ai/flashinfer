@@ -124,10 +124,13 @@ context-parallel window):
   needs `S_dst >= S`.
 * The kernel does not range-check `dkv_dst_map`: every value must lie in
   `[0, S_dst)` (the rows of `dkv_acc`), and a value outside that range would
-  add into memory outside the buffer.  Setting
-  `FLASHINFER_CAKE_DSA_CHECK_DST_MAP=1` validates the values on every call
-  (one device synchronization) and raises `ValueError` on a violation; leave
-  it unset in production.
+  add into memory outside the buffer.  The keyword `check_dst_map` of the
+  entry points (default `False`) validates the values on every call when
+  `True` (one device synchronization) and raises `ValueError` on a violation;
+  leave it off in production.  The backend reads no environment variable:
+  flashinfer's public wrapper `flashinfer.dsa_sparse_attention` maps
+  `FLASHINFER_CAKE_DSA_CHECK_DST_MAP` onto the keyword when the caller leaves
+  it at `None`.
 * With `dkv_acc` the backward returns `(dq_latent, dq_rope, None, None)`, the
   autograd wrapper returns `None` gradients for `kv_latent` / `k_rope`, and
   `dkv_fp32=True` is rejected.  The kernels' permuted FP32 accumulators remain
@@ -158,8 +161,11 @@ reduce-bound rows per tile, and only rows with many keys per query token pay
 it back (B200 backward: `S / T >= 16` 0.5-4 % faster, `S = T` 3.7 % slower), so
 the host takes the direct path by the size rule the record carries
 (`dkv_direct`: `min_keys_per_query`, 4 -- direct iff `S >= 4 T`) whenever
-`dkv_acc` is given; `FLASHINFER_CAKE_DSA_DKV_DIRECT=1` / `=0` forces or
-disables it (`auto` = the rule; the value is part of the binding key).  Both
+`dkv_acc` is given; the keyword `dkv_direct` of the entry points (default
+`None` = the rule) forces (`True`) or disables (`False`) it, and the resolved
+value is part of the binding key (flashinfer's public wrapper maps
+`FLASHINFER_CAKE_DSA_DKV_DIRECT=auto|1|0` onto the keyword when the caller
+leaves it at `None`).  Both
 paths add the same FP32 contributions into the same rows in another summation
 order; dq is bitwise the same.  Without the natural stages every `dkv_acc`
 call takes the cast's accumulate path.
@@ -171,9 +177,11 @@ resolved once per input geometry (shapes, strides, dtypes, device, alignment
 and the call options): the prepared runner carves its scratch from the
 workspace it is given; the eager entry points keep the resolved plans in a
 bounded, lock-protected cache (`BINDING_CACHE`, 64 entries by default,
-`FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY` sets the capacity, least
-recently used first out; a plan owns only the full-length `topk_length` vector it
-materializes when the caller passes none) and, per call, allocate the outputs
+`BINDING_CACHE.configure(capacity=...)` resizes it -- flashinfer's public
+wrapper applies `FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY` through it
+when that variable is set; least recently used first out; a plan owns only the
+full-length `topk_length` vector it materializes when the caller passes none)
+and, per call, allocate the outputs
 and the backward scratch from the caching allocator and launch the stages
 through the generated positional launchers of `cake_launch.py`.  During
 CUDA-graph capture the eager entry points plan privately and leave the cache
@@ -326,6 +334,9 @@ its compaction, each with its natural-layout direct-accumulation variant) and
 cast stages plus the key-range-pass and direct-accumulation policies, exported
 from the kernel snapshot named in the pull request.
 
-Tests: `tests/experimental/test_cake_dsa_train.py` (skips without a registered
-program or a compute capability 10.0 / 10.3 / 10.7 device).  Benchmark:
+Tests: `tests/experimental/test_cake_dsa_train.py` (the backend suite: imports
+only this package; skips without a registered program or a compute capability
+10.0 / 10.3 / 10.7 device) and `tests/experimental/test_cake_dsa_train_api.py`
+(the flashinfer public entry points and the environment variables the wrapper
+resolves into this package's keyword switches).  Benchmark:
 `benchmarks/bench_cake_dsa_train.py`.

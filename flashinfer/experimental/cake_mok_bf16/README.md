@@ -117,8 +117,8 @@ memory, not work.
 
 ## Targets
 
-`sources.json` lists every kernel role with the exact targets each variant
-was generated for, its argument plan and its architecture-free `library`
+`sources.json` lists every kernel role with the targets it is generated
+for, the argument names of its entry and its architecture-free `library`
 stem (`cake_mok_<role>`); `build.json` (schema `cake-build/1`) records the
 sources, digests and nvcc flags of every `<library>_<arch>` build
 (`cake_mok_<role>_<arch>`, for example `cake_mok_forward_sm_100a`), and the
@@ -126,9 +126,19 @@ shared `cake_build.py` loader loads it (prebuilt from `aot/`, else JIT).
 `jit.variant(role, capability)` returns the record selected by the device
 compute capability and `jit.library_name(role, capability)` the name of its
 `build.json` entry, a plain string like the other Cake loaders. The bindings include the
-package's `csrc/cake_ffi_checks.h`, no FlashInfer header. The BF16 kernels, scheduler, communication and
-epilogue sources are shared by SM100a, SM103a and SM107a. The MXFP8 fused
-kernels have target-specific schedules: SM100a/SM103a (512 tensor-memory
+package's `csrc/cake_ffi_checks.h`, no FlashInfer header. The fused bindings
+(`csrc/sm_100a/*_binding.cu`), the BF16 fused kernels (`csrc/sm_100a/*.cu`,
+which select the UMMA shared-memory descriptor address mask from
+`__CUDA_ARCH__`: 15 bits on SM107a, 14 bits otherwise) and the scheduler,
+communication and epilogue sources are shared by SM100a, SM103a and SM107a.
+Launchers of the same shape share one TU: the plain fused launcher also
+serves the `_clamped` kernel of its role, and `csrc/cake_mok_count_binding.cu`,
+`cake_mok_rows_binding.cu`, `cake_mok_pad_binding.cu`,
+`cake_mok_epilogue_2_binding.cu` and `cake_mok_epilogue_8_binding.cu` serve
+their kernel families; the entry's `nvcc_flags` name the kernel with
+`-DCAKE_MOK_KERNEL=<symbol>` (and the count/rows launch's dynamic shared
+memory with `-DCAKE_MOK_DYN_SMEM=<bytes>`).
+The MXFP8 fused kernels have target-specific schedules: SM100a/SM103a (512 tensor-memory
 columns) use 256 x 256 routed tiles with a six-stage operand ring, and SM107a
 (576 columns) uses 256 x 512 tiles that compute and save gate and up in one
 tile, with the K=64 block-scaled MMA. The adapter selects the variant from the
@@ -201,7 +211,10 @@ to recreate the workspace.
   (checkpoint) under an unconditional 44 / 36, which is why only imbalanced
   steps switch; with 4 ranks at 2.4x +0.8 % (one screening round). The MXFP8
   threshold sits between the measured 2.4x and 3.0x. No row elsewhere.
-  `CAKE_MOK_COMM_SPLIT_LOG=1` prints each split change per rank to stderr.
+  `MoKConfig.comm_split_log=True` (default `False`; `dataclasses.replace(config,
+  comm_split_log=True)` on the returned config) prints each split change per
+  rank to stderr; the `CAKE_MOK_COMM_SPLIT_LOG` environment variable that used
+  to select this no longer exists.
 - Fixed split per device and group size (`fwd_num_comm_sms="auto"` /
   `bwd_num_comm_sms="auto"`; the factory default stays 40 / 40): `"auto"` takes
   the measured row of `COMM_SMS` (compute capability, SM count, precision, EP
@@ -240,10 +253,16 @@ Single-GPU tests:
 
 Distributed tests (`torchrun --standalone --nproc-per-node=4 -m pytest ...`):
 `test_mok_bf16_distributed.py` (toy), `test_mok_bf16_unequal.py` (unequal and
-empty ranks, graph reuse), `test_mok_bf16_capacity.py` (API guards) and
+empty ranks, graph reuse), `test_mok_bf16_capacity.py` (adapter guards) and
 `test_mok_training_distributed.py` (clamped SwiGLU, recompute versus saved
 context, FP32 accumulation with BF16 and MXFP8 routed experts, and MXFP8
-over unequal ranks; 288 experts at EP8 or EP32). `test_mok_bf16_tolerance.py` checks the tolerance reporter. The
+over unequal ranks; 288 experts at EP8 or EP32). `test_mok_bf16_tolerance.py` checks the tolerance reporter.
+`test_mok_bf16.py`, `test_mok_mxfp8.py` and `test_mok_bf16_capacity.py` import the
+package only through `tests/test_helpers/cake_package.py`; the torchrun suites and
+`test_mok_bf16_tolerance.py` drive the `examples/mok_*.py` scripts, which use the
+`flashinfer.mok` wrapper;
+`test_mok_bf16_api.py` checks the `flashinfer.mok` wrapper itself (experimental
+marking, signatures, re-exports and argument forwarding). The
 runnable examples are `examples/mok_bf16_toy.py`,
 `examples/mok_bf16_unequal.py` and `examples/mok_training_features.py`.
 

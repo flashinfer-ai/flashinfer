@@ -29,7 +29,10 @@ Graph replay.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import multiprocessing as mp
+import re
 import socket
 import traceback
 
@@ -93,11 +96,17 @@ def test_registry_records_are_consistent() -> None:
                 record["pdl_trigger"]
                 == cake_jit.POLICY["merge_production"]["scorer_pdl_trigger"]
             )
+            block_q = 4 * int(record["query_len"])
+            assert f"-DBLOCK_Q={block_q}" in record["compile_flags"], name
+            assert f"-DCAKE_PROGRAM_KERNEL=kernel_{name}" in record["compile_flags"]
         else:
             assert int(record["world_size"]) in cake_backend.WORLD_SIZES
             assert 32 * int(record["warps"]) >= TOPK * int(record["world_size"])
             assert int(record["entries_per_thread"]) % 2 == 0
     for role, plan in cake_jit.ARG_PLANS.items():
+        # cake_backend._bind binds grid values and named buffers / parameters.
+        kinds = {kind for kind, _name in plan}
+        assert kinds <= {"buffer", "grid", "parameter", "tma_buffer"}, role
         names = [name for _kind, name in plan]
         assert names[-3:] == ["grid_x", "grid_y", "grid_z"], role
         assert len(set(names)) == len(names), role
@@ -113,6 +122,83 @@ def test_registry_records_are_consistent() -> None:
         "timeout_ns",
     ):
         assert required in merge_names, required
+
+
+def test_registry_tables_expand_to_the_pinned_records() -> None:
+    """The compact registry tables expand to exactly the exported record set.
+
+    ``cake_jit.PROGRAMS`` is built from one row per record plus the per-family
+    constants.  This digest of its canonical JSON pins the expanded dict (26
+    records: 12 scorers, 14 merges), so neither a row nor the expander can
+    drift silently.  After an intended registry change, recompute it as the
+    sha256 of ``json.dumps(PROGRAMS, sort_keys=True, separators=(",", ":"))``.
+    """
+    roles = [record["role"] for record in cake_jit.PROGRAMS.values()]
+    assert (roles.count("scorer"), roles.count("merge")) == (12, 14)
+    canonical = json.dumps(cake_jit.PROGRAMS, sort_keys=True, separators=(",", ":"))
+    assert (
+        hashlib.sha256(canonical.encode()).hexdigest()
+        == "fc9e6f6dda22b61dfea2aeeb60aaca59977398cf13fdfc9e61c894587c04ee8f"
+    )
+
+
+def test_scorer_records_share_one_kernel_text_per_rows_per_rank() -> None:
+    """Host-only: the 12 scorer records build three kernel texts.
+
+    Within a ``rows_per_rank`` family the exported scorer kernels differed only
+    in ``#define BLOCK_Q`` (``4 * query_len``) and in the kernel symbol, so
+    every record of a family names the family's kernel text and fixes both
+    through its ``compile_flags``: ``-DBLOCK_Q`` and ``-DCAKE_PROGRAM_KERNEL``
+    with the record's own symbol (all libraries load into one process, so no
+    two records may export one kernel symbol).  The shared text requires
+    exactly those two definitions (``#ifndef`` guards, no defaults), the
+    binding names the kernel through the same macro, and no generated source
+    is left unreferenced.
+    """
+    root = cake_jit._csrc_root()
+    guard = re.compile(r"^#ifndef (\w+)$", re.M)
+    kernels: dict[int, set[str]] = {}
+    symbols: dict[str, str] = {}
+    referenced: set[str] = set()
+    for name, record in cake_jit.PROGRAMS.items():
+        for source in record["sources"]:
+            assert (root / source).is_file(), source
+            referenced.add(source)
+        if record["role"] != "scorer":
+            continue
+        kernel, binding = record["sources"]
+        kernels.setdefault(int(record["rows_per_rank"]), set()).add(kernel)
+        defines = dict(
+            flag.removeprefix("-D").split("=", 1)
+            for flag in record["compile_flags"]
+            if flag.startswith("-D")
+        )
+        assert defines["BLOCK_Q"] == str(4 * int(record["query_len"])), name
+        symbol = defines["CAKE_PROGRAM_KERNEL"]
+        assert symbol == f"kernel_{name}", name
+        assert symbol not in symbols.values(), (name, symbol)
+        symbols[name] = symbol
+        kernel_text = (root / kernel).read_text()
+        assert set(guard.findall(kernel_text)) == {
+            "BLOCK_Q",
+            "CAKE_PROGRAM_KERNEL",
+        }, kernel
+        assert "#define BLOCK_Q" not in kernel_text, kernel
+        assert "\nCAKE_PROGRAM_KERNEL(" in kernel_text, kernel
+        binding_text = (root / binding).read_text()
+        assert "CAKE_PROGRAM_KERNEL" in guard.findall(binding_text), binding
+        assert "void CAKE_PROGRAM_KERNEL(" in binding_text, binding
+        assert "reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL)" in binding_text
+    assert sorted(kernels) == [32, 64, 128], sorted(kernels)
+    assert all(len(texts) == 1 for texts in kernels.values()), kernels
+    assert len({text for texts in kernels.values() for text in texts}) == 3, kernels
+    family = root / cake_jit.SOURCE_PACKAGE
+    orphans = sorted(
+        path.name
+        for path in family.glob("*.cu")
+        if f"{cake_jit.SOURCE_PACKAGE}/{path.name}" not in referenced
+    )
+    assert not orphans, orphans
 
 
 def test_pool_layout_and_merge_geometry_follow_the_policy() -> None:
@@ -167,6 +253,61 @@ def test_public_api_rejects_other_backends_before_touching_cuda() -> None:
         )
     with pytest.raises(TypeError):
         destroy_msa_icp_indexer_workspace(object())
+
+
+def test_shared_role_bindings_take_each_record_from_its_compile_flags() -> None:
+    """One host binding per role; each record selects itself through -D flags."""
+    root = cake_jit._csrc_root()
+    package = cake_jit.SOURCE_PACKAGE
+    binding_of_role = {
+        "scorer": f"{package}/{package}_a8101e4dbbf1639b3bbd_binding.cu",
+        "merge": f"{package}/{package}_6c9de96daa7d9ac678d6_binding.cu",
+    }
+    required: dict[str, set[str]] = {}
+    for role, relative in binding_of_role.items():
+        lines = (root / relative).read_text(encoding="utf-8").splitlines()
+        required[role] = {
+            line.split()[1]
+            for line, after in zip(lines, lines[1:], strict=False)
+            if line.startswith("#ifndef ") and after.startswith("#error ")
+        }
+        assert required[role], role
+        # TVM_FFI_CHECK stringizes its condition unexpanded; a macro there would
+        # change the failure message, so the shared bindings keep them out.
+        for line in lines:
+            if line.lstrip().startswith("TVM_FFI_CHECK("):
+                tokens = set(line.replace("(", " ").replace(",", " ").split())
+                assert not tokens & required[role], line
+    kernels: set[str] = set()
+    shims: set[str] = set()
+    for name, record in cake_jit.PROGRAMS.items():
+        role = record["role"]
+        assert record["sources"][1] == binding_of_role[role], name
+        defines = dict(
+            flag[2:].split("=", 1)
+            for flag in record["compile_flags"]
+            if flag.startswith("-D")
+        )
+        assert required[role] <= set(defines), (name, required[role] - set(defines))
+        assert defines["CAKE_PROGRAM_KERNEL"] == f"kernel_{name}", name
+        kernels.add(defines["CAKE_PROGRAM_KERNEL"])
+        shims.add(defines["CAKE_PROGRAM_SHIM"])
+        kernel_lines = (root / record["sources"][0]).read_text(encoding="utf-8")
+        kernel_defines = {
+            parts[1]: parts[2]
+            for parts in (line.split() for line in kernel_lines.splitlines())
+            if len(parts) == 3 and parts[0] == "#define"
+        }
+        smem = int(defines["CAKE_BIND_SMEM"])
+        assert smem == int(kernel_defines["SMEM_TOTAL"]), name
+        if role == "scorer":
+            assert int(defines["BLOCK_Q"]) == 4 * int(record["query_len"]), name
+            assert int(defines["CAKE_BIND_KBOX_ROWS"]) == int(record["rows_per_rank"])
+        else:
+            assert int(defines["CAKE_BIND_THREADS"]) == 32 * int(record["warps"]), name
+            assert int(defines["CAKE_BIND_THREADS"]) == int(kernel_defines["THREADS"])
+            assert int(defines["CAKE_BIND_WORLD"]) == int(record["world_size"]), name
+    assert len(kernels) == len(cake_jit.PROGRAMS) == len(shims)
 
 
 # ---------------------------------------------------------------------------
