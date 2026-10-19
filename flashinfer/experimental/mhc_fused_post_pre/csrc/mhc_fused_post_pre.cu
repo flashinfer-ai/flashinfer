@@ -34,7 +34,8 @@ namespace flashinfer {
 namespace mhc_fpp {
 namespace {
 
-// Status codes of mhc_fused_post_pre_run. Anything but kLaunched means nothing was enqueued
+// Status codes of mhc_fused_post_pre_run and mhc_fused_post_pre_check (for the latter
+// kLaunched means "would launch"). Anything but kLaunched means nothing was enqueued
 // and the caller keeps its own implementation. The order of the checks is semantics ->
 // shape/stride -> device, so every operand check runs on host tensors too.
 enum Status : int64_t {
@@ -173,6 +174,103 @@ bool overlaps(const TensorView& a, const TensorView& b) {
          b0 < a0 + static_cast<uintptr_t>(num_bytes(a));
 }
 
+// Operand checks shared by the launch and the inputs-only query. With `outputs` the checks
+// run in the launch's order (dtype -> shape -> layout -> aliasing -> device) and return its
+// status codes; without them only the inputs are checked.
+int64_t check_operands(const TensorView& x, const TensorView& residual,
+                       const TensorView& post_layer_mix, const TensorView& comb_res_mix,
+                       const TensorView& fn, const TensorView& hc_scale, const TensorView& hc_base,
+                       const TensorView& norm_weight,
+                       const std::array<const TensorView*, 4>* outputs) {
+  const TensorView* inputs[] = {&x,  &residual, &post_layer_mix, &comb_res_mix,
+                                &fn, &hc_scale, &hc_base,        &norm_weight};
+  // Semantics: dtypes.
+  for (const TensorView* t : {&x, &residual, &norm_weight}) {
+    if (t->dtype() != dl_bfloat16) return kBadDtype;
+  }
+  for (const TensorView* t : {&post_layer_mix, &comb_res_mix, &fn, &hc_scale, &hc_base}) {
+    if (t->dtype() != dl_float32) return kBadDtype;
+  }
+  if (outputs != nullptr) {
+    const auto& out = *outputs;  // residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
+    if (out[0]->dtype() != dl_bfloat16 || out[3]->dtype() != dl_bfloat16 ||
+        out[1]->dtype() != dl_float32 || out[2]->dtype() != dl_float32) {
+      return kBadDtype;
+    }
+  }
+  // Shapes: the kernels are compiled for H = 4096, four streams and 24 mixes, and derive
+  // every stride from these shapes.
+  if (x.ndim() != 2) return kBadShape;
+  const int64_t m = x.size(0);
+  if (m <= 0 || m > (int64_t{1} << 24)) return kBadShape;
+  if (!same_shape(x, {m, kHidden}) || !same_shape(residual, {m, kStreams, kHidden}) ||
+      !same_shape(post_layer_mix, {m, kStreams}) ||
+      !same_shape(comb_res_mix, {m, kStreams, kStreams}) ||
+      !same_shape(fn, {kMixWidth, kStreams * kHidden}) || !same_shape(hc_scale, {3}) ||
+      !same_shape(hc_base, {kMixWidth}) || !same_shape(norm_weight, {kHidden})) {
+    return kBadShape;
+  }
+  if (outputs != nullptr) {
+    const auto& out = *outputs;
+    if (!same_shape(*out[0], {m, kStreams, kHidden}) || !same_shape(*out[1], {m, kStreams}) ||
+        !same_shape(*out[2], {m, kStreams, kStreams}) || !same_shape(*out[3], {m, kHidden})) {
+      return kBadShape;
+    }
+  }
+  // Layout: dense row-major; TMA / bulk copies need 16-byte addresses, the fn slice loads
+  // are 32-byte vectors.
+  for (const TensorView* t : inputs) {
+    if (!t->IsContiguous()) return kNotContiguous;
+    if (address_of(*t) % 16 != 0) return kMisaligned;
+  }
+  if (outputs != nullptr) {
+    for (const TensorView* t : *outputs) {
+      if (!t->IsContiguous()) return kNotContiguous;
+      if (address_of(*t) % 16 != 0) return kMisaligned;
+    }
+  }
+  if (address_of(fn) % 32 != 0) return kMisaligned;
+  // Outputs are written while inputs are still being read: no aliasing.
+  if (outputs != nullptr) {
+    const auto& out = *outputs;
+    for (int i = 0; i < 4; ++i) {
+      for (const TensorView* t : inputs) {
+        if (overlaps(*out[i], *t)) return kOverlap;
+      }
+      for (int j = i + 1; j < 4; ++j) {
+        if (overlaps(*out[i], *out[j])) return kOverlap;
+      }
+    }
+  }
+  // Device last.
+  const DLDevice device = x.device();
+  if (device.device_type != kDLCUDA || device.device_id < 0 || device.device_id >= kMaxDevices) {
+    return kBadDevice;
+  }
+  for (const TensorView* t : inputs) {
+    if (t->device().device_type != kDLCUDA || t->device().device_id != device.device_id) {
+      return kBadDevice;
+    }
+  }
+  if (outputs != nullptr) {
+    for (const TensorView* t : *outputs) {
+      if (t->device().device_type != kDLCUDA || t->device().device_id != device.device_id) {
+        return kBadDevice;
+      }
+    }
+  }
+  return kLaunched;
+}
+
+// Readiness of `device_id` and the regime for `num_tokens` (operands already checked).
+int64_t check_plan(int device_id, int64_t num_tokens, LaunchPlan* plan) {
+  const DeviceState& state = g_devices[device_id];
+  if (!state.ready.load(std::memory_order_acquire)) return kNotPrepared;
+  *plan = plan_launch(static_cast<int>(num_tokens), state.limits);
+  if (plan->variant == Variant::kUnsupported) return kNoKernelForShape;
+  return kLaunched;
+}
+
 }  // namespace
 
 // Sets the kernels' launch attributes and measures their co-resident cluster capacity on
@@ -240,73 +338,16 @@ int64_t mhc_fused_post_pre_run(TensorView x, TensorView residual, TensorView pos
                                TensorView hc_base, TensorView norm_weight, TensorView residual_cur,
                                TensorView post_mix_cur, TensorView comb_mix_cur,
                                TensorView layer_input_cur, bool dry_run) {
-  const TensorView* inputs[] = {&x,  &residual, &post_layer_mix, &comb_res_mix,
-                                &fn, &hc_scale, &hc_base,        &norm_weight};
-  const TensorView* outputs[] = {&residual_cur, &post_mix_cur, &comb_mix_cur, &layer_input_cur};
-  // Semantics: dtypes.
-  for (const TensorView* t : {&x, &residual, &norm_weight, &residual_cur, &layer_input_cur}) {
-    if (t->dtype() != dl_bfloat16) return kBadDtype;
-  }
-  for (const TensorView* t :
-       {&post_layer_mix, &comb_res_mix, &fn, &hc_scale, &hc_base, &post_mix_cur, &comb_mix_cur}) {
-    if (t->dtype() != dl_float32) return kBadDtype;
-  }
-  // Shapes: the kernels are compiled for H = 4096, four streams and 24 mixes, and derive
-  // every stride from these shapes.
-  if (x.ndim() != 2) return kBadShape;
+  const std::array<const TensorView*, 4> outputs = {&residual_cur, &post_mix_cur, &comb_mix_cur,
+                                                    &layer_input_cur};
+  const int64_t operands = check_operands(x, residual, post_layer_mix, comb_res_mix, fn, hc_scale,
+                                          hc_base, norm_weight, &outputs);
+  if (operands != kLaunched) return operands;
   const int64_t m = x.size(0);
-  if (m <= 0 || m > (int64_t{1} << 24)) return kBadShape;
-  if (!same_shape(x, {m, kHidden}) || !same_shape(residual, {m, kStreams, kHidden}) ||
-      !same_shape(post_layer_mix, {m, kStreams}) ||
-      !same_shape(comb_res_mix, {m, kStreams, kStreams}) ||
-      !same_shape(fn, {kMixWidth, kStreams * kHidden}) || !same_shape(hc_scale, {3}) ||
-      !same_shape(hc_base, {kMixWidth}) || !same_shape(norm_weight, {kHidden}) ||
-      !same_shape(residual_cur, {m, kStreams, kHidden}) ||
-      !same_shape(post_mix_cur, {m, kStreams}) ||
-      !same_shape(comb_mix_cur, {m, kStreams, kStreams}) ||
-      !same_shape(layer_input_cur, {m, kHidden})) {
-    return kBadShape;
-  }
-  // Layout: dense row-major; TMA / bulk copies need 16-byte addresses, the fn slice loads
-  // are 32-byte vectors.
-  for (const TensorView* t : inputs) {
-    if (!t->IsContiguous()) return kNotContiguous;
-    if (address_of(*t) % 16 != 0) return kMisaligned;
-  }
-  for (const TensorView* t : outputs) {
-    if (!t->IsContiguous()) return kNotContiguous;
-    if (address_of(*t) % 16 != 0) return kMisaligned;
-  }
-  if (address_of(fn) % 32 != 0) return kMisaligned;
-  // Outputs are written while inputs are still being read: no aliasing.
-  for (int i = 0; i < 4; ++i) {
-    for (const TensorView* t : inputs) {
-      if (overlaps(*outputs[i], *t)) return kOverlap;
-    }
-    for (int j = i + 1; j < 4; ++j) {
-      if (overlaps(*outputs[i], *outputs[j])) return kOverlap;
-    }
-  }
-  // Device last.
   const DLDevice device = x.device();
-  if (device.device_type != kDLCUDA || device.device_id < 0 || device.device_id >= kMaxDevices) {
-    return kBadDevice;
-  }
-  for (const TensorView* t : inputs) {
-    if (t->device().device_type != kDLCUDA || t->device().device_id != device.device_id) {
-      return kBadDevice;
-    }
-  }
-  for (const TensorView* t : outputs) {
-    if (t->device().device_type != kDLCUDA || t->device().device_id != device.device_id) {
-      return kBadDevice;
-    }
-  }
-  const DeviceState& state = g_devices[device.device_id];
-  if (!state.ready.load(std::memory_order_acquire)) return kNotPrepared;
-
-  const LaunchPlan plan = plan_launch(static_cast<int>(m), state.limits);
-  if (plan.variant == Variant::kUnsupported) return kNoKernelForShape;
+  LaunchPlan plan{Variant::kUnsupported, 0, 0, 0};
+  const int64_t planned = check_plan(device.device_id, m, &plan);
+  if (planned != kLaunched) return planned;
   if (dry_run) return kLaunched;
 
   // Tensor-map encoding needs the tensors' device context current.
@@ -365,11 +406,25 @@ int64_t mhc_fused_post_pre_run(TensorView x, TensorView residual, TensorView pos
   return kLaunched;
 }
 
+// Inputs-only form of mhc_fused_post_pre_run(..., dry_run=true) for a call that lets the op
+// allocate its outputs: freshly allocated outputs always pass the output checks, so the
+// verdict depends on the inputs alone and nothing has to be allocated to obtain it.
+int64_t mhc_fused_post_pre_check(TensorView x, TensorView residual, TensorView post_layer_mix,
+                                 TensorView comb_res_mix, TensorView fn, TensorView hc_scale,
+                                 TensorView hc_base, TensorView norm_weight) {
+  const int64_t operands = check_operands(x, residual, post_layer_mix, comb_res_mix, fn, hc_scale,
+                                          hc_base, norm_weight, nullptr);
+  if (operands != kLaunched) return operands;
+  LaunchPlan plan{Variant::kUnsupported, 0, 0, 0};
+  return check_plan(x.device().device_id, x.size(0), &plan);
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mhc_fused_post_pre_prepare, mhc_fused_post_pre_prepare);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mhc_fused_post_pre_limits, mhc_fused_post_pre_limits);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mhc_fused_post_pre_plan, mhc_fused_post_pre_plan);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mhc_fused_post_pre_counters, mhc_fused_post_pre_counters);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mhc_fused_post_pre_run, mhc_fused_post_pre_run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(mhc_fused_post_pre_check, mhc_fused_post_pre_check);
 
 }  // namespace mhc_fpp
 }  // namespace flashinfer

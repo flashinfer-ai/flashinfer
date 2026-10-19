@@ -39,7 +39,7 @@ Anything else runs the composable PyTorch implementation in `reference.py`
 (a correctness path, not a fast one), or, with `fallback=False`, computes
 nothing and returns `None` so that a caller keeps its own implementation.
 `mhc_fused_post_pre_supported(...)` answers "would this call run the
-specialized kernel?" without launching anything.
+specialized kernel?" without launching or allocating anything.
 
 The module is built, loaded and prepared (kernel attributes and co-resident
 cluster capacity per device) on the first call outside CUDA graph capture,

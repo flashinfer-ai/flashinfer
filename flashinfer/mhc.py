@@ -715,7 +715,9 @@ def mhc_fused_post_pre_supported(
     for exactly these arguments (nothing is launched).
 
     Capture-safe: under CUDA graph capture it never compiles or prepares a device, so an
-    unprepared device reports ``False`` (see :func:`mhc_fused_post_pre_warmup`).
+    unprepared device reports ``False`` (see :func:`mhc_fused_post_pre_warmup`). It never
+    allocates: without ``out`` only the inputs are checked (the outputs the op would
+    allocate always pass the output checks); with ``out`` those tensors are checked too.
 
     Parameters
     ----------

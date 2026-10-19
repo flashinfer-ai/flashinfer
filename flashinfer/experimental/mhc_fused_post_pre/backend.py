@@ -284,18 +284,27 @@ def _try_specialized(
     module = _load_module(res3.device.index)
     if module is None:
         return "not_ready"
-    status = module.mhc_fused_post_pre_run(
-        x2,
-        res3,
-        pm2,
-        comb3,
-        fn,
-        hc_scale,
-        hc_base,
-        norm_weight,
-        *outs,
-        dry_run,
-    )
+    if outs is None:
+        # Support query without caller outputs: the outputs the op would allocate always
+        # pass the native output checks, so check the inputs only and allocate nothing.
+        if not dry_run:
+            raise ValueError("a launch needs output tensors")
+        status = module.mhc_fused_post_pre_check(
+            x2, res3, pm2, comb3, fn, hc_scale, hc_base, norm_weight
+        )
+    else:
+        status = module.mhc_fused_post_pre_run(
+            x2,
+            res3,
+            pm2,
+            comb3,
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            *outs,
+            dry_run,
+        )
     if status:
         return _STATUS.get(int(status), f"status_{int(status)}")
     return None
@@ -361,8 +370,10 @@ def supported(
 ) -> bool:
     """See :func:`flashinfer.mhc.mhc_fused_post_pre_supported`."""
     try:
+        # allocate=False: without caller outputs only the inputs are checked, so a support
+        # query never allocates output-sized buffers (also not under CUDA graph capture).
         _, _, _, x2, res3, pm2, comb3, outs = _flatten_args(
-            x, residual, post_layer_mix, comb_res_mix, out
+            x, residual, post_layer_mix, comb_res_mix, out, allocate=False
         )
     except (ValueError, RuntimeError):
         return False

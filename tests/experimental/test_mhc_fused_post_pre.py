@@ -167,6 +167,16 @@ def test_supported_is_false_off_device():
     assert not mhc.mhc_fused_post_pre_supported(**_inputs(48, "cpu"))
 
 
+def test_supported_without_out_never_allocates(monkeypatch):
+    inputs = _inputs(48, "cpu")
+
+    def no_allocation(*args, **kwargs):
+        raise AssertionError("mhc_fused_post_pre_supported must not allocate outputs")
+
+    monkeypatch.setattr(torch, "empty", no_allocation)
+    assert not mhc.mhc_fused_post_pre_supported(**inputs)
+
+
 def test_warmup_declines_other_geometry_without_building():
     state = backend._state
     loaded = state["module"]
@@ -308,6 +318,29 @@ def test_operand_checks_decline():
     # Declined calls still compute through the fallback.
     got = mhc.mhc_fused_post_pre(**{**inputs, "x": misaligned})
     _assert_matches(got, mhc_fused_post_pre_reference(**inputs, **_CONSTANTS))
+
+
+@sm103
+@pytest.mark.parametrize("num_tokens", [48, 16384])
+def test_supported_checks_inputs_only_without_out(num_tokens):
+    assert mhc.mhc_fused_post_pre_warmup()
+    inputs = _inputs(num_tokens, "cuda")
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    assert mhc.mhc_fused_post_pre_supported(**inputs)
+    assert torch.cuda.memory_allocated() == allocated
+    assert torch.cuda.max_memory_allocated() == allocated
+    # Caller-provided outputs are still checked.
+    out = (
+        torch.empty(num_tokens, 4, 4096, dtype=torch.bfloat16, device="cuda"),
+        torch.empty(num_tokens, 4, device="cuda"),
+        torch.empty(num_tokens, 4, 4, device="cuda"),
+        torch.empty(num_tokens, 4096, dtype=torch.bfloat16, device="cuda"),
+    )
+    assert mhc.mhc_fused_post_pre_supported(**inputs, out=out)
+    aliased = (out[0], out[1], out[2], inputs["x"])
+    assert not mhc.mhc_fused_post_pre_supported(**inputs, out=aliased)
 
 
 @sm103
