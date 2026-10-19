@@ -58,7 +58,7 @@ from cutlass.experimental.task_scheduling.enums import WorkAttr
 from ...mask import kv_tile_needs_right_mask
 from ...tensor_map import transform_ragged_coords
 
-from ..helpers.sparse_indices import SparseKVIndices
+from ..helpers.sparse_indices import SparseKVIndices, SparseSourceTile
 from ..helpers.gather import (
     gather4_cached,
     load_sparse_rows,
@@ -868,18 +868,38 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
                 if cutlass.const_expr(isinstance(self.page_offsets, SparseKVIndices))
                 else self.page_offsets
             )
-            new_k = load_sparse_rows(
-                routes,
-                blk_coord[2],
-                global_k_index * cfg.tokens_per_k_tile + cta * cfg.tokens_per_k_cta,
-                fragments=cfg.tokens_per_k_cta // WARP_LANES,
-            )
-            new_v = load_sparse_rows(
-                routes,
-                blk_coord[2],
-                global_k_index * cfg.tokens_per_v_tile,
-                fragments=cfg.tokens_per_v_tile // WARP_LANES,
-            )
+            if cutlass.const_expr(isinstance(routes, SparseSourceTile)):
+                new_v = load_sparse_rows(
+                    routes,
+                    blk_coord[2],
+                    global_k_index * cfg.tokens_per_v_tile,
+                    fragments=cfg.tokens_per_v_tile // WARP_LANES,
+                )
+                # K is one CTA half of this freshly loaded pending-V window.
+                # cached_v_pages instead belongs to the previous K tile.
+                fragments_k = cfg.tokens_per_k_cta // WARP_LANES
+                new_k = cutlass.Array(
+                    Int32, fragments_k, space=cutlass.AddressSpace.rmem
+                )
+                for fragment in cutlass.range_constexpr(fragments_k):
+                    new_k[fragment] = (
+                        new_v[fragment]
+                        if cta == Int32(0)
+                        else new_v[fragment + fragments_k]
+                    )
+            else:
+                new_k = load_sparse_rows(
+                    routes,
+                    blk_coord[2],
+                    global_k_index * cfg.tokens_per_k_tile + cta * cfg.tokens_per_k_cta,
+                    fragments=cfg.tokens_per_k_cta // WARP_LANES,
+                )
+                new_v = load_sparse_rows(
+                    routes,
+                    blk_coord[2],
+                    global_k_index * cfg.tokens_per_v_tile,
+                    fragments=cfg.tokens_per_v_tile // WARP_LANES,
+                )
             # Expand only current K/V coordinates once per tile. "Uniform"
             # means identical across lanes, not consecutive physical KV rows.
             # Reuse across D slices trades register capacity for fewer shuffles.
