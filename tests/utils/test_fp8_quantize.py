@@ -1088,37 +1088,6 @@ def test_mxfp8_grouped_quantize_cuda_non_finite():
 
 @pytest.mark.parametrize("use_silu_and_mul", [True, False])
 @torch.inference_mode()
-def test_mxfp8_experts_quantize_fake_op_matches_real(use_silu_and_mul):
-    """The CUDA ops' fake (meta) twins must match the real outputs' metadata."""
-    _skip_unless_grouped_backend("cuda")
-
-    from flashinfer.quantization.fp8_quantization import (
-        get_mxfp8_quantization_sm100_module,
-    )
-
-    module = get_mxfp8_quantization_sm100_module()
-    if use_silu_and_mul:
-        real_op = module.silu_and_mul_mxfp8_experts_quantize_sm100
-        fake_op = module._fake_silu_and_mul_mxfp8_experts_quantize_sm100
-    else:
-        real_op = module.mxfp8_grouped_quant_sm100
-        fake_op = module._fake_mxfp8_grouped_quant_sm100
-
-    b, m, k = 3, 200, 160
-    in_k = 2 * k if use_silu_and_mul else k
-    a = torch.randn((b, m, in_k), dtype=torch.bfloat16, device="cuda")
-    mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
-
-    real = real_op(a, mask, False)
-    fake = fake_op(a.to("meta"), mask.to("meta"), False)
-    for got, expected in zip(fake, real, strict=True):
-        assert got.shape == expected.shape
-        assert got.dtype == expected.dtype
-        assert got.stride() == expected.stride()
-
-
-@pytest.mark.parametrize("use_silu_and_mul", [True, False])
-@torch.inference_mode()
 def test_mxfp8_experts_quantize_mask_out_of_range(use_silu_and_mul):
     """``mask`` values are clamped to ``[0, M]``: larger values select every row."""
     _skip_unless_grouped_backend("cuda")

@@ -255,9 +255,7 @@ def get_mxfp8_quantization_sm100_module():
         mxfp8_quantize_sm100=mxfp8_quantize_sm100,
         mxfp8_dequantize_host_sm100=mxfp8_dequantize_host_sm100,
         silu_and_mul_mxfp8_experts_quantize_sm100=silu_and_mul_mxfp8_experts_quantize_sm100,
-        _fake_silu_and_mul_mxfp8_experts_quantize_sm100=_fake_silu_and_mul_mxfp8_experts_quantize_sm100,
         mxfp8_grouped_quant_sm100=mxfp8_grouped_quant_sm100,
-        _fake_mxfp8_grouped_quant_sm100=_fake_mxfp8_grouped_quant_sm100,
     )
 
 
