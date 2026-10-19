@@ -970,15 +970,35 @@ class ArmCakeNope:
 
     def __init__(self, inp, chunk=NOPE_CHUNK):
         from flashinfer.dsa_sparse_attention import dsa_sparse_attention_nope_varlen
+        from flashinfer.experimental.cake_dsa_train import cake_jit
 
+        program = getattr(cake_jit, "NOPE_PROGRAM", None)
+        if program is None or not cake_backend.generated_program_available(
+            inp.q.device, backward=True, program=program
+        ):
+            raise RuntimeError("skipped: nope stems not installed")
+        try:  # the record may be registered before the device libraries are built
+            from flashinfer.experimental.cake_dsa_train import cake_build
+
+            arch = cake_backend.arch_for(inp.q.device)
+            installed = cake_build.libraries_by_name()
+            missing = [
+                stage
+                for stage in cake_jit.registered_stages(program)
+                if cake_jit.library_name(stage, arch, program) not in installed
+            ]
+        except Exception:  # noqa: BLE001 -- an older manifest API: let the first launch decide
+            missing = []
+        if missing:
+            raise RuntimeError("skipped: nope stems not installed")
+        self.program = program
         self.fn = dsa_sparse_attention_nope_varlen
         self.inp, self.chunk = inp, chunk
         self.q = inp.q.detach().requires_grad_()
         self.eager = None
 
     def versions(self):
-        module_name, _record = cake_backend.record_for(self.inp.q.device)
-        return dict(module=module_name, entry="dsa_sparse_attention_nope_varlen")
+        return dict(module=self.program, entry="dsa_sparse_attention_nope_varlen")
 
     def _call(self, q, kv, dkv_acc):
         inp = self.inp
@@ -1071,7 +1091,6 @@ class ArmCakeNope:
                 inp.q.device,
                 backward=True,
                 num_segments=inp.num_segments,
-                dkv_acc=True,
             )
         )
 
@@ -1488,7 +1507,10 @@ def _nope_arm_or_error(cls, inp):
     except (
         Exception
     ) as exc:  # optional dependency missing, entry not shipped, or arm unavailable here
-        return None, f"{type(exc).__name__}: {exc}"
+        text = str(exc)
+        if text.startswith("skipped:"):
+            return None, text
+        return None, f"{type(exc).__name__}: {text}"
 
 
 def run_perf_nope_row(row, args, results):
@@ -1690,10 +1712,38 @@ NOPE_ACCURACY_CASES = {
 }
 
 
+def _row_normalised(x, ref, atol=2e-2, rtol=1e-2):
+    """Row-normalised comparison of ``x`` with the FP64 ``ref`` over the vectors of its last
+    axis (the (token, head) rows of ``dq``): the p99 and maximum over rows of
+    ``max_k |x - ref| / max(RMS(ref row), 1e-3)`` and the number of elements outside the band
+    ``|x - ref| <= atol * max(RMS(ref row), 1e-3) + rtol * |ref|`` -- the per-row form the
+    kernel's own tests use for ``dq`` in place of a flat elementwise band (the bf16 rounding of
+    dS bounds the error per row, not per element).  Report only."""
+    x2 = x.detach().double().reshape(-1, x.shape[-1])
+    r2 = ref.detach().double().reshape(-1, ref.shape[-1])
+    diff = (x2 - r2).abs_()
+    den = r2.pow(2).mean(1, keepdim=True).sqrt_().clamp_min_(1e-3)
+    row_max = (diff / den).max(1).values
+    exceed = diff > (atol * den + rtol * r2.abs())
+    # rows whose reference RMS sits below the 1e-3 clamp (a single-key row has dq == 0
+    # exactly): their exceedances measure the clamp, not the kernel, so they are counted apart
+    degenerate = r2.pow(2).mean(1) < 1e-6
+    return dict(
+        row_norm_max_p99=float(row_max.quantile(0.99)),
+        row_norm_max_max=float(row_max.max()),
+        band_exceed_count=int(exceed.sum()),
+        elements=int(diff.numel()),
+        rows_rms_below_clamp=int(degenerate.sum()),
+        band_exceed_count_rows_rms_ge_clamp=int(exceed[~degenerate].sum()),
+        band=dict(atol=atol, rtol=rtol, denominator="max(RMS(ref row), 1e-3)"),
+    )
+
+
 def measure_accuracy_nope(arm, inp):
     """Relative-L2 of a NoPE arm against the chunked FP64 reference (``out``, ``dq``, the
-    combined ``dkv``), the ``lse`` maximum absolute error over finite rows and the p99 of
-    the per-row ``dq`` error."""
+    combined ``dkv``), the ``lse`` maximum absolute error over finite rows, the p99 of the
+    per-row ``dq`` rel-L2 and the row-normalised ``dq`` metrics (:func:`_row_normalised`),
+    each beside the bf16 emulation floor of the same quantity."""
     st = arm.forward()
     grads = arm.backward(st)
     torch.cuda.synchronize()
@@ -1716,10 +1766,15 @@ def measure_accuracy_nope(arm, inp):
         dq_rel_l2=rel_l2(grads["dq"], ref["dq"]),
         dkv_rel_l2=rel_l2(grads["dkv"], ref["dkv"]),
         dq_row_p99=float(rel_l2_rows(grads["dq"], ref["dq"]).quantile(0.99)),
+        dq_row_normalised=_row_normalised(grads["dq"], ref["dq"]),
+        dkv_row_p99=float(rel_l2_rows(grads["dkv"], ref["dkv"]).quantile(0.99)),
         bf16_floor=dict(
             out=rel_l2(ref["out_emu"], ref["out"]),
             dq=rel_l2(ref["dq_emu"], ref["dq"]),
+            dq_row_p99=float(rel_l2_rows(ref["dq_emu"], ref["dq"]).quantile(0.99)),
+            dq_row_normalised=_row_normalised(ref["dq_emu"], ref["dq"]),
             dkv=rel_l2(ref["dkv_emu"], ref["dkv"]),
+            dkv_row_p99=float(rel_l2_rows(ref["dkv_emu"], ref["dkv"]).quantile(0.99)),
         ),
         nan=bool(
             any(
