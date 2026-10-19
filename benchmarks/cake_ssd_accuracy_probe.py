@@ -31,7 +31,7 @@ decay kept exact) isolate the delta-rounding difference between the kernels.
 
 Usage (GPU; FlashInfer repo root on ``PYTHONPATH``)::
 
-    python tests/mamba/cake_ssd_accuracy_probe.py --out probe.json [--only NAME ...]
+    python benchmarks/cake_ssd_accuracy_probe.py --out probe.json [--only NAME ...]
 """
 
 from __future__ import annotations
@@ -49,7 +49,8 @@ from flashinfer.mamba import SSDCombined
 
 
 def _load_test_module():
-    path = Path(__file__).resolve().with_name("test_cake_ssd_combined.py")
+    root = Path(__file__).resolve().parents[1]
+    path = root / "tests" / "mamba" / "test_cake_ssd_combined.py"
     spec = importlib.util.spec_from_file_location("_cake_ssd_tests", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

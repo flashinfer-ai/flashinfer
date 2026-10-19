@@ -81,7 +81,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #ifndef HEADS_PER_CTA
 #error "HEADS_PER_CTA is a downstream specialization of this program; define it on the compile line"
 #endif
+#ifndef LAUNCH_MIN_BLOCKS
 #define LAUNCH_MIN_BLOCKS 3
+#endif
 
 #include <math_constants.h>
 
