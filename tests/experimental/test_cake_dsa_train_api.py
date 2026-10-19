@@ -36,6 +36,8 @@ import flashinfer.dsa_sparse_attention as public_api
 from flashinfer.api_logging import ExperimentalWarning
 from flashinfer.dsa_sparse_attention import (
     dsa_sparse_attention,
+    dsa_sparse_attention_nope,
+    dsa_sparse_attention_nope_varlen,
     dsa_sparse_attention_varlen,
 )
 from flashinfer.experimental.cake_dsa_train import cake_backend, cake_jit
@@ -56,6 +58,7 @@ from flashinfer.experimental.cake_dsa_train.cake_backend import (
     prepare_dsa_train,
     record_for,
 )
+from tests.test_helpers import cake_dsa_train_reference as nope_ref
 from tests.test_helpers.cake_dsa_train_reference import (
     globalize_gather_indices_loop,
     make_inputs,
@@ -1080,3 +1083,367 @@ def test_varlen_packed_glm_structure_small():
     ref = reference_fp64(*args, inp.idx_global, dout=inp.dout)
     _check_forward(inp, out_v, lse_v, ref)
     _check_backward(grads_v, ref)
+
+
+# ---------------------------------------------------------------------------
+# NoPE (zero-rope) public entries: ``dsa_sparse_attention_nope`` / ``dsa_sparse_attention_nope_varlen``
+# ---------------------------------------------------------------------------
+
+NOPE_PROGRAM = cake_jit.NOPE_PROGRAM
+NOPE_SOFTMAX_SCALE = cake_backend.NOPE_SOFTMAX_SCALE
+NOPE_SEED = SEED + 2000
+ACC_REL_L2 = 1e-4
+
+
+def _nope_host_inputs(total_q=8, total_k=16, topk=5):
+    q = torch.zeros(total_q, NUM_HEADS, D_LATENT, dtype=torch.bfloat16)
+    kv = torch.zeros(total_k, D_LATENT, dtype=torch.bfloat16)
+    idx = torch.zeros(total_q, topk, dtype=torch.int32)
+    return q, kv, idx
+
+
+def _require_nope_program(*, backward: bool = False):
+    if not _device_supported():
+        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+    if not generated_program_available(
+        torch.device("cuda"), backward=backward, program=NOPE_PROGRAM
+    ):
+        pytest.skip(
+            "generated program not available: the NoPE DSA training program has no registered "
+            + ("backward" if backward else "forward")
+            + " stages for this device"
+        )
+
+
+def _nope_inputs(seq_q, seq_k, *, seed, topk, index="iid", **kw):
+    return nope_ref.make_nope_inputs(
+        seq_q if isinstance(seq_q, list) else [seq_q],
+        seq_k if isinstance(seq_k, list) else [seq_k],
+        seed=seed,
+        topk=topk,
+        index=index,
+        **kw,
+    )
+
+
+def _check_nope_grads(dq, dkv, ref):
+    for got, name in ((dq, "dq"), (dkv, "dkv")):
+        err, floor = rel_l2(got, ref[name]), rel_l2(ref[f"{name}_emu"], ref[name])
+        assert err <= FLOOR_MARGIN * floor + FLOOR_ABS, (
+            f"{name}: rel-L2 {err:.6f} vs floor {floor:.6f}"
+        )
+
+
+def test_public_nope_api_is_marked_experimental():
+    assert dsa_sparse_attention_nope.is_experimental is True
+    assert dsa_sparse_attention_nope_varlen.is_experimental is True
+    doc = dsa_sparse_attention_nope.__doc__
+    assert "SM100" in doc and "1 / 16" in doc
+    assert "dK + dV" in doc and "[S, 1, 512]" in doc and "K_slots >= 1" in doc
+    assert "SM100" in dsa_sparse_attention_nope_varlen.__doc__
+
+
+def test_nope_zero_query_rows_return_empty_outputs_without_binding(monkeypatch):
+    """``T == 0`` through the NoPE entries: empty outputs, a zero FP32 ``dkv`` (``None`` with ``dkv_acc``) and
+    zero leaf gradients without consulting the registry, loading a module, binding or launching."""
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a call without query rows must neither bind nor launch")
+
+    monkeypatch.setattr(cake_backend, "prepare_dsa_nope_train", refuse)
+    monkeypatch.setattr(cake_backend, "_binding", refuse)
+    monkeypatch.setattr(cake_jit, "load_cake_dsa_train_module", refuse)
+    monkeypatch.setattr(cake_backend, "record_for", refuse)
+    q, kv, idx = _nope_host_inputs(total_q=0)
+    out, lse, o_lo = cake_backend.forward_nope(q, kv, idx)
+    assert tuple(out.shape) == (0, NUM_HEADS, D_LATENT) and out.dtype == torch.bfloat16
+    assert tuple(lse.shape) == (0, NUM_HEADS) and lse.dtype == torch.float32
+    assert tuple(o_lo.shape) == tuple(out.shape) and o_lo.dtype == torch.bfloat16
+    dout = torch.zeros(0, NUM_HEADS, D_LATENT, dtype=torch.bfloat16)
+    dq, dkv = cake_backend.backward_nope(q, kv, idx, out, o_lo, lse, dout)
+    assert tuple(dq.shape) == (0, NUM_HEADS, D_LATENT) and dq.dtype == torch.bfloat16
+    assert tuple(dkv.shape) == (16, D_LATENT) and dkv.dtype == torch.float32
+    assert torch.all(dkv == 0)
+    acc = torch.zeros(16, D_LATENT)
+    assert (
+        cake_backend.backward_nope(q, kv, idx, out, o_lo, lse, dout, dkv_acc=acc)[1]
+        is None
+    )
+    with pytest.raises(ValueError, match="int32"):
+        cake_backend.forward_nope(q, kv, idx.long())
+    with pytest.raises(ValueError, match="S > 0"):
+        cake_backend.forward_nope(q, kv[:0], idx)
+    # the autograd path, with the 2-D and the one-head kv forms
+    for kv_leaf in (kv, kv.unsqueeze(1)):
+        leaves = [t.detach().clone().requires_grad_() for t in (q, kv_leaf)]
+        with _quiet_experimental():
+            out_pub, lse_pub = dsa_sparse_attention_nope(*leaves, idx, return_lse=True)
+        assert tuple(out_pub.shape) == (0, NUM_HEADS, D_LATENT)
+        assert tuple(lse_pub.shape) == (0, NUM_HEADS)
+        g = torch.autograd.grad(out_pub, leaves, dout)
+        assert [tuple(t.shape) for t in g] == [tuple(leaf.shape) for leaf in leaves]
+        assert torch.all(g[1] == 0) and g[1].dtype == torch.bfloat16
+    with _quiet_experimental():
+        out_pub = dsa_sparse_attention_nope_varlen(
+            q,
+            kv,
+            idx,
+            torch.tensor([0, 0], dtype=torch.int32),
+            torch.tensor([0, 16], dtype=torch.int32),
+        )
+    assert tuple(out_pub.shape) == (0, NUM_HEADS, D_LATENT)
+
+
+def test_nope_public_entries_resolve_the_environment_and_reject_other_backends(
+    monkeypatch,
+):
+    """The NoPE entries map the same variables as the rope entries (``FLASHINFER_CAKE_DSA_DKV_DIRECT`` into
+    ``dkv_direct``, ``FLASHINFER_CAKE_DSA_CHECK_DST_MAP`` into ``check_dst_map``) and refuse another backend
+    before reaching the package; the backend itself reads no variable."""
+    q, kv, idx = _nope_host_inputs()
+    cu_q = torch.tensor([0, 8], dtype=torch.int32)
+    cu_k = torch.tensor([0, 16], dtype=torch.int32)
+    monkeypatch.setenv(public_api.DKV_DIRECT_ENV, "maybe")
+    with (
+        _quiet_experimental(),
+        pytest.raises(ValueError, match=public_api.DKV_DIRECT_ENV),
+    ):
+        dsa_sparse_attention_nope(q, kv, idx)
+    with (
+        _quiet_experimental(),
+        pytest.raises(ValueError, match=public_api.DKV_DIRECT_ENV),
+    ):
+        dsa_sparse_attention_nope_varlen(q, kv, idx, cu_q, cu_k)
+    monkeypatch.delenv(public_api.DKV_DIRECT_ENV, raising=False)
+    with _quiet_experimental(), pytest.raises(ValueError, match="backend='cake'"):
+        dsa_sparse_attention_nope(q, kv, idx, backend="other")
+    with _quiet_experimental(), pytest.raises(ValueError, match="backend='cake'"):
+        dsa_sparse_attention_nope_varlen(q, kv, idx, cu_q, cu_k, backend="other")
+    with pytest.raises(ValueError, match="backend='cake'"):
+        cake_backend.prepare_dsa_nope_train(q, kv, idx, backend="other")
+
+
+def test_nope_public_entries_forward_their_keywords_to_the_backend(monkeypatch):
+    """What the wrappers hand to ``cake_backend.dsa_sparse_attention_nope`` / ``_varlen``: every keyword as given,
+    ``dkv_direct`` / ``check_dst_map`` resolved from the environment when ``None`` and taken as given otherwise."""
+    seen = {}
+
+    def flat(q, kv, indices, **kwargs):
+        seen["flat"] = (q, kv, indices, kwargs)
+        return "flat"
+
+    def varlen(q, kv, gather, cu_q, cu_k, max_q, max_k, **kwargs):
+        seen["varlen"] = (q, kv, gather, cu_q, cu_k, max_q, max_k, kwargs)
+        return "varlen"
+
+    monkeypatch.setattr(cake_backend, "dsa_sparse_attention_nope", flat)
+    monkeypatch.setattr(cake_backend, "dsa_sparse_attention_nope_varlen", varlen)
+    q, kv, idx = _nope_host_inputs()
+    lengths = torch.full((8,), 5, dtype=torch.int32)
+    acc = torch.zeros(16, D_LATENT)
+    dst_map = torch.arange(16, dtype=torch.int32)
+    monkeypatch.delenv(public_api.DKV_DIRECT_ENV, raising=False)
+    monkeypatch.delenv(public_api.CHECK_DST_MAP_ENV, raising=False)
+    with _quiet_experimental():
+        assert dsa_sparse_attention_nope(q, kv, idx) == "flat"
+    assert seen["flat"][0] is q and seen["flat"][1] is kv and seen["flat"][2] is idx
+    assert seen["flat"][3] == dict(
+        topk_length=None,
+        softmax_scale=None,
+        return_lse=False,
+        key_passes=None,
+        dkv_acc=None,
+        dkv_dst_map=None,
+        dkv_direct=None,
+        check_dst_map=False,
+    )
+    monkeypatch.setenv(public_api.DKV_DIRECT_ENV, "1")
+    monkeypatch.setenv(public_api.CHECK_DST_MAP_ENV, "1")
+    with _quiet_experimental():
+        dsa_sparse_attention_nope(
+            q,
+            kv,
+            idx,
+            topk_length=lengths,
+            softmax_scale=0.25,
+            return_lse=True,
+            key_passes=2,
+            dkv_acc=acc,
+            dkv_dst_map=dst_map,
+        )
+    kwargs = seen["flat"][3]
+    assert kwargs["topk_length"] is lengths and kwargs["softmax_scale"] == 0.25
+    assert kwargs["return_lse"] is True and kwargs["key_passes"] == 2
+    assert kwargs["dkv_acc"] is acc and kwargs["dkv_dst_map"] is dst_map
+    assert kwargs["dkv_direct"] is True and kwargs["check_dst_map"] is True
+    monkeypatch.setenv(public_api.DKV_DIRECT_ENV, "0")
+    with _quiet_experimental():
+        dsa_sparse_attention_nope(q, kv, idx, dkv_direct=True, check_dst_map=False)
+    assert seen["flat"][3]["dkv_direct"] is True  # the keyword wins over the variable
+    assert seen["flat"][3]["check_dst_map"] is False
+    cu_q = torch.tensor([0, 8], dtype=torch.int32)
+    cu_k = torch.tensor([0, 16], dtype=torch.int32)
+    with _quiet_experimental():
+        assert (
+            dsa_sparse_attention_nope_varlen(
+                q, kv, idx, cu_q, cu_k, 8, 16, causal=True, key_passes=1
+            )
+            == "varlen"
+        )
+    assert all(
+        a is b
+        for a, b in zip(seen["varlen"][:5], (q, kv, idx, cu_q, cu_k), strict=True)
+    )
+    assert seen["varlen"][5:7] == (8, 16)
+    assert seen["varlen"][7] == dict(
+        causal=True,
+        topk_length=None,
+        softmax_scale=None,
+        return_lse=False,
+        key_passes=1,
+        dkv_acc=None,
+        dkv_dst_map=None,
+        dkv_direct=False,
+        check_dst_map=True,
+    )
+
+
+def test_nope_autograd_matches_explicit_backward_and_casts_kv_grad_to_the_leaf():
+    """Through the public entry the ``q`` gradient is the explicit ``dq`` bitwise; the ``kv`` gradient is the FP32
+    ``dkv`` cast by the autograd engine to the BF16 leaf; with ``dkv_acc`` the FP32 values are accumulated and the
+    ``kv`` gradient is ``None``."""
+    _require_nope_program(backward=True)
+    inp = _nope_inputs(256, 1024, seed=NOPE_SEED, topk=128)
+    leaves = [t.detach().clone().requires_grad_() for t in (inp.q, inp.kv)]
+    with _quiet_experimental():
+        out, lse = dsa_sparse_attention_nope(*leaves, inp.idx_global, return_lse=True)
+    with pytest.raises(NotImplementedError, match="lse"):
+        torch.autograd.grad(lse.sum(), leaves)
+    grads = torch.autograd.grad(out, leaves, inp.dout)
+    o2, l2, o_lo = cake_backend.forward_nope(inp.q, inp.kv, inp.idx_global)
+    dq, dkv = cake_backend.backward_nope(
+        inp.q, inp.kv, inp.idx_global, o2, o_lo, l2, inp.dout
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out, o2) and torch.equal(lse, l2)
+    assert torch.equal(grads[0], dq)
+    assert grads[1].dtype == torch.bfloat16 and rel_l2(grads[1], dkv) < 1e-2
+    ref = nope_ref.reference_fp64_nope(inp.q, inp.kv, inp.idx_global, dout=inp.dout)
+    _check_nope_grads(dq, dkv, ref)
+    acc = torch.zeros(inp.total_k, 704, device="cuda")
+    leaves = [t.detach().clone().requires_grad_() for t in (inp.q, inp.kv)]
+    with _quiet_experimental():
+        out = dsa_sparse_attention_nope(*leaves, inp.idx_global, dkv_acc=acc)
+    out.backward(inp.dout)
+    torch.cuda.synchronize()
+    assert leaves[1].grad is None and torch.equal(leaves[0].grad, dq)
+    assert rel_l2(acc[:, :D_LATENT], dkv) < ACC_REL_L2
+    assert torch.all(acc[:, D_LATENT:] == 0)
+
+
+def test_nope_public_head_major_dout_and_one_head_kv_leaf():
+    """A head-major ``dout`` (the layout an output projection hands back) through autograd gives the dense path's
+    gradients; a ``[S, 1, 512]`` kv leaf receives its gradient through the squeeze."""
+    _require_nope_program(backward=True)
+    inp = _nope_inputs(
+        256, 1024, seed=NOPE_SEED + 1, topk=128, dout_layout="head_major"
+    )
+    assert inp.dout.stride() == (D_LATENT, inp.total_q * D_LATENT, 1)
+    dense = inp.dout.contiguous()
+    leaves = [t.detach().clone().requires_grad_() for t in (inp.q, inp.kv)]
+    with _quiet_experimental():
+        out = dsa_sparse_attention_nope(*leaves, inp.idx_global)
+    out.backward(inp.dout)
+    one_head = inp.kv.unsqueeze(1).detach().clone().requires_grad_()
+    q = inp.q.detach().clone().requires_grad_()
+    with _quiet_experimental():
+        out_h = dsa_sparse_attention_nope(q, one_head, inp.idx_global)
+    out_h.backward(dense)
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_h) and torch.equal(leaves[0].grad, q.grad)
+    assert tuple(one_head.grad.shape) == (inp.total_k, 1, D_LATENT)
+    assert rel_l2(one_head.grad.squeeze(1), leaves[1].grad) < 1e-2
+    o2, l2, o_lo = cake_backend.forward_nope(inp.q, inp.kv, inp.idx_global)
+    dq, _ = cake_backend.backward_nope(
+        inp.q, inp.kv, inp.idx_global, o2, o_lo, l2, dense
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(leaves[0].grad, dq)
+
+
+def test_nope_varlen_multi_document_matches_flat_and_reference():
+    _require_nope_program(backward=True)
+    inp = _nope_inputs(
+        [300, 517, 0, 1024], [400, 517, 64, 2048], seed=NOPE_SEED + 2, topk=200
+    )
+    leaves = [t.detach().clone().requires_grad_() for t in (inp.q, inp.kv)]
+    with _quiet_experimental():
+        out_v, lse_v = dsa_sparse_attention_nope_varlen(
+            *leaves,
+            inp.idx_local,
+            inp.cu_seqlens_q,
+            inp.cu_seqlens_k,
+            inp.max_seqlen_q,
+            inp.max_seqlen_k,
+            return_lse=True,
+        )
+    grads_v = torch.autograd.grad(out_v, leaves, inp.dout)
+    with _quiet_experimental():
+        out_f, lse_f = dsa_sparse_attention_nope(
+            inp.q, inp.kv, inp.idx_global, return_lse=True
+        )
+    torch.cuda.synchronize()
+    assert torch.equal(out_v, out_f) and torch.equal(lse_v, lse_f)
+    offset = offset_gather_kv_indices(inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k)
+    assert torch.equal(offset, inp.idx_global)
+    o2, l2, o_lo = cake_backend.forward_nope(inp.q, inp.kv, inp.idx_global)
+    dq, dkv = cake_backend.backward_nope(
+        inp.q, inp.kv, inp.idx_global, o2, o_lo, l2, inp.dout
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(grads_v[0], dq) and rel_l2(grads_v[1], dkv) < 1e-2
+    ref = nope_ref.reference_fp64_nope(inp.q, inp.kv, inp.idx_global, dout=inp.dout)
+    assert rel_l2(out_v, ref["out"]) <= _floor_gate(ref)
+    finite = torch.isfinite(ref["lse"])
+    assert torch.equal(torch.isfinite(lse_v), finite)
+    assert (
+        lse_v.double()[finite] - ref["lse"][finite]
+    ).abs().max().item() <= GATE_LSE_ABS
+    _check_nope_grads(dq, dkv, ref)
+
+
+def test_nope_varlen_causal_tail_of_prefix_drops_future_keys():
+    """``causal=True`` on a query segment that is the tail of its key prefix: a selected key after the query's own
+    position is invalid; the result equals the flat call over the explicitly masked global indices."""
+    _require_nope_program()
+    inp = _nope_inputs([256, 128], [512, 512], seed=NOPE_SEED + 3, topk=96)
+    gen = torch.Generator(device="cuda").manual_seed(NOPE_SEED + 3)
+    local = torch.full_like(inp.idx_local, -1)
+    for d, (lq, lk) in enumerate(zip(inp.seq_q, inp.seq_k, strict=True)):
+        rows = slice(int(inp.cu_seqlens_q[d]), int(inp.cu_seqlens_q[d + 1]))
+        local[rows] = torch.randint(
+            0, lk, (lq, inp.topk), device="cuda", generator=gen
+        ).to(torch.int32)
+    with _quiet_experimental():
+        out_c, lse_c = dsa_sparse_attention_nope_varlen(
+            inp.q,
+            inp.kv,
+            local,
+            inp.cu_seqlens_q,
+            inp.cu_seqlens_k,
+            causal=True,
+            return_lse=True,
+        )
+    masked = globalize_gather_indices_loop(
+        local, inp.cu_seqlens_q, inp.cu_seqlens_k, causal=True
+    ).cuda()
+    offset = offset_gather_kv_indices(
+        local, inp.cu_seqlens_q, inp.cu_seqlens_k, causal=True
+    )
+    assert torch.equal(offset, masked)
+    with _quiet_experimental():
+        out_f, lse_f = dsa_sparse_attention_nope(inp.q, inp.kv, masked, return_lse=True)
+    torch.cuda.synchronize()
+    assert torch.equal(out_c, out_f) and torch.equal(lse_c, lse_f)
+    ref = nope_ref.reference_fp64_nope(inp.q, inp.kv, masked)
+    assert rel_l2(out_c, ref["out"]) <= _floor_gate(ref)

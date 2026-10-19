@@ -293,15 +293,90 @@ the same reds in another order.  `key_passes=` on the entry points overrides
 the policy (`1` = single pass, `n` = that many passes); a program without the
 pass stages serves the single pass only.
 
+## NoPE (zero-rope) program
+
+A second registry record, `cake_dsa_h64_nope_train`, carries the native kernels
+of the zero-rope form of the same attention (GLM-5.3 geometry: 64 heads, 512
+shared latent dimensions and no rope part, softmax scale `1 / 16`, top-k slot
+counts such as 2176 or 1152 -- any `K_slots >= 1`).  The score is the latent
+product alone, `softmax(scale * q . kv^T) . kv`, and the backward produces one
+combined gradient per key row, `dkv = dK + dV`, natural layout, FP32 `[S, 512]`.
+The rope entry points above are unchanged; the NoPE entries are additive.
+
+```python
+from flashinfer.dsa_sparse_attention import dsa_sparse_attention_nope, dsa_sparse_attention_nope_varlen
+
+out = dsa_sparse_attention_nope(q, kv, indices, topk_length=None, softmax_scale=None,
+                                return_lse=False, dkv_acc=None, dkv_dst_map=None)
+out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, cu_seqlens_k,
+                                       max_seqlen_q=None, max_seqlen_k=None, causal=False,
+                                       topk_length=None, softmax_scale=None, return_lse=False,
+                                       dkv_acc=None, dkv_dst_map=None)
+```
+
+* `q [T, 64, 512]` BF16 (contiguous or a strided token / head view, consumed in
+  place); `kv [S, 512]` BF16 or its one-head form `[S, 1, 512]` (squeezed on the
+  host; the gradient reaches that leaf through the view); `indices [T, K_slots]`
+  int32 global key rows, `topk_length` and the validity rules as above.
+  `softmax_scale` defaults to `1 / 16`.
+* Backend entries (`cake_backend`): `forward_nope`, `backward_nope`,
+  `prepare_dsa_nope_train` / `DSANopeTrainRunner`, `dsa_nope_train_workspace_size`,
+  `validate_dsa_nope_inputs`, `DSASparseAttentionNopeFunction` (12 forward inputs,
+  gradients for `q` and `kv` only).  The binding cache is shared; the NoPE keys are
+  tagged (`"nope_fwd"` / `"nope_bwd"`) and never collide with the rope keys.
+* `dkv` semantics.  Fresh (no `dkv_acc`): `backward_nope` returns a new natural
+  FP32 `[S, 512]` buffer -- filled by the natural-layout main stage adding into
+  the zero-filled buffer when the record's direct rule (`dkv_direct`, 4 keys per
+  query) selects it, else by the cast stage writing the permuted accumulator out
+  densely (`out_f32`).  Accumulate (`dkv_acc` FP32 `[S_dst, >= 512]`, optional
+  `dkv_dst_map`): `+=` into columns `0:512` of the caller's rows by the same two
+  paths and `None` for `dkv`; chunked backward passes of one long row sum into
+  one buffer without intermediate rounding.  Through autograd without
+  `dkv_acc`, the FP32 `dkv` becomes the `kv` gradient and the autograd engine
+  casts it to the leaf's dtype (BF16 for a BF16 leaf).
+* `dout` may be a head-major view (strides `[512, T * 512, 1]`) or any strided
+  `[T, 64, 512]` view: the main stage reads it through a stride-carrying tensor
+  map, the delta stage of this release through a dense array, so
+  `backward_nope` copies a strided `dout` once, explicitly, inside the backward
+  (`_dense_dout`, a counted cost of the step; a dense `dout` is read in place).
+  A prepared runner takes a dense `dout` only.
+* Varlen: per-document indices are offset by `cu_seqlens_k` through the same
+  `offset_gather_kv_indices` glue as the rope entry (`causal=True` drops keys
+  after the query's own position, query segments are tails of their key prefix).
+
+Stages of the record, in launch order and with the kernels they share with the
+rope program: `nope_fwd` (own kernel, 320 threads), `nope_bwd_delta` (the rope
+`bwd_delta` kernel over the dense `[T * 64, 512]` rows), `nope_bwd_main` /
+`nope_bwd_main_natural` (own kernels, 640 threads: no rope operands, one
+accumulator `dkv_f32` with `dkv_stride >= 512`, a multiple of 4, and the
+destination map), `nope_bwd_compact` (the rope compaction kernel),
+`nope_bwd_main_pass` / `nope_bwd_main_pass_natural` (the key-range-pass forms)
+and `nope_bwd_cast` (the rope cast kernel with `rope_groups = 0`, grid
+`ceil(num_kv * 16 / 256)`).  The key-range-pass policy of the record plans with
+2048 B of accumulator per key and a dQ partial of 131,072 B per token: the
+token chunk of a multi-pass backward is 4736 at `K_slots` 2048 / 2176, 4864 at
+1152 and 4992 at 128 (the 640 MiB budget, a multiple of 128).
+
+Status of the record: the three shared stages (`nope_bwd_delta`,
+`nope_bwd_compact`, `nope_bwd_cast`) are registered; the forward and main
+stages join the record when their libraries are exported, and until then
+`generated_program_available(..., program=cake_jit.NOPE_PROGRAM)` is `False`,
+the eager NoPE entries raise `NotImplementedError` naming the missing stages and
+the GPU tests of the NoPE block skip.
+
 ## Layout of this package
 
-* `cake_jit.py` -- the `MODULES` registry (one record for every architecture,
-  filled by the generated-program export: per stage the `library` stem of its
-  `build.json` entries, the FFI entry and the launch geometry), stage names
-  and the loader glue: `library_name(stage, arch)` is the `build.json` entry
-  `<library>_<arch>` that `load_cake_dsa_train_module(stage, arch)` loads
-  through `cake_build`; `specs_for_arch(arch)` lists the JIT specs of an
-  architecture for `flashinfer.jit.build_jit_specs`.
+* `cake_jit.py` -- the `MODULES` registry (one record per program, the rope
+  `cake_dsa_h64_train` and the NoPE `cake_dsa_h64_nope_train`, each shared by
+  every architecture it compiles for; per stage the `library` stem of its
+  `build.json` entries, the FFI entry and the launch geometry -- block,
+  cluster, cooperative, dynamic shared memory, PDL -- that the export rewrites),
+  the stage names of both programs (`STAGES` / `NOPE_STAGES`, `PROGRAMS`) and
+  the loader glue: `library_name(stage, arch, program)` is the `build.json`
+  entry `<library>_<arch>` that `load_cake_dsa_train_module(stage, arch,
+  program)` loads through `cake_build`; `specs_for_arch(arch)` lists the JIT
+  specs of an architecture for `flashinfer.jit.build_jit_specs`.  Stages of
+  the two programs that share a kernel name the same library stem.
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
   package (byte-identical copies) and this package's build manifest (schema
   `cake-build/1`, written by the export): one entry per `<library>_<arch>`
@@ -314,7 +389,8 @@ pass stages serves the single pass only.
   digest-verified first; `sm_107a` needs an nvcc that lists `compute_107`).
   `aot/` is never tracked (`.gitignore`).
 * `cake_launch.py` -- generated positional launchers and grid functions, one
-  per stage, over the kernels' own argument names.
+  per stage of either program, over the kernels' own argument names
+  (`STAGE_ARGS` / `LAUNCH` / `GRID` keyed by stage name).
 * `cake_backend.py` -- validation, workspace layout, varlen index offsetting,
   the prepared runner, the autograd `Function` and the eager entry points.
 * `csrc/cake_ffi_checks.h` -- the TVM-FFI helper header the bindings include
@@ -328,11 +404,13 @@ pass stages serves the single pass only.
 
 ## Status
 
-The registry holds one program for `sm_100a`, `sm_103a` and `sm_107a` with the forward,
+The registry holds the rope program for `sm_100a`, `sm_103a` and `sm_107a` with the forward,
 backward preprocess, backward main (single-pass and key-range-pass form with
 its compaction, each with its natural-layout direct-accumulation variant) and
 cast stages plus the key-range-pass and direct-accumulation policies, exported
-from the kernel snapshot named in the pull request.
+from the kernel snapshot named in the pull request, and the NoPE program's
+record with its shared stages and policies (see "NoPE (zero-rope) program" for
+the stages that join it with their export).
 
 Tests: `tests/experimental/test_cake_dsa_train.py` (the backend suite: imports
 only this package; skips without a registered program or a compute capability

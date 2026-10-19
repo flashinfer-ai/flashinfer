@@ -452,3 +452,420 @@ def calibrate_beta(
         else:
             hi = mid
     return 0.5 * (lo + hi)
+
+
+# ---------------------------------------------------------------------------
+# NoPE (zero-RoPE) problem: shared latent K/V, explicit scale 1/16, combined dkv
+# ---------------------------------------------------------------------------
+
+# GLM-5.3-Flash: softmax scale 1/16 (not 1/sqrt(512) nor 1/sqrt(576)), index pools of
+# four tokens, ``K_slots = round_up(4 * P + 3, 128)`` with the pool capacity ``P``
+# capped at 512 (2176 slots).
+DEFAULT_NOPE_SCALE = 1.0 / 16
+POOL_TOKENS = 4
+TAIL_SLOTS = 3
+SLOT_ALIGN = 128
+DEFAULT_NOPE_TOPK = 2176
+
+
+def nope_k_slots(pools: int, align: int = SLOT_ALIGN) -> int:
+    """``round_up(4 * pools + 3, align)``: the physical slot count of a pool capacity."""
+    return -(-(POOL_TOKENS * int(pools) + TAIL_SLOTS) // align) * align
+
+
+# Recorded pool capacity per slot width: the model's capacities for its own widths (512 -> 2176,
+# the profiled case; 256 -> 1152), the width-filling capacity for the sweep widths.
+NOPE_POOLS_BY_K_SLOTS = {2176: 512, 1152: 256, 128: 31, 256: 63, 512: 127, 1024: 255}
+
+
+def nope_pools(k_slots: int) -> int:
+    """The recorded pool capacity of a slot width (``NOPE_POOLS_BY_K_SLOTS``), else the largest
+    capacity the width holds, ``(k_slots - 3) // 4``."""
+    return NOPE_POOLS_BY_K_SLOTS.get(
+        int(k_slots), (int(k_slots) - TAIL_SLOTS) // POOL_TOKENS
+    )
+
+
+def pooled_topk_local(
+    seq_q: int,
+    seq_k: int,
+    topk: int,
+    gen: torch.Generator,
+    device,
+    *,
+    pools: int,
+    self_including: bool = False,
+    chunk_rows: int = 1024,
+) -> torch.Tensor:
+    """Document-relative pooled selection for one document (the GLM-5.3 index structure).
+
+    Query ``i`` sits at key position ``pos = seq_k - seq_q + i``.  Its row holds up to
+    ``pools`` complete four-token pools drawn uniformly without replacement from the
+    ``(pos + 1) // 4`` complete pools inside ``[0, pos]``, written in ascending pool order
+    (keys ``4 p .. 4 p + 3``), then the causal tail of the open pool (keys
+    ``4 * (pos // 4) .. pos``, 1-3 keys; none when ``pos % 4 == 3``, that pool being a
+    complete candidate), then ``-1`` padding.  Valid slots come first and every valid key
+    satisfies ``key <= pos``.  ``self_including`` forces the query's own pool when the own
+    key is not already in the tail.  Needs ``4 * pools + 3 <= topk``.
+    """
+    pools = int(pools)
+    if POOL_TOKENS * pools + TAIL_SLOTS > topk:
+        raise ValueError(
+            f"pooled selection needs 4 * pools + 3 <= topk, got pools={pools}, topk={topk}"
+        )
+    out = torch.full((seq_q, topk), -1, dtype=torch.int32, device=device)
+    big = torch.iinfo(torch.int32).max
+    quad = torch.arange(POOL_TOKENS, device=device)
+    for r0 in range(0, seq_q, chunk_rows):
+        r1 = min(seq_q, r0 + chunk_rows)
+        n = r1 - r0
+        pos = torch.arange(r0, r1, device=device) + (seq_k - seq_q)
+        complete = (pos + 1) // POOL_TOKENS  # complete pools inside [0, pos]
+        cand = max(int(complete.max()), pools, 1)
+        pool_id = torch.arange(cand, device=device)
+        scores = torch.rand(n, cand, device=device, generator=gen)
+        if self_including:
+            own_pool = pos // POOL_TOKENS
+            in_tail = pos % POOL_TOKENS != POOL_TOKENS - 1
+            rows = torch.arange(n, device=device)[~in_tail]
+            scores[rows, own_pool[~in_tail]] = 2.0
+        scores.masked_fill_(pool_id[None, :] >= complete[:, None], float("-inf"))
+        # descending argsort rather than topk: identical selection for distinct random scores
+        order = scores.argsort(dim=-1, descending=True)[:, :pools]
+        chosen = order.masked_fill(torch.isinf(scores.gather(-1, order)), big)
+        chosen = chosen.sort(dim=-1).values  # ascending pool order, invalid (big) last
+        keys = chosen[:, :, None] * POOL_TOKENS + quad[None, None, :]
+        keys = keys.masked_fill((chosen == big)[:, :, None], -1).reshape(
+            n, POOL_TOKENS * pools
+        )
+        block = out[r0:r1]
+        block[:, : POOL_TOKENS * pools] = keys.to(torch.int32)
+        n_sel = torch.minimum(complete, torch.full_like(complete, pools))
+        tail_n = torch.where(
+            pos % POOL_TOKENS == POOL_TOKENS - 1, 0, pos % POOL_TOKENS + 1
+        )
+        base = POOL_TOKENS * n_sel  # first free slot after the pool keys
+        first_tail = POOL_TOKENS * (pos // POOL_TOKENS)
+        for j in range(TAIL_SLOTS):
+            rows = torch.nonzero(tail_n > j, as_tuple=True)[0]
+            block[rows, base[rows] + j] = (first_tail[rows] + j).to(torch.int32)
+        valid = block >= 0
+        assert bool((block[valid] <= pos[:, None].expand_as(block)[valid]).all()), (
+            "pooled key after its query"
+        )
+        assert bool(((block >= 0).int().diff(dim=1) <= 0).all()), (
+            "pooled row is not valid-first"
+        )
+    return out
+
+
+@dataclass
+class NopeInputs:
+    """One NoPE problem: absorbed latent queries, the shared latent, both index representations."""
+
+    seq_q: list
+    seq_k: list
+    topk: int
+    q: torch.Tensor  # [T, 64, 512] BF16
+    kv: torch.Tensor  # [S, 512] BF16 (K and V)
+    dout: (
+        torch.Tensor
+    )  # [T, 64, 512] BF16, contiguous or the head-major view [512, T * 512, 1]
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    idx_local: torch.Tensor  # document-relative, -1 padded (valid first)
+    idx_global: torch.Tensor  # global key rows, -1 padded
+    topk_length: torch.Tensor
+    own_key: torch.Tensor  # global key row of each query's own token
+    index: str  # "pooled" | "iid"
+    pools: Optional[int]
+    dout_layout: str  # "contiguous" | "head_major"
+
+    @property
+    def total_q(self) -> int:
+        return int(self.q.shape[0])
+
+    @property
+    def total_k(self) -> int:
+        return int(self.kv.shape[0])
+
+    @property
+    def max_seqlen_q(self) -> int:
+        return max(self.seq_q)
+
+    @property
+    def max_seqlen_k(self) -> int:
+        return max(self.seq_k)
+
+    @property
+    def num_segments(self) -> int:
+        return len(self.seq_q)
+
+    @property
+    def valid_keys(self) -> int:
+        return int((self.idx_local >= 0).sum().item())
+
+    def bytes_inputs(self) -> int:
+        return sum(
+            t.numel() * t.element_size()
+            for t in (self.q, self.kv, self.dout, self.idx_local, self.idx_global)
+        )
+
+
+def make_nope_inputs(
+    seq_q,
+    seq_k,
+    *,
+    seed: int,
+    topk: int = DEFAULT_NOPE_TOPK,
+    index: str = "pooled",
+    pools: Optional[int] = None,
+    self_including: bool = False,
+    beta: float = 0.0,
+    dout_layout: str = "contiguous",
+    device="cuda",
+) -> NopeInputs:
+    """Seeded BF16 NoPE inputs for documents of lengths ``seq_q`` / ``seq_k``.
+
+    ``index="pooled"`` draws the GLM-5.3 pool structure with capacity ``pools`` (default
+    ``nope_pools(topk)``, the largest the width holds); ``"iid"`` draws
+    :func:`causal_topk_local` (``min(pos + 1, topk)`` distinct keys).  ``beta > 0`` adds
+    ``beta * (own key)`` to every query (peaked attention; pair with ``self_including``).
+    ``dout_layout="head_major"`` stores ``dout`` as ``[64, T, 512]`` and returns the
+    ``[T, 64, 512]`` view with strides ``[512, T * 512, 1]`` (the recorded trainer layout).
+    """
+    seq_q, seq_k = [int(x) for x in seq_q], [int(x) for x in seq_k]
+    if len(seq_q) != len(seq_k) or any(
+        lq > lk for lq, lk in zip(seq_q, seq_k, strict=True)
+    ):
+        raise ValueError(
+            "documents need seq_q <= seq_k, one key length per query length"
+        )
+    if index not in ("pooled", "iid"):
+        raise ValueError(f"index must be 'pooled' or 'iid', got {index!r}")
+    if dout_layout not in ("contiguous", "head_major"):
+        raise ValueError(
+            f"dout_layout must be 'contiguous' or 'head_major', got {dout_layout!r}"
+        )
+    if pools is None:
+        pools = nope_pools(topk) if index == "pooled" else None
+    device = torch.device(device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+    total_q, total_k = sum(seq_q), sum(seq_k)
+    q = _randn_bf16((total_q, NUM_HEADS, D_LATENT), gen, device)
+    kv = _randn_bf16((total_k, D_LATENT), gen, device)
+    if dout_layout == "head_major":
+        dout = _randn_bf16((NUM_HEADS, total_q, D_LATENT), gen, device).permute(1, 0, 2)
+    else:
+        dout = _randn_bf16((total_q, NUM_HEADS, D_LATENT), gen, device)
+    cu_q = [0] + torch.tensor(seq_q).cumsum(0).tolist()
+    cu_k = [0] + torch.tensor(seq_k).cumsum(0).tolist()
+    locals_, globals_, own = [], [], []
+    for d, (lq, lk) in enumerate(zip(seq_q, seq_k, strict=True)):
+        if index == "pooled":
+            loc = pooled_topk_local(
+                lq, lk, topk, gen, device, pools=pools, self_including=self_including
+            )
+        else:
+            loc = causal_topk_local(
+                lq, lk, topk, gen, device, self_including=self_including
+            )
+        locals_.append(loc)
+        globals_.append(torch.where(loc >= 0, loc + cu_k[d], loc))
+        own.append(torch.arange(lq, device=device) + (cu_k[d] + lk - lq))
+    idx_local = torch.cat(locals_, 0).contiguous()
+    idx_global = torch.cat(globals_, 0).contiguous()
+    own_key = torch.cat(own)
+    if beta:
+        q.add_(kv[own_key][:, None, :], alpha=beta)
+    return NopeInputs(
+        seq_q=seq_q,
+        seq_k=seq_k,
+        topk=topk,
+        q=q,
+        kv=kv,
+        dout=dout,
+        cu_seqlens_q=torch.tensor(cu_q, dtype=torch.int32, device=device),
+        cu_seqlens_k=torch.tensor(cu_k, dtype=torch.int32, device=device),
+        idx_local=idx_local,
+        idx_global=idx_global,
+        topk_length=(idx_local >= 0).sum(-1).to(torch.int32).contiguous(),
+        own_key=own_key,
+        index=index,
+        pools=pools,
+        dout_layout=dout_layout,
+    )
+
+
+@torch.no_grad()
+def reference_fp64_nope(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    dout: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    softmax_scale: float = DEFAULT_NOPE_SCALE,
+    own_key: Optional[torch.Tensor] = None,
+    chunk_rows: int = 256,
+    consume: Optional[Callable[[int, int, dict], None]] = None,
+) -> dict:
+    """Chunked FP64 reference of the NoPE problem from the BF16 inputs (the oracle of
+    GOAL §5 for the zero-RoPE family; ``indices`` are global key rows).
+
+    ``p = softmax_j(q . kv_j * softmax_scale)`` over the valid slots, ``out = p @ kv``.
+    Returns ``out [T, 64, 512]``, natural-log ``lse [T, 64]`` (``-inf`` for fully masked
+    rows), ``out_emu`` (BF16-P numerics floor, as :func:`reference_fp64`) and, with
+    ``dout``, ``dq [T, 64, 512]``, the combined ``dkv [S, 512] = dk + dv`` (the gradient of
+    the shared latent: ``dS^T q`` plus ``P^T dout``), ``dq_emu`` / ``dkv_emu`` (BF16 P/dS at
+    the MMA inputs, BF16 outputs) and, with ``own_key``, ``self_weight``.  Slots that are
+    ``-1``, ``>= S`` or ``>= topk_length[t]`` are invalid.  ``consume`` streams the
+    per-query results as in :func:`reference_fp64` (``out``, ``lse``, ``out_emu``, ``dq``,
+    ``dq_emu``).
+    """
+    device = q.device
+    total_q, total_k = int(q.shape[0]), int(kv.shape[0])
+    vf = kv.double()
+    want_grad = dout is not None
+    stream = consume is not None
+    out = out_emu = lse = dq = dq_emu = None
+    if not stream:
+        out = torch.empty(
+            total_q, NUM_HEADS, D_LATENT, dtype=torch.float64, device=device
+        )
+        out_emu = torch.empty_like(out)
+        lse = torch.empty(total_q, NUM_HEADS, dtype=torch.float64, device=device)
+        dq = torch.empty_like(out) if want_grad else None
+        dq_emu = torch.empty_like(out) if want_grad else None
+    dkv = (
+        torch.zeros(total_k, D_LATENT, dtype=torch.float64, device=device)
+        if want_grad
+        else None
+    )
+    dkv_emu = torch.zeros_like(dkv) if want_grad else None
+    self_w = torch.zeros((), dtype=torch.float64, device=device)
+    slot = torch.arange(indices.shape[1], device=device)
+    for r0 in range(0, total_q, chunk_rows):
+        r1 = min(total_q, r0 + chunk_rows)
+        ix = indices[r0:r1].long()
+        valid = (ix >= 0) & (ix < total_k)
+        if topk_length is not None:
+            valid &= slot[None, :] < topk_length[r0:r1, None].long()
+        ixs = ix.clamp(0, total_k - 1)
+        vg = vf[ixs]
+        ql = q[r0:r1].double()
+        s = torch.einsum("thd,twd->thw", ql, vg)
+        s = (s * softmax_scale).masked_fill(~valid[:, None, :], float("-inf"))
+        l = torch.logsumexp(s, dim=-1)
+        p = torch.exp(s - l[..., None]).nan_to_num(0.0)
+        o = torch.einsum("thw,twd->thd", p, vg)
+        if not stream:
+            out[r0:r1], lse[r0:r1] = o, l
+        m = s.amax(dim=-1, keepdim=True)
+        m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
+        p_rel = torch.exp(s - m).nan_to_num(0.0)
+        num = torch.einsum("thw,twd->thd", p_rel.to(torch.bfloat16).double(), vg)
+        o_emu = (
+            (num / p_rel.sum(-1, keepdim=True))
+            .nan_to_num(0.0)
+            .to(torch.bfloat16)
+            .double()
+        )
+        if stream:
+            chunk = dict(out=o, lse=l, out_emu=o_emu)
+        else:
+            out_emu[r0:r1] = o_emu
+        del p_rel, num, o_emu
+        if own_key is not None:
+            is_own = (ix == own_key[r0:r1, None]) & valid
+            self_w += (p * is_own[:, None, :]).sum()
+        if want_grad:
+            g = dout[r0:r1].double()
+            dp = torch.einsum("thd,twd->thw", g, vg)
+            ds = p * (dp - (g * o).sum(-1, keepdim=True)) * softmax_scale
+            dq_c = torch.einsum("thw,twd->thd", ds, vg)
+            if stream:
+                chunk.update(dq=dq_c)
+            else:
+                dq[r0:r1] = dq_c
+            del dq_c
+            # combined latent gradient: the key part dS^T q and the value part P^T dout
+            dkv_c = torch.einsum("thw,thd->twd", ds, ql) + torch.einsum(
+                "thw,thd->twd", p, g
+            )
+            dkv.index_add_(0, ix[valid], dkv_c[valid])
+            del dkv_c
+            p_b = p.to(torch.bfloat16).double()
+            ds_b = ds.to(torch.bfloat16).double()
+            dq_emu_c = (
+                torch.einsum("thw,twd->thd", ds_b, vg).to(torch.bfloat16).double()
+            )
+            if stream:
+                chunk.update(dq_emu=dq_emu_c)
+            else:
+                dq_emu[r0:r1] = dq_emu_c
+            del dq_emu_c
+            dkv_emu.index_add_(
+                0,
+                ix[valid],
+                (
+                    torch.einsum("thw,thd->twd", ds_b, ql)
+                    + torch.einsum("thw,thd->twd", p_b, g)
+                )[valid],
+            )
+            del p_b, ds_b
+        if stream:
+            consume(r0, r1, chunk)
+            del chunk
+    result = {} if stream else dict(out=out, lse=lse, out_emu=out_emu)
+    if want_grad:
+        if not stream:
+            result.update(dq=dq, dq_emu=dq_emu)
+        result.update(dkv=dkv, dkv_emu=dkv_emu.to(torch.bfloat16).double())
+    if own_key is not None:
+        result["self_weight"] = (self_w / (total_q * NUM_HEADS)).item()
+    return result
+
+
+def calibrate_beta_nope(
+    target_self_weight: float,
+    *,
+    seed: int,
+    probe_len: int = 4096,
+    topk: int = DEFAULT_NOPE_TOPK,
+    index: str = "iid",
+    pools: Optional[int] = None,
+    softmax_scale: float = DEFAULT_NOPE_SCALE,
+    device="cuda",
+) -> float:
+    """``beta`` of :func:`make_nope_inputs` giving the mean own-key softmax mass ``target``
+    on a ``probe_len x probe_len`` peaked NoPE problem at ``softmax_scale`` (bisection on
+    :func:`reference_fp64_nope`; the RoPE calibration does not apply: it adds ``beta`` to
+    both query parts at the 576-scale)."""
+    lo, hi = 0.0, 8.0
+    for _ in range(18):
+        mid = 0.5 * (lo + hi)
+        inp = make_nope_inputs(
+            [probe_len],
+            [probe_len],
+            seed=seed,
+            topk=topk,
+            index=index,
+            pools=pools,
+            self_including=True,
+            beta=mid,
+            device=device,
+        )
+        w = reference_fp64_nope(
+            inp.q,
+            inp.kv,
+            inp.idx_global,
+            softmax_scale=softmax_scale,
+            own_key=inp.own_key,
+        )["self_weight"]
+        if w < target_self_weight:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
