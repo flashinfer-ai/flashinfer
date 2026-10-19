@@ -5,6 +5,7 @@ import importlib
 import importlib.metadata
 import io
 import json
+import os
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
