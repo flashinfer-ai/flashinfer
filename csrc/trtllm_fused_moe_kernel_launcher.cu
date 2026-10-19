@@ -1056,18 +1056,20 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
          "ActivationType::SwigluStep with MxFp8.";
 }
 
-std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_tile_nums,
+std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& ascending_supported_tile_sizes,
                                        int64_t const num_tokens, int64_t const top_k,
                                        int64_t const num_local_experts,
                                        int const num_smaller_tile_candidates = 2) {
-  TVM_FFI_ICHECK(!supported_tile_nums.empty()) << "supported_tile_nums must not be empty.";
+  TVM_FFI_ICHECK(!ascending_supported_tile_sizes.empty())
+      << "ascending_supported_tile_sizes must not be empty.";
   TVM_FFI_ICHECK(num_tokens >= 0) << "num_tokens must be non-negative.";
   TVM_FFI_ICHECK(top_k > 0) << "top_k must be positive.";
   TVM_FFI_ICHECK(num_local_experts > 0) << "num_local_experts must be positive.";
-  TVM_FFI_ICHECK(std::is_sorted(supported_tile_nums.begin(), supported_tile_nums.end()))
-      << "supported_tile_nums must be sorted.";
-  TVM_FFI_ICHECK(supported_tile_nums.front() > 0)
-      << "supported_tile_nums must contain only positive values.";
+  TVM_FFI_ICHECK(
+      std::is_sorted(ascending_supported_tile_sizes.begin(), ascending_supported_tile_sizes.end()))
+      << "ascending_supported_tile_sizes must be sorted.";
+  TVM_FFI_ICHECK(ascending_supported_tile_sizes.front() > 0)
+      << "ascending_supported_tile_sizes must contain only positive values.";
   double const avg_tokens_per_expert =
       static_cast<double>(num_tokens) * static_cast<double>(top_k) / num_local_experts;
   // NOTE: This differs from Python AutoTuner bucketing:
@@ -1076,10 +1078,11 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_til
   // Because they bucket different quantities, cache bucket and runtime tile candidates can
   // diverge; launcher-side tactic resolution handles that mismatch.
   auto it = std::lower_bound(
-      supported_tile_nums.begin(), supported_tile_nums.end(), avg_tokens_per_expert,
+      ascending_supported_tile_sizes.begin(), ascending_supported_tile_sizes.end(),
+      avg_tokens_per_expert,
       [](int32_t tile, double average) { return static_cast<double>(tile) < average; });
-  if (it == supported_tile_nums.end()) {
-    it = std::prev(supported_tile_nums.end());
+  if (it == ascending_supported_tile_sizes.end()) {
+    it = std::prev(ascending_supported_tile_sizes.end());
   }
 
   // Candidate tile set centered on the heuristic tile.
@@ -1088,9 +1091,9 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_til
   // Final tile choice is made later (autotuner-provided tile if valid, otherwise fallback policy).
   std::set<int32_t> selected_tile_nums;
   selected_tile_nums.insert(*it);
-  if (std::next(it) != supported_tile_nums.end()) {
+  if (std::next(it) != ascending_supported_tile_sizes.end()) {
     selected_tile_nums.insert(*std::next(it));
-    if (std::next(std::next(it)) != supported_tile_nums.end()) {
+    if (std::next(std::next(it)) != ascending_supported_tile_sizes.end()) {
       selected_tile_nums.insert(*std::next(std::next(it)));
     }
   }
@@ -1099,7 +1102,8 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_til
   // adding a tile to the ladder (e.g. 192) does not push the best smaller tile out of its window;
   // the default-tactic path keeps one.
   auto down = it;
-  for (int i = 0; i < num_smaller_tile_candidates && down != supported_tile_nums.begin(); ++i) {
+  for (int i = 0; i < num_smaller_tile_candidates && down != ascending_supported_tile_sizes.begin();
+       ++i) {
     down = std::prev(down);
     selected_tile_nums.insert(*down);
   }
@@ -1107,21 +1111,20 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_til
   return selected_tile_nums;
 }
 
-int64_t selectDefaultTileN(std::vector<int32_t> const& supported_tile_nums,
+int64_t selectDefaultTileN(std::vector<int32_t> const& ascending_supported_tile_sizes,
                            int64_t const num_tokens, int64_t const top_k,
                            int64_t const num_local_experts) {
   auto selected =
-      computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts, 1);
+      computeSelectedTileN(ascending_supported_tile_sizes, num_tokens, top_k, num_local_experts, 1);
   TVM_FFI_ICHECK(!selected.empty()) << "No selected tile_N candidates for current MoE input.";
   return *selected.begin();
 }
 
 // Resolve the (tile_N, config) pair passed from Python side, applying fallback logic
 // when tile_N is -1.
-std::pair<int64_t, int64_t> resolveMoeTileAndConfig(Array<int64_t> const& config_index,
-                                                    std::vector<int32_t> const& supported_tile_nums,
-                                                    int64_t const num_tokens, int64_t const top_k,
-                                                    int64_t const num_local_experts) {
+std::pair<int64_t, int64_t> resolveMoeTileAndConfig(
+    Array<int64_t> const& config_index, std::vector<int32_t> const& ascending_supported_tile_sizes,
+    int64_t const num_tokens, int64_t const top_k, int64_t const num_local_experts) {
   // Python side convention: tactic is [tile_N, config]
   TVM_FFI_ICHECK(config_index.size() == 2)
       << "Invalid tactic, expected to be [tile_N, config], but got array of size "
@@ -1132,7 +1135,7 @@ std::pair<int64_t, int64_t> resolveMoeTileAndConfig(Array<int64_t> const& config
   if (tile_N == -1 || config == -1) {
     // Use fallback tactic
     auto const default_tile_N =
-        selectDefaultTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
+        selectDefaultTileN(ascending_supported_tile_sizes, num_tokens, top_k, num_local_experts);
     return {default_tile_N, -1};
   }
 
