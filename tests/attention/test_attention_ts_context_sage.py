@@ -14,14 +14,14 @@ from flashinfer.attention.prims_ts import (
     SageAttentionParams,
 )
 from flashinfer.utils import get_compute_capability
-from tests.attention.test_attention_ts_sage import (
-    _REQUIRES_INT8_QK_GPU,
-    _dequantize,
-    _fold,
-    _ieee_float32_references,  # noqa: F401
-    _random_qk,
-    _random_qk_scales,
-    _reference_sage_scales,
+from tests.attention.sage_test_utils import (
+    REQUIRES_INT8_QK_GPU,
+    dequantize,
+    fold,
+    ieee_float32_references,  # noqa: F401
+    random_qk,
+    random_qk_scales,
+    reference_sage_scales,
 )
 
 _FP8 = torch.float8_e4m3fn
@@ -91,7 +91,7 @@ def _random_params(
     qk_dtype: torch.dtype = _FP8,
 ) -> SageAttentionParams:
     """Random positive scales for ``qk_dtype`` Q/K and E4M3 V."""
-    q_scale, k_scale = _random_qk_scales(
+    q_scale, k_scale = random_qk_scales(
         num_qo_heads,
         num_kv_heads,
         batch_size,
@@ -120,8 +120,8 @@ def _reference(q, k, v, params: SageAttentionParams, *, config, sm_scale: float)
     batch_size, seq_len_kv, num_kv_heads, _ = k.shape
     num_qo_heads = q.shape[2]
     group = num_qo_heads // num_kv_heads
-    q_real = _dequantize(q, params.q_scale, config.q_block_size)
-    k_real = _dequantize(k, params.k_scale, config.k_block_size)
+    q_real = dequantize(q, params.q_scale, config.q_block_size)
+    k_real = dequantize(k, params.k_scale, config.k_block_size)
     output = torch.zeros(q.shape, device="cuda")
     for batch_idx in range(batch_size):
         for kv_head in range(num_kv_heads):
@@ -138,7 +138,7 @@ def _reference(q, k, v, params: SageAttentionParams, *, config, sm_scale: float)
             for begin in range(0, seq_len_kv, _KV_TILE):
                 tile = slice(begin, begin + _KV_TILE)
                 # The kernel's P scale is one at this headroom.
-                state = _fold(
+                state = fold(
                     state,
                     logits[..., tile],
                     v[batch_idx, tile, kv_head].float(),
@@ -168,7 +168,7 @@ _INT8_K_BLOCK_SIZES = (16, 4, 1)
         (2, 300, 1004, 8, 4, 2, 4, True, _FP8),
         (1, 512, 1000, 4, 4, 1, 1, False, _FP8),
         *(
-            pytest.param(*case, _INT8, marks=_REQUIRES_INT8_QK_GPU)
+            pytest.param(*case, _INT8, marks=REQUIRES_INT8_QK_GPU)
             for case in (
                 (1, 1024, 1024, 8, 8, 1, 16, False),
                 (2, 300, 1004, 8, 4, 2, 4, True),
@@ -207,8 +207,8 @@ def test_context_sage_matches_dequantized_reference(
         sage=config, sm_scale=sm_scale, **_qk_dtype_options(qk_dtype), **shape
     )
     params = _random_params(config, qk_dtype=qk_dtype, **shape)
-    q = _random_qk((batch_size, seq_len_q, num_qo_heads, _HEAD_DIM), qk_dtype)
-    k = _random_qk((batch_size, seq_len_kv, num_kv_heads, _HEAD_DIM), qk_dtype)
+    q = random_qk((batch_size, seq_len_q, num_qo_heads, _HEAD_DIM), qk_dtype)
+    k = random_qk((batch_size, seq_len_kv, num_kv_heads, _HEAD_DIM), qk_dtype)
     v = torch.randn(k.shape, device="cuda").to(_FP8)
     actual = wrapper.run(q, k, v, sage=params)
     torch.cuda.synchronize()
@@ -219,7 +219,7 @@ def test_context_sage_matches_dequantized_reference(
 
 
 @_REQUIRES_CONTEXT_SAGE_GPU
-@_REQUIRES_INT8_QK_GPU
+@REQUIRES_INT8_QK_GPU
 @pytest.mark.parametrize("k_block_size", _INT8_K_BLOCK_SIZES)
 @torch.no_grad()
 def test_context_int8_extreme_scores_stay_in_the_bias_binade(k_block_size) -> None:
@@ -232,8 +232,8 @@ def test_context_int8_extreme_scores_stay_in_the_bias_binade(k_block_size) -> No
     sm_scale = _HEAD_DIM**-0.5
     wrapper = _plan(sage=config, sm_scale=sm_scale, **_qk_dtype_options(_INT8), **shape)
     params = _random_params(config, qk_dtype=_INT8, **shape)
-    q = _random_qk((1, 256, 2, _HEAD_DIM), _INT8)
-    k = _random_qk((1, 1000, 2, _HEAD_DIM), _INT8)
+    q = random_qk((1, 256, 2, _HEAD_DIM), _INT8)
+    k = random_qk((1, 1000, 2, _HEAD_DIM), _INT8)
     # Query token 5 against key tokens 300 and 700 gives the extreme dot
     # products +2**21 and -128 * 127 * 128; their scales keep the logits
     # near +-2 so both stay visible in the softmax.
@@ -298,7 +298,7 @@ def test_context_sage_prepared_scales_match_reference(
     assert out.shape == q.shape and out.dtype == torch.bfloat16
     state = wrapper._plan_state.sage
     assert state is not None
-    reference = _reference_sage_scales(
+    reference = reference_sage_scales(
         state.layout, params, batch_size=batch_size, num_kv_heads=num_kv_heads
     )
     torch.testing.assert_close(state.scales, reference, rtol=0, atol=0)
