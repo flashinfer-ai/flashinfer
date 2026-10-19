@@ -131,12 +131,16 @@ and infinity macro are renamed for the public export (`CakeTensorMap`, `CakeTens
 `CakeTensorMapPack`, `CAKE_INF`); the export tool checks that the inverse substitution restores
 the generator's text.
 
-Register use at the shipped test geometries (EP 4 / 8 / 16 / 32, both variants): 150-168, zero
-local memory (the `m128` copier-free instance runs at the 168-register cap; DeepSeek-V3, Qwen3 and
-H7680 at EP 32 compile spill-free).  Above 16 ranks (outside the generator's exhaustive compile
-grid) `validate_init` builds the device module the deployment may launch — the same module the
-workspace loads — and raises `MoEEpConfigError` on any that spills; the
-workspace re-checks every loaded instance (`CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES <= 8`, the generated code's own stack frame).
+Register use at the shipped test geometries plus DeepSeek-V4.1-Flash (E384 / H5120 / I2304 /
+top-k 6), EP 4 / 8 / 16, both variants, every copier count the tables select (352 instances):
+154-168 with nvcc 13.0.88 and 157-168 with nvcc 13.3.73, stack 8 / local 0 for every instance
+(the `m128` instances run at the 168-register cap).  At EP 32 (the same shapes, 128 instances)
+13.0.88 compiles every instance spill-free; 13.2 and 13.3 spill the Qwen3-235B `:l0` fp8shared
+`m128_nocopier`.  Register allocation depends on the toolkit, so `validate_init` builds the
+device module a deployment may launch (the same module the workspace loads) at every rank count
+and raises `MoEEpConfigError` on any instance that spills, naming its registers, stack and local
+bytes and the nvcc release; the workspace re-checks every loaded instance
+(`CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES <= 8`, the generated code's own stack frame).
 
 **libcu++ automatic-storage check.** The device source defines
 `_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE` before it includes `nccl_device.h`.  The libcu++ headers
@@ -185,8 +189,16 @@ division and remainder); nothing is `eval`-ed.
   Device API of the headers it is compiled against, and only 2.30.7 is validated.  Headers and
   library are found as `flashinfer/jit/comm.py` finds NCCL: `NCCL_HOME`, then the
   `nvidia-nccl-cu13==2.30.7` wheel.
-* CUDA 13.x toolkit (`cuTensorMapEncodeTiled` via the driver entry point; `cuLaunchCooperativeKernel`;
-  `-lcuda`).
+* CUDA 13 toolkit (`cuTensorMapEncodeTiled` via the driver entry point; `cuLaunchCooperativeKernel`;
+  `-lcuda`).  The device build uses the compiler and headers of one release, found through
+  `CUDA_HOME`.  All multi-GPU tests run with **13.0.88**.  The register grid above (EP 4 / 8 / 16)
+  compiles spill-free with 13.0.48, 13.0.88, 13.2.51, 13.2.78, 13.2.86, 13.3.33 and 13.3.73
+  (compile only for the releases other than 13.0.88).  Other releases allocate registers
+  differently and spill a few instances: 13.1.80 / 13.1.115 the `m128_copier` at EP 8 for
+  Qwen3-30B (noshared) and DeepSeek-V4.1-Flash (fp8shared); 13.4.59 / 13.4.92 nearly every
+  `m128` instance at EP 8 and some `m64` instances at EP 8 / 16 (EP 4 is spill-free).  `validate_init`
+  refuses such a build with the nvcc release in the message; point `CUDA_HOME` at a release
+  listed above and clear the JIT cache.
 * An initialized `torch.distributed` **NCCL** process group for the EP domain (the session adopts
   its `ncclComm_t`).
 * Window memory per rank grows with world size x rows x top-k (the result windows dominate:

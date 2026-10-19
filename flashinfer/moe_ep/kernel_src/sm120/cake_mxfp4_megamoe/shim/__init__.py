@@ -7,6 +7,7 @@ from .cake_jit import (
     INSTANCE_NAMES,
     cake_sm120_megamoe_available,
     check_exact_sm120,
+    cuobjdump_path,
     device_cubin,
     device_cubin_resource_usage,
     device_defines,
@@ -15,6 +16,7 @@ from .cake_jit import (
     gen_cake_sm120_megamoe_module,
     load_cake_sm120_megamoe_module,
     nccl_installation,
+    nvcc_version,
     read_geometry,
     read_manifest,
 )
@@ -26,6 +28,7 @@ __all__ = [
     "INSTANCE_NAMES",
     "cake_sm120_megamoe_available",
     "check_exact_sm120",
+    "cuobjdump_path",
     "device_cubin",
     "device_cubin_resource_usage",
     "device_defines",
@@ -34,6 +37,7 @@ __all__ = [
     "gen_cake_sm120_megamoe_module",
     "load_cake_sm120_megamoe_module",
     "nccl_installation",
+    "nvcc_version",
     "read_geometry",
     "read_manifest",
 ]

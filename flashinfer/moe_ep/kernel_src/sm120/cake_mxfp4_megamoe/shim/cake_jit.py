@@ -43,6 +43,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -234,6 +235,31 @@ def _nvcc() -> str:
     return os.environ.get("NVCC", "nvcc")
 
 
+@functools.cache
+def nvcc_version() -> str:
+    """Release of the nvcc that compiles the device instances, e.g. ``"13.0.88"``.
+
+    Register allocation of the device instances depends on it (``"unknown"`` when
+    ``nvcc --version`` does not run or reports no release).
+    """
+
+    try:
+        completed = subprocess.run(
+            [_nvcc(), "--version"], capture_output=True, text=True, check=False
+        )
+    except OSError:
+        return "unknown"
+    match = re.search(r"\bV(\d+\.\d+\.\d+)\b", completed.stdout)
+    return match.group(1) if match else "unknown"
+
+
+def cuobjdump_path() -> str | None:
+    """``cuobjdump`` next to the JIT's nvcc, else on ``PATH`` (``None`` without a CUDA toolkit)."""
+
+    cuobjdump = Path(_nvcc()).with_name("cuobjdump")
+    return str(cuobjdump) if cuobjdump.is_file() else shutil.which("cuobjdump")
+
+
 def _flavor_instances(copiers: bool) -> dict[int, dict[str, Any]]:
     """Manifest records of the flavor's instances, keyed by row-schedule height (128, 64)."""
 
@@ -387,8 +413,7 @@ def device_cubin_resource_usage(
     import tempfile
 
     cubin = device_cubin(parameters, instance)
-    cuobjdump = Path(_nvcc()).with_name("cuobjdump")
-    tool = str(cuobjdump) if cuobjdump.is_file() else "cuobjdump"
+    tool = cuobjdump_path() or "cuobjdump"
     with tempfile.NamedTemporaryFile(suffix=".cubin") as handle:
         handle.write(cubin)
         handle.flush()
@@ -454,6 +479,7 @@ __all__ = [
     "INSTANCE_NAMES",
     "cake_sm120_megamoe_available",
     "check_exact_sm120",
+    "cuobjdump_path",
     "device_cubin",
     "device_cubin_resource_usage",
     "device_defines",
@@ -462,6 +488,7 @@ __all__ = [
     "gen_cake_sm120_megamoe_module",
     "load_cake_sm120_megamoe_module",
     "nccl_installation",
+    "nvcc_version",
     "read_geometry",
     "read_manifest",
 ]

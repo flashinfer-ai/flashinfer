@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import ctypes
 import struct
+import warnings
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -393,17 +394,22 @@ def _check_scratch_extent(
 # register spill grows it (one spilled register = 16 bytes), so anything above this limit is
 # refused.
 LOCAL_BYTES_LIMIT = 8
-# Register-budget evidence (generator-side compile grid): all four instances of both variants
-# compile without spills at EP 2..16 for DeepSeek-V4-Flash, DeepSeek-V3, Qwen3-235B-A22B,
-# Qwen3-30B-A3B, a padded GPT-OSS shape, H512/top-1, top-9 with 96 local experts and
-# H7680 with one local expert (registers up to the 168 cap).  The M128 copier-free instance
-# runs at the 168-register cap; before the device-resident epoch it spilled one register at
-# 32 ranks for DeepSeek-V3, both Qwen3 shapes and H7680, and the shipped source compiles all of
-# them (and DeepSeek-V4-Flash, GPT-OSS-padded, 288 physical experts) spill-free at EP 32.
-# Above 16 ranks the shipped grid is not exhaustive, so ``validate_init`` still compiles the
-# instances a deployment may launch (same JIT cache the workspace uses) and rejects any that
-# spill.
-REGISTER_BUDGET_VERIFIED_MAX_RANKS = 16
+# nvcc releases the shipped register budget was checked with: every instance of the
+# test-shape grid (EP 4/8/16) compiles spill-free.  Register allocation differs between
+# releases and parameter sets, so ``validate_init`` compiles the instances a deployment may
+# launch at every rank count (same JIT cache the workspace uses) and rejects any that spill.
+VALIDATED_NVCC_VERSIONS = ("13.0.88", "13.3.73")
+
+
+def spill_message(instance_name: str, usage: Any, nvcc: str) -> str:
+    """Error text for an instance whose stack + local bytes exceed :data:`LOCAL_BYTES_LIMIT`."""
+
+    return (
+        f"the {instance_name} instance spills registers (REG {usage['reg']}, stack "
+        f"{usage['stack']} B, local {usage['local']} B per thread; limit "
+        f"{LOCAL_BYTES_LIMIT} B) with nvcc {nvcc}; validated toolkits: nvcc "
+        f"{' / '.join(VALIDATED_NVCC_VERSIONS)} (kernel package README)"
+    )
 
 
 def candidate_instances(transport_table: Any) -> tuple[int, ...]:
@@ -420,35 +426,43 @@ def check_device_resources(
     instances: tuple[int, ...],
     *,
     resource_usage: Any = None,
+    nvcc: Any = None,
 ) -> dict[int, dict[str, int]]:
     """Fail closed on parameter sets whose device build spills (no GPU needed).
 
-    Within the verified region (``params.ranks <= REGISTER_BUDGET_VERIFIED_MAX_RANKS``)
-    nothing is compiled.  Above it each candidate instance is compiled (cached) and its
-    stack + local bytes per thread must not exceed :data:`LOCAL_BYTES_LIMIT`, the same
-    limit the workspace enforces when it loads the instance.
+    Each candidate instance is compiled (cached; the workspace loads the same cubins) and
+    its stack + local bytes per thread must not exceed :data:`LOCAL_BYTES_LIMIT`, the same
+    limit the workspace enforces when it loads the instance.  ``resource_usage(parameters,
+    instance)`` and ``nvcc()`` (the compiler release named in the error) default to the
+    JIT loader's.
     """
 
-    if params.ranks <= REGISTER_BUDGET_VERIFIED_MAX_RANKS:
-        return {}
-    if resource_usage is None:
-        from ......kernel_src.sm120.cake_mxfp4_megamoe import (
-            device_cubin_resource_usage,
-        )
-
-        resource_usage = device_cubin_resource_usage
+    from ......kernel_src.sm120.cake_mxfp4_megamoe import (
+        cuobjdump_path,
+        device_cubin_resource_usage,
+        nvcc_version,
+    )
     from .cake_geometry import INSTANCE_NAMES
 
+    if resource_usage is None:
+        if cuobjdump_path() is None:
+            # No CUDA toolkit (packaged AOT modules only): the workspace still refuses a
+            # spilling instance when it loads it.
+            warnings.warn(
+                f"{KERNEL_NAME}: cuobjdump not found; the register-spill check of the "
+                "device instances runs when the workspace loads them",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return {}
+        resource_usage = device_cubin_resource_usage
+    nvcc = nvcc or nvcc_version
     report: dict[int, dict[str, int]] = {}
     for index in instances:
         usage = dict(resource_usage(params.device_parameters(), index))
         report[index] = usage
         if usage["stack"] + usage["local"] > LOCAL_BYTES_LIMIT:
-            raise GeometryError(
-                f"the {INSTANCE_NAMES[index]} instance spills registers at this parameter set "
-                f"(REG {usage['reg']}, stack {usage['stack']} B, local {usage['local']} B per "
-                f"thread; limit {LOCAL_BYTES_LIMIT} B)"
-            )
+            raise GeometryError(spill_message(INSTANCE_NAMES[index], usage, nvcc()))
     return report
 
 
@@ -788,9 +802,9 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             lsa_copiers = world - 1
         # Fail closed at construction on any parameter set the device source rejects
         # (the same guards the source checks with static_assert / #error) or whose
-        # device build would spill registers (checked by compiling above the verified
-        # rank range; the workspace reuses the cached cubins).  Tables resolved at
-        # workspace creation ("lsa_where_reachable", "auto") are checked again there
+        # device build spills registers with this nvcc (checked by compiling the
+        # candidate instances; the workspace reuses the cached cubins).  Tables resolved
+        # at workspace creation ("lsa_where_reachable", "auto") are checked again there
         # with their copier count.
         kernel = self._describe(world, fleet_params, lsa_copiers)
         try:
@@ -1131,9 +1145,25 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             )
             # Unloaded by the caller if the build fails, else by destroy().
             loaded_functions.append(function)
-            if int(module.function_local_bytes(function)) > LOCAL_BYTES_LIMIT:
+            local_bytes = int(module.function_local_bytes(function))
+            if local_bytes > LOCAL_BYTES_LIMIT:
+                from ......kernel_src.sm120.cake_mxfp4_megamoe import (
+                    cuobjdump_path,
+                    device_cubin_resource_usage,
+                    nvcc_version,
+                )
+
+                detail = f" (limit {LOCAL_BYTES_LIMIT} B) with nvcc {nvcc_version()}"
+                if cuobjdump_path() is not None:  # registers, stack and local apart
+                    usage = device_cubin_resource_usage(
+                        device_parameters, int(spec["instance"])
+                    )
+                    detail = ": " + spill_message(
+                        inst_name + suffix, usage, nvcc_version()
+                    )
                 raise RuntimeError(
-                    f"{KERNEL_NAME}: {inst_name}{suffix} uses local memory"
+                    f"{KERNEL_NAME}: {inst_name}{suffix} uses {local_bytes} B of local "
+                    f"memory per thread{detail}"
                 )
             smem = int(spec["smem_bytes"])
             blocks = int(module.function_max_active_blocks(function, threads, smem))
@@ -1603,13 +1633,14 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
 __all__ = [
     "KERNEL_NAME",
     "LOCAL_BYTES_LIMIT",
-    "REGISTER_BUDGET_VERIFIED_MAX_RANKS",
     "Sm120Mxfp4Mxfp8CakeMegaKernelBackend",
+    "VALIDATED_NVCC_VERSIONS",
     "candidate_instances",
     "check_device_resources",
     "even_expert_counts",
     "residency_grid",
     "rows_residency_grid",
     "scratch_specs",
+    "spill_message",
     "static_residency_grid",
 ]

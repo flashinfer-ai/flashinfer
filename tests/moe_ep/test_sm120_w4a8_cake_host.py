@@ -797,11 +797,12 @@ def test_geometry_rejects_outside_the_supported_region() -> None:
     G.describe_kernel(G.KernelParams(32, 256, 8, 1024, 7168, 2048, True))
 
 
-def test_device_resource_check_rejects_spills_above_the_verified_ranks() -> None:
+@pytest.mark.parametrize("ranks", [4, 8, 16, 32])
+def test_device_resource_check_rejects_spills_at_every_rank_count(ranks: int) -> None:
     G = _geometry()
     from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_backend import (
         LOCAL_BYTES_LIMIT,
-        REGISTER_BUDGET_VERIFIED_MAX_RANKS,
+        VALIDATED_NVCC_VERSIONS,
         candidate_instances,
         check_device_resources,
     )
@@ -814,26 +815,49 @@ def test_device_resource_check_rejects_spills_above_the_verified_ranks() -> None
         calls.append((parameters, instance))
         return {"reg": 168, "stack": 8, "local": 0}
 
-    inside = G.KernelParams(
-        REGISTER_BUDGET_VERIFIED_MAX_RANKS, 256, 8, 1024, 7168, 2048, False
-    )
-    assert check_device_resources(inside, (0, 1, 2, 3), resource_usage=clean) == {}
-    assert calls == []  # verified region: nothing is compiled
-    wide = G.KernelParams(32, 256, 8, 1024, 7168, 2048, False)
-    report = check_device_resources(wide, (2, 3), resource_usage=clean)
+    def nvcc() -> str:
+        return "13.3.73"
+
+    # DeepSeek-V4.1-Flash routed experts (the #6755 geometry).
+    params = G.KernelParams(ranks, 384, 6, 2048, 5120, 2304, False)
+    report = check_device_resources(params, (2, 3), resource_usage=clean, nvcc=nvcc)
     assert sorted(report) == [2, 3]
     assert [i for _, i in calls] == [2, 3]
-    assert all(p == wide.device_parameters() for p, _ in calls)
+    assert all(p == params.device_parameters() for p, _ in calls)
 
     def spills(parameters, instance):
         del parameters
-        stack = LOCAL_BYTES_LIMIT + 8 if instance == 2 else 8
-        return {"reg": 168, "stack": stack, "local": 0}
+        stack = LOCAL_BYTES_LIMIT + 8 if instance == 1 else 8
+        return {"reg": 166, "stack": stack, "local": 0}
 
-    with pytest.raises(G.GeometryError, match="m128_nocopier"):
-        check_device_resources(wide, (0, 1, 2, 3), resource_usage=spills)
-    # The copier-only flavors of the same build are fine.
-    check_device_resources(wide, (0, 1), resource_usage=spills)
+    with pytest.raises(G.GeometryError) as error:
+        check_device_resources(params, (0, 1, 2, 3), resource_usage=spills, nvcc=nvcc)
+    message = str(error.value)
+    assert "m64_copier" in message
+    assert "REG 166, stack 16 B, local 0 B" in message
+    assert "nvcc 13.3.73" in message
+    assert all(version in message for version in VALIDATED_NVCC_VERSIONS)
+    # The copier-free flavor of the same build is fine.
+    check_device_resources(params, (2, 3), resource_usage=spills, nvcc=nvcc)
+
+
+def test_device_resource_check_without_cuobjdump_defers_to_the_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    G = _geometry()
+    import flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe as package
+    from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_backend import (
+        check_device_resources,
+    )
+
+    def no_build(*args):
+        raise AssertionError("nothing is compiled without cuobjdump")
+
+    monkeypatch.setattr(package, "cuobjdump_path", lambda: None)
+    monkeypatch.setattr(package, "device_cubin_resource_usage", no_build)
+    params = G.KernelParams(8, 384, 6, 2048, 5120, 2304, False)
+    with pytest.warns(RuntimeWarning, match="cuobjdump not found"):
+        assert check_device_resources(params, (0, 1, 2, 3)) == {}
 
 
 def test_static_residency_grid_is_a_routing_independent_lower_bound() -> None:
