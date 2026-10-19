@@ -1352,7 +1352,6 @@ def test_trtllm_batch_prefill_dynamic_page_size_gqa(
         ("fp16", "fp16", "fp16"),
         ("fp8", "fp8", "fp8"),
         ("fp8", "fp8", "bf16"),
-        # Materialized to FP8: trtllm-gen has no NVFP4-KV kernel at 512.
         ("fp8", "nvfp4", "fp8"),
     ],
 )

@@ -326,9 +326,8 @@ def get_customize_batch_prefill_module(
     ).build_and_load()
 
 
-# trtllm-gen ships no NVFP4-KV context kernels above this head_dim: the
-# transformed K/V stages and scale-factor tiles do not fit in shared memory.
-# Larger head dims run the FP8 kernel on an FP8 copy of the active pages.
+# NVFP4-KV context attention above this head_dim runs the FP8 kernel on an
+# FP8 copy of the active pages.
 _TRTLLM_GEN_NVFP4_KV_MAX_HEAD_DIM = 256
 
 
@@ -343,12 +342,17 @@ def _materialize_nvfp4_kv_for_trtllm_gen(
     max_kv_len: int,
     batch_size: int,
     uses_shared_paged_kv_idx: bool,
+    kv_page_indptr: Optional[torch.Tensor] = None,
+    num_pages: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return ``(k_cache, v_cache, block_tables)`` for an FP8 copy of the pages.
 
     The tensor-level K/V scales already folded into ``bmm1_scale`` and
     ``bmm2_scale`` stay valid, since only block scales are applied here.
     The returned block table indexes the copy with shared K/V page indices.
+    Without ``kv_page_indptr`` the copy reserves ``ceil(max_kv_len / page_size)``
+    pages per request.
     """
     if query.dtype != torch.float8_e4m3fn:
         raise ValueError(
@@ -366,6 +370,9 @@ def _materialize_nvfp4_kv_for_trtllm_gen(
         seq_lens[:batch_size],
         max_kv_len,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+        out=out,
+        kv_page_indptr=kv_page_indptr,
+        num_pages=num_pages,
     )
     k_cache, v_cache = kv_cache_fp8.unbind(dim=1)
     return k_cache, v_cache, block_tables
@@ -3112,6 +3119,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         # arguments such as window_left); _backend holds the resolved value.
         self._requested_backend = backend
         self._backend = backend
+        # trtllm-gen NVFP4 KV above _TRTLLM_GEN_NVFP4_KV_MAX_HEAD_DIM: pages in
+        # the FP8 copy (set by plan) and the FP8 buffer reused across run() calls.
+        self._nvfp4_kv_num_pages: Optional[int] = None
+        self._nvfp4_kv_fp8_buffer: Optional[torch.Tensor] = None
         self._plan_info = None
         self._cached_module = None
         self._seq_lens_kv = None
@@ -4010,6 +4021,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         self._block_tables = block_tables
         if self._backend == "trtllm-gen":
+            # NVFP4 KV fallback: copy only the planned pages. Under CUDA graphs,
+            # size by the page buffer so a later plan fits the captured copy.
+            self._nvfp4_kv_num_pages = (
+                len(self._paged_kv_indices_buf)
+                if self.is_cuda_graph_enabled
+                else int(paged_kv_indptr_host[-1])
+            )
             # Allocated once per plan and reused across run() launches; the
             # trtllm-gen kernel self-resets the counters after each launch.
             self._trtllm_gen_multi_ctas_kv_counter_buffer = (
@@ -4336,6 +4354,49 @@ class BatchPrefillWithPagedKVCacheWrapper:
         use_fp16_softmax: Optional[bool] = None,
         uses_spcompress: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
+
+    def _materialize_nvfp4_kv(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        key_block_scales: torch.Tensor,
+        value_block_scales: torch.Tensor,
+        page_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """FP8 copy of the planned NVFP4 pages for the trtllm-gen context kernel.
+
+        The copy holds only the pages from :meth:`plan` and lives in a buffer
+        reused across :meth:`run` calls, which keeps its address stable for
+        CUDA graph replay.
+        """
+        assert self._nvfp4_kv_num_pages is not None, "plan() must run first"
+        shape = (
+            self._nvfp4_kv_num_pages + 1,
+            2,
+            self._num_kv_heads,
+            page_size,
+            q.shape[-1],
+        )
+        buf = self._nvfp4_kv_fp8_buffer
+        if buf is None or tuple(buf.shape) != shape:
+            buf = torch.empty(shape, dtype=torch.float8_e4m3fn, device=q.device)
+            self._nvfp4_kv_fp8_buffer = buf
+        return _materialize_nvfp4_kv_for_trtllm_gen(
+            q,
+            k_cache,
+            v_cache,
+            key_block_scales,
+            value_block_scales,
+            self._block_tables,
+            self._kv_lens_buffer,
+            self._max_kv_len,
+            self._batch_size,
+            True,
+            kv_page_indptr=self._paged_kv_indptr_buf[: self._batch_size + 1],
+            num_pages=self._nvfp4_kv_num_pages,
+            out=buf,
+        )
 
     @flashinfer_api(trace=gqa_paged_prefill_trace)
     def run(
@@ -4908,6 +4969,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
         else:
             if self._backend != "trtllm-gen":
                 assert self._plan_info is not None, "plan info is not initialized"
+            block_tables = self._block_tables
+            if (
+                self._backend == "trtllm-gen"
+                and key_block_scales is not None
+                and q.shape[-1] > _TRTLLM_GEN_NVFP4_KV_MAX_HEAD_DIM
+            ):
+                k_cache, v_cache, block_tables = self._materialize_nvfp4_kv(
+                    q, k_cache, v_cache, key_block_scales, value_block_scales, page_size
+                )
+                key_block_scales = value_block_scales = None
             run_args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -5006,7 +5077,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._workspace_size,
                     self._num_qo_heads,
                     self._num_kv_heads,
-                    self._block_tables,
+                    block_tables,
                     self._kv_lens_buffer,
                     page_size,
                     self._max_q_len,
@@ -8287,6 +8358,15 @@ def trtllm_batch_context_with_kv_cache(
 
         When :attr:`kv_layout` is ``NHD``, scale tensors are transposed to HND internally
         (incurring a ``.contiguous()`` copy). Use ``HND`` for better performance.
+
+        Above head_dim 256, the KV is first copied to FP8, reserving
+        ``ceil(max_kv_len / page_size)`` pages per request
+        (``2 * num_kv_heads * head_dim`` bytes per token), since only device-side
+        lengths are available here. For batches with mixed lengths, use
+        :class:`BatchPrefillWithPagedKVCacheWrapper`, which copies only the planned
+        pages, or call
+        :func:`flashinfer.quantization.kernels.nvfp4_kv_materialize_fp8` with
+        ``kv_page_indptr`` and pass its output to this function.
 
         **Contiguity requirements (trtllm-gen backend):**
 
