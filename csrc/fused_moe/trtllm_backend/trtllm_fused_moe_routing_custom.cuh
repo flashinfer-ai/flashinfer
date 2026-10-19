@@ -112,6 +112,9 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
   // then wait on primary grid
   if (params.mUsePdl) {
     cudaGridDependencySynchronize();
+    // Permit downstream launch early. Consumers must still synchronize their grid
+    // dependency before reading the routing outputs written below.
+    cudaTriggerProgrammaticLaunchCompletion();
   }
 #endif
 
@@ -313,14 +316,6 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
       }
     }
   }
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  // Trigger the secondary kernel AFTER all global memory writes (including permutation indices).
-  // The downstream kernels depend on all routing outputs being visible.
-  if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
-#endif
 }
 
 // Returns whether a compiled tier covered the runtime (numExperts, topK) and the
