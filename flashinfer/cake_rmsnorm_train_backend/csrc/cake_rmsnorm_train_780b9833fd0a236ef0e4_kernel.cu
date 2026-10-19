@@ -14,8 +14,38 @@
  * limitations under the License.
  */
 
-// Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
-#include "cake_rmsnorm_train_device_common.cuh"
+typedef signed char        int8_t;
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+#if defined(__CUDACC_RTC__)
+typedef unsigned long long uint64_t;
+#else
+typedef unsigned long      uint64_t;
+#endif
+static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
+typedef signed int         int32_t;
+typedef short int          int16_t;
+struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+
+#if defined(__CUDACC_RTC__)
+typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+#else
+#include <cuda.h>
+#endif
+
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
@@ -28,10 +58,12 @@
 #define GROUP_THREADS 64
 #define LAUNCH_BOUNDS_THREADS 64
 
+#include <math_constants.h>
+
 extern "C" {
 
 __global__ __launch_bounds__(LAUNCH_BOUNDS_THREADS) void
-kernel_cake_rmsnorm_train_780b9833fd0a236ef0e4(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ u, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ y, __nv_bfloat16* __restrict__ h_new, float* __restrict__ r, int T, long long x_stride, long long u_stride, float eps)
+kernel_cake_rmsnorm_train_780b9833fd0a236ef0e4(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ u, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ y, __nv_bfloat16* __restrict__ h_new, float* __restrict__ r, int T, float eps, long long x_stride_p0, long long u_stride_p0)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -52,8 +84,8 @@ kernel_cake_rmsnorm_train_780b9833fd0a236ef0e4(__nv_bfloat16* __restrict__ x, __
     const int cta_rank = 0;
 
     // Kernel setup ops
-    float* partials = reinterpret_cast<float*>(smem_raw + SMEM_PARTIALS_OFF);
-    const int partials_addr = smem + SMEM_PARTIALS_OFF;
+    float* partials = reinterpret_cast<float*>(smem_raw + 0);
+    const int partials_addr = smem + 0;
 
     // === Task calls (dependency order) ===
     int warp_0 = warp;
@@ -65,7 +97,7 @@ kernel_cake_rmsnorm_train_780b9833fd0a236ef0e4(__nv_bfloat16* __restrict__ x, __
     for (int row0 = bid * ROWS_PER_CTA; row0 < T; row0 += num_bids * ROWS_PER_CTA) {
         int row = row0 + group;
         long long row64 = (long long)row;
-        long long xbase = row64 * x_stride;
+        long long xbase = row64 * x_stride_p0;
         long long obase = row64 * 2048;
         float x_cache[32];
         float sum_sq = 0.0f;
@@ -106,7 +138,7 @@ kernel_cake_rmsnorm_train_780b9833fd0a236ef0e4(__nv_bfloat16* __restrict__ x, __
             for (int v_1 = 0; v_1 < 2; v_1++) {
                 #pragma unroll
                 for (int j_1 = 0; j_1 < 16; j_1++) {
-                    sum_sq += x_cache[v_1 * 16 + j_1] * x_cache[v_1 * 16 + j_1];
+                    sum_sq = __fmaf_rn(x_cache[v_1 * 16 + j_1], x_cache[v_1 * 16 + j_1], sum_sq);
                 }
             }
         }
@@ -193,3 +225,4 @@ kernel_cake_rmsnorm_train_780b9833fd0a236ef0e4(__nv_bfloat16* __restrict__ x, __
 }
 
 } // extern "C"
+

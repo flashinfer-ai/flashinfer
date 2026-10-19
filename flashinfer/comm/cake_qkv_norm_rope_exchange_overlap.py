@@ -44,6 +44,21 @@ bits.  Per call (current stream = producer stream):
 4. the current stream waits ``exchange_done[slot]`` so the outputs are
    consumable in stream order.
 
+Row-count gates (``plans.SHAPE_GATE_DEFAULT_BY_ARCH``, resolved once per session
+by :func:`resolve_shape_gates`: the architecture default unless
+``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` overrides it -- ``auto``, ``off`` or
+``gate=value,...`` with ``0`` = never; rank-uniform, checked collectively): a call
+with ``batch * s_local <= words_capacity_small_m`` rows publishes one readiness
+word per destination (``num_words = 1``), and a call with ``batch * s_local >=
+per_dest_large_m`` rows launches the producer once per destination run of its
+tile table (``plans.dest_parts``; on the folded path the first part carries the
+rendezvous and the later parts are the plain producer, stream-ordered behind it;
+on the barrier path every part is the plain producer) instead of one persistent
+grid.  SM100 / SM103 ship ``4096`` / ``16384``; SM90 ships both gates off.  The
+gates change the host plan only -- never the tile table or the stored bits -- and
+``describe()`` reports them (``shape_gates``) with every prepared row's verdict
+(``prepared_row_plans``).
+
 Eager calls publish a monotonic epoch; a call issued while the current stream
 is capturing publishes the sentinel ``0xFFFFFFFF``, clears its slot's words
 with one stream memset after the wait kernel, uses capture-local events and
@@ -114,6 +129,58 @@ def fold_barrier_from_env() -> Optional[bool]:
         raise ValueError(
             f"{FOLD_BARRIER_ENV} must be 0, 1 or auto, got {raw!r}"
         ) from None
+
+
+# Row-count gate override read once per session: ``auto`` (or unset) = the architecture default of
+# ``plans.SHAPE_GATE_DEFAULT_BY_ARCH``; ``off`` / ``0`` = every gate off; ``gate=value[,gate=value]`` with ``gate``
+# in ``plans.SHAPE_GATE_NAMES`` and ``value`` an int >= 0 (``0`` = never) or ``auto`` = that gate's default.
+SHAPE_GATES_ENV = "FLASHINFER_QKV_EXCHANGE_SHAPE_GATES"
+
+
+def shape_gates_from_env() -> Optional[dict[str, Optional[int]]]:
+    """The gate override of :data:`SHAPE_GATES_ENV`: ``None`` when unset or ``auto``; otherwise one entry per gate
+    (``None`` = keep the architecture default of that gate)."""
+
+    raw = os.environ.get(SHAPE_GATES_ENV, "").strip()
+    if not raw or raw.lower() == "auto":
+        return None
+    if raw.lower() in ("off", "0", "none"):
+        return {name: plans.SHAPE_GATE_OFF for name in plans.SHAPE_GATE_NAMES}
+    override: dict[str, Optional[int]] = {name: None for name in plans.SHAPE_GATE_NAMES}
+    for item in raw.replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        name, separator, value = item.partition("=")
+        name, value = name.strip(), value.strip()
+        if not separator or name not in plans.SHAPE_GATE_NAMES:
+            raise ValueError(
+                f"{SHAPE_GATES_ENV} must be auto, off or gate=value pairs over {plans.SHAPE_GATE_NAMES}, got {raw!r}"
+            )
+        if value.lower() == "auto":
+            override[name] = None
+        elif value.isdigit():
+            override[name] = int(value)
+        else:
+            raise ValueError(
+                f"{SHAPE_GATES_ENV}: {name} must be an int >= 0 or auto, got {value!r}"
+            )
+    return override
+
+
+def resolve_shape_gates(arch: str) -> tuple[dict[str, int], str]:
+    """The row-count gates of a session on ``arch``: the architecture default
+    (``plans.SHAPE_GATE_DEFAULT_BY_ARCH``) with :data:`SHAPE_GATES_ENV` applied on top.  Returns ``(gates, source)``
+    with ``source`` ``"default"`` or ``"env"``."""
+
+    gates = plans.default_shape_gates(arch)
+    override = shape_gates_from_env()
+    if override is None:
+        return plans.check_shape_gates(gates), "default"
+    for name, value in override.items():
+        if value is not None:
+            gates[name] = int(value)
+    return plans.check_shape_gates(gates), "env"
 
 
 def resolve_fold_barrier(
@@ -192,6 +259,16 @@ class _RowPlan:
     program: str
     # Both rendezvous phases of the folded producer of this tile width (empty where none is delivered).
     fold_programs: tuple[str, ...]
+    # The row-count gate verdict of this row and the producer launches it selects: ``(start, stop, grid, tiles)``
+    # per launch -- one whole-table entry for a persistent row, one per destination run for a ``per_dest`` row.
+    verdict: plans.ShapeGateVerdict
+    parts: tuple[tuple[int, int, int, torch.Tensor], ...]
+
+    @property
+    def launches_per_call(self) -> int:
+        """Producer launches of one call of this row (the wait kernel and, on the barrier path, the barrier add one each)."""
+
+        return len(self.parts)
 
 
 class CakeQkvExchangeSession:
@@ -241,6 +318,7 @@ class CakeQkvExchangeSession:
             arch, fold_barrier
         )
         self.fold_barrier_requested = fold_barrier
+        self.shape_gates, self.shape_gates_source = resolve_shape_gates(arch)
         self.group = group
         self.group_name = _group_name(group)
         self.rank = int(dist.get_rank(group=group))
@@ -314,8 +392,12 @@ class CakeQkvExchangeSession:
         self._wait_name = loader.wait_program(self.arch)
         self._wait = loader.load(self._wait_name, self.arch)
         self._producers: dict[str, Any] = {}
+        per_dest_reachable = (
+            plans.gate_rows(self.shape_gates, self.max_tokens).producer_launches
+            == "per_dest"
+        )
         for pair in self._reachable_pairs():
-            for name in self._launched_producers(pair):
+            for name in self._launched_producers(pair, per_dest=per_dest_reachable):
                 self._producers[name] = loader.load(name, self.arch)
 
         # Symmetric memory: receive slots, readiness pad, barrier flags (rendezvous = collective).  The
@@ -423,18 +505,22 @@ class CakeQkvExchangeSession:
             for phase in loader.FOLD_PHASES
         )
 
-    def _launched_producers(self, pair: bool) -> tuple[str, ...]:
-        """Producer programs the resolved launch path launches for this tile width."""
+    def _launched_producers(
+        self, pair: bool, *, per_dest: bool = False
+    ) -> tuple[str, ...]:
+        """Producer programs the resolved launch path launches for this tile width; a ``per_dest`` row on the
+        folded path adds the plain producer (its second and later destination parts)."""
 
+        plain = loader.producer_program(self.arch, self.bn, pair)
         if not self.fold_barrier:
-            return (loader.producer_program(self.arch, self.bn, pair),)
+            return (plain,)
         names = self._fold_producer_names(pair)
         if not names:
             raise RuntimeError(
                 f"fold_barrier=True, but {self.arch} delivers no folded producer for block_n={self.bn}, "
                 f"pair={pair}; pass fold_barrier=False"
             )
-        return names
+        return (*names, plain) if per_dest else names
 
     def _rank_uniform_probe(self, words: int) -> dict[str, Any]:
         """Collective self-check before the first launch: ``memset32_`` accepts the dedicated pad on every
@@ -452,6 +538,7 @@ class CakeQkvExchangeSession:
                 "rank": self.rank,
                 "error": local_error,
                 "fold_barrier": self.fold_barrier,
+                "shape_gates": dict(self.shape_gates),
             },
             group=self.group,
         )
@@ -468,6 +555,16 @@ class CakeQkvExchangeSession:
             raise RuntimeError(
                 f"the launch path differs across ranks (fold_barrier per rank: {paths}); pass the same "
                 f"fold_barrier keyword or the same {FOLD_BARRIER_ENV} value on every rank"
+            )
+        # The gates decide every rank's readiness words and launch count per row; they must agree before any launch.
+        gates = {
+            int(v["rank"]): tuple(sorted((v.get("shape_gates") or {}).items()))
+            for v in verdicts
+        }
+        if len(set(gates.values())) != 1:
+            raise RuntimeError(
+                f"the row-count gates differ across ranks (per rank: {gates}); set the same {SHAPE_GATES_ENV} value "
+                "on every rank (or none)"
             )
         return {"accepted": True, "words": int(words)}
 
@@ -501,29 +598,56 @@ class CakeQkvExchangeSession:
             raise ValueError(
                 "row geometry exceeds the receive slot capacity of the session"
             )
+        # Row-count gates of this call (the session's gates on ``rows = batch * s_local``): one readiness word per
+        # destination for a small row, one producer launch per destination run for a large row.
+        verdict = plans.gate_rows(self.shape_gates, int(geometry.rows))
+        words_capacity = (
+            verdict.words_capacity_per_dest
+            if verdict.words_capacity_per_dest is not None
+            else self.words_cap
+        )
         policy, plan = plans.plan_for(
             geometry,
             self.layout,
             self.rank,
             arch=self.arch,
             pair_available=self.pair_available[self.bn],
-            words_capacity_per_dest=self.words_cap,
+            words_capacity_per_dest=words_capacity,
         )
         if plan.bn != self.bn or plan.num_words > self.words_cap:
             raise RuntimeError("tile plan disagrees with the session capacity")
         program = loader.producer_program(self.arch, plan.bn, plan.pair)
-        for name in self._launched_producers(plan.pair):
+        per_dest = verdict.producer_launches == "per_dest"
+        for name in self._launched_producers(plan.pair, per_dest=per_dest):
             if name not in self._producers:
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError(
                         f"program {name!r} is not loaded; a JIT build cannot run inside a capture"
                     )
                 self._producers[name] = loader.load(name, self.arch)
+        tiles = plan.tiles.to(self.device)
+        ranges = plans.dest_parts(plan) if per_dest else ((0, plan.num_tiles),)
+        parts = tuple(
+            (
+                start,
+                stop,
+                plans.producer_grid(
+                    stop - start,
+                    sm_count=self.sm_count,
+                    reserved_sms=RESERVED_SMS,
+                    lockstep=plan.lockstep,
+                ),
+                tiles if (start, stop) == (0, plan.num_tiles) else tiles[start:stop],
+            )
+            for start, stop in ranges
+        )
         row = _RowPlan(
             policy=policy,
             plan=plan,
-            tiles=plan.tiles.to(self.device),
-            grid=plans.producer_grid(
+            tiles=tiles,
+            grid=parts[0][2]
+            if len(parts) == 1
+            else plans.producer_grid(
                 plan.num_tiles,
                 sm_count=self.sm_count,
                 reserved_sms=RESERVED_SMS,
@@ -531,6 +655,8 @@ class CakeQkvExchangeSession:
             ),
             program=program,
             fold_programs=self._fold_producer_names(plan.pair),
+            verdict=verdict,
+            parts=parts,
         )
         self._plans[key] = row
         return row
@@ -649,41 +775,49 @@ class CakeQkvExchangeSession:
                     stream.wait_event(self._exchange_done[slot])
                     fork = self._fork
                     done = self._exchange_done[slot]
-                producer_args = (
-                    x.view(plan.M, plan.K),
-                    w_qkv,
-                    cos_sin,
-                    q_scale,
-                    k_scale,
-                    row.tiles,
-                    self.dst_ptrs,
-                    self.ready_ptrs_fold if self.fold_barrier else self.ready_ptrs,
-                    self.counters,
-                    plan.num_tiles,
-                    plan.M,
-                    plan.K,
-                    s_local,
-                    plan.head_stride,
-                    plan.batch_stride,
-                    slot * self.slot_stride,
-                    pad_base,
-                    plan.num_words,
-                    self.rank,
-                    self.world_size,
-                    ready_target,
-                )
+                a_view = x.view(plan.M, plan.K)
+
+                def producer_args(tiles, num_tiles, ready_ptrs):
+                    # One launch over ``tiles`` (the whole table, or one destination run of a ``per_dest`` row);
+                    # every part shares the call's slot, pad and epoch.
+                    return (
+                        a_view,
+                        w_qkv,
+                        cos_sin,
+                        q_scale,
+                        k_scale,
+                        tiles,
+                        self.dst_ptrs,
+                        ready_ptrs,
+                        self.counters,
+                        num_tiles,
+                        plan.M,
+                        plan.K,
+                        s_local,
+                        plan.head_stride,
+                        plan.batch_stride,
+                        slot * self.slot_stride,
+                        pad_base,
+                        plan.num_words,
+                        self.rank,
+                        self.world_size,
+                        ready_target,
+                    )
+
                 with tvm_ffi.use_torch_stream():
                     if self.fold_barrier:
                         # Folded rendezvous: the fork is recorded before the producer so the wait kernel runs
-                        # beside it; the producer's rendezvous warp runs the cross-rank barrier of this call's
-                        # phase and releases every CTA's stores through the arrive flag.
+                        # beside it; the FIRST launch's rendezvous warp runs the cross-rank barrier of this call's
+                        # phase and releases every CTA's stores through the arrive flag; the later destination
+                        # parts of a ``per_dest`` row are the plain producer, stream-ordered behind it.
                         fork.record(stream)
+                        start, stop, grid, tiles = row.parts[0]
                         self._producers[row.fold_programs[phase]].run(
-                            *producer_args,
+                            *producer_args(tiles, stop - start, self.ready_ptrs_fold),
                             self.world_size,
                             self.rank,
                             self.flag_peers,
-                            row.grid,
+                            grid,
                             1,
                             1,
                         )
@@ -692,6 +826,13 @@ class CakeQkvExchangeSession:
                             # order behind the producer) so the next replay waits for a fresh rendezvous.
                             torch.ops.symm_mem.memset32_(
                                 self._ready, self.arrive_flag_offset, 0, 1
+                            )
+                        for start, stop, grid, tiles in row.parts[1:]:
+                            self._producers[row.program].run(
+                                *producer_args(tiles, stop - start, self.ready_ptrs),
+                                grid,
+                                1,
+                                1,
                             )
                     else:
                         self._barrier[phase].run(
@@ -704,7 +845,13 @@ class CakeQkvExchangeSession:
                             1,
                         )
                         fork.record(stream)
-                        self._producers[row.program].run(*producer_args, row.grid, 1, 1)
+                        for start, stop, grid, tiles in row.parts:
+                            self._producers[row.program].run(
+                                *producer_args(tiles, stop - start, self.ready_ptrs),
+                                grid,
+                                1,
+                                1,
+                            )
                     consumer.wait_event(fork)
                     with torch.cuda.stream(consumer):
                         self._wait.run(
@@ -793,12 +940,36 @@ class CakeQkvExchangeSession:
                 else self.fold_barrier_requested
             ),
             "fold_barrier_source": self.fold_barrier_source,
+            # The launch structure of a row below the per_dest gate; a row at or above it launches one producer
+            # part per destination run (``prepared_row_plans[row]["launches_per_call"]``).
             "launches_per_call": 2 if self.fold_barrier else 3,
             "launch_sequence": (
                 ["producer_fold<phase>", "wait"]
                 if self.fold_barrier
                 else ["barrier_p<phase>", "producer", "wait"]
             ),
+            "launch_sequence_per_dest": (
+                ["producer_fold<phase>", "producer (x parts - 1)", "wait"]
+                if self.fold_barrier
+                else ["barrier_p<phase>", "producer (x parts)", "wait"]
+            ),
+            "shape_gates": {
+                "values": dict(self.shape_gates),
+                "source": self.shape_gates_source,
+                "env": SHAPE_GATES_ENV,
+                "default": plans.default_shape_gates(self.arch),
+            },
+            "prepared_row_plans": {
+                f"{batch}x{s_local}": {
+                    **row.verdict.summary(),
+                    "num_words": row.plan.num_words,
+                    "producer_parts": row.launches_per_call,
+                    "launches_per_call": row.launches_per_call
+                    + (1 if self.fold_barrier else 2),
+                    "part_grids": [grid for _, _, grid, _ in row.parts],
+                }
+                for (batch, s_local), row in sorted(self._plans.items())
+            },
             "programs": {
                 "barrier_p0": self._barrier_names[0],
                 "barrier_p1": self._barrier_names[1],
@@ -838,11 +1009,14 @@ __all__ = [
     "EAGER_READY_TARGET_MAX",
     "FOLD_BARRIER_ENV",
     "RESERVED_SMS",
+    "SHAPE_GATES_ENV",
     "SUPPORTED_SYMMETRIC_MEMORY_BACKENDS",
     "CakeQkvExchangeSession",
     "device_arch",
     "fold_barrier_from_env",
     "resolve_fold_barrier",
+    "resolve_shape_gates",
+    "shape_gates_from_env",
     "supports_symmetric_memory_backend",
     "symmetric_memory_backend",
 ]
