@@ -393,6 +393,10 @@ template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
 cudaError_t SingleFP8PrefillWithKVCacheDispatched(Params& params, cudaStream_t stream) {
   static_assert(cutlass::sizeof_bits_v<typename Params::DTypeQ> == 8);
   static_assert(cutlass::sizeof_bits_v<typename Params::DTypeKV> == 8);
+  // Asymmetric K/V plumbing; this quantized path assumes one KV dtype.
+  static_assert(std::is_same_v<typename Params::DTypeK, typename Params::DTypeV>,
+                "SM90 SingleFP8PrefillWithKVCacheDispatched does not support "
+                "asymmetric K/V dtypes; only decode kernels do");
   static_assert(HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256);
   if (MASK_MODE == MaskMode::kCustom) {
     return cudaErrorNotSupported;  // Not supported yet.
@@ -436,6 +440,10 @@ template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
 cudaError_t BatchFP8PrefillWithPagedKVCacheDispatched(Params& params, bool enable_pdl,
                                                       cudaStream_t stream) {
   static_assert(HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256);
+  // Asymmetric K/V plumbing; this quantized path assumes one KV dtype.
+  static_assert(std::is_same_v<typename Params::DTypeK, typename Params::DTypeV>,
+                "SM90 BatchFP8PrefillWithPagedKVCacheDispatched does not "
+                "support asymmetric K/V dtypes; only decode kernels do");
   if (MASK_MODE == MaskMode::kCustom) {
     return cudaErrorNotSupported;  // Not supported yet.
   }
@@ -556,6 +564,10 @@ template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
 cudaError_t BatchFP8PrefillWithRaggedKVCacheDispatched(Params& params, bool enable_pdl,
                                                        cudaStream_t stream) {
   static_assert(HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256);
+  // Asymmetric K/V plumbing; this quantized path assumes one KV dtype.
+  static_assert(std::is_same_v<typename Params::DTypeK, typename Params::DTypeV>,
+                "SM90 BatchFP8PrefillWithRaggedKVCacheDispatched does not "
+                "support asymmetric K/V dtypes; only decode kernels do");
   if (MASK_MODE == MaskMode::kCustom) {
     return cudaErrorNotSupported;  // Not supported yet.
   }
