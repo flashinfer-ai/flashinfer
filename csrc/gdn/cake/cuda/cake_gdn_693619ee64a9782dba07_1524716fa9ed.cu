@@ -15,18 +15,19 @@
 // clang-format off
 // Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
 #include "cake_gdn_device_common.cuh"
+// The common preamble's fallback helper this module's helper library does not provide; the shared
+// header carries another member's library definition of the name (kept translation-unit-local).
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
+
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 128
-// Specializations of this record its compile line does not define (the shipped record carries them in its
-// own text); the values are the record's.
-#define H 16
-#define HV 32
-#define INTERMEDIATE_BATCH_STRIDE 1048576
-#define INTERMEDIATE_TOKEN_STRIDE 524288
-#define STRIDED_INPUTS 1
-#define SCALE 0.08838834764831845
 #ifndef H
 #error "H is a downstream specialization of this program; define it on the compile line"
 #endif
@@ -49,7 +50,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_gdn_decode_pretranspose_mtp_t2_inline_tile8(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, float* __restrict__ state, float* __restrict__ A_log, __nv_bfloat16* __restrict__ a, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ out, float* __restrict__ intermediate_state, int* __restrict__ initial_state_indices, long long state_size_p0, long long state_stride_p0, long long state_stride_p1, long long state_stride_p2, long long q_stride_p0, long long q_stride_p1, long long q_stride_p2, long long k_stride_p0, long long k_stride_p1, long long k_stride_p2, long long v_stride_p0, long long v_stride_p1, long long v_stride_p2, long long a_stride_p0, long long a_stride_p1, long long a_stride_p2, long long b_stride_p0, long long b_stride_p1, long long b_stride_p2)
+kernel_cake_gdn_693619ee64a9782dba07(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, float* __restrict__ state, float* __restrict__ A_log, __nv_bfloat16* __restrict__ a, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ out, float* __restrict__ intermediate_state, int* __restrict__ initial_state_indices, long long state_size_p0, long long state_stride_p0, long long state_stride_p1, long long state_stride_p2, long long q_stride_p0, long long q_stride_p1, long long q_stride_p2, long long k_stride_p0, long long k_stride_p1, long long k_stride_p2, long long v_stride_p0, long long v_stride_p1, long long v_stride_p2, long long a_stride_p0, long long a_stride_p1, long long a_stride_p2, long long b_stride_p0, long long b_stride_p1, long long b_stride_p2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -170,13 +171,11 @@ kernel_gdn_decode_pretranspose_mtp_t2_inline_tile8(__nv_bfloat16* __restrict__ q
         float _rsqrt_1 = rsqrtf(sum_k + 1e-06f);
         float inv_k = _rsqrt_1;
         float x = (float)a[gate_index] + r_dt_bias;
-        float softplus_x = x;
-        if (x <= 20.0f) {
-            float _expf_0 = __expf(x);
-            float _log2_0;
-            asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_0) : "f"(1.0f + _expf_0));
-            softplus_x = _log2_0 * 0.6931471805599453f;
-        }
+        float _expf_0 = __expf(x);
+        float _log2_0;
+        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_0) : "f"(1.0f + _expf_0));
+        float softplus_val = _log2_0 * 0.6931471805599453f;
+        float softplus_x = ((x <= 20.0f) ? softplus_val : x);
         float _expf_1 = __expf(-(float)b[b_index]);
         float _rcp_0 = approx_rcp(1.0f + _expf_1);
         float beta_val = _rcp_0;
@@ -225,20 +224,20 @@ kernel_gdn_decode_pretranspose_mtp_t2_inline_tile8(__nv_bfloat16* __restrict__ q
         h_a_pair1 = fma_f32x2_rn_ftz(k_pair1, k_scale_a, h_a_pair1);
         h_b_pair0 = fma_f32x2_rn_ftz(k_pair0, k_scale_b, h_b_pair0);
         h_b_pair1 = fma_f32x2_rn_ftz(k_pair1, k_scale_b, h_b_pair1);
+        r_h_a[0] = h_a_pair0.x;
+        r_h_a[1] = h_a_pair0.y;
+        r_h_a[2] = h_a_pair1.x;
+        r_h_a[3] = h_a_pair1.y;
+        r_h_b[0] = h_b_pair0.x;
+        r_h_b[1] = h_b_pair0.y;
+        r_h_b[2] = h_b_pair1.x;
+        r_h_b[3] = h_b_pair1.y;
         if (read_state_slot_valid != 0) {
             long long cache_head_base = (long long)n * (long long)INTERMEDIATE_BATCH_STRIDE + (long long)t * (long long)INTERMEDIATE_TOKEN_STRIDE + (long long)h * 16384;
-            r_h_a[0] = h_a_pair0.x;
-            r_h_a[1] = h_a_pair0.y;
-            r_h_a[2] = h_a_pair1.x;
-            r_h_a[3] = h_a_pair1.y;
             {
                 float4 _v4 = make_float4(r_h_a[0 + 0], r_h_a[0 + 1], r_h_a[0 + 2], r_h_a[0 + 3]);
                 *reinterpret_cast<float4*>(intermediate_state + cache_head_base + (long long)(v_row_a * 128) + (long long)k_start) = _v4;
             }
-            r_h_b[0] = h_b_pair0.x;
-            r_h_b[1] = h_b_pair0.y;
-            r_h_b[2] = h_b_pair1.x;
-            r_h_b[3] = h_b_pair1.y;
             {
                 float4 _v4 = make_float4(r_h_b[0 + 0], r_h_b[0 + 1], r_h_b[0 + 2], r_h_b[0 + 3]);
                 *reinterpret_cast<float4*>(intermediate_state + cache_head_base + (long long)(v_row_b * 128) + (long long)k_start) = _v4;
@@ -262,11 +261,9 @@ kernel_gdn_decode_pretranspose_mtp_t2_inline_tile8(__nv_bfloat16* __restrict__ q
         for (int offset = 16; offset > 0; offset >>= 1)
             _warp_reduce_5 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_5, offset);
         sum_hq_b = _warp_reduce_5 * inv_q;
-        if (lane_local == 0) {
-            if (read_state_slot_valid != 0) {
-                out[((n * 2 + t) * HV + h) * 128 + v_row_a] = sum_hq_a;
-                out[((n * 2 + t) * HV + h) * 128 + v_row_b] = sum_hq_b;
-            }
+        if (lane_local == 0 && read_state_slot_valid != 0) {
+            out[((n * 2 + t) * HV + h) * 128 + v_row_a] = sum_hq_a;
+            out[((n * 2 + t) * HV + h) * 128 + v_row_b] = sum_hq_b;
         }
     }
 }

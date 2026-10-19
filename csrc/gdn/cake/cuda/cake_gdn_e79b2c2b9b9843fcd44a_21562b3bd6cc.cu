@@ -103,7 +103,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_gdn_c2cc4dde363f0f11c73d(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap O, float* __restrict__ gate, float* __restrict__ beta, int* __restrict__ cu_seqlens, int* __restrict__ state_indices, float* __restrict__ initial_state, float* __restrict__ output_state, float* __restrict__ checkpoint_state, int* __restrict__ cu_checkpoints, uint8_t* __restrict__ tensormap_workspace, long long initial_state_stride_slot, long long output_state_stride_slot, int checkpoint_every_n_tokens, float scale, int num_seqs, int total_tokens, int num_q_heads, int num_v_heads, int total_tiles)
+kernel_cake_gdn_e79b2c2b9b9843fcd44a(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap O, float* __restrict__ gate, float* __restrict__ beta, int* __restrict__ cu_seqlens, int* __restrict__ state_indices, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ output_state, __nv_bfloat16* __restrict__ checkpoint_state, int* __restrict__ cu_checkpoints, uint8_t* __restrict__ tensormap_workspace, long long initial_state_stride_slot, long long output_state_stride_slot, int checkpoint_every_n_tokens, float scale, int num_seqs, int total_tokens, int num_q_heads, int num_v_heads, int total_tiles, int metadata_i64_mask)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -352,8 +352,8 @@ kernel_cake_gdn_c2cc4dde363f0f11c73d(const __grid_constant__ CUtensorMap Q, cons
                 int head_idx = ((NUM_O_HEADS_LOG2 >= 0) ? tile & (unsigned int)(num_o_heads - 1) : tile % (unsigned int)num_o_heads);
                 int qk_head_idx = ((IS_GQA != 0) ? head_idx : ((HEAD_GROUP_LOG2 >= 0) ? head_idx >> HEAD_GROUP_LOG2 : head_idx / (num_v_heads / num_q_heads)));
                 int v_head_idx = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx >> HEAD_GROUP_LOG2 : head_idx / (num_q_heads / num_v_heads)) : head_idx);
-                int raw_batch_start = cu_seqlens[batch_idx];
-                int raw_batch_end = cu_seqlens[batch_idx + 1];
+                int raw_batch_start = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)batch_idx] : cu_seqlens[batch_idx]);
+                int raw_batch_end = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)(batch_idx + 1)] : cu_seqlens[batch_idx + 1]);
                 int batch_start_floor = ((raw_batch_start > 0) ? raw_batch_start : 0);
                 int batch_start = ((batch_start_floor < total_tokens) ? batch_start_floor : total_tokens);
                 int batch_end_floor = ((raw_batch_end > batch_start) ? raw_batch_end : batch_start);
@@ -1330,8 +1330,8 @@ kernel_cake_gdn_c2cc4dde363f0f11c73d(const __grid_constant__ CUtensorMap Q, cons
                 int head_idx_1 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_1 & (unsigned int)(num_o_heads_1 - 1) : tile_1 % (unsigned int)num_o_heads_1);
                 int qk_head_idx_1 = ((IS_GQA != 0) ? head_idx_1 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_1 >> HEAD_GROUP_LOG2 : head_idx_1 / (num_v_heads / num_q_heads)));
                 int v_head_idx_1 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_1 >> HEAD_GROUP_LOG2 : head_idx_1 / (num_q_heads / num_v_heads)) : head_idx_1);
-                int raw_batch_start_1 = cu_seqlens[batch_idx_1];
-                int raw_batch_end_1 = cu_seqlens[batch_idx_1 + 1];
+                int raw_batch_start_1 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)batch_idx_1] : cu_seqlens[batch_idx_1]);
+                int raw_batch_end_1 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)(batch_idx_1 + 1)] : cu_seqlens[batch_idx_1 + 1]);
                 int batch_start_floor_1 = ((raw_batch_start_1 > 0) ? raw_batch_start_1 : 0);
                 int batch_start_1 = ((batch_start_floor_1 < total_tokens) ? batch_start_floor_1 : total_tokens);
                 int batch_end_floor_1 = ((raw_batch_end_1 > batch_start_1) ? raw_batch_end_1 : batch_start_1);
@@ -1360,11 +1360,14 @@ kernel_cake_gdn_c2cc4dde363f0f11c73d(const __grid_constant__ CUtensorMap Q, cons
                                 long long state_vec_index_init = state_base_init + (long long)(state_col_block_init * 32) + (long long)(state_vec_init * 4);
                                 {
                                     {
-                                        float4 _v4 = *reinterpret_cast<const float4*>(initial_state + state_vec_index_init);
-                                        state_init_frag[state_vec_init * 4 + 0] = _v4.x;
-                                        state_init_frag[state_vec_init * 4 + 1] = _v4.y;
-                                        state_init_frag[state_vec_init * 4 + 2] = _v4.z;
-                                        state_init_frag[state_vec_init * 4 + 3] = _v4.w;
+                                        uint2 _vld_0;
+                                        _vld_0 = *reinterpret_cast<const uint2*>(initial_state + state_vec_index_init);
+                                        uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0);
+                                        #pragma unroll
+                                        for (int _pair = 0; _pair < 2; _pair++) {
+                                            (&state_init_frag[state_vec_init * 4 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
+                                            (&state_init_frag[state_vec_init * 4 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
+                                        }
                                     }
                                 }
                             }
@@ -2297,9 +2300,13 @@ kernel_cake_gdn_c2cc4dde363f0f11c73d(const __grid_constant__ CUtensorMap Q, cons
                             {
                                 long long final_state_vec_index_cg1 = state_base_idx_cg1 + (long long)(state_col_block_cg1 * 32) + (long long)(state_vec_idx_cg1 * 4);
                                 {
-                                    asm volatile(
-                                        "st.global.L1::no_allocate.v4.f32 [%0], {%1, %2, %3, %4};"
-                                        :: "l"((output_state + final_state_vec_index_cg1) + 0), "f"(_tmem_load_34[state_vec_idx_cg1 * 4 + 0]), "f"(_tmem_load_34[state_vec_idx_cg1 * 4 + 1]), "f"(_tmem_load_34[state_vec_idx_cg1 * 4 + 2]), "f"(_tmem_load_34[state_vec_idx_cg1 * 4 + 3]) : "memory");
+                                    {
+                                        uint2 _pk2;
+                                        __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
+                                        _pk[0] = __floats2bfloat162_rn(_tmem_load_34[state_vec_idx_cg1 * 4 + 0], _tmem_load_34[state_vec_idx_cg1 * 4 + 1]);
+                                        _pk[1] = __floats2bfloat162_rn(_tmem_load_34[state_vec_idx_cg1 * 4 + 2], _tmem_load_34[state_vec_idx_cg1 * 4 + 3]);
+                                        *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(output_state + final_state_vec_index_cg1))[0]) = _pk2;
+                                    }
                                 }
                             }
                         }
@@ -2317,15 +2324,21 @@ kernel_cake_gdn_c2cc4dde363f0f11c73d(const __grid_constant__ CUtensorMap Q, cons
                         {
                             float _vec_load_0[4];
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(initial_state + empty_initial_base + (long long)empty_state_col);
-                                _vec_load_0[0 + 0] = _v4.x;
-                                _vec_load_0[0 + 1] = _v4.y;
-                                _vec_load_0[0 + 2] = _v4.z;
-                                _vec_load_0[0 + 3] = _v4.w;
+                                uint2 _vld_13;
+                                _vld_13 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + (long long)empty_state_col);
+                                uint32_t* _vpairs_13 = reinterpret_cast<uint32_t*>(&_vld_13);
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 2; _pair++) {
+                                    (&_vec_load_0[0 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_13[_pair]) << 16);
+                                    (&_vec_load_0[0 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_13[_pair]) & 0xffff0000u);
+                                }
                             }
                             {
-                                float4 _v4 = make_float4(_vec_load_0[0 + 0], _vec_load_0[0 + 1], _vec_load_0[0 + 2], _vec_load_0[0 + 3]);
-                                *reinterpret_cast<float4*>((output_state + (empty_output_base + (long long)empty_state_col)) + 0) = _v4;
+                                uint2 _pk2;
+                                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
+                                _pk[0] = __floats2bfloat162_rn(_vec_load_0[0 + 0], _vec_load_0[0 + 1]);
+                                _pk[1] = __floats2bfloat162_rn(_vec_load_0[0 + 2], _vec_load_0[0 + 3]);
+                                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(output_state + (empty_output_base + (long long)empty_state_col)))[0]) = _pk2;
                             }
                         }
                     }
@@ -2351,8 +2364,8 @@ kernel_cake_gdn_c2cc4dde363f0f11c73d(const __grid_constant__ CUtensorMap Q, cons
                 int head_idx_2 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_2 & (unsigned int)(num_o_heads_2 - 1) : tile_2 % (unsigned int)num_o_heads_2);
                 int qk_head_idx_2 = ((IS_GQA != 0) ? head_idx_2 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_2 >> HEAD_GROUP_LOG2 : head_idx_2 / (num_v_heads / num_q_heads)));
                 int v_head_idx_2 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_2 >> HEAD_GROUP_LOG2 : head_idx_2 / (num_q_heads / num_v_heads)) : head_idx_2);
-                int raw_batch_start_2 = cu_seqlens[batch_idx_2];
-                int raw_batch_end_2 = cu_seqlens[batch_idx_2 + 1];
+                int raw_batch_start_2 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)batch_idx_2] : cu_seqlens[batch_idx_2]);
+                int raw_batch_end_2 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)(batch_idx_2 + 1)] : cu_seqlens[batch_idx_2 + 1]);
                 int batch_start_floor_2 = ((raw_batch_start_2 > 0) ? raw_batch_start_2 : 0);
                 int batch_start_2 = ((batch_start_floor_2 < total_tokens) ? batch_start_floor_2 : total_tokens);
                 int batch_end_floor_2 = ((raw_batch_end_2 > batch_start_2) ? raw_batch_end_2 : batch_start_2);
@@ -2615,8 +2628,8 @@ kernel_cake_gdn_c2cc4dde363f0f11c73d(const __grid_constant__ CUtensorMap Q, cons
                 int head_idx_3 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_3 & (unsigned int)(num_o_heads_3 - 1) : tile_3 % (unsigned int)num_o_heads_3);
                 int qk_head_idx_3 = ((IS_GQA != 0) ? head_idx_3 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_3 >> HEAD_GROUP_LOG2 : head_idx_3 / (num_v_heads / num_q_heads)));
                 int v_head_idx_3 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_3 >> HEAD_GROUP_LOG2 : head_idx_3 / (num_q_heads / num_v_heads)) : head_idx_3);
-                int raw_batch_start_3 = cu_seqlens[batch_idx_3];
-                int raw_batch_end_3 = cu_seqlens[batch_idx_3 + 1];
+                int raw_batch_start_3 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)batch_idx_3] : cu_seqlens[batch_idx_3]);
+                int raw_batch_end_3 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)(batch_idx_3 + 1)] : cu_seqlens[batch_idx_3 + 1]);
                 int batch_start_floor_3 = ((raw_batch_start_3 > 0) ? raw_batch_start_3 : 0);
                 int batch_start_3 = ((batch_start_floor_3 < total_tokens) ? batch_start_floor_3 : total_tokens);
                 int batch_end_floor_3 = ((raw_batch_end_3 > batch_start_3) ? raw_batch_end_3 : batch_start_3);
@@ -2716,8 +2729,8 @@ kernel_cake_gdn_c2cc4dde363f0f11c73d(const __grid_constant__ CUtensorMap Q, cons
                 int head_idx_4 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_4 & (unsigned int)(num_o_heads_4 - 1) : tile_4 % (unsigned int)num_o_heads_4);
                 int qk_head_idx_4 = ((IS_GQA != 0) ? head_idx_4 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_4 >> HEAD_GROUP_LOG2 : head_idx_4 / (num_v_heads / num_q_heads)));
                 int v_head_idx_4 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_4 >> HEAD_GROUP_LOG2 : head_idx_4 / (num_q_heads / num_v_heads)) : head_idx_4);
-                int raw_batch_start_4 = cu_seqlens[batch_idx_4];
-                int raw_batch_end_4 = cu_seqlens[batch_idx_4 + 1];
+                int raw_batch_start_4 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)batch_idx_4] : cu_seqlens[batch_idx_4]);
+                int raw_batch_end_4 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)(batch_idx_4 + 1)] : cu_seqlens[batch_idx_4 + 1]);
                 int batch_start_floor_4 = ((raw_batch_start_4 > 0) ? raw_batch_start_4 : 0);
                 int batch_start_4 = ((batch_start_floor_4 < total_tokens) ? batch_start_floor_4 : total_tokens);
                 int batch_end_floor_4 = ((raw_batch_end_4 > batch_start_4) ? raw_batch_end_4 : batch_start_4);
@@ -3261,8 +3274,8 @@ kernel_cake_gdn_c2cc4dde363f0f11c73d(const __grid_constant__ CUtensorMap Q, cons
                 int head_idx_5 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_5 & (unsigned int)(num_o_heads_5 - 1) : tile_5 % (unsigned int)num_o_heads_5);
                 int qk_head_idx_5 = ((IS_GQA != 0) ? head_idx_5 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_5 >> HEAD_GROUP_LOG2 : head_idx_5 / (num_v_heads / num_q_heads)));
                 int v_head_idx_5 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_5 >> HEAD_GROUP_LOG2 : head_idx_5 / (num_q_heads / num_v_heads)) : head_idx_5);
-                int raw_batch_start_5 = cu_seqlens[batch_idx_5];
-                int raw_batch_end_5 = cu_seqlens[batch_idx_5 + 1];
+                int raw_batch_start_5 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)batch_idx_5] : cu_seqlens[batch_idx_5]);
+                int raw_batch_end_5 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)(batch_idx_5 + 1)] : cu_seqlens[batch_idx_5 + 1]);
                 int batch_start_floor_5 = ((raw_batch_start_5 > 0) ? raw_batch_start_5 : 0);
                 int batch_start_5 = ((batch_start_floor_5 < total_tokens) ? batch_start_floor_5 : total_tokens);
                 int batch_end_floor_5 = ((raw_batch_end_5 > batch_start_5) ? raw_batch_end_5 : batch_start_5);
