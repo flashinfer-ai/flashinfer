@@ -61,6 +61,23 @@ each, the order of the entry points rotated every round and recorded per
 round), and checks that both paths produce the same results and the same
 kernel-only time.
 
+NoPE rows (GLM-5.3-Flash: shared latent K/V, zero RoPE, softmax scale 1/16, pooled
+selection).  The ``nope_*`` rows (``--preset nope`` runs them all) are the zigzag-CP16
+rank-0 packed batches at the observed token counts (``nope_glm53_a`` 16263 queries over
+269564 keys, ``nope_glm53_b`` 14928 over 247211), their 4096-query backward chunks,
+single documents of 4k .. 64k tokens, a selection-width sweep (``K_slots`` 128 .. 1024),
+context-parallel tails and short rows; the indices follow the pool structure (``P``
+four-token pools plus the open pool's causal tail, ``K_slots = round_up(4 P + 3, 128)``,
+2176 at the model's ``P = 512``) or an iid causal top-k (``nope_glm53_a_iid``).  Arms:
+``cake_nope`` (the native zero-RoPE entry), ``cake_rope_bridge`` (the previous Cake
+version: the RoPE entry fed zero rope operands, with the zero fills, the index conversion
+and the ``dkv_acc[:, :512]`` slice inside the timed step), ``fa4_nope`` (the FA sparse-MLA
+kernels with ``k is v`` and an explicit scale) and ``flashmla_cudnn_nope`` (the 512 / 512
+geometry when the packages accept it).  Every NoPE arm reports the training forward, the
+no-grad forward, the whole-row and the chunked backward, the step, the recompute step
+(two forwards + backward), the peak memory and the workspace; ``--accuracy-nope`` adds
+the FP64 comparison of ``out`` / ``dq`` / the combined ``dkv``.
+
 Usage::
 
     python benchmarks/bench_cake_dsa_train.py [--rows doc_4096 ...] [--arms cake,flashmla_cudnn,fa4]
@@ -97,12 +114,18 @@ from tests.test_helpers.cake_dsa_train_reference import (  # noqa: E402
     D_LATENT,
     D_QK,
     D_ROPE,
+    DEFAULT_NOPE_SCALE,
+    DEFAULT_NOPE_TOPK,
     DEFAULT_SCALE,
     DEFAULT_TOPK,
     NUM_HEADS,
     calibrate_beta,
+    calibrate_beta_nope,
     make_inputs,
+    make_nope_inputs,
+    nope_pools,
     reference_fp64,
+    reference_fp64_nope,
     rel_l2,
     rel_l2_rows,
 )
@@ -229,6 +252,77 @@ ROWS["chunk_4096x268757"] = bwd_chunk(
 ROWS["chunk_3943x268757"] = bwd_chunk(*GLM_A, 12288, 16231)
 ROWS["chunk_3884x267520"] = bwd_chunk(*GLM_B, 12288, 16172)
 
+
+# ---------------------------------------------------------------------------
+# NoPE rows: the GLM-5.3-Flash geometry (shared latent K/V, softmax scale 1/16, pooled
+# selection, K_slots = round_up(4 * P + 3, 128))
+# ---------------------------------------------------------------------------
+# GLM-5.3-Flash packs with zigzag context parallelism (CP16): a document of length L is cut
+# into 32 chunks of c = ceil(L / 32) tokens (the last one r = L - 31 c); rank 0 holds chunk 0
+# (dense-causal inside its own window: seq_q = seq_k = c) and chunk 31 (seq_q = r over the
+# whole prefix, seq_k = L), so Skv - Tq = 31 * sum(c).  The observed pairs 16263 / 269564 and
+# 14928 / 247211 satisfy it; the per-document (c, r) splits below are one choice that
+# reproduces them (the trainer's real cu_seqlens are not public).
+GLM53_A_DOCS = ((1802, 1783), (2123, 2103), (2123, 2103), (2123, 2103))
+GLM53_B_DOCS = ((1873, 1859), (1873, 1859), (1873, 1858), (1874, 1859))
+
+
+def zigzag_rank0(docs):
+    """Rank-0 segment lists ``(seq_q, seq_k)`` of zigzag-CP16 documents given as ``(c, r)``."""
+    seq_q, seq_k = [], []
+    for c, r in docs:
+        length = 31 * c + r
+        if -(-length // 32) != c or not 1 <= r <= c:
+            raise ValueError(
+                f"({c}, {r}) is not a zigzag split of a {length}-token document"
+            )
+        seq_q += [c, r]
+        seq_k += [c, length]
+    return seq_q, seq_k
+
+
+GLM53_A = zigzag_rank0(GLM53_A_DOCS)  # Tq 16263, Skv 269564, 8 segments
+GLM53_B = zigzag_rank0(GLM53_B_DOCS)  # Tq 14928, Skv 247211, 8 segments
+NOPE_CHUNK = 4096  # the trainer's backward query-chunk policy
+
+
+def _nope_row(seq_q, seq_k, k_slots=DEFAULT_NOPE_TOPK, index="pooled", pools=None):
+    """One NoPE row: document lengths, the physical slot width, the index structure
+    (``pooled``: P four-token pools plus the causal tail of the open pool; ``iid``: random
+    causal top-k) and the pool capacity (default: the width's recorded capacity)."""
+    if pools is None and index == "pooled":
+        pools = nope_pools(k_slots)
+    return dict(
+        seq_q=[int(x) for x in seq_q],
+        seq_k=[int(x) for x in seq_k],
+        k_slots=int(k_slots),
+        index=index,
+        pools=pools,
+    )
+
+
+# name -> NoPE row; the chunk rows are the trainer's 4096-query backward chunks of the packed
+# batch over the full key row (``bwd_chunk``; the split 4096 chunks have nine segments).
+NOPE_ROWS: dict[str, dict] = {
+    "nope_glm53_a": _nope_row(*GLM53_A),
+    "nope_glm53_b": _nope_row(*GLM53_B),
+    "nope_glm53_a_iid": _nope_row(*GLM53_A, index="iid"),
+    "nope_chunk_4096x269564": _nope_row(*bwd_chunk(*GLM53_A, 0, 4096)),
+    "nope_chunk_3975x269564": _nope_row(*bwd_chunk(*GLM53_A, 12288, 16263)),
+    "nope_chunk_1927x269564": _nope_row(*bwd_chunk(*GLM53_A, 14336, 16263)),
+    "nope_tail_2048x65536": _nope_row([2048], [65536]),
+    "nope_tail_4096x131072": _nope_row([4096], [131072]),
+    "nope_tail_1024x16384_k512": _nope_row([1024], [16384], k_slots=512),
+    "nope_short_1024_k128": _nope_row([1024], [1024], k_slots=128),
+    "nope_short_4096_k512": _nope_row([4096], [4096], k_slots=512),
+    "nope_glm53_a_p256": _nope_row(*GLM53_A, k_slots=1152, pools=256),
+}
+for _n in (4096, 16384, 65536):
+    NOPE_ROWS[f"nope_doc_{_n}"] = _nope_row([_n], [_n])
+for _k in (128, 256, 512, 1024):
+    NOPE_ROWS[f"nope_doc_16384_k{_k}"] = _nope_row([16384], [16384], k_slots=_k)
+NOPE_ARMS_DEFAULT = "cake_nope,cake_rope_bridge,fa4_nope,flashmla_cudnn_nope"
+
 Q_LAYOUTS = ("packed576", "pre256")
 KV_STRIDES = (D_QK, 704)
 DST_MAPS = ("none", "identity", "perm", "glm_a", "glm_b")
@@ -268,6 +362,7 @@ PRESETS = {
     name: dict(rows=[name], **ROW_LAYOUTS[name])
     for name in ("packed_glm_a", "packed_glm_b", "tail_2123x67923")
 }
+PRESETS["nope"] = dict(rows=list(NOPE_ROWS))  # every NoPE row with the NoPE arms
 
 ACCURACY_CASES = {
     "iid_4k": dict(
@@ -823,6 +918,486 @@ ARMS = {
 
 
 # ---------------------------------------------------------------------------
+# NoPE arms
+# ---------------------------------------------------------------------------
+
+
+def _chunk_bounds(inp, chunk):
+    """Query sub-ranges ``(q0, q1, cu_seqlens_q, cu_seqlens_k, num_segments)`` of the
+    backward chunk policy (``bwd_chunk`` over the full key row), as device tensors."""
+    device = inp.q.device
+    bounds = []
+    for q0 in range(0, inp.total_q, chunk):
+        q1 = min(q0 + chunk, inp.total_q)
+        seq_q, seq_k = bwd_chunk(inp.seq_q, inp.seq_k, q0, q1)
+        cu_q = [0] + torch.tensor(seq_q).cumsum(0).tolist()
+        cu_k = [0] + torch.tensor(seq_k).cumsum(0).tolist()
+        bounds.append(
+            (
+                q0,
+                q1,
+                torch.tensor(cu_q, dtype=torch.int32, device=device),
+                torch.tensor(cu_k, dtype=torch.int32, device=device),
+                len(seq_q),
+            )
+        )
+    return bounds
+
+
+def _bridge_dkv_direct(device, num_queries, num_kv):
+    """The shipped record's direct-accumulation decision for a bridge call, passed explicitly
+    so the binding does not depend on the environment."""
+    _, record = cake_backend.record_for(device)
+    stages = cake_jit.registered_stages()
+    policy = cake_backend.DkvDirectPolicy.from_record(record)
+    return bool(
+        policy is not None
+        and cake_backend.record_direct_stages(record, stages)
+        and policy.wants(num_queries, num_kv)
+    )
+
+
+class ArmCakeNope:
+    """The native zero-RoPE entry (``dsa_sparse_attention_nope_varlen``) through autograd.
+
+    The caller's fp32 ``dkv_acc [S, 512]`` is allocated and zero-filled inside the timed
+    forward (the trainer allocates it per step) and receives the combined dK + dV; ``dq`` is
+    the autograd gradient of ``q``.  ``backward_chunks`` runs the eager backward over the
+    4096-query chunks of the row into one accumulate buffer.
+    """
+
+    name = "cake_nope"
+
+    def __init__(self, inp, chunk=NOPE_CHUNK):
+        from flashinfer.dsa_sparse_attention import dsa_sparse_attention_nope_varlen
+
+        self.fn = dsa_sparse_attention_nope_varlen
+        self.inp, self.chunk = inp, chunk
+        self.q = inp.q.detach().requires_grad_()
+        self.eager = None
+
+    def versions(self):
+        module_name, _record = cake_backend.record_for(self.inp.q.device)
+        return dict(module=module_name, entry="dsa_sparse_attention_nope_varlen")
+
+    def _call(self, q, kv, dkv_acc):
+        inp = self.inp
+        return self.fn(
+            q,
+            kv,
+            inp.idx_local,
+            inp.cu_seqlens_q,
+            inp.cu_seqlens_k,
+            inp.max_seqlen_q,
+            inp.max_seqlen_k,
+            causal=True,
+            softmax_scale=DEFAULT_NOPE_SCALE,
+            return_lse=True,
+            dkv_acc=dkv_acc,
+        )
+
+    def forward(self):
+        dkv_acc = torch.zeros(
+            self.inp.total_k, D_LATENT, dtype=torch.float32, device=self.q.device
+        )
+        out, lse = self._call(self.q, self.inp.kv, dkv_acc)
+        return dict(out=out, lse=lse, dkv_acc=dkv_acc)
+
+    def forward_nograd(self):
+        out, lse = self._call(self.inp.q, self.inp.kv, None)
+        return dict(out=out, lse=lse)
+
+    def backward(self, st):
+        (dq,) = torch.autograd.grad(
+            st["out"], (self.q,), self.inp.dout, retain_graph=True
+        )
+        return dict(dq=dq, dkv=st["dkv_acc"])
+
+    def backward_chunks(self, st):
+        """Eager backward over the query chunks into one accumulate buffer (``None`` when the
+        eager NoPE entries are not available)."""
+        fwd = getattr(cake_backend, "forward_nope", None)
+        bwd = getattr(cake_backend, "backward_nope", None)
+        if fwd is None or bwd is None:
+            return None
+        inp = self.inp
+        if self.eager is None:
+            idx, length = cake_backend.offset_gather_kv_indices(
+                inp.idx_local,
+                inp.cu_seqlens_q,
+                inp.cu_seqlens_k,
+                causal=True,
+                return_topk_length=True,
+            )
+            out, lse, o_lo = fwd(
+                inp.q, inp.kv, idx, topk_length=length, softmax_scale=DEFAULT_NOPE_SCALE
+            )
+            self.eager = dict(
+                out=out, lse=lse, o_lo=o_lo, bounds=_chunk_bounds(inp, self.chunk)
+            )
+        e = self.eager
+        dkv_acc = torch.zeros(
+            inp.total_k, D_LATENT, dtype=torch.float32, device=inp.q.device
+        )
+        for q0, q1, cu_q, cu_k, segments in e["bounds"]:
+            idx_c, len_c = cake_backend.offset_gather_kv_indices(
+                inp.idx_local[q0:q1], cu_q, cu_k, causal=True, return_topk_length=True
+            )
+            bwd(
+                inp.q[q0:q1],
+                inp.kv,
+                idx_c,
+                e["out"][q0:q1],
+                e["o_lo"][q0:q1],
+                e["lse"][q0:q1],
+                inp.dout[q0:q1],
+                topk_length=len_c,
+                softmax_scale=DEFAULT_NOPE_SCALE,
+                dkv_acc=dkv_acc,
+                num_segments=segments,
+            )
+        return dict(dkv=dkv_acc)
+
+    def workspace(self):
+        size = getattr(cake_backend, "dsa_nope_train_workspace_size", None)
+        if size is None:
+            return None
+        inp = self.inp
+        return int(
+            size(
+                inp.total_q,
+                inp.total_k,
+                inp.topk,
+                inp.q.device,
+                backward=True,
+                num_segments=inp.num_segments,
+                dkv_acc=True,
+            )
+        )
+
+    def outputs(self, st):
+        return dict(out=st["out"], lse=st["lse"])
+
+
+class ArmCakeRopeBridge:
+    """The previous Cake version: the RoPE entry driven through a zero-RoPE bridge.
+
+    Inside the timed forward: ``q_rope0 [T, 64, 64]`` and ``k_rope0 [S, 64]`` zero fills, the
+    caller's fp32 ``dkv_acc [S, 576]`` zero fill, the varlen index conversion of the public
+    entry, ``softmax_scale = 1/16``; the backward is the autograd gradient of ``q`` (the dead
+    ``dq_rope`` output is still written) and ``dkv = dkv_acc[:, :512]`` (a view; a consumer
+    that needs contiguous rows pays a copy).  ``dkv_direct`` is passed as the record's own
+    size rule evaluates.  ``backward_chunks`` uses the eager entries over the 4096-query
+    chunks.
+    """
+
+    name = "cake_rope_bridge"
+
+    def __init__(self, inp, chunk=NOPE_CHUNK):
+        self.inp, self.chunk = inp, chunk
+        self.q = inp.q.detach().requires_grad_()
+        self.direct = _bridge_dkv_direct(inp.q.device, inp.total_q, inp.total_k)
+        self.eager = None
+
+    def versions(self):
+        module_name, _record = cake_backend.record_for(self.inp.q.device)
+        return dict(
+            module=module_name,
+            entry="dsa_sparse_attention_varlen (zero-RoPE bridge)",
+            dkv_direct=self.direct,
+        )
+
+    def _zeros(self):
+        inp = self.inp
+        device = inp.q.device
+        q_rope0 = torch.zeros(
+            inp.total_q, NUM_HEADS, D_ROPE, dtype=torch.bfloat16, device=device
+        )
+        k_rope0 = torch.zeros(inp.total_k, D_ROPE, dtype=torch.bfloat16, device=device)
+        return q_rope0, k_rope0
+
+    def forward(self):
+        inp = self.inp
+        q_rope0, k_rope0 = self._zeros()
+        dkv_acc = torch.zeros(
+            inp.total_k, D_QK, dtype=torch.float32, device=inp.q.device
+        )
+        out, lse = dsa_sparse_attention_varlen(
+            self.q,
+            q_rope0,
+            inp.kv,
+            k_rope0,
+            inp.idx_local,
+            inp.cu_seqlens_q,
+            inp.cu_seqlens_k,
+            inp.max_seqlen_q,
+            inp.max_seqlen_k,
+            causal=True,
+            softmax_scale=DEFAULT_NOPE_SCALE,
+            return_lse=True,
+            dkv_acc=dkv_acc,
+            dkv_direct=self.direct,
+        )
+        return dict(out=out, lse=lse, dkv_acc=dkv_acc)
+
+    def forward_nograd(self):
+        return (
+            self.forward()
+        )  # the same kernels: the forward always writes its o_lo residual
+
+    def backward(self, st):
+        (dq,) = torch.autograd.grad(
+            st["out"], (self.q,), self.inp.dout, retain_graph=True
+        )
+        return dict(dq=dq, dkv=st["dkv_acc"][:, :D_LATENT])
+
+    def backward_chunks(self, st):
+        inp = self.inp
+        if self.eager is None:
+            q_rope0, k_rope0 = self._zeros()
+            idx, length = cake_backend.offset_gather_kv_indices(
+                inp.idx_local,
+                inp.cu_seqlens_q,
+                inp.cu_seqlens_k,
+                causal=True,
+                return_topk_length=True,
+            )
+            out, lse, o_lo = cake_backend.forward(
+                inp.q,
+                q_rope0,
+                inp.kv,
+                k_rope0,
+                idx,
+                topk_length=length,
+                softmax_scale=DEFAULT_NOPE_SCALE,
+            )
+            bounds = [
+                (
+                    q0,
+                    q1,
+                    cu_q,
+                    cu_k,
+                    segments,
+                    _bridge_dkv_direct(inp.q.device, q1 - q0, inp.total_k),
+                )
+                for q0, q1, cu_q, cu_k, segments in _chunk_bounds(inp, self.chunk)
+            ]
+            self.eager = dict(
+                out=out,
+                lse=lse,
+                o_lo=o_lo,
+                q_rope0=q_rope0,
+                k_rope0=k_rope0,
+                bounds=bounds,
+            )
+        e = self.eager
+        dkv_acc = torch.zeros(
+            inp.total_k, D_QK, dtype=torch.float32, device=inp.q.device
+        )
+        for q0, q1, cu_q, cu_k, segments, direct in e["bounds"]:
+            idx_c, len_c = cake_backend.offset_gather_kv_indices(
+                inp.idx_local[q0:q1], cu_q, cu_k, causal=True, return_topk_length=True
+            )
+            cake_backend.backward(
+                inp.q[q0:q1],
+                e["q_rope0"][q0:q1],
+                inp.kv,
+                e["k_rope0"],
+                idx_c,
+                e["out"][q0:q1],
+                e["o_lo"][q0:q1],
+                e["lse"][q0:q1],
+                inp.dout[q0:q1],
+                topk_length=len_c,
+                softmax_scale=DEFAULT_NOPE_SCALE,
+                dkv_acc=dkv_acc,
+                num_segments=segments,
+                dkv_direct=direct,
+            )
+        return dict(dkv=dkv_acc[:, :D_LATENT])
+
+    def workspace(self):
+        inp = self.inp
+        return int(
+            cake_backend.dsa_train_workspace_size(
+                inp.total_q,
+                inp.total_k,
+                inp.topk,
+                inp.q.device,
+                backward=True,
+                num_segments=inp.num_segments,
+                dkv_acc=True,
+                dkv_direct=self.direct,
+            )
+        )
+
+    def outputs(self, st):
+        return dict(out=st["out"], lse=st["lse"])
+
+
+class ArmFA4Nope:
+    """FA sparse-MLA kernels on the NoPE geometry: ``k is v`` (the shared latent, so the
+    kernels take the latent query as ``qv``), explicit ``softmax_scale = 1/16``,
+    per-document gather indices, recompute-P backward in 4096-token chunks.  The bf16
+    ``dkv`` they return is upcast-added into a fresh fp32 ``[S, 512]`` accumulator inside
+    the timed backward (the trainer's accumulation); the gather width must be a multiple of
+    128, so other widths are ``-1``-padded inside the timed forward (correctness widths
+    only; every performance row is a multiple of 128).
+    """
+
+    name = "fa4_nope"
+
+    def __init__(self, inp, token_chunk=NOPE_CHUNK):
+        from flash_attn.cute import flash_attn_varlen_func
+
+        self.fn = flash_attn_varlen_func
+        self.inp, self.token_chunk = inp, token_chunk
+        self.q = inp.q.detach().requires_grad_()
+        self.kv3 = inp.kv.detach().unsqueeze(1).requires_grad_()  # [S, 1, 512]
+        self.q_d, self.kv3_d = inp.q.detach(), inp.kv.detach().unsqueeze(1)
+
+    def versions(self):
+        import cutlass
+        import flash_attn.cute as fc
+
+        return dict(cutlass_dsl=cutlass.__version__, fa_file=fc.__file__)
+
+    def _indices(self):
+        idx = self.inp.idx_local
+        pad = (-idx.shape[1]) % 128
+        if pad:
+            idx = torch.cat([idx, idx.new_full((idx.shape[0], pad), -1)], dim=1)
+        return idx
+
+    def _call(self, q, kv3):
+        inp = self.inp
+        return self.fn(
+            q,
+            kv3,
+            kv3,
+            cu_seqlens_q=inp.cu_seqlens_q,
+            cu_seqlens_k=inp.cu_seqlens_k,
+            max_seqlen_q=inp.max_seqlen_q,
+            max_seqlen_k=inp.max_seqlen_k,
+            softmax_scale=DEFAULT_NOPE_SCALE,
+            causal=True,
+            gather_kv_indices=self._indices(),
+            pack_gqa=True,
+            gather_bwd_recompute_p=True,
+            gather_bwd_token_chunk=self.token_chunk,
+            return_lse=True,
+        )
+
+    def forward(self):
+        out, lse = self._call(self.q, self.kv3)
+        return dict(out=out, lse=lse)
+
+    def forward_nograd(self):
+        # the inference configuration is selected by the inputs' requires_grad flags
+        out, lse = self._call(self.q_d, self.kv3_d)
+        return dict(out=out, lse=lse)
+
+    def backward(self, st):
+        dq, dkv = torch.autograd.grad(
+            st["out"], (self.q, self.kv3), self.inp.dout, retain_graph=True
+        )
+        acc = torch.zeros(
+            self.inp.total_k, D_LATENT, dtype=torch.float32, device=dq.device
+        )
+        acc.add_(dkv[:, 0])
+        return dict(dq=dq, dkv=acc)
+
+    def backward_chunks(self, st):
+        return None  # the backward chunks internally (gather_bwd_token_chunk)
+
+    def workspace(self):
+        return None
+
+    def outputs(self, st):
+        lse = st["lse"]
+        if lse.shape[0] != self.inp.total_q:
+            lse = lse.transpose(0, 1)
+        return dict(out=st["out"], lse=lse)
+
+
+class ArmFlashMLACudnnNope:
+    """FlashMLA sparse forward + cuDNN frontend DSA backward on the 512 / 512 geometry
+    (``d_qk = d_v = 512``, global indices); cuDNN's bf16 ``dkv`` is upcast-added into a fresh
+    fp32 accumulator inside the timed backward.  Unavailable packages or a refused geometry
+    are recorded as the arm's error."""
+
+    name = "flashmla_cudnn_nope"
+
+    def __init__(self, inp):
+        import flash_mla
+        from cudnn import DSA
+
+        self.inp = inp
+        self.flash_mla, self.DSA = flash_mla, DSA
+        device = inp.q.device
+        self.sink = torch.full(
+            (NUM_HEADS,), float("-inf"), dtype=torch.float32, device=device
+        )
+        self.idx_cudnn = inp.idx_global.clamp_min(0).contiguous()
+
+    def versions(self):
+        import cudnn
+
+        return dict(
+            flash_mla=getattr(self.flash_mla, "__file__", "?"),
+            cudnn_frontend=cudnn.__version__,
+        )
+
+    def forward(self):
+        inp = self.inp
+        out, max_logits, lse = self.flash_mla.flash_mla_sparse_fwd(
+            inp.q,
+            inp.kv.unsqueeze(1),
+            inp.idx_global.unsqueeze(1),
+            DEFAULT_NOPE_SCALE,
+            D_LATENT,
+        )
+        return dict(out=out, lse=lse, max_logits=max_logits)
+
+    def backward(self, st):
+        inp = self.inp
+        dq, dkv = torch.empty_like(inp.q), torch.zeros_like(inp.kv)
+        self.DSA.sparse_attention_backward_wrapper(
+            inp.q,
+            inp.kv,
+            st["out"],
+            inp.dout,
+            st["lse"],
+            self.sink,
+            self.idx_cudnn,
+            softmax_scale=DEFAULT_NOPE_SCALE,
+            topk_length=inp.topk_length,
+            dq=dq,
+            dkv=dkv,
+        )
+        acc = torch.zeros(inp.total_k, D_LATENT, dtype=torch.float32, device=dq.device)
+        acc.add_(dkv)
+        return dict(dq=dq, dkv=acc)
+
+    def backward_chunks(self, st):
+        return None
+
+    def workspace(self):
+        return None
+
+    def outputs(self, st):
+        return dict(out=st["out"], lse=st["lse"])
+
+
+NOPE_ARMS = {
+    ArmCakeNope.name: ArmCakeNope,
+    ArmCakeRopeBridge.name: ArmCakeRopeBridge,
+    ArmFA4Nope.name: ArmFA4Nope,
+    ArmFlashMLACudnnNope.name: ArmFlashMLACudnnNope,
+}
+
+
+# ---------------------------------------------------------------------------
 # Measurement
 # ---------------------------------------------------------------------------
 
@@ -859,6 +1434,123 @@ def measure_perf(arm, steps):
     return dict(
         fwd_ms=fwd_ms, bwd_ms=bwd_ms, step_ms=step_ms, peak_above_inputs_gib=gib(peak)
     )
+
+
+def measure_perf_nope(arm, inp, steps):
+    """Median milliseconds of a NoPE arm: the training forward, the no-grad forward (detached
+    inputs), the whole-row backward, the chunked backward (the 4096-query policy into one
+    accumulate buffer; ``None`` where the arm chunks internally), the step (forward +
+    backward) and the recompute step (two forwards + backward, activation checkpointing),
+    plus the peak memory above the inputs, the workspace and the row's geometry columns.
+    """
+    st = arm.forward()
+    torch.cuda.synchronize()
+    perf = dict(
+        Tq=inp.total_q,
+        Skv=inp.total_k,
+        K_slots=inp.topk,
+        valid_keys=inp.valid_keys,
+        chunk_policy=NOPE_CHUNK,
+        fwd_ms=median_ms(arm.forward, steps),
+    )
+    if hasattr(arm, "forward_nograd"):
+        perf["fwd_nograd_ms"] = median_ms(arm.forward_nograd, steps)
+    perf["bwd_ms"] = median_ms(lambda: arm.backward(st), steps)
+    perf["bwd_chunks_ms"] = (
+        median_ms(lambda: arm.backward_chunks(st), steps)
+        if arm.backward_chunks(st) is not None
+        else None
+    )
+
+    def step():
+        arm.backward(arm.forward())
+
+    def recompute_step():
+        arm.forward()
+        arm.backward(arm.forward())
+
+    perf["step_ms"] = median_ms(step, steps)
+    perf["recompute_step_ms"] = median_ms(recompute_step, steps)
+    perf["workspace_bytes"] = arm.workspace()
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    arm.backward(arm.forward())
+    torch.cuda.synchronize()
+    perf["peak_above_inputs_gib"] = gib(torch.cuda.max_memory_allocated() - base)
+    return perf
+
+
+def _nope_arm_or_error(cls, inp):
+    """A NoPE arm over ``inp`` (the NoPE arms take no layout), or the error that makes it unavailable."""
+    try:
+        return cls(inp), None
+    except (
+        Exception
+    ) as exc:  # optional dependency missing, entry not shipped, or arm unavailable here
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def run_perf_nope_row(row, args, results):
+    spec = NOPE_ROWS[row]
+    inp = make_nope_inputs(
+        spec["seq_q"],
+        spec["seq_k"],
+        seed=SEED,
+        topk=spec["k_slots"],
+        index=spec["index"],
+        pools=spec["pools"],
+        device=args.device,
+    )
+    entry = dict(
+        row=row,
+        total_q=inp.total_q,
+        total_k=inp.total_k,
+        num_docs=len(spec["seq_q"]),
+        cu_seqlens_q=inp.cu_seqlens_q.tolist(),
+        cu_seqlens_k=inp.cu_seqlens_k.tolist(),
+        K_slots=inp.topk,
+        index=inp.index,
+        pools=inp.pools,
+        valid_keys=inp.valid_keys,
+        inputs_gib=gib(inp.bytes_inputs()),
+        arms={},
+    )
+    steps = max(
+        args.min_steps,
+        args.steps if inp.total_q * inp.total_k < 2**34 else args.steps_128k,
+    )
+    arms = [a for a in args.arms if a in NOPE_ARMS] or NOPE_ARMS_DEFAULT.split(",")
+    for name in arms:
+        arm, error = _nope_arm_or_error(NOPE_ARMS[name], inp)
+        if arm is None:
+            entry["arms"][name] = dict(error=error)
+            print(f"{row:26s} {name:19s} unavailable: {error}", flush=True)
+            continue
+        try:
+            perf = measure_perf_nope(arm, inp, steps)
+            perf["versions"] = arm.versions()
+        except Exception as exc:
+            perf = dict(
+                error=f"{type(exc).__name__}: {exc}",
+                traceback=traceback.format_exc(),
+            )
+        entry["arms"][name] = perf
+        fmt = lambda v: "   n/a" if v is None else f"{v:8.3f}"
+        if "error" in perf:
+            print(f"{row:26s} {name:19s} failed: {perf['error']}", flush=True)
+        else:
+            print(
+                f"{row:26s} {name:19s} fwd {fmt(perf['fwd_ms'])} ms  bwd {fmt(perf['bwd_ms'])} ms  "
+                f"step {fmt(perf['step_ms'])} ms  recompute {fmt(perf['recompute_step_ms'])} ms  "
+                f"peak {perf['peak_above_inputs_gib']:.2f} GiB",
+                flush=True,
+            )
+        del arm
+        torch.cuda.empty_cache()
+    results["rows"].append(entry)
+    del inp
+    torch.cuda.empty_cache()
 
 
 def measure_accuracy(arm, inp, layout):
@@ -932,6 +1624,9 @@ def run_perf(args, results):
         args.steps if inp.total_q * inp.total_k < 2**34 else args.steps_128k,
     )
     for row in args.rows:
+        if row in NOPE_ROWS:
+            run_perf_nope_row(row, args, results)
+            continue
         seq_q, seq_k = ROWS[row]
         inp = make_inputs(
             seq_q, seq_k, seed=SEED, topk=DEFAULT_TOPK, device=args.device
@@ -978,6 +1673,105 @@ def run_perf(args, results):
             torch.cuda.empty_cache()
         results["rows"].append(entry)
         del inp, layout
+        torch.cuda.empty_cache()
+
+
+NOPE_ACCURACY_CASES = {
+    "nope_iid_4k": dict(index="iid", self_including=False, target_self_weight=None),
+    "nope_pooled_4k": dict(
+        index="pooled", self_including=False, target_self_weight=None
+    ),
+    "nope_peaked_053_4k": dict(
+        index="iid", self_including=True, target_self_weight=0.53
+    ),
+    "nope_peaked_099_4k": dict(
+        index="iid", self_including=True, target_self_weight=0.99
+    ),
+}
+
+
+def measure_accuracy_nope(arm, inp):
+    """Relative-L2 of a NoPE arm against the chunked FP64 reference (``out``, ``dq``, the
+    combined ``dkv``), the ``lse`` maximum absolute error over finite rows and the p99 of
+    the per-row ``dq`` error."""
+    st = arm.forward()
+    grads = arm.backward(st)
+    torch.cuda.synchronize()
+    ref = reference_fp64_nope(
+        inp.q,
+        inp.kv,
+        inp.idx_global,
+        dout=inp.dout,
+        softmax_scale=DEFAULT_NOPE_SCALE,
+        own_key=inp.own_key,
+    )
+    outs = arm.outputs(st)
+    valid = torch.isfinite(ref["lse"])
+    return dict(
+        self_weight=ref["self_weight"],
+        out_rel_l2=rel_l2(outs["out"], ref["out"]),
+        lse_max_abs=float((outs["lse"].double()[valid] - ref["lse"][valid]).abs().max())
+        if valid.any()
+        else 0.0,
+        dq_rel_l2=rel_l2(grads["dq"], ref["dq"]),
+        dkv_rel_l2=rel_l2(grads["dkv"], ref["dkv"]),
+        dq_row_p99=float(rel_l2_rows(grads["dq"], ref["dq"]).quantile(0.99)),
+        bf16_floor=dict(
+            out=rel_l2(ref["out_emu"], ref["out"]),
+            dq=rel_l2(ref["dq_emu"], ref["dq"]),
+            dkv=rel_l2(ref["dkv_emu"], ref["dkv"]),
+        ),
+        nan=bool(
+            any(
+                torch.isnan(g).any().item()
+                for g in grads.values()
+                if torch.is_tensor(g)
+            )
+        ),
+    )
+
+
+def run_accuracy_nope(args, results):
+    arms = [a for a in args.arms if a in NOPE_ARMS] or NOPE_ARMS_DEFAULT.split(",")
+    for case, spec in NOPE_ACCURACY_CASES.items():
+        beta = 0.0
+        if spec["target_self_weight"] is not None:
+            beta = calibrate_beta_nope(
+                spec["target_self_weight"],
+                seed=SEED,
+                index=spec["index"],
+                device=args.device,
+            )
+        inp = make_nope_inputs(
+            [4096],
+            [4096],
+            seed=SEED,
+            topk=DEFAULT_NOPE_TOPK,
+            index=spec["index"],
+            self_including=spec["self_including"],
+            beta=beta,
+            device=args.device,
+        )
+        entry = dict(
+            case=case, beta=beta, K_slots=inp.topk, valid_keys=inp.valid_keys, arms={}
+        )
+        for name in arms:
+            arm, error = _nope_arm_or_error(NOPE_ARMS[name], inp)
+            if arm is None:
+                entry["arms"][name] = dict(error=error)
+                continue
+            try:
+                entry["arms"][name] = measure_accuracy_nope(arm, inp)
+            except Exception as exc:
+                entry["arms"][name] = dict(error=f"{type(exc).__name__}: {exc}")
+            print(
+                f"{case:20s} {name:19s} {json.dumps(entry['arms'][name], default=str)}",
+                flush=True,
+            )
+            del arm
+            torch.cuda.empty_cache()
+        results["accuracy_nope"].append(entry)
+        del inp
         torch.cuda.empty_cache()
 
 
@@ -1197,8 +1991,9 @@ def main():
         "--rows",
         nargs="*",
         default=None,
-        choices=list(ROWS),
-        help="rows to run (default: every row, or the --preset row)",
+        choices=list(ROWS) + list(NOPE_ROWS),
+        help="rows to run (default: every RoPE row, or the --preset rows); the nope_* rows "
+        "run the NoPE arms",
     )
     parser.add_argument(
         "--preset",
@@ -1236,13 +2031,25 @@ def main():
         "trainer maps: 268,757 / 267,520 key rows onto 260,611 / 259,412 fp32 rows; "
         "only for the rows of that batch); needs --dkv-acc",
     )
-    parser.add_argument("--arms", default="cake,flashmla_cudnn,fa4")
+    parser.add_argument(
+        "--arms",
+        default="cake,flashmla_cudnn,fa4",
+        help="RoPE arms (cake, flashmla_cudnn, fa4) and / or NoPE arms (cake_nope, "
+        "cake_rope_bridge, fa4_nope, flashmla_cudnn_nope); nope_* rows run the NoPE arms "
+        f"named here, else all of them ({NOPE_ARMS_DEFAULT})",
+    )
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument(
         "--steps-128k", type=int, default=13, help="iterations for the largest problems"
     )
     parser.add_argument("--min-steps", type=int, default=5)
     parser.add_argument("--accuracy", action="store_true")
+    parser.add_argument(
+        "--accuracy-nope",
+        action="store_true",
+        help="NoPE accuracy cases (iid / pooled / peaked 4k x 4k at K_slots 2176, scale 1/16) "
+        "against the FP64 reference, for the NoPE arms",
+    )
     parser.add_argument(
         "--host-us",
         action="store_true",
@@ -1255,15 +2062,21 @@ def main():
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
     args.arms = [a for a in args.arms.split(",") if a]
-    unknown = sorted(set(args.arms) - set(ARMS))
+    unknown = sorted(set(args.arms) - set(ARMS) - set(NOPE_ARMS))
     if unknown:
-        parser.error(f"unknown arms {unknown}; choose from {sorted(ARMS)}")
+        parser.error(
+            f"unknown arms {unknown}; choose from {sorted(ARMS)} and {sorted(NOPE_ARMS)}"
+        )
     if args.rows is None:
         args.rows = PRESETS[args.preset]["rows"] if args.preset else list(ROWS)
     # every layout the run will build (one per perf row, plus the accuracy cases) must carry dkv_acc when a
     # destination map is set, and a recorded glm_* map must match the key-row count of the inputs it is applied
     # to -- Layout() raises otherwise, which would abort the run after rows (or the whole perf run) have been timed
-    planned = [(row, resolve_layout(row, args), sum(ROWS[row][1])) for row in args.rows]
+    planned = [
+        (row, resolve_layout(row, args), sum(ROWS[row][1]))
+        for row in args.rows
+        if row in ROWS  # the NoPE rows take no layout options
+    ]
     if args.accuracy:
         accuracy_layout = resolve_layout(None, args)
         planned += [
@@ -1300,12 +2113,15 @@ def main():
         ),
         rows=[],
         accuracy=[],
+        accuracy_nope=[],
         host_path=[],
     )
     if not args.no_perf:
         run_perf(args, results)
     if args.accuracy:
         run_accuracy(args, results)
+    if args.accuracy_nope:
+        run_accuracy_nope(args, results)
     if args.host_us:
         run_host_path(args, results)
     if args.json:
