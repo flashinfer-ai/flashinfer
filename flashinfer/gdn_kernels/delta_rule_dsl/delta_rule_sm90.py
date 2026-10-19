@@ -6,6 +6,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import warp, warpgroup, cpasync
 from ...utils import get_device_sm_count, _get_cache_buf
+from ..head_sizes import CHUNKED_PREFILL_HEAD_SIZES, check_head_sizes
 from .alpha import AlphaProcessor
 from .collective_store_tma import CollectiveStoreTma
 from .custom_compile_cache import (
@@ -2465,10 +2466,7 @@ def delta_rule_prefill_dsl_sm90(
         num_q_heads, num_k_heads, num_v_heads, DK, DV, q.element_size()
     ):
         raise RuntimeError("can_implement failed")
-    if DK not in (64, 128):
-        raise RuntimeError(f"DSL kernel only supports DK=64/128, got {DK}")
-    if DV not in (64, 128):
-        raise RuntimeError(f"DSL kernel only supports DV=64/128, got {DV}")
+    check_head_sizes("SM90 GDN prefill", DK, DV, CHUNKED_PREFILL_HEAD_SIZES)
 
     needs_alpha = alpha is not None
     needs_beta = beta is not None

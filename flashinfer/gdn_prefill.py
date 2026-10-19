@@ -47,6 +47,11 @@ from .gdn_kernels.delta_rule_dsl.varlen_helper import (
     is_integer_dtype,
     should_use_cp_host,
 )
+from .gdn_kernels.head_sizes import (
+    CHUNKED_PREFILL_HEAD_SIZES,
+    SM120_PREFILL_HEAD_SIZES,
+    check_head_sizes,
+)
 
 
 _STATE_DTYPES: tuple[torch.dtype, ...] = (
@@ -1200,15 +1205,10 @@ def chunk_gated_delta_rule(
         if chunk_gated_delta_rule_sm100 is None:
             raise NotImplementedError("Blackwell GDN prefill kernel is unavailable")
 
-        # Blackwell SM100 and SM103 path (CuTe DSL kernel). With the
-        # head_size_v <= head_size check above this admits exactly (128, 128),
-        # (128, 64) and (64, 64). A raise, not an assert: nothing else guards
-        # this path, and asserts vanish under python -O.
-        if head_size not in (64, 128) or head_size_v not in (64, 128):
-            raise NotImplementedError(
-                "Blackwell GDN prefill requires head_size and head_size_v of 64 "
-                f"or 128, got head_size={head_size}, head_size_v={head_size_v}"
-            )
+        # Blackwell SM100 and SM103 path (CuTe DSL kernel)
+        check_head_sizes(
+            "Blackwell GDN prefill", head_size, head_size_v, CHUNKED_PREFILL_HEAD_SIZES
+        )
 
         # Allocate output_state only when needed
         if not output_final_state:
@@ -1257,11 +1257,9 @@ def chunk_gated_delta_rule(
             raise NotImplementedError("SM120 GDN prefill DSL kernel is unavailable")
         # The SM120 kernel derives one D from q and views v with it, so a
         # narrower value head would read past v's storage.
-        if head_size != 128 or head_size_v != head_size:
-            raise NotImplementedError(
-                "SM120 GDN prefill requires head_size == head_size_v == 128, got "
-                f"head_size={head_size}, head_size_v={head_size_v}"
-            )
+        check_head_sizes(
+            "SM120 GDN prefill", head_size, head_size_v, SM120_PREFILL_HEAD_SIZES
+        )
         if output_state is None:
             output_state_shape = (
                 initial_state.shape
@@ -1291,6 +1289,9 @@ def chunk_gated_delta_rule(
         # SM90 Hopper path (CuTe DSL kernel)
         if chunk_gated_delta_rule_sm90 is None:
             raise NotImplementedError("SM90 GDN prefill DSL kernel is unavailable")
+        check_head_sizes(
+            "SM90 GDN prefill", head_size, head_size_v, CHUNKED_PREFILL_HEAD_SIZES
+        )
 
         if output_state is None:
             output_state = torch.empty(

@@ -1272,6 +1272,30 @@ def test_verify_kernel_mtp(
     )
 
 
+def test_mtp_rejects_unsupported_head_sizes():
+    """An unsupported K raises NotImplementedError, not an assert."""
+    _skip_if_not_sm90_or_later()
+    B, T, H, HV, K, V = 1, 2, 1, 1, 96, 128
+    device = torch.device("cuda")
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device)
+    state = torch.zeros(B, HV, V, K, dtype=torch.float32, device=device)
+    gate = torch.zeros(B, T, HV, device=device)
+    with pytest.raises(NotImplementedError, match="head_size"):
+        gated_delta_rule_mtp(
+            q,
+            q,
+            v,
+            state,
+            torch.zeros(B, dtype=torch.int32, device=device),
+            torch.zeros(HV, device=device),
+            gate,
+            torch.zeros(HV, device=device),
+            gate,
+            disable_state_update=True,
+        )
+
+
 @pytest.mark.parametrize(
     "batch_size",
     [1, 5],

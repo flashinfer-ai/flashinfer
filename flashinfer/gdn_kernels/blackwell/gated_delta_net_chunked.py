@@ -421,19 +421,19 @@ class GatedDeltaNetChunkedKernel:
             )
         if mma_tiler_qk != (64, 64, DK):
             raise testing.CantImplementError(
-                f"mma_tiler_qk={mma_tiler_qk} not supported"
+                f"mma_tiler_qk={mma_tiler_qk} not supported; expected {(64, 64, DK)}"
             )
         if mma_tiler_qs != (DV, 64, DK):
             raise testing.CantImplementError(
-                f"mma_tiler_qs={mma_tiler_qs} not supported"
+                f"mma_tiler_qs={mma_tiler_qs} not supported; expected {(DV, 64, DK)}"
             )
         if mma_tiler_qkv != (DV, 64, 64):
             raise testing.CantImplementError(
-                f"mma_tiler_qkv={mma_tiler_qkv} not supported"
+                f"mma_tiler_qkv={mma_tiler_qkv} not supported; expected {(DV, 64, 64)}"
             )
         if mma_tiler_kv != (DV, DK, 64):
             raise testing.CantImplementError(
-                f"mma_tiler_kv={mma_tiler_kv} not supported"
+                f"mma_tiler_kv={mma_tiler_kv} not supported; expected {(DV, DK, 64)}"
             )
 
     # -----------------------------------------------------------------------

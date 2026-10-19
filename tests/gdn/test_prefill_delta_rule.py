@@ -251,6 +251,18 @@ def test_prefill_block_end_decay(qkv_factory, seed=0):
     )
 
 
+@pytest.mark.parametrize("head_size, head_size_v", [(96, 96), (64, 128)])
+def test_prefill_rejects_unsupported_head_sizes(head_size, head_size_v):
+    """Every arch path raises NotImplementedError, not an assert, for a pair it lacks."""
+    _skip_if_unsupported()
+    device = torch.device("cuda")
+    q = torch.randn(64, 1, head_size, dtype=torch.bfloat16, device=device)
+    v = torch.randn(64, 1, head_size_v, dtype=torch.bfloat16, device=device)
+    cu_seqlens = torch.tensor([0, 64], dtype=torch.int64, device=device)
+    with pytest.raises(NotImplementedError, match="head_size"):
+        chunk_gated_delta_rule(q, q, v, cu_seqlens=cu_seqlens, use_cp=False)
+
+
 @pytest.mark.parametrize("beta", [False, True])
 @pytest.mark.parametrize("alpha", [False, True])
 @pytest.mark.parametrize("scale", [1.0, "auto"])
