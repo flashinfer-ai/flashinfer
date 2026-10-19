@@ -2556,12 +2556,11 @@ NOPE_FLOOR_MARGIN = 1.02
 # head)-row RMS of the normalised error as a distribution, the kernel's p99 within ``NOPE_ROW_P99_GUARD`` x and its
 # maximum within ``NOPE_ROW_MAX_GUARD`` x the emulated floor's. It detects a wrong key / wrong row contribution (row
 # errors of order 100 %); the precision claim is the case-level rel-L2 within the measured floor x 1.02. Rows whose
-# exact gradient is identically zero carry the absolute per-element band ``NOPE_ZERO_ROW_ATOL`` x
-# ``NOPE_ROW_SCALE_FLOOR`` instead.
+# exact gradient is identically zero (tokens with at most one valid key) are checked element-wise against the bound
+# the reference derives from the inputs and the frozen fp32 / bf16 numerics instead (``_check_dq_zero_rows``).
 NOPE_ROW_P99_GUARD = 1.5
 NOPE_ROW_MAX_GUARD = 2.0
 NOPE_ROW_SCALE_FLOOR = 1e-3
-NOPE_ZERO_ROW_ATOL = 2e-2
 NOPE_OUT_ATOL = 1e-2
 NOPE_OUT_RTOL = 1e-2
 NOPE_SEED = SEED + 1000
@@ -2679,17 +2678,44 @@ def _check_forward_nope(out, lse, ref, *, fixed=False, margin=NOPE_FLOOR_MARGIN)
         assert torch.all(out[~finite.any(-1)] == 0)  # fully masked rows
 
 
-def _dq_row_errors(dq, dq_ref):
+def _dq_row_errors(dq, dq_ref, zero_rows):
     """Per-(token, head)-row normalised error ``e[r]``: the RMS over the 512 elements of ``dq_r - exact_r`` divided by
-    the row's exact RMS (floored at ``NOPE_ROW_SCALE_FLOOR``), over the rows whose exact gradient is not identically
-    zero; returns ``(e, nonzero_rows)``."""
-    ref = dq_ref.double()
+    the row's exact RMS (floored at ``NOPE_ROW_SCALE_FLOOR``), over the rows of the tokens whose exact gradient is
+    not identically zero (``zero_rows`` marks the tokens with at most one valid key: :func:`_check_dq_zero_rows`)."""
+    ref = dq_ref.double()[~zero_rows]
     rms = ref.pow(2).mean(-1).sqrt()
-    nonzero = rms > 0
-    err = (dq.double() - ref).pow(2).mean(-1).sqrt() / rms.clamp_min(
+    return (dq.double()[~zero_rows] - ref).pow(2).mean(-1).sqrt() / rms.clamp_min(
         NOPE_ROW_SCALE_FLOOR
     )
-    return err[nonzero], nonzero
+
+
+def _check_dq_zero_rows(dq, ref):
+    """Rows whose exact ``dq`` is identically zero: the (token, head) rows of the tokens with at most one valid key
+    (``ref["dq_zero_rows"]``).  With one valid key ``P = 1`` and ``out = v`` exactly, so ``dS = P (dP - delta)``
+    cancels: ``dP`` (the MMA's fp32 accumulation of ``dout . v`` over the 512 dims) and ``delta`` (the row-sum stage's
+    fp32 dot product of ``dout`` with ``hi + lo = v``) are the same exact value, and the kernel's
+    ``dq = scale (dP - delta) k`` is their fp32 rounding difference times the key.  The check is element-wise against
+    the bound the reference derives from the inputs and the frozen numerics (``ref["dq_zero_bound"]``,
+    :func:`nope_ref.nope_zero_row_dq_bound`): ``|dq[t, h, el]| <= (1 + 2^-8)^2 scale B[t, h] |k[el]|`` with
+    ``B[t, h] = 2 gamma_512 sum_d |dout[t, h, d] v[d]|``, ``gamma_n = n u / (1 - n u)``, ``u = 2^-24`` -- the standard
+    forward error bound of two fp32 dot products of 512 exact products in any order, times the bf16 roundings of
+    ``dS`` and ``dq``.  A token without a valid key has a zero bound: ``dq`` is exactly zero there.  The kernel's
+    residue sits far below the bound -- measured on sm_103a (GB300), the largest ``|dq| / bound`` over all zero-gradient
+    rows is 0.0019 on the peaked 0.99 self-weight case (one token, 64 rows), 0.0016 on the peaked 0.53 case and 0.0027
+    at ``K_slots = 1`` (130 tokens, 8320 rows; single and two-pass alike), the per-row median of the implied
+    ``|dP - delta| / B`` about 3e-4: a margin above 350x."""
+    zero = ref["dq_zero_rows"]
+    if not zero.any():
+        return
+    got, bound = dq.double()[zero].abs(), ref["dq_zero_bound"]
+    positive = bound > 0
+    ratio = torch.where(
+        positive, got / bound.clamp_min(torch.finfo(torch.float64).tiny), 0.0
+    )
+    assert (got <= bound).all(), (
+        f"dq on zero-gradient rows: {ratio.max().item():.4f} x the fp32 rounding bound "
+        f"(max |dq| {got.max().item():.3e}; non-zero dq on a zero bound: {int((got[~positive] > 0).sum())})"
+    )
 
 
 def _check_dq_row_stats(e_k, e_f):
@@ -2707,7 +2733,7 @@ def _check_dq_row_stats(e_k, e_f):
     )
 
 
-def _check_dq_rows_nope(dq, dq_ref, dq_floor):
+def _check_dq_rows_nope(dq, ref):
     """Row-level ``dq`` guard as a distribution statistic, kernel against its emulated floor, both measured against the
     FP64 reference: ``e[r]`` = RMS of ``dq_r - exact_r`` over the row, divided by the row's exact RMS (floor 1e-3);
     the 0.99 quantile of the kernel's ``e`` within ``NOPE_ROW_P99_GUARD`` x the floor's, the maximum within
@@ -2718,16 +2744,12 @@ def _check_dq_rows_nope(dq, dq_ref, dq_floor):
     ~1 / (1 - max P) on rows where one key holds most of the mass (two to four valid keys, a self key near 1), as two
     different realisations of the same noise -- only their magnitudes compare.  The FA4 sparse-MLA backward on the same
     inputs misses the per-element band on those rows by x40-x1527 (measured), the kernel by x3-x7.  Rows whose exact
-    gradient is identically zero (one valid key: P = 1, dS = 0) carry the absolute per-element band
-    ``|dq| <= NOPE_ZERO_ROW_ATOL x NOPE_ROW_SCALE_FLOOR`` (the kernel's residue there is the fp32 rounding of dP - delta,
-    ~1e-7 per element)."""
-    e_k, nonzero = _dq_row_errors(dq, dq_ref)
-    e_f, _ = _dq_row_errors(dq_floor, dq_ref)
-    if (~nonzero).any():
-        zero_rows = dq.double()[~nonzero].abs() / NOPE_ROW_SCALE_FLOOR
-        assert zero_rows.max().item() <= NOPE_ZERO_ROW_ATOL, (
-            f"dq on zero-gradient rows: {zero_rows.max().item():.6f} x the row-RMS floor"
-        )
+    gradient is identically zero (at most one valid key) are checked first, element-wise against the bound derived
+    from the inputs (:func:`_check_dq_zero_rows`), and stay out of the statistics."""
+    _check_dq_zero_rows(dq, ref)
+    zero = ref["dq_zero_rows"]
+    e_k = _dq_row_errors(dq, ref["dq"], zero)
+    e_f = _dq_row_errors(ref["dq_emu"], ref["dq"], zero)
     if e_k.numel():
         _check_dq_row_stats(e_k, e_f)
 
@@ -2742,16 +2764,15 @@ def _check_backward_nope(dq, dkv, ref, *, fixed=False, margin=NOPE_FLOOR_MARGIN)
     for got, name in ((dq, "dq"), (dkv, "dkv")):
         if not ref[name].any():
             # an identically zero exact gradient (one valid key per row: P = 1, dS = 0, so dq = 0): a relative
-            # floor is undefined there; the kernel's residue is the fp32 rounding of dP - delta (~1e-7 per
-            # element), which the absolute per-element band of the row check bounds (|dq| <= 2e-2 x the 1e-3
-            # row-RMS floor)
+            # floor is undefined there; the kernel's residue is the fp32 rounding of dP - delta, which the row
+            # check bounds element-wise from the inputs (_check_dq_zero_rows)
             continue
         err, floor = rel_l2(got, ref[name]), rel_l2(ref[f"{name}_emu"], ref[name])
         limit = margin if name == "dq" else FLOOR_MARGIN
         assert err <= limit * floor + FLOOR_ABS, (
             f"{name}: rel-L2 {err:.6f} vs floor {floor:.6f}"
         )
-    _check_dq_rows_nope(dq, ref["dq"], ref["dq_emu"])
+    _check_dq_rows_nope(dq, ref)
     if fixed:
         assert rel_l2(dq, ref["dq"]) <= NOPE_GATE_DQ
         assert rel_l2(dkv, ref["dkv"]) <= NOPE_GATE_DKV
@@ -4195,8 +4216,10 @@ def test_nope_backward_32k_x_256k_skewed_per_row_dq_p99():
     def consume(r0, r1, chunk):
         d_ref, o_ref = chunk["dq"], chunk["out"]
         rows.append(rel_l2_rows(dq[r0:r1], d_ref).cpu())
-        row_err_k.append(_dq_row_errors(dq[r0:r1], d_ref)[0].cpu())
-        row_err_f.append(_dq_row_errors(chunk["dq_emu"], d_ref)[0].cpu())
+        _check_dq_zero_rows(dq[r0:r1], chunk)
+        zero = chunk["dq_zero_rows"]
+        row_err_k.append(_dq_row_errors(dq[r0:r1], d_ref, zero).cpu())
+        row_err_f.append(_dq_row_errors(chunk["dq_emu"], d_ref, zero).cpu())
         sq["err"] += (dq[r0:r1].double() - d_ref).pow(2).sum().item()
         sq["emu"] += (chunk["dq_emu"] - d_ref).pow(2).sum().item()
         sq["ref"] += d_ref.pow(2).sum().item()

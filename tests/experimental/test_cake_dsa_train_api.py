@@ -1144,28 +1144,42 @@ def _nope_inputs(seq_q, seq_k, *, seed, topk, index="iid", **kw):
 # ``dq`` check is the backend suite's structural guard: per-(token, head)-row RMS of the normalised error as a
 # distribution, kernel p99 within 1.5x and maximum within 2x the floor's (detects a wrong key / wrong row
 # contribution; the precision claim is the case-level rel-L2 within the measured floor x 1.02); rows with an
-# identically zero exact gradient carry the absolute per-element band 2e-2 x the 1e-3 row-RMS floor.
+# identically zero exact gradient (tokens with at most one valid key) are checked element-wise against the bound the
+# reference derives from the inputs and the frozen numerics (``_check_dq_zero_rows``).
 NOPE_FLOOR_MARGIN = 1.02
 NOPE_ROW_P99_GUARD = 1.5
 NOPE_ROW_MAX_GUARD = 2.0
 NOPE_ROW_SCALE_FLOOR = 1e-3
-NOPE_ZERO_ROW_ATOL = 2e-2
 
 
 def _nope_floor_gate(ref) -> float:
     return NOPE_FLOOR_MARGIN * rel_l2(ref["out_emu"], ref["out"]) + FLOOR_ABS
 
 
-def _dq_row_errors(dq, dq_ref):
-    """Per-(token, head)-row RMS of ``dq - exact`` over the row's exact RMS (floored at 1e-3), rows with a non-zero
-    exact gradient; returns ``(e, nonzero_rows)``."""
-    ref = dq_ref.double()
+def _dq_row_errors(dq, dq_ref, zero_rows):
+    """Per-(token, head)-row RMS of ``dq - exact`` over the row's exact RMS (floored at 1e-3), over the tokens whose
+    exact gradient is not identically zero (``zero_rows``: at most one valid key, :func:`_check_dq_zero_rows`)."""
+    ref = dq_ref.double()[~zero_rows]
     rms = ref.pow(2).mean(-1).sqrt()
-    nonzero = rms > 0
-    err = (dq.double() - ref).pow(2).mean(-1).sqrt() / rms.clamp_min(
+    return (dq.double()[~zero_rows] - ref).pow(2).mean(-1).sqrt() / rms.clamp_min(
         NOPE_ROW_SCALE_FLOOR
     )
-    return err[nonzero], nonzero
+
+
+def _check_dq_zero_rows(dq, ref):
+    """Tokens with at most one valid key have an identically zero exact ``dq`` (``P = 1``, ``out = v``, so
+    ``dS = P (dP - delta)`` cancels); the kernel's residue there is the fp32 rounding difference of its two reductions
+    of ``dout . v`` (the MMA's ``dP`` and the row-sum stage's ``delta``) times ``scale k``.  Element-wise check against
+    the bound the reference derives from the inputs and the frozen numerics, ``ref["dq_zero_bound"]``
+    (:func:`nope_ref.nope_zero_row_dq_bound`; the backend suite's ``_check_dq_zero_rows`` records the measured
+    margin); a token without a valid key has a zero bound."""
+    zero = ref["dq_zero_rows"]
+    if not zero.any():
+        return
+    got, bound = dq.double()[zero].abs(), ref["dq_zero_bound"]
+    assert (got <= bound).all(), (
+        f"dq on zero-gradient rows: max |dq| {got.max().item():.3e} above the fp32 rounding bound"
+    )
 
 
 def _check_nope_grads(dq, dkv, ref):
@@ -1183,11 +1197,10 @@ def _check_nope_grads(dq, dkv, ref):
         assert err <= margin * floor + FLOOR_ABS, (
             f"{name}: rel-L2 {err:.6f} vs floor {floor:.6f}"
         )
-    e_k, nonzero = _dq_row_errors(dq, ref["dq"])
-    e_f, _ = _dq_row_errors(ref["dq_emu"], ref["dq"])
-    if (~nonzero).any():
-        zero_rows = dq.double()[~nonzero].abs() / NOPE_ROW_SCALE_FLOOR
-        assert zero_rows.max().item() <= NOPE_ZERO_ROW_ATOL
+    _check_dq_zero_rows(dq, ref)
+    zero = ref["dq_zero_rows"]
+    e_k = _dq_row_errors(dq, ref["dq"], zero)
+    e_f = _dq_row_errors(ref["dq_emu"], ref["dq"], zero)
     if e_k.numel():
         got, floor = e_k.quantile(0.99).item(), e_f.quantile(0.99).item()
         assert got <= NOPE_ROW_P99_GUARD * floor + FLOOR_ABS, (

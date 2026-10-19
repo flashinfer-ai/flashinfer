@@ -462,6 +462,17 @@ def calibrate_beta(
 # four tokens, ``K_slots = round_up(4 * P + 3, 128)`` with the pool capacity ``P``
 # capped at 512 (2176 slots).
 DEFAULT_NOPE_SCALE = 1.0 / 16
+# Unit roundoffs of round-to-nearest fp32 and bf16 and the forward error constant gamma_n = n u / (1 - n u) (Higham,
+# Accuracy and Stability of Numerical Algorithms, 2nd ed., section 3.1): a sum of n exact fp32 terms carries at most
+# gamma_{n - 1} x the sum of their magnitudes of rounding error in any summation order.
+FP32_UNIT_ROUNDOFF = 2.0**-24
+BF16_UNIT_ROUNDOFF = 2.0**-8
+
+
+def gamma_fp32(n: int) -> float:
+    return n * FP32_UNIT_ROUNDOFF / (1.0 - n * FP32_UNIT_ROUNDOFF)
+
+
 POOL_TOKENS = 4
 TAIL_SLOTS = 3
 SLOT_ALIGN = 128
@@ -784,6 +795,37 @@ def _out_emu_lazy_rescale(
 
 
 @torch.no_grad()
+def nope_zero_row_dq_bound(
+    dout: torch.Tensor, v: torch.Tensor, softmax_scale: float
+) -> torch.Tensor:
+    """Element-wise bound on the backward kernel's ``|dq|`` for query tokens whose exact
+    ``dq`` is identically zero: ``dout [Z, 64, 512]`` are their output gradients and
+    ``v [Z, 512]`` the one valid key of each (zero for a token without a valid key); returns
+    the fp64 bound ``[Z, 64, 512]``.
+
+    With one valid key the forward is exact -- ``P = 1``, ``l = 1``, ``out = v`` (a bf16
+    value, so its low part is 0) -- and ``dS = P (dP - delta)`` cancels: ``dP = dout . v``
+    and ``delta = dout . (hi + lo) = dout . v`` are the same exact value.  The kernel takes
+    them from two fp32 reductions of the same 512 exact products (bf16 x bf16 fits fp32):
+    the MMA accumulation of ``dP`` and the row-sum stage's dot product ``delta``.  Under
+    round-to-nearest fp32 additions (``u = 2^-24``) each carries at most
+    ``gamma_512 x sum_d |dout_d v_d|`` of error in any summation order, so
+    ``|dP - delta| <= B = 2 gamma_512 sum_d |dout_d v_d|`` and, with ``dq = dS k``
+    (``k = v``, the shared latent) and the bf16 roundings of ``dS`` and ``dq``,
+    ``|dq_el| <= (1 + 2^-8)^2 softmax_scale B |v_el|``.  A token without a valid key has
+    ``B = 0``: its ``dq`` must be exactly zero.
+    """
+    v = v.double()
+    b = (dout.double().abs() * v.abs()[:, None, :]).sum(-1)
+    b *= 2.0 * gamma_fp32(D_LATENT)
+    return (
+        (1.0 + BF16_UNIT_ROUNDOFF) ** 2
+        * softmax_scale
+        * b[:, :, None]
+        * v.abs()[:, None, :]
+    )
+
+
 def reference_fp64_nope(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -824,10 +866,13 @@ def reference_fp64_nope(
     rows), ``out_emu`` (BF16-P numerics floor, as :func:`reference_fp64`) and, with
     ``dout``, ``dq [T, 64, 512]``, the combined ``dkv [S, 512] = dk + dv`` (the gradient of
     the shared latent: ``dS^T q`` plus ``P^T dout``), ``dq_emu`` / ``dkv_emu`` (BF16 P/dS at
-    the MMA inputs, BF16 outputs) and, with ``own_key``, ``self_weight``.  Slots that are
+    the MMA inputs, BF16 outputs), ``dq_zero_rows [T]`` (the tokens with at most one valid
+    key, whose exact ``dq`` is identically zero), ``dq_zero_bound [Z, 64, 512]`` (the
+    element-wise bound on the kernel's ``dq`` on those tokens, in their order:
+    :func:`nope_zero_row_dq_bound`) and, with ``own_key``, ``self_weight``.  Slots that are
     ``-1``, ``>= S`` or ``>= topk_length[t]`` are invalid.  ``consume`` streams the
     per-query results as in :func:`reference_fp64` (``out``, ``lse``, ``out_emu``, ``dq``,
-    ``dq_emu``).
+    ``dq_emu``, ``dq_zero_rows``, ``dq_zero_bound``).
     """
     assert torch.get_float32_matmul_precision() == "highest", (
         "the fp32 accumulation model needs exact fp32 matmul (no TF32)"
@@ -852,6 +897,8 @@ def reference_fp64_nope(
         else None
     )
     dkv_emu = torch.zeros_like(dkv) if want_grad else None
+    zero_rows = torch.zeros(total_q, dtype=torch.bool, device=device)
+    zero_bound = []
     self_w = torch.zeros((), dtype=torch.float64, device=device)
     slot = torch.arange(indices.shape[1], device=device)
     for r0 in range(0, total_q, chunk_rows):
@@ -894,6 +941,18 @@ def reference_fp64_nope(
             is_own = (ix == own_key[r0:r1, None]) & valid
             self_w += (p * is_own[:, None, :]).sum()
         if want_grad:
+            # tokens whose exact dq is identically zero (at most one valid key) and the element-wise bound on the
+            # kernel's fp32 rounding residue there, from the inputs
+            zero_c = valid.sum(-1) <= 1
+            v_one = (vg[zero_c] * valid[zero_c][:, :, None]).sum(1)
+            bound_c = nope_zero_row_dq_bound(dout[r0:r1][zero_c], v_one, softmax_scale)
+            del v_one
+            if stream:
+                chunk.update(dq_zero_rows=zero_c, dq_zero_bound=bound_c)
+            else:
+                zero_rows[r0:r1] = zero_c
+                zero_bound.append(bound_c)
+            del zero_c, bound_c
             g = dout[r0:r1].double()
             dp = torch.einsum("thd,twd->thw", g, vg)
             ds = p * (dp - (g * o).sum(-1, keepdim=True)) * softmax_scale
@@ -946,7 +1005,12 @@ def reference_fp64_nope(
     result = {} if stream else dict(out=out, lse=lse, out_emu=out_emu)
     if want_grad:
         if not stream:
-            result.update(dq=dq, dq_emu=dq_emu)
+            result.update(
+                dq=dq,
+                dq_emu=dq_emu,
+                dq_zero_rows=zero_rows,
+                dq_zero_bound=torch.cat(zero_bound, 0),
+            )
         result.update(dkv=dkv, dkv_emu=dkv_emu.to(torch.bfloat16).double())
     if own_key is not None:
         result["self_weight"] = (self_w / (total_q * NUM_HEADS)).item()
