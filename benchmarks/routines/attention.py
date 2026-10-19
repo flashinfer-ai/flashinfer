@@ -458,6 +458,13 @@ def parse_attention_args(line, parser):
         help="Enable bottom-right causal masking for backends that support it.",
     )
     parser.add_argument(
+        "--use_fp16_qk_reduction",
+        action="store_true",
+        default=False,
+        help="FA2 prefill only: pass use_fp16_qk_reduction=True to plan() "
+        "(on SM12x this selects the FP16-accumulate MMA kernels).",
+    )
+    parser.add_argument(
         "--spec_dec_mask",
         type=str,
         choices=["causal", "full"],
@@ -1947,6 +1954,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 page_size,
                 pos_encoding_mode="NONE",
                 causal=causal,
+                use_fp16_qk_reduction=args.use_fp16_qk_reduction
+                and backend in ["fa2", "auto"],
                 q_data_type=q_dtype,
                 kv_data_type=kv_dtype,
                 o_data_type=o_data_type,
@@ -2389,6 +2398,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 cur_res["out_dtype"] = o_data_type
                 cur_res["avg_actual_seq_len"] = avg_seq_len_q
                 cur_res["random_actual_seq_len"] = args.random_actual_seq_len
+                cur_res["use_fp16_qk_reduction"] = args.use_fp16_qk_reduction
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
@@ -2804,6 +2814,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 head_dim_qk,
                 head_dim_vo=head_dim_vo,
                 causal=causal,
+                use_fp16_qk_reduction=args.use_fp16_qk_reduction and backend == "fa2",
                 q_data_type=q_dtype,
                 kv_data_type=kv_dtype,
                 o_data_type=out_dtype,
@@ -3283,6 +3294,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 cur_res["out_dtype"] = out_dtype
                 cur_res["avg_actual_seq_len"] = avg_seq_len_q
                 cur_res["random_actual_seq_len"] = args.random_actual_seq_len
+                cur_res["use_fp16_qk_reduction"] = args.use_fp16_qk_reduction
                 cur_res["case_tag"] = args.case_tag
                 if args.row_activity_mode is not None:
                     cur_res["timing_metric"] = TRTLLM_RAGGED_TIMING_METRIC
