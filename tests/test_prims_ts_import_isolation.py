@@ -131,6 +131,55 @@ assert WorkTileInfo.__init__ is original_init
     )
 
 
+def test_flashinfer_schedulers_own_their_work_tile_type():
+    """Nested / 4-axis FlashInfer schedulers must not use cutlass.utils.WorkTileInfo.
+
+    Task Scheduling is imported before FlashInfer, as the Prims-TS attention
+    tests and kernels do at module scope, so on CUTLASS DSL 4.7 the shared
+    class carries the flat (m, n, l) representation for the rest of the
+    process. The schedulers' own work-tile type must still accept their
+    coordinates.
+    """
+
+    from flashinfer.prims_ts import is_prims_ts_available
+
+    if not is_prims_ts_available():
+        pytest.skip("CUTLASS DSL is not installed")
+
+    _run_isolated(
+        """
+import importlib
+
+import cutlass.experimental.task_scheduling.enums  # noqa: F401
+from cutlass import Boolean, Int32
+from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo as Shared
+
+from flashinfer.cute_dsl.attention.scheduler import persistent
+from flashinfer.cute_dsl.work_tile_info import WorkTileInfo as Owned
+
+assert persistent.WorkTileInfo is Owned
+classes = [Owned]
+for name in (
+    "flashinfer.cute_dsl.sparse.sm100_blk64.tile_scheduler",
+    "flashinfer.cute_dsl.sparse.sm100_blk128.tile_scheduler",
+):
+    try:
+        module = importlib.import_module(name)
+    except ImportError:  # sm100_blk128 needs the optional quack-kernels
+        continue
+    assert issubclass(module.WorkTileInfo, Owned)
+    assert not issubclass(module.WorkTileInfo, Shared)
+    classes.append(module.WorkTileInfo)
+
+for cls in classes:
+    nested = cls((Int32(1), 0, (Int32(2), Int32(3))), Boolean(True))
+    assert isinstance(nested.tile_idx[2], tuple)
+    four = cls((Int32(1), Int32(2), Int32(3), Int32(0)), Boolean(True))
+    assert len(four.tile_idx) == 4
+"""
+    )
+
+
 # Emulates a CUTLASS DSL 4.6 wheel: `cutlass.experimental` resolves as an empty
 # package so the eager chain inside `import cutlass` is satisfied, while every
 # submodule Prims-TS needs (`.primitives`, `.task_scheduling`) stays missing. A

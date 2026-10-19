@@ -9,8 +9,10 @@ non-persistent kernel modes.
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils as utils
+import cutlass.utils  # noqa: F401 - cutlass.utils.HardwareInfo
 from cutlass.cute.typing import Int32, Boolean
+
+from ...work_tile_info import WorkTileInfo
 
 
 class FmhaStaticTileSchedulerParams:
@@ -108,7 +110,7 @@ class FmhaStaticTileScheduler:
     ) -> Boolean:
         return current_idx * q_tiler < seqlen_q
 
-    def get_current_work(self, *, loc=None, ip=None) -> utils.WorkTileInfo:
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
         is_valid = (
             self._current_work_linear_idx < self._num_blocks
             if self._is_persistent
@@ -130,7 +132,10 @@ class FmhaStaticTileScheduler:
             (blk_coord[1], blk_coord[2]),
         )
 
-        return utils.WorkTileInfo(cur_tile_coord, is_valid)
+        # FlashInfer-owned type: the nested coordinate does not fit the flat
+        # (m, n, l) form CUTLASS DSL 4.7 Task Scheduling installs on
+        # cutlass.utils.WorkTileInfo.
+        return WorkTileInfo(cur_tile_coord, is_valid)
 
     def initial_work_tile_info(self, *, loc=None, ip=None):
         return self.get_current_work(loc=loc, ip=ip)

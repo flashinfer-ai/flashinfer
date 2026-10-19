@@ -14,6 +14,8 @@ from cutlass.cute import FastDivmodDivisor
 
 from quack.cute_dsl_utils import ParamsBase
 
+from flashinfer.cute_dsl.work_tile_info import WorkTileInfo as _WorkTileInfoBase
+
 
 class SchedulingMode(IntEnum):
     NONE = 0
@@ -33,7 +35,7 @@ class TileSchedulerProtocol(Protocol):
     def consumer_advance(self) -> "WorkTileInfo": ...
 
 
-class WorkTileInfo(cutlass.utils.WorkTileInfo):
+class WorkTileInfo(_WorkTileInfoBase):
     """Altered WorkTileInfo which includes four axes: (block, head, batch, split)"""
 
     @override
