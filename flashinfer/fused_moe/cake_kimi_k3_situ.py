@@ -44,6 +44,11 @@ _LARGE_C7_TOKENS = (8192, 16384)
 # this set would launch the separate single-token quantization + router kernel
 # before the FC1 (four kernels, the "m1" selector).
 _M1_FUSED_ARCHES = ("sm_100a", "sm_103a")
+# Architectures whose 8- and 16-token routes run the FC1 + FC2 programs with evict_first cache
+# hints on their weight-stream TMA loads (the "n8_feature_ef_f2e" / "n8_w2a_m16_ef_f2e"
+# selectors) -- sm_100a today; sm_103a keeps "n8_feature" / "n8_w2a_m16".  Same stage lists
+# and launch arguments as the routes they supersede.
+_SMALL_L2POLICY_ARCHES = ("sm_100a",)
 # Architectures whose 8192- and 16384-token route runs the FC2 that stores an
 # 8-bit per-tile partial with per-tile FP32 scales and the finalize that
 # consumes it (eight kernels) -- both today; an architecture outside this set
@@ -171,6 +176,26 @@ _SELECTORS = {
         },
         "sm2",
     ),
+    "n8_feature_ef_f2e": (
+        _QUANT_ROUTE,
+        {
+            "quant_route": "quant_route:s2b",
+            "fc1": "fc1:n8_persistent_ef",
+            "fc2": "fc2:n8_workfeed_f2e",
+            "finalize": "finalize:feature",
+        },
+        "sm",
+    ),
+    "n8_w2a_m16_ef_f2e": (
+        _QUANT_ROUTE,
+        {
+            "quant_route": "quant_route:s2b",
+            "fc1": "fc1:n8_persistent_ef",
+            "fc2": "fc2:n8_w2a_s4_f2e",
+            "finalize": "finalize:feature",
+        },
+        "sm2",
+    ),
     "m64_claim8": (
         _FUSED,
         {
@@ -273,9 +298,9 @@ def _selector(arch, num_tokens):
     if num_tokens == 1:
         return "m1_s2a" if arch in _M1_FUSED_ARCHES else "m1"
     if num_tokens in _N8_W2A_M16_TOKENS:
-        return "n8_w2a_m16"
+        return "n8_w2a_m16_ef_f2e" if arch in _SMALL_L2POLICY_ARCHES else "n8_w2a_m16"
     if num_tokens == 8:
-        return "n8_feature"
+        return "n8_feature_ef_f2e" if arch in _SMALL_L2POLICY_ARCHES else "n8_feature"
     if num_tokens in _FORCED_TILE_N16_TOKENS:
         return "m64_claim8"
     if num_tokens in _N32_CLAIM8_TOKENS:
@@ -707,7 +732,15 @@ def _stage_constants(stage, views, prepared, num_tokens):
             values.update(C_tma=partial, C=partial, partial_scale=partial_scale)
         return values
     if stage == "finalize":
-        feature = selector in ("m1", "m1_s2a", "n8_feature", "n8_w2a_m16", "m64_claim8")
+        feature = selector in (
+            "m1",
+            "m1_s2a",
+            "n8_feature",
+            "n8_feature_ef_f2e",
+            "n8_w2a_m16",
+            "n8_w2a_m16_ef_f2e",
+            "m64_claim8",
+        )
         vec = 2 if tile_n == 8 else 8
         values = dict(
             grid=(

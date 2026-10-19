@@ -68,6 +68,10 @@ REFERENCE_SM_COUNT = 148
 # FC1 (three kernels) -- both today; an architecture outside this set would run
 # the separate quantization + router kernel (four kernels, the "m1" selector).
 FUSED_M1_ARCHES = ("sm_100a", "sm_103a")
+# Architectures whose 8- and 16-token routes run the FC1 + FC2 programs with evict_first cache
+# hints on their weight-stream TMA loads (four kernels) -- sm_100a today; sm_103a keeps the
+# "n8_feature" / "n8_w2a_m16" routes.
+SMALL_L2POLICY_ARCHES = ("sm_100a",)
 # Architectures whose 8192- and 16384-token route stores the FC2 result as an
 # 8-bit per-tile partial with per-tile FP32 scales (eight kernels) -- both
 # today; an architecture outside this set would run the pre-shuffled
@@ -124,6 +128,8 @@ STAGES_BY_SELECTOR = {
     "m1_s2a": ["fc1", "fc2", "finalize"],
     "n8_feature": ["quant_route", "fc1", "fc2", "finalize"],
     "n8_w2a_m16": ["quant_route", "fc1", "fc2", "finalize"],
+    "n8_feature_ef_f2e": ["quant_route", "fc1", "fc2", "finalize"],
+    "n8_w2a_m16_ef_f2e": ["quant_route", "fc1", "fc2", "finalize"],
     "m64_claim8": ["quant", "fused_router", "fc1", "fc2", "finalize"],
     "n32_claim8": ["quant", "fused_router", "fc1", "fc2", "finalize"],
     "mid_work5fd": GENERIC_STAGES,
@@ -146,6 +152,10 @@ def _tile_bucket(num_tokens):
 
 
 def _expected_selector(arch, num_tokens):
+    if num_tokens == 8 and arch in SMALL_L2POLICY_ARCHES:
+        return "n8_feature_ef_f2e"
+    if num_tokens == 16 and arch in SMALL_L2POLICY_ARCHES:
+        return "n8_w2a_m16_ef_f2e"
     if num_tokens == 1 and arch in FUSED_M1_ARCHES:
         return "m1_s2a"
     if num_tokens in LARGE_P512FH2QR_TOKENS and arch in LARGE_P512FH2QR_ARCHES:
@@ -168,6 +178,8 @@ def _expected_fc2_grid_n(selector, max_tiles, sm_count):
     pools = {
         "n8_feature": sm_count // (HIDDEN // 128),
         "n8_w2a_m16": 2 * sm_count // (HIDDEN // 128),
+        "n8_feature_ef_f2e": sm_count // (HIDDEN // 128),
+        "n8_w2a_m16_ef_f2e": 2 * sm_count // (HIDDEN // 128),
         "m64_claim8": 12,
         "n32_claim8": 7,
     }
@@ -591,7 +603,7 @@ def _check_prepared_shape(prepared, arch, num_tokens, device):
         assert (prepared["fc2_grid_n"], prepared["fc2_pool_ctas"]) == (7, 196)
     if selector == "m64_claim8":
         assert (prepared["fc2_grid_n"], prepared["fc2_pool_ctas"]) == (12, 336)
-    if selector == "n8_w2a_m16":
+    if selector in ("n8_w2a_m16", "n8_w2a_m16_ef_f2e"):
         assert prepared["fc2_grid_n"] == min(
             prepared["max_tiles"], 2 * sm_count // (HIDDEN // 128)
         )
