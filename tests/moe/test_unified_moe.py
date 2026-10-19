@@ -1419,12 +1419,14 @@ class TestMoERunnerSupport:
         )
         assert CutlassBf16Runner.supported_activation_classes == cutlass
         assert CutlassW4A16Runner.supported_activation_classes == cutlass
-        assert CuteDslRunner.supported_activation_classes == (
-            SwiGLU,
-            GeGLUTanh,
-            ReLU2,
-            SiTU,
-        )
+        cute_dsl = (SwiGLU, GeGLUTanh, ReLU2, SiTU)
+        cute_dsl_mxfp8_act = (SwiGLU, GeGLUTanh, ReLU2)
+        assert CuteDslRunner.supported_activation_classes_by_quant == {
+            (QuantFormat.NVFP4, QuantFormat.NVFP4): cute_dsl,
+            (QuantFormat.MXFP4, QuantFormat.MXFP8): cute_dsl_mxfp8_act,
+            (QuantFormat.MXFP8, QuantFormat.MXFP8): cute_dsl_mxfp8_act,
+            (QuantFormat.NVFP4, QuantFormat.BF16): cute_dsl,
+        }
         assert TrtllmFp4RoutedRunner.supported_activation_classes_by_quant == {
             (QuantFormat.NVFP4, QuantFormat.NVFP4): (
                 SwiGLU,

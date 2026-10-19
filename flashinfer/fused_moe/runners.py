@@ -4932,7 +4932,15 @@ class CuteDslRunner(MoERunner):
         (QuantFormat.MXFP8, QuantFormat.MXFP8),
         (QuantFormat.NVFP4, QuantFormat.BF16),
     )
-    supported_activation_classes = (SwiGLU, GeGLUTanh, ReLU2, SiTU)
+    supported_activation_classes_by_quant: ClassVar[
+        dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
+    ] = {
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
+        # MXFP8 activations: _check_support() rejects SiTU.
+        (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLUTanh, ReLU2),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLUTanh, ReLU2),
+        (QuantFormat.NVFP4, QuantFormat.BF16): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
+    }
     # The GEMM2 input is quantized by nvfp4_quantize_per_token_cute_dsl, which
     # takes the recipe as an argument; _check_support() below narrows this to
     # the per-token path, the only one that runs that quantizer.
