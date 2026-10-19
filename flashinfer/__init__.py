@@ -267,6 +267,19 @@ from .cake_rmsnorm_train import (
 from .cake_rmsnorm_train import (
     cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
 )
+from .cake_causal_conv1d_train import (
+    CakeCausalConv1dFunction as CakeCausalConv1dFunction,
+)
+from .cake_causal_conv1d_train import cake_causal_conv1d as cake_causal_conv1d
+from .cake_causal_conv1d_train import (
+    cake_causal_conv1d_train_backward as cake_causal_conv1d_train_backward,
+)
+from .cake_causal_conv1d_train import (
+    cake_causal_conv1d_train_backward_workspace_bytes as cake_causal_conv1d_train_backward_workspace_bytes,
+)
+from .cake_causal_conv1d_train import (
+    cake_causal_conv1d_train_forward as cake_causal_conv1d_train_forward,
+)
 from .norm import gated_residual_rmsnorm as gated_residual_rmsnorm
 from .norm import gated_residual_next_rmsnorm as gated_residual_next_rmsnorm
 from .norm import rmsnorm_sigmoid_gate as rmsnorm_sigmoid_gate
