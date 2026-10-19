@@ -7,27 +7,28 @@ Kernels for LLM sampling.
 
 .. important::
 
-   Tensor ``seed`` and ``offset`` values identify request-local random streams.
-   Each tensor must have length one (broadcast) or one element per output row.
-   The seed/offset pair is mixed into a Philox seed independently of batch
-   position, including for single-row batches. Tensor offsets are stream keys,
-   not skip-ahead positions within a shared stream. Change the offset for a
-   new sampling call, and use distinct keys for independent requests.
+   Each ``seed`` and ``offset`` tensor must have length one (broadcast) or one
+   element per output row. RNG values are indexed by output row, including when
+   ``indices`` gathers or repeats input distributions.
 
-   **Breaking change:** this changes the previous length-one tensor behavior,
-   including broadcast RNG tensors used with CUDA graphs, as well as batch-length
-   tensor behavior. Repeating a pair, whether with ``torch.full((B,), seed)`` or
-   length-one tensors, replays the same stream in every row; identical input
-   distributions therefore produce identical tokens. Scalar seed/offset values
-   and calls using ``torch.Generator`` retain their existing row-dependent
-   subsequences and skip-ahead offsets.
+   When either RNG tensor has batch length in a multi-row batch, the seed/offset
+   pair identifies a request-local random stream. The pair is mixed into a
+   Philox seed independently of batch position. Tensor RNG in a single-row batch
+   uses the same rule, so per-row requests replay when compacted to one row.
+   In this mode, offsets are stream keys, not skip-ahead positions. Change the
+   offset for each new sampling call and use distinct keys for independent
+   requests. Repeating a per-row pair (for example, with ``torch.full((B,), seed)``
+   and a shared offset) replays the same draw for identical distributions.
 
-   To migrate CUDA-graph callers that previously broadcast one seed/offset pair,
-   allocate a seed or offset tensor with one distinct key per request and keep
-   those keys with the requests when reordering or compacting the batch. Update
-   offsets between sampling calls. Broadcasting a pair deliberately replays the
-   same random stream across rows, even when their distributions differ; it does
-   not provide independent draws for those rows.
+   **Compatibility:** multi-row batches with only length-one RNG tensors retain
+   the released broadcast behavior, including CUDA graph callers. Like scalar
+   seeds/offsets and ``torch.Generator``, they use row-dependent subsequences and
+   skip-ahead offsets; advance these offsets by the random values consumed.
+   The choice depends on tensor lengths and output batch size, not their values.
+   Per-row tensors and singleton tensor calls change from the previous RNG
+   mapping. Compacting a broadcast-only batch to one row switches to request-key
+   semantics. Use per-row RNG tensors from the start when replay across batch
+   layouts is required.
 
 .. seealso::
 

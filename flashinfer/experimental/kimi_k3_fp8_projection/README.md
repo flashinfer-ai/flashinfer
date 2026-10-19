@@ -24,9 +24,26 @@ Every launch of the call is a generated Cake program:
 
 | Route (host dispatch) | Programs | When |
 | --- | --- | --- |
-| quantization launch + persistent 2-CTA GEMM | `quant:u<units>`, `gemm_tstore` (16-byte aligned output base and a row stride that is a multiple of 8 elements: TMA-store epilogue) or `gemm` (other strides: register epilogue); the `_n192` instances of the same epilogues on the tabulated `gemm_bn` rows (the N = 576 `kv_a` family at M > 256: three 192-column tiles instead of 768 padded columns) ; decode programs carry `_px<D>` when the row's table key `pfx` prefetches the BF16 token tile into L2 D stages ahead of its TMA load (round-6 next loop, lever PX on the small fused rows: the tile's DRAM access precedes the weight burst instead of queueing behind it) | `M > 256` unless the family is tabulated for the decode kernel at that row count, and the tabulated `(N, K)` families whose measured best route is the GEMM |
-| quantization launch + decode | `quant:u1`, `decode:t<tok>_p<stages>` | measured table entry with `fused = false` |
-| fused decode | `decode:t<tok>_p<stages>_fused[_res]` | measured table entry with `fused = true` (the token tile is quantized in-CTA; `_res` keeps the quantized token tiles resident for `K <= 256`); above 256 rows only the single-N-tile families (`f_a`, `b_proj`) are tabulated |
+| quantization launch + persistent 2-CTA GEMM | `quant:u<units>`, `gemm_tstore` (16-byte aligned output base and a row stride that is a multiple of 8 elements: TMA-store epilogue) or `gemm` (other strides: register epilogue); the `_n192` instances of the same epilogues on the tabulated `gemm_bn` rows (the N = 576 `kv_a` family at M > 256: three 192-column tiles instead of 768 padded columns); the `_k128` instances of the TMA-store and staged-register epilogues on the tabulated `gemm_bk` rows (every 128-K half of an operand stage is loaded and multiplied under its own barrier pair, so the MMA of one half overlaps the TMA of the other; same SMEM layout, same MMA sequence, bit-identical output; the token follows `_n192` in the program name, before the stream-K suffixes); the `_s2_ts4` instances of the TMA-store epilogue on the tabulated `gemm_stages` / `gemm_ts_slots` rows (round 9: two operand stages and four staging slots per epilogue group on the short-K large-M `f_b` / `kv_b` rows, so a 32-column store chunk waits for the store issued one tile earlier instead of the previous chunk's read; same MMA sequence, bit-identical output; the tokens follow `_k128`, before the stream-K suffixes; the register epilogues keep the untokened programs); the `_pdlb` instances of the TMA-store and staged-register epilogues on the tabulated `gemm_pdlb` rows (round 11: the loader issues every stage's weight boxes before its activation boxes and waits for the quantization launch once per CTA, right before its first activation box, so the first stage's weights, the weight L2 prefetches and the first CLC request land under the quantization kernel's drain; same MMA sequence, bit-identical output; the token closes the program stem, after the stream-K suffixes and before `_pf<D>`; the register epilogue and the 384-wide program keep the untokened programs); the `_st` instances of the TMA-store and staged-register epilogues on the tabulated `gemm_static` rows (round 11: the static one-tile form of the plain `_n192_k128` programs -- one output tile per CTA pair over 2 x tiles CTAs, no cluster-launch-control work ring, admissible when the launch's CTA-pair tiles fit the resident pairs; same MMA sequence, bit-identical output; the token takes the `_cs<S>` slot after `_k128`; the register epilogue keeps the untokened program); the `_gs` instances of the TMA-store epilogue on the tabulated `gemm_gs` rows (round 11: the static grid-stride form of the plain `_k128` / `_n192_k128` programs -- a grid of 2 x min(tiles, resident pairs) CTAs whose pair p owns the tiles p, p + P', p + 2 P', ..., no cluster-launch-control work ring; same MMA sequence per tile, bit-identical output; the token takes the `_cs<S>` / `_st` slot after `_k128`; the staged-register and register epilogues keep the untokened programs) ; decode programs carry `_px<D>` when the row's table key `pfx` prefetches the BF16 token tile into L2 D stages ahead of its TMA load (round-6 next loop, lever PX on the small fused rows: the tile's DRAM access precedes the weight burst instead of queueing behind it) | `M > 256` unless the family is tabulated for the decode kernel at that row count, and the tabulated `(N, K)` families whose measured best route is the GEMM |
+| quantization launch + decode | `quant:u<units>` (`u1` unless the table cell pins a width with `quant_units`), `decode:t<tok>_p<stages>[_a<n>][_e<n>]...` | measured table entry with `fused = false` |
+| fused decode | `decode:t<tok>_p<stages>_fused[_w<n>][_a<n>][_e<n>][_res]` | measured table entry with `fused = true` (the token tile is quantized in-CTA; `_res` keeps the quantized token tiles resident for `K <= 256`); above 256 rows only the single-N-tile families (`f_a`, `b_proj`) are tabulated |
+
+Decode programs carry `_a<n>` when the row's table key `acc_bufs` gives the
+instance `n` TMEM accumulator sets and `_e<n>` when `epi_groups` gives it `n`
+epilogue warp groups (64/128-token tiles only; the host forces one group below
+64 tokens); both sit right after the `_fused[_w<n>]` block and are absent at
+the default of 1. A two-launch row whose cell carries `quant_units` launches
+the quantization program at that width (`quant:u<units>`, decode and GEMM
+routes alike; it must divide `K / 128`) instead of the `quant_units` rule.
+
+Decode programs carry `_dpf` when the row's table key `dpf` prefetches the
+tensor-map descriptors in the kernel prelude, before the first TMA issue
+(round-6 lever Q1, adopted in round 8 on the SM103 `tp1 f_b` cell of the
+65..256-row bucket); the token follows the TMA-store token `_tso` and
+precedes `_pi<n>` / `_xp`, as in the Cake kernel symbol, so a `tstore` row
+that pins it ships the pair `..._tso_dpf` (16-byte-aligned output views) and
+`..._dpf` (register epilogue). The prefetch changes no data path and no
+launch argument.
 
 `decode_table.py` is the measured dispatch table
 (`"<n_tiles128>,<num_k_iters>,<m_bucket>"`, buckets `M <= 1 / 8 / 64 / 256` for
@@ -84,17 +101,32 @@ activation bit-exact vs the DeepGEMM recipe; see
 `tests/experimental/test_cake_kimi_k3_fp8_projection.py`.
 
 Benchmark: `python benchmarks/bench_cake_kimi_k3_fp8_projection.py [--cupti]`
-times the 198 representative rows (22 families x `M in {1, 8, 64, 256, 512,
-1024, 2048, 4096, 16384}`) as CUDA-graph replays with a cold L2 against FlashInfer's existing
+times the 132 representative rows (22 families x `M in {1, 8, 64, 256, 4096,
+16384}`) as CUDA-graph replays with a cold L2 against FlashInfer's existing
 `per_token_group_quant_8bit` + `gemm_fp8_nt_groupwise` chains (`cutlass` sm1 /
 sm2, `trtllm`, `cutile`) on the same weight.
 
 Generated sources live under `csrc/cake_kimi_k3_fp8_projection/`: one kernel
-and one launcher source per program for both architectures (the
+source per program or lever family and one launcher source per launcher text
+(54 launcher sources for the 107 programs) for both architectures (the
 architecture-specific lowering sits behind `__CUDA_ARCH__` guards; the JIT
 compiles each source with the flags of the device it runs on), the shared
-device-helper and host-helper headers, and nothing else. `cake_jit.py`
-registers them (`MODULES`: one record per program; `KERNELS`: logical kernel
-key -> program and compile-line defines, e.g. the three quantization widths
-are one program with `-DQUANT_UNITS=1|2|4`). Both are written by the Cake
-generated-program export; nothing there is hand-written.
+device-helper header, the host-helper header
+(`cake_kimi_k3_fp8_projection_host_common.cuh`: the dynamic-shared-memory
+opt-in and the receipt / chain text every launcher includes verbatim inside
+its namespace), and nothing else. A program that differs from a sibling only
+by a prefetch lever or by the raster group width shares the sibling's kernel
+source and selects its lever value (`-DCAKE_LEVER_*` or `-DGROUP_M`) on the
+compile line; programs whose exported launcher text differs only in the
+kernel symbol and the launcher namespace share one launcher source. A program
+that builds a shared source names its own kernel symbol and launcher
+namespace (`-DCAKE_PROGRAM_KERNEL`, `-DCAKE_PROGRAM_SHIM`) on the compile
+line; a source's defaults select the program it was exported for.
+`cake_jit.py` registers them (`MODULES`: one record per program, expanded
+from one row per program and the five named argument plans of `ARG_PLANS`;
+`KERNELS`: logical kernel key -> program and compile-line defines, e.g. the
+three quantization widths are one program with `-DQUANT_UNITS=1|2|4`). Both
+are written by the Cake generated-program export; the shared kernel and
+launcher sources, the hoisted host header, the `-D` entries of the records
+that use them and the row form of `MODULES` are a hand fold of the exported
+files, pending regeneration by the export.

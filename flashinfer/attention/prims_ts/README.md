@@ -133,7 +133,7 @@ wrapper.run(...)   # live indexer IDs and request metadata; graph hot path
 ```
 
 `plan` binds the single caller-owned byte workspace and fixes
-`batch_size`, `seq_len_q`, head geometry, `block_topk`,
+`batch_size`, `group_size`, head geometry, `block_topk`,
 `max_seq_len_kv`, dtypes, and packed-versus-fixed Q layout. The first eager
 `run` binds the live tensor ABI, compiles the selected kernels, and
 initializes split-KV state. Capture only later `run` calls. One wrapper
@@ -141,9 +141,11 @@ revision owns mutable route and split-KV scratch, so unordered concurrent runs
 need distinct wrappers.
 
 Packed prefill uses `q[total_q, Hq, D]`, `qo_indptr`, and
-`use_packed_q=True`; planned `seq_len_q` is the maximum request-safe route
+`use_packed_q=True`; planned `group_size` is the maximum request-safe route
 length. Fixed MTP decode uses `q[B, Nq, G, Hq, D]` without `qo_indptr`,
-where planned `batch_size = B * Nq` and `seq_len_q = G`. Q lengths need not
+where planned `batch_size = B * Nq` and `group_size = G`. The default
+`group_size=1` disables query grouping; pass a larger G explicitly for either
+layout, using the same value for workspace sizing and planning. Q lengths need not
 be divisible by a suggested group: packed mode permits a shorter final route,
 while fixed mode may append consecutive semantic dummy rows and discard their
 outputs.
@@ -157,11 +159,18 @@ independent of packed/fixed Q and must match workspace sizing and planning.
 metadata plus disjoint attention scratch. The model's per-request
 `max_seq_len_kv`, rather than the global physical page-pool capacity, bounds
 the plan. Each group and pattern head forms at most
-`G * (block_topk + 1)` selected/tail candidates, sorts and unique-reduces
-them in one CTA, and ORs per-query membership bits. It processes only candidate
-IDs, with no full-context bitmap or scan. Shared patterns prepare one row per
+`G * (block_topk + 1)` selected/tail candidates and ORs per-query membership
+bits in one CTA. A shared byte/bit map forms the sorted union when its footprint
+fits without adding CTA waves; otherwise bounded radix sort is used. This
+temporary map is sized by model context, not physical cache capacity, and adds
+no caller-owned workspace. Shared patterns prepare one row per
 group; independent patterns prepare one per group and KV head. G1 resolves
 selected blocks and the causal tail inside attention, without a metadata launch.
+
+Eligible prepared FP8 G2–G8/page-4 Keeps routes store query-oriented membership
+words internally, with eight query slots and complete tail tiles reserved in
+the workspace. Unused slots and tail bits are zero. Standalone metadata outputs
+retain four membership bytes per Int32 word; the public plan/run API is unchanged.
 
 Nonsplit sparse grids larger than one service wave use the common CLC
 persistent scheduler. Each work item resolves its own request, query group and
@@ -173,25 +182,29 @@ groups. `split_kv=False` disables splitting, not persistent scheduling.
 The production specialization supports D64/D128/D256, matching FP16/BF16
 Q/K/V/output, or FP8 E4M3 Q/K/V with FP16/BF16 output. It is causal and
 non-windowed, uses KV128 for Q1--Q8, and requires
-`seq_len_q * (Hq / Hkv) <= TileQ128`. Groups exceeding 64 token/head rows
+`group_size * (Hq / Hkv) <= TileQ128`. Groups exceeding 64 token/head rows
 use TileQ128; per-fragment query membership still occupies one byte.
 The pure-host
 `suggest_q_token_kv_block_sparse_group_size` helper takes a caller-cached SM
 count and prefers the largest legal group that can fill one service wave using
 independent routes plus useful split-KV work. It falls back toward Q1 when a
 large union would leave SMs idle. The helper never queries device properties
-or reads tensors.
+or reads tensors. Its `seq_len_q` input is the actual per-request query
+length, distinct from the suggested `group_size`.
 
 `q_token_kv_block_sparse_attention_with_paged_kv_cache` is the eager
 plan-plus-run convenience API and is not graph-capturable. Shared argument
 spellings intentionally match paged block-sparse attention: `q`,
 `paged_kv_cache`, `kv_block_size`, `mask_type`,
-`sm_scale`, `seq_len_q`, and `max_seq_len_kv`. The optional runtime
+`sm_scale`, and `max_seq_len_kv`. Query grouping is specified separately with
+`group_size`, not a sequence-length argument. The optional runtime
 `v_scale` applies the value-cache dequantization scale and defaults to one.
 The convenience API infers physical page size from `paged_kv_cache`; only
 the prepared wrapper's `plan` takes `page_size` explicitly.
 
 On SM90 and newer, the combined route-builder and attention launch use PDL.
+Metadata releases at entry so the attention prologue can overlap it; the
+attention dependency wait still covers all metadata stores.
 Attention initializes its independent resources before acquiring immediately
 ahead of the first metadata-dependent read. Split-KV attention releases its
 reducer only after producer completion and TMEM teardown; the reducer
@@ -261,7 +274,14 @@ proxy summaries or their represented mass.
 `BlockSparseTSWrapper.plan(..., use_block_sparse=False)` and
 `block_sparse_attention(..., use_block_sparse=False)` run dense attention over
 the whole contiguous K/V sequence with the same Q-tile selection. A dense plan
-owns no route workspace, and its `run` takes Q/K/V only.
+owns no route workspace, and its `run` takes Q/K/V only, plus `sage=` for a
+Sage plan.
+
+Every plan takes `softmax_rescale_threshold_log2` (0 to 8, default 8). On the
+Q64/KV256 and Q128/KV128 tiles of block-sparse plans, and on dense Q64/KV256
+plans, a row keeps its softmax exponent anchor while a tile raises the row
+maximum by at most that many binades, so the accumulated output is not
+rescaled; 0 rescales on every new maximum.
 
 ## Sage attention
 
@@ -273,9 +293,12 @@ with `sage_config=SageAttentionConfig(...)`; every run supplies the scales as
 
 ```text
 S[r][c] = sfQ[blkQ(r)] * sfK[blkK(c)] * (Q8 . K8^T)[r][c]
-P       = softmax_row(S), quantized to E4M3 as 448 * p
-O[r][d] = sfV[d] * (sum_c P8[r][c] * V8[c][d]) / (448 * l[r])  (+ v_mean[d])
+P       = softmax_row(S), quantized to E4M3 as C * p with C = 448 * 2**-h
+O[r][d] = sfV[d] * (sum_c P8[r][c] * V8[c][d]) / (C * l[r])  (+ v_mean[d])
 ```
+
+`h` is the plan's `softmax_rescale_threshold_log2` (default 8) on Q64/KV256
+tiles and block-sparse plans, and 0 elsewhere.
 
 FlashInfer does not quantize: the 8-bit tensors and scales come from the
 caller, for example TensorRT-LLM's `sageQuant`. `v_mean` adds a per-channel
@@ -295,7 +318,21 @@ scale must be finite and positive; the kernel does not check the values.
 
 The block-size fields belong to `SageAttentionConfig`; the defaults are
 TensorRT-LLM's production recipe. Masks and scheduling follow the 16-bit
-plans. The paged block-sparse APIs do not support Sage attention.
+plans. Every run first launches a small kernel that gathers the plan's scales
+into one buffer in the order the attention kernel reads them: the K scales
+per 64-token atom, the Q scales per Q-tile row and the V scales (and means)
+per KV head; attention reads that buffer alone. A block-sparse run's route
+prepare follows it as a programmatic dependent launch, starting while the
+scale kernel drains and acquiring it before exiting, so the attention launch
+that follows in stream order finds both the scales and the routes complete.
+The paged block-sparse APIs do not support Sage attention.
+
+With the default threshold, FP8 P is quantized at `C = 448 * 2**-8 = 1.75`:
+the E4M3 grid of P moves down by the threshold, so probabilities far below the
+anchor round to subnormals or zero. Rows whose largest scores arrive first,
+such as an attention sink in the leading blocks, lose the most. A smaller
+threshold trades rescales back for range; 0 keeps exact anchors and
+`C = 448`.
 
 ### Scale tensors
 
@@ -310,8 +347,8 @@ slots.
 | --- | --- |
 | `q_scale` | `[Hq, flat_scale_numel(B, Sq, q_block_size)]` |
 | `k_scale` | `[Hkv, flat_scale_numel(B, Skv, k_block_size)]` |
-| `v_scale` | `[Hkv, D]` |
-| `v_mean` | `[Hkv, D]`; exactly when the recipe sets `v_mean=True` |
+| `v_scale` | `[B, Hkv, D]` |
+| `v_mean` | `[B, Hkv, D]`; exactly when the recipe sets `v_mean=True` |
 | `k_summary_scale` | `[Hkv, flat_scale_numel(B, ceil(Skv / kv_block_size), k_summary_block_size)]`; exactly for proxy plans |
 
 With proxy routes, `k_summary` holds the per-block K means in the K dtype,
@@ -356,7 +393,7 @@ v = torch.randn(B, Skv, Hkv, D, device=device).to(fp8)
 scales = SageAttentionParams(
     q_scale=torch.rand(Hq, flat_scale_numel(B, Sq, 1), device=device),
     k_scale=torch.rand(Hkv, flat_scale_numel(B, Skv, 16), device=device),
-    v_scale=torch.rand(Hkv, D, device=device),
+    v_scale=torch.rand(B, Hkv, D, device=device),
 )
 out = wrapper.run(q, k, v, sage=scales)  # [B, Sq, Hq, D] bfloat16
 ```
@@ -399,7 +436,7 @@ block_indptr = (
 scales = SageAttentionParams(
     q_scale=torch.rand(Hq, flat_scale_numel(B, Sq, 1), device=device),
     k_scale=torch.rand(Hkv, flat_scale_numel(B, Skv, 16), device=device),
-    v_scale=torch.rand(Hkv, D, device=device),
+    v_scale=torch.rand(B, Hkv, D, device=device),
     k_summary_scale=torch.rand(
         Hkv, flat_scale_numel(B, num_kv_blocks, 16), device=device
     ),

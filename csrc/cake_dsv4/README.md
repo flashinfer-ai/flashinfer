@@ -2,9 +2,11 @@
 
 Generated device kernels and TVM-FFI launchers for SM100 / SM103 behind
 `trtllm_batch_decode_sparse_mla_dsv4(..., backend="cake")` for BF16 and FP8 E4M3
-inputs with head dimension 512 (BF16 output). Select the backend explicitly;
-`backend="auto"` keeps the architecture-based selection. Programmatic dependent
-launch and the TRTLLM-GEN RopeQuant epilogue are not supported.
+inputs with head dimension 512 (BF16 output); `kv_cache_format="nvfp4"` selects
+the NVFP4 decode family (`run_cake_dsv4_nvfp4`; see the host module docstring).
+Select the backend explicitly; `backend="auto"` keeps the architecture-based
+selection. Programmatic dependent launch and the TRTLLM-GEN RopeQuant epilogue
+are not supported.
 
 ```python
 from flashinfer.mla import (
@@ -29,24 +31,25 @@ out = trtllm_batch_decode_sparse_mla_dsv4(
 
 | path | contents |
 | --- | --- |
-| `sm_100a/`, `sm_103a/` | one `*_kernel.cu` (device code) and one `*_binding.cu` (launcher) per variant and architecture |
-| `common/` | kernels whose source is identical on both architectures (`split_reduce`, `bf16_h64_compressed_reduce`) |
-| `cake_dsv4_host_shim.h` | the launcher helpers shared by every binding (device guard, tensor checks, SM103 descriptor-storage writes) |
+| `sm_100a/`, `sm_103a/` | one `cake_dsv4_<hash>_kernel.cu` (device code) and one `cake_dsv4_<hash>_binding.cu` (TVM-FFI launcher) per BF16 / FP8 variant whose kernel differs between the two architectures (14 per directory), plus the headers every unit of that directory includes: `cake_dsv4_device_common.cuh` (device preamble) and `cake_dsv4_host_common.cuh` (dynamic shared-memory opt-in) |
+| `common/` | sources both architectures compile: the 13 BF16 / FP8 variants whose kernel is identical on sm_100a and sm_103a (`cake_dsv4_<hash>_{kernel,binding}.cu`, named by the sm_100a hash, with their own copies of the two `cake_dsv4_*_common.cuh` headers), and the NVFP4 decode family (the `cake_dsv4_nvfp4_*_kernel.cu` units, their `*_binding.cu` launchers and the `cake_dsv4_nvfp4_{device,host}_common.cuh` headers: launch helpers, tensor-map encoders, tensor checks) |
 | `cake_dsv4_launch_sequence.cc` | host-only `run_sequence`: issues the producer and reducer launches of a two-stage route from one FFI call |
 
 `flashinfer/jit/cake_dsv4.py` registers each variant per architecture: its
 sources, nvcc flags, an identity that names the JIT module, and the `arg_plan`
 the host binds by name. `flashinfer/mla/cake_dsv4.py` resolves the sparse
-metadata, carves the caller-owned workspace, picks the route (`_route`) and
-launches the variant kernels directly, reducers included; shapes without an
-exported kernel are rejected before any launch. Bindings perform no device
-allocation.
+metadata, carves the caller-owned workspace, picks the route (`_route`, or
+`_nvfp4_plan` for the NVFP4 cache) and launches the variant kernels directly,
+reducers included; shapes without an exported kernel are rejected before any
+launch. Bindings perform no device allocation.
 
 ## Host contract
 
-* Metadata: every kernel takes `swa_indices`, `compressed_indices`,
-  `sparse_topk_lens`, `swa_index_stride`, `compressed_index_stride`,
-  `sparse_topk_lens_offset`, `sparse_topk`, `num_query_tokens`. Combined
+* Metadata (BF16 / FP8 kernels; the NVFP4 family binds two independent
+  tables, see the host module docstring): every kernel takes `swa_indices`,
+  `compressed_indices`, `sparse_topk_lens`, `swa_index_stride`,
+  `compressed_index_stride`, `sparse_topk_lens_offset`, `sparse_topk`,
+  `num_query_tokens`. Combined
   (`sparse_indices [T, sparse_topk]`) and separate (`sparse_indices [T, 128]` +
   `extra_sparse_indices [T, topk_c]`, lengths via `sparse_topk_lens` or
   `extra_sparse_topk_lens`) tables are resolved without copies; int32, unit column
@@ -58,25 +61,19 @@ allocation.
   every launch), then `partial_O` (BF16) and `partial_lse` (FP32) sized by
   `get_cake_dsv4_workspace_bytes`. CUDA-graph replays are self-contained once the
   counters were zeroed eagerly.
-* SM103 descriptor storage: the bindings with `tma_workspace_bytes` read their TMA
-  descriptors from a private device tensor the host passes in; the binding writes
-  the descriptors of the call into it when they differ from what it holds (in
-  stream order, never inside graph capture). The host keeps a bounded pool of
-  such tensors per (variant, device), keyed by the TMA source geometry: recent
-  geometries reuse their storage, new ones take a free or the least recently
-  used storage, geometries launched under graph capture keep theirs for the
-  process lifetime, and a capture that reaches a geometry never launched
-  eagerly raises.
 * Query / output / KV pools must be densely packed; the host makes no copies.
 
 ## Tests
 
 ```bash
-pytest tests/mla/test_cake_dsv4.py -q              # routing, binding, workspace, metadata (CPU)
-pytest tests/mla/test_cake_dsv4_hardening.py -q    # numerical and graph-replay checks (SM100/SM103 GPU)
+pytest tests/mla/test_cake_dsv4.py -q                        # routing, binding, workspace, metadata (CPU)
+pytest tests/mla/test_cake_dsv4_nvfp4_route.py -q            # NVFP4 planner, variant names, workspace (CPU)
+pytest tests/mla/test_cake_dsv4_hardening.py -q              # numerical and graph-replay checks (SM100/SM103 GPU)
+pytest tests/attention/test_sparse_mla_blackwell_dsv4_nvfp4.py -q  # NVFP4 cache ops and cake decode (GPU: SM100/SM103; cache ops also SM120/SM121)
 ```
 
-Tolerances: `atol=rtol=0.01` (BF16), `atol=rtol=0.1` (FP8).
+Tolerances of the hardening checks: `atol=rtol=0.01` (BF16), `atol=rtol=0.1`
+(FP8); the NVFP4 decode test pins its own bounds.
 
 ## SM120 / SM121: DeepSeek-V4 NVFP4 sparse-MLA decode and prefill
 
@@ -91,14 +88,14 @@ tracker: flashinfer#4254):
   over one shared candidate gather);
 * **prefill** -- one translation unit per head count 16 .. 128,
   `cake_sparse_mla_dsv4_nvfp4_prefill_h<N>.cu`, with one kernel per (head tiles
-  x single / dual cache x one-item / persistent CTAs): a prefill CTA holds
+  x single / dual cache x cp.async ring depth): a prefill CTA holds
   `16 * head_tiles` heads of one token (1 tile always, 2 for head counts
   divisible by 32, 4 for head counts divisible by 64) and runs *all* of the
   token's 64-candidate chunks (at most 16, so `topk + extra_topk <= 1024`)
-  with a direct epilogue -- no split scratch, no merge launch. The persistent
-  form launches `min(items, SMs)` CTAs that walk the (token, head block) items
-  with a grid stride while the IO warps prefetch and quantize the next item's
-  Q.
+  with a direct epilogue -- no split scratch, no merge launch. The gather ring
+  holds two chunks; the one-tile instance also ships a three-stage form. The
+  launch runs one CTA per (token, head block) item, token-major or head
+  blocks first, and takes the query L2 policy as a kernel argument.
 
 Both share the TVM-FFI binding `cake_sparse_mla_dsv4_nvfp4_binding.cu`
 (entries `cake_sparse_mla_sm120_dsv4_nvfp4_decode` and
@@ -136,22 +133,37 @@ candidates always split) mirror the generating kernel module's launcher;
 `head_tiles` / `num_splits` on the low-level decode entry override them.
 `backend="auto"` keeps the hand-written SM120 kernels.
 
-For several query tokens the same entry points pick between the decode and
-the prefill kernel through
-`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel` (one token,
-head counts without a prefill instance, more than 16 chunks and candidate
-counts that are not multiples of 64 always decode; wide head counts (>= 64)
-decode up to 16 tokens, or up to 32 tokens with at most 128 candidates;
-narrower head counts decode up to 64 tokens with at least 512 candidates). The
-prefill planner `cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill` returns
-`(head_tiles, persistent)`: two tiles below 128 tokens for head counts >= 64
-that are divisible by 32, otherwise the largest instance (one tile for 16 / 32
-/ 48 heads), persistent CTAs once the one-item grid covers two waves of SMs.
-These thresholds are provisional until the paired decode / prefill sweeps on
-RTX PRO 6000 Blackwell and RTX 5090 land. The low-level entry
+At every token count the same entry points pick between the decode and the
+prefill kernel through
+`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`, keyed on
+`(num_tokens, num_heads, topk, extra_topk, num_sms)`: head counts without a
+prefill instance (8) and more than 16 chunks (over 1024 candidates) always
+decode; a partial 64-wide chunk is served by the prefill's masked tail. With
+`candidates = topk + extra_topk`, wide head counts (>= 64) decode up to 8
+tokens at 512 and more candidates and up to 16 below; narrower head counts
+decode up to 8 tokens on devices with >= 180 SMs (RTX PRO 6000 Blackwell:
+188) and up to 32 on smaller ones (RTX 5090: 170) at 512 and more candidates,
+and run the prefill at every token count below 512, one token included. The
+thresholds were measured by paired decode / prefill sweeps on both SKUs and
+live in `_PREFILL_POLICY` (`flashinfer/mla/_sparse_mla_sm120/_cake_dsv4_nvfp4.py`);
+the CPU tests in `tests/attention/test_cake_sparse_mla_sm120_dsv4_nvfp4_prefill.py`
+pin them.
+
+The prefill planner `cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill` returns
+the `head_tiles` int: for head counts >= 64 that are divisible by 32, two
+tiles up to 96 tokens (128 tokens for 128 heads with 512 .. 639 candidates on
+the >= 180-SM die) and the largest instance above; every other head count
+takes its largest instance at every token count (two tiles for 32 heads, one
+for 16 / 48 / 80 / 112). Three companions fix the rest of the launch:
+`..._plan_prefill_stages` (cp.async ring depth: 3 for the one-tile instance
+from 8 chunks per token, except dual-cache lists below 16 chunks and 512
+tokens; 2 otherwise), `..._plan_prefill_q_evict_first` (L2 evict-first on the
+query loads from 512 tokens) and `..._plan_prefill_grid_head_blocks_first`
+(head blocks first for lists of at most 4 chunks and at most 65535 tokens,
+the CUDA grid.y limit). The low-level entry
 `flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_prefill` runs the prefill
-directly (caller-owned `output` / `out_lse`, `head_tiles` / `persistent`
-overrides, no scratch):
+directly (caller-owned `output` / `out_lse`, optional `head_tiles` override,
+no scratch) and returns the resolved plan:
 
 ```python
 from flashinfer.mla import cake_sparse_mla_sm120_dsv4_nvfp4_prefill
@@ -161,7 +173,9 @@ plan = cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
     topk_length=lengths, attn_sink=sink,
     extra_kv_cache=compressed_cache, extra_indices=extra_indices,
 )
-# plan == {"head_tiles": 4, "persistent": 1, "num_ctas": <SMs>} for 128 heads x 2048 tokens
+# 128 heads x 2048 tokens with 512 + 128 candidates (10 chunks):
+# plan == {"head_tiles": 4, "num_ctas": 4096, "num_stages": 2,
+#          "q_evict_first": True, "grid_head_blocks_first": False}
 ```
 
 ```bash
@@ -248,7 +262,9 @@ is launched as a programmatic dependent of the decode grid when `enable_pdl`
 is set (`None` = device default; the merge waits for the decode's memory before
 its first load, so both settings are bitwise identical). The names are distinct
 from the NVFP4 family above so the two generated kernel sets never share a
-translation unit, header, manifest or JIT module name. Without the manifest,
+translation unit, kernel header, manifest or JIT module name (the two host
+bindings share only the hand-written tensor checks in
+`cake_sparse_mla_sm120_host_checks.h`). Without the manifest,
 `flashinfer.mla.cake_sparse_mla_sm120_dsv41_mixed_format_info()["kernels_available"]`
 is `False`, the planners run on the provisional geometry and the first launch
 raises `FileNotFoundError` naming the expected manifest location.

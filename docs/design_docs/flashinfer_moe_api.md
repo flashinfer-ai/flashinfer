@@ -788,12 +788,76 @@ controls remain in backend-native `MoEWeightPack` views: TRT-LLM uses
 `situ_beta` / `situ_linear_beta`. Where supported, these tensors override the
 config-derived values.
 
+TRT-LLM supports StepFun's clipped activation through `SwiGLUStep(limit=7)`:
+
+```python
+activation = SwiGLUStep(limit=7.0)
+# Physical values, after FC1 dequantization:
+activated = up.clamp(-7.0, 7.0) * torch.nn.functional.silu(gate).clamp(max=7.0)
+```
+
+The gate is capped after SiLU. The fused epilogue accepts a per-expert
+`gemm1_clamp_limit` tensor and rejects `gemm1_alpha` / `gemm1_beta` for this
+activation. A null limit pointer uses physical `7`; a custom typed limit,
+including `SwiGLUStep(limit=16)`, is materialized during weight preparation.
+An explicit tensor in the prepared view overrides that typed limit.
+
+The tensor contains raw FC1 accumulator limits: for NVFP4 and per-tensor FP8,
+divide physical limits by the FC1 gate dequantization scale. BF16 and MXFP8
+use physical limits directly. The FP8 preparation helper performs this
+conversion, and the NVFP4 helper prepares unit global scales. With fused
+shared experts in NVFP4 or MXFP8, append the shared expert limits after the
+routed expert limits:
+
+```python
+limits = torch.full((num_local_experts + 1,), 7.0, device=device)
+limits[-1] = 16.0
+gate_scale = view.get(
+    "output1_scales_gate_scalar", view.get("output1_scale_gate_scalar")
+)
+view["gemm1_clamp_limit"] = (
+    limits if gate_scale is None else limits / gate_scale
+).contiguous()
+```
+
+The fused StepFun epilogue supports BF16, FP8 per tensor, MXFP8 block scale,
+and NVFP4. DeepSeek FP8 uses a separate activation kernel and rejects StepFun.
+NVFP4 also supports explicit per-token scaling through BF16-output FC1
+StepFun cubins followed by per-token requantization for FC2.
+The TRT-LLM backend requires batched-GEMM export `7.0.5.0.4.0` or later
+containing StepFun epilogues; older artifacts report missing StepFun kernels.
+
+StepFun trace references consume the same native weight layouts as the APIs:
+BF16 uses BlockMajorK, and shuffled weights use the prepared FC1/FC2 row
+order. MXFP8 and NVFP4 additionally use 128x4 weight-scale layouts. BF16 and
+MXFP8 traces retain `use_shuffled_weight` to select the row order. Serialized
+references restore these layouts using PyTorch.
+
 `SiTU.linear_scale` is the linear-branch soft-clamp scale, applied as
 `linear_scale * tanh(linear / linear_scale)`. It accepts `None` for the
 unclamped linear branch, which only the CuTe-DSL scalar ABI can express: the
 TRT-LLM path carries the value in a per-expert `gemm1_beta` float tensor that
 has no encoding for "no clamp", so TRT-LLM runners reject `None` rather than
 silently dropping the parameter.
+
+### Cake StepFun backend (`cake_stepfun`)
+
+`CakeStepFunConfig(backend="cake_stepfun")` is an opt-in Blackwell (exact SM100 /
+SM103) backend for the StepFun fused MoE: `SwiGLUStep(limit)` with a per-expert
+`gemm1_clamp_limit`, over `BF16×BF16`, `FP8PerTensor×FP8PerTensor`, `MXFP8×MXFP8`
+and `NVFP4×NVFP4` (also with `per_token_scale`). It runs the trtllm-gen
+fused-MoE pipeline with exported Cake kernels in the FC1 stage and, when the
+generated inventory covers them (`fused_moe_cake_stepfun_full_*`), in the
+routing, FC2, requantization and finalize stages as well. It is not in the
+default backend list; weights must come from `CakeStepFunConfig.prepare_weights`
+(view `cake_stepfun`). A tactic is the FC1 tile x GEMM configuration; the
+module restricts the trtllm-gen tile ladder to the tiles with exported Cake
+kernels in every Cake stage, so neither the tactic windows nor `tactic=-1` (the
+smallest exported tile of the token window) can name a tile without a kernel.
+The full path routes `Renormalize` from logits or from unpacked pre-computed
+top-k ids + weights (each when the inventory exports that routing variant) and
+has no fused shared experts. The host contract lives in
+`csrc/fused_moe/cake_stepfun/README.md`.
 
 The class-level matrix below is generated from the registered runner classes.
 The Quantization column is always the MMA pair ``weight×activation``
@@ -811,14 +875,18 @@ python scripts/generate_moe_activation_matrix.py --write
 | `b12x_nvfp4` | `B12xNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2` |
 | `b12x_w4a16` | `B12xW4A16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
 | `cake` | `CakeWarpDecodeConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiLU`, `SiTU` |
+| `cake_stepfun` | `CakeStepFunConfig` | `BF16×BF16` | `SwiGLUStep` |
+| `cake_stepfun` | `CakeStepFunConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLUStep` |
+| `cake_stepfun` | `CakeStepFunConfig` | `MXFP8×MXFP8` | `SwiGLUStep` |
+| `cake_stepfun` | `CakeStepFunConfig` | `NVFP4×NVFP4` | `SwiGLUStep` |
 | `cudnn_frost_bf16` | `CudnnFrostBf16Config` | `BF16×BF16` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cudnn_frost_mxfp8` | `CudnnFrostMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cudnn_frost_mxfp8_mxfp4` | `CudnnFrostMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cudnn_frost_nvfp4` | `CudnnFrostNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `SwiGLUStep`, `GELU`, `ReLU`, `SiLU`, `Identity` |
-| `cudnn_grouped_gemm_bf16` | `CudnnGroupedGemmBf16Config` | `BF16×BF16` | `SwiGLU` |
-| `cudnn_grouped_gemm_fp8_per_tensor` | `CudnnGroupedGemmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU` |
-| `cudnn_grouped_gemm_mxfp8` | `CudnnGroupedGemmMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU` |
-| `cudnn_grouped_gemm_nvfp4` | `CudnnGroupedGemmNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU` |
+| `cudnn_grouped_gemm_bf16` | `CudnnGroupedGemmBf16Config` | `BF16×BF16` | `SwiGLU`, `GeGLU`, `GELU`, `ReLU`, `SiLU`, `Identity` |
+| `cudnn_grouped_gemm_fp8_per_tensor` | `CudnnGroupedGemmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `GeGLU`, `GELU`, `ReLU`, `SiLU`, `Identity` |
+| `cudnn_grouped_gemm_mxfp8` | `CudnnGroupedGemmMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `GELU`, `ReLU`, `SiLU`, `Identity` |
+| `cudnn_grouped_gemm_nvfp4` | `CudnnGroupedGemmNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cute_dsl` | `CuteDslConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4×BF16` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
@@ -850,14 +918,15 @@ python scripts/generate_moe_activation_matrix.py --write
 | `prims_ts` | `PrimsTsConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
 | `sm12x_fp8` | `SM12xFp8Config` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
 | `sm12x_mxfp8_mxfp4` | `SM12xMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `SiTU` |
+| `sm12x_nvfp4` | `SM12xNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `ReLU2` |
 | `sm12x_nvfp4_bf16` | `SM12xNvfp4Bf16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
-| `trtllm_bf16_routed` | `TrtllmBf16Config` | `BF16×BF16` | `SwiGLU`, `ReLU2` |
+| `trtllm_bf16_routed` | `TrtllmBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `ReLU2` |
 | `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4×BF16` | `SwiGLU` |
 | `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
-| `trtllm_fp4_routed` | `TrtllmFp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
+| `trtllm_fp4_routed` | `TrtllmFp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `SiTU`, `ReLU2` |
 | `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
-| `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `ReLU2` |
-| `trtllm_fp8_per_tensor` | `TrtllmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `ReLU2` |
+| `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `MXFP8×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `ReLU2` |
+| `trtllm_fp8_per_tensor` | `TrtllmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `ReLU2` |
 | `trtllm_mxint4_routed` | `TrtllmMxInt4Config` | `MXINT4×BF16` | `SwiGLU` |
 <!-- END GENERATED MOE ACTIVATION MATRIX -->
 

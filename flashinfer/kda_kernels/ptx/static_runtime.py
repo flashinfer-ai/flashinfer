@@ -226,33 +226,23 @@ class StaticPTXModule:
             entry(*args, *grid)
 
 
-def compiled_stream_m64_fixed_final(*, split_major=False, **_):
+def compiled_stream_m64_fixed_final(*, split_major=False):
     return StaticPTXModule("fixed_h64") if split_major else None
 
 
-def compiled_stream_m64_fixed():
-    return None
-
-
-def compiled_stream_m128_fixed_h96_final(**_):
+def compiled_stream_m128_fixed_h96_final():
     return StaticPTXModule("fixed_h96")
 
 
-def compiled_stream_m128_cluster8(**_):
-    return None
-
-
 def compiled_stream_m128_cluster2(
-    *, full_chunks=False, store_final_state=True, handoff=False, **_
+    *, full_chunks=False, store_final_state=True, handoff=False
 ):
     if not full_chunks and store_final_state and handoff:
         return StaticPTXModule("varlen_mixed_h64")
     return None
 
 
-def compiled_stream_m128(
-    *, full_chunks=False, store_final_state=True, handoff=False, **_
-):
+def compiled_stream_m128(*, full_chunks=False, store_final_state=True, handoff=False):
     if full_chunks and store_final_state:
         return StaticPTXModule("varlen_uniform_h64")
     if not full_chunks and store_final_state:
@@ -262,10 +252,8 @@ def compiled_stream_m128(
 
 __all__ = [
     "StaticPTXModule",
-    "compiled_stream_m64_fixed",
     "compiled_stream_m64_fixed_final",
     "compiled_stream_m128",
     "compiled_stream_m128_cluster2",
-    "compiled_stream_m128_cluster8",
     "compiled_stream_m128_fixed_h96_final",
 ]

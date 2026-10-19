@@ -23,6 +23,7 @@ import torch
 from .api_logging import flashinfer_api
 from .jit.cake_blackwell_softmax import gen_blackwell_softmax_module
 from .jit.sampling import gen_sampling_module
+from .topk import _ROW_STATES_NBYTES
 from .trace.templates.sampling import (
     chain_speculative_sampling_trace,
     min_p_sampling_trace,
@@ -399,8 +400,14 @@ def get_sampling_module():
         device = probs.device
         probs = probs.float()
         batch_size = indices.size(0) if indices is not None else probs.size(0)
-        maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
         out_dtype = indices.dtype if indices is not None else torch.int32
+        # The kernel reads top_k_arr with the element type it uses for indices and
+        # output (IdType), so the threshold tensor has to carry that dtype. Casting
+        # unconditionally to int32 makes an int64 indices path reinterpret two int32
+        # entries as one int64 and read past the end of the array.
+        maybe_top_k_arr = (
+            maybe_top_k_arr.to(out_dtype) if maybe_top_k_arr is not None else None
+        )
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         valid = torch.empty(batch_size, dtype=torch.bool, device=device)
         if seed is None or offset is None:
@@ -529,12 +536,15 @@ def get_sampling_module():
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         device = probs.device
         probs = probs.float()
-        maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
         maybe_top_p_arr = (
             maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
         )
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
+        # See top_k_sampling_from_probs: top_k_arr is read as IdType by the kernel.
+        maybe_top_k_arr = (
+            maybe_top_k_arr.to(out_dtype) if maybe_top_k_arr is not None else None
+        )
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         valid = torch.empty(batch_size, dtype=torch.bool, device=device)
         if seed is None or offset is None:
@@ -990,7 +1000,8 @@ def sampling_from_logits(
     offset: Optional[Union[int, torch.Tensor]] = None,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for category sampling from logits. It's equivalent to sampling
-    from :attr:`logits` after applying softmax.
+    from the probabilities obtained by applying softmax to :attr:`logits`.
+
     Parameters
     ----------
     logits: torch.Tensor
@@ -1006,12 +1017,12 @@ def sampling_from_logits(
         If indices is not provided, the i-th output will be sampled from the i-th row of logits
         and output dtype defaults to ``torch.int32``.
     deterministic: bool
-        Since the sampling doesn't use cub's BlockScan, the sampling is deterministic. We keep this
+        Since the sampling doesn't use cub's BlockScan, it is deterministic. We keep this
         argument for compatibility with other sampling functions.
     generator: Optional[torch.Generator]
         A random number generator for the operation.
     check_nan: bool
-        Whether to check nan in :attr:`logits`, default is ``False``.
+        Whether to check for NaNs in :attr:`logits`; the default is ``False``.
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
@@ -1020,22 +1031,27 @@ def sampling_from_logits(
         than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
-        Tensor seed/offset pairs identify request-local RNG streams, including
-        length-one tensors. The pair is mixed into a Philox seed; tensor offset
-        is part of the stream identity, not a skip-ahead position. Moving a
-        request's distribution and RNG values together preserves its draw for
-        the same sampling operation, including when sampled alone. Identical
-        pairs replay the same stream: broadcasting a length-one pair or repeating
-        it across rows gives identical draws for identical distributions. Use
-        distinct request keys and advance the offset between sampling calls.
-        This changes the previous length-one tensor behavior. Scalar inputs and
-        torch.Generator retain the legacy row-dependent subsequence and offset
-        skip-ahead semantics.
+        When either RNG tensor has one element per output row in a multi-row
+        batch, or any RNG tensor is used in a single-row batch, the seed/offset
+        pair identifies a request-local RNG stream. The pair is mixed into a
+        Philox seed; offset is a stream key, not a skip-ahead position. Moving
+        a request's distribution and RNG values together preserves its draw,
+        including when sampled alone. Repeated per-row pairs replay identical
+        draws for identical distributions. Use distinct request keys and
+        increment the offset between calls.
+
+        For multi-row batches with two length-one RNG tensors, broadcasting
+        retains the legacy row-dependent subsequences and skip-ahead offsets.
+        Scalar-only inputs and torch.Generator also retain that behavior.
+        The choice depends on tensor lengths and output batch size, not whether
+        tensor values differ.
+        Compacting a broadcast-only batch to one row switches to request-key
+        semantics; use per-row RNG tensors for replay across batch sizes.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
-        - Incrementing a tensor offset once per call to select a new request stream
-        - Advancing a scalar offset by the number of random values consumed
+        - Incrementing a request-key offset once per call to select a new stream
+        - Advancing a scalar or broadcast offset by the random values consumed
         - Updating seed based on the number of calls to the operation
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
@@ -1046,13 +1062,15 @@ def sampling_from_logits(
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
-        their values between calls to ensure different random samples. Increment tensor
-        offsets once per call; advance scalar offsets by the number of random values consumed.
+        their values between calls to ensure different random samples. Increment request-key
+        offsets once per call; advance scalar or broadcast offsets by the random values consumed.
+
     Returns
     -------
     samples: torch.Tensor
         Sampled categories, shape (batch_size,). It's equivalent to sampling from
         :attr:`logits` after applying softmax.
+
     Examples
     --------
     >>> import torch
@@ -1110,7 +1128,7 @@ def sampling_from_probs(
     generator: Optional[torch.Generator]
         A random number generator for the operation.
     check_nan: bool
-        Whether to check nan in :attr:`probs`, default is ``False``.
+        Whether to check for NaNs in :attr:`probs`; the default is ``False``.
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
@@ -1119,22 +1137,27 @@ def sampling_from_probs(
         than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
-        Tensor seed/offset pairs identify request-local RNG streams, including
-        length-one tensors. The pair is mixed into a Philox seed; tensor offset
-        is part of the stream identity, not a skip-ahead position. Moving a
-        request's distribution and RNG values together preserves its draw for
-        the same sampling operation, including when sampled alone. Identical
-        pairs replay the same stream: broadcasting a length-one pair or repeating
-        it across rows gives identical draws for identical distributions. Use
-        distinct request keys and advance the offset between sampling calls.
-        This changes the previous length-one tensor behavior. Scalar inputs and
-        torch.Generator retain the legacy row-dependent subsequence and offset
-        skip-ahead semantics.
+        When either RNG tensor has one element per output row in a multi-row
+        batch, or any RNG tensor is used in a single-row batch, the seed/offset
+        pair identifies a request-local RNG stream. The pair is mixed into a
+        Philox seed; offset is a stream key, not a skip-ahead position. Moving
+        a request's distribution and RNG values together preserves its draw,
+        including when sampled alone. Repeated per-row pairs replay identical
+        draws for identical distributions. Use distinct request keys and
+        increment the offset between calls.
+
+        For multi-row batches with two length-one RNG tensors, broadcasting
+        retains the legacy row-dependent subsequences and skip-ahead offsets.
+        Scalar-only inputs and torch.Generator also retain that behavior.
+        The choice depends on tensor lengths and output batch size, not whether
+        tensor values differ.
+        Compacting a broadcast-only batch to one row switches to request-key
+        semantics; use per-row RNG tensors for replay across batch sizes.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
-        - Incrementing a tensor offset once per call to select a new request stream
-        - Advancing a scalar offset by the number of random values consumed
+        - Incrementing a request-key offset once per call to select a new stream
+        - Advancing a scalar or broadcast offset by the random values consumed
         - Updating seed based on the number of calls to the operation
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
@@ -1145,8 +1168,8 @@ def sampling_from_probs(
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
-        their values between calls to ensure different random samples. Increment tensor
-        offsets once per call; advance scalar offsets by the number of random values consumed.
+        their values between calls to ensure different random samples. Increment request-key
+        offsets once per call; advance scalar or broadcast offsets by the random values consumed.
     return_valid : bool
         When ``True``, the kernel returns an additional boolean mask
         indicating which rows had a valid (non-degenerate) distribution.
@@ -1182,7 +1205,7 @@ def sampling_from_probs(
 
     Note
     ----
-    This function expects float32 inputs, and the output is int32.
+    This function expects float32 inputs, and the output is int32 unless ``indices`` is provided, in which case the output has the same dtype as ``indices``.
     """
     if check_nan:
         if torch.any(torch.isnan(probs)):
@@ -1210,8 +1233,8 @@ def top_p_sampling_from_probs(
     offset: Optional[Union[int, torch.Tensor]] = None,
     return_valid: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    r"""Fused GPU kernel for top-p sampling (nucleus sampling) from probabilities,
-    this operator implements GPU-based rejection sampling without explicit sorting.
+    r"""Fused GPU kernel for top-p (nucleus) sampling from probabilities.
+    This operator implements GPU-based rejection sampling without explicit sorting.
     Check the `blog post <https://flashinfer.ai/2025/03/10/sampling.html>`_ for more details.
 
     The multiple rounds of rejection sampling are implemented in a single CUDA kernel,
@@ -1240,7 +1263,7 @@ def top_p_sampling_from_probs(
     generator: Optional[torch.Generator]
         A random number generator for the operation.
     check_nan: bool
-        Whether to check nan in :attr:`probs`, default is ``False``.
+        Whether to check for NaNs in :attr:`probs`; the default is ``False``.
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
@@ -1249,22 +1272,27 @@ def top_p_sampling_from_probs(
         than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
-        Tensor seed/offset pairs identify request-local RNG streams, including
-        length-one tensors. The pair is mixed into a Philox seed; tensor offset
-        is part of the stream identity, not a skip-ahead position. Moving a
-        request's distribution and RNG values together preserves its draw for
-        the same sampling operation, including when sampled alone. Identical
-        pairs replay the same stream: broadcasting a length-one pair or repeating
-        it across rows gives identical draws for identical distributions. Use
-        distinct request keys and advance the offset between sampling calls.
-        This changes the previous length-one tensor behavior. Scalar inputs and
-        torch.Generator retain the legacy row-dependent subsequence and offset
-        skip-ahead semantics.
+        When either RNG tensor has one element per output row in a multi-row
+        batch, or any RNG tensor is used in a single-row batch, the seed/offset
+        pair identifies a request-local RNG stream. The pair is mixed into a
+        Philox seed; offset is a stream key, not a skip-ahead position. Moving
+        a request's distribution and RNG values together preserves its draw,
+        including when sampled alone. Repeated per-row pairs replay identical
+        draws for identical distributions. Use distinct request keys and
+        increment the offset between calls.
+
+        For multi-row batches with two length-one RNG tensors, broadcasting
+        retains the legacy row-dependent subsequences and skip-ahead offsets.
+        Scalar-only inputs and torch.Generator also retain that behavior.
+        The choice depends on tensor lengths and output batch size, not whether
+        tensor values differ.
+        Compacting a broadcast-only batch to one row switches to request-key
+        semantics; use per-row RNG tensors for replay across batch sizes.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
-        - Incrementing a tensor offset once per call to select a new request stream
-        - Advancing a scalar offset by the number of random values consumed
+        - Incrementing a request-key offset once per call to select a new stream
+        - Advancing a scalar or broadcast offset by the random values consumed
         - Updating seed based on the number of calls to the operation
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
@@ -1275,8 +1303,8 @@ def top_p_sampling_from_probs(
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
-        their values between calls to ensure different random samples. Increment tensor
-        offsets once per call; advance scalar offsets by the number of random values consumed.
+        their values between calls to ensure different random samples. Increment request-key
+        offsets once per call; advance scalar or broadcast offsets by the random values consumed.
     return_valid : bool
         When ``True``, the kernel returns an additional boolean mask
         indicating which rows had a valid (non-degenerate) distribution
@@ -1349,8 +1377,8 @@ def top_k_sampling_from_probs(
     offset: Optional[Union[int, torch.Tensor]] = None,
     return_valid: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    r"""Fused GPU kernel for top-k sampling from probabilities,
-    this operator implements GPU-based rejection sampling without explicit sorting.
+    r"""Fused GPU kernel for top-k sampling from probabilities.
+    This operator implements GPU-based rejection sampling without explicit sorting.
     Check the `blog post <https://flashinfer.ai/2025/03/10/sampling.html>`_ for more details.
 
     The multiple rounds of rejection sampling are implemented in a single CUDA kernel,
@@ -1379,7 +1407,7 @@ def top_k_sampling_from_probs(
     generator: Optional[torch.Generator]
         A random number generator for the operation.
     check_nan: bool
-        Whether to check nan in :attr:`probs`, default is ``False``.
+        Whether to check for NaNs in :attr:`probs`; the default is ``False``.
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
@@ -1388,22 +1416,27 @@ def top_k_sampling_from_probs(
         than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
-        Tensor seed/offset pairs identify request-local RNG streams, including
-        length-one tensors. The pair is mixed into a Philox seed; tensor offset
-        is part of the stream identity, not a skip-ahead position. Moving a
-        request's distribution and RNG values together preserves its draw for
-        the same sampling operation, including when sampled alone. Identical
-        pairs replay the same stream: broadcasting a length-one pair or repeating
-        it across rows gives identical draws for identical distributions. Use
-        distinct request keys and advance the offset between sampling calls.
-        This changes the previous length-one tensor behavior. Scalar inputs and
-        torch.Generator retain the legacy row-dependent subsequence and offset
-        skip-ahead semantics.
+        When either RNG tensor has one element per output row in a multi-row
+        batch, or any RNG tensor is used in a single-row batch, the seed/offset
+        pair identifies a request-local RNG stream. The pair is mixed into a
+        Philox seed; offset is a stream key, not a skip-ahead position. Moving
+        a request's distribution and RNG values together preserves its draw,
+        including when sampled alone. Repeated per-row pairs replay identical
+        draws for identical distributions. Use distinct request keys and
+        increment the offset between calls.
+
+        For multi-row batches with two length-one RNG tensors, broadcasting
+        retains the legacy row-dependent subsequences and skip-ahead offsets.
+        Scalar-only inputs and torch.Generator also retain that behavior.
+        The choice depends on tensor lengths and output batch size, not whether
+        tensor values differ.
+        Compacting a broadcast-only batch to one row switches to request-key
+        semantics; use per-row RNG tensors for replay across batch sizes.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
-        - Incrementing a tensor offset once per call to select a new request stream
-        - Advancing a scalar offset by the number of random values consumed
+        - Incrementing a request-key offset once per call to select a new stream
+        - Advancing a scalar or broadcast offset by the random values consumed
         - Updating seed based on the number of calls to the operation
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
@@ -1414,8 +1447,8 @@ def top_k_sampling_from_probs(
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
-        their values between calls to ensure different random samples. Increment tensor
-        offsets once per call; advance scalar offsets by the number of random values consumed.
+        their values between calls to ensure different random samples. Increment request-key
+        offsets once per call; advance scalar or broadcast offsets by the random values consumed.
     return_valid : bool
         When ``True``, the kernel returns an additional boolean mask
         indicating which rows had a valid (non-degenerate) distribution
@@ -1488,7 +1521,7 @@ def min_p_sampling_from_probs(
     offset: Optional[Union[int, torch.Tensor]] = None,
     return_valid: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    r"""Fused GPU kernel for `min_p sampling <https://arxiv.org/abs/2407.01082>`_ from probabilities,
+    r"""Fused GPU kernel for `min_p sampling <https://arxiv.org/abs/2407.01082>`_ from probabilities.
 
     this operator implements GPU-based rejection sampling without explicit sorting.
     Check the `blog post <https://flashinfer.ai/2025/03/10/sampling.html>`_ for more details.
@@ -1519,7 +1552,7 @@ def min_p_sampling_from_probs(
     generator: Optional[torch.Generator]
         A random number generator for the operation.
     check_nan: bool
-        Whether to check nan in :attr:`probs`, default is ``False``.
+        Whether to check for NaNs in :attr:`probs`; the default is ``False``.
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
@@ -1528,22 +1561,27 @@ def min_p_sampling_from_probs(
         than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
-        Tensor seed/offset pairs identify request-local RNG streams, including
-        length-one tensors. The pair is mixed into a Philox seed; tensor offset
-        is part of the stream identity, not a skip-ahead position. Moving a
-        request's distribution and RNG values together preserves its draw for
-        the same sampling operation, including when sampled alone. Identical
-        pairs replay the same stream: broadcasting a length-one pair or repeating
-        it across rows gives identical draws for identical distributions. Use
-        distinct request keys and advance the offset between sampling calls.
-        This changes the previous length-one tensor behavior. Scalar inputs and
-        torch.Generator retain the legacy row-dependent subsequence and offset
-        skip-ahead semantics.
+        When either RNG tensor has one element per output row in a multi-row
+        batch, or any RNG tensor is used in a single-row batch, the seed/offset
+        pair identifies a request-local RNG stream. The pair is mixed into a
+        Philox seed; offset is a stream key, not a skip-ahead position. Moving
+        a request's distribution and RNG values together preserves its draw,
+        including when sampled alone. Repeated per-row pairs replay identical
+        draws for identical distributions. Use distinct request keys and
+        increment the offset between calls.
+
+        For multi-row batches with two length-one RNG tensors, broadcasting
+        retains the legacy row-dependent subsequences and skip-ahead offsets.
+        Scalar-only inputs and torch.Generator also retain that behavior.
+        The choice depends on tensor lengths and output batch size, not whether
+        tensor values differ.
+        Compacting a broadcast-only batch to one row switches to request-key
+        semantics; use per-row RNG tensors for replay across batch sizes.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
-        - Incrementing a tensor offset once per call to select a new request stream
-        - Advancing a scalar offset by the number of random values consumed
+        - Incrementing a request-key offset once per call to select a new stream
+        - Advancing a scalar or broadcast offset by the random values consumed
         - Updating seed based on the number of calls to the operation
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
@@ -1554,8 +1592,8 @@ def min_p_sampling_from_probs(
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
-        their values between calls to ensure different random samples. Increment tensor
-        offsets once per call; advance scalar offsets by the number of random values consumed.
+        their values between calls to ensure different random samples. Increment request-key
+        offsets once per call; advance scalar or broadcast offsets by the random values consumed.
     return_valid : bool
         When ``True``, the kernel returns an additional boolean mask
         indicating which rows had a valid (non-degenerate) distribution
@@ -1713,7 +1751,7 @@ def top_k_top_p_sampling_from_logits(
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
 ) -> torch.Tensor:
-    r"""Fused GPU kernel for top-k and top-p sampling from pre-softmax logits,
+    r"""Fused GPU kernel for top-k and top-p sampling from pre-softmax logits.
 
     this operator implements GPU-based rejection sampling without explicit sorting.
     Check the `blog post <https://flashinfer.ai/2025/03/10/sampling.html>`_ for more details.
@@ -1752,7 +1790,7 @@ def top_k_top_p_sampling_from_logits(
     generator: Optional[torch.Generator]
         A random number generator for the operation.
     check_nan: bool
-        Whether to check nan in :attr:`probs`, default is ``False``.
+        Whether to check the probabilities derived from ``logits`` for NaNs; the default is ``False``.
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
@@ -1761,22 +1799,27 @@ def top_k_top_p_sampling_from_logits(
         than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
-        Tensor seed/offset pairs identify request-local RNG streams, including
-        length-one tensors. The pair is mixed into a Philox seed; tensor offset
-        is part of the stream identity, not a skip-ahead position. Moving a
-        request's distribution and RNG values together preserves its draw for
-        the same sampling operation, including when sampled alone. Identical
-        pairs replay the same stream: broadcasting a length-one pair or repeating
-        it across rows gives identical draws for identical distributions. Use
-        distinct request keys and advance the offset between sampling calls.
-        This changes the previous length-one tensor behavior. Scalar inputs and
-        torch.Generator retain the legacy row-dependent subsequence and offset
-        skip-ahead semantics.
+        When either RNG tensor has one element per output row in a multi-row
+        batch, or any RNG tensor is used in a single-row batch, the seed/offset
+        pair identifies a request-local RNG stream. The pair is mixed into a
+        Philox seed; offset is a stream key, not a skip-ahead position. Moving
+        a request's distribution and RNG values together preserves its draw,
+        including when sampled alone. Repeated per-row pairs replay identical
+        draws for identical distributions. Use distinct request keys and
+        increment the offset between calls.
+
+        For multi-row batches with two length-one RNG tensors, broadcasting
+        retains the legacy row-dependent subsequences and skip-ahead offsets.
+        Scalar-only inputs and torch.Generator also retain that behavior.
+        The choice depends on tensor lengths and output batch size, not whether
+        tensor values differ.
+        Compacting a broadcast-only batch to one row switches to request-key
+        semantics; use per-row RNG tensors for replay across batch sizes.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
-        - Incrementing a tensor offset once per call to select a new request stream
-        - Advancing a scalar offset by the number of random values consumed
+        - Incrementing a request-key offset once per call to select a new stream
+        - Advancing a scalar or broadcast offset by the random values consumed
         - Updating seed based on the number of calls to the operation
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
@@ -1787,8 +1830,8 @@ def top_k_top_p_sampling_from_logits(
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
-        their values between calls to ensure different random samples. Increment tensor
-        offsets once per call; advance scalar offsets by the number of random values consumed.
+        their values between calls to ensure different random samples. Increment request-key
+        offsets once per call; advance scalar or broadcast offsets by the random values consumed.
 
     Returns
     -------
@@ -1891,7 +1934,7 @@ def top_k_top_p_sampling_from_probs(
     offset: Optional[Union[int, torch.Tensor]] = None,
     return_valid: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    r"""Fused GPU kernel for top-k and top-p sampling from probabilities,
+    r"""Fused GPU kernel for top-k and top-p sampling from probabilities.
 
     this operator implements GPU-based rejection sampling without explicit sorting.
     Check the `blog post <https://flashinfer.ai/2025/03/10/sampling.html>`_ for more details.
@@ -1930,7 +1973,7 @@ def top_k_top_p_sampling_from_probs(
     generator: Optional[torch.Generator]
         A random number generator for the operation.
     check_nan: bool
-        Whether to check nan in :attr:`probs`, default is ``False``.
+        Whether to check for NaNs in :attr:`probs`; the default is ``False``.
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype and 1D.
@@ -1939,22 +1982,27 @@ def top_k_top_p_sampling_from_probs(
         than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
-        Tensor seed/offset pairs identify request-local RNG streams, including
-        length-one tensors. The pair is mixed into a Philox seed; tensor offset
-        is part of the stream identity, not a skip-ahead position. Moving a
-        request's distribution and RNG values together preserves its draw for
-        the same sampling operation, including when sampled alone. Identical
-        pairs replay the same stream: broadcasting a length-one pair or repeating
-        it across rows gives identical draws for identical distributions. Use
-        distinct request keys and advance the offset between sampling calls.
-        This changes the previous length-one tensor behavior. Scalar inputs and
-        torch.Generator retain the legacy row-dependent subsequence and offset
-        skip-ahead semantics.
+        When either RNG tensor has one element per output row in a multi-row
+        batch, or any RNG tensor is used in a single-row batch, the seed/offset
+        pair identifies a request-local RNG stream. The pair is mixed into a
+        Philox seed; offset is a stream key, not a skip-ahead position. Moving
+        a request's distribution and RNG values together preserves its draw,
+        including when sampled alone. Repeated per-row pairs replay identical
+        draws for identical distributions. Use distinct request keys and
+        increment the offset between calls.
+
+        For multi-row batches with two length-one RNG tensors, broadcasting
+        retains the legacy row-dependent subsequences and skip-ahead offsets.
+        Scalar-only inputs and torch.Generator also retain that behavior.
+        The choice depends on tensor lengths and output batch size, not whether
+        tensor values differ.
+        Compacting a broadcast-only batch to one row switches to request-key
+        semantics; use per-row RNG tensors for replay across batch sizes.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
-        - Incrementing a tensor offset once per call to select a new request stream
-        - Advancing a scalar offset by the number of random values consumed
+        - Incrementing a request-key offset once per call to select a new stream
+        - Advancing a scalar or broadcast offset by the random values consumed
         - Updating seed based on the number of calls to the operation
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
@@ -1965,8 +2013,8 @@ def top_k_top_p_sampling_from_probs(
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
-        their values between calls to ensure different random samples. Increment tensor
-        offsets once per call; advance scalar offsets by the number of random values consumed.
+        their values between calls to ensure different random samples. Increment request-key
+        offsets once per call; advance scalar or broadcast offsets by the random values consumed.
     return_valid : bool
         When ``True``, the kernel returns an additional boolean mask
         indicating which rows had a valid (non-degenerate) distribution
@@ -2081,7 +2129,7 @@ def top_p_renorm_probs(
         We mask out the probabilities less than `threshold` where the cumulative sum
         of ``probs[probs >= threshold]`` is `top_p`, and renormalize the probabilities.
     is_deterministic: bool
-        If True, use deterministic integer accumulation for reproducible results. Will affect performance.
+        If True, use deterministic integer accumulation for reproducible results. This will affect performance.
         Default is False.
 
     Returns
@@ -2163,7 +2211,7 @@ def top_k_renorm_probs(
         Supported dtypes: ``float32``, ``float16``, ``bfloat16``.
     top_k: Union[torch.Tensor, int]
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the top-k threshold for
-        for re-normalizing probabilities, should be in ``(0, num_classes)``.
+        re-normalizing probabilities, should be in ``(0, num_classes)``.
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
         We keep the top-k probabilities, set the rest to zero, and renormalize the probabilities.
@@ -2216,13 +2264,9 @@ def top_k_renorm_probs(
     top_p_renorm_probs
     top_k : General-purpose top-k selection (returns indices and values)
     """
-    # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU)
-    buffer_bytes = 1024 * 1024  # 1MB
-    row_states_buffer = _get_cache_buf(
-        f"top_k_renorm_probs_row_states_{probs.device}",
-        buffer_bytes,
-        probs.device,
-        zero_init=True,
+    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
+    row_states_buffer = torch.zeros(
+        _ROW_STATES_NBYTES, dtype=torch.uint8, device=probs.device
     )
 
     return get_sampling_module().top_k_renorm_probs(
@@ -2249,7 +2293,7 @@ def top_k_mask_logits(
         Supported dtypes: ``float32``, ``float16``, ``bfloat16``.
     top_k: Union[torch.Tensor, int]
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the top-k threshold for
-        for masking logits, should be in ``(0, num_classes)``.
+        masking logits, should be in ``(0, num_classes)``.
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
         We keep the top-k logits, set the rest to negative infinity.
@@ -2291,17 +2335,10 @@ def top_k_mask_logits(
     top_k_renorm_probs
     top_k : General-purpose top-k selection (returns indices and values)
     """
-    # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU)
-    buffer_bytes = 1024 * 1024  # 1MB
-    row_states_buffer = _get_cache_buf(
-        f"top_k_mask_logits_row_states_{logits.device}",
-        buffer_bytes,
-        logits.device,
-        zero_init=True,
+    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
+    row_states_buffer = torch.zeros(
+        _ROW_STATES_NBYTES, dtype=torch.uint8, device=logits.device
     )
-
-    # Note: row_states_buffer is zero-initialized on first allocation by _get_cache_buf
-    # Kernel will reset arrival_counter to 0 at the end of each launch
 
     return get_sampling_module().top_k_mask_logits(
         logits, *_to_tensor_scalar_tuple(top_k), row_states_buffer
@@ -2319,10 +2356,10 @@ def chain_speculative_sampling(
     generator: Optional[torch.Generator] = None,
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Fused-GPU kernel for speculative sampling for sequence generation (proposed in
     paper `Accelerating Large Language Model Decoding with Speculative Sampling <https://arxiv.org/pdf/2302.01318>`_),
-    where the draft model generates a sequence(chain) of tokens for each request.
+    where the draft model generates a sequence (chain) of tokens for each request.
 
     Parameters
     ----------
@@ -2362,22 +2399,27 @@ def chain_speculative_sampling(
         than per input distribution row.
         Using torch.Tensor is required for CUDA graph compatibility.
 
-        Tensor seed/offset pairs identify request-local RNG streams, including
-        length-one tensors. The pair is mixed into a Philox seed; tensor offset
-        is part of the stream identity, not a skip-ahead position. Moving a
-        request's distribution and RNG values together preserves its draw for
-        the same sampling operation, including when sampled alone. Identical
-        pairs replay the same stream: broadcasting a length-one pair or repeating
-        it across rows gives identical draws for identical distributions. Use
-        distinct request keys and advance the offset between sampling calls.
-        This changes the previous length-one tensor behavior. Scalar inputs and
-        torch.Generator retain the legacy row-dependent subsequence and offset
-        skip-ahead semantics.
+        When either RNG tensor has one element per output row in a multi-row
+        batch, or any RNG tensor is used in a single-row batch, the seed/offset
+        pair identifies a request-local RNG stream. The pair is mixed into a
+        Philox seed; offset is a stream key, not a skip-ahead position. Moving
+        a request's distribution and RNG values together preserves its draw,
+        including when sampled alone. Repeated per-row pairs replay identical
+        draws for identical distributions. Use distinct request keys and
+        increment the offset between calls.
+
+        For multi-row batches with two length-one RNG tensors, broadcasting
+        retains the legacy row-dependent subsequences and skip-ahead offsets.
+        Scalar-only inputs and torch.Generator also retain that behavior.
+        The choice depends on tensor lengths and output batch size, not whether
+        tensor values differ.
+        Compacting a broadcast-only batch to one row switches to request-key
+        semantics; use per-row RNG tensors for replay across batch sizes.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
-        - Incrementing a tensor offset once per call to select a new request stream
-        - Advancing a scalar offset by the number of random values consumed
+        - Incrementing a request-key offset once per call to select a new stream
+        - Advancing a scalar or broadcast offset by the random values consumed
         - Updating seed based on the number of calls to the operation
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
@@ -2388,8 +2430,8 @@ def chain_speculative_sampling(
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
-        their values between calls to ensure different random samples. Increment tensor
-        offsets once per call; advance scalar offsets by the number of random values consumed.
+        their values between calls to ensure different random samples. Increment request-key
+        offsets once per call; advance scalar or broadcast offsets by the random values consumed.
 
     Returns
     -------

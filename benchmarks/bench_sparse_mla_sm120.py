@@ -33,11 +33,16 @@ Sweeps representative shapes:
 * DSv4   (d_qk=512, page_block_size=64, 584 B/token)
 * DSv4 dual cache (fixed main cache + secondary cache)
 * DSv3.2 (d_qk=576, page_block_size=64, 656 B/token)
+* DSv4.1 (d_qk=512, page_block_size=64, 528 B/token) in the footer-scale and
+  inline-scale (FlashMLA V4.1 record) placements, with and without the 288 B
+  FP4 compressed cache; timed per call with CUPTI on a cold L2
 
 The KV pool is sized ≫ L2 so the analytical KV bandwidth reflects DRAM-bound
 large-cache prefill. Reports median latency, KV bandwidth, and analytical
 attention TFLOPs. Requires sm120a / sm121a.
 """
+
+import functools
 
 import numpy as np
 import torch
@@ -383,6 +388,124 @@ def bench_sparse_mla_sm120_dsv3_2(
     return ms * 1e3, kv_bw_gbps, tflops
 
 
+# ── DSv4.1: footer-scale vs inline-scale records ──────────────────────────────
+
+_DSV41_PAGE = 64
+
+
+@functools.cache
+def _dsv41_pool(num_pages, fp4, inline, device, seed):
+    """Pack random latents into a DSv4.1 cache ``[num_pages, 64, row]``.
+
+    Both placements pack the same latents, so row ``r`` (page ``r // 64``, slot
+    ``r % 64``) holds the same record in either.
+    """
+    from flashinfer.mla import (
+        dsv41_fp4_quantize_pack_sparse_mla_cache,
+        dsv41_fp8_quantize_pack_sparse_mla_cache,
+    )
+
+    pack = (
+        dsv41_fp4_quantize_pack_sparse_mla_cache
+        if fp4
+        else dsv41_fp8_quantize_pack_sparse_mla_cache
+    )
+    generator = torch.Generator(device=device).manual_seed(seed)
+    pages = []
+    for start in range(0, num_pages, 1024):
+        count = min(1024, num_pages - start)
+        latent = (
+            torch.randn(
+                count,
+                _DSV41_PAGE,
+                512,
+                device=device,
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            / 10.0
+        ).clamp(-1, 1)
+        pages.append(pack(latent, kv_layout="NHD", inline_scale=inline).squeeze(2))
+    return torch.cat(pages)
+
+
+def bench_sparse_mla_sm120_dsv41(
+    num_heads,
+    num_tokens,
+    topk,
+    extra_topk=0,
+    extra_fp4=False,
+    inline=False,
+    compute_precision="default",
+    seed=0,
+):
+    """Returns (median_us, kv_bw_gbps) for DeepSeek-V4.1 on 64-token pages.
+
+    ``inline`` selects the inline-scale records (``kv_scale_format=
+    "ue8m0_g32_inline"``) over the footer-scale pages (``"ue8m0_g32"``).
+    ``extra_topk`` adds a compressed cache (FP4 records with ``extra_fp4``).
+    ``compute_precision`` is the wrapper's (``"bf16"`` runs the full-BF16 route).
+    Pools exceed L2, and every call starts with a flushed L2.
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(seed)
+    main_pages, extra_pages = 16384, 8192  # 553 MB main; 302 / 151 MB extra
+    main = _dsv41_pool(main_pages, False, inline, device, seed)
+    extra = (
+        _dsv41_pool(extra_pages, extra_fp4, inline, device, seed + 1)
+        if extra_topk
+        else None
+    )
+    q = (
+        torch.randn(num_tokens, num_heads, 512, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, main_pages * _DSV41_PAGE, (num_tokens, topk), device=device
+    ).int()
+    extra_indices = (
+        torch.randint(
+            0, extra_pages * _DSV41_PAGE, (num_tokens, extra_topk), device=device
+        ).int()
+        if extra_topk
+        else None
+    )
+    wrapper = flashinfer.mla.SparseMLASm120Wrapper(
+        kv_scale_format="ue8m0_g32_inline" if inline else "ue8m0_g32",
+        extra_kv_fp4=extra_fp4,
+        compute_precision=compute_precision,
+        device=device,
+    )
+    output = torch.empty(
+        num_tokens, num_heads, 512, device=device, dtype=torch.bfloat16
+    )
+
+    def fn():
+        wrapper.run(
+            q,
+            main,
+            indices,
+            output,
+            512**-0.5,
+            extra_kv_cache=extra,
+            extra_indices=extra_indices,
+        )
+
+    fn()
+    torch.cuda.synchronize()
+    measurements = bench_gpu_time(
+        fn,
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
+        enable_cupti=True,
+        cold_l2_cache=True,
+    )
+    ms = float(np.median(measurements))
+    extra_bpt = 288 if extra_fp4 else 528
+    kv_bytes = num_tokens * (topk * 528 + extra_topk * extra_bpt)
+    return ms * 1e3, kv_bytes * 1e-6 / ms
+
+
 if __name__ == "__main__":
     if not is_sm120a_supported(torch.device("cuda")):
         raise SystemExit("Sparse-MLA SM120 requires sm120a.")
@@ -532,3 +655,27 @@ if __name__ == "__main__":
             print(
                 f"{h:>10}  {2048:>6}  {t:>11}  {lat_us:>10.1f}  {kvbw:>13.1f}  {tfl:>12.2f}"
             )
+
+    # DSv4.1: the V4.1 indexer topk (512) on a single cache, and the SWA window
+    # (128) plus 512 compressed FP4 candidates, in both scale placements.
+    dsv41_header = (
+        f"{'num_heads':>10}  {'num_tokens':>11}  {'cache':>10}  "
+        f"{'footer (us)':>12}  {'inline (us)':>12}  {'inline/footer':>13}"
+    )
+    print()
+    print("DSv4.1 (page_block_size=64, cold L2, CUPTI):")
+    print(dsv41_header)
+    print("-" * len(dsv41_header))
+    for label, topk, extra_topk in (("512", 512, 0), ("128+fp4", 128, 512)):
+        for t in (1, 4, 16, 64, 1024):
+            for h in (8, 16, 32, 64):
+                footer_us, _ = bench_sparse_mla_sm120_dsv41(
+                    h, t, topk, extra_topk, extra_fp4=bool(extra_topk)
+                )
+                inline_us, _ = bench_sparse_mla_sm120_dsv41(
+                    h, t, topk, extra_topk, extra_fp4=bool(extra_topk), inline=True
+                )
+                print(
+                    f"{h:>10}  {t:>11}  {label:>10}  {footer_us:>12.1f}  "
+                    f"{inline_us:>12.1f}  {inline_us / footer_us:>13.3f}"
+                )

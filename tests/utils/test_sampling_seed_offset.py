@@ -35,7 +35,7 @@ SAMPLERS = [
     "top_k_top_p_sequential",
     "top_k_top_p_logits_sequential",
 ]
-RNG_SHAPES = [(4, 4), (1, 4), (4, 1), (1, 1)]
+RNG_SHAPES = [(4, 4), (1, 4), (4, 1)]
 
 
 def _sampler(name, indexed, vocab_size=257):
@@ -103,7 +103,7 @@ def _select_rows(sample, rows):
 
 def _assert_rng_reference(sample, actual, seed, offset):
     """Check exact replay across singleton, reordered, and smaller batches."""
-    # Tensor keys identify requests even in singleton or broadcast-only calls.
+    # Per-row tensor keys identify requests even when sampled alone.
     seeds = seed.cpu().tolist()
     offsets = offset.cpu().tolist()
     outputs = actual if isinstance(actual, tuple) else (actual,)
@@ -177,19 +177,45 @@ def test_chain_sampling_row_seed_offset(reject_at, dtype, seed_size, offset_size
 @pytest.mark.parametrize("name", [*SAMPLERS, "chain"])
 @pytest.mark.parametrize("seed_size,offset_size", [(4, 4), (1, 1)])
 def test_sampling_rng_tensor_cuda_graph(name, seed_size, offset_size):
-    """Graph replay must read updated RNG tensors and preserve request identity."""
+    """Graph replay must preserve per-row keys and legacy broadcast draws."""
     sample = _chain_sampler(1) if name == "chain" else _sampler(name, True)
     seed, offset = _rng_tensors(seed_size, offset_size, torch.int64)
     sample(seed=seed, offset=offset)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         actual = sample(seed=seed, offset=offset)
-    graph.replay()
-    _assert_rng_reference(sample, actual, seed, offset)
-    seed.add_(1234567)
-    offset.add_(256)
-    graph.replay()
-    _assert_rng_reference(sample, actual, seed, offset)
+    for update in (0, 1):
+        seed.add_(update * 1234567)
+        offset.add_(update * 256)
+        graph.replay()
+        if seed_size == offset_size == 1:
+            expected = sample(seed=seed.item(), offset=offset.item())
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        else:
+            _assert_rng_reference(sample, actual, seed, offset)
+
+
+@pytest.mark.parametrize(
+    "name,indexed",
+    [(name, indexed) for name in SAMPLERS for indexed in (False, True)]
+    + [("chain", False)],
+)
+@pytest.mark.parametrize("dtype", [torch.int64, torch.uint64])
+@pytest.mark.parametrize("repeat_distribution", [False, True])
+def test_broadcast_rng_matches_scalar(name, indexed, dtype, repeat_distribution):
+    """Broadcast tensors must preserve scalar draws for every output row."""
+    sample = _chain_sampler(1) if name == "chain" else _sampler(name, indexed)
+    # Cover identical distributions (the original collapse to one token) and
+    # distinct distributions (the same-quantile correlation hidden by that test).
+    rows = [2] * 64 if repeat_distribution else list(range(4)) * 16
+    sample = _select_rows(sample, rows)
+    seed, offset = 17, 128
+    expected = sample(seed=seed, offset=offset)
+    actual = sample(
+        seed=torch.tensor([seed], device="cuda", dtype=dtype),
+        offset=torch.tensor([offset], device="cuda", dtype=dtype),
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("name", ["seed", "offset"])
