@@ -279,10 +279,14 @@ _ONLY_SEEDS = os.environ.get("FLASHINFER_UMOE_FUZZ_ONLY_SEED", "")
 # sequence enabled is its regression coverage.
 # Set FLASHINFER_UMOE_FUZZ=0 to disable in an emergency; FLASHINFER_UMOE_FUZZ=1 (the old opt-in
 # value) still enables and is now a no-op.
-pytestmark = pytest.mark.skipif(
-    os.environ.get("FLASHINFER_UMOE_FUZZ", "1") == "0",
-    reason="unified MoE fuzzer disabled via FLASHINFER_UMOE_FUZZ=0",
-)
+# H100 CI peak host RSS: 313.6 GiB, including cold JIT compilation.
+pytestmark = [
+    pytest.mark.host_memory_heavy,
+    pytest.mark.skipif(
+        os.environ.get("FLASHINFER_UMOE_FUZZ", "1") == "0",
+        reason="unified MoE fuzzer disabled via FLASHINFER_UMOE_FUZZ=0",
+    ),
+]
 
 # Per-backend determinism contract, established empirically (CRC across reruns) + confirmed against
 # code. A "True" backend MUST reproduce bitwise; flip to False only with evidence (and ideally an

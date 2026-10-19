@@ -500,6 +500,7 @@ kernel_cake_moe_grouped_gemm_1edcad995dcc790600cb(const __grid_constant__ CUtens
     }
 
     // Cleanup
+    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
     asm volatile("barrier.cluster.arrive.release.aligned;");
     asm volatile("barrier.cluster.wait.acquire.aligned;");
 
@@ -509,3 +510,4 @@ kernel_cake_moe_grouped_gemm_1edcad995dcc790600cb(const __grid_constant__ CUtens
 }
 
 } // extern "C"
+

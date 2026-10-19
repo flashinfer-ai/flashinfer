@@ -171,6 +171,9 @@ class GeneratedFlashKDAModule:
     pair_packed_beta: bool
     affine_dependency: str
     selectors: tuple[GeneratedFlashKDASelector, ...]
+    # ``-D<name>=<value>`` knobs of a folded body: one source serves several
+    # rows and selects this row's code from them (empty for a per-row body).
+    defines: tuple[tuple[str, int], ...] = ()
 
 
 GeneratedFlashKDASelectorKey = tuple[
@@ -261,6 +264,42 @@ def _parse_specialization(
     return tuple(items)
 
 
+def _knob_defines(
+    knobs: object,
+    selectors: list[GeneratedFlashKDASelector],
+    *,
+    label: str,
+) -> tuple[tuple[str, int], ...]:
+    """Derive a folded body's ``-D`` knobs from the row's specialization.
+
+    A folded body serves several rows and selects each row's code with
+    ``FLASHKDA_GENERATED_<FIELD>`` macros; the row lists the specialization
+    fields that drive them under ``knobs``. Every selector of the row must
+    carry the same boolean or integer value for each knob.
+    """
+
+    if not isinstance(knobs, list) or not all(isinstance(k, str) for k in knobs):
+        raise ValueError(f"{label} field 'knobs' must be a list of field names")
+    if len(set(knobs)) != len(knobs):
+        raise ValueError(f"{label} repeats a knob")
+    defines = []
+    for name in knobs:
+        values = [dict(selector.specialization).get(name) for selector in selectors]
+        first = values[0]
+        if not isinstance(first, int) or any(
+            type(value) is not type(first) or value != first for value in values
+        ):
+            raise ValueError(
+                f"{label} knob {name!r} must be one boolean or integer "
+                "specialization value shared by every selector"
+            )
+        macro = f"FLASHKDA_GENERATED_{name.upper()}"
+        if _FLASH_KDA_C_IDENTIFIER_RE.fullmatch(macro) is None:
+            raise ValueError(f"{label} knob {name!r} is not a C identifier")
+        defines.append((macro, int(first)))
+    return tuple(defines)
+
+
 def _read_text(path: Path, label: str) -> str:
     if not path.is_file():
         raise FileNotFoundError(f"{label} not found: {path}")
@@ -271,14 +310,19 @@ def _read_text(path: Path, label: str) -> str:
 def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
     """Load the generated physical-module table, keyed by ``arch:module_ident``.
 
-    The table is lazy: importing FlashInfer or using the checkpoint fallback does
-    not read it. Source files are read only when a module's JIT spec is created.
+    One table row describes one generated module: its body, the ``knobs``
+    (specialization fields passed to the body as ``FLASHKDA_GENERATED_*``
+    defines when several rows share one folded body) and every exact
+    architecture that compiles it under ``archs``; the registry holds one entry
+    per (architecture, module) pair. The table is lazy: importing FlashInfer or
+    using the checkpoint fallback does not read it. Source files are read only
+    when a module's JIT spec is created.
     """
 
     csrc_dir = _get_flash_kda_csrc_dir()
     metadata_path = csrc_dir / _FLASH_KDA_GENERATED_METADATA_NAME
     metadata = json.loads(_read_text(metadata_path, "generated FlashKDA module table"))
-    if not isinstance(metadata, dict) or metadata.get("schema_version") != 2:
+    if not isinstance(metadata, dict) or metadata.get("schema_version") != 3:
         raise ValueError("unsupported generated FlashKDA module table schema")
     rows = metadata.get("modules")
     if not isinstance(rows, list) or not rows:
@@ -289,18 +333,19 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
         label = f"generated FlashKDA module {index}"
         if not isinstance(row, dict):
             raise ValueError(f"{label} is not an object")
-        arch = row.get("arch")
-        if arch not in _FLASH_KDA_GENERATED_ARCH_TARGETS:
-            raise ValueError(f"{label} has unsupported exact architecture: {arch!r}")
+        archs = row.get("archs")
+        if (
+            not isinstance(archs, list)
+            or not archs
+            or any(arch not in _FLASH_KDA_GENERATED_ARCH_TARGETS for arch in archs)
+        ):
+            raise ValueError(f"{label} has unsupported exact architectures: {archs!r}")
         module_ident = row.get("module_ident")
         if (
             not isinstance(module_ident, str)
             or _FLASH_KDA_C_IDENTIFIER_RE.fullmatch(module_ident) is None
         ):
             raise ValueError(f"{label} module_ident is not a C identifier")
-        variant_id = f"{arch}:{module_ident}"
-        if variant_id in modules:
-            raise ValueError(f"duplicate generated FlashKDA module: {variant_id}")
         state_mode = row.get("state_mode")
         if state_mode not in _FLASH_KDA_GENERATED_STATE_MODES:
             raise ValueError(f"{label} has unsupported state mode {state_mode!r}")
@@ -352,26 +397,32 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
                     ),
                 )
             )
-        modules[variant_id] = GeneratedFlashKDAModule(
-            variant_id=variant_id,
-            arch=arch,
-            target=_FLASH_KDA_GENERATED_ARCH_TARGETS[arch],
-            module_ident=module_ident,
-            body=row["body"],
-            kernel=row["kernel"],
-            threads=row["threads"],
-            smem_bytes=row["smem_bytes"],
-            use_pdl=row["use_pdl"],
-            state_mode=state_mode,
-            abi_family=abi_family,
-            abi_variant=abi_variant,
-            tma_tile_tokens=row["tma_tile_tokens"],
-            value_rows=row["value_rows"],
-            value_tma_rank=row["value_tma_rank"],
-            pair_packed_beta=row["pair_packed_beta"],
-            affine_dependency=row["affine_dependency"],
-            selectors=tuple(selectors),
-        )
+        defines = _knob_defines(row.get("knobs", []), selectors, label=label)
+        for arch in archs:
+            variant_id = f"{arch}:{module_ident}"
+            if variant_id in modules:
+                raise ValueError(f"duplicate generated FlashKDA module: {variant_id}")
+            modules[variant_id] = GeneratedFlashKDAModule(
+                variant_id=variant_id,
+                arch=arch,
+                target=_FLASH_KDA_GENERATED_ARCH_TARGETS[arch],
+                module_ident=module_ident,
+                body=row["body"],
+                kernel=row["kernel"],
+                threads=row["threads"],
+                smem_bytes=row["smem_bytes"],
+                use_pdl=row["use_pdl"],
+                state_mode=state_mode,
+                abi_family=abi_family,
+                abi_variant=abi_variant,
+                tma_tile_tokens=row["tma_tile_tokens"],
+                value_rows=row["value_rows"],
+                value_tma_rank=row["value_tma_rank"],
+                pair_packed_beta=row["pair_packed_beta"],
+                affine_dependency=row["affine_dependency"],
+                selectors=tuple(selectors),
+                defines=defines,
+            )
     return MappingProxyType(modules)
 
 
@@ -528,9 +579,9 @@ def _flash_kda_generated_closure(variant_id: str) -> tuple[Path, str, str]:
     """Return (body path, rendered selector, content cache ident) for one module.
 
     The cache ident seals every byte the selector translation unit compiles:
-    the rendered selector, the generated body, its ABI wrapper, and the shared
-    binding headers. A changed body or integration header therefore cannot
-    reuse a stale JIT/AOT artifact.
+    the rendered selector, the generated body, its ABI wrapper, the shared
+    binding headers, and the knob defines of a folded body. A changed body,
+    knob or integration header therefore cannot reuse a stale JIT/AOT artifact.
     """
 
     module = _generated_module(variant_id)
@@ -549,6 +600,12 @@ def _flash_kda_generated_closure(variant_id: str) -> tuple[Path, str, str]:
             for name in _FLASH_KDA_GENERATED_SHARED_HEADERS
         ),
     ]
+    if module.defines:
+        # A folded body compiles differently per row; seal the knobs as well so
+        # that a changed knob cannot reuse a stale artifact either.
+        closure.append(
+            " ".join(f"-D{name}={value}" for name, value in module.defines).encode()
+        )
     cache_ident = hashlib.sha256(b"\0".join(closure)).hexdigest()[:10]
     return body_path, selector, cache_ident
 
@@ -632,6 +689,7 @@ def gen_flash_kda_generated_module(variant_id: str) -> JitSpec:
             kernel_name=module.kernel,
             module_ident=module.module_ident,
             target=module.target,
+            defines=module.defines,
         ),
     )
     logger.info(

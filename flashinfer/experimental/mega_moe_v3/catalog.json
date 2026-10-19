@@ -14,7 +14,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t1_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t1_binding.cu"
    ],
-   "closure_sha256": "23c342c0a9d0be6d072d4696abf62bcba8d9d3a306ea45fecfccf042bed03c29",
+   "closure_sha256": "ffda005feaeea8b7dc5b712377392455692c8874a1d9d94d955bfd5f408ffc6f",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -266,7 +266,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a_binding.cu"
    ],
-   "closure_sha256": "f53a56a62f788670c9c2804869af7cb3fa243738c3baed5d69026501ac9cef35",
+   "closure_sha256": "2b2ded4cc16798cf1bc2baafd94cdc58c5a773bcd526efab9479e3961ba4013b",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -515,7 +515,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm103a_binding.cu"
    ],
-   "closure_sha256": "2777b057b5f86b58e3c3fd3a16fadffd67cf424695180b2742f543793958a31b",
+   "closure_sha256": "0fb3f135e52d013ddaa09b7df9116d902fe64c1098bdbeb6931e9c7bea1db165",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -764,7 +764,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a_binding.cu"
    ],
-   "closure_sha256": "11078f4541769ef5db18218f5db179de2c869a9709f0348d1dc6687f3d570759",
+   "closure_sha256": "30c1e3e892df2569658b4162d37894fbb2c476ec8c2c41c78378daca8f6fc8e7",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -1013,7 +1013,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm103a_binding.cu"
    ],
-   "closure_sha256": "77e1c7a364e1ada5934f6b31c109c06e05b51838a54d8c71d5923975cabf5592",
+   "closure_sha256": "7c236bf3c8a992e7c81627da72b000d1b793650ee76f0405f2fe67b8bd912006",
    "compile_flags": [
     "--use_fast_math",
     "--ptxas-options=--register-usage-level=10"
@@ -1264,7 +1264,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t512_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t512_binding.cu"
    ],
-   "closure_sha256": "f9bdfe1b5430f89eb8d7f15416001851d259f955e8a56878338572556c5f3e4d",
+   "closure_sha256": "4e733bdb76a757b4ee2da799a6b67ec85bdc63ce3cf9c10dec3280decede4b0d",
    "compile_flags": {
     "sm_100a": [
      "--use_fast_math"
@@ -1523,7 +1523,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp8_t16_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp8_t16_binding.cu"
    ],
-   "closure_sha256": "7327da1e4451919f2a3ddf80e9e81035083bb5ed3da426e8ebc84412a6af2d1e",
+   "closure_sha256": "6308c131ae94d55e5c582ddc402064be0f6f606feef3b90c6fddb339815d6e62",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -2167,7 +2167,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t1024_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t1024_binding.cu"
    ],
-   "closure_sha256": "8ae67025dbae730ac98bb640276bddb47367331fdec29affcf3da1e1ecaa1dec",
+   "closure_sha256": "2cc695afec524e0ae278064088101b88060c7bad6d2a6aa4a351de63cd62122d",
    "compile_flags": [
     "--use_fast_math"
    ],
@@ -2420,7 +2420,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t4096_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t4096_binding.cu"
    ],
-   "closure_sha256": "58e52ab59f7c1405cb91d8367be7e51f9ae14304fd9b25e605ed1afc3e4a72ef",
+   "closure_sha256": "01804da860e13dbb15e277b44996d434c52a4854a1576e6cac935dd9516b1a35",
    "compile_flags": [
     "--use_fast_math"
    ],

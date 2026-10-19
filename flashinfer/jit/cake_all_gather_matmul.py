@@ -21,9 +21,28 @@ architectures (``PROGRAMS`` records its launch block and dynamic shared memory;
 sequence module per (world size, dtype, weight layout, architecture)
 (``SEQUENCES``): the route's device units together with the rendered one-call
 launcher ``run`` (barrier, bridge event, copy-engine pushes with their
-readiness epochs, main kernel with cached tensor maps) and, on the routes with
-a shape of at most ``SM_PUSH_MAX_ROWS`` padded rows, ``run_push``. The main kernels are tcgen05 code, so a
-sequence is compiled for its exact architecture (``sm_100a`` or ``sm_103a``).
+readiness epochs, main kernel with cached tensor maps) and ``run_push`` for
+the calls ``uses_sm_push`` routes through the SM push kernel (the base rule
+plus the architecture's ``SM_PUSH_BANDS_BY_ARCH`` bands). The main kernels are
+tcgen05 code, so a sequence is compiled for its exact architecture
+(``sm_100a`` or ``sm_103a``).
+A route whose (world size, dtype, weight layout) class is listed in
+``N128_CLASSES`` for the device's architecture also compiles the 128-wide main
+twin (``main_n128``) into its sequence module; ``main_block_n`` selects that
+twin per call from the frozen wave rule (``SM_COUNT_BY_ARCH`` and the
+per-architecture wave cap ``N128_MAX_WAVES_BY_ARCH``) and the table, and the
+launcher receives the chosen ``block_n``. ``N`` stays a positive multiple of
+``BLOCK_N`` (256) either way.
+A route whose class is listed in ``CG2_CLASSES`` for the device's architecture
+also compiles the CTA-pair twin of the N256 main (``main_cg2``:
+``tcgen05.mma.cta_group::2`` over a cluster of two CTAs, each loading its own
+128 A rows and 128 B columns per stage); ``main_form`` selects it per N256 call
+from the frozen region table (``CG2_REGIONS``: per class one or more measured
+rectangles of padded rows x N, pairwise disjoint, per architecture) and the
+delivered-class table, ``main_grid`` sizes its even grid of
+CTA pairs, and the launcher receives the chosen form as the positional
+``main_cg2`` flag and launches the twin with the cluster-dimension attribute
+``CG2_CLUSTER_DIMS``.
 The tables are filled by the exporter from the program bundle; the loader never
 hashes sources or interprets argument plans.
 """
@@ -41,6 +60,30 @@ from .core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
 # Filled mechanically from the program bundle.
 PROGRAMS: dict[str, dict[str, Any]] = {
+    "cake_all_gather_matmul_06c1f7cb4aa36c5918bd": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_06c1f7cb4aa36c5918bd_kernel.cu",
+        ],
+        "arches": ["sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_17f60837feb11a634b34": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_17f60837feb11a634b34_kernel.cu",
+        ],
+        "arches": ["sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_18bb325baf7347c5f496": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_18bb325baf7347c5f496_kernel.cu",
+        ],
+        "arches": ["sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
     "cake_all_gather_matmul_21d7e2b21b372ffeab36": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_21d7e2b21b372ffeab36_kernel.cu",
@@ -57,6 +100,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "block": [128, 1, 1],
         "dynamic_smem_bytes": 0,
     },
+    "cake_all_gather_matmul_52f3fc23159650a89719": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_52f3fc23159650a89719_kernel.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
     "cake_all_gather_matmul_5d04e5464f88d3d5ab8c": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_5d04e5464f88d3d5ab8c_kernel.cu",
@@ -70,6 +121,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_61c61aabb5967bd8e9d9_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_6e81f55424d75f150b3b": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_6e81f55424d75f150b3b_kernel.cu",
+        ],
+        "arches": ["sm_100a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
@@ -94,6 +153,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a55baa3bdb6ce5b39f7e_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_b4f547b76a4b6c14c87b": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_b4f547b76a4b6c14c87b_kernel.cu",
+        ],
+        "arches": ["sm_100a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
@@ -129,9 +196,25 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
+    "cake_all_gather_matmul_c37bb42697799791a7c5": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c37bb42697799791a7c5_kernel.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
     "cake_all_gather_matmul_dba24f495a33b1a179e7": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_dba24f495a33b1a179e7_kernel.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_ef0a40fd8365adef0679": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ef0a40fd8365adef0679_kernel.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
@@ -153,6 +236,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
+    "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [128, 1, 1],
+        "dynamic_smem_bytes": 0,
+    },
     "cake_all_gather_matmul_f85e6d8165a64ac49252": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f85e6d8165a64ac49252_kernel.cu",
@@ -167,17 +258,26 @@ ROUTES: dict[str, str] = {
     "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
     "main_bfloat16_ws2_k_major": "cake_all_gather_matmul_bb046ade8e857469f0c6",
     "main_bfloat16_ws2_n_major": "cake_all_gather_matmul_c27adeb3c14305afd206",
+    "main_bfloat16_ws2_n_major_cg2": "cake_all_gather_matmul_06c1f7cb4aa36c5918bd",
     "main_bfloat16_ws4_k_major": "cake_all_gather_matmul_a01c4436c21e679aaed9",
+    "main_bfloat16_ws4_k_major_cg2": "cake_all_gather_matmul_18bb325baf7347c5f496",
+    "main_bfloat16_ws4_k_major_n128": "cake_all_gather_matmul_52f3fc23159650a89719",
     "main_bfloat16_ws4_n_major": "cake_all_gather_matmul_dba24f495a33b1a179e7",
     "main_bfloat16_ws8_k_major": "cake_all_gather_matmul_a55baa3bdb6ce5b39f7e",
+    "main_bfloat16_ws8_k_major_cg2": "cake_all_gather_matmul_17f60837feb11a634b34",
+    "main_bfloat16_ws8_k_major_n128": "cake_all_gather_matmul_c37bb42697799791a7c5",
     "main_bfloat16_ws8_n_major": "cake_all_gather_matmul_f2e488e6c8974711b331",
+    "main_bfloat16_ws8_n_major_n128": "cake_all_gather_matmul_ef0a40fd8365adef0679",
     "main_float16_ws2_k_major": "cake_all_gather_matmul_c0a6678e73a6e854bfac",
     "main_float16_ws2_n_major": "cake_all_gather_matmul_61c61aabb5967bd8e9d9",
     "main_float16_ws4_k_major": "cake_all_gather_matmul_21d7e2b21b372ffeab36",
+    "main_float16_ws4_k_major_n128": "cake_all_gather_matmul_b4f547b76a4b6c14c87b",
     "main_float16_ws4_n_major": "cake_all_gather_matmul_f0cbdce7150397ae0989",
     "main_float16_ws8_k_major": "cake_all_gather_matmul_f85e6d8165a64ac49252",
+    "main_float16_ws8_k_major_n128": "cake_all_gather_matmul_6e81f55424d75f150b3b",
     "main_float16_ws8_n_major": "cake_all_gather_matmul_5d04e5464f88d3d5ab8c",
     "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+    "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
 }
 SEQUENCES: dict[str, dict[str, Any]] = {
     "bfloat16_ws2_k_major_sm_100a": {
@@ -185,6 +285,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bb046ade8e857469f0c6_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_k_major_sm_100a.cu",
         ],
@@ -192,12 +293,20 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "world_size": 2,
         "dtype": "bfloat16",
         "b_layout": "k_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_bb046ade8e857469f0c6",
+        },
     },
     "bfloat16_ws2_k_major_sm_103a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bb046ade8e857469f0c6_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_k_major_sm_103a.cu",
         ],
@@ -205,12 +314,20 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "world_size": 2,
         "dtype": "bfloat16",
         "b_layout": "k_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_bb046ade8e857469f0c6",
+        },
     },
     "bfloat16_ws2_n_major_sm_100a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c27adeb3c14305afd206_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_n_major_sm_100a.cu",
         ],
@@ -218,51 +335,91 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "world_size": 2,
         "dtype": "bfloat16",
         "b_layout": "n_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_c27adeb3c14305afd206",
+        },
     },
     "bfloat16_ws2_n_major_sm_103a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c27adeb3c14305afd206_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_06c1f7cb4aa36c5918bd_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws2_n_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
         "world_size": 2,
         "dtype": "bfloat16",
         "b_layout": "n_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_c27adeb3c14305afd206",
+            "main_cg2": "cake_all_gather_matmul_06c1f7cb4aa36c5918bd",
+        },
     },
     "bfloat16_ws4_k_major_sm_100a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a01c4436c21e679aaed9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_52f3fc23159650a89719_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
         "world_size": 4,
         "dtype": "bfloat16",
         "b_layout": "k_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_a01c4436c21e679aaed9",
+            "main_n128": "cake_all_gather_matmul_52f3fc23159650a89719",
+        },
     },
     "bfloat16_ws4_k_major_sm_103a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a01c4436c21e679aaed9_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_52f3fc23159650a89719_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_18bb325baf7347c5f496_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_k_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
         "world_size": 4,
         "dtype": "bfloat16",
         "b_layout": "k_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_a01c4436c21e679aaed9",
+            "main_n128": "cake_all_gather_matmul_52f3fc23159650a89719",
+            "main_cg2": "cake_all_gather_matmul_18bb325baf7347c5f496",
+        },
     },
     "bfloat16_ws4_n_major_sm_100a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_dba24f495a33b1a179e7_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_n_major_sm_100a.cu",
         ],
@@ -270,12 +427,20 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "world_size": 4,
         "dtype": "bfloat16",
         "b_layout": "n_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_dba24f495a33b1a179e7",
+        },
     },
     "bfloat16_ws4_n_major_sm_103a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_dba24f495a33b1a179e7_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_n_major_sm_103a.cu",
         ],
@@ -283,64 +448,114 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "world_size": 4,
         "dtype": "bfloat16",
         "b_layout": "n_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_dba24f495a33b1a179e7",
+        },
     },
     "bfloat16_ws8_k_major_sm_100a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a55baa3bdb6ce5b39f7e_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c37bb42697799791a7c5_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws8_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
         "world_size": 8,
         "dtype": "bfloat16",
         "b_layout": "k_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_a55baa3bdb6ce5b39f7e",
+            "main_n128": "cake_all_gather_matmul_c37bb42697799791a7c5",
+        },
     },
     "bfloat16_ws8_k_major_sm_103a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a55baa3bdb6ce5b39f7e_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c37bb42697799791a7c5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_17f60837feb11a634b34_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws8_k_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
         "world_size": 8,
         "dtype": "bfloat16",
         "b_layout": "k_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_a55baa3bdb6ce5b39f7e",
+            "main_n128": "cake_all_gather_matmul_c37bb42697799791a7c5",
+            "main_cg2": "cake_all_gather_matmul_17f60837feb11a634b34",
+        },
     },
     "bfloat16_ws8_n_major_sm_100a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f2e488e6c8974711b331_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ef0a40fd8365adef0679_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws8_n_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
         "world_size": 8,
         "dtype": "bfloat16",
         "b_layout": "n_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_f2e488e6c8974711b331",
+            "main_n128": "cake_all_gather_matmul_ef0a40fd8365adef0679",
+        },
     },
     "bfloat16_ws8_n_major_sm_103a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f2e488e6c8974711b331_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ef0a40fd8365adef0679_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws8_n_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
         "world_size": 8,
         "dtype": "bfloat16",
         "b_layout": "n_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_f2e488e6c8974711b331",
+            "main_n128": "cake_all_gather_matmul_ef0a40fd8365adef0679",
+        },
     },
     "float16_ws2_k_major_sm_100a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c0a6678e73a6e854bfac_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_k_major_sm_100a.cu",
         ],
@@ -348,12 +563,20 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "world_size": 2,
         "dtype": "float16",
         "b_layout": "k_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_c0a6678e73a6e854bfac",
+        },
     },
     "float16_ws2_k_major_sm_103a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_c0a6678e73a6e854bfac_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_k_major_sm_103a.cu",
         ],
@@ -361,12 +584,20 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "world_size": 2,
         "dtype": "float16",
         "b_layout": "k_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_c0a6678e73a6e854bfac",
+        },
     },
     "float16_ws2_n_major_sm_100a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_61c61aabb5967bd8e9d9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_n_major_sm_100a.cu",
         ],
@@ -374,12 +605,20 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "world_size": 2,
         "dtype": "float16",
         "b_layout": "n_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_61c61aabb5967bd8e9d9",
+        },
     },
     "float16_ws2_n_major_sm_103a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_61c61aabb5967bd8e9d9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws2_n_major_sm_103a.cu",
         ],
@@ -387,25 +626,43 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "world_size": 2,
         "dtype": "float16",
         "b_layout": "n_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_61c61aabb5967bd8e9d9",
+        },
     },
     "float16_ws4_k_major_sm_100a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_21d7e2b21b372ffeab36_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_b4f547b76a4b6c14c87b_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
         "world_size": 4,
         "dtype": "float16",
         "b_layout": "k_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_21d7e2b21b372ffeab36",
+            "main_n128": "cake_all_gather_matmul_b4f547b76a4b6c14c87b",
+        },
     },
     "float16_ws4_k_major_sm_103a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_21d7e2b21b372ffeab36_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_k_major_sm_103a.cu",
         ],
@@ -413,12 +670,20 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "world_size": 4,
         "dtype": "float16",
         "b_layout": "k_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_21d7e2b21b372ffeab36",
+        },
     },
     "float16_ws4_n_major_sm_100a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f0cbdce7150397ae0989_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_n_major_sm_100a.cu",
         ],
@@ -426,12 +691,20 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "world_size": 4,
         "dtype": "float16",
         "b_layout": "n_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_f0cbdce7150397ae0989",
+        },
     },
     "float16_ws4_n_major_sm_103a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f0cbdce7150397ae0989_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws4_n_major_sm_103a.cu",
         ],
@@ -439,25 +712,43 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "world_size": 4,
         "dtype": "float16",
         "b_layout": "n_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_f0cbdce7150397ae0989",
+        },
     },
     "float16_ws8_k_major_sm_100a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f85e6d8165a64ac49252_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_6e81f55424d75f150b3b_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws8_k_major_sm_100a.cu",
         ],
         "arches": ["sm_100a"],
         "world_size": 8,
         "dtype": "float16",
         "b_layout": "k_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_f85e6d8165a64ac49252",
+            "main_n128": "cake_all_gather_matmul_6e81f55424d75f150b3b",
+        },
     },
     "float16_ws8_k_major_sm_103a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f85e6d8165a64ac49252_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws8_k_major_sm_103a.cu",
         ],
@@ -465,12 +756,20 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "world_size": 8,
         "dtype": "float16",
         "b_layout": "k_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_f85e6d8165a64ac49252",
+        },
     },
     "float16_ws8_n_major_sm_100a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_5d04e5464f88d3d5ab8c_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws8_n_major_sm_100a.cu",
         ],
@@ -478,12 +777,20 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "world_size": 8,
         "dtype": "float16",
         "b_layout": "n_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_5d04e5464f88d3d5ab8c",
+        },
     },
     "float16_ws8_n_major_sm_103a": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_8dea171063652cd775f8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_40242e9c64d6e66af6f5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_5d04e5464f88d3d5ab8c_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_float16_ws8_n_major_sm_103a.cu",
         ],
@@ -491,9 +798,71 @@ SEQUENCES: dict[str, dict[str, Any]] = {
         "world_size": 8,
         "dtype": "float16",
         "b_layout": "n_major",
+        "programs": {
+            "barrier_p0": "cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9",
+            "barrier_p1": "cake_all_gather_matmul_8dea171063652cd775f8",
+            "peer_push": "cake_all_gather_matmul_40242e9c64d6e66af6f5",
+            "peer_push_wide": "cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3",
+            "main": "cake_all_gather_matmul_5d04e5464f88d3d5ab8c",
+        },
     },
 }
 COMPILE_FLAGS: list[str] = ["--use_fast_math"]
+# Classes ``[world_size, dtype, b_layout]`` with a delivered ``_n128`` main, per
+# architecture; ``main_block_n`` selects the 128-wide twin only inside this table.
+N128_CLASSES: dict[str, list[list[Any]]] = {
+    "sm_100a": [
+        [4, "bfloat16", "k_major"],
+        [4, "float16", "k_major"],
+        [8, "bfloat16", "k_major"],
+        [8, "bfloat16", "n_major"],
+        [8, "float16", "k_major"],
+    ],
+    "sm_103a": [
+        [4, "bfloat16", "k_major"],
+        [8, "bfloat16", "k_major"],
+        [8, "bfloat16", "n_major"],
+    ],
+}
+# Frozen inputs of the N128 selection rule, copied from the kernel module (the
+# live SM count only clamps the persistent grid; the N256 wave cap is per
+# architecture).
+SM_COUNT_BY_ARCH: dict[str, int] = {"sm_100a": 148, "sm_103a": 148}
+N128_MAX_WAVES_BY_ARCH: dict[str, int] = {"sm_100a": 2, "sm_103a": 1}
+# Per-architecture SM push bands ``[world_size, padded_rows, max_cols]`` beyond
+# the base rule of ``uses_sm_push`` (copied from the kernel module; an arch
+# outside the table is an error, never the base rule alone).
+SM_PUSH_BANDS_BY_ARCH: dict[str, list[list[int]]] = {
+    "sm_100a": [],
+    "sm_103a": [[8, 1024, 1619]],
+}
+# Classes ``[world_size, dtype, b_layout]`` with a delivered ``_cg2`` main (the
+# CTA-pair twin of the N256 main), per architecture; ``main_form`` selects the
+# twin only inside this table.
+CG2_CLASSES: dict[str, list[list[Any]]] = {
+    "sm_100a": [],
+    "sm_103a": [
+        [2, "bfloat16", "n_major"],
+        [4, "bfloat16", "k_major"],
+        [8, "bfloat16", "k_major"],
+    ],
+}
+# Frozen input of the pair selection rule, copied from the kernel module: the
+# measured rectangles of the twin per architecture, ``[world_size, dtype,
+# b_layout, min_padded_rows, max_padded_rows, min_cols, max_cols]`` entries (a
+# class may list several, pairwise disjoint; an architecture without one lists
+# nothing); an N256 call runs the twin iff some rectangle of its class satisfies
+# ``min_padded_rows <= ceil128(rows) <= max_padded_rows`` and
+# ``min_cols <= N <= max_cols``.
+CG2_REGIONS: dict[str, list[list[Any]]] = {
+    "sm_100a": [],
+    "sm_103a": [
+        [2, "bfloat16", "n_major", 2048, 5760, 1, 2048],
+        [4, "bfloat16", "k_major", 1024, 1536, 1, 6058],
+        [4, "bfloat16", "k_major", 512, 512, 14336, 14336],
+        [8, "bfloat16", "k_major", 512, 512, 7168, 7168],
+    ],
+}
 
 SOURCE_PACKAGE = "cake_all_gather_matmul"
 # The kernels are tcgen05 / TMEM code; one source serves both capabilities,
@@ -511,18 +880,42 @@ SUPPORTED_DTYPES: dict[torch.dtype, str] = {
 K = 8192
 BLOCK_M = 128
 BLOCK_N = 256
-# Rows pushed per peer chunk; the main kernel consumes chunk ``c`` of a peer
-# after the matching readiness word reaches the launch epoch.
-CHUNK_ROWS = 19 * BLOCK_M
+# Tile widths of the delivered main programs: the public N256 program and the
+# ``_n128`` twin ``main_block_n`` selects per call.
+MAIN_BLOCK_NS: tuple[int, ...] = (256, 128)
+# Forms of the delivered N256 main: the one-CTA program (``cg1``) and its
+# CTA-pair twin (``cg2``, ``tcgen05.mma.cta_group::2``) ``main_form`` selects per
+# call; the twin launches clusters of ``CG2_CLUSTER_DIMS`` CTAs (the pair).
+MAIN_FORMS: tuple[str, ...] = ("cg1", "cg2")
+CG2_CLUSTER_DIMS: tuple[int, int, int] = (2, 1, 1)
+# Rows pushed per peer chunk (19 * BLOCK_M); the main kernel consumes chunk
+# ``c`` of a peer after the matching readiness word reaches the launch epoch.
+# A literal: the export's route contract runs the loader's literals and pure
+# functions in a scratch namespace, and ``chunk_plan`` (the pair tiles) reads it.
+CHUNK_ROWS = 2432
 # Physical layouts of the logical ``[K, N]`` weight, each with its own main
 # kernel: ``n_major`` = contiguous ``[K, N]``; ``k_major`` = the ``w.t()`` view
 # of a contiguous ``[N, K]`` parameter.
 B_LAYOUTS: tuple[str, ...] = ("n_major", "k_major")
 MAIN_THREADS = 192
-# SM push kernel: CTAs per remote peer along grid x, one peer per grid y; padded
-# local rows up to which it replaces the copy-engine pushes (every world size,
-# dtype and architecture). Both mirror the Cake export adapter.
+# SM push launch: the per-peer payload of a call, ``padded_rows x K x
+# dtype_bytes``, selects it (``push_launch``). Below
+# ``PUSH_PAYLOAD_THRESHOLD_BYTES``: ``PUSH_CTAS_PER_PEER`` CTAs per remote peer
+# along grid x (one peer per grid y) of the ``peer_push`` program
+# (``PUSH_UNROLL`` 16-byte vectors in flight per lane); at or above it:
+# ``PUSH_WIDE_CTAS_PER_PEER`` CTAs of the ``peer_push_wide`` program
+# (``PUSH_WIDE_UNROLL``). ``PUSH_CARVEOUT`` is both push functions' preferred
+# shared-memory carveout (-1 = driver default). ``SM_PUSH_MAX_ROWS``: padded
+# local rows up to which the base rule routes a ws4/ws8 call through the SM
+# push (``SM_PUSH_BANDS_BY_ARCH`` adds per-architecture bands beyond it). All
+# mirror the Cake export adapter; the host sequence compiles the launch
+# constants and its bands in and chooses per call itself.
 PUSH_CTAS_PER_PEER = 32
+PUSH_UNROLL = 1
+PUSH_WIDE_CTAS_PER_PEER = 8
+PUSH_WIDE_UNROLL = 8
+PUSH_PAYLOAD_THRESHOLD_BYTES = 4194304
+PUSH_CARVEOUT = -1
 SM_PUSH_MAX_ROWS = 512
 # Width ceiling of the SM push route: N <= SM_PUSH_COLS_INTERCEPT - SM_PUSH_COLS_PER_ROW * padded_rows
 # (10240 at 128 padded rows, 4096 at 512); wider GEMMs overlap the copy-engine pushes instead.
@@ -573,21 +966,199 @@ def chunk_plan(rows: int) -> tuple[int, int, int]:
     return padded, chunk_rows, (padded + chunk_rows - 1) // chunk_rows
 
 
+def _check_block_n(block_n: int) -> int:
+    if type(block_n) is not int or block_n not in MAIN_BLOCK_NS:
+        raise ValueError(f"block_n must be one of {MAIN_BLOCK_NS}, got {block_n!r}")
+    return block_n
+
+
+def _check_form(form: str) -> str:
+    if type(form) is not str or form not in MAIN_FORMS:
+        raise ValueError(f"form must be one of {MAIN_FORMS}, got {form!r}")
+    return form
+
+
+def main_tiles(rows: int, n: int, *, world_size: int, block_n: int) -> int:
+    """Output tiles of one call: ``world_size * ceil128(rows) / 128 * n / block_n``."""
+
+    _check_block_n(block_n)
+    n = int(n)
+    if n <= 0 or n % block_n:
+        raise ValueError(f"N must be a positive multiple of {block_n}, got {n}")
+    return int(world_size) * (padded_rows(rows) // BLOCK_M) * (n // block_n)
+
+
+def _n128_classes(arch: str) -> frozenset[tuple[int, str, str]]:
+    """``(world_size, dtype, b_layout)`` classes with a delivered ``_n128`` main on
+    ``arch`` (the emitted table holds them as three-element lists)."""
+
+    if arch not in N128_CLASSES:
+        raise ValueError(
+            f"N128_CLASSES has no entry for arch {arch!r} "
+            f"(known: {sorted(N128_CLASSES)})"
+        )
+    return frozenset(
+        (int(world_size), str(dtype_name), str(b_layout))
+        for world_size, dtype_name, b_layout in N128_CLASSES[arch]
+    )
+
+
+def _cg2_classes(arch: str) -> frozenset[tuple[int, str, str]]:
+    """``(world_size, dtype, b_layout)`` classes with a delivered ``_cg2`` main on
+    ``arch`` (the emitted table holds them as three-element lists)."""
+
+    if arch not in CG2_CLASSES:
+        raise ValueError(
+            f"CG2_CLASSES has no entry for arch {arch!r} (known: {sorted(CG2_CLASSES)})"
+        )
+    return frozenset(
+        (int(world_size), str(dtype_name), str(b_layout))
+        for world_size, dtype_name, b_layout in CG2_CLASSES[arch]
+    )
+
+
+def _cg2_regions(
+    arch: str, world_size: int, dtype_name: str, b_layout: str
+) -> list[tuple[int, int, int, int]]:
+    """``(min_padded_rows, max_padded_rows, min_cols, max_cols)`` of every measured
+    rectangle of the pair twin for one class on ``arch`` (the emitted
+    ``CG2_REGIONS`` table, in table order); empty when the class has none there.
+    Several rectangles per class are legal; an unknown arch raises."""
+
+    if arch not in CG2_REGIONS:
+        raise ValueError(
+            f"CG2_REGIONS has no entry for arch {arch!r} (known: {sorted(CG2_REGIONS)})"
+        )
+    key = (int(world_size), str(dtype_name), str(b_layout))
+    return [
+        (int(entry[3]), int(entry[4]), int(entry[5]), int(entry[6]))
+        for entry in CG2_REGIONS[arch]
+        if (int(entry[0]), str(entry[1]), str(entry[2])) == key
+    ]
+
+
+def main_block_n(
+    rows: int,
+    n: int,
+    *,
+    world_size: int,
+    arch: str,
+    dtype_name: str,
+    b_layout: str,
+) -> int:
+    """Tile width (256 or 128) of the main program for one call.
+
+    ws2 always runs the N256 program (``arch`` is validated for every world
+    size; an unknown arch raises, never defaults). At ws4/ws8 the N128 twin
+    is selected when halving the tile width fills the SMs with fewer idle slots
+    (``ceil(T256 / S) > ceil(2 * T256 / S) / 2`` for ``T256`` N256 tiles and
+    ``S = SM_COUNT_BY_ARCH[arch]``), the call spans at most
+    ``N128_MAX_WAVES_BY_ARCH[arch]`` N256 waves, and the ``(world_size,
+    dtype_name, b_layout)`` class has a delivered ``_n128`` program on ``arch``
+    (``N128_CLASSES``). The rule mirrors the kernel module's ``main_block_n``;
+    the table restricts it to delivered programs."""
+
+    if arch not in SM_COUNT_BY_ARCH or arch not in N128_MAX_WAVES_BY_ARCH:
+        raise ValueError(
+            f"main_block_n has no SM count or N128 wave cap for arch {arch!r} "
+            f"(known: {sorted(set(SM_COUNT_BY_ARCH) & set(N128_MAX_WAVES_BY_ARCH))})"
+        )
+    world_size = int(world_size)
+    if world_size not in (4, 8):
+        return 256
+    sm_count = SM_COUNT_BY_ARCH[arch]
+    max_waves = N128_MAX_WAVES_BY_ARCH[arch]
+    t256 = main_tiles(rows, n, world_size=world_size, block_n=256)
+    w256 = -(-t256 // sm_count)
+    w128 = -(-(2 * t256) // sm_count)
+    qualify = 2 * w256 > w128
+    cap = w256 <= max_waves
+    delivered = (world_size, str(dtype_name), str(b_layout)) in _n128_classes(arch)
+    return 128 if (qualify and cap and max_waves > 0 and delivered) else 256
+
+
+def main_form(
+    rows: int,
+    n: int,
+    *,
+    world_size: int,
+    arch: str,
+    dtype_name: str,
+    b_layout: str,
+    block_n: int,
+) -> str:
+    """Form (``"cg1"`` or ``"cg2"``) of the main program for one call.
+
+    The CTA-pair twin (``cg2``) is selected for an N256 call whose
+    ``(world_size, dtype_name, b_layout)`` class has a measured rectangle on
+    ``arch`` (``CG2_REGIONS``) and a delivered ``_cg2`` program there
+    (``CG2_CLASSES``), when some rectangle of the class satisfies
+    ``min_padded_rows <= ceil128(rows) <= max_padded_rows`` and
+    ``min_cols <= n <= max_cols``. A 128-wide call, a class without a rectangle
+    and a call outside every rectangle of its class run the one-CTA program.
+    The rule mirrors the kernel module's ``main_form`` with its frozen region
+    table; an unknown arch raises, never defaults."""
+
+    if arch not in CG2_REGIONS:
+        raise ValueError(
+            f"main_form has no pair-form regions for arch {arch!r} "
+            f"(known: {sorted(CG2_REGIONS)})"
+        )
+    if _check_block_n(block_n) != 256:
+        return "cg1"
+    main_tiles(rows, n, world_size=world_size, block_n=256)
+    delivered = (int(world_size), str(dtype_name), str(b_layout)) in _cg2_classes(arch)
+    padded = padded_rows(rows)
+    cols = int(n)
+    rectangles = _cg2_regions(arch, world_size, dtype_name, b_layout)
+    qualify = any(
+        min_rows <= padded <= max_rows and min_cols <= cols <= max_cols
+        for min_rows, max_rows, min_cols, max_cols in rectangles
+    )
+    return "cg2" if (qualify and delivered) else "cg1"
+
+
+def main_pair_tiles(rows: int, n: int, *, world_size: int) -> int:
+    """Pair tiles of one call of the CTA-pair main: per peer and N tile, the
+    chunks' ``ceil(M tiles / 2)`` pairs summed over the readiness chunks (the
+    odd-rank CTA of the last pair of an odd chunk idles)."""
+
+    main_tiles(rows, n, world_size=world_size, block_n=256)
+    padded, chunk_rows, num_chunks = chunk_plan(rows)
+    first_tiles_m = chunk_rows // BLOCK_M
+    last_tiles_m = (padded - (num_chunks - 1) * chunk_rows) // BLOCK_M
+    pairs_per_peer = (num_chunks - 1) * ((first_tiles_m + 1) // 2) + (
+        last_tiles_m + 1
+    ) // 2
+    return int(world_size) * pairs_per_peer * (int(n) // 256)
+
+
 def main_grid(
     rows: int,
     n: int,
     *,
     world_size: int,
     sm_count: int,
+    block_n: int = 256,
+    form: str = "cg1",
 ) -> tuple[int, int, int]:
     """Launch grid of the persistent main kernel: one CTA per SM, bounded by the
-    total output tile count (``world_size * ceil128(rows) / 128 * N / 256``), each
-    CTA striding over the arrival-ordered tile list."""
+    total output tile count (``world_size * ceil128(rows) / 128 * N / block_n``),
+    each CTA striding over the arrival-ordered tile list. The CTA-pair twin
+    (``form="cg2"``) launches an even grid of ``2 * min(pair_tiles, SMs / 2)``
+    CTAs, each cluster striding over the pair-tile list."""
 
     if int(world_size) <= 0 or int(sm_count) <= 0:
         message = "the persistent main grid needs a positive world_size and sm_count"
         raise ValueError(message)
-    total_tiles = int(world_size) * (padded_rows(rows) // BLOCK_M) * (int(n) // BLOCK_N)
+    if _check_form(form) == "cg2":
+        if _check_block_n(block_n) != 256:
+            raise ValueError(
+                f"the CTA-pair main exists at block_n=256 only, got {block_n}"
+            )
+        pair_tiles = main_pair_tiles(rows, n, world_size=world_size)
+        return (2 * max(1, min(pair_tiles, int(sm_count) // 2)), 1, 1)
+    total_tiles = main_tiles(rows, n, world_size=world_size, block_n=block_n)
     return (max(1, min(total_tiles, int(sm_count))), 1, 1)
 
 
@@ -597,16 +1168,76 @@ def sm_push_max_cols(padded_rows: int) -> int:
     return SM_PUSH_COLS_INTERCEPT - SM_PUSH_COLS_PER_ROW * int(padded_rows)
 
 
-def uses_sm_push(*, rows: int, world_size: int, cols: int) -> bool:
+def sm_push_bands(arch: str) -> tuple[tuple[int, int, int], ...]:
+    """``SM_PUSH_BANDS_BY_ARCH[arch]`` as ``(world_size, padded_rows, max_cols)`` triples; an arch
+    outside the table is an error, never an empty default."""
+
+    if arch not in SM_PUSH_BANDS_BY_ARCH:
+        raise ValueError(
+            f"SM_PUSH_BANDS_BY_ARCH has no SM push bands for arch {arch!r} (known: {sorted(SM_PUSH_BANDS_BY_ARCH)})"
+        )
+    return tuple(
+        (int(band[0]), int(band[1]), int(band[2]))
+        for band in SM_PUSH_BANDS_BY_ARCH[arch]
+    )
+
+
+def uses_sm_push(*, rows: int, world_size: int, cols: int, arch: str) -> bool:
     """Padded local rows up to ``SM_PUSH_MAX_ROWS`` with ``N`` up to ``sm_push_max_cols`` push
     through the SM kernel instead of the copy engines at world sizes 4 and 8 (a single peer
     saturates neither route; a wider GEMM overlaps the copy-engine pushes but would wait behind
-    the SM push; the copy engine wins in both cases)."""
+    the SM push; the copy engine wins in both cases), and so does a call in a band of
+    ``SM_PUSH_BANDS_BY_ARCH[arch]`` (its world size, exactly its padded rows, ``N <= max_cols``).
+    The rule mirrors the kernel module's ``uses_sm_push``; ``arch`` is validated on every call."""
 
+    bands = sm_push_bands(arch)
+    world_size = int(world_size)
     padded = padded_rows(rows)
-    if int(world_size) < 4 or padded > SM_PUSH_MAX_ROWS:
-        return False
-    return int(cols) <= sm_push_max_cols(padded)
+    cols = int(cols)
+    if (
+        world_size >= 4
+        and padded <= SM_PUSH_MAX_ROWS
+        and cols <= sm_push_max_cols(padded)
+    ):
+        return True
+    return any(
+        world_size == band_world_size and padded == band_rows and cols <= band_max_cols
+        for band_world_size, band_rows, band_max_cols in bands
+    )
+
+
+def sm_push_reachable(*, world_size: int, cols: int, arch: str) -> bool:
+    """Whether some row count of a ``(world_size, N)`` group takes the SM push route on ``arch``:
+    the base rule at its widest ceiling (128 padded rows) or a band of the architecture. The
+    backend resolves a group's SM push tables at prepare time by this predicate, so a captured
+    call allocates nothing."""
+
+    if uses_sm_push(rows=BLOCK_M, world_size=world_size, cols=cols, arch=arch):
+        return True
+    return any(
+        int(world_size) == band_world_size and int(cols) <= band_max_cols
+        for band_world_size, _band_rows, band_max_cols in sm_push_bands(arch)
+    )
+
+
+def push_payload_bytes(padded_rows: int, dtype_bytes: int) -> int:
+    """Per-peer payload of one call: the padded local shard, ``padded_rows x K x dtype_bytes``."""
+
+    return int(padded_rows) * K * int(dtype_bytes)
+
+
+def push_launch(padded_rows: int, dtype_bytes: int) -> tuple[str, int, int]:
+    """``(route key, CTAs per peer, vectors in flight)`` of the SM push launch a call takes.
+
+    The mirror of the rule compiled into ``run_push`` (which makes the choice
+    itself): the ``peer_push`` program with the 32-CTA grid below
+    ``PUSH_PAYLOAD_THRESHOLD_BYTES`` per peer, the ``peer_push_wide`` program
+    with the wide grid at or above it.
+    """
+
+    if push_payload_bytes(padded_rows, dtype_bytes) >= PUSH_PAYLOAD_THRESHOLD_BYTES:
+        return "peer_push_wide", PUSH_WIDE_CTAS_PER_PEER, PUSH_WIDE_UNROLL
+    return "peer_push", PUSH_CTAS_PER_PEER, PUSH_UNROLL
 
 
 def weight_layout(w: torch.Tensor) -> str:
@@ -641,12 +1272,46 @@ def barrier_program(phase: int) -> str:
     return ROUTES[f"barrier_p{int(phase)}"]
 
 
-def main_program(world_size: int, dtype_name: str, b_layout: str) -> str:
-    return ROUTES[f"main_{dtype_name}_ws{int(world_size)}_{b_layout}"]
+def _main_route_key(
+    world_size: int, dtype_name: str, b_layout: str, block_n: int, form: str = "cg1"
+) -> str:
+    """``ROUTES`` key of one main program (``_n128`` suffix for the 128-wide twin,
+    ``_cg2`` for the CTA-pair twin of the N256 main)."""
+
+    width = "" if _check_block_n(block_n) == 256 else f"_n{block_n}"
+    if _check_form(form) == "cg2" and block_n != 256:
+        raise ValueError(f"the CTA-pair main exists at block_n=256 only, got {block_n}")
+    pair = "" if form == "cg1" else f"_{form}"
+    return f"main_{dtype_name}_ws{int(world_size)}_{b_layout}{width}{pair}"
+
+
+def main_program(
+    world_size: int,
+    dtype_name: str,
+    b_layout: str,
+    block_n: int = 256,
+    form: str = "cg1",
+) -> str:
+    """The main program of one route at tile width ``block_n`` (256, or the delivered
+    ``_n128`` twin) and form (``cg1``, or the delivered ``_cg2`` CTA-pair twin);
+    a class without that program raises ``ValueError``."""
+
+    key = _main_route_key(world_size, dtype_name, b_layout, block_n, form)
+    if key not in ROUTES:
+        raise ValueError(
+            f"no all-gather matmul main program is delivered for {key!r} "
+            f"(world_size={int(world_size)}, dtype={dtype_name}, "
+            f"b_layout={b_layout}, block_n={block_n}, form={form})"
+        )
+    return ROUTES[key]
 
 
 def peer_push_program() -> str:
     return ROUTES["peer_push"]
+
+
+def peer_push_wide_program() -> str:
+    return ROUTES["peer_push_wide"]
 
 
 def _source_dir() -> Path:
@@ -681,15 +1346,24 @@ def sequence_name(world_size: int, dtype_name: str, b_layout: str, arch: str) ->
 
 
 def sequence_programs(sequence: str) -> tuple[str, ...]:
-    """Programs whose device units the sequence module compiles (route order)."""
+    """Programs whose device units the sequence module compiles (route order: both
+    barrier phases, both SM push programs, the N256 main, then the ``_n128`` main
+    when the row's ``programs`` carry ``main_n128``, then the ``_cg2`` main when
+    they carry ``main_cg2``)."""
 
     row = SEQUENCES[sequence]
-    return (
+    programs = [
         ROUTES["barrier_p0"],
         ROUTES["barrier_p1"],
         ROUTES["peer_push"],
-        ROUTES[f"main_{row['dtype']}_ws{int(row['world_size'])}_{row['b_layout']}"],
-    )
+        ROUTES["peer_push_wide"],
+        main_program(row["world_size"], row["dtype"], row["b_layout"]),
+    ]
+    if "main_n128" in row["programs"]:
+        programs.append(row["programs"]["main_n128"])
+    if "main_cg2" in row["programs"]:
+        programs.append(row["programs"]["main_cg2"])
+    return tuple(programs)
 
 
 @functools.cache
@@ -734,17 +1408,31 @@ __all__ = [
     "BLOCK_M",
     "BLOCK_N",
     "CAPABILITY_ARCH",
+    "CG2_CLASSES",
+    "CG2_CLUSTER_DIMS",
+    "CG2_REGIONS",
     "CHUNK_ROWS",
     "COMPILE_FLAGS",
+    "PUSH_CARVEOUT",
     "PUSH_CTAS_PER_PEER",
+    "PUSH_PAYLOAD_THRESHOLD_BYTES",
+    "PUSH_UNROLL",
+    "PUSH_WIDE_CTAS_PER_PEER",
+    "PUSH_WIDE_UNROLL",
+    "SM_PUSH_BANDS_BY_ARCH",
     "SM_PUSH_MAX_ROWS",
     "SM_PUSH_COLS_INTERCEPT",
     "SM_PUSH_COLS_PER_ROW",
     "K",
+    "MAIN_BLOCK_NS",
+    "MAIN_FORMS",
     "MAIN_THREADS",
+    "N128_CLASSES",
+    "N128_MAX_WAVES_BY_ARCH",
     "PROGRAMS",
     "ROUTES",
     "SEQUENCES",
+    "SM_COUNT_BY_ARCH",
     "SUPPORTED_DTYPES",
     "SUPPORTED_WORLD_SIZES",
     "DeviceFacts",
@@ -755,13 +1443,22 @@ __all__ = [
     "dynamic_smem_bytes",
     "launch_block",
     "load",
+    "main_block_n",
+    "main_form",
     "main_grid",
+    "main_pair_tiles",
     "main_program",
+    "main_tiles",
     "padded_rows",
     "peer_push_program",
+    "peer_push_wide_program",
+    "push_launch",
+    "push_payload_bytes",
     "sequence_name",
     "sequence_programs",
+    "sm_push_bands",
     "sm_push_max_cols",
+    "sm_push_reachable",
     "spec",
     "uses_sm_push",
     "weight_layout",

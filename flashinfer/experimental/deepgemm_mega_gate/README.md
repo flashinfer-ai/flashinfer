@@ -25,7 +25,12 @@ The small physical-map production token counts (1, 3, 16, 128, 512) and the
 every other token count runs the runtime program.
 Physical mapping (`to_physical_map`, `logical_count`), a logical
 `unmapped_topk_idx` output and deterministic routing (the split-K-free
-template) combine freely. Other scoring functions, image bias, token masks,
+templates: up to 16 tokens run one paired-CTA 32-token block with two MMA CTAs
+per expert group; larger counts keep the MMA CTA pairing DeepGEMM selects for
+them and run that pairing's split-K-free block whatever block size DeepGEMM
+chose, the single-CTA 16-token block for single-CTA selections and the
+paired-CTA 176-token block for paired-CTA selections) combine freely. Other
+scoring functions, image bias, token masks,
 fixed and random routing are part of the kernel ABI but have no exported
 program.
 
@@ -48,5 +53,5 @@ The test covers the eleven production rows (M in 1, 3, 16, 128, 512, 1024,
 2048, 4096, 8192 with physical mapping; deterministic M=16 with a logical
 output; logical M=16 without a map) with independent expected indices and
 weights, physical duplicate mapping, changed bias values, graph replay and a
-non-default stream, plus held-out token counts (2, 7, 33, 100, 777, 3000,
-5000) on every route against an FP32 reference.
+non-default stream, plus held-out token counts (2, 7, 33, 100, 400, 777,
+3000, 5000) on every route against an FP32 reference.

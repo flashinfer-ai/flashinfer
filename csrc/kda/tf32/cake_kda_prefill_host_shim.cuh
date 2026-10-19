@@ -15,10 +15,11 @@
  */
 
 // Shared tvm-ffi host-shim helpers for the generated Cake KDA prefill bindings in
-// csrc/kda/tf32 and csrc/kda/bf16: device guard, tensor checks, caller-owned TMA
-// descriptor upload, the dynamic shared-memory opt-in and every distinct TMA
-// descriptor encoder. Bindings include this header and keep only their own
-// argument checks, descriptor wiring and launch.
+// csrc/kda/tf32 and csrc/kda/bf16: device checks, caller-owned TMA descriptor
+// upload, the dynamic shared-memory opt-in and every distinct TMA descriptor
+// encoder. The device guard and the per-tensor checks come from tvm_ffi_utils.h.
+// Bindings include this header and keep only their own argument checks,
+// descriptor wiring and launch.
 #pragma once
 
 #include <cuda.h>
@@ -28,7 +29,6 @@
 
 #include "tvm_ffi_utils.h"
 
-#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -40,61 +40,6 @@ namespace cake_kda_prefill_shim {
 
 using tvm::ffi::Optional;
 using tvm::ffi::TensorView;
-
-class ScopedCudaDevice {
- public:
-  explicit ScopedCudaDevice(int device_id) {
-    cudaError_t error = cudaGetDevice(&previous_device_);
-    TVM_FFI_CHECK(error == cudaSuccess, RuntimeError)
-        << "cudaGetDevice failed before host-shim launch: cudaError="
-        << static_cast<int>(error);
-    if (previous_device_ != device_id) {
-      error = cudaSetDevice(device_id);
-      TVM_FFI_CHECK(error == cudaSuccess, RuntimeError)
-          << "cudaSetDevice failed before host-shim launch for cuda:"
-          << device_id << ": cudaError=" << static_cast<int>(error);
-      restore_ = true;
-    }
-  }
-
-  ScopedCudaDevice(const ScopedCudaDevice&) = delete;
-  ScopedCudaDevice& operator=(const ScopedCudaDevice&) = delete;
-
-  ~ScopedCudaDevice() noexcept {
-    if (restore_) {
-      (void)cudaSetDevice(previous_device_);
-    }
-  }
-
- private:
-  int previous_device_ = -1;
-  bool restore_ = false;
-};
-
-inline int64_t CakeDeviceMultiprocessorCount(int device_id) {
-  constexpr int kMaxCachedCudaDevices = 64;
-  TVM_FFI_CHECK(device_id >= 0 && device_id < kMaxCachedCudaDevices, RuntimeError)
-      << "physical-SM-count cache does not cover cuda:" << device_id;
-  static std::atomic<int> count_by_device[kMaxCachedCudaDevices]{};
-  int cached = count_by_device[device_id].load(std::memory_order_acquire);
-  if (cached > 0) return cached;
-
-  int count = 0;
-  cudaError_t error = cudaDeviceGetAttribute(
-      &count, cudaDevAttrMultiProcessorCount, device_id);
-  TVM_FFI_CHECK(error == cudaSuccess && count > 0, RuntimeError)
-      << "querying multiProcessorCount failed for cuda:" << device_id
-      << ": cudaError=" << static_cast<int>(error) << ", count=" << count;
-  // Concurrent first launches may repeat the immutable device query, but all
-  // publication is atomic and every later hot-path lookup is one acquire load.
-  count_by_device[device_id].store(count, std::memory_order_release);
-  return count;
-}
-
-inline void CheckCudaTensor(const TensorView& t, const char* name) {
-  TVM_FFI_CHECK(t.device().device_type == kDLCUDA, ValueError)
-      << name << " must be a CUDA tensor, got device_type=" << (int)t.device().device_type;
-}
 
 inline void CheckSameCudaDevice(
     const TensorView& t,
@@ -119,46 +64,6 @@ inline void CheckCurrentCudaDevice(
       << "current CUDA device must match " << reference_name
       << ": current=cuda:" << current_device
       << ", tensor=cuda:" << reference.device().device_id;
-}
-
-inline void CheckContiguous(const TensorView& t, const char* name) {
-  TVM_FFI_CHECK(t.IsContiguous(), ValueError) << name << " must be contiguous";
-}
-
-inline void CheckDtype(const TensorView& t, const char* name, int code, int bits, int lanes) {
-  DLDataType d = t.dtype();
-  TVM_FFI_CHECK((int)d.code == code && (int)d.bits == bits && (int)d.lanes == lanes, TypeError)
-      << name << " dtype mismatch: expected DLDataType(code=" << code << ", bits=" << bits
-      << ", lanes=" << lanes << "), got (code=" << (int)d.code << ", bits=" << (int)d.bits
-      << ", lanes=" << (int)d.lanes << ")";
-}
-
-// A logical axis.outer(trailing) folds every source dim above the trailing
-// dimensions. Shape products are independent of physical strides, so verify
-// the leading dimensions form one dense row-major chain instead of inventing
-// a "folded stride". The descriptor reads its exact adjacent physical step
-// separately through stride[-(trailing + 1)].
-inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char* name) {
-  TVM_FFI_CHECK(trailing > 0 && t.ndim() >= trailing, ValueError)
-      << name << " cannot fold leading dimensions above " << trailing
-      << " trailing dims from ndim=" << t.ndim();
-  int outer_last = t.ndim() - trailing - 1;
-  if (outer_last <= 0) {
-    return;
-  }
-  int64_t step = t.stride(outer_last);
-  TVM_FFI_CHECK(step > 0, ValueError)
-      << name << " physical strides must be positive";
-  int64_t expected = step;
-  for (int axis = outer_last - 1; axis >= 0; --axis) {
-    expected *= t.size(axis + 1);
-    if (t.size(axis) > 1) {
-      TVM_FFI_CHECK(t.stride(axis) == expected, ValueError)
-          << name << " leading dims are not physically foldable above " << trailing
-          << " trailing dims: stride(" << axis << ")=" << t.stride(axis)
-          << ", expected " << expected;
-    }
-  }
 }
 
 // Caller-owned storage is mutable scratch, including when its address and
@@ -245,7 +150,7 @@ inline CUtensorMap EncodeTma_beta_logits_tma_0(const TensorView& t) {
   TVM_FFI_CHECK(d1 > 0, ValueError)
       << "TMA source 'beta_logits_tma' trailing dims must be positive";
   int64_t outer1 = t.numel() / (d1);
-  CheckDenseLeadingFold(t, 1, "beta_logits_tma");
+  check_dense_leading_dims(t, 1, "beta_logits_tma");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'beta_logits_tma' physical strides must be positive";
@@ -286,7 +191,7 @@ inline CUtensorMap EncodeTma_beta_logits_tma_1(const TensorView& t) {
   TVM_FFI_CHECK(d1 > 0, ValueError)
       << "TMA source 'beta_logits_tma' trailing dims must be positive";
   int64_t outer1 = t.numel() / (d1);
-  CheckDenseLeadingFold(t, 1, "beta_logits_tma");
+  check_dense_leading_dims(t, 1, "beta_logits_tma");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'beta_logits_tma' physical strides must be positive";
@@ -327,7 +232,7 @@ inline CUtensorMap EncodeTma_beta_tma_0(const TensorView& t) {
   TVM_FFI_CHECK(d1 > 0, ValueError)
       << "TMA source 'beta_tma' trailing dims must be positive";
   int64_t outer1 = t.numel() / (d1);
-  CheckDenseLeadingFold(t, 1, "beta_tma");
+  check_dense_leading_dims(t, 1, "beta_tma");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'beta_tma' physical strides must be positive";
@@ -368,7 +273,7 @@ inline CUtensorMap EncodeTma_beta_tma_1(const TensorView& t) {
   TVM_FFI_CHECK(d1 > 0, ValueError)
       << "TMA source 'beta_tma' trailing dims must be positive";
   int64_t outer1 = t.numel() / (d1);
-  CheckDenseLeadingFold(t, 1, "beta_tma");
+  check_dense_leading_dims(t, 1, "beta_tma");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'beta_tma' physical strides must be positive";
@@ -409,7 +314,7 @@ inline CUtensorMap EncodeTma_beta_tma_2(const TensorView& t) {
   TVM_FFI_CHECK(d1 > 0, ValueError)
       << "TMA source 'beta_tma' trailing dims must be positive";
   int64_t outer1 = t.numel() / (d1);
-  CheckDenseLeadingFold(t, 1, "beta_tma");
+  check_dense_leading_dims(t, 1, "beta_tma");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'beta_tma' physical strides must be positive";
@@ -452,7 +357,7 @@ inline CUtensorMap EncodeTma_beta_tma_3(const TensorView& t) {
   TVM_FFI_CHECK(d1 > 0, ValueError)
       << "TMA source 'beta_tma' trailing dims must be positive";
   int64_t outer1 = t.numel() / (d1);
-  CheckDenseLeadingFold(t, 1, "beta_tma");
+  check_dense_leading_dims(t, 1, "beta_tma");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'beta_tma' physical strides must be positive";
@@ -796,7 +701,7 @@ inline CUtensorMap EncodeTma_g_tma_0(const TensorView& t) {
   TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
       << "TMA source 'g_tma' trailing dims must be positive";
   int64_t outer2 = t.numel() / (d1 * d2);
-  CheckDenseLeadingFold(t, 2, "g_tma");
+  check_dense_leading_dims(t, 2, "g_tma");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'g_tma' physical strides must be positive";
@@ -851,7 +756,7 @@ inline CUtensorMap EncodeTma_g_tma_1(const TensorView& t) {
   TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
       << "TMA source 'g_tma' trailing dims must be positive";
   int64_t outer2 = t.numel() / (d1 * d2);
-  CheckDenseLeadingFold(t, 2, "g_tma");
+  check_dense_leading_dims(t, 2, "g_tma");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'g_tma' physical strides must be positive";
@@ -906,7 +811,7 @@ inline CUtensorMap EncodeTma_k_tma_0(const TensorView& t) {
   TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
       << "TMA source 'k_tma' trailing dims must be positive";
   int64_t outer2 = t.numel() / (d1 * d2);
-  CheckDenseLeadingFold(t, 2, "k_tma");
+  check_dense_leading_dims(t, 2, "k_tma");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'k_tma' physical strides must be positive";
@@ -1149,7 +1054,7 @@ inline CUtensorMap EncodeTma_k_tma_4(const TensorView& t) {
   TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
       << "TMA source 'k_tma' trailing dims must be positive";
   int64_t outer2 = t.numel() / (d1 * d2);
-  CheckDenseLeadingFold(t, 2, "k_tma");
+  check_dense_leading_dims(t, 2, "k_tma");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'k_tma' physical strides must be positive";
@@ -1931,7 +1836,7 @@ inline CUtensorMap EncodeTma_q_tma_0(const TensorView& t) {
   TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
       << "TMA source 'q_tma' trailing dims must be positive";
   int64_t outer2 = t.numel() / (d1 * d2);
-  CheckDenseLeadingFold(t, 2, "q_tma");
+  check_dense_leading_dims(t, 2, "q_tma");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'q_tma' physical strides must be positive";
@@ -2056,7 +1961,7 @@ inline CUtensorMap EncodeTma_q_tma_2(const TensorView& t) {
   TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
       << "TMA source 'q_tma' trailing dims must be positive";
   int64_t outer2 = t.numel() / (d1 * d2);
-  CheckDenseLeadingFold(t, 2, "q_tma");
+  check_dense_leading_dims(t, 2, "q_tma");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'q_tma' physical strides must be positive";
@@ -2240,7 +2145,7 @@ inline CUtensorMap EncodeTma_raw_gate_tma_0(const TensorView& t) {
   TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
       << "TMA source 'raw_gate_tma' trailing dims must be positive";
   int64_t outer2 = t.numel() / (d1 * d2);
-  CheckDenseLeadingFold(t, 2, "raw_gate_tma");
+  check_dense_leading_dims(t, 2, "raw_gate_tma");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'raw_gate_tma' physical strides must be positive";
@@ -2295,7 +2200,7 @@ inline CUtensorMap EncodeTma_raw_gate_tma_1(const TensorView& t) {
   TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
       << "TMA source 'raw_gate_tma' trailing dims must be positive";
   int64_t outer2 = t.numel() / (d1 * d2);
-  CheckDenseLeadingFold(t, 2, "raw_gate_tma");
+  check_dense_leading_dims(t, 2, "raw_gate_tma");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'raw_gate_tma' physical strides must be positive";
@@ -2647,7 +2552,7 @@ inline CUtensorMap EncodeTma_v_tma_2(const TensorView& t) {
   TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
       << "TMA source 'v_tma' trailing dims must be positive";
   int64_t outer2 = t.numel() / (d1 * d2);
-  CheckDenseLeadingFold(t, 2, "v_tma");
+  check_dense_leading_dims(t, 2, "v_tma");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'v_tma' physical strides must be positive";
@@ -2702,7 +2607,7 @@ inline CUtensorMap EncodeTma_v_tma_3(const TensorView& t) {
   TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
       << "TMA source 'v_tma' trailing dims must be positive";
   int64_t outer2 = t.numel() / (d1 * d2);
-  CheckDenseLeadingFold(t, 2, "v_tma");
+  check_dense_leading_dims(t, 2, "v_tma");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'v_tma' physical strides must be positive";
@@ -2827,7 +2732,7 @@ inline CUtensorMap EncodeTma_v_tma_5(const TensorView& t) {
   TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
       << "TMA source 'v_tma' trailing dims must be positive";
   int64_t outer2 = t.numel() / (d1 * d2);
-  CheckDenseLeadingFold(t, 2, "v_tma");
+  check_dense_leading_dims(t, 2, "v_tma");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
   TVM_FFI_CHECK(s2 > 0, ValueError)
       << "TMA source 'v_tma' physical strides must be positive";
