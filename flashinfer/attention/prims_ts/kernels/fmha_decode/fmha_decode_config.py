@@ -36,6 +36,7 @@ from ..._block_sparse.common import (
     _validate_sparse_kv_block_size,
 )
 from ...sage.layout import _SAGE_ATOM_MIN_WORDS, _SAGE_ATOM_TOKENS, _SageScaleLayout
+from ...sage.modes import SageScoreScaling
 from ...split_kv_mode_policy import select_split_kv_modes
 from ..tcgen05_compat import ldtm_stat_supported
 from .fmha_decode_constants import (
@@ -2696,18 +2697,21 @@ class FmhaDecodeConfig:
             1, self.softmax_score_fragment_regs // self.sage_k_scale_block_size(proxy)
         )
 
-    def sage_scores_dequantized(self, proxy: bool = False) -> bool:
-        """Whether the max pass writes a route kind's scores back dequantized.
+    def sage_score_scaling(self, proxy: bool = False) -> SageScoreScaling | None:
+        """Return how the softmax applies a route kind's ``sfK`` to its scores.
 
-        A kind with one scale per score (the one-token K block) does, so the P
-        pass reads neither its ``sfK`` nor the INT32 bias; other geometries
-        stay quantized to avoid a TMEM round trip per tile.
+        A kind with one scale per score (the one-token K block) is
+        dequantized: the max pass writes its scores back multiplied, so the P
+        pass reads neither its ``sfK`` nor the INT32 bias. Other geometries
+        scale blocks of ``sage_k_scale_block_size`` columns, avoiding a TMEM
+        round trip per tile. Every kind's words come through the
+        ``SageKScalesResource`` ring (``SageKTransport.RING``).
         """
-        return (
-            self.use_sage_attention
-            and self.sage_k_groups_per_fragment(proxy)
-            == self.softmax_score_fragment_regs
-        )
+        if not self.use_sage_attention:
+            return None
+        if self.sage_k_groups_per_fragment(proxy) == self.softmax_score_fragment_regs:
+            return SageScoreScaling.DEQUANTIZED
+        return SageScoreScaling.BLOCK
 
     @property
     def matches_kv256_task_topology(self) -> bool:

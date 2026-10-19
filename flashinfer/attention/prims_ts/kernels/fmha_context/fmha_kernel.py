@@ -184,6 +184,7 @@ from .fmha_resources import (
 )
 from .sage_scales import validate_context_sage_layout
 from ...sage.layout import _SageScaleLayout
+from ...sage.modes import SageKTransport
 from .fmha_tasks import (
     PackedContextWorkQueue,
     create_correction_task,
@@ -1192,10 +1193,10 @@ def build_context_task_manager(
             for index in range(cfg.num_qkv_instances)
         ]
     smem_p0, smem_p1 = smem_p_resources
-    # Sage K blocks under 16 tokens: the load warp stages each K tile's sfK
-    # words in a ring both softmax groups read in place.
+    # Sage ring transport (``SageKTransport.RING``): the load warp stages each
+    # K tile's sfK words in a ring both softmax groups read.
     smem_sage_k: SmemSageKScalesResource | None = None
-    if cfg.sage_stages_k_scales:
+    if cfg.sage_k_transport is SageKTransport.RING:
         smem_sage_k = SmemSageKScalesResource(
             pipeline_config=PipelineConfig.create_async_async_pipeline_cfg(
                 num_stages=cfg.sage_k_scale_stages,
@@ -1851,7 +1852,9 @@ def _context_pipeline_stage_counts(
         ),
         "tmem_sp": cfg.mma_softmax_stage * cfg.num_qkv_instances,
         "tmem_p": cfg.mma_softmax_stage if cfg.has_tmem_p_pipeline else 0,
-        "smem_sage_k": cfg.sage_k_scale_stages if cfg.sage_stages_k_scales else 0,
+        "smem_sage_k": cfg.sage_k_scale_stages
+        if cfg.sage_k_transport is SageKTransport.RING
+        else 0,
         "tmem_vec": cfg.softmax_corr_stage * cfg.num_qkv_instances,
         "tmem_o": cfg.mma_corr_stage,
         "smem_o": cfg.num_qkv_instances,
@@ -1923,7 +1926,7 @@ def _kv_ring_smem_budget_bytes(
             (cfg.smem_p_bytes + align - 1) // align * align * cfg.num_qkv_instances
         )
     sage_k_bytes = 0
-    if cfg.sage_stages_k_scales:
+    if cfg.sage_k_transport is SageKTransport.RING:
         sage_k_bytes = cfg.sage_k_scale_stages * cfg.sage_k_tile_bytes
     score_seed_bytes = cfg.score_seed_tile_bytes if cfg.uses_int32_scores else 0
     control_bytes = (2 * cutlass.Int32.width + cutlass.Int64.width) // 8

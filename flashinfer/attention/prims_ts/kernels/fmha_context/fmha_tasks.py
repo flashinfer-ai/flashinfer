@@ -34,7 +34,7 @@ import cutlass.cute as cute
 from cutlass import Int32
 
 from ..stage import FmhaStage
-from .sage_scales import SageSoftmaxMode
+from ...sage.modes import SageKTransport, SageScoreScaling
 from cutlass.experimental.task_scheduling.schedule_builder import (
     domain_loop,
     schedule,
@@ -2248,15 +2248,15 @@ def create_softmax_task(
         if smem_p is None:
             raise ValueError("p_in_smem requires the group's SMEM P resource")
         dst.append(smem_p)
-    # Sage attention reads its scales from the prepared buffer inside the
-    # softmax passes, or from the load warp's sfK ring for K blocks under 16
-    # tokens (``SageSoftmaxMode``).
+    # Sage attention takes each K tile's sfK words from the prepared buffer
+    # or from the load warp's ring (``SageKTransport``), and scales blocks of
+    # raw scores or dequantizes them (``SageScoreScaling``).
     use_sage = tmem_sp.cfg.use_sage_attention
-    sage_mode = tmem_sp.cfg.sage_softmax_mode
+    sage_transport = tmem_sp.cfg.sage_k_transport
+    sage_scaling = tmem_sp.cfg.sage_score_scaling
     if use_sage and not p_in_smem:
         raise ValueError("Sage attention requires P in SMEM")
-    stages_sage_k = tmem_sp.cfg.sage_stages_k_scales
-    if stages_sage_k:
+    if sage_transport is SageKTransport.RING:
         if smem_sage_k is None:
             raise ValueError("this Sage K block size requires the sfK ring")
         src.append(smem_sage_k)
@@ -2285,18 +2285,18 @@ def create_softmax_task(
             row_max: Any,
             scale_softmax_log2: Any,
             sage_q_scale: Any = None,
-            sage_k_block_scales: Any = None,
+            sage_k_words: Any = None,
         ) -> Any:
             """Softmax and P store. With P in SMEM the store goes to the SMEM P tile,
             with the half overlap the leading half is published behind ``pr``, else P goes
-            to the TMEM S/P stage. A block-scaled Sage plan passes the work tile's ``sfQ``
-            and the tile's per-block ``sfK`` from its max pass."""
-            if sage_mode is SageSoftmaxMode.BLOCK_SCALED:
+            to the TMEM S/P stage. A Sage plan passes the work tile's ``sfQ`` and, when it
+            scales blocks, the tile's ``sfK`` words from its max pass."""
+            if sage_scaling is SageScoreScaling.BLOCK:
                 p_chunk = sp.sage_exp2_p_smem(
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
                     sage_q_scale=sage_q_scale,
-                    sage_k_block_scales=sage_k_block_scales,
+                    sage_k_words=sage_k_words,
                 )
                 pb.acquire()
                 sp.store_p()
@@ -2345,65 +2345,59 @@ def create_softmax_task(
             window_end = Int32(0)
             if tmem_sp.uses_variable_window:
                 window_start, window_end = sp.cache_variable_window_bounds()
-            sage_q_scale = sage_k_block_scales = None
+            sage_q_scale = sage_k_words = None
             if use_sage:
                 sage_q_scale, sage_k_first_atom = sp.cache_sage_scales()
 
-            def load_sage_k_scales(section: FmhaStage) -> Any:
-                """Obtain the K tile's ``sfK`` before the wait for its scores.
+            def start_sage_k_words(section: FmhaStage) -> Any:
+                """Start obtaining the K tile's ``sfK`` words before the wait for its scores.
 
-                Register block scales and words load from the prepared
-                buffer, so the wait hides their latency; staged words wait
-                for the load warp's ring stage and take its offset."""
-                if sage_mode is SageSoftmaxMode.BLOCK_SCALED:
-                    return sp.load_sage_k_block_scales(
-                        sage_k_first_atom=sage_k_first_atom, section=section
-                    )
-                if sage_mode is SageSoftmaxMode.HOISTED:
+                The global transport loads the words, so the wait hides their
+                latency; the ring transport waits for the load warp's stage and
+                returns its offset, read after the score wait."""
+                if sage_transport is SageKTransport.GLOBAL:
                     return sp.load_sage_k_words(
                         sage_k_first_atom=sage_k_first_atom, section=section
                     )
                 skr.wait()
                 return skr.open_stage()
 
-            def sage_row_max(row_max: Any, k_scales: Any, section: FmhaStage) -> Any:
-                """Row max of the dequantized scores, by the plan's Sage mode.
+            def sage_row_max(row_max: Any, k_words: Any, section: FmhaStage) -> Any:
+                """Row max of the dequantized scores and the tile's ``sfK`` words.
 
-                The staged ring stage is released here: the max pass is its
-                only reader."""
-                if sage_mode is SageSoftmaxMode.BLOCK_SCALED:
-                    return sp.sage_row_max(
+                A ring stage's words are read after the score wait and the
+                stage is released after the max pass
+                (``read_staged_sage_k_words``)."""
+                if sage_transport is SageKTransport.RING:
+                    k_words = sp.read_staged_sage_k_words(sage_k_stage_words=k_words)
+                if sage_scaling is SageScoreScaling.BLOCK:
+                    maxima = sp.sage_row_max(
                         row_max=row_max,
                         sage_q_scale=sage_q_scale,
-                        sage_k_block_scales=k_scales,
+                        sage_k_words=k_words,
                         section=section,
                     )
-                if sage_mode is SageSoftmaxMode.HOISTED:
-                    return sp.sage_dequantized_row_max(
+                else:
+                    maxima = sp.sage_dequantized_row_max(
                         row_max=row_max,
                         sage_q_scale=sage_q_scale,
-                        sage_k_words=k_scales,
+                        sage_k_words=k_words,
                         section=section,
                     )
-                maxima = sp.sage_staged_row_max(
-                    row_max=row_max,
-                    sage_q_scale=sage_q_scale,
-                    sage_k_stage_words=k_scales,
-                    section=section,
-                )
-                skr.release()
-                return maxima
+                if sage_transport is SageKTransport.RING:
+                    skr.release()
+                return maxima, k_words
 
             # Reserve a stats slot before the first softmax result is published.
             vec.acquire()
             with domain_loop(loop_start, loop_end, loop_step):
                 if use_sage:
-                    sage_k_block_scales = load_sage_k_scales(FmhaStage.Loop)
+                    sage_k_words = start_sage_k_words(FmhaStage.Loop)
                 sp.wait()
                 # Compute row max and publish vec.
                 if use_sage:
-                    old_row_max, row_max = sage_row_max(
-                        row_max, sage_k_block_scales, FmhaStage.Loop
+                    (old_row_max, row_max), sage_k_words = sage_row_max(
+                        row_max, sage_k_words, FmhaStage.Loop
                     )
                 elif tmem_sp.uses_variable_window:
                     old_row_max, row_max = sp.variable_window_row_max(
@@ -2474,7 +2468,7 @@ def create_softmax_task(
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
                     sage_q_scale=sage_q_scale,
-                    sage_k_block_scales=sage_k_block_scales,
+                    sage_k_words=sage_k_words,
                 )
                 if s0s1_seq is None or early_token:
                     pass
@@ -2677,11 +2671,11 @@ def create_softmax_task(
             elif tmem_sp.uses_fixed_dense_k_tail_mask:
                 # Dense tail: one more loop step with the zero-filled lanes masked out.
                 if use_sage:
-                    sage_k_block_scales = load_sage_k_scales(FmhaStage.Tail)
+                    sage_k_words = start_sage_k_words(FmhaStage.Tail)
                 sp.wait()
                 if use_sage:
-                    old_row_max, row_max = sage_row_max(
-                        row_max, sage_k_block_scales, FmhaStage.Tail
+                    (old_row_max, row_max), sage_k_words = sage_row_max(
+                        row_max, sage_k_words, FmhaStage.Tail
                     )
                 else:
                     old_row_max, row_max = sp.fixed_dense_k_tail_masked_row_max(
@@ -2707,7 +2701,7 @@ def create_softmax_task(
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
                     sage_q_scale=sage_q_scale,
-                    sage_k_block_scales=sage_k_block_scales,
+                    sage_k_words=sage_k_words,
                 )
                 if s0s1_seq is None:
                     pass
@@ -2791,7 +2785,7 @@ def create_softmax_task(
     ) -> None:
         softmax_schedule_body(sp, vec, seq, wq, None, pb, skr)
 
-    if p_in_smem and stages_sage_k:
+    if p_in_smem and sage_transport is SageKTransport.RING:
         captured_schedule = _schedule_with_work_queue(
             softmax_schedule_pb_skr,
             tmem_sp,

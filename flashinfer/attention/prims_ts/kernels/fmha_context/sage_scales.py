@@ -27,15 +27,14 @@ buffer and move the words the kernel reads:
 * ``load_sage_k_tile`` reads one K tile's ``sfK`` atoms from the tile's
   address (``sage_k_section_address`` gives the sequence's first atom) for
   the softmax lanes or the load warp's shared-memory staging;
-  ``sage_softmax_mode`` says which of the two the plan's K block size takes
-  and how the softmax applies the words; ``prefetch_sage_k_tile`` warms L1
-  with the next tile's atoms one tile ahead of direct loads;
+  ``sage_k_transport`` says which of the two the plan's K block size takes
+  and ``sage_score_scaling`` how the softmax applies the words;
+  ``prefetch_sage_k_tile`` warms L1 with the next tile's atoms one tile ahead
+  of direct loads;
 * ``load_sage_v_channels`` reads the sequence's ``sfV`` / ``v_mean`` words per
   output column in the epilogue (``sage_v_section_address`` gives the
   sequence's first ``sfV`` word).
 """
-
-import enum
 
 import cutlass
 import cutlass.cute as cute
@@ -43,39 +42,19 @@ from cutlass import Float32, Int32, Int64
 
 from ...sage.index import sage_q_word, sage_section_word
 from ...sage.layout import _FLOAT4_WORDS, _SAGE_ATOM_TOKENS, _SageScaleLayout
+from ...sage.modes import SageKTransport, SageScoreScaling
 
 Constexpr = cutlass.Constexpr
 
-# Score columns that share one ``sfK`` word in the block-scaled softmax
-# passes (``SageSoftmaxMode.BLOCK_SCALED``), the width of one LDTM.STAT piece.
+# Score columns that share one ``sfK`` word when the softmax scales blocks
+# (``SageScoreScaling.BLOCK``), the width of one LDTM.STAT piece.
 SAGE_SCORE_BLOCK_COLS = 16
 # Bytes of one L1 line, the granularity of ``prefetch_sage_k_tile``.
 _L1_LINE_BYTES = 128
-# Most ``sfK`` words of one K tile the softmax lanes carry across the S wait
-# as a task-local vector (``SageSoftmaxMode.HOISTED``).
-_HOISTED_MAX_TILE_WORDS = 32
-
-
-class SageSoftmaxMode(enum.Enum):
-    """How the context softmax obtains and applies a K tile's ``sfK`` words.
-
-    ``BLOCK_SCALED``: K blocks of 16 tokens or more, one word per 16-column
-    score block. The lanes load the tile's few words from global memory
-    before the S wait; the scores stay raw and each block's maximum and exp2
-    multiplier carry ``sfQ * sfK``.
-
-    Finer blocks need one multiplier per word of fewer columns, so the max
-    pass multiplies the scores by ``sfQ * sfK`` in place and the P pass runs
-    the per-tensor path. ``HOISTED``: the tile's multipliers fit a task-local
-    vector, loaded from global memory before the S wait. ``STAGED``: too many
-    words to carry or to broadcast-load per lane; the load warp stages each
-    tile's words in shared memory (``SmemSageKScalesResource``) and the max
-    pass reads them there.
-    """
-
-    BLOCK_SCALED = "block_scaled"
-    HOISTED = "hoisted"
-    STAGED = "staged"
+# Most ``sfK`` words of one K tile the softmax lanes load from global memory
+# and carry across the S wait as a task-local vector
+# (``SageKTransport.GLOBAL``); more words go through the load warp's ring.
+_GLOBAL_MAX_TILE_WORDS = 32
 
 
 def validate_context_sage_layout(layout: _SageScaleLayout, kv_tile_n: int) -> None:
@@ -92,13 +71,31 @@ def validate_context_sage_layout(layout: _SageScaleLayout, kv_tile_n: int) -> No
         raise ValueError("the context kernel reads one Q head per 128 Q rows")
 
 
-def sage_softmax_mode(layout: _SageScaleLayout) -> SageSoftmaxMode:
-    """Return how the softmax obtains and applies the layout's ``sfK`` words."""
+def sage_score_scaling(layout: _SageScaleLayout) -> SageScoreScaling:
+    """Return how the context softmax applies the layout's ``sfK`` words.
+
+    K blocks of 16 tokens or more give one word per 16-column score block:
+    the scores stay raw and each block's maximum and exp2 multiplier carry
+    ``sfQ * sfK``. Finer blocks need one multiplier per word of fewer
+    columns, so the max pass multiplies the scores in place and the P pass
+    runs the per-tensor path with ``sfQ`` in its exp2 scale.
+    """
     if layout.k_tokens.tokens_per_word >= SAGE_SCORE_BLOCK_COLS:
-        return SageSoftmaxMode.BLOCK_SCALED
-    if sage_k_tile_words(layout) <= _HOISTED_MAX_TILE_WORDS:
-        return SageSoftmaxMode.HOISTED
-    return SageSoftmaxMode.STAGED
+        return SageScoreScaling.BLOCK
+    return SageScoreScaling.DEQUANTIZED
+
+
+def sage_k_transport(layout: _SageScaleLayout) -> SageKTransport:
+    """Return how the context softmax obtains a K tile's ``sfK`` words.
+
+    The lanes load a tile of at most ``_GLOBAL_MAX_TILE_WORDS`` words from
+    global memory before the S wait; a tile with more words (one-token
+    blocks) is too many to carry or to broadcast-load per lane, so the load
+    warp stages it in the ``sfK`` ring (``SmemSageKScalesResource``).
+    """
+    if sage_k_tile_words(layout) <= _GLOBAL_MAX_TILE_WORDS:
+        return SageKTransport.GLOBAL
+    return SageKTransport.RING
 
 
 def sage_k_tile_words(layout: _SageScaleLayout) -> int:

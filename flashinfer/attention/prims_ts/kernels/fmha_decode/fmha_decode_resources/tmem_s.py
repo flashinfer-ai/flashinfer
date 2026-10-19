@@ -97,6 +97,7 @@ from .smem_block_sparse_metadata import (
     _swaps_forwards_packed_route_full,
 )
 from ....sage.index import sage_sequence_words
+from ....sage.modes import SageScoreScaling
 from .sage_scales import (
     load_q_scale,
     load_sage_k_fragment,
@@ -2525,7 +2526,9 @@ class TmemSResource(DecodeGenResourceBase):
         tail_fragment_mask = Int32(0)
         tail_lane: Constexpr[int] = 0
         shifts_tail: Constexpr[bool] = False
-        dequantizes_scores: Constexpr[bool] = cfg.sage_scores_dequantized()
+        dequantizes_scores: Constexpr[bool] = (
+            cfg.sage_score_scaling() is SageScoreScaling.DEQUANTIZED
+        )
         # With LDTM.STAT the unmasked pass takes each fragment's maximum, or
         # each Sage scale group's, from the TMEM load itself. INT32 scores (the
         # load reduces FP32 values) and one-scale-per-score geometries, which
@@ -2807,7 +2810,9 @@ class TmemSResource(DecodeGenResourceBase):
         num_fragments = cfg.num_softmax_score_fragments
         fragment_regs = cfg.softmax_score_fragment_regs
         groups: Constexpr[int] = cfg.sage_k_groups_per_fragment(proxy_kind)
-        dequantize_scores: Constexpr[bool] = cfg.sage_scores_dequantized(proxy_kind)
+        dequantize_scores: Constexpr[bool] = (
+            cfg.sage_score_scaling(proxy_kind) is SageScoreScaling.DEQUANTIZED
+        )
         for fragment in cutlass.range(num_fragments, unroll=1):
             fragment_scales = None
             if cutlass.const_expr(cfg.use_sage_attention):

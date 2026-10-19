@@ -21,6 +21,7 @@
   attention (``_SageScaleLayout``).
 * ``prepare``: the kernel that writes that buffer from the flat scales.
 * ``index``: device-side index math and loads over the layout.
+* ``modes``: the names of how a softmax obtains and applies the K scales.
 * ``int32_scores``: INT8 Q/K accumulated as INT32 scores on a float bias.
 
 Each attention kernel keeps its own resources, pipelines and softmax for
