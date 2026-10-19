@@ -155,25 +155,38 @@ def test_n128_table_lists_ws4_and_ws8_classes_per_architecture_under_the_frozen_
             assert b_layout in loader.B_LAYOUTS
 
 
+# ``[world_size, dtype, b_layout, min_padded_rows, max_padded_rows, min_cols,
+# max_cols]`` rectangles; a class may list several, pairwise disjoint.
 _CG2_REGIONS = {
     "sm_100a": [],
     "sm_103a": [
-        [2, "bfloat16", "n_major", 2048, 5760, 2048],
-        [4, "bfloat16", "k_major", 1024, 1536, 6058],
+        # R2 regions (min_cols 1 keeps every R2-routed call routed).
+        [2, "bfloat16", "n_major", 2048, 5760, 1, 2048],
+        [4, "bfloat16", "k_major", 1024, 1536, 1, 6058],
+        # R3 lever alpha (arm a1): the two measured gate_up M=512 rows, as points. The M=2048
+        # rows of arm a2 are not routed (export gate blocked at the frozen 0.60 SM-clock floor, GAP-15c).
+        [4, "bfloat16", "k_major", 512, 512, 14336, 14336],
+        [8, "bfloat16", "k_major", 512, 512, 7168, 7168],
     ],
 }
 _CG2_CLASSES = {
     "sm_100a": set(),
-    "sm_103a": {(2, "bfloat16", "n_major"), (4, "bfloat16", "k_major")},
+    "sm_103a": {
+        (2, "bfloat16", "n_major"),
+        (4, "bfloat16", "k_major"),
+        (8, "bfloat16", "k_major"),
+    },
 }
 
 
 def test_cg2_tables_list_the_measured_pair_regions_and_classes_per_architecture():
-    """The CTA-pair twin is delivered for the classes with a measured region:
-    on sm_103a the ws2 bf16 n_major class at 2048..5760 padded rows / N <= 2048
-    and the ws4 bf16 k_major class at 1024..1536 padded rows / N <= 6058;
-    sm_100a has no region and delivers no twin. The rule inputs are the kernel
-    module's (clusters of two)."""
+    """The CTA-pair twin is delivered for the classes with a measured rectangle:
+    on sm_103a the ws2 bf16 n_major class at 2048..5760 padded rows / N <= 2048,
+    the ws4 bf16 k_major class at 1024..1536 padded rows / N <= 6058 and at its
+    gate_up point (exactly 512 padded rows at N = 14336), and the ws8 bf16
+    k_major class at its gate_up point (exactly 512 padded rows at N = 7168; the
+    M=2048 gate_up rows of arm a2 are not routed); sm_100a has no rectangle and
+    delivers no twin. The rule inputs are the kernel module's (clusters of two)."""
 
     assert set(loader.CG2_CLASSES) == set(loader.CG2_REGIONS) == set(loader.ARCH_FLAGS)
     assert loader.CG2_REGIONS == _CG2_REGIONS
@@ -290,10 +303,12 @@ def test_every_program_is_delivered_for_both_architectures():
             for arch in loader.ARCH_FLAGS
             if (world_size, dtype_name, b_layout) in _n128_classes(arch)
         ), twin
-    # A ``_cg2`` main likewise (the two sm_103a pair classes have pair-routed rows on sm_103a only).
+    # A ``_cg2`` main likewise (the three sm_103a pair classes have pair-routed
+    # rows on sm_103a only).
     assert sorted(_cg2_programs()) == [
         (2, "bfloat16", "n_major"),
         (4, "bfloat16", "k_major"),
+        (8, "bfloat16", "k_major"),
     ]
     for world_size, dtype_name, b_layout in _cg2_programs():
         pair = loader.main_program(world_size, dtype_name, b_layout, form="cg2")
@@ -623,6 +638,29 @@ _INVENTORY_ROWS = (
         (125, 14336, 4, "bfloat16", "k_major"),
         _N256,
     ),
+    # The R3 lever-alpha gate_up rows (896 / 3584 N256 tiles: beyond
+    # the cap of both architectures); on sm_103a the M=512 rows run the CTA-pair
+    # twin and the M=2048 rows (arm a2, not routed) keep the one-CTA program.
+    (
+        "llama_tp4_gate_up_bf16_m512_kmajor",
+        (512, 14336, 4, "bfloat16", "k_major"),
+        _N256,
+    ),
+    (
+        "llama_tp8_gate_up_bf16_m512_kmajor",
+        (512, 7168, 8, "bfloat16", "k_major"),
+        _N256,
+    ),
+    (
+        "llama_tp4_gate_up_bf16_m2048_kmajor",
+        (2048, 14336, 4, "bfloat16", "k_major"),
+        _N256,
+    ),
+    (
+        "llama_tp8_gate_up_bf16_m2048_kmajor",
+        (2048, 7168, 8, "bfloat16", "k_major"),
+        _N256,
+    ),
     # The N256 coverage rows of the float16 k_major classes (640 tiles: five waves).
     (
         "kmajor_ws4_fp16_m2048_n2560",
@@ -705,11 +743,12 @@ def test_main_block_n_routes_the_inventory_rows_like_the_exporter(label, shape, 
 )
 def test_main_form_routes_the_inventory_rows_by_the_region_table(label, shape, widths):
     """The loader's ``main_form`` on the inventory is the frozen region rule:
-    the CTA-pair form for an N256 row whose class has a measured region on the
-    architecture and whose padded rows and N lie inside it -- on sm_103a
-    perf_bf16_m2048 / m4096 (ws2 bf16 n_major) and llama_tp4_qkv_bf16_m1024 /
-    m1025_kmajor (ws4 bf16 k_major); the one-CTA form for every other row and
-    on sm_100a."""
+    the CTA-pair form for an N256 row whose padded rows and N lie inside some
+    measured rectangle of its class on the architecture -- on sm_103a
+    perf_bf16_m2048 / m4096 (ws2 bf16 n_major), llama_tp4_qkv_bf16_m1024 /
+    m1025_kmajor and llama_tp4_gate_up_bf16_m512_kmajor (ws4 bf16 k_major) and
+    llama_tp8_gate_up_bf16_m512_kmajor (ws8 bf16 k_major);
+    the one-CTA form for every other row and on sm_100a."""
 
     rows, n, world_size, dtype_name, b_layout = shape
     for arch, block_n in widths.items():
@@ -724,19 +763,14 @@ def test_main_form_routes_the_inventory_rows_by_the_region_table(label, shape, w
         )
         padded = loader.padded_rows(rows)
         delivered = (world_size, dtype_name, b_layout) in _cg2_classes(arch)
-        region = next(
-            (
-                entry[3:]
-                for entry in loader.CG2_REGIONS[arch]
-                if tuple(entry[:3]) == (world_size, dtype_name, b_layout)
-            ),
-            None,
-        )
-        qualifies = (
-            block_n == 256
-            and region is not None
-            and region[0] <= padded <= region[1]
-            and n <= region[2]
+        rectangles = [
+            entry[3:]
+            for entry in loader.CG2_REGIONS[arch]
+            if tuple(entry[:3]) == (world_size, dtype_name, b_layout)
+        ]
+        qualifies = block_n == 256 and any(
+            min_rows <= padded <= max_rows and min_cols <= n <= max_cols
+            for min_rows, max_rows, min_cols, max_cols in rectangles
         )
         assert form == ("cg2" if qualifies and delivered else "cg1"), (label, arch)
         expected_pair = arch == "sm_103a" and label in {
@@ -744,6 +778,8 @@ def test_main_form_routes_the_inventory_rows_by_the_region_table(label, shape, w
             "perf_bf16_m4096",
             "llama_tp4_qkv_bf16_m1024_kmajor",
             "llama_tp4_qkv_bf16_m1025_kmajor",
+            "llama_tp4_gate_up_bf16_m512_kmajor",
+            "llama_tp8_gate_up_bf16_m512_kmajor",
         }
         assert (form == "cg2") is expected_pair, (label, arch)
         # Every inventory row the rule qualifies belongs to a delivered class (the table is derived from the rows).
@@ -790,8 +826,8 @@ def test_main_form_selects_the_pair_twin_only_inside_a_measured_region_at_the_pu
                 "cg2"
             ] * 5
             assert rule(2048, n=1792) == "cg2" and rule(2048, n=2304) == "cg1"
-        else:
-            # (4, bfloat16, k_major): 1024..1536 padded rows and N <= 6058.
+        elif world_size == 4:
+            # (4, bfloat16, k_major) R2 rectangle: 1024..1536 padded rows, N <= 6058.
             assert [rule(rows) for rows in (1, 512, 896, 1537, 2048, 4096, 65536)] == [
                 "cg1"
             ] * 7
@@ -801,6 +837,40 @@ def test_main_form_selects_the_pair_twin_only_inside_a_measured_region_at_the_pu
                 and rule(1024, n=6144) == "cg1"
                 and rule(1024, n=14336) == "cg1"
             )
+            # R3 alpha point (llama_tp4_gate_up m512): exactly 512 padded rows at
+            # exactly N = 14336; 511 pads to 512 (cg2), 513 pads to 640 (cg1); the
+            # M=2048 row (arm a2, not routed) and the neighbouring column multiples
+            # stay cg1.
+            assert [rule(rows, n=14336) for rows in (500, 511, 512)] == ["cg2"] * 3
+            assert [
+                rule(rows, n=14336)
+                for rows in (1, 513, 640, 1024, 1536, 1921, 2048, 2049, 4096)
+            ] == ["cg1"] * 9
+            assert rule(512, n=14080) == "cg1" and rule(512, n=14592) == "cg1"
+            assert rule(2048, n=14080) == "cg1" and rule(2048, n=14592) == "cg1"
+            assert rule(512, n=14336, block_n=128) == "cg1"
+            for cols in (14335, 14337):
+                with pytest.raises(ValueError, match="multiple of 256"):
+                    rule(512, n=cols)
+        else:
+            # (8, bfloat16, k_major), R3 alpha point (llama_tp8_gate_up m512):
+            # exactly 512 padded rows at exactly N = 7168; the class has no other
+            # rectangle, so the M=2048 row (arm a2, not routed) and every N = 1280
+            # call stay cg1.
+            assert [rule(rows) for rows in (1, 512, 1024, 1025, 2048, 4096)] == [
+                "cg1"
+            ] * 6
+            assert [rule(rows, n=7168) for rows in (500, 511, 512)] == ["cg2"] * 3
+            assert [
+                rule(rows, n=7168)
+                for rows in (1, 513, 640, 1024, 1025, 1536, 1921, 2048, 2049, 4096)
+            ] == ["cg1"] * 10
+            assert rule(512, n=6912) == "cg1" and rule(512, n=7424) == "cg1"
+            assert rule(2048, n=6912) == "cg1" and rule(2048, n=7424) == "cg1"
+            assert rule(512, n=7168, block_n=128) == "cg1"
+            for cols in (7167, 7169):
+                with pytest.raises(ValueError, match="multiple of 256"):
+                    rule(512, n=cols)
         # The 128-wide program has no pair form, whatever the row count.
         assert rule(1024, block_n=128) == "cg1" and rule(2048, block_n=128) == "cg1"
     with pytest.raises(ValueError, match="sm_90a"):
@@ -1862,15 +1932,27 @@ def test_small_rows_use_the_sm_push_sequence_entry_on_the_callers_stream(monkeyp
         # SM push route beyond the base rule; three N256 waves keep the N256 main.
         (1024, 1280, 8, "sm_103a", "bfloat16", "k_major", "run_push", 256, 0),
         # Three N256 waves exceed the cap: the copy-engine route runs the N256 main;
-        # a call inside a measured pair region of its class on the architecture
+        # a call inside a measured pair rectangle of its class on the architecture
         # selects its CTA-pair twin (main_cg2 = 1): on sm_103a the ws2 bf16
         # n_major calls of 2048..5760 padded rows (N <= 2048) and the ws4 bf16
-        # k_major calls of 1024..1536 padded rows (N <= 6058).
+        # k_major calls of 1024..1536 padded rows (N <= 6058) (R2).
         (2048, 2048, 2, "sm_103a", "bfloat16", "n_major", "run", 256, 1),
         (4096, 2048, 2, "sm_103a", "bfloat16", "n_major", "run", 256, 1),
         (1024, 2560, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 1),
         (1025, 2560, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 1),
-        # Outside a region, another class, or sm_100a: the one-CTA N256 main.
+        # The R3 lever-alpha points: ws4 bf16 k_major at exactly 512
+        # padded rows and N = 14336, ws8 bf16 k_major at exactly 512 padded rows
+        # and N = 7168 (500 pads to 512; 513 pads to 640 and leaves); the M=2048
+        # gate_up rows (arm a2) are not routed.
+        (512, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 1),
+        (2048, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
+        (500, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 1),
+        (512, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, 1),
+        (2048, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
+        (513, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
+        (512, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        (512, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        # Outside every rectangle, another class, or sm_100a: the one-CTA N256 main.
         (8192, 2048, 2, "sm_103a", "bfloat16", "n_major", "run", 256, 0),
         (2048, 2560, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
         (1024, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
