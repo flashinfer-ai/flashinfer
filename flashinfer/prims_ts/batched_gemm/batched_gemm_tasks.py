@@ -1509,7 +1509,7 @@ def create_epilogue_task(
         epi_cols_per_call = cfg.epi_tile_n * epi_warpgroup_count
         epi_subtile_cnt = max(1, cfg.tile_n // max(1, epi_cols_per_call))
     else:
-        epi_t2r_repx = cfg.epi_tile_n // 4
+        epi_t2r_repx = cfg.non_swap_tmem_load_num_regs
         epi_subtile_cnt = max(1, cfg.tile_n // max(1, epi_t2r_repx))
     is_persistent = _is_persistent(cfg)
 
@@ -1534,17 +1534,30 @@ def create_epilogue_task(
             # then consume/store that preloaded fragment and the remaining D
             # tiles. The corresponding T2R index remap must be SSA-safe; see
             # the tmem_c_resources.py comment around t2r_output_call_idx.
-            t2r_rmem, t2r_rmem_1, t2r_output_call_idx = tmem.consumer_work(
-                subtile_idx=0
-            )
-            tmem.release()
-            gmem.store_epilogue(
-                t2r_rmem=t2r_rmem,
-                t2r_rmem_1=t2r_rmem_1,
-                t2r_output_call_idx=t2r_output_call_idx,
-                subtile_idx=0,
-            )
-            for subtile_idx in range(max(0, epi_subtile_cnt - 1)):
+            if cfg.is_swap_ab:
+                t2r_rmem, t2r_rmem_1, t2r_output_call_idx = tmem.consumer_work(
+                    subtile_idx=0
+                )
+                tmem.release()
+                gmem.store_epilogue(
+                    t2r_rmem=t2r_rmem,
+                    t2r_rmem_1=t2r_rmem_1,
+                    t2r_output_call_idx=t2r_output_call_idx,
+                    subtile_idx=0,
+                )
+                overlap_loads = 1
+            else:
+                t2r_rmem, t2r_rmem_1, t2r_output_call_idx = (
+                    tmem.preload_non_swap_overlap()
+                )
+                tmem.release()
+                gmem.store_non_swap_overlap(
+                    t2r_rmem=t2r_rmem,
+                    t2r_rmem_1=t2r_rmem_1,
+                    t2r_output_call_idx=t2r_output_call_idx,
+                )
+                overlap_loads = cfg.non_swap_tmem_overlap_loads
+            for subtile_idx in range(max(0, epi_subtile_cnt - overlap_loads)):
                 t2r_rmem, t2r_rmem_1, t2r_output_call_idx = tmem.load_overlap_subtile(
                     subtile_idx=subtile_idx
                 )
