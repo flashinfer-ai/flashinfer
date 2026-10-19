@@ -3143,6 +3143,10 @@ def _plan_nope(
     elif backward:
         token_chunks = _pass_token_chunks(record, num_queries, topk)
         ranges = key_pass_ranges(num_kv, passes)
+        # per chunk launch: the compaction reads ``num_tokens``; the main pass kernel's token count is
+        # ``num_queries`` -- the launch's tokens (CTA b takes tokens b, b + grid, ... below it), so it is the
+        # chunk's count, not the row's, and its scratch rows (dq_partial, key_scratch, pass_counts) are the
+        # launch-relative token index into the one-chunk scratch
         pass_overrides = tuple(
             tuple(
                 dict(
@@ -3151,6 +3155,7 @@ def _plan_nope(
                     dq_mode=key_pass_dq_mode(index, passes),
                     token_base=int(base),
                     num_tokens=int(num_tokens),
+                    num_queries=int(num_tokens),
                 )
                 for index, (lo, hi) in enumerate(ranges)
             )

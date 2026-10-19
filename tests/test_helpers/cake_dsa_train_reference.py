@@ -698,6 +698,91 @@ def make_nope_inputs(
     )
 
 
+_LOG2E = 1.4426950408889634
+
+
+def _out_emu_lazy_rescale(
+    s: torch.Tensor,
+    vg: torch.Tensor,
+    *,
+    tile: int = 64,
+    threshold: float = 6.0,
+    vote_group: int = 32,
+    mma_k: int = 16,
+) -> torch.Tensor:
+    """Emulated forward output at the kernel's own rounding points (an fp32 value returned
+    in fp64, before the final bf16 rounding; the caller rounds it to the BF16-P numerics
+    floor of ``out`` and splits it into the bf16 high + low parts the backward reads).
+
+    ``s`` ``[rows, 64, K]`` fp64 scaled scores (natural log units, ``-inf`` at invalid
+    slots), ``vg`` ``[rows, K, 512]`` fp64 gathered values.  The forward kernel walks the
+    index row in tiles of 64 consecutive slots, keeps a running row maximum ``mi`` (log2
+    units) that it raises only when a tile's maximum exceeds it by more than ``threshold``
+    (the lazy rescale; the vote is taken over ``vote_group`` consecutive heads of the
+    token, so a head whose own tile maximum is above ``mi`` by less than the threshold
+    still follows its group), rounds ``P = exp2(s * log2(e) - mi)`` to bf16 for the PV
+    MMA, accumulates the denominator from the unrounded P, rescales numerator and
+    denominator by ``exp2(mi_old - mi_new)`` at the rescale points and rounds the
+    normalised output to bf16 once.
+
+    The accumulation of ``O`` (bf16 P x bf16 V products, exact in fp32) and of the
+    denominator ``l`` is fp32 in slot order: fp32 partial sums per ``mma_k``-key MMA step
+    added to the fp32 accumulator, the rescale factors applied in fp32 per tile, and
+    ``out = O * (1 / l)`` in fp32 (a plain fp32 reciprocal stands for the kernel's
+    ``rcp.approx``, 2^-23 and below the modelled effect).  The fp32 accumulation is
+    modelled statistically -- the same magnitude class, not the tensor core's exact
+    summation order.  It matters only through ``delta`` on rows whose exact gradient is
+    ~0 (one dominant key): an fp32-level realisation error eps ~ 1e-6 on the forward
+    output flips ~eps * 2^16 ~ 6 % of the 16-bit hi + lo roundings, which widens the
+    delta-path residue RMS by ~1.3x (sqrt(0.083 + 0.065) / 0.29); an fp64 accumulation
+    under-estimates the per-row floor there by that factor.  ``ex2.approx`` (P, rescale
+    factors) is not modelled: two orders below bf16 rounding.
+    """
+    assert torch.get_float32_matmul_precision() == "highest", (
+        "the fp32 accumulation model needs exact fp32 matmul (no TF32)"
+    )
+    rows, heads, slots = s.shape
+    s2 = s * _LOG2E
+    pad = (-slots) % tile
+    if pad:
+        s2 = torch.nn.functional.pad(s2, (0, pad), value=float("-inf"))
+        vg = torch.nn.functional.pad(vg, (0, 0, 0, pad))
+    v32 = vg.float()  # bf16 values: exact in fp32
+    mi = torch.full((rows, heads), float("-inf"), dtype=s2.dtype, device=s2.device)
+    num = torch.zeros(rows, heads, vg.shape[-1], dtype=torch.float32, device=s2.device)
+    den = torch.zeros(rows, heads, dtype=torch.float32, device=s2.device)
+    groups = heads // vote_group
+    for t in range(0, s2.shape[-1], tile):
+        st = s2[..., t : t + tile]
+        cur = st.amax(-1)
+        # -inf - -inf is NaN: no vote from a still-empty row
+        pred = (cur - mi) > threshold
+        vote = (
+            pred.view(rows, groups, vote_group)
+            .any(-1, keepdim=True)
+            .expand(rows, groups, vote_group)
+            .reshape(rows, heads)
+        )
+        nxt = torch.where(vote, torch.maximum(cur, mi), mi)
+        factor = torch.where(vote, torch.exp2(mi - nxt), torch.ones_like(mi))
+        factor = torch.where(torch.isnan(factor), torch.ones_like(factor), factor)
+        f32 = factor.float()
+        num = num * f32[..., None]
+        den = den * f32
+        mi = nxt
+        p = torch.exp2(st - mi[..., None]).nan_to_num(0.0)
+        p_b = p.to(torch.bfloat16).float()
+        for k in range(0, tile, mma_k):
+            num = num + torch.einsum(
+                "thw,twd->thd",
+                p_b[..., k : k + mma_k],
+                v32[:, t + k : t + k + mma_k],
+            )
+        den = den + p.float().sum(-1)
+    out = (num * torch.reciprocal(den)[..., None]).nan_to_num(0.0)
+    return out.double()
+
+
 @torch.no_grad()
 def reference_fp64_nope(
     q: torch.Tensor,
@@ -710,9 +795,29 @@ def reference_fp64_nope(
     own_key: Optional[torch.Tensor] = None,
     chunk_rows: int = 256,
     consume: Optional[Callable[[int, int, dict], None]] = None,
+    out_emu_model: str = "lazy_rescale",
 ) -> dict:
     """Chunked FP64 reference of the NoPE problem from the BF16 inputs (the oracle of
     GOAL §5 for the zero-RoPE family; ``indices`` are global key rows).
+
+    ``out_emu_model``: ``"lazy_rescale"`` (default) places the bf16 rounding of P where
+    the forward kernel places it (running row maximum with the threshold-6 lazy rescale
+    over 64-slot tiles, see :func:`_out_emu_lazy_rescale`); ``"exact_max"`` rounds P
+    relative to the exact row maximum (the earlier, optimistic model).
+
+    The emulated gradients ``dq_emu`` / ``dkv_emu`` take the softmax row sum ``delta`` the
+    way the backward kernel reads it: ``dout . (hi + lo)`` of the emulated forward output
+    split into its bf16 high and bf16 low parts (the kernel's ``out`` and ``o_lo``), not
+    the exact ``dout . out``.  ``dS = P (dP - delta)`` cancels on rows where one key
+    carries most of the mass (two to four valid keys, a self key near 1), so the error of
+    that ``delta`` -- the forward's bf16-P rounding carried by ``hi + lo`` and the 2^-18
+    split residue -- is amplified by about ``1 / (1 - max P)`` there and dominates the
+    floor of ``dq`` on those rows; the exact-``delta`` gradients ``dq`` / ``dkv`` stay the
+    reference distance.  On that same amplified path the emulated gradients accumulate
+    ``dP_j = dout . v_j`` (512 dims, the kernel's fp32 MMA) and ``delta = dout . (hi + lo)``
+    (the fp32 dot product of the row-sum stage) in fp32, modelled statistically (torch's
+    fp32 reduction order, not the kernel's; ~2^-24 x sqrt(512) relative each); everything
+    else stays fp64.
 
     ``p = softmax_j(q . kv_j * softmax_scale)`` over the valid slots, ``out = p @ kv``.
     Returns ``out [T, 64, 512]``, natural-log ``lse [T, 64]`` (``-inf`` for fully masked
@@ -724,6 +829,9 @@ def reference_fp64_nope(
     per-query results as in :func:`reference_fp64` (``out``, ``lse``, ``out_emu``, ``dq``,
     ``dq_emu``).
     """
+    assert torch.get_float32_matmul_precision() == "highest", (
+        "the fp32 accumulation model needs exact fp32 matmul (no TF32)"
+    )
     device = q.device
     total_q, total_k = int(q.shape[0]), int(kv.shape[0])
     vf = kv.double()
@@ -762,21 +870,26 @@ def reference_fp64_nope(
         o = torch.einsum("thw,twd->thd", p, vg)
         if not stream:
             out[r0:r1], lse[r0:r1] = o, l
-        m = s.amax(dim=-1, keepdim=True)
-        m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
-        p_rel = torch.exp(s - m).nan_to_num(0.0)
-        num = torch.einsum("thw,twd->thd", p_rel.to(torch.bfloat16).double(), vg)
-        o_emu = (
-            (num / p_rel.sum(-1, keepdim=True))
-            .nan_to_num(0.0)
-            .to(torch.bfloat16)
-            .double()
-        )
+        if out_emu_model == "lazy_rescale":
+            o_emu_full = _out_emu_lazy_rescale(s, vg)
+        elif out_emu_model == "exact_max":
+            m = s.amax(dim=-1, keepdim=True)
+            m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
+            p_rel = torch.exp(s - m).nan_to_num(0.0)
+            num = torch.einsum("thw,twd->thd", p_rel.to(torch.bfloat16).double(), vg)
+            o_emu_full = (num / p_rel.sum(-1, keepdim=True)).nan_to_num(0.0)
+            del p_rel, num
+        else:
+            raise ValueError(f"unknown out_emu_model {out_emu_model!r}")
+        o_emu = o_emu_full.to(torch.bfloat16).double()
+        # the kernel's forward output as its backward reads it: bf16 high part plus bf16 low part
+        o_emu_hl = o_emu + (o_emu_full - o_emu).to(torch.bfloat16).double()
+        del o_emu_full
         if stream:
             chunk = dict(out=o, lse=l, out_emu=o_emu)
         else:
             out_emu[r0:r1] = o_emu
-        del p_rel, num, o_emu
+        del o_emu
         if own_key is not None:
             is_own = (ix == own_key[r0:r1, None]) & valid
             self_w += (p * is_own[:, None, :]).sum()
@@ -797,7 +910,18 @@ def reference_fp64_nope(
             dkv.index_add_(0, ix[valid], dkv_c[valid])
             del dkv_c
             p_b = p.to(torch.bfloat16).double()
-            ds_b = ds.to(torch.bfloat16).double()
+            # emulated dS: fp32 dP (dout . v over the 512 dims, the kernel's fp32 MMA) and fp32 delta (dout . (hi + lo)
+            # of the emulated output, the row-sum stage), both statistically modelled in torch's reduction order;
+            # P x (dP - delta) at bf16 for the MMA input
+            g32 = g.float()
+            dp32 = torch.einsum("thd,twd->thw", g32, vg.float())
+            delta32 = (g32 * o_emu_hl.float()).sum(-1, keepdim=True)
+            ds_b = (
+                (p * (dp32.double() - delta32.double()) * softmax_scale)
+                .to(torch.bfloat16)
+                .double()
+            )
+            del g32, dp32, delta32
             dq_emu_c = (
                 torch.einsum("thw,twd->thd", ds_b, vg).to(torch.bfloat16).double()
             )
@@ -815,6 +939,7 @@ def reference_fp64_nope(
                 )[valid],
             )
             del p_b, ds_b
+        del o_emu_hl
         if stream:
             consume(r0, r1, chunk)
             del chunk
