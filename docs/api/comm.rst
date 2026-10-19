@@ -70,6 +70,45 @@ configurations raise during preparation instead of falling back.
     all_gather_matmul
     prepare_all_gather_matmul
 
+Fused FP8 Row-wise GEMM + All-Reduce
+------------------------------------
+
+``fp8_rowwise_gemm_allreduce`` computes, for a four-rank NCCL process group on
+one SM100 node, ``Y = sum_r (A_r @ W_r.T) * (a_scale_r[:, None] * w_scale_r[None, :])``
+with the per-rank FP8 (e4m3) operands ``A_r`` of shape ``[M, K_l]`` and ``W_r``
+of shape ``[N, K_l]``, fp32 row and column scales applied before the cross-rank
+sum, and a bfloat16 result ``[M, N]`` on every rank. ``backend="cake"`` (the
+only backend; ``"auto"`` selects it) runs one fused kernel per call: the GEMM
+epilogue stores each owned tile's bf16 partial into this rank's output and
+publishes every other tile's partial into the chunk owner's symmetric receive
+slot, the owner sums the four partials in fixed rank order and broadcasts the
+result, so no separate all-reduce kernel or collective runs.
+Operands are contiguous CUDA tensors with ``N`` a positive multiple of 256,
+``K_l`` a positive multiple of 128, any positive ``M`` with ``M * N <= 2**30``,
+and the process's torch symmetric-memory backend being the default ``CUDA``
+backend or ``NVSHMEM`` (the Cake backend never selects one itself). The
+symmetric workspace of a group grows to the largest ``M`` seen; that growth is
+the only collective after the first call. Unsupported requests raise instead
+of silently falling back.
+
+``prepare_fp8_rowwise_gemm_allreduce`` binds the process group, ``N``, ``K_l``
+and a row capacity ``max_rows`` (default: the rows of the sample input) once,
+sizing the symmetric workspace in that single collective, and returns a
+callable ``launcher(a, a_scale, w, w_scale, *, out=None)`` that accepts any
+operands of the bound ``N`` and ``K_l`` with at most ``max_rows`` rows and
+never runs another collective. The launcher is CUDA-graph capturable: a
+captured call allocates nothing but its output and replays interleave with
+eager calls; a call that exceeds the capacity raises before any launch.
+``max_rows`` must be identical on every rank of the group: the preparation
+checks it in that collective and raises ``ValueError`` on every rank when the
+values differ.
+
+.. autosummary::
+    :toctree: ../generated
+
+    fp8_rowwise_gemm_allreduce
+    prepare_fp8_rowwise_gemm_allreduce
+
 TensorRT-LLM AllReduce
 ----------------------
 
@@ -559,8 +598,8 @@ Fused QKV Projection + Norm + RoPE + Head Exchange
 sequence-parallel (Ulysses) layer into one prepared session: the BF16 QKV
 projection, per-head RMSNorm of Q and K (one ``[D]`` scale each), interleaved
 RoPE from a per-token ``[rows, D]`` cos/sin table, and the head exchange.  The
-Cake backend (``backend="nvlink"``; SM90, SM100 and SM103, single-node NVLink
-groups of 2, 4 or 8 ranks, ``head_dim=128``, BF16) stores every destination's
+Cake backend (``backend="nvlink"``; SM90, SM100, SM103 and SM107, single-node NVLink
+groups of 2, 4 or 8 ranks (2 or 4 on SM107), ``head_dim=128``, BF16) stores every destination's
 head band straight from the GEMM epilogue into that rank's symmetric receive
 slot and publishes per-chunk readiness words, so the exchange overlaps the
 projection instead of following it; a one-CTA wait kernel on a consumer stream
@@ -587,7 +626,7 @@ The producer build is selected per architecture and world size
 of the JIT loader): on SM100 a group of 8 ranks runs the build with wide
 operand loads and bulk row stores (``bulk_ow256``), a group of 4 ranks the
 build with wide operand loads (``ow256``); on SM103 groups of 8 and 4 ranks run
-``ow256``; groups of 2 ranks and SM90 run the baseline build.  Every build
+``ow256``; groups of 2 ranks, SM90 and SM107 run the baseline build.  Every build
 stores identical bits; the wide-load builds require 32-byte-aligned ``cos_sin``
 and norm-weight tensors (a misaligned view raises and names the opt-out).  The
 environment variable ``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT`` (``auto`` /
@@ -599,16 +638,17 @@ delivered ones.  The host plan's group scaling follows the same keying
 groups of 4 and 2 ranks and on SM103 every group size double the token-tile
 group of a grouped row whose hidden size is at least 6144 (the tile order
 changes, every destination element is still written once); SM100 groups of 8
-ranks and SM90 keep the baseline plan.  ``FLASHINFER_QKV_EXCHANGE_GROUP_M_SCALE``
+ranks, SM90 and SM107 keep the baseline plan.  ``FLASHINFER_QKV_EXCHANGE_GROUP_M_SCALE``
 (``auto`` / ``1`` / ``2`` / ``4``) overrides it per session, rank-uniformly.
 
 Per-architecture row-count gates shape each call's host plan: on SM100 and
 SM103 a call with at most 4096 rows per rank publishes one readiness word per
 destination, and a call with at least 16384 rows per rank launches the producer
 once per destination run of its tile table (the first launch carrying the
-folded rendezvous); on SM90 a call with at least 16384 rows per rank runs the
-persistent producer grid over every SM (no reserved SMs) and the other two gates
-are off.  The environment variable ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES``
+folded rendezvous); on SM90 a call with at most 4096 rows per rank publishes one
+readiness word per destination, a call with at least 16384 rows per rank runs the
+persistent producer grid over every SM (no reserved SMs), and the per-destination
+launch gate is off; on SM107 every gate is off.  The environment variable ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES``
 (``auto`` / ``off`` /
 ``words_capacity_small_m=N,reserved_sms_large_m=N,per_dest_large_m=N``)
 overrides them per session, rank-uniformly; ``describe()`` reports the resolved

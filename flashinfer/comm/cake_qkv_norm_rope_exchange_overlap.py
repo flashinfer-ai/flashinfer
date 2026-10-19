@@ -16,7 +16,7 @@ limitations under the License.
 Cake backend of :class:`flashinfer.comm.QkvNormRopeExchangeOverlap`: the fused
 QKV projection + per-head RMSNorm + RoPE producer that stores every head band
 straight into the destination rank's symmetric receive slot (SM90 WGMMA, SM100
-/ SM103 tcgen05), the one-CTA readiness wait kernel and the two-phase NVLink
+/ SM103 / SM107 tcgen05), the one-CTA readiness wait kernel and the two-phase NVLink
 barrier -- as a separate kernel, or folded into the producer as a rendezvous
 warp (one extra warp per CTA on SM100 / SM103, the otherwise idle TMA warp on
 SM90) that runs the rendezvous and releases the stores -- driven from Python
@@ -24,10 +24,9 @@ one launcher call per stage.
 
 Launch path (``fold_barrier``; the keyword, else ``FLASHINFER_QKV_EXCHANGE_FOLD_BARRIER``
 = ``0`` / ``1`` / ``auto``, else the architecture default
-``loader.FOLD_BARRIER_DEFAULT_BY_ARCH``: folded on SM90, SM100 and SM103; the
-folded producers are delivered on every architecture, and ``True`` fails closed
-only on a route table without them).  Both paths compute and store identical
-bits.  Per call (current stream = producer stream):
+``loader.FOLD_BARRIER_DEFAULT_BY_ARCH``: folded on SM90, SM100, SM103 and SM107;
+``True`` fails closed on a route table without folded producers).  Both paths
+compute and store identical bits.  Per call (current stream = producer stream):
 
 1. wait for the slot's previous exchange (``exchange_done[slot]``; eager only),
 2. folded (two launches): record the fork event, then the producer build of
@@ -431,9 +430,10 @@ class CakeQkvExchangeSession:
             raise RuntimeError(
                 f"process group reports rank {self.rank} outside [0, {self.world_size})"
             )
-        if self.world_size not in loader.SUPPORTED_WORLD_SIZES:
+        supported = loader.supported_world_sizes(arch)
+        if self.world_size not in supported:
             raise ValueError(
-                f"world size must be one of {loader.SUPPORTED_WORLD_SIZES}, got {self.world_size}"
+                f"world size must be one of {supported} on {arch}, got {self.world_size}"
             )
         self.fold_barrier, self.fold_barrier_source = resolve_fold_barrier(
             arch, fold_barrier

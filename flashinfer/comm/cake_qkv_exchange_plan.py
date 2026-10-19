@@ -89,7 +89,7 @@ GROUP_A_SLICE_BYTES_MAX = 16 << 20
 PAIR_BN = 256
 PAIR_MIN_M = 4096
 PAIR_MIN_GROUPS = 4
-PAIR_ARCHES: tuple[str, ...] = ("sm_100a", "sm_103a")
+PAIR_ARCHES: tuple[str, ...] = ("sm_100a", "sm_103a", "sm_107a")
 # Group sizes the fused exchange is delivered for; every per-(architecture, world size) table below has exactly
 # these keys per architecture.
 SUPPORTED_WORLD_SIZES: tuple[int, ...] = (2, 4, 8)
@@ -97,7 +97,7 @@ SUPPORTED_WORLD_SIZES: tuple[int, ...] = (2, 4, 8)
 # GROUP_M_SCALE_MIN_K`` (and raises the activation-slice budget by the same factor); every other row keeps the
 # baseline plan.  ``GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD`` is the shipped scale per architecture and world size
 # (1 = the baseline plan): measured per (architecture, world size) -- SM100 groups of 4 and 2 ranks and SM103
-# every group size double the group, SM100 groups of 8 ranks and SM90 keep the baseline plan.  The scale changes
+# every group size double the group, SM100 groups of 8 ranks, SM90 and SM107 keep the baseline plan.  The scale changes
 # the tile ORDER only (every destination element is still written exactly once; the readiness words are
 # unchanged); ``FLASHINFER_QKV_EXCHANGE_GROUP_M_SCALE`` (see the Cake backend) overrides a session's scale.
 GROUP_M_SCALES: tuple[int, ...] = (1, 2, 4)
@@ -106,6 +106,9 @@ GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD: dict[str, dict[int, int]] = {
     "sm_90a": {2: 1, 4: 1, 8: 1},
     "sm_100a": {2: 2, 4: 2, 8: 1},
     "sm_103a": {2: 2, 4: 2, 8: 2},
+    # SM107 keeps the baseline plan on every group size (the scale was not measured there); the 8-rank entry
+    # exists because every row covers SUPPORTED_WORLD_SIZES -- SM107 sessions admit 2 or 4 ranks only.
+    "sm_107a": {2: 1, 4: 1, 8: 1},
 }
 LAYOUTS: tuple[str, ...] = ("bshd", "fused")
 # SMs the persistent producer grid leaves free: one for the wait kernel, one
@@ -124,7 +127,8 @@ RESERVED_SMS = 2
 # instead of one persistent grid.  ``0`` = the gate never fires.  Every gate is
 # inclusive at its threshold and changes neither the tile table nor the stored
 # bits.  Measured per architecture: SM100 / SM103 ship the small-row word gate
-# and the per-destination launch gate, SM90 ships the large-row reserved-SM gate;
+# and the per-destination launch gate, SM90 ships the small-row word gate and the
+# large-row reserved-SM gate, SM107 ships none;
 # ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` (see the Cake backend) overrides a
 # session's gates in either direction.
 SHAPE_GATE_NAMES: tuple[str, ...] = (
@@ -134,8 +138,10 @@ SHAPE_GATE_NAMES: tuple[str, ...] = (
 )
 SHAPE_GATE_OFF = 0
 SHAPE_GATE_DEFAULT_BY_ARCH: dict[str, dict[str, int]] = {
+    # SM90: the small-row word gate (4096) and the large-row reserved-SM gate (16384) on every group size; the
+    # per-destination launch gate off.
     "sm_90a": {
-        "words_capacity_small_m": SHAPE_GATE_OFF,
+        "words_capacity_small_m": 4096,
         "reserved_sms_large_m": 16384,
         "per_dest_large_m": SHAPE_GATE_OFF,
     },
@@ -148,6 +154,12 @@ SHAPE_GATE_DEFAULT_BY_ARCH: dict[str, dict[str, int]] = {
         "words_capacity_small_m": 4096,
         "reserved_sms_large_m": SHAPE_GATE_OFF,
         "per_dest_large_m": 16384,
+    },
+    # SM107: no gate ships (none was measured there); every call takes the ungated host plan.
+    "sm_107a": {
+        "words_capacity_small_m": SHAPE_GATE_OFF,
+        "reserved_sms_large_m": SHAPE_GATE_OFF,
+        "per_dest_large_m": SHAPE_GATE_OFF,
     },
 }
 
