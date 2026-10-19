@@ -799,9 +799,10 @@ def _launch(
                 dtype_name=call.dtype_name,
                 b_layout=call.b_layout,
             )
-            # Form of the main program for this call ("cg1", or "cg2" when the
-            # loader's table routes this class and shape to the CTA-pair twin,
-            # launched as clusters of two CTAs on an even grid).
+            # Form of the main program for this call ("cg1", "cg2", or a spill-wave
+            # N-split pair form when the loader's point table names this class and
+            # shape); every pair form launches clusters of two CTAs on an even
+            # grid, and the host sequence takes the form as a positional code.
             form = loader.main_form(
                 rows,
                 call.n,
@@ -811,7 +812,7 @@ def _launch(
                 b_layout=call.b_layout,
                 block_n=block_n,
             )
-            main_cg2 = 1 if form == "cg2" else 0
+            form_code = loader.main_form_code(form)
             grid_x, grid_y, grid_z = loader.main_grid(
                 rows,
                 call.n,
@@ -843,7 +844,7 @@ def _launch(
                     grid_y,
                     grid_z,
                     block_n,
-                    main_cg2,
+                    form_code,
                     main_handle,
                     workspace.comm_handle,
                 )
@@ -873,7 +874,7 @@ def _launch(
                     grid_y,
                     grid_z,
                     block_n,
-                    main_cg2,
+                    form_code,
                     main_handle,
                     workspace.comm_handle,
                 )
