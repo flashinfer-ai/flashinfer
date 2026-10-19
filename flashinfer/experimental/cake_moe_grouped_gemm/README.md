@@ -115,22 +115,30 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
 
 ## Build targets and layout
 
-The programs are exact-architecture tcgen05 payloads compiled with
-FlashInfer's exact flag sets for `sm_100a`, `sm_103a` and `sm_107a`. Each
+The programs are exact-architecture tcgen05 payloads built for the exact
+targets `sm_100a`, `sm_103a` and `sm_107a` (`build.json` `arch_flags`). Each
 physical program (`fwd`, `dgrad`, the weight-gradient main kernel for bf16 and
 fp32 outputs with a 256- or 512-wide k tile, and the weight-gradient
 tail-reduce for bf16 and fp32 outputs) has one kernel and one host-binding
 translation unit under `csrc/cake_moe_grouped_gemm/`, shared by the three
 architectures: the single architecture-dependent line is folded under
 `__CUDA_ARCH__`, and the tail-reduce k tile is a compile-line specialization
-(`-DWGRAD_TILE=256|512`). `cake_jit.PROGRAMS` lists each program once
-(sources, compile flags, FFI entry, argument plan, launch geometry and its
-per-architecture closure identity); `cake_jit.ROUTES` maps each public route
-(operation, output dtype, k tile) to its stage programs and specializations.
-The JIT cache name carries the exact target and the closure identity. Which
-targets can be built follows `FLASHINFER_CUDA_ARCH_LIST` (or the visible
-devices) through `flashinfer.compilation_context`; the loader never probes
-`nvcc` or the device. The 512-wide weight-gradient tile is registered for
+(`-DWGRAD_TILE=256|512`). `cake_jit.PROGRAMS` lists each program once (its
+architecture-free `library` stem, FFI entry, argument plan and launch
+geometry); `cake_jit.ROUTES` maps each public route (operation, output dtype,
+k tile) to its stage programs and specializations. `build.json` (schema
+`cake-build/1`, written by the export) is the only record of what to compile:
+one entry per build `<library>[<specialization tag>]_<arch>` -- the tag is
+`_wgrad_tile256` / `_wgrad_tile512` for the specialized tail-reduce builds,
+empty otherwise -- with its translation units, digests, nvcc flags (the
+`-D` defines included), per-architecture closure digest and `aot/<name>.so`
+path. `cake_jit.load_module(program, arch, specializations)` loads that entry
+through the shared `cake_build.py` loader: the prebuilt library when `aot/`
+holds it, else FlashInfer's JIT build (the cache name carries the exact target
+and the closure digest; FlashInfer's build-target rules --
+`FLASHINFER_CUDA_ARCH_LIST` or the visible devices -- apply to that path
+only). The bindings include the package's `csrc/cake_ffi_checks.h`, no
+FlashInfer header. The 512-wide weight-gradient tile is registered for
 `sm_100a` and `sm_103a`.
 
 Measured on B200 (`sm_100a`), GB300 (`sm_103a`) and R200 (`sm_107a`); the
@@ -139,7 +147,7 @@ performance summary is in the delivery pull requests.
 ## Tests and benchmark
 
 ```bash
-pytest tests/experimental/test_cake_moe_grouped_gemm.py
+pytest tests/experimental/test_cake_moe_grouped_gemm.py tests/experimental/test_cake_moe_grouped_gemm_api.py
 python benchmarks/bench_cake_moe_grouped_gemm.py --help
 ```
 

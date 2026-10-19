@@ -1,6 +1,22 @@
 import contextlib
 
 from .cuda_ipc import CudaRTLibrary, create_shared_buffer, free_shared_buffer
+from .cake_fp4_allreduce import (
+    CakeFp4AllReduceFusedNormOutput as CakeFp4AllReduceFusedNormOutput,
+)
+from .cake_fp4_allreduce import (
+    CakeFp4AllReduceFusedNormResult as CakeFp4AllReduceFusedNormResult,
+)
+from .cake_fp4_allreduce import (
+    CakeFp4AllReduceFusedNormSpec as CakeFp4AllReduceFusedNormSpec,
+)
+from .cake_fp4_allreduce import CakeFp4AllReduceWorkspace as CakeFp4AllReduceWorkspace
+from .cake_fp4_allreduce import cake_fp4_allreduce as cake_fp4_allreduce
+from .cake_fp4_allreduce import cake_fp4_allreduce_nvfp4 as cake_fp4_allreduce_nvfp4
+from .cake_fp4_allreduce import cake_fp4_allreduce_rmsnorm as cake_fp4_allreduce_rmsnorm
+from .cake_fp4_allreduce import (
+    cake_fp4_allreduce_rmsnorm_nvfp4 as cake_fp4_allreduce_rmsnorm_nvfp4,
+)
 from .dlpack_utils import pack_strided_memory
 from .mapping import Mapping
 from .trtllm_ar import AllReduceFusionOp as AllReduceFusionOp
@@ -128,7 +144,6 @@ with contextlib.suppress(ImportError, AttributeError):
     )
 
 # MNNVL A2A (Throughput Backend)
-from .trtllm_moe_alltoall import MoeAlltoAll as MoeAlltoAll
 from .trtllm_moe_alltoall import moe_a2a_active_rank_mask as moe_a2a_active_rank_mask
 from .trtllm_moe_alltoall import moe_a2a_combine as moe_a2a_combine
 from .trtllm_moe_alltoall import moe_a2a_dispatch as moe_a2a_dispatch
@@ -157,8 +172,6 @@ from .dcp_lse_reduce import (
 from .dcp_lse_reduce import (
     decode_cp_a2a_lse_reduce_workspace_size as decode_cp_a2a_lse_reduce_workspace_size,
 )
-
-# from .mnnvl import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
 
 from .all_gather_matmul import all_gather_matmul as all_gather_matmul
 from .all_gather_matmul import (

@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import ast
+import dataclasses
 import re
 from collections import OrderedDict
 from pathlib import Path
@@ -23,58 +24,62 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from flashinfer.experimental.dense_projection_gemm import cake_backend, cake_jit
-from flashinfer.experimental.dense_projection_gemm.cake_backend import (
-    ARCH_RULE_DEFAULTS,
-    BLOCK_K,
-    BLOCK_N_CHOICES,
-    CONVENIENCE_CACHE_SIZE,
-    CTA_GROUP,
-    CTA_ROWS_CHOICES,
-    EPI_WARPS,
-    ROUTER_SPLITS,
-    ROW_RULES,
-    SK_DUMMY_BASE,
-    SK_MIN_ITERS,
-    SMEM_OPT_IN,
-    SUPPORTED_COMPUTE_CAPABILITIES,
-    arch_for,
-    bind_launch,
-    convenience_key,
-    default_block_n,
-    default_group_m,
-    default_hints,
-    default_hints_cgrp,
-    b_stage_bytes,
-    box_rows_of,
-    default_stages,
-    device_l2_bytes,
-    epi_cols,
-    epi_mode,
-    epi_slots,
-    generated_program_available,
-    instance_key,
-    instance_symbol,
-    sk_exact_plan,
-    sk_sync_plan,
-    operand_view,
-    plan_dense_projection_gemm,
-    plan_router_fp32_gemm,
-    prepare_dense_projection_gemm,
-    prepare_projection_wgrad,
-    prepare_router_fp32_gemm,
-    router_layout_class,
-    row_rule,
-    sk_parts_plan,
-    smem_limit_for,
-    split_fp32_to_bf16x3_,
-    stream_k_plan,
-    swap_small_m,
-    wave_working_set,
-    wave_working_set_cgrp,
-    wgrad_swapped,
-    wgrad_views,
-)
+from tests.test_helpers.cake_package import cake_package
+
+# Backend suite: the package is named once, through ``cake_package``; nothing else
+# of flashinfer is imported here.
+cake_backend = cake_package("dense_projection_gemm", "cake_backend")
+cake_build = cake_package("dense_projection_gemm", "cake_build")
+cake_jit = cake_package("dense_projection_gemm", "cake_jit")
+ARCH_RULE_DEFAULTS = cake_backend.ARCH_RULE_DEFAULTS
+BLOCK_K = cake_backend.BLOCK_K
+BLOCK_N_CHOICES = cake_backend.BLOCK_N_CHOICES
+CONVENIENCE_CACHE_SIZE = cake_backend.CONVENIENCE_CACHE_SIZE
+CTA_GROUP = cake_backend.CTA_GROUP
+CTA_ROWS_CHOICES = cake_backend.CTA_ROWS_CHOICES
+EPI_WARPS = cake_backend.EPI_WARPS
+ROUTER_SPLITS = cake_backend.ROUTER_SPLITS
+ROW_RULES = cake_backend.ROW_RULES
+SK_DUMMY_BASE = cake_backend.SK_DUMMY_BASE
+SK_MIN_ITERS = cake_backend.SK_MIN_ITERS
+SMEM_OPT_IN = cake_backend.SMEM_OPT_IN
+arch_for = cake_backend.arch_for
+bind_launch = cake_backend.bind_launch
+convenience_key = cake_backend.convenience_key
+default_block_n = cake_backend.default_block_n
+default_group_m = cake_backend.default_group_m
+default_hints = cake_backend.default_hints
+default_hints_cgrp = cake_backend.default_hints_cgrp
+b_stage_bytes = cake_backend.b_stage_bytes
+box_rows_of = cake_backend.box_rows_of
+default_stages = cake_backend.default_stages
+device_l2_bytes = cake_backend.device_l2_bytes
+epi_cols = cake_backend.epi_cols
+epi_mode = cake_backend.epi_mode
+epi_slots = cake_backend.epi_slots
+generated_program_available = cake_backend.generated_program_available
+instance_key = cake_backend.instance_key
+instance_symbol = cake_backend.instance_symbol
+sk_exact_plan = cake_backend.sk_exact_plan
+sk_sync_plan = cake_backend.sk_sync_plan
+check_stream_k_plan = cake_backend.check_stream_k_plan
+operand_view = cake_backend.operand_view
+plan_dense_projection_gemm = cake_backend.plan_dense_projection_gemm
+plan_router_fp32_gemm = cake_backend.plan_router_fp32_gemm
+prepare_dense_projection_gemm = cake_backend.prepare_dense_projection_gemm
+prepare_projection_wgrad = cake_backend.prepare_projection_wgrad
+prepare_router_fp32_gemm = cake_backend.prepare_router_fp32_gemm
+router_layout_class = cake_backend.router_layout_class
+row_rule = cake_backend.row_rule
+sk_parts_plan = cake_backend.sk_parts_plan
+smem_limit_for = cake_backend.smem_limit_for
+split_fp32_to_bf16x3_ = cake_backend.split_fp32_to_bf16x3_
+stream_k_plan = cake_backend.stream_k_plan
+swap_small_m = cake_backend.swap_small_m
+wave_working_set = cake_backend.wave_working_set
+wave_working_set_cgrp = cake_backend.wave_working_set_cgrp
+wgrad_swapped = cake_backend.wgrad_swapped
+wgrad_views = cake_backend.wgrad_views
 
 # Accuracy gates against the FP64 reference of the exact BF16 operands.
 # BF16 output: elementwise |out - ref| <= atol + rtol * |ref|, zero violations.
@@ -691,14 +696,19 @@ def _assert_mirrors_cake(plan, cake_template, where, arch):
 
 
 def _device_supported() -> bool:
-    return torch.cuda.is_available() and (
-        torch.cuda.get_device_capability(0) in SUPPORTED_COMPUTE_CAPABILITIES
+    """A device this checkout registers generated programs for (``build.json`` ships
+    ``sm_100a`` and ``sm_107a`` builds: compute capability 10.0 or 10.7; see README)."""
+    return torch.cuda.is_available() and generated_program_available(
+        torch.device("cuda")
     )
 
 
 def _require_program(template: str):
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     if not generated_program_available(torch.device("cuda"), template):
         pytest.skip(f"generated instance {template!r} not registered for this device")
 
@@ -708,7 +718,10 @@ def _registered_knobs(v, *candidates):
     The per-arch export only ships the instances its measured rules route to, so a test that pins a tile
     family takes whichever family's instance this device has; skips when none is registered."""
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     templates = [_plan_template(v, **knobs) for knobs in candidates]
     for knobs, template in zip(candidates, templates, strict=True):
         if generated_program_available(torch.device("cuda"), template):
@@ -756,24 +769,35 @@ def test_registry_records_are_well_formed():
     assert {record["arg_plan"] for record in cake_jit.MODULES.values()} == set(
         cake_jit.ARG_PLANS
     )
+    # build.json (``cake_build``) is the only record of what to compile; the registry names its
+    # entries ``<library>_<arch>``
+    manifest = cake_build.manifest()
+    libraries = {entry["name"]: entry for entry in manifest["libraries"]}
+    assert len(libraries) == len(manifest["libraries"])  # names unique
+    assert set(cake_jit.KERNELS) == set(cake_jit.ARCHES) == set(manifest["arch_flags"])
     for arch, table in cake_jit.KERNELS.items():
-        assert arch in cake_jit.ARCH_NVCC_FLAGS
         for template, name in table.items():
             record = cake_jit.MODULES[name]
             assert arch in record["arches"] and record["template"] == template
             assert cake_jit.select_module(arch, template) == name
     for name, record in cake_jit.MODULES.items():
-        # architecture-neutral programs: one source pair, registered for every arch it serves
+        # architecture-neutral programs: one source pair, built for every arch it serves
         assert record["arches"] and record["arches"] == sorted(record["arches"])
+        assert record["library"] == name
         for arch in record["arches"]:
-            assert arch in cake_jit.ARCH_NVCC_FLAGS
+            assert arch in cake_jit.ARCHES
             assert cake_jit.KERNELS[arch][record["template"]] == name
-        assert len(record["sources"]) == 2
-        assert all(
-            s.startswith("cake_dense_projection_gemm/") and "/sm_" not in s
-            for s in record["sources"]
-        )
-        assert len(record["closure_sha256"]) == 64
+            entry = libraries[cake_jit.library_name(name, arch)]
+            assert entry["arch"] == arch and entry["entry"] == record["ffi_entry"]
+            assert len(entry["sources"]) == 2
+            assert all(
+                s.startswith("csrc/cake_dense_projection_gemm/") and "/sm_" not in s
+                for s in entry["sources"]
+            )
+            assert all(
+                (Path(cake_jit.__file__).parent / s).is_file() for s in entry["sources"]
+            )
+            assert len(entry["closure_sha256"]) == 64
         assert (
             "tma_workspace_bytes" not in record
         )  # by-value TMA ABI: no descriptor workspace
@@ -803,6 +827,12 @@ def test_registry_records_are_well_formed():
         assert int(launch["block"][0]) % 32 == 0  # whole warps
     with pytest.raises(NotImplementedError, match="not registered"):
         cake_jit.select_module("sm_100a", "dense_proj_gemm_not_a_template")
+    # every manifest entry belongs to a registered (program, arch) pair
+    assert set(libraries) == {
+        cake_jit.library_name(name, arch)
+        for name, record in cake_jit.MODULES.items()
+        for arch in record["arches"]
+    }
 
 
 def test_registry_literals_follow_the_export_contract():
@@ -3777,9 +3807,9 @@ def test_instance_key_rejects_bad_configurations():
 
 @pytest.mark.parametrize("pairs", [74, 106])  # 148 SMs (B200) / 212 SMs (R200)
 def test_stream_k_plan_rules(pairs):
-    # --- sk="auto" (the launcher default): a K-aligned two-way split of a single partial wave ---
-    # every tile has exactly two parts (unit u = tile u // 2, K half u % 2), so tiles that share an A / B
-    # panel stay K-synchronised and the fixup reads one slab
+    # --- sk="auto" (the launcher default): a two-way split of a single partial wave ---
+    # on an even K every tile has exactly two parts (unit u = tile u // 2, K half u % 2), so tiles that share an
+    # A / B panel stay K-synchronised and the fixup reads one slab
     assert stream_k_plan(24, 96, pairs, sk="auto") == (0, 24, 48, 48)
     assert stream_k_plan(pairs // 2, 96, pairs, sk="auto") == (
         0,
@@ -3787,12 +3817,12 @@ def test_stream_k_plan_rules(pairs):
         2 * (pairs // 2),
         48,
     )
-    assert stream_k_plan(10, 17, pairs, sk="auto") == (
-        0,
-        10,
-        20,
-        9,
-    )  # odd K steps: ceil(k / 2)
+    # odd K steps: units of ceil(k / 2) over the linearised 10 x 17 steps; 2 x 10 units would leave the last one
+    # starting at step 19 x 9 = 171 of 170, so the plan has the 19 that hold a K step
+    assert stream_k_plan(10, 17, pairs, sk="auto") == (0, 10, 19, 9)
+    assert stream_k_plan(16, 17, pairs, sk="auto") == (0, 16, 31, 9)
+    # 15 x 9 < 8 x 17: still two units per tile
+    assert stream_k_plan(8, 17, pairs, sk="auto") == (0, 8, 16, 9)
     assert stream_k_plan(10, 2 * SK_MIN_ITERS, pairs, sk="auto") == (
         0,
         10,
@@ -3857,6 +3887,50 @@ def test_stream_k_plan_rules(pairs):
     # --- sk="tiles": the diagnostic whole-tile unit path ---
     assert stream_k_plan(pairs + 10, 256, pairs, sk="tiles") == (pairs, 10, 10, 256)
     assert stream_k_plan(0, 96, pairs, sk=True) == (0, 0, 0, 96)
+
+
+@pytest.mark.parametrize("pairs", [74, 76, 106])  # 148 / 152 / 212 SMs
+def test_stream_k_plans_give_every_unit_a_k_step(pairs):
+    # a unit without a K step never finishes in the pd 2 / sk_slab 2 / stt programs (the work handoff runs in an
+    # item's last segment): every linearised policy plans the units that hold one, and nothing more
+    for tiles in range(1, 2 * pairs + 3):
+        for k_blocks in range(1, 80):
+            for sk in ("auto", True):
+                num_full, tail, units, ipu = stream_k_plan(tiles, k_blocks, pairs, sk)
+                if units:
+                    assert (
+                        ipu >= 1 and (units - 1) * ipu < tail * k_blocks <= units * ipu
+                    )
+
+
+def test_check_stream_k_plan_refuses_a_plan_outside_the_launch_contract():
+    # the dgrad of T = 1024, N = 1032, K = 1000 on 76 CTA pairs: 16 tail tiles of 17 K steps, one partial wave
+    E = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16)  # noqa: E731
+    kw = dict(sm_count=152, l2_bytes=L2_BYTES, _fallback=False)
+    plan, *_ = plan_dense_projection_gemm(
+        E(1024, 1032), E(1032, 1000), E(1024, 1000), pd=2, slots=2, epi="tma", **kw
+    )
+    assert plan.pd == 2 and (plan.tail_tiles, plan.k_blocks) == (16, 17)
+    assert (plan.sk_units, plan.iters_per_unit, plan.sk_iters) == (31, 9, 272)
+    check_stream_k_plan(plan)
+    # the 2 x tail units of the earlier plan: unit 31 starts at K step 279 of 272
+    with pytest.raises(ValueError, match="every stream-K unit to hold a K step"):
+        check_stream_k_plan(dataclasses.replace(plan, sk_units=32))
+    with pytest.raises(ValueError, match="every stream-K unit to hold a K step"):
+        check_stream_k_plan(dataclasses.replace(plan, iters_per_unit=0))
+    # the same empty unit is legal on a program that hands off at the bottom of the item loop
+    check_stream_k_plan(dataclasses.replace(plan, pd=0, sk_units=32))
+    # synchronised plans: a collector for every program, at most one per tail tile for the sk_slab 2 / stt ones
+    sync = dataclasses.replace(
+        plan, pd=0, sk_sync=True, sk_slab=2, sk_units=32, iters_per_unit=9
+    )
+    check_stream_k_plan(sync)
+    with pytest.raises(ValueError, match="collectors <= tail_tiles"):
+        check_stream_k_plan(dataclasses.replace(sync, sk_units=33))
+    check_stream_k_plan(dataclasses.replace(sync, sk_slab=0, sk_units=33))
+    for slab in (0, 2):
+        with pytest.raises(ValueError, match="1 <= collectors"):
+            check_stream_k_plan(dataclasses.replace(sync, sk_slab=slab, sk_units=16))
 
 
 def test_planner_defaults_to_auto_stream_k_and_guards_the_slice_counters():
@@ -4289,12 +4363,13 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                         and 2 * plan.tail_tiles <= plan.sm_pairs
                     )
                     assert plan.k_blocks >= 2 * SK_MIN_ITERS
+                    # the units of ceil(k_blocks / 2) K steps that hold one: 2 x tail on an even k_blocks
+                    assert plan.iters_per_unit == -(-plan.k_blocks // 2)
                     assert (plan.num_full, plan.tail_tiles, plan.sk_units) == (
                         0,
                         plan.pair_tiles,
-                        2 * plan.pair_tiles,
+                        -(-(plan.pair_tiles * plan.k_blocks) // plan.iters_per_unit),
                     )
-                    assert plan.iters_per_unit == -(-plan.k_blocks // 2)
                 if plan.sk_units and not htail and sync_plan is None:
                     assert (
                         plan.ws_f32_elems
@@ -4903,9 +4978,7 @@ def test_bind_launch_fails_closed_and_checks_the_cluster(monkeypatch):
         "arches": ["sm_100a"],
         "template": "dense_proj_gemm_kk_n256",
         "kernel": "kernel_fake",
-        "cache_name": "fake",
-        "sources": [],
-        "compile_flags": [],
+        "library": "cake_dense_projection_gemm_fake",
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -4914,7 +4987,6 @@ def test_bind_launch_fails_closed_and_checks_the_cluster(monkeypatch):
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "0" * 64,
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
     }
     monkeypatch.setitem(cake_jit.MODULES, "cake_dense_projection_gemm_fake", record)
@@ -5249,7 +5321,10 @@ def _plan_template(v, **knobs):
 @pytest.mark.parametrize("row, op, out_dtype, T", GPU_ROWS)
 def test_projection_rows_match_fp64_reference(row, op, out_dtype, T):
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     v = _make_inputs("proj", row, op, out_dtype, T, seed=SEED)
     _require_program(_plan_template(v))
     if op == "wgrad":
@@ -5268,7 +5343,10 @@ def test_projection_rows_match_fp64_reference(row, op, out_dtype, T):
 @pytest.mark.parametrize("op", ["fwd", "dgrad", "wgrad"])
 def test_mla_batched_rows_match_fp64_reference(row, op):
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     v = _make_inputs("mla", row, op, "bf16", 257, seed=SEED + 1)
     _require_program(_plan_template(v))
     prepared = prepare_dense_projection_gemm(v["A"], v["B"], v["out"])
@@ -5281,7 +5359,10 @@ def test_mla_batched_rows_match_fp64_reference(row, op):
 
 def test_strided_views_and_storage_offsets_match_fp64_reference():
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     device = torch.device("cuda")
     g = torch.Generator(device=device).manual_seed(SEED + 2)
     T, K, N = 301, 704, 264
@@ -5337,7 +5418,10 @@ def test_strided_views_and_storage_offsets_match_fp64_reference():
 
 def test_prepared_gemm_launches_without_allocation_and_is_deterministic():
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     # a swapped weight gradient on a half-width synthetic row (N = 32, K = 3072, T = 1001): stream-K "auto"
     # two-part split of a single partial wave with the deterministic in-kernel fixup.  The round-9 rules route
     # the GLM small-N weight gradients to whole tiles on sm_100a (64-row family: 48 tiles, which 74 pairs cannot
@@ -5378,7 +5462,10 @@ def test_prepared_gemm_launches_without_allocation_and_is_deterministic():
 
 def test_convenience_path_reuses_its_planned_launch_without_allocation():
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     device = torch.device("cuda")
     g = torch.Generator(device=device).manual_seed(SEED + 6)
     T, K, N = (
@@ -5427,7 +5514,10 @@ def test_convenience_path_replays_a_stream_k_row_bit_exact():
     geometry reuses them without a memset (the kernel resets every counter it uses), stays allocation-free
     and reproduces the first result bit for bit."""
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     device = torch.device("cuda")
     g = torch.Generator(device=device).manual_seed(SEED + 7)
     T, K, N = (
@@ -5474,6 +5564,46 @@ def test_convenience_path_replays_a_stream_k_row_bit_exact():
     )
 
 
+# longer than a cold-cache JIT build; the hang this test guards against never returns
+@pytest.mark.timeout(300)
+def test_pd2_stream_k_on_an_odd_k_completes():
+    """The dgrad of T = 1024, N = 1032, K = 1000 is one partial wave of 16 tiles of 17 K steps.  Two units per tile
+    would leave the last one without a K step, and the pd 2 program waits for that unit's accumulator forever; the
+    planner plans the 31 units that hold one."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
+    device = torch.device("cuda")
+    g = torch.Generator(device=device).manual_seed(SEED + 11)
+    T, N, K = 1024, 1032, 1000
+    G = torch.randn(T, N, device=device, generator=g).to(torch.bfloat16)
+    W = (torch.randn(N, K, device=device, generator=g) * N**-0.5).to(torch.bfloat16)
+    v = dict(
+        A=G,
+        B=W,
+        out=torch.full((T, K), float("nan"), device=device, dtype=torch.bfloat16),
+    )
+    knobs = _registered_knobs(
+        v,
+        dict(pd=2, slots=2, epi="tma"),
+        dict(pd=2, slots=2, epi="tma", pro=15),
+        dict(pd=2, slots=1, epi="tma", pro=15),
+    )
+    prepared = prepare_dense_projection_gemm(v["A"], v["B"], v["out"], **knobs)
+    plan = prepared.plan
+    assert plan.pd == 2 and plan.k_blocks == 17 and plan.tail_tiles * 2 <= plan.sm_pairs
+    assert (
+        (plan.sk_units - 1) * plan.iters_per_unit
+        < plan.sk_iters
+        < 2 * plan.tail_tiles * plan.iters_per_unit
+    )
+    prepared.launch()
+    torch.cuda.synchronize()
+    _check(v["out"], G.double() @ W.double())
+
+
 def _router_inputs(op, T, seed, K=6144, N=256, device="cuda"):
     g = torch.Generator(device=device).manual_seed(seed)
     X = torch.randn(T, K, device=device, generator=g)
@@ -5491,7 +5621,10 @@ def _router_inputs(op, T, seed, K=6144, N=256, device="cuda"):
 )
 def test_router_rows_match_fp64_reference_and_rerun_bit_exact(op, T):
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            "(compute capability 10.0 or 10.7)"
+        )
     v = _router_inputs(op, T, seed=SEED + 4)
     plan, *_ = plan_router_fp32_gemm(v["A"], v["B"], v["out"])
     _require_program(plan.template)

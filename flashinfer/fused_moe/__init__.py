@@ -35,6 +35,7 @@ from .api import (  # noqa: F401
     B12xNvfp4Config,
     B12xW4A16Config,
     BackendOptions,
+    CakeStepFunConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
     CudnnFrostNvfp4Config,
@@ -95,6 +96,7 @@ from .da_runtime import (  # noqa: F401
 from .runners import (  # noqa: F401
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    CakeStepFunRunner,
     CakeWarpDecodeRunner,
     CudnnGroupedGemmBf16Runner,
     CudnnGroupedGemmFp8PerTensorRunner,
@@ -245,7 +247,6 @@ from .alphamoe_nvfp4_sm100 import (  # noqa: F401
 )
 
 from .bgmv_moe import (  # noqa: F401
-    BGMVMoEBlackwellPlan as BGMVMoEBlackwellPlan,
     BGMVMoECakePlan as BGMVMoECakePlan,
     BGMVMoEPortablePlan as BGMVMoEPortablePlan,
     bgmv_moe as bgmv_moe,
@@ -331,11 +332,13 @@ __all__ = [
     "B12xW4A16Config",
     "B12xW4A16Runner",
     "BackendOptions",
+    "CakeStepFunConfig",
     "CudnnFrostBf16Config",
     "CudnnFrostMxfp8Config",
     "CudnnFrostNvfp4Config",
     "CudnnFrostMxfp8Mxfp4Config",
     "CakeWarpDecodeConfig",
+    "CakeStepFunRunner",
     "CakeWarpDecodeRunner",
     "PrimsTsConfig",
     "PrimsTsRunner",
@@ -488,7 +491,6 @@ __all__ = [
     "cudnn_frost_grouped_gemm1_swiglu",
     "cudnn_frost_grouped_gemm1_swiglu_workspace_size",
     "bgmv_moe",
-    "BGMVMoEBlackwellPlan",
     "BGMVMoECakePlan",
     "BGMVMoEPortablePlan",
     "bgmv_moe_shrink",

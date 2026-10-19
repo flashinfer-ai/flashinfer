@@ -1,4 +1,4 @@
-# Cake dense projection GEMM backend (SM100 / SM103 / SM107)
+# Cake dense projection GEMM backend (SM100 / SM107)
 
 Experimental backend for the GLM-5.2 training GEMMs: the BF16 dense projection
 GEMM (K1 -- BF16 operands, FP32 accumulation, BF16 or FP32 output, strided
@@ -7,11 +7,14 @@ GEMM through split-BF16x3 tensor-core emulation with chunked FP32 promotion
 (K2).  Tracking issue: flashinfer-ai/flashinfer#5677.
 
 Both the API and the backend are experimental: no compatibility guarantee.
-SM107 (Rubin R200) is the primary architecture; SM100 (B200 / GB200) and
-SM103 (B300 / GB300) are compiled from the same sources.  The feature is
-JIT-only, has no core entry point yet (importing this package is the
-explicit opt-in) and does not participate in automatic backend selection,
-autotuning or trace-apply.
+SM107 (Rubin R200) is the primary architecture; SM100 (B200 / GB200) is built
+from the same sources.  No program is registered for SM103 (B300 / GB300): a
+compute capability 10.3 device raises `NotImplementedError` naming the missing
+instance.  The feature has no core entry point yet (importing this package is
+the explicit opt-in) and does not participate in automatic backend selection,
+autotuning or trace-apply.  Its libraries are loaded prebuilt from `aot/` when
+the package ships them and JIT-built by FlashInfer from `build.json` otherwise
+(see "Layout of this package").
 
 ## Entry points (`cake_backend.py`)
 
@@ -117,7 +120,7 @@ stream-K split, raster group, wave working set) and the L2 size (hint gate);
 | L2 promotion, prefetch | `default_promo` = `none`, `default_pf` = 0 (measured, off); the symbol carries `_<promo>` / `_pf<n>` when set |
 | template | `instance_symbol(instance_key(...))`, e.g. `dense_proj_gemm_kk_n256`, `dense_proj_gemm_kk_n128_hen`, `dense_proj_gemm_kn_n256_f32_tma1`, `dense_proj_gemm_nn_n256_f32_tma1`, `dense_proj_gemm_nn_n128_hen_t`, `dense_proj_gemm_kk_n256_m64`, `dense_proj_gemm_kk_n256_m256_ov_ht`, `dense_proj_gemm_nn_n160_m256_bz64`, `dense_proj_gemm_nn_n128_hen_t_skx`, `dense_proj_gemm_kn_n256_tma1_bg8`, `dense_proj_gemm_kn_n256_f32_v8_ef_s9`, `dense_proj_gemm_nn_n256_m256_sks_sb2`, `dense_proj_gemm_kk_n128_hen_c1` (round 13: `_pk` parked / `_ov` overlapped single-TMEM-buffer / `_ht` half-height-tail-wave tall epilogues; `htail` replaces the stream-K tail plan by 2 x tail whole-K half items when they fit the CTA pairs, so `ws_f32_elems = 0` and `sk_iters = sk_units * k_blocks`; `_bz64` = 32-column MN-major B panels (`b_swz` 64, smaller stages, deeper default pipeline), `_skx` = exact p-way K split of the tail tiles (`sk_exact`, pre-empts `sk_parts` / `htail`, p travels in `sk_iters`); `_sks` = synchronised stream-K tail (round 18: `sk_sync`, the tail tiles' main units over K steps [0, s) plus collector units over the leftovers, one fp32 slab per tail tile and a deterministic two-addend fixup; `sk_iters` = the main-unit count, `iters_per_unit` = s = ceil((q K + `sk_sync_m`) / (q + 1)); yields to `sk_exact`, pre-empts `sk_parts` / `htail`); `_bg8` = eight adjacent batch entries (heads) interleaved across the CTA pairs (`batch_group`, batched MLA rows only, 0 for a batch of one); `_ef` = fp32 v8 register stores with `L1::no_allocate.L2::evict_first` (`store_ef`), `_s9` = nine pipeline stages (oversized dynamic shared memory on sm_107a); round 19: `_sb<n>` = the slab path of the synchronised fixup (`sk_slab`: 1 early arrival, 2 + the bulk slab read through the dead mainloop stages, 3 + the fp32 output as the slab - the same `_sks` plan, forced to 0 without `sk_sync`; a rule's 3 yields to 2 when a caller forces the row-major fp32 register epilogue, a rule's 2 to 0 when the eight warp slabs do not fit a caller-forced pipeline), `_c1` = the single-CTA form (`cta1`: one `CTA_ROWS` x `BLOCK_N` tile per CTA with cluster dims (1, 1, 1), so `m_tiles` is not rounded to pairs, `pair_tiles` counts CTA tiles, `sm_pairs` is the SM count (`sm_units`), the grid is `num_full` CTAs and the form carries no tail policy; 128-row family only)) |
 | grid | `(num_full + sk_units) * 2` CTAs: one cluster of two CTAs per `2 * CTA_ROWS` x `BLOCK_N` output tile plus the stream-K units; under `cta1` (round 19) `num_full` CTAs, one per `CTA_ROWS` x `BLOCK_N` tile, launched with the module's recorded cluster dims (1, 1, 1) |
-| stream-K | `stream_k_plan(pair_tiles, k_blocks, sm_count // 2, sk="auto")`: only when the whole problem is one partial wave of CTA pairs whose halves fit the pairs (`pair_tiles <= pairs`, `2 * tail <= pairs`) and `k_blocks >= 16`, every tile is split into two K-aligned halves (`sk_units = 2 * pair_tiles`, `iters_per_unit = ceil(k_blocks / 2)`) with an in-kernel deterministic fixup; otherwise every work item is a whole tile (multi-wave tails stay data-parallel).  `sk=True` is the linearised-units policy (up to `pairs` units of >= 8 K steps), `sk="tiles"` the whole-tile diagnostic, `sk=False` off.  A measured `sk_parts = p` rule, or the caller knob `sk_parts`, instead splits every tail tile `p` ways when `p * tail` units fit the pairs and each keeps >= 8 K steps (`sk_parts_plan`).  The host asserts `tail_tiles * 16 <= 4096` slice counters |
+| stream-K | `stream_k_plan(pair_tiles, k_blocks, sm_count // 2, sk="auto")`: only when the whole problem is one partial wave of CTA pairs whose halves fit the pairs (`pair_tiles <= pairs`, `2 * tail <= pairs`) and `k_blocks >= 16`, the tiles' linearised K steps are cut into units of `iters_per_unit = ceil(k_blocks / 2)` (two K-aligned halves per tile on an even `k_blocks`), `sk_units = ceil(pair_tiles * k_blocks / iters_per_unit)` so that every unit holds a K step, with an in-kernel deterministic fixup; otherwise every work item is a whole tile (multi-wave tails stay data-parallel).  `sk=True` is the linearised-units policy (up to `pairs` units of >= 8 K steps), `sk="tiles"` the whole-tile diagnostic, `sk=False` off.  A measured `sk_parts = p` rule, or the caller knob `sk_parts`, instead splits every tail tile `p` ways when `p * tail` units fit the pairs and each keeps >= 8 K steps (`sk_parts_plan`).  The host asserts `tail_tiles * 16 <= 4096` slice counters, and `check_stream_k_plan` refuses a plan outside the kernel's launch contract: a unit without a K step on the `pd` 2 / `sk_slab` 2 / `stt` programs (they hand off the work in an item's last segment, so such a unit never finishes), or synchronised collectors outside `[1, tail_tiles]` (`[1, ...)` on the other `sk_sync` programs) |
 
 `plan_dense_projection_gemm(A, B, out, sm_count=..., l2_bytes=...)` exposes
 the plan (`GemmPlan`, including `wave_working_set_bytes`) without a device;
@@ -148,23 +151,40 @@ launcher's.
 
 ## Layout of this package
 
-* `cake_jit.py` -- the registry (schema v2) and the JIT specs.  Three literals
-  filled by the generated-program export, each wrapped in `# fmt: off` /
-  `# fmt: on` and rendered one record per line (the export replaces a literal
-  from its head line up to the next `# fmt: on`): `ARG_PLANS` (the distinct
-  argument plans -- the ordered `[kind, name]` pairs a generated entry takes --
-  keyed by the first 12 hex digits of the SHA-256 of the plan's compact JSON,
-  `arg_plan_key`; one plan serves every K1 program and one every K2 program),
-  `MODULES` (one record per generated program: template, kernel symbol, cache
-  name, sources, compile flags, FFI entry, `arg_plan` key -- `arg_plan_of`
-  resolves it and still accepts an inline list -- launch geometry, `arches`,
-  closure digest) and `KERNELS` (`arch -> template -> module name`).
+* `cake_jit.py` -- the registry (schema v2) and the loader glue.  Three
+  literals filled by the generated-program export, each wrapped in
+  `# fmt: off` / `# fmt: on` and rendered one record per line (the export
+  replaces a literal from its head line up to the next `# fmt: on`):
+  `ARG_PLANS` (the distinct argument plans -- the ordered `[kind, name]` pairs
+  a generated entry takes -- keyed by the first 12 hex digits of the SHA-256
+  of the plan's compact JSON, `arg_plan_key`; one plan serves every K1 program
+  and one every K2 program), `MODULES` (one record per generated program:
+  template, kernel symbol, the architecture-free `library` stem, FFI entry,
+  `arg_plan` key -- `arg_plan_of` resolves it and still accepts an inline
+  list -- launch geometry, `arches`) and `KERNELS` (`arch -> template ->
+  module name`).  `ARCHES` names the registered architectures;
+  `load_cake_dense_projection_gemm_module(name, arch)` loads the build
+  `<library>_<arch>` through `cake_build`.
+* `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
+  package (byte-identical copies) and this package's build manifest (schema
+  `cake-build/1`, written by the export): one entry per `<library>_<arch>`
+  with its translation units, digests, nvcc flags, closure digest and
+  `aot/<name>.so` path.  `cake_build.load_library(name)` loads the prebuilt
+  library when `aot/` holds it and otherwise JIT-builds the entry through
+  FlashInfer (`gen_jit_spec`, sources digest-verified first);
+  `cake_jit.specs_for_arch(arch)` lists the JIT specs of an architecture for
+  `flashinfer.jit.build_jit_specs`.  `cake_build.jit_spec(name)` /
+  `jit_specs(arch)` gate an entry on its `min_cuda` only (`sm_107a` entries
+  need CUDA 13.0): a 13.0 toolkit whose `nvcc` does not emit `compute_107a`
+  fails inside the JIT build with nvcc's own message.
 * `cake_backend.py` -- view validation, instance selection, stream-K
   planning, argument-plan binding, the prepared launches and the eager entry
   points.
 * `csrc/cake_dense_projection_gemm/` -- generated kernel and binding
   translation units (`.clang-format` disables formatting: the sources are
-  identity-checked by the registry's closure digests).
+  identity-checked by the manifest's digests); `csrc/cake_ffi_checks.h` -- the
+  tvm-ffi tensor checks the bindings include (shipped with the package, no
+  FlashInfer header).
 
 ## Status
 
@@ -173,9 +193,10 @@ Cake exporter (`exports/dense_projection_gemm` of the Cake repository) emits
 one program per template, shared by `sm_100a` and `sm_107a` wherever the generated text is the same (the per-architecture
 template lists are `KERNELS` in `cake_jit.py`; `K1_TEMPLATES` of the exporter
 is the source of truth and is regenerated whenever `ROW_RULES` resolve a new
-instance), and `sm_103a` is compiled from the same sources when a B300 route
-is exercised.  An entry point raises `NotImplementedError` naming the missing
-instance only for a template that no export has generated.
+instance).  `build.json` ships `sm_100a` and `sm_107a` builds only; `sm_103a`
+has no registered program.  An entry point raises `NotImplementedError` naming
+the missing instance for a template that no export has generated and for every
+template on a compute capability 10.3 device.
 
 CUDA Graphs: prepare outside capture and replay the prepared launch
 (`prepare_*` once, `launch` many times).  The convenience entry points
@@ -186,7 +207,7 @@ paths").
 
 Tests: `tests/experimental/test_cake_dense_projection_gemm.py` (host-side
 planning tests run everywhere; the GPU tests skip without a registered
-instance or a compute capability 10.0 / 10.3 / 10.7 device).  Benchmark:
+generated instance -- a compute capability 10.0 or 10.7 device).  Benchmark:
 `benchmarks/bench_cake_dense_projection_gemm.py` (the 11 GLM-5.2 projection
 rows x fwd / dgrad / wgrad x T in {16231, 16172}, the router rows and the two
 batched MLA rows, paired against `torch.matmul`; `--host-overhead` adds the
