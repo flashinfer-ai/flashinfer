@@ -25,6 +25,7 @@ from .utils import (
     bench_gpu_time_with_cupti,
     bench_gpu_time_with_cuda_event,
     bench_gpu_time_with_cudagraph,
+    is_compute_sanitizer_active,
     set_seed,
     sleep_after_kernel_run,
 )

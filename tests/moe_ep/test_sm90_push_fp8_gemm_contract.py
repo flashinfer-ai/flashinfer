@@ -13,6 +13,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from flashinfer.testing import is_compute_sanitizer_active
+
 pytestmark = pytest.mark.usefixtures("isolated_deep_gemm_cache")
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -637,6 +639,11 @@ def _assert_device_trap(result: subprocess.CompletedProcess[str], marker: str) -
         assert bad_marker not in combined, combined[-1500:]
 
 
+@pytest.mark.skipif(
+    is_compute_sanitizer_active(),
+    reason="the test makes a kernel execute its `trap;` guard on purpose, "
+    "which compute-sanitizer reports as errors",
+)
 @requires_sm90
 @pytest.mark.parametrize(
     "fused,offset_values,marker",
@@ -691,6 +698,11 @@ print("UNEXPECTED-SURVIVAL")
     _assert_device_trap(result, marker)
 
 
+@pytest.mark.skipif(
+    is_compute_sanitizer_active(),
+    reason="the test makes a kernel execute its `trap;` guard on purpose, "
+    "which compute-sanitizer reports as errors",
+)
 @requires_sm90
 @pytest.mark.parametrize("fused", [False, True])
 def test_moe_gemm_offsets_exceed_input_capacity_trap(fused: bool) -> None:

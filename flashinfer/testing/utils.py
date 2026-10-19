@@ -416,6 +416,22 @@ def dequantize_fp8(x, x_scale, scale_major_mode):
     return out
 
 
+def is_compute_sanitizer_active() -> bool:
+    """Detect whether the process runs under compute-sanitizer.
+
+    The tool injects itself through environment variables that child processes
+    inherit, so this also holds inside a subprocess a test spawns. CUDA 13.x
+    uses the NV_SANITIZER_INJECTION_* set; older toolkits use
+    CUDA_INJECTION64_PATH, which Nsight tools set too, hence the value check.
+    """
+    if any(name.startswith("NV_SANITIZER_INJECTION_") for name in os.environ):
+        return True
+    return any(
+        "sanitizer" in os.environ.get(name, "").lower()
+        for name in ("CUDA_INJECTION64_PATH", "NVTX_INJECTION64_PATH")
+    )
+
+
 def set_seed(random_seed):
     """
     Set random seed for reproducibility during testing.
