@@ -202,19 +202,24 @@ def _backward_module_records(arch: str, hidden: int, residual: bool) -> list[dic
 
 
 def _workspace_record(arch: str, hidden: int, residual: bool) -> dict:
-    """The backward module that owns the partial / counter workspace."""
+    """The backward module that sizes the partial / counter workspace.
+
+    Every backward module of a route declares a ``workspace_rule``; a route
+    that switches modules on the row count is sized by the module with the
+    largest chunk capacity, whose layout every module of the route shares.
+    """
 
     owners = [
         record
         for record in _backward_module_records(arch, hidden, residual)
         if record.get("workspace_rule") is not None
     ]
-    if len(owners) != 1:
+    if not owners:
         raise RuntimeError(
             f"the exported backward route for hidden={hidden} declares "
-            f"{len(owners)} workspace owners; expected exactly one"
+            "no workspace owner; expected at least one"
         )
-    return owners[0]
+    return max(owners, key=lambda record: _loader.max_chunks(record, device_index=0))
 
 
 def cake_rmsnorm_train_backward_workspace_bytes(
@@ -237,11 +242,19 @@ def cake_rmsnorm_train_backward_workspace_bytes(
     if rows < 0:
         raise ValueError("rows must be non-negative")
     arch = _device_arch(device)
-    record = _workspace_record(arch, hidden, residual)
-    layout = _loader.workspace_layout(
-        record, max(rows, 1), device_index=_device_index(device)
+    owner = _workspace_record(arch, hidden, residual)
+    device_index = _device_index(device)
+    # Every module of the route shares the owner's partial capacity; the buffer
+    # also holds the widest counter table any module of the route declares.
+    return max(
+        int(
+            _loader.workspace_layout(
+                record, max(rows, 1), device_index=device_index, capacity_record=owner
+            )["total_bytes"]
+        )
+        for record in _backward_module_records(arch, hidden, residual)
+        if record.get("workspace_rule") is not None
     )
-    return int(layout["total_bytes"])
 
 
 def cake_rmsnorm_train_backward_workspace(
@@ -256,9 +269,19 @@ def cake_rmsnorm_train_backward_workspace(
 
 
 def _workspace_views(
-    workspace: torch.Tensor, record: dict, *, rows: int, device: torch.device
+    workspace: torch.Tensor,
+    record: dict,
+    *,
+    rows: int,
+    device: torch.device,
+    owner: Optional[dict] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, int]]:
-    layout = _loader.workspace_layout(record, rows, device_index=_device_index(device))
+    layout = _loader.workspace_layout(
+        record,
+        rows,
+        device_index=_device_index(device),
+        capacity_record=record if owner is None else owner,
+    )
     if not isinstance(workspace, torch.Tensor):
         raise TypeError("workspace must be a torch.Tensor")
     if (
@@ -548,13 +571,27 @@ def cake_rmsnorm_train_backward(
     if rows == 0:
         dw_result.zero_()
         return dx_result, dw_result
-    record = _workspace_record(arch, hidden, has_residual)
+    owner = _workspace_record(arch, hidden, has_residual)
+    names = selected_modules(arch, hidden, "bwd", has_residual, rows=rows)
+    launched = [
+        _loader.MODULES[name]
+        for name in names
+        if _loader.MODULES[name].get("workspace_rule") is not None
+    ]
+    if len(launched) != 1:
+        raise RuntimeError(
+            f"the exported backward route for hidden={hidden} launches "
+            f"{len(launched)} workspace-owning modules for {rows} rows; expected one"
+        )
     if workspace is None:
         workspace = cake_rmsnorm_train_backward_workspace(
             rows, hidden, device, residual=has_residual
         )
+    # The chunk count is the launched module's; the partial capacity and the
+    # counter offset are the route's, so every module of the route reads the
+    # same zeroed counters.
     partial, counters, layout = _workspace_views(
-        workspace, record, rows=rows, device=device
+        workspace, launched[0], rows=rows, device=device, owner=owner
     )
     # The plain kernel keeps the residual-gradient parameters in its signature
     # and never reads them: bind them to ``g`` exactly like the source launcher.
@@ -577,7 +614,7 @@ def cake_rmsnorm_train_backward(
         "rows_per_chunk": int(layout["rows_per_chunk"]),
     }
     device_index = _device_index(device)
-    for name in selected_modules(arch, hidden, "bwd", has_residual, rows=rows):
+    for name in names:
         _loader.run_module(name, values, rows=rows, device_index=device_index)
     _copy_back(copy_backs)
     return dx_result, dw_result

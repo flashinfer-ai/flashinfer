@@ -59,10 +59,18 @@ cake_rmsnorm_train_forward = pkg.cake_rmsnorm_train_forward
 is_cake_rmsnorm_train_supported = pkg.is_cake_rmsnorm_train_supported
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
-WIDTHS = ((6144, 1e-5), (2048, 1e-6), (512, 1e-6))
+WIDTHS = ((6144, 1e-5), (4096, 1e-5), (2048, 1e-6), (1536, 1e-6), (512, 1e-6))
 HIDDEN_SIZES = tuple(hidden for hidden, _eps in WIDTHS)
 EPS = {hidden: eps for hidden, eps in WIDTHS}
+# Widths whose contract names both eps values: every case runs at each.
+EPS_VARIANTS = {4096: (1e-5, 1e-6), 1536: (1e-5, 1e-6)}
 ROWS = (1, 2, 7, 63, 64, 65, 127, 128, 129, 255, 257, 16172, 16231)
+# Further row counts of the H=1536 / H=4096 contract: the program-window edges, the 2^n +- 1 counts and the
+# representative training shapes (GLM-5.3-Flash CP16 among them).
+CONTRACT_ROWS = {
+    4096: (1023, 1025, 4097, 14928, 16263, 16384, 32769, 65536),
+    1536: (1023, 1025, 4097, 14928, 16263, 16384, 32769, 65536),
+}
 STRIDE_PADS = (0, 64, "2H")
 SCALES = (1.0, 1e-3, 1e3)
 ATOL = 1e-2
@@ -256,8 +264,9 @@ def _check_case(
     zeros: bool = False,
     residual: bool = False,
     spike: bool = False,
+    eps: float | None = None,
 ) -> None:
-    eps = EPS[hidden]
+    eps = EPS[hidden] if eps is None else eps
     pad_key = hidden if x_pad == "2H" else int(x_pad)
     generator = _generator(
         hidden, rows, pad_key, int(scale * 1e6) % 9973, zeros, residual, spike
@@ -279,7 +288,7 @@ def _check_case(
     y, rstd = outputs[0], outputs[1]
     assert tuple(y.shape) == (rows, hidden) and y.is_contiguous()
     assert rstd.dtype == torch.float32 and tuple(rstd.shape) == (rows,)
-    label = f"hidden={hidden} rows={rows} pad={x_pad} scale={scale} zeros={zeros} residual={residual}"
+    label = f"hidden={hidden} rows={rows} eps={eps} pad={x_pad} scale={scale} zeros={zeros} residual={residual}"
     _assert_bf16_close(y, y_ref, f"y {label}")
     assert torch.isfinite(rstd).all(), f"rstd {label}"
     assert _rel_l2(rstd, rstd_ref) <= RSTD_REL_L2, f"rstd {label}"
@@ -319,6 +328,26 @@ def _forward_switch_rows(arch: str, hidden: int, residual: bool) -> tuple[int, .
             int(bound) for bound in (rule["above"], rule["at_most"]) if bound
         )
     return tuple(sorted({1, *switches, *(rows + 1 for rows in switches)}))
+
+
+@pytest.mark.parametrize(
+    ("hidden", "rows"),
+    [(hidden, rows) for hidden, counts in CONTRACT_ROWS.items() for rows in counts],
+)
+def test_contract_rows_match_fp64(hidden: int, rows: int) -> None:
+    _skip_unless_hidden(hidden)
+    _check_case(hidden, rows)
+
+
+@pytest.mark.parametrize(
+    ("hidden", "eps"),
+    [(hidden, eps) for hidden, variants in EPS_VARIANTS.items() for eps in variants],
+)
+@pytest.mark.parametrize("rows", (7, 16231))
+@pytest.mark.parametrize("scale", SCALES)
+def test_eps_variants(hidden: int, eps: float, rows: int, scale: float) -> None:
+    _skip_unless_hidden(hidden)
+    _check_case(hidden, rows, scale=scale, eps=eps)
 
 
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES)
