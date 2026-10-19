@@ -809,10 +809,10 @@ def test_device_resource_check_rejects_spills_at_every_rank_count(ranks: int) ->
 
     assert candidate_instances("all_gin") == (2, 3)
     assert candidate_instances(None) == candidate_instances("all_lsa") == (0, 1, 2, 3)
-    calls: list[tuple[tuple[int, ...], int]] = []
+    calls: list[tuple[tuple[int, ...], int, str]] = []
 
-    def clean(parameters, instance):
-        calls.append((parameters, instance))
+    def clean(parameters, instance, gin_backend):
+        calls.append((parameters, instance, gin_backend))
         return {"reg": 168, "stack": 8, "local": 0}
 
     def nvcc() -> str:
@@ -821,24 +821,60 @@ def test_device_resource_check_rejects_spills_at_every_rank_count(ranks: int) ->
     # DeepSeek-V4.1-Flash routed experts (the #6755 geometry).
     params = G.KernelParams(ranks, 384, 6, 2048, 5120, 2304, False)
     report = check_device_resources(params, (2, 3), resource_usage=clean, nvcc=nvcc)
-    assert sorted(report) == [2, 3]
-    assert [i for _, i in calls] == [2, 3]
-    assert all(p == params.device_parameters() for p, _ in calls)
+    # Every GIN backend's build is checked: the session (hence the backend) does not exist yet.
+    expected = {(b, i) for b in ("proxy", "gdaki", "gpi") for i in (2, 3)}
+    assert set(report) == expected
+    assert {(b, i) for _, i, b in calls} == expected
+    assert all(p == params.device_parameters() for p, _, _ in calls)
 
-    def spills(parameters, instance):
+    def spills(parameters, instance, gin_backend):
         del parameters
-        stack = LOCAL_BYTES_LIMIT + 8 if instance == 1 else 8
+        stack = LOCAL_BYTES_LIMIT + 8 if (instance, gin_backend) == (1, "gpi") else 8
         return {"reg": 166, "stack": stack, "local": 0}
 
     with pytest.raises(G.GeometryError) as error:
         check_device_resources(params, (0, 1, 2, 3), resource_usage=spills, nvcc=nvcc)
     message = str(error.value)
-    assert "m64_copier" in message
+    assert "m64_copier (gpi GIN)" in message
     assert "REG 166, stack 16 B, local 0 B" in message
     assert "nvcc 13.3.73" in message
     assert all(version in message for version in VALIDATED_NVCC_VERSIONS)
-    # The copier-free flavor of the same build is fine.
+    # The copier-free flavor of the same build, and the other backends, are fine.
     check_device_resources(params, (2, 3), resource_usage=spills, nvcc=nvcc)
+    check_device_resources(
+        params,
+        (0, 1, 2, 3),
+        resource_usage=spills,
+        nvcc=nvcc,
+        gin_backends=("proxy", "gdaki"),
+    )
+
+
+def test_gin_backend_builds() -> None:
+    from flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe import (
+        AOT_DEVICE_PARAMETERS,
+        GIN_BACKENDS,
+        gen_cake_sm120_megamoe_aot_modules,
+        gen_cake_sm120_megamoe_kernel_module,
+        gin_backend_name,
+    )
+
+    # ncclGinType_t values: 2 proxy, 3 GDAKI, 4 GPI; anything else fails closed.
+    assert [gin_backend_name(t) for t in (2, 3, 4)] == ["proxy", "gdaki", "gpi"]
+    with pytest.raises(RuntimeError, match="no device build for NCCL GIN type 5"):
+        gin_backend_name(5)
+    # Each backend build compiles the other two out and is its own JIT module.
+    for name, (_, defines) in GIN_BACKENDS.items():
+        assert len(defines) == 2 and all(name.upper() not in d for d in defines)
+    names = {
+        gen_cake_sm120_megamoe_kernel_module(AOT_DEVICE_PARAMETERS[0], False, b).name
+        for b in GIN_BACKENDS
+    }
+    assert len(names) == len(GIN_BACKENDS)
+    # AOT packages every backend's build of the default parameter sets.
+    assert len(gen_cake_sm120_megamoe_aot_modules()) == 1 + len(
+        AOT_DEVICE_PARAMETERS
+    ) * len(GIN_BACKENDS)
 
 
 def test_device_resource_check_without_cuobjdump_defers_to_the_workspace(

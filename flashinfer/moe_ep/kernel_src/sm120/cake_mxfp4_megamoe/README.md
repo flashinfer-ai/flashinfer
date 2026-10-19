@@ -105,16 +105,26 @@ Both kinds of modules are ordinary FlashInfer `JitSpec`s (`shim/cake_jit.py`), c
 directory and packaged ahead of time by `flashinfer/aot.py`:
 
 * `cake_sm120_megamoe_binding_<digest>`: the host binding, one per source revision.
-* `cake_sm120_megamoe_{copier,nocopier}_<digest>`: the device instances of one parameter set and
-  transport flavor.  Its `embedded_cubin_factory` compiles the flavor's M128 and M64 wrappers
-  (`nvcc -cubin --generate-code=arch=compute_120a,code=sm_120a -std=c++17 -O3`, about 10 s each,
-  in parallel) and the build embeds both cubins into the carrier; the digest covers the sealed
-  sources, the wrappers, the `-D` parameters, the flags and the NCCL version.  A workspace builds
-  or loads only the module of the flavor its transport table needs.
+* `cake_sm120_megamoe_{copier,nocopier}_{proxy,gdaki,gpi}_<digest>`: the device instances of one
+  parameter set, transport flavor and NCCL GIN backend.  Its `embedded_cubin_factory` compiles the
+  flavor's M128 and M64 wrappers (`nvcc -cubin --generate-code=arch=compute_120a,code=sm_120a
+  -std=c++17 -O3`, about 10 s each, in parallel) and the build embeds both cubins into the carrier;
+  the digest covers the sealed sources, the wrappers, the `-D` parameters, the flags and the NCCL
+  version.  A workspace builds or loads only the module of the flavor its transport table needs and
+  of its communicator's GIN backend (`ncclGinType_t` of the transport session; proxy when the
+  communicator has no GIN, where no GIN call executes).
+
+**GIN backend builds.** The NCCL Device API inlines every enabled GIN backend (proxy, GDAKI, GPI)
+into each GIN call behind a runtime switch on the context's backend.  The device modules compile
+only the session's backend (`NCCL_GIN_{PROXY,GDAKI,GPI}_ENABLE`; `GIN_BACKENDS` in
+`shim/cake_jit.py`), which lowers the persistent kernel's register use by 10-20 registers and
+removes the 8-byte stack frame of the GPI fence.  `validate_init` runs before the transport
+session exists, so it compile-checks the candidate instances of all three backends (in parallel,
+cached); the workspace loads the one it needs.
 
 `flashinfer/aot.py` registers the binding and the DeepSeek-V4-Flash routed-expert defaults
 (`AOT_DEVICE_PARAMETERS`: E256 / H4096 / I2048 / top-k 6, in-kernel FP8 shared expert,
-`swiglu_limit=10`, 4096 tokens per rank, all-GIN table, EP 4 and EP 8) when the target list has
+`swiglu_limit=10`, 4096 tokens per rank, all-GIN table, EP 4 and EP 8, each GIN backend) when the target list has
 SM120 and NCCL 2.30.7 (headers + library) is found at build time.  Any other parameter set compiles
 on first use; with `FLASHINFER_DISABLE_JIT=1` an unpackaged one raises `MissingJITCacheError`.  The
 `MOE_MAX_ROWS` capacity is a compile-time parameter, so a packaged module is used only by a
@@ -132,15 +142,20 @@ and infinity macro are renamed for the public export (`CakeTensorMap`, `CakeTens
 the generator's text.
 
 Register use at the shipped test geometries plus DeepSeek-V4.1-Flash (E384 / H5120 / I2304 /
-top-k 6), EP 4 / 8 / 16, both variants, every copier count the tables select (352 instances):
-154-168 with nvcc 13.0.88 and 157-168 with nvcc 13.3.73, stack 8 / local 0 for every instance
-(the `m128` instances run at the 168-register cap).  At EP 32 (the same shapes, 128 instances)
-13.0.88 compiles every instance spill-free; 13.2 and 13.3 spill the Qwen3-235B `:l0` fp8shared
-`m128_nocopier`.  Register allocation depends on the toolkit, so `validate_init` builds the
-device module a deployment may launch (the same module the workspace loads) at every rank count
-and raises `MoEEpConfigError` on any instance that spills, naming its registers, stack and local
-bytes and the nvcc release; the workspace re-checks every loaded instance
-(`CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES <= 8`, the generated code's own stack frame).
+top-k 6), EP 4 / 8 / 16 / 32, both variants, every copier count the tables select (480 instances
+per GIN backend): every instance of every GIN backend build compiles spill-free with each CUDA 13
+release listed under *Runtime requirements*, at 130-168 registers (the `m128` instances run at
+the 168-register cap), local 0, stack 0 for the proxy and GDAKI builds and 8 bytes for the GPI
+build.  Two choices keep the kernel under the cap on newer toolkits: the `m128` instances issue
+one MMA K step per main-loop iteration (the `m64` instances keep four, which their throughput
+needs; unrolling `m128` measured within noise on CUDA 13.0 and lets later compilers keep more
+operand fragments in flight), and above 16 ranks the task builder keeps its per-source tables in
+the `tb_pub` workspace instead of rank-indexed register arrays.  Register allocation depends on
+the toolkit, so `validate_init` builds the device modules a deployment may launch (the same
+modules the workspace loads) at every rank count and raises `MoEEpConfigError` on any instance
+that spills, naming its GIN backend, registers, stack and local bytes and the nvcc release; the
+workspace re-checks every loaded instance (`CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES <= 8`, the
+GPI fence's stack frame).
 
 **libcu++ automatic-storage check.** The device source defines
 `_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE` before it includes `nccl_device.h`.  The libcu++ headers
@@ -191,14 +206,14 @@ division and remainder); nothing is `eval`-ed.
   `nvidia-nccl-cu13==2.30.7` wheel.
 * CUDA 13 toolkit (`cuTensorMapEncodeTiled` via the driver entry point; `cuLaunchCooperativeKernel`;
   `-lcuda`).  The device build uses the compiler and headers of one release, found through
-  `CUDA_HOME`.  All multi-GPU tests run with **13.0.88**.  The register grid above (EP 4 / 8 / 16)
-  compiles spill-free with 13.0.48, 13.0.88, 13.2.51, 13.2.78, 13.2.86, 13.3.33 and 13.3.73
-  (compile only for the releases other than 13.0.88).  Other releases allocate registers
-  differently and spill a few instances: 13.1.80 / 13.1.115 the `m128_copier` at EP 8 for
-  Qwen3-30B (noshared) and DeepSeek-V4.1-Flash (fp8shared); 13.4.59 / 13.4.92 nearly every
-  `m128` instance at EP 8 and some `m64` instances at EP 8 / 16 (EP 4 is spill-free).  `validate_init`
-  refuses such a build with the nvcc release in the message; point `CUDA_HOME` at a release
-  listed above and clear the JIT cache.
+  `CUDA_HOME`.  All multi-GPU tests run with **13.0.88**.  The register grid above compiles
+  spill-free with 13.0.48, 13.0.88, 13.1.80, 13.1.115, 13.2.51, 13.2.78, 13.2.86, 13.3.33,
+  13.3.73, 13.4.59 and 13.4.92 (compile only for the releases other than 13.0.88).  Code built
+  by the releases after 13.0 ran about 5-8 % slower in our EP 8 DeepSeek-V4-Flash measurements
+  (most at 512-1024 tokens per rank, within a few percent at 4096), with or without spills, so
+  13.0 remains the recommended device compiler.  On any other release `validate_init` refuses a
+  spilling build with the nvcc release in the message; point `CUDA_HOME` at a release listed
+  above and clear the JIT cache.
 * An initialized `torch.distributed` **NCCL** process group for the EP domain (the session adopts
   its `ncclComm_t`).
 * Window memory per rank grows with world size x rows x top-k (the result windows dominate:

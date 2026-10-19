@@ -389,16 +389,19 @@ def _check_scratch_extent(
         )
 
 
-# Local memory per thread of a spill-free instance: the generated code's own 8-byte stack
-# frame (every compiled instance of the shipped test matrix reports stack 8 / local 0).  A
-# register spill grows it (one spilled register = 16 bytes), so anything above this limit is
-# refused.
+# Local memory per thread of a spill-free instance: at most the 8-byte stack frame of the GPI
+# fence (the shipped test matrix reports stack 0 for the proxy / GDAKI builds and 8 for GPI,
+# local 0).  A register spill grows it (one spilled register = 16 bytes), so anything above
+# this limit is refused.
 LOCAL_BYTES_LIMIT = 8
 # nvcc releases the shipped register budget was checked with: every instance of the
-# test-shape grid (EP 4/8/16) compiles spill-free.  Register allocation differs between
-# releases and parameter sets, so ``validate_init`` compiles the instances a deployment may
-# launch at every rank count (same JIT cache the workspace uses) and rejects any that spill.
-VALIDATED_NVCC_VERSIONS = ("13.0.88", "13.3.73")
+# test-shape grid (EP 4/8/16/32, every GIN backend) compiles spill-free.  Register allocation
+# differs between releases and parameter sets, so ``validate_init`` compiles the instances a
+# deployment may launch at every rank count (same JIT cache the workspace uses) and rejects
+# any that spill.
+VALIDATED_NVCC_VERSIONS = ("13.0.88", "13.1.115", "13.2.86", "13.3.73", "13.4.92")
+# GIN backend built for a workspace without GIN (every pair on LSA): no GIN call executes.
+_NO_GIN_BACKEND = "proxy"
 
 
 def spill_message(instance_name: str, usage: Any, nvcc: str) -> str:
@@ -427,17 +430,23 @@ def check_device_resources(
     *,
     resource_usage: Any = None,
     nvcc: Any = None,
-) -> dict[int, dict[str, int]]:
+    gin_backends: tuple[str, ...] | None = None,
+) -> dict[tuple[str, int], dict[str, int]]:
     """Fail closed on parameter sets whose device build spills (no GPU needed).
 
-    Each candidate instance is compiled (cached; the workspace loads the same cubins) and
-    its stack + local bytes per thread must not exceed :data:`LOCAL_BYTES_LIMIT`, the same
-    limit the workspace enforces when it loads the instance.  ``resource_usage(parameters,
-    instance)`` and ``nvcc()`` (the compiler release named in the error) default to the
-    JIT loader's.
+    Each candidate instance is compiled for each GIN backend (cached; the workspace loads the
+    build of its communicator's backend) and its stack + local bytes per thread must not
+    exceed :data:`LOCAL_BYTES_LIMIT`, the same limit the workspace enforces when it loads the
+    instance.  The backend is unknown before the transport session exists, so every backend
+    is checked (``gin_backends``, default all, built in parallel).  ``resource_usage(parameters,
+    instance, gin_backend)`` and ``nvcc()`` (the compiler release named in the error) default
+    to the JIT loader's.
     """
 
+    from concurrent.futures import ThreadPoolExecutor
+
     from ......kernel_src.sm120.cake_mxfp4_megamoe import (
+        GIN_BACKENDS,
         cuobjdump_path,
         device_cubin_resource_usage,
         nvcc_version,
@@ -457,12 +466,23 @@ def check_device_resources(
             return {}
         resource_usage = device_cubin_resource_usage
     nvcc = nvcc or nvcc_version
-    report: dict[int, dict[str, int]] = {}
-    for index in instances:
-        usage = dict(resource_usage(params.device_parameters(), index))
-        report[index] = usage
+    backends = tuple(GIN_BACKENDS) if gin_backends is None else tuple(gin_backends)
+    keys = [(backend, index) for backend in backends for index in instances]
+    with ThreadPoolExecutor(max_workers=len(backends)) as pool:
+        usages = list(
+            pool.map(
+                lambda key: dict(
+                    resource_usage(params.device_parameters(), key[1], key[0])
+                ),
+                keys,
+            )
+        )
+    report = dict(zip(keys, usages, strict=True))
+    for (backend, index), usage in report.items():
         if usage["stack"] + usage["local"] > LOCAL_BYTES_LIMIT:
-            raise GeometryError(spill_message(INSTANCE_NAMES[index], usage, nvcc()))
+            raise GeometryError(
+                spill_message(f"{INSTANCE_NAMES[index]} ({backend} GIN)", usage, nvcc())
+            )
     return report
 
 
@@ -1135,8 +1155,13 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
         sm_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
         instances: dict[str, _Instance] = {}
         device_parameters = kernel["params"].device_parameters()
+        gin_backend = _NO_GIN_BACKEND
+        if session.gin_available:
+            from ......kernel_src.sm120.cake_mxfp4_megamoe import gin_backend_name
+
+            gin_backend = gin_backend_name(session.gin_type)
         for inst_name, spec in specs.items():
-            cubin = device_cubin(device_parameters, int(spec["instance"]))
+            cubin = device_cubin(device_parameters, int(spec["instance"]), gin_backend)
             function = int(
                 module.module_load_function(
                     torch.frombuffer(bytearray(cubin), dtype=torch.uint8),
@@ -1156,10 +1181,12 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
                 detail = f" (limit {LOCAL_BYTES_LIMIT} B) with nvcc {nvcc_version()}"
                 if cuobjdump_path() is not None:  # registers, stack and local apart
                     usage = device_cubin_resource_usage(
-                        device_parameters, int(spec["instance"])
+                        device_parameters, int(spec["instance"]), gin_backend
                     )
                     detail = ": " + spill_message(
-                        inst_name + suffix, usage, nvcc_version()
+                        f"{inst_name}{suffix} ({gin_backend} GIN)",
+                        usage,
+                        nvcc_version(),
                     )
                 raise RuntimeError(
                     f"{KERNEL_NAME}: {inst_name}{suffix} uses {local_bytes} B of local "
