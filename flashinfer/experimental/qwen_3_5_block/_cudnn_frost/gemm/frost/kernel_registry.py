@@ -886,6 +886,9 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         template_cls=Sm120KernelTemplate,
     ),
 )
+# [vendor.py P6] the vendored tree carries the sm100 arch family only: the sm120 registrations above are dropped (their
+# template files are not vendored, and their block-quant gate imports the sm120 compiler).
+TEMPLATES = tuple(t for t in TEMPLATES if t.family in arch_family.FAMILIES)
 
 
 # Pipeline families the AUTO path (``tile_config.select_config``) may build

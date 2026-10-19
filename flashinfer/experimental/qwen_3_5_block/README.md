@@ -184,9 +184,11 @@ The backend is a subset of the cuDNN Frontend Python package vendored byte-faith
 chain's norm + RoPE pass and cache write --, the FROST SDPA adapter with its configuration tables (the shared d128-family table and the
 two backward configuration tables the forward configs import at module level: geometry and validators, no backward kernel) and its
 SM107 prefill / decode tiles and SM100 split combine, the FROST GEMM compiler and its kernel templates, the `tile_dsl` helpers; every file keeps its NVIDIA SPDX header, MIT or
-Apache-2.0), with only the import roots rewritten and four declared, exact-text patches (P0-P2 replace the nanobind extension's
-seams, P3 rewords sixteen comment lines that named internal hosts, file paths or workflow vocabulary; all listed in
-`_cudnn_frost/VENDOR.md`; per-file digests in `_cudnn_frost/VENDOR_MANIFEST.json`). Pinned revision: cuDNN Frontend
+Apache-2.0), with only the import roots rewritten and seven declared patches (P0-P2, exact text, replace the nanobind extension's
+seams, P3 rewords twenty-two comment lines that named internal hosts, file paths or workflow vocabulary, P4 carries the cache-write
+launcher's one-device check ahead of its upstream landing, P5-P6 prune what the subset does not carry -- the `gemm` package's lazy
+exports and the sm120 arch family; all listed in `_cudnn_frost/VENDOR.md`; per-file digests in `_cudnn_frost/VENDOR_MANIFEST.json`).
+Pinned revision: cuDNN Frontend
 `c9f3118a1` (1.32.0: the Rubin decode levers -- the 64-column decode tile, the decode-grid split combine and its lean group
 walk, the lowered small-M decode chain -- plus, since the previous vendoring, independent K / V paged-pool layouts (HND / NHD per
 pool, bound and validated per operand), the split-prefix scheduling of paged packed attention (long-KV requests first, work-prefix

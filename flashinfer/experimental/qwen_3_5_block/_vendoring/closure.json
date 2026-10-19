@@ -2713,6 +2713,16 @@
    "why": "the fp32 oracle (gated_attention_block_reference), build_rope_tables, make_inputs, RefGeometry: what a FlashInfer correctness test compares against (the quantized / backward refs inside import test-tree siblings lazily and are not used)"
   }
  ],
+ "extra_files": [
+  {
+   "path": "test/python/sdpa/frost/sdpa_binding_reference.py",
+   "bytes": 56032,
+   "lines": 995,
+   "sha256": "18d299619342f41ccf86b446234117d5ec3f924423328047961d8e2cf7d64009",
+   "license": "MIT",
+   "why": "the retired Python frame implementation of the SDPA launch binder (bind_dense / bind_dense_split / bind_thd, the paged pools and tables, the split combine): the frame logic the FlashInfer-side Python binder delegates to, vendored as sdpa/fwd/_binding_reference.py"
+  }
+ ],
  "excluded": {
   "cudnn": "the package root: loads the nanobind extension; the vendored root is written fresh (shim)",
   "cudnn._compiled_module": "the nanobind extension (.so): NOT vendored; its Python-visible surface is shimmed",

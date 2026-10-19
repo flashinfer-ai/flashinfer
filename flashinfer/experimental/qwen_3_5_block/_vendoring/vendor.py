@@ -18,9 +18,13 @@ read live when a cuDNN Frontend install is importable, else from the recorded co
   alone (they resolve inside the vendored tree).  No regular expression touches anything that is not an import statement; the
   ONE string-literal site that importlib resolves at runtime (``engines/manifest.py``'s ``("cudnn._gemm_validate", ...)``
   family references) is rewritten by locating ``ast.Constant`` nodes in that one named file.
-* Four declared PATCHES (P0-P3, listed in VENDOR.md): P0-P2, exact text, make the copy importable without the nanobind
+* Seven declared PATCHES (P0-P6, listed in VENDOR.md): P0-P2, exact text, make the copy importable without the nanobind
   extension; P3, context-anchored regular expressions that name nothing themselves, rewords the comment / docstring lines that
-  named internal hosts or internal file paths; everything else is byte-identical to the commit, SPDX headers included.
+  named internal hosts or internal file paths; P4, exact text, carries a fix ahead of its upstream landing (dropped at the
+  re-vendor that follows it); P5-P6, exact text, prune what the vendored subset does not carry (the lazy exports outside the
+  closure, the sm120 arch family); everything else is byte-identical to the commit, SPDX headers included.
+* The one file vendored from OUTSIDE ``python/cudnn`` (``EXTRA_FILES``) is pinned by digest like every closure file: ``closure.json``
+  carries its blob's sha256 (``extra_files``, written by ``build_closure.py``) and the exporter stops when the blob moved.
 * The generated files (the package root, the shim ``_compiled_module.py``, ``VENDOR.md``, ``VENDOR_MANIFEST.json``) carry a
   FlashInfer-side Apache-2.0 header and name the origin + commit.
 * ``--selftest`` imports the vendored package in a SUBPROCESS with the real ``cudnn`` package shadowed
@@ -58,6 +62,18 @@ GEN_HEADER = "# Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0
 #     shim instead.
 # P3 (REGEX_PATCHES below): comment / docstring lines that name an internal host or an internal file path, or use internal
 #     workflow vocabulary, are reworded (the sentence stays, the name goes).  No code changes.
+# P4: the cache-write launcher (`run_cache_write`) pins every operand to ONE CUDA device, the sources' -- the host contract of every
+#     other block launcher (`_check_one_cuda_device` in kernels/quantize.py): a CPU `slot_mapping` passed the dtype / rank / length
+#     checks and the kernel dereferenced a host address.  The block's own execute preflight already pins the pools and the slot
+#     mapping to `h`'s device, so the route was guarded; the launcher's standalone contract was not.  A fix carried AHEAD of its
+#     upstream landing (the same hunk, no vendor marker): dropped at the re-vendor that follows it.
+# P5: gemm/__init__.py's lazy-export table names two modules outside the closure (cudnn.gemm.mhc_projection_bwd, cudnn.gemm.ops):
+#     importlib would resolve them against whatever `cudnn` package is installed, never the vendored tree.  The table is emptied
+#     (`__all__` with it), so an absent name is an AttributeError by name.
+# P6: the vendored tree carries the sm100 arch family only.  arch_family.py serves it for every device (a pin on another family
+#     through CUDNN_FRONTEND_GEMM_ARCH_FAMILY is refused by name, never a ModuleNotFoundError at the facade import), and
+#     kernel_registry.py drops the sm120 template registrations (their template files are not vendored, and their block-quant
+#     gate imported the sm120 compiler).
 PATCHES = {
     "gated_attention_block/__init__.py": [
         (
@@ -81,6 +97,72 @@ PATCHES = {
             "P2",
             '_pybind_module = importlib.import_module(module_name, package="cudnn")\n',
             "from . import _compiled_module as _pybind_module  # [vendor.py P2] the shim, not the nanobind extension\n",
+        ),
+    ],
+    "gated_attention_block/kernels/cache_write.py": [
+        (
+            "P4",
+            '    check_pool(pool_a, "pool_a", h=r.h, page_size=r.page_size, d=r.d, dtype=r.dtype)\n'
+            "    if pool_b is not None:\n"
+            '        check_pool(pool_b, "pool_b", h=r.h, page_size=r.page_size, d=r.d, dtype=r.dtype)\n'
+            '    check_slot_mapping(slot, "slot_mapping", t=t)\n',
+            "    # Every operand on ONE CUDA device, src_a's (the kernel reads them through device pointers): a CPU slot_mapping -- a serving\n"
+            "    # stack's `torch.tensor(slots, dtype=torch.int32)` with no device= -- passed the dtype / rank / length checks and the kernel\n"
+            "    # dereferenced a host address, an illegal-address fault that is sticky for the process; `is_cuda` alone cannot tell a tensor on\n"
+            "    # ANOTHER GPU from a local one, so the pools and the slot mapping are compared against src_a's device by name.\n"
+            "    if not src_a.is_cuda:\n"
+            '        raise ValueError(f"src_a must be a CUDA tensor (the kernel reads every operand through a device pointer), got device {src_a.device}")\n'
+            "    if src_b is not None and src_b.device != src_a.device:\n"
+            '        raise ValueError(f"src_b must be on {src_a.device} with src_a, got {src_b.device}")\n'
+            '    check_pool(pool_a, "pool_a", h=r.h, page_size=r.page_size, d=r.d, dtype=r.dtype, device=src_a.device)\n'
+            "    if pool_b is not None:\n"
+            '        check_pool(pool_b, "pool_b", h=r.h, page_size=r.page_size, d=r.d, dtype=r.dtype, device=src_a.device)\n'
+            '    check_slot_mapping(slot, "slot_mapping", t=t, device=src_a.device)\n',
+        ),
+    ],
+    "gemm/__init__.py": [
+        (
+            "P5",
+            "_LAZY_EXPORTS = {\n"
+            '    "MhcProjectionBackward": ("cudnn.gemm.mhc_projection_bwd", "MhcProjectionBackward"),\n'
+            '    "mhc_projection_backward": ("cudnn.gemm.mhc_projection_bwd", "mhc_projection_backward"),\n'
+            '    "moe_grouped_matmul": ("cudnn.gemm.ops", "moe_grouped_matmul"),\n'
+            '    "situ_mlp": ("cudnn.gemm.ops", "situ_mlp"),\n'
+            '    "swiglu_mlp": ("cudnn.gemm.ops", "swiglu_mlp"),\n'
+            '    "swiglu_moe": ("cudnn.gemm.ops", "swiglu_moe"),\n'
+            "}\n",
+            "_LAZY_EXPORTS: dict = {}  # [vendor.py P5] the lazy exports (mhc_projection_bwd, ops) lie outside the vendored closure\n",
+        ),
+    ],
+    "gemm/frost/arch_family.py": [
+        (
+            "P6",
+            'FAMILIES: tuple[str, ...] = ("sm100", "sm120")\n',
+            'FAMILIES: tuple[str, ...] = ("sm100",)  # [vendor.py P6] the vendored tree carries the sm100 family only\n',
+        ),
+        (
+            "P6",
+            "def family_for_arch(arch: int | None) -> str:\n"
+            '    """The per-arch tree that serves SM ``arch``: ``sm120`` for SM 12.x, the\n'
+            '    :data:`DEFAULT_FAMILY` for everything else, ``None`` included."""\n'
+            "    if arch is not None and 120 <= arch < 130:\n"
+            '        return "sm120"\n'
+            "    return DEFAULT_FAMILY\n",
+            "def family_for_arch(arch: int | None) -> str:\n"
+            '    """[vendor.py P6] The vendored tree carries one per-arch tree, :data:`DEFAULT_FAMILY`:\n'
+            "    it serves every SM ``arch`` (``None`` included); a device outside its range is\n"
+            '    declined, by name, by the kernels\' own device gates."""\n'
+            "    return DEFAULT_FAMILY\n",
+        ),
+    ],
+    "gemm/frost/kernel_registry.py": [
+        (
+            "P6",
+            "        template_cls=Sm120KernelTemplate,\n    ),\n)\n",
+            "        template_cls=Sm120KernelTemplate,\n    ),\n)\n"
+            "# [vendor.py P6] the vendored tree carries the sm100 arch family only: the sm120 registrations above are dropped (their\n"
+            "# template files are not vendored, and their block-quant gate imports the sm120 compiler).\n"
+            "TEMPLATES = tuple(t for t in TEMPLATES if t.family in arch_family.FAMILIES)\n",
         ),
     ],
 }
@@ -230,6 +312,9 @@ STRING_SITE_FILES = {
 # nanobind extension in cuDNN Frontend; its retired Python frame implementation lives in the FE test tree as a differential oracle
 # ("the retired Python frame implementations live solely in the differential tests", sdpa/fwd/prepared.py) and is vendored here,
 # byte-faithful (imports rewritten like every other file), as the frame logic the FlashInfer-side Python binder delegates to.
+# Pinned by digest like every closure file: closure.json's `extra_files` (build_closure.py's EXTRA_FILES) carries the blob's sha256
+# at the pinned commit, and the export STOPS when the blob moved -- the Python binder calls this file's private frame helpers
+# (bind_dense / bind_dense_split / bind_thd, resolve_thd_geometry, initialize_thd_stats), so a moved blob is re-checked against it.
 EXTRA_FILES = [
     (
         "test/python/sdpa/frost/sdpa_binding_reference.py",
@@ -631,7 +716,7 @@ def gen_vendor_md(
         f"Origin: {ORIGIN} (`python/cudnn`), commit `{commit}` (cuDNN Frontend {fe_version}).  Import path: `{package}`.\n",
         f"Files: {closure['n_files']} source files ({closure['total_bytes']:,} bytes, {closure['total_lines']:,} lines) copied from the commit's blobs "
         f"(`git show {commit}:<path>`; VENDOR_MANIFEST.json holds each file's source sha256 and the vendored file's sha256) and one file from the FE test tree "
-        f"(`sdpa/fwd/_binding_reference.py`, see Native seams), plus the generated "
+        f"(`sdpa/fwd/_binding_reference.py`, see Native seams; its blob digest is pinned in `closure.json` like the closure files'), plus the generated "
         f"`__init__.py`, `_compiled_module.py` (the shim) and these two notes.  Imports rewritten: {counts['rewritten_imports']} statements in {counts['files_with_rewrites']} files "
         f"(and {counts['string_sites']} importlib string references in `engines/manifest.py`).\n",
         "## License\n",
@@ -647,8 +732,9 @@ def gen_vendor_md(
         "```\n"
         "`closure.json` (the closure list: every file, its module, licence and the digest of its blob at the pinned commit) is produced by `build_closure.py` "
         "from the import traces of `trace_closure.py` (run on a host for the declarations and on a cc 10.7 device for compile + execute of each form); "
-        "a re-vendor at a new commit re-runs `vendor.py` alone when the route is unchanged (the exporter stops on any blob whose digest moved: recompute "
-        "the closure then), and re-runs the tracer + builder when the FE route changes (a new kernel file, a new lazily imported module).  "
+        "a re-vendor at a new commit re-runs `vendor.py` alone when the route is unchanged (the exporter stops on any blob whose digest moved -- the "
+        "FE test-tree file `sdpa/fwd/_binding_reference.py` included, pinned in `closure.json`'s `extra_files`: re-check the Python binder against it, then "
+        "recompute the closure), and re-runs the tracer + builder when the FE route changes (a new kernel file, a new lazily imported module).  "
         "The self-test must pass before the vendored tree is committed; the FlashInfer test `test_support.py` re-digests every file against "
         "`VENDOR_MANIFEST.json`.\n",
         "## Patches (exact text, applied once each; everything else is byte-identical to the commit)\n",
@@ -660,6 +746,17 @@ def gen_vendor_md(
         + ", ".join(f"`{f}` ({len(ps)})" for f, ps in REGEX_PATCHES.items())
         + f" | {sum(len(ps) for ps in REGEX_PATCHES.values())} comment / docstring lines that named an internal host or an internal file path, or used internal workflow vocabulary, are reworded "
         "(the sentence stays, the name goes; the context-anchored patterns and the replacements are `REGEX_PATCHES` in `vendor.py`); no code changes; dropped at the next re-vendor once the upstream files are scrubbed |\n",
+        "| P4 | `gated_attention_block/kernels/cache_write.py` | `run_cache_write` pins every operand to ONE CUDA device, the sources' (`src_a.is_cuda`, `src_b` on it, the pools and "
+        "`slot_mapping` compared against it through the contract helpers' `device=`): a CPU `slot_mapping` passed the dtype / rank / length checks and the kernel dereferenced a host "
+        "address.  The block's execute preflight already pins the pools and the slot mapping to `h`'s device (the route was guarded); this is the launcher's standalone contract.  "
+        "A fix carried ahead of its upstream landing -- the same hunk, no vendor marker -- dropped at the re-vendor that follows it |\n",
+        "| P5 | `gemm/__init__.py` | the lazy-export table (`_LAZY_EXPORTS`, and `__all__` with it) is emptied: its six entries named `cudnn.gemm.mhc_projection_bwd` and `cudnn.gemm.ops`, "
+        "modules outside the closure that `importlib.import_module` would have resolved against whatever `cudnn` package is installed, never the vendored tree; an absent name is "
+        "an `AttributeError` by name |\n",
+        '| P6 | `gemm/frost/arch_family.py` (2), `gemm/frost/kernel_registry.py` (1) | the vendored tree carries the sm100 arch family only: `FAMILIES = ("sm100",)` and `family_for_arch` '
+        "serve it for every device (the `compiler` / `epilogue_codegen` facades become the sm100 modules on any GPU and on no GPU; a `CUDNN_FRONTEND_GEMM_ARCH_FAMILY` pin on another "
+        "family is refused by name, never a `ModuleNotFoundError` at the facade import), and `TEMPLATES` drops the sm120 registrations (their template files are not vendored, and their "
+        "block-quant gate imported the sm120 compiler) |\n",
         '| string sites | `engines/manifest.py` | the `("cudnn._gemm_validate", "validate_graph")`-style module references importlib resolves at runtime are rewritten to the vendored path (the same rule renames that module\'s logger, `logging.getLogger("cudnn.engines.manifest")`, into the vendored namespace) |\n',
         "## Excluded (not in the closure; a lazily imported excluded path raises `ModuleNotFoundError` at the call site, never silently)\n",
         "".join(f"- `{k}`: {v}\n" for k, v in closure["excluded"].items()),
@@ -810,8 +907,19 @@ def main():
                 "bytes": len(new_text.encode()),
             }
         )
+    extra_pins = {e["path"]: e for e in closure.get("extra_files", [])}
     for src_path, rel, why in EXTRA_FILES:
+        pin = extra_pins.get(src_path)
+        if pin is None:
+            raise SystemExit(
+                f"{src_path}: closure.json carries no digest pin for this file (extra_files) -- re-run build_closure.py at this commit"
+            )
         blob = git_blob(fe, commit, src_path)
+        if hashlib.sha256(blob).hexdigest() != pin["sha256"]:
+            raise SystemExit(
+                f"{src_path}: the commit's blob differs from closure.json's digest -- the Python SDPA binder (_sdpa_binder.py) "
+                "builds on this file's private frame helpers: re-check it against the new blob, then recompute the closure at this commit"
+            )
         text = blob.decode("utf-8")
         lic = re.search(r"SPDX-License-Identifier:\s*([^\n]+)", text)
         new_text, n = rw.rewrite(text, rel)

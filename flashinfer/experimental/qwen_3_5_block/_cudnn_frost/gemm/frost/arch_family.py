@@ -35,7 +35,7 @@ FROST_DIR = Path(__file__).parent
 
 #: The per-arch packages, best first (``kernel_registry._AUTO_PIPELINE_ORDER``
 #: is the pipeline-level twin).
-FAMILIES: tuple[str, ...] = ("sm100", "sm120")
+FAMILIES: tuple[str, ...] = ("sm100",)  # [vendor.py P6] the vendored tree carries the sm100 family only
 
 #: Serves a GPU no other family claims -- and no GPU at all (render-only / CI).
 #: sm100 is the flagship line and the one the auto path ranks first.
@@ -60,10 +60,9 @@ def current_arch(device=None) -> int | None:
 
 
 def family_for_arch(arch: int | None) -> str:
-    """The per-arch tree that serves SM ``arch``: ``sm120`` for SM 12.x, the
-    :data:`DEFAULT_FAMILY` for everything else, ``None`` included."""
-    if arch is not None and 120 <= arch < 130:
-        return "sm120"
+    """[vendor.py P6] The vendored tree carries one per-arch tree, :data:`DEFAULT_FAMILY`:
+    it serves every SM ``arch`` (``None`` included); a device outside its range is
+    declined, by name, by the kernels' own device gates."""
     return DEFAULT_FAMILY
 
 
