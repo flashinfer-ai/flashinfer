@@ -127,8 +127,8 @@ RESERVED_SMS = 2
 # instead of one persistent grid.  ``0`` = the gate never fires.  Every gate is
 # inclusive at its threshold and changes neither the tile table nor the stored
 # bits.  Measured per architecture: SM100 / SM103 ship the small-row word gate
-# and the per-destination launch gate, SM90 ships the large-row reserved-SM gate,
-# SM107 ships none;
+# and the per-destination launch gate, SM90 ships the small-row word gate and the
+# large-row reserved-SM gate, SM107 ships none;
 # ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` (see the Cake backend) overrides a
 # session's gates in either direction.
 SHAPE_GATE_NAMES: tuple[str, ...] = (
@@ -138,8 +138,10 @@ SHAPE_GATE_NAMES: tuple[str, ...] = (
 )
 SHAPE_GATE_OFF = 0
 SHAPE_GATE_DEFAULT_BY_ARCH: dict[str, dict[str, int]] = {
+    # SM90: the small-row word gate (4096) and the large-row reserved-SM gate (16384) on every group size; the
+    # per-destination launch gate off.
     "sm_90a": {
-        "words_capacity_small_m": SHAPE_GATE_OFF,
+        "words_capacity_small_m": 4096,
         "reserved_sms_large_m": 16384,
         "per_dest_large_m": SHAPE_GATE_OFF,
     },

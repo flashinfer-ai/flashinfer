@@ -322,9 +322,9 @@ def test_fold_barrier_resolution(monkeypatch):
 
 def test_shape_gate_default_table():
     """The row-count gates per architecture: one readiness word per destination for calls of at most 4096 rows and one
-    producer launch per destination run for calls of at least 16384 rows on SM100 / SM103; on SM90 the persistent
-    producer grid over every SM (no reserved SMs) for calls of at least 16384 rows and the other two gates off; on
-    SM107 every gate is off."""
+    producer launch per destination run for calls of at least 16384 rows on SM100 / SM103; on SM90 one readiness word
+    per destination for calls of at most 4096 rows, the persistent producer grid over every SM (no reserved SMs) for
+    calls of at least 16384 rows, and the per-destination launch gate off; on SM107 every gate is off."""
 
     assert plans.SHAPE_GATE_NAMES == (
         "words_capacity_small_m",
@@ -334,7 +334,7 @@ def test_shape_gate_default_table():
     assert plans.SHAPE_GATE_OFF == 0 and plans.RESERVED_SMS == 2
     assert plans.SHAPE_GATE_DEFAULT_BY_ARCH == {
         "sm_90a": {
-            "words_capacity_small_m": 0,
+            "words_capacity_small_m": 4096,
             "reserved_sms_large_m": 16384,
             "per_dest_large_m": 0,
         },
@@ -401,11 +401,16 @@ def test_shape_gate_default_table():
     assert plans.gate_rows(blackwell, 16384).words_capacity_per_dest is None
     assert plans.gate_rows(blackwell, 16384).reserved_sms is None
     hopper = plans.default_shape_gates("sm_90a")
-    for rows in (128, 4096, 16383):
+    # SM90 ships the small-row word gate too (one readiness word per destination).
+    for rows in (128, 4096):
         verdict = plans.gate_rows(hopper, rows)
-        assert verdict.fired == () and verdict.producer_launches == "persistent"
-        assert verdict.words_capacity_per_dest is None and verdict.reserved_sms is None
+        assert verdict.fired == ("words_capacity_small_m",)
+        assert verdict.producer_launches == "persistent"
+        assert verdict.words_capacity_per_dest == 1 and verdict.reserved_sms is None
         assert verdict.summary()["rows"] == rows
+    verdict = plans.gate_rows(hopper, 16383)
+    assert verdict.fired == () and verdict.producer_launches == "persistent"
+    assert verdict.words_capacity_per_dest is None and verdict.reserved_sms is None
     for rows in (16384, 65536):
         verdict = plans.gate_rows(hopper, rows)
         assert verdict.fired == ("reserved_sms_large_m",)

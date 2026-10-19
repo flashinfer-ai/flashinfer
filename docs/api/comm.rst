@@ -645,9 +645,10 @@ Per-architecture row-count gates shape each call's host plan: on SM100 and
 SM103 a call with at most 4096 rows per rank publishes one readiness word per
 destination, and a call with at least 16384 rows per rank launches the producer
 once per destination run of its tile table (the first launch carrying the
-folded rendezvous); on SM90 a call with at least 16384 rows per rank runs the
-persistent producer grid over every SM (no reserved SMs) and the other two gates
-are off; on SM107 every gate is off.  The environment variable ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES``
+folded rendezvous); on SM90 a call with at most 4096 rows per rank publishes one
+readiness word per destination, a call with at least 16384 rows per rank runs the
+persistent producer grid over every SM (no reserved SMs), and the per-destination
+launch gate is off; on SM107 every gate is off.  The environment variable ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES``
 (``auto`` / ``off`` /
 ``words_capacity_small_m=N,reserved_sms_large_m=N,per_dest_large_m=N``)
 overrides them per session, rank-uniformly; ``describe()`` reports the resolved
