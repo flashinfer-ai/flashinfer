@@ -40,6 +40,7 @@ from .api import (
     CudnnFrostMxfp8Mxfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    CakeStepFunConfig,
     CakeWarpDecodeConfig,
     CudnnGroupedGemmBf16Config,
     CudnnGroupedGemmFp8PerTensorConfig,
@@ -72,6 +73,7 @@ from .api import (
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
+    SM12xNvfp4Config,
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
@@ -81,6 +83,7 @@ from .api import (
 from .runners import (
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    CakeStepFunRunner,
     CakeWarpDecodeRunner,
     CudnnGroupedGemmBf16Runner,
     CudnnGroupedGemmFp8PerTensorRunner,
@@ -110,6 +113,7 @@ from .runners import (
     SM12xFp8Runner,
     SM12xMxfp8Mxfp4Runner,
     SM12xNvfp4Bf16Runner,
+    SM12xNvfp4Runner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
@@ -124,6 +128,7 @@ from .utils import map_to_hybrid_bucket
 
 # Concrete host runners for configured candidates; device kernel loading stays deferred.
 _RunnerT = Union[
+    CakeStepFunRunner,
     CudnnFrostBf16MoeRunner,
     CudnnFrostMxfp8MoeRunner,
     CudnnFrostNvfp4MoeRunner,
@@ -157,6 +162,7 @@ _RunnerT = Union[
     SM12xFp8Runner,
     SM12xMxfp8Mxfp4Runner,
     SM12xNvfp4Bf16Runner,
+    SM12xNvfp4Runner,
     TrtllmFp4RoutedRunner,
     TrtllmBf16RoutedRunner,
     TrtllmFp8BlockRunner,
@@ -168,6 +174,7 @@ _RunnerT = Union[
 
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
+    CakeStepFunConfig: CakeStepFunRunner,
     CudnnFrostBf16Config: CudnnFrostBf16MoeRunner,
     CudnnFrostMxfp8Config: CudnnFrostMxfp8MoeRunner,
     CudnnFrostNvfp4Config: CudnnFrostNvfp4MoeRunner,
@@ -201,6 +208,7 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     SM12xFp8Config: SM12xFp8Runner,
     SM12xMxfp8Mxfp4Config: SM12xMxfp8Mxfp4Runner,
     SM12xNvfp4Bf16Config: SM12xNvfp4Bf16Runner,
+    SM12xNvfp4Config: SM12xNvfp4Runner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
     TrtllmBf16Config: TrtllmBf16RoutedRunner,
     TrtllmFp8BlockConfig: TrtllmFp8BlockRunner,

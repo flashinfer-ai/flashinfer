@@ -48,7 +48,6 @@ from .dense_mqa import (
 )
 
 FUSED_ROW_BYTES = HEAD_DIM + 4  # one FP8 row + its FP32 scale
-LOGITS_DTYPES = ("float32",)
 
 
 def paged_policy():
@@ -255,7 +254,6 @@ def paged_route_name(
     num_heads,
     block_kv,
     next_n,
-    logits_dtype="float32",
     *,
     batch=None,
     max_context_len=None,
@@ -267,10 +265,7 @@ def paged_route_name(
     windows (``static_windows``; applied only when ``arch`` and ``max_context_len`` are given), where the static
     route -- or the TEXT route the window names (``static_window_routes``) -- is returned; without ``batch`` the
     static route."""
-    if logits_dtype not in LOGITS_DTYPES:
-        raise ValueError(f"logits_dtype must be one of {LOGITS_DTYPES}")
-    suffix = "" if logits_dtype == "float32" else f":{logits_dtype}"
-    static = f"paged:fp8:h{int(num_heads)}:p{int(block_kv)}:n{int(next_n)}{suffix}"
+    static = f"paged:fp8:h{int(num_heads)}:p{int(block_kv)}:n{int(next_n)}"
     if batch is None:
         return static
     dynamic = paged_dynamic_scheduler()
@@ -324,7 +319,6 @@ def paged_route_available(
     num_heads,
     block_kv,
     next_n,
-    logits_dtype="float32",
     *,
     arch=None,
     batch=None,
@@ -337,7 +331,7 @@ def paged_route_available(
         if num_heads not in paged_heads() or block_kv not in paged_block_sizes():
             return False
         paged_next_n_atoms(next_n)
-        route = paged_route_name(num_heads, block_kv, next_n, logits_dtype)
+        route = paged_route_name(num_heads, block_kv, next_n)
     except ValueError:
         return False
     if route not in _catalog()["paged_routes"]:
@@ -352,7 +346,6 @@ def paged_route_available(
         num_heads,
         block_kv,
         next_n,
-        logits_dtype,
         batch=batch,
         max_context_len=max_context_len,
         arch=arch,
@@ -504,7 +497,6 @@ class PagedMqaPlan:
         schedule_meta=None,
         output=None,
         sm_count=None,
-        logits_dtype="float32",
         enforce_admission=True,
     ):
         import torch
@@ -565,15 +557,14 @@ class PagedMqaPlan:
             or max_context_len > int(block_table.shape[1]) * block_kv
         ):
             raise ValueError("max_context_len must be in 1..S * block_kv")
-        if not paged_route_available(num_heads, block_kv, next_n, logits_dtype):
+        if not paged_route_available(num_heads, block_kv, next_n):
             raise ValueError(
-                f"no exported paged MQA route for {num_heads} heads, page {block_kv}, next_n {next_n}, {logits_dtype}"
+                f"no exported paged MQA route for {num_heads} heads, page {block_kv}, next_n {next_n}"
             )
         route_name = paged_route_name(
             num_heads,
             block_kv,
             next_n,
-            logits_dtype,
             batch=batch,
             max_context_len=max_context_len,
             arch=arch,

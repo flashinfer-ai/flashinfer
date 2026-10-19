@@ -270,6 +270,7 @@ kernel_minimax_h3_norm_adaln_bf16(__nv_bfloat16* __restrict__ x, __nv_bfloat16* 
     const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     int row = bid * ROWS_PER_CTA + warp;
     int _min_0 = ((row) < (M - 1) ? (row) : (M - 1));
     int load_row = _min_0;
@@ -2156,6 +2157,7 @@ kernel_minimax_h3_norm_adaln_mxfp8(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
     const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     int row = bid * ROWS_PER_CTA + warp;
     int _min_0 = ((row) < (M - 1) ? (row) : (M - 1));
     int load_row = _min_0;
@@ -2201,6 +2203,7 @@ kernel_minimax_h3_norm_adaln_mxfp8(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
         unsigned long long sf_row_base = (unsigned long long)m_tile * (unsigned long long)SF_K_TILES * (unsigned long long)SF_TILE_BYTES + (unsigned long long)(row_in_tile & 31) * 16 + (unsigned long long)(row_in_tile >> 5) * 4;
         int quad_lane = lane & 3;
         int block_in_vec = lane >> 2;
+        unsigned long long sf_lane_base = sf_row_base + (unsigned long long)(block_in_vec >> 2) * (unsigned long long)SF_TILE_BYTES + (unsigned long long)(block_in_vec & 3);
         long long table_row = adaln_index[row];
         if (table_row >= 0 && table_row < (long long)adaln_rows) {
             unsigned long long table_base = (unsigned long long)table_row * (unsigned long long)adaln_row_stride;
@@ -2340,15 +2343,16 @@ kernel_minimax_h3_norm_adaln_mxfp8(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
                 float o2 = _shfl_xor_1;
                 float _max_1 = max_noftz(absmax, o2);
                 absmax = _max_1;
-                float scale = absmax / 448.0f;
-                unsigned int scale_bits = __as_u32(scale);
-                unsigned int exponent = scale_bits >> 23 & 255;
-                unsigned int mantissa = scale_bits & 8388607;
-                unsigned int has_mantissa = ((mantissa != 0) ? 1 : 0);
-                unsigned int normal = ((exponent != 0) ? 1 : 0);
-                unsigned int large_subnormal = ((mantissa > 4194304) ? 1 : 0);
-                unsigned int _min_1 = ((exponent + (has_mantissa & (normal | large_subnormal))) < (254) ? (exponent + (has_mantissa & (normal | large_subnormal))) : (254));
-                unsigned int scale_byte = _min_1;
+                unsigned int absmax_bits = __as_u32(absmax);
+                unsigned int absmax_exp = absmax_bits >> 23 & 255;
+                unsigned int absmax_mant = absmax_bits & 8388607;
+                unsigned int above_1p75 = ((absmax_mant > 6291456) ? 1 : 0);
+                unsigned int exp_plus = absmax_exp + above_1p75;
+                unsigned int scale_byte_zero = 0;
+                unsigned int scale_byte_shifted = exp_plus - 8;
+                unsigned int scale_byte_finite = ((exp_plus < 8) ? scale_byte_zero : scale_byte_shifted);
+                unsigned int scale_byte_inf = 254;
+                unsigned int scale_byte = ((absmax_exp == 255) ? scale_byte_inf : scale_byte_finite);
                 unsigned int inverse_nonzero_bits = 254 - scale_byte << 23;
                 unsigned int zero_bits = 0;
                 unsigned int inverse_bits = ((scale_byte == 0) ? zero_bits : inverse_nonzero_bits);
@@ -2384,10 +2388,7 @@ kernel_minimax_h3_norm_adaln_mxfp8(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
                     *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(a_q + (row_base + (unsigned long long)k_1)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
                 }
                 if (quad_lane == 0) {
-                    int block = i_1 * 8 + block_in_vec;
-                    int k_tile = block >> 2;
-                    int sf_col = block & 3;
-                    *(reinterpret_cast<unsigned char*>(a_sf + (sf_row_base + (unsigned long long)k_tile * (unsigned long long)SF_TILE_BYTES + (unsigned long long)sf_col)) + (0)) = (unsigned char)(scale_byte);
+                    *(reinterpret_cast<unsigned char*>(a_sf + (sf_lane_base + (unsigned long long)(i_1 * (2 * SF_TILE_BYTES)))) + (0)) = (unsigned char)(scale_byte);
                 }
             }
         } else {
@@ -2398,10 +2399,7 @@ kernel_minimax_h3_norm_adaln_mxfp8(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
                 int k_2 = (lane + i_2 * 32) * 8;
                 *(reinterpret_cast<unsigned long long*>(a_q + (row_base + (unsigned long long)k_2)) + (0)) = zero_word;
                 if (quad_lane == 0) {
-                    int block_1 = i_2 * 8 + block_in_vec;
-                    int k_tile_1 = block_1 >> 2;
-                    int sf_col_1 = block_1 & 3;
-                    *(reinterpret_cast<unsigned char*>(a_sf + (sf_row_base + (unsigned long long)k_tile_1 * (unsigned long long)SF_TILE_BYTES + (unsigned long long)sf_col_1)) + (0)) = (unsigned char)(zero_byte);
+                    *(reinterpret_cast<unsigned char*>(a_sf + (sf_lane_base + (unsigned long long)(i_2 * (2 * SF_TILE_BYTES)))) + (0)) = (unsigned char)(zero_byte);
                 }
             }
         }
@@ -3975,6 +3973,7 @@ kernel_minimax_h3_norm_adaln_nvfp4(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
     const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     int row = bid * ROWS_PER_CTA + warp;
     int _min_0 = ((row) < (M - 1) ? (row) : (M - 1));
     int load_row = _min_0;
@@ -4021,6 +4020,7 @@ kernel_minimax_h3_norm_adaln_nvfp4(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
         unsigned long long sf_row_base = (unsigned long long)m_tile * (unsigned long long)SF_K_TILES * (unsigned long long)SF_TILE_BYTES + (unsigned long long)(row_in_tile & 31) * 16 + (unsigned long long)(row_in_tile >> 5) * 4;
         int pair_lane = lane & 1;
         int block_in_vec = lane >> 1;
+        unsigned long long sf_lane_base = sf_row_base + (unsigned long long)(block_in_vec >> 2) * (unsigned long long)SF_TILE_BYTES + (unsigned long long)(block_in_vec & 3);
         float g = a_global_scale[0];
         float _rcp_0 = approx_rcp(g);
         float inv_g = _rcp_0;
@@ -4167,13 +4167,13 @@ kernel_minimax_h3_norm_adaln_nvfp4(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
                 asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_0) : "f"(zero_f32), "f"(sf_value));
                 uint16_t sf_pair = _e4m3x2_f32_0;
                 unsigned int sf_byte = (unsigned int)sf_pair & 255;
-                unsigned int sf_exp = sf_byte >> 3 & 15;
-                unsigned int sf_mant = sf_byte & 7;
-                unsigned int normal_bits = sf_exp + 120 << 23 | sf_mant << 20;
-                float sf_normal = 0.0f;
-                sf_normal = reinterpret_cast<float*>(&normal_bits)[0];
-                float sf_subnormal = (float)sf_mant * 0.001953125f;
-                float sf_f = ((sf_exp == 0) ? sf_subnormal : sf_normal);
+                uint32_t _e4m3x2_to_f16x2_0;
+                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_e4m3x2_to_f16x2_0) : "h"((uint16_t)(sf_pair)));
+                unsigned int sf_f16x2 = _e4m3x2_to_f16x2_0;
+                unsigned int sf_f16_lo = sf_f16x2 & 65535;
+                float _cvt_f32_f16_0;
+                asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_0) : "h"((uint16_t)(sf_f16_lo)));
+                float sf_f = _cvt_f32_f16_0;
                 float _rcp_2 = approx_rcp(sf_f * inv_g);
                 float out_scale_nonzero = _rcp_2;
                 float out_scale = ((absmax == 0.0f) ? 0.0f : out_scale_nonzero);
@@ -4192,10 +4192,7 @@ kernel_minimax_h3_norm_adaln_nvfp4(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
                 asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed[0]) : "f"(vals[0]), "f"(vals[1]), "f"(vals[2]), "f"(vals[3]), "f"(vals[4]), "f"(vals[5]), "f"(vals[6]), "f"(vals[7]));
                 *(reinterpret_cast<unsigned int*>(a_q + (word_base + (unsigned long long)(k_1 >> 3))) + (0)) = packed[0];
                 if (pair_lane == 0) {
-                    int block = i_1 * 16 + block_in_vec;
-                    int k_tile = block >> 2;
-                    int sf_col = block & 3;
-                    *(reinterpret_cast<unsigned char*>(a_sf + (sf_row_base + (unsigned long long)k_tile * (unsigned long long)SF_TILE_BYTES + (unsigned long long)sf_col)) + (0)) = (unsigned char)(sf_byte);
+                    *(reinterpret_cast<unsigned char*>(a_sf + (sf_lane_base + (unsigned long long)(i_1 * (4 * SF_TILE_BYTES)))) + (0)) = (unsigned char)(sf_byte);
                 }
             }
         } else {
@@ -4205,10 +4202,7 @@ kernel_minimax_h3_norm_adaln_nvfp4(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
                 int k_2 = (lane + i_2 * 32) * 8;
                 *(reinterpret_cast<unsigned int*>(a_q + (word_base + (unsigned long long)(k_2 >> 3))) + (0)) = zero_word;
                 if (pair_lane == 0) {
-                    int block_1 = i_2 * 16 + block_in_vec;
-                    int k_tile_1 = block_1 >> 2;
-                    int sf_col_1 = block_1 & 3;
-                    *(reinterpret_cast<unsigned char*>(a_sf + (sf_row_base + (unsigned long long)k_tile_1 * (unsigned long long)SF_TILE_BYTES + (unsigned long long)sf_col_1)) + (0)) = (unsigned char)(zero_word);
+                    *(reinterpret_cast<unsigned char*>(a_sf + (sf_lane_base + (unsigned long long)(i_2 * (4 * SF_TILE_BYTES)))) + (0)) = (unsigned char)(zero_word);
                 }
             }
         }
