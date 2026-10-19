@@ -16,7 +16,7 @@ from flashinfer.tllm_enums import SfLayout
 from tests.utils_fp8 import mxfp8_quantize_reference
 
 from .conftest import mnnvl_available
-from .moe_a2a_driver import MoeA2ADriver, workspace_bytes_per_rank
+from .cake_a2a_driver import CakeA2ADriver, workspace_bytes_per_rank
 
 
 def test_cake_ops_are_not_public_comm_api():
@@ -879,7 +879,7 @@ def _run_public_mpi2_cycle():
         eplb_stats_num_experts=5,
     )
     mapping = Mapping(rank=rank, moe_ep_size=2, tp_size=2, world_size=2)
-    collective = MoeA2ADriver(
+    collective = CakeA2ADriver(
         mapping,
         max_num_tokens=max_tokens,
         top_k=top_k,
@@ -922,7 +922,7 @@ def _run_public_mpi2_cycle():
         _HIDDEN_SIZE,
         extra_payload_bytes_per_token=extra_payload_bytes,
     )
-    topk8_collective = MoeA2ADriver(
+    topk8_collective = CakeA2ADriver(
         mapping,
         max_num_tokens=max_tokens,
         top_k=8,

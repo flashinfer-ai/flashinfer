@@ -17,7 +17,7 @@
 The cache is a pure host-side optimization: it skips rebuilding the workspace-backed
 views on every dispatch. These tests pin the three properties that make that safe, and
 they run without a GPU or an MPI harness by stubbing the FFI module -- the real
-``tests/comm/test_cake_moe_alltoall.py`` path needs multi-rank NVLink hardware.
+``tests/comm/test_cake_moe_alltoall_multi_gpu.py`` path needs multi-rank NVLink hardware.
 """
 
 import torch

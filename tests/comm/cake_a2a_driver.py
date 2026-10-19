@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Test driver for the kernel-level operations of the Cake MoE all-to-all.
 
-``MoeA2ADriver`` allocates and initializes an MNNVL workspace, shared by
+``CakeA2ADriver`` allocates and initializes an MNNVL workspace, shared by
 drivers with the same geometry, and runs the ``dispatch``,
 ``sanitize_expert_ids`` and ``combine`` operations of
 :mod:`flashinfer.moe_ep.backends.split.comm.cake.kernels` on it, carrying the
@@ -19,7 +19,7 @@ from flashinfer.moe_ep.backends.split.comm.cake import kernels as cake_kernels
 from flashinfer.moe_ep.backends.split.comm.cake.kernels import metainfo_index
 from flashinfer.tllm_enums import SfLayout
 
-__all__ = ["MoeA2ADriver", "metainfo_index", "workspace_bytes_per_rank"]
+__all__ = ["CakeA2ADriver", "metainfo_index", "workspace_bytes_per_rank"]
 
 
 def workspace_bytes_per_rank(
@@ -41,7 +41,7 @@ def workspace_bytes_per_rank(
     )
 
 
-class MoeA2ADriver:
+class CakeA2ADriver:
     # Workspaces keyed by (bytes per rank, ep_rank, ep_size, max tokens,
     # EPLB experts).
     _WORKSPACES: dict = {}
