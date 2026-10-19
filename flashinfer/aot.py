@@ -889,8 +889,10 @@ def gen_all_modules(
             # SM103 registers its own FP4 quantization, CUTLASS fused MoE and FP4 GEMM
             # below, and takes the SM100f TGV GEMMs instead of these sm_100a ones.
             jit_specs.append(gen_fp4_quantization_sm100_module())
-            jit_specs.append(gen_cutlass_fused_moe_sm100_module())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
+        if has_sm100 or has_sm107 or has_sm110:
+            # The SM100-named MoE also serves SM107 (via SM100f) and SM110.
+            jit_specs.append(gen_cutlass_fused_moe_sm100_module())
         # Both TGV variants share a module name, so a build that also targets SM103
         # must keep only the SM100f one, which runs on both.
         if has_sm100 and not has_sm103:
@@ -909,9 +911,11 @@ def gen_all_modules(
             jit_specs.append(gen_gemm_sm100_module_cutlass_nvfp4_svdquant())
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
             jit_specs.append(gen_trtllm_gen_routing_module())
+        if has_sm100 or has_sm103 or has_sm107 or has_sm110:
+            # SM107 (via SM100f) and SM110 load this SM100-named FP8 GEMM too.
+            jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
         if has_sm100 or has_sm103 or has_sm110:
             # These SM100-named modules also build for SM110, which loads them at runtime.
-            jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
             jit_specs.append(gen_gemm_sm100_module_cutlass_mxfp8())
             jit_specs.append(gen_mxfp8_quantization_sm100_module())
         if has_sm100f or has_sm103:
@@ -948,10 +952,9 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=True))
         if has_sm110:
             jit_specs.append(gen_fp4_quantization_sm110_module())
-            # fused_moe_100 and fp4_gemm_cutlass also target SM110 and must ship in
-            # its provider.
+            # fp4_gemm_cutlass also targets SM110 and must ship in its provider
+            # (fused_moe_100 is registered with SM100/SM107 above).
             if not has_sm100:
-                jit_specs.append(gen_cutlass_fused_moe_sm100_module())
                 jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
         if has_sm120:
             jit_specs.append(gen_cudnn_frost_moe_module("bf16", "sm_120a"))
@@ -1149,7 +1152,7 @@ def gen_all_modules(
                         *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
                     )
                 )
-        if has_sm90 or has_sm100 or has_sm103:
+        if has_sm90 or has_sm100 or has_sm103 or has_sm107:
             jit_specs.append(gen_trtllm_utils_module())
         # FP4 KV cache quantization/dequantization
         jit_specs.append(gen_fp4_kv_dequantization_module())
