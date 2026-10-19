@@ -106,12 +106,18 @@ times the 198 representative rows (22 families x `M in {1, 8, 64, 256, 512,
 `per_token_group_quant_8bit` + `gemm_fp8_nt_groupwise` chains (`cutlass` sm1 /
 sm2, `trtllm`, `cutile`) on the same weight.
 
-Generated sources live under `csrc/cake_kimi_k3_fp8_projection/`: one kernel
-and one launcher source per program for both architectures (the
-architecture-specific lowering sits behind `__CUDA_ARCH__` guards; the JIT
-compiles each source with the flags of the device it runs on), the shared
-device-helper and host-helper headers, and nothing else. `cake_jit.py`
-registers them (`MODULES`: one record per program; `KERNELS`: logical kernel
-key -> program and compile-line defines, e.g. the three quantization widths
-are one program with `-DQUANT_UNITS=1|2|4`). Both are written by the Cake
-generated-program export; nothing there is hand-written.
+Generated sources live under `csrc/cake_kimi_k3_fp8_projection/`: one
+launcher source per program and one kernel source per program or lever
+family for both architectures (the architecture-specific lowering sits behind
+`__CUDA_ARCH__` guards; the JIT compiles each source with the flags of the
+device it runs on), the shared device-helper and host-helper headers, and
+nothing else. A program that differs from a sibling only by a prefetch lever
+or by the raster group width shares the sibling's kernel source and selects
+its lever value (`-DCAKE_LEVER_*` or `-DGROUP_M`) and its own kernel symbol
+(`-DCAKE_PROGRAM_KERNEL`) on the compile line. `cake_jit.py` registers them
+(`MODULES`: one record per program; `KERNELS`: logical kernel key -> program
+and compile-line defines, e.g. the three quantization widths are one program
+with `-DQUANT_UNITS=1|2|4`). Both are written by the Cake generated-program
+export; the shared kernel sources and the `-D` entries of the records that
+use them are a hand fold of the exported files, pending regeneration by the
+export.

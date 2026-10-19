@@ -89,7 +89,13 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 #   lists every token.
 #
 # Both literals are populated by the generated-program export; do not edit
-# them by hand.
+# them by hand. One hand-maintained exception, pending regeneration by the
+# export: a record whose kernel source is another record's translation unit
+# (a prefetch-lever or raster-width twin) carries in ``compile_flags`` the
+# lever define (``-DCAKE_LEVER_<X>=<n>`` or ``-DGROUP_M=<n>``) and
+# ``-DCAKE_PROGRAM_KERNEL`` / ``-DCAKE_PROGRAM_SHIM`` naming its own kernel
+# symbol and host-shim namespace; the shared kernel source carries the
+# matching guarded defaults and ``#if`` arms.
 MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_021cc0171d570f358807": {
         "role": "kernel",
@@ -205,11 +211,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_0f46cbbf5011f4371f92": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_0f46cbbf5011f4371f92_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_baa922f3fad64f788380_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_0f46cbbf5011f4371f92_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PF=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_0f46cbbf5011f4371f92",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_a1c520d06c82b077",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -281,11 +292,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_20ea24437d297722619d": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_20ea24437d297722619d_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_5196dc524176f72bfdb6_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_20ea24437d297722619d_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PF=2",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_20ea24437d297722619d",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_22d7bf24b2a10e03",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -393,11 +409,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_28d3f834bafa2bf36d00": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_28d3f834bafa2bf36d00_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_baa922f3fad64f788380_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_28d3f834bafa2bf36d00_binding.cu",
         ],
         "arches": ["sm_100a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PF=2",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_28d3f834bafa2bf36d00",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_78e8c78ada438ce9",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -545,11 +566,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_3654f2f7a859afea0aa6": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_3654f2f7a859afea0aa6_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_24a91d5a85a8465ab6ca_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_3654f2f7a859afea0aa6_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PX=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_3654f2f7a859afea0aa6",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_11296ebf54354318",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "W"],
@@ -581,11 +607,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_39fd3fc41b3d7ca27508": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_39fd3fc41b3d7ca27508_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_71c5eadf708248a0d43c_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_39fd3fc41b3d7ca27508_binding.cu",
         ],
         "arches": ["sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PW=2",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_39fd3fc41b3d7ca27508",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_b11387199d0dd7c3",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "W"],
@@ -878,11 +909,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_504b13e2236557baa266": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_504b13e2236557baa266_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_a8222cc117f456537bdc_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_504b13e2236557baa266_binding.cu",
         ],
         "arches": ["sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PF=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_504b13e2236557baa266",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_0bb5ea91c93581fe",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "W"],
@@ -990,11 +1026,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_55edd49d3fc4d8738f68": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_55edd49d3fc4d8738f68_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_3fa6af62a780530c1810_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_55edd49d3fc4d8738f68_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PF=3",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_55edd49d3fc4d8738f68",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_c12a23595302b755",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "W"],
@@ -1027,11 +1068,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_5660a6b1b752dc71dc15": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_5660a6b1b752dc71dc15_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_ee2e0fe9754d301492e2_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_5660a6b1b752dc71dc15_binding.cu",
         ],
         "arches": ["sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PF=4",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_5660a6b1b752dc71dc15",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_97fab907207c981b",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -1174,11 +1220,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_60d7ceeca1565284fa84": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_60d7ceeca1565284fa84_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_0cdb8cc10eb1192d3635_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_60d7ceeca1565284fa84_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PF=3",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_60d7ceeca1565284fa84",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_6da2c2551ea588de",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "W"],
@@ -1464,11 +1515,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_718b9dd8552d49e4f782": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_718b9dd8552d49e4f782_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_f13cdc4b7875b5c1ca74_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_718b9dd8552d49e4f782_binding.cu",
         ],
         "arches": ["sm_100a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PF=2",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_718b9dd8552d49e4f782",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_6be44e6374d5dbfe",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -1649,11 +1705,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_79f0e568c12ad3ab2f9a": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_79f0e568c12ad3ab2f9a_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_b66413033ce4e9b54af0_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_79f0e568c12ad3ab2f9a_binding.cu",
         ],
         "arches": ["sm_100a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PF=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_79f0e568c12ad3ab2f9a",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_31eaf8dabc5b9205",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "W"],
@@ -2052,11 +2113,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_8becf9f889fc4a657c22": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_8becf9f889fc4a657c22_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_5196dc524176f72bfdb6_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_8becf9f889fc4a657c22_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PF=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_8becf9f889fc4a657c22",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_6ba646259e9cadc4",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -2127,11 +2193,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_922236e00dea3cbba602": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_922236e00dea3cbba602_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_83c6d5b5d853851ec87a_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_922236e00dea3cbba602_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PX=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_922236e00dea3cbba602",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_4492bd3ae544c0e2",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "W"],
@@ -2199,11 +2270,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_93fd6a71010eb8fb34f5": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_93fd6a71010eb8fb34f5_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_88eaaccbac79ef8cf184_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_93fd6a71010eb8fb34f5_binding.cu",
         ],
         "arches": ["sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_DPF=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_93fd6a71010eb8fb34f5",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_e8c2a330a7db152e",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "W"],
@@ -2235,11 +2311,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_96a3edd7d4db71c390df": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_96a3edd7d4db71c390df_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_53557e910bed0b361877_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_96a3edd7d4db71c390df_binding.cu",
         ],
         "arches": ["sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PF=2",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_96a3edd7d4db71c390df",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_38175979a2656920",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -2381,11 +2462,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_a1ee4a9c1f1f7ea1917c": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_a1ee4a9c1f1f7ea1917c_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_09ef673497e9adb01b7e_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_a1ee4a9c1f1f7ea1917c_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PF=2",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_a1ee4a9c1f1f7ea1917c",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_1f06dccd0c0a72f1",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -2419,11 +2505,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_a2e46d7b502767bca64c": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_a2e46d7b502767bca64c_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_71c5eadf708248a0d43c_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_a2e46d7b502767bca64c_binding.cu",
         ],
         "arches": ["sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PF=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_a2e46d7b502767bca64c",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_ea34dee130223833",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "W"],
@@ -2602,11 +2693,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_ae4ec3a3d90aac71ea20": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_ae4ec3a3d90aac71ea20_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_83c6d5b5d853851ec87a_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_ae4ec3a3d90aac71ea20_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PF=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_ae4ec3a3d90aac71ea20",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_0c748b922871df7e",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "W"],
@@ -2746,11 +2842,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_b658c4971aa78e9c9165": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_b658c4971aa78e9c9165_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_021cc0171d570f358807_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_b658c4971aa78e9c9165_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PF=2",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_b658c4971aa78e9c9165",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_5f5331e70dd7f128",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "W"],
@@ -2858,11 +2959,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_bac8891ceedeac1efaf2": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_bac8891ceedeac1efaf2_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_09ef673497e9adb01b7e_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_bac8891ceedeac1efaf2_binding.cu",
         ],
         "arches": ["sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PF=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_bac8891ceedeac1efaf2",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_761ee9710b90f91f",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -2896,11 +3002,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_c068dc77b0968fcc0a15": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_c068dc77b0968fcc0a15_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_83c6d5b5d853851ec87a_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_c068dc77b0968fcc0a15_binding.cu",
         ],
         "arches": ["sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_DPF=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_c068dc77b0968fcc0a15",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_3f012b9ad612b7c9",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "W"],
@@ -2932,11 +3043,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_c22cadffa1705cdcb3b8": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_c22cadffa1705cdcb3b8_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_82375137e249e01d15c2_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_c22cadffa1705cdcb3b8_binding.cu",
         ],
         "arches": ["sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DGROUP_M=64",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_c22cadffa1705cdcb3b8",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_4d04809c3755ce1f",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -3008,11 +3124,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_c4486703f068891e6898": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_c4486703f068891e6898_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_6c9831e79f12b9d92832_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_c4486703f068891e6898_binding.cu",
         ],
         "arches": ["sm_100a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PX=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_c4486703f068891e6898",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_ffbfb6caf29869bd",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "W"],
@@ -3044,11 +3165,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_c5da9b7926ca218a3b36": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_c5da9b7926ca218a3b36_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_62ed5b839ef485e277bc_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_c5da9b7926ca218a3b36_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PX=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_c5da9b7926ca218a3b36",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_f5bbd342029b1c1b",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "W"],
@@ -3179,11 +3305,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_cced2467167c42643d15": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_cced2467167c42643d15_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_53557e910bed0b361877_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_cced2467167c42643d15_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PF=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_cced2467167c42643d15",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_430d9070efba3939",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -3253,11 +3384,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_cf10903c711b1dd4f7af": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_cf10903c711b1dd4f7af_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_8cceae711ab4461f4135_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_cf10903c711b1dd4f7af_binding.cu",
         ],
         "arches": ["sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_DPF=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_cf10903c711b1dd4f7af",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_267677c142dd3880",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "W"],
@@ -3290,11 +3426,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_d1ac3a99961e78557b6f": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_d1ac3a99961e78557b6f_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_a8222cc117f456537bdc_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_d1ac3a99961e78557b6f_binding.cu",
         ],
         "arches": ["sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PW=2",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_d1ac3a99961e78557b6f",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_b0fff8ce01adde74",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "W"],
@@ -3326,11 +3467,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_d4cfd6a99b1a5f08bd75": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_d4cfd6a99b1a5f08bd75_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_f90460931d7c9a77f1a1_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_d4cfd6a99b1a5f08bd75_binding.cu",
         ],
         "arches": ["sm_100a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PF=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_d4cfd6a99b1a5f08bd75",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_f3481f1632c2f219",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "W"],
@@ -3400,11 +3546,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_e319dfda1d4453cff859": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_e319dfda1d4453cff859_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_baa922f3fad64f788380_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_e319dfda1d4453cff859_binding.cu",
         ],
         "arches": ["sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DGROUP_M=64",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_e319dfda1d4453cff859",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_3fdcd009bdf3f5b7",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -3474,11 +3625,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_e985ccc1acc9a1b0c018": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_e985ccc1acc9a1b0c018_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_6965aeafa116c7f6ef89_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_e985ccc1acc9a1b0c018_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PF=2",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_e985ccc1acc9a1b0c018",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_0a67a5bb2b4a7eda",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "W"],
@@ -3589,11 +3745,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_ea8d2ae10f643d1b0341": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_ea8d2ae10f643d1b0341_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_6055768204261cb211ec_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_ea8d2ae10f643d1b0341_binding.cu",
         ],
         "arches": ["sm_100a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PW=2",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_ea8d2ae10f643d1b0341",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_3eb3e28f2802b3d2",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "W"],
@@ -3883,11 +4044,16 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fp8_projection_fcd2cccaffa526675b6d": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_fcd2cccaffa526675b6d_kernel.cu",
+            "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_e9af5f2d6bdaec79f30a_kernel.cu",
             "cake_kimi_k3_fp8_projection/cake_kimi_k3_fp8_projection_fcd2cccaffa526675b6d_binding.cu",
         ],
         "arches": ["sm_100a"],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_LEVER_PF=2",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fp8_projection_fcd2cccaffa526675b6d",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_1aad653a89cd8fd9",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],

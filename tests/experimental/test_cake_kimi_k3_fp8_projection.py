@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import math
+import pathlib
 import re
 
 import pytest
@@ -1876,6 +1877,37 @@ def test_required_kernel_keys_are_registered_when_programs_exist(arch):
         assert set(KERNELS) == set().union(
             *(required_kernel_keys(a, SM_COUNT) for a in ARCHES)
         )
+
+
+_PROGRAM_KERNEL_FLAG = "-DCAKE_PROGRAM_KERNEL="
+_PROGRAM_KERNEL_DEFAULT = re.compile(r"^#define CAKE_PROGRAM_KERNEL (\w+)$", re.M)
+
+
+def test_shared_kernel_sources_keep_distinct_symbols():
+    # Lever twins build from one kernel translation unit: the record whose source it is defines
+    # the symbol through the file's ``CAKE_PROGRAM_KERNEL`` default, every other record names its
+    # own symbol on the compile line. All programs of one architecture load into one process, so
+    # every record must still produce ``kernel_<record>``.
+    csrc = pathlib.Path(cb.__file__).resolve().parent / "csrc"
+    symbols = {}
+    for name, record in MODULES.items():
+        kernel_source = record["sources"][0]
+        assert kernel_source.endswith("_kernel.cu"), (name, kernel_source)
+        text = (csrc / kernel_source).read_text()
+        flags = [
+            f for f in record["compile_flags"] if f.startswith(_PROGRAM_KERNEL_FLAG)
+        ]
+        defaults = _PROGRAM_KERNEL_DEFAULT.findall(text)
+        if name in kernel_source:
+            assert not flags, (name, flags)
+            symbol = defaults[0] if defaults else f"kernel_{name}"
+            assert f"{symbol}(" in text or "CAKE_PROGRAM_KERNEL(" in text, name
+        else:
+            assert len(flags) == 1 and len(defaults) == 1, (name, flags, defaults)
+            symbol = flags[0][len(_PROGRAM_KERNEL_FLAG) :]
+        assert symbol == f"kernel_{name}", (name, symbol)
+        symbols[name] = symbol
+    assert len(set(symbols.values())) == len(MODULES)
 
 
 # ---------------------------------------------------------------------------
