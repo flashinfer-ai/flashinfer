@@ -52,15 +52,15 @@ class _CutlassAutoRunner(TunableRunner):
         self.linear = linear
         self.fused = fused
         # TunableRunner excludes *_cache fields from its hash.
-        self._runner_cache: TunableRunner | None = None
+        self._runner_cache: cutlass._SvdquantRunner | None = None
 
     def get_cache_key_extras(self, inputs: list[torch.Tensor]) -> tuple:
         return (self.enable_pdl, self.linear, self.fused)
 
-    def _runner(self, inputs: list[torch.Tensor]) -> TunableRunner:
+    def _runner(self, inputs: list[torch.Tensor]) -> cutlass._SvdquantRunner:
         if self._runner_cache is None:
             rank = inputs[5].shape[1]
-            factory: Callable[[bool, torch.device, int], TunableRunner] = (
+            factory: Callable[[bool, torch.device, int], cutlass._SvdquantRunner] = (
                 cutlass._nvfp4_svdquant_gemm_runner
             )
             if self.linear:

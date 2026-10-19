@@ -108,8 +108,7 @@ void nvfp4_quantize_smooth(TensorView x, TensorView pqs, TensorView global_scale
   TVM_FFI_ICHECK_EQ(xq.size(1), n / 2) << "xq must be [m, n/2]";
   // Swizzled 128x4 SF layout: rows padded to a multiple of 128, SF columns (n/16) to a multiple
   // of 4.
-  int64_t const sfSize =
-      (static_cast<int64_t>(m) + 127) / 128 * 128 * ((n / 16 + 3) / 4 * 4);
+  int64_t const sfSize = (static_cast<int64_t>(m) + 127) / 128 * 128 * ((n / 16 + 3) / 4 * 4);
   TVM_FFI_ICHECK_GE(sf.numel(), sfSize)
       << "sf is smaller than the required swizzled scale layout (" << sfSize << " bytes)";
 

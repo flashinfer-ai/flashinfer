@@ -8,6 +8,7 @@ it with CuTe DSL while autotuning. Untuned auto calls prefer CuTe DSL when avail
 
 import functools
 import weakref
+from abc import abstractmethod
 from collections import OrderedDict
 from typing import Final, List, Optional
 
@@ -37,6 +38,15 @@ from .gemm_svdquant import (
     _swizzled_sf_size,
     get_nvfp4_svdquant_module,
 )
+
+
+class _SvdquantRunner(TunableRunner):
+    """Native SVDQuant runner with workspace-aware tactic validation."""
+
+    @abstractmethod
+    def validate_tactic(self, inputs: list[torch.Tensor], tactic: int) -> bool:
+        """Check tactic eligibility against the caller's actual workspace."""
+        raise NotImplementedError
 
 
 _SM120_FUSED_LINEAR_MK = _sm120_routes.SM120_FUSED_LINEAR_MK
@@ -423,10 +433,10 @@ def _sm120_run_unfused_linear_prefix(
 
 def _sm120_fused_linear_runner(
     enable_pdl: bool, device: torch.device, rank: int = 32
-) -> TunableRunner:
+) -> _SvdquantRunner:
     module = get_nvfp4_svdquant_sm120_module(rank)
 
-    class Sm120FusedLinearRunner(TunableRunner):
+    class Sm120FusedLinearRunner(_SvdquantRunner):
         def validate_tactic(self, inputs: List[torch.Tensor], tactic: int) -> bool:
             row, _ = _sm120_unpack_tactic(tactic)
             return _svdquant_tactic_fits_workspace(
@@ -508,10 +518,10 @@ def _sm120_fused_linear_runner(
 
 def _sm120_cutlass_linear_runner(
     enable_pdl: bool, device: torch.device, rank: int
-) -> TunableRunner:
+) -> _SvdquantRunner:
     module = get_nvfp4_svdquant_sm120_module(rank)
 
-    class Sm120CutlassLinearRunner(TunableRunner):
+    class Sm120CutlassLinearRunner(_SvdquantRunner):
         def validate_tactic(self, inputs: List[torch.Tensor], tactic: int) -> bool:
             return _svdquant_tactic_fits_workspace(
                 module, _sm120_linear_inputs_shape(inputs), inputs[-1], tactic
@@ -591,7 +601,7 @@ def _sm120_linear_runners(
     rank: int,
 ) -> List[TunableRunner]:
     """Return every full-linear route valid for one exact SM120 shape."""
-    runners = []
+    runners: list[TunableRunner] = []
     if _sm120_fused_linear_supported(m, k, rank):
         runners.append(_sm120_fused_linear_runner(enable_pdl, device, rank))
     runners.append(_sm120_cutlass_linear_runner(enable_pdl, device, rank))
@@ -808,10 +818,10 @@ def _nvfp4_svdquant_gemm_runner(
     enable_pdl: bool,
     device: torch.device,
     lora_rank: int = SVDQUANT_LORA_RANK_GRANULARITY,
-):
+) -> _SvdquantRunner:
     module = _get_nvfp4_svdquant_module_for_device(device, lora_rank)
 
-    class Nvfp4SvdquantGemmRunner(TunableRunner):
+    class Nvfp4SvdquantGemmRunner(_SvdquantRunner):
         def validate_tactic(self, inputs: List[torch.Tensor], tactic: int) -> bool:
             a, b, _, _, _, d = inputs[:6]
             shape = (a.shape[0], b.shape[0], a.shape[1] * 2, d.shape[1])

@@ -465,8 +465,7 @@ inline cudaError_t launch_small_m_dyn_kernel(void const* x, void const* pre_quan
     return cudaErrorInvalidValue;
   } else {
     // What SmallMLaunchGeometry asserted at compile time is a precondition here.
-    if (m <= 0 || m > std::numeric_limits<int>::max() - 127 || k <= 0 ||
-        RowsPerQuantBlock <= 0) {
+    if (m <= 0 || m > std::numeric_limits<int>::max() - 127 || k <= 0 || RowsPerQuantBlock <= 0) {
       return cudaErrorInvalidValue;
     }
     if (k % kDownWarps || (k / kDownWarps) % 16) return cudaErrorInvalidValue;
@@ -838,49 +837,59 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn
     int const row1 = row0 + 8;
     int const col = warp * 8 + pair_col;
     if (row0 < M) {
-      store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row0) * kRank + col, d0, d1);
+      store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row0) * kRank + col, d0,
+                                           d1);
     }
     if (row1 < M) {
-      store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row1) * kRank + col, d2, d3);
+      store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row1) * kRank + col, d2,
+                                           d3);
     }
     if constexpr (kKernelTileM >= 32) {
       int const row2 = row0 + 16;
       int const row3 = row0 + 24;
       if (row2 < M) {
-        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row2) * kRank + col, d4, d5);
+        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row2) * kRank + col,
+                                             d4, d5);
       }
       if (row3 < M) {
-        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row3) * kRank + col, d6, d7);
+        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row3) * kRank + col,
+                                             d6, d7);
       }
     }
     if constexpr (kKernelTileM >= 48) {
       int const row4 = row0 + 32;
       int const row5 = row0 + 40;
       if (row4 < M) {
-        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row4) * kRank + col, d8, d9);
+        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row4) * kRank + col,
+                                             d8, d9);
       }
       if (row5 < M) {
-        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row5) * kRank + col, d10, d11);
+        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row5) * kRank + col,
+                                             d10, d11);
       }
     }
     if constexpr (kKernelTileM >= 64) {
       int const row6 = row0 + 48;
       int const row7 = row0 + 56;
       if (row6 < M) {
-        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row6) * kRank + col, d12, d13);
+        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row6) * kRank + col,
+                                             d12, d13);
       }
       if (row7 < M) {
-        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row7) * kRank + col, d14, d15);
+        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row7) * kRank + col,
+                                             d14, d15);
       }
     }
     if constexpr (kKernelTileM >= 80) {
       int const row8 = row0 + 64;
       int const row9 = row0 + 72;
       if (row8 < M) {
-        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row8) * kRank + col, d16, d17);
+        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row8) * kRank + col,
+                                             d16, d17);
       }
       if (row9 < M) {
-        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row9) * kRank + col, d18, d19);
+        store_down_pair<kUsePackedDownStore>(down + static_cast<std::int64_t>(row9) * kRank + col,
+                                             d18, d19);
       }
     }
   }
@@ -926,7 +935,8 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
     int const padded_m = (m + 127) / 128 * 128;
     int const grid_blocks = (padded_m + kKernelTileM - 1) / kKernelTileM;
     if constexpr (LongK) {
-      std::int64_t const l2_lines = static_cast<std::int64_t>(k) * kRank * sizeof(quant::Type) / 128;
+      std::int64_t const l2_lines =
+          static_cast<std::int64_t>(k) * kRank * sizeof(quant::Type) / 128;
       if (static_cast<std::int64_t>(grid_blocks) * BlockThreads < l2_lines) {
         return cudaErrorInvalidValue;
       }
