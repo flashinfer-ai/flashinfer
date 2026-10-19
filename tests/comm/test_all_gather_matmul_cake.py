@@ -158,7 +158,20 @@ def test_n128_table_lists_ws4_and_ws8_classes_per_architecture_under_the_frozen_
 # ``[world_size, dtype, b_layout, min_padded_rows, max_padded_rows, min_cols,
 # max_cols]`` rectangles; a class may list several, pairwise disjoint.
 _CG2_REGIONS = {
-    "sm_100a": [],
+    "sm_100a": [
+        # The nine sm_100a rows measured on B200, as points on padded rows and exact N
+        # (M=1025 pads to 1152): the ws2 bf16 n_major perf rows, the ws4 bf16 k_major QKV rows and the ws4 / ws8
+        # bf16 k_major gate_up M=512 / M=1024 rows.
+        [2, "bfloat16", "n_major", 2048, 2048, 2048, 2048],
+        [2, "bfloat16", "n_major", 4096, 4096, 2048, 2048],
+        [4, "bfloat16", "k_major", 1024, 1024, 2560, 2560],
+        [4, "bfloat16", "k_major", 1152, 1152, 2560, 2560],
+        [4, "bfloat16", "k_major", 2048, 2048, 2560, 2560],
+        [4, "bfloat16", "k_major", 512, 512, 14336, 14336],
+        [4, "bfloat16", "k_major", 1024, 1024, 14336, 14336],
+        [8, "bfloat16", "k_major", 512, 512, 7168, 7168],
+        [8, "bfloat16", "k_major", 1024, 1024, 7168, 7168],
+    ],
     "sm_103a": [
         # R2 regions (min_cols 1 keeps every R2-routed call routed).
         [2, "bfloat16", "n_major", 2048, 5760, 1, 2048],
@@ -170,7 +183,11 @@ _CG2_REGIONS = {
     ],
 }
 _CG2_CLASSES = {
-    "sm_100a": set(),
+    "sm_100a": {
+        (2, "bfloat16", "n_major"),
+        (4, "bfloat16", "k_major"),
+        (8, "bfloat16", "k_major"),
+    },
     "sm_103a": {
         (2, "bfloat16", "n_major"),
         (4, "bfloat16", "k_major"),
@@ -185,8 +202,12 @@ def test_cg2_tables_list_the_measured_pair_regions_and_classes_per_architecture(
     the ws4 bf16 k_major class at 1024..1536 padded rows / N <= 6058 and at its
     gate_up point (exactly 512 padded rows at N = 14336), and the ws8 bf16
     k_major class at its gate_up point (exactly 512 padded rows at N = 7168; the
-    M=2048 gate_up rows of arm a2 are not routed); sm_100a has no rectangle and
-    delivers no twin. The rule inputs are the kernel module's (clusters of two)."""
+    M=2048 gate_up rows of arm a2 are not routed); on sm_100a the ws2 bf16
+    n_major class at its two measured points (exactly 2048 or 4096 padded rows at
+    N = 2048), the ws4 bf16 k_major class at its five (exactly 1024, 1152 or
+    2048 padded rows at N = 2560; exactly 512 or 1024 padded rows at N = 14336)
+    and the ws8 bf16 k_major class at its two (exactly 512 or 1024 padded rows
+    at N = 7168). The rule inputs are the kernel module's (clusters of two)."""
 
     assert set(loader.CG2_CLASSES) == set(loader.CG2_REGIONS) == set(loader.ARCH_FLAGS)
     assert loader.CG2_REGIONS == _CG2_REGIONS
@@ -303,8 +324,8 @@ def test_every_program_is_delivered_for_both_architectures():
             for arch in loader.ARCH_FLAGS
             if (world_size, dtype_name, b_layout) in _n128_classes(arch)
         ), twin
-    # A ``_cg2`` main likewise (the three sm_103a pair classes have pair-routed
-    # rows on sm_103a only).
+    # A ``_cg2`` main likewise (the ws2 bf16 n_major, ws4 bf16 k_major and ws8
+    # bf16 k_major classes have pair-routed rows on both architectures).
     assert sorted(_cg2_programs()) == [
         (2, "bfloat16", "n_major"),
         (4, "bfloat16", "k_major"),
@@ -317,7 +338,7 @@ def test_every_program_is_delivered_for_both_architectures():
             for arch in loader.ARCH_FLAGS
             if (world_size, dtype_name, b_layout) in _cg2_classes(arch)
         ), pair
-        assert loader.PROGRAMS[pair]["arches"] == ["sm_103a"]
+        assert loader.PROGRAMS[pair]["arches"] == ["sm_100a", "sm_103a"], pair
     sm103_sequence = loader.sequence_name(8, "bfloat16", "n_major", "sm_103a")
     loader.spec.cache_clear()
     try:
@@ -640,7 +661,9 @@ _INVENTORY_ROWS = (
     ),
     # The R3 lever-alpha gate_up rows (896 / 3584 N256 tiles: beyond
     # the cap of both architectures); on sm_103a the M=512 rows run the CTA-pair
-    # twin and the M=2048 rows (arm a2, not routed) keep the one-CTA program.
+    # twin and the M=2048 rows (arm a2, not routed) keep the one-CTA program; on
+    # sm_100a the M=512 and M=1024 rows (measured points) run the twin and
+    # the M=1025 (1152 padded rows) / M=2048 rows keep the one-CTA program.
     (
         "llama_tp4_gate_up_bf16_m512_kmajor",
         (512, 14336, 4, "bfloat16", "k_major"),
@@ -652,6 +675,26 @@ _INVENTORY_ROWS = (
         _N256,
     ),
     (
+        "llama_tp4_gate_up_bf16_m1024_kmajor",
+        (1024, 14336, 4, "bfloat16", "k_major"),
+        _N256,
+    ),
+    (
+        "llama_tp8_gate_up_bf16_m1024_kmajor",
+        (1024, 7168, 8, "bfloat16", "k_major"),
+        _N256,
+    ),
+    (
+        "llama_tp4_gate_up_bf16_m1025_kmajor",
+        (1025, 14336, 4, "bfloat16", "k_major"),
+        _N256,
+    ),
+    (
+        "llama_tp8_gate_up_bf16_m1025_kmajor",
+        (1025, 7168, 8, "bfloat16", "k_major"),
+        _N256,
+    ),
+    (
         "llama_tp4_gate_up_bf16_m2048_kmajor",
         (2048, 14336, 4, "bfloat16", "k_major"),
         _N256,
@@ -659,6 +702,35 @@ _INVENTORY_ROWS = (
     (
         "llama_tp8_gate_up_bf16_m2048_kmajor",
         (2048, 7168, 8, "bfloat16", "k_major"),
+        _N256,
+    ),
+    # The pair-routed N256 rows (ws2 always 256; 320 / 360 / 640
+    # N256 tiles at ws4 = three to five waves, beyond the cap of both
+    # architectures): on sm_103a the R2 regions route them, on sm_100a the
+    # measured points (the m2048 QKV row is pair-routed on sm_100a only).
+    (
+        "perf_bf16_m2048",
+        (2048, 2048, 2, "bfloat16", "n_major"),
+        _N256,
+    ),
+    (
+        "perf_bf16_m4096",
+        (4096, 2048, 2, "bfloat16", "n_major"),
+        _N256,
+    ),
+    (
+        "llama_tp4_qkv_bf16_m1024_kmajor",
+        (1024, 2560, 4, "bfloat16", "k_major"),
+        _N256,
+    ),
+    (
+        "llama_tp4_qkv_bf16_m1025_kmajor",
+        (1025, 2560, 4, "bfloat16", "k_major"),
+        _N256,
+    ),
+    (
+        "llama_tp4_qkv_bf16_m2048_kmajor",
+        (2048, 2560, 4, "bfloat16", "k_major"),
         _N256,
     ),
     # The N256 coverage rows of the float16 k_major classes (640 tiles: five waves).
@@ -747,8 +819,11 @@ def test_main_form_routes_the_inventory_rows_by_the_region_table(label, shape, w
     measured rectangle of its class on the architecture -- on sm_103a
     perf_bf16_m2048 / m4096 (ws2 bf16 n_major), llama_tp4_qkv_bf16_m1024 /
     m1025_kmajor and llama_tp4_gate_up_bf16_m512_kmajor (ws4 bf16 k_major) and
-    llama_tp8_gate_up_bf16_m512_kmajor (ws8 bf16 k_major);
-    the one-CTA form for every other row and on sm_100a."""
+    llama_tp8_gate_up_bf16_m512_kmajor (ws8 bf16 k_major); on sm_100a
+    perf_bf16_m2048 / m4096 (ws2 bf16 n_major), llama_tp4_qkv_bf16_m1024 /
+    m1025 / m2048_kmajor and llama_tp4_gate_up_bf16_m512 / m1024_kmajor (ws4
+    bf16 k_major) and llama_tp8_gate_up_bf16_m512 / m1024_kmajor (ws8 bf16
+    k_major; the measured sm_100a points); the one-CTA form for every other row."""
 
     rows, n, world_size, dtype_name, b_layout = shape
     for arch, block_n in widths.items():
@@ -773,14 +848,30 @@ def test_main_form_routes_the_inventory_rows_by_the_region_table(label, shape, w
             for min_rows, max_rows, min_cols, max_cols in rectangles
         )
         assert form == ("cg2" if qualifies and delivered else "cg1"), (label, arch)
-        expected_pair = arch == "sm_103a" and label in {
-            "perf_bf16_m2048",
-            "perf_bf16_m4096",
-            "llama_tp4_qkv_bf16_m1024_kmajor",
-            "llama_tp4_qkv_bf16_m1025_kmajor",
-            "llama_tp4_gate_up_bf16_m512_kmajor",
-            "llama_tp8_gate_up_bf16_m512_kmajor",
-        }
+        expected_pair = (
+            label
+            in {
+                "sm_103a": {
+                    "perf_bf16_m2048",
+                    "perf_bf16_m4096",
+                    "llama_tp4_qkv_bf16_m1024_kmajor",
+                    "llama_tp4_qkv_bf16_m1025_kmajor",
+                    "llama_tp4_gate_up_bf16_m512_kmajor",
+                    "llama_tp8_gate_up_bf16_m512_kmajor",
+                },
+                "sm_100a": {
+                    "perf_bf16_m2048",
+                    "perf_bf16_m4096",
+                    "llama_tp4_qkv_bf16_m1024_kmajor",
+                    "llama_tp4_qkv_bf16_m1025_kmajor",
+                    "llama_tp4_qkv_bf16_m2048_kmajor",
+                    "llama_tp4_gate_up_bf16_m512_kmajor",
+                    "llama_tp4_gate_up_bf16_m1024_kmajor",
+                    "llama_tp8_gate_up_bf16_m512_kmajor",
+                    "llama_tp8_gate_up_bf16_m1024_kmajor",
+                },
+            }[arch]
+        )
         assert (form == "cg2") is expected_pair, (label, arch)
         # Every inventory row the rule qualifies belongs to a delivered class (the table is derived from the rows).
         assert delivered or not qualifies, (label, arch)
@@ -803,10 +894,7 @@ def test_main_form_selects_the_pair_twin_only_inside_a_measured_region_at_the_pu
         )
         if (world_size, dtype_name, b_layout) not in _cg2_classes(arch):
             # No delivered pair twin: the one-CTA program whatever the row count.
-            assert (
-                arch == "sm_100a"
-                or (world_size, dtype_name, b_layout) not in _CG2_CLASSES["sm_103a"]
-            )
+            assert (world_size, dtype_name, b_layout) not in _CG2_CLASSES[arch]
             for rows in (1, 1024, 1025, 2048, 4096, 32768, 65536):
                 assert rule(rows) == "cg1", (
                     arch,
@@ -815,6 +903,107 @@ def test_main_form_selects_the_pair_twin_only_inside_a_measured_region_at_the_pu
                     b_layout,
                     rows,
                 )
+            continue
+        assert (world_size, dtype_name, b_layout) in _CG2_CLASSES[arch]
+        if arch == "sm_100a":
+            # The measured sm_100a points: exact padded rows at exact N.
+            assert world_size in (2, 4, 8) and dtype_name == "bfloat16"
+            if world_size == 2:
+                # (2, bfloat16, n_major): exactly 2048 or 4096 padded rows at
+                # N = 2048 (1921..2048 and 3969..4096 pad onto the points).
+                assert [rule(rows) for rows in (1921, 2048, 3969, 4096)] == ["cg2"] * 4
+                assert [
+                    rule(rows)
+                    for rows in (
+                        1,
+                        1000,
+                        1024,
+                        1920,
+                        2049,
+                        3000,
+                        3968,
+                        4097,
+                        5760,
+                        8192,
+                        65536,
+                    )
+                ] == ["cg1"] * 11
+                assert rule(2048, n=1792) == "cg1" and rule(2048, n=2304) == "cg1"
+                assert rule(4096, n=1792) == "cg1" and rule(4096, n=2304) == "cg1"
+            elif world_size == 4:
+                # (4, bfloat16, k_major): exactly 1024, 1152 or 2048 padded rows
+                # at N = 2560 (897..1024, 1025..1152 and 1921..2048 pad onto the
+                # points; M = 1000 is inside the 1024 point) ...
+                assert [
+                    rule(rows)
+                    for rows in (897, 1000, 1024, 1025, 1100, 1152, 1921, 2048)
+                ] == ["cg2"] * 8
+                assert [
+                    rule(rows)
+                    for rows in (1, 512, 896, 1153, 1280, 1536, 1920, 2049, 4096, 65536)
+                ] == ["cg1"] * 10
+                assert rule(1024, n=2304) == "cg1" and rule(1024, n=2816) == "cg1"
+                assert rule(1024, n=5888) == "cg1" and rule(512, n=2560) == "cg1"
+                # ... and the gate_up points: exactly 512 or 1024 padded rows at
+                # N = 14336 (385..512 and 897..1024 pad onto them; 513 pads to 640,
+                # 1025 to 1152 and 2048 -- the arm a2 row -- stays one-CTA).
+                assert [
+                    rule(rows, n=14336)
+                    for rows in (385, 500, 511, 512, 897, 1000, 1023, 1024)
+                ] == ["cg2"] * 8
+                assert [
+                    rule(rows, n=14336)
+                    for rows in (
+                        1,
+                        384,
+                        513,
+                        640,
+                        896,
+                        1025,
+                        1152,
+                        1921,
+                        2048,
+                        2049,
+                        4096,
+                    )
+                ] == ["cg1"] * 11
+                assert rule(512, n=14080) == "cg1" and rule(512, n=14592) == "cg1"
+                assert rule(1024, n=14080) == "cg1" and rule(1024, n=14592) == "cg1"
+            else:
+                # (8, bfloat16, k_major): exactly 512 or 1024 padded rows at
+                # N = 7168 (385..512 and 897..1024 pad onto the points; 513 pads
+                # to 640, 1025 to 1152); every N = 1280 call stays one-CTA.
+                assert [rule(rows) for rows in (1, 512, 1024, 1025, 2048, 4096)] == [
+                    "cg1"
+                ] * 6
+                assert [
+                    rule(rows, n=7168)
+                    for rows in (385, 500, 511, 512, 897, 1000, 1023, 1024)
+                ] == ["cg2"] * 8
+                assert [
+                    rule(rows, n=7168)
+                    for rows in (
+                        1,
+                        384,
+                        513,
+                        640,
+                        896,
+                        1025,
+                        1152,
+                        1921,
+                        2048,
+                        2049,
+                        4096,
+                    )
+                ] == ["cg1"] * 11
+                assert rule(512, n=6912) == "cg1" and rule(512, n=7424) == "cg1"
+                assert rule(1024, n=6912) == "cg1" and rule(1024, n=7424) == "cg1"
+            # The 128-wide program has no pair form, whatever the row count.
+            assert rule(1024, block_n=128) == "cg1" and rule(2048, block_n=128) == "cg1"
+            if world_size == 4:
+                assert rule(512, n=14336, block_n=128) == "cg1"
+            elif world_size == 8:
+                assert rule(512, n=7168, block_n=128) == "cg1"
             continue
         assert arch == "sm_103a"
         if world_size == 2:
@@ -1950,9 +2139,38 @@ def test_small_rows_use_the_sm_push_sequence_entry_on_the_callers_stream(monkeyp
         (512, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, 1),
         (2048, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
         (513, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
-        (512, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
-        (512, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
-        # Outside every rectangle, another class, or sm_100a: the one-CTA N256 main.
+        # The measured points on sm_100a: ws2 bf16 n_major at
+        # exactly 2048 or 4096 padded rows and N = 2048, ws4 bf16 k_major at
+        # exactly 1024, 1152 or 2048 padded rows and N = 2560 (1000 pads to 1024
+        # and takes the twin; 1153 pads to 1280 and leaves; 3000 pads to 3072 and
+        # leaves) and at exactly 512 or 1024 padded rows and N = 14336, ws8 bf16
+        # k_major at exactly 512 or 1024 padded rows and N = 7168 (500 / 1000 pad
+        # to 512 / 1024 and take the twin; 513 / 1025 pad to 640 / 1152 and
+        # leave; the M=2048 gate_up rows stay one-CTA).
+        (2048, 2048, 2, "sm_100a", "bfloat16", "n_major", "run", 256, 1),
+        (4096, 2048, 2, "sm_100a", "bfloat16", "n_major", "run", 256, 1),
+        (1024, 2560, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (1025, 2560, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (2048, 2560, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (1000, 2560, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (1153, 2560, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        (3000, 2048, 2, "sm_100a", "bfloat16", "n_major", "run", 256, 0),
+        (1024, 2048, 2, "sm_100a", "bfloat16", "n_major", "run", 256, 0),
+        (512, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (500, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (513, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        (1024, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (1000, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (1025, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        (2048, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        (512, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (500, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (513, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        (1024, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (1000, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (1025, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        (2048, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        # Outside every rectangle or another class: the one-CTA N256 main.
         (8192, 2048, 2, "sm_103a", "bfloat16", "n_major", "run", 256, 0),
         (2048, 2560, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
         (1024, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
@@ -1960,8 +2178,7 @@ def test_small_rows_use_the_sm_push_sequence_entry_on_the_callers_stream(monkeyp
         (1024, 2048, 8, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
         (1025, 2048, 4, "sm_103a", "bfloat16", "n_major", "run", 256, 0),
         (65536, 2048, 2, "sm_103a", "float16", "n_major", "run", 256, 0),
-        (2048, 2048, 2, "sm_100a", "bfloat16", "n_major", "run", 256, 0),
-        (1024, 2560, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        (2048, 2048, 2, "sm_100a", "float16", "n_major", "run", 256, 0),
         (1024, 1280, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
         (1025, 2048, 4, "sm_100a", "bfloat16", "n_major", "run", 256, 0),
         (256, 2048, 2, "sm_100a", "bfloat16", "n_major", "run", 256, 0),
