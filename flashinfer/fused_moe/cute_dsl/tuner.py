@@ -519,10 +519,12 @@ class CuteDslFusedMoERunner(TunableRunner):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
         quant_mode = quant_mode.lower()
-        if quant_mode not in ("w4a4", "w4a8"):
+        if quant_mode not in ("w4a4", "w4a8", "mxfp8"):
             raise ValueError(f"unsupported CuTe-DSL quant_mode {quant_mode!r}")
-        if quant_mode == "w4a8" and use_per_token_activation:
-            raise ValueError("per-token activation scaling is not supported for W4A8")
+        if quant_mode in ("w4a8", "mxfp8") and use_per_token_activation:
+            raise ValueError(
+                f"per-token activation scaling is not supported for {quant_mode}"
+            )
         if localized_weights is not None and quant_mode != "w4a4":
             raise ValueError("localized runner supports quant_mode='w4a4' only")
         self.forward_impl = forward_impl
@@ -758,7 +760,8 @@ class CuteDslFusedMoERunner(TunableRunner):
 
         gated = self.gated
         num_tokens = x.shape[0]
-        is_mxfp8 = self.quant_mode == "w4a8"
+        # MXFP8 activations (E4M3 + E8M0, block 32) in both the W4A8 and MXFP8 modes.
+        is_mxfp8 = self.quant_mode in ("w4a8", "mxfp8")
         hidden_size = x.shape[1] * (1 if is_mxfp8 else 2)
         num_local_experts = w1_weight.shape[0]
         # Gated SwiGLU fuses gate+up (2*intermediate rows); non-gated ReLU^2
@@ -766,10 +769,13 @@ class CuteDslFusedMoERunner(TunableRunner):
         gemm1_n = w1_weight.shape[1]
         intermediate_size = gemm1_n // 2 if gated else gemm1_n
         gemm2_n = w2_weight.shape[1]
-        gemm2_k = w2_weight.shape[2] * 2
+        # Packed FP4 weights hold two elements per byte; MXFP8 weights one.
+        gemm2_k = w2_weight.shape[2] * (1 if self.quant_mode == "mxfp8" else 2)
 
         a_dtype = cutlass.Float8E4M3FN if is_mxfp8 else cutlass.Float4E2M1FN
-        b_dtype = cutlass.Float4E2M1FN
+        b_dtype = (
+            cutlass.Float8E4M3FN if self.quant_mode == "mxfp8" else cutlass.Float4E2M1FN
+        )
         sf_dtype = cutlass.Float8E8M0FNU if is_mxfp8 else cutlass.Float8E4M3FN
         sf_vec_size = 32 if is_mxfp8 else 16
 
@@ -963,10 +969,10 @@ class CuteDslFusedMoERunner(TunableRunner):
         if tactic is None or tactic == -1:
             tactic = (
                 DEFAULT_BLACKWELL_MOE_TACTIC
-                if self.quant_mode == "w4a8"
+                if self.quant_mode in ("w4a8", "mxfp8")
                 else _get_default_tactic()
             )
-        elif self.quant_mode == "w4a8":
+        elif self.quant_mode in ("w4a8", "mxfp8"):
             tactic = canonicalize_w4a8_tactic(tactic)
 
         params = _extract_tactic_params(tactic)
