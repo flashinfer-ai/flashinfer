@@ -160,14 +160,18 @@ is filtered: FlashInfer's `ExperimentalWarning` is this API's single opt-in sign
 ## Where the kernels come from
 
 The backend is a subset of the cuDNN Frontend Python package vendored byte-faithfully under `_cudnn_frost/`
-(99 files: the block's forward and its serving launches -- the fused norm + RoPE projection fork and the lowered small-M decode
-chain's norm + RoPE pass and cache write --, the FROST SDPA adapter and its SM107 prefill / decode tiles and SM100 split combine,
-the FROST GEMM compiler and its kernel templates, the `tile_dsl` helpers; every file keeps its NVIDIA SPDX header, MIT or
+(103 files: the block's forward and its serving launches -- the fused norm + RoPE projection fork and the lowered small-M decode
+chain's norm + RoPE pass and cache write --, the FROST SDPA adapter with its configuration tables (the shared d128-family table and the
+two backward configuration tables the forward configs import at module level: geometry and validators, no backward kernel) and its
+SM107 prefill / decode tiles and SM100 split combine, the FROST GEMM compiler and its kernel templates, the `tile_dsl` helpers; every file keeps its NVIDIA SPDX header, MIT or
 Apache-2.0), with only the import roots rewritten and four declared, exact-text patches (P0-P2 replace the nanobind extension's
-seams, P3 rewords fourteen comment lines that named internal hosts, file paths or workflow vocabulary; all listed in
+seams, P3 rewords sixteen comment lines that named internal hosts, file paths or workflow vocabulary; all listed in
 `_cudnn_frost/VENDOR.md`; per-file digests in `_cudnn_frost/VENDOR_MANIFEST.json`). Pinned revision: cuDNN Frontend
-`aba744cd6` (1.32.0, with the Rubin decode levers: the 64-column decode tile, the decode-grid split combine and its lean group
-walk, the lowered small-M decode chain); `qwen_3_5_block_support(...).source` reports it at runtime. The deployed process never imports the
+`c9f3118a1` (1.32.0: the Rubin decode levers -- the 64-column decode tile, the decode-grid split combine and its lean group
+walk, the lowered small-M decode chain -- plus, since the previous vendoring, independent K / V paged-pool layouts (HND / NHD per
+pool, bound and validated per operand), the split-prefix scheduling of paged packed attention (long-KV requests first, work-prefix
+task lookup), the closed scheduler-reader and barrier back-edges of the SM100 / SM107 prefill tiles, and the shared d128-family
+configuration tables); `qwen_3_5_block_support(...).source` reports it at runtime. The deployed process never imports the
 `cudnn` package nor the cuDNN library: the one native piece of that route, the SDPA launch binder, is served in Python
 (`_sdpa_binder.py`, built on cuDNN Frontend's own retired Python binder implementation vendored from its test tree). The
 kernels keep living in cuDNN Frontend and are re-vendored deliberately: the exporter, the closure list and the tracer live in

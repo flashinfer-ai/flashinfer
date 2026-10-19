@@ -19,6 +19,13 @@ Q-length address to the combine frame (``DenseLaunchSpec.combine_q_lens``); this
 name (``supports_combine_q_lens`` is False, which the vendored ``prepared.py`` reads before it builds such a plan).  The Qwen
 3.5 block has no attention sink, and on cc 10.7 the adapter keeps the sink-free dense split contract, so the decline is never
 reached on the served device.
+
+Each paged pool binds its OWN declared in-page layout (``paged_hnd`` for K, ``paged_v_hnd`` for V: cuDNN Frontend's independent
+K / V physical layouts, which its native binders read the same way): the vendored frame implementation takes the V flag off the
+spec, so a plan whose K pool is HND and V pool NHD (or the reverse) binds each pool by its own strides, and a runtime pool in the
+other layout is refused by name (``compiled for HND / NHD``) before anything launches -- ``tests/experimental/qwen_3_5_block/
+test_binder.py`` pins both directions for the dense and the packed frame.  FlashInfer's paged cache spells one ``kv_layout`` for
+both pools, so the adapter declares the two pools alike; the binder serves either declaration.
 """
 
 from __future__ import annotations
