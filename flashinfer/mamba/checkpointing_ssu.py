@@ -90,6 +90,138 @@ def _get_module(
     ).build_and_load()
 
 
+def prepare_checkpointing_ssu_runtime_kernel(
+    state_dtype: torch.dtype,
+    input_dtype: torch.dtype,
+    dt_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    matrixA_dtype: torch.dtype,
+    stateIndex_dtype: torch.dtype,
+    state_scale_dtype: Optional[torch.dtype],
+    dim: int,
+    dstate: int,
+    npredicted: int,
+    max_window: int,
+    heads_per_group: int,
+    num_groups: int,
+    philox_rounds: int = 0,
+    enable_pdl: bool = False,
+) -> Any:
+    """Resolve the raw checkpointing kernel before steady-state execution.
+
+    This entry point is for runtimes that validate a fixed tensor contract
+    during warmup and bind an explicit launch policy. It bypasses the public
+    wrapper and autotuner on subsequent calls while preserving the same JIT
+    specialization.
+    """
+    return _get_module(
+        state_dtype,
+        input_dtype,
+        dt_dtype,
+        weight_dtype,
+        matrixA_dtype,
+        stateIndex_dtype,
+        state_scale_dtype,
+        dim,
+        dstate,
+        npredicted,
+        max_window,
+        heads_per_group,
+        num_groups,
+        philox_rounds,
+        enable_pdl,
+    ).checkpointing_ssu
+
+
+def prepare_checkpointing_ssu_runtime(
+    state_dtype: torch.dtype,
+    input_dtype: torch.dtype,
+    dt_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    matrixA_dtype: torch.dtype,
+    stateIndex_dtype: torch.dtype,
+    state_scale_dtype: Optional[torch.dtype],
+    dim: int,
+    dstate: int,
+    npredicted: int,
+    max_window: int,
+    heads_per_group: int,
+    num_groups: int,
+    max_batch_size: int,
+    device: torch.device | str,
+    use_rand_seed: bool,
+    philox_rounds: int = 0,
+    enable_pdl: bool = False,
+) -> tuple[Any, tuple[tuple[bool, int, int, int, int], ...]]:
+    """Bind the raw kernel and cached dense-decode tactics for serving.
+
+    This runs after ReplaySSM autotuning. It resolves every serving batch
+    bucket once, then returns a table indexed by the live request count. The
+    timed path can therefore launch the raw JIT function without rebuilding an
+    autotuner key or calling :meth:`AutoTuner.choose_one`.
+
+    The prepared contract uses ``dt_softplus=True``, ``pad_slot_id=-1``,
+    present ``D``, ``dt_bias``, and ``state_batch_indices``, and absent ``z``.
+    It resolves dense decode tactics; a caller using packed inputs must keep
+    each sequence within ``npredicted`` and provide valid ``cu_seqlens``.
+    Optional state scales and the random seed must match the arguments here.
+    All other tensor shape, dtype, device, and stride requirements of
+    :func:`checkpointing_ssu` remain the caller's responsibility. Preparation
+    must run outside autotuning and CUDA graph capture, after warming every
+    required specialization. Re-prepare after changing the tuning cache.
+
+    Returns
+    -------
+    kernel : callable
+        The low-level JIT callable used by ``CheckpointingSSURunner.forward``;
+        it mutates state and replay caches and bypasses Python validation.
+    policies : tuple
+        Indexed by batch size from 1 through ``max_batch_size`` (entry 0 is
+        an unused copy of entry 1). Each entry is ``(two_kernel, d_split,
+        heads_per_cta, main_stages, main_ctas_per_sm)``. Missing cached tactics
+        use the runner's normal fallback policy. These policies are snapshots,
+        not live references to the autotuner cache.
+    """
+    kernel = prepare_checkpointing_ssu_runtime_kernel(
+        state_dtype,
+        input_dtype,
+        dt_dtype,
+        weight_dtype,
+        matrixA_dtype,
+        stateIndex_dtype,
+        state_scale_dtype,
+        dim,
+        dstate,
+        npredicted,
+        max_window,
+        heads_per_group,
+        num_groups,
+        philox_rounds,
+        enable_pdl,
+    )
+    policies = _resolve_checkpointing_ssu_runtime_policies(
+        state_dtype=state_dtype,
+        input_dtype=input_dtype,
+        dt_dtype=dt_dtype,
+        weight_dtype=weight_dtype,
+        matrixA_dtype=matrixA_dtype,
+        stateIndex_dtype=stateIndex_dtype,
+        state_scale_dtype=state_scale_dtype,
+        dim=dim,
+        dstate=dstate,
+        npredicted=npredicted,
+        max_window=max_window,
+        heads_per_group=heads_per_group,
+        num_groups=num_groups,
+        max_batch_size=max_batch_size,
+        device=device,
+        use_rand_seed=use_rand_seed,
+        philox_rounds=philox_rounds,
+        enable_pdl=enable_pdl,
+    )
+    return kernel, policies
+
+
 @functools.cache
 def _make_tactics(
     heads_per_group: int,
@@ -549,6 +681,178 @@ def _get_checkpointing_ssu_runner(
         heads_per_group=heads_per_group,
         optional_tensor_presence=optional_tensor_presence,
     )
+
+
+def _shape_only_tensor(
+    shape: tuple[int, ...], dtype: torch.dtype, device: torch.device | str
+) -> torch.Tensor:
+    """Make a one-element-storage tensor for cache-key resolution only."""
+    return torch.empty_strided(shape, (0,) * len(shape), dtype=dtype, device=device)
+
+
+def _resolve_checkpointing_ssu_runtime_policies(
+    *,
+    state_dtype: torch.dtype,
+    input_dtype: torch.dtype,
+    dt_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    matrixA_dtype: torch.dtype,
+    stateIndex_dtype: torch.dtype,
+    state_scale_dtype: Optional[torch.dtype],
+    dim: int,
+    dstate: int,
+    npredicted: int,
+    max_window: int,
+    heads_per_group: int,
+    num_groups: int,
+    max_batch_size: int,
+    device: torch.device | str,
+    use_rand_seed: bool,
+    philox_rounds: int,
+    enable_pdl: bool,
+) -> tuple[tuple[bool, int, int, int, int], ...]:
+    if max_batch_size <= 0:
+        raise ValueError("max_batch_size must be positive")
+
+    tuner = AutoTuner.get()
+    if tuner.is_tuning_mode:
+        raise RuntimeError(
+            "ReplaySSM runtime tactics must be resolved after autotuning"
+        )
+
+    nheads = heads_per_group * num_groups
+    cache_window = max_window + npredicted
+    state_itemsize = torch.empty((), dtype=state_dtype).element_size()
+    input_itemsize = torch.empty((), dtype=input_dtype).element_size()
+    has_two_kernel = state_itemsize in (2, 4) and input_itemsize == 2
+    token_pad = ((npredicted + 15) // 16) * 16
+    old_token_pad = ((max_window + 7) // 8) * 8
+
+    def tensor(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        return _shape_only_tensor(shape, dtype, device)
+
+    state_scale = (
+        tensor((max_batch_size + 1, nheads, dim), state_scale_dtype)
+        if state_scale_dtype is not None
+        else None
+    )
+    rand_seed = tensor((1,), torch.int64) if use_rand_seed else None
+    cb_scaled = (
+        tensor((max_batch_size, nheads, 32, token_pad // 2), input_dtype)
+        if has_two_kernel
+        else None
+    )
+    cumAdt_vec = (
+        tensor((max_batch_size, nheads, token_pad), torch.float32)
+        if has_two_kernel
+        else None
+    )
+    cb_old = (
+        tensor((max_batch_size, nheads, 32, old_token_pad // 2), input_dtype)
+        if has_two_kernel
+        else None
+    )
+    inputs: list[Any] = [
+        tensor((max_batch_size + 1, nheads, dim, dstate), state_dtype),
+        tensor((max_batch_size, npredicted, nheads, dim), input_dtype),
+        tensor((max_batch_size, npredicted, nheads, dim), dt_dtype),
+        tensor((nheads, dim, dstate), matrixA_dtype),
+        tensor((max_batch_size, npredicted, num_groups, dstate), weight_dtype),
+        tensor((max_batch_size, npredicted, num_groups, dstate), weight_dtype),
+        tensor((max_batch_size, npredicted, nheads, dim), input_dtype),
+        tensor((max_batch_size + 1, nheads, cache_window, dim), input_dtype),
+        tensor(
+            (max_batch_size + 1, num_groups, cache_window, dstate),
+            weight_dtype,
+        ),
+        tensor((max_batch_size + 1, nheads, cache_window), torch.float32),
+        tensor((max_batch_size + 1,), torch.int32),
+        tensor((max_batch_size + 1,), torch.int32),
+        tensor((nheads, dim), weight_dtype),
+        None,  # z
+        tensor((nheads, dim), weight_dtype),
+        tensor((max_batch_size,), stateIndex_dtype),
+        state_scale,
+        rand_seed,
+        None,  # cu_seqlens: dense tactics also launch valid packed batches.
+        cb_scaled,
+        cumAdt_vec,
+        cb_old,
+    ]
+    module_base_args = (
+        state_dtype,
+        input_dtype,
+        dt_dtype,
+        weight_dtype,
+        matrixA_dtype,
+        stateIndex_dtype,
+        state_scale_dtype,
+        dim,
+        dstate,
+        npredicted,
+        max_window,
+        heads_per_group,
+        num_groups,
+        philox_rounds,
+        enable_pdl,
+    )
+    optional_input_indices = (12, 13, 14, 15, 16, 17, 18)
+    runner = _get_checkpointing_ssu_runner(
+        module_base_args,
+        True,
+        -1,
+        _ALGORITHM_AUTO,
+        0,
+        0,
+        heads_per_group,
+        tuple(inputs[index] is not None for index in optional_input_indices),
+    )
+    tuning_config = runner.get_tuning_config(inputs)
+    batch_input_indices = (1, 2, 4, 5, 6, 15, 19, 20, 21)
+
+    def inputs_for_batch(batch: int) -> list[Any]:
+        batch_inputs = list(inputs)
+        for index in batch_input_indices:
+            value = batch_inputs[index]
+            if value is not None:
+                batch_inputs[index] = value[:batch]
+        return batch_inputs
+
+    policy_by_bucket: dict[int, Optional[tuple[bool, int, int, int, int]]] = {}
+    for batch in get_hybrid_num_tokens_buckets(max_batch_size):
+        batch_inputs = inputs_for_batch(batch)
+        _, tactic = tuner.choose_one(
+            "checkpointing_ssu", [runner], tuning_config, batch_inputs
+        )
+        if tactic == -1:
+            policy = None
+        else:
+            if not isinstance(tactic, tuple) or len(tactic) != 4:
+                raise ValueError(f"Unknown checkpointing SSU tactic: {tactic}")
+            stages, ctas_per_sm, heads_per_cta, d_split = tactic
+            policy = (
+                any((stages, ctas_per_sm, heads_per_cta)),
+                d_split,
+                heads_per_cta,
+                stages,
+                ctas_per_sm,
+            )
+        policy_by_bucket[batch] = policy
+
+    policies = []
+    for batch in range(1, max_batch_size + 1):
+        policy = policy_by_bucket[
+            min(map_to_hybrid_bucket_uncapped(batch), max_batch_size)
+        ]
+        if policy is None:
+            # Cache hits share a tuned bucket, but the normal fallback makes
+            # launch decisions using the actual live batch size.
+            batch_inputs = inputs_for_batch(batch)
+            algorithm = runner._resolve_fallback_algorithm(batch_inputs)
+            d_split = runner._resolve_d_split(batch_inputs, algorithm)
+            policy = (algorithm == _ALGORITHM_TWO_KERNEL, d_split, 0, 0, 0)
+        policies.append(policy)
+    return (policies[0], *policies)
 
 
 @register_custom_op(

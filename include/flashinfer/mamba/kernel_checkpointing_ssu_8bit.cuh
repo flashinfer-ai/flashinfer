@@ -1367,7 +1367,8 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
 
   // ── Resolve cache slot ──
   auto const* __restrict__ sbi = reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
-  int64_t const cache_slot = sbi ? static_cast<int64_t>(sbi[seq]) : seq;
+  int64_t const cache_slot =
+      sbi ? static_cast<int64_t>(sbi[seq * params.state_batch_indices_stride_batch]) : seq;
   if (cache_slot == params.pad_slot_id) return;
 
   auto const* __restrict__ ring_start_ptr = reinterpret_cast<int32_t const*>(params.ring_start);
