@@ -2716,9 +2716,9 @@
  "extra_files": [
   {
    "path": "test/python/sdpa/frost/sdpa_binding_reference.py",
-   "bytes": 56032,
-   "lines": 995,
-   "sha256": "18d299619342f41ccf86b446234117d5ec3f924423328047961d8e2cf7d64009",
+   "bytes": 56226,
+   "lines": 1003,
+   "sha256": "58bf1c41ba20ca9cb26eba266d3eeb65577cede813c00f10c1b2b948f0cb5063",
    "license": "MIT",
    "why": "the retired Python frame implementation of the SDPA launch binder (bind_dense / bind_dense_split / bind_thd, the paged pools and tables, the split combine): the frame logic the FlashInfer-side Python binder delegates to, vendored as sdpa/fwd/_binding_reference.py"
   }
