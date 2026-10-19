@@ -5513,14 +5513,19 @@ class FlashKDABlackwellLaunch:
         if _supports_affine_split_launch(args, kwargs):
             impl = FlashKDABlackwellAffineSplitLaunch
         elif state_is_fp32:
-            candidates = (
-                (FlashKDABlackwellFP32BT16Launch, _supports_fp32_bt16_launch),
-                (FlashKDABlackwellFP32SmallBHLaunch, _supports_fp32_small_bh_launch),
-            )
-            if compute_dtype != "tf32":
-                # The BF16 BT16 and small-BH bodies are not exported; the fused
-                # M128 launch routes those grids to its direct / M64 families.
-                candidates = ()
+            # The BF16 BT16 and small-BH bodies are not exported; the fused
+            # M128 launch routes those grids to its direct / M64 families.
+            candidates: tuple[
+                tuple[type[FlashKDABlackwellBF16FusedLaunch], Any], ...
+            ] = ()
+            if compute_dtype == "tf32":
+                candidates = (
+                    (FlashKDABlackwellFP32BT16Launch, _supports_fp32_bt16_launch),
+                    (
+                        FlashKDABlackwellFP32SmallBHLaunch,
+                        _supports_fp32_small_bh_launch,
+                    ),
+                )
             impl = (
                 FlashKDABlackwellFP32FusedM128Launch
                 if state_indices is not None
