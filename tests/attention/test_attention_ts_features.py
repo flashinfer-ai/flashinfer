@@ -36,6 +36,8 @@ from flashinfer.attention.prims_ts._compile_cache import (
 )
 from flashinfer.attention.prims_ts import _hardware
 
+pytestmark = pytest.mark.arch_blackwell
+
 
 @dataclass(frozen=True)
 class _Spec:
