@@ -1341,7 +1341,6 @@ def _resolve_context_plan_geometry(
         else _validate_static_extent(head_dim_vo, "head_dim_vo")
     )
     device, device_index = _resolve_cuda_device(device)
-    _validate_int8_qk_device(qk_dtype, device_index)
 
     _validate_padded_data_extent(
         batch_size * max_seq_len_q, "batch_size * max_seq_len_q"
@@ -1404,6 +1403,8 @@ def _resolve_context_plan_geometry(
             "int8 Q/K require a Sage recipe (sage=SageAttentionConfig(...)) that "
             "dequantizes them"
         )
+    # The recipe is rejected before the device, as in block-sparse plans.
+    _validate_int8_qk_device(qk_dtype, device_index)
     return geometry
 
 
