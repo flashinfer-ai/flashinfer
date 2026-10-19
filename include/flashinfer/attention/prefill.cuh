@@ -456,6 +456,186 @@ __device__ __forceinline__ uint32_t get_warp_idx(const uint32_t tid_y = threadId
 }
 
 /*!
+ * \brief Whether the FP8 KV in-loop path (the one taken when the tile is not repacked, e.g.
+ *   CTA_TILE_Q=16 decode) runs its MMAs in FP16 on a head-dim permuted layout.
+ *
+ * The generic in-loop path uses half of each ldmatrix.x4, rebuilds the 16-bit fragment
+ * layout with lane shuffles, and dequantizes with integer bit tricks. At CTA_TILE_Q=16 that
+ * work, not memory bandwidth, bounds the decode kernel. This path instead:
+ *  - permutes the head dimension of Q (slot 2i+j <- dim 4i+j, slot 8+2i+j <- dim 4i+2+j
+ *    within each 16-dim group), so the bytes a lane receives from a plain ldmatrix of FP8 K
+ *    already form its B fragment,
+ *  - splits each V word into two tokens of an even and an odd head-dim column with one
+ *    byte permute, which permutes the columns of O (undone once after the main loop),
+ *  - converts FP8 to FP16, which is exact for e4m3 and e5m2, and runs QK and PV in FP16.
+ *    A bf16 Q is converted to FP16 once per CTA. A row whose largest element would overflow
+ *    FP16 or is below 2^-4 is first scaled by a power of two that is folded back into its
+ *    logits, so only elements far smaller than their row maximum can round (to FP16
+ *    subnormals).
+ */
+template <typename KTraits>
+constexpr bool use_fp8_kv_f16_mma() {
+  using DTypeQ = typename KTraits::DTypeQ;
+  using DTypeKV = typename KTraits::DTypeKV;
+  return sizeof(DTypeKV) == 1 && !is_fp4_type_v<DTypeKV> && !KTraits::USE_KV_REPACK &&
+         !KTraits::USE_VO_SPLIT && !KTraits::USE_KV_SHARED_SMEM && KTraits::CTA_TILE_Q == 16 &&
+         KTraits::NUM_MMA_Q == 1 && KTraits::NUM_WARPS_Q == 1 && KTraits::NUM_THREADS == 128 &&
+         KTraits::NUM_D_VO_TILES == 1 && KTraits::NUM_MMA_D_QK % 8 == 0 &&
+         KTraits::NUM_MMA_D_VO % 2 == 0 && KTraits::SWIZZLE_MODE_KV == SwizzleMode::k128B &&
+         std::is_same_v<typename KTraits::DTypeQKAccum, float> &&
+         (std::is_same_v<DTypeQ, half> || std::is_same_v<DTypeQ, nv_bfloat16>);
+}
+
+// Four packed FP8 values -> two half2 registers: {b0, b1}, {b2, b3}.
+template <typename DTypeKV>
+__device__ __forceinline__ void fp8x4_to_f16x4(uint32_t x, uint32_t* out) {
+  vec_cast<half, DTypeKV>::template cast<4>(reinterpret_cast<half*>(out),
+                                            reinterpret_cast<const DTypeKV*>(&x));
+}
+
+/*!
+ * \brief Rewrite the Q tile in shared memory as FP16 in the permuted head-dim order
+ *   used by use_fp8_kv_f16_mma(), and return the per-row power-of-two logits scale
+ *   for the two rows (lane/4 and lane/4+8) this thread holds in s_frag.
+ * \note Must be called by all threads after Q has landed in shared memory. Rows at or
+ *   past qo_upper_bound hold stale shared memory and are never rescaled.
+ */
+template <typename KTraits>
+__device__ __forceinline__ void prepare_q_fp8_kv_f16_mma(
+    smem_t<KTraits::SWIZZLE_MODE_Q>* q_smem, const uint32_t qo_packed_idx_base,
+    const uint32_t qo_upper_bound, const uint_fastdiv group_size, const uint32_t warp_idx,
+    const uint32_t lane_idx, float* row_logits_scale) {
+  using DTypeQ = typename KTraits::DTypeQ;
+  constexpr uint32_t UPCAST_STRIDE_Q = KTraits::UPCAST_STRIDE_Q;
+  constexpr uint32_t NUM_CHUNKS = KTraits::HEAD_DIM_QK / 8;  // b128 chunks per row
+  constexpr uint32_t NUM_GROUPS = KTraits::HEAD_DIM_QK / 16;
+  constexpr bool kConvert = !std::is_same_v<DTypeQ, half>;
+  auto block = cg::this_thread_block();
+
+  // Per-row exponent e: a bf16 row is multiplied by 2^-e before the FP16 conversion and its
+  // logits by 2^e after QK. Rows whose largest element is in [2^-4, 2^16) keep e = 0; larger
+  // or smaller rows are moved to [2^15, 2^16) so they neither overflow nor go subnormal.
+  int32_t row_exp = 0;
+  if constexpr (kConvert) {
+    const uint32_t row = lane_idx % 16;
+    float amax = 0.f;
+#pragma unroll
+    for (uint32_t c = (lane_idx / 16) * (NUM_CHUNKS / 2);
+         c < (lane_idx / 16 + 1) * (NUM_CHUNKS / 2); ++c) {
+      uint4 v = *reinterpret_cast<const uint4*>(
+          q_smem->base + q_smem->template get_permuted_offset<UPCAST_STRIDE_Q>(row, c));
+      const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+      for (uint32_t i = 0; i < 4; ++i) {
+        float2 f = __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(&w[i]));
+        amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y)));
+      }
+    }
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 16));
+    uint32_t q_idx, r;
+    group_size.divmod(qo_packed_idx_base + row, q_idx, r);
+    const uint32_t exp_bits = (__float_as_uint(amax) >> 23) & 0xff;
+    const int32_t e = int32_t(exp_bits) - 127 - 15;  // amax * 2^-e < 2^16
+    const bool keep = q_idx >= qo_upper_bound || amax == 0.f || exp_bits == 0xff ||
+                      (e <= 0 && exp_bits >= 127 - 4);
+    row_exp = keep ? 0 : max(e, -126);  // -126 keeps 2^e and 2^-e normal floats
+    block.sync();                       // every warp has read the 16-bit Q before it is overwritten
+  }
+  {
+    const int32_t e_g = __shfl_sync(0xffffffff, row_exp, lane_idx / 4);
+    const int32_t e_g8 = __shfl_sync(0xffffffff, row_exp, lane_idx / 4 + 8);
+    row_logits_scale[0] = __uint_as_float(uint32_t(127 + e_g) << 23);
+    row_logits_scale[1] = __uint_as_float(uint32_t(127 + e_g8) << 23);
+  }
+
+  const uint32_t tid = warp_idx * 32 + lane_idx;
+  const uint32_t row = tid / 8;
+  const int32_t e_row = __shfl_sync(0xffffffff, row_exp, row % 16);
+  const float q_scale = __uint_as_float(uint32_t(127 - e_row) << 23);
+#pragma unroll
+  for (uint32_t grp = tid % 8; grp < NUM_GROUPS; grp += 8) {
+    const uint32_t off0 = q_smem->template get_permuted_offset<UPCAST_STRIDE_Q>(row, 2 * grp);
+    const uint32_t off1 = q_smem->template get_permuted_offset<UPCAST_STRIDE_Q>(row, 2 * grp + 1);
+    uint4 v0 = *reinterpret_cast<const uint4*>(q_smem->base + off0);
+    uint4 v1 = *reinterpret_cast<const uint4*>(q_smem->base + off1);
+    uint32_t w[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+    if constexpr (kConvert) {
+#pragma unroll
+      for (uint32_t i = 0; i < 8; ++i) {
+        float2 f = __bfloat1622float2(*reinterpret_cast<const nv_bfloat162*>(&w[i]));
+        half2 h = __floats2half2_rn(f.x * q_scale, f.y * q_scale);
+        w[i] = *reinterpret_cast<uint32_t*>(&h);
+      }
+    }
+    // dim pairs {0,1},{4,5},{8,9},{12,13} -> first chunk; {2,3},{6,7},{10,11},{14,15} -> second
+    *reinterpret_cast<uint4*>(q_smem->base + off0) = make_uint4(w[0], w[2], w[4], w[6]);
+    *reinterpret_cast<uint4*>(q_smem->base + off1) = make_uint4(w[1], w[3], w[5], w[7]);
+  }
+  block.sync();
+}
+
+// Fold the per-row power-of-two Q pre-scale of prepare_q_fp8_kv_f16_mma() back into the
+// logits. Only rows whose largest element is outside [2^-4, 2^16) take the multiply; an FP16
+// query is never rescaled.
+template <typename KTraits>
+__device__ __forceinline__ void rescale_s_fp8_kv_f16_mma(
+    typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
+    const float* row_logits_scale) {
+  if constexpr (!std::is_same_v<typename KTraits::DTypeQ, half>) {
+    if (row_logits_scale[0] != 1.f || row_logits_scale[1] != 1.f) {
+#pragma unroll
+      for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
+#pragma unroll
+        for (uint32_t reg = 0; reg < 8; ++reg) {
+          s_frag[0][mma_kv][reg] *= row_logits_scale[(reg / 2) % 2];
+        }
+      }
+    }
+  }
+}
+
+/*!
+ * \brief Undo the head-dim permutation use_fp8_kv_f16_mma() leaves in o_frag.
+ *   In each 16-column block lane (4g+i) holds columns {4i, 4i+2} in regs {0,1}/{2,3}
+ *   and {4i+1, 4i+3} in regs {4,5}/{6,7}; afterwards it holds the standard
+ *   {2i, 2i+1} and {8+2i, 9+2i}.
+ */
+template <typename KTraits>
+__device__ __forceinline__ void unpermute_o_fp8_kv_f16_mma(
+    float (*o_frag)[KTraits::NUM_MMA_D_VO_TILE][8], const uint32_t lane_idx) {
+  const uint32_t i = lane_idx % 4;
+  const uint32_t src_lo = (lane_idx & ~3u) | (i >> 1);
+  const uint32_t src_hi = src_lo + 2;
+  const bool odd = i & 1;
+#pragma unroll
+  for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+    for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO_TILE; ++mma_d) {
+      float* o = o_frag[mma_q][mma_d];
+      float r[8];
+#pragma unroll
+      for (uint32_t h = 0; h < 2; ++h) {  // h=0: row g (regs 0,1,4,5); h=1: row g+8
+        const float p0 = o[2 * h], p1 = o[2 * h + 1], p4 = o[4 + 2 * h], p5 = o[5 + 2 * h];
+        const float a0 = __shfl_sync(0xffffffff, p0, src_lo);
+        const float a1 = __shfl_sync(0xffffffff, p1, src_lo);
+        const float a4 = __shfl_sync(0xffffffff, p4, src_lo);
+        const float a5 = __shfl_sync(0xffffffff, p5, src_lo);
+        const float b0 = __shfl_sync(0xffffffff, p0, src_hi);
+        const float b1 = __shfl_sync(0xffffffff, p1, src_hi);
+        const float b4 = __shfl_sync(0xffffffff, p4, src_hi);
+        const float b5 = __shfl_sync(0xffffffff, p5, src_hi);
+        r[2 * h] = odd ? a1 : a0;
+        r[2 * h + 1] = odd ? a5 : a4;
+        r[4 + 2 * h] = odd ? b1 : b0;
+        r[5 + 2 * h] = odd ? b5 : b4;
+      }
+#pragma unroll
+      for (uint32_t reg = 0; reg < 8; ++reg) o[reg] = r[reg];
+    }
+  }
+}
+
+/*!
  * \brief Apply Llama style rotary embedding to two 16x16 fragments.
  * \tparam T The data type of the input fragments.
  * \param x_first_half First fragment x[offset:offset+16, j*16:(j+1)*16]
@@ -1329,11 +1509,15 @@ __device__ __forceinline__ void repack_kv_tile_to_16b(typename KTraits::DTypeKV*
   }
 }
 
-template <typename KTraits, bool REPACK_BF16 = false>
+template <typename KTraits, bool REPACK_BF16 = false, bool FP8_F16 = false>
 __device__ __forceinline__ void compute_qk(
     smem_t<KTraits::SWIZZLE_MODE_Q>* q_smem, uint32_t* q_smem_offset_r,
     smem_t<KTraits::SWIZZLE_MODE_KV>* k_smem, uint32_t* k_smem_offset_r, uint8_t* k_sf_smem,
     uint32_t lane_idx, typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8]) {
+  static_assert(!FP8_F16 || use_fp8_kv_f16_mma<KTraits>());
+  using DTypeMMA = std::conditional_t<FP8_F16, half, typename KTraits::DTypeQ>;
+  // FP8_F16: the upper 16-dim half of each ldmatrix.x4, consumed at the next (odd) mma_d.
+  [[maybe_unused]] uint32_t k_frag_next[KTraits::NUM_MMA_KV][2];
   constexpr uint32_t UPCAST_STRIDE_Q = KTraits::UPCAST_STRIDE_Q;
   constexpr uint32_t UPCAST_STRIDE_K = KTraits::UPCAST_STRIDE_K;
   // When reading from the BF16 repack buffer, K is laid out as native 16-bit, so
@@ -1357,7 +1541,24 @@ __device__ __forceinline__ void compute_qk(
 
 #pragma unroll
     for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
-      if constexpr (sizeof(typename KTraits::DTypeKV) == 1 && !REPACK_BF16) {
+      if constexpr (FP8_F16) {
+        // Lane (4g+i) holds dims 4i..4i+3 of tokens g and g+8; with Q permuted to match,
+        // bytes {0,1} and {2,3} are exactly the two k-halves of the B fragment.
+        uint32_t k_quant[2];
+        if (mma_d % 2 == 0) {
+          uint32_t r[4];
+          k_smem->ldmatrix_m8n8x4(*k_smem_offset_r, r);
+          k_quant[0] = r[0];
+          k_quant[1] = r[2];
+          k_frag_next[mma_kv][0] = r[1];
+          k_frag_next[mma_kv][1] = r[3];
+        } else {
+          k_quant[0] = k_frag_next[mma_kv][0];
+          k_quant[1] = k_frag_next[mma_kv][1];
+        }
+        fp8x4_to_f16x4<typename KTraits::DTypeKV>(k_quant[0], b_frag);
+        fp8x4_to_f16x4<typename KTraits::DTypeKV>(k_quant[1], b_frag + 2);
+      } else if constexpr (sizeof(typename KTraits::DTypeKV) == 1 && !REPACK_BF16) {
         uint32_t b_frag_quant[2];
         if (mma_d % 2 == 0) {
           k_smem->ldmatrix_m8n8x4_left_half(*k_smem_offset_r, b_frag_quant);
@@ -1404,11 +1605,11 @@ __device__ __forceinline__ void compute_qk(
       for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
         if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
           if (mma_d == 0) {
-            mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ, MMAMode::kInit>(
+            mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeMMA, MMAMode::kInit>(
                 s_frag[mma_q][mma_kv], a_frag[mma_q], b_frag);
           } else {
-            mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(
-                s_frag[mma_q][mma_kv], a_frag[mma_q], b_frag);
+            mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeMMA>(s_frag[mma_q][mma_kv],
+                                                                a_frag[mma_q], b_frag);
           }
         } else if (std::is_same_v<typename KTraits::DTypeQKAccum, half>) {
           if (mma_d == 0) {
@@ -1848,25 +2049,29 @@ __device__ __forceinline__ void update_mdo_states(
   }
 }
 
-template <typename KTraits, bool REPACK_BF16 = false>
+template <typename KTraits, bool REPACK_BF16 = false, bool FP8_F16 = false>
 __device__ __forceinline__ void compute_sfm_v(
     smem_t<KTraits::SWIZZLE_MODE_KV>* v_smem, uint32_t* v_smem_offset_r, uint8_t* v_sf_smem,
     uint32_t lane_idx, typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
     float (*o_frag)[KTraits::NUM_MMA_D_VO_TILE][8], float (*d)[2], const uint32_t d_base = 0) {
+  static_assert(!FP8_F16 || use_fp8_kv_f16_mma<KTraits>());
+  using DTypeMMA = std::conditional_t<FP8_F16, half, typename KTraits::DTypeQ>;
+  // FP8_F16: the second 16-dim column block of each ldmatrix.x4.trans.
+  [[maybe_unused]] uint32_t v_frag_next[2];
   constexpr uint32_t UPCAST_STRIDE_V = KTraits::UPCAST_STRIDE_V;
   // When reading from the BF16 repack buffer, V is native 16-bit.
   constexpr uint32_t VV_STRIDE = REPACK_BF16 ? KTraits::REPACK_STRIDE_VO : UPCAST_STRIDE_V;
   constexpr uint32_t VV_ESIZE =
       REPACK_BF16 ? sizeof(typename KTraits::DTypeQ) : sizeof(typename KTraits::DTypeKV);
 
-  typename KTraits::DTypeQ s_frag_f16[KTraits::NUM_MMA_Q][KTraits::NUM_MMA_KV][8];
+  DTypeMMA s_frag_f16[KTraits::NUM_MMA_Q][KTraits::NUM_MMA_KV][8];
   if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
 #pragma unroll
     for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
 #pragma unroll
       for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
-        vec_cast<typename KTraits::DTypeQ, float>::cast<8>(s_frag_f16[mma_q][mma_kv],
-                                                           s_frag[mma_q][mma_kv]);
+        vec_cast<DTypeMMA, float>::template cast<8>(s_frag_f16[mma_q][mma_kv],
+                                                    s_frag[mma_q][mma_kv]);
       }
     }
   }
@@ -1891,7 +2096,29 @@ __device__ __forceinline__ void compute_sfm_v(
     for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
       if (mma_d >= d_base && mma_d < d_base + KTraits::NUM_MMA_D_VO_TILE) {
         uint32_t b_frag[4];
-        if constexpr (sizeof(typename KTraits::DTypeKV) == 1 && !REPACK_BF16) {
+        if constexpr (FP8_F16) {
+          // Lane (4g+i) holds tokens {2i, 2i+1} x dims {2g, 2g+1}; one byte permute splits
+          // them into the even-dim and odd-dim column blocks (O columns end up permuted).
+          uint32_t v_quant[2];
+          if (mma_d % 2 == 0) {
+            uint32_t r[4];
+            v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, r);
+            v_quant[0] = r[0];
+            v_quant[1] = r[1];
+            v_frag_next[0] = r[2];
+            v_frag_next[1] = r[3];
+          } else {
+            v_quant[0] = v_frag_next[0];
+            v_quant[1] = v_frag_next[1];
+          }
+          uint32_t lo[2], hi[2];
+          fp8x4_to_f16x4<typename KTraits::DTypeKV>(__byte_perm(v_quant[0], 0, 0x3120), lo);
+          fp8x4_to_f16x4<typename KTraits::DTypeKV>(__byte_perm(v_quant[1], 0, 0x3120), hi);
+          b_frag[0] = lo[0];
+          b_frag[1] = hi[0];
+          b_frag[2] = lo[1];
+          b_frag[3] = hi[1];
+        } else if constexpr (sizeof(typename KTraits::DTypeKV) == 1 && !REPACK_BF16) {
           uint32_t b_frag_quant[2];
           if (mma_d % 2 == 0) {
             v_smem->ldmatrix_m8n8x4_trans_left_half(*v_smem_offset_r, b_frag_quant);
@@ -1938,7 +2165,7 @@ __device__ __forceinline__ void compute_sfm_v(
 #pragma unroll
         for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
           if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
-            mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(
+            mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeMMA>(
                 o_frag[mma_q][mma_d_local], (uint32_t*)s_frag_f16[mma_q][mma_kv], b_frag);
           } else {
             mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(
@@ -2524,6 +2751,15 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
         cp_async::commit_group();
       }
 
+      constexpr bool kFp8F16 = use_fp8_kv_f16_mma<KTraits>();
+      [[maybe_unused]] float row_logits_scale[2] = {1.f, 1.f};
+      if constexpr (kFp8F16) {
+        cp_async::wait_group<2>();  // Q landed; K/V(0) still in flight
+        block.sync();
+        prepare_q_fp8_kv_f16_mma<KTraits>(&qo_smem, qo_packed_idx_base, qo_len, group_size,
+                                          warp_idx, lane_idx, row_logits_scale);
+      }
+
 #pragma unroll 1
       for (uint32_t iter = 0; iter < num_iterations; ++iter) {
         // Shared K/V serializes loads (no K/V prefetch overlap) -> drain fully.
@@ -2564,11 +2800,14 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
                                          16 * KTraits::NUM_MMA_D_QK),
               lane_idx, s_frag);
         } else {
-          compute_qk<KTraits>(
+          compute_qk<KTraits, /*REPACK_BF16=*/false, kFp8F16>(
               &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r,
               smem_storage.k_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
                                          16 * KTraits::NUM_MMA_D_QK),
               lane_idx, s_frag);
+          if constexpr (kFp8F16) {
+            rescale_s_fp8_kv_f16_mma<KTraits>(s_frag, row_logits_scale);
+          }
         }
         logits_transform<KTraits>(params, variant, /*batch_idx=*/0, qo_packed_idx_base, kv_idx_base,
                                   qo_len, kv_len, chunk_end, group_size, s_frag, tid, kv_head_idx);
@@ -2625,7 +2864,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
                                          16 * KTraits::NUM_MMA_D_VO),
               lane_idx, s_frag, o_frag, d, d_base);
         } else {
-          compute_sfm_v<KTraits>(
+          compute_sfm_v<KTraits, /*REPACK_BF16=*/false, kFp8F16>(
               &v_smem, &v_smem_offset_r,
               smem_storage.v_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
                                          16 * KTraits::NUM_MMA_D_VO),
@@ -2651,6 +2890,10 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
       }
       cp_async::wait_group<0>();
       block.sync();
+
+      if constexpr (kFp8F16) {
+        unpermute_o_fp8_kv_f16_mma<KTraits>(o_frag, lane_idx);
+      }
 
       finalize_m<KTraits>(variant, m);
 
@@ -3225,6 +3468,15 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
         cp_async::commit_group();
       }
 
+      constexpr bool kFp8F16 = use_fp8_kv_f16_mma<KTraits>();
+      [[maybe_unused]] float row_logits_scale[2] = {1.f, 1.f};
+      if constexpr (kFp8F16) {
+        cp_async::wait_group<2>();  // Q landed; K/V(0) still in flight
+        block.sync();
+        prepare_q_fp8_kv_f16_mma<KTraits>(&qo_smem, qo_packed_idx_base, qo_upper_bound, group_size,
+                                          warp_idx, lane_idx, row_logits_scale);
+      }
+
 #pragma unroll 1
       for (uint32_t iter = 0; iter < num_iterations; ++iter) {
         // Shared K/V serializes loads (no K/V prefetch overlap) -> drain fully.
@@ -3273,11 +3525,14 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
                                          16 * KTraits::NUM_MMA_D_QK),
               lane_idx, s_frag);
         } else {
-          compute_qk<KTraits>(
+          compute_qk<KTraits, /*REPACK_BF16=*/false, kFp8F16>(
               &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r,
               smem_storage.k_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
                                          16 * KTraits::NUM_MMA_D_QK),
               lane_idx, s_frag);
+          if constexpr (kFp8F16) {
+            rescale_s_fp8_kv_f16_mma<KTraits>(s_frag, row_logits_scale);
+          }
         }
         logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                   kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
@@ -3336,7 +3591,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
                                          16 * KTraits::NUM_MMA_D_VO),
               lane_idx, s_frag, o_frag, d, d_base);
         } else {
-          compute_sfm_v<KTraits>(
+          compute_sfm_v<KTraits, /*REPACK_BF16=*/false, kFp8F16>(
               &v_smem, &v_smem_offset_r,
               smem_storage.v_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
                                          16 * KTraits::NUM_MMA_D_VO),
@@ -3362,6 +3617,10 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       }
       cp_async::wait_group<0>();
       block.sync();
+
+      if constexpr (kFp8F16) {
+        unpermute_o_fp8_kv_f16_mma<KTraits>(o_frag, lane_idx);
+      }
 
       finalize_m<KTraits>(variant, m);
 
@@ -4028,6 +4287,15 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         cp_async::commit_group();
       }
 
+      constexpr bool kFp8F16 = use_fp8_kv_f16_mma<KTraits>();
+      [[maybe_unused]] float row_logits_scale[2] = {1.f, 1.f};
+      if constexpr (kFp8F16) {
+        cp_async::wait_group<2>();  // Q landed; K/V(0) still in flight
+        block.sync();
+        prepare_q_fp8_kv_f16_mma<KTraits>(&qo_smem, qo_packed_idx_base, qo_upper_bound, group_size,
+                                          warp_idx, lane_idx, row_logits_scale);
+      }
+
       uint32_t num_iterations_prefix;
       uint32_t num_iterations_mask;
       uint32_t num_iterations = 0;
@@ -4162,11 +4430,14 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                          16 * KTraits::NUM_MMA_D_QK),
               lane_idx, s_frag);
         } else {
-          compute_qk<KTraits>(
+          compute_qk<KTraits, /*REPACK_BF16=*/false, kFp8F16>(
               &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r,
               smem_storage.k_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
                                          16 * KTraits::NUM_MMA_D_QK),
               lane_idx, s_frag);
+          if constexpr (kFp8F16) {
+            rescale_s_fp8_kv_f16_mma<KTraits>(s_frag, row_logits_scale);
+          }
         }
         logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                   kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
@@ -4252,7 +4523,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                          16 * KTraits::NUM_MMA_D_VO),
               lane_idx, s_frag, o_frag, d, d_base);
         } else {
-          compute_sfm_v<KTraits>(
+          compute_sfm_v<KTraits, /*REPACK_BF16=*/false, kFp8F16>(
               &v_smem, &v_smem_offset_r,
               smem_storage.v_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
                                          16 * KTraits::NUM_MMA_D_VO),
@@ -4287,6 +4558,10 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       }
       cp_async::wait_group<0>();
       block.sync();
+
+      if constexpr (kFp8F16) {
+        unpermute_o_fp8_kv_f16_mma<KTraits>(o_frag, lane_idx);
+      }
 
       finalize_m<KTraits>(variant, m);
 
