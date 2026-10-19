@@ -1191,10 +1191,13 @@ def _fused_indexer_shared_storage_cls(
     paged_output: bool,
 ):
     # Unique class name per variant: cute.struct keys its layout by the class
-    # __name__, so two variants sharing the name "SharedStorage" would collide
-    # in the DSL compiler when both are traced in one process.
+    # __name__, so two variants sharing a name would collide in the DSL
+    # compiler when both are traced in one process. Every layout parameter
+    # must appear in the name (the lru_cache key already distinguishes them,
+    # but the generated __name__ is what cute.struct actually keys on).
     SharedStorage = type(
-        f"FusedIndexerSharedStorage_{topk}_{carry_cap}_{int(paged_output)}",
+        f"FusedIndexerSharedStorage_{padded_q_heads}_{tokens_per_work}_"
+        f"{num_q_head_tiles}_{topk}_{carry_cap}_{cands}_{int(paged_output)}",
         (),
         {},
     )
@@ -1561,6 +1564,7 @@ def _fused_radix_select(
             ni1,
             lr,
             True,
+            False,
             vin_v,
             vin_l,
             vin_v,
@@ -2145,9 +2149,15 @@ class DSAFusedIndexerKernel:
                                     gidx = span_first + tok_rel
                             s_c0_values[carry_count + tok_rel - round_base] = val
                             s_c0_gindex[carry_count + tok_rel - round_base] = gidx
-                            s_c0_lindex[carry_count + tok_rel - round_base] = (
-                                span_first + tok_rel
-                            )
+                            # Only write the separate logical index when it
+                            # exists: for paged_output=False, s_c0_lindex
+                            # aliases s_c0_gindex, and gidx already carries the
+                            # logical index (or the -1 sentinel for unmapped
+                            # pages, which must not be overwritten).
+                            if cutlass.const_expr(self.paged_output):
+                                s_c0_lindex[carry_count + tok_rel - round_base] = (
+                                    span_first + tok_rel
+                                )
                 carry_count = carry_count + round_valid
                 round_base += Int32(256)
             cute.arch.sync_threads()
@@ -2946,6 +2956,7 @@ class DSAFusedIndexerKernel:
                                     ni1,
                                     lr,
                                     True,
+                                    False,
                                     s_tie_v,
                                     s_tie_l,
                                     pack_v_row,
@@ -2994,6 +3005,7 @@ class DSAFusedIndexerKernel:
                                     ni1,
                                     lr,
                                     True,
+                                    True,
                                     pack_v_row,
                                     pack_l_row,
                                     pack_v_row,
@@ -3012,11 +3024,15 @@ class DSAFusedIndexerKernel:
                                 i = Int32(tx)
                                 while i < remaining_k:
                                     sel = Int32(s_out[i])
-                                    out_values[group_id, winners + i] = Float32(
-                                        pack_v_row[sel]
+                                    out_values[group_id, winners + i] = (
+                                        ld_global_cg_f32(
+                                            get_ptr_as_int64(pack_v_row, sel)
+                                        )
                                     )
-                                    out_indices[group_id, winners + i] = Int32(
-                                        pack_i_row[sel]
+                                    out_indices[group_id, winners + i] = (
+                                        ld_global_cg_i32(
+                                            get_ptr_as_int64(pack_i_row, sel)
+                                        )
                                     )
                                     i += Int32(_RADIX_THREADS)
                 # Departure: once its output is placed, every CTA publishes
@@ -3266,6 +3282,12 @@ def _launch_fused(kernel, cute_args, key_tensors, policy, *, launcher=None):
         variant = "fused_indexer_v8_coop"
     else:
         variant = "fused_indexer_v8_oversub_serial"
+    if launcher is not None:
+        from b12x._lib.compiler import run_compiled
+
+        return run_compiled(launcher, cute_args)
+    # Only the compile path invalidates the cache: a prepared launcher replays
+    # a fixed cubin and must not trigger a recompile for later launches.
     global _FUSED_INDEXER_LAST_VARIANT_SIG
     variant_sig = (variant,) + tuple(policy)
     if variant_sig != _FUSED_INDEXER_LAST_VARIANT_SIG:
@@ -3278,10 +3300,6 @@ def _launch_fused(kernel, cute_args, key_tensors, policy, *, launcher=None):
     compile_spec = KernelCompileSpec.from_key(
         "attention.indexer.fused_indexer", 1, cache_key, labels=labels
     )
-    if launcher is not None:
-        from b12x._lib.compiler import run_compiled
-
-        return run_compiled(launcher, cute_args)
     return b12x_launch(
         kernel,
         compile_spec=compile_spec,

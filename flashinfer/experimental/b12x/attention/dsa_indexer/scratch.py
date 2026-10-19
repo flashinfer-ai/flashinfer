@@ -570,7 +570,7 @@ class B12XIndexerPagedScratch:
         self,
         *,
         topk: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         topk = int(topk)
         if topk <= 0 or topk > int(self.topk):
             raise ValueError(

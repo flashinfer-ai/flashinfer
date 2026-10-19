@@ -31,6 +31,9 @@ from b12x._lib.compiler import (
 from b12x._lib.compile_plan import compile_only_launches_enabled
 from b12x._lib.intrinsics import (
     atomic_add_shared_i32,
+    get_ptr_as_int64,
+    ld_global_cg_f32,
+    ld_global_cg_i32,
     ld_shared_i32,
     ld_shared_i32_relaxed,
     red_add_shared_i32,
@@ -503,6 +506,7 @@ def _exact_overflow_fallback(
         ni1,
         lr,
         flat,
+        False,
         flat_values,
         flat_lindex,
         input_tensor,
@@ -539,6 +543,7 @@ def _deterministic_tie_fill(
     ni1: Int32,
     lr: Int32,
     flat: cutlass.Constexpr[bool],
+    cg_load: cutlass.Constexpr[bool],
     flat_values,
     flat_lindex,
     input_tensor,
@@ -699,23 +704,28 @@ def _deterministic_tie_fill(
     while idx_base < tf_full_limit:
         for tf_scan_u in cutlass.range_constexpr(_SCAN_UNROLL):
             tf_idx = idx_base + Int32(tf_scan_u * _THREADS_PER_CTA)
-            tf_val = _fallback_load_value(
-                flat,
-                tf_idx,
-                flat_values,
-                input_tensor,
-                carry_values,
-                row_base,
-                row_start,
-                carry_base,
-                chunk_len,
-                block_q,
-                block_k,
-                is_tiled,
-                is_first,
-            )
+            if cutlass.const_expr(flat and cg_load):
+                tf_val = ld_global_cg_f32(get_ptr_as_int64(flat_values, tf_idx))
+            else:
+                tf_val = _fallback_load_value(
+                    flat,
+                    tf_idx,
+                    flat_values,
+                    input_tensor,
+                    carry_values,
+                    row_base,
+                    row_start,
+                    carry_base,
+                    chunk_len,
+                    block_q,
+                    block_k,
+                    is_tiled,
+                    is_first,
+                )
             if _convert_to_uint32(tf_val) == pivot_key:
-                if cutlass.const_expr(flat):
+                if cutlass.const_expr(flat and cg_load):
+                    tf_col = ld_global_cg_i32(get_ptr_as_int64(flat_lindex, tf_idx))
+                elif cutlass.const_expr(flat):
                     tf_col = Int32(flat_lindex[tf_idx])
                 else:
                     tf_col = _tie_break_column_index(
@@ -733,23 +743,28 @@ def _deterministic_tie_fill(
                     s_cand1[tf_pos] = tf_col
         idx_base = idx_base + Int32(_THREADS_PER_CTA * _SCAN_UNROLL)
     while idx_base < n_total:
-        tf_val = _fallback_load_value(
-            flat,
-            idx_base,
-            flat_values,
-            input_tensor,
-            carry_values,
-            row_base,
-            row_start,
-            carry_base,
-            chunk_len,
-            block_q,
-            block_k,
-            is_tiled,
-            is_first,
-        )
+        if cutlass.const_expr(flat and cg_load):
+            tf_val = ld_global_cg_f32(get_ptr_as_int64(flat_values, idx_base))
+        else:
+            tf_val = _fallback_load_value(
+                flat,
+                idx_base,
+                flat_values,
+                input_tensor,
+                carry_values,
+                row_base,
+                row_start,
+                carry_base,
+                chunk_len,
+                block_q,
+                block_k,
+                is_tiled,
+                is_first,
+            )
         if _convert_to_uint32(tf_val) == pivot_key:
-            if cutlass.const_expr(flat):
+            if cutlass.const_expr(flat and cg_load):
+                tf_col = ld_global_cg_i32(get_ptr_as_int64(flat_lindex, idx_base))
+            elif cutlass.const_expr(flat):
                 tf_col = Int32(flat_lindex[idx_base])
             else:
                 tf_col = _tie_break_column_index(
@@ -1561,6 +1576,7 @@ class DSATiledTopkKernel:
                         ni0,
                         ni1,
                         lr,
+                        False,
                         False,
                         input_tensor,
                         carry_indices,

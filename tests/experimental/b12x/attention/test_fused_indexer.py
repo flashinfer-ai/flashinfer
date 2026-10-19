@@ -723,6 +723,65 @@ def test_fused_indexer_paged_direct_k_high_page_id_i64_offsets():
         assert torch.allclose(val[row].float(), paired.float(), atol=1e-2, rtol=0)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for fused indexer"
+)
+def test_fused_indexer_direct_k_unmapped_page_preserves_sentinel():
+    """Direct-K append must not clobber the -1 sentinel for unmapped pages.
+
+    With paged_output=False the output gindex IS the logical token index, so the
+    kernel aliases the logical-index buffer onto the gindex buffer. The direct-K
+    append writes gidx=-1 for an unmapped page and then (bug) overwrote the same
+    slot with the logical index, turning an absent token into a live one. A
+    sparse consumer counts the -1 sentinels, so the sentinel count must equal
+    topk - valid_tokens.
+    """
+    device = torch.device("cuda")
+    rows, heads, topk, seqlen = 2, 64, 512, 128  # 64 heads -> direct-K score path
+    g = torch.Generator(device="cpu").manual_seed(5)
+    npages = 2  # page 0 mapped, page 1 unmapped (-1)
+    q_fp8 = (
+        (torch.randn((rows, heads, 128), generator=g) / 3)
+        .to(torch.float8_e4m3fn)
+        .to(device)
+    )
+    weights = torch.randn((rows, heads), generator=g, dtype=torch.float32).to(device)
+    k_fp8 = (
+        (torch.randn((npages, _PS, 128), generator=g) / 3)
+        .to(torch.float8_e4m3fn)
+        .to(device)
+    )
+    k_scales = (
+        torch.rand((npages, _PS), generator=g, dtype=torch.float32).to(device) + 0.1
+    )
+    # Page 0 -> physical page 0 (mapped); page 1 -> -1 (unmapped).
+    page_table = torch.full((rows, npages), -1, dtype=torch.int32, device=device)
+    page_table[:, 0] = 0
+    seqlens = torch.full((rows,), seqlen, dtype=torch.int32, device=device)
+
+    idx, val = run_fused_paged_indexer(
+        q_bytes=q_fp8.view(torch.uint8),
+        weights=weights,
+        k_quant_bytes=k_fp8.view(torch.uint8).contiguous(),
+        k_scales=k_scales,
+        real_page_table=page_table,
+        seqlens=seqlens,
+        num_heads=heads,
+        topk=topk,
+    )
+    torch.cuda.synchronize(device)
+
+    valid_tokens = _PS  # only page 0 is mapped
+    for r in range(rows):
+        sentinels = int((idx[r] == -1).sum())
+        assert sentinels == topk - valid_tokens, (
+            f"row {r}: expected {topk - valid_tokens} sentinels, got {sentinels} "
+            "(unmapped-page tokens were treated as live)"
+        )
+        live = idx[r][idx[r] >= 0]
+        assert set(live.tolist()) == set(range(valid_tokens))
+
+
 # --- fused_merge policy knob -------------------------------------------------
 
 
