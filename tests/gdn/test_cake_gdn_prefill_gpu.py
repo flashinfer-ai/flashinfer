@@ -896,10 +896,12 @@ def test_public_cake_gdn_prefill_performs_no_device_to_host_sync(
     assert torch.equal(case["output"], expected_out)
     assert torch.equal(case["output_state"], expected_state)
 
-    # The detector sees a real device-to-host read (positive control) ...
-    control = _profile_window(lambda: case["cu_seqlens"].cpu())
+    # The detector sees an explicit host synchronization (positive control).
+    # Profilers on some CUDA/PyTorch combinations report ``Tensor.cpu()`` only
+    # as aten::to/_to_copy, without a Memcpy DtoH or cudaMemcpy event.
+    control = _profile_window(torch.cuda.synchronize)
     assert _forbidden_sync_names(control), control
-    # ... and none in the route.
+    # The route itself reports none.
     names = _profile_window(lambda: _launch(case, **public_kwargs))
     assert not _forbidden_sync_names(names), names
     torch.cuda.synchronize()
