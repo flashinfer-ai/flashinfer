@@ -120,12 +120,12 @@ def token_sparse_kv_indices(
     if block_table.shape[1] == 0:
         raise ValueError("The block table must hold at least one page per request")
     args = (positions, requests, block_table, block_tables, seq_lens)
-    if not all(
-        t.is_cuda and t.is_contiguous() and t.dtype == torch.int32 for t in args
+    device = positions.device
+    if device.type != "cuda" or not all(
+        t.device == device and t.is_contiguous() and t.dtype == torch.int32
+        for t in args
     ):
-        raise ValueError(
-            "Positions, tables and lengths must be contiguous int32 on CUDA"
-        )
+        raise ValueError("Positions, tables and lengths: contiguous int32, one GPU")
     if num_tokens:
         constants = (requests_per_token, top_k)
         launch(
