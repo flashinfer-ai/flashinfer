@@ -224,6 +224,6 @@ No performance number is claimed in this draft. The Rubin decode levers (the 64-
 and its lean group walk, the lowered small-M decode chain) landed on the cuDNN Frontend side on 2026-10-16 and are vendored here;
 a fused decode step is still in flight there and will be re-vendored before the final review.
 
-Owner: @RomanAnders90. Tracking issue: TBD (opened with the PR). Graduation intent: re-vendor at each cuDNN Frontend
+Owner: @RomanAnders90. Tracking issue: #6805. Graduation intent: re-vendor at each cuDNN Frontend
 release while the decode levers land, finalise the signatures with the vLLM integration, then graduate to a stable
 attention namespace with `docs/api/` pages.
