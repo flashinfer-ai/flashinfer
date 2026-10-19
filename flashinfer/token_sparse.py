@@ -162,7 +162,7 @@ def union_masks_kernel(
     union: cute.Tensor,
     union_sizes: cute.Tensor,
     mask: cute.Tensor,
-    key_tiles: cutlass.Int32,
+    num_keys: cutlass.Int32,
     group: cutlass.Constexpr[int],
     words: cutlass.Constexpr[int],
     top_k: cutlass.Constexpr[int],
@@ -178,8 +178,9 @@ def union_masks_kernel(
     3. Mask: row r sets bit j of word w of mask row query_rows[r] when it selected
        column 32w + j. Masks are written in whole tiles of TILE columns.
 
-    Union and mask rows of -1 are not written. The CTA reads ROWS rows at a time,
-    THREADS threads each, as in kv_indices_kernel."""
+    Positions outside [0, num_keys) are skipped, and union and mask rows of -1 are
+    not written. The CTA reads ROWS rows at a time, THREADS threads each, as in
+    kv_indices_kernel."""
     thread, g = cute.arch.thread_idx()[0], cute.arch.block_idx()[0]
     # Team t (THREADS threads) takes rows t, t + ROWS, ... of the group.
     lane, team = thread % THREADS, thread // THREADS
@@ -198,6 +199,8 @@ def union_masks_kernel(
     sums = shared.allocate_tensor(cutlass.Int32, cute.make_layout(CTA // 32), ALIGN)
     first, row_stage = g * group, stage[team, None]
     request, batch = requests[g], group_unions[g]
+    key_tiles = (num_keys + TILE - 1) // TILE
+    keys_end = cutlass.Uint32(num_keys)  # unsigned: negative keys are past it
     for base in cutlass.range(0, TILE_WORDS * key_tiles, CTA):  # whole scan rounds
         bitmap[base + thread] = 0
     for i in cutlass.range(lane, stage_words, THREADS):
@@ -211,7 +214,7 @@ def union_masks_kernel(
             chunk = cute.local_tile(positions[r, None], (LOAD,), (lane + THREADS * i,))
             keys[None, i].store(chunk.load())
         for j in cutlass.range(top_k // THREADS, unroll_full=True):
-            if keys[j] >= 0:
+            if cutlass.Uint32(keys[j]) < keys_end:
                 word = bitmap.iterator + (keys[j] >> 5)
                 bit = cutlass.Int32(1) << (keys[j] & 31)
                 cute.arch.atomic_or(word.llvm_ptr, bit, scope="cta")
@@ -249,7 +252,8 @@ def union_masks_kernel(
             keys[None, i].store(chunk.load())
         for j in cutlass.range(top_k // THREADS, unroll_full=True):
             key = keys[j]
-            if key >= 0:  # its column: union keys below its tile, word and bit
+            if cutlass.Uint32(key) < keys_end:
+                # Its column: union keys below its tile, then below it in the tile.
                 word = key >> 5
                 lower = (cutlass.Uint32(1) << cutlass.Uint32(key & 31)) - 1
                 column = below[word // TILE_WORDS] + cutlass.Int32(
@@ -318,17 +322,19 @@ def group_union_masks(
         token selected union column ``32w + j``. Only words
         ``w < 4 ceil(U / 128)`` are written.
     num_keys : int
-        A bound on the key positions. The block table must cover it.
+        The number of keys: positions at or past it count as -1. The block table
+        must cover it, and shared memory grows with it.
     """
     rows, top_k = positions.shape
     groups = len(requests)
     group = rows // max(groups, 1)
     key_tiles = (num_keys + TILE - 1) // TILE
     columns = min(group * top_k, TILE * key_tiles)  # the most keys a union holds
-    # Shared memory, in int32 words: the key bitmap (PAGE_WORDS per page, in whole
-    # scan rounds of CTA words), its counts per key tile, a mask staging row per
-    # team, and the scan's per-warp sums.
-    words = CTA * -(-block_table.shape[1] * PAGE_WORDS // CTA)
+    # Shared memory, in int32 words: the key bitmap (a bit per key below num_keys,
+    # in a power of two of whole scan rounds of CTA words, so few sizes compile),
+    # its counts per key tile, a mask staging row per team, and the scan's sums.
+    rounds = -(-TILE_WORDS * key_tiles // CTA)
+    words = CTA << max(rounds - 1, 0).bit_length()
     stage = ROWS * min(group * top_k // 32, words)
     shared = 4 * (words + words // TILE_WORDS + stage + CTA // 32)
     device = torch.cuda.get_device_properties(positions.device)
@@ -355,7 +361,7 @@ def group_union_masks(
         union,
         union_sizes,
         mask,
-        key_tiles,
+        num_keys,
     )
     if not all(
         t.is_cuda and t.is_contiguous() and t.dtype == torch.int32 for t in args[:-1]
