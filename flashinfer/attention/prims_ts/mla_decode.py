@@ -20,7 +20,7 @@ import copy
 import math
 import struct
 import functools
-from typing import Any, Literal, NamedTuple, Optional, cast
+from typing import Any, Literal, Optional, cast
 
 import torch
 
@@ -1210,8 +1210,6 @@ def _get_compiled_mla_decode(
             cache_seqs_fake,
             scalar,
             scalar,
-            scalar,
-            scalar,
             sink,
         )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -1949,30 +1947,6 @@ __all__ = [
 ]
 
 
-class SparseMLAPreparedMetadata(NamedTuple):
-    """Caller-owned storage-row indices and prepared attention metadata.
-
-    Indices are int32 [rows, capacity], with -1 invalid; lengths are int32
-    [rows]. Primary and extra indices address their own flattened native pool.
-    No block-table lookup or page-stride conversion occurs in run.
-
-    Both pools share one KV descale and participate in a single attention
-    pass. Scales and attention sinks are separate run() inputs; no packed
-    routes or scale/sink copies are required.
-
-    Live lengths and index-array widths need not be multiples of 128. The
-    kernel rounds the primary source's logical execution span internally so
-    a KV tile never crosses sources; bounded loads mask holes and tails.
-    Buffers must remain alive and unaliased with writable attention buffers
-    through graph replay.
-    """
-
-    indices: torch.Tensor
-    lengths: torch.Tensor
-    extra_indices: torch.Tensor | None = None
-    extra_lengths: torch.Tensor | None = None
-
-
 def _make_sparse_output_quant(heads, block_size, scale_format, groups):
     if block_size is None:
         if groups is not None or scale_format != "ue8m0":
@@ -2290,13 +2264,13 @@ def _resolve_sparse_mla_plan(
 
 
 class BatchSparseMLADecodePagedTSWrapper:
-    """Plan native BF16/E4M3 attention over one or two pools, then bind metadata.
+    """Plan native BF16/E4M3 attention, then bind one or two source index lists.
 
-    Q is [B,Sq,H,512] or packed [total_q,H,512]. Caller-prepared metadata
-    contains int32 [rows, capacity] storage-row indices and live lengths.
-    Indices already include physical page strides; -1 is masked. Both source
-    lists participate in one attention distribution and share ``kv_scale``.
-    Independent KV scales and packed KV are unsupported.
+    Q is [B,Sq,H,512] or packed [total_q,H,512]. Each source supplies int32
+    [rows, capacity] storage-row indices and int32 [rows] live lengths directly
+    to run(). Indices include physical page strides; -1 is masked. Both source
+    lists participate in one attention distribution. The caller folds the
+    shared KV descale into the effective softmax and output scales.
 
     ``output_quant_block_size=32`` or ``128`` fuses conjugate output RoPE on
     D[448:512] and E4M3 quantization after the final attention reduction. Q/KV
@@ -2557,13 +2531,14 @@ class BatchSparseMLADecodePagedTSWrapper:
         self,
         query,
         kv_cache,
-        metadata: SparseMLAPreparedMetadata,
+        indices,
+        lengths,
         extra_kv_cache=None,
         *,
+        extra_indices=None,
+        extra_lengths=None,
         qo_indptr=None,
         softmax_scale=512**-0.5,
-        q_scale=1.0,
-        kv_scale=1.0,
         output_scale=1.0,
         sinks=None,
         out=None,
@@ -2573,14 +2548,37 @@ class BatchSparseMLADecodePagedTSWrapper:
         out_scale=None,
         validate=True,
     ):
-        """Launch with caller-prepared metadata, without index conversion.
+        """Attend to caller-selected storage rows in one or two native KV pools.
+
+        ``indices`` and ``extra_indices`` are CUDA INT32 [T,K] tensors, with
+        T equal to the query token count and K equal to the corresponding
+        planned max_topk/max_extra_topk. The last dimension is contiguous;
+        row strides may include padding. Each index addresses its own pool's
+        flattened storage, including physical page strides. The caller performs
+        logical-token/page-table conversion and applies causality upstream.
+        ``lengths`` and ``extra_lengths`` are contiguous CUDA INT32 [T]. Only
+        entries before each length are considered; -1 entries are masked holes.
+        Omit both extra tensors when no extra pool was planned. Input widths
+        and live lengths need no 128-entry padding: the kernel aligns source
+        execution spans internally and bounds all source reads.
+
+        ``softmax_scale`` and ``output_scale`` are positive finite Python
+        scalars or scalar CUDA FP32 tensors. They are already combined:
+        softmax_scale = attention_scale * q_descale * kv_descale;
+        output_scale = output_multiplier * kv_descale. Both pools share that
+        KV descale. These multiply QK scores and the weighted stored V values,
+        respectively; sink logits are not multiplied by softmax_scale. The
+        output multiplier applies before fused RoPE/quantization. ``out_scale``
+        instead holds the generated per-block quantization scales.
+        Combine dynamic scales in upstream work before each launch/replay and
+        keep their tensor addresses stable for CUDA Graphs.
 
         Caller-owned inputs and plan workspace must outlive graph replay,
-        including tensor scales and sinks. Q and native KV are used directly;
-        flattening padded pages only creates a tensor view. Required attention
-        reductions/finishing remain included.
-        ``kv_scale`` is the common K/V descale for both pools. Caller-owned LSE
-        must be contiguous FP32 and 16-byte aligned, including with validate=False.
+        including tensor scales and sinks, and must not alias writable output
+        or workspace storage. Q and native KV are used directly; flattening
+        padded pages only creates a tensor view. Required attention reductions
+        remain included. Caller-owned LSE must be contiguous FP32 and 16-byte
+        aligned, including with validate=False.
 
         With output quantization enabled, ``token_positions`` is contiguous
         INT32 with the query's batch/token prefix; ``cos_sin_cache`` is aligned
@@ -2609,8 +2607,6 @@ class BatchSparseMLADecodePagedTSWrapper:
         state = self._state
         if state is None:
             raise RuntimeError("plan() must be called before run()")
-        if not isinstance(metadata, SparseMLAPreparedMetadata):
-            raise TypeError("metadata must be SparseMLAPreparedMetadata")
         _validate_query(
             query,
             packed_query=state["packed"],
@@ -2638,19 +2634,15 @@ class BatchSparseMLADecodePagedTSWrapper:
 
         primary = self._pool(kv_cache, "kv_cache")
         if extra_kv_cache is None:
-            if (
-                state["kc"]
-                or metadata.extra_indices is not None
-                or metadata.extra_lengths is not None
-            ):
+            if state["kc"] or extra_indices is not None or extra_lengths is not None:
                 raise ValueError("extra pool and indices are required by the plan")
             extra = state["dummy_cache"]
         else:
             extra = self._pool(extra_kv_cache, "extra_kv_cache")
 
         si, sl = self._source_metadata(
-            metadata.indices,
-            metadata.lengths,
+            indices,
+            lengths,
             state["ks"],
             primary.shape[0],
             "primary",
@@ -2658,8 +2650,8 @@ class BatchSparseMLADecodePagedTSWrapper:
             validate=validate,
         )
         ci, cl = self._source_metadata(
-            metadata.extra_indices,
-            metadata.extra_lengths,
+            extra_indices,
+            extra_lengths,
             state["kc"],
             extra.shape[0],
             "extra",
@@ -2683,14 +2675,9 @@ class BatchSparseMLADecodePagedTSWrapper:
             self._scalar(v, n, validate)
             for v, n in (
                 (softmax_scale, "softmax_scale"),
-                (q_scale, "q_scale"),
-                (kv_scale, "kv_scale"),
                 (output_scale, "output_scale"),
             )
         ]
-        if validate and state["dtype"] == torch.bfloat16:
-            if any(t.item() != 1 for t in scale_tensors[1:3]):
-                raise ValueError("BF16 Q/KV descales must be one")
         quant = state["output_quant"]
         output_quant_args = None
         if quant is not None:
@@ -2741,17 +2728,12 @@ class BatchSparseMLADecodePagedTSWrapper:
                 "lse must be contiguous, 16-byte-aligned FP32 with one value per query/head"
             )
         static_scales = all(
-            not isinstance(v, torch.Tensor)
-            for v in (softmax_scale, q_scale, kv_scale, output_scale)
+            not isinstance(v, torch.Tensor) for v in (softmax_scale, output_scale)
         )
-        bmm1_scale, bmm2_scale = 1.0, 1.0
-        if static_scales:
-
-            def f32(value):
-                return struct.unpack("f", struct.pack("f", float(value)))[0]
-
-            bmm1_scale = f32(f32(f32(softmax_scale) * f32(q_scale)) * f32(kv_scale))
-            bmm2_scale = f32(f32(output_scale) * f32(kv_scale))
+        # Both paths consume the same effective scales; no Q/K/V scale
+        # composition or auxiliary preparation is performed here.
+        bmm1_scale = float(softmax_scale) if static_scales else 1.0
+        bmm2_scale = float(output_scale) if static_scales else 1.0
         sparse_inputs = (
             si,
             ci,
@@ -2759,8 +2741,6 @@ class BatchSparseMLADecodePagedTSWrapper:
             cl,
             scale_tensors[0],
             scale_tensors[1],
-            scale_tensors[2],
-            scale_tensors[3],
             sinks,
         )
         if rows:
@@ -2820,15 +2800,16 @@ def get_prims_ts_sparse_mla_decode_workspace_size(*plan_args, **plan_kwargs):
 def batch_sparse_mla_decode_with_paged_kv_cache(
     query,
     kv_cache,
-    metadata: SparseMLAPreparedMetadata,
+    indices,
+    lengths,
     extra_kv_cache=None,
     *,
+    extra_indices=None,
+    extra_lengths=None,
     qo_indptr=None,
     max_seq_len_q=None,
     kv_layout="NHD",
     softmax_scale=512**-0.5,
-    q_scale=1.0,
-    kv_scale=1.0,
     output_scale=1.0,
     sinks=None,
     out=None,
@@ -2843,18 +2824,18 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
     cos_sin_cache=None,
     out_scale=None,
 ):
-    """Eager plan-and-run helper using caller-prepared metadata.
+    """Eager plan-and-run helper using separate source indices and lengths.
 
-    Use a planned wrapper for CUDA Graph replay. Preparation remains external.
-    Output quantization arguments and return layouts follow
+    Use a planned wrapper for CUDA Graph replay. Index conversion and scale
+    composition remain external. softmax_scale includes attention/Q/K descales;
+    output_scale includes the V descale and optional output multiplier.
+    Source contracts, output quantization arguments and return layouts follow
     :class:`BatchSparseMLADecodePagedTSWrapper`.
     """
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "plan BatchSparseMLADecodePagedTSWrapper before CUDA Graph capture"
         )
-    if not isinstance(metadata, SparseMLAPreparedMetadata):
-        raise TypeError("metadata must be SparseMLAPreparedMetadata")
     packed = query.ndim == 3
     if packed:
         if qo_indptr is None:
@@ -2870,10 +2851,8 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
         query.device,
         batch,
         query.shape[-2],
-        max_topk=metadata.indices.shape[-1],
-        max_extra_topk=0
-        if metadata.extra_indices is None
-        else metadata.extra_indices.shape[-1],
+        max_topk=indices.shape[-1],
+        max_extra_topk=0 if extra_indices is None else extra_indices.shape[-1],
         max_seq_len_q=max_seq_len_q,
         packed_query=packed,
         q_data_type=query.dtype,
@@ -2888,12 +2867,13 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
     return wrapper.run(
         query,
         kv_cache,
-        metadata,
+        indices,
+        lengths,
         extra_kv_cache,
+        extra_indices=extra_indices,
+        extra_lengths=extra_lengths,
         qo_indptr=qo_indptr,
         softmax_scale=softmax_scale,
-        q_scale=q_scale,
-        kv_scale=kv_scale,
         output_scale=output_scale,
         sinks=sinks,
         out=out,

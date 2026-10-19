@@ -1576,7 +1576,7 @@ class MlaDecodeTs:
         if cutlass.const_expr(self.direct_sparse):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
 
-            si, ci, sl, cl, sm, qs, ss, os, sinks = block_split_kvs
+            si, ci, sl, cl, sm, os, sinks = block_split_kvs
             capacity = cutlass.const_expr(
                 max(
                     256,
@@ -1606,10 +1606,9 @@ class MlaDecodeTs:
                 has_extra=self.direct_sparse_capacities[1] > 0,
             )
             if cutlass.const_expr(not self.direct_static_scales):
-                softmax_scale_log2 = (
-                    Float32(sm[0]) * Float32(qs[0]) * Float32(ss[0]) * LOG2_E
-                )
-                output_scale = Float32(os[0]) * Float32(ss[0])
+                # Caller scales already include Q/K/V descales.
+                softmax_scale_log2 = Float32(sm[0]) * LOG2_E
+                output_scale = Float32(os[0])
         cfg = self._make_config()
         num_query_tiles = self.num_q_tiles
         use_clc_dynamic = self.is_persistent and not cfg.is_fp8_qkv()

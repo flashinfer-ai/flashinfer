@@ -15,7 +15,6 @@ triton = pytest.importorskip("triton")
 import triton.language as tl
 from flashinfer.attention.prims_ts import (
     BatchSparseMLADecodePagedTSWrapper,
-    SparseMLAPreparedMetadata,
     batch_sparse_mla_decode_with_paged_kv_cache,
     get_prims_ts_sparse_mla_decode_workspace_size,
 )
@@ -156,7 +155,7 @@ def map_sparse_indices(
     return out, counts
 
 
-def prepare_sparse_mla_metadata(
+def prepare_sparse_mla_indices(
     wrapper,
     query,
     kv_cache,
@@ -186,7 +185,7 @@ def prepare_sparse_mla_metadata(
         return torch.empty(shape, device=device, dtype=dtype)
 
     if out is None:
-        out = SparseMLAPreparedMetadata(
+        out = dict(
             indices=empty((rows, ks)),
             lengths=empty((rows,)),
             extra_indices=empty((rows, kc)) if kc else None,
@@ -205,7 +204,7 @@ def prepare_sparse_mla_metadata(
             counts=count,
         )
 
-    map_pool(kv_cache, indices, lengths, ks, out.indices, out.lengths)
+    map_pool(kv_cache, indices, lengths, ks, out["indices"], out["lengths"])
     if kc:
         if extra_kv_cache is None or extra_indices is None:
             raise ValueError("the extra pool and indices are required")
@@ -214,8 +213,8 @@ def prepare_sparse_mla_metadata(
             extra_indices,
             extra_lengths,
             kc,
-            out.extra_indices,
-            out.extra_lengths,
+            out["extra_indices"],
+            out["extra_lengths"],
         )
     return out
 
@@ -326,7 +325,7 @@ def test_rope_quant_graph(
         out_scale_format=fmt,
         num_output_groups=groups,
     )
-    metadata = prepare_sparse_mla_metadata(
+    metadata = prepare_sparse_mla_indices(
         wrapper,
         q,
         kv,
@@ -346,9 +345,15 @@ def test_rope_quant_graph(
         sinks=sinks,
         token_positions=positions,
         cos_sin_cache=cos_sin,
-        **descales,
+        softmax_scale=512**-0.5 * descales["kv_scale"],
+        output_scale=descales["output_scale"] * descales["kv_scale"],
     )
-    output, scales, lse = wrapper.run(q, kv, metadata, extra, **kwargs)
+    if packed:
+        # Cover graph-live effective scales with fused output as well as the
+        # Python-number path exercised by the fixed-query cases.
+        kwargs["softmax_scale"] = torch.tensor(kwargs["softmax_scale"], device=q.device)
+        kwargs["output_scale"] = torch.tensor(kwargs["output_scale"], device=q.device)
+    output, scales, lse = wrapper.run(q, kv, **metadata, extra_kv_cache=extra, **kwargs)
     channels = heads // groups * 512
     assert output.shape == (rows, groups, channels)
     assert output.dtype == torch.float8_e4m3fn
@@ -377,8 +382,8 @@ def test_rope_quant_graph(
         wrapper.run(
             q,
             kv,
-            metadata,
-            extra,
+            **metadata,
+            extra_kv_cache=extra,
             out=output,
             out_scale=scales,
             lse=lse,
@@ -450,13 +455,9 @@ def test_rope_quant_scales_and_contract(block, fmt):
         out_scale_format=fmt,
         num_output_groups=2,
     )
-    metadata = prepare_sparse_mla_metadata(wrapper, q, kv, indices)
+    metadata = prepare_sparse_mla_indices(wrapper, q, kv, indices)
     output, scales = wrapper.run(
-        q,
-        kv,
-        metadata,
-        token_positions=positions,
-        cos_sin_cache=cos_sin,
+        q, kv, **metadata, token_positions=positions, cos_sin_cache=cos_sin
     )
     reference = _inverse_output_rope(kv.expand(1, 8, 512).float(), positions, cos_sin)
     grouped = reference.reshape(1, 2, 2048).unflatten(-1, (-1, block))
@@ -472,7 +473,7 @@ def test_rope_quant_scales_and_contract(block, fmt):
         eager_out, eager_scales = batch_sparse_mla_decode_with_paged_kv_cache(
             q,
             kv,
-            metadata,
+            **metadata,
             output_quant_block_size=block,
             out_scale_format=fmt,
             num_output_groups=2,
@@ -490,7 +491,7 @@ def test_rope_quant_scales_and_contract(block, fmt):
             wrapper.run(
                 q,
                 kv,
-                metadata,
+                **metadata,
                 token_positions=positions,
                 cos_sin_cache=cos_sin,
                 out=misaligned,
@@ -505,20 +506,20 @@ def test_rope_quant_scales_and_contract(block, fmt):
             wrapper.run(
                 q,
                 kv,
-                metadata,
+                **metadata,
                 token_positions=positions,
                 cos_sin_cache=cos_sin,
                 out_scale=misaligned_scales,
             )
     with pytest.raises(ValueError, match="token_positions"):
         wrapper.run(
-            q, kv, metadata, token_positions=positions + 2, cos_sin_cache=cos_sin
+            q, kv, **metadata, token_positions=positions + 2, cos_sin_cache=cos_sin
         )
     with pytest.raises(ValueError, match="out_scale"):
         wrapper.run(
             q,
             kv,
-            metadata,
+            **metadata,
             token_positions=positions,
             cos_sin_cache=cos_sin,
             out_scale=scales.contiguous(),
@@ -536,11 +537,11 @@ def test_rope_quant_scales_and_contract(block, fmt):
         num_output_groups=2,
     )
     empty_q = q.view(1, 8, 512)[:0]
-    empty_metadata = prepare_sparse_mla_metadata(wrapper, empty_q, kv, indices[:0])
+    empty_metadata = prepare_sparse_mla_indices(wrapper, empty_q, kv, indices[:0])
     empty_out, empty_scales = wrapper.run(
         empty_q,
         kv,
-        empty_metadata,
+        **empty_metadata,
         qo_indptr=torch.zeros(2, device="cuda", dtype=torch.int32),
         token_positions=positions.view(-1)[:0],
         cos_sin_cache=cos_sin,
@@ -569,14 +570,14 @@ def test_rope_quant_output_layout_contract(rows, groups):
         out_scale_format="fp32",
         num_output_groups=groups,
     )
-    metadata = prepare_sparse_mla_metadata(wrapper, q, kv, indices)
+    metadata = prepare_sparse_mla_indices(wrapper, q, kv, indices)
     token_major = torch.empty(
         (rows, groups, heads // groups * 512), dtype=torch.float8_e4m3fn, device="cuda"
     )
 
     def run(out):
         return wrapper.run(
-            q, kv, metadata, token_positions=positions, cos_sin_cache=cos_sin, out=out
+            q, kv, **metadata, token_positions=positions, cos_sin_cache=cos_sin, out=out
         )
 
     if rows > 1 and groups > 1:
@@ -720,10 +721,23 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
         return_lse=True,
         assume_valid_prefix=prefix,
     )
-    scales = dict(q_scale=q_scale, kv_scale=kv_scale, sinks=sinks)
+    attention_scale = torch.tensor(512**-0.5, device=q.device)
+    output_multiplier = torch.tensor(0.75, device=q.device)
+    effective_softmax_scale = torch.empty_like(attention_scale)
+    effective_output_scale = torch.empty_like(output_multiplier)
+    scales = dict(
+        softmax_scale=effective_softmax_scale,
+        output_scale=effective_output_scale,
+        sinks=sinks,
+    )
 
     def prepare(out=None):
-        return prepare_sparse_mla_metadata(
+        # Upstream work combines descales into stable graph inputs. The oracle
+        # below keeps the original Q/K/V factors to check equivalence.
+        torch.mul(attention_scale, q_scale, out=effective_softmax_scale)
+        effective_softmax_scale.mul_(kv_scale)
+        torch.mul(output_multiplier, kv_scale, out=effective_output_scale)
+        return prepare_sparse_mla_indices(
             w,
             q,
             primary,
@@ -743,8 +757,8 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
         return w.run(
             q,
             primary,
-            meta,
-            secondary if extra else None,
+            **meta,
+            extra_kv_cache=secondary if extra else None,
             qo_indptr=offsets,
             out=out,
             lse=target_lse,
@@ -764,6 +778,8 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
             extra_lengths=bl.reshape(prefix_shape) if extra else None,
             q_scale=q_scale.item(),
             kv_scale=kv_scale.item(),
+            softmax_scale=attention_scale.item(),
+            output_scale=output_multiplier.item(),
             sinks=sinks,
         )
         if dtype == torch.float8_e4m3fn:
@@ -790,6 +806,8 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
     if dtype == torch.float8_e4m3fn:
         kv_scale.fill_(1.25)
         q_scale.fill_(0.5)
+    attention_scale.mul_(0.75)
+    output_multiplier.fill_(1.25)
     graph.replay()
     torch.cuda.synchronize()
     check()
@@ -800,7 +818,7 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
         with pytest.raises(ValueError, match="16-byte-aligned"):
             run(target_lse=unaligned)
     if packed and heads == 6 and dtype == torch.bfloat16:
-        empty_meta = prepare_sparse_mla_metadata(
+        empty_meta = prepare_sparse_mla_indices(
             w,
             q[:0],
             primary,
@@ -813,8 +831,8 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
         empty, empty_lse = w.run(
             q[:0],
             primary,
-            empty_meta,
-            secondary,
+            **empty_meta,
+            extra_kv_cache=secondary,
             qo_indptr=torch.zeros_like(offsets),
             **scales,
         )
@@ -841,21 +859,19 @@ def test_caller_workspace_single_source_and_eager_api():
     workspace = torch.empty(size, device=q.device, dtype=torch.uint8)
     wrapper = BatchSparseMLADecodePagedTSWrapper(workspace)
     wrapper.plan(**args)
-    metadata = prepare_sparse_mla_metadata(wrapper, q, kv, indices)
-    with pytest.raises(TypeError, match="extra_kv_scale"):
-        wrapper.run(q, kv, metadata, extra_kv_scale=2.0)
-    result, lse = wrapper.run(q, kv, metadata)
+    metadata = prepare_sparse_mla_indices(wrapper, q, kv, indices)
+    result, lse = wrapper.run(q, kv, **metadata)
     torch.testing.assert_close(result, torch.full_like(q, 1.5))
     eager, eager_lse = batch_sparse_mla_decode_with_paged_kv_cache(
-        q, kv, metadata, return_lse=True
+        q, kv, **metadata, return_lse=True
     )
     torch.testing.assert_close(result, eager, atol=0, rtol=0)
     torch.testing.assert_close(lse, eager_lse, atol=0, rtol=0)
     first_lse = lse.clone()
-    shorter = prepare_sparse_mla_metadata(
+    shorter = prepare_sparse_mla_indices(
         wrapper, q, kv, indices, torch.ones((1, 1), device=q.device, dtype=torch.int32)
     )
-    _, next_lse = wrapper.run(q, kv, shorter)
+    _, next_lse = wrapper.run(q, kv, **shorter)
     torch.testing.assert_close(next_lse, torch.zeros_like(next_lse), atol=0, rtol=0)
     torch.testing.assert_close(lse, first_lse, atol=0, rtol=0)
     short = BatchSparseMLADecodePagedTSWrapper(workspace[:-1])
@@ -864,9 +880,9 @@ def test_caller_workspace_single_source_and_eager_api():
     bad = indices.clone()
     bad[..., 0] = 2
     with pytest.raises(ValueError, match="outside pool"):
-        wrapper.run(q, kv, metadata._replace(indices=bad.view(1, 3)))
+        wrapper.run(q, kv, **dict(metadata, indices=bad.view(1, 3)))
     with pytest.raises(ValueError, match="positive"):
-        wrapper.run(q, kv, metadata, softmax_scale=1e-100)
+        wrapper.run(q, kv, **metadata, softmax_scale=1e-100)
 
 
 def test_valid_prefix_eager_contract():
@@ -882,7 +898,7 @@ def test_valid_prefix_eager_contract():
     wrapper.plan(
         q.device, 1, 16, max_topk=3, max_extra_topk=3, assume_valid_prefix=True
     )
-    metadata = prepare_sparse_mla_metadata(
+    metadata = prepare_sparse_mla_indices(
         wrapper,
         q,
         swa,
@@ -892,43 +908,41 @@ def test_valid_prefix_eager_contract():
         extra_indices=ci,
         extra_lengths=lengths,
     )
-    metadata.extra_indices[0, 1] = -1
+    metadata["extra_indices"][0, 1] = -1
     kwargs = dict(assume_valid_prefix=True, return_lse=True)
     with pytest.raises(ValueError, match="extra active prefix contains a hole"):
         batch_sparse_mla_decode_with_paged_kv_cache(
-            q, swa, metadata, compressed, **kwargs
+            q, swa, **metadata, extra_kv_cache=compressed, **kwargs
         )
-    metadata.extra_indices[0, 1] = 0
+    metadata["extra_indices"][0, 1] = 0
     result, lse = batch_sparse_mla_decode_with_paged_kv_cache(
-        q, swa, metadata, compressed, **kwargs
+        q, swa, **metadata, extra_kv_cache=compressed, **kwargs
     )
     # Q=0 gives uniform attention over values 1, 2, 20, 10.
     torch.testing.assert_close(result, torch.full_like(result, 8.25))
     torch.testing.assert_close(lse, torch.full_like(lse, 4.0).log())
 
 
-def test_direct_metadata_without_packed_fields_graph():
-    """Direct kernels accept live source lists without preparation scratch."""
+def test_sparse_indices_graph():
+    """Caller index/length tensors remain live through graph replay."""
     q = torch.zeros(1, 1, 16, 512, device="cuda", dtype=torch.bfloat16)
     kv = torch.ones(2, 1, 512, device=q.device, dtype=q.dtype)
     kv[1] *= 3
-    meta = SparseMLAPreparedMetadata(
-        torch.tensor([[0, -1, 1]], device=q.device, dtype=torch.int32),
-        torch.tensor([3], device=q.device, dtype=torch.int32),
-    )
+    indices = torch.tensor([[0, -1, 1]], device=q.device, dtype=torch.int32)
+    lengths = torch.tensor([3], device=q.device, dtype=torch.int32)
     w = BatchSparseMLADecodePagedTSWrapper()
     w.plan(q.device, 1, 16, max_topk=3, return_lse=True)
-    out, lse = w.run(q, kv, meta)
+    out, lse = w.run(q, kv, indices, lengths)
     torch.testing.assert_close(out, torch.full_like(out, 2.0))
     torch.testing.assert_close(lse, torch.full_like(lse, 2.0).log())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        w.run(q, kv, meta, out=out, lse=lse, validate=False)
-    meta.indices[0, 2] = -1
+        w.run(q, kv, indices, lengths, out=out, lse=lse, validate=False)
+    indices[0, 2] = -1
     graph.replay()
     torch.testing.assert_close(out, torch.ones_like(out))
     torch.testing.assert_close(lse, torch.zeros_like(lse))
-    meta.lengths.zero_()
+    lengths.zero_()
     graph.replay()
     assert torch.count_nonzero(out) == 0 and torch.isneginf(lse).all()
 
@@ -965,21 +979,35 @@ def test_source_tile_boundary_graph(heads, prefix, dtype):
     )
 
     # No packed routes or source padding: the kernel derives the boundary.
-    metadata = SparseMLAPreparedMetadata(indices, lengths, extra_indices, extra_lengths)
+    metadata = dict(
+        indices=indices,
+        lengths=lengths,
+        extra_indices=extra_indices,
+        extra_lengths=extra_lengths,
+    )
     sinks = torch.full((heads,), -torch.inf, device=q.device)
-    out, lse = wrapper.run(q, primary, metadata, extra, kv_scale=kv_scale, sinks=sinks)
+    out, lse = wrapper.run(
+        q,
+        primary,
+        **metadata,
+        extra_kv_cache=extra,
+        sinks=sinks,
+        softmax_scale=512 ** (-0.5) * kv_scale,
+        output_scale=kv_scale,
+    )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         wrapper.run(
             q,
             primary,
-            metadata,
-            extra,
-            kv_scale=kv_scale,
+            **metadata,
+            extra_kv_cache=extra,
             sinks=sinks,
             out=out,
             lse=lse,
             validate=False,
+            softmax_scale=512 ** (-0.5) * kv_scale,
+            output_scale=kv_scale,
         )
     for primary_length, extra_length in (
         (127, 5),
@@ -1061,7 +1089,7 @@ def test_softmax_score_jumps(heads, dtype):
         return_lse=True,
     )
     softmax_scale = 0.6931471805599453
-    meta = prepare_sparse_mla_metadata(
+    meta = prepare_sparse_mla_indices(
         w,
         q,
         swa,
@@ -1072,8 +1100,8 @@ def test_softmax_score_jumps(heads, dtype):
     w.run(
         q,
         swa,
-        meta,
-        kv,
+        **meta,
+        extra_kv_cache=kv,
         sinks=sinks,
         softmax_scale=softmax_scale,
         out=out,
@@ -1084,8 +1112,8 @@ def test_softmax_score_jumps(heads, dtype):
         w.run(
             q,
             swa,
-            meta,
-            kv,
+            **meta,
+            extra_kv_cache=kv,
             sinks=sinks,
             softmax_scale=softmax_scale,
             out=out,

@@ -2373,7 +2373,7 @@ class ThroughputLatencyMlaDecodeTs:
         if cutlass.const_expr(cfg.sparse_direct):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
 
-            si, ci, sl, cl, sm, qs, ss, os, sinks = sparse_inputs
+            si, ci, sl, cl, sm, os, sinks = sparse_inputs
             request = None
             if cutlass.const_expr(cfg.use_persistent_scheduler != 1):
                 request = cutlass.Int64(cute.arch.block_idx()[2])
@@ -2388,13 +2388,9 @@ class ThroughputLatencyMlaDecodeTs:
                 has_extra=cfg.sparse_direct_capacities[1] > 0,
             )
             if cutlass.const_expr(not cfg.sparse_static_scales):
-                softmax_scale_log2 = (
-                    cutlass.Float32(sm[0])
-                    * cutlass.Float32(qs[0])
-                    * cutlass.Float32(ss[0])
-                    * LOG2_E
-                )
-                output_scale = cutlass.Float32(os[0]) * cutlass.Float32(ss[0])
+                # Caller scales already include Q/K/V descales.
+                softmax_scale_log2 = cutlass.Float32(sm[0]) * LOG2_E
+                output_scale = cutlass.Float32(os[0])
             sparse_epilogue_params = sinks
         else:
             sparse_epilogue_params = None
