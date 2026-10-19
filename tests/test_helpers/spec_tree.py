@@ -16,7 +16,9 @@
 
 A speculative draft of ``T`` tokens is described by ``parents[t]``: the index of
 token ``t``'s parent within the same draft, or ``-1`` when its parent is the
-committed state. A chain is ``[-1, 0, 1, ..., T-2]``; EAGLE-style drafts with
+committed state. The root entry ``parents[0]`` is ignored by the kernels, so
+engines that write 0 there (SGLang's conv kernel does) need no copy. A chain is
+``[-1, 0, 1, ..., T-2]``; EAGLE-style drafts with
 ``topk > 1`` fork, so a token's history is its root-to-node path rather than
 the prefix ``0..t-1``.
 """
