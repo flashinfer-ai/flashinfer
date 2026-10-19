@@ -1007,38 +1007,6 @@ def test_mxfp8_grouped_quantize_cuda_matches_other_backends(
         )
 
 
-@pytest.mark.parametrize("other_backend", ["cutile", "cake"])
-@torch.inference_mode()
-def test_mxfp8_grouped_quantize_cuda_nan_matches_other_backends(other_backend):
-    """NaN inputs stay NaN with the same block scales as the other backends."""
-    _skip_unless_grouped_backend("cuda")
-    _skip_unless_grouped_backend(other_backend)
-
-    torch.manual_seed(0)
-    b, m, k = 2, 128, 256
-    x = torch.randn((b, m, k), dtype=torch.bfloat16, device="cuda") * 4
-    x[0, 0, 0] = float("nan")
-    x[0, 5, 37] = float("nan")
-    x[1, 127, 255] = float("nan")
-    mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
-
-    got_q, got_sf = mxfp8_grouped_quantize(x, mask, backend="cuda")
-    ref_q, ref_sf = mxfp8_grouped_quantize(x, mask, backend=other_backend)
-    got_q = got_q.permute(2, 0, 1).contiguous().view(torch.uint8)
-    ref_q = ref_q.permute(2, 0, 1).contiguous().view(torch.uint8)
-    assert got_q[0, 0, 0].item() & 0x7F == 0x7F  # E4M3 NaN
-    torch.testing.assert_close(got_q, ref_q, rtol=0, atol=0)
-    got_sf = got_sf.permute(5, 2, 4, 0, 1, 3)
-    ref_sf = ref_sf.permute(5, 2, 4, 0, 1, 3)
-    for i in range(b):
-        torch.testing.assert_close(
-            _unswizzle_mxfp8_scales_128x4(got_sf[i], m, k),
-            _unswizzle_mxfp8_scales_128x4(ref_sf[i], m, k),
-            rtol=0,
-            atol=0,
-        )
-
-
 def _grouped_mxfp8_scales(sf: torch.Tensor, m: int, k: int) -> torch.Tensor:
     """UE8M0 scales ``[B, m, k // 32]`` from the logical ``[32, 4, rm, 4, rk, B]`` layout."""
     b, rm, rk = sf.shape[5], sf.shape[2], sf.shape[4]
@@ -1092,41 +1060,30 @@ def test_mxfp8_experts_quantize_grid_stride(batch_shape, use_silu_and_mul):
 
 
 @torch.inference_mode()
-def test_mxfp8_grouped_quantize_cuda_infinity():
-    """A block with an infinity gets scale byte 254; the infinity becomes NaN and its
-    other values signed zeros."""
+def test_mxfp8_grouped_quantize_cuda_non_finite():
+    """NaN and infinities quantize to 448 with the scales of ``mxfp8_quantize``."""
     _skip_unless_grouped_backend("cuda")
 
     torch.manual_seed(0)
     b, m, k = 2, 128, 256
     x = torch.randn((b, m, k), dtype=torch.bfloat16, device="cuda") * 4
+    x[0, 0, 0] = float("nan")
     x[0, 1, 3] = float("inf")
     x[0, 1, 9] = float("-inf")
     x[1, 7, 200] = float("-inf")
+    x[1, 127, 255] = float("nan")
     mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
 
     out, out_scale = mxfp8_grouped_quantize(x, mask, backend="cuda")
-
-    ref_out, ref_scale = mxfp8_quantize_reference(
-        x.masked_fill(x.isinf(), 0).reshape(b * m, k),
-        sf_swizzle_layout=SfLayout.layout_linear,
-    )
-    ref_out = ref_out.view(torch.uint8).reshape(b, m, k)
-    ref_scale = ref_scale.reshape(b, m, k // 32)
-    inf_blocks = x.isinf().reshape(b, m, k // 32, 32).any(dim=-1)
-    signed_zero = torch.where(x.signbit(), 0x80, 0x00).to(torch.uint8)
-    ref_out = torch.where(
-        inf_blocks.repeat_interleave(32, dim=-1),
-        torch.where(x.isinf(), 0x7F, signed_zero).to(torch.uint8),
-        ref_out,
-    )
-    ref_scale = ref_scale.masked_fill(inf_blocks, 254)
-    torch.testing.assert_close(
-        out.permute(2, 0, 1).contiguous().view(torch.uint8), ref_out, rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        _grouped_mxfp8_scales(out_scale, m, k), ref_scale, rtol=0, atol=0
-    )
+    out = out.permute(2, 0, 1).contiguous().view(torch.uint8)
+    out_scale = _grouped_mxfp8_scales(out_scale, m, k)
+    assert out[0, 0, 0].item() == 0x7E  # E4M3 448
+    for i in range(b):
+        ref_out, ref_scale = mxfp8_quantize(x[i], is_sf_swizzled_layout=False)
+        torch.testing.assert_close(out[i], ref_out.view(torch.uint8), rtol=0, atol=0)
+        torch.testing.assert_close(
+            out_scale[i], ref_scale.view(m, k // 32), rtol=0, atol=0
+        )
 
 
 @pytest.mark.parametrize("use_silu_and_mul", [True, False])
@@ -1211,42 +1168,6 @@ def test_mxfp8_experts_quantize_empty(batch_shape, use_silu_and_mul):
     assert out_scale.shape == (32, 4, padded_m // 128, 4, padded_k // 128, b)
 
 
-@pytest.mark.parametrize("view", ["offset", "strided"])
-@torch.inference_mode()
-def test_mxfp8_grouped_quantize_cuda_unaligned_or_strided_view(view):
-    """The ``cuda`` backend copies views its vector loads cannot read directly."""
-    _skip_unless_grouped_backend("cuda")
-
-    torch.manual_seed(0)
-    b, m, k = 2, 128, 256
-    if view == "offset":
-        # Contiguous, but 16 bytes past a 32-byte boundary.
-        flat = torch.randn(b * m * k + 8, dtype=torch.bfloat16, device="cuda")
-        x = flat[8:].view(b, m, k)
-        assert x.data_ptr() % 32 == 16
-    else:
-        x = torch.randn((b, m, 2 * k), dtype=torch.bfloat16, device="cuda")[..., :k]
-        assert not x.is_contiguous()
-    mask = torch.tensor([m, m // 2], dtype=torch.int32, device="cuda")
-
-    got_q, got_sf = mxfp8_grouped_quantize(x, mask, backend="cuda")
-    ref_q, ref_sf = mxfp8_grouped_quantize(x.clone(), mask, backend="cuda")
-    torch.cuda.synchronize()
-
-    got_q = got_q.permute(2, 0, 1).contiguous().view(torch.uint8)
-    ref_q = ref_q.permute(2, 0, 1).contiguous().view(torch.uint8)
-    got_sf = got_sf.permute(5, 2, 4, 0, 1, 3)
-    ref_sf = ref_sf.permute(5, 2, 4, 0, 1, 3)
-    for i, mask_i in enumerate(mask.tolist()):
-        torch.testing.assert_close(got_q[i, :mask_i], ref_q[i, :mask_i], rtol=0, atol=0)
-        torch.testing.assert_close(
-            _unswizzle_mxfp8_scales_128x4(got_sf[i], m, k)[:mask_i],
-            _unswizzle_mxfp8_scales_128x4(ref_sf[i], m, k)[:mask_i],
-            rtol=0,
-            atol=0,
-        )
-
-
 @pytest.mark.parametrize("use_silu_and_mul", [True, False])
 @torch.inference_mode()
 def test_mxfp8_experts_quantize_non_current_device(use_silu_and_mul):
@@ -1323,7 +1244,7 @@ def test_silu_and_mul_mxfp8_experts_quantize_invalid_inputs():
 
 @torch.inference_mode()
 def test_mxfp8_grouped_quantize_cuda_invalid_inputs():
-    """The ``cuda`` backend rejects the inputs the other backends reject."""
+    """Inputs the ``cuda`` backend cannot read raise ``ValueError``."""
     _skip_unless_grouped_backend("cuda")
 
     b, m, k = 2, 64, 128
@@ -1346,6 +1267,15 @@ def test_mxfp8_grouped_quantize_cuda_invalid_inputs():
         mxfp8_grouped_quantize(x, mask.long(), backend="cuda")
     with pytest.raises(ValueError, match="CUDA tensor"):
         mxfp8_grouped_quantize(x, mask.cpu(), backend="cuda")
+    with pytest.raises(ValueError, match="contiguous"):
+        strided = torch.randn((b, m, 2 * k), dtype=x.dtype, device="cuda")[..., :k]
+        mxfp8_grouped_quantize(strided, mask, backend="cuda")
+    with pytest.raises(ValueError, match="contiguous"):
+        mxfp8_grouped_quantize(x, mask.repeat_interleave(2)[::2], backend="cuda")
+    with pytest.raises(ValueError, match="32-byte"):
+        # Contiguous, but 16 bytes past a 32-byte boundary.
+        flat = torch.randn(b * m * k + 8, dtype=x.dtype, device="cuda")
+        mxfp8_grouped_quantize(flat[8:].view(b, m, k), mask, backend="cuda")
 
 
 @pytest.mark.parametrize("m", [1, 2, 16, 1024])

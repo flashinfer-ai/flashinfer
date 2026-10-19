@@ -250,32 +250,26 @@ void invokeSiluAndMulMxFP8Quantization(int numExperts, int m, int n, int padded_
   if (numExperts == 0 || m == 0) {
     return;
   }
-  // The kernel loads half a 32-value scale block per vector access.
+  // Vector accesses: 16 input values per load, 16 output bytes per store.
   constexpr size_t kInputAlignment = sizeof(T) * 16;
   TLLM_CHECK_WITH_INFO(reinterpret_cast<uintptr_t>(input) % kInputAlignment == 0,
                        "input must be %zu-byte aligned", kInputAlignment);
-  // The plain quantization stores a whole 32-byte scale block per vector access.
-  constexpr size_t kOutputAlignment = 32;
+  constexpr size_t kOutputAlignment = 16;
   TLLM_CHECK_WITH_INFO(reinterpret_cast<uintptr_t>(output) % kOutputAlignment == 0,
                        "output must be %zu-byte aligned", kOutputAlignment);
 
-  // A thread converts a 32-value scale block, or half of one with SiLU-and-mul. blockDim.x covers
-  // a row in the fewest passes of at most kMaxBlockThreads, balanced across the passes, and is warp
-  // aligned on the SiLU path, which pairs lanes within a warp. Narrow rows stack along y.
+  // A thread converts 16 values. blockDim.x is a multiple of 32 that covers a row in the fewest
+  // balanced passes; narrow rows stack along y.
   constexpr int kMaxBlockThreads = 256;
-  int const numColThreads = padded_n / (use_silu_and_mul ? 16 : 32);
+  int const numColThreads = padded_n / 16;
   int const numColPasses = (numColThreads + kMaxBlockThreads - 1) / kMaxBlockThreads;
-  int blockX = (numColThreads + numColPasses - 1) / numColPasses;
-  if (use_silu_and_mul) {
-    blockX = PadUpFn(blockX, 32);
-  }
+  int const blockX = PadUpFn((numColThreads + numColPasses - 1) / numColPasses, 32);
   int const blockY = std::max(1, kMaxBlockThreads / blockX);
   dim3 const block(blockX, blockY);
 
-  // The mask is on the device, so the grid is sized for all m rows and blocks past mask[e] exit
-  // early. Row blocks per expert are capped so the grid fits one wave of resident blocks, keeping
-  // at least one per expert. Experts vary fastest, so with few valid rows the active blocks of all
-  // experts are adjacent in launch order and spread over all SMs.
+  // The mask is read on the device, so the grid covers all m rows, capped at one wave of resident
+  // blocks (at least one per expert). Experts are on grid x so that, with few valid rows, the
+  // active blocks spread over all SMs.
   auto const kernel =
       use_silu_and_mul ? cvt_fp16_to_mxfp8_expert<T, true> : cvt_fp16_to_mxfp8_expert<T, false>;
   int numBlocksPerSM = 0;

@@ -1101,15 +1101,10 @@ mxfp8_grouped_quantize_trace = TraceTemplate(
 def _quantize_mxfp8_round_up_scale(
     x: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """MXFP8-quantize ``[M, K]`` with power-of-two block scales rounded up.
+    """MXFP8-quantize ``[M, K]``; each UE8M0 block scale is ``amax / 448`` rounded up.
 
-    Rounding ``amax / 448`` up keeps each block maximum within E4M3. ``amax``
-    skips NaN, and every NaN is written as the positive E4M3 NaN. An all-NaN
-    block gets scale byte 255. A block whose scale is below ``2**-126`` gets
-    scale byte 0, and a block with an infinity gets 254; both quantize their
-    finite values to zero and an infinity to NaN. The CUDA kernels may differ
-    in blocks whose largest magnitude is at most ``448 * 2**-117``. Returns
-    ``(x_q [M, K] fp8_e4m3fn, sf [M, K // 32] uint8)``.
+    Scale bytes 0 and 254 get a zero output scale; 254 marks a block with an
+    infinity. Returns ``(x_q [M, K] fp8_e4m3fn, sf [M, K // 32] uint8)``.
     """
     m, k = x.shape
     blocks = x.to(torch.float32).reshape(m, k // 32, 32)
@@ -1133,14 +1128,11 @@ def _silu_and_mul_mxfp8_experts_quantize_reference(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Reference for silu_and_mul_mxfp8_experts_quantize in a plain layout.
 
-    Rounds ``silu(gate) * up`` to the input dtype, as the kernel does, before
-    quantizing; the kernel's fast ``exp`` can push a product near an
-    input-dtype rounding boundary to the other side. NaN and infinities
-    become NaN here, while the kernel quantizes them to 448. Returns
-    ``x_q [B, M, K]`` (fp8_e4m3fn) and ``sf [B, M, K // 32]`` (UE8M0 bytes)
-    without the K padding, scale swizzle or grouped GEMM permutation. Every
-    row is computed; compare only the first ``min(mask[i], M)`` rows of
-    expert ``i``.
+    NaN and infinities become NaN here; the kernel quantizes them to 448.
+    Returns ``x_q [B, M, K]`` (fp8_e4m3fn) and ``sf [B, M, K // 32]`` (UE8M0
+    bytes) for every row, without the K padding, scale swizzle or grouped GEMM
+    permutation; only the first ``min(mask[i], M)`` rows of expert ``i`` match
+    the kernel.
     """
     b, m, k_doubled = a.shape
     k = k_doubled // 2

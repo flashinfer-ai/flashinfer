@@ -715,30 +715,22 @@ def mxfp8_grouped_quantize(
         ``bfloat16``.
     mask : torch.Tensor
         Int32 CUDA tensor of shape ``[B]`` with the number of valid rows of
-        each group. Its values are not validated, since reading them on the
-        host would synchronize and break CUDA-graph capture. The ``"cuda"``
-        backend uses the first ``min(mask[i], M)`` rows, so any value is safe
-        (a negative value selects no rows). The ``"cutile"`` and ``"cake"``
-        backends require ``0 <= mask[i] <= M``; other values are undefined
-        behavior, and the cuTile kernel writes scale factors without bounds
-        checks, so ``mask[i] > M`` corrupts neighboring groups or writes out of
-        bounds.
+        each group. It is read only on the device, so its values are not
+        validated. The ``"cuda"`` backend uses the first ``min(mask[i], M)``
+        rows. The ``"cutile"`` and ``"cake"`` backends require
+        ``0 <= mask[i] <= M``; with ``mask[i] > M`` the cuTile kernel writes
+        out of bounds.
     backend : {``"cutile"``, ``"cake"``, ``"cuda"``}
-        Implementation backend. ``"cutile"`` remains the default and fallback
-        path and requires the ``cuda-tile`` package. ``"cake"`` explicitly
-        selects a generated, exact-architecture Blackwell profile and raises a
-        clear error when that profile is not installed. ``"cuda"`` runs the
-        kernel of :func:`silu_and_mul_mxfp8_experts_quantize` without the
-        SiLU-and-mul step and copies ``a`` first when it is not contiguous or
-        not 32-byte aligned. Runtime launch failures are never silently
-        retried through a different implementation.
+        Implementation backend. ``"cutile"`` (default) requires the
+        ``cuda-tile`` package and ``"cake"`` a generated profile for the exact
+        Blackwell architecture. ``"cake"`` and ``"cuda"`` require contiguous
+        ``a`` and ``mask``; ``"cuda"`` also requires ``a`` to be 32-byte
+        aligned. A failed launch is not retried on another backend.
 
-        Valid-row outputs match across backends for finite inputs, except
-        possibly in bfloat16 blocks whose largest magnitude is at most
-        ``448 * 2**-117``. NaN stays NaN. Blocks that hold an infinity, or only
-        NaN, can differ: ``"cuda"`` and ``"cake"`` give a block with an
-        infinity the scale byte 254 and quantize the infinity to NaN and its
-        finite values to zero.
+        Outputs match across backends for finite inputs, except possibly in
+        bfloat16 blocks whose largest magnitude is at most ``448 * 2**-117``.
+        ``"cuda"`` quantizes NaN and infinities to 448, as
+        :func:`mxfp8_quantize` does; blocks that hold them can differ.
 
     Returns
     -------
@@ -751,9 +743,7 @@ def mxfp8_grouped_quantize(
         physical layouts are grouped by ``B`` and then permuted to match
         FlashInfer masked grouped GEMM conventions.
 
-        Only the valid rows of group ``i`` are written; the rows past them
-        (and their scale factors) are unspecified. The consumer must use the
-        same ``mask`` and read only the valid rows.
+        Rows past the valid ones (and their scale factors) are unspecified.
     """
 
     if backend not in ("cutile", "cake", "cuda"):
@@ -781,10 +771,18 @@ def mxfp8_grouped_quantize(
         raise RuntimeError("mxfp8_grouped_quantize requires SM100 or newer")
 
     if backend == "cuda":
-        if not a.is_contiguous() or a.data_ptr() % _MXFP8_EXPERTS_INPUT_ALIGNMENT != 0:
-            a = a.clone(memory_format=torch.contiguous_format)
+        if not a.is_contiguous() or not mask.is_contiguous():
+            raise ValueError(
+                "backend='cuda' requires contiguous a [B, M, K] and mask [B]; pass "
+                "a.contiguous() / mask.contiguous() explicitly instead of a view"
+            )
+        if a.data_ptr() % _MXFP8_EXPERTS_INPUT_ALIGNMENT != 0:
+            raise ValueError(
+                f"backend='cuda' requires a {_MXFP8_EXPERTS_INPUT_ALIGNMENT}-byte "
+                "aligned a; copy an offset view with a.clone()"
+            )
         return get_mxfp8_quantization_sm100_module().mxfp8_grouped_quant_sm100(
-            a, mask.contiguous(), device_support_pdl(a.device)
+            a, mask, device_support_pdl(a.device)
         )
 
     if backend == "cutile":
@@ -811,9 +809,8 @@ def silu_and_mul_mxfp8_experts_quantize(
 
     Quantizes ``silu(a[..., :K]) * a[..., K:]``, rounded to the input dtype,
     to MXFP8 (E4M3 values, one UE8M0 scale per 32 values). Requires SM100+.
-    The outputs feed the second :func:`flashinfer.gemm.grouped_gemm_nt_masked`
-    of a MoE as its ``(A, SFA)`` operand with ``ab_dtype="float8_e4m3fn"``,
-    ``sf_dtype="float8_e8m0fnu"`` and ``sf_vec_size=32``.
+    The outputs are the ``(A, SFA)`` operand of the second
+    :func:`flashinfer.gemm.grouped_gemm_nt_masked` of a MoE.
 
     Parameters
     ----------
@@ -822,10 +819,9 @@ def silu_and_mul_mxfp8_experts_quantize(
         shape ``[B, M, 2 * K]``; each row holds the gate values, then the up
         values. ``K`` must be divisible by 32.
     mask : torch.Tensor
-        Contiguous int32 CUDA tensor of shape ``[B]``. Only the first
-        ``min(mask[i], M)`` rows of expert ``i`` are read and written (none for
-        a negative value). It is read on the device, so the call does not
-        synchronize and can be captured in a CUDA graph.
+        Contiguous int32 CUDA tensor of shape ``[B]``, read on the device.
+        Only the first ``min(mask[i], M)`` rows of expert ``i`` are read and
+        written.
     enable_pdl : bool, optional
         Whether to enable Programmatic Dependent Launch. Auto-detected from
         the device capability when ``None``.
@@ -838,15 +834,11 @@ def silu_and_mul_mxfp8_experts_quantize(
         and ``sf`` has logical shape
         ``[32, 4, padded_M // 128, 4, padded_K // 128, B]`` with dtype
         ``uint8``, where ``padded_K`` and ``padded_M`` round ``K`` and ``M`` up
-        to multiples of 128. The padded columns hold zero values and scale
-        byte 0; rows past ``min(mask[i], M)`` (and their scale factors) are
-        unspecified, so the consumer must use the same ``mask``.
+        to multiples of 128. Rows past the valid ones (and their scale
+        factors) are unspecified.
 
-        For finite ``silu(gate) * up``, the outputs match
-        :func:`flashinfer.silu_and_mul` followed by the ``"cuda"`` backend of
-        :func:`mxfp8_grouped_quantize`. NaN and infinities (including a
-        float16 ``silu(gate) * up`` that overflows) quantize to 448, and a
-        block that holds an infinity quantizes its finite values to zero.
+        NaN and infinities quantize to 448, and the other values of a block
+        with an infinity to zero.
     """
     if a.dim() != 3:
         raise ValueError("a must be a 3D tensor with shape [B, M, 2 * K]")

@@ -173,7 +173,7 @@ def _run_shape(shape: tuple[int, int, int], warmup_ms: int, benchmark_ms: int) -
     cuda_module = gen_mxfp8_quantization_sm100_module().build_and_load()
 
     def run_cuda_kernel():
-        # use_silu_and_mul=False, enable_pdl=False; the kernel pads K, so it reads x.
+        # use_silu_and_mul=False, enable_pdl=False; reads the unpadded x.
         cuda_module.silu_and_mul_mxfp8_experts_quantize(
             x, mask, cuda_q, cuda_sf, False, False
         )
