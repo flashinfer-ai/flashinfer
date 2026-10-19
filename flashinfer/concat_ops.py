@@ -138,16 +138,22 @@ def _concat_mla_k_cake(
     if not tokens:
         return None
     from .jit.cake_concat_mla_k import (
+        cake_concat_mla_k_split_ctas,
+        cake_concat_mla_k_target,
         cake_concat_mla_k_tokens_per_cta,
-        get_cake_concat_mla_k_module,
+        load_cake_concat_mla_k_module,
     )
 
     # One CTA copies two 1-byte tokens or one 2-byte token (the module's
-    # launch_policy); the kernel bounds the second token with ``tokens``.
+    # launch_policy); the kernel bounds the second token with ``tokens``.  On
+    # the split module (compute capability 10.7) ``grid_y`` CTAs share one
+    # token window (the module's split_rule); 1 elsewhere.
+    target = cake_concat_mla_k_target(k.device)
     window = cake_concat_mla_k_tokens_per_cta(element_bytes)
     grid_x = (tokens + window - 1) // window
+    grid_y = cake_concat_mla_k_split_ctas(tokens, element_bytes, target)
     with torch.cuda.device(k.device):
-        get_cake_concat_mla_k_module(k.device).run(
+        load_cake_concat_mla_k_module(target, grid_y > 1).run(
             k.view(torch.uint8),
             k_nope.view(torch.uint8),
             k_rope.view(torch.uint8),
@@ -159,7 +165,7 @@ def _concat_mla_k_cake(
             int(k_rope.stride(0)) * element_bytes,
             tokens,
             grid_x,
-            1,
+            grid_y,
             1,
         )
     return None

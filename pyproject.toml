@@ -91,8 +91,13 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.experimental.nvfp4_mla_decode" = ["csrc/**"]
 "flashinfer.experimental.nvfp4_sparse_mla_decode" = ["csrc/**"]
 "flashinfer.experimental.cake_dsa_indexer" = ["csrc/**", "build.json"]
+# Generated sources for the experimental exact-SM100a/SM103a Kimi-K3 attention-residual (AttnRes) backend, compiled on demand.
+"flashinfer.experimental.cake_kimi_k3_attn_res" = ["csrc/**"]
 # Route catalog of the experimental SM120 paged MQA-logits export, read at runtime next to its module.
 "flashinfer.experimental.deepgemm_sm120_paged_mqa_logits" = ["*.json"]
+# Route catalog of the experimental SM100/SM103 dense and paged MQA-logits export, read at runtime
+# next to its module.
+"flashinfer.experimental.deepgemm_dense_mqa" = ["*.json"]
 "flashinfer" = ["_build_meta.py", "mla_kv_pack_fp8_workloads.json"]
 "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
@@ -109,6 +114,9 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.gdn_kernels.experimental.kernel" = ["*.cu"]
 # Generated sources for the experimental exact-SM103a MXFP8 MegaMoE backend.
 "flashinfer.experimental.cake_mxfp8_megamoe_ep16" = ["csrc/**"]
+# Generated programs, hand-written bindings and manifest of the experimental
+# exact-SM103a W8A8 MXFP8 MegaMoE EP16 backend, compiled on demand.
+"flashinfer.experimental.cake_w8a8_megamoe_ep16" = ["csrc/**"]
 # Generated sources for the experimental exact-SM100a/SM103a/SM107a ragged BF16 MoE grouped GEMM backend.
 "flashinfer.experimental.cake_moe_grouped_gemm" = ["csrc/**", "build.json"]
 # Generated sources for the experimental exact-SM100a/SM107a dense projection GEMM backend.
@@ -239,7 +247,6 @@ extend-exclude = [
   "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py",
   "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py",
   "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py",
-  "flashinfer/experimental/cake_vsa_sm90_cute/attention_queue.py",
 ]
 force-exclude = true
 

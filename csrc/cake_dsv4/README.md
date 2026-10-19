@@ -2,9 +2,11 @@
 
 Generated device kernels and TVM-FFI launchers for SM100 / SM103 behind
 `trtllm_batch_decode_sparse_mla_dsv4(..., backend="cake")` for BF16 and FP8 E4M3
-inputs with head dimension 512 (BF16 output). Select the backend explicitly;
-`backend="auto"` keeps the architecture-based selection. Programmatic dependent
-launch and the TRTLLM-GEN RopeQuant epilogue are not supported.
+inputs with head dimension 512 (BF16 output); `kv_cache_format="nvfp4"` selects
+the NVFP4 decode family (`run_cake_dsv4_nvfp4`; see the host module docstring).
+Select the backend explicitly; `backend="auto"` keeps the architecture-based
+selection. Programmatic dependent launch and the TRTLLM-GEN RopeQuant epilogue
+are not supported.
 
 ```python
 from flashinfer.mla import (
@@ -29,24 +31,25 @@ out = trtllm_batch_decode_sparse_mla_dsv4(
 
 | path | contents |
 | --- | --- |
-| `sm_100a/`, `sm_103a/` | one `*_kernel.cu` (device code) and one `*_binding.cu` (launcher) per variant and architecture |
-| `common/` | kernels whose source is identical on both architectures (`split_reduce`, `bf16_h64_compressed_reduce`) |
-| `cake_dsv4_host_shim.h` | the launcher helpers shared by every binding (device guard, tensor checks, SM103 descriptor-storage writes) |
+| `sm_100a/`, `sm_103a/` | one `cake_dsv4_<hash>_kernel.cu` (device code) and one `cake_dsv4_<hash>_binding.cu` (TVM-FFI launcher) per BF16 / FP8 variant whose kernel differs between the two architectures (14 per directory), plus the headers every unit of that directory includes: `cake_dsv4_device_common.cuh` (device preamble) and `cake_dsv4_host_common.cuh` (dynamic shared-memory opt-in) |
+| `common/` | sources both architectures compile: the 13 BF16 / FP8 variants whose kernel is identical on sm_100a and sm_103a (`cake_dsv4_<hash>_{kernel,binding}.cu`, named by the sm_100a hash, with their own copies of the two `cake_dsv4_*_common.cuh` headers), and the NVFP4 decode family (the `cake_dsv4_nvfp4_*_kernel.cu` units, their `*_binding.cu` launchers and the `cake_dsv4_nvfp4_{device,host}_common.cuh` headers: launch helpers, tensor-map encoders, tensor checks) |
 | `cake_dsv4_launch_sequence.cc` | host-only `run_sequence`: issues the producer and reducer launches of a two-stage route from one FFI call |
 
 `flashinfer/jit/cake_dsv4.py` registers each variant per architecture: its
 sources, nvcc flags, an identity that names the JIT module, and the `arg_plan`
 the host binds by name. `flashinfer/mla/cake_dsv4.py` resolves the sparse
-metadata, carves the caller-owned workspace, picks the route (`_route`) and
-launches the variant kernels directly, reducers included; shapes without an
-exported kernel are rejected before any launch. Bindings perform no device
-allocation.
+metadata, carves the caller-owned workspace, picks the route (`_route`, or
+`_nvfp4_plan` for the NVFP4 cache) and launches the variant kernels directly,
+reducers included; shapes without an exported kernel are rejected before any
+launch. Bindings perform no device allocation.
 
 ## Host contract
 
-* Metadata: every kernel takes `swa_indices`, `compressed_indices`,
-  `sparse_topk_lens`, `swa_index_stride`, `compressed_index_stride`,
-  `sparse_topk_lens_offset`, `sparse_topk`, `num_query_tokens`. Combined
+* Metadata (BF16 / FP8 kernels; the NVFP4 family binds two independent
+  tables, see the host module docstring): every kernel takes `swa_indices`,
+  `compressed_indices`, `sparse_topk_lens`, `swa_index_stride`,
+  `compressed_index_stride`, `sparse_topk_lens_offset`, `sparse_topk`,
+  `num_query_tokens`. Combined
   (`sparse_indices [T, sparse_topk]`) and separate (`sparse_indices [T, 128]` +
   `extra_sparse_indices [T, topk_c]`, lengths via `sparse_topk_lens` or
   `extra_sparse_topk_lens`) tables are resolved without copies; int32, unit column
@@ -58,25 +61,19 @@ allocation.
   every launch), then `partial_O` (BF16) and `partial_lse` (FP32) sized by
   `get_cake_dsv4_workspace_bytes`. CUDA-graph replays are self-contained once the
   counters were zeroed eagerly.
-* SM103 descriptor storage: the bindings with `tma_workspace_bytes` read their TMA
-  descriptors from a private device tensor the host passes in; the binding writes
-  the descriptors of the call into it when they differ from what it holds (in
-  stream order, never inside graph capture). The host keeps a bounded pool of
-  such tensors per (variant, device), keyed by the TMA source geometry: recent
-  geometries reuse their storage, new ones take a free or the least recently
-  used storage, geometries launched under graph capture keep theirs for the
-  process lifetime, and a capture that reaches a geometry never launched
-  eagerly raises.
 * Query / output / KV pools must be densely packed; the host makes no copies.
 
 ## Tests
 
 ```bash
-pytest tests/mla/test_cake_dsv4.py -q              # routing, binding, workspace, metadata (CPU)
-pytest tests/mla/test_cake_dsv4_hardening.py -q    # numerical and graph-replay checks (SM100/SM103 GPU)
+pytest tests/mla/test_cake_dsv4.py -q                        # routing, binding, workspace, metadata (CPU)
+pytest tests/mla/test_cake_dsv4_nvfp4_route.py -q            # NVFP4 planner, variant names, workspace (CPU)
+pytest tests/mla/test_cake_dsv4_hardening.py -q              # numerical and graph-replay checks (SM100/SM103 GPU)
+pytest tests/attention/test_sparse_mla_blackwell_dsv4_nvfp4.py -q  # NVFP4 cache ops and cake decode (GPU: SM100/SM103; cache ops also SM120/SM121)
 ```
 
-Tolerances: `atol=rtol=0.01` (BF16), `atol=rtol=0.1` (FP8).
+Tolerances of the hardening checks: `atol=rtol=0.01` (BF16), `atol=rtol=0.1`
+(FP8); the NVFP4 decode test pins its own bounds.
 
 ## SM120 / SM121: DeepSeek-V4 NVFP4 sparse-MLA decode and prefill
 

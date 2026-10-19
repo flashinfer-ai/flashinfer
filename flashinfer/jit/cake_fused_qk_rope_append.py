@@ -15,12 +15,22 @@
 
 One source-only manifest lives under ``csrc/cake_fused_qk_rope_append``
 (``cake_fused_qk_rope_append_manifest.json``, schema ``cake.library_export.v5``):
-for every architecture (``sm_90a`` H100/H200, ``sm_100a`` B200, ``sm_103a`` B300)
-one stage per build the Cake host policy can select for the two head
-configurations ``(Hq, Hkv) = (8, 1)`` / ``(64, 8)`` (``contract.stages_by_arch``;
-the base build ``hq8_hkv1`` / ``hq64_hkv8`` plus lever builds such as
-``hq8_hkv1_vsub3_d`` or ``hq64_hkv8_w20_vsub18_d``), each with its tvm-ffi
-binding.  :func:`stage_for` mirrors the Cake policy (``contract.stage_policy``)
+one record per stage, i.e. per build the Cake host policy can select for the
+two head configurations ``(Hq, Hkv) = (8, 1)`` / ``(64, 8)`` (the base build
+``hq8_hkv1`` / ``hq64_hkv8`` plus lever builds such as ``hq8_hkv1_vsub3_d`` or
+``hq64_hkv8_w20_vsub18_d``).  ``contract.stages_by_arch`` lists the stages
+shipped for ``sm_90a`` (H100/H200), ``sm_100a`` (B200) and ``sm_103a`` (B300);
+a record's ``builds[arch]`` holds the module name and kernel symbol of that
+(stage, arch) library, and ``contract.arg_plan`` the binding's argument order
+shared by every build.  One parametric kernel source
+(``cake_fused_qk_rope_append_kernel.cu``) and one tvm-ffi binding are shared
+by every stage and architecture: a module compiles them with the stage's knob
+defines (``-DNUM_Q_HEADS=...`` ... ``-DCLEAR_UNITS_PER_WARP=...`` from the
+record's ``specializations``, :func:`_knob_defines`), with
+``-DCAKE_KERNEL_SYMBOL=<its kernel_symbol>`` and its own host-shim namespace
+(:func:`_module_defines`), so the per-(stage, arch) libraries keep distinct
+symbols and can be loaded into one process.
+:func:`stage_for` mirrors the Cake policy (``contract.stage_policy``)
 and picks the stage from the architecture and the problem shape; the host
 wrapper lives in :mod:`flashinfer.cake_fused_qk_rope_append`.
 """
@@ -47,23 +57,22 @@ _PACKAGE = "cake_fused_qk_rope_append"
 _GENERATED_ROOT = f"csrc/{_PACKAGE}"
 _MANIFEST_NAME = f"{_PACKAGE}_manifest.json"
 
-#: Legacy single-build stage names (one per head configuration).  Since the round-2 export the manifest ships
-#: one stage per build the Cake host policy can select (``contract.stages_by_arch``); :func:`stage_for` picks it.
-STAGES = ("hq8_hkv1", "hq64_hkv8")
 ARCHES = ("sm_90a", "sm_100a", "sm_103a")
 HEAD_DIM = 128
 _VEC = 8
 _CLEAR_UNIT_CHUNKS = 256
-#: Fallback for manifests without ``contract.stage_policy`` (mirrors Cake ``POLICY_EXPORT`` of 2026-10-03).
-_DEFAULT_POLICY_CONSTANTS = {
-    "direct_min_requests": 257,
-    "sm100_decode_8_1_min_requests": 128,
-    "clear_ctas_per_free_sm": 16,
-    "w20": 20,
-    "w20_v_sub_base": 18,
-    "v_sub_base_8_1": 3,
-    "sm100_u2_min_clear_ctas": 2048,
-}
+# Knobs of the parametric kernel source, in the order of its ``#ifndef`` guards;
+# every stage record's ``specializations`` carries exactly these (the former
+# per-stage in-file ``#define`` values).
+_KNOBS = (
+    "NUM_Q_HEADS",
+    "NUM_KV_HEADS",
+    "WARPS_PER_ROW",
+    "V_SUB_BASE",
+    "CLEAR_UNIT_CHUNKS",
+    "L_DIRECT_LOOKUP",
+    "CLEAR_UNITS_PER_WARP",
+)
 _NVCC_FLAGS = {
     "sm_90a": sm90a_nvcc_flags,
     "sm_100a": sm100a_nvcc_flags,
@@ -86,13 +95,10 @@ def clear_units_per_request(page_size: int, num_kv_heads: int) -> int:
     return 2 * ((chunks + _CLEAR_UNIT_CHUNKS - 1) // _CLEAR_UNIT_CHUNKS)
 
 
+@functools.cache
 def policy_constants() -> dict[str, int]:
-    try:
-        policy = _manifest().get("contract", {}).get("stage_policy") or {}
-        constants = dict(policy.get("constants") or {})
-    except (FileNotFoundError, RuntimeError):
-        constants = {}
-    return {**_DEFAULT_POLICY_CONSTANTS, **constants}
+    """Constants of the Cake stage policy (``contract.stage_policy.constants``)."""
+    return dict(_manifest()["contract"]["stage_policy"]["constants"])
 
 
 def policy_knobs(
@@ -140,7 +146,14 @@ def policy_knobs(
         out["L_DIRECT_LOOKUP"] = 1
     if cfg == (8, 1) and (hopper or direct):
         out["V_SUB_BASE"] = c["v_sub_base_8_1"]
-    if not hopper and cfg == (64, 8) and clear_ctas >= c["sm100_u2_min_clear_ctas"]:
+    # No shipped build combines WARPS_PER_ROW=w20 with CLEAR_UNITS_PER_WARP=2
+    # (``contract.stages_by_arch``): when both conditions hold, w20 wins.
+    if (
+        not hopper
+        and cfg == (64, 8)
+        and not w20
+        and clear_ctas >= c["sm100_u2_min_clear_ctas"]
+    ):
         out["CLEAR_UNITS_PER_WARP"] = 2
     return out
 
@@ -159,13 +172,10 @@ def stage_name(num_q_heads: int, num_kv_heads: int, knobs: dict[str, int]) -> st
     return "_".join(parts)
 
 
+@functools.cache
 def stages_for(arch: str) -> tuple[str, ...]:
     """Stage names the manifest ships for ``arch``."""
-    contract = _manifest().get("contract", {})
-    by_arch = contract.get("stages_by_arch")
-    if isinstance(by_arch, dict) and by_arch.get(arch):
-        return tuple(by_arch[arch])
-    return tuple(contract.get("stages") or STAGES)
+    return tuple(_manifest()["contract"]["stages_by_arch"][arch])
 
 
 def stage_for(
@@ -260,7 +270,14 @@ def _manifest() -> dict[str, Any]:
     return value
 
 
+def arg_plan() -> tuple[tuple[str, str], ...]:
+    """Binding arguments ``(kind, name)`` in call order (``contract.arg_plan``)."""
+    plan = _manifest()["contract"]["arg_plan"]
+    return tuple((str(kind), str(name)) for kind, name in plan)
+
+
 def _record(stage: str, arch: str) -> dict[str, Any]:
+    """Per-module view of a stage record: its shared fields plus ``builds[arch]``."""
     if arch not in ARCHES:
         raise ValueError(f"unknown arch {arch!r}; expected one of {ARCHES}")
     shipped = stages_for(arch)
@@ -268,17 +285,17 @@ def _record(stage: str, arch: str) -> dict[str, Any]:
         raise ValueError(
             f"unknown stage {stage!r} for {arch}; expected one of {shipped}"
         )
-    matches = [
-        item
-        for item in _manifest()["modules"]
-        if item.get("arch") == arch
-        and dict(item.get("route", {})).get("stage") == stage
-    ]
+    matches = [item for item in _manifest()["modules"] if item.get("stage") == stage]
     if len(matches) != 1:
         raise RuntimeError(
-            f"expected one generated Cake module for ({arch}, {stage}), got {len(matches)}"
+            f"expected one Cake stage record for {stage!r}, got {len(matches)}"
         )
-    return matches[0]
+    record = matches[0]
+    build = dict(record.get("builds", {})).get(arch)
+    if not isinstance(build, dict):
+        raise RuntimeError(f"stage {stage!r} ships no build for {arch}")
+    view = {key: value for key, value in record.items() if key != "builds"}
+    return {**view, **build, "arch": arch}
 
 
 def _source_path(relative_path: str) -> Path:
@@ -303,9 +320,33 @@ def _source_path(relative_path: str) -> Path:
     return path
 
 
-def cake_fused_qk_rope_append_record(stage: str, arch: str) -> dict[str, Any]:
-    """Manifest record of one generated module (arg plan, launch block, specialization)."""
-    return dict(_record(stage, arch))
+def _knob_defines(record: dict[str, Any]) -> list[str]:
+    """``-D`` flags that instantiate the parametric kernel source for one stage.
+
+    The knobs are the record's ``specializations``; the kernel source has an
+    ``#ifndef``/``#error`` guard per knob, so a missing one fails the build.
+    """
+    knobs = record["specializations"]
+    if set(knobs) != set(_KNOBS):
+        raise RuntimeError(
+            f"stage {record['stage']!r} specializations {sorted(knobs)} "
+            f"!= {sorted(_KNOBS)}"
+        )
+    return [f"-D{name}={int(knobs[name])}" for name in _KNOBS]
+
+
+def _module_defines(record: dict[str, Any], arch: str) -> list[str]:
+    """``-D`` flags that instantiate the shared sources for one (stage, arch) module.
+
+    The kernel source and the binding are shared by all stages and architectures.
+    Each module is its own JIT library and all of them may be loaded into one
+    process, so every build keeps its own kernel symbol (the manifest record's
+    ``kernel_symbol``) and its own host-shim namespace.
+    """
+    return [
+        f"-DCAKE_KERNEL_SYMBOL={record['kernel_symbol']}",
+        f"-DCAKE_HOST_SHIM_NAMESPACE=cake_host_shim_{record['name']}_{arch}",
+    ]
 
 
 @functools.cache
@@ -315,7 +356,12 @@ def gen_cake_fused_qk_rope_append_module(stage: str, arch: str) -> JitSpec:
     spec = gen_jit_spec(
         name=f"{record['name']}_{arch}",
         sources=[_source_path(units["device"]), _source_path(units["binding"])],
-        extra_cuda_cflags=[*_NVCC_FLAGS[arch], *record["compile_flags"]],
+        extra_cuda_cflags=[
+            *_NVCC_FLAGS[arch],
+            *record["compile_flags"],
+            *_module_defines(record, arch),
+            *_knob_defines(record),
+        ],
         extra_ldflags=["-lcuda"],
         extra_include_paths=[_get_csrc_dir().parent, _get_include_dir()],
     )
@@ -329,15 +375,3 @@ def load_cake_fused_qk_rope_append_module(stage: str, arch: str):
     spec = gen_cake_fused_qk_rope_append_module(stage, arch)
     module = spec.build_and_load()
     return module, _record(stage, arch)
-
-
-def build_all_cake_fused_qk_rope_append_modules(arch: str) -> dict[str, str]:
-    built = {}
-    for stage in stages_for(arch):
-        spec = gen_cake_fused_qk_rope_append_module(stage, arch)
-        module = spec.build_and_load()
-        record = _record(stage, arch)
-        if not hasattr(module, str(record["ffi_entry"])):
-            raise RuntimeError(f"built module {record['name']} lacks its FFI entry")
-        built[stage] = spec.name
-    return built

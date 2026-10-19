@@ -709,6 +709,8 @@ class CakeWarpDecodeConfig:
         shared. Refresh the derived buffers outside timing/capture when logical
         beta, clamp, or gate scale changes, preserving captured addresses.
         """
+        from .runners import CakeWarpDecodeRunner
+
         if quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
             raise ValueError(
                 "Cake warp decode weight preparation requires "
@@ -716,27 +718,12 @@ class CakeWarpDecodeConfig:
             )
         activation = SwiGLU() if activation is None else activation
         geometry = (hidden_size, intermediate_size, num_local_experts)
-        supported = (
-            (SwiGLU(), (2048, 512, 512)),
-            (SwiGLU(), (2048, 1536, 60)),
-            (SwiGLU(), (2560, 768, 384)),
-            (SiLU(), (6144, 1536, 192)),
-            (SwiGLU(limit=10.0), (4096, 2048, 256)),
-            (SwiGLU(), (2048, 768, 128)),
-            (SwiGLU(), (4096, 1536, 128)),
-            (SwiGLU(), (2048, 512, 256)),
-            (SwiGLU(), (4096, 1024, 512)),
-            (SwiGLU(), (3072, 1536, 256)),
-            (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), (6144, 3072, 128)),
-            (SiTU(gate_scale=4.0, linear_scale=25.0), (3584, 3072, 896)),
-            (SwiGLU(), (4096, 512, 512)),
-            (SwiGLU(), (4096, 256, 512)),
-            (SwiGLU(), (3072, 768, 256)),
-            (SwiGLU(), (3072, 384, 256)),
-        )
         if not any(
-            activation == supported_activation and geometry == supported_geometry
-            for supported_activation, supported_geometry in supported
+            activation == supported_activation
+            and geometry == (hidden, intermediate, experts)
+            for supported_activation, hidden, intermediate, experts, _ in (
+                CakeWarpDecodeRunner._SUPPORTED_CONFIGURATIONS
+            )
         ):
             raise ValueError(
                 "Cake warp decode weight preparation supports only default "

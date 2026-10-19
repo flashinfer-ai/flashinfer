@@ -156,6 +156,8 @@ def parse_gemm_args(line, parser):
             "cublaslt",
             "cute-dsl",
             "cute-dsl-native",
+            "blackwell-native",
+            "blackwell-tiled",
             "b12x",
             "auto",
             "tinygemm",
