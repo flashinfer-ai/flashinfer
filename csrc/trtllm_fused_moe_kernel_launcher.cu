@@ -1058,7 +1058,7 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
 
 std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_tile_nums,
                                        int64_t const num_tokens, int64_t const top_k,
-                                       int64_t const num_local_experts) {
+                                       int64_t const num_local_experts, int const tiles_below = 2) {
   TVM_FFI_ICHECK(!supported_tile_nums.empty()) << "supported_tile_nums must not be empty.";
   TVM_FFI_ICHECK(num_tokens >= 0) << "num_tokens must be non-negative.";
   TVM_FFI_ICHECK(top_k > 0) << "top_k must be positive.";
@@ -1093,8 +1093,10 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_til
       selected_tile_nums.insert(*std::next(std::next(it)));
     }
   }
-  if (it != supported_tile_nums.begin()) {
-    selected_tile_nums.insert(*std::prev(it));
+  auto down = it;
+  for (int i = 0; i < tiles_below && down != supported_tile_nums.begin(); ++i) {
+    down = std::prev(down);
+    selected_tile_nums.insert(*down);
   }
 
   return selected_tile_nums;
@@ -1103,7 +1105,8 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_til
 int64_t selectDefaultTileN(std::vector<int32_t> const& supported_tile_nums,
                            int64_t const num_tokens, int64_t const top_k,
                            int64_t const num_local_experts) {
-  auto selected = computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
+  auto selected =
+      computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts, 1);
   TVM_FFI_ICHECK(!selected.empty()) << "No selected tile_N candidates for current MoE input.";
   return *selected.begin();
 }
@@ -4858,18 +4861,10 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     std::vector<int32_t> tiles(mBaseSupportedTileNums.begin(), mBaseSupportedTileNums.end());
     if (dtype_act != btg::Dtype::Bfloat16) {
       tiles.push_back(128);
-#ifndef TLLM_RUBIN_FEATURES
-      // Keep tactic enumeration aligned with the public BMM artifact. The
-      // previously separate Rubin BMM pin had no 192-tile FP4 kernels (its only
-      // 192-tile kernels were FP8), and launchers are built eagerly for every
-      // advertised tile, so advertising 192 there failed runner construction
-      // outright. The consolidated multi-arch BMM pin does ship sm107a 192-tile
-      // FP4 kernels, so this guard can be dropped once Rubin is re-verified.
       if ((dtype_weights == btg::Dtype::E2m1 && dtype_act == btg::Dtype::E2m1) ||
           (dtype_weights == btg::Dtype::MxE2m1 && dtype_act == btg::Dtype::MxE4m3)) {
         tiles.push_back(192);
       }
-#endif
       tiles.push_back(256);
     }
     return tiles;
