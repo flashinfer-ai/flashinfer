@@ -887,3 +887,44 @@ def stmc_bf16x8(
         loc=loc,
         ip=ip,
     )
+
+
+@cute.jit
+def load_f32x8(base: cute.Tensor, offset: Int64):
+    pointer = cute.make_ptr(
+        Float32,
+        (base.iterator + offset).llvm_ptr,
+        cute.AddressSpace.gmem,
+        assumed_align=32,
+    )
+    fragment = cute.make_rmem_tensor(cute.make_layout((VEC_BF16,)), Float32)
+    cute.autovec_copy(
+        cute.make_tensor(pointer, cute.make_layout((VEC_BF16,))), fragment
+    )
+    return fragment.load()
+
+
+@cute.jit
+def store_f32x8(base: cute.Tensor, offset: Int64, values) -> None:
+    pointer = cute.make_ptr(
+        Float32,
+        (base.iterator + offset).llvm_ptr,
+        cute.AddressSpace.gmem,
+        assumed_align=32,
+    )
+    fragment = cute.make_rmem_tensor(cute.make_layout((VEC_BF16,)), Float32)
+    fragment.store(values)
+    cute.autovec_copy(
+        fragment, cute.make_tensor(pointer, cute.make_layout((VEC_BF16,)))
+    )
+
+
+@cute.jit
+def load_bf16x8_as_f32(base: cute.Tensor, offset: Int64):
+    pointer = cute.make_ptr(
+        BFloat16,
+        (base.iterator + offset).llvm_ptr,
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    return packed_u32x4_to_bf16x8(load_global_u32x4(pointer)).to(Float32)

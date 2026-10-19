@@ -81,6 +81,9 @@ class TllmGenFmhaKernel {
  public:
   static constexpr int kDynamicNumTokensPerPageThreshold = 128;
   static constexpr int kDynamicNumTokensPerPageKernelKey = 128;
+  // Max KV splits per CGA cluster, and the per-CTA KV length up to which clamping to it pays off.
+  static constexpr int kMaxCgaSmemReductionCtasPerSeqKv = 16;
+  static constexpr int kMaxSeqLenKvPerCtaForCgaClamp = 4096;
 
   // The parameters for launching the kernel.
   // maxNumCtasQ, maxNumCtasKv, numCtasX, numCtasY, numCtasZ, clusterDimX
@@ -234,8 +237,11 @@ class TllmGenFmhaKernel {
            mDtypeOut == DATA_TYPE_BF16;
   }
 
+  inline bool isNvFp4Kv() const { return mDtypeK == DATA_TYPE_E2M1 && mDtypeV == DATA_TYPE_E2M1; }
+
   inline bool supportsGqaGroupingTokensHeadsQ(SelectKernelParams const& selectKernelParams) const {
-    return mDtypeQ == mDtypeK ||
+    // NVFP4 K/V is eligible independently of query/output dtype and workload shape.
+    return mDtypeQ == mDtypeK || isNvFp4Kv() ||
            (isBf16QFp8KvGeneration() &&
             selectKernelParams.mBf16QFp8KvTransformMode != Bf16QFp8KvTransformMode::Full);
   }
@@ -681,6 +687,21 @@ class TllmGenFmhaKernel {
       numCtasPerSeqKv = std::min(
           tunedMaxNumCtasPerSeqKv,
           std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
+      // Clamp >16 splits to 16 so small-batch long-KV decode keeps the CGA reduction.
+      // Benchmarked: 16-split CGA beats >16-split GMEM while each CTA walks <= 4096 KV tokens;
+      // beyond that, the extra CTAs win.
+      // Multi-token (spec-decode) D256 is excluded: the clamp measured slightly slower there.
+      if (numCtasPerSeqKv > kMaxCgaSmemReductionCtasPerSeqKv &&
+          (params.mMaxSeqLenQ == 1 || params.mHeadDimV != 256) && params.mHeadDimV < 512 &&
+          !isDsv3MinLatencyMode && !selectKernelParams.mForceGmemReduction &&
+          isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType) &&
+          flashinfer::ceil_div(maxAttentionWindow, kMaxCgaSmemReductionCtasPerSeqKv) <=
+              kMaxSeqLenKvPerCtaForCgaClamp &&
+          (isCgaSmemReduction(selectKernelParams.mMultiCtasKvMode) ||
+           (isGmemReduction(selectKernelParams.mMultiCtasKvMode) &&
+            hasCgaSmemReductionKernel(params, selectKernelParams)))) {
+        numCtasPerSeqKv = kMaxCgaSmemReductionCtasPerSeqKv;
+      }
       // Update the numCtasX.
       numCtasX *= numCtasPerSeqKv;
       // The current total number of CTAs.
@@ -1162,7 +1183,10 @@ class TllmGenFmhaKernel {
 
     // Generic mixed precision kernels don't work with groupsTokensHeadsQ = true. BF16Q+FP8KV
     // transform paths present BF16 K to BMM1, so they can use the grouped-token cubins.
-    if (!supportsGqaGroupingTokensHeadsQ(selectKernelParams)) {
+    // Single-token NVFP4 decode uses the existing ungrouped cubins because grouped
+    // single-token NVFP4 shows a small performance regression.
+    bool const singleTokenNvFp4 = params.mMaxSeqLenQ == 1 && isNvFp4Kv();
+    if (!supportsGqaGroupingTokensHeadsQ(selectKernelParams) || singleTokenNvFp4) {
       selectKernelParams.mGroupsTokensHeadsQ = false;
       tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
       kernelType = FmhaKernelType::SwapsMmaAbForGeneration;

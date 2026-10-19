@@ -611,6 +611,76 @@ def test_hit_rebinds_strided_qkv_views_in_place(heads, lengths):
     _assert_same(got, _snapshot(second))
 
 
+def _head_padded_g(d, heads, *, extra=8):
+    """Replace the dense g with a view into head-padded storage.
+
+    Serving allocators may pad the gate buffer in the head dimension (token
+    pitch above ``H * 128`` with a dense ``[H, 128]`` payload).  Every body
+    reads the gate rows at that pitch through ``g_token_stride``; nothing is
+    densified and the binding receives the view itself.
+    """
+    tokens = d["g"].shape[1]
+    storage = torch.full(
+        (1, tokens, heads + extra, HEAD_DIM),
+        float("nan"),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    view = storage[:, :, :heads]
+    view.copy_(d["g"])
+    assert not view.is_contiguous() and view.stride(1) == (heads + extra) * HEAD_DIM
+    d = dict(d, g=view)
+    d["_g_storage"] = storage  # keep the storage alive
+    return d
+
+
+@pytest.mark.parametrize(
+    "lengths,heads,checkpoints,lower_bound",
+    [
+        pytest.param([64] * 4, 12, True, None, id="h12_short_direct_n16"),
+        pytest.param([512], 12, False, -1.0, id="h12_bounded_dvsplit_m64"),
+        pytest.param([1024] * 4, 16, True, None, id="h16_direct_m128"),
+        pytest.param([2048, 3073], 16, True, -1.0, id="h16_bounded_long"),
+        pytest.param([16384], 12, True, None, id="h12_affine_split"),
+    ],
+)
+def test_head_padded_g_matches_dense_bitwise_on_every_body(
+    lengths, heads, checkpoints, lower_bound
+):
+    dense = _inputs(lengths, heads, seed=37)
+    pool = dense["pool"].clone()
+    dense_call = _run(dense, checkpoints=checkpoints, lower_bound=lower_bound)
+    dense_got = _snapshot(dense)
+
+    padded = _head_padded_g(dense, heads)
+    padded["out"] = torch.empty_like(dense["out"])
+    padded["state_checkpoints"] = torch.zeros_like(dense["state_checkpoints"])
+    dense["pool"].copy_(pool)
+    padded_call = _run(padded, checkpoints=checkpoints, lower_bound=lower_bound)
+    assert str(padded_call.schedule) == str(dense_call.schedule), (
+        dense_call.schedule,
+        padded_call.schedule,
+    )
+    _assert_same(_snapshot(padded), dense_got)
+
+
+@pytest.mark.parametrize("heads,lengths", [(12, [512]), (16, [1024])])
+def test_hit_rebinds_head_padded_g_in_place(heads, lengths):
+    """A plan-cache hit re-points the head-padded g view (the recorded argument
+    is the view, not a one-element carrier) and stays bitwise exact."""
+    cache = KDAPrefillPlanCache(8)
+    first = _head_padded_g(_inputs(lengths, heads, seed=43), heads)
+    second = _head_padded_g(_inputs(lengths, heads, seed=44), heads)
+    pool_second = second["pool"].clone()
+    miss = _run(first, cache, checkpoints=False, lower_bound=-1.0)
+    hit = _run(second, cache, checkpoints=False, lower_bound=-1.0)
+    assert hit is miss and (cache.misses, cache.hits) == (1, 1)
+    got = _snapshot(second)
+    second["pool"].copy_(pool_second)
+    _run(second, checkpoints=False, lower_bound=-1.0)
+    _assert_same(got, _snapshot(second))
+
+
 @pytest.mark.parametrize(
     "lengths", [[5461, 5461, 5462], [4096] * 4, [500] * 6 + [13384], [2048] * 8]
 )

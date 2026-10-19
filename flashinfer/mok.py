@@ -1,8 +1,42 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Experimental adapter for Mixture of Kittens (MoK) MoE training kernels."""
+"""Experimental adapter for Mixture of Kittens (MoK) MoE training kernels.
+
+Thin public entry points of the experimental package
+:mod:`flashinfer.experimental.cake_mok_bf16`: the three functions below carry
+the public signatures, documentation and the experimental-API marking and
+forward to :mod:`flashinfer.experimental.cake_mok_bf16.api`, which holds the
+bodies, the measured communication-SM tables and their resolvers. Following the
+experimental-track rules, this core module imports the package only inside the
+functions (and lazily for the table and resolver names), never at import time.
+"""
 
 from .api_logging import flashinfer_experimental_api
+
+# Tables and resolvers that live in the package but stay reachable here
+# (``flashinfer.mok.COMM_SMS``, ``flashinfer.mok.resolve_comm_sms(...)``, ...).
+_PACKAGE_NAMES = (
+    "COMM_SMS",
+    "IMBALANCE_COMM_SMS",
+    "IMBALANCE_THRESHOLD",
+    "IMBALANCE_THRESHOLDS",
+    "MOK_PRECISIONS",
+    "resolve_comm_sms",
+    "resolve_imbalance_comm_sms",
+    "resolve_imbalance_threshold",
+)
+
+
+def __getattr__(name):
+    if name in _PACKAGE_NAMES:
+        from .experimental.cake_mok_bf16 import api as _api
+
+        return getattr(_api, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_PACKAGE_NAMES))
 
 
 @flashinfer_experimental_api
@@ -36,12 +70,12 @@ def prepare_mok_bf16(
     This is a synthetic training experiment, with no full-model or optimizer
     integration.
     """
-    from .experimental.cake_mok_bf16.backend import MoKFunctional
+    from .experimental.cake_mok_bf16 import api as _api
 
-    return MoKFunctional(
-        ep_size,
-        local_experts,
-        topk,
+    return _api.prepare_mok_bf16(
+        ep_size=ep_size,
+        local_experts=local_experts,
+        topk=topk,
         clamped_swiglu=clamped_swiglu,
         fp32_wgrad=fp32_wgrad,
     )
@@ -61,6 +95,9 @@ def create_mok_bf16_workspace(
     minibatch_size=4096,
     macrobatch_size=32768,
     schedule_capacity_multiplier=3 / 16,
+    precision="bf16",
+    imbalance_comm_sms="auto",
+    imbalance_threshold="auto",
 ):
     """Collectively create a caller-owned ``(config, workspace)`` pair.
 
@@ -72,25 +109,49 @@ def create_mok_bf16_workspace(
     a small toy ring; see the backend README for capacity and reuse rules.
     The same workspace serves BF16 and MXFP8 routed experts.
     Call outside CUDA Graph capture; retain the workspace for every replay.
-    """
-    from .experimental.cake_mok_bf16.workspace import MoKConfig
-    from .experimental.cake_mok_bf16.backend import create_source_workspace
 
-    config = MoKConfig(
-        fwd_num_comm_sms=fwd_num_comm_sms,
-        bwd_num_comm_sms=bwd_num_comm_sms,
-        minibatch_size=minibatch_size,
-        macrobatch_size=macrobatch_size,
-        schedule_capacity_multiplier=schedule_capacity_multiplier,
-    )
-    return config, create_source_workspace(
-        config,
-        group,
+    ``fwd_num_comm_sms`` / ``bwd_num_comm_sms`` are the fixed (forward, backward)
+    communication-SM counts of every launch (factory default 40 / 40). ``"auto"``
+    for both takes the measured row of the device, ``precision`` and EP group
+    size (:func:`resolve_comm_sms`, :data:`COMM_SMS`; GB300 MXFP8 at EP8: 44 / 36,
+    no row elsewhere, so the factory split stays in force there).
+    ``imbalance_comm_sms`` is the (forward, backward) communication-SM split the
+    launches switch to while the hottest rank's routed-row load is at least
+    ``imbalance_threshold`` times the mean per-rank load (observed on the
+    gathered expert IDs of each step without a host synchronization; the counts
+    are identical on every rank, each rank applies its own latest completed
+    observation). ``"auto"`` (default) takes the measured row of the device
+    for ``precision`` (:func:`resolve_imbalance_comm_sms`, keyed by compute
+    capability and SM count; B200 BF16: 24 / 28, B200 MXFP8: 44 / 36, no row
+    elsewhere - GB200 and GB300 included - so the fixed split stays in force
+    there), ``None`` keeps the fixed split and a pair sets it. ``precision``
+    only selects that row and the threshold. ``imbalance_threshold`` ``"auto"``
+    (default) takes the measured ratio of ``precision``
+    (:func:`resolve_imbalance_threshold`; :data:`IMBALANCE_THRESHOLDS`): BF16 4,
+    between the 3x load ratio, where its split shows no gain, and 5.6x, where it
+    gains 1-2 %; MXFP8 2.7, between 2.4x (no gain) and 3x (gains 1 %). A number
+    sets the ratio. Balanced steps never switch.
+    ``MoKConfig.comm_split_log`` (default ``False``; ``dataclasses.replace(config,
+    comm_split_log=True)`` on the returned config) prints each split change per
+    rank to stderr.
+    """
+    from .experimental.cake_mok_bf16 import api as _api
+
+    return _api.create_mok_bf16_workspace(
+        group=group,
         device=device,
         num_local_tokens=num_local_tokens,
         hidden_size=hidden_size,
         topk=topk,
         source_capacity=source_capacity,
+        fwd_num_comm_sms=fwd_num_comm_sms,
+        bwd_num_comm_sms=bwd_num_comm_sms,
+        minibatch_size=minibatch_size,
+        macrobatch_size=macrobatch_size,
+        schedule_capacity_multiplier=schedule_capacity_multiplier,
+        precision=precision,
+        imbalance_comm_sms=imbalance_comm_sms,
+        imbalance_threshold=imbalance_threshold,
     )
 
 
@@ -107,6 +168,10 @@ def quantize_mok_mxfp8_weights(gate, up, down):
     and ``backward_weights`` to ``backward``. Requantize after every weight
     update; weight gradients are returned in BF16 (or FP32 accumulators).
     """
-    from .experimental.cake_mok_bf16.mxfp8 import quantize_routed_weights
+    from .experimental.cake_mok_bf16 import api as _api
 
-    return quantize_routed_weights(gate, up, down)
+    return _api.quantize_mok_mxfp8_weights(
+        gate,
+        up,
+        down,
+    )

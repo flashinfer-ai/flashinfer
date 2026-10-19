@@ -10,6 +10,7 @@ imports and launches never use it.
 """
 
 import bisect
+import re
 
 import pytest
 import torch
@@ -41,7 +42,10 @@ _FP4_LUT = (
 # counts that are not 1, 16 or 128 (partial four-query blocks, 33 and 132
 # queries, and 2052/2053 queries on the unbounded metadata tier), plus one row
 # per two-launch route at the first KV length above its single-launch class's
-# policy bound (the ``:short`` classes serve every other row of this table).
+# policy bound, two rows past the fused Q <= 2048 route's union bound (the
+# le2048 tier pairs), and the two 32-head rows whose KV length is not a multiple
+# of 256 (served where the served route record's ``kv_alignment`` is 1 for the
+# device's architecture; skipped elsewhere).
 CASES = [
     (precision, queries, keys)
     for precision in ("fp4", "fp8")
@@ -85,6 +89,10 @@ CASES = [
     ("fp4", 33, 1048832),
     ("fp4", 130, 65792),
     ("fp4", 2052, 65792),
+    ("fp8", 130, 65792),
+    ("fp8", 132, 65792),
+    ("fp8", 37, 4137),
+    ("fp8", 1024, 33803),
 ]
 
 
@@ -110,7 +118,8 @@ def _inputs(precision, queries, keys):
         q = torch.randn(rows, 32, 128, device="cuda").to(torch.float8_e4m3fn)
         kv = torch.randn(keys, 128, device="cuda").to(torch.float8_e4m3fn)
         qs = None
-        ks = torch.rand(keys, device="cuda") + 0.5
+        # the plan reads the FP32 scales through a [1, K] view with an align4(K) row stride
+        ks = (torch.rand(_runtime.align4(keys), device="cuda") + 0.5)[:keys]
     weights = torch.randn(rows, 32, device="cuda")
     starts = torch.zeros(queries, device="cuda", dtype=torch.int32)
     ends = torch.full_like(starts, keys)
@@ -278,6 +287,11 @@ def _deep_gemm_check(
 @pytest.mark.parametrize("precision,queries,keys", CASES)
 def test_dense_mqa_logits(precision, queries, keys):
     _skip_unless_exported()
+    arch = _runtime.device_arch(torch.device("cuda"))
+    if not _runtime.dense_route_available(32, queries, keys, precision, arch=arch):
+        pytest.skip(
+            f"catalog has no admitted route for {precision}, Q={queries}, K={keys} on {arch}"
+        )
     q, kv, qs, ks, weights, starts, ends = _inputs(precision, queries, keys)
     plan = prepare_dense_mqa_logits(
         precision, q, kv, weights, starts, ends, q_scales=qs, kv_scales=ks
@@ -357,37 +371,163 @@ def test_dense_mqa_logits(precision, queries, keys):
         ("fp8", 128, 4096, "fp8:q128:short"),
         ("fp8", 128, 131072, "fp8:q128:short"),
         ("fp8", 128, 131328, "fp8:full:le128"),
-        ("fp8", 16, 2048, "fp8:full:le32:short"),
+        (
+            "fp8",
+            128,
+            4352,
+            "fp8:q128:short",
+        ),  # Q = 128 is the fused Q128 rule's up to its bound, whatever the tier's order
+        ("fp8", 128, 4353, "fp8:q128:short"),
+        (
+            "fp8",
+            128,
+            131077,
+            "fp8:full:le128",
+        ),  # never the le32 class, never the fused Q <= 128 text (K > 4352)
+        # On the overlap tiers (le128: 1 < Q <= 128, le2048: 128 < Q <= 2048) the published
+        # ``single_launch_precedence`` of the tier decides between the v9 scan class and
+        # the r3 fused tiered text: ``{first family: route}`` (published: ``qle`` first).
+        (
+            "fp8",
+            16,
+            2048,
+            {"le_class": "fp8:full:le32:short", "qle": "fp8:qle128:short"},
+        ),
+        (
+            "fp8",
+            16,
+            4096,
+            {"le_class": "fp8:full:le32:short", "qle": "fp8:qle128:short"},
+        ),
+        (
+            "fp8",
+            16,
+            4353,
+            "fp8:full:le32:short",
+        ),  # above the fused Q <= 128 bound: the class under either order
+        ("fp8", 16, 32768, "fp8:full:le32:short"),
         ("fp8", 16, 1048576, "fp8:full:le32:short"),
         ("fp8", 16, 1048832, "fp8:full:le16"),
         ("fp8", 3, 8192, "fp8:partial:le32:short"),
         ("fp8", 3, 1048832, "fp8:partial:le16"),
+        (
+            "fp8",
+            2,
+            300,
+            {"le_class": "fp8:partial:le32:short", "qle": "fp8:qle128:short"},
+        ),
         ("fp8", 33, 8192, "fp8:partial:le32:short"),
         ("fp8", 33, 1048832, "fp8:partial:le128"),
-        ("fp8", 124, 4096, "fp8:full:le32:short"),
-        ("fp8", 132, 2048, "fp8:full:le768:short"),
-        ("fp8", 132, 8192, "fp8:full:le768:short"),
-        ("fp8", 132, 8448, "fp8:full:le2048"),
-        ("fp8", 130, 8192, "fp8:partial:le768:short"),
-        ("fp8", 130, 8448, "fp8:partial:le2048"),
+        (
+            "fp8",
+            37,
+            4137,
+            {"le_class": "fp8:partial:le32:short", "qle": "fp8:qle128:short"},
+        ),
+        ("fp8", 37, 4353, "fp8:partial:le32:short"),
+        (
+            "fp8",
+            124,
+            4096,
+            {"le_class": "fp8:full:le32:short", "qle": "fp8:qle128:short"},
+        ),
+        (
+            "fp8",
+            132,
+            2048,
+            {"le_class": "fp8:full:le768:short", "qle": "fp8:qle2048:short"},
+        ),
+        (
+            "fp8",
+            132,
+            8192,
+            {"le_class": "fp8:full:le768:short", "qle": "fp8:qle2048:short"},
+        ),
+        (
+            "fp8",
+            132,
+            200,
+            {"le_class": "fp8:full:le768:short", "qle": "fp8:qle2048:short"},
+        ),
+        (
+            "fp8",
+            130,
+            8192,
+            {"le_class": "fp8:partial:le768:short", "qle": "fp8:qle2048:short"},
+        ),
+        (
+            "fp8",
+            129,
+            4137,
+            {"le_class": "fp8:partial:le768:short", "qle": "fp8:qle2048:short"},
+        ),
+        # above the le768 class's bound (8192) and within the fused Q <= 2048 bound -- a per-arch
+        # bound (sm_100a 34048, sm_103a 65536); the logical name applies the most permissive
+        # one and served_route the device's -- the fused text under either order; the
+        # two-launch tiers start above the union bound and above Q = 2048 (the le768 class
+        # up to 8192, then the pair)
+        ("fp8", 132, 8448, "fp8:qle2048:short"),
+        ("fp8", 130, 8448, "fp8:qle2048:short"),
+        ("fp8", 1024, 33803, "fp8:qle2048:short"),
+        ("fp8", 2048, 34048, "fp8:qle2048:short"),
+        ("fp8", 2048, 34049, "fp8:qle2048:short"),
+        ("fp8", 1024, 65536, "fp8:qle2048:short"),
+        ("fp8", 2048, 65537, "fp8:full:le2048"),
+        ("fp8", 1024, 65792, "fp8:full:le2048"),
+        ("fp8", 132, 65792, "fp8:full:le2048"),
+        ("fp8", 130, 65792, "fp8:partial:le2048"),
+        ("fp8", 129, 65537, "fp8:partial:le2048"),
         ("fp8", 2052, 2048, "fp8:full:le768:short"),
+        ("fp8", 2052, 4096, "fp8:full:le768:short"),
         ("fp8", 2052, 8448, "fp8:full:any"),
         ("fp8", 2053, 2048, "fp8:partial:le768:short"),
+        ("fp8", 2049, 4137, "fp8:partial:le768:short"),
         ("fp8", 2053, 8448, "fp8:partial:any"),
         ("fp8", 3076, 2048, "fp8:full:any"),  # 769 query blocks: no scan class
     ],
 )
 def test_dense_mqa_route_selection(precision, queries, keys, route):
+    if isinstance(route, dict):
+        # a point both single-launch families cover: the published order of its overlap tier decides (one order on every
+        # architecture for a logical route; ``served_route`` per device otherwise)
+        tier = _runtime._overlap_tier(queries)
+        orders = {
+            _runtime._single_launch_precedence(a, tier)
+            for a in sorted(_runtime._catalog()["arches"])
+        }
+        assert len(orders) == 1 and next(iter(orders)), orders
+        route = route[next(iter(orders))[0]]
     assert _runtime.route_name(precision, queries, keys) == route
+    if route == "fp8:qle128:short":
+        assert _runtime._catalog()["policy"]["fused_qle128_max_kv"] == 4352
+    if route == "fp8:qle2048:short":
+        bounds = _runtime._catalog()["policy"]["fused_qle2048_max_kv"]
+        assert bounds == {"sm_100a": 34048, "sm_103a": 65536}
+        # the served route applies the device's own bound: the two-launch tier of the query count past it
+        tier = f"fp8:{'full' if queries % 4 == 0 else 'partial'}:le2048"
+        for arch, bound in bounds.items():
+            served = _runtime.served_route(precision, queries, keys, arch=arch)
+            assert served == (route if keys <= int(bound) else tier), (arch, served)
+        if any(keys > int(b) for b in bounds.values()):
+            with pytest.raises(ValueError, match="pass arch"):
+                _runtime.served_route(precision, queries, keys)
+        else:
+            assert _runtime.served_route(precision, queries, keys) == route
 
 
 def test_dense_single_launch_policy_is_published():
-    """Host-only: the v9 policy carries the single-launch classes the router
-    reads -- the FP8 scan ceilings with one KV bound each and the ``fp4`` block
-    (fused Q1 bound, scan ceilings, one KV bound each) -- as positive multiples
-    of the 256-token KV alignment, ceilings ascending; every ``:short`` 32-head
-    route is one ``logits`` stage of the catalog."""
+    """Host-only: the v10 policy carries the single-launch classes the router
+    reads -- the FP8 scan ceilings with one KV bound each, the fused tiered
+    bounds (``fused_qle128_max_kv``; ``fused_qle2048_max_kv`` per architecture)
+    and the ``fp4`` block (fused Q1 bound, scan ceilings, one KV bound each) --
+    as positive multiples of the 256-token KV alignment, ceilings ascending.
+    Every ``:short`` 32-head route is one ``logits`` stage of the catalog with a
+    per-architecture K rule; the fused tiered routes are catalogued exactly where
+    ``single_launch_precedence`` gives the ``qle`` family a domain (the export's
+    rule: a family serves iff its own KV bound exceeds the bound of every family
+    ahead of it in the tier's order)."""
     catalog = _runtime._catalog()
+    arches = sorted(catalog["arches"])
     policy = catalog["policy"]
     tables = {"fp8": policy, "fp4": policy["fp4"]}
     for precision, table in tables.items():
@@ -399,6 +539,11 @@ def test_dense_single_launch_policy_is_published():
         q1_bound = int(table["fused_q1_max_kv"])
         assert q1_bound >= 256 and q1_bound % 256 == 0, precision
     assert int(policy["fused_q128_max_kv"]) % 256 == 0
+    qle128_bound = int(policy["fused_qle128_max_kv"])
+    assert qle128_bound >= 256 and qle128_bound % 256 == 0
+    qle2048_bounds = {a: int(v) for a, v in policy["fused_qle2048_max_kv"].items()}
+    assert sorted(qle2048_bounds) == arches
+    assert all(v >= 256 and v % 256 == 0 for v in qle2048_bounds.values())
     short = {
         route
         for route, record in catalog["routes"].items()
@@ -410,12 +555,42 @@ def test_dense_single_launch_policy_is_published():
             expected.add(f"fp8:{kind}:le{int(ceiling)}:short")
     for ceiling in tables["fp4"]["fused_scan_ceilings"]:
         expected.add(f"fp4:le{int(ceiling)}:short")
-    assert short == expected
+    # the fused tiered routes: on each overlap tier the ``qle`` family's KV bound against the bound of the scan class that
+    # serves the tier's query counts (the smallest ceiling covering the tier's query blocks); the route is catalogued iff
+    # some architecture's order gives the family a domain (``["qle", "le_class"]`` on both tiers: both routes; the v9
+    # order ``["le_class", "qle"]`` on le128 would drop ``fp8:qle128:short``, whose bound is below the le32 class's)
+    ceilings = [int(c) for c in policy["fused_scan_ceilings"]]
+    fused = set()
+    for tier, max_q, route in (
+        ("le128", _runtime.FUSED_QLE128_MAX_Q, "fp8:qle128:short"),
+        ("le2048", _runtime.FUSED_QLE2048_MAX_Q, "fp8:qle2048:short"),
+    ):
+        blocks = (max_q + _runtime.BLOCK_Q - 1) // _runtime.BLOCK_Q
+        ceiling = next(c for c in ceilings if blocks <= c)
+        class_bound = int(policy[f"fused_scan{ceiling}_max_kv"])
+        for arch in arches:
+            bounds = {
+                "qle": qle128_bound if tier == "le128" else qle2048_bounds[arch],
+                "le_class": class_bound,
+            }
+            order = list(policy["single_launch_precedence"][arch][tier])
+            if "qle" not in order:
+                continue
+            ahead = [bounds[f] for f in order[: order.index("qle")]]
+            if bounds["qle"] > max(ahead, default=0):
+                fused.add(route)
+    assert short == expected | fused
     for route in short:
         record = catalog["routes"][route]
         assert [stage for stage, _p in record["stages"]] == ["logits"], route
         assert not record.get("sequence"), route
-        assert record["clean_logits"] == "fused" and record["kv_alignment"] == 256
+        assert record["clean_logits"] == "fused", route
+        # the K rule is published per architecture: whole 256-row blocks for the scan classes and the fused Q1 / Q128
+        # texts, any K >= 1 for the fused tiered texts (their KV boxes may extend past the tensor)
+        divisor = 1 if route in fused else 256
+        assert int(record["kv_min"]) == divisor, route
+        assert sorted(record["kv_alignment"]) == arches, route
+        assert all(int(v) == divisor for v in record["kv_alignment"].values()), route
 
 
 @pytest.mark.parametrize("sm_count", [132, 148, 152])
@@ -433,11 +608,8 @@ def test_dense_mqa_sm_count_definition(sm_count):
     )
     assert plan.route_name == "fp8:q1:short"
     assert plan.num_sms == sm_count
-    program = dict(plan.route["stages"])["logits"][arch]
+    program = _runtime.stage_program(plan.route["stages"][0], arch)
     assert plan.program_names == [program]
-    record = _runtime._catalog()["programs"][program]
-    assert record["definitions"] == ["SM_COUNT"]
-    assert _runtime.program_definitions(record, sm_count) == {"SM_COUNT": sm_count}
     assert _runtime.program_spec(arch, program, sm_count).name.endswith(
         f"_sm_count{sm_count}"
     )
@@ -449,15 +621,42 @@ def test_dense_mqa_sm_count_definition(sm_count):
 
 def test_dense_mqa_rejects_unsupported_shapes():
     _skip_unless_exported()
+    arch = _runtime.device_arch(torch.device("cuda"))
     q, kv, qs, ks, weights, starts, ends = _inputs("fp8", 4, 4096)
-    with pytest.raises(ValueError):
-        prepare_dense_mqa_logits(
-            "fp8", q, kv[:4000], weights, starts, ends, kv_scales=ks[:4000]
-        )
     with pytest.raises(ValueError):
         prepare_dense_mqa_logits("fp8", q, kv, weights, starts, ends[:3], kv_scales=ks)
     with pytest.raises(ValueError):
         prepare_dense_mqa_logits("bf16", q, kv, weights, starts, ends, kv_scales=ks)
+    # FP4 keeps whole 256-row KV blocks (the route record's kv_alignment is 256 on every architecture)
+    q4, kv4, qs4, ks4, w4, s4, e4 = _inputs("fp4", 4, 4096)
+    with pytest.raises(ValueError):
+        prepare_dense_mqa_logits(
+            "fp4", q4, kv4[:4000], w4, s4, e4, q_scales=qs4, kv_scales=ks4[:4000]
+        )
+    # A 32-head route whose programs keep whole 256-row KV blocks (kv_min 256) is never served below one block.
+    # Q = 2052 (513 query blocks) is past the fused Q <= 2048 route, whose boxes may extend past the tensor, so the
+    # le768 scan class owns the call while K <= fused_scan768_max_kv; its record publishes kv_min 256 on every
+    # architecture and the call is refused (the catalog's word, not a restated rule).
+    q2, kv2, _qs, ks2, w2, s2, e2 = _inputs("fp8", 2052, 200)
+    assert _runtime.route_name("fp8", 2052, 200) == "fp8:full:le768:short"
+    assert _runtime.route_kv_min("fp8:full:le768:short") == 256
+    assert not _runtime.dense_route_available(32, 2052, 200, arch=arch)
+    with pytest.raises(ValueError):
+        prepare_dense_mqa_logits("fp8", q2, kv2, w2, s2, e2, kv_scales=ks2)
+    # A 32-head K that is not a multiple of 256 is served exactly where the route record publishes
+    # kv_alignment 1 for this architecture (the catalog's word, not a restated rule): above the fused
+    # Q <= 2048 bound the two-launch tier record decides.
+    above = max(_runtime._fused_qle2048_bounds().values()) + 4000
+    q3, kv3, _qs, ks3, w3, s3, e3 = _inputs("fp8", 132, above)
+    assert _runtime.route_name("fp8", 132, above) == "fp8:full:le2048"
+    served = _runtime.dense_route_available(32, 132, above, arch=arch)
+    assert served == (_runtime.route_kv_alignment("fp8:full:le2048", arch=arch) == 1)
+    if served:
+        plan = prepare_dense_mqa_logits("fp8", q3, kv3, w3, s3, e3, kv_scales=ks3)
+        assert plan.route_name == "fp8:full:le2048"
+    else:
+        with pytest.raises(ValueError, match="K % 256 == 0"):
+            prepare_dense_mqa_logits("fp8", q3, kv3, w3, s3, e3, kv_scales=ks3)
 
 
 # ---------------------------------------------------------------------------
@@ -466,29 +665,245 @@ def test_dense_mqa_rejects_unsupported_shapes():
 
 
 def test_dense_route_table_is_catalog_driven():
-    """Host-only: the 32-head names carry no head infix (the single-launch
-    classes by query-block kind and ceiling, the pairs by metadata tier), other
-    head counts carry the ``h<H>`` infix with tiers named by their token
-    ceiling, and availability (including the per-head KV alignment) is the
-    catalog's word."""
-    assert _runtime.route_name("fp8", 16, 4096) == "fp8:full:le32:short"
-    assert _runtime.route_name("fp8", 16, 1048832) == "fp8:full:le16"
+    """Host-only: the 32-head names carry no head infix -- the shipped routes, the
+    ``dense_mqa.v9`` single-launch classes by query-block kind and ceiling, the
+    ``dense_mqa.v10`` single-launch fused tiered routes ``fp8:qle128:short``
+    (1 < Q <= 128, K <= ``fused_qle128_max_kv``) and ``fp8:qle2048:short``
+    (128 < Q <= 2048, K <= ``fused_qle2048_max_kv[arch]``, the per-arch bound)
+    consulted in the published per-tier, per-arch order
+    ``single_launch_precedence`` (published: the fused texts first), the pairs by
+    metadata tier -- other head counts carry the ``h<H>`` infix with tiers named
+    by their token ceiling, and availability (including the per-route, per-arch
+    KV alignment and the per-arch fused Q <= 2048 bound) is the catalog's word."""
+    catalog = _runtime._catalog()
+    policy = catalog["policy"]
+    routes = catalog["routes"]
+    arches = sorted(catalog["arches"])
+    fused_max_kv = int(policy["fused_qle128_max_kv"])
+    assert 4096 <= fused_max_kv < 8192
+    bounds = _runtime._fused_qle2048_bounds()
+    assert set(bounds) == set(arches) and all(v % 256 == 0 for v in bounds.values())
+    fused_2048_max_kv = max(
+        bounds.values()
+    )  # the most permissive bound: the logical route's
+    assert fused_max_kv < min(bounds.values()) < fused_2048_max_kv
+    scan32, scan768 = (
+        int(policy["fused_scan32_max_kv"]),
+        int(policy["fused_scan768_max_kv"]),
+    )
+    assert fused_max_kv < scan32 and scan768 < min(bounds.values())
+    precedence = policy["single_launch_precedence"]
+    assert set(precedence) == set(arches)
+    for arch in arches:
+        assert set(precedence[arch]) == {"le128", "le2048"}
+        for tier, order in precedence[arch].items():
+            assert set(order) <= {"le_class", "qle"} and len(set(order)) == len(
+                order
+            ), (arch, tier, order)
+            assert tuple(order) == _runtime._single_launch_precedence(arch, tier)
+    assert _runtime._single_launch_precedence(arches[0], None) == ("le_class",)
+    with pytest.raises(ValueError, match="arch must be one of"):
+        _runtime._single_launch_precedence("sm_999x", "le128")
+    first = {
+        tier: {precedence[a][tier][0] if precedence[a][tier] else None for a in arches}
+        for tier in ("le128", "le2048")
+    }
+    # order-independent points
     assert _runtime.route_name("fp8", 1, 4096) == "fp8:q1:short"
-    assert _runtime.route_name("fp8", 130, 8192) == "fp8:partial:le768:short"
-    assert _runtime.route_name("fp8", 130, 8448) == "fp8:partial:le2048"
+    assert _runtime.route_name("fp8", 16, scan32 + 256) == "fp8:full:le16"
+    assert (
+        _runtime.route_name("fp8", 130, fused_2048_max_kv + 256) == "fp8:partial:le2048"
+    )
+    assert _runtime.route_name("fp8", 130, scan768 + 256) == "fp8:qle2048:short"
+    assert _runtime.route_name("fp8", 2049, 8192) == "fp8:partial:le768:short"
+    assert _runtime.route_name("fp8", 2049, scan768 + 256) == "fp8:partial:any"
+    # the fused Q <= 128 route is catalogued iff some architecture consults it before the le32 class (its bound is below the
+    # class's, so it has no domain behind the class); the fused Q <= 2048 route serves above the le768 class's bound either way
+    assert ("fp8:qle128:short" in routes) == ("qle" in first["le128"])
+    assert "fp8:qle2048:short" in routes
+    if first["le128"] == {
+        "le_class"
+    }:  # the v9 routing of Cake main (the classes first)
+        assert _runtime.route_name("fp8", 16, 4096) == "fp8:full:le32:short"
+        assert _runtime.route_name("fp8", 37, 4096) == "fp8:partial:le32:short"
+        assert _runtime.route_name("fp8", 16, scan32) == "fp8:full:le32:short"
+    elif first["le128"] == {"qle"}:
+        assert _runtime.route_name("fp8", 16, 4096) == "fp8:qle128:short"
+        assert (
+            _runtime.route_name("fp8", 16, fused_max_kv + 256) == "fp8:full:le32:short"
+        )
+    else:  # the architectures disagree on the tier's order: no logical route on it
+        with pytest.raises(ValueError, match="pass arch"):
+            _runtime.route_name("fp8", 16, 4096)
+    if first["le2048"] == {"le_class"}:
+        assert _runtime.route_name("fp8", 130, 8192) == "fp8:partial:le768:short"
+        assert _runtime.route_name("fp8", 132, 200) == "fp8:full:le768:short"
+    elif first["le2048"] == {"qle"}:
+        assert _runtime.route_name("fp8", 130, 8192) == "fp8:qle2048:short"
+        assert _runtime.route_name("fp8", 132, 200) == "fp8:qle2048:short"
+    else:
+        with pytest.raises(ValueError, match="pass arch"):
+            _runtime.route_name("fp8", 130, 8192)
     assert _runtime.dense_route_available(32, 16, 4096)
     assert _runtime.dense_route_available(32, 16, 1048832)
-    assert not _runtime.dense_route_available(32, 16, 4100)  # 32 heads: K % 256
+    # 32 heads: the K rule is each route record's, per architecture (FP4 256; an FP8 route 256, or 1 on the
+    # architectures where its programs take any K), with the record's kv_min (256 for the shipped two-stage
+    # programs and the v9 scan classes, whose KV boxes are fitted to one block; 1 for the fused tiered programs).
+    fp8_h32_alignment = _runtime.kv_alignment(32, "fp8")
+    assert fp8_h32_alignment in (1, 256) and _runtime.kv_alignment(32, "fp4") == 256
+    for route, record in routes.items():
+        assert sorted(record["kv_alignment"]) == arches, route
+        assert all(int(v) in (1, 256) for v in record["kv_alignment"].values()), route
+        assert int(record["kv_min"]) in (1, 256), route
+        if route.startswith("fp4"):
+            assert all(int(v) == 256 for v in record["kv_alignment"].values()), route
+        if route.startswith("fp8:h64"):
+            assert record["kv_min"] == 1
+            assert all(int(v) == 1 for v in record["kv_alignment"].values()), route
     for keys in (4096, 1048832):
         record = _runtime.route_record("fp8", 16, keys)
         assert record["num_heads"] == 32 and record["block_q"] == 4
-        assert record["clean_logits"] == "fused" and record["kv_alignment"] == 256
-    # A 32-head ``:short`` route is served everywhere (no per-arch admission).
-    for arch in sorted(_runtime._catalog()["arches"]):
-        served = _runtime.served_route("fp8", 16, 4096, arch=arch)
-        assert served == "fp8:full:le32:short"
+        assert record["clean_logits"] == "fused"
+        assert (
+            record["kv_alignment"]
+            == routes[_runtime.route_name("fp8", 16, keys)]["kv_alignment"]
+        )
+    for arch in arches:
+        assert _runtime.route_kv_alignment("fp8:full:le16", arch=arch) in (1, 256)
+        # A 32-head ``:short`` route is served everywhere (no per-arch admission); the K verdict is the served record's
+        assert _runtime.served_route("fp8", 16, 4096, arch=arch) == _runtime.route_name(
+            "fp8", 16, 4096
+        )
         assert _runtime.served_route("fp4", 7, 2048, arch=arch) == "fp4:le32:short"
         assert _runtime.dense_route_available(32, 7, 2048, "fp4", arch=arch)
+        for queries, keys in (
+            (16, 4100),
+            (16, 8196),
+            (37, 4137),
+            (1024, 33803),
+            (1024, fused_2048_max_kv + 13),
+            (132, 200),
+            (3, 100),
+        ):
+            served = _runtime.served_route("fp8", queries, keys, arch=arch)
+            record = routes[served]
+            expected = (
+                keys >= int(record["kv_min"])
+                and keys % int(record["kv_alignment"][arch]) == 0
+            )
+            assert (
+                _runtime.dense_route_available(32, queries, keys, arch=arch) == expected
+            ), (arch, queries, keys, served)
+        assert not _runtime.dense_route_available(
+            32, 16, 4100, precision="fp4", arch=arch
+        )
+        # below the route's smallest KV length nothing is served, whatever the divisor (a two-stage
+        # 32-head route: Q > 2048 above the le768 class's bound); the fused tiered routes' boxes may extend past the tensor (kv_min 1)
+        assert not _runtime.dense_route_available(32, 2052, 200, arch=arch)
+        # above the le768 class's bound a Q > 2048 call takes its two-stage tier route and the K verdict is that
+        # record's, per architecture: ``fp8:full:any`` takes any K on sm_100a and whole blocks on sm_103a;
+        # ``fp8:partial:any`` whole blocks everywhere, so the unaligned point is refused there on both
+        unaligned = scan768 + 13
+        tier_route = _runtime.served_route("fp8", 2052, unaligned, arch=arch)
+        assert tier_route == "fp8:full:any", (arch, tier_route)
+        whole = unaligned % int(routes[tier_route]["kv_alignment"][arch]) == 0
+        assert whole == (arch == "sm_100a"), arch
+        assert _runtime.dense_route_available(32, 2052, unaligned, arch=arch) == whole
+        assert (
+            _runtime.served_route("fp8", 2053, unaligned, arch=arch)
+            == "fp8:partial:any"
+        )
+        assert not _runtime.dense_route_available(32, 2053, unaligned, arch=arch)
+    # The single-launch fused Q <= 2048 route (and the fused Q <= 128 route where catalogued) takes any K (its KV boxes
+    # extend past the tensor) on every architecture; the two-launch Q >= 129 full class is admitted for any K on the
+    # architectures the producer measured a win on -- sm_100a -- and keeps whole 256-row blocks on sm_103a.
+    assert routes["fp8:qle2048:short"]["kv_min"] == 1
+    assert all(
+        int(v) == 1 for v in routes["fp8:qle2048:short"]["kv_alignment"].values()
+    )
+    if "fp8:qle128:short" in routes:
+        assert routes["fp8:qle128:short"]["kv_min"] == 1
+        assert all(
+            int(v) == 1 for v in routes["fp8:qle128:short"]["kv_alignment"].values()
+        )
+        assert _runtime.dense_route_available(32, 37, 4137, arch="sm_100a")
+        assert _runtime.dense_route_available(32, 37, 4137, arch="sm_103a")
+        assert _runtime.dense_route_available(32, 3, 100, arch="sm_103a")
+        assert _runtime.dense_route_available(32, 37, 4137)
+    else:  # the classes first: the q37 point is the le32 class's (whole blocks) on both architectures -> stock, no arch needed
+        for arch in arches:
+            assert not _runtime.dense_route_available(32, 37, 4137, arch=arch)
+            assert (
+                _runtime.served_route("fp8", 37, 4137, arch=arch)
+                == "fp8:partial:le32:short"
+            )
+        assert not _runtime.dense_route_available(32, 37, 4137)
+    assert _runtime.dense_route_available(32, 1024, 33803, arch="sm_100a")
+    assert _runtime.dense_route_available(32, 1024, 33803, arch="sm_103a")
+    assert _runtime.dense_route_available(32, 1024, 33792, arch="sm_103a")
+    assert _runtime.dense_route_available(
+        32, 1024, fused_2048_max_kv + 13, arch="sm_100a"
+    )
+    assert not _runtime.dense_route_available(
+        32, 1024, fused_2048_max_kv + 13, arch="sm_103a"
+    )
+    # Without ``arch`` the K verdict must agree across the architectures (no silent admit).
+    assert _runtime.dense_route_available(32, 1024, 33803)
+    with pytest.raises(ValueError, match="pass arch"):
+        _runtime.dense_route_available(32, 1024, fused_2048_max_kv + 13)
+    # inside the larger per-arch bound only: served on both arches, by the fused route where the bound covers K and by the
+    # two-launch full tier elsewhere (any K on sm_100a); no architecture-less verdict
+    band = min(bounds.values()) + 256
+    assert _runtime.route_name("fp8", 1024, band) == "fp8:qle2048:short"
+    assert (
+        _runtime.served_route("fp8", 1024, band, arch="sm_103a") == "fp8:qle2048:short"
+    )
+    assert _runtime.served_route("fp8", 1024, band, arch="sm_100a") == "fp8:full:le2048"
+    assert _runtime.dense_route_available(32, 1024, band, arch="sm_103a")
+    assert _runtime.dense_route_available(32, 1024, band, arch="sm_100a")
+    assert (
+        _runtime.route_record("fp8", 1024, band, arch="sm_103a")["stages"]
+        == routes["fp8:qle2048:short"]["stages"]
+    )
+    assert (
+        _runtime.route_record("fp8", 1024, band, arch="sm_100a")["stages"]
+        == routes["fp8:full:le2048"]["stages"]
+    )
+    with pytest.raises(ValueError, match="pass arch"):
+        _runtime.dense_route_available(32, 1024, band)
+    with pytest.raises(ValueError, match="pass arch"):
+        _runtime.route_record("fp8", 1024, band)
+    with pytest.raises(ValueError, match="pass arch"):
+        _runtime.route_kv_alignment("fp8:full:le2048")
+    assert _runtime.route_kv_alignment("fp8:full:le2048", arch="sm_100a") == 1
+    assert _runtime.route_kv_alignment("fp8:full:le2048", arch="sm_103a") == 256
+    assert _runtime.route_kv_alignment("fp8:full:le128", arch="sm_100a") == 256
+    assert _runtime.route_kv_alignment("fp8:partial:le2048", arch="sm_100a") == 256
+    record = _runtime.route_record("fp8", 16, 32768)
+    assert record["num_heads"] == 32 and record["block_q"] == 4
+    assert (
+        record["clean_logits"] == "fused"
+        and record["kv_alignment"]
+        == routes[_runtime.route_name("fp8", 16, 32768)]["kv_alignment"]
+    )
+    # an aligned le128-tier point is served (and has a record) under either order; its text is single-launch either way
+    served = _runtime.served_route("fp8", 37, 4096, arch="sm_100a")
+    single = _runtime.route_record("fp8", 37, 4096, arch="sm_100a")
+    assert (
+        single["clean_logits"] == "fused"
+        and single["stages"] == routes[served]["stages"]
+    )
+    assert [stage for stage, _p in single["stages"]] == ["logits"]
+    assert served in ("fp8:partial:le32:short", "fp8:qle128:short")
+    fused_2048 = _runtime.route_record("fp8", 1024, 33803, arch="sm_103a")
+    assert (
+        fused_2048["clean_logits"] == "fused"
+        and fused_2048["stages"] == routes["fp8:qle2048:short"]["stages"]
+    )
+    assert [stage for stage, _p in fused_2048["stages"]] == ["logits"]
+    assert _runtime.route_record("fp4", 16, 4096)["kv_alignment"] == {
+        a: 256 for a in arches
+    }
     if 64 in _runtime.heads():
         assert _runtime.block_q(64) == 2
         assert _runtime.route_name("fp8", 16, 4096, 64) == "fp8:h64:full:le64"
@@ -514,7 +929,8 @@ def test_dense_route_table_is_catalog_driven():
             r for r in _runtime._catalog()["routes"] if r.startswith("fp8:h64:")
         )
         record = _runtime._catalog()["routes"][h64_route]
-        assert record["clean_logits"] == "raw" and record["kv_alignment"] == 1
+        assert record["clean_logits"] == "raw" and record["kv_min"] == 1
+        assert all(int(v) == 1 for v in record["kv_alignment"].values())
         assert [stage for stage, _p in record["stages"]] == ["logits"]
         # Only tiers admitted on at least one architecture have a record (and programs); a route withheld
         # everywhere is absent from the table. Every catalogued 64-head route is a single logits stage whose
@@ -552,6 +968,10 @@ def test_dense_route_table_is_catalog_driven():
         (128, 4096, 32),
         (37, 4100, 64),
         (1, 8192, 64),
+        # 32-head unaligned K (served only when the catalog publishes kv_alignment.fp8.32 == 1; skipped otherwise)
+        (37, 4137, 32),
+        (5, 300, 32),
+        (3, 100, 32),
     ],
 )
 def test_fp8_mqa_logits_one_shot(queries, keys, heads):
@@ -677,12 +1097,56 @@ def test_fp8_mqa_logits_graph_replay(queries, keys, heads):
     assert torch.equal(captured, changed) and not torch.equal(captured, eager)
 
 
+_LADDER = re.compile(
+    r"^#(?:el)?if (.+)\n#define CAKE_PROGRAM_KERNEL (\w+)(?:\n#define CAKE_PROGRAM_SHIM (\w+))?",
+    re.MULTILINE,
+)
+
+
+def _program_identity(kernel_text, binding_text, definitions):
+    """``(kernel symbol, host-shim namespace)`` a JIT module built from the two units with
+    ``definitions`` exports: the literal names of a per-route text, or the branch of a shared
+    text's program-identity ladder whose ``MACRO == value`` conjunction holds for exactly these
+    definitions (one branch in the kernel and one in the binding, naming the same kernel)."""
+
+    def select(text, what):
+        branches = _LADDER.findall(text)
+        if not branches:
+            return None
+        hits = [
+            (kernel, shim)
+            for condition, kernel, shim in branches
+            if {k: int(v) for k, v in re.findall(r"(\w+) == (\d+)", condition)}
+            == definitions
+        ]
+        assert len(hits) == 1, (what, definitions, hits)
+        return hits[0]
+
+    kernel, binding = select(kernel_text, "kernel"), select(binding_text, "binding")
+    if kernel is None and binding is None:
+        symbol = re.search(r"^(kernel_cake_\w+)\(", kernel_text, re.MULTILINE).group(1)
+        shim = re.search(
+            r"^namespace (cake_host_shim_[0-9a-f]{16}) \{", binding_text, re.MULTILINE
+        ).group(1)
+        return symbol, shim
+    assert kernel is not None and binding is not None and kernel[0] == binding[0], (
+        kernel,
+        binding,
+    )
+    return binding
+
+
 def test_catalog_programs_are_delivered_and_distinct():
-    """Host-only: every program a dense or paged route names is catalogued, its generated units exist
-    under FlashInfer's ``csrc`` (a module: its own ``<name>_kernel.cu`` + ``<name>_binding.cu``; a
-    sequence: >= 2 module kernels + its own binding), no two generated kernel units are byte-identical
-    and no generated unit is unreferenced -- a route table pointing at a program hash whose units were
-    regenerated under a new hash fails here, not at JIT build time."""
+    """Host-only: every program a dense or paged route names is catalogued on exactly the architectures
+    the route is delivered on, its generated units exist under FlashInfer's ``csrc`` (a module: its own
+    ``<name>_kernel.cu`` + ``<name>_binding.cu``; a sequence: >= 2 kernels + its own binding),
+    no two generated kernel units are byte-identical, a module record built from a shared parameterised
+    text (``fixed_definitions``) names that text's units, which guard exactly those definitions, no two
+    records build one text with the same definitions, and no generated unit is unreferenced -- a route
+    table pointing at a program hash whose units were regenerated under a new hash fails here, not at
+    JIT build time.  Every standalone module exports its own kernel symbol and host-shim namespace
+    (a shared text selects the per-program names for each definition set through its
+    program-identity ladder)."""
     import hashlib
 
     from flashinfer.jit import env
@@ -691,11 +1155,23 @@ def test_catalog_programs_are_delivered_and_distinct():
     catalog = _runtime._catalog()
     programs = catalog["programs"]
     generated = "csrc/experimental/deepgemm_dense_mqa/generated"
+    # A window-selected text route is delivered only on the architectures whose window
+    # table names it (``policy.paged.dynamic_scheduler.static_window_routes``); every
+    # other route binds a program on every catalogued architecture.
+    text_route_arches = {}
+    for arch, table in catalog["policy"]["paged"]["dynamic_scheduler"][
+        "static_window_routes"
+    ].items():
+        for pairs in table.values():
+            for _window, named in pairs:
+                text_route_arches.setdefault(named, set()).add(arch)
     for table in ("routes", "paged_routes"):
         for route, record in catalog.get(table, {}).items():
-            for _stage, by_arch in record["stages"]:
-                where = (table, route, by_arch)
-                assert sorted(by_arch) == sorted(catalog["arches"]), where
+            expected = sorted(text_route_arches.get(route, catalog["arches"]))
+            for stage in record["stages"]:
+                by_arch = _runtime.stage_programs(stage, catalog["arches"])
+                where = (table, route, by_arch, expected)
+                assert sorted(by_arch) == expected, where
                 for arch, program in by_arch.items():
                     where = (table, route, arch, program)
                     assert program in programs, where
@@ -704,23 +1180,49 @@ def test_catalog_programs_are_delivered_and_distinct():
                 table,
                 route,
             )
-    referenced, kernels = set(), {}
+    referenced, kernels, instances, identities = set(), {}, {}, {}
     for name, record in programs.items():
         for source in record["sources"]:
             assert source.startswith("csrc/"), (name, source)
             assert (csrc / source.removeprefix("csrc/")).is_file(), (name, source)
             referenced.add(source)
-        if record.get(
-            "standalone", True
-        ):  # an omitted-binding module carries no closure digest
-            for arch in record["arches"]:
-                assert arch in (record.get("closure_sha256") or {}), (name, arch)
         if record["kind"] == "module":
-            expected = {f"{generated}/{name}_kernel.cu"}
+            fixed = record.get("fixed_definitions", {})
+            text = name
+            if fixed:
+                text = record["sources"][0].rsplit("/", 1)[1].removesuffix("_kernel.cu")
+            expected = {f"{generated}/{text}_kernel.cu"}
             if record["standalone"]:
-                expected.add(f"{generated}/{name}_binding.cu")
+                expected.add(f"{generated}/{text}_binding.cu")
             assert set(record["sources"]) == expected, (name, record["sources"])
-            kernels[f"{generated}/{name}_kernel.cu"] = name
+            kernel = f"{generated}/{text}_kernel.cu"
+            # The text requires exactly the definitions the record fixes (its
+            # ``#ifndef`` guards beyond the runtime-supplied ``SM_COUNT``) and no
+            # two records build one text with the same definitions.
+            guarded = set(
+                re.findall(
+                    r"^#ifndef (\w+)$",
+                    (csrc / kernel.removeprefix("csrc/")).read_text(),
+                    re.MULTILINE,
+                )
+            )
+            assert guarded - {"SM_COUNT"} == set(fixed), (name, guarded)
+            instance = (kernel, tuple(sorted(fixed.items())))
+            assert instance not in instances, (
+                f"{name} builds {text} with {instances[instance]}'s definitions"
+            )
+            instances[instance] = name
+            kernels[kernel] = text
+            if record["standalone"]:
+                identity = _program_identity(
+                    (csrc / kernel.removeprefix("csrc/")).read_text(),
+                    (
+                        csrc / f"{generated}/{text}_binding.cu".removeprefix("csrc/")
+                    ).read_text(),
+                    fixed,
+                )
+                assert identity not in identities.values(), (name, identity)
+                identities[name] = identity
         else:
             assert record["kind"] == "sequence", name
             devices = [s for s in record["sources"] if s.endswith("_kernel.cu")]
@@ -729,8 +1231,7 @@ def test_catalog_programs_are_delivered_and_distinct():
                 and f"{generated}/{name}_binding.cu" in record["sources"]
             ), name
             for device in devices:
-                owner = device.rsplit("/", 1)[1].removesuffix("_kernel.cu")
-                assert programs.get(owner, {}).get("kind") == "module", (name, device)
+                kernels.setdefault(device, name)
     digests = {}
     for source, name in sorted(kernels.items()):
         digest = hashlib.sha256(
@@ -811,13 +1312,28 @@ def test_h64_admission_matches_the_catalog_table():
             route = _runtime.route_name("fp8", queries, max_kv, 64)
             assert not route.endswith(":short")
         assert not _runtime.route_name("fp8", 3, max_kv + 1, 64).endswith(":short")
-        # 32 heads never take the 64-head one-split route: at this KV length Q = 37 is the 32-head
-        # in-kernel scan class (v9 ``fp8:partial:le32:short``); above that class's policy bound the
-        # metadata + logits pair serves it.
-        route32 = _runtime.route_name("fp8", 37, max_kv, 32)
-        assert route32 == "fp8:partial:le32:short", route32
+        # 32 heads never take the 64-head one-split route: at this KV length a 32-head call takes its
+        # single-launch route -- the v9 in-kernel scan class of its query count, or the r3 fused tiered
+        # text where the published order of its tier puts that family first; above the le32 class's
+        # policy bound the metadata + logits pair serves Q = 37; above Q = 3072 no scan class applies.
+        order = _runtime._single_launch_precedence(arch, "le128")
+        route32 = _runtime.served_route("fp8", 37, max_kv, 32, arch=arch)
+        assert route32 == (
+            "fp8:qle128:short"
+            if order and order[0] == "qle"
+            else "fp8:partial:le32:short"
+        ), route32
+        order = _runtime._single_launch_precedence(arch, "le2048")
+        route32 = _runtime.served_route("fp8", 129, max_kv, 32, arch=arch)
+        assert route32 == (
+            "fp8:qle2048:short"
+            if order and order[0] == "qle"
+            else "fp8:partial:le768:short"
+        ), route32
+        assert _runtime.route_name("fp8", 2049, max_kv, 32) == "fp8:partial:le768:short"
         above32 = int(catalog["policy"]["fused_scan32_max_kv"]) + 256
         assert not _runtime.route_name("fp8", 37, above32, 32).endswith(":short")
+        assert not _runtime.route_name("fp8", 3073, max_kv, 32).endswith(":short")
     for route, outcomes in verdicts.items():
         if len(outcomes) == 1:
             assert (
@@ -833,31 +1349,41 @@ def test_h64_admission_matches_the_catalog_table():
 
 def _route_point(route_name, record):
     """A legal ``(queries, keys)`` of one dense route: the KV length that selects the
-    route's KV range (``:short`` routes below their class's bound, a 32-head
-    two-launch route at the first KV length above the single-launch bound that
-    would otherwise own the query count, the 64-head routes any length) and the
-    smallest query count the router maps to the route name."""
+    route's KV range (``:short`` routes below their class's bound -- or, for the
+    family consulted second on its overlap tier, the first KV length above the
+    bound of the family ahead of it -- a 32-head two-launch route at the first KV
+    length above every single-launch bound that would otherwise own the query
+    count, the 64-head routes any length) and the smallest query count the router
+    maps to the route name."""
     policy = _runtime._catalog()["policy"]
     precision = route_name.split(":")[0]
     num_heads = int(record["num_heads"])
-    if route_name.endswith(":short"):
-        # 32 heads: the single-launch routes below their KV bound; 64 heads: the one-split routes at K <= dense_short.max_kv
-        short_kv = int(policy["dense_short"]["max_kv"])
-        candidates = [512 if num_heads == _runtime.NUM_HEADS else short_kv]
-    elif num_heads == _runtime.NUM_HEADS:
-        # the two-launch pairs: 256 past each single-launch bound of the precision
+    if num_heads == _runtime.NUM_HEADS:
+        # every single-launch bound of the precision: a route is reached at 512 or 256 past one of them
         table = policy if precision == "fp8" else policy["fp4"]
         bounds = [int(table["fused_q1_max_kv"])]
-        if precision == "fp8":
-            bounds.append(int(policy["fused_q128_max_kv"]))
         for ceiling in table["fused_scan_ceilings"]:
             bounds.append(int(table[f"fused_scan{int(ceiling)}_max_kv"]))
+        if precision == "fp8":
+            bounds.append(int(policy["fused_q128_max_kv"]))
+            bounds.append(int(policy["fused_qle128_max_kv"]))
+            bounds.extend(int(v) for v in policy["fused_qle2048_max_kv"].values())
         candidates = [512] + sorted({bound + 256 for bound in bounds})
+    elif route_name.endswith(":short"):
+        # the 64-head one-split routes at K <= dense_short.max_kv
+        candidates = [int(policy["dense_short"]["max_kv"])]
     else:
         candidates = [300]
     for keys in candidates:
         for queries in range(1, 4200):
-            if _runtime.route_name(precision, queries, keys, num_heads) == route_name:
+            try:
+                found = (
+                    _runtime.route_name(precision, queries, keys, num_heads)
+                    == route_name
+                )
+            except ValueError:  # no logical route at this point (the architectures' orders differ on its tier)
+                continue
+            if found:
                 return queries, keys
     raise AssertionError(
         f"no query count in 1..4199 selects {route_name} at K in {candidates}"
@@ -927,9 +1453,11 @@ def test_dense_bindings_cover_every_program_argument():
         else:
             # Every program a stage launches on any architecture binds the same way.
             selections = [
-                (stage, program)
-                for stage, by_arch in record["stages"]
-                for program in sorted(set(by_arch.values()))
+                (stage[0], program)
+                for stage in record["stages"]
+                for program in sorted(
+                    set(_runtime.stage_programs(stage, catalog["arches"]).values())
+                )
             ]
         for stage, program in selections:
             missing = []

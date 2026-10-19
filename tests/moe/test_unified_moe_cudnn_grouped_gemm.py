@@ -1087,6 +1087,21 @@ def test_cudnn_autotune_and_cuda_graph_replay(key):
     _autotune_and_graph(runner, case, cache_name=f"test_unified_moe_{key}")
 
 
+@pytest.mark.parametrize("key", _BLOCK_SCALE_FAMILY_PARAMS)
+def test_cudnn_block_scale_graphs_across_token_buckets(key):
+    """Scale storage stays live through tuning and graph replay at a new bucket."""
+    family = _FAMILIES[key]
+    torch.manual_seed(41)
+    first = _make_case(family, 1, 8, 2, 4096, 14336)
+    runner = _layer(first).runners[0]
+    _autotune_and_graph(runner, first, cache_name=f"test_block_scale_bucket_{key}_1")
+    for tokens in (4, 16):
+        case = _make_case(family, tokens, 8, 2, 4096, 14336, shared=first)
+        _autotune_and_graph(
+            runner, case, cache_name=f"test_block_scale_bucket_{key}_{tokens}"
+        )
+
+
 @pytest.mark.parametrize("key", _FAMILY_PARAMS)
 def test_cudnn_moe_layer_autotunes_and_caches_a_winner_per_bucket(key):
     family = _FAMILIES[key]
