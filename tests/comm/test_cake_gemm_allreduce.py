@@ -19,7 +19,8 @@ The route table and workspace arithmetic are checked without a GPU.  The multi-r
 (``torch.multiprocessing.spawn``) on an SM100 / SM103 node with MNNVL fabric memory, creates FlashInfer's own MNNVL
 all-reduce fusion workspace, and compares the fused kernel against the NCCL fp32 all-reduce of the bf16-rounded local
 partials (the production chain's semantics) at ``atol = rtol = 1e-2``, requiring the output to be bitwise identical on
-every rank, across M = 1 ... 128, a relaunch, and the PDL launch.
+every rank, across one-shot rows, full and partial two-shot tiles and a multi-tile M (M = 1 ... 200), a relaunch, and
+the PDL launch.
 """
 
 from __future__ import annotations
@@ -37,7 +38,9 @@ from flashinfer.jit import cake_gemm_allreduce as loader
 
 HIDDEN = 7168
 K_SHARD = 1536
-TOKENS = (1, 8, 16, 32, 64, 128)
+# One-shot rows (<= 16), two-shot full tiles, two-shot partial tiles (17 -> 32-token tile, 100 -> 128-token tile,
+# masked output tail) and a multi-tile M (200: 128-token tile, grid.y = 2).
+TOKENS = (1, 8, 16, 17, 32, 64, 100, 128, 200)
 
 
 @pytest.mark.parametrize(
@@ -268,9 +271,14 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 
 
 @pytest.mark.parametrize("world_size", [2, 4, 8])
-def test_fused_gemm_allreduce_matches_the_all_reduced_partials(world_size: int) -> None:
+def test_fused_gemm_allreduce_matches_the_all_reduced_partials(
+    world_size: int, monkeypatch
+) -> None:
     reason = _supported_platform(world_size)
     if reason is not None:
         pytest.skip(reason)
-    os.environ.setdefault("FLASHINFER_CUDA_ARCH_LIST", "10.0a 10.3a")
+    if (
+        "FLASHINFER_CUDA_ARCH_LIST" not in os.environ
+    ):  # scoped to this test; the spawned workers inherit it
+        monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.0a 10.3a")
     mp.spawn(_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)

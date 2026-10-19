@@ -41,12 +41,10 @@ import torch
 from ..jit.cake_gemm_allreduce import (
     COLUMN_TILE,
     K_MULTIPLE,
-    SUPPORTED_CAPABILITIES,
     WORLD_SIZES,
     required_workspace_bytes,
     run_cake_gemm_allreduce,
     select_route,
-    supported_capability,
 )
 
 __all__ = [
@@ -155,15 +153,6 @@ def cake_gemm_allreduce(
         )
     if not 0 <= rank < world_size:
         raise ValueError(f"workspace rank {rank} is outside [0, {world_size})")
-    capability = tuple(torch.cuda.get_device_capability(x.device))
-    if (
-        capability not in SUPPORTED_CAPABILITIES
-        or supported_capability(capability) is None
-    ):
-        raise ValueError(
-            "cake_gemm_allreduce needs an SM100 / SM103 device built into FLASHINFER_CUDA_ARCH_LIST, "
-            f"got compute capability {capability[0]}.{capability[1]}"
-        )
     token_tile, twoshot = select_route(m)
     needed = required_workspace_bytes(m, n, world_size)
     if int(workspace.buffer_size_bytes) < needed:

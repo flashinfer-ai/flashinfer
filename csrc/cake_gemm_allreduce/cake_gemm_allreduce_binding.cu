@@ -17,7 +17,7 @@
 // Lamport all-reduce (``cake_gemm_allreduce_kernels.cu``, compiled into this translation unit).  Routes: world size
 // 2 / 4 / 8 x token tile 16 (one-shot) / 32 / 64 / 128 (two-shot); the caller picks the route (``select_route`` in
 // ``flashinfer/jit/cake_gemm_allreduce.py``) and this launcher encodes the two K-major SWIZZLE_128B tensor maps
-// exactly as the Cake runtime does, sets the kernel's dynamic shared memory once, and launches on the tvm-ffi
+// exactly as the Cake runtime does, sets the kernel's dynamic shared memory once per device, and launches on the tvm-ffi
 // environment stream, optionally with the programmatic-dependent-launch attribute.
 // Generated file; do not edit manually.
 #include <cuda.h>
@@ -62,7 +62,10 @@ static const Route kRoutes[] = {
     {8, 128, 1, reinterpret_cast<const void*>(&kernel_cake_blackwell_gemm_allreduce_twoshot_n128_bf16_ws8), 214528, "kernel_cake_blackwell_gemm_allreduce_twoshot_n128_bf16_ws8"},
 };
 static constexpr int kRouteCount = sizeof(kRoutes) / sizeof(kRoutes[0]);
-static std::once_flag g_smem_once[kRouteCount];
+// cudaFuncSetAttribute applies to the current device's context, so the opt-in is recorded per (device, route): a
+// process that drives several GPUs must set it on each of them.
+static constexpr int kMaxDevices = 64;
+static std::once_flag g_smem_once[kMaxDevices][kRouteCount];
 
 inline PFN_cuTensorMapEncodeTiled_v12000 EncodeTiledFn() {
   static PFN_cuTensorMapEncodeTiled_v12000 fn = [] {
@@ -152,7 +155,9 @@ void Run(TensorView x, TensorView w, TensorView out, int64_t mc_ptr, int64_t uc_
 
   const int route = RouteIndex(world_size, token_tile, twoshot);
   const Route& r = kRoutes[route];
-  std::call_once(g_smem_once[route], [&] {
+  TVM_FFI_CHECK(dev.device_id >= 0 && dev.device_id < kMaxDevices, ValueError)
+      << "device id " << dev.device_id << " is outside [0, " << kMaxDevices << ")";
+  std::call_once(g_smem_once[dev.device_id][route], [&] {
     const cudaError_t status =
         cudaFuncSetAttribute(r.kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, r.dynamic_smem_bytes);
     TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
