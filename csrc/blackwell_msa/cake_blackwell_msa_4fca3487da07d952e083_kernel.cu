@@ -23,7 +23,11 @@
 #define TMEM_SCORES1_OFFSET 128
 #define TMEM_OUTPUT0_OFFSET 256
 #define TMEM_OUTPUT1_OFFSET 384
+#if __CUDA_ARCH__ == 1000
 #define NUM_DECODE_KV_STAGES 4
+#else
+#define NUM_DECODE_KV_STAGES 8
+#endif
 #define NUM_P_STORE_ORDER_STAGES 1
 #define SMEM_SMEM_Q_OFF 1024
 #define SMEM_SMEM_Q_STAGE_BYTES 16384
@@ -34,15 +38,14 @@
 #define SMEM_SMEM_V_OFF 17408
 #define SMEM_SMEM_V_STAGE_BYTES 16384
 #define SMEM_SMEM_V_STRIDE 16384
-#define SMEM_SMEM_NVFP4_DATA_OFF 82944
-#define SMEM_SMEM_NVFP4_DATA_STAGE_BYTES 8192
-#define SMEM_SMEM_NVFP4_DATA_STRIDE 8192
-#define SMEM_SMEM_NVFP4_SCALE_OFF 115712
-#define SMEM_SMEM_NVFP4_SCALE_STAGE_BYTES 1024
-#define SMEM_SMEM_NVFP4_SCALE_STRIDE 1024
 #define SMEM_SMEM_PAGE_INDICES_OFF 148480
+#if __CUDA_ARCH__ == 1000
 #define SMEM_SMEM_PAGE_INDICES_STAGE_BYTES 2048
 #define SMEM_SMEM_PAGE_INDICES_STRIDE 2048
+#else
+#define SMEM_SMEM_PAGE_INDICES_STAGE_BYTES 4096
+#define SMEM_SMEM_PAGE_INDICES_STRIDE 4096
+#endif
 #define SMEM_SMEM_ACC_SCALE_OFF 152576
 #define SMEM_SMEM_ACC_SCALE_STAGE_BYTES 2048
 #define SMEM_SMEM_ACC_SCALE_STRIDE 2048
@@ -83,6 +86,7 @@ kernel_cake_blackwell_msa_4fca3487da07d952e083(const __grid_constant__ CUtensorM
     #define q_full_addr (mbar_base + 0)
     #define q_empty_addr (mbar_base + 8)
     #define kv_full_addr (mbar_base + 16)
+#if __CUDA_ARCH__ == 1000
     #define kv_raw_full_addr (mbar_base + 48)
     #define kv_empty_addr (mbar_base + 80)
     #define s_full_addr (mbar_base + 112)
@@ -94,6 +98,19 @@ kernel_cake_blackwell_msa_4fca3487da07d952e083(const __grid_constant__ CUtensorM
     #define p_free_addr (mbar_base + 184)
     #define softmax_done_addr (mbar_base + 200)
     #define decode_done_addr (mbar_base + 216)
+#else
+    #define kv_raw_full_addr (mbar_base + 80)
+    #define kv_empty_addr (mbar_base + 144)
+    #define s_full_addr (mbar_base + 208)
+    #define p_full_addr (mbar_base + 224)
+    #define corr_sig_addr (mbar_base + 240)
+    #define p_store_turn0_addr (mbar_base + 256)
+    #define p_store_turn1_addr (mbar_base + 264)
+    #define o_full_addr (mbar_base + 272)
+    #define p_free_addr (mbar_base + 280)
+    #define softmax_done_addr (mbar_base + 296)
+    #define decode_done_addr (mbar_base + 312)
+#endif
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -107,10 +124,6 @@ kernel_cake_blackwell_msa_4fca3487da07d952e083(const __grid_constant__ CUtensorM
     const int smem_kv_addr = smem + SMEM_SMEM_KV_OFF;
     uint8_t* smem_v = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_V_OFF);
     const int smem_v_addr = smem + SMEM_SMEM_V_OFF;
-    uint8_t* smem_nvfp4_data = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_NVFP4_DATA_OFF);
-    const int smem_nvfp4_data_addr = smem + SMEM_SMEM_NVFP4_DATA_OFF;
-    uint8_t* smem_nvfp4_scale = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_NVFP4_SCALE_OFF);
-    const int smem_nvfp4_scale_addr = smem + SMEM_SMEM_NVFP4_SCALE_OFF;
     int* smem_page_indices = reinterpret_cast<int*>(smem_raw + SMEM_SMEM_PAGE_INDICES_OFF);
     const int smem_page_indices_addr = smem + SMEM_SMEM_PAGE_INDICES_OFF;
     float* smem_acc_scale = reinterpret_cast<float*>(smem_raw + SMEM_SMEM_ACC_SCALE_OFF);
@@ -124,8 +137,13 @@ kernel_cake_blackwell_msa_4fca3487da07d952e083(const __grid_constant__ CUtensorM
     uint8_t* smem_p = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_P_OFF);
     const int smem_p_addr = smem + SMEM_SMEM_P_OFF;
 
+#if __CUDA_ARCH__ == 1000
     // Mbarrier init (14 pipeline groups, 0 ordered-sequence groups, 28 barriers)
     // Mbarriers at smem_raw[0..224)
+#else
+    // Mbarrier init (14 pipeline groups, 0 ordered-sequence groups, 40 barriers)
+    // Mbarriers at smem_raw[0..320)
+#endif
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -135,6 +153,7 @@ kernel_cake_blackwell_msa_4fca3487da07d952e083(const __grid_constant__ CUtensorM
             // q_empty: 1 barriers, init_count=1
             mbarrier_init(smem + 8, 1);
             // --- pipeline 'decode_kv' ---
+#if __CUDA_ARCH__ == 1000
             // kv_full: 4 barriers, init_count=1
             mbarrier_init(smem + 16, 1);
             mbarrier_init(smem + 24, 1);
@@ -173,6 +192,58 @@ kernel_cake_blackwell_msa_4fca3487da07d952e083(const __grid_constant__ CUtensorM
             mbarrier_init(smem + 208, 64);
             // decode_done: 1 barriers, init_count=128
             mbarrier_init(smem + 216, 128);
+#else
+            // kv_full: 8 barriers, init_count=1
+            mbarrier_init(smem + 16, 1);
+            mbarrier_init(smem + 24, 1);
+            mbarrier_init(smem + 32, 1);
+            mbarrier_init(smem + 40, 1);
+            mbarrier_init(smem + 48, 1);
+            mbarrier_init(smem + 56, 1);
+            mbarrier_init(smem + 64, 1);
+            mbarrier_init(smem + 72, 1);
+            // kv_raw_full: 8 barriers, init_count=1
+            mbarrier_init(smem + 80, 1);
+            mbarrier_init(smem + 88, 1);
+            mbarrier_init(smem + 96, 1);
+            mbarrier_init(smem + 104, 1);
+            mbarrier_init(smem + 112, 1);
+            mbarrier_init(smem + 120, 1);
+            mbarrier_init(smem + 128, 1);
+            mbarrier_init(smem + 136, 1);
+            // kv_empty: 8 barriers, init_count=1
+            mbarrier_init(smem + 144, 1);
+            mbarrier_init(smem + 152, 1);
+            mbarrier_init(smem + 160, 1);
+            mbarrier_init(smem + 168, 1);
+            mbarrier_init(smem + 176, 1);
+            mbarrier_init(smem + 184, 1);
+            mbarrier_init(smem + 192, 1);
+            mbarrier_init(smem + 200, 1);
+            // s_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 208, 1);
+            mbarrier_init(smem + 216, 1);
+            // p_full: 2 barriers, init_count=128
+            mbarrier_init(smem + 224, 128);
+            mbarrier_init(smem + 232, 128);
+            // corr_sig: 2 barriers, init_count=64
+            mbarrier_init(smem + 240, 64);
+            mbarrier_init(smem + 248, 64);
+            // p_store_turn0: 1 barriers, init_count=64
+            mbarrier_init(smem + 256, 64);
+            // p_store_turn1: 1 barriers, init_count=64
+            mbarrier_init(smem + 264, 64);
+            // o_full: 1 barriers, init_count=1
+            mbarrier_init(smem + 272, 1);
+            // p_free: 2 barriers, init_count=1
+            mbarrier_init(smem + 280, 1);
+            mbarrier_init(smem + 288, 1);
+            // softmax_done: 2 barriers, init_count=64
+            mbarrier_init(smem + 296, 64);
+            mbarrier_init(smem + 304, 64);
+            // decode_done: 1 barriers, init_count=128
+            mbarrier_init(smem + 312, 128);
+#endif
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -180,9 +251,17 @@ kernel_cake_blackwell_msa_4fca3487da07d952e083(const __grid_constant__ CUtensorM
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
+#if __CUDA_ARCH__ == 1000
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 224);
+#else
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 320);
+#endif
     if (warp == 0) {
+#if __CUDA_ARCH__ == 1000
         int _tmem_hold = smem + 224;
+#else
+        int _tmem_hold = smem + 320;
+#endif
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -729,7 +808,7 @@ kernel_cake_blackwell_msa_4fca3487da07d952e083(const __grid_constant__ CUtensorM
                             tma_3d_gmem2smem(smem_kv_addr + (unsigned int)(load_stage * 16384), (&K), 0, 0, page_head, kv_full_addr + (load_stage) * 8);
                         }
                         load_stage += 1;
-                        if (load_stage == 4) { load_stage = 0; load_phase ^= 1; }
+                        if (load_stage == NUM_DECODE_KV_STAGES) { load_stage = 0; load_phase ^= 1; }
                     }
                     #pragma unroll 1
                     for (int next_k_tile = 3; next_k_tile < 16; next_k_tile++) {
@@ -741,7 +820,7 @@ kernel_cake_blackwell_msa_4fca3487da07d952e083(const __grid_constant__ CUtensorM
                             tma_3d_gmem2smem(smem_kv_addr + (unsigned int)(load_stage * 16384), (&V), 0, 0, v_page_head, kv_full_addr + (load_stage) * 8);
                         }
                         load_stage += 1;
-                        if (load_stage == 4) { load_stage = 0; load_phase ^= 1; }
+                        if (load_stage == NUM_DECODE_KV_STAGES) { load_stage = 0; load_phase ^= 1; }
                         int selected_position_1 = 15 - split_l * 16 - next_k_tile;
                         int next_token_base = 0;
                         int next_page_head = 0;
@@ -796,7 +875,7 @@ kernel_cake_blackwell_msa_4fca3487da07d952e083(const __grid_constant__ CUtensorM
                             tma_3d_gmem2smem(smem_kv_addr + (unsigned int)(load_stage * 16384), (&K), 0, 0, next_page_head, kv_full_addr + (load_stage) * 8);
                         }
                         load_stage += 1;
-                        if (load_stage == 4) { load_stage = 0; load_phase ^= 1; }
+                        if (load_stage == NUM_DECODE_KV_STAGES) { load_stage = 0; load_phase ^= 1; }
                     }
                     #pragma unroll
                     for (int v_tile_1 = 13; v_tile_1 < 16; v_tile_1++) {
@@ -807,7 +886,7 @@ kernel_cake_blackwell_msa_4fca3487da07d952e083(const __grid_constant__ CUtensorM
                             tma_3d_gmem2smem(smem_kv_addr + (unsigned int)(load_stage * 16384), (&V), 0, 0, v_page_head_1, kv_full_addr + (load_stage) * 8);
                         }
                         load_stage += 1;
-                        if (load_stage == 4) { load_stage = 0; load_phase ^= 1; }
+                        if (load_stage == NUM_DECODE_KV_STAGES) { load_stage = 0; load_phase ^= 1; }
                     }
                 }
             }
@@ -856,7 +935,7 @@ kernel_cake_blackwell_msa_4fca3487da07d952e083(const __grid_constant__ CUtensorM
                 elect_commit(s_full_addr);
                 elect_commit(kv_empty_addr + (kv_stage_m) * 8);
                 kv_stage_m += 1;
-                if (kv_stage_m == 4) { kv_stage_m = 0; kv_phase_m ^= 1; }
+                if (kv_stage_m == NUM_DECODE_KV_STAGES) { kv_stage_m = 0; kv_phase_m ^= 1; }
                 mbarrier_wait(kv_full_addr + (kv_stage_m) * 8, kv_phase_m);
                 int _mma_b_lo_1 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (kv_stage_m) * 1024);
                 {
@@ -884,7 +963,7 @@ kernel_cake_blackwell_msa_4fca3487da07d952e083(const __grid_constant__ CUtensorM
                 elect_commit(s_full_addr + 8);
                 elect_commit(kv_empty_addr + (kv_stage_m) * 8);
                 kv_stage_m += 1;
-                if (kv_stage_m == 4) { kv_stage_m = 0; kv_phase_m ^= 1; }
+                if (kv_stage_m == NUM_DECODE_KV_STAGES) { kv_stage_m = 0; kv_phase_m ^= 1; }
                 int item_m = (work_idx_m - (unsigned int)blockIdx.x) / (unsigned int)gridDim.x;
                 mbarrier_wait(decode_done_addr, (item_m + 1) % 2);
                 #pragma unroll 1
@@ -920,7 +999,7 @@ kernel_cake_blackwell_msa_4fca3487da07d952e083(const __grid_constant__ CUtensorM
                     elect_commit(s_full_addr);
                     elect_commit(kv_empty_addr + (kv_stage_m) * 8);
                     kv_stage_m += 1;
-                    if (kv_stage_m == 4) { kv_stage_m = 0; kv_phase_m ^= 1; }
+                    if (kv_stage_m == NUM_DECODE_KV_STAGES) { kv_stage_m = 0; kv_phase_m ^= 1; }
                     mbarrier_wait(kv_full_addr + (kv_stage_m) * 8, kv_phase_m);
                     int _mma_a_lo_3 = make_warp_uniform((((smem_p_addr) >> 4) & 0x3FFF) + (0) * 1024);
                     int _mma_b_lo_3 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (kv_stage_m) * 1024);
@@ -949,7 +1028,7 @@ kernel_cake_blackwell_msa_4fca3487da07d952e083(const __grid_constant__ CUtensorM
                     elect_commit(kv_empty_addr + (kv_stage_m) * 8);
                     elect_commit(p_free_addr);
                     kv_stage_m += 1;
-                    if (kv_stage_m == 4) { kv_stage_m = 0; kv_phase_m ^= 1; }
+                    if (kv_stage_m == NUM_DECODE_KV_STAGES) { kv_stage_m = 0; kv_phase_m ^= 1; }
                     mbarrier_wait(kv_full_addr + (kv_stage_m) * 8, kv_phase_m);
                     mbarrier_wait(p_full_addr + 8, _phase_p_full_1);
                     _phase_p_full_1 ^= 1;
@@ -984,7 +1063,7 @@ kernel_cake_blackwell_msa_4fca3487da07d952e083(const __grid_constant__ CUtensorM
                     }
                     elect_commit(kv_empty_addr + (kv_stage_m) * 8);
                     kv_stage_m += 1;
-                    if (kv_stage_m == 4) { kv_stage_m = 0; kv_phase_m ^= 1; }
+                    if (kv_stage_m == NUM_DECODE_KV_STAGES) { kv_stage_m = 0; kv_phase_m ^= 1; }
                     mbarrier_wait(kv_full_addr + (kv_stage_m) * 8, kv_phase_m);
                     int _mma_a_lo_5 = make_warp_uniform((((smem_p_addr) >> 4) & 0x3FFF) + (1) * 1024);
                     int _mma_b_lo_5 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (kv_stage_m) * 1024);
@@ -1013,7 +1092,7 @@ kernel_cake_blackwell_msa_4fca3487da07d952e083(const __grid_constant__ CUtensorM
                     elect_commit(kv_empty_addr + (kv_stage_m) * 8);
                     elect_commit(p_free_addr + 8);
                     kv_stage_m += 1;
-                    if (kv_stage_m == 4) { kv_stage_m = 0; kv_phase_m ^= 1; }
+                    if (kv_stage_m == NUM_DECODE_KV_STAGES) { kv_stage_m = 0; kv_phase_m ^= 1; }
                     first_pv0 = 0;
                     first_pv1 = 0;
                 }
@@ -1048,7 +1127,7 @@ kernel_cake_blackwell_msa_4fca3487da07d952e083(const __grid_constant__ CUtensorM
                 elect_commit(kv_empty_addr + (kv_stage_m) * 8);
                 elect_commit(p_free_addr);
                 kv_stage_m += 1;
-                if (kv_stage_m == 4) { kv_stage_m = 0; kv_phase_m ^= 1; }
+                if (kv_stage_m == NUM_DECODE_KV_STAGES) { kv_stage_m = 0; kv_phase_m ^= 1; }
                 mbarrier_wait(kv_full_addr + (kv_stage_m) * 8, kv_phase_m);
                 mbarrier_wait(p_full_addr + 8, _phase_p_full_1);
                 _phase_p_full_1 ^= 1;
@@ -1080,7 +1159,7 @@ kernel_cake_blackwell_msa_4fca3487da07d952e083(const __grid_constant__ CUtensorM
                 elect_commit(kv_empty_addr + (kv_stage_m) * 8);
                 elect_commit(p_free_addr + 8);
                 kv_stage_m += 1;
-                if (kv_stage_m == 4) { kv_stage_m = 0; kv_phase_m ^= 1; }
+                if (kv_stage_m == NUM_DECODE_KV_STAGES) { kv_stage_m = 0; kv_phase_m ^= 1; }
                 elect_commit(o_full_addr);
                 if (total_work_items_m <= work_idx_m + (unsigned int)gridDim.x) {
                     mbarrier_wait(decode_done_addr, item_m % 2);
