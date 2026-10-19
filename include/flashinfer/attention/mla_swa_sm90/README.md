@@ -28,9 +28,22 @@ This is a dense Page64 latent cache, not SM120's sparse-index packed FP8 API.
 |4|32|2|All-WG softmax|DSM FP32, natural fragment|
 |5|32|1|All-WG softmax|Direct|
 
-The device implementation is ported from the project's frozen unified kernel;
-`config.cuh`, `primitives.cuh` and `device/*.cuh` are preserved byte-for-byte,
-except for removing trailing whitespace from four blank lines in `storage.cuh`.
-Only Torch-dependent host code is replaced by `launch.cuh` and the TVM-FFI
-binding. New tactics must be explicitly qualified; this is not an arbitrary
+The device implementation retains the validated kernel's arithmetic and
+pipeline, with formatting normalized to FlashInfer's style. Torch-dependent
+host code is replaced by `launch.cuh` and the TVM-FFI binding.
+New tactics must be explicitly qualified; this is not an arbitrary
 M x S parameter product. The normal JitSpec is shared by JIT and AOT builds.
+
+## Reproduce
+
+```bash
+pytest tests/attention/test_mla_swa_sm90.py tests/trace/test_mla_swa.py
+python benchmarks/bench_mla_swa_sm90.py --refcheck --output results/mla_swa.json
+```
+
+The benchmark uses only FlashInfer and PyTorch, times the complete operation
+including any split combine with interleaved CUDA Graph replays, and checks an
+independent FP64 reference. Its PyTorch gather/mask baseline is not SGLang's
+Triton fallback; do not compare that baseline's speedup to historical SGLang
+fallback speedups. Use `--autotune --autotune-cache results/mla_swa_tuning.json`
+to benchmark startup-tuned dispatch instead of the default tactic catalogue.
