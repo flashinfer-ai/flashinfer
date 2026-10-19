@@ -18,6 +18,7 @@ returns this rank's value at its own index and the other ranks' values from a
 script, so collective decisions can be checked without launching ranks.
 """
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -56,26 +57,19 @@ def _status_comm(statuses):
 
 
 @pytest.fixture(autouse=True)
-def _fresh_choices(monkeypatch):
-    monkeypatch.setattr(mnnvl, "_HANDLE_TYPE_CHOICES", {})
+def _one_host(monkeypatch):
     monkeypatch.setattr(mnnvl.socket, "gethostname", lambda: "node0")
+    monkeypatch.setattr(mnnvl, "_fabric_fallback_warned", False)
 
 
 def _local_status(monkeypatch, reason=None, uuid=CLUSTER):
     monkeypatch.setattr(mnnvl, "_local_fabric_status", lambda dev_id: (reason, uuid))
 
 
-def test_single_host_prefers_fabric_tentatively(monkeypatch):
+def test_single_host_prefers_fabric(monkeypatch):
     _local_status(monkeypatch)
     comm = _status_comm([("node0", None, b""), ("node0", None, b"")])
-    choice = mnnvl.choose_mnnvl_handle_type(comm, 0)
-    assert (choice.handle_type, choice.final, choice.single_host) == (
-        FABRIC,
-        False,
-        True,
-    )
-    # One choice per set of hosts.
-    assert mnnvl.choose_mnnvl_handle_type(comm, 0) is choice
+    assert mnnvl.choose_mnnvl_handle_type(comm, 0) == (FABRIC, True)
 
 
 def test_single_host_uses_posix_when_any_rank_lacks_fabric(monkeypatch):
@@ -83,19 +77,13 @@ def test_single_host_uses_posix_when_any_rank_lacks_fabric(monkeypatch):
     comm = _status_comm(
         [("node0", None, b""), ("node0", "the driver does not support FABRIC", b"")]
     )
-    choice = mnnvl.choose_mnnvl_handle_type(comm, 0)
-    assert (choice.handle_type, choice.final) == (POSIX, True)
+    assert mnnvl.choose_mnnvl_handle_type(comm, 0) == (POSIX, True)
 
 
 def test_multi_host_needs_one_fabric_cluster(monkeypatch):
     _local_status(monkeypatch)
     comm = _status_comm([("node0", None, CLUSTER), ("node1", None, CLUSTER)])
-    choice = mnnvl.choose_mnnvl_handle_type(comm, 0)
-    assert (choice.handle_type, choice.final, choice.single_host) == (
-        FABRIC,
-        False,
-        False,
-    )
+    assert mnnvl.choose_mnnvl_handle_type(comm, 0) == (FABRIC, False)
 
 
 @pytest.mark.parametrize(
@@ -112,7 +100,6 @@ def test_multi_host_rejects_ranks_outside_the_cluster(monkeypatch, peer, message
     with pytest.raises(RuntimeError, match=message) as error:
         mnnvl.choose_mnnvl_handle_type(comm, 0)
     assert "IMEX" in str(error.value)
-    assert not mnnvl._HANDLE_TYPE_CHOICES
 
 
 def _attempts(monkeypatch, results):
@@ -127,53 +114,55 @@ def _attempts(monkeypatch, results):
     return attempts
 
 
-def _choose(monkeypatch, handle_type, final, single_host):
-    choice = mnnvl._HandleTypeChoice(handle_type, final, single_host)
-    monkeypatch.setattr(mnnvl, "choose_mnnvl_handle_type", lambda comm, dev_id: choice)
-    return choice
-
-
-def test_allocation_confirms_fabric(monkeypatch):
-    choice = _choose(monkeypatch, FABRIC, final=False, single_host=True)
-    attempts = _attempts(monkeypatch, [(["h0", "h1"], [None, None])])
-    handles, handle_type = mnnvl.allocate_mnnvl_handles(
-        None, 0, lambda handle_type: (handle_type, 64)
+def _choose(monkeypatch, handle_type, single_host):
+    monkeypatch.setattr(
+        mnnvl,
+        "choose_mnnvl_handle_type",
+        lambda comm, dev_id: (handle_type, single_host),
     )
-    assert (handles, handle_type, attempts) == (["h0", "h1"], FABRIC, [FABRIC])
-    assert choice.final
 
 
-def test_single_host_falls_back_to_posix_for_good(monkeypatch, caplog):
-    choice = _choose(monkeypatch, FABRIC, final=False, single_host=True)
-    attempts = _attempts(
-        monkeypatch,
-        [
-            (
-                None,
-                [None, "creating or exporting the allocation failed: NOT_PERMITTED"],
-            ),
-            (["h0", "h1"], [None, None]),
-        ],
-    )
-    handles, handle_type = mnnvl.allocate_mnnvl_handles(
-        None, 0, lambda handle_type: (handle_type, 64)
-    )
-    assert (handles, handle_type, attempts) == (["h0", "h1"], POSIX, [FABRIC, POSIX])
-    assert (choice.handle_type, choice.final) == (POSIX, True)
-    assert "rank 1: creating or exporting" in caplog.text
+_FABRIC_FAILS = (
+    None,
+    [None, "creating or exporting the allocation failed: NOT_PERMITTED"],
+)
+_SUCCEEDS = (["h0", "h1"], [None, None])
+
+
+def _allocate():
+    return mnnvl.allocate_mnnvl_handles(None, 0, lambda handle_type: (handle_type, 64))
+
+
+def test_allocation_uses_the_chosen_type(monkeypatch):
+    _choose(monkeypatch, FABRIC, single_host=True)
+    attempts = _attempts(monkeypatch, [_SUCCEEDS])
+    assert _allocate() == (["h0", "h1"], FABRIC)
+    assert attempts == [FABRIC]
+
+
+def test_single_host_falls_back_to_posix_on_every_allocation(monkeypatch, caplog):
+    # Nothing is remembered between allocations, so ranks that allocate over
+    # different groups always decide alike; each allocation tries FABRIC again.
+    caplog.set_level(logging.DEBUG, logger=mnnvl.logger.name)
+    _choose(monkeypatch, FABRIC, single_host=True)
+    attempts = _attempts(monkeypatch, [_FABRIC_FAILS, _SUCCEEDS] * 2)
+    assert _allocate() == (["h0", "h1"], POSIX)
+    assert _allocate() == (["h0", "h1"], POSIX)
+    assert attempts == [FABRIC, POSIX, FABRIC, POSIX]
+    levels = [r.levelno for r in caplog.records if "rank 1: creating" in r.message]
+    assert levels == [logging.WARNING, logging.DEBUG]
 
 
 @pytest.mark.parametrize(
-    ("handle_type", "final", "single_host"),
-    [(FABRIC, True, True), (FABRIC, False, False), (POSIX, True, True)],
+    ("handle_type", "single_host"), [(FABRIC, False), (POSIX, True)]
 )
-def test_settled_or_multi_host_choices_do_not_fall_back(
-    monkeypatch, handle_type, final, single_host
+def test_multi_host_or_posix_allocations_do_not_fall_back(
+    monkeypatch, handle_type, single_host
 ):
-    _choose(monkeypatch, handle_type, final, single_host)
+    _choose(monkeypatch, handle_type, single_host)
     attempts = _attempts(monkeypatch, [(None, ["importing failed", None])])
     with pytest.raises(RuntimeError, match="rank 0: importing failed") as error:
-        mnnvl.allocate_mnnvl_handles(None, 0, lambda handle_type: (handle_type, 64))
+        _allocate()
     assert attempts == [handle_type]
     assert ("IMEX" in str(error.value)) == (handle_type == FABRIC)
 
@@ -202,6 +191,8 @@ class _FakeDriver:
         return self._ok(self.next_handle)
 
     def cuMemExportToShareableHandle(self, handle, handle_type, flags):
+        if handle_type == POSIX:
+            return self._ok(handle + 1000)
         return self._ok(SimpleNamespace(data=f"export-{handle}".encode()))
 
     def cuMemImportFromShareableHandle(self, data, handle_type):
@@ -266,3 +257,41 @@ def test_attempt_votes_on_a_local_import_failure(fake_driver):
     handles, errors = mnnvl._create_and_import_handles(_two_rank_comm(), prop, 64)
     assert handles is None and "importing the allocation of rank 1" in errors[0]
     assert driver.released == [101]
+
+
+def test_attempt_releases_its_allocation_when_the_fd_exchange_fails(
+    fake_driver, monkeypatch
+):
+    driver = fake_driver()
+    closed = []
+    monkeypatch.setattr(mnnvl, "os", SimpleNamespace(close=closed.append))
+
+    def exchange_fds(comm, fd):
+        raise ConnectionError("peer went away")
+
+    monkeypatch.setattr(mnnvl, "exchange_fds", exchange_fds)
+    prop = SimpleNamespace(requestedHandleTypes=POSIX)
+    with pytest.raises(ConnectionError):
+        mnnvl._create_and_import_handles(_two_rank_comm(), prop, 64)
+    assert driver.released == [101] and closed == [1101]
+
+
+@pytest.mark.parametrize(
+    ("granularities", "expected"),
+    [
+        ({FABRIC: 1 << 21, POSIX: 1 << 21}, 1 << 21),
+        ({FABRIC: 1 << 22, POSIX: 1 << 21}, 1 << 22),
+        ({POSIX: 1 << 21}, 1 << 21),
+    ],
+)
+def test_granularity_fits_both_handle_types(monkeypatch, granularities, expected):
+    # A type missing from ``granularities`` is one the driver rejects.
+    def granularity(prop, option):
+        if prop.requestedHandleTypes in granularities:
+            return (SimpleNamespace(value=0), granularities[prop.requestedHandleTypes])
+        return (SimpleNamespace(value=1),)
+
+    monkeypatch.setattr(mnnvl, "checkCudaErrors", _check)
+    monkeypatch.setattr(mnnvl.cuda, "cuMemGetAllocationGranularity", granularity)
+    monkeypatch.setattr(mnnvl.MnnvlMemory, "allocation_granularity", 0)
+    assert mnnvl.MnnvlMemory.get_allocation_granularity(0) == expected

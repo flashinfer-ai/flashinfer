@@ -292,15 +292,16 @@ class MnnvlMemory:  # type: ignore[no-redef]
 
     @staticmethod
     def uses_fabric_handles(comm: CommBackend, dev_id: int) -> bool:
-        """Return True if MNNVL memory shared over ``comm`` uses FABRIC handles.
+        """Return True if MNNVL memory shared over ``comm`` starts with FABRIC
+        handles.
 
-        Collective over ``comm``. Before the first allocation over these hosts
-        the answer is tentative: a FABRIC allocation that fails on a single
-        host falls back to POSIX file descriptors (see
-        :func:`allocate_mnnvl_handles`); :attr:`fabric_handles` of an allocation
-        tells what it uses.
+        Collective over ``comm``. This is the precheck of
+        :func:`choose_mnnvl_handle_type`: a FABRIC allocation that fails on a
+        single host still falls back to POSIX file descriptors (see
+        :func:`allocate_mnnvl_handles`), so :attr:`fabric_handles` of an
+        allocation tells what it uses.
         """
-        return choose_mnnvl_handle_type(comm, dev_id).handle_type == _FABRIC_HANDLE
+        return choose_mnnvl_handle_type(comm, dev_id)[0] == _FABRIC_HANDLE
 
     @staticmethod
     def get_allocation_prop(dev_id: int, handle_type: Any):
@@ -314,16 +315,29 @@ class MnnvlMemory:  # type: ignore[no-redef]
         return allocation_prop
 
     @staticmethod
-    def get_allocation_granularity(dev_id: int, handle_type: Any):
+    def get_allocation_granularity(dev_id: int):
+        """Return the recommended granularity of both FABRIC and POSIX file
+        descriptor allocations, so an allocation keeps its size when it falls
+        back from one handle type to the other."""
         if MnnvlMemory.allocation_granularity != 0:
             return MnnvlMemory.allocation_granularity
-        allocation_prop = MnnvlMemory.get_allocation_prop(dev_id, handle_type)
         option = cuda.CUmemAllocationGranularity_flags(
             cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
         )
-        granularity = checkCudaErrors(
-            cuda.cuMemGetAllocationGranularity(prop=allocation_prop, option=option)
-        )
+        granularity = 1
+        for handle_type in (_FABRIC_HANDLE, _POSIX_FD_HANDLE):
+            allocation_prop = MnnvlMemory.get_allocation_prop(dev_id, handle_type)
+            try:
+                handle_granularity = checkCudaErrors(
+                    cuda.cuMemGetAllocationGranularity(
+                        prop=allocation_prop, option=option
+                    )
+                )
+            except RuntimeError:
+                # The driver does not support this handle type.
+                continue
+            # Granularities are powers of two, so the larger is a multiple of both.
+            granularity = max(granularity, handle_granularity)
         MnnvlMemory.allocation_granularity = granularity
         return MnnvlMemory.allocation_granularity
 
@@ -399,8 +413,7 @@ class MnnvlMemory:  # type: ignore[no-redef]
         assert all(x == size for x in all_rank_allocate_sizes), (
             "Not all rank allocating same size."
         )
-        choice = choose_mnnvl_handle_type(comm, dev_id)
-        granularity = MnnvlMemory.get_allocation_granularity(dev_id, choice.handle_type)
+        granularity = MnnvlMemory.get_allocation_granularity(dev_id)
         aligned_size = (size + granularity - 1) // granularity * granularity
 
         if (
@@ -602,22 +615,8 @@ _IMEX_HINT = (
 )
 
 
-@dataclass
-class _HandleTypeChoice:
-    """How a set of hosts shares MNNVL memory.
-
-    ``final`` is False while FABRIC has only passed the precheck: the first
-    allocation confirms it or, on a single host, falls back to POSIX file
-    descriptors. Every allocation over the same hosts follows this choice.
-    """
-
-    handle_type: Any
-    final: bool
-    single_host: bool
-
-
-# Keyed by the sorted host names of the group; shared by MnnvlMemory and SymmDeviceMemory.
-_HANDLE_TYPE_CHOICES: Dict[Tuple[str, ...], _HandleTypeChoice] = {}
+# Warn about a FABRIC fallback once per process; later fallbacks log at debug level.
+_fabric_fallback_warned = False
 
 
 def _local_fabric_status(dev_id: int) -> Tuple[Optional[str], bytes]:
@@ -649,52 +648,45 @@ def _local_fabric_status(dev_id: int) -> Tuple[Optional[str], bytes]:
     return None, bytes(fabric_info.clusterUuid)
 
 
-def choose_mnnvl_handle_type(comm: CommBackend, dev_id: int) -> _HandleTypeChoice:
+def choose_mnnvl_handle_type(comm: CommBackend, dev_id: int) -> Tuple[Any, bool]:
     """Choose FABRIC handles or POSIX file descriptors for MNNVL memory shared
-    over ``comm``.
+    over ``comm``; return the handle type and whether the group is on a single
+    host.
 
-    Collective over ``comm``; every rank gets the same choice. On one host,
-    FABRIC is chosen tentatively when every GPU reports FABRIC support and
-    POSIX file descriptors otherwise. Across hosts, every GPU must support
-    FABRIC handles and report the same non-zero NVML fabric cluster UUID;
-    otherwise this raises with each rank's reason, since file descriptors
-    cannot cross hosts.
+    Collective over ``comm``; every rank gets the same answer, which depends
+    only on what the ranks report now. On one host, FABRIC is chosen when
+    every GPU reports FABRIC support and POSIX file descriptors otherwise.
+    Across hosts, every GPU must support FABRIC handles and report the same
+    non-zero NVML fabric cluster UUID; otherwise this raises with each rank's
+    reason, since file descriptors cannot cross hosts.
     """
     reason, cluster_uuid = _local_fabric_status(dev_id)
     status = comm.allgather((socket.gethostname(), reason, cluster_uuid))
-    hosts = tuple(sorted({host for host, _, _ in status}))
-    choice = _HANDLE_TYPE_CHOICES.get(hosts)
-    if choice is not None:
-        return choice
-    if len(hosts) == 1:
+    if len({host for host, _, _ in status}) == 1:
         if all(reason is None for _, reason, _ in status):
-            choice = _HandleTypeChoice(_FABRIC_HANDLE, final=False, single_host=True)
-        else:
-            choice = _HandleTypeChoice(_POSIX_FD_HANDLE, final=True, single_host=True)
-    else:
-        problems = []
-        for rank, (host, reason, uuid) in enumerate(status):
-            if reason is not None:
-                problems.append(f"rank {rank} on {host}: {reason}")
-            elif not any(uuid):
-                problems.append(
-                    f"rank {rank} on {host}: the GPU is not in a completed NVLink "
-                    "fabric cluster (NVML clusterUuid unset)"
-                )
-        if not problems and len({uuid for _, _, uuid in status}) > 1:
-            problems = [
-                f"rank {rank} on {host}: NVLink fabric cluster {uuid.hex()}"
-                for rank, (host, _, uuid) in enumerate(status)
-            ]
-            problems.insert(0, "the ranks are in different NVLink domains")
-        if problems:
-            raise RuntimeError(
-                "[MNNVL] memory shared across hosts needs FABRIC handles within one "
-                "NVLink domain:\n  " + "\n  ".join(problems) + "\n" + _IMEX_HINT
+            return _FABRIC_HANDLE, True
+        return _POSIX_FD_HANDLE, True
+    problems = []
+    for rank, (host, reason, uuid) in enumerate(status):
+        if reason is not None:
+            problems.append(f"rank {rank} on {host}: {reason}")
+        elif not any(uuid):
+            problems.append(
+                f"rank {rank} on {host}: the GPU is not in a completed NVLink "
+                "fabric cluster (NVML clusterUuid unset)"
             )
-        choice = _HandleTypeChoice(_FABRIC_HANDLE, final=False, single_host=False)
-    _HANDLE_TYPE_CHOICES[hosts] = choice
-    return choice
+    if not problems and len({uuid for _, _, uuid in status}) > 1:
+        problems = [
+            f"rank {rank} on {host}: NVLink fabric cluster {uuid.hex()}"
+            for rank, (host, _, uuid) in enumerate(status)
+        ]
+        problems.insert(0, "the ranks are in different NVLink domains")
+    if problems:
+        raise RuntimeError(
+            "[MNNVL] memory shared across hosts needs FABRIC handles within one "
+            "NVLink domain:\n  " + "\n  ".join(problems) + "\n" + _IMEX_HINT
+        )
+    return _FABRIC_HANDLE, False
 
 
 def _create_and_import_handles(
@@ -737,6 +729,7 @@ def _create_and_import_handles(
             shareable = exchange_fds(comm, int(exported))
         except BaseException:
             os.close(int(exported))
+            checkCudaErrors(cuda.cuMemRelease(local_handle))
             raise
     handles: List[Any] = [None] * size_of_group
     handles[rank] = local_handle
@@ -782,34 +775,35 @@ def allocate_mnnvl_handles(
     ``make_prop(handle_type)`` returns the ``CUmemAllocationProp`` and the size
     to allocate with that handle type. Collective over ``comm``. Returns the
     per-rank allocation handles (this rank's own at its index) and the handle
-    type used. The first allocation over a set of hosts settles the type
-    chosen by :func:`choose_mnnvl_handle_type`: if a tentative FABRIC choice
-    fails on a single host, it falls back to POSIX file descriptors for this
-    and every later allocation.
+    type used: the one :func:`choose_mnnvl_handle_type` picks or, when FABRIC
+    handles fail on a single host (e.g. without an IMEX channel), POSIX file
+    descriptors. Each call decides on its own, so every allocation over a host
+    without usable FABRIC handles tries them first.
     """
-    choice = choose_mnnvl_handle_type(comm, dev_id)
-    prop, size = make_prop(choice.handle_type)
+    global _fabric_fallback_warned
+    handle_type, single_host = choose_mnnvl_handle_type(comm, dev_id)
+    prop, size = make_prop(handle_type)
     handles, errors = _create_and_import_handles(comm, prop, size)
     if handles is not None:
-        choice.final = True
-        return handles, choice.handle_type
+        return handles, handle_type
     failure = _format_rank_errors(errors)
-    if choice.handle_type == _FABRIC_HANDLE and not choice.final and choice.single_host:
-        logger.warning(
+    if handle_type == _FABRIC_HANDLE and single_host:
+        log = logger.debug if _fabric_fallback_warned else logger.warning
+        _fabric_fallback_warned = True
+        log(
             "[MNNVL] FABRIC handles failed on this host; using POSIX file "
             "descriptors instead:\n%s\n%s",
             failure,
             _IMEX_HINT,
         )
-        choice.handle_type = _POSIX_FD_HANDLE
-        choice.final = True
-        prop, size = make_prop(_POSIX_FD_HANDLE)
+        handle_type = _POSIX_FD_HANDLE
+        prop, size = make_prop(handle_type)
         handles, errors = _create_and_import_handles(comm, prop, size)
         if handles is not None:
-            return handles, _POSIX_FD_HANDLE
+            return handles, handle_type
         failure = _format_rank_errors(errors)
-    kind = "FABRIC" if choice.handle_type == _FABRIC_HANDLE else "POSIX file descriptor"
-    hint = "\n" + _IMEX_HINT if choice.handle_type == _FABRIC_HANDLE else ""
+    kind = "FABRIC" if handle_type == _FABRIC_HANDLE else "POSIX file descriptor"
+    hint = "\n" + _IMEX_HINT if handle_type == _FABRIC_HANDLE else ""
     raise RuntimeError(
         f"[MNNVL] allocating memory shared through {kind} handles failed:\n"
         f"{failure}{hint}"
