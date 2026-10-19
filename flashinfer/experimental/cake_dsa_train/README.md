@@ -303,6 +303,12 @@ product alone, `softmax(scale * q . kv^T) . kv`, and the backward produces one
 combined gradient per key row, `dkv = dK + dV`, natural layout, FP32 `[S, 512]`.
 The rope entry points above are unchanged; the NoPE entries are additive.
 
+Slot-count rule: the host accepts every int32 `indices [T, K_slots]` with
+`K_slots >= 1` (any width, odd widths included; `topk_length` may be shorter
+per row) and rejects `K_slots <= 0`, a non-int32 dtype and a row stride below
+`K_slots` explicitly (`validate_dsa_nope_inputs`); the kernels bound the per-row
+work by `topk_length` and read no slot beyond `K_slots`.
+
 ```python
 from flashinfer.dsa_sparse_attention import dsa_sparse_attention_nope, dsa_sparse_attention_nope_varlen
 
@@ -311,7 +317,7 @@ out = dsa_sparse_attention_nope(q, kv, indices, topk_length=None, softmax_scale=
 out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, cu_seqlens_k,
                                        max_seqlen_q=None, max_seqlen_k=None, causal=False,
                                        topk_length=None, softmax_scale=None, return_lse=False,
-                                       dkv_acc=None, dkv_dst_map=None)
+                                       dkv_acc=None, dkv_dst_map=None, check_cu_seqlens=True)
 ```
 
 * `q [T, 64, 512]` BF16 (contiguous or a strided token / head view, consumed in
@@ -326,36 +332,54 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
   tagged (`"nope_fwd"` / `"nope_bwd"`) and never collide with the rope keys.
 * `dkv` semantics.  Fresh (no `dkv_acc`): `backward_nope` returns a new natural
   FP32 `[S, 512]` buffer -- filled by the natural-layout main stage adding into
-  the zero-filled buffer when the record's direct rule (`dkv_direct`, 4 keys per
-  query) selects it, else by the cast stage writing the permuted accumulator out
-  densely (`out_f32`).  Accumulate (`dkv_acc` FP32 `[S_dst, >= 512]`, optional
-  `dkv_dst_map`): `+=` into columns `0:512` of the caller's rows by the same two
+  the zero-filled buffer when the record's direct rule selects it (`dkv_direct`:
+  `min_keys_per_query` 1, so whenever the row has at least one key per query --
+  every packed causal problem; measured faster than the permuted drain on every
+  row), else -- more query rows than keys, or `dkv_direct=False` -- by the cast
+  stage writing the permuted accumulator out densely (`out_f32`).  Accumulate
+  (`dkv_acc` FP32 `[S_dst, >= 512]`, optional `dkv_dst_map`): `+=` into columns
+  `0:512` of the caller's rows by the same two
   paths and `None` for `dkv`; chunked backward passes of one long row sum into
   one buffer without intermediate rounding.  Through autograd without
   `dkv_acc`, the FP32 `dkv` becomes the `kv` gradient and the autograd engine
   casts it to the leaf's dtype (BF16 for a BF16 leaf).
 * `dout` may be a head-major view (strides `[512, T * 512, 1]`) or any strided
-  `[T, 64, 512]` view: the main stage reads it through a stride-carrying tensor
-  map, the delta stage of this release through a dense array, so
-  `backward_nope` copies a strided `dout` once, explicitly, inside the backward
-  (`_dense_dout`, a counted cost of the step; a dense `dout` is read in place).
-  A prepared runner takes a dense `dout` only.
+  `[T, 64, 512]` view under the layout rules of `q` (unit channel stride, token
+  and head strides multiples of 8 elements, 16-byte base): it is read in place
+  by every entry, the eager `backward_nope` and a prepared runner alike -- the
+  main stage through a stride-carrying tensor map, the delta stage through the
+  token / head strides (elements) and the element offset the launcher passes
+  (`dout_token_stride`, `dout_head_stride`, `dout_offset = 0`).  No host copy.
 * Varlen: per-document indices are offset by `cu_seqlens_k` through the same
   `offset_gather_kv_indices` glue as the rope entry (`causal=True` drops keys
   after the query's own position, query segments are tails of their key prefix).
+  The prefix sums are checked on every call (`validate_cu_seqlens`;
+  `check_cu_seqlens=False` keeps the structural checks only): int32
+  `[num_docs + 1]` of one length, start at 0, non-decreasing,
+  `cu_seqlens_q[-1] == T`, `cu_seqlens_k[-1] == S` (a shorter or longer key
+  window is rejected, not truncated) and `seqlen_q <= seqlen_k` per document.
+  The check costs one device-to-host copy and is skipped during CUDA-graph
+  capture.  The rope varlen entry is unchanged (structural checks only).
 
 Stages of the record, in launch order and with the kernels they share with the
-rope program: `nope_fwd` (own kernel, 320 threads), `nope_bwd_delta` (the rope
-`bwd_delta` kernel over the dense `[T * 64, 512]` rows), `nope_bwd_main` /
+rope program: `nope_fwd` (own kernel, 320 threads), `nope_bwd_delta` (the
+strided sibling of the rope `bwd_delta` kernel, 256 threads: the `[T * 64, 512]`
+rows of `dout` addressed as `dout_offset + token * dout_token_stride + head *
+dout_head_stride + channel`, strides and offset multiples of 8 elements),
+`nope_bwd_main` /
 `nope_bwd_main_natural` (own kernels, 640 threads: no rope operands, one
 accumulator `dkv_f32` with `dkv_stride >= 512`, a multiple of 4, and the
 destination map), `nope_bwd_compact` (the rope compaction kernel),
 `nope_bwd_main_pass` / `nope_bwd_main_pass_natural` (the key-range-pass forms)
 and `nope_bwd_cast` (the rope cast kernel with `rope_groups = 0`, grid
-`ceil(num_kv * 16 / 256)`).  The key-range-pass policy of the record plans with
-2048 B of accumulator per key and a dQ partial of 131,072 B per token: the
-token chunk of a multi-pass backward is 4736 at `K_slots` 2048 / 2176, 4864 at
-1152 and 4992 at 128 (the 640 MiB budget, a multiple of 128).
+`ceil(num_kv * 16 / 256)`).  The key-range-pass policy of the record plans one
+pass on every row (`max_passes` 1, no per-architecture rules: one pass measured
+fastest on every row, build and GPU of this form), so the single-pass main stage
+is the default and `dq_partial` is not allocated; `key_passes=n` on the entry
+points forces the pass form, which plans with 2048 B of accumulator per key and
+a dQ partial of 131,072 B per token: the token chunk of a multi-pass backward is
+4736 at `K_slots` 2048 / 2176, 4864 at 1152 and 4992 at 128 (the 640 MiB budget,
+a multiple of 128).
 
 `generated_program_available(..., program=cake_jit.NOPE_PROGRAM)` reports
 whether the record registers the stages a call needs for the device; the NoPE

@@ -400,14 +400,15 @@ def dsa_sparse_attention_nope(
         scores over the valid keys (``-inf`` for fully masked rows).
     key_passes : Optional[int]
         Number of key-range passes of the backward's main stage.  ``None``
-        (default) applies the registered policy of this program (2048 B of
-        FP32 accumulator per key: the key range is split so that each pass's
-        slice stays L2-resident when the whole row fits the pass workspace
-        budget, ``T <= 4736`` at ``K_slots`` 2048 / 2176); ``1`` forces the
-        single pass; a larger value forces that many passes (``<= S``).  The
-        passes carry dQ through an FP32 partial in the workspace
-        (``T * 131,072`` B plus ``T * (4 * K_slots + 4)`` B); dQ stays bitwise
-        deterministic and the dK + dV accumulation is unchanged.
+        (default) applies the registered policy of this program, which plans
+        one pass on every row (one pass measured fastest on every shape of
+        this form); ``1`` forces the single pass; a larger value forces that
+        many passes (``<= S``) over slices of the key range, each pass's FP32
+        accumulator slice sized at 2048 B per key.  The passes carry dQ
+        through an FP32 partial in the workspace (``T * 131,072`` B plus
+        ``T * (4 * K_slots + 4)`` B, ``T <= 4736`` tokens per chunk at
+        ``K_slots`` 2048 / 2176); dQ stays bitwise deterministic and the
+        dK + dV accumulation is unchanged.
     backend : str
         Only ``"cake"``.
     dkv_acc : Optional[torch.Tensor]
@@ -428,12 +429,15 @@ def dsa_sparse_attention_nope(
         (``dkv_acc`` or the fresh ``dkv``) when the registered program has the
         natural-layout main stages.  ``None`` (default) reads
         ``FLASHINFER_CAKE_DSA_DKV_DIRECT``: ``auto`` (its default) applies the
-        record's size rule -- the main stage adds into the buffer directly
-        (no permuted accumulator, no cast launch) when the row has at least
-        ``dkv_direct.min_keys_per_query`` (4) keys per query token --, ``1``
-        forces the direct path whenever the stages are registered, ``0``
-        always takes the accumulate-and-cast path; any other value raises
-        ``ValueError``.  ``True`` / ``False`` select the path explicitly and
+        record's rule -- the main stage adds into the buffer directly (no
+        permuted accumulator, no cast launch) when the row has at least
+        ``dkv_direct.min_keys_per_query`` keys per query token, 1 for this
+        program (every row with at least as many keys as query tokens; the
+        direct path measured faster than the permuted drain on every such
+        row), so only a problem with more query rows than keys takes the
+        cast --, ``1`` forces the direct path whenever the stages are
+        registered, ``0`` always takes the accumulate-and-cast path; any
+        other value raises ``ValueError``.  ``True`` / ``False`` select the path explicitly and
         ignore the variable.  Both paths add the same FP32 contributions into
         the same rows (another summation order).
     check_dst_map : Optional[bool]
@@ -463,9 +467,11 @@ def dsa_sparse_attention_nope(
 
     The incoming ``dout`` may be a head-major view (strides ``[512, T * 512,
     1]``, the layout an output projection hands back) or any strided
-    ``[T, 64, 512]`` view: the backward copies it once to a dense array (the
-    delta stage of this release reads a dense array) -- a counted cost of the
-    step; a dense ``dout`` is read in place.
+    ``[T, 64, 512]`` view under the layout rules of ``q`` (unit channel
+    stride, token and head strides multiples of 8 elements, 16-byte base): it
+    is read in place -- the main stage through a stride-carrying tensor map,
+    the delta stage through the token and head strides it receives -- with no
+    host copy.
 
     Host side as in :func:`dsa_sparse_attention`: the inputs are validated and
     bound on the first call for an input binding; later calls with the same
@@ -511,6 +517,7 @@ def dsa_sparse_attention_nope_varlen(
     dkv_dst_map: Optional[torch.Tensor] = None,
     dkv_direct: Optional[bool] = None,
     check_dst_map: Optional[bool] = None,
+    check_cu_seqlens: bool = True,
 ):
     r"""Packed multi-document form of :func:`dsa_sparse_attention_nope` (SM100 /
     SM103 / SM107).
@@ -533,8 +540,26 @@ def dsa_sparse_attention_nope_varlen(
     arguments, the ``1 / 16`` default scale, the FP32 ``dK + dV`` semantics and
     the returns as in :func:`dsa_sparse_attention_nope`.
 
+    ``cu_seqlens_q`` and ``cu_seqlens_k`` are caller-owned prefix sums with
+    these invariants: int32 ``[num_docs + 1]`` tensors of one length on the
+    device of ``q``, starting at 0 and non-decreasing, ``cu_seqlens_q[-1] ==
+    T`` (the packed rows of ``q``), ``cu_seqlens_k[-1] == S`` (the packed rows
+    of ``kv``; a shorter or longer key window is not accepted) and ``seqlen_q
+    <= seqlen_k`` for every document.  They are checked on every call
+    (``check_cu_seqlens``), because a violation is otherwise not detected on
+    device: a document with ``seqlen_k < seqlen_q`` gives negative own
+    positions (all-invalid rows under ``causal``), a non-monotonic prefix sum
+    an asynchronous device-side index error.
+
     Parameters
     ----------
+    check_cu_seqlens : bool
+        ``True`` (default) checks the values of ``cu_seqlens_q`` /
+        ``cu_seqlens_k`` against the invariants above at the cost of one
+        device-to-host copy per call (skipped during CUDA-graph capture, where
+        no synchronization is possible; the eager call captured was checked).
+        ``False`` keeps the structural checks (dtype, rank, length, device)
+        only -- for a timed loop over inputs validated once.
     causal : bool
         With ``False`` (default) the index row is taken as is -- only ``-1`` /
         out-of-range slots are dropped.  With ``True`` a slot that selects a
@@ -571,6 +596,7 @@ def dsa_sparse_attention_nope_varlen(
         dkv_dst_map=dkv_dst_map,
         dkv_direct=dkv_direct,
         check_dst_map=check_dst_map,
+        check_cu_seqlens=check_cu_seqlens,
     )
 
 

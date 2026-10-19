@@ -185,11 +185,19 @@ MODULES: dict[str, dict[str, Any]] = {
     # dimensions, no rope operands, one combined FP32 dK + dV gradient of 2048 B
     # per key.  Its key-range-pass policy is re-calibrated for that row size
     # (``key_bytes`` 2048; ``dq_partial_bytes_per_token`` = 64 heads x 512 x 4 B
-    # per token of FP32 dQ partial).  The delta, compaction and cast stages are
-    # rope-independent kernels shared with the RoPE program (same libraries, same
-    # launch geometry; the cast runs over the one 512-wide accumulator, 16 groups
-    # per key); the forward (320 threads, 222,464 B dynamic shared memory) and the
-    # four main backward forms (640 threads, 214,208 B; permuted / natural-layout
+    # per token of FP32 dQ partial).  Measured on the acceptance GPUs, one key
+    # pass is the fastest plan on every row and build (``max_passes`` 1: the
+    # policy never plans a second pass; ``key_passes`` still forces the pass
+    # form, whose stages and scratch stay registered) and the natural-layout
+    # main stage beats the permuted accumulator plus cast whenever the row has
+    # at least one key per query (``min_keys_per_query`` 1).  The compaction and
+    # cast stages are rope-independent kernels shared with the RoPE program
+    # (same libraries, same launch geometry; the cast runs over the one 512-wide
+    # accumulator, 16 groups per key); the delta stage is the strided form of
+    # the shared delta kernel (256 threads: it reads ``dout`` through its token
+    # and head strides, so a head-major gradient view is consumed in place);
+    # the forward (320 threads, 222,464 B dynamic shared memory) and the four
+    # main backward forms (640 threads, 214,208 B; permuted / natural-layout
     # accumulation, single-pass / key-range-pass) are the NoPE kernels.  Stage
     # order = launch order.  ``build.json`` carries every library named here
     # once the export delivers it; ``scripts/check_cake_build_manifests.py``
@@ -211,33 +219,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "key_bytes": 2048,
             "workspace_budget_bytes": 671088640,
             "token_chunk_multiple": 128,
-            "max_passes": 4,
+            "max_passes": 1,
             "dq_partial_bytes_per_token": 131072,
-            "rules": {
-                "sm_100a": {
-                    "tail_rows": 0,
-                    "fixed_passes": 0,
-                    "min_kv": 0,
-                    "tail_min_kv": 0,
-                    "tail_cap": 0,
-                },
-                "sm_103a": {
-                    "tail_rows": 1,
-                    "fixed_passes": 0,
-                    "min_kv": 0,
-                    "tail_min_kv": 131072,
-                    "tail_cap": 3,
-                },
-                "sm_107a": {
-                    "tail_rows": 1,
-                    "fixed_passes": 2,
-                    "min_kv": 131072,
-                    "tail_min_kv": 131072,
-                    "tail_cap": 0,
-                },
-            },
         },
-        "dkv_direct": {"min_keys_per_query": 4},
+        "dkv_direct": {"min_keys_per_query": 1},
         "nope_fwd": {
             "module": "cake_dsa_h64_nope_train_46cdc056c891876ed545",
             "library": "cake_dsa_h64_nope_train_46cdc056c891876ed545",
@@ -251,8 +236,8 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "nope_bwd_delta": {
-            "module": "cake_dsa_h64_train_da16f2d6e1b0fa6a05fd",
-            "library": "cake_dsa_h64_train_da16f2d6e1b0fa6a05fd",
+            "module": "cake_dsa_h64_nope_train_ae9db52dff326ae8409b",
+            "library": "cake_dsa_h64_nope_train_ae9db52dff326ae8409b",
             "ffi_entry": "run",
             "launch": {
                 "block": [256, 1, 1],

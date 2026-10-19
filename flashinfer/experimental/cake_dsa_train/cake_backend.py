@@ -676,11 +676,13 @@ def validate_dsa_nope_inputs(
     stride); ``indices``: int32 ``[T, K_slots]`` global key rows with contiguous rows (any row stride; ``-1`` or
     ``>= S`` invalid), any ``K_slots >= 1`` -- no width alignment is required (rows whose stride and start are
     multiples of eight elements take the kernels' vector index path, the others the scalar path);
-    ``topk_length``: contiguous int32 ``[T]`` or ``None``; ``dout``: BF16 ``[T, 64, 512]`` with ``T`` rows, dense
-    (the delta stage of this release reads it as a ``[T * 64, 512]`` array; :func:`backward_nope` copies a strided
-    ``dout`` explicitly before validating, see there).  ``S == 0`` is rejected; ``T == 0`` only without
-    ``allow_empty_queries`` (the eager entries return empty results for it).  Device placement is checked by the
-    callers, so this runs on host tensors.
+    ``topk_length``: contiguous int32 ``[T]`` or ``None``; ``dout``: BF16 ``[T, 64, 512]`` with ``T`` rows, under
+    the same layout rules as ``q_latent`` (:func:`_check_head_tensor`: unit channel stride, token and head strides
+    positive multiples of 8 elements, head stride >= 512, 16-byte base) -- a dense array or a strided view such as
+    the head-major ``[512, T * 512, 1]`` layout is consumed in place (the main stage reads it through a
+    stride-carrying tensor map, the delta stage through the strides it receives).  ``S == 0`` is rejected;
+    ``T == 0`` only without ``allow_empty_queries`` (the eager entries return empty results for it).  Device
+    placement is checked by the callers, so this runs on host tensors.
     """
     _check_head_tensor(q_latent, "q_latent", D_LATENT)
     _check_key_tensor(kv_latent, "kv_latent", D_LATENT)
@@ -714,14 +716,6 @@ def validate_dsa_nope_inputs(
         _check_head_tensor(dout, "dout", D_LATENT)
         if int(dout.shape[0]) != num_queries:
             raise ValueError("dout must have T rows")
-        if not dout.is_contiguous():
-            # the delta stage registered for this release reads dout as a dense [T * 64, 512] array
-            # (the main stage reads it through a stride-carrying tensor map): the eager backward
-            # copies a strided dout once, explicitly (backward_nope), a prepared runner takes a dense one
-            raise ValueError(
-                "dout must be contiguous for the delta stage (backward_nope copies a head-major "
-                "or otherwise strided dout once, inside the backward)"
-            )
     return num_queries, num_kv, topk
 
 
@@ -978,9 +972,12 @@ def _plan_nope_direct(
     """Does a NoPE backward add its dK + dV straight into the natural FP32 buffer from the main stage?
 
     Every NoPE backward accumulates into a natural-layout FP32 ``[S_dst, >= 512]`` buffer -- the caller's
-    ``dkv_acc`` or the fresh ``dkv`` the backend allocates and zero-fills -- so the record's size rule (and the
-    ``dkv_direct`` keyword) applies to both forms: :func:`plan_dkv_direct` with ``accumulate=True``.  Without the
-    natural-layout stages the kernels' permuted accumulator and the cast serve both forms.
+    ``dkv_acc`` or the fresh ``dkv`` the backend allocates and zero-fills -- so the record's rule (and the
+    ``dkv_direct`` keyword) applies to both forms: :func:`plan_dkv_direct` with ``accumulate=True``.  The NoPE
+    record's rule (``min_keys_per_query`` 1) takes the natural stage whenever the row has at least one key per
+    query (every packed causal problem; measured faster than the permuted accumulator plus cast on every row);
+    a problem with more query rows than keys, or ``dkv_direct=False``, uses the permuted accumulator and the cast.
+    Without the natural-layout stages the kernels' permuted accumulator and the cast serve both forms.
     """
     return plan_dkv_direct(
         record,
@@ -1108,6 +1105,15 @@ def offset_gather_kv_indices(
     derived from the same mask with one ``where`` and one ``amax`` and the
     function returns ``(indices, topk_length)``.  Runs on device without a
     host synchronization, in int32 throughout.
+
+    Caller-owned invariants of the prefix sums (checked by
+    :func:`validate_cu_seqlens`, which the NoPE varlen entries run by default;
+    this function checks structure only): both int32 ``[num_docs + 1]``, start
+    at 0, non-decreasing, ``cu_seqlens_q[-1] == T``, ``cu_seqlens_k[-1] == S``
+    and ``seqlen_q <= seqlen_k`` per document.  A violation that passes here
+    is not detected on device: a document with ``seqlen_k < seqlen_q`` gives
+    negative own positions and all-invalid rows under ``causal``, a
+    non-monotonic ``cu_seqlens_q`` an asynchronous device-side index error.
     """
     if gather_kv_indices.ndim != 2 or gather_kv_indices.dtype != torch.int32:
         raise ValueError("gather_kv_indices must be an int32 [T, topk] tensor")
@@ -1145,6 +1151,65 @@ def offset_gather_kv_indices(
         return result
     topk_length = torch.where(valid, _slot_positions(topk, device), 0).amax(dim=-1)
     return result, topk_length
+
+
+def validate_cu_seqlens(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    num_queries: int,
+    num_kv: int,
+    *,
+    values: bool = True,
+) -> None:
+    """Check the packed-batch invariants of a varlen call; raises ``ValueError`` naming the argument.
+
+    Structure (host side, always): both int32 1-D ``[num_docs + 1]`` tensors of one length (at least two entries)
+    on one device.  Values (one device-to-host copy; ``values=False`` skips them, and they are skipped during
+    CUDA-graph capture, where a synchronization is not possible -- a capture replays the geometry of the eager
+    call that was validated before it): both start at 0 and are non-decreasing, ``cu_seqlens_q[-1] == num_queries``
+    (the packed query rows ``T``) and ``cu_seqlens_k[-1] == num_kv`` (the packed key rows ``S``; a shorter or longer
+    key window is not accepted), and every document has ``seqlen_q <= seqlen_k`` (the query segment is the tail of
+    its key prefix).
+    """
+    for name, cu in (("cu_seqlens_q", cu_seqlens_q), ("cu_seqlens_k", cu_seqlens_k)):
+        if (
+            not isinstance(cu, torch.Tensor)
+            or cu.ndim != 1
+            or cu.dtype != torch.int32
+            or cu.numel() < 2
+        ):
+            raise ValueError(f"{name} must be an int32 [num_docs + 1] tensor")
+    if cu_seqlens_q.numel() != cu_seqlens_k.numel():
+        raise ValueError(
+            "cu_seqlens_q and cu_seqlens_k must describe the same documents"
+        )
+    if cu_seqlens_q.device != cu_seqlens_k.device:
+        raise ValueError("cu_seqlens_q and cu_seqlens_k must be on one device")
+    if not values or (
+        cu_seqlens_q.is_cuda and torch.cuda.is_current_stream_capturing()
+    ):
+        return
+    q, k = torch.stack([cu_seqlens_q, cu_seqlens_k]).tolist()  # one copy to the host
+    for name, cu in (("cu_seqlens_q", q), ("cu_seqlens_k", k)):
+        if cu[0] != 0:
+            raise ValueError(f"{name} must start at 0, got {cu[0]}")
+        if any(b < a for a, b in zip(cu, cu[1:], strict=False)):
+            raise ValueError(f"{name} must be non-decreasing")
+    if q[-1] != int(num_queries):
+        raise ValueError(
+            f"cu_seqlens_q[-1] ({q[-1]}) must equal the packed query rows T ({int(num_queries)})"
+        )
+    if k[-1] != int(num_kv):
+        raise ValueError(
+            f"cu_seqlens_k[-1] ({k[-1]}) must equal the packed key rows S ({int(num_kv)}); "
+            "a key window shorter or longer than the packed keys is not accepted"
+        )
+    for d, (q0, q1, k0, k1) in enumerate(zip(q, q[1:], k, k[1:], strict=False)):
+        if q1 - q0 > k1 - k0:
+            raise ValueError(
+                f"document {d} has seqlen_q ({q1 - q0}) > seqlen_k ({k1 - k0}): the query segment "
+                "must be the tail of its key prefix"
+            )
 
 
 _SLOT_POSITIONS: dict[tuple, torch.Tensor] = {}
@@ -2840,11 +2905,11 @@ def dsa_sparse_attention_varlen(
 #   backward passes of one long row accumulate into one such buffer with no
 #   intermediate rounding.
 #
-# ``dout`` may arrive head-major (``[512, T * 512, 1]`` strides): the main stage
-# reads it through a stride-carrying tensor map, the delta stage registered for
-# this release as a dense ``[T * 64, 512]`` array, so :func:`backward_nope`
-# copies a strided ``dout`` once, explicitly, inside the backward (a counted
-# cost of this release; see :func:`_dense_dout`).
+# ``dout`` may arrive head-major (``[512, T * 512, 1]`` strides, the layout an
+# output projection hands back) or in any other admissible strided layout: the
+# main stage reads it through a stride-carrying tensor map and the delta stage
+# through the token / head strides and element offset the launcher passes, so no
+# host copy is made.
 
 
 def _main_accumulator_constants_nope(
@@ -2855,17 +2920,6 @@ def _main_accumulator_constants_nope(
     if direct:
         return dict(dkv_stride=int(dst_row_stride), dkv_has_map=int(bool(has_map)))
     return dict(dkv_stride=D_LATENT, dkv_has_map=0)
-
-
-def _dense_dout(dout: torch.Tensor) -> torch.Tensor:
-    """``dout`` as the dense ``[T, 64, 512]`` array the delta stage of this release reads.
-
-    A head-major view (strides ``[512, T * 512, 1]``, the layout a trainer's output projection hands back) or any
-    other strided ``dout`` is copied once per backward, here, inside the step: an explicit, counted cost of this
-    release (the main stage itself reads ``dout`` through a stride-carrying tensor map; a delta stage that carries
-    the strides removes the copy).  A dense ``dout`` is returned as is.
-    """
-    return dout if dout.is_contiguous() else dout.contiguous()
 
 
 def _kv_latent_rows(kv_latent: torch.Tensor) -> torch.Tensor:
@@ -3012,6 +3066,17 @@ def _plan_nope(
         sm_scale=scale,
         scale_log2=scale * LOG2E,
         num_rows=T * NUM_HEADS,  # delta: (token, head) rows
+        # delta: dout's token / head strides in elements and the element offset of the pointer the launcher
+        # passes (the validated view itself, 16-byte aligned: offset 0); both strides are multiples of 8
+        **(
+            dict(
+                dout_token_stride=int(dout.stride(0)),
+                dout_head_stride=int(dout.stride(1)),
+                dout_offset=0,
+            )
+            if dout is not None
+            else {}
+        ),
         latent_groups=S * D_LATENT // 32,  # cast: permuted 32-element groups
         rope_groups=0,  # cast: no rope part
         out_f32=scalars["out_f32"],
@@ -3215,8 +3280,8 @@ def prepare_dsa_nope_train(
 
     ``q_latent`` BF16 ``[T, 64, 512]`` (strided token / head views in place), ``kv_latent`` BF16 ``[S, 512]`` (the
     shared latent, K = V), ``indices`` int32 ``[T, K_slots]`` global key rows (``K_slots >= 1``, any width).
-    ``backward`` defaults to ``dout is not None``; ``dout`` must be dense here (a prepared binding cannot copy; the
-    eager :func:`backward_nope` copies a strided ``dout`` explicitly).  ``softmax_scale`` defaults to
+    ``backward`` defaults to ``dout is not None``; ``dout`` is read in place in any layout
+    :func:`validate_dsa_nope_inputs` admits (dense or strided, head-major included).  ``softmax_scale`` defaults to
     ``NOPE_SOFTMAX_SCALE`` (1/16).  Missing outputs and the workspace are allocated here (the only allocations of a
     prepared runner); pass ``workspace_buffer`` of :func:`dsa_nope_train_workspace_size` bytes to reuse storage.
     ``backward()`` returns ``(dq, dkv)`` with ``dkv`` the natural-layout FP32 ``[S, 512]`` combined dK + dV (the
@@ -3609,18 +3674,18 @@ def backward_nope(
       The caller owns the zeroing; chunked backward passes of one row sum into one buffer without intermediate
       rounding.
 
-    ``dout`` may be a head-major view (strides ``[512, T * 512, 1]``) or any strided ``[T, 64, 512]`` view: it is
-    copied once to a dense array here, inside the backward (:func:`_dense_dout`; an explicit, counted cost of
-    this release whose delta stage reads a dense array).  ``key_passes`` / ``num_segments`` as in
-    :func:`backward` (the NoPE record's policy plans with 2048 B per key); ``dkv_direct`` (default ``None`` = the
-    record's size rule, ``True`` / ``False`` = force / disable the natural-layout main stage adding straight into
-    the FP32 buffer -- fresh or ``dkv_acc`` alike) and ``check_dst_map`` as in :func:`prepare_dsa_nope_train`.
+    ``dout`` may be a head-major view (strides ``[512, T * 512, 1]``) or any strided ``[T, 64, 512]`` view the
+    layout rules admit: it is read in place (no host copy; the delta stage takes its token / head strides).
+    ``key_passes`` / ``num_segments`` as in :func:`backward` (the NoPE record's policy plans one pass; an explicit
+    ``key_passes`` forces the pass form); ``dkv_direct`` (default ``None`` = the record's rule, the natural-layout
+    main stage adding straight into the FP32 buffer -- fresh or ``dkv_acc`` alike -- whenever the row has at least
+    one key per query; ``True`` / ``False`` = force / disable it) and ``check_dst_map`` as in
+    :func:`prepare_dsa_nope_train`.
     A call without query rows returns an empty ``dq`` and a zero ``dkv`` (``None`` with ``dkv_acc``) without
     launching.
     """
     if dkv_dst_map is not None and dkv_acc is None:
         raise ValueError("dkv_dst_map is only meaningful together with dkv_acc")
-    dout = _dense_dout(dout)
     if _no_query_rows(q_latent):
         return _empty_backward_nope(
             q_latent,
@@ -3834,15 +3899,26 @@ def dsa_sparse_attention_nope_varlen(
     dkv_dst_map: Optional[torch.Tensor] = None,
     dkv_direct: Optional[bool] = None,
     check_dst_map: bool = False,
+    check_cu_seqlens: bool = True,
 ):
     """Packed multi-document NoPE form: per-document key indices are offset by ``cu_seqlens_k`` on device
     (:func:`offset_gather_kv_indices`; this glue counts in the step time), then the flat kernels run over the
     packed rows.  Query and key segment lengths may differ (the query segment is the tail of its key prefix);
     ``causal=True`` also drops selected keys after the query's own position ``(seqlen_k - seqlen_q) + local_q``.
     ``max_seqlen_q/k`` are accepted for signature parity and not used on the host.  The segment count
-    ``len(cu_seqlens_k) - 1`` is passed on as ``num_segments``.  Other arguments as in
+    ``len(cu_seqlens_k) - 1`` is passed on as ``num_segments``.  ``check_cu_seqlens`` (default ``True``) runs
+    :func:`validate_cu_seqlens` -- int32 prefix sums starting at 0, non-decreasing, ``cu_seqlens_q[-1] == T``,
+    ``cu_seqlens_k[-1] == S``, ``seqlen_q <= seqlen_k`` per document -- at the cost of one device-to-host copy
+    (skipped during CUDA-graph capture); ``False`` keeps the structural checks only.  Other arguments as in
     :func:`dsa_sparse_attention_nope`."""
     del max_seqlen_q, max_seqlen_k
+    validate_cu_seqlens(
+        cu_seqlens_q,
+        cu_seqlens_k,
+        int(q_latent.shape[0]),
+        int(_kv_latent_rows(kv_latent).shape[0]),
+        values=check_cu_seqlens,
+    )
     if topk_length is None:
         indices, topk_length = offset_gather_kv_indices(
             gather_kv_indices,

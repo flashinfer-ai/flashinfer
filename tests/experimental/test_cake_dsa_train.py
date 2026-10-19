@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
+import os
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -2454,6 +2456,7 @@ forward_nope = cake_backend.forward_nope
 backward_nope = cake_backend.backward_nope
 prepare_dsa_nope_train = cake_backend.prepare_dsa_nope_train
 validate_dsa_nope_inputs = cake_backend.validate_dsa_nope_inputs
+validate_cu_seqlens = cake_backend.validate_cu_seqlens
 workspace_layout_nope = cake_backend.workspace_layout_nope
 dsa_nope_train_workspace_size = cake_backend.dsa_nope_train_workspace_size
 forward_binding_key_nope = cake_backend.forward_binding_key_nope
@@ -2517,10 +2520,26 @@ NOPE_MAIN_ARGS = (
     "grid_z",
 )
 NOPE_SHARED_STAGES = {
-    "nope_bwd_delta": "bwd_delta",
     "nope_bwd_compact": "bwd_compact",
     "nope_bwd_cast": "bwd_cast",
 }
+# the strided sibling of the rope delta kernel: dout addressed as
+# dout_offset + token * dout_token_stride + head * dout_head_stride + channel (elements, multiples of 8)
+NOPE_DELTA_ARGS = (
+    "dout",
+    "out",
+    "o_lo",
+    "delta",
+    "num_rows",
+    "dout_token_stride",
+    "dout_head_stride",
+    "dout_offset",
+    "grid_x",
+    "grid_y",
+    "grid_z",
+)
+NOPE_SLOT_WIDTHS = (1, 64, 67, 256, 512, 1024, 2177)
+NOPE_LARGE_TESTS_ENV = "FLASHINFER_CAKE_DSA_NOPE_LARGE_TESTS"
 # Fixed rel-L2 table of the iid 4k x 4k, K_slots 2176 configuration (the frozen rope-path figures of the same
 # geometry times a 2 % noise band) and the element-wise output tolerance of the NoPE acceptance.
 NOPE_GATE_OUT = 0.002013 * 1.02
@@ -2685,8 +2704,8 @@ def _nope_reference(inp, indices=None, *, dout=None, topk_length=None):
 def test_registry_programs_are_well_formed(program):
     """Both records: declared stages in the program's order with physical entries, every library named in
     ``build.json`` for every arch, five launch leaves per stage, launchers and grids for every stage; the NoPE
-    record carries the rope record's policies with its own key bytes and may be partial until its libraries are
-    exported (a registered forward stage comes first)."""
+    record carries its own policies (2048 B per key, one pass by default, natural accumulation from one key per
+    query) and may be partial until its libraries are exported (a registered forward stage comes first)."""
     assert cake_jit.PROGRAMS == (cake_jit.PROGRAM, NOPE_PROGRAM)
     record = cake_jit.record(program)
     order = cake_jit.STAGES_OF[program]
@@ -2702,20 +2721,24 @@ def test_registry_programs_are_well_formed(program):
     policy = KeyPassPolicy.from_record(record)
     assert policy is not None
     direct = cake_backend.DkvDirectPolicy.from_record(record)
-    assert direct is not None and direct.min_keys_per_query == 4
+    assert direct is not None
     if program == NOPE_PROGRAM:
+        # natural accumulation whenever the row has at least one key per query (measured faster than the
+        # permuted drain on every row) and one pass by default (measured fastest on every row): no per-arch rules
+        assert direct.min_keys_per_query == 1
         assert policy.key_bytes == 2048
         assert policy.dq_partial_bytes_per_token == NOPE_DQ_PARTIAL_BYTES_PER_TOKEN
+        assert policy.max_passes == 1
+        for arch in record["arches"]:
+            assert policy.rule_for(arch) == policy.rule_for(None)
         rope = KeyPassPolicy.from_record(cake_jit.record())
         assert (policy.l2_budget_bytes, policy.workspace_budget_bytes) == (
             rope.l2_budget_bytes,
             rope.workspace_budget_bytes,
         )
-        assert (policy.token_chunk_multiple, policy.max_passes) == (
-            rope.token_chunk_multiple,
-            rope.max_passes,
-        )
-        assert policy.rules == rope.rules
+        assert policy.token_chunk_multiple == rope.token_chunk_multiple
+    else:
+        assert direct.min_keys_per_query == 4
     pending = []
     for stage in stages:
         physical = record[stage]
@@ -2762,6 +2785,12 @@ def test_registry_programs_are_well_formed(program):
                 assert tuple(cake_launch.STAGE_ARGS[stage]) == tuple(
                     cake_launch.STAGE_ARGS[shared]
                 )
+        if "nope_bwd_delta" in stages:
+            # the strided delta: its own library (not the rope delta's), 256 threads, no dynamic shared memory
+            delta = record["nope_bwd_delta"]
+            assert delta["library"] != rope["bwd_delta"]["library"]
+            assert delta["launch"]["block"] == [256, 1, 1]
+            assert delta["launch"]["dynamic_smem_bytes"] == 0
     if pending:
         # the registry is the source the export renders from; its libraries reach build.json with the export
         # (scripts/check_cake_build_manifests.py reports the gap until then)
@@ -2826,6 +2855,9 @@ def test_nope_launchers_bind_the_kernel_argument_lists_and_grids():
         assert args[stage] == NOPE_MAIN_ARGS
     for stage, shared in NOPE_SHARED_STAGES.items():
         assert args[stage] == args[shared]
+    assert args["nope_bwd_delta"] == NOPE_DELTA_ARGS
+    dense_delta = NOPE_DELTA_ARGS[:5] + NOPE_DELTA_ARGS[-3:]  # the dense sibling
+    assert args["bwd_delta"] == dense_delta
     assert "q_rope" not in NOPE_MAIN_ARGS and "dkr_f32" not in NOPE_MAIN_ARGS
     for stage in cake_jit.NOPE_STAGES:
         names = args[stage]
@@ -2937,21 +2969,101 @@ def test_validate_dsa_nope_inputs_rejects_bad_lengths_and_dout():
         1, 0, 2
     )
     assert head_major.stride() == (D_LATENT, 8 * D_LATENT, 1)
-    with pytest.raises(ValueError, match="contiguous for the delta stage"):
-        validate_dsa_nope_inputs(q, kv, idx, dout=head_major)
-
-
-def test_dense_dout_copies_strided_views_once_and_passes_dense_through():
-    dense = torch.arange(2 * NUM_HEADS * D_LATENT, dtype=torch.float32).view(
-        2, NUM_HEADS, D_LATENT
+    # a head-major dout, or a slice of a packed [T, 64, 576] tensor, is admitted: the delta stage reads dout
+    # through its token / head strides (multiples of 8 elements); an odd head stride or a channel stride is not
+    assert validate_dsa_nope_inputs(q, kv, idx, dout=head_major) == (8, 16, 5)
+    packed = torch.zeros(8, NUM_HEADS, D_QK, dtype=torch.bfloat16)
+    assert validate_dsa_nope_inputs(q, kv, idx, dout=packed[..., :D_LATENT]) == (
+        8,
+        16,
+        5,
     )
-    dense = dense.to(torch.bfloat16)
-    assert cake_backend._dense_dout(dense) is dense
-    head_major = dense.permute(1, 0, 2).contiguous().permute(1, 0, 2)
-    assert head_major.stride() == (D_LATENT, 2 * D_LATENT, 1)
-    copy = cake_backend._dense_dout(head_major)
-    assert copy.is_contiguous() and copy.data_ptr() != head_major.data_ptr()
-    assert torch.equal(copy, dense)
+    odd = torch.zeros(8, NUM_HEADS, D_LATENT + 4, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="head stride"):
+        validate_dsa_nope_inputs(q, kv, idx, dout=odd[..., :D_LATENT])
+    wide = torch.zeros(8, NUM_HEADS, 2 * D_LATENT, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="last dimension"):
+        validate_dsa_nope_inputs(q, kv, idx, dout=wide[..., ::2])
+
+
+def _i32(*values):
+    return torch.tensor(values, dtype=torch.int32)
+
+
+def test_validate_cu_seqlens_checks_structure_and_values():
+    """The varlen invariants: int32 ``[num_docs + 1]`` prefix sums of one length, starting at 0, non-decreasing,
+    ending at the packed ``T`` / ``S`` (a shorter or longer key window is rejected, not truncated) and with
+    ``seqlen_q <= seqlen_k`` per document; ``values=False`` keeps the structural checks only."""
+    validate_cu_seqlens(_i32(0, 3, 8), _i32(0, 5, 16), 8, 16)
+    validate_cu_seqlens(_i32(0, 0, 8), _i32(0, 4, 16), 8, 16)  # an empty query segment
+    validate_cu_seqlens(_i32(0, 0), _i32(0, 16), 0, 16)  # no query rows at all
+    cases = [
+        (torch.tensor([0, 8]), _i32(0, 16), 8, 16, "cu_seqlens_q must be an int32"),
+        (_i32(0, 8), _i32(0, 16).view(2, 1), 8, 16, "cu_seqlens_k must be an int32"),
+        (_i32(0), _i32(0), 0, 0, r"\[num_docs \+ 1\]"),
+        (_i32(0, 3, 8), _i32(0, 16), 8, 16, "same documents"),
+        (_i32(1, 8), _i32(0, 16), 8, 16, "cu_seqlens_q must start at 0"),
+        (_i32(0, 8), _i32(2, 16), 8, 16, "cu_seqlens_k must start at 0"),
+        (
+            _i32(0, 5, 3, 8),
+            _i32(0, 5, 10, 16),
+            8,
+            16,
+            "cu_seqlens_q must be non-decreasing",
+        ),
+        (
+            _i32(0, 4, 6, 8),
+            _i32(0, 12, 10, 16),
+            8,
+            16,
+            "cu_seqlens_k must be non-decreasing",
+        ),
+        (
+            _i32(0, 8),
+            _i32(0, 12),
+            8,
+            16,
+            r"cu_seqlens_k\[-1\] \(12\) must equal the packed key rows S \(16\)",
+        ),
+        (_i32(0, 8), _i32(0, 20), 8, 16, r"cu_seqlens_k\[-1\] \(20\)"),
+        (
+            _i32(0, 6),
+            _i32(0, 16),
+            8,
+            16,
+            r"cu_seqlens_q\[-1\] \(6\) must equal the packed query rows T \(8\)",
+        ),
+        (
+            _i32(0, 6, 8),
+            _i32(0, 4, 16),
+            8,
+            16,
+            r"document 0 has seqlen_q \(6\) > seqlen_k \(4\)",
+        ),
+    ]
+    for bad_q, bad_k, T, S, match in cases:
+        with pytest.raises(ValueError, match=match):
+            validate_cu_seqlens(bad_q, bad_k, T, S)
+    # values=False: the structural checks only (a timed loop over inputs validated once)
+    validate_cu_seqlens(_i32(0, 8), _i32(0, 12), 8, 16, values=False)
+    validate_cu_seqlens(_i32(0, 6, 8), _i32(0, 4, 16), 8, 16, values=False)
+    with pytest.raises(ValueError, match="int32"):
+        validate_cu_seqlens(torch.tensor([0, 8]), _i32(0, 16), 8, 16, values=False)
+
+
+def test_nope_varlen_backend_entry_checks_cu_seqlens_before_any_device_work():
+    """The backend's varlen entry validates the prefix sums first (host tensors: nothing else would run), and
+    ``check_cu_seqlens=False`` skips the value checks only."""
+    q, kv, idx = _nope_host_inputs()
+    varlen = cake_backend.dsa_sparse_attention_nope_varlen
+    with pytest.raises(ValueError, match=r"cu_seqlens_k\[-1\]"):
+        varlen(q, kv, idx, _i32(0, 8), _i32(0, 12), 8, 12)
+    with pytest.raises(ValueError, match="seqlen_q"):
+        varlen(q, kv, idx, _i32(0, 6, 8), _i32(0, 4, 16), 8, 16)
+    with pytest.raises(ValueError, match="non-decreasing"):
+        varlen(q, kv, idx, _i32(0, 5, 3, 8), _i32(0, 5, 10, 16), 8, 16)
+    with pytest.raises(ValueError, match="same documents"):
+        varlen(q, kv, idx, _i32(0, 3, 8), _i32(0, 16), 8, 16, check_cu_seqlens=False)
 
 
 def test_kv_latent_rows_squeezes_the_one_head_form_only():
@@ -3046,6 +3158,38 @@ def test_nope_key_pass_policy_plans_with_2048_bytes_per_key():
         assert chunk % policy.token_chunk_multiple == 0
     assert policy.formula_passes(4096) == 1
     assert policy.formula_passes(262144) == -(-262144 * 2048 // policy.l2_budget_bytes)
+    # one pass by default on every row (max_passes 1, no per-architecture rules; one pass measured fastest on
+    # every row, build and GPU of this form); an explicit key_passes still plans the pass form
+    assert policy.max_passes == 1
+    for arch in ("sm_100a", "sm_103a", "sm_107a", None):
+        assert policy.rule_for(arch) == policy.rule_for(None)
+        for T, S in ((2048, 65536), (4096, 131072), (4096, 270336), (32768, 262144)):
+            assert policy.passes(T, S, 2176, arch=arch) == 1
+    nope_record = cake_jit.record(NOPE_PROGRAM)
+    stages = cake_jit.NOPE_STAGES
+    assert (
+        plan_key_passes(nope_record, stages, 4096, 131072, 2176, program=NOPE_PROGRAM)
+        == 1
+    )
+    assert (
+        plan_key_passes(
+            nope_record, stages, 4096, 131072, 2176, 2, program=NOPE_PROGRAM
+        )
+        == 2
+    )
+    assert (
+        plan_key_passes(
+            nope_record,
+            stages,
+            4096,
+            131072,
+            2176,
+            3,
+            arch="sm_103a",
+            program=NOPE_PROGRAM,
+        )
+        == 3
+    )
     # the rope record keeps its defaults (147,456 B per token)
     rope = KeyPassPolicy.from_record(cake_jit.record())
     assert rope.key_bytes == D_QK * 4
@@ -3379,10 +3523,11 @@ def test_nope_plan_forward_launch_values(monkeypatch):
 
 
 def test_nope_plan_backward_fresh_and_accumulate_by_the_direct_rule(monkeypatch):
-    """S = 8 T: the record's rule (4 keys per query) selects the natural-layout main stage adding into the FP32
+    """S = 8 T: the record's rule (one key per query) selects the natural-layout main stage adding into the FP32
     buffer -- the fresh ``dkv`` (zero-filled, stride 512) or the caller's rows (their stride, the map) -- with no
     cast; ``dkv_direct=False`` routes both forms through the permuted accumulator and the cast (``out_f32`` for
-    the fresh buffer, ``accumulate`` into the caller's rows); S = 2 T takes the cast path unless ``dkv_direct=True``."""
+    the fresh buffer, ``accumulate`` into the caller's rows); T > S (fewer keys than query rows) takes the cast
+    path unless ``dkv_direct=True``.  The delta stage receives the dense ``dout``'s strides and a zero offset."""
     calls = []
     _stand_in_nope_program(monkeypatch, calls)
     T, S, K = 8, 64, 5
@@ -3416,6 +3561,11 @@ def test_nope_plan_backward_fresh_and_accumulate_by_the_direct_rule(monkeypatch)
     assert delta["num_rows"] == T * NUM_HEADS and delta["grid_x"] == T * 8
     assert delta["dout"] is dout and delta["delta"] is main["delta"]
     assert delta["out"] is out and delta["o_lo"] is o_lo
+    assert (
+        delta["dout_token_stride"],
+        delta["dout_head_stride"],
+        delta["dout_offset"],
+    ) == (NUM_HEADS * D_LATENT, D_LATENT, 0)
     # fresh through the cast
     dq2, dkv2 = backward_nope(*args, dkv_direct=False)
     assert [c[0] for c in calls] == ["nope_bwd_delta", "nope_bwd_main", "nope_bwd_cast"]
@@ -3460,8 +3610,8 @@ def test_nope_plan_backward_fresh_and_accumulate_by_the_direct_rule(monkeypatch)
     assert cast["dst_packed"].data_ptr() == acc.data_ptr() and cast["dst_map"] is perm
     assert (cast["out_f32"], cast["accumulate"], cast["has_dst_map"]) == (0, 1, 1)
     assert cast["dst_row_stride"] == 704 and cast["dst_latent_f32"] is main["dkv_f32"]
-    # S = 2 T: the rule takes the cast path; dkv_direct=True forces the natural stage
-    q, kv, idx, dout = _nope_device_inputs(T, 2 * T, K, seed=1)
+    # T = 2 S (fewer keys than query rows): the rule takes the cast path; dkv_direct=True forces the natural stage
+    q, kv, idx, dout = _nope_device_inputs(T, T // 2, K, seed=1)
     small = (q, kv, idx, out, o_lo, lse, dout)
     backward_nope(*small)
     assert launched() == ["nope_bwd_delta", "nope_bwd_main", "nope_bwd_cast"]
@@ -3542,7 +3692,10 @@ def test_nope_plan_multi_pass_backward_launch_order(monkeypatch):
             )["total"]
         )
     assert cake_backend._plan_nope_direct(record, stages, T, S, None)
-    assert not cake_backend._plan_nope_direct(record, stages, T, 2 * T, None)
+    # one key per query suffices for the natural path; fewer keys than query rows do not
+    assert cake_backend._plan_nope_direct(record, stages, T, T, None)
+    assert not cake_backend._plan_nope_direct(record, stages, 2 * S, S, None)
+    assert not cake_backend._plan_nope_direct(record, stages, T, S, False)
     runner = prepare_dsa_nope_train(
         q, kv, idx, dout=dout, key_passes=2, dkv_direct=False
     )
@@ -3660,17 +3813,32 @@ def test_nope_prepared_runner_binds_outputs_scratch_and_zero_fill(monkeypatch):
         prepare_dsa_nope_train(q, kv, idx, dkv_acc=acc)
     with pytest.raises(ValueError, match="needs dout"):
         prepare_dsa_nope_train(q, kv, idx, backward=True)
-    with pytest.raises(ValueError, match="contiguous for the delta stage"):
-        prepare_dsa_nope_train(
-            q, kv, idx, dout=dout.permute(1, 0, 2).contiguous().permute(1, 0, 2)
-        )
     with pytest.raises(ValueError, match="dkv must be"):
         prepare_dsa_nope_train(q, kv, idx, dout=dout, dkv=dkv.to(torch.bfloat16))
     with pytest.raises(ValueError, match="backend='cake'"):
         prepare_dsa_nope_train(q, kv, idx, backend="other")
+    # a head-major dout is bound in place: the delta stage receives its token / head strides
+    calls.clear()
+    head_major = dout.permute(1, 0, 2).contiguous().permute(1, 0, 2)
+    hm_runner = prepare_dsa_nope_train(q, kv, idx, dout=head_major)
+    assert hm_runner.tensors["dout"].data_ptr() == head_major.data_ptr()
+    assert hm_runner.tensors["dout"].stride() == head_major.stride()
+    hm_runner.backward()
+    assert [c[0] for c in calls] == ["nope_bwd_delta", "nope_bwd_main_natural"]
+    delta, main = calls[0][1], calls[1][1]
+    assert delta["dout"].data_ptr() == head_major.data_ptr()
+    assert main["dout"].data_ptr() == head_major.data_ptr()
+    assert (
+        delta["dout_token_stride"],
+        delta["dout_head_stride"],
+        delta["dout_offset"],
+    ) == (D_LATENT, T * D_LATENT, 0)
 
 
-def test_nope_eager_backward_copies_a_strided_dout_once(monkeypatch):
+def test_nope_eager_backward_reads_a_strided_dout_in_place(monkeypatch):
+    """A head-major ``dout`` (or a slice of a packed ``[T, 64, 576]`` tensor) is handed to the delta and main
+    stages as is -- no copy: the delta receives the token / head strides in elements and a zero offset, the dense
+    call its dense strides; every layout is its own plan (the binding key carries the strides)."""
     calls = []
     _stand_in_nope_program(monkeypatch, calls)
     T, S, K = 8, 64, 5
@@ -3678,18 +3846,38 @@ def test_nope_eager_backward_copies_a_strided_dout_once(monkeypatch):
     out, lse, o_lo = _saved_outputs(T)
     head_major = dout.permute(1, 0, 2).contiguous().permute(1, 0, 2)
     assert head_major.stride() == (D_LATENT, T * D_LATENT, 1)
+
+    def delta_strides():
+        delta = calls[0][1]
+        assert calls[0][0] == "nope_bwd_delta"
+        assert delta["num_rows"] == T * NUM_HEADS and delta["grid_x"] == T * 8
+        return (
+            delta["dout"],
+            delta["dout_token_stride"],
+            delta["dout_head_stride"],
+            delta["dout_offset"],
+        )
+
     backward_nope(q, kv, idx, out, o_lo, lse, head_major)
-    delta, main = calls[0][1], calls[1][1]
+    seen, token, head, offset = delta_strides()
     assert (
-        delta["dout"].is_contiguous()
-        and delta["dout"].data_ptr() != head_major.data_ptr()
+        seen.data_ptr() == head_major.data_ptr()
+        and seen.stride() == head_major.stride()
     )
-    assert torch.equal(delta["dout"], dout) and main["dout"] is delta["dout"]
+    assert calls[1][1]["dout"].data_ptr() == head_major.data_ptr()
+    assert (token, head, offset) == (D_LATENT, T * D_LATENT, 0)
     calls.clear()
     backward_nope(q, kv, idx, out, o_lo, lse, dout)
-    assert calls[0][1]["dout"] is dout  # a dense dout is read in place
-    # the two calls share one plan: the copy has the geometry of the dense tensor
-    assert len(cake_backend.BINDING_CACHE) == 1
+    seen, token, head, offset = delta_strides()
+    assert seen is dout and (token, head, offset) == (NUM_HEADS * D_LATENT, D_LATENT, 0)
+    calls.clear()
+    packed = torch.zeros(T, NUM_HEADS, D_QK, dtype=torch.bfloat16, device="cuda")
+    packed[..., :D_LATENT] = dout
+    backward_nope(q, kv, idx, out, o_lo, lse, packed[..., :D_LATENT])
+    seen, token, head, offset = delta_strides()
+    assert seen.data_ptr() == packed.data_ptr()
+    assert (token, head, offset) == (NUM_HEADS * D_QK, D_QK, 0)
+    assert len(cake_backend.BINDING_CACHE) == 3  # three layouts, three plans
 
 
 def test_nope_registered_record_without_kernels_fails_loudly():
@@ -3761,13 +3949,102 @@ def test_nope_forward_pooled_default_width():
     _check_forward_nope(out, lse, _nope_reference(inp))
 
 
-@pytest.mark.parametrize("topk", [1, 64, 67, 2177])
-def test_nope_forward_odd_slot_widths(topk):
+@pytest.mark.parametrize("topk", NOPE_SLOT_WIDTHS)
+def test_nope_forward_slot_widths(topk):
+    """Any ``K_slots >= 1``: the 256 / 512 / 1024 widths, the odd widths 1 / 67 / 2177 and 64."""
     _require_nope_program()
     inp = _nope_inputs(130, 512, seed=NOPE_SEED + topk, topk=topk)
     out, lse, _ = forward_nope(inp.q, inp.kv, inp.idx_global)
     torch.cuda.synchronize()
     _check_forward_nope(out, lse, _nope_reference(inp))
+
+
+@pytest.mark.parametrize("key_passes", [1, 2])
+@pytest.mark.parametrize("topk", NOPE_SLOT_WIDTHS)
+def test_nope_backward_slot_widths(topk, key_passes):
+    """The backward at every width above, as the single pass and as two forced passes (the compaction and pass
+    stages read the index rows through the same ``K_slots`` metadata), each against the reference."""
+    if key_passes > 1:
+        _require_nope_pass_program()
+    else:
+        _require_nope_program(backward=True)
+    inp = _nope_inputs(130, 512, seed=NOPE_SEED + 100 + topk, topk=topk)
+    out, lse, o_lo = forward_nope(inp.q, inp.kv, inp.idx_global)
+    dq, dkv = backward_nope(
+        inp.q, inp.kv, inp.idx_global, out, o_lo, lse, inp.dout, key_passes=key_passes
+    )
+    torch.cuda.synchronize()
+    _check_backward_nope(dq, dkv, _nope_reference(inp, dout=inp.dout))
+
+
+@pytest.mark.parametrize("seq_q, seq_k", [(4095, 4096), (4097, 4097)])
+def test_nope_irregular_tail_lengths(seq_q, seq_k):
+    """Query counts one below and one above a 4096 multiple (the latter with an odd key count): the forward and the
+    single-pass backward handle the partial tail tile at the top-k width 2176."""
+    _require_nope_program(backward=True)
+    inp = _nope_inputs(seq_q, seq_k, seed=NOPE_SEED + 200 + seq_q, topk=2176)
+    out, lse, o_lo = forward_nope(inp.q, inp.kv, inp.idx_global)
+    dq, dkv = backward_nope(inp.q, inp.kv, inp.idx_global, out, o_lo, lse, inp.dout)
+    torch.cuda.synchronize()
+    ref = _nope_reference(inp, dout=inp.dout)
+    _check_forward_nope(out, lse, ref)
+    _check_backward_nope(dq, dkv, ref)
+
+
+def test_nope_backward_32k_x_256k_skewed_per_row_dq_p99():
+    """The 32k x 256k peaked row (own key ~99 % of the softmax mass, iid K_slots 2176): per-token ``dq`` rel-L2
+    p99 within ``GATE_ROW_P99_DQ``; ``out``, ``dq`` and ``dkv`` within 1.05x their BF16-P/dS numerics floors.  The FP64 reference streams over 256-row chunks and takes minutes: opt in with
+    ``FLASHINFER_CAKE_DSA_NOPE_LARGE_TESTS=1``."""
+    if os.environ.get(NOPE_LARGE_TESTS_ENV, "") != "1":
+        pytest.skip(
+            f"set {NOPE_LARGE_TESTS_ENV}=1 to run the 32k x 256k per-row p99 case (minutes of FP64 reference)"
+        )
+    _require_nope_program(backward=True)
+    T, S, K = 32768, 262144, 2176
+    beta = nope_ref.calibrate_beta_nope(0.99, seed=NOPE_SEED + 300, topk=K)
+    inp = _nope_inputs(
+        T, S, seed=NOPE_SEED + 300, topk=K, self_including=True, beta=beta
+    )
+    out, lse, o_lo = forward_nope(inp.q, inp.kv, inp.idx_global)
+    dq, dkv = backward_nope(inp.q, inp.kv, inp.idx_global, out, o_lo, lse, inp.dout)
+    torch.cuda.synchronize()
+    rows = []
+    sq = {k: 0.0 for k in ("err", "emu", "ref", "out_err", "out_emu", "out_ref")}
+
+    def consume(r0, r1, chunk):
+        d_ref, o_ref = chunk["dq"], chunk["out"]
+        rows.append(rel_l2_rows(dq[r0:r1], d_ref).cpu())
+        sq["err"] += (dq[r0:r1].double() - d_ref).pow(2).sum().item()
+        sq["emu"] += (chunk["dq_emu"] - d_ref).pow(2).sum().item()
+        sq["ref"] += d_ref.pow(2).sum().item()
+        sq["out_err"] += (out[r0:r1].double() - o_ref).pow(2).sum().item()
+        sq["out_emu"] += (chunk["out_emu"] - o_ref).pow(2).sum().item()
+        sq["out_ref"] += o_ref.pow(2).sum().item()
+
+    ref = nope_ref.reference_fp64_nope(
+        inp.q,
+        inp.kv,
+        inp.idx_global,
+        dout=inp.dout,
+        softmax_scale=NOPE_SOFTMAX_SCALE,
+        own_key=inp.own_key,
+        consume=consume,
+    )
+    assert 0.9 < ref["self_weight"] < 0.999, (
+        f"calibrated self weight {ref['self_weight']:.4f} outside the peaked window"
+    )
+    p99 = torch.cat(rows).quantile(0.99).item()
+    assert p99 <= GATE_ROW_P99_DQ, f"per-row dq rel-L2 p99 {p99:.6f}"
+    for name, prefix in (("dq", ""), ("out", "out_")):
+        err = math.sqrt(sq[prefix + "err"] / sq[prefix + "ref"])
+        floor = math.sqrt(sq[prefix + "emu"] / sq[prefix + "ref"])
+        assert err <= FLOOR_MARGIN * floor + FLOOR_ABS, (
+            f"{name}: rel-L2 {err:.6f} vs floor {floor:.6f}"
+        )
+    err, floor = rel_l2(dkv, ref["dkv"]), rel_l2(ref["dkv_emu"], ref["dkv"])
+    assert err <= FLOOR_MARGIN * floor + FLOOR_ABS, (
+        f"dkv: rel-L2 {err:.6f} vs floor {floor:.6f}"
+    )
 
 
 def test_nope_forward_masked_rows_and_out_of_range():
@@ -3950,8 +4227,12 @@ def test_nope_backward_head_major_dout_matches_dense():
     torch.cuda.synchronize()
     assert torch.equal(dq_hm, dq) and rel_l2(dkv_hm, dkv) < ACC_REL_L2
     _check_backward_nope(dq_hm, dkv_hm, _nope_reference(inp, dout=dense))
-    with pytest.raises(ValueError, match="contiguous for the delta stage"):
-        prepare_dsa_nope_train(inp.q, inp.kv, inp.idx_global, dout=inp.dout)
+    # a prepared runner reads the head-major view in place as well
+    runner = prepare_dsa_nope_train(inp.q, inp.kv, inp.idx_global, dout=inp.dout)
+    assert runner.tensors["dout"].data_ptr() == inp.dout.data_ptr()
+    dq_r, dkv_r = runner.step()
+    torch.cuda.synchronize()
+    assert torch.equal(dq_r, dq) and rel_l2(dkv_r, dkv) < ACC_REL_L2
 
 
 def test_nope_backward_deterministic_dq_and_dkv_spread():

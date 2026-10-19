@@ -1323,7 +1323,11 @@ def test_nope_public_entries_forward_their_keywords_to_the_backend(monkeypatch):
         dkv_dst_map=None,
         dkv_direct=False,
         check_dst_map=True,
+        check_cu_seqlens=True,
     )
+    with _quiet_experimental():
+        dsa_sparse_attention_nope_varlen(q, kv, idx, cu_q, cu_k, check_cu_seqlens=False)
+    assert seen["varlen"][7]["check_cu_seqlens"] is False
 
 
 def test_nope_autograd_matches_explicit_backward_and_casts_kv_grad_to_the_leaf():
@@ -1465,3 +1469,42 @@ def test_nope_varlen_causal_tail_of_prefix_drops_future_keys():
     assert torch.equal(out_c, out_f) and torch.equal(lse_c, lse_f)
     ref = nope_ref.reference_fp64_nope(inp.q, inp.kv, masked)
     assert rel_l2(out_c, ref["out"]) <= _floor_gate(ref)
+
+
+def test_nope_varlen_rejects_inconsistent_cu_seqlens_through_the_public_entry():
+    """A key window shorter than the packed keys, a query segment longer than its key prefix and a non-monotonic
+    prefix sum raise ``ValueError`` before any launch; ``check_cu_seqlens=False`` keeps the structural checks only,
+    so the shorter window runs (its documents see fewer keys: the caller's responsibility)."""
+    _require_nope_program()
+    inp = _nope_inputs([256, 128], [512, 512], seed=NOPE_SEED + 4, topk=96)
+    cu_q, cu_k = inp.cu_seqlens_q, inp.cu_seqlens_k
+
+    def i32(*values):
+        return torch.tensor(values, dtype=torch.int32, device="cuda")
+
+    short = cu_k.clone()
+    short[-1] = inp.total_k - 64
+    with _quiet_experimental():
+        with pytest.raises(ValueError, match=r"cu_seqlens_k\[-1\]"):
+            dsa_sparse_attention_nope_varlen(inp.q, inp.kv, inp.idx_local, cu_q, short)
+        with pytest.raises(ValueError, match="seqlen_q"):
+            dsa_sparse_attention_nope_varlen(
+                inp.q, inp.kv, inp.idx_local, cu_q, i32(0, 200, inp.total_k)
+            )
+        with pytest.raises(ValueError, match="non-decreasing"):
+            dsa_sparse_attention_nope_varlen(
+                inp.q,
+                inp.kv,
+                inp.idx_local,
+                i32(0, 300, 256, inp.total_q),
+                i32(0, 512, 512, inp.total_k),
+            )
+        with pytest.raises(ValueError, match="int32"):
+            dsa_sparse_attention_nope_varlen(
+                inp.q, inp.kv, inp.idx_local, cu_q.long(), cu_k, check_cu_seqlens=False
+            )
+        out = dsa_sparse_attention_nope_varlen(
+            inp.q, inp.kv, inp.idx_local, cu_q, short, check_cu_seqlens=False
+        )
+    torch.cuda.synchronize()
+    assert tuple(out.shape) == (inp.total_q, NUM_HEADS, D_LATENT)
