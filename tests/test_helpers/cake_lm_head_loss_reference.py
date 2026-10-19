@@ -16,7 +16,8 @@ limitations under the License.
 Seeded inputs, the unchunked PyTorch baseline and the chunked FP64 oracle of
 the chunked LM-head + loss training problem (``X [T, H]`` BF16 hidden states,
 ``W [V, H]`` BF16 output weight, int64 labels with ``-100`` = ignored), shared
-by ``tests/experimental/test_cake_lm_head_loss.py`` and
+by ``tests/experimental/test_cake_lm_head_loss.py``,
+``tests/experimental/test_cake_lm_head_loss_api.py`` and
 ``benchmarks/bench_cake_lm_head_loss.py``.
 
 Contract reproduced here (see ``flashinfer.chunked_lm_head``):

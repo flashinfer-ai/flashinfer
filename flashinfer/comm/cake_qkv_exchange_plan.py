@@ -36,7 +36,7 @@ H_local, D]`` planes for Q, K, V) or ``"fused"`` (one ``[B, S_global, H_local,
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import torch
 
@@ -90,7 +90,66 @@ PAIR_BN = 256
 PAIR_MIN_M = 4096
 PAIR_MIN_GROUPS = 4
 PAIR_ARCHES: tuple[str, ...] = ("sm_100a", "sm_103a")
+# Group sizes the fused exchange is delivered for; every per-(architecture, world size) table below has exactly
+# these keys per architecture.
+SUPPORTED_WORLD_SIZES: tuple[int, ...] = (2, 4, 8)
+# Group scaling: ``group_m_scale`` multiplies the ``grouped`` group count of a row whose ``hidden >=
+# GROUP_M_SCALE_MIN_K`` (and raises the activation-slice budget by the same factor); every other row keeps the
+# baseline plan.  ``GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD`` is the shipped scale per architecture and world size
+# (1 = the baseline plan): measured per (architecture, world size) -- SM100 groups of 4 and 2 ranks and SM103
+# every group size double the group, SM100 groups of 8 ranks and SM90 keep the baseline plan.  The scale changes
+# the tile ORDER only (every destination element is still written exactly once; the readiness words are
+# unchanged); ``FLASHINFER_QKV_EXCHANGE_GROUP_M_SCALE`` (see the Cake backend) overrides a session's scale.
+GROUP_M_SCALES: tuple[int, ...] = (1, 2, 4)
+GROUP_M_SCALE_MIN_K = 6144
+GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD: dict[str, dict[int, int]] = {
+    "sm_90a": {2: 1, 4: 1, 8: 1},
+    "sm_100a": {2: 2, 4: 2, 8: 1},
+    "sm_103a": {2: 2, 4: 2, 8: 2},
+}
 LAYOUTS: tuple[str, ...] = ("bshd", "fused")
+# SMs the persistent producer grid leaves free: one for the wait kernel, one
+# slack (``producer_grid``); a fired ``reserved_sms_large_m`` gate selects 0.
+RESERVED_SMS = 2
+# Row-count gates of the host plan (``rows = batch * s_local`` of a call: the token
+# rows this rank projects), in the order of ``SHAPE_GATE_NAMES``.
+# ``words_capacity_small_m``: a call with ``rows <= T`` publishes one readiness
+# word per destination (``words_capacity_per_dest = 1``: the wait kernel scans
+# ``world_size`` words instead of one per 128-row tile and destination);
+# ``reserved_sms_large_m``: a call with ``rows >= T`` runs the persistent producer
+# grid over every SM (``reserved_sms = 0`` instead of ``RESERVED_SMS``);
+# ``per_dest_large_m``: a call with ``rows >= T`` launches the producer once per
+# destination run of its tile table (the first launch carries the folded
+# rendezvous, the later ones are the plain producer, stream-ordered behind it)
+# instead of one persistent grid.  ``0`` = the gate never fires.  Every gate is
+# inclusive at its threshold and changes neither the tile table nor the stored
+# bits.  Measured per architecture: SM100 / SM103 ship the small-row word gate
+# and the per-destination launch gate, SM90 ships the large-row reserved-SM gate;
+# ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` (see the Cake backend) overrides a
+# session's gates in either direction.
+SHAPE_GATE_NAMES: tuple[str, ...] = (
+    "words_capacity_small_m",
+    "reserved_sms_large_m",
+    "per_dest_large_m",
+)
+SHAPE_GATE_OFF = 0
+SHAPE_GATE_DEFAULT_BY_ARCH: dict[str, dict[str, int]] = {
+    "sm_90a": {
+        "words_capacity_small_m": SHAPE_GATE_OFF,
+        "reserved_sms_large_m": 16384,
+        "per_dest_large_m": SHAPE_GATE_OFF,
+    },
+    "sm_100a": {
+        "words_capacity_small_m": 4096,
+        "reserved_sms_large_m": SHAPE_GATE_OFF,
+        "per_dest_large_m": 16384,
+    },
+    "sm_103a": {
+        "words_capacity_small_m": 4096,
+        "reserved_sms_large_m": SHAPE_GATE_OFF,
+        "per_dest_large_m": 16384,
+    },
+}
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -180,6 +239,7 @@ class Policy:
     a_bytes: int
     m_tiles: int
     reasons: tuple[str, ...]
+    group_m_scale: int = 1
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -189,6 +249,7 @@ class Policy:
             "pair": self.pair,
             "a_bytes": self.a_bytes,
             "m_tiles": self.m_tiles,
+            "group_m_scale": self.group_m_scale,
             "reasons": list(self.reasons),
         }
 
@@ -200,7 +261,11 @@ def pair_geometry(geometry: Geometry) -> bool:
 
 
 def plan_policy(
-    geometry: Geometry, *, arch: str, pair_available: bool = True
+    geometry: Geometry,
+    *,
+    arch: str,
+    pair_available: bool = True,
+    group_m_scale: int | None = None,
 ) -> Policy:
     """Resolve tile width, tile order and the pair tile from ``(M, K, H_local)``.
 
@@ -213,8 +278,20 @@ def plan_policy(
        with ``M >= PAIR_MIN_M`` (or above the L2 budget) are ``grouped`` with the
        largest even ``group_m`` within the slice budget and at most
        ``m_tiles // PAIR_MIN_GROUPS``; smaller pair rows keep ``nt_outer``.
+    4. ``group_m_scale`` (``None`` = the architecture's default for the
+       geometry's world size, ``GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD[arch]
+       [world_size]``): a ``grouped`` row with ``hidden >= GROUP_M_SCALE_MIN_K``
+       takes ``group_m`` times the scale (capped at ``m_tiles``, kept even under
+       the pair) within the slice budget raised by the same factor; other rows
+       are unchanged.
     """
 
+    if group_m_scale is None:
+        group_m_scale = default_group_m_scale(arch, geometry.world_size)
+    if isinstance(group_m_scale, bool) or group_m_scale not in GROUP_M_SCALES:
+        raise ValueError(
+            f"group_m_scale must be one of {GROUP_M_SCALES}, got {group_m_scale!r}"
+        )
     bn = block_n_for(geometry)
     M, K = geometry.rows, geometry.hidden
     m_tiles = ceil_div(M, BLOCK_M)
@@ -259,6 +336,22 @@ def plan_policy(
         reasons.append(
             f"A bytes {a_bytes} > {NT_OUTER_A_BYTES_MAX} -> grouped, group_m = {group_m}"
         )
+    if group_m_scale != 1 and order == "grouped" and K >= GROUP_M_SCALE_MIN_K:
+        scaled = min(m_tiles, group_m * group_m_scale)
+        if pair and scaled % PAIR_LOCKSTEP and scaled != m_tiles:
+            scaled -= scaled % PAIR_LOCKSTEP
+        slice_bytes = 2 * scaled * BLOCK_M * K
+        budget = GROUP_A_SLICE_BYTES_MAX * group_m_scale
+        if slice_bytes > budget:
+            raise ValueError(
+                f"group_m_scale={group_m_scale}: A slice 2 * {scaled} * {BLOCK_M} * {K} = "
+                f"{slice_bytes} exceeds the raised budget {budget}"
+            )
+        reasons.append(
+            f"group_m_scale={group_m_scale} (K {K} >= {GROUP_M_SCALE_MIN_K}): group_m "
+            f"{group_m} -> {scaled} within {budget >> 20} MiB"
+        )
+        group_m = scaled
     return Policy(
         bn=bn,
         order=order,
@@ -267,6 +360,7 @@ def plan_policy(
         a_bytes=a_bytes,
         m_tiles=m_tiles,
         reasons=tuple(reasons),
+        group_m_scale=group_m_scale,
     )
 
 
@@ -568,10 +662,14 @@ def plan_for(
     arch: str,
     pair_available: bool = True,
     words_capacity_per_dest: int = DEFAULT_WORDS_CAPACITY_PER_DEST,
+    group_m_scale: Optional[int] = None,
 ) -> tuple[Policy, TilePlan]:
-    """Policy and tile plan of one row for one rank."""
+    """Policy and tile plan of one row for one rank (``group_m_scale`` ``None`` = the architecture's default for
+    the geometry's world size)."""
 
-    policy = plan_policy(geometry, arch=arch, pair_available=pair_available)
+    policy = plan_policy(
+        geometry, arch=arch, pair_available=pair_available, group_m_scale=group_m_scale
+    )
     plan = chunk_plan(
         geometry,
         layout,
@@ -602,12 +700,142 @@ def words_capacity_for_rows(max_rows: int) -> int:
     return min(DEFAULT_WORDS_CAPACITY_PER_DEST, ceil_div(int(max_rows), BLOCK_M))
 
 
+def default_group_m_scale(arch: str, world_size: int) -> int:
+    """The shipped ``group_m_scale`` of ``arch`` for a group of ``world_size`` ranks
+    (``GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD``); an unknown architecture or world size is an error."""
+
+    try:
+        row = GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD[arch]
+    except KeyError:
+        raise ValueError(
+            f"no group_m_scale default for architecture {arch!r}; known: "
+            f"{tuple(GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD)}"
+        ) from None
+    try:
+        return row[world_size]
+    except KeyError:
+        raise ValueError(
+            f"no group_m_scale default for architecture {arch!r} at world_size={world_size!r}; known: {tuple(row)}"
+        ) from None
+
+
+def default_shape_gates(arch: str) -> dict[str, int]:
+    """The shipped row-count gates of ``arch`` (:data:`SHAPE_GATE_DEFAULT_BY_ARCH`; a copy); an unknown architecture
+    is an error."""
+
+    try:
+        return dict(SHAPE_GATE_DEFAULT_BY_ARCH[arch])
+    except KeyError:
+        raise ValueError(
+            f"no shape gates for architecture {arch!r}; known: {tuple(SHAPE_GATE_DEFAULT_BY_ARCH)}"
+        ) from None
+
+
+def check_shape_gates(gates: Mapping[str, Any]) -> dict[str, int]:
+    """Validate a gate table: exactly :data:`SHAPE_GATE_NAMES`, each an int ``>= 0`` (``0`` = off)."""
+
+    if set(gates) != set(SHAPE_GATE_NAMES):
+        raise ValueError(
+            f"shape gates must name exactly {SHAPE_GATE_NAMES}, got {tuple(gates)}"
+        )
+    checked: dict[str, int] = {}
+    for name in SHAPE_GATE_NAMES:
+        value = gates[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"shape gate {name} must be an int >= 0 (0 = off), got {value!r}"
+            )
+        checked[name] = int(value)
+    return checked
+
+
+@dataclass(frozen=True)
+class ShapeGateVerdict:
+    """The row-count gates of one call (``rows = batch * s_local``): which fired and what they select.
+    ``words_capacity_per_dest`` is ``1`` when the small-row gate fired, else ``None`` (the session's capacity
+    stands); ``reserved_sms`` is ``0`` when the large-row reserved-SM gate fired, else ``None`` (``RESERVED_SMS``
+    stands); ``producer_launches`` is ``"per_dest"`` or ``"persistent"``."""
+
+    rows: int
+    gates: dict[str, int]
+    words_capacity_per_dest: Optional[int]
+    producer_launches: str
+    reserved_sms: Optional[int] = None
+
+    @property
+    def fired(self) -> tuple[str, ...]:
+        """The gates that fired, in ``SHAPE_GATE_NAMES`` order."""
+
+        fired = []
+        if self.words_capacity_per_dest is not None:
+            fired.append("words_capacity_small_m")
+        if self.reserved_sms is not None:
+            fired.append("reserved_sms_large_m")
+        if self.producer_launches == "per_dest":
+            fired.append("per_dest_large_m")
+        return tuple(fired)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "rows": self.rows,
+            "gates": dict(self.gates),
+            "fired": list(self.fired),
+            "words_capacity_per_dest": self.words_capacity_per_dest,
+            "reserved_sms": self.reserved_sms,
+            "producer_launches": self.producer_launches,
+        }
+
+
+def gate_rows(gates: Mapping[str, Any], rows: int) -> ShapeGateVerdict:
+    """Resolve the row-count gates on one call's ``rows`` (inclusive thresholds; a gate at ``0`` never fires)."""
+
+    checked = check_shape_gates(gates)
+    if isinstance(rows, bool) or not isinstance(rows, int) or rows < 1:
+        raise ValueError(f"rows must be a positive int, got {rows!r}")
+    small = checked["words_capacity_small_m"]
+    reserved = checked["reserved_sms_large_m"]
+    large = checked["per_dest_large_m"]
+    return ShapeGateVerdict(
+        rows=int(rows),
+        gates=checked,
+        words_capacity_per_dest=1 if small and rows <= small else None,
+        producer_launches="per_dest" if large and rows >= large else "persistent",
+        reserved_sms=0 if reserved and rows >= reserved else None,
+    )
+
+
+def dest_parts(plan: TilePlan) -> tuple[tuple[int, int], ...]:
+    """Contiguous ``(start, stop)`` runs of the plan's table that share one destination, in table order; lockstep pad
+    rows (``dest = -1``) stay with the run they pad.  Covers the table exactly once -- the launches of a
+    ``per_dest`` call."""
+
+    dests = [int(value) for value in plan.tiles[:, TILE_FIELDS.index("dest")].tolist()]
+    if not dests:
+        raise ValueError("dest_parts: empty tile table")
+    parts: list[tuple[int, int]] = []
+    start, current = 0, dests[0]
+    for index, dest in enumerate(dests):
+        if dest == -1 or dest == current:
+            continue
+        parts.append((start, index))
+        start, current = index, dest
+    parts.append((start, len(dests)))
+    if sum(stop - start for start, stop in parts) != len(dests) or parts[0][0] != 0:
+        raise AssertionError(
+            f"dest_parts {parts} do not cover the {len(dests)}-row table"
+        )
+    return tuple(parts)
+
+
 __all__ = [
     "BLOCK_K",
     "BLOCK_M",
     "BLOCK_N_CHOICES",
     "DEFAULT_WORDS_CAPACITY_PER_DEST",
     "GEMM_GROUP_NORM_KIND",
+    "GROUP_M_SCALES",
+    "GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD",
+    "GROUP_M_SCALE_MIN_K",
     "HEAD_DIM",
     "LAYOUTS",
     "PAIR_ARCHES",
@@ -615,14 +843,25 @@ __all__ = [
     "PAIR_LOCKSTEP",
     "PAIR_MIN_GROUPS",
     "PAIR_MIN_M",
+    "RESERVED_SMS",
+    "SHAPE_GATE_DEFAULT_BY_ARCH",
+    "SHAPE_GATE_NAMES",
+    "SHAPE_GATE_OFF",
+    "SUPPORTED_WORLD_SIZES",
     "TILE_FIELDS",
     "TILE_ORDERS",
     "Geometry",
     "Policy",
+    "ShapeGateVerdict",
     "TilePlan",
     "block_n_for",
     "ceil_div",
+    "check_shape_gates",
     "chunk_plan",
+    "default_group_m_scale",
+    "default_shape_gates",
+    "dest_parts",
+    "gate_rows",
     "heads_divisibility_error",
     "pair_geometry",
     "plan_for",

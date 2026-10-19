@@ -74,8 +74,11 @@ from .gemm_svdquant import (
     svdquant_linear as svdquant_linear,
 )
 from .cake_quant_lora_gemm import (
+    PreparedNvFp4LoraAdapter as PreparedNvFp4LoraAdapter,
+    StaleAdapterError as StaleAdapterError,
     mm_fp8_lora as mm_fp8_lora,
     mm_nvfp4_lora as mm_nvfp4_lora,
+    prepare_nvfp4_lora_adapter as prepare_nvfp4_lora_adapter,
 )
 
 # Dense PrimsTS FP8/NVFP4 GEMMs are imported lazily enough that installations
@@ -203,8 +206,11 @@ __all__ = (
         "prepare_kimi_k3_fp8_projection",
         "prepare_kimi_k3_fp8_projection_weights",
         "fp8_blockscale_gemm_sm90",
+        "PreparedNvFp4LoraAdapter",
+        "StaleAdapterError",
         "mm_fp8_lora",
         "mm_nvfp4_lora",
+        "prepare_nvfp4_lora_adapter",
         "mm_bf16_fp4",
         "prepare_bf16_fp4_weights",
         "fp8_linear",

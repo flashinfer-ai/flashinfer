@@ -148,8 +148,8 @@ def _reference(
     return out.unsqueeze(1).to(torch.bfloat16).contiguous(), state.contiguous()
 
 
-def _load(batch_size: int):
-    route = cake_gdn.select_cake_gdn_decode_variant(
+def _route(batch_size: int):
+    return cake_gdn.select_cake_gdn_decode_variant(
         arch=_arch(),
         batch_size=batch_size,
         io_dtype="bfloat16",
@@ -163,6 +163,10 @@ def _load(batch_size: int):
         seq_len=1,
         use_qk_l2norm=True,
     )
+
+
+def _load(batch_size: int):
+    route = _route(batch_size)
     return route, cake_gdn.load_cake_gdn_kernel(route.variant_name, _arch())
 
 
@@ -324,6 +328,8 @@ def _launch_prefill(
         0,
         _SCALE,
         4,
+        # Launch ABI v2: total_tokens (4 sequences of 64) after num_seqs.
+        4 * 64,
         4,
         num_v_heads,
         total_tiles,
@@ -341,7 +347,11 @@ def _launch(
     state: torch.Tensor | None = None,
     grid_x: int | None = None,
 ) -> None:
-    blocks_per_state = 8 if batch_size < 32 else 1
+    # The grid is ``blocks_per_state`` CTAs per state head; the count is the selected
+    # record's (the CC 10.7 small band runs the four-CTA body), never re-derived here.
+    blocks_per_state = cake_gdn.cake_gdn_nontranspose_fp32_t1_ctas_per_state(
+        _route(batch_size).variant_name
+    )
     entry(
         tensors["q"],
         tensors["k"],
@@ -956,14 +966,19 @@ def _launch_bf16_serving(
     )
 
 
-@pytest.mark.parametrize("batch_size", [1, 32])
+# B 1 / 31: small band (mid4 on sm_107a); 32 / 34: the wave-fit range (tilev32_x2 on
+# sm_107a); 35: the large body on every architecture.
+@pytest.mark.parametrize("batch_size", [1, 31, 32, 34, 35])
 def test_exported_decode_matches_torch_on_caller_stream(batch_size: int) -> None:
     tensors = _make_inputs(batch_size)
     initial_state = tensors["state"].clone()
     expected_out, expected_state = _reference(tensors, initial_state)
     route, entry = _load(batch_size)
-    assert route.route_id.endswith(
-        "nontranspose_small" if batch_size < 32 else "nontranspose_large"
+    band = "small" if batch_size < 32 else "large"
+    assert f"nontranspose_{band}" in route.route_id
+    assert (
+        route.route_id
+        == cake_gdn.cake_gdn_nontranspose_fp32_t1_route(batch_size, _arch())[1]
     )
 
     stream = torch.cuda.Stream()

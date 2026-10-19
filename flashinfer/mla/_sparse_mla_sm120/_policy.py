@@ -75,10 +75,16 @@ _MODEL_TYPE_DOTS3_SWA = 4
 # Its 528B payload collides with GLM53_NOPE's, so it is only ever selected
 # explicitly (kv_scale_format="ue8m0_g32"), never inferred from widths.
 _MODEL_TYPE_DSV4_1 = 5
+# DeepSeek-V4.1 stored as FlashMLA's inline-scale records
+# (kv_scale_format="ue8m0_g32_inline"): each token's 16 scale bytes follow its
+# 512 data bytes and the indices address rows of the whole cache. Same kernel
+# routes as DSV4_1; only the cache addressing differs.
+_MODEL_TYPE_DSV4_1_INLINE = 6
+_DSV4_1_MODEL_TYPES = frozenset({_MODEL_TYPE_DSV4_1, _MODEL_TYPE_DSV4_1_INLINE})
 
 # d_v per model type. Every DeepSeek-family type is 512; DOTS3_SWA is the one
 # divergence (its latent V is the full 1024-wide latent, rope excluded).
-_D_V_BY_MODEL_TYPE = FormatValues({model: model for model in range(6)}, "value_dim")
+_D_V_BY_MODEL_TYPE = FormatValues({model: model for model in range(7)}, "value_dim")
 
 # Kernel-family names used in the public config query and error messages.
 _MODEL_TYPE_TO_FAMILY = _cpb.MODEL_FAMILIES
@@ -138,6 +144,7 @@ _STATIC_DECODE_ENVELOPE = {
         dedicated_heads=frozenset({8, 16, 32, 64}),
     ),
     _MODEL_TYPE_DSV4_1: _StaticFamilyEnvelope(d_qk=512, bytes_per_token=528),
+    _MODEL_TYPE_DSV4_1_INLINE: _StaticFamilyEnvelope(d_qk=512, bytes_per_token=528),
 }
 
 
@@ -184,6 +191,7 @@ _DECODE_DSV3_2_DISPATCH = _DecodeDispatchEnvelope(_MODEL_TYPE_DSV3_2)
 _DECODE_GLM53_NOPE_DISPATCH = _DecodeDispatchEnvelope(_MODEL_TYPE_GLM53_NOPE)
 _DECODE_DOTS3_SWA_DISPATCH = _DecodeDispatchEnvelope(_MODEL_TYPE_DOTS3_SWA)
 _DECODE_DSV4_1_DISPATCH = _DecodeDispatchEnvelope(_MODEL_TYPE_DSV4_1)
+_DECODE_DSV4_1_INLINE_DISPATCH = _DecodeDispatchEnvelope(_MODEL_TYPE_DSV4_1_INLINE)
 
 # Calibration/documented topk values per family (the crossover sweep points).
 # Any width >= min_topk above is served; these are the values with measured
@@ -612,7 +620,7 @@ def plan(
     if compute_precision != "default":
         if compute_precision not in ("fp8", "bf16"):
             raise ValueError(f"unsupported compute_precision={compute_precision!r}")
-        if model_type != _MODEL_TYPE_DSV4_1:
+        if model_type not in _DSV4_1_MODEL_TYPES:
             raise ValueError("explicit compute_precision requires DSV4.1 storage")
         eligible_decode = decode_splitk_eligible(
             model_type, num_heads, topk, page_block_size, has_extra, num_tokens
@@ -677,7 +685,7 @@ def plan(
     if not decode_ok and pf is None:
         return None
     cpb = -1
-    if decode_ok and model_type != _MODEL_TYPE_DSV4_1:
+    if decode_ok and model_type not in _DSV4_1_MODEL_TYPES:
         cpb = _resolve_cpb(
             device,
             _MODEL_TYPE_TO_FAMILY[model_type],

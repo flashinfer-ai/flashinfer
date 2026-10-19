@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
+import os
 from typing import Optional
 
 import torch
@@ -22,9 +24,71 @@ from .api_logging import flashinfer_experimental_api
 
 # Thin experimental entry points; validation of the backend contract, the
 # workspace, launch binding, autograd wrapper and JIT registration live in
-# flashinfer.experimental.cake_dsa_train.
+# flashinfer.experimental.cake_dsa_train.  The backend takes every switch as
+# a keyword argument and reads no environment variable; the variables below
+# are this module's A/B knobs, resolved here and passed down.
 
 _FEATURE = "DSA sparse-attention training (64 query heads, SM100/SM103/SM107)"
+
+# ``auto`` (default): the registered record's size rule decides whether a
+# backward with ``dkv_acc`` accumulates directly from the main stage; ``1``
+# forces the direct path, ``0`` the accumulate-and-cast path.
+DKV_DIRECT_ENV = "FLASHINFER_CAKE_DSA_DKV_DIRECT"
+# Unset, empty or ``0`` (default): the values of ``dkv_dst_map`` are not
+# checked; anything else validates them on every backward (one device sync).
+CHECK_DST_MAP_ENV = "FLASHINFER_CAKE_DSA_CHECK_DST_MAP"
+# A positive integer: the capacity of the backend's binding cache (64 by
+# default).  Read when this module is imported, applied when it first reaches
+# the backend.
+BINDING_CACHE_CAPACITY_ENV = "FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY"
+
+
+def _dkv_direct_from_environment() -> Optional[bool]:
+    """``FLASHINFER_CAKE_DSA_DKV_DIRECT`` as the backend's ``dkv_direct`` keyword:
+    ``auto`` (default) is ``None`` (the record's size rule), ``1`` is ``True``
+    (direct whenever the program registers the natural stages), ``0`` is
+    ``False`` (never).  Any other value raises ``ValueError``."""
+    mode = os.environ.get(DKV_DIRECT_ENV, "auto").strip() or "auto"
+    if mode not in ("auto", "0", "1"):
+        raise ValueError(f"{DKV_DIRECT_ENV} must be auto, 0 or 1, got {mode!r}")
+    return None if mode == "auto" else mode == "1"
+
+
+def _check_dst_map_from_environment() -> bool:
+    """``FLASHINFER_CAKE_DSA_CHECK_DST_MAP`` as the backend's ``check_dst_map``
+    keyword: unset, empty or ``0`` is ``False`` (default), anything else
+    ``True``."""
+    return os.environ.get(CHECK_DST_MAP_ENV, "0") not in ("", "0")
+
+
+def _binding_cache_capacity_from_environment() -> Optional[int]:
+    """``FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY`` as a positive integer,
+    or ``None`` when unset or blank (the backend's configured capacity stays).
+    Anything else raises ``ValueError``."""
+    raw = os.environ.get(BINDING_CACHE_CAPACITY_ENV)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        capacity = int(raw)
+    except ValueError:
+        capacity = 0
+    if capacity < 1:
+        raise ValueError(
+            f"{BINDING_CACHE_CAPACITY_ENV} must be a positive integer, got {raw!r}"
+        )
+    return capacity
+
+
+@functools.cache
+def _cake_backend():
+    # The backend is imported on first use (experimental containment: core
+    # reaches kernels and their dependencies through a deferred import) and
+    # the binding-cache capacity read at import is applied to it once.
+    from .experimental.cake_dsa_train import cake_backend
+
+    if _BINDING_CACHE_CAPACITY is not None:
+        cake_backend.BINDING_CACHE.configure(capacity=_BINDING_CACHE_CAPACITY)
+    return cake_backend
 
 
 def _backend(backend: str):
@@ -32,9 +96,7 @@ def _backend(backend: str):
         raise ValueError(
             "DSA sparse-attention training currently supports backend='cake'"
         )
-    from .experimental.cake_dsa_train import cake_backend
-
-    return cake_backend
+    return _cake_backend()
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
@@ -52,6 +114,8 @@ def dsa_sparse_attention(
     backend: str = "cake",
     dkv_acc: Optional[torch.Tensor] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
+    dkv_direct: Optional[bool] = None,
+    check_dst_map: Optional[bool] = None,
 ):
     r"""Differentiable top-k sparse MLA attention with absorbed queries (DeepSeek
     Sparse Attention) for training, 64 query heads, SM100 / SM103 / SM107 only.
@@ -122,9 +186,29 @@ def dsa_sparse_attention(
         (default identity).  Repeated destinations are allowed (the rows of a
         context-parallel window that map onto one parameter row) and are
         combined with FP32 atomics.  Every value must lie in ``[0, S_dst)``;
-        the kernel does not range-check the map.  Setting
-        ``FLASHINFER_CAKE_DSA_CHECK_DST_MAP=1`` validates the values on every
-        call (one device synchronization) and raises ``ValueError`` otherwise.
+        the kernel does not range-check the map (see ``check_dst_map``).
+    dkv_direct : Optional[bool]
+        How the backward accumulates dK / dV into ``dkv_acc`` when the
+        registered program has the natural-layout main stages.  ``None``
+        (default) reads ``FLASHINFER_CAKE_DSA_DKV_DIRECT``: ``auto`` (its
+        default) applies the record's size rule -- the main stage adds into
+        the caller's packed rows directly (no workspace accumulators, zero
+        fill or cast launch) when the row has at least
+        ``dkv_direct.min_keys_per_query`` (4) keys per query token --, ``1``
+        forces the direct path whenever the stages are registered, ``0`` always
+        takes the accumulate-and-cast path; any other value raises
+        ``ValueError``.  ``True`` / ``False`` select the path explicitly and
+        ignore the variable.  Both paths add the same FP32 contributions into
+        the same rows (another summation order); without ``dkv_acc`` or the
+        natural stages the setting has no effect.
+    check_dst_map : Optional[bool]
+        Validate the values of ``dkv_dst_map`` (every destination row in
+        ``[0, S_dst)``) on every backward, at the cost of one device
+        synchronization, raising ``ValueError`` on a violation.  ``None``
+        (default) reads ``FLASHINFER_CAKE_DSA_CHECK_DST_MAP``: unset, empty or
+        ``0`` (its default) means no check, anything else enables it.  ``True``
+        / ``False`` decide explicitly and ignore the variable.  Leave it off in
+        production.
 
     Returns
     -------
@@ -144,9 +228,16 @@ def dsa_sparse_attention(
     input binding (``data_ptr``, shape, stride and dtype of every input plus
     the scale); later calls with the same binding launch from the remembered
     argument plans with freshly allocated outputs
-    (``flashinfer.experimental.cake_dsa_train.cake_backend.BINDING_CACHE``;
-    ``FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE=0`` disables it).
+    (``flashinfer.experimental.cake_dsa_train.cake_backend.BINDING_CACHE``, 64
+    bindings by default, least recently used first out;
+    ``FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY`` -- a positive integer,
+    read when this module is imported -- sets the capacity through
+    ``BINDING_CACHE.configure(capacity=...)``).
     """
+    if dkv_direct is None:
+        dkv_direct = _dkv_direct_from_environment()
+    if check_dst_map is None:
+        check_dst_map = _check_dst_map_from_environment()
     return _backend(backend).dsa_sparse_attention(
         q_latent,
         q_rope,
@@ -159,6 +250,8 @@ def dsa_sparse_attention(
         key_passes=key_passes,
         dkv_acc=dkv_acc,
         dkv_dst_map=dkv_dst_map,
+        dkv_direct=dkv_direct,
+        check_dst_map=check_dst_map,
     )
 
 
@@ -182,6 +275,8 @@ def dsa_sparse_attention_varlen(
     backend: str = "cake",
     dkv_acc: Optional[torch.Tensor] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
+    dkv_direct: Optional[bool] = None,
+    check_dst_map: Optional[bool] = None,
 ):
     r"""Packed multi-document form of :func:`dsa_sparse_attention` (SM100 /
     SM103 / SM107).
@@ -214,7 +309,21 @@ def dsa_sparse_attention_varlen(
         top-k selector need not enforce causality itself (the rule GLM-style
         trainers with query segments that are tails of their key prefix rely
         on).
+    dkv_direct : Optional[bool]
+        As in :func:`dsa_sparse_attention`: ``None`` (default) reads
+        ``FLASHINFER_CAKE_DSA_DKV_DIRECT`` (``auto`` = the record's size rule,
+        ``1`` / ``0`` = force / disable the direct accumulation into
+        ``dkv_acc``); ``True`` / ``False`` decide explicitly.
+    check_dst_map : Optional[bool]
+        As in :func:`dsa_sparse_attention`: ``None`` (default) reads
+        ``FLASHINFER_CAKE_DSA_CHECK_DST_MAP`` (unset, empty or ``0`` = no
+        check); ``True`` validates the values of ``dkv_dst_map`` on every
+        backward, ``False`` never does.
     """
+    if dkv_direct is None:
+        dkv_direct = _dkv_direct_from_environment()
+    if check_dst_map is None:
+        check_dst_map = _check_dst_map_from_environment()
     return _backend(backend).dsa_sparse_attention_varlen(
         q_latent,
         q_rope,
@@ -232,4 +341,11 @@ def dsa_sparse_attention_varlen(
         key_passes=key_passes,
         dkv_acc=dkv_acc,
         dkv_dst_map=dkv_dst_map,
+        dkv_direct=dkv_direct,
+        check_dst_map=check_dst_map,
     )
+
+
+# Read once at import: a malformed value fails here, naming the variable, not
+# on the first call.  Applied to the backend's cache by ``_cake_backend``.
+_BINDING_CACHE_CAPACITY = _binding_cache_capacity_from_environment()

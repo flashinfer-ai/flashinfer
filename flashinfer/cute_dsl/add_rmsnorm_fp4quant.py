@@ -329,6 +329,25 @@ class AddRMSNormFP4QuantKernel:
         return threads_per_row, num_threads
 
     @staticmethod
+    def _compute_sm107_launch_config(
+        H_per_cta: int,
+        elem_size: int,
+    ) -> tuple[int, int]:
+        """Select the measured SM107 launch config."""
+        kernel = AddRMSNormFP4QuantKernel
+        threads_per_row = kernel._compute_threads_per_row(H_per_cta)
+        num_threads = kernel._compute_num_threads(H_per_cta)
+        vec_size = COPY_BITS // 8 // elem_size
+        if -(-H_per_cta // (vec_size * threads_per_row)) <= 2:
+            return threads_per_row, num_threads
+
+        # Stage at most two cp.async vectors per tensor per thread.
+        threads_per_row = -(-H_per_cta // (2 * vec_size))
+        threads_per_row = min(-(-threads_per_row // 32) * 32, 1024)
+        rows_per_block = max(1, 128 // threads_per_row)
+        return threads_per_row, threads_per_row * rows_per_block
+
+    @staticmethod
     @functools.lru_cache(maxsize=1024)
     def _compute_launch_config(
         H: int,
@@ -343,6 +362,9 @@ class AddRMSNormFP4QuantKernel:
 
         if sm_version in (100, 103):
             config = kernel._compute_sm100_sm103_launch_config(H_per_cta, M)
+            return cluster_n, *config
+        if sm_version == 107:
+            config = kernel._compute_sm107_launch_config(H_per_cta, dtype.width // 8)
             return cluster_n, *config
 
         threads_per_row = kernel._compute_threads_per_row(H_per_cta)

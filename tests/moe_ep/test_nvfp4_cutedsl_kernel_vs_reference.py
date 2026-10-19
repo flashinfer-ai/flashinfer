@@ -13,6 +13,9 @@ with FP32 output, a Triton helper matching the kernel's fast SwiGLU, and
 ordered FP32 combine. Its deterministic path requires finite bit-exact output;
 atomic in-kernel FC2 reduction is checked separately with a rounding band.
 
+Shared NVFP4/MXFP8 regressions cover the masked BF16 reducer under captured
+route changes and the sparse-dispatch workspace capacity boundary.
+
 Run on one Blackwell GPU from the FlashInfer repo root (no torchrun required)::
 
     cd /path/to/flashinfer
@@ -25,6 +28,7 @@ Run on one Blackwell GPU from the FlashInfer repo root (no torchrun required)::
 from __future__ import annotations
 
 import pytest
+import torch
 
 # Verify only through the cutedsl_megamoe shim public API (plus the FI backend
 # helpers); never import the src/ kernel packages directly, so a new src/ drop
@@ -33,6 +37,134 @@ pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
 
 NVFP4_BLOCK = 16
 NVFP4_MODES = ("w4a4", "w4a16")
+
+
+def _run_blackwell_genphase_graph(rank, world, capacity, early, tile_n, cluster_m):
+    """Native reference plus changing-route graph replay for the GenPhase prototype."""
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as genphase
+
+    hidden, intermediate, topk, experts = 384, 192, 3, 8 * world
+    torch.manual_seed(6447 + rank)
+    w13 = (
+        torch.randn(8, 2 * intermediate, hidden, device="cuda") / hidden**0.5
+    ).bfloat16()
+    w2 = (
+        torch.randn(8, hidden, intermediate, device="cuda") / intermediate**0.5
+    ).bfloat16()
+    weights = pkg.preprocess_genphase_weights(
+        w13, w2, quant_kind="mxfp8_e4m3", intermediate_size=intermediate
+    )
+    cfg = pkg.Sm100GenphaseMoeConfig(
+        num_total_experts=experts,
+        max_tokens_per_rank=capacity,
+        num_topk=topk,
+        hidden=hidden,
+        intermediate=intermediate,
+        rank=rank,
+        world_size=world,
+        apply_topk_at_fc1=early,
+        mma_tiler_mnk=(256, tile_n, 128),
+        cluster_shape_mn=(cluster_m, 1),
+    )
+    ws = pkg.Sm100GenphaseSymmBuffer(cfg)
+    try:
+        x, sf = pkg.quantize_genphase_mxfp8(
+            torch.randn(capacity, hidden, device="cuda"), torch.float8_e4m3fn
+        )
+        ws.x[:capacity].copy_(x)
+        ws.x_sf[:capacity, : sf.shape[1]].copy_(sf)
+        ids = torch.arange(capacity * topk, device="cuda", dtype=torch.int32).view(
+            capacity, topk
+        )
+        ids = (ids + rank * 7) % experts
+        scores = torch.linspace(0.1, 0.9, capacity * topk, device="cuda").view(
+            capacity, topk
+        )
+        ws.topk_idx[:capacity].copy_(ids)
+        ws.topk_weights[:capacity].copy_(scores)
+        thunk = pkg.sm100_genphase_mega_launch_thunk(*weights, ws)
+        thunk()
+        torch.cuda.synchronize()
+        indices, expected = genphase.sampled_reference(
+            ws, *weights, capacity, sample_size=min(capacity, 32)
+        )
+        error = torch.tensor(
+            genphase.output_error(ws.output_activation, indices, expected),
+            device="cuda",
+        )
+        if world > 1:
+            dist.all_reduce(error, op=dist.ReduceOp.MAX)
+        assert torch.isfinite(error) and error.item() < 0.02
+        dense_terms = (
+            ws._pre_reduced_activation.view(torch.bfloat16)[:capacity].float().clone()
+        )
+        graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.graph(graph, stream=stream):
+            thunk()
+        torch.cuda.current_stream().wait_stream(stream)
+        for state in ("empty", "last", "holes", "asymmetric", "restore"):
+            valid = torch.ones_like(ids, dtype=torch.bool)
+            if state in ("empty", "last"):
+                valid.zero_()
+            if state == "last":
+                valid[-1, -1] = True
+            if state == "holes":
+                valid = (
+                    torch.arange(ids.numel(), device="cuda").reshape_as(ids) % 3 != 0
+                )
+            if state == "asymmetric":
+                valid[min(rank, capacity) :].zero_()
+            ws.topk_idx[:capacity].copy_(ids).masked_fill_(~valid, -1)
+            ws.topk_weights[:capacity].copy_(scores).masked_fill_(~valid, float("nan"))
+            control = torch.zeros((capacity, hidden), device="cuda")
+            for slot in range(topk):
+                term = torch.where(valid[:, slot, None], dense_terms[:, slot], 0)
+                if not early:
+                    # BF16 terms and FP32 scores have an exact FP64 product.
+                    # Round only after adding, matching the reducer's FP32 FMA.
+                    control = (
+                        control.double()
+                        + term.double() * scores[:, slot, None].double()
+                    ).float()
+                else:
+                    control += term
+            control = control.bfloat16()
+            ws._pre_reduced_activation.fill_(255)
+            if world > 1:
+                dist.barrier()
+            for replay in range(65):
+                graph.replay()
+                if replay in (0, 64):
+                    torch.cuda.synchronize()
+                    failed = torch.tensor(
+                        not torch.equal(ws.output_activation[:capacity], control),
+                        device="cuda",
+                        dtype=torch.int32,
+                    )
+                    if world > 1:
+                        dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+                    assert failed.item() == 0, (rank, state, replay)
+        assert ws.kernel.architecture == "sm_100"
+        assert ws.kernel._mainloop.tmem_plan.allocation_columns == 512
+    finally:
+        ws.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("capacity", [1, 65, 129, 1024])
+@pytest.mark.parametrize("early", [True, False])
+@pytest.mark.parametrize("tile_n,cluster_m", [(128, 4), (64, 4), (64, 2)])
+def test_blackwell_genphase_graph(monkeypatch, capacity, early, tile_n, cluster_m):
+    _require_cuda()
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Requires SM100/103")
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    _run_blackwell_genphase_graph(0, 1, capacity, early, tile_n, cluster_m)
 
 
 def _require_cuda():
@@ -982,3 +1114,147 @@ def test_nvfp4_w4a16_fp32_scales_and_routing(
         if unnormalized_graph is not None:
             unnormalized_graph.reset()
         layer.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "tokens,hidden,topk", [(1, 256, 4), (33, 520, 17), (33, 1024, 16)]
+)
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_masked_bf16_combine_graph(tokens, hidden, topk, weighted, index_dtype):
+    """Check holes, poisoned scores, empty rows and dense restoration exactly."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("requires SM100 or newer packed FP32 arithmetic")
+
+    import cutlass.cute as cute
+    from cuda.bindings import driver as cuda
+    from cutlass.cute.runtime import from_dlpack
+
+    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as pkg
+
+    experts = 128
+    # Exercise 16-byte alignment without assuming a 32-byte-aligned allocation.
+    terms = torch.empty(
+        tokens * topk * hidden + 8, device="cuda", dtype=torch.bfloat16
+    )[8:].reshape(tokens, topk, hidden)
+    output = torch.empty(tokens * hidden + 8, device="cuda", dtype=torch.bfloat16)[
+        8:
+    ].reshape(tokens, hidden)
+    ids = torch.zeros((tokens, topk), device="cuda", dtype=index_dtype)
+    scores = torch.ones((tokens, topk), device="cuda", dtype=torch.float32)
+    reducer = pkg.TopkReduce(
+        hidden,
+        topk,
+        pkg.CombineFormat.parse("bf16"),
+        sm_arch=pkg.get_cutedsl_target_arch(),
+        num_experts=experts,
+    )
+    kwargs = dict(
+        combine_quant=from_dlpack(terms, assumed_align=16),
+        combine_sf=None,
+        reduced_output=from_dlpack(output, assumed_align=16),
+        topk_score=(
+            from_dlpack(scores, assumed_align=4).mark_layout_dynamic(leading_dim=1)
+            if weighted
+            else None
+        ),
+        topk_indices=from_dlpack(ids, assumed_align=4).mark_layout_dynamic(
+            leading_dim=1
+        ),
+        stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    executable = cute.compile(reducer, **kwargs)
+    terms.fill_(1)
+    executable(**kwargs)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            kwargs["stream"] = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+            executable(**kwargs)
+        base = torch.arange(tokens * topk, device="cuda").reshape_as(ids)
+        for iteration, state in enumerate(
+            ("dense", "holes", "empty", "last", "restore")
+        ):
+            ids.copy_((base + iteration) % experts)
+            if state == "holes":
+                ids.view(-1)[::3] = -1
+                ids.view(-1)[1::3] = experts
+            elif state == "empty":
+                ids.fill_(torch.iinfo(index_dtype).min)
+            elif state == "last":
+                ids.fill_(torch.iinfo(index_dtype).max)
+                ids[-1, -1] = experts - 1
+            valid = (ids >= 0) & (ids < experts)
+            values = (
+                (
+                    torch.arange(terms.numel(), device="cuda").reshape_as(terms)
+                    + iteration
+                )
+                % 9
+                - 4
+            ).to(torch.bfloat16)
+            terms.copy_(values).masked_fill_(~valid.unsqueeze(-1), float("nan"))
+            scores.copy_(((base % 4).float() + 1) * 0.25)
+            scores.masked_fill_(~valid, float("nan"))
+            expected = torch.zeros((tokens, hidden), device="cuda", dtype=torch.float32)
+            for k in range(topk):
+                value = torch.where(valid[:, k, None], values[:, k].float(), 0.0)
+                if weighted:
+                    value *= torch.where(valid[:, k, None], scores[:, k, None], 0.0)
+                expected += value
+            for replay in range(17):
+                graph.replay()
+                if replay in (0, 16):
+                    torch.cuda.synchronize()
+                    assert torch.isfinite(output).all(), state
+                    torch.testing.assert_close(
+                        output, expected.bfloat16(), rtol=0, atol=0
+                    )
+    finally:
+        graph.reset()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("capacity", [129, 1024, 2048])
+@pytest.mark.parametrize("dtype", ["nvfp4", "mxfp8"])
+def test_sparse_dispatch_workspace(capacity, dtype, monkeypatch):
+    """The real frontend includes publication state in the late reset prefix."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA for the frontend workspace")
+    import cutlass.cute as cute
+    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as pkg
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    create = (
+        pkg.create_dummy_nvfp4_inputs
+        if dtype == "nvfp4"
+        else pkg.create_dummy_mxfp8_inputs
+    )
+    make_thunk = (
+        pkg.nvfp4_mega_launch_thunk if dtype == "nvfp4" else pkg.mxfp8_mega_launch_thunk
+    )
+    _, w1, w2, buffer = create(0, 1, 4, capacity, 1, 4, 512, 256, seed=6447)
+    # Construct the real layout/arguments without executing architecture-specific MMA.
+    monkeypatch.setattr(cute, "compile", lambda kernel, **kwargs: lambda **args: None)
+    try:
+        make_thunk(w1, w2, buffer)
+        kernel = buffer._frontend._mega.kernel
+        if capacity <= 1024:
+            region = kernel._local_region_by_name["dispatch_route_extent"]
+            offset = kernel._local_offsets["dispatch_route_extent"]
+            assert region.shape == (2,)
+            assert offset % 16 == 0
+            assert offset + region.nbytes <= kernel.local_zero_i32_count * 4
+            grid = kernel._local_offsets["grid_sync_counter"]
+            assert (
+                offset
+                >= grid + kernel._local_region_by_name["grid_sync_counter"].nbytes
+            )
+        else:
+            assert "dispatch_route_extent" not in kernel._local_offsets
+    finally:
+        buffer.destroy()

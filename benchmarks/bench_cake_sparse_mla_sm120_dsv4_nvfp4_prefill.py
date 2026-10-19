@@ -26,8 +26,10 @@ page size 64 (override with the flags).  Arms:
 
 * ``sparse`` -- ``SparseMLASm120Wrapper(kv_cache_format="nvfp4", backend="sparse")``;
 * ``cake`` -- the same wrapper with ``backend="cake"`` (decode / prefill crossover);
-* ``cake-prefill`` -- the low-level Cake prefill entry (``--head-tiles`` /
-  ``--persistent`` override the planner);
+* ``cake-prefill`` -- the low-level Cake prefill entry (``--head-tiles``
+  overrides the planner's head-tile count; the ``plan`` column shows the
+  resolved ``ht<head_tiles>-st<num_stages>`` plus ``-qef`` / ``-hbf`` when the
+  planner enables the query L2 evict-first policy / the head-blocks-first grid);
 * ``cake-decode`` -- the low-level Cake split decode with caller-owned scratch.
 
 Each row prints the GPU median (CUPTI-timed, cold L2 between repetitions), the
@@ -48,7 +50,6 @@ from flashinfer.mla import nvfp4_quantize_pack_sparse_mla_cache
 from flashinfer.mla._sparse_mla_sm120._cake_dsv4_nvfp4 import (
     cake_sparse_mla_sm120_dsv4_nvfp4_decode,
     cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks,
-    cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill,
     cake_sparse_mla_sm120_dsv4_nvfp4_prefill,
     cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel,
 )
@@ -143,12 +144,6 @@ def main() -> None:
         type=int,
         default=None,
         help="cake-prefill: head tiles per CTA (1, 2, 4); default = planner",
-    )
-    parser.add_argument(
-        "--persistent",
-        choices=("auto", "on", "off"),
-        default="auto",
-        help="cake-prefill: persistent CTAs; default = planner",
     )
     parser.add_argument("--warmup-ms", type=int, default=50)
     parser.add_argument("--measure-ms", type=int, default=300)
@@ -264,20 +259,25 @@ def main() -> None:
                                 )
 
                         elif backend == "cake-prefill":
-                            head_tiles, persistent = (
-                                cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill(
-                                    num_tokens=num_tokens,
-                                    num_heads=num_heads,
-                                    topk=topk,
-                                    extra_topk=args.extra_topk,
-                                    num_sms=num_sms,
-                                )
+                            resolved = cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
+                                q,
+                                cache,
+                                indices,
+                                output,
+                                out_lse,
+                                sm_scale,
+                                topk_length=lengths,
+                                attn_sink=sink,
+                                extra_kv_cache=extra_cache,
+                                extra_indices=extra_indices,
+                                extra_topk_length=extra_lengths,
+                                head_tiles=args.head_tiles,
                             )
-                            if args.head_tiles is not None:
-                                head_tiles = args.head_tiles
-                            if args.persistent != "auto":
-                                persistent = args.persistent == "on"
-                            plan = f"ht{head_tiles}{'-pers' if persistent else ''}"
+                            plan = "ht{head_tiles}-st{num_stages}".format(**resolved)
+                            if resolved["q_evict_first"]:
+                                plan += "-qef"
+                            if resolved["grid_head_blocks_first"]:
+                                plan += "-hbf"
 
                             def run() -> None:
                                 cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
@@ -292,8 +292,7 @@ def main() -> None:
                                     extra_kv_cache=extra_cache,
                                     extra_indices=extra_indices,
                                     extra_topk_length=extra_lengths,
-                                    head_tiles=head_tiles,
-                                    persistent=persistent,
+                                    head_tiles=args.head_tiles,
                                 )
 
                         else:
