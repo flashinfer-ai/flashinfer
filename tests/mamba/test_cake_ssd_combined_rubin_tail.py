@@ -5,8 +5,6 @@ pair program and the per-capability chunk-parallel workspace cap
 import importlib
 import math
 
-import pytest
-
 
 def _module():
     return importlib.import_module("flashinfer.mamba.cake_ssd_combined")
@@ -48,7 +46,24 @@ def test_source_tail_route_default_arguments_keep_the_blackwell_rule():
         )
 
     for sm_count in (148, 152, 212):
-        for items in (64, 128, 148, 152, 212, 216, 256, 296, 304, 384, 512, 640, 768, 1024, 2048, 4096):
+        for items in (
+            64,
+            128,
+            148,
+            152,
+            212,
+            216,
+            256,
+            296,
+            304,
+            384,
+            512,
+            640,
+            768,
+            1024,
+            2048,
+            4096,
+        ):
             for chunks in (1, 4, 8, 15, 16, 17, 31, 32, 64):
                 for mode_varlen in (False, True):
                     assert module.tail_selected(
@@ -59,14 +74,30 @@ def test_source_tail_route_default_arguments_keep_the_blackwell_rule():
                     ) == expected(items, chunks, sm_count), (sm_count, items, chunks)
     # the round-7 Blackwell rows keep their route
     for sm_count in (148, 152):
-        assert module.tail_selected(total_work=512, chunks_per_item=16, sm_count=sm_count)
-        assert module.tail_selected(total_work=512, chunks_per_item=32, sm_count=sm_count)
-        assert not module.tail_selected(total_work=256, chunks_per_item=32, sm_count=sm_count)
+        assert module.tail_selected(
+            total_work=512, chunks_per_item=16, sm_count=sm_count
+        )
+        assert module.tail_selected(
+            total_work=512, chunks_per_item=32, sm_count=sm_count
+        )
+        assert not module.tail_selected(
+            total_work=256, chunks_per_item=32, sm_count=sm_count
+        )
     # on 212 SMs the default rule routes none of the gate geometry
-    for items, chunks in ((256, 32), (512, 16), (512, 32), (256, 8), (512, 8), (640, 16)):
+    for items, chunks in (
+        (256, 32),
+        (512, 16),
+        (512, 32),
+        (256, 8),
+        (512, 8),
+        (640, 16),
+    ):
         for mode_varlen in (False, True):
             assert not module.tail_selected(
-                total_work=items, chunks_per_item=chunks, sm_count=212, mode_varlen=mode_varlen
+                total_work=items,
+                chunks_per_item=chunks,
+                sm_count=212,
+                mode_varlen=mode_varlen,
             )
 
 
@@ -78,10 +109,22 @@ R200_SCREEN_ROWS = (
     ("perf_varlen_64x32", 512, 32, True, False),  # 0.936 (main kernel 0.922)
     ("perf_varlen_32x8", 256, 8, True, True),  # 1.026 (chunk floor 8)
     ("perf_varlen_64x8", 512, 8, True, False),  # 0.864 (main kernel 0.815)
-    ("nem_v1024x2", 256, 8, True, True),  # 1.027 bf16 / 1.072 f32 (2 x 1024 tokens x 128 heads)
+    (
+        "nem_v1024x2",
+        256,
+        8,
+        True,
+        True,
+    ),  # 1.027 bf16 / 1.072 f32 (2 x 1024 tokens x 128 heads)
     ("perf_varlen_128x32", 1024, 32, True, False),  # control 1.0006
     ("perf_batched_128x16", 1024, 16, False, False),  # control 0.9996
-    ("nem_v128p896", 256, 4, True, False),  # control 0.9995 (mean 512 tokens = 4 chunks)
+    (
+        "nem_v128p896",
+        256,
+        4,
+        True,
+        False,
+    ),  # control 0.9995 (mean 512 tokens = 4 chunks)
     ("perf_batched_128x4", 1024, 4, False, False),  # control 0.998
 )
 
@@ -142,7 +185,11 @@ def test_source_tail_full_grid_rule_geometry():
     for items in (384, 768, 1024, 2048):
         for chunks in (8, 16, 32, 64):
             for mode_varlen in (False, True):
-                assert not route(items, chunks, mode_varlen), (items, chunks, mode_varlen)
+                assert not route(items, chunks, mode_varlen), (
+                    items,
+                    chunks,
+                    mode_varlen,
+                )
     # the item ladder at 16 chunks: 213..255 items win 1.09-1.27 on both
     # forms; at most one item per SM never reaches the pair program
     for items in (216, 224, 240, 248):
@@ -181,7 +228,12 @@ def test_source_tail_full_grid_rule_stays_disjoint_from_the_fused_window():
                         mode_varlen=mode_varlen,
                         total_tokens=num_sequences * chunks * 128,
                     )
-                    assert not (tail and fused), (nheads, num_sequences, chunks, mode_varlen)
+                    assert not (tail and fused), (
+                        nheads,
+                        num_sequences,
+                        chunks,
+                        mode_varlen,
+                    )
 
 
 def test_source_chunk_parallel_workspace_cap_rubin():
@@ -191,10 +243,12 @@ def test_source_chunk_parallel_workspace_cap_rubin():
 
     module = _module()
     assert module._CHUNK_PARALLEL_WORKSPACE_CAP_BYTES == 256 << 20
-    assert module._CHUNK_PARALLEL_WORKSPACE_CAP_BYTES_BY_CAPABILITY == {(10, 7): 512 << 20}
+    assert module._CHUNK_PARALLEL_WORKSPACE_CAP_BYTES_BY_CAPABILITY == {
+        (10, 7): 512 << 20
+    }
     assert module.chunk_parallel_workspace_cap_bytes((10, 7)) == 512 << 20
     for capability in ((10, 0), (10, 3), (9, 0)):
         assert module.chunk_parallel_workspace_cap_bytes(capability) == 256 << 20
     assert 8192 * 48 * 1024 == 384 << 20
-    assert 384 << 20 > module._CHUNK_PARALLEL_WORKSPACE_CAP_BYTES
-    assert 384 << 20 <= module.chunk_parallel_workspace_cap_bytes((10, 7))
+    assert module._CHUNK_PARALLEL_WORKSPACE_CAP_BYTES < 384 << 20
+    assert module.chunk_parallel_workspace_cap_bytes((10, 7)) >= 384 << 20

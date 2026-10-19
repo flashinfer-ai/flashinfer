@@ -981,6 +981,8 @@ def chunk_parallel_workspace_cap_bytes(capability) -> int:
     return _CHUNK_PARALLEL_WORKSPACE_CAP_BYTES_BY_CAPABILITY.get(
         (int(capability[0]), int(capability[1])), _CHUNK_PARALLEL_WORKSPACE_CAP_BYTES
     )
+
+
 # Third cost arm: the three-phase program's own
 # calibrated constants (``CHUNK_PARALLEL_COST_MODEL_US`` of the Cake seed
 # module flashinfer_blackwell_mamba_ssd_combined_chunk_parallel_seed_v1, round
@@ -1392,7 +1394,8 @@ def chunk_parallel_family(
     predicted = quantities["predicted_us"]
     chunk_parallel = (
         quantities["work_items"] < quantities["sm_count"]
-        and quantities["workspace_bytes"] <= chunk_parallel_workspace_cap_bytes(capability)
+        and quantities["workspace_bytes"]
+        <= chunk_parallel_workspace_cap_bytes(capability)
         and min(predicted["chunk_parallel"], predicted["three_phase"])
         * _CHUNK_PARALLEL_SELECTION_MARGIN
         <= predicted["exact_scan"]
@@ -1592,7 +1595,9 @@ class _TailFullGridRule:
         return self.min_chunks_varlen if mode_varlen else self.min_chunks_batched
 
     def render_penalty(self, mode_varlen: bool) -> float:
-        return self.render_penalty_varlen if mode_varlen else self.render_penalty_batched
+        return (
+            self.render_penalty_varlen if mode_varlen else self.render_penalty_batched
+        )
 
 
 # sm_107a (R200, 212 SMs) only; the Blackwell rule keeps the balanced-grid
