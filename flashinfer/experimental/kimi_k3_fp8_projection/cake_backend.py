@@ -346,11 +346,6 @@ def n_padded(n_valid: int) -> int:
     return -(-int(n_valid) // WEIGHT_TILE_ROWS) * WEIGHT_TILE_ROWS
 
 
-def n_padded_128(n_valid: int) -> int:
-    """ModelOpt's serialized padding (128-row blocks)."""
-    return -(-int(n_valid) // BLOCK) * BLOCK
-
-
 def k_sets(K: int) -> int:
     """Scale K-sets per row block as the GEMM consumes them: two per 256-K stage, zero padded."""
     if K % BLOCK:
@@ -374,16 +369,6 @@ def swizzle_sf_128x4(sf_linear: torch.Tensor) -> torch.Tensor:
     # (tile, r_hi(4), r_lo(32), c_hi, c_lo(4)) -> (tile, c_hi, r_lo, r_hi, c_lo)
     v = padded.reshape(Rp // SF_TILE_ROWS, 4, 32, Cp // 4, 4).permute(0, 3, 2, 1, 4)
     return v.reshape(-1).contiguous()
-
-
-def unswizzle_sf_128x4(sf_swizzled: torch.Tensor, R: int, C: int) -> torch.Tensor:
-    """Inverse of :func:`swizzle_sf_128x4` -> ``[R, C]``."""
-    Rp = -(-R // SF_TILE_ROWS) * SF_TILE_ROWS
-    Cp = -(-C // 4) * 4
-    v = sf_swizzled.reshape(Rp // SF_TILE_ROWS, Cp // 4, 32, 4, 4).permute(
-        0, 3, 2, 1, 4
-    )
-    return v.reshape(Rp, Cp)[:R, :C]
 
 
 def requant_weight_ue8m0(
@@ -1725,19 +1710,6 @@ def gemm_cs_alias_fits(
 ) -> bool:
     """True when the staging + inbox blocks of the exchange fit inside the dead ring."""
     return gemm_cs_alias_bytes(cs, bn) <= gemm_cs_ring_bytes(bn, num_stages)
-
-
-def gemm_cs_k_ranges(cs: int, num_k_iters: int) -> tuple[tuple[int, int], ...]:
-    """K iterations ``[nk p // S, nk (p + 1) // S)`` streamed by pair p (ascending pair
-    = ascending K)."""
-    cs, nk = int(cs), int(num_k_iters)
-    return tuple((nk * p // cs, nk * (p + 1) // cs) for p in range(cs))
-
-
-def gemm_cs_suffix(cs: int, bn: int = GEMM_BLOCK_N_NARROW) -> str:
-    """Program-key token of the instance: ``_cs<S>`` (column form) or ``_cs<S>r`` (row
-    form), the Cake symbol spelling; after ``_k128``."""
-    return f"{GEMM_CS_SUFFIX}{int(cs)}" + ("r" if gemm_cs_row_form(cs, bn) else "")
 
 
 class ClusterSplitPlan(NamedTuple):
@@ -3699,35 +3671,6 @@ def route_plan(
         partials_offset=p_off,
         partials_bytes=p_bytes,
     )
-
-
-def generated_program_available(
-    device: torch.device,
-    M: Optional[int] = None,
-    prepared: Optional[PreparedProjectionWeight] = None,
-) -> bool:
-    """True when this checkout registers the programs for ``device``.
-
-    With ``M`` and ``prepared`` the check names the exact launch sequence of that call; without them it asks
-    whether every kernel the dispatch table can select on the device's architecture is registered."""
-    try:
-        facts = device_facts(device)
-    except ValueError:
-        return False
-    if M is None and prepared is None:
-        return bool(MODULES) and route_available(
-            facts.arch, required_kernel_keys(facts.arch, facts.sm_count)
-        )
-    if M is None or prepared is None:
-        raise ValueError("pass both M and prepared or neither")
-    cfg = decode_config(
-        int(M), prepared.n_tiles128, prepared.num_k_iters, facts.arch, facts.sm_count
-    )
-    try:
-        route_plan(prepared, int(M), facts.arch, facts.sm_count, cfg)
-    except NotImplementedError:
-        return False
-    return True
 
 
 def _bind(

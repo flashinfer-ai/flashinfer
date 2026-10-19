@@ -38,7 +38,6 @@ from flashinfer.experimental.kimi_k3_fp8_projection.cake_backend import (
     quant_units,
     required_kernel_keys,
     swizzle_sf_128x4,
-    unswizzle_sf_128x4,
 )
 from flashinfer.experimental.kimi_k3_fp8_projection.cake_jit import (
     KERNELS,
@@ -154,6 +153,16 @@ def per_block_cast_to_fp8(w):
     return q, sf.view(n // BLOCK, k // BLOCK)
 
 
+def unswizzle_sf_128x4(sf_swizzled, R, C):
+    """Inverse of ``cb.swizzle_sf_128x4`` -> ``[R, C]``."""
+    Rp = -(-R // cb.SF_TILE_ROWS) * cb.SF_TILE_ROWS
+    Cp = -(-C // 4) * 4
+    v = sf_swizzled.reshape(Rp // cb.SF_TILE_ROWS, Cp // 4, 32, 4, 4).permute(
+        0, 3, 2, 1, 4
+    )
+    return v.reshape(Rp, Cp)[:R, :C]
+
+
 def make_weight(n_valid, K, device, seed):
     g = torch.Generator(device=device).manual_seed(seed + 31 * n_valid + K)
     n_pad = n_padded(n_valid)
@@ -248,7 +257,7 @@ def test_weight_scale_tiles_bn_layout():
     t192 = cb.weight_scale_tiles_bn(sf, K, 192)
     assert t192.numel() == n_tiles * ks * 2 * cb.SF_TILE_BYTES
     flat = t192.view(n_tiles, ks, 2, cb.SF_TILE_BYTES).permute(0, 2, 1, 3).reshape(-1)
-    per_row = cb.unswizzle_sf_128x4(flat, n_tiles * 256, ks * 4)
+    per_row = unswizzle_sf_128x4(flat, n_tiles * 256, ks * 4)
     rows = sf.repeat_interleave(128, dim=0).repeat_interleave(4, dim=1)
     for t in range(n_tiles):
         expect = torch.zeros((256, ks * 4), dtype=torch.uint8)
@@ -267,7 +276,7 @@ def test_weight_scale_tiles_bn_layout():
     flat = (
         t384.view(n_tiles384, ks, 3, cb.SF_TILE_BYTES).permute(0, 2, 1, 3).reshape(-1)
     )
-    per_row = cb.unswizzle_sf_128x4(flat, n_tiles384 * 384, ks * 4)
+    per_row = unswizzle_sf_128x4(flat, n_tiles384 * 384, ks * 4)
     for t in range(n_tiles384):
         expect = torch.zeros((384, ks * 4), dtype=torch.uint8)
         lo, hi = t * 384, min(t * 384 + 384, n_pad)
@@ -550,7 +559,6 @@ def test_sk_bindings_carry_no_split_scalars(monkeypatch):
 
 def test_padding_and_k_sets():
     assert n_padded(12) == 256 and n_padded(6284) == 6400 and n_padded(1536) == 1536
-    assert cb.n_padded_128(12) == 128 and cb.n_padded_128(6284) == 6400
     assert (
         k_sets(128) == 2
         and k_sets(512) == 4
@@ -1926,7 +1934,13 @@ def _require_program():
     if arch is None:
         pytest.skip("the Kimi-K3 FP8 projection requires an SM100/SM103 GPU")
     device = torch.device("cuda", 0)
-    if not cb.generated_program_available(device):
+    facts = cb.device_facts(device)
+    if not (
+        MODULES
+        and route_available(
+            facts.arch, required_kernel_keys(facts.arch, facts.sm_count)
+        )
+    ):
         pytest.skip(
             f"no generated Kimi-K3 FP8 projection program registered for {arch}"
         )
