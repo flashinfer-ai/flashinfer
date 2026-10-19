@@ -948,7 +948,7 @@ def svdquant_linear(
     if rank not in _SM120_CUTLASS_LORA_RANKS:
         raise ValueError(
             "the SM120 CUTLASS SVDQuant linear backend supports LoRA ranks "
-            f"32 and 64, got {rank}"
+            f"32, 64 and 128, got {rank}"
         )
 
     if m == 0:

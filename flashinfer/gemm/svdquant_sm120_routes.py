@@ -185,7 +185,7 @@ SM120_SMALL_M_TILING_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
 
 # LoRA ranks the native CUTLASS kernels can stage. Other multiples of 32 compile
 # but leave no tactic, so callers exclude them before loading a module.
-SM120_CUTLASS_LORA_RANKS: Final[tuple[int, ...]] = (32, 64)
+SM120_CUTLASS_LORA_RANKS: Final[tuple[int, ...]] = (32, 64, 128)
 
 SM120_FAMILY_LARGE_M: Final = 0
 SM120_FAMILY_SMALL_M: Final = 1

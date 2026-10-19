@@ -135,9 +135,15 @@ struct SvdquantGemmConfigSm120 {
   // compiled rather than dropping it is what keeps kernel ids stable, since the
   // KernelShapeSm120 enum and SVDQ_SM120_DISPATCH are written out by hand and
   // would otherwise have to be regenerated per rank.
+  //
+  // The byte-exact path stages a rank wider than one stage as consecutive stage-wide
+  // chunks (CollectiveMmaLoRaSm120::LoRaChunks), so any multiple of the stage width
+  // compiles. The row80 dedicated side slot is still sized for one chunk.
   static constexpr int kLoRaStageCapacity = cute::size<2>(MmaTileShape{}) / 4;
-  static constexpr int LoRaRank =
-      kSvdqSm120ModuleLoRaRank <= kLoRaStageCapacity ? kSvdqSm120ModuleLoRaRank : 32;
+  static constexpr bool kStagesModuleRank =
+      kSvdqSm120ModuleLoRaRank <= kLoRaStageCapacity ||
+      (!IsRow80SideSlot && kSvdqSm120ModuleLoRaRank % kLoRaStageCapacity == 0);
+  static constexpr int LoRaRank = kStagesModuleRank ? kSvdqSm120ModuleLoRaRank : 32;
   static_assert(!IsRow80SideSlot || IsRow80, "the production side slot is row80-only");
   static_assert(IsRow80 ||
                     LoRaPathSm120 == cutlass::gemm::collective::Sm120LoRaPath::kByteExactMainloop,
