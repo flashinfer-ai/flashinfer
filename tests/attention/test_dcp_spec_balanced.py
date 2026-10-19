@@ -898,8 +898,10 @@ def test_balanced_families_ship_one_program_per_selector_with_both_packed_instan
                 int(v) for v in variants["bodies"]
             )
             assert variants["default"] in variants["values"]
+            # the programs share one folded source; the loader's
+            # -DCAKE_FMHA_DCP_<KEY>=<value> (from the selector) picks the text
             programs = {
-                int(value): f"cuda/dcp_spec/{family}/kernel_{key}{int(value)}.cu"
+                int(value): f"cuda/dcp_spec/{family}/kernel.cu"
                 for value in variants["values"]
             }
             expected_selectors = [
@@ -913,7 +915,7 @@ def test_balanced_families_ship_one_program_per_selector_with_both_packed_instan
         ] == expected_selectors, family
         assert sorted(
             path.name for path in (csrc_dir / "cuda" / "dcp_spec" / family).iterdir()
-        ) == sorted(Path(program).name for program in programs.values())
+        ) == sorted({Path(program).name for program in programs.values()})
         texts = {}
         for value, program in programs.items():
             assert (csrc_dir / program).is_file(), program
@@ -926,7 +928,12 @@ def test_balanced_families_ship_one_program_per_selector_with_both_packed_instan
             assert "const __grid_constant__ CUtensorMap" in program_text
             assert "TensorMap const*" not in program_text
             texts[value] = program_text
-        assert len(set(texts.values())) == len(texts)  # distinct programs
+        if variants is not None:
+            knob = f"CAKE_FMHA_DCP_{str(variants['key']).upper()}"
+            # one folded source for every program of the family
+            assert len(set(texts.values())) == 1
+            (text,) = set(texts.values())
+            assert text.count(f"#if {knob}\n") == text.count(f"#endif  // {knob}\n") > 0
         for member in entry["source_family"]:
             program = programs[
                 None if variants is None else int(member["selector"][variants["key"]])
@@ -1046,12 +1053,10 @@ def test_balanced_jit_selects_the_packed_instance_and_launch_binding(
                     body, launch_binding, api_binding = (
                         Path(source) for source in spec.sources
                     )
-                    expected_body = (
-                        "kernel.cu"
-                        if variants is None
-                        else f"kernel_{variants['key']}{program}.cu"
-                    )
-                    assert body.name == expected_body and body.parent.name == family
+                    assert body.name == "kernel.cu" and body.parent.name == family
+                    if variants is not None:
+                        knob = f"CAKE_FMHA_DCP_{str(variants['key']).upper()}"
+                        assert f"-D{knob}={program}" in spec.extra_cuda_cflags
                     assert body.parent.parent.name == "dcp_spec"
                     assert f"-DN_ROWS={n_rows}" in spec.extra_cuda_cflags
                     assert launch_binding.name == f"cake_fmha_{family}_binding.cu"

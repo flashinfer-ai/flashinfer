@@ -13,7 +13,6 @@ passed as caller-prequantized MXFP8 tuples, as in MoK's functional API.
 
 from dataclasses import dataclass, replace
 import math
-import os
 import sys
 
 import torch
@@ -319,6 +318,8 @@ class MoKFunctional:
                 raise ValueError(
                     "imbalance_threshold must be a finite number above 1.0"
                 )
+        if type(config.comm_split_log) is not bool:
+            raise TypeError("comm_split_log must be a boolean")
         if (
             type(config.minibatch_size) is not int
             or config.minibatch_size <= 0
@@ -441,7 +442,10 @@ class MoKFunctional:
         entry["slot"] = entry["pending"] = slot
 
     def _comm_split(self, config, workspace):
-        """(forward, backward) communication-SM counts for the next launch."""
+        """(forward, backward) communication-SM counts for the next launch.
+
+        ``config.comm_split_log`` prints each change of the split to stderr.
+        """
         base = (config.fwd_num_comm_sms, config.bwd_num_comm_sms)
         if config.imbalance_comm_sms is None:
             return base
@@ -458,7 +462,7 @@ class MoKFunctional:
         )
         if split != entry["split"]:
             entry["split"] = split
-            if os.environ.get("CAKE_MOK_COMM_SPLIT_LOG", "0") not in ("", "0"):
+            if config.comm_split_log:
                 loads = entry["loads"]
                 total = sum(loads)
                 ratio = f"{max(loads) * len(loads) / total:.3f}" if total else "n/a"

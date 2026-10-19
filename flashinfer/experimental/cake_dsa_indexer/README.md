@@ -9,8 +9,10 @@ flashinfer-ai/flashinfer#5676.
 Both the API and the backend are experimental: no compatibility guarantee.
 SM107 (Rubin) is the primary target of the request, SM100 (B200 / GB200) the
 comparison architecture, SM103 (B300 / GB300) the third target.  The feature
-is JIT-only and does not participate in automatic backend selection,
-autotuning or trace-apply.
+does not participate in automatic backend selection, autotuning or
+trace-apply; its libraries are loaded prebuilt from `aot/` when the package
+ships them and JIT-built by FlashInfer from `build.json` otherwise (see
+"Layout of this package").
 
 ## Public entry points (`flashinfer/dsa_indexer.py`)
 
@@ -189,11 +191,27 @@ that writes the registry verifies the record against them before it is frozen.
 ## Layout of this package
 
 * `cake_jit.py` -- registry written by the generated-program export: one
-  record per program (`PROGRAMS`: role, sources, architectures, launch
-  geometry), the program of every dispatch key per architecture
-  (`PROGRAM_KEYS`), the per-architecture dispatch policy (`POLICY`), the
-  argument plan and compile flags per role, and the JIT specs (one library per
-  program and architecture, compiled with the exact architecture flags).
+  record per program (`PROGRAMS`: role, the architecture-free `library` stem,
+  architectures, launch geometry), the program of every dispatch key per
+  architecture (`PROGRAM_KEYS`), the per-architecture dispatch policy
+  (`POLICY`), the argument plan per role, and the loader glue
+  (`library_name(program, arch)` = the `build.json` entry `<library>_<arch>`,
+  `load_program(program, arch)` through `cake_build.load_library`,
+  `specs_for_arch(arch)` for JIT warm-up).
+* `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
+  FlashInfer package and this package's build manifest (schema `cake-build/1`),
+  the only record of what the package compiles: one entry per program and
+  architecture with its package-relative sources, nvcc flags, closure digest,
+  per-source SHA-256 and `aot/<name>.so` path, plus the common nvcc / link
+  flags, the `tvm-ffi` requirement and the CCCL revision the finalize programs
+  (CUB block radix sort) were compiled against.  `cake_build.load_library(name)`
+  loads the prebuilt library when `aot/` holds it (checked against the
+  builder's `aot/build_info.json` and the library's own `build_cuda_version()`)
+  and otherwise JIT-builds the entry through FlashInfer from the same sources
+  and flags; the prebuilt path never imports `flashinfer`.
+* `csrc/cake_ffi_checks.h` -- the tvm-ffi / DLPack include set, the named
+  tensor-argument checks and `cake_ffi_build_cuda_version()` the generated
+  launchers use; the package compiles without FlashInfer's `csrc/`.
 * `cake_policy.py` -- the dependency-free dispatch policy (program choice,
   capacity, check period, finalize program, workspace bound).
 * `cake_backend.py` -- validation, planning, argument binding, the prepared
@@ -208,7 +226,10 @@ that writes the registry verifies the record against them before it is frozen.
 
 ## Tests and benchmark
 
-Tests: `tests/experimental/test_cake_dsa_indexer.py` with the independent
+Tests: `tests/experimental/test_cake_dsa_indexer.py` (the backend suite, which
+imports the package only through `tests/test_helpers/cake_package.py`) and
+`tests/experimental/test_cake_dsa_indexer_api.py` (the `flashinfer.dsa_indexer`
+wrapper), with the independent
 FP64 / FP32 reference in `tests/test_helpers/cake_dsa_indexer_reference.py`
 (exact semantic cases incl. cutoff ties, all-equal scores, mixed signed zeros
 at the boundary with bit checks, negative scores and a few winners over a

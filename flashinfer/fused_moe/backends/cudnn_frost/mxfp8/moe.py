@@ -18,7 +18,7 @@ from .....fused_moe.runners import MoERunner, _validate_prerouted_inputs
 from .....utils import get_compute_capability
 from .. import runtime as common
 from ..activations import ACTIVATIONS, activation_name
-from ..support import weight_view
+from ..support import SUPPORTED_ARCHS, weight_view
 from ..compiler import require_moe_assembler
 from ..cache import require_graph_resource_retention
 from ..engine import (
@@ -48,9 +48,10 @@ _WEIGHT_KEYS = (
     "fc2_input_scale",
 )
 _TAG = "cudnn_frost-mxfp8-moe-v2"
+_UNSUPPORTED = "cuDNN Frost MXFP8 MoE kernels require SM107a or SM120a"
 
 
-@functools.lru_cache(maxsize=1)
+@functools.lru_cache(maxsize=None)
 def _module(arch):
     from .....jit.cudnn_frost import gen_cudnn_frost_moe_module
 
@@ -365,8 +366,12 @@ class CudnnFrostMxfp8MoeRunner(FrostRunnerMixin, MoERunner):
 
     def _check_support(self):
         super()._check_support()
-        if self.device.type != "cuda" or get_compute_capability(self.device) != (10, 7):
-            raise NotImplementedError("cuDNN Frost MXFP8 MoE kernels require SM107a")
+        if self.device.type != "cuda":
+            raise NotImplementedError(_UNSUPPORTED)
+        major, minor = get_compute_capability(self.device)
+        arch = f"sm_{major}{minor}a"
+        if arch not in SUPPORTED_ARCHS:
+            raise NotImplementedError(_UNSUPPORTED)
         name = activation_name(self.config.activation)
         if not self.config.finalize.do_finalize or self.config.quant.per_token_scale:
             raise NotImplementedError(
@@ -379,14 +384,16 @@ class CudnnFrostMxfp8MoeRunner(FrostRunnerMixin, MoERunner):
                     for root in _artifact_roots()
                     for quantized in (False, True)
                     for kernel in runtime.discover(root, quantized_output=quantized)
-                    if kernel.arch == "sm_107a"
+                    if kernel.arch == arch
                     and (not kernel.fc1 or kernel.activation == name)
                 }
             )
         )
         require_graph_resource_retention()
-        require_moe_assembler()
-        require_compiler("sm_107a", sources)
+        # Only the SM107 sources patch tensor maps and need the assembler floor.
+        if arch == "sm_107a":
+            require_moe_assembler()
+        require_compiler(arch, sources)
 
     def _build(self):
         device, activation = self.device, self.config.activation
@@ -398,7 +405,7 @@ class CudnnFrostMxfp8MoeRunner(FrostRunnerMixin, MoERunner):
             artifact_version=lambda: runtime._artifact_cache_version,
             policy_version=POLICY_VERSION,
             tactic_tag=_TAG,
-            require_assembler=True,
+            require_assembler=get_compute_capability(device) == (10, 7),
             refresh_artifacts=runtime.clear_artifact_cache,
             capture_selection=lambda roots, arch, sm_count: _capture_selection(
                 roots, arch, sm_count, activation

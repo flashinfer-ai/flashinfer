@@ -41,6 +41,8 @@ import pytest
 
 from flashinfer.comm import pcie_ipc_tuning as tuning
 from flashinfer.comm.pcie_ipc_policy import (
+    CE_MAX_PIECES,
+    CE_THREADS,
     MAX_BLOCKS,
     IpcLaunchConfig,
     IpcVariant,
@@ -259,6 +261,84 @@ def test_a_small_max_blocks_is_never_exceeded(max_blocks: int) -> None:
             assert 0 < config.blocks <= max_blocks, (world_size, numel, config)
             assert _is_launchable(world_size, config, max_blocks)
         assert admitted, f"ws={world_size} max_blocks={max_blocks} checks nothing"
+
+
+# The variants whose `blocks` is a ring depth rather than a grid size.
+_CE_VARIANTS = (
+    IpcVariant.COPY_ENGINE_RING,
+    IpcVariant.COPY_ENGINE_ISLAND,
+    IpcVariant.COPY_ENGINE_RING_MEMOP,
+)
+
+
+def _ce_variants(world_size):
+    # The island schedule is a 4+4 decomposition; see _is_launchable.
+    return [
+        v
+        for v in _CE_VARIANTS
+        if v is not IpcVariant.COPY_ENGINE_ISLAND or world_size == 8
+    ]
+
+
+@pytest.mark.parametrize("max_blocks", (1, 2, 3))
+def test_a_small_max_blocks_bounds_the_copy_engine_depth_too(max_blocks: int) -> None:
+    """Copy-engine depths past ``max_blocks`` are neither admitted nor offered.
+
+    The launcher checks ``blocks <= max_blocks`` for every variant, and the seed
+    never picks a copy-engine variant, so the test above cannot see this.
+    """
+    for world_size in (4, 8):
+        for variant in _ce_variants(world_size):
+            for depth in range(max_blocks + 1, CE_MAX_PIECES + 1):
+                config = IpcLaunchConfig(depth, CE_THREADS, variant)
+                assert not _is_launchable(world_size, config, max_blocks), config
+
+        offered = 0
+        for numel in (None, *_NUMELS):
+            for memop_supported in (False, True):
+                tactics = tuning.candidate_tactics(
+                    world_size,
+                    max_blocks,
+                    numel=numel,
+                    elem_size=_ELEM_SIZE,
+                    memop_supported=memop_supported,
+                )
+                for tactic in tactics:
+                    config = tuning.tactic_to_config(tactic)
+                    if config.variant in _CE_VARIANTS:
+                        offered += 1
+                        assert config.blocks <= max_blocks, (world_size, numel, config)
+        # Not vacuous: depth 1 fits every budget.
+        assert offered, f"ws={world_size} max_blocks={max_blocks} checks nothing"
+
+
+@pytest.mark.parametrize("max_blocks", (1, 2, 3, CE_MAX_PIECES, MAX_BLOCKS))
+def test_a_copy_engine_depth_within_max_blocks_is_still_offered(
+    max_blocks: int,
+) -> None:
+    """The budget removes only the depths the launcher refuses."""
+    bound = min(CE_MAX_PIECES, max_blocks)
+    ring = {b for b in tuning.TUNE_BLOCKS if b <= bound}
+    for world_size in (4, 8):
+        for variant in _ce_variants(world_size):
+            # Memop runs at depth 1 only; deeper falls back to the plain ring.
+            if variant is IpcVariant.COPY_ENGINE_RING_MEMOP:
+                continue
+            for depth in range(1, bound + 1):
+                config = IpcLaunchConfig(depth, CE_THREADS, variant)
+                assert _is_launchable(world_size, config, max_blocks), config
+
+        expected = {
+            IpcVariant.COPY_ENGINE_RING: ring,
+            # A candidate-list rule, whatever the budget.
+            IpcVariant.COPY_ENGINE_RING_MEMOP: {1},
+        }
+        if world_size == 8:
+            expected[IpcVariant.COPY_ENGINE_ISLAND] = ring
+        tactics = tuning.candidate_tactics(world_size, max_blocks, memop_supported=True)
+        for variant, depths in expected.items():
+            offered = {b for v, b, _ in tactics if v == int(variant)}
+            assert offered == depths, (world_size, variant.name, offered)
 
 
 def test_every_dispatchable_variant_is_reachable_from_the_tuner() -> None:
