@@ -55,8 +55,12 @@ ws = kda_train_workspace(S, num_docs, H, device, backward=True, save_mode="light
   reduce in a fixed order and use no atomic adds.  The backward from the saved
   set and the checkpoint replay (`saved=None`) give bitwise the same gradients.
 * Limits: `H * 128 * 64 < 2**31` (`H <= 262143`; the public contract covers
-  `H` in 1..64); `S >= 1`, `num_docs >= 1`.  Any `S`, including `S < 64` and
-  document lengths that are not multiples of 64.
+  `H` in 1..64); `R * H * 64 < 2**31` over the padded rows `R = 64 * NC_pad` of
+  the intra-chunk buffers (at `H = 64` that is `S` up to about 524k tokens; the
+  contract's shapes use at most half of that range); `num_docs <= 65536` (the
+  layout table's 16-step document search); `S >= 1`, `num_docs >= 1`.  Any `S`,
+  including `S < 64` and document lengths that are not multiples of 64.  The
+  host refuses a problem outside these limits before any launch.
 
 ### Saved set (`KdaChunkSaved`)
 

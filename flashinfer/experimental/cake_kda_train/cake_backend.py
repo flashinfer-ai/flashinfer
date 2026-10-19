@@ -81,6 +81,7 @@ from .cake_jit import CHUNK, HEAD_DIM, STAGES, STAGES_BWD, STAGES_FWD
 
 BT = CHUNK  # tokens per chunk
 D = HEAD_DIM  # head dimension of q, k, v and g
+MAX_DOCS = 65536  # the layout table finds a chunk's document with a 16-step search over [0, num_docs)
 SCALE = D**-0.5  # the default softmax-free scale of the GLM contract
 SAVED_VERSION = 1  # saved set {Aqk, Akk, tables}
 SAVED_VERSION_TAPE = (
@@ -224,7 +225,9 @@ class Plan:
 def plan(S: int, num_docs: int, H: int, sm_count: int) -> Plan:
     """The :class:`Plan` of a packed problem; reads no tensor.
 
-    ``ValueError`` when a scalar is below one or ``H * 128 * 64`` overflows the kernels' per-chunk int32 offsets.
+    ``ValueError`` when a scalar is below one, ``num_docs`` exceeds :data:`MAX_DOCS` (the depth of the layout
+    table's document search) or an int32 offset of the kernels would overflow: ``H * 128 * 64`` per chunk,
+    ``R * H * 64`` over the padded rows of the ``[R, H, 64]`` intra-chunk buffers.
     """
     S, num_docs, H, sm_count = int(S), int(num_docs), int(H), int(sm_count)
     if S < 1 or num_docs < 1 or H < 1 or sm_count < 1:
@@ -233,7 +236,16 @@ def plan(S: int, num_docs: int, H: int, sm_count: int) -> Plan:
         )
     if H * D * BT >= 2**31:
         raise ValueError(f"plan: H={H} overflows the kernels' per-chunk int32 offsets")
+    if num_docs > MAX_DOCS:
+        raise ValueError(
+            f"plan: num_docs={num_docs} exceeds {MAX_DOCS}, the depth of the layout table's document search"
+        )
     nc_max, nc_pad, rows = _geometry(S, num_docs)
+    if rows * H * BT >= 2**31:
+        raise ValueError(
+            f"plan: R={rows} padded rows (S={S}, num_docs={num_docs}) x H={H} overflow the kernels' int32 "
+            f"row-head offsets: R * H * 64 must stay below 2**31"
+        )
     recur, segments, num_segments = cake_jit.segment_plan(num_docs, H, sm_count)
     scalars = {
         "num_chunks_pad": nc_pad,
@@ -770,8 +782,8 @@ class KdaWorkspace:
                 f"KdaWorkspace: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
             )
         self.plan = plan
-        self.device = torch.device(device)
-        self.device_index = _device_index(self.device)
+        self.device_index = _device_index(torch.device(device))
+        self.device = torch.device("cuda", self.device_index)
         self.arch = cake_jit.device_arch(self.device_index)
         self.backward = backward
         self.save_mode = save_mode
@@ -1160,7 +1172,11 @@ def chunk_kda_fwd(
             f"chunk_kda_fwd: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
         )
     tape = save_mode == "tape" and save_for_backward
-    a = ws.views("fwd_tape" if tape else "fwd")
+    # A tape-mode workspace sizes its arena for the tape layouts (h / v_new outside the arena), so a call on it
+    # that hands no tape to a saved set allocates them per call; a light workspace holds them in the arena.  The
+    # launch order and the operands are the same.
+    tape_ws = (not tape) and ws.save_mode == "tape"
+    a = ws.views("fwd_tape" if (tape or tape_ws) else "fwd")
     seg = p.recur == "seg"
     out = _alloc((S, H, D), torch.bfloat16, ws.device)
     if save_for_backward:
@@ -1174,6 +1190,10 @@ def chunk_kda_fwd(
         seg_state = (
             _alloc((2, p.NSEG, H, D, D), torch.float32, ws.device) if seg else None
         )
+    elif tape_ws:  # per-call h / v_new; the segment states of the arena's replay slots serve this call
+        h = _alloc((p.NC_pad, H, D, D), torch.bfloat16, ws.device)
+        v_new = _alloc((p.R, H, D), torch.bfloat16, ws.device)
+        seg_state = a.seg_state if seg else None
     else:
         h, v_new = a.h, a.v_new
         seg_state = a.seg_state if seg else None
@@ -1287,13 +1307,14 @@ def chunk_kda_bwd(
                     torch.float32,
                     ws.device,
                 )
-    # A tape-mode workspace (arena sized for the bwd_tape layout) replays with per-call h / v_new, as its forward
-    # does; a light one recomputes them inside the arena.  The launch order and the operands are the same.
-    tape_replay = replay and ws.save_mode == "tape"
-    b = ws.views("bwd_tape" if (tape or tape_replay) else "bwd")
+    # A tape-mode workspace (arena sized for the bwd_tape layout) recomputes h / v_new into per-call buffers
+    # whenever the saved set does not carry them (a version-1 saved set, the replay), as its forward does; a
+    # light one recomputes them inside the arena.  The launch order and the operands are the same.
+    tape_ws = (not tape) and ws.save_mode == "tape"
+    b = ws.views("bwd_tape" if (tape or tape_ws) else "bwd")
     if tape:
         h, v_new = saved.h, saved.v_new
-    elif tape_replay:
+    elif tape_ws:
         h = _alloc((p.NC_pad, H, D, D), torch.bfloat16, ws.device)
         v_new = _alloc((p.R, H, D), torch.bfloat16, ws.device)
     else:
@@ -1470,6 +1491,7 @@ __all__ = [
     "FWD_SLOTS",
     "FWD_TAPE_SLOTS",
     "KIND_SHAPE",
+    "MAX_DOCS",
     "MODES",
     "SAVED_VERSION",
     "SAVED_VERSION_TAPE",

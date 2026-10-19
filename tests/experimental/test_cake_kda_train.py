@@ -735,10 +735,13 @@ def test_autograd_and_checkpoint_give_the_explicit_gradients(device, manifest) -
         (q, k, v, g, beta), ("dq", "dk", "dv", "dg", "dbeta"), strict=True
     ):
         assert torch.equal(leaf.grad, grads[name]), name
-    # A non-contiguous upstream gradient is accepted by the autograd node.
+    # A non-contiguous upstream gradient is accepted by the autograd node (two heads: the transposed view of
+    # a one-head tensor would still be contiguous).
     q, k, v, g, beta = leaves()
     o = cake_backend.chunk_kda(q, k, v, g, beta, cu)
-    o.backward(dout[..., None].expand(*dout.shape, 1)[..., 0])
+    dout_nc = dout.transpose(0, 1).contiguous().transpose(0, 1)
+    assert not dout_nc.is_contiguous()
+    o.backward(dout_nc)
     assert torch.equal(v.grad, grads["dv"])
 
 
@@ -966,3 +969,68 @@ def test_operand_checks(device, manifest) -> None:
     out, _ = cake_backend.chunk_kda_fwd(q, k, v, g, beta, cu, save_for_backward=False)
     assert out.shape == (65, heads, D)
     assert cake_backend.is_supported(device)
+
+
+def test_plan_limits_cover_the_kernels_int32_offsets() -> None:
+    # The [R, H, 64] intra-chunk buffers are addressed with 32-bit row-head offsets: R * H * 64 < 2**31 over the
+    # padded rows R = 64 * NC_pad.
+    assert cake_backend.plan(2**25 - 192, 1, 1, 148).R * 1 * BT < 2**31
+    with pytest.raises(ValueError, match="row-head"):
+        cake_backend.plan(2**25 - 128, 1, 1, 148)
+    assert cake_backend.plan(2**19 - 192, 1, 64, 148).R * 64 * BT < 2**31
+    with pytest.raises(ValueError, match="row-head"):
+        cake_backend.plan(2**19 - 128, 1, 64, 148)
+    # The layout table finds a chunk's document with a 16-step search: at most MAX_DOCS documents.
+    assert (
+        cake_backend.plan(70000, cake_backend.MAX_DOCS, 1, 148).N
+        == cake_backend.MAX_DOCS
+    )
+    with pytest.raises(ValueError, match="document search"):
+        cake_backend.plan(70000, cake_backend.MAX_DOCS + 1, 1, 148)
+
+
+def test_tape_workspace_serves_light_calls(device, manifest) -> None:
+    # A saved set can go to a backward on any workspace of the same problem: a tape-mode arena (sized for the tape
+    # layouts) recomputes h / v_new into per-call buffers for a version-1 saved set, for the replay and for a
+    # forward that saves nothing, as its own forward does; the results are those of a light workspace.
+    lengths, heads = (63, 1, 65), 4
+    inputs = make_inputs(lengths, heads, device)
+    q, k, v, g, beta, cu, dout = (
+        inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
+    )
+    out, grads, _ = _run_fwd_bwd(inputs)
+    out, grads = _clone_all(out, grads)
+    S, N = sum(lengths), len(lengths)
+    ws = KdaWorkspace.for_problem(S, N, heads, device, save_mode="tape")
+    o, saved = cake_backend.chunk_kda_fwd(
+        q, k, v, g, beta, cu, workspace=ws, save_mode="light"
+    )
+    assert saved.version == cake_backend.SAVED_VERSION
+    assert torch.equal(o, out)
+    for saved_set in (saved, None):
+        got = cake_backend.chunk_kda_bwd(
+            q, k, v, g, beta, cu, dout, saved=saved_set, workspace=ws
+        )
+        for name, t in zip(("dq", "dk", "dv", "dbeta", "dg"), got, strict=True):
+            assert torch.equal(t, grads[name]), (name, saved_set is None)
+    fwd_only = KdaWorkspace.for_problem(
+        S, N, heads, device, backward=False, save_mode="tape"
+    )
+    o, saved = cake_backend.chunk_kda_fwd(
+        q, k, v, g, beta, cu, workspace=fwd_only, save_for_backward=False
+    )
+    assert saved is None
+    assert torch.equal(o, out)
+
+
+def test_workspace_accepts_an_unindexed_cuda_device(device, manifest) -> None:
+    lengths, heads = (65,), 2
+    inputs = make_inputs(lengths, heads, device)
+    q, k, v, g, beta, cu = (
+        inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens")
+    )
+    with torch.cuda.device(q.device):
+        ws = KdaWorkspace.for_problem(sum(lengths), 1, heads, "cuda")
+    assert ws.device == q.device
+    o, _ = cake_backend.chunk_kda_fwd(q, k, v, g, beta, cu, workspace=ws)
+    assert o.shape == (sum(lengths), heads, D)
