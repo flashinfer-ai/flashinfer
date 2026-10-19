@@ -2200,3 +2200,23 @@ def test_prepared_calls_perform_no_device_queries_after_warm_up(monkeypatch):
     torch.cuda.synchronize()
     assert boom.call_count == 0
     assert ref.same_bits(again, expected) and ref.same_bits(captured, expected)
+
+
+def test_policy_is_validated_once_per_architecture(monkeypatch):
+    """The registry record is process-immutable: ``policy_for`` validates it once per architecture, the planning
+    path re-validates nothing, and an unregistered architecture keeps raising by name."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    validate = mock.Mock(wraps=DispatchPolicy.from_record)
+    monkeypatch.setattr(DispatchPolicy, "from_record", validate)
+    for arch in cake_jit.ARCHES:
+        policy = policy_for(arch)
+        validate.reset_mock()
+        assert policy_for(arch) is policy
+        plan_dsa_indexer_topk(
+            1024, 4096, 1, top_k=256, arch=arch, num_sms=_FROZEN_GRIDS[arch][0]
+        )
+        assert validate.call_count == 0, arch
+    for _ in range(2):
+        with pytest.raises(NotImplementedError, match="5676"):
+            policy_for("sm_90a")
