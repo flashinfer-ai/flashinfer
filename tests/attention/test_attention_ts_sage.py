@@ -36,7 +36,10 @@ from flashinfer.attention.prims_ts import (
     block_sparse_attention,
 )
 from flashinfer.attention.prims_ts._block_sparse import config as sparse_config
-from flashinfer.attention.prims_ts.sage.config import _INT8_QK_COMPUTE_CAPABILITIES
+from flashinfer.attention.prims_ts.sage.config import (
+    _INT8_QK_COMPUTE_CAPABILITIES,
+    validate_sage_recipe,
+)
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_constants import (
     E4M3_MAX,
     SOFTMAX_RESCALE_THRESHOLD_LOG2,
@@ -881,10 +884,16 @@ def test_int8_qk_plans_only_on_sm100(monkeypatch: pytest.MonkeyPatch) -> None:
             id="kv-alias-conflict",
         ),
         pytest.param(
-            {"q_data_type": torch.bfloat16}, ValueError, "Int8 Q and K", id="16-bit-qk"
+            {"q_data_type": torch.bfloat16},
+            NotImplementedError,
+            "float8_e4m3fn or int8 Q/K",
+            id="16-bit-qk",
         ),
         pytest.param(
-            {"v_data_type": torch.bfloat16}, ValueError, "E4M3FN V", id="16-bit-v"
+            {"v_data_type": torch.bfloat16},
+            NotImplementedError,
+            "float8_e4m3fn V",
+            id="16-bit-v",
         ),
         pytest.param(
             {"sage_config": SageAttentionConfig(k_block_size=8)},
@@ -933,6 +942,73 @@ def test_sage_plan_rejects_unsupported_recipes(
     )
     with pytest.raises(error, match=match):
         BlockSparseTSWrapper().plan(**{**arguments, **overrides})
+
+
+@pytest.mark.parametrize(
+    ("config", "dtypes", "error", "match"),
+    (
+        pytest.param(SageAttentionConfig(), {}, None, None, id="fp8-recipe"),
+        pytest.param(
+            SageAttentionConfig(q_block_size=64, k_block_size=1, v_mean=True),
+            {
+                "q_dtype": torch.int8,
+                "k_dtype": torch.int8,
+                "output_dtype": torch.float16,
+            },
+            None,
+            None,
+            id="int8-recipe",
+        ),
+        pytest.param(
+            SageAttentionConfig(q_block_size=3),
+            {},
+            ValueError,
+            "q_block_size must be a power of two",
+            id="q-block-3",
+        ),
+        pytest.param(
+            SageAttentionConfig(k_summary_block_size=8),
+            {},
+            ValueError,
+            "k_summary_block_size",
+            id="summary-block-8",
+        ),
+        pytest.param(
+            SageAttentionConfig(),
+            {"output_dtype": _FP8},
+            NotImplementedError,
+            "float16 or bfloat16 output",
+            id="fp8-output",
+        ),
+        pytest.param(
+            SageAttentionConfig(),
+            {"k_dtype": torch.int8},
+            ValueError,
+            "one dtype",
+            id="mixed-qk",
+        ),
+    ),
+)
+def test_validate_sage_recipe(
+    config: SageAttentionConfig,
+    dtypes: dict[str, torch.dtype],
+    error: type[Exception] | None,
+    match: str | None,
+) -> None:
+    """Both wrappers check a Sage recipe with ``validate_sage_recipe`` at plan time."""
+
+    arguments = {
+        "q_dtype": _FP8,
+        "k_dtype": _FP8,
+        "v_dtype": _FP8,
+        "output_dtype": torch.bfloat16,
+        **dtypes,
+    }
+    if error is None:
+        validate_sage_recipe(config, **arguments)
+        return
+    with pytest.raises(error, match=match):
+        validate_sage_recipe(config, **arguments)
 
 
 def _sage_decode_config(

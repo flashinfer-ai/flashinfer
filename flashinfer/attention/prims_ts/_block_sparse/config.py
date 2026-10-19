@@ -24,7 +24,7 @@ from flashinfer.utils import ceil_div
 
 from ..decode import _cutlass_dtype, _dtype_key, _validate_mask, _validate_positive_int
 from ..kernels.fmha_decode.fmha_decode_constants import SOFTMAX_RESCALE_THRESHOLD_LOG2
-from ..sage.config import SageAttentionConfig
+from ..sage.config import SageAttentionConfig, validate_sage_recipe
 from .common import (
     _PREPARED_KV_ROUTE_SIZE,
     _SIGNED_INT32_MAX,
@@ -385,7 +385,7 @@ def _resolve_plan_dtypes(
     """Return ``(kv_dtype, v_dtype, output_dtype, dtype_key)`` of one plan.
 
     K defaults to Q and V to K. The output defaults to Q, or to bfloat16 with
-    Sage; the decode configuration validates the Sage dtype recipe.
+    Sage, whose recipe ``validate_sage_recipe`` checks.
     """
 
     if kv_dtype is None:
@@ -401,12 +401,15 @@ def _resolve_plan_dtypes(
             output_dtype,
             _validate_matching_dtypes(q_dtype, kv_dtype, v_dtype, output_dtype),
         )
-    if not isinstance(sage, SageAttentionConfig):
-        raise TypeError("sage must be a SageAttentionConfig instance")
-    if q_dtype != kv_dtype:
-        raise ValueError("Sage attention requires Q and K in one dtype")
     if output_dtype is None:
         output_dtype = torch.bfloat16
+    validate_sage_recipe(
+        sage,
+        q_dtype=q_dtype,
+        k_dtype=kv_dtype,
+        v_dtype=v_dtype,
+        output_dtype=output_dtype,
+    )
     return kv_dtype, v_dtype, output_dtype, _plan_dtype_key(q_dtype)
 
 

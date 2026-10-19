@@ -316,7 +316,7 @@ def test_context_sage_plan_rejects_unsupported_recipes() -> None:
         _plan(sage=config, q_dtype=torch.bfloat16, k_dtype=torch.bfloat16, **shape)
     with pytest.raises(NotImplementedError, match="require a Sage recipe"):
         _plan(sage=None, **_qk_dtype_options(_INT8), **shape)
-    with pytest.raises(NotImplementedError, match="with float8_e4m3fn V"):
+    with pytest.raises(NotImplementedError, match="float8_e4m3fn V"):
         _plan(sage=config, q_dtype=_INT8, k_dtype=_INT8, v_dtype=_INT8, **shape)
     with pytest.raises(NotImplementedError, match="dense, fixed-length"):
         _plan(sage=config, mask_type="causal", **shape)

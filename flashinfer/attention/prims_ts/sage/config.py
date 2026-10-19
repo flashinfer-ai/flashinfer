@@ -163,6 +163,59 @@ def _validate_scale_tensor(
         raise ValueError(f"{name} must be on device {device}, got {tensor.device}")
 
 
+# Q/K and output dtypes of the Sage recipe.
+_SAGE_QK_DTYPES = (torch.float8_e4m3fn, torch.int8)
+_SAGE_OUTPUT_DTYPES = (torch.float16, torch.bfloat16)
+
+
+def validate_sage_recipe(
+    config: object,
+    *,
+    q_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    v_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+) -> None:
+    """Reject a Sage recipe at plan time, the same way for every wrapper.
+
+    The recipe quantizes Q and K to one 8-bit dtype, float8_e4m3fn or int8,
+    and V to float8_e4m3fn, and returns a float16 or bfloat16 output: an
+    8-bit output would discard the precision the scales keep. The block
+    sizes follow ``SageAttentionConfig``. Int8 Q/K also need an SM100 GPU
+    (``_validate_int8_qk_device``), and each wrapper rejects the plan
+    geometries its kernel does not run.
+    """
+    if not isinstance(config, SageAttentionConfig):
+        raise TypeError("sage must be a SageAttentionConfig")
+    if q_dtype != k_dtype:
+        raise ValueError(
+            "Sage attention requires Q and K in one dtype; "
+            f"got q {q_dtype} and k {k_dtype}"
+        )
+    if q_dtype not in _SAGE_QK_DTYPES:
+        raise NotImplementedError(
+            f"Sage attention requires float8_e4m3fn or int8 Q/K; got {q_dtype}"
+        )
+    if v_dtype != torch.float8_e4m3fn:
+        raise NotImplementedError(
+            f"Sage attention requires float8_e4m3fn V; got {v_dtype}"
+        )
+    if output_dtype not in _SAGE_OUTPUT_DTYPES:
+        raise NotImplementedError(
+            f"Sage attention requires a float16 or bfloat16 output; got {output_dtype}"
+        )
+    for name in ("k_block_size", "k_summary_block_size"):
+        block_size = getattr(config, name)
+        if block_size not in SAGE_K_BLOCK_SIZES:
+            raise ValueError(
+                f"sage.{name} must be one of {SAGE_K_BLOCK_SIZES}, got {block_size}"
+            )
+    if not is_power_of_two(config.q_block_size):
+        raise ValueError(
+            f"sage.q_block_size must be a power of two, got {config.q_block_size}"
+        )
+
+
 def sage_scale_shapes(
     config: SageAttentionConfig,
     *,
@@ -237,4 +290,5 @@ __all__ = [
     "sage_adapter_slots",
     "sage_scale_shapes",
     "validate_sage_params",
+    "validate_sage_recipe",
 ]

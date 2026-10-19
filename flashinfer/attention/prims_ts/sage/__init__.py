@@ -42,6 +42,7 @@ from .config import (
     sage_adapter_slots,
     sage_scale_shapes,
     validate_sage_params,
+    validate_sage_recipe,
 )
 
 __all__ = [
@@ -56,4 +57,5 @@ __all__ = [
     "sage_adapter_slots",
     "sage_scale_shapes",
     "validate_sage_params",
+    "validate_sage_recipe",
 ]

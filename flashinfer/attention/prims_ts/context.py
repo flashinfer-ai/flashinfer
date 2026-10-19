@@ -51,11 +51,11 @@ import torch
 from flashinfer.api_logging import flashinfer_experimental_api
 
 from .sage.config import (
-    SAGE_K_BLOCK_SIZES,
     SageAttentionConfig,
     SageAttentionParams,
     sage_scale_shapes,
     validate_sage_params,
+    validate_sage_recipe,
     _validate_int8_qk_device,
 )
 from .sage.layout import _SAGE_ATOM_TOKENS, _SageScaleLayout
@@ -1740,34 +1740,23 @@ def _validate_context_sage_config(
 ) -> None:
     """Reject a Sage recipe the contiguous context kernel does not run.
 
-    Sage attention covers the dense, fixed-length, query-paired D128 path with
-    E4M3 or Int8 Q/K, E4M3 V and a 16-bit output: the recipe quantizes Q/K/V
-    and P, so an FP8 output would discard the precision it keeps.
+    Beyond the recipe every wrapper checks (``validate_sage_recipe``), Sage
+    attention covers the dense, fixed-length, query-paired D128 path.
     """
 
-    if not isinstance(sage, SageAttentionConfig):
-        raise TypeError("sage must be a SageAttentionConfig")
+    validate_sage_recipe(
+        sage,
+        q_dtype=geometry.qk_dtype,
+        k_dtype=geometry.qk_dtype,
+        v_dtype=geometry.pv_dtype,
+        output_dtype=geometry.output_dtype,
+    )
     if geometry.mask_type != "dense" or geometry.packed or geometry.head_paired:
         raise NotImplementedError(
             "Sage attention requires a dense, fixed-length, query-paired context plan"
         )
     if geometry.head_dim != 128 or geometry.head_dim_vo not in (None, 128):
         raise NotImplementedError("Sage attention requires head_dim 128")
-    if (
-        geometry.qk_dtype not in (torch.float8_e4m3fn, torch.int8)
-        or geometry.pv_dtype != torch.float8_e4m3fn
-    ):
-        raise NotImplementedError(
-            "Sage attention requires float8_e4m3fn or int8 Q/K with "
-            f"float8_e4m3fn V; got q/k {geometry.qk_dtype} and v {geometry.pv_dtype}"
-        )
-    if geometry.output_dtype not in (torch.float16, torch.bfloat16):
-        raise NotImplementedError(
-            "Sage attention requires a float16 or bfloat16 output; "
-            f"got {geometry.output_dtype}"
-        )
-    if sage.k_block_size not in SAGE_K_BLOCK_SIZES:
-        raise ValueError(f"sage.k_block_size must be one of {SAGE_K_BLOCK_SIZES}")
 
 
 def _context_sage_layout(geometry: _ContextPlanGeometry) -> _SageScaleLayout:
