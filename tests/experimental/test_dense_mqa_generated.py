@@ -10,6 +10,7 @@ imports and launches never use it.
 """
 
 import bisect
+import re
 
 import pytest
 import torch
@@ -607,11 +608,8 @@ def test_dense_mqa_sm_count_definition(sm_count):
     )
     assert plan.route_name == "fp8:q1:short"
     assert plan.num_sms == sm_count
-    program = dict(plan.route["stages"])["logits"][arch]
+    program = _runtime.stage_program(plan.route["stages"][0], arch)
     assert plan.program_names == [program]
-    record = _runtime._catalog()["programs"][program]
-    assert record["definitions"] == ["SM_COUNT"]
-    assert _runtime.program_definitions(record, sm_count) == {"SM_COUNT": sm_count}
     assert _runtime.program_spec(arch, program, sm_count).name.endswith(
         f"_sm_count{sm_count}"
     )
@@ -1099,13 +1097,56 @@ def test_fp8_mqa_logits_graph_replay(queries, keys, heads):
     assert torch.equal(captured, changed) and not torch.equal(captured, eager)
 
 
+_LADDER = re.compile(
+    r"^#(?:el)?if (.+)\n#define CAKE_PROGRAM_KERNEL (\w+)(?:\n#define CAKE_PROGRAM_SHIM (\w+))?",
+    re.MULTILINE,
+)
+
+
+def _program_identity(kernel_text, binding_text, definitions):
+    """``(kernel symbol, host-shim namespace)`` a JIT module built from the two units with
+    ``definitions`` exports: the literal names of a per-route text, or the branch of a shared
+    text's program-identity ladder whose ``MACRO == value`` conjunction holds for exactly these
+    definitions (one branch in the kernel and one in the binding, naming the same kernel)."""
+
+    def select(text, what):
+        branches = _LADDER.findall(text)
+        if not branches:
+            return None
+        hits = [
+            (kernel, shim)
+            for condition, kernel, shim in branches
+            if {k: int(v) for k, v in re.findall(r"(\w+) == (\d+)", condition)}
+            == definitions
+        ]
+        assert len(hits) == 1, (what, definitions, hits)
+        return hits[0]
+
+    kernel, binding = select(kernel_text, "kernel"), select(binding_text, "binding")
+    if kernel is None and binding is None:
+        symbol = re.search(r"^(kernel_cake_\w+)\(", kernel_text, re.MULTILINE).group(1)
+        shim = re.search(
+            r"^namespace (cake_host_shim_[0-9a-f]{16}) \{", binding_text, re.MULTILINE
+        ).group(1)
+        return symbol, shim
+    assert kernel is not None and binding is not None and kernel[0] == binding[0], (
+        kernel,
+        binding,
+    )
+    return binding
+
+
 def test_catalog_programs_are_delivered_and_distinct():
     """Host-only: every program a dense or paged route names is catalogued on exactly the architectures
     the route is delivered on, its generated units exist under FlashInfer's ``csrc`` (a module: its own
-    ``<name>_kernel.cu`` + ``<name>_binding.cu``; a sequence: >= 2 module kernels + its own binding),
-    no two generated kernel units are byte-identical and no generated unit is unreferenced -- a route
+    ``<name>_kernel.cu`` + ``<name>_binding.cu``; a sequence: >= 2 kernels + its own binding),
+    no two generated kernel units are byte-identical, a module record built from a shared parameterised
+    text (``fixed_definitions``) names that text's units, which guard exactly those definitions, no two
+    records build one text with the same definitions, and no generated unit is unreferenced -- a route
     table pointing at a program hash whose units were regenerated under a new hash fails here, not at
-    JIT build time."""
+    JIT build time.  Every standalone module exports its own kernel symbol and host-shim namespace
+    (a shared text selects the per-program names for each definition set through its
+    program-identity ladder)."""
     import hashlib
 
     from flashinfer.jit import env
@@ -1127,7 +1168,8 @@ def test_catalog_programs_are_delivered_and_distinct():
     for table in ("routes", "paged_routes"):
         for route, record in catalog.get(table, {}).items():
             expected = sorted(text_route_arches.get(route, catalog["arches"]))
-            for _stage, by_arch in record["stages"]:
+            for stage in record["stages"]:
+                by_arch = _runtime.stage_programs(stage, catalog["arches"])
                 where = (table, route, by_arch, expected)
                 assert sorted(by_arch) == expected, where
                 for arch, program in by_arch.items():
@@ -1138,23 +1180,49 @@ def test_catalog_programs_are_delivered_and_distinct():
                 table,
                 route,
             )
-    referenced, kernels = set(), {}
+    referenced, kernels, instances, identities = set(), {}, {}, {}
     for name, record in programs.items():
         for source in record["sources"]:
             assert source.startswith("csrc/"), (name, source)
             assert (csrc / source.removeprefix("csrc/")).is_file(), (name, source)
             referenced.add(source)
-        if record.get(
-            "standalone", True
-        ):  # an omitted-binding module carries no closure digest
-            for arch in record["arches"]:
-                assert arch in (record.get("closure_sha256") or {}), (name, arch)
         if record["kind"] == "module":
-            expected = {f"{generated}/{name}_kernel.cu"}
+            fixed = record.get("fixed_definitions", {})
+            text = name
+            if fixed:
+                text = record["sources"][0].rsplit("/", 1)[1].removesuffix("_kernel.cu")
+            expected = {f"{generated}/{text}_kernel.cu"}
             if record["standalone"]:
-                expected.add(f"{generated}/{name}_binding.cu")
+                expected.add(f"{generated}/{text}_binding.cu")
             assert set(record["sources"]) == expected, (name, record["sources"])
-            kernels[f"{generated}/{name}_kernel.cu"] = name
+            kernel = f"{generated}/{text}_kernel.cu"
+            # The text requires exactly the definitions the record fixes (its
+            # ``#ifndef`` guards beyond the runtime-supplied ``SM_COUNT``) and no
+            # two records build one text with the same definitions.
+            guarded = set(
+                re.findall(
+                    r"^#ifndef (\w+)$",
+                    (csrc / kernel.removeprefix("csrc/")).read_text(),
+                    re.MULTILINE,
+                )
+            )
+            assert guarded - {"SM_COUNT"} == set(fixed), (name, guarded)
+            instance = (kernel, tuple(sorted(fixed.items())))
+            assert instance not in instances, (
+                f"{name} builds {text} with {instances[instance]}'s definitions"
+            )
+            instances[instance] = name
+            kernels[kernel] = text
+            if record["standalone"]:
+                identity = _program_identity(
+                    (csrc / kernel.removeprefix("csrc/")).read_text(),
+                    (
+                        csrc / f"{generated}/{text}_binding.cu".removeprefix("csrc/")
+                    ).read_text(),
+                    fixed,
+                )
+                assert identity not in identities.values(), (name, identity)
+                identities[name] = identity
         else:
             assert record["kind"] == "sequence", name
             devices = [s for s in record["sources"] if s.endswith("_kernel.cu")]
@@ -1163,8 +1231,7 @@ def test_catalog_programs_are_delivered_and_distinct():
                 and f"{generated}/{name}_binding.cu" in record["sources"]
             ), name
             for device in devices:
-                owner = device.rsplit("/", 1)[1].removesuffix("_kernel.cu")
-                assert programs.get(owner, {}).get("kind") == "module", (name, device)
+                kernels.setdefault(device, name)
     digests = {}
     for source, name in sorted(kernels.items()):
         digest = hashlib.sha256(
@@ -1386,9 +1453,11 @@ def test_dense_bindings_cover_every_program_argument():
         else:
             # Every program a stage launches on any architecture binds the same way.
             selections = [
-                (stage, program)
-                for stage, by_arch in record["stages"]
-                for program in sorted(set(by_arch.values()))
+                (stage[0], program)
+                for stage in record["stages"]
+                for program in sorted(
+                    set(_runtime.stage_programs(stage, catalog["arches"]).values())
+                )
             ]
         for stage, program in selections:
             missing = []

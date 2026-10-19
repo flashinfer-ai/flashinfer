@@ -169,7 +169,7 @@ kernel_cake_quant_lora_gemm_b24e291cc9bbcb6adad1(unsigned int M, unsigned int N,
                         }
                         for (unsigned int k_p = 0; k_p < num_k_stages; k_p++) {
                             unsigned int stage_p = rs_p;
-                            mbarrier_wait_relaxed_hint(empty_local_addr + (rs_p) * 8, rph_p, 10000000);
+                            mbarrier_wait_plain_hint(empty_local_addr + (rs_p) * 8, rph_p, 10000000);
                             if (cta_rank == 0) {
                                 mbarrier_wait_cluster_hint(empty_addr + (rs_p) * 8, rph_p, 10000000);
                                 if (p_count > t_p) {
@@ -218,7 +218,7 @@ kernel_cake_quant_lora_gemm_b24e291cc9bbcb6adad1(unsigned int M, unsigned int N,
                         }
                         for (unsigned int s_p = 0; s_p < lora_stages; s_p++) {
                             unsigned int stage_pl = rs_p;
-                            mbarrier_wait_relaxed_hint(empty_local_addr + (rs_p) * 8, rph_p, 10000000);
+                            mbarrier_wait_plain_hint(empty_local_addr + (rs_p) * 8, rph_p, 10000000);
                             if (cta_rank == 0) {
                                 mbarrier_wait_cluster_hint(empty_addr + (rs_p) * 8, rph_p, 10000000);
                                 if (p_count > t_p) {
@@ -405,20 +405,20 @@ kernel_cake_quant_lora_gemm_b24e291cc9bbcb6adad1(unsigned int M, unsigned int N,
                 acc_fin[93] = 0.0f;
                 acc_fin[94] = 0.0f;
                 acc_fin[95] = 0.0f;
+                unsigned int one_h = 1;
+                unsigned int last_k_h = num_k_stages - 1;
+                if (num_k_stages != 0) {
+                    mbarrier_wait_plain_hint(full_addr + (rs_c) * 8, rph_c, 10000000);
+                }
+                unsigned int fip_h = 1;
+                unsigned int pn_h = 0;
+                if (last_k_h == 0) {
+                    pn_h = one_h;
+                }
                 for (unsigned int k_c = 0; k_c < num_k_stages; k_c++) {
                     unsigned int stage_c = rs_c;
-                    unsigned int blk_pos = k_c % 8;
-                    unsigned int one_c = 1;
-                    unsigned int _min_2 = ((blk_pos) < (one_c) ? (blk_pos) : (one_c));
-                    unsigned int first_in_period = one_c - _min_2;
-                    unsigned int blocks_left = 7 - blk_pos;
-                    unsigned int _min_3 = ((blocks_left) < (one_c) ? (blocks_left) : (one_c));
-                    unsigned int promote_now = one_c - _min_3;
-                    unsigned int last_k = num_k_stages - 1;
-                    if (k_c == last_k) {
-                        promote_now = one_c;
-                    }
-                    mbarrier_wait_relaxed_hint(full_addr + (rs_c) * 8, rph_c, 10000000);
+                    unsigned int first_in_period = fip_h;
+                    unsigned int promote_now = pn_h;
                     asm volatile("" : "+f"(accum[0]) :: "memory");
                     asm volatile("" : "+f"(accum[1]) :: "memory");
                     asm volatile("" : "+f"(accum[2]) :: "memory");
@@ -638,6 +638,19 @@ kernel_cake_quant_lora_gemm_b24e291cc9bbcb6adad1(unsigned int M, unsigned int N,
                     asm volatile("" : "+f"(accum[93]) :: "memory");
                     asm volatile("" : "+f"(accum[94]) :: "memory");
                     asm volatile("" : "+f"(accum[95]) :: "memory");
+                    unsigned int k_next = k_c + 1;
+                    if (k_next < num_k_stages) {
+                        mbarrier_wait_plain_hint(full_addr + (((rs_c + 1 < 5) ? rs_c + 1 : (unsigned int)0)) * 8, ((rs_c + 1 < 5) ? rph_c : rph_c ^ 1), 10000000);
+                    }
+                    unsigned int blk_pos_n = k_next % 8;
+                    unsigned int _min_2 = ((blk_pos_n) < (one_h) ? (blk_pos_n) : (one_h));
+                    fip_h = one_h - _min_2;
+                    unsigned int blocks_left_n = 7 - blk_pos_n;
+                    unsigned int _min_3 = ((blocks_left_n) < (one_h) ? (blocks_left_n) : (one_h));
+                    pn_h = one_h - _min_3;
+                    if (k_next == last_k_h) {
+                        pn_h = one_h;
+                    }
                     asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
                     if (warp_in_wg == 0) {
                         if (elect_sync()) {
@@ -847,7 +860,7 @@ kernel_cake_quant_lora_gemm_b24e291cc9bbcb6adad1(unsigned int M, unsigned int N,
                 accum[95] = 0.0f;
                 for (unsigned int s_c = 0; s_c < lora_stages; s_c++) {
                     unsigned int stage_cl = rs_c;
-                    mbarrier_wait_relaxed_hint(full_addr + (rs_c) * 8, rph_c, 10000000);
+                    mbarrier_wait_plain_hint(full_addr + (rs_c) * 8, rph_c, 10000000);
                     asm volatile("" : "+f"(accum[0]) :: "memory");
                     asm volatile("" : "+f"(accum[1]) :: "memory");
                     asm volatile("" : "+f"(accum[2]) :: "memory");

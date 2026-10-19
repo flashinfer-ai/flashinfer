@@ -460,11 +460,29 @@ def _check_hidden_size(hidden_size: int) -> None:
         )
 
 
-def _metadata(hidden_size: int, dtype: CakeBGMVMoEDType) -> CakeBGMVMoEMetadata:
+# Compute-capability-10.7-only records: the same kernels with 256-bit B-row loads in the
+# token-owned expand kernels (specialized bf16 hidden 2688 / 3072) and, for the generic bf16
+# rank-32 bundle, the merge-in-expand form (the per-route shrink stores its hidden-split f32
+# partials only; the token-owned expand kernels sum them in split order and write shrink_out),
+# bitwise identical outputs, rendered for the measured shapes.  Every other (arch, dtype, shape)
+# compiles the shared body.
+_SM107A_BODY_ARCH: CakeBGMVMoEArch = "sm107a"
+_SM107A_SPECIALIZED_BODIES = frozenset({("bfloat16", 2688), ("bfloat16", 3072)})
+_SM107A_GENERIC_BODIES = frozenset({("bfloat16", 32)})
+
+
+def _body_suffix(arch: Optional[CakeBGMVMoEArch], has_record: bool) -> str:
+    return "_sm107a" if arch == _SM107A_BODY_ARCH and has_record else ""
+
+
+def _metadata(
+    hidden_size: int, dtype: CakeBGMVMoEDType, arch: Optional[CakeBGMVMoEArch] = None
+) -> CakeBGMVMoEMetadata:
     _check_hidden_size(hidden_size)
     tag = _dtype_tag(dtype)
+    suffix = _body_suffix(arch, (dtype, hidden_size) in _SM107A_SPECIALIZED_BODIES)
     return CakeBGMVMoEMetadata(
-        body=f"cake_bgmv_moe_{tag}_h{hidden_size}.cu",
+        body=f"cake_bgmv_moe_{tag}_h{hidden_size}{suffix}.cu",
         shrink_decode_symbol=(
             f"kernel_flashinfer_bgmv_moe_shrink_{tag}_h{hidden_size}_r32_p4_s3"
         ),
@@ -592,11 +610,14 @@ def cake_bgmv_moe_variant(
     return None
 
 
-def _generic_metadata(rank: int, dtype: CakeBGMVMoEDType) -> CakeBGMVMoEGenericMetadata:
+def _generic_metadata(
+    rank: int, dtype: CakeBGMVMoEDType, arch: Optional[CakeBGMVMoEArch] = None
+) -> CakeBGMVMoEGenericMetadata:
     _check_generic_rank(rank)
     tag = _dtype_tag(dtype)
+    suffix = _body_suffix(arch, (dtype, rank) in _SM107A_GENERIC_BODIES)
     return CakeBGMVMoEGenericMetadata(
-        body=f"cake_bgmv_moe_generic_{tag}_r{rank}.cu",
+        body=f"cake_bgmv_moe_generic_{tag}_r{rank}{suffix}.cu",
         shrink_decode_symbol=(
             f"kernel_flashinfer_bgmv_moe_shrink_generic_{tag}_r{rank}_p4_s3"
         ),
@@ -817,11 +838,27 @@ def get_cake_bgmv_moe_generic_uri(
     return f"cake_bgmv_moe_generic_{tag}_r{rank}_{arch}"
 
 
+def _generic_merge_in_expand(metadata: CakeBGMVMoEGenericMetadata) -> bool:
+    """Whether ``metadata.body`` is a merge-in-expand record (the sm107a generic records).
+
+    Those bodies' expand kernels take the shrink's per-split partials and the split count; the
+    binding passes them (``CAKE_BGMV_MOE_GENERIC_MERGE_IN_EXPAND``).  The shared bodies keep the
+    shrink-side last-arrival merge.
+    """
+
+    return metadata.body.endswith(f"{_body_suffix(_SM107A_BODY_ARCH, True)}.cu")
+
+
 def _generic_binding_source(
-    metadata: CakeBGMVMoEGenericMetadata, rank: int, target: CakeBGMVMoEArchTarget
+    metadata: CakeBGMVMoEGenericMetadata,
+    rank: int,
+    target: CakeBGMVMoEArchTarget,
+    merge_in_expand: Optional[bool] = None,
 ) -> str:
     input_dtype = "dl_bfloat16" if "_bf16_" in metadata.body else "dl_float16"
     major, minor = target.capability
+    if merge_in_expand is None:
+        merge_in_expand = _generic_merge_in_expand(metadata)
     # Lever 3c: sm_90 runs the cp.async operand-ring grouped shrink on single-K-tile rows too
     # (768x16 0.983 / 768x64 0.976 vs the direct form on H100); Blackwell keeps the direct form
     # there (the ring's two barriers cost 1.2-2.2 % with nothing to overlap).
@@ -869,6 +906,7 @@ def _generic_binding_source(
 #define CAKE_BGMV_MOE_SHRINK_GROUPED_RING_MIXED {metadata.shrink_grouped_ring_mixed_symbol}
 #define CAKE_BGMV_MOE_SHRINK_GROUPED_RING_MIXED_SINGLE {metadata.shrink_grouped_ring_mixed_single_symbol}
 #define CAKE_BGMV_MOE_GROUP_SHRINK_MIXED {group_shrink_mixed}
+#define CAKE_BGMV_MOE_GENERIC_MERGE_IN_EXPAND {1 if merge_in_expand else 0}
 #define CAKE_BGMV_MOE_EXPAND_GROUPED {metadata.expand_grouped_symbol}
 #define CAKE_BGMV_MOE_COMBINE_GROUPED {metadata.combine_grouped_symbol}
 #define CAKE_BGMV_MOE_ORDER_BUILD {metadata.order_build_symbol}
@@ -883,7 +921,7 @@ def gen_cake_bgmv_moe_generic_module(
     dtype: CakeBGMVMoEDType,
     arch: CakeBGMVMoEArch = "sm100a",
 ) -> JitSpec:
-    metadata = _generic_metadata(rank, dtype)
+    metadata = _generic_metadata(rank, dtype, arch)
     target = _check_arch(arch)
     csrc_dir = _get_csrc_dir()
     include_dir = _get_include_dir()
@@ -942,7 +980,7 @@ def gen_cake_bgmv_moe_module(
     dtype: CakeBGMVMoEDType,
     arch: CakeBGMVMoEArch = "sm100a",
 ) -> JitSpec:
-    metadata = _metadata(hidden_size, dtype)
+    metadata = _metadata(hidden_size, dtype, arch)
     target = _check_arch(arch)
     csrc_dir = _get_csrc_dir()
     include_dir = _get_include_dir()

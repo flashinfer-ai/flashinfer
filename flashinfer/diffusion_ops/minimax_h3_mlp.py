@@ -257,7 +257,10 @@ def prepare_minimax_h3_fc2_weight_mxfp8(
     ``[256 t, 256 (t + 1))``; each 4-column K set of that block is two 512-byte 128x4 tiles, rows
     0-127 then 128-255; see :func:`flashinfer.diffusion_ops.minimax_h3_out_proj._weight_scale_tiles`).
     The FC1 weight is prepared by
-    :func:`~flashinfer.diffusion_ops.minimax_h3_fc1_swiglu.prepare_minimax_h3_fc1_weight_mxfp8`.
+    :func:`~flashinfer.diffusion_ops.minimax_h3_fc1_swiglu.prepare_minimax_h3_fc1_weight_mxfp8`
+    (128-row gate/up weight scale tiles, ``112 * 42 * 1024`` bytes; the standalone FC1 operator's
+    :func:`~flashinfer.diffusion_ops.minimax_h3_fc1_swiglu.prepare_minimax_h3_fc1_swiglu_weight_mxfp8`
+    tiles are rejected by :func:`minimax_h3_mlp_mxfp8`).
     """
     from ..quantization.fp8_quantization import mxfp8_quantize
 
@@ -721,7 +724,11 @@ def minimax_h3_mlp_mxfp8(
         :func:`~flashinfer.diffusion_ops.minimax_h3_fc1_swiglu.prepare_minimax_h3_fc1_weight_mxfp8`
         (gate rows then up rows).
     fc1_scale_tiles : torch.Tensor
-        Flat ``uint8`` ``[112 * 42 * 1024]`` FC1 weight scale tiles from the same call.
+        Flat ``uint8`` ``[112 * 42 * 1024]`` FC1 weight scale tiles from the same call (128-row
+        gate/up tiles of this operator's 256x256 FC1 GEMM tile).  The standalone FC1 operator's
+        tiles from
+        :func:`~flashinfer.diffusion_ops.minimax_h3_fc1_swiglu.prepare_minimax_h3_fc1_swiglu_weight_mxfp8`
+        (``128 * 42 * 1024`` bytes) are rejected.
     fc2_weight_q : torch.Tensor
         ``float8_e4m3fn`` ``[5376, 14336]`` weights from :func:`prepare_minimax_h3_fc2_weight_mxfp8`.
     fc2_scale_tiles : torch.Tensor
@@ -755,7 +762,11 @@ def minimax_h3_mlp_mxfp8(
         device,
     )
     fc1_scale_tiles = _scale_tiles(
-        fc1_scale_tiles, "fc1_scale_tiles", MXFP8_FC1_SCALE_TILE_BYTES, device
+        fc1_scale_tiles,
+        "fc1_scale_tiles",
+        MXFP8_FC1_SCALE_TILE_BYTES,
+        device,
+        prepare="prepare_minimax_h3_fc1_weight_mxfp8",
     )
     _check_tensor(
         fc2_weight_q,
