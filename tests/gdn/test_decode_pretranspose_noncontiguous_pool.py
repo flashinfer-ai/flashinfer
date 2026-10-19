@@ -245,7 +245,14 @@ def test_decode_pretranspose_pool_cache_keeps_inner_strides_static() -> None:
         HV=32,
         K=128,
         V=128,
-        dtype=torch.bfloat16,
+        dtype_key=(
+            torch.float32,  # h0_source
+            torch.float32,  # A_log
+            torch.bfloat16,  # a
+            torch.float32,  # dt_bias
+            torch.bfloat16,  # b
+            torch.bfloat16,  # output
+        ),
         scale=1.0,
         use_qk_l2norm=True,
         use_pool_indexing=True,
