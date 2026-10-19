@@ -90,6 +90,7 @@ import torch
 import tvm_ffi
 
 from .cake_jit import (
+    ARG_PLANS,
     GEMM_KERNEL_KEY,
     GEMM_RSTAGED_KERNEL_KEY,
     GEMM_TSTORE_KERNEL_KEY,
@@ -3507,7 +3508,7 @@ def _bind(
     record = MODULES[name]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
     arguments = []
-    for kind, argument in record["arg_plan"]:
+    for kind, argument in ARG_PLANS[record["arg_plan"]]:
         if kind == "grid":
             arguments.append(grid[argument])
         elif argument in kwargs:
@@ -3518,7 +3519,7 @@ def _bind(
                 f"({kind}); host binding provides {sorted(kwargs)}"
             )
     module = load_cake_kimi_k3_fp8_projection_module(name, arch, defines)
-    return getattr(module, record["ffi_entry"]), tuple(arguments)
+    return module.run, tuple(arguments)
 
 
 @dataclass(frozen=True)
@@ -4066,11 +4067,12 @@ class KimiK3Fp8ProjectionLauncher:
                 ):
                     name, defines = program
                     record = MODULES[name]
+                    arg_plan = ARG_PLANS[record["arg_plan"]]
                     grid = dict(
                         zip(("grid_x", "grid_y", "grid_z"), fixed["grid"], strict=True)
                     )
                     slots: list[tuple[bool, Any]] = []
-                    for kind, argument in record["arg_plan"]:
+                    for kind, argument in arg_plan:
                         if kind == "grid":
                             slots.append((False, grid[argument]))
                         elif argument in _CALL_ARGS:
@@ -4095,7 +4097,7 @@ class KimiK3Fp8ProjectionLauncher:
                     )
                     rebinds = [
                         (index, _REBIND_SOURCES[argument])
-                        for index, (_kind, argument) in enumerate(record["arg_plan"])
+                        for index, (_kind, argument) in enumerate(arg_plan)
                         if argument in _REBIND_SOURCES
                         and (real_out or argument != "OUT")
                     ]
@@ -4105,12 +4107,11 @@ class KimiK3Fp8ProjectionLauncher:
                             f"run_launch re-binds one to {_REBIND_SLOTS}"
                         )
                     rebinds += [(-1, 0)] * (_REBIND_SLOTS - len(rebinds))
-                    entry = record["ffi_entry"]
                     stages.append(
                         _StageEntry(
-                            getattr(module, f"{entry}_plan"),
-                            getattr(module, f"{entry}_launch"),
-                            getattr(module, f"{entry}_chain"),
+                            module.run_plan,
+                            module.run_launch,
+                            module.run_chain,
                             tuple(slots),
                             tuple(rebinds),
                         )

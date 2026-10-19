@@ -40,6 +40,7 @@ from flashinfer.experimental.kimi_k3_fp8_projection.cake_backend import (
     swizzle_sf_128x4,
 )
 from flashinfer.experimental.kimi_k3_fp8_projection.cake_jit import (
+    ARG_PLANS,
     KERNELS,
     MODULES,
     decode_kernel_key,
@@ -1800,6 +1801,7 @@ def test_required_kernel_keys_are_registered_when_programs_exist(arch):
         for key in required:
             name, defines = kernel_program(arch, key)
             assert arch in MODULES[name]["arches"]
+            assert MODULES[name]["arg_plan"] in ARG_PLANS
             if key.startswith("quant:"):
                 quant_programs.add(name)
                 assert dict(defines) == {

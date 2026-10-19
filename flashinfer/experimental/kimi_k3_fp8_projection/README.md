@@ -115,9 +115,10 @@ nothing else. A program that differs from a sibling only by a prefetch lever
 or by the raster group width shares the sibling's kernel source and selects
 its lever value (`-DCAKE_LEVER_*` or `-DGROUP_M`) and its own kernel symbol
 (`-DCAKE_PROGRAM_KERNEL`) on the compile line. `cake_jit.py` registers them
-(`MODULES`: one record per program; `KERNELS`: logical kernel key -> program
-and compile-line defines, e.g. the three quantization widths are one program
-with `-DQUANT_UNITS=1|2|4`). Both are written by the Cake generated-program
-export; the shared kernel sources and the `-D` entries of the records that
-use them are a hand fold of the exported files, pending regeneration by the
-export.
+(`MODULES`: one record per program, expanded from one row per program and
+the five named argument plans of `ARG_PLANS`; `KERNELS`: logical kernel key
+-> program and compile-line defines, e.g. the three quantization widths are
+one program with `-DQUANT_UNITS=1|2|4`). Both are written by the Cake
+generated-program export; the shared kernel sources, the `-D` entries of the
+records that use them and the row form of `MODULES` are a hand fold of the
+exported files, pending regeneration by the export.
