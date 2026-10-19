@@ -1,12 +1,9 @@
-.. _apimoe_ep:
+.. _apimoe_ep_communication:
 
-flashinfer.moe_ep
-=================
+flashinfer.moe_ep: Expert-Parallel Communication
+================================================
 
 .. currentmodule:: flashinfer.moe_ep
-
-Expert-parallel communication
------------------------------
 
 A :class:`MoEEpCommunication` dispatches each token to the ranks that own its
 experts and combines the expert outputs back on the token's source rank.
