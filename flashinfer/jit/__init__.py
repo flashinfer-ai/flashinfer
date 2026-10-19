@@ -82,7 +82,7 @@ from .comm import gen_trtllm_mnnvl_comm_module as gen_trtllm_mnnvl_comm_module
 from .comm import gen_trtllm_comm_module as gen_trtllm_comm_module
 from .comm import gen_vllm_comm_module as gen_vllm_comm_module
 from .comm import gen_pcie_ipc_comm_module as gen_pcie_ipc_comm_module
-from .comm import gen_moe_ep_cake_module as gen_moe_ep_cake_module
+from .comm import gen_cake_alltoall_module as gen_cake_alltoall_module
 from .comm import (
     gen_nvlink_one_sided_alltoall_module as gen_nvlink_one_sided_alltoall_module,
 )

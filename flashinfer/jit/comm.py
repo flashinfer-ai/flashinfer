@@ -317,11 +317,11 @@ _CAKE_ALLTOALL_NVCC_FLAGS = {
 }
 
 
-def gen_moe_ep_cake_module(target: CakeAlltoAllTarget) -> JitSpec:
+def gen_cake_alltoall_module(target: CakeAlltoAllTarget) -> JitSpec:
     """Cake MoE all-to-all of one architecture behind ``flashinfer.moe_ep.CakeAlltoAll``."""
     if target not in _CAKE_ALLTOALL_GENERATED_SOURCE:
         raise ValueError(f"unsupported Cake MoE all-to-all target: {target}")
-    module_name = f"moe_ep_cake_alltoall_{target}"
+    module_name = f"cake_alltoall_{target}"
     kernel_sources = [
         jit_env.FLASHINFER_CSRC_DIR / "cake_moe_alltoall_dispatch.cu",
         jit_env.FLASHINFER_CSRC_DIR

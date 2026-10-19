@@ -47,18 +47,19 @@ def test_each_target_loads_its_own_module(monkeypatch):
             built.append(self.target)
             return SimpleNamespace(target=self.target)
 
-    kernels.get_cake_module.cache_clear()
-    monkeypatch.setattr(jit_comm, "gen_moe_ep_cake_module", FakeSpec)
+    kernels.get_cake_alltoall_module.cache_clear()
+    monkeypatch.setattr(jit_comm, "gen_cake_alltoall_module", FakeSpec)
     try:
         modules = {
-            target: kernels.get_cake_module(target) for target in ("sm100a", "sm103a")
+            target: kernels.get_cake_alltoall_module(target)
+            for target in ("sm100a", "sm103a")
         }
         for target, module in modules.items():
             assert module.target == target
-            assert kernels.get_cake_module(target) is module
+            assert kernels.get_cake_alltoall_module(target) is module
         assert built == ["sm100a", "sm103a"]
     finally:
-        kernels.get_cake_module.cache_clear()
+        kernels.get_cake_alltoall_module.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -66,13 +67,13 @@ def test_each_target_loads_its_own_module(monkeypatch):
     [
         (
             "sm100a",
-            "moe_ep_cake_alltoall_sm100a",
+            "cake_alltoall_sm100a",
             "cake_moe_alltoall_sm100.cu",
             "compute_100a,code=sm_100a",
         ),
         (
             "sm103a",
-            "moe_ep_cake_alltoall_sm103a",
+            "cake_alltoall_sm103a",
             "cake_moe_alltoall_sm103.cu",
             "compute_103a,code=sm_103a",
         ),
@@ -90,7 +91,7 @@ def test_fused_jit_inventory_is_exact_arch_and_self_contained(
         return object()
 
     monkeypatch.setattr(jit_comm, "gen_jit_spec", capture)
-    jit_comm.gen_moe_ep_cake_module(target)
+    jit_comm.gen_cake_alltoall_module(target)
     names = {path.name for path in captured["sources"]}
     assert captured["name"] == module_name
     assert generated_name in names
@@ -127,7 +128,7 @@ def test_runtime_module_selection_follows_the_device(
         capability_queries.append(device)
         return capability
 
-    monkeypatch.setattr(kernels, "get_cake_module", lambda target: target)
+    monkeypatch.setattr(kernels, "get_cake_alltoall_module", lambda target: target)
     monkeypatch.setattr(
         kernels.torch.cuda, "get_device_capability", get_device_capability
     )
@@ -167,7 +168,7 @@ def test_aot_registers_each_exact_mnnvl_moe_target(monkeypatch):
     )
     monkeypatch.setattr(
         jit_comm,
-        "gen_moe_ep_cake_module",
+        "gen_cake_alltoall_module",
         lambda target: selected.append(target) or spec(f"cake_{target}"),
     )
 

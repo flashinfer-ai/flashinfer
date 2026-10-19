@@ -1036,7 +1036,7 @@ def gen_all_modules(
         from .jit.comm import (
             gen_dcp_alltoall_module,
             gen_dcp_lse_reduce_module,
-            gen_moe_ep_cake_module,
+            gen_cake_alltoall_module,
             gen_nvlink_one_sided_alltoall_module,
             gen_nvlink_two_sided_alltoall_module,
             gen_pcie_ipc_ag_rs_module,
@@ -1077,9 +1077,9 @@ def gen_all_modules(
         ):
             jit_specs.append(gen_dcp_lse_reduce_module())
         if has_sm100a_exact:
-            jit_specs.append(gen_moe_ep_cake_module("sm100a"))
+            jit_specs.append(gen_cake_alltoall_module("sm100a"))
         if has_sm103a_exact:
-            jit_specs.append(gen_moe_ep_cake_module("sm103a"))
+            jit_specs.append(gen_cake_alltoall_module("sm103a"))
         # Cake NVFP4-transport tensor-parallel all-reduce: exact-architecture
         # programs, one module per (program, exact target); never a family
         # target.

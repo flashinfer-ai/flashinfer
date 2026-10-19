@@ -25,11 +25,11 @@ _TARGETS = {(10, 0): "sm100a", (10, 3): "sm103a"}
 
 
 @functools.cache
-def get_cake_module(target: str) -> Any:
+def get_cake_alltoall_module(target: str) -> Any:
     """Build (on first use) and load the module of one architecture."""
-    from ......jit.comm import gen_moe_ep_cake_module
+    from ......jit.comm import gen_cake_alltoall_module
 
-    return gen_moe_ep_cake_module(target).build_and_load()  # type: ignore[arg-type]
+    return gen_cake_alltoall_module(target).build_and_load()  # type: ignore[arg-type]
 
 
 @functools.cache
@@ -47,7 +47,7 @@ def _device_target(device_index: int) -> str:
 
 def current_module() -> Any:
     """The module of the current CUDA device's architecture."""
-    return get_cake_module(_device_target(torch.cuda.current_device()))
+    return get_cake_alltoall_module(_device_target(torch.cuda.current_device()))
 
 
 def metainfo_index() -> dict[str, int]:
