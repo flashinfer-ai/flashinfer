@@ -23,11 +23,14 @@ from .cpp_ext import is_cuda_version_at_least
 
 MiniMaxH3MlpTarget = Literal["sm100a", "sm103a"]
 
-# Exact-architecture tcgen05 payloads: one generated source per target, compiled with that
-# target's flags only (no fatbin; the 2-CTA MMA / TMEM code is not portable across 10.x minors).
+# Exact-architecture tcgen05 payloads: one generated source shared by both targets,
+# compiled once per target with that target's flags only (no fatbin; the 2-CTA MMA /
+# TMEM code is not portable across 10.x minors).  MINIMAX_H3_SM_MINOR pins the host
+# capability check of each build to the compiled minor.
+_CUDA_SOURCE_NAME = "cake_minimax_h3_mlp_sm10x.cu"
 _TARGETS = {
-    "sm100a": ("cake_minimax_h3_mlp_sm100a.cu", sm100a_nvcc_flags),
-    "sm103a": ("cake_minimax_h3_mlp_sm103a.cu", sm103a_nvcc_flags),
+    "sm100a": (_CUDA_SOURCE_NAME, [*sm100a_nvcc_flags, "-DMINIMAX_H3_SM_MINOR=0"]),
+    "sm103a": (_CUDA_SOURCE_NAME, [*sm103a_nvcc_flags, "-DMINIMAX_H3_SM_MINOR=3"]),
 }
 _CAPABILITY_TO_TARGET: Dict[Tuple[int, int], MiniMaxH3MlpTarget] = {
     (10, 0): "sm100a",

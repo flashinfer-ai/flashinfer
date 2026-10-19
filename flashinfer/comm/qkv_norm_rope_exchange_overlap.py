@@ -77,11 +77,19 @@ def validate_request(
     max_tokens: int,
     num_slots: int,
     backend: str,
+    fold_barrier: Optional[bool] = None,
 ) -> None:
     """Static checks of a session request (no collective); raises ``ValueError`` on every rank alike."""
 
     if backend not in ULYSSES_BACKENDS:
         raise ValueError(f"backend must be one of {ULYSSES_BACKENDS}, got {backend!r}")
+    if fold_barrier is not None and not isinstance(fold_barrier, bool):
+        raise ValueError(f"fold_barrier must be a bool or None, got {fold_barrier!r}")
+    if fold_barrier is not None and backend == "nccl":
+        raise ValueError(
+            "fold_barrier selects the launch path of the Cake (nvlink) backend; it has no meaning with "
+            "backend='nccl'"
+        )
     if layout not in LAYOUTS:
         raise ValueError(f"layout must be one of {LAYOUTS}, got {layout!r}")
     if dtype != torch.bfloat16:
@@ -283,12 +291,50 @@ class QkvNormRopeExchangeOverlap:
     num_slots : int, default 2
         Receive slots cycled by consecutive calls; a call's outputs stay valid for ``num_slots - 1`` further calls.
     backend : {"auto", "nvlink", "nccl"}
-        ``"nvlink"`` selects the Cake fused kernels (single-node NVLink mesh, SM90 / SM100 / SM103, torch's
-        default CUDA symmetric-memory backend) and raises when they cannot be used; ``"nccl"`` selects the
+        ``"nvlink"`` selects the Cake fused kernels (single-node NVLink mesh, SM90 / SM100 / SM103 / SM107, groups of
+        2, 4 or 8 ranks (2 or 4 on SM107), torch's default CUDA symmetric-memory backend) and raises when they
+        cannot be used; ``"nccl"`` selects the
         per-operator path (cuBLAS, ``rmsnorm``, RoPE, ``UlyssesCommunicator.scatter_qkv_head_chunk``);
         ``"auto"`` resolves through :func:`resolve_ulysses_backend` and the device architecture.
     device : torch.device or str or int, optional
         CUDA device of this rank (``None``: the current device).
+    fold_barrier : bool, optional
+        Launch path of the Cake backend.  ``True``: the producer program with the folded cross-rank
+        rendezvous -- two launches per call (producer, wait kernel); ``False``: the separate barrier kernel
+        before the producer -- three launches.  ``None`` (default) reads the environment variable
+        ``FLASHINFER_QKV_EXCHANGE_FOLD_BARRIER`` (``0`` / ``1`` / ``auto``) and otherwise takes the
+        architecture default: ``True`` on SM90, SM100, SM103 and SM107 (the folded producers are delivered
+        on every architecture).  Both paths store identical bits.  Must be uniform across the ranks of the group; not accepted with ``backend="nccl"``.
+
+    The Cake backend selects its producer build per architecture and world size
+    (``flashinfer.jit.cake_qkv_norm_rope_exchange_overlap.PRODUCER_VARIANT_DEFAULT_BY_ARCH_WORLD``: SM100 groups of
+    8 ranks run the ``bulk_ow256`` build -- wide operand loads and bulk row stores --, SM100 groups of 4 ranks and
+    SM103 groups of 8 or 4 ranks the ``ow256`` build -- wide operand loads --, groups of 2 ranks, SM90 and SM107 the
+    baseline build).  Every build stores identical bits; the wide-load builds require 32-byte-aligned ``cos_sin``
+    and norm-weight tensors (a misaligned view raises and names the opt-out).  The environment variable
+    ``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT`` (``auto`` / ``shipped`` / a delivered build name) overrides the
+    selection for a session, rank-uniformly; the baseline build is delivered beside every variant, and a build that
+    is not delivered for the session's tile width raises and names the delivered ones.  The host plan's group
+    scaling follows the same keying (``cake_qkv_exchange_plan.GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD``: ``2`` on SM100
+    groups of 4 and 2 ranks and on SM103, ``1`` otherwise -- SM100 groups of 8 ranks, SM90 and SM107; it applies to
+    grouped rows with ``hidden >= 6144`` and
+    changes the tile order only); ``FLASHINFER_QKV_EXCHANGE_GROUP_M_SCALE`` (``auto`` / ``1`` / ``2`` / ``4``)
+    overrides it for a session, rank-uniformly.
+
+    The Cake backend also applies per-architecture row-count gates to each call's host plan
+    (``cake_qkv_exchange_plan.SHAPE_GATE_DEFAULT_BY_ARCH``; SM100 / SM103: a call with ``batch * s_local <= 4096``
+    rows publishes one readiness word per destination, a call with ``>= 16384`` rows launches the producer once per
+    destination run; SM90: a call with ``>= 16384`` rows runs the persistent producer grid over every SM --
+    ``reserved_sms_large_m = 16384``, no reserved SMs --, the other two gates off; SM107: every gate off).  The
+    environment variable
+    ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` (``auto`` / ``off`` /
+    ``words_capacity_small_m=N,reserved_sms_large_m=N,per_dest_large_m=N``, ``0`` = never) overrides them for a
+    session, rank-uniformly.  ``describe()`` reports the resolved build (``producer_variant``), scale
+    (``group_m_scale``) and gates (``shape_gates``), each with its value, source, environment variable and default,
+    and every prepared row's verdict (``prepared_row_plans``, including ``reserved_sms`` and ``part_grids``).  The
+    gates change neither the tile table nor the stored bits.  The largest 2-rank shape of the evaluation grid
+    (``S_global = 131072``, ``hidden = 8192``) is not supported on an 80 GB H100: its operands and receive slots
+    exceed the device memory.
     """
 
     def __init__(
@@ -304,6 +350,7 @@ class QkvNormRopeExchangeOverlap:
         num_slots: int = 2,
         backend: str = "auto",
         device: Optional[Union[torch.device, str, int]] = None,
+        fold_barrier: Optional[bool] = None,
     ) -> None:
         if not dist.is_available() or not dist.is_initialized():
             raise RuntimeError("an initialized NCCL process group is required")
@@ -322,6 +369,7 @@ class QkvNormRopeExchangeOverlap:
             max_tokens=max_tokens,
             num_slots=num_slots,
             backend=backend,
+            fold_barrier=fold_barrier,
         )
         self.device = _resolve_device(device)
         self.hidden, self.num_heads, self.head_dim = (
@@ -333,6 +381,7 @@ class QkvNormRopeExchangeOverlap:
         self.layout = layout
         self.max_tokens = int(max_tokens)
         self.num_slots = int(num_slots)
+        self.fold_barrier_requested = fold_barrier
         decision = resolve_ulysses_backend(
             backend, group, self.device
         )  # collective, rank-uniform
@@ -367,6 +416,7 @@ class QkvNormRopeExchangeOverlap:
                 layout=layout,
                 max_tokens=self.max_tokens,
                 num_slots=self.num_slots,
+                fold_barrier=fold_barrier,
             )
         else:
             self._impl = _NcclQkvExchange(
@@ -416,7 +466,8 @@ class QkvNormRopeExchangeOverlap:
         return self._impl.last_outputs()
 
     def bound_programs(self, batch: int, s_local: int) -> dict[str, str]:
-        """Cake backend: program names a ``(batch, s_local)`` call launches per stage (prepares the row eagerly)."""
+        """Cake backend: program names of every delivered stage of a ``(batch, s_local)`` call (prepares the row
+        eagerly); ``describe()["launch_sequence"]`` says which of them the launch path launches."""
 
         if self.backend != "nvlink":
             raise RuntimeError(
@@ -430,7 +481,15 @@ class QkvNormRopeExchangeOverlap:
         self._impl.poison_receive_slots()
 
     def describe(self) -> dict[str, Any]:
-        return {"backend_reason": self.backend_reason, **self._impl.describe()}
+        return {
+            "backend_reason": self.backend_reason,
+            "fold_barrier_requested": (
+                "auto"
+                if self.fold_barrier_requested is None
+                else self.fold_barrier_requested
+            ),
+            **self._impl.describe(),
+        }
 
     def close(self) -> None:
         """Release the session's resources (collective for the Cake backend)."""

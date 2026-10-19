@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -92,6 +93,16 @@ class MegaKernelBackend(ABC):
         self._ep_rank: int = 0
         self._ep_world_size: int = 0
         self._profile_knobs: dict[tuple[int, int | None], dict] = {}
+        self._autotune_winner: dict[str, Any] | None = None
+
+    def get_tuned_knobs(self) -> dict[str, Any]:
+        """Return a copy of the last completed automatic tuning result."""
+        if self._autotune_winner is None:
+            raise RuntimeError(
+                "MegaMoE has no completed automatic tuning result; "
+                "call warmup() on a layer configured with knobs='auto' first"
+            )
+        return deepcopy(self._autotune_winner)
 
     @classmethod
     @abstractmethod

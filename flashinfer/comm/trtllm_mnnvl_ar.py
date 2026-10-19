@@ -73,9 +73,9 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         comm_backend: Optional[CommBackend] = None,
     ):
         """
-        Initialize the MNNVL Allreduce Fusion Workspace. The workspace will be allocated and initialized based on the provided problem size. If max_num_tokens is larger than the one-shot threshold, the workspace will be created according to the max of required one-shot size at threshold, or the required two-shot size. Note that the workspace is not bind to the given problem size. It can be reused for different problem size without reinitialization given the allocated size is sufficient.
+        Initialize the MNNVL Allreduce Fusion Workspace. The workspace will be allocated and initialized based on the provided problem size. If the maximum problem size in bytes exceeds the one-shot threshold, the workspace will be created according to the max of required one-shot size at the threshold or the required two-shot size. Note that the workspace is not bound to the given problem size. It can be reused for different problem sizes without reinitialization given the allocated size is sufficient.
 
-        If the buffer_size_in_bytes is provided, the workspace will be created according to the provided size. The user is expected to use the utility function get_required_buffer_size_bytes to calculate the required size. The actual allocation size may be larger due to alignment requirements. This covers the advanced used case, for example, the user may want to enforce oneshot strategy and ignore the heuristics.
+        If the buffer_size_in_bytes is provided, the workspace will be created according to the provided size. The user is expected to use the utility function get_required_buffer_size_bytes to calculate the required size. The actual allocation size may be larger due to alignment requirements. This covers the advanced use case, for example, the user may want to enforce oneshot strategy and ignore the heuristics.
 
         Either max_num_tokens or buffer_size_in_bytes must be provided.
 

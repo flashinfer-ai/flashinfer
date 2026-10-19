@@ -360,6 +360,7 @@ jobs:
       MATRIX_ARCH: ${{ matrix.runner[2] }}
       MATRIX_CUDA: ${{ matrix.cuda }}
       CI_GPU_NAME: ${{ matrix.gpu_name }}
+      MATRIX_KIND: ${{ matrix.kind }}
       TEST_SCRIPT: ${{ matrix.script }}
       # Empty for every lane except the experimental one. Quoted at the use site and
       # never interpolated into script text - it originates from the PR body.
@@ -475,6 +476,10 @@ jobs:
               exit 1
               ;;
           esac
+          TEST_RUNNER_ARGS=()
+          if [ "${MATRIX_KIND}" = "h100" ]; then
+            TEST_RUNNER_ARGS+=(--workers-per-gpu 2)
+          fi
           if [ -n "${TEST_PATH_ARG:-}" ]; then
             # Read into an array and expand quoted, rather than relying on word
             # splitting: this keeps the shell safe on its own terms instead of
@@ -487,9 +492,9 @@ jobs:
             # to unit_test_runner.py, whose parser takes the scope as an option (or the
             # TEST_PATH env var, which ci/bash.sh does not forward into the container).
             # Bare paths fail argument-preflight with "unrecognized arguments".
-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" --test-path "${TEST_TARGETS[@]}"
+            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}" --test-path "${TEST_TARGETS[@]}"
           else
-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}"
+            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}"
           fi
 
       - name: Make JUnit XML readable

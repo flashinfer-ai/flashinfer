@@ -39,10 +39,9 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define WORLD_SIZE 16
 
 #include <math_constants.h>
-
 extern "C" {
 
-__global__ __launch_bounds__(1) void
+__global__ __launch_bounds__(THREADS) void
 kernel_cake_mok_pad_16(int* __restrict__ counts, int* __restrict__ tokens_per_expert, int* __restrict__ num_tokens)
 {
     const int tid = threadIdx.x;

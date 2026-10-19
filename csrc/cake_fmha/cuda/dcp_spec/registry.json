@@ -171,10 +171,14 @@
       "dispatch_band": {
         "band": {
           "chunk_tokens": 256,
-          "long_tile_blocks": 24,
+          "long_tile_blocks": 18,
+          "long_tile_blocks_by_arch": {
+            "sm_100a": 18,
+            "sm_103a": 17
+          },
           "min_items": 160,
           "two_wave_min_items": {
-            "sm_100a": 384,
+            "sm_100a": 160,
             "sm_103a": 160
           },
           "two_wave_min_items_default": 160
@@ -187,7 +191,7 @@
           "q_heads_per_kv_head": 8,
           "q_tiles": 1
         },
-        "decision": "blocks_per_cta >= long_tile_blocks or (waves >= 2 and items >= min_items and (waves >= 3 or items >= two_wave_min_items[arch]))",
+        "decision": "blocks_per_cta >= long_tile_blocks_by_arch.get(arch, long_tile_blocks) or (waves >= 2 and items >= min_items and (waves >= 3 or items >= two_wave_min_items.get(arch, two_wave_min_items_default)))",
         "family": "dcp_spec_bf16_fp8_balanced",
         "incumbent_family": "dcp_spec_bf16_fp8",
         "incumbent_shape": {
@@ -242,6 +246,22 @@
           8
         ],
         "v_scale": "per_tensor_folded_into_output"
+      },
+      "program_variants": {
+        "at_or_above_grid": 0,
+        "below_grid": 1,
+        "bodies": {
+          "0": "cake_fmha_dcp_spec_bf16_fp8_balanced_eight_slice_fold0.cu",
+          "1": "cake_fmha_dcp_spec_bf16_fp8_balanced_eight_slice_fold1.cu"
+        },
+        "default": 1,
+        "items_lower_bound": "batch_size * num_kv_heads",
+        "key": "eight_slice_fold",
+        "rule": "eight_slice_fold = below_grid when batch_size * num_kv_heads < grid (sm_count: one persistent CTA per multiprocessor), else at_or_above_grid: the idle-CTA eight-slice fold needs chunk tickets + 8 reduce tickets per split tile <= grid and every (request, KV head) is at least one chunk ticket; the program without it has the same plan and fold order",
+        "values": [
+          0,
+          1
+        ]
       },
       "public_name": "cake_fmha_dcp_spec_bf16_fp8_balanced",
       "public_symbol": "kernel_cake_fmha_dcp_spec_bf16_fp8_balanced",
@@ -321,7 +341,13 @@
         "band": {
           "chunk_tokens": 256,
           "long_tile_blocks": 96,
-          "min_items": 160
+          "min_items": 160,
+          "one_wave_long_tile_blocks": 22,
+          "one_wave_long_tile_blocks_by_arch": {
+            "sm_100a": 22,
+            "sm_103a": 22
+          },
+          "one_wave_min_q_len": 3
         },
         "contract": {
           "head_dim": 256,
@@ -332,9 +358,9 @@
           "q_heads_per_kv_head": 16,
           "q_tiles": "ceil(q_len / q_box_rows)"
         },
-        "decision": "blocks_per_cta >= long_tile_blocks or (waves >= 2 and items >= min_items)",
+        "decision": "blocks_per_cta >= long_tile_blocks or (waves >= 2 and items >= min_items) or (waves < 2 and q_len >= one_wave_min_q_len and blocks_per_cta >= one_wave_long_tile_blocks_by_arch.get(arch, one_wave_long_tile_blocks))",
         "family": "dcp_spec_bf16_fp8_d256_balanced",
-        "incumbent_family": "cake_fmha_dcp_spec_bf16_fp8_d256 (static split family, carried downstream in csrc/dcp)",
+        "incumbent_family": "fp8_d256 (static split family of the cake_fmha_dcp_spec programs)",
         "incumbent_shape": {
           "block_n": 128,
           "blocks_per_cta": "ceil(local_blocks / num_split)",
@@ -471,18 +497,18 @@
       "launch_binding": "cake_fmha_launch_dcp_spec_bf16_balanced",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Q"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -609,18 +635,18 @@
       "launch_binding": "cake_fmha_launch_dcp_spec_bf16_fp8_balanced",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Q"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -724,6 +750,7 @@
             "N_ROWS": 32
           },
           "selector": {
+            "eight_slice_fold": 0,
             "n_rows": 32
           },
           "sources": {
@@ -736,6 +763,33 @@
             "N_ROWS": 64
           },
           "selector": {
+            "eight_slice_fold": 0,
+            "n_rows": 64
+          },
+          "sources": {
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu"
+          }
+        },
+        {
+          "defines": {
+            "N_ROWS": 32
+          },
+          "selector": {
+            "eight_slice_fold": 1,
+            "n_rows": 32
+          },
+          "sources": {
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu"
+          }
+        },
+        {
+          "defines": {
+            "N_ROWS": 64
+          },
+          "selector": {
+            "eight_slice_fold": 1,
             "n_rows": 64
           },
           "sources": {
@@ -752,18 +806,18 @@
       "launch_binding": "cake_fmha_launch_dcp_spec_bf16_fp8_d256_balanced",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Q"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -893,118 +947,23 @@
   "format_version": 1,
   "minimum_arch": "sm_100a",
   "name": "cake_fmha_dcp_spec",
-  "pass_through": {
-    "d256_route": {
-      "files": [
-        "cake_fmha_dcp_spec_bf16_fp8_d256_binding.cu",
-        "cake_fmha_dcp_spec_bf16_fp8_d256_split16_retain0.cu",
-        "cake_fmha_dcp_spec_bf16_fp8_d256_split1_retain0.cu",
-        "cake_fmha_dcp_spec_bf16_fp8_d256_split2_retain0.cu",
-        "cake_fmha_dcp_spec_bf16_fp8_d256_split3_retain0.cu",
-        "cake_fmha_dcp_spec_bf16_fp8_d256_split4_retain0.cu",
-        "cake_fmha_dcp_spec_bf16_fp8_d256_split8_retain0.cu"
-      ],
-      "reason": "static D256 split family compiled downstream from its csrc/dcp copy with the producer binding; authenticated in the package digest, not an add-on family"
-    }
-  },
   "programs": {
     "cake_cake_fmha_dcp_spec_15a6b2e8ee623392850d": {
       "arches": [
         "sm_100a",
         "sm_103a"
       ],
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "Qt"
-        ],
-        [
-          "tma_buffer",
-          "K"
-        ],
-        [
-          "tma_buffer",
-          "V"
-        ],
-        [
-          "buffer",
-          "partial_O_ptr"
-        ],
-        [
-          "buffer",
-          "partial_LSE_ptr"
-        ],
-        [
-          "buffer",
-          "O_ptr"
-        ],
-        [
-          "buffer",
-          "LSE_ptr"
-        ],
-        [
-          "buffer",
-          "split_completion"
-        ],
-        [
-          "buffer",
-          "page_table"
-        ],
-        [
-          "buffer",
-          "causal_seqlens_kv_global"
-        ],
-        [
-          "parameter",
-          "max_pages_per_seq"
-        ],
-        [
-          "parameter",
-          "max_local_seq_len"
-        ],
-        [
-          "parameter",
-          "softmax_scale_log2"
-        ],
-        [
-          "parameter",
-          "cp_rank"
-        ],
-        [
-          "parameter",
-          "num_q_heads"
-        ],
-        [
-          "parameter",
-          "num_kv_heads"
-        ],
-        [
-          "parameter",
-          "batch_size"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=2"
       ],
       "family": "bf16_v4",
       "ffi_entry": "run",
       "instance": "split2",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_15a6b2e8ee623392850d_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_15a6b2e8ee623392850d_binding.cu"
+        "cuda/dcp_spec/bf16_v4_kernel.cu",
+        "cuda/dcp_spec/bf16_v4_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -1018,106 +977,18 @@
       "arches": [
         "sm_103a"
       ],
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "Qt"
-        ],
-        [
-          "tma_buffer",
-          "K"
-        ],
-        [
-          "tma_buffer",
-          "V"
-        ],
-        [
-          "buffer",
-          "partial_O_ptr"
-        ],
-        [
-          "buffer",
-          "partial_LSE_ptr"
-        ],
-        [
-          "buffer",
-          "O_ptr"
-        ],
-        [
-          "buffer",
-          "LSE_ptr"
-        ],
-        [
-          "buffer",
-          "split_completion"
-        ],
-        [
-          "buffer",
-          "page_table"
-        ],
-        [
-          "buffer",
-          "seq_lens_kv"
-        ],
-        [
-          "buffer",
-          "causal_seqlens_kv_global"
-        ],
-        [
-          "parameter",
-          "max_pages_per_seq"
-        ],
-        [
-          "parameter",
-          "max_local_seq_len"
-        ],
-        [
-          "parameter",
-          "softmax_scale_log2"
-        ],
-        [
-          "parameter",
-          "output_scale"
-        ],
-        [
-          "parameter",
-          "cp_rank"
-        ],
-        [
-          "parameter",
-          "num_q_heads"
-        ],
-        [
-          "parameter",
-          "num_kv_heads"
-        ],
-        [
-          "parameter",
-          "batch_size"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_ARCH=103",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=0"
       ],
       "family": "fp8_d256",
       "ffi_entry": "run",
       "instance": "splitn",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_2870e9f5407a58e718b3_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_2870e9f5407a58e718b3_binding.cu"
+        "cuda/dcp_spec/fp8_d256_sm_103a_kernel.cu",
+        "cuda/dcp_spec/fp8_d256_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -1132,106 +1003,18 @@
         "sm_100a",
         "sm_103a"
       ],
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "Qt"
-        ],
-        [
-          "tma_buffer",
-          "K"
-        ],
-        [
-          "tma_buffer",
-          "V"
-        ],
-        [
-          "buffer",
-          "partial_O_ptr"
-        ],
-        [
-          "buffer",
-          "partial_LSE_ptr"
-        ],
-        [
-          "buffer",
-          "O_ptr"
-        ],
-        [
-          "buffer",
-          "LSE_ptr"
-        ],
-        [
-          "buffer",
-          "split_completion"
-        ],
-        [
-          "buffer",
-          "page_table"
-        ],
-        [
-          "buffer",
-          "seq_lens_kv"
-        ],
-        [
-          "buffer",
-          "causal_seqlens_kv_global"
-        ],
-        [
-          "parameter",
-          "max_pages_per_seq"
-        ],
-        [
-          "parameter",
-          "max_local_seq_len"
-        ],
-        [
-          "parameter",
-          "softmax_scale_log2"
-        ],
-        [
-          "parameter",
-          "output_scale"
-        ],
-        [
-          "parameter",
-          "cp_rank"
-        ],
-        [
-          "parameter",
-          "num_q_heads"
-        ],
-        [
-          "parameter",
-          "num_kv_heads"
-        ],
-        [
-          "parameter",
-          "batch_size"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_RETAIN_KV_L2=0",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=2"
       ],
       "family": "fp8_d128",
       "ffi_entry": "run",
       "instance": "split2_retain0",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_39177f8f6200207b079b_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_39177f8f6200207b079b_binding.cu"
+        "cuda/dcp_spec/fp8_d128_kernel.cu",
+        "cuda/dcp_spec/fp8_d128_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -1246,106 +1029,18 @@
         "sm_100a",
         "sm_103a"
       ],
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "Qt"
-        ],
-        [
-          "tma_buffer",
-          "K"
-        ],
-        [
-          "tma_buffer",
-          "V"
-        ],
-        [
-          "buffer",
-          "partial_O_ptr"
-        ],
-        [
-          "buffer",
-          "partial_LSE_ptr"
-        ],
-        [
-          "buffer",
-          "O_ptr"
-        ],
-        [
-          "buffer",
-          "LSE_ptr"
-        ],
-        [
-          "buffer",
-          "split_completion"
-        ],
-        [
-          "buffer",
-          "page_table"
-        ],
-        [
-          "buffer",
-          "seq_lens_kv"
-        ],
-        [
-          "buffer",
-          "causal_seqlens_kv_global"
-        ],
-        [
-          "parameter",
-          "max_pages_per_seq"
-        ],
-        [
-          "parameter",
-          "max_local_seq_len"
-        ],
-        [
-          "parameter",
-          "softmax_scale_log2"
-        ],
-        [
-          "parameter",
-          "output_scale"
-        ],
-        [
-          "parameter",
-          "cp_rank"
-        ],
-        [
-          "parameter",
-          "num_q_heads"
-        ],
-        [
-          "parameter",
-          "num_kv_heads"
-        ],
-        [
-          "parameter",
-          "batch_size"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_RETAIN_KV_L2=0",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=1"
       ],
       "family": "fp8_d128",
       "ffi_entry": "run",
       "instance": "split1_retain0",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_3e0618cb2e4bbbe11d43_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_3e0618cb2e4bbbe11d43_binding.cu"
+        "cuda/dcp_spec/fp8_d128_kernel.cu",
+        "cuda/dcp_spec/fp8_d128_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -1360,106 +1055,18 @@
         "sm_100a",
         "sm_103a"
       ],
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "Qt"
-        ],
-        [
-          "tma_buffer",
-          "K"
-        ],
-        [
-          "tma_buffer",
-          "V"
-        ],
-        [
-          "buffer",
-          "partial_O_ptr"
-        ],
-        [
-          "buffer",
-          "partial_LSE_ptr"
-        ],
-        [
-          "buffer",
-          "O_ptr"
-        ],
-        [
-          "buffer",
-          "LSE_ptr"
-        ],
-        [
-          "buffer",
-          "split_completion"
-        ],
-        [
-          "buffer",
-          "page_table"
-        ],
-        [
-          "buffer",
-          "seq_lens_kv"
-        ],
-        [
-          "buffer",
-          "causal_seqlens_kv_global"
-        ],
-        [
-          "parameter",
-          "max_pages_per_seq"
-        ],
-        [
-          "parameter",
-          "max_local_seq_len"
-        ],
-        [
-          "parameter",
-          "softmax_scale_log2"
-        ],
-        [
-          "parameter",
-          "output_scale"
-        ],
-        [
-          "parameter",
-          "cp_rank"
-        ],
-        [
-          "parameter",
-          "num_q_heads"
-        ],
-        [
-          "parameter",
-          "num_kv_heads"
-        ],
-        [
-          "parameter",
-          "batch_size"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_RETAIN_KV_L2=1",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=2"
       ],
       "family": "fp8_d128",
       "ffi_entry": "run",
       "instance": "split2_retain1",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_479b92ffbc9c6f529c12_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_479b92ffbc9c6f529c12_binding.cu"
+        "cuda/dcp_spec/fp8_d128_kernel.cu",
+        "cuda/dcp_spec/fp8_d128_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -1474,98 +1081,17 @@
         "sm_100a",
         "sm_103a"
       ],
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "Qt"
-        ],
-        [
-          "tma_buffer",
-          "K"
-        ],
-        [
-          "tma_buffer",
-          "V"
-        ],
-        [
-          "buffer",
-          "partial_O_ptr"
-        ],
-        [
-          "buffer",
-          "partial_LSE_ptr"
-        ],
-        [
-          "buffer",
-          "O_ptr"
-        ],
-        [
-          "buffer",
-          "LSE_ptr"
-        ],
-        [
-          "buffer",
-          "split_completion"
-        ],
-        [
-          "buffer",
-          "page_table"
-        ],
-        [
-          "buffer",
-          "causal_seqlens_kv_global"
-        ],
-        [
-          "parameter",
-          "max_pages_per_seq"
-        ],
-        [
-          "parameter",
-          "max_local_seq_len"
-        ],
-        [
-          "parameter",
-          "softmax_scale_log2"
-        ],
-        [
-          "parameter",
-          "cp_rank"
-        ],
-        [
-          "parameter",
-          "num_q_heads"
-        ],
-        [
-          "parameter",
-          "num_kv_heads"
-        ],
-        [
-          "parameter",
-          "batch_size"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=0"
       ],
       "family": "bf16_v4",
       "ffi_entry": "run",
       "instance": "splitn",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_5261ee95ed8b6d2d6189_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_5261ee95ed8b6d2d6189_binding.cu"
+        "cuda/dcp_spec/bf16_v4_kernel.cu",
+        "cuda/dcp_spec/bf16_v4_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -1579,106 +1105,18 @@
       "arches": [
         "sm_103a"
       ],
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "Qt"
-        ],
-        [
-          "tma_buffer",
-          "K"
-        ],
-        [
-          "tma_buffer",
-          "V"
-        ],
-        [
-          "buffer",
-          "partial_O_ptr"
-        ],
-        [
-          "buffer",
-          "partial_LSE_ptr"
-        ],
-        [
-          "buffer",
-          "O_ptr"
-        ],
-        [
-          "buffer",
-          "LSE_ptr"
-        ],
-        [
-          "buffer",
-          "split_completion"
-        ],
-        [
-          "buffer",
-          "page_table"
-        ],
-        [
-          "buffer",
-          "seq_lens_kv"
-        ],
-        [
-          "buffer",
-          "causal_seqlens_kv_global"
-        ],
-        [
-          "parameter",
-          "max_pages_per_seq"
-        ],
-        [
-          "parameter",
-          "max_local_seq_len"
-        ],
-        [
-          "parameter",
-          "softmax_scale_log2"
-        ],
-        [
-          "parameter",
-          "output_scale"
-        ],
-        [
-          "parameter",
-          "cp_rank"
-        ],
-        [
-          "parameter",
-          "num_q_heads"
-        ],
-        [
-          "parameter",
-          "num_kv_heads"
-        ],
-        [
-          "parameter",
-          "batch_size"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_ARCH=103",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=1"
       ],
       "family": "fp8_d256",
       "ffi_entry": "run",
       "instance": "split1",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_608a53a1b95e91265bfb_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_608a53a1b95e91265bfb_binding.cu"
+        "cuda/dcp_spec/fp8_d256_sm_103a_kernel.cu",
+        "cuda/dcp_spec/fp8_d256_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -1693,86 +1131,17 @@
         "sm_100a",
         "sm_103a"
       ],
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "Qt"
-        ],
-        [
-          "tma_buffer",
-          "K"
-        ],
-        [
-          "tma_buffer",
-          "V"
-        ],
-        [
-          "buffer",
-          "O_ptr"
-        ],
-        [
-          "buffer",
-          "LSE_ptr"
-        ],
-        [
-          "buffer",
-          "page_table"
-        ],
-        [
-          "buffer",
-          "causal_seqlens_kv_global"
-        ],
-        [
-          "parameter",
-          "max_pages_per_seq"
-        ],
-        [
-          "parameter",
-          "max_local_seq_len"
-        ],
-        [
-          "parameter",
-          "softmax_scale_log2"
-        ],
-        [
-          "parameter",
-          "cp_rank"
-        ],
-        [
-          "parameter",
-          "num_q_heads"
-        ],
-        [
-          "parameter",
-          "num_kv_heads"
-        ],
-        [
-          "parameter",
-          "batch_size"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_RETAIN_KV_L2=0"
       ],
       "family": "bf16_v1",
       "ffi_entry": "run",
       "instance": "retain0",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_a39221485cc74a6dbe98_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_a39221485cc74a6dbe98_binding.cu"
+        "cuda/dcp_spec/bf16_v1_kernel.cu",
+        "cuda/dcp_spec/bf16_v1_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -1786,86 +1155,17 @@
         "sm_100a",
         "sm_103a"
       ],
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "Qt"
-        ],
-        [
-          "tma_buffer",
-          "K"
-        ],
-        [
-          "tma_buffer",
-          "V"
-        ],
-        [
-          "buffer",
-          "O_ptr"
-        ],
-        [
-          "buffer",
-          "LSE_ptr"
-        ],
-        [
-          "buffer",
-          "page_table"
-        ],
-        [
-          "buffer",
-          "causal_seqlens_kv_global"
-        ],
-        [
-          "parameter",
-          "max_pages_per_seq"
-        ],
-        [
-          "parameter",
-          "max_local_seq_len"
-        ],
-        [
-          "parameter",
-          "softmax_scale_log2"
-        ],
-        [
-          "parameter",
-          "cp_rank"
-        ],
-        [
-          "parameter",
-          "num_q_heads"
-        ],
-        [
-          "parameter",
-          "num_kv_heads"
-        ],
-        [
-          "parameter",
-          "batch_size"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_RETAIN_KV_L2=1"
       ],
       "family": "bf16_v1",
       "ffi_entry": "run",
       "instance": "retain1",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_a49e536424c875700ddf_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_a49e536424c875700ddf_binding.cu"
+        "cuda/dcp_spec/bf16_v1_kernel.cu",
+        "cuda/dcp_spec/bf16_v1_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -1878,106 +1178,18 @@
       "arches": [
         "sm_100a"
       ],
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "Qt"
-        ],
-        [
-          "tma_buffer",
-          "K"
-        ],
-        [
-          "tma_buffer",
-          "V"
-        ],
-        [
-          "buffer",
-          "partial_O_ptr"
-        ],
-        [
-          "buffer",
-          "partial_LSE_ptr"
-        ],
-        [
-          "buffer",
-          "O_ptr"
-        ],
-        [
-          "buffer",
-          "LSE_ptr"
-        ],
-        [
-          "buffer",
-          "split_completion"
-        ],
-        [
-          "buffer",
-          "page_table"
-        ],
-        [
-          "buffer",
-          "seq_lens_kv"
-        ],
-        [
-          "buffer",
-          "causal_seqlens_kv_global"
-        ],
-        [
-          "parameter",
-          "max_pages_per_seq"
-        ],
-        [
-          "parameter",
-          "max_local_seq_len"
-        ],
-        [
-          "parameter",
-          "softmax_scale_log2"
-        ],
-        [
-          "parameter",
-          "output_scale"
-        ],
-        [
-          "parameter",
-          "cp_rank"
-        ],
-        [
-          "parameter",
-          "num_q_heads"
-        ],
-        [
-          "parameter",
-          "num_kv_heads"
-        ],
-        [
-          "parameter",
-          "batch_size"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_ARCH=100",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=1"
       ],
       "family": "fp8_d256",
       "ffi_entry": "run",
       "instance": "split1",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_ab8ae294a36d13f273e8_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_ab8ae294a36d13f273e8_binding.cu"
+        "cuda/dcp_spec/fp8_d256_sm_100a_kernel.cu",
+        "cuda/dcp_spec/fp8_d256_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -1991,106 +1203,18 @@
       "arches": [
         "sm_100a"
       ],
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "Qt"
-        ],
-        [
-          "tma_buffer",
-          "K"
-        ],
-        [
-          "tma_buffer",
-          "V"
-        ],
-        [
-          "buffer",
-          "partial_O_ptr"
-        ],
-        [
-          "buffer",
-          "partial_LSE_ptr"
-        ],
-        [
-          "buffer",
-          "O_ptr"
-        ],
-        [
-          "buffer",
-          "LSE_ptr"
-        ],
-        [
-          "buffer",
-          "split_completion"
-        ],
-        [
-          "buffer",
-          "page_table"
-        ],
-        [
-          "buffer",
-          "seq_lens_kv"
-        ],
-        [
-          "buffer",
-          "causal_seqlens_kv_global"
-        ],
-        [
-          "parameter",
-          "max_pages_per_seq"
-        ],
-        [
-          "parameter",
-          "max_local_seq_len"
-        ],
-        [
-          "parameter",
-          "softmax_scale_log2"
-        ],
-        [
-          "parameter",
-          "output_scale"
-        ],
-        [
-          "parameter",
-          "cp_rank"
-        ],
-        [
-          "parameter",
-          "num_q_heads"
-        ],
-        [
-          "parameter",
-          "num_kv_heads"
-        ],
-        [
-          "parameter",
-          "batch_size"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_ARCH=100",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=0"
       ],
       "family": "fp8_d256",
       "ffi_entry": "run",
       "instance": "splitn",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_c96172e37ab2b5fb1257_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_c96172e37ab2b5fb1257_binding.cu"
+        "cuda/dcp_spec/fp8_d256_sm_100a_kernel.cu",
+        "cuda/dcp_spec/fp8_d256_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -2105,106 +1229,18 @@
         "sm_100a",
         "sm_103a"
       ],
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "Qt"
-        ],
-        [
-          "tma_buffer",
-          "K"
-        ],
-        [
-          "tma_buffer",
-          "V"
-        ],
-        [
-          "buffer",
-          "partial_O_ptr"
-        ],
-        [
-          "buffer",
-          "partial_LSE_ptr"
-        ],
-        [
-          "buffer",
-          "O_ptr"
-        ],
-        [
-          "buffer",
-          "LSE_ptr"
-        ],
-        [
-          "buffer",
-          "split_completion"
-        ],
-        [
-          "buffer",
-          "page_table"
-        ],
-        [
-          "buffer",
-          "seq_lens_kv"
-        ],
-        [
-          "buffer",
-          "causal_seqlens_kv_global"
-        ],
-        [
-          "parameter",
-          "max_pages_per_seq"
-        ],
-        [
-          "parameter",
-          "max_local_seq_len"
-        ],
-        [
-          "parameter",
-          "softmax_scale_log2"
-        ],
-        [
-          "parameter",
-          "output_scale"
-        ],
-        [
-          "parameter",
-          "cp_rank"
-        ],
-        [
-          "parameter",
-          "num_q_heads"
-        ],
-        [
-          "parameter",
-          "num_kv_heads"
-        ],
-        [
-          "parameter",
-          "batch_size"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_RETAIN_KV_L2=1",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=1"
       ],
       "family": "fp8_d128",
       "ffi_entry": "run",
       "instance": "split1_retain1",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_d7d4c8cc3dda810d204e_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_d7d4c8cc3dda810d204e_binding.cu"
+        "cuda/dcp_spec/fp8_d128_kernel.cu",
+        "cuda/dcp_spec/fp8_d128_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -2219,106 +1255,18 @@
         "sm_100a",
         "sm_103a"
       ],
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "Qt"
-        ],
-        [
-          "tma_buffer",
-          "K"
-        ],
-        [
-          "tma_buffer",
-          "V"
-        ],
-        [
-          "buffer",
-          "partial_O_ptr"
-        ],
-        [
-          "buffer",
-          "partial_LSE_ptr"
-        ],
-        [
-          "buffer",
-          "O_ptr"
-        ],
-        [
-          "buffer",
-          "LSE_ptr"
-        ],
-        [
-          "buffer",
-          "split_completion"
-        ],
-        [
-          "buffer",
-          "page_table"
-        ],
-        [
-          "buffer",
-          "seq_lens_kv"
-        ],
-        [
-          "buffer",
-          "causal_seqlens_kv_global"
-        ],
-        [
-          "parameter",
-          "max_pages_per_seq"
-        ],
-        [
-          "parameter",
-          "max_local_seq_len"
-        ],
-        [
-          "parameter",
-          "softmax_scale_log2"
-        ],
-        [
-          "parameter",
-          "output_scale"
-        ],
-        [
-          "parameter",
-          "cp_rank"
-        ],
-        [
-          "parameter",
-          "num_q_heads"
-        ],
-        [
-          "parameter",
-          "num_kv_heads"
-        ],
-        [
-          "parameter",
-          "batch_size"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_RETAIN_KV_L2=0",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=0"
       ],
       "family": "fp8_d128",
       "ffi_entry": "run",
       "instance": "splitn_retain0",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_dbf1678bdc76b4ff249f_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_dbf1678bdc76b4ff249f_binding.cu"
+        "cuda/dcp_spec/fp8_d128_kernel.cu",
+        "cuda/dcp_spec/fp8_d128_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
@@ -2333,106 +1281,18 @@
         "sm_100a",
         "sm_103a"
       ],
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "Qt"
-        ],
-        [
-          "tma_buffer",
-          "K"
-        ],
-        [
-          "tma_buffer",
-          "V"
-        ],
-        [
-          "buffer",
-          "partial_O_ptr"
-        ],
-        [
-          "buffer",
-          "partial_LSE_ptr"
-        ],
-        [
-          "buffer",
-          "O_ptr"
-        ],
-        [
-          "buffer",
-          "LSE_ptr"
-        ],
-        [
-          "buffer",
-          "split_completion"
-        ],
-        [
-          "buffer",
-          "page_table"
-        ],
-        [
-          "buffer",
-          "seq_lens_kv"
-        ],
-        [
-          "buffer",
-          "causal_seqlens_kv_global"
-        ],
-        [
-          "parameter",
-          "max_pages_per_seq"
-        ],
-        [
-          "parameter",
-          "max_local_seq_len"
-        ],
-        [
-          "parameter",
-          "softmax_scale_log2"
-        ],
-        [
-          "parameter",
-          "output_scale"
-        ],
-        [
-          "parameter",
-          "cp_rank"
-        ],
-        [
-          "parameter",
-          "num_q_heads"
-        ],
-        [
-          "parameter",
-          "num_kv_heads"
-        ],
-        [
-          "parameter",
-          "batch_size"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
       "compile_flags": [
-        "--use_fast_math"
+        "--use_fast_math",
+        "-DCAKE_FMHA_DCP_RETAIN_KV_L2=1",
+        "-DCAKE_FMHA_DCP_SPLIT_CLASS=0"
       ],
       "family": "fp8_d128",
       "ffi_entry": "run",
       "instance": "splitn_retain1",
       "role": "kernel",
       "sources": [
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_f6b426b8c862da0e2807_kernel.cu",
-        "cuda/dcp_spec/cake_cake_fmha_dcp_spec_f6b426b8c862da0e2807_binding.cu"
+        "cuda/dcp_spec/fp8_d128_kernel.cu",
+        "cuda/dcp_spec/fp8_d128_binding.cu"
       ],
       "specializations": [
         "Q_LEN",
