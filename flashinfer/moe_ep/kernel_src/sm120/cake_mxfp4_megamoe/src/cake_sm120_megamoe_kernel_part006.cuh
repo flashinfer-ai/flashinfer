@@ -696,6 +696,11 @@ static_assert(!((((((MOE_RANKS_LL - 1) + 4) - 1) / 4)) <= (2)), "parametric guar
 static_assert((((((MOE_RANKS_LL - 1) + 4) - 1) / 4)) <= (4), "parametric guard: comparison <=");
 static_assert(!((((((MOE_RANKS_LL - 1) + 4) - 1) / 4)) <= (2)), "parametric guard: comparison <=");
 #endif // moe-select
+// NCCL's device-API atomics never target automatic storage: skip libcu++'s
+// local-memory test (CUDA 13.0/13.1 headers skip it unconditionally).
+#ifndef _CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE
+#define _CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE
+#endif
 #include <nccl_device.h>
 
 struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };

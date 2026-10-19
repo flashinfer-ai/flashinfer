@@ -138,6 +138,16 @@ grid) `validate_init` builds the device module the deployment may launch — the
 workspace loads — and raises `MoEEpConfigError` on any that spills; the
 workspace re-checks every loaded instance (`CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES <= 8`, the generated code's own stack frame).
 
+**libcu++ automatic-storage check.** The device source defines
+`_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE` before it includes `nccl_device.h`.  The libcu++ headers
+of CUDA 13.3 test every `cuda::atomic_ref` operation for a local-memory (automatic storage)
+address and carry a local-memory fallback for it.  NCCL's Device API uses `cuda::atomic_ref` for
+its proxy queues, signals and counters, and with the fallback 34 of the 352 instances above
+spill one register at EP 8 / 16 (`m64_copier`, `m128_nocopier`, `m128_copier` at the
+DeepSeek-V3, Qwen3 and DeepSeek-V4.1-Flash geometries).  Those atomics only ever address
+NCCL-owned device or host-pinned memory.  The headers of CUDA 13.0 and 13.1 skip the check
+unconditionally and do not know this macro, so their output is unchanged by it.
+
 ## Manifest schema (`cake-sm120-megamoe-manifest/3`)
 
 ```json
