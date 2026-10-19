@@ -363,10 +363,14 @@ def group_union_masks(
         mask,
         num_keys,
     )
-    if not all(
-        t.is_cuda and t.is_contiguous() and t.dtype == torch.int32 for t in args[:-1]
+    device = positions.device
+    if device.type != "cuda" or not all(
+        t.device == device and t.is_contiguous() and t.dtype == torch.int32
+        for t in args[:-1]
     ):
-        raise ValueError("Positions, tables, unions and masks must be contiguous int32")
+        raise ValueError(
+            "Positions, tables, unions and masks: contiguous int32, one GPU"
+        )
     if rows:
         launch(
             union_masks_kernel,
