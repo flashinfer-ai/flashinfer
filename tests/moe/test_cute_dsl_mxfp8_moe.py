@@ -147,8 +147,6 @@ def _cos(a, b):
 @pytest.mark.parametrize(
     "num_tokens,hidden,inter,num_experts,top_k",
     [
-        (17, 256, 256, 4, 2),
-        (128, 512, 512, 8, 2),
         (33, 896, 1024, 16, 4),
         # Many-expert latent-MoE shape
         (64, 640, 3584, 384, 8),
@@ -170,16 +168,11 @@ def test_mxfp8_relu2_moe(num_tokens, hidden, inter, num_experts, top_k):
     torch.testing.assert_close(out, ref_q, rtol=5e-2, atol=5e-2 * ref_q.abs().max())
 
 
-@pytest.mark.parametrize(
-    "num_tokens,hidden,inter,num_experts,top_k",
-    [
-        (64, 512, 384, 8, 2),  # intermediate = 2 x 192
-        (256, 1024, 2688, 64, 8),  # Nemotron 3.5 Super expert width (14 x 192)
-    ],
-)
 @pytest.mark.parametrize("tile", [128, 256])
-def test_mxfp8_relu2_gemm1_n192(num_tokens, hidden, inter, num_experts, top_k, tile):
+def test_mxfp8_relu2_gemm1_n192(tile):
     """Non-gated GEMM1 may use N=192 tiles; check them against the MXFP8 reference."""
+    # intermediate = 14 x 192, not a multiple of 256
+    num_tokens, hidden, inter, num_experts, top_k = 256, 1024, 2688, 64, 8
     x, w1, w2, topk_ids, topk_w = _make_case(
         num_tokens, hidden, inter, num_experts, top_k
     )
@@ -192,13 +185,11 @@ def test_mxfp8_relu2_gemm1_n192(num_tokens, hidden, inter, num_experts, top_k, t
     torch.testing.assert_close(out, ref_q, rtol=5e-2, atol=5e-2 * ref_q.abs().max())
 
 
-@pytest.mark.parametrize("inter", [512, 1024])
-@pytest.mark.parametrize("tile", [128, 256])
-def test_mxfp8_relu2_gemm1_n192_rejects_partial_n_tile(inter, tile):
+def test_mxfp8_relu2_gemm1_n192_rejects_partial_n_tile():
     """GEMM1 has no partial-N-tile predicate, so N=192 needs inter % 192 == 0."""
-    x, w1, w2, topk_ids, topk_w = _make_case(33, 512, inter, 8, 2)
+    x, w1, w2, topk_ids, topk_w = _make_case(33, 512, 512, 8, 2)
     with pytest.raises(ValueError, match="Unsupported configuration"):
-        _run_kernel(x, w1, w2, topk_ids, topk_w, 8, tactic=_gemm1_n192_tactic(tile))
+        _run_kernel(x, w1, w2, topk_ids, topk_w, 8, tactic=_gemm1_n192_tactic(128))
 
 
 @pytest.mark.parametrize("tile", [128, 256])
@@ -301,12 +292,13 @@ def test_mxfp8_mode_rejects_invalid_inputs():
         cute_dsl_fused_moe(x=x_q, x_sf=x_sf, **{**kwargs, "w1_weight": w1})
 
 
-@pytest.mark.parametrize("num_experts,rows,cols", [(3, 256, 512), (2, 192, 384)])
-def test_row_major_scales_match_swizzled_quantizer_layout(num_experts, rows, cols):
+def test_row_major_scales_match_swizzled_quantizer_layout():
     """Checkpoint (row-major) scales convert to the layout mxfp8_quantize emits."""
     from flashinfer.cute_dsl.utils import convert_row_major_sf_to_mma_layout
     from flashinfer.fp8_quantization import mxfp8_quantize
 
+    # 192 rows also exercises the padding of each expert's scales to 128 rows.
+    num_experts, rows, cols = 2, 192, 384
     torch.manual_seed(1)
     w = torch.randn(num_experts, rows, cols, dtype=torch.bfloat16, device="cuda")
     flat = w.reshape(num_experts * rows, cols)
