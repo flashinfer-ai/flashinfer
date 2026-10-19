@@ -1839,15 +1839,88 @@ def test_shared_kernel_sources_keep_distinct_symbols():
         ]
         defaults = _PROGRAM_KERNEL_DEFAULT.findall(text)
         if name in kernel_source:
-            assert not flags, (name, flags)
+            # A shared launcher needs the record's symbol on the compile line even
+            # when the kernel source is the record's own; the kernel source then
+            # sees a define equal to its default or defines the symbol literally.
             symbol = defaults[0] if defaults else f"kernel_{name}"
             assert f"{symbol}(" in text or "CAKE_PROGRAM_KERNEL(" in text, name
+            assert flags in ([], [f"{_PROGRAM_KERNEL_FLAG}{symbol}"]), (name, flags)
         else:
             assert len(flags) == 1 and len(defaults) == 1, (name, flags, defaults)
             symbol = flags[0][len(_PROGRAM_KERNEL_FLAG) :]
         assert symbol == f"kernel_{name}", (name, symbol)
         symbols[name] = symbol
     assert len(set(symbols.values())) == len(MODULES)
+
+
+_PROGRAM_SHIM_FLAG = "-DCAKE_PROGRAM_SHIM="
+_PROGRAM_SHIM_DEFAULT = re.compile(r"^#define CAKE_PROGRAM_SHIM (\w+)$", re.M)
+_LAUNCHER_NAMESPACE = re.compile(r"^namespace (\w+) \{$", re.M)
+
+
+def _check_conditions(text):
+    # The condition of every TVM_FFI_CHECK( in ``text`` as the preprocessor
+    # stringizes it: balanced parentheses, string literals skipped, multi-line aware.
+    conditions = []
+    for match in re.finditer(r"\bTVM_FFI_CHECK\(", text):
+        start = match.end()
+        depth, quoted, i = 1, False, start
+        while depth and i < len(text):
+            char = text[i]
+            if quoted:
+                if char == "\\":
+                    i += 1
+                elif char == '"':
+                    quoted = False
+            elif char == '"':
+                quoted = True
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            i += 1
+        assert depth == 0, text[start : start + 80]
+        conditions.append(text[start : i - 1])
+    return conditions
+
+
+def test_shared_launcher_sources_keep_distinct_namespaces():
+    # Programs whose exported launcher text differs only in the kernel symbol and the
+    # host-shim namespace build one launcher translation unit: the record whose source
+    # it is selects both through the file's defaults, every other record names its own
+    # on the compile line. Every record must still export its entry points from its own
+    # namespace and declare / launch its own kernel symbol.
+    csrc = pathlib.Path(cb.__file__).resolve().parent / "csrc"
+    namespaces = {}
+    for name, record in MODULES.items():
+        binding_source = record["sources"][1]
+        assert binding_source.endswith("_binding.cu"), (name, binding_source)
+        text = (csrc / binding_source).read_text()
+        assert _LAUNCHER_NAMESPACE.findall(text) == ["CAKE_PROGRAM_SHIM"], name
+        assert 'extern "C" __global__ void CAKE_PROGRAM_KERNEL(' in text, name
+        # TVM_FFI_CHECK stringizes its condition unexpanded: the kernel symbol reaches a
+        # check condition only through the expanding wrapper.
+        for condition in _check_conditions(text):
+            assert "CAKE_PROGRAM_KERNEL" not in condition, (name, condition)
+        shim_defaults = _PROGRAM_SHIM_DEFAULT.findall(text)
+        assert len(shim_defaults) == 1, (name, shim_defaults)
+        shim_flags = [
+            f for f in record["compile_flags"] if f.startswith(_PROGRAM_SHIM_FLAG)
+        ]
+        kernel_flags = [
+            f for f in record["compile_flags"] if f.startswith(_PROGRAM_KERNEL_FLAG)
+        ]
+        assert len(shim_flags) <= 1 and len(kernel_flags) <= 1, (name, record)
+        namespace = shim_flags[0][len(_PROGRAM_SHIM_FLAG) :] if shim_flags else None
+        if name in binding_source:
+            assert namespace in (None, shim_defaults[0]), (name, namespace)
+            namespace = shim_defaults[0]
+        else:
+            assert namespace is not None, (name, record["compile_flags"])
+            assert kernel_flags == [f"{_PROGRAM_KERNEL_FLAG}kernel_{name}"], name
+        assert re.fullmatch(r"cake_host_shim_[0-9a-f]{16}", namespace), name
+        namespaces[name] = namespace
+    assert len(set(namespaces.values())) == len(MODULES)
 
 
 # ---------------------------------------------------------------------------
