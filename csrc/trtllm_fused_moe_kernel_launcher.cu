@@ -1058,7 +1058,8 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
 
 std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_tile_nums,
                                        int64_t const num_tokens, int64_t const top_k,
-                                       int64_t const num_local_experts, int const tiles_below = 2) {
+                                       int64_t const num_local_experts,
+                                       int const num_smaller_tile_candidates = 2) {
   TVM_FFI_ICHECK(!supported_tile_nums.empty()) << "supported_tile_nums must not be empty.";
   TVM_FFI_ICHECK(num_tokens >= 0) << "num_tokens must be non-negative.";
   TVM_FFI_ICHECK(top_k > 0) << "top_k must be positive.";
@@ -1083,7 +1084,7 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_til
 
   // Candidate tile set centered on the heuristic tile.
   // This function returns nearby candidates (not a single final tile):
-  //   center, +1, +2, and -1 neighbors when available.
+  //   center, +1, +2, and up to num_smaller_tile_candidates smaller neighbors when available.
   // Final tile choice is made later (autotuner-provided tile if valid, otherwise fallback policy).
   std::set<int32_t> selected_tile_nums;
   selected_tile_nums.insert(*it);
@@ -1093,8 +1094,12 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_til
       selected_tile_nums.insert(*std::next(std::next(it)));
     }
   }
+  // Walk down the ascending tile ladder (checked sorted above) to add up to
+  // num_smaller_tile_candidates tiles below the covering tile. The tuner receives two so that
+  // adding a tile to the ladder (e.g. 192) does not push the best smaller tile out of its window;
+  // the default-tactic path keeps one.
   auto down = it;
-  for (int i = 0; i < tiles_below && down != supported_tile_nums.begin(); ++i) {
+  for (int i = 0; i < num_smaller_tile_candidates && down != supported_tile_nums.begin(); ++i) {
     down = std::prev(down);
     selected_tile_nums.insert(*down);
   }
