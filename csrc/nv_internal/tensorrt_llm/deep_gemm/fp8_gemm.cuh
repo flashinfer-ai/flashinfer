@@ -228,8 +228,8 @@ void runGemmSwapAB(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int 
                    int ld_d, float* scales_a, float* scales_b, uint32_t shape_m, uint32_t shape_n,
                    uint32_t shape_k, uint32_t block_m, uint32_t block_n, uint32_t block_k,
                    uint32_t num_groups, uint32_t num_tma_multicast, GemmType gemm_type,
-                   LayoutIndexType* grouped_layout, cudaStream_t stream, int num_sms,
-                   uint32_t smem_size) {
+                   LayoutIndexType* grouped_layout, uint32_t num_split_k, cudaStream_t stream,
+                   int num_sms, uint32_t smem_size) {
   auto tma_a_desc =
       make_2d_tma_a_desc_swapAB(reinterpret_cast<__nv_fp8_e4m3*>(mat_a), shape_m, shape_k, block_m,
                                 block_k, num_groups, gemm_type, ld_a);
@@ -261,6 +261,13 @@ void runGemmSwapAB(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int 
   attr.val.clusterDim = {num_tma_multicast, 1, 1};
   config.attrs = &attr;
   config.numAttrs = 1;
+
+  // Split-K: one (num_split_k, 1, 1) cluster per output block, not persistent
+  if (num_split_k > 1) {
+    DG_HOST_ASSERT(num_tma_multicast == 1);
+    config.gridDim = ceil_div(shape_m, block_m) * ceil_div(shape_n, block_n) * num_split_k;
+    attr.val.clusterDim = {num_split_k, 1, 1};
+  }
 
   NormalSchedulerInputSwapAB input;
   input.shape_n = shape_n;
