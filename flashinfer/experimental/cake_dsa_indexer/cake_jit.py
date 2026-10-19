@@ -21,16 +21,21 @@ from typing import Any
 
 from . import cake_build
 
-# Registry of the generated Cake DSA indexer programs: exporter output,
-# trimmed by hand here pending exporter support.
+# Registry of the generated Cake DSA indexer programs.  The kernel and
+# launcher sources, this registry and ``build.json`` are exporter output,
+# hand-folded here pending exporter support: programs that differ only in
+# their constants or lever text share one translation unit, and each
+# ``build.json`` entry selects its program through its own ``-D``
+# definitions.
 #
-# Every program is one device translation unit plus its host binding, shared
+# Every program is one device translation unit plus one host binding, shared
 # by the architectures listed in its record; a program that differs from a
 # sibling only in its constants (a scan lever twin, a rank-finalize program of
 # the same window form, a CUB finalize program) builds the sibling's kernel
-# translation unit with the compile definitions of its ``build.json`` entry
-# (those shared kernels and entries are a hand fold of the exported files,
-# pending regeneration by the exporter).  ``build.json`` next to this file
+# translation unit, and a program whose binding text equals a sibling's up to
+# the kernel symbol, the host-shim namespace and the launch constants builds
+# the sibling's binding -- each with the compile definitions of its
+# ``build.json`` entry.  ``build.json`` next to this file
 # (schema ``cake-build/1``, read by ``cake_build``) is the only record of what
 # to compile: one entry ``<library>_<arch>`` per program and architecture with
 # its sources, nvcc flags and digests.  ``cake_build.load_library`` serves the

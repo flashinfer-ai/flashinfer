@@ -190,8 +190,13 @@ that writes the registry verifies the record against them before it is frozen.
 
 ## Layout of this package
 
-* `cake_jit.py` -- registry (exporter output, trimmed by hand here pending
-  exporter support): one record per program (`PROGRAMS`: role, the
+The kernel and launcher sources under `csrc/`, the registry `cake_jit.py` and
+`build.json` are exporter output, hand-folded here pending exporter support:
+programs that differ only in their constants or lever text share one
+translation unit, and each `build.json` entry selects its program through its
+own `-D` definitions.
+
+* `cake_jit.py` -- registry: one record per program (`PROGRAMS`: role, the
   architecture-free `library` stem, architectures), the program of every
   dispatch key per architecture (`PROGRAM_KEYS`), the per-architecture
   dispatch policy (`POLICY`), the argument plan per role, and the loader glue
@@ -218,15 +223,20 @@ that writes the registry verifies the record against them before it is frozen.
 * `cake_backend.py` -- validation, planning, argument binding, the prepared
   runner and the eager entry point.
 * `csrc/cake_dsa_indexer_topk/` -- generated kernel and binding translation
-  units: one binding per program and one kernel per program or per group of
-  programs that differ only in their constants -- a scan lever-twin group,
-  the rank-finalize programs of one window form, the CUB finalize programs
-  (such a program's `build.json` entry builds the group's kernel with the
-  compile definitions that select its lever text or its window / thread-count
-  constants and its own kernel symbol, `CAKE_PROGRAM_KERNEL`, the source's
-  `#ifndef` defaults naming its own program; those shared kernels and entries
-  are a hand fold of the exported files, pending regeneration by the
-  exporter), with the shared device
+  units: one kernel per program or per group of programs that differ only in
+  their constants (a scan lever-twin group, the rank-finalize programs of one
+  window form, the CUB finalize programs) and one binding per launcher text
+  (the 37 scan programs share 7 bindings, one per TMA box shape, block size
+  and cluster form; the 25 rank-finalize programs share 2, the 5 CUB finalize
+  programs 1; the merge program has its own).  A shared source names its
+  kernel symbol and host-shim namespace through `CAKE_PROGRAM_KERNEL` /
+  `CAKE_PROGRAM_SHIM` and its constants (the lever text, the window or
+  thread-count constants; a finalize binding reads its block size and dynamic
+  shared memory from `THREADS` / `SMEM_TOTAL`) through `#ifndef` defaults
+  naming the program it was exported for; every other program's `build.json`
+  entry passes its own values with `-D`.  The TMA descriptor encoders every
+  scan binding carried verbatim live once in the shared launch helpers,
+  selected by `CAKE_HOST_COMMON_PART`.  The sources come with the shared device
   preamble `cake_dsa_indexer_topk_device_common.cuh` and the shared launch helpers
   `cake_dsa_indexer_topk_host_common.cuh` delivered once; the preamble's helper
   functions are content-addressed files under `csrc/cake_device_helpers/`

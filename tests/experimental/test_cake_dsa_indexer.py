@@ -30,6 +30,7 @@ limitations under the License.
 # warning contract are covered by ``test_cake_dsa_indexer_api.py``.
 
 import os
+import re
 from types import SimpleNamespace
 from unittest import mock
 
@@ -453,6 +454,117 @@ def test_shared_kernel_sources_keep_distinct_symbols():
         symbols.setdefault(program, set()).add(symbol)
     assert set(symbols) == set(cake_jit.PROGRAMS)
     assert len({s for group in symbols.values() for s in group}) == len(symbols)
+
+
+_PROGRAM_SHIM_FLAG = "-DCAKE_PROGRAM_SHIM="
+_PROGRAM_SHIM_DEFAULT = "#define CAKE_PROGRAM_SHIM "
+_HOST_SHIM_NAMESPACE = re.compile(r"^cake_host_shim_[0-9a-f]{16}$")
+_PROGRAM_IDENTIFIER = re.compile(
+    r"cake_dsa_indexer_topk_[0-9a-f]{20}|cake_host_shim_[0-9a-f]{16}"
+)
+_CHECK_OPEN = re.compile(r"\bTVM_FFI_CHECK(?:_CUDA_ERROR)?\(")
+
+
+def _check_conditions(text):
+    # Every ``TVM_FFI_CHECK(`` condition of ``text`` as ``#cond`` stringizes it
+    # (unexpanded): balanced parentheses, string literals skipped, multi-line aware.
+    conditions = []
+    for match in _CHECK_OPEN.finditer(text):
+        start = match.end()
+        depth, quoted, i = 1, False, start
+        while depth and i < len(text):
+            c = text[i]
+            if quoted:
+                if c == "\\":
+                    i += 1
+                elif c == '"':
+                    quoted = False
+            elif c == '"':
+                quoted = True
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            i += 1
+        assert depth == 0, text[start : start + 80]
+        conditions.append(text[start : i - 1])
+    return conditions
+
+
+def test_shared_binding_sources_keep_distinct_namespaces():
+    # Programs whose exported binding text differs only in the kernel symbol, the
+    # host-shim namespace and the launch constants build one binding translation
+    # unit: it declares and launches ``CAKE_PROGRAM_KERNEL`` and exports ``run`` from
+    # namespace ``CAKE_PROGRAM_SHIM``, both defaulting to the program the file was
+    # exported for; every other entry names its own symbol and namespace on the
+    # compile line.  All libraries of one architecture load into one process, so
+    # every entry must still export a distinct namespace, and no check condition may
+    # spell a macro (``TVM_FFI_CHECK`` stringizes its condition unexpanded).
+    package = cake_jit.__file__.rsplit("/", 1)[0]
+    with open(
+        os.path.join(
+            package, "csrc/cake_dsa_indexer_topk/cake_dsa_indexer_topk_host_common.cuh"
+        )
+    ) as header:
+        assert not [c for c in _check_conditions(header.read()) if "CAKE_" in c]
+    namespaces = {}
+    for entry in cake_build.manifest()["libraries"]:
+        name, arch = entry["name"], entry["arch"]
+        program = name[: -len(arch) - 1]
+        binding_source = entry["sources"][1]
+        assert binding_source.endswith("_binding.cu"), (name, entry["sources"])
+        with open(os.path.join(package, binding_source)) as source:
+            text = source.read()
+        lines = text.splitlines()
+        assert lines.count("namespace CAKE_PROGRAM_SHIM {") == 1, name
+        assert 'extern "C" __global__ void CAKE_PROGRAM_KERNEL(' in text, name
+        assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_PROGRAM_SHIM::Run);" in text
+        assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, " in text, name
+        assert not [
+            c for c in _check_conditions(text) if "CAKE_" in c or "SMEM_TOTAL" in c
+        ], name
+        kernel_defaults = [
+            line[len(_PROGRAM_KERNEL_DEFAULT) :].strip()
+            for line in lines
+            if line.startswith(_PROGRAM_KERNEL_DEFAULT)
+        ]
+        shim_defaults = [
+            line[len(_PROGRAM_SHIM_DEFAULT) :].strip()
+            for line in lines
+            if line.startswith(_PROGRAM_SHIM_DEFAULT)
+        ]
+        assert len(kernel_defaults) == 1 and len(shim_defaults) == 1, name
+        # every other mention of a program identifier goes through the two macros
+        assert not [
+            line
+            for line in lines
+            if _PROGRAM_IDENTIFIER.search(line)
+            and not line.startswith(("#define CAKE_PROGRAM_", "//"))
+        ], name
+        shim_flags = [
+            f for f in entry["nvcc_flags"] if f.startswith(_PROGRAM_SHIM_FLAG)
+        ]
+        kernel_flags = [
+            f for f in entry["nvcc_flags"] if f.startswith(_PROGRAM_KERNEL_FLAG)
+        ]
+        assert len(shim_flags) <= 1 and len(kernel_flags) <= 1, (name, entry)
+        if program in binding_source:
+            # the file's own program: the defaults name it; a flag, when present, agrees
+            assert kernel_defaults == [f"kernel_{program}"], (name, kernel_defaults)
+            assert shim_flags in ([], [_PROGRAM_SHIM_FLAG + shim_defaults[0]]), name
+        else:
+            # another program's translation unit: symbol and namespace come from the
+            # compile line
+            assert kernel_flags == [f"{_PROGRAM_KERNEL_FLAG}kernel_{program}"], name
+            assert shim_flags, (name, binding_source)
+        namespace = (
+            shim_flags[0][len(_PROGRAM_SHIM_FLAG) :] if shim_flags else shim_defaults[0]
+        )
+        assert _HOST_SHIM_NAMESPACE.match(namespace), (name, namespace)
+        namespaces.setdefault(program, set()).add(namespace)
+    assert set(namespaces) == set(cake_jit.PROGRAMS)
+    assert all(len(found) == 1 for found in namespaces.values()), namespaces
+    assert len({next(iter(found)) for found in namespaces.values()}) == len(namespaces)
 
 
 def test_policy_record_round_trip_and_validation():
