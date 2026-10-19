@@ -205,21 +205,13 @@ def _q_row_token_and_head(
 ) -> tuple[cutlass.Int32, cutlass.Int32]:
     """Return the token and local Q head of row ``row`` of Q tile ``tile_idx``.
 
-    The row order is the section's (``_SageQSection``); the token is clamped
-    to the sequence's last token.
+    The row order is the section's (``_SageQSection.row_token_and_head``);
+    the token is clamped to the sequence's last token.
     """
 
-    heads = cutlass.Int32(q_rows.heads_q_per_kv)
-    tokens_per_tile = cutlass.Int32(q_rows.tokens_per_tile)
-    if cutlass.const_expr(q_rows.heads_interleaved):
-        token_in_tile = row // heads
-        local_head = row - token_in_tile * heads
-    else:
-        local_head = row // tokens_per_tile
-        token_in_tile = row - local_head * tokens_per_tile
+    token, local_head = q_rows.row_token_and_head(tile_idx, row)
     last_token = cutlass.Int32(q_rows.seq_len_q - 1)
-    token = cute.math.min(tile_idx * tokens_per_tile + token_in_tile, last_token)
-    return token, local_head
+    return cute.math.min(token, last_token), local_head
 
 
 @cute.jit

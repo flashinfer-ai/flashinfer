@@ -16,9 +16,10 @@
 
 The helpers turn coordinates into words of the flat scale tensors
 (``config.flat_scale_slot``) and of the prepared buffer
-(``layout._SageScaleLayout``), and load single FP32 scales. They hold no
-resource or pipeline state; each attention kernel moves the words it reads
-with its own resources.
+(``layout._SageScaleLayout``): a sequence's first word, a section's first
+word and a Q tile row's word. They also load single FP32 scales. They hold
+no resource or pipeline state; each attention kernel moves the words it
+reads with its own resources.
 """
 
 import cutlass
@@ -26,6 +27,48 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64
 
 from .config import flat_scale_slot
+from .layout import _SageScaleLayout
+
+Constexpr = cutlass.Constexpr
+
+
+@cute.jit
+def sage_sequence_words(
+    layout: Constexpr[_SageScaleLayout],
+    *,
+    batch_idx: Int32,
+    kv_head_idx: Int32,
+    num_kv_heads: Int32,
+) -> Int32:
+    """Return the first word of sequence ``b * Hkv + h`` in the prepared scales."""
+    sequence_idx = batch_idx * num_kv_heads + kv_head_idx
+    return sequence_idx * Int32(layout.sequence_words)
+
+
+@cute.jit
+def sage_section_word(sequence_words: Int32, section: Constexpr) -> Int32:
+    """Return the first word of one section of a sequence's prepared scales."""
+    return sequence_words + Int32(section.word_offset)
+
+
+@cute.jit
+def sage_q_word(
+    layout: Constexpr[_SageScaleLayout],
+    *,
+    sequence_words: Int32,
+    q_tile_idx: Int32,
+    row_idx: Int32,
+) -> Int32:
+    """Return the ``sfQ`` word of row ``row_idx`` of Q tile ``q_tile_idx``.
+
+    Each kernel numbers its Q tiles with ``_SageQSection.tile_index``.
+    """
+    q_rows = layout.q_rows
+    return (
+        sage_section_word(sequence_words, q_rows)
+        + q_tile_idx * Int32(q_rows.rows_per_tile)
+        + row_idx
+    )
 
 
 @cute.jit

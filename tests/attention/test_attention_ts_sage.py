@@ -724,14 +724,6 @@ def test_sage_matches_dequantized_reference(case: _SageCase) -> None:
     _check_case(case, *_random_inputs(case))
 
 
-def _q_row_tokens_and_heads(q_rows, rows: torch.Tensor):
-    """Map Q tile rows to (token within the tile, local Q head) in the section's order."""
-
-    if q_rows.heads_interleaved:
-        return rows // q_rows.heads_q_per_kv, rows % q_rows.heads_q_per_kv
-    return rows % q_rows.tokens_per_tile, rows // q_rows.tokens_per_tile
-
-
 def _reference_sage_scales(
     layout, params, *, batch_size: int, num_kv_heads: int
 ) -> torch.Tensor:
@@ -760,10 +752,8 @@ def _reference_sage_scales(
     q_rows = layout.q_rows
     tiles = torch.arange(q_rows.tiles, device="cuda")[:, None]
     rows = torch.arange(q_rows.rows_per_tile, device="cuda")
-    tokens_in_tile, local_heads = _q_row_tokens_and_heads(q_rows, rows)
-    tokens = (tiles * q_rows.tokens_per_tile + tokens_in_tile).clamp(
-        max=q_rows.seq_len_q - 1
-    )
+    tokens, local_heads = q_rows.row_token_and_head(tiles, rows)
+    tokens = tokens.clamp(max=q_rows.seq_len_q - 1)
     kv_heads = torch.arange(hkv, device="cuda")[:, None, None]
     heads = kv_heads * q_rows.heads_q_per_kv + local_heads
     slots = _scale_slots(batch, q_rows.seq_len_q, q_rows.q_block_size)

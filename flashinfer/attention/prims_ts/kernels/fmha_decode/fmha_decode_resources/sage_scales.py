@@ -66,7 +66,12 @@ from ...._block_sparse.prepared import (
     _PREPARED_ROUTE_IS_PROXY_FLAG,
     _BlockSparseRouteLayout,
 )
-from ....sage.index import _load_scale
+from ....sage.index import (
+    _load_scale,
+    sage_q_word,
+    sage_section_word,
+    sage_sequence_words,
+)
 from ....sage.layout import _FLOAT4_WORDS, _SAGE_ATOM_TOKENS, _SageKSection
 from ...stage import FmhaStage
 from ..fmha_decode_config import FmhaDecodeConfig
@@ -89,20 +94,6 @@ Constexpr = cutlass.Constexpr
 
 
 @cute.jit
-def sage_sequence_words(
-    cfg: Constexpr[FmhaDecodeConfig],
-    *,
-    batch_idx: Int32,
-    kv_head_idx: Int32,
-    num_heads_kv: Int32,
-) -> Int32:
-    """Return the first word of sequence ``b * Hkv + h`` in the prepared scales."""
-    layout = cfg.sage_scale_layout(cfg.static_seq_len_kv)
-    sequence_idx = batch_idx * num_heads_kv + kv_head_idx
-    return sequence_idx * Int32(layout.sequence_words)
-
-
-@cute.jit
 def load_q_scale(
     cfg: Constexpr[FmhaDecodeConfig],
     scales_ptr: cute.Pointer,
@@ -118,12 +109,11 @@ def load_q_scale(
     token and Q head, the last token's for a row past the sequence's end
     (``_SageQSection``).
     """
-    q_rows = cfg.sage_scale_layout(cfg.static_seq_len_kv).q_rows
-    word = (
-        sequence_words
-        + Int32(q_rows.word_offset)
-        + q_group_idx * Int32(q_rows.rows_per_tile)
-        + row_idx
+    word = sage_q_word(
+        cfg.sage_scale_layout(cfg.static_seq_len_kv),
+        sequence_words=sequence_words,
+        q_tile_idx=q_group_idx,
+        row_idx=row_idx,
     )
     return _load_scale(scales_ptr.toint(), word)
 
@@ -291,14 +281,14 @@ def copy_route_k_scales(
     )
     if cutlass.const_expr(cfg.sage_mixed_k_geometry):
         if is_proxy_route:
-            copy(summaries, sequence_words + Int32(summaries.word_offset))
+            copy(summaries, sage_section_word(sequence_words, summaries))
         else:
-            copy(k_tokens, sequence_words + Int32(k_tokens.word_offset))
+            copy(k_tokens, sage_section_word(sequence_words, k_tokens))
     else:
-        section_words = sequence_words + Int32(k_tokens.word_offset)
+        section_words = sage_section_word(sequence_words, k_tokens)
         if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
             if is_proxy_route:
-                section_words = sequence_words + Int32(summaries.word_offset)
+                section_words = sage_section_word(sequence_words, summaries)
         copy(k_tokens, section_words)
 
 
@@ -345,7 +335,7 @@ def stage_v_channel_scales(
     assert cfg.headdim % num_threads == 0
     v_rows = cfg.sage_scale_layout(cfg.static_seq_len_kv).v_rows
     scales_addr = scales_ptr.toint()
-    rows_base = sequence_words + Int32(v_rows.word_offset)
+    rows_base = sage_section_word(sequence_words, v_rows)
     for base in cutlass.range_constexpr(0, cfg.headdim, num_threads):
         channel = Int32(base) + thread_idx
         staged[channel] = _load_scale(scales_addr, rows_base + channel)
@@ -542,10 +532,10 @@ class SageKScalesResource(DecodeGenResourceBase):
             stage_info, self.h_k_idx, self.b_idx
         )
         return sage_sequence_words(
-            self.cfg,
+            self.cfg.sage_scale_layout(self.cfg.static_seq_len_kv),
             batch_idx=batch_idx,
             kv_head_idx=kv_head_idx,
-            num_heads_kv=self.num_heads_kv,
+            num_kv_heads=self.num_heads_kv,
         )
 
     @producer_work
@@ -620,7 +610,7 @@ class SageKScalesResource(DecodeGenResourceBase):
             cfg,
             self.sage_scales_ptr,
             self._stage_words(stage_info),
-            self._sequence_words(stage_info) + Int32(k_tokens.word_offset),
+            sage_section_word(self._sequence_words(stage_info), k_tokens),
             k_tokens.atom_words,
             lambda atom: cute.math.min(tile_atom + atom, last_atom),
             self.tile_atoms,
@@ -698,10 +688,10 @@ class SageVScalesResource(DecodeGenResourceBase):
             self.sage_scales_ptr,
             self.staged(stage_info.context),
             sequence_words=sage_sequence_words(
-                cfg,
+                cfg.sage_scale_layout(cfg.static_seq_len_kv),
                 batch_idx=batch_idx,
                 kv_head_idx=kv_head_idx,
-                num_heads_kv=self.num_heads_kv,
+                num_kv_heads=self.num_heads_kv,
             ),
             thread_idx=task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX],
             num_threads=cfg.correction_barrier_threads,

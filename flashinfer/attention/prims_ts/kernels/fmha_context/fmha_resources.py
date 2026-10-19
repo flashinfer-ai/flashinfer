@@ -95,6 +95,7 @@ from ...sage.int32_scores import (
     score_seed_tile_bytes,
     score_seed_words,
 )
+from ...sage.index import sage_section_word, sage_sequence_words
 from ...sage.layout import _FLOAT4_WORDS, _SageScaleLayout
 from .helpers import (
     bottom_right_window_left_bound,
@@ -113,7 +114,6 @@ from .sage_scales import (
     sage_k_section_address,
     sage_k_tile_bytes,
     sage_k_tile_words,
-    sage_sequence_words,
     sage_softmax_mode,
     sage_v_section_address,
 )
@@ -2047,11 +2047,9 @@ class SmemSageKScalesResource(MemoryResource):
             num_kv_heads=self.num_kv_heads,
         )
         tile_words = cfg.sage_k_tile_words
-        source_word = (
-            sequence_words
-            + Int32(layout.k_tokens.word_offset)
-            + tile_idx * Int32(tile_words)
-        )
+        source_word = sage_section_word(
+            sequence_words, layout.k_tokens
+        ) + tile_idx * Int32(tile_words)
         stage_bytes = Int32(self._alloc.offset) + stage_info.stage_idx * Int32(
             cfg.sage_k_tile_bytes
         )
@@ -3398,10 +3396,10 @@ class TmemSPResource(MemoryResource):
     def cache_sage_scales(self, stage_info: StageInfo) -> tuple[Float32, Int64]:
         """Cache this lane's Sage ``sfQ`` word and the work tile's first ``sfK`` atom.
 
-        The lane's Q row is row ``(warp % 4) * 32 + lane`` of Q tile
+        The lane's Q row is row ``(warp % 4) * 32 + lane`` of token range
         ``2 * seq + q_half`` of head ``head``, which is local head ``head %
-        h_r`` of KV head ``head // h_r``; the prepared Q rows hold one word
-        per such row (``_SageQSection``). The ``sfK`` atoms are the
+        h_r`` of KV head ``head // h_r``; ``_SageQSection.tile_index`` names
+        the prepared Q tile holding it. The ``sfK`` atoms are the
         sequence's K-token section (``_SageKSection``), padded to whole K
         tiles; the max pass addresses each tile's atoms from the first one.
         """
@@ -3421,13 +3419,12 @@ class TmemSPResource(MemoryResource):
             kv_head_idx=kv_head_coord,
             num_kv_heads=self.num_kv_heads,
         )
+        token_tile = seq_coord * Int32(cfg.work_tile_q_seq_tiles) + Int32(self.q_half)
         sage_q_scale = load_sage_q_scale(
             layout,
             self.sage_scales,
             sequence_words=sequence_words,
-            q_tile_idx=seq_coord * Int32(cfg.work_tile_q_seq_tiles)
-            + Int32(self.q_half),
-            local_head_idx=local_head_coord,
+            q_tile_idx=layout.q_rows.tile_index(local_head_coord, token_tile),
             row_idx=row_idx,
         )
         first_atom = sage_k_section_address(

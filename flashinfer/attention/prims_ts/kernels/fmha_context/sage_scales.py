@@ -22,7 +22,8 @@ lane order) and the V rows (``sfV`` and, with a V mean, ``v_mean`` per
 channel). The helpers here turn work-tile coordinates into words of that
 buffer and move the words the kernel reads:
 
-* ``load_sage_q_scale`` reads a softmax lane's ``sfQ`` word once per work tile;
+* ``load_sage_q_scale`` reads a softmax lane's ``sfQ`` word once per work
+  tile (``sage.index`` holds the word arithmetic both kernels share);
 * ``load_sage_k_tile`` reads one K tile's ``sfK`` atoms from the tile's
   address (``sage_k_section_address`` gives the sequence's first atom) for
   the softmax lanes or the load warp's shared-memory staging;
@@ -40,6 +41,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64
 
+from ...sage.index import sage_q_word, sage_section_word
 from ...sage.layout import _FLOAT4_WORDS, _SAGE_ATOM_TOKENS, _SageScaleLayout
 
 Constexpr = cutlass.Constexpr
@@ -121,52 +123,33 @@ def sage_k_block_word(layout: _SageScaleLayout, block_idx: int) -> int:
 
 
 @cute.jit
-def sage_sequence_words(
-    layout: Constexpr[_SageScaleLayout],
-    *,
-    batch_idx: Int32,
-    kv_head_idx: Int32,
-    num_kv_heads: Int32,
-) -> Int32:
-    """Return the first word of sequence ``b * Hkv + h`` in the prepared scales."""
-    return (batch_idx * num_kv_heads + kv_head_idx) * Int32(layout.sequence_words)
-
-
-@cute.jit
 def load_sage_q_scale(
     layout: Constexpr[_SageScaleLayout],
     scales: cute.Pointer,
     *,
     sequence_words: Int32,
     q_tile_idx: Int32,
-    local_head_idx: Int32,
     row_idx: Int32,
 ) -> Float32:
-    """Return ``sfQ`` of row ``row_idx`` of Q tile ``q_tile_idx`` of a local Q head.
+    """Return ``sfQ`` of row ``row_idx`` of Q tile ``q_tile_idx``.
 
     ``sequence_words`` is the first word of the row's sequence
-    (``sage_sequence_words``). The prepared Q rows hold one word per row of
-    each Q tile, the tile's rows of one head contiguous (``_SageQSection``
-    without interleaved heads); the word already holds the scale of the
+    (``sage_sequence_words``); a tile holds 128 tokens of one Q head
+    (``_SageQSection.tile_index``). The word already holds the scale of the
     row's token, the last token's for a row past the sequence's end.
     """
-    q_rows = layout.q_rows
-    word = (
-        sequence_words
-        + Int32(q_rows.word_offset)
-        + q_tile_idx * Int32(q_rows.rows_per_tile)
-        + local_head_idx * Int32(q_rows.tokens_per_tile)
-        + row_idx
+    word = sage_q_word(
+        layout, sequence_words=sequence_words, q_tile_idx=q_tile_idx, row_idx=row_idx
     )
     return Float32(scales[word])
 
 
 @cute.jit
 def _section_address(
-    scales: cute.Pointer, sequence_words: Int32, word_offset: Constexpr[int]
+    scales: cute.Pointer, sequence_words: Int32, section: Constexpr
 ) -> Int64:
-    """Return the address of word ``word_offset`` of a sequence's prepared scales."""
-    return scales.toint() + Int64(sequence_words + Int32(word_offset)) * Int64(4)
+    """Return the address of the first word of a sequence's section."""
+    return scales.toint() + Int64(sage_section_word(sequence_words, section)) * Int64(4)
 
 
 @cute.jit
@@ -182,7 +165,7 @@ def sage_k_section_address(
     padded to whole tiles, so every tile's atoms lie inside it; a tile past
     the sequence end reads the pad atoms, which repeat the last scale.
     """
-    return _section_address(scales, sequence_words, layout.k_tokens.word_offset)
+    return _section_address(scales, sequence_words, layout.k_tokens)
 
 
 @cute.jit
@@ -193,7 +176,7 @@ def sage_v_section_address(
     sequence_words: Int32,
 ) -> Int64:
     """Return the address of a sequence's first ``sfV`` word (``_SageVSection``)."""
-    return _section_address(scales, sequence_words, layout.v_rows.word_offset)
+    return _section_address(scales, sequence_words, layout.v_rows)
 
 
 @cute.jit

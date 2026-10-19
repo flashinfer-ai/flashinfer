@@ -96,11 +96,11 @@ from .helpers_common import (
 from .smem_block_sparse_metadata import (
     _swaps_forwards_packed_route_full,
 )
+from ....sage.index import sage_sequence_words
 from .sage_scales import (
     load_q_scale,
     load_sage_k_fragment,
     sage_k_view,
-    sage_sequence_words,
 )
 from .helpers_kv_tile_idx import (
     resolve_keeps_tile_context,
@@ -2224,10 +2224,10 @@ class TmemSResource(DecodeGenResourceBase):
             cfg,
             self.sage_scales_ptr,
             sequence_words=sage_sequence_words(
-                cfg,
+                cfg.sage_scale_layout(cfg.static_seq_len_kv),
                 batch_idx=batch_idx,
                 kv_head_idx=kv_head_idx,
-                num_heads_kv=self.num_heads_kv,
+                num_kv_heads=self.num_heads_kv,
             ),
             q_group_idx=_logical_q_group_idx(cfg, stage_info, self.q_group_idx),
             row_idx=_keeps_row_idx(cfg, warp_grp_thread_idx),
