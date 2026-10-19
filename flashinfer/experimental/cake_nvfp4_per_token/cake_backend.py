@@ -66,6 +66,7 @@ import tvm_ffi
 
 from ...utils import get_compute_capability, get_device_sm_count
 from .cake_jit import (
+    ARG_PLANS,
     MODULES,
     kernel_definitions,
     kernel_module_name,
@@ -974,9 +975,8 @@ def _entry(
     module = load_cake_nvfp4_per_token_module(
         module_name, arch, kernel_definitions(kernel_key)
     )
-    return getattr(module, record["ffi_entry"]), tuple(
-        tuple(item) for item in record["arg_plan"]
-    )
+    plan = ARG_PLANS[record["arg_plan"]]
+    return module.run, tuple((kind, name) for kind, name in plan)
 
 
 def _arguments(arg_plan: tuple[tuple[str, str], ...], kwargs: dict[str, Any]) -> tuple:

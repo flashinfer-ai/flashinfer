@@ -70,7 +70,7 @@ Generated sources live flat under `csrc/cake_nvfp4_per_token/` (architecture-neu
 `*_kernel.cu` / `*_binding.cu` sources whose per-architecture lowering is selected by
 `__CUDA_ARCH__` guards, plus the shared `*_common.cuh` headers) and are registered in
 `cake_jit.py` (`MODULES`, `KERNELS`) by the Cake generated-program export (see the
-hand-maintained exception below).
+two hand-maintained exceptions below).
 
 One hand-maintained exception, pending regeneration by the export: a program that
 differs from a sibling only by its output dtype, TMA cache-hint policies, raster group,
@@ -78,3 +78,9 @@ quantizer CTA shape, folded output scale or store policy shares the sibling's ke
 source and selects those values (`-DCAKE_*`) and its own kernel symbol
 (`-DCAKE_PROGRAM_KERNEL`) on the compile line; the shared kernel sources carry the
 matching guarded defaults and `#if` arms.
+
+The registry's row form is a second hand fold, also pending regeneration by the
+export: `cake_jit.py` keeps the exported per-program data as sparse `_PROGRAMS` rows,
+the four named argument plans of `ARG_PLANS` and one `KERNELS` table shared by both
+architectures plus the per-architecture additions, and expands them into `MODULES`
+and `KERNELS` at import.

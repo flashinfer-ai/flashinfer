@@ -25,6 +25,7 @@ from flashinfer import NVFP44Over6Config, SfLayout, nvfp4_quantize
 from flashinfer.experimental.cake_nvfp4_per_token import cake_backend as cb
 from flashinfer.experimental.cake_nvfp4_per_token.cake_jit import (
     ARCHES,
+    ARG_PLANS,
     DEFINITIONS,
     KERNELS,
     MODULES,
@@ -320,7 +321,9 @@ def test_required_kernel_keys_are_registered_when_programs_exist(arch):
         missing = sorted(set(required) - set(KERNELS[arch]))
         assert not missing, f"{arch} lacks {missing}"
         for module_name in KERNELS[arch].values():
-            assert arch in MODULES[module_name]["arches"]
+            record = MODULES[module_name]
+            assert record["arg_plan"] in ARG_PLANS, (module_name, record["arg_plan"])
+            assert arch in record["closure_sha256"], (module_name, arch)
 
 
 _PROGRAM_KERNEL_FLAG = "-DCAKE_PROGRAM_KERNEL="
