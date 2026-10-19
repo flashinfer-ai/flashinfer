@@ -318,8 +318,6 @@ class _PrimsTSQTokenKvBlockSparsePlan:
     """
 
     _metadata_plan: _PrimsTSQTokenKvBlockSparseMetadataPlan
-    _bmm1_scale: float
-    _bmm2_scale: float
     _attention_plan: Any
     _query: _QTokenKvBlockSparseTensorDescriptor
     _block_indices: _QTokenKvBlockSparseTensorDescriptor
@@ -396,14 +394,10 @@ class _PrimsTSQTokenKvBlockSparsePlan:
         )
         from .decode import _validate_scale
 
-        scale_qk = (
-            self._bmm1_scale
-            if sm_scale is None
-            else _validate_scale(sm_scale, "sm_scale")
+        scale_qk = _validate_scale(
+            query.shape[-1] ** -0.5 if sm_scale is None else sm_scale, "sm_scale"
         )
-        scale_v = (
-            self._bmm2_scale if v_scale is None else _validate_scale(v_scale, "v_scale")
-        )
+        scale_v = 1.0 if v_scale is None else _validate_scale(v_scale, "v_scale")
         self._attention_plan._run_unchecked(
             attention_query,
             attention_out,
@@ -1695,8 +1689,6 @@ def _prepare_q_token_kv_block_sparse_attention(
     *,
     out: torch.Tensor,
     max_seq_len_kv: int,
-    bmm1_scale: Optional[float] = None,
-    bmm2_scale: float = 1.0,
     qo_indptr: Optional[torch.Tensor] = None,
     group_size: int = 1,
     sparse_block_size: int = 4,
@@ -1763,10 +1755,6 @@ def _prepare_q_token_kv_block_sparse_attention(
         Static maximum visible logical K/V length in tokens, including current
         query or MTP tokens. It must fit within each dense block-table row and
         remain unchanged across CUDA graph replay.
-    bmm1_scale : float, optional
-        Scale applied to QK scores. It defaults to ``head_dim**-0.5``.
-    bmm2_scale : float
-        Scale applied to the attention output.
     qo_indptr : torch.Tensor, optional
         Contiguous CUDA Int32 cumulative route offsets selecting packed-query
         mode.
@@ -1865,13 +1853,8 @@ def _prepare_q_token_kv_block_sparse_attention(
         count_current_block_in_topk=count_current_block_in_topk,
     )
     views = layout.bind(workspace_buffer)
-    from .decode import _prepare_prims_ts_batch_decode_plan, _validate_scale
+    from .decode import _prepare_prims_ts_batch_decode_plan
 
-    scale_qk = _validate_scale(
-        query.shape[-1] ** -0.5 if bmm1_scale is None else bmm1_scale,
-        "bmm1_scale",
-    )
-    scale_v = _validate_scale(bmm2_scale, "bmm2_scale")
     # Generic FMHA sees one query group as a route, so its route-local
     # sequence-length parameters receive G, not the full request length.
     attention_plan, _ = _prepare_prims_ts_batch_decode_plan(
@@ -1931,8 +1914,6 @@ def _prepare_q_token_kv_block_sparse_attention(
     )
     return _PrimsTSQTokenKvBlockSparsePlan(
         _metadata_plan=metadata_plan,
-        _bmm1_scale=scale_qk,
-        _bmm2_scale=scale_v,
         _attention_plan=attention_plan,
         _query=_describe_q_token_kv_block_sparse_tensor(query),
         _block_indices=_describe_q_token_kv_block_sparse_tensor(block_indices),
