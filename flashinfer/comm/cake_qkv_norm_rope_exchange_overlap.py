@@ -17,17 +17,31 @@ Cake backend of :class:`flashinfer.comm.QkvNormRopeExchangeOverlap`: the fused
 QKV projection + per-head RMSNorm + RoPE producer that stores every head band
 straight into the destination rank's symmetric receive slot (SM90 WGMMA, SM100
 / SM103 tcgen05), the one-CTA readiness wait kernel and the two-phase NVLink
-barrier, driven from Python one launcher call per stage.
+barrier -- as a separate kernel, or folded into the producer as a rendezvous
+warp (one extra warp per CTA on SM100 / SM103, the otherwise idle TMA warp on
+SM90) that runs the rendezvous and releases the stores -- driven from Python
+one launcher call per stage.
 
-Per call (current stream = producer stream):
+Launch path (``fold_barrier``; the keyword, else ``FLASHINFER_QKV_EXCHANGE_FOLD_BARRIER``
+= ``0`` / ``1`` / ``auto``, else the architecture default
+``loader.FOLD_BARRIER_DEFAULT_BY_ARCH``: folded on SM90, SM100 and SM103; the
+folded producers are delivered on every architecture, and ``True`` fails closed
+only on a route table without them).  Both paths compute and store identical
+bits.  Per call (current stream = producer stream):
 
 1. wait for the slot's previous exchange (``exchange_done[slot]``; eager only),
-2. barrier kernel (phase alternating per call) and a ``barrier_done`` record,
-3. producer kernel (persistent grid ``min(num_tiles, sm_count - 2)``), which
-   publishes ``ready_target`` into every destination's readiness pad per chunk,
-4. consumer stream: wait ``barrier_done``, wait kernel over this call's
+2. folded (two launches): record the fork event, then the producer build of
+   this call's rendezvous phase (``producer_fold<phase>``, persistent grid
+   ``min(num_tiles, sm_count - 2)``; the rendezvous warp -- one extra warp per
+   CTA on SM100 / SM103, the idle TMA warp on SM90 -- of CTA 0 runs the
+   cross-rank barrier and publishes ``ready_target`` into this rank's arrive
+   flag, every CTA acquires it once before its first store);
+   separate barrier (three launches): the barrier kernel of the phase, the
+   fork event, then the plain producer.  Either producer publishes
+   ``ready_target`` into every destination's readiness pad per chunk,
+3. consumer stream: wait the fork event, wait kernel over this call's
    ``W * num_words`` words, record ``exchange_done[slot]``,
-5. the current stream waits ``exchange_done[slot]`` so the outputs are
+4. the current stream waits ``exchange_done[slot]`` so the outputs are
    consumable in stream order.
 
 Eager calls publish a monotonic epoch; a call issued while the current stream
@@ -42,6 +56,7 @@ it has not seen (or a row count above ``max_tokens``) inside a capture.
 
 from __future__ import annotations
 
+import os
 import threading
 import warnings
 from dataclasses import dataclass
@@ -62,6 +77,15 @@ RESERVED_SMS = 2
 # torch's default CUDA symmetric-memory backend provides the peer buffer
 # pointers, ``memset32_`` and the rendezvous this backend needs.
 SUPPORTED_SYMMETRIC_MEMORY_BACKENDS = ("CUDA",)
+# Launch-path override read when the ``fold_barrier`` keyword is ``None``: ``0`` = the separate barrier kernel,
+# ``1`` = the producer with the folded rendezvous, ``auto`` / unset = the architecture default of the loader.
+FOLD_BARRIER_ENV = "FLASHINFER_QKV_EXCHANGE_FOLD_BARRIER"
+_FOLD_BARRIER_ENV_VALUES: dict[str, Optional[bool]] = {
+    "": None,
+    "auto": None,
+    "0": False,
+    "1": True,
+}
 
 
 def symmetric_memory_backend(device: torch.device) -> str:
@@ -78,6 +102,47 @@ def supports_symmetric_memory_backend(device: torch.device) -> bool:
         "",
         *SUPPORTED_SYMMETRIC_MEMORY_BACKENDS,
     )
+
+
+def fold_barrier_from_env() -> Optional[bool]:
+    """The launch-path override of :data:`FOLD_BARRIER_ENV` (``None`` when unset or ``auto``)."""
+
+    raw = os.environ.get(FOLD_BARRIER_ENV, "")
+    try:
+        return _FOLD_BARRIER_ENV_VALUES[raw.strip().lower()]
+    except KeyError:
+        raise ValueError(
+            f"{FOLD_BARRIER_ENV} must be 0, 1 or auto, got {raw!r}"
+        ) from None
+
+
+def resolve_fold_barrier(
+    arch: str, requested: Optional[bool] = None
+) -> tuple[bool, str]:
+    """Resolve the launch path on ``arch``: the explicit ``requested`` value, else :data:`FOLD_BARRIER_ENV`,
+    else the architecture default.  Returns ``(fold_barrier, source)`` with ``source`` in ``"keyword"``,
+    ``"env"``, ``"default"``.  ``True`` fails closed where the route table delivers no folded producer (no
+    delivered architecture; the check guards the table): the message names the architecture default and the
+    opt-out, since the barrier path is always delivered."""
+
+    if requested is not None and not isinstance(requested, bool):
+        raise ValueError(f"fold_barrier must be a bool or None, got {requested!r}")
+    if requested is not None:
+        fold, source = requested, "keyword"
+    else:
+        override = fold_barrier_from_env()
+        if override is not None:
+            fold, source = override, "env"
+        else:
+            fold, source = loader.default_fold_barrier(arch), "default"
+    if fold and not loader.fold_producers_delivered(arch):
+        raise ValueError(
+            f"fold_barrier=True ({source}): no producer program with the folded rendezvous is delivered for "
+            f"{arch} (its route table carries no fold key; the architecture default is "
+            f"fold_barrier={loader.default_fold_barrier(arch)}) -- pass fold_barrier=False to select the "
+            "separate barrier kernel, which is delivered on every architecture"
+        )
+    return fold, source
 
 
 def device_arch(device: torch.device) -> Optional[str]:
@@ -125,6 +190,8 @@ class _RowPlan:
     tiles: torch.Tensor
     grid: int
     program: str
+    # Both rendezvous phases of the folded producer of this tile width (empty where none is delivered).
+    fold_programs: tuple[str, ...]
 
 
 class CakeQkvExchangeSession:
@@ -143,6 +210,7 @@ class CakeQkvExchangeSession:
         num_slots: int,
         sample_batch: Optional[int] = None,
         sample_s_local: Optional[int] = None,
+        fold_barrier: Optional[bool] = None,
     ) -> None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
@@ -169,6 +237,10 @@ class CakeQkvExchangeSession:
                 f"backend needs one of {SUPPORTED_SYMMETRIC_MEMORY_BACKENDS}"
             )
         self.arch = arch
+        self.fold_barrier, self.fold_barrier_source = resolve_fold_barrier(
+            arch, fold_barrier
+        )
+        self.fold_barrier_requested = fold_barrier
         self.group = group
         self.group_name = _group_name(group)
         self.rank = int(dist.get_rank(group=group))
@@ -228,30 +300,35 @@ class CakeQkvExchangeSession:
             symm_mem.enable_symm_mem_for_group(self.group_name)
 
         # Programs (JIT build is collective-safe only outside the barrier: every rank builds before any launch).
+        # The barrier programs are loaded on both paths; of the producers only the launch path's builds are:
+        # the plain producer for the barrier path, both rendezvous phases of the folded producer otherwise.
         self.pair_available = {
             bn: loader.has_producer(self.arch, bn, True) for bn in plans.BLOCK_N_CHOICES
         }
-        self._barrier = tuple(
-            loader.load(loader.barrier_program(self.arch, phase), self.arch)
-            for phase in (0, 1)
-        )
         self._barrier_names = tuple(
             loader.barrier_program(self.arch, phase) for phase in (0, 1)
+        )
+        self._barrier = tuple(
+            loader.load(name, self.arch) for name in self._barrier_names
         )
         self._wait_name = loader.wait_program(self.arch)
         self._wait = loader.load(self._wait_name, self.arch)
         self._producers: dict[str, Any] = {}
         for pair in self._reachable_pairs():
-            name = loader.producer_program(self.arch, self.bn, pair)
-            self._producers[name] = loader.load(name, self.arch)
+            for name in self._launched_producers(pair):
+                self._producers[name] = loader.load(name, self.arch)
 
-        # Symmetric memory: receive slots, readiness pad, barrier flags (rendezvous = collective).
+        # Symmetric memory: receive slots, readiness pad, barrier flags (rendezvous = collective).  The
+        # readiness pad holds ``words`` symmetric words the peers publish into, then one rank-local word: the
+        # arrive flag of the folded rendezvous (CTA 0's rendezvous warp publishes the call's epoch into it after
+        # the cross-rank barrier, every CTA acquires it once before its first store; peers never touch it).
         words = self.num_slots * self.world_size * self.words_cap
+        self.arrive_flag_offset = words
         flag_words = loader.barrier_flag_words(self.world_size)
         self._recv = symm_mem.empty(
             self.num_slots * self.slot_stride, dtype=torch.bfloat16, device=self.device
         )
-        self._ready = symm_mem.empty(words, dtype=torch.uint32, device=self.device)
+        self._ready = symm_mem.empty(words + 1, dtype=torch.uint32, device=self.device)
         self._flags = symm_mem.empty(flag_words, dtype=torch.uint32, device=self.device)
         self._recv.zero_()
         self._ready.zero_()
@@ -276,8 +353,18 @@ class CakeQkvExchangeSession:
             dtype=torch.int64,
             device=self.device,
         )
+        ready_peers = _peer_pointers(
+            self._ready_handle, self.world_size, words, torch.uint32
+        )
         self.ready_ptrs = torch.tensor(
-            _peer_pointers(self._ready_handle, self.world_size, words, torch.uint32),
+            ready_peers, dtype=torch.int64, device=self.device
+        )
+        # The folded producer reads ``world_size + 1`` pointers: the peers' pads, then this rank's arrive flag.
+        self.ready_ptrs_fold = torch.tensor(
+            [
+                *ready_peers,
+                int(self._ready.data_ptr()) + 4 * self.arrive_flag_offset,
+            ],
             dtype=torch.int64,
             device=self.device,
         )
@@ -289,13 +376,14 @@ class CakeQkvExchangeSession:
         self.counters = torch.zeros(
             self.world_size * self.words_cap, dtype=torch.uint32, device=self.device
         )
-        # The captured-call clear needs ``memset32_`` on the dedicated pad; probe it once with a rank-uniform verdict.
-        self.memset32_probe = self._probe_memset32(words)
+        # The captured-call clear needs ``memset32_`` on the dedicated pad; probe it once with a rank-uniform
+        # verdict, and check that every rank resolved the same launch path.
+        self.memset32_probe = self._rank_uniform_probe(words)
         torch.cuda.current_stream(self.device).synchronize()
         dist.barrier(group=group)
 
         self._consumer = torch.cuda.Stream(device=self.device)
-        self._barrier_done = torch.cuda.Event()
+        self._fork = torch.cuda.Event()
         self._exchange_done = [torch.cuda.Event() for _ in range(self.num_slots)]
         self._capture_done: dict[int, torch.cuda.Event] = {}
         self._lock = threading.Lock()
@@ -325,7 +413,33 @@ class CakeQkvExchangeSession:
             pairs.add(bool(self.pair_available[self.bn]))
         return tuple(sorted(pairs))
 
-    def _probe_memset32(self, words: int) -> dict[str, Any]:
+    def _fold_producer_names(self, pair: bool) -> tuple[str, ...]:
+        """Both rendezvous phases of the folded producer of this tile width (empty where it is not delivered)."""
+
+        if not loader.has_fold_producer(self.arch, self.bn, pair):
+            return ()
+        return tuple(
+            loader.fold_producer_program(self.arch, self.bn, pair, phase)
+            for phase in loader.FOLD_PHASES
+        )
+
+    def _launched_producers(self, pair: bool) -> tuple[str, ...]:
+        """Producer programs the resolved launch path launches for this tile width."""
+
+        if not self.fold_barrier:
+            return (loader.producer_program(self.arch, self.bn, pair),)
+        names = self._fold_producer_names(pair)
+        if not names:
+            raise RuntimeError(
+                f"fold_barrier=True, but {self.arch} delivers no folded producer for block_n={self.bn}, "
+                f"pair={pair}; pass fold_barrier=False"
+            )
+        return names
+
+    def _rank_uniform_probe(self, words: int) -> dict[str, Any]:
+        """Collective self-check before the first launch: ``memset32_`` accepts the dedicated pad on every
+        rank (the captured-call clear needs it) and every rank resolved the same launch path."""
+
         local_error: Optional[str] = None
         try:
             torch.ops.symm_mem.memset32_(self._ready, 0, 0, int(words))
@@ -333,7 +447,13 @@ class CakeQkvExchangeSession:
             local_error = f"{type(error).__name__}: {error}"[:500]
         verdicts: list[Any] = [None] * self.world_size
         dist.all_gather_object(
-            verdicts, {"rank": self.rank, "error": local_error}, group=self.group
+            verdicts,
+            {
+                "rank": self.rank,
+                "error": local_error,
+                "fold_barrier": self.fold_barrier,
+            },
+            group=self.group,
         )
         rejecting = {
             int(v["rank"]): v["error"] for v in verdicts if v.get("error") is not None
@@ -342,6 +462,12 @@ class CakeQkvExchangeSession:
             raise RuntimeError(
                 "torch.ops.symm_mem.memset32_ rejected the dedicated readiness pad on ranks "
                 f"{sorted(rejecting)}: {rejecting[sorted(rejecting)[0]]}; the captured-call clear needs it"
+            )
+        paths = {int(v["rank"]): bool(v["fold_barrier"]) for v in verdicts}
+        if len(set(paths.values())) != 1:
+            raise RuntimeError(
+                f"the launch path differs across ranks (fold_barrier per rank: {paths}); pass the same "
+                f"fold_barrier keyword or the same {FOLD_BARRIER_ENV} value on every rank"
             )
         return {"accepted": True, "words": int(words)}
 
@@ -386,12 +512,13 @@ class CakeQkvExchangeSession:
         if plan.bn != self.bn or plan.num_words > self.words_cap:
             raise RuntimeError("tile plan disagrees with the session capacity")
         program = loader.producer_program(self.arch, plan.bn, plan.pair)
-        if program not in self._producers:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    f"program {program!r} is not loaded; a JIT build cannot run inside a capture"
-                )
-            self._producers[program] = loader.load(program, self.arch)
+        for name in self._launched_producers(plan.pair):
+            if name not in self._producers:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        f"program {name!r} is not loaded; a JIT build cannot run inside a capture"
+                    )
+                self._producers[name] = loader.load(name, self.arch)
         row = _RowPlan(
             policy=policy,
             plan=plan,
@@ -403,20 +530,28 @@ class CakeQkvExchangeSession:
                 lockstep=plan.lockstep,
             ),
             program=program,
+            fold_programs=self._fold_producer_names(plan.pair),
         )
         self._plans[key] = row
         return row
 
     def bound_programs(self, batch: int, s_local: int) -> dict[str, str]:
-        """Program names the stages of a ``(batch, s_local)`` call launch (prepares the row eagerly)."""
+        """Program names of every delivered stage of a ``(batch, s_local)`` call (prepares the row eagerly):
+        the barrier programs, the plain producer, the folded producers where delivered
+        (``producer_fold0`` / ``producer_fold1``) and the wait kernel.  :meth:`describe` says which of them a
+        call launches (``launch_sequence``)."""
 
         row = self.prepare_rows(batch, s_local)
-        return {
+        bound = {
             "barrier_p0": self._barrier_names[0],
             "barrier_p1": self._barrier_names[1],
             "producer": row.program,
-            "wait": self._wait_name,
         }
+        if row.fold_programs:
+            for phase, name in zip(loader.FOLD_PHASES, row.fold_programs, strict=True):
+                bound[f"producer_fold{phase}"] = name
+        bound["wait"] = self._wait_name
+        return bound
 
     # ------------------------------------------------------------------ calls
 
@@ -508,50 +643,69 @@ class CakeQkvExchangeSession:
             pad_base = slot_base + self.rank * plan.num_words
             try:
                 if capturing:
-                    barrier_done = torch.cuda.Event()
+                    fork = torch.cuda.Event()
                     done = torch.cuda.Event()
                 else:
                     stream.wait_event(self._exchange_done[slot])
-                    barrier_done = self._barrier_done
+                    fork = self._fork
                     done = self._exchange_done[slot]
+                producer_args = (
+                    x.view(plan.M, plan.K),
+                    w_qkv,
+                    cos_sin,
+                    q_scale,
+                    k_scale,
+                    row.tiles,
+                    self.dst_ptrs,
+                    self.ready_ptrs_fold if self.fold_barrier else self.ready_ptrs,
+                    self.counters,
+                    plan.num_tiles,
+                    plan.M,
+                    plan.K,
+                    s_local,
+                    plan.head_stride,
+                    plan.batch_stride,
+                    slot * self.slot_stride,
+                    pad_base,
+                    plan.num_words,
+                    self.rank,
+                    self.world_size,
+                    ready_target,
+                )
                 with tvm_ffi.use_torch_stream():
-                    self._barrier[phase].run(
-                        self.device_index,
-                        self.world_size,
-                        self.rank,
-                        self.flag_peers,
-                        1,
-                        1,
-                        1,
-                    )
-                    barrier_done.record(stream)
-                    self._producers[row.program].run(
-                        x.view(plan.M, plan.K),
-                        w_qkv,
-                        cos_sin,
-                        q_scale,
-                        k_scale,
-                        row.tiles,
-                        self.dst_ptrs,
-                        self.ready_ptrs,
-                        self.counters,
-                        plan.num_tiles,
-                        plan.M,
-                        plan.K,
-                        s_local,
-                        plan.head_stride,
-                        plan.batch_stride,
-                        slot * self.slot_stride,
-                        pad_base,
-                        plan.num_words,
-                        self.rank,
-                        self.world_size,
-                        ready_target,
-                        row.grid,
-                        1,
-                        1,
-                    )
-                    consumer.wait_event(barrier_done)
+                    if self.fold_barrier:
+                        # Folded rendezvous: the fork is recorded before the producer so the wait kernel runs
+                        # beside it; the producer's rendezvous warp runs the cross-rank barrier of this call's
+                        # phase and releases every CTA's stores through the arrive flag.
+                        fork.record(stream)
+                        self._producers[row.fold_programs[phase]].run(
+                            *producer_args,
+                            self.world_size,
+                            self.rank,
+                            self.flag_peers,
+                            row.grid,
+                            1,
+                            1,
+                        )
+                        if capturing:
+                            # The arrive flag holds the sentinel: clear it once every CTA acquired it (stream
+                            # order behind the producer) so the next replay waits for a fresh rendezvous.
+                            torch.ops.symm_mem.memset32_(
+                                self._ready, self.arrive_flag_offset, 0, 1
+                            )
+                    else:
+                        self._barrier[phase].run(
+                            self.device_index,
+                            self.world_size,
+                            self.rank,
+                            self.flag_peers,
+                            1,
+                            1,
+                            1,
+                        )
+                        fork.record(stream)
+                        self._producers[row.program].run(*producer_args, row.grid, 1, 1)
+                    consumer.wait_event(fork)
                     with torch.cuda.stream(consumer):
                         self._wait.run(
                             self._ready, words_total, slot_base, ready_target, 1, 1, 1
@@ -632,6 +786,19 @@ class CakeQkvExchangeSession:
             "sm_count": self.sm_count,
             "ready_mode": "dedicated_symmetric_u32",
             "memset32_probe": dict(self.memset32_probe),
+            "fold_barrier": self.fold_barrier,
+            "fold_barrier_requested": (
+                "auto"
+                if self.fold_barrier_requested is None
+                else self.fold_barrier_requested
+            ),
+            "fold_barrier_source": self.fold_barrier_source,
+            "launches_per_call": 2 if self.fold_barrier else 3,
+            "launch_sequence": (
+                ["producer_fold<phase>", "wait"]
+                if self.fold_barrier
+                else ["barrier_p<phase>", "producer", "wait"]
+            ),
             "programs": {
                 "barrier_p0": self._barrier_names[0],
                 "barrier_p1": self._barrier_names[1],
@@ -663,15 +830,19 @@ class CakeQkvExchangeSession:
         self._recv = self._ready = self._flags = None  # type: ignore[assignment]
         self._recv_handle = self._ready_handle = self._flags_handle = None
         self.dst_ptrs = self.ready_ptrs = self.counters = None  # type: ignore[assignment]
+        self.ready_ptrs_fold = None  # type: ignore[assignment]
 
 
 __all__ = [
     "CAPTURE_READY_TARGET",
     "EAGER_READY_TARGET_MAX",
+    "FOLD_BARRIER_ENV",
     "RESERVED_SMS",
     "SUPPORTED_SYMMETRIC_MEMORY_BACKENDS",
     "CakeQkvExchangeSession",
     "device_arch",
+    "fold_barrier_from_env",
+    "resolve_fold_barrier",
     "supports_symmetric_memory_backend",
     "symmetric_memory_backend",
 ]
