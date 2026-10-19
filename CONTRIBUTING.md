@@ -134,10 +134,54 @@ It is what applies the `run-ci` label that starts CI, not the label sitting on t
 
 | Command | Who can use | Description |
 |---------|-------------|-------------|
-| `@flashinfer-bot run` | Can label the PR, or `ci-users` | Start CI on the PR's current commit |
+| `@flashinfer-bot run` | Can label the PR, or `ci-users` | AI selects up to ten focused pytest paths and starts CI on the current commit |
+| `@flashinfer-bot run full` | Can label the PR, or `ci-users` | Start the full suite on the current commit |
+| `@flashinfer-bot run tests/<dir-or-file> [tests/...]` | Can label the PR, or `ci-users` | Start CI on the explicitly named paths, without calling AI |
 | `@flashinfer-bot rerun` | Can label the PR, or `ci-users` | Cancel and rerun all workflows |
 | `@flashinfer-bot rerun failed` | Can label the PR, or `ci-users` | Rerun only failed/cancelled jobs |
 | `@flashinfer-bot stop` | Can label the PR, or `ci-users` | Cancel all in-progress workflows |
+
+Plain `run` follows Phase 3 of the FlashInfer PR screening guidance: prefer
+added/modified tests, then tests of the changed public symbol/kernel/dispatch
+path, then a small subsystem file or directory. The bot reads the merged tree
+combining the current base and PR-head commits, plus current GitHub CI routing.
+It resolves the current target tip independently of the PR's recorded base and
+constructs their merge in an isolated temporary repository. GitHub's merge ref
+is not required. Source hooks, merge drivers and configuration are not inherited;
+PR code is never imported, executed or collected while choosing tests. The acknowledgement
+lists the selected paths, their purpose, known GPU requirements, and CI evidence;
+these are AI suggestions, not proof of coverage. Author-declared
+`experimental-tests` blocks remain unchanged.
+
+If there is no pytest-applicable change, no confident selection, missing AI
+configuration, an inference failure, an unavailable/conflicted merge, or a changed
+PR head/base, no CI is started.
+Specify paths yourself or use `run full`; the bot never substitutes the full
+suite for a failed automatic request. The existing scope validator still checks
+manual paths, and the matrix intersects scoped paths with each lane's coverage.
+Automatic scopes carry their selected base, merge commit and tree identities.
+They also carry a fingerprint of the selected paths and use the bot's
+`run-ci-focused` label, which requires that snapshot metadata. Repository
+administrators must create both `run-ci` and `run-ci-focused` labels before
+enabling the commands. Explicit/full requests continue to use `run-ci`.
+Before scheduling tests, CI reconstructs the pinned base/head merge and verifies
+its tree. GPU jobs reconstruct the same tree before initializing submodules.
+A stale GitHub merge ref or event base does not replace the selected source;
+actual conflicts or tree mismatches fail preparation.
+If another command overwrites the scope or clears its metadata before CI reads
+it, an automatic trigger fails instead of becoming a full run.
+
+Repository administrators enable automatic selection with an `INFERENCE_API_KEY`
+Actions secret entitled to the selected NVIDIA Inference Hub model. Optional
+Actions variables are `INFERENCE_BASE_URL` (default
+`https://inference-api.nvidia.com/v1`), `CI_BOT_TARGET_MODEL` (default
+`us/aws/anthropic/eccn-claude-opus-5`), and
+`CI_BOT_TARGET_TIMEOUT_SECONDS` (default `240`, maximum `1800`; the command job
+also has a ten-minute timeout). Explicit paths and `run full` need no AI key.
+The selector uses Git, Python's standard library and two bounded JSON model calls,
+matching the Inference Hub integration used by the cuDNN frontend triage job.
+Only the authorized command step receives the inference key. The endpoint must be
+reachable from the GitHub-hosted command runner; it is never given to PR code.
 
 > **Note:** Draft PRs work the same way. They never run CI on their own, but anyone who can use the commands above can start a run on one when you need it.
 
@@ -147,7 +191,8 @@ Internal CI runs an extended test matrix across NVIDIA GPU architectures. It is 
 
 | Command | Who can use | Description |
 |---------|-------------|-------------|
-| `/bot run` | Allowed users | Mirror PR to GitLab and run the full unit-test pipeline |
+| `/bot run` | Allowed users | AI selects focused paths from the merged tree, then mirrors the PR and tests that pinned source/base combination |
+| `/bot run full` | Allowed users | Mirror PR to GitLab and run the full unit-test pipeline without AI selection |
 | `/bot run tests/<dir-or-file> [tests/...]` | Allowed users | Same pipeline, scoped to one or more paths under `tests/` (whitespace-separated). Invalid tokens are rejected and do not start a pipeline. Unit jobs collect those trees. Multi-GPU and multi-node jobs run only their hardcoded files that fall under the same paths, and skip (exit 0) before package setup when none overlap. |
 | `/bot status` | Allowed users | Check current pipeline status |
 | `/bot stop` | Allowed users | Cancel a running pipeline |

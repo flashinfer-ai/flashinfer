@@ -4,7 +4,7 @@
 #
 # Permission Control:
 # - Push to main: Always runs
-# - PRs: run only when the 'run-ci' label is applied, for every contributor.
+# - PRs: run when 'run-ci' or the bot's 'run-ci-focused' label is applied.
 #   Applying the label is the trigger, so new commits need a new trigger:
 #   @flashinfer-bot run.
 #
@@ -39,8 +39,8 @@ on:
 concurrency:
   # A label other than run-ci can never start tests, so it gets its own group and
   # does not cancel - otherwise label churn would discard running GPU jobs.
-  group: pr-test-${{ github.ref }}${{ (github.event.action == 'labeled' && github.event.label.name != 'run-ci') && '-noop' || '' }}
-  cancel-in-progress: ${{ !(github.event.action == 'labeled' && github.event.label.name != 'run-ci') }}
+  group: pr-test-${{ github.ref }}${{ (github.event.action == 'labeled' && github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-focused') && '-noop' || '' }}
+  cancel-in-progress: ${{ !(github.event.action == 'labeled' && github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-focused') }}
 
 permissions:
   contents: read
@@ -79,9 +79,9 @@ jobs:
           # Authorize on run-ci being applied, not on it being present: presence
           # would re-authorize every later push, which is the auto-trigger this
           # gate removes.
-          if [[ "$EVENT_ACTION" == "labeled" && "$LABEL_NAME" == "run-ci" ]]; then
+          if [[ "$EVENT_ACTION" == "labeled" && ( "$LABEL_NAME" == "run-ci" || "$LABEL_NAME" == "run-ci-focused" ) ]]; then
             echo "authorized=true" >> "$GITHUB_OUTPUT"
-            echo "run-ci label applied, authorized"
+            echo "$LABEL_NAME label applied, authorized"
             exit 0
           fi
 
@@ -103,11 +103,89 @@ jobs:
       test_count: ${{ steps.matrix.outputs.count }}
       # Surfaced so the required check can say a green result was scoped.
       test_scope: ${{ steps.scope.outputs.test_path }}
+      checkout_sha: ${{ steps.scope.outputs.checkout_sha || github.sha }}
+      snapshot_base: ${{ steps.scope.outputs.snapshot_base }}
+      snapshot_tree: ${{ steps.scope.outputs.snapshot_tree }}
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+
+      # Built here rather than written inline in the test job because the
+      # `@flashinfer-bot run <paths>` publishes the requested scope as a `ci/test-scope`
+      # commit status on this SHA (see ci-bot-commands.yml). Read it verbatim - the
+      # comment was parsed once, there, and nothing is re-parsed here.
+      #
+      # Statuses come back newest-first, so the newest for this context is the last
+      # command issued. No status means nobody asked for a scope: run the full suite.
+      # Because the status is keyed to the SHA, a scope cannot outlive the commit it was
+      # requested for.
+      - name: Read requested test scope
+        id: scope
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_SHA: ${{ github.sha }}
+          REQUIRE_SNAPSHOT: ${{ github.event.label.name == 'run-ci-focused' }}
+        run: |
+          # The combined endpoint (/status, not /statuses) returns one entry per
+          # context, already the latest. Using it means re-triggering overwrites
+          # cleanly without this step deduplicating by hand, and without depending on
+          # the raw list's ordering, which is not a documented guarantee.
+          STATUSES=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status")
+          SCOPE=$(jq -r '
+              .statuses
+              | map(select(.context | test("^ci/test-scope-[0-9]+$")))
+              | map({n: (.context | sub("^ci/test-scope-"; "") | tonumber),
+                     d: (.description // "")})
+              | sort_by(.n) | map(.d) | map(select(. != "")) | join(" ")' <<< "$STATUSES")
+          SNAPSHOT=$(jq -r '[.statuses[] | select(.context == "ci/test-snapshot")][0].description // ""' <<< "$STATUSES")
+          if [ "${REQUIRE_SNAPSHOT:-false}" = true ] && [ -z "$SNAPSHOT" ]; then
+            echo "::error::Automatic test snapshot was cleared or is missing. Issue a new bot run command."
+            exit 1
+          fi
+          if [ -n "$SNAPSHOT" ]; then
+            if [[ ! "$SNAPSHOT" =~ ^[0-9a-f]{40}\ [0-9a-f]{40}\ [0-9a-f]{40}\ [0-9a-f]{16}$ ]]; then
+              echo "::error::Invalid automatic test snapshot. Issue a new bot run command."
+              exit 1
+            fi
+            read -r SELECTED_BASE SELECTED_MERGE SELECTED_TREE SELECTED_SCOPE <<< "$SNAPSHOT"
+            ACTUAL_SCOPE=$(printf '%s' "$SCOPE" | sha256sum | cut -c1-16)
+            if [ -z "$SCOPE" ] || [ "$ACTUAL_SCOPE" != "$SELECTED_SCOPE" ]; then
+              echo "::error::The automatic scope does not match its snapshot. Issue a new bot run command."
+              exit 1
+            fi
+            # Reconstruct the selected source independently of GitHub's merge ref.
+            # No PR scripts, hooks, or submodule contents run during preparation.
+            for sha in "$SELECTED_BASE" "$HEAD_SHA"; do
+              git cat-file -e "${sha}^{commit}" 2>/dev/null || git fetch --no-tags origin "$sha"
+            done
+            git -c core.hooksPath=/dev/null checkout --detach "$SELECTED_BASE"
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+              git -c user.name=flashinfer-ci -c user.email=flashinfer-ci@nvidia.com \
+              -c core.hooksPath=/dev/null -c rerere.enabled=false \
+              merge --no-ff --no-edit "$HEAD_SHA"
+            ACTUAL_TREE=$(git rev-parse 'HEAD^{tree}')
+            if [ "$ACTUAL_TREE" != "$SELECTED_TREE" ]; then
+              echo "::error::Merged source differs from AI-selected tree. Issue a new bot run command."
+              exit 1
+            fi
+            echo "Verified AI-selected tree $ACTUAL_TREE (selection $SELECTED_MERGE)"
+            echo "checkout_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+            echo "snapshot_base=${SELECTED_BASE}" >> "$GITHUB_OUTPUT"
+            echo "snapshot_tree=${SELECTED_TREE}" >> "$GITHUB_OUTPUT"
+          else
+            echo "checkout_sha=${EVENT_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -z "$SCOPE" ]; then
+            echo "No requested scope for ${HEAD_SHA}; running the full suite"
+          else
+            echo "Requested scope: ${SCOPE}"
+          fi
+          echo "test_path=${SCOPE}" >> "$GITHUB_OUTPUT"
 
       - name: Validate CUDA configuration
         run: python3 ci/validate_cuda_versions.py
@@ -163,39 +241,6 @@ jobs:
           if [ "$SKIP" == "true" ]; then
             echo "::notice::Skipping build - only docs/config files changed"
           fi
-
-      # Built here rather than written inline in the test job because the
-      # `@flashinfer-bot run <paths>` publishes the requested scope as a `ci/test-scope`
-      # commit status on this SHA (see ci-bot-commands.yml). Read it verbatim - the
-      # comment was parsed once, there, and nothing is re-parsed here.
-      #
-      # Statuses come back newest-first, so the newest for this context is the last
-      # command issued. No status means nobody asked for a scope: run the full suite.
-      # Because the status is keyed to the SHA, a scope cannot outlive the commit it was
-      # requested for.
-      - name: Read requested test scope
-        id: scope
-        if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          # The combined endpoint (/status, not /statuses) returns one entry per
-          # context, already the latest. Using it means re-triggering overwrites
-          # cleanly without this step deduplicating by hand, and without depending on
-          # the raw list's ordering, which is not a documented guarantee.
-          SCOPE=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" --jq '
-              .statuses
-              | map(select(.context | test("^ci/test-scope-[0-9]+$")))
-              | map({n: (.context | sub("^ci/test-scope-"; "") | tonumber),
-                     d: (.description // "")})
-              | sort_by(.n) | map(.d) | map(select(. != "")) | join(" ")')
-          if [ -z "$SCOPE" ]; then
-            echo "No requested scope for ${HEAD_SHA}; running the full suite"
-          else
-            echo "Requested scope: ${SCOPE}"
-          fi
-          echo "test_path=${SCOPE}" >> "$GITHUB_OUTPUT"
 
       # skip_aot / skip_gpu dispatch inputs have to drop entries before the
       # matrix expands - a job-level `if` cannot see the matrix context, and
@@ -400,11 +445,32 @@ jobs:
 
       - uses: actions/checkout@v5
         with:
-          submodules: recursive
+          ref: ${{ needs.setup.outputs.checkout_sha }}
           # Self-hosted runners keep the workspace between jobs, so the token
           # must not be left behind in .git/config. Nothing here uses git after
-          # checkout, and submodules authenticate during the checkout itself.
+          # checkout. Submodules initialize after source snapshot verification.
           persist-credentials: false
+
+      - name: Prepare selected source and submodules
+        env:
+          SELECTED_BASE: ${{ needs.setup.outputs.snapshot_base }}
+          SELECTED_TREE: ${{ needs.setup.outputs.snapshot_tree }}
+        run: |
+          if [ -n "$SELECTED_BASE" ]; then
+            [[ "$SELECTED_BASE" =~ ^[0-9a-f]{40}$ && "$SELECTED_TREE" =~ ^[0-9a-f]{40}$ ]]
+            PINNED_HEAD=$(git rev-parse HEAD)
+            if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+              git fetch --no-tags --unshallow origin "$PINNED_HEAD" "$SELECTED_BASE"
+            fi
+            git cat-file -e "${SELECTED_BASE}^{commit}" 2>/dev/null || git fetch --no-tags origin "$SELECTED_BASE"
+            git -c core.hooksPath=/dev/null checkout --detach "$SELECTED_BASE"
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+              git -c user.name=flashinfer-ci -c user.email=flashinfer-ci@nvidia.com \
+              -c core.hooksPath=/dev/null -c rerere.enabled=false \
+              merge --no-ff --no-edit "$PINNED_HEAD"
+            [ "$(git rev-parse 'HEAD^{tree}')" = "$SELECTED_TREE" ]
+          fi
+          git submodule update --init --recursive
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -871,7 +937,7 @@ jobs:
           if [ -n "${TEST_SCOPE:-}" ]; then
             echo "> **Scoped run — NOT the full suite.**" >> $GITHUB_STEP_SUMMARY
             echo "> Tested only: \`${TEST_SCOPE}\`" >> $GITHUB_STEP_SUMMARY
-            echo "> Comment \`@flashinfer-bot run\` with no paths for full coverage." >> $GITHUB_STEP_SUMMARY
+            echo "> Comment \`@flashinfer-bot run full\` for full coverage." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
 

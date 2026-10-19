@@ -66,10 +66,12 @@ that shrinks re-publishes its leftover chunks as empty.
 reaches a shell, so "starts with `tests/` and has no `..`" is not sufficient — a legal
 filename can still carry shell metacharacters.
 
-**Existence is deliberately not checked.** The handler validates shape — charset, root,
-count — but not whether the paths exist. It cannot: the job holds a write token, so it does
-not check out the pull request, and it therefore has no files to look at. A well-formed path
-that does not exist is accepted and published.
+**Manual paths retain shape-only validation.** Explicit path requests validate charset,
+root and count, without an extra contents lookup. A well-formed manual path that does not
+exist is accepted and published. Automatic suggestions instead verify the pinned merged
+tree and inspect test blobs in an isolated temporary repository. Automatic preparation
+checks out source with hooks and external Git configuration disabled, without importing,
+executing, or collecting PR code. Manual validation needs no source checkout.
 
 The cost of that lands later and is not small. The lanes start, pull the image and install,
 and only then does the runner's selection check reject the path, failing every lane. The
@@ -114,3 +116,45 @@ driving must avoid reproducing the phrase.
 **A narrowed run is not a full run.** The GPU lanes change name and the summary states the
 scope, but the required check reports success either way. Green on a narrowed run means
 "what was asked for passed", not "everything passed".
+
+## Automatic scope selection for public bot runs
+
+The public `run` command with no arguments selects up to ten focused pytest
+paths using NVIDIA Inference Hub. `run full` explicitly requests the full suite;
+`run <paths>` retains the manual path validator and never calls a model. The
+selector is trusted default-branch code. It resolves the current target-branch tip,
+merges that pinned commit and PR head in an isolated temporary repository, and reads
+its immutable tree and blobs. It inspects current public CI routing. It never imports,
+executes or collects PR code; hooks and external Git configuration are disabled. It follows the Phase 3 priority of changed tests, tests of
+the changed behavior, then a small existing subsystem scope. Selection failures
+and uncertain/non-pytest changes stop before the `run-ci` label is applied.
+
+The selected paths still travel through the same `ci/test-scope-N` commit
+statuses and lane-intersection logic. Scope reads, publication, and clearing
+old trailing chunks must succeed before labeling, so an automatic request does
+not quietly become a full run or retain stale paths. The PR head and base are rechecked
+after selection; the current target tip is checked again before labeling. The parsed unfenced command is passed in
+a file rather than extracting arguments from the raw comment a second time.
+
+Automatic commands also publish `ci/test-snapshot` on the PR-head commit, with
+the base, merge and tree SHAs plus the first 16 hex digits of the scope's SHA-256,
+separated by spaces (139 characters). This marker
+is published after the scope chunks; explicit/full commands clear it. Automatic
+commands apply `run-ci-focused`; explicit/full and legacy label requests use
+`run-ci`. A focused label event requires snapshot metadata, so another command
+clearing it cannot silently substitute a full run. `pr-test.yml`
+verifies the scope fingerprint, rejects an empty automatic scope, reconstructs the
+selected base/head merge, and verifies the resulting tree before scheduling jobs.
+A stale GitHub merge ref or event base is not used as the source authority.
+GPU jobs check out the pinned head with complete history, reconstruct that same
+base/head merge, verify its tree, and only then initialize submodules. The local
+synthetic commit SHA is diagnostic; tree equality defines source identity because
+merge commit metadata may differ between machines. Interleaved scope/marker writes
+fail verification unless they describe a coherent selection. Actual merge conflicts
+and mismatched trees stop preparation.
+Direct label triggers and explicit/full commands retain the existing unpinned
+selection behavior; this does not prevent the base from advancing after tests finish.
+
+The inference key is an Actions secret available only to the authorized
+command step. Model and endpoint are repository variables; manual modes do not
+require inference configuration. See CONTRIBUTING.md for names and defaults.
