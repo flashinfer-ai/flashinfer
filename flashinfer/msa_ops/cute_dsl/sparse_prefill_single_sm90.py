@@ -32,6 +32,8 @@ QSC = 16.0  # Q prescale before fp8 quantization
 LOG2E = 1.4426950408889634
 KVBYTES = PG * D  # bytes of one fp8 (128,128) tile
 NKV = 64  # keys per PV sub-gemm (halves the converted-V buffer)
+F8_LO = -448.0  # e4m3 finite range; clamping maps NaN into it
+F8_HI = 448.0
 NEG = 1.0e30  # mask sentinel (finite: keeps the running max finite)
 OSTR = 136  # padded bf16 row stride of the smem epilogue buffer
 
@@ -106,14 +108,19 @@ class MsaSparseAttn:
             rw = idx % NKV
             cc = idx // NKV
             cute.autovec_copy(srcT[(None, None, None), (rw + h * NKV, cc, bv)], cv8)
-            cv16.store(cv8.load().to(f16))
+            # same reasoning as the transpose: a NaN V byte past seqused_k
+            # would reach the PV gemm, and the score mask cannot clear it.
+            # Element-wise because cute.arch.fmax takes scalars, not the
+            # TensorSSA a vector load returns.
+            for e in range(16):
+                xv = cutlass.Float32(cv8[0, e, 0])
+                cv16[0, e] = cute.arch.fmin(cute.arch.fmax(xv, F8_LO), F8_HI).to(f16)
             cute.autovec_copy(cv16, dstT[(None, None), (rw, cc)])
 
     # Part 2: mask + bounded direct-exp2 accumulation + PV GEMM.
     @cute.jit
     def _p2(
         self,
-        do_mask,
         j,
         pv_mma,
         meta,
@@ -139,13 +146,18 @@ class MsaSparseAttn:
         f16, f32 = self.f16, self.f32
 
         if warp == 0:
-            if do_mask:
-                klim = (qpos - meta[j] * PG - cbase).to(f32)
-                for e in cutlass.range_constexpr(64):
-                    coff = float(8 * (e // 4) + (e % 2))
-                    acc_s[e] = acc_s[e] + cute.arch.fmin(
-                        f32(0.0), (klim - coff) * f32(NEG)
-                    )
+            # Every block, not just the last one: the top-k list is ascending
+            # by contract, but a caller that lists the straddling block before
+            # a fully-visible one would leave it unmasked. The mask is already
+            # a no-op once klim >= coff, so this only costs the scalar ops.
+            klim = (qpos - meta[j] * PG - cbase).to(f32)
+            for e in cutlass.range_constexpr(64):
+                coff = float(8 * (e // 4) + (e % 2))
+                # A page's tail past seqused_k may be uninitialised, and
+                # NaN + -NEG is still NaN, so the additive mask alone leaks
+                # it. fmax(NaN, x) returns x (IEEE maxNum) and clears it.
+                acc_s[e] = cute.arch.fmax(f32(acc_s[e]), f32(-NEG))
+                acc_s[e] = acc_s[e] + cute.arch.fmin(f32(0.0), (klim - coff) * f32(NEG))
 
             nsoft = 2 if self.g == 16 else 1
             for i in cutlass.range_constexpr(nsoft):
@@ -475,7 +487,7 @@ class MsaSparseAttn:
                     tKVs[(None, 0)],
                     tma_bar_ptr=mbar + 0,
                 )
-            self._p2(False, j, *a2t, 1, *a2b)
+            self._p2(j, *a2t, 1, *a2b)
             if warp == 0:
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(mbar + 1, KVBYTES)
@@ -486,7 +498,7 @@ class MsaSparseAttn:
                     tma_bar_ptr=mbar + 1,
                 )
         self._p1(nblk - 1, qk_mma2, *a1)
-        self._p2(True, nblk - 1, *a2t, 1, *a2b)
+        self._p2(nblk - 1, *a2t, 1, *a2b)
 
         # ---- epilogue ----------------------------------------------------
         for i in cutlass.range_constexpr(2):
@@ -625,7 +637,11 @@ class VTranspose:
             kc = 4 * (cutlass.Int32(tidx) // D) + kci
             r0 = 32 * (kc // 2) + (kc % 2)
             for i in cutlass.range_constexpr(16):
-                vb[0, i] = sInC[r0 + 8 * (i % 4) + 2 * (i // 4)]
+                # The causal mask only sanitises SCORES; a NaN in V survives
+                # it because 0 * NaN = NaN in the PV matmul, so page bytes
+                # past seqused_k would poison the output. fmax(NaN, x) = x.
+                xv = cutlass.Float32(sInC[r0 + 8 * (i % 4) + 2 * (i // 4)])
+                vb[0, i] = cute.arch.fmin(cute.arch.fmax(xv, F8_LO), F8_HI).to(f8)
             cute.autovec_copy(vb, cute.make_tensor(sOut + d * SPAD + kc * 16, l16))
 
         cute.arch.sync_threads()
@@ -812,7 +828,11 @@ class MsaSparseAttnFp8:
             kc = 4 * (cutlass.Int32(tidx) // D) + kci
             r0 = 32 * (kc // 2) + (kc % 2)
             for i in cutlass.range_constexpr(16):
-                vb[0, i] = sInC[r0 + 8 * (i % 4) + 2 * (i // 4)]
+                # The causal mask only sanitises SCORES; a NaN in V survives
+                # it because 0 * NaN = NaN in the PV matmul, so page bytes
+                # past seqused_k would poison the output. fmax(NaN, x) = x.
+                xv = cutlass.Float32(sInC[r0 + 8 * (i % 4) + 2 * (i // 4)])
+                vb[0, i] = cute.arch.fmin(cute.arch.fmax(xv, F8_LO), F8_HI).to(f8)
             cute.autovec_copy(vb, cute.make_tensor(sOut + d * SPAD + kc * 16, l16))
 
         cute.arch.sync_threads()
@@ -993,8 +1013,8 @@ class MsaSparseAttnFp8:
             hkv,
         )
         for j in cutlass.range(nblk - 1, unroll=1):
-            _blk(False, True, j, qk_mma, *args)
-        _blk(True, False, nblk - 1, qk_mma2, *args)
+            _blk(True, j, qk_mma, *args)
+        _blk(False, nblk - 1, qk_mma2, *args)
 
         for i in cutlass.range_constexpr(2):
             l_i[i] = cute.arch.warp_reduction_sum(l_i[i], threads_in_group=4)
@@ -1028,7 +1048,6 @@ class MsaSparseAttnFp8:
 
 @cute.jit
 def _blk(
-    do_mask,
     refill,
     j,
     qk_mma,
@@ -1083,11 +1102,13 @@ def _blk(
     # Only warp 0 owns live rows, but both of its row bands must be converted:
     # the FP8 C->A register relabel consumes both even for GQA-8.
     if warp == 0:
-        if cutlass.const_expr(do_mask):
-            klim = (qpos - meta[j] * PG - cbase).to(f32)
-            for e in cutlass.range_constexpr(64):
-                coff = float(8 * (e // 4) + (e % 2))
-                acc_s[e] = acc_s[e] + cute.arch.fmin(f32(0.0), (klim - coff) * f32(NEG))
+        # see _p2: masked on every block, not just the last listed one
+        klim = (qpos - meta[j] * PG - cbase).to(f32)
+        for e in cutlass.range_constexpr(64):
+            coff = float(8 * (e // 4) + (e % 2))
+            # see _p2: clears a NaN read from the page tail
+            acc_s[e] = cute.arch.fmax(f32(acc_s[e]), f32(-NEG))
+            acc_s[e] = acc_s[e] + cute.arch.fmin(f32(0.0), (klim - coff) * f32(NEG))
 
         for i in cutlass.range_constexpr(2):
             rs = cute.make_tensor(

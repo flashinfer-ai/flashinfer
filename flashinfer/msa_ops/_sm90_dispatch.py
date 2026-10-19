@@ -567,6 +567,16 @@ def sparse_prefill_sm90(
         return out
 
     if int(page_table.shape[1]) > _MPG_UNION_MAX:
+        # The single-token copy-out moves g * (D // 8) vectors with one
+        # warpgroup, so g < 8 gives the loop zero iterations and never writes
+        # out. The union kernel sizes that loop by MMA_M, so it takes any g.
+        g = int(q.shape[1]) // int(k.shape[1])
+        if g not in (8, 16):
+            raise NotImplementedError(
+                f"SM90 MSA single-token prefill (page_table width "
+                f"{int(page_table.shape[1])} > {_MPG_UNION_MAX}) supports "
+                f"Hq/Hkv of 8 or 16, got {g}"
+            )
         from .cute_dsl.sparse_prefill_single_sm90 import run as _prefill
     else:
         from .cute_dsl.sparse_prefill_sm90 import run as _prefill

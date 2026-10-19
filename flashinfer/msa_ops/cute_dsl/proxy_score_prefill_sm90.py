@@ -121,6 +121,7 @@ def mma_epilogue(
     page: cutlass.Constexpr,
     total_q,
     do_mask: cutlass.Constexpr = True,
+    nvr=0,
 ):
     """Row-max epilogue: apply the mask if any, then reduce along N."""
     if cutlass.const_expr(do_mask):
@@ -147,7 +148,12 @@ def mma_epilogue(
             cute.make_layout(128),
         )
         for i in cutlass.range_constexpr(n_rows):
-            gO[rows[i]] = s_max[i]
+            # m0 is pulled back so the tile fits inside the sequence only when
+            # sqb >= blk_m. A shorter sequence leaves rows [nvr, blk_m) with no
+            # query behind them; storing those walks into the next KV tile's
+            # slice of this head.
+            if rows[i] < nvr:
+                gO[rows[i]] = s_max[i]
 
 
 class MsaProxyScore:
@@ -372,6 +378,12 @@ class MsaProxyScore:
 
         nb = (sk + (self.page - 1)) // self.page
 
+        # rows of this tile that actually have a query behind them
+        nvr = sqb - m0
+        if nvr > self.blk_m:
+            nvr = cutlass.Int32(self.blk_m)
+        if nvr < 0:
+            nvr = cutlass.Int32(0)
         qmax = m0 + self.blk_m - 1
         if qmax > sqb - 1:
             qmax = sqb - 1
@@ -619,6 +631,7 @@ class MsaProxyScore:
                         self.page,
                         total_q,
                         False,
+                        nvr=nvr,
                     )
                     t1 = t0 + nkchunk
                     k1 = t1 * self.page
@@ -647,6 +660,7 @@ class MsaProxyScore:
                         self.page,
                         total_q,
                         False,
+                        nvr=nvr,
                     )
 
                 for j in cutlass.range(npair_safe, npair, unroll=1):
@@ -677,6 +691,7 @@ class MsaProxyScore:
                         sk - k0 - 1,
                         self.page,
                         total_q,
+                        nvr=nvr,
                     )
                     t1 = t0 + nkchunk
                     k1 = t1 * self.page
@@ -704,6 +719,7 @@ class MsaProxyScore:
                         sk - k1 - 1,
                         self.page,
                         total_q,
+                        nvr=nvr,
                     )
 
                 tt = byy + 2 * npair * nkchunk
@@ -733,6 +749,7 @@ class MsaProxyScore:
                         sk - kt - 1,
                         self.page,
                         total_q,
+                        nvr=nvr,
                     )
                     tt2 = tt + nkchunk
                     kt2 = tt2 * self.page
@@ -757,6 +774,7 @@ class MsaProxyScore:
                         sk - kt2 - 1,
                         self.page,
                         total_q,
+                        nvr=nvr,
                     )
                 else:
                     cute.nvgpu.warpgroup.wait_group(0)
@@ -780,12 +798,13 @@ class MsaProxyScore:
                         sk - kt - 1,
                         self.page,
                         total_q,
+                        nvr=nvr,
                     )
 
             # ---- -inf tail (blocks past the sequence / fully masked) ----
             for it in cutlass.range(n_dead, unroll=1):
                 t = t_lim + byy + it * nkchunk
-                if tidx < self.blk_m:
+                if tidx < nvr:
                     gO = cute.make_tensor(
                         mO.iterator + (o_row_base + t * total_q),
                         cute.make_layout(self.blk_m),
@@ -911,7 +930,11 @@ def run(
     # Derived inside the kernel object while shapes were static; with dynamic
     # shapes these are the only compile-time selections left, so the driver
     # computes them and they alone key the cache.
-    use_tma_q = sq_max % 128 == 0 and total_q % batch_size == 0
+    # total_q % batch_size == 0 does not mean the lengths are uniform: a
+    # ragged batch can divide evenly and still have no sequence of sq_max.
+    # The TMA-Q path indexes a (128, d, qblocks, hq) view that assumes every
+    # sequence contributes sq_max rows, so require that exactly.
+    use_tma_q = sq_max % 128 == 0 and batch_size * sq_max == total_q
     fold = 1 if n_mtiles * 16 >= nkt else 0
 
     key = (hq, k.shape[2], k.shape[3], use_tma_q, fold, use_fp32_acc)
