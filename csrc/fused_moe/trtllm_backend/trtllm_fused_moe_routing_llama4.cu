@@ -111,7 +111,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     // if we use `mPtrScores` as input, we need to perform the top-1 reduction
     // for each token, we load the scores then use `reduceTopK` for this.
     // each thread works on 4 experts, so a local reduction is done before
-    for (int tokenIdx = 0; tokenIdx < params.mNumTokens; ++tokenIdx) {
+    for (int tokenIdx = 0; tokenIdx < routingActiveTokenCount(params); ++tokenIdx) {
       auto scoreOffset = tokenIdx * params.mNumExperts;
       int32_t warpMaxExpertIdx[MaxNumTopExperts];
       InputT warpMaxScore[MaxNumTopExperts];
@@ -145,12 +145,12 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     static_assert(WarpKernelMaxNumTokens <= WarpSize);
     TypePacked scoreIdx = TypePacked{};
     if (params.mPtrTopKIds != nullptr) {
-      if (threadIdx.x < params.mNumTokens) {
+      if (threadIdx.x < routingActiveTokenCount(params)) {
         scoreIdx = TypePacked{static_cast<OutputT>(params.mPtrTopKWeights[threadIdx.x]),
                               static_cast<int16_t>(params.mPtrTopKIds[threadIdx.x])};
       }
     } else {
-      if (threadIdx.x < params.mNumTokens) {
+      if (threadIdx.x < routingActiveTokenCount(params)) {
         scoreIdx = TypePacked{static_cast<OutputT>(params.mPtrTopKPacked[threadIdx.x].score),
                               static_cast<int16_t>(params.mPtrTopKPacked[threadIdx.x].idx)};
         if (params.mPtrTopKWeights != nullptr) {
@@ -163,7 +163,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
 
     int32_t expertTokenCount = 0;
     setBits</* IsZero= */ true>(expertTokenCount, 1, scoreIdx.idx % ExpertsPerThread);
-    if (threadIdx.x < params.mNumTokens) {
+    if (threadIdx.x < routingActiveTokenCount(params)) {
       smemExpertTokenCountFull[threadIdx.x][scoreIdx.idx / ExpertsPerThread] = expertTokenCount;
       if (params.mPtrRoutingReplayOut != nullptr) {
         params.mPtrRoutingReplayOut[threadIdx.x] = scoreIdx.idx;
@@ -181,10 +181,11 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
   int32_t expertOffset[WarpKernelMaxNumTokens + 1];
 #pragma unroll
   for (int tokenIdx = 0; tokenIdx < WarpKernelMaxNumTokens + 1; ++tokenIdx) {
-    if (tokenIdx > params.mNumTokens) break;
+    if (tokenIdx > routingActiveTokenCount(params)) break;
     // simple reduction for `expertCount`, and scan for `expertOffset`
-    auto expertTokenCount =
-        tokenIdx < params.mNumTokens ? smemExpertTokenCountFull[tokenIdx][threadIdx.x] : 0;
+    auto expertTokenCount = tokenIdx < routingActiveTokenCount(params)
+                                ? smemExpertTokenCountFull[tokenIdx][threadIdx.x]
+                                : 0;
     expertOffset[tokenIdx] = expertCount;
     expertCount += expertTokenCount;
   }
@@ -296,7 +297,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     // based on whether the offset for that token changed.
     // we can then easily compute the final `expertIdx` and `permutedIdx` relative
     // to this token and expert, and write them out.
-    if (tokenIdx >= params.mNumTokens) break;
+    if (tokenIdx >= routingActiveTokenCount(params)) break;
 
 #pragma unroll
     for (int ii = 0; ii < ExpertsPerThread; ++ii) {
@@ -351,7 +352,7 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
   // TODO(mjoux): expand to more tokens (possibly)
   auto warpTokenIdx = clusterBlockRank * NumWarps + warpIdx;
   auto scoreOffset = warpTokenIdx * params.mNumExperts;
-  bool validToken = warpTokenIdx < params.mNumTokens;
+  bool validToken = warpTokenIdx < routingActiveTokenCount(params);
   InputT minScore = InputT{-INFINITY};
 
   auto block = cg::this_thread_block();
@@ -453,7 +454,8 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
 
   // in this case, each warp represents a token, and we use a grid-stride loop
   // over all warps/tokens
-  for (int tokenIdx = globalWarpIdx; tokenIdx < params.mNumTokens; tokenIdx += globalWarpStride) {
+  for (int tokenIdx = globalWarpIdx; tokenIdx < routingActiveTokenCount(params);
+       tokenIdx += globalWarpStride) {
     auto scoreOffset = tokenIdx * params.mNumExperts;
     int32_t warpMaxExpertIdx[MaxNumTopExperts];
     InputT warpMaxScore[MaxNumTopExperts];

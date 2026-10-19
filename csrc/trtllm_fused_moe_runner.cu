@@ -515,6 +515,7 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
       args.intermediate_size * (isGatedActivation(args.activation_type) ? 2 : 1);
   activationData.topK = totalExpertsPerToken;
   activationData.numTokens = args.num_tokens;
+  activationData.numActiveTokensPtr = args.num_active_tokens_ptr;
   activationData.expandedIdxToPermutedIdx = workspace.expanded_idx_to_permuted_idx;
 
   activationData.totalNumPaddedTokens = workspace.total_num_padded_tokens;
@@ -531,6 +532,8 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
   if (args.do_finalize) {
     // Setup finalize data
     finalizeData.mDtypeElt = args.mDtypeOut;
+    finalizeData.mDtypeOut = args.mDtypeFinalizeOut;
+    finalizeData.numActiveTokensPtr = args.num_active_tokens_ptr;
     finalizeData.mDtypeExpW = args.mDtypeExpW;
     finalizeData.mUsePdl = enablePdl;
     finalizeData.mUseDeepSeekFp8 = false;

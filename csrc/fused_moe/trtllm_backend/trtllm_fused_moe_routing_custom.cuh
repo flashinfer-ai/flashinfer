@@ -89,7 +89,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
   int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
   int32_t const laneIdx = cutlass::arch::LaneId();
   auto scoreOffset = warpIdx * params.mNumExperts;
-  bool validToken = warpIdx < params.mNumTokens;
+  bool validToken = warpIdx < routingActiveTokenCount(params);
 
   static constexpr int VecSize = KernelParams::MaxNumExperts / WarpSize;
   static constexpr int totalExpertCounts = BlockKernelMaxNumTokens * MaxNumExperts;
@@ -283,7 +283,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
     params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
   }
 
-  for (int tokenIdx = 0; tokenIdx < params.mNumTokens; tokenIdx++) {
+  for (int tokenIdx = 0; tokenIdx < routingActiveTokenCount(params); tokenIdx++) {
 #pragma unroll
     for (int e = 0; e < ExpertsPerThread; e++) {
       int expert = threadIdx.x * ExpertsPerThread + e;
@@ -423,7 +423,7 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
   int32_t const numWarps = blockDim.x / WarpSize;
 
   extern __shared__ char dynSmem[];
-  int const numSlots = params.mNumTokens * MaxNumExperts;
+  int const numSlots = routingActiveTokenCount(params) * MaxNumExperts;
   int8_t* smemKIdx = reinterpret_cast<int8_t*>(dynSmem);
   int16_t* smemOffset = reinterpret_cast<int16_t*>(dynSmem + numSlots);
   char* warpBase = dynSmem + numSlots + numSlots * 2;
@@ -446,7 +446,7 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
 #endif
 
   // Phase 1: TopK — one warp per token (loop when numTokens > numWarps)
-  for (int tokenIdx = warpIdx; tokenIdx < params.mNumTokens; tokenIdx += numWarps) {
+  for (int tokenIdx = warpIdx; tokenIdx < routingActiveTokenCount(params); tokenIdx += numWarps) {
     if (params.mPtrTopKIds != nullptr) {
       if (laneIdx < params.mTopK) {
         auto const expandedIdx = tokenIdx * params.mTopK + laneIdx;
@@ -514,7 +514,7 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
       accExpertCount[e] = 0;
       if (isLocal) {
         int offset = expert;
-        for (int j = 0; j < params.mNumTokens; j++) {
+        for (int j = 0; j < routingActiveTokenCount(params); j++) {
           if (smemKIdx[offset] >= 0) {
             smemOffset[offset] = static_cast<int16_t>(accExpertCount[e]);
             accExpertCount[e]++;
@@ -619,7 +619,7 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
 
   // Phase 5: Permutation
   if (threadIdx.x < NumThreadsExperts) {
-    for (int tokenIdx = 0; tokenIdx < params.mNumTokens; tokenIdx++) {
+    for (int tokenIdx = 0; tokenIdx < routingActiveTokenCount(params); tokenIdx++) {
 #pragma unroll
       for (int e = 0; e < ExpertsPerThread; e++) {
         int expert = threadIdx.x * ExpertsPerThread + e;
@@ -740,7 +740,7 @@ __device__ __forceinline__ void routingIndicesClusterKernelBody(
   int32_t const laneIdx = cutlass::arch::LaneId();
   auto warpTokenIdx = clusterBlockRank * ClusterNumWarps + warpIdx;
   auto scoreOffset = warpTokenIdx * params.mNumExperts;
-  bool validToken = warpTokenIdx < params.mNumTokens;
+  bool validToken = warpTokenIdx < routingActiveTokenCount(params);
   auto block = cg::this_thread_block();
   auto warp = cg::tiled_partition<WarpSize>(block);
 
@@ -1035,7 +1035,8 @@ __global__ void __launch_bounds__(
 
   // in this case, each warp represents a token, and we use a grid-stride loop
   // over all warps/tokens
-  for (int tokenIdx = globalWarpIdx; tokenIdx < params.mNumTokens; tokenIdx += globalWarpStride) {
+  for (int tokenIdx = globalWarpIdx; tokenIdx < routingActiveTokenCount(params);
+       tokenIdx += globalWarpStride) {
     auto scoreOffset = tokenIdx * params.mNumExperts;
 
     BaseType laneTopKScore;

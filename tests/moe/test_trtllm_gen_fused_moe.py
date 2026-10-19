@@ -3998,3 +3998,103 @@ def test_moe_lora_delta(
     assert (real_reference - zero_reference).abs().max().item() > 0.05
     # Kernel matches the dequant reference (delta injected on both sides).
     check_accuracy(real_reference, real_actual, **moe_impl.get_tolerances())
+
+
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
+def test_fp8_block_scale_routed_num_active_tokens(output_dtype):
+    """Routed MXFP8 MoE with a device token count: rows at or beyond it carry stale local ids and
+    must be ignored and left untouched; the live rows match the unbounded call; fp32 output is the
+    bf16 result converted on the finalize store."""
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda:0")
+    num_tokens, num_active = 64, 40
+    hidden_size, intermediate_size, num_experts, top_k = 512, 512, 64, 8
+    local_expert_offset, local_num_experts = 16, 16
+    activation_type = ActivationType.Relu2.value
+    fp8_quantization_type = Fp8QuantizationType.MxFp8
+
+    routing_logits = torch.randn((num_tokens, num_experts), device=device).to(
+        torch.bfloat16
+    )
+    hidden_states = torch.randn((num_tokens, hidden_size), device=device).to(
+        torch.bfloat16
+    )
+    gemm1_weights = torch.randn(
+        (num_experts, intermediate_size, hidden_size),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    gemm2_weights = torch.randn(
+        (num_experts, hidden_size, intermediate_size),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    quant_impl = FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8)
+    quant_weights = quant_impl.quantize_weights(
+        gemm1_weights, gemm2_weights, hidden_states
+    )
+    quant_inputs = quant_impl.quantize_inputs(hidden_states)
+    permute_info, expert_weights_full = routing_reference_renormalize(
+        routing_logits, top_k, num_experts, 8
+    )
+    topk_ids = permute_info["topKIndices"].to(torch.int32)
+    expert_weights = expert_weights_full.view(num_tokens, num_experts)[
+        torch.arange(num_tokens, device=device).unsqueeze(1), topk_ids
+    ].to(torch.bfloat16)
+    # Stale rows beyond the live prefix route to local experts; they must not be read.
+    topk_ids[num_active:] = local_expert_offset
+    packed_topk_ids = pack_topk_for_routed_moe(topk_ids, expert_weights)
+
+    local_slice = slice(local_expert_offset, local_expert_offset + local_num_experts)
+    common = dict(
+        routing_bias=None,
+        gemm1_weights=quant_weights["gemm1_weights"][local_slice].contiguous(),
+        gemm1_weights_scale=quant_weights["gemm1_scales"][local_slice].contiguous(),
+        gemm2_weights=quant_weights["gemm2_weights"][local_slice].contiguous(),
+        gemm2_weights_scale=quant_weights["gemm2_scales"][local_slice].contiguous(),
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=RoutingMethodType.Renormalize.value,
+        use_shuffled_weight=True,
+        weight_layout=WeightLayout.MajorK.value,
+        enable_pdl=True,
+        fp8_quantization_type=fp8_quantization_type,
+        activation_type=activation_type,
+    )
+    reference = trtllm_fp8_block_scale_routed_moe(
+        topk_ids=packed_topk_ids[:num_active].contiguous(),
+        hidden_states=quant_inputs["hidden_states"][:num_active].contiguous(),
+        hidden_states_scale=quant_inputs["hidden_states_scale"][
+            :num_active
+        ].contiguous(),
+        **common,
+    ).to(torch.float)
+
+    output = torch.full(
+        (num_tokens, hidden_size), 7.0, dtype=output_dtype, device=device
+    )
+    num_active_tokens = torch.tensor([num_active], dtype=torch.int32, device=device)
+    result = trtllm_fp8_block_scale_routed_moe(
+        topk_ids=packed_topk_ids,
+        hidden_states=quant_inputs["hidden_states"],
+        hidden_states_scale=quant_inputs["hidden_states_scale"],
+        output=output,
+        num_active_tokens=num_active_tokens,
+        **common,
+    )
+    assert result is output
+    live = output[:num_active].to(torch.bfloat16).to(torch.float)
+    close = torch.isclose(reference, live, atol=1e-2, rtol=1e-2)
+    mismatch_pct = (~close).float().mean().item() * 100
+    assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
+    assert torch.equal(output[num_active:], torch.full_like(output[num_active:], 7.0))
