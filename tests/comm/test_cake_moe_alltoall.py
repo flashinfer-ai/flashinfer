@@ -1758,10 +1758,11 @@ def test_moe_workspace_size_per_rank():
     )
 
     assert empty_workspace_size > 0
-    assert (
-        empty_workspace_size
-        == cake_kernels.current_module().moe_a2a_get_aux_data_size(ep_size, num_tokens)
+    aux_data_size = cake_kernels.current_module().moe_a2a_get_aux_data_size(
+        ep_size, num_tokens, 0
     )
+    # Each workspace region is padded to 128 bytes.
+    assert empty_workspace_size == (aux_data_size + 127) // 128 * 128
 
     non_empty_workspace_size = cake_kernels.workspace_size_per_rank(
         ep_size, num_tokens, hidden_size, hidden_size
