@@ -24,7 +24,7 @@ import torch
 
 from flashinfer.utils import ceil_div
 
-from ..sage import (
+from ..sage.config import (
     SageAttentionConfig,
     sage_scale_shapes,
     _validate_int8_qk_device,
@@ -39,7 +39,7 @@ from .config import (
     _BlockSparseStaticProfile,
     _resolve_block_sparse_launch_spec,
 )
-from ..sage import _SageScaleLayout
+from ..sage.layout import _SageScaleLayout
 from .prepared import _BlockSparseRouteLayout
 
 _P = ParamSpec("_P")

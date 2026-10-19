@@ -50,16 +50,15 @@ import torch
 
 from flashinfer.api_logging import flashinfer_experimental_api
 
-from .sage import (
+from .sage.config import (
     SAGE_K_BLOCK_SIZES,
     SageAttentionConfig,
     SageAttentionParams,
-    _SAGE_ATOM_TOKENS,
-    _SageScaleLayout,
     sage_scale_shapes,
     validate_sage_params,
     _validate_int8_qk_device,
 )
+from .sage.layout import _SAGE_ATOM_TOKENS, _SageScaleLayout
 
 
 if TYPE_CHECKING:
@@ -1816,7 +1815,7 @@ def _get_compiled_sage_prepare(
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda_drv
 
-    from .kernels.fmha_decode.sage_prepare import _PrepareSageScales
+    from .sage.prepare import _PrepareSageScales
 
     prepare = _PrepareSageScales(layout=layout, num_kv_heads=num_kv_heads)
 

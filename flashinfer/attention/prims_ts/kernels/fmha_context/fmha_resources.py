@@ -88,14 +88,14 @@ from cutlass.cutlass_dsl import Boolean, Constexpr, dsl_user_op, if_generate
 
 from ..placeholder_helpers import _placeholder_smem_array, _placeholder_tmem_ptr
 from ..tcgen05_compat import tcgen05_ld_32x32b_max
-from ..int32_scores import (
+from ...sage.int32_scores import (
     INT32_SCORE_BIAS,
     fill_score_seed_tile,
     issue_score_seed_mma,
     score_seed_tile_bytes,
     score_seed_words,
 )
-from ...sage import _FLOAT4_WORDS, _SageScaleLayout
+from ...sage.layout import _FLOAT4_WORDS, _SageScaleLayout
 from .helpers import (
     bottom_right_window_left_bound,
     bottom_right_window_tile_start,

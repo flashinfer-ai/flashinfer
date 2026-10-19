@@ -21,7 +21,7 @@ import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Int32, Uint32
 from cutlass.experimental import primitives as prims
 
-from .tcgen05_compat import tcgen05_mma_ws
+from ..kernels.tcgen05_compat import tcgen05_mma_ws
 
 INT32_SCORE_BIAS = 12582912.0
 INT32_SCORE_SEED_MMA_K = 16

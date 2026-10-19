@@ -24,14 +24,14 @@ from flashinfer.utils import ceil_div
 
 from ..decode import _cutlass_dtype, _dtype_key, _validate_mask, _validate_positive_int
 from ..kernels.fmha_decode.fmha_decode_constants import SOFTMAX_RESCALE_THRESHOLD_LOG2
-from ..sage import SageAttentionConfig
+from ..sage.config import SageAttentionConfig
 from .common import (
     _PREPARED_KV_ROUTE_SIZE,
     _SIGNED_INT32_MAX,
     _select_block_sparse_q_tile_size,
     _validate_sparse_kv_block_size,
 )
-from ..sage import _SageScaleLayout
+from ..sage.layout import _SageScaleLayout
 from .prepared import _BlockSparseRouteLayout
 
 if TYPE_CHECKING:

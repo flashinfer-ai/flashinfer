@@ -82,7 +82,7 @@ from .decode import (
     _validate_runtime_device,
 )
 from .kernels.fmha_decode.fmha_decode_constants import SOFTMAX_RESCALE_THRESHOLD_LOG2
-from .sage import SageAttentionConfig, SageAttentionParams
+from .sage.config import SageAttentionConfig, SageAttentionParams
 
 
 class _BlockSparseWrapperBase:

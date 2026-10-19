@@ -28,14 +28,14 @@ import math
 import cutlass.utils as utils
 from cutlass import BFloat16, Float16, Float32, Float4E2M1FN, Float8E4M3FN, Int8
 
-from ...sage import SAGE_K_BLOCK_SIZES, is_power_of_two
+from ...sage.config import SAGE_K_BLOCK_SIZES, is_power_of_two
 from ..._block_sparse.common import (
     _block_sparse_kv_atom_size,
     _block_sparse_proxy_summary_geometry,
     _select_block_sparse_q_tile_size,
     _validate_sparse_kv_block_size,
 )
-from ...sage import _SAGE_ATOM_MIN_WORDS, _SAGE_ATOM_TOKENS, _SageScaleLayout
+from ...sage.layout import _SAGE_ATOM_MIN_WORDS, _SAGE_ATOM_TOKENS, _SageScaleLayout
 from ...split_kv_mode_policy import select_split_kv_modes
 from ..tcgen05_compat import ldtm_stat_supported
 from .fmha_decode_constants import (

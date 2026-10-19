@@ -24,7 +24,7 @@ import torch
 from flashinfer.utils import ceil_div
 
 from .common import _num_sparse_pattern_heads
-from ..sage import sage_adapter_slots, sage_scale_shapes
+from ..sage.config import sage_adapter_slots, sage_scale_shapes
 from .config import _BlockSparseCompileKey, _make_block_sparse_config
 
 
@@ -59,7 +59,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         fmha_block_sparse_launch,
         fmha_decode_launch,
     )
-    from ..kernels.fmha_decode.sage_prepare import _PrepareSageScales
+    from ..sage.prepare import _PrepareSageScales
 
     config = _make_block_sparse_config(key)
     sparse_format = key.sparse_format

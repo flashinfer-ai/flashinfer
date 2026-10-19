@@ -40,7 +40,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64
 
-from ...sage import _FLOAT4_WORDS, _SAGE_ATOM_TOKENS, _SageScaleLayout
+from ...sage.layout import _FLOAT4_WORDS, _SAGE_ATOM_TOKENS, _SageScaleLayout
 
 Constexpr = cutlass.Constexpr
 

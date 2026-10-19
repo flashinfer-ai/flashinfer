@@ -183,7 +183,7 @@ from .fmha_resources import (
     TmemPPrefixReadyResource,
 )
 from .sage_scales import validate_context_sage_layout
-from ...sage import _SageScaleLayout
+from ...sage.layout import _SageScaleLayout
 from .fmha_tasks import (
     PackedContextWorkQueue,
     create_correction_task,

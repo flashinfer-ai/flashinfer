@@ -36,7 +36,7 @@ from flashinfer.attention.prims_ts import (
     block_sparse_attention,
 )
 from flashinfer.attention.prims_ts._block_sparse import config as sparse_config
-from flashinfer.attention.prims_ts.sage import _INT8_QK_COMPUTE_CAPABILITIES
+from flashinfer.attention.prims_ts.sage.config import _INT8_QK_COMPUTE_CAPABILITIES
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_constants import (
     E4M3_MAX,
     SOFTMAX_RESCALE_THRESHOLD_LOG2,

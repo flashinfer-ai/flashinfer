@@ -42,7 +42,7 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from ..fmha_decode_config import FmhaDecodeConfig
-from ...int32_scores import INT32_SCORE_BIAS
+from ....sage.int32_scores import INT32_SCORE_BIAS
 from ...placeholder_helpers import _placeholder_smem_array
 from .helpers_common import (
     _route_is_proxy,

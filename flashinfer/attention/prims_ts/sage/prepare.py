@@ -32,15 +32,15 @@ from cuda.bindings import driver as cuda_drv
 
 from flashinfer.utils import ceil_div
 
-from ...sage import (
+from .config import log2_block_size
+from .index import load_flat_scale
+from .layout import (
     _FLOAT4_WORDS,
     _SAGE_ATOM_TOKENS,
     _SageKSection,
     _SageQSection,
     _SageScaleLayout,
-    log2_block_size,
 )
-from .fmha_decode_resources.sage_scales import load_flat_scale
 
 _THREADS_PER_CTA = 128
 

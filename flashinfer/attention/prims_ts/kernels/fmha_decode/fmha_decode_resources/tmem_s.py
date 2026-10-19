@@ -43,7 +43,7 @@ from cutlass.experimental.task_scheduling.resources import (
 
 from ...._block_sparse.prepared import _PREPARED_ROUTE_IS_FULL_FLAG
 from ..fmha_decode_config import CAUSAL, FmhaDecodeConfig
-from ...int32_scores import (
+from ....sage.int32_scores import (
     INT32_SCORE_BIAS,
     fill_score_seed_tile,
     issue_score_seed_mma,
