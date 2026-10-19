@@ -522,6 +522,45 @@ def test_misaligned_layouts_are_materialized(
 
 
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES)
+def test_half_vector_aligned_weight_is_materialized(hidden: int) -> None:
+    """A contiguous ``w`` whose storage base is 16 bytes past a 32-byte boundary.
+
+    The backward kernels load the weight with 16-byte vectors and read this view
+    in place; the forward kernels load it with 32-byte vectors, so the forward
+    must copy it (an in-place read would be a misaligned vector load).  Both
+    match the FP64 reference and the aligned weight's results bitwise.
+    """
+
+    _skip_unless_hidden(hidden)
+    eps = EPS[hidden]
+    rows = 129
+    generator = _generator(hidden, rows, 47)
+    x = _rows(rows, hidden, generator=generator)
+    w_aligned = _weight(hidden, generator)
+    storage = torch.empty(hidden + 16, dtype=torch.bfloat16, device=_device())
+    offset = ((16 - storage.data_ptr() % 32) % 32) // storage.element_size()
+    w = storage[offset : offset + hidden]
+    w.copy_(w_aligned)
+    assert w.is_contiguous() and w.data_ptr() % 32 == 16, "test layout"
+    label = f"hidden={hidden} 16-byte aligned w"
+
+    y, rstd = cake_rmsnorm_train_forward(x, w, eps)
+    y_ref, rstd_ref, _ = _reference_forward(x, w, eps)
+    _assert_bf16_close(y, y_ref, f"y {label}")
+    assert _rel_l2(rstd, rstd_ref) <= RSTD_REL_L2, f"rstd {label}"
+    y_aligned, rstd_aligned = cake_rmsnorm_train_forward(x, w_aligned, eps)
+    assert torch.equal(y, y_aligned) and torch.equal(rstd, rstd_aligned), label
+
+    g = _rows(rows, hidden, generator=generator)
+    dx, dw = cake_rmsnorm_train_backward(g, x, w, rstd)
+    dx_ref, dw_ref = _reference_backward(g, x, w, eps)
+    _assert_bf16_close(dx, dx_ref, f"dx {label}")
+    _assert_dw(dw, dw_ref, g, x, rstd, f"dw {label}")
+    dx_aligned, dw_aligned = cake_rmsnorm_train_backward(g, x, w_aligned, rstd)
+    assert torch.equal(dx, dx_aligned) and torch.equal(dw, dw_aligned), label
+
+
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES)
 def test_zero_rows(hidden: int) -> None:
     _skip_unless_hidden(hidden)
     generator = _generator(hidden, 0)

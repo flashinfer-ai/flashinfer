@@ -332,7 +332,8 @@ def cake_rmsnorm_train_forward(
         ``residual`` this is the residual stream ``h`` and the normalized value is
         ``h_new = BF16(h + residual)``.
     w : torch.Tensor
-        BF16 ``[H]`` weight (copied when not contiguous).
+        BF16 ``[H]`` weight, read in place when contiguous and 32-byte aligned
+        (the forward kernels load it with 32-byte vectors), else copied once.
     eps : float
         Variance epsilon (FP32 inside the kernel).
     residual : torch.Tensor, optional
@@ -372,7 +373,7 @@ def cake_rmsnorm_train_forward(
         shape=(hidden,),
         device=device,
         dtype=torch.bfloat16,
-        alignment=BACKWARD_ALIGNMENT_BYTES,
+        alignment=align,
     )
     if has_residual:
         residual = _kernel_input(
@@ -474,7 +475,8 @@ def cake_rmsnorm_train_backward(
         The BF16 ``[T, H]`` tensor that was normalized (``x`` of the plain
         forward, ``h_new`` of the residual forward); same layout rules as ``g``.
     w : torch.Tensor
-        BF16 ``[H]`` weight (copied when not contiguous).
+        BF16 ``[H]`` weight, read in place when contiguous and 16-byte aligned,
+        else copied once.
     rstd : torch.Tensor
         FP32 ``[T]`` reciprocal RMS returned by the forward.
     deterministic : bool
