@@ -29,6 +29,19 @@ import torch
 _PROPERTY_SLOTS = 8
 
 
+def _group_alive(group: Any) -> bool:
+    """Whether ``group`` (``None`` = the default group) is still registered with torch."""
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        return False
+    try:
+        dist.get_rank(group)
+    except (RuntimeError, ValueError):  # destroyed by dist.destroy_process_group(group)
+        return False
+    return True
+
+
 class TransportSession:
     def __init__(
         self,
@@ -145,10 +158,18 @@ class TransportSession:
         stream.synchronize()
 
     def close(self) -> None:
-        """Collective teardown; synchronizes the whole device (not for a serving path)."""
+        """Collective teardown; synchronizes the whole device (not for a serving path).
+
+        After the EP process group is destroyed its NCCL communicator is gone, so the
+        windows cannot be deregistered any more: the session is then only marked closed
+        and its memory is reclaimed at process exit.
+        """
         import torch.distributed as dist
 
         if self.closed:
+            return
+        if not _group_alive(self.group):
+            self.closed = True
             return
         dist.barrier(group=self.group)
         self.module.transport_session_close(self.handle)

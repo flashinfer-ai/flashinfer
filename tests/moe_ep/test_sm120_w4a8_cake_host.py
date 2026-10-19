@@ -999,6 +999,43 @@ def test_rows_residency_grid_needs_no_routing_and_stays_in_the_valid_range() -> 
                 )
 
 
+def test_transport_session_close_after_process_group_destroyed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the EP process group gone, close() must not run collectives or touch NCCL."""
+    import torch.distributed as dist
+    from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_session import (
+        TransportSession,
+    )
+
+    closed_handles: list[int] = []
+
+    class _Module:
+        def transport_session_close(self, handle: int) -> None:
+            closed_handles.append(handle)
+
+    def unexpected_barrier(*args, **kwargs) -> None:
+        raise AssertionError("close() ran a collective on a destroyed process group")
+
+    def destroyed_group(group=None) -> int:
+        raise ValueError("Group is not registered")
+
+    monkeypatch.setattr(dist, "barrier", unexpected_barrier)
+    for initialized in (False, True):  # default group destroyed / EP subgroup destroyed
+        monkeypatch.setattr(dist, "is_initialized", lambda: initialized)
+        monkeypatch.setattr(dist, "get_rank", destroyed_group)
+        session = TransportSession.__new__(TransportSession)
+        session.module, session.group, session.handle, session.closed = (
+            _Module(),
+            object(),
+            7,
+            False,
+        )
+        session.close()
+        assert session.closed
+    assert closed_handles == []
+
+
 def test_knob_cache_round_trip_and_bucket_choice(tmp_path, monkeypatch) -> None:
     """Tuned transport tables: exact key match (topology included), nearest capacity bucket,
     entries of other backends preserved."""

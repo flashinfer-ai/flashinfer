@@ -215,7 +215,9 @@ division and remainder); nothing is `eval`-ed.
   spilling build with the nvcc release in the message; point `CUDA_HOME` at a release listed
   above and clear the JIT cache.
 * An initialized `torch.distributed` **NCCL** process group for the EP domain (the session adopts
-  its `ncclComm_t`).
+  its `ncclComm_t`).  Call `layer.destroy()` before `dist.destroy_process_group()` to release the
+  windows; once the group is destroyed its communicator is gone, so a session still open then
+  (or at process exit) is only marked closed and its memory is reclaimed when the process exits.
 * Window memory per rank grows with world size x rows x top-k (the result windows dominate:
   about 3.3 GB at EP4 / E256 / top-k 6 / 4096 rows, 13 GB at EP16); size `max_tokens_per_rank`
   to the real per-call token count.

@@ -344,7 +344,12 @@ class TransportSession {
 };
 
 std::mutex g_registry_mutex;
-std::unordered_map<int64_t, std::unique_ptr<TransportSession>> g_sessions;
+// Never destroyed: a session adopts the ncclComm_t of a torch process group, which the
+// application may destroy (dist.destroy_process_group) before the process exits.  Releasing
+// such a session from a static destructor would deregister windows of a freed communicator,
+// so sessions still open at exit are left to the OS.
+std::unordered_map<int64_t, std::unique_ptr<TransportSession>>& g_sessions =
+    *new std::unordered_map<int64_t, std::unique_ptr<TransportSession>>();
 int64_t g_next_session_handle = 1;
 
 TransportSession& SessionOf(int64_t handle) {
