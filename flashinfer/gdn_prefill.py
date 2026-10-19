@@ -154,7 +154,12 @@ def _cake_gdn_unit_gates(
 # empty sequence (a documented no-op, never an out-of-bounds access).  There
 # is no host-int cache and no cached int32 copy: a metadata buffer the caller
 # rewrites in place (a persistent engine buffer, a CUDA Graph replay) is
-# always read live.  ``cu_seqlens_cpu`` is the optional host copy engines
+# always read live.  A record that declares ``metadata_i64`` (every sm_107a
+# non-CP prefill record) reads int32 or int64 ``cu_seqlens`` /
+# ``state_indices`` / ``checkpoint_cu_starts`` directly, so the caller's
+# buffers are passed as they are; every other record takes int32 and an
+# int64 buffer is cast per call (``_cake_gdn_prefill_i32``).
+# ``cu_seqlens_cpu`` is the optional host copy engines
 # already hold (vLLM ``query_start_loc_cpu``, the prefix sums of SGLang's
 # ``extend_seq_lens_cpu``): it tightens the host validation and the launch
 # bound without a synchronization.
@@ -238,10 +243,20 @@ def _cake_gdn_prefill_i32(values: torch.Tensor) -> torch.Tensor:
     The cast is one small device kernel on the caller's stream (no host
     synchronization; recorded into the graph under capture) and is never
     cached, so an in-place rewrite of the caller's buffer is always what the
-    kernel reads.  Int32 metadata is the zero-copy path.
+    kernel reads.  Int32 metadata is the zero-copy path.  Records that declare
+    ``metadata_i64`` (``CakeGDNRoute.metadata_i64``) never take this path:
+    their kernels read int32 or int64 metadata directly.
     """
 
     return values if values.dtype == torch.int32 else values.to(torch.int32)
+
+
+def _cake_gdn_prefill_launch_metadata(
+    values: torch.Tensor, *, metadata_i64: bool
+) -> torch.Tensor:
+    """The metadata buffer the kernel reads: as given for a ``metadata_i64`` record, else int32."""
+
+    return values if metadata_i64 else _cake_gdn_prefill_i32(values)
 
 
 # Per-call device-side slot validation, same default as ``gdn_decode.py``: the
@@ -560,11 +575,18 @@ def _run_cake_gdn_prefill(
     )
 
     empty_i32 = _cake_gdn_sentinel(device_index, torch.int32)
-    # The kernels take int32 offsets and slots; int64 metadata is cast per call
-    # on the caller's stream (``_cake_gdn_prefill_i32``), never cached.
-    cu_seqlens_i32 = _cake_gdn_prefill_i32(cu_seqlens)
+    # A ``metadata_i64`` record (every sm_107a record) reads int32 or int64
+    # offsets and slots directly: the caller's buffers go to the kernel as
+    # they are.  Every other record takes int32; int64 metadata is cast per
+    # call on the caller's stream (``_cake_gdn_prefill_i32``), never cached.
+    metadata_i64 = route.metadata_i64
+    cu_seqlens_i32 = _cake_gdn_prefill_launch_metadata(
+        cu_seqlens, metadata_i64=metadata_i64
+    )
     state_indices_i32 = (
-        empty_i32 if state_indices is None else _cake_gdn_prefill_i32(state_indices)
+        empty_i32
+        if state_indices is None
+        else _cake_gdn_prefill_launch_metadata(state_indices, metadata_i64=metadata_i64)
     )
     empty_state = _cake_gdn_sentinel(device_index, state_dtype)
     launch_initial_state = initial_state if initial_state is not None else empty_state
@@ -579,7 +601,9 @@ def _run_cake_gdn_prefill(
     cu_checkpoints_i32 = (
         empty_i32
         if checkpoint_every_n_tokens == 0 or checkpoint_cu_starts is None
-        else _cake_gdn_prefill_i32(checkpoint_cu_starts)
+        else _cake_gdn_prefill_launch_metadata(
+            checkpoint_cu_starts, metadata_i64=metadata_i64
+        )
     )
     tensormap_workspace = _cake_gdn_tensormap_workspace(
         device_index, torch.cuda.current_stream(device_index).cuda_stream, grid_x
@@ -1080,7 +1104,7 @@ def chunk_gated_delta_rule(
         chunk size (64).  ``0`` disables checkpointing (default).
     use_cp : Literal["auto"] | bool, optional:
         Whether to use context parallelism when low-parallelism heuristics
-        match. SM100/SM103 uses the generated GDN CP-only four-stage
+        match. SM100/SM103/SM107 uses the generated GDN CP-only four-stage
         implementation for structurally supported shapes. Other legal
         configurations retain the CuTe-DSL implementation.
         ``"auto"`` enables conservative routing, ``True`` requires CP support,
@@ -1122,7 +1146,7 @@ def chunk_gated_delta_rule(
         routing. Requires cuDNN frontend 1.31 GA and CuTe DSL 4.7 or newer.
         Cake kernels require an explicit ``cake_gdn``
         request. Use ``backend="cake_gdn", use_cp=True`` for Cake CP on
-        SM100/SM103; ``use_cp=False`` retains Cake non-CP, and ``"auto"``
+        SM100/SM103/SM107; ``use_cp=False`` retains Cake non-CP, and ``"auto"``
         enters Cake CP only inside the measured SM100/SM103 band (BF16/FP16
         I/O, FP32 initial and final state, gates, no checkpoints or state
         indices, ``4 * num_seqs * max(Hq, Hv) < SMs`` and ``max_seqlen >=
@@ -1200,8 +1224,10 @@ def chunk_gated_delta_rule(
         empty sequence -- a documented no-op, never an out-of-bounds access
         (``checkpoint_cu_starts`` consistency stays a caller precondition).
         Int32 ``cu_seqlens`` reaches the kernel as is; int64 is cast on the
-        stream at every call. Nothing is cached by tensor identity, so a
-        buffer rewritten in place is always read live, including on CUDA
+        stream at every call, except on records that read int64 metadata
+        directly (every Cake non-CP prefill record on CC 10.7), where int64
+        reaches the kernel as is too. Nothing is cached by tensor identity, so
+        a buffer rewritten in place is always read live, including on CUDA
         Graph replay.
 
     Returns
@@ -1223,7 +1249,8 @@ def chunk_gated_delta_rule(
     - Requires SM90 (Hopper) or SM100 (Blackwell) architecture. The SM100
       path requires ``head_size == 128``. On SM100/SM103, ``gdn_cp`` supports
       structurally legal equal-head, GQA, and GVA shapes on CUDA 12.8,
-      CUDA 12.9, and CUDA 13.
+      CUDA 12.9, and CUDA 13; SM107 supports the same shapes with an ``nvcc``
+      that can emit ``compute_107a``.
       Other SM100 CP DSL routes require CUDA 13 and
       ``nvidia-cutlass-dsl[cu13]>=4.4.2`` (``pip install
       flashinfer-python[cu13]``).

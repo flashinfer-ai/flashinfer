@@ -98,7 +98,11 @@ __device__ __forceinline__ float2 fma_f32x2_rn_ftz(float2 a, float2 b, float2 c)
 extern "C" {
 
 __global__ __launch_bounds__(512) void
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+kernel_cake_fused_kda_decode_ceb0985ab93695f02817(__nv_bfloat16* __restrict__ x, float* __restrict__ weight, __nv_bfloat16* __restrict__ conv_state, __nv_bfloat16* __restrict__ raw_gate, __nv_bfloat16* __restrict__ raw_beta, float* __restrict__ A_log, float* __restrict__ dt_bias, int* __restrict__ state_indices, __nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ output_gate, float* __restrict__ norm_weight, __nv_bfloat16* __restrict__ output, int x_row_stride, int conv_slot_stride, int beta_row_stride, int state_slot_stride, int output_gate_row_stride, int H, int use_lower_bound, float lower_bound_log2, float norm_eps)
+#else
 kernel_cake_fused_kda_decode_753293b369d11fb0880f(__nv_bfloat16* __restrict__ x, float* __restrict__ weight, __nv_bfloat16* __restrict__ conv_state, __nv_bfloat16* __restrict__ raw_gate, __nv_bfloat16* __restrict__ raw_beta, float* __restrict__ A_log, float* __restrict__ dt_bias, int* __restrict__ state_indices, __nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ output_gate, float* __restrict__ norm_weight, __nv_bfloat16* __restrict__ output, int x_row_stride, int conv_slot_stride, int beta_row_stride, int state_slot_stride, int output_gate_row_stride, int H, int use_lower_bound, float lower_bound_log2, float norm_eps)
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -165,7 +169,11 @@ kernel_cake_fused_kda_decode_753293b369d11fb0880f(__nv_bfloat16* __restrict__ x,
         int channel_pair = tid_0 - qkv_idx * 64;
         int channel = channel_pair * 2;
         int channel_base = qkv_idx * hidden + head * 128 + channel;
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+        long long conv_base = (long long)slot * (long long)conv_slot_stride + (long long)channel_base;
+#else
         int conv_base = slot * conv_slot_stride + channel_base;
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
         {
             uint32_t _bf16x2_bits_0;
             _bf16x2_bits_0 = *reinterpret_cast<const uint32_t*>(conv_state + conv_base);
@@ -173,12 +181,20 @@ kernel_cake_fused_kda_decode_753293b369d11fb0880f(__nv_bfloat16* __restrict__ x,
         }
         {
             uint32_t _bf16x2_bits_1;
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+            _bf16x2_bits_1 = *reinterpret_cast<const uint32_t*>(conv_state + conv_base + (long long)qkv_size);
+#else
             _bf16x2_bits_1 = *reinterpret_cast<const uint32_t*>(conv_state + conv_base + qkv_size);
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
             state_carriers[1] = _bf16x2_bits_1;
         }
         {
             uint32_t _bf16x2_bits_2;
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+            _bf16x2_bits_2 = *reinterpret_cast<const uint32_t*>(conv_state + conv_base + (long long)(2 * qkv_size));
+#else
             _bf16x2_bits_2 = *reinterpret_cast<const uint32_t*>(conv_state + conv_base + 2 * qkv_size);
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
             state_carriers[2] = _bf16x2_bits_2;
         }
         int x_base = row * x_row_stride + channel_base;
@@ -223,10 +239,17 @@ kernel_cake_fused_kda_decode_753293b369d11fb0880f(__nv_bfloat16* __restrict__ x,
         if (is_live != 0) {
             conv_state[conv_base] = r_q[2];
             conv_state[conv_base + 1] = r_q[3];
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+            conv_state[conv_base + (long long)qkv_size] = r_q[4];
+            conv_state[conv_base + (long long)qkv_size + 1] = r_q[5];
+            conv_state[conv_base + (long long)(2 * qkv_size)] = r_q[6];
+            conv_state[conv_base + (long long)(2 * qkv_size) + 1] = r_q[7];
+#else
             conv_state[conv_base + qkv_size] = r_q[4];
             conv_state[conv_base + qkv_size + 1] = r_q[5];
             conv_state[conv_base + 2 * qkv_size] = r_q[6];
             conv_state[conv_base + 2 * qkv_size + 1] = r_q[7];
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
         }
     }
     if (tid_0 >= 384) {
@@ -265,12 +288,21 @@ kernel_cake_fused_kda_decode_753293b369d11fb0880f(__nv_bfloat16* __restrict__ x,
             sBeta[0] = _tanh_approx_4 * 0.5f + 0.5f;
         }
     }
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+    long long state_head_base = (long long)slot * (long long)state_slot_stride + (long long)(head * 128 * 128);
+    long long state_group_base = state_head_base + (long long)(state_owner_row_base * 128) + (long long)k_start;
+#else
     int state_head_base = slot * state_slot_stride + head * 128 * 128;
     int state_group_base = state_head_base + state_owner_row_base * 128 + k_start;
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
     #pragma unroll
     for (int local_row = 0; local_row < 4; local_row++) {
         {
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+            const uint4* _vptr_3 = reinterpret_cast<const uint4*>(state + state_group_base + (long long)(local_row * 128));
+#else
             const uint4* _vptr_3 = reinterpret_cast<const uint4*>(state + state_group_base + local_row * 128);
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
             uint4* _vdst_3 = reinterpret_cast<uint4*>(&state_carriers[0]);
             #pragma unroll
             for (int _blk = 0; _blk < 1; _blk++) {
@@ -362,12 +394,20 @@ kernel_cake_fused_kda_decode_753293b369d11fb0880f(__nv_bfloat16* __restrict__ x,
     #pragma unroll
     for (int value_tile = 0; value_tile < 1; value_tile++) {
         int tile_base = value_tile * 128;
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+        long long state_tile_base = state_group_base + (long long)(tile_base * 128);
+#else
         int state_tile_base = state_group_base + tile_base * 128;
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
         if (value_tile > 0) {
             #pragma unroll
             for (int local_row_1 = 0; local_row_1 < 4; local_row_1++) {
                 {
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+                    const uint4* _vptr_4 = reinterpret_cast<const uint4*>(state + state_tile_base + (long long)(local_row_1 * 128));
+#else
                     const uint4* _vptr_4 = reinterpret_cast<const uint4*>(state + state_tile_base + local_row_1 * 128);
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
                     uint4* _vdst_4 = reinterpret_cast<uint4*>(&state_carriers[0]);
                     #pragma unroll
                     for (int _blk = 0; _blk < 1; _blk++) {
@@ -614,7 +654,11 @@ kernel_cake_fused_kda_decode_753293b369d11fb0880f(__nv_bfloat16* __restrict__ x,
                     _pk[1] = __floats2bfloat162_rn(state_regs[local_row_a * 8 + 2], state_regs[local_row_a * 8 + 3]);
                     _pk[2] = __floats2bfloat162_rn(state_regs[local_row_a * 8 + 4], state_regs[local_row_a * 8 + 5]);
                     _pk[3] = __floats2bfloat162_rn(state_regs[local_row_a * 8 + 6], state_regs[local_row_a * 8 + 7]);
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state))[state_tile_base + (long long)(local_row_a * 128) + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+#else
                     *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state))[state_tile_base + local_row_a * 128 + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
                 }
                 {
                     __nv_bfloat162 _pk[4];
@@ -622,7 +666,11 @@ kernel_cake_fused_kda_decode_753293b369d11fb0880f(__nv_bfloat16* __restrict__ x,
                     _pk[1] = __floats2bfloat162_rn(state_regs[local_row_b * 8 + 2], state_regs[local_row_b * 8 + 3]);
                     _pk[2] = __floats2bfloat162_rn(state_regs[local_row_b * 8 + 4], state_regs[local_row_b * 8 + 5]);
                     _pk[3] = __floats2bfloat162_rn(state_regs[local_row_b * 8 + 6], state_regs[local_row_b * 8 + 7]);
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state))[state_tile_base + (long long)(local_row_b * 128) + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+#else
                     *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state))[state_tile_base + local_row_b * 128 + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
                 }
                 {
                     __nv_bfloat162 _pk[4];
@@ -630,7 +678,11 @@ kernel_cake_fused_kda_decode_753293b369d11fb0880f(__nv_bfloat16* __restrict__ x,
                     _pk[1] = __floats2bfloat162_rn(state_regs[local_row_c * 8 + 2], state_regs[local_row_c * 8 + 3]);
                     _pk[2] = __floats2bfloat162_rn(state_regs[local_row_c * 8 + 4], state_regs[local_row_c * 8 + 5]);
                     _pk[3] = __floats2bfloat162_rn(state_regs[local_row_c * 8 + 6], state_regs[local_row_c * 8 + 7]);
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state))[state_tile_base + (long long)(local_row_c * 128) + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+#else
                     *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state))[state_tile_base + local_row_c * 128 + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
                 }
                 {
                     __nv_bfloat162 _pk[4];
@@ -638,7 +690,11 @@ kernel_cake_fused_kda_decode_753293b369d11fb0880f(__nv_bfloat16* __restrict__ x,
                     _pk[1] = __floats2bfloat162_rn(state_regs[local_row_d * 8 + 2], state_regs[local_row_d * 8 + 3]);
                     _pk[2] = __floats2bfloat162_rn(state_regs[local_row_d * 8 + 4], state_regs[local_row_d * 8 + 5]);
                     _pk[3] = __floats2bfloat162_rn(state_regs[local_row_d * 8 + 6], state_regs[local_row_d * 8 + 7]);
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state))[state_tile_base + (long long)(local_row_d * 128) + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+#else
                     *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state))[state_tile_base + local_row_d * 128 + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
                 }
             }
             if (lane_group == 0) {

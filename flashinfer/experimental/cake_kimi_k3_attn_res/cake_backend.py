@@ -53,6 +53,7 @@ import torch
 import tvm_ffi
 
 from .cake_jit import (
+    ARG_PLANS,
     KERNELS,
     MODULES,
     kernel_module_name,
@@ -158,7 +159,7 @@ _R5_PERSISTENT_SCHEDULE_CELLS = {
         (768, 2): (3, 2),
     },
 }
-_R5_WRITE_PERSISTENT_SCHEDULE_CELLS = {"sm_100a": {(1024, 4): (3, 2)}, "sm_103a": {}}
+_R5_WRITE_PERSISTENT_SCHEDULE_CELLS = {"sm_100a": {(1024, 4): (3, 2)}}
 _R5_PREFIX_BF16_ADD_CELLS = {
     "sm_100a": frozenset({(256, 3), (192, 6), (192, 7)}),
     "sm_103a": frozenset({(256, 3), (192, 6), (384, 2), (768, 2)}),
@@ -169,71 +170,28 @@ _SM100_R5_EARLY_CONSUMED_RELEASE_CELLS: frozenset[tuple[int, int]] = frozenset(
 _SM103_R5_HELD_CONSUMED_RELEASE_CELLS: frozenset[tuple[int, int]] = frozenset(
     {(512, 5), (768, 5)}
 )
-_R5_WRITE_EARLY_CONSUMED_RELEASE_CELLS = {
-    "sm_100a": frozenset({(1024, 4)}),
-    "sm_103a": frozenset(),
-}
+_R5_WRITE_EARLY_CONSUMED_RELEASE_CELLS = {"sm_100a": frozenset({(1024, 4)})}
 _R5_SMALL_M_EXCLUDED_CELLS = {
     "sm_100a": frozenset({(256, 3)}),
     "sm_103a": frozenset({(256, 3)}),
 }
 # Dense cells above the small-M table that run the direct kernel (chunk from _R5_SMALL_M_CHUNK_CELLS).
-_R5_SMALL_M_INCLUDED_CELLS = {"sm_100a": frozenset(), "sm_103a": frozenset({(192, 5)})}
-_R5_SMALL_M_CHUNK_CELLS = {"sm_100a": {}, "sm_103a": {(192, 5): 6}}
-_R5_SMALL_M_CLUSTER_CELLS = {"sm_100a": {}, "sm_103a": {(192, 2): 2}}
+_R5_SMALL_M_INCLUDED_CELLS = {"sm_103a": frozenset({(192, 5)})}
+_R5_SMALL_M_CHUNK_CELLS = {"sm_103a": {(192, 5): 6}}
+_R5_SMALL_M_CLUSTER_CELLS = {"sm_103a": {(192, 2): 2}}
 _WRITE_HELD_CONSUMED_RELEASE_MIN_M = {"sm_100a": {4: 1024}, "sm_103a": {4: 1024}}
 # K = 0 TMA route: grid multiple of the SM count on the promoted mid-M cells.
 _K0_TMA_GRID_MULTIPLIER_M = {
     "sm_100a": {256: 2, 512: 2, 1024: 3},
     "sm_103a": {256: 2, 512: 3, 1024: 3},
 }
-_SM100_RELAXED_PRODUCER_WAIT_CELLS: frozenset[tuple[int, int]] = frozenset()
 _SM103_RELAXED_PRODUCER_WAIT_CELLS = frozenset({(4096, 5), (1024, 5)})
+# Native ports: name, {arch: routed M}, num_blocks.  Only the cells above the small-M table are
+# listed: every other cell the ports were measured on resolves to a small-M program first.
 _NATIVE_ROUTES = (
-    # name, {arch: routed M}, num_blocks, PDL modes, consumed-release policy
-    (
-        "k5",
-        {"sm_100a": frozenset({1}), "sm_103a": frozenset({1})},
-        5,
-        (False, True),
-        "native_lane0_before_wait_st",
-    ),
-    (
-        "m128",
-        {
-            "sm_100a": frozenset({1, 2, 4, 8, 16, 32, 64, 128, 1024}),
-            "sm_103a": frozenset({1, 2, 4, 8, 16, 32, 64, 128, 256}),
-        },
-        4,
-        (False, True),
-        "native_all_reader_before_wait_st",
-    ),
-    (
-        "k6",
-        {"sm_100a": frozenset({1}), "sm_103a": frozenset({1})},
-        6,
-        (False, True),
-        "native_all_reader_before_wait_st",
-    ),
-    (
-        "k7",
-        {"sm_100a": frozenset({1}), "sm_103a": frozenset({1})},
-        7,
-        (False,),
-        "native_all_reader_nofence_before_wait_st",
-    ),
-    (
-        "k8",
-        {
-            "sm_100a": frozenset({1, 2, 4, 8, 32, 256}),
-            "sm_103a": frozenset({1, 8, 256}),
-        },
-        8,
-        (False, True),
-        "native_all_reader_nofence_before_wait_st",
-    ),
+    ("m128", {"sm_100a": frozenset({1024}), "sm_103a": frozenset({256})}, 4),
+    ("k8", {"sm_100a": frozenset({256}), "sm_103a": frozenset({256})}, 8),
 )
-_NATIVE_K8_SM100_PDL_ONLY_M = frozenset({16})
 # Small-M direct kernel: one token per 256-thread CTA, every source register-resident,
 # selected ahead of every other dense program for M <= max_m (per architecture and K).
 _SMALL_M_DIRECT_MAX_M = {
@@ -262,7 +220,7 @@ _SMALL_M_CLUSTER: dict[str, dict[int, tuple[tuple[int, int], ...]]] = {
 
 
 def _small_m_cluster(arch: str, M: int, K: int) -> int:
-    cell = _R5_SMALL_M_CLUSTER_CELLS[arch].get((M, K))
+    cell = _R5_SMALL_M_CLUSTER_CELLS.get(arch, {}).get((M, K))
     if cell is not None:
         return int(cell)
     for max_m, cluster in _SMALL_M_CLUSTER[arch].get(K, ()):
@@ -375,7 +333,7 @@ _SMALL_M_CHUNK_BANDS: dict[str, dict[int, tuple[tuple[int, int], ...]]] = {
 
 def _small_m_sources_per_chunk(arch: str, M: int, K: int) -> int | None:
     default = 4 if K <= 3 else 3
-    cell = _R5_SMALL_M_CHUNK_CELLS[arch].get((M, K))
+    cell = _R5_SMALL_M_CHUNK_CELLS.get(arch, {}).get((M, K))
     if cell is not None:
         return None if int(cell) == default else int(cell)
     for max_m, sources_per_chunk in _SMALL_M_CHUNK_BANDS[arch].get(K, ()):
@@ -438,7 +396,7 @@ def _schedule(arch: str, M: int, K: int, write: bool = False) -> tuple[int, int]
     snapshot-write twin is derived from; round r5 cells may give it its own schedule)."""
     r5_cells = (
         _R5_WRITE_PERSISTENT_SCHEDULE_CELLS if write else _R5_PERSISTENT_SCHEDULE_CELLS
-    )[arch]
+    ).get(arch, {})
     cell = (M if write else _cell_m(arch, M, K), K)
     if cell in r5_cells:
         return r5_cells[cell]
@@ -447,8 +405,6 @@ def _schedule(arch: str, M: int, K: int, write: bool = False) -> tuple[int, int]
     ):
         return 3, 3
     if arch == "sm_100a":
-        if K == 0 and M in {1, 2, 16, 32, 64, 512, 2048, 4096, 8192, 16384}:
-            return 1, PERSISTENT_CHUNK_DEPTH
         if K == 1 and M in _SM100_K1_NC2_M:
             return 2, PERSISTENT_CHUNK_DEPTH
         if K == 5 and M >= _SM100_K5_NC4_D3_MIN_M:
@@ -458,8 +414,6 @@ def _schedule(arch: str, M: int, K: int, write: bool = False) -> tuple[int, int]
                 5 if M in {1, 32, 1024, 2048, 4096, 8192, 16384} else 3
             ), PERSISTENT_CHUNK_DEPTH
     else:
-        if K == 0 and M not in {4, 16, 256}:
-            return 1, PERSISTENT_CHUNK_DEPTH
         if K == 1 and M in _SM103_K1_NC2_M:
             return 2, PERSISTENT_CHUNK_DEPTH
         if K == 5 and M >= _SM103_K5_NC4_D3_MIN_M:
@@ -487,7 +441,7 @@ def _early_consumed_release(
     if (
         write
         and _WRITE_HELD_CONSUMED_RELEASE_MIN_M[arch].get(K, M + 1) <= M
-        and (M, K) not in _R5_WRITE_EARLY_CONSUMED_RELEASE_CELLS[arch]
+        and (M, K) not in _R5_WRITE_EARLY_CONSUMED_RELEASE_CELLS.get(arch, ())
     ):
         return False
     if arch == "sm_100a":
@@ -520,26 +474,15 @@ def _early_consumed_release(
 
 
 def _producer_wait_acquire(arch: str, M: int, K: int) -> bool:
-    return not (
-        (arch == "sm_100a" and (M, K) in _SM100_RELAXED_PRODUCER_WAIT_CELLS)
-        or (arch == "sm_103a" and (M, K) in _SM103_RELAXED_PRODUCER_WAIT_CELLS)
-    )
+    return not (arch == "sm_103a" and (M, K) in _SM103_RELAXED_PRODUCER_WAIT_CELLS)
 
 
-def _native_route(arch: str, num_sms: int, M: int, K: int, use_pdl: bool):
+def _native_route(arch: str, num_sms: int, M: int, K: int) -> Optional[str]:
     if num_sms not in NATIVE_SM_COUNTS:
         return None
-    for name, routed, k, pdl_modes, release in _NATIVE_ROUTES:
-        if k != K or use_pdl not in pdl_modes:
-            continue
-        pdl_only = (
-            name == "k8"
-            and arch == "sm_100a"
-            and use_pdl
-            and M in _NATIVE_K8_SM100_PDL_ONLY_M
-        )
-        if M in routed[arch] or pdl_only:
-            return name, release
+    for name, routed, k in _NATIVE_ROUTES:
+        if k == K and M in routed[arch]:
+            return name
     return None
 
 
@@ -855,7 +798,7 @@ def _plan_route_exact(
             use_pdl,
         )
     max_m = _SMALL_M_DIRECT_MAX_M[arch].get(K)
-    if (M, K) in _R5_SMALL_M_INCLUDED_CELLS[arch] or (
+    if (M, K) in _R5_SMALL_M_INCLUDED_CELLS.get(arch, ()) or (
         max_m is not None
         and max_m >= M
         and (M, K) not in _R5_SMALL_M_EXCLUDED_CELLS[arch]
@@ -869,14 +812,13 @@ def _plan_route_exact(
             None,
             sources_per_chunk=_small_m_sources_per_chunk(arch, M, K),
         )
-    native = _native_route(arch, num_sms, M, K, use_pdl)
+    native = _native_route(arch, num_sms, M, K)
     if native is not None:
-        name, _release = native
-        schedule_id = f"native_{name}_nc3_d2_ws288_grid{num_sms}"
+        schedule_id = f"native_{native}_nc3_d2_ws288_grid{num_sms}"
         route_id = f"{schedule_id}.{arch}.native_no_hint.k{K}.delta1.write0.norm1.pdl{int(use_pdl)}.native_full_sm"
         return RoutePlan(
             "native",
-            f"native_{name}",
+            f"native_{native}",
             num_sms,
             PERSISTENT_THREADS,
             schedule_id,
@@ -948,26 +890,14 @@ def _persistent_plan_exact(
     k4_early_nc5_input_first = (
         arch == "sm_100a" and M == 1024 and K == 4 and nc == 5 and ecr
     )
-    k4_held_nc3_input_first = arch == "sm_103a" and K == 4 and M in {64, 128}
-    k4_nc5_source0_carry = (
-        arch == "sm_103a" and M == 1024 and K == 4 and nc == 5 and not ecr
-    )
     k1_on_output_norm_cache = (
         arch == "sm_103a" and use_pdl and K == 1 and M in {1024, 2048, 4096, 8192}
     )
-    k1_m1_on_source_barrier_norm_prefetch = (
-        arch == "sm_103a" and use_pdl and K == 1 and M == 1
-    )
-    k4_m4_on_packed_cross_warp = (
-        arch == "sm_100a" and K == 4 and not use_pdl and M == 64
-    )
-    k5_m1_on_terminal_packed_stats = arch == "sm_103a" and use_pdl and K == 5 and M == 1
     k1_output_norm_packed_cache = (
         arch == "sm_103a"
         and not use_pdl
         and K == 1
         and nc == 4
-        and not one_token_per_cta
         and not prefix_bf16_add
         and not prefix_round_once
         and ecr
@@ -982,8 +912,13 @@ def _persistent_plan_exact(
         and not ecr
         and prefix_bf16_add
         and prefix_round_once
-        and not one_token_per_cta
     )
+    # Positions 7, 8, 10, 11 and 12 (the sm_103a K4 held input-first and source-0 carry
+    # programs; the sm_103a M = 1 K1 / K5 and the sm_100a M = 64 K4 programs) are '0' in
+    # every registered key and False for every input that reaches this function through
+    # plan_route: their cells resolve inside the small-M table or, for (1024, 4) on sm_103a,
+    # to a three-source schedule.  They stay in the key as constant 0 bits so its
+    # 15-character flag field matches the registered keys.
     flags = (
         ecr,
         pwa,
@@ -992,12 +927,12 @@ def _persistent_plan_exact(
         one_token_per_cta,
         prefetch_fifth_stats,
         k4_early_nc5_input_first,
-        k4_held_nc3_input_first,
-        k4_nc5_source0_carry,
+        False,
+        False,
         k1_on_output_norm_cache,
-        k1_m1_on_source_barrier_norm_prefetch,
-        k4_m4_on_packed_cross_warp,
-        k5_m1_on_terminal_packed_stats,
+        False,
+        False,
+        False,
         k1_output_norm_packed_cache,
         k8_sm103_nonallocator_qk_prelude,
     )
@@ -1150,7 +1085,7 @@ def _bind(module_name: str, kwargs: dict[str, Any]) -> tuple[Callable[..., Any],
     record = MODULES[module_name]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
     arguments = []
-    for kind, name in record["arg_plan"]:
+    for kind, name in ARG_PLANS[record["arg_plan"]]:
         if kind == "grid":
             arguments.append(grid[name])
         elif name in kwargs:
@@ -1161,7 +1096,7 @@ def _bind(module_name: str, kwargs: dict[str, Any]) -> tuple[Callable[..., Any],
                 f"host binding provides {sorted(kwargs)}"
             )
     module = load_cake_kimi_k3_attn_res_module(module_name)
-    return getattr(module, record["ffi_entry"]), tuple(arguments)
+    return module.run, tuple(arguments)
 
 
 @dataclass(frozen=True)
@@ -1310,9 +1245,6 @@ def prepare_kimi_k3_attn_res(
         eps=float(eps),
         output_norm_eps=float(output_norm_eps),
         block_write_idx=int(block_write_idx),
-        num_blocks=int(num_blocks),
-        has_delta=int(delta is not None),
-        apply_output_norm=int(output_norm_weight is not None),
         enable_pdl=int(enable_pdl),
         M=M,
     )

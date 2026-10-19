@@ -83,4 +83,3 @@ union MmaSmemDesc {
 #include "cake_device_helpers/cake_add_f32x2_74578aa6314ab32b.cuh"
 #include "cake_device_helpers/cake_fma_f32x2_rn_ftz_abada39162909eda.cuh"
 #include "cake_device_helpers/cake_tcgen05_mma_f8f6f4_7dc3dbed82e9a479.cuh"
-#include "cake_device_helpers/cake_mma_ts_step_6161a952880ed45d.cuh"

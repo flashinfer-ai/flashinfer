@@ -599,7 +599,9 @@ def _run_cake_gdn_decode_nontranspose(
         use_qk_l2norm=use_qk_l2norm,
     )
     entry = _cake_gdn.load_cake_gdn_kernel(route.variant_name, arch)
-    blocks_per_state = 8 if batch_size < 32 else 1
+    blocks_per_state = _cake_gdn.cake_gdn_nontranspose_fp32_t1_ctas_per_state(
+        route.variant_name
+    )
     entry(
         q,
         k,

@@ -1,5 +1,6 @@
 """Catalog consistency of the generated MegaMoE v3 family (no GPU required)."""
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -73,6 +74,16 @@ def test_programs_sources_symbols_and_compile_line_definitions():
         assert (
             "ScopedCudaDevice" not in binding_text and "std::mutex" not in binding_text
         )
+
+
+def test_closure_sha256_names_the_shipped_sources():
+    """Each program's closure_sha256 is the SHA-256 of its kernel then binding source bytes."""
+    data = json.loads(_catalog().path.read_text())
+    for name, record in data["programs"].items():
+        digest = hashlib.sha256(
+            b"".join((ROOT / src).read_bytes() for src in record["sources"])
+        ).hexdigest()
+        assert record["closure_sha256"] == digest, name
 
 
 def test_load_program_supplies_the_route_sm_count_as_num_ctas():

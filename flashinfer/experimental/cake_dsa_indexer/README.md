@@ -226,7 +226,10 @@ that writes the registry verifies the record against them before it is frozen.
 
 ## Tests and benchmark
 
-Tests: `tests/experimental/test_cake_dsa_indexer.py` with the independent
+Tests: `tests/experimental/test_cake_dsa_indexer.py` (the backend suite, which
+imports the package only through `tests/test_helpers/cake_package.py`) and
+`tests/experimental/test_cake_dsa_indexer_api.py` (the `flashinfer.dsa_indexer`
+wrapper), with the independent
 FP64 / FP32 reference in `tests/test_helpers/cake_dsa_indexer_reference.py`
 (exact semantic cases incl. cutoff ties, all-equal scores, mixed signed zeros
 at the boundary with bit checks, negative scores and a few winners over a

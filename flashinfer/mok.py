@@ -131,7 +131,9 @@ def create_mok_bf16_workspace(
     between the 3x load ratio, where its split shows no gain, and 5.6x, where it
     gains 1-2 %; MXFP8 2.7, between 2.4x (no gain) and 3x (gains 1 %). A number
     sets the ratio. Balanced steps never switch.
-    ``CAKE_MOK_COMM_SPLIT_LOG=1`` prints each split change.
+    ``MoKConfig.comm_split_log`` (default ``False``; ``dataclasses.replace(config,
+    comm_split_log=True)`` on the returned config) prints each split change per
+    rank to stderr.
     """
     from .experimental.cake_mok_bf16 import api as _api
 

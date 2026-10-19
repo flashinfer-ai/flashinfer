@@ -115,6 +115,7 @@ def _make_case(
     num_v_heads=8,
     state_pool_padding=257,
     checkpoint_cu_dtype=torch.int32,
+    gates=True,
 ):
     generator = torch.Generator(device="cuda").manual_seed(20260828)
     hq, hv = num_q_heads, num_v_heads
@@ -191,8 +192,8 @@ def _make_case(
         "q": q.contiguous(),
         "k": k.contiguous(),
         "v": v.contiguous(),
-        "g": alpha.contiguous(),
-        "beta": beta.contiguous(),
+        "g": alpha.contiguous() if gates else None,
+        "beta": beta.contiguous() if gates else None,
         "scale": 1.0 / math.sqrt(128),
         "initial_state": initial_state,
         "output": torch.empty((total, heads, 128), dtype=io_dtype, device="cuda"),
@@ -1188,12 +1189,13 @@ def test_public_cake_gdn_prefill_checkpoint_is_cuda_graph_safe():
 
 @torch.inference_mode()
 def test_public_cake_gdn_prefill_int64_metadata_matches_int32_and_follows_rewrites():
-    """Int64 cu_seqlens / slots are cast per call: bitwise-identical to int32, never cached.
+    """Int64 cu_seqlens / slots: bitwise-identical to int32, never cached.
 
-    The kernels take int32 offsets and slots.  Int32 metadata is the zero-copy
-    path; int64 metadata is cast on the stream at every call, so an int64 buffer
-    the caller rewrites in place under inference mode (no version bump) drives
-    the kernel with the new offsets, exactly like passing them as int32.
+    A ``metadata_i64`` record (every sm_107a record) reads the caller's int32 or
+    int64 buffer directly; every other record takes int32 and an int64 buffer is
+    cast on the stream at every call.  Either way nothing is cached, so an int64
+    buffer the caller rewrites in place under inference mode (no version bump)
+    drives the kernel with the new offsets, exactly like passing them as int32.
     """
 
     case = _make_case(
@@ -1261,7 +1263,8 @@ def test_public_cake_gdn_prefill_int64_state_indices_follow_in_place_updates():
     state_indices are validated on-device every call and were never under the
     host-int immutability contract, so an int64 slot buffer that the caller refreshes
     with ``copy_`` must drive the kernel with the new slots, bitwise-identical to
-    passing those slots as int32.
+    passing those slots as int32 (read in place on a ``metadata_i64`` record, cast
+    per call on every other record).
     """
 
     case = _make_case(
@@ -1299,13 +1302,16 @@ def test_public_cake_gdn_prefill_int64_state_indices_follow_in_place_updates():
     assert torch.equal(case["initial_state"], pool_i32)
 
 
-def test_public_cake_gdn_prefill_int64_graph_replay_follows_in_place_rewrite():
-    """A graph captured with int64 cu_seqlens re-casts the live buffer on replay.
+def test_public_cake_gdn_prefill_int64_graph_replay_follows_in_place_rewrite(
+    monkeypatch,
+):
+    """A graph captured with int64 cu_seqlens reads the live buffer on replay.
 
-    The cast is recorded into the graph (its int32 copy lives in the graph's
-    private pool); rewriting the caller's int64 buffer in place between replays
-    changes what the kernel reads, bitwise-identical to the eager int32 call on
-    the same split.
+    On a ``metadata_i64`` record the captured kernel reads the caller's int64
+    buffer itself (no cast is recorded); on every other record the cast is
+    recorded into the graph (its int32 copy lives in the graph's private pool).
+    Rewriting the caller's int64 buffer in place between replays changes what
+    the kernel reads, bitwise-identical to the eager int32 call on the same split.
     """
 
     case = _make_case(
@@ -1329,9 +1335,14 @@ def test_public_cake_gdn_prefill_int64_graph_replay_follows_in_place_rewrite():
         case["initial_state"].copy_(initial_state)
         case["output"].zero_()
     stream.synchronize()
+    casts = _record_metadata_casts(monkeypatch)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         _launch(case)
+    if _public_route(case).metadata_i64:
+        assert casts == [], casts
+    else:
+        assert torch.int64 in casts, casts
 
     other = [0, 64, 192]
     with torch.cuda.stream(stream):
@@ -1352,6 +1363,274 @@ def test_public_cake_gdn_prefill_int64_graph_replay_follows_in_place_rewrite():
     stream.synchronize()
     assert torch.equal(case["output"], out_other)
     assert torch.equal(case["output_state"], state_other)
+
+
+def _live_arch(case):
+    major, minor = torch.cuda.get_device_capability(case["q"].device)
+    return cake_gdn.arch_for_compute_capability(major, minor)
+
+
+def _device_kernel_names(fn):
+    """Names of the device kernels ``fn`` launches (profiler CUDA activities; copies excluded)."""
+
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as profile:
+        fn()
+        torch.cuda.synchronize()
+    return [
+        event.name
+        for event in profile.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+        and not event.name.startswith(("Memcpy", "Memset"))
+    ]
+
+
+def _record_metadata_casts(monkeypatch):
+    """Dtypes handed to ``_cake_gdn_prefill_i32`` (the per-call int64 -> int32 cast path)."""
+
+    seen = []
+    original = prefill_mod._cake_gdn_prefill_i32
+
+    def recording(values):
+        seen.append(values.dtype)
+        return original(values)
+
+    monkeypatch.setattr(prefill_mod, "_cake_gdn_prefill_i32", recording)
+    return seen
+
+
+def _reset_outputs(case, initial_state):
+    case["initial_state"].copy_(initial_state)
+    case["output"].zero_()
+    if case["checkpoint_every"]:
+        case["state_checkpoints"].fill_(float("nan"))
+    torch.cuda.synchronize()
+
+
+def _outputs_of(case):
+    return (
+        case["output"].clone(),
+        case["output_state"].clone(),
+        case["state_checkpoints"].clone() if case["checkpoint_every"] else None,
+    )
+
+
+def _assert_same_outputs(case, expected):
+    out, state, checkpoints = expected
+    assert torch.equal(case["output"], out)
+    assert torch.equal(case["output_state"], state)
+    if checkpoints is not None:
+        assert torch.equal(case["state_checkpoints"], checkpoints)
+
+
+_METADATA_WIDTHS = (
+    pytest.param((torch.int64, torch.int64, torch.int64), id="all-i64"),
+    pytest.param((torch.int64, torch.int32, torch.int64), id="i64-cu-i32-slots"),
+    pytest.param((torch.int32, torch.int64, torch.int32), id="i64-slots-only"),
+    pytest.param((torch.int32, torch.int32, torch.int64), id="i64-checkpoints-only"),
+)
+
+
+@pytest.mark.parametrize("widths", _METADATA_WIDTHS)
+def test_public_cake_gdn_prefill_metadata_i64_record_reads_mixed_widths_without_a_cast(
+    monkeypatch, widths
+):
+    """A ``metadata_i64`` record (every sm_107a record) reads int32 or int64 metadata in place.
+
+    ``cu_seqlens`` / ``state_indices`` / ``checkpoint_cu_starts`` each go to the
+    kernel in the width the caller holds; the kernel decodes the widths from its
+    launch mask and every output is bitwise identical to the all-int32 call.  On
+    such a record the host never calls the per-call cast and a call is exactly
+    one device kernel.  On an int32-only record the same inputs take the cast
+    path (extra kernels per call) and reach the same outputs.
+    """
+
+    cu_dtype, slots_dtype, checkpoints_dtype = widths
+    case = _make_case(
+        seq_lens=(52, 93, 15, 107),
+        indexed=True,
+        state_dtype=torch.bfloat16,
+        checkpoint_every=64,
+        state_pool_padding=0,
+    )
+    initial_state = case["initial_state"].clone()
+    zero_copy = _live_arch(case) == "sm_107a"
+    route = _public_route(case)
+    assert route.metadata_i64 is zero_copy, route
+    _launch(case)  # all-int32 reference (also the one-time kernel compile/load)
+    torch.cuda.synchronize()
+    expected = _outputs_of(case)
+
+    case["cu_seqlens"] = case["cu_seqlens"].to(cu_dtype)
+    case["state_indices"] = case["state_indices"].to(slots_dtype)
+    case["checkpoint_cu_starts"] = case["checkpoint_cu_starts"].to(checkpoints_dtype)
+    casts = _record_metadata_casts(monkeypatch)
+    _reset_outputs(case, initial_state)
+    _launch(case)
+    torch.cuda.synchronize()
+    _assert_same_outputs(case, expected)
+
+    _reset_outputs(case, initial_state)
+    kernels = _device_kernel_names(lambda: _launch(case))
+    _assert_same_outputs(case, expected)
+    if zero_copy:
+        assert casts == [], casts
+        assert len(kernels) == 1, kernels
+    else:
+        assert torch.int64 in casts, casts
+        assert len(kernels) > 1, kernels
+
+
+@pytest.mark.parametrize(
+    "slots_dtype", (torch.int32, torch.int64), ids=("i32-slots", "i64-slots")
+)
+def test_public_cake_gdn_prefill_metadata_i64_single_sequence_with_sentinel_checkpoints(
+    monkeypatch, slots_dtype
+):
+    """One sequence: int64 cu_seqlens, a one-element slot buffer, no checkpoints.
+
+    ``checkpoint_cu_starts`` is absent, so the kernel receives the one-element
+    int32 sentinel for it while ``cu_seqlens`` is int64 and ``state_indices`` is
+    the one-element buffer in either width; the outputs match the all-int32 call
+    bitwise and a ``metadata_i64`` record never takes the cast path.
+    """
+
+    case = _make_case(
+        seq_lens=(421,),
+        indexed=True,
+        state_dtype=torch.bfloat16,
+        state_pool_padding=0,
+    )
+    initial_state = case["initial_state"].clone()
+    _launch(case)
+    torch.cuda.synchronize()
+    expected = _outputs_of(case)
+
+    case["cu_seqlens"] = case["cu_seqlens"].to(torch.int64)
+    case["state_indices"] = case["state_indices"].to(slots_dtype)
+    assert case["state_indices"].numel() == 1
+    casts = _record_metadata_casts(monkeypatch)
+    _reset_outputs(case, initial_state)
+    _launch(case)
+    torch.cuda.synchronize()
+    _assert_same_outputs(case, expected)
+    if _public_route(case).metadata_i64:
+        assert casts == [], casts
+        _reset_outputs(case, initial_state)
+        kernels = _device_kernel_names(lambda: _launch(case))
+        _assert_same_outputs(case, expected)
+        assert len(kernels) == 1, kernels
+    else:
+        assert torch.int64 in casts, casts
+
+
+def test_public_cake_gdn_prefill_metadata_i64_non_indexed_int64_cu_seqlens(monkeypatch):
+    """Without state slots the kernel gets the slot sentinel and int64 ``cu_seqlens``."""
+
+    case = _make_case(seq_lens=(300, 212), state_dtype=torch.bfloat16)
+    initial_state = case["initial_state"].clone()
+    _launch(case)
+    torch.cuda.synchronize()
+    expected = _outputs_of(case)
+    case["cu_seqlens"] = case["cu_seqlens"].to(torch.int64)
+    casts = _record_metadata_casts(monkeypatch)
+    _reset_outputs(case, initial_state)
+    _launch(case)
+    torch.cuda.synchronize()
+    _assert_same_outputs(case, expected)
+    if _public_route(case).metadata_i64:
+        assert casts == [], casts
+    else:
+        assert casts == [torch.int64], casts
+
+
+@torch.inference_mode()
+def test_public_cake_gdn_prefill_absent_gates_reuse_one_cached_unit_tensor():
+    """Calls without g and beta share one cached read-only all-ones gate tensor.
+
+    The compiled kernels read both gates from memory (``UNIT_GATES`` stays off),
+    so an absent gate used to be filled fresh on every call: one or two fill
+    kernels ahead of the main kernel.  The adapter now keeps one FP32 ones tensor
+    per device and ``[tokens, heads]`` shape and passes it for both gates.  The
+    output must match explicit unit gates bitwise, stay bitwise-identical across
+    launches, and the kernel must never write the shared tensor.
+
+    The rows are stateless 64-token sequences; the exact host bound
+    (``cu_seqlens_cpu``) lets the resolver reach the shipped single-chunk
+    kernel (``_dvsplit_single_chunk``), the only stateless (3, 1) key the
+    manifest ships.
+    """
+    from flashinfer import gdn_prefill as prefill_mod
+
+    case = _make_case(
+        seq_lens=(64,) * 4,
+        num_q_heads=4,
+        num_k_heads=4,
+        num_v_heads=8,
+        gates=False,
+    )
+    assert case["g"] is None and case["beta"] is None
+    total_tokens = sum(case["seq_lens"])
+    num_o_heads = max(case["num_q_heads"], case["num_v_heads"])
+    device = case["q"].device
+
+    def launch(g, beta):
+        return chunk_gated_delta_rule(
+            q=case["q"],
+            k=case["k"],
+            v=case["v"],
+            g=g,
+            beta=beta,
+            scale=case["scale"],
+            initial_state=None,
+            output_final_state=False,
+            cu_seqlens=case["cu_seqlens"],
+            cu_seqlens_cpu=_host_cu_seqlens(case["seq_lens"]),
+            use_qk_l2norm_in_kernel=False,
+            output=case["output"],
+            use_cp=False,
+            backend="cake_gdn",
+        )
+
+    explicit_ones = torch.ones((total_tokens, num_o_heads), device=device)
+    launch(explicit_ones, explicit_ones.clone())
+    torch.cuda.synchronize()
+    expected = case["output"].clone()
+
+    prefill_mod._CAKE_GDN_UNIT_GATES.clear()
+    case["output"].zero_()
+    launch(None, None)
+    torch.cuda.synchronize()
+    first = case["output"].clone()
+    assert torch.equal(first, expected), "absent gates must act as explicit ones"
+
+    assert list(prefill_mod._CAKE_GDN_UNIT_GATES) == [
+        (device.index, total_tokens, num_o_heads)
+    ]
+    gates = next(iter(prefill_mod._CAKE_GDN_UNIT_GATES.values()))
+    assert gates.dtype == torch.float32
+    assert gates.is_contiguous()
+    assert tuple(gates.shape) == (total_tokens, num_o_heads)
+    assert gates.device == device
+    assert torch.equal(gates, torch.ones_like(gates))
+    assert (
+        prefill_mod._cake_gdn_unit_gates(device.index, total_tokens, num_o_heads)
+        is gates
+    )
+
+    for _ in range(2):
+        case["output"].zero_()
+        launch(None, None)
+        torch.cuda.synchronize()
+        assert torch.equal(case["output"], first)
+    assert len(prefill_mod._CAKE_GDN_UNIT_GATES) == 1
+    assert torch.equal(gates, torch.ones_like(gates)), (
+        "the kernel must not write the shared unit gates"
+    )
 
 
 def test_public_cake_gdn_prefill_is_cuda_graph_safe():

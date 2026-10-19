@@ -888,7 +888,8 @@ def gen_all_modules(
             jit_specs.append(gen_cake_megamoe_topk_reduce_module("sm_100a"))
         if has_cake_megamoe_topk_reduce_sm103a:
             jit_specs.append(gen_cake_megamoe_topk_reduce_module("sm_103a"))
-        # Cake selective state update: every delivered program instantiation per architecture.
+        # Cake selective state update: every program instantiation a route of the architecture selects
+        # (the four-CTA residency schedule of the paired row-major program has an sm_100a band only).
         if has_cake_selective_state_update_sm100a:
             jit_specs.extend(gen_cake_selective_state_update_modules("sm_100a"))
         if has_cake_selective_state_update_sm103a:

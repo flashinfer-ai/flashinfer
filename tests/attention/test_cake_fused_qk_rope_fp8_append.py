@@ -7,12 +7,15 @@ fp32 payload with ``atol = rtol = 0.1``; ``q_scale`` with ``rtol = 1e-5``; flags
 tails and every untouched byte bitwise.
 """
 
+from pathlib import Path
+
 import pytest
 import torch
 
 from flashinfer.cake_fused_qk_rope_fp8_append import (
     cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache as fused_fp8,
 )
+from flashinfer.jit import cake_fused_qk_rope_fp8_append as jit_fp8
 from flashinfer.utils import get_compute_capability
 
 HEAD_DIM = 128
@@ -30,6 +33,115 @@ def _skip_unless_supported():
         pytest.skip(
             f"cake_fused_qk_rope_fp8_append has no cubin for compute capability {cc}"
         )
+
+
+def test_shared_sources_bind_one_kernel_symbol_per_module(monkeypatch):
+    """CPU-only: every architecture compiles the same kernel and binding sources,
+    and the loader binds each module to its own kernel symbol through a define."""
+    import flashinfer.jit.core as jit_core
+
+    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+    define = "-DCAKE_KERNEL_SYMBOL="
+    sources = set()
+    symbols = set()
+    for arch in jit_fp8.ARCHES:
+        spec = jit_fp8.gen_cake_fused_qk_rope_fp8_append_module(jit_fp8.STAGES[0], arch)
+        assert spec.name.endswith(f"_{arch}")
+        # _source_path() checked the manifest sha256 receipt of both sources.
+        sources.add(tuple(Path(source).resolve() for source in spec.sources))
+        flags = [flag for flag in spec.extra_cuda_cflags if flag.startswith(define)]
+        assert len(flags) == 1, spec.extra_cuda_cflags
+        symbol = flags[0][len(define) :]
+        assert symbol == "kernel_" + spec.name[: -len(f"_{arch}")]
+        symbols.add(symbol)
+    assert len(symbols) == len(jit_fp8.ARCHES)
+    [(kernel, binding)] = sources
+    assert kernel.name == "cake_fused_qk_rope_fp8_append_kernel.cu"
+    assert binding.name == "cake_fused_qk_rope_fp8_append_binding.cu"
+    assert kernel.parent == binding.parent
+    assert kernel.parent.name == "cake_fused_qk_rope_fp8_append"
+    kernel_text = kernel.read_text(encoding="utf-8")
+    binding_text = binding.read_text(encoding="utf-8")
+    assert "void CAKE_KERNEL_SYMBOL(" in kernel_text
+    assert "void CAKE_KERNEL_SYMBOL(" in binding_text
+    assert "namespace CAKE_HOST_SHIM_NAMESPACE {" in binding_text
+    default_symbol = "kernel_cake_fused_qk_rope_fp8_append_caf9bdb5445726a94bed"
+    for symbol in symbols - {default_symbol}:
+        assert symbol not in kernel_text and symbol not in binding_text
+
+
+# The 20-hex digest identifies the architecture's build in the Cake export: module
+# name ``cake_fused_qk_rope_fp8_append_<digest>``, spec name ``<module>_<arch>``,
+# kernel symbol ``kernel_<module>``.
+_MODULE_DIGESTS = {
+    "sm_90a": "31cb02d023f2ccb40a0b",
+    "sm_100a": "caf9bdb5445726a94bed",
+    "sm_103a": "f2873a52b7d6a3954655",
+}
+
+_ARG_NAMES = [
+    "qkv",
+    "cos_sin",
+    "seq_lens",
+    "q_indptr",
+    "page_indices",
+    "q_norm_weight",
+    "k_norm_weight",
+    "k_scale",
+    "v_scale",
+    "q_scale_inv",
+    "out_q",
+    "key_cache",
+    "value_cache",
+    "out_k",
+    "out_v",
+    "q_scale",
+    "split_k_flag",
+    "num_rows",
+    "num_requests",
+    "num_q_heads",
+    "num_kv_heads",
+    "page_size",
+    "max_pages_per_request",
+    "max_seqlen",
+    "max_seqlen_aligned",
+    "quant_policy",
+    "norm_policy",
+    "is_prefill",
+    "has_out_kv",
+    "upper_max",
+    "grid_x",
+    "grid_y",
+    "grid_z",
+]
+
+
+def test_jit_spec_matches_the_pinned_module_table(monkeypatch):
+    """CPU-only: spec name, sources and loader flags of every architecture's module
+    against the manifest's module table (``builds`` of the one stage record)."""
+    import flashinfer.jit.core as jit_core
+
+    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+    arch_flags = {
+        "sm_90a": jit_core.sm90a_nvcc_flags,
+        "sm_100a": jit_core.sm100a_nvcc_flags,
+        "sm_103a": jit_core.sm103a_nvcc_flags,
+    }
+    assert set(_MODULE_DIGESTS) == set(jit_fp8.ARCHES)
+    csrc = jit_fp8._get_csrc_dir()
+    for arch, digest in sorted(_MODULE_DIGESTS.items()):
+        module = f"cake_fused_qk_rope_fp8_append_{digest}"
+        spec = jit_fp8.gen_cake_fused_qk_rope_fp8_append_module("fp8_e4m3", arch)
+        assert spec.name == f"{module}_{arch}"
+        assert spec.sources == [
+            csrc / "cake_fused_qk_rope_fp8_append_kernel.cu",
+            csrc / "cake_fused_qk_rope_fp8_append_binding.cu",
+        ]
+        added = [*arch_flags[arch], f"-DCAKE_KERNEL_SYMBOL=kernel_{module}"]
+        assert spec.extra_cuda_cflags[-len(added) :] == added
+        generic = spec.extra_cuda_cflags[: -len(added)]
+        assert not any(flag.startswith(("-gencode", "-DCAKE_")) for flag in generic)
+    assert [name for _kind, name in jit_fp8.arg_plan()] == _ARG_NAMES
 
 
 def rotary_cos_sin_table(
