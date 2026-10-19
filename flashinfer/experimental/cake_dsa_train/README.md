@@ -357,12 +357,11 @@ and `nope_bwd_cast` (the rope cast kernel with `rope_groups = 0`, grid
 token chunk of a multi-pass backward is 4736 at `K_slots` 2048 / 2176, 4864 at
 1152 and 4992 at 128 (the 640 MiB budget, a multiple of 128).
 
-Status of the record: the three shared stages (`nope_bwd_delta`,
-`nope_bwd_compact`, `nope_bwd_cast`) are registered; the forward and main
-stages join the record when their libraries are exported, and until then
-`generated_program_available(..., program=cake_jit.NOPE_PROGRAM)` is `False`,
-the eager NoPE entries raise `NotImplementedError` naming the missing stages and
-the GPU tests of the NoPE block skip.
+`generated_program_available(..., program=cake_jit.NOPE_PROGRAM)` reports
+whether the record registers the stages a call needs for the device; the NoPE
+GPU tests additionally skip while `build.json` lacks a registered NoPE library
+(the export delivers the libraries; `scripts/check_cake_build_manifests.py`
+reports that gap).
 
 ## Layout of this package
 
@@ -409,8 +408,8 @@ backward preprocess, backward main (single-pass and key-range-pass form with
 its compaction, each with its natural-layout direct-accumulation variant) and
 cast stages plus the key-range-pass and direct-accumulation policies, exported
 from the kernel snapshot named in the pull request, and the NoPE program's
-record with its shared stages and policies (see "NoPE (zero-rope) program" for
-the stages that join it with their export).
+record with its eight stages (three shared with the rope program) and its own
+key-range-pass and direct-accumulation policies (see "NoPE (zero-rope) program").
 
 Tests: `tests/experimental/test_cake_dsa_train.py` (the backend suite: imports
 only this package; skips without a registered program or a compute capability

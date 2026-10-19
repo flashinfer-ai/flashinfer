@@ -40,7 +40,7 @@ from flashinfer.dsa_sparse_attention import (
     dsa_sparse_attention_nope_varlen,
     dsa_sparse_attention_varlen,
 )
-from flashinfer.experimental.cake_dsa_train import cake_backend, cake_jit
+from flashinfer.experimental.cake_dsa_train import cake_backend, cake_build, cake_jit
 from flashinfer.experimental.cake_dsa_train.cake_backend import (
     D_LATENT,
     D_QK,
@@ -1113,6 +1113,19 @@ def _require_nope_program(*, backward: bool = False):
             + ("backward" if backward else "forward")
             + " stages for this device"
         )
+    record = cake_jit.record(NOPE_PROGRAM)
+    names = {entry["name"] for entry in cake_build.manifest()["libraries"]}
+    missing = sorted(
+        f"{record[stage]['library']}_{arch}"
+        for stage in cake_jit.registered_stages(NOPE_PROGRAM)
+        for arch in record["arches"]
+        if f"{record[stage]['library']}_{arch}" not in names
+    )
+    if missing:
+        pytest.skip(
+            "generated program not available: build.json lacks the NoPE libraries "
+            f"{missing[:2]}... ({len(missing)} entries; the export delivers them)"
+        )
 
 
 def _nope_inputs(seq_q, seq_k, *, seed, topk, index="iid", **kw):
@@ -1132,6 +1145,11 @@ def _check_nope_grads(dq, dkv, ref):
         assert err <= FLOOR_MARGIN * floor + FLOOR_ABS, (
             f"{name}: rel-L2 {err:.6f} vs floor {floor:.6f}"
         )
+    # the element-wise dq band holds per (token, head) row, normalised by the row's exact RMS (floor 1e-3)
+    scale = ref["dq"].pow(2).mean(-1, keepdim=True).sqrt().clamp_min(1e-3)
+    torch.testing.assert_close(
+        dq.double() / scale, ref["dq"] / scale, atol=2e-2, rtol=1e-2
+    )
 
 
 def test_public_nope_api_is_marked_experimental():

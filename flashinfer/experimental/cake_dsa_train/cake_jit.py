@@ -186,19 +186,24 @@ MODULES: dict[str, dict[str, Any]] = {
     # per key.  Its key-range-pass policy is re-calibrated for that row size
     # (``key_bytes`` 2048; ``dq_partial_bytes_per_token`` = 64 heads x 512 x 4 B
     # per token of FP32 dQ partial).  The delta, compaction and cast stages are
-    # rope-independent kernels shared with the RoPE program (same libraries);
-    # the forward and the main backward stages are the NoPE kernels and join
-    # this record, in the launch order ``nope_fwd, nope_bwd_delta,
-    # nope_bwd_main, nope_bwd_main_natural, nope_bwd_compact, nope_bwd_main_pass,
-    # nope_bwd_main_pass_natural, nope_bwd_cast``, when their generated programs
-    # are delivered to ``build.json``; until then the record carries the shared
-    # stages only and ``cake_backend.generated_program_available(...,
-    # program=NOPE_PROGRAM)`` is False.
+    # rope-independent kernels shared with the RoPE program (same libraries, same
+    # launch geometry; the cast runs over the one 512-wide accumulator, 16 groups
+    # per key); the forward (320 threads, 222,464 B dynamic shared memory) and the
+    # four main backward forms (640 threads, 214,208 B; permuted / natural-layout
+    # accumulation, single-pass / key-range-pass) are the NoPE kernels.  Stage
+    # order = launch order.  ``build.json`` carries every library named here
+    # once the export delivers it; ``scripts/check_cake_build_manifests.py``
+    # reports a registry library the manifest lacks.
     "cake_dsa_h64_nope_train": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "stages": [
+            "nope_fwd",
             "nope_bwd_delta",
+            "nope_bwd_main",
+            "nope_bwd_main_natural",
             "nope_bwd_compact",
+            "nope_bwd_main_pass",
+            "nope_bwd_main_pass_natural",
             "nope_bwd_cast",
         ],
         "key_pass_policy": {
@@ -233,6 +238,18 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
         "dkv_direct": {"min_keys_per_query": 4},
+        "nope_fwd": {
+            "module": "cake_dsa_h64_nope_train_46cdc056c891876ed545",
+            "library": "cake_dsa_h64_nope_train_46cdc056c891876ed545",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [320, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 222464,
+                "use_pdl": False,
+            },
+        },
         "nope_bwd_delta": {
             "module": "cake_dsa_h64_train_da16f2d6e1b0fa6a05fd",
             "library": "cake_dsa_h64_train_da16f2d6e1b0fa6a05fd",
@@ -245,6 +262,30 @@ MODULES: dict[str, dict[str, Any]] = {
                 "use_pdl": False,
             },
         },
+        "nope_bwd_main": {
+            "module": "cake_dsa_h64_nope_train_d7b52eccaf718555e88f",
+            "library": "cake_dsa_h64_nope_train_d7b52eccaf718555e88f",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [640, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 214208,
+                "use_pdl": False,
+            },
+        },
+        "nope_bwd_main_natural": {
+            "module": "cake_dsa_h64_nope_train_4ef6557b664950985182",
+            "library": "cake_dsa_h64_nope_train_4ef6557b664950985182",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [640, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 214208,
+                "use_pdl": False,
+            },
+        },
         "nope_bwd_compact": {
             "module": "cake_dsa_h64_train_19c560118a407f5473fe",
             "library": "cake_dsa_h64_train_19c560118a407f5473fe",
@@ -254,6 +295,30 @@ MODULES: dict[str, dict[str, Any]] = {
                 "cluster": [1, 1, 1],
                 "cooperative": False,
                 "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "nope_bwd_main_pass": {
+            "module": "cake_dsa_h64_nope_train_90ab03044736858291f5",
+            "library": "cake_dsa_h64_nope_train_90ab03044736858291f5",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [640, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 214208,
+                "use_pdl": False,
+            },
+        },
+        "nope_bwd_main_pass_natural": {
+            "module": "cake_dsa_h64_nope_train_bf83fa2a070687feb74c",
+            "library": "cake_dsa_h64_nope_train_bf83fa2a070687feb74c",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [640, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 214208,
                 "use_pdl": False,
             },
         },
