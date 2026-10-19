@@ -218,11 +218,15 @@ that writes the registry verifies the record against them before it is frozen.
 * `cake_backend.py` -- validation, planning, argument binding, the prepared
   runner and the eager entry point.
 * `csrc/cake_dsa_indexer_topk/` -- generated kernel and binding translation
-  units: one binding per program and one kernel per program or scan lever-twin
-  group (a twin's `build.json` entry builds its sibling's kernel with the
-  compile definitions that select its lever text and kernel symbol; those
-  shared kernels and entries are a hand fold of the exported files, pending
-  regeneration by the exporter), with the shared device
+  units: one binding per program and one kernel per program or per group of
+  programs that differ only in their constants -- a scan lever-twin group,
+  the rank-finalize programs of one window form, the CUB finalize programs
+  (such a program's `build.json` entry builds the group's kernel with the
+  compile definitions that select its lever text or its window / thread-count
+  constants and its own kernel symbol, `CAKE_PROGRAM_KERNEL`, the source's
+  `#ifndef` defaults naming its own program; those shared kernels and entries
+  are a hand fold of the exported files, pending regeneration by the
+  exporter), with the shared device
   preamble `cake_dsa_indexer_topk_device_common.cuh` and the shared launch helpers
   `cake_dsa_indexer_topk_host_common.cuh` delivered once; the preamble's helper
   functions are content-addressed files under `csrc/cake_device_helpers/`

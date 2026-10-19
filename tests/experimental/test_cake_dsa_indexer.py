@@ -417,8 +417,9 @@ _PROGRAM_KERNEL_DEFAULT = "#define CAKE_PROGRAM_KERNEL "
 
 
 def test_shared_kernel_sources_keep_distinct_symbols():
-    # Scan lever twins build one kernel translation unit: the program whose source it
-    # is names its symbol through the file's ``CAKE_PROGRAM_KERNEL`` default, every
+    # Programs that differ only in their constants (scan lever twins, finalize
+    # groups) build one kernel translation unit: the program whose source it is
+    # names its symbol through the file's ``CAKE_PROGRAM_KERNEL`` default, every
     # other entry names its own symbol on the compile line.  All libraries of one
     # architecture load into one process, so every entry must still produce
     # ``kernel_<program>``.

@@ -25,11 +25,12 @@ from . import cake_build
 # trimmed by hand here pending exporter support.
 #
 # Every program is one device translation unit plus its host binding, shared
-# by the architectures listed in its record; a scan lever twin builds its
-# sibling's kernel translation unit with the compile definitions of its
-# ``build.json`` entry (those shared kernels and entries are a hand fold of
-# the exported files, pending regeneration by the exporter).  ``build.json``
-# next to this file
+# by the architectures listed in its record; a program that differs from a
+# sibling only in its constants (a scan lever twin, a rank-finalize program of
+# the same window form, a CUB finalize program) builds the sibling's kernel
+# translation unit with the compile definitions of its ``build.json`` entry
+# (those shared kernels and entries are a hand fold of the exported files,
+# pending regeneration by the exporter).  ``build.json`` next to this file
 # (schema ``cake-build/1``, read by ``cake_build``) is the only record of what
 # to compile: one entry ``<library>_<arch>`` per program and architecture with
 # its sources, nvcc flags and digests.  ``cake_build.load_library`` serves the
