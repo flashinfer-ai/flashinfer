@@ -78,10 +78,22 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
     return u;
 }
 
+// Shared by every record that names this translation unit in its sources: the record's
+// compile_flags select the lever arms below (-DCAKE_LEVER_PX=<n>; the guarded defaults are this
+// file's own values) and rename the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>; every
+// JIT library of the family exports a distinct kernel); the defaults name this file's own
+// program.
+#ifndef CAKE_LEVER_PX
+#define CAKE_LEVER_PX 0
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_kimi_k3_fp8_projection_6c9831e79f12b9d92832
+#endif
+
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) __cluster_dims__(4,1,1) void
-kernel_cake_kimi_k3_fp8_projection_6c9831e79f12b9d92832(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap SFW, const __grid_constant__ CUtensorMap SFX, __nv_bfloat16* __restrict__ out, float* __restrict__ partials, unsigned int* __restrict__ counters, int M, int n_tiles, int n_valid, int ldo, int num_k_iters, int sf_k_tiles, int split, int tok_per_cta, int total_work, int store_vec, __nv_bfloat16* __restrict__ x, int K, const __grid_constant__ CUtensorMap XB)
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap SFW, const __grid_constant__ CUtensorMap SFX, __nv_bfloat16* __restrict__ out, float* __restrict__ partials, unsigned int* __restrict__ counters, int M, int n_tiles, int n_valid, int ldo, int num_k_iters, int sf_k_tiles, int split, int tok_per_cta, int total_work, int store_vec, __nv_bfloat16* __restrict__ x, int K, const __grid_constant__ CUtensorMap XB)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -224,6 +236,17 @@ kernel_cake_kimi_k3_fp8_projection_6c9831e79f12b9d92832(const __grid_constant__ 
                     #pragma unroll 1
                     for (int i = 0; i < k_count; i++) {
                         int iter_k = k_begin + i;
+#if CAKE_LEVER_PX == 1
+                        if (i == 0) {
+                            if (k_begin < k_begin + k_count) {
+                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&XB))), "r"((int)(0)), "r"((int)(x_row)), "r"((int)(k_begin * 2)) : "memory");
+                            }
+                        }
+                        int k_px = iter_k + 1;
+                        if (k_px < k_begin + k_count) {
+                            asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&XB))), "r"((int)(0)), "r"((int)(x_row)), "r"((int)(k_px * 2)) : "memory");
+                        }
+#endif
                         mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
                         int k_group = iter_k * 2;
                         tma_3d_gmem2smem(smem_w_addr + load_stage * 51200, (&W), 0, 0, w_tile0 + k_group, tma_full_addr + (load_stage) * 8);
