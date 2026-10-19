@@ -114,6 +114,9 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.gdn_kernels.experimental.kernel" = ["*.cu"]
 # Generated sources for the experimental exact-SM103a MXFP8 MegaMoE backend.
 "flashinfer.experimental.cake_mxfp8_megamoe_ep16" = ["csrc/**"]
+# Generated programs, hand-written bindings and manifest of the experimental
+# exact-SM103a W8A8 MXFP8 MegaMoE EP16 backend, compiled on demand.
+"flashinfer.experimental.cake_w8a8_megamoe_ep16" = ["csrc/**"]
 # Generated sources for the experimental exact-SM100a/SM103a/SM107a ragged BF16 MoE grouped GEMM backend.
 "flashinfer.experimental.cake_moe_grouped_gemm" = ["csrc/**", "build.json"]
 # Generated sources for the experimental exact-SM100a/SM107a dense projection GEMM backend.
