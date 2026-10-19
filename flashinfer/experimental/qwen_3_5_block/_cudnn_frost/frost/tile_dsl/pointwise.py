@@ -554,6 +554,18 @@ def vec_scale_pair(vec, scalar, N):
     return cutlass.Vector(vector.shape_cast(flat_ty, result), dtype=cutlass.Float32)
 
 
+def vec_select_zero(pred, vec, N):
+    """``select(pred, 0, vec)`` on a ``vector<N x f32>``: EXACT +0.0 in every element where the thread's ``pred`` (one i1) holds,
+    ``vec`` unchanged elsewhere -- one ``arith.select`` over the whole vector (a SEL per element in the SASS, no FMUL).
+
+    The substitute for folding a zero into a scale (``vec * 0``): the multiply keeps a NaN / Inf operand (``NaN * 0 = NaN``), and an
+    accumulator can hold exactly that residue (a stage that ran zero iterations, a sub-tile whose body was skipped), so an epilogue
+    that must store zeros SELECTS them after the arithmetic (sdpa-invariants s 2)."""
+    flat_ty = _ir.VectorType.get([N], T_.f32())
+    zeros = vector.broadcast(flat_ty, cutlass.Float32(0.0).ir_value())
+    return cutlass.Vector(arith.select(pred.ir_value(), zeros, vec.ir_value()), dtype=cutlass.Float32)
+
+
 @cutlass.cute.jit
 def f16x2_to_f32(word, *, dtype=cutlass.Float16):
     """Unpack one Int32 (= 2 packed halves) into ``(lo_f32, hi_f32)`` Float32.
@@ -816,6 +828,23 @@ def sigmoid2(x_lo, x_hi):
     halving and the scale-bias folded into one FMUL2 and one FFMA2."""
     half = opaque_f32_zero() + cutlass.Float32(0.5)
     scaled_lo, scaled_hi = fmul2(x_lo, x_hi, half, half)
+    tanh_lo = cute.math.tanh(scaled_lo, approx=True)
+    tanh_hi = cute.math.tanh(scaled_hi, approx=True)
+    return ffma2(tanh_lo, tanh_hi, half, half, half, half)
+
+
+@cute.jit
+def sigmoid2_biased_half(x_lo, x_hi, hb_lo, hb_hi):
+    """``(sigmoid(x_lo + b_lo), sigmoid(x_hi + b_hi))`` from the HALVED biases ``hb = b / 2``: one ``fma.rn.f32x2`` forms the tanh
+    argument ``x / 2 + b / 2`` in place of :func:`sigmoid2`'s ``add.f32x2`` (the bias add) + ``mul.f32x2`` (the halving), then the tanh
+    identity exactly as :func:`sigmoid2`.  The caller stages ``hb`` once (a bf16 bias halved in fp32 is exact down to the last bf16
+    subnormal).  OUTPUT-BITWISE with ``sigmoid2(*fadd2(x_lo, x_hi, b_lo, b_hi))`` on every input: for ``|x + b| >= 2^-125`` the fp32
+    grid is self-similar under a power-of-two scale, so ``RN(x / 2 + b / 2) = RN(x + b) / 2`` = the two-op form's argument bitwise; below
+    that both arguments are tiny (``|tanh| < 2^-25``) and ``RN(tanh / 2 + 1 / 2)`` is exactly 0.5 on both; an infinite ``x`` or an
+    overflowing sum saturates ``tanh.approx`` to +-1 on both; NaN propagates on both.  Measured use: the LN-prologue dual GEMM's gated
+    epilogue with per-channel biases (`epi_math="packed_biasfold"`): -16 FADD2 per 32-channel subtile per lane."""
+    half = opaque_f32_zero() + cutlass.Float32(0.5)
+    scaled_lo, scaled_hi = ffma2(x_lo, x_hi, half, half, hb_lo, hb_hi)
     tanh_lo = cute.math.tanh(scaled_lo, approx=True)
     tanh_hi = cute.math.tanh(scaled_hi, approx=True)
     return ffma2(tanh_lo, tanh_hi, half, half, half, half)

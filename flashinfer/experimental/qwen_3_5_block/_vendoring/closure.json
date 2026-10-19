@@ -1,9 +1,9 @@
 {
- "commit": "aba744cd6",
+ "commit": "c9f3118a1",
  "fe": "cudnn_frontend",
  "runs": {
   "host_declare_cpu": {
-   "n_cudnn_modules": 32,
+   "n_cudnn_modules": 36,
    "facts": {
     "lower_to_cpp_calls": 0,
     "create_handle_calls": 0,
@@ -17,7 +17,7 @@
    }
   },
   "node_exec_decode_flagset": {
-   "n_cudnn_modules": 89,
+   "n_cudnn_modules": 94,
    "facts": {
     "lower_to_cpp_calls": 0,
     "create_handle_calls": 0,
@@ -28,11 +28,11 @@
     "decode": {
      "check_support": {
       "ok": true,
-      "s": 1.643
+      "s": 0.798
      },
      "compile": {
       "ok": true,
-      "s": 16.654
+      "s": 14.428
      },
      "workspace": {
       "ok": true,
@@ -40,11 +40,11 @@
      },
      "execute": {
       "ok": true,
-      "s": 0.004
+      "s": 0.039
      },
      "synchronize": {
       "ok": true,
-      "s": 0.533
+      "s": 0.227
      },
      "execute2": {
       "ok": true
@@ -53,7 +53,7 @@
    }
   },
   "node_exec_decode_unset": {
-   "n_cudnn_modules": 88,
+   "n_cudnn_modules": 93,
    "facts": {
     "lower_to_cpp_calls": 2,
     "create_handle_calls": 1,
@@ -69,11 +69,11 @@
     "decode": {
      "check_support": {
       "ok": true,
-      "s": 2.338
+      "s": 1.864
      },
      "compile": {
       "ok": true,
-      "s": 20.514
+      "s": 18.498
      },
      "workspace": {
       "ok": true,
@@ -81,11 +81,11 @@
      },
      "execute": {
       "ok": true,
-      "s": 0.03
+      "s": 0.034
      },
      "synchronize": {
       "ok": true,
-      "s": 0.536
+      "s": 0.55
      },
      "execute2": {
       "ok": true
@@ -94,7 +94,7 @@
    }
   },
   "node_exec_extend_unset": {
-   "n_cudnn_modules": 85,
+   "n_cudnn_modules": 89,
    "facts": {
     "lower_to_cpp_calls": 1,
     "create_handle_calls": 1,
@@ -109,11 +109,11 @@
     "extend": {
      "check_support": {
       "ok": true,
-      "s": 0.256
+      "s": 0.26
      },
      "compile": {
       "ok": true,
-      "s": 11.745
+      "s": 13.5
      },
      "workspace": {
       "ok": true,
@@ -121,11 +121,11 @@
      },
      "execute": {
       "ok": true,
-      "s": 0.028
+      "s": 0.003
      },
      "synchronize": {
       "ok": true,
-      "s": 0.228
+      "s": 0.224
      },
      "execute2": {
       "ok": true
@@ -134,7 +134,7 @@
    }
   },
   "node_exec_prefill_unset": {
-   "n_cudnn_modules": 81,
+   "n_cudnn_modules": 85,
    "facts": {
     "lower_to_cpp_calls": 1,
     "create_handle_calls": 1,
@@ -149,11 +149,11 @@
     "prefill": {
      "check_support": {
       "ok": true,
-      "s": 0.41
+      "s": 0.284
      },
      "compile": {
       "ok": true,
-      "s": 9.784
+      "s": 14.765
      },
      "workspace": {
       "ok": true,
@@ -161,11 +161,11 @@
      },
      "execute": {
       "ok": true,
-      "s": 0.002
+      "s": 0.003
      },
      "synchronize": {
       "ok": true,
-      "s": 0.142
+      "s": 0.241
      },
      "execute2": {
       "ok": true
@@ -174,29 +174,29 @@
    }
   }
  },
- "n_files": 98,
- "total_bytes": 4526982,
- "total_lines": 86196,
+ "n_files": 102,
+ "total_bytes": 5161920,
+ "total_lines": 95673,
  "by_group": {
   "root": {
    "files": 14,
-   "bytes": 346174,
-   "lines": 7514
+   "bytes": 349263,
+   "lines": 7560
   },
   "engines": {
    "files": 5,
-   "bytes": 57650,
-   "lines": 1298
+   "bytes": 57713,
+   "lines": 1299
   },
   "frost": {
    "files": 8,
-   "bytes": 95923,
-   "lines": 2157
+   "bytes": 96736,
+   "lines": 2169
   },
   "frost.tile_dsl": {
    "files": 15,
-   "bytes": 244333,
-   "lines": 5088
+   "bytes": 263613,
+   "lines": 5393
   },
   "gated_attention_block": {
    "files": 12,
@@ -219,24 +219,24 @@
    "lines": 8985
   },
   "sdpa": {
-   "files": 2,
-   "bytes": 70568,
-   "lines": 1465
+   "files": 5,
+   "bytes": 275268,
+   "lines": 5051
   },
   "sdpa.fwd": {
-   "files": 10,
-   "bytes": 1075259,
-   "lines": 19452
+   "files": 11,
+   "bytes": 1470666,
+   "lines": 24799
   },
   "sdpa.fwd.kernels": {
    "files": 11,
-   "bytes": 581680,
-   "lines": 11324
+   "bytes": 593266,
+   "lines": 11504
   }
  },
  "licenses": {
-  "Apache-2.0": 42,
-  "MIT": 55,
+  "Apache-2.0": 43,
+  "MIT": 58,
   "Apache-2.0 AND MIT": 1
  },
  "files": [
@@ -364,9 +364,9 @@
    "path": "python/cudnn/_pygraph.py",
    "module": "cudnn._pygraph",
    "group": "root",
-   "bytes": 207475,
-   "lines": 4152,
-   "sha256": "8c2c446bd2eb735863b5a7d118339b840986e4e8f45e559e1b905b01cae43a3e",
+   "bytes": 208176,
+   "lines": 4161,
+   "sha256": "7b033ce20a300a3a933d0ea67970a123dff21ed7c551fd5e9dfd5728d703587f",
    "license": "Apache-2.0",
    "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -462,9 +462,9 @@
    "path": "python/cudnn/api_base.py",
    "module": "cudnn.api_base",
    "group": "root",
-   "bytes": 51853,
-   "lines": 1214,
-   "sha256": "ffe573d3c8a50c1694d125c774b8a05f7dc6f56a0fcff0ca5eb76248a4642741",
+   "bytes": 54241,
+   "lines": 1251,
+   "sha256": "6b138157b0d9af9dfd3191b7deeff4817db75daaa460c59a6ad831ac37896ddd",
    "license": "Apache-2.0",
    "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -596,9 +596,9 @@
    "path": "python/cudnn/engines/manifest.py",
    "module": "cudnn.engines.manifest",
    "group": "engines",
-   "bytes": 19928,
-   "lines": 478,
-   "sha256": "4c301605766a07538c9bf36e5c4f4df28a6a247ccdfffc4a4d41f136db2db122",
+   "bytes": 19991,
+   "lines": 479,
+   "sha256": "9506f11437e264fe1b3e726a6dbfbf9bc459d520d90b6aaa9411c5e258e87162",
    "license": "Apache-2.0",
    "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -738,9 +738,9 @@
    "path": "python/cudnn/frost/template_loader.py",
    "module": "cudnn.frost.template_loader",
    "group": "frost",
-   "bytes": 3858,
-   "lines": 85,
-   "sha256": "e18363e1d1c8fa60fb8e3ec5ede7493f96639951a0fb6919e9528cafed50d72a",
+   "bytes": 4671,
+   "lines": 97,
+   "sha256": "d5d8d4f2bc14cf1980b663586fa357e458455bd8afaf986a7158d42cce183384",
    "license": "MIT",
    "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -772,9 +772,9 @@
    "path": "python/cudnn/frost/tile_dsl/barrier.py",
    "module": "cudnn.frost.tile_dsl.barrier",
    "group": "frost.tile_dsl",
-   "bytes": 23354,
-   "lines": 425,
-   "sha256": "5fa3b28c75e67a519fdf8b469e5aafe2d7465c88f2f0be7e78147211d1ccb9f6",
+   "bytes": 27529,
+   "lines": 465,
+   "sha256": "975935618e5389c61ab3f7991d4ac99a13960613bbb01bf3ffc5c9bd46501280",
    "license": "MIT",
    "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -823,9 +823,9 @@
    "path": "python/cudnn/frost/tile_dsl/mask.py",
    "module": "cudnn.frost.tile_dsl.mask",
    "group": "frost.tile_dsl",
-   "bytes": 24090,
-   "lines": 484,
-   "sha256": "d1202e5850ae4b8a3a99d150e9de999d2b467e4480fd8551d5a1d16db00c0e63",
+   "bytes": 26839,
+   "lines": 526,
+   "sha256": "a1da90f9a141d76d55797573d6ea79af3316a9ecb56f66f6a17e583a611de52a",
    "license": "MIT",
    "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -861,9 +861,9 @@
    "path": "python/cudnn/frost/tile_dsl/pointwise.py",
    "module": "cudnn.frost.tile_dsl.pointwise",
    "group": "frost.tile_dsl",
-   "bytes": 66895,
-   "lines": 1216,
-   "sha256": "20e771cdf1c2656c4bed0ea732add360a8374bf95931168a2732f7e0adfd6285",
+   "bytes": 69159,
+   "lines": 1245,
+   "sha256": "dcfd2ca268f0ccd5d10bfe2a8e8647dd2fe61f90d078e1221926c6e868cbff29",
    "license": "MIT",
    "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -916,9 +916,9 @@
    "path": "python/cudnn/frost/tile_dsl/scheduler.py",
    "module": "cudnn.frost.tile_dsl.scheduler",
    "group": "frost.tile_dsl",
-   "bytes": 22230,
-   "lines": 397,
-   "sha256": "7543bfd891f3a9ef2e3161d44801b641d3f62e5d4f205735106e02330a379d2c",
+   "bytes": 24363,
+   "lines": 437,
+   "sha256": "6eaa7c9e8b67619a0c25fb7c3d4dcbe58be94d34d76ae3a0c0033c5f837f17f5",
    "license": "MIT",
    "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -970,9 +970,9 @@
    "path": "python/cudnn/frost/tile_dsl/thd.py",
    "module": "cudnn.frost.tile_dsl.thd",
    "group": "frost.tile_dsl",
-   "bytes": 28735,
-   "lines": 587,
-   "sha256": "671ef808b14d19c12e86259c319d99f725bf8aa1cd699ed85d184c4e0d9a45f1",
+   "bytes": 31816,
+   "lines": 647,
+   "sha256": "5c5ab52a587312eae70e894fb6b1c6779a99539e8fa6afa45d6b739012c6adfe",
    "license": "MIT",
    "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -987,9 +987,9 @@
    "path": "python/cudnn/frost/tile_dsl/tma.py",
    "module": "cudnn.frost.tile_dsl.tma",
    "group": "frost.tile_dsl",
-   "bytes": 30661,
-   "lines": 686,
-   "sha256": "fa787443cca6f00b92a72f3a3d4701ee4146be3af17cea504dbac43bbf2ed3ca",
+   "bytes": 35539,
+   "lines": 780,
+   "sha256": "eed7c12de34aff9dad7a286709d175b91c7d52c578cb923f1dd08f45d92c2776",
    "license": "MIT",
    "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -1990,6 +1990,62 @@
    "root_cudnn_imports": []
   },
   {
+   "path": "python/cudnn/sdpa/bwd/__init__.py",
+   "module": "cudnn.sdpa.bwd",
+   "group": "sdpa",
+   "bytes": 2102,
+   "lines": 49,
+   "sha256": "f84b1a1eec4d5e856884381cbcdbf8a9eecb335d0649ad8d5729929dc1b1292d",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/bwd/config_sm100.py",
+   "module": "cudnn.sdpa.bwd.config_sm100",
+   "group": "sdpa",
+   "bytes": 79768,
+   "lines": 1324,
+   "sha256": "386a8b00e5fe049ffb5c39568ae93ef0a4a7c59243b81c20d96e3664941e00c8",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.tile_dsl.constants"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/bwd/config_sm107.py",
+   "module": "cudnn.sdpa.bwd.config_sm107",
+   "group": "sdpa",
+   "bytes": 119780,
+   "lines": 2166,
+   "sha256": "4af070630b87758b9dde39a1465d6556c99aec509a8f9a5981a01f9173937127",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.tile_dsl.constants",
+    "cudnn.sdpa.bwd.config_sm100"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
    "path": "python/cudnn/sdpa/fwd/__init__.py",
    "module": "cudnn.sdpa.fwd",
    "group": "sdpa.fwd",
@@ -2010,9 +2066,9 @@
    "path": "python/cudnn/sdpa/fwd/api_dsl.py",
    "module": "cudnn.sdpa.fwd.api_dsl",
    "group": "sdpa.fwd",
-   "bytes": 331251,
-   "lines": 6141,
-   "sha256": "deb1ce83f773344c816287d9fc9f5f6a781ce256da23f45365adcc4be774d22f",
+   "bytes": 406323,
+   "lines": 7147,
+   "sha256": "16bffa9bfa91d1c45f651943e7a4e2ed970bc254a45de70e405c838e99ad4be2",
    "license": "Apache-2.0 AND MIT",
    "copyright": "# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -2042,12 +2098,15 @@
     "cudnn.frost.buffers (in sdpa_fwd_wrapper_sm80)",
     "cudnn.frost.tile_dsl.thd (in _compile_thd_meta)",
     "cudnn.frost.tile_dsl.thd (in _execute_thd)",
+    "cudnn.frost.tile_dsl.thd (in _thd_meta_words)",
     "cudnn.frost.tile_dsl.thd (in _thd_plan)",
     "cudnn.frost.tile_dsl.thd (in scratch_workspace_bytes)",
     "cudnn.graph_types (in _prepared_operand_layout)",
     "cudnn.sdpa.bwd.kernels.thd_helpers (in _compile_thd_meta)",
+    "cudnn.sdpa.fwd.config_sm100 (in _load_kernel_template)",
     "cudnn.sdpa.fwd.config_sm100 (in _prepared_operand_layout)",
     "cudnn.sdpa.fwd.config_sm107 (in __init__)",
+    "cudnn.sdpa.fwd.config_sm107 (in _load_kernel_template)",
     "cudnn.sdpa.fwd.config_sm80 (in _execute_thd)",
     "cudnn.sdpa.fwd.config_sm80 (in _sm80_thd_forward)",
     "cudnn.sdpa.fwd.config_sm80 (in compile)",
@@ -2093,19 +2152,40 @@
    ]
   },
   {
-   "path": "python/cudnn/sdpa/fwd/config_sm100.py",
-   "module": "cudnn.sdpa.fwd.config_sm100",
+   "path": "python/cudnn/sdpa/fwd/config_d128_family.py",
+   "module": "cudnn.sdpa.fwd.config_d128_family",
    "group": "sdpa.fwd",
-   "bytes": 159537,
-   "lines": 3093,
-   "sha256": "f69a55192a75de824a34dab86d1b0ebe9adad37d493e215970323979fa859913",
+   "bytes": 71281,
+   "lines": 1106,
+   "sha256": "b067d555e5a589e66eeb76e2f6f268dc700fea969b935d726d8bcd56481c35f3",
    "license": "MIT",
    "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
    "opened_by_path": false,
    "why": "traced on the serving route",
    "top_level_cudnn_imports": [
-    "cudnn.frost.tile_dsl.constants"
+    "cudnn.frost.tile_dsl.constants",
+    "cudnn.sdpa.bwd.config_sm107"
+   ],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
+   "path": "python/cudnn/sdpa/fwd/config_sm100.py",
+   "module": "cudnn.sdpa.fwd.config_sm100",
+   "group": "sdpa.fwd",
+   "bytes": 218521,
+   "lines": 3879,
+   "sha256": "1407bb555d3f29d983923c852e76f33bea427b0aa83c6c903c225497466898a2",
+   "license": "MIT",
+   "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [
+    "cudnn.frost.tile_dsl.constants",
+    "cudnn.sdpa.fwd.config_d128_family"
    ],
    "lazy_cudnn_imports": [
     "cudnn.frost.tile_dsl.mask (in canonicalize_d192_lowering)"
@@ -2117,9 +2197,9 @@
    "path": "python/cudnn/sdpa/fwd/config_sm107.py",
    "module": "cudnn.sdpa.fwd.config_sm107",
    "group": "sdpa.fwd",
-   "bytes": 146628,
-   "lines": 2596,
-   "sha256": "3df1a2da93927605cc4cd8a28ef6b38fd9fae62958792bf7aaf10ce247db0c55",
+   "bytes": 252648,
+   "lines": 3849,
+   "sha256": "842052337e36909af50a0e0097d150be767bf496c4e39891af968792c7da0256",
    "license": "MIT",
    "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -2127,6 +2207,8 @@
    "why": "traced on the serving route",
    "top_level_cudnn_imports": [
     "cudnn.frost.tile_dsl.constants",
+    "cudnn.sdpa.bwd.config_sm107",
+    "cudnn.sdpa.fwd.config_d128_family",
     "cudnn.sdpa.fwd.config_sm100"
    ],
    "lazy_cudnn_imports": [],
@@ -2197,9 +2279,9 @@
    "path": "python/cudnn/sdpa/fwd/engines.py",
    "module": "cudnn.sdpa.fwd.engines",
    "group": "sdpa.fwd",
-   "bytes": 184802,
-   "lines": 3091,
-   "sha256": "cb3231d4f7030d44cd2aed178e4a41ca9dc0a1510c21359d39a3df8a07ea6eed",
+   "bytes": 226161,
+   "lines": 3630,
+   "sha256": "cf0625180e7a581d68c22c85b4d7ba8e777e739a6c883feb1568eaf041a91041",
    "license": "MIT",
    "copyright": "# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -2209,6 +2291,7 @@
     "cudnn",
     "cudnn.frost.buffers",
     "cudnn.frost.tile_dsl.constants",
+    "cudnn.sdpa.fwd.config_d128_family",
     "cudnn.sdpa.fwd.config_sm100",
     "cudnn.sdpa.fwd.config_sm107",
     "cudnn.sdpa.fwd.config_sm120",
@@ -2216,10 +2299,13 @@
    ],
    "lazy_cudnn_imports": [
     "cudnn.graph_types (in _prepared_decline_reason)",
+    "cudnn.graph_types (in _resident_arm_layout_decline)",
     "cudnn.graph_types (in lower_dsl_prefill._layout)",
     "cudnn.sdpa.fwd.api_dsl (in _adapter)",
     "cudnn.sdpa.fwd.api_dsl (in lower_dsl_prefill)",
     "cudnn.sdpa.fwd.config_sm100 (in _prepared_decline_reason)",
+    "cudnn.sdpa.fwd.config_sm100 (in _resident_arm_layout_decline)",
+    "cudnn.sdpa.fwd.config_sm107 (in _bias_arm_decline)",
     "cudnn.sdpa.fwd.config_sm120 (in _sm120_fp8_spec)",
     "cudnn.sdpa.fwd.config_sm120 (in _sm120_mxfp8_spec)",
     "cudnn.sdpa.fwd.config_sm120 (in _sm120_spec)",
@@ -2239,9 +2325,9 @@
    "path": "python/cudnn/sdpa/fwd/heuristics.py",
    "module": "cudnn.sdpa.fwd.heuristics",
    "group": "sdpa.fwd",
-   "bytes": 167800,
-   "lines": 2859,
-   "sha256": "e5577837edd039189c650112dc5207f82e9e66495d1c85ac76f2226ece1c9667",
+   "bytes": 173137,
+   "lines": 2922,
+   "sha256": "35f5995c1cbb28e461d40a6cfb1ca9383ec27555e9481686e3b4d5e30c90cc0b",
    "license": "Apache-2.0",
    "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -2252,6 +2338,7 @@
     "cudnn.engines.base",
     "cudnn.frost.tile_dsl.constants",
     "cudnn.sdpa.fwd.config_sm100",
+    "cudnn.sdpa.fwd.config_sm107",
     "cudnn.sdpa.fwd.config_sm120",
     "cudnn.sdpa.fwd.engines"
    ],
@@ -2288,9 +2375,9 @@
    "path": "python/cudnn/sdpa/fwd/kernels/_common_blackwell.py",
    "module": "cudnn.sdpa.fwd.kernels._common_blackwell",
    "group": "sdpa.fwd.kernels",
-   "bytes": 90585,
-   "lines": 1603,
-   "sha256": "b8b84011aae6656a57122c7d71706341459a32402f85280c510aae3ac2fe5096",
+   "bytes": 100984,
+   "lines": 1760,
+   "sha256": "49c37fd0da51bbc458b2a42ada8fe7f2fe4f0332be305ddb7a957c89408aeb0b",
    "license": "MIT",
    "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -2301,6 +2388,7 @@
     "cudnn.frost.tile_dsl.mask",
     "cudnn.frost.tile_dsl.pointwise",
     "cudnn.frost.tile_dsl.scheduler",
+    "cudnn.frost.tile_dsl.thd",
     "cudnn.frost.tile_dsl.tma",
     "cudnn.sdpa.fwd.config_sm100"
    ],
@@ -2366,9 +2454,9 @@
    "path": "python/cudnn/sdpa/fwd/kernels/sm100/prefill_d256_f16.py",
    "module": "cudnn.sdpa.fwd.kernels.sm100.prefill_d256_f16",
    "group": "sdpa.fwd.kernels",
-   "bytes": 116960,
-   "lines": 2433,
-   "sha256": "148b9588da3941574d1ba33d1b95c5c217c648972bb82d96fd74468cc51a9503",
+   "bytes": 117289,
+   "lines": 2440,
+   "sha256": "764e34c1b32265b27a8495cdbd66a841463195370d9bda97f9d6d26819b3395a",
    "license": "MIT",
    "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": false,
@@ -2470,9 +2558,9 @@
    "path": "python/cudnn/sdpa/fwd/kernels/sm107/prefill_d256_f16.py",
    "module": "cudnn.sdpa.fwd.kernels.sm107.prefill_d256_f16",
    "group": "sdpa.fwd.kernels",
-   "bytes": 118177,
-   "lines": 2414,
-   "sha256": "3321fb2925eca784ac01d79de76dacd09d73609a7e59666a465ef376da587e18",
+   "bytes": 118433,
+   "lines": 2420,
+   "sha256": "ff113a6f57c4068ce4d5262b55aff302dad45db46e12f94e069726e0948e410d",
    "license": "MIT",
    "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": false,
@@ -2501,9 +2589,9 @@
    "path": "python/cudnn/sdpa/fwd/kernels/thd_helpers.py",
    "module": "cudnn.sdpa.fwd.kernels.thd_helpers",
    "group": "sdpa.fwd.kernels",
-   "bytes": 16332,
-   "lines": 326,
-   "sha256": "3646d18feb51721fbc290a9f0f45da843fabb7c1867d394c29a8a8637df5003e",
+   "bytes": 16934,
+   "lines": 336,
+   "sha256": "23c88df6adf1a30cbd0c9e5b3f55dda0ec962cde182407932f4ae563f4700289",
    "license": "MIT",
    "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -2521,9 +2609,9 @@
    "path": "python/cudnn/sdpa/fwd/prepared.py",
    "module": "cudnn.sdpa.fwd.prepared",
    "group": "sdpa.fwd",
-   "bytes": 56333,
-   "lines": 1094,
-   "sha256": "27e4f76df574e29b41aaa1d94d153db5712bf5ca0857270f200ab9a01e9a65b2",
+   "bytes": 93687,
+   "lines": 1688,
+   "sha256": "7974a282d151982460e0ea233b6eb422cf78644e113ab81ee2e907e40bcbc73e",
    "license": "MIT",
    "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -2544,6 +2632,7 @@
     "cudnn.sdpa.fwd.api_dsl (in build_dense_spec)",
     "cudnn.sdpa.fwd.config_sm100 (in _dense_role_layout)",
     "cudnn.sdpa.fwd.config_sm100 (in _paged_pool_layout)",
+    "cudnn.sdpa.fwd.config_sm107 (in _kv_mask_role)",
     "cudnn.sdpa.fwd.config_sm90 (in _dense_role_layout)",
     "cudnn.sdpa.fwd.heuristics (in _split_combine_decode_grid)",
     "cudnn.sdpa.fwd.kernels.sm100.split_combine (in _split_combine_decode_grid)",
@@ -2560,9 +2649,9 @@
    "path": "python/cudnn/sdpa/graph_analyzer.py",
    "module": "cudnn.sdpa.graph_analyzer",
    "group": "sdpa",
-   "bytes": 68843,
-   "lines": 1424,
-   "sha256": "de46b491dbe97f65ee333137df256e521c8cc3097a7d668ecb983a0e3e4a8ed1",
+   "bytes": 71893,
+   "lines": 1471,
+   "sha256": "df3514c27f90ad22bd287c034225d44f1fabf98986131940b859951dfbdece01",
    "license": "MIT",
    "copyright": "# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,

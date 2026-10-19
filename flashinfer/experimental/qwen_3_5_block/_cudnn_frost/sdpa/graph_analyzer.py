@@ -45,6 +45,8 @@ _TORCH_FROM_CUDNN = {
     # UE8M0 scale factors of its MXFP8 output.
     cudnn.data_type.FP4_E2M1: "float4_e2m1fn_x2",
     cudnn.data_type.FP8_E8M0: "float8_e8m0fnu",
+    # The per-key boolean mask (the python-only ``kv_mask`` sdpa input): one byte per key.
+    cudnn.data_type.BOOLEAN: "bool",
 }
 _KNOWN_DTYPES = frozenset(_TORCH_FROM_CUDNN)
 
@@ -394,6 +396,20 @@ class SdpaGraphFacts:
     block_mask_t: Any = None
     score_max_t: Any = None
     score_sum_exp_t: Any = None
+    # The additive bias's geometry, DESCRIBED for the rows that TMA-load it (the Rubin resident row-block): its rank-4
+    # dims (every legal bias is ``[1|B, 1|H_q, S_q, S_kv]`` -- anything else is ``invalid``), its element strides and
+    # its cudnn.data_type.  () / None without a bias.
+    bias_dim: tuple = ()
+    bias_stride: tuple = ()
+    bias_dtype: Optional[Any] = None
+    # The per-key boolean mask (the python-only ``kv_mask`` input of ``sdpa``: ``[1|B, 1, 1, S_kv]``, broadcast over the
+    # heads and the query rows; a key whose entry is False is masked like a padded one).  Described here, judged by the
+    # rows that fold it into their mask word (``Capabilities.kv_mask``).
+    has_kv_mask: bool = False
+    kv_mask_t: Any = None
+    kv_mask_dim: tuple = ()
+    kv_mask_stride: tuple = ()
+    kv_mask_dtype: Optional[Any] = None
     # Backward-only refs.
     do_t: Any = None
     dq_t: Any = None
@@ -701,8 +717,6 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         s_kv = int(declared_max) if declared_max is not None else max_pages * page_size
         if s_kv > max_pages * page_size:
             return _invalid(f"paged_attention_max_seq_len_kv ({s_kv}) exceeds what the block table addresses ({max_pages} pages x {page_size})")
-        if (k_stride[1] > k_stride[2]) != (v_stride[1] > v_stride[2]):
-            return _invalid("paged K and V containers must share an in-page layout (both HND or both NHD)")
         table_k = table_k if table_k is not None else table_v
         table_v = table_v if table_v is not None else table_k
     else:
@@ -727,6 +741,28 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         return _invalid("B/H/S/D must all be > 0")
     if h_q % h_kv != 0:
         return _invalid("H_q must be divisible by H_kv (GQA / MQA)")
+
+    # Additive bias: the forward's shape contract is ``[1|B, 1|H_q, S_q, S_kv]`` (the four broadcast forms the operation
+    # documents) -- a bias of another rank or with a score extent that is not (S_q, S_kv) is malformed for EVERY engine,
+    # so it is ``invalid`` here (not a per-row decline); the broadcast dims, strides and dtype are facts the rows judge.
+    bias = rec.get("bias")
+    bias_dim = tuple(int(x) for x in bias.get_dim()) if bias is not None else ()
+    bias_stride = tuple(int(x) for x in bias.get_stride()) if bias is not None else ()
+    bias_dtype = bias.get_data_type() if bias is not None else None
+    if bias is not None and not is_backward:
+        if len(bias_dim) != 4 or len(bias_stride) != 4:
+            return _invalid(f"bias must be rank-4 (1|B, 1|H_q, S_q, S_kv); got dims {bias_dim}")
+        if bias_dim[2:] != (s_q, s_kv) or bias_dim[0] not in (1, b) or bias_dim[1] not in (1, h_q):
+            return _invalid(f"bias dims {bias_dim} must be (1|B, 1|H_q, S_q, S_kv) = (1|{b}, 1|{h_q}, {s_q}, {s_kv})")
+    # Per-key boolean mask (python-only input): rank-4 like every graph tensor, (1|B, 1, 1, S_kv); malformed for everyone
+    # otherwise (no engine can read a mask whose key extent is not S_kv).
+    kv_mask = rec.get("kv_mask")
+    kv_mask_dim = tuple(int(x) for x in kv_mask.get_dim()) if kv_mask is not None else ()
+    kv_mask_stride = tuple(int(x) for x in kv_mask.get_stride()) if kv_mask is not None else ()
+    kv_mask_dtype = kv_mask.get_data_type() if kv_mask is not None else None
+    if kv_mask is not None:
+        if len(kv_mask_dim) != 4 or len(kv_mask_stride) != 4 or kv_mask_dim[1:3] != (1, 1) or kv_mask_dim[3] != s_kv or kv_mask_dim[0] not in (1, b):
+            return _invalid(f"kv_mask dims {kv_mask_dim} must be (1|B, 1, 1, S_kv) = (1|{b}, 1, 1, {s_kv})")
 
     # Epilogue gate (the sdpa -> sigmoid(G) -> mul tail).  G is described, never
     # judged: its shape / dtype / layout become facts the gate-claiming rows
@@ -1016,6 +1052,14 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         o_t=o,
         stats_t=(stats if (wants_stats or is_backward) else None),
         bias_t=rec.get("bias"),
+        bias_dim=bias_dim,
+        bias_stride=bias_stride,
+        bias_dtype=bias_dtype,
+        has_kv_mask=kv_mask is not None,
+        kv_mask_t=kv_mask,
+        kv_mask_dim=kv_mask_dim,
+        kv_mask_stride=kv_mask_stride,
+        kv_mask_dtype=kv_mask_dtype,
         block_mask_t=rec.get("block_mask"),
         score_max_t=rec.get("score_max"),
         score_sum_exp_t=rec.get("score_sum_exp"),
@@ -1190,6 +1234,8 @@ class SdpaBinding:
     block_mask: Any = None
     score_max: Any = None
     score_sum_exp: Any = None
+    # The per-key boolean mask (python-only ``kv_mask`` input): a bound operand of the rows that fold it.
+    kv_mask: Any = None
     do: Any = None
     dq: Any = None
     dk: Any = None
@@ -1282,6 +1328,7 @@ class SdpaBinding:
                 self.block_mask,
                 self.score_max,
                 self.score_sum_exp,
+                self.kv_mask,
                 self.do,
                 self.dq,
                 self.dk,

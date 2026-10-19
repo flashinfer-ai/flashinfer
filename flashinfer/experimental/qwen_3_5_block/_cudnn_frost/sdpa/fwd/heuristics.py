@@ -74,6 +74,8 @@ from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm100 i
     supports_paged_d256_pack_gqa,
     supports_paged_prefill_cga1,
 )
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm107 import SM107_FP32_VECTOR_WITH_BIAS_TILE_N, sm107_bias_auto_cga, sm107_pair_item_active, sm107_tile_n_pick
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm100 import sm100_bias_auto_cga, sm100_tile_n_pick
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm120 import (
     D512_FLAVOR,
     FP8_HEAD_TILE_GRANULE,
@@ -1711,17 +1713,78 @@ def _in_flavor_sched_domain(caps: Capabilities, facts, selected: int, seed: int)
     return seed if seed in domain else min(domain)
 
 
+def _resident_arm_tile_n(spec: EngineSpec, facts, default: Optional[int]) -> Optional[int]:
+    """The KV tile width of a plan on the Rubin small head-dim tiles: the knob sweep's measured table,
+    ``config_sm107.sm107_tile_n_pick`` -- 64 for a bias TOGETHER WITH a kv_mask (any form; for the fp32 ADDITIVE vector it is also
+    the only width that serves the pair, ``SM107_FP32_VECTOR_WITH_BIAS_TILE_N``: the 128-wide rendering spills on the softmax role and
+    ``engines._bias_arm_decline`` refuses an explicit 128 typed), for a bias at one or two 128-wide kv tiles and for the plain / bias
+    body on the padding leg at the 32-wide tile (the 64-wide one up to two tiles); 128 everywhere else -- the ``sm107_bias_auto_cga``
+    idiom for the other knob of the form.  The engine row evaluates the pair / one-batch-entry form at the same width
+    (``engines._bias_arm_decline``) and the adapter defaults to it (rule 8b').  Every plan off those tiles keeps ``default``."""
+    caps = spec.capabilities
+    selected = _selected_d_shape(caps, facts, None)
+    domain = dict(caps.tile_ns_by_d_shape).get(selected)
+    if selected is None or domain is None:
+        return default
+    if caps.sm_lo == 100:
+        # The SM100 small tiles: the same question through config_sm100.sm100_tile_n_pick (128 unless the fp32 vector WITH a bias, which the
+        # 128-wide rendering does not serve, the bias body on the PADDING leg inside the 64-wide resident budget (measured on GB200), or the
+        # BUDGET rule); the row's _bias_arm_decline and the adapter read the same arithmetic (rule 8b').
+        pick = sm100_tile_n_pick(
+            selected[0],
+            facts.s_kv,
+            has_bias=facts.has_bias,
+            has_kv_mask=facts.has_kv_mask,
+            kv_mask_fp32=facts.kv_mask_dtype == cudnn.data_type.FLOAT,
+            padded=facts.padded,
+            domain=domain,
+        )
+        return pick if pick in domain else default
+    if caps.sm_lo != 107:
+        return default
+    pick = sm107_tile_n_pick(selected[0], facts.s_kv, has_bias=facts.has_bias, has_kv_mask=facts.has_kv_mask, padded=facts.padded, domain=domain)
+    return pick if pick in domain else default
+
+
 def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int, pack_gqa: Optional[bool] = None) -> tuple[int, Optional[int]]:
     """``pack_gqa`` is the candidate's packing where the width depends on it
     (the d128 f16 SM100 flavor, :func:`_d128_decode_tile_fits`); ``None`` asks
     the graph-level question.  The other flavors' rules ignore it."""
     caps = spec.capabilities
     domain = effective_cgas(caps, facts, split_kv)
-    selected_shape = _selected_d_shape(caps, facts)
+    # The leg's knobs ride along: on a row with dense-only tiles (the Rubin d32 / d64) a split or packed leg at D <= 64
+    # selects the d128 flavor, so the rule below reasons about the shape that leg actually lands on.
+    selected_shape = _selected_d_shape(caps, facts, SdpaFwdKnobs(split_kv=split_kv, pack_gqa=pack_gqa))
     if selected_shape == (192, 128) and (split_kv or 1) > 1 and domain == frozenset({1}):
         # The packed THD split ABI uses the single-Q tile. The existing dense
         # D192 split remains a two-CTA lowering.
         return sched_policy, 1
+    if caps.sm_lo == 107 and selected_shape is not None and facts.has_bias and caps.bias_d_shapes is not None:
+        # The resident bias block of the Rubin 32- / 64-wide tiles (a kv_mask ALONE stages nothing in SMEM -- no block, no
+        # budget -- and takes the flavor's own rule below): the NARROWEST width whose block holds S_kv
+        # (config_sm107.sm107_bias_auto_cga -- the arithmetic engines._bias_arm_decline and the adapter read, rule 8b'):
+        # a d64 graph at S_kv 256 lands on cga2 (two tiles), S_kv <= 128 keeps the tuned cga1 below.  No width holding it
+        # falls through: mismatch() declines every plan of such a graph whatever the pick.
+        bias_shapes = caps.bias_d_shapes if caps.bias_d_shapes is not None else caps.d_shapes
+        # The (n, n+1) pair item (a batch-broadcast bias on >= 2 rows, cga1) holds twice the kv columns of the 256-row item --
+        # the width pick evaluates the block of the form each width would run (config_sm107.sm107_bias_pair_form).
+        _bias_b = facts.bias_dim[0] if len(facts.bias_dim) == 4 else 1
+        # the item form depends on the plan's KV tile width (the one-batch-entry guard holds at 128 only): the width pick first
+        _tile_n = _resident_arm_tile_n(spec, facts, 128) or 128
+        _pair = sm107_pair_item_active(
+            _bias_b, facts.b, facts.h_q, facts.s_q, facts.device_sm_count or 0, 1, s_kv=facts.s_kv, d_flavor=selected_shape[0], tile_n=_tile_n
+        )
+        bias_cga = sm107_bias_auto_cga(selected_shape[0], facts.s_kv, domain, pair=_pair) if selected_shape in bias_shapes else None
+        if bias_cga is not None:
+            return sched_policy, bias_cga
+    if caps.sm_lo == 100 and selected_shape is not None and facts.has_bias and caps.bias_d_shapes is not None and selected_shape in caps.bias_d_shapes:
+        # The SM100 twin of the rule above at the SM100 budget (config_sm100.sm100_bias_auto_cga -- the arithmetic the row's
+        # _bias_arm_decline and the adapter's _resident_arm_cga read, rule 8b'): the NARROWEST width whose resident block holds S_kv --
+        # a D 64 bias graph lands on cga2 (its cga1 holds no block at 227 KiB), the 32-wide tile on its cga1.  No width holding it
+        # falls through: mismatch() declined every plan of such a graph already (the ring is not on the SM100 file yet).
+        bias_cga = sm100_bias_auto_cga(selected_shape[0], facts.s_kv, domain, tile_n=_resident_arm_tile_n(spec, facts, 128) or 128)
+        if bias_cga is not None:
+            return sched_policy, bias_cga
     if selected_shape == (64, 64) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
         # d64 runs cga1 on BOTH legs -- it is the prefill width (the narrow
         # slabs need no collective MMA, and a 512-row cga2 cluster wastes most
@@ -2484,7 +2547,7 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         and facts.h_kv > 0
         and facts.h_q % facts.h_kv == 0
         and facts.h_q // facts.h_kv in ((1, 2, 4, 8, 16) if caps.sm_lo == 100 else (1, 2, 4, 8))
-        and facts.page_size == 16
+        and facts.page_size in ((16, 128) if caps.sm_lo == 100 else (16,))
         and facts.causal
         and facts.bottom_right
         and facts.window_left is None
@@ -2669,7 +2732,7 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         return SdpaFwdKnobs(
             sched_policy=sched_policy,
             tile_m=base_tile[0],
-            tile_n=base_tile[1],
+            tile_n=_resident_arm_tile_n(spec, facts, base_tile[1]),
             cga=cga,
             pack_gqa=pack_gqa,
             split_kv=split_value,
@@ -2789,7 +2852,7 @@ def _fallback_knobs(spec: EngineSpec, facts) -> SdpaFwdKnobs:
     return SdpaFwdKnobs(
         sched_policy=sched_policy,
         tile_m=min(caps.tile_ms, default=None),
-        tile_n=min(caps.tile_ns, default=None),
+        tile_n=_resident_arm_tile_n(spec, facts, min(caps.tile_ns, default=None)),
         cga=cga,
         pack_gqa=pack_gqa,
         split_kv=1,  # the fallback never splits: least-demanding means one kernel, no partial workspace

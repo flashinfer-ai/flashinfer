@@ -781,6 +781,12 @@ _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 # === TMA-LDG warp group ===
 
 
+# Only the common dense CLC path has a single scheduler publisher.
+# THD/predecode retains local schedulers and broadcast credits.
+if not CFG.THD_VARLEN:
+    from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.scheduler import read_tile_id_arrive_on_leader as read_tile_id_arrive
+
+
 @cute.jit
 def _tmaldg_warp_group(
     tma_q_desc,

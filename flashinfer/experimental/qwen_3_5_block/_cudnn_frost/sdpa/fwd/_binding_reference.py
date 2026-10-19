@@ -402,7 +402,15 @@ def _bind_paged_kv(spec, frame: List[Any], ix: Dict[str, int], facts: Dict[str, 
     pool_strides = {}
     for name, f, d in (("k", k, spec.d_qk), ("v", v, spec.d_v)):
         try:
-            strides, need = _paged_pool_layout(f.shape, f.strides, _buffers.DTYPE_ITEMSIZE[f.dtype], spec.paged_hnd, spec.kh, spec.page_size, d)
+            strides, need = _paged_pool_layout(
+                f.shape,
+                f.strides,
+                _buffers.DTYPE_ITEMSIZE[f.dtype],
+                (getattr(spec, "paged_v_hnd", spec.paged_hnd) if name == "v" else spec.paged_hnd),
+                spec.kh,
+                spec.page_size,
+                d,
+            )
         except ValueError as error:
             raise ValueError(f"cudnn.sdpa: {name}: {error}") from error
         if f.span >= 0 and f.span < need:
