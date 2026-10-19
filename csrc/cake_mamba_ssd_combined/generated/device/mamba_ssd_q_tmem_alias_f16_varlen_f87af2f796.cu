@@ -62,13 +62,19 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_CUMSUM_ALL_OFF 230400
 #define SMEM_SMEM_CUMSUM_ALL_STAGE_BYTES 1024
 #define SMEM_SMEM_CUMSUM_ALL_STRIDE 1024
-#define SMEM_SMEM_BSCALE_OFF 231424
+#define SMEM_SMEM_D_ROW_OFF 231424
+#define SMEM_SMEM_D_ROW_STAGE_BYTES 128
+#define SMEM_SMEM_D_ROW_STRIDE 128
+#define SMEM_SMEM_BSCALE_OFF 231552
 #define SMEM_SMEM_BSCALE_STAGE_BYTES 512
 #define SMEM_SMEM_BSCALE_STRIDE 512
+#define SMEM_SMEM_GEOMETRY_OFF 232064
+#define SMEM_SMEM_GEOMETRY_STAGE_BYTES 8
+#define SMEM_SMEM_GEOMETRY_STRIDE 8
 #define SMEM_SMEM_Y_OFF 196608
 #define SMEM_SMEM_Y_STAGE_BYTES 16384
 #define SMEM_SMEM_Y_STRIDE 16384
-#define SMEM_TOTAL 232192
+#define SMEM_TOTAL 232320
 #define THREADS 512
 #define LAUNCH_MIN_BLOCKS 1
 
@@ -238,6 +244,16 @@ __device__ __forceinline__ void tma_store_4d(
 
 
 
+__device__ __forceinline__ void tmem_ld_x8(float* dst, int tmem_addr) {
+    asm volatile(
+        "tcgen05.ld.sync.aligned.32x32b.x8.b32"
+        " {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+        : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3]),
+          "=f"(dst[4]), "=f"(dst[5]), "=f"(dst[6]), "=f"(dst[7])
+        : "r"(tmem_addr));
+}
+
+
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
     asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
@@ -248,7 +264,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, __half* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, __half* __restrict__ initial_states, __half* __restrict__ final_states, __half* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count, int* __restrict__ cu_seqlens, int metadata_from_cu_seqlens, int* __restrict__ preprocess_status)
+kernel_mamba_ssd_q_tmem_alias_f16_varlen(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, __half* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, __half* __restrict__ initial_states, __half* __restrict__ final_states, __half* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count, int* __restrict__ cu_seqlens, int metadata_from_cu_seqlens, int* __restrict__ preprocess_status)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -263,7 +279,7 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 #endif
 
-    const int mbar_base = smem + 231936;
+    const int mbar_base = smem + 232072;
     #define bc_full_addr (mbar_base + 0)
     #define bc_empty_addr (mbar_base + 16)
     #define x_full_addr (mbar_base + 32)
@@ -304,68 +320,72 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
     const int smem_delta_all_addr = smem + 229376;
     float* smem_cumsum_all = reinterpret_cast<float*>(smem_raw + 230400);
     const int smem_cumsum_all_addr = smem + 230400;
-    float* smem_bscale = reinterpret_cast<float*>(smem_raw + 231424);
-    const int smem_bscale_addr = smem + 231424;
+    __nv_bfloat16* smem_d_row = reinterpret_cast<__nv_bfloat16*>(smem_raw + 231424);
+    const int smem_d_row_addr = smem + 231424;
+    float* smem_bscale = reinterpret_cast<float*>(smem_raw + 231552);
+    const int smem_bscale_addr = smem + 231552;
+    int* smem_geometry = reinterpret_cast<int*>(smem_raw + 232064);
+    const int smem_geometry_addr = smem + 232064;
     __nv_bfloat16* smem_y = reinterpret_cast<__nv_bfloat16*>(smem_raw + 196608);
     const int smem_y_addr = smem + 196608;
 
     // Mbarrier init (17 pipeline groups, 0 ordered-sequence groups, 30 barriers)
-    // Mbarriers at smem_raw[231936..232176)
+    // Mbarriers at smem_raw[232072..232312)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'input_pipe' ---
             // bc_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 231936, 1);
-            mbarrier_init(smem + 231944, 1);
-            // bc_empty: 2 barriers, init_count=3
-            mbarrier_init(smem + 231952, 3);
-            mbarrier_init(smem + 231960, 3);
-            // x_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 231968, 1);
-            mbarrier_init(smem + 231976, 1);
-            // x_empty: 2 barriers, init_count=3
-            mbarrier_init(smem + 231984, 3);
-            mbarrier_init(smem + 231992, 3);
-            // aux_full: 2 barriers, init_count=32
-            mbarrier_init(smem + 232000, 32);
-            mbarrier_init(smem + 232008, 32);
-            // aux_empty: 2 barriers, init_count=384
-            mbarrier_init(smem + 232016, 384);
-            mbarrier_init(smem + 232024, 384);
-            // --- pipeline 'intra1_acc_pipe' ---
-            // cb_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 232032, 1);
-            mbarrier_init(smem + 232040, 1);
-            // cb_empty: 2 barriers, init_count=1
-            mbarrier_init(smem + 232048, 1);
-            mbarrier_init(smem + 232056, 1);
-            // q_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 232064, 1);
             mbarrier_init(smem + 232072, 1);
-            // scaled_b_full: 1 barriers, init_count=1
             mbarrier_init(smem + 232080, 1);
-            // --- pipeline 'state_pipe' ---
-            // state_operand_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 232088, 1);
-            mbarrier_init(smem + 232096, 1);
-            // state_read_released: 2 barriers, init_count=1
+            // bc_empty: 2 barriers, init_count=3
+            mbarrier_init(smem + 232088, 3);
+            mbarrier_init(smem + 232096, 3);
+            // x_full: 2 barriers, init_count=1
             mbarrier_init(smem + 232104, 1);
             mbarrier_init(smem + 232112, 1);
+            // x_empty: 2 barriers, init_count=3
+            mbarrier_init(smem + 232120, 3);
+            mbarrier_init(smem + 232128, 3);
+            // aux_full: 2 barriers, init_count=32
+            mbarrier_init(smem + 232136, 32);
+            mbarrier_init(smem + 232144, 32);
+            // aux_empty: 2 barriers, init_count=384
+            mbarrier_init(smem + 232152, 384);
+            mbarrier_init(smem + 232160, 384);
+            // --- pipeline 'intra1_acc_pipe' ---
+            // cb_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 232168, 1);
+            mbarrier_init(smem + 232176, 1);
+            // cb_empty: 2 barriers, init_count=1
+            mbarrier_init(smem + 232184, 1);
+            mbarrier_init(smem + 232192, 1);
+            // q_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 232200, 1);
+            mbarrier_init(smem + 232208, 1);
+            // scaled_b_full: 1 barriers, init_count=1
+            mbarrier_init(smem + 232216, 1);
+            // --- pipeline 'state_pipe' ---
+            // state_operand_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 232224, 1);
+            mbarrier_init(smem + 232232, 1);
+            // state_read_released: 2 barriers, init_count=1
+            mbarrier_init(smem + 232240, 1);
+            mbarrier_init(smem + 232248, 1);
             // state_delta_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 232120, 1);
+            mbarrier_init(smem + 232256, 1);
             // --- pipeline 'intra1_acc_pipe' ---
             // intra_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 232128, 1);
-            mbarrier_init(smem + 232136, 1);
+            mbarrier_init(smem + 232264, 1);
+            mbarrier_init(smem + 232272, 1);
             // intra_empty: 2 barriers, init_count=4
-            mbarrier_init(smem + 232144, 4);
-            mbarrier_init(smem + 232152, 4);
+            mbarrier_init(smem + 232280, 4);
+            mbarrier_init(smem + 232288, 4);
             // inter_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 232160, 1);
+            mbarrier_init(smem + 232296, 1);
             // inter_empty: 1 barriers, init_count=4
-            mbarrier_init(smem + 232168, 4);
+            mbarrier_init(smem + 232304, 4);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -373,9 +393,9 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 232176);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 232312);
     if (warp == 12) {
-        int _tmem_hold = smem + 232176;
+        int _tmem_hold = smem + 232312;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -391,73 +411,6 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
     const int tmem_intra_tmem = taddr + 256;
     const int tmem_state_delta_tmem = taddr + 384;
     const int tmem_inter_tmem = taddr + 448;
-    int table_base = 0;
-    if (metadata_from_cu_seqlens >= 2) {
-        table_base = bid * (sequence_count + 1);
-        #pragma unroll 1
-        for (int segment = tid; segment < num_logical_chunks; segment += 512) {
-            int start = chunk_indices[segment] * 128 + chunk_offsets[segment];
-            int sequence = 0;
-            if (metadata_from_cu_seqlens == 3) {
-                long long raw_sequence = seq_idx_i64[start];
-                sequence = (int)raw_sequence;
-                if (raw_sequence < 0) {
-                    sequence = -1;
-                }
-                if (raw_sequence >= (long long)sequence_count) {
-                    sequence = sequence_count;
-                }
-            } else {
-                sequence = seq_idx_i32[start];
-            }
-            int _max_0 = ((sequence) > (-1) ? (sequence) : (-1));
-            int _min_0 = ((_max_0) < (sequence_count) ? (_max_0) : (sequence_count));
-            sequence = _min_0;
-            int previous_sequence = -1;
-            if (segment != 0) {
-                int previous_start = chunk_indices[segment - 1] * 128 + chunk_offsets[segment - 1];
-                if (metadata_from_cu_seqlens == 3) {
-                    long long raw_previous = seq_idx_i64[previous_start];
-                    previous_sequence = (int)raw_previous;
-                    if (raw_previous < 0) {
-                        previous_sequence = -1;
-                    }
-                    if (raw_previous >= (long long)sequence_count) {
-                        previous_sequence = sequence_count;
-                    }
-                } else {
-                    previous_sequence = seq_idx_i32[previous_start];
-                }
-                int _max_1 = ((previous_sequence) > (-1) ? (previous_sequence) : (-1));
-                int _min_1 = ((_max_1) < (sequence_count) ? (_max_1) : (sequence_count));
-                previous_sequence = _min_1;
-            }
-            int flagged = 0;
-            if (sequence < 0) {
-                flagged = 1;
-            }
-            if (sequence >= sequence_count) {
-                flagged = 1;
-            }
-            if (sequence < previous_sequence) {
-                flagged = 1;
-            }
-            if (flagged != 0) {
-                preprocess_status[0] = 1;
-            }
-            #pragma unroll 1
-            for (int opened_id = previous_sequence + 1; opened_id < sequence + 1; opened_id++) {
-                seq_chunk_cumsum[table_base + opened_id] = segment;
-            }
-            if (segment == num_logical_chunks - 1) {
-                #pragma unroll 1
-                for (int closed_id = sequence + 1; closed_id < sequence_count + 1; closed_id++) {
-                    seq_chunk_cumsum[table_base + closed_id] = num_logical_chunks;
-                }
-            }
-        }
-    }
-    asm volatile("barrier.sync 1, 512;" ::: "memory");
 
     // ---- Ordered hardware-WG register redistribution ----
     // Dec phase frees registers before any WG attempts inc.
@@ -477,25 +430,25 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
             unsigned int _phase_scaled_b_full_0 = 0;
             #pragma unroll 1
             for (unsigned int work = bid; work < sequence_count * nheads; work += num_bids) {
-                int sequence_1 = work / (unsigned int)nheads;
-                int first_logical = sequence_1 * nchunks;
+                int sequence = work / (unsigned int)nheads;
+                int first_logical = sequence * nchunks;
                 int logical_end = first_logical + nchunks;
                 int item_lo = 0;
                 int item_hi = 0;
                 int item_checkpoint = -1;
                 int checkpoint_rank = 1073741824;
-                if (metadata_from_cu_seqlens == 1) {
-                    int _max_12 = ((cu_seqlens[sequence_1]) > (0) ? (cu_seqlens[sequence_1]) : (0));
-                    int _min_14 = ((_max_12) < (seqlen) ? (_max_12) : (seqlen));
-                    item_lo = _min_14;
-                    int _max_13 = ((cu_seqlens[sequence_1 + 1]) > (0) ? (cu_seqlens[sequence_1 + 1]) : (0));
-                    int _min_15 = ((_max_13) < (seqlen) ? (_max_13) : (seqlen));
-                    item_hi = _min_15;
+                if (metadata_from_cu_seqlens != 0) {
+                    int _max_10 = ((cu_seqlens[sequence]) > (0) ? (cu_seqlens[sequence]) : (0));
+                    int _min_12 = ((_max_10) < (seqlen) ? (_max_10) : (seqlen));
+                    item_lo = _min_12;
+                    int _max_11 = ((cu_seqlens[sequence + 1]) > (0) ? (cu_seqlens[sequence + 1]) : (0));
+                    int _min_13 = ((_max_11) < (seqlen) ? (_max_11) : (seqlen));
+                    item_hi = _min_13;
                     int item_count = 0;
                     if (item_hi > item_lo) {
                         item_count = (item_hi + 127) / 128 - item_lo / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint = checkpoint_token_indices[sequence_1];
+                            int candidate_checkpoint = checkpoint_token_indices[sequence];
                             if (candidate_checkpoint > item_lo && candidate_checkpoint < item_hi && candidate_checkpoint % 128 != 0) {
                                 item_checkpoint = candidate_checkpoint;
                                 checkpoint_rank = candidate_checkpoint / 128 - item_lo / 128 + 1;
@@ -506,8 +459,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     first_logical = 0;
                     logical_end = item_count;
                 } else {
-                    first_logical = seq_chunk_cumsum[table_base + sequence_1];
-                    logical_end = seq_chunk_cumsum[table_base + sequence_1 + 1];
+                    first_logical = seq_chunk_cumsum[sequence];
+                    logical_end = seq_chunk_cumsum[sequence + 1];
                 }
                 int _uniform_7 = make_warp_uniform(first_logical);
                 first_logical = _uniform_7;
@@ -635,25 +588,25 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
             unsigned int _phase_x_full_1 = 0;
             #pragma unroll 1
             for (unsigned int work_1 = bid; work_1 < sequence_count * nheads; work_1 += num_bids) {
-                int sequence_2 = work_1 / (unsigned int)nheads;
-                int first_logical_1 = sequence_2 * nchunks;
+                int sequence_1 = work_1 / (unsigned int)nheads;
+                int first_logical_1 = sequence_1 * nchunks;
                 int logical_end_1 = first_logical_1 + nchunks;
                 int item_lo_1 = 0;
                 int item_hi_1 = 0;
                 int item_checkpoint_1 = -1;
                 int checkpoint_rank_1 = 1073741824;
-                if (metadata_from_cu_seqlens == 1) {
-                    int _max_10 = ((cu_seqlens[sequence_2]) > (0) ? (cu_seqlens[sequence_2]) : (0));
-                    int _min_12 = ((_max_10) < (seqlen) ? (_max_10) : (seqlen));
-                    item_lo_1 = _min_12;
-                    int _max_11 = ((cu_seqlens[sequence_2 + 1]) > (0) ? (cu_seqlens[sequence_2 + 1]) : (0));
-                    int _min_13 = ((_max_11) < (seqlen) ? (_max_11) : (seqlen));
-                    item_hi_1 = _min_13;
+                if (metadata_from_cu_seqlens != 0) {
+                    int _max_8 = ((cu_seqlens[sequence_1]) > (0) ? (cu_seqlens[sequence_1]) : (0));
+                    int _min_10 = ((_max_8) < (seqlen) ? (_max_8) : (seqlen));
+                    item_lo_1 = _min_10;
+                    int _max_9 = ((cu_seqlens[sequence_1 + 1]) > (0) ? (cu_seqlens[sequence_1 + 1]) : (0));
+                    int _min_11 = ((_max_9) < (seqlen) ? (_max_9) : (seqlen));
+                    item_hi_1 = _min_11;
                     int item_count_1 = 0;
                     if (item_hi_1 > item_lo_1) {
                         item_count_1 = (item_hi_1 + 127) / 128 - item_lo_1 / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint_1 = checkpoint_token_indices[sequence_2];
+                            int candidate_checkpoint_1 = checkpoint_token_indices[sequence_1];
                             if (candidate_checkpoint_1 > item_lo_1 && candidate_checkpoint_1 < item_hi_1 && candidate_checkpoint_1 % 128 != 0) {
                                 item_checkpoint_1 = candidate_checkpoint_1;
                                 checkpoint_rank_1 = candidate_checkpoint_1 / 128 - item_lo_1 / 128 + 1;
@@ -664,8 +617,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     first_logical_1 = 0;
                     logical_end_1 = item_count_1;
                 } else {
-                    first_logical_1 = seq_chunk_cumsum[table_base + sequence_2];
-                    logical_end_1 = seq_chunk_cumsum[table_base + sequence_2 + 1];
+                    first_logical_1 = seq_chunk_cumsum[sequence_1];
+                    logical_end_1 = seq_chunk_cumsum[sequence_1 + 1];
                 }
                 int _uniform_5 = make_warp_uniform(first_logical_1);
                 first_logical_1 = _uniform_5;
@@ -745,27 +698,27 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
             unsigned int _phase_cb_empty = 1;
             #pragma unroll 1
             for (unsigned int work_2 = bid; work_2 < sequence_count * nheads; work_2 += num_bids) {
-                int sequence_3 = work_2 / (unsigned int)nheads;
+                int sequence_2 = work_2 / (unsigned int)nheads;
                 int head = work_2 % (unsigned int)nheads;
                 int group = head * ngroups / nheads;
-                int first_logical_2 = sequence_3 * nchunks;
+                int first_logical_2 = sequence_2 * nchunks;
                 int logical_end_2 = first_logical_2 + nchunks;
                 int item_lo_2 = 0;
                 int item_hi_2 = 0;
                 int item_checkpoint_2 = -1;
                 int checkpoint_rank_2 = 1073741824;
-                if (metadata_from_cu_seqlens == 1) {
-                    int _max_2 = ((cu_seqlens[sequence_3]) > (0) ? (cu_seqlens[sequence_3]) : (0));
-                    int _min_2 = ((_max_2) < (seqlen) ? (_max_2) : (seqlen));
-                    item_lo_2 = _min_2;
-                    int _max_3 = ((cu_seqlens[sequence_3 + 1]) > (0) ? (cu_seqlens[sequence_3 + 1]) : (0));
-                    int _min_3 = ((_max_3) < (seqlen) ? (_max_3) : (seqlen));
-                    item_hi_2 = _min_3;
+                if (metadata_from_cu_seqlens != 0) {
+                    int _max_0 = ((cu_seqlens[sequence_2]) > (0) ? (cu_seqlens[sequence_2]) : (0));
+                    int _min_0 = ((_max_0) < (seqlen) ? (_max_0) : (seqlen));
+                    item_lo_2 = _min_0;
+                    int _max_1 = ((cu_seqlens[sequence_2 + 1]) > (0) ? (cu_seqlens[sequence_2 + 1]) : (0));
+                    int _min_1 = ((_max_1) < (seqlen) ? (_max_1) : (seqlen));
+                    item_hi_2 = _min_1;
                     int item_count_2 = 0;
                     if (item_hi_2 > item_lo_2) {
                         item_count_2 = (item_hi_2 + 127) / 128 - item_lo_2 / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint_2 = checkpoint_token_indices[sequence_3];
+                            int candidate_checkpoint_2 = checkpoint_token_indices[sequence_2];
                             if (candidate_checkpoint_2 > item_lo_2 && candidate_checkpoint_2 < item_hi_2 && candidate_checkpoint_2 % 128 != 0) {
                                 item_checkpoint_2 = candidate_checkpoint_2;
                                 checkpoint_rank_2 = candidate_checkpoint_2 / 128 - item_lo_2 / 128 + 1;
@@ -776,8 +729,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     first_logical_2 = 0;
                     logical_end_2 = item_count_2;
                 } else {
-                    first_logical_2 = seq_chunk_cumsum[table_base + sequence_3];
-                    logical_end_2 = seq_chunk_cumsum[table_base + sequence_3 + 1];
+                    first_logical_2 = seq_chunk_cumsum[sequence_2];
+                    logical_end_2 = seq_chunk_cumsum[sequence_2 + 1];
                 }
                 int _uniform_0 = make_warp_uniform(first_logical_2);
                 first_logical_2 = _uniform_0;
@@ -798,8 +751,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                 int next_physical = 0;
                 int next_token = 0;
                 if (first_logical_2 < logical_end_2) {
-                    int chunk = first_logical_2 - sequence_3 * nchunks;
-                    if (metadata_from_cu_seqlens == 1) {
+                    int chunk = first_logical_2 - sequence_2 * nchunks;
+                    if (metadata_from_cu_seqlens != 0) {
                         chunk = ((first_logical_2 > checkpoint_rank_2) ? (item_lo_2 / 128 + first_logical_2 - 1) * 128 : ((first_logical_2 == checkpoint_rank_2) ? item_checkpoint_2 : ((first_logical_2 == 0) ? item_lo_2 : (item_lo_2 / 128 + first_logical_2) * 128))) / 128;
                     } else {
                         chunk = chunk_indices[first_logical_2];
@@ -821,8 +774,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     int refill_before_cb = refill_first;
                     if (refill_before_cb != 0) {
                         if (logical_end_2 > logical_2 + 1) {
-                            int chunk_1 = logical_2 + 1 - sequence_3 * nchunks;
-                            if (metadata_from_cu_seqlens == 1) {
+                            int chunk_1 = logical_2 + 1 - sequence_2 * nchunks;
+                            if (metadata_from_cu_seqlens != 0) {
                                 chunk_1 = ((checkpoint_rank_2 < logical_2 + 1) ? (item_lo_2 / 128 + (logical_2 + 1) - 1) * 128 : ((logical_2 + 1 == checkpoint_rank_2) ? item_checkpoint_2 : ((logical_2 + 1 == 0) ? item_lo_2 : (item_lo_2 / 128 + (logical_2 + 1)) * 128))) / 128;
                             } else {
                                 chunk_1 = chunk_indices[logical_2 + 1];
@@ -896,8 +849,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     if (cb_acc_stage == 2) { cb_acc_stage = 0; _phase_cb_empty ^= 1; }
                     if (refill_before_cb == 0) {
                         if (logical_end_2 > logical_2 + 1) {
-                            int chunk_2 = logical_2 + 1 - sequence_3 * nchunks;
-                            if (metadata_from_cu_seqlens == 1) {
+                            int chunk_2 = logical_2 + 1 - sequence_2 * nchunks;
+                            if (metadata_from_cu_seqlens != 0) {
                                 chunk_2 = ((checkpoint_rank_2 < logical_2 + 1) ? (item_lo_2 / 128 + (logical_2 + 1) - 1) * 128 : ((logical_2 + 1 == checkpoint_rank_2) ? item_checkpoint_2 : ((logical_2 + 1 == 0) ? item_lo_2 : (item_lo_2 / 128 + (logical_2 + 1)) * 128))) / 128;
                             } else {
                                 chunk_2 = chunk_indices[logical_2 + 1];
@@ -928,26 +881,26 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
             unsigned int _phase_x_empty = 1;
             #pragma unroll 1
             for (unsigned int work_3 = bid; work_3 < sequence_count * nheads; work_3 += num_bids) {
-                int sequence_4 = work_3 / (unsigned int)nheads;
+                int sequence_3 = work_3 / (unsigned int)nheads;
                 int head_1 = work_3 % (unsigned int)nheads;
-                int first_logical_3 = sequence_4 * nchunks;
+                int first_logical_3 = sequence_3 * nchunks;
                 int logical_end_3 = first_logical_3 + nchunks;
                 int item_lo_3 = 0;
                 int item_hi_3 = 0;
                 int item_checkpoint_3 = -1;
                 int checkpoint_rank_3 = 1073741824;
-                if (metadata_from_cu_seqlens == 1) {
-                    int _max_4 = ((cu_seqlens[sequence_4]) > (0) ? (cu_seqlens[sequence_4]) : (0));
-                    int _min_4 = ((_max_4) < (seqlen) ? (_max_4) : (seqlen));
-                    item_lo_3 = _min_4;
-                    int _max_5 = ((cu_seqlens[sequence_4 + 1]) > (0) ? (cu_seqlens[sequence_4 + 1]) : (0));
-                    int _min_5 = ((_max_5) < (seqlen) ? (_max_5) : (seqlen));
-                    item_hi_3 = _min_5;
+                if (metadata_from_cu_seqlens != 0) {
+                    int _max_2 = ((cu_seqlens[sequence_3]) > (0) ? (cu_seqlens[sequence_3]) : (0));
+                    int _min_2 = ((_max_2) < (seqlen) ? (_max_2) : (seqlen));
+                    item_lo_3 = _min_2;
+                    int _max_3 = ((cu_seqlens[sequence_3 + 1]) > (0) ? (cu_seqlens[sequence_3 + 1]) : (0));
+                    int _min_3 = ((_max_3) < (seqlen) ? (_max_3) : (seqlen));
+                    item_hi_3 = _min_3;
                     int item_count_3 = 0;
                     if (item_hi_3 > item_lo_3) {
                         item_count_3 = (item_hi_3 + 127) / 128 - item_lo_3 / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint_3 = checkpoint_token_indices[sequence_4];
+                            int candidate_checkpoint_3 = checkpoint_token_indices[sequence_3];
                             if (candidate_checkpoint_3 > item_lo_3 && candidate_checkpoint_3 < item_hi_3 && candidate_checkpoint_3 % 128 != 0) {
                                 item_checkpoint_3 = candidate_checkpoint_3;
                                 checkpoint_rank_3 = candidate_checkpoint_3 / 128 - item_lo_3 / 128 + 1;
@@ -958,8 +911,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     first_logical_3 = 0;
                     logical_end_3 = item_count_3;
                 } else {
-                    first_logical_3 = seq_chunk_cumsum[table_base + sequence_4];
-                    logical_end_3 = seq_chunk_cumsum[table_base + sequence_4 + 1];
+                    first_logical_3 = seq_chunk_cumsum[sequence_3];
+                    logical_end_3 = seq_chunk_cumsum[sequence_3 + 1];
                 }
                 int _uniform_3 = make_warp_uniform(first_logical_3);
                 first_logical_3 = _uniform_3;
@@ -970,14 +923,14 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                 float next_delta[4];
                 #pragma unroll 1
                 for (int logical_3 = first_logical_3; logical_3 < logical_end_3; logical_3++) {
-                    int physical_chunk = logical_3 - sequence_4 * nchunks;
+                    int physical_chunk = logical_3 - sequence_3 * nchunks;
                     int segment_offset = 0;
                     int segment_limit = 128;
-                    if (metadata_from_cu_seqlens == 1) {
+                    if (metadata_from_cu_seqlens != 0) {
                         int first_chunk = item_lo_3 / 128;
                         int segment_start = ((checkpoint_rank_3 < logical_3) ? (first_chunk + logical_3 - 1) * 128 : ((logical_3 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 == 0) ? item_lo_3 : (first_chunk + logical_3) * 128)));
-                        int _min_6 = ((((checkpoint_rank_3 < logical_3 + 1) ? (first_chunk + (logical_3 + 1) - 1) * 128 : ((logical_3 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 == 0) ? item_lo_3 : (first_chunk + (logical_3 + 1)) * 128)))) < (item_hi_3) ? (((checkpoint_rank_3 < logical_3 + 1) ? (first_chunk + (logical_3 + 1) - 1) * 128 : ((logical_3 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 == 0) ? item_lo_3 : (first_chunk + (logical_3 + 1)) * 128)))) : (item_hi_3));
-                        int segment_end = _min_6;
+                        int _min_4 = ((((checkpoint_rank_3 < logical_3 + 1) ? (first_chunk + (logical_3 + 1) - 1) * 128 : ((logical_3 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 == 0) ? item_lo_3 : (first_chunk + (logical_3 + 1)) * 128)))) < (item_hi_3) ? (((checkpoint_rank_3 < logical_3 + 1) ? (first_chunk + (logical_3 + 1) - 1) * 128 : ((logical_3 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 == 0) ? item_lo_3 : (first_chunk + (logical_3 + 1)) * 128)))) : (item_hi_3));
+                        int segment_end = _min_4;
                         physical_chunk = segment_start / 128;
                         segment_offset = segment_start - physical_chunk * 128;
                         segment_limit = segment_end - physical_chunk * 128;
@@ -1001,6 +954,7 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     int physical_batch_1 = 0;
                     int token_in_batch = physical_chunk * 128;
                     int physical_start = physical_batch_1 * seqlen + token_in_batch;
+                    int geometry_word = segment_offset + segment_limit * 256 + chunk_tokens * 65536;
                     int publish_end = chunk_tokens;
                     publish_end = segment_limit;
                     int prefetch_base = lane * 4;
@@ -1009,8 +963,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                         int prefetch_last = publish_end - 1;
                         #pragma unroll
                         for (int local = 0; local < 4; local++) {
-                            int _min_7 = ((prefetch_last) < (prefetch_base + local) ? (prefetch_last) : (prefetch_base + local));
-                            lane_raw[local] = dt[(physical_start + _min_7) * nheads + head_1];
+                            int _min_5 = ((prefetch_last) < (prefetch_base + local) ? (prefetch_last) : (prefetch_base + local));
+                            lane_raw[local] = dt[(physical_start + _min_5) * nheads + head_1];
                         }
                     }
                     int has_next_chunk = 0;
@@ -1022,14 +976,14 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     int next_chunk_tokens = 128;
                     float raw_next[4];
                     if (has_next_chunk != 0) {
-                        int physical_chunk_0 = logical_3 + 1 - sequence_4 * nchunks;
+                        int physical_chunk_0 = logical_3 + 1 - sequence_3 * nchunks;
                         int segment_offset_1 = 0;
                         int segment_limit_2 = 128;
-                        if (metadata_from_cu_seqlens == 1) {
+                        if (metadata_from_cu_seqlens != 0) {
                             int first_chunk_1 = item_lo_3 / 128;
                             int segment_start_1 = ((checkpoint_rank_3 < logical_3 + 1) ? (first_chunk_1 + (logical_3 + 1) - 1) * 128 : ((logical_3 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 == 0) ? item_lo_3 : (first_chunk_1 + (logical_3 + 1)) * 128)));
-                            int _min_8 = ((((checkpoint_rank_3 < logical_3 + 1 + 1) ? (first_chunk_1 + (logical_3 + 1 + 1) - 1) * 128 : ((logical_3 + 1 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 + 1 == 0) ? item_lo_3 : (first_chunk_1 + (logical_3 + 1 + 1)) * 128)))) < (item_hi_3) ? (((checkpoint_rank_3 < logical_3 + 1 + 1) ? (first_chunk_1 + (logical_3 + 1 + 1) - 1) * 128 : ((logical_3 + 1 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 + 1 == 0) ? item_lo_3 : (first_chunk_1 + (logical_3 + 1 + 1)) * 128)))) : (item_hi_3));
-                            int segment_end_1 = _min_8;
+                            int _min_6 = ((((checkpoint_rank_3 < logical_3 + 1 + 1) ? (first_chunk_1 + (logical_3 + 1 + 1) - 1) * 128 : ((logical_3 + 1 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 + 1 == 0) ? item_lo_3 : (first_chunk_1 + (logical_3 + 1 + 1)) * 128)))) < (item_hi_3) ? (((checkpoint_rank_3 < logical_3 + 1 + 1) ? (first_chunk_1 + (logical_3 + 1 + 1) - 1) * 128 : ((logical_3 + 1 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 + 1 == 0) ? item_lo_3 : (first_chunk_1 + (logical_3 + 1 + 1)) * 128)))) : (item_hi_3));
+                            int segment_end_1 = _min_6;
                             physical_chunk_0 = segment_start_1 / 128;
                             segment_offset_1 = segment_start_1 - physical_chunk_0 * 128;
                             segment_limit_2 = segment_end_1 - physical_chunk_0 * 128;
@@ -1058,8 +1012,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                         int next_last = next_publish_end - 1;
                         #pragma unroll
                         for (int local_1 = 0; local_1 < 4; local_1++) {
-                            int _min_9 = ((next_last) < (prefetch_base + local_1) ? (next_last) : (prefetch_base + local_1));
-                            raw_next[local_1] = dt[(next_start + _min_9) * nheads + head_1];
+                            int _min_7 = ((next_last) < (prefetch_base + local_1) ? (next_last) : (prefetch_base + local_1));
+                            raw_next[local_1] = dt[(next_start + _min_7) * nheads + head_1];
                         }
                     }
                     mbarrier_wait(aux_empty_addr + (input_stage_3) * 8, _phase_aux_empty);
@@ -1067,6 +1021,7 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     if (elect_sync()) {
                         tma_4d_gmem2smem(smem_x_tma_addr + input_stage_3 * 16384, (&x_map), 0, head_1, token_in_batch, physical_batch_1, x_full_addr + (input_stage_3) * 8);
                         mbarrier_arrive_expect_tx(x_full_addr + (input_stage_3) * 8, 16384);
+                        smem_geometry[input_stage_3] = geometry_word;
                     }
                     if (have_next == 0) {
                         float a_value = A[head_1];
@@ -1236,8 +1191,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                             }
                             physical_cumsum[local_6] = value;
                         }
-                        int _max_6 = ((segment_offset - 1) > (0) ? (segment_offset - 1) : (0));
-                        int base_token = _max_6;
+                        int _max_4 = ((segment_offset - 1) > (0) ? (segment_offset - 1) : (0));
+                        int base_token = _max_4;
                         int base_lane = base_token / 4;
                         int base_slot = base_token % 4;
                         float _shfl_2 = __shfl_sync(0xFFFFFFFF, physical_cumsum[0], base_lane);
@@ -1266,9 +1221,9 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                                 float _sub_0;
                                 asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_0) : "f"(physical_cumsum[local_8]), "f"(segment_base));
                                 cumsum_value = _sub_0;
-                                float _max_7 = max_noftz(lane_dt[local_8], -65504.0f);
-                                float _min_10 = fminf(_max_7, 65504.0f);
-                                float bounded = _min_10;
+                                float _max_5 = max_noftz(lane_dt[local_8], -65504.0f);
+                                float _min_8 = fminf(_max_5, 65504.0f);
+                                float bounded = _min_8;
                                 __half delta_half = (__half)bounded;
                                 float _cvt_f32_0 = (float)delta_half;
                                 delta_value = _cvt_f32_0;
@@ -1464,8 +1419,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                             }
                             physical_cumsum_1[local_15] = value_1;
                         }
-                        int _max_8 = ((next_segment_offset - 1) > (0) ? (next_segment_offset - 1) : (0));
-                        int base_token_1 = _max_8;
+                        int _max_6 = ((next_segment_offset - 1) > (0) ? (next_segment_offset - 1) : (0));
+                        int base_token_1 = _max_6;
                         int base_lane_1 = base_token_1 / 4;
                         int base_slot_1 = base_token_1 % 4;
                         float _shfl_6 = __shfl_sync(0xFFFFFFFF, physical_cumsum_1[0], base_lane_1);
@@ -1494,9 +1449,9 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                                 float _sub_1;
                                 asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_1) : "f"(physical_cumsum_1[local_17]), "f"(segment_base_1));
                                 cumsum_value_1 = _sub_1;
-                                float _max_9 = max_noftz(lane_dt_1[local_17], -65504.0f);
-                                float _min_11 = fminf(_max_9, 65504.0f);
-                                float bounded_1 = _min_11;
+                                float _max_7 = max_noftz(lane_dt_1[local_17], -65504.0f);
+                                float _min_9 = fminf(_max_7, 65504.0f);
+                                float bounded_1 = _min_9;
                                 __half delta_half_1 = (__half)bounded_1;
                                 float _cvt_f32_1 = (float)delta_half_1;
                                 delta_value_1 = _cvt_f32_1;
@@ -1512,6 +1467,16 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                         have_next = 1;
                     } else {
                         have_next = 0;
+                    }
+                }
+                if (has_initial != 0) {
+                    int pf_work = work_3 + (unsigned int)num_bids;
+                    if (pf_work < sequence_count * nheads) {
+                        int pf_state_base = pf_work * 64 * 128;
+                        #pragma unroll
+                        for (int pf_repeat = 0; pf_repeat < 4; pf_repeat++) {
+                            asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(initial_states + (pf_state_base + (pf_repeat * 32 + lane) * 64))));
+                        }
                     }
                 }
             }
@@ -1533,21 +1498,21 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
             unsigned int _phase_state_delta_full_0 = 0;
             #pragma unroll 1
             for (unsigned int work_4 = bid; work_4 < sequence_count * nheads; work_4 += num_bids) {
-                int sequence_5 = work_4 / (unsigned int)nheads;
+                int sequence_4 = work_4 / (unsigned int)nheads;
                 int head_2 = work_4 % (unsigned int)nheads;
-                int state_head_base = (sequence_5 * nheads + head_2) * 64 * 128;
-                if (metadata_from_cu_seqlens == 1) {
+                int state_head_base = (sequence_4 * nheads + head_2) * 64 * 128;
+                if (metadata_from_cu_seqlens != 0) {
                     if (warp == 4) {
                         if (elect_sync()) {
-                            int raw_lo = cu_seqlens[sequence_5];
-                            int raw_hi = cu_seqlens[sequence_5 + 1];
+                            int raw_lo = cu_seqlens[sequence_4];
+                            int raw_hi = cu_seqlens[sequence_4 + 1];
                             int flagged_cu = 0;
-                            if (sequence_5 == 0) {
+                            if (sequence_4 == 0) {
                                 if (raw_lo != 0) {
                                     flagged_cu = 1;
                                 }
                             }
-                            if (sequence_5 == sequence_count - 1) {
+                            if (sequence_4 == sequence_count - 1) {
                                 if (raw_hi != seqlen) {
                                     flagged_cu = 1;
                                 }
@@ -1587,24 +1552,24 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                         }
                     }
                 }
-                int first_logical_4 = sequence_5 * nchunks;
+                int first_logical_4 = sequence_4 * nchunks;
                 int logical_end_4 = first_logical_4 + nchunks;
                 int item_lo_4 = 0;
                 int item_hi_4 = 0;
                 int item_checkpoint_4 = -1;
                 int checkpoint_rank_4 = 1073741824;
-                if (metadata_from_cu_seqlens == 1) {
-                    int _max_16 = ((cu_seqlens[sequence_5]) > (0) ? (cu_seqlens[sequence_5]) : (0));
-                    int _min_19 = ((_max_16) < (seqlen) ? (_max_16) : (seqlen));
-                    item_lo_4 = _min_19;
-                    int _max_17 = ((cu_seqlens[sequence_5 + 1]) > (0) ? (cu_seqlens[sequence_5 + 1]) : (0));
-                    int _min_20 = ((_max_17) < (seqlen) ? (_max_17) : (seqlen));
-                    item_hi_4 = _min_20;
+                if (metadata_from_cu_seqlens != 0) {
+                    int _max_14 = ((cu_seqlens[sequence_4]) > (0) ? (cu_seqlens[sequence_4]) : (0));
+                    int _min_16 = ((_max_14) < (seqlen) ? (_max_14) : (seqlen));
+                    item_lo_4 = _min_16;
+                    int _max_15 = ((cu_seqlens[sequence_4 + 1]) > (0) ? (cu_seqlens[sequence_4 + 1]) : (0));
+                    int _min_17 = ((_max_15) < (seqlen) ? (_max_15) : (seqlen));
+                    item_hi_4 = _min_17;
                     int item_count_4 = 0;
                     if (item_hi_4 > item_lo_4) {
                         item_count_4 = (item_hi_4 + 127) / 128 - item_lo_4 / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint_4 = checkpoint_token_indices[sequence_5];
+                            int candidate_checkpoint_4 = checkpoint_token_indices[sequence_4];
                             if (candidate_checkpoint_4 > item_lo_4 && candidate_checkpoint_4 < item_hi_4 && candidate_checkpoint_4 % 128 != 0) {
                                 item_checkpoint_4 = candidate_checkpoint_4;
                                 checkpoint_rank_4 = candidate_checkpoint_4 / 128 - item_lo_4 / 128 + 1;
@@ -1615,8 +1580,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     first_logical_4 = 0;
                     logical_end_4 = item_count_4;
                 } else {
-                    first_logical_4 = seq_chunk_cumsum[table_base + sequence_5];
-                    logical_end_4 = seq_chunk_cumsum[table_base + sequence_5 + 1];
+                    first_logical_4 = seq_chunk_cumsum[sequence_4];
+                    logical_end_4 = seq_chunk_cumsum[sequence_4 + 1];
                 }
                 int _uniform_11 = make_warp_uniform(first_logical_4);
                 first_logical_4 = _uniform_11;
@@ -1624,36 +1589,13 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                 logical_end_4 = _uniform_12;
                 #pragma unroll 1
                 for (int logical_4 = first_logical_4; logical_4 < logical_end_4; logical_4++) {
-                    int physical_chunk_1 = logical_4 - sequence_5 * nchunks;
                     int segment_offset_2 = 0;
                     int segment_limit_1 = 128;
-                    if (metadata_from_cu_seqlens == 1) {
-                        int first_chunk_2 = item_lo_4 / 128;
-                        int segment_start_2 = ((checkpoint_rank_4 < logical_4) ? (first_chunk_2 + logical_4 - 1) * 128 : ((logical_4 == checkpoint_rank_4) ? item_checkpoint_4 : ((logical_4 == 0) ? item_lo_4 : (first_chunk_2 + logical_4) * 128)));
-                        int _min_21 = ((((checkpoint_rank_4 < logical_4 + 1) ? (first_chunk_2 + (logical_4 + 1) - 1) * 128 : ((logical_4 + 1 == checkpoint_rank_4) ? item_checkpoint_4 : ((logical_4 + 1 == 0) ? item_lo_4 : (first_chunk_2 + (logical_4 + 1)) * 128)))) < (item_hi_4) ? (((checkpoint_rank_4 < logical_4 + 1) ? (first_chunk_2 + (logical_4 + 1) - 1) * 128 : ((logical_4 + 1 == checkpoint_rank_4) ? item_checkpoint_4 : ((logical_4 + 1 == 0) ? item_lo_4 : (first_chunk_2 + (logical_4 + 1)) * 128)))) : (item_hi_4));
-                        int segment_end_2 = _min_21;
-                        physical_chunk_1 = segment_start_2 / 128;
-                        segment_offset_2 = segment_start_2 - physical_chunk_1 * 128;
-                        segment_limit_1 = segment_end_2 - physical_chunk_1 * 128;
-                    } else {
-                        physical_chunk_1 = chunk_indices[logical_4];
-                        segment_offset_2 = chunk_offsets[logical_4];
-                        if (logical_4 + 1 < num_logical_chunks) {
-                            int next_chunk_2 = chunk_indices[logical_4 + 1];
-                            if (next_chunk_2 == physical_chunk_1) {
-                                segment_limit_1 = chunk_offsets[logical_4 + 1];
-                            }
-                        }
-                    }
-                    int chunk_tokens_1 = seqlen - physical_chunk_1 * 128;
-                    if (chunk_tokens_1 > 128) {
-                        chunk_tokens_1 = 128;
-                    }
-                    if (segment_limit_1 > chunk_tokens_1) {
-                        segment_limit_1 = chunk_tokens_1;
-                    }
                     {
                         mbarrier_wait(aux_full_addr + (input_stage_4) * 8, _phase_aux_full);
+                        int geometry = smem_geometry[input_stage_4];
+                        segment_offset_2 = geometry & 255;
+                        segment_limit_1 = geometry >> 8 & 255;
                         float last_cumsum = smem_cumsum_all[input_stage_4 * 128 + (unsigned int)(segment_limit_1 - 1)];
                         int factor_token = warp % 4 * 32 + lane;
                         float factor_value = 0.0f;
@@ -1794,13 +1736,19 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                         if (state_stage_1 == 2) { state_stage_1 = 0; _phase_state_read_released ^= 1; }
                     }
                     if (checkpoint_state_count > 0) {
-                        int checkpoint_token = checkpoint_token_indices[sequence_5];
-                        int segment_end_3 = physical_chunk_1 * 128 + segment_limit_1;
-                        if (segment_end_3 > seqlen) {
-                            segment_end_3 = seqlen;
+                        int checkpoint_token = checkpoint_token_indices[sequence_4];
+                        int chunk_3 = logical_4 - sequence_4 * nchunks;
+                        if (metadata_from_cu_seqlens != 0) {
+                            chunk_3 = ((checkpoint_rank_4 < logical_4) ? (item_lo_4 / 128 + logical_4 - 1) * 128 : ((logical_4 == checkpoint_rank_4) ? item_checkpoint_4 : ((logical_4 == 0) ? item_lo_4 : (item_lo_4 / 128 + logical_4) * 128))) / 128;
+                        } else {
+                            chunk_3 = chunk_indices[logical_4];
                         }
-                        if (checkpoint_token == segment_end_3) {
-                            int checkpoint_slot = checkpoint_state_slots[sequence_5];
+                        int segment_end_2 = chunk_3 * 128 + segment_limit_1;
+                        if (segment_end_2 > seqlen) {
+                            segment_end_2 = seqlen;
+                        }
+                        if (checkpoint_token == segment_end_2) {
+                            int checkpoint_slot = checkpoint_state_slots[sequence_4];
                             if (checkpoint_slot >= 0 && checkpoint_slot < checkpoint_state_count) {
                                 int checkpoint_head_base = (checkpoint_slot * nheads + head_2) * 64 * 128;
                                 #pragma unroll
@@ -1857,25 +1805,25 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
             unsigned int _phase_aux_full_1 = 0;
             #pragma unroll 1
             for (unsigned int work_5 = bid; work_5 < sequence_count * nheads; work_5 += num_bids) {
-                int sequence_6 = work_5 / (unsigned int)nheads;
-                int first_logical_5 = sequence_6 * nchunks;
+                int sequence_5 = work_5 / (unsigned int)nheads;
+                int first_logical_5 = sequence_5 * nchunks;
                 int logical_end_5 = first_logical_5 + nchunks;
                 int item_lo_5 = 0;
                 int item_hi_5 = 0;
                 int item_checkpoint_5 = -1;
                 int checkpoint_rank_5 = 1073741824;
-                if (metadata_from_cu_seqlens == 1) {
-                    int _max_14 = ((cu_seqlens[sequence_6]) > (0) ? (cu_seqlens[sequence_6]) : (0));
-                    int _min_16 = ((_max_14) < (seqlen) ? (_max_14) : (seqlen));
-                    item_lo_5 = _min_16;
-                    int _max_15 = ((cu_seqlens[sequence_6 + 1]) > (0) ? (cu_seqlens[sequence_6 + 1]) : (0));
-                    int _min_17 = ((_max_15) < (seqlen) ? (_max_15) : (seqlen));
-                    item_hi_5 = _min_17;
+                if (metadata_from_cu_seqlens != 0) {
+                    int _max_12 = ((cu_seqlens[sequence_5]) > (0) ? (cu_seqlens[sequence_5]) : (0));
+                    int _min_14 = ((_max_12) < (seqlen) ? (_max_12) : (seqlen));
+                    item_lo_5 = _min_14;
+                    int _max_13 = ((cu_seqlens[sequence_5 + 1]) > (0) ? (cu_seqlens[sequence_5 + 1]) : (0));
+                    int _min_15 = ((_max_13) < (seqlen) ? (_max_13) : (seqlen));
+                    item_hi_5 = _min_15;
                     int item_count_5 = 0;
                     if (item_hi_5 > item_lo_5) {
                         item_count_5 = (item_hi_5 + 127) / 128 - item_lo_5 / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint_5 = checkpoint_token_indices[sequence_6];
+                            int candidate_checkpoint_5 = checkpoint_token_indices[sequence_5];
                             if (candidate_checkpoint_5 > item_lo_5 && candidate_checkpoint_5 < item_hi_5 && candidate_checkpoint_5 % 128 != 0) {
                                 item_checkpoint_5 = candidate_checkpoint_5;
                                 checkpoint_rank_5 = candidate_checkpoint_5 / 128 - item_lo_5 / 128 + 1;
@@ -1886,8 +1834,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     first_logical_5 = 0;
                     logical_end_5 = item_count_5;
                 } else {
-                    first_logical_5 = seq_chunk_cumsum[table_base + sequence_6];
-                    logical_end_5 = seq_chunk_cumsum[table_base + sequence_6 + 1];
+                    first_logical_5 = seq_chunk_cumsum[sequence_5];
+                    logical_end_5 = seq_chunk_cumsum[sequence_5 + 1];
                 }
                 int _uniform_9 = make_warp_uniform(first_logical_5);
                 first_logical_5 = _uniform_9;
@@ -1895,37 +1843,14 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                 logical_end_5 = _uniform_10;
                 #pragma unroll 1
                 for (int logical_5 = first_logical_5; logical_5 < logical_end_5; logical_5++) {
-                    int physical_chunk_2 = logical_5 - sequence_6 * nchunks;
                     int segment_offset_3 = 0;
                     int segment_limit_3 = 128;
-                    if (metadata_from_cu_seqlens == 1) {
-                        int first_chunk_3 = item_lo_5 / 128;
-                        int segment_start_3 = ((checkpoint_rank_5 < logical_5) ? (first_chunk_3 + logical_5 - 1) * 128 : ((logical_5 == checkpoint_rank_5) ? item_checkpoint_5 : ((logical_5 == 0) ? item_lo_5 : (first_chunk_3 + logical_5) * 128)));
-                        int _min_18 = ((((checkpoint_rank_5 < logical_5 + 1) ? (first_chunk_3 + (logical_5 + 1) - 1) * 128 : ((logical_5 + 1 == checkpoint_rank_5) ? item_checkpoint_5 : ((logical_5 + 1 == 0) ? item_lo_5 : (first_chunk_3 + (logical_5 + 1)) * 128)))) < (item_hi_5) ? (((checkpoint_rank_5 < logical_5 + 1) ? (first_chunk_3 + (logical_5 + 1) - 1) * 128 : ((logical_5 + 1 == checkpoint_rank_5) ? item_checkpoint_5 : ((logical_5 + 1 == 0) ? item_lo_5 : (first_chunk_3 + (logical_5 + 1)) * 128)))) : (item_hi_5));
-                        int segment_end_4 = _min_18;
-                        physical_chunk_2 = segment_start_3 / 128;
-                        segment_offset_3 = segment_start_3 - physical_chunk_2 * 128;
-                        segment_limit_3 = segment_end_4 - physical_chunk_2 * 128;
-                    } else {
-                        physical_chunk_2 = chunk_indices[logical_5];
-                        segment_offset_3 = chunk_offsets[logical_5];
-                        if (logical_5 + 1 < num_logical_chunks) {
-                            int next_chunk_3 = chunk_indices[logical_5 + 1];
-                            if (next_chunk_3 == physical_chunk_2) {
-                                segment_limit_3 = chunk_offsets[logical_5 + 1];
-                            }
-                        }
-                    }
-                    int chunk_tokens_2 = seqlen - physical_chunk_2 * 128;
-                    if (chunk_tokens_2 > 128) {
-                        chunk_tokens_2 = 128;
-                    }
-                    if (segment_limit_3 > chunk_tokens_2) {
-                        segment_limit_3 = chunk_tokens_2;
-                    }
                     {
                         mbarrier_wait(cb_full_addr + (acc_stage_2) * 8, _phase_cb_full_1);
                         mbarrier_wait(aux_full_addr + (input_stage_5) * 8, _phase_aux_full_1);
+                        int geometry_1 = smem_geometry[input_stage_5];
+                        segment_offset_3 = geometry_1 & 255;
+                        segment_limit_3 = geometry_1 >> 8 & 255;
                         float row_cumsum = smem_cumsum_all[input_stage_5 * 128 + (unsigned int)row];
                         float segment_base_3 = 0.0f;
                         if (segment_offset_3 > 0) {
@@ -2010,30 +1935,61 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
             unsigned int _phase_x_full_2 = 0;
             #pragma unroll 1
             for (unsigned int work_6 = bid; work_6 < sequence_count * nheads; work_6 += num_bids) {
-                int sequence_7 = work_6 / (unsigned int)nheads;
+                int sequence_6 = work_6 / (unsigned int)nheads;
                 int head_3 = work_6 % (unsigned int)nheads;
                 float d_head_value = 0.0f;
                 if (D_mode == 1) {
                     d_head_value = (float)D[head_3];
                 }
-                int first_logical_6 = sequence_7 * nchunks;
+                float d_row[8];
+                #pragma unroll
+                for (int d_slot = 0; d_slot < 8; d_slot++) {
+                    d_row[d_slot] = d_head_value;
+                }
+                unsigned int d_row_bf16[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 4; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(d_row[_lp*2 + 0], d_row[_lp*2+1 + 0]));
+                    d_row_bf16[_lp] = *(uint32_t*)&_bf2;
+                }
+                int warp_id_in_role = (warp - 12);
+                if (warp_id_in_role == 0) {
+                    if (lane < 8) {
+                        if (D_mode == 2) {
+                            unsigned int d_load[4];
+                            {
+                                const uint4* _vptr_0 = reinterpret_cast<const uint4*>(D + head_3 * 64 + lane * 8);
+                                uint4* _vdst_0 = reinterpret_cast<uint4*>(&d_load[0]);
+                                #pragma unroll
+                                for (int _blk = 0; _blk < 1; _blk++) {
+                                    _vdst_0[_blk] = _vptr_0[_blk];
+                                }
+                            }
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_d_row_addr + (unsigned int)(lane * 16)), "r"(d_load[0]), "r"(d_load[1]), "r"(d_load[2]), "r"(d_load[3]));
+                        } else {
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_d_row_addr + (unsigned int)(lane * 16)), "r"(d_row_bf16[0]), "r"(d_row_bf16[1]), "r"(d_row_bf16[2]), "r"(d_row_bf16[3]));
+                        }
+                    }
+                }
+                asm volatile("barrier.sync 10, 128;" ::: "memory");
+                int first_logical_6 = sequence_6 * nchunks;
                 int logical_end_6 = first_logical_6 + nchunks;
                 int item_lo_6 = 0;
                 int item_hi_6 = 0;
                 int item_checkpoint_6 = -1;
                 int checkpoint_rank_6 = 1073741824;
-                if (metadata_from_cu_seqlens == 1) {
-                    int _max_18 = ((cu_seqlens[sequence_7]) > (0) ? (cu_seqlens[sequence_7]) : (0));
-                    int _min_22 = ((_max_18) < (seqlen) ? (_max_18) : (seqlen));
-                    item_lo_6 = _min_22;
-                    int _max_19 = ((cu_seqlens[sequence_7 + 1]) > (0) ? (cu_seqlens[sequence_7 + 1]) : (0));
-                    int _min_23 = ((_max_19) < (seqlen) ? (_max_19) : (seqlen));
-                    item_hi_6 = _min_23;
+                if (metadata_from_cu_seqlens != 0) {
+                    int _max_16 = ((cu_seqlens[sequence_6]) > (0) ? (cu_seqlens[sequence_6]) : (0));
+                    int _min_18 = ((_max_16) < (seqlen) ? (_max_16) : (seqlen));
+                    item_lo_6 = _min_18;
+                    int _max_17 = ((cu_seqlens[sequence_6 + 1]) > (0) ? (cu_seqlens[sequence_6 + 1]) : (0));
+                    int _min_19 = ((_max_17) < (seqlen) ? (_max_17) : (seqlen));
+                    item_hi_6 = _min_19;
                     int item_count_6 = 0;
                     if (item_hi_6 > item_lo_6) {
                         item_count_6 = (item_hi_6 + 127) / 128 - item_lo_6 / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint_6 = checkpoint_token_indices[sequence_7];
+                            int candidate_checkpoint_6 = checkpoint_token_indices[sequence_6];
                             if (candidate_checkpoint_6 > item_lo_6 && candidate_checkpoint_6 < item_hi_6 && candidate_checkpoint_6 % 128 != 0) {
                                 item_checkpoint_6 = candidate_checkpoint_6;
                                 checkpoint_rank_6 = candidate_checkpoint_6 / 128 - item_lo_6 / 128 + 1;
@@ -2044,8 +2000,8 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     first_logical_6 = 0;
                     logical_end_6 = item_count_6;
                 } else {
-                    first_logical_6 = seq_chunk_cumsum[table_base + sequence_7];
-                    logical_end_6 = seq_chunk_cumsum[table_base + sequence_7 + 1];
+                    first_logical_6 = seq_chunk_cumsum[sequence_6];
+                    logical_end_6 = seq_chunk_cumsum[sequence_6 + 1];
                 }
                 int _uniform_13 = make_warp_uniform(first_logical_6);
                 first_logical_6 = _uniform_13;
@@ -2053,39 +2009,24 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                 logical_end_6 = _uniform_14;
                 #pragma unroll 1
                 for (int logical_6 = first_logical_6; logical_6 < logical_end_6; logical_6++) {
-                    int physical_chunk_3 = logical_6 - sequence_7 * nchunks;
+                    int chunk_4 = logical_6 - sequence_6 * nchunks;
+                    if (metadata_from_cu_seqlens != 0) {
+                        chunk_4 = ((checkpoint_rank_6 < logical_6) ? (item_lo_6 / 128 + logical_6 - 1) * 128 : ((logical_6 == checkpoint_rank_6) ? item_checkpoint_6 : ((logical_6 == 0) ? item_lo_6 : (item_lo_6 / 128 + logical_6) * 128))) / 128;
+                    } else {
+                        chunk_4 = chunk_indices[logical_6];
+                    }
                     int segment_offset_4 = 0;
                     int segment_limit_4 = 128;
-                    if (metadata_from_cu_seqlens == 1) {
-                        int first_chunk_4 = item_lo_6 / 128;
-                        int segment_start_4 = ((checkpoint_rank_6 < logical_6) ? (first_chunk_4 + logical_6 - 1) * 128 : ((logical_6 == checkpoint_rank_6) ? item_checkpoint_6 : ((logical_6 == 0) ? item_lo_6 : (first_chunk_4 + logical_6) * 128)));
-                        int _min_24 = ((((checkpoint_rank_6 < logical_6 + 1) ? (first_chunk_4 + (logical_6 + 1) - 1) * 128 : ((logical_6 + 1 == checkpoint_rank_6) ? item_checkpoint_6 : ((logical_6 + 1 == 0) ? item_lo_6 : (first_chunk_4 + (logical_6 + 1)) * 128)))) < (item_hi_6) ? (((checkpoint_rank_6 < logical_6 + 1) ? (first_chunk_4 + (logical_6 + 1) - 1) * 128 : ((logical_6 + 1 == checkpoint_rank_6) ? item_checkpoint_6 : ((logical_6 + 1 == 0) ? item_lo_6 : (first_chunk_4 + (logical_6 + 1)) * 128)))) : (item_hi_6));
-                        int segment_end_5 = _min_24;
-                        physical_chunk_3 = segment_start_4 / 128;
-                        segment_offset_4 = segment_start_4 - physical_chunk_3 * 128;
-                        segment_limit_4 = segment_end_5 - physical_chunk_3 * 128;
-                    } else {
-                        physical_chunk_3 = chunk_indices[logical_6];
-                        segment_offset_4 = chunk_offsets[logical_6];
-                        if (logical_6 + 1 < num_logical_chunks) {
-                            int next_chunk_4 = chunk_indices[logical_6 + 1];
-                            if (next_chunk_4 == physical_chunk_3) {
-                                segment_limit_4 = chunk_offsets[logical_6 + 1];
-                            }
-                        }
-                    }
-                    int chunk_tokens_4 = seqlen - physical_chunk_3 * 128;
-                    if (chunk_tokens_4 > 128) {
-                        chunk_tokens_4 = 128;
-                    }
-                    if (segment_limit_4 > chunk_tokens_4) {
-                        segment_limit_4 = chunk_tokens_4;
-                    }
+                    int chunk_tokens_1 = 128;
                     mbarrier_wait(intra_full_addr + (acc_stage_3) * 8, _phase_intra_full);
                     mbarrier_wait(inter_full_addr, _phase_inter_full_0);
                     _phase_inter_full_0 ^= 1;
                     mbarrier_wait(aux_full_addr + (input_stage_6) * 8, _phase_aux_full_2);
                     mbarrier_wait(x_full_addr + (input_stage_6) * 8, _phase_x_full_2);
+                    int geometry_2 = smem_geometry[input_stage_6];
+                    segment_offset_4 = geometry_2 & 255;
+                    segment_limit_4 = geometry_2 >> 8 & 255;
+                    chunk_tokens_1 = geometry_2 >> 16;
                     int physical_batch_2 = 0;
                     float segment_base_4 = 0.0f;
                     if (segment_offset_4 > 0) {
@@ -2093,32 +2034,99 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     }
                     int full_chunk = 1;
                     full_chunk = 0;
-                    if (segment_offset_4 == 0 && segment_limit_4 == chunk_tokens_4) {
+                    if (segment_offset_4 == 0 && segment_limit_4 == chunk_tokens_1) {
                         full_chunk = 1;
                     }
                     if (full_chunk != 0 && output_issued >= 2) {
-                        int warp_id_in_role = (warp - 12);
-                        if (warp_id_in_role == 0) {
-                            asm volatile("cp.async.bulk.wait_group.read 1;");
-                        }
-                        asm volatile("barrier.sync 10, 128;" ::: "memory");
+                        asm volatile("cp.async.bulk.wait_group.read 1;");
+                        __syncwarp();
                     }
+                    float ring_intra_0[8];
+                    float ring_inter_0[8];
+                    unsigned int ring_z_0[4];
+                    float ring_intra_1[8];
+                    float ring_inter_1[8];
+                    unsigned int ring_z_1[4];
+                    float ring_intra_2[8];
+                    float ring_inter_2[8];
+                    unsigned int ring_z_2[4];
+                    float ring_intra_3[8];
+                    float ring_inter_3[8];
+                    unsigned int ring_z_3[4];
+                    unsigned int x_packed[4];
+                    unsigned int d_packed[4];
+                    float d_values[8];
+                    float z_scale[8];
+                    float group_values[8];
+                    int token_in_batch_1 = chunk_4 * 128 + row_1;
+                    int token = physical_batch_2 * seqlen + token_in_batch_1;
+                    int z_token = token;
+                    if (row_1 >= chunk_tokens_1) {
+                        z_token = physical_batch_2 * seqlen + chunk_4 * 128 + chunk_tokens_1 - 1;
+                    }
+                    int z_row_base = z_token * nheads * 64 + head_3 * 64;
+                    int out_row_base = (token * nheads + head_3) * 64;
+                    tmem_ld_x8(&ring_intra_0[0], (unsigned int)(taddr_0_2 + row_tmem_base_1 + 256) + acc_stage_3 * 64);
+                    tmem_ld_x8(&ring_inter_0[0], taddr_0_2 + row_tmem_base_1 + 448);
+                    if (has_z != 0) {
+                        if (row_1 >= segment_offset_4 && row_1 < segment_limit_4) {
+                            {
+                                const uint4* _vptr_1 = reinterpret_cast<const uint4*>(z + z_row_base);
+                                uint4* _vdst_1 = reinterpret_cast<uint4*>(&ring_z_0[0]);
+                                #pragma unroll
+                                for (int _blk = 0; _blk < 1; _blk++) {
+                                    _vdst_1[_blk] = _vptr_1[_blk];
+                                }
+                            }
+                        }
+                    }
+                    tmem_ld_x8(&ring_intra_1[0], (unsigned int)(taddr_0_2 + row_tmem_base_1 + 256) + acc_stage_3 * 64 + 8);
+                    tmem_ld_x8(&ring_inter_1[0], taddr_0_2 + row_tmem_base_1 + 448 + 8);
+                    if (has_z != 0) {
+                        if (row_1 >= segment_offset_4 && row_1 < segment_limit_4) {
+                            {
+                                const uint4* _vptr_2 = reinterpret_cast<const uint4*>(z + z_row_base + 8);
+                                uint4* _vdst_2 = reinterpret_cast<uint4*>(&ring_z_1[0]);
+                                #pragma unroll
+                                for (int _blk = 0; _blk < 1; _blk++) {
+                                    _vdst_2[_blk] = _vptr_2[_blk];
+                                }
+                            }
+                        }
+                    }
+                    tmem_ld_x8(&ring_intra_2[0], (unsigned int)(taddr_0_2 + row_tmem_base_1 + 256) + acc_stage_3 * 64 + 16);
+                    tmem_ld_x8(&ring_inter_2[0], taddr_0_2 + row_tmem_base_1 + 448 + 16);
+                    if (has_z != 0) {
+                        if (row_1 >= segment_offset_4 && row_1 < segment_limit_4) {
+                            {
+                                const uint4* _vptr_3 = reinterpret_cast<const uint4*>(z + z_row_base + 16);
+                                uint4* _vdst_3 = reinterpret_cast<uint4*>(&ring_z_2[0]);
+                                #pragma unroll
+                                for (int _blk = 0; _blk < 1; _blk++) {
+                                    _vdst_3[_blk] = _vptr_3[_blk];
+                                }
+                            }
+                        }
+                    }
+                    tmem_ld_x8(&ring_intra_3[0], (unsigned int)(taddr_0_2 + row_tmem_base_1 + 256) + acc_stage_3 * 64 + 24);
+                    tmem_ld_x8(&ring_inter_3[0], taddr_0_2 + row_tmem_base_1 + 448 + 24);
+                    if (has_z != 0) {
+                        if (row_1 >= segment_offset_4 && row_1 < segment_limit_4) {
+                            {
+                                const uint4* _vptr_4 = reinterpret_cast<const uint4*>(z + z_row_base + 24);
+                                uint4* _vdst_4 = reinterpret_cast<uint4*>(&ring_z_3[0]);
+                                #pragma unroll
+                                for (int _blk = 0; _blk < 1; _blk++) {
+                                    _vdst_4[_blk] = _vptr_4[_blk];
+                                }
+                            }
+                        }
+                    }
+                    float _exp2_5 = approx_exp2((smem_cumsum_all[input_stage_6 * 128 + (unsigned int)row_1] - segment_base_4) * 1.4426950408889634f);
+                    float decay_1 = _exp2_5;
                     #pragma unroll
                     for (int dim_chunk_5 = 0; dim_chunk_5 < 2; dim_chunk_5++) {
-                        float _tmem_load_2[32];
-                        asm volatile(
-                            "tcgen05.ld.sync.aligned.32x32b.x32.b32"
-                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                            : "=f"(_tmem_load_2[0]), "=f"(_tmem_load_2[1]), "=f"(_tmem_load_2[2]), "=f"(_tmem_load_2[3]), "=f"(_tmem_load_2[4]), "=f"(_tmem_load_2[5]), "=f"(_tmem_load_2[6]), "=f"(_tmem_load_2[7]), "=f"(_tmem_load_2[8]), "=f"(_tmem_load_2[9]), "=f"(_tmem_load_2[10]), "=f"(_tmem_load_2[11]), "=f"(_tmem_load_2[12]), "=f"(_tmem_load_2[13]), "=f"(_tmem_load_2[14]), "=f"(_tmem_load_2[15]), "=f"(_tmem_load_2[16]), "=f"(_tmem_load_2[17]), "=f"(_tmem_load_2[18]), "=f"(_tmem_load_2[19]), "=f"(_tmem_load_2[20]), "=f"(_tmem_load_2[21]), "=f"(_tmem_load_2[22]), "=f"(_tmem_load_2[23]), "=f"(_tmem_load_2[24]), "=f"(_tmem_load_2[25]), "=f"(_tmem_load_2[26]), "=f"(_tmem_load_2[27]), "=f"(_tmem_load_2[28]), "=f"(_tmem_load_2[29]), "=f"(_tmem_load_2[30]), "=f"(_tmem_load_2[31])
-                            : "r"((unsigned int)(taddr_0_2 + row_tmem_base_1 + 256) + acc_stage_3 * 64 + (unsigned int)(dim_chunk_5 * 32)));
-                        asm volatile("tcgen05.wait::ld.sync.aligned;");
-                        float _tmem_load_3[32];
-                        asm volatile(
-                            "tcgen05.ld.sync.aligned.32x32b.x32.b32"
-                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                            : "=f"(_tmem_load_3[0]), "=f"(_tmem_load_3[1]), "=f"(_tmem_load_3[2]), "=f"(_tmem_load_3[3]), "=f"(_tmem_load_3[4]), "=f"(_tmem_load_3[5]), "=f"(_tmem_load_3[6]), "=f"(_tmem_load_3[7]), "=f"(_tmem_load_3[8]), "=f"(_tmem_load_3[9]), "=f"(_tmem_load_3[10]), "=f"(_tmem_load_3[11]), "=f"(_tmem_load_3[12]), "=f"(_tmem_load_3[13]), "=f"(_tmem_load_3[14]), "=f"(_tmem_load_3[15]), "=f"(_tmem_load_3[16]), "=f"(_tmem_load_3[17]), "=f"(_tmem_load_3[18]), "=f"(_tmem_load_3[19]), "=f"(_tmem_load_3[20]), "=f"(_tmem_load_3[21]), "=f"(_tmem_load_3[22]), "=f"(_tmem_load_3[23]), "=f"(_tmem_load_3[24]), "=f"(_tmem_load_3[25]), "=f"(_tmem_load_3[26]), "=f"(_tmem_load_3[27]), "=f"(_tmem_load_3[28]), "=f"(_tmem_load_3[29]), "=f"(_tmem_load_3[30]), "=f"(_tmem_load_3[31])
-                            : "r"(taddr_0_2 + row_tmem_base_1 + 448 + dim_chunk_5 * 32));
-                        asm volatile("tcgen05.wait::ld.sync.aligned;");
+                        asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                         if (dim_chunk_5 == 1) {
                             asm volatile("tcgen05.fence::before_thread_sync;");
                             if (elect_sync()) {
@@ -2127,135 +2135,337 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                             }
                         }
                         if (row_1 >= segment_offset_4 && row_1 < segment_limit_4) {
-                            int token_in_batch_1 = physical_chunk_3 * 128 + row_1;
-                            int token = physical_batch_2 * seqlen + token_in_batch_1;
-                            float _exp2_5 = approx_exp2((smem_cumsum_all[input_stage_6 * 128 + (unsigned int)row_1] - segment_base_4) * 1.4426950408889634f);
-                            float decay_1 = _exp2_5;
-                            int z_token = token;
-                            if (row_1 >= chunk_tokens_4) {
-                                z_token = physical_batch_2 * seqlen + physical_chunk_3 * 128 + chunk_tokens_4 - 1;
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&x_packed[0])), "=r"(*reinterpret_cast<uint32_t*>(&x_packed[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&x_packed[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&x_packed[(0) + 3]))
+                                : "r"((smem_x_tma_addr + input_stage_6 * 16384 + (unsigned int)(dim_chunk_5 * 4 * 8 / 64 * 16384 + row_1 * 128 + dim_chunk_5 * 4 * 8 % 64 * 2 ^ (dim_chunk_5 * 4 * 8 / 64 * 16384 + row_1 * 128 + dim_chunk_5 * 4 * 8 % 64 * 2 >> 7 & 7) << 4))));
+                            float _unpack_bf16_0[8];
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 4; _pair++) {
+                                (&_unpack_bf16_0[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(x_packed[_pair]) << 16);
+                                (&_unpack_bf16_0[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(x_packed[_pair]) & 0xffff0000u);
                             }
-                            int z_row_base = z_token * nheads * 64 + head_3 * 64;
-                            int out_row_base = (token * nheads + head_3) * 64;
-                            unsigned int z_packed[16];
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&d_packed[0])), "=r"(*reinterpret_cast<uint32_t*>(&d_packed[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&d_packed[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&d_packed[(0) + 3]))
+                                : "r"(smem_d_row_addr + (unsigned int)(dim_chunk_5 * 4 * 8 * 2)));
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 4; _pair++) {
+                                (&d_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(d_packed[_pair]) << 16);
+                                (&d_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(d_packed[_pair]) & 0xffff0000u);
+                            }
                             if (has_z != 0) {
                                 #pragma unroll
-                                for (int load_group = 0; load_group < 4; load_group++) {
+                                for (int _pair = 0; _pair < 4; _pair++) {
+                                    (&z_scale[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(ring_z_0[_pair]) << 16);
+                                    (&z_scale[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(ring_z_0[_pair]) & 0xffff0000u);
+                                }
+                                if (dim_chunk_5 * 4 < 4) {
                                     {
-                                        const uint4* _vptr_0 = reinterpret_cast<const uint4*>(z + z_row_base + dim_chunk_5 * 32 + load_group * 8);
-                                        uint4* _vdst_0 = reinterpret_cast<uint4*>(&z_packed[load_group * 4]);
+                                        const uint4* _vptr_5 = reinterpret_cast<const uint4*>(z + z_row_base + (dim_chunk_5 * 4 + 4) * 8);
+                                        uint4* _vdst_5 = reinterpret_cast<uint4*>(&ring_z_0[0]);
                                         #pragma unroll
                                         for (int _blk = 0; _blk < 1; _blk++) {
-                                            _vdst_0[_blk] = _vptr_0[_blk];
+                                            _vdst_5[_blk] = _vptr_5[_blk];
                                         }
                                     }
+                                }
+                                #pragma unroll
+                                for (int group_dim = 0; group_dim < 8; group_dim++) {
+                                    float z_value = z_scale[group_dim];
+                                    float _expf_0 = __expf(-z_value);
+                                    float _rcp_0 = approx_rcp(1.0f + _expf_0);
+                                    z_scale[group_dim] = z_value * _rcp_0;
+                                }
+                            } else {
+                                #pragma unroll
+                                for (int group_dim_1 = 0; group_dim_1 < 8; group_dim_1++) {
+                                    z_scale[group_dim_1] = 1.0f;
                                 }
                             }
                             #pragma unroll
-                            for (int local_group = 0; local_group < 4; local_group++) {
-                                int dim_base = dim_chunk_5 * 32 + local_group * 8;
-                                unsigned int x_packed[4];
-                                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                    : "=r"(*reinterpret_cast<uint32_t*>(&x_packed[0])), "=r"(*reinterpret_cast<uint32_t*>(&x_packed[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&x_packed[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&x_packed[(0) + 3]))
-                                    : "r"((smem_x_tma_addr + input_stage_6 * 16384 + (unsigned int)(dim_base / 64 * 16384 + row_1 * 128 + dim_base % 64 * 2 ^ (dim_base / 64 * 16384 + row_1 * 128 + dim_base % 64 * 2 >> 7 & 7) << 4))));
-                                float _unpack_bf16_0[8];
+                            for (int group_dim_2 = 0; group_dim_2 < 8; group_dim_2++) {
+                                float _fma_11 = __fmaf_rn(ring_inter_0[group_dim_2], decay_1, ring_intra_0[group_dim_2]);
+                                float value_2 = _fma_11;
+                                float x_value = _unpack_bf16_0[group_dim_2];
+                                float d_value = d_values[group_dim_2];
+                                if (D_mode != 0) {
+                                    float _fma_12 = __fmaf_rn(x_value, d_value, value_2);
+                                    value_2 = _fma_12;
+                                }
+                                float z_mul = z_scale[group_dim_2];
+                                value_2 = value_2 * z_mul;
+                                group_values[group_dim_2] = value_2;
+                            }
+                            if (full_chunk != 0) {
+                                unsigned int group_values_bf16[4];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 4; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(group_values[_lp*2 + 0], group_values[_lp*2+1 + 0]));
+                                    group_values_bf16[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_y_addr + output_stage * 16384 + (unsigned int)(row_1 * 128 + dim_chunk_5 * 4 * 8 * 2 ^ (row_1 * 128 + dim_chunk_5 * 4 * 8 * 2 >> 7 & 7) << 4))), "r"(group_values_bf16[0]), "r"(group_values_bf16[1]), "r"(group_values_bf16[2]), "r"(group_values_bf16[3]) : "memory");
+                            } else {
+                                #pragma unroll
+                                for (int group_dim_3 = 0; group_dim_3 < 8; group_dim_3++) {
+                                    out_native[out_row_base + dim_chunk_5 * 4 * 8 + group_dim_3] = group_values[group_dim_3];
+                                }
+                            }
+                        }
+                        if (dim_chunk_5 == 0) {
+                            tmem_ld_x8(&ring_intra_0[0], (unsigned int)(taddr_0_2 + row_tmem_base_1 + 256) + acc_stage_3 * 64 + 32);
+                            tmem_ld_x8(&ring_inter_0[0], taddr_0_2 + row_tmem_base_1 + 448 + 32);
+                        }
+                        if (row_1 >= segment_offset_4 && row_1 < segment_limit_4) {
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&x_packed[0])), "=r"(*reinterpret_cast<uint32_t*>(&x_packed[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&x_packed[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&x_packed[(0) + 3]))
+                                : "r"((smem_x_tma_addr + input_stage_6 * 16384 + (unsigned int)((dim_chunk_5 * 4 + 1) * 8 / 64 * 16384 + row_1 * 128 + (dim_chunk_5 * 4 + 1) * 8 % 64 * 2 ^ ((dim_chunk_5 * 4 + 1) * 8 / 64 * 16384 + row_1 * 128 + (dim_chunk_5 * 4 + 1) * 8 % 64 * 2 >> 7 & 7) << 4))));
+                            float _unpack_bf16_1[8];
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 4; _pair++) {
+                                (&_unpack_bf16_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(x_packed[_pair]) << 16);
+                                (&_unpack_bf16_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(x_packed[_pair]) & 0xffff0000u);
+                            }
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&d_packed[0])), "=r"(*reinterpret_cast<uint32_t*>(&d_packed[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&d_packed[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&d_packed[(0) + 3]))
+                                : "r"(smem_d_row_addr + (unsigned int)((dim_chunk_5 * 4 + 1) * 8 * 2)));
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 4; _pair++) {
+                                (&d_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(d_packed[_pair]) << 16);
+                                (&d_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(d_packed[_pair]) & 0xffff0000u);
+                            }
+                            if (has_z != 0) {
                                 #pragma unroll
                                 for (int _pair = 0; _pair < 4; _pair++) {
-                                    (&_unpack_bf16_0[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(x_packed[_pair]) << 16);
-                                    (&_unpack_bf16_0[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(x_packed[_pair]) & 0xffff0000u);
+                                    (&z_scale[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(ring_z_1[_pair]) << 16);
+                                    (&z_scale[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(ring_z_1[_pair]) & 0xffff0000u);
                                 }
-                                float d_values[8];
-                                #pragma unroll
-                                for (int group_dim = 0; group_dim < 8; group_dim++) {
-                                    d_values[group_dim] = d_head_value;
-                                }
-                                if (D_mode == 2) {
+                                if (dim_chunk_5 * 4 + 1 < 4) {
                                     {
-                                        const uint4* _vptr_1 = reinterpret_cast<const uint4*>(D + head_3 * 64 + dim_base);
-                                        uint4 _vld_1[1];
+                                        const uint4* _vptr_6 = reinterpret_cast<const uint4*>(z + z_row_base + (dim_chunk_5 * 4 + 1 + 4) * 8);
+                                        uint4* _vdst_6 = reinterpret_cast<uint4*>(&ring_z_1[0]);
                                         #pragma unroll
                                         for (int _blk = 0; _blk < 1; _blk++) {
-                                            _vld_1[_blk] = _vptr_1[_blk];
-                                            uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
-                                            #pragma unroll
-                                            for (int _pair = 0; _pair < 4; _pair++) {
-                                                (&d_values[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) << 16);
-                                                (&d_values[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) & 0xffff0000u);
-                                            }
+                                            _vdst_6[_blk] = _vptr_6[_blk];
                                         }
                                     }
                                 }
-                                float z_scale[8];
-                                if (has_z != 0) {
-                                    #pragma unroll
-                                    for (int _pair = 0; _pair < 4; _pair++) {
-                                        (&z_scale[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>((z_packed + local_group * 4)[_pair]) << 16);
-                                        (&z_scale[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>((z_packed + local_group * 4)[_pair]) & 0xffff0000u);
-                                    }
-                                    #pragma unroll
-                                    for (int group_dim_1 = 0; group_dim_1 < 8; group_dim_1++) {
-                                        float z_value = z_scale[group_dim_1];
-                                        float _expf_0 = __expf(-z_value);
-                                        float _rcp_0 = approx_rcp(1.0f + _expf_0);
-                                        z_scale[group_dim_1] = z_value * _rcp_0;
-                                    }
-                                } else {
-                                    #pragma unroll
-                                    for (int group_dim_2 = 0; group_dim_2 < 8; group_dim_2++) {
-                                        z_scale[group_dim_2] = 1.0f;
-                                    }
-                                }
-                                float group_values[8];
                                 #pragma unroll
-                                for (int group_dim_3 = 0; group_dim_3 < 8; group_dim_3++) {
-                                    int local_dim = local_group * 8 + group_dim_3;
-                                    float _fma_11 = __fmaf_rn(_tmem_load_3[local_dim], decay_1, _tmem_load_2[local_dim]);
-                                    float value_2 = _fma_11;
-                                    float x_value = _unpack_bf16_0[group_dim_3];
-                                    float d_value = d_values[group_dim_3];
-                                    if (D_mode != 0) {
-                                        float _fma_12 = __fmaf_rn(x_value, d_value, value_2);
-                                        value_2 = _fma_12;
-                                    }
-                                    float z_mul = z_scale[group_dim_3];
-                                    value_2 = value_2 * z_mul;
-                                    group_values[group_dim_3] = value_2;
+                                for (int group_dim_4 = 0; group_dim_4 < 8; group_dim_4++) {
+                                    float z_value_1 = z_scale[group_dim_4];
+                                    float _expf_1 = __expf(-z_value_1);
+                                    float _rcp_1 = approx_rcp(1.0f + _expf_1);
+                                    z_scale[group_dim_4] = z_value_1 * _rcp_1;
                                 }
-                                if (full_chunk != 0) {
-                                    unsigned int group_values_bf16[4];
-                                    #pragma unroll
-                                    for (int _lp = 0; _lp < 4; _lp++) {
-                                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(group_values[_lp*2 + 0], group_values[_lp*2+1 + 0]));
-                                        group_values_bf16[_lp] = *(uint32_t*)&_bf2;
-                                    }
-                                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_y_addr + output_stage * 16384 + (unsigned int)(row_1 * 128 + dim_base * 2 ^ (row_1 * 128 + dim_base * 2 >> 7 & 7) << 4))), "r"(group_values_bf16[0]), "r"(group_values_bf16[1]), "r"(group_values_bf16[2]), "r"(group_values_bf16[3]) : "memory");
-                                } else {
-                                    #pragma unroll
-                                    for (int group_dim_4 = 0; group_dim_4 < 8; group_dim_4++) {
-                                        out_native[out_row_base + dim_base + group_dim_4] = group_values[group_dim_4];
-                                    }
+                            } else {
+                                #pragma unroll
+                                for (int group_dim_5 = 0; group_dim_5 < 8; group_dim_5++) {
+                                    z_scale[group_dim_5] = 1.0f;
                                 }
                             }
+                            #pragma unroll
+                            for (int group_dim_6 = 0; group_dim_6 < 8; group_dim_6++) {
+                                float _fma_13 = __fmaf_rn(ring_inter_1[group_dim_6], decay_1, ring_intra_1[group_dim_6]);
+                                float value_3 = _fma_13;
+                                float x_value_1 = _unpack_bf16_1[group_dim_6];
+                                float d_value_1 = d_values[group_dim_6];
+                                if (D_mode != 0) {
+                                    float _fma_14 = __fmaf_rn(x_value_1, d_value_1, value_3);
+                                    value_3 = _fma_14;
+                                }
+                                float z_mul_1 = z_scale[group_dim_6];
+                                value_3 = value_3 * z_mul_1;
+                                group_values[group_dim_6] = value_3;
+                            }
+                            if (full_chunk != 0) {
+                                unsigned int group_values_bf16_1[4];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 4; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(group_values[_lp*2 + 0], group_values[_lp*2+1 + 0]));
+                                    group_values_bf16_1[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_y_addr + output_stage * 16384 + (unsigned int)(row_1 * 128 + (dim_chunk_5 * 4 + 1) * 8 * 2 ^ (row_1 * 128 + (dim_chunk_5 * 4 + 1) * 8 * 2 >> 7 & 7) << 4))), "r"(group_values_bf16_1[0]), "r"(group_values_bf16_1[1]), "r"(group_values_bf16_1[2]), "r"(group_values_bf16_1[3]) : "memory");
+                            } else {
+                                #pragma unroll
+                                for (int group_dim_7 = 0; group_dim_7 < 8; group_dim_7++) {
+                                    out_native[out_row_base + (dim_chunk_5 * 4 + 1) * 8 + group_dim_7] = group_values[group_dim_7];
+                                }
+                            }
+                        }
+                        if (dim_chunk_5 == 0) {
+                            tmem_ld_x8(&ring_intra_1[0], (unsigned int)(taddr_0_2 + row_tmem_base_1 + 256) + acc_stage_3 * 64 + 40);
+                            tmem_ld_x8(&ring_inter_1[0], taddr_0_2 + row_tmem_base_1 + 448 + 40);
+                        }
+                        if (row_1 >= segment_offset_4 && row_1 < segment_limit_4) {
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&x_packed[0])), "=r"(*reinterpret_cast<uint32_t*>(&x_packed[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&x_packed[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&x_packed[(0) + 3]))
+                                : "r"((smem_x_tma_addr + input_stage_6 * 16384 + (unsigned int)((dim_chunk_5 * 4 + 2) * 8 / 64 * 16384 + row_1 * 128 + (dim_chunk_5 * 4 + 2) * 8 % 64 * 2 ^ ((dim_chunk_5 * 4 + 2) * 8 / 64 * 16384 + row_1 * 128 + (dim_chunk_5 * 4 + 2) * 8 % 64 * 2 >> 7 & 7) << 4))));
+                            float _unpack_bf16_2[8];
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 4; _pair++) {
+                                (&_unpack_bf16_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(x_packed[_pair]) << 16);
+                                (&_unpack_bf16_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(x_packed[_pair]) & 0xffff0000u);
+                            }
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&d_packed[0])), "=r"(*reinterpret_cast<uint32_t*>(&d_packed[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&d_packed[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&d_packed[(0) + 3]))
+                                : "r"(smem_d_row_addr + (unsigned int)((dim_chunk_5 * 4 + 2) * 8 * 2)));
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 4; _pair++) {
+                                (&d_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(d_packed[_pair]) << 16);
+                                (&d_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(d_packed[_pair]) & 0xffff0000u);
+                            }
+                            if (has_z != 0) {
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 4; _pair++) {
+                                    (&z_scale[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(ring_z_2[_pair]) << 16);
+                                    (&z_scale[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(ring_z_2[_pair]) & 0xffff0000u);
+                                }
+                                if (dim_chunk_5 * 4 + 2 < 4) {
+                                    {
+                                        const uint4* _vptr_7 = reinterpret_cast<const uint4*>(z + z_row_base + (dim_chunk_5 * 4 + 2 + 4) * 8);
+                                        uint4* _vdst_7 = reinterpret_cast<uint4*>(&ring_z_2[0]);
+                                        #pragma unroll
+                                        for (int _blk = 0; _blk < 1; _blk++) {
+                                            _vdst_7[_blk] = _vptr_7[_blk];
+                                        }
+                                    }
+                                }
+                                #pragma unroll
+                                for (int group_dim_8 = 0; group_dim_8 < 8; group_dim_8++) {
+                                    float z_value_2 = z_scale[group_dim_8];
+                                    float _expf_2 = __expf(-z_value_2);
+                                    float _rcp_2 = approx_rcp(1.0f + _expf_2);
+                                    z_scale[group_dim_8] = z_value_2 * _rcp_2;
+                                }
+                            } else {
+                                #pragma unroll
+                                for (int group_dim_9 = 0; group_dim_9 < 8; group_dim_9++) {
+                                    z_scale[group_dim_9] = 1.0f;
+                                }
+                            }
+                            #pragma unroll
+                            for (int group_dim_10 = 0; group_dim_10 < 8; group_dim_10++) {
+                                float _fma_15 = __fmaf_rn(ring_inter_2[group_dim_10], decay_1, ring_intra_2[group_dim_10]);
+                                float value_4 = _fma_15;
+                                float x_value_2 = _unpack_bf16_2[group_dim_10];
+                                float d_value_2 = d_values[group_dim_10];
+                                if (D_mode != 0) {
+                                    float _fma_16 = __fmaf_rn(x_value_2, d_value_2, value_4);
+                                    value_4 = _fma_16;
+                                }
+                                float z_mul_2 = z_scale[group_dim_10];
+                                value_4 = value_4 * z_mul_2;
+                                group_values[group_dim_10] = value_4;
+                            }
+                            if (full_chunk != 0) {
+                                unsigned int group_values_bf16_2[4];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 4; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(group_values[_lp*2 + 0], group_values[_lp*2+1 + 0]));
+                                    group_values_bf16_2[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_y_addr + output_stage * 16384 + (unsigned int)(row_1 * 128 + (dim_chunk_5 * 4 + 2) * 8 * 2 ^ (row_1 * 128 + (dim_chunk_5 * 4 + 2) * 8 * 2 >> 7 & 7) << 4))), "r"(group_values_bf16_2[0]), "r"(group_values_bf16_2[1]), "r"(group_values_bf16_2[2]), "r"(group_values_bf16_2[3]) : "memory");
+                            } else {
+                                #pragma unroll
+                                for (int group_dim_11 = 0; group_dim_11 < 8; group_dim_11++) {
+                                    out_native[out_row_base + (dim_chunk_5 * 4 + 2) * 8 + group_dim_11] = group_values[group_dim_11];
+                                }
+                            }
+                        }
+                        if (dim_chunk_5 == 0) {
+                            tmem_ld_x8(&ring_intra_2[0], (unsigned int)(taddr_0_2 + row_tmem_base_1 + 256) + acc_stage_3 * 64 + 48);
+                            tmem_ld_x8(&ring_inter_2[0], taddr_0_2 + row_tmem_base_1 + 448 + 48);
+                        }
+                        if (row_1 >= segment_offset_4 && row_1 < segment_limit_4) {
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&x_packed[0])), "=r"(*reinterpret_cast<uint32_t*>(&x_packed[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&x_packed[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&x_packed[(0) + 3]))
+                                : "r"((smem_x_tma_addr + input_stage_6 * 16384 + (unsigned int)((dim_chunk_5 * 4 + 3) * 8 / 64 * 16384 + row_1 * 128 + (dim_chunk_5 * 4 + 3) * 8 % 64 * 2 ^ ((dim_chunk_5 * 4 + 3) * 8 / 64 * 16384 + row_1 * 128 + (dim_chunk_5 * 4 + 3) * 8 % 64 * 2 >> 7 & 7) << 4))));
+                            float _unpack_bf16_3[8];
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 4; _pair++) {
+                                (&_unpack_bf16_3[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(x_packed[_pair]) << 16);
+                                (&_unpack_bf16_3[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(x_packed[_pair]) & 0xffff0000u);
+                            }
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&d_packed[0])), "=r"(*reinterpret_cast<uint32_t*>(&d_packed[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&d_packed[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&d_packed[(0) + 3]))
+                                : "r"(smem_d_row_addr + (unsigned int)((dim_chunk_5 * 4 + 3) * 8 * 2)));
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 4; _pair++) {
+                                (&d_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(d_packed[_pair]) << 16);
+                                (&d_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(d_packed[_pair]) & 0xffff0000u);
+                            }
+                            if (has_z != 0) {
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 4; _pair++) {
+                                    (&z_scale[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(ring_z_3[_pair]) << 16);
+                                    (&z_scale[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(ring_z_3[_pair]) & 0xffff0000u);
+                                }
+                                if (dim_chunk_5 * 4 + 3 < 4) {
+                                    {
+                                        const uint4* _vptr_8 = reinterpret_cast<const uint4*>(z + z_row_base + (dim_chunk_5 * 4 + 3 + 4) * 8);
+                                        uint4* _vdst_8 = reinterpret_cast<uint4*>(&ring_z_3[0]);
+                                        #pragma unroll
+                                        for (int _blk = 0; _blk < 1; _blk++) {
+                                            _vdst_8[_blk] = _vptr_8[_blk];
+                                        }
+                                    }
+                                }
+                                #pragma unroll
+                                for (int group_dim_12 = 0; group_dim_12 < 8; group_dim_12++) {
+                                    float z_value_3 = z_scale[group_dim_12];
+                                    float _expf_3 = __expf(-z_value_3);
+                                    float _rcp_3 = approx_rcp(1.0f + _expf_3);
+                                    z_scale[group_dim_12] = z_value_3 * _rcp_3;
+                                }
+                            } else {
+                                #pragma unroll
+                                for (int group_dim_13 = 0; group_dim_13 < 8; group_dim_13++) {
+                                    z_scale[group_dim_13] = 1.0f;
+                                }
+                            }
+                            #pragma unroll
+                            for (int group_dim_14 = 0; group_dim_14 < 8; group_dim_14++) {
+                                float _fma_17 = __fmaf_rn(ring_inter_3[group_dim_14], decay_1, ring_intra_3[group_dim_14]);
+                                float value_5 = _fma_17;
+                                float x_value_3 = _unpack_bf16_3[group_dim_14];
+                                float d_value_3 = d_values[group_dim_14];
+                                if (D_mode != 0) {
+                                    float _fma_18 = __fmaf_rn(x_value_3, d_value_3, value_5);
+                                    value_5 = _fma_18;
+                                }
+                                float z_mul_3 = z_scale[group_dim_14];
+                                value_5 = value_5 * z_mul_3;
+                                group_values[group_dim_14] = value_5;
+                            }
+                            if (full_chunk != 0) {
+                                unsigned int group_values_bf16_3[4];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 4; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(group_values[_lp*2 + 0], group_values[_lp*2+1 + 0]));
+                                    group_values_bf16_3[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_y_addr + output_stage * 16384 + (unsigned int)(row_1 * 128 + (dim_chunk_5 * 4 + 3) * 8 * 2 ^ (row_1 * 128 + (dim_chunk_5 * 4 + 3) * 8 * 2 >> 7 & 7) << 4))), "r"(group_values_bf16_3[0]), "r"(group_values_bf16_3[1]), "r"(group_values_bf16_3[2]), "r"(group_values_bf16_3[3]) : "memory");
+                            } else {
+                                #pragma unroll
+                                for (int group_dim_15 = 0; group_dim_15 < 8; group_dim_15++) {
+                                    out_native[out_row_base + (dim_chunk_5 * 4 + 3) * 8 + group_dim_15] = group_values[group_dim_15];
+                                }
+                            }
+                        }
+                        if (dim_chunk_5 == 0) {
+                            tmem_ld_x8(&ring_intra_3[0], (unsigned int)(taddr_0_2 + row_tmem_base_1 + 256) + acc_stage_3 * 64 + 56);
+                            tmem_ld_x8(&ring_inter_3[0], taddr_0_2 + row_tmem_base_1 + 448 + 56);
                         }
                     }
-                    asm volatile("barrier.sync 10, 128;" ::: "memory");
                     if (full_chunk != 0) {
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        asm volatile("barrier.sync 10, 128;" ::: "memory");
-                        int warp_id_in_role_1 = (warp - 12);
-                        if (warp_id_in_role_1 == 0) {
-                            if (elect_sync()) {
-                                #pragma unroll
-                                for (int out_slab = 0; out_slab < 4; out_slab++) {
-                                    tma_store_4d((&out_map), 0, head_3, physical_chunk_3 * 128 + out_slab * 32, physical_batch_2, smem_y_addr + output_stage * 16384 + (unsigned int)(out_slab * 4096));
-                                }
-                            }
-                            asm volatile("cp.async.bulk.commit_group;");
+                        __syncwarp();
+                        if (elect_sync()) {
+                            tma_store_4d((&out_map), 0, head_3, chunk_4 * 128 + warp_id_in_role * 32, physical_batch_2, smem_y_addr + output_stage * 16384 + (unsigned int)(warp_id_in_role * 4096));
                         }
-                        asm volatile("barrier.sync 10, 128;" ::: "memory");
+                        asm volatile("cp.async.bulk.commit_group;");
                         output_stage = output_stage ^ 1;
                         output_issued += 1;
                     }
+                    asm volatile("barrier.sync 10, 128;" ::: "memory");
                     mbarrier_arrive(aux_empty_addr + (input_stage_6) * 8);
                     if (warp == 12) {
                         if (elect_sync()) {
@@ -2268,10 +2478,7 @@ kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensor
                     if (acc_stage_3 == 2) { acc_stage_3 = 0; _phase_intra_full ^= 1; }
                 }
             }
-            int warp_id_in_role_2 = (warp - 12);
-            if (warp_id_in_role_2 == 0) {
-                asm volatile("cp.async.bulk.wait_group.read 0;");
-            }
+            asm volatile("cp.async.bulk.wait_group.read 0;");
             asm volatile("barrier.sync 10, 128;" ::: "memory");
         }
     }
