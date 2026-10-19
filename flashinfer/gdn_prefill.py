@@ -1104,7 +1104,7 @@ def chunk_gated_delta_rule(
         chunk size (64).  ``0`` disables checkpointing (default).
     use_cp : Literal["auto"] | bool, optional:
         Whether to use context parallelism when low-parallelism heuristics
-        match. SM100/SM103 uses the generated GDN CP-only four-stage
+        match. SM100/SM103/SM107 uses the generated GDN CP-only four-stage
         implementation for structurally supported shapes. Other legal
         configurations retain the CuTe-DSL implementation.
         ``"auto"`` enables conservative routing, ``True`` requires CP support,
@@ -1146,7 +1146,7 @@ def chunk_gated_delta_rule(
         routing. Requires cuDNN frontend 1.31 GA and CuTe DSL 4.7 or newer.
         Cake kernels require an explicit ``cake_gdn``
         request. Use ``backend="cake_gdn", use_cp=True`` for Cake CP on
-        SM100/SM103; ``use_cp=False`` retains Cake non-CP, and ``"auto"``
+        SM100/SM103/SM107; ``use_cp=False`` retains Cake non-CP, and ``"auto"``
         enters Cake CP only inside the measured SM100/SM103 band (BF16/FP16
         I/O, FP32 initial and final state, gates, no checkpoints or state
         indices, ``4 * num_seqs * max(Hq, Hv) < SMs`` and ``max_seqlen >=
@@ -1249,7 +1249,8 @@ def chunk_gated_delta_rule(
     - Requires SM90 (Hopper) or SM100 (Blackwell) architecture. The SM100
       path requires ``head_size == 128``. On SM100/SM103, ``gdn_cp`` supports
       structurally legal equal-head, GQA, and GVA shapes on CUDA 12.8,
-      CUDA 12.9, and CUDA 13.
+      CUDA 12.9, and CUDA 13; SM107 supports the same shapes with an ``nvcc``
+      that can emit ``compute_107a``.
       Other SM100 CP DSL routes require CUDA 13 and
       ``nvidia-cutlass-dsl[cu13]>=4.4.2`` (``pip install
       flashinfer-python[cu13]``).

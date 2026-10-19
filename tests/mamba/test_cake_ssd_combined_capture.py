@@ -1008,24 +1008,33 @@ def test_tail_route_precedes_the_noring_variant_without_gpu(monkeypatch, sm_coun
     the pair rule off, the same shape takes the variant function's answer on
     the balanced persistent grid, from ``prepare`` and ``run`` alike.  The
     two readings never coincide on a real shape (``noring`` is one-chunk
-    geometry, the pair rule needs 16 chunks), so each is forced here."""
+    geometry, the pair rule needs 16 chunks), so each is forced here.  The
+    ``_noring`` programs ship only where the variant rule can select them
+    (one-chunk items of the retained ``exact`` family, never the two-kernel
+    family), so the second arm takes the same 512-item x 16-chunk call in its
+    packed-varlen form and also forces the retained family."""
 
     module = _module()
     rule = module.tail_selected
-    for pair_rule, expected in (
-        (True, "exactpre_bf16_batched_tail"),
-        (False, "exactpre_bf16_batched_noring"),
+    for pair_rule, form, family, expected in (
+        (True, "batched", None, "exactpre_bf16_batched_tail"),
+        (False, "cu_seqlens", "exact", "exact_bf16_varlen_noring"),
     ):
         calls, loads = [], []
-        runner = _cpu_runner(module, monkeypatch, calls, loads)
+        varlen = form != "batched"
+        runner = _cpu_runner(module, monkeypatch, calls, loads, has_varlen=varlen)
         monkeypatch.setattr(module, "_sm_count", lambda _: sm_count)
         monkeypatch.setattr(module, "_exact_scan_variant", lambda **_: "noring")
+        if family is not None:
+            monkeypatch.setattr(
+                module, "two_kernel_family", lambda _family=family, **_: _family
+            )
         monkeypatch.setattr(
             module,
             "tail_selected",
             lambda _on=pair_rule, **kwargs: _on and rule(**kwargs),
         )
-        (x, dt, A, B, C), _ = _tail_call("batched")
+        (x, dt, A, B, C), kwargs = _tail_call(form)
         out = torch.empty_like(x)
         grid = (
             module._tail_grid_size(sm_count=sm_count)
@@ -1033,11 +1042,11 @@ def test_tail_route_precedes_the_noring_variant_without_gpu(monkeypatch, sm_coun
             else module._persistent_grid_size(total_work=512, sm_count=sm_count)
         )
 
-        prepared = runner.prepare(x=x, dt=dt, A=A, B=B, C=C, out=out)
+        prepared = runner.prepare(x=x, dt=dt, A=A, B=B, C=C, out=out, **kwargs)
 
         assert prepared.program_name == expected, (pair_rule, prepared.program_name)
         assert prepared.grid == (grid, 1, 1)
-        runner.run(x, dt, A, B, C, out=out)
+        runner.run(x, dt, A, B, C, out=out, **kwargs)
         name, launch = calls[-1]
         assert name == runner.last_program_name == prepared.program_name
         assert launch["main_grid"] == prepared.grid
