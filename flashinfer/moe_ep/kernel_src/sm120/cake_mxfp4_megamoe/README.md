@@ -50,7 +50,7 @@ The device source is compiled per deployment with
 | `MOE_RANKS` | EP world size | 2..32 (the generator-covered region; GPU-validated at 4, 8, 16; 32 compile-checked) |
 | `MOE_EXPERTS` | global routed experts (physical experts under EPLB) | `% MOE_RANKS == 0`, <= 128 per rank, <= 1024 |
 | `MOE_TOPK` | routed experts per token | 1..9 |
-| `MOE_MAX_ROWS` | tokens per rank per call (capacity) | multiple of 128, <= 65408 (the 16-bit row fields of the `active_rows` kernel argument) |
+| `MOE_MAX_ROWS` | tokens per rank per call (capacity) | multiple of 128, <= 32640 (the row fields of the signed 32-bit `active_rows` kernel argument) |
 | `MOE_HIDDEN` | hidden size | multiple of 512, <= 7680 |
 | `MOE_INTERMEDIATE` | expert intermediate size | multiple of 128 |
 | `MOE_SHARED_EXPERT` | 1: one in-kernel FP8 e4m3 shared expert added to the output | 0 / 1 |

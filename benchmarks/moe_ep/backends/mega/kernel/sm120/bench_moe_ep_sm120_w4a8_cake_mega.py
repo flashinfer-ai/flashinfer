@@ -182,7 +182,9 @@ def main() -> None:
                 transport_table=_table_spec(args.table, world),
                 swiglu_limit=limit,
             )
-            layer.warmup(random_inputs(256, geometry, seed=args.seed + rank))
+            layer.warmup(
+                random_inputs(min(256, capacity), geometry, seed=args.seed + rank)
+            )
             ws = layer._workspace
             timer = _KernelTimer(ws.module)
             ws.module = timer

@@ -786,11 +786,11 @@ def test_geometry_rejects_outside_the_supported_region() -> None:
         G.KernelParams(2, 258, 6, 1024, 4096, 2048, False),  # 129 experts per rank
         G.KernelParams(33, 264, 6, 1024, 4096, 2048, False),  # EP 33
         G.KernelParams(1, 256, 6, 1024, 4096, 2048, False),  # EP 1
-        G.KernelParams(2, 256, 1, 65536, 512, 128, False),  # 16-bit active_rows field
+        G.KernelParams(2, 256, 1, 32768, 512, 128, False),  # 15-bit active_rows field
     ):
         with pytest.raises(G.GeometryError):
             G.describe_kernel(params)
-    G.describe_kernel(G.KernelParams(2, 256, 1, 65408, 512, 128, False))
+    G.describe_kernel(G.KernelParams(2, 256, 1, 32640, 512, 128, False))
     G.describe_kernel(
         G.KernelParams(8, 1024, 8, 512, 4096, 2048, False)
     )  # 128 per rank

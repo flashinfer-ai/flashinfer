@@ -757,6 +757,9 @@ void probe_round(int64_t dev_comm, int64_t src, int64_t src_win, int64_t dst_win
                  row.shape()[0] == world && gin_targets.shape()[0] == world &&
                  gin_barrier_targets.shape()[0] == world && out.shape()[0] >= 2)
       << "probe argument extents do not match world";
+  // The GIN sender advances by chunk_bytes; zero would never finish.
+  TVM_FFI_ICHECK(chunk_bytes > 0 && chunk_bytes <= UINT32_MAX)
+      << "probe chunk_bytes must be in [1, 2^32), got " << chunk_bytes;
 
   ProbeArgs a{};
   a.comm = reinterpret_cast<ncclDevComm const*>(dev_comm);
