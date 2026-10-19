@@ -18,19 +18,57 @@
 // Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
 #include "cake_nvfp4_per_token_device_common.cuh"
 
+// Shared by every record that names this translation unit in its sources: the record's
+// compile_flags select the knob values below (the guarded defaults are this file's own values) and
+// rename the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>; every JIT library of the family
+// exports a distinct kernel); the defaults name this file's own program.
+//   CAKE_Q_THREADS         CTA width in threads (CAKE_Q_WARPS = CAKE_Q_THREADS / 32)
+//   CAKE_Q_MIN_BLOCKS      __launch_bounds__ minimum CTAs per SM
+//   CAKE_Q_BPT             16-element blocks per thread (CAKE_Q_WORDS = 8 * CAKE_Q_BPT)
+//   CAKE_Q_WORDS           32-bit words of the row slice held per thread
+//   CAKE_Q_WARPS           warps per CTA
+//   CAKE_FOLD              1 = fold out_scale[0] into the per-token scale
+//   CAKE_STORE_EVICT_LAST  1 = the fp4 stores carry the L2 evict-last policy
+#ifndef CAKE_Q_THREADS
+#define CAKE_Q_THREADS 256
+#endif
+#ifndef CAKE_Q_MIN_BLOCKS
+#define CAKE_Q_MIN_BLOCKS 3
+#endif
+#ifndef CAKE_Q_BPT
+#define CAKE_Q_BPT 2
+#endif
+#ifndef CAKE_Q_WORDS
+#define CAKE_Q_WORDS 16
+#endif
+#ifndef CAKE_Q_WARPS
+#define CAKE_Q_WARPS 8
+#endif
+#ifndef CAKE_FOLD
+#define CAKE_FOLD 0
+#endif
+#ifndef CAKE_STORE_EVICT_LAST
+#define CAKE_STORE_EVICT_LAST 0
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_nvfp4_per_token_266051f22af995b10bc8
+#endif
+
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_REDUCE_SCRATCH_OFF 0
 #define SMEM_REDUCE_SCRATCH_STAGE_BYTES 128
 #define SMEM_REDUCE_SCRATCH_STRIDE 128
 #define SMEM_TOTAL 128
-#define THREADS 256
+#define THREADS CAKE_Q_THREADS
+#ifndef K_STATIC
 #define K_STATIC 0
+#endif
 
 extern "C" {
 
-__global__ __launch_bounds__(256, 3) void
-kernel_cake_nvfp4_per_token_266051f22af995b10bc8(__nv_bfloat16* __restrict__ x, uint8_t* __restrict__ out_fp4, uint8_t* __restrict__ out_sf, float* __restrict__ per_token_scale, float* __restrict__ global_scale_inv, float* __restrict__ out_scale, int M, int K, int x_row_stride)
+__global__ __launch_bounds__(CAKE_Q_THREADS, CAKE_Q_MIN_BLOCKS) void
+CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, uint8_t* __restrict__ out_fp4, uint8_t* __restrict__ out_sf, float* __restrict__ per_token_scale, float* __restrict__ global_scale_inv, float* __restrict__ out_scale, int M, int K, int x_row_stride)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -56,9 +94,15 @@ kernel_cake_nvfp4_per_token_266051f22af995b10bc8(__nv_bfloat16* __restrict__ x, 
 
     // === Task calls (dependency order) ===
     int row = bid;
+#if K_STATIC
+    int num_blocks = K_STATIC / 16;
+    int padded_cols = (K_STATIC / 16 + 3) / 4 * 4;
+    unsigned int sf_tile_bytes = (K_STATIC / 16 + 3) / 4 * 4 * 128;
+#else
     int num_blocks = K >> 4;
     int padded_cols = num_blocks + 3 >> 2 << 2;
     unsigned int sf_tile_bytes = (unsigned int)padded_cols * 128;
+#endif
     asm volatile("griddepcontrol.wait;" ::: "memory");
     {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
@@ -66,12 +110,19 @@ kernel_cake_nvfp4_per_token_266051f22af995b10bc8(__nv_bfloat16* __restrict__ x, 
     if (row < M) {
         float gs_inv = global_scale_inv[0];
         float fold_scale = 1.0f;
-        unsigned int words[16];
-        float block_max[2];
+#if CAKE_FOLD
+        fold_scale = out_scale[0];
+#endif
+        unsigned int words[CAKE_Q_WORDS];
+        float block_max[CAKE_Q_BPT];
+#if K_STATIC
+        unsigned long long row_base = (unsigned long long)row * (unsigned long long)K_STATIC;
+#else
         unsigned long long row_base = (unsigned long long)row * (unsigned long long)x_row_stride;
+#endif
         #pragma unroll
-        for (int j = 0; j < 2; j++) {
-            int col = tid + j * 256;
+        for (int j = 0; j < CAKE_Q_BPT; j++) {
+            int col = tid + j * CAKE_Q_THREADS;
             int _min_0 = ((col) < (num_blocks - 1) ? (col) : (num_blocks - 1));
             int col_ld = _min_0;
             unsigned long long src = row_base + (unsigned long long)col_ld * 16;
@@ -82,7 +133,7 @@ kernel_cake_nvfp4_per_token_266051f22af995b10bc8(__nv_bfloat16* __restrict__ x, 
         }
         float local_amax = 0.0f;
         #pragma unroll
-        for (int j_1 = 0; j_1 < 2; j_1++) {
+        for (int j_1 = 0; j_1 < CAKE_Q_BPT; j_1++) {
             uint32_t _bf16x2_abs_0;
             asm("abs.bf16x2 %0, %1;" : "=r"(_bf16x2_abs_0) : "r"(words[j_1 * 8]));
             unsigned int pair_max = _bf16x2_abs_0;
@@ -102,7 +153,7 @@ kernel_cake_nvfp4_per_token_266051f22af995b10bc8(__nv_bfloat16* __restrict__ x, 
             float _max_0 = max_noftz(local_amax, block_max[j_1]);
             local_amax = _max_0;
         }
-        // BlockReduceF32: threads=256, warps=8, all-thread broadcast
+        // BlockReduceF32: threads=CAKE_Q_THREADS, warps=CAKE_Q_WARPS, all-thread broadcast
         float _block_reduce_f32_1_accum = local_amax;
         const int _block_reduce_f32_1_lane = threadIdx.x & 31;
         const int _block_reduce_f32_1_warp = threadIdx.x >> 5;
@@ -113,7 +164,7 @@ kernel_cake_nvfp4_per_token_266051f22af995b10bc8(__nv_bfloat16* __restrict__ x, 
         }
         if (_block_reduce_f32_1_lane == 0) { reduce_scratch[_block_reduce_f32_1_warp] = _block_reduce_f32_1_accum; }
         __syncthreads();
-        float _block_reduce_f32_1_level2 = (_block_reduce_f32_1_lane < 8) ? reduce_scratch[_block_reduce_f32_1_lane] : -CUDART_INF_F;
+        float _block_reduce_f32_1_level2 = (_block_reduce_f32_1_lane < CAKE_Q_WARPS) ? reduce_scratch[_block_reduce_f32_1_lane] : -CUDART_INF_F;
         #pragma unroll
         for (int _block_reduce_f32_1_offset_level2 = 16; _block_reduce_f32_1_offset_level2 > 0; _block_reduce_f32_1_offset_level2 >>= 1) {
             _block_reduce_f32_1_level2 = fmaxf(_block_reduce_f32_1_level2, __shfl_xor_sync(0xffffffffu, _block_reduce_f32_1_level2, _block_reduce_f32_1_offset_level2));
@@ -128,6 +179,9 @@ kernel_cake_nvfp4_per_token_266051f22af995b10bc8(__nv_bfloat16* __restrict__ x, 
             encode = 3.4028234663852886e+38f;
         }
         float token_scale_out = token_scale;
+#if CAKE_FOLD
+        token_scale_out = token_scale * fold_scale;
+#endif
         if (tid == 0) {
             *(reinterpret_cast<float*>(per_token_scale + row) + (0)) = token_scale_out;
         }
@@ -135,11 +189,15 @@ kernel_cake_nvfp4_per_token_266051f22af995b10bc8(__nv_bfloat16* __restrict__ x, 
         float rcp_six = _rcp_1;
         float _rcp_2 = approx_rcp(encode);
         float rcp_encode = _rcp_2;
+#if K_STATIC
+        unsigned long long out_row_bytes = (unsigned long long)row * (unsigned long long)(K_STATIC / 2);
+#else
         int half_k = K >> 1;
         unsigned long long out_row_bytes = (unsigned long long)row * (unsigned long long)half_k;
+#endif
         #pragma unroll
-        for (int j_2 = 0; j_2 < 2; j_2++) {
-            int col_1 = tid + j_2 * 256;
+        for (int j_2 = 0; j_2 < CAKE_Q_BPT; j_2++) {
+            int col_1 = tid + j_2 * CAKE_Q_THREADS;
             if (col_1 < num_blocks) {
                 float sf_value = encode * (block_max[j_2] * rcp_six);
                 float _fp8_rt_0;
@@ -172,7 +230,11 @@ kernel_cake_nvfp4_per_token_266051f22af995b10bc8(__nv_bfloat16* __restrict__ x, 
                 }
                 asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed[1]) : "f"(values[0]), "f"(values[1]), "f"(values[2]), "f"(values[3]), "f"(values[4]), "f"(values[5]), "f"(values[6]), "f"(values[7]));
                 unsigned long long fp4_offset = out_row_bytes + (unsigned long long)col_1 * 8;
+#if CAKE_STORE_EVICT_LAST
+                asm volatile("st.global.L2::cache_hint.v2.b32 [%0], {%1, %2}, %3;" :: "l"(out_fp4 + fp4_offset + (0)), "r"(packed[(0) + 0]), "r"(packed[(0) + 1]), "l"(0x14F0000000000000ULL) : "memory");
+#else
                 asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(out_fp4 + fp4_offset + (0)), "r"(packed[(0) + 0]), "r"(packed[(0) + 1]) : "memory");
+#endif
                 {
                     unsigned short _sf_pair;
                     asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_sf_pair) : "f"(sf_value));
@@ -186,8 +248,8 @@ kernel_cake_nvfp4_per_token_266051f22af995b10bc8(__nv_bfloat16* __restrict__ x, 
         }
     } else {
         #pragma unroll
-        for (int p = 0; p < 2; p++) {
-            int pad_col_1 = tid + p * 256;
+        for (int p = 0; p < CAKE_Q_BPT; p++) {
+            int pad_col_1 = tid + p * CAKE_Q_THREADS;
             if (pad_col_1 < padded_cols) {
                 *(reinterpret_cast<unsigned char*>(out_sf + (((unsigned int)pad_col_1 & 3) + ((unsigned int)pad_col_1 >> 2 << 9) + (((unsigned int)row & 31) << 4) + (((unsigned int)row >> 5 & 3) << 2) + ((unsigned int)row >> 7) * sf_tile_bytes)) + (0)) = (unsigned char)((unsigned int)0);
             }

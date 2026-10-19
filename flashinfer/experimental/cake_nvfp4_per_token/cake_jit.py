@@ -52,18 +52,34 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # ``DEFINITIONS`` maps a logical kernel key to the compile-line definitions
 # (``-D<name>=<value>``) its program is built with; keys absent from it build
 # with none.  The three literals are populated verbatim by the
-# generated-program export; do not edit them by hand.  The shared headers ``csrc/cake_nvfp4_per_token/
+# generated-program export; do not edit them by hand.  One hand-maintained
+# exception, pending regeneration by the export: a record whose kernel source
+# is another record's translation unit (a program that differs from it only
+# by output dtype, TMA cache-hint policies, raster group, quantizer CTA
+# shape, folded output scale or store policy) carries in ``compile_flags``
+# the knob values (``-DCAKE_<knob>=<value>``) and ``-DCAKE_PROGRAM_KERNEL`` /
+# ``-DCAKE_PROGRAM_SHIM`` naming its own kernel symbol and host-shim
+# namespace; the shared kernel source carries the matching guarded defaults
+# and ``#if`` arms.  The shared headers ``csrc/cake_nvfp4_per_token/
 # cake_nvfp4_per_token_device_common.cuh`` (device helpers) and
 # ``cake_nvfp4_per_token_host_common.cuh`` (launch helpers) are included by
 # every program.
 MODULES: dict[str, dict[str, Any]] = {
     "cake_nvfp4_per_token_062311ac440fbaf37629": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_062311ac440fbaf37629_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_062311ac440fbaf37629_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_MIN_BLOCKS=1",
+            "-DCAKE_Q_BPT=3",
+            "-DCAKE_Q_WORDS=24",
+            "-DCAKE_Q_WARPS=16",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_062311ac440fbaf37629",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_ae9aa916a579ea14",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -117,11 +133,17 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_0d13de6f1682e55c1373": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_0d13de6f1682e55c1373_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_0d13de6f1682e55c1373_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_BPT=1",
+            "-DCAKE_Q_WORDS=8",
+            "-DCAKE_FOLD=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_0d13de6f1682e55c1373",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_48801c681b24ba45",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -175,11 +197,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_139c3fab2a0249e02c3e": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_139c3fab2a0249e02c3e_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_a6fc65c9fcae34137fec_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_139c3fab2a0249e02c3e_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_RASTER_GROUP=8",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_139c3fab2a0249e02c3e",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_5cead2195728a5a6",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -298,11 +324,17 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_1bc4fe20d5d1fa219ea4": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_1bc4fe20d5d1fa219ea4_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_288adcab31da85191a26_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_1bc4fe20d5d1fa219ea4_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_A_POLICY=0",
+            "-DCAKE_B_POLICY=0x12F0000000000000ULL",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_1bc4fe20d5d1fa219ea4",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_98d44e229d4048b2",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -334,11 +366,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_1d6630a145ff559d1fa3": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_1d6630a145ff559d1fa3_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_78fcd21adb756e3fddc9_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_1d6630a145ff559d1fa3_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_1d6630a145ff559d1fa3",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_2348e5a05c5e6302",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -366,11 +402,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_1de51aa8fd0339bfc55c": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_1de51aa8fd0339bfc55c_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_a6fc65c9fcae34137fec_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_1de51aa8fd0339bfc55c_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_1de51aa8fd0339bfc55c",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_45d5f61eead32f1d",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -398,11 +438,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_1fa625dd627403d62d62": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_1fa625dd627403d62d62_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_a1674da021d7fdb5e3d0_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_1fa625dd627403d62d62_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_1fa625dd627403d62d62",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_3f6f2cd66ddb6cd1",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -430,11 +474,20 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_2126ed4021a5df3e8461": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_2126ed4021a5df3e8461_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_2126ed4021a5df3e8461_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_MIN_BLOCKS=1",
+            "-DCAKE_Q_BPT=1",
+            "-DCAKE_Q_WORDS=8",
+            "-DCAKE_Q_WARPS=16",
+            "-DCAKE_FOLD=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_2126ed4021a5df3e8461",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_99d8a68a104de03e",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -552,11 +605,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_2db9273326bd94259cd1": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_2db9273326bd94259cd1_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_fff83b2919d87c3723b3_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_2db9273326bd94259cd1_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_2db9273326bd94259cd1",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_016f27f7345b34a5",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -582,11 +639,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_2e26ffc7ce8d8fa6f128": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_2e26ffc7ce8d8fa6f128_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_2e26ffc7ce8d8fa6f128_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_FOLD=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_2e26ffc7ce8d8fa6f128",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_e651fcce480d6f44",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -610,11 +671,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_310dce04e62dc4479f2f": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_310dce04e62dc4479f2f_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_925e8165fab2f00266d9_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_310dce04e62dc4479f2f_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_310dce04e62dc4479f2f",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_bc3efea40712df4e",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -668,11 +733,19 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_34e066f626b4be154822": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_34e066f626b4be154822_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_34e066f626b4be154822_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_MIN_BLOCKS=4",
+            "-DCAKE_Q_BPT=1",
+            "-DCAKE_Q_WORDS=8",
+            "-DCAKE_FOLD=1",
+            "-DCAKE_STORE_EVICT_LAST=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_34e066f626b4be154822",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_bb0b1dffe43bdf04",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -696,11 +769,17 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_3b069158e5efd68b3d56": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_3b069158e5efd68b3d56_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_dd3a532430c9f881f75d_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_3b069158e5efd68b3d56_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_A_POLICY=0",
+            "-DCAKE_B_POLICY=0x12F0000000000000ULL",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_3b069158e5efd68b3d56",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_90fff4b2be488c40",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -728,11 +807,20 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_3bebdf16f8b8ec303083": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_3bebdf16f8b8ec303083_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_3bebdf16f8b8ec303083_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_MIN_BLOCKS=1",
+            "-DCAKE_Q_BPT=3",
+            "-DCAKE_Q_WORDS=24",
+            "-DCAKE_Q_WARPS=16",
+            "-DCAKE_FOLD=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_3bebdf16f8b8ec303083",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_e0e26e1509b6ae48",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -756,11 +844,19 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_3c0a0335f02050ebb60e": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_3c0a0335f02050ebb60e_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_3c0a0335f02050ebb60e_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_MIN_BLOCKS=1",
+            "-DCAKE_Q_BPT=1",
+            "-DCAKE_Q_WORDS=8",
+            "-DCAKE_Q_WARPS=16",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_3c0a0335f02050ebb60e",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_b1963fada7f4f475",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -843,11 +939,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_455c60a5c10aa2bcece8": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_455c60a5c10aa2bcece8_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_18fd61a4a764c2d1ab3e_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_455c60a5c10aa2bcece8_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_RASTER_GROUP=16",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_455c60a5c10aa2bcece8",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_ffaf036d5f85c138",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -875,11 +975,16 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_45fc8d20d916671c5f36": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_45fc8d20d916671c5f36_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_18fd61a4a764c2d1ab3e_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_45fc8d20d916671c5f36_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_RASTER_GROUP=16",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_45fc8d20d916671c5f36",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_ba4c49ed42f27127",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -907,11 +1012,20 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_48485b687a58cef62559": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_48485b687a58cef62559_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_48485b687a58cef62559_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_MIN_BLOCKS=2",
+            "-DCAKE_Q_BPT=3",
+            "-DCAKE_Q_WORDS=24",
+            "-DCAKE_Q_WARPS=16",
+            "-DCAKE_FOLD=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_48485b687a58cef62559",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_2d2fcafaed6cfa25",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -935,11 +1049,19 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_4a4ae65a3551bedbc110": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_4a4ae65a3551bedbc110_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_4a4ae65a3551bedbc110_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_MIN_BLOCKS=2",
+            "-DCAKE_Q_BPT=3",
+            "-DCAKE_Q_WORDS=24",
+            "-DCAKE_Q_WARPS=16",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_4a4ae65a3551bedbc110",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_a3f40889094d4f03",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -963,11 +1085,16 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_4d85976d6c18ce148ca4": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_4d85976d6c18ce148ca4_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_4d85976d6c18ce148ca4_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_BPT=1",
+            "-DCAKE_Q_WORDS=8",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_4d85976d6c18ce148ca4",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_a1a905c2e5f86ddb",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -991,11 +1118,17 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_53e1454ac0d533cefcda": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_53e1454ac0d533cefcda_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_53e1454ac0d533cefcda_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_MIN_BLOCKS=1",
+            "-DCAKE_Q_BPT=1",
+            "-DCAKE_Q_WORDS=8",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_53e1454ac0d533cefcda",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_fd09e1b86969caa1",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -1019,11 +1152,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_5606b2d9571f0787e563": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_5606b2d9571f0787e563_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_9ca737b8f50f70eb4b5d_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_5606b2d9571f0787e563_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_5606b2d9571f0787e563",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_dcd764c5d858dcea",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -1049,11 +1186,16 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_5872000a0bd8bd391059": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_5872000a0bd8bd391059_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_288adcab31da85191a26_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_5872000a0bd8bd391059_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_A_POLICY=0",
+            "-DCAKE_B_POLICY=0x12F0000000000000ULL",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_5872000a0bd8bd391059",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_80990f8b9094a706",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -1085,11 +1227,19 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_58eeece815f48fd1d43a": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_58eeece815f48fd1d43a_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_58eeece815f48fd1d43a_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_MIN_BLOCKS=1",
+            "-DCAKE_Q_BPT=1",
+            "-DCAKE_Q_WORDS=8",
+            "-DCAKE_Q_WARPS=16",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_58eeece815f48fd1d43a",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_611e7697a0ce40bf",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -1113,11 +1263,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_5d8bea1558154053d314": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_5d8bea1558154053d314_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_18fd61a4a764c2d1ab3e_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_5d8bea1558154053d314_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_RASTER_GROUP=8",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_5d8bea1558154053d314",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_871475b1bda7a9a5",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -1145,11 +1299,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_64313df7982791417a2b": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_64313df7982791417a2b_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_18fd61a4a764c2d1ab3e_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_64313df7982791417a2b_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_64313df7982791417a2b",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_f4c260890861e49b",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -1177,11 +1335,17 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_6659f7757bcb7bae97b1": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_6659f7757bcb7bae97b1_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_a1674da021d7fdb5e3d0_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_6659f7757bcb7bae97b1_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_A_POLICY=0",
+            "-DCAKE_B_POLICY=0x12F0000000000000ULL",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_6659f7757bcb7bae97b1",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_3011f0106a0d7e88",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -1208,11 +1372,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_66c17b2c6c8645cc5a76": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_66c17b2c6c8645cc5a76_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_becd24cbb8333dc48dcb_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_66c17b2c6c8645cc5a76_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_66c17b2c6c8645cc5a76",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_8888a7aa83344549",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -1240,11 +1408,18 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_6717875e66a6fcec8341": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_6717875e66a6fcec8341_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_6717875e66a6fcec8341_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_BPT=7",
+            "-DCAKE_Q_WORDS=56",
+            "-DCAKE_FOLD=1",
+            "-DCAKE_STORE_EVICT_LAST=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_6717875e66a6fcec8341",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_ac469cd799b76098",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -1268,11 +1443,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_6791cd4bf5cc9b5e088b": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_6791cd4bf5cc9b5e088b_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_17270a6f1bb78bfd8f92_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_6791cd4bf5cc9b5e088b_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_6791cd4bf5cc9b5e088b",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_b51fdc97c4df0b62",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -1298,11 +1477,19 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_684d5b4c9c173753e179": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_684d5b4c9c173753e179_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_684d5b4c9c173753e179_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_MIN_BLOCKS=1",
+            "-DCAKE_Q_BPT=4",
+            "-DCAKE_Q_WORDS=32",
+            "-DCAKE_Q_WARPS=16",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_684d5b4c9c173753e179",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_d8935a6c9e0fcf06",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -1326,11 +1513,19 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_6864d70ab56de3ba8bfd": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_6864d70ab56de3ba8bfd_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_6864d70ab56de3ba8bfd_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_MIN_BLOCKS=4",
+            "-DCAKE_Q_BPT=5",
+            "-DCAKE_Q_WORDS=40",
+            "-DCAKE_FOLD=1",
+            "-DCAKE_STORE_EVICT_LAST=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_6864d70ab56de3ba8bfd",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_1bbbe57555a27f52",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -1354,11 +1549,20 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_68ee524b89f5e289133c": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_68ee524b89f5e289133c_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_68ee524b89f5e289133c_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=128",
+            "-DCAKE_Q_MIN_BLOCKS=5",
+            "-DCAKE_Q_BPT=8",
+            "-DCAKE_Q_WORDS=64",
+            "-DCAKE_Q_WARPS=4",
+            "-DCAKE_STORE_EVICT_LAST=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_68ee524b89f5e289133c",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_f8cee2deea678a22",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -1382,11 +1586,20 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_69f8274b12662366ecb8": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_69f8274b12662366ecb8_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_69f8274b12662366ecb8_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_MIN_BLOCKS=1",
+            "-DCAKE_Q_BPT=1",
+            "-DCAKE_Q_WORDS=8",
+            "-DCAKE_Q_WARPS=16",
+            "-DCAKE_FOLD=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_69f8274b12662366ecb8",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_490dd6ddc757b332",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -1440,11 +1653,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_6fed99e520aa239db6c9": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_6fed99e520aa239db6c9_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_a1674da021d7fdb5e3d0_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_6fed99e520aa239db6c9_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_RASTER_GROUP=8",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_6fed99e520aa239db6c9",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_f9d5f5b51f57de9c",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -1472,11 +1689,16 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_72a49b93eb629736017a": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_72a49b93eb629736017a_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_a6fc65c9fcae34137fec_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_72a49b93eb629736017a_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_RASTER_GROUP=8",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_72a49b93eb629736017a",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_017fda2ef28e92d7",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -1504,11 +1726,18 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_75d30269a025a195653c": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_75d30269a025a195653c_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_75d30269a025a195653c_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_MIN_BLOCKS=4",
+            "-DCAKE_Q_BPT=5",
+            "-DCAKE_Q_WORDS=40",
+            "-DCAKE_STORE_EVICT_LAST=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_75d30269a025a195653c",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_45c198a2409476f6",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -1532,11 +1761,17 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_7652be76af016751909c": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_7652be76af016751909c_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_7652be76af016751909c_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_MIN_BLOCKS=1",
+            "-DCAKE_Q_WARPS=16",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_7652be76af016751909c",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_fb4acc149191df75",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -1560,11 +1795,17 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_78452434e3ec2d8f5e13": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_78452434e3ec2d8f5e13_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_78452434e3ec2d8f5e13_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_MIN_BLOCKS=2",
+            "-DCAKE_Q_BPT=4",
+            "-DCAKE_Q_WORDS=32",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_78452434e3ec2d8f5e13",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_f920f4a18b27d2be",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -1650,11 +1891,17 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_7a07511bc4c0c0f06089": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_7a07511bc4c0c0f06089_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_7a07511bc4c0c0f06089_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_MIN_BLOCKS=2",
+            "-DCAKE_Q_WARPS=16",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_7a07511bc4c0c0f06089",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_e6ff2547bdfa33c6",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -1678,11 +1925,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_7abdeaf1ad1dc7c64ef4": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_7abdeaf1ad1dc7c64ef4_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_dd3a532430c9f881f75d_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_7abdeaf1ad1dc7c64ef4_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_RASTER_GROUP=8",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_7abdeaf1ad1dc7c64ef4",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_cca0178f2311dd45",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -1739,11 +1990,17 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_83fec50b7af0311f8244": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_83fec50b7af0311f8244_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_83fec50b7af0311f8244_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_BPT=7",
+            "-DCAKE_Q_WORDS=56",
+            "-DCAKE_STORE_EVICT_LAST=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_83fec50b7af0311f8244",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_9e76cbd15f10cadd",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -1767,11 +2024,21 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_8499e042c80c6cf6a00f": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_8499e042c80c6cf6a00f_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_8499e042c80c6cf6a00f_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=128",
+            "-DCAKE_Q_MIN_BLOCKS=8",
+            "-DCAKE_Q_BPT=4",
+            "-DCAKE_Q_WORDS=32",
+            "-DCAKE_Q_WARPS=4",
+            "-DCAKE_FOLD=1",
+            "-DCAKE_STORE_EVICT_LAST=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_8499e042c80c6cf6a00f",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_08b9c3e927c3d209",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -1795,11 +2062,16 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_8c27d1a9b8f95d84ea63": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_8c27d1a9b8f95d84ea63_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_a6fc65c9fcae34137fec_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_8c27d1a9b8f95d84ea63_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_A_POLICY=0",
+            "-DCAKE_B_POLICY=0x12F0000000000000ULL",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_8c27d1a9b8f95d84ea63",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_d7cc7ee6952e1c5d",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -1827,11 +2099,16 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_8c70d72aaecb580a5783": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_8c70d72aaecb580a5783_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_8c70d72aaecb580a5783_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_MIN_BLOCKS=4",
+            "-DCAKE_STORE_EVICT_LAST=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_8c70d72aaecb580a5783",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_0d43859601e4c551",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -1855,11 +2132,16 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_8cf7856e23c713904d31": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_8cf7856e23c713904d31_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_8cf7856e23c713904d31_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_MIN_BLOCKS=4",
+            "-DCAKE_STORE_EVICT_LAST=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_8cf7856e23c713904d31",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_2643c9b8ea78d678",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -1883,11 +2165,17 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_9069465975d6f1ca6311": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_9069465975d6f1ca6311_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_a6fc65c9fcae34137fec_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_9069465975d6f1ca6311_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_A_POLICY=0",
+            "-DCAKE_B_POLICY=0x12F0000000000000ULL",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_9069465975d6f1ca6311",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_2de55b625e7f53eb",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -1915,11 +2203,16 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_90f233fd2ad0ca2fdd38": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_90f233fd2ad0ca2fdd38_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_a1674da021d7fdb5e3d0_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_90f233fd2ad0ca2fdd38_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_A_POLICY=0",
+            "-DCAKE_B_POLICY=0x12F0000000000000ULL",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_90f233fd2ad0ca2fdd38",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_2497d0446f18cff6",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -1976,11 +2269,16 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_93b60320bbfa3449a921": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_93b60320bbfa3449a921_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_07b0189c8953c02acff3_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_93b60320bbfa3449a921_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_A_POLICY=0x12F0000000000000ULL",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_93b60320bbfa3449a921",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_fd9a2ba20cd553b7",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -2006,11 +2304,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_942b39aa9ca66fb980e8": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_942b39aa9ca66fb980e8_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_07b0189c8953c02acff3_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_942b39aa9ca66fb980e8_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_942b39aa9ca66fb980e8",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_8cf67c1b20d9eaf2",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -2036,11 +2338,18 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_96e142849dcfaaf7c1a4": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_96e142849dcfaaf7c1a4_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_96e142849dcfaaf7c1a4_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_MIN_BLOCKS=4",
+            "-DCAKE_Q_BPT=1",
+            "-DCAKE_Q_WORDS=8",
+            "-DCAKE_STORE_EVICT_LAST=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_96e142849dcfaaf7c1a4",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_c61cd0333af6286c",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -2064,11 +2373,20 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_98778736f957e3baf9cd": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_98778736f957e3baf9cd_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_98778736f957e3baf9cd_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_MIN_BLOCKS=2",
+            "-DCAKE_Q_BPT=4",
+            "-DCAKE_Q_WORDS=32",
+            "-DCAKE_Q_WARPS=16",
+            "-DCAKE_FOLD=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_98778736f957e3baf9cd",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_b3eb77835d0e86b3",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -2092,11 +2410,19 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_98c1d7945ad0dcb98963": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_98c1d7945ad0dcb98963_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_98c1d7945ad0dcb98963_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=128",
+            "-DCAKE_Q_MIN_BLOCKS=8",
+            "-DCAKE_Q_WARPS=4",
+            "-DCAKE_FOLD=1",
+            "-DCAKE_STORE_EVICT_LAST=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_98c1d7945ad0dcb98963",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_b2713e87d0d1525d",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -2120,11 +2446,21 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_996c7fd21642f288f697": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_996c7fd21642f288f697_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_996c7fd21642f288f697_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=128",
+            "-DCAKE_Q_MIN_BLOCKS=5",
+            "-DCAKE_Q_BPT=8",
+            "-DCAKE_Q_WORDS=64",
+            "-DCAKE_Q_WARPS=4",
+            "-DCAKE_FOLD=1",
+            "-DCAKE_STORE_EVICT_LAST=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_996c7fd21642f288f697",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_3138970ca2bfcfab",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -2210,11 +2546,16 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_a6cf54d2fb100c00ad63": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_a6cf54d2fb100c00ad63_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_18fd61a4a764c2d1ab3e_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_a6cf54d2fb100c00ad63_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_RASTER_GROUP=8",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_a6cf54d2fb100c00ad63",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_278ad15d72dab5d0",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -2274,11 +2615,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_aa069aa70914114fa1c5": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_aa069aa70914114fa1c5_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_288adcab31da85191a26_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_aa069aa70914114fa1c5_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_aa069aa70914114fa1c5",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_620082c0371a42cf",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -2310,11 +2655,17 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_aa08d05b7a61e9ea3498": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_aa08d05b7a61e9ea3498_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_aa08d05b7a61e9ea3498_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_MIN_BLOCKS=4",
+            "-DCAKE_FOLD=1",
+            "-DCAKE_STORE_EVICT_LAST=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_aa08d05b7a61e9ea3498",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_4d762063ff52037d",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -2338,11 +2689,19 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_aa2933408365d2cd4269": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_aa2933408365d2cd4269_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_aa2933408365d2cd4269_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_MIN_BLOCKS=4",
+            "-DCAKE_Q_BPT=4",
+            "-DCAKE_Q_WORDS=32",
+            "-DCAKE_FOLD=1",
+            "-DCAKE_STORE_EVICT_LAST=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_aa2933408365d2cd4269",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_01e8db3e023f58ac",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -2366,11 +2725,19 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_ab2e761d5b22bebc40e7": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_ab2e761d5b22bebc40e7_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_ab2e761d5b22bebc40e7_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_MIN_BLOCKS=2",
+            "-DCAKE_Q_BPT=4",
+            "-DCAKE_Q_WORDS=32",
+            "-DCAKE_Q_WARPS=16",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_ab2e761d5b22bebc40e7",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_a9d83e8f8cb8e13f",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -2424,11 +2791,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_b0b95c4118991384623d": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_b0b95c4118991384623d_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_12c633607bd8e310fc7c_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_b0b95c4118991384623d_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_b0b95c4118991384623d",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_8c2d9e568c0b8969",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -2484,11 +2855,20 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_b6b2ef866ed5f8f91335": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_b6b2ef866ed5f8f91335_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_b6b2ef866ed5f8f91335_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=128",
+            "-DCAKE_Q_MIN_BLOCKS=8",
+            "-DCAKE_Q_BPT=4",
+            "-DCAKE_Q_WORDS=32",
+            "-DCAKE_Q_WARPS=4",
+            "-DCAKE_STORE_EVICT_LAST=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_b6b2ef866ed5f8f91335",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_3d58e71dc87f6070",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -2544,11 +2924,18 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_c253402ceb2f05cb709c": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_c253402ceb2f05cb709c_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_c253402ceb2f05cb709c_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_MIN_BLOCKS=2",
+            "-DCAKE_Q_BPT=4",
+            "-DCAKE_Q_WORDS=32",
+            "-DCAKE_FOLD=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_c253402ceb2f05cb709c",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_8b64ece63c7cf6b9",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -2572,11 +2959,18 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_c5d78751c560c3d11f7c": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_c5d78751c560c3d11f7c_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_c5d78751c560c3d11f7c_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_MIN_BLOCKS=4",
+            "-DCAKE_Q_BPT=4",
+            "-DCAKE_Q_WORDS=32",
+            "-DCAKE_STORE_EVICT_LAST=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_c5d78751c560c3d11f7c",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_faf2675ff2c118db",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -2600,11 +2994,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_cce6da2b9b938e36636e": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_cce6da2b9b938e36636e_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_e51e19d19bcf42ae3ee0_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_cce6da2b9b938e36636e_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_cce6da2b9b938e36636e",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_c1b5ef50690a4dd3",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -2629,11 +3027,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_cf59fa0f9ceb0c7f38f8": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_cf59fa0f9ceb0c7f38f8_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_6a8f0bd74f7f517d1b11_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_cf59fa0f9ceb0c7f38f8_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_cf59fa0f9ceb0c7f38f8",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_a780a1eff74bee17",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -2687,11 +3089,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_d37bd37aefbd1c2663ce": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_d37bd37aefbd1c2663ce_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_795f9ce57ce7e6812b6c_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_d37bd37aefbd1c2663ce_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_d37bd37aefbd1c2663ce",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_e8df8f724688efa0",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -2717,11 +3123,18 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_d4316f7bb385939a95f9": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_d4316f7bb385939a95f9_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_d4316f7bb385939a95f9_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_MIN_BLOCKS=1",
+            "-DCAKE_Q_WARPS=16",
+            "-DCAKE_FOLD=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_d4316f7bb385939a95f9",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_095cb0007084350e",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -2745,11 +3158,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_d7bad35e46134c38d973": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_d7bad35e46134c38d973_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_267ea66edacba2a365e7_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_d7bad35e46134c38d973_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_d7bad35e46134c38d973",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_9694422168006a9d",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -2835,11 +3252,18 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_dcd89b2e097fbee53eb7": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_dcd89b2e097fbee53eb7_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_dcd89b2e097fbee53eb7_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_MIN_BLOCKS=1",
+            "-DCAKE_Q_BPT=1",
+            "-DCAKE_Q_WORDS=8",
+            "-DCAKE_FOLD=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_dcd89b2e097fbee53eb7",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_e58e97981fbf7913",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -2895,11 +3319,17 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_df3fe3e881a30df9d6c8": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_df3fe3e881a30df9d6c8_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_df3fe3e881a30df9d6c8_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_MIN_BLOCKS=4",
+            "-DCAKE_FOLD=1",
+            "-DCAKE_STORE_EVICT_LAST=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_df3fe3e881a30df9d6c8",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_4e9353661205c671",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -2923,11 +3353,20 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_e101e3ffad576f12a678": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_e101e3ffad576f12a678_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_e101e3ffad576f12a678_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_MIN_BLOCKS=1",
+            "-DCAKE_Q_BPT=4",
+            "-DCAKE_Q_WORDS=32",
+            "-DCAKE_Q_WARPS=16",
+            "-DCAKE_FOLD=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_e101e3ffad576f12a678",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_d18b3ddea00fecfa",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -2951,11 +3390,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_e3cc580e3d59b4530e6c": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_e3cc580e3d59b4530e6c_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_07b0189c8953c02acff3_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_e3cc580e3d59b4530e6c_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_A_POLICY=0x12F0000000000000ULL",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_e3cc580e3d59b4530e6c",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_583f7938bf79b95d",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -3010,11 +3453,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_e933d7e9cbe827e25d3e": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_e933d7e9cbe827e25d3e_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_dbd1cac20715c4715cd3_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_e933d7e9cbe827e25d3e_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_e933d7e9cbe827e25d3e",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_470caa285468bca0",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -3040,11 +3487,15 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_e98c42f779ed53e68b30": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_e98c42f779ed53e68b30_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_e98c42f779ed53e68b30_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_FOLD=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_e98c42f779ed53e68b30",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_94d7519b3ec8760e",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -3128,11 +3579,16 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_f53911591c205d67bcce": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_f53911591c205d67bcce_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_a1674da021d7fdb5e3d0_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_f53911591c205d67bcce_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_OUT_F16=1",
+            "-DCAKE_RASTER_GROUP=8",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_f53911591c205d67bcce",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_35f508f05a4142e9",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -3160,11 +3616,14 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_f7ff78ec5855b9b22ea7": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_f7ff78ec5855b9b22ea7_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_f7ff78ec5855b9b22ea7_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_f7ff78ec5855b9b22ea7",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_a39c7e44083b7975",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -3188,11 +3647,18 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_f876d047b54150469a71": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_f876d047b54150469a71_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_f876d047b54150469a71_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=512",
+            "-DCAKE_Q_MIN_BLOCKS=2",
+            "-DCAKE_Q_WARPS=16",
+            "-DCAKE_FOLD=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_f876d047b54150469a71",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_f3f75c866bf65a53",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -3216,11 +3682,18 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_fa93c77677bea4179924": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_fa93c77677bea4179924_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_266051f22af995b10bc8_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_fa93c77677bea4179924_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_Q_THREADS=128",
+            "-DCAKE_Q_MIN_BLOCKS=8",
+            "-DCAKE_Q_WARPS=4",
+            "-DCAKE_STORE_EVICT_LAST=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_fa93c77677bea4179924",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_815589414a88ccc3",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "x"],
@@ -3244,11 +3717,16 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_nvfp4_per_token_fbbc792eeaea807c03ac": {
         "sources": [
-            "cake_nvfp4_per_token/cake_nvfp4_per_token_fbbc792eeaea807c03ac_kernel.cu",
+            "cake_nvfp4_per_token/cake_nvfp4_per_token_dd3a532430c9f881f75d_kernel.cu",
             "cake_nvfp4_per_token/cake_nvfp4_per_token_fbbc792eeaea807c03ac_binding.cu",
         ],
         "role": "kernel",
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_A_POLICY=0",
+            "-DCAKE_B_POLICY=0x12F0000000000000ULL",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_nvfp4_per_token_fbbc792eeaea807c03ac",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_4ff099b96a5eb045",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],

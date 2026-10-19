@@ -66,5 +66,12 @@ Correctness: quantizer outputs bitwise equal to the CuTe-DSL per-token kernel; G
 operands (`tests/gemm/test_cake_mm_fp4.py`, `tests/quantization/test_cake_nvfp4_quantize.py`).
 
 Generated sources live under `csrc/cake_nvfp4_per_token/<arch>/` and are registered in
-`cake_jit.py` (`MODULES`, `KERNELS`) by the Cake generated-program export; nothing
-there is hand-written.
+`cake_jit.py` (`MODULES`, `KERNELS`) by the Cake generated-program export (see the
+hand-maintained exception below).
+
+One hand-maintained exception, pending regeneration by the export: a program that
+differs from a sibling only by its output dtype, TMA cache-hint policies, raster group,
+quantizer CTA shape, folded output scale or store policy shares the sibling's kernel
+source and selects those values (`-DCAKE_*`) and its own kernel symbol
+(`-DCAKE_PROGRAM_KERNEL`) on the compile line; the shared kernel sources carry the
+matching guarded defaults and `#if` arms.
