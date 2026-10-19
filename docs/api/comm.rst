@@ -70,6 +70,45 @@ configurations raise during preparation instead of falling back.
     all_gather_matmul
     prepare_all_gather_matmul
 
+Fused FP8 Row-wise GEMM + All-Reduce
+------------------------------------
+
+``fp8_rowwise_gemm_allreduce`` computes, for a four-rank NCCL process group on
+one SM100 node, ``Y = sum_r (A_r @ W_r.T) * (a_scale_r[:, None] * w_scale_r[None, :])``
+with the per-rank FP8 (e4m3) operands ``A_r`` of shape ``[M, K_l]`` and ``W_r``
+of shape ``[N, K_l]``, fp32 row and column scales applied before the cross-rank
+sum, and a bfloat16 result ``[M, N]`` on every rank. ``backend="cake"`` (the
+only backend; ``"auto"`` selects it) runs one fused kernel per call: the GEMM
+epilogue stores each owned tile's bf16 partial into this rank's output and
+publishes every other tile's partial into the chunk owner's symmetric receive
+slot, the owner sums the four partials in fixed rank order and broadcasts the
+result, so no separate all-reduce kernel or collective runs.
+Operands are contiguous CUDA tensors with ``N`` a positive multiple of 256,
+``K_l`` a positive multiple of 128, any positive ``M`` with ``M * N <= 2**30``,
+and the process's torch symmetric-memory backend being the default ``CUDA``
+backend or ``NVSHMEM`` (the Cake backend never selects one itself). The
+symmetric workspace of a group grows to the largest ``M`` seen; that growth is
+the only collective after the first call. Unsupported requests raise instead
+of silently falling back.
+
+``prepare_fp8_rowwise_gemm_allreduce`` binds the process group, ``N``, ``K_l``
+and a row capacity ``max_rows`` (default: the rows of the sample input) once,
+sizing the symmetric workspace in that single collective, and returns a
+callable ``launcher(a, a_scale, w, w_scale, *, out=None)`` that accepts any
+operands of the bound ``N`` and ``K_l`` with at most ``max_rows`` rows and
+never runs another collective. The launcher is CUDA-graph capturable: a
+captured call allocates nothing but its output and replays interleave with
+eager calls; a call that exceeds the capacity raises before any launch.
+``max_rows`` must be identical on every rank of the group: the preparation
+checks it in that collective and raises ``ValueError`` on every rank when the
+values differ.
+
+.. autosummary::
+    :toctree: ../generated
+
+    fp8_rowwise_gemm_allreduce
+    prepare_fp8_rowwise_gemm_allreduce
+
 TensorRT-LLM AllReduce
 ----------------------
 
