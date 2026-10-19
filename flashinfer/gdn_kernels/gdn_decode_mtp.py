@@ -2943,8 +2943,10 @@ def run_mtp_decode(
         cache_replayssm: Whether to persist only the fold-every-commit
             ReplaySSM inputs instead of full intermediate states.
         verify_parents: Optional int32 [B, T] parent indices for tree-structured
-            drafts. Requires ``parent[i] < i``, checked on device only when
-            ``FLASHINFER_VALIDATE_VERIFY_PARENTS=1``. ReplaySSM verify only.
+            drafts. Requires ``parent[i] < i`` for ``i >= 1``; the root entry
+            may be -1 or 0. Checked on device only when
+            ``FLASHINFER_VALIDATE_VERIFY_PARENTS=1``. Only the tcgen05
+            ReplaySSM verify honors it; any other path raises.
     """
     if B == 0:
         return
@@ -3019,6 +3021,13 @@ def run_mtp_decode(
             verify_parents,
         )
         return
+    if verify_parents is not None:
+        raise ValueError(
+            "verify_parents is only supported by the tcgen05 ReplaySSM verify "
+            "(SM100/SM103, cache_replayssm with a contiguous fp32 pool and int32 "
+            "indices, 4 <= T <= 8, B <= 256, K = V = 128, even HV and HV // H, "
+            "use_qk_l2norm); this call does not qualify"
+        )
 
     # cute.compile bakes pool strides; key them only for the 4D pool-indexing path.
     if use_pool_indexing:

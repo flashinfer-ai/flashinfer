@@ -338,13 +338,16 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
                 for i_t in cutlass.range_constexpr(T):
                     parent = cutlass.Int32(verify_parents[(i_n, i_t)])
                     mask = cutlass.Int32(0)
-                    if parent >= 0:
-                        mask = s_anc[parent] | (cutlass.Int32(1) << parent)
+                    # The root has no in-draft parent whatever the entry says.
+                    if cutlass.const_expr(i_t > 0):
+                        if parent >= 0:
+                            mask = s_anc[parent] | (cutlass.Int32(1) << parent)
                     s_anc[i_t] = mask
                     for head in cutlass.range_constexpr(HEADS_PER_CTA):
                         acc = s_log_decay[(head, i_t)]
-                        if parent >= 0:
-                            acc = acc + s_log_path[(head, parent)]
+                        if cutlass.const_expr(i_t > 0):
+                            if parent >= 0:
+                                acc = acc + s_log_path[(head, parent)]
                         s_log_path[(head, i_t)] = acc
                         s_path_decay[(head, i_t)] = cute.exp(acc, fastmath=True)
             cute.arch.sync_warp()
@@ -671,9 +674,10 @@ def _assert_verify_parents(parents: torch.Tensor) -> None:
     if not _VALIDATE_VERIFY_PARENTS:
         return
     steps = torch.arange(parents.shape[1], device=parents.device, dtype=parents.dtype)
+    # The root entry is ignored by the kernel, so 0 is as valid as -1 there.
     torch._assert_async(
-        ((parents >= -1) & (parents < steps)).all(),
-        "verify_parents[:, i] must be in [-1, i)",
+        ((parents >= -1) & (parents < steps.clamp_min(1))).all(),
+        "verify_parents[:, i] must be in [-1, i) (the root may be -1 or 0)",
     )
 
 
