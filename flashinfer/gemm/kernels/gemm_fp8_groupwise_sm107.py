@@ -34,6 +34,26 @@ def _num_sms(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
+def _kernel_disk_name(
+    use_2cta: bool, c_dtype_name: str, max_active_clusters: int
+) -> str:
+    """On-disk kernel name; must cover every codegen argument of ``_get_compiled``."""
+    return (
+        f"blockwise_{2 if use_2cta else 1}cta_{c_dtype_name}_mac{max_active_clusters}"
+    )
+
+
+def _cache_key_files() -> Tuple[str, ...]:
+    """Source files whose content invalidates the on-disk kernels."""
+    from . import blockwise_gemm_blackwell, blockwise_gemm_rubin
+
+    return (
+        __file__,
+        blockwise_gemm_blackwell.__file__,
+        blockwise_gemm_rubin.__file__,
+    )
+
+
 @functools.cache
 def _get_compiled(use_2cta: bool, out_is_fp32: bool, out_dtype_name: str) -> Callable:
     import cutlass
@@ -41,6 +61,7 @@ def _get_compiled(use_2cta: bool, out_is_fp32: bool, out_dtype_name: str) -> Cal
     import cutlass.utils as utils
 
     from flashinfer.cute_dsl.utils import is_rubin_cute_dsl_available
+    from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
     if not is_rubin_cute_dsl_available():
         raise NotImplementedError(
@@ -91,16 +112,24 @@ def _get_compiled(use_2cta: bool, out_is_fp32: bool, out_dtype_name: str) -> Cal
     max_active_clusters = utils.HardwareInfo().get_max_active_clusters(
         cluster[0] * cluster[1]
     )
-    return cute.compile(
-        gemm,
-        a_f,
-        b_f,
-        c_f,
-        sfa_f,
-        sfb_f,
-        max_active_clusters,
-        stream_f,
-        options="--enable-tvm-ffi",
+    # max_active_clusters is baked into the kernel, so it is part of the disk name.
+    return build_and_load_cute_dsl_kernel(
+        "gemm_fp8_groupwise_sm107",
+        _kernel_disk_name(
+            use_2cta, "float32" if out_is_fp32 else out_dtype_name, max_active_clusters
+        ),
+        lambda: cute.compile(
+            gemm,
+            a_f,
+            b_f,
+            c_f,
+            sfa_f,
+            sfb_f,
+            max_active_clusters,
+            stream_f,
+            options="--enable-tvm-ffi",
+        ),
+        extra_key_files=_cache_key_files(),
     )
 
 

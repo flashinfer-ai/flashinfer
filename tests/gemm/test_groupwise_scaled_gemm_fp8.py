@@ -118,8 +118,11 @@ def test_fp8_groupwise_gemm(
             pytest.skip("trtllm only supports MN scale_major_mode")
         if k < 256:
             pytest.skip("k < 256")
-    if backend == "cute-dsl" and scale_major_mode != "MN":
-        pytest.skip("cute-dsl (SM107) only supports MN scale_major_mode")
+    if backend == "cute-dsl":
+        if not is_rubin_cute_dsl_available():
+            pytest.skip("cute-dsl (SM107) requires CuTe DSL >= 4.8")
+        if scale_major_mode != "MN":
+            pytest.skip("cute-dsl (SM107) only supports MN scale_major_mode")
     if backend == "cutile":
         if scale_major_mode != "K":
             pytest.skip(
@@ -179,6 +182,8 @@ def test_fp8_groupwise_gemm_cute_dsl_sm107_tactics(m, n, k):
     major, minor = get_compute_capability(torch.device("cuda"))
     if not gemm_fp8_nt_groupwise.is_backend_supported("cute-dsl", major * 10 + minor):
         pytest.skip("cute-dsl gemm_fp8_nt_groupwise is SM107-only")
+    if not is_rubin_cute_dsl_available():
+        pytest.skip("cute-dsl (SM107) requires CuTe DSL >= 4.8")
     from flashinfer.gemm.kernels.gemm_fp8_groupwise_sm107 import (
         gemm_fp8_nt_groupwise_sm107,
         valid_tactics,
