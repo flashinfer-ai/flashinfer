@@ -18,6 +18,10 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <cstdint>
+
+#include "tensorrt_llm/common/NvInferRuntime.h"
+
 namespace tensorrt_llm::kernels::moe_alltoall {
 
 // Configuration constants
