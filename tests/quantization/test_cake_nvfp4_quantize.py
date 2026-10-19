@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import glob
 import re
+from pathlib import Path
 
 import pytest
 import torch
@@ -401,6 +403,33 @@ def test_shared_kernel_sources_keep_distinct_symbols_and_knobs():
             for knob, value in effective.items():
                 assert expected.get(knob) == value, (name, key, knob, value)
     assert len(set(symbols.values())) == len(MODULES)
+
+
+def test_generated_sources_are_declared_as_package_data():
+    """A non-editable install carries the sources the loader resolves next to
+    cake_jit.py: every kernel and binding named by MODULES and the two family
+    headers they include.  pyproject.toml sets include-package-data = false, so
+    only the package-data globs of this package put them into a wheel."""
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    if not pyproject.is_file():
+        pytest.skip("pyproject.toml is only available in source-tree test runs")
+    key = '"flashinfer.experimental.cake_nvfp4_per_token" = ['
+    text = pyproject.read_text(encoding="utf-8")
+    assert key in text, "pyproject.toml has no package-data entry for the package"
+    globs = re.findall(r'"([^"]*)"', text.split(key, 1)[1].split("]", 1)[0])
+    package_root = Path(cb.__file__).resolve().parent
+    shipped = {
+        path
+        for pattern in globs
+        for path in glob.glob(pattern, root_dir=package_root, recursive=True)
+        if (package_root / path).is_file()
+    }
+    needed = {f"csrc/{rel}" for record in MODULES.values() for rel in record["sources"]}
+    needed |= {
+        "csrc/cake_nvfp4_per_token/cake_nvfp4_per_token_device_common.cuh",
+        "csrc/cake_nvfp4_per_token/cake_nvfp4_per_token_host_common.cuh",
+    }
+    assert needed <= shipped, sorted(needed - shipped)
 
 
 # ---------------------------------------------------------------------------
