@@ -111,24 +111,34 @@ def test_every_vendored_module_imports_without_cudnn_and_nothing_dangles():
     outside the closure would raise here.  The GEMM kernel templates (``kernel_templates/sm*.py``) are rendered by the compiler, never
     imported (their geometry names are injected before the JIT), so they are the one documented exception.  What the exporter prunes
     stays pruned: the ``gemm`` package exports nothing lazily (patch P5), and the arch-family facades are the sm100 tree on any device
-    (patch P6: one family vendored, no template of another one registered)."""
+    (patch P6: one family vendored, no template of another one registered).  A kernel module that declines the installed DSL at
+    import (the sm_107a target missing from a build below 4.8.0: a typed ``NotImplementedError`` naming it, the kernels' own gate)
+    is counted apart from a dangling import: with the target present no module may decline, without it the decline must be that
+    gate and nothing else may fail."""
     pytest.importorskip("cutlass")
     out = _run_isolated(
         _BLOCK_CUDNN
         + """
 import importlib, pkgutil, re
 import flashinfer.experimental.qwen_3_5_block._cudnn_frost as v
+from flashinfer.experimental.qwen_3_5_block import support
 names = [v.__name__] + [m.name for m in pkgutil.walk_packages(v.__path__, v.__name__ + ".")]
 rendered = re.compile(r"\\.kernel_templates\\.sm\\d+_")
-failed = []
+failed, declined = [], []
 for name in names:
     if rendered.search(name):
         continue
     try:
         importlib.import_module(name)
+    except NotImplementedError as exc:  # a kernel module's own gate on the installed DSL: the sm_107a target is missing
+        (declined if "sm_107a" in str(exc) else failed).append(f"{name}: {type(exc).__name__}: {exc}")
     except Exception as exc:  # noqa: BLE001
         failed.append(f"{name}: {type(exc).__name__}: {exc}")
 assert not failed, "\\n".join(failed)
+if support.cutedsl_reason() is None:
+    assert not declined, "the installed DSL carries the sm_107a target, yet a module declined at import:\\n" + "\\n".join(declined)
+else:
+    assert declined, "the installed DSL lacks the sm_107a target, yet no kernel module declined at import"
 leaked = sorted(k for k in sys.modules if (k == "cudnn" and sys.modules[k] is not None) or k.startswith("cudnn."))
 assert not leaked, leaked
 gemm = importlib.import_module(v.__name__ + ".gemm")
@@ -147,7 +157,7 @@ compiler = importlib.import_module(v.__name__ + ".gemm.frost.compiler")
 codegen = importlib.import_module(v.__name__ + ".gemm.frost.epilogue_codegen")
 assert compiler.__name__ == v.__name__ + ".gemm.frost.sm100.compiler", compiler.__name__
 assert codegen.__name__ == v.__name__ + ".gemm.frost.sm100.epilogue_codegen", codegen.__name__
-print("OK", len(names))
+print("OK", len(names), "declined", len(declined))
 """
     )
     assert out.startswith("OK")
