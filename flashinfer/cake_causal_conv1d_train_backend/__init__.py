@@ -119,8 +119,8 @@ def _tokens(
     """Validate a BF16 ``[S, C]`` or ``[1, S, C]`` token tensor; return ``(S, C, [S, C] view)``.
 
     ``shape`` pins the exact shape another token tensor of the call has (``dy``
-    against ``x``).  The kernels read the packed rows with 16-byte vector
-    accesses, so ``C`` is a multiple of eight; ``S`` and ``C`` are 32-bit kernel
+    against ``x``).  The forward reads the packed rows as 16-byte vectors of eight
+    channels and the backward as 8-byte vectors of four, so ``C`` is a multiple of eight; ``S`` and ``C`` are 32-bit kernel
     scalars (``S x C`` itself may exceed 2^31: the kernels address with 64-bit
     offsets).
     """

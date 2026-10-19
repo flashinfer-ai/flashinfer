@@ -121,7 +121,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "fwd",
         "workspace_rule": None,
     },
-    "cake_causal_conv1d_train_48304da0448355498186": {
+    "cake_causal_conv1d_train_fca4a5467470b5e55f31": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -149,19 +149,19 @@ MODULES: dict[str, dict[str, Any]] = {
         "ffi_entry": "run",
         # Cooperative (a grid-wide barrier precedes the fixed-order dweight
         # reduction): the grid is exactly the co-resident CTA count.
-        # ``ctas_per_sm`` PLACEHOLDER 2 until the exporting session records
+        # ``ctas_per_sm`` PLACEHOLDER 4 (the launch bound) until the exporting session records
         # the measured co-residency.
         "grid_rule": {
             "cooperative": True,
-            "ctas_per_sm": 2,
+            "ctas_per_sm": 4,
             "geometry": {
                 "threads": 128,
-                "vec": 8,
+                "vec": 4,
             },
             "kind": "co_resident",
         },
-        "kernel": "cake_causal_conv1d_train_48304da0448355498186",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_48304da0448355498186",
+        "kernel": "cake_causal_conv1d_train_fca4a5467470b5e55f31",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_fca4a5467470b5e55f31",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -169,7 +169,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 16384,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_48304da0448355498186",
+        "library": "cake_causal_conv1d_train_fca4a5467470b5e55f31",
         "logical": {
             "C": "C",
             "S": "S",
@@ -200,7 +200,7 @@ MODULES: dict[str, dict[str, Any]] = {
 ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_100a": {
         "bwd": [
-            "cake_causal_conv1d_train_48304da0448355498186",
+            "cake_causal_conv1d_train_fca4a5467470b5e55f31",
         ],
         "fwd": [
             "cake_causal_conv1d_train_f193c5247980992f4f81",
@@ -208,7 +208,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
     },
     "sm_103a": {
         "bwd": [
-            "cake_causal_conv1d_train_48304da0448355498186",
+            "cake_causal_conv1d_train_fca4a5467470b5e55f31",
         ],
         "fwd": [
             "cake_causal_conv1d_train_f193c5247980992f4f81",
@@ -216,7 +216,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
     },
     "sm_107a": {
         "bwd": [
-            "cake_causal_conv1d_train_48304da0448355498186",
+            "cake_causal_conv1d_train_fca4a5467470b5e55f31",
         ],
         "fwd": [
             "cake_causal_conv1d_train_f193c5247980992f4f81",
@@ -238,8 +238,9 @@ KINDS = ("fwd", "bwd")
 # The convolution width: ``weight`` and ``dweight`` are ``[C, WIDTH]`` and tap
 # ``WIDTH - 1`` multiplies the current token.
 WIDTH = 4
-# A thread owns one 16-byte vector of BF16 channels, so ``C`` is a multiple of
-# eight; the ``vec`` of every record's geometry equals this.
+# A forward thread owns one 16-byte vector of eight BF16 channels and a
+# backward thread one 8-byte vector of four, so ``C`` is a multiple of eight;
+# the ``vec`` of every record's geometry divides this.
 CHANNEL_MULTIPLE = 8
 # The kernels take ``S``, ``C`` and the plan scalars as 32-bit integers.
 INT32_MAX = 2**31 - 1

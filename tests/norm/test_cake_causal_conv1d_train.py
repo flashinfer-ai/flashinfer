@@ -76,7 +76,7 @@ PERF_FRACTIONS = (0.37, 0.29, 0.21)
 SEED = 2033
 
 # (S, C, documents): documents of lengths 1, 2 and 3; empty documents before,
-# between and after others; C = 136 (17 channel vectors: 7 sub-tiles of 17
+# between and after others; C = 136 (forward: 17 channel vectors, 7 sub-tiles of 17
 # threads, 9 threads idle); boundaries inside a sub-tile and at S = 64 and 65;
 # the perf packing at S = 1000; 38 documents (a six-step device-side search).
 CASES = (
@@ -467,9 +467,13 @@ def test_cuda_graph_replays_match_eager() -> None:
         with torch.cuda.graph(graph, stream=side):
             step()
         torch.cuda.synchronize(device)
-        captured.append((graph, (y, dx, dw), (eager_y, eager_dx, eager_dw), workspace))
+        # The graph holds raw pointers to x, w, cu and dy: keep them alive until the replays, or the
+        # allocator hands their memory to the next shape's tensors and the replay reads those instead.
+        captured.append(
+            (graph, (x, w, cu, dy), (y, dx, dw), (eager_y, eager_dx, eager_dw), workspace)
+        )
     replays = 0
-    for graph, outputs, eager, workspace in captured:
+    for graph, _inputs_alive, outputs, eager, workspace in captured:
         for _replay in range(GRAPH_REPLAYS):
             for tensor in outputs:
                 tensor.fill_(float("nan"))
@@ -551,12 +555,14 @@ def test_workspace_bytes_and_layout() -> None:
             == -(-grid // n_ch_tiles)
         )
         assert small == layout["total_bytes"] == 4 * WIDTH * C * layout["rows"]
-    # One channel tile up to threads x vec channels (a partial row per CTA); 8192 channels are eight tiles.
-    assert loader.channel_split(1024, geometry=geometry) == (geometry["threads"], 1, 1)
-    assert loader.channel_split(8192, geometry=geometry) == (geometry["threads"], 1, 8)
+    # One channel tile holds up to threads x vec channels (a partial row per CTA): 512 for the backward's four
+    # channels per thread; 8192 channels are sixteen tiles; C = 136 is 34 channel vectors (three sub-tiles of 34).
+    vec, threads = geometry["vec"], geometry["threads"]
+    assert loader.channel_split(threads * vec, geometry=geometry) == (threads, 1, 1)
+    assert loader.channel_split(8192, geometry=geometry) == (threads, 1, 8192 // (threads * vec))
     assert loader.channel_split(136, geometry=geometry) == (
-        17,
-        geometry["threads"] // 17,
+        136 // vec,
+        threads // (136 // vec),
         1,
     )
     workspace = cake_causal_conv1d_train_backward_workspace(65536, 512, device)
@@ -653,7 +659,7 @@ def test_registry_records_reference_the_build_manifest() -> None:
         assert (
             record["grid_rule"]["geometry"]["threads"] == record["launch"]["block"][0]
         )
-        assert record["grid_rule"]["geometry"]["vec"] == loader.CHANNEL_MULTIPLE
+        assert loader.CHANNEL_MULTIPLE % record["grid_rule"]["geometry"]["vec"] == 0
         plan = {key for kind, key in record["arg_plan"] if kind != "grid"}
         assert plan == set(record["logical"])
         assert set(record["logical"].values()) <= set(loader.LOGICAL_TENSORS) | set(
