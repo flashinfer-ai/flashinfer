@@ -338,7 +338,10 @@ def qwen_3_5_block_bf16_prefill(
     workspace_buffer : Optional[torch.Tensor]
         Overrides the plan's own workspace (uint8, at least ``plan.workspace_size``).
     plan : Optional[Qwen35BlockPlan]
-        A prepared plan to run (skips the plan cache).
+        A prepared plan to run (skips the plan cache).  Without one the call runs the bucket's cached plan (an LRU of 32 shape
+        buckets): under CUDA-graph capture only a bucket already cached (a cold one is a typed ``RuntimeError`` -- warm it with
+        one eager call first), and a plan a captured graph runs is retained when the cache evicts it, released by
+        ``flashinfer.experimental.qwen_3_5_block.api.clear_plan_cache()`` only (the README's "Capture and replay").
 
     Returns
     -------

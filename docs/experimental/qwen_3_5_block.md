@@ -34,8 +34,9 @@ Three serving forms over the stack's own paged KV cache, each its own compiled p
 `declaration`, `supports`); `Qwen35BlockWrapper(workspace_buffer, kv_layout, geometry=...)` is the same thing in
 FlashInfer's `plan()` / `run()` idiom over a caller-owned workspace -- the serving idiom. The functional entry points are the
 convenience form: they keep a small LRU (32 entries, one per shape bucket, each owning a zeroed workspace) keyed on exactly what
-a plan compiles in, so a serving stack's shape buckets need no bookkeeping of their own;
-`flashinfer.experimental.qwen_3_5_block.api.clear_plan_cache()` drops them.
+a plan compiles in, so a serving stack's shape buckets need no bookkeeping of their own; a plan a CUDA graph was captured over
+outlives its eviction (rules 6 and 7 of "Capture and replay"), and `flashinfer.experimental.qwen_3_5_block.api.clear_plan_cache()`
+is the one call that drops them all.
 
 ## A step, vLLM-shaped
 
@@ -105,6 +106,15 @@ out = qwen_3_5_block_bf16_extend(hidden_states, cos, sin, weights, w_o, geometry
    sequences) -- vLLM's capture-size buckets.
 4. The pools must be FINITE where the kernels read past `seq_lens` inside the last live page (a zero-initialised cache is).
 5. One plan / wrapper is a single-writer resource: do not re-plan while a captured or in-flight `run` may read its buffers.
+6. The functional entry points under capture run the bucket's CACHED plan: a bucket already in the LRU is a hit and its run is
+   captured; a cold bucket raises a typed `RuntimeError` (warm it with one eager call of the same entry point outside the
+   capture -- a serving stack's warm-up step -- or run an explicit plan). The plan a graph was captured over is RETAINED when
+   the LRU evicts it (the graph baked that plan's workspace and buffers), so any number of buckets may be captured through the
+   functional entry points and replayed in any order; the bucket asked for again revives the retained plan (no second compile,
+   no second workspace). Tested: bucket A captured, 33 more buckets, freed storage reused, A replayed bitwise.
+7. `clear_plan_cache()` is the ONLY release of those plans and their workspaces: call it when no graph captured over a
+   functional-entry plan can replay any more (after `graph.reset()`, at model teardown), never while one may; under capture
+   it is refused (typed `RuntimeError`).
 
 ## Errors
 
@@ -112,7 +122,7 @@ out = qwen_3_5_block_bf16_extend(hidden_states, cos, sin, weights, w_o, geometry
 |---|---|
 | not cc 10.7; `nvidia-cutlass-dsl` absent, below 4.8.0 or without the Rubin target; f16 / fp8 on the bf16 entry; `head_dim != 256`, `d_model % 256`, more than 32 decode rows | `NotImplementedError` naming the device / version / feature (and `qwen_3_5_block_support` reports it without raising) |
 | a malformed tensor (dtype, rank, shape, strides, alignment, device), a page size off the contract, a call outside the plan's capacities, a token count off the small-capacity plans' multiple | `ValueError` naming the operand and the expected form |
-| `prepare` / `plan` under capture | `RuntimeError` naming the remedy |
+| `prepare` / `plan` under capture; a functional entry point under capture on a bucket without a cached plan; `clear_plan_cache()` under capture | `RuntimeError` naming the remedy |
 
 No silent fallback: an unserved case never runs a slower path.
 
@@ -182,12 +192,16 @@ and 32 on the unpacked tile, the paged prefill route of a part-filling batch (32
 decode chain against its fused-fork control arm, the split model, an explicit
 split and the unsplit tile with the gate as its own launch, the separate cache-write launch, extend behind prefixes and as two
 chunks, the bounded token count and the small-capacity plans' live-row rule), CUDA-graph capture of the FIRST run of every form
-under `set_sync_debug_mode("error")` replayed bitwise (decode also over a new step), cached steps under the same mode, the typed
+under `set_sync_debug_mode("error")` replayed bitwise (decode also over a new step), the functional decode captured through the
+plan cache and replayed bitwise after 33 more buckets evicted its plan and storage of the workspace's size was reallocated (the
+plan and workspace retained, `clear_plan_cache()` their release), cached steps under the same mode, the typed
 declines at plan time and at run time, the compiled-plan cache's location and reload path, the weight packer at TP 1 / 2 / 4 / 8
-(bitwise the cuDNN Frontend loader), the RoPE table helper, and the import-isolation test (the `cudnn` package blocked).
+(bitwise the cuDNN Frontend loader), the RoPE table helper, the plan cache's ownership contract on CPU (an eager-only plan freed
+at eviction, a captured one retained and revived, a cold bucket under capture refused) and the import-isolation test (the
+`cudnn` package blocked).
 Validated on an SM107 (cc 10.7) GPU with `nvidia-cutlass-dsl` 4.8.0 and torch 2.14 in a Python environment without the
 cudnn-frontend package; the public and internal CI matrices have no SM107 runner, so the GPU tests skip there and the CPU tests
-(support, weights, RoPE, isolation) run everywhere, including under the CI images' `nvidia-cutlass-dsl` 4.7.0, where the
+(support, weights, RoPE, plan cache, isolation) run everywhere, including under the CI images' `nvidia-cutlass-dsl` 4.7.0, where the
 envelope declines by target.
 
 No performance number is claimed in this draft. The Rubin decode levers (the 64-column decode tile, the decode-grid split combine
