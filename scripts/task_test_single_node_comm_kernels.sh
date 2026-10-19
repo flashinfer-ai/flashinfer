@@ -59,6 +59,13 @@ pytest -s tests/moe/test_trtllm_cutlass_fused_moe.py
 pytest -s tests/comm/test_trtllm_moe_allreduce_fusion.py
 pytest -s tests/comm/test_trtllm_moe_allreduce_fusion_finalize.py
 pytest -s tests/comm/test_cake_moe_alltoall.py
+# MoE expert-parallel communication backends (NVLink one-sided, Cake, two-sided)
+pytest -s tests/comm/test_nvlink_two_sided_alltoall.py
+if [ "$pcie_ipc_gpus" -lt 2 ]; then
+  echo "SKIPPING MoEEpCommunication multirank: $pcie_ipc_gpus GPU visible, needs >=2"
+else
+  NPROC_MULTIRANK=$(( pcie_ipc_gpus < 4 ? pcie_ipc_gpus : 4 )) bash tests/moe_ep/run_tests.sh comm
+fi
 # nvshmem ar
 pytest -s tests/comm/test_nvshmem.py
 pytest -s tests/comm/test_nvshmem_allreduce.py
