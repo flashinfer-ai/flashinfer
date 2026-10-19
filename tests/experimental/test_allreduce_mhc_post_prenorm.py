@@ -292,6 +292,127 @@ def test_composable_path_matches_reference(monkeypatch, num_tokens):
     assert backend.stats()["fallback_count"] == before + 1
 
 
+def _packed_mix_views(num_tokens, hc_mult=HC, device="cpu", seed=0):
+    """``post_layer_mix`` / ``comb_res_mix`` as an mHC pre block often produces them: views
+    into one packed ``[T, hc * (2 + hc)]`` mix tensor (pre, post, comb), hence non-contiguous."""
+    g = torch.Generator(device=device).manual_seed(seed)
+    packed = torch.rand(num_tokens, MIX, device=device, generator=g)
+    post = packed[:, hc_mult : 2 * hc_mult].unsqueeze(
+        -1
+    )  # [T, hc, 1], strides (MIX, 1, 1)
+    comb = packed[:, 2 * hc_mult :].view(
+        num_tokens, hc_mult, hc_mult
+    )  # strides (MIX, hc, 1)
+    if num_tokens > 1:  # a single row is contiguous whatever its row stride
+        assert not post.reshape(num_tokens, hc_mult).is_contiguous()
+        assert not comb.is_contiguous()
+    return post, comb
+
+
+def _strided_outputs(num_tokens, hidden_size, hc_mult=HC, device="cpu"):
+    yp = torch.empty(num_tokens, N_SPLITS, MIX, device=device).transpose(0, 1)
+    rp = torch.empty(num_tokens, N_SPLITS, device=device).t()
+    residual_out = torch.empty(
+        num_tokens, hidden_size, hc_mult, dtype=torch.bfloat16, device=device
+    ).permute(0, 2, 1)
+    assert not (
+        yp.is_contiguous() or rp.is_contiguous() or residual_out.is_contiguous()
+    )
+    return yp, rp, residual_out
+
+
+class _ContiguityCheckingModule:
+    """Stands in for the JIT module: rejects non-contiguous tensors like the binding's
+    ``CHECK_INPUT_AND_TYPE`` and writes recognisable values into the outputs."""
+
+    def __init__(self):
+        self.seen = None
+
+    def allreduce_mhc_post_prenorm(
+        self, input, residual, post, comb, fn, yp, rp, residual_out, *rest
+    ):
+        tensors = {
+            "input": input,
+            "residual": residual,
+            "post": post,
+            "comb": comb,
+            "fn": fn,
+            "yp": yp,
+            "rp": rp,
+            "residual_out": residual_out,
+        }
+        for name, tensor in tensors.items():
+            if not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
+        self.seen = {name: tensor.clone() for name, tensor in tensors.items()}
+        yp.fill_(1.0)
+        rp.fill_(2.0)
+        residual_out.fill_(3.0)
+
+
+def _fused_stub(monkeypatch):
+    module = _ContiguityCheckingModule()
+    monkeypatch.setattr(backend, "is_supported", lambda *args, **kwargs: True)
+    monkeypatch.setattr(backend, "_get_module", lambda allow_build: module)
+    workspace = _stub_workspace()
+    workspace._require_handles_attached = lambda: None
+    workspace.mc_ptr = 0
+    workspace.uc_ptr_local = 0
+    workspace.buffer_flags = None
+    return module, workspace
+
+
+@pytest.mark.parametrize(
+    "num_tokens", [2, 3, 32]
+)  # one token is contiguous at any stride
+def test_fused_path_accepts_strided_inputs_and_outputs(monkeypatch, num_tokens):
+    # A call the support query accepts must not fail on layout: strided inputs reach the
+    # kernel as contiguous copies with the same values, and strided preallocated outputs
+    # receive the results.
+    module, workspace = _fused_stub(monkeypatch)
+    hidden = 256
+    inputs = _make_inputs(num_tokens, hidden_size=hidden, device="cpu", seed=num_tokens)
+    post, comb = _packed_mix_views(num_tokens, seed=num_tokens)
+    inputs["post_layer_mix"], inputs["comb_res_mix"] = post, comb
+    inputs["residual"] = (
+        inputs["residual"].permute(0, 2, 1).contiguous().permute(0, 2, 1)
+    )  # same values, non-contiguous
+    assert not inputs["residual"].is_contiguous()
+    yp, rp, residual_out = _strided_outputs(num_tokens, hidden)
+    before = backend.stats()["dispatch_count"]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        out = comm.allreduce_mhc_post_prenorm(
+            **inputs, workspace=workspace, yp=yp, rp=rp, residual_out=residual_out
+        )
+    assert backend.stats()["dispatch_count"] == before + 1
+    seen = module.seen
+    assert torch.equal(seen["post"], post.reshape(num_tokens, HC))
+    assert torch.equal(seen["comb"], comb)
+    assert torch.equal(seen["residual"], inputs["residual"])
+    assert out[0] is yp and out[1] is rp and out[2] is residual_out
+    assert bool((yp == 1.0).all()) and bool((rp == 2.0).all())
+    assert bool((residual_out == 3.0).all())
+
+
+def test_off_contract_dtypes_take_the_composable_path(monkeypatch):
+    # The support query only sees the input dtype; a mix tensor in another dtype must fall
+    # back to the composable path instead of reaching the binding's dtype check.
+    module, workspace = _fused_stub(monkeypatch)
+    monkeypatch.setattr(backend, "trtllm_mnnvl_allreduce", lambda x, ws, pdl: x)
+    inputs = _make_inputs(2, hidden_size=256, device="cpu", seed=7)
+    inputs["post_layer_mix"] = inputs["post_layer_mix"].to(torch.bfloat16)
+    before = backend.stats()["fallback_count"]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        out = comm.allreduce_mhc_post_prenorm(**inputs, workspace=workspace)
+    assert module.seen is None
+    assert backend.stats()["fallback_count"] == before + 1
+    x = inputs.pop("input")
+    for got, want in zip(out, _reference(x, **inputs), strict=True):
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
 # ---------------------------------------------------------------------------
 # Kernel tests (8 ranks, SM100 / SM103, MNNVL)
 # ---------------------------------------------------------------------------
@@ -416,6 +537,41 @@ def test_fused_matches_stock_allreduce_and_reference(mnnvl_workspace, num_tokens
         torch.cuda.synchronize()
         assert backend.stats()["dispatch_count"] == before + 1
         _check_epilogue(out, ref)
+
+    _run_ranks(body)
+
+
+@pytest.mark.parametrize("num_tokens", [2, 5, 17, 32])
+def test_fused_accepts_packed_mix_and_strided_outputs(mnnvl_workspace, num_tokens):
+    # post / comb as views into one packed [T, 24] mix tensor and strided preallocated outputs
+    # take the fused path and give exactly the results of the contiguous call.
+    workspace, rank = mnnvl_workspace
+
+    def body():
+        parts, epi = _rank_inputs(num_tokens, rank, seed=3000 + num_tokens)
+        x_local = parts[rank].contiguous()
+        dense = comm.allreduce_mhc_post_prenorm(x_local, workspace=workspace, **epi)
+        packed = torch.zeros(num_tokens, MIX, device="cuda")
+        packed[:, HC : 2 * HC] = epi["post_layer_mix"]
+        packed[:, 2 * HC :] = epi["comb_res_mix"].reshape(num_tokens, HC * HC)
+        strided = dict(epi)
+        strided["post_layer_mix"] = packed[:, HC : 2 * HC].unsqueeze(-1)
+        strided["comb_res_mix"] = packed[:, 2 * HC :].view(num_tokens, HC, HC)
+        yp, rp, residual_out = _strided_outputs(num_tokens, HIDDEN, device="cuda")
+        before = backend.stats()["dispatch_count"]
+        out = comm.allreduce_mhc_post_prenorm(
+            x_local,
+            workspace=workspace,
+            yp=yp,
+            rp=rp,
+            residual_out=residual_out,
+            **strided,
+        )
+        torch.cuda.synchronize()
+        assert backend.stats()["dispatch_count"] == before + 1
+        assert out[0] is yp and out[1] is rp and out[2] is residual_out
+        for got, want in zip(out, dense, strict=True):
+            assert torch.equal(got, want)
 
     _run_ranks(body)
 

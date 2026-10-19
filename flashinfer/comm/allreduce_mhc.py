@@ -94,6 +94,11 @@ def allreduce_mhc_post_prenorm(
     Every rank of the group must make the same call. Before capturing a CUDA graph that contains
     this call, call :func:`allreduce_mhc_post_prenorm_prepare` outside capture: a call made during
     capture never builds the module, and without it the composable path is captured instead.
+
+    Any strides are accepted. The fused kernel reads and writes dense row-major tensors, so a
+    strided input (e.g. ``post_layer_mix`` / ``comb_res_mix`` sliced from one packed mix tensor)
+    is copied first and a strided preallocated output receives a copy of the result; contiguous
+    tensors are used as they are. Tensors outside the dtypes above take the composable path.
     """
     from ..experimental.allreduce_mhc_post_prenorm.backend import run
 
@@ -125,7 +130,8 @@ def allreduce_mhc_post_prenorm_supported(
     Checks the supported surface (8 ranks, ``hidden_size == 4096``, ``hc_mult == 4``, bf16, 1 to
     32 tokens, compute capability 10.x), the workspace type and its one-shot capacity, and that
     the fused module is loaded; outside CUDA-graph capture it builds the module on first use.
-    Callers that keep their own unfused path take it whenever this returns False.
+    The answer holds for the documented tensor dtypes and for any strides. Callers that keep
+    their own unfused path take it whenever this returns False.
 
     Parameters
     ----------

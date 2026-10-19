@@ -184,6 +184,34 @@ def _composable(
     return yp, rp, residual_out
 
 
+def _dtypes_supported(
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    yp: torch.Tensor,
+    rp: torch.Tensor,
+    residual_out: torch.Tensor,
+) -> bool:
+    """The kernel's dtypes for the tensors :func:`is_supported` does not see."""
+    return (
+        residual.dtype == DTYPE
+        and residual_out.dtype == DTYPE
+        and post_layer_mix.dtype == torch.float32
+        and comb_res_mix.dtype == torch.float32
+        and fn.dtype == torch.float32
+        and yp.dtype == torch.float32
+        and rp.dtype == torch.float32
+    )
+
+
+def _dense_output(out: torch.Tensor) -> torch.Tensor:
+    """``out`` if the kernel can write it directly, else a contiguous buffer of its shape."""
+    if out.is_contiguous():
+        return out
+    return torch.empty_like(out, memory_format=torch.contiguous_format)
+
+
 def run(
     input: torch.Tensor,
     residual: torch.Tensor,
@@ -212,21 +240,30 @@ def run(
     if residual_out is None:
         residual_out = torch.empty_like(residual)
 
-    if is_supported(
+    if _dtypes_supported(
+        residual, post_flat, comb_res_mix, fn, yp, rp, residual_out
+    ) and is_supported(
         workspace, num_tokens, hidden_size, hc_mult, input.dtype, input.device
     ):
         workspace._require_handles_attached()
         module = _get_module(allow_build=False)
         assert module is not None
+        # The kernel takes dense row-major tensors. Strided inputs (e.g. post / comb mix
+        # sliced from one packed mix tensor) are copied; contiguous ones pass through.
+        # Strided preallocated outputs get a dense buffer and receive a copy of the result.
+        # Both copies are plain stream work and are valid during CUDA-graph capture.
+        yp_dense = _dense_output(yp)
+        rp_dense = _dense_output(rp)
+        residual_out_dense = _dense_output(residual_out)
         module.allreduce_mhc_post_prenorm(
-            input,
-            residual,
-            post_flat,
-            comb_res_mix,
-            fn,
-            yp,
-            rp,
-            residual_out,
+            input.contiguous(),
+            residual.contiguous(),
+            post_flat.contiguous(),
+            comb_res_mix.contiguous(),
+            fn.contiguous(),
+            yp_dense,
+            rp_dense,
+            residual_out_dense,
             workspace.mc_ptr,
             workspace.uc_ptr_local,
             workspace.buffer_flags,
@@ -234,6 +271,13 @@ def run(
             workspace.rank,
             launch_with_pdl,
         )
+        for out, dense in (
+            (yp, yp_dense),
+            (rp, rp_dense),
+            (residual_out, residual_out_dense),
+        ):
+            if dense is not out:
+                out.copy_(dense)
         _stats["dispatch_count"] += 1
         per_m = _stats["dispatch_by_num_tokens"]
         per_m[num_tokens] = per_m.get(num_tokens, 0) + 1
