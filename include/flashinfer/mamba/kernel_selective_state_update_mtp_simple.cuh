@@ -514,7 +514,9 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
                                 head * DIM + dim_offset;
   };
 
-  if constexpr (DIM_PER_CTA % warpSize == 0) {
+  // The vectorized path steps by whole vectors, so each lane's DIM_PER_CTA / warpSize elements
+  // must be a multiple of the vector size. Otherwise the last vector runs past the row.
+  if constexpr (DIM_PER_CTA % warpSize == 0 && (DIM_PER_CTA / warpSize) % outputLoadSize == 0) {
     // Fast path: each lane handles DIM_PER_CTA / warpSize elements, use vectorized loads/stores
     constexpr int elemsPerThreadEpilogue = DIM_PER_CTA / warpSize;
 
@@ -544,8 +546,9 @@ __device__ __forceinline__ void update_state_simple(SramT& sram, int lane, int w
       }
     }
   } else {
-    // Strided path: DIM_PER_CTA is not a multiple of warpSize (for example 16, 48 or 80),
-    // so each lane handles elements lane, lane + warpSize, ...
+    // Strided path: DIM_PER_CTA is not a multiple of warpSize (for example 16, 48 or 80), or the
+    // vectors do not tile each lane's elements (for example 288 with bf16 input), so each lane
+    // handles elements lane, lane + warpSize, ...
     for (int step = warp; step < seq_len; step += NUM_WARPS) {
       int64_t const out_offset = out_addr(step);
       for (int d = lane; d < DIM_PER_CTA; d += warpSize) {
