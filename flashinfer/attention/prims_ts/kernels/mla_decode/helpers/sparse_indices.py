@@ -15,8 +15,11 @@
     tile = row.select_source_tile(tile_start)
     quad = tile.load_quad(kv_offset)
 
-Each source occupies a 128-aligned logical span, so a tile uses one pool even
-when its physical rows are random. These compiler-side objects carry existing
+The primary source's logical span is rounded to 128 so BK64/BK128 tiles never
+cross pools, even when physical rows are random. Caller arrays/live lengths
+need no such padding; bounded loads synthesize invalid tails. A 32-entry
+boundary would suffice for the grouped TMA descriptors alone, but not for
+this whole-tile source selection. These compiler-side objects carry existing
 pointers/scalars through CuTe calls; they allocate no merged metadata buffer.
 Only SparseKVLengths retains tensor indexing for the shared scheduler.
 """
@@ -29,7 +32,7 @@ from cutlass import Int32, Int64
 class SparseKVIndices:
     """Caller-owned index lists; optionally cache one query row's live lengths."""
 
-    def __init__(self, values, capacity, assume_valid_prefix=False):
+    def __init__(self, values, capacity, assume_valid_prefix=False, has_extra=True):
         self.values = values
         (
             self.primary_indices,
@@ -42,6 +45,7 @@ class SparseKVIndices:
         ) = values
         self.capacity = capacity
         self.assume_valid_prefix = assume_valid_prefix
+        self.has_extra = has_extra
         self.is_bound = self.query_row is not None
         if self.is_bound:
             self.primary_span = (
@@ -56,6 +60,7 @@ class SparseKVIndices:
             cutlass.new_from_mlir_values(self.values, values),
             self.capacity,
             self.assume_valid_prefix,
+            self.has_extra,
         )
 
     @cute.jit
@@ -74,12 +79,17 @@ class SparseKVIndices:
                 Int32(self.primary_lengths[row])
                 if cutlass.const_expr(primary_length is None)
                 else primary_length,
-                Int32(self.extra_lengths[row])
-                if cutlass.const_expr(extra_length is None)
-                else extra_length,
+                (
+                    Int32(self.extra_lengths[row])
+                    if cutlass.const_expr(extra_length is None)
+                    else extra_length
+                )
+                if cutlass.const_expr(self.has_extra)
+                else Int32(0),
             ),
             self.capacity,
             self.assume_valid_prefix,
+            self.has_extra,
         )
 
     @cute.jit
@@ -87,6 +97,21 @@ class SparseKVIndices:
         self, tile_start, query_row=None, *, for_mask: cutlass.Constexpr[bool] = False
     ):
         row = self.bind_query_row(query_row)
+        if cutlass.const_expr(not self.has_extra):
+            # A single-pool plan needs no second length, pointer selection or tag.
+            if cutlass.const_expr(for_mask and self.assume_valid_prefix):
+                return SparseSourceTile(
+                    (None, Int32(0), row.primary_length, None), valid_prefix=True
+                )
+            return SparseSourceTile(
+                (
+                    row.primary_indices[row.query_row, None],
+                    Int32(0),
+                    row.primary_length,
+                    Int32(0),
+                ),
+                valid_prefix=self.assume_valid_prefix,
+            )
         use_extra = tile_start >= row.primary_span
         origin = row.primary_span if use_extra else Int32(0)
         length = row.extra_length if use_extra else row.primary_length
@@ -105,26 +130,12 @@ class SparseKVIndices:
             cute.make_ptr(Int32, address, assumed_align=4),
             cute.make_layout((self.capacity,), stride=(1,)),
         )
+        # The first coordinate chooses a shared TMA descriptor, even when
+        # invalid. Preserve this source tag on every synthesized tail entry.
         tag = Int32(-2147483648) if use_extra else Int32(0)
-        return SparseSourceTile((indices, origin, length, tag))
-
-    @cute.jit
-    def load_index(self, token, query_row):
-        """Scalar path for lane-distributed register windows, including padding."""
-        row = self.bind_query_row(query_row)
-        result = Int32(0x7FFFFFFF)
-        if token < row.primary_length:
-            index = Int32(row.primary_indices[row.query_row, token])
-            if index >= 0:
-                result = index
-        elif token >= row.primary_span:
-            result = Int32(-1)
-            position = token - row.primary_span
-            if position < row.extra_length:
-                index = Int32(row.extra_indices[row.query_row, position])
-                if index >= 0:
-                    result = index | Int32(-2147483648)
-        return result
+        return SparseSourceTile(
+            (indices, origin, length, tag), valid_prefix=self.assume_valid_prefix
+        )
 
 
 class SparseSourceTile:
@@ -153,13 +164,30 @@ class SparseSourceTile:
             cute.math.max(self.length - Int32(1), Int32(0)),
         )
         index = Int32(self.indices[safe])
-        valid = (position >= Int32(0)) & (position < self.length) & (index >= Int32(0))
+        valid = (position >= Int32(0)) & (position < self.length)
+        if cutlass.const_expr(not self.valid_prefix):
+            valid = valid & (index >= Int32(0))
         return index, valid
 
     @cute.jit
     def load_row(self, token):
         index, valid = self._bounded_index(token)
         return (index if valid else Int32(0x7FFFFFFF)) | self.tag
+
+    @cute.jit
+    def load_full_quad(self, token):
+        """Load an in-bounds quad; callers establish its source-local bounds."""
+        values = cutlass.Pointer(
+            self.indices.iterator + token - self.origin, dtype=Int32
+        ).load(count=4, alignment=4)
+        rows = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
+        for j in cutlass.range_constexpr(4):
+            index = Int32(values[j])
+            if cutlass.const_expr(self.valid_prefix):
+                rows[j] = index | self.tag
+            else:
+                rows[j] = (index if index >= Int32(0) else Int32(0x7FFFFFFF)) | self.tag
+        return rows
 
     @cute.jit
     def load_quad(self, token):
@@ -169,12 +197,9 @@ class SparseSourceTile:
             rows[j] = Int32(0x7FFFFFFF) | self.tag
         position = token - self.origin
         if position >= Int32(0) and position + Int32(3) < self.length:
-            values = cutlass.Pointer(
-                self.indices.iterator + position, dtype=Int32
-            ).load(count=4, alignment=4)
+            values = self.load_full_quad(token)
             for j in cutlass.range_constexpr(4):
-                index = Int32(values[j])
-                rows[j] = (index if index >= Int32(0) else Int32(0x7FFFFFFF)) | self.tag
+                rows[j] = values[j]
         elif position + Int32(3) >= Int32(0) and position < self.length:
             for j in cutlass.range_constexpr(4):
                 rows[j] = self.load_row(token + Int32(j))
@@ -207,8 +232,9 @@ class SparseSourceTile:
 class SparseKVLengths:
     """Adapter for the scheduler's lengths[query_row] interface only."""
 
-    def __init__(self, values):
+    def __init__(self, values, has_extra=True):
         self.values = values
+        self.has_extra = has_extra
         self.primary_lengths, self.extra_lengths, self.bound_length, rows = values
         self.shape = (
             (rows,) if self.bound_length is not None else self.primary_lengths.shape
@@ -218,14 +244,19 @@ class SparseKVLengths:
         return cutlass.extract_mlir_values(self.values)
 
     def __new_from_mlir_values__(self, values):
-        return SparseKVLengths(cutlass.new_from_mlir_values(self.values, values))
+        return SparseKVLengths(
+            cutlass.new_from_mlir_values(self.values, values), self.has_extra
+        )
 
     @cute.jit
     def __getitem__(self, query_row):
         if cutlass.const_expr(self.bound_length is not None):
             return self.bound_length
         return _sparse_execution_length(
-            Int32(self.primary_lengths[query_row]), Int32(self.extra_lengths[query_row])
+            Int32(self.primary_lengths[query_row]),
+            Int32(self.extra_lengths[query_row])
+            if cutlass.const_expr(self.has_extra)
+            else Int32(0),
         )
 
 
@@ -247,6 +278,7 @@ def bind_sparse_kv_indices(
     *,
     query_row=None,
     assume_valid_prefix: cutlass.Constexpr[bool] = False,
+    has_extra: cutlass.Constexpr[bool] = True,
 ):
     """Bind index readers and scheduler lengths without copying metadata."""
     indices = SparseKVIndices(
@@ -261,11 +293,16 @@ def bind_sparse_kv_indices(
         ),
         capacity,
         assume_valid_prefix,
+        has_extra,
     )
     if cutlass.const_expr(query_row is not None):
         indices = indices.bind_query_row(query_row)
         length = _sparse_execution_length(indices.primary_length, indices.extra_length)
-        lengths = SparseKVLengths((None, None, length, primary_lengths.shape[0]))
+        lengths = SparseKVLengths(
+            (None, None, length, primary_lengths.shape[0]), has_extra
+        )
     else:
-        lengths = SparseKVLengths((primary_lengths, extra_lengths, None, None))
+        lengths = SparseKVLengths(
+            (primary_lengths, extra_lengths, None, None), has_extra
+        )
     return indices, lengths

@@ -831,7 +831,6 @@ class MlaDecodeTs:
         seq_len_q=1,
         batch_size=1,
         mask_type: MaskType | str = MaskType.CAUSAL,
-        device_scales: bool = False,
     ):
         """
         Parameters
@@ -914,12 +913,11 @@ class MlaDecodeTs:
             raise ValueError("batch_size must be positive")
         self.batch_size = batch_size
         self.mask_type = normalize_mask_type(mask_type)
-        self.device_scales = device_scales
         self.fuse_sparse_reduction = False
         self.fuse_sparse_epilogue = False
         self.output_quant = None
-        # Separate prepared source lists, rather than a premerged tagged list.
-        # Both representations reuse the same metadata staging and KV loaders.
+        # Sparse attention binds separate source lists; dense attention uses
+        # the ordinary page table. Both reuse the staged KV loaders.
         self.direct_sparse = False
         self.sparse_gather_warps = 1
         self.sparse_kv_stages = 0
@@ -1605,24 +1603,13 @@ class MlaDecodeTs:
                 capacity,
                 query_row=request,
                 assume_valid_prefix=self.assume_valid_prefix,
+                has_extra=self.direct_sparse_capacities[1] > 0,
             )
             if cutlass.const_expr(not self.direct_static_scales):
                 softmax_scale_log2 = (
                     Float32(sm[0]) * Float32(qs[0]) * Float32(ss[0]) * LOG2_E
                 )
                 output_scale = Float32(os[0]) * Float32(ss[0])
-        else:
-            if cutlass.const_expr(self.device_scales):
-                softmax_scale_log2 = cutlass.Float32(block_split_kvs[0]) * LOG2_E
-                output_scale = cutlass.Float32(block_split_kvs[1])
-            if cutlass.const_expr(self.fuse_sparse_epilogue):
-                # A host-scale caller can bind sinks alone. Device-scale
-                # metadata starts with QK/PV scales, followed by sinks.
-                sink_offset = 2 if self.device_scales else 0
-                sinks = cute.make_tensor(
-                    block_split_kvs.iterator + sink_offset,
-                    cute.make_layout(self.num_heads),
-                )
         cfg = self._make_config()
         num_query_tiles = self.num_q_tiles
         use_clc_dynamic = self.is_persistent and not cfg.is_fp8_qkv()
@@ -2227,12 +2214,7 @@ class MlaDecodeTs:
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         atten_sinks = None
         if cutlass.const_expr(self.fuse_sparse_reduction):
-            if cutlass.const_expr(self.direct_sparse):
-                atten_sinks = block_split_kvs[-1]
-            else:
-                atten_sinks = cute.make_tensor(
-                    block_split_kvs.iterator + 2, cute.make_layout(self.num_heads)
-                )
+            atten_sinks = block_split_kvs[-1]
             block_split_kvs = None
         topology = self._reduction_topology()
         run_parallel_reduction_kernel(

@@ -859,14 +859,23 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
         global_k_index = work_tile.k_index_base + local_k_index
         if cutlass.const_expr(cfg.page_size == 1):
             cta = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+            # K and pending V cover the same source-aligned BK128 tile.
+            # Bind its source once, not again for every lane/fragment.
+            routes = (
+                self.page_offsets.select_source_tile(
+                    global_k_index * cfg.tokens_per_k_tile, blk_coord[2]
+                )
+                if cutlass.const_expr(isinstance(self.page_offsets, SparseKVIndices))
+                else self.page_offsets
+            )
             new_k = load_sparse_rows(
-                self.page_offsets,
+                routes,
                 blk_coord[2],
                 global_k_index * cfg.tokens_per_k_tile + cta * cfg.tokens_per_k_cta,
                 fragments=cfg.tokens_per_k_cta // WARP_LANES,
             )
             new_v = load_sparse_rows(
-                self.page_offsets,
+                routes,
                 blk_coord[2],
                 global_k_index * cfg.tokens_per_v_tile,
                 fragments=cfg.tokens_per_v_tile // WARP_LANES,

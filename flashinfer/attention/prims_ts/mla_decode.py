@@ -90,7 +90,6 @@ class _MLADecodeCompileSpec:
     has_kernel_workspace: bool
     split_kv: int
     kernel: Any = field(compare=False, hash=False, repr=False)
-    device_scales: bool = False
 
 
 @dataclass(frozen=True)
@@ -143,7 +142,6 @@ class _MLARuntime:
     bmm1_scale: float
     bmm2_scale: float
     extra_cache: Optional[torch.Tensor] = None
-    scale_params: Optional[torch.Tensor] = None
     sparse_inputs: Optional[tuple] = None
     output_quant_args: Optional[tuple] = None
 
@@ -1038,7 +1036,6 @@ def _make_mla_decode_compile_spec(
     output_dtype_key: str,
     max_seq_len_q: int,
     packed_query: bool,
-    device_scales: bool = False,
 ) -> _MLADecodeCompileSpec:
     """Keep policy resolution plan-specific and JIT identity batch-free."""
 
@@ -1056,7 +1053,6 @@ def _make_mla_decode_compile_spec(
         has_kernel_workspace=launch_spec.kernel_workspace_bytes > 0,
         split_kv=launch_spec.split_kv,
         kernel=launch_spec.kernel,
-        device_scales=device_scales,
     )
 
 
@@ -1190,13 +1186,7 @@ def _get_compiled_mla_decode(
             stride_order=(0,),
             assumed_align=4,
         )
-    scale_params_fake = (
-        cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32, (cute.sym_int(),), stride_order=(0,), assumed_align=4
-        )
-        if compile_spec.device_scales
-        else None
-    )
+    sparse_inputs_fake = None
     if getattr(kernel, "direct_sparse", False):
 
         def sparse_indices(capacity):
@@ -1213,7 +1203,7 @@ def _get_compiled_mla_decode(
         sink = cute.runtime.make_fake_compact_tensor(
             cutlass.Float32, (num_heads,), stride_order=(0,), assumed_align=4
         )
-        scale_params_fake = (
+        sparse_inputs_fake = (
             sparse_indices(kernel.direct_sparse_capacities[0]),
             sparse_indices(kernel.direct_sparse_capacities[1]),
             cache_seqs_fake,
@@ -1244,7 +1234,7 @@ def _get_compiled_mla_decode(
             cutlass.Int32(compile_spec.split_kv),
             cache_seqs_fake,
             qo_indptr_fake,
-            scale_params_fake,
+            sparse_inputs_fake,
             cutlass.Float32(1.0),
             cutlass.Float32(1.0),
             stream_fake,
@@ -1467,9 +1457,7 @@ def _launch_mla_decode(
         split_kv,
         seq_lens,
         qo_indptr,
-        runtime.sparse_inputs
-        if runtime.sparse_inputs is not None
-        else runtime.scale_params,
+        runtime.sparse_inputs,
         runtime.bmm1_scale,
         runtime.bmm2_scale,
         **(
@@ -1968,27 +1956,21 @@ class SparseMLAPreparedMetadata(NamedTuple):
     [rows]. Primary and extra indices address their own flattened native pool.
     No block-table lookup or page-stride conversion occurs in run.
 
-    Combined-route schedules also consume routes [rows, route_capacity],
-    execution_lengths [rows], and FP32 scale_params [2 + heads + rows].
-    Route bit 31 selects the extra pool; bits 0:31
-    encode the storage row, with 0x7fffffff invalid. Each source's execution
-    span is rounded to 128. Empty rows execute one masked slot. Scale rows
-    contain [QK scale, PV scale, sinks[heads], valid_counts[rows]]. Both pools
-    share one KV descale and participate in a single attention pass.
+    Both pools share one KV descale and participate in a single attention
+    pass. Scales and attention sinks are separate run() inputs; no packed
+    routes or scale/sink copies are required.
 
-    Preparation must refresh all dependent fields when routes, lengths,
-    scales or sinks change. Buffers must remain alive and unaliased with
-    writable attention buffers through graph replay. Applications may supply
-    these buffers from any preparer satisfying this contract.
+    Live lengths and index-array widths need not be multiples of 128. The
+    kernel rounds the primary source's logical execution span internally so
+    a KV tile never crosses sources; bounded loads mask holes and tails.
+    Buffers must remain alive and unaliased with writable attention buffers
+    through graph replay.
     """
 
     indices: torch.Tensor
     lengths: torch.Tensor
     extra_indices: torch.Tensor | None = None
     extra_lengths: torch.Tensor | None = None
-    routes: torch.Tensor | None = None
-    execution_lengths: torch.Tensor | None = None
-    scale_params: torch.Tensor | None = None
 
 
 def _make_sparse_output_quant(heads, block_size, scale_format, groups):
@@ -2236,7 +2218,6 @@ def _resolve_sparse_mla_plan(
             seq_len_q=1,
             batch_size=max_rows,
             mask_type="dense",
-            device_scales=True,
         )
         kernel.sparse_gather_warps = profile.gather_issue_warps
         kernel.sparse_kv_stages = profile.kv_pipeline_stages
@@ -2280,7 +2261,6 @@ def _resolve_sparse_mla_plan(
             tile_size_q=tile,
             sparse_profile=profile,
             mask_type="dense",
-            device_scales=True,
         )
         core_bytes = compute_workspace_size(
             cfg=kernel._make_config(),
@@ -2298,7 +2278,6 @@ def _resolve_sparse_mla_plan(
         output_dtype_key="float8_e4m3fn" if output_quant is not None else "bfloat16",
         max_seq_len_q=1,
         packed_query=False,
-        device_scales=True,
     )
     sections = {}
     byte_end = 0
@@ -2326,9 +2305,9 @@ class BatchSparseMLADecodePagedTSWrapper:
     This option does not change attention dispatch or softmax correction.
 
     Planning with ``assume_valid_prefix=True`` promises that every index before
-    each live source length is valid (no -1 holes). Direct FP8 2CTA kernels
-    then derive masks from lengths without reading indices or issuing ballots.
-    Other kernels retain their generic mask path; no gain was established.
+    each live source length is valid (no -1 holes). Kernels can then derive
+    masks from lengths and omit per-index hole checks. This does not imply
+    that the physical KV rows are consecutive.
     ``run(validate=True)`` checks the promise; graph replay with validation
     disabled must preserve it. Tail entries beyond the lengths are ignored.
 
@@ -2376,7 +2355,7 @@ class BatchSparseMLADecodePagedTSWrapper:
         MXFP8; FP32 scales use unrounded amax/448. Both use an amax floor of
         1e-4. A block never crosses a head boundary.
         """
-        (device, profile, spec, sections, byte_end, capacity, output_quant) = (
+        (device, profile, spec, sections, byte_end, _, output_quant) = (
             _resolve_sparse_mla_plan(
                 device,
                 batch_size,
@@ -2399,7 +2378,6 @@ class BatchSparseMLADecodePagedTSWrapper:
         family = profile.family
         splits = profile.split_kv
         max_rows = batch_size * max_seq_len_q
-        use_direct = profile.direct_inputs
         workspace = self._workspace_buffer
         if workspace is None:
             workspace = torch.empty(byte_end, device=device, dtype=torch.uint8)
@@ -2412,29 +2390,27 @@ class BatchSparseMLADecodePagedTSWrapper:
         # split-KV reducer. No per-source outputs or finishing launch are needed.
         kernel = copy.copy(kernel)
         kernel.output_quant = output_quant
+        kernel.assume_valid_prefix = assume_valid_prefix
         if family == "2cta":
             kernel.fuse_sparse_epilogue = splits == 1
             kernel.fuse_sparse_reduction = splits > 1
-            kernel.assume_valid_prefix = assume_valid_prefix
         else:
             kernel.finalize_output = True
-        kernel.direct_sparse = use_direct
+        kernel.direct_sparse = True
         kernel.direct_sparse_capacities = (max_topk, max_extra_topk)
         spec = replace(
             spec, kernel=kernel, kernel_signature=_mla_kernel_compile_signature(kernel)
         )
         compiled = _get_compiled_mla_decode(spec)
-        compiled_static = None
-        if use_direct:
-            static_kernel = copy.copy(kernel)
-            static_kernel.direct_static_scales = True
-            compiled_static = _get_compiled_mla_decode(
-                replace(
-                    spec,
-                    kernel=static_kernel,
-                    kernel_signature=_mla_kernel_compile_signature(static_kernel),
-                )
+        static_kernel = copy.copy(kernel)
+        static_kernel.direct_static_scales = True
+        compiled_static = _get_compiled_mla_decode(
+            replace(
+                spec,
+                kernel=static_kernel,
+                kernel_signature=_mla_kernel_compile_signature(static_kernel),
             )
+        )
         self._state = dict(
             device=device,
             batch=batch_size,
@@ -2445,7 +2421,6 @@ class BatchSparseMLADecodePagedTSWrapper:
             dtype=q_data_type,
             ks=max_topk,
             kc=max_extra_topk,
-            capacity=capacity,
             kv_layout=kv_layout,
             has_sinks=has_sinks,
             return_lse=return_lse,
@@ -2454,14 +2429,12 @@ class BatchSparseMLADecodePagedTSWrapper:
             workspace=workspace,
             compiled=compiled,
             compiled_static=compiled_static,
-            direct_inputs=use_direct,
             assume_valid_prefix=assume_valid_prefix,
             splits=splits,
             default_cl=torch.full(
                 (max_rows,), max_extra_topk, device=device, dtype=torch.int32
             ),
             dummy_indices=torch.zeros((max_rows, 1), device=device, dtype=torch.int32),
-            dummy_scales=torch.ones((2,), device=device, dtype=torch.float32),
             dummy_cache=torch.zeros((1, 1, 512), device=device, dtype=q_data_type),
             default_sinks=torch.full(
                 (num_heads,), -torch.inf, device=device, dtype=torch.float32
@@ -2579,53 +2552,6 @@ class BatchSparseMLADecodePagedTSWrapper:
                 )
         return indices, lengths
 
-    def _bind_metadata(self, metadata, *, rows, direct, primary_lengths):
-        state = self._state
-        buffers = state["buffers"]
-        prepared_buffers = {}
-        for key, value, dtype, shape in (
-            (
-                "routes",
-                metadata.routes,
-                torch.int32,
-                (rows, state["capacity"]),
-            ),
-            (
-                "lengths",
-                metadata.execution_lengths,
-                torch.int32,
-                (rows,),
-            ),
-            (
-                "scales",
-                metadata.scale_params,
-                torch.float32,
-                (2 + state["heads"] + rows,),
-            ),
-        ):
-            if value is None:
-                if not direct:
-                    raise ValueError(f"prepared {key} are required by this schedule")
-                continue
-            if (
-                value.dtype != dtype
-                or value.device != state["device"]
-                or value.shape != shape
-                or not value.is_contiguous()
-            ):
-                raise ValueError(f"prepared {key} must be contiguous {dtype}{shape}")
-            prepared_buffers[key] = value
-        buffers = (
-            buffers
-            | dict(
-                routes=state["dummy_indices"][:rows],
-                lengths=primary_lengths,
-                scales=state["dummy_scales"],
-            )
-            | prepared_buffers
-        )
-        return buffers
-
     @flashinfer_experimental_api
     def run(
         self,
@@ -2649,11 +2575,10 @@ class BatchSparseMLADecodePagedTSWrapper:
     ):
         """Launch with caller-prepared metadata, without index conversion.
 
-        Caller-owned metadata and plan workspace must outlive graph replay. Q and
-        native KV are used directly; flattening padded pages only creates a
-        tensor view. Required attention reductions/finishing remain included.
-        Metadata is an unchecked consistency contract: its packed routes,
-        counts and scales must agree with the supplied indices and scalars.
+        Caller-owned inputs and plan workspace must outlive graph replay,
+        including tensor scales and sinks. Q and native KV are used directly;
+        flattening padded pages only creates a tensor view. Required attention
+        reductions/finishing remain included.
         ``kv_scale`` is the common K/V descale for both pools. Caller-owned LSE
         must be contiguous FP32 and 16-byte aligned, including with validate=False.
 
@@ -2815,8 +2740,7 @@ class BatchSparseMLADecodePagedTSWrapper:
             raise ValueError(
                 "lse must be contiguous, 16-byte-aligned FP32 with one value per query/head"
             )
-        direct = state["direct_inputs"]
-        static_scales = direct and all(
+        static_scales = all(
             not isinstance(v, torch.Tensor)
             for v in (softmax_scale, q_scale, kv_scale, output_scale)
         )
@@ -2829,24 +2753,18 @@ class BatchSparseMLADecodePagedTSWrapper:
             bmm1_scale = f32(f32(f32(softmax_scale) * f32(q_scale)) * f32(kv_scale))
             bmm2_scale = f32(f32(output_scale) * f32(kv_scale))
         sparse_inputs = (
-            (
-                si,
-                ci,
-                sl,
-                cl,
-                scale_tensors[0],
-                scale_tensors[1],
-                scale_tensors[2],
-                scale_tensors[3],
-                sinks,
-            )
-            if direct
-            else None
+            si,
+            ci,
+            sl,
+            cl,
+            scale_tensors[0],
+            scale_tensors[1],
+            scale_tensors[2],
+            scale_tensors[3],
+            sinks,
         )
         if rows:
-            buffers = self._bind_metadata(
-                metadata, rows=rows, direct=direct, primary_lengths=sl
-            )
+            buffers = state["buffers"]
             # Quantized stores use output_quant_args, including group/bucket
             # strides. The core O view supplies compact launch geometry only.
             core_out = (
@@ -2865,12 +2783,11 @@ class BatchSparseMLADecodePagedTSWrapper:
                     bmm1_scale,
                     bmm2_scale,
                     extra_cache=extra,
-                    scale_params=buffers["scales"],
                     sparse_inputs=sparse_inputs,
                     output_quant_args=output_quant_args,
                 ),
-                block_tables=buffers["routes"],
-                seq_lens=buffers["lengths"],
+                block_tables=si,
+                seq_lens=sl,
                 qo_indptr=None,
                 packed_query=False,
                 kv_lora_rank=512,

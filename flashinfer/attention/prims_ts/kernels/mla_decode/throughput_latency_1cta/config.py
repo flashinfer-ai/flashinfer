@@ -174,6 +174,7 @@ class MlaConfig:
     fuse_sparse_reduction: bool = False
     sparse_direct: bool = False
     sparse_static_scales: bool = False
+    sparse_valid_prefix: bool = False
     sparse_direct_capacities: tuple[int, int] = (0, 0)
     page_offsets_num_warps: int = 1
     scheduler_num_warps: int = 1
@@ -1723,6 +1724,7 @@ def configure_sparse_mla(
     *,
     finalize_output=False,
     direct_inputs=False,
+    assume_valid_prefix=False,
     static_scales=False,
     source_capacities=(0, 0),
 ) -> MlaConfig:
@@ -1801,6 +1803,7 @@ def configure_sparse_mla(
         defer_sparse_max_update=profile.defer_max_update,
         sparse_direct=direct_inputs,
         sparse_static_scales=static_scales,
+        sparse_valid_prefix=assume_valid_prefix,
         sparse_direct_capacities=source_capacities if direct_inputs else (0, 0),
         fuse_sparse_epilogue=direct_finish,
         fuse_sparse_cluster_epilogue=cluster_finish,

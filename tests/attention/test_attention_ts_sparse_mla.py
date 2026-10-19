@@ -156,60 +156,6 @@ def map_sparse_indices(
     return out, counts
 
 
-@triton.jit
-def _pack_ts_metadata(
-    si,
-    ci,
-    sl,
-    cl,
-    routes,
-    lengths,
-    scales,
-    sinks,
-    sm,
-    qs,
-    ss,
-    os,
-    KS: tl.constexpr,
-    KC: tl.constexpr,
-    HEADS: tl.constexpr,
-    CAP: tl.constexpr,
-    BLOCK: tl.constexpr,
-    HEAD_BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0)
-    ls = tl.load(sl + row)
-    lc = tl.load(cl + row) if KC else 0
-    span_s = tl.cdiv(ls, 128) * 128
-    span_c = tl.cdiv(lc, 128) * 128
-    col = tl.arange(0, BLOCK)
-    for start in range(0, CAP, BLOCK):
-        p = start + col
-        a = tl.load(si + row * KS + p, (p < ls) & (p < CAP), 0x7FFFFFFF)
-        local = p - span_s
-        if KC:
-            b = tl.load(
-                ci + row * KC + local,
-                (local >= 0) & (local < lc) & (p < CAP),
-                0x7FFFFFFF,
-            )
-        else:
-            b = tl.full((BLOCK,), 0x7FFFFFFF, tl.int32)
-        b = b | -2147483648
-        word = tl.where(p < span_s, a, b)
-        tl.store(routes + row * CAP + p, word, p < CAP)
-    tl.store(lengths + row, tl.maximum(span_s + span_c, 1))
-    scale_base = scales
-    tl.store(scale_base + 2 + HEADS + row, (ls + lc).to(tl.float32))
-    if row == 0:
-        kv_scale = tl.load(ss)
-        tl.store(scale_base, tl.load(sm) * tl.load(qs) * kv_scale)
-        tl.store(scale_base + 1, tl.load(os) * kv_scale)
-        h = tl.arange(0, HEAD_BLOCK)
-        sink = tl.load(sinks + h, h < HEADS, 0)
-        tl.store(scale_base + 2 + h, sink, h < HEADS)
-
-
 def prepare_sparse_mla_metadata(
     wrapper,
     query,
@@ -220,25 +166,20 @@ def prepare_sparse_mla_metadata(
     extra_kv_cache=None,
     extra_indices=None,
     extra_lengths=None,
-    softmax_scale=512**-0.5,
-    q_scale=1.0,
-    kv_scale=1.0,
-    output_scale=1.0,
-    sinks=None,
     out=None,
 ):
-    """Test adapter producing every representation required by a prepared plan.
+    """Test adapter mapping/compacting each source into storage-row indices.
 
     Inputs are physical page-slot indices, as in the original model fixtures.
     All allocations/preparation belong outside measured attention. Supplying
     out reuses addresses and supports preparation in graph-lifetime tests.
-    Scalar/sink arguments must match the subsequent run invocation.
+    Scales and sinks are passed directly to run(); this adapter does not copy them.
     """
     state = wrapper._state
     if state is None:
         raise ValueError("a prepared attention plan is required")
     rows = query.numel() // (state["heads"] * 512)
-    ks, kc, cap = state["ks"], state["kc"], state["capacity"]
+    ks, kc = state["ks"], state["kc"]
     device = query.device
 
     def empty(shape, dtype=torch.int32):
@@ -250,9 +191,6 @@ def prepare_sparse_mla_metadata(
             lengths=empty((rows,)),
             extra_indices=empty((rows, kc)) if kc else None,
             extra_lengths=empty((rows,)) if kc else None,
-            routes=empty((rows, cap)),
-            execution_lengths=empty((rows,)),
-            scale_params=empty((2 + state["heads"] + rows,), torch.float32),
         )
 
     def map_pool(cache, idx, lens, width, dst, count):
@@ -278,34 +216,6 @@ def prepare_sparse_mla_metadata(
             kc,
             out.extra_indices,
             out.extra_lengths,
-        )
-    scalars = [
-        wrapper._scalar(v, name, False)
-        for v, name in (
-            (softmax_scale, "softmax_scale"),
-            (q_scale, "q_scale"),
-            (kv_scale, "kv_scale"),
-            (output_scale, "output_scale"),
-        )
-    ]
-    if rows:
-        _pack_ts_metadata[(rows,)](
-            out.indices,
-            out.extra_indices,
-            out.lengths,
-            out.extra_lengths,
-            out.routes,
-            out.execution_lengths,
-            out.scale_params,
-            state["default_sinks"] if sinks is None else sinks,
-            *scalars,
-            ks,
-            kc,
-            state["heads"],
-            cap,
-            256,
-            triton.next_power_of_2(state["heads"]),
-            num_warps=4,
         )
     return out
 
@@ -425,8 +335,6 @@ def test_rope_quant_graph(
         extra_kv_cache=extra,
         extra_indices=extra_indices,
         extra_lengths=extra_lengths,
-        sinks=sinks,
-        **descales,
     )
     indptr = (
         torch.tensor([0, queries, rows], device="cuda", dtype=torch.int32)
@@ -825,7 +733,6 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
             extra_indices=bi,
             extra_lengths=bl,
             out=out,
-            **scales,
         )
 
     meta = prepare()
@@ -902,7 +809,6 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
             extra_kv_cache=secondary,
             extra_indices=bi[:0],
             extra_lengths=bl[:0],
-            **scales,
         )
         empty, empty_lse = w.run(
             q[:0],
@@ -938,8 +844,6 @@ def test_caller_workspace_single_source_and_eager_api():
     metadata = prepare_sparse_mla_metadata(wrapper, q, kv, indices)
     with pytest.raises(TypeError, match="extra_kv_scale"):
         wrapper.run(q, kv, metadata, extra_kv_scale=2.0)
-    with pytest.raises(ValueError, match="prepared routes"):
-        wrapper.run(q, kv, metadata._replace(routes=metadata.routes.unsqueeze(0)))
     result, lse = wrapper.run(q, kv, metadata)
     torch.testing.assert_close(result, torch.full_like(q, 1.5))
     eager, eager_lse = batch_sparse_mla_decode_with_paged_kv_cache(
@@ -1029,7 +933,9 @@ def test_direct_metadata_without_packed_fields_graph():
     assert torch.count_nonzero(out) == 0 and torch.isneginf(lse).all()
 
 
-@pytest.mark.parametrize("heads,prefix", [(8, False), (128, True)])
+@pytest.mark.parametrize(
+    "heads,prefix", [(8, False), (8, True), (128, False), (128, True)]
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_source_tile_boundary_graph(heads, prefix, dtype):
     """Move the extra-source boundary between 128/256 during graph replay."""
@@ -1054,34 +960,23 @@ def test_source_tile_boundary_graph(heads, prefix, dtype):
         max_extra_topk=5,
         q_data_type=dtype,
         return_lse=True,
+        has_sinks=True,
         assume_valid_prefix=prefix,
     )
 
-    def prepare(out=None):
-        return prepare_sparse_mla_metadata(
-            wrapper,
-            q,
-            primary,
-            indices,
-            lengths,
-            extra_kv_cache=extra,
-            extra_indices=extra_indices,
-            extra_lengths=extra_lengths,
-            kv_scale=kv_scale,
-            out=out,
-        )
-
-    metadata = prepare()
-    out, lse = wrapper.run(q, primary, metadata, extra, kv_scale=kv_scale)
+    # No packed routes or source padding: the kernel derives the boundary.
+    metadata = SparseMLAPreparedMetadata(indices, lengths, extra_indices, extra_lengths)
+    sinks = torch.full((heads,), -torch.inf, device=q.device)
+    out, lse = wrapper.run(q, primary, metadata, extra, kv_scale=kv_scale, sinks=sinks)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        prepare(out=metadata)
         wrapper.run(
             q,
             primary,
             metadata,
             extra,
             kv_scale=kv_scale,
+            sinks=sinks,
             out=out,
             lse=lse,
             validate=False,
@@ -1108,6 +1003,24 @@ def test_source_tile_boundary_graph(heads, prefix, dtype):
         torch.testing.assert_close(
             lse, expected_lse.expand_as(lse), rtol=1e-4, atol=2e-4
         )
+
+    # An invalid first route must not redirect later rows to the other pool.
+    # Sinks are graph-live inputs and need no metadata refresh either.
+    lengths.fill_(129)
+    extra_lengths.fill_(5)
+    if not prefix:
+        indices[:, 0] = -1
+        extra_indices[:, 0] = -1
+    sinks.zero_()
+    graph.replay()
+    primary_count, extra_count = (129, 5) if prefix else (128, 4)
+    count = primary_count + extra_count
+    expected = kv_scale * (primary_count + 8 * extra_count) / (count + 1)
+    torch.testing.assert_close(
+        out.float(), torch.full_like(out.float(), expected), rtol=0.01, atol=0.002
+    )
+    expected_lse = torch.tensor(float(count), device=q.device).log()
+    torch.testing.assert_close(lse, expected_lse.expand_as(lse), rtol=1e-4, atol=2e-4)
 
 
 @pytest.mark.parametrize("heads", [64, 128])
@@ -1155,8 +1068,6 @@ def test_softmax_score_jumps(heads, dtype):
         si,
         extra_kv_cache=kv,
         extra_indices=ci,
-        sinks=sinks,
-        softmax_scale=softmax_scale,
     )
     w.run(
         q,

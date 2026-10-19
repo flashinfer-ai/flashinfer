@@ -2,6 +2,11 @@
 
 Native D512 two-source sparse MLA is available through
 `BatchSparseMLADecodePagedTSWrapper` (see its `plan()` / `run()` docstrings).
+Every sparse schedule consumes separate storage-row index lists and live lengths
+for the primary and optional extra pool. Pass scales and attention sinks directly
+to `run()`; applications do not construct combined tagged routes or copy sinks
+into metadata. Index lists use `-1` for holes and need no 128-entry padding.
+The kernel keeps source boundaries aligned to its KV tiles internally.
 The dense API contract below retains its 512-latent plus 64-RoPE layout.
 
 This directory contains the CuTe DSL task-scheduled (TS) Multi-head Latent

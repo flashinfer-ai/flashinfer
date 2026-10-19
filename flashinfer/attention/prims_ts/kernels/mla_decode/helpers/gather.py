@@ -51,9 +51,8 @@ def load_sparse_rows(routes, request, offset, *, fragments: cutlass.Constexpr[in
     for fragment in cutlass.range_constexpr(fragments):
         index = offset + lane + Int32(fragment * 32)
         value = Int32(0x7FFFFFFF)
-        if cutlass.const_expr(isinstance(routes, SparseKVIndices)):
-            if index < routes.capacity:
-                value = routes.load_index(index, request)
+        if cutlass.const_expr(isinstance(routes, SparseSourceTile)):
+            value = routes.load_row(index)
         elif index < routes.shape[0]:
             value = Int32(routes[index, request])
         rows[fragment] = value
@@ -95,6 +94,8 @@ def decode_sparse_quad(primary, extra, raw):
         # reserved sentinel is already an out-of-bounds TMA coordinate;
         # retaining it gives zero fill without a compare/select per row.
         rows[j] = raw[j] & Int32(0x7FFFFFFF)
+    # Internally generated invalid coordinates retain the source bit: the
+    # first coordinate selects the shared descriptor even when it is invalid.
     return select_gather_map(primary, extra, raw[0] < 0), rows
 
 
@@ -154,6 +155,7 @@ def gather4_cached(
         )
         row = raw & Int32(0x7FFFFFFF)
         rows[j] = row if row != Int32(0x7FFFFFFF) else Int32(-1)
+    # The same source-tag invariant applies to cached invalid anchors.
     descriptor = select_gather_map(primary, extra, raw0 < 0)
     if prims.elect_sync():
         gather4(
