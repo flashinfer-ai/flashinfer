@@ -18,7 +18,7 @@ Compute-capability 10.0/10.3 backend for MiniMax Sparse Attention.
 The Cake-generated programs behind this module are registered in
 ``flashinfer.jit.blackwell_msa``: ``ROUTES`` maps a logical route
 (``<route key>:<stage>``) to the program that serves it on each target and
-``MODULES`` carries the program's physical argument order.  This module owns
+``MODULES`` names the program's ``ARG_PLANS`` argument plan.  This module owns
 the public semantics only -- argument validation, route selection from the
 inputs, the host-side plan of the long-prefill route and the CUDA-graph
 workspace contract.  There are no environment switches.  The only shape-exact
@@ -61,6 +61,7 @@ import torch
 import tvm_ffi
 
 from ..jit.blackwell_msa import (
+    ARG_PLANS,
     MODULES,
     BlackwellMSATarget,
     load_blackwell_msa_module,
@@ -476,7 +477,9 @@ def _program(route: str, target: BlackwellMSATarget) -> _Program:
     name = route_program(route, target)
     record = MODULES[name]
     module = load_blackwell_msa_module(name, target)
-    plan = tuple((str(kind), str(argument)) for kind, argument in record["arg_plan"])
+    plan = tuple(
+        (str(kind), str(argument)) for kind, argument in ARG_PLANS[record["arg_plan"]]
+    )
     return _Program(name, getattr(module, record["ffi_entry"]), plan)
 
 
