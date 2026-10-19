@@ -6,7 +6,7 @@ from a cuDNN Frontend checkout, and the two scripts that compute its closure lis
 | file | what |
 |---|---|
 | `vendor.py` | reads every file of `closure.json` from the pinned commit (`git show <commit>:<path>`), rewrites the `cudnn` import roots to the vendored package, applies the declared patches P0-P3, writes the shim, `VENDOR.md` and `VENDOR_MANIFEST.json`; `--selftest` imports the result with the real `cudnn` package shadowed and declares the three serving forms |
-| `closure.json` | the closure list: every vendored file with its module, licence and the sha256 of its blob at the pinned commit (the exporter stops on a digest that moved) |
+| `closure.json` | the closure list: every vendored file with its module, licence and the sha256 of its blob at the pinned commit, plus the same digest pin for the file vendored from the FE test tree (`extra_files`); the exporter stops on any digest that moved |
 | `nanobind_enums.json` | the extension's enum tables and binder capability flags the shim spells; read live from a cuDNN Frontend install when one is importable, else from this copy |
 | `build_closure.py` | computes `closure.json` from the import traces plus a static module-level import check (the EXTRA / EXCLUDE policy is at its top) |
 | `trace_closure.py` | the import tracer: declares the forms on a host (and compiles + executes them on a cc 10.7 device) and records every module, data file and extension attribute the route touches |

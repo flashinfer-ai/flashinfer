@@ -21,6 +21,8 @@ read live when a cuDNN Frontend install is importable, else from the recorded co
 * Four declared PATCHES (P0-P3, listed in VENDOR.md): P0-P2, exact text, make the copy importable without the nanobind
   extension; P3, context-anchored regular expressions that name nothing themselves, rewords the comment / docstring lines that
   named internal hosts or internal file paths; everything else is byte-identical to the commit, SPDX headers included.
+* The one file vendored from OUTSIDE ``python/cudnn`` (``EXTRA_FILES``) is pinned by digest like every closure file: ``closure.json``
+  carries its blob's sha256 (``extra_files``, written by ``build_closure.py``) and the exporter stops when the blob moved.
 * The generated files (the package root, the shim ``_compiled_module.py``, ``VENDOR.md``, ``VENDOR_MANIFEST.json``) carry a
   FlashInfer-side Apache-2.0 header and name the origin + commit.
 * ``--selftest`` imports the vendored package in a SUBPROCESS with the real ``cudnn`` package shadowed
@@ -179,6 +181,9 @@ STRING_SITE_FILES = {
 # nanobind extension in cuDNN Frontend; its retired Python frame implementation lives in the FE test tree as a differential oracle
 # ("the retired Python frame implementations live solely in the differential tests", sdpa/fwd/prepared.py) and is vendored here,
 # byte-faithful (imports rewritten like every other file), as the frame logic the FlashInfer-side Python binder delegates to.
+# Pinned by digest like every closure file: closure.json's `extra_files` (build_closure.py's EXTRA_FILES) carries the blob's sha256
+# at the pinned commit, and the export STOPS when the blob moved -- the Python binder calls this file's private frame helpers
+# (bind_dense / bind_dense_split / bind_thd, resolve_thd_geometry, initialize_thd_stats), so a moved blob is re-checked against it.
 EXTRA_FILES = [
     (
         "test/python/sdpa/frost/sdpa_binding_reference.py",
@@ -580,7 +585,7 @@ def gen_vendor_md(
         f"Origin: {ORIGIN} (`python/cudnn`), commit `{commit}` (cuDNN Frontend {fe_version}).  Import path: `{package}`.\n",
         f"Files: {closure['n_files']} source files ({closure['total_bytes']:,} bytes, {closure['total_lines']:,} lines) copied from the commit's blobs "
         f"(`git show {commit}:<path>`; VENDOR_MANIFEST.json holds each file's source sha256 and the vendored file's sha256) and one file from the FE test tree "
-        f"(`sdpa/fwd/_binding_reference.py`, see Native seams), plus the generated "
+        f"(`sdpa/fwd/_binding_reference.py`, see Native seams; its blob digest is pinned in `closure.json` like the closure files'), plus the generated "
         f"`__init__.py`, `_compiled_module.py` (the shim) and these two notes.  Imports rewritten: {counts['rewritten_imports']} statements in {counts['files_with_rewrites']} files "
         f"(and {counts['string_sites']} importlib string references in `engines/manifest.py`).\n",
         "## License\n",
@@ -596,8 +601,9 @@ def gen_vendor_md(
         "```\n"
         "`closure.json` (the closure list: every file, its module, licence and the digest of its blob at the pinned commit) is produced by `build_closure.py` "
         "from the import traces of `trace_closure.py` (run on a host for the declarations and on a cc 10.7 device for compile + execute of each form); "
-        "a re-vendor at a new commit re-runs `vendor.py` alone when the route is unchanged (the exporter stops on any blob whose digest moved: recompute "
-        "the closure then), and re-runs the tracer + builder when the FE route changes (a new kernel file, a new lazily imported module).  "
+        "a re-vendor at a new commit re-runs `vendor.py` alone when the route is unchanged (the exporter stops on any blob whose digest moved -- the "
+        "FE test-tree file `sdpa/fwd/_binding_reference.py` included, pinned in `closure.json`'s `extra_files`: re-check the Python binder against it, then "
+        "recompute the closure), and re-runs the tracer + builder when the FE route changes (a new kernel file, a new lazily imported module).  "
         "The self-test must pass before the vendored tree is committed; the FlashInfer test `test_support.py` re-digests every file against "
         "`VENDOR_MANIFEST.json`.\n",
         "## Patches (exact text, applied once each; everything else is byte-identical to the commit)\n",
@@ -759,8 +765,19 @@ def main():
                 "bytes": len(new_text.encode()),
             }
         )
+    extra_pins = {e["path"]: e for e in closure.get("extra_files", [])}
     for src_path, rel, why in EXTRA_FILES:
+        pin = extra_pins.get(src_path)
+        if pin is None:
+            raise SystemExit(
+                f"{src_path}: closure.json carries no digest pin for this file (extra_files) -- re-run build_closure.py at this commit"
+            )
         blob = git_blob(fe, commit, src_path)
+        if hashlib.sha256(blob).hexdigest() != pin["sha256"]:
+            raise SystemExit(
+                f"{src_path}: the commit's blob differs from closure.json's digest -- the Python SDPA binder (_sdpa_binder.py) "
+                "builds on this file's private frame helpers: re-check it against the new blob, then recompute the closure at this commit"
+            )
         text = blob.decode("utf-8")
         lic = re.search(r"SPDX-License-Identifier:\s*([^\n]+)", text)
         new_text, n = rw.rewrite(text, rel)

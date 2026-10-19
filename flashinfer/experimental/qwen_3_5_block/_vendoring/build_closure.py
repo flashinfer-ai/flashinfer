@@ -99,6 +99,12 @@ EXTRA = {
 TEST_HELPERS = {
     "test/python/gated_attention_block/cutedsl/gated_block_reference.py": "the fp32 oracle (gated_attention_block_reference), build_rope_tables, make_inputs, RefGeometry: what a FlashInfer correctness test compares against (the quantized / backward refs inside import test-tree siblings lazily and are not used)",
 }
+# vendor.py's EXTRA_FILES -- files outside python/cudnn that ARE vendored (next to the closure): pinned here by the digest of their
+# blob at the commit, like every closure file, so a re-vendor at a commit where the blob moved STOPS (the exporter compares before it
+# copies).  The Python SDPA binder builds on this file's private frame helpers; a moved blob is re-checked against it first.
+EXTRA_FILES = {
+    "test/python/sdpa/frost/sdpa_binding_reference.py": "the retired Python frame implementation of the SDPA launch binder (bind_dense / bind_dense_split / bind_thd, the paged pools and tables, the split combine): the frame logic the FlashInfer-side Python binder delegates to, vendored as sdpa/fwd/_binding_reference.py",
+}
 GROUPS = [
     ("gated_attention_block", "gated_attention_block/"),
     ("sdpa.fwd.kernels", "sdpa/fwd/kernels/"),
@@ -301,10 +307,27 @@ for rel, why in TEST_HELPERS.items():
         }
     )
 
+# the files vendored from outside python/cudnn (vendor.py's EXTRA_FILES): the same digest pin as a closure file
+extras = []
+for rel, why in EXTRA_FILES.items():
+    p = FE / rel
+    t = p.read_bytes()
+    lic, cpr = spdx(p)
+    extras.append(
+        {
+            "path": rel,
+            "bytes": len(t),
+            "lines": t.count(b"\n"),
+            "sha256": hashlib.sha256(t).hexdigest(),
+            "license": lic,
+            "why": why,
+        }
+    )
+
 # git identity: every closure file must be identical to the commit's blob
 commit = args.commit
 git_mismatch = []
-for r in rows + helpers:
+for r in rows + helpers + extras:
     blob = subprocess.run(
         ["git", "-C", str(FE), "show", f"{commit}:{r['path']}"], capture_output=True
     ).stdout
@@ -336,6 +359,7 @@ result = {
     "templates_executed_by_path": [r["path"] for r in templates],
     "data_files": data_files,
     "test_helpers": helpers,
+    "extra_files": extras,
     "excluded": EXCLUDE,
     "holes_module_level": holes,
     "lazy_imports_outside_closure": lazy_out,
