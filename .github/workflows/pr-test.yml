@@ -358,6 +358,10 @@ jobs:
       # Empty for every lane except the experimental one. Quoted at the use site and
       # never interpolated into script text - it originates from the PR body.
       TEST_PATH_ARG: ${{ matrix.test_path }}
+      # GPU lanes route their JIT compiles through the AOT lanes' S3 sccache.
+      # On unless the repository variable FLASHINFER_GPU_TEST_SCCACHE is '0',
+      # which turns it off for A/B timing without a code change.
+      GPU_TEST_SCCACHE: ${{ matrix.kind != 'aot' && vars.FLASHINFER_GPU_TEST_SCCACHE != '0' && '1' || '0' }}
     steps:
       - name: Cleanup
         if: matrix.kind != 'h100'
@@ -427,40 +431,13 @@ jobs:
             -e SCCACHE_STATS_DIR /workspace/sccache-stats \
             --no-gpu "./scripts/${TEST_SCRIPT}"
 
-      - name: Display sccache stats
-        if: always() && matrix.kind == 'aot'
-        run: |
-          STATS_FILE="${GITHUB_WORKSPACE}/sccache-stats/sccache-stats.txt"
-          if [ -s "${STATS_FILE}" ]; then
-            cat "${STATS_FILE}"
-          else
-            echo "::warning::sccache stats were not produced"
-          fi
-
-      - name: Record sccache job metadata
-        if: always() && matrix.kind == 'aot'
-        run: |
-          mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
-          IMAGE_DIGESTS=$(docker image inspect --format '{{json .RepoDigests}}' "${DOCKER_IMAGE}" 2>/dev/null || printf 'unavailable')
-          {
-            printf 'git_commit=%s\n' "$(git rev-parse HEAD)"
-            printf 'docker_image=%s\n' "${DOCKER_IMAGE}"
-            printf 'docker_image_repo_digests=%s\n' "${IMAGE_DIGESTS}"
-            printf 'matrix_cuda=%s\n' "${MATRIX_CUDA}"
-            printf 'matrix_arch=%s\n' "${MATRIX_ARCH}"
-          } > "${GITHUB_WORKSPACE}/sccache-stats/job-metadata.txt"
-
-      - name: Upload sccache stats
-        if: always() && matrix.kind == 'aot'
-        uses: actions/upload-artifact@v4
-        with:
-          name: sccache-stats-${{ matrix.cuda }}-${{ matrix.runner[2] }}
-          path: sccache-stats/
-          if-no-files-found: warn
-          retention-days: 14
-
       - name: Run Test
         if: matrix.kind != 'aot'
+        env:
+          SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET }}
+          SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ env.GPU_TEST_SCCACHE == '1' && secrets.SCCACHE_AWS_ACCESS_KEY_ID || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.GPU_TEST_SCCACHE == '1' && secrets.SCCACHE_AWS_SECRET_ACCESS_KEY || '' }}
         run: |
           case "${TEST_SCRIPT}" in
             task_jit_run_tests_part[1-5].sh|task_jit_run_tests_t4.sh|task_run_unit_tests.sh) ;;
@@ -469,6 +446,21 @@ jobs:
               exit 1
               ;;
           esac
+          # ci/bash.sh options must precede the command. The credentials are
+          # forwarded by name so ci/bash.sh never echoes their values.
+          DOCKER_ARGS=()
+          LANE_COMMAND=("./scripts/${TEST_SCRIPT}")
+          if [ "${GPU_TEST_SCCACHE}" = "1" ]; then
+            mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
+            DOCKER_ARGS+=(
+              -e SCCACHE_BUCKET "${SCCACHE_BUCKET}"
+              -e SCCACHE_REGION "${SCCACHE_REGION}"
+              -e AWS_ACCESS_KEY_ID
+              -e AWS_SECRET_ACCESS_KEY
+              -e SCCACHE_STATS_DIR /workspace/sccache-stats
+            )
+            LANE_COMMAND=(./scripts/run_with_test_sccache.sh "${LANE_COMMAND[@]}")
+          fi
           TEST_RUNNER_ARGS=()
           if [ "${MATRIX_KIND}" = "h100" ]; then
             TEST_RUNNER_ARGS+=(--workers-per-gpu 2)
@@ -485,10 +477,45 @@ jobs:
             # to unit_test_runner.py, whose parser takes the scope as an option (or the
             # TEST_PATH env var, which ci/bash.sh does not forward into the container).
             # Bare paths fail argument-preflight with "unrecognized arguments".
-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}" --test-path "${TEST_TARGETS[@]}"
+            bash ci/bash.sh "${DOCKER_IMAGE}" "${DOCKER_ARGS[@]}" "${LANE_COMMAND[@]}" "${TEST_RUNNER_ARGS[@]}" --test-path "${TEST_TARGETS[@]}"
           else
-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}"
+            bash ci/bash.sh "${DOCKER_IMAGE}" "${DOCKER_ARGS[@]}" "${LANE_COMMAND[@]}" "${TEST_RUNNER_ARGS[@]}"
           fi
+
+      - name: Display sccache stats
+        if: always() && (matrix.kind == 'aot' || env.GPU_TEST_SCCACHE == '1')
+        run: |
+          STATS_FILE="${GITHUB_WORKSPACE}/sccache-stats/sccache-stats.txt"
+          if [ -s "${STATS_FILE}" ]; then
+            cat "${STATS_FILE}"
+          else
+            echo "::warning::sccache stats were not produced"
+          fi
+
+      - name: Record sccache job metadata
+        if: always() && (matrix.kind == 'aot' || env.GPU_TEST_SCCACHE == '1')
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
+          IMAGE_DIGESTS=$(docker image inspect --format '{{json .RepoDigests}}' "${DOCKER_IMAGE}" 2>/dev/null || printf 'unavailable')
+          {
+            printf 'git_commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'docker_image=%s\n' "${DOCKER_IMAGE}"
+            printf 'docker_image_repo_digests=%s\n' "${IMAGE_DIGESTS}"
+            printf 'matrix_cuda=%s\n' "${MATRIX_CUDA}"
+            printf 'matrix_arch=%s\n' "${MATRIX_ARCH}"
+            printf 'matrix_kind=%s\n' "${MATRIX_KIND}"
+            printf 'test_script=%s\n' "${TEST_SCRIPT}"
+          } > "${GITHUB_WORKSPACE}/sccache-stats/job-metadata.txt"
+
+      - name: Upload sccache stats
+        if: always() && (matrix.kind == 'aot' || env.GPU_TEST_SCCACHE == '1')
+        uses: actions/upload-artifact@v4
+        with:
+          # GPU lanes share a CUDA/runner pair, so they add the matrix index.
+          name: ${{ matrix.kind == 'aot' && format('sccache-stats-{0}-{1}', matrix.cuda, matrix.runner[2]) || format('sccache-stats-{0}-{1}-{2}', matrix.kind, matrix.cuda, strategy.job-index) }}
+          path: sccache-stats/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Make JUnit XML readable
         if: ${{ always() && (matrix.kind == 'h100' || startsWith(matrix.script, 'task_jit_run_tests_part')) }}

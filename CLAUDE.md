@@ -723,6 +723,15 @@ the whole build container, so diagnostics include compiler processes owned by
 the sccache daemon even though they are outside the wrapped process group. The
 CI `docker run --rm` boundary provides final cleanup for those processes.
 
+PR GPU test lanes run their test script through `scripts/run_with_test_sccache.sh`,
+which routes JIT compiles through the same S3 cache and prefix as the AOT lanes
+and uploads `sccache-stats-<kind>-<cuda>-<index>` artifacts. Set the repository
+variable `FLASHINFER_GPU_TEST_SCCACHE=0` to turn this off for A/B timing. If the
+sccache install fails, the wrapper runs the lane uncached. Compiles run in the
+sccache server, so a timed-out unit's process-group kill does not reach them, and
+per-unit memory telemetry excludes nvcc. Locally:
+`scripts/run_with_test_sccache.sh scripts/task_run_unit_tests.sh` (read-only without AWS credentials).
+
 ##### Cubin / Artifact Loader
 
 | Variable | Default | Read in | Effect |
