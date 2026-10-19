@@ -69,7 +69,8 @@ kind, and both paths hand the inner kernel the same `SplitKernelContext`:
 - **`MoEEpCommunication`** (`core/comm/communication.py`) is a self-contained
   dispatch/combine object: one long-lived instance per EP group owns its
   workspace, and per-step routing state lives in that workspace. The NVLink
-  backends implement it. `dispatch(hidden_states, topk_ids,
+  backends implement it, with the workspace in
+  [symmetric memory](./symmetric_memory.md). `dispatch(hidden_states, topk_ids,
   topk_weights, ...)` returns `ep_size * tokens_per_rank` receive rows with
   their GLOBAL top-k routing (rows without a token carry
   `MoEEpCommParams.invalid_expert_id`); the expert computation weights and
