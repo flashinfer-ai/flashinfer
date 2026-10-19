@@ -283,15 +283,15 @@ _EXACTONE_MODULES = {
 # varlen twin.
 _SM107_MODULES = {
     "exactfused_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_f13183e6a1",
-    "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_2d5cb59346",
+    "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_3ec1f033bd",
     "exactfused_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_4b3914f176",
-    "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_7fb91bb6f2",
+    "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_f87af2f796",
     "exactfused_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_1bc323f61f",
-    "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_8ed847c643",
+    "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_99ce5bde25",
     "exactfused_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_3dc3d34077",
-    "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_66b8bd4f9f",
+    "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_454ff3e943",
     "exactfused_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_beaa6c0634",
-    "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_cb5a7c4eff",
+    "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_cdc21d988b",
     "exactfused_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_1f7505eacf",
     "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_v3_bf16_batched_0dbe1ddb35",
     "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_v3_bf16_varlen_73e1fa1e8b",
@@ -300,11 +300,11 @@ _SM107_MODULES = {
     "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_v3_f32_batched_5394d76cd0",
     "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_v3_f32_varlen_4248999288",
     "exactpre_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_cb5e8e04f4",
-    "exactpre_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_7477f7179b",
+    "exactpre_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_5d4025970d",
     "exactpre_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_c2308748ef",
-    "exactpre_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_8d7007b9c3",
+    "exactpre_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_f4339285aa",
     "exactpre_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_88a1af468a",
-    "exactpre_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_bd9b159b8f",
+    "exactpre_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_15d09ba066",
     "exactpre_bf16_batched_tail": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_tail_79a1e86066",
     "exactpre_bf16_varlen_tail": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_f2b8226a51",
     "exactpre_f16_batched_tail": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_tail_80dd0f122a",
@@ -317,16 +317,16 @@ _SM107_MODULES = {
     "chunkpar3_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_c710487fff",
     "chunkpar3_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_796c446558",
     "chunkpar3_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_95d4c416ce",
-    "exactmeta_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_2d5cb59346",
-    "exactmeta_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_7fb91bb6f2",
-    "exactmeta_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_8ed847c643",
-    "exactmeta_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_66b8bd4f9f",
-    "exactmeta_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_cb5a7c4eff",
-    "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_a536b8b6e8",
-    "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_d6103de117",
-    "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_539c003e6b",
-    "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_b68ce1e618",
-    "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_f2717ae6c0",
+    "exactmeta_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_3ec1f033bd",
+    "exactmeta_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_f87af2f796",
+    "exactmeta_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_99ce5bde25",
+    "exactmeta_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_454ff3e943",
+    "exactmeta_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_cdc21d988b",
+    "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_f26cd16aaa",
+    "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_2bed7dea98",
+    "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_fca6c53f6c",
+    "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_052f7ae9d4",
+    "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_5a1d1b451b",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
@@ -969,6 +969,20 @@ _CHUNK_PARALLEL_SMALL_ITEMS = 32
 _CHUNK_PARALLEL_LARGE_ITEMS = 128
 _CHUNK_PARALLEL_SELECTION_MARGIN = 1.05
 _CHUNK_PARALLEL_WORKSPACE_CAP_BYTES = 256 << 20
+# Per-capability cap: sm_107a admits 8192-tile calls (384 MiB) -- 1 sequence x
+# 1024 chunks or 4 x 256 chunks at 8 heads -- which the exact scan serves 2-7x
+# slower; the workspace is grow-only per device, so the cap bounds that growth.
+_CHUNK_PARALLEL_WORKSPACE_CAP_BYTES_BY_CAPABILITY = {(10, 7): 512 << 20}
+
+
+def chunk_parallel_workspace_cap_bytes(capability) -> int:
+    """Workspace cap of the chunk-parallel regime for ``capability``."""
+
+    return _CHUNK_PARALLEL_WORKSPACE_CAP_BYTES_BY_CAPABILITY.get(
+        (int(capability[0]), int(capability[1])), _CHUNK_PARALLEL_WORKSPACE_CAP_BYTES
+    )
+
+
 # Third cost arm: the three-phase program's own
 # calibrated constants (``CHUNK_PARALLEL_COST_MODEL_US`` of the Cake seed
 # module flashinfer_blackwell_mamba_ssd_combined_chunk_parallel_seed_v1, round
@@ -1380,7 +1394,8 @@ def chunk_parallel_family(
     predicted = quantities["predicted_us"]
     chunk_parallel = (
         quantities["work_items"] < quantities["sm_count"]
-        and quantities["workspace_bytes"] <= _CHUNK_PARALLEL_WORKSPACE_CAP_BYTES
+        and quantities["workspace_bytes"]
+        <= chunk_parallel_workspace_cap_bytes(capability)
         and min(predicted["chunk_parallel"], predicted["three_phase"])
         * _CHUNK_PARALLEL_SELECTION_MARGIN
         <= predicted["exact_scan"]
@@ -1547,28 +1562,125 @@ def two_kernel_family(*, mode_varlen: bool, num_sequences: int, seqlen: int) -> 
 _TAIL_MIN_CHUNKS = 16
 
 
+@dataclass(frozen=True)
+class _TailFullGridRule:
+    """Admission of a two-kernel call whose balanced persistent grid is the
+    full device (``_persistent_grid_size`` returned ``sm_count``: on 212 SMs
+    every item count above 212 except multiples the balancing rule accepts,
+    e.g. 256, 512, 640) to the ``_tail`` pair program.  The persistent program
+    then runs ``ceil(items / sm_count)`` item waves, the last one ragged; the
+    pair program runs ``ceil(items / pairs) / 2`` half-item rounds and saves
+    the difference.  Measured on R200 (CAKE-2549 round 9, lease 799171: the
+    item ladder 128..256 and the (items x chunks x form) grid, main-kernel
+    medians, cold L2): the pair render costs more per item than the ring
+    render -- ``render_penalty`` is that measured ratio minus one (batched
+    ~1.5-5 us per launch, up to 1/12 of an item at 16 chunks; varlen 4-11 us
+    per item, up to 1/5) -- and the split item of an odd pair hands its scan
+    state over at the cost of about one chunk step.  The route is taken only
+    where the saved waves exceed both: 256 items (2 waves vs 1.5 rounds) win
+    on every form (1.04-1.26x), 512 and 640 items win on the batched form
+    only (1.06-1.13x; the varlen pair render loses 0.90-0.99x there), and
+    equal makespans (384, 768, 1024, 2048 items) lose by the overhead.  The
+    varlen chunk floor is 8: 256-item varlen calls of 8 chunks win 1.03-1.08x
+    (perf_varlen_32x8, nem_v1024x2) and no varlen call above one item per SM
+    with 8 chunks lies inside the fused window; the batched floor stays 16
+    (an 8-chunk batched call up to 256 items is a fused-window call)."""
+
+    min_chunks_batched: int
+    min_chunks_varlen: int
+    render_penalty_batched: float
+    render_penalty_varlen: float
+
+    def min_chunks(self, mode_varlen: bool) -> int:
+        return self.min_chunks_varlen if mode_varlen else self.min_chunks_batched
+
+    def render_penalty(self, mode_varlen: bool) -> float:
+        return (
+            self.render_penalty_varlen if mode_varlen else self.render_penalty_batched
+        )
+
+
+# sm_107a (R200, 212 SMs) only; the Blackwell rule keeps the balanced-grid
+# condition (no entry: a full grid never takes the pair program).
+_TAIL_FULL_GRID_RULES: dict[tuple[int, int], _TailFullGridRule] = {
+    (10, 7): _TailFullGridRule(
+        min_chunks_batched=16,
+        min_chunks_varlen=8,
+        render_penalty_batched=1 / 12,
+        render_penalty_varlen=1 / 5,
+    ),
+}
+
+
+def tail_full_grid_rule(capability) -> Optional[_TailFullGridRule]:
+    """The full-grid admission rule of ``capability`` (``None``: none)."""
+
+    return _TAIL_FULL_GRID_RULES.get((int(capability[0]), int(capability[1])))
+
+
+def _full_grid_tail_selected(
+    *,
+    rule: _TailFullGridRule,
+    total_work: int,
+    chunks_per_item: int,
+    sm_count: int,
+    mode_varlen: bool,
+) -> bool:
+    """:class:`_TailFullGridRule` on a call whose balanced grid is the full
+    device: the pair makespan (half-item rounds) grown by the measured render
+    penalty, plus one chunk step of hand-off when the pair with the most items
+    splits one, must stay below the persistent program's item waves."""
+
+    if chunks_per_item < rule.min_chunks(mode_varlen):
+        return False
+    pairs = sm_count // 2
+    pair_rounds = -(-total_work // pairs)
+    persistent_makespan = -(-total_work // sm_count)
+    pair_makespan = pair_rounds / 2
+    hand_off = (pair_rounds % 2) / chunks_per_item
+    return (
+        pair_makespan * (1.0 + rule.render_penalty(mode_varlen)) + hand_off
+        < persistent_makespan
+    )
+
+
 def _tail_grid_size(*, sm_count: int) -> int:
     """Grid of a ``_tail`` program: one 2-CTA cluster per SM pair."""
 
     return 2 * (sm_count // 2)
 
 
-def tail_selected(*, total_work: int, chunks_per_item: int, sm_count: int) -> bool:
+def tail_selected(
+    *,
+    total_work: int,
+    chunks_per_item: int,
+    sm_count: int,
+    mode_varlen: bool = False,
+    full_grid_rule: Optional[_TailFullGridRule] = None,
+) -> bool:
     """Whether a two-kernel exact-scan call of ``total_work`` (sequence, head)
     items with ``chunks_per_item`` host-known chunks per item
     (:func:`host_chunks_per_item`) runs the ``_tail`` pair program on a device
     of ``sm_count`` SMs: a tail wave exists (the balanced persistent grid is
     below one CTA per SM), the chunk floor is met and ``ceil(items / pairs) /
     2`` (half items count) is below the persistent program's ``ceil(items /
-    grid)``."""
+    grid)``.  A call whose balanced grid is the full device takes the pair
+    program only under ``full_grid_rule`` (:class:`_TailFullGridRule`, the
+    sm_107a admission; ``None`` -- the Blackwell default -- never)."""
 
     pairs = sm_count // 2
     if pairs < 1 or total_work <= sm_count:
         return False
-    if chunks_per_item < _TAIL_MIN_CHUNKS:
-        return False
     balanced_grid = _persistent_grid_size(total_work=total_work, sm_count=sm_count)
     if balanced_grid >= sm_count:
+        return full_grid_rule is not None and _full_grid_tail_selected(
+            rule=full_grid_rule,
+            total_work=total_work,
+            chunks_per_item=chunks_per_item,
+            sm_count=sm_count,
+            mode_varlen=mode_varlen,
+        )
+    if chunks_per_item < _TAIL_MIN_CHUNKS:
         return False
     persistent_makespan = -(-total_work // balanced_grid)
     pair_makespan = -(-total_work // pairs) / 2
@@ -2373,6 +2485,8 @@ class CakeSSDCombined:
                     seqlen=batch * seqlen if self.has_varlen else seqlen,
                 ),
                 sm_count=sm_count,
+                mode_varlen=self.has_varlen,
+                full_grid_rule=tail_full_grid_rule(capability),
             )
         )
         variant = (
