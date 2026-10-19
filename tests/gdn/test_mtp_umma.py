@@ -34,6 +34,7 @@ Run:  pytest tests/gdn/test_mtp_umma.py -q
 from __future__ import annotations
 
 import functools
+import importlib
 import importlib.util
 import math
 import os
@@ -72,12 +73,20 @@ def _skip_if_no_cvt_rs():
         pytest.skip("stochastic rounding needs cvt.rs (sm_100a / sm_103a / sm_107a)")
 
 
-def _umma():
-    from flashinfer.gdn_kernels.gdn_replay_mtp_umma import (
-        gated_delta_rule_mtp_ucache_flush_umma,
-    )
+# The kernel module and public entry under test. tests/gdn/test_mtp_umma_rubin.py re-runs
+# every test of this file against the Rubin build by swapping this pair.
+_ENTRY = (
+    "flashinfer.gdn_kernels.gdn_replay_mtp_umma",
+    "gated_delta_rule_mtp_ucache_flush_umma",
+)
 
-    return gated_delta_rule_mtp_ucache_flush_umma
+
+def _kmod():
+    return importlib.import_module(_ENTRY[0])
+
+
+def _umma():
+    return getattr(_kmod(), _ENTRY[1])
 
 
 _FI = {}
@@ -248,9 +257,7 @@ def _check_case(
     pool0, kc0, uc0, gc0 = pool.clone(), kc.clone(), uc.clone(), gc.clone()
     ro = None
     if row_order == "flush_first":
-        from flashinfer.gdn_kernels.gdn_replay_mtp_umma import flush_first_row_order
-
-        ro = flush_first_row_order(hl, flush_min)
+        ro = _kmod().flush_first_row_order(hl, flush_min)
     elif row_order == "reverse":
         ro = torch.arange(B - 1, -1, -1, dtype=torch.int32, device=DEV)
     y = _run(fn, case, flush_min, ro)
@@ -376,8 +383,7 @@ def test_head_slices_bit_identical(hv, hpc):
 
 
 def test_auto_heads_per_cta_policy():
-    from flashinfer.gdn_kernels.gdn_replay_mtp_umma import auto_heads_per_cta
-
+    auto_heads_per_cta = _kmod().auto_heads_per_cta
     nsm = 148
     assert [auto_heads_per_cta(b, 16, nsm, 4) for b in (1, 9, 10, 148, 149)] == [
         1,
@@ -681,6 +687,15 @@ def _sr_call(case, fm, **kw):
     return y, pool, (kc, uc, gc)
 
 
+def _sr_contradictions(noise, up, down, rn_even):
+    """Rounding directions the 13-bit noise contradicts. cvt.rs rounds up iff frac + noise
+    >= 8192 (frac = the 13 dropped mantissa bits), so up where RN went down needs noise >=
+    4096 -- equal only at an exact tie (frac == 4096), which RN broke down to an even
+    mantissa -- and down where RN went up needs noise < 4096."""
+    tie = (noise == 4096) & rn_even
+    return int((up & (noise <= 4096) & ~tie).sum() + (down & (noise >= 4096)).sum())
+
+
 @pytest.mark.parametrize("T", [1, 4, 8])
 @pytest.mark.parametrize("mode", ["philox10", "philox5", "lcg"])
 @pytest.mark.parametrize("hpc", [1, 2, 4])
@@ -688,10 +703,11 @@ def test_stochastic_rounding_matches_reference_bits(T, mode, hpc):
     """SR only changes how the flushed fp16 state is rounded: outputs and rings are
     bit-identical to round-to-nearest, verify rows keep their state, every flushed element
     is RN or its neighbour, and each rounding direction agrees with the reference noise
-    bits (rounding up where RN went down needs noise > 4096 of 8192; down where RN went up
-    needs noise < 4096). Noise from a different seed must violate that, which proves the
-    check can fail. hpc 1 and 4 cover both RMW group sizes (16 / 32 TMEM columns); hpc 2 at
-    T = 8 the 256-thread register-split builds of Philox-5 and LCG."""
+    bits (rounding up where RN went down needs noise >= 4096 of 8192, = 4096 only at an
+    exact tie RN broke down to even; down where RN went up needs noise < 4096). Noise from
+    a different seed must violate that, which proves the check can fail. hpc 1 and 4 cover
+    both RMW group sizes (16 / 32 TMEM columns); hpc 2 at T = 8 the 256-thread
+    register-split builds of Philox-5 and LCG."""
     _skip_if_no_cvt_rs()
     case, hist, fm = _sr_case(T, seed=70 + T)
     seed = 0x1234_5678_9ABC_DEF1 + T
@@ -735,8 +751,9 @@ def test_stochastic_rounding_matches_reference_bits(T, mode, hpc):
         ctl = noise_of(seed + 1, r)
         up, down = normal & (step == 1), normal & (step == -1)
         n_diff += int(up.sum() + down.sum())
-        n_bad += int(((noise <= 4096) & up).sum() + ((noise >= 4096) & down).sum())
-        n_bad_ctl += int(((ctl <= 4096) & up).sum() + ((ctl >= 4096) & down).sum())
+        even = (mag_rn & 1) == 0
+        n_bad += _sr_contradictions(noise, up, down, even)
+        n_bad_ctl += _sr_contradictions(ctl, up, down, even)
     total = sum(HV * V * K for hist_r in hist if hist_r >= fm)
     assert abs(n_diff / total - 0.25) < 0.05, n_diff / total  # E[min(f, 1 - f)] = 1/4
     assert n_bad == 0, (

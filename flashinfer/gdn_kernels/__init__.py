@@ -20,6 +20,8 @@ Exported Kernels:
   read-only state; legacy 16-deep flat ring)
 - gated_delta_rule_mtp_ucache_flush: fused verify+flush ucache kernel (32-slot
   rotating ring; folds the window into the checkpoint state)
+- gated_delta_rule_mtp_ucache_flush_umma_rubin: Rubin (sm_107a) build of the UMMA
+  backend of the flush kernel (also sm_100a), with an opt-in persistent kernel
 """
 
 try:
@@ -76,6 +78,15 @@ except (ImportError, RuntimeError):
     gated_delta_rule_mtp_ucache_flush_umma = None  # type: ignore
     flush_first_row_order = None  # type: ignore
 
+# Rubin (sm_107a) build of the UMMA kernel: same contract and results, Rubin tunings and an
+# opt-in persistent kernel for die-localized launches (also runs on sm_100a); called directly.
+try:
+    from .gdn_replay_mtp_umma_rubin import (
+        gated_delta_rule_mtp_ucache_flush_umma_rubin,
+    )
+except (ImportError, RuntimeError):
+    gated_delta_rule_mtp_ucache_flush_umma_rubin = None  # type: ignore
+
 try:
     from .gdn_decode_pretranspose import run_pretranspose_decode
 except (ImportError, RuntimeError):
@@ -129,6 +140,7 @@ __all__ = [
     "gated_delta_rule_mtp_ucache",
     "gated_delta_rule_mtp_ucache_flush",
     "gated_delta_rule_mtp_ucache_flush_umma",
+    "gated_delta_rule_mtp_ucache_flush_umma_rubin",
     "flush_first_row_order",
     "gated_delta_rule_mtp_wy_output_only",
     "gated_delta_rule_bf16state_cooprow",
