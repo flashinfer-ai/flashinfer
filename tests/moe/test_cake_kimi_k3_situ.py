@@ -80,6 +80,11 @@ LARGE_Q8I_ARCHES = ("sm_100a", "sm_103a")
 # production routing kernels (256 pairs per CTA).
 LARGE_P1024_ARCHES = ("sm_100a",)
 LARGE_P1024_TOKENS = (16384,)
+# ... and the seven-stage route (quantization fused with the routing-table reset,
+# 512 routed pairs per CTA; the "large_q8i_p512fh2qr" selector) -- the 8192-token
+# row of sm_100a.
+LARGE_P512FH2QR_ARCHES = ("sm_100a",)
+LARGE_P512FH2QR_TOKENS = (8192,)
 # Architectures whose 4096-token route stores the FC2 result as the same 8-bit
 # per-tile partial behind the work5fd FC1; the 2048-token route keeps the BF16
 # expert output everywhere.
@@ -112,6 +117,8 @@ GENERIC_STAGES = [
     "fc2",
     "finalize",
 ]
+# The seven-stage large route: quantization + routing-table reset fused in one launch.
+QR_GENERIC_STAGES = ["quant_reset"] + GENERIC_STAGES[2:]
 STAGES_BY_SELECTOR = {
     "m1": ["quant_route", "fc1", "fc2", "finalize"],
     "m1_s2a": ["fc1", "fc2", "finalize"],
@@ -124,6 +131,7 @@ STAGES_BY_SELECTOR = {
     "large_c7": GENERIC_STAGES[:5] + ["sfb_shuffle"] + GENERIC_STAGES[5:],
     "large_q8i": GENERIC_STAGES,
     "large_q8i_p1024": GENERIC_STAGES,
+    "large_q8i_p512fh2qr": QR_GENERIC_STAGES,
 }
 
 
@@ -140,6 +148,8 @@ def _tile_bucket(num_tokens):
 def _expected_selector(arch, num_tokens):
     if num_tokens == 1 and arch in FUSED_M1_ARCHES:
         return "m1_s2a"
+    if num_tokens in LARGE_P512FH2QR_TOKENS and arch in LARGE_P512FH2QR_ARCHES:
+        return "large_q8i_p512fh2qr"
     if num_tokens in LARGE_P1024_TOKENS and arch in LARGE_P1024_ARCHES:
         return "large_q8i_p1024"
     if num_tokens in LARGE_TOKENS and arch in LARGE_Q8I_ARCHES:
@@ -712,6 +722,29 @@ def test_cake_situ_every_route_eager_and_external_graph(
                 1,
             )
             assert bindings[stage]["total_pairs"] == prepared["total_pairs"]
+    if prepared["selector"] == "large_q8i_p512fh2qr":
+        # Seven launches: the quantization and the routing-table reset share one
+        # launch (blocks below num_tokens quantize, the trailing blocks reset), the
+        # routing histogram and scatter handle 512 routed pairs per CTA.
+        bindings = _cake_situ_stage_bindings(
+            _options(x, ids, route_weights, output, weights, workspace), prepared
+        )
+        assert list(bindings) == QR_GENERIC_STAGES
+        reset_items = max(EXPERTS, prepared["max_tiles"] * 128 + 1)
+        assert bindings["quant_reset"]["grid"] == (
+            num_tokens + (reset_items + 255) // 256,
+            1,
+            1,
+        )
+        assert bindings["quant_reset"]["M"] == num_tokens
+        assert bindings["quant_reset"]["max_tiles"] == prepared["max_tiles"]
+        for stage in ("route_histogram", "route_scatter"):
+            assert bindings[stage]["grid"] == (
+                (prepared["total_pairs"] + 511) // 512,
+                1,
+                1,
+            )
+            assert bindings[stage]["total_pairs"] == prepared["total_pairs"]
     if num_tokens == 1:
         # The single-token route quantizes and routes inside the FC1 prologue on
         # the fused architectures (three launches; the FC1 binding carries the
@@ -737,7 +770,12 @@ def test_cake_situ_every_route_eager_and_external_graph(
             )
         else:
             assert bindings["quant_route"]["x"] is x
-    if prepared["selector"] in ("large_q8i", "large_q8i_p1024", "mid_q8i"):
+    if prepared["selector"] in (
+        "large_q8i",
+        "large_q8i_p1024",
+        "large_q8i_p512fh2qr",
+        "mid_q8i",
+    ):
         # The FC2 stage stores an 8-bit per-tile partial and its per-tile FP32
         # scales inside the BF16 expert-output scratch, and the finalize reads
         # the same two views: no pre-shuffled scale-factor images are bound.
@@ -797,7 +835,12 @@ def test_cake_situ_every_route_eager_and_external_graph(
     default_parameters_output = output.clone()
     output.fill_(float("nan"))
     assert submit(explicit_parameters=True) is output
-    if prepared["selector"] in ("large_q8i", "large_q8i_p1024", "mid_q8i"):
+    if prepared["selector"] in (
+        "large_q8i",
+        "large_q8i_p1024",
+        "large_q8i_p512fh2qr",
+        "mid_q8i",
+    ):
         # The 8-bit FC2 partial of this route carries one FP32 scale per
         # 128x128 tile, and the atomic-counter routing assigns rows to tiles
         # in a call-dependent order, so the tile membership (hence each
@@ -1002,4 +1045,123 @@ def test_cake_situ_per_cta_privatized_routing_matches_the_production_routing(
     torch.testing.assert_close(output, expected, atol=1.0, rtol=0.1)
     # Recorded, not asserted: the two routings' outputs differ bitwise.
     recorded = (output.float() - privatized_output.float()).abs().max().item()
+    print(f"largest absolute difference between the two routings' outputs: {recorded}")
+
+
+@pytest.mark.parametrize(
+    "num_tokens, routing",
+    [(8192, "uniform"), (8192, "skewed")],
+    ids=["m8192_uniform", "m8192_skewed"],
+)
+def test_cake_situ_fused_quant_reset_routing_matches_the_production_routing(
+    num_tokens,
+    routing,
+    cake_situ_device,
+    cake_situ_weights,
+    cake_situ_workspace,
+):
+    # The sm_100a 8192-token route runs seven launches: the quantization fused
+    # with the routing-table reset, then the routing histogram and scatter
+    # kernels that privatize the expert histogram in per-CTA shared memory
+    # (first-toucher flush) and reserve a block of rows per CTA (512 routed
+    # pairs per CTA). Their routing tables, quantized activations, the FC1
+    # scratch of every routed pair and the complete call are compared, in pair
+    # order, with the production route (route_reset, quant, histogram, scatter;
+    # 256 pairs per CTA) run on the same workspace, inputs and stage bindings:
+    # expert counts, tile tables, quantized activations and the per-pair expert,
+    # row set, route map and FC1 output must be bitwise identical, and each
+    # call's output must match the reference within the published tolerance.
+    # The two outputs are not compared with each other (the INT8 per-tile FC2
+    # partial's accumulation order depends on tile membership); their largest
+    # absolute difference is recorded.
+    device, weights, workspace = (
+        cake_situ_device,
+        cake_situ_weights,
+        cake_situ_workspace,
+    )
+    arch = _arch(device)
+    if _expected_selector(arch, num_tokens) != "large_q8i_p512fh2qr":
+        pytest.skip(
+            f"{arch} routes {num_tokens} tokens to {_expected_selector(arch, num_tokens)}; "
+            "the fused quant_reset routing programs are not delivered for it"
+        )
+    x, ids, route_weights, output, options = _submit_prepared(
+        num_tokens, routing, device, weights, workspace
+    )
+    prepared = _prepared(workspace, num_tokens)
+    assert prepared["selector"] == "large_q8i_p512fh2qr"
+    assert prepared["stages"] == QR_GENERIC_STAGES
+    production = {
+        stage: cake_situ_program(arch, stage)
+        for stage in ("route_reset", "quant", "route_histogram", "route_scatter")
+    }
+    for stage, key in (
+        ("route_histogram", "route_histogram:n128_p512f"),
+        ("route_scatter", "route_scatter:n128_p512fh2"),
+    ):
+        assert prepared["modules"][stage] == cake_situ_program(arch, key)
+        assert prepared["modules"][stage] != production[stage]
+        assert (
+            MODULES[prepared["modules"][stage]]["arg_plan"]
+            == MODULES[production[stage]]["arg_plan"]
+        )
+    assert prepared["modules"]["quant_reset"] == cake_situ_program(
+        arch, "quant_reset:n128_p512fh2qr"
+    )
+    bindings = _cake_situ_stage_bindings(options, prepared)
+    total_pairs = prepared["total_pairs"]
+    assert total_pairs == num_tokens * TOP_K
+    for stage in ("route_histogram", "route_scatter"):
+        assert bindings[stage]["grid"] == ((total_pairs + 511) // 512, 1, 1)
+        assert bindings[stage]["total_pairs"] == total_pairs
+    expected = _trtllm_reference(x, ids, route_weights, weights)
+    torch.testing.assert_close(output, expected, atol=1.0, rtol=0.1)
+
+    views = _cake_situ_workspace_views(workspace, num_tokens)
+    max_tiles = prepared["max_tiles"]
+    fused = _routing_in_pair_order(views, ids, max_tiles)
+    fused.update(x_packed=views["x_packed"].clone(), x_scales=views["x_scales"].clone())
+    fused_output = output.clone()
+    assert 0 < fused["total_tiles"] <= max_tiles
+    for name in ("intermediate_packed", "intermediate_scales", "x_packed", "x_scales"):
+        views[name].zero_()
+    views["token_to_permuted"].fill_(-1)
+    views["expert_output"].fill_(float("nan"))
+    output.fill_(float("nan"))
+
+    # The same call with the production route: the separate reset and
+    # quantization launches take the values the host bound for the fused
+    # launch (the fused program's argument list is their union), the histogram
+    # and scatter run as the production programs on their 256-pairs-per-CTA grid.
+    quant_reset = bindings["quant_reset"]
+    reset_items = max(EXPERTS, max_tiles * 128 + 1)
+    _launch(
+        production["route_reset"],
+        arch,
+        {**quant_reset, "grid": ((reset_items + 255) // 256, 1, 1)},
+    )
+    _launch(production["quant"], arch, {**quant_reset, "grid": (num_tokens, 1, 1)})
+    production_grid = ((total_pairs + 255) // 256, 1, 1)
+    for stage in prepared["stages"]:
+        if stage == "quant_reset":
+            continue
+        if stage in production:
+            _launch(
+                production[stage], arch, {**bindings[stage], "grid": production_grid}
+            )
+        else:
+            _launch(prepared["modules"][stage], arch, bindings[stage])
+    torch.cuda.synchronize(device)
+    reference = _routing_in_pair_order(views, ids, max_tiles)
+    reference.update(
+        x_packed=views["x_packed"].clone(), x_scales=views["x_scales"].clone()
+    )
+    for name, value in fused.items():
+        if isinstance(value, torch.Tensor):
+            assert torch.equal(reference[name], value), name
+        else:
+            assert reference[name] == value, name
+    torch.testing.assert_close(output, expected, atol=1.0, rtol=0.1)
+    # Recorded, not asserted: the two routings' outputs differ bitwise.
+    recorded = (output.float() - fused_output.float()).abs().max().item()
     print(f"largest absolute difference between the two routings' outputs: {recorded}")
