@@ -65,9 +65,11 @@ The six existing GenPhase names are also lazily re-exported by
 
 Supported: native SM100/SM103, MXFP8 E4M3, SwiGLU, BF16 combine with separate
 reduction, grouped N128/CGA4 or N64/CGA2/CGA4, early/late top-k weights and
-capacity at most 1024 per rank. N128/CGA4 remains the default; N64 requires an
-explicit tile/cluster selection. Blackwell's default backend heuristics do not
-select this path. NVFP4, dynamic N and in-kernel reduction are outside this port.
+capacity at most 1024 per rank. The low-level config retains N128/CGA4 defaults.
+The explicit GenPhase backend resolves performance knobs from an exact workload
+cache or geometry estimate and supports collective warmup tuning. Blackwell's
+default backend selection does not select this path. NVFP4, dynamic N and
+in-kernel reduction are outside this port.
 
 Native correctness is covered in the existing Blackwell workspace, oracle and
 multirank graph test files; no new test file is required. Host construction

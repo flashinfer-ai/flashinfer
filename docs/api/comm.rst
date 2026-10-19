@@ -570,6 +570,18 @@ the current receive slot (``layout="bshd"``: ``(q, k, v)`` each
 ``[B, S_global, H_local, 3 * D]`` payload) and stay valid until the slot is
 reused ``num_slots`` calls later; pass ``out=`` for an owned copy.
 
+Per call the Cake backend launches, by default on every architecture, the
+producer build with the folded cross-rank rendezvous (a rendezvous warp of
+CTA 0 runs the NVLink barrier of the call's phase and releases the stores
+through a rank-local arrive flag: one extra warp per CTA on SM100 / SM103, the
+idle TMA warp on SM90) on the caller's stream and the wait kernel on the
+consumer stream: two launches.  ``fold_barrier=False`` (or the environment
+variable ``FLASHINFER_QKV_EXCHANGE_FOLD_BARRIER=0``) selects the three-launch
+path instead: the barrier kernel, the plain producer and the wait kernel; both
+paths are delivered on every architecture.  Both paths store identical bits;
+``describe()`` reports the resolved path (``fold_barrier``) and its launch
+count (``launches_per_call``).
+
 The session is prepared eagerly (symmetric slots, readiness pad, barrier
 flags, JIT programs, the tile plan of ``max_tokens`` rows) and a prepared call
 is CUDA-graph capturable: a captured call allocates nothing, runs no

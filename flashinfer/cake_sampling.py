@@ -378,7 +378,8 @@ def _fused_block_tail_kcap() -> int:
 @functools.cache
 def _stage1_has_fused_block_tail(cluster: int, ept: int, stream: bool) -> bool:
     """Whether the frozen variant ships a whole-CTA-tail build (a manifest entry with ``fused_block_tail``): the
-    kernel taken by launch_flags bit 3.  The default build of every variant carries only the two-warp tail --
+    kernel taken by launch_flags bit 3, built for the cluster-8 streams the host can fuse it into
+    (``_fuse_block_tail``).  The default build of every variant carries only the two-warp tail --
     compiling the whole-CTA tail into it slowed every k <= 64 launch on sm_103a / sm_107a by 13-33 %."""
     found = False
     for v in load_manifest()["stage1"]:
@@ -643,8 +644,9 @@ def _coarse_sample_flag(cluster: int, ept: int, stream: bool, top_k_max: int) ->
 @functools.cache
 def _stage1_has_spec_sample(cluster: int, ept: int, stream: bool) -> bool:
     """Whether the frozen variant ships a speculative-sample build (a manifest entry with ``spec_sample``): the kernel
-    taken by launch_flags bit 6, whose first register chunk doubles as the sample (every streaming variant; residents
-    take no sample).  The exact passes are the same and every output is bit-identical."""
+    taken by launch_flags bit 6, whose first register chunk doubles as the sample (every streaming variant whose
+    launches can take the plain build: not the (8, 16) stream, whose speculative launches all take the leader-push
+    form; residents take no sample).  The exact passes are the same and every output is bit-identical."""
     found = False
     for v in load_manifest()["stage1"]:
         if (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, stream):

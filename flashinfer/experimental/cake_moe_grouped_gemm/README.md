@@ -147,7 +147,7 @@ performance summary is in the delivery pull requests.
 ## Tests and benchmark
 
 ```bash
-pytest tests/experimental/test_cake_moe_grouped_gemm.py
+pytest tests/experimental/test_cake_moe_grouped_gemm.py tests/experimental/test_cake_moe_grouped_gemm_api.py
 python benchmarks/bench_cake_moe_grouped_gemm.py --help
 ```
 
