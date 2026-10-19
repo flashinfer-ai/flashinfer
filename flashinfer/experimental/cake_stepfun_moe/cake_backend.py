@@ -548,6 +548,13 @@ def _tensor(
     return value
 
 
+def _work_counter_dummy(device: torch.device) -> torch.Tensor:
+    """The one-element ``int32`` the host binds to a unit's unreferenced ``work_counter``
+    parameter (the exporter asserts that no delivered kernel reads it): uninitialised on
+    purpose, so that binding it launches no fill kernel."""
+    return torch.empty((1,), dtype=torch.int32, device=device)
+
+
 def _optional(name: str, value: Any, required: bool, context: str) -> None:
     if required and value is None:
         raise ValueError(f"{context} requires {name}")
@@ -1658,7 +1665,10 @@ def prepare_stepfun_moe(
         )
         buffers["gemm1_output_scale"] = gemm1_output_scale
     if "work_counter" in fc1_keys or "work_counter" in fc2_keys:
-        buffers["work_counter"] = torch.zeros((1,), dtype=torch.int32, device=device)
+        # A one-element dummy: the units that declare ``work_counter`` never read it (the
+        # exporter asserts that), and a ``zeros`` here would put a fill kernel into every
+        # forward (and into every captured graph).
+        buffers["work_counter"] = _work_counter_dummy(device)
     buffers["gemm2_output"] = torch.empty(
         (g.max_padded, H), dtype=torch.bfloat16, device=device
     )
@@ -1987,9 +1997,7 @@ def prepare_fc1(
         tables, device=device, max_ctas=g.max_ctas, max_padded=g.max_padded
     )
     work_counter = (
-        torch.zeros((1,), dtype=torch.int32, device=device)
-        if "work_counter" in _arg_keys(program)
-        else None
+        _work_counter_dummy(device) if "work_counter" in _arg_keys(program) else None
     )
     operands = dict(
         hidden_states=hidden_states,
@@ -2146,9 +2154,7 @@ def prepare_fc2(
         tables, device=device, max_ctas=max_ctas, max_padded=g.max_padded
     )
     work_counter = (
-        torch.zeros((1,), dtype=torch.int32, device=device)
-        if "work_counter" in _arg_keys(program)
-        else None
+        _work_counter_dummy(device) if "work_counter" in _arg_keys(program) else None
     )
     operands = dict(
         gemm2_input=gemm2_input,
