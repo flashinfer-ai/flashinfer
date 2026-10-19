@@ -9,16 +9,9 @@ with plain loads and stores.
 <p align="center"><em>Symmetric memory registration across GPUs. (Image source: <a href="https://developer.nvidia.com/blog/enabling-fast-inference-and-resilient-training-with-nccl-2-27/">NVIDIA NCCL 2.27 blog</a>)</em></p>
 
 Two classes in [`flashinfer/comm/mnnvl.py`](../../flashinfer/comm/mnnvl.py)
-provide it:
-
-| | `MnnvlMemory` | `SymmDeviceMemory` |
-|---|---|---|
-| Users | MoE all-to-all workspaces (`flashinfer.moe_ep` NVLink one-sided, Cake, two-sided), `dcp_alltoall` | All-reduce workspaces (`trtllm_ar`, `McastGPUBuffer` for `trtllm_mnnvl_ar`), the SM90 push-style MegaMoE |
-| Group | Derived from a `Mapping` and cached on the class (`MnnvlMemory.get_comm`); one group and one device per process | The `CommBackend` passed to the constructor (MPI by default) |
-| Virtual addresses | One reservation per process, shared by allocations: `group_size * rank_stride` bytes, the stride a multiple of 512 MB; allocations are packed at increasing offsets and the reservation is freed when its last allocation closes | One reservation per instance: `group_size * allocation_size` bytes, rank `i` at offset `i * allocation_size` |
-| Peer `i` of an allocation at `ptr` | `ptr + i * rank_stride` | `get_unicast_ptr(i)` |
-| Multicast | No | Optional: one multicast object bound to every rank's buffer, mapped at `get_multicast_ptr()` |
-| Extras | — | A signal pad after each rank's buffer; Lamport initialization for the one-shot all-reduce |
+provide it, `MnnvlMemory` and `SymmDeviceMemory`. They allocate and share the
+physical memory the same way and differ in how they lay it out; the
+[comparison](#comparison) at the end summarizes the differences.
 
 ## Allocating and sharing the physical memory
 
@@ -128,3 +121,14 @@ FABRIC handles. The workspace layout depends on whether CFT is used, so the
 backend decides before allocating, from `MnnvlMemory.uses_fabric_handles` (the
 precheck above). If the allocation then falls back to POSIX file
 descriptors, binding is skipped and the backend uses its fence path.
+
+## Comparison
+
+| | `MnnvlMemory` | `SymmDeviceMemory` |
+|---|---|---|
+| Users | MoE all-to-all workspaces (`flashinfer.moe_ep` NVLink one-sided, Cake, two-sided), `dcp_alltoall` | All-reduce workspaces (`trtllm_ar`, `McastGPUBuffer` for `trtllm_mnnvl_ar`), the SM90 push-style MegaMoE |
+| Group | Derived from a `Mapping` and cached on the class (`MnnvlMemory.get_comm`); one group and one device per process | The `CommBackend` passed to the constructor (MPI by default) |
+| Virtual addresses | One reservation per process, shared by allocations: `group_size * rank_stride` bytes, the stride a multiple of 512 MB; allocations are packed at increasing offsets and the reservation is freed when its last allocation closes | One reservation per instance: `group_size * allocation_size` bytes, rank `i` at offset `i * allocation_size` |
+| Peer `i` of an allocation at `ptr` | `ptr + i * rank_stride` | `get_unicast_ptr(i)` |
+| Multicast | No | Optional: one multicast object bound to every rank's buffer, mapped at `get_multicast_ptr()` |
+| Extras | — | A signal pad after each rank's buffer; Lamport initialization for the one-shot all-reduce |
