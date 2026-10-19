@@ -433,6 +433,8 @@ def cute_dsl_hca_decode(
     if not query.is_cuda:
         raise ValueError("query must be on a CUDA device")
     compute_capability = torch.cuda.get_device_capability(query.device)
+    # SM107 uses the prebuilt-cubin backend, which covers a superset of this
+    # kernel's features.
     if compute_capability not in ((10, 0), (10, 3)):
         raise ValueError(
             "CuTe DSL HCA requires SM100/SM103, got "

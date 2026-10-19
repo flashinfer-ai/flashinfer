@@ -3043,6 +3043,10 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
 
         row_max_new = row_max
         arch = BaseDSL._get_dsl().get_arch_enum()
+        # SM100 and SM103 only. SM107 is served by the prebuilt-cubin backend;
+        # this kernel was not found to be faster there or to add functionality,
+        # so it has no SM107 arm. Any other arch must fail here, because with no
+        # matching arm the accumulator fragment is never written.
         if cutlass.const_expr(arch >= Arch.sm_100 and arch <= Arch.sm_100f):
             cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
@@ -3079,6 +3083,10 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
                 )
             else:
                 row_max_new = cute.arch.fmax(row_max_new, tTR_rMax[0])
+        else:
+            raise NotImplementedError(
+                f"HCA softmax supports sm_100 and sm_103 only, got {arch}"
+            )
 
         cute.arch.fence_view_async_tmem_load()
         softmax_params.mma_s_pipeline.consumer_release(mma_s_consumer_state)
