@@ -276,25 +276,29 @@ def test_w8a16_fp8_gemm_empty_m():
 
 
 def test_w8a16_fp8_gemm_strided_act():
-    """A non-contiguous activation is copied, as documented: row slices (strides
-    (2K, 1) survive reshape as a view), transposed last dims, permuted 3D."""
+    """No implicit copies: a non-contiguous activation (row slice, transposed
+    last dims, permuted 3D) is rejected in Python; the caller's own
+    .contiguous() of it works."""
     torch.manual_seed(0)
     dev = torch.device("cuda")
     k, n = 1024, 64
     w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
     base = torch.randn(14, k, device=dev, dtype=torch.bfloat16)
-    rows = base[::2]
-    assert not rows.is_contiguous()
-    ref = w8a16_fp8_gemm(rows.contiguous(), w_fp8, scale)
-    assert torch.equal(w8a16_fp8_gemm(rows, w_fp8, scale), ref)
-    t = torch.randn(k, 7, device=dev, dtype=torch.bfloat16).T
-    assert torch.equal(
-        w8a16_fp8_gemm(t, w_fp8, scale), w8a16_fp8_gemm(t.contiguous(), w_fp8, scale)
-    )
-    x3 = torch.randn(3, 5, k, device=dev, dtype=torch.bfloat16).permute(1, 0, 2)
-    out3 = w8a16_fp8_gemm(x3, w_fp8, scale)
-    assert out3.shape == (5, 3, n)
-    assert torch.equal(out3, w8a16_fp8_gemm(x3.contiguous(), w_fp8, scale))
+    strided = [
+        base[::2],
+        torch.randn(k, 7, device=dev, dtype=torch.bfloat16).T,
+        torch.randn(3, 5, k, device=dev, dtype=torch.bfloat16).permute(1, 0, 2),
+    ]
+    for t in strided:
+        assert not t.is_contiguous()
+        with pytest.raises(ValueError, match="act must be contiguous"):
+            w8a16_fp8_gemm(t, w_fp8, scale)
+        out = w8a16_fp8_gemm(t.contiguous(), w_fp8, scale)
+        assert out.shape == t.shape[:-1] + (n,)
+        ref = t.float().reshape(-1, k) @ (w_fp8.float() * scale).T
+        torch.testing.assert_close(
+            out.float().reshape(-1, n), ref, atol=5e-2, rtol=2e-2
+        )
 
 
 def test_w8a16_fp8_gemm_device_resolution():

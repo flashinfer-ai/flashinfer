@@ -256,10 +256,9 @@ def w8a16_fp8_gemm(
     Parameters
     ----------
     act: torch.Tensor
-        Activation, shape ``(..., K)``, ``float16`` or ``bfloat16``, any
-        strides (a non-contiguous one is copied to a contiguous buffer first).
-        Leading dimensions are flattened; a leading dimension of 0 returns the
-        empty output without launching.
+        Activation, shape ``(..., K)``, ``float16`` or ``bfloat16``,
+        contiguous.  Leading dimensions are flattened; a leading dimension of
+        0 returns the empty output without launching.
     weight: torch.Tensor
         Weight, shape ``(N, K)`` (``torch.nn.Linear`` layout),
         ``float8_e4m3fn``, contiguous.
@@ -300,9 +299,9 @@ def w8a16_fp8_gemm(
     start at a 16-byte aligned address (a view into a larger buffer at an odd
     storage offset does not; contiguity alone is not enough); anything else is
     rejected with a ValueError before launch, and the C++ launcher checks the
-    same rules again.  A non-contiguous ``act`` is copied to a contiguous
-    buffer first; a non-contiguous ``out`` is rejected (it could not receive
-    the result in place).  On Hopper the launcher picks a CUTLASS tile and
+    same rules again.  Nothing is copied on the caller's behalf: a
+    non-contiguous ``act`` or ``out`` is rejected (call ``.contiguous()``
+    yourself if a copy is acceptable).  On Hopper the launcher picks a CUTLASS tile and
     decomposition (plain, stream-K or split-K) from a cost model; split-K runs
     go through an fp32 workspace (``workspace``, or one this function
     allocates).  On Blackwell it picks one of the 2SM tiles from the same kind
@@ -348,11 +347,14 @@ def w8a16_fp8_gemm(
     if m == 0:
         # Nothing to compute; the tile schedulers would divide by zero tiles.
         return out
-    # reshape() keeps a view for e.g. a row-sliced act (strides (2K, 1)), which
-    # the launcher rejects as non-contiguous: make the promised copy explicit.
-    act2d = act.reshape(-1, k)
-    if not act2d.is_contiguous():
-        act2d = act2d.contiguous()
+    # No implicit copies: a non-contiguous act (row slice, transposed last dim,
+    # permuted leading dims) is the caller's to .contiguous() if they want that.
+    if not act.is_contiguous():
+        raise ValueError(
+            "act must be contiguous (this function does not copy; pass "
+            "act.contiguous() if a copy is acceptable)"
+        )
+    act2d = act.view(-1, k)
     out2d = out.view(-1, n)
     _check_aligned(act2d, "act")
     _check_aligned(weight, "weight")
