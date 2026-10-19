@@ -3446,7 +3446,6 @@ kernel_cake_dsa_h64_train_c949a885132a772bdb53(const __grid_constant__ CUtensorM
                             unsigned int phase_2 = cursor_2 / 3 & 1;
                             int p_free_phase = cursor_2 & 1 ^ 1;
                             mbarrier_wait(p_free_addr, p_free_phase);
-                            asm volatile("tcgen05.fence::after_thread_sync;");
                             int kr_ready_phase = cursor_2 & 1;
                             mbarrier_wait(kr_ready_addr, kr_ready_phase);
                             asm volatile("tcgen05.fence::after_thread_sync;");

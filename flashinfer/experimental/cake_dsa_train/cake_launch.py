@@ -313,6 +313,33 @@ def bwd_cast_grid(num_queries, num_kv, topk):
     return (max(1, -(-(num_kv * 18) // 256)), 1, 1)
 
 
+def index_prep(run, values, grid):
+    run(
+        values["indices"],
+        values["cu_seqlens_q"],
+        values["cu_seqlens_k"],
+        values["out"],
+        values["topk_length"],
+        values["num_rows"],
+        values["topk"],
+        values["idx_stride"],
+        values["indices_offset"],
+        values["num_docs"],
+        values["search_iters"],
+        values["causal"],
+        values["has_docs"],
+        values["flat_bound"],
+        values["write_out"],
+        grid[0],
+        grid[1],
+        grid[2],
+    )
+
+
+def index_prep_grid(num_queries, num_kv, topk):
+    return (max(1, -(-(num_queries) // 4)), 1, 1)
+
+
 def nope_fwd(run, values, grid):
     run(
         values["q_latent"],
@@ -815,6 +842,26 @@ STAGE_ARGS: dict[str, list[str]] = {
         "grid_y",
         "grid_z",
     ],
+    "index_prep": [
+        "indices",
+        "cu_seqlens_q",
+        "cu_seqlens_k",
+        "out",
+        "topk_length",
+        "num_rows",
+        "topk",
+        "idx_stride",
+        "indices_offset",
+        "num_docs",
+        "search_iters",
+        "causal",
+        "has_docs",
+        "flat_bound",
+        "write_out",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ],
     "nope_fwd": [
         "q_latent",
         "kv_latent",
@@ -1035,6 +1082,7 @@ LAUNCH = {
     "bwd_main_pass": bwd_main_pass,
     "bwd_main_pass_natural": bwd_main_pass_natural,
     "bwd_cast": bwd_cast,
+    "index_prep": index_prep,
     "nope_fwd": nope_fwd,
     "nope_bwd_delta": nope_bwd_delta,
     "nope_bwd_main": nope_bwd_main,
@@ -1053,6 +1101,7 @@ GRID = {
     "bwd_main_pass": bwd_main_pass_grid,
     "bwd_main_pass_natural": bwd_main_pass_natural_grid,
     "bwd_cast": bwd_cast_grid,
+    "index_prep": index_prep_grid,
     "nope_fwd": nope_fwd_grid,
     "nope_bwd_delta": nope_bwd_delta_grid,
     "nope_bwd_main": nope_bwd_main_grid,

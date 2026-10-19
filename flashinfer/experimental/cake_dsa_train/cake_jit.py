@@ -205,6 +205,7 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_dsa_h64_nope_train": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "stages": [
+            "index_prep",
             "nope_fwd",
             "nope_bwd_delta",
             "nope_bwd_main",
@@ -223,6 +224,18 @@ MODULES: dict[str, dict[str, Any]] = {
             "dq_partial_bytes_per_token": 131072,
         },
         "dkv_direct": {"min_keys_per_query": 1},
+        "index_prep": {
+            "module": "cake_dsa_h64_nope_train_db791110b21a91be1388",
+            "library": "cake_dsa_h64_nope_train_db791110b21a91be1388",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [128, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
         "nope_fwd": {
             "module": "cake_dsa_h64_nope_train_46cdc056c891876ed545",
             "library": "cake_dsa_h64_nope_train_46cdc056c891876ed545",
