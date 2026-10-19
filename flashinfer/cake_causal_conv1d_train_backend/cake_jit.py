@@ -39,7 +39,8 @@ workspace rows); everything else derives from them.
 The program name ``cake_causal_conv1d_train_<20 hex>`` is the first twenty hex
 digits of the SHA-256 of the compact JSON ``{"build": <build keywords, sorted>,
 "module": <dotted kernel module>}`` of the kernel the program was rendered
-from; both programs are built with the kernel file's default keywords.
+from; the forward is built with its kernel file's default keywords and the
+backward with ``vec=4`` (four channels, 8-byte vectors, per thread).
 """
 
 from __future__ import annotations

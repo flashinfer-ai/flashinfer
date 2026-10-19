@@ -470,7 +470,13 @@ def test_cuda_graph_replays_match_eager() -> None:
         # The graph holds raw pointers to x, w, cu and dy: keep them alive until the replays, or the
         # allocator hands their memory to the next shape's tensors and the replay reads those instead.
         captured.append(
-            (graph, (x, w, cu, dy), (y, dx, dw), (eager_y, eager_dx, eager_dw), workspace)
+            (
+                graph,
+                (x, w, cu, dy),
+                (y, dx, dw),
+                (eager_y, eager_dx, eager_dw),
+                workspace,
+            )
         )
     replays = 0
     for graph, _inputs_alive, outputs, eager, workspace in captured:
@@ -559,7 +565,11 @@ def test_workspace_bytes_and_layout() -> None:
     # channels per thread; 8192 channels are sixteen tiles; C = 136 is 34 channel vectors (three sub-tiles of 34).
     vec, threads = geometry["vec"], geometry["threads"]
     assert loader.channel_split(threads * vec, geometry=geometry) == (threads, 1, 1)
-    assert loader.channel_split(8192, geometry=geometry) == (threads, 1, 8192 // (threads * vec))
+    assert loader.channel_split(8192, geometry=geometry) == (
+        threads,
+        1,
+        8192 // (threads * vec),
+    )
     assert loader.channel_split(136, geometry=geometry) == (
         136 // vec,
         threads // (136 // vec),

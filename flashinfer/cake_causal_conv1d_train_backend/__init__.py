@@ -125,20 +125,18 @@ def _tokens(
     offsets).
     """
 
-    tensor = _require_tensor(tensor, name)
-    if tensor.ndim == 3 and tensor.shape[0] == 1:
-        S, C = int(tensor.shape[1]), int(tensor.shape[2])
-    elif tensor.ndim == 2:
-        S, C = int(tensor.shape[0]), int(tensor.shape[1])
+    t = _require_tensor(tensor, name)
+    if t.ndim == 3 and t.shape[0] == 1:
+        S, C = int(t.shape[1]), int(t.shape[2])
+    elif t.ndim == 2:
+        S, C = int(t.shape[0]), int(t.shape[1])
     else:
         raise ValueError(
-            f"{name} must be a [S, C] or [1, S, C] tensor, got shape {tuple(tensor.shape)}"
+            f"{name} must be a [S, C] or [1, S, C] tensor, got shape {tuple(t.shape)}"
         )
-    if shape is not None and tuple(tensor.shape) != tuple(shape):
-        raise ValueError(
-            f"{name} must have shape {tuple(shape)}, got {tuple(tensor.shape)}"
-        )
-    _check_placement(tensor, name, device=device, dtype=torch.bfloat16)
+    if shape is not None and tuple(t.shape) != tuple(shape):
+        raise ValueError(f"{name} must have shape {tuple(shape)}, got {tuple(t.shape)}")
+    _check_placement(t, name, device=device, dtype=torch.bfloat16)
     if C <= 0 or C % CHANNEL_MULTIPLE:
         raise ValueError(
             f"{name} must have a channel count C that is a positive multiple of "
@@ -148,24 +146,24 @@ def _tokens(
         raise ValueError(
             f"{name}: S={S} and C={C} must each fit a 32-bit kernel scalar"
         )
-    return S, C, tensor.view(S, C)
+    return S, C, t.view(S, C)
 
 
 def _weight(
     weight: object, C: int, *, device: torch.device, name: str = "weight"
 ) -> torch.Tensor:
-    weight = _require_tensor(weight, name)
-    if weight.ndim != 2 or int(weight.shape[1]) != WIDTH:
+    w = _require_tensor(weight, name)
+    if w.ndim != 2 or int(w.shape[1]) != WIDTH:
         raise ValueError(
             f"{name} must be a [C, {WIDTH}] tensor of a width-{WIDTH} convolution "
-            f"(tap {WIDTH - 1} multiplies the current token), got shape {tuple(weight.shape)}"
+            f"(tap {WIDTH - 1} multiplies the current token), got shape {tuple(w.shape)}"
         )
-    if int(weight.shape[0]) != C:
+    if int(w.shape[0]) != C:
         raise ValueError(
-            f"{name} must have one row per channel ([{C}, {WIDTH}]), got shape {tuple(weight.shape)}"
+            f"{name} must have one row per channel ([{C}, {WIDTH}]), got shape {tuple(w.shape)}"
         )
-    _check_placement(weight, name, device=device, dtype=torch.float32)
-    return weight
+    _check_placement(w, name, device=device, dtype=torch.float32)
+    return w
 
 
 def _cu_seqlens(
@@ -204,13 +202,13 @@ def _output(
 
     if tensor is None:
         return torch.empty(shape, dtype=dtype, device=device)
-    tensor = _require_tensor(tensor, name)
-    if tuple(tensor.shape) != tuple(shape):
+    out = _require_tensor(tensor, name)
+    if tuple(out.shape) != tuple(shape):
         raise ValueError(
-            f"{name} must have shape {tuple(shape)}, got {tuple(tensor.shape)}"
+            f"{name} must have shape {tuple(shape)}, got {tuple(out.shape)}"
         )
-    _check_placement(tensor, name, device=device, dtype=dtype)
-    return tensor
+    _check_placement(out, name, device=device, dtype=dtype)
+    return out
 
 
 def _scalars(scalars: dict[str, int]) -> dict[str, int]:
@@ -278,22 +276,22 @@ def _partial_view(
 ) -> torch.Tensor:
     """The FP32 ``[rows, C, taps]`` view of this launch's partial rows inside ``workspace``."""
 
-    workspace = _require_tensor(workspace, "workspace")
-    if workspace.ndim != 1:
+    ws = _require_tensor(workspace, "workspace")
+    if ws.ndim != 1:
         raise ValueError(
-            f"workspace must be a 1-D uint8 CUDA tensor, got shape {tuple(workspace.shape)}"
+            f"workspace must be a 1-D uint8 CUDA tensor, got shape {tuple(ws.shape)}"
         )
-    _check_placement(workspace, "workspace", device=device, dtype=torch.uint8)
-    if workspace.data_ptr() % 16 != 0:
+    _check_placement(ws, "workspace", device=device, dtype=torch.uint8)
+    if ws.data_ptr() % 16 != 0:
         raise ValueError("workspace must be 16-byte aligned")
     nbytes = partial_bytes(record, C, rows)
-    if workspace.numel() < nbytes:
+    if ws.numel() < nbytes:
         raise ValueError(
-            f"workspace holds {workspace.numel()} bytes; this call needs {nbytes} "
+            f"workspace holds {ws.numel()} bytes; this call needs {nbytes} "
             "(cake_causal_conv1d_train_backward_workspace_bytes)"
         )
     taps = int(record["workspace_rule"]["taps"])
-    return workspace[:nbytes].view(torch.float32).view(rows, C, taps)
+    return ws[:nbytes].view(torch.float32).view(rows, C, taps)
 
 
 def cake_causal_conv1d_train_forward(
