@@ -5,6 +5,12 @@ allocates a buffer of the same size, and every rank maps every peer's buffer
 into its own virtual address space, so a kernel reads and writes peer memory
 with plain loads and stores.
 
+A **group** is the set of ranks that share one allocation: the ranks of the
+`CommBackend` it is allocated over. Allocations are collective over their
+group, and a process can be in several groups at once, for example a TP group
+for all-reduce and an EP group for MoE all-to-all, each with its own
+allocations.
+
 <p align="center"><img src="./media/symmetric_memory.png" alt="Symmetric memory across GPUs" width="600"/></p>
 <p align="center"><em>Symmetric memory registration across GPUs. (Image source: <a href="https://developer.nvidia.com/blog/enabling-fast-inference-and-resilient-training-with-nccl-2-27/">NVIDIA NCCL 2.27 blog</a>)</em></p>
 
@@ -50,10 +56,13 @@ attempt(handle_type)                        # _create_and_import_handles
     vote; if any rank failed: release everything, return the errors
 ```
 
-The decision depends only on what the ranks report in that call, so nothing is
-remembered between allocations: ranks that allocate in different groups cannot
-disagree. The votes turn a failure on one rank into the same outcome on all of
-them instead of leaving the others blocked in a collective.
+Every rank of the group must pick the same handle type, since the two types
+exchange handles through different collectives. Each call therefore decides
+afresh from one allgather over the group, rather than reusing an earlier
+result: a process that already allocated in another group (say, its TP group)
+may have settled on a type that the other ranks of this group (say, its EP
+group) never saw. The votes likewise turn a failure on one rank into the same
+outcome on all of them instead of leaving the others blocked in a collective.
 
 The callers' `make_prop(handle_type)` builds the allocation properties and
 size for the handle type being tried. `SymmDeviceMemory` sizes its buffer
