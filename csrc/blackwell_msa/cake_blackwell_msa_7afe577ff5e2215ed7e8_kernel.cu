@@ -16,9 +16,24 @@
 
 // Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
 #include "cake_blackwell_msa_device_common.cuh"
+// The common preamble's fallback helper this module's helper library does not provide; the shared
+// header carries another member's library definition of the name (kept translation-unit-local).
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
+
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
+#define SMEM_SCAN_SCORES_OFF 33856
+#define SMEM_SCAN_SCORES_STAGE_BYTES 4096
+#define SMEM_SCAN_SCORES_STRIDE 4096
+#define SMEM_FINAL_INDICES_OFF 33792
+#define SMEM_FINAL_INDICES_STAGE_BYTES 64
+#define SMEM_FINAL_INDICES_STRIDE 64
 #define SMEM_WARP_LIST_SCORES_OFF 0
 #define SMEM_WARP_LIST_SCORES_STAGE_BYTES 512
 #define SMEM_WARP_LIST_SCORES_STRIDE 512
@@ -31,13 +46,13 @@
 #define SMEM_CANDIDATE_INDICES_OFF 17408
 #define SMEM_CANDIDATE_INDICES_STAGE_BYTES 16384
 #define SMEM_CANDIDATE_INDICES_STRIDE 16384
-#define SMEM_TOTAL 33792
+#define SMEM_TOTAL 38016
 #define THREADS 256
 
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_blackwell_msa_d03b9d08c1e9314fbc4a(float* __restrict__ max_score, int* __restrict__ output, int num_heads, int max_k_tiles, int total_q, int num_valid_pages, int force_begin_blocks, int force_end_blocks)
+kernel_cake_blackwell_msa_7afe577ff5e2215ed7e8(float* __restrict__ max_score, int* __restrict__ output, int num_heads, int max_k_tiles, int total_q, int num_valid_pages, int force_begin_blocks, int force_end_blocks)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -58,6 +73,10 @@ kernel_cake_blackwell_msa_d03b9d08c1e9314fbc4a(float* __restrict__ max_score, in
     const int cta_rank = 0;
 
     // Kernel setup ops
+    float* scan_scores = reinterpret_cast<float*>(smem_raw + SMEM_SCAN_SCORES_OFF);
+    const int scan_scores_addr = smem + SMEM_SCAN_SCORES_OFF;
+    int* final_indices = reinterpret_cast<int*>(smem_raw + SMEM_FINAL_INDICES_OFF);
+    const int final_indices_addr = smem + SMEM_FINAL_INDICES_OFF;
     float* warp_list_scores = reinterpret_cast<float*>(smem_raw + SMEM_WARP_LIST_SCORES_OFF);
     const int warp_list_scores_addr = smem + SMEM_WARP_LIST_SCORES_OFF;
     int* warp_list_indices = reinterpret_cast<int*>(smem_raw + SMEM_WARP_LIST_INDICES_OFF);
@@ -81,29 +100,67 @@ kernel_cake_blackwell_msa_d03b9d08c1e9314fbc4a(float* __restrict__ max_score, in
         local_scores[rank] = -CAKE_INF;
         local_indices[rank] = max_k_tiles;
     }
-    for (int block = tid_0; block < num_valid_pages; block += 256) {
-        int eligible = (int)(block >= force_begin_blocks) & (int)(block < num_valid_pages - force_end_blocks);
-        float carry_score = -CAKE_INF;
-        int carry_index = max_k_tiles;
-        if (eligible != 0) {
-            int score_offset = (head * max_k_tiles + block) * total_q + query;
-            carry_score = max_score[score_offset];
-            carry_index = block;
+    if (num_valid_pages <= 1024) {
+        int row_base = head * max_k_tiles * total_q + query;
+        for (int stage = 0; stage < 4; stage++) {
+            int stage_block = stage * 256 + tid_0;
+            asm volatile(
+                "{\n\t"
+                ".reg .pred p;\n\t"
+                "setp.ne.b32 p, %0, 0;\n\t"
+                "@p cp.async.ca.shared::cta.global [%1], [%2], 4;\n\t"
+                "}"
+                :: "r"((stage_block < num_valid_pages) ? 1 : 0), "r"(scan_scores_addr + (unsigned int)(stage_block * 4)), "l"(max_score + (row_base + stage_block * total_q)));
         }
-        for (int rank_1 = 0; rank_1 < 16; rank_1++) {
-            float old_score = local_scores[rank_1];
-            int old_index = local_indices[rank_1];
-            int better = (int)(carry_score > old_score || carry_score == old_score && carry_index < old_index);
-            local_scores[rank_1] = ((better != 0) ? carry_score : old_score);
-            local_indices[rank_1] = ((better != 0) ? carry_index : old_index);
-            carry_score = ((better != 0) ? old_score : carry_score);
-            carry_index = ((better != 0) ? old_index : carry_index);
+        asm volatile("cp.async.commit_group;");
+        asm volatile("cp.async.wait_group 0;");
+        __syncthreads();
+        for (int block = tid_0; block < num_valid_pages; block += 256) {
+            int eligible = (int)(block >= force_begin_blocks) & (int)(block < num_valid_pages - force_end_blocks);
+            float carry_score = -CAKE_INF;
+            int carry_index = max_k_tiles;
+            if (eligible != 0) {
+                carry_score = scan_scores[block];
+                carry_index = block;
+            }
+            for (int rank_1 = 0; rank_1 < 16; rank_1++) {
+                float old_score = local_scores[rank_1];
+                int old_index = local_indices[rank_1];
+                int better = (int)(carry_score > old_score || carry_score == old_score && carry_index < old_index);
+                local_scores[rank_1] = ((better != 0) ? carry_score : old_score);
+                local_indices[rank_1] = ((better != 0) ? carry_index : old_index);
+                carry_score = ((better != 0) ? old_score : carry_score);
+                carry_index = ((better != 0) ? old_index : carry_index);
+            }
+        }
+    } else {
+        for (int block_1 = tid_0; block_1 < num_valid_pages; block_1 += 256) {
+            int eligible_1 = (int)(block_1 >= force_begin_blocks) & (int)(block_1 < num_valid_pages - force_end_blocks);
+            float carry_score_1 = -CAKE_INF;
+            int carry_index_1 = max_k_tiles;
+            if (eligible_1 != 0) {
+                int score_offset = (head * max_k_tiles + block_1) * total_q + query;
+                carry_score_1 = max_score[score_offset];
+                carry_index_1 = block_1;
+            }
+            for (int rank_2 = 0; rank_2 < 16; rank_2++) {
+                float old_score_1 = local_scores[rank_2];
+                int old_index_1 = local_indices[rank_2];
+                int better_1 = (int)(carry_score_1 > old_score_1 || carry_score_1 == old_score_1 && carry_index_1 < old_index_1);
+                local_scores[rank_2] = ((better_1 != 0) ? carry_score_1 : old_score_1);
+                local_indices[rank_2] = ((better_1 != 0) ? carry_index_1 : old_index_1);
+                carry_score_1 = ((better_1 != 0) ? old_score_1 : carry_score_1);
+                carry_index_1 = ((better_1 != 0) ? old_index_1 : carry_index_1);
+            }
         }
     }
-    for (int rank_2 = 0; rank_2 < 16; rank_2++) {
-        int candidate_offset = rank_2 * 256 + tid_0;
-        candidate_scores[candidate_offset] = local_scores[rank_2];
-        candidate_indices[candidate_offset] = local_indices[rank_2];
+    for (int rank_3 = 0; rank_3 < 16; rank_3++) {
+        int candidate_offset = rank_3 * 256 + tid_0;
+        candidate_scores[candidate_offset] = local_scores[rank_3];
+        candidate_indices[candidate_offset] = local_indices[rank_3];
+    }
+    if (tid_0 < 16) {
+        final_indices[tid_0] = max_k_tiles;
     }
     __syncthreads();
     float merge_scores[4];
@@ -1217,497 +1274,49 @@ kernel_cake_blackwell_msa_d03b9d08c1e9314fbc4a(float* __restrict__ max_score, in
         warp_list_indices[list_offset_2] = merge_indices[3];
     }
     __syncthreads();
+    int element = lane_1 & 15;
+    int half = lane_1 / 16;
+    float x_score = warp_list_scores[warp_2 * 16 + element];
+    int x_index = warp_list_indices[warp_2 * 16 + element];
+    int counts[4];
+    for (int m = 0; m < 4; m++) {
+        int list_base = (warp_2 + (1 + 2 * m) + half & 7) * 16;
+        float fixed_score = warp_list_scores[list_base + 7];
+        int fixed_index = warp_list_indices[list_base + 7];
+        float last_score = warp_list_scores[list_base + 15];
+        int last_index = warp_list_indices[list_base + 15];
+        int fixed_better = (int)(fixed_score > x_score || fixed_score == x_score && fixed_index < x_index);
+        int last_better = (int)(last_score > x_score || last_score == x_score && last_index < x_index);
+        int count = 0;
+        if (fixed_better != 0) {
+            count = 8;
+        }
+        int probe = list_base + count + 3;
+        float probe_score = warp_list_scores[probe];
+        int probe_index = warp_list_indices[probe];
+        int probe_better = (int)(probe_score > x_score || probe_score == x_score && probe_index < x_index);
+        count = ((probe_better != 0) ? count + 4 : count);
+        int probe_0 = list_base + count + 1;
+        float probe_score_1 = warp_list_scores[probe_0];
+        int probe_index_2 = warp_list_indices[probe_0];
+        int probe_better_3 = (int)(probe_score_1 > x_score || probe_score_1 == x_score && probe_index_2 < x_index);
+        count = ((probe_better_3 != 0) ? count + 2 : count);
+        int probe_4 = list_base + count;
+        float probe_score_5 = warp_list_scores[probe_4];
+        int probe_index_6 = warp_list_indices[probe_4];
+        int probe_better_7 = (int)(probe_score_5 > x_score || probe_score_5 == x_score && probe_index_6 < x_index);
+        count = ((probe_better_7 != 0) ? count + 1 : count);
+        counts[m] = count + last_better;
+    }
+    int rank_4 = counts[0] + counts[1] + counts[2] + counts[3];
+    int _shfl_xor_216 = __shfl_xor_sync(0xFFFFFFFF, rank_4, 16);
+    rank_4 = rank_4 + _shfl_xor_216;
+    int store_final = (int)(half == 0) & (int)(rank_4 < 16) & (int)(x_index != max_k_tiles);
+    if (store_final != 0) {
+        final_indices[rank_4] = x_index;
+    }
+    __syncthreads();
     if (warp_2 == 0) {
-        float cta_scores[4];
-        int cta_indices[4];
-        cta_scores[0] = warp_list_scores[lane_1 * 4];
-        cta_indices[0] = warp_list_indices[lane_1 * 4];
-        cta_scores[1] = warp_list_scores[lane_1 * 4 + 1];
-        cta_indices[1] = warp_list_indices[lane_1 * 4 + 1];
-        cta_scores[2] = warp_list_scores[lane_1 * 4 + 2];
-        cta_indices[2] = warp_list_indices[lane_1 * 4 + 2];
-        cta_scores[3] = warp_list_scores[lane_1 * 4 + 3];
-        cta_indices[3] = warp_list_indices[lane_1 * 4 + 3];
-        int keep_worse_0 = (int)((lane_1 & 1) != 0);
-        float _shfl_xor_216 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[3], 1);
-        int _shfl_xor_217 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[3], 1);
-        float _shfl_xor_218 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[2], 1);
-        int _shfl_xor_219 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[2], 1);
-        float _shfl_xor_220 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[1], 1);
-        int _shfl_xor_221 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[1], 1);
-        float _shfl_xor_222 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[0], 1);
-        int _shfl_xor_223 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[0], 1);
-        int mine_better_1 = (int)(cta_scores[0] > _shfl_xor_216 || cta_scores[0] == _shfl_xor_216 && cta_indices[0] < _shfl_xor_217);
-        int take_mine_2 = mine_better_1 ^ keep_worse_0;
-        cta_scores[0] = ((take_mine_2 != 0) ? cta_scores[0] : _shfl_xor_216);
-        cta_indices[0] = ((take_mine_2 != 0) ? cta_indices[0] : _shfl_xor_217);
-        int mine_better_4_1 = (int)(cta_scores[1] > _shfl_xor_218 || cta_scores[1] == _shfl_xor_218 && cta_indices[1] < _shfl_xor_219);
-        int take_mine_5_1 = mine_better_4_1 ^ keep_worse_0;
-        cta_scores[1] = ((take_mine_5_1 != 0) ? cta_scores[1] : _shfl_xor_218);
-        cta_indices[1] = ((take_mine_5_1 != 0) ? cta_indices[1] : _shfl_xor_219);
-        int mine_better_6_1 = (int)(cta_scores[2] > _shfl_xor_220 || cta_scores[2] == _shfl_xor_220 && cta_indices[2] < _shfl_xor_221);
-        int take_mine_7_1 = mine_better_6_1 ^ keep_worse_0;
-        cta_scores[2] = ((take_mine_7_1 != 0) ? cta_scores[2] : _shfl_xor_220);
-        cta_indices[2] = ((take_mine_7_1 != 0) ? cta_indices[2] : _shfl_xor_221);
-        int mine_better_8_1 = (int)(cta_scores[3] > _shfl_xor_222 || cta_scores[3] == _shfl_xor_222 && cta_indices[3] < _shfl_xor_223);
-        int take_mine_9_1 = mine_better_8_1 ^ keep_worse_0;
-        cta_scores[3] = ((take_mine_9_1 != 0) ? cta_scores[3] : _shfl_xor_222);
-        cta_indices[3] = ((take_mine_9_1 != 0) ? cta_indices[3] : _shfl_xor_223);
-        int swap_10 = (int)(cta_scores[2] > cta_scores[0] || cta_scores[2] == cta_scores[0] && cta_indices[2] < cta_indices[0]);
-        float lower_score_11 = ((swap_10 != 0) ? cta_scores[2] : cta_scores[0]);
-        int lower_index_12 = ((swap_10 != 0) ? cta_indices[2] : cta_indices[0]);
-        float upper_score_13 = ((swap_10 != 0) ? cta_scores[0] : cta_scores[2]);
-        int upper_index_14 = ((swap_10 != 0) ? cta_indices[0] : cta_indices[2]);
-        cta_scores[0] = lower_score_11;
-        cta_indices[0] = lower_index_12;
-        cta_scores[2] = upper_score_13;
-        cta_indices[2] = upper_index_14;
-        int swap_15 = (int)(cta_scores[3] > cta_scores[1] || cta_scores[3] == cta_scores[1] && cta_indices[3] < cta_indices[1]);
-        float lower_score_16 = ((swap_15 != 0) ? cta_scores[3] : cta_scores[1]);
-        int lower_index_17 = ((swap_15 != 0) ? cta_indices[3] : cta_indices[1]);
-        float upper_score_18 = ((swap_15 != 0) ? cta_scores[1] : cta_scores[3]);
-        int upper_index_19 = ((swap_15 != 0) ? cta_indices[1] : cta_indices[3]);
-        cta_scores[1] = lower_score_16;
-        cta_indices[1] = lower_index_17;
-        cta_scores[3] = upper_score_18;
-        cta_indices[3] = upper_index_19;
-        int swap_20 = (int)(cta_scores[1] > cta_scores[0] || cta_scores[1] == cta_scores[0] && cta_indices[1] < cta_indices[0]);
-        float lower_score_21 = ((swap_20 != 0) ? cta_scores[1] : cta_scores[0]);
-        int lower_index_22 = ((swap_20 != 0) ? cta_indices[1] : cta_indices[0]);
-        float upper_score_23 = ((swap_20 != 0) ? cta_scores[0] : cta_scores[1]);
-        int upper_index_24 = ((swap_20 != 0) ? cta_indices[0] : cta_indices[1]);
-        cta_scores[0] = lower_score_21;
-        cta_indices[0] = lower_index_22;
-        cta_scores[1] = upper_score_23;
-        cta_indices[1] = upper_index_24;
-        int swap_25 = (int)(cta_scores[3] > cta_scores[2] || cta_scores[3] == cta_scores[2] && cta_indices[3] < cta_indices[2]);
-        float lower_score_26 = ((swap_25 != 0) ? cta_scores[3] : cta_scores[2]);
-        int lower_index_27 = ((swap_25 != 0) ? cta_indices[3] : cta_indices[2]);
-        float upper_score_28 = ((swap_25 != 0) ? cta_scores[2] : cta_scores[3]);
-        int upper_index_29 = ((swap_25 != 0) ? cta_indices[2] : cta_indices[3]);
-        cta_scores[2] = lower_score_26;
-        cta_indices[2] = lower_index_27;
-        cta_scores[3] = upper_score_28;
-        cta_indices[3] = upper_index_29;
-        int keep_worse_30 = (int)((lane_1 & 2) != 0);
-        float _shfl_xor_224 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[3], 3);
-        int _shfl_xor_225 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[3], 3);
-        float _shfl_xor_226 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[2], 3);
-        int _shfl_xor_227 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[2], 3);
-        float _shfl_xor_228 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[1], 3);
-        int _shfl_xor_229 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[1], 3);
-        float _shfl_xor_230 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[0], 3);
-        int _shfl_xor_231 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[0], 3);
-        int mine_better_32 = (int)(cta_scores[0] > _shfl_xor_224 || cta_scores[0] == _shfl_xor_224 && cta_indices[0] < _shfl_xor_225);
-        int take_mine_33 = mine_better_32 ^ keep_worse_30;
-        cta_scores[0] = ((take_mine_33 != 0) ? cta_scores[0] : _shfl_xor_224);
-        cta_indices[0] = ((take_mine_33 != 0) ? cta_indices[0] : _shfl_xor_225);
-        int mine_better_35_1 = (int)(cta_scores[1] > _shfl_xor_226 || cta_scores[1] == _shfl_xor_226 && cta_indices[1] < _shfl_xor_227);
-        int take_mine_36_1 = mine_better_35_1 ^ keep_worse_30;
-        cta_scores[1] = ((take_mine_36_1 != 0) ? cta_scores[1] : _shfl_xor_226);
-        cta_indices[1] = ((take_mine_36_1 != 0) ? cta_indices[1] : _shfl_xor_227);
-        int mine_better_37_1 = (int)(cta_scores[2] > _shfl_xor_228 || cta_scores[2] == _shfl_xor_228 && cta_indices[2] < _shfl_xor_229);
-        int take_mine_38_1 = mine_better_37_1 ^ keep_worse_30;
-        cta_scores[2] = ((take_mine_38_1 != 0) ? cta_scores[2] : _shfl_xor_228);
-        cta_indices[2] = ((take_mine_38_1 != 0) ? cta_indices[2] : _shfl_xor_229);
-        int mine_better_39_1 = (int)(cta_scores[3] > _shfl_xor_230 || cta_scores[3] == _shfl_xor_230 && cta_indices[3] < _shfl_xor_231);
-        int take_mine_40_1 = mine_better_39_1 ^ keep_worse_30;
-        cta_scores[3] = ((take_mine_40_1 != 0) ? cta_scores[3] : _shfl_xor_230);
-        cta_indices[3] = ((take_mine_40_1 != 0) ? cta_indices[3] : _shfl_xor_231);
-        int keep_worse_41_1 = (int)((lane_1 & 1) != 0);
-        float _shfl_xor_232 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[0], 1);
-        int _shfl_xor_233 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[0], 1);
-        float _shfl_xor_234 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[1], 1);
-        int _shfl_xor_235 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[1], 1);
-        float _shfl_xor_236 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[2], 1);
-        int _shfl_xor_237 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[2], 1);
-        float _shfl_xor_238 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[3], 1);
-        int _shfl_xor_239 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[3], 1);
-        int mine_better_42_1 = (int)(cta_scores[0] > _shfl_xor_232 || cta_scores[0] == _shfl_xor_232 && cta_indices[0] < _shfl_xor_233);
-        int take_mine_43_1 = mine_better_42_1 ^ keep_worse_41_1;
-        cta_scores[0] = ((take_mine_43_1 != 0) ? cta_scores[0] : _shfl_xor_232);
-        cta_indices[0] = ((take_mine_43_1 != 0) ? cta_indices[0] : _shfl_xor_233);
-        int mine_better_44_1 = (int)(cta_scores[1] > _shfl_xor_234 || cta_scores[1] == _shfl_xor_234 && cta_indices[1] < _shfl_xor_235);
-        int take_mine_45_1 = mine_better_44_1 ^ keep_worse_41_1;
-        cta_scores[1] = ((take_mine_45_1 != 0) ? cta_scores[1] : _shfl_xor_234);
-        cta_indices[1] = ((take_mine_45_1 != 0) ? cta_indices[1] : _shfl_xor_235);
-        int mine_better_46_1 = (int)(cta_scores[2] > _shfl_xor_236 || cta_scores[2] == _shfl_xor_236 && cta_indices[2] < _shfl_xor_237);
-        int take_mine_47_1 = mine_better_46_1 ^ keep_worse_41_1;
-        cta_scores[2] = ((take_mine_47_1 != 0) ? cta_scores[2] : _shfl_xor_236);
-        cta_indices[2] = ((take_mine_47_1 != 0) ? cta_indices[2] : _shfl_xor_237);
-        int mine_better_48_1 = (int)(cta_scores[3] > _shfl_xor_238 || cta_scores[3] == _shfl_xor_238 && cta_indices[3] < _shfl_xor_239);
-        int take_mine_49_1 = mine_better_48_1 ^ keep_worse_41_1;
-        cta_scores[3] = ((take_mine_49_1 != 0) ? cta_scores[3] : _shfl_xor_238);
-        cta_indices[3] = ((take_mine_49_1 != 0) ? cta_indices[3] : _shfl_xor_239);
-        int swap_50_1 = (int)(cta_scores[2] > cta_scores[0] || cta_scores[2] == cta_scores[0] && cta_indices[2] < cta_indices[0]);
-        float lower_score_51_1 = ((swap_50_1 != 0) ? cta_scores[2] : cta_scores[0]);
-        int lower_index_52_1 = ((swap_50_1 != 0) ? cta_indices[2] : cta_indices[0]);
-        float upper_score_53_1 = ((swap_50_1 != 0) ? cta_scores[0] : cta_scores[2]);
-        int upper_index_54_1 = ((swap_50_1 != 0) ? cta_indices[0] : cta_indices[2]);
-        cta_scores[0] = lower_score_51_1;
-        cta_indices[0] = lower_index_52_1;
-        cta_scores[2] = upper_score_53_1;
-        cta_indices[2] = upper_index_54_1;
-        int swap_55_1 = (int)(cta_scores[3] > cta_scores[1] || cta_scores[3] == cta_scores[1] && cta_indices[3] < cta_indices[1]);
-        float lower_score_56_1 = ((swap_55_1 != 0) ? cta_scores[3] : cta_scores[1]);
-        int lower_index_57_1 = ((swap_55_1 != 0) ? cta_indices[3] : cta_indices[1]);
-        float upper_score_58_1 = ((swap_55_1 != 0) ? cta_scores[1] : cta_scores[3]);
-        int upper_index_59_1 = ((swap_55_1 != 0) ? cta_indices[1] : cta_indices[3]);
-        cta_scores[1] = lower_score_56_1;
-        cta_indices[1] = lower_index_57_1;
-        cta_scores[3] = upper_score_58_1;
-        cta_indices[3] = upper_index_59_1;
-        int swap_60_1 = (int)(cta_scores[1] > cta_scores[0] || cta_scores[1] == cta_scores[0] && cta_indices[1] < cta_indices[0]);
-        float lower_score_61_1 = ((swap_60_1 != 0) ? cta_scores[1] : cta_scores[0]);
-        int lower_index_62_1 = ((swap_60_1 != 0) ? cta_indices[1] : cta_indices[0]);
-        float upper_score_63_1 = ((swap_60_1 != 0) ? cta_scores[0] : cta_scores[1]);
-        int upper_index_64_1 = ((swap_60_1 != 0) ? cta_indices[0] : cta_indices[1]);
-        cta_scores[0] = lower_score_61_1;
-        cta_indices[0] = lower_index_62_1;
-        cta_scores[1] = upper_score_63_1;
-        cta_indices[1] = upper_index_64_1;
-        int swap_65_1 = (int)(cta_scores[3] > cta_scores[2] || cta_scores[3] == cta_scores[2] && cta_indices[3] < cta_indices[2]);
-        float lower_score_66_1 = ((swap_65_1 != 0) ? cta_scores[3] : cta_scores[2]);
-        int lower_index_67_1 = ((swap_65_1 != 0) ? cta_indices[3] : cta_indices[2]);
-        float upper_score_68_1 = ((swap_65_1 != 0) ? cta_scores[2] : cta_scores[3]);
-        int upper_index_69_1 = ((swap_65_1 != 0) ? cta_indices[2] : cta_indices[3]);
-        cta_scores[2] = lower_score_66_1;
-        cta_indices[2] = lower_index_67_1;
-        cta_scores[3] = upper_score_68_1;
-        cta_indices[3] = upper_index_69_1;
-        int keep_worse_70_1 = (int)((lane_1 & 4) != 0);
-        float _shfl_xor_240 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[3], 7);
-        int _shfl_xor_241 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[3], 7);
-        float _shfl_xor_242 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[2], 7);
-        int _shfl_xor_243 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[2], 7);
-        float _shfl_xor_244 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[1], 7);
-        int _shfl_xor_245 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[1], 7);
-        float _shfl_xor_246 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[0], 7);
-        int _shfl_xor_247 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[0], 7);
-        int mine_better_71_1 = (int)(cta_scores[0] > _shfl_xor_240 || cta_scores[0] == _shfl_xor_240 && cta_indices[0] < _shfl_xor_241);
-        int take_mine_72_1 = mine_better_71_1 ^ keep_worse_70_1;
-        cta_scores[0] = ((take_mine_72_1 != 0) ? cta_scores[0] : _shfl_xor_240);
-        cta_indices[0] = ((take_mine_72_1 != 0) ? cta_indices[0] : _shfl_xor_241);
-        int mine_better_73_1 = (int)(cta_scores[1] > _shfl_xor_242 || cta_scores[1] == _shfl_xor_242 && cta_indices[1] < _shfl_xor_243);
-        int take_mine_74_1 = mine_better_73_1 ^ keep_worse_70_1;
-        cta_scores[1] = ((take_mine_74_1 != 0) ? cta_scores[1] : _shfl_xor_242);
-        cta_indices[1] = ((take_mine_74_1 != 0) ? cta_indices[1] : _shfl_xor_243);
-        int mine_better_75_1 = (int)(cta_scores[2] > _shfl_xor_244 || cta_scores[2] == _shfl_xor_244 && cta_indices[2] < _shfl_xor_245);
-        int take_mine_76_1 = mine_better_75_1 ^ keep_worse_70_1;
-        cta_scores[2] = ((take_mine_76_1 != 0) ? cta_scores[2] : _shfl_xor_244);
-        cta_indices[2] = ((take_mine_76_1 != 0) ? cta_indices[2] : _shfl_xor_245);
-        int mine_better_77_1 = (int)(cta_scores[3] > _shfl_xor_246 || cta_scores[3] == _shfl_xor_246 && cta_indices[3] < _shfl_xor_247);
-        int take_mine_78_1 = mine_better_77_1 ^ keep_worse_70_1;
-        cta_scores[3] = ((take_mine_78_1 != 0) ? cta_scores[3] : _shfl_xor_246);
-        cta_indices[3] = ((take_mine_78_1 != 0) ? cta_indices[3] : _shfl_xor_247);
-        int keep_worse_79_1 = (int)((lane_1 & 2) != 0);
-        float _shfl_xor_248 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[0], 2);
-        int _shfl_xor_249 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[0], 2);
-        float _shfl_xor_250 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[1], 2);
-        int _shfl_xor_251 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[1], 2);
-        float _shfl_xor_252 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[2], 2);
-        int _shfl_xor_253 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[2], 2);
-        float _shfl_xor_254 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[3], 2);
-        int _shfl_xor_255 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[3], 2);
-        int mine_better_80_1 = (int)(cta_scores[0] > _shfl_xor_248 || cta_scores[0] == _shfl_xor_248 && cta_indices[0] < _shfl_xor_249);
-        int take_mine_81_1 = mine_better_80_1 ^ keep_worse_79_1;
-        cta_scores[0] = ((take_mine_81_1 != 0) ? cta_scores[0] : _shfl_xor_248);
-        cta_indices[0] = ((take_mine_81_1 != 0) ? cta_indices[0] : _shfl_xor_249);
-        int mine_better_82_1 = (int)(cta_scores[1] > _shfl_xor_250 || cta_scores[1] == _shfl_xor_250 && cta_indices[1] < _shfl_xor_251);
-        int take_mine_83_1 = mine_better_82_1 ^ keep_worse_79_1;
-        cta_scores[1] = ((take_mine_83_1 != 0) ? cta_scores[1] : _shfl_xor_250);
-        cta_indices[1] = ((take_mine_83_1 != 0) ? cta_indices[1] : _shfl_xor_251);
-        int mine_better_84_1 = (int)(cta_scores[2] > _shfl_xor_252 || cta_scores[2] == _shfl_xor_252 && cta_indices[2] < _shfl_xor_253);
-        int take_mine_85_1 = mine_better_84_1 ^ keep_worse_79_1;
-        cta_scores[2] = ((take_mine_85_1 != 0) ? cta_scores[2] : _shfl_xor_252);
-        cta_indices[2] = ((take_mine_85_1 != 0) ? cta_indices[2] : _shfl_xor_253);
-        int mine_better_86_1 = (int)(cta_scores[3] > _shfl_xor_254 || cta_scores[3] == _shfl_xor_254 && cta_indices[3] < _shfl_xor_255);
-        int take_mine_87_1 = mine_better_86_1 ^ keep_worse_79_1;
-        cta_scores[3] = ((take_mine_87_1 != 0) ? cta_scores[3] : _shfl_xor_254);
-        cta_indices[3] = ((take_mine_87_1 != 0) ? cta_indices[3] : _shfl_xor_255);
-        int keep_worse_88_1 = (int)((lane_1 & 1) != 0);
-        float _shfl_xor_256 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[0], 1);
-        int _shfl_xor_257 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[0], 1);
-        float _shfl_xor_258 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[1], 1);
-        int _shfl_xor_259 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[1], 1);
-        float _shfl_xor_260 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[2], 1);
-        int _shfl_xor_261 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[2], 1);
-        float _shfl_xor_262 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[3], 1);
-        int _shfl_xor_263 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[3], 1);
-        int mine_better_89_1 = (int)(cta_scores[0] > _shfl_xor_256 || cta_scores[0] == _shfl_xor_256 && cta_indices[0] < _shfl_xor_257);
-        int take_mine_90_1 = mine_better_89_1 ^ keep_worse_88_1;
-        cta_scores[0] = ((take_mine_90_1 != 0) ? cta_scores[0] : _shfl_xor_256);
-        cta_indices[0] = ((take_mine_90_1 != 0) ? cta_indices[0] : _shfl_xor_257);
-        int mine_better_91_1 = (int)(cta_scores[1] > _shfl_xor_258 || cta_scores[1] == _shfl_xor_258 && cta_indices[1] < _shfl_xor_259);
-        int take_mine_92_1 = mine_better_91_1 ^ keep_worse_88_1;
-        cta_scores[1] = ((take_mine_92_1 != 0) ? cta_scores[1] : _shfl_xor_258);
-        cta_indices[1] = ((take_mine_92_1 != 0) ? cta_indices[1] : _shfl_xor_259);
-        int mine_better_93_1 = (int)(cta_scores[2] > _shfl_xor_260 || cta_scores[2] == _shfl_xor_260 && cta_indices[2] < _shfl_xor_261);
-        int take_mine_94_1 = mine_better_93_1 ^ keep_worse_88_1;
-        cta_scores[2] = ((take_mine_94_1 != 0) ? cta_scores[2] : _shfl_xor_260);
-        cta_indices[2] = ((take_mine_94_1 != 0) ? cta_indices[2] : _shfl_xor_261);
-        int mine_better_95_1 = (int)(cta_scores[3] > _shfl_xor_262 || cta_scores[3] == _shfl_xor_262 && cta_indices[3] < _shfl_xor_263);
-        int take_mine_96_1 = mine_better_95_1 ^ keep_worse_88_1;
-        cta_scores[3] = ((take_mine_96_1 != 0) ? cta_scores[3] : _shfl_xor_262);
-        cta_indices[3] = ((take_mine_96_1 != 0) ? cta_indices[3] : _shfl_xor_263);
-        int swap_97_1 = (int)(cta_scores[2] > cta_scores[0] || cta_scores[2] == cta_scores[0] && cta_indices[2] < cta_indices[0]);
-        float lower_score_98_1 = ((swap_97_1 != 0) ? cta_scores[2] : cta_scores[0]);
-        int lower_index_99_1 = ((swap_97_1 != 0) ? cta_indices[2] : cta_indices[0]);
-        float upper_score_100_1 = ((swap_97_1 != 0) ? cta_scores[0] : cta_scores[2]);
-        int upper_index_101_1 = ((swap_97_1 != 0) ? cta_indices[0] : cta_indices[2]);
-        cta_scores[0] = lower_score_98_1;
-        cta_indices[0] = lower_index_99_1;
-        cta_scores[2] = upper_score_100_1;
-        cta_indices[2] = upper_index_101_1;
-        int swap_102_1 = (int)(cta_scores[3] > cta_scores[1] || cta_scores[3] == cta_scores[1] && cta_indices[3] < cta_indices[1]);
-        float lower_score_103_1 = ((swap_102_1 != 0) ? cta_scores[3] : cta_scores[1]);
-        int lower_index_104_1 = ((swap_102_1 != 0) ? cta_indices[3] : cta_indices[1]);
-        float upper_score_105_1 = ((swap_102_1 != 0) ? cta_scores[1] : cta_scores[3]);
-        int upper_index_106_1 = ((swap_102_1 != 0) ? cta_indices[1] : cta_indices[3]);
-        cta_scores[1] = lower_score_103_1;
-        cta_indices[1] = lower_index_104_1;
-        cta_scores[3] = upper_score_105_1;
-        cta_indices[3] = upper_index_106_1;
-        int swap_107_1 = (int)(cta_scores[1] > cta_scores[0] || cta_scores[1] == cta_scores[0] && cta_indices[1] < cta_indices[0]);
-        float lower_score_108_1 = ((swap_107_1 != 0) ? cta_scores[1] : cta_scores[0]);
-        int lower_index_109_1 = ((swap_107_1 != 0) ? cta_indices[1] : cta_indices[0]);
-        float upper_score_110_1 = ((swap_107_1 != 0) ? cta_scores[0] : cta_scores[1]);
-        int upper_index_111_1 = ((swap_107_1 != 0) ? cta_indices[0] : cta_indices[1]);
-        cta_scores[0] = lower_score_108_1;
-        cta_indices[0] = lower_index_109_1;
-        cta_scores[1] = upper_score_110_1;
-        cta_indices[1] = upper_index_111_1;
-        int swap_112_1 = (int)(cta_scores[3] > cta_scores[2] || cta_scores[3] == cta_scores[2] && cta_indices[3] < cta_indices[2]);
-        float lower_score_113_1 = ((swap_112_1 != 0) ? cta_scores[3] : cta_scores[2]);
-        int lower_index_114_1 = ((swap_112_1 != 0) ? cta_indices[3] : cta_indices[2]);
-        float upper_score_115_1 = ((swap_112_1 != 0) ? cta_scores[2] : cta_scores[3]);
-        int upper_index_116_1 = ((swap_112_1 != 0) ? cta_indices[2] : cta_indices[3]);
-        cta_scores[2] = lower_score_113_1;
-        cta_indices[2] = lower_index_114_1;
-        cta_scores[3] = upper_score_115_1;
-        cta_indices[3] = upper_index_116_1;
-        int keep_worse_117_1 = (int)((lane_1 & 8) != 0);
-        float _shfl_xor_264 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[3], 11);
-        int _shfl_xor_265 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[3], 11);
-        float _shfl_xor_266 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[2], 11);
-        int _shfl_xor_267 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[2], 11);
-        float _shfl_xor_268 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[1], 11);
-        int _shfl_xor_269 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[1], 11);
-        float _shfl_xor_270 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[0], 11);
-        int _shfl_xor_271 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[0], 11);
-        int mine_better_118_1 = (int)(cta_scores[0] > _shfl_xor_264 || cta_scores[0] == _shfl_xor_264 && cta_indices[0] < _shfl_xor_265);
-        int take_mine_119_1 = mine_better_118_1 ^ keep_worse_117_1;
-        cta_scores[0] = ((take_mine_119_1 != 0) ? cta_scores[0] : _shfl_xor_264);
-        cta_indices[0] = ((take_mine_119_1 != 0) ? cta_indices[0] : _shfl_xor_265);
-        int mine_better_120_1 = (int)(cta_scores[1] > _shfl_xor_266 || cta_scores[1] == _shfl_xor_266 && cta_indices[1] < _shfl_xor_267);
-        int take_mine_121_1 = mine_better_120_1 ^ keep_worse_117_1;
-        cta_scores[1] = ((take_mine_121_1 != 0) ? cta_scores[1] : _shfl_xor_266);
-        cta_indices[1] = ((take_mine_121_1 != 0) ? cta_indices[1] : _shfl_xor_267);
-        int mine_better_122_1 = (int)(cta_scores[2] > _shfl_xor_268 || cta_scores[2] == _shfl_xor_268 && cta_indices[2] < _shfl_xor_269);
-        int take_mine_123_1 = mine_better_122_1 ^ keep_worse_117_1;
-        cta_scores[2] = ((take_mine_123_1 != 0) ? cta_scores[2] : _shfl_xor_268);
-        cta_indices[2] = ((take_mine_123_1 != 0) ? cta_indices[2] : _shfl_xor_269);
-        int mine_better_124_1 = (int)(cta_scores[3] > _shfl_xor_270 || cta_scores[3] == _shfl_xor_270 && cta_indices[3] < _shfl_xor_271);
-        int take_mine_125_1 = mine_better_124_1 ^ keep_worse_117_1;
-        cta_scores[3] = ((take_mine_125_1 != 0) ? cta_scores[3] : _shfl_xor_270);
-        cta_indices[3] = ((take_mine_125_1 != 0) ? cta_indices[3] : _shfl_xor_271);
-        int keep_worse_126_1 = (int)((lane_1 & 2) != 0);
-        float _shfl_xor_272 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[0], 2);
-        int _shfl_xor_273 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[0], 2);
-        float _shfl_xor_274 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[1], 2);
-        int _shfl_xor_275 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[1], 2);
-        float _shfl_xor_276 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[2], 2);
-        int _shfl_xor_277 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[2], 2);
-        float _shfl_xor_278 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[3], 2);
-        int _shfl_xor_279 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[3], 2);
-        int mine_better_127_1 = (int)(cta_scores[0] > _shfl_xor_272 || cta_scores[0] == _shfl_xor_272 && cta_indices[0] < _shfl_xor_273);
-        int take_mine_128_1 = mine_better_127_1 ^ keep_worse_126_1;
-        cta_scores[0] = ((take_mine_128_1 != 0) ? cta_scores[0] : _shfl_xor_272);
-        cta_indices[0] = ((take_mine_128_1 != 0) ? cta_indices[0] : _shfl_xor_273);
-        int mine_better_129_1 = (int)(cta_scores[1] > _shfl_xor_274 || cta_scores[1] == _shfl_xor_274 && cta_indices[1] < _shfl_xor_275);
-        int take_mine_130_1 = mine_better_129_1 ^ keep_worse_126_1;
-        cta_scores[1] = ((take_mine_130_1 != 0) ? cta_scores[1] : _shfl_xor_274);
-        cta_indices[1] = ((take_mine_130_1 != 0) ? cta_indices[1] : _shfl_xor_275);
-        int mine_better_131_1 = (int)(cta_scores[2] > _shfl_xor_276 || cta_scores[2] == _shfl_xor_276 && cta_indices[2] < _shfl_xor_277);
-        int take_mine_132_1 = mine_better_131_1 ^ keep_worse_126_1;
-        cta_scores[2] = ((take_mine_132_1 != 0) ? cta_scores[2] : _shfl_xor_276);
-        cta_indices[2] = ((take_mine_132_1 != 0) ? cta_indices[2] : _shfl_xor_277);
-        int mine_better_133_1 = (int)(cta_scores[3] > _shfl_xor_278 || cta_scores[3] == _shfl_xor_278 && cta_indices[3] < _shfl_xor_279);
-        int take_mine_134_1 = mine_better_133_1 ^ keep_worse_126_1;
-        cta_scores[3] = ((take_mine_134_1 != 0) ? cta_scores[3] : _shfl_xor_278);
-        cta_indices[3] = ((take_mine_134_1 != 0) ? cta_indices[3] : _shfl_xor_279);
-        int keep_worse_135_1 = (int)((lane_1 & 1) != 0);
-        float _shfl_xor_280 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[0], 1);
-        int _shfl_xor_281 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[0], 1);
-        float _shfl_xor_282 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[1], 1);
-        int _shfl_xor_283 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[1], 1);
-        float _shfl_xor_284 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[2], 1);
-        int _shfl_xor_285 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[2], 1);
-        float _shfl_xor_286 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[3], 1);
-        int _shfl_xor_287 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[3], 1);
-        int mine_better_136_1 = (int)(cta_scores[0] > _shfl_xor_280 || cta_scores[0] == _shfl_xor_280 && cta_indices[0] < _shfl_xor_281);
-        int take_mine_137_1 = mine_better_136_1 ^ keep_worse_135_1;
-        cta_scores[0] = ((take_mine_137_1 != 0) ? cta_scores[0] : _shfl_xor_280);
-        cta_indices[0] = ((take_mine_137_1 != 0) ? cta_indices[0] : _shfl_xor_281);
-        int mine_better_138_1 = (int)(cta_scores[1] > _shfl_xor_282 || cta_scores[1] == _shfl_xor_282 && cta_indices[1] < _shfl_xor_283);
-        int take_mine_139_1 = mine_better_138_1 ^ keep_worse_135_1;
-        cta_scores[1] = ((take_mine_139_1 != 0) ? cta_scores[1] : _shfl_xor_282);
-        cta_indices[1] = ((take_mine_139_1 != 0) ? cta_indices[1] : _shfl_xor_283);
-        int mine_better_140_1 = (int)(cta_scores[2] > _shfl_xor_284 || cta_scores[2] == _shfl_xor_284 && cta_indices[2] < _shfl_xor_285);
-        int take_mine_141_1 = mine_better_140_1 ^ keep_worse_135_1;
-        cta_scores[2] = ((take_mine_141_1 != 0) ? cta_scores[2] : _shfl_xor_284);
-        cta_indices[2] = ((take_mine_141_1 != 0) ? cta_indices[2] : _shfl_xor_285);
-        int mine_better_142_1 = (int)(cta_scores[3] > _shfl_xor_286 || cta_scores[3] == _shfl_xor_286 && cta_indices[3] < _shfl_xor_287);
-        int take_mine_143_1 = mine_better_142_1 ^ keep_worse_135_1;
-        cta_scores[3] = ((take_mine_143_1 != 0) ? cta_scores[3] : _shfl_xor_286);
-        cta_indices[3] = ((take_mine_143_1 != 0) ? cta_indices[3] : _shfl_xor_287);
-        int swap_144_1 = (int)(cta_scores[2] > cta_scores[0] || cta_scores[2] == cta_scores[0] && cta_indices[2] < cta_indices[0]);
-        float lower_score_145_1 = ((swap_144_1 != 0) ? cta_scores[2] : cta_scores[0]);
-        int lower_index_146_1 = ((swap_144_1 != 0) ? cta_indices[2] : cta_indices[0]);
-        float upper_score_147_1 = ((swap_144_1 != 0) ? cta_scores[0] : cta_scores[2]);
-        int upper_index_148_1 = ((swap_144_1 != 0) ? cta_indices[0] : cta_indices[2]);
-        cta_scores[0] = lower_score_145_1;
-        cta_indices[0] = lower_index_146_1;
-        cta_scores[2] = upper_score_147_1;
-        cta_indices[2] = upper_index_148_1;
-        int swap_149_1 = (int)(cta_scores[3] > cta_scores[1] || cta_scores[3] == cta_scores[1] && cta_indices[3] < cta_indices[1]);
-        float lower_score_150_1 = ((swap_149_1 != 0) ? cta_scores[3] : cta_scores[1]);
-        int lower_index_151_1 = ((swap_149_1 != 0) ? cta_indices[3] : cta_indices[1]);
-        float upper_score_152_1 = ((swap_149_1 != 0) ? cta_scores[1] : cta_scores[3]);
-        int upper_index_153_1 = ((swap_149_1 != 0) ? cta_indices[1] : cta_indices[3]);
-        cta_scores[1] = lower_score_150_1;
-        cta_indices[1] = lower_index_151_1;
-        cta_scores[3] = upper_score_152_1;
-        cta_indices[3] = upper_index_153_1;
-        int swap_154_1 = (int)(cta_scores[1] > cta_scores[0] || cta_scores[1] == cta_scores[0] && cta_indices[1] < cta_indices[0]);
-        float lower_score_155_1 = ((swap_154_1 != 0) ? cta_scores[1] : cta_scores[0]);
-        int lower_index_156_1 = ((swap_154_1 != 0) ? cta_indices[1] : cta_indices[0]);
-        float upper_score_157_1 = ((swap_154_1 != 0) ? cta_scores[0] : cta_scores[1]);
-        int upper_index_158_1 = ((swap_154_1 != 0) ? cta_indices[0] : cta_indices[1]);
-        cta_scores[0] = lower_score_155_1;
-        cta_indices[0] = lower_index_156_1;
-        cta_scores[1] = upper_score_157_1;
-        cta_indices[1] = upper_index_158_1;
-        int swap_159_1 = (int)(cta_scores[3] > cta_scores[2] || cta_scores[3] == cta_scores[2] && cta_indices[3] < cta_indices[2]);
-        float lower_score_160_1 = ((swap_159_1 != 0) ? cta_scores[3] : cta_scores[2]);
-        int lower_index_161_1 = ((swap_159_1 != 0) ? cta_indices[3] : cta_indices[2]);
-        float upper_score_162_1 = ((swap_159_1 != 0) ? cta_scores[2] : cta_scores[3]);
-        int upper_index_163_1 = ((swap_159_1 != 0) ? cta_indices[2] : cta_indices[3]);
-        cta_scores[2] = lower_score_160_1;
-        cta_indices[2] = lower_index_161_1;
-        cta_scores[3] = upper_score_162_1;
-        cta_indices[3] = upper_index_163_1;
-        int keep_worse_164_1 = (int)((lane_1 & 16) != 0);
-        float _shfl_xor_288 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[3], 19);
-        int _shfl_xor_289 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[3], 19);
-        float _shfl_xor_290 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[2], 19);
-        int _shfl_xor_291 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[2], 19);
-        float _shfl_xor_292 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[1], 19);
-        int _shfl_xor_293 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[1], 19);
-        float _shfl_xor_294 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[0], 19);
-        int _shfl_xor_295 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[0], 19);
-        int mine_better_165_1 = (int)(cta_scores[0] > _shfl_xor_288 || cta_scores[0] == _shfl_xor_288 && cta_indices[0] < _shfl_xor_289);
-        int take_mine_166_1 = mine_better_165_1 ^ keep_worse_164_1;
-        cta_scores[0] = ((take_mine_166_1 != 0) ? cta_scores[0] : _shfl_xor_288);
-        cta_indices[0] = ((take_mine_166_1 != 0) ? cta_indices[0] : _shfl_xor_289);
-        int mine_better_167_1 = (int)(cta_scores[1] > _shfl_xor_290 || cta_scores[1] == _shfl_xor_290 && cta_indices[1] < _shfl_xor_291);
-        int take_mine_168_1 = mine_better_167_1 ^ keep_worse_164_1;
-        cta_scores[1] = ((take_mine_168_1 != 0) ? cta_scores[1] : _shfl_xor_290);
-        cta_indices[1] = ((take_mine_168_1 != 0) ? cta_indices[1] : _shfl_xor_291);
-        int mine_better_169_1 = (int)(cta_scores[2] > _shfl_xor_292 || cta_scores[2] == _shfl_xor_292 && cta_indices[2] < _shfl_xor_293);
-        int take_mine_170_1 = mine_better_169_1 ^ keep_worse_164_1;
-        cta_scores[2] = ((take_mine_170_1 != 0) ? cta_scores[2] : _shfl_xor_292);
-        cta_indices[2] = ((take_mine_170_1 != 0) ? cta_indices[2] : _shfl_xor_293);
-        int mine_better_171_1 = (int)(cta_scores[3] > _shfl_xor_294 || cta_scores[3] == _shfl_xor_294 && cta_indices[3] < _shfl_xor_295);
-        int take_mine_172_1 = mine_better_171_1 ^ keep_worse_164_1;
-        cta_scores[3] = ((take_mine_172_1 != 0) ? cta_scores[3] : _shfl_xor_294);
-        cta_indices[3] = ((take_mine_172_1 != 0) ? cta_indices[3] : _shfl_xor_295);
-        int keep_worse_173_1 = (int)((lane_1 & 2) != 0);
-        float _shfl_xor_296 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[0], 2);
-        int _shfl_xor_297 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[0], 2);
-        float _shfl_xor_298 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[1], 2);
-        int _shfl_xor_299 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[1], 2);
-        float _shfl_xor_300 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[2], 2);
-        int _shfl_xor_301 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[2], 2);
-        float _shfl_xor_302 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[3], 2);
-        int _shfl_xor_303 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[3], 2);
-        int mine_better_174_1 = (int)(cta_scores[0] > _shfl_xor_296 || cta_scores[0] == _shfl_xor_296 && cta_indices[0] < _shfl_xor_297);
-        int take_mine_175_1 = mine_better_174_1 ^ keep_worse_173_1;
-        cta_scores[0] = ((take_mine_175_1 != 0) ? cta_scores[0] : _shfl_xor_296);
-        cta_indices[0] = ((take_mine_175_1 != 0) ? cta_indices[0] : _shfl_xor_297);
-        int mine_better_176_1 = (int)(cta_scores[1] > _shfl_xor_298 || cta_scores[1] == _shfl_xor_298 && cta_indices[1] < _shfl_xor_299);
-        int take_mine_177_1 = mine_better_176_1 ^ keep_worse_173_1;
-        cta_scores[1] = ((take_mine_177_1 != 0) ? cta_scores[1] : _shfl_xor_298);
-        cta_indices[1] = ((take_mine_177_1 != 0) ? cta_indices[1] : _shfl_xor_299);
-        int mine_better_178_1 = (int)(cta_scores[2] > _shfl_xor_300 || cta_scores[2] == _shfl_xor_300 && cta_indices[2] < _shfl_xor_301);
-        int take_mine_179_1 = mine_better_178_1 ^ keep_worse_173_1;
-        cta_scores[2] = ((take_mine_179_1 != 0) ? cta_scores[2] : _shfl_xor_300);
-        cta_indices[2] = ((take_mine_179_1 != 0) ? cta_indices[2] : _shfl_xor_301);
-        int mine_better_180_1 = (int)(cta_scores[3] > _shfl_xor_302 || cta_scores[3] == _shfl_xor_302 && cta_indices[3] < _shfl_xor_303);
-        int take_mine_181_1 = mine_better_180_1 ^ keep_worse_173_1;
-        cta_scores[3] = ((take_mine_181_1 != 0) ? cta_scores[3] : _shfl_xor_302);
-        cta_indices[3] = ((take_mine_181_1 != 0) ? cta_indices[3] : _shfl_xor_303);
-        int keep_worse_182_1 = (int)((lane_1 & 1) != 0);
-        float _shfl_xor_304 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[0], 1);
-        int _shfl_xor_305 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[0], 1);
-        float _shfl_xor_306 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[1], 1);
-        int _shfl_xor_307 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[1], 1);
-        float _shfl_xor_308 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[2], 1);
-        int _shfl_xor_309 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[2], 1);
-        float _shfl_xor_310 = __shfl_xor_sync(0xFFFFFFFF, cta_scores[3], 1);
-        int _shfl_xor_311 = __shfl_xor_sync(0xFFFFFFFF, cta_indices[3], 1);
-        int mine_better_183_1 = (int)(cta_scores[0] > _shfl_xor_304 || cta_scores[0] == _shfl_xor_304 && cta_indices[0] < _shfl_xor_305);
-        int take_mine_184_1 = mine_better_183_1 ^ keep_worse_182_1;
-        cta_scores[0] = ((take_mine_184_1 != 0) ? cta_scores[0] : _shfl_xor_304);
-        cta_indices[0] = ((take_mine_184_1 != 0) ? cta_indices[0] : _shfl_xor_305);
-        int mine_better_185_1 = (int)(cta_scores[1] > _shfl_xor_306 || cta_scores[1] == _shfl_xor_306 && cta_indices[1] < _shfl_xor_307);
-        int take_mine_186_1 = mine_better_185_1 ^ keep_worse_182_1;
-        cta_scores[1] = ((take_mine_186_1 != 0) ? cta_scores[1] : _shfl_xor_306);
-        cta_indices[1] = ((take_mine_186_1 != 0) ? cta_indices[1] : _shfl_xor_307);
-        int mine_better_187_1 = (int)(cta_scores[2] > _shfl_xor_308 || cta_scores[2] == _shfl_xor_308 && cta_indices[2] < _shfl_xor_309);
-        int take_mine_188_1 = mine_better_187_1 ^ keep_worse_182_1;
-        cta_scores[2] = ((take_mine_188_1 != 0) ? cta_scores[2] : _shfl_xor_308);
-        cta_indices[2] = ((take_mine_188_1 != 0) ? cta_indices[2] : _shfl_xor_309);
-        int mine_better_189_1 = (int)(cta_scores[3] > _shfl_xor_310 || cta_scores[3] == _shfl_xor_310 && cta_indices[3] < _shfl_xor_311);
-        int take_mine_190_1 = mine_better_189_1 ^ keep_worse_182_1;
-        cta_scores[3] = ((take_mine_190_1 != 0) ? cta_scores[3] : _shfl_xor_310);
-        cta_indices[3] = ((take_mine_190_1 != 0) ? cta_indices[3] : _shfl_xor_311);
-        int swap_191_1 = (int)(cta_scores[2] > cta_scores[0] || cta_scores[2] == cta_scores[0] && cta_indices[2] < cta_indices[0]);
-        float lower_score_192_1 = ((swap_191_1 != 0) ? cta_scores[2] : cta_scores[0]);
-        int lower_index_193_1 = ((swap_191_1 != 0) ? cta_indices[2] : cta_indices[0]);
-        float upper_score_194_1 = ((swap_191_1 != 0) ? cta_scores[0] : cta_scores[2]);
-        int upper_index_195_1 = ((swap_191_1 != 0) ? cta_indices[0] : cta_indices[2]);
-        cta_scores[0] = lower_score_192_1;
-        cta_indices[0] = lower_index_193_1;
-        cta_scores[2] = upper_score_194_1;
-        cta_indices[2] = upper_index_195_1;
-        int swap_196_1 = (int)(cta_scores[3] > cta_scores[1] || cta_scores[3] == cta_scores[1] && cta_indices[3] < cta_indices[1]);
-        float lower_score_197_1 = ((swap_196_1 != 0) ? cta_scores[3] : cta_scores[1]);
-        int lower_index_198_1 = ((swap_196_1 != 0) ? cta_indices[3] : cta_indices[1]);
-        float upper_score_199_1 = ((swap_196_1 != 0) ? cta_scores[1] : cta_scores[3]);
-        int upper_index_200_1 = ((swap_196_1 != 0) ? cta_indices[1] : cta_indices[3]);
-        cta_scores[1] = lower_score_197_1;
-        cta_indices[1] = lower_index_198_1;
-        cta_scores[3] = upper_score_199_1;
-        cta_indices[3] = upper_index_200_1;
-        int swap_201_1 = (int)(cta_scores[1] > cta_scores[0] || cta_scores[1] == cta_scores[0] && cta_indices[1] < cta_indices[0]);
-        float lower_score_202_1 = ((swap_201_1 != 0) ? cta_scores[1] : cta_scores[0]);
-        int lower_index_203_1 = ((swap_201_1 != 0) ? cta_indices[1] : cta_indices[0]);
-        float upper_score_204_1 = ((swap_201_1 != 0) ? cta_scores[0] : cta_scores[1]);
-        int upper_index_205_1 = ((swap_201_1 != 0) ? cta_indices[0] : cta_indices[1]);
-        cta_scores[0] = lower_score_202_1;
-        cta_indices[0] = lower_index_203_1;
-        cta_scores[1] = upper_score_204_1;
-        cta_indices[1] = upper_index_205_1;
-        int swap_206_1 = (int)(cta_scores[3] > cta_scores[2] || cta_scores[3] == cta_scores[2] && cta_indices[3] < cta_indices[2]);
-        float lower_score_207_1 = ((swap_206_1 != 0) ? cta_scores[3] : cta_scores[2]);
-        int lower_index_208_1 = ((swap_206_1 != 0) ? cta_indices[3] : cta_indices[2]);
-        float upper_score_209_1 = ((swap_206_1 != 0) ? cta_scores[2] : cta_scores[3]);
-        int upper_index_210_1 = ((swap_206_1 != 0) ? cta_indices[2] : cta_indices[3]);
-        cta_scores[2] = lower_score_207_1;
-        cta_indices[2] = lower_index_208_1;
-        cta_scores[3] = upper_score_209_1;
-        cta_indices[3] = upper_index_210_1;
         int position = lane_1 - forced;
         if (position < 0) {
             position = 0;
@@ -1715,26 +1324,7 @@ kernel_cake_blackwell_msa_d03b9d08c1e9314fbc4a(float* __restrict__ max_score, in
         if (position > 15) {
             position = 15;
         }
-        int source_lane = position / 4;
-        int source_slot = position & 3;
-        int _shfl_0 = __shfl_sync(0xFFFFFFFF, cta_indices[0], source_lane);
-        int pick_0 = _shfl_0;
-        int _shfl_1 = __shfl_sync(0xFFFFFFFF, cta_indices[1], source_lane);
-        int pick_1 = _shfl_1;
-        int _shfl_2 = __shfl_sync(0xFFFFFFFF, cta_indices[2], source_lane);
-        int pick_2 = _shfl_2;
-        int _shfl_3 = __shfl_sync(0xFFFFFFFF, cta_indices[3], source_lane);
-        int pick_3 = _shfl_3;
-        int picked = pick_0;
-        if (source_slot == 1) {
-            picked = pick_1;
-        }
-        if (source_slot == 2) {
-            picked = pick_2;
-        }
-        if (source_slot == 3) {
-            picked = pick_3;
-        }
+        int picked = final_indices[position];
         int value = max_k_tiles;
         if (lane_1 < 16) {
             value = picked;
@@ -1748,96 +1338,96 @@ kernel_cake_blackwell_msa_d03b9d08c1e9314fbc4a(float* __restrict__ max_score, in
                 value = max_k_tiles;
             }
         }
-        int _shfl_xor_312 = __shfl_xor_sync(0xFFFFFFFF, value, 1);
-        int _min_0 = ((value) < (_shfl_xor_312) ? (value) : (_shfl_xor_312));
+        int _shfl_xor_217 = __shfl_xor_sync(0xFFFFFFFF, value, 1);
+        int _min_0 = ((value) < (_shfl_xor_217) ? (value) : (_shfl_xor_217));
         int lo = _min_0;
-        int _max_0 = ((value) > (_shfl_xor_312) ? (value) : (_shfl_xor_312));
+        int _max_0 = ((value) > (_shfl_xor_217) ? (value) : (_shfl_xor_217));
         int hi = _max_0;
         int ascending = (int)((lane_1 & 2) == 0);
         int lower_lane = (int)((lane_1 & 1) == 0);
         int take_low = (int)(ascending == lower_lane);
         value = ((take_low == 1) ? lo : hi);
-        int _shfl_xor_313 = __shfl_xor_sync(0xFFFFFFFF, value, 2);
-        int _min_1 = ((value) < (_shfl_xor_313) ? (value) : (_shfl_xor_313));
-        int lo_211 = _min_1;
-        int _max_1 = ((value) > (_shfl_xor_313) ? (value) : (_shfl_xor_313));
-        int hi_212 = _max_1;
-        int ascending_213 = (int)((lane_1 & 4) == 0);
-        int lower_lane_214 = (int)((lane_1 & 2) == 0);
-        int take_low_215 = (int)(ascending_213 == lower_lane_214);
-        value = ((take_low_215 == 1) ? lo_211 : hi_212);
-        int _shfl_xor_314 = __shfl_xor_sync(0xFFFFFFFF, value, 1);
-        int _min_2 = ((value) < (_shfl_xor_314) ? (value) : (_shfl_xor_314));
-        int lo_216 = _min_2;
-        int _max_2 = ((value) > (_shfl_xor_314) ? (value) : (_shfl_xor_314));
-        int hi_217 = _max_2;
-        int ascending_218 = (int)((lane_1 & 4) == 0);
-        int lower_lane_219 = (int)((lane_1 & 1) == 0);
-        int take_low_220 = (int)(ascending_218 == lower_lane_219);
-        value = ((take_low_220 == 1) ? lo_216 : hi_217);
-        int _shfl_xor_315 = __shfl_xor_sync(0xFFFFFFFF, value, 4);
-        int _min_3 = ((value) < (_shfl_xor_315) ? (value) : (_shfl_xor_315));
-        int lo_221 = _min_3;
-        int _max_3 = ((value) > (_shfl_xor_315) ? (value) : (_shfl_xor_315));
-        int hi_222 = _max_3;
-        int ascending_223 = (int)((lane_1 & 8) == 0);
-        int lower_lane_224 = (int)((lane_1 & 4) == 0);
-        int take_low_225 = (int)(ascending_223 == lower_lane_224);
-        value = ((take_low_225 == 1) ? lo_221 : hi_222);
-        int _shfl_xor_316 = __shfl_xor_sync(0xFFFFFFFF, value, 2);
-        int _min_4 = ((value) < (_shfl_xor_316) ? (value) : (_shfl_xor_316));
-        int lo_226 = _min_4;
-        int _max_4 = ((value) > (_shfl_xor_316) ? (value) : (_shfl_xor_316));
-        int hi_227 = _max_4;
-        int ascending_228 = (int)((lane_1 & 8) == 0);
-        int lower_lane_229 = (int)((lane_1 & 2) == 0);
-        int take_low_230 = (int)(ascending_228 == lower_lane_229);
-        value = ((take_low_230 == 1) ? lo_226 : hi_227);
-        int _shfl_xor_317 = __shfl_xor_sync(0xFFFFFFFF, value, 1);
-        int _min_5 = ((value) < (_shfl_xor_317) ? (value) : (_shfl_xor_317));
-        int lo_231 = _min_5;
-        int _max_5 = ((value) > (_shfl_xor_317) ? (value) : (_shfl_xor_317));
-        int hi_232 = _max_5;
-        int ascending_233 = (int)((lane_1 & 8) == 0);
-        int lower_lane_234 = (int)((lane_1 & 1) == 0);
-        int take_low_235 = (int)(ascending_233 == lower_lane_234);
-        value = ((take_low_235 == 1) ? lo_231 : hi_232);
-        int _shfl_xor_318 = __shfl_xor_sync(0xFFFFFFFF, value, 8);
-        int _min_6 = ((value) < (_shfl_xor_318) ? (value) : (_shfl_xor_318));
-        int lo_236 = _min_6;
-        int _max_6 = ((value) > (_shfl_xor_318) ? (value) : (_shfl_xor_318));
-        int hi_237 = _max_6;
-        int ascending_238 = (int)((lane_1 & 16) == 0);
-        int lower_lane_239 = (int)((lane_1 & 8) == 0);
-        int take_low_240 = (int)(ascending_238 == lower_lane_239);
-        value = ((take_low_240 == 1) ? lo_236 : hi_237);
-        int _shfl_xor_319 = __shfl_xor_sync(0xFFFFFFFF, value, 4);
-        int _min_7 = ((value) < (_shfl_xor_319) ? (value) : (_shfl_xor_319));
-        int lo_241 = _min_7;
-        int _max_7 = ((value) > (_shfl_xor_319) ? (value) : (_shfl_xor_319));
-        int hi_242 = _max_7;
-        int ascending_243 = (int)((lane_1 & 16) == 0);
-        int lower_lane_244 = (int)((lane_1 & 4) == 0);
-        int take_low_245 = (int)(ascending_243 == lower_lane_244);
-        value = ((take_low_245 == 1) ? lo_241 : hi_242);
-        int _shfl_xor_320 = __shfl_xor_sync(0xFFFFFFFF, value, 2);
-        int _min_8 = ((value) < (_shfl_xor_320) ? (value) : (_shfl_xor_320));
-        int lo_246 = _min_8;
-        int _max_8 = ((value) > (_shfl_xor_320) ? (value) : (_shfl_xor_320));
-        int hi_247 = _max_8;
-        int ascending_248 = (int)((lane_1 & 16) == 0);
-        int lower_lane_249 = (int)((lane_1 & 2) == 0);
-        int take_low_250 = (int)(ascending_248 == lower_lane_249);
-        value = ((take_low_250 == 1) ? lo_246 : hi_247);
-        int _shfl_xor_321 = __shfl_xor_sync(0xFFFFFFFF, value, 1);
-        int _min_9 = ((value) < (_shfl_xor_321) ? (value) : (_shfl_xor_321));
-        int lo_251 = _min_9;
-        int _max_9 = ((value) > (_shfl_xor_321) ? (value) : (_shfl_xor_321));
-        int hi_252 = _max_9;
-        int ascending_253 = (int)((lane_1 & 16) == 0);
-        int lower_lane_254 = (int)((lane_1 & 1) == 0);
-        int take_low_255 = (int)(ascending_253 == lower_lane_254);
-        value = ((take_low_255 == 1) ? lo_251 : hi_252);
+        int _shfl_xor_218 = __shfl_xor_sync(0xFFFFFFFF, value, 2);
+        int _min_1 = ((value) < (_shfl_xor_218) ? (value) : (_shfl_xor_218));
+        int lo_0 = _min_1;
+        int _max_1 = ((value) > (_shfl_xor_218) ? (value) : (_shfl_xor_218));
+        int hi_1 = _max_1;
+        int ascending_2 = (int)((lane_1 & 4) == 0);
+        int lower_lane_3 = (int)((lane_1 & 2) == 0);
+        int take_low_4 = (int)(ascending_2 == lower_lane_3);
+        value = ((take_low_4 == 1) ? lo_0 : hi_1);
+        int _shfl_xor_219 = __shfl_xor_sync(0xFFFFFFFF, value, 1);
+        int _min_2 = ((value) < (_shfl_xor_219) ? (value) : (_shfl_xor_219));
+        int lo_5 = _min_2;
+        int _max_2 = ((value) > (_shfl_xor_219) ? (value) : (_shfl_xor_219));
+        int hi_6 = _max_2;
+        int ascending_7 = (int)((lane_1 & 4) == 0);
+        int lower_lane_8 = (int)((lane_1 & 1) == 0);
+        int take_low_9 = (int)(ascending_7 == lower_lane_8);
+        value = ((take_low_9 == 1) ? lo_5 : hi_6);
+        int _shfl_xor_220 = __shfl_xor_sync(0xFFFFFFFF, value, 4);
+        int _min_3 = ((value) < (_shfl_xor_220) ? (value) : (_shfl_xor_220));
+        int lo_10 = _min_3;
+        int _max_3 = ((value) > (_shfl_xor_220) ? (value) : (_shfl_xor_220));
+        int hi_11 = _max_3;
+        int ascending_12 = (int)((lane_1 & 8) == 0);
+        int lower_lane_13 = (int)((lane_1 & 4) == 0);
+        int take_low_14 = (int)(ascending_12 == lower_lane_13);
+        value = ((take_low_14 == 1) ? lo_10 : hi_11);
+        int _shfl_xor_221 = __shfl_xor_sync(0xFFFFFFFF, value, 2);
+        int _min_4 = ((value) < (_shfl_xor_221) ? (value) : (_shfl_xor_221));
+        int lo_15 = _min_4;
+        int _max_4 = ((value) > (_shfl_xor_221) ? (value) : (_shfl_xor_221));
+        int hi_16 = _max_4;
+        int ascending_17 = (int)((lane_1 & 8) == 0);
+        int lower_lane_18 = (int)((lane_1 & 2) == 0);
+        int take_low_19 = (int)(ascending_17 == lower_lane_18);
+        value = ((take_low_19 == 1) ? lo_15 : hi_16);
+        int _shfl_xor_222 = __shfl_xor_sync(0xFFFFFFFF, value, 1);
+        int _min_5 = ((value) < (_shfl_xor_222) ? (value) : (_shfl_xor_222));
+        int lo_20 = _min_5;
+        int _max_5 = ((value) > (_shfl_xor_222) ? (value) : (_shfl_xor_222));
+        int hi_21 = _max_5;
+        int ascending_22 = (int)((lane_1 & 8) == 0);
+        int lower_lane_23 = (int)((lane_1 & 1) == 0);
+        int take_low_24 = (int)(ascending_22 == lower_lane_23);
+        value = ((take_low_24 == 1) ? lo_20 : hi_21);
+        int _shfl_xor_223 = __shfl_xor_sync(0xFFFFFFFF, value, 8);
+        int _min_6 = ((value) < (_shfl_xor_223) ? (value) : (_shfl_xor_223));
+        int lo_25 = _min_6;
+        int _max_6 = ((value) > (_shfl_xor_223) ? (value) : (_shfl_xor_223));
+        int hi_26 = _max_6;
+        int ascending_27 = (int)((lane_1 & 16) == 0);
+        int lower_lane_28 = (int)((lane_1 & 8) == 0);
+        int take_low_29 = (int)(ascending_27 == lower_lane_28);
+        value = ((take_low_29 == 1) ? lo_25 : hi_26);
+        int _shfl_xor_224 = __shfl_xor_sync(0xFFFFFFFF, value, 4);
+        int _min_7 = ((value) < (_shfl_xor_224) ? (value) : (_shfl_xor_224));
+        int lo_30 = _min_7;
+        int _max_7 = ((value) > (_shfl_xor_224) ? (value) : (_shfl_xor_224));
+        int hi_31 = _max_7;
+        int ascending_32 = (int)((lane_1 & 16) == 0);
+        int lower_lane_33 = (int)((lane_1 & 4) == 0);
+        int take_low_34 = (int)(ascending_32 == lower_lane_33);
+        value = ((take_low_34 == 1) ? lo_30 : hi_31);
+        int _shfl_xor_225 = __shfl_xor_sync(0xFFFFFFFF, value, 2);
+        int _min_8 = ((value) < (_shfl_xor_225) ? (value) : (_shfl_xor_225));
+        int lo_35 = _min_8;
+        int _max_8 = ((value) > (_shfl_xor_225) ? (value) : (_shfl_xor_225));
+        int hi_36 = _max_8;
+        int ascending_37 = (int)((lane_1 & 16) == 0);
+        int lower_lane_38 = (int)((lane_1 & 2) == 0);
+        int take_low_39 = (int)(ascending_37 == lower_lane_38);
+        value = ((take_low_39 == 1) ? lo_35 : hi_36);
+        int _shfl_xor_226 = __shfl_xor_sync(0xFFFFFFFF, value, 1);
+        int _min_9 = ((value) < (_shfl_xor_226) ? (value) : (_shfl_xor_226));
+        int lo_40 = _min_9;
+        int _max_9 = ((value) > (_shfl_xor_226) ? (value) : (_shfl_xor_226));
+        int hi_41 = _max_9;
+        int ascending_42 = (int)((lane_1 & 16) == 0);
+        int lower_lane_43 = (int)((lane_1 & 1) == 0);
+        int take_low_44 = (int)(ascending_42 == lower_lane_43);
+        value = ((take_low_44 == 1) ? lo_40 : hi_41);
         if (lane_1 < 16) {
             int stored = value;
             if (value >= num_valid_pages) {
