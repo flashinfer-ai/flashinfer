@@ -154,6 +154,58 @@ memory do not support this lifecycle.
 
     .. automethod:: __init__
 
+Cake NVFP4-Transport AllReduce
+------------------------------
+
+``cake_fp4_allreduce`` sums ``[rows, 6144]`` bfloat16 activations over a two-
+or four-rank NCCL process group through NVFP4 records: every rank quantises
+its rows (E2M1 values, one E4M3 scale per 16 values, one float32 row scale),
+pushes them into Lamport receive windows of its peers and decodes the gathered
+records in rank order with float32 accumulation, so the result is bitwise
+identical on every rank.  World size 2 runs a one-shot exchange, world size 4
+a two-shot exchange whose owner ranks reduce, re-encode and all-gather (one of
+three phase-B schedules is chosen per call from the rows each CTA owns).
+``cake_fp4_allreduce_nvfp4`` accepts pre-quantised ``[rows, 3456]`` records
+with one static scale per rank.
+
+A ``CakeFp4AllReduceWorkspace`` is created collectively on every rank of the
+group with the same family (``"allreduce"`` or ``"rmsnorm"``), input format
+(``"bf16"`` or ``"nvfp4"``) and row capacity; it shares the receive windows
+through CUDA IPC, arms their sentinels and publishes the peer window table.
+Calls accept any row count up to the capacity (a multiple of 4 for world size
+4), perform no allocation when the output buffers are given and no host
+synchronisation, so they can be captured into CUDA graphs; the
+``launch_with_pdl`` flag issues the kernel as a programmatic dependent launch.
+The programs are exact-architecture builds for SM100 (B200), SM103 (B300) and
+SM107;
+the build targets follow ``FLASHINFER_CUDA_ARCH_LIST`` when set, else the
+visible devices.
+
+``cake_fp4_allreduce_rmsnorm`` (family ``"rmsnorm"``, world size 2) fuses the
+exchange with the residual add and a Gemma RMSNorm: ``z = sum + residual`` in
+float32, ``residual_out = bf16(z)``, ``rinv = rsqrt(mean(z^2) + eps)`` from the
+float32 sum of squares and ``y = bf16(z) * rinv * (weight_bias + weight)``,
+with ``eps`` and ``weight_bias`` as runtime scalars of the
+``CakeFp4AllReduceFusedNormSpec``.  The spec selects the output: bfloat16
+``y``, or ``y`` quantised to NVFP4 (packed E2M1 values and 128x4-swizzled E4M3
+block scales for a caller-supplied float32 global scale -- the layout and
+arithmetic of ``fp4_quantize``) or to MXFP8 (E4M3 values and swizzled UE8M0
+scales, as ``mxfp8_quantize``).  ``cake_fp4_allreduce_rmsnorm_nvfp4`` takes
+pre-quantised records with the same epilogue.  Both return a
+``CakeFp4AllReduceFusedNormResult``.
+
+.. autosummary::
+    :toctree: ../generated
+
+    CakeFp4AllReduceWorkspace
+    CakeFp4AllReduceFusedNormOutput
+    CakeFp4AllReduceFusedNormSpec
+    CakeFp4AllReduceFusedNormResult
+    cake_fp4_allreduce
+    cake_fp4_allreduce_nvfp4
+    cake_fp4_allreduce_rmsnorm
+    cake_fp4_allreduce_rmsnorm_nvfp4
+
 FP8 Quantized AllReduce
 -----------------------
 
