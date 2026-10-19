@@ -793,9 +793,14 @@ class MsaProxyScore:
                     gO[tidx] = -cutlass.Float32.inf
 
 
-def select_split_k(total_q, hq, batch_size, nkt):
-    """Pick the split-K fan-in from the grid this call would otherwise launch."""
-    n_mtiles = (total_q // batch_size + 127) // 128
+def select_split_k(n_mtiles, hq, batch_size, nkt):
+    """Pick the split-K fan-in from the grid this call would otherwise launch.
+
+    ``n_mtiles`` is the caller's actual query-tile count. Deriving it here from
+    total_q // batch_size priced a ragged batch off the mean: with lengths
+    [128, 128, 128, 4096] the mean picks a fan-in for a one-tile grid while the
+    real grid has 32, which over-splits work that was already wide enough.
+    """
     base_ctas = n_mtiles * hq * batch_size
     best_cost = 0x7FFFFFFF
     best_nk = 1
@@ -896,12 +901,13 @@ def run(
             f"expects {nkt}"
         )
     page_table = page_table[:, :nkt]
-    nkchunk = select_split_k(total_q, hq, batch_size, nkt)
     # The M-tile count and the TMA-Q choice must cover the LONGEST request, not
     # the mean: total_q // batch_size understates a ragged batch, which would
-    # leave the tail of the longest sequence unprocessed.
+    # leave the tail of the longest sequence unprocessed. The split-K fan-in is
+    # priced off the same count, so it is computed before the choice is made.
     sq_max = int(max_seqlen_q) if max_seqlen_q is not None else total_q // batch_size
     n_mtiles = (sq_max + 127) // 128
+    nkchunk = select_split_k(n_mtiles, hq, batch_size, nkt)
     # Derived inside the kernel object while shapes were static; with dynamic
     # shapes these are the only compile-time selections left, so the driver
     # computes them and they alone key the cache.

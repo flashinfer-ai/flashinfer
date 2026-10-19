@@ -194,20 +194,40 @@ def _mask_half(i, acc_s, klim):
             )
 
 
-def _soft_half(i, acc_s, l_i, slog2):
-    """Softmax numerator for the 8 rows of half i (this thread's row-i elements
-    sit at 4*k + 2*i + {0,1}: a (2, n) view with stride (1, 4)).
+def _soft_half(i, acc_s, l_i, m_i, acc_o, slog2):
+    """Online-softmax numerator for the 8 rows of half i.
 
-    No running max: q is prescaled by QSC and both operands are fp8, so
-    |s * slog2| stays around 1 (6-sigma bound ~= 1.0 for this cache), which
-    keeps exp2 -- and the fp8 P operand -- far from either fp8 limit.  That
-    removes the per-block max reduction, the correction exp2 and the O rescale;
-    one reciprocal in the epilogue normalizes."""
+    This thread's row-i scores sit at 4*k + 2*i + {0,1}: a (2, n) view with
+    stride (1, 4). The previous build subtracted no running max, on the grounds
+    that a prescaled q and fp8 operands keep |s * slog2| near 1. That holds for
+    the cache this was tuned on and not in general: P = exp2(s * slog2) is cast
+    to fp8, whose 448 ceiling is passed once the scaled score exceeds
+    log2(448) ~= 8.8, and the overflow becomes inf * V. Measured non-finite
+    output from operand magnitude 16 on this path.
+
+    The tile max has to be reduced across the four lanes that share a row: the
+    PV gemm sums their P values into one output row, so a per-lane offset would
+    scale parts of the same row differently. The correction is applied
+    unconditionally since exp2(0) == 1 when the max does not move, which keeps
+    the loop branch-free. Loops are plain Python: these helpers run inside a
+    dynamic ``if``, where range_constexpr is rejected.
+    """
     f32 = cutlass.Float32
     rs = cute.make_tensor(
         acc_s.iterator + 2 * i, cute.make_layout((2, PG // 8), stride=(1, 4))
     )
-    pv = cute.math.exp2(rs.load() * slog2, fastmath=True)
+    sv = rs.load() * slog2
+    tmax = sv.reduce(cute.ReductionOp.MAX, f32(-NEG), 0)
+    tmax = cute.arch.warp_reduction_max(tmax, threads_in_group=4)
+    mnew = cute.arch.fmax(m_i[i], tmax)
+    corr = cute.arch.exp2(m_i[i] - mnew)
+    l_i[i] = l_i[i] * corr
+    for jj in range(D // 8):
+        e = 4 * jj + 2 * i
+        acc_o[e] = (acc_o[e].to(f32) * corr).to(acc_o.element_type)
+        acc_o[e + 1] = (acc_o[e + 1].to(f32) * corr).to(acc_o.element_type)
+    m_i[i] = mnew
+    pv = cute.math.exp2(sv - mnew, fastmath=True)
     # Round to the fp8 the PV gemm will actually consume BEFORE summing: the
     # numerator sees fp8(P) and the denominator must see the same values, or a
     # one-key window returns V scaled by fp8(P)/P.
@@ -643,8 +663,10 @@ class MsaSparseAttnFp8:
         pv_mma.set(warpgroup.Field.ACCUMULATE, True)
 
         l_i = cute.make_rmem_tensor(cute.make_layout(2), f32)
+        m_i = cute.make_rmem_tensor(cute.make_layout(2), f32)
         for i in cutlass.range_constexpr(2):
             l_i[i] = f32(0.0)
+            m_i[i] = f32(-NEG)
 
         # the token owned by row half i of this warp, and its causal limits
         tl0 = (16 * warp) // g
@@ -706,11 +728,11 @@ class MsaSparseAttnFp8:
             if live0:
                 if blk >= ow0:
                     _mask_half(0, acc_s, (qp0 - base).to(f32))
-                _soft_half(0, acc_s, l_i, slog2)
+                _soft_half(0, acc_s, l_i, m_i, acc_o, slog2)
             if live1:
                 if blk >= ow1:
                     _mask_half(1, acc_s, (qp1 - base).to(f32))
-                _soft_half(1, acc_s, l_i, slog2)
+                _soft_half(1, acc_s, l_i, m_i, acc_o, slog2)
 
             # The f32 accumulator hands a thread two consecutive columns per
             # 8-wide group; the fp8 WGMMA A operand wants four consecutive k in
