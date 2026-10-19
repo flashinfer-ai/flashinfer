@@ -35,10 +35,7 @@ runs as one or two generated Cake programs on the current stream:
   aligned output view whose row stride is a multiple of 8 elements, or the
   register epilogue for other strides (``_n192``: the 192-wide N-tile instance
   of the tabulated ``gemm_bn`` rows, e.g. the N = 576 ``kv_a`` family at
-  M > 256, whose three 192-column tiles stream no padded columns; ``_sk``: the
-  ordered stream-K instance of the tabulated ``gemm_sk`` rows, whose head CTA
-  pairs run the first K half of the fractional last wave's tiles and hand the
-  FP32 partial to the tail pair -- bit-exact with the plain schedule; ``_skf``:
+  M > 256, whose three 192-column tiles stream no padded columns; ``_skf``:
   the fix-up stream-K instance of the tabulated ``gemm_skf`` rows, whose last
   wave plus fraction is cut into one contiguous K range per resident pair and
   whose finishing pair adds the other pairs' FP32 partials in ordinal order --
@@ -183,7 +180,7 @@ GEMM_K128_RSTAGED_STRIDE_PAD = 4  # round 8 (lever L8): the output row stride of
 # (row form) after ``_k128``; the first build has no stream-K, staging-token or prefetch
 # form of it.
 GEMM_CS_SUFFIX = "_cs"
-# The row form S = 4 (``_cs4r``) is designed (gemm_cs_row_form) but not built in round 10.
+# Only the column form is built: gemm_cs_row_form refuses an S without one (no ``_cs<S>r`` row form).
 GEMM_CS_FORMS = (2, 3)  # pair counts the Cake GEMM instance supports (gemm_ir cs)
 GEMM_CS_PAD_WORDS = 4  # padded row stride of the exchanged FP32 blocks, in 32-bit words
 GEMM_CS_TILE_ROWS = BLOCK_M  # rows of one CTA's accumulator half-tile
@@ -201,7 +198,6 @@ GEMM_TS_SLOT_FORMS = (
 _GEMM_INSTANCE_TOKEN = re.compile(
     r"(?:_s(?P<s>[0-9]+)|_ts(?P<ts>[0-9]+))(?=_|$)"
 )  # ``_s<n>`` / ``_ts<n>`` (never ``_sk`` / ``_skf<n>`` / ``_sks<n>`` / ``_tstore``)
-GEMM_SK_SUFFIX = "_sk"  # round 6 continuation 12 (lever SKO): the ordered stream-K instance of any GEMM epilogue program (table key ``gemm_sk``)
 GEMM_SKF_SUFFIX = "_skf"  # round 6 continuation 17/18 (lever SKF): the fix-up stream-K instance of the TMA-store GEMM programs (table key ``gemm_skf``)
 GEMM_SKF_MIN_ITERS = 4  # lever SKF: a pair's range of fewer K iterations cannot pay for the partial hand-offs
 GEMM_SKF_MAX_SLOTS = 2  # lever SKF: contributor partial slots per tile the finisher adds (more contributors: plain schedule)
@@ -212,22 +208,18 @@ GEMM_SKF_SLOT_FORMS = (
 )  # round 7: slot bounds of the shipped fix-up forms (``_skf`` = 2, ``_skf4`` / ``_skf8``)
 GEMM_SKS_SUFFIX = "_sks"  # round 7 (lever SKS): the sliced fix-up stream-K instance (table key ``gemm_sks``; ``_sks<slots>``)
 # round 10 (CAKE-985, lever SKP): the prefetched stream-K instance of the TMA-store GEMM programs (table key
-# ``gemm_skp``: the slot bound 1 / 4 / 8 names ``_skp`` / ``_skp4`` / ``_skp8``; precedence ``_sk`` > ``_skp`` >
-# ``_skf`` as the Cake launcher)
+# ``gemm_skp``: the slot bound 1 / 4 / 8 names ``_skp`` / ``_skp4`` / ``_skp8``; precedence ``_skp`` > ``_skf``
+# as the Cake launcher)
 GEMM_SKP_SUFFIX = "_skp"
 GEMM_SKP_SLOT_FORMS = (1, 4, 8)
 # lever SKP: default iterations a contributor piece ends before its tile's finisher (table key ``gemm_skp_slack``)
 GEMM_SKP_SLACK = 4
-GEMM_SK_MIN_K_ITERS = 4  # lever SKO: a head / tail chunk of fewer than two K iterations cannot pay for the partial hand-off
-GEMM_SK_FLAG_BYTES = 2048  # stream-K flag area: 512 u32 flags >= 2 x the largest tile count of a split region (SKO: pairs / 2 tail tiles; SKF: < 2 pairs SK tiles)
+GEMM_SK_FLAG_BYTES = 2048  # stream-K flag area: 512 u32 flags >= 2 x the largest tile count of a split region (SKF: < 2 pairs SK tiles)
 # lever SKP: one u32 flag per (SK tile, contributor ordinal, CTA rank) inside the stream-K flag area
 GEMM_SKP_MAX_FLAGS = GEMM_SK_FLAG_BYTES // 4
 GEMM_EPI_WARPS = (
     8  # epilogue warps per GEMM CTA (the head partial record is written per warp)
 )
-GEMM_SK_TILE_BYTES = (
-    2 * GEMM_EPI_WARPS * 32 * 32 * 16
-)  # lever SKO: one head partial tile (2 CTAs x 8 warps x 32 vectors x 32 lanes x 16 B = 256 KiB)
 BLOCK_K = 256  # E4M3 elements per pipeline stage = two 128-K scale sets
 CTA_GROUP = 2
 WEIGHT_TILE_ROWS = 2 * BLOCK  # one CTA-pair N tile
@@ -1639,11 +1631,10 @@ def gemm_cluster_capacity(arch: str, cluster_size: int) -> int:
 
 
 def gemm_cs_row_form(cs: int, bn: int = GEMM_BLOCK_N_NARROW) -> bool:
-    """Form of the ``_cs<S>`` instance: the column form (``_cs<S>``: pair p owns columns
-    ``[bn p / S, bn (p + 1) / S)`` of all 128 rows) when ``bn / S`` is a whole number of
-    32-column store chunks, else the row form (``_cs<S>r``, S even: pair
-    ``p = (S / 2) g + h`` owns epilogue column group ``g`` x rows
-    ``[128 h / (S / 2), 128 (h + 1) / (S / 2))``); raises when neither form exists."""
+    """Form of the ``_cs<S>`` instance: ``False`` for the column form (``_cs<S>``: pair p
+    owns columns ``[bn p / S, bn (p + 1) / S)`` of all 128 rows), the only form built,
+    when ``bn / S`` is a whole number of 32-column store chunks; raises otherwise (the
+    row form ``_cs<S>r`` was never built)."""
     cs, bn = int(cs), int(bn)
     if cs < 2:
         raise ValueError(
@@ -1651,11 +1642,9 @@ def gemm_cs_row_form(cs: int, bn: int = GEMM_BLOCK_N_NARROW) -> bool:
         )
     if bn % cs == 0 and (bn // cs) % GEMM_CS_TS_COLS == 0:
         return False
-    if cs % 2 == 0 and GEMM_CS_TILE_ROWS % (cs // 2) == 0:
-        return True
     raise ValueError(
         f"cluster split-K S = {cs} has no form at bn {bn}: {bn} / {cs} columns is not "
-        f"a multiple of {GEMM_CS_TS_COLS} and S is odd"
+        f"a multiple of {GEMM_CS_TS_COLS}"
     )
 
 
@@ -1871,77 +1860,6 @@ def _cs_launch_instance(
     )
     pf = int(entry.get("gemm_pf", 0)) if tma_store else 0
     return bn, bk, stages, slots, pf
-
-
-class StreamKPlan(NamedTuple):
-    """Round 6 continuation 12 (lever SKO): the ordered stream-K split of one GEMM launch (host mirror of the Cake
-    ``gemm_stream_k_plan`` dict): ``pairs`` resident CTA pairs, ``rem`` tail tiles (one head + one tail chunk each),
-    ``ksplit`` head K iterations, ``dp`` data-parallel tiles, ``grid`` launched CTAs (2 x ``dp``: one CTA pair per
-    data-parallel tile, as the plain schedule; the tail tiles are taken after them)."""
-
-    pairs: int
-    rem: int
-    ksplit: int
-    dp: int
-    grid: int
-
-
-def gemm_stream_k(M: int, n_tiles128: int, num_k_iters: int, arch: str) -> bool:
-    """Round 6 continuation 12 (lever SKO): True when the shape's table row asks for the ordered stream-K GEMM instance
-    (key ``gemm_sk``; GEMM-routed rows only)."""
-    entry = decode_table_entry(M, n_tiles128, num_k_iters, arch)
-    return bool(
-        entry is not None and entry.get("route") == "gemm" and entry.get("gemm_sk", 0)
-    )
-
-
-def gemm_stream_k_ksplit(M: int, n_tiles128: int, num_k_iters: int, arch: str) -> int:
-    """Round 6 continuation 13 (lever SKO-ksplit): the table row's head-chunk length of the ordered stream-K split
-    (key ``gemm_sk_ksplit``), or 0 for the default ceil(K / 2)."""
-    entry = decode_table_entry(M, n_tiles128, num_k_iters, arch)
-    if entry is None or entry.get("route") != "gemm":
-        return 0
-    return int(entry.get("gemm_sk_ksplit", 0))
-
-
-def gemm_stream_k_plan(
-    M: int,
-    n_tiles128: int,
-    num_k_iters: int,
-    arch: str,
-    sm_count: int,
-    m_tiles: int,
-    gemm_n_tiles: int,
-) -> Optional[StreamKPlan]:
-    """The ordered stream-K split of a GEMM launch (round 6 continuation 12, lever SKO), or ``None`` for the plain
-    CLC schedule: taken when the table row asks for it AND the launch has at least one full wave of CTA pairs plus a
-    fractional one that is at most half a wave (one head and one tail chunk per pair), with at least
-    ``GEMM_SK_MIN_K_ITERS`` K iterations to split.  The head chunk takes the larger half of the K iterations."""
-    if (
-        not gemm_stream_k(M, n_tiles128, num_k_iters, arch)
-        or int(num_k_iters) < GEMM_SK_MIN_K_ITERS
-    ):
-        return None
-    pairs = int(sm_count) // CTA_GROUP
-    tiles = (int(m_tiles) // CTA_GROUP) * int(gemm_n_tiles)
-    full = tiles // pairs
-    rem = tiles - full * pairs
-    if full < 1 or rem == 0 or rem > pairs - rem:
-        return None
-    # Round 6 continuation 13 (lever SKO-ksplit): the table row may ask for a head-heavy split (key ``gemm_sk_ksplit``
-    # = head K iterations; 0 / absent = ceil(K / 2)); both chunks keep at least two K iterations, as in the Cake host.
-    ksplit = (
-        gemm_stream_k_ksplit(M, n_tiles128, num_k_iters, arch)
-        or (int(num_k_iters) + 1) // 2
-    )
-    ksplit = min(max(ksplit, 2), int(num_k_iters) - 2)
-    return StreamKPlan(
-        pairs,
-        rem,
-        ksplit,
-        full * pairs,
-        full * pairs * CTA_GROUP,
-    )
 
 
 class StreamKFixupPlan(NamedTuple):
@@ -2372,8 +2290,8 @@ def gemm_stream_k_prefetch_plan(
 def _sk_layout(
     prepared: PreparedProjectionWeight, M: int, arch: str, sm_count: int
 ) -> Optional[tuple[int, int, int]]:
-    """``(flags_off, partials_off, partials_bytes)`` of the stream-K hand-off area (lever SKO) inside the auxiliary
-    workspace of a GEMM-path launch, or ``None`` when the shape takes the plain CLC schedule."""
+    """``(flags_off, partials_off, partials_bytes)`` of the stream-K hand-off area (levers SKP / SKF) inside the
+    auxiliary workspace of a GEMM-path launch, or ``None`` when the shape takes the plain CLC schedule."""
     bn = gemm_block_n(
         M,
         prepared.n_tiles128,
@@ -2382,18 +2300,7 @@ def _sk_layout(
         prepared.n_valid,
         prepared.n_pad,
     )
-    plan = gemm_stream_k_plan(
-        M,
-        prepared.n_tiles128,
-        prepared.num_k_iters,
-        arch,
-        sm_count,
-        _m_tiles(M),
-        gemm_n_tiles(prepared, bn),
-    )
     c_off, _c_bytes, _p_off, _p_bytes = reduction_layout(prepared, M, None)
-    if plan is not None:
-        return c_off, c_off + GEMM_SK_FLAG_BYTES, plan.rem * GEMM_SK_TILE_BYTES
     # round 10 (CAKE-985, lever SKP): the prefetched form's flags + partial slots, before the fix-up form (launcher precedence)
     skp = gemm_stream_k_prefetch_plan(
         M,
@@ -2407,7 +2314,7 @@ def _sk_layout(
     )
     if skp is not None:
         return c_off, c_off + GEMM_SK_FLAG_BYTES, skp.partial_bytes
-    # round 6 continuation 17/18 (lever SKF): the fix-up form's partial slots when the ordered form does not apply
+    # round 6 continuation 17/18 (lever SKF): the fix-up form's partial slots when the prefetched form does not apply
     skf = gemm_stream_k_fixup_plan(
         M,
         prepared.n_tiles128,
@@ -2458,27 +2365,24 @@ def _skp_scalars(skp: StreamKPrefetchPlan) -> dict[str, int]:
 def _sk_launch_kwargs(
     plan: ProjectionPlan, sf: torch.Tensor, device: torch.device
 ) -> dict[str, Any]:
-    """The two stream-K hand-off tensors of a GEMM program (lever SKO): the partial / flag areas of the workspace on the
-    stream-K forms (``plan.gemm_sk`` / ``gemm_skf`` / ``gemm_skp``), zero dummies on every other GEMM form (every GEMM
+    """The two stream-K hand-off tensors of a GEMM program: the partial / flag areas of the workspace on the stream-K
+    forms (``plan.gemm_skf`` / ``gemm_skp``), zero dummies on every other GEMM form (every GEMM
     program takes the pointers).  The split scalars (``sk_pairs`` / ``sk_rem`` / ``sk_ksplit`` / ``sk_dp``, the three more
     of the ``_skp`` programs) are stage arguments (``_sk_scalar_kwargs`` in ``_stage_kwargs``), never bindings: the
     call-bound dictionary is applied over the stage arguments, and a binding of the same name would shadow them -- round
     11 (CAKE-985 T6, ``_gs``): the launched pairs P' travel in ``sk_pairs`` of a form without a hand-off area, so a zero
     ``sk_pairs`` binding here would launch the grid-stride program with no tiles (every output row left unwritten)."""
-    sk = plan.gemm_sk
     skf = plan.gemm_skf
     skp = plan.gemm_skp
-    if sk is None and skp is not None:
+    if skp is not None:
         # round 10 (CAKE-985, lever SKP): the SKF record layout of the partials, one flag per (SK tile, ordinal, CTA rank)
         p_bytes = skp.partial_bytes
-    elif sk is None and skf is not None:
+    elif skf is not None:
         # round 6 continuation 17/18 (lever SKF): the fix-up form's partial area
         p_bytes = skf.partial_bytes
-    elif sk is None:
+    else:
         partials, flags = _sk_dummy(device)
         return dict(sk_partials=partials, sk_flags=flags)
-    else:
-        p_bytes = sk.rem * GEMM_SK_TILE_BYTES
     f_off = plan.counters_offset
     p_off = f_off + GEMM_SK_FLAG_BYTES
     if sf.numel() < p_off + p_bytes:
@@ -2636,9 +2540,7 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                 # ``gemm_stages`` / ``gemm_ts_slots``; after ``_k128``, before the stream-K suffixes); the register epilogues of
                 # the bucket's padded-stride rows keep the untokened programs (Cake launcher rule)
                 isfx = gemm_instance_suffix(*_entry_stages_ts_slots(entry))
-                gsk = bool(entry.get("gemm_sk", 0))
                 gskf = bool(entry.get("gemm_skf", 0))
-                gsks = bool(entry.get("gemm_sks", 0))
                 gskp = int(
                     entry.get("gemm_skp", 0)
                 )  # round 10 (CAKE-985, lever SKP): the slot bound names the form
@@ -2647,13 +2549,13 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                     # round 8 (lever L8): only the _k128 programs some contract row of the cell's bucket launches, derived from
                     # the rows' epilogues (``gemm_k128_cell_epilogues``) rather than from the cell's flags and bucket alone --
                     # the perf row's TMA-store program at the cell's prefetch distance when the family's column edge admits
-                    # the TMA store and no stream-K lever names that row's program (the ``_sk`` / ``_skf`` / ``_sks`` keys
+                    # the TMA store and no stream-K lever names that row's program (the ``_skp`` / ``_skf`` keys
                     # below carry the token instead), the staged-register program when the perf row or an 8-byte-stride row
                     # of the bucket launches it; the 256-K fallbacks stay registered through the base list
                     k128_tstore, k128_rstaged = gemm_k128_cell_epilogues(
                         n_tiles128, num_k_iters, bucket
                     )
-                    if k128_tstore and not (gsk or gskf or gsks or gskp):
+                    if k128_tstore and not (gskf or gskp):
                         gkeys.append(
                             gemm_kernel_key(
                                 GEMM_TSTORE_KERNEL_KEY
@@ -2676,7 +2578,7 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                     # untokened TMA-store programs are launched by no row of this cell
                     if gemm_k128_cell_epilogues(n_tiles128, num_k_iters, bucket)[
                         0
-                    ] and not (gsk or gskf or gsks or gskp):
+                    ] and not (gskf or gskp):
                         gkeys.append(
                             gemm_kernel_key(
                                 GEMM_TSTORE_KERNEL_KEY + tsfx + isfx + psfx, gpf
@@ -2696,28 +2598,12 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                         # TMA store; 8-byte aligned rows: staged register epilogue); other views fall back to the 256-wide program.
                         # Round 11 (CAKE-985 C17): the plain 192-wide TMA-store program only when the cell neither prefetches nor
                         # names a stream-K lever -- the Cake export plan (``stage_kernels``) launches the ``_pf<D>`` form on every
-                        # TMA-store row of a prefetching cell (``gpf`` is the cell's key on each of them) and the ``_sk`` / ``_skp`` /
-                        # ``_skf`` form where the lever engages, so no row of such a cell launches the plain program (the gate of
+                        # TMA-store row of a prefetching cell (``gpf`` is the cell's key on each of them) and the ``_skp`` / ``_skf``
+                        # form where the lever engages, so no row of such a cell launches the plain program (the gate of
                         # the ``_k128`` branch above); the staged-register program reads neither key and stays listed
-                        if gpf == 0 and not (gsk or gskf or gsks or gskp):
+                        if gpf == 0 and not (gskf or gskp):
                             gkeys.append(GEMM_TSTORE_KERNEL_KEY + tsfx + psfx)
                         gkeys.append(GEMM_RSTAGED_KERNEL_KEY + tsfx + psfx)
-                if gsk:
-                    # round 6 continuation 12 (lever SKO): the ordered stream-K instance of the row's production epilogue (16-byte
-                    # aligned views: TMA store, with the row's prefetch distance -- the only stream-K program the Cake export plan
-                    # ships); other views and launches outside the stream-K wave window fall back to the plain programs
-                    # (``route_plan``)
-                    gkeys.append(
-                        gemm_kernel_key(
-                            GEMM_TSTORE_KERNEL_KEY
-                            + tsfx
-                            + ksfx
-                            + isfx
-                            + GEMM_SK_SUFFIX
-                            + psfx,
-                            gpf,
-                        )
-                    )
                 if gskp:
                     # round 10 (CAKE-985, lever SKP): the prefetched stream-K instance of the row's TMA-store program
                     # (``_skp`` / ``_skp4`` / ``_skp8`` by the cell's slot bound); launches whose geometry admits no
@@ -2740,41 +2626,18 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                     )
                 if gskf:
                     # round 6 continuation 17/18 (lever SKF): the fix-up stream-K instance of the row's TMA-store program (the
-                    # only fix-up program the Cake export plan ships); other views fall back to the plain programs.  Round 7:
-                    # a slot bound of 4 / 8 in the cell names the wider form.
-                    skf_key = int(entry.get("gemm_skf", 0))
-                    skf_sfx = GEMM_SKF_SUFFIX + (
-                        str(skf_key)
-                        if skf_key in GEMM_SKF_SLOT_FORMS
-                        and skf_key != GEMM_SKF_MAX_SLOTS
-                        else ""
-                    )
+                    # only fix-up program the Cake export plan ships); other views fall back to the plain programs.
                     gkeys.append(
                         gemm_kernel_key(
                             GEMM_TSTORE_KERNEL_KEY
                             + tsfx
                             + ksfx
                             + isfx
-                            + skf_sfx
+                            + GEMM_SKF_SUFFIX
                             + psfx,
                             gpf,
                         )
                     )
-                if gsks:
-                    # round 7 (lever SKS): the sliced fix-up forms the row may launch (the slot form follows the
-                    # row count inside the bucket: every form is listed, unavailable ones fall back in ``route_plan``)
-                    for form in GEMM_SKF_SLOT_FORMS:
-                        gkeys.append(
-                            gemm_kernel_key(
-                                GEMM_TSTORE_KERNEL_KEY
-                                + tsfx
-                                + ksfx
-                                + isfx
-                                + f"{GEMM_SKS_SUFFIX}{form}"
-                                + psfx,
-                                gpf,
-                            )
-                        )
                 if gsfx:
                     # round 10 (S3, _g64): the raster twin of the plain programs the cell's rows launch (the base list holds
                     # only the GROUP_M 32 programs): the TMA-store program of the cell's form when the family's column edge
@@ -2783,7 +2646,7 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                     g64_tstore, g64_rstaged = gemm_k128_cell_epilogues(
                         n_tiles128, num_k_iters, bucket
                     )
-                    if g64_tstore and not (gsk or gskf or gsks or gskp):
+                    if g64_tstore and not (gskf or gskp):
                         gkeys.append(
                             gemm_kernel_key(
                                 GEMM_TSTORE_KERNEL_KEY
@@ -2807,7 +2670,7 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                     pdlb_tstore, pdlb_rstaged = gemm_k128_cell_epilogues(
                         n_tiles128, num_k_iters, bucket
                     )
-                    if pdlb_tstore and not (gsk or gskf or gsks or gskp):
+                    if pdlb_tstore and not (gskf or gskp):
                         gkeys.append(
                             gemm_kernel_key(
                                 GEMM_TSTORE_KERNEL_KEY + tsfx + ksfx + isfx + psfx, gpf
@@ -3063,7 +2926,7 @@ def workspace_sf_bytes(
     cfg = decode_config(M, prepared.n_tiles128, prepared.num_k_iters, arch, sm_count)
     _c_off, _c_bytes, p_off, p_bytes = reduction_layout(prepared, M, cfg)
     if cfg is None:
-        # round 6 continuation 12 / 17 (levers SKO / SKF): the GEMM path's stream-K flags + partial tiles (zero-initialised once)
+        # levers SKP / SKF: the GEMM path's stream-K flags + partial tiles (zero-initialised once)
         sk = _sk_layout(prepared, M, arch, sm_count)
         if sk is not None:
             return sk[1] + sk[2]
@@ -3086,7 +2949,7 @@ def allocate_kimi_k3_fp8_projection_workspace(
     facts = device_facts(device)
     q = torch.empty((M, prepared.K), dtype=torch.float8_e4m3fn, device=device)
     # Zero initialised as a whole: the activation scale padding rows must read as zero scales, the decode per-tile
-    # counters and the stream-K flags (levers SKO / SKF) start at zero, and the programs leave them reset.
+    # counters and the stream-K flags (levers SKP / SKF) start at zero, and the programs leave them reset.
     sf = torch.zeros(
         (workspace_sf_bytes(prepared, M, facts.arch, facts.sm_count),),
         dtype=torch.uint8,
@@ -3178,9 +3041,6 @@ class ProjectionPlan:
     gemm_gs: bool  # GEMM route: the static grid-stride form of the launched program (True on the tabulated ``gemm_gs`` rows' plain 128-K TMA-store launches at bn 192 / 256; round 11 T6, ``_gs``)
     gemm_gs_pairs: int  # GEMM route: the launched pairs P' = min(T, sm_count // 2) of a ``_gs`` launch (its ``sk_pairs`` scalar, half its grid); 0 on every other program
     gemm_n_tiles: int  # GEMM route: CTA-pair N tiles of the launched program (``n_pad / 256`` or ``ceil(n_valid / 192)``)
-    gemm_sk: Optional[
-        StreamKPlan
-    ]  # GEMM route: the ordered stream-K split of the launched ``_sk`` program, None for the plain CLC schedule (round 6 continuation 12, lever SKO)
     gemm_skf: Optional[
         StreamKFixupPlan
     ]  # GEMM route: the fix-up stream-K split of the launched ``_skf`` program, None otherwise (round 6 continuation 17/18, lever SKF)
@@ -3310,7 +3170,6 @@ def route_plan(
             False,
             0,
         )  # ... and no static grid-stride form (round 11 T6, _gs: exclusive by construction)
-        sk_plan = None
         skf_plan = None
         skp_plan = None
         kernels.append(key)
@@ -3483,14 +3342,12 @@ def route_plan(
             stems = [
                 v for s, pf, bn in stems for v in ((s + isfx, pf, bn), (s, pf, bn))
             ]
-        # round 6 continuation 12 (lever SKO): the ordered stream-K instance (``_sk`` before ``_pf``) of each candidate when
-        # the table row asks for it and the launch sits in the stream-K wave window (one full wave plus at most half a
-        # wave of tail tiles), falling back to the plain program of the same stem
+        # the stream-K instance (``_skp`` / ``_skf`` before ``_pf``) of each candidate when the table row asks for it
+        # and the geometry admits a plan, falling back to the plain program of the same stem
         candidates: list[
             tuple[
                 str,
                 int,
-                Optional[StreamKPlan],
                 Optional[StreamKFixupPlan],
                 Optional[StreamKPrefetchPlan],
             ]
@@ -3503,10 +3360,11 @@ def route_plan(
             return (_pdlb_stem(stem), stem) if pdlb else (stem,)
 
         for stem, pf, bn in stems:
-            # round 7: the ordered stream-K form ships for the TMA-store epilogue only, like the fix-up form
-            # (Cake launcher rule); the register epilogues keep the plain schedule
-            sk = (
-                gemm_stream_k_plan(
+            # round 10 (lever SKP): the prefetched stream-K instance (``_skp`` / ``_skp4`` / ``_skp8``) when the
+            # table row asks for it and the geometry admits a plan, before the fix-up form (launcher precedence);
+            # TMA-store stems only (Cake launcher rule: the register epilogues keep the plain schedule)
+            skp = (
+                gemm_stream_k_prefetch_plan(
                     M,
                     prepared.n_tiles128,
                     prepared.num_k_iters,
@@ -3514,66 +3372,38 @@ def route_plan(
                     sm_count,
                     _m_tiles(M),
                     gemm_n_tiles(prepared, bn),
+                    bn,
                 )
                 if stem.startswith(GEMM_TSTORE_KERNEL_KEY)
                 else None
             )
-            if sk is not None:
-                for form in pdlb_forms(stem + GEMM_SK_SUFFIX):
-                    candidates.append((gemm_kernel_key(form, pf), bn, sk, None, None))
-            else:
-                # round 10 (CAKE-985, lever SKP): the prefetched stream-K instance (``_skp`` / ``_skp4`` / ``_skp8``) when the
-                # table row asks for it and the geometry admits a plan, before the fix-up form (launcher precedence);
-                # TMA-store stems only
-                skp = (
-                    gemm_stream_k_prefetch_plan(
-                        M,
-                        prepared.n_tiles128,
-                        prepared.num_k_iters,
-                        arch,
-                        sm_count,
-                        _m_tiles(M),
-                        gemm_n_tiles(prepared, bn),
-                        bn,
-                    )
-                    if stem.startswith(GEMM_TSTORE_KERNEL_KEY)
-                    else None
+            if skp is not None:
+                for form in pdlb_forms(stem + skp.program_suffix):
+                    candidates.append((gemm_kernel_key(form, pf), bn, None, skp))
+            # round 6 continuation 17/18 (lever SKF): the fix-up stream-K instance (``_skf``) when the table row asks
+            # for it and the launch has a fractional wave; TMA-store stems only
+            skf = (
+                gemm_stream_k_fixup_plan(
+                    M,
+                    prepared.n_tiles128,
+                    prepared.num_k_iters,
+                    arch,
+                    sm_count,
+                    _m_tiles(M),
+                    gemm_n_tiles(prepared, bn),
+                    bn,
                 )
-                if skp is not None:
-                    for form in pdlb_forms(stem + skp.program_suffix):
-                        candidates.append(
-                            (gemm_kernel_key(form, pf), bn, None, None, skp)
-                        )
-                # round 6 continuation 17/18 (lever SKF): the fix-up stream-K instance (``_skf``) when the table row asks
-                # for it and the launch has a fractional wave the ordered form cannot serve; TMA-store stems only
-                skf = (
-                    gemm_stream_k_fixup_plan(
-                        M,
-                        prepared.n_tiles128,
-                        prepared.num_k_iters,
-                        arch,
-                        sm_count,
-                        _m_tiles(M),
-                        gemm_n_tiles(prepared, bn),
-                        bn,
-                    )
-                    if stem.startswith(GEMM_TSTORE_KERNEL_KEY) and skp is None
-                    else None
-                )
-                if skf is not None:
-                    for form in pdlb_forms(stem + skf.program_suffix):
-                        candidates.append(
-                            (gemm_kernel_key(form, pf), bn, None, skf, None)
-                        )
+                if stem.startswith(GEMM_TSTORE_KERNEL_KEY) and skp is None
+                else None
+            )
+            if skf is not None:
+                for form in pdlb_forms(stem + skf.program_suffix):
+                    candidates.append((gemm_kernel_key(form, pf), bn, skf, None))
             for form in pdlb_forms(stem):
-                candidates.append((gemm_kernel_key(form, pf), bn, None, None, None))
-        key, gbn, sk_plan, skf_plan, skp_plan = next(
-            (
-                (k, b, s, f, p)
-                for k, b, s, f, p in candidates
-                if route_available(arch, (k,))
-            ),
-            (base, BLOCK_N, None, None, None),
+                candidates.append((gemm_kernel_key(form, pf), bn, None, None))
+        key, gbn, skf_plan, skp_plan = next(
+            ((k, b, f, p) for k, b, f, p in candidates if route_available(arch, (k,))),
+            (base, BLOCK_N, None, None),
         )
         gbk = (
             128 if GEMM_K128_SUFFIX in key.split("_pf")[0] else BLOCK_K
@@ -3606,9 +3436,7 @@ def route_plan(
         )  # the launched program's stages / slots (a fallback may have dropped the tokens)
         kernels.append(key)
         grids.append(
-            sk_plan.grid
-            if sk_plan is not None
-            else skp_plan.grid
+            skp_plan.grid
             if skp_plan is not None
             else skf_plan.grid
             if skf_plan is not None
@@ -3624,7 +3452,6 @@ def route_plan(
         gpdlb = False
         gstatic = False
         ggs, ggs_pairs = False, 0
-        sk_plan = None
         skf_plan = None
         skp_plan = None
     dec_ts = False
@@ -3657,7 +3484,6 @@ def route_plan(
         gemm_gs=ggs,
         gemm_gs_pairs=ggs_pairs,
         gemm_n_tiles=gemm_n_tiles(prepared, gbn),
-        gemm_sk=sk_plan,
         gemm_skf=skf_plan,
         gemm_skp=skp_plan,
         gemm_cs=cs_plan,
@@ -4001,20 +3827,17 @@ def _stage_kwargs(
 def _sk_scalar_kwargs(plan: ProjectionPlan) -> dict[str, int]:
     """The four stream-K split scalars of a GEMM program (the two hand-off tensors are workspace bindings); seven on the
     ``_skp`` programs (round 10, CAKE-985, lever SKP)."""
-    sk = plan.gemm_sk
     skf = plan.gemm_skf
-    if sk is None and plan.gemm_skp is not None:
+    if plan.gemm_skp is not None:
         return _skp_scalars(plan.gemm_skp)
-    if sk is None and skf is not None:
+    if skf is not None:
         return dict(
             sk_pairs=skf.pairs, sk_rem=skf.total, sk_ksplit=skf.slots, sk_dp=skf.first
         )
-    if sk is None and plan.gemm_gs:
+    if plan.gemm_gs:
         # round 11 (CAKE-985 T6, _gs): the launched pairs P' travel in ``sk_pairs`` (the static grid-stride form has no other scalar)
         return dict(sk_pairs=plan.gemm_gs_pairs, sk_rem=0, sk_ksplit=0, sk_dp=0)
-    if sk is None:
-        return dict(sk_pairs=0, sk_rem=0, sk_ksplit=0, sk_dp=0)
-    return dict(sk_pairs=sk.pairs, sk_rem=sk.rem, sk_ksplit=sk.ksplit, sk_dp=sk.dp)
+    return dict(sk_pairs=0, sk_rem=0, sk_ksplit=0, sk_dp=0)
 
 
 def prepare_kimi_k3_fp8_projection(
