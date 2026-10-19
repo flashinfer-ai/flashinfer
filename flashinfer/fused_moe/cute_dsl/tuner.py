@@ -149,6 +149,9 @@ def get_w4a8_moe_valid_tactics() -> List[Tuple]:
 
     The mixed finalize kernel also supports N tiles 64 and 192. Keep its
     tactic space distinct so W4A8 does not change W4A4 tuning results.
+    GEMM1 N=192 is valid for non-gated activations whose intermediate size is a
+    multiple of 192 (GEMM1 has no partial-N-tile store); ``get_valid_tactics``
+    filters other configs out through ``can_implement``.
     """
     return [
         (
@@ -157,7 +160,7 @@ def get_w4a8_moe_valid_tactics() -> List[Tuple]:
             ((tile, gemm2_n), (tile // 128, cluster_n), False),
         )
         for tile, gemm1_n, gemm2_n, cluster_n in itertools.product(
-            VALID_TILE_SIZES, (128, 256), (64, 128, 192, 256), (1, 2)
+            VALID_TILE_SIZES, (128, 192, 256), (64, 128, 192, 256), (1, 2)
         )
     ]
 
@@ -901,6 +904,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                     a_major="k",
                     b_major="k",
                     c_major="n",
+                    gated=gated,
                 )
                 gemm2_ok = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.can_implement(
                     a_dtype=a_dtype,

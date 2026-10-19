@@ -867,7 +867,8 @@ class TestTacticEnumeration:
         )
 
         tactics = get_w4a8_moe_valid_tactics()
-        assert len(tactics) == 32
+        assert len(tactics) == 48
+        assert {gemm1[0][1] for _, gemm1, _ in tactics} == {128, 192, 256}
         assert {gemm2[0][1] for _, _, gemm2 in tactics} == {64, 128, 192, 256}
         assert canonicalize_w4a8_tactic(list(tactics[0])) == tactics[0]
         with pytest.raises(ValueError, match="unsupported W4A8 MoE tactic"):

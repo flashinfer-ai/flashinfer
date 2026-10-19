@@ -88,7 +88,7 @@ def _reference(x, w1, w2, topk_ids, topk_w, quantized: bool):
     return out
 
 
-def _run_kernel(x, w1, w2, topk_ids, topk_w, num_experts):
+def _run_kernel(x, w1, w2, topk_ids, topk_w, num_experts, tactic=None):
     from flashinfer import cute_dsl_fused_moe
     from flashinfer.fp8_quantization import mxfp8_quantize
 
@@ -116,6 +116,15 @@ def _run_kernel(x, w1, w2, topk_ids, topk_w, num_experts):
         output_dtype=torch.bfloat16,
         activation_type=ActivationType.Relu2.value,
         quant_mode="mxfp8",
+        tactic=tactic,
+    )
+
+
+def _gemm1_n192_tactic(tile):
+    return (
+        tile,
+        ((tile, 192), (tile // 128, 1), False),
+        ((tile, 128), (tile // 128, 1), False),
     )
 
 
@@ -159,6 +168,105 @@ def test_mxfp8_relu2_moe(num_tokens, hidden, inter, num_experts, top_k):
     cos_q = _cos(out, ref_q)
     assert cos_q > 0.999, f"cos vs MXFP8 reference {cos_q:.5f}"
     torch.testing.assert_close(out, ref_q, rtol=5e-2, atol=5e-2 * ref_q.abs().max())
+
+
+@pytest.mark.parametrize(
+    "num_tokens,hidden,inter,num_experts,top_k",
+    [
+        (64, 512, 384, 8, 2),  # intermediate = 2 x 192
+        (256, 1024, 2688, 64, 8),  # Nemotron 3.5 Super expert width (14 x 192)
+    ],
+)
+@pytest.mark.parametrize("tile", [128, 256])
+def test_mxfp8_relu2_gemm1_n192(num_tokens, hidden, inter, num_experts, top_k, tile):
+    """Non-gated GEMM1 may use N=192 tiles; check them against the MXFP8 reference."""
+    x, w1, w2, topk_ids, topk_w = _make_case(
+        num_tokens, hidden, inter, num_experts, top_k
+    )
+    out = _run_kernel(
+        x, w1, w2, topk_ids, topk_w, num_experts, tactic=_gemm1_n192_tactic(tile)
+    ).float()
+    ref_q = _reference(x, w1, w2, topk_ids, topk_w, quantized=True)
+    cos_q = _cos(out, ref_q)
+    assert cos_q > 0.999, f"cos vs MXFP8 reference {cos_q:.5f}"
+    torch.testing.assert_close(out, ref_q, rtol=5e-2, atol=5e-2 * ref_q.abs().max())
+
+
+@pytest.mark.parametrize("inter", [512, 1024])
+@pytest.mark.parametrize("tile", [128, 256])
+def test_mxfp8_relu2_gemm1_n192_rejects_partial_n_tile(inter, tile):
+    """GEMM1 has no partial-N-tile predicate, so N=192 needs inter % 192 == 0."""
+    x, w1, w2, topk_ids, topk_w = _make_case(33, 512, inter, 8, 2)
+    with pytest.raises(ValueError, match="Unsupported configuration"):
+        _run_kernel(x, w1, w2, topk_ids, topk_w, 8, tactic=_gemm1_n192_tactic(tile))
+
+
+@pytest.mark.parametrize("tile", [128, 256])
+def test_w4a8_relu2_gemm1_n192_matches_default(tile):
+    """W4A8 (MXFP4 weights) with GEMM1 N=192 matches the default tactic."""
+    from flashinfer import cute_dsl_fused_moe
+    from flashinfer.fused_moe import CuteDslConfig, QuantConfig, QuantFormat, ReLU2
+
+    num_tokens, hidden, inter, num_experts, top_k = 64, 512, 384, 8, 2
+    x, w1, w2, topk_ids, topk_w = _make_case(
+        num_tokens, hidden, inter, num_experts, top_k
+    )
+    quant = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+    view = CuteDslConfig.prepare_weights(
+        w1,
+        w2,
+        quant=quant,
+        num_local_experts=num_experts,
+        hidden_size=hidden,
+        intermediate_size=inter,
+        activation=ReLU2(),
+    )
+    x_q, x_sf = CuteDslConfig.prepare_activations(
+        x, quant=QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8)
+    )
+
+    def run(tactic):
+        return cute_dsl_fused_moe(
+            x=x_q,
+            x_sf=x_sf,
+            token_selected_experts=topk_ids,
+            token_final_scales=topk_w,
+            w1_weight=view["w1_weight"],
+            w1_weight_sf=view["w1_weight_sf"],
+            w1_alpha=view["w1_alpha"],
+            fc2_input_scale=None,
+            w2_weight=view["w2_weight"],
+            w2_weight_sf=view["w2_weight_sf"],
+            w2_alpha=view["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+            activation_type=ActivationType.Relu2.value,
+            quant_mode="w4a8",
+            tactic=tactic,
+        ).float()
+
+    default = run(-1)
+    out = run(_gemm1_n192_tactic(tile))
+    assert _cos(out, default) > 0.999
+    torch.testing.assert_close(out, default, rtol=2e-2, atol=2e-2 * default.abs().max())
+
+
+def test_gemm1_n192_is_non_gated_only():
+    from flashinfer.fused_moe.cute_dsl.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (  # noqa: E501
+        BlockScaledContiguousGatherGroupedGemmKernel as Kernel,
+    )
+
+    for tile in (128, 256):
+        cluster = (tile // 128, 1)
+        assert Kernel.is_valid_mma_tiler_and_cluster_shape(
+            (tile, 192), cluster, gated=False
+        )
+        assert not Kernel.is_valid_mma_tiler_and_cluster_shape(
+            (tile, 192), cluster, gated=True
+        )
+        assert Kernel.is_valid_mma_tiler_and_cluster_shape(
+            (tile, 128), cluster, gated=True
+        )
 
 
 def test_mxfp8_mode_rejects_invalid_inputs():
