@@ -83,9 +83,11 @@ MODULES: dict[str, dict[str, Any]] = {
         # CTA ``b`` owns channel tile ``b % n_ch_tiles`` and, with the other
         # CTAs of that tile, an equal contiguous share of the token axis.  Any
         # positive grid is correct; ``ctas_per_sm`` is the measured
-        # co-residency of the program (CTAs per SM), PLACEHOLDER 4 until the
-        # exporting session records the measured value.  ``geometry`` is the
-        # kernel's build geometry the host plan derives its scalars from.
+        # co-residency of the program: 4 CTAs per SM on B200 (sm_100a, 107
+        # registers) and GB300 (sm_103a, 109 registers), the register limit
+        # at 128 threads (ncu launch__occupancy_limit_registers); sm_107a is
+        # taken as the same launch bound.  ``geometry`` is the kernel's build
+        # geometry the host plan derives its scalars from.
         "grid_rule": {
             "cooperative": False,
             "ctas_per_sm": 4,
@@ -149,8 +151,9 @@ MODULES: dict[str, dict[str, Any]] = {
         "ffi_entry": "run",
         # Cooperative (a grid-wide barrier precedes the fixed-order dweight
         # reduction): the grid is exactly the co-resident CTA count.
-        # ``ctas_per_sm`` PLACEHOLDER 4 (the launch bound) until the exporting session records
-        # the measured co-residency.
+        # ``ctas_per_sm``: 4 CTAs per SM measured on B200 and GB300 (128
+        # registers at 128 threads, the launch bound; ncu
+        # launch__occupancy_limit_registers); sm_107a is taken as the same.
         "grid_rule": {
             "cooperative": True,
             "ctas_per_sm": 4,
