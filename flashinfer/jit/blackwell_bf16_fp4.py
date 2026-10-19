@@ -19,12 +19,11 @@ limitations under the License.
 # ``MODULES`` lists every physical program once: its device and binding
 # translation units under ``csrc/blackwell_bf16_fp4`` (one source for every
 # architecture in ``arches``), the compile flags of the source build, the
-# tvm-ffi entry, the positional argument plan and the launch geometry:
-# ``threads`` (block size), ``dynamic_smem_bytes``, ``cluster_dims`` (the
-# thread-block cluster shape ``[x, y, z]``; ``[1, 1, 1]`` for a plain launch)
-# and ``use_pdl``.  The generated binding fixes the cluster and PDL launch
-# attributes into its ``cudaLaunchKernelExC`` call; the host reads
-# ``cluster_dims`` only to size and check the launch grid.
+# tvm-ffi entry, the positional argument plan and ``cluster_dims`` (the
+# thread-block cluster shape ``[x, y, z]``; ``[1, 1, 1]`` for a plain launch).
+# The generated binding fixes the block size, dynamic shared memory, cluster
+# and PDL launch attributes into its ``cudaLaunchKernelExC`` call; the host
+# reads ``cluster_dims`` only to size and check the launch grid.
 # ``ROUTES`` maps the logical kernel key selected by
 # ``flashinfer.gemm.gemm_bf16_fp4_blackwell`` to its program.  Both tables are
 # written by the generated-program export; do not edit them by hand.
@@ -41,7 +40,6 @@ from .core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
 MODULES: dict[str, dict[str, Any]] = {
     "cake_blackwell_bf16_fp4_00f9662aef31e9f8afcf": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_00f9662aef31e9f8afcf",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_00f9662aef31e9f8afcf_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_00f9662aef31e9f8afcf_binding.cu",
@@ -61,14 +59,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_0260157ff19a2009e088": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_0260157ff19a2009e088",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_0260157ff19a2009e088_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_0260157ff19a2009e088_binding.cu",
@@ -88,14 +82,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 30720,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_03663ccb5c3794adf73f": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_03663ccb5c3794adf73f",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_03663ccb5c3794adf73f_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_03663ccb5c3794adf73f_binding.cu",
@@ -117,14 +107,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 218112,
         "cluster_dims": [2, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_067916d318c62cedc87c": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_067916d318c62cedc87c",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_067916d318c62cedc87c_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_067916d318c62cedc87c_binding.cu",
@@ -144,14 +130,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_09b6edbaee3bc97c325d": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_09b6edbaee3bc97c325d",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_09b6edbaee3bc97c325d_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_09b6edbaee3bc97c325d_binding.cu",
@@ -171,14 +153,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_0aa81729a16b6f7970b9": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_0aa81729a16b6f7970b9",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_0aa81729a16b6f7970b9_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_0aa81729a16b6f7970b9_binding.cu",
@@ -198,14 +176,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_0bc12861525b941fb731": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_0bc12861525b941fb731",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_0bc12861525b941fb731_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_0bc12861525b941fb731_binding.cu",
@@ -225,14 +199,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_14a9b217c2b64cd518d8": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_14a9b217c2b64cd518d8",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_14a9b217c2b64cd518d8_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_14a9b217c2b64cd518d8_binding.cu",
@@ -252,14 +222,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 96,
-        "dynamic_smem_bytes": 150528,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_15183f16cdcea47666d4": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_15183f16cdcea47666d4",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_15183f16cdcea47666d4_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_15183f16cdcea47666d4_binding.cu",
@@ -279,14 +245,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 96,
-        "dynamic_smem_bytes": 150528,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_17f70c3774940e052131": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_17f70c3774940e052131",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_17f70c3774940e052131_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_17f70c3774940e052131_binding.cu",
@@ -306,14 +268,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_1bf5950bdb68b3a00594": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_1bf5950bdb68b3a00594",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_1bf5950bdb68b3a00594_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_1bf5950bdb68b3a00594_binding.cu",
@@ -333,14 +291,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_1ca53a59dd02a007f622": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_1ca53a59dd02a007f622",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_1ca53a59dd02a007f622_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_1ca53a59dd02a007f622_binding.cu",
@@ -360,14 +314,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 30720,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_1d093cef4e9d03349cbd_binding.cu",
@@ -387,14 +337,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 62464,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_2091d6b6347b02e20937": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_2091d6b6347b02e20937",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_2091d6b6347b02e20937_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_2091d6b6347b02e20937_binding.cu",
@@ -414,14 +360,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 62464,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_237fdf62606f7aaa8048": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_237fdf62606f7aaa8048",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_237fdf62606f7aaa8048_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_237fdf62606f7aaa8048_binding.cu",
@@ -441,14 +383,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_245b04e342922bec79a0": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_245b04e342922bec79a0",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_245b04e342922bec79a0_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_245b04e342922bec79a0_binding.cu",
@@ -468,14 +406,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_26f4a8214b8e11b048c5_binding.cu",
@@ -495,14 +429,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 47104,
         "cluster_dims": [1, 1, 4],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_2b7eedebd8f3fb650580": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_2b7eedebd8f3fb650580",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_2b7eedebd8f3fb650580_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_2b7eedebd8f3fb650580_binding.cu",
@@ -524,14 +454,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 85120,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_2cc4a32a57472117df41": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_2cc4a32a57472117df41",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_2cc4a32a57472117df41_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_2cc4a32a57472117df41_binding.cu",
@@ -551,14 +477,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 47104,
         "cluster_dims": [1, 1, 4],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_2f1f07fe72294a63de83": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_2f1f07fe72294a63de83",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_2f1f07fe72294a63de83_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_2f1f07fe72294a63de83_binding.cu",
@@ -578,14 +500,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_2f6a670baf612d2eca71": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_2f6a670baf612d2eca71",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_2f6a670baf612d2eca71_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_2f6a670baf612d2eca71_binding.cu",
@@ -605,14 +523,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_317c4acf4da1909bd51e": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_317c4acf4da1909bd51e",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_317c4acf4da1909bd51e_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_317c4acf4da1909bd51e_binding.cu",
@@ -632,14 +546,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 96,
-        "dynamic_smem_bytes": 150528,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_3402204cb63059a8551f": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_3402204cb63059a8551f",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_3402204cb63059a8551f_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_3402204cb63059a8551f_binding.cu",
@@ -661,14 +571,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 78976,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_390ff5549d35cde4b990": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_390ff5549d35cde4b990",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_390ff5549d35cde4b990_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_390ff5549d35cde4b990_binding.cu",
@@ -688,14 +594,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_3a0e07b9c304aeecb521": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_3a0e07b9c304aeecb521",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_3a0e07b9c304aeecb521_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_3a0e07b9c304aeecb521_binding.cu",
@@ -715,14 +617,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_410a822b59152e28bf3a": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_410a822b59152e28bf3a",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_410a822b59152e28bf3a_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_410a822b59152e28bf3a_binding.cu",
@@ -742,14 +640,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 96,
-        "dynamic_smem_bytes": 150528,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_44cc3fc32d80c039991b": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_44cc3fc32d80c039991b",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_44cc3fc32d80c039991b_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_44cc3fc32d80c039991b_binding.cu",
@@ -769,14 +663,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 30720,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_45bc6cba4fd3782ec97e": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_45bc6cba4fd3782ec97e",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_45bc6cba4fd3782ec97e_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_45bc6cba4fd3782ec97e_binding.cu",
@@ -796,14 +686,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 160,
-        "dynamic_smem_bytes": 218112,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_4d0cccec3b78ae116caa": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_4d0cccec3b78ae116caa",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_4d0cccec3b78ae116caa_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_4d0cccec3b78ae116caa_binding.cu",
@@ -823,14 +709,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 96,
-        "dynamic_smem_bytes": 150528,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_4fdb3230c20e03f3f3a9": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_4fdb3230c20e03f3f3a9",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_4fdb3230c20e03f3f3a9_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_4fdb3230c20e03f3f3a9_binding.cu",
@@ -852,14 +734,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 78976,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_5231418224f82e216679": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_5231418224f82e216679",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_5231418224f82e216679_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_5231418224f82e216679_binding.cu",
@@ -879,14 +757,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_525782f3f3e0be42ccb5": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_525782f3f3e0be42ccb5",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_525782f3f3e0be42ccb5_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_525782f3f3e0be42ccb5_binding.cu",
@@ -906,14 +780,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_538a30e223ef4d0f0af1": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_538a30e223ef4d0f0af1",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_538a30e223ef4d0f0af1_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_538a30e223ef4d0f0af1_binding.cu",
@@ -933,14 +803,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 96,
-        "dynamic_smem_bytes": 150528,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_5415a49326aaf2478405": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_5415a49326aaf2478405",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_5415a49326aaf2478405_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_5415a49326aaf2478405_binding.cu",
@@ -960,14 +826,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_58f2ab0edca01519d7bb": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_58f2ab0edca01519d7bb",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_58f2ab0edca01519d7bb_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_58f2ab0edca01519d7bb_binding.cu",
@@ -987,14 +849,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_622e3fe1ab9cce044aa5": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_622e3fe1ab9cce044aa5",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_622e3fe1ab9cce044aa5_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_622e3fe1ab9cce044aa5_binding.cu",
@@ -1016,14 +874,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 78976,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_63e7c7cecc879889b97a": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_63e7c7cecc879889b97a",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_63e7c7cecc879889b97a_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_63e7c7cecc879889b97a_binding.cu",
@@ -1043,14 +897,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 160,
-        "dynamic_smem_bytes": 73728,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_64fe12eec6e8456c7dc0": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_64fe12eec6e8456c7dc0",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_64fe12eec6e8456c7dc0_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_64fe12eec6e8456c7dc0_binding.cu",
@@ -1070,14 +920,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_692512cee52024c81cd3": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_692512cee52024c81cd3",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_692512cee52024c81cd3_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_692512cee52024c81cd3_binding.cu",
@@ -1099,14 +945,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 196608,
         "cluster_dims": [2, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_6b97292c5497a02ffed5": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_6b97292c5497a02ffed5",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_6b97292c5497a02ffed5_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_6b97292c5497a02ffed5_binding.cu",
@@ -1126,14 +968,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 96,
-        "dynamic_smem_bytes": 150528,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_6d3ecebd787375da667e": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_6d3ecebd787375da667e",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_6d3ecebd787375da667e_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_6d3ecebd787375da667e_binding.cu",
@@ -1155,14 +993,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 196608,
         "cluster_dims": [2, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_70306fbf7ffed04bfcac": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_70306fbf7ffed04bfcac",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_70306fbf7ffed04bfcac_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_70306fbf7ffed04bfcac_binding.cu",
@@ -1184,14 +1018,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 85120,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_732b4fb18587ae537f22": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_732b4fb18587ae537f22",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_732b4fb18587ae537f22_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_732b4fb18587ae537f22_binding.cu",
@@ -1211,14 +1041,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 160,
-        "dynamic_smem_bytes": 73728,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_734a89d3a2dae4a7cb1e": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_734a89d3a2dae4a7cb1e",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_734a89d3a2dae4a7cb1e_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_734a89d3a2dae4a7cb1e_binding.cu",
@@ -1238,14 +1064,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_73976e00e93c52d244b1": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_73976e00e93c52d244b1",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_73976e00e93c52d244b1_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_73976e00e93c52d244b1_binding.cu",
@@ -1267,14 +1089,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 196608,
         "cluster_dims": [2, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_73d03fb8ec9ab128de20": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_73d03fb8ec9ab128de20",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_73d03fb8ec9ab128de20_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_73d03fb8ec9ab128de20_binding.cu",
@@ -1296,14 +1114,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 85120,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_7468dc6cc46a70c1decc": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_7468dc6cc46a70c1decc",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_7468dc6cc46a70c1decc_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_7468dc6cc46a70c1decc_binding.cu",
@@ -1323,14 +1137,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 62464,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_74e3c3bb85bf627ef506": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_74e3c3bb85bf627ef506",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_74e3c3bb85bf627ef506_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_74e3c3bb85bf627ef506_binding.cu",
@@ -1350,14 +1160,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 96,
-        "dynamic_smem_bytes": 150528,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_7937a0f740c97f86d76a": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_7937a0f740c97f86d76a",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_7937a0f740c97f86d76a_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_7937a0f740c97f86d76a_binding.cu",
@@ -1377,14 +1183,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 98304,
         "cluster_dims": [1, 1, 4],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_7ab95684b2efbc6cbe8e": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_7ab95684b2efbc6cbe8e",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_7ab95684b2efbc6cbe8e_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_7ab95684b2efbc6cbe8e_binding.cu",
@@ -1404,14 +1206,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 30720,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_7b60c5816c1611ca1701": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_7b60c5816c1611ca1701",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_7b60c5816c1611ca1701_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_7b60c5816c1611ca1701_binding.cu",
@@ -1431,14 +1229,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_7f3a3292f5a452dfe666": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_7f3a3292f5a452dfe666",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_7f3a3292f5a452dfe666_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_7f3a3292f5a452dfe666_binding.cu",
@@ -1458,14 +1252,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 98304,
         "cluster_dims": [1, 1, 4],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_825e5f1f041667160dc6": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_825e5f1f041667160dc6",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_825e5f1f041667160dc6_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_825e5f1f041667160dc6_binding.cu",
@@ -1485,14 +1275,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 62464,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_83e9a9c8e6150e9ba7bb": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_83e9a9c8e6150e9ba7bb",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_83e9a9c8e6150e9ba7bb_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_83e9a9c8e6150e9ba7bb_binding.cu",
@@ -1512,14 +1298,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 47104,
         "cluster_dims": [1, 1, 4],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_87242024d283a189416f": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_87242024d283a189416f",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_87242024d283a189416f_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_87242024d283a189416f_binding.cu",
@@ -1539,14 +1321,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 62464,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_8a751c88d50636b4efb9": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_8a751c88d50636b4efb9",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_8a751c88d50636b4efb9_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_8a751c88d50636b4efb9_binding.cu",
@@ -1568,14 +1346,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 78976,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_916900985e3576f137a2": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_916900985e3576f137a2",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_916900985e3576f137a2_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_916900985e3576f137a2_binding.cu",
@@ -1595,14 +1369,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 98304,
         "cluster_dims": [1, 1, 4],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_931adc9ba7101cfcd57e": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_931adc9ba7101cfcd57e",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_931adc9ba7101cfcd57e_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_931adc9ba7101cfcd57e_binding.cu",
@@ -1622,14 +1392,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_94e594f619f21558d45a": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_94e594f619f21558d45a",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_94e594f619f21558d45a_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_94e594f619f21558d45a_binding.cu",
@@ -1649,14 +1415,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 62464,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_95f6d354e2e536c51ce2": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_95f6d354e2e536c51ce2",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_95f6d354e2e536c51ce2_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_95f6d354e2e536c51ce2_binding.cu",
@@ -1676,14 +1438,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_964205318c4b32d14401": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_964205318c4b32d14401",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_964205318c4b32d14401_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_964205318c4b32d14401_binding.cu",
@@ -1703,14 +1461,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 96,
-        "dynamic_smem_bytes": 150528,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_9869d2ccf9c5783ab28b": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_9869d2ccf9c5783ab28b",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_9869d2ccf9c5783ab28b_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_9869d2ccf9c5783ab28b_binding.cu",
@@ -1730,14 +1484,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_994c1fb1a1edb89bc971": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_994c1fb1a1edb89bc971",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_994c1fb1a1edb89bc971_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_994c1fb1a1edb89bc971_binding.cu",
@@ -1757,14 +1507,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 160,
-        "dynamic_smem_bytes": 218112,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_9d6a5705c2d7227ce03e": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_9d6a5705c2d7227ce03e",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_9d6a5705c2d7227ce03e_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_9d6a5705c2d7227ce03e_binding.cu",
@@ -1784,14 +1530,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_a33d4197b54d8953d9be": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_a33d4197b54d8953d9be",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_a33d4197b54d8953d9be_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_a33d4197b54d8953d9be_binding.cu",
@@ -1811,14 +1553,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 96,
-        "dynamic_smem_bytes": 150528,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_a961b62f20862d164a4d": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_a961b62f20862d164a4d",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_a961b62f20862d164a4d_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_a961b62f20862d164a4d_binding.cu",
@@ -1838,14 +1576,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 160,
-        "dynamic_smem_bytes": 218112,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_af124eba68ad18229e9e": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_af124eba68ad18229e9e",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_af124eba68ad18229e9e_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_af124eba68ad18229e9e_binding.cu",
@@ -1865,14 +1599,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 98304,
         "cluster_dims": [1, 1, 4],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_b7136150009825ef5216": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_b7136150009825ef5216",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_b7136150009825ef5216_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_b7136150009825ef5216_binding.cu",
@@ -1894,14 +1624,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 85120,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_b9f16942c2ab22125ec6": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_b9f16942c2ab22125ec6",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_b9f16942c2ab22125ec6_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_b9f16942c2ab22125ec6_binding.cu",
@@ -1921,14 +1647,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 96,
-        "dynamic_smem_bytes": 150528,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_bee1a475ab153a6e8530": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_bee1a475ab153a6e8530",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_bee1a475ab153a6e8530_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_bee1a475ab153a6e8530_binding.cu",
@@ -1948,14 +1670,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 160,
-        "dynamic_smem_bytes": 73728,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_c23e44493a5326e83be6": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_c23e44493a5326e83be6",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_c23e44493a5326e83be6_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_c23e44493a5326e83be6_binding.cu",
@@ -1975,14 +1693,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 96,
-        "dynamic_smem_bytes": 150528,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_c62cb04aff8f3851ad33": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_c62cb04aff8f3851ad33",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_c62cb04aff8f3851ad33_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_c62cb04aff8f3851ad33_binding.cu",
@@ -2002,14 +1716,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_c92b4b0b92c276d17a18": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_c92b4b0b92c276d17a18",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_c92b4b0b92c276d17a18_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_c92b4b0b92c276d17a18_binding.cu",
@@ -2029,14 +1739,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 96,
-        "dynamic_smem_bytes": 150528,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_cacf97e824f54a8b10cd": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_cacf97e824f54a8b10cd",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_cacf97e824f54a8b10cd_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_cacf97e824f54a8b10cd_binding.cu",
@@ -2056,14 +1762,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_cbf2ec3e4ed455d4eea9": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_cbf2ec3e4ed455d4eea9",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_cbf2ec3e4ed455d4eea9_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_cbf2ec3e4ed455d4eea9_binding.cu",
@@ -2083,14 +1785,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_cf3d29a336e4abbf0c6b": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_cf3d29a336e4abbf0c6b",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_cf3d29a336e4abbf0c6b_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_cf3d29a336e4abbf0c6b_binding.cu",
@@ -2110,14 +1808,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_d523068a6e7ae7de4b58": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_d523068a6e7ae7de4b58",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_d523068a6e7ae7de4b58_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_d523068a6e7ae7de4b58_binding.cu",
@@ -2137,14 +1831,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 96,
-        "dynamic_smem_bytes": 150528,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_d8375102fff4eb1643d1": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_d8375102fff4eb1643d1",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_d8375102fff4eb1643d1_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_d8375102fff4eb1643d1_binding.cu",
@@ -2164,14 +1854,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_db741aa36d51caefee17": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_db741aa36d51caefee17",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_db741aa36d51caefee17_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_db741aa36d51caefee17_binding.cu",
@@ -2191,14 +1877,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_dfbf721a98d42045de27": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_dfbf721a98d42045de27",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_dfbf721a98d42045de27_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_dfbf721a98d42045de27_binding.cu",
@@ -2218,14 +1900,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 47104,
         "cluster_dims": [1, 1, 4],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_e14073c132ab76375064": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_e14073c132ab76375064",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e14073c132ab76375064_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e14073c132ab76375064_binding.cu",
@@ -2245,14 +1923,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 96,
-        "dynamic_smem_bytes": 150528,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_e4f06dd5a2443a5abaf3": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_e4f06dd5a2443a5abaf3",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e4f06dd5a2443a5abaf3_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e4f06dd5a2443a5abaf3_binding.cu",
@@ -2272,14 +1946,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_e51d6aa5b4c91f53d1a3": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_e51d6aa5b4c91f53d1a3",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e51d6aa5b4c91f53d1a3_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e51d6aa5b4c91f53d1a3_binding.cu",
@@ -2299,14 +1969,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_e739183dc3c8c9c7dd33": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_e739183dc3c8c9c7dd33",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e739183dc3c8c9c7dd33_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e739183dc3c8c9c7dd33_binding.cu",
@@ -2326,14 +1992,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_e90ca23df12bd1d56d77": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_e90ca23df12bd1d56d77",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e90ca23df12bd1d56d77_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e90ca23df12bd1d56d77_binding.cu",
@@ -2353,14 +2015,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_e9b60f9d1678a0714152": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_e9b60f9d1678a0714152",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e9b60f9d1678a0714152_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_e9b60f9d1678a0714152_binding.cu",
@@ -2380,14 +2038,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 160,
-        "dynamic_smem_bytes": 73728,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_f05e3d89f345095156e0": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_f05e3d89f345095156e0",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f05e3d89f345095156e0_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f05e3d89f345095156e0_binding.cu",
@@ -2407,14 +2061,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 160,
-        "dynamic_smem_bytes": 218112,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_f09a6b112cd48156248b": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_f09a6b112cd48156248b",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f09a6b112cd48156248b_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f09a6b112cd48156248b_binding.cu",
@@ -2436,14 +2086,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 196608,
         "cluster_dims": [2, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_f377cbb03d9d54a3fcde": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_f377cbb03d9d54a3fcde",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f377cbb03d9d54a3fcde_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f377cbb03d9d54a3fcde_binding.cu",
@@ -2463,14 +2109,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 96,
-        "dynamic_smem_bytes": 150528,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_f43322c985f7e02ca8f6": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_f43322c985f7e02ca8f6",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f43322c985f7e02ca8f6_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f43322c985f7e02ca8f6_binding.cu",
@@ -2490,14 +2132,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_f963463e57b22269872e": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_f963463e57b22269872e",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f963463e57b22269872e_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f963463e57b22269872e_binding.cu",
@@ -2517,14 +2155,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_f9ddcd2381f2d5f2ec19": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_f9ddcd2381f2d5f2ec19",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f9ddcd2381f2d5f2ec19_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_f9ddcd2381f2d5f2ec19_binding.cu",
@@ -2544,14 +2178,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 62464,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_fb3b1ecfde8c57a51696": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_fb3b1ecfde8c57a51696",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_fb3b1ecfde8c57a51696_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_fb3b1ecfde8c57a51696_binding.cu",
@@ -2571,14 +2201,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_fbb91c1770193c627a03": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_fbb91c1770193c627a03",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_fbb91c1770193c627a03_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_fbb91c1770193c627a03_binding.cu",
@@ -2598,14 +2224,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_fcf5c2b4556a6eb5a0d3": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_fcf5c2b4556a6eb5a0d3",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_fcf5c2b4556a6eb5a0d3_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_fcf5c2b4556a6eb5a0d3_binding.cu",
@@ -2625,14 +2247,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": True,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_ff8aafdbfc390df477b1": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_ff8aafdbfc390df477b1",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_ff8aafdbfc390df477b1_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_ff8aafdbfc390df477b1_binding.cu",
@@ -2652,14 +2270,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 512,
-        "dynamic_smem_bytes": 107520,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_bf16_fp4_ffb4392d5fa01f008308": {
-        "kernel": "kernel_cake_blackwell_bf16_fp4_ffb4392d5fa01f008308",
         "sources": [
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_ffb4392d5fa01f008308_kernel.cu",
             "blackwell_bf16_fp4/cake_blackwell_bf16_fp4_ffb4392d5fa01f008308_binding.cu",
@@ -2679,10 +2293,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "threads": 256,
-        "dynamic_smem_bytes": 62464,
         "cluster_dims": [1, 1, 1],
-        "use_pdl": False,
         "arches": ["sm_100a", "sm_103a"],
     },
 }
