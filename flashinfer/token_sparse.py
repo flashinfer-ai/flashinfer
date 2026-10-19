@@ -30,6 +30,7 @@ PAGE = 64  # keys per block-table page
 # written in whole attention key tiles of TILE columns.
 ROWS, TILE = 4, 128
 CTA, TILE_WORDS, PAGE_WORDS = ROWS * THREADS, TILE // 32, PAGE // 32
+ALIGN = 16  # bytes, of its shared tensors: mask rows are copied 16 bytes at a time
 
 
 @cute.kernel
@@ -184,17 +185,17 @@ def union_masks_kernel(
     lane, team = thread % THREADS, thread // THREADS
     stage_words = min(group * top_k // 32, words)
     shared = utils.SmemAllocator()
-    bitmap = shared.allocate_tensor(cutlass.Int32, cute.make_layout(words), 16)
+    bitmap = shared.allocate_tensor(cutlass.Int32, cute.make_layout(words), ALIGN)
     # Union keys below each key tile, and a staging row of mask bits per team.
     below = shared.allocate_tensor(
-        cutlass.Int32, cute.make_layout(words // TILE_WORDS), 16
+        cutlass.Int32, cute.make_layout(words // TILE_WORDS), ALIGN
     )
     stage = shared.allocate_tensor(
         cutlass.Int32,
         cute.make_layout((ROWS, stage_words), stride=(stage_words, 1)),
-        16,
+        ALIGN,
     )
-    sums = shared.allocate_tensor(cutlass.Int32, cute.make_layout(CTA // 32), 16)
+    sums = shared.allocate_tensor(cutlass.Int32, cute.make_layout(CTA // 32), ALIGN)
     first, row_stage = g * group, stage[team, None]
     request, batch = requests[g], group_unions[g]
     for base in cutlass.range(0, TILE_WORDS * key_tiles, CTA):  # whole scan rounds
