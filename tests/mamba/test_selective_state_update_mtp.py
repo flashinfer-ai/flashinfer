@@ -34,6 +34,8 @@ _BASE_PARAMS = (
     (  64,    64,    128,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # dim=128
     (  64,    64,     80,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # dim=80
     (  64,    64,     96,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # dim=96
+    (   1,    64,     96,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # batch=1, dim=96: 48 rows per CTA
+    (  64,    64,    288,  128,    4,           torch.bfloat16,     torch.float32,  True ),  # dim=288
     (  64,    64,     64,   64,    4,           torch.bfloat16,     torch.float32,  True ),  # dstate=64
     (  64,    64,     64,   96,    4,           torch.bfloat16,     torch.float32,  True ),  # dstate=96
     (  64,    64,     64,  128,    1,           torch.bfloat16,     torch.float32,  True ),  # cache_steps=1
@@ -220,7 +222,8 @@ class TestSelectiveStateUpdateMTP:
 
         # Prepare output tensor if requested
         if use_out_tensor:
-            out = torch.empty_like(inputs["x"])
+            # Start from NaN, so an element that the kernel does not write fails the check.
+            out = torch.full_like(inputs["x"], float("nan"))
         else:
             out = None
 
@@ -326,7 +329,11 @@ class TestSelectiveStateUpdateMTPWithZ(TestSelectiveStateUpdateMTP):
 
     @pytest.mark.parametrize(
         "batch,nheads,dim,dstate,cache_steps,state_dtype,weight_dtype,use_out_tensor",
-        [(64, 64, 64, 128, 4, torch.bfloat16, torch.float32, True)],
+        [
+            (64, 64, 64, 128, 4, torch.bfloat16, torch.float32, True),
+            # dim=80 runs the strided epilogue with z gating
+            (64, 64, 80, 128, 4, torch.bfloat16, torch.float32, True),
+        ],
     )
     def test_output_correctness(
         self,
