@@ -8,8 +8,8 @@ pair the same way: ``NotImplementedError``, which survives ``python -O``.
 CHUNKED_PREFILL_HEAD_SIZES = frozenset({(128, 128), (128, 64), (64, 64)})
 # SM120 prefill derives one head dim from q.
 SM120_PREFILL_HEAD_SIZES = frozenset({(128, 128)})
-# MTP decode; head_size_v > head_size works too (checked on SM90).
-MTP_DECODE_HEAD_SIZES = frozenset({(128, 128), (128, 64), (64, 64), (64, 128)})
+# MTP decode.
+MTP_DECODE_HEAD_SIZES = frozenset({(128, 128), (128, 64), (64, 64)})
 
 
 def check_head_sizes(

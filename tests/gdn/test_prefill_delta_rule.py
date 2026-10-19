@@ -224,6 +224,8 @@ def test_prefill_block_end_decay(qkv_factory, seed=0):
         v,
         alpha,
         beta,
+        # Not 1.0: at unit scale the test cannot tell a scale applied once
+        # from one applied twice or not at all.
         1.0 / math.sqrt(head_size),
         None,
         True,
@@ -615,12 +617,15 @@ def _test_chunked_prefill(
     alpha: bool,
     beta: bool,
     seed: int | None = None,
+    head_size_v: int | None = None,
 ):
     _skip_if_unsupported()
     if not alpha and not beta:
         pytest.skip(
             "large diff due to output value amplitude explosion along token dimension"
         )
+    if head_size_v is None:
+        head_size_v = head_size
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -638,10 +643,22 @@ def _test_chunked_prefill(
     device = torch.device("cuda")
     with device:
         q1, k1, v1 = qkv_factory(
-            seq_lens1, num_q_heads, num_k_heads, num_v_heads, head_size, dtype
+            seq_lens1,
+            num_q_heads,
+            num_k_heads,
+            num_v_heads,
+            head_size,
+            dtype,
+            head_size_v=head_size_v,
         )
         q2, k2, v2 = qkv_factory(
-            seq_lens2, num_q_heads, num_k_heads, num_v_heads, head_size, dtype
+            seq_lens2,
+            num_q_heads,
+            num_k_heads,
+            num_v_heads,
+            head_size,
+            dtype,
+            head_size_v=head_size_v,
         )
         # l2 norm k to avoid numerical instability
         k1 = torch.nn.functional.normalize(k1, p=2.0, dim=-1)
@@ -654,18 +671,18 @@ def _test_chunked_prefill(
         beta2 = torch.rand(total_seqlen2, num_sab_heads) if beta else None
 
     our_o1 = torch.empty(
-        [total_seqlen1, num_o_heads, head_size], dtype=q1.dtype, device=q1.device
+        [total_seqlen1, num_o_heads, head_size_v], dtype=q1.dtype, device=q1.device
     )
     our_o2 = torch.empty(
-        [total_seqlen2, num_o_heads, head_size], dtype=q2.dtype, device=q2.device
+        [total_seqlen2, num_o_heads, head_size_v], dtype=q2.dtype, device=q2.device
     )
     our_state1 = torch.empty(
-        (num_seqs, num_sab_heads, head_size, head_size),
+        (num_seqs, num_sab_heads, head_size_v, head_size),
         dtype=torch.float32,
         device=q1.device,
     )
     our_state2 = torch.empty(
-        (num_seqs, num_sab_heads, head_size, head_size),
+        (num_seqs, num_sab_heads, head_size_v, head_size),
         dtype=torch.float32,
         device=q1.device,
     )
@@ -766,7 +783,13 @@ def _test_chunked_prefill(
 @pytest.mark.parametrize("beta", [False, True])
 @pytest.mark.parametrize("alpha", [False, True])
 @pytest.mark.parametrize("scale", [1.0, "auto"])
-@pytest.mark.parametrize("head_size", [128])
+# The second call loads the first call's final state, so DV = 64 checks the
+# state store -> load round trip with a state that matters to the output.
+@pytest.mark.parametrize(
+    "head_size, head_size_v",
+    [(128, 128), (128, 64), (64, 64)],
+    ids=["dk128-dv128", "dk128-dv64", "dk64-dv64"],
+)
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [(6, 2, 2), (2, 2, 4), (16, 16, 32), (16, 16, 64)],
@@ -790,6 +813,7 @@ def test_chunked_prefill(
     num_k_heads: int,
     num_v_heads: int,
     head_size: int,
+    head_size_v: int,
     block_size: int,
     seq_lens1: list[int],
     seq_lens2: list[int],
@@ -798,6 +822,11 @@ def test_chunked_prefill(
     beta: bool,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
+    if (head_size, head_size_v) != (128, 128) and not (
+        is_sm90a_supported(torch.device("cuda"))
+        or is_sm100a_supported(torch.device("cuda"))
+    ):
+        pytest.skip("the SM12x kernel only implements DK == DV == 128")
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
     _test_chunked_prefill(
         qkv_factory,
@@ -813,6 +842,7 @@ def test_chunked_prefill(
         alpha,
         beta,
         seed,
+        head_size_v=head_size_v,
     )
 
 

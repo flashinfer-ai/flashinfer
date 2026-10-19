@@ -811,10 +811,11 @@ def chunk_gated_delta_rule(
     - Supports GQA (``num_q_heads > num_k_heads = num_v_heads``) and GVA
       (``num_v_heads > num_q_heads = num_k_heads``).
     - The final state layout is ``[N, H, V, K]``.
-    - Requires SM90 (Hopper) or SM100 (Blackwell) architecture. The SM100
-      path requires ``head_size == 128``. On SM100/SM103, ``gdn_cp`` supports
-      structurally legal equal-head, GQA, and GVA shapes on CUDA 12.8,
-      CUDA 12.9, and CUDA 13.
+    - Requires SM90 (Hopper) or SM100 (Blackwell) architecture. The SM90 and
+      SM100 chunked kernels take ``(head_size, head_size_v)`` in
+      ``(128, 128)``, ``(128, 64)`` and ``(64, 64)``. On SM100/SM103,
+      ``gdn_cp`` supports structurally legal equal-head, GQA, and GVA shapes
+      on CUDA 12.8, CUDA 12.9, and CUDA 13.
       Other SM100 CP DSL routes require CUDA 13 and
       ``nvidia-cutlass-dsl[cu13]>=4.4.2`` (``pip install
       flashinfer-python[cu13]``).

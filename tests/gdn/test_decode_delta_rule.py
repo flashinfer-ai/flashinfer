@@ -1223,13 +1223,17 @@ def _test_verify_kernel_mtp(
     print(f"✓ MTP kernel test passed (batch={B}, seq_len={T}, dtype={dtype})")
 
 
+@pytest.mark.parametrize("disable_state_update", [True, False])
 @pytest.mark.parametrize("cache_intermediate_states", [True, False])
 @pytest.mark.parametrize("beta", [True])
 @pytest.mark.parametrize("alpha", [True])
 @pytest.mark.parametrize("scale", ["auto"])
 @pytest.mark.parametrize("seq_len", [2, 4, 8])
-@pytest.mark.parametrize("head_size", [128, 64], ids=lambda d: f"dk{d}")
-@pytest.mark.parametrize("head_size_v", [128, 64], ids=lambda d: f"dv{d}")
+@pytest.mark.parametrize(
+    "head_size, head_size_v",
+    [(128, 128), (128, 64), (64, 64)],
+    ids=["dk128-dv128", "dk128-dv64", "dk64-dv64"],
+)
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
@@ -1250,10 +1254,9 @@ def test_verify_kernel_mtp(
     alpha: bool,
     beta: bool,
     cache_intermediate_states: bool,
+    disable_state_update: bool,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
-    if head_size_v > head_size:
-        pytest.skip("DV > DK is not supported")
     scale_val = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
     _test_verify_kernel_mtp(
         dtype,
@@ -1267,15 +1270,17 @@ def test_verify_kernel_mtp(
         alpha,
         beta,
         cache_intermediate_states,
-        seed,
+        disable_state_update=disable_state_update,
+        seed=seed,
         head_size_v=head_size_v,
     )
 
 
-def test_mtp_rejects_unsupported_head_sizes():
-    """An unsupported K raises NotImplementedError, not an assert."""
+@pytest.mark.parametrize("K, V", [(96, 128), (64, 128)])
+def test_mtp_rejects_unsupported_head_sizes(K, V):
+    """An unsupported pair raises NotImplementedError, not an assert."""
     _skip_if_not_sm90_or_later()
-    B, T, H, HV, K, V = 1, 2, 1, 1, 96, 128
+    B, T, H, HV = 1, 2, 1, 1
     device = torch.device("cuda")
     q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
     v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device)
