@@ -316,10 +316,10 @@ plans pair the same way; see
 [Query pairing](kernels/fmha_decode/README.md#query-pairing).
 
 Every plan takes `softmax_rescale_threshold_log2` (0 to 8, default 8). On the
-Q64/KV256 and Q128/KV128 tiles of block-sparse plans, and on dense Q64/KV256
-plans, a row keeps its softmax exponent anchor while a tile raises the row
-maximum by at most that many binades, so the accumulated output is not
-rescaled; 0 rescales on every new maximum.
+Q64/KV256 and Q128/KV128 tiles of dense and block-sparse plans, a row keeps its
+softmax exponent anchor while a tile raises the row maximum by at most that
+many binades, so the accumulated output is not rescaled; 0 rescales on every
+new maximum.
 
 ## Sage attention
 
@@ -335,8 +335,7 @@ P       = softmax_row(S), quantized to E4M3 as C * p with C = 448 * 2**-h
 O[r][d] = sfV[d] * (sum_c P8[r][c] * V8[c][d]) / (C * l[r])  (+ v_mean[d])
 ```
 
-`h` is the plan's `softmax_rescale_threshold_log2` (default 8) on Q64/KV256
-tiles and block-sparse plans, and 0 elsewhere.
+`h` is the plan's `softmax_rescale_threshold_log2` (default 8).
 
 FlashInfer does not quantize: the 8-bit tensors and scales come from the
 caller, for example TensorRT-LLM's `sageQuant`. `v_mean` adds a per-channel

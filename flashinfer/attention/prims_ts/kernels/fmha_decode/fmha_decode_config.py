@@ -2687,16 +2687,11 @@ class FmhaDecodeConfig:
         Keeps correction skips the in-place O rescale whenever the anchor is
         unchanged, so keeping the prior anchor within
         ``softmax_anchor_headroom_log2`` binades trades a bounded P range for
-        fewer TMEM rescales. The profiles listed here are the ones where that
-        trade was measured to pay: KV256 tiles and block-sparse routes, whose
-        row maximum moves often but rarely by much. A zero headroom anchors on
-        the exact row maximum.
+        fewer TMEM rescales. A row maximum moves often but rarely by much, so
+        every Keeps profile takes the trade. A zero headroom anchors on the
+        exact row maximum.
         """
-        return (
-            self.use_keeps_mma_ab
-            and (self.tile_size_kv == 256 or self.use_block_sparse)
-            and self.softmax_anchor_headroom_log2 > 0
-        )
+        return self.use_keeps_mma_ab and self.softmax_anchor_headroom_log2 > 0
 
     @property
     def softmax_anchor_headroom_log2(self) -> float:
