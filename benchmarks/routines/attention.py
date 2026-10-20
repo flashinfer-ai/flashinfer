@@ -3421,6 +3421,12 @@ def testBatchMLAPagedAttentionWrapper(args):
         ]:
             print("[INFO] Cutlass MLA backend does not support FP8. Skipping.")
             remove_cutlass = True
+        if num_qo_heads != 128:
+            print(
+                "[INFO] Cutlass MLA backend requires 128 heads; "
+                f"got {num_qo_heads}. Skipping."
+            )
+            remove_cutlass = True
         if remove_cutlass:
             backends.remove("cutlass")
     if "trtllm-native" in backends:
