@@ -34,9 +34,10 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # per architecture.  One source serves every architecture it lists; a program
 # listed for one architecture only is a form the host plan selects on that
 # architecture alone (the plain one-tile and two-tile-split attention forms
-# exist on SM103 only) or a kernel whose device code genuinely differs
-# between the two (the attention kernels drain their scores with
-# ``tcgen05.ld.red`` on SM103).
+# exist on SM103 only).  The five attention forms both architectures share
+# are one source each with compile-time architecture arms
+# (``#if __CUDA_ARCH__ == 1000``; SM103 drains its scores with
+# ``tcgen05.ld.red`` in the other arm).
 #
 # ``ARG_PLANS`` lists each distinct argument plan once (``[kind, name]`` in
 # launch order; ``kind`` is ``tma_buffer`` / ``buffer`` / ``parameter`` /
@@ -73,8 +74,11 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # * ``merge``                     final RMSNorm + 2x2 spatial / temporal-mean merge;
 # * ``rmsnorm_apply``             the post-projector RMSNorm apply pass.
 #
-# The three literals are populated verbatim by the generated-program export;
-# do not edit them by hand.
+# The three literals are Cake exporter output, hand-folded here pending
+# exporter support: the five SM100-only attention programs were folded into
+# their SM103 twins -- the twins' records list both architectures (the SM100
+# closure entry repeats the SM103 literal, which only salts the build name)
+# and ``KERNELS["sm_100a"]`` points at them.
 MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_vision_tower_05528121bdb20ac63f4a": {
         "role": "kernel",
@@ -82,11 +86,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_05528121bdb20ac63f4a_kernel.cu",
             "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_05528121bdb20ac63f4a_binding.cu",
         ],
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math", "--ptxas-options=--opt-level=1"],
         "ffi_entry": "run",
         "arg_plan": "attention",
         "closure_sha256": {
+            "sm_100a": "6d908a3a9c5a6030c9d6fb3b829a8323210309febf89ce152b8080f9af783343",
             "sm_103a": "6d908a3a9c5a6030c9d6fb3b829a8323210309febf89ce152b8080f9af783343",
         },
     },
@@ -141,11 +146,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_153c43aa8701296c68b2_kernel.cu",
             "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_153c43aa8701296c68b2_binding.cu",
         ],
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math", "--ptxas-options=--opt-level=1"],
         "ffi_entry": "run",
         "arg_plan": "attention",
         "closure_sha256": {
+            "sm_100a": "92b303c4c73ebf96d436a20d7de2423fac59193e60c442fb26ea63200dadf1b8",
             "sm_103a": "92b303c4c73ebf96d436a20d7de2423fac59193e60c442fb26ea63200dadf1b8",
         },
     },
@@ -185,11 +191,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_23237a8f58b5d594d271_kernel.cu",
             "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_23237a8f58b5d594d271_binding.cu",
         ],
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math", "--ptxas-options=--opt-level=1"],
         "ffi_entry": "run",
         "arg_plan": "attention",
         "closure_sha256": {
+            "sm_100a": "57daaa0c39b88d3831a280ff04059ca15387ccc50da0948ae2c210d8c8f31527",
             "sm_103a": "57daaa0c39b88d3831a280ff04059ca15387ccc50da0948ae2c210d8c8f31527",
         },
     },
@@ -236,20 +243,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "closure_sha256": {
             "sm_100a": "74d7857a5f480e8473c5634a12e2d7105583ef409d400221e6c2c7cfc38f4505",
             "sm_103a": "0fa6babd9ac8874f9a239260edebde1ce3a23855a35e51f7012b4d9d0225358b",
-        },
-    },
-    "cake_kimi_k3_vision_tower_2b1f73ebc160206c4ba9": {
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_2b1f73ebc160206c4ba9_kernel.cu",
-            "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_2b1f73ebc160206c4ba9_binding.cu",
-        ],
-        "arches": ["sm_100a"],
-        "compile_flags": ["--use_fast_math", "--ptxas-options=--opt-level=1"],
-        "ffi_entry": "run",
-        "arg_plan": "attention",
-        "closure_sha256": {
-            "sm_100a": "6c7b1788111fc67b9913742b15cda9028da89e7215490679ef03482dab16e729",
         },
     },
     "cake_kimi_k3_vision_tower_2c6f70951276ee4ad16a": {
@@ -558,11 +551,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_6a51ed9304f30c8815cc_kernel.cu",
             "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_6a51ed9304f30c8815cc_binding.cu",
         ],
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math", "--ptxas-options=--opt-level=1"],
         "ffi_entry": "run",
         "arg_plan": "attention",
         "closure_sha256": {
+            "sm_100a": "261449cbf1e735a0cafc163f7bb60a677b40af5cb49999567a4be22232ba32b9",
             "sm_103a": "261449cbf1e735a0cafc163f7bb60a677b40af5cb49999567a4be22232ba32b9",
         },
     },
@@ -819,20 +813,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a": "b43663f90fb66cc39a7de4fbf694fa1c80582fc3be4740705ca515e090eb351b",
         },
     },
-    "cake_kimi_k3_vision_tower_b217c8895787ddb2a4de": {
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_b217c8895787ddb2a4de_kernel.cu",
-            "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_b217c8895787ddb2a4de_binding.cu",
-        ],
-        "arches": ["sm_100a"],
-        "compile_flags": ["--use_fast_math", "--ptxas-options=--opt-level=1"],
-        "ffi_entry": "run",
-        "arg_plan": "attention",
-        "closure_sha256": {
-            "sm_100a": "061da2d9c6707ab2c49699b18540a2d965e4bb85ace68381d5bd35189fbaf1bb",
-        },
-    },
     "cake_kimi_k3_vision_tower_b2eeaf27a8eaffecafa2": {
         "role": "kernel",
         "sources": [
@@ -846,20 +826,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "closure_sha256": {
             "sm_100a": "6c396845da9e74e267149b50fae908137a41375c011de8e8ade084c6dbde3726",
             "sm_103a": "26b67af3d2643f5e6bf34655d9a4432096013c5b9275eaefbaa7afdf12c4ffff",
-        },
-    },
-    "cake_kimi_k3_vision_tower_b7eb9c9816240252c48c": {
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_b7eb9c9816240252c48c_kernel.cu",
-            "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_b7eb9c9816240252c48c_binding.cu",
-        ],
-        "arches": ["sm_100a"],
-        "compile_flags": ["--use_fast_math", "--ptxas-options=--opt-level=1"],
-        "ffi_entry": "run",
-        "arg_plan": "attention",
-        "closure_sha256": {
-            "sm_100a": "5bcd31ba18cb55f80b6a15538f39d359fa30d7ce80dd8baa6a8b8eab98d92cf2",
         },
     },
     "cake_kimi_k3_vision_tower_b8e7e62f4c62c1cc15de": {
@@ -898,11 +864,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_baca276f87b855ba86ee_kernel.cu",
             "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_baca276f87b855ba86ee_binding.cu",
         ],
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--use_fast_math", "--ptxas-options=--opt-level=1"],
         "ffi_entry": "run",
         "arg_plan": "attention",
         "closure_sha256": {
+            "sm_100a": "13020ab80684c00bf1c924fb85baadc1fe5861a26de6f9c5ab6acb9a5e3eb174",
             "sm_103a": "13020ab80684c00bf1c924fb85baadc1fe5861a26de6f9c5ab6acb9a5e3eb174",
         },
     },
@@ -1008,20 +975,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "closure_sha256": {
             "sm_100a": "e85e34e2308ee861783031bb5b41642efcec77bc6edc37f370bf72d876d96a72",
             "sm_103a": "e8d2ac60c1ed0668efece294b47cd56cb98ca58e5d30fc66fc3d5104b042628a",
-        },
-    },
-    "cake_kimi_k3_vision_tower_d3641cd21e427b2ed442": {
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_d3641cd21e427b2ed442_kernel.cu",
-            "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_d3641cd21e427b2ed442_binding.cu",
-        ],
-        "arches": ["sm_100a"],
-        "compile_flags": ["--use_fast_math", "--ptxas-options=--opt-level=1"],
-        "ffi_entry": "run",
-        "arg_plan": "attention",
-        "closure_sha256": {
-            "sm_100a": "98860aec8b813eb76d37004acb13ef4339ed11ade93e086273c263bcf5aeb1ed",
         },
     },
     "cake_kimi_k3_vision_tower_d8e69a7d4433d7fe81a5": {
@@ -1203,20 +1156,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a": "44ad38ebfc7b87c45f8e06221bc9fe55bea22e51adb41ce4e4a5ca148932a733",
         },
     },
-    "cake_kimi_k3_vision_tower_f404bc4408d53752e702": {
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_f404bc4408d53752e702_kernel.cu",
-            "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_f404bc4408d53752e702_binding.cu",
-        ],
-        "arches": ["sm_100a"],
-        "compile_flags": ["--use_fast_math", "--ptxas-options=--opt-level=1"],
-        "ffi_entry": "run",
-        "arg_plan": "attention",
-        "closure_sha256": {
-            "sm_100a": "7e6c53e0e14077974e291ff6347bcca746a3c11200fa1d9d60bff9b94a56fbf3",
-        },
-    },
     "cake_kimi_k3_vision_tower_f4b3b1373781bf4578ad": {
         "role": "kernel",
         "sources": [
@@ -1367,11 +1306,11 @@ ARG_PLANS: dict[str, list[list[str]]] = {
 
 KERNELS: dict[str, dict[str, str]] = {
     "sm_100a": {
-        "attention:ring3": "cake_kimi_k3_vision_tower_b217c8895787ddb2a4de",
-        "attention:ring3:split": "cake_kimi_k3_vision_tower_b7eb9c9816240252c48c",
-        "attention:ring3:wide": "cake_kimi_k3_vision_tower_d3641cd21e427b2ed442",
-        "attention:tiles2": "cake_kimi_k3_vision_tower_f404bc4408d53752e702",
-        "attention:tiles2:wide": "cake_kimi_k3_vision_tower_2b1f73ebc160206c4ba9",
+        "attention:ring3": "cake_kimi_k3_vision_tower_baca276f87b855ba86ee",
+        "attention:ring3:split": "cake_kimi_k3_vision_tower_6a51ed9304f30c8815cc",
+        "attention:ring3:wide": "cake_kimi_k3_vision_tower_23237a8f58b5d594d271",
+        "attention:tiles2": "cake_kimi_k3_vision_tower_05528121bdb20ac63f4a",
+        "attention:tiles2:wide": "cake_kimi_k3_vision_tower_153c43aa8701296c68b2",
         "attention_merge": "cake_kimi_k3_vision_tower_e0b196f00aea91ddbf42",
         "gemm:gelu_erf:l": "cake_kimi_k3_vision_tower_f4b3b1373781bf4578ad",
         "gemm:gelu_erf:l_h": "cake_kimi_k3_vision_tower_db2e4e6986f3081ba04c",

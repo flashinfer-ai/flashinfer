@@ -134,12 +134,16 @@ FlashInfer ragged BF16 attention route:
 `benchmarks/bench_cake_kimi_k3_vision_tower.py`.
 
 The generated sources under `csrc/cake_kimi_k3_vision_tower/` and the
-`MODULES` / `ARG_PLANS` / `KERNELS` registries in `cake_jit.py` are written by
-the Cake generated-program export; do not edit them by hand. One source pair
-is one program, built for every architecture it lists (`MODULES[name]["arches"]`)
-with FlashInfer's exact `sm100a` / `sm103a` flag set of the device it runs on;
-the attention kernels are separate programs per architecture (SM103 drains the
-scores with `tcgen05.ld.red`), and the plain one-tile / two-tile-split attention
-forms exist on SM103 only because the plan rule selects them there alone. On a
-device without a registered program the entry points raise
+`MODULES` / `ARG_PLANS` / `KERNELS` registries in `cake_jit.py` are Cake
+exporter output, hand-folded here pending exporter support; apart from the
+fold described next they are not edited by hand. One source pair is one
+program, built for every architecture it lists (`MODULES[name]["arches"]`)
+with FlashInfer's exact `sm100a` / `sm103a` flag set of the device it runs on.
+The five attention forms both architectures share (`ring3`, `ring3:split`,
+`ring3:wide`, `tiles2`, `tiles2:wide`) are one source each with compile-time
+architecture arms (`#if __CUDA_ARCH__ == 1000`: SM100 text first, then the
+SM103 text, which drains the scores with `tcgen05.ld.red`), so their SM100
+build carries the SM103 kernel symbol; the plain one-tile / two-tile-split
+attention forms exist on SM103 only because the plan rule selects them there
+alone. On a device without a registered program the entry points raise
 `NotImplementedError`.
