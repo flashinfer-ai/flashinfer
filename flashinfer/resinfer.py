@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Rong Shuo
 # SPDX-License-Identifier: Apache-2.0
-"""Experimental ResInfer quantization and folded GEMM APIs.
+"""Experimental ResInfer quantization, folded GEMM and paged decode APIs.
 
 Ported from https://github.com/ShawRong/resinfer at
 51b906836a69fa43915040314df57bc9f23030ad. See the backend README for lineage.
@@ -19,6 +19,7 @@ from .utils import get_compute_capability
 __all__ = [
     "nvfp4_quantize_residue",
     "mm_nvfp4_residue",
+    "paged_decode_residue",
 ]
 
 
@@ -117,4 +118,101 @@ def mm_nvfp4_residue(
     with torch.cuda.device(act.device):
         return mext_fold_gemm(
             weight, act, weight_scale, act_scale, alpha, out_dtype=out_dtype
+        )
+
+
+@flashinfer_experimental_api
+def paged_decode_residue(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    sm_scale: float | None = None,
+    key_scale: float = 1.0,
+    value_scale: float = 1.0,
+    num_splits: int = 1,
+):
+    """ResInfer single-token paged NVFP4 attention with BF16 output (SM100).
+
+    Q is contiguous BF16 ``[batch, query_heads, D]``. K/V are packed uint8
+    ``[pages, kv_heads, 128, D/2]``. K scales are contiguous E4M3 (or uint8
+    bytes) ``[pages, kv_heads, 128, D/16]``. V scales use the same dtype but
+    four-token interleaving: ``[pages, kv_heads, 32, D/16, 4]``, indexed by
+    page, head, token//4, channel//16, token%4. Prepare that layout when
+    writing the cache; this call does not reorder scale contents. D is 128/256,
+    and the query/KV head ratio is 4, 6 or 8. ``key_scale`` and ``value_scale``
+    are positive finite reconstruction multipliers for the prequantized cache.
+
+    ``block_tables`` is contiguous int32 ``[batch, max_pages]``; ``seq_lens``
+    is contiguous int32 ``[batch]``. The caller must supply positive lengths
+    no greater than ``128 * max_pages`` and valid page indices for every
+    used page. Values are not copied to the CPU for validation. Q must be finite.
+
+    Q is quantized into base/residue groups and the two QK contributions are
+    folded before softmax. V is converted to E4M3 by QMUL4; unnormalized
+    probabilities are rounded to E4M3 for PV, with an FP32 denominator. Split count 1
+    uses no reducer; 2 uses a deterministic FP32-partial kernel reducer.
+    Requires CUTLASS DSL 4.8 with its CUDA 13.4 PTX compiler. Warm up before
+    graph capture. No implicit auto-backend selection is performed.
+    """
+    import math
+
+    _check_sm100(q)
+    _check_tensor(q, "q", q.device, (torch.bfloat16,), 32)
+    if q.ndim != 3 or min(q.shape) <= 0 or q.shape[-1] not in (128, 256):
+        raise ValueError("q must be positive [batch, query_heads, 128 or 256]")
+    b, hq, d = q.shape
+    if k.ndim != 4 or min(k.shape) <= 0:
+        raise ValueError("k must be positive [pages, kv_heads, 128, D/2]")
+    pages, h = k.shape[:2]
+    if hq % h or hq // h not in (4, 6, 8):
+        raise ValueError("ResAttn requires GQA4, GQA6 or GQA8")
+    for tensor, name in ((k, "k"), (v, "v")):
+        _check_tensor(tensor, name, q.device, (torch.uint8,), 16)
+        if tuple(tensor.shape) != (pages, h, 128, d // 2):
+            raise ValueError(f"{name} must be [pages, kv_heads, 128, D/2]")
+    for tensor, name in ((k_scale, "k_scale"), (v_scale, "v_scale")):
+        _check_tensor(tensor, name, q.device, (torch.uint8, torch.float8_e4m3fn))
+    if tuple(k_scale.shape) != (pages, h, 128, d // 16):
+        raise ValueError("k_scale must be [pages, kv_heads, 128, D/16]")
+    if tuple(v_scale.shape) != (pages, h, 32, d // 16, 4):
+        raise ValueError(
+            "v_scale must be four-token interleaved [pages, kv_heads, 32, D/16, 4]"
+        )
+    for tensor, name in ((block_tables, "block_tables"), (seq_lens, "seq_lens")):
+        _check_tensor(tensor, name, q.device, (torch.int32,), 4)
+    if (
+        block_tables.ndim != 2
+        or block_tables.shape[0] != b
+        or block_tables.shape[1] <= 0
+    ):
+        raise ValueError("block_tables must be [batch, max_pages > 0]")
+    if tuple(seq_lens.shape) != (b,):
+        raise ValueError("seq_lens must be [batch]")
+    if type(num_splits) is not int or num_splits not in (1, 2):
+        raise ValueError("this experimental API exposes num_splits=1 or 2")
+    sm_scale = d**-0.5 if sm_scale is None else float(sm_scale)
+    if not all(math.isfinite(x) and x > 0 for x in (sm_scale, key_scale, value_scale)):
+        raise ValueError(
+            "attention and cache reconstruction scales must be positive finite scalars"
+        )
+    from .experimental.resinfer_resattn.backend import decode
+
+    with torch.cuda.device(q.device):
+        return decode(
+            q,
+            k,
+            v,
+            k_scale,
+            v_scale,
+            block_tables,
+            seq_lens,
+            sm_scale,
+            key_scale,
+            value_scale,
+            num_splits,
         )

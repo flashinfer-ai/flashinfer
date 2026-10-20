@@ -15,3 +15,13 @@ def gen_resinfer_mext_quantize_module():
             supported_major_versions=[10]
         ),
     )
+
+
+def gen_resinfer_grouped_q_module():
+    return gen_jit_spec(
+        "resinfer_grouped_q",
+        [jit_env.FLASHINFER_CSRC_DIR / "resinfer_grouped_q.cu"],
+        extra_cuda_cflags=current_compilation_context.get_nvcc_flags_list(
+            supported_major_versions=[10]
+        ),
+    )
