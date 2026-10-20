@@ -42,6 +42,7 @@ from .fmha_decode_constants import (
     E4M3_MAX,
     SOFTMAX_RESCALE_THRESHOLD_LOG2,
     AUTO_LAUNCH_TILE_SIZE_KV,
+    KV_TILE_256_MAX_EX2_EMULATED_PAIRS,
     BITS_PER_BYTE,
     BYTES_PER_KIB,
     FALLBACK_SM_COUNT_B200,
@@ -1577,8 +1578,9 @@ class FmhaDecodeConfig:
     softmax_order_barrier_threads: int = 256
     # Score pairs per streamed K32 fragment whose exponentials run as FMA
     # polynomials instead of MUFU. The best value depends on the GPU's MUFU
-    # rate; ``arch_config_args`` supplies it for the launch device.
-    ex2_emulated_pairs: int = 4
+    # rate; ``arch_config_args`` supplies it for the launch device, and
+    # ``fragment_ex2_emulated_pairs`` caps it on KV256 tiles.
+    ex2_emulated_pairs: int = 6
     # Reduce streamed score-fragment maxima inside the TMEM load
     # (tcgen05.ld.red); ``arch_config_args`` supplies it.
     uses_ldtm_stat: bool = False
@@ -1733,6 +1735,17 @@ class FmhaDecodeConfig:
         if self.streams_tmem_p_fragments:
             return 32
         return self.num_s_regs_per_thread
+
+    @property
+    def fragment_ex2_emulated_pairs(self) -> int:
+        """Return a streamed fragment's score pairs exponentiated on the FMA pipe.
+
+        KV128 tiles take ``ex2_emulated_pairs``; KV256 tiles take at most
+        ``KV_TILE_256_MAX_EX2_EMULATED_PAIRS``.
+        """
+        if self.tile_size_kv == 256:
+            return min(self.ex2_emulated_pairs, KV_TILE_256_MAX_EX2_EMULATED_PAIRS)
+        return self.ex2_emulated_pairs
 
     @property
     def num_softmax_score_fragments(self) -> int:
@@ -2663,11 +2676,11 @@ class FmhaDecodeConfig:
         Dense KV128 tiles stream too when K and V share a width and the
         softmax stats travel through SMEM (the 16-bit and 8-bit Q/K/V recipes,
         including Sage): the PV MMA starts on the first fragment instead of
-        the complete row, and the exponentials share the FMA pipes
-        (``ex2_emulated_pairs``). Q-token page membership keeps the complete
-        row, since a dense fragment's keep word is one visible token range and
-        cannot express per-page membership; so do FP8 D64 (softmax stats in
-        TMEM) and QK-BF16/PV-FP8.
+        the complete row, and the exponentials share the FMA pipe
+        (``fragment_ex2_emulated_pairs``). Q-token page membership keeps the
+        complete row, since a dense fragment's keep word is one visible token
+        range and cannot express per-page membership; so do FP8 D64 (softmax
+        stats in TMEM) and QK-BF16/PV-FP8.
         """
         if not self.uses_two_inst_tmem_p:
             return False
@@ -5413,10 +5426,11 @@ def validate_storage_page_size(
 def arch_config_args(compute_capability: tuple[int, int]) -> dict[str, object]:
     """Return the config fields whose value depends on the GPU architecture.
 
-    SM100 runs a quarter of the streamed exponentials as FMA polynomials
-    because the MUFU issue rate bounds its P pass while the FMA pipe is nearly
-    idle; larger shares grow the fragment body until the softmax warps become
-    instruction-fetch bound. SM103 doubles the MUFU ex2 rate (32 results per
+    SM100 runs three eighths of the streamed exponentials of KV128 tiles (a
+    quarter on KV256 tiles) as FMA polynomials because the MUFU issue rate
+    bounds its P pass while the FMA pipe has room; larger shares grow the
+    fragment body until the softmax warps become instruction-fetch bound.
+    SM103 doubles the MUFU ex2 rate (32 results per
     SM clock), so the polynomials only add instructions there and every
     exponential stays on MUFU. GPUs whose TMEM loads return score maxima
     (LDTM.STAT) take them from the load, which replaces the max pass's
@@ -5424,7 +5438,7 @@ def arch_config_args(compute_capability: tuple[int, int]) -> dict[str, object]:
     """
     is_sm103 = tuple(compute_capability) == (10, 3)
     return {
-        "ex2_emulated_pairs": 0 if is_sm103 else 4,
+        "ex2_emulated_pairs": 0 if is_sm103 else 6,
         "uses_ldtm_stat": ldtm_stat_supported(compute_capability),
     }
 

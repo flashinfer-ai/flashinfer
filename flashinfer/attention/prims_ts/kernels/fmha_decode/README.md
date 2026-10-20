@@ -258,11 +258,11 @@ Q + paged K/V
 
 Profiles that stream score fragments (KV256 tiles, block-sparse routes, and
 Q128/KV128 tiles whose K and V are both 16-bit or both 8-bit) choose their
-softmax arithmetic per architecture. SM100 evaluates a quarter of each
-fragment's exponentials as FMA polynomials to offload MUFU. SM103, with twice
-the MUFU ex2 rate, keeps every exponential on MUFU, and its unmasked max pass
-takes fragment maxima (or Sage scale-group maxima) from LDTM.STAT instead of a
-register reduction.
+softmax arithmetic per architecture. SM100 evaluates three eighths of each
+fragment's exponentials (a quarter on KV256 tiles) as FMA polynomials to
+offload MUFU. SM103, with twice the MUFU ex2 rate, keeps every exponential on
+MUFU, and its unmasked max pass takes fragment maxima (or Sage scale-group
+maxima) from LDTM.STAT instead of a register reduction.
 
 Eligible nonsplit work that exceeds one resident SM wave uses CLC-persistent
 scheduling. A scheduler warp discovers each schedule token once and broadcasts it to
