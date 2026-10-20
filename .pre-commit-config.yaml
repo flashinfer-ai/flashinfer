@@ -51,8 +51,9 @@ repos:
     rev: v5.0.0
     hooks:
       - id: check-added-large-files
-        # Required generated CuTe sources and Frost catalogs; retain other checks.
-        exclude: ^flashinfer/(?:experimental/cake_mxfp8_megamoe_ep16/kernels/fused_(?:cta0|all_ctas)\.py|fused_moe/backends/cudnn_frost/artifacts/[^/]+/cudnn_frost_selected_kernels\.json|experimental/qwen_3_5_block/_cudnn_frost/gated_attention_block/api\.py)$
+        # Required Frost catalogs; retain other checks.
+        # The vendored cuDNN Frontend block API module exceeds the size limit; its bytes are digest-checked by VENDOR_MANIFEST.json.
+        exclude: ^flashinfer/(?:fused_moe/backends/cudnn_frost/artifacts/[^/]+/cudnn_frost_selected_kernels\.json|experimental/qwen_3_5_block/_cudnn_frost/gated_attention_block/api\.py)$
       - id: check-case-conflict
       - id: check-merge-conflict
       - id: check-symlinks
