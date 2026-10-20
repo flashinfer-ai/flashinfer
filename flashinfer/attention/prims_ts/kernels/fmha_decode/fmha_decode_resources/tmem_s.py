@@ -1418,8 +1418,13 @@ class TmemSResource(DecodeGenResourceBase):
             and not cfg.use_sliding_window_causal
             and cfg.tile_size_q in (64, 128)
         )
+        # Query-paired instances take their mask bounds from different Q tiles,
+        # which keeps the compiler from splitting the post-load mask pass off
+        # fully visible tiles, so they select the loader before LDTM as well.
         use_preload_mask_split = (
-            use_runtime_paged_dense_load or cfg.uses_per_row_causal_mask
+            use_runtime_paged_dense_load
+            or cfg.uses_per_row_causal_mask
+            or cfg.q_groups_per_cta > 1
         )
         if cutlass.const_expr(not use_preload_mask_split):
             for reg_idx in cutlass.range_constexpr(num_s_regs):
