@@ -368,7 +368,7 @@ def _issue_sparse_page_copies(
 
 @dataclass(kw_only=True)
 class SmemQResource(DecodeGenResourceBase):
-    """Q tile in SMEM. Loaded once in HEAD."""
+    """Q tiles of the CTA in SMEM. Loaded once in HEAD."""
 
     _task_local_specs: ClassVar[tuple[tuple, ...]] = (
         (
@@ -394,7 +394,7 @@ class SmemQResource(DecodeGenResourceBase):
         """Create placeholder Q SMEM and descriptor state for static analysis."""
         self._smem_base_q = _placeholder_smem_array(
             self.cfg.q_dtype,
-            self.cfg.smem_q_tile_elements * self.cfg.q_stages,
+            self.cfg.smem_q_stage_elements * self.cfg.q_stages,
         )
         self._q_descs = _placeholder_local_array(
             cutlass.Int64, self.cfg.q_stages, alignment=8
@@ -405,7 +405,7 @@ class SmemQResource(DecodeGenResourceBase):
         if self._alloc is None:
             self._alloc = SmemAllocation(
                 name=f"{self.name}",
-                size_bytes=self.cfg.smem_q_tile_bytes * self.cfg.q_stages,
+                size_bytes=self.cfg.smem_q_stage_bytes * self.cfg.q_stages,
                 alignment=self.cfg.stensor_align,
             )
         return [self._alloc]
@@ -425,7 +425,7 @@ class SmemQResource(DecodeGenResourceBase):
             self._smem_base_q = cutlass.Array(
                 context.smem_base.data_ptr() + self._alloc.offset,
                 dtype=self.cfg.q_dtype,
-                shape=(self.cfg.smem_q_tile_elements * self.cfg.q_stages,),
+                shape=(self.cfg.smem_q_stage_elements * self.cfg.q_stages,),
                 addrspace=3,
             )
             self._q_descs = cutlass.Array(
@@ -434,7 +434,7 @@ class SmemQResource(DecodeGenResourceBase):
                 space=cutlass.AddressSpace.rmem,
                 alignment=8,
             )
-            stage_elems = self.cfg.smem_q_tile_elements
+            stage_elems = self.cfg.smem_q_stage_elements
             q_head_dim_partition = min(self.cfg.headdim, 64)
             # 16-bit Q uses two 64-column TMA loads for headDim=128. FP8 Q
             # uses a descriptor stride based on the actual MMA K-major swizzle.
@@ -566,7 +566,7 @@ class SmemQResource(DecodeGenResourceBase):
     @producer_work
     @cute.jit
     def tma_load(self, stage_info: StageInfo) -> None:
-        """TMA load the current staged Q tile from GMEM to SMEM."""
+        """TMA load the current stage's Q tiles from GMEM to SMEM."""
         cfg = self.cfg
         # ProdWork: issue the Q TMA copies for the current pipeline stage. The
         # pipeline barrier in stage_info is the handoff to the MMA consumer.
@@ -578,8 +578,28 @@ class SmemQResource(DecodeGenResourceBase):
         logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
         # Select the SMEM stage owned by this producer fire. The TS pipeline
         # barrier attached to stage_info protects this stage until QK consumes it.
-        stage_elems = cfg.smem_q_tile_elements
+        stage_elems = cfg.smem_q_stage_elements
         stage_base = self._smem_base_q.subview(stage_info.stage_idx * stage_elems)
+        for tile_idx in cutlass.range_constexpr(cfg.q_groups_per_cta):
+            self._tma_load_tile(
+                stage_info,
+                stage_base.subview(tile_idx * cfg.smem_q_tile_elements),
+                logical_q_group_idx + Int32(tile_idx),
+                logical_h_k_idx,
+                logical_b_idx,
+            )
+
+    @cute.jit
+    def _tma_load_tile(
+        self,
+        stage_info: StageInfo,
+        stage_base: cutlass.Array,
+        logical_q_group_idx: Int32,
+        logical_h_k_idx: Int32,
+        logical_b_idx: Int32,
+    ) -> None:
+        """Issue the TMA copies of one Q tile into ``stage_base``."""
+        cfg = self.cfg
         if cutlass.const_expr(cfg.q_dtype_bytes == 1):
             if _is_load_task_warp_leader(cfg):
                 if cutlass.const_expr(cfg.headdim <= 128):
@@ -1636,11 +1656,8 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         # inert partner in odd-tail direct launches so lane-partitioned locator
         # reads remain in bounds; the producer fills that partner with -1.
         local_tiles = self.cfg.static_local_kv_tiles
-        return (
-            (local_tiles + self.cfg.num_insts_kv - 1)
-            // self.cfg.num_insts_kv
-            * self.cfg.num_insts_kv
-        )
+        tiles_per_loop = self.cfg.kv_tiles_per_loop
+        return (local_tiles + tiles_per_loop - 1) // tiles_per_loop * tiles_per_loop
 
     def _init_placeholder_state(self) -> None:
         """Create placeholder storage for per-stage page-offset windows."""

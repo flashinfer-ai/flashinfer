@@ -755,6 +755,10 @@ class TmemSResource(DecodeGenResourceBase):
         else:
             k_desc = _freeze_smem_descriptor(kv_desc)
         q_desc = _freeze_smem_descriptor(q_desc)
+        if cutlass.const_expr(cfg.q_groups_per_cta > 1 and self.inst_id > 0):
+            # Q descriptors name the stage's first Q tile; a paired instance
+            # reads its own tile, ``inst_id`` tiles further into the stage.
+            q_desc = q_desc + Int32((cfg.smem_q_tile_bytes * self.inst_id) >> 4)
         q_desc, head_dim_stage_idx = self._q_desc_for_head_dim_stage(
             q_desc, head_dim_stage_idx
         )
@@ -2230,7 +2234,9 @@ class TmemSResource(DecodeGenResourceBase):
                 kv_head_idx=kv_head_idx,
                 num_kv_heads=self.num_heads_kv,
             ),
-            q_tile_idx=_logical_q_group_idx(cfg, stage_info, self.q_group_idx),
+            q_tile_idx=_logical_q_group_idx(
+                cfg, stage_info, self.q_group_idx, self.inst_id
+            ),
             row_idx=_keeps_row_idx(cfg, warp_grp_thread_idx),
         )
 
@@ -2412,7 +2418,7 @@ class TmemSResource(DecodeGenResourceBase):
                 sparse_token_word3,
             )
             logical_q_group_idx = _logical_q_group_idx(
-                cfg, stage_info, self.q_group_idx
+                cfg, stage_info, self.q_group_idx, self.inst_id
             )
             q_token_idx, _ = _q_row_token_and_local_head(
                 cfg,

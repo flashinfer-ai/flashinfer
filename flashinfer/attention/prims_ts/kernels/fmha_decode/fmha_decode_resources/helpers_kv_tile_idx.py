@@ -150,7 +150,7 @@ def _runtime_effective_seq_len_kv(
     visible_k_end = seq_len_kv
     if cutlass.const_expr(cfg.mask_type == CAUSAL):
         q_token_end = cute.math.min(
-            q_token_base + Int32(cfg.q_tokens_per_cta),
+            q_token_base + Int32(cfg.q_tokens_per_kv_domain),
             seq_len_q,
         )
         visible_k_end = cute.math.min(
@@ -367,15 +367,16 @@ def _local_kv_tile_idx_for_section(
     - LOOP produces V for the current MMA iteration and K for the next one.
     - TAIL drains the final V tiles after the last loop iteration.
     """
-    num_insts_kv = Int32(cfg.num_insts_kv)
+    tiles_per_loop = Int32(cfg.kv_tiles_per_loop)
+    inst_offset = Int32(cfg.kv_inst_tile_offset(inst_id))
     if cutlass.const_expr(section == FmhaStage.Head):
-        return Int32(inst_id)
+        return inst_offset
     if cutlass.const_expr(section == FmhaStage.Loop):
-        base = stage_info.loop_offset * num_insts_kv + Int32(inst_id)
+        base = stage_info.loop_offset * tiles_per_loop + inst_offset
         if cutlass.const_expr(kv_kind == KV_KIND_V):
             return base
-        return base + num_insts_kv
-    return stage_info.loop_end * num_insts_kv + Int32(inst_id)
+        return base + tiles_per_loop
+    return stage_info.loop_end * tiles_per_loop + inst_offset
 
 
 @cute.jit
@@ -411,7 +412,7 @@ def resolve_keeps_tile_context(
             Int32(0),
         )
 
-    logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, q_group_idx)
+    logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, q_group_idx, inst_id)
     q_token_base = _q_group_token_base(cfg, logical_q_group_idx)
     element_mask_end_idx = seq_len_kv
     if cutlass.const_expr(cfg.uses_uniform_causal_mask):
@@ -436,26 +437,30 @@ def resolve_keeps_tile_context(
         tile_idx = effective_tile_idx
         window_start_idx = Int32(task_cache[_TASK_CACHE_KV_WINDOW_START])
     else:
+        # The tile indexes the CTA's K/V stream, which every Q tile shares.
+        kv_domain_token_base = _q_group_token_base(
+            cfg, _logical_q_group_idx(cfg, stage_info, q_group_idx)
+        )
         effective_tile_idx = _runtime_split_kv_global_tile_idx(
             cfg,
             stage_info,
             local_tile_idx,
             seq_len_kv,
             seq_len_q,
-            q_token_base,
+            kv_domain_token_base,
         )
         effective_total_kv_tiles = _runtime_total_kv_tiles(
-            cfg, seq_len_kv, seq_len_q, q_token_base
+            cfg, seq_len_kv, seq_len_q, kv_domain_token_base
         )
         tile_idx = _runtime_clamp_valid_tile_idx(
             cfg,
             effective_tile_idx,
             seq_len_kv,
             seq_len_q,
-            q_token_base,
+            kv_domain_token_base,
         )
         tile_idx = tile_idx + _num_skipped_kv_tiles(
-            cfg, seq_len_kv, seq_len_q, q_token_base
+            cfg, seq_len_kv, seq_len_q, kv_domain_token_base
         )
         window_start_idx = _sliding_window_start_idx(
             cfg, seq_len_kv, seq_len_q, q_token_base
