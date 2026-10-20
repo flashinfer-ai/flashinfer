@@ -276,6 +276,10 @@ def test_capacity_growth_never_frees_a_capture_pinned_workspace(monkeypatch):
         return FakeWorkspace(kwargs["routed_rows"])
 
     monkeypatch.setattr(moe_dispatch, "allocate_sm120_moe_workspace", fake_allocate)
+    # The real refuse guard asks the CUDA runtime whether a capture is
+    # underway, which needs a driver; this test is CPU-only. Stand it down:
+    # with no capture active the guard is a pass-through anyway.
+    monkeypatch.setattr(moe_dispatch, "_refuse_during_capture", lambda _what: None)
 
     def call(routed_rows):
         return moe_dispatch._get_cached_workspace(
@@ -304,11 +308,18 @@ def test_capacity_growth_never_frees_a_capture_pinned_workspace(monkeypatch):
             ws = call(rows)
             if i == 0:
                 unpinned = ws
-        assert weakref.ref(warm)() is not None
+
+        # Judge retention on stored weakrefs: the test's own strong
+        # references must be dropped first, or the pin check is vacuous
+        # and the eviction check can never observe the free.
+        warm_ref = weakref.ref(warm)
+        unpinned_ref = weakref.ref(unpinned)
+        del warm, unpinned
+        assert warm_ref() is not None
 
         # One more retirement evicts the oldest unpinned workspace as before.
         call(16384)
-        assert weakref.ref(unpinned)() is None
+        assert unpinned_ref() is None
     finally:
         moe_dispatch._WORKSPACE_CACHE.clear()
         moe_dispatch._WORKSPACE_CACHE.update(cache_before)
