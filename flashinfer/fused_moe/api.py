@@ -28,6 +28,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Mapping
 import math
+import os
 from dataclasses import KW_ONLY, dataclass, field
 from enum import Enum
 from typing import Any, ClassVar, Dict, Literal, Optional, Tuple, Union
@@ -709,6 +710,8 @@ class CakeWarpDecodeConfig:
         shared. Refresh the derived buffers outside timing/capture when logical
         beta, clamp, or gate scale changes, preserving captured addresses.
         """
+        from .runners import CakeWarpDecodeRunner
+
         if quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
             raise ValueError(
                 "Cake warp decode weight preparation requires "
@@ -716,27 +719,12 @@ class CakeWarpDecodeConfig:
             )
         activation = SwiGLU() if activation is None else activation
         geometry = (hidden_size, intermediate_size, num_local_experts)
-        supported = (
-            (SwiGLU(), (2048, 512, 512)),
-            (SwiGLU(), (2048, 1536, 60)),
-            (SwiGLU(), (2560, 768, 384)),
-            (SiLU(), (6144, 1536, 192)),
-            (SwiGLU(limit=10.0), (4096, 2048, 256)),
-            (SwiGLU(), (2048, 768, 128)),
-            (SwiGLU(), (4096, 1536, 128)),
-            (SwiGLU(), (2048, 512, 256)),
-            (SwiGLU(), (4096, 1024, 512)),
-            (SwiGLU(), (3072, 1536, 256)),
-            (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), (6144, 3072, 128)),
-            (SiTU(gate_scale=4.0, linear_scale=25.0), (3584, 3072, 896)),
-            (SwiGLU(), (4096, 512, 512)),
-            (SwiGLU(), (4096, 256, 512)),
-            (SwiGLU(), (3072, 768, 256)),
-            (SwiGLU(), (3072, 384, 256)),
-        )
         if not any(
-            activation == supported_activation and geometry == supported_geometry
-            for supported_activation, supported_geometry in supported
+            activation == supported_activation
+            and geometry == (hidden, intermediate, experts)
+            for supported_activation, hidden, intermediate, experts, _ in (
+                CakeWarpDecodeRunner._SUPPORTED_CONFIGURATIONS
+            )
         ):
             raise ValueError(
                 "Cake warp decode weight preparation supports only default "
@@ -806,6 +794,315 @@ def _shuffle_deepseek_prims_ts_weights(view: dict) -> dict:
         ]
         shuffled[name] = torch.stack(rows)
     return shuffled
+
+
+CAKE_STEPFUN_FULL_PATH_ENV = "FLASHINFER_CAKE_STEPFUN_FULL_PATH"
+CAKE_STEPFUN_RESERVED_SMS_ENV = "FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS"
+CAKE_STEPFUN_DEFAULT_RESERVED_SMS = 8
+# The exported NVFP4 requantization unit bakes e4m3_max = 448 (no 4over6 recipe).
+CAKE_STEPFUN_GLOBAL_SCALE_INV = 1.0 / (448.0 * 6.0)
+
+
+@dataclass(frozen=True)
+class CakeStepFunConfig:
+    """The StepFun fused MoE on exported Cake kernels (experimental backend
+    :mod:`flashinfer.experimental.cake_stepfun_moe`).
+
+    Every stage of the forward -- Renormalize routing, FC1 with the StepFun
+    activation ``clamp(up, -L, L) * min(silu(gate), L)`` and a per-expert limit
+    ``L``, the NVFP4 per-token requantization, FC2 and finalize -- is an exported
+    Cake kernel. It accepts four weight families, each with :class:`SwiGLUStep`
+    on exact SM100 and SM103 only: NVFP4×NVFP4 (E2m1 output, or bf16 output with
+    ``per_token_scale``), BF16×BF16, per-tensor FP8×FP8 and MXFP8×MXFP8. It is
+    never part of the default backend list; users opt in with
+    ``CakeStepFunConfig(backend="cake_stepfun")``.
+
+    The physical weight and activation layouts are exactly those produced by
+    the matching trtllm-gen config for the family (:class:`TrtllmFp4Config` for
+    NVFP4, :class:`TrtllmBf16Config` for BF16, :class:`TrtllmFp8PerTensorConfig`
+    for per-tensor FP8 and :class:`TrtllmFp8BlockConfig` for MXFP8); the view
+    additionally carries the per-expert ``gemm1_clamp_limit`` the Cake kernels
+    read.
+
+    ``full_path`` and ``reserved_sms`` are the backend knobs; ``None`` reads
+    ``FLASHINFER_CAKE_STEPFUN_FULL_PATH`` (``auto`` / ``1``; the FC1-only hybrid of
+    flashinfer-ai/flashinfer#6046 was removed by the cake-build/1 migration, so
+    ``0`` raises ``NotImplementedError``) and
+    ``FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS`` (default 8, the SMs the
+    cooperative router leaves free) once in ``check_support``. An explicit value
+    wins over the environment. The package itself reads no environment variable.
+    """
+
+    backend: Literal["cake_stepfun"] = "cake_stepfun"
+    full_path: Optional[bool] = None
+    reserved_sms: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.backend != "cake_stepfun":
+            raise ValueError(
+                f"CakeStepFunConfig backend must be 'cake_stepfun', got {self.backend!r}."
+            )
+        if self.full_path is not None and not isinstance(self.full_path, bool):
+            raise TypeError(
+                f"CakeStepFunConfig.full_path must be a bool or None, got {self.full_path!r}."
+            )
+        if self.reserved_sms is not None and (
+            isinstance(self.reserved_sms, bool)
+            or not isinstance(self.reserved_sms, int)
+            or self.reserved_sms < 0
+        ):
+            raise ValueError(
+                "CakeStepFunConfig.reserved_sms must be a non-negative int or None, "
+                f"got {self.reserved_sms!r}."
+            )
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        quant: QuantConfig = _NVFP4_NVFP4,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+        permute_cache=None,
+        step_limits: Optional[Tensor] = None,
+        hidden_states_scale_global=None,
+        intermediate_scale_global=None,
+    ):
+        """Build the TRTLLM weight view of ``quant`` plus the per-expert StepFun limits.
+
+        Register the returned dictionary with ``MoEWeightPack.prepare_for("cake_stepfun", view)``.
+        ``quant`` selects the FC1 family: NVFP4x NVFP4 (:class:`TrtllmFp4Config`), BF16xBF16
+        (:class:`TrtllmBf16Config`), FP8PerTensorxFP8PerTensor (:class:`TrtllmFp8PerTensorConfig`,
+        which needs ``hidden_states_scale_global`` and ``intermediate_scale_global``) or
+        MXFP8xMXFP8 (:class:`TrtllmFp8BlockConfig`). ``activation`` defaults to ``SwiGLUStep()``;
+        ``step_limits`` optionally gives one logical limit per physical expert row (routed experts
+        followed by fused shared experts) and overrides ``activation.limit`` row by row.
+        The view stores ``gemm1_clamp_limit`` in the units the kernels clamp: raw accumulator
+        units (the logical limit divided by the FC1 gate dequant scale) for NVFP4 and per-tensor
+        FP8, physical units for BF16 and MXFP8.
+        """
+        activation = SwiGLUStep() if activation is None else activation
+        if not isinstance(activation, SwiGLUStep):
+            raise ValueError(
+                "Cake StepFun weight preparation requires a SwiGLUStep activation, "
+                f"got {activation!r}."
+            )
+        common = dict(
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+        pair = quant.pair
+        if pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            view = TrtllmFp4Config.prepare_weights(
+                w1_bf16, w2_bf16, quant=quant, permute_cache=permute_cache, **common
+            )
+            gate_scale = view["output1_scale_gate_scalar"]
+        elif pair == (QuantFormat.BF16, QuantFormat.BF16):
+            view = TrtllmBf16Config.prepare_weights(
+                w1_bf16, w2_bf16, permute_cache=permute_cache, **common
+            )
+            gate_scale = None
+        elif pair == (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor):
+            if hidden_states_scale_global is None or intermediate_scale_global is None:
+                raise ValueError(
+                    "Cake StepFun FP8 per-tensor weight preparation requires "
+                    "hidden_states_scale_global and intermediate_scale_global."
+                )
+            view = TrtllmFp8PerTensorConfig.prepare_weights(
+                w1_bf16,
+                w2_bf16,
+                hidden_states_scale_global=hidden_states_scale_global,
+                intermediate_scale_global=intermediate_scale_global,
+                **common,
+            )
+            gate_scale = view["output1_scales_gate_scalar"]
+        elif pair == (QuantFormat.MXFP8, QuantFormat.MXFP8):
+            view = TrtllmFp8BlockConfig.prepare_weights(
+                w1_bf16, w2_bf16, quant=quant, **common
+            )
+            gate_scale = None
+        else:
+            raise ValueError(
+                "Cake StepFun weight preparation supports NVFP4xNVFP4, BF16xBF16, "
+                f"FP8PerTensorxFP8PerTensor and MXFP8xMXFP8, got {quant!r}."
+            )
+        rows = num_local_experts
+        reference = (
+            gate_scale
+            if gate_scale is not None
+            else torch.empty(
+                rows, dtype=torch.float32, device=view["gemm1_weights"].device
+            )
+        )
+        if step_limits is None:
+            limits = torch.full_like(reference, activation.limit)
+        else:
+            limits = torch.as_tensor(
+                step_limits, dtype=torch.float32, device=reference.device
+            )
+            if limits.shape != reference.shape:
+                raise ValueError(
+                    "step_limits must hold one limit per physical expert row "
+                    f"{tuple(reference.shape)}, got {tuple(limits.shape)}."
+                )
+            if not bool(torch.isfinite(limits).all()) or not bool((limits > 0).all()):
+                raise ValueError("step_limits must be finite and positive.")
+        view["gemm1_clamp_limit"] = (
+            (limits / gate_scale).contiguous()
+            if gate_scale is not None
+            else limits.contiguous()
+        )
+        return view
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states_bf16,
+        *,
+        quant: QuantConfig = _NVFP4_NVFP4,
+        hidden_states_scale_global=None,
+    ):
+        """Build the activation view of ``quant`` as ``(hidden_states_q, hidden_states_scale)``.
+
+        BF16 returns the raw activations with ``None`` scales; per-tensor FP8 needs
+        ``hidden_states_scale_global`` (the calibrated E4M3 multiplier) and has no block scales.
+        """
+        pair = quant.pair
+        if pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            return TrtllmFp4Config.prepare_activations(hidden_states_bf16, quant=quant)
+        if pair == (QuantFormat.BF16, QuantFormat.BF16):
+            return hidden_states_bf16.to(torch.bfloat16).contiguous(), None
+        if pair == (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor):
+            if hidden_states_scale_global is None:
+                raise ValueError(
+                    "Cake StepFun FP8 per-tensor activation preparation requires "
+                    "hidden_states_scale_global."
+                )
+            return TrtllmFp8PerTensorConfig.prepare_activations(
+                hidden_states_bf16,
+                hidden_states_scale_global=hidden_states_scale_global,
+            )
+        if pair == (QuantFormat.MXFP8, QuantFormat.MXFP8):
+            return TrtllmFp8BlockConfig.prepare_activations(
+                hidden_states_bf16, quant=quant
+            )
+        raise ValueError(
+            "Cake StepFun activation preparation supports NVFP4xNVFP4, BF16xBF16, "
+            f"FP8PerTensorxFP8PerTensor and MXFP8xMXFP8, got {quant!r}."
+        )
+
+    def __repr__(self) -> str:
+        parts = ["backend='cake_stepfun'"]
+        if self.full_path is not None:
+            parts.append(f"full_path={self.full_path!r}")
+        if self.reserved_sms is not None:
+            parts.append(f"reserved_sms={self.reserved_sms!r}")
+        return f"CakeStepFunConfig({', '.join(parts)})"
+
+
+def _resolve_cake_stepfun_full_path(explicit: Optional[bool]) -> bool:
+    """``full_path`` of the Cake StepFun backend: the explicit value, else
+    ``FLASHINFER_CAKE_STEPFUN_FULL_PATH`` (unset / ``""`` / ``auto`` / ``1`` / ``true`` /
+    ``on`` -> ``True``; ``0`` / ``false`` / ``off`` -> ``False``; anything else raises
+    ``ValueError`` naming the variable)."""
+    if explicit is not None:
+        return bool(explicit)
+    raw = os.environ.get(CAKE_STEPFUN_FULL_PATH_ENV, "")
+    token = raw.strip().lower()
+    if token in ("", "auto", "1", "true", "on"):
+        return True
+    if token in ("0", "false", "off"):
+        return False
+    raise ValueError(
+        f"{CAKE_STEPFUN_FULL_PATH_ENV}={raw!r} is not one of auto, 1, true, on, 0, "
+        "false, off."
+    )
+
+
+def _resolve_cake_stepfun_reserved_sms(explicit: Optional[int]) -> int:
+    if explicit is not None:
+        return int(explicit)
+    raw = os.environ.get(CAKE_STEPFUN_RESERVED_SMS_ENV)
+    if raw is None or raw.strip() == "":
+        return CAKE_STEPFUN_DEFAULT_RESERVED_SMS
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        raise ValueError(
+            f"{CAKE_STEPFUN_RESERVED_SMS_ENV}={raw!r} is not an integer."
+        ) from None
+    if value < 0:
+        raise ValueError(f"{CAKE_STEPFUN_RESERVED_SMS_ENV}={raw!r} must be >= 0.")
+    return value
+
+
+def _cake_stepfun_backend_config(backend: Any) -> "CakeStepFunConfig":
+    """The :class:`CakeStepFunConfig` of a ``MoEConfig.backend`` value.
+
+    Accepts the config itself or a :class:`BackendOptions` whose only candidate is
+    a :class:`CakeStepFunConfig`, the binding :class:`MoELayer` gives every runner
+    (``replace(config, backend=BackendOptions(candidates=(backend_cfg,)))``).
+    Raises ``TypeError`` naming the value otherwise (several candidates, or none of
+    that type): the knobs of a multi-candidate option list are not resolvable here.
+    """
+    if isinstance(backend, CakeStepFunConfig):
+        return backend
+    if isinstance(backend, BackendOptions) and len(backend) == 1:
+        (candidate,) = tuple(backend)
+        if isinstance(candidate, CakeStepFunConfig):
+            return candidate
+    raise TypeError(
+        "_resolve_cake_stepfun_knobs expects a CakeStepFunConfig backend or a "
+        f"BackendOptions whose only candidate is one, got {backend!r}."
+    )
+
+
+def _resolve_cake_stepfun_knobs(config: "MoEConfig") -> Dict[str, Any]:
+    """Resolve the Cake StepFun backend knobs of ``config`` once (``check_support``).
+
+    ``config.backend`` is the :class:`CakeStepFunConfig` or the single-candidate
+    :class:`BackendOptions` holding it (:func:`_cake_stepfun_backend_config`).
+    Returns ``{"full_path": True, "reserved_sms": int, "global_scale_inv": float}``.
+    ``full_path`` resolves through :func:`_resolve_cake_stepfun_full_path`; ``False``
+    raises ``NotImplementedError``: the FC1-only hybrid of flashinfer-ai/flashinfer#6046
+    was removed by the cake-build/1 migration, not migrated (the variable stays and
+    ``0`` raises). ``reserved_sms`` sizes the cooperative routing grid. The NVFP4 4over6
+    recipe of ``config.quant`` (explicit or from ``FLASHINFER_NVFP4_4OVER6*``)
+    must resolve to ``None``: only the ``e4m3_max = 448`` requantization unit is
+    exported, so ``global_scale_inv`` is always ``1 / (448 * 6)``.
+    """
+    backend = _cake_stepfun_backend_config(config.backend)
+    full_path = _resolve_cake_stepfun_full_path(backend.full_path)
+    if not full_path:  # the variable stays; 0 names the removed hybrid and raises
+        raise NotImplementedError(
+            "The Cake StepFun FC1-only hybrid (FLASHINFER_CAKE_STEPFUN_FULL_PATH=0 / "
+            "CakeStepFunConfig(full_path=False)) of flashinfer-ai/flashinfer#6046 was "
+            "removed by the cake-build/1 migration, not migrated; every stage runs on "
+            "the exported Cake kernels (full_path=True)."
+        )
+    reserved_sms = _resolve_cake_stepfun_reserved_sms(backend.reserved_sms)
+    if config.quant.activation is QuantFormat.NVFP4:
+        recipe = resolve_nvfp4_4over6(config.quant.nvfp4_4over6)
+        if recipe is not None:
+            raise NotImplementedError(
+                "The Cake StepFun backend exports only the e4m3_max = 448 NVFP4 "
+                f"requantization unit; the 4over6 recipe {recipe!r} is unavailable."
+            )
+    return {
+        "full_path": True,
+        "reserved_sms": reserved_sms,
+        "global_scale_inv": CAKE_STEPFUN_GLOBAL_SCALE_INV,
+    }
 
 
 @dataclass(frozen=True)
@@ -2395,6 +2692,65 @@ class SM12xNvfp4Bf16Config:
 
 
 @dataclass(frozen=True)
+class SM12xNvfp4Config:
+    """SM120/SM121 CuTe-DSL NVFP4-weight x NVFP4-activation backend.
+
+    The W4A4 peer of :class:`SM12xNvfp4Bf16Config`: it reads the same prepared
+    cuTile NVFP4 weight view in place and quantizes BF16 hidden states to NVFP4
+    inside the op, so one weight copy serves W4A4 and W4A16. Activation global
+    scales are taken from the optional view keys ``"w1_input_global_scale"``
+    and ``"w2_input_global_scale"`` (FP32 scalars, the quantization multiplier
+    ``1 / input_scale``) and default to 1. Requires ``hidden_size % 128 == 0``
+    and ``intermediate_size % 64 == 0``. Supports ``SwiGLU`` with default
+    scalars and ``ReLU2``. Expert parallelism and fused shared experts are not
+    supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (120, 121)
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp4,
+        w1_block_scale,
+        w1_global_scale,
+        w2_fp4,
+        w2_block_scale,
+        w2_global_scale,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        source_format: str = "modelopt",
+        device=None,
+    ):
+        """Build the shared cuTile NVFP4 view from checkpoint NVFP4 weights.
+
+        Register it with ``MoEWeightPack.prepare_for("sm12x_nvfp4", ...)``, or
+        reuse a view already registered for ``"cutile_nvfp4"``.
+        """
+        return CuTileNvfp4Config.prepare_weights(
+            w1_fp4,
+            w1_block_scale,
+            w1_global_scale,
+            w2_fp4,
+            w2_block_scale,
+            w2_global_scale,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            source_format=source_format,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "SM12xNvfp4Config()"
+
+
+@dataclass(frozen=True)
 class B12xNvfp4Config:
     """SM120/SM121 CuTe-DSL b12x NVFP4/W4A4 backend."""
 
@@ -2507,7 +2863,7 @@ class CudnnFrostBf16Config:
 
 @dataclass(frozen=True)
 class CudnnFrostMxfp8Config:
-    """Frost MXFP8 MoE on SM107, with packed precomputed routing.
+    """Frost MXFP8 MoE on SM107 and SM120, with packed precomputed routing.
 
     Register prepared weights under ``cudnn_frost_mxfp8``. The canonical
     ``cutlass_mxfp8`` view is also accepted without conversion. H/I must be
@@ -2516,7 +2872,7 @@ class CudnnFrostMxfp8Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch == 107
+        return arch in (107, 120)
 
     prepare_weights = staticmethod(CutlassMxfp8Config.prepare_weights)
     prepare_activations = staticmethod(CutlassMxfp8Config.prepare_activations)
@@ -2524,7 +2880,7 @@ class CudnnFrostMxfp8Config:
 
 @dataclass(frozen=True)
 class CudnnFrostNvfp4Config:
-    """Frost NVFP4 MoE on SM107, with packed precomputed routing.
+    """Frost NVFP4 MoE on SM107 and SM120, with packed precomputed routing.
 
     Register prepared weights under ``cudnn_frost_nvfp4``. The canonical
     ``cutlass_nvfp4`` view is also accepted without conversion. H/I must be
@@ -2533,7 +2889,7 @@ class CudnnFrostNvfp4Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch == 107
+        return arch in (107, 120)
 
     prepare_weights = staticmethod(CutlassNvfp4Config.prepare_weights)
     prepare_activations = staticmethod(CutlassNvfp4Config.prepare_activations)
@@ -2541,7 +2897,7 @@ class CudnnFrostNvfp4Config:
 
 @dataclass(frozen=True)
 class CudnnFrostMxfp8Mxfp4Config:
-    """Frost MXFP8-activation / MXFP4-weight MoE on SM107.
+    """Frost MXFP8-activation / MXFP4-weight MoE on SM107 and SM120.
 
     Requires packed precomputed routing and H/I divisible by 128. Register
     prepared weights under ``cudnn_frost_mxfp8_mxfp4``; the canonical
@@ -2551,7 +2907,7 @@ class CudnnFrostMxfp8Mxfp4Config:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch == 107
+        return arch in (107, 120)
 
     prepare_weights = staticmethod(CutlassMxfp8Mxfp4Config.prepare_weights)
     prepare_activations = staticmethod(CutlassMxfp8Mxfp4Config.prepare_activations)
@@ -2597,6 +2953,7 @@ BackendConfigType = Union[
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
+    SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
 ]
@@ -2640,6 +2997,7 @@ ALL_BACKEND_CONFIGS = (
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
+    SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
 )

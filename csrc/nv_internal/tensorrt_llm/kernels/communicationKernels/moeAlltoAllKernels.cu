@@ -1559,6 +1559,10 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
 // Combine Launch Function
 // ============================================================================
 
+// The trtllm backend always writes the BF16/FP16 intermediate and quantizes it in a second
+// launch; only the generated cake backend fuses the two.
+bool moe_a2a_combine_fuses_quantization(MoeA2ACombineParams const&) { return false; }
+
 void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
   // Validate parameters
   TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);

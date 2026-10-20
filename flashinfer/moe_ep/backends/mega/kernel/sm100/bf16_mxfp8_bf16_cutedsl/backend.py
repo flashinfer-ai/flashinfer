@@ -202,7 +202,7 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             num_tokens = staged
 
         if self._autotune_pending:
-            autotune_bf16_mxfp8_mega_moe(
+            self._autotune_winner = autotune_bf16_mxfp8_mega_moe(
                 output,
                 transformed_weights[0],
                 transformed_weights[1],

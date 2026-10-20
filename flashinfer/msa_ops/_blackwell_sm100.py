@@ -18,11 +18,13 @@ Compute-capability 10.0/10.3 backend for MiniMax Sparse Attention.
 The Cake-generated programs behind this module are registered in
 ``flashinfer.jit.blackwell_msa``: ``ROUTES`` maps a logical route
 (``<route key>:<stage>``) to the program that serves it on each target and
-``MODULES`` carries the program's physical argument order.  This module owns
+``MODULES`` names the program's ``ARG_PLANS`` argument plan.  This module owns
 the public semantics only -- argument validation, route selection from the
 inputs, the host-side plan of the long-prefill route and the CUDA-graph
-workspace contract.  There are no environment switches and no shape-exact
-routes: every TopK16 call on a supported device is served by the route its
+workspace contract.  There are no environment switches.  The only shape-exact
+routes are the two FP8-KV single-query decode specializations that
+``force_fused=True`` selects at their exact coordinates (``_fp8_q1_schedule``);
+every other TopK16 call on a supported device is served by the route its
 inputs select.  Compute capability 10.7 is admitted for the packed-NVFP4
 paged-KV routes only.
 
@@ -59,6 +61,7 @@ import torch
 import tvm_ffi
 
 from ..jit.blackwell_msa import (
+    ARG_PLANS,
     MODULES,
     BlackwellMSATarget,
     load_blackwell_msa_module,
@@ -76,10 +79,65 @@ _SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3), (10, 7)}
 _M128_Q_TILE = 256
 _GQA8_Q_TILE = 32
 _GQA16_Q_TILE = 16
+# Lever P-PERS (persistent heavy-first tile loop): the folded-GQA union prefill
+# retraces run a persistent tile loop.  The kernel rebuilds the tile / KV-head
+# extents from its scalar arguments and reads its CTA count from grid_dim.x, so
+# the host launches min(tiles x KV heads, SMs) CTAs on a one-dimensional grid
+# (mirror of ``minimax_sparse_attention_prefill_sm100.union_persistent_grid``;
+# ``_UNION_PERSISTENT_FOLDED`` mirrors the Cake default of
+# ``UNION_PERSISTENT_FOLDED``).  The base grid ``(tiles, heads, 1)`` would run
+# every item ``heads`` times.
+_UNION_PERSISTENT_FOLDED = True
+
+
+def _union_persistent_grid(
+    tiles: int, heads: int, num_sms: int
+) -> tuple[int, int, int]:
+    return (max(1, min(int(tiles) * int(heads), int(num_sms))), 1, 1)
+
+
+def _prefill_launch_grid(
+    *,
+    total_q: int,
+    batch_size: int,
+    folded_gqa_group: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    num_sms: int,
+) -> tuple[int, int, int]:
+    """Launch grid of the prefill programs (mirror of the Cake dispatcher).
+
+    Official grid: x = the compact query-tile upper bound, y = the KV heads of a
+    folded-GQA program or the query heads of a general one.  The folded-GQA
+    union retraces take the persistent grid when ``_UNION_PERSISTENT_FOLDED``.
+    """
+    q_tile = (
+        _GQA8_Q_TILE
+        if folded_gqa_group == 8
+        else _GQA16_Q_TILE
+        if folded_gqa_group == 16
+        else _M128_Q_TILE
+    )
+    tiles = (int(total_q) + q_tile - 1) // q_tile + int(batch_size) - 1
+    heads = int(num_kv_heads) if folded_gqa_group else int(num_q_heads)
+    if folded_gqa_group and _UNION_PERSISTENT_FOLDED:
+        return _union_persistent_grid(tiles, heads, num_sms)
+    return (tiles, heads, 1)
+
+
 _UNIFORM_FP8_EVEN_WAVE_GRID = 128
 
 _LONG_WORK_GROUP_BUCKETS = (128, 64, 32, 16, 8, 4, 2, 1)
 _LONG_GROUP_BOUNDARIES = _LONG_WORK_GROUP_BUCKETS[:-1]
+# Tail-wave split of the long-prefill work list (mirrors the generator's work-plan model).
+_LONG_WORK_TAIL_SPLIT_FIXED_GROUPS = 2
+_LONG_WORK_TAIL_SPLIT_MIN_GROUPS = 32
+_LONG_WORK_TAIL_SPLIT_MAX_ROUNDS = 4
+# Q-resident launch order of the long-prefill work list (mirrors the generator's work-plan model).  Requires the
+# long_prefill_* kernels of this export, which derive the CTA's group count from the item's q_count (the
+# q_group_segment_end_* scalars are bucket counts, not launch-index boundaries).
+_LONG_WORK_ORDER_Q_WINDOW = 1024
+_LONG_WORK_ORDER_FILL_GROUPS = 128
 _LONG_QSPLIT_Q_MASK = 0x00FF_FFFF
 _LONG_QSPLIT_SLOT_SHIFT = 24
 _LONG_QSPLIT_SINGLE_SHIFT = 28
@@ -136,6 +194,10 @@ class MSASparseAttentionWorkspace:
         # | seqused_k) binding with weak references to the two tensor objects;
         # filled by the eager warm call, read during capture (``_request_lengths``).
         self._request_lengths: dict[tuple, tuple] = {}
+        # Union census verdict of one long-admitted paged GQA-16 binding
+        # (lever P10; ``_union_census_route``): signature, counters, verdict
+        # and strong references to the two tensors it was read from.
+        self._union_census: dict = {}
         self._warmed_launches: set[tuple] = set()
         self._bound_stream_ptr: Optional[int] = None
         self._captured = False
@@ -149,9 +211,11 @@ _topk_warmed_devices_lock = threading.Lock()
 # from its source and asserts the plan and every _TOPK_* constant agree with the module over a shape
 # grid; tools/msa_rebench/dev/topk_v2_check.py repeats the check on the GPU steps.
 _TOPK_QT = 16
-_TOPK_SLICES = (1, 2, 4, 8)
+_TOPK_SLICES = (1, 2, 4, 8, 16)
 _TOPK_WAVE_CTAS = 444
 _TOPK_CTA_FIXED_BLOCKS = 1536
+_TOPK_CTA_STAGE_ONLY_BLOCKS = 512
+_TOPK_CTA_SLICE_BLOCKS = 112
 _TOPK_MIN_SLICE = 32
 _TOPK_MAX_INDEX_BITS = 22
 _TOPK_CAND_CAP = 64
@@ -161,23 +225,37 @@ _TOPK_STREAM_MAX_ROWS = 512
 _TOPK_STREAM_MAX_NVP = 1024
 _TOPK_ROUTE_RADIX = "topk_select"
 _TOPK_ROUTE_STREAMING = "topk_select_streaming"
+# 32-query instance (MSA ceiling Goal lever T4): two queries per lane, u16-packed histogram, 2 CTAs/SM.
+_TOPK_Q32_WAVE_CTAS = 296
+_TOPK_Q32_MIN_Q = 32
+_TOPK_Q32_MIN_SLICE = 1024
+_TOPK_Q32_MAX_SLICE = 65535
+_TOPK_ROUTE_Q32 = "topk_select_q32"
+_TOPK_KEQ_MAX_SLEN = 512
+_TOPK_ROUTE_KEQ = "topk_select_keq"
 _topk_workspaces: dict[int, dict[str, torch.Tensor]] = {}
 _topk_workspaces_lock = threading.Lock()
 
 
 def _topk_grid_plan(
-    total_q: int, num_heads: int, num_valid_pages: int, max_k_tiles: int
+    total_q: int, num_heads: int, num_valid_pages: int, max_k_tiles: int, qpack: int = 1
 ) -> dict:
-    """Shape-only plan: over ``s in (1,2,4,8)`` with ``ceil(nvp / s) >= 32`` (else ``s = 1``), ``S`` minimises
-    ``ceil(groups * s / 444) * (1536 + ceil(nvp / s))`` (ties: the larger ``s``); ``bid = (h * S + s) * num_qtiles + qtile``."""
+    """Shape-only plan: over ``s in (1,2,4,8,16)`` with ``ceil(nvp / s) >= 32`` (else ``s = 1``), ``S`` minimises
+    ``ceil(groups * s / W) * (fixed(s) + ceil(nvp / s) + 112 * s)`` with ``fixed(s) = 1536`` for a slice above the
+    candidate cap (multi-pass CTA) and ``512`` for a slice within it (stage-only CTA); ``W`` = 444 for the 16-query
+    program, 296 for the 32-query instance ``qpack = 2``; ties: the larger ``s``.
+    ``bid = (h * S + s) * num_qtiles + qtile``."""
     total_q = int(total_q)
     num_heads = int(num_heads)
     num_valid_pages = int(num_valid_pages)
     max_k_tiles = int(max_k_tiles)
+    qpack = int(qpack)
     if min(total_q, num_heads, num_valid_pages, max_k_tiles) <= 0:
         raise ValueError(
             "topk grid plan requires positive total_q, num_heads, num_valid_pages, max_k_tiles"
         )
+    if qpack not in (1, 2):
+        raise ValueError("qpack must be 1 (16-query program) or 2 (32-query program)")
     if num_heads * max_k_tiles >= 2**31:
         raise ValueError("num_heads * max_k_tiles must fit in int32")
     if total_q * num_heads * _TOPK >= 2**31:
@@ -187,7 +265,9 @@ def _topk_grid_plan(
         raise ValueError(
             f"max_k_tiles must be <= 2**{_TOPK_MAX_INDEX_BITS}, got {max_k_tiles}"
         )
-    num_qtiles = (total_q + _TOPK_QT - 1) // _TOPK_QT
+    qt = _TOPK_QT * qpack
+    wave_ctas = _TOPK_WAVE_CTAS if qpack == 1 else _TOPK_Q32_WAVE_CTAS
+    num_qtiles = (total_q + qt - 1) // qt
     groups = num_heads * num_qtiles
     fitting = [
         c for c in _TOPK_SLICES if -(-num_valid_pages // c) >= _TOPK_MIN_SLICE
@@ -195,8 +275,14 @@ def _topk_grid_plan(
     num_slices = fitting[0]
     best_cost = None
     for candidate in fitting:
-        waves = -(-(groups * candidate) // _TOPK_WAVE_CTAS)
-        cost = waves * (_TOPK_CTA_FIXED_BLOCKS + -(-num_valid_pages // candidate))
+        waves = -(-(groups * candidate) // wave_ctas)
+        cand_slice = -(-num_valid_pages // candidate)
+        fixed = (
+            _TOPK_CTA_FIXED_BLOCKS
+            if cand_slice > _TOPK_CAND_CAP
+            else _TOPK_CTA_STAGE_ONLY_BLOCKS
+        )
+        cost = waves * (fixed + cand_slice + _TOPK_CTA_SLICE_BLOCKS * candidate)
         if best_cost is None or cost <= best_cost:
             best_cost = cost
             num_slices = candidate
@@ -212,17 +298,32 @@ def _topk_grid_plan(
         "grid": grid,
         "index_bits": index_bits,
         "bmax_words": grid * chunks * _TOPK_BMAX_WORDS_PER_CHUNK,
+        "qpack": qpack,
     }
+
+
+def _topk_radix_route(slice_len: int) -> str:
+    """The radix select's production instance for a planned slice (duplicated verbatim from
+    loom/examples/weave/minimax_sparse_topk_select_v2_sm100.py::topk_radix_route): ``topk_select_keq`` (the
+    lever T9 pass-0 all-equal fold) for a streamed slice above the candidate cap ``_TOPK_CAND_CAP`` and up to
+    ``_TOPK_KEQ_MAX_SLEN`` blocks, ``topk_select`` for a stage-only slice (the fold cannot fire) and beyond the
+    bound -- a cost choice, both instances are bit-identical on every input."""
+    if _TOPK_CAND_CAP < int(slice_len) <= _TOPK_KEQ_MAX_SLEN:
+        return _TOPK_ROUTE_KEQ
+    return _TOPK_ROUTE_RADIX
 
 
 def _topk_route(
     total_q: int, num_heads: int, num_valid_pages: int, max_k_tiles: int
 ) -> str:
     """Shape-only program choice (duplicated verbatim from
-    loom/examples/weave/minimax_sparse_topk_select_v2_sm100.py::topk_route): ``topk_select`` (the query-tiled
-    radix select) or ``topk_select_streaming`` (the one-CTA-per-row program) for small latency-bound
-    multi-pass grids: at most ``_TOPK_STREAM_MAX_ROWS`` rows, at most ``_TOPK_STREAM_MAX_NVP`` valid pages
-    and a planned slice above the candidate cap."""
+    loom/examples/weave/minimax_sparse_topk_select_v2_sm100.py::topk_route): ``topk_select_streaming`` (the
+    one-CTA-per-row program) for small latency-bound multi-pass grids -- at most ``_TOPK_STREAM_MAX_ROWS`` rows,
+    at most ``_TOPK_STREAM_MAX_NVP`` valid pages and a planned slice above the candidate cap; ``topk_select_q32``
+    (the 32-query instance) for an even ``total_q >= _TOPK_Q32_MIN_Q`` whose 32-query plan has a slice in
+    ``[_TOPK_Q32_MIN_SLICE, _TOPK_Q32_MAX_SLICE]``; otherwise one of the query-tiled radix select's two 16-query
+    production instances by the planned slice (``_topk_radix_route``): ``topk_select_keq`` for a streamed
+    slice in (``_TOPK_CAND_CAP``, ``_TOPK_KEQ_MAX_SLEN``], ``topk_select`` otherwise."""
     plan = _topk_grid_plan(total_q, num_heads, num_valid_pages, max_k_tiles)
     if (
         int(total_q) * int(num_heads) <= _TOPK_STREAM_MAX_ROWS
@@ -230,21 +331,30 @@ def _topk_route(
         and plan["slice_len"] > _TOPK_CAND_CAP
     ):
         return _TOPK_ROUTE_STREAMING
-    return _TOPK_ROUTE_RADIX
+    if int(total_q) % 2 == 0 and int(total_q) >= _TOPK_Q32_MIN_Q:
+        plan32 = _topk_grid_plan(total_q, num_heads, num_valid_pages, max_k_tiles, 2)
+        if _TOPK_Q32_MIN_SLICE <= plan32["slice_len"] <= _TOPK_Q32_MAX_SLICE:
+            return _TOPK_ROUTE_Q32
+    return _topk_radix_route(plan["slice_len"])
 
 
 def _topk_workspace(
-    device: torch.device, groups: int, num_slices: int, bmax_words: int, capturing: bool
+    device: torch.device,
+    groups: int,
+    num_slices: int,
+    bmax_words: int,
+    capturing: bool,
+    qt: int = _TOPK_QT,
 ):
     """Per-device ``(partials u64, counters u32, block_max u32)`` grown eagerly to the largest plan seen.
 
     ``counters`` is zeroed once on (re)allocation and self-resets through the kernel's ``atom.inc``
     semaphore, so eager launches and graph replays share one buffer; ``block_max`` (the per-block tile
     maxima of the histogram pass) is fully rewritten by every launch before it is read.  Growth under
-    capture is refused.
+    capture is refused.  ``qt`` is the program's queries per CTA (16; 32 for the lever-T4 instance).
     """
     index = _device_index(device)
-    need_partials = groups * num_slices * _TOPK * _TOPK_QT if num_slices > 1 else 1
+    need_partials = groups * num_slices * _TOPK * qt if num_slices > 1 else 1
     need_counters = groups if num_slices > 1 else 1
     need_bmax = max(int(bmax_words), 1)
     with _topk_workspaces_lock:
@@ -390,7 +500,9 @@ def _program(route: str, target: BlackwellMSATarget) -> _Program:
     name = route_program(route, target)
     record = MODULES[name]
     module = load_blackwell_msa_module(name, target)
-    plan = tuple((str(kind), str(argument)) for kind, argument in record["arg_plan"])
+    plan = tuple(
+        (str(kind), str(argument)) for kind, argument in ARG_PLANS[record["arg_plan"]]
+    )
     return _Program(name, getattr(module, record["ffi_entry"]), plan)
 
 
@@ -634,12 +746,25 @@ def _explicit_q_offsets(
     )
 
 
-def _cumulative_kv_lengths(
+def _paged_prefill_cu_seqlens_k(
     kv_lens: torch.Tensor,
     *,
     workspace: Optional[MSASparseAttentionWorkspace],
     name: str,
 ) -> torch.Tensor:
+    """The ``(batch + 1,)`` int32 ``cu_seqlens_k`` carrier of paged prefill: all zero.
+
+    The paged prefill programs take their request KV lengths from
+    ``kv_lens`` (``seqused_k``) and their K/V rows from ``page_table``; the
+    offsets are read only for a token base the paged loaders overwrite with
+    0, so no scan is issued (lever P-H1d, mirrors the Cake dispatcher).  The
+    buffer is zeroed when it is created -- once per warmed workspace, every
+    call without one -- and only re-bound afterwards: the attention kernel is
+    the first GPU activity of the call.  The flat-ABI form ``max_pages == 0``
+    (kv_len from adjacent offsets) is handled by the caller.
+    """
+
+    previous = None if workspace is None else workspace._buffers.get(name)
     cu_k = _workspace_buffer(
         workspace,
         name,
@@ -647,8 +772,8 @@ def _cumulative_kv_lengths(
         dtype=torch.int32,
         device=kv_lens.device,
     )
-    cu_k[0].zero_()
-    torch.cumsum(kv_lens, dim=0, dtype=torch.int32, out=cu_k[1:])
+    if cu_k is not previous:
+        cu_k.zero_()
     return cu_k
 
 
@@ -765,8 +890,13 @@ def _prepare_layout(
     batch_size: int,
     prefill: bool,
     workspace: Optional[MSASparseAttentionWorkspace],
-) -> tuple[bool, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """``(paged, cu_k, kv_lens, page_table, max_pages)`` of one call."""
+) -> tuple[bool, Optional[torch.Tensor], torch.Tensor, torch.Tensor, int]:
+    """``(paged, cu_k, kv_lens, page_table, max_pages)`` of one call.
+
+    ``cu_k`` is ``None`` for paged prefill without caller offsets: the prefill
+    runners bind the all-zero carrier of :func:`_paged_prefill_cu_seqlens_k`
+    (levers P-H1 / P-H1d; the paged programs never read the offsets).
+    """
 
     paged = page_table is not None
     if paged:
@@ -791,13 +921,10 @@ def _prepare_layout(
             seqused_k, device=q.device, name="seqused_k", length=batch_size
         )
         if cu_seqlens_k is None:
-            cu_k = (
-                _cumulative_kv_lengths(
-                    kv_lens, workspace=workspace, name="prefill_cu_seqlens_k"
-                )
-                if prefill
-                else kv_lens
-            )
+            # Paged decode reads seqused_k and binds it as the ABI-only
+            # cu_seqlens_k carrier; paged prefill binds an all-zero one at
+            # its launch (P-H1d).
+            cu_k = None if prefill else kv_lens
         else:
             cu_k = _require_cuda_i32(
                 cu_seqlens_k,
@@ -851,11 +978,9 @@ def _decode_route(*, q_dtype: torch.dtype, k_dtype: torch.dtype, paged: bool) ->
     return f"decode_m16:{_DTYPE_NAMES[q_dtype]}:{_DTYPE_NAMES[k_dtype]}:{layout}"
 
 
-def _long_prefill_route(*, paged: bool, group_size: int, direct_group: bool) -> str:
+def _long_prefill_route(*, paged: bool, group_size: int) -> str:
     layout = "paged" if paged else "flat"
-    return f"long_bf16_reverse:{layout}:gqa{group_size}" + (
-        ":direct_group" if direct_group else ""
-    )
+    return f"long_bf16_reverse:{layout}:gqa{group_size}"
 
 
 def _fp8_q1_schedule(
@@ -896,6 +1021,41 @@ def _fp8_q1_schedule(
     if not paged and batch_size == 32 and k_outer_dim == 262144 and max_pages == 0:
         return "q1_flat_xform2"
     return ""
+
+
+# Lever D4b(dynpair) ships with the route off by default: the two-token
+# ticket program costs 6-11 % on per-token random block selections.  Turning the mirror
+# on needs a Cake re-export that registers ``decode_uniform_fp8:paged_dynpair`` again
+# (``exports/blackwell_msa/export.PRODUCTION_ROUTE_KEYS``); this package carries only
+# the single-token program.
+_UNIFORM_FP8_DYNPAIR_ROUTE = (
+    False  # mirror of minimax_sparse_attention_sm100.UNIFORM_FP8_DYNPAIR_ROUTE
+)
+_UNIFORM_FP8_SINGLE_ROUTE = "decode_uniform_fp8:paged"
+_UNIFORM_FP8_DYNPAIR_ROUTE_KEY = "decode_uniform_fp8:paged_dynpair"
+
+
+def _uniform_fp8_dynpair(seqlen_q: int) -> bool:
+    """Even ``seqlen_q`` in [2, 32] takes the two-token ticket program when the route is on.
+
+    Mirror of ``minimax_sparse_attention_sm100.uniform_fp8_dynpair_route`` (lever
+    D4b(dynpair), shipped off): query pairs ``(2 i, 2 i + 1)`` never straddle a
+    request; the kernel pairs the two tokens of a ticket when their selected-block lists
+    are equal and runs them one after the other otherwise; the output is bitwise the
+    single-token program's.  Same kernel ABI, grid rule and launch arguments as the
+    single-token route.
+    """
+    seqlen_q = int(seqlen_q)
+    return _UNIFORM_FP8_DYNPAIR_ROUTE and 2 <= seqlen_q <= 32 and seqlen_q % 2 == 0
+
+
+def _uniform_fp8_route(seqlen_q: int) -> str:
+    """Route key of the uniform FP8 Q/K/V paged decode program for ``seqlen_q``."""
+    return (
+        _UNIFORM_FP8_DYNPAIR_ROUTE_KEY
+        if _uniform_fp8_dynpair(seqlen_q)
+        else _UNIFORM_FP8_SINGLE_ROUTE
+    )
 
 
 def _uniform_fp8_decode_grid(
@@ -998,6 +1158,154 @@ def _use_long_prefill(
     )
 
 
+# Lever P10 (mirror of minimax_sparse_attention_long_prefill_sm100.prefill_union_census /
+# union_census_prefers_union / union_census_route; the Cake test
+# loom/tests/test_minimax_sparse_prefill_union_census_route.py pins the parity): a paged GQA-16
+# request the long route admits takes the folded union program when its tokens select (nearly)
+# the same KV blocks -- the exact per-tile union census from ``q2k_indices`` (torch ops, one
+# three-counter device-to-host read at the long route's own plan sync point, cached per binding)
+# reads a waste ratio union_visits / ideal_visits <= 5/4 and no tile union above 64 blocks.
+_UNION_CENSUS_TILE_TOKENS = 16
+_UNION_CENSUS_MAX_PAGES = 1024
+_UNION_CENSUS_MAX_TILE_UNION = 64
+_UNION_CENSUS_WASTE_NUM = 5
+_UNION_CENSUS_WASTE_DEN = 4
+_implicit_union_census: dict[tuple, dict] = {}
+_implicit_union_census_lock = threading.Lock()
+
+
+class _UnionCensus(NamedTuple):
+    """Per-request block-visit counts of the folded GQA-16 union program."""
+
+    union_visits: int
+    ideal_visits: int
+    max_tile_union: int
+    tiles: int
+
+
+def _prefill_union_census(
+    q2k_indices: torch.Tensor,
+    *,
+    q_len: int,
+    kv_len,
+    tile_tokens: int = _UNION_CENSUS_TILE_TOKENS,
+) -> _UnionCensus:
+    """Exact per-tile union census of one request (``q2k_indices[:, :q_len]``)."""
+
+    heads, total_q, topk = (int(value) for value in q2k_indices.shape)
+    q_len = int(q_len)
+    if q_len <= 0 or q_len > total_q:
+        raise ValueError("union census needs 0 < q_len <= total_q")
+    tile_tokens = int(tile_tokens)
+    tiles = (q_len + tile_tokens - 1) // tile_tokens
+    device = q2k_indices.device
+    selection = q2k_indices[:, :q_len]
+    pad = tiles * tile_tokens - q_len
+    if pad:
+        selection = torch.cat(
+            (
+                selection,
+                torch.full(
+                    (heads, pad, topk), -1, dtype=q2k_indices.dtype, device=device
+                ),
+            ),
+            dim=1,
+        )
+    selection = selection.reshape(heads, tiles, tile_tokens * topk)
+    tile_index = torch.arange(tiles, dtype=torch.int64, device=device)
+    q_valid = torch.clamp(q_len - tile_index * tile_tokens, max=tile_tokens)
+    if isinstance(kv_len, int):
+        kv_length = torch.tensor([kv_len], dtype=torch.int64, device=device)
+    else:
+        kv_length = kv_len.reshape(-1)[:1].to(device=device, dtype=torch.int64)
+    pages = (kv_length + _BLOCK_SIZE - 1) // _BLOCK_SIZE
+    visible_tokens = kv_length - q_len + tile_index * tile_tokens + q_valid
+    visible = torch.minimum(
+        (visible_tokens + _BLOCK_SIZE - 1) // _BLOCK_SIZE, pages
+    ).clamp_(min=1)
+    valid = (selection >= 0) & (
+        selection < visible.view(1, tiles, 1).to(selection.dtype)
+    )
+    masked = torch.where(valid, selection, torch.full_like(selection, -1))
+    ordered = masked.sort(dim=-1).values
+    distinct = ((ordered[..., 1:] != ordered[..., :-1]) & (ordered[..., 1:] >= 0)).sum(
+        dim=-1, dtype=torch.int64
+    ) + (ordered[..., 0] >= 0).to(torch.int64)
+    row_counts = valid.view(heads, tiles, tile_tokens, topk).sum(
+        dim=-1, dtype=torch.int64
+    )
+    counters = torch.stack(
+        (distinct.sum(), row_counts.amax(dim=-1).sum(), distinct.amax())
+    ).cpu()
+    union_visits, ideal_visits, max_tile_union = (
+        int(value) for value in counters.tolist()
+    )
+    return _UnionCensus(union_visits, ideal_visits, max_tile_union, heads * tiles)
+
+
+def _union_census_prefers_union(census: _UnionCensus) -> bool:
+    return bool(
+        census.ideal_visits > 0
+        and census.max_tile_union <= _UNION_CENSUS_MAX_TILE_UNION
+        and census.union_visits * _UNION_CENSUS_WASTE_DEN
+        <= census.ideal_visits * _UNION_CENSUS_WASTE_NUM
+    )
+
+
+def _union_census_route(
+    workspace: Optional[MSASparseAttentionWorkspace],
+    *,
+    q2k_indices: torch.Tensor,
+    q_len: int,
+    kv_lens: torch.Tensor,
+    max_pages: int,
+    capturing: bool,
+) -> bool:
+    """Whether a long-admitted paged GQA-16 request takes the union program (one request only).
+
+    Cached per binding (``q2k_indices`` pointer / version / shape, query length, ``seqused_k``
+    binding, page-table width) in the workspace, or in a module slot keeping the latest binding;
+    capture replays a warmed verdict and never synchronizes (an unwarmed capture keeps the long
+    route, whose own capture rule applies).
+    """
+
+    if int(max_pages) > _UNION_CENSUS_MAX_PAGES:
+        return False
+    signature = (
+        _device_index(q2k_indices.device),
+        int(q2k_indices.data_ptr()),
+        int(q2k_indices._version),
+        tuple(int(value) for value in q2k_indices.shape),
+        int(q_len),
+        _host_lengths_signature(kv_lens),
+        int(max_pages),
+    )
+    if workspace is not None:
+        entry = workspace._union_census
+    else:
+        with _implicit_union_census_lock:
+            entry = _implicit_union_census.get(signature)
+    if entry and entry.get("signature") == signature:
+        return bool(entry["prefers_union"])
+    if capturing or torch.cuda.is_current_stream_capturing():
+        return False
+    census = _prefill_union_census(q2k_indices, q_len=q_len, kv_len=kv_lens)
+    entry = {
+        "signature": signature,
+        "census": census,
+        "prefers_union": _union_census_prefers_union(census),
+        "q2k_owner": q2k_indices,
+        "kv_lens_owner": kv_lens,
+    }
+    if workspace is not None:
+        workspace._union_census = entry
+    else:
+        with _implicit_union_census_lock:
+            _implicit_union_census.clear()
+            _implicit_union_census[signature] = entry
+    return bool(entry["prefers_union"])
+
+
 class _RequestLengths(NamedTuple):
     """Host view of one prefill call's request boundaries."""
 
@@ -1042,7 +1350,7 @@ def _request_lengths(
     workspace: Optional[MSASparseAttentionWorkspace],
     *,
     cu_q: torch.Tensor,
-    cu_k: torch.Tensor,
+    cu_k: Optional[torch.Tensor],
     kv_lens: torch.Tensor,
     paged: bool,
     total_q: int,
@@ -1130,6 +1438,182 @@ def _long_state_tensor(
     return tensor
 
 
+def _long_prefill_decompose_work(counts_host, *, buckets, q_tokens_per_group):
+    """Binary decomposition of every (kv head, kv block) row into (group_count, (head, kv_block, q_begin,
+    q_count, 0, kv_block)) items, largest bucket first, each item as full as the bucket allows."""
+    work = []
+    for head, head_counts in enumerate(counts_host):
+        for kv_block, row_count in enumerate(head_counts):
+            q_begin = 0
+            remaining = int(row_count)
+            for group_count in buckets:
+                group_capacity = group_count * q_tokens_per_group
+                while (
+                    remaining + q_tokens_per_group - 1
+                ) // q_tokens_per_group >= group_count:
+                    q_count = min(group_capacity, remaining)
+                    derived_group_count = (
+                        q_count + q_tokens_per_group - 1
+                    ) // q_tokens_per_group
+                    if derived_group_count != group_count:
+                        raise AssertionError(
+                            "long-prefill q-count group derivation drifted"
+                        )
+                    work.append(
+                        (group_count, (head, kv_block, q_begin, q_count, 0, kv_block))
+                    )
+                    q_begin += q_count
+                    remaining -= q_count
+            if remaining != 0 or q_begin != row_count:
+                raise AssertionError("long-prefill binary work decomposition failed")
+    return work
+
+
+def _long_prefill_simulate_makespan(work, *, sm_count, fixed_groups):
+    """Longest-processing-time simulation of the launch order (group count descending, stable) on sm_count
+    machines: the finish time of every item in that order and the makespan (cost = groups + fixed)."""
+    import heapq
+
+    machines = [0] * max(1, int(sm_count))
+    heapq.heapify(machines)
+    finishes = []
+    for group_count, _entry in sorted(work, key=lambda item: item[0], reverse=True):
+        start = heapq.heappop(machines)
+        finish = start + int(group_count) + int(fixed_groups)
+        heapq.heappush(machines, finish)
+        finishes.append(finish)
+    return finishes, (max(finishes) if finishes else 0)
+
+
+def _long_prefill_tail_split_work(
+    work,
+    *,
+    sm_count,
+    q_tokens_per_group,
+    fixed_groups=_LONG_WORK_TAIL_SPLIT_FIXED_GROUPS,
+    min_groups=_LONG_WORK_TAIL_SPLIT_MIN_GROUPS,
+    max_rounds=_LONG_WORK_TAIL_SPLIT_MAX_ROUNDS,
+):
+    """Halve the items that finish inside the simulated tail wave while the simulated makespan drops (mirror
+    of the Weave module's tail_split_long_prefill_work; bitwise-neutral host reordering)."""
+    current = list(work)
+    for _round in range(max(0, int(max_rounds))):
+        ordered = sorted(current, key=lambda item: item[0], reverse=True)
+        finishes, makespan = _long_prefill_simulate_makespan(
+            ordered, sm_count=sm_count, fixed_groups=fixed_groups
+        )
+        total = sum(group_count + int(fixed_groups) for group_count, _entry in ordered)
+        ideal = -(-total // max(1, int(sm_count)))
+        if makespan <= ideal:
+            break
+        candidate = []
+        split_any = False
+        for (group_count, entry), finish in zip(ordered, finishes, strict=False):
+            if (
+                finish > ideal
+                and group_count >= int(min_groups)
+                and group_count % 2 == 0
+            ):
+                head, kv_block, q_begin, q_count, zero, kv_block_again = entry
+                half_groups = group_count // 2
+                q_first = half_groups * q_tokens_per_group
+                q_second = q_count - q_first
+                if (
+                    q_second <= 0
+                    or (q_second + q_tokens_per_group - 1) // q_tokens_per_group
+                    != half_groups
+                ):
+                    raise AssertionError(
+                        "long-prefill tail split drifted from the kernel's group derivation"
+                    )
+                candidate.append(
+                    (
+                        half_groups,
+                        (head, kv_block, q_begin, q_first, zero, kv_block_again),
+                    )
+                )
+                candidate.append(
+                    (
+                        half_groups,
+                        (
+                            head,
+                            kv_block,
+                            q_begin + q_first,
+                            q_second,
+                            zero,
+                            kv_block_again,
+                        ),
+                    )
+                )
+                split_any = True
+            else:
+                candidate.append((group_count, entry))
+        if not split_any:
+            break
+        _finishes, new_makespan = _long_prefill_simulate_makespan(
+            candidate, sm_count=sm_count, fixed_groups=fixed_groups
+        )
+        if new_makespan >= makespan:
+            break
+        current = candidate
+    return current
+
+
+def _long_prefill_first_query_tokens(work, *, row_starts_host, q_indices_by_head):
+    """The first (lowest) query token of every item, q_indices_by_head[head][row_start + q_begin] (mirror of
+    the Weave module's first_query_tokens_of_long_prefill_work; one gather + one copy per head)."""
+    positions = [[] for _head in q_indices_by_head]
+    slots = [[] for _head in q_indices_by_head]
+    for index, (
+        _group_count,
+        (head, kv_block, q_begin, _q_count, _zero, _again),
+    ) in enumerate(work):
+        positions[head].append(int(row_starts_host[head][kv_block]) + int(q_begin))
+        slots[head].append(index)
+    first_tokens = [0] * len(work)
+    for head, q_indices in enumerate(q_indices_by_head):
+        if not positions[head]:
+            continue
+        gathered = q_indices.index_select(
+            0, torch.tensor(positions[head], dtype=torch.int64, device=q_indices.device)
+        )
+        for index, token in zip(slots[head], gathered.cpu().tolist(), strict=False):
+            first_tokens[index] = int(token)
+    return first_tokens
+
+
+def _long_prefill_order_work_q_resident(work, first_tokens, *, window, fill_groups):
+    """Launch order of lever P1b (mirror of the Weave module's order_long_prefill_work_q_resident): the items
+    with at least fill_groups groups sorted by (head, first_token // window, group_count desc, kv_block,
+    q_begin), then the smaller items in bucket-descending (stable) order.  A permutation of work."""
+    if len(first_tokens) != len(work):
+        raise ValueError("one first query token per work item is required")
+    if int(window) <= 0 or int(fill_groups) <= 0:
+        raise ValueError("window and fill_groups must be positive")
+    bulk = []
+    fill = []
+    for item, token in zip(work, first_tokens, strict=False):
+        group_count, (head, kv_block, q_begin, _q_count, _zero, _again) = item
+        if int(group_count) >= int(fill_groups):
+            bulk.append(
+                (
+                    (
+                        int(head),
+                        int(token) // int(window),
+                        -int(group_count),
+                        int(kv_block),
+                        int(q_begin),
+                    ),
+                    item,
+                )
+            )
+        else:
+            fill.append(item)
+    bulk.sort(key=lambda pair: pair[0])
+    fill.sort(key=lambda item: item[0], reverse=True)
+    return [item for _key, item in bulk] + fill
+
+
 def _build_long_prefill_plan(
     q2k_indices: torch.Tensor,
     *,
@@ -1175,6 +1659,7 @@ def _build_long_prefill_plan(
         dim=2, dtype=torch.int32
     )
     counts_by_head: list[torch.Tensor] = []
+    q_indices_by_head: list[torch.Tensor] = []
     for head in range(num_kv_heads):
         flat = q2k_indices[head].reshape(-1)
         valid = (flat >= 0) & (flat < total_rows)
@@ -1196,31 +1681,34 @@ def _build_long_prefill_plan(
             torch.int32
         ) << _LONG_QSPLIT_SINGLE_SHIFT
         qsplit[head, : packed.numel()] = packed
+        q_indices_by_head.append(q_indices)
 
     # The host decomposes the per-row counts into the CTA work list: one device-to-host
     # transfer for all heads (the plan is rebuilt only when the selection changes).
     counts_host = torch.stack(counts_by_head).cpu().tolist()
-    work: list[tuple[int, tuple[int, int, int, int, int, int]]] = []
-    for head, counts in enumerate(counts_host):
-        for kv_block, row_count in enumerate(counts):
-            q_begin = 0
-            remaining = row_count
-            for group_count in buckets:
-                capacity = group_count * q_tokens_per_group
-                while (
-                    remaining + q_tokens_per_group - 1
-                ) // q_tokens_per_group >= group_count:
-                    q_count = min(capacity, remaining)
-                    work.append(
-                        (group_count, (head, kv_block, q_begin, q_count, 0, kv_block))
-                    )
-                    q_begin += q_count
-                    remaining -= q_count
-            if remaining:
-                raise AssertionError("long-prefill work decomposition failed")
+    work = _long_prefill_decompose_work(
+        counts_host, buckets=buckets, q_tokens_per_group=q_tokens_per_group
+    )
     if not work:
         raise ValueError("long prefill requires at least one selected edge")
-    work.sort(key=lambda item: item[0], reverse=True)
+    work = _long_prefill_tail_split_work(
+        work, sm_count=int(num_sms), q_tokens_per_group=q_tokens_per_group
+    )
+    row_starts_host = []
+    for head_counts in counts_host:
+        starts = [0]
+        for count in head_counts:
+            starts.append(starts[-1] + int(count))
+        row_starts_host.append(starts)
+    first_tokens = _long_prefill_first_query_tokens(
+        work, row_starts_host=row_starts_host, q_indices_by_head=q_indices_by_head
+    )
+    work = _long_prefill_order_work_q_resident(
+        work,
+        first_tokens,
+        window=_LONG_WORK_ORDER_Q_WINDOW,
+        fill_groups=min(_LONG_WORK_ORDER_FILL_GROUPS, work_group_cap),
+    )
     metadata = torch.tensor(
         [entry for _group, entry in work], dtype=torch.int32, device=q2k_indices.device
     )
@@ -1347,8 +1835,8 @@ def _run_long_prefill(
     temperature_lse: torch.Tensor,
     q2k_indices: torch.Tensor,
     cu_q: torch.Tensor,
-    cu_k: torch.Tensor,
-    q_offsets: torch.Tensor,
+    cu_k: Optional[torch.Tensor],
+    q_offsets: Optional[torch.Tensor],
     kv_lens: torch.Tensor,
     page_table: torch.Tensor,
     paged: bool,
@@ -1378,7 +1866,9 @@ def _run_long_prefill(
     combine) pair records its own warmed-launch signature, so the eager warm
     call covers all requests and capture checks each in turn.  One request
     binds the caller's ``cu_seqlens`` / ``q_offsets`` / ``kv_lens`` tensors
-    unchanged (its boundaries are never read; zero-based by contract).
+    unchanged (its boundaries are never read; zero-based by contract); a
+    paged ``cu_k`` of ``None`` (levers P-H1 / P-H1d) binds the all-zero
+    carrier and a ``None`` ``q_offsets`` is bound to it.
     """
 
     total_q, num_q_heads, _ = (int(value) for value in q.shape)
@@ -1442,18 +1932,22 @@ def _run_long_prefill(
             dtype=torch.float32,
             device=q.device,
         )
-    direct_group = (
-        target == "sm100a" and paged and group_size == 16 and max_pages == 8192
-    )
-    route = _long_prefill_route(
-        paged=paged, group_size=group_size, direct_group=direct_group
-    )
+    route = _long_prefill_route(paged=paged, group_size=group_size)
     forward_program = _program(f"{route}:main", target)
     combine_program = _program(f"{route}:reduce", target)
     # Flat K/V: a never-dereferenced carrier, the caller's whole contiguous q2k
     # flattened (a view; a per-request slice is not flattenable without a copy).
     q2k_flat = q2k_indices.reshape(-1)
     single = len(q_lens) == 1
+    if single and cu_k is None:
+        # Lever P-H1d: the paged request binds the all-zero cu_seqlens_k
+        # carrier; the producer reads kv_lens / page_table (the long route
+        # admits paged K/V at 64 pages or more, never the flat-ABI form).
+        cu_k = _paged_prefill_cu_seqlens_k(
+            kv_lens, workspace=workspace, name="prefill_cu_seqlens_k"
+        )
+        if q_offsets is None:
+            q_offsets = cu_k
     q_begin = 0
     k_begin = 0
     for index, (len_q, len_k) in enumerate(zip(q_lens, k_lens, strict=True)):
@@ -1591,7 +2085,8 @@ def _launch_route(
         grid=grid,
     )
     _check_warmed_launch(workspace, signature, capturing=capturing)
-    _program(f"{route}:main", target).launch(grid, **arguments)
+    program = _program(f"{route}:main", target)
+    program.launch(grid, **arguments)
     _record_successful_launch(workspace, signature, capturing=capturing)
 
 
@@ -1606,8 +2101,8 @@ def _run_prefill(
     temperature_lse: torch.Tensor,
     q2k_indices: torch.Tensor,
     cu_q: torch.Tensor,
-    cu_k: torch.Tensor,
-    q_offsets: torch.Tensor,
+    cu_k: Optional[torch.Tensor],
+    q_offsets: Optional[torch.Tensor],
     kv_lens: torch.Tensor,
     page_table: torch.Tensor,
     paged: bool,
@@ -1635,18 +2130,29 @@ def _run_prefill(
         dtype=torch.uint8,
         device=q.device,
     )
-    q_tile = (
-        _GQA8_Q_TILE
-        if folded_gqa_group == 8
-        else _GQA16_Q_TILE
-        if folded_gqa_group == 16
-        else _M128_Q_TILE
+    grid = _prefill_launch_grid(
+        total_q=total_q,
+        batch_size=batch_size,
+        folded_gqa_group=folded_gqa_group,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        num_sms=int(get_device_sm_count(q.device)),
     )
-    grid = (
-        (total_q + q_tile - 1) // q_tile + batch_size - 1,
-        num_kv_heads if folded_gqa_group else num_q_heads,
-        1,
-    )
+    if cu_k is None:
+        # Lever P-H1d: paged prefill without caller offsets binds the all-zero
+        # cu_seqlens_k carrier (the program reads kv_lens / page_table); no
+        # scan kernel precedes the launch.
+        cu_k = _paged_prefill_cu_seqlens_k(
+            kv_lens, workspace=workspace, name="prefill_cu_seqlens_k"
+        )
+        if max_pages == 0:
+            # Flat-ABI form: the kernel derives kv_len from adjacent
+            # cu_seqlens_k entries.  A page table without pages carries no
+            # K/V, so the offsets of this degenerate call are all zero; write
+            # them rather than trust the buffer's creation-time fill.
+            cu_k.zero_()
+        if q_offsets is None:
+            q_offsets = cu_k
     arguments = {
         "q": q,
         "k": k.view(torch.uint8) if fp8_kv else k,
@@ -1845,7 +2351,7 @@ def _run_fp8_direct(
 ) -> None:
     """One direct FP8-MMA decode program (BF16-Q xform2 or uniform FP8 Q/K/V)."""
 
-    uniform = route == "decode_uniform_fp8:paged"
+    uniform = route in (_UNIFORM_FP8_SINGLE_ROUTE, _UNIFORM_FP8_DYNPAIR_ROUTE_KEY)
     total_q, num_q_heads, _ = (int(value) for value in q.shape)
     num_kv_heads = int(k.shape[1])
     arguments: dict[str, Any] = {
@@ -2371,6 +2877,23 @@ def blackwell_msa_sparse_attention(
         use_long = lengths is not None and _use_long_prefill(
             q_lens=lengths.q_lens, k_lens=lengths.k_lens, **predicate
         )
+        if (
+            use_long
+            and paged
+            and group_size == 16
+            and batch_size == 1
+            and _union_census_route(
+                workspace,
+                q2k_indices=q2k_indices,
+                q_len=total_q,
+                kv_lens=kv_lens,
+                max_pages=max_pages,
+                capturing=capturing,
+            )
+        ):
+            # Lever P10: same-block selections take the folded union program
+            # (``prefill_union:...:paged:gqa16:causal_large``).
+            use_long = False
         if use_long:
             _run_long_prefill(group_size=group_size, lengths=lengths, **common)
         else:
@@ -2544,7 +3067,9 @@ def blackwell_msa_sparse_decode_attention(
                     "force_fused=True, and no explicit q_offset"
                 )
             _run_fp8_direct(
-                route="decode_uniform_fp8:paged", output_scale=output_scale, **common
+                route=_uniform_fp8_route(int(seqlen_q)),
+                output_scale=output_scale,
+                **common,
             )
         else:
             schedule = _fp8_q1_schedule(
@@ -2586,10 +3111,12 @@ def blackwell_msa_topk_select(
 ) -> torch.Tensor:
     """Select exact top-16 block indices on compute capability 10.0/10.3/10.7.
 
-    One launch: the query-tiled radix-select program, or -- for small latency-bound multi-pass grids
-    (``_topk_route``: at most 512 rows, at most 1024 valid pages, planned slice above the candidate
-    cap) -- the one-CTA-per-row streaming program; both implement the same order (IEEE numeric,
-    ties by ascending block index).  Shapes whose plan splits the valid pages over ``S > 1`` K-slices
+    One launch: the query-tiled radix-select program -- in its ``topk_select_keq`` instance (lever T9
+    pass-0 all-equal fold) for a planned slice above the candidate cap (64) and at most 512 blocks
+    (``_topk_radix_route``), its ``topk_select`` instance for a stage-only slice and beyond --
+    or -- for small latency-bound multi-pass grids (``_topk_route``: at most 512 rows, at most 1024 valid
+    pages, planned slice above the candidate cap) -- the one-CTA-per-row streaming program; all implement
+    the same order (IEEE numeric, ties by ascending block index) and are bit-identical on every input.  Shapes whose plan splits the valid pages over ``S > 1`` K-slices
     use a per-device workspace (``partials`` u64, self-resetting ``counters``, ``block_max`` tile
     maxima) that is allocated by the first eager call for the largest shape seen; under CUDA-graph
     capture a missing warm-up or an insufficient workspace raises ``RuntimeError``.  The workspace is
@@ -2642,7 +3169,8 @@ def blackwell_msa_topk_select(
         raise RuntimeError(
             "msa_topk_select must be invoked eagerly on this device before CUDA graph capture"
         )
-    if _topk_route(total_q, num_heads, valid, max_k_tiles) == _TOPK_ROUTE_STREAMING:
+    route = _topk_route(total_q, num_heads, valid, max_k_tiles)
+    if route == _TOPK_ROUTE_STREAMING:
         _program(f"{_TOPK_ROUTE_STREAMING}:main", target).launch(
             (total_q * num_heads, 1, 1),
             max_score=max_score,
@@ -2658,15 +3186,26 @@ def blackwell_msa_topk_select(
             with _topk_warmed_devices_lock:
                 _topk_warmed_devices.add(warm_key)
         return output
-    plan = _topk_grid_plan(total_q, num_heads, valid, max_k_tiles)
+    # The 32-query instance (lever T4) loads a lane's query pair with one 8-byte load: a score tensor whose
+    # storage offset is only 4-byte aligned takes the 16-query instance (same selection, bit for bit).
+    qpack = 2 if route == _TOPK_ROUTE_Q32 and max_score.data_ptr() % 8 == 0 else 1
+    # (a 16-query launch runs the instance of the route key; the alignment fallback of a ``topk_select_q32`` shape
+    # runs ``topk_select``, as the source dispatcher does)
+    program_key = (
+        _TOPK_ROUTE_Q32
+        if qpack == 2
+        else (_TOPK_ROUTE_KEQ if route == _TOPK_ROUTE_KEQ else _TOPK_ROUTE_RADIX)
+    )
+    plan = _topk_grid_plan(total_q, num_heads, valid, max_k_tiles, qpack)
     partials, counters, block_max = _topk_workspace(
         max_score.device,
         plan["groups"],
         plan["num_slices"],
         plan["bmax_words"],
         capturing,
+        _TOPK_QT * qpack,
     )
-    _program(f"{_TOPK_ROUTE_RADIX}:main", target).launch(
+    _program(f"{program_key}:main", target).launch(
         (plan["grid"], 1, 1),
         max_score=max_score,
         output=output,

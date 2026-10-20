@@ -17,50 +17,44 @@ limitations under the License.
 from __future__ import annotations
 
 import functools
-from pathlib import Path
 from typing import Any
 
-from ...jit import env as jit_env
-from ...jit.core import (
-    gen_jit_spec,
-    sm100a_nvcc_flags,
-    sm103a_nvcc_flags,
-    sm107a_nvcc_flags,
-)
+from . import cake_build
 
-# Registry of the generated Cake DSA indexer programs (written by the
-# generated-program export; do not edit by hand).
+# Registry of the generated Cake DSA indexer programs.  The kernel and
+# launcher sources, this registry and ``build.json`` are exporter output,
+# hand-folded here pending exporter support: programs that differ only in
+# their constants or lever text share one translation unit, and each
+# ``build.json`` entry selects its program through its own ``-D``
+# definitions.
 #
-# Every program is one device translation unit plus its host binding, shared
-# by the architectures listed in its record; the loader compiles it with the
-# exact flag set of the device it runs on.  ``ARG_PLANS`` holds the one
+# Every program is one device translation unit plus one host binding, shared
+# by the architectures listed in its record; a program that differs from a
+# sibling only in its constants (a scan lever twin, a rank-finalize program of
+# the same window form, a CUB finalize program) builds the sibling's kernel
+# translation unit, and a program whose binding text equals a sibling's up to
+# the kernel symbol, the host-shim namespace and the launch constants builds
+# the sibling's binding -- each with the compile definitions of its
+# ``build.json`` entry.  ``build.json`` next to this file
+# (schema ``cake-build/1``, read by ``cake_build``) is the only record of what
+# to compile: one entry ``<library>_<arch>`` per program and architecture with
+# its sources, nvcc flags and digests.  ``cake_build.load_library`` serves the
+# prebuilt ``aot/<entry>.so`` when a builder compiled it and otherwise
+# JIT-builds the entry through FlashInfer.  ``ARG_PLANS`` holds the one
 # argument order per stage role (``scan``: a persistent fused scoring /
 # selection program; ``merge``: the split-range merge; ``finalize``: the
 # ascending-id row sort by CUB block radix sort; ``finalize_rank``: the same
-# sort as a prefix-popcount rank scatter), ``COMPILE_FLAGS`` the extra nvcc
-# flags per role,
-# ``PROGRAMS`` every program once with its role, sources, architectures and
-# launch geometry, ``PROGRAM_KEYS`` the program of every host dispatch key per
+# sort as a prefix-popcount rank scatter), ``PROGRAMS`` every program once
+# with its role, its architecture-free ``library`` stem and its
+# architectures, ``PROGRAM_KEYS`` the program of every host dispatch key per
 # architecture (see ``cake_policy``), ``POLICY`` the per-architecture host
 # dispatch record and ``NUMERICS`` the documented numerics of the programs.
-# The program-text levers of every scan key are documented for the test suite
-# in ``tests/test_helpers/cake_dsa_indexer_program_levers.py``; the loader
-# does not read them.
+# The launch geometry of a program (block, cluster, dynamic shared memory) is
+# fixed in its host binding.
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
-ARCH_NVCC_FLAGS = {
-    "sm_100a": sm100a_nvcc_flags,
-    "sm_103a": sm103a_nvcc_flags,
-    "sm_107a": sm107a_nvcc_flags,
-}
 STAGES: list[str] = ["scan", "merge", "finalize", "finalize_rank"]
 ABI: str = "dsa_indexer_v2"
 NUMERICS: dict[str, str] = {"zero_sign_policy": "positive_accumulator"}
-COMPILE_FLAGS: dict[str, list[str]] = {
-    "scan": ["--ptxas-options=--register-usage-level=10"],
-    "merge": [],
-    "finalize": [],
-    "finalize_rank": [],
-}
 FFI_ENTRY: str = "run"
 ARG_PLANS: dict[str, list[list[str]]] = {
     "scan": [
@@ -121,617 +115,345 @@ ARG_PLANS: dict[str, list[list[str]]] = {
     ],
 }
 PROGRAMS: dict[str, dict[str, Any]] = {
-    "cake_dsa_indexer_topk_0078a7a815dd3ae05528": {
+    "cake_dsa_indexer_topk_0d38735ee8e81ae6f5e8": {
         "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_0078a7a815dd3ae05528_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_0078a7a815dd3ae05528_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_0d38735ee8e81ae6f5e8",
         "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_03d703ce0f576fb5e1ba": {
+    "cake_dsa_indexer_topk_110194b650e766125f9f": {
         "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_03d703ce0f576fb5e1ba_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_03d703ce0f576fb5e1ba_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_110194b650e766125f9f",
         "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [2, 1, 1]},
     },
-    "cake_dsa_indexer_topk_04581dfcfd4b8da77e0e": {
+    "cake_dsa_indexer_topk_1b6af9940d486a0832d9": {
         "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_04581dfcfd4b8da77e0e_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_04581dfcfd4b8da77e0e_binding.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_07a9b7f678d301b6ec8f": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_07a9b7f678d301b6ec8f_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_07a9b7f678d301b6ec8f_binding.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_0843306409e1e7fc6092": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_0843306409e1e7fc6092_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_0843306409e1e7fc6092_binding.cu",
-        ],
-        "arches": ["sm_100a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_16c3c87110694f7d9ef5": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_16c3c87110694f7d9ef5_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_16c3c87110694f7d9ef5_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_1b6af9940d486a0832d9",
         "arches": ["sm_107a"],
-        "launch": {"block": [512, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_183f566a58cfd448adc8": {
+    "cake_dsa_indexer_topk_23a4ebeaa3ba23c23c80": {
         "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_183f566a58cfd448adc8_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_183f566a58cfd448adc8_binding.cu",
-        ],
-        "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_19f3a43b141139e9c889": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_19f3a43b141139e9c889_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_19f3a43b141139e9c889_binding.cu",
-        ],
-        "arches": ["sm_107a"],
-        "launch": {"block": [512, 1, 1], "cluster": [2, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_1e987836f71bb5c3ba52": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_1e987836f71bb5c3ba52_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_1e987836f71bb5c3ba52_binding.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "launch": {"block": [512, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_21194ed236fd9b34ca5c": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_21194ed236fd9b34ca5c_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_21194ed236fd9b34ca5c_binding.cu",
-        ],
-        "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
+        "library": "cake_dsa_indexer_topk_23a4ebeaa3ba23c23c80",
+        "arches": ["sm_103a", "sm_107a"],
     },
     "cake_dsa_indexer_topk_2581ee71bf5e5ecd2556": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_2581ee71bf5e5ecd2556_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_2581ee71bf5e5ecd2556_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_2581ee71bf5e5ecd2556",
         "arches": ["sm_100a", "sm_103a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_2a0be0fd36be3320b3df": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_2a0be0fd36be3320b3df_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_2a0be0fd36be3320b3df_binding.cu",
-        ],
-        "arches": ["sm_100a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_2a8ee36778e8e723a2db": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_2a8ee36778e8e723a2db_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_2a8ee36778e8e723a2db_binding.cu",
-        ],
-        "arches": ["sm_107a"],
-        "launch": {"block": [512, 1, 1], "cluster": [2, 1, 1]},
     },
     "cake_dsa_indexer_topk_2d40b7d91582905f31c3": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_2d40b7d91582905f31c3_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_2d40b7d91582905f31c3_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_2d40b7d91582905f31c3",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_302e1fbcd75de335d203": {
+    "cake_dsa_indexer_topk_2de9f2d0467668d46463": {
         "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_302e1fbcd75de335d203_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_302e1fbcd75de335d203_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_2de9f2d0467668d46463",
         "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_38109fa62ccefe5460c2": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_38109fa62ccefe5460c2_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_38109fa62ccefe5460c2_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_38109fa62ccefe5460c2",
         "arches": ["sm_100a", "sm_103a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_3d24871c62801c250a13": {
+    "cake_dsa_indexer_topk_384649a6eee3c6a35aa4": {
         "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_3d24871c62801c250a13_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_3d24871c62801c250a13_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_384649a6eee3c6a35aa4",
         "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
+    },
+    "cake_dsa_indexer_topk_3bd43d833b5d53e81dbe": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_3bd43d833b5d53e81dbe",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_3c6dc460295ddf3c44de": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_3c6dc460295ddf3c44de",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_dsa_indexer_topk_3c9bece1433e9cf03979": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_3c9bece1433e9cf03979",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_401fb46fc3a69d791fdd": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_401fb46fc3a69d791fdd",
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_dsa_indexer_topk_44163f96c12681e411cc": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_44163f96c12681e411cc_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_44163f96c12681e411cc_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_44163f96c12681e411cc",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_466abdd77cd9e3a2bbed": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_466abdd77cd9e3a2bbed_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_466abdd77cd9e3a2bbed_binding.cu",
-        ],
-        "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_4ba570d7296334795923": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_4ba570d7296334795923_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_4ba570d7296334795923_binding.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "launch": {"block": [512, 1, 1], "cluster": [2, 1, 1]},
     },
     "cake_dsa_indexer_topk_4c792ffa06c1b93d77fa": {
         "role": "finalize",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_4c792ffa06c1b93d77fa_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_4c792ffa06c1b93d77fa_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_4c792ffa06c1b93d77fa",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [512, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_51ea1878006e6309d084": {
+    "cake_dsa_indexer_topk_506cb2b2c57f0a514cde": {
         "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_51ea1878006e6309d084_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_51ea1878006e6309d084_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_506cb2b2c57f0a514cde",
         "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_5413483cf3311fde30f0": {
+    "cake_dsa_indexer_topk_521027e8563a9664acef": {
         "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_5413483cf3311fde30f0_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_5413483cf3311fde30f0_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_521027e8563a9664acef",
         "arches": ["sm_100a", "sm_103a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_54319ec98a91debb5537": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_54319ec98a91debb5537_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_54319ec98a91debb5537_binding.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_55767b3e4f028548bd92": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_55767b3e4f028548bd92_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_55767b3e4f028548bd92_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_55767b3e4f028548bd92",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_578634f8fe7efda0f97c": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_578634f8fe7efda0f97c_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_578634f8fe7efda0f97c_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_578634f8fe7efda0f97c",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_57f29000b1d34d25491c": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_57f29000b1d34d25491c_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_57f29000b1d34d25491c_binding.cu",
-        ],
-        "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [2, 1, 1]},
     },
     "cake_dsa_indexer_topk_58f1c8a36e2cf5f302ae": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_58f1c8a36e2cf5f302ae_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_58f1c8a36e2cf5f302ae_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_58f1c8a36e2cf5f302ae",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_5ad452feced8e672c27a": {
+    "cake_dsa_indexer_topk_5c6e55c74de033e5f7af": {
         "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_5ad452feced8e672c27a_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_5ad452feced8e672c27a_binding.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "launch": {"block": [512, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_5b000ac1fbbe1d2bd758": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_5b000ac1fbbe1d2bd758_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_5b000ac1fbbe1d2bd758_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_5c6e55c74de033e5f7af",
         "arches": ["sm_107a"],
-        "launch": {"block": [512, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_5f64e59f766ec915c70b": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_5f64e59f766ec915c70b_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_5f64e59f766ec915c70b_binding.cu",
-        ],
-        "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_60b4f87115fbecd243e2": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_60b4f87115fbecd243e2_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_60b4f87115fbecd243e2_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_60b4f87115fbecd243e2",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_675d0ddb78caa74b1b0f": {
+    "cake_dsa_indexer_topk_616b9e7f58f356a9e146": {
         "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_675d0ddb78caa74b1b0f_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_675d0ddb78caa74b1b0f_binding.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
+        "library": "cake_dsa_indexer_topk_616b9e7f58f356a9e146",
+        "arches": ["sm_100a"],
     },
     "cake_dsa_indexer_topk_69d2d7c68ccceb095540": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_69d2d7c68ccceb095540_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_69d2d7c68ccceb095540_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_69d2d7c68ccceb095540",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_6c9c7e92e94144a6fb51": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_6c9c7e92e94144a6fb51_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_6c9c7e92e94144a6fb51_binding.cu",
-        ],
-        "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [2, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_7035b336a4a4209cfd66": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_7035b336a4a4209cfd66_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_7035b336a4a4209cfd66_binding.cu",
-        ],
-        "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_7286faf88e17986cff38": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_7286faf88e17986cff38_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_7286faf88e17986cff38_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_7286faf88e17986cff38",
         "arches": ["sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
+    },
+    "cake_dsa_indexer_topk_74f132250e5e565dfcc9": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_74f132250e5e565dfcc9",
+        "arches": ["sm_107a"],
     },
     "cake_dsa_indexer_topk_75842ae0f80e05addeaa": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_75842ae0f80e05addeaa_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_75842ae0f80e05addeaa_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_75842ae0f80e05addeaa",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_84a329cdc9c49b60663e": {
+    "cake_dsa_indexer_topk_763009af2c0de13ffc29": {
         "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_84a329cdc9c49b60663e_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_84a329cdc9c49b60663e_binding.cu",
-        ],
-        "arches": ["sm_103a", "sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
+        "library": "cake_dsa_indexer_topk_763009af2c0de13ffc29",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_7d1b556b2aedea7f5249": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_7d1b556b2aedea7f5249",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_808a62a6315ae38034c6": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_808a62a6315ae38034c6",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_dsa_indexer_topk_81ccb257c7338a468c3b": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_81ccb257c7338a468c3b",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_88619e22363515835efe": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_88619e22363515835efe",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_88f7b0c3c31837a87b60": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_88f7b0c3c31837a87b60",
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_dsa_indexer_topk_8a91a587122e3032ace6": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_8a91a587122e3032ace6_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_8a91a587122e3032ace6_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_8a91a587122e3032ace6",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_8f8c393ea106e74d70e9": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_8f8c393ea106e74d70e9_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_8f8c393ea106e74d70e9_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_8f8c393ea106e74d70e9",
         "arches": ["sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
+    },
+    "cake_dsa_indexer_topk_90c88df0fd82d4908fca": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_90c88df0fd82d4908fca",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_dsa_indexer_topk_93373e506f0537a0ed67": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_93373e506f0537a0ed67",
+        "arches": ["sm_100a"],
+    },
+    "cake_dsa_indexer_topk_942797c60bc61df40715": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_942797c60bc61df40715",
+        "arches": ["sm_107a"],
     },
     "cake_dsa_indexer_topk_96c30b1f33d2a094d9b9": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_96c30b1f33d2a094d9b9_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_96c30b1f33d2a094d9b9_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_96c30b1f33d2a094d9b9",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_988afe38390f12e5bbc7": {
+    "cake_dsa_indexer_topk_99af5257f5e28006f79e": {
         "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_988afe38390f12e5bbc7_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_988afe38390f12e5bbc7_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_99af5257f5e28006f79e",
         "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [2, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_9930ec5efe7e98e63ad5": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_9930ec5efe7e98e63ad5_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_9930ec5efe7e98e63ad5_binding.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "launch": {"block": [512, 1, 1], "cluster": [2, 1, 1]},
     },
     "cake_dsa_indexer_topk_9b89c92489b0e60d8ee7": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_9b89c92489b0e60d8ee7_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_9b89c92489b0e60d8ee7_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_9b89c92489b0e60d8ee7",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
+    },
+    "cake_dsa_indexer_topk_9c823649b35909199596": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_9c823649b35909199596",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_9cc421366d6079aa6ca8": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_9cc421366d6079aa6ca8",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_9f4b76cb713088f1285d": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_9f4b76cb713088f1285d",
+        "arches": ["sm_107a"],
     },
     "cake_dsa_indexer_topk_a42ccc07b6379bcf9549": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_a42ccc07b6379bcf9549_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_a42ccc07b6379bcf9549_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_a42ccc07b6379bcf9549",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_a8bb259a1b930c8383bf": {
+    "cake_dsa_indexer_topk_a64563a936f84ea4d9f5": {
         "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_a8bb259a1b930c8383bf_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_a8bb259a1b930c8383bf_binding.cu",
-        ],
-        "arches": ["sm_103a", "sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
+        "library": "cake_dsa_indexer_topk_a64563a936f84ea4d9f5",
+        "arches": ["sm_107a"],
     },
     "cake_dsa_indexer_topk_aa0bedf1a5601a3c55be": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_aa0bedf1a5601a3c55be_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_aa0bedf1a5601a3c55be_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_aa0bedf1a5601a3c55be",
         "arches": ["sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_aacebef79deb11b3aea9": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_aacebef79deb11b3aea9_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_aacebef79deb11b3aea9_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_aacebef79deb11b3aea9",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_aaf33000c051f155da63": {
+    "cake_dsa_indexer_topk_af8d290aa9010d180ed0": {
         "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_aaf33000c051f155da63_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_aaf33000c051f155da63_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_af8d290aa9010d180ed0",
+        "arches": ["sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_afa89b4033e466d158b1": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_afa89b4033e466d158b1",
         "arches": ["sm_107a"],
-        "launch": {"block": [512, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_b8440d1d1d54917a47d7": {
         "role": "merge",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_b8440d1d1d54917a47d7_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_b8440d1d1d54917a47d7_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_b8440d1d1d54917a47d7",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [512, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_bbc99b799b2c58f8401f": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_bbc99b799b2c58f8401f_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_bbc99b799b2c58f8401f_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_bbc99b799b2c58f8401f",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_c02bcf153cf2ddae3b58": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_c02bcf153cf2ddae3b58_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_c02bcf153cf2ddae3b58_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_c02bcf153cf2ddae3b58",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_c161a63db67e3af8e906": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_c161a63db67e3af8e906_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_c161a63db67e3af8e906_binding.cu",
-        ],
-        "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [2, 1, 1]},
     },
     "cake_dsa_indexer_topk_c496f83c2e9979f7830a": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_c496f83c2e9979f7830a_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_c496f83c2e9979f7830a_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_c496f83c2e9979f7830a",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_cb8c20570699061f544d": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_cb8c20570699061f544d_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_cb8c20570699061f544d_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_cb8c20570699061f544d",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_cf92373ea526254d61a0": {
         "role": "finalize",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_cf92373ea526254d61a0_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_cf92373ea526254d61a0_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_cf92373ea526254d61a0",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [64, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_d0b7ecc9edbdcd71b2d7": {
         "role": "finalize",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_d0b7ecc9edbdcd71b2d7_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_d0b7ecc9edbdcd71b2d7_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_d0b7ecc9edbdcd71b2d7",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
+    },
+    "cake_dsa_indexer_topk_d121d20b4ff827b4b6d2": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_d121d20b4ff827b4b6d2",
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_dsa_indexer_topk_d965d76ede39f71e674b": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_d965d76ede39f71e674b_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_d965d76ede39f71e674b_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_d965d76ede39f71e674b",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
+    },
+    "cake_dsa_indexer_topk_e13c66d0acb361a94a1b": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_e13c66d0acb361a94a1b",
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_dsa_indexer_topk_e1e316281190b2a3203b": {
         "role": "finalize",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_e1e316281190b2a3203b_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_e1e316281190b2a3203b_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_e1e316281190b2a3203b",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [32, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_e3bb94a1bd63e4b54a08": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_e3bb94a1bd63e4b54a08_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_e3bb94a1bd63e4b54a08_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_e3bb94a1bd63e4b54a08",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_e818ec29250079fb914b": {
+    "cake_dsa_indexer_topk_e7860bf225417a2a3b51": {
         "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_e818ec29250079fb914b_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_e818ec29250079fb914b_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_e7860bf225417a2a3b51",
         "arches": ["sm_107a"],
-        "launch": {"block": [512, 1, 1], "cluster": [2, 1, 1]},
     },
-    "cake_dsa_indexer_topk_ebd66dea6d0305acb891": {
+    "cake_dsa_indexer_topk_e983ae66ae1ef4d182e5": {
         "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_ebd66dea6d0305acb891_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_ebd66dea6d0305acb891_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_e983ae66ae1ef4d182e5",
         "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_ed1192a18ca915b70af7": {
         "role": "finalize",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_ed1192a18ca915b70af7_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_ed1192a18ca915b70af7_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_ed1192a18ca915b70af7",
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "launch": {"block": [128, 1, 1], "cluster": [1, 1, 1]},
     },
     "cake_dsa_indexer_topk_f244c85e76fde1284ab2": {
         "role": "finalize_rank",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_f244c85e76fde1284ab2_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_f244c85e76fde1284ab2_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_f244c85e76fde1284ab2",
         "arches": ["sm_100a", "sm_103a"],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     },
-    "cake_dsa_indexer_topk_f4031ae0f60aafeade4f": {
+    "cake_dsa_indexer_topk_fad73cb8b09709a23920": {
         "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_f4031ae0f60aafeade4f_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_f4031ae0f60aafeade4f_binding.cu",
-        ],
-        "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [2, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_f6a9ad865c292fc968d1": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_f6a9ad865c292fc968d1_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_f6a9ad865c292fc968d1_binding.cu",
-        ],
-        "arches": ["sm_107a"],
-        "launch": {"block": [384, 1, 1], "cluster": [2, 1, 1]},
-    },
-    "cake_dsa_indexer_topk_fa80099a4f529287f3be": {
-        "role": "scan",
-        "sources": [
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_fa80099a4f529287f3be_kernel.cu",
-            "cake_dsa_indexer_topk/cake_dsa_indexer_topk_fa80099a4f529287f3be_binding.cu",
-        ],
+        "library": "cake_dsa_indexer_topk_fad73cb8b09709a23920",
         "arches": ["sm_100a", "sm_103a"],
-        "launch": {"block": [512, 1, 1], "cluster": [1, 1, 1]},
+    },
+    "cake_dsa_indexer_topk_fbcc24125a5af183d1dc": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_fbcc24125a5af183d1dc",
+        "arches": ["sm_100a", "sm_103a"],
     },
 }
 PROGRAM_KEYS: dict[str, dict[str, str]] = {
@@ -764,18 +486,18 @@ PROGRAM_KEYS: dict[str, dict[str, str]] = {
         "finalize_rank:t256:w8192:staged": "cake_dsa_indexer_topk_58f1c8a36e2cf5f302ae",
         "finalize_rank:t256:w8192:staged:bulk": "cake_dsa_indexer_topk_2581ee71bf5e5ecd2556",
         "merge": "cake_dsa_indexer_topk_b8440d1d1d54917a47d7",
-        "scan:l6:u1:s0:f0": "cake_dsa_indexer_topk_fa80099a4f529287f3be",
-        "scan:l6:u1:s0:f1": "cake_dsa_indexer_topk_1e987836f71bb5c3ba52",
-        "scan:narrow:u1:s0:f0": "cake_dsa_indexer_topk_0843306409e1e7fc6092",
-        "scan:narrow:u1:s0:f1": "cake_dsa_indexer_topk_2a0be0fd36be3320b3df",
-        "scan:pair_l6:u1:s0:f0": "cake_dsa_indexer_topk_9930ec5efe7e98e63ad5",
-        "scan:pair_l6:u1:s0:f1": "cake_dsa_indexer_topk_4ba570d7296334795923",
-        "scan:split_l6:u1:s0:f0": "cake_dsa_indexer_topk_5ad452feced8e672c27a",
-        "scan:split_narrow:u1:s0:f0": "cake_dsa_indexer_topk_5413483cf3311fde30f0",
-        "scan:wide:u1:s0:f0": "cake_dsa_indexer_topk_54319ec98a91debb5537",
-        "scan:wide:u1:s0:f1": "cake_dsa_indexer_topk_675d0ddb78caa74b1b0f",
-        "scan:wide:u2:s0:f0": "cake_dsa_indexer_topk_04581dfcfd4b8da77e0e",
-        "scan:wide:u2:s0:f1": "cake_dsa_indexer_topk_07a9b7f678d301b6ec8f",
+        "scan:l6:u1:s0:f0": "cake_dsa_indexer_topk_401fb46fc3a69d791fdd",
+        "scan:l6:u1:s0:f1": "cake_dsa_indexer_topk_d121d20b4ff827b4b6d2",
+        "scan:narrow:u1:s0:f0": "cake_dsa_indexer_topk_93373e506f0537a0ed67",
+        "scan:narrow:u1:s0:f1": "cake_dsa_indexer_topk_616b9e7f58f356a9e146",
+        "scan:pair_l6:u1:s0:f0": "cake_dsa_indexer_topk_90c88df0fd82d4908fca",
+        "scan:pair_l6:u1:s0:f1": "cake_dsa_indexer_topk_88f7b0c3c31837a87b60",
+        "scan:split_l6:u1:s0:f0": "cake_dsa_indexer_topk_fbcc24125a5af183d1dc",
+        "scan:split_narrow:u1:s0:f0": "cake_dsa_indexer_topk_521027e8563a9664acef",
+        "scan:wide:u1:s0:f0": "cake_dsa_indexer_topk_fad73cb8b09709a23920",
+        "scan:wide:u1:s0:f1": "cake_dsa_indexer_topk_e13c66d0acb361a94a1b",
+        "scan:wide:u2:s0:f0": "cake_dsa_indexer_topk_3c6dc460295ddf3c44de",
+        "scan:wide:u2:s0:f1": "cake_dsa_indexer_topk_808a62a6315ae38034c6",
     },
     "sm_103a": {
         "finalize:t128": "cake_dsa_indexer_topk_ed1192a18ca915b70af7",
@@ -806,18 +528,18 @@ PROGRAM_KEYS: dict[str, dict[str, str]] = {
         "finalize_rank:t256:w8192:staged": "cake_dsa_indexer_topk_58f1c8a36e2cf5f302ae",
         "finalize_rank:t256:w8192:staged:bulk": "cake_dsa_indexer_topk_2581ee71bf5e5ecd2556",
         "merge": "cake_dsa_indexer_topk_b8440d1d1d54917a47d7",
-        "scan:l6:u1:s0:f0": "cake_dsa_indexer_topk_fa80099a4f529287f3be",
-        "scan:l6:u1:s0:f1": "cake_dsa_indexer_topk_1e987836f71bb5c3ba52",
-        "scan:narrow:u1:s0:f0": "cake_dsa_indexer_topk_84a329cdc9c49b60663e",
-        "scan:narrow:u1:s0:f1": "cake_dsa_indexer_topk_a8bb259a1b930c8383bf",
-        "scan:pair_l6:u1:s0:f0": "cake_dsa_indexer_topk_9930ec5efe7e98e63ad5",
-        "scan:pair_l6:u1:s0:f1": "cake_dsa_indexer_topk_4ba570d7296334795923",
-        "scan:split_l6:u1:s0:f0": "cake_dsa_indexer_topk_5ad452feced8e672c27a",
-        "scan:split_narrow:u1:s0:f0": "cake_dsa_indexer_topk_5413483cf3311fde30f0",
-        "scan:wide:u1:s0:f0": "cake_dsa_indexer_topk_54319ec98a91debb5537",
-        "scan:wide:u1:s0:f1": "cake_dsa_indexer_topk_675d0ddb78caa74b1b0f",
-        "scan:wide:u2:s0:f0": "cake_dsa_indexer_topk_04581dfcfd4b8da77e0e",
-        "scan:wide:u2:s0:f1": "cake_dsa_indexer_topk_07a9b7f678d301b6ec8f",
+        "scan:l6:u1:s0:f0": "cake_dsa_indexer_topk_401fb46fc3a69d791fdd",
+        "scan:l6:u1:s0:f1": "cake_dsa_indexer_topk_d121d20b4ff827b4b6d2",
+        "scan:narrow:u1:s0:f0": "cake_dsa_indexer_topk_23a4ebeaa3ba23c23c80",
+        "scan:narrow:u1:s0:f1": "cake_dsa_indexer_topk_af8d290aa9010d180ed0",
+        "scan:pair_l6:u1:s0:f0": "cake_dsa_indexer_topk_90c88df0fd82d4908fca",
+        "scan:pair_l6:u1:s0:f1": "cake_dsa_indexer_topk_88f7b0c3c31837a87b60",
+        "scan:split_l6:u1:s0:f0": "cake_dsa_indexer_topk_fbcc24125a5af183d1dc",
+        "scan:split_narrow:u1:s0:f0": "cake_dsa_indexer_topk_521027e8563a9664acef",
+        "scan:wide:u1:s0:f0": "cake_dsa_indexer_topk_fad73cb8b09709a23920",
+        "scan:wide:u1:s0:f1": "cake_dsa_indexer_topk_e13c66d0acb361a94a1b",
+        "scan:wide:u2:s0:f0": "cake_dsa_indexer_topk_3c6dc460295ddf3c44de",
+        "scan:wide:u2:s0:f1": "cake_dsa_indexer_topk_808a62a6315ae38034c6",
     },
     "sm_107a": {
         "finalize:t128": "cake_dsa_indexer_topk_ed1192a18ca915b70af7",
@@ -848,31 +570,31 @@ PROGRAM_KEYS: dict[str, dict[str, str]] = {
         "finalize_rank:t256:w8192:staged": "cake_dsa_indexer_topk_58f1c8a36e2cf5f302ae",
         "finalize_rank:t256:w8192:staged:bulk:persist": "cake_dsa_indexer_topk_aa0bedf1a5601a3c55be",
         "merge": "cake_dsa_indexer_topk_b8440d1d1d54917a47d7",
-        "scan:l6:u1:s0:f0": "cake_dsa_indexer_topk_16c3c87110694f7d9ef5",
-        "scan:l6:u1:s0:f1": "cake_dsa_indexer_topk_aaf33000c051f155da63",
-        "scan:l6:u1:s1:f1": "cake_dsa_indexer_topk_5b000ac1fbbe1d2bd758",
-        "scan:narrow:u1:s0:f0": "cake_dsa_indexer_topk_84a329cdc9c49b60663e",
-        "scan:narrow:u1:s0:f1": "cake_dsa_indexer_topk_a8bb259a1b930c8383bf",
-        "scan:narrow:u1:s1:f1": "cake_dsa_indexer_topk_302e1fbcd75de335d203",
-        "scan:narrow:u2:s0:f0": "cake_dsa_indexer_topk_21194ed236fd9b34ca5c",
-        "scan:pair_l6:u1:s0:f0": "cake_dsa_indexer_topk_19f3a43b141139e9c889",
-        "scan:pair_l6:u1:s0:f1": "cake_dsa_indexer_topk_2a8ee36778e8e723a2db",
-        "scan:pair_l6:u1:s1:f1": "cake_dsa_indexer_topk_e818ec29250079fb914b",
-        "scan:pair_narrow:u1:s1:f1": "cake_dsa_indexer_topk_6c9c7e92e94144a6fb51",
-        "scan:pair_narrow:u2:s0:f0": "cake_dsa_indexer_topk_03d703ce0f576fb5e1ba",
-        "scan:pair_narrow:u2:s0:f1": "cake_dsa_indexer_topk_f4031ae0f60aafeade4f",
-        "scan:pair_wide:u1:s1:f0": "cake_dsa_indexer_topk_f6a9ad865c292fc968d1",
-        "scan:pair_wide:u1:s1:f1": "cake_dsa_indexer_topk_c161a63db67e3af8e906",
-        "scan:pair_wide:u2:s0:f0": "cake_dsa_indexer_topk_57f29000b1d34d25491c",
-        "scan:pair_wide:u2:s0:f1": "cake_dsa_indexer_topk_988afe38390f12e5bbc7",
-        "scan:split_narrow:u1:s0:f0": "cake_dsa_indexer_topk_7035b336a4a4209cfd66",
-        "scan:split_wide:u1:s0:f0": "cake_dsa_indexer_topk_ebd66dea6d0305acb891",
-        "scan:split_wide:u2:s0:f0": "cake_dsa_indexer_topk_183f566a58cfd448adc8",
-        "scan:wide:u1:s0:f0": "cake_dsa_indexer_topk_3d24871c62801c250a13",
-        "scan:wide:u1:s0:f1": "cake_dsa_indexer_topk_51ea1878006e6309d084",
-        "scan:wide:u1:s1:f0": "cake_dsa_indexer_topk_0078a7a815dd3ae05528",
-        "scan:wide:u1:s1:f1": "cake_dsa_indexer_topk_466abdd77cd9e3a2bbed",
-        "scan:wide:u2:s0:f0": "cake_dsa_indexer_topk_5f64e59f766ec915c70b",
+        "scan:l6:u1:s0:f0": "cake_dsa_indexer_topk_3c9bece1433e9cf03979",
+        "scan:l6:u1:s0:f1": "cake_dsa_indexer_topk_110194b650e766125f9f",
+        "scan:l6:u1:s1:f1": "cake_dsa_indexer_topk_384649a6eee3c6a35aa4",
+        "scan:narrow:u1:s0:f0": "cake_dsa_indexer_topk_23a4ebeaa3ba23c23c80",
+        "scan:narrow:u1:s0:f1": "cake_dsa_indexer_topk_af8d290aa9010d180ed0",
+        "scan:narrow:u1:s1:f1": "cake_dsa_indexer_topk_506cb2b2c57f0a514cde",
+        "scan:narrow:u2:s0:f0": "cake_dsa_indexer_topk_2de9f2d0467668d46463",
+        "scan:pair_l6:u1:s0:f0": "cake_dsa_indexer_topk_7d1b556b2aedea7f5249",
+        "scan:pair_l6:u1:s0:f1": "cake_dsa_indexer_topk_9f4b76cb713088f1285d",
+        "scan:pair_l6:u1:s1:f1": "cake_dsa_indexer_topk_88619e22363515835efe",
+        "scan:pair_narrow:u1:s1:f1": "cake_dsa_indexer_topk_0d38735ee8e81ae6f5e8",
+        "scan:pair_narrow:u2:s0:f0": "cake_dsa_indexer_topk_a64563a936f84ea4d9f5",
+        "scan:pair_narrow:u2:s0:f1": "cake_dsa_indexer_topk_942797c60bc61df40715",
+        "scan:pair_wide:u1:s1:f0": "cake_dsa_indexer_topk_74f132250e5e565dfcc9",
+        "scan:pair_wide:u1:s1:f1": "cake_dsa_indexer_topk_1b6af9940d486a0832d9",
+        "scan:pair_wide:u2:s0:f0": "cake_dsa_indexer_topk_3bd43d833b5d53e81dbe",
+        "scan:pair_wide:u2:s0:f1": "cake_dsa_indexer_topk_9c823649b35909199596",
+        "scan:split_narrow:u1:s0:f0": "cake_dsa_indexer_topk_9cc421366d6079aa6ca8",
+        "scan:split_wide:u1:s0:f0": "cake_dsa_indexer_topk_763009af2c0de13ffc29",
+        "scan:split_wide:u2:s0:f0": "cake_dsa_indexer_topk_81ccb257c7338a468c3b",
+        "scan:wide:u1:s0:f0": "cake_dsa_indexer_topk_5c6e55c74de033e5f7af",
+        "scan:wide:u1:s0:f1": "cake_dsa_indexer_topk_e983ae66ae1ef4d182e5",
+        "scan:wide:u1:s1:f0": "cake_dsa_indexer_topk_99af5257f5e28006f79e",
+        "scan:wide:u1:s1:f1": "cake_dsa_indexer_topk_e7860bf225417a2a3b51",
+        "scan:wide:u2:s0:f0": "cake_dsa_indexer_topk_afa89b4033e466d158b1",
     },
 }
 POLICY: dict[str, dict[str, Any]] = {
@@ -1066,92 +788,15 @@ POLICY: dict[str, dict[str, Any]] = {
 TRACKING_ISSUE = "flashinfer-ai/flashinfer#5676"
 
 
-@functools.cache
-def toolchain_supports(arch: str) -> bool:
-    """Can the nvcc this checkout invokes emit ``arch``?
-
-    ``compute_107a`` needs a CUDA toolkit that lists it; a toolkit without it
-    declines the sm_107a builds up front instead of failing inside the JIT
-    build, so a checkout that registers sm_107a programs stays importable and
-    testable on a toolkit that only knows 10.0 / 10.3.
-    """
-    if arch not in ARCH_NVCC_FLAGS:
-        return False
-    if arch == "sm_107a":
-        from ...compilation_context import _nvcc_supports_sm107
-
-        return bool(_nvcc_supports_sm107())
-    return True
-
-
-def registered_archs() -> tuple[str, ...]:
-    """Architectures with registered programs, in ``ARCHES`` order."""
-    return tuple(arch for arch in ARCHES if arch in PROGRAM_KEYS and arch in POLICY)
-
-
-def program_available(arch: str) -> bool:
-    """True when ``arch`` registers a scan, the merge and a finalize program (CUB or rank)."""
-    keys = PROGRAM_KEYS.get(arch, {})
-    return (
-        arch in POLICY
-        and any(key.startswith("scan:") for key in keys)
-        and "merge" in keys
-        and any(key.startswith(("finalize:", "finalize_rank:")) for key in keys)
-    )
-
-
-def select_program(arch: str, key: str) -> str:
-    """Return the registered program of dispatch ``key`` on ``arch``."""
-    keys = PROGRAM_KEYS.get(arch)
-    if keys is None:
-        raise NotImplementedError(
-            f"The generated DSA indexer top-k programs for {arch} are not registered "
-            f"in this checkout (registered: {sorted(PROGRAM_KEYS)}; see {TRACKING_ISSUE})"
-        )
-    program = keys.get(key)
-    if program is None:
-        raise NotImplementedError(
-            f"The DSA indexer top-k program {key!r} is not registered for {arch} "
-            f"(registered on {arch}: {sorted(keys)}; see {TRACKING_ISSUE})"
-        )
-    return program
-
-
-def _header_dirs():
-    installed = [jit_env.FLASHINFER_CSRC_DIR, jit_env.FLASHINFER_INCLUDE_DIR]
-    if (installed[0] / "tvm_ffi_utils.h").is_file() and (
-        installed[1] / "flashinfer/layout.cuh"
-    ).is_file():
-        return installed
-    checkout = Path(__file__).resolve().parents[3]
-    source = [checkout / "csrc", checkout / "include"]
-    if (source[0] / "tvm_ffi_utils.h").is_file() and (
-        source[1] / "flashinfer/layout.cuh"
-    ).is_file():
-        return source
-    raise FileNotFoundError("FlashInfer binding headers were not found")
-
-
-@functools.cache
-def gen_program(program: str, arch: str):
-    """JIT spec of ``program`` compiled for ``arch`` (one cached library per pair)."""
+def library_name(program: str, arch: str) -> str:
+    """The ``build.json`` entry of ``program`` for ``arch``: ``<library>_<arch>``."""
     record = PROGRAMS[program]
     if arch not in record["arches"]:
         raise ValueError(f"program {program!r} is not built for {arch!r}")
-    if not toolchain_supports(arch):
-        raise RuntimeError(f"this checkout cannot compile {arch}")
-    root = Path(__file__).resolve().parent / "csrc"
-    sources = [root / relative for relative in record["sources"]]
-    return gen_jit_spec(
-        name=f"{program}_{arch}",
-        sources=sources,
-        extra_cuda_cflags=[*ARCH_NVCC_FLAGS[arch], *COMPILE_FLAGS[record["role"]]],
-        extra_ldflags=["-lcuda"],
-        extra_include_paths=[root, *{p.parent for p in sources}, *_header_dirs()],
-        use_fast_math=False,
-    )
+    return f"{record['library']}_{arch}"
 
 
 @functools.cache
 def load_program(program: str, arch: str):
-    return gen_program(program, arch).build_and_load()
+    """The library of ``program`` for ``arch``: prebuilt ``aot/`` else a JIT build."""
+    return cake_build.load_library(library_name(program, arch))

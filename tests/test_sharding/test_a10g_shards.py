@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from collections import Counter
@@ -29,6 +30,17 @@ def _commands(script):
     ]
 
 
+def test_nightly_build_stages_pytest_plugin():
+    script = (ROOT / "scripts/task_test_nightly_build.sh").read_text()
+    assert 'mkdir -p "${TEST_RUN_DIR}/scripts"' in script
+    assert (
+        'cp -a "${SOURCE_WORKSPACE}/scripts/__init__.py" '
+        '"${TEST_RUN_DIR}/scripts/"' in script
+    )
+    assert 'cp -a "${SOURCE_WORKSPACE}/scripts/test_sharding"' in script
+    assert '"${TEST_RUN_DIR}/scripts/"' in script
+
+
 def test_a10g_coverage_and_t4_scope(tmp_path):
     counts = Counter(cmd[2] for script in SCRIPTS for cmd in _commands(script))
     expected = {
@@ -36,6 +48,7 @@ def test_a10g_coverage_and_t4_scope(tmp_path):
             "batch_decode_kernels",
             "batch_prefill_kernels",
             "block_sparse",
+            "cake_vsa_planning",
             "deepseek_mla",
             "logits_cap",
             "mla_page",
@@ -50,12 +63,13 @@ def test_a10g_coverage_and_t4_scope(tmp_path):
             "norm",
             "quantization",
             "sampling",
+            "sampling_fuzz",
             "topk",
         ],
         "cli": ["cli_cmds", "cli_cmds_gpu"],
         "moe": ["bgmv_moe", "bgmv_moe_lora_delta"],
         "gemm": ["group_gemm"],
-        "experimental": ["experimental_api"],
+        "experimental": ["cake_vsa_sm90", "experimental_api"],
     }
     files = {
         f"tests/{folder}/test_{name}.py"
@@ -213,6 +227,10 @@ def test_nvfp4_only_warmup_skips_unrelated_grid(monkeypatch):
 
 @pytest.mark.parametrize("fails", [False, True])
 def test_logging_keeps_results_and_failure_exit(tmp_path, fails):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    shutil.copy2(ROOT / "scripts/__init__.py", scripts)
+    shutil.copytree(ROOT / "scripts/test_sharding", scripts / "test_sharding")
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests/test_sample.py").write_text(
         f"def test_case(): assert {not fails}\n"
@@ -223,7 +241,7 @@ def test_logging_keeps_results_and_failure_exit(tmp_path, fails):
     )
     env = os.environ.copy()
     env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env["PATH"]
-    env["PYTHONPATH"] = str(ROOT)
+    env.pop("PYTHONPATH", None)
     result = subprocess.run(
         ["bash", str(script)], cwd=tmp_path, env=env, text=True, capture_output=True
     )

@@ -278,7 +278,9 @@ def _run_cake_subgroup(
             # graph, three replays with fresh static input, an eager call
             # between replays. 512 rows at world sizes 4 and 8 take the
             # PDL-chained SM push route (N within the route's width ceiling),
-            # 1024 rows the copy-engine route; both are captured.
+            # 1024 rows the copy-engine route -- except the eight-rank N = 1280
+            # call on an architecture whose SM push band lists it, which takes
+            # the SM push route at its launch row; both are captured.
             for static_rows in (512, 1024):
                 static = torch.randn(static_rows, K, dtype=dtype, device=device)
                 _replayed_launcher(
@@ -339,6 +341,53 @@ def _run_cake_subgroup(
             del refusal_graph, oversized
             del launcher, engine_param, sample, prepared_first, prepared_second
             del prepared_first_snapshot, prepared_expected
+    # The 512-row calls of tensor-parallel degree 8 at every width class the SM
+    # push route resolves to there -- bf16: the 128-wide main at N = 256 / 512
+    # ([N, K] parameter) and at an N-major [K, N] weight of N = 512, the 256-wide
+    # main at an N-major weight of N = 1280 (the [N, K] N = 1280 call is above);
+    # fp16: the 256-wide main at N = 256 and N = 1280 ([N, K]) and at an N-major
+    # N = 1280 weight. A launcher prepared with max_rows=512 serves each eagerly,
+    # serves a shorter call through the same workspace, and captures it into a
+    # graph (two calls, three replays with fresh static input, an eager call
+    # between replays), so every width class a device's readiness slice table
+    # can list at these rows is exercised on both paths. The group's workspace
+    # already holds the 2048-row pitch of the growth above (a prepared launcher
+    # never shrinks it), so these calls run on that generation; at this
+    # tensor-parallel degree its readiness pad view and ticket counters are
+    # sized by the 512-row slice row either way (four words per rank row at
+    # both pitches), and the 512-row pad view itself is pinned by the unit
+    # tests of the backend.
+    if world_size == 8:
+        if dtype == torch.bfloat16:
+            widths = ((256, True), (512, True), (512, False), (1280, False))
+        else:
+            widths = ((256, True), (1280, True), (1280, False))
+        for n, k_major in widths:
+            engine_param = torch.randn(
+                (n, K) if k_major else (K, n), dtype=dtype, device=device
+            )
+            weight = engine_param.t() if k_major else engine_param
+            sample = torch.randn(512, K, dtype=dtype, device=device)
+            launcher = prepare_all_gather_matmul(
+                sample, weight, group, backend="cake", max_rows=512
+            )
+            served = launcher(sample)
+            assert served.shape == (world_size * 512, n)
+            _check(served, _expected(sample, weight, group, world_size))
+            shorter = torch.randn(125, K, dtype=dtype, device=device)
+            _check(launcher(shorter), _expected(shorter, weight, group, world_size))
+            static = torch.randn(512, K, dtype=dtype, device=device)
+            _replayed_launcher(
+                launcher,
+                static,
+                device,
+                lambda x: _expected(x, weight, group, world_size),
+                sample,
+                _check,
+            )
+            with pytest.raises(ValueError, match=r"\[1, 512\]"):
+                launcher(torch.randn(513, K, dtype=dtype, device=device))
+            del launcher, engine_param, weight, sample, served, shorter, static
 
     torch.cuda.synchronize(device)
     dist.destroy_process_group(group)

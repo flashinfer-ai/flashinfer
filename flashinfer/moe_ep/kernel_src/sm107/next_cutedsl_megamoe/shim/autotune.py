@@ -67,7 +67,9 @@ def sm107_candidates(
     - epi flag batches (1,4) vs (2,4),
     - FC2 bulk TMA (2 stages) on/off.
 
-    GenPhase fixes the cluster to (4, 1) and requires FC2 bulk stores.
+    Default GenPhase candidates use cluster (4, 1) and require FC2 bulk stores.
+    MXFP8 E4M3 and mixed FP4/FP8 additionally include the N64 decode tile,
+    using one FC2 stage and deterministic separate top-k reduction.
 
     ``token_in_flag_batch`` and the phase-interleave hint are skew-sensitive —
     sweep them with :func:`sm107_schedule_candidates` instead.  An ikr winner
@@ -111,6 +113,32 @@ def sm107_candidates(
                                 "reduce_topk_in_kernel": ikr,
                             }
                         )
+    if kernel_variant == "genphase" and quant_kind in (
+        "mxfp8_e4m3",
+        "mxfp4_mxfp8",
+    ):
+        # These are additional candidates, not a replacement for wider tiles:
+        # routing, cache residency and token count change the best pipeline.
+        for schedule, work_id in (
+            (("grouped", None), "grid_stride"),
+            (("grouped", None), "atomic_counter"),
+            (("phase_interleave", None), "atomic_counter"),
+        ):
+            out.append(
+                {
+                    "mma_tiler_mnk": (256, 64, 128),
+                    "cluster_shape_mn": (4, 1),
+                    "fallback_cluster_shape_mn": None,
+                    "schedule_policy": schedule,
+                    "work_id_mode": work_id,
+                    "fc2_use_bulk": True,
+                    "fc2_tma_stages": 1,
+                    "epi_flag_batches": (1, 4),
+                    "token_in_flag_batch": 1,
+                    "token_back_mode": "epi_warps",
+                    "reduce_topk_in_kernel": False,
+                }
+            )
     return out
 
 
@@ -244,7 +272,9 @@ def autotune_sm107_block_scaled_mega_moe(
         trial.topk_weights.copy_(symm_buffer.topk_weights)
         if cfg.quant_kind == "nvfp4":
             for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
-                getattr(trial, name).copy_(getattr(symm_buffer, name))
+                # the scalars the workspace's launches use (bound per-call tensors by
+                # default, where the workspace tensors stay unwritten)
+                getattr(trial, name).copy_(symm_buffer._scalar_tensor(name))
         trial.note_staged_tokens(num_tokens)
         barrier()
         for _ in range(warmup_iters):

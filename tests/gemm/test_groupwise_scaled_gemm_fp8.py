@@ -29,11 +29,14 @@ from flashinfer.gemm import (
     group_gemm_fp8_nt_groupwise_contiguous,
 )
 from flashinfer.gemm import is_cuda_tile_available
-from flashinfer.cute_dsl import is_cute_dsl_available
+from flashinfer.cute_dsl import is_cute_dsl_available, is_rubin_cute_dsl_available
 from flashinfer.testing.utils import dequantize_fp8, quantize_fp8
 from flashinfer.utils import get_compute_capability
 
-pytestmark = pytest.mark.solo
+# Peak host RSS 124-200 GiB in 9 of 35 flashinfer-ci nightly runs (2026-10),
+# from JIT-building the blockscale GEMM module when no earlier file in the job
+# built it; 2-4 GiB otherwise.
+pytestmark = pytest.mark.node_exclusive
 
 # Representative cuTile subset: every shape is a fresh tileiras JIT.
 _CUTILE_GEMM_SHAPES = {
@@ -96,7 +99,7 @@ def test_fp8_blockscale_gemm(
 @pytest.mark.parametrize("n", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("k", [128, 256, 512, 4096, 8192])
 @pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
-@pytest.mark.parametrize("backend", ["cutlass", "trtllm", "cutile"])
+@pytest.mark.parametrize("backend", ["cutlass", "trtllm", "cutile", "cute-dsl"])
 def test_fp8_groupwise_gemm(
     m,
     n,
@@ -115,6 +118,11 @@ def test_fp8_groupwise_gemm(
             pytest.skip("trtllm only supports MN scale_major_mode")
         if k < 256:
             pytest.skip("k < 256")
+    if backend == "cute-dsl":
+        if not is_rubin_cute_dsl_available():
+            pytest.skip("cute-dsl (SM107) requires CuTe DSL >= 4.8")
+        if scale_major_mode != "MN":
+            pytest.skip("cute-dsl (SM107) only supports MN scale_major_mode")
     if backend == "cutile":
         if scale_major_mode != "K":
             pytest.skip(
@@ -162,6 +170,99 @@ def test_fp8_groupwise_gemm(
         backend=backend,
     )
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "m,n,k", [(4, 896, 5120), (32, 8192, 28672), (512, 8192, 28672), (300, 1280, 8192)]
+)
+def test_fp8_groupwise_gemm_cute_dsl_sm107_tactics(m, n, k):
+    """Every SM107 cute-dsl tactic (1/2-CTA x split-K over the batch mode) on large-K shapes."""
+    if not torch.cuda.is_available():
+        pytest.skip("gemm_fp8_nt_groupwise requires CUDA")
+    major, minor = get_compute_capability(torch.device("cuda"))
+    if not gemm_fp8_nt_groupwise.is_backend_supported("cute-dsl", major * 10 + minor):
+        pytest.skip("cute-dsl gemm_fp8_nt_groupwise is SM107-only")
+    if not is_rubin_cute_dsl_available():
+        pytest.skip("cute-dsl (SM107) requires CuTe DSL >= 4.8")
+    from flashinfer.gemm.kernels.gemm_fp8_groupwise_sm107 import (
+        gemm_fp8_nt_groupwise_sm107,
+        valid_tactics,
+    )
+
+    torch.random.manual_seed(0)
+    a_val = torch.randn((m, k), dtype=torch.float, device="cuda")
+    b_val = torch.randn((n, k), dtype=torch.float, device="cuda") / math.sqrt(k)
+    a_fp8, a_scale = quantize_fp8(a_val, (k // 128, m), (1, 128), "MN")
+    b_fp8, b_scale = quantize_fp8(b_val, (k // 128, n // 128), (128, 128), "MN")
+    ref_c = einsum(
+        dequantize_fp8(a_fp8, a_scale, "MN"),
+        dequantize_fp8(b_fp8, b_scale, "MN"),
+        "m k, n k -> m n",
+    ).to(torch.bfloat16)
+    tactics = valid_tactics(m, n, k)
+    assert any(t.split_k > 1 for t in tactics)
+    for tactic in tactics:
+        c = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+        gemm_fp8_nt_groupwise_sm107(a_fp8, b_fp8, a_scale, b_scale, c, tactic)
+        torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2, msg=str(tactic))
+
+
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (16, 7168, 4608),  # M <= 32, split-K < 4: cutlass on SM107
+        (16, 1024, 7168),  # M <= 32, split-K 8: cute-dsl on SM107
+        (16, 2560, 16384),  # M <= 32, long K: cute-dsl on SM107
+        (16, 7168, 512),  # M <= 32, short K: cute-dsl on SM107
+        (48, 7168, 2304),  # M > 32: cute-dsl on SM107
+        (128, 256, 256),  # small problem, M > 32: cute-dsl on SM107
+    ],
+)
+@pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
+def test_fp8_groupwise_gemm_auto(m, n, k, scale_major_mode):
+    """backend="auto" is correct and picks cute-dsl only where the SM107 rule says."""
+    if not torch.cuda.is_available():
+        pytest.skip("gemm_fp8_nt_groupwise requires CUDA")
+    major, minor = get_compute_capability(torch.device("cuda"))
+    cc = major * 10 + minor
+    if not gemm_fp8_nt_groupwise.is_backend_supported("cutlass", cc):
+        pytest.skip(f"gemm_fp8_nt_groupwise has no cutlass backend on SM{cc}")
+    from flashinfer.gemm.gemm_base import _sm107_groupwise_prefers_cute_dsl
+
+    torch.random.manual_seed(0)
+    a_val = torch.randn((m, k), dtype=torch.float, device="cuda")
+    b_val = torch.randn((n, k), dtype=torch.float, device="cuda") / math.sqrt(k)
+    if scale_major_mode == "K":
+        a_scale_shape, b_scale_shape = (m, k // 128), (n // 128, k // 128)
+    else:
+        a_scale_shape, b_scale_shape = (k // 128, m), (k // 128, n // 128)
+    a_fp8, a_scale = quantize_fp8(a_val, a_scale_shape, (1, 128), scale_major_mode)
+    b_fp8, b_scale = quantize_fp8(b_val, b_scale_shape, (128, 128), scale_major_mode)
+    ref_c = einsum(
+        dequantize_fp8(a_fp8, a_scale, scale_major_mode),
+        dequantize_fp8(b_fp8, b_scale, scale_major_mode),
+        "m k, n k -> m n",
+    ).to(torch.bfloat16)
+
+    c = gemm_fp8_nt_groupwise(
+        a_fp8,
+        b_fp8,
+        a_scale,
+        b_scale,
+        scale_major_mode,
+        out_dtype=torch.bfloat16,
+        backend="auto",
+    )
+    torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
+
+    expect_cute_dsl = (
+        cc == 107
+        and is_rubin_cute_dsl_available()
+        and scale_major_mode == "MN"
+        and _sm107_groupwise_prefers_cute_dsl(m, n, k, torch.device("cuda"))
+    )
+    picked = gemm_fp8_nt_groupwise.suitable_auto_backends[0]
+    assert picked == ("cute-dsl" if expect_cute_dsl else "cutlass")
 
 
 @pytest.mark.parametrize("m", [1, 4, 16, 32])
