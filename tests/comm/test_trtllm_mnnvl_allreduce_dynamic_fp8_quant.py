@@ -8,7 +8,10 @@ from mpi4py import MPI
 
 import flashinfer.comm as comm
 from flashinfer.comm.mnnvl import TorchDistBackend
-from tests.test_helpers.comm import init_torch_distributed_from_mpi
+from tests.test_helpers.comm import (
+    get_world_size_from_env,
+    init_torch_distributed_from_mpi,
+)
 
 
 FP8_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
@@ -98,11 +101,12 @@ def test_mnnvl_allreduce_dynamic_fp8_quant(
         pytest.skip("requires CUDA")
 
     _prefer_mpi_launcher_env()
-    init_torch_distributed_from_mpi()
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    world_size = get_world_size_from_env()
     if world_size < 2:
         pytest.skip(f"requires at least 2 ranks, got {world_size}")
+
+    init_torch_distributed_from_mpi()
+    rank = dist.get_rank()
 
     local_rank = rank % torch.cuda.device_count()
     torch.cuda.set_device(local_rank)
@@ -187,11 +191,12 @@ def test_mnnvl_allreduce_dynamic_fp8_cuda_graph_replay(use_oneshot: bool) -> Non
         pytest.skip("requires CUDA")
 
     _prefer_mpi_launcher_env()
-    init_torch_distributed_from_mpi()
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    world_size = get_world_size_from_env()
     if world_size < 2:
         pytest.skip(f"requires at least 2 ranks, got {world_size}")
+
+    init_torch_distributed_from_mpi()
+    rank = dist.get_rank()
 
     local_rank = rank % torch.cuda.device_count()
     torch.cuda.set_device(local_rank)
