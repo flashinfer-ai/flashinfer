@@ -41,6 +41,7 @@ from ...helpers.constants import (
 
 from ...helpers.layout import (
     _TASK_CACHE_LANE_IDX,
+    _TASK_CACHE_PARTIAL_IDX,
     _TASK_CACHE_TMEM_BASE_OFFSET,
     _TASK_CACHE_WARP_GRP_THREAD_IDX,
     _TASK_CACHE_WARP_IDX,
@@ -78,6 +79,7 @@ from ...helpers.ops import (
     vector_from_scalars,
 )
 from ...helpers.query import (
+    balanced_split_o_element_offset,
     flat_query_row_state,
     public_query_flat_row,
     split_o_element_offset,
@@ -387,7 +389,7 @@ class TmemCorrResource(MlaResource):
         batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
         head_base_idx = head_idx_for_stage(self.head_idx, cfg, stage_info)
         cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
-        cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)
+        cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info, task_cache, cfg)
         warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
         warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
         lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
@@ -430,7 +432,37 @@ class TmemCorrResource(MlaResource):
                         smem_src.load(count=4, alignment=16),
                     )
                 elif valid_output_row:
-                    if cutlass.const_expr(self.acc_o_tensor is not None):
+                    if cutlass.const_expr(cfg.use_balanced_scheduler):
+                        write_partial = Int32(
+                            task_cache[_TASK_CACHE_PARTIAL_IDX]
+                        ) >= Int32(0)
+                        base_elem_offset = Int64(0)
+                        base_ptr = Int64(0)
+                        if write_partial:
+                            base_elem_offset = balanced_split_o_element_offset(
+                                cfg,
+                                cta_idx_q,
+                                global_head_idx,
+                                cta_idx_kv,
+                                head_dim_offset
+                                + Int32(v_stage_idx * cfg.head_dim_per_stage_v),
+                            )
+                            base_ptr = self.acc_o_tensor.iterator.raw_ptr().toint(Int64)
+                        else:
+                            output_query_row = public_query_flat_row(
+                                cfg,
+                                storage_flat_query_row,
+                                batch_idx,
+                                self.cu_seqlens_q,
+                            )
+                            base_elem_offset = (
+                                Int64(output_query_row) * Int64(cfg.head_dim_v)
+                                + Int64(head_dim_offset)
+                                + Int64(v_stage_idx * cfg.head_dim_per_stage_v)
+                            )
+                            base_ptr = self.o_tensor.iterator.raw_ptr().toint(Int64)
+                        element_bytes = cfg.partial_o_dtype_bytes
+                    elif cutlass.const_expr(self.acc_o_tensor is not None):
                         base_elem_offset = split_o_element_offset(
                             cfg,
                             batch_idx,
@@ -479,7 +511,9 @@ class TmemCorrResource(MlaResource):
         batch_idx = batch_idx_for_stage_cfg(self.batch_idx, self.cfg, stage_info)
         head_base_idx = head_idx_for_stage(self.head_idx, self.cfg, stage_info)
         cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
-        cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)
+        cta_idx_kv = cta_idx_kv_for_stage(
+            self.cta_idx_kv, stage_info, task_cache, self.cfg
+        )
         cta_idx_head_dim_v = cta_idx_head_dim_v_for_stage(
             self.cta_idx_head_dim_v, stage_info
         )
@@ -532,6 +566,31 @@ class TmemCorrResource(MlaResource):
                     self._store_partial_lse_to_cluster_smem(
                         local_row_idx, cta_idx_kv, lse_val
                     )
+                elif cutlass.const_expr(self.cfg.use_balanced_scheduler):
+                    if valid_output_row and cta_idx_head_dim_v == Int32(0):
+                        if Int32(task_cache[_TASK_CACHE_PARTIAL_IDX]) >= Int32(0):
+                            elem_offset = (
+                                cta_idx_q
+                                * Int32(
+                                    self.cfg.num_heads_q
+                                    * self.cfg.balanced_partial_capacity
+                                )
+                                + head_idx * Int32(self.cfg.balanced_partial_capacity)
+                                + cta_idx_kv
+                            )
+                            (
+                                self.acc_lse_tensor.iterator.raw_ptr() + elem_offset
+                            ).store(lse_val)
+                        else:
+                            elem_offset = public_query_flat_row(
+                                self.cfg,
+                                storage_flat_query_row,
+                                batch_idx,
+                                self.cu_seqlens_q,
+                            )
+                            (self.lse_tensor.iterator.raw_ptr() + elem_offset).store(
+                                lse_val
+                            )
                 elif cutlass.const_expr(self.acc_lse_tensor is not None):
                     if valid_output_row and cta_idx_head_dim_v == Int32(0):
                         split_kv = Int32(self.cfg.num_ctas_per_seq_kv)
@@ -679,7 +738,9 @@ class TmemCorrResource(MlaResource):
             batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
             head_base_idx = head_idx_for_stage(self.head_idx, cfg, stage_info)
             cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
-            cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)
+            cta_idx_kv = cta_idx_kv_for_stage(
+                self.cta_idx_kv, stage_info, task_cache, cfg
+            )
             cta_idx_head_dim_v = cta_idx_head_dim_v_for_stage(
                 self.cta_idx_head_dim_v, stage_info
             )
@@ -1366,7 +1427,7 @@ class TmemCorrResource(MlaResource):
         batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
         head_base_idx = head_idx_for_stage(self.head_idx, cfg, stage_info)
         cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
-        cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)
+        cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info, task_cache, cfg)
         warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
         lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
         # Keeps-MMA-AB stores one head row per half-warp.  The low 16 lanes own
@@ -1447,7 +1508,34 @@ class TmemCorrResource(MlaResource):
                 + Int32(chunk_idx)
             )
             if global_head_idx < Int32(cfg.num_heads_q) and valid_output_row:
-                if cutlass.const_expr(self.acc_o_tensor is not None):
+                if cutlass.const_expr(cfg.use_balanced_scheduler):
+                    write_partial = Int32(task_cache[_TASK_CACHE_PARTIAL_IDX]) >= Int32(
+                        0
+                    )
+                    base_elem_offset = Int64(0)
+                    base_ptr = Int64(0)
+                    if write_partial:
+                        base_elem_offset = balanced_split_o_element_offset(
+                            cfg,
+                            cta_idx_q,
+                            global_head_idx,
+                            cta_idx_kv,
+                            store_col_offset,
+                        )
+                        base_ptr = self.acc_o_tensor.iterator.raw_ptr().toint(Int64)
+                    else:
+                        output_query_row = public_query_flat_row(
+                            cfg,
+                            storage_flat_query_row,
+                            batch_idx,
+                            self.cu_seqlens_q,
+                        )
+                        base_elem_offset = Int64(output_query_row) * Int64(
+                            cfg.head_dim_v
+                        ) + Int64(store_col_offset)
+                        base_ptr = self.o_tensor.iterator.raw_ptr().toint(Int64)
+                    element_bytes = cfg.partial_o_dtype_bytes
+                elif cutlass.const_expr(self.acc_o_tensor is not None):
                     base_elem_offset = split_o_element_offset(
                         cfg,
                         batch_idx,

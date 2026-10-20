@@ -21,6 +21,46 @@ import cutlass.cute as cute
 from cutlass import Int32, Int64
 
 
+def groups_tokens_heads_q_capacity(logical_num_heads_q: int, tile_size_q: int) -> int:
+    """Return logical Q tokens grouped into one physical query tile."""
+
+    if logical_num_heads_q <= 0:
+        raise ValueError("logical_num_heads_q must be positive")
+    if tile_size_q <= 0:
+        raise ValueError("tile_size_q must be positive")
+    return max(1, tile_size_q // logical_num_heads_q)
+
+
+def groups_tokens_heads_q_group_count(
+    logical_seq_len_q: int, groups_tokens_heads_q_ratio: int
+) -> int:
+    """Return the ceil-divided number of grouped query tiles."""
+
+    if logical_seq_len_q <= 0:
+        raise ValueError("logical_seq_len_q must be positive")
+    if groups_tokens_heads_q_ratio <= 0:
+        raise ValueError("groups_tokens_heads_q_ratio must be positive")
+    return (
+        logical_seq_len_q + groups_tokens_heads_q_ratio - 1
+    ) // groups_tokens_heads_q_ratio
+
+
+@cute.jit
+def runtime_query_group_has_rows(
+    effective_seq_group_idx,
+    groups_tokens_heads_q_ratio: cutlass.Constexpr[int],
+    logical_seq_len_q: cutlass.Constexpr[int],
+    cu_seqlens_q=None,
+    batch_idx=None,
+):
+    """Return whether a grouped query tile contains a runtime query row."""
+
+    _, query_len = query_batch_bounds(cu_seqlens_q, batch_idx, logical_seq_len_q)
+    return (
+        Int32(effective_seq_group_idx) * Int32(groups_tokens_heads_q_ratio) < query_len
+    )
+
+
 @dataclass(frozen=True)
 class FlatQueryTileLayout:
     """Host-side layout for consecutive ``(query, head)`` rows.
@@ -236,3 +276,76 @@ def split_o_element_offset(
         * Int64(cfg.num_ctas_per_seq_kv)
         + Int64(split_idx)
     ) * Int64(cfg.head_dim_v) + Int64(dim_idx)
+
+
+@cute.jit
+def balanced_split_o_element_offset(
+    cfg,
+    q_idx,
+    head_idx,
+    partial_idx,
+    dim_idx,
+):
+    """Return the descriptor-major compact balanced partial-O offset."""
+
+    capacity = Int64(cfg.balanced_partial_capacity)
+    return (
+        Int64(q_idx) * Int64(cfg.num_heads_q) * capacity * Int64(cfg.head_dim_v)
+        + Int64(head_idx) * capacity * Int64(cfg.head_dim_v)
+        + Int64(partial_idx) * Int64(cfg.head_dim_v)
+        + Int64(dim_idx)
+    )
+
+
+@cute.jit
+def groups_tokens_heads_q_row_state(
+    effective_head_idx,
+    effective_seq_group_idx,
+    groups_tokens_heads_q_ratio: cutlass.Constexpr[int],
+    logical_num_heads_q: cutlass.Constexpr[int],
+    logical_seq_len_q: cutlass.Constexpr[int],
+    cu_seqlens_q=None,
+    batch_idx=None,
+):
+    """Map one effective groups_tokens_heads_q row to logical and storage coordinates.
+
+    Returns ``(storage_flat_row, logical_head, safe_local_q, storage_q,
+    is_valid)``.  In variable-length mode, storage coordinates include the
+    cumulative batch offset while causal coordinates stay batch-local.  The
+    local Q index is clamped to the final real query row so padded rows can
+    safely participate in K scheduling and synchronization.  ``is_valid``
+    predicates public and GMEM-partial output stores.  cluster-local staging may
+    retain padded rows so all participants synchronize uniformly.
+    """
+
+    effective_num_heads_q = Int32(logical_num_heads_q * groups_tokens_heads_q_ratio)
+    local_flat_query_row = Int32(
+        effective_seq_group_idx
+    ) * effective_num_heads_q + Int32(effective_head_idx)
+    logical_q_idx = local_flat_query_row // Int32(logical_num_heads_q)
+    logical_head_idx = local_flat_query_row - logical_q_idx * Int32(logical_num_heads_q)
+    q_start, q_len = query_batch_bounds(
+        cu_seqlens_q,
+        batch_idx,
+        logical_seq_len_q,
+    )
+    # Keep invalid padded rows on a valid local coordinate for control-flow
+    # and synchronization.  Their GMEM loads/stores are independently made
+    # OOB/predicated by the resource that owns the transaction.
+    safe_q_len = cute.math.max(q_len, Int32(1))
+    safe_logical_q_idx = cute.math.min(
+        logical_q_idx,
+        safe_q_len - Int32(1),
+    )
+    storage_q_idx = q_start + safe_logical_q_idx
+    storage_flat_query_row = (
+        storage_q_idx * Int32(logical_num_heads_q) + logical_head_idx
+    )
+    is_valid = logical_q_idx < q_len
+    return (
+        storage_flat_query_row,
+        logical_head_idx,
+        safe_logical_q_idx,
+        storage_q_idx,
+        is_valid,
+    )

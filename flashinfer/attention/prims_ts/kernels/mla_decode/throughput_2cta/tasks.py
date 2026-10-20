@@ -202,6 +202,50 @@ class MlaTask(Task):
 
         params = self.work_queue.tile_sched_params
 
+        if cutlass.const_expr(self.work_queue.use_balanced_scheduler):
+            cluster_width = cutlass.Int32(params.cluster_shape_mnk[0])
+            partition_idx = cute.arch.block_idx()[0] // cluster_width
+            descriptor_idx = cutlass.Int32(
+                self.work_queue.balanced_partition_offsets[partition_idx]
+            )
+            descriptor_end = cutlass.Int32(
+                self.work_queue.balanced_partition_offsets[partition_idx + 1]
+            )
+            work_tile = self.work_queue._work_tile_from_balanced_descriptor(
+                descriptor_idx,
+                cutlass.Int32(0),
+                descriptor_idx < descriptor_end,
+            )
+            self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
+            self._run_pre_work_loop_entries(work_tile, **task_context_kwargs(context))
+            while descriptor_idx < descriptor_end:
+                seq_q_idx = cutlass.Int32(0)
+                while seq_q_idx < params.problem_shape_s:
+                    work_tile.update_from(
+                        self.work_queue._work_tile_from_balanced_descriptor(
+                            descriptor_idx,
+                            seq_q_idx,
+                            cutlass.Boolean(True),
+                        )
+                    )
+                    self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
+                    if work_tile.k_tile_count > cutlass.Int32(0):
+                        self._run_one_mla_work_tile(work_tile, context)
+                    seq_q_idx += cutlass.Int32(1)
+                descriptor_idx += cutlass.Int32(1)
+                self.dummy = True
+            work_tile.update_from(
+                self.work_queue._work_tile_from_balanced_descriptor(
+                    descriptor_idx,
+                    cutlass.Int32(0),
+                    cutlass.Boolean(False),
+                )
+            )
+            self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
+            self._run_post_work_loop_entries(work_tile, **task_context_kwargs(context))
+            self._drain_mla_work_tile_tails()
+            return
+
         if cutlass.const_expr(not params.is_persistent):
             work_tile = self.work_queue._work_tile_from_block_idx(cute.arch.block_idx())
             self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
@@ -362,23 +406,32 @@ def create_load_tma_task(
 
     def load_tma_body(page_offset_window, smem_q, smem_kv, cached_page_state):
         """Load Q once and load K/V tiles with the K-before-V cadence."""
-        cached_k_pages, cached_v_pages, cached_next_v_pages, cached_window_page = (
-            cached_page_state
-        )
+        (
+            cached_k_pages,
+            cached_v_pages,
+            cached_next_v_pages,
+            cached_window_page,
+            prefetched_window_page,
+        ) = cached_page_state
 
         # HEAD: Q is independent of page IDs.  Enqueue it before the TMA warp
         # refreshes its first coalesced 32-entry page-table window.
         smem_q.acquire()
         smem_q.tma_load()
         smem_q.commit()
-        cached_k_pages, cached_v_pages, cached_next_v_pages, cached_window_page = (
-            page_offset_window.read_page_offset_window(
-                cached_k_pages=cached_k_pages,
-                cached_v_pages=cached_v_pages,
-                cached_next_v_pages=cached_next_v_pages,
-                cached_window_page=cached_window_page,
-                init_v_cache=True,
-            )
+        (
+            cached_k_pages,
+            cached_v_pages,
+            cached_next_v_pages,
+            cached_window_page,
+            prefetched_window_page,
+        ) = page_offset_window.read_page_offset_window(
+            cached_k_pages=cached_k_pages,
+            cached_v_pages=cached_v_pages,
+            cached_next_v_pages=cached_next_v_pages,
+            cached_window_page=cached_window_page,
+            prefetched_window_page=prefetched_window_page,
+            init_v_cache=True,
         )
         staged_kv_tma_load(
             smem_kv,
@@ -391,13 +444,18 @@ def create_load_tma_task(
 
         with domain_loop(loop_start, loop_end, loop_step):
             # LOOP: cache K[n]/V[n] offsets, load K[n], then deferred V[n-1].
-            cached_k_pages, cached_v_pages, cached_next_v_pages, cached_window_page = (
-                page_offset_window.read_page_offset_window(
-                    cached_k_pages=cached_k_pages,
-                    cached_v_pages=cached_v_pages,
-                    cached_next_v_pages=cached_next_v_pages,
-                    cached_window_page=cached_window_page,
-                )
+            (
+                cached_k_pages,
+                cached_v_pages,
+                cached_next_v_pages,
+                cached_window_page,
+                prefetched_window_page,
+            ) = page_offset_window.read_page_offset_window(
+                cached_k_pages=cached_k_pages,
+                cached_v_pages=cached_v_pages,
+                cached_next_v_pages=cached_next_v_pages,
+                cached_window_page=cached_window_page,
+                prefetched_window_page=prefetched_window_page,
             )
             # K sub-tiles then deferred V sub-tiles, each with its own local
             # sub-tile index; ``is_v`` tells the loader which path to take.

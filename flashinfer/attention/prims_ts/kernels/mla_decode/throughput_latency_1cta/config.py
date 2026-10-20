@@ -138,6 +138,9 @@ class MlaConfig:
     num_ctas_for_all_heads: int = 1
     num_ctas_per_head_dim: int = 1
     head_dim_per_cta_v: int = 512
+    use_balanced_scheduler: bool = False
+    balanced_descriptor_capacity: int = 0
+    balanced_partial_capacity: int = 0
     head_dim_per_stage_kv: int = 128
     head_dim_per_stage_v: int = 128
     num_tokens_per_page: int = 32
@@ -667,18 +670,27 @@ def correction_register_budget(tile_size_q: int) -> int:
     return MlaConfig.correction_regs
 
 
-def keeps_mma_ab_config_kwargs(profile: MlaProfile, qkv_dtype: str) -> dict[str, int]:
+def keeps_mma_ab_config_kwargs(
+    profile: MlaProfile,
+    qkv_dtype: str,
+    *,
+    use_balanced_scheduler: bool = False,
+) -> dict[str, int]:
     """Return keeps-MMA-AB scheduler, pipeline, and register traits."""
 
     kv_stages = MlaConfig.kv_stages
     q_stages = 1
     if qkv_dtype == "e4m3":
         kv_stages = 8
-        q_stages = MlaConfig.q_stages
+        q_stages = 1 if use_balanced_scheduler else MlaConfig.q_stages
 
     use_persistent_scheduler = profile.use_persistent_scheduler
     use_clc_dynamic_persistent_scheduler = profile.use_clc_dynamic_persistent_scheduler
-    if profile.use_multi_ctas_kv == 1:
+    if profile.use_multi_ctas_kv == 1 and not use_balanced_scheduler:
+        # Ordinary keeps-MMA-AB multi-CTA profiles use the rectangular launch
+        # and standalone reducer. Balanced profiles instead require their
+        # descriptor-backed persistent queue even though they also publish
+        # split partials.
         use_persistent_scheduler = 0
         use_clc_dynamic_persistent_scheduler = 0
 
@@ -1448,6 +1460,9 @@ def make_throughput_latency_mla_config(
     explicit_split_kv: int | None = None,
     explicit_persistent: bool | None = None,
     mask_type: MaskType | str = MaskType.CAUSAL,
+    use_balanced_scheduler: bool = False,
+    balanced_descriptor_capacity: int = 0,
+    balanced_partial_capacity: int = 0,
 ) -> MlaConfig:
     """Return throughput-latency 1CTA MLA traits for a concrete profile."""
 
@@ -1507,6 +1522,19 @@ def make_throughput_latency_mla_config(
     elif isinstance(profile, str):
         tile_size_q = tile_size_q_from_profile_name(profile)
     max_active_clusters = validate_max_active_clusters(max_active_clusters)
+    if use_balanced_scheduler:
+        if balanced_descriptor_capacity <= 0:
+            raise ValueError(
+                "balanced_descriptor_capacity must be positive for balanced scheduling"
+            )
+        if balanced_partial_capacity <= 0:
+            raise ValueError(
+                "balanced_partial_capacity must be positive for balanced scheduling"
+            )
+        if reduction_mode == "cluster":
+            raise ValueError("balanced 1CTA MLA does not support cluster reduction")
+        if o_dtype != "bf16":
+            raise ValueError("balanced 1CTA MLA requires BF16 output storage")
 
     head_dim_qk = latent_dim + rope_dim
     selected_profile = resolve_throughput_latency_mla_profile(
@@ -1528,6 +1556,24 @@ def make_throughput_latency_mla_config(
         selected_profile,
         explicit_persistent,
     )
+    if use_balanced_scheduler:
+        # Retain the selected Q/V decomposition and task graph, but replace its
+        # rectangular split policy with the descriptor-backed persistent queue.
+        # A non-unit split value keeps the established partial-output path
+        # enabled; descriptor ranges, rather than this value, own the K domain.
+        balanced_split_capacity = min(
+            127,
+            max_active_clusters,
+            max(1, ceil(seq_len_kv / MlaConfig.tile_size_kv)),
+        )
+        selected_profile = replace(
+            selected_profile,
+            num_ctas_per_seq_kv=balanced_split_capacity,
+            use_persistent_scheduler=1,
+            use_clc_dynamic_persistent_scheduler=0,
+            use_multi_ctas_kv=1,
+            use_cluster_reduction=0,
+        )
     tile_size_q = tile_size_q_for_profile(
         selected_profile, num_heads_q, seq_len_q, tile_size_q
     )
@@ -1624,10 +1670,19 @@ def make_throughput_latency_mla_config(
             selected_profile.use_clc_dynamic_persistent_scheduler
         ),
         persistent_wave_sm_count=persistent_wave_sm_count,
+        use_balanced_scheduler=use_balanced_scheduler,
+        balanced_descriptor_capacity=balanced_descriptor_capacity,
+        balanced_partial_capacity=balanced_partial_capacity,
     )
     config_kwargs.update(dtype_config_kwargs(qkv_dtype, o_dtype))
     if selected_profile.kernel_variant == "keeps_mma_ab":
-        config_kwargs.update(keeps_mma_ab_config_kwargs(selected_profile, qkv_dtype))
+        config_kwargs.update(
+            keeps_mma_ab_config_kwargs(
+                selected_profile,
+                qkv_dtype,
+                use_balanced_scheduler=use_balanced_scheduler,
+            )
+        )
     cfg = MlaConfig(**config_kwargs)
     validate_explicit_cluster_reduction_config(cfg, reduction_mode=reduction_mode)
     cfg = resolve_auto_cluster_reduction_config(
