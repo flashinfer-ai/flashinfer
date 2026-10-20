@@ -9953,6 +9953,12 @@ def _trtllm_gemm_fp8_nt_groupwise_requirement(
         raise ValueError("scale_granularity_mnk must be (1, 128, 128) in TRTLLM")
     if a.shape[1] < 256:
         raise ValueError("a.shape[1] must be >= 256 in TRTLLM")
+    # The block-scaled FP8 trtllm-gen kernels use TileK=128 with
+    # UnrollLoop2xForMma, so K must be a multiple of 2 * TileK = 256.
+    if a.shape[1] % 256 != 0:
+        raise ValueError(
+            f"a.shape[1] must be a multiple of 256 in TRTLLM, got {a.shape[1]}"
+        )
 
     return True
 
