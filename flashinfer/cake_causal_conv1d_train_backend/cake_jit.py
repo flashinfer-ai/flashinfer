@@ -27,22 +27,36 @@ map.  What to compile -- sources, digests, nvcc flags -- is recorded once in
 and otherwise through FlashInfer's JIT from the same sources and flags,
 verifying every source digest before the first build.
 
-A route is the module record one public call launches: ``fwd`` (``y`` from
+A route lists every program one public call may launch: ``fwd`` (``y`` from
 ``x``, ``weight`` and ``cu_seqlens``) and ``bwd`` (``dx`` and the deterministic
-FP32 ``dweight`` in one cooperative launch).  Token and channel counts are
-runtime scalars, so a changed problem size never recompiles anything.
+FP32 ``dweight`` in one cooperative launch).  The forward launches its route in
+order.  The backward route of an architecture may carry several programs of
+the kernel and launches exactly one per call, chosen by the channel count: a
+record's ``select_rule`` (``channels_at_least``: ``C >= channels[arch]``)
+names the channel counts it owns, the record without a rule is the
+architecture's fallback, and :func:`selected_modules` applies that rule (a
+pure function of the architecture and ``C``; the host never reads the data).
+Token and channel counts are runtime scalars, so a changed problem size never
+recompiles anything; building every library of the architecture
+(:func:`specs_for_arch`) before a CUDA Graph capture keeps the JIT out of the
+capture.
 
 The host plan is the three functions :func:`plan` (the kernel scalars),
 :func:`launch_grid` (the grid) and :func:`partial_rows` (the backward
-workspace rows); everything else derives from them.
+workspace rows); everything else derives from them.  The public workspace is
+sized by the largest grid of the architecture's backward programs
+(:func:`workspace_record`, the capacity owner); each program writes and
+reduces the leading rows of its own grid.
 
 The program name ``cake_causal_conv1d_train_<20 hex>`` is the first twenty hex
 digits of the SHA-256 of the compact JSON ``{"build": <build keywords, sorted>,
 "module": <dotted kernel module>}`` of the kernel the program was rendered
 from; the forward is built with its kernel file's default keywords; the
 backward with ``vec=8`` (eight channels, 16-byte vectors, per thread) on
-sm_100a and sm_103a, and with ``vec=8, min_blocks=2`` (two CTAs per SM) on
-sm_107a.
+sm_100a and sm_103a, with ``vec=8, min_blocks=2`` (two CTAs per SM) on
+sm_107a, and the big-channel backward (the program the ``channels_at_least``
+rule selects) with ``vec=8, copy="tma2d", stage_tokens=8, min_blocks=2``
+(eight-token stages, two CTAs per SM).
 """
 
 from __future__ import annotations
@@ -319,6 +333,10 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
     (10, 7): "sm_107a",
 }
 KINDS = ("fwd", "bwd")
+# The selection-rule vocabulary of a backward record (``record["select_rule"]
+# ["kind"]``); a backward record without a rule is its route's fallback and a
+# forward record never carries one.
+SELECT_KINDS = ("channels_at_least",)
 # The convolution width: ``weight`` and ``dweight`` are ``[C, WIDTH]`` and tap
 # ``WIDTH - 1`` multiplies the current token.
 WIDTH = 4
@@ -370,7 +388,11 @@ def route_applies(*, device_capability: Sequence[int], kind: str) -> bool:
 
 
 def route_modules(arch: str, kind: str) -> tuple[str, ...]:
-    """Ordered module names of one route on ``arch`` (every program the route launches)."""
+    """Ordered module names of one route on ``arch`` (every program the route may launch).
+
+    The forward launches them all, in order; the backward launches the one
+    :func:`selected_modules` picks for the call's channel count.
+    """
 
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {KINDS}, got {kind!r}")
@@ -383,20 +405,117 @@ def route_modules(arch: str, kind: str) -> tuple[str, ...]:
     return tuple(names)
 
 
-def workspace_record(arch: str) -> dict[str, Any]:
-    """The backward module record that owns the ``partial`` workspace on ``arch``."""
+def select_rule(record: dict[str, Any]) -> dict[str, Any] | None:
+    """The selection rule of one module record, ``None`` when the record carries none.
 
-    owners = [
+    A backward record without a rule (no ``select_rule`` key, or ``None``) is
+    its route's fallback program.  ``{"kind": "channels_at_least", "channels":
+    {arch: C_min, ...}}`` owns the calls whose channel count is at least
+    ``channels[arch]`` on the architectures it names and never hits on the
+    others.  Forward records carry no rule.
+    """
+
+    return record.get("select_rule")
+
+
+def _admits(rule: dict[str, Any], *, arch: str, C: int) -> bool:
+    """Whether a selection rule owns ``C`` channels on ``arch`` (``ValueError`` for an unknown kind)."""
+
+    kind = rule["kind"]
+    if kind == "channels_at_least":
+        channels = rule["channels"]
+        return arch in channels and int(C) >= int(channels[arch])
+    raise ValueError(
+        f"unknown Cake causal conv1d training selection rule: {kind!r} "
+        f"(known: {SELECT_KINDS})"
+    )
+
+
+def selected_modules(
+    arch: str, kind: str, *, C: int, S: int | None = None
+) -> tuple[str, ...]:
+    """Ordered module names one public call launches on ``arch`` for ``C`` channels.
+
+    The forward launches every program of its route (:func:`route_modules`).
+    The backward route may carry several programs of the kernel and launches
+    exactly one: the record whose :func:`select_rule` admits ``C`` on ``arch``
+    when one does, else the route's single fallback record (the one without a
+    rule).  The choice is a pure function of the architecture and the channel
+    count -- ``S`` is accepted and unused, and the host never reads the data --
+    so a given ``(S, C, device)`` always runs the same program and ``dweight``
+    stays bitwise reproducible.  Several admitting records, or zero or several
+    fallbacks, are registry errors (``RuntimeError``); an unknown rule kind is
+    a ``ValueError``.
+    """
+
+    names = route_modules(arch, kind)
+    if kind == "fwd":
+        return names
+    positive: list[str] = []
+    fallback: list[str] = []
+    for name in names:
+        rule = select_rule(MODULES[name])
+        if rule is None:
+            fallback.append(name)
+        elif _admits(rule, arch=arch, C=C):
+            positive.append(name)
+    if len(positive) > 1:
+        raise RuntimeError(
+            f"the exported backward route on {arch} selects {len(positive)} programs "
+            f"for C={int(C)} ({positive}); expected at most one"
+        )
+    if positive:
+        return (positive[0],)
+    if len(fallback) != 1:
+        raise RuntimeError(
+            f"the exported backward route on {arch} declares {len(fallback)} fallback "
+            "programs (records without a select_rule); expected exactly one"
+        )
+    return (fallback[0],)
+
+
+def workspace_owners(arch: str) -> tuple[dict[str, Any], ...]:
+    """The backward module records of ``arch`` that own a ``partial`` workspace, in route order.
+
+    Every backward program declares a ``workspace_rule``; a route without one
+    is a registry error (``RuntimeError``).
+    """
+
+    owners = tuple(
         MODULES[name]
         for name in route_modules(arch, "bwd")
         if MODULES[name]["workspace_rule"] is not None
-    ]
-    if len(owners) != 1:
+    )
+    if not owners:
         raise RuntimeError(
-            f"the exported backward route on {arch} declares {len(owners)} workspace "
-            "owners; expected exactly one"
+            f"the exported backward route on {arch} declares no workspace owner; "
+            "expected at least one"
         )
-    return owners[0]
+    return owners
+
+
+def workspace_record(arch: str) -> dict[str, Any]:
+    """The capacity owner of the backward ``partial`` workspace on ``arch``.
+
+    The public workspace serves every backward program of the route
+    (:func:`workspace_owners`), each of which writes the leading rows of its
+    own grid.  The owners share one build geometry, so for every ``C`` their
+    rows, ``ceil(ctas_per_sm x SM count / n_ch_tiles)``, and bytes grow with
+    ``ctas_per_sm`` alone: the record with the largest ``ctas_per_sm`` (route
+    order breaks ties) bounds them all.  Owners of different geometries are a
+    registry error (``RuntimeError``).
+    """
+
+    owners = workspace_owners(arch)
+    geometries = {
+        tuple(sorted(owner["grid_rule"]["geometry"].items())) for owner in owners
+    }
+    if len(geometries) != 1:
+        raise RuntimeError(
+            f"the backward programs on {arch} declare {len(geometries)} build "
+            "geometries; one workspace serves them only when they share one"
+        )
+    return max(owners, key=lambda owner: int(owner["grid_rule"]["ctas_per_sm"]))
 
 
 def _ceil_div(numerator: int, denominator: int) -> int:
@@ -605,6 +724,7 @@ __all__ = [
     "LOGICAL_TENSORS",
     "MODULES",
     "ROUTES",
+    "SELECT_KINDS",
     "WIDTH",
     "arch_for_capability",
     "channel_split",
@@ -618,8 +738,11 @@ __all__ = [
     "route_applies",
     "route_modules",
     "run_module",
+    "select_rule",
+    "selected_modules",
     "sm_count",
     "specs_for_arch",
     "workspace_layout",
+    "workspace_owners",
     "workspace_record",
 ]

@@ -44,6 +44,17 @@ runtime scalars: they may change between calls, the host never reads
 launching, and the calls are CUDA Graph capturable once the libraries are
 built.
 
+An architecture's backward may ship several programs of the kernel; every
+call runs exactly one, chosen by ``C`` through a host-side rule of the
+backend's registry (never the data), so a given ``(S, C, device)`` always
+runs the same program.  The workspace size is the maximum over the
+architecture's backward programs, so one buffer of
+``cake_causal_conv1d_train_backward_workspace_bytes(S, C, device)`` serves
+whichever program ``C`` selects.  Before capturing a CUDA Graph, build every
+library of the device's architecture (the backend's
+``cake_jit.specs_for_arch``) so that no JIT build happens inside the capture;
+the captured graph holds the program selected for its shape.
+
 Usage::
 
     y = cake_causal_conv1d_train_forward(x, weight, cu_seqlens)

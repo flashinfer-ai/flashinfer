@@ -44,8 +44,9 @@ from .cake_jit import (
     route_applies,
     route_modules,
     run_module,
+    selected_modules,
     workspace_layout,
-    workspace_record,
+    workspace_owners,
 )
 
 SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
@@ -221,8 +222,8 @@ def _launch(
     """The kernel scalars and the grid of one launch of ``record`` (the host plan of ``cake_jit``).
 
     CTA ``b`` owns channel tile ``b % n_ch_tiles``, so every channel tile needs
-    a CTA of the device's grid: a ``C`` beyond ``grid x threads x vec``
-    channels is refused rather than left partly unwritten.
+    a CTA of the launched program's grid on the device: a ``C`` beyond ``grid
+    x threads x vec`` channels is refused rather than left partly unwritten.
     """
 
     scalars = plan(S, C, num_docs, geometry=record["grid_rule"]["geometry"])
@@ -241,9 +242,12 @@ def cake_causal_conv1d_train_backward_workspace_bytes(
     """Bytes of the caller-owned backward workspace for ``C`` channels on ``device``.
 
     The workspace holds the FP32 ``[rows, C, 4]`` ``dweight`` partials of the
-    cooperative backward, one row per ``n_ch_tiles`` CTAs of the device's
-    launch grid (``rows = ceil(grid / n_ch_tiles)``).  It depends on ``C`` and
-    the device only, so it is independent of ``S`` and one buffer serves every
+    cooperative backward, one row per ``n_ch_tiles`` CTAs of a program's
+    launch grid (``rows = ceil(grid / n_ch_tiles)``), sized by the largest
+    grid of the architecture's backward programs: the channel count selects
+    the program a call runs, and every program writes and reduces the leading
+    rows of its own grid inside this buffer.  It depends on ``C`` and the
+    device only, so it is independent of ``S`` and one buffer serves every
     token count; the kernel fully writes the rows it reduces, so the buffer
     needs no zeroing between launches or CUDA Graph replays.
     """
@@ -257,9 +261,11 @@ def cake_causal_conv1d_train_backward_workspace_bytes(
             f"C must be a positive multiple of {CHANNEL_MULTIPLE}, got {C}"
         )
     arch = _device_arch(device)
-    record = workspace_record(arch)
-    layout = workspace_layout(record, C, device_index=_device_index(device))
-    return int(layout["total_bytes"])
+    device_index = _device_index(device)
+    return max(
+        int(workspace_layout(owner, C, device_index=device_index)["total_bytes"])
+        for owner in workspace_owners(arch)
+    )
 
 
 def cake_causal_conv1d_train_backward_workspace(
@@ -385,6 +391,17 @@ def cake_causal_conv1d_train_backward(
     weight gradient, accumulated in a fixed order, so ``dweight`` is bitwise
     reproducible for a given ``(S, C, device)``.  ``S == 0`` returns the empty
     ``dx`` and a zero ``dweight`` without launching.
+
+    The architecture's backward route may ship several programs of the
+    kernel; a call runs exactly one, chosen by ``C`` through the registry's
+    host-side rule (``cake_jit.selected_modules``; the data is never read),
+    so a given ``(S, C, device)`` always runs the same program.  The
+    ``workspace`` is sized for every program of the route
+    (:func:`cake_causal_conv1d_train_backward_workspace_bytes`); the selected
+    program uses the leading rows of its own grid.  Build every library of
+    the device's architecture (``cake_jit.specs_for_arch``) before capturing
+    a CUDA Graph: the capture holds the program selected for its shape, and
+    no JIT build may happen inside it.
     """
 
     x = _require_tensor(x, "x")
@@ -403,7 +420,15 @@ def cake_causal_conv1d_train_backward(
     if S == 0:
         dw_out.zero_()
         return dx_out, dw_out
-    record = workspace_record(arch)
+    # The program is a pure function of the architecture and C (S never enters):
+    # its own grid sizes the partial rows this call writes inside the workspace.
+    names = selected_modules(arch, "bwd", C=C, S=S)
+    record = _loader.MODULES[names[0]]
+    if record["workspace_rule"] is None:
+        raise RuntimeError(
+            f"the backward program {names[0]} selected for C={C} on {arch} owns no "
+            "partial workspace"
+        )
     device_index = _device_index(device)
     scalars, grid_x = _launch(record, S, C, num_docs, device_index=device_index)
     if workspace is None:
@@ -420,7 +445,7 @@ def cake_causal_conv1d_train_backward(
         "partial": partial,
         **_scalars(scalars),
     }
-    for name in route_modules(arch, "bwd"):
+    for name in names:
         run_module(name, values, device_index=device_index)
     return dx_out, dw_out
 
