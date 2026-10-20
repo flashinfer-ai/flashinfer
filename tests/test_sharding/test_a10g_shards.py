@@ -63,6 +63,7 @@ def test_a10g_coverage_and_t4_scope(tmp_path):
             "norm",
             "quantization",
             "sampling",
+            "sampling_fuzz",
             "topk",
         ],
         "cli": ["cli_cmds", "cli_cmds_gpu"],
