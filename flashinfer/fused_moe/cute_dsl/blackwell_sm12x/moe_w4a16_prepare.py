@@ -170,6 +170,13 @@ def _process_nvfp4_packed_scales(
     *,
     scale_factor: float,
 ) -> torch.Tensor:
+    """De-interleave packed NVFP4 K/16 scales into per-block E4M3 bytes.
+
+    Column-shuffles the packed fp16 scale words to split the byte pairs, then
+    flushes subnormal scale decodes (values < 2 after the ``2**7`` fold) whose
+    shifted int16 view would otherwise alias a wrong E4M3 exponent pattern,
+    and returns the de-interleaved high-byte scales.
+    """
     packed_scales = packed_scales.to(torch.float16)
     packed_scales = packed_scales.view(-1, 4)[:, [0, 2, 1, 3]].view(
         packed_scales.size(0),
@@ -274,6 +281,7 @@ def _validate_e8m0_k32_scales(
 def _validate_e4m3_k32_scales(
     scales: torch.Tensor,
     *,
+    experts: int,
     rows: int,
     cols: int,
     name: str,
@@ -281,15 +289,16 @@ def _validate_e4m3_k32_scales(
     """Validate logical ModelOpt-style E4M3 K/32 expert scales."""
     if scales.ndim != 3:
         raise ValueError(
-            f"{name} must be [E, {int(rows)}, {int(cols) // 32}], "
-            f"got {tuple(scales.shape)}"
+            f"{name} must be [E, {int(rows)}, {int(cols) // 32}] for "
+            f"{int(experts)} experts, got {tuple(scales.shape)}"
         )
     if int(cols) % 32 != 0:
         raise ValueError(f"{name} requires K divisible by 32, got {int(cols)}")
-    expected = (int(scales.shape[0]), int(rows), int(cols) // 32)
+    expected = (int(experts), int(rows), int(cols) // 32)
     if tuple(scales.shape) != expected:
         raise ValueError(
-            f"{name} must have shape [E, {int(rows)}, {int(cols) // 32}], "
+            f"{name} must have shape [E, {int(rows)}, {int(cols) // 32}] for "
+            f"{int(experts)} experts (matching the weights), "
             f"got {tuple(scales.shape)}"
         )
     if scales.dtype != torch.float8_e4m3fn:
@@ -796,12 +805,14 @@ def prepare_w4a16_modelopt_e4m3_k32_weights(
 
     w13_scale = _validate_e4m3_k32_scales(
         w13_blockscale,
+        experts=num_experts,
         rows=w13_rows,
         cols=hidden_size,
         name="w13_blockscale",
     )
     w2_scale = _validate_e4m3_k32_scales(
         w2_blockscale,
+        experts=num_experts,
         rows=hidden_size,
         cols=intermediate_size,
         name="w2_blockscale",
@@ -1041,6 +1052,7 @@ __all__ = [
     "make_w4a16_packed_buffers",
     "prepare_w4a16_compressed_tensors_weights",
     "prepare_w4a16_fp4_e8m0_k32_weights",
+    "prepare_w4a16_modelopt_e4m3_k32_weights",
     "prepare_w4a16_modelopt_nvfp4_weights",
     "prepare_w4a16_packed_weights",
 ]

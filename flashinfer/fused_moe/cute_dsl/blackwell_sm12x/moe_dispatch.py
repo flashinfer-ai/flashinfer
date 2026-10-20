@@ -11,7 +11,7 @@ import hashlib
 import os
 import weakref
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -3830,6 +3830,13 @@ _Sm120Workspace = Union[
 # depends only on the counts, and EP callers pass expert_map per call.
 _WORKSPACE_CACHE: Dict[Tuple, _Sm120Workspace] = {}
 
+# Workspaces replaced by a capacity growth. A captured CUDA graph may still
+# reference the replaced buffers, so they are parked here instead of being
+# freed; releasing one mid-replay surfaces as cudaErrorIllegalAddress. The
+# list is FIFO-bounded and clear_sm120_moe_caches() releases everything.
+_RETIRED_WORKSPACES: List[_Sm120Workspace] = []
+_RETIRED_WORKSPACES_MAX = 8
+
 
 def clear_sm120_moe_caches() -> None:
     """Release every module-level SM12x MoE cache.
@@ -3837,6 +3844,7 @@ def clear_sm120_moe_caches() -> None:
     References held by callers are unaffected.
     """
     _WORKSPACE_CACHE.clear()
+    _RETIRED_WORKSPACES.clear()
     _WEIGHT_CACHE.clear()
     _W4A16_WEIGHT_CACHE.clear()
     _PADDED_SCALE_CACHE.clear()
@@ -4010,6 +4018,13 @@ def _get_cached_workspace(
         activation=activation,
     )
 
+    # A capacity growth replaces the cached workspace; a captured CUDA graph
+    # may still reference the replaced buffers, so park the old workspace in
+    # _RETIRED_WORKSPACES instead of dropping the last reference to it.
+    if cached is not None:
+        _RETIRED_WORKSPACES.append(cached)
+        if len(_RETIRED_WORKSPACES) > _RETIRED_WORKSPACES_MAX:
+            _RETIRED_WORKSPACES.pop(0)
     _WORKSPACE_CACHE[cache_key] = workspace
     return workspace
 

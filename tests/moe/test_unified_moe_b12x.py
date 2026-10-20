@@ -116,6 +116,41 @@ class TestB12xUnifiedValidation:
                 source_format=source_format,
             )
 
+    @pytest.mark.parametrize(
+        "source_format", ["modelopt_e4m3_k32", "e4m3_k32"]
+    )
+    def test_w4a16_e4m3_k32_rejects_expert_count_mismatch(self, source_format):
+        """The E4M3 K/32 validator must cross-check scales against the weights.
+
+        A self-referential expected-shape check validates the scales' expert
+        axis against itself and always passes, so a scales tensor whose expert
+        count disagrees with the packed weights -- the shape a mis-sharded EP
+        checkpoint produces -- would flow into the kernel and read wrong rows.
+        """
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare import (
+            prepare_w4a16_packed_weights,
+        )
+
+        # 2-expert geometry: w13 [E, 2*32, 64], w2 [E, 64, 32] (K divisible by 32).
+        w13_fp4 = torch.zeros(2, 64, 64, dtype=torch.uint8)
+        w13_scales = torch.zeros(3, 64, 2, dtype=torch.float8_e4m3fn)
+        w2_fp4 = torch.zeros(2, 64, 16, dtype=torch.uint8)
+        w2_scales = torch.zeros(2, 64, 1, dtype=torch.float8_e4m3fn)
+        globals_fp32 = torch.ones(2, dtype=torch.float32)
+        with pytest.raises(
+            ValueError, match=r"w13_blockscale must have shape \[E, 64, 2\] for 2 experts"
+        ):
+            prepare_w4a16_packed_weights(
+                w13_fp4,
+                w13_scales,
+                globals_fp32,
+                w2_fp4,
+                w2_scales,
+                globals_fp32,
+                activation="silu",
+                source_format=source_format,
+            )
+
     @staticmethod
     def _runner(config, runner_type=B12xNvfp4Runner):
         runner = runner_type.__new__(runner_type)
@@ -662,6 +697,39 @@ def _assert_b12x_accurate(actual, expected):
     assert passed, f"{percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
 
 
+def _quantize_w4a16_e4m3_k32(w_bf16):
+    """Quantize ``[E, R, K]`` bf16 weights to the ModelOpt E4M3 K/32 format.
+
+    Per-32-block scales are stored as E4M3 (block amax / 6) and packed E2M1
+    nibbles keep the kernel's convention (even element in the low nibble) --
+    the byte layout is identical to the NVFP4 K/16 format, only the scale
+    cadence differs. Returns ``(packed [E, R, K/2] uint8, logical
+    [E, R, K/32] float8_e4m3fn scales)``.
+    """
+    experts, rows, cols = w_bf16.shape
+    assert cols % 32 == 0
+    x = w_bf16.float().reshape(experts, rows, cols // 32, 32)
+    block_max = x.abs().amax(dim=-1, keepdim=True)
+    scales = (block_max / 6.0).to(torch.float8_e4m3fn).float()
+    scales = torch.where(scales == 0, torch.ones_like(scales), scales)
+    values = (x / scales).reshape(experts, rows, cols)
+    # Kernel-matching E2M1 rounding (breakpoints from _fp4_quantize_values).
+    mag = values.abs()
+    codes = torch.zeros(mag.shape, dtype=torch.uint8, device=w_bf16.device)
+    codes[(mag > 0.25) & (mag < 0.75)] = 1
+    codes[(mag >= 0.75) & (mag <= 1.25)] = 2
+    codes[(mag > 1.25) & (mag < 1.75)] = 3
+    codes[(mag >= 1.75) & (mag <= 2.5)] = 4
+    codes[(mag > 2.5) & (mag < 3.5)] = 5
+    codes[(mag >= 3.5) & (mag <= 5.0)] = 6
+    codes[mag > 5.0] = 7
+    codes = codes | ((values < 0).to(torch.uint8) << 3)
+    packed = codes.reshape(experts, rows, cols // 2, 2)
+    packed = packed[..., 0] | (packed[..., 1] << 4)
+    logical_scales = scales.reshape(experts, rows, cols // 32)
+    return packed.contiguous(), logical_scales.to(torch.float8_e4m3fn).contiguous()
+
+
 def _assert_b12x_case(
     *,
     quant: QuantConfig,
@@ -1150,6 +1218,60 @@ class TestUnifiedB12xConformance:
             )
 
         torch.testing.assert_close(outputs[0], outputs[1], rtol=0.05, atol=0.05)
+
+    @pytest.mark.parametrize(
+        "source_format", ["modelopt_e4m3_k32", "e4m3_k32"]
+    )
+    def test_w4a16_e4m3_k32_matches_bf16_reference(self, source_format):
+        """The native K/32 wrapper arm must reconstruct the bf16 MoE output.
+
+        Feeds the wrapper the production contract's tensors -- packed E2M1
+        weights, LOGICAL E4M3 K/32 scales, per-expert FP32 globals -- through
+        source_format="modelopt_e4m3_k32" and its "e4m3_k32" alias, then
+        compares against the same bf16 reference the NVFP4 conformance cases
+        use. Exercises the full native route: B12xMoEWrapper -> launch ->
+        prepare_w4a16_packed_weights -> the E4M3 K/32 prepare -> kernel.
+        """
+        from flashinfer.fused_moe import B12xMoEWrapper
+
+        tensors = _make_b12x_tensors(
+            activation="silu",
+            num_tokens=8,
+            hidden_size=256,
+            intermediate_size=512,
+            num_experts=8,
+            top_k=2,
+        )
+        w13_fp4, w13_scales = _quantize_w4a16_e4m3_k32(tensors["w1_weight_bf16"])
+        w2_fp4, w2_scales = _quantize_w4a16_e4m3_k32(tensors["w2_weight_bf16"])
+        wrapper = B12xMoEWrapper(
+            num_experts=8,
+            top_k=2,
+            hidden_size=256,
+            intermediate_size=512,
+            quant_mode="w4a16",
+            source_format=source_format,
+        )
+        actual = wrapper.run(
+            x=tensors["x_bf16"],
+            w1_weight=w13_fp4,
+            w1_weight_sf=w13_scales,
+            w1_alpha=tensors["w1_alpha"],
+            w2_weight=w2_fp4,
+            w2_weight_sf=w2_scales,
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+        )
+        expected = _b12x_reference(
+            tensors,
+            quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+            activation="silu",
+            intermediate_size=512,
+            num_experts=8,
+            top_k=2,
+        )
+        _assert_b12x_accurate(actual, expected)
 
     def test_w4a16_ep_partials_sum_to_full(self):
         """Contiguous-shard EP through the unified API: two fake ranks'
