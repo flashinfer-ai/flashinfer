@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -23,6 +25,21 @@ import flashinfer
 from flashinfer.jit import env as jit_env
 from flashinfer.jit.core import gen_jit_spec
 from flashinfer.utils import device_support_pdl
+
+
+def _skip_if_fused_norm_smem_exceeds_limit(hidden_size, dtype, device):
+    # Match FusedAddRMSNorm{,Quant} and GemmaFusedAddRMSNorm in norm.cuh:
+    # one FP32 row plus the warp-reduction scratch space. A 16384-wide row
+    # needs 65664 bytes, exceeding T4's 65536-byte opt-in per-block limit.
+    vec_size = math.gcd(16 // dtype.itemsize, hidden_size)
+    num_warps = (min(1024, hidden_size // vec_size) + 31) // 32
+    required = (hidden_size + ((num_warps + 3) // 4) * 4) * 4
+    limit = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    if required > limit:
+        pytest.skip(
+            f"Fused norm requires {required} bytes of shared memory per block, "
+            f"but this device supports {limit}"
+        )
 
 
 def llama_rms_norm(x, w, eps=1e-6):
@@ -48,12 +65,15 @@ def llama_rms_norm_quant(x, w, scale, quant_dtype, eps=1e-6):
     return x
 
 
-def layer_norm_quant(x, gamma, beta, scale, quant_dtype, eps=1e-6):
+def layer_norm_quant(x, gamma, beta, scale, quant_dtype, eps=1e-6, round_to_input=True):
     y = torch.nn.functional.layer_norm(
         x.float(), (x.shape[-1],), weight=gamma, bias=beta, eps=eps
     )
-    # Kernel rounds to input dtype before scaling; match it.
-    y = y.to(x.dtype).float() / scale
+    # The CUDA kernel rounds to input dtype before scaling; the CuTe-DSL
+    # kernel stays in fp32.
+    if round_to_input:
+        y = y.to(x.dtype)
+    y = y.float() / scale
     finfo = torch.finfo(quant_dtype)
     y = torch.clamp(y, finfo.min, finfo.max)
     return y.to(quant_dtype)
@@ -137,6 +157,58 @@ def test_norm(batch_size, hidden_size, dtype, specify_out, enable_pdl, contiguou
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("shape", [(5, 111), (5, 1024), (3, 5, 64), (3, 5, 256)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("padded", [False, True])
+@pytest.mark.parametrize("pattern", ["zero", "tiny", "sparse", "alternating", "large"])
+def test_rmsnorm_output_contract(shape, dtype, padded, pattern):
+    """Exercise finite edge inputs and caller-owned output storage on the public API."""
+    hidden = shape[-1]
+    storage_shape = (*shape[:-1], hidden + 16) if padded else shape
+    input_storage = torch.full(storage_shape, -23, dtype=dtype, device="cuda")
+    output_storage = torch.full_like(input_storage, -23)
+    x = input_storage[..., 8:-8] if padded else input_storage
+    out = output_storage[..., 8:-8] if padded else output_storage
+    columns = torch.arange(hidden, device="cuda")
+    signs = (columns % 2 * 2 - 1).to(dtype)
+    if pattern == "zero":
+        x.zero_()
+    elif pattern == "tiny":
+        x.copy_(signs * 2**-14)
+    elif pattern == "sparse":
+        x.zero_()
+        x[..., hidden // 2] = 2
+    elif pattern == "alternating":
+        x.copy_(signs)
+    else:
+        # Finite in the input dtype and FP32 reduction, but not an FP16 square.
+        magnitude = 2**14 if dtype == torch.float16 else 2**30
+        x.copy_(signs * magnitude)
+    weight = ((columns % 9 - 4).float() / 4).to(dtype)
+    input_before = input_storage.clone()
+    weight_before = weight.clone()
+    expected = llama_rms_norm(x, weight)
+    assert torch.isfinite(expected).all()
+    tolerance = 1e-3 if dtype == torch.float16 else 1e-2
+
+    previous = None
+    for poison in (float("nan"), 17.0):
+        out.fill_(poison)
+        returned = flashinfer.norm.rmsnorm(x, weight, out=out, enable_pdl=False)
+        torch.cuda.synchronize()
+        assert returned is out
+        assert torch.isfinite(out).all()
+        torch.testing.assert_close(out, expected, rtol=tolerance, atol=tolerance)
+        torch.testing.assert_close(input_storage, input_before, rtol=0, atol=0)
+        torch.testing.assert_close(weight, weight_before, rtol=0, atol=0)
+        if padded:
+            assert (output_storage[..., :8] == -23).all()
+            assert (output_storage[..., -8:] == -23).all()
+        if previous is not None:
+            torch.testing.assert_close(out, previous, rtol=0, atol=0)
+        previous = out.clone()
+
+
 @parametrize_product(
     {
         "batch_size": [1, 19, 99, 989],
@@ -209,6 +281,8 @@ def test_qknorm(
 @pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize("contiguous", [True, False])
 def test_fused_add_rmsnorm(batch_size, hidden_size, dtype, enable_pdl, contiguous):
+    _skip_if_fused_norm_smem_exceeds_limit(hidden_size, dtype, "cuda")
+
     eps = 1e-6
 
     if contiguous:
@@ -252,6 +326,8 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype, enable_pdl, contiguou
 def test_fused_add_rmsnorm_quant(
     batch_size, hidden_size, dtype, quant_dtype, quant_scale, enable_pdl, contiguous
 ):
+    _skip_if_fused_norm_smem_exceeds_limit(hidden_size, dtype, "cuda")
+
     eps = 1e-6
 
     if contiguous:
@@ -463,6 +539,8 @@ def test_gemma_norm(
 def test_gemma_fused_add_rmsnorm(
     batch_size, hidden_size, dtype, enable_pdl, contiguous
 ):
+    _skip_if_fused_norm_smem_exceeds_limit(hidden_size, dtype, "cuda")
+
     eps = 1e-6
 
     if contiguous:
@@ -511,7 +589,23 @@ def test_layernorm(batch_size, hidden_size, dtype):
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 4096, 8192, 16384])
 @pytest.mark.parametrize("quant_scale", [0.01, 1.0, 10.0])
 @pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
-def test_layernorm_quant(batch_size, hidden_size, quant_scale, quant_dtype):
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_layernorm_quant(
+    batch_size, hidden_size, quant_scale, quant_dtype, backend, monkeypatch
+):
+    if backend == "cuda":
+        monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    elif not hasattr(flashinfer.norm, "layernorm_quant_cute"):
+        pytest.skip("nvidia-cutlass-dsl not available")
+    elif not flashinfer.norm._cute_dsl_supports_arch(
+        *torch.cuda.get_device_capability()
+    ):
+        pytest.skip("CuTe DSL cannot target this compute capability")
+    else:
+        # Dispatch also honors FLASHINFER_USE_CUDA_NORM from the environment;
+        # pin it so this branch really exercises the DSL kernel.
+        monkeypatch.setattr(flashinfer.norm, "_use_cuda_norm", lambda _device: False)
+
     # The check bounds the fraction of drifting elements, so fix the seed.
     torch.manual_seed(0)
     x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device="cuda")
@@ -519,7 +613,9 @@ def test_layernorm_quant(batch_size, hidden_size, quant_scale, quant_dtype):
     beta = torch.randn(hidden_size, dtype=torch.float32, device="cuda")
     scale = torch.tensor([quant_scale], dtype=torch.float32, device="cuda")
 
-    y_ref = layer_norm_quant(x, gamma, beta, scale, quant_dtype)
+    y_ref = layer_norm_quant(
+        x, gamma, beta, scale, quant_dtype, round_to_input=(backend == "cuda")
+    )
     y = torch.empty_like(x, dtype=quant_dtype)
     flashinfer.norm.layernorm_quant(y, x, gamma, beta, scale)
 
@@ -530,7 +626,21 @@ def test_layernorm_quant(batch_size, hidden_size, quant_scale, quant_dtype):
     assert default_check([y_ref], [y], max_mismatch_pct=1.0, min_cos_sim=None)
 
 
-def test_layernorm_quant_invalid_inputs():
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_layernorm_quant_invalid_inputs(backend, monkeypatch):
+    if backend == "cuda":
+        monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    elif not hasattr(flashinfer.norm, "layernorm_quant_cute"):
+        pytest.skip("nvidia-cutlass-dsl not available")
+    elif not flashinfer.norm._cute_dsl_supports_arch(
+        *torch.cuda.get_device_capability()
+    ):
+        pytest.skip("CuTe DSL cannot target this compute capability")
+    else:
+        # Dispatch also honors FLASHINFER_USE_CUDA_NORM from the environment;
+        # pin it so this branch really exercises the DSL kernel.
+        monkeypatch.setattr(flashinfer.norm, "_use_cuda_norm", lambda _device: False)
+
     batch_size, hidden_size = 8, 1024
     x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device="cuda")
     gamma = torch.randn(hidden_size, dtype=torch.float32, device="cuda")

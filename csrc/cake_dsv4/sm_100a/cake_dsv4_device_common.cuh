@@ -94,6 +94,7 @@ union MmaSmemDesc {
 #include "cake_device_helpers/cake_tcgen05_mma_f8f6f4_7dc3dbed82e9a479.cuh"
 #include "cake_device_helpers/cake_tmem_st_x8_u32_dc3bd531d058988e.cuh"
 #include "cake_device_helpers/cake_tmem_ld_x8_38cb8e5e57da80f2.cuh"
+#include "cake_device_helpers/cake_tma_2d_gmem2smem_f2637c69284c470a.cuh"
 template <int Stages>
 struct CakePipelineState {
     uint32_t index_;
@@ -109,4 +110,3 @@ cake_pipeline_state_at(CakePipelineState<Stages> state) {
     }
     return state;
 }
-#include "cake_device_helpers/cake_tma_2d_gmem2smem_f2637c69284c470a.cuh"

@@ -359,7 +359,14 @@ def _trtllm_batch_decode_sparse_mla_sm120(
     return_lse: bool,
     lse_scale: float,
     kv_scale_format: str,
-    kv_cache_format: Literal["fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"] = "fp8",
+    kv_cache_format: Literal[
+        "fp8",
+        "nvfp4",
+        "fp8_dsv41",
+        "fp8_dsv41_fp4_ca",
+        "fp8_dsv41_inline",
+        "fp8_dsv41_inline_fp4_ca",
+    ] = "fp8",
     backend: Literal["sparse", "cake"] = "sparse",
     enable_pdl: Optional[bool] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -500,7 +507,7 @@ def _trtllm_batch_decode_sparse_mla_sm120(
         lse=out_lse_arg,
         kv_scale_format=kv_scale_format,
         is_dsv4_nvfp4=(kv_cache_format == "nvfp4"),
-        extra_fp4=kv_cache_format == "fp8_dsv41_fp4_ca",
+        extra_fp4=kv_cache_format in _DSV41_FP4_CA_KV_CACHE_FORMATS,
         lse_scale=lse_scale,
     )
 
@@ -1148,7 +1155,16 @@ def _check_dsv4_sparse_mla_inputs(
     )
 
 
-_DSV4_KV_CACHE_FORMATS = ("fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca")
+# DeepSeek-V4.1 storage forms. The ``_inline`` forms hold inline-scale records
+# (FlashMLA's V4.1 ABI as of its 2026.09.30 release: each token's data bytes
+# followed by its own scale bytes); the others keep the footer-scale pages.
+_DSV41_INLINE_KV_CACHE_FORMATS = ("fp8_dsv41_inline", "fp8_dsv41_inline_fp4_ca")
+_DSV41_FP4_CA_KV_CACHE_FORMATS = ("fp8_dsv41_fp4_ca", "fp8_dsv41_inline_fp4_ca")
+_DSV41_KV_CACHE_FORMATS = (
+    "fp8_dsv41",
+    "fp8_dsv41_fp4_ca",
+) + _DSV41_INLINE_KV_CACHE_FORMATS
+_DSV4_KV_CACHE_FORMATS = ("fp8", "nvfp4") + _DSV41_KV_CACHE_FORMATS
 
 
 def _check_dsv4_kv_cache_format_backend(
@@ -1159,8 +1175,9 @@ def _check_dsv4_kv_cache_format_backend(
 ) -> None:
     """Pair a resolved DSv4 backend with the sparse-cache storage format.
 
-    ``fp8_dsv41`` is SM120/SM121 ``backend="sparse"`` only; ``fp8_dsv41_fp4_ca``
-    additionally accepts the Cake mixed-cache decode on SM120/SM121
+    ``fp8_dsv41`` and the inline-scale ``fp8_dsv41_inline`` /
+    ``fp8_dsv41_inline_fp4_ca`` are SM120/SM121 ``backend="sparse"`` only;
+    ``fp8_dsv41_fp4_ca`` additionally accepts the Cake mixed-cache decode on SM120/SM121
     (``sm120_cake=True``: ``backend="cake"`` resolved on an SM120-family
     device). The 384-byte NVFP4 ABI runs on SM120/SM121 through
     ``backend="sparse"`` or ``backend="cake"`` and on SM100/SM103 through the
@@ -1170,10 +1187,17 @@ def _check_dsv4_kv_cache_format_backend(
     if kv_cache_format not in _DSV4_KV_CACHE_FORMATS:
         raise ValueError(
             "kv_cache_format must be 'fp8', 'fp8_dsv41', 'fp8_dsv41_fp4_ca', "
-            f"or 'nvfp4', got {kv_cache_format!r}"
+            "'fp8_dsv41_inline', 'fp8_dsv41_inline_fp4_ca', or 'nvfp4', got "
+            f"{kv_cache_format!r}"
         )
     if kv_cache_format == "fp8_dsv41" and backend != "sparse":
         raise ValueError("kv_cache_format='fp8_dsv41' requires backend='sparse'")
+    if kv_cache_format in _DSV41_INLINE_KV_CACHE_FORMATS and backend != "sparse":
+        raise ValueError(
+            f"kv_cache_format={kv_cache_format!r} (inline-scale records) requires "
+            "backend='sparse'; backend='cake' reads the footer-scale "
+            "'fp8_dsv41_fp4_ca' cache only"
+        )
     if kv_cache_format == "fp8_dsv41_fp4_ca" and backend != "sparse":
         if backend != "cake" or not sm120_cake:
             raise ValueError(
@@ -1250,7 +1274,14 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
     lse_scale: float,
     sinks: Optional[torch.Tensor],
     kv_layout: Literal["HND", "NHD"],
-    kv_cache_format: Literal["fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"],
+    kv_cache_format: Literal[
+        "fp8",
+        "nvfp4",
+        "fp8_dsv41",
+        "fp8_dsv41_fp4_ca",
+        "fp8_dsv41_inline",
+        "fp8_dsv41_inline_fp4_ca",
+    ],
     backend: Literal["sparse", "cake"] = "sparse",
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
@@ -1261,8 +1292,8 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
     if cake and kv_cache_format not in ("nvfp4", "fp8_dsv41_fp4_ca"):
         raise ValueError(
             "backend='cake' on SM120/SM121 serves the DSv4 NVFP4 cache "
-            "(kv_cache_format='nvfp4') and the DeepSeek-V4.1 mixed cache "
-            f"(kv_cache_format='fp8_dsv41_fp4_ca'); got {kv_cache_format!r}"
+            "(kv_cache_format='nvfp4') and the footer-scale DeepSeek-V4.1 mixed "
+            f"cache (kv_cache_format='fp8_dsv41_fp4_ca'); got {kv_cache_format!r}"
         )
     if query.ndim in (3, 4):
         num_heads, head_dim = query.shape[-2:]
@@ -1308,14 +1339,13 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
 
     # Packed FP8 row width per cache format: DSV4 is 584B (448B FP8 + 128B
     # BF16 rope + 8B UE8M0 footer); DSV4.1 is 528B (512B all-FP8 K + 16B
-    # 32-wide-group UE8M0 footer). The mixed "fp8_dsv41_fp4_ca" form keeps the
-    # 528B main (SWA) cache and carries the compressed cache as 288B V41_FP4
-    # rows (256B E2M1 + 32B E4M3-G16 scales).
-    packed_row_bytes = (
-        528 if kv_cache_format in ("fp8_dsv41", "fp8_dsv41_fp4_ca") else 584
-    )
+    # 32-wide-group UE8M0 scales, as a page footer or inline after each token's
+    # data). The mixed "fp4_ca" forms keep the 528B main (SWA) cache and carry
+    # the compressed cache as 288B V41_FP4 rows (256B E2M1 + 32B E4M3-G16
+    # scales).
+    packed_row_bytes = 528 if kv_cache_format in _DSV41_KV_CACHE_FORMATS else 584
     packed_row_bytes_extra = (
-        288 if kv_cache_format == "fp8_dsv41_fp4_ca" else packed_row_bytes
+        288 if kv_cache_format in _DSV41_FP4_CA_KV_CACHE_FORMATS else packed_row_bytes
     )
 
     swa_kv_cache = _check_sm120_dsv4_kv_cache_layout(
@@ -1464,12 +1494,15 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
             lse=None,
             return_lse=False,
             lse_scale=lse_scale,
-            # fp8_dsv41 (and the mixed fp4-ca form) selects the DSV4_1 model
-            # type (32-wide UE8M0 groups) in the SM120 runner; 'fp8' stays on
-            # the DSV4 default.
+            # The V4.1 forms select the DSV4_1 model types (32-wide UE8M0
+            # groups) in the SM120 runner: DSV4_1 for the footer-scale pages,
+            # DSV4_1_INLINE for the inline-scale records; 'fp8' stays on the
+            # DSV4 default.
             kv_scale_format=(
-                "ue8m0_g32"
-                if kv_cache_format in ("fp8_dsv41", "fp8_dsv41_fp4_ca")
+                "ue8m0_g32_inline"
+                if kv_cache_format in _DSV41_INLINE_KV_CACHE_FORMATS
+                else "ue8m0_g32"
+                if kv_cache_format in _DSV41_KV_CACHE_FORMATS
                 else "auto"
             ),
             kv_cache_format=kv_cache_format,
@@ -1816,7 +1849,14 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     sparse_topk_lens_offset: int = 0,
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     *,
-    kv_cache_format: Literal["fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"] = "fp8",
+    kv_cache_format: Literal[
+        "fp8",
+        "nvfp4",
+        "fp8_dsv41",
+        "fp8_dsv41_fp4_ca",
+        "fp8_dsv41_inline",
+        "fp8_dsv41_inline_fp4_ca",
+    ] = "fp8",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode DeepSeek V4 sparse MLA.
 
@@ -2126,7 +2166,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         launches and CUDA-graph replays. When ``None`` (default) a fresh buffer
         is allocated per call, which is not CUDA-graph friendly. Only used by
         ``backend="trtllm-gen"``.
-    kv_cache_format : {"fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"}
+    kv_cache_format : {"fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca", "fp8_dsv41_inline", "fp8_dsv41_inline_fp4_ca"}
         SM120/SM121 sparse-cache storage format. ``"fp8"`` preserves the
         existing 584-byte DSv4 cache ABI. ``"fp8_dsv41"`` selects the
         528-byte DeepSeek-V4.1 ABI (all-FP8 512-wide K with a 16-byte
@@ -2145,6 +2185,20 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         With ``backend="cake"`` on SM120/SM121 the ``fp8_dsv41_fp4_ca`` form
         selects the Cake mixed-cache decode instead (BF16 numerics route,
         both caches dequantized exactly on chip).
+        ``"fp8_dsv41_inline"`` and ``"fp8_dsv41_inline_fp4_ca"`` are the same
+        two V4.1 forms on inline-scale records, FlashMLA's V4.1 ABI as of its
+        2026.09.30 release: each token's 512 data bytes are followed by its own
+        16 scale bytes (V41_FP4: 256 data bytes then 32 scale bytes) instead
+        of a per-page scale footer. Inline records are rows of the whole cache
+        at a uniform row pitch (a 16-byte multiple of at least the record
+        size) with a page stride of whole rows; ``sparse_indices`` and
+        ``extra_sparse_indices`` then address row ``page * (page_stride //
+        row_pitch) + slot`` (the paged slot ID when pages carry no padding).
+        They take the same SM120 routes as the footer forms, reading each
+        record with one bulk copy (``backend="sparse"`` only; ``backend=
+        "cake"`` rejects them). Footer and inline caches cannot be told apart
+        from their shapes, so the format must name the layout the cache was
+        written in.
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
     _check_dsv4_kv_cache_format_backend(
@@ -4781,6 +4835,189 @@ def prepare_cake_mla_varq_dcp_decode(
         lse=lse,
         backend="cake",
     )
+
+
+@flashinfer_experimental_api(feature="Cake dense NVFP4 MLA decode (SM100/SM103)")
+def cake_mla_nvfp4_paged_decode(
+    q_nope: torch.Tensor,
+    q_sf: torch.Tensor,
+    q_rope: torch.Tensor,
+    q_scale: torch.Tensor,
+    ckv_cache: torch.Tensor,
+    ckv_sf_cache: torch.Tensor,
+    kpe_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    *,
+    sm_scale: float,
+    ckv_scale: float,
+    o_scale: float = 1.0,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+    cum_seq_lens_q: Optional[torch.Tensor] = None,
+    max_q_len: Optional[int] = None,
+    max_seq_len: Optional[int] = None,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    kv_len_global: Optional[torch.Tensor] = None,
+    backend: str = "cake",
+):
+    """Dense absorbed-MLA decode over an NVFP4 paged latent cache.
+
+    The experimental Cake backend serves Kimi-K3 / DeepSeek-V3 MLA decode
+    (512 latent + 64 rope channels per key, 512-wide value) over the NVFP4
+    paged cache of flashinfer-ai/flashinfer#4676: ``ckv_cache`` uint8
+    ``[num_pages, page_size, 256]`` packed E2M1, ``ckv_sf_cache``
+    float8_e4m3fn ``[num_pages, page_size, 32]`` block-16 scales,
+    ``kpe_cache`` float8_e4m3fn ``[num_pages, page_size, 64]`` rope channels
+    (page sizes 32 / 64 / 128 / ..., strided views of one allocation allowed),
+    decoded as ``e2m1 * sf * ckv_scale | fp8 * kpe_scale``.  The query is
+    NVFP4 too -- ``q_nope`` uint8 ``[.., 256]``, ``q_sf`` float8_e4m3fn
+    ``[.., 32]``, ``q_rope`` float8_e4m3fn ``[.., 64]``, ``q_scale`` float32
+    ``[..]`` from :func:`quantize_mla_nvfp4_query` -- as ``[batch, q_len,
+    num_heads, .]`` or packed ``[total_q, num_heads, .]`` with
+    ``cum_seq_lens_q`` / ``max_q_len`` (variable-length / MTP queries,
+    bottom-right causal against the request's last keys).  It writes BF16
+    ``out`` (``q.shape[:-1] + (512,)``) and, with ``return_lse=True``, the
+    natural-log FP32 ``lse``; decode context parallelism follows the static
+    cyclic rule (``cp_world`` / ``cp_rank`` with the per-request global
+    lengths ``kv_len_global``).  Requires compute capability 10.0 or 10.3.
+    The caller owns ``workspace_buffer`` (uint8; size from
+    ``flashinfer.experimental.cake_mla_nvfp4_paged_decode.cake_backend
+    .workspace_bytes`` / ``max_workspace_bytes``).  Nothing reads device
+    tensor contents on the host.  ``prepare_cake_mla_nvfp4_paged_decode``
+    returns a launch-only runner for repeated calls with fixed bindings.  See
+    ``flashinfer/experimental/cake_mla_nvfp4_paged_decode/README.md``.
+    """
+    if backend != "cake":
+        raise ValueError("Cake NVFP4 MLA decode currently supports backend='cake'")
+    from ..experimental.cake_mla_nvfp4_paged_decode.cake_backend import (
+        cake_mla_nvfp4_paged_decode as run,
+    )
+
+    return run(
+        q_nope,
+        q_sf,
+        q_rope,
+        q_scale,
+        ckv_cache,
+        ckv_sf_cache,
+        kpe_cache,
+        block_tables,
+        seq_lens,
+        workspace_buffer,
+        sm_scale=sm_scale,
+        ckv_scale=ckv_scale,
+        o_scale=o_scale,
+        out=out,
+        lse=lse,
+        return_lse=return_lse,
+        cum_seq_lens_q=cum_seq_lens_q,
+        max_q_len=max_q_len,
+        max_seq_len=max_seq_len,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+        kv_len_global=kv_len_global,
+        backend="cake",
+    )
+
+
+@flashinfer_experimental_api(
+    feature="Prepared Cake dense NVFP4 MLA decode (SM100/SM103)"
+)
+def prepare_cake_mla_nvfp4_paged_decode(
+    q_nope: torch.Tensor,
+    q_sf: torch.Tensor,
+    q_rope: torch.Tensor,
+    q_scale: torch.Tensor,
+    ckv_cache: torch.Tensor,
+    ckv_sf_cache: torch.Tensor,
+    kpe_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    *,
+    sm_scale: float,
+    ckv_scale: float,
+    o_scale: float = 1.0,
+    lse: Optional[torch.Tensor] = None,
+    cum_seq_lens_q: Optional[torch.Tensor] = None,
+    max_q_len: Optional[int] = None,
+    max_seq_len: Optional[int] = None,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    kv_len_global: Optional[torch.Tensor] = None,
+    backend: str = "cake",
+):
+    """Plan and bind one Cake dense NVFP4 MLA decode problem.
+
+    Validation, the host plan (row tile, KV split count, grids, reducer), the
+    workspace carve and every allocation happen here; the returned
+    ``CakeMlaNvfp4PagedDecode`` launches the attention kernel (and, when the
+    plan splits the KV, the merge kernel behind it) with no CUDA allocation
+    and no host synchronization, writing the caller-owned ``out`` / ``lse``.
+    Prepare a new runner when shapes, ``max_seq_len`` or the tensor bindings
+    change.  CUDA Graph ownership remains with the caller.  See
+    :func:`cake_mla_nvfp4_paged_decode` for the semantics.
+    """
+    if backend != "cake":
+        raise ValueError("Cake NVFP4 MLA decode currently supports backend='cake'")
+    from ..experimental.cake_mla_nvfp4_paged_decode.cake_backend import (
+        CakeMlaNvfp4PagedDecode,
+    )
+
+    return CakeMlaNvfp4PagedDecode(
+        q_nope=q_nope,
+        q_sf=q_sf,
+        q_rope=q_rope,
+        q_scale=q_scale,
+        ckv_cache=ckv_cache,
+        ckv_sf_cache=ckv_sf_cache,
+        kpe_cache=kpe_cache,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        out=out,
+        workspace_buffer=workspace_buffer,
+        sm_scale=sm_scale,
+        ckv_scale=ckv_scale,
+        o_scale=o_scale,
+        lse=lse,
+        cum_seq_lens_q=cum_seq_lens_q,
+        max_q_len=max_q_len,
+        max_seq_len=max_seq_len,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+        kv_len_global=kv_len_global,
+    )
+
+
+@flashinfer_experimental_api(feature="Cake NVFP4 MLA query quantization (SM100/SM103)")
+def quantize_mla_nvfp4_query(
+    query: torch.Tensor,
+    ckv_scale: float,
+    kpe_scale: float,
+    *,
+    out: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize a BF16 MLA query ``[.., 576]`` into the NVFP4 operands of
+    :func:`cake_mla_nvfp4_paged_decode`: ``(q_nope, q_sf, q_rope, q_scale)``.
+
+    Per (token, head) row ``q_scale = max(amax(nope) / (6 * 448),
+    amax(rope) * kpe_scale / (448 * ckv_scale))``, E4M3 block-16 scales
+    ``amax_block / (6 q_scale)``, E2M1 codes ``x / (sf q_scale)`` (ties to
+    even) and FP8 rope ``x * kpe_scale / (q_scale * ckv_scale)``, so the rope
+    product lands in the latent logit unit.  ``out`` reuses caller buffers
+    (``cake_backend.mla_nvfp4_query_buffers``); the launch then allocates
+    nothing.  Requires compute capability 10.0 or 10.3.
+    """
+    from ..experimental.cake_mla_nvfp4_paged_decode.cake_backend import (
+        quantize_mla_nvfp4_query as run,
+    )
+
+    return run(query, ckv_scale, kpe_scale, out=out)
 
 
 @flashinfer_api(trace=trtllm_batch_decode_mla_trace_dispatch)

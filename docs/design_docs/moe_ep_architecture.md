@@ -90,9 +90,9 @@ kind, and both paths hand the inner kernel the same `SplitKernelContext`:
 
 | Backend | Config | Interface | Transport |
 |---|---|---|---|
-| `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back (`flashinfer.comm.MoeAlltoAll`, TRT-LLM kernels) |
-| `cake` | `CakeAlltoAllConfig` | `MoEEpCommunication` | `nvlink_one_sided` running the generated Cake kernels (`MoeAlltoAll` with `backend="cake"`); SM100/SM103 only |
-| `nvlink_two_sided` | `NVLinkTwoSidedConfig` | `MoEEpCommunication` | MNNVL FIFO channels, all-to-all-v (`flashinfer.comm.MnnvlMoe`); `num_experts % 4 == 0` |
+| `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back; optional CFT counted writes over the NVLink fabric (SM100+, CUDA 13.4+, driver 615+); up to 256 ranks. Kernels follow TensorRT-LLM's (`kernels/moe/communication/`) |
+| `cake` | `CakeAlltoAllConfig` | `MoEEpCommunication` | The one-sided protocol of the `flashinfer.comm` `moe_a2a_*` ops running the generated Cake kernels (`backend="cake"`); SM100/SM103 only |
+| `nvlink_two_sided` | `NVLinkTwoSidedConfig` | `MoEEpCommunication` | MNNVL FIFO channels, all-to-all-v (`moe_prepare` / `moe_comm` of `flashinfer.comm.trtllm_alltoall`); `num_experts % 4 == 0` |
 | `nccl_ep` | `NcclEpConfig` | Fleet/Handle | see below |
 | `nixl_ep` | `NvepConfig` | Fleet/Handle | see below |
 
@@ -330,13 +330,21 @@ decode_view = layer.forward(
 )
 ```
 
+Pass `knobs=selected_knobs` to `create_workspace()` to use a fixed dictionary
+for that capacity while sharing the layer's transformed weights. The dictionary
+is copied. Omitting `knobs` or passing `None` inherits the layer's configuration.
+The layer must use fixed knobs. An override for the default capacity must be
+supplied before that workspace is allocated.
+
 Creation and destruction are collective across EP ranks and must occur in the
-same order. A handle belongs to the layer that created it and accepts any live
-token count up to its capacity. Only one live handle per capacity is allowed on
-a layer. If an explicit handle is created for the
+same order, with matching capacities and knobs. A handle belongs to the layer
+that created it and accepts any live
+token count up to its capacity. Only one live handle per `(capacity, live_tokens)`
+is allowed on a layer. If an explicit handle is created for the
 `FleetParams.max_tokens_per_rank` capacity, it becomes the same logical profile
 selected by `workspace=None`; FlashInfer transfers/reuses the default allocation
-rather than acquiring an aliasing pool reference. `workspace=` selects capacity
+when knobs are inherited, rather than acquiring an aliasing pool reference.
+`workspace=` selects capacity and knobs
 but preserves the existing owned-output default; request
 `return_workspace_view=True` explicitly when a supported backend and CUDA Graph
 need a stable borrowed output address.
@@ -365,7 +373,7 @@ classDiagram
     MoEEpSplitLayer --> Handle : per forward
 
     MoEEpCommunication <|-- NVLinkOneSidedAlltoAll
-    NVLinkOneSidedAlltoAll <|-- CakeAlltoAll
+    MoEEpCommunication <|-- CakeAlltoAll
     MoEEpCommunication <|-- NVLinkTwoSidedAlltoAll
 
     MoEEpMegaLayer --> MegaKernelBackend

@@ -36,7 +36,6 @@ from .cake_jit import (
     MODULES,
     gen_cake_kimi_k3_attn_res_module,
     load_cake_kimi_k3_attn_res_module,
-    registered_kernel_keys,
 )
 
 __all__ = [
@@ -52,6 +51,5 @@ __all__ = [
     "plan_route",
     "prepare_kimi_k3_attn_res",
     "reference_kimi_k3_attn_res",
-    "registered_kernel_keys",
     "validate_kimi_k3_attn_res_inputs",
 ]

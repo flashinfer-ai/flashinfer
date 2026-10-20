@@ -31,7 +31,6 @@ from .jit.cake_concat_mla_kv_quant_fp8 import (
     concat_mla_kv_quant_fp8_route_record,
     concat_mla_kv_quant_fp8_target_for_capability,
     load_concat_mla_kv_quant_fp8_build,
-    route_key,
 )
 from .jit.mla_kv_pack import gen_mla_kv_pack_fp8_module
 from .trace.templates.attention import concat_mla_kv_quant_fp8_trace
@@ -386,8 +385,6 @@ def _cake_supported(
     if any(t.data_ptr() % 32 for t in (kv_nope, k_pe, key, value)):
         return "alignment"
     num_tokens, num_heads = kv_nope.shape[0], kv_nope.shape[1]
-    if route_key(_plan_head_group(num_tokens, num_heads)) not in ROUTES:
-        return "head_group_route"
     reason = _device_supported(kv_nope)
     if reason is not None:
         return reason

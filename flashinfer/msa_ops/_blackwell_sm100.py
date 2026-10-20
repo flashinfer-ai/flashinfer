@@ -18,11 +18,13 @@ Compute-capability 10.0/10.3 backend for MiniMax Sparse Attention.
 The Cake-generated programs behind this module are registered in
 ``flashinfer.jit.blackwell_msa``: ``ROUTES`` maps a logical route
 (``<route key>:<stage>``) to the program that serves it on each target and
-``MODULES`` carries the program's physical argument order.  This module owns
+``MODULES`` names the program's ``ARG_PLANS`` argument plan.  This module owns
 the public semantics only -- argument validation, route selection from the
 inputs, the host-side plan of the long-prefill route and the CUDA-graph
-workspace contract.  There are no environment switches and no shape-exact
-routes: every TopK16 call on a supported device is served by the route its
+workspace contract.  There are no environment switches.  The only shape-exact
+routes are the two FP8-KV single-query decode specializations that
+``force_fused=True`` selects at their exact coordinates (``_fp8_q1_schedule``);
+every other TopK16 call on a supported device is served by the route its
 inputs select.  Compute capability 10.7 is admitted for the packed-NVFP4
 paged-KV routes only.
 
@@ -59,6 +61,7 @@ import torch
 import tvm_ffi
 
 from ..jit.blackwell_msa import (
+    ARG_PLANS,
     MODULES,
     BlackwellMSATarget,
     load_blackwell_msa_module,
@@ -80,18 +83,13 @@ _UNIFORM_FP8_EVEN_WAVE_GRID = 128
 
 _LONG_WORK_GROUP_BUCKETS = (128, 64, 32, 16, 8, 4, 2, 1)
 _LONG_GROUP_BOUNDARIES = _LONG_WORK_GROUP_BUCKETS[:-1]
-# Tail-wave split of the long-prefill work list (mirror of the Weave module's WORK_TAIL_SPLIT* constants and of
-# decompose_long_prefill_work / simulate_long_prefill_makespan / tail_split_long_prefill_work; the Cake test
-# loom/tests/test_minimax_sparse_long_prefill_work_plan.py pins the parity).
-_LONG_WORK_TAIL_SPLIT = True
+# Tail-wave split of the long-prefill work list (mirrors the generator's work-plan model).
 _LONG_WORK_TAIL_SPLIT_FIXED_GROUPS = 2
 _LONG_WORK_TAIL_SPLIT_MIN_GROUPS = 32
 _LONG_WORK_TAIL_SPLIT_MAX_ROUNDS = 4
-# Q-resident launch order of the long-prefill work list (lever P1b; mirror of the Weave module's WORK_ORDER_*
-# constants and of first_query_tokens_of_long_prefill_work / order_long_prefill_work_q_resident, pinned by the
-# same Cake test).  Requires the long_prefill_* kernels of this export, which derive the CTA's group count from
-# the item's q_count (the q_group_segment_end_* scalars are bucket counts, not launch-index boundaries).
-_LONG_WORK_ORDER_Q_RESIDENT = True
+# Q-resident launch order of the long-prefill work list (mirrors the generator's work-plan model).  Requires the
+# long_prefill_* kernels of this export, which derive the CTA's group count from the item's q_count (the
+# q_group_segment_end_* scalars are bucket counts, not launch-index boundaries).
 _LONG_WORK_ORDER_Q_WINDOW = 1024
 _LONG_WORK_ORDER_FILL_GROUPS = 128
 _LONG_QSPLIT_Q_MASK = 0x00FF_FFFF
@@ -479,7 +477,9 @@ def _program(route: str, target: BlackwellMSATarget) -> _Program:
     name = route_program(route, target)
     record = MODULES[name]
     module = load_blackwell_msa_module(name, target)
-    plan = tuple((str(kind), str(argument)) for kind, argument in record["arg_plan"])
+    plan = tuple(
+        (str(kind), str(argument)) for kind, argument in ARG_PLANS[record["arg_plan"]]
+    )
     return _Program(name, getattr(module, record["ffi_entry"]), plan)
 
 
@@ -955,11 +955,9 @@ def _decode_route(*, q_dtype: torch.dtype, k_dtype: torch.dtype, paged: bool) ->
     return f"decode_m16:{_DTYPE_NAMES[q_dtype]}:{_DTYPE_NAMES[k_dtype]}:{layout}"
 
 
-def _long_prefill_route(*, paged: bool, group_size: int, direct_group: bool) -> str:
+def _long_prefill_route(*, paged: bool, group_size: int) -> str:
     layout = "paged" if paged else "flat"
-    return f"long_bf16_reverse:{layout}:gqa{group_size}" + (
-        ":direct_group" if direct_group else ""
-    )
+    return f"long_bf16_reverse:{layout}:gqa{group_size}"
 
 
 def _fp8_q1_schedule(
@@ -1635,28 +1633,24 @@ def _build_long_prefill_plan(
     )
     if not work:
         raise ValueError("long prefill requires at least one selected edge")
-    if _LONG_WORK_TAIL_SPLIT:
-        work = _long_prefill_tail_split_work(
-            work, sm_count=int(num_sms), q_tokens_per_group=q_tokens_per_group
-        )
-    if _LONG_WORK_ORDER_Q_RESIDENT:
-        row_starts_host = []
-        for head_counts in counts_host:
-            starts = [0]
-            for count in head_counts:
-                starts.append(starts[-1] + int(count))
-            row_starts_host.append(starts)
-        first_tokens = _long_prefill_first_query_tokens(
-            work, row_starts_host=row_starts_host, q_indices_by_head=q_indices_by_head
-        )
-        work = _long_prefill_order_work_q_resident(
-            work,
-            first_tokens,
-            window=_LONG_WORK_ORDER_Q_WINDOW,
-            fill_groups=min(_LONG_WORK_ORDER_FILL_GROUPS, work_group_cap),
-        )
-    else:
-        work.sort(key=lambda item: item[0], reverse=True)
+    work = _long_prefill_tail_split_work(
+        work, sm_count=int(num_sms), q_tokens_per_group=q_tokens_per_group
+    )
+    row_starts_host = []
+    for head_counts in counts_host:
+        starts = [0]
+        for count in head_counts:
+            starts.append(starts[-1] + int(count))
+        row_starts_host.append(starts)
+    first_tokens = _long_prefill_first_query_tokens(
+        work, row_starts_host=row_starts_host, q_indices_by_head=q_indices_by_head
+    )
+    work = _long_prefill_order_work_q_resident(
+        work,
+        first_tokens,
+        window=_LONG_WORK_ORDER_Q_WINDOW,
+        fill_groups=min(_LONG_WORK_ORDER_FILL_GROUPS, work_group_cap),
+    )
     metadata = torch.tensor(
         [entry for _group, entry in work], dtype=torch.int32, device=q2k_indices.device
     )
@@ -1880,12 +1874,7 @@ def _run_long_prefill(
             dtype=torch.float32,
             device=q.device,
         )
-    direct_group = (
-        target == "sm100a" and paged and group_size == 16 and max_pages == 8192
-    )
-    route = _long_prefill_route(
-        paged=paged, group_size=group_size, direct_group=direct_group
-    )
+    route = _long_prefill_route(paged=paged, group_size=group_size)
     forward_program = _program(f"{route}:main", target)
     combine_program = _program(f"{route}:reduce", target)
     # Flat K/V: a never-dereferenced carrier, the caller's whole contiguous q2k

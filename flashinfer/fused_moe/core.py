@@ -114,6 +114,7 @@ from .utils import (
 
 if TYPE_CHECKING:
     from flashinfer.fused_moe.da_config import TrtllmDaConfig
+    from flashinfer.jit.cake_stepfun_moe import CakeStepFunTarget
 
 
 # RoutingInputMode (the FusedMoE launcher's routing-input ABI enum) lives in
@@ -1324,7 +1325,7 @@ def cutlass_fused_moe(
     ----------
     input : torch.Tensor
         Input tensor of shape [num_tokens, hidden_size].
-        Support float, float16, bfloat16, float8_e4m3fn and nvfp4.
+        Supports float, float16, bfloat16, float8_e4m3fn, and nvfp4.
         For FP8, the input must be quantized.
         For NVFP4, both quantized and non-quantized inputs are supported.
 
@@ -1371,7 +1372,7 @@ def cutlass_fused_moe(
         GEMM1 biases for each expert.
 
     fc2_expert_biases : Optional[torch.Tensor]
-        GEMM1 biases for each expert.
+        GEMM2 biases for each expert.
 
     input_sf : Optional[torch.Tensor]
         Input scaling factor for quantization.
@@ -1808,7 +1809,33 @@ def get_trtllm_moe_sm100_module():
 
 @functools.cache
 def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
-    module = gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=enable_rubin)
+    return _build_trtllm_moe_namespace(
+        gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=enable_rubin)
+    )
+
+
+@functools.cache
+def get_cake_stepfun_moe_module(
+    target: "CakeStepFunTarget", full_path: bool | None = None
+):
+    """Load the Cake StepFun fused-MoE module for an exact ``sm_100a``/``sm_103a`` target.
+
+    The module exports the trtllm-gen fused-MoE operations with the GEMM1 stage
+    served by the exported Cake StepFun FC1 kernels and, on the full path (see
+    :func:`flashinfer.jit.cake_stepfun_moe.resolve_cake_stepfun_full_path`), the
+    routing, GEMM2, requantization and finalize stages by Cake kernels as well.
+    The returned namespace is the one :func:`get_trtllm_moe_sm100_module` returns
+    for the public module.
+    """
+    from ..jit.cake_stepfun_moe import gen_cake_stepfun_fused_moe_module
+
+    return _build_trtllm_moe_namespace(
+        gen_cake_stepfun_fused_moe_module(target, full_path)
+    )
+
+
+def _build_trtllm_moe_namespace(module):
+    """Build and load a trtllm-gen fused-MoE JIT module and wrap its operations."""
     moe_op = module.build_and_load()
     for library_path in module.get_library_paths():
         setup_cubin_loader(str(library_path))
