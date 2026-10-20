@@ -57,8 +57,9 @@ SAGE_K_BLOCK_SIZES = (1, 4, 16, 32, 64, 128, 256)
 class SageAttentionConfig:
     """Compile-time Sage attention recipe of one plan.
 
-    ``q_block_size`` tokens share one Q scale and must be a power of two no
-    larger than the planned Q tile. ``k_block_size`` tokens share one K scale;
+    ``q_block_size`` tokens share one Q scale and must be a power of two; a
+    block may span several Q tiles, since every Q row reads its own prepared
+    scale. ``k_block_size`` tokens share one K scale;
     ``k_summary_block_size`` is the K block size of a proxy plan's summary
     scales; construction sets it to ``k_block_size`` when it is omitted.
     Both must be one of ``SAGE_K_BLOCK_SIZES``. ``v_mean`` says whether every

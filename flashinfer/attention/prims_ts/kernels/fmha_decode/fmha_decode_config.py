@@ -2077,10 +2077,9 @@ class FmhaDecodeConfig:
                 f"got {self.sage_k_summary_block_size}"
             )
         q_block_size = self.sage_q_block_size
-        if not is_power_of_two(q_block_size) or q_block_size > self.tile_size_q:
+        if not is_power_of_two(q_block_size):
             raise ValueError(
-                "sage_q_block_size must be a power of two no larger than "
-                f"tile_size_q ({self.tile_size_q}), got {q_block_size}"
+                f"sage_q_block_size must be a power of two, got {q_block_size}"
             )
         if not self.streams_tmem_p_fragments:
             raise ValueError(

@@ -178,6 +178,12 @@ _DENSE_CASES = (
         **{**_KV256, "seq_len_q": 100, "num_qo_heads": 4, "q_block_size": 32},
         sage=SageAttentionConfig(q_block_size=2),
     ),
+    # One 256-token Q scale block spans every Q128 tile of a sequence.
+    _SageCase(
+        "q128_fp8_k16_q256",
+        **_Q128,
+        sage=SageAttentionConfig(q_block_size=256),
+    ),
 )
 _SPARSE_CASES = (
     _SageCase(

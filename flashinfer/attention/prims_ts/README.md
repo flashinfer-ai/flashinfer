@@ -48,7 +48,7 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 
 | Kernel | Guide | Public APIs |
 | --- | --- | --- |
-| FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md); FP8 Sage plans: [Sage attention](#sage-attention) | `BatchPrefillTSWrapper`, `batch_prefill`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache` |
+| FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md); Sage plans: [Sage attention](#sage-attention) | `BatchPrefillTSWrapper`, `batch_prefill`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache` |
 | FMHA decode | [Task-Scheduled FMHA Decode](kernels/fmha_decode/README.md) | `BatchDecodePagedTSWrapper`, `batch_decode_with_paged_kv_cache`, `get_prims_ts_batch_decode_workspace_size`, `prepare_prims_ts_batch_decode_with_kv_cache` |
 | QToken-KvBlock-Sparse-Attention | [Packed-prefill and fixed-decode example](https://github.com/PerkzZheng/prims-ts-examples/blob/main/q_token_kv_block_sparse_attention.py) | `QTokenKvBlockSparsePagedTSWrapper`, `q_token_kv_block_sparse_attention_with_paged_kv_cache`, `get_q_token_kv_block_sparse_workspace_size`, `suggest_q_token_kv_block_sparse_group_size`, `validate_q_token_kv_block_sparse_group_size`, `make_q_token_kv_block_sparse_qo_indptr` |
 | Block-sparse FMHA | [Sage attention](#sage-attention) below | `BlockSparseTSWrapper`, `block_sparse_attention`, `SageAttentionConfig`, `SageAttentionParams`; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
@@ -342,8 +342,8 @@ TensorRT-LLM's production recipe.
 | --- | --- |
 | Q/K dtype | One dtype: `torch.float8_e4m3fn`, or `torch.int8` on SM100a/B200 only |
 | V dtype (`v_data_type`; context `v_dtype`) | `torch.float8_e4m3fn`; it defaults to the K dtype, so INT8 plans set it |
-| Output dtype | `torch.bfloat16` (the block-sparse default) or `torch.float16` |
-| `q_block_size` | Power of two; default 1. The decode kernel also bounds it by its Q tile |
+| Output dtype | `torch.bfloat16` (the default) or `torch.float16` |
+| `q_block_size` | Power of two, which may exceed the Q tile; default 1 |
 | `k_block_size` | 1, 4, 16, 32, 64, 128 or 256; default 16 |
 | `k_summary_block_size` | One of the `k_block_size` values, for proxy summary scales; default `k_block_size` |
 | `v_mean` | Whether every run supplies `v_mean`; default `False` |

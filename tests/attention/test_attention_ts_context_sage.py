@@ -168,6 +168,8 @@ _INT8_K_BLOCK_SIZES = (16, 4, 1)
         (1, 256, 4096, 4, 4, 128, 64, True, _FP8),
         (2, 300, 1004, 8, 4, 2, 4, True, _FP8),
         (1, 512, 1000, 4, 4, 1, 1, False, _FP8),
+        # 256-token Q scale blocks span two Q tiles.
+        (2, 600, 1004, 8, 4, 256, 16, True, _FP8),
         *(
             pytest.param(*case, _INT8, marks=REQUIRES_INT8_QK_GPU)
             for case in (
