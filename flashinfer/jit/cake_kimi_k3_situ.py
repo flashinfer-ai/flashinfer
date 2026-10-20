@@ -24,8 +24,11 @@ from .core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # Generated-program registry of the Cake SiTU backend. One record per physical
 # program (device + binding translation units, launch contract, the
 # architectures it compiles for); every architecture compiles the same source
-# with its own flag set. Written by the Cake exporter and hand-edited here
-# pending exporter support.
+# with its own flag set. A program whose exported binding differed from another
+# program's only in the kernel symbol and the host-shim namespace names that
+# program's binding in "sources" and selects its own values through the
+# CAKE_SITU_KERNEL / CAKE_SITU_SHIM compile definitions in "compile_flags".
+# Written by the Cake exporter and hand-edited here pending exporter support.
 MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_nvfp4_situ_routed_moe_13ccea112756c78b4f7f": {
         "sources": [
@@ -660,9 +663,12 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_nvfp4_situ_routed_moe_94ed2948cdb1b434548f": {
         "sources": [
             "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_94ed2948cdb1b434548f_kernel.cu",
-            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_94ed2948cdb1b434548f_binding.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_920a885b92d4dbd32aaf_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_SITU_KERNEL=kernel_cake_kimi_k3_nvfp4_situ_routed_moe_94ed2948cdb1b434548f",
+            "-DCAKE_SITU_SHIM=cake_host_shim_3c096cf9099f7b16",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "expert_output"],
@@ -681,9 +687,12 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_nvfp4_situ_routed_moe_98eeb51d40321f05a2e9": {
         "sources": [
             "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_98eeb51d40321f05a2e9_kernel.cu",
-            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_98eeb51d40321f05a2e9_binding.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_5237090cc1d6ad6ce001_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_SITU_KERNEL=kernel_cake_kimi_k3_nvfp4_situ_routed_moe_98eeb51d40321f05a2e9",
+            "-DCAKE_SITU_SHIM=cake_host_shim_e8dc03f98b763511",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "topk_ids"],
@@ -730,9 +739,12 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_nvfp4_situ_routed_moe_af08a3678dee668769ef": {
         "sources": [
             "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_af08a3678dee668769ef_kernel.cu",
-            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_af08a3678dee668769ef_binding.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_920a885b92d4dbd32aaf_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_SITU_KERNEL=kernel_cake_kimi_k3_nvfp4_situ_routed_moe_af08a3678dee668769ef",
+            "-DCAKE_SITU_SHIM=cake_host_shim_5d44b4d2fe76f87e",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "expert_output"],
@@ -849,9 +861,12 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_nvfp4_situ_routed_moe_bf03708b8a006adcd5e1": {
         "sources": [
             "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_bf03708b8a006adcd5e1_kernel.cu",
-            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_bf03708b8a006adcd5e1_binding.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_194f5c89b6e5659e023f_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_SITU_KERNEL=kernel_cake_kimi_k3_nvfp4_situ_routed_moe_bf03708b8a006adcd5e1",
+            "-DCAKE_SITU_SHIM=cake_host_shim_7912fe34ef798eda",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "topk_ids"],
@@ -868,9 +883,12 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_nvfp4_situ_routed_moe_bf607b3707fa37b411b7": {
         "sources": [
             "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_bf607b3707fa37b411b7_kernel.cu",
-            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_bf607b3707fa37b411b7_binding.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_9b180b07b1e91d891258_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_SITU_KERNEL=kernel_cake_kimi_k3_nvfp4_situ_routed_moe_bf607b3707fa37b411b7",
+            "-DCAKE_SITU_SHIM=cake_host_shim_d24ce3a0218bb59d",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "expert_output"],
@@ -1011,9 +1029,12 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_nvfp4_situ_routed_moe_d879256424e97e4fe373": {
         "sources": [
             "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_d879256424e97e4fe373_kernel.cu",
-            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_d879256424e97e4fe373_binding.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_13ccea112756c78b4f7f_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_SITU_KERNEL=kernel_cake_kimi_k3_nvfp4_situ_routed_moe_d879256424e97e4fe373",
+            "-DCAKE_SITU_SHIM=cake_host_shim_e8983ee7ef44c799",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -1100,9 +1121,12 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_nvfp4_situ_routed_moe_eb341800f93919d98c45": {
         "sources": [
             "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_eb341800f93919d98c45_kernel.cu",
-            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_eb341800f93919d98c45_binding.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_5f1134ff62964abafd6b_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_SITU_KERNEL=kernel_cake_kimi_k3_nvfp4_situ_routed_moe_eb341800f93919d98c45",
+            "-DCAKE_SITU_SHIM=cake_host_shim_1142fb2428bec1d5",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -1193,9 +1217,12 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_nvfp4_situ_routed_moe_f732ff559a0b5d60dbe9": {
         "sources": [
             "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_f732ff559a0b5d60dbe9_kernel.cu",
-            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_f732ff559a0b5d60dbe9_binding.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_eca3a107617c19a7c046_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_SITU_KERNEL=kernel_cake_kimi_k3_nvfp4_situ_routed_moe_f732ff559a0b5d60dbe9",
+            "-DCAKE_SITU_SHIM=cake_host_shim_4ee595b5db600994",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -1229,9 +1256,12 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_nvfp4_situ_routed_moe_ffc17ea7b5160932a22c": {
         "sources": [
             "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_ffc17ea7b5160932a22c_kernel.cu",
-            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_ffc17ea7b5160932a22c_binding.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_b2c812c6b0328fbe0449_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_SITU_KERNEL=kernel_cake_kimi_k3_nvfp4_situ_routed_moe_ffc17ea7b5160932a22c",
+            "-DCAKE_SITU_SHIM=cake_host_shim_0a43a7ac2965ab39",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],

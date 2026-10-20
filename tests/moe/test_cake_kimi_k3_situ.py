@@ -280,11 +280,44 @@ def test_cake_situ_sixteen_token_pool_is_twice_the_eight_token_pool():
 def test_cake_situ_program_records_are_consistent():
     # Every program record names its two sources, the architectures it compiles
     # for and a complete launch plan; every program is bound by a kernel key on
-    # each architecture it lists.
+    # each architecture it lists. Nine programs build from another program's
+    # binding (the two exported bindings differed only in the kernel symbol and
+    # the host-shim namespace) and select their own values through compile
+    # definitions: program digest -> digest of the program whose binding it names.
+    prefix = "cake_kimi_k3_nvfp4_situ_routed_moe_"
+    binding_of = {
+        f"{prefix}{member}": f"{prefix}{owner}"
+        for member, owner in (
+            ("94ed2948cdb1b434548f", "920a885b92d4dbd32aaf"),
+            ("98eeb51d40321f05a2e9", "5237090cc1d6ad6ce001"),
+            ("af08a3678dee668769ef", "920a885b92d4dbd32aaf"),
+            ("bf03708b8a006adcd5e1", "194f5c89b6e5659e023f"),
+            ("bf607b3707fa37b411b7", "9b180b07b1e91d891258"),
+            ("d879256424e97e4fe373", "13ccea112756c78b4f7f"),
+            ("eb341800f93919d98c45", "5f1134ff62964abafd6b"),
+            ("f732ff559a0b5d60dbe9", "eca3a107617c19a7c046"),
+            ("ffc17ea7b5160932a22c", "b2c812c6b0328fbe0449"),
+        )
+    }
     bound = {arch: set(KERNELS[arch].values()) for arch in ARCHES}
     for name, record in MODULES.items():
         assert record["sources"][0].endswith(f"{name}_kernel.cu"), name
-        assert record["sources"][1].endswith(f"{name}_binding.cu"), name
+        owner = binding_of.get(name, name)
+        assert record["sources"][1].endswith(f"{owner}_binding.cu"), name
+        definitions = [
+            flag for flag in record["compile_flags"] if flag.startswith("-DCAKE_SITU_")
+        ]
+        if owner == name:
+            assert definitions == [], name
+        else:
+            assert record["sources"][1] == MODULES[owner]["sources"][1], name
+            assert record["arg_plan"] == MODULES[owner]["arg_plan"], name
+            assert len(definitions) == 2, name
+            assert f"-DCAKE_SITU_KERNEL=kernel_{name}" in definitions, name
+            assert any(
+                flag.startswith("-DCAKE_SITU_SHIM=cake_host_shim_")
+                for flag in definitions
+            ), name
         assert record["arches"] == sorted(record["arches"]), name
         assert set(record["arches"]) <= set(ARCHES), name
         assert len(record["closure_sha256"]) == 64, name
