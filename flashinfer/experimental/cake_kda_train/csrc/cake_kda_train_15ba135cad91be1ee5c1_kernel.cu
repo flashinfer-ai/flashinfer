@@ -266,7 +266,7 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(576, LAUNCH_MIN_BLOCKS) void
-kernel_cake_kda_train_61dd40db6dd98ecd4ad0(const __grid_constant__ CUtensorMap do_tma, const __grid_constant__ CUtensorMap vn_tma, const __grid_constant__ CUtensorMap dv2_tma, const __grid_constant__ CUtensorMap v_tma, const __grid_constant__ CUtensorMap h_tma, const __grid_constant__ CUtensorMap dh_tma, const __grid_constant__ CUtensorMap akk_tma, const __grid_constant__ CUtensorMap gk_tma, const __grid_constant__ CUtensorMap k_tma, const __grid_constant__ CUtensorMap q_tma, float* __restrict__ beta, float* __restrict__ dq_out, float* __restrict__ dk_out, float* __restrict__ dg_out, float* __restrict__ db_out, float* __restrict__ dAkk_out, __nv_bfloat16* __restrict__ dv_out, int num_heads, int* __restrict__ seq_chunk_start, int num_seqs, int* __restrict__ chunk_bos, int* __restrict__ chunk_len, float scale)
+kernel_cake_kda_train_15ba135cad91be1ee5c1(const __grid_constant__ CUtensorMap do_tma, const __grid_constant__ CUtensorMap vn_tma, const __grid_constant__ CUtensorMap dv2_tma, const __grid_constant__ CUtensorMap v_tma, const __grid_constant__ CUtensorMap h_tma, const __grid_constant__ CUtensorMap dh_tma, const __grid_constant__ CUtensorMap akk_tma, const __grid_constant__ CUtensorMap gk_tma, const __grid_constant__ CUtensorMap k_tma, const __grid_constant__ CUtensorMap q_tma, float* __restrict__ beta, float* __restrict__ dq_out, float* __restrict__ dk_out, float* __restrict__ dg_out, float* __restrict__ db_out, float* __restrict__ dAkk_out, __nv_bfloat16* __restrict__ dv_out, int num_heads, int* __restrict__ seq_chunk_start, int num_seqs, int* __restrict__ chunk_bos, int* __restrict__ chunk_len, float scale)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -458,6 +458,7 @@ kernel_cake_kda_train_61dd40db6dd98ecd4ad0(const __grid_constant__ CUtensorMap d
             int t_row = wq * 16 + (lane & 15);
             int row_base = wq * 32 << 16;
             int tid_1 = warp * 32 + lane;
+            int lane_c = lane;
             int it_i = 0;
             int nc_c = seq_chunk_start[num_seqs];
             int num_items_c = nc_c * num_heads;
@@ -465,9 +466,9 @@ kernel_cake_kda_train_61dd40db6dd98ecd4ad0(const __grid_constant__ CUtensorMap d
             unsigned int _phase_dh_full_0 = 0;
             unsigned int _phase_a_ready_0 = 0;
             unsigned int _phase_ops_full_0 = 0;
+            unsigned int _phase_akkv_full_0 = 0;
             unsigned int _phase_b_ready_0 = 0;
             unsigned int _phase_q_full_0 = 0;
-            unsigned int _phase_akkv_full_0 = 0;
             unsigned int _phase_c_ready_0 = 0;
             unsigned int _phase_d_ready_0 = 0;
             #pragma unroll 1
@@ -535,6 +536,21 @@ kernel_cake_kda_train_61dd40db6dd98ecd4ad0(const __grid_constant__ CUtensorMap d
                 mbarrier_wait(ops_full_addr, _phase_ops_full_0);
                 _phase_ops_full_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
+                if (clen < 64) {
+                    float zq[4];
+                    zq[0] = 0.0f;
+                    zq[1] = 0.0f;
+                    zq[2] = 0.0f;
+                    zq[3] = 0.0f;
+                    int row = wq * 16 + (lane_c & 15);
+                    #pragma unroll
+                    for (int i = 0; i < 2; i++) {
+                        int qc = (lane_c >> 4) * 2 + i;
+                        if (row >= clen) {
+                            asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"((k_s_addr + (unsigned int)((cblk * 32 + qc * 8) / 64 * 8192 + row * 128 + (cblk * 32 + qc * 8) % 64 * 2 ^ ((cblk * 32 + qc * 8) / 64 * 8192 + row * 128 + (cblk * 32 + qc * 8) % 64 * 2 >> 7 & 7) << 4))), "f"(zq[0]), "f"(zq[1]), "f"(zq[2]), "f"(zq[3]) : "memory");
+                        }
+                    }
+                }
                 #pragma unroll
                 for (int _one_a = 0; _one_a < 1; _one_a++) {
                     int blk = cblk;
@@ -654,6 +670,24 @@ kernel_cake_kda_train_61dd40db6dd98ecd4ad0(const __grid_constant__ CUtensorMap d
                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((kgb_k_addr + (unsigned int)((col + q_4 * 8) / 64 * 8192 + t_row * 128 + (col + q_4 * 8) % 64 * 2 ^ ((col + q_4 * 8) / 64 * 8192 + t_row * 128 + (col + q_4 * 8) % 64 * 2 >> 7 & 7) << 4))), "r"(kgv_bf16[q_4 * 4]), "r"(kgv_bf16[q_4 * 4 + 1]), "r"(kgv_bf16[q_4 * 4 + 2]), "r"(kgv_bf16[q_4 * 4 + 3]) : "memory");
                     }
                 }
+                mbarrier_wait(akkv_full_addr, _phase_akkv_full_0);
+                _phase_akkv_full_0 ^= 1;
+                asm volatile("tcgen05.fence::after_thread_sync;");
+                if (clen < 64) {
+                    float zq_1[4];
+                    zq_1[0] = 0.0f;
+                    zq_1[1] = 0.0f;
+                    zq_1[2] = 0.0f;
+                    zq_1[3] = 0.0f;
+                    int row_1 = wq * 16 + (lane_c & 15);
+                    #pragma unroll
+                    for (int i_1 = 0; i_1 < 2; i_1++) {
+                        int qc_1 = (lane_c >> 4) * 2 + i_1;
+                        if (row_1 >= clen) {
+                            asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"((v_k_addr + (unsigned int)((cblk * 32 + qc_1 * 8) / 64 * 8192 + row_1 * 128 + (cblk * 32 + qc_1 * 8) % 64 * 2 ^ ((cblk * 32 + qc_1 * 8) / 64 * 8192 + row_1 * 128 + (cblk * 32 + qc_1 * 8) % 64 * 2 >> 7 & 7) << 4))), "f"(zq_1[0]), "f"(zq_1[1]), "f"(zq_1[2]), "f"(zq_1[3]) : "memory");
+                        }
+                    }
+                }
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(a_drained_addr);
@@ -689,9 +723,22 @@ kernel_cake_kda_train_61dd40db6dd98ecd4ad0(const __grid_constant__ CUtensorMap d
                 _phase_b_ready_0 ^= 1;
                 mbarrier_wait(q_full_addr, _phase_q_full_0);
                 _phase_q_full_0 ^= 1;
-                mbarrier_wait(akkv_full_addr, _phase_akkv_full_0);
-                _phase_akkv_full_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
+                if (clen < 64) {
+                    float zq_2[4];
+                    zq_2[0] = 0.0f;
+                    zq_2[1] = 0.0f;
+                    zq_2[2] = 0.0f;
+                    zq_2[3] = 0.0f;
+                    int row_2 = wq * 16 + (lane_c & 15);
+                    #pragma unroll
+                    for (int i_2 = 0; i_2 < 2; i_2++) {
+                        int qc_2 = (lane_c >> 4) * 2 + i_2;
+                        if (row_2 >= clen) {
+                            asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"((q_s_addr + (unsigned int)((cblk * 32 + qc_2 * 8) / 64 * 8192 + row_2 * 128 + (cblk * 32 + qc_2 * 8) % 64 * 2 ^ ((cblk * 32 + qc_2 * 8) / 64 * 8192 + row_2 * 128 + (cblk * 32 + qc_2 * 8) % 64 * 2 >> 7 & 7) << 4))), "f"(zq_2[0]), "f"(zq_2[1]), "f"(zq_2[2]), "f"(zq_2[3]) : "memory");
+                        }
+                    }
+                }
                 float db_acc = 0.0f;
                 #pragma unroll
                 for (int _one_b = 0; _one_b < 1; _one_b++) {
@@ -1080,6 +1127,7 @@ kernel_cake_kda_train_61dd40db6dd98ecd4ad0(const __grid_constant__ CUtensorMap d
                     int head_1 = it_1 % (unsigned int)num_heads;
                     int row0_1 = chunk_1 * 64;
                     int hrow0_1 = (chunk_1 * num_heads + head_1) * 128;
+                    int trow = chunk_bos[chunk_1];
                     mbarrier_wait(dv2_free_addr, _phase_dv2_free_0);
                     _phase_dv2_free_0 ^= 1;
                     mbarrier_arrive_expect_tx(dv2_full_addr, 16384);
@@ -1113,7 +1161,7 @@ kernel_cake_kda_train_61dd40db6dd98ecd4ad0(const __grid_constant__ CUtensorMap d
                     #pragma unroll
                     for (int seg_4 = 0; seg_4 < 2; seg_4++) {
                         int c4 = seg_4 * 64;
-                        tma_3d_gmem2smem(k_p_addr + (unsigned int)(seg_4 * 8192), (&k_tma), c4, head_1, row0_1, ops_full_addr);
+                        tma_3d_gmem2smem(k_p_addr + (unsigned int)(seg_4 * 8192), (&k_tma), c4, head_1, trow, ops_full_addr);
                     }
                     mbarrier_arrive_expect_tx(dovn_full_addr, 32768);
                     #pragma unroll
@@ -1129,7 +1177,7 @@ kernel_cake_kda_train_61dd40db6dd98ecd4ad0(const __grid_constant__ CUtensorMap d
                     #pragma unroll
                     for (int seg_6 = 0; seg_6 < 2; seg_6++) {
                         int c6 = seg_6 * 64;
-                        tma_3d_gmem2smem(v_p_addr + (unsigned int)(seg_6 * 8192), (&v_tma), c6, head_1, row0_1, akkv_full_addr);
+                        tma_3d_gmem2smem(v_p_addr + (unsigned int)(seg_6 * 8192), (&v_tma), c6, head_1, trow, akkv_full_addr);
                     }
                     mbarrier_wait(a_committed_addr, _phase_a_committed_0);
                     _phase_a_committed_0 ^= 1;
@@ -1139,7 +1187,7 @@ kernel_cake_kda_train_61dd40db6dd98ecd4ad0(const __grid_constant__ CUtensorMap d
                     #pragma unroll
                     for (int seg_7 = 0; seg_7 < 2; seg_7++) {
                         int c7 = seg_7 * 64;
-                        tma_3d_gmem2smem(q_p_addr + (unsigned int)(seg_7 * 8192), (&q_tma), c7, head_1, row0_1, q_full_addr);
+                        tma_3d_gmem2smem(q_p_addr + (unsigned int)(seg_7 * 8192), (&q_tma), c7, head_1, trow, q_full_addr);
                     }
                     unsigned int nxt = it_1 + (unsigned int)num_bids;
                     if (nxt < (unsigned int)num_items_l) {

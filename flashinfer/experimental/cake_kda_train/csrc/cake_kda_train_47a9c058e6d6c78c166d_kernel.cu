@@ -61,7 +61,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_kda_train_a9c705bf13fade587728(float* __restrict__ dg_in, float* __restrict__ db_in, int* __restrict__ chunk_bos, int* __restrict__ chunk_len, float* __restrict__ dg_out, __nv_bfloat16* __restrict__ dbeta_out, int num_heads)
+kernel_cake_kda_train_47a9c058e6d6c78c166d(float* __restrict__ dg_in, float* __restrict__ db_in, int* __restrict__ chunk_bos, int* __restrict__ chunk_len, float* __restrict__ dg_out, __nv_bfloat16* __restrict__ dbeta_out, int num_heads)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -84,12 +84,21 @@ kernel_cake_kda_train_a9c705bf13fade587728(float* __restrict__ dg_in, float* __r
     // Kernel setup ops
     float* totals = reinterpret_cast<float*>(smem_raw + 0);
     const int totals_addr = smem + 0;
-    int clen_setup = chunk_len[blockIdx.x];
+    int bx_s = blockIdx.x;
+    int by_s = blockIdx.y;
+    int nbx_s = (int)gridDim.x;
+    int lin_s = by_s * nbx_s + bx_s;
+    int chunk_s = lin_s / num_heads;
+    int clen_setup = chunk_len[chunk_s];
     if (__syncthreads_and(clen_setup == 0)) return;
 
     // === Task calls (dependency order) ===
-    int chunk = blockIdx.x;
-    int head = blockIdx.y;
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int nbx = (int)gridDim.x;
+    int lin = by * nbx + bx;
+    int chunk = lin / num_heads;
+    int head = lin - chunk * num_heads;
     int tgrp = tid / 32;
     int quad = tid - tgrp * 32;
     int d0 = quad * 4;

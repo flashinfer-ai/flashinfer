@@ -70,7 +70,7 @@ __device__ __forceinline__ float approx_exp2(float x) {
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ beta, __nv_bfloat16* __restrict__ aqk, __nv_bfloat16* __restrict__ akk, __nv_bfloat16* __restrict__ do_, int* __restrict__ chunk_bos, int* __restrict__ chunk_len, float* __restrict__ gk_out, __nv_bfloat16* __restrict__ vb_out, __nv_bfloat16* __restrict__ kb_out, __nv_bfloat16* __restrict__ qg_out, __nv_bfloat16* __restrict__ kg_out, __nv_bfloat16* __restrict__ ke_out, __nv_bfloat16* __restrict__ qe_out, __nv_bfloat16* __restrict__ aqk_tril, __nv_bfloat16* __restrict__ akk_int, __nv_bfloat16* __restrict__ do_int, __nv_bfloat16* __restrict__ v_int, float* __restrict__ beta_int, __nv_bfloat16* __restrict__ v_new, __nv_bfloat16* __restrict__ dv2, int num_qk_heads, int num_heads, int group, int copy_saved)
+kernel_cake_kda_train_fc0b31b14ef852100538(float* __restrict__ g, __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ beta, __nv_bfloat16* __restrict__ aqk, __nv_bfloat16* __restrict__ akk, __nv_bfloat16* __restrict__ do_, int* __restrict__ chunk_bos, int* __restrict__ chunk_len, float* __restrict__ gk_out, __nv_bfloat16* __restrict__ vb_out, __nv_bfloat16* __restrict__ kb_out, __nv_bfloat16* __restrict__ qg_out, __nv_bfloat16* __restrict__ kg_out, __nv_bfloat16* __restrict__ aqk_tril, __nv_bfloat16* __restrict__ akk_int, __nv_bfloat16* __restrict__ do_int, float* __restrict__ beta_int, __nv_bfloat16* __restrict__ v_new, __nv_bfloat16* __restrict__ dv2, int num_qk_heads, int num_heads, int group, int copy_saved)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -97,8 +97,12 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
     const int gtot_addr = smem + 32768;
 
     // === Task calls (dependency order) ===
-    int chunk = blockIdx.x;
-    int head = blockIdx.y;
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int nbx = (int)gridDim.x;
+    int lin = by * nbx + bx;
+    int chunk = lin / num_heads;
+    int head = lin - chunk * num_heads;
     int qk_head = head / group;
     int warp_0 = warp;
     int lane_1 = lane;
@@ -275,13 +279,6 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
             _pk[1] = __floats2bfloat162_rn(vb[0 + 2], vb[0 + 3]);
             *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(vb_out + iidx))[0]) = _pk2;
         }
-        {
-            uint2 _pk2;
-            __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-            _pk[0] = __floats2bfloat162_rn(vsel[0 + 0], vsel[0 + 1]);
-            _pk[1] = __floats2bfloat162_rn(vsel[0 + 2], vsel[0 + 3]);
-            *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(v_int + iidx))[0]) = _pk2;
-        }
         float kb[4];
         #pragma unroll
         for (int e_10 = 0; e_10 < 4; e_10++) {
@@ -317,30 +314,14 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
             _pk[1] = __floats2bfloat162_rn(kg[0 + 2], kg[0 + 3]);
             *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(kg_out + iidx))[0]) = _pk2;
         }
-        float ke[4];
-        #pragma unroll
-        for (int e_12 = 0; e_12 < 4; e_12++) {
-            float k_e_2 = 0.0f;
-            if (t_u_2 < clen) {
-                k_e_2 = kv[e_12];
-            }
-            ke[e_12] = k_e_2;
-        }
-        {
-            uint2 _pk2;
-            __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-            _pk[0] = __floats2bfloat162_rn(ke[0 + 0], ke[0 + 1]);
-            _pk[1] = __floats2bfloat162_rn(ke[0 + 2], ke[0 + 3]);
-            *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(ke_out + iidx))[0]) = _pk2;
-        }
         float qg[4];
         #pragma unroll
-        for (int e_13 = 0; e_13 < 4; e_13++) {
+        for (int e_12 = 0; e_12 < 4; e_12++) {
             float q_e = 0.0f;
             if (t_u_2 < clen) {
-                q_e = qv[e_13];
+                q_e = qv[e_12];
             }
-            qg[e_13] = q_e * eg[e_13];
+            qg[e_12] = q_e * eg[e_12];
         }
         {
             uint2 _pk2;
@@ -348,22 +329,6 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
             _pk[0] = __floats2bfloat162_rn(qg[0 + 0], qg[0 + 1]);
             _pk[1] = __floats2bfloat162_rn(qg[0 + 2], qg[0 + 3]);
             *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(qg_out + iidx))[0]) = _pk2;
-        }
-        float qe[4];
-        #pragma unroll
-        for (int e_14 = 0; e_14 < 4; e_14++) {
-            float q_e_1 = 0.0f;
-            if (t_u_2 < clen) {
-                q_e_1 = qv[e_14];
-            }
-            qe[e_14] = q_e_1;
-        }
-        {
-            uint2 _pk2;
-            __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-            _pk[0] = __floats2bfloat162_rn(qe[0 + 0], qe[0 + 1]);
-            _pk[1] = __floats2bfloat162_rn(qe[0 + 2], qe[0 + 3]);
-            *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(qe_out + iidx))[0]) = _pk2;
         }
         if (lane_1 == 0) {
             beta_int[(int0 + (long long)t_u_2) * (long long)num_heads + (long long)head] = bt;
@@ -475,12 +440,12 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
         (&dsel[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(dwa[_pair]) & 0xffff0000u);
     }
     #pragma unroll
-    for (int e_15 = 0; e_15 < 4; e_15++) {
+    for (int e_13 = 0; e_13 < 4; e_13++) {
         float d_e = 0.0f;
         if (t_u_23 < clen) {
-            d_e = dsel[e_15];
+            d_e = dsel[e_13];
         }
-        dsel[e_15] = d_e;
+        dsel[e_13] = d_e;
     }
     {
         uint2 _pk2;
@@ -498,12 +463,12 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
         (&dsel_26[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(dwa[2 + _pair]) & 0xffff0000u);
     }
     #pragma unroll
-    for (int e_16 = 0; e_16 < 4; e_16++) {
+    for (int e_14 = 0; e_14 < 4; e_14++) {
         float d_e_1 = 0.0f;
         if (t_u_24 < clen) {
-            d_e_1 = dsel_26[e_16];
+            d_e_1 = dsel_26[e_14];
         }
-        dsel_26[e_16] = d_e_1;
+        dsel_26[e_14] = d_e_1;
     }
     {
         uint2 _pk2;
@@ -521,12 +486,12 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
         (&dsel_29[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(dwa[4 + _pair]) & 0xffff0000u);
     }
     #pragma unroll
-    for (int e_17 = 0; e_17 < 4; e_17++) {
+    for (int e_15 = 0; e_15 < 4; e_15++) {
         float d_e_2 = 0.0f;
         if (t_u_27 < clen) {
-            d_e_2 = dsel_29[e_17];
+            d_e_2 = dsel_29[e_15];
         }
-        dsel_29[e_17] = d_e_2;
+        dsel_29[e_15] = d_e_2;
     }
     {
         uint2 _pk2;
@@ -544,12 +509,12 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
         (&dsel_32[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(dwa[6 + _pair]) & 0xffff0000u);
     }
     #pragma unroll
-    for (int e_18 = 0; e_18 < 4; e_18++) {
+    for (int e_16 = 0; e_16 < 4; e_16++) {
         float d_e_3 = 0.0f;
         if (t_u_30 < clen) {
-            d_e_3 = dsel_32[e_18];
+            d_e_3 = dsel_32[e_16];
         }
-        dsel_32[e_18] = d_e_3;
+        dsel_32[e_16] = d_e_3;
     }
     {
         uint2 _pk2;
@@ -567,12 +532,12 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
         (&dsel_35[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(dwa[8 + _pair]) & 0xffff0000u);
     }
     #pragma unroll
-    for (int e_19 = 0; e_19 < 4; e_19++) {
+    for (int e_17 = 0; e_17 < 4; e_17++) {
         float d_e_4 = 0.0f;
         if (t_u_33 < clen) {
-            d_e_4 = dsel_35[e_19];
+            d_e_4 = dsel_35[e_17];
         }
-        dsel_35[e_19] = d_e_4;
+        dsel_35[e_17] = d_e_4;
     }
     {
         uint2 _pk2;
@@ -590,12 +555,12 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
         (&dsel_38[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(dwa[10 + _pair]) & 0xffff0000u);
     }
     #pragma unroll
-    for (int e_20 = 0; e_20 < 4; e_20++) {
+    for (int e_18 = 0; e_18 < 4; e_18++) {
         float d_e_5 = 0.0f;
         if (t_u_36 < clen) {
-            d_e_5 = dsel_38[e_20];
+            d_e_5 = dsel_38[e_18];
         }
-        dsel_38[e_20] = d_e_5;
+        dsel_38[e_18] = d_e_5;
     }
     {
         uint2 _pk2;
@@ -613,12 +578,12 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
         (&dsel_41[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(dwa[12 + _pair]) & 0xffff0000u);
     }
     #pragma unroll
-    for (int e_21 = 0; e_21 < 4; e_21++) {
+    for (int e_19 = 0; e_19 < 4; e_19++) {
         float d_e_6 = 0.0f;
         if (t_u_39 < clen) {
-            d_e_6 = dsel_41[e_21];
+            d_e_6 = dsel_41[e_19];
         }
-        dsel_41[e_21] = d_e_6;
+        dsel_41[e_19] = d_e_6;
     }
     {
         uint2 _pk2;
@@ -636,12 +601,12 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
         (&dsel_44[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(dwa[14 + _pair]) & 0xffff0000u);
     }
     #pragma unroll
-    for (int e_22 = 0; e_22 < 4; e_22++) {
+    for (int e_20 = 0; e_20 < 4; e_20++) {
         float d_e_7 = 0.0f;
         if (t_u_42 < clen) {
-            d_e_7 = dsel_44[e_22];
+            d_e_7 = dsel_44[e_20];
         }
-        dsel_44[e_22] = d_e_7;
+        dsel_44[e_20] = d_e_7;
     }
     {
         uint2 _pk2;
@@ -653,8 +618,8 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
     if (clen == 0) {
         float zq[4];
         #pragma unroll
-        for (int e_23 = 0; e_23 < 4; e_23++) {
-            zq[e_23] = 0.0f;
+        for (int e_21 = 0; e_21 < 4; e_21++) {
+            zq[e_21] = 0.0f;
         }
         #pragma unroll
         for (int u_3 = 0; u_3 < 8; u_3++) {
@@ -770,14 +735,14 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
             (&raw[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(aw[_pair]) & 0xffff0000u);
         }
         #pragma unroll
-        for (int e_24 = 0; e_24 < 4; e_24++) {
+        for (int e_22 = 0; e_22 < 4; e_22++) {
             float val = 0.0f;
             if (t_a_16 < clen) {
-                if (t_a_16 >= s0_17 + e_24) {
-                    val = raw[e_24];
+                if (t_a_16 >= s0_17 + e_22) {
+                    val = raw[e_22];
                 }
             }
-            raw[e_24] = val;
+            raw[e_22] = val;
         }
         {
             uint2 _pk2;
@@ -793,12 +758,12 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
             (&rawk[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(akw[_pair]) & 0xffff0000u);
         }
         #pragma unroll
-        for (int e_25 = 0; e_25 < 4; e_25++) {
+        for (int e_23 = 0; e_23 < 4; e_23++) {
             float valk = 0.0f;
             if (t_a_16 < clen) {
-                valk = rawk[e_25];
+                valk = rawk[e_23];
             }
-            rawk[e_25] = valk;
+            rawk[e_23] = valk;
         }
         {
             uint2 _pk2;
@@ -818,14 +783,14 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
             (&raw_22[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(aw[2 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
-        for (int e_26 = 0; e_26 < 4; e_26++) {
+        for (int e_24 = 0; e_24 < 4; e_24++) {
             float val_1 = 0.0f;
             if (t_a_19 < clen) {
-                if (t_a_19 >= s0_20 + e_26) {
-                    val_1 = raw_22[e_26];
+                if (t_a_19 >= s0_20 + e_24) {
+                    val_1 = raw_22[e_24];
                 }
             }
-            raw_22[e_26] = val_1;
+            raw_22[e_24] = val_1;
         }
         {
             uint2 _pk2;
@@ -841,12 +806,12 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
             (&rawk_23[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(akw[2 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
-        for (int e_27 = 0; e_27 < 4; e_27++) {
+        for (int e_25 = 0; e_25 < 4; e_25++) {
             float valk_1 = 0.0f;
             if (t_a_19 < clen) {
-                valk_1 = rawk_23[e_27];
+                valk_1 = rawk_23[e_25];
             }
-            rawk_23[e_27] = valk_1;
+            rawk_23[e_25] = valk_1;
         }
         {
             uint2 _pk2;
@@ -866,14 +831,14 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
             (&raw_28[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(aw[4 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
-        for (int e_28 = 0; e_28 < 4; e_28++) {
+        for (int e_26 = 0; e_26 < 4; e_26++) {
             float val_2 = 0.0f;
             if (t_a_25 < clen) {
-                if (t_a_25 >= s0_26 + e_28) {
-                    val_2 = raw_28[e_28];
+                if (t_a_25 >= s0_26 + e_26) {
+                    val_2 = raw_28[e_26];
                 }
             }
-            raw_28[e_28] = val_2;
+            raw_28[e_26] = val_2;
         }
         {
             uint2 _pk2;
@@ -889,12 +854,12 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
             (&rawk_29[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(akw[4 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
-        for (int e_29 = 0; e_29 < 4; e_29++) {
+        for (int e_27 = 0; e_27 < 4; e_27++) {
             float valk_2 = 0.0f;
             if (t_a_25 < clen) {
-                valk_2 = rawk_29[e_29];
+                valk_2 = rawk_29[e_27];
             }
-            rawk_29[e_29] = valk_2;
+            rawk_29[e_27] = valk_2;
         }
         {
             uint2 _pk2;
@@ -914,14 +879,14 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
             (&raw_34[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(aw[6 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
-        for (int e_30 = 0; e_30 < 4; e_30++) {
+        for (int e_28 = 0; e_28 < 4; e_28++) {
             float val_3 = 0.0f;
             if (t_a_31 < clen) {
-                if (t_a_31 >= s0_32 + e_30) {
-                    val_3 = raw_34[e_30];
+                if (t_a_31 >= s0_32 + e_28) {
+                    val_3 = raw_34[e_28];
                 }
             }
-            raw_34[e_30] = val_3;
+            raw_34[e_28] = val_3;
         }
         {
             uint2 _pk2;
@@ -937,12 +902,12 @@ kernel_cake_kda_train_94752a9b3de59da296d4(float* __restrict__ g, __nv_bfloat16*
             (&rawk_35[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(akw[6 + _pair]) & 0xffff0000u);
         }
         #pragma unroll
-        for (int e_31 = 0; e_31 < 4; e_31++) {
+        for (int e_29 = 0; e_29 < 4; e_29++) {
             float valk_3 = 0.0f;
             if (t_a_31 < clen) {
-                valk_3 = rawk_35[e_31];
+                valk_3 = rawk_35[e_29];
             }
-            rawk_35[e_31] = valk_3;
+            rawk_35[e_29] = valk_3;
         }
         {
             uint2 _pk2;

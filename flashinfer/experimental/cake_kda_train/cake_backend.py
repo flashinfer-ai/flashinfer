@@ -38,9 +38,11 @@ grid; nothing here synchronizes or reads device memory.
 
 Launch sequences.  Forward: table (+ seg_table), GLM prep (bulk | split),
 intra (``Aqk`` / ``Akk``), WY, the state recurrence, the output.  Backward:
-GLM prep (g8 | g8s | v2), [intra on the checkpoint-replay path], WY, [the
-state recurrence], dA / dv, the adjoint state recurrence, the fused
-dq / dk / dg, GLM intra, the gate epilogue.  The two state recurrences
+GLM prep, [intra on the checkpoint-replay path], WY, [the state recurrence],
+dA / dv, the adjoint state recurrence, the fused dq / dk / dg, GLM intra, the
+gate epilogue; the fused gradient and the GLM intra kernel read the user's
+``q`` / ``k`` / ``v`` token rows where they are, so the prep writes no copies
+of them.  The two state recurrences
 (``fwdh``, ``dhu``) run as the serial walk over each document's chunk chain
 (``v2`` when its one-wave form fits the device, else ``v1``) for more than
 eight heads, and as the segmented three passes for at most eight heads
@@ -329,7 +331,9 @@ def seg_states_saved(S: int, NSEG: int) -> bool:
 # slot and no launch reads a slot another live occupant holds.  Pad-chunk rows every consumer reads are written in
 # the same call by their producer (prep: all of its outputs and the v_new / dv2 pad rows; intra: Aqk / Akk pad
 # rows; wy / dav: whole pairs), so nothing depends on the arena's content from a previous call, and only the
-# per-call outputs leave the arena.
+# per-call outputs leave the arena.  The fused gradient (6) and the GLM intra kernel (7) read the user's q / k / v
+# token rows directly (TMA boxes, zero-filled past the pack), so the backward prep writes no chunk-layout copies
+# of them and the backward layouts hold none.
 
 KIND_SHAPE: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
     "F32": ((D,), torch.float32),
@@ -370,11 +374,8 @@ FWD_SLOTS: tuple[tuple[Occupant, ...], ...] = (
 )
 BWD_SLOTS: tuple[tuple[Occupant, ...], ...] = (
     (("gk", "F32", 0, (1, 7)),),
-    (("ke", "B16", 0, (1, 7)),),
-    (("qe", "B16", 0, (1, 7)),),
     (("akk_int", "A16", 0, (1, 6)),),  # written at 1 (saved path) or 1b (replay path)
     (("do_int", "B16", 0, (1, 6)), ("db_int", "V32", 0, (7, 8))),
-    (("v_int", "B16", 0, (1, 6)),),
     (("v_new", "B16", 0, (1, 6)),),  # pad rows at 1, real rows at 3
     (("dv2", "B16", 0, (1, 6)),),  # pad rows at 1, real rows at 5
     (("h", "TAPE", 0, (3, 6)), ("dg_int", "F32", 0, (7, 8))),
@@ -423,11 +424,8 @@ FWD_TAPE_SLOTS: tuple[tuple[Occupant, ...], ...] = (
 )
 BWD_TAPE_SLOTS: tuple[tuple[Occupant, ...], ...] = (
     (("gk", "F32", 0, (1, 7)),),
-    (("ke", "B16", 0, (1, 7)),),
-    (("qe", "B16", 0, (1, 7)),),
     (("akk_int", "A16", 0, (1, 6)),),
     (("do_int", "B16", 0, (1, 6)), ("db_int", "V32", 0, (7, 8))),
-    (("v_int", "B16", 0, (1, 6)),),
     (("dv2", "B16", 0, (1, 6)),),
     (("vb", "B16", 0, (1, 2)), ("dAqk", "A32", 0, (4, 7))),
     (
@@ -1101,6 +1099,8 @@ def _values(
         group=1,
         num_segments=p.NSEG,
         segments=p.P,
+        # the chunk pairs the persistent pair kernels walk
+        num_pairs=p.R // cake_jit.PAIR_ROWS,
     )
     values.update(extra)
     return values

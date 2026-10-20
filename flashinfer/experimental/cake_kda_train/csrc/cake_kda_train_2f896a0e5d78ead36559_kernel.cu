@@ -70,7 +70,7 @@ __device__ __forceinline__ float approx_exp2(float x) {
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_kda_train_786e47d493c49202746d(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, float* __restrict__ g, __nv_bfloat16* __restrict__ beta, int* __restrict__ chunk_bos, int* __restrict__ chunk_len, float* __restrict__ gk_out, __nv_bfloat16* __restrict__ vb_out, __nv_bfloat16* __restrict__ kb_out, __nv_bfloat16* __restrict__ kg_out, __nv_bfloat16* __restrict__ qg_out, __nv_bfloat16* __restrict__ v_new, int num_qk_heads, int num_heads, int group)
+kernel_cake_kda_train_2f896a0e5d78ead36559(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, float* __restrict__ g, __nv_bfloat16* __restrict__ beta, int* __restrict__ chunk_bos, int* __restrict__ chunk_len, float* __restrict__ gk_out, __nv_bfloat16* __restrict__ vb_out, __nv_bfloat16* __restrict__ kb_out, __nv_bfloat16* __restrict__ kg_out, __nv_bfloat16* __restrict__ qg_out, __nv_bfloat16* __restrict__ v_new, int num_qk_heads, int num_heads, int group)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -97,9 +97,15 @@ kernel_cake_kda_train_786e47d493c49202746d(__nv_bfloat16* __restrict__ q, __nv_b
     const int gtot_addr = smem + 32768;
 
     // === Task calls (dependency order) ===
-    int chunk = blockIdx.x / 2;
-    int half = blockIdx.x - chunk * 2;
-    int head = blockIdx.y;
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int nbx = (int)gridDim.x;
+    int lin = by * nbx + bx;
+    int per_chunk = num_heads * 2;
+    int chunk = lin / per_chunk;
+    int rem = lin - chunk * per_chunk;
+    int head = rem / 2;
+    int half = rem - head * 2;
     int qk_head = head / group;
     int warp_0 = warp;
     int lane_1 = lane;

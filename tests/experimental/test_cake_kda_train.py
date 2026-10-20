@@ -53,8 +53,6 @@ OUTPUT_NAMES = ("out",) + GRAD_NAMES
 
 # Dispatch constants the registry rules must reproduce (the kernels' validated regimes).
 FWD_BULK_MIN_CTAS = 256
-G8_MIN_CTAS = 256
-G8S_MIN_CTAS = 128
 FWDH_V2_CTAS_PER_SM = 4
 DHU_V2_CTAS_PER_SM = 4
 RECUR_SLICES = {"v1": 2, "v2": 4}
@@ -131,7 +129,7 @@ def _rule_kinds(rule: dict) -> list[str]:
 
 
 def test_registry_records_are_well_formed() -> None:
-    assert len(cake_jit.MODULES) == 21
+    assert len(cake_jit.MODULES) == 19
     assert tuple(cake_jit.OPTIONAL_STAGES) == OPTIONAL_STAGES
     assert cake_jit.SEGMENTS == {
         "max_heads": SEG_MAX_H,
@@ -198,6 +196,7 @@ def test_registry_records_are_well_formed() -> None:
             "fixed",
             "chunks",
             "pairs",
+            "pairs_bounded",
             "per_doc_head",
             "sm_bounded",
             "docs_heads",
@@ -251,11 +250,7 @@ def _expected_records(nc_pad: int, n: int, h: int, sm: int) -> dict[str, str | N
         ),
         "seg_carry": "seg_carry" if seg else None,
         "fwd_o": "fwd_o",
-        "bwd_prep": (
-            "bwd_prep_g8"
-            if ctas >= G8_MIN_CTAS
-            else ("bwd_prep_g8s" if ctas >= G8S_MIN_CTAS else "bwd_prep_v2")
-        ),
+        "bwd_prep": "bwd_prep_g8",
         "dav": "dav",
         "dhu": "dhu_v3"
         if seg
@@ -276,19 +271,18 @@ def _expected_grid(
     ctas = nc_pad * h
     if name in ("table", "seg_table"):
         return (1, 1, 1)
-    if name in ("fwd_prep_split", "bwd_prep_g8s"):
+    if name == "fwd_prep_split":
         return (2 * nc_pad, h, 1)
     if name in (
         "fwd_prep_bulk",
         "fwd_intra",
-        "bwd_prep_v2",
         "bwd_prep_g8",
         "glm_intra",
         "gate_epilogue",
     ):
         return (nc_pad, h, 1)
-    if name in ("wy", "dav"):
-        return (nc_pad // 2, h, 1)
+    if name in ("wy", "dav"):  # persistent over the (pair, head) items
+        return (max(1, min(nc_pad // 2 * h, sm)), 1, 1)
     if name == "fwdh_v3":
         return ((2 if launch == 0 else 1) * nseg * h, 1, 1)
     if name == "dhu_v3":
@@ -384,6 +378,42 @@ def test_pairs_grid_needs_an_even_chunk_bound() -> None:
         cake_jit.launch_grid(
             "wy", num_chunks_pad=3, num_seqs=1, num_heads=1, sm_count=148
         )
+
+
+def test_pair_kernels_walk_the_pairs_on_a_persistent_grid() -> None:
+    # wy / dav: one CTA per SM at most, walking the (chunk pair, head) items; the pair count is a plan scalar.
+    for name in ("wy", "dav"):
+        record = cake_jit.MODULES[name]
+        assert record["grid_rule"] == {"kind": "pairs_bounded", "ctas_per_sm": 1}
+        assert ["parameter", "num_pairs"] in [list(pair) for pair in record["arg_plan"]]
+        assert record["logical"]["num_pairs"] == "num_pairs"
+        for nc_pad, h, sm in (
+            (2, 1, 148),
+            (64, 4, 148),
+            (4096, 64, 132),
+            (4096, 1, 160),
+        ):
+            grid = cake_jit.launch_grid(
+                name, num_chunks_pad=nc_pad, num_seqs=1, num_heads=h, sm_count=sm
+            )
+            assert grid == (max(1, min(nc_pad // 2 * h, sm)), 1, 1)
+
+
+def test_the_backward_reads_the_token_rows_without_chunk_layout_copies() -> None:
+    # The fused gradient and the GLM intra kernel read q / k / v where they are (TMA boxes on the token rows), so
+    # the backward prep ships its copy-free form alone and the backward layouts hold no slot for such copies.
+    logical = cake_jit.MODULES["dqkg"]["logical"]
+    assert (logical["v_tma"], logical["k_tma"], logical["q_tma"]) == ("v", "k", "q")
+    logical = cake_jit.MODULES["glm_intra"]["logical"]
+    assert (logical["k_e"], logical["q_e"]) == ("k", "q")
+    prep = cake_jit.MODULES["bwd_prep_g8"]
+    assert prep["select_rule"] == {"kind": "always"}
+    assert cake_jit.records_of_stage("bwd_prep") == ("bwd_prep_g8",)
+    assert not {"ke_out", "qe_out", "v_int"} & set(prep["logical"])
+    assert not {"ke", "qe", "v_int"} & set(cake_jit.LOGICAL_TENSORS)
+    for mode, slots in cake_backend.SLOTS.items():
+        names = {name for occupants in slots for name, *_ in occupants}
+        assert not names & {"ke", "qe", "v_int"}, mode
 
 
 def test_plan_follows_the_chunk_bound_formulas() -> None:
@@ -570,7 +600,7 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
     assert set(ARCHES) <= set(arch_flags)
     libraries = manifest["libraries"]
     names = [entry["name"] for entry in libraries]
-    assert len(names) == len(set(names)) == 21 * len(ARCHES)
+    assert len(names) == len(set(names)) == 19 * len(ARCHES)
     for entry in libraries:
         assert entry["arch"] in ARCHES
         assert entry["entry"] == "run"
