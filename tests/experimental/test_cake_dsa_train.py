@@ -2482,6 +2482,13 @@ NOPE_FWD_ARGS = (
     "has_topk_length",
     "derive_length",
     "scale_log2",
+    "cu_seqlens_q",
+    "cu_seqlens_k",
+    "indices_out",
+    "num_docs",
+    "search_iters",
+    "causal",
+    "convert",
     "grid_x",
     "grid_y",
     "grid_z",
@@ -2949,6 +2956,8 @@ def test_nope_launchers_bind_the_kernel_argument_lists_and_grids():
     keep the rope lists) followed by the grid; the grid rules follow the program's CTA mapping."""
     args = {stage: tuple(names) for stage, names in cake_launch.STAGE_ARGS.items()}
     assert args["nope_fwd"] == NOPE_FWD_ARGS
+    # the conversion operands the packed entry binds (``varlen_index_mode`` probes them) close the kernel list
+    assert NOPE_FWD_ARGS[-10:-3] == cake_backend.NOPE_FWD_CONVERT_ARGS
     for stage in (
         "nope_bwd_main",
         "nope_bwd_main_natural",
@@ -3909,12 +3918,14 @@ def _stand_in_index_prep(monkeypatch, calls: list) -> dict:
 def test_nope_index_prep_launch_values(monkeypatch):
     """The stage's launch values from the host -- the flat alias of the index rows with their offset and stride, the
     caller-allocated outputs, the document count and its search depth, the causal flag, the document-mode constants,
-    the four-rows-per-CTA grid -- and the packed entry: the stage, then the forward over its outputs, nothing else."""
+    the four-rows-per-CTA grid -- and the packed entry: the forward alone (the shipped forward program converts the
+    rows itself), the stage first only with caller lengths."""
     calls = []
     _stand_in_index_prep(monkeypatch, calls)
     local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
     T, K = (int(d) for d in local.shape)
-    assert cake_backend.varlen_index_mode(local) == "index_prep"
+    assert cake_backend.varlen_index_mode(local) == "kernel"
+    assert cake_backend.varlen_index_mode(local, caller_lengths=True) == "index_prep"
     indices, lengths = nope_globalize_indices(local, cu_q, cu_k, causal=True)
     assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE]
     v = calls[0][1]
@@ -3948,26 +3959,42 @@ def test_nope_index_prep_launch_values(monkeypatch):
         local[:0], cu_q.new_tensor([0, 0]), cu_k.new_tensor([0, 18])
     )
     assert calls == [] and tuple(empty[0].shape) == (0, K) and empty[1].numel() == 0
-    # the packed entry: the stage, then the forward over its outputs; caller lengths take precedence
+    # the packed entry: the forward program converts the rows itself -- one launch with convert = 1, the prefix
+    # sums, the document count and search depth, the causal flag, the fresh global-row buffer and derived lengths
     q, kv, _ = _nope_host_inputs(total_q=T, total_k=18, topk=K, device="cuda")
     varlen = cake_backend.dsa_sparse_attention_nope_varlen
     out, lse = varlen(q, kv, local, cu_q, cu_k, causal=True, return_lse=True)
-    assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "nope_fwd"]
-    prep, fwd = calls[0][1], calls[1][1]
-    assert prep["causal"] == 1 and prep["out"].data_ptr() == fwd["indices"].data_ptr()
-    assert fwd["topk_length"] is prep["topk_length"]
+    assert [c[0] for c in calls] == ["nope_fwd"]
+    fwd = calls[0][1]
+    assert (fwd["convert"], fwd["causal"], fwd["num_docs"], fwd["search_iters"]) == (
+        1,
+        1,
+        4,
+        3,
+    )
+    assert fwd["cu_seqlens_q"] is cu_q and fwd["cu_seqlens_k"] is cu_k
+    assert fwd["indices"].data_ptr() == local.data_ptr()
+    assert (
+        tuple(fwd["indices_out"].shape) == (T, K) and fwd["indices_out"].is_contiguous()
+    )
     assert fwd["out"] is out and fwd["lse"] is lse
-    assert (fwd["has_topk_length"], fwd["derive_length"]) == (1, 0)
+    assert (fwd["has_topk_length"], fwd["derive_length"]) == (1, 1)
+    assert tuple(fwd["topk_length"].shape) == (T,)
     assert (fwd["num_queries"], fwd["num_kv"], fwd["topk"]) == (T, 18, K)
     assert (fwd["idx_stride"], fwd["indices_offset"]) == (K, 0)
-    # (the converting program's operands ride along in the launch values with convert = 0; a launcher without the
-    # names does not pass them, so they are asserted with the extended tables in the converting-program test)
+    # caller lengths select the stage: the stage (causal off, lengths not written over the caller's), then the
+    # forward over its rows with convert = 0 and the caller's lengths
     mine = torch.full((T,), 2, dtype=torch.int32, device="cuda")
     del calls[:]
     varlen(q, kv, local, cu_q, cu_k, topk_length=mine)
     assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "nope_fwd"]
-    assert calls[1][1]["topk_length"] is mine and calls[0][1]["topk_length"] is not mine
-    assert calls[0][1]["causal"] == 0
+    prep, fwd = calls[0][1], calls[1][1]
+    assert prep["causal"] == 0 and prep["topk_length"] is not mine
+    assert prep["out"].data_ptr() == fwd["indices"].data_ptr()
+    assert fwd["topk_length"] is mine
+    assert (fwd["has_topk_length"], fwd["derive_length"], fwd["convert"]) == (1, 0, 0)
+    assert fwd["indices_out"].data_ptr() == prep["out"].data_ptr()
+    assert (fwd["num_docs"], fwd["search_iters"], fwd["causal"]) == (1, 1, 0)
     # T == 0 through the entry: nothing launched; a non-contiguous prefix sum is refused before any launch
     del calls[:]
     out = varlen(
@@ -3990,13 +4017,15 @@ def test_nope_packed_entry_lets_a_converting_forward_program_skip_the_stage(
     calls = []
     _stand_in_index_prep(monkeypatch, calls)
     names = list(cake_launch.STAGE_ARGS["nope_fwd"])
-    extended = names[:-3] + list(cake_backend.NOPE_FWD_CONVERT_ARGS) + names[-3:]
-    monkeypatch.setitem(cake_launch.STAGE_ARGS, "nope_fwd", extended)
+    if not all(name in names for name in cake_backend.NOPE_FWD_CONVERT_ARGS):
+        # a program without the operands: stand in the extended tables (the shipped tables carry them)
+        extended = names[:-3] + list(cake_backend.NOPE_FWD_CONVERT_ARGS) + names[-3:]
+        monkeypatch.setitem(cake_launch.STAGE_ARGS, "nope_fwd", extended)
 
-    def launch(run, values, grid):
-        run(*(values[name] for name in extended[:-3]), *grid)
+        def launch(run, values, grid):
+            run(*(values[name] for name in extended[:-3]), *grid)
 
-    monkeypatch.setitem(cake_launch.LAUNCH, "nope_fwd", launch)
+        monkeypatch.setitem(cake_launch.LAUNCH, "nope_fwd", launch)
     local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
     T, K = (int(d) for d in local.shape)
     assert cake_backend.varlen_index_mode(local) == "kernel"
