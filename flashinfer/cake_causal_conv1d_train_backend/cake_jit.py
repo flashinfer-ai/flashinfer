@@ -126,7 +126,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "fwd",
         "workspace_rule": None,
     },
-    "cake_causal_conv1d_train_a578fae272376f2d9537": {
+    "cake_causal_conv1d_train_21cc8e5b2b49282a47ef": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -165,8 +165,8 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "co_resident",
         },
-        "kernel": "cake_causal_conv1d_train_a578fae272376f2d9537",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_a578fae272376f2d9537",
+        "kernel": "cake_causal_conv1d_train_21cc8e5b2b49282a47ef",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_21cc8e5b2b49282a47ef",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -174,7 +174,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 50176,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_a578fae272376f2d9537",
+        "library": "cake_causal_conv1d_train_21cc8e5b2b49282a47ef",
         "logical": {
             "C": "C",
             "S": "S",
@@ -282,7 +282,7 @@ MODULES: dict[str, dict[str, Any]] = {
 ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_100a": {
         "bwd": [
-            "cake_causal_conv1d_train_a578fae272376f2d9537",
+            "cake_causal_conv1d_train_21cc8e5b2b49282a47ef",
         ],
         "fwd": [
             "cake_causal_conv1d_train_f193c5247980992f4f81",
@@ -290,7 +290,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
     },
     "sm_103a": {
         "bwd": [
-            "cake_causal_conv1d_train_a578fae272376f2d9537",
+            "cake_causal_conv1d_train_21cc8e5b2b49282a47ef",
         ],
         "fwd": [
             "cake_causal_conv1d_train_f193c5247980992f4f81",
