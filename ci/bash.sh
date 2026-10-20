@@ -90,14 +90,16 @@ if [[ ${USE_GPU} == "true" ]]; then
 
     # Forward CI_GPU_NAME so summary.py can record the lane without a torch import.
     if [[ -n "${CI_GPU_NAME:-}" ]]; then
-        DOCKER_ENV="${DOCKER_ENV} -e CI_GPU_NAME=${CI_GPU_NAME}"
+        DOCKER_ENV="${DOCKER_ENV} -e CI_GPU_NAME"
     fi
     # Forward lane-identity variables for the composite lane_id.
     if [[ -n "${TEST_SCRIPT:-}" ]]; then
-        DOCKER_ENV="${DOCKER_ENV} -e CI_TEST_SCRIPT=${TEST_SCRIPT}"
+        export CI_TEST_SCRIPT="${TEST_SCRIPT}"
+        DOCKER_ENV="${DOCKER_ENV} -e CI_TEST_SCRIPT"
     fi
     if [[ -n "${MATRIX_CUDA:-}" ]]; then
-        DOCKER_ENV="${DOCKER_ENV} -e CI_MATRIX_CUDA=${MATRIX_CUDA}"
+        export CI_MATRIX_CUDA="${MATRIX_CUDA}"
+        DOCKER_ENV="${DOCKER_ENV} -e CI_MATRIX_CUDA"
     fi
 
     # An unset host mask should leave the container's GPUs visible. Preserve
