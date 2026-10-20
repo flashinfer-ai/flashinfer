@@ -141,6 +141,65 @@ class LLProtocolState:
     stage_state: torch.Tensor
 
 
+def create_ll_state(
+    group: dist.ProcessGroup,
+    tp_size: int,
+    rank: int,
+    capacity_m: int,
+    hidden: int,
+) -> LLProtocolState:
+    """Collectively allocate a sentinel-filled ``[3, tp, capacity_m, hidden]`` mailbox."""
+    if dist.get_world_size(group) != tp_size:
+        raise ValueError("ProcessGroup size does not match tp_size")
+    if dist.get_rank(group) != rank:
+        raise ValueError("ProcessGroup rank does not match rank")
+    device = torch.device("cuda", torch.cuda.current_device())
+    mailbox = SymmetricBuffer.allocate(
+        (LAMPORT_GENERATIONS, tp_size, capacity_m, hidden),
+        torch.bfloat16,
+        device,
+        group,
+        require_multicast=True,
+    )
+    mailbox.tensor.view(torch.int16).fill_(-32768)
+    return LLProtocolState(
+        contribution_mailbox=mailbox,
+        stage_state=torch.zeros((2,), dtype=torch.int32, device=device),
+    )
+
+
+def compile_shared_only_publish(
+    *,
+    hidden: int,
+    tp: int,
+    rank: int,
+    capacity_m: int,
+    elements_per_thread: int,
+    threads: int,
+    release_before_store: bool,
+    enable_pdl: bool,
+):
+    """Compile the publisher that multicasts a local ``[m, hidden]`` BF16 tensor."""
+    device_kernel = _SharedOnlyPublishDeviceKernel(
+        hidden=hidden,
+        tp=tp,
+        rank=rank,
+        capacity_m=capacity_m,
+        elements_per_thread=elements_per_thread,
+        threads=threads,
+        release_before_store=release_before_store,
+        enable_pdl=enable_pdl,
+    )
+    return cute.compile(
+        device_kernel,
+        make_fake_dynamic_compact_tensor(BFloat16, alignment=16, divisibility=hidden),
+        make_fake_compact_tensor(Int32, (2,), assumed_align=4),
+        Int64(0),
+        Int32(capacity_m),
+        current_cu_stream(),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _CompiledFinalize:
     publish: Any
@@ -395,7 +454,7 @@ class LLProtocol:
             )
             for tuning in dict.fromkeys(all_reduce_tunings)
         }
-        self.state = self._create_state(group)
+        self.state = create_ll_state(group, tp_size, rank, capacity_m, hidden_size)
 
     def _path_kwargs(self) -> _PathKwargs:
         return {
@@ -448,7 +507,7 @@ class LLProtocol:
         return cute.compile(device_kernel, *args)
 
     def _compile_all_reduce_publish(self, tuning: LLAllReduceTuning):
-        device_kernel = _SharedOnlyPublishDeviceKernel(
+        return compile_shared_only_publish(
             hidden=self.hidden_size,
             tp=self.tp_size,
             rank=self.rank,
@@ -458,16 +517,6 @@ class LLProtocol:
             release_before_store=tuning.publish_release_before_store,
             enable_pdl=tuning.collective.enable_pdl,
         )
-        args = (
-            make_fake_dynamic_compact_tensor(
-                BFloat16, alignment=16, divisibility=self.hidden_size
-            ),
-            make_fake_compact_tensor(Int32, (2,), assumed_align=4),
-            Int64(0),
-            Int32(self.capacity_m),
-            current_cu_stream(),
-        )
-        return cute.compile(device_kernel, *args)
 
     def _compile_collective(self, tuning: LLCollectiveTuning):
         device_kernel = _LamportResidualRMSNormDeviceKernel(
@@ -516,27 +565,3 @@ class LLProtocol:
             current_cu_stream(),
         )
         return cute.compile(device_kernel, *args)
-
-    def _create_state(self, group: dist.ProcessGroup) -> LLProtocolState:
-        if dist.get_world_size(group) != self.tp_size:
-            raise ValueError("ProcessGroup size does not match tp_size")
-        if dist.get_rank(group) != self.rank:
-            raise ValueError("ProcessGroup rank does not match rank")
-        device = torch.device("cuda", torch.cuda.current_device())
-        mailbox = SymmetricBuffer.allocate(
-            (
-                LAMPORT_GENERATIONS,
-                self.tp_size,
-                self.capacity_m,
-                self.hidden_size,
-            ),
-            torch.bfloat16,
-            device,
-            group,
-            require_multicast=True,
-        )
-        mailbox.tensor.view(torch.int16).fill_(-32768)
-        return LLProtocolState(
-            contribution_mailbox=mailbox,
-            stage_state=torch.zeros((2,), dtype=torch.int32, device=device),
-        )

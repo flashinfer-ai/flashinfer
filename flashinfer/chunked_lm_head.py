@@ -14,17 +14,144 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from typing import Optional
+import json
+import os
+from typing import Any, Dict, Optional, Union
 
 import torch
 
 from .api_logging import flashinfer_experimental_api
+from .experimental.cake_lm_head_loss import cake_backend
 
 # Thin experimental entry points; validation of the backend contract, the
 # chunk plans, the workspace, launch binding, autograd wrappers and JIT
 # registration live in flashinfer.experimental.cake_lm_head_loss.
+#
+# The package backend takes every switch as a keyword argument and reads no
+# environment variable.  The FLASHINFER_CAKE_LM_HEAD_LOSS_* variables below
+# are this wrapper's A/B knobs: a switch keyword left at ``None`` falls back
+# to its variable here, and the resolved value is passed down.  The two
+# binding-cache variables are applied once, when this module is imported.
 
 _FEATURE = "chunked LM-head + loss training kernels (SM100/SM103)"
+
+# "0" turns valid-row compaction off (``compact_rows``); anything else: on.
+COMPACT_ROWS_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS"
+# "0" turns the fused weight-gradient cast off (``fuse_dw_cast``).
+FUSE_DW_CAST_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST"
+# "0" turns the fused dX finalize off (``dx_finalize``).
+DX_FINALIZE_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE"
+# "0" / "false" / "off" / "no": never; "1" / "true" / "on" / "yes": every
+# multi-chunk call; anything else (the default): "auto" (``dw_stream``).
+DW_STREAM_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM"
+# "0" turns the hidden valid-row count off (``hidden_count``).
+HIDDEN_COUNT_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT"
+# A JSON object of explicit per-GEMM knobs (``gemm_tuning``); unset / empty:
+# none.
+GEMM_TUNING_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING"
+# "0" disables the backend's binding cache (applied at import).
+BINDING_CACHE_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE"
+# Positive integer: the binding cache's capacity (applied at import; unset /
+# blank: the backend's default of 64 bindings).
+BINDING_CACHE_CAPACITY_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY"
+
+_DW_STREAM_OFF = ("0", "false", "off", "no")
+_DW_STREAM_ON = ("1", "true", "on", "yes")
+
+
+def _env_switch(value: Optional[bool], name: str) -> bool:
+    """``value`` when given, else the variable ``name``: on unless set to ``"0"``."""
+    if value is not None:
+        return bool(value)
+    return os.environ.get(name, "1") != "0"
+
+
+def _env_dw_stream(value: Optional[Union[bool, str]]) -> Union[bool, str]:
+    """``value`` when given, else ``FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM`` as
+    ``False`` (never), ``True`` (every multi-chunk call) or ``"auto"``."""
+    if value is not None:
+        return value
+    raw = os.environ.get(DW_STREAM_ENV, "auto").strip().lower()
+    if raw in _DW_STREAM_OFF:
+        return False
+    if raw in _DW_STREAM_ON:
+        return True
+    return "auto"
+
+
+def _env_gemm_tuning(
+    value: Optional[Dict[str, Dict[str, Any]]],
+) -> Optional[Dict[str, Dict[str, Any]]]:
+    """``value`` when given, else ``FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING`` parsed
+    as a JSON object (``None`` when unset / blank; invalid JSON or a non-object is a
+    ``ValueError``); the backend validates the knobs themselves."""
+    if value is not None:
+        return value
+    raw = os.environ.get(GEMM_TUNING_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        knobs = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"${GEMM_TUNING_ENV} must be a JSON object of GEMM knobs: {exc}"
+        ) from exc
+    if not isinstance(knobs, dict):
+        raise ValueError(
+            f"${GEMM_TUNING_ENV} must be a JSON object of GEMM knobs, got {raw!r}"
+        )
+    return knobs
+
+
+def _resolve_knobs(
+    *,
+    compact_rows: Optional[bool],
+    fuse_dw_cast: Optional[bool],
+    dx_finalize: Optional[bool],
+    dw_stream: Optional[Union[bool, str]],
+    hidden_count: Optional[bool],
+    gemm_tuning: Optional[Dict[str, Dict[str, Any]]],
+) -> Dict[str, Any]:
+    """The switch keywords one call passes to the backend: every explicit value
+    as given, every ``None`` replaced by its environment variable."""
+    return dict(
+        compact_rows=_env_switch(compact_rows, COMPACT_ROWS_ENV),
+        fuse_dw_cast=_env_switch(fuse_dw_cast, FUSE_DW_CAST_ENV),
+        dx_finalize=_env_switch(dx_finalize, DX_FINALIZE_ENV),
+        dw_stream=_env_dw_stream(dw_stream),
+        hidden_count=_env_switch(hidden_count, HIDDEN_COUNT_ENV),
+        gemm_tuning=_env_gemm_tuning(gemm_tuning),
+    )
+
+
+def _binding_cache_settings() -> Dict[str, Any]:
+    """``enabled`` / ``capacity`` of the backend's binding cache from the two
+    binding-cache variables (``capacity`` ``None`` = the backend's default)."""
+    enabled = os.environ.get(BINDING_CACHE_ENV, "1") != "0"
+    raw = os.environ.get(BINDING_CACHE_CAPACITY_ENV)
+    capacity: Optional[int] = None
+    if raw is not None and raw.strip():
+        try:
+            capacity = int(raw)
+        except ValueError:
+            capacity = 0
+        if capacity < 1:
+            raise ValueError(
+                f"{BINDING_CACHE_CAPACITY_ENV} must be a positive integer, got {raw!r}"
+            )
+    return dict(enabled=enabled, capacity=capacity)
+
+
+def _configure_binding_cache() -> None:
+    """Apply the binding-cache variables to ``cake_backend.BINDING_CACHE`` (at import)."""
+    settings = _binding_cache_settings()
+    capacity = settings["capacity"]
+    cake_backend.BINDING_CACHE.configure(
+        enabled=settings["enabled"],
+        capacity=cake_backend.BINDING_CACHE_DEFAULT_CAPACITY
+        if capacity is None
+        else capacity,
+    )
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
@@ -44,6 +171,10 @@ def chunked_lm_head_loss(
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
     fuse_dw_cast: Optional[bool] = None,
+    dx_finalize: Optional[bool] = None,
+    dw_stream: Optional[Union[bool, str]] = None,
+    hidden_count: Optional[bool] = None,
+    gemm_tuning: Optional[Dict[str, Dict[str, Any]]] = None,
 ):
     r"""Differentiable chunked LM-head projection + loss with a memory-bounded
     backward, SM100 / SM103 only.
@@ -110,8 +241,8 @@ def chunked_lm_head_loss(
         bitwise that of the uncompacted path; the ``loss`` / ``dW`` reductions
         run over different chunk boundaries and differ by FP32 rounding).
         ``None`` (default) reads ``FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS``
-        (on unless set to ``0``).  Compaction costs two device
-        synchronizations per call.
+        (on unless set to ``0``; the backend's own default is ``True``).
+        Compaction costs two device synchronizations per call.
     fuse_dw_cast : bool, optional
         Run the last chunk's weight-gradient GEMM in the backward, where the
         upstream scalar gradient is known, with the scale and the output cast
@@ -124,33 +255,48 @@ def chunked_lm_head_loss(
         its rows of ``X`` are saved for the backward (an in-place write to
         ``X`` between the forward and the backward raises PyTorch's
         saved-tensor version error).  ``None`` (default) reads
-        ``FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST`` (on unless set to ``0``).
+        ``FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST`` (on unless set to ``0``;
+        the backend's own default is ``True``).
+    dx_finalize : bool, optional
+        Add the K-slice slabs of a sliced ``dX`` GEMM with one fixed-order
+        kernel and, with ``compact_rows``, write the ``[T, H]`` ``dX`` in one
+        pass (``bf16(g * dX_acc)`` on the valid rows, exact zeros elsewhere)
+        instead of casting, zero-filling and scattering the compact rows; the
+        same FP32 operations in the same order, so ``dX`` is bitwise the same.
+        ``None`` (default) reads ``FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE``
+        (on unless set to ``0``; the backend's own default is ``True``).
+    dw_stream : bool or str, optional
+        Launch each chunk's weight-gradient accumulate GEMM on a per-device
+        side stream, forked after the chunk's row gradients and joined before
+        the chunk buffer is reused and before the call returns, so it overlaps
+        the tail of the chunk's ``dX`` GEMM: ``"auto"`` for calls of three or
+        more chunks, ``True`` for every multi-chunk call, ``False`` never; the
+        same kernels in the same order per kernel, so every output is bitwise
+        the same.  ``None`` (default) reads
+        ``FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM`` (``0`` / ``false`` / ``off``
+        / ``no`` -> ``False``, ``1`` / ``true`` / ``on`` / ``yes`` -> ``True``,
+        anything else -> ``"auto"``; the backend's own default is ``"auto"``).
+    hidden_count : bool, optional
+        Form a compacted call's valid-row index on the device and queue chunk
+        0's row gather and logits GEMM (its device-count form, bounded by the
+        count read from device memory) before the count reaches the host
+        through a pinned cell and a CUDA event, instead of counting and
+        indexing on the host before the first launch; the same kernels per
+        row, so every output is bitwise the same.  ``None`` (default) reads
+        ``FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT`` (on unless set to ``0``;
+        the backend's own default is ``True``).
+    gemm_tuning : dict, optional
+        Explicit per-GEMM knobs, ``{"logits": {...}, "dx": {...}, "dw": {...}}``
+        (e.g. ``{"dx": {"tile_n": 256, "k_slices": 2}}``; a knob given as
+        ``None`` pins the default form), winning over the per-chunk rules for
+        the knobs they name; a form the compiled program does not register
+        fails closed.  ``None`` (default) reads
+        ``FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING`` as a JSON object (unset or
+        blank: no explicit knob, the backend's own default; invalid JSON is a
+        ``ValueError``).
 
     Notes
     -----
-    The fused dX finalize (``FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE``, on
-    unless set to ``0``) adds the K-slice slabs of a sliced ``dX`` GEMM with one
-    fixed-order kernel and, with ``compact_rows``, writes the ``[T, H]`` ``dX`` in
-    one pass (``bf16(g * dX_acc)`` on the valid rows, exact zeros elsewhere)
-    instead of casting, zero-filling and scattering the compact rows; the same
-    FP32 operations in the same order, so ``dX`` is bitwise the same.
-
-    The dW side stream (``FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM``: ``auto``
-    (default) for calls of three or more chunks, ``1`` for every multi-chunk
-    call, ``0`` never) launches each chunk's weight-gradient accumulate GEMM on
-    a per-device side stream, forked after the chunk's row gradients and joined
-    before the chunk buffer is reused and before the call returns, so it overlaps
-    the tail of the chunk's ``dX`` GEMM; the same kernels in the same order per
-    kernel, so every output is bitwise the same.
-
-    The hidden valid-row count (``FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT``,
-    on unless set to ``0``) forms a compacted call's valid-row index on the
-    device and queues chunk 0's row gather and logits GEMM (its device-count
-    form, bounded by the count read from device memory) before the count
-    reaches the host through a pinned cell and a CUDA event, instead of
-    counting and indexing on the host before the first launch; the same
-    kernels per row, so every output is bitwise the same.
-
     Precision boundary: BF16 GEMM output promoted to FP32 for the max /
     log-sum-exp / loss arithmetic, BF16 ``dlogits``, FP32 ``dW`` accumulation
     with one cast at the output, BF16 ``dX`` (FP32 accumulation, one cast).
@@ -163,10 +309,13 @@ def chunked_lm_head_loss(
     binding (``data_ptr``, shape, stride and dtype of every input plus the
     options); later calls with the same binding launch from the remembered
     argument plans
-    (``flashinfer.experimental.cake_lm_head_loss.cake_backend.BINDING_CACHE``;
-    ``FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE=0`` disables it).  Peak
-    temporary memory is reported separately from the weights, the outputs and
-    the FP32 accumulators by ``cake_backend.memory_report``.
+    (``flashinfer.experimental.cake_lm_head_loss.cake_backend.BINDING_CACHE``).
+    When this module is imported, ``FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE=0``
+    disables that cache and ``FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY``
+    (a positive integer; default 64) sets its capacity, through
+    ``BINDING_CACHE.configure``.  Peak temporary memory is reported separately
+    from the weights, the outputs and the FP32 accumulators by
+    ``cake_backend.memory_report``.
 
     Returns
     -------
@@ -179,8 +328,6 @@ def chunked_lm_head_loss(
         raise ValueError(
             "the chunked LM-head + loss kernels currently support backend='cake'"
         )
-    from .experimental.cake_lm_head_loss import cake_backend
-
     return cake_backend.chunked_lm_head_loss(
         X,
         W,
@@ -194,8 +341,14 @@ def chunked_lm_head_loss(
         grad_weight_dtype=grad_weight_dtype,
         deterministic=deterministic,
         backend="cake",
-        compact_rows=compact_rows,
-        fuse_dw_cast=fuse_dw_cast,
+        **_resolve_knobs(
+            compact_rows=compact_rows,
+            fuse_dw_cast=fuse_dw_cast,
+            dx_finalize=dx_finalize,
+            dw_stream=dw_stream,
+            hidden_count=hidden_count,
+            gemm_tuning=gemm_tuning,
+        ),
     )
 
 
@@ -210,6 +363,10 @@ def chunked_lm_head_logprob(
     backend: str = "cake",
     compact_rows: Optional[bool] = None,
     fuse_dw_cast: Optional[bool] = None,
+    dx_finalize: Optional[bool] = None,
+    dw_stream: Optional[Union[bool, str]] = None,
+    hidden_count: Optional[bool] = None,
+    gemm_tuning: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> torch.Tensor:
     r"""Differentiable chunked selected-token log-probability, SM100 / SM103 only.
 
@@ -221,15 +378,17 @@ def chunked_lm_head_logprob(
     recomputes each chunk's logits (four GEMMs per chunk) and produces BF16
     ``dX`` and ``dW`` through FP32 accumulators with one cast each (with
     ``fuse_dw_cast`` the last chunk's weight-gradient GEMM writes the BF16
-    ``dW`` from its epilogue).  Arguments as in :func:`chunked_lm_head_loss`;
-    ``dW`` is returned in BF16.
+    ``dW`` from its epilogue).  Arguments as in :func:`chunked_lm_head_loss`,
+    including the switches ``compact_rows``, ``fuse_dw_cast``, ``dx_finalize``,
+    ``dw_stream``, ``hidden_count`` and ``gemm_tuning`` with the same defaults
+    (``None`` reads the same ``FLASHINFER_CAKE_LM_HEAD_LOSS_*`` variable; every
+    switch is resolved once in the forward and the backward recomputes under
+    the same values); ``dW`` is returned in BF16.
     """
     if backend != "cake":
         raise ValueError(
             "the chunked LM-head + loss kernels currently support backend='cake'"
         )
-    from .experimental.cake_lm_head_loss import cake_backend
-
     return cake_backend.chunked_lm_head_logprob(
         X,
         W,
@@ -237,6 +396,15 @@ def chunked_lm_head_logprob(
         chunk_size=chunk_size,
         deterministic=deterministic,
         backend="cake",
-        compact_rows=compact_rows,
-        fuse_dw_cast=fuse_dw_cast,
+        **_resolve_knobs(
+            compact_rows=compact_rows,
+            fuse_dw_cast=fuse_dw_cast,
+            dx_finalize=dx_finalize,
+            dw_stream=dw_stream,
+            hidden_count=hidden_count,
+            gemm_tuning=gemm_tuning,
+        ),
     )
+
+
+_configure_binding_cache()

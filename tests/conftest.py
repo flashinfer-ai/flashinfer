@@ -37,7 +37,7 @@ def _patch_cutlass_dsl_operand_major_mode():
 _patch_cutlass_dsl_operand_major_mode()
 
 import flashinfer
-from flashinfer.jit import MissingJITCacheError
+from flashinfer.jit import JitSpec, JitSpecNvcc, MissingJITCacheError
 
 pytest_plugins = ["tests.test_helpers.parametrize"]
 
@@ -92,6 +92,21 @@ TORCH_COMPILE_FNS = [
 ]
 
 _TORCH_COMPILE_CACHE: Dict[str, Any] = dict()
+
+
+def _missing_jit_cache_spec_info(spec: JitSpec) -> Dict[str, Any]:
+    """Return report metadata without assuming a particular JIT backend."""
+    if isinstance(spec, JitSpecNvcc):
+        return {
+            "name": spec.name,
+            "sources": [str(s) for s in spec.sources],
+            "needs_device_linking": spec.needs_device_linking,
+            "aot_path": str(spec.aot_path),
+        }
+    return {
+        "name": spec.name,
+        "artifact_path": str(spec.get_library_path()),
+    }
 
 
 def _set_torch_compile_options():
@@ -316,14 +331,7 @@ def pytest_runtest_call(item):
             module_name = spec.name if spec else "unknown"
 
             # Create a dict with module info for reporting
-            spec_info = None
-            if spec:
-                spec_info = {
-                    "name": spec.name,
-                    "sources": [str(s) for s in spec.sources],
-                    "needs_device_linking": spec.needs_device_linking,
-                    "aot_path": str(spec.aot_path),
-                }
+            spec_info = _missing_jit_cache_spec_info(spec) if spec else None
 
             _MISSING_JIT_CACHE_MODULES.add((test_name, module_name, str(spec_info)))
             pytest.skip(f"Skipping due to missing JIT cache for module: {module_name}")

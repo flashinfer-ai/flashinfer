@@ -30,7 +30,7 @@ class MoKConfig:
     # identical on every rank, the decision is per rank (see
     # ``MoKFunctional._observe_load``). ``None`` keeps the fixed split; see
     # ``MoKFunctional._comm_split``. The threshold default is the BF16 value of
-    # ``flashinfer.mok.IMBALANCE_THRESHOLDS`` (the facade resolves it per
+    # ``flashinfer.experimental.cake_mok_bf16.api.IMBALANCE_THRESHOLDS`` (the facade resolves it per
     # precision): on B200 BF16 the imbalance split pays from about 5.6x the mean
     # load and shows no gain at 3x; on B200 MXFP8 it pays from 3x.
     imbalance_comm_sms: tuple[int, int] | None = None
@@ -39,6 +39,13 @@ class MoKConfig:
     macrobatch_size: int = 131072
     schedule_capacity_multiplier: float = 0.5
     all_gather_top_experts_chunk_bytes: int = 2048
+    # Diagnostics of the imbalance-aware path: ``True`` prints each change of
+    # the (forward, backward) communication-SM split to stderr, one line per
+    # rank, from the launch that applies it (``MoKFunctional._comm_split``).
+    # Off by default; no effect while ``imbalance_comm_sms`` is ``None``. The
+    # value is compared across ranks at workspace creation like every field; a
+    # later ``dataclasses.replace`` on one rank only changes that rank's log.
+    comm_split_log: bool = False
 
 
 @dataclass(frozen=True, slots=True)

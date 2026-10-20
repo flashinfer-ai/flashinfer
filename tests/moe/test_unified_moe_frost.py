@@ -83,9 +83,7 @@ def test_public_config_registration(config, key):
     assert config in api.ALL_BACKEND_CONFIGS
     assert eval(repr(config()), vars(api)) == config()
     assert BackendOptions((config(),)).valid_for(107) == [config()]
-    assert BackendOptions((config(),)).valid_for(120) == (
-        [config()] if config is CudnnFrostBf16Config else []
-    )
+    assert BackendOptions((config(),)).valid_for(120) == [config()]
     assert BackendOptions((config(),)).valid_for(121) == []
     assert BackendOptions((config(),)).valid_for(100) == []
     assert layer_module._BACKEND_RUNNERS[config].backend_key == key
@@ -505,7 +503,7 @@ def frost_case(request):
 
 
 def _make_frost_case(dtype, geometry=(64, 2048, 1408, 6)):
-    supported = ((10, 7), (12, 0)) if dtype == "bf16" else ((10, 7),)
+    supported = ((10, 7), (12, 0))
     if (
         not torch.cuda.is_available()
         or torch.cuda.get_device_capability() not in supported

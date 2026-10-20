@@ -16,7 +16,7 @@
 
 // tvm-ffi direct-source launcher shared by every SM120 Sage block-sparse attention
 // specialization. The JIT loader defines CAKE_SAGE_SM120_KERNEL as the kernel symbol of the
-// specialization compiled into the same module; all 25 kernels share this launch contract.
+// specialization compiled into the same module; every specialization shares this contract.
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -69,41 +69,6 @@ class ScopedCudaDevice {
   int previous_device_ = -1;
   bool restore_ = false;
 };
-
-inline void CheckCudaTensor(const TensorView& t, const char* name) {
-  TVM_FFI_CHECK(t.device().device_type == kDLCUDA, ValueError)
-      << name << " must be a CUDA tensor, got device_type=" << (int)t.device().device_type;
-}
-
-inline void CheckSameCudaDevice(const TensorView& t, const TensorView& reference, const char* name,
-                                const char* reference_name) {
-  TVM_FFI_CHECK(t.device().device_id == reference.device().device_id, ValueError)
-      << name << " must be on the same CUDA device as " << reference_name
-      << ": got cuda:" << t.device().device_id << " versus cuda:" << reference.device().device_id;
-}
-
-inline void CheckCurrentCudaDevice(const TensorView& reference, const char* reference_name) {
-  int current_device = -1;
-  cudaError_t error = cudaGetDevice(&current_device);
-  TVM_FFI_CHECK(error == cudaSuccess, RuntimeError)
-      << "cudaGetDevice failed while validating " << reference_name
-      << ": cudaError=" << static_cast<int>(error);
-  TVM_FFI_CHECK(current_device == reference.device().device_id, ValueError)
-      << "current CUDA device must match " << reference_name << ": current=cuda:" << current_device
-      << ", tensor=cuda:" << reference.device().device_id;
-}
-
-inline void CheckContiguous(const TensorView& t, const char* name) {
-  TVM_FFI_CHECK(t.IsContiguous(), ValueError) << name << " must be contiguous";
-}
-
-inline void CheckDtype(const TensorView& t, const char* name, int code, int bits, int lanes) {
-  DLDataType d = t.dtype();
-  TVM_FFI_CHECK((int)d.code == code && (int)d.bits == bits && (int)d.lanes == lanes, TypeError)
-      << name << " dtype mismatch: expected DLDataType(code=" << code << ", bits=" << bits
-      << ", lanes=" << lanes << "), got (code=" << (int)d.code << ", bits=" << (int)d.bits
-      << ", lanes=" << (int)d.lanes << ")";
-}
 
 // 4D TMA descriptor for buffer 'Q_map' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
@@ -378,36 +343,36 @@ void Run(TensorView arg_Q_map, TensorView arg_K_map, TensorView arg_V_map, Tenso
          double arg_softmax_scale, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = arg_Q_map.device();
   ScopedCudaDevice device_guard(dev.device_id);
-  CheckCudaTensor(arg_Q_map, "Q_map");
-  CheckDtype(arg_Q_map, "Q_map", 0, 8, 1);
-  CheckContiguous(arg_Q_map, "Q_map");
-  CheckCudaTensor(arg_K_map, "K_map");
-  CheckDtype(arg_K_map, "K_map", 0, 8, 1);
-  CheckContiguous(arg_K_map, "K_map");
-  CheckCudaTensor(arg_V_map, "V_map");
-  CheckDtype(arg_V_map, "V_map", 1, 8, 1);
-  CheckContiguous(arg_V_map, "V_map");
-  CheckCudaTensor(arg_O_map, "O_map");
-  CheckDtype(arg_O_map, "O_map", 4, 16, 1);
-  CheckContiguous(arg_O_map, "O_map");
-  CheckCudaTensor(arg_q_scale, "q_scale");
-  CheckDtype(arg_q_scale, "q_scale", 2, 32, 1);
-  CheckContiguous(arg_q_scale, "q_scale");
-  CheckCudaTensor(arg_k_scale, "k_scale");
-  CheckDtype(arg_k_scale, "k_scale", 2, 32, 1);
-  CheckContiguous(arg_k_scale, "k_scale");
-  CheckCudaTensor(arg_v_scale, "v_scale");
-  CheckDtype(arg_v_scale, "v_scale", 2, 32, 1);
-  CheckContiguous(arg_v_scale, "v_scale");
-  CheckCudaTensor(arg_q2k_block_index, "q2k_block_index");
-  CheckDtype(arg_q2k_block_index, "q2k_block_index", 0, 32, 1);
-  CheckContiguous(arg_q2k_block_index, "q2k_block_index");
-  CheckCudaTensor(arg_q2k_block_nums, "q2k_block_nums");
-  CheckDtype(arg_q2k_block_nums, "q2k_block_nums", 0, 32, 1);
-  CheckContiguous(arg_q2k_block_nums, "q2k_block_nums");
-  CheckCudaTensor(arg_block_sizes, "block_sizes");
-  CheckDtype(arg_block_sizes, "block_sizes", 0, 32, 1);
-  CheckContiguous(arg_block_sizes, "block_sizes");
+  check_cuda_tensor(arg_Q_map, "Q_map");
+  check_dtype(arg_Q_map, dl_int8, "Q_map");
+  check_contiguous(arg_Q_map, "Q_map");
+  check_cuda_tensor(arg_K_map, "K_map");
+  check_dtype(arg_K_map, dl_int8, "K_map");
+  check_contiguous(arg_K_map, "K_map");
+  check_cuda_tensor(arg_V_map, "V_map");
+  check_dtype(arg_V_map, dl_uint8, "V_map");
+  check_contiguous(arg_V_map, "V_map");
+  check_cuda_tensor(arg_O_map, "O_map");
+  check_dtype(arg_O_map, dl_bfloat16, "O_map");
+  check_contiguous(arg_O_map, "O_map");
+  check_cuda_tensor(arg_q_scale, "q_scale");
+  check_dtype(arg_q_scale, dl_float32, "q_scale");
+  check_contiguous(arg_q_scale, "q_scale");
+  check_cuda_tensor(arg_k_scale, "k_scale");
+  check_dtype(arg_k_scale, dl_float32, "k_scale");
+  check_contiguous(arg_k_scale, "k_scale");
+  check_cuda_tensor(arg_v_scale, "v_scale");
+  check_dtype(arg_v_scale, dl_float32, "v_scale");
+  check_contiguous(arg_v_scale, "v_scale");
+  check_cuda_tensor(arg_q2k_block_index, "q2k_block_index");
+  check_dtype(arg_q2k_block_index, dl_int32, "q2k_block_index");
+  check_contiguous(arg_q2k_block_index, "q2k_block_index");
+  check_cuda_tensor(arg_q2k_block_nums, "q2k_block_nums");
+  check_dtype(arg_q2k_block_nums, dl_int32, "q2k_block_nums");
+  check_contiguous(arg_q2k_block_nums, "q2k_block_nums");
+  check_cuda_tensor(arg_block_sizes, "block_sizes");
+  check_dtype(arg_block_sizes, dl_int32, "block_sizes");
+  check_contiguous(arg_block_sizes, "block_sizes");
   TVM_FFI_CHECK(arg_seqlen_q >= -2147483648LL && arg_seqlen_q <= 2147483647LL, ValueError)
       << "scalar 'seqlen_q' value " << arg_seqlen_q
       << " is outside i32 range [-2147483648, 2147483647]";
@@ -427,16 +392,15 @@ void Run(TensorView arg_Q_map, TensorView arg_K_map, TensorView arg_V_map, Tenso
                 ValueError)
       << "scalar 'block_sparse_num' value " << arg_block_sparse_num
       << " is outside i32 range [-2147483648, 2147483647]";
-  CheckSameCudaDevice(arg_K_map, arg_Q_map, "K_map", "Q_map");
-  CheckSameCudaDevice(arg_V_map, arg_Q_map, "V_map", "Q_map");
-  CheckSameCudaDevice(arg_O_map, arg_Q_map, "O_map", "Q_map");
-  CheckSameCudaDevice(arg_q_scale, arg_Q_map, "q_scale", "Q_map");
-  CheckSameCudaDevice(arg_k_scale, arg_Q_map, "k_scale", "Q_map");
-  CheckSameCudaDevice(arg_v_scale, arg_Q_map, "v_scale", "Q_map");
-  CheckSameCudaDevice(arg_q2k_block_index, arg_Q_map, "q2k_block_index", "Q_map");
-  CheckSameCudaDevice(arg_q2k_block_nums, arg_Q_map, "q2k_block_nums", "Q_map");
-  CheckSameCudaDevice(arg_block_sizes, arg_Q_map, "block_sizes", "Q_map");
-  CheckCurrentCudaDevice(arg_Q_map, "Q_map");
+  check_same_device(arg_K_map, arg_Q_map, "K_map", "Q_map");
+  check_same_device(arg_V_map, arg_Q_map, "V_map", "Q_map");
+  check_same_device(arg_O_map, arg_Q_map, "O_map", "Q_map");
+  check_same_device(arg_q_scale, arg_Q_map, "q_scale", "Q_map");
+  check_same_device(arg_k_scale, arg_Q_map, "k_scale", "Q_map");
+  check_same_device(arg_v_scale, arg_Q_map, "v_scale", "Q_map");
+  check_same_device(arg_q2k_block_index, arg_Q_map, "q2k_block_index", "Q_map");
+  check_same_device(arg_q2k_block_nums, arg_Q_map, "q2k_block_nums", "Q_map");
+  check_same_device(arg_block_sizes, arg_Q_map, "block_sizes", "Q_map");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y << ", "
       << grid_z << ")";

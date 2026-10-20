@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import math
+import pathlib
 import re
 
 import pytest
@@ -37,9 +38,9 @@ from flashinfer.experimental.kimi_k3_fp8_projection.cake_backend import (
     quant_units,
     required_kernel_keys,
     swizzle_sf_128x4,
-    unswizzle_sf_128x4,
 )
 from flashinfer.experimental.kimi_k3_fp8_projection.cake_jit import (
+    ARG_PLANS,
     KERNELS,
     MODULES,
     decode_kernel_key,
@@ -61,8 +62,6 @@ from flashinfer.gemm import (
 ATOL = 1e-2
 RTOL = 1e-2
 SM_COUNT = 148
-# Measured SM counts of the dispatch tables (round 7): B200 148, GB300 152.
-SM_COUNTS = {"sm_100a": 148, "sm_103a": 152}
 # Representative rows (tp, module, M): every route of the dispatch (fused decode incl.
 # resident token tiles, quantization launch + decode, quantization launch + GEMM) and
 # the correctness-only row counts of the contract (partial tiles, > 256 rows, padded
@@ -111,8 +110,9 @@ GPU_ROWS = [
         0,
     ),  # narrow-N large-M row: tabulated fused decode route above DECODE_MAX_M
     ("tp1", "b_proj", 4097, 4),
-    # Round 6 continuation 12 (lever SKO): tabulated ``gemm_sk`` rows inside the stream-K wave window -- the TMA-store
-    # instance on the aligned view and the staged register instance on the 8-byte-aligned padded row stride
+    # The former ordered stream-K cells (round 6 continuation 12; sm_100a carries the prefetched / fix-up forms there
+    # now) -- the TMA-store instance on the aligned view and the staged register instance on the 8-byte-aligned
+    # padded row stride
     ("tp8", "q_proj", 4096, 0),
     ("tp1", "o_proj", 4096, 4),
     # Round 6 continuation 17/18 (lever SKF): tabulated ``gemm_skf`` rows (fractional wave) -- the fix-up stream-K
@@ -151,6 +151,16 @@ def per_block_cast_to_fp8(w):
     sf = amax / E4M3_MAX
     q = (wv.float() * (1.0 / sf)).to(torch.float8_e4m3fn).view(n, k)
     return q, sf.view(n // BLOCK, k // BLOCK)
+
+
+def unswizzle_sf_128x4(sf_swizzled, R, C):
+    """Inverse of ``cb.swizzle_sf_128x4`` -> ``[R, C]``."""
+    Rp = -(-R // cb.SF_TILE_ROWS) * cb.SF_TILE_ROWS
+    Cp = -(-C // 4) * 4
+    v = sf_swizzled.reshape(Rp // cb.SF_TILE_ROWS, Cp // 4, 32, 4, 4).permute(
+        0, 3, 2, 1, 4
+    )
+    return v.reshape(Rp, Cp)[:R, :C]
 
 
 def make_weight(n_valid, K, device, seed):
@@ -247,7 +257,7 @@ def test_weight_scale_tiles_bn_layout():
     t192 = cb.weight_scale_tiles_bn(sf, K, 192)
     assert t192.numel() == n_tiles * ks * 2 * cb.SF_TILE_BYTES
     flat = t192.view(n_tiles, ks, 2, cb.SF_TILE_BYTES).permute(0, 2, 1, 3).reshape(-1)
-    per_row = cb.unswizzle_sf_128x4(flat, n_tiles * 256, ks * 4)
+    per_row = unswizzle_sf_128x4(flat, n_tiles * 256, ks * 4)
     rows = sf.repeat_interleave(128, dim=0).repeat_interleave(4, dim=1)
     for t in range(n_tiles):
         expect = torch.zeros((256, ks * 4), dtype=torch.uint8)
@@ -266,7 +276,7 @@ def test_weight_scale_tiles_bn_layout():
     flat = (
         t384.view(n_tiles384, ks, 3, cb.SF_TILE_BYTES).permute(0, 2, 1, 3).reshape(-1)
     )
-    per_row = cb.unswizzle_sf_128x4(flat, n_tiles384 * 384, ks * 4)
+    per_row = unswizzle_sf_128x4(flat, n_tiles384 * 384, ks * 4)
     for t in range(n_tiles384):
         expect = torch.zeros((384, ks * 4), dtype=torch.uint8)
         lo, hi = t * 384, min(t * 384 + 384, n_pad)
@@ -319,7 +329,7 @@ def test_n384_cell_rules_and_g64_stems():
         cb._pdlb_stem("gemm_tstore_n192_k128_cs2") == "gemm_tstore_n192_k128_cs2_pdlb"
     )
     assert (
-        cb._pdlb_stem("gemm_tstore_n192_k128_skf4") == "gemm_tstore_n192_k128_skf4_pdlb"
+        cb._pdlb_stem("gemm_tstore_n192_k128_skf") == "gemm_tstore_n192_k128_skf_pdlb"
     )
     assert (
         cb._pdlb_stem("gemm_rstaged_n192_g64_k128") == "gemm_rstaged_n192_g64_k128_pdlb"
@@ -488,15 +498,12 @@ def test_sk_bindings_carry_no_split_scalars(monkeypatch):
             torch.zeros((128,), dtype=torch.uint32),
         ),
     )
-    # the largest hand-off area of the classes below: the stream-K form's ``rem`` tiles of GEMM_SK_TILE_BYTES behind the flags
-    sf = torch.zeros(
-        (cb.GEMM_SK_FLAG_BYTES + 8 * cb.GEMM_SK_TILE_BYTES,), dtype=torch.uint8
-    )
+    # the largest hand-off area of the classes below: the fix-up form's partial slots behind the flags
+    sf = torch.zeros((cb.GEMM_SK_FLAG_BYTES + 4096,), dtype=torch.uint8)
     device = torch.device("cpu")
     tensors = {"sk_partials", "sk_flags"}
     assert tensors <= cb._CALL_ARGS
     plain = types.SimpleNamespace(
-        gemm_sk=None,
         gemm_skf=None,
         gemm_skp=None,
         gemm_gs=False,
@@ -504,7 +511,6 @@ def test_sk_bindings_carry_no_split_scalars(monkeypatch):
         counters_offset=0,
     )
     gs = types.SimpleNamespace(
-        gemm_sk=None,
         gemm_skf=None,
         gemm_skp=None,
         gemm_gs=True,
@@ -512,7 +518,6 @@ def test_sk_bindings_carry_no_split_scalars(monkeypatch):
         counters_offset=0,
     )
     skf = types.SimpleNamespace(
-        gemm_sk=None,
         gemm_skf=types.SimpleNamespace(
             pairs=74, total=5, slots=2, first=3, partial_bytes=4096
         ),
@@ -521,15 +526,7 @@ def test_sk_bindings_carry_no_split_scalars(monkeypatch):
         gemm_gs_pairs=0,
         counters_offset=0,
     )
-    sk = types.SimpleNamespace(
-        gemm_sk=types.SimpleNamespace(pairs=74, rem=6, ksplit=7, dp=1),
-        gemm_skf=None,
-        gemm_skp=None,
-        gemm_gs=False,
-        gemm_gs_pairs=0,
-        counters_offset=0,
-    )
-    for plan in (plain, gs, skf, sk):
+    for plan in (plain, gs, skf):
         bound = cb._sk_launch_kwargs(plan, sf, device)
         scalars = cb._sk_scalar_kwargs(plan)
         assert set(bound) == tensors, sorted(bound)
@@ -542,14 +539,12 @@ def test_sk_bindings_carry_no_split_scalars(monkeypatch):
     assert cb._sk_scalar_kwargs(skf) == dict(
         sk_pairs=74, sk_rem=5, sk_ksplit=2, sk_dp=3
     )
-    assert cb._sk_scalar_kwargs(sk) == dict(sk_pairs=74, sk_rem=6, sk_ksplit=7, sk_dp=1)
     with pytest.raises(ValueError, match="stream-K partial area"):
         cb._sk_launch_kwargs(skf, sf[:64], device)
 
 
 def test_padding_and_k_sets():
     assert n_padded(12) == 256 and n_padded(6284) == 6400 and n_padded(1536) == 1536
-    assert cb.n_padded_128(12) == 128 and cb.n_padded_128(6284) == 6400
     assert (
         k_sets(128) == 2
         and k_sets(512) == 4
@@ -1472,69 +1467,13 @@ def test_decode_config_round6_continuation_rules(arch):
     # staging-slot fix (B200 S5 v2 step ee27c6e0 1.02372 / 1.02367 / 1.02372; GB300 step fc1e9fd3 1.01575 / 1.01772 / 1.01575;
     # bit-exact, Tier A), so ``gemm_tstore_n192_s2_ts4`` is in BOTH plans now (sm_103a since C18 through 96,1,512).
     assert "gemm_tstore_n192_s2_ts4" in required
-    # Round 6 continuation 12 (lever SKO): the tabulated ``gemm_sk`` rows launch the ordered stream-K instance when the
-    # launch has one full wave of CTA pairs plus at most half a wave of tail tiles: the head pair of each tail tile runs
-    # the first K half and hands its FP32 partial to the tail pair, which continues the same accumulation (bit-exact).
-    # A cell whose ordered form was replaced keeps the flag as ``gemm_sk: 0`` next to its new form (round 9: the sm_100a
-    # 56,48,4096 cell moved to the fix-up form), so the flag is read for truth, as the host does.
-    sk_rows = {k: e for k, e in decode_table(arch).items() if e.get("gemm_sk")}
-    # round 7 adds measured stream-K cells on the 512 / 1024 / 2048 buckets; every cell's window opens at its bucket.
-    # Round 8 (R8-19): the sm_103a 56,48,4096 selection is pruned -- on the 152-SM part the 448-tile launch leaves a
-    # 68-tile fractional wave (more than half a wave), so the ordered window never opened there (a plain cell); the
-    # sm_100a cell carries exactly one stream-K form (ordered until round 9's third-wave adoption, fix-up after it).
-    # Round 10 (CAKE-985 S3): the 96,28,512 cell dropped its ordered stream-K flag on both GPUs when it adopted the
-    # 384-wide pair tile (``gemm_n384_cell_conflicts``); the 12,28,4096 cell dropped it on sm_103a when that cell
-    # adopted the 384-wide tile too (R8-3 step 2ceb0c33) and on sm_100a when it adopted the prefetched stream-K form
-    # (S2, ``gemm_skp`` 4, exclusive-node confirm step 32b8cc76): the ordered record is in no architecture's sk_rows
-    # now -- sm_100a carries the SKP cell, sm_103a the 384-wide cell.
-    assert "12,28,4096" not in sk_rows and "96,28,512" not in sk_rows
+    # The ordered stream-K form (table key ``gemm_sk``, round 6 continuation 12) is no longer planned: no cell asks for
+    # it on either architecture (a cell may still carry the flag as 0 next to another form; it is read for truth),
+    # and ``required_kernel_keys`` names no ``_sk`` / ``_sks<n>`` / ``_skf4`` / ``_skf8`` program (none is registered).
+    assert not any(e.get("gemm_sk") for e in decode_table(arch).values())
     o_proj_4096 = decode_table(arch).get("56,48,4096", {})
-    assert (bool(o_proj_4096.get("gemm_sk")) != bool(o_proj_4096.get("gemm_skf"))) == (
-        arch == "sm_100a"
-    )
-    assert all(e["route"] == "gemm" and e["gemm_sk"] == 1 for e in sk_rows.values())
-    sm_count = SM_COUNTS[arch]
-    for key in sk_rows:
-        n_tiles128, num_k_iters, bucket = (int(v) for v in key.split(","))
-        plan = cb.gemm_stream_k_plan(
-            bucket,
-            n_tiles128,
-            num_k_iters,
-            arch,
-            sm_count,
-            cb._m_tiles(bucket),
-            n_tiles128 // 2,
-        )
-        assert (
-            plan is not None
-            and plan.pairs == sm_count // 2
-            and plan.grid == 2 * plan.dp
-        )
-        expected_ks = (
-            int(sk_rows[key].get("gemm_sk_ksplit", 0)) or (num_k_iters + 1) // 2
-        )
-        assert 0 < plan.rem <= plan.pairs - plan.rem and plan.ksplit == expected_ks
-        assert 2 <= plan.ksplit <= num_k_iters - 2
-        assert plan.dp + plan.rem == (cb._m_tiles(bucket) // 2) * (n_tiles128 // 2)
-    # 96 tiles over 74 pairs would plan 22 tail tiles with head 16 of 28 K iterations (table key gemm_sk_ksplit,
-    # continuation 13), but since round 10 the 12,28,4096 cell carries ``gemm_sk`` on neither architecture (sm_100a:
-    # ``gemm_skp`` 4, sm_103a: ``gemm_bn`` 384), so the ordered planner reads no flag there: plain schedule, as below
-    # one wave or untabulated
-    assert cb.gemm_stream_k_plan(4096, 12, 28, arch, 148, cb._m_tiles(4096), 6) is None
-    # 448 tiles over 74 pairs: 6 full waves (888 CTAs, one pair per data-parallel tile) + 4 tail tiles, head 28 of 48 (table key gemm_sk_ksplit)
-    assert cb.gemm_stream_k_plan(4096, 56, 48, arch, 148, cb._m_tiles(4096), 28) == (
-        cb.StreamKPlan(74, 4, 28, 444, 888) if "56,48,4096" in sk_rows else None
-    )
-    assert cb.gemm_stream_k_plan(2048, 12, 28, arch, 148, cb._m_tiles(2048), 6) is None
-    assert cb.gemm_stream_k_plan(4096, 96, 28, arch, 148, cb._m_tiles(4096), 48) is None
-    # the 256-K ordered stream-K program is required exactly where a ``gemm_sk`` cell without ``gemm_bk`` 128 remains
-    # (round 10 S3: the sm_103a 12,28,4096 cell moved to the 384-wide tile; S2: the sm_100a 12,28,4096 cell -- the last
-    # 256-K ordered cell -- moved to the prefetched form, so no architecture requires ``gemm_tstore_sk`` now; sm_103a
-    # 56,48,1024 launches the ``_k128_sk`` form); the staged-register ordered form is never required
-    assert ("gemm_tstore_sk" in required) == any(
-        int(e.get("gemm_bk", 256)) != 128 for e in sk_rows.values()
-    )
-    assert "gemm_rstaged_sk" not in required
+    assert bool(o_proj_4096.get("gemm_skf")) == (arch == "sm_100a")
+    assert not any(re.search(r"_sk(s\d+|f[48])?(_|$)", k) for k in required)
     # Round 10 (CAKE-985 S2, lever SKP): the tabulated ``gemm_skp`` rows launch the prefetched stream-K instance
     # (``_skp`` / ``_skp4`` / ``_skp8`` by the cell's slot bound) when the geometry admits a plan.  The sm_100a 12,28,4096
     # cell (tp8 q_proj, N = 1536) replaced its ordered stream-K record (``gemm_sk`` 1 / ``gemm_sk_ksplit`` 16) with
@@ -1626,8 +1565,9 @@ def test_decode_config_round6_continuation_rules(arch):
             74, 3304, 1, 74, 118, 148, 118 * cb.gemm_skf_tile_bytes(192)
         )
     )
-    assert cb.gemm_skf_tile_bytes(256) == cb.GEMM_SK_TILE_BYTES
-    # untabulated shapes, the ordered-form rows and whole waves keep the plain / ordered schedule
+    assert cb.gemm_skf_tile_bytes(256) == 256 * 1024
+    assert cb.gemm_skf_tile_bytes(192) == 192 * 1024
+    # untabulated shapes and whole waves keep the plain schedule
     assert (
         cb.gemm_stream_k_fixup_plan(4096, 5, 28, arch, 148, cb._m_tiles(4096), 3, 192)
         is None
@@ -1861,6 +1801,7 @@ def test_required_kernel_keys_are_registered_when_programs_exist(arch):
         for key in required:
             name, defines = kernel_program(arch, key)
             assert arch in MODULES[name]["arches"]
+            assert MODULES[name]["arg_plan"] in ARG_PLANS
             if key.startswith("quant:"):
                 quant_programs.add(name)
                 assert dict(defines) == {
@@ -1876,6 +1817,110 @@ def test_required_kernel_keys_are_registered_when_programs_exist(arch):
         assert set(KERNELS) == set().union(
             *(required_kernel_keys(a, SM_COUNT) for a in ARCHES)
         )
+
+
+_PROGRAM_KERNEL_FLAG = "-DCAKE_PROGRAM_KERNEL="
+_PROGRAM_KERNEL_DEFAULT = re.compile(r"^#define CAKE_PROGRAM_KERNEL (\w+)$", re.M)
+
+
+def test_shared_kernel_sources_keep_distinct_symbols():
+    # Lever twins build from one kernel translation unit: the record whose source it is defines
+    # the symbol through the file's ``CAKE_PROGRAM_KERNEL`` default, every other record names its
+    # own symbol on the compile line. All programs of one architecture load into one process, so
+    # every record must still produce ``kernel_<record>``.
+    csrc = pathlib.Path(cb.__file__).resolve().parent / "csrc"
+    symbols = {}
+    for name, record in MODULES.items():
+        kernel_source = record["sources"][0]
+        assert kernel_source.endswith("_kernel.cu"), (name, kernel_source)
+        text = (csrc / kernel_source).read_text()
+        flags = [
+            f for f in record["compile_flags"] if f.startswith(_PROGRAM_KERNEL_FLAG)
+        ]
+        defaults = _PROGRAM_KERNEL_DEFAULT.findall(text)
+        if name in kernel_source:
+            # A shared launcher needs the record's symbol on the compile line even
+            # when the kernel source is the record's own; the kernel source then
+            # sees a define equal to its default or defines the symbol literally.
+            symbol = defaults[0] if defaults else f"kernel_{name}"
+            assert f"{symbol}(" in text or "CAKE_PROGRAM_KERNEL(" in text, name
+            assert flags in ([], [f"{_PROGRAM_KERNEL_FLAG}{symbol}"]), (name, flags)
+        else:
+            assert len(flags) == 1 and len(defaults) == 1, (name, flags, defaults)
+            symbol = flags[0][len(_PROGRAM_KERNEL_FLAG) :]
+        assert symbol == f"kernel_{name}", (name, symbol)
+        symbols[name] = symbol
+    assert len(set(symbols.values())) == len(MODULES)
+
+
+_PROGRAM_SHIM_FLAG = "-DCAKE_PROGRAM_SHIM="
+_PROGRAM_SHIM_DEFAULT = re.compile(r"^#define CAKE_PROGRAM_SHIM (\w+)$", re.M)
+_LAUNCHER_NAMESPACE = re.compile(r"^namespace (\w+) \{$", re.M)
+
+
+def _check_conditions(text):
+    # The condition of every TVM_FFI_CHECK( in ``text`` as the preprocessor
+    # stringizes it: balanced parentheses, string literals skipped, multi-line aware.
+    conditions = []
+    for match in re.finditer(r"\bTVM_FFI_CHECK\(", text):
+        start = match.end()
+        depth, quoted, i = 1, False, start
+        while depth and i < len(text):
+            char = text[i]
+            if quoted:
+                if char == "\\":
+                    i += 1
+                elif char == '"':
+                    quoted = False
+            elif char == '"':
+                quoted = True
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            i += 1
+        assert depth == 0, text[start : start + 80]
+        conditions.append(text[start : i - 1])
+    return conditions
+
+
+def test_shared_launcher_sources_keep_distinct_namespaces():
+    # Programs whose exported launcher text differs only in the kernel symbol and the
+    # host-shim namespace build one launcher translation unit: the record whose source
+    # it is selects both through the file's defaults, every other record names its own
+    # on the compile line. Every record must still export its entry points from its own
+    # namespace and declare / launch its own kernel symbol.
+    csrc = pathlib.Path(cb.__file__).resolve().parent / "csrc"
+    namespaces = {}
+    for name, record in MODULES.items():
+        binding_source = record["sources"][1]
+        assert binding_source.endswith("_binding.cu"), (name, binding_source)
+        text = (csrc / binding_source).read_text()
+        assert _LAUNCHER_NAMESPACE.findall(text) == ["CAKE_PROGRAM_SHIM"], name
+        assert 'extern "C" __global__ void CAKE_PROGRAM_KERNEL(' in text, name
+        # TVM_FFI_CHECK stringizes its condition unexpanded: the kernel symbol reaches a
+        # check condition only through the expanding wrapper.
+        for condition in _check_conditions(text):
+            assert "CAKE_PROGRAM_KERNEL" not in condition, (name, condition)
+        shim_defaults = _PROGRAM_SHIM_DEFAULT.findall(text)
+        assert len(shim_defaults) == 1, (name, shim_defaults)
+        shim_flags = [
+            f for f in record["compile_flags"] if f.startswith(_PROGRAM_SHIM_FLAG)
+        ]
+        kernel_flags = [
+            f for f in record["compile_flags"] if f.startswith(_PROGRAM_KERNEL_FLAG)
+        ]
+        assert len(shim_flags) <= 1 and len(kernel_flags) <= 1, (name, record)
+        namespace = shim_flags[0][len(_PROGRAM_SHIM_FLAG) :] if shim_flags else None
+        if name in binding_source:
+            assert namespace in (None, shim_defaults[0]), (name, namespace)
+            namespace = shim_defaults[0]
+        else:
+            assert namespace is not None, (name, record["compile_flags"])
+            assert kernel_flags == [f"{_PROGRAM_KERNEL_FLAG}kernel_{name}"], name
+        assert re.fullmatch(r"cake_host_shim_[0-9a-f]{16}", namespace), name
+        namespaces[name] = namespace
+    assert len(set(namespaces.values())) == len(MODULES)
 
 
 # ---------------------------------------------------------------------------
@@ -1894,7 +1939,13 @@ def _require_program():
     if arch is None:
         pytest.skip("the Kimi-K3 FP8 projection requires an SM100/SM103 GPU")
     device = torch.device("cuda", 0)
-    if not cb.generated_program_available(device):
+    facts = cb.device_facts(device)
+    if not (
+        MODULES
+        and route_available(
+            facts.arch, required_kernel_keys(facts.arch, facts.sm_count)
+        )
+    ):
         pytest.skip(
             f"no generated Kimi-K3 FP8 projection program registered for {arch}"
         )
@@ -2070,24 +2121,9 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
             else ""
         )
         stem = stem + slot + isfx
-        # Round 6 continuation 12 (lever SKO): the tabulated ``gemm_sk`` rows inside the stream-K wave window launch the
-        # ``_sk`` instance over 2 x dp CTAs with the hand-off area behind the activation scale tiles.
-        sk = cb.gemm_stream_k_plan(
-            M,
-            _prepared.n_tiles128,
-            _prepared.num_k_iters,
-            plan.arch,
-            plan.sm_count,
-            cb._m_tiles(M),
-            plan.gemm_n_tiles,
-        )
-        sk_key = cb.gemm_kernel_key(stem + "_sk", gpf)
-        if sk is not None and not cb.route_available(plan.arch, (sk_key,)):
-            sk = None  # only the TMA-store stream-K program ships: other views keep the plain program
-        assert plan.gemm_sk == sk
         # Round 10 (CAKE-985 S2, lever SKP): the tabulated ``gemm_skp`` rows launch the prefetched stream-K instance
         # (``_skp`` / ``_skp4`` / ``_skp8`` by the cell's slot bound) when the geometry admits a plan; TMA-store stems
-        # only, after the ordered form and before the fix-up form (the Cake launcher precedence).
+        # only, before the fix-up form (the Cake launcher precedence).
         skp = (
             cb.gemm_stream_k_prefetch_plan(
                 M,
@@ -2099,7 +2135,7 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
                 plan.gemm_n_tiles,
                 bn,
             )
-            if sk is None and expected_kernel == "gemm_tstore"
+            if expected_kernel == "gemm_tstore"
             else None
         )
         skp_key = cb.gemm_kernel_key(
@@ -2121,7 +2157,7 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
                 plan.gemm_n_tiles,
                 bn,
             )
-            if sk is None and skp is None and expected_kernel == "gemm_tstore"
+            if skp is None and expected_kernel == "gemm_tstore"
             else None
         )
         skf_key = cb.gemm_kernel_key(stem + "_skf", gpf)
@@ -2129,13 +2165,7 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
             skf = None
         assert plan.gemm_skf == skf
         full_stem = stem + (
-            "_sk"
-            if sk is not None
-            else skp.program_suffix
-            if skp is not None
-            else "_skf"
-            if skf is not None
-            else ""
+            skp.program_suffix if skp is not None else "_skf" if skf is not None else ""
         )
         # the ``_pdlb`` form first, then the record-order program when it is not registered (route_plan's fallback)
         expected_key = cb.gemm_kernel_key(full_stem, gpf)
@@ -2160,9 +2190,7 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
         # lever _gs): the static grid-stride form launches 2 P' CTAs (P' = min(T, sm_count // 2), its ``sk_pairs`` scalar).
         assert plan.gemm_gs_pairs == (gs_pairs if plan.gemm_gs else 0)
         assert plan.grids[-1] == (
-            sk.grid
-            if sk is not None
-            else skp.grid
+            skp.grid
             if skp is not None
             else skf.grid
             if skf is not None
@@ -2170,13 +2198,6 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
             if plan.gemm_gs
             else cb._gemm_grid(cb._m_tiles(M), plan.gemm_n_tiles)
         )
-        if sk is not None:
-            assert (
-                _workspace_sf_numel(runner)
-                >= plan.counters_offset
-                + cb.GEMM_SK_FLAG_BYTES
-                + sk.rem * cb.GEMM_SK_TILE_BYTES
-            )
         if skf is not None:
             assert (
                 _workspace_sf_numel(runner)
@@ -2413,7 +2434,7 @@ def test_launcher_receipts_keep_placeholder_output_descriptor():
             "q_proj",
             4096,
             0,
-        ),  # quant:u4 + ordered stream-K TMA-store GEMM (gemm_sk cell)
+        ),  # quant:u4 + TMA-store GEMM (sm_100a: the prefetched stream-K form; sm_103a: the 192-wide 128-K tile)
         (
             "tp8",
             "kv_a",

@@ -67,15 +67,11 @@ MXFP8_RECORDS = read_manifest(MXFP8_ROOT / "cudnn_frost_selected_kernels.json")[
 ]
 
 
-supported_gpu = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
-    reason="packaged cuDNN Frost sources target SM107a",
-)
-# BF16 additionally packages SM120a sources of the warp-MMA template.
-bf16_gpu = pytest.mark.skipif(
+# Every dtype packages SM107a sources and SM120a sources of the warp-MMA templates.
+frost_gpu = pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 7), (12, 0)),
-    reason="packaged BF16 cuDNN Frost sources target SM107a and SM120a",
+    reason="packaged cuDNN Frost sources target SM107a and SM120a",
 )
 BF16_SHORTLIST_GEOMETRIES = {
     (12, 7168, 3072, 1),
@@ -87,8 +83,18 @@ BF16_SHORTLIST_GEOMETRIES = {
 
 
 def _sm120():
-    """SM120 has STG normal-orientation kernels only: no swap-AB or TMA store."""
+    """SM120 kernels store through STG only: no TMA store, CTA pair or FMA."""
     return torch.cuda.get_device_capability() == (12, 0)
+
+
+def _device_arch():
+    major, minor = torch.cuda.get_device_capability()
+    return f"sm_{major}{minor}a"
+
+
+def _skip_sm120_tma(store):
+    if store == "tma" and _sm120():
+        pytest.skip("SM120 Frost templates store through STG only")
 
 
 def bf16_config(topk=2, experts=8, intermediate=256, ceiling=16384):
@@ -142,7 +148,7 @@ def _bf16_moe_reference(act, weights, activation=None):
     return expanded.sum(dim=1).bfloat16()
 
 
-@bf16_gpu
+@frost_gpu
 @pytest.mark.parametrize("name", [name for name in ACTIVATIONS if name != "swiglu"])
 @pytest.mark.parametrize("tokens,topk", [(17, 1), (129, 4)])
 def test_bf16_extended_activations_graph_and_routing(name, tokens, topk, monkeypatch):
@@ -166,7 +172,7 @@ def test_bf16_extended_activations_graph_and_routing(name, tokens, topk, monkeyp
         tokens * topk, 128, 256, 8, act.hidden_states_q.device, activation
     )
     assert {k.activation for k in first} == {name}
-    assert {k.swap_ab for k in first} == ({False} if _sm120() else {False, True})
+    assert {k.swap_ab for k in first} == {False, True}
     reference = _bf16_moe_reference(act, weights, activation)
     for tactic in runner.get_valid_tactics(inputs, None):
         out = runner.forward(inputs, tactic)
@@ -225,7 +231,7 @@ def test_bf16_activation_artifact_pools_are_disjoint(
         shared_fc2 = fc2_ids
 
 
-@bf16_gpu
+@frost_gpu
 @pytest.mark.parametrize("topk", [1, 2, 4])
 def test_bf16_all_compound_tactics_full_moe_graph_and_dynamic_routing(
     topk, monkeypatch
@@ -247,12 +253,11 @@ def test_bf16_all_compound_tactics_full_moe_graph_and_dynamic_routing(
     inputs = runner.pack_inputs(act, weights)
     expected = _bf16_moe_reference(act, weights)
     tactics = runner.get_valid_tactics(inputs, None)
-    # SM107: normal/swap-AB x STG/TMA per stage. SM120: three STG geometries.
     assert len(tactics) == 4  # Two bounded choices per stage outside tuning mode.
-    if torch.cuda.get_device_capability() == (10, 7):
-        first, second = bf16_moe._kernels(129 * topk, 128, 256, 8, torch.device("cuda"))
-        assert {k.swap_ab for k in first} == {False, True}
-        assert {k.swap_ab for k in second} == {False, True}
+    # Both architectures retain a swap-AB alternative in the bounded pool.
+    first, second = bf16_moe._kernels(129 * topk, 128, 256, 8, torch.device("cuda"))
+    assert {k.swap_ab for k in first} == {False, True}
+    assert {k.swap_ab for k in second} == {False, True}
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -281,7 +286,7 @@ def test_bf16_all_compound_tactics_full_moe_graph_and_dynamic_routing(
     torch.cuda.current_stream().wait_stream(stream)
 
 
-@bf16_gpu
+@frost_gpu
 def test_bf16_interleaved_packs_do_not_exchange_weights_and_reject_stale_tactics():
     runner = bf16_moe.CudnnFrostBf16MoeRunner(bf16_config(), "cuda")
     runner.check_support()
@@ -310,7 +315,7 @@ def test_bf16_interleaved_packs_do_not_exchange_weights_and_reject_stale_tactics
         runner.pack_inputs(a, wa)
 
 
-@bf16_gpu
+@frost_gpu
 @pytest.mark.parametrize(
     "experts,hidden,intermediate",
     [(12, 7168, 3072), (8, 4096, 14336), (64, 2048, 1408)],
@@ -355,7 +360,7 @@ def test_bf16_model_geometry_artifacts_ragged_graph(
     assert error.item() < 0.01
 
 
-@bf16_gpu
+@frost_gpu
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -501,7 +506,7 @@ def test_bf16_layer_adds_independent_candidate_and_separates_winner_cache(monkey
     assert not layer._winners
 
 
-@bf16_gpu
+@frost_gpu
 @pytest.mark.parametrize(
     "experts,hidden,intermediate",
     [(12, 7168, 3072), (8, 4096, 14336)],
@@ -612,11 +617,11 @@ def test_bf16_artifact_architecture_and_swap_abi_isolation(
                 f"sm_{capability[0]}{capability[1]}a"
             }
             if capability == (12, 0):
-                # The SM120 template has neither swap-AB nor TMA-store variants.
+                # The SM120 templates have no TMA-store variant.
                 assert {
                     (k.swap_ab, k.tactic_metadata["store_mode"])
                     for k in (*first, *second)
-                } == {(False, "stg")}
+                } == {(False, "stg"), (True, "stg")}
     # Swapping changes the native signature: a flag alone cannot reinterpret
     # an old normal object, nor can a swapped object omit its orientation.
     for abi, swap in (
@@ -663,7 +668,7 @@ def test_bf16_source_distribution_has_no_binary_or_cudnn_frost_dependency():
         assert options == [f"--enable-tvm-ffi --gpu-arch {record['arch']}"]
 
 
-@bf16_gpu
+@frost_gpu
 @pytest.mark.parametrize("stage", ["fc1", "fc2"])
 @pytest.mark.parametrize("swap", [False, True])
 @pytest.mark.parametrize("store", ["stg", "tma"])
@@ -760,30 +765,45 @@ def test_bf16_source_manifest_rejects_tampering_and_legacy_objects(tmp_path):
         runtime._read_root(tmp_path)
 
 
-def test_bf16_sm120_sources_roundtrip_without_cudnn(monkeypatch):
-    """SM120 warp-MMA templates: one STG family per op and exact re-extraction."""
-    from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
-        runtime,
-    )
+@pytest.mark.parametrize("dtype", ["bf16", "mxfp8", "nvfp4", "mxfp8_mxfp4"])
+def test_sm120_sources_roundtrip_without_cudnn(dtype, monkeypatch):
+    """SM120 warp-MMA templates: one STG family per op/orientation, exact re-extraction."""
+    from flashinfer.fused_moe.backends.cudnn_frost import runtime
 
     monkeypatch.setitem(sys.modules, "cudnn", None)
-    root = runtime.artifact_root("bf16")
+    root = runtime.artifact_root(dtype)
     records = [
         record
         for record in read_manifest(root / runtime._MANIFEST)["kernels"]
         if record["arch"] == "sm_120a"
     ]
+    block_scale = dtype != "bf16"
+    prefix = "block_scale_" if block_scale else ""
     families = {}
     for record in records:
         entry = record["source"]
         template = (root / entry["path"]).read_text()
         concrete = render_source(template, entry["parameters"])
-        families.setdefault(record["op"], set()).add(entry["path"])
-        # Kernel names are sm120_cudnn_frost_<op>...
-        assert record["id"].startswith(f"sm120_cudnn_frost_{record['op']}_")
-        assert entry["path"].startswith("sources/sm120_")
+        tactic = record["tactic"]
+        swap = tactic["swap_ab"]
+        quantized = record["contract"]["output_dtype"] != "bfloat16"
+        families.setdefault((record["op"], quantized, swap), set()).add(entry["path"])
+        # Kernel IDs are sm120_cudnn_frost_<op>_<dtype>_<digest>. The activations
+        # of one topology share a template and differ only in exact fragments.
+        assert record["id"].startswith(f"sm120_cudnn_frost_{record['op']}_{dtype}_")
+        stage = "fc2" if record["op"].endswith("gemm2") else "fc1"
+        gated = (
+            stage == "fc1" and ACTIVATIONS[record["contract"]["activation"]]().is_gated
+        )
+        assert entry["path"] == (
+            f"sources/sm120_{stage}_{'gated' if gated else 'non_gated'}"
+            f"_{'swap' if swap else 'normal'}_{'quantized' if quantized else 'bf16'}_stg.py"
+        )
         # Explicit G+1 group boundaries: no final endpoint inferred from S.
-        assert record["abi"] == f"cudnn_frost_{record['op']}"
+        assert record["abi"] == (
+            f"cudnn_frost_{record['op']}{'_quantized' if quantized else ''}"
+            f"{'_swap_ab' if swap else ''}"
+        )
         assert "first_token_arr[my_group + 1]" in template
         assert "gemm_s" not in template
         # Unreached helpers (e.g. SM100 tcgen05 wrappers) are not frozen in.
@@ -804,13 +824,13 @@ def test_bf16_sm120_sources_roundtrip_without_cudnn(monkeypatch):
             "        nvvm.setmaxregister(PROD_REG_COUNT, nvvm.SetMaxRegisterAction.DECREASE)\n"
         ) in template
         assert "SCHED_REG_COUNT" not in template
-        tactic = record["tactic"]
-        assert tactic["template"] == "sm120_moe_grouped_matmul_fwd.py"
-        assert (tactic["swap_ab"], tactic["store_mode"], tactic["cta_group"]) == (
-            False,
-            "stg",
-            1,
+        # One CTA per SM, so ptxas keeps the setmaxnreg register split.
+        assert "min_blocks_per_mp=1" in template
+        assert tactic["template"] == (
+            f"sm120_moe_grouped{'_block_scale' if block_scale else ''}_matmul_fwd"
+            f"{'_swap_ab' if swap else ''}.py"
         )
+        assert (tactic["store_mode"], tactic["cta_group"]) == ("stg", 1)
         # Only the scheduler counter: the template patches no tensormap.
         assert record["workspace_bytes"] == 128
         constants = dict(entry["parameters"]["constants"])
@@ -818,23 +838,39 @@ def test_bf16_sm120_sources_roundtrip_without_cudnn(monkeypatch):
         assert constants["frost_compile_options"] == repr(
             "--enable-tvm-ffi --gpu-arch sm_120a"
         )
-        assert int(constants["grid_num_clusters"]) > 0
-        concrete = render_source(template, entry["parameters"])
+        # Occupancy, L2 budget and pipeline depth resolve on the preparation device.
+        assert entry["parameters"]["device_dependent"]
+        assert all(
+            constants[name] == "1"
+            for name in ("grid_num_clusters", "swizzle_l2_budget_bytes", "ab_stages")
+        )
         # The host zeroes the tile-scheduler counter before every launch, so
         # the exported TVM-FFI function needs no caller-side reset.
-        assert "_dynamic_scheduler_counter_initialization(a_tma_workspace" in concrete
+        assert "_dynamic_scheduler_counter_initialization(" in concrete
         first = entry["parameters"]["constants"][0][0]
+        header = "# Block-scale config:" if block_scale else "# Tile config:"
         produced = concrete.replace(
-            f"\n{first} = ", f"\n# Tile config: {tactic['tile']}\n{first} = ", 1
+            f"\n{first} = ", f"\n{header} {tactic['tile']}\n{first} = ", 1
         )
-        extracted, parameters = extract_template(produced, swap_ab=False)
+        extracted, parameters = extract_template(produced, swap_ab=swap)
         assert ast.dump(ast.parse(render_source(extracted, parameters))) == ast.dump(
             ast.parse(concrete)
         )
-    assert set(families) == {
-        *(f"grouped_gemm1_{name}" for name in ACTIVATIONS),
-        "grouped_gemm2",
+    assert {op for op, _, _ in families} == {
+        *(f"{prefix}grouped_gemm1_{name}" for name in ACTIVATIONS),
+        f"{prefix}grouped_gemm2",
     }
+    assert {swap for _, _, swap in families} == {False, True}
+    # Fused intermediate quantization is a normal-orientation FC1 variant, and
+    # SM120 has no packed FP4 output.
+    assert all(
+        not swap and op != f"{prefix}grouped_gemm2"
+        for op, quantized, swap in families
+        if quantized
+    )
+    assert any(quantized for _, quantized, _ in families) == (
+        dtype in ("mxfp8", "mxfp8_mxfp4")
+    )
     assert all(len(paths) == 1 for paths in families.values())
 
 
@@ -873,7 +909,7 @@ def test_frost_export_names_architecture_first_and_prunes_unreached_helpers():
     ) == (2, 3, 4, 1, 1)
 
 
-@bf16_gpu
+@frost_gpu
 def test_bf16_sm120_launches_need_no_workspace_reset(monkeypatch):
     """The SM120 host zeroes its scheduler counter, even in a garbage workspace."""
     from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
@@ -1526,14 +1562,19 @@ def _assert_block_scale_geometry_roundtrip(
         operands = (data_dtype, weight_dtype or data_dtype)
         if record["tactic"]["swap_ab"]:
             operands = operands[::-1]
-        assert (constants["a_dtype"], constants["b_dtype"]) == operands
+        # SM120 warp-MMA templates name their operand storage types *_fake_dtype
+        # and have no CTA pair.
+        sm120 = record["arch"] == "sm_120a"
+        names = ("a_fake_dtype", "b_fake_dtype") if sm120 else ("a_dtype", "b_dtype")
+        assert tuple(constants[name] for name in names) == operands
         assert constants["sf_cutlass_dtype"] == sf_dtype
         assert constants["block_size"] == str(block)
-        assert int(constants["cta_group"]) == record["tactic"]["cta_group"]
+        assert int(constants.get("cta_group", "1")) == record["tactic"]["cta_group"]
         for name in ("cta_tile_mnk", "cluster_shape_mnk", "cgrp_tile_mnk"):
             geometry = ast.literal_eval(constants[name])
             assert len(geometry) == 3 and all(value > 0 for value in geometry)
-        assert "sm_107a" in constants["frost_compile_options"]
+        assert record["arch"] in ("sm_107a", "sm_120a")
+        assert record["arch"] in constants["frost_compile_options"]
         if (
             record["contract"]["output_dtype"] in ("float4_e2m1fn_x2", "float8_e4m3fn")
             and record["tactic"]["store_mode"] == "tma"
@@ -1577,7 +1618,16 @@ def _assert_block_scale_geometry_roundtrip(
         len({(v[0], v[2], v[3], v[4]) for v in variants}) == 1
         for variants in source_families.values()
     )
-    assert len(by_source) <= len(ACTIVATIONS) * 6 + 4
+    # Per gated/non-gated topology: SM107 normal/swap-AB x STG/TMA plus fused
+    # STG/TMA FC1, SM120 STG normal/swap-AB plus fused normal FC1; then FC2.
+    for arch, per_topology, fc2 in (("sm_107a", 6, 4), ("sm_120a", 3, 2)):
+        sources = {
+            path
+            for family, paths in families.items()
+            if family[0] == arch
+            for path in paths
+        }
+        assert len(sources) <= 2 * per_topology + fc2
     assert sum(len(digests) for digests in by_source.values()) == len(records)
 
 
@@ -1756,7 +1806,7 @@ def test_block_scale_requires_start_and_end_boundaries(runtime, boundaries):
         )
 
 
-@supported_gpu
+@frost_gpu
 @pytest.mark.parametrize("runtime", [mxfp8, nvfp4, mxfp8_mxfp4])
 @pytest.mark.parametrize("groups", [32, 40, 64])
 @pytest.mark.parametrize("swap", [False, True])
@@ -1767,7 +1817,7 @@ def test_block_scale_final_boundary_across_scheduler_warps(runtime, groups, swap
     kernel = next(
         kernel
         for kernel in runtime.discover()
-        if not kernel.fc1 and kernel.swap_ab == swap
+        if not kernel.fc1 and kernel.swap_ab == swap and kernel.arch == _device_arch()
     )
     nv = runtime is nvfp4
     mixed = runtime is mxfp8_mxfp4
@@ -2018,9 +2068,10 @@ def test_mxfp8_reject_incompatible_scale_contract(change, tmp_path, schema_versi
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("index", range(len(mxfp8.discover())))
 def test_mxfp8_grouped_kernel_and_graph_replay(index, monkeypatch):
-    if torch.cuda.get_device_capability() != (10, 7):
-        pytest.skip("packaged block-scale templates target SM107a")
-    _assert_mxfp8_grouped_kernel_and_graph(mxfp8, mxfp8.discover()[index], monkeypatch)
+    kernel = mxfp8.discover()[index]
+    if kernel.arch != _device_arch():
+        pytest.skip(f"packaged {kernel.arch} source")
+    _assert_mxfp8_grouped_kernel_and_graph(mxfp8, kernel, monkeypatch)
 
 
 def _assert_mxfp8_grouped_kernel_and_graph(runtime, kernel, monkeypatch, mixed=False):
@@ -2240,8 +2291,11 @@ def _mxfp8_moe_reference(act, weights, activation, swizzled=False, mixed=False):
 
 def _pick_stage_pair(pool):
     # Prefer different retained launch ABIs without assuming selection retained
-    # a particular store, orientation, CTAMMA group, or geometry.
-    assert len(pool) >= 2
+    # a particular store, orientation, CTAMMA group, or geometry. An SM120
+    # fused FC1 family may retain a single tile.
+    assert pool
+    if len(pool) == 1:
+        return tuple(pool)
     first = pool[0]
     second = max(
         pool[1:],
@@ -2253,7 +2307,7 @@ def _pick_stage_pair(pool):
     return first, second
 
 
-@supported_gpu
+@frost_gpu
 @pytest.mark.parametrize("name", ACTIVATIONS)
 @pytest.mark.parametrize("swizzled", [False, True])
 @pytest.mark.parametrize("fc1_output", ["bf16", "fp8_stg", "fp8_tma"])
@@ -2283,6 +2337,8 @@ def _assert_mxfp8_moe_full_pipeline_and_graph(
         f"flashinfer.fused_moe.backends.cudnn_frost.{dtype}.moe"
     )
     backend = CutlassMxfp8Mxfp4Config if mixed else CutlassMxfp8Config
+    if fc1_output != "bf16":
+        _skip_sm120_tma(fc1_output.removeprefix("fp8_"))
 
     monkeypatch.setitem(sys.modules, "cudnn", None)
     torch.manual_seed(77)
@@ -2364,9 +2420,11 @@ def _assert_mxfp8_moe_full_pipeline_and_graph(
     runner.build()
     inputs = runner.pack_inputs(act, weights)
     tactics = runner.get_valid_tactics(inputs, None)
-    assert len(tactics) in (4, 5)  # Four TC pairs, optionally a small-token FMA.
+    # Every Tensor Core pair, optionally a small-token FMA.
+    pairs = len(selected[0]) * len(selected[1])
+    assert len(tactics) in (pairs, pairs + 1)
     if require_fma:
-        assert len(tactics) == 5 and "fma" in tactics[-1][0]
+        assert len(tactics) == pairs + 1 and "fma" in tactics[-1][0]
     assert inputs[9] is view["fc1_input_scale"]
     assert inputs[10] is view["fc2_input_scale"]
     assert inputs[6].data_ptr() == view["fc1_expert_scales"].data_ptr()
@@ -2455,7 +2513,7 @@ def _assert_mxfp8_moe_full_pipeline_and_graph(
     assert (out.float() - reference.float()).norm() / reference.float().norm() < 0.02
 
 
-@supported_gpu
+@frost_gpu
 def test_mxfp8_moe_inference_mode_preparation_and_graph(monkeypatch):
     with torch.inference_mode():
         test_mxfp8_moe_full_pipeline_and_graph("swiglu", False, monkeypatch, "fp8_stg")
@@ -2526,6 +2584,16 @@ def _assert_moe_shortlist_buckets(moe, monkeypatch):
     moe._selected_kernels_cached.cache_clear()
     assert moe._selected_kernels(128, *args) == fallback
     moe._selected_kernels_cached.cache_clear()
+
+
+def test_mxfp8_packaged_shortlists_resolve_all_profiles(
+    monkeypatch, frost_metadata_only
+):
+    from flashinfer.fused_moe.backends.cudnn_frost.mxfp8 import (
+        moe,
+    )
+
+    _assert_packaged_shortlists_resolve_all_profiles(moe, monkeypatch)
 
 
 def test_mxfp8_plan_workspaces_preserve_prior_allocations(monkeypatch):
@@ -2754,7 +2822,7 @@ def _nvfp4_dequant(data, scales):
     ).double().repeat_interleave(16, -1)
 
 
-@supported_gpu
+@frost_gpu
 @pytest.mark.parametrize("name", [*ACTIVATIONS, "fc2"])
 @pytest.mark.parametrize(
     "swap_ab,store", [(False, "stg"), (False, "tma"), (True, "stg"), (True, "tma")]
@@ -2764,6 +2832,7 @@ def test_nvfp4_grouped_kernel_extremes_alpha_and_graph(
 ):
     from tests.moe.utils import compute_reference_activation
 
+    _skip_sm120_tma(store)
     monkeypatch.setitem(sys.modules, "cudnn", None)
     op = (
         "block_scale_grouped_gemm2"
@@ -2774,6 +2843,7 @@ def test_nvfp4_grouped_kernel_extremes_alpha_and_graph(
         kernel
         for kernel in nvfp4.discover()
         if kernel.op == op
+        and kernel.arch == _device_arch()
         and kernel.swap_ab == swap_ab
         and kernel.tactic_metadata["store_mode"] == store
     ]
@@ -2926,7 +2996,7 @@ def _nvfp4_moe_reference(act, weights, activation, swizzled=False):
     return expanded.sum(dim=1).bfloat16()
 
 
-@supported_gpu
+@frost_gpu
 @pytest.mark.parametrize("name", ACTIVATIONS)
 @pytest.mark.parametrize("swizzled", [False, True])
 @pytest.mark.parametrize("fc1_output", ["bf16", "fp4_stg", "fp4_tma"])
@@ -2938,6 +3008,8 @@ def test_nvfp4_moe_full_pipeline_and_dynamic_graph(
     )
     from flashinfer.fused_moe import CutlassNvfp4Config, QuantFormat
 
+    if fc1_output != "bf16" and _sm120():
+        pytest.skip("SM120 Frost templates have no packed FP4 FC1 output")
     monkeypatch.setitem(sys.modules, "cudnn", None)
     monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "0")
     torch.manual_seed(117)
@@ -3078,16 +3150,19 @@ def test_nvfp4_moe_full_pipeline_and_dynamic_graph(
         runner.forward(list(inputs))
 
 
-@supported_gpu
+@frost_gpu
 @pytest.mark.parametrize("store", ["stg", "tma"])
 def test_nvfp4_moe_inference_mode_preparation_and_graph(store, monkeypatch):
+    _skip_sm120_tma(store)
+    # SM120 has no fused FP4 FC1 output: prepare its unfused pipeline instead.
+    fc1_output = "bf16" if _sm120() else f"fp4_{store}"
     with torch.inference_mode():
         test_nvfp4_moe_full_pipeline_and_dynamic_graph(
-            "swiglu", False, f"fp4_{store}", monkeypatch
+            "swiglu", False, fc1_output, monkeypatch
         )
 
 
-@supported_gpu
+@frost_gpu
 @pytest.mark.parametrize("tokens", [1, 17, 129])
 @pytest.mark.parametrize("mixed", [False, True])
 @pytest.mark.parametrize("store", ["stg", "tma"])
@@ -3100,6 +3175,7 @@ def test_mxfp8_fused_quantization_preserves_bf16_intermediate(
         QuantFormat,
     )
 
+    _skip_sm120_tma(store)
     dtype = "mxfp8_mxfp4" if mixed else "mxfp8"
     moe = importlib.import_module(
         f"flashinfer.fused_moe.backends.cudnn_frost.{dtype}.moe"
@@ -3235,7 +3311,7 @@ def test_mxfp8_fused_quantization_preserves_bf16_intermediate(
             ).norm() / reference.float().norm() < 0.02
 
 
-@supported_gpu
+@frost_gpu
 @pytest.mark.parametrize("tokens", [1, 17, 129])
 @pytest.mark.parametrize("store", ["stg", "tma"])
 def test_nvfp4_fused_quantization_preserves_bf16_intermediate(
@@ -3246,6 +3322,8 @@ def test_nvfp4_fused_quantization_preserves_bf16_intermediate(
     )
     from flashinfer.fused_moe import CutlassNvfp4Config, QuantFormat
 
+    if _sm120():
+        pytest.skip("SM120 Frost templates have no packed FP4 FC1 output")
     monkeypatch.setitem(sys.modules, "cudnn", None)
     monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "0")
     torch.manual_seed(131)
@@ -3375,15 +3453,18 @@ def _assert_packaged_shortlists_resolve_all_profiles(moe, monkeypatch):
     roots = moe._artifact_roots()
     table = shortlist._read(roots)
     assert table
-    assert {key[1] for key in table} == set(ACTIVATIONS)
-    monkeypatch.setattr(moe.common, "_arch_for", lambda device: "sm_107a")
+    assert {key[0] for key in table} == {"sm_107a", "sm_120a"}
+    for arch in ("sm_107a", "sm_120a"):
+        assert {key[1] for key in table if key[0] == arch} == set(ACTIVATIONS)
+    device_arch = {}
+    monkeypatch.setattr(moe.common, "_arch_for", lambda device: device_arch["arch"])
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
         lambda device: SimpleNamespace(multi_processor_count=128),
     )
     for (arch, name, experts, hidden, intermediate, topk), profiles in table.items():
-        assert arch == "sm_107a"
+        device_arch["arch"] = arch
         previous = 0
         for tokens, identities in sorted(profiles.items()):
             # Check both measured counts and the next-bucket rule using the
@@ -3419,11 +3500,13 @@ def _assert_packaged_shortlists_resolve_all_profiles(moe, monkeypatch):
                         for original in first[:2]
                         if not original.swap_ab
                     }
-                    assert {(tile, "stg") for tile in normal_tiles} <= variants
+                    # SM120 stores through STG only, and its producer fuses the
+                    # quantized output for a subset of the warp-MMA tiles.
+                    stores = ("stg", "tma") if arch == "sm_107a" else ("stg",)
+                    if arch == "sm_107a":
+                        assert {(tile, "stg") for tile in normal_tiles} <= variants
                     assert variants <= {
-                        (tile, store)
-                        for tile in normal_tiles
-                        for store in ("stg", "tma")
+                        (tile, store) for tile in normal_tiles for store in stores
                     }
                 assert all(k.fc1 and k.activation == name for k in first)
                 assert all(not k.fc1 for k in second)
@@ -3506,7 +3589,7 @@ def test_mxfp8_mxfp4_auto_admission_uses_logical_hidden_size(name):
     _assert_mxfp8_auto_admission(name, mixed=True)
 
 
-@supported_gpu
+@frost_gpu
 @pytest.mark.parametrize("name", [*ACTIVATIONS, "fc2"])
 @pytest.mark.parametrize(
     "swap_ab,store", [(False, "stg"), (False, "tma"), (True, "stg"), (True, "tma")]
@@ -3514,10 +3597,12 @@ def test_mxfp8_mxfp4_auto_admission_uses_logical_hidden_size(name):
 def test_mxfp8_mxfp4_grouped_kernel_extremes_and_graph(
     name, swap_ab, store, monkeypatch
 ):
+    _skip_sm120_tma(store)
     candidates = [
         kernel
         for kernel in mxfp8_mxfp4.discover()
         if (kernel.activation if kernel.fc1 else "fc2") == name
+        and kernel.arch == _device_arch()
         and kernel.swap_ab == swap_ab
         and kernel.tactic_metadata["store_mode"] == store
     ]
@@ -3528,7 +3613,7 @@ def test_mxfp8_mxfp4_grouped_kernel_extremes_and_graph(
     )
 
 
-@supported_gpu
+@frost_gpu
 @pytest.mark.parametrize("name", ACTIVATIONS)
 @pytest.mark.parametrize("swizzled", [False, True])
 @pytest.mark.parametrize("fc1_output", ["bf16", "fp8_stg", "fp8_tma"])
@@ -3540,7 +3625,7 @@ def test_mxfp8_mxfp4_moe_full_pipeline_and_dynamic_graph(
     )
 
 
-@supported_gpu
+@frost_gpu
 def test_mxfp8_mxfp4_moe_inference_mode_preparation_and_graph(monkeypatch):
     with torch.inference_mode():
         test_mxfp8_mxfp4_moe_full_pipeline_and_dynamic_graph(
@@ -3900,9 +3985,9 @@ def test_frost_layer_bounds_token_bucket_winners_and_refreshes_lru(monkeypatch):
 @pytest.mark.parametrize(
     "dtype",
     [
-        pytest.param("bf16", marks=bf16_gpu),
+        pytest.param("bf16", marks=frost_gpu),
         *(
-            pytest.param(dtype, marks=supported_gpu)
+            pytest.param(dtype, marks=frost_gpu)
             for dtype in ("mxfp8", "nvfp4", "mxfp8_mxfp4")
         ),
     ],

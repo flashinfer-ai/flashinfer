@@ -19,19 +19,23 @@ import math
 import pytest
 import torch
 
-from flashinfer.experimental.cake_moe_grouped_gemm import (
-    grouped_gemm_dgrad,
-    grouped_gemm_fwd,
-    grouped_gemm_wgrad,
-)
-from flashinfer.experimental.cake_moe_grouped_gemm import cake_backend as cb
-from flashinfer.experimental.cake_moe_grouped_gemm.cake_backend import (
-    SUPPORTED_COMPUTE_CAPABILITIES,
-    prepare_grouped_gemm_dgrad,
-    prepare_grouped_gemm_fwd,
-    prepare_grouped_gemm_wgrad,
-)
-from flashinfer.experimental.cake_moe_grouped_gemm.cake_jit import HOST_PLAN_CONSTANTS
+from tests.test_helpers.cake_package import cake_package
+
+# Backend suite: the package is named once, through ``cake_package``; nothing else
+# of flashinfer is imported here.  The tests of the stable flashinfer entry point
+# ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")`` live in
+# ``test_cake_moe_grouped_gemm_api.py``.
+pkg = cake_package("cake_moe_grouped_gemm")
+cb = cake_package("cake_moe_grouped_gemm", "cake_backend")
+cake_jit = cake_package("cake_moe_grouped_gemm", "cake_jit")
+grouped_gemm_dgrad = pkg.grouped_gemm_dgrad
+grouped_gemm_fwd = pkg.grouped_gemm_fwd
+grouped_gemm_wgrad = pkg.grouped_gemm_wgrad
+SUPPORTED_COMPUTE_CAPABILITIES = cb.SUPPORTED_COMPUTE_CAPABILITIES
+prepare_grouped_gemm_dgrad = cb.prepare_grouped_gemm_dgrad
+prepare_grouped_gemm_fwd = cb.prepare_grouped_gemm_fwd
+prepare_grouped_gemm_wgrad = cb.prepare_grouped_gemm_wgrad
+HOST_PLAN_CONSTANTS = cake_jit.HOST_PLAN_CONSTANTS
 
 ATOL = RTOL = 1e-2  # bf16 outputs
 FP32_REL_L2 = 1e-4  # fp32 weight gradient vs the fp64 reference
@@ -42,6 +46,10 @@ RAGGED_E4 = [300, 0, 1, 700]
 RAGGED_E6 = [1, 257, 511, 4099, 0, 33]
 TINY_E5 = [1, 2, 3, 0, 4]
 LONG_E3 = [6145, 0, 12289]
+# Groups shorter than one 64-row k-step: every output tile is a single k-step, and
+# a CTA switches group at almost every tile (the shape of flashinfer-ai/flashinfer#6570).
+SMALL_E512 = [32] * 512
+SMALL_GROUP_LAUNCHES = 200
 
 
 def _require_program(op, out_dtype=None):
@@ -242,6 +250,32 @@ def test_wgrad_long_reduction_selects_a_valid_tile(out_dtype):
     assert torch.equal(out[1], torch.zeros_like(out[1]))
 
 
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_wgrad_short_groups_never_include_the_next_group(out_dtype):
+    """A tile of a group shorter than one k-step must not add the rows of the group
+    the same CTA reduces next (#6570). Repeated launches of one prepared call,
+    checked block by block against the per-group reference."""
+    device = _require_program("wgrad", out_dtype)
+    n, k = 512, 3072
+    x, _w, g, offs = _inputs(SMALL_E512, n, k, device, seed=6)
+    launch = prepare_grouped_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
+    ref = torch.stack(
+        [g[s:t].float().T @ x[s:t].float() for s, t in _bounds(SMALL_E512)]
+    )
+    blocks = ref.view(len(SMALL_E512), n // 128, 128, k // 128, 128)
+    scale = blocks.abs().amax(dim=(2, 4), keepdim=True)
+    wrong = []
+    for call in range(SMALL_GROUP_LAUNCHES):
+        out = launch.launch().float().view_as(blocks)
+        bad = ((out - blocks).abs() > scale * 2.0**-6 + 1e-6).any(dim=4).any(dim=2)
+        if bool(bad.any()):
+            wrong.append((call, bad.nonzero()[:4].tolist()))
+    assert not wrong, (
+        f"{len(wrong)} of {SMALL_GROUP_LAUNCHES} launches have wrong 128 x 128 blocks "
+        f"(call, [group, n block, k block]): {wrong[:3]}"
+    )
+
+
 def test_prepared_launch_reuses_buffers_without_allocation():
     device = _require_program("fwd")
     x, w, _g, offs = _inputs(RAGGED_E6, 1024, 512, device)
@@ -309,43 +343,13 @@ def test_rejects_misaligned_shapes():
 
 
 # ---------------------------------------------------------------------------
-# Stable-API opt-in, the m_indptr form and the autograd wrapper
+# The m_indptr form and the autograd wrapper
 # ---------------------------------------------------------------------------
 
 
 def _m_indptr(sizes, device):
     ends = [sum(sizes[: i + 1]) for i in range(len(sizes))]
     return torch.tensor([0] + ends, dtype=torch.int32, device=device)
-
-
-def test_grouped_mm_bf16_cake_backend_matches_reference():
-    device = _require_program("fwd")
-    from flashinfer.grouped_mm import grouped_mm_bf16
-
-    x, w, _g, _offs = _inputs(RAGGED_E6, 1024, 512, device)
-    out = grouped_mm_bf16(x, w, _m_indptr(RAGGED_E6, device), backend="cake")
-    assert out.shape == (sum(RAGGED_E6), 1024) and out.dtype == torch.bfloat16
-    _assert_bf16_close(out, _reference("fwd", x, w, RAGGED_E6))
-    # rows past m_indptr[-1] belong to no group and are left untouched
-    padded_x = torch.cat([x, torch.zeros(37, 512, dtype=x.dtype, device=device)])
-    out = torch.full(
-        (sum(RAGGED_E6) + 37, 1024), float("nan"), dtype=torch.bfloat16, device=device
-    )
-    grouped_mm_bf16(padded_x, w, _m_indptr(RAGGED_E6, device), out=out, backend="cake")
-    _assert_bf16_close(out[: sum(RAGGED_E6)], _reference("fwd", x, w, RAGGED_E6))
-    assert torch.isnan(out[sum(RAGGED_E6) :]).all()
-
-
-def test_grouped_mm_bf16_cake_backend_rejects_unsupported_options():
-    device = _require_program("fwd")
-    from flashinfer.grouped_mm import grouped_mm_bf16
-
-    x, w, _g, _offs = _inputs(RAGGED_E4, 512, 256, device)
-    m_indptr = _m_indptr(RAGGED_E4, device)
-    with pytest.raises(ValueError):
-        grouped_mm_bf16(x, w, m_indptr, out_dtype=torch.float32, backend="cake")
-    with pytest.raises(ValueError):
-        grouped_mm_bf16(x, w, m_indptr, backend="cake", tactic=0)
 
 
 def test_m_indptr_form_matches_offs_form():
@@ -370,7 +374,7 @@ def test_autograd_wrapper_matches_reference_and_is_deterministic():
     device = _require_program("fwd")
     device = _require_program("dgrad")
     device = _require_program("wgrad", torch.bfloat16)
-    from flashinfer.experimental.cake_moe_grouped_gemm import cake_grouped_mm
+    cake_grouped_mm = pkg.cake_grouped_mm
 
     x, w, g, offs = _inputs(RAGGED_E6, 512, 256, device)
     x = x.clone().requires_grad_(True)

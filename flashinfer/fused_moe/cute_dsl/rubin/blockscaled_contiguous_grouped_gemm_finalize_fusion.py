@@ -1652,7 +1652,8 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                                     sC[sC_row, None, 0],
                                     valid_copy_size,
                                 )
-                # Finish reading shared output before the next tile reuses it.
+                # The next tile reuses sC. Finish the async reductions' reads
+                # before any epilogue thread overwrites its shared rows.
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
                 self.epilog_sync_barrier.arrive_and_wait()

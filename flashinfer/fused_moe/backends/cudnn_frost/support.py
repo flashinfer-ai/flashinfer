@@ -1,6 +1,11 @@
 # Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0.
 """Weight-view aliases and input geometry policy for Frost MoELayer candidates."""
 
+# Every dtype packages sources for these exact targets; no other architecture
+# runs them.
+SUPPORTED_ARCHS = ("sm_107a", "sm_120a")
+SUPPORTED_ARCH_NUMBERS = (107, 120)
+
 
 def weight_view(weights, backend_key, canonical_key):
     """Use the backend's named view, or share an existing canonical view."""

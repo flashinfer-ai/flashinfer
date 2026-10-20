@@ -16,6 +16,15 @@
 
 // Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
 #include "cake_dsa_indexer_topk_device_common.cuh"
+// The common preamble's fallback helper this module's helper library does not provide; the shared
+// header carries another member's library definition of the name (kept translation-unit-local).
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
+
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
@@ -26,22 +35,53 @@
 #define SMEM_S_OUT_SC_STAGE_BYTES 8192
 #define SMEM_S_OUT_SC_STRIDE 8192
 #define SMEM_S_BITS_OFF 16384
+#ifndef SMEM_S_BITS_STAGE_BYTES
 #define SMEM_S_BITS_STAGE_BYTES 16384
+#endif
+#ifndef SMEM_S_BITS_STRIDE
 #define SMEM_S_BITS_STRIDE 16384
+#endif
+#ifndef SMEM_S_BKT_OFF
 #define SMEM_S_BKT_OFF 32768
+#endif
+#ifndef SMEM_S_BKT_STAGE_BYTES
 #define SMEM_S_BKT_STAGE_BYTES 2048
+#endif
+#ifndef SMEM_S_BKT_STRIDE
 #define SMEM_S_BKT_STRIDE 2048
+#endif
+#ifndef SMEM_S_XCH_OFF
 #define SMEM_S_XCH_OFF 34816
+#endif
+#ifndef SMEM_S_XCH_STAGE_BYTES
 #define SMEM_S_XCH_STAGE_BYTES 384
+#endif
+#ifndef SMEM_S_XCH_STRIDE
 #define SMEM_S_XCH_STRIDE 384
+#endif
+#ifndef SMEM_TOTAL
 #define SMEM_TOTAL 35200
+#endif
 #define THREADS 256
+#ifndef RANK_XCH_PAD
 #define RANK_XCH_PAD 16
+#endif
+
+// Shared by every build.json entry that names this translation unit in its sources: the entry's -D
+// defines select the rank window constants (SMEM_S_BITS_STAGE_BYTES / SMEM_S_BITS_STRIDE /
+// SMEM_S_BKT_OFF / SMEM_S_BKT_STAGE_BYTES / SMEM_S_BKT_STRIDE / SMEM_S_XCH_OFF /
+// SMEM_S_XCH_STAGE_BYTES / SMEM_S_XCH_STRIDE / SMEM_TOTAL / RANK_XCH_PAD; the guarded defaults
+// above are this file's own values) and the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>;
+// every library of the family exports a distinct kernel); without them the defaults name this
+// file's own program.
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_dsa_indexer_topk_bbc99b799b2c58f8401f
+#endif
 
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_dsa_indexer_topk_bbc99b799b2c58f8401f(int* __restrict__ Indices, float* __restrict__ Scores, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, int top_k, int num_segments)
+CAKE_PROGRAM_KERNEL(int* __restrict__ Indices, float* __restrict__ Scores, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, int top_k, int num_segments)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
