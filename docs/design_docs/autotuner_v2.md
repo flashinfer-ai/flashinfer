@@ -222,7 +222,11 @@ Persistence and orchestration stay separate responsibilities.
   profile's old runner entries and re-profile. Invalidation covers memory and persistence so
   a different runner can win without an older entry taking precedence after reload. These
   collectives run only during tuning, outside CUDA Graph capture. The framework must still
-  ensure matching op/profile/candidate order and skip lists across the group.
+  ensure matching op/profile/candidate order, measurement policies and skip lists across the group.
+- **Timer fallback**: CUPTI availability and initialization are checked across the tuning
+  group before candidate warmup or graph capture. If tracing fails on any rank, all ranks
+  fall back to CUDA events. Candidate exceptions still disqualify the tactic rather than
+  retrying it with another timer.
 - **In-session rank consistency**: ranks may still hold divergent locally-measured winners until
   `autotune_v2_reload()` runs — a finalize step (tune → barrier → reload) that drops in-process
   winners and ephemeral tactic shortlists, bulk re-hydrates the attached store's final
