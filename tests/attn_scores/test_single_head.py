@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 by FlashInfer team.
 
-"""single_head_paged_mqa_logits and quantize_write_index_k_nvfp4 against exact
-references over random paged BF16 or NVFP4 keys."""
+"""The single-head paged MQA kernels and quantize_write_index_k_nvfp4 against
+exact references over random paged BF16 or NVFP4 keys."""
 
 import pytest
 import torch
@@ -11,6 +11,7 @@ from flashinfer import nvfp4_kv_dequantize
 from flashinfer.attn_scores import (
     quantize_write_index_k_nvfp4,
     single_head_paged_mqa_logits,
+    single_head_paged_mqa_threshold_select,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -124,6 +125,110 @@ def test_single_head_paged_mqa_logits_match_reference_and_replay(
     prepare(replayed)
     graph.replay()
     check(replayed)
+
+
+@pytest.mark.parametrize(
+    ("query_lens", "context_lens"),
+    [
+        ((1, 3, 7, 2), (1, 63, 127, 64)),  # keys end on a page, mid key tile
+        ((129, 3, 1), (4097, 2051, 2049)),
+        # 8 query tiles: runs of several tiles per CTA, some cut short, some empty.
+        ((3, 128, 641), (16384, 16000, 12289)),
+    ],
+)
+@pytest.mark.parametrize("keys", ["bf16", "nvfp4"])
+@pytest.mark.parametrize("top_k", [64, 512, 2048])
+@torch.inference_mode()
+def test_single_head_paged_mqa_threshold_select_matches_reference_and_replay(
+    query_lens, context_lens, top_k, keys
+) -> None:
+    """Causal 128-row tiles, odd ones reversed; rows 2 mod 8 score 0 (ties past
+    the tie slots), rows 5 mod 8 NaN. Counts are exact, and each written slot
+    holds a distinct key of its class with its score (less the threshold)."""
+    torch.manual_seed(0)
+    nvfp4, width = keys == "nvfp4", max(context_lens)
+    capacity, blocks = width // 2, -(-width // 64)
+    tiles = [(r, s) for r, n in enumerate(query_lens) for s in range(0, n, 128)]
+    ends = torch.zeros(len(tiles), 128, dtype=torch.int32)
+    for tile, (request, start) in enumerate(tiles):
+        count = min(query_lens[request] - start, 128)
+        first = context_lens[request] - query_lens[request] + start + 1
+        ends[tile, :count] = torch.arange(first, first + count)
+    ends[1::2] = ends[1::2].flip(1)
+    ends, rows = ends.flatten().cuda(), 128 * len(tiles)
+    requests = torch.tensor([r for r, _ in tiles], dtype=torch.int32, device="cuda")
+    pages = len(query_lens) * blocks
+    values, scales = rows_of(nvfp4, 64 * pages)
+    key_cache = values.view(pages, 64, -1)
+    key_scales = scales.view(pages, 64, 8) if nvfp4 else None
+    table = torch.randperm(pages, device="cuda").int().view(-1, blocks)
+    query, query_scales = rows_of(nvfp4, rows)
+    query[2::8] = 0
+    if nvfp4:
+        query_scales.view(torch.uint8)[5::8] = 0x7F  # E4M3 NaN
+    else:
+        query[5::8] = torch.nan
+    thresholds = torch.empty(rows, device="cuda")
+    counters = torch.empty(rows, 2, dtype=torch.int32, device="cuda")
+    candidates = torch.empty(rows, top_k + capacity, 2, dtype=torch.int32).cuda()
+
+    def run() -> None:
+        counters.zero_()
+        candidates.fill_(-1)
+        single_head_paged_mqa_threshold_select(
+            *(query, key_cache, ends, requests, table),
+            thresholds=thresholds,
+            counters=counters,
+            candidates=candidates,
+            max_context=width,
+            top_k=top_k,
+            query_scales=query_scales,
+            key_scales=key_scales,
+        )
+
+    def reference() -> tuple[torch.Tensor, torch.Tensor]:
+        keys = dequantize(key_cache.flatten(0, 1), None if scales is None else scales)
+        queries = dequantize(query, query_scales)
+        scores = torch.zeros(rows, width, device="cuda")
+        for tile, (request, _) in enumerate(tiles):
+            mine = slice(128 * tile, 128 * tile + 128)
+            slot = table[request].long()[:, None] * 64 + torch.arange(64).cuda()
+            scores[mine] = (queries[mine] @ keys[slot.flatten()[:width]].T).float()
+        return scores, torch.arange(width, device="cuda") < ends[:, None]
+
+    def check(scores: torch.Tensor, valid: torch.Tensor) -> None:
+        above = valid & (scores > thresholds[:, None])
+        tied = valid & ~(scores > thresholds[:, None]) & ~(scores < thresholds[:, None])
+        assert torch.equal(counters, torch.stack((above.sum(1), tied.sum(1)), 1).int())
+        fit, tie = above.sum(1).clamp(max=capacity), tied.sum(1).clamp(max=top_k)
+        for row in range(rows):
+            fitted, tied_count = int(fit[row]), int(tie[row])
+            written = candidates[row, top_k - tied_count : top_k + fitted]
+            assert bool((candidates[row, : top_k - tied_count] == -1).all())
+            assert bool((candidates[row, top_k + fitted :] == -1).all())
+            keys, bits = written.long().unbind(1)
+            assert bool((keys >= 0).all()) and keys.unique().numel() == keys.numel()
+            assert bool(tied[row, keys[:tied_count]].all())
+            assert bool(above[row, keys[tied_count:]].all())
+            score, threshold = scores[row, keys], thresholds[row]
+            stored = bits.int().view(torch.float32)
+            exact = torch.where(score <= 2 * threshold, score - threshold, score)
+            torch.testing.assert_close(stored, exact, rtol=0, atol=0, equal_nan=True)
+
+    scores, valid = reference()
+    median = scores.nan_to_num(0).masked_fill(~valid, 0).median(1).values
+    for threshold in (median, scores[:, 0].nan_to_num(0), -torch.inf, torch.inf):
+        thresholds[:] = threshold
+        run()  # the first run compiles
+        check(scores, valid)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    ends.copy_((ends - 9).clamp(min=0))
+    scores, valid = reference()
+    thresholds.copy_(scores.nan_to_num(0).masked_fill(~valid, 0).median(1).values)
+    graph.replay()
+    check(scores, valid)
 
 
 def e2m1(x: torch.Tensor) -> torch.Tensor:
