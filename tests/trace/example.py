@@ -3053,4 +3053,6 @@ single_head_paged_mqa_threshold_select.fi_trace(
     candidates=torch.empty(256, 4096, 2, dtype=torch.int32),
     max_context=4096,
     top_k=2048,
+    arrivals=torch.zeros(2, dtype=torch.int32),
+    ranges=torch.empty(2, 256, dtype=torch.int32),
 )

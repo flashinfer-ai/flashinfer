@@ -98,7 +98,8 @@ def single_head_paged_mqa_logits(
     workers = max(CTAS_PER_SM * get_device_sm_count(query.device) // batch, runs, 1)
     keys = (query, query_scales, key_cache, key_scales)
     tables = (context_lengths, requests, block_table)
-    _score("decode", rows, keys, (*tables, None, None, scores, max_context, workers, 0))
+    outputs = (None, None, None, None, scores)
+    _score("decode", rows, keys, (*tables, *outputs, max_context, workers, 0))
 
 
 def _score(mode: str, rows: int, keys: tuple, args: tuple) -> None:
@@ -169,6 +170,8 @@ def single_head_paged_mqa_threshold_select(
     top_k: int,
     query_scales: Optional[torch.Tensor] = None,
     key_scales: Optional[torch.Tensor] = None,
+    arrivals: Optional[torch.Tensor] = None,
+    ranges: Optional[torch.Tensor] = None,
 ) -> None:
     """Select the keys that score above each query row's threshold, in one pass
     over the row's paged keys and without writing its scores.
@@ -181,7 +184,13 @@ def single_head_paged_mqa_threshold_select(
     ``capacity`` and, with at most ``top_k`` ties, reach
     ``min(row_ends[r], top_k)``. Its exact Top-``top_k`` keys are then among its
     slots, and a threshold at or a little below its ``top_k``-th largest score
-    makes it fit. It runs as one launch without host synchronization, so it can be captured in a
+    makes it fit.
+
+    With ``arrivals`` and ``ranges``, and a ``capacity`` of at least
+    ``top_k - 1``, every row fits. Any threshold then gives the same result, and
+    only decides how often a repair runs: the last CTA of a query tile to finish
+    sweeps the tile again for each row that does not fit, and selects it again
+    at its radix-selected ``min(row_ends[r], top_k)``-th largest score. It runs as one launch without host synchronization, so it can be captured in a
     CUDA graph (run it once before capture to compile it).
 
     Parameters
@@ -197,7 +206,8 @@ def single_head_paged_mqa_threshold_select(
     block_table : torch.Tensor
         int32 ``[requests, blocks]``: each request's pages of 64 keys.
     thresholds : torch.Tensor
-        float32 ``[rows]``: each row's threshold.
+        float32 ``[rows]``: each row's threshold. A repaired row gets its new
+        threshold.
     counters : torch.Tensor
         int32 ``[rows, 2]``, zeroed by the caller: each row's candidate and tie
         counts.
@@ -212,6 +222,11 @@ def single_head_paged_mqa_threshold_select(
         The number of tie slots.
     query_scales, key_scales : torch.Tensor, optional
         NVFP4 scales, as in :func:`single_head_paged_mqa_logits`.
+    arrivals : torch.Tensor, optional
+        int32 ``[tiles]``: zeroed once, and left zeroed by every call.
+    ranges : torch.Tensor, optional
+        int32 ``[2, rows]``, output: the range of slots holding each row's
+        candidates and ties. Other slots are unspecified.
     """
     if not is_cute_dsl_experimental_available():
         raise RuntimeError("Threshold select needs CuTe DSL 4.7 or newer")
@@ -229,10 +244,18 @@ def single_head_paged_mqa_threshold_select(
         raise ValueError(f"Mismatched query rows ({TILE} per tile) and per-row outputs")
     if max_context > PAGE * width:
         raise ValueError("The block table must cover the context capacity")
+    if (arrivals is None) != (ranges is None):
+        raise ValueError("The repair takes both arrivals and ranges")
+    if ranges is not None and (
+        arrivals.shape[0] < tiles or ranges.shape != (2, tiles * TILE)
+    ):
+        raise ValueError("arrivals must hold a count per tile and ranges [2, rows]")
     if not 0 <= top_k < candidates.shape[1]:
         raise ValueError(
             "candidates must hold the top_k tie slots and at least one more"
         )
+    if ranges is not None and candidates.shape[1] - top_k < top_k - 1:
+        raise ValueError("The repair needs candidate slots for top_k - 1 keys")
     # CTAs per query tile: the fewest that give every SM the same number of CTAs
     # and keep each CTA's run within SELECT_TILES_PER_CTA. tiles * workers is a
     # multiple of the SM count exactly when workers is a multiple of unit.
@@ -242,7 +265,7 @@ def single_head_paged_mqa_threshold_select(
     workers = unit * -(-runs // unit)
     keys = (query, query_scales, key_cache, key_scales)
     tables = (row_ends, tile_requests, block_table)
-    outputs = (thresholds, counters, candidates)
+    outputs = (thresholds, counters, arrivals, ranges, candidates)
     _score("select", TILE, keys, (*tables, *outputs, max_context, workers, top_k))
 
 

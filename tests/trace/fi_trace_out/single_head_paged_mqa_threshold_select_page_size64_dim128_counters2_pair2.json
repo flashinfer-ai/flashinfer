@@ -55,6 +55,10 @@
       "type": "const",
       "value": 2,
       "description": "Key index and score bits."
+    },
+    "range": {
+      "type": "var",
+      "description": "A row's first and past-last Top-K slot."
     }
   },
   "constraints": [
@@ -140,9 +144,37 @@
       ],
       "dtype": "unknown",
       "optional": true
+    },
+    "arrivals": {
+      "shape": [
+        "tiles"
+      ],
+      "dtype": "int32",
+      "optional": true
+    },
+    "ranges": {
+      "shape": [
+        "range",
+        "rows"
+      ],
+      "dtype": "int32",
+      "optional": true
     }
   },
   "outputs": {
+    "thresholds": {
+      "shape": [
+        "rows"
+      ],
+      "dtype": "float32"
+    },
+    "ranges": {
+      "shape": [
+        "range",
+        "rows"
+      ],
+      "dtype": "int32"
+    },
     "counters": {
       "shape": [
         "rows",

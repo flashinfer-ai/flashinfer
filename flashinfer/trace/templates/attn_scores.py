@@ -704,6 +704,7 @@ single_head_paged_mqa_threshold_select_trace = TraceTemplate(
         "slots": Var(description="Tie slots, then candidate slots."),
         "counters": Const(description="Candidate and tie counts."),
         "pair": Const(description="Key index and score bits."),
+        "range": Var(description="A row's first and past-last Top-K slot."),
     },
     inputs={
         "query": Tensor(["rows", "dim"]),
@@ -718,8 +719,12 @@ single_head_paged_mqa_threshold_select_trace = TraceTemplate(
         "top_k": Scalar("int32"),
         "query_scales": Tensor(["rows", "scales"], optional=True),
         "key_scales": Tensor(["pages", "page_size", "scales"], optional=True),
+        "arrivals": Tensor(["tiles"], optional=True),
+        "ranges": Tensor(["range", "rows"], optional=True),
     },
     outputs={
+        "thresholds": Tensor(["rows"], dtype="float32"),
+        "ranges": Tensor(["range", "rows"], dtype="int32"),
         "counters": Tensor(["rows", "counters"], dtype="int32"),
         "candidates": Tensor(["rows", "slots", "pair"], dtype="int32"),
     },
