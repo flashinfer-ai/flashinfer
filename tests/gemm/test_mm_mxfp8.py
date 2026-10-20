@@ -500,7 +500,10 @@ def test_mm_mxfp8_cute_dsl_waits_for_pdl_producer(m, n, k, auto_tuning):
 @pytest.mark.parametrize(
     "m,n,k",
     [
-        (1, 1536, 1024),
+        (1, 1536, 1024),  # M <= 32: a small-M runner is the untuned default
+        (4, 6144, 4096),
+        (16, 6144, 1536),
+        (64, 1536, 1024),  # M > 32: the SM107 kernel is the untuned default
         (100, 4096, 1024),  # M % 8 != 0
         (256, 1536, 6144),
         (4096, 6144, 1536),
@@ -509,7 +512,7 @@ def test_mm_mxfp8_cute_dsl_waits_for_pdl_producer(m, n, k, auto_tuning):
     ],
 )
 def test_mm_mxfp8_cute_dsl_sm107(m, n, k, auto_tuning, monkeypatch):
-    """On SM107, mm_mxfp8(backend="cute-dsl") runs the SM107 kernel and is correct."""
+    """On SM107, mm_mxfp8(backend="cute-dsl") picks the SM107 kernel above M=32, a small-M runner below, and is correct."""
     _skip_if_unsupported("cute-dsl")
     from flashinfer.cute_dsl.utils import is_rubin_cute_dsl_available
 
@@ -537,6 +540,9 @@ def test_mm_mxfp8_cute_dsl_sm107(m, n, k, auto_tuning, monkeypatch):
     monkeypatch.setattr(
         gemm_base, "_cute_dsl_gemm_mxfp8_sm107_runner", recording_sm107_runner
     )
+    if not auto_tuning:
+        # A cached winner (autotuning covers every M bucket) would replace the untuned default.
+        AutoTuner.get().clear_cache()
     _run_mm_mxfp8(
         m,
         n,
@@ -548,12 +554,16 @@ def test_mm_mxfp8_cute_dsl_sm107(m, n, k, auto_tuning, monkeypatch):
         provide_out=True,
     )
 
-    assert sm107_tactics_run, "mm_mxfp8 did not use the SM107 kernel"
     if auto_tuning:
-        # The last launch is the run with the tuned SM107 tactic.
+        # Autotuning profiles the SM107 kernel at every M; the last launch is a tuned tactic.
+        assert sm107_tactics_run, "mm_mxfp8 did not profile the SM107 kernel"
         assert isinstance(sm107_tactics_run[-1], tuple), sm107_tactics_run[-1]
         return
-    assert sm107_tactics_run == [-1], sm107_tactics_run
+    if m <= 32:
+        # A small-M runner is the untuned default; the SM107 kernel does not launch.
+        assert sm107_tactics_run == [], sm107_tactics_run
+    else:
+        assert sm107_tactics_run == [-1], sm107_tactics_run
 
     # Autotuning launches every tactic but only checks the one it picks, so also
     # run every SM107 tactic for this shape against the reference.
