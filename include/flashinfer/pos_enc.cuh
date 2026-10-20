@@ -21,6 +21,7 @@
 #include <iostream>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include "layout.cuh"
 #include "math.cuh"
@@ -357,7 +358,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel(
 }
 
 template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
-          typename IdType>
+          typename IdType, uint32_t heads_per_step = 1, bool split_heads = false>
 __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
     DType* q, DType* k, DType* q_rope, DType* k_rope, float* __restrict__ cos_sin_cache,
     IdType* __restrict__ pos_ids, uint32_t nnz, uint32_t num_qo_heads, uint32_t num_kv_heads,
@@ -392,34 +393,77 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
     }
 
     // not to unroll the loop, because num head might be large and might lead to worse performance
+    if constexpr (heads_per_step == 2) {
+      // Heads (q, then kv) strided by gridDim.y, two per step: both loads issue before
+      // either store.
+      const uint32_t num_heads = num_qo_heads + num_kv_heads;
+      auto head_ptrs = [&](uint32_t h, DType*& in_ptr, DType*& out_ptr) {
+        if (h < num_qo_heads) {
+          in_ptr = q + get_elem_offset_impl(idx, h, 0, q_stride_n, q_stride_h);
+          out_ptr = q_rope + get_elem_offset_impl(idx, h, 0, q_rope_stride_n, q_rope_stride_h);
+        } else {
+          in_ptr = k + get_elem_offset_impl(idx, h - num_qo_heads, 0, k_stride_n, k_stride_h);
+          out_ptr = k_rope + get_elem_offset_impl(idx, h - num_qo_heads, 0, k_rope_stride_n,
+                                                  k_rope_stride_h);
+        }
+      };
+      auto apply_head = [&](DType* in_ptr) {
+        if constexpr (interleave) {
+          return vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(in_ptr, cos, sin,
+                                                                                   rotary_dim);
+        } else {
+          return vec_apply_llama_rope_cos_sin<vec_size, bdx>(in_ptr, cos, sin, rotary_dim);
+        }
+      };
 #pragma unroll 1
-    for (uint32_t qo_head_idx = 0; qo_head_idx < num_qo_heads; ++qo_head_idx) {
-      DType* q_ptr = q + get_elem_offset_impl(idx, qo_head_idx, 0, q_stride_n, q_stride_h);
-      DType* q_rope_ptr =
-          q_rope + get_elem_offset_impl(idx, qo_head_idx, 0, q_rope_stride_n, q_rope_stride_h);
-      vec_t<float, vec_size> q_vec;
-      if constexpr (interleave) {
-        q_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(q_ptr, cos, sin,
-                                                                                  rotary_dim);
-      } else {
-        q_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
+      for (uint32_t h0 = blockIdx.y; h0 < num_heads; h0 += 2 * gridDim.y) {
+        const uint32_t h1 = h0 + gridDim.y;
+        const bool has_h1 = h1 < num_heads;
+        // Odd tail re-reads h0 so both loads stay branch-free.
+        DType *in0, *out0, *in1, *out1;
+        head_ptrs(h0, in0, out0);
+        head_ptrs(has_h1 ? h1 : h0, in1, out1);
+        vec_t<float, vec_size> v0 = apply_head(in0);
+        vec_t<float, vec_size> v1 = apply_head(in1);
+        v0.cast_store(out0 + tx * vec_size);
+        if (has_h1) {
+          v1.cast_store(out1 + tx * vec_size);
+        }
       }
-      q_vec.cast_store(q_rope_ptr + tx * vec_size);
-    }
+    } else {
+      // q heads, then kv heads; split_heads strides them by gridDim.y (two extra registers,
+      // which can cost a resident CTA, so the unsplit variant is kept for gridDim.y == 1).
+      const uint32_t h_begin = split_heads ? blockIdx.y : 0;
+      const uint32_t h_step = split_heads ? gridDim.y : 1;
+#pragma unroll 1
+      for (uint32_t qo_head_idx = h_begin; qo_head_idx < num_qo_heads; qo_head_idx += h_step) {
+        DType* q_ptr = q + get_elem_offset_impl(idx, qo_head_idx, 0, q_stride_n, q_stride_h);
+        DType* q_rope_ptr =
+            q_rope + get_elem_offset_impl(idx, qo_head_idx, 0, q_rope_stride_n, q_rope_stride_h);
+        vec_t<float, vec_size> q_vec;
+        if constexpr (interleave) {
+          q_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(q_ptr, cos, sin,
+                                                                                    rotary_dim);
+        } else {
+          q_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
+        }
+        q_vec.cast_store(q_rope_ptr + tx * vec_size);
+      }
 
 #pragma unroll 1
-    for (uint32_t kv_head_idx = 0; kv_head_idx < num_kv_heads; ++kv_head_idx) {
-      DType* k_ptr = k + get_elem_offset_impl(idx, kv_head_idx, 0, k_stride_n, k_stride_h);
-      DType* k_rope_ptr =
-          k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
-      vec_t<float, vec_size> k_vec;
-      if constexpr (interleave) {
-        k_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(k_ptr, cos, sin,
-                                                                                  rotary_dim);
-      } else {
-        k_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
+      for (uint32_t kv_head_idx = h_begin; kv_head_idx < num_kv_heads; kv_head_idx += h_step) {
+        DType* k_ptr = k + get_elem_offset_impl(idx, kv_head_idx, 0, k_stride_n, k_stride_h);
+        DType* k_rope_ptr =
+            k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
+        vec_t<float, vec_size> k_vec;
+        if constexpr (interleave) {
+          k_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(k_ptr, cos, sin,
+                                                                                    rotary_dim);
+        } else {
+          k_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
+        }
+        k_vec.cast_store(k_rope_ptr + tx * vec_size);
       }
-      k_vec.cast_store(k_rope_ptr + tx * vec_size);
     }
   }
 }
@@ -646,7 +690,7 @@ __global__ void BatchQKApplyRotaryPosIdsHeadParallelismKernel(
 }
 
 template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
-          typename IdType>
+          typename IdType, uint32_t heads_per_step = 1, bool split_heads = false>
 __global__ void BatchQKApplyRotaryPosIdsKernel(
     DType* q, DType* k, DType* q_rope, DType* k_rope, IdType* __restrict__ pos_ids, uint32_t nnz,
     uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rotary_dim, size_t q_stride_n,
@@ -687,32 +731,77 @@ __global__ void BatchQKApplyRotaryPosIdsKernel(
       }
     }
 
+    if constexpr (heads_per_step == 2) {
+      // Heads (q, then kv) strided by gridDim.y, two per step: both loads issue before
+      // either store.
+      const uint32_t num_heads = num_qo_heads + num_kv_heads;
+      auto head_ptrs = [&](uint32_t h, DType*& in_ptr, DType*& out_ptr) {
+        if (h < num_qo_heads) {
+          in_ptr = q + get_elem_offset_impl(idx, h, 0, q_stride_n, q_stride_h);
+          out_ptr = q_rope + get_elem_offset_impl(idx, h, 0, q_rope_stride_n, q_rope_stride_h);
+        } else {
+          in_ptr = k + get_elem_offset_impl(idx, h - num_qo_heads, 0, k_stride_n, k_stride_h);
+          out_ptr = k_rope + get_elem_offset_impl(idx, h - num_qo_heads, 0, k_rope_stride_n,
+                                                  k_rope_stride_h);
+        }
+      };
+      auto apply_head = [&](DType* in_ptr) {
+        if constexpr (interleave) {
+          return vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(in_ptr, cos, sin,
+                                                                        rotary_dim);
+        } else {
+          return vec_apply_llama_rope_cos_sin<vec_size, bdx>(in_ptr, cos, sin, rotary_dim);
+        }
+      };
 #pragma unroll 1
-    for (uint32_t qo_head_idx = 0; qo_head_idx < num_qo_heads; ++qo_head_idx) {
-      DType* q_ptr = q + get_elem_offset_impl(idx, qo_head_idx, 0, q_stride_n, q_stride_h);
-      DType* q_rope_ptr =
-          q_rope + get_elem_offset_impl(idx, qo_head_idx, 0, q_rope_stride_n, q_rope_stride_h);
-      vec_t<float, vec_size> q_vec;
-      if constexpr (interleave) {
-        q_vec = vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
-      } else {
-        q_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
+      for (uint32_t h0 = blockIdx.y; h0 < num_heads; h0 += 2 * gridDim.y) {
+        const uint32_t h1 = h0 + gridDim.y;
+        const bool has_h1 = h1 < num_heads;
+        // Odd tail re-reads h0 so both loads stay branch-free.
+        DType *in0, *out0, *in1, *out1;
+        head_ptrs(h0, in0, out0);
+        head_ptrs(has_h1 ? h1 : h0, in1, out1);
+        vec_t<float, vec_size> v0 = apply_head(in0);
+        vec_t<float, vec_size> v1 = apply_head(in1);
+        v0.cast_store(out0 + tx * vec_size);
+        if (has_h1) {
+          v1.cast_store(out1 + tx * vec_size);
+        }
       }
-      q_vec.cast_store(q_rope_ptr + tx * vec_size);
-    }
+    } else {
+      // q heads, then kv heads; split_heads strides them by gridDim.y (two extra registers,
+      // which can cost a resident CTA, so the unsplit variant is kept for gridDim.y == 1).
+      const uint32_t h_begin = split_heads ? blockIdx.y : 0;
+      const uint32_t h_step = split_heads ? gridDim.y : 1;
+#pragma unroll 1
+      for (uint32_t qo_head_idx = h_begin; qo_head_idx < num_qo_heads; qo_head_idx += h_step) {
+        DType* q_ptr = q + get_elem_offset_impl(idx, qo_head_idx, 0, q_stride_n, q_stride_h);
+        DType* q_rope_ptr =
+            q_rope + get_elem_offset_impl(idx, qo_head_idx, 0, q_rope_stride_n, q_rope_stride_h);
+        vec_t<float, vec_size> q_vec;
+        if constexpr (interleave) {
+          q_vec =
+              vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
+        } else {
+          q_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
+        }
+        q_vec.cast_store(q_rope_ptr + tx * vec_size);
+      }
 
 #pragma unroll 1
-    for (uint32_t kv_head_idx = 0; kv_head_idx < num_kv_heads; ++kv_head_idx) {
-      DType* k_ptr = k + get_elem_offset_impl(idx, kv_head_idx, 0, k_stride_n, k_stride_h);
-      DType* k_rope_ptr =
-          k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
-      vec_t<float, vec_size> k_vec;
-      if constexpr (interleave) {
-        k_vec = vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
-      } else {
-        k_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
+      for (uint32_t kv_head_idx = h_begin; kv_head_idx < num_kv_heads; kv_head_idx += h_step) {
+        DType* k_ptr = k + get_elem_offset_impl(idx, kv_head_idx, 0, k_stride_n, k_stride_h);
+        DType* k_rope_ptr =
+            k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
+        vec_t<float, vec_size> k_vec;
+        if constexpr (interleave) {
+          k_vec =
+              vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
+        } else {
+          k_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
+        }
+        k_vec.cast_store(k_rope_ptr + tx * vec_size);
       }
-      k_vec.cast_store(k_rope_ptr + tx * vec_size);
     }
   }
 }
@@ -751,7 +840,7 @@ __global__ void BatchQKApplyRotaryKernel(
     const uint32_t seq_len = indptr[batch_idx + 1] - indptr[batch_idx];
     const uint32_t offset = offsets[batch_idx];
 #pragma unroll 2
-    for (uint32_t i = 0; i < (seq_len + bdy - 1) / bdy; ++i) {
+    for (uint32_t i = blockIdx.y; i < (seq_len + bdy - 1) / bdy; i += gridDim.y) {
       vec_t<float, vec_size> q_vec;
       if (i * bdy + ty < seq_len) {
         DType* q_ptr = q + get_elem_offset_impl(indptr[batch_idx] + i * bdy + ty, qo_head_idx, 0,
@@ -776,7 +865,7 @@ __global__ void BatchQKApplyRotaryKernel(
     const uint32_t seq_len = indptr[batch_idx + 1] - indptr[batch_idx];
     const uint32_t offset = offsets[batch_idx];
 #pragma unroll 2
-    for (uint32_t i = 0; i < (seq_len + bdy - 1) / bdy; ++i) {
+    for (uint32_t i = blockIdx.y; i < (seq_len + bdy - 1) / bdy; i += gridDim.y) {
       vec_t<float, vec_size> k_vec;
       if (i * bdy + ty < seq_len) {
         DType* k_ptr = k + get_elem_offset_impl(indptr[batch_idx] + i * bdy + ty, kv_head_idx, 0,
@@ -1033,6 +1122,111 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
+}
+
+// Split a CTA's serial loop over gridDim.y = g CTAs (1 <= g <= max_split), minimising
+// waves(g) * (steps(g) + 1); steps(g) is the CTA's loop trip count and the +1 models per-CTA
+// setup (freqs, sin/cos, index loads).
+template <typename StepsFn>
+inline uint64_t RopeSplitCost(uint32_t nblks, uint32_t num_ctas_resident, uint32_t g,
+                              StepsFn steps) {
+  const uint64_t waves =
+      (static_cast<uint64_t>(nblks) * g + num_ctas_resident - 1) / num_ctas_resident;
+  return waves * (static_cast<uint64_t>(steps(g)) + 1);
+}
+
+template <typename StepsFn>
+inline uint32_t RopeGridSplit(uint32_t nblks, uint32_t num_ctas_resident, uint32_t max_split,
+                              StepsFn steps, uint64_t* cost_out = nullptr) {
+  if (nblks == 0 || num_ctas_resident == 0 || max_split <= 1) {
+    if (cost_out != nullptr) *cost_out = UINT64_MAX;
+    return 1;
+  }
+  max_split = std::min(max_split, 128u);
+  uint32_t best = 1;
+  uint64_t best_cost = UINT64_MAX;
+  for (uint32_t g = 1; g <= max_split; ++g) {
+    const uint64_t cost = RopeSplitCost(nblks, num_ctas_resident, g, steps);
+    if (cost < best_cost) {
+      best_cost = cost;
+      best = g;
+    }
+  }
+  if (cost_out != nullptr) *cost_out = best_cost;
+  return best;
+}
+
+// Resident CTAs (SMs x occupancy) of `kernel` on the current device, cached per thread by
+// (device, kernel, block size) so launches skip the attribute and occupancy queries.
+inline cudaError_t RopeResidentCtas(const void* kernel, uint32_t num_threads, uint32_t& num_ctas) {
+  struct Entry {
+    int device;
+    const void* kernel;
+    uint32_t num_threads;
+    uint32_t num_ctas;
+  };
+  static thread_local std::vector<Entry> cache;
+  int device = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
+  for (const Entry& e : cache) {
+    if (e.device == device && e.kernel == kernel && e.num_threads == num_threads) {
+      num_ctas = e.num_ctas;
+      return cudaSuccess;
+    }
+  }
+  int num_sms = 0, num_blocks_per_sm = 0;
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device));
+  FLASHINFER_CUDA_CALL(
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, num_threads, 0));
+  num_ctas = static_cast<uint32_t>(num_sms * num_blocks_per_sm);
+  cache.push_back({device, kernel, num_threads, num_ctas});
+  return cudaSuccess;
+}
+
+// Two heads per step only pays where SM occupancy is already capped by the 1024-thread
+// resident limit (SM107); with 2048 threads/SM its extra registers cost occupancy.
+inline cudaError_t RopeUseTwoHeadsPerStep(bool& two_heads) {
+  static thread_local int cached_device = -1;
+  static thread_local bool cached_value = false;
+  int device = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
+  if (device != cached_device) {
+    int max_threads_per_sm = 0;
+    FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_threads_per_sm,
+                                                cudaDevAttrMaxThreadsPerMultiProcessor, device));
+    cached_value = max_threads_per_sm <= 1024;
+    cached_device = device;
+  }
+  two_heads = cached_value;
+  return cudaSuccess;
+}
+
+// gridDim.y for the token-parallel pos_ids kernels; a step is one head, or a pair of heads
+// with two heads per step. With one head per step the unsplit
+// kernel (gridDim.y == 1, fewer registers) is kept unless the strided kernel, at its own
+// occupancy, models faster; `use_split_kernel` reports which kernel to launch.
+inline cudaError_t RopeHeadSplit(uint32_t nblks, const void* split_kernel,
+                                 const void* unsplit_kernel, uint32_t num_threads,
+                                 uint32_t num_qo_heads, uint32_t num_kv_heads, bool two_heads,
+                                 uint32_t& split, bool& use_split_kernel) {
+  auto steps = [&](uint32_t g) {
+    const uint32_t heads = ceil_div(num_qo_heads + num_kv_heads, g);
+    return two_heads ? ceil_div(heads, 2u) : heads;
+  };
+  uint32_t split_ctas = 0;
+  FLASHINFER_CUDA_CALL(RopeResidentCtas(split_kernel, num_threads, split_ctas));
+  uint64_t split_cost = UINT64_MAX;
+  split = RopeGridSplit(nblks, split_ctas, num_qo_heads + num_kv_heads, steps, &split_cost);
+  use_split_kernel = true;
+  if (!two_heads) {
+    uint32_t unsplit_ctas = 0;
+    FLASHINFER_CUDA_CALL(RopeResidentCtas(unsplit_kernel, num_threads, unsplit_ctas));
+    if (unsplit_ctas == 0 || RopeSplitCost(nblks, unsplit_ctas, 1, steps) <= split_cost) {
+      split = 1;
+      use_split_kernel = false;
+    }
+  }
+  return cudaSuccess;
 }
 
 template <typename DType, typename IdType, typename QuantType>
@@ -1306,10 +1500,8 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
 
   // We have better performance with this kernel with these head_dim instead of RopeQuantize
   if (head_dim == 64 || head_dim == 128 || head_dim == 256 || head_dim == 512) {
-    int dev_id = 0;
-    int num_sms = 0;
-    FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
-    FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
+    bool two_heads = false;
+    FLASHINFER_CUDA_CALL(RopeUseTwoHeadsPerStep(two_heads));
 
     DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
       DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
@@ -1341,18 +1533,30 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
                         (void*)&q_rope_stride_h,
                         (void*)&k_rope_stride_n,
                         (void*)&k_rope_stride_h};
-        auto kernel_0 = BatchQKApplyRotaryPosIdsCosSinCacheKernel<INTERLEAVE, HEAD_DIM, vec_size,
-                                                                  bdx, DType, IdType>;
+        auto split_kernel =
+            two_heads ? BatchQKApplyRotaryPosIdsCosSinCacheKernel<INTERLEAVE, HEAD_DIM, vec_size,
+                                                                  bdx, DType, IdType, 2, true>
+                      : BatchQKApplyRotaryPosIdsCosSinCacheKernel<INTERLEAVE, HEAD_DIM, vec_size,
+                                                                  bdx, DType, IdType, 1, true>;
+        auto unsplit_kernel =
+            BatchQKApplyRotaryPosIdsCosSinCacheKernel<INTERLEAVE, HEAD_DIM, vec_size, bdx, DType,
+                                                      IdType>;
 
-        int num_blocks_per_sm_0 = 0;
-        FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &num_blocks_per_sm_0, kernel_0, num_threads, /*smem_size=*/0));
-        uint32_t num_ctas_0 = num_blocks_per_sm_0 * num_sms;
+        uint32_t num_ctas_0 = 0;
+        FLASHINFER_CUDA_CALL(RopeResidentCtas(
+            two_heads ? (void*)split_kernel : (void*)unsplit_kernel, num_threads, num_ctas_0));
 
         if ((nnz + bdy - 1) / bdy >= num_ctas_0) {
-          dim3 nblks(nblks_x);
+          uint32_t split = 1;
+          bool use_split_kernel = false;
+          FLASHINFER_CUDA_CALL(RopeHeadSplit(nblks_x, (void*)split_kernel, (void*)unsplit_kernel,
+                                             num_threads, num_qo_heads, num_kv_heads, two_heads,
+                                             split, use_split_kernel));
+          dim3 nblks(nblks_x, split);
           dim3 nthrs(bdx, bdy);
-          FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel_0, nblks, nthrs, args, 0, stream));
+          FLASHINFER_CUDA_CALL(
+              cudaLaunchKernel(use_split_kernel ? (void*)split_kernel : (void*)unsplit_kernel,
+                               nblks, nthrs, args, 0, stream));
         } else {
           dim3 nblks(nblks_x, num_qo_heads + num_kv_heads);
           dim3 nthrs(bdx, bdy);
@@ -1398,10 +1602,8 @@ cudaError_t BatchQKApplyRotaryPosIds(
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = 0.f;
   float smooth_b = 0.f;
-  int dev_id = 0;
-  int num_sms = 0;
-  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
-  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
+  bool two_heads = false;
+  FLASHINFER_CUDA_CALL(RopeUseTwoHeadsPerStep(two_heads));
 
   DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
@@ -1432,18 +1634,28 @@ cudaError_t BatchQKApplyRotaryPosIds(
                       (void*)&smooth_b,
                       (void*)&rope_rcp_scale,
                       (void*)&rope_rcp_theta};
-      auto kernel_0 =
+      auto split_kernel = two_heads ? BatchQKApplyRotaryPosIdsKernel<INTERLEAVE, HEAD_DIM, vec_size,
+                                                                     bdx, DType, IdType, 2, true>
+                                    : BatchQKApplyRotaryPosIdsKernel<INTERLEAVE, HEAD_DIM, vec_size,
+                                                                     bdx, DType, IdType, 1, true>;
+      auto unsplit_kernel =
           BatchQKApplyRotaryPosIdsKernel<INTERLEAVE, HEAD_DIM, vec_size, bdx, DType, IdType>;
 
-      int num_blocks_per_sm_0 = 0;
-      FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &num_blocks_per_sm_0, kernel_0, num_threads, /*smem_size=*/0));
-      uint32_t num_ctas_0 = num_blocks_per_sm_0 * num_sms;
+      uint32_t num_ctas_0 = 0;
+      FLASHINFER_CUDA_CALL(RopeResidentCtas(two_heads ? (void*)split_kernel : (void*)unsplit_kernel,
+                                            num_threads, num_ctas_0));
       if (nblks_x >= num_ctas_0) {
-        dim3 nblks(nblks_x);
+        uint32_t split = 1;
+        bool use_split_kernel = false;
+        FLASHINFER_CUDA_CALL(RopeHeadSplit(nblks_x, (void*)split_kernel, (void*)unsplit_kernel,
+                                           num_threads, num_qo_heads, num_kv_heads, two_heads,
+                                           split, use_split_kernel));
+        dim3 nblks(nblks_x, split);
         dim3 nthrs(bdx, bdy);
 
-        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel_0, nblks, nthrs, args, 0, stream));
+        FLASHINFER_CUDA_CALL(
+            cudaLaunchKernel(use_split_kernel ? (void*)split_kernel : (void*)unsplit_kernel, nblks,
+                             nthrs, args, 0, stream));
       } else {
         dim3 nblks(nblks_x, num_qo_heads + num_kv_heads);
         dim3 nthrs(bdx, bdy);
@@ -1466,7 +1678,8 @@ cudaError_t BatchQKApplyRotary(DType* q, DType* k, DType* q_rope, DType* k_rope,
                                size_t q_stride_h, size_t k_stride_n, size_t k_stride_h,
                                size_t q_rope_stride_n, size_t q_rope_stride_h,
                                size_t k_rope_stride_n, size_t k_rope_stride_h, bool interleave,
-                               float rope_scale, float rope_theta, cudaStream_t stream = nullptr) {
+                               float rope_scale, float rope_theta, cudaStream_t stream = nullptr,
+                               uint32_t nnz = 0) {
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = 0.f;
@@ -1478,9 +1691,19 @@ cudaError_t BatchQKApplyRotary(DType* q, DType* k, DType* q_rope, DType* k_rope,
       constexpr uint32_t bdx = HEAD_DIM / vec_size;
       uint32_t num_threads = std::max(128U, bdx);
       uint32_t bdy = num_threads / bdx;
-      dim3 nblks(batch_size * (num_qo_heads + num_kv_heads));
-      dim3 nthrs(bdx, bdy);
       auto kernel = BatchQKApplyRotaryKernel<INTERLEAVE, HEAD_DIM, vec_size, bdx, DType, IdType>;
+      // Split each (request, head) token walk over gridDim.y; nnz == 0 disables the split.
+      const uint32_t nblks_x = batch_size * (num_qo_heads + num_kv_heads);
+      uint32_t split = 1;
+      if (nnz > 0 && batch_size > 0) {
+        uint32_t num_ctas = 0;
+        FLASHINFER_CUDA_CALL(RopeResidentCtas((void*)kernel, num_threads, num_ctas));
+        const uint32_t mean_iters = ceil_div(ceil_div(nnz, batch_size), bdy);
+        split = RopeGridSplit(nblks_x, num_ctas, mean_iters,
+                              [&](uint32_t g) { return ceil_div(mean_iters, g); });
+      }
+      dim3 nblks(nblks_x, split);
+      dim3 nthrs(bdx, bdy);
       void* args[] = {(void*)&q,
                       (void*)&k,
                       (void*)&q_rope,
@@ -1517,11 +1740,12 @@ cudaError_t BatchQKApplyRotaryInPlace(DType* __restrict__ q, DType* __restrict__
                                       uint32_t num_kv_heads, uint32_t rotary_dim, uint32_t head_dim,
                                       size_t q_stride_n, size_t q_stride_h, size_t k_stride_n,
                                       size_t k_stride_h, bool interleave, float rope_scale,
-                                      float rope_theta, cudaStream_t stream = nullptr) {
+                                      float rope_theta, cudaStream_t stream = nullptr,
+                                      uint32_t nnz = 0) {
   return BatchQKApplyRotary<DType, IdType>(
       q, k, q, k, indptr, offsets, batch_size, num_qo_heads, num_kv_heads, rotary_dim, head_dim,
       q_stride_n, q_stride_h, k_stride_n, k_stride_h, q_stride_n, q_stride_h, k_stride_n,
-      k_stride_h, interleave, rope_scale, rope_theta, stream);
+      k_stride_h, interleave, rope_scale, rope_theta, stream, nnz);
 }
 
 template <typename DType, typename IdType>
@@ -1532,7 +1756,7 @@ cudaError_t BatchQKApplyLlama31Rotary(
     size_t k_stride_h, size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n,
     size_t k_rope_stride_h, bool interleave, float rope_scale, float rope_theta,
     float low_freq_factor, float high_freq_factor, float old_context_length,
-    cudaStream_t stream = nullptr) {
+    cudaStream_t stream = nullptr, uint32_t nnz = 0) {
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = old_context_length / (2 * M_PI * high_freq_factor - 2 * M_PI * low_freq_factor);
@@ -1544,9 +1768,19 @@ cudaError_t BatchQKApplyLlama31Rotary(
       constexpr uint32_t bdx = HEAD_DIM / vec_size;
       uint32_t num_threads = std::max(128U, bdx);
       uint32_t bdy = num_threads / bdx;
-      dim3 nblks(batch_size * (num_qo_heads + num_kv_heads));
-      dim3 nthrs(bdx, bdy);
       auto kernel = BatchQKApplyRotaryKernel<INTERLEAVE, HEAD_DIM, vec_size, bdx, DType, IdType>;
+      // Split each (request, head) token walk over gridDim.y; nnz == 0 disables the split.
+      const uint32_t nblks_x = batch_size * (num_qo_heads + num_kv_heads);
+      uint32_t split = 1;
+      if (nnz > 0 && batch_size > 0) {
+        uint32_t num_ctas = 0;
+        FLASHINFER_CUDA_CALL(RopeResidentCtas((void*)kernel, num_threads, num_ctas));
+        const uint32_t mean_iters = ceil_div(ceil_div(nnz, batch_size), bdy);
+        split = RopeGridSplit(nblks_x, num_ctas, mean_iters,
+                              [&](uint32_t g) { return ceil_div(mean_iters, g); });
+      }
+      dim3 nblks(nblks_x, split);
+      dim3 nthrs(bdx, bdy);
       void* args[] = {(void*)&q,
                       (void*)&k,
                       (void*)&q_rope,
@@ -1588,6 +1822,8 @@ cudaError_t BatchQKApplyLlama31RotaryPosIds(
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = old_context_length / (2 * M_PI * high_freq_factor - 2 * M_PI * low_freq_factor);
   float smooth_b = -1.0f / (high_freq_factor / low_freq_factor - 1.0f);
+  bool two_heads = false;
+  FLASHINFER_CUDA_CALL(RopeUseTwoHeadsPerStep(two_heads));
 
   DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
@@ -1595,10 +1831,21 @@ cudaError_t BatchQKApplyLlama31RotaryPosIds(
       constexpr uint32_t bdx = HEAD_DIM / vec_size;
       uint32_t num_threads = std::max(128U, bdx);
       uint32_t bdy = num_threads / bdx;
-      dim3 nblks((nnz + bdy - 1) / bdy);
-      dim3 nthrs(bdx, bdy);
-      auto kernel =
+      const uint32_t nblks_x = (nnz + bdy - 1) / bdy;
+      auto split_kernel = two_heads ? BatchQKApplyRotaryPosIdsKernel<INTERLEAVE, HEAD_DIM, vec_size,
+                                                                     bdx, DType, IdType, 2, true>
+                                    : BatchQKApplyRotaryPosIdsKernel<INTERLEAVE, HEAD_DIM, vec_size,
+                                                                     bdx, DType, IdType, 1, true>;
+      auto unsplit_kernel =
           BatchQKApplyRotaryPosIdsKernel<INTERLEAVE, HEAD_DIM, vec_size, bdx, DType, IdType>;
+      uint32_t split = 1;
+      bool use_split_kernel = false;
+      FLASHINFER_CUDA_CALL(RopeHeadSplit(nblks_x, (void*)split_kernel, (void*)unsplit_kernel,
+                                         num_threads, num_qo_heads, num_kv_heads, two_heads, split,
+                                         use_split_kernel));
+      void* kernel = use_split_kernel ? (void*)split_kernel : (void*)unsplit_kernel;
+      dim3 nblks(nblks_x, split);
+      dim3 nthrs(bdx, bdy);
       void* args[] = {(void*)&q,
                       (void*)&k,
                       (void*)&q_rope,
