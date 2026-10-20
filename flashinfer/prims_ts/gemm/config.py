@@ -36,9 +36,6 @@ class PrimsTsGemmConfig:
     # 96 selects the SM103 NVFP4 instruction and 128 the SM107 64-byte one;
     # 64 retains the reference path.
     nvfp4_mma_k: int = 64
-    # Dense FP8 MMA instruction K. None picks the arch default (64 on SM107,
-    # otherwise 32); 64 requires SM107.
-    fp8_mma_k: Optional[int] = None
     # None retains the epilogue default (8 for overlap/fused, otherwise 4).
     epilogue_warps: Optional[int] = None
     tmem_overlap: bool = False
@@ -48,3 +45,6 @@ class PrimsTsGemmConfig:
     use_tma_store: bool = False
     # Store Q, K, V as three contiguous [M, N/3] sections.
     separate_qkv_output: bool = False
+    # Dense FP8 MMA instruction K. None picks the arch default (64 on SM107,
+    # otherwise 32); 64 requires SM107.
+    fp8_mma_k: Optional[int] = None
