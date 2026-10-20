@@ -179,4 +179,3 @@ kernel_cake_sage_block_sparse_attention_ce646595859ababcf2bd(__nv_bfloat16* __re
 }
 
 } // extern "C"
-

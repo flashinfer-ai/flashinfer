@@ -99,7 +99,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "block": (512, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 110592,
+            "dynamic_smem_bytes": 119040,
             "use_pdl": False,
         },
         "library": "cake_sage_block_sparse_attention_9884891b129880048274",
