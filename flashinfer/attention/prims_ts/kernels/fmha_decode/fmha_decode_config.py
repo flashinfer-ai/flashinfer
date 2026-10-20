@@ -419,6 +419,13 @@ class GroupedQMmaCandidate:
     tile_size_q: int
     q_tokens_per_cta: int
     q_tiles: int
+    # Each CTA runs two consecutive Q tiles over one K/V stream.
+    query_paired: bool = False
+
+    @property
+    def ctas_per_kv_head(self) -> int:
+        """Return the CTAs that cover ``q_tiles`` for one batch and KV head."""
+        return (self.q_tiles + 1) // 2 if self.query_paired else self.q_tiles
 
 
 @dataclass(frozen=True)
@@ -463,10 +470,19 @@ _GROUPED_Q_REDUCTION_COST = {
     16: {8: 1.0, 16: 1.03, 32: 1.08, 64: 1.2, 128: 1.32},
 }
 _GROUPED_Q_REDUCTION_SEQ_LEN_FACTOR = 128.0
+# A query-paired CTA loads each K/V tile once for its two Q128 tiles; per Q
+# tile its mainloop costs this fraction of an unpaired CTA's, by K/V width.
+# Multi-wave paged launches measure a median of 0.94 (16-bit) and 0.93 to
+# 0.98 (8-bit) on B200, and 0.91 and 0.83 to 0.90 on GB300.
+_QUERY_PAIRED_MAINLOOP_SCALE = {8: 0.95, 16: 0.93}
 
 
 def enumerate_grouped_q_mma_candidates(
-    *, heads_q_per_kv: int, seq_len_q: int, swaps_only: bool = False
+    *,
+    heads_q_per_kv: int,
+    seq_len_q: int,
+    swaps_only: bool = False,
+    query_paired: bool = False,
 ) -> tuple[GroupedQMmaCandidate, ...]:
     """Return grouped-Q candidates without applying launch policy.
 
@@ -476,6 +492,8 @@ def enumerate_grouped_q_mma_candidates(
     cases.  This helper deliberately does not inspect dtypes, reduction modes,
     scheduler state, or mutate ``FmhaDecodeConfig``. ``swaps_only`` excludes
     KeepsMmaAb tiles for profiles such as transformed mixed-precision K/V.
+    ``query_paired`` adds the Keeps Q128 tile paired two per CTA when a
+    sequence holds at least two of them.
     """
     if heads_q_per_kv <= 0:
         raise ValueError("heads_q_per_kv must be positive")
@@ -497,6 +515,14 @@ def enumerate_grouped_q_mma_candidates(
                 q_tiles=(seq_len_q + q_tokens_per_cta - 1) // q_tokens_per_cta,
             )
         )
+    if query_paired:
+        candidates += [
+            replace(candidate, query_paired=True)
+            for candidate in candidates
+            if candidate.variant == "keeps_mma_ab"
+            and candidate.tile_size_q == 128
+            and candidate.q_tiles >= 2
+        ]
     return tuple(candidates)
 
 
@@ -511,16 +537,18 @@ def make_grouped_q_launch_candidate(
     num_heads_kv: int,
     service_capacity: int,
     cost_kv_width: int,
+    mainloop_scale: float = 1.0,
 ) -> GroupedQLaunchCandidate:
     """Build one empirical grouped-Q launch-cost record.
 
     The model follows the measured GQA-generation cost structure:
 
-    ``(mainloop_factor[TileQ] * seq_len_per_cta_kv +``
+    ``(mainloop_scale * mainloop_factor[TileQ] * seq_len_per_cta_kv +``
     `` reduction_factor[TileQ] * 128 * splits_kv) * waves``.
 
     This is a small deterministic default heuristic. Both factors come from
-    the tables of ``cost_kv_width`` (``_grouped_q_cost_kv_width``); the
+    the tables of ``cost_kv_width`` (``_grouped_q_cost_kv_width``), and
+    ``mainloop_scale`` prices a query-paired CTA's Q tiles; the
     production profile validator still determines which actual-dtype recipes
     are legal.
     """
@@ -540,11 +568,12 @@ def make_grouped_q_launch_candidate(
         raise ValueError("service_capacity must be positive")
     kv_tiles = (seq_len_kv + tile_size_kv - 1) // tile_size_kv
     seq_len_per_cta_kv = ((kv_tiles + splits_kv - 1) // splits_kv) * tile_size_kv
-    base_ctas = batch_size * num_heads_kv * candidate.q_tiles
+    base_ctas = batch_size * num_heads_kv * candidate.ctas_per_kv_head
     launched_ctas = base_ctas * splits_kv
     waves = (launched_ctas + service_capacity - 1) // service_capacity
     modeled_time = (
-        _GROUPED_Q_MAINLOOP_COST[cost_kv_width][candidate.tile_size_q]
+        mainloop_scale
+        * _GROUPED_Q_MAINLOOP_COST[cost_kv_width][candidate.tile_size_q]
         * seq_len_per_cta_kv
         + _GROUPED_Q_REDUCTION_COST[cost_kv_width][candidate.tile_size_q]
         * _GROUPED_Q_REDUCTION_SEQ_LEN_FACTOR
@@ -4451,6 +4480,7 @@ def _apply_grouped_q_mma_candidate(
     """Apply one internally selected grouped-Q MMA tile to ``cfg``."""
     cfg.use_keeps_mma_ab = candidate.variant == "keeps_mma_ab"
     cfg.tile_size_q = candidate.tile_size_q
+    cfg.query_paired = candidate.query_paired
     if cfg.use_keeps_mma_ab:
         return
     cfg.tmem_s_cols = candidate.tile_size_q
@@ -4531,6 +4561,10 @@ def _resolve_grouped_q_launch_candidates(
     except ValueError:
         return ()
     cost_kv_width = _grouped_q_cost_kv_width(probe)
+    mainloop_scale = 1.0
+    if candidate.query_paired:
+        # A paired CTA runs its Q tiles over one K/V stream and never splits it.
+        mainloop_scale = 2 * _QUERY_PAIRED_MAINLOOP_SCALE[cost_kv_width]
 
     split_candidates = enumerate_auto_splits_kv(
         seq_len_kv=seq_len_kv,
@@ -4540,7 +4574,7 @@ def _resolve_grouped_q_launch_candidates(
         num_insts_kv=cost_num_insts_kv,
         num_q_tiles=candidate.q_tiles,
         service_capacity=service_capacity,
-        split_kv=split_kv,
+        split_kv=split_kv and not candidate.query_paired,
     )
     recipes = []
     for candidate_splits_kv in split_candidates:
@@ -4570,6 +4604,7 @@ def _resolve_grouped_q_launch_candidates(
                 num_heads_kv=num_heads_kv,
                 service_capacity=service_capacity,
                 cost_kv_width=cost_kv_width,
+                mainloop_scale=mainloop_scale,
             )
         )
     return tuple(recipes)
@@ -4612,6 +4647,8 @@ def _apply_auto_grouped_q_mma_config(
         heads_q_per_kv=num_heads_q // num_heads_kv,
         seq_len_q=seq_len_q,
         swaps_only=cfg.use_transform_kv,
+        # A caller that sets query_paired keeps that choice.
+        query_paired="query_paired" not in explicit_fields,
     )
     if not candidates:
         return None
