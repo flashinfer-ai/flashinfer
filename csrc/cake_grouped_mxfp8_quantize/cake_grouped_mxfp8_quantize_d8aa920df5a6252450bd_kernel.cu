@@ -14,6 +14,17 @@
  * limitations under the License.
  */
 
+// This unit serves two programs: cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd (CAKE_PROGRAM_VARIANT 0, the default) and
+// cake_grouped_mxfp8_quantize_f84d4eab2905894ac4c2 (CAKE_PROGRAM_VARIANT 1).  CAKE_PROGRAM_KERNEL names the kernel it defines.  A build
+// selects the second program with the compile definitions
+// -DCAKE_PROGRAM_VARIANT=1 -DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_f84d4eab2905894ac4c2.
+#ifndef CAKE_PROGRAM_VARIANT
+#define CAKE_PROGRAM_VARIANT 0
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd
+#endif
+
 typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -50,7 +61,11 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 128
+#if CAKE_PROGRAM_VARIANT == 1
+#define IS_BF16 0
+#else
 #define IS_BF16 1
+#endif
 
 #include <math_constants.h>
 
@@ -96,7 +111,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8_t* __restrict__ quantized, uint8_t* __restrict__ scales, int M, int K, int PADDED_K, int PM_TILES, int PK_TILES, int BLOCKS_PER_ROW, unsigned long long TOTAL_TASKS)
+CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8_t* __restrict__ quantized, uint8_t* __restrict__ scales, int M, int K, int PADDED_K, int PM_TILES, int PK_TILES, int BLOCKS_PER_ROW, unsigned long long TOTAL_TASKS)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -131,6 +146,96 @@ kernel_cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd(__nv_bfloat16* __restric
                         asm volatile(
                             "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                             : "=r"(_v8_0_0[0]), "=r"(_v8_0_0[1]), "=r"(_v8_0_0[2]), "=r"(_v8_0_0[3]), "=r"(_v8_0_0[4]), "=r"(_v8_0_0[5]), "=r"(_v8_0_0[6]), "=r"(_v8_0_0[7]) : "l"((const char*)_v8p_0 + 0) : "memory");
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .b16 h_lo, h_hi;\n\t"
+                            ".reg .b32 f_lo, f_hi;\n\t"
+                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                            "cvt.f32.f16 f_lo, h_lo;\n\t"
+                            "cvt.f32.f16 f_hi, h_hi;\n\t"
+                            "mov.b64 %0, {f_lo, f_hi};\n\t"
+                            "}\n"
+                            : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 0]))
+                            : "r"(_v8_0_0[0]));
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .b16 h_lo, h_hi;\n\t"
+                            ".reg .b32 f_lo, f_hi;\n\t"
+                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                            "cvt.f32.f16 f_lo, h_lo;\n\t"
+                            "cvt.f32.f16 f_hi, h_hi;\n\t"
+                            "mov.b64 %0, {f_lo, f_hi};\n\t"
+                            "}\n"
+                            : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 2]))
+                            : "r"(_v8_0_0[1]));
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .b16 h_lo, h_hi;\n\t"
+                            ".reg .b32 f_lo, f_hi;\n\t"
+                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                            "cvt.f32.f16 f_lo, h_lo;\n\t"
+                            "cvt.f32.f16 f_hi, h_hi;\n\t"
+                            "mov.b64 %0, {f_lo, f_hi};\n\t"
+                            "}\n"
+                            : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 4]))
+                            : "r"(_v8_0_0[2]));
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .b16 h_lo, h_hi;\n\t"
+                            ".reg .b32 f_lo, f_hi;\n\t"
+                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                            "cvt.f32.f16 f_lo, h_lo;\n\t"
+                            "cvt.f32.f16 f_hi, h_hi;\n\t"
+                            "mov.b64 %0, {f_lo, f_hi};\n\t"
+                            "}\n"
+                            : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 6]))
+                            : "r"(_v8_0_0[3]));
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .b16 h_lo, h_hi;\n\t"
+                            ".reg .b32 f_lo, f_hi;\n\t"
+                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                            "cvt.f32.f16 f_lo, h_lo;\n\t"
+                            "cvt.f32.f16 f_hi, h_hi;\n\t"
+                            "mov.b64 %0, {f_lo, f_hi};\n\t"
+                            "}\n"
+                            : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 8]))
+                            : "r"(_v8_0_0[4]));
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .b16 h_lo, h_hi;\n\t"
+                            ".reg .b32 f_lo, f_hi;\n\t"
+                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                            "cvt.f32.f16 f_lo, h_lo;\n\t"
+                            "cvt.f32.f16 f_hi, h_hi;\n\t"
+                            "mov.b64 %0, {f_lo, f_hi};\n\t"
+                            "}\n"
+                            : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 10]))
+                            : "r"(_v8_0_0[5]));
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .b16 h_lo, h_hi;\n\t"
+                            ".reg .b32 f_lo, f_hi;\n\t"
+                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                            "cvt.f32.f16 f_lo, h_lo;\n\t"
+                            "cvt.f32.f16 f_hi, h_hi;\n\t"
+                            "mov.b64 %0, {f_lo, f_hi};\n\t"
+                            "}\n"
+                            : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 12]))
+                            : "r"(_v8_0_0[6]));
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .b16 h_lo, h_hi;\n\t"
+                            ".reg .b32 f_lo, f_hi;\n\t"
+                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                            "cvt.f32.f16 f_lo, h_lo;\n\t"
+                            "cvt.f32.f16 f_hi, h_hi;\n\t"
+                            "mov.b64 %0, {f_lo, f_hi};\n\t"
+                            "}\n"
+                            : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 14]))
+                            : "r"(_v8_0_0[7]));
+#else
                         (&values[0 + 0])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[0]) << 16);
                         (&values[0 + 0])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[0]) & 0xffff0000u);
                         (&values[0 + 2])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[1]) << 16);
@@ -147,10 +252,101 @@ kernel_cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd(__nv_bfloat16* __restric
                         (&values[0 + 12])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[6]) & 0xffff0000u);
                         (&values[0 + 14])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[7]) << 16);
                         (&values[0 + 14])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_0[7]) & 0xffff0000u);
+#endif
                         uint32_t _v8_0_1[8];
                         asm volatile(
                             "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                             : "=r"(_v8_0_1[0]), "=r"(_v8_0_1[1]), "=r"(_v8_0_1[2]), "=r"(_v8_0_1[3]), "=r"(_v8_0_1[4]), "=r"(_v8_0_1[5]), "=r"(_v8_0_1[6]), "=r"(_v8_0_1[7]) : "l"((const char*)_v8p_0 + 32) : "memory");
+#if CAKE_PROGRAM_VARIANT == 1
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .b16 h_lo, h_hi;\n\t"
+                            ".reg .b32 f_lo, f_hi;\n\t"
+                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                            "cvt.f32.f16 f_lo, h_lo;\n\t"
+                            "cvt.f32.f16 f_hi, h_hi;\n\t"
+                            "mov.b64 %0, {f_lo, f_hi};\n\t"
+                            "}\n"
+                            : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 16]))
+                            : "r"(_v8_0_1[0]));
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .b16 h_lo, h_hi;\n\t"
+                            ".reg .b32 f_lo, f_hi;\n\t"
+                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                            "cvt.f32.f16 f_lo, h_lo;\n\t"
+                            "cvt.f32.f16 f_hi, h_hi;\n\t"
+                            "mov.b64 %0, {f_lo, f_hi};\n\t"
+                            "}\n"
+                            : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 18]))
+                            : "r"(_v8_0_1[1]));
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .b16 h_lo, h_hi;\n\t"
+                            ".reg .b32 f_lo, f_hi;\n\t"
+                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                            "cvt.f32.f16 f_lo, h_lo;\n\t"
+                            "cvt.f32.f16 f_hi, h_hi;\n\t"
+                            "mov.b64 %0, {f_lo, f_hi};\n\t"
+                            "}\n"
+                            : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 20]))
+                            : "r"(_v8_0_1[2]));
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .b16 h_lo, h_hi;\n\t"
+                            ".reg .b32 f_lo, f_hi;\n\t"
+                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                            "cvt.f32.f16 f_lo, h_lo;\n\t"
+                            "cvt.f32.f16 f_hi, h_hi;\n\t"
+                            "mov.b64 %0, {f_lo, f_hi};\n\t"
+                            "}\n"
+                            : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 22]))
+                            : "r"(_v8_0_1[3]));
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .b16 h_lo, h_hi;\n\t"
+                            ".reg .b32 f_lo, f_hi;\n\t"
+                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                            "cvt.f32.f16 f_lo, h_lo;\n\t"
+                            "cvt.f32.f16 f_hi, h_hi;\n\t"
+                            "mov.b64 %0, {f_lo, f_hi};\n\t"
+                            "}\n"
+                            : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 24]))
+                            : "r"(_v8_0_1[4]));
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .b16 h_lo, h_hi;\n\t"
+                            ".reg .b32 f_lo, f_hi;\n\t"
+                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                            "cvt.f32.f16 f_lo, h_lo;\n\t"
+                            "cvt.f32.f16 f_hi, h_hi;\n\t"
+                            "mov.b64 %0, {f_lo, f_hi};\n\t"
+                            "}\n"
+                            : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 26]))
+                            : "r"(_v8_0_1[5]));
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .b16 h_lo, h_hi;\n\t"
+                            ".reg .b32 f_lo, f_hi;\n\t"
+                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                            "cvt.f32.f16 f_lo, h_lo;\n\t"
+                            "cvt.f32.f16 f_hi, h_hi;\n\t"
+                            "mov.b64 %0, {f_lo, f_hi};\n\t"
+                            "}\n"
+                            : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 28]))
+                            : "r"(_v8_0_1[6]));
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .b16 h_lo, h_hi;\n\t"
+                            ".reg .b32 f_lo, f_hi;\n\t"
+                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                            "cvt.f32.f16 f_lo, h_lo;\n\t"
+                            "cvt.f32.f16 f_hi, h_hi;\n\t"
+                            "mov.b64 %0, {f_lo, f_hi};\n\t"
+                            "}\n"
+                            : "=l"(*reinterpret_cast<unsigned long long*>(&values[0 + 30]))
+                            : "r"(_v8_0_1[7]));
+#else
                         (&values[0 + 16])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[0]) << 16);
                         (&values[0 + 16])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[0]) & 0xffff0000u);
                         (&values[0 + 18])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[1]) << 16);
@@ -167,6 +363,7 @@ kernel_cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd(__nv_bfloat16* __restric
                         (&values[0 + 28])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[6]) & 0xffff0000u);
                         (&values[0 + 30])[0] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[7]) << 16);
                         (&values[0 + 30])[1] = __uint_as_float(static_cast<uint32_t>(_v8_0_1[7]) & 0xffff0000u);
+#endif
                     }
                 }
             } else {

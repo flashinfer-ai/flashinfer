@@ -64,11 +64,30 @@ F16 = cake_program.CakeProgram(
     operator_dir="cake_grouped_mxfp8_quantize",
     kernel="kernel_cake_grouped_mxfp8_quantize_f84d4eab2905894ac4c2",
     sources=(
-        "cake_grouped_mxfp8_quantize_f84d4eab2905894ac4c2_kernel.cu",
-        "cake_grouped_mxfp8_quantize_f84d4eab2905894ac4c2_binding.cu",
+        "cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd_kernel.cu",
+        "cake_grouped_mxfp8_quantize_d8aa920df5a6252450bd_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
-    compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
+    compile_options=(
+        (
+            "sm_100a",
+            (
+                "--fmad=true",
+                "-DCAKE_PROGRAM_VARIANT=1",
+                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_f84d4eab2905894ac4c2",
+                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_f84d4eab2905894ac4c2",
+            ),
+        ),
+        (
+            "sm_103a",
+            (
+                "--fmad=true",
+                "-DCAKE_PROGRAM_VARIANT=1",
+                "-DCAKE_PROGRAM_KERNEL=kernel_cake_grouped_mxfp8_quantize_f84d4eab2905894ac4c2",
+                "-DCAKE_PROGRAM_SHIM=cake_binding_kernel_cake_grouped_mxfp8_quantize_f84d4eab2905894ac4c2",
+            ),
+        ),
+    ),
     args=(
         "x",
         "mask",
