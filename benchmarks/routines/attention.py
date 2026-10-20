@@ -1954,11 +1954,11 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             )
             resolved_backends[backend] = backend_wrappers[backend]._backend
         elif backend == "cudnn":
-            # cuDNN uses NHD layout and the wrapper API
+            # K/V cache tensors use [pages, heads, page_size, dim] (HND).
             backend_wrappers[backend] = (
                 flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
                     workspace_buffer,
-                    "NHD",
+                    "HND",
                     backend="cudnn",
                 )
             )
