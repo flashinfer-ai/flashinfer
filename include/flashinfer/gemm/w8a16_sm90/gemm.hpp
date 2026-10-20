@@ -48,6 +48,7 @@
 #include "cutlass/kernel_hardware_info.hpp"
 #include "cutlass/numeric_types.h"
 #include "cutlass/util/packed_stride.hpp"
+#include "flashinfer/gemm/w8a16_common.hpp"
 #include "flashinfer/gemm/w8a16_sm90/convert.hpp"
 #include "flashinfer/gemm/w8a16_sm90/scheduler.hpp"
 #include "flashinfer/gemm/w8a16_sm90/tile_order.hpp"
@@ -78,25 +79,14 @@ namespace flashinfer::gemm {
 
 namespace W8A16Sm90 = constants::W8A16Sm90;
 
-template <typename T>
-struct W8A16Sm90CutlassType;
-template <>
-struct W8A16Sm90CutlassType<__nv_bfloat16> {
-  using type = cutlass::bfloat16_t;
-};
-template <>
-struct W8A16Sm90CutlassType<half> {
-  using type = cutlass::half_t;
-};
-
 // TileW: weight rows per CTA tile (M'): 128 for the cooperative schedule (two consumer
 //         warpgroups, 64 rows each), 64 for ping-pong (one warpgroup per tile).
 // TileA: activation rows per CTA tile (N' = wgmma N), any multiple of 8 up to 256.
 // TileK: 64 fp8 bytes of weight per row per stage; with the 16-bit activation that is
 //         8 KB + TileA * 128 B per stage (40 KB for 256 rows: 5 stages in 227 KB).
 // Cluster: CTAs per cluster along the weight-row dimension.  2 = the two CTAs take
-//         adjacent weight tiles of the same activation tile, which TMA multicasts to both
-//         (the hand kernel's arrangement): halves the activation's L2 -> SMEM traffic.
+//         adjacent weight tiles of the same activation tile, which TMA multicasts to both:
+//         halves the activation's L2 -> SMEM traffic.
 template <int TileW, int TileA, int TileK = W8A16Sm90::TileK,
           int Cluster = W8A16Sm90::DefaultCluster>
 struct W8A16Sm90Cfg {
@@ -120,64 +110,29 @@ struct W8A16Sm90Cfg {
                          cutlass::epilogue::TmaWarpSpecialized>;
 };
 
-using W8A16Sm90Cfg128x256 =
-    W8A16Sm90Cfg<W8A16Sm90::CooperativeW, W8A16Sm90::TileA256>;  // the hand kernel's default shape
-using W8A16Sm90Cfg128x192 =
-    W8A16Sm90Cfg<W8A16Sm90::CooperativeW, W8A16Sm90::TileA192>;  // wave-fill heights (see PickTile)
+// The instantiated tiles.  Cooperative 128-row weight tiles at four activation heights (the
+// dispatcher picks the height whose tile count best fills the SMs), and two ping-pong tiles
+// (two tiles in flight per SM) for short mainloops.  A cluster-2 multicast pair of the
+// 128x256 tile measured within 2% of the cluster-1 tile on every benchmark row, so it is
+// not instantiated.
+using W8A16Sm90Cfg128x256 = W8A16Sm90Cfg<W8A16Sm90::CooperativeW, W8A16Sm90::TileA256>;
+using W8A16Sm90Cfg128x192 = W8A16Sm90Cfg<W8A16Sm90::CooperativeW, W8A16Sm90::TileA192>;
 using W8A16Sm90Cfg128x160 = W8A16Sm90Cfg<W8A16Sm90::CooperativeW, W8A16Sm90::TileA160>;
 using W8A16Sm90Cfg128x128 = W8A16Sm90Cfg<W8A16Sm90::CooperativeW, W8A16Sm90::TileA128>;
-using W8A16Sm90Cfg64x256 =
-    W8A16Sm90Cfg<W8A16Sm90::PingpongW, W8A16Sm90::TileA256>;  // ping-pong: 2 tiles in flight per SM
-using W8A16Sm90Cfg64x128 =
-    W8A16Sm90Cfg<W8A16Sm90::PingpongW, W8A16Sm90::TileA128>;  // ping-pong, short activation tile
-// W8A16Sm90Cfg<128, 256, 64, 2> (activation multicast pair) was swept on Tue 13 Oct 2026:
-// within +-2% of the cluster-1 tile on all 144 rows, so it is not instantiated.
+using W8A16Sm90Cfg64x256 = W8A16Sm90Cfg<W8A16Sm90::PingpongW, W8A16Sm90::TileA256>;
+using W8A16Sm90Cfg64x128 = W8A16Sm90Cfg<W8A16Sm90::PingpongW, W8A16Sm90::TileA128>;
 
-// Version H7 step 3.1: split-K reduce.  out[i] = T(sum_s ws[s][i] * scale + bias[i % N]),
-// 8 elements per thread (two 16 B loads per split, one 16 B store).  Same kernel as the
-// Blackwell path's; N % 8 == 0 is checked by the launcher.
-template <typename T>
-__global__ void W8A16Sm90SplitKReduceKernel(const float* __restrict__ ws, int splits,
-                                            const float* __restrict__ scale,
-                                            const T* __restrict__ bias, T* __restrict__ out,
-                                            int64_t mn, int N) {
-  const int64_t i = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 8;
-  if (i >= mn) return;
-  float acc[8];
-#pragma unroll
-  for (int e = 0; e < 8; ++e) acc[e] = 0.f;
-  for (int sp = 0; sp < splits; ++sp) {
-    const float4* src = reinterpret_cast<const float4*>(ws + static_cast<int64_t>(sp) * mn + i);
-    const float4 a = src[0], b = src[1];
-    acc[0] += a.x;
-    acc[1] += a.y;
-    acc[2] += a.z;
-    acc[3] += a.w;
-    acc[4] += b.x;
-    acc[5] += b.y;
-    acc[6] += b.z;
-    acc[7] += b.w;
-  }
-  const float sc = *scale;
-  const int n = static_cast<int>(i % N);
-  alignas(16) T v[8];
-#pragma unroll
-  for (int e = 0; e < 8; ++e) {
-    const float bb = bias != nullptr ? static_cast<float>(bias[n + e]) : 0.f;
-    v[e] = static_cast<T>(acc[e] * sc + bb);
-  }
-  *reinterpret_cast<uint4*>(out + i) = *reinterpret_cast<const uint4*>(v);
-}
-
-// kSplitK: the GEMM runs as a batch of `splits` GEMMs over K-slices in one launch (batch
-// stride = the slice length along K for both operands, one M x N fp32 partial per batch),
-// so an under-filled grid becomes `splits` times as many tiles; W8A16Sm90SplitKReduceKernel
-// then sums the partials and applies scale and bias once.  No CUTLASS stream-K fixup.
-template <typename T, typename Cfg, bool kStreamK = false, bool kSplitK = false>
+// One kernel variant: a tile configuration under one decomposition (W8A16Decomposition).
+// Split-K runs the GEMM as a batch of `splits` K-slices in one launch (batch stride = the
+// slice length along K for both operands, one M x N fp32 partial per batch), so an
+// under-filled grid becomes `splits` times as many tiles; W8A16SplitKReduceKernel then sums
+// the partials and applies scale and bias once.  No CUTLASS stream-K fixup is involved.
+template <typename T, typename Cfg, W8A16Decomposition Decomp = W8A16Decomposition::kPlain>
 struct W8A16Sm90Gemm {
-  static_assert(!(kStreamK && kSplitK), "split-K and stream-K are different variants");
+  static constexpr bool kSplitK = Decomp == W8A16Decomposition::kSplitK;
+  static constexpr bool kStreamK = Decomp == W8A16Decomposition::kStreamK;
   using ElementW = cutlass::float_e4m3_t;
-  using ElementAct = typename W8A16Sm90CutlassType<T>::type;
+  using ElementAct = typename W8A16CutlassType<T>::type;
   using ElementD = std::conditional_t<kSplitK, float, ElementAct>;
   using ElementBias = ElementAct;
   using ElementAccumulator = float;
@@ -229,7 +184,7 @@ struct W8A16Sm90Gemm {
   using StrideB = typename GemmKernel::StrideB;
   using StrideD = typename GemmKernel::StrideD;
 
-  // `splits` > 1 only with kSplitK: problem {N, M, K / splits, splits}; A and B batch stride
+  // `splits` > 1 only with split-K: problem {N, M, K / splits, splits}; A and B batch stride
   // = K / splits elements (the next K-slice, row strides stay K so TMA walks the slices in
   // place), D batch stride = M * N (the next fp32 partial).
   static typename Gemm::Arguments MakeArguments(const T* act, const __nv_fp8_e4m3* weight,
@@ -277,8 +232,8 @@ struct W8A16Sm90Gemm {
     args.scheduler.raster_order = kW8A16Sm90Raster;
     if constexpr (kStreamK) {
       // CUTLASS's heuristic decomposition (data-parallel full waves, stream-K tail) with
-      // the deterministic (K-ordered) peer reduction.  The other modes were measured in
-      // version H2 and never won (ladder doc).
+      // the deterministic (K-ordered) peer reduction; the other modes never measured
+      // faster.
       args.scheduler.decomposition_mode =
           cutlass::gemm::kernel::detail::DecompositionMode::Heuristic;
       args.scheduler.reduction_mode = cutlass::gemm::kernel::detail::ReductionMode::Deterministic;
@@ -295,7 +250,7 @@ struct W8A16Sm90Gemm {
   static size_t WorkspaceBytes(int M, int N, int K, int device_id, int num_sms, int splits = 1) {
     auto args = MakeArguments(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, device_id,
                               num_sms, splits);
-    return (Gemm::get_workspace_size(args) + 255) / 256 * 256 + PartialsBytes(M, N, splits);
+    return W8A16Align256(Gemm::get_workspace_size(args)) + PartialsBytes(M, N, splits);
   }
 
   static cudaError_t Run(const T* act, const __nv_fp8_e4m3* weight, const float* scale,
@@ -307,7 +262,7 @@ struct W8A16Sm90Gemm {
     if constexpr (kSplitK) {
       auto probe = MakeArguments(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, device_id,
                                  num_sms, splits);
-      const size_t cutlass_ws = (Gemm::get_workspace_size(probe) + 255) / 256 * 256;
+      const size_t cutlass_ws = W8A16Align256(Gemm::get_workspace_size(probe));
       if (cutlass_ws + PartialsBytes(M, N, splits) > workspace_bytes) return cudaErrorInvalidValue;
       d_out = static_cast<char*>(workspace) + cutlass_ws;
     }
@@ -320,12 +275,8 @@ struct W8A16Sm90Gemm {
     }
     if (gemm.run(stream) != cutlass::Status::kSuccess) return cudaErrorLaunchFailure;
     if constexpr (kSplitK) {
-      const int64_t mn = static_cast<int64_t>(M) * N;
-      const int threads = 256;
-      const int64_t blocks = (mn / 8 + threads - 1) / threads;
-      W8A16Sm90SplitKReduceKernel<T><<<static_cast<unsigned>(blocks), threads, 0, stream>>>(
-          static_cast<const float*>(d_out), splits, scale, bias, out, mn, N);
-      return cudaGetLastError();
+      return W8A16SplitKReduce<T>(static_cast<const float*>(d_out), splits, scale, bias, out, M, N,
+                                  stream);
     }
     return cudaSuccess;
   }

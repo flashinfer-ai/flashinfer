@@ -303,8 +303,8 @@ public:
   static_assert((size<2>(TileShape{}) % size<1>(SmemLayoutAtomScale{})) == 0, "SmemLayoutAtomScale must evenly divide tile k shape.");
 
   // Thread Counts
-  // Version B3/B5: transform warpgroups (two, then four).  All map onto the same 128 TMEM lanes (rows);
-  // warpgroup g converts k-blocks [g * K_BLOCK_MAX / 2, (g + 1) * K_BLOCK_MAX / 2).
+  // FlashInfer: two transform warpgroups (upstream has one).  Both map onto the same 128 TMEM
+  // lanes (rows); warpgroup g converts k-blocks [g * K_BLOCK_MAX / 2, (g + 1) * K_BLOCK_MAX / 2).
   static constexpr uint32_t NumTransformationGroups = 2;
   static constexpr uint32_t NumTransformationThreadsPerGroup = 128;
   static constexpr uint32_t NumTransformationThreads = NumTransformationGroups * NumTransformationThreadsPerGroup;
@@ -448,7 +448,8 @@ public:
     ElementZero const* ptr_Z{nullptr};
     // L2 eviction priority of the A (weight) and B (activation) TMA loads
     // (cute::TMA::CacheHintSm100 values).  FlashInfer addition: the weight is re-read once
-    // per activation tile, the activation once per weight tile; see W8A16Sm100L2HintEnv.
+    // per activation tile, the activation once per weight tile; the launcher passes the
+    // constants of tile_order.hpp (kW8A16Sm100WeightCacheHint / kW8A16Sm100ActCacheHint).
     uint64_t cache_hint_a{static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL)};
     uint64_t cache_hint_b{static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL)};
   };
@@ -1080,9 +1081,7 @@ public:
           // Dequantize this warpgroup's k-blocks in RF and store them into Smem or Tmem
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < kPerGroup; ++i) {
-#ifndef W8A16_PROBE_NO_CONVERT
             Utils::dequantize_A_kblock_for_transform(tArA, tArACompute, partitioned_extra_info, kFirst + i);
-#endif
             copy(dst_copy_A, tArACompute(_,_,_,kFirst + i), tAsACompute(_,_,_,kFirst + i,transform2mma_producer_index));
           }
         }
@@ -1105,9 +1104,7 @@ public:
             auto dst4 = make_tensor(dst_chunk.data(), make_layout(append(dst_chunk.shape(), _1{}), append(dst_chunk.stride(), _0{})));
             CUTLASS_PRAGMA_UNROLL
             for (int k_block = 0; k_block < K_BLOCK_MAX; ++k_block) {
-#ifndef W8A16_PROBE_NO_CONVERT
               Utils::dequantize_A_kblock_for_transform(src4, dst4, partitioned_extra_info, k_block);
-#endif
             }
             copy(dst_copy_A, tArACompute(_,kFirst + i,_,_), tAsACompute(_,kFirst + i,_,_,transform2mma_producer_index));
           }
@@ -1220,7 +1217,7 @@ public:
     // Partition of thread -> shared and thread -> RF for the scale / zero tensors.
     // Only meaningful (and only compilable, it builds a TMEM copy) when scales exist;
     // the no-scale path hands partition_extra_transform_info a copy it ignores, which
-    // is what lets the smem-A (SS) MMA atoms through (version B4).
+    // is what lets the smem-A (SS) MMA atoms through.
     auto partitioned_extra_info = [&] () {
       if constexpr (ModeHasScales) {
         auto fragment_compute = TiledMma::make_fragment_A(sS);

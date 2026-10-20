@@ -31,8 +31,8 @@ def _gen_sources(uri: str, act_dtype: torch.dtype, cu_files: list[str]) -> list:
     """Render the per-dtype config header next to copies of the launcher sources.
 
     One module per activation dtype: the launcher is a template over the activation
-    type, so fixing it here instantiates half the kernel variants per module and
-    halves the compile time of a first call (the other dtype compiles only if used).
+    type, so fixing it here instantiates only that dtype's kernel variants (the
+    other dtype compiles only if it is ever used).
     """
     if act_dtype not in _ACT_DTYPE_CODE:
         raise ValueError(

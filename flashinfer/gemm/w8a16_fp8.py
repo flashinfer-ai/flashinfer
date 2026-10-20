@@ -173,7 +173,7 @@ def _check_dims(m: int, n: int, k: int) -> None:
 
 
 # Blackwell kernel variants selectable through ``algo``.  The codes are the
-# W8A16Sm100Tile enum values in include/flashinfer/gemm/w8a16_sm100/dispatch.hpp.
+# W8A16Sm100Algo enum values in include/flashinfer/gemm/w8a16_sm100/dispatch.hpp.
 W8A16_FP8_GEMM_ALGOS_SM100: dict[str, int] = {
     "auto": 0,
     "2sm256x128": 1,
@@ -272,18 +272,25 @@ def w8a16_fp8_gemm(
         One ``float32`` value (shape ``()`` or ``(1,)``) on ``act``'s device:
         the per-tensor dequantization scale.
     bias: Optional[torch.Tensor]
-        Optional bias, shape ``(N,)``, same dtype as ``act``.
+        Optional bias, shape ``(N,)``, same dtype as ``act``, on ``act``'s
+        device, contiguous.
     out: Optional[torch.Tensor]
         Optional output, shape ``(..., N)`` (``act``'s leading dimensions),
-        same dtype as ``act``, contiguous.  Allocated when omitted.
+        same dtype as ``act``, on ``act``'s device, contiguous.  Allocated when
+        omitted.
     workspace: Optional[torch.Tensor]
-        Optional scratch for the split-K / stream-K decompositions, on
-        ``act``'s device, contiguous, 16-byte aligned, any dtype; at least
-        :func:`w8a16_fp8_gemm_workspace_bytes` bytes for this call's shape and
-        ``algo``.  Allocated per call when omitted (through the caching
-        allocator, so the cost is a few microseconds of host time).  A caller
-        that wants a fixed memory budget sizes one buffer once and passes it to
-        every call.
+        Optional scratch for the split-K / stream-K decompositions: a
+        contiguous, 16-byte aligned buffer of any dtype on ``act``'s device,
+        at least :func:`w8a16_fp8_gemm_workspace_bytes` bytes for this call's
+        shape and ``algo`` (its byte size counts, not its dtype).  Allocated
+        per call when omitted (through the caching allocator, so the cost is a
+        few microseconds of host time).  A caller that wants a fixed memory
+        budget sizes one buffer once and passes it to every call, under these
+        rules: the call overwrites the buffer (nothing in it survives), it
+        must not overlap ``act`` / ``weight`` / ``bias`` / ``out``, and two
+        calls may share one buffer only if they are ordered on one stream or
+        synchronised, since a call still running on another stream would be
+        reading partials the next call overwrites.
     algo: Optional[str]
         Pins one kernel variant instead of the launcher's choice: a key of
         ``W8A16_FP8_GEMM_ALGOS_SM100`` on Blackwell or of
@@ -305,13 +312,16 @@ def w8a16_fp8_gemm(
     start at a 16-byte aligned address (a view into a larger buffer at an odd
     storage offset does not; contiguity alone is not enough); anything else is
     rejected with a ValueError before launch, and the C++ launcher checks the
-    same rules again.  Nothing is copied on the caller's behalf: a
-    non-contiguous ``act`` or ``out`` is rejected (call ``.contiguous()``
-    yourself if a copy is acceptable).  On Hopper the launcher picks a CUTLASS tile and
-    decomposition (plain, stream-K or split-K) from a cost model; split-K runs
-    go through an fp32 workspace (``workspace``, or one this function
-    allocates).  On Blackwell it picks one of the 2SM tiles from the same kind
-    of model.
+    same rules again.  The checks do not depend on the shape: a call with an
+    empty ``act`` (``M == 0``) validates every argument exactly like a
+    non-empty one and then returns the empty output without launching.
+    Nothing is copied on the caller's behalf: a non-contiguous ``act`` or
+    ``out`` is rejected (call ``.contiguous()`` yourself if a copy is
+    acceptable).  On Hopper the launcher picks a CUTLASS tile and
+    decomposition (plain, stream-K or split-K) from a cost model; split-K and
+    stream-K runs go through scratch memory (``workspace``, or a buffer this
+    function allocates).  On Blackwell it picks one of the 2SM tiles from the
+    same kind of model.
 
     Returns
     -------
@@ -338,7 +348,28 @@ def w8a16_fp8_gemm(
         raise ValueError(f"weight_scale must be float32, got {weight_scale.dtype}")
     weight_scale = weight_scale.reshape(1)  # () or (1,): a view either way
     device = _resolve_device(act.device)
+    if weight.device != act.device or weight_scale.device != act.device:
+        raise ValueError(
+            f"weight and weight_scale must be on act's device {act.device}, got "
+            f"{weight.device} and {weight_scale.device}"
+        )
     algo_code = _algo_code(algo, device)
+    # No implicit copies: a non-contiguous act (row slice, transposed last dim,
+    # permuted leading dims) is the caller's to .contiguous() if they want that.
+    if not act.is_contiguous():
+        raise ValueError(
+            "act must be contiguous (this function does not copy; pass "
+            "act.contiguous() if a copy is acceptable)"
+        )
+    if bias is not None:
+        if bias.dtype != act.dtype or tuple(bias.shape) != (n,):
+            raise ValueError(
+                f"bias must be ({n},) in {act.dtype}, got {tuple(bias.shape)} in {bias.dtype}"
+            )
+        if bias.device != act.device:
+            raise ValueError(f"bias must be on act's device, got {bias.device}")
+        if not bias.is_contiguous():
+            raise ValueError("bias must be contiguous")
 
     out_shape = tuple(lead_shape) + (n,)
     if out is None:
@@ -347,20 +378,20 @@ def w8a16_fp8_gemm(
         raise ValueError(
             f"out must be {out_shape} in {act.dtype}, got {tuple(out.shape)} in {out.dtype}"
         )
+    elif out.device != act.device:
+        raise ValueError(f"out must be on act's device, got {out.device}")
     elif not out.is_contiguous():
         # reshape() would hand the kernel a contiguous copy and the caller's
         # buffer would never see the result.
         raise ValueError("out must be contiguous")
+    if workspace is not None:
+        if workspace.device != act.device or not workspace.is_contiguous():
+            raise ValueError("workspace must be a contiguous tensor on act's device")
+        _check_aligned(workspace, "workspace")
     if m == 0:
         # Nothing to compute; the tile schedulers would divide by zero tiles.
+        # (The alignment checks below need data; an empty tensor has none.)
         return out
-    # No implicit copies: a non-contiguous act (row slice, transposed last dim,
-    # permuted leading dims) is the caller's to .contiguous() if they want that.
-    if not act.is_contiguous():
-        raise ValueError(
-            "act must be contiguous (this function does not copy; pass "
-            "act.contiguous() if a copy is acceptable)"
-        )
     act2d = act.view(-1, k)
     out2d = out.view(-1, n)
     _check_aligned(act2d, "act")
@@ -368,29 +399,21 @@ def w8a16_fp8_gemm(
     _check_aligned(out2d, "out")
     if bias is not None:
         _check_aligned(bias, "bias")
-    # Under-filled grids run split-K through an fp32 workspace; the kernel
-    # decides, this only sizes the buffer (0 bytes = single pass).
+    # Split-K / stream-K variants need scratch; the launcher decides the variant,
+    # this only sizes the buffer (0 bytes = single pass).  The launchers take any
+    # buffer by its byte size.
     ws_bytes = _workspace_bytes(m, n, k, device.index, algo_code, act.dtype)
     if ws_bytes == 0:
         ws = None
     elif workspace is None:
-        ws = torch.empty(ws_bytes // 4, dtype=torch.float32, device=act.device)
+        ws = torch.empty(ws_bytes, dtype=torch.uint8, device=act.device)
     else:
         have = workspace.numel() * workspace.element_size()
-        if workspace.device != act.device or not workspace.is_contiguous():
-            raise ValueError("workspace must be a contiguous tensor on act's device")
-        _check_aligned(workspace, "workspace")
         if have < ws_bytes:
             raise ValueError(
                 f"workspace too small: {have} bytes, this call needs {ws_bytes} "
                 "(see w8a16_fp8_gemm_workspace_bytes)"
             )
-        # The launchers take fp32; any dtype is accepted here and reinterpreted
-        # (a whole number of 4-byte words, then exactly the bytes this call needs).
-        ws = workspace.view(-1)
-        if ws.dtype != torch.float32:
-            words = have // 4
-            ws = ws[: words * 4 // ws.element_size()].view(torch.float32)
-        ws = ws[: ws_bytes // 4]
+        ws = workspace
     _w8a16_fp8_gemm_impl(out2d, act2d, weight, weight_scale, bias, ws, algo_code)
     return out

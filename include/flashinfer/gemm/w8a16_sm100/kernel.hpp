@@ -230,7 +230,7 @@ public:
     MainloopLoad  = 2,
     EpilogueLoad  = 3,
     Epilogue      = 4,
-    // Transformation starts at 256 thread alignment; two warpgroups (version B3)
+    // Transformation starts at 256 thread alignment; two warpgroups (FlashInfer: upstream has one)
     Transformation = 8,
     MainloopLoadB  = 16,
   };

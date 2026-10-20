@@ -209,6 +209,44 @@ def test_w8a16_fp8_gemm_rejects_bad_inputs():
         w8a16_fp8_gemm(act, w_fp8, scale.half().float()),
         w8a16_fp8_gemm(act, w_fp8, scale.half().float().reshape(())),
     )
+    # bias: shape, dtype, device and contiguity are all checked before launch.
+    with pytest.raises(ValueError, match="bias must be"):
+        w8a16_fp8_gemm(
+            act, w_fp8, scale, bias=torch.zeros(31, device=dev, dtype=act.dtype)
+        )
+    with pytest.raises(ValueError, match="bias must be"):
+        w8a16_fp8_gemm(act, w_fp8, scale, bias=torch.zeros(32, device=dev))
+    with pytest.raises(ValueError, match="device"):
+        w8a16_fp8_gemm(act, w_fp8, scale, bias=torch.zeros(32, dtype=act.dtype))
+    with pytest.raises(ValueError, match="contiguous"):
+        w8a16_fp8_gemm(
+            act, w_fp8, scale, bias=torch.zeros(64, device=dev, dtype=act.dtype)[::2]
+        )
+
+
+def test_w8a16_fp8_gemm_forced_splitk_unsplittable_k():
+    """A split-K variant forced on a K it cannot slice is rejected with the rule, by
+    the workspace query as well as by the call (both resolve the same plan), instead
+    of the query reporting a size and the launch failing."""
+    dev = torch.device("cuda")
+    major = get_compute_capability(dev)[0]
+    algo = {9: "128x128_splitk", 10: "2sm256x128_splitk"}[major]
+    m, n, k = (
+        256,
+        1024,
+        960,
+    )  # K % 16 == 0, but neither 64 x (2 x 8) nor 128 x 2 divides it
+    act = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
+    w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
+    with pytest.raises(Exception, match="cannot slice K=960"):
+        w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo)
+    with pytest.raises(Exception, match="cannot slice K=960"):
+        w8a16_fp8_gemm(act, w_fp8, scale, algo=algo)
+    # The launcher's own choice never asks for an impossible split.
+    assert w8a16_fp8_gemm_workspace_bytes(m, n, k, dev) >= 0
+    out = w8a16_fp8_gemm(act, w_fp8, scale)
+    ref = act.float() @ (w_fp8.float() * scale).T
+    torch.testing.assert_close(out.float(), ref, atol=5e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("n,k", [(1024, 5128), (1028, 5120)])
@@ -283,6 +321,21 @@ def test_w8a16_fp8_gemm_empty_m():
         is given
     )
     assert w8a16_fp8_gemm_workspace_bytes(0, 64, 256, dev) == 0
+    # The empty call validates like a non-empty one: a CPU out, a CPU or
+    # mis-shaped bias and a CPU weight are rejected, not returned untouched.
+    empty = torch.empty(0, 256, device=dev, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="device"):
+        w8a16_fp8_gemm(
+            empty, w_fp8, scale, out=torch.empty(0, 64, dtype=torch.bfloat16)
+        )
+    with pytest.raises(ValueError, match="device"):
+        w8a16_fp8_gemm(empty, w_fp8, scale, bias=torch.zeros(64, dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="bias must be"):
+        w8a16_fp8_gemm(
+            empty, w_fp8, scale, bias=torch.zeros(65, device=dev, dtype=torch.bfloat16)
+        )
+    with pytest.raises(ValueError, match="device"):
+        w8a16_fp8_gemm(empty, w_fp8.cpu(), scale)
     act = torch.empty(4, 0, device=dev, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="K > 0"):
         w8a16_fp8_gemm(
@@ -342,7 +395,7 @@ def test_w8a16_fp8_gemm_device_resolution():
 
 
 def test_w8a16_fp8_gemm_rejects_retired_hand_algo():
-    """The hand-written Hopper kernel was retired in version H7; its name is gone."""
+    """The retired hand-written Hopper kernel is not selectable; its name is gone."""
     dev = torch.device("cuda")
     act = torch.randn(16, 256, device=dev, dtype=torch.bfloat16)
     w_fp8, scale = _quantize(torch.randn(128, 256, device=dev))

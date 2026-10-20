@@ -36,8 +36,11 @@ Columns reported per (layer, TP, M) row:
 
 Correctness gate: the kernel's max abs error against the fp32 reference must
 not exceed ``--tol-mult`` times the cast-copy path's own error against that
-reference (both only differ from fp32 by bf16/fp16 accumulation order), with a
-small absolute floor.  A failing shape is marked FAIL and the exit status is 1.
+reference, with a small absolute floor.  Both differ from fp32 by the 16-bit
+accumulation order; the cast-copy path additionally rounds ``weight * scale``
+to the activation dtype before the GEMM, where the kernel applies the fp32
+scale to the fp32 accumulator.  A failing shape is marked FAIL and the exit
+status is 1.
 
 Shapes
 ------

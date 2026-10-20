@@ -19,11 +19,10 @@
 // Tile walk order of the Hopper persistent schedulers: which operand's tiles consecutive
 // CTAs take, and how many tiles are grouped so that the operand slab they share stays in L2.
 // Pure functions of the problem shape; the measurements behind each rule are in
-// benchmarks/w8a16_fp8_gemm_ladder.md (versions H1, H3, H4).  Until version H10 these were
-// overridable through environment variables for benchmarking; the tuned values are now the
-// only values.
+// benchmarks/w8a16_fp8_gemm_ladder.md.
 
 #include "cutlass/gemm/kernel/tile_scheduler.hpp"
+#include "flashinfer/gemm/w8a16_common.hpp"
 
 namespace flashinfer::gemm {
 
@@ -31,42 +30,30 @@ namespace flashinfer::gemm {
 // tile stays in L2, the weight streams).  CUTLASS's heuristic picks "n" (walk the activation
 // tiles of one weight tile) whenever there are at least as many weight tiles as activation
 // tiles (N >= M/2), and for this operand layout that is 2x slower once the activation
-// outgrows L2: mlp.gate_up tp1 M=44160 31.1 vs 14.9 ms, mlp.down tp1 33.2 vs 14.5, gen.qkv
-// tp1 12.9 vs 5.8 (ncu, locked clocks, Tue 13 Oct 2026); "m" is never worse than the
-// heuristic on the 144-row table.
+// outgrows L2; "m" is never worse than the heuristic on the benchmark grid.
 inline constexpr cutlass::gemm::kernel::detail::RasterOrderOptions kW8A16Sm90Raster =
     cutlass::gemm::kernel::detail::RasterOrderOptions::AlongM;
 
 // L2 tile-group size handed to CUTLASS's own schedulers (the stream-K variants and any
 // cluster-2 tile): 1, i.e. none.  CUTLASS's persistent and stream-K schedulers round BOTH
 // tile counts up to a multiple of (swizzle x cluster) and run the padding tiles (TMA
-// zero-fills them, the epilogue drops them; see round_up in tile_scheduler_params.h).  With
-// swizzle 8 that is 10 -> 16 weight tiles on N=1280 (ncu, Tue 13 Oct 2026: 1.6x the HGMMA
-// count, 247 vs 162 us) and 4 -> 8 activation tiles on M=1024.  Version H1 had made 8 the
-// default because it recovered 12% on gen.qkv tp1 M=8192; that was the heuristic's "n"
-// raster being papered over by the grouping.  With raster "m" the group buys nothing (1.046
-// vs 1.054 ms on that shape, equal on five others), so it is off; the plain persistent
-// variants get their L2 grouping from W8A16Sm90GroupedTileScheduler instead, which does not
-// pad (W8A16Sm90PickGroup below).
+// zero-fills them, the epilogue drops them; see round_up in tile_scheduler_params.h): with
+// swizzle 8 that is 10 -> 16 weight tiles on N=1280, 1.6x the MMA work.  With raster "m" the
+// group buys nothing on top, so it is off; the plain persistent variants get their L2
+// grouping from W8A16Sm90GroupedTileScheduler instead, which does not pad
+// (W8A16Sm90PickGroup below).
 inline constexpr int kW8A16Sm90CutlassSwizzle = 1;
 
-// L2 group of the grouped scheduler (version H4, ncu locked-clock sweep of the 48 rows at
-// M = 44160 / 88320, Wed 14 Oct 2026): ungrouped, the 132 CTAs in flight cover ~one
-// activation tile and every activation tile re-reads the whole weight; that only matters once
-// the weight is a large share of the 50 MB L2.  N*K >= 40 MB: 4 activation tiles per group
-// when there are >= 64 weight tiles (und.q / gen.qkv / mlp.gate_up tp1, mlp.gate_up tp2:
-// DRAM reads 2.0-2.7x lower, 1-3% faster), else 2 (mlp.down tp1 / tp2, attn.out tp1).
-// Smaller weights stay ungrouped: there the group only adds activation re-reads (und.q tp4
-// 0.67 -> 0.87 GB at group 4).  M below 16384 stays ungrouped too: at M = 4096 / 8192 the
-// group cuts DRAM reads 20-30% but the time does not move (+-1%), so those rows keep H3's
-// exact schedule.
-// Tile count along one dimension.  The launcher admits dimensions up to INT32_MAX, so
-// `(dim + tile - 1)` is formed in 64 bits: as int it overflows for dim > INT32_MAX - tile.
-inline long long W8A16Sm90Tiles(long long dim, long long tile) { return (dim + tile - 1) / tile; }
-
+// L2 group of the grouped scheduler.  Ungrouped, the 132 CTAs in flight cover about one
+// activation tile and every activation tile re-reads the whole weight; that only matters
+// once the weight is a large share of the 50 MB L2 and there are many activation tiles.
+// Weight >= 40 MB and M >= 16384: 4 activation tiles per group when there are >= 64 weight
+// tiles, else 2 (DRAM reads 2.0-2.7x lower, 1-3% faster).  Smaller weights stay ungrouped
+// (the group only adds activation re-reads), and so does M < 16384 (the group cuts DRAM
+// reads 20-30% there but the time does not move).
 inline int W8A16Sm90PickGroup(int M, int N, int K, int tile_w) {
   const long long weight_bytes = 1LL * N * K;
-  const long long tiles_w = W8A16Sm90Tiles(N, tile_w);
+  const long long tiles_w = W8A16Tiles(N, tile_w);
   if (weight_bytes < 40LL * 1000 * 1000 || M < 16384) return 1;
   return tiles_w >= 64 ? 4 : 2;
 }

@@ -16,14 +16,14 @@
 #ifndef FLASHINFER_GEMM_W8A16_SM90_SCHEDULER_HPP_
 #define FLASHINFER_GEMM_W8A16_SM90_SCHEDULER_HPP_
 
-// Version H4: a persistent tile scheduler that groups tiles for L2 without padding the tile
-// grid.  CUTLASS's sm90 persistent scheduler implements its L2 swizzle by rounding both tile
+// A persistent tile scheduler that groups tiles for L2 without padding the tile grid.
+// CUTLASS's sm90 persistent scheduler implements its L2 swizzle by rounding both tile
 // counts up to a multiple of the swizzle size and running the padding tiles (see
-// tile_order.hpp), so H3 had to run the large-M rows ungrouped: the 132 CTAs in flight
-// walk ~132 weight tiles of ONE activation tile, and every activation tile re-streams the
-// weight from HBM once the weight is larger than what fits next to it in the 50 MB L2.  This
-// scheduler walks the same linear work index as CUTLASS's (swizzle 1, so its grid and
-// work count are exact), but maps it the way the hand kernel does: groups of G tiles of the
+// tile_order.hpp), which would force the large-M rows to run ungrouped: the 132 CTAs in
+// flight walk ~132 weight tiles of ONE activation tile, and every activation tile re-streams
+// the weight from HBM once the weight is larger than what fits next to it in the 50 MB L2.
+// This scheduler walks the same linear work index as CUTLASS's (swizzle 1, so its grid and
+// work count are exact), but maps it differently: groups of G tiles of the
 // slow dimension (activation tiles for raster "m"), the fast dimension walked within a group,
 // and a last, narrower group for the remainder instead of padding.  G = 1 is exactly
 // CUTLASS's order.  Cluster size 1 only; the stream-K variants keep CUTLASS's scheduler.
@@ -52,9 +52,8 @@ struct W8A16Sm90GroupedParams : cutlass::gemm::kernel::detail::PersistentTileSch
 };
 
 // Index map: FastDivmod (multiply-high + shift, precomputed on the host), as CUTLASS's own
-// scheduler does.  A/B against the stock scheduler and a plain-division build (version H4,
-// mlp.gate_up tp1 M=44160, 5 interleaved rounds): 1.053 / 1.070 / 1.067 of cuBLAS free-running,
-// 14.87 / 14.83 / 14.99 ms and 3316 / 3320 / 3313 M instructions under ncu: one kernel.
+// scheduler does.  Measured equal to the stock scheduler and to a plain-division build
+// (same time within noise, same instruction count under ncu).
 class W8A16Sm90GroupedTileScheduler
     : public cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90 {
   using Base = cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90;

@@ -50,8 +50,8 @@ __device__ __forceinline__ uint32_t prmt_b32(uint32_t a, uint32_t b, uint32_t se
 // Four e4m3 bytes (little-endian in `q`) -> two bf16x2 registers, value order kept.
 // Hopper has no packed e4m3 -> bf16 convert (that is sm_100's cvt.rn.bf16x2.e4m3x2);
 // CUTLASS's own converter goes e4m3x2 -> f16x2 -> 2 x f32 -> bf16x2, four dependent
-// cvt per pair.  This is the ALU path of the hand kernel / Blackwell version B1: a
-// sign-replicating prmt puts byte k in the low byte of lane k with its sign copied
+// cvt per pair.  This is a four-instruction ALU path instead: a sign-replicating prmt
+// puts byte k in the low byte of lane k with its sign copied
 // into the high byte, (v << 4) & 0x87F0 leaves the sign at [15] and the 7 magnitude
 // bits at [10:4], so the bf16 exponent field holds e4m3's raw exponent, and one
 // bf16x2 multiply by 2^(127 - 7) fixes the bias.  Exact for every finite e4m3 code,
