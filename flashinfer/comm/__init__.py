@@ -111,6 +111,7 @@ from .allreduce import allreduce_fusion as allreduce_fusion
 from .allreduce import (
     create_allreduce_fusion_workspace as create_allreduce_fusion_workspace,
 )
+from .allreduce import is_mnnvl_cutedsl_supported as is_mnnvl_cutedsl_supported
 
 with contextlib.suppress(ImportError, AttributeError):
     from .tp_moe_finalize_rmsnorm import (

@@ -150,6 +150,74 @@ memory do not support this lifecycle.
 
     .. automethod:: __init__
 
+MNNVL CuTe DSL backend
+~~~~~~~~~~~~~~~~~~~~~~
+
+``create_allreduce_fusion_workspace(backend="mnnvl-cutedsl", ...)`` builds an
+:class:`~flashinfer.comm.mnnvl_cutedsl_ar.MNNVLCuteDSLAllReduceFusionWorkspace`:
+CuTe DSL kernels for the ranks of one NVLink multicast domain, compiled for
+one static problem. ``backend="auto"`` never selects it. The keyword-only
+arguments of the factory (``top_k``, ``rms_eps``, ``weight_bias``,
+``routed_scaling_factor``, ``include_shared_expert``, ``add_residual``,
+``write_residual_output``, ``apply_rms_norm``, ``output_dtype``,
+``dynamic_fp8``, ``write_norm_output`` and ``config``) are compile-time
+settings: every :func:`allreduce_fusion` call on the workspace must use the
+same epsilon, weight bias, residual, norm and output mode, and at most
+``max_token_num`` tokens of ``hidden_dim`` BF16 elements. Other backends
+reject these arguments. ``residual_in`` must be identical on every rank, as
+under tensor parallelism: most kernels add the residual once, on the rank that
+owns a token or a hidden-dimension shard.
+
+The kernels spin on data written by the other ranks and some of them occupy
+every SM. Do not run two of these collectives (for example from two
+workspaces) concurrently on different streams: a rank whose SMs are all held
+by one collective cannot start the other, which the peers may be waiting on.
+
+The workspace picks a static profile for ``(world_size, hidden_dim, top_k,
+dtype)`` and the device's compute capability, then routes each token count to
+a low-latency (LL), balanced (BT) or high-throughput (HT) kernel. Construction
+fails when no profile matches; :func:`is_mnnvl_cutedsl_supported` runs the same
+checks without raising. It describes the local rank only, and construction is
+collective, so agree on the result across ranks first:
+
+.. code-block:: python
+
+    ok = is_mnnvl_cutedsl_supported(
+        4, 8192, torch.bfloat16, max_token_num=2048, apply_rms_norm=False
+    )
+    flag = torch.tensor(int(ok), device="cuda")
+    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+    if flag.item():
+        workspace = create_allreduce_fusion_workspace(
+            backend="mnnvl-cutedsl",
+            world_size=4,
+            rank=rank,
+            max_token_num=2048,
+            hidden_dim=8192,
+            dtype=torch.bfloat16,
+            apply_rms_norm=False,
+            add_residual=False,
+        )
+        out = allreduce_fusion(
+            input=x, workspace=workspace, pattern=AllReduceFusionPattern.kAllReduce
+        )
+
+A workspace built with ``apply_rms_norm=False`` and ``add_residual=False``
+serves ``kAllReduce``; the default norm-on workspace serves
+``kARResidualRMSNorm`` and the MoE finalize pattern, an
+``output_dtype=torch.float8_e4m3fn`` workspace the static FP8 patterns, and one
+with ``dynamic_fp8=True`` as well the dynamic FP8 patterns.
+
+.. autosummary::
+    :toctree: ../generated
+
+    is_mnnvl_cutedsl_supported
+
+.. autoclass:: flashinfer.comm.mnnvl_cutedsl_ar.MNNVLCuteDSLAllReduceFusionWorkspace
+    :show-inheritance:
+
+    .. automethod:: __init__
+
 FP8 Quantized AllReduce
 -----------------------
 
