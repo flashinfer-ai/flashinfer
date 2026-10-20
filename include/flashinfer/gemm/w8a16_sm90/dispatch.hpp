@@ -242,7 +242,7 @@ struct W8A16Sm90Plan {
 //   cudaErrorInvalidValue: `algo_code` is not a variant (1 is the retired reserved code).
 //   cudaErrorNotSupported: a forced split-K variant on a K that cannot be sliced (see
 //                          W8A16Sm90LegalSplits); the launcher's own choice never is.
-inline cudaError_t W8A16Sm90Resolve(int M, int N, int K, int num_sms, int algo_code,
+inline cudaError_t W8A16Sm90Resolve(int M, int N, int K, int num_sms, int64_t algo_code,
                                     W8A16Sm90Plan* plan) {
   if (algo_code == 0) {
     plan->algo = W8A16Sm90PickAlgo(M, N, K, num_sms);
@@ -280,17 +280,17 @@ size_t W8A16Fp8GemmSm90WorkspaceBytes(const W8A16Sm90Plan& plan, int M, int N, i
     case W8A16Sm90Algo::k64x128:
       return W8A16Sm90Gemm<T, W8A16Sm90Cfg64x128>::WorkspaceBytes(M, N, K, device_id, num_sms);
     case W8A16Sm90Algo::k128x256StreamK:
-      return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x256, D::kStreamK>::WorkspaceBytes(M, N, K, device_id,
-                                                                                num_sms);
+      return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x256, D::StreamK>::WorkspaceBytes(M, N, K, device_id,
+                                                                               num_sms);
     case W8A16Sm90Algo::k128x192StreamK:
-      return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x192, D::kStreamK>::WorkspaceBytes(M, N, K, device_id,
-                                                                                num_sms);
+      return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x192, D::StreamK>::WorkspaceBytes(M, N, K, device_id,
+                                                                               num_sms);
     case W8A16Sm90Algo::k128x128SplitK:
-      return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x128, D::kSplitK>::WorkspaceBytes(
-          M, N, K, device_id, num_sms, plan.splits);
+      return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x128, D::SplitK>::WorkspaceBytes(M, N, K, device_id,
+                                                                              num_sms, plan.splits);
     case W8A16Sm90Algo::k128x256SplitK:
-      return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x256, D::kSplitK>::WorkspaceBytes(
-          M, N, K, device_id, num_sms, plan.splits);
+      return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x256, D::SplitK>::WorkspaceBytes(M, N, K, device_id,
+                                                                              num_sms, plan.splits);
     default:
       return 0;
   }
@@ -328,19 +328,19 @@ cudaError_t W8A16Fp8GemmSm90(const W8A16Sm90Plan& plan, const T* act, const __nv
                                                        workspace, workspace_bytes, device_id,
                                                        num_sms, stream);
     case W8A16Sm90Algo::k128x256StreamK:
-      return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x256, D::kStreamK>::Run(
+      return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x256, D::StreamK>::Run(
           act, weight, scale, bias, out, M, N, K, workspace, workspace_bytes, device_id, num_sms,
           stream);
     case W8A16Sm90Algo::k128x192StreamK:
-      return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x192, D::kStreamK>::Run(
+      return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x192, D::StreamK>::Run(
           act, weight, scale, bias, out, M, N, K, workspace, workspace_bytes, device_id, num_sms,
           stream);
     case W8A16Sm90Algo::k128x128SplitK:
-      return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x128, D::kSplitK>::Run(
+      return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x128, D::SplitK>::Run(
           act, weight, scale, bias, out, M, N, K, workspace, workspace_bytes, device_id, num_sms,
           stream, plan.splits);
     case W8A16Sm90Algo::k128x256SplitK:
-      return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x256, D::kSplitK>::Run(
+      return W8A16Sm90Gemm<T, W8A16Sm90Cfg128x256, D::SplitK>::Run(
           act, weight, scale, bias, out, M, N, K, workspace, workspace_bytes, device_id, num_sms,
           stream, plan.splits);
     default:

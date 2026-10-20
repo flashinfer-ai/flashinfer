@@ -162,7 +162,7 @@ struct W8A16Sm100Plan {
 //   cudaErrorInvalidValue: `algo_code` is not a variant.
 //   cudaErrorNotSupported: the split-K variant forced on a K that cannot be sliced (see
 //                          W8A16Sm100SplitsFor); the launcher's own choice never is.
-inline cudaError_t W8A16Sm100Resolve(int M, int N, int K, int num_sms, int algo_code,
+inline cudaError_t W8A16Sm100Resolve(int M, int N, int K, int num_sms, int64_t algo_code,
                                      W8A16Sm100Plan* plan) {
   if (algo_code == 0) {
     plan->algo = W8A16Sm100PickAlgo(M, N, K, num_sms);
@@ -186,10 +186,10 @@ size_t W8A16Fp8GemmSm100WorkspaceBytes(const W8A16Sm100Plan& plan, int M, int N,
   using D = W8A16Decomposition;
   switch (plan.algo) {
     case W8A16Sm100Algo::k2SM256x128SplitK:
-      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128, D::kSplitK>::WorkspaceBytes(
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128, D::SplitK>::WorkspaceBytes(
           M, N, K, device_id, num_sms, plan.splits);
     case W8A16Sm100Algo::k2SM256x128StreamK:
-      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128, D::kStreamK>::WorkspaceBytes(
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128, D::StreamK>::WorkspaceBytes(
           M, N, K, device_id, num_sms);
     case W8A16Sm100Algo::k1SM128x128:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg1SM128x128>::WorkspaceBytes(M, N, K, device_id,
@@ -219,11 +219,11 @@ cudaError_t W8A16Fp8GemmSm100(const W8A16Sm100Plan& plan, const T* act, const __
   using D = W8A16Decomposition;
   switch (plan.algo) {
     case W8A16Sm100Algo::k2SM256x128SplitK:
-      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128, D::kSplitK>::Run(
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128, D::SplitK>::Run(
           act, weight, scale, bias, out, M, N, K, workspace, workspace_bytes, device_id, num_sms,
           stream, plan.splits);
     case W8A16Sm100Algo::k2SM256x128StreamK:
-      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128, D::kStreamK>::Run(
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128, D::StreamK>::Run(
           act, weight, scale, bias, out, M, N, K, workspace, workspace_bytes, device_id, num_sms,
           stream);
     case W8A16Sm100Algo::k1SM128x128:

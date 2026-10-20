@@ -122,13 +122,13 @@ using W8A16Sm100Cfg2SM256x160 = W8A16Sm100Cfg<256, 160, 128, 2, true>;
 // (deterministic order); only the final peer runs the real epilogue (scale, bias, cast), so
 // the output path is the plain one.  The mainloop is untouched: kernel.hpp already consumes
 // the per-unit k-range and calls the scheduler's fixup before the epilogue.
-template <typename T, typename Cfg, W8A16Decomposition Decomp = W8A16Decomposition::kPlain>
+template <typename T, typename Cfg, W8A16Decomposition Decomp = W8A16Decomposition::Plain>
 struct W8A16Sm100Gemm {
-  static constexpr bool kSplitK = Decomp == W8A16Decomposition::kSplitK;
-  static constexpr bool kStreamK = Decomp == W8A16Decomposition::kStreamK;
+  static constexpr bool IsSplitK = Decomp == W8A16Decomposition::SplitK;
+  static constexpr bool IsStreamK = Decomp == W8A16Decomposition::StreamK;
   using ElementW = cutlass::float_e4m3_t;
   using ElementAct = typename W8A16CutlassType<T>::type;
-  using ElementD = std::conditional_t<kSplitK, float, ElementAct>;
+  using ElementD = std::conditional_t<IsSplitK, float, ElementAct>;
   using ElementBias = ElementAct;
   using ElementAccumulator = float;
   using ElementCompute = float;
@@ -146,14 +146,14 @@ struct W8A16Sm100Gemm {
   // D = alpha * acc + bias[row]; alpha is the per-tensor weight scale, bias is per M' (= N).
   // Split-K partials: D = acc (fp32), scale and bias applied in the reduce kernel.
   using FusionOp = std::conditional_t<
-      kSplitK, cutlass::epilogue::fusion::LinearCombination<float, float, void, float>,
+      IsSplitK, cutlass::epilogue::fusion::LinearCombination<float, float, void, float>,
       cutlass::epilogue::fusion::LinCombPerRowBias<ElementD, ElementCompute, ElementBias, ElementD,
                                                    float, kAlignD>>;
 
   // fp32 partials double the epilogue's smem per stage (the auto tile is 128x32 for bf16:
   // 18 KB; fp32 would be 33 KB and overshoot the 227 KB budget by 1 KB next to the 6/4
   // mainloop stages), so the split-K variant uses a 128x16 epilogue tile.
-  using EpilogueTile = std::conditional_t<kSplitK, cute::Shape<cute::_128, cute::_16>,
+  using EpilogueTile = std::conditional_t<IsSplitK, cute::Shape<cute::_128, cute::_16>,
                                           cutlass::epilogue::collective::EpilogueTileAuto>;
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, typename Cfg::TileShape,
@@ -168,7 +168,7 @@ struct W8A16Sm100Gemm {
           sizeof(typename CollectiveEpilogue::SharedStorage))>,
       typename Cfg::MainloopSchedule>::CollectiveOp;
 
-  using TileSchedulerTag = std::conditional_t<kStreamK, cutlass::gemm::StreamKScheduler, void>;
+  using TileSchedulerTag = std::conditional_t<IsStreamK, cutlass::gemm::StreamKScheduler, void>;
   using GemmKernel =
       cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, CollectiveMainloop,
                                            CollectiveEpilogue, TileSchedulerTag>;
@@ -210,7 +210,7 @@ struct W8A16Sm100Gemm {
     auto& fusion = args.epilogue.thread;
     fusion.alpha = 1.0f;
     fusion.beta = 0.0f;
-    if constexpr (!kSplitK) {
+    if constexpr (!IsSplitK) {
       fusion.alpha_ptr = scale;  // per-tensor weight scale, read on device
       fusion.beta_ptr = nullptr;
       fusion.bias_ptr = reinterpret_cast<const ElementBias*>(bias);  // nullptr -> 0
@@ -226,7 +226,7 @@ struct W8A16Sm100Gemm {
     args.scheduler.raster_order = kW8A16Sm100Raster;
     args.mainloop.cache_hint_a = kW8A16Sm100WeightCacheHint;
     args.mainloop.cache_hint_b = kW8A16Sm100ActCacheHint;
-    if constexpr (kStreamK) {
+    if constexpr (IsStreamK) {
       // CUTLASS's heuristic decomposition: data-parallel for the full waves, stream-K for
       // the tiles of the last (up to two) waves; collapses to plain split-K when the
       // leftover tiles divide the clusters evenly, and to data-parallel when there is
@@ -239,7 +239,7 @@ struct W8A16Sm100Gemm {
   }
 
   static size_t PartialsBytes(int M, int N, int splits) {
-    return kSplitK && splits > 1 ? static_cast<size_t>(splits) * M * N * sizeof(float) : 0;
+    return IsSplitK && splits > 1 ? static_cast<size_t>(splits) * M * N * sizeof(float) : 0;
   }
 
   // CUTLASS workspace (persistent scheduler: usually 0; stream-K: the peers' fp32
@@ -255,9 +255,9 @@ struct W8A16Sm100Gemm {
                          const T* bias, T* out, int M, int N, int K, void* workspace,
                          size_t workspace_bytes, int device_id, int num_sms, cudaStream_t stream,
                          int splits = 1) {
-    if (kSplitK && (splits < 2 || K % (splits * Cfg::K) != 0)) return cudaErrorInvalidValue;
+    if (IsSplitK && (splits < 2 || K % (splits * Cfg::K) != 0)) return cudaErrorInvalidValue;
     void* d_out = out;
-    if constexpr (kSplitK) {
+    if constexpr (IsSplitK) {
       auto probe = MakeArguments(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, device_id,
                                  num_sms, splits);
       const size_t cutlass_ws = W8A16Align256(Gemm::get_workspace_size(probe));
@@ -274,7 +274,7 @@ struct W8A16Sm100Gemm {
     if (gemm.run(stream, nullptr, /*launch_with_pdl=*/false) != cutlass::Status::kSuccess) {
       return cudaErrorLaunchFailure;
     }
-    if constexpr (kSplitK) {
+    if constexpr (IsSplitK) {
       return W8A16SplitKReduce<T>(static_cast<const float*>(d_out), splits, scale, bias, out, M, N,
                                   stream);
     }

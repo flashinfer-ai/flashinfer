@@ -314,14 +314,17 @@ def w8a16_fp8_gemm(
     rejected with a ValueError before launch, and the C++ launcher checks the
     same rules again.  The checks do not depend on the shape: a call with an
     empty ``act`` (``M == 0``) validates every argument exactly like a
-    non-empty one and then returns the empty output without launching.
+    non-empty one (the only exception is the address alignment of the empty
+    ``act`` and ``out`` themselves, which have none) and then returns the
+    empty output without launching.
     Nothing is copied on the caller's behalf: a non-contiguous ``act`` or
     ``out`` is rejected (call ``.contiguous()`` yourself if a copy is
     acceptable).  On Hopper the launcher picks a CUTLASS tile and
     decomposition (plain, stream-K or split-K) from a cost model; split-K and
     stream-K runs go through scratch memory (``workspace``, or a buffer this
-    function allocates).  On Blackwell it picks one of the 2SM tiles from the
-    same kind of model.
+    function allocates).  On Blackwell it picks from the same kind of model
+    among the 2SM tiles, their split-K and stream-K decompositions, and the
+    1SM tile for weights of at most 128 rows at large ``M``.
 
     Returns
     -------
@@ -388,17 +391,20 @@ def w8a16_fp8_gemm(
         if workspace.device != act.device or not workspace.is_contiguous():
             raise ValueError("workspace must be a contiguous tensor on act's device")
         _check_aligned(workspace, "workspace")
+    if not weight.is_contiguous():
+        raise ValueError("weight must be contiguous (this function does not copy)")
+    _check_aligned(weight, "weight")
+    if bias is not None:
+        _check_aligned(bias, "bias")
     if m == 0:
         # Nothing to compute; the tile schedulers would divide by zero tiles.
-        # (The alignment checks below need data; an empty tensor has none.)
+        # Everything above applies to the empty call too; only act and out are
+        # empty here, and an empty tensor has no address to align.
         return out
     act2d = act.view(-1, k)
     out2d = out.view(-1, n)
     _check_aligned(act2d, "act")
-    _check_aligned(weight, "weight")
     _check_aligned(out2d, "out")
-    if bias is not None:
-        _check_aligned(bias, "bias")
     # Split-K / stream-K variants need scratch; the launcher decides the variant,
     # this only sizes the buffer (0 bytes = single pass).  The launchers take any
     # buffer by its byte size.

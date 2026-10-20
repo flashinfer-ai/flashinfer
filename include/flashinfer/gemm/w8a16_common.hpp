@@ -32,13 +32,13 @@
 namespace flashinfer::gemm {
 
 // How a kernel variant covers the reduction dimension.
-//   kPlain:   one CTA (or 2SM cluster) per output tile walks the whole K.
-//   kSplitK:  the GEMM runs as a batch of `splits` K-slices in one launch, each writing an
+//   Plain:    one CTA (or 2SM cluster) per output tile walks the whole K.
+//   SplitK:   the GEMM runs as a batch of `splits` K-slices in one launch, each writing an
 //             fp32 partial; W8A16SplitKReduceKernel sums the partials and applies scale and
 //             bias once.
-//   kStreamK: CUTLASS's stream-K scheduler cuts the tiles of the partial last wave(s) along
+//   StreamK:  CUTLASS's stream-K scheduler cuts the tiles of the partial last wave(s) along
 //             K across the resident CTAs and reduces the peers through its workspace.
-enum class W8A16Decomposition { kPlain, kSplitK, kStreamK };
+enum class W8A16Decomposition { Plain, SplitK, StreamK };
 
 // Activation dtype of the public op -> the CUTLASS element type.
 template <typename T>

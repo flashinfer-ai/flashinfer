@@ -23,8 +23,8 @@ using namespace flashinfer;
 
 namespace {
 
-constexpr int kFirstAlgoCode = 1;
-constexpr const char* kSliceRule =
+constexpr int FirstAlgoCode = 1;
+constexpr const char* SliceRule =
     "K must be a multiple of 128 whose k-tile count (K / 128) has a divisor in 2..8";
 
 }  // namespace
@@ -40,9 +40,8 @@ void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorVie
   const W8A16Operands ops =
       W8A16CheckOperands(out, act, weight, scale, bias, workspace, W8A16_ACT_DTYPE_CODE);
   gemm::W8A16Sm100Plan plan;
-  W8A16CheckPlan(
-      gemm::W8A16Sm100Resolve(ops.M, ops.N, ops.K, ops.num_sms, static_cast<int>(algo), &plan),
-      algo, kFirstAlgoCode, gemm::kW8A16Sm100MaxAlgoCode, ops.K, kSliceRule);
+  W8A16CheckPlan(gemm::W8A16Sm100Resolve(ops.M, ops.N, ops.K, ops.num_sms, algo, &plan), algo,
+                 FirstAlgoCode, gemm::kW8A16Sm100MaxAlgoCode, ops.K, SliceRule);
 
   ffi::CUDADeviceGuard device_guard(ops.device_id);
   const cudaStream_t stream = get_stream(act.device());
@@ -64,10 +63,9 @@ int64_t w8a16_fp8_gemm_workspace_bytes(int64_t M, int64_t N, int64_t K, int64_t 
   W8A16CheckDims(M, N, K);
   const int num_sms = W8A16NumSms(static_cast<int>(device_id));
   gemm::W8A16Sm100Plan plan;
-  W8A16CheckPlan(
-      gemm::W8A16Sm100Resolve(static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-                              num_sms, static_cast<int>(algo), &plan),
-      algo, kFirstAlgoCode, gemm::kW8A16Sm100MaxAlgoCode, K, kSliceRule);
+  W8A16CheckPlan(gemm::W8A16Sm100Resolve(static_cast<int>(M), static_cast<int>(N),
+                                         static_cast<int>(K), num_sms, algo, &plan),
+                 algo, FirstAlgoCode, gemm::kW8A16Sm100MaxAlgoCode, K, SliceRule);
   // Both activation dtypes share the mainloop / epilogue layout, so the answer is the same
   // from either dtype's module.
   return static_cast<int64_t>(gemm::W8A16Fp8GemmSm100WorkspaceBytes<W8A16ActType>(

@@ -336,6 +336,18 @@ def test_w8a16_fp8_gemm_empty_m():
         )
     with pytest.raises(ValueError, match="device"):
         w8a16_fp8_gemm(empty, w_fp8.cpu(), scale)
+    # weight contiguity and weight / bias alignment are checked on the empty call too.
+    wide = torch.randn(64, 512, device=dev).to(torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="weight must be contiguous"):
+        w8a16_fp8_gemm(empty, wide[:, ::2], scale)
+    w_off = (
+        torch.randn(64 * 256 + 1, device=dev).to(torch.float8_e4m3fn)[1:].view(64, 256)
+    )
+    with pytest.raises(ValueError, match="aligned"):
+        w8a16_fp8_gemm(empty, w_off, scale)
+    b_off = torch.zeros(65, device=dev, dtype=torch.bfloat16)[1:]
+    with pytest.raises(ValueError, match="aligned"):
+        w8a16_fp8_gemm(empty, w_fp8, scale, bias=b_off)
     act = torch.empty(4, 0, device=dev, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="K > 0"):
         w8a16_fp8_gemm(
