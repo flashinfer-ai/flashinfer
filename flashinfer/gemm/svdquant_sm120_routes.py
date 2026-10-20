@@ -26,7 +26,7 @@ SM120_TACTIC_ABI_VERSION: Final = 3
 SM120_LINEAR_ROUTE_ABI_VERSION: Final = 5
 SM120_PACKED_SMALL_M_ROUTE_ABI_VERSION: Final = 10
 SM120_RANK64_FUSED_ROUTE_ABI_VERSION: Final = 11
-SM120_RANK128_FUSED_ROUTE_ABI_VERSION: Final = 12
+SM120_RANK128_FUSED_ROUTE_ABI_VERSION: Final = 13
 
 # Historical route versions remain the fallback for shapes without the new
 # packed small-M family. Candidate admission below determines the v10 scope.
@@ -123,6 +123,25 @@ SM120_RANK64_PRODUCER_GEOMETRY_LADDER: Final[tuple[tuple[int, int, int], ...]] =
     (512, 32, 256),
 )
 
+# Rank 128 additionally offers K64 geometries that stage B (L2T) in shared
+# memory with cp.async; they mirror FI_SVDQ_RANK128_STAGED_B_GEOMETRIES and are
+# appended after the shared ladder so existing producer indices keep their meaning.
+SM120_RANK128_STAGED_B_GEOMETRY_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
+    (320, 64, 64),
+    (352, 48, 64),
+    (384, 64, 64),
+    (384, 80, 64),
+    (416, 80, 64),
+)
+# One down warp's staged slice: 16 columns x (64 + 8) bf16.
+_STAGED_B_SLICE_BYTES: Final = 16 * (64 + 8) * 2
+
+
+def _stages_b(rank: int, tile_k: int) -> bool:
+    """Mirrors large_m_stages_b() in the producer header."""
+    return rank > 64 and tile_k == 64
+
+
 # How the runtime row offset is formed. Both are built; which one is faster is a
 # property of the geometry -- accumulating wins on some and loses on others --
 # so the tuner picks, on the device it is running
@@ -158,7 +177,8 @@ def sm120_producer_geometry_is_valid(
     if block_threads % 32 or quant_threads <= 0:
         return False
     sf_cols_per_tile = tile_k // _GEOMETRY_SF_VEC
-    if (tile_m * sf_cols_per_tile) % quant_threads:
+    # The staged-B kernel's quantize loop tolerates a remainder.
+    if (tile_m * sf_cols_per_tile) % quant_threads and not _stages_b(rank, tile_k):
         return False
     long_k = k >= 8192
     padded_m = (m + 127) // 128 * 128
@@ -171,6 +191,7 @@ def sm120_producer_geometry_is_valid(
         2 * tile_m * (tile_k + 8) * _GEOMETRY_ELEM_BYTES
         + 2 * tile_k * _GEOMETRY_ELEM_BYTES
         + 2 * ((tile_m * sf_cols_per_tile) if long_k else 1)
+        + (down_warps * _STAGED_B_SLICE_BYTES if _stages_b(rank, tile_k) else 0)
     )
     return shared_bytes <= _GEOMETRY_SHARED_LIMIT
 
@@ -269,6 +290,8 @@ def sm120_producer_variants(
         if rank >= 64
         else SM120_PRODUCER_GEOMETRY_LADDER
     )
+    if rank == 128:
+        geometries = geometries + SM120_RANK128_STAGED_B_GEOMETRY_LADDER
     large = tuple(
         (SM120_FAMILY_LARGE_M, geometry, policy)
         for geometry in geometries
