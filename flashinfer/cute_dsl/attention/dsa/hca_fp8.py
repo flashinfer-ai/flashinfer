@@ -3050,10 +3050,7 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         arch = BaseDSL._get_dsl().get_arch_enum()
         # SM100, SM103 and SM107. Any other arch must fail here, because with no
         # matching arm the accumulator fragment is never written.
-        if cutlass.const_expr(
-            (arch >= Arch.sm_100 and arch <= Arch.sm_100f)
-            or (arch >= _ARCH_SM107 and arch <= _ARCH_SM107F)
-        ):
+        if cutlass.const_expr(arch >= Arch.sm_100 and arch <= Arch.sm_100f):
             cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                 if apply_mask:
@@ -3061,7 +3058,10 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
                     is_valid = cute.elem_less(sparse_k_idx, tile_valid_len)
                     tTR_rAcc[i] = tTR_rAcc[i] if is_valid else -self.acc_dtype.inf
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
-        elif cutlass.const_expr(arch >= Arch.sm_103 and arch <= Arch.sm_103f):
+        elif cutlass.const_expr(
+            (arch >= Arch.sm_103 and arch <= Arch.sm_103f)
+            or (arch >= _ARCH_SM107 and arch <= _ARCH_SM107F)
+        ):
             tmem_load_red_atom = cute.make_copy_atom(
                 tcgen05.copy.LdRed32x32bOp(
                     tcgen05.copy.Repetition(64), redOp=tcgen05.TmemLoadRedOp.MAX
