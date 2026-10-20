@@ -10,6 +10,7 @@ import functools
 import weakref
 from abc import abstractmethod
 from collections import OrderedDict
+from collections.abc import Callable
 from typing import Final, List, Optional
 
 import torch
@@ -53,6 +54,7 @@ _SM120_FUSED_LINEAR_MK = _sm120_routes.SM120_FUSED_LINEAR_MK
 _sm120_producer_variants = _sm120_routes.sm120_producer_variants
 _sm120_decode_producer_variant = _sm120_routes.sm120_decode_producer_variant
 _sm120_variant_packs_l2t = _sm120_routes.sm120_variant_packs_l2t
+_sm120_variant_reads_kmajor_l2t = _sm120_routes.sm120_variant_reads_kmajor_l2t
 _sm120_pack_tactic = _sm120_routes.sm120_pack_tactic
 _sm120_unpack_tactic = _sm120_routes.sm120_unpack_tactic
 _SM120_LINEAR_ROUTE_ABI_VERSION = _sm120_routes.SM120_LINEAR_ROUTE_ABI_VERSION
@@ -152,46 +154,79 @@ def _pack_sm120_m537_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _cached_sm120_m537_l2t(
+def _cached_l2t_pack(
     l2t_smoothed: torch.Tensor,
+    pack: Callable[[torch.Tensor], torch.Tensor],
+    cache: OrderedDict[int, tuple[weakref.ReferenceType, int, torch.Tensor]],
 ) -> torch.Tensor:
-    """Cache a shared L2T pack and invalidate it on mutation."""
+    """Cache one L2T layout transform per source tensor; invalidate on mutation."""
     # Capture the pack so graph replay observes weight updates without Python
     # cache lookups. Keep graph-owned buffers out of the eager cache as well.
     # Inference tensors have no version counter and must also be repacked.
     if l2t_smoothed.is_inference() or (
         l2t_smoothed.is_cuda and torch.cuda.is_current_stream_capturing()
     ):
-        return _pack_sm120_m537_l2t(l2t_smoothed)
+        return pack(l2t_smoothed)
 
     source_id = id(l2t_smoothed)
     source_version = int(l2t_smoothed._version)
-    cached = _SM120_M537_PACKED_L2T_CACHE.get(source_id)
+    cached = cache.get(source_id)
     if (
         cached is not None
         and cached[0]() is l2t_smoothed
         and cached[1] == source_version
     ):
-        _SM120_M537_PACKED_L2T_CACHE.move_to_end(source_id)
+        cache.move_to_end(source_id)
         return cached[2]
 
-    packed = _pack_sm120_m537_l2t(l2t_smoothed)
+    packed = pack(l2t_smoothed)
 
     def discard(dead_ref: weakref.ReferenceType, *, key: int = source_id) -> None:
-        current = _SM120_M537_PACKED_L2T_CACHE.get(key)
+        current = cache.get(key)
         if current is not None and current[0] is dead_ref:
-            _SM120_M537_PACKED_L2T_CACHE.pop(key, None)
+            cache.pop(key, None)
 
     source_ref = weakref.ref(l2t_smoothed, discard)
-    _SM120_M537_PACKED_L2T_CACHE[source_id] = (
-        source_ref,
-        source_version,
-        packed,
-    )
-    _SM120_M537_PACKED_L2T_CACHE.move_to_end(source_id)
-    while len(_SM120_M537_PACKED_L2T_CACHE) > _SM120_M537_PACKED_L2T_CACHE_CAPACITY:
-        _SM120_M537_PACKED_L2T_CACHE.popitem(last=False)
+    cache[source_id] = (source_ref, source_version, packed)
+    cache.move_to_end(source_id)
+    while len(cache) > _SM120_M537_PACKED_L2T_CACHE_CAPACITY:
+        cache.popitem(last=False)
     return packed
+
+
+def _cached_sm120_m537_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
+    """Cache the M537 / packed-small-M L2T pack."""
+    return _cached_l2t_pack(
+        l2t_smoothed, _pack_sm120_m537_l2t, _SM120_M537_PACKED_L2T_CACHE
+    )
+
+
+_SM120_KMAJOR_L2T_CACHE: OrderedDict[
+    int, tuple[weakref.ReferenceType, int, torch.Tensor]
+] = OrderedDict()
+
+
+def _pack_sm120_kmajor_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
+    """K-major L2T, l2[rank][K], viewed with the [K, rank] shape the FFI checks."""
+    return l2t_smoothed.t().contiguous().view(l2t_smoothed.shape)
+
+
+def _cached_sm120_kmajor_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
+    """Cache the K-major L2T the wide-rank large-M producer reads."""
+    return _cached_l2t_pack(
+        l2t_smoothed, _pack_sm120_kmajor_l2t, _SM120_KMAJOR_L2T_CACHE
+    )
+
+
+def _sm120_fused_l2t(
+    l2t_smoothed: torch.Tensor, m: int, k: int, producer_variant: int, rank: int
+) -> torch.Tensor:
+    """The L2T layout the chosen fused producer reads."""
+    if _sm120_variant_packs_l2t(m, k, producer_variant, rank):
+        return _cached_sm120_m537_l2t(l2t_smoothed)
+    if _sm120_variant_reads_kmajor_l2t(m, k, producer_variant, rank):
+        return _cached_sm120_kmajor_l2t(l2t_smoothed)
+    return l2t_smoothed
 
 
 def _sm120_fused_linear_supported(m: int, k: int, rank: int) -> bool:
@@ -484,10 +519,8 @@ def _sm120_fused_linear_runner(
             )
             # M537 and packed small-M producers share the packed L2T layout;
             # the remaining producers read the original row-major matrix.
-            fused_l2t_smoothed = (
-                _cached_sm120_m537_l2t(l2t_smoothed)
-                if _sm120_variant_packs_l2t(m_rt, k_rt, producer_variant, rank)
-                else l2t_smoothed
+            fused_l2t_smoothed = _sm120_fused_l2t(
+                l2t_smoothed, m_rt, k_rt, producer_variant, rank
             )
             module.nvfp4_svdquant_linear_sm120(
                 x,

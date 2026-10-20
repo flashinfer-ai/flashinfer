@@ -504,6 +504,14 @@ __device__ __forceinline__ std::uint64_t make_l2_evict_first_policy() {
 // quantize warps and one A fragment load feeds several MMAs.
 constexpr int large_m_down_warps(int rank) { return rank <= 64 ? rank / 8 : 8; }
 
+// Wide ranks read L2T from a K-major copy, l2[rank][K] stored in the [K, rank]
+// tensor. Row-major L2T makes each B-fragment pair two bf16 reads 2*Rank bytes
+// apart, so a warp's load touches 32 lines for 64 useful bytes; at rank 128 the
+// prefix lost ~50us of a ~160us run to those loads (16384x3072, removing them
+// left 106us). K-major turns each pair into one aligned 32-bit read and a warp
+// load into eight 16-byte segments. Rank 32/64 keep the row-major layout.
+constexpr bool large_m_kmajor_l2(int rank) { return rank > 64; }
+
 template <bool UsePackedStore>
 __device__ __forceinline__ void store_down_pair(quant::Type* destination, float low, float high) {
   if constexpr (UsePackedStore) {
@@ -778,19 +786,34 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn
         }
       } else {
         // Wide rank: one A fragment per m16 block feeds kFrags adjacent n8 MMAs.
+        // Every B fragment of the tile is issued before the first MMA so the
+        // global-load latency overlaps instead of serialising each k step
+        // (removing these loads entirely took the 16384x3072 rank-128 prefix
+        // from ~160us to ~106us; a layout change alone recovered nothing).
+        constexpr int kKSteps = kTileK / 16;
+        std::uint32_t b0[kKSteps][kFrags];
+        std::uint32_t b1[kKSteps][kFrags];
 #pragma unroll
-        for (int local_k = 0; local_k < kTileK; local_k += 16) {
-          int const b_row = tile_k + local_k + pair_col;
-          std::uint32_t b0[kFrags];
-          std::uint32_t b1[kFrags];
+        for (int ks = 0; ks < kKSteps; ++ks) {
+          int const b_row = tile_k + ks * 16 + pair_col;
 #pragma unroll
           for (int f = 0; f < kFrags; ++f) {
             int const b_col = (warp * kFrags + f) * 8 + group;
-            quant::Type const* b_base =
-                l2t_smoothed + static_cast<std::int64_t>(b_row) * kRank + b_col;
-            b0[f] = base::pack_bf16_pair(b_base, b_base + kRank);
-            b1[f] = base::pack_bf16_pair(b_base + 8 * kRank, b_base + 9 * kRank);
+            if constexpr (large_m_kmajor_l2(Rank)) {
+              quant::Type const* b_base = l2t_smoothed + static_cast<std::int64_t>(b_col) * K + b_row;
+              b0[ks][f] = base::load_bf16_pair(b_base);
+              b1[ks][f] = base::load_bf16_pair(b_base + 8);
+            } else {
+              quant::Type const* b_base =
+                  l2t_smoothed + static_cast<std::int64_t>(b_row) * kRank + b_col;
+              b0[ks][f] = base::pack_bf16_pair(b_base, b_base + kRank);
+              b1[ks][f] = base::pack_bf16_pair(b_base + 8 * kRank, b_base + 9 * kRank);
+            }
           }
+        }
+#pragma unroll
+        for (int ks = 0; ks < kKSteps; ++ks) {
+          int const local_k = ks * 16;
 #pragma unroll
           for (int mb = 0; mb < kMBlocks; ++mb) {
             quant::Type const* a_base =
@@ -803,7 +826,7 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn
             for (int f = 0; f < kFrags; ++f) {
               base::mma_m16n8k16_row_col(wide_acc[f][mb][0], wide_acc[f][mb][1],
                                          wide_acc[f][mb][2], wide_acc[f][mb][3], a0, a1, a2, a3,
-                                         b0[f], b1[f]);
+                                         b0[ks][f], b1[ks][f]);
             }
           }
         }
