@@ -5076,7 +5076,13 @@ def test_native_prefix_rejects_misaligned_inputs_before_launch(
     assert inputs[index].is_contiguous()
     assert inputs[index].data_ptr() % 16 == offset * 2
     module = get_nvfp4_svdquant_sm120_module(rank)
-    with pytest.raises(RuntimeError, match=f"{name} must be 16-byte aligned"):
+    # The cuBLASLt prefix is rank-32 only and refuses other ranks first.
+    expected = (
+        "supports rank 32 only"
+        if entry == "cublaslt" and rank != 32
+        else f"{name} must be 16-byte aligned"
+    )
+    with pytest.raises(RuntimeError, match=expected):
         match entry:
             case "quantize":
                 module.nvfp4_quantize_smooth(*inputs[:3], *inputs[4:6], False)

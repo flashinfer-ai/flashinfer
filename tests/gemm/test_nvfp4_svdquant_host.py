@@ -3386,6 +3386,7 @@ using cudaError_t = int;
 constexpr int cudaSuccess = 0;
 constexpr int cudaErrorInvalidValue = 1;
 constexpr int kSm120PrefixRank = TEST_RANK;
+struct LoraDownCublasLtState { static constexpr int kRank = 32; };
 int backend_calls = 0;
 int getMultiProcessorCount(int) { return 1; }
 int get_stream(Device) { return 0; }
@@ -3421,6 +3422,18 @@ int main(int argc, char** argv) {
   }
   inputs.at(index).pointer += offset;
   auto const& [x, pqs, scale, l2t, xq, sf, down, workspace] = inputs;
+  // The cuBLASLt prefix is rank-32 only; it must refuse a rank-64 module's
+  // tensors before quantizing, whatever the alignment.
+  if (entry == 3 && TEST_RANK != 32) {
+    try {
+      nvfp4_quantize_smooth_lora_down_cublaslt_sm120(x, pqs, scale, l2t, xq, sf, down, workspace);
+    } catch (std::runtime_error const& error) {
+      assert(std::string(error.what()).find("supports rank 32 only") != std::string::npos);
+      assert(backend_calls == 0);
+      return 0;
+    }
+    assert(false);
+  }
   bool rejected = false;
   try {
     switch (entry) {
@@ -3516,8 +3529,10 @@ def test_persisting_l2_hints_are_skipped_during_stream_capture() -> None:
     source = _BINDING_PATH.read_text(encoding="utf-8")
 
     assert "cudaStreamIsCapturing(stream, &capture_status)" in source
-    assert "state.persisting_l2t_stream != stream" in source
-    assert "if (!is_capturing)" in source
+
+    # The cuBLASLt LoRA-down must not leave a stream window or device limit set.
+    lora_down = _function(source, "void run_lora_down_cublaslt(")
+    assert "persisting_l2" not in lora_down
 
     linear = source[source.index("void nvfp4_svdquant_linear_sm120(") :]
     linear = linear[: linear.index("\n#endif")]

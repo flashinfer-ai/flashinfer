@@ -331,6 +331,8 @@ cudaError_t query_stream_capture(cudaStream_t stream, bool& is_capturing) {
 }
 
 struct LoraDownCublasLtState {
+  // The plans are built for this rank only; the entry point rejects any other.
+  static constexpr int kRank = 32;
   static constexpr int kMaxHeuristicResults = 32;
 
   cublasLtHandle_t handle = nullptr;
@@ -344,8 +346,6 @@ struct LoraDownCublasLtState {
   int device_id = -1;
   int m = 0;
   int k = 0;
-  void const* persisting_l2t_ptr = nullptr;
-  cudaStream_t persisting_l2t_stream = nullptr;
   bool initialized = false;
 
   LoraDownCublasLtState() = default;
@@ -384,8 +384,6 @@ struct LoraDownCublasLtState {
     device_id = -1;
     m = 0;
     k = 0;
-    persisting_l2t_ptr = nullptr;
-    persisting_l2t_stream = nullptr;
     initialized = false;
   }
 };
@@ -409,7 +407,7 @@ LoraDownCublasLtState& lora_down_cublaslt_state(int device_id, int m, int k) {
   }
   state.reset();
   LoraDownCublasLtInitGuard init_guard{state};
-  constexpr int kRank = 32;
+  constexpr int kRank = LoraDownCublasLtState::kRank;
   constexpr std::size_t kMaxWorkspaceBytes = 32 * 1024 * 1024;
   int current_device = -1;
   cudaError_t cuda_status = cudaGetDevice(&current_device);
@@ -487,25 +485,6 @@ void run_lora_down_cublaslt(TensorView x, TensorView l2t_smoothed, TensorView do
 
   if (m == 0) return;
   LoraDownCublasLtState& state = lora_down_cublaslt_state(x.device().device_id, m, k);
-  if (m == 537 && (state.persisting_l2t_ptr != l2t_smoothed.data_ptr() ||
-                   state.persisting_l2t_stream != stream)) {
-    bool is_capturing = false;
-    cudaError_t cuda_status = query_stream_capture(stream, is_capturing);
-    TVM_FFI_ICHECK_EQ(cuda_status, cudaSuccess)
-        << "failed to query M537 LoRA-down stream capture status: "
-        << cudaGetErrorString(cuda_status);
-    if (!is_capturing) {
-      std::size_t const l2t_bytes =
-          static_cast<std::size_t>(l2t_smoothed.numel()) * get_element_size(l2t_smoothed);
-      cuda_status = configure_case7_xq_persisting_l2(x.device().device_id, stream,
-                                                     l2t_smoothed.data_ptr(), l2t_bytes, l2t_bytes);
-      TVM_FFI_ICHECK_EQ(cuda_status, cudaSuccess)
-          << "failed to configure M537 L2T persisting-L2 window: "
-          << cudaGetErrorString(cuda_status);
-      state.persisting_l2t_ptr = l2t_smoothed.data_ptr();
-      state.persisting_l2t_stream = stream;
-    }
-  }
   auto const& heuristic = state.heuristics[state.heuristic_index];
   std::size_t const workspace_bytes = workspace_buffer.numel() * get_element_size(workspace_buffer);
   TVM_FFI_ICHECK_GE(workspace_bytes, heuristic.workspaceSize)
@@ -564,6 +543,10 @@ void nvfp4_quantize_smooth_lora_down_cublaslt_sm120(TensorView x, TensorView pqs
   // shapes named here were the ones it had been measured on, which is a
   // different question and belongs to the autotuner.
   TVM_FFI_ICHECK(x.ndim() == 2) << "x must be 2-D [m, k]";
+  // Reject before the quantizer runs: a rank-64 module exports this entry too,
+  // and its plans would read L2T and write down with the rank-32 layout.
+  TVM_FFI_ICHECK(l2t_smoothed.ndim() == 2 && l2t_smoothed.size(1) == LoraDownCublasLtState::kRank)
+      << "the cuBLASLt LoRA-down prefix supports rank " << LoraDownCublasLtState::kRank << " only";
 
   cudaStream_t stream = get_stream(x.device());
   // Two shapes used to swap these calls, to keep XQ/SF hot for the residual GEMM
