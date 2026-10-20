@@ -16,6 +16,7 @@ from types import ModuleType
 PACKAGES: dict[str, str] = {
     "cake_rmsnorm_train": "flashinfer.cake_rmsnorm_train_backend",
     "cake_causal_conv1d_train": "flashinfer.cake_causal_conv1d_train_backend",
+    "cake_ulysses": "flashinfer.cake_ulysses_backend",
     "cake_dsa_train": "flashinfer.experimental.cake_dsa_train",
     "cake_dsa_indexer": "flashinfer.experimental.cake_dsa_indexer",
     "cake_lm_head_loss": "flashinfer.experimental.cake_lm_head_loss",
@@ -23,6 +24,7 @@ PACKAGES: dict[str, str] = {
     "cake_moe_grouped_gemm": "flashinfer.experimental.cake_moe_grouped_gemm",
     "cake_mok_bf16": "flashinfer.experimental.cake_mok_bf16",
     "cake_kda_train": "flashinfer.experimental.cake_kda_train",
+    "cake_stepfun_moe": "flashinfer.experimental.cake_stepfun_moe",
 }
 
 

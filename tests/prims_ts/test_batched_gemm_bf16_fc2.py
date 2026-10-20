@@ -66,7 +66,7 @@ BF16_FC2_BASE = dict(
 def _run_bf16_fc2(
     *,
     tile_n,
-    tile_k=128,
+    tile_k=64,
     pipeline_stages=4,
     num_experts=1,
     num_tokens=128,
@@ -104,24 +104,7 @@ def _run_bf16_fc2(
 
 
 class TestScheduleValidation:
-    def test_validate_bf16_fc2_tile8(self):
-        from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
-            build_batched_gemm_task_manager,
-        )
-
-        build_batched_gemm_task_manager(
-            num_experts=1,
-            num_tokens=128,
-            top_k=1,
-            tile_n=8,
-            tile_k=128,
-            mma_n=8,
-            epi_tile_n=8,
-            **uniform_pipeline_stage_overrides(4),
-            **BF16_FC2_BASE,
-        )
-
-    def test_validate_bf16_fc2_tile16(self):
+    def test_validate_bf16_fc2_tile128(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
             build_batched_gemm_task_manager,
         )
@@ -130,10 +113,10 @@ class TestScheduleValidation:
             num_experts=2,
             num_tokens=256,
             top_k=1,
-            tile_n=16,
-            tile_k=128,
-            mma_n=16,
-            epi_tile_n=16,
+            tile_n=128,
+            tile_k=64,
+            mma_n=128,
+            epi_tile_n=128,
             **uniform_pipeline_stage_overrides(5),
             **BF16_FC2_BASE,
         )
@@ -152,10 +135,10 @@ class TestScheduleValidation:
             num_experts=1,
             num_tokens=160,
             top_k=1,
-            tile_n=16,
-            tile_k=128,
-            mma_n=16,
-            epi_tile_n=16,
+            tile_n=128,
+            tile_k=64,
+            mma_n=128,
+            epi_tile_n=128,
             **uniform_pipeline_stage_overrides(4),
             use_pdl=1,
             use_early_exit=1,
@@ -192,10 +175,10 @@ class TestScheduleValidation:
                 num_experts=1,
                 num_tokens=160,
                 top_k=1,
-                tile_n=16,
-                tile_k=128,
-                mma_n=16,
-                epi_tile_n=16,
+                tile_n=128,
+                tile_k=64,
+                mma_n=128,
+                epi_tile_n=128,
                 **uniform_pipeline_stage_overrides(4),
                 use_early_exit=1,
                 do_pdl_wait_for_num_non_exiting_ctas=1,
@@ -215,10 +198,10 @@ class TestScheduleValidation:
                 num_experts=1,
                 num_tokens=160,
                 top_k=1,
-                tile_n=16,
-                tile_k=128,
-                mma_n=16,
-                epi_tile_n=16,
+                tile_n=128,
+                tile_k=64,
+                mma_n=128,
+                epi_tile_n=128,
                 **uniform_pipeline_stage_overrides(4),
                 use_pdl=1,
                 do_pdl_wait_for_num_non_exiting_ctas=1,
@@ -237,28 +220,19 @@ class TestBf16Fc2ReferenceCheck:
     )
     def test_plain_output_dtype(self, dtype_c, expected_output_dtype):
         _run_bf16_fc2(
-            tile_n=16,
+            tile_n=128,
             pipeline_stages=4,
             dtype_c=dtype_c,
             expected_output_dtype=expected_output_dtype,
         )
 
-    def test_tile_n8_stages4(self):
-        _run_bf16_fc2(tile_n=8, pipeline_stages=4)
+    def test_tile_n128_stages4(self):
+        _run_bf16_fc2(tile_n=128, pipeline_stages=4)
 
-    def test_tile_n16_stages4(self):
-        _run_bf16_fc2(tile_n=16, pipeline_stages=4)
+    def test_tma_store_tile_n128(self):
+        _run_bf16_fc2(tile_n=128, use_tma_store=1)
 
-    def test_tile_n32_stages4(self):
-        _run_bf16_fc2(tile_n=32, pipeline_stages=4)
-
-    def test_tma_store_tile_n8(self):
-        _run_bf16_fc2(tile_n=8, use_tma_store=1)
-
-    def test_tma_store_tile_n32(self):
-        _run_bf16_fc2(tile_n=32, use_tma_store=1)
-
-    def test_bias_m_tile_n16(self):
+    def test_bias_m_tile_n128(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
@@ -267,10 +241,10 @@ class TestBf16Fc2ReferenceCheck:
             num_experts=1,
             num_tokens=128,
             top_k=1,
-            tile_n=16,
-            tile_k=128,
-            mma_n=16,
-            epi_tile_n=16,
+            tile_n=128,
+            tile_k=64,
+            mma_n=128,
+            epi_tile_n=128,
             **uniform_pipeline_stage_overrides(4),
             bias_type=1,
             **BF16_FC2_BASE,
@@ -286,10 +260,10 @@ class TestBf16Fc2ReferenceCheck:
             num_experts=4,
             num_tokens=160,
             top_k=1,
-            tile_n=16,
-            tile_k=128,
-            mma_n=16,
-            epi_tile_n=16,
+            tile_n=128,
+            tile_k=64,
+            mma_n=128,
+            epi_tile_n=128,
             **uniform_pipeline_stage_overrides(4),
             use_tma_oob_opt=1,
             **BF16_FC2_BASE,
@@ -305,10 +279,10 @@ class TestBf16Fc2ReferenceCheck:
             num_experts=1,
             num_tokens=160,
             top_k=1,
-            tile_n=16,
-            tile_k=128,
-            mma_n=16,
-            epi_tile_n=16,
+            tile_n=128,
+            tile_k=64,
+            mma_n=128,
+            epi_tile_n=128,
             **uniform_pipeline_stage_overrides(4),
             use_early_exit=1,
             **BF16_FC2_BASE,
@@ -324,10 +298,10 @@ class TestBf16Fc2ReferenceCheck:
             num_experts=1,
             num_tokens=160,
             top_k=1,
-            tile_n=16,
-            tile_k=128,
-            mma_n=16,
-            epi_tile_n=16,
+            tile_n=128,
+            tile_k=64,
+            mma_n=128,
+            epi_tile_n=128,
             **uniform_pipeline_stage_overrides(4),
             use_pdl=1,
             use_early_exit=1,
@@ -337,11 +311,11 @@ class TestBf16Fc2ReferenceCheck:
         assert result
 
     def test_nonrounded_topk_expanded_layout(self):
-        _run_bf16_fc2(tile_n=16, num_experts=3, num_tokens=130, top_k=2)
+        _run_bf16_fc2(tile_n=128, num_experts=3, num_tokens=130, top_k=2)
 
 
 class TestBf16Fc2LargerProblem:
-    def test_tile_n16_problem_n256_k256(self):
+    def test_tile_n128_problem_n256_k256(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
@@ -352,16 +326,16 @@ class TestBf16Fc2LargerProblem:
             top_k=1,
             problem_n=256,
             problem_k=256,
-            tile_n=16,
-            tile_k=128,
-            mma_n=16,
-            epi_tile_n=16,
+            tile_n=128,
+            tile_k=64,
+            mma_n=128,
+            epi_tile_n=128,
             **uniform_pipeline_stage_overrides(5),
             **BF16_FC2_BASE,
         )
         assert result
 
-    def test_tile_n16_problem_n1024_k1024(self):
+    def test_tile_n128_problem_n1024_k1024(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
@@ -372,10 +346,10 @@ class TestBf16Fc2LargerProblem:
             top_k=1,
             problem_n=1024,
             problem_k=1024,
-            tile_n=16,
-            tile_k=128,
-            mma_n=16,
-            epi_tile_n=16,
+            tile_n=128,
+            tile_k=64,
+            mma_n=128,
+            epi_tile_n=128,
             **uniform_pipeline_stage_overrides(5),
             **BF16_FC2_BASE,
         )
@@ -384,10 +358,10 @@ class TestBf16Fc2LargerProblem:
 
 class TestBf16Fc2MultiExpert:
     def test_2_experts(self):
-        _run_bf16_fc2(tile_n=16, num_experts=2, num_tokens=256)
+        _run_bf16_fc2(tile_n=128, num_experts=2, num_tokens=256)
 
     def test_4_experts(self):
-        _run_bf16_fc2(tile_n=16, num_experts=4, num_tokens=512)
+        _run_bf16_fc2(tile_n=128, num_experts=4, num_tokens=512)
 
 
 class TestBf16Fc2Persistent:
@@ -397,7 +371,7 @@ class TestBf16Fc2Persistent:
         "num_stages_tmem_acc": 2,
     }
 
-    def test_validate_persistent_tile16(self):
+    def test_validate_persistent_tile128(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
             build_batched_gemm_task_manager,
         )
@@ -406,10 +380,10 @@ class TestBf16Fc2Persistent:
             num_experts=2,
             num_tokens=256,
             top_k=1,
-            tile_n=16,
-            tile_k=128,
-            mma_n=16,
-            epi_tile_n=16,
+            tile_n=128,
+            tile_k=64,
+            mma_n=128,
+            epi_tile_n=128,
             **uniform_pipeline_stage_overrides(5),
             **self.PERSISTENT_CFG,
         )
@@ -429,10 +403,10 @@ class TestBf16Fc2Persistent:
             num_experts=2,
             num_tokens=256,
             top_k=1,
-            tile_n=16,
-            tile_k=128,
-            mma_n=16,
-            epi_tile_n=16,
+            tile_n=128,
+            tile_k=64,
+            mma_n=128,
+            epi_tile_n=128,
             **uniform_pipeline_stage_overrides(5),
             use_pdl=1,
             **self.PERSISTENT_CFG,
@@ -480,7 +454,7 @@ class TestBf16Fc2Persistent:
         assert dep_graph["GmemA"] == ["PdlWait"]
         assert dep_graph["PdlLaunch"] == []
 
-    def test_persistent_tile16_stages5(self):
+    def test_persistent_tile128_stages5(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
@@ -489,16 +463,16 @@ class TestBf16Fc2Persistent:
             num_experts=2,
             num_tokens=256,
             top_k=1,
-            tile_n=16,
-            tile_k=128,
-            mma_n=16,
-            epi_tile_n=16,
+            tile_n=128,
+            tile_k=64,
+            mma_n=128,
+            epi_tile_n=128,
             **uniform_pipeline_stage_overrides(5),
             **self.PERSISTENT_CFG,
         )
         assert result
 
-    def test_persistent_tile16_stages5_pdl(self):
+    def test_persistent_tile128_stages5_pdl(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
@@ -507,10 +481,10 @@ class TestBf16Fc2Persistent:
             num_experts=2,
             num_tokens=256,
             top_k=1,
-            tile_n=16,
-            tile_k=128,
-            mma_n=16,
-            epi_tile_n=16,
+            tile_n=128,
+            tile_k=64,
+            mma_n=128,
+            epi_tile_n=128,
             **uniform_pipeline_stage_overrides(5),
             use_pdl=1,
             **self.PERSISTENT_CFG,
@@ -526,17 +500,17 @@ class TestBf16Fc2Persistent:
             num_experts=4,
             num_tokens=160,
             top_k=1,
-            tile_n=16,
-            tile_k=128,
-            mma_n=16,
-            epi_tile_n=16,
+            tile_n=128,
+            tile_k=64,
+            mma_n=128,
+            epi_tile_n=128,
             **uniform_pipeline_stage_overrides(5),
             use_early_exit=1,
             **self.PERSISTENT_CFG,
         )
         assert result
 
-    def test_persistent_tile8_stages4(self):
+    def test_persistent_tile128_stages4(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
@@ -545,16 +519,16 @@ class TestBf16Fc2Persistent:
             num_experts=4,
             num_tokens=512,
             top_k=1,
-            tile_n=8,
-            tile_k=128,
-            mma_n=8,
-            epi_tile_n=8,
+            tile_n=128,
+            tile_k=64,
+            mma_n=128,
+            epi_tile_n=128,
             **uniform_pipeline_stage_overrides(4),
             **self.PERSISTENT_CFG,
         )
         assert result
 
-    def test_persistent_tile32_generated_rows(self):
+    def test_persistent_tile128_generated_rows(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
@@ -569,10 +543,10 @@ class TestBf16Fc2Persistent:
                     num_experts=2,
                     num_tokens=256,
                     top_k=1,
-                    tile_n=32,
-                    tile_k=128,
-                    mma_n=32,
-                    epi_tile_n=32,
+                    tile_n=128,
+                    tile_k=64,
+                    mma_n=128,
+                    epi_tile_n=128,
                     **uniform_pipeline_stage_overrides(pipeline_stages),
                     **cfg,
                 )
@@ -593,7 +567,7 @@ class TestBf16Fc2DoubleBufferedAcc:
             num_tokens=num_tokens,
             top_k=1,
             tile_n=tile_n,
-            tile_k=128,
+            tile_k=64,
             mma_n=tile_n,
             epi_tile_n=tile_n,
             **uniform_pipeline_stage_overrides(pipeline_stages),
@@ -601,15 +575,12 @@ class TestBf16Fc2DoubleBufferedAcc:
         )
         assert result
 
-    def test_tile_n8_stages5_mma2(self):
-        self._run_double_buf(tile_n=8, pipeline_stages=5)
+    def test_tile_n128_stages5_mma2(self):
+        self._run_double_buf(tile_n=128, pipeline_stages=5)
 
-    def test_tile_n16_stages5_mma2(self):
-        self._run_double_buf(tile_n=16, pipeline_stages=5)
-
-    def test_tile_n16_stages5_mma2_multi_expert(self):
+    def test_tile_n128_stages5_mma2_multi_expert(self):
         self._run_double_buf(
-            tile_n=16, pipeline_stages=5, num_experts=4, num_tokens=512
+            tile_n=128, pipeline_stages=5, num_experts=4, num_tokens=512
         )
 
 
@@ -629,7 +600,7 @@ class TestBf16Fc2SwapAB:
             num_tokens=256,
             top_k=1,
             tile_n=16,
-            tile_k=128,
+            tile_k=64,
             mma_n=16,
             epi_tile_n=16,
             **uniform_pipeline_stage_overrides(5),
@@ -647,10 +618,10 @@ class TestBf16Fc2SwapAB:
             num_experts=2,
             num_tokens=256,
             top_k=1,
-            tile_n=16,
-            tile_k=128,
-            mma_n=16,
-            epi_tile_n=16,
+            tile_n=128,
+            tile_k=64,
+            mma_n=128,
+            epi_tile_n=128,
             **uniform_pipeline_stage_overrides(5),
             **cfg,
         )
@@ -671,7 +642,7 @@ class TestBf16Fc2SwapAB:
             num_tokens=512,
             top_k=1,
             tile_n=8,
-            tile_k=128,
+            tile_k=64,
             mma_n=8,
             epi_tile_n=8,
             **uniform_pipeline_stage_overrides(4),
@@ -702,8 +673,8 @@ class TestBf16Fc2HighThroughput:
         )
 
         for tile_n, tile_k, epi_tile_n, pipeline_stages in (
-            (64, 128, 64, 4),
-            (128, 64, 64, 8),
+            (128, 64, 128, 4),
+            (128, 64, 128, 6),
         ):
             cfg = {**self.HT_CFG}
             build_batched_gemm_task_manager(
@@ -724,8 +695,8 @@ class TestBf16Fc2HighThroughput:
         )
 
         for tile_n, tile_k, epi_tile_n, pipeline_stages in (
-            (64, 128, 64, 4),
-            (128, 64, 64, 8),
+            (128, 64, 128, 4),
+            (128, 64, 128, 6),
         ):
             for unroll in (0,):
                 cfg = {
@@ -760,7 +731,7 @@ class TestBf16Fc2HighThroughput:
             num_tokens=256,
             top_k=1,
             tile_n=64,
-            tile_k=128,
+            tile_k=64,
             mma_n=64,
             epi_tile_n=64,
             **uniform_pipeline_stage_overrides(4),
@@ -823,10 +794,10 @@ class TestBf16Fc2HighThroughput:
             warmup_iters=1,
             bench_iters=1,
             num_rotated_buffers=0,
-            tile_n=64,
-            tile_k=128,
-            mma_n=64,
-            epi_tile_n=64,
+            tile_n=128,
+            tile_k=64,
+            mma_n=128,
+            epi_tile_n=128,
             **uniform_pipeline_stage_overrides(5),
             **pred_cfg,
         )
@@ -839,8 +810,8 @@ class TestBf16Fc2HighThroughput:
             tile_n=128,
             tile_k=64,
             mma_n=128,
-            epi_tile_n=64,
-            **uniform_pipeline_stage_overrides(8),
+            epi_tile_n=128,
+            **uniform_pipeline_stage_overrides(6),
             **target_cfg,
         )
         assert result
@@ -857,10 +828,10 @@ class TestBf16Fc2RepeatedLaunch:
                 num_experts=1,
                 num_tokens=128,
                 top_k=1,
-                tile_n=16,
-                tile_k=128,
-                mma_n=16,
-                epi_tile_n=16,
+                tile_n=128,
+                tile_k=64,
+                mma_n=128,
+                epi_tile_n=128,
                 **uniform_pipeline_stage_overrides(4),
                 **BF16_FC2_BASE,
             )

@@ -103,6 +103,25 @@ def _cg2s_programs():
     return sorted(classes)
 
 
+def _order_classes(arch):
+    """``(world_size, dtype, b_layout, form)`` classes with a delivered tile-order
+    twin of the one-CTA N256 main on ``arch``, read from the emitted table."""
+
+    return {
+        (int(world_size), str(dtype_name), str(b_layout), str(form))
+        for world_size, dtype_name, b_layout, form in loader.ORDER_CLASSES[arch]
+    }
+
+
+def _order_programs():
+    """Every class with a delivered tile-order twin (union over the architectures)."""
+
+    classes = set()
+    for arch in loader.ARCH_FLAGS:
+        classes |= _order_classes(arch)
+    return sorted(classes)
+
+
 def _spill_point_form(arch, world_size, dtype_name, b_layout, padded, n):
     """Form of the emitted spill point naming the class, padded rows and ``n`` on
     ``arch``, or ``None`` when no point does."""
@@ -163,7 +182,33 @@ def test_route_table_covers_every_world_size_dtype_layout_and_phase():
         f"main_{dtype_name}_ws{world_size}_{b_layout}_{form}"
         for world_size, dtype_name, b_layout, form in _cg2s_programs()
     }
-    assert len(loader.ROUTES) == 2 + 12 + 2 + len(twins) + len(pairs) + len(spills)
+    # One tile-order twin of the one-CTA main per class of the delivered
+    # order-class table, each a program of its own; no other ``_po`` / ``_pi``
+    # route exists.
+    orders = set()
+    for world_size, dtype_name, b_layout, form in _order_programs():
+        program = loader.main_program(world_size, dtype_name, b_layout, form=form)
+        assert program in loader.PROGRAMS
+        assert program not in mains | twins | pairs | spills
+        orders.add(program)
+    assert len(orders) == len(_order_programs())
+    order_keys = {key for key in loader.ROUTES if key.endswith(("_po", "_pi"))}
+    assert order_keys == {
+        f"main_{dtype_name}_ws{world_size}_{b_layout}_{form}"
+        for world_size, dtype_name, b_layout, form in _order_programs()
+    }
+    kslice_routes = {key for key in loader.ROUTES if loader._is_kslice_stage(key)}
+    expected_routes = (
+        2
+        + 12
+        + 2
+        + len(twins)
+        + len(pairs)
+        + len(spills)
+        + len(orders)
+        + len(kslice_routes)
+    )
+    assert len(loader.ROUTES) == expected_routes
     # ws2 never has a twin: asking for one names the missing route.
     with pytest.raises(ValueError, match="main_bfloat16_ws2_n_major_n128"):
         loader.main_program(2, "bfloat16", "n_major", block_n=128)
@@ -198,8 +243,9 @@ def test_n128_table_lists_ws4_and_ws8_classes_per_architecture_under_the_frozen_
     assert loader.SM_PUSH_BANDS_BY_ARCH == {"sm_100a": [], "sm_103a": [[8, 1024, 1619]]}
     assert loader.PUSH_LAUNCH_ROWS_BY_ARCH == {
         "sm_100a": [],
-        "sm_103a": [[4, 512, 16, 8]],
+        "sm_103a": [[4, 512, 16, 8], [8, 1024, 16, 8]],
     }
+    assert loader.PUSH_KSLICES_BY_ARCH == {"sm_100a": [], "sm_103a": [[8, 512, 4]]}
     assert loader.MAIN_BLOCK_NS == (256, 128) and loader.BLOCK_N == 256
     for arch in loader.ARCH_FLAGS:
         classes = _n128_classes(arch)
@@ -277,8 +323,9 @@ def test_cg2_tables_list_the_measured_pair_regions_and_classes_per_architecture(
 
     assert set(loader.CG2_CLASSES) == set(loader.CG2_REGIONS) == set(loader.ARCH_FLAGS)
     assert loader.CG2_REGIONS == _CG2_REGIONS
-    assert loader.MAIN_FORMS == ("cg1", "cg2", "cg2s1", "cg2s2")
+    assert loader.MAIN_FORMS == ("cg1", "cg2", "cg2s1", "cg2s2", "po", "pi")
     assert loader.PAIR_FORMS == ("cg2", "cg2s1", "cg2s2")
+    assert loader.ORDER_FORMS == ("po", "pi")
     assert loader.CG2_CLUSTER_DIMS == (2, 1, 1)
     for arch in loader.ARCH_FLAGS:
         classes = _cg2_classes(arch)
@@ -350,9 +397,161 @@ def test_cg2_spill_point_table_lists_the_measured_points_per_architecture():
                 min_rows <= padded <= max_rows and min_cols <= n <= max_cols
                 for min_rows, max_rows, min_cols, max_cols in rectangles
             ), (arch, world_size, dtype_name, b_layout, padded, n)
-    assert [loader.main_form_code(form) for form in loader.MAIN_FORMS] == [0, 1, 2, 3]
+    assert [loader.main_form_code(form) for form in loader.MAIN_FORMS] == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+    ]
     with pytest.raises(ValueError, match="form"):
         loader.main_form_code("pair")
+
+
+# ``[world_size, dtype, b_layout, padded_rows, n, form]`` tile-order points: the
+# one-CTA N256 main's ``po`` / ``pi`` twins (another tile -> (peer, B panel) map
+# of the persistent walk; the one-CTA launch and grid) on exact padded rows
+# (always 128: one M tile, one chunk) and exact N. One point is delivered, on
+# sm_103a alone: the four-rank bf16 K-major calls of 128 padded rows at
+# N = 14336 (1..128 rows) run the ``po`` twin; sm_100a lists none, and no
+# ``pi`` twin is delivered anywhere.
+_TILE_ORDER_POINTS = {
+    "sm_100a": [],
+    "sm_103a": [[4, "bfloat16", "k_major", 128, 14336, "po"]],
+}
+_ORDER_CLASSES = {"sm_100a": set(), "sm_103a": {(4, "bfloat16", "k_major", "po")}}
+_ORDER_POINT_ROUTE = "main_bfloat16_ws4_k_major_po"
+# ``(rows, n, world_size)`` bf16 K-major calls at the point (1..128 rows pad to
+# the one 128-row tile) and off it (129 pads to 256; the neighbouring column
+# multiples; the eight-rank gate_up M=125 call; a two-rank call).
+_ORDER_POINT_CALLS = ((1, 14336, 4), (125, 14336, 4), (128, 14336, 4))
+_OFF_POINT_CALLS = (
+    (129, 14336, 4),
+    (256, 14336, 4),
+    (125, 14080, 4),
+    (125, 14592, 4),
+    (125, 7168, 8),
+    (1, 256, 2),
+)
+
+
+def test_tile_order_point_table_lists_the_ws4_bf16_k_major_point_on_sm_103a_and_the_forms_take_the_one_cta_grid():
+    """The tile-order twins of the one-CTA main are form codes 4 / 5 of the host
+    sequence. One point is delivered, on sm_103a alone: ``main_form`` selects
+    ``po`` for exactly the four-rank bf16 K-major calls of 128 padded rows at
+    N = 14336 there, one ``_po`` route ships (a program of its own next to the
+    one-CTA main of the class) and ``main_program`` refuses the form for every
+    other class and the ``pi`` form by name; sm_100a keeps every call on the
+    one-CTA program. The twins' grid is the one-CTA grid at the public width and
+    they exist at that width only."""
+
+    assert set(loader.TILE_ORDER_POINTS) == set(loader.ARCH_FLAGS)
+    assert set(loader.ORDER_CLASSES) == set(loader.ARCH_FLAGS)
+    assert loader.TILE_ORDER_POINTS == _TILE_ORDER_POINTS
+    for arch in loader.ARCH_FLAGS:
+        assert _order_classes(arch) == _ORDER_CLASSES[arch], arch
+        assert loader._order_classes(arch) == frozenset(_ORDER_CLASSES[arch]), arch
+        on_point = "po" if arch == "sm_103a" else None
+        for rows, n, world_size in _ORDER_POINT_CALLS:
+            assert (
+                loader._tile_order_point(
+                    arch, world_size, "bfloat16", "k_major", loader.padded_rows(rows), n
+                )
+                == on_point
+            ), (arch, rows)
+            assert loader.main_form(
+                rows,
+                n,
+                world_size=world_size,
+                arch=arch,
+                dtype_name="bfloat16",
+                b_layout="k_major",
+                block_n=256,
+            ) == (on_point or "cg1"), (arch, rows)
+        for rows, n, world_size in _OFF_POINT_CALLS:
+            assert (
+                loader._tile_order_point(
+                    arch, world_size, "bfloat16", "k_major", loader.padded_rows(rows), n
+                )
+                is None
+            ), (arch, rows, n, world_size)
+            assert (
+                loader.main_form(
+                    rows,
+                    n,
+                    world_size=world_size,
+                    arch=arch,
+                    dtype_name="bfloat16",
+                    b_layout="k_major",
+                    block_n=256,
+                )
+                == "cg1"
+            ), (arch, rows, n, world_size)
+        # The other layout and dtype of the point geometry, and the 128-wide call,
+        # stay on the one-CTA program on both architectures.
+        for dtype_name, b_layout, block_n in (
+            ("bfloat16", "n_major", 256),
+            ("float16", "k_major", 256),
+            ("bfloat16", "k_major", 128),
+        ):
+            assert (
+                loader.main_form(
+                    125,
+                    14336,
+                    world_size=4,
+                    arch=arch,
+                    dtype_name=dtype_name,
+                    b_layout=b_layout,
+                    block_n=block_n,
+                )
+                == "cg1"
+            ), (arch, dtype_name, b_layout, block_n)
+    # Exactly one order route: the ``_po`` twin of the ws4 bf16 k_major class, a
+    # program of its own next to the class's one-CTA main. The ``_po`` suffix is
+    # the route key's: a delivered program is named by the export's content
+    # fingerprint (``cake_all_gather_matmul_<hash>``), not by its kernel symbol.
+    assert {key for key in loader.ROUTES if key.endswith(("_po", "_pi"))} == {
+        _ORDER_POINT_ROUTE
+    }
+    twin = loader.main_program(4, "bfloat16", "k_major", form="po")
+    assert twin == loader.ROUTES[_ORDER_POINT_ROUTE]
+    assert twin in loader.PROGRAMS
+    assert twin != loader.main_program(4, "bfloat16", "k_major")
+    for form in loader.ORDER_FORMS:
+        assert loader.main_form_code(form) == 4 + loader.ORDER_FORMS.index(form)
+        assert form not in loader.PAIR_FORMS
+        assert (
+            loader.main_grid(125, 14336, world_size=4, sm_count=148, form=form)
+            == loader.main_grid(125, 14336, world_size=4, sm_count=148)
+            == (148, 1, 1)
+        )
+        with pytest.raises(ValueError, match="block_n=256 only"):
+            loader.main_grid(
+                125, 14336, world_size=4, sm_count=148, block_n=128, form=form
+            )
+        with pytest.raises(ValueError, match="block_n=256 only"):
+            loader._main_route_key(4, "bfloat16", "k_major", 128, form)
+    # The ``pi`` twin is delivered for no class; the ``po`` twin for the point's
+    # class alone.
+    with pytest.raises(
+        ValueError, match="no all-gather matmul main program is delivered"
+    ):
+        loader.main_program(4, "bfloat16", "k_major", block_n=256, form="pi")
+    for world_size, dtype_name, b_layout in (
+        (8, "bfloat16", "k_major"),
+        (4, "bfloat16", "n_major"),
+        (4, "float16", "k_major"),
+        (2, "bfloat16", "k_major"),
+    ):
+        with pytest.raises(
+            ValueError, match="no all-gather matmul main program is delivered"
+        ):
+            loader.main_program(world_size, dtype_name, b_layout, form="po")
+    with pytest.raises(ValueError, match="no entry for arch 'sm_90a'"):
+        loader._tile_order_point("sm_90a", 4, "bfloat16", "k_major", 128, 14336)
+    with pytest.raises(ValueError, match="no entry for arch 'sm_90a'"):
+        loader._order_classes("sm_90a")
 
 
 def test_every_program_lists_its_device_source_only():
@@ -436,6 +635,59 @@ def test_every_route_has_one_host_sequence_per_architecture():
                     assert row["programs"][f"main_{form}"] == spill
                     assert arch in loader.PROGRAMS[spill]["arches"]
                     route.add(spill)
+            # A tile-order twin likewise, for the classes with a delivered point of
+            # that form on this architecture (the per-call form is chosen by
+            # ``main_form`` over the tile-order point table: the ws4 bf16 k_major
+            # ``po`` class on sm_103a, none on sm_100a).
+            for form in loader.ORDER_FORMS:
+                order_class = (world_size, dtype_name, b_layout, form)
+                order_delivered = order_class in loader._order_classes(arch)
+                assert (f"main_{form}" in row["programs"]) is order_delivered
+                if order_delivered:
+                    order_twin = loader.main_program(
+                        world_size, dtype_name, b_layout, form=form
+                    )
+                    assert row["programs"][f"main_{form}"] == order_twin
+                    assert arch in loader.PROGRAMS[order_twin]["arches"]
+                    route.add(order_twin)
+            # The per-K-slice readiness twins of the class's slice points on this
+            # architecture travel with the sequence under their ``_ks<S>`` stage
+            # names: the push twin of each point's launched program family and the
+            # main twin of every width and form a call at a point can resolve to
+            # (each a delivered program of this architecture); a class without a
+            # point carries none.
+            kslice_stages = {
+                stage: program
+                for stage, program in row["programs"].items()
+                if loader._is_kslice_stage(stage)
+            }
+            slice_rows = [
+                row_entry
+                for row_entry in loader.push_kslice_rows(arch)
+                if row_entry[0] == world_size
+            ]
+            assert bool(kslice_stages) is bool(slice_rows)
+            for stage, program in kslice_stages.items():
+                base, _separator, slices = stage.rpartition("_ks")
+                assert int(slices) in {k_slices for _ws, _rows, k_slices in slice_rows}
+                assert arch in loader.PROGRAMS[program]["arches"]
+                if base in ("peer_push", "peer_push_wide"):
+                    assert program == loader.ROUTES[stage]
+                else:
+                    block_n = 128 if base.startswith("main_n128") else 256
+                    if base in ("main", "main_n128"):
+                        form = "cg1"
+                    else:
+                        form = base[len("main_") :]
+                    assert program == loader.main_program(
+                        world_size,
+                        dtype_name,
+                        b_layout,
+                        block_n=block_n,
+                        form=form,
+                        k_slices=int(slices),
+                    )
+                route.add(program)
             assert len(programs) == len(route) and set(programs) == route
     assert set(loader.SEQUENCES) == expected
     with pytest.raises(ValueError, match="host sequence"):
@@ -501,6 +753,20 @@ def test_every_program_is_delivered_for_both_architectures():
             if (world_size, dtype_name, b_layout, form) in _cg2s_classes(arch)
         ), spill
         assert loader.PROGRAMS[spill]["arches"] == ["sm_103a"], spill
+    # A tile-order twin of the one-CTA main is delivered for exactly the
+    # architectures whose point table names its class (the pinned order class:
+    # the ws4 bf16 k_major ``po`` twin on sm_103a alone).
+    assert sorted(_order_programs()) == sorted(
+        {cls for classes in _ORDER_CLASSES.values() for cls in classes}
+    )
+    for world_size, dtype_name, b_layout, form in _order_programs():
+        twin = loader.main_program(world_size, dtype_name, b_layout, form=form)
+        assert loader.PROGRAMS[twin]["arches"] == sorted(
+            arch
+            for arch in loader.ARCH_FLAGS
+            if (world_size, dtype_name, b_layout, form) in _order_classes(arch)
+        ), twin
+        assert loader.PROGRAMS[twin]["arches"] == ["sm_103a"], twin
     sm103_sequence = loader.sequence_name(8, "bfloat16", "n_major", "sm_103a")
     loader.spec.cache_clear()
     try:
@@ -523,7 +789,8 @@ def test_barrier_and_push_programs_use_static_shared_memory_only():
 def test_push_launch_follows_the_per_peer_payload():
     # 128 padded rows x K x 2 B = 2 MiB per peer keep the 32-CTA launch; 512 rows
     # (8 MiB) take the wide launch; the threshold itself is on the wide side. The
-    # eight-rank calls have no launch row on either architecture.
+    # eight-rank calls of these row counts have no launch row on either
+    # architecture (the eight-rank launch row sits at 1024 padded rows, below).
     assert loader.push_payload_bytes(128, 2) == 2 * 1024 * 1024
     assert loader.push_payload_bytes(512, 2) == 8 * 1024 * 1024
     for arch in _BOTH:
@@ -547,16 +814,23 @@ def test_push_launch_follows_the_per_peer_payload():
     assert loader.PUSH_CARVEOUT == -1
 
 
-def test_push_launch_rows_give_the_sm_103a_four_rank_512_row_calls_sixteen_wide_ctas():
+def test_push_launch_rows_give_the_sm_103a_listed_calls_sixteen_wide_ctas():
     """``PUSH_LAUNCH_ROWS_BY_ARCH`` replaces the payload rule for exactly the listed
     (world size, padded rows): on ``sm_103a`` the four-rank calls of exactly 512
-    padded rows launch 16 CTAs per peer of the wide program (the rule's 8 x 8
-    elsewhere); the four-rank 128-row calls keep 32 x 1, every eight-rank call and
-    every ``sm_100a`` call the payload rule. An arch outside the table raises."""
+    padded rows and the eight-rank calls of exactly 1024 padded rows (the SM push
+    band row) launch 16 CTAs per peer of the wide program (the rule's 8 x 8
+    elsewhere); the four-rank 128-row calls keep 32 x 1, every other call of either
+    world size and every ``sm_100a`` call the payload rule. An arch outside the
+    table raises."""
 
-    assert loader.push_launch_rows("sm_103a") == ((4, 512, 16, 8),)
+    assert loader.push_launch_rows("sm_103a") == ((4, 512, 16, 8), (8, 1024, 16, 8))
     assert loader.push_launch_rows("sm_100a") == ()
     assert loader.push_launch(512, 2, world_size=4, arch="sm_103a") == (
+        "peer_push_wide",
+        16,
+        8,
+    )
+    assert loader.push_launch(1024, 2, world_size=8, arch="sm_103a") == (
         "peer_push_wide",
         16,
         8,
@@ -567,12 +841,29 @@ def test_push_launch_rows_give_the_sm_103a_four_rank_512_row_calls_sixteen_wide_
         16,
         8,
     )
+    assert loader.push_launch(1024, 4, world_size=8, arch="sm_103a") == (
+        "peer_push_wide",
+        16,
+        8,
+    )
     assert loader.push_launch(512, 2, world_size=4, arch="sm_100a") == (
         "peer_push_wide",
         8,
         8,
     )
+    assert loader.push_launch(1024, 2, world_size=8, arch="sm_100a") == (
+        "peer_push_wide",
+        8,
+        8,
+    )
+    # Each row is keyed on its own world size: the other world size at the same
+    # row count keeps the payload rule.
     assert loader.push_launch(512, 2, world_size=8, arch="sm_103a") == (
+        "peer_push_wide",
+        8,
+        8,
+    )
+    assert loader.push_launch(1024, 2, world_size=4, arch="sm_103a") == (
         "peer_push_wide",
         8,
         8,
@@ -588,11 +879,126 @@ def test_push_launch_rows_give_the_sm_103a_four_rank_512_row_calls_sixteen_wide_
             8,
             8,
         )
+    for rows in (256, 384, 512, 640, 1152, 2048):
+        assert loader.push_launch(rows, 2, world_size=8, arch="sm_103a") == (
+            "peer_push_wide",
+            8,
+            8,
+        )
     for arch in ("sm_90a", "sm_120a", ""):
         with pytest.raises(ValueError, match="no SM push launch rows"):
             loader.push_launch(512, 2, world_size=4, arch=arch)
         with pytest.raises(ValueError, match="no SM push launch rows"):
             loader.push_launch_rows(arch)
+
+
+def test_push_kslices_table_lists_the_eight_rank_512_row_calls_at_four_slices_on_sm_103a():
+    """``PUSH_KSLICES_BY_ARCH`` (per-K-slice readiness on the SM push chain) lists one
+    row: on ``sm_103a`` the SM-push calls of world size 8 and exactly 512 padded rows
+    publish four readiness words per (peer, chunk) -- the host sequence launches their
+    ``_ks4`` push and main twins -- and every other call on either architecture
+    publishes one; the backend sizes a workspace by the widest call of its capacity
+    (the pitch's chunk count wherever the row is out of reach or narrower) and a
+    captured call clears ``world_size * num_chunks * k_slices`` words. An arch outside
+    the table raises."""
+
+    assert loader.PUSH_KSLICES_BY_ARCH == {"sm_100a": [], "sm_103a": [[8, 512, 4]]}
+    assert loader.push_kslice_rows("sm_103a") == ((8, 512, 4),)
+    assert loader.push_kslice_rows("sm_100a") == ()
+    assert loader.push_kslices(512, world_size=8, arch="sm_103a") == 4
+    assert loader.max_push_kslices(8, "sm_103a") == 4
+    for arch in _BOTH:
+        for world_size in (2, 4, 8):
+            for padded in (128, 256, 384, 512, 640, 1024, 2432, 65536):
+                listed = (arch, world_size, padded) == ("sm_103a", 8, 512)
+                assert loader.push_kslices(
+                    padded, world_size=world_size, arch=arch
+                ) == (4 if listed else 1)
+                chunks = loader.chunk_plan(padded)[2]
+                reached = (arch, world_size) == ("sm_103a", 8) and padded >= 512
+                assert loader.push_signal_slots(
+                    padded, world_size=world_size, arch=arch
+                ) == (max(chunks, 4) if reached else chunks)
+            if (arch, world_size) != ("sm_103a", 8):
+                assert loader.max_push_kslices(world_size, arch) == 1
+        assert backend._readiness_words(4, 512, arch) == 4 * loader.chunk_plan(512)[2]
+        assert (
+            backend._readiness_words(4, 65536, arch) == 4 * loader.chunk_plan(65536)[2]
+        )
+    assert backend._readiness_words(8, 512, "sm_100a") == 8
+    assert backend._readiness_words(8, 512, "sm_103a") == 32
+    for arch in ("sm_90a", "sm_120a", ""):
+        with pytest.raises(ValueError, match="no SM push readiness slice rows"):
+            loader.push_kslices(512, world_size=4, arch=arch)
+        with pytest.raises(ValueError, match="no SM push readiness slice rows"):
+            loader.push_kslice_rows(arch)
+        with pytest.raises(ValueError, match="no SM push readiness slice rows"):
+            loader.max_push_kslices(8, arch)
+        with pytest.raises(ValueError, match="no SM push readiness slice rows"):
+            loader.push_signal_slots(512, world_size=8, arch=arch)
+    with pytest.raises(ValueError, match="pitch must be positive"):
+        loader.push_signal_slots(0, world_size=8, arch="sm_103a")
+
+
+def test_push_signal_slots_size_the_readiness_pad_by_the_widest_call_of_the_capacity():
+    """With the ``sm_103a`` readiness slice row, a workspace is sized by the largest
+    words-per-rank-row count any call up to its pitch publishes: the row's chunk count
+    times its slice count once the pitch can serve the row, the pitch's own chunk count
+    wherever that is larger (a large workspace never grows past the one-word sizing) or
+    the row is out of reach; the other world sizes and the other architecture keep the
+    chunk count. ``_publish_scratch`` refuses a signal pad too small for the widened
+    view and sizes the generation's ticket counters by the same count."""
+
+    slots = loader.push_signal_slots
+    assert loader.max_push_kslices(8, "sm_103a") == 4
+    assert loader.max_push_kslices(4, "sm_103a") == 1
+    assert loader.max_push_kslices(8, "sm_100a") == 1
+    assert slots(128, world_size=8, arch="sm_103a") == 1
+    assert slots(384, world_size=8, arch="sm_103a") == 1
+    for pitch in (512, 640, 2048, 2432, 2560, 7296):
+        assert slots(pitch, world_size=8, arch="sm_103a") == 4, pitch
+    assert loader.chunk_plan(7296)[2] == 3 and loader.chunk_plan(7424)[2] == 4
+    assert slots(7424, world_size=8, arch="sm_103a") == 4
+    assert slots(9856, world_size=8, arch="sm_103a") == 5
+    assert loader.chunk_plan(65536)[2] == 27
+    assert slots(65536, world_size=8, arch="sm_103a") == 27
+    for pitch in (128, 512, 2048, 65536):
+        chunks = loader.chunk_plan(pitch)[2]
+        for world_size in (2, 4):
+            assert slots(pitch, world_size=world_size, arch="sm_103a") == chunks
+        assert slots(pitch, world_size=8, arch="sm_100a") == chunks
+    assert backend._readiness_words(8, 512, "sm_103a") == 32
+    assert backend._readiness_words(8, 512, "sm_100a") == 8
+    assert backend._readiness_words(8, 65536, "sm_103a") == 8 * 27
+    # Publication at 512 rows per peer on eight ranks: 32 words (128 bytes) must fit the pad.
+    call = backend._Call(0, 0, 8, "g", "bfloat16", "sm_103a", 512, 1280, "k_major")
+
+    class _PadHandle(_GrowthHandle):
+        def __init__(self, signal_pad_size):
+            self.signal_pad_size = signal_pad_size
+
+    workspace = _published_workspace(push_buffers=None)
+    workspace.world_size, workspace.arch = 8, "sm_103a"
+    scratch = torch.empty(8, 512, 8, dtype=torch.bfloat16)
+    backend._publish_scratch(workspace, call, 512, scratch, _PadHandle(2048))
+    assert workspace.max_chunks == 1 and workspace.signal_slots == 4
+    assert tuple(workspace.signal_pad.shape) == (32,)
+    workspace = _published_workspace(push_buffers=None)
+    workspace.world_size, workspace.arch = 8, "sm_103a"
+    with pytest.raises(RuntimeError, match="cannot hold 32 readiness words"):
+        backend._publish_scratch(workspace, call, 512, scratch, _PadHandle(64))
+    # The same pitch on the other architecture keeps the one-word view and never reads the pad size.
+    workspace = _published_workspace(push_buffers=None)
+    workspace.world_size = 8
+    backend._publish_scratch(
+        workspace,
+        backend._Call(0, 0, 8, "g", "bfloat16", "sm_100a", 512, 1280, "k_major"),
+        512,
+        scratch,
+        _GrowthHandle(),
+    )
+    assert workspace.max_chunks == 1 and workspace.signal_slots == 1
+    assert tuple(workspace.signal_pad.shape) == (8,)
 
 
 def test_main_programs_share_one_block_and_dynamic_shared_memory_contract():
@@ -877,6 +1283,25 @@ _INVENTORY_ROWS = (
         (125, 2048, 8, "bfloat16", "n_major"),
         _N128,
     ),
+    # The sm_103a-only ws8 512-row readiness-coverage rows: 32 / 64 N256 tiles
+    # (one wave on the twin too) route the two bf16 rows to the twin; the fp16
+    # n_major row (160 tiles, two waves) stays at 256, and its class has no
+    # delivered twin on sm_103a anyway.
+    (
+        "kmajor_ws8_bf16_m512_n256",
+        (512, 256, 8, "bfloat16", "k_major"),
+        {"sm_103a": 128},
+    ),
+    (
+        "tp8_correctness_bf16_m512_n512",
+        (512, 512, 8, "bfloat16", "n_major"),
+        {"sm_103a": 128},
+    ),
+    (
+        "tp8_correctness_fp16_m512_n1280",
+        (512, 1280, 8, "float16", "n_major"),
+        {"sm_103a": 256},
+    ),
     # 320 N256 tiles = three waves: beyond the cap of both architectures.
     (
         "llama_tp8_qkv_bf16_m1024_kmajor",
@@ -1078,7 +1503,11 @@ def test_main_form_routes_the_inventory_rows_by_the_region_table(label, shape, w
     Of the pair rows, the two sm_103a spill points --
     llama_tp4_gate_up_bf16_m512_kmajor and llama_tp8_gate_up_bf16_m512_kmajor --
     run the spill-wave N-split pair twin of the form their point names instead;
-    llama_tp4_qkv_bf16_m1024_kmajor stays on the CTA-pair twin."""
+    llama_tp4_qkv_bf16_m1024_kmajor stays on the CTA-pair twin. Of the one-CTA
+    rows, llama_tp4_gate_up_bf16_m125_kmajor on sm_103a (128 padded rows at
+    N = 14336: the one tile-order point) runs the ``po`` tile-order twin of the
+    one-CTA program; every other row, and that row on sm_100a, runs the
+    one-CTA program itself."""
 
     rows, n, world_size, dtype_name, b_layout = shape
     for arch, block_n in widths.items():
@@ -1103,8 +1532,25 @@ def test_main_form_routes_the_inventory_rows_by_the_region_table(label, shape, w
             for min_rows, max_rows, min_cols, max_cols in rectangles
         )
         point = _spill_point_form(arch, world_size, dtype_name, b_layout, padded, n)
-        expected_form = (point or "cg2") if qualifies and delivered else "cg1"
+        order = loader._tile_order_point(
+            arch, world_size, dtype_name, b_layout, padded, n
+        )
+        order_delivered = (world_size, dtype_name, b_layout, order) in _order_classes(
+            arch
+        )
+        if qualifies and delivered:
+            expected_form = point or "cg2"
+        elif block_n == 256 and order is not None and order_delivered:
+            expected_form = order
+        else:
+            expected_form = "cg1"
         assert form == expected_form, (label, arch)
+        expected_order = (
+            arch == "sm_103a" and label == "llama_tp4_gate_up_bf16_m125_kmajor"
+        )
+        assert (order is not None) is expected_order, (label, arch)
+        assert (form in loader.ORDER_FORMS) is expected_order, (label, arch)
+        assert (form == "po") is expected_order, (label, arch)
         expected_pair = (
             label
             in {
@@ -1204,6 +1650,10 @@ def test_main_form_selects_the_pair_twin_only_inside_a_measured_region_at_the_pu
                 cls = (4, "bfloat16", "k_major")
                 assert _spill_point_form(arch, *cls, 1024, 2560) is None
                 assert _spill_point_form(arch, *cls, 512, 14336) is None
+                # No tile-order point on sm_100a: the 1..128-row gate_up calls
+                # keep the one-CTA program (asserted below with rows 1 / 128).
+                assert loader._tile_order_point(arch, *cls, 128, 14336) is None
+                assert rule(128, n=14336) == "cg1"
                 assert [
                     rule(rows)
                     for rows in (897, 1000, 1024, 1025, 1100, 1152, 1921, 2048)
@@ -1335,11 +1785,22 @@ def test_main_form_selects_the_pair_twin_only_inside_a_measured_region_at_the_pu
             assert [rule(rows, n=14336) for rows in gate_rows] == [p_gate] * 4
             assert [
                 rule(rows, n=14336)
-                for rows in (1, 513, 640, 1024, 1536, 1921, 2048, 2049, 4096)
-            ] == ["cg1"] * 9
+                for rows in (129, 256, 513, 640, 1024, 1536, 1921, 2048, 2049, 4096)
+            ] == ["cg1"] * 10
             assert rule(512, n=14080) == "cg1" and rule(512, n=14592) == "cg1"
             assert rule(2048, n=14080) == "cg1" and rule(2048, n=14592) == "cg1"
             assert rule(512, n=14336, block_n=128) == "cg1"
+            # The tile-order point (llama_tp4_gate_up m125): exactly 128 padded rows
+            # at exactly N = 14336 run the ``po`` tile-order twin of the one-CTA
+            # program (1..128 pad onto it; 129 pads to 256 and leaves); the
+            # neighbouring column multiples and the 128-wide call stay cg1.
+            p_order = loader._tile_order_point(
+                arch, 4, "bfloat16", "k_major", 128, 14336
+            )
+            assert p_order == "po" and p_order in loader.ORDER_FORMS
+            assert [rule(rows, n=14336) for rows in (1, 125, 128)] == ["po"] * 3
+            assert rule(128, n=14080) == "cg1" and rule(128, n=14592) == "cg1"
+            assert rule(125, n=14336, block_n=128) == "cg1"
             for cols in (14335, 14337):
                 with pytest.raises(ValueError, match="multiple of 256"):
                     rule(512, n=cols)
@@ -1406,8 +1867,9 @@ def test_n128_classes_are_exactly_the_classes_of_the_routed_inventory_rows():
             if widths.get(arch) == 128
         }
         assert _n128_classes(arch) == routed, arch
-    # Eight routed rows define five classes on sm_100a; the three one-wave rows
-    # define three on sm_103a (a subset of the sm_100a classes).
+    # Eight routed rows define five classes on sm_100a; the five one-wave rows
+    # (three M=125 rows, two ws8 512-row coverage rows) define three on sm_103a
+    # (a subset of the sm_100a classes).
     assert len(_n128_classes("sm_100a")) == 5
     assert len(_n128_classes("sm_103a")) == 3
     assert _n128_classes("sm_103a") < _n128_classes("sm_100a")
@@ -1618,9 +2080,16 @@ def test_sm_push_bands_route_the_sm_103a_eight_rank_1024_row_calls_up_to_n_1619(
     assert (
         loader.uses_sm_push(rows=1025, world_size=8, cols=1280, arch="sm_103a") is False
     )
-    # The band row's per-peer payload (1024 x 8192 x 2 B = 16 MiB) selects the wide push launch.
+    # The band row's per-peer payload (1024 x 8192 x 2 B = 16 MiB) selects the wide
+    # push program; on sm_103a its launch row raises the CTAs per peer from the
+    # rule's 8 to 16, on sm_100a (no row, no band) the pure rule keeps 8 x 8.
     assert loader.push_payload_bytes(1024, 2) == 16 * 1024 * 1024
     assert loader.push_launch(1024, 2, world_size=8, arch="sm_103a") == (
+        "peer_push_wide",
+        16,
+        loader.PUSH_WIDE_UNROLL,
+    )
+    assert loader.push_launch(1024, 2, world_size=8, arch="sm_100a") == (
         "peer_push_wide",
         loader.PUSH_WIDE_CTAS_PER_PEER,
         loader.PUSH_WIDE_UNROLL,
@@ -1905,7 +2374,12 @@ def test_captured_call_clears_only_its_readiness_words_with_a_stream_memset(
     )
     pad = torch.zeros(4 * 8, dtype=torch.uint32)
     workspace = backend._Workspace(
-        dtype=torch.bfloat16, rank=0, world_size=4, device_index=0, signal_pad=pad
+        dtype=torch.bfloat16,
+        rank=0,
+        world_size=4,
+        device_index=0,
+        arch="sm_100a",
+        signal_pad=pad,
     )
     backend._clear_readiness(workspace, 4 * 3)
     assert calls == [(pad, 0, 0, 12)]
@@ -1927,7 +2401,7 @@ def test_workspace_materializes_the_sm_push_tables_at_prepare_time():
     and only when that route is reachable for the prepared group."""
 
     workspace = backend._Workspace(
-        dtype=torch.bfloat16, rank=1, world_size=4, device_index=0
+        dtype=torch.bfloat16, rank=1, world_size=4, device_index=0, arch="sm_100a"
     )
     resolved = []
     workspace.push_tables = lambda: resolved.append(True)
@@ -1979,6 +2453,7 @@ def _published_workspace(push_buffers):
         rank=0,
         world_size=2,
         device_index=0,
+        arch="sm_100a",
     )
     workspace.pitch = 512
     workspace.scratch = torch.empty(2, 512, 8, dtype=torch.bfloat16)
@@ -2169,7 +2644,12 @@ def test_prepared_launcher_serves_every_row_count_up_to_its_capacity(monkeypatch
     call = backend._validate(sample, weight, _fake_group(8, 3))
     state = backend._LaunchState(rank=3, world_size=8)
     workspace = backend._Workspace(
-        dtype=torch.bfloat16, rank=3, world_size=8, device_index=0, pitch=2048
+        dtype=torch.bfloat16,
+        rank=3,
+        world_size=8,
+        device_index=0,
+        arch="sm_103a",
+        pitch=2048,
     )
     group = _fake_group(8, 3)
     launcher = backend._PreparedLauncher(
@@ -2205,7 +2685,12 @@ def test_prepared_launcher_serves_every_row_count_up_to_its_capacity(monkeypatch
 def test_launch_refuses_a_workspace_smaller_than_the_padded_rows():
     state = backend._LaunchState(rank=0, world_size=2)
     workspace = backend._Workspace(
-        dtype=torch.bfloat16, rank=0, world_size=2, device_index=0, pitch=128
+        dtype=torch.bfloat16,
+        rank=0,
+        world_size=2,
+        device_index=0,
+        arch="sm_100a",
+        pitch=128,
     )
     call = backend._Call(0, 0, 2, "g", "bfloat16", "sm_100a", 129, 2048, "n_major")
     with pytest.raises(
@@ -2280,6 +2765,7 @@ def _launch_fixture(
         rank=1,
         world_size=world_size,
         device_index=0,
+        arch=arch,
         pitch=max(2048, backend.loader.padded_rows(rows)),
     )
     # The launch reads the device facts once (the SM count bounds the grid);
@@ -2413,6 +2899,23 @@ _GATE_WS4_CODE = _pinned_spill_code(4, "bfloat16", "k_major", 512, 14336)
 _GATE_WS8_CODE = _pinned_spill_code(8, "bfloat16", "k_major", 512, 7168)
 
 
+def _pinned_order_code(world_size, dtype_name, b_layout, padded, n):
+    """Host-sequence form code of the pinned sm_103a tile-order point naming the
+    class, padded rows and ``n`` (``_TILE_ORDER_POINTS``): the launch rows below
+    follow the pinned table when a point's form changes."""
+
+    [form] = [
+        entry[5]
+        for entry in _TILE_ORDER_POINTS["sm_103a"]
+        if tuple(entry[:5]) == (world_size, dtype_name, b_layout, padded, n)
+    ]
+    return loader.main_form_code(form)
+
+
+# The sm_103a tile-order point: the ws4 gate_up M=125 row (128 padded rows).
+_ORDER_WS4_CODE = _pinned_order_code(4, "bfloat16", "k_major", 128, 14336)
+
+
 @pytest.mark.parametrize(
     (
         "rows",
@@ -2461,6 +2964,14 @@ _GATE_WS8_CODE = _pinned_spill_code(8, "bfloat16", "k_major", 512, 7168)
         (512, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, _GATE_WS4_CODE),
         (2048, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
         (500, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, _GATE_WS4_CODE),
+        # The sm_103a tile-order point: ws4 bf16 k_major at exactly 128 padded rows
+        # and N = 14336 (125 pads to 128; 129 pads to 256 and leaves) selects the
+        # ``po`` tile-order twin of the one-CTA program (form code 4) on the
+        # copy-engine route with the one-CTA grid; sm_100a has no point.
+        (125, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, _ORDER_WS4_CODE),
+        (128, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, _ORDER_WS4_CODE),
+        (129, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
+        (125, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
         (512, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, _GATE_WS8_CODE),
         (2048, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
         (513, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
@@ -2540,8 +3051,10 @@ def test_launch_passes_the_loader_tile_width_and_form_after_grid_z_on_both_route
     measured pair region of its class on that architecture, whose class
     delivers the CTA-pair twin there; the point's form code -- 2 for the
     four-tile split, 3 for the two-tile split -- when the call also names a
-    delivered spill-wave N-split point of its class; 0 otherwise) positionally
-    after ``grid_z``, with the grid of that width and form."""
+    delivered spill-wave N-split point of its class; 4 / 5 for an N256 call the
+    pair rule leaves on the one-CTA program that names a delivered tile-order
+    point of its class; 0 otherwise) positionally after ``grid_z``, with the
+    grid of that width and form."""
 
     call, state, workspace, sequence = _launch_fixture(
         monkeypatch,
@@ -2563,8 +3076,12 @@ def test_launch_passes_the_loader_tile_width_and_form_after_grid_z_on_both_route
         rows, n, world_size=world_size, sm_count=148, block_n=block_n, form=form
     )
     assert args[grid_z - 2 : grid_z + 1] == grid
-    if form_code:
+    if form in backend.loader.PAIR_FORMS:
         assert grid[0] % 2 == 0
+    if form in backend.loader.ORDER_FORMS:
+        assert grid == backend.loader.main_grid(
+            rows, n, world_size=world_size, sm_count=148
+        )
     assert args[grid_z + 1 :] == (block_n, form_code, 4242, 77)
     assert block_n == backend.loader.main_block_n(
         rows,
@@ -2586,18 +3103,21 @@ def test_launch_passes_the_loader_tile_width_and_form_after_grid_z_on_both_route
 
 
 @pytest.mark.parametrize(
-    "rows, n, world_size, arch, entry, target_index",
+    "rows, n, world_size, arch, entry, target_index, k_slices",
     [
-        (1025, 2048, 4, "sm_100a", "run", 12),
-        (512, 1280, 8, "sm_103a", "run_push", 13),
+        (1025, 2048, 4, "sm_100a", "run", 12, 1),
+        (512, 1280, 8, "sm_103a", "run_push", 13, 4),
     ],
 )
 def test_captured_launch_publishes_the_sentinel_and_clears_its_words_on_both_routes(
-    monkeypatch, rows, n, world_size, arch, entry, target_index
+    monkeypatch, rows, n, world_size, arch, entry, target_index, k_slices
 ):
     """Under capture both routes pass the sentinel as ``ready_target``, leave the
     eager epoch untouched, skip ``record_stream`` and clear exactly the
-    ``world_size * num_chunks`` words the peers wrote, after the sequence."""
+    ``world_size * num_chunks * k_slices`` words the peers wrote (the readiness
+    slice table's count of the SM push call -- four words per (peer, chunk) on
+    the eight-rank 512-row call of ``sm_103a`` -- and one word per (peer, chunk)
+    off the table), after the sequence."""
 
     call, state, workspace, sequence = _launch_fixture(
         monkeypatch, rows=rows, n=n, world_size=world_size, arch=arch
@@ -2614,7 +3134,13 @@ def test_captured_launch_publishes_the_sentinel_and_clears_its_words_on_both_rou
     assert args[target_index] == backend._CAPTURE_READY_TARGET
     assert state.ready_epoch == 0
     assert inp.streams == []
-    assert cleared == [(workspace, world_size * backend.loader.chunk_plan(rows)[2])]
+    assert (
+        loader.push_kslices(loader.padded_rows(rows), world_size=world_size, arch=arch)
+        == k_slices
+    )
+    assert cleared == [
+        (workspace, world_size * backend.loader.chunk_plan(rows)[2] * k_slices)
+    ]
     assert state.next_phase == 1 and state.poisoned is False
     assert workspace.captured is True
 

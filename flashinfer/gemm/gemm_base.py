@@ -9222,9 +9222,11 @@ def _heuristic_func_mm_fp4(
       - On SM103 (B300) - use cutlass (faster based on benchmarks).
       - On SM100 (B200) - use cudnn (faster based on benchmarks).
 
-    A per-token alpha overrides all of the above: only the CuTe-DSL SM100 kernel
-    has a per-row alpha epilogue, and any other backend would apply alpha[0] to
-    every row.
+    A per-token alpha overrides all of the above: of the automatically selected
+    backends only the CuTe-DSL SM100 kernel has a per-row alpha epilogue, and any
+    other backend would apply alpha[0] to every row.  The experimental ``cake``
+    backend has one too, but it is explicit opt-in only (``backend="cake"``) and
+    never auto-selected.
     """
     if _is_per_token_alpha(alpha):
         return [c for c in ("cute-dsl",) if c in suitable_backends]

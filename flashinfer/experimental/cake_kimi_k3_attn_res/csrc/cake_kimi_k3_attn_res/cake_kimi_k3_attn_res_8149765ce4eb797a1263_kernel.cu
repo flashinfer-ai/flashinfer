@@ -1166,6 +1166,10 @@ kernel_cake_kimi_k3_attn_res_8149765ce4eb797a1263(__nv_bfloat16* __restrict__ ou
                     }
                 }
             }
+#if __CUDA_ARCH__ == 1000
+            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+#endif
             asm volatile("barrier.sync 9, 288;" ::: "memory");
 #if __CUDA_ARCH__ == 1000
             if (consumer_warp == 0) {

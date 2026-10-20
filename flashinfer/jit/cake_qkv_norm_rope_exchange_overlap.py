@@ -24,9 +24,10 @@ logical stage keys to programs: ``barrier_p0``, ``barrier_p1`` and ``wait`` on
 every architecture, ``producer_bn<bn>[_pair][_<variant>]`` for the producer of
 a tile width (``_pair``: the 2-CTA pair tile; ``<variant>``: a producer build
 other than the baseline -- ``ow256`` wide operand loads, ``bulk_ow256`` wide
-operand loads with bulk row stores -- the baseline build has no suffix), and
--- where the architecture's default launch path folds the cross-rank
-rendezvous into the producer (``FOLD_BARRIER_DEFAULT_BY_ARCH``) --
+operand loads with bulk row stores, ``bulk`` bulk row stores alone -- the
+baseline build has no suffix), and -- where the architecture's default launch
+path folds the cross-rank rendezvous into the producer
+(``FOLD_BARRIER_DEFAULT_BY_ARCH``) --
 ``producer_bn<bn>[_pair][_<variant>]_fold<phase>`` for the producer builds that
 run the barrier of mailbox phase ``phase`` in a rendezvous warp (one extra warp
 per CTA on SM100 / SM103, the otherwise idle TMA warp on SM90).  The default
@@ -707,6 +708,43 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "cluster": [2, 1, 1],
         "dynamic_smem_bytes": 232448,
     },
+    "cake_qkv_norm_rope_exchange_overlap_69efd34074e608023116": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_69efd34074e608023116_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_69efd34074e608023116_binding.cu",
+        ],
+        "arches": ["sm_107a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [192, 1, 1],
+        "cluster": [2, 1, 1],
+        "dynamic_smem_bytes": 232448,
+    },
     "cake_qkv_norm_rope_exchange_overlap_6cea4b1cead955382caa": {
         "sources": [
             "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_6cea4b1cead955382caa_kernel.cu",
@@ -821,6 +859,46 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "grid_z",
         ],
         "block": [192, 1, 1],
+        "cluster": [2, 1, 1],
+        "dynamic_smem_bytes": 232448,
+    },
+    "cake_qkv_norm_rope_exchange_overlap_85994b80021f37783cfb": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_85994b80021f37783cfb_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_85994b80021f37783cfb_binding.cu",
+        ],
+        "arches": ["sm_107a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [224, 1, 1],
         "cluster": [2, 1, 1],
         "dynamic_smem_bytes": 232448,
     },
@@ -1466,6 +1544,46 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "cluster": [2, 1, 1],
         "dynamic_smem_bytes": 232448,
     },
+    "cake_qkv_norm_rope_exchange_overlap_f3ef71043fa04f37683f": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_f3ef71043fa04f37683f_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_f3ef71043fa04f37683f_binding.cu",
+        ],
+        "arches": ["sm_107a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [224, 1, 1],
+        "cluster": [2, 1, 1],
+        "dynamic_smem_bytes": 232448,
+    },
     "cake_qkv_norm_rope_exchange_overlap_f680859b58db85fe3dac": {
         "sources": [
             "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_f680859b58db85fe3dac_kernel.cu",
@@ -1652,6 +1770,9 @@ ROUTES: dict[str, dict[str, str]] = {
         "barrier_p0": "cake_qkv_norm_rope_exchange_overlap_ee7af16c3fae716e45d2",
         "barrier_p1": "cake_qkv_norm_rope_exchange_overlap_b7fcf611d8f7bdc09ca2",
         "producer_bn256_pair": "cake_qkv_norm_rope_exchange_overlap_27a9e2ff563af5644d27",
+        "producer_bn256_pair_bulk": "cake_qkv_norm_rope_exchange_overlap_69efd34074e608023116",
+        "producer_bn256_pair_bulk_fold0": "cake_qkv_norm_rope_exchange_overlap_85994b80021f37783cfb",
+        "producer_bn256_pair_bulk_fold1": "cake_qkv_norm_rope_exchange_overlap_f3ef71043fa04f37683f",
         "producer_bn256_pair_fold0": "cake_qkv_norm_rope_exchange_overlap_f86aebd1e176ce36e6d2",
         "producer_bn256_pair_fold1": "cake_qkv_norm_rope_exchange_overlap_6cea4b1cead955382caa",
         "wait": "cake_qkv_norm_rope_exchange_overlap_b1d866d329f2f38fa312",
@@ -1663,19 +1784,20 @@ PRODUCER_VARIANT_DEFAULT_BY_ARCH_WORLD: dict[str, dict[int, str]] = {
     "sm_90a": {2: "", 4: "", 8: ""},
     "sm_100a": {2: "", 4: "ow256", 8: "bulk_ow256"},
     "sm_103a": {2: "", 4: "ow256", 8: "ow256"},
-    "sm_107a": {2: "", 4: "", 8: ""},
+    "sm_107a": {2: "", 4: "bulk", 8: ""},
 }
 
-# Producer builds a route table may carry, in the symbol order of the generated programs: the baseline build
-# (``SHIPPED_VARIANT``), wide (256-bit) operand loads, and wide operand loads with bulk row stores.  Every build
-# stores identical bits; the wide-load builds read their ``cos_sin`` / norm-weight operands through 32-byte
+# Producer builds a route table may carry: the baseline build (``SHIPPED_VARIANT``) first, then wide (256-bit) operand
+# loads, wide operand loads with bulk row stores, and bulk row stores alone (the baseline operand loads).  Every
+# build stores identical bits; the wide-load builds read their ``cos_sin`` / norm-weight operands through 32-byte
 # aligned bases (``PRODUCER_VARIANT_OPERAND_LOAD_WIDTH``; the Cake backend checks the alignment).
-PRODUCER_VARIANTS: tuple[str, ...] = ("", "ow256", "bulk_ow256")
+PRODUCER_VARIANTS: tuple[str, ...] = ("", "ow256", "bulk_ow256", "bulk")
 SHIPPED_VARIANT = ""
 PRODUCER_VARIANT_OPERAND_LOAD_WIDTH: dict[str, int] = {
     "": 128,
     "ow256": 256,
     "bulk_ow256": 256,
+    "bulk": 128,
 }
 
 SOURCE_PACKAGE = "cake_qkv_norm_rope_exchange_overlap"

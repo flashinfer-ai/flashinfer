@@ -114,7 +114,6 @@ from .utils import (
 
 if TYPE_CHECKING:
     from flashinfer.fused_moe.da_config import TrtllmDaConfig
-    from flashinfer.jit.cake_stepfun_moe import CakeStepFunTarget
 
 
 # RoutingInputMode (the FusedMoE launcher's routing-input ABI enum) lives in
@@ -1811,26 +1810,6 @@ def get_trtllm_moe_sm100_module():
 def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
     return _build_trtllm_moe_namespace(
         gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=enable_rubin)
-    )
-
-
-@functools.cache
-def get_cake_stepfun_moe_module(
-    target: "CakeStepFunTarget", full_path: bool | None = None
-):
-    """Load the Cake StepFun fused-MoE module for an exact ``sm_100a``/``sm_103a`` target.
-
-    The module exports the trtllm-gen fused-MoE operations with the GEMM1 stage
-    served by the exported Cake StepFun FC1 kernels and, on the full path (see
-    :func:`flashinfer.jit.cake_stepfun_moe.resolve_cake_stepfun_full_path`), the
-    routing, GEMM2, requantization and finalize stages by Cake kernels as well.
-    The returned namespace is the one :func:`get_trtllm_moe_sm100_module` returns
-    for the public module.
-    """
-    from ..jit.cake_stepfun_moe import gen_cake_stepfun_fused_moe_module
-
-    return _build_trtllm_moe_namespace(
-        gen_cake_stepfun_fused_moe_module(target, full_path)
     )
 
 
