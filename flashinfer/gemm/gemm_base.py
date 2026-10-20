@@ -7106,17 +7106,22 @@ def _cute_dsl_mxfp8_runners(
     # tactics only for the M it serves.
     if not warp.supports_inputs(inputs, check_m=False):
         return [_cute_dsl_gemm_mxfp8_runner(sm_major, sm_minor, enable_pdl, out_dtype)]
-    tcgen05 = _cute_dsl_gemm_mxfp8_runner(
+    cluster_splitk = _cute_dsl_gemm_mxfp8_runner(
         sm_major,
         sm_minor,
         enable_pdl,
         out_dtype,
         warp_splitk_supports=warp.supports_inputs,
     )
-    m, k = inputs[0].shape
-    if warp.supports_inputs(inputs) and (m <= 8 or k <= 2048):
-        return [warp, tcgen05]
-    return [tcgen05, warp]
+    a, b = inputs[0], inputs[1]
+    # Untuned, warp split-K runs first only while its 16-wide output tiles fit in
+    # one wave. On wider N the cluster split-K default is faster in back-to-back
+    # PDL calls, where its prologue overlaps the previous kernel (#6839).
+    if warp.supports_inputs(inputs) and b.shape[1] // 16 <= get_device_sm_count(
+        a.device
+    ):
+        return [warp, cluster_splitk]
+    return [cluster_splitk, warp]
 
 
 def _cute_dsl_mxfp8_runners_sm107(
