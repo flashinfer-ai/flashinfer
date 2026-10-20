@@ -7,10 +7,15 @@ NVFP4 supports four or eight ranks; MXFP4 supports power-of-two rank counts up t
 
 Usage::
 
+    # Once, at load time. Inputs are already in the format described in
+    # flashinfer.megamoe.weights: Marlin byte order, scales within the decoder
+    # range, and the excess moved into per-expert FP32 global scales g1 / g2.
+    w1, w2 = transform_nvfp4_weights_for_mega_moe((w13, w13_sf), (w2_raw, w2_sf))
     buf = MegaMoESymmBuffer(group, num_experts=256, num_max_tokens_per_rank=8448,
                             num_topk=6, hidden=4096, intermediate_hidden=2048)
+    # Every step: stage FP8 activations and routing, then run.
     buf.stage(x_fp8, x_sf, topk_idx, topk_weights)
-    nvfp4_mega_moe(y, l1_weights, l2_weights, buf)
+    nvfp4_mega_moe(y, w1, w2, buf, l1_global_scales=g1, l2_global_scales=g2)
 """
 
 import dataclasses
