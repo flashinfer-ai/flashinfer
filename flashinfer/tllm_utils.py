@@ -1,11 +1,35 @@
 import functools
 
+from .jit.core import logger
 from .jit.tllm_utils import gen_trtllm_utils_module
 
 
 @functools.cache
+def _load_trtllm_utils_module():
+    # The autotuner calls delay_kernel() for every tactic and only logs
+    # per-tactic failures at DEBUG. functools.cache does not cache exceptions
+    # and JitSpec.build() reruns ninja, so remember a failed build instead of
+    # rebuilding it for every tactic, and report it once.
+    try:
+        return gen_trtllm_utils_module().build_and_load(), None
+    except Exception as e:
+        logger.warning(
+            "Failed to build JIT module trtllm_utils; delay_kernel() will raise "
+            "for the rest of this process and autotuning skips the tactics "
+            "that need it. %s: %s",
+            type(e).__name__,
+            e,
+        )
+        return None, e
+
+
 def get_trtllm_utils_module():
-    return gen_trtllm_utils_module().build_and_load()
+    module, error = _load_trtllm_utils_module()
+    if error is not None:
+        raise RuntimeError(
+            "JIT module trtllm_utils failed to build earlier in this process"
+        ) from error
+    return module
 
 
 def delay_kernel(stream_delay_micro_secs: int):
