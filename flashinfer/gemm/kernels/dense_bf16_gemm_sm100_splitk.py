@@ -197,7 +197,103 @@ def autotune_tactics(
                         min(max_stages, stage_limit) + 1,
                     )
                 )
-    return tactics
+    if not tactics:
+        return tactics
+    default = default_tactic(m, n, k)
+    return [
+        t
+        for t in tactics
+        if t == default or _keep_autotune_tactic(t, default, tactics, m, n, k)
+    ]
+
+
+@functools.cache
+def _max_active_clusters(device_index: int, split_k: int) -> int:
+    with _torch.cuda.device(device_index):
+        return utils.HardwareInfo().get_max_active_clusters(split_k)
+
+
+# Weight bytes the ring should keep in flight per CTA (9 stages of a 64-row
+# tile): with M <= 32 the weight stream is what the pipeline has to cover.
+_WEIGHT_BYTES_IN_FLIGHT = 9 * 64 * _CTA_K * 2
+
+
+def _keep_autotune_tactic(t, default, tactics, m, n, k) -> bool:
+    """Keep the tactics that can beat the default; see the rules below.
+
+    A cold-L2 CUPTI sweep of every tactic (B200 and B300, M=1..32,
+    N=128..8192, K=768..40960) kept the best tactic within 2.1% while
+    profiling about 8% of the space.  Winners fill one co-resident wave
+    (clusters must fit their GPC) and keep ~144 KB of weights in flight.
+    """
+    device = _torch.cuda.current_device()
+    sm_count = _torch.cuda.get_device_properties(device).multi_processor_count
+
+    def tiles(x):
+        return (m + x.mma_n - 1) // x.mma_n
+
+    def grid(x):
+        return (n + x.mma_m - 1) // x.mma_m * tiles(x) * x.split_k
+
+    def fits(x):
+        capacity = (
+            sm_count if x.split_k == 1 else _max_active_clusters(device, x.split_k)
+        )
+        return grid(x) // x.split_k <= capacity
+
+    def unpadded(x):
+        # A narrower mma_n covering M with as many token tiles is pure padding.
+        return not any(
+            w < x.mma_n and (m + w - 1) // w == tiles(x) for w in _SUPPORTED_MMA_N
+        )
+
+    if not unpadded(t):
+        return False
+    cands = [x for x in tactics if unpadded(x)]
+    # mma_m=128 halves the CTAs; it only won on long, wide shapes where the
+    # 64-row tile at the same (mma_n, split_k) cannot fit one wave.
+    if t.mma_m == 128 and (
+        n < 2048
+        or k < 2048
+        or any(
+            x.mma_m == 64 and (x.mma_n, x.split_k) == (t.mma_n, t.split_k) and fits(x)
+            for x in cands
+        )
+    ):
+        return False
+
+    def fullest(mma_n):
+        return max((grid(x) for x in cands if x.mma_n == mma_n and fits(x)), default=0)
+
+    # A coarser mma_n saves a weight pass but halves the CTAs; keep it only
+    # when its fullest one-wave grid still occupies >= 40% of the SMs.
+    if t.mma_n > min(x.mma_n for x in cands) and fullest(t.mma_n) < 0.4 * sm_count:
+        return False
+    # Grid fill per mma_n: one-wave grids within 0.75x of the fullest; split 1
+    # (no DSMEM reduction) down to 0.5x, and any split when the fullest grid
+    # leaves each CTA <= 2 K blocks.  Without a one-wave grid keep the smallest.
+    same_n = [x for x in cands if x.mma_n == t.mma_n]
+    fitting = [x for x in same_n if fits(x)]
+    if not fitting:
+        if grid(t) != min(grid(x) for x in same_n):
+            return False
+    else:
+        best = max(grid(x) for x in fitting)
+        split = min(x.split_k for x in fitting if grid(x) == best)
+        alpha = 0.5 if k // _CTA_K // split <= 2 else 0.75
+        if not fits(t) or not (
+            grid(t) >= alpha * best or (t.split_k == 1 and 2 * grid(t) >= best)
+        ):
+            return False
+    # ab_stages: the shallowest window stage reaching the in-flight target, else
+    # the deepest stage the window allows.
+    window = sorted(
+        x.ab_stages
+        for x in tactics
+        if x.mma_m == t.mma_m and (x.mma_n, x.split_k) == (t.mma_n, t.split_k)
+    )
+    deep = [s for s in window if t.mma_m * _CTA_K * 2 * s >= _WEIGHT_BYTES_IN_FLIGHT]
+    return t.ab_stages == (deep[0] if deep else window[-1])
 
 
 def default_tactic(m: int, n: int, k: int) -> SplitKTactic:

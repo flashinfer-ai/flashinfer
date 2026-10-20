@@ -741,7 +741,8 @@ def mm_bf16(
         cluster Split-K otherwise. With autotuning, one call profiles the
         available low-M kernels on their supported buckets and a single
         cuBLASLt fallback runner on each M > 32 bucket, so a single large-M
-        warm-up tunes both ranges; with bias the direct kernel is excluded.
+        warm-up tunes both ranges; the direct kernel is profiled only for
+        M <= 2 or M * N <= 4096, and never with bias.
         Direct and warp Split-K reuse compiled kernels across M for matching
         tactics, while each M bucket still tunes independently.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
@@ -2421,6 +2422,7 @@ def _cute_dsl_direct_bf16_gemm_runner(
         DirectTactic,
         autotune_tactics,
         default_tactic,
+        is_direct_bf16_gemm_candidate_sm100,
         run_direct_dense,
         validate_tactic,
     )
@@ -2429,6 +2431,11 @@ def _cute_dsl_direct_bf16_gemm_runner(
         def supports_inputs(self, inputs: List[torch.Tensor]) -> bool:
             a, b, bias, *_ = inputs
             if bias is not None:  # the Direct kernel has no bias epilogue
+                return False
+            # Outside this M x N region warp / cluster Split-K matched or beat
+            # direct (cold-L2 B200/B300 sweep), so its tactics would only add
+            # autotune compiles.
+            if not is_direct_bf16_gemm_candidate_sm100(a.shape[0], b.shape[1]):
                 return False
             try:
                 default_tactic(a.shape[0], b.shape[1], a.shape[1])

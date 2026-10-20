@@ -413,7 +413,117 @@ def autotune_tactics(m: int, n: int, k: int) -> list[WarpSplitKTactic]:
                         )
                     )
     default = default_tactic(m, n, k)
-    return [default, *(tactic for tactic in tactics if tactic != default)]
+    sm_count = _torch.cuda.get_device_properties(
+        _torch.cuda.current_device()
+    ).multi_processor_count
+    return [
+        default,
+        *(
+            tactic
+            for tactic in tactics
+            if tactic != default
+            and _keep_autotune_tactic(tactic, default, tactics, m, n, k, sm_count)
+        ),
+    ]
+
+
+# Below ~96 KB of A + B in flight per SM a cold read is latency-bound (see
+# _MAX_STAGES); a shallower ring is only worth profiling above it.
+_MIN_BYTES_IN_FLIGHT = 96 * 1024
+
+
+def _resident_ring(output_tile, token_tile, k_tile, stages, ctas_per_sm):
+    """Deepest legal ring that lets ``ctas_per_sm`` CTAs co-reside on one SM."""
+    fit = [
+        s
+        for s in stages
+        if ctas_per_sm
+        * (
+            _smem_bytes(WarpSplitKTactic(output_tile, token_tile, k_tile, s, 1))
+            + _CTA_RESERVED_SMEM
+        )
+        <= _SM_SMEM_BYTES
+    ]
+    return max(fit) if fit else min(stages)
+
+
+def _keep_autotune_tactic(t, default, tactics, m, n, k, sm_count) -> bool:
+    """Keep the tactics that can beat the default; see the rules below.
+
+    A cold-L2 CUPTI sweep of every legal tactic (B200 and B300, M=1..32,
+    N=128..8192, K=768..8192) kept the best tactic within 2.6% while profiling
+    about 4% of the space.  The rules follow from the kernel being bound by the
+    weight stream: what matters is how many CTAs co-reside (wave fill) and how
+    many bytes each SM keeps in flight.
+    """
+    ctas = (n // t.output_tile) * ((m + t.token_tile - 1) // t.token_tile)
+    default_ctas = (n // default.output_tile) * (
+        (m + default.token_tile - 1) // default.token_tile
+    )
+    same_grid = ctas == default_ctas
+    # Token tile: the default or one step finer.  A coarser tile re-streams
+    # fewer weights but halves the CTAs; it only won on tiny short-K grids.
+    if not default.token_tile // 2 <= t.token_tile <= 2 * default.token_tile:
+        return False
+    if t.token_tile > default.token_tile and not (
+        t.token_tile <= 16 and n // 16 <= 16 and k <= 2048
+    ):
+        return False
+
+    # Output tile: the default, or the other width when both deal the same work
+    # per SM wave (a tie the default breaks blindly), on a tiny short-K grid,
+    # or when it keeps the default CTA count.
+    def wave_work(tile):
+        return (n // tile + sm_count - 1) // sm_count * tile
+
+    if t.output_tile != default.output_tile:
+        if not (
+            (n % 32 == 0 and wave_work(16) == wave_work(32) and t.token_tile <= 16)
+            or (n // 16 <= 16 and k <= 1024)
+            or same_grid
+        ):
+            return False
+        if t.token_tile != default.token_tile and not same_grid:
+            return False
+
+    def legal(k_tile):
+        return [
+            x.stages
+            for x in tactics
+            if (x.output_tile, x.token_tile, x.k_tile, x.b_loader_warps)
+            == (t.output_tile, t.token_tile, k_tile, t.b_loader_warps)
+        ]
+
+    waves = (ctas + sm_count - 1) // sm_count
+    stages = legal(t.k_tile)
+    ring = _resident_ring(t.output_tile, t.token_tile, t.k_tile, stages, waves)
+    # 128-wide K tiles only when their co-resident ring holds at least as many
+    # K elements as the 256-wide one (fewer barriers otherwise win).
+    stages_256 = legal(256)
+    if t.k_tile == 128 and stages_256:
+        ring_256 = _resident_ring(t.output_tile, t.token_tile, 256, stages_256, waves)
+        if 128 * ring < 256 * ring_256:
+            return False
+    # Two B-loader warps only matter while one CTA per SM must keep a deep ring
+    # full; on >= 2-wave grids keep default_tactic()'s choice.
+    if ctas >= 2 * sm_count and t.b_loader_warps != (
+        2 if t.token_tile >= 16 or k // t.k_tile >= 8 else 1
+    ):
+        return False
+    # Stages: the deepest ring that keeps the grid in one wave, and on a
+    # half-filled default-token-tile grid one ring shallower (one more CTA per
+    # SM) if it still keeps enough bytes in flight.
+    if t.stages == ring:
+        return t.b_loader_warps == 1 or t.output_tile == default.output_tile
+    shallower = _resident_ring(t.output_tile, t.token_tile, t.k_tile, stages, waves + 1)
+    return (
+        t.stages == shallower
+        and t.token_tile == default.token_tile
+        and 2 * ctas >= waves * sm_count
+        and waves * shallower * (t.output_tile + t.token_tile) * t.k_tile * 2
+        >= _MIN_BYTES_IN_FLIGHT
+        and t.b_loader_warps == 1
+    )
 
 
 def _make_smem_layout(dtype, rows: int, cols: int, stages: int):
