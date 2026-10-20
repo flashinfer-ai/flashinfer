@@ -101,6 +101,15 @@ def _worker(rank, args):
     )
     gs1 = torch.linspace(0.73, 1.37, epr, device="cuda")
     gs2 = torch.linspace(1.31, 0.67, epr, device="cuda")
+    direct_stage = getattr(args, "direct_stage", False)
+    if getattr(args, "prewarm", False):
+        from flashinfer.megamoe import _get_jit_module
+
+        assert buffer.prewarm() > 0
+        modules_after_prewarm = _get_jit_module.cache_info().currsize
+        for bad in (0, args.capacity + 1):
+            with pytest.raises(ValueError):
+                buffer.commit_staged(bad)
     for fmt in args.formats:
         gran = 16 if fmt == "nvfp4" else 32
         raw1, ref1 = _weights(epr, ih * 2, h, gran, generator)
@@ -131,7 +140,15 @@ def _worker(rank, args):
                 x.float() / 128, idx, routing, ref1, ref2, gs1, gs2, rank, epr
             )
             stats = torch.zeros(epr, dtype=torch.int32, device="cuda")
-            buffer.stage(x, sf, idx, routing)
+            if direct_stage:
+                # A producer writing the staging views in place, then committing.
+                buffer.x[:m].copy_(x)
+                buffer.x_sf[:m].copy_(sf)
+                buffer.topk_idx[:m].copy_(idx)
+                buffer.topk_weights[:m].copy_(routing)
+                buffer.commit_staged(m)
+            else:
+                buffer.stage(x, sf, idx, routing)
             y = torch.empty(m, h, device="cuda", dtype=torch.bfloat16)
             family = "split" if fmt == "nvfp4" and m > 256 else "fused"
             kwargs = dict(
@@ -209,6 +226,11 @@ def _worker(rank, args):
                     f"relative_l2={metrics[0].item():.6g} max_abs={metrics[1].item():.6g} stats/reuse=exact",
                     flush=True,
                 )
+    if getattr(args, "prewarm", False):
+        from flashinfer.megamoe import _get_jit_module
+
+        # Every token count the run used was already built by prewarm().
+        assert _get_jit_module.cache_info().currsize == modules_after_prewarm
     buffer.destroy()
     dist.destroy_process_group()
 
@@ -302,6 +324,26 @@ def test_nvfp4_ep4_production_shape(hidden, intermediate, experts, topk):
             fast_math=True,
             routing="random",
             cuda_graph=True,
+        )
+    )
+
+
+def test_nvfp4_prewarm_and_direct_staging():
+    """prewarm() builds every module the run selects; commit_staged() accepts in-place staging."""
+    if torch.cuda.device_count() < 8 or torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("requires 8 Hopper GPUs")
+    _run(
+        argparse.Namespace(
+            hidden=512,
+            intermediate=256,
+            capacity=384,
+            tokens=[1, 24, 96, 300],
+            formats=["nvfp4"],
+            fast_math=True,
+            routing="random",
+            cuda_graph=True,
+            prewarm=True,
+            direct_stage=True,
         )
     )
 
