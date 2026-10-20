@@ -18,6 +18,7 @@ from .utils import get_compute_capability
 
 __all__ = [
     "nvfp4_quantize_residue",
+    "nvfp4_quantize_kext",
     "mm_nvfp4_residue",
     "paged_decode_residue",
 ]
@@ -37,6 +38,61 @@ def _check_sm100(tensor):
         raise ValueError("ResInfer requires CUDA tensors")
     if get_compute_capability(tensor.device) != (10, 0):
         raise ValueError("ResInfer currently supports SM100 only")
+
+
+@flashinfer_experimental_api
+def nvfp4_quantize_kext(
+    input: torch.Tensor,
+    global_scale: torch.Tensor,
+    channel_masks: torch.Tensor,
+    residue_per_8: int,
+    *,
+    elts_per_thread: int = 0,
+):
+    """Append selected-channel NVFP4 residues along K (ResInfer KEXT).
+
+    SM100; contiguous FP16/BF16 ``input[M, K]``, positive M and K, K divisible
+    by 256. ``global_scale`` is one positive finite FP32 quantization multiplier
+    on the input device. Inputs must be finite.
+
+    ``channel_masks`` is contiguous uint8 ``[K/8]`` on the same device. Every
+    byte must have exactly ``residue_per_8`` set bits, selecting that group's
+    channels in ascending bit order. ``residue_per_8`` is 1, 2 or 4 (12.5%,
+    25% or 50% extension). Mask contents and scale values are caller
+    preconditions, not checked with a synchronizing device-to-host copy.
+
+    Returns packed uint8 E2M1 ``[M, K_ext/2]`` (base then selected residue)
+    and flat uint8 E4M3 scales in the 128-row, 4-scale swizzle, with zero
+    padding. Extended weights must append the same selected columns in
+    ascending channel order *before* weight quantization. Use ordinary
+    ``flashinfer.mm_fp4`` with reconstruction alpha equal to the reciprocal
+    product of activation and weight global multipliers. Its backend-specific
+    K alignment/padding requirements still apply.
+
+    ``elts_per_thread=0`` preserves ResInfer's SM100 pack8/pack16 shape policy;
+    8 or 16 explicitly selects one producer. This is not GEMM autotuning.
+    Warm up before CUDA graph capture. Swap and ratio-1 MEXT are separate.
+    """
+    _check_sm100(input)
+    _check_tensor(input, "input", input.device, (torch.float16, torch.bfloat16), 32)
+    _check_tensor(global_scale, "global_scale", input.device, (torch.float32,), 4)
+    _check_tensor(channel_masks, "channel_masks", input.device, (torch.uint8,), 1)
+    if input.ndim != 2 or min(input.shape) <= 0 or input.shape[1] % 256:
+        raise ValueError("input must be [M, K], M > 0, K > 0 and K divisible by 256")
+    if global_scale.numel() != 1:
+        raise ValueError("global_scale must contain one element")
+    if channel_masks.ndim != 1 or channel_masks.numel() != input.shape[1] // 8:
+        raise ValueError("channel_masks must have shape [K/8]")
+    if residue_per_8 not in (1, 2, 4) or isinstance(residue_per_8, bool):
+        raise ValueError("residue_per_8 must be 1, 2 or 4")
+    if elts_per_thread not in (0, 8, 16):
+        raise ValueError("elts_per_thread must be 0, 8 or 16")
+    from .experimental.resinfer_kext.quantization import quantize
+
+    with torch.cuda.device(input.device):
+        return quantize(
+            input, global_scale, channel_masks, residue_per_8, elts_per_thread
+        )
 
 
 @flashinfer_experimental_api

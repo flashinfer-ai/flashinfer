@@ -57,7 +57,8 @@ Run `python examples/resinfer/bench_mext.py --m 32 --n 128 --k 256` for a
 small runnable pipeline comparison on SM100. Run
 `pytest tests/experimental/test_resinfer_mext.py` for correctness. Graduation
 requires correctness and graph replay validation, matched performance records,
-API review, and completion of the tracking issue.
+API review, and completion of the tracking issue. ResAttn and
+[KEXT](../resinfer_kext/README.md) share the quantization helpers.
 
 ## Validation
 
