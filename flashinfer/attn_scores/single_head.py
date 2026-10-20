@@ -70,15 +70,17 @@ def single_head_paged_mqa_logits(
         raise ValueError("queries, keys, scores and the block table must be nonempty")
     rows = scores.shape[0] // batch
     if not 1 <= rows <= MAX_ROWS or rows * batch != scores.shape[0]:
-        raise ValueError("each request must serve 1 to 8 query rows")
+        raise ValueError(f"each request must serve 1 to {MAX_ROWS} query rows")
     if query.shape[0] != scores.shape[0] or context_lengths.shape[0] != batch:
         raise ValueError("Mismatched query rows, scores, lengths or requests")
     if max_context > PAGE * width:
         raise ValueError("The block table must cover the context capacity")
     if {query.dtype, key_cache.dtype} != {torch.bfloat16} or query.shape[1] != DIM:
-        raise ValueError("Queries and keys must be BF16 of dimension 128")
+        raise ValueError(f"Queries and keys must be BF16 of dimension {DIM}")
     if key_cache.shape[1:] != (PAGE, DIM) or key_cache.stride()[1:] != (DIM, 1):
-        raise ValueError("Keys must be [pages, 64, 128], each page's keys contiguous")
+        raise ValueError(
+            f"Keys must be [pages, {PAGE}, {DIM}], each page's keys contiguous"
+        )
     if get_compute_capability(query.device)[0] != 10:
         raise ValueError("single_head_paged_mqa_logits requires SM10x")
     tensors = (query, context_lengths, requests, block_table, scores)
