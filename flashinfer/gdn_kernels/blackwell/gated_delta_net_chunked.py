@@ -171,43 +171,44 @@ from .gated_delta_net_tile_scheduler import (
 
 
 # ---------------------------------------------------------------------------
-# fp32 recurrent state, TMEM <-> GMEM.  Every state load and store in this
-# kernel and the CP prefill kernel goes through these two, so the M = 64
-# rules live in one place.
+# fp32 recurrent state, TMEM <-> GMEM.  The initial-state load and the
+# end-of-sequence stores use state_tmem_copy, and every GMEM state tile comes
+# from state_gmem_tile; they are module-level so the CP prefill kernel can
+# share them.
 # ---------------------------------------------------------------------------
 
 
-def state_tmem_copy(mma_tiler_kv, acc_dtype, is_load, tCtState, tCtState_mn_view):
-    """fp32 state TMEM <-> register copy.
+def state_tmem_copy(acc_dtype, is_load, tCtState_mn_view):
+    """fp32 state TMEM <-> register copy, at M = DV = 64 and 128 alike.
 
-    At M = DV = 64 the state is split-lane ((16,4): row a+16b -> lane a+32b),
+    At M = 64 the state is split-lane ((16,4): row a+16b -> lane a+32b),
     which only the 16-datapath atoms can tile (see the copy-atom note in
-    GatedDeltaNetChunkedKernel.compute_group_1_chunk); M = 128 keeps 32x32b.
+    GatedDeltaNetChunkedKernel.compute_group_1_chunk).  At M = 128 a warp
+    covers its 32 lanes in two 16-lane passes, so partitions of this copy
+    carry an M rest mode of 2 (1 at M = 64): index it with None, not 0.
+
+    These atoms suit GMEM-facing sites: on GB200 at DK = DV = 128 they made
+    batches of short sequences 17-30% faster than 32x32b.  The per-chunk
+    state round trip in compute_group_1_chunk keeps 32x32b at M = 128.
     """
-    if mma_tiler_kv[0] == 64:
-        op = tcgen05.copy.Ld16x256bOp if is_load else tcgen05.copy.St16x256bOp
-        atom = cute.make_copy_atom(op(tcgen05.copy.Repetition(8)), acc_dtype)
-        return tcgen05.make_tmem_copy(atom, tCtState_mn_view[None, None, 0])
-    op = tcgen05.copy.Ld32x32bOp if is_load else tcgen05.copy.St32x32bOp
-    atom = cute.make_copy_atom(op(tcgen05.copy.Repetition(32)), acc_dtype)
-    return tcgen05.make_tmem_copy(atom, tCtState[(None, None), 0, 0, 0])
+    op = tcgen05.copy.Ld16x256bOp if is_load else tcgen05.copy.St16x256bOp
+    atom = cute.make_copy_atom(op(tcgen05.copy.Repetition(8)), acc_dtype)
+    return tcgen05.make_tmem_copy(atom, tCtState_mn_view[None, None, 0])
 
 
 def state_gmem_tile(mma_tiler_kv, tiled_mma_kv, mS):
     """(DV, DK) GMEM state tile, for a state_tmem_copy slice to partition.
 
-    At M = 64 the tile goes through the MMA's C partition, as CUTLASS's SM100
-    epilogues do, so its row mode is the TMEM fragment's ((16,4), N) one.  A
-    plain (M, N) tile has given the same per-thread coordinates with these
-    copies so far; going through the C partition does not rely on that.  At
-    M = 128 the C mode is flat and the two are the same tile.
+    The tile goes through the MMA's C partition, as CUTLASS's SM100
+    epilogues do, so its row mode is the TMEM fragment's ((16,4) at M = 64,
+    flat at M = 128).  A plain (M, N) tile has given the same per-thread
+    coordinates with these copies so far; going through the C partition
+    does not rely on that.
     """
     gS = cute.flat_divide(mS, (mma_tiler_kv[0], mma_tiler_kv[1]))[None, None, 0, 0]
-    if mma_tiler_kv[0] == 64:
-        return utils.gemm.sm100.transform_partitioned_tensor_layout(
-            tiled_mma_kv.get_slice(0).partition_C(gS)
-        )
-    return gS
+    return utils.gemm.sm100.transform_partitioned_tensor_layout(
+        tiled_mma_kv.get_slice(0).partition_C(gS)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3556,9 +3557,7 @@ class GatedDeltaNetChunkedKernel:
             tCtState
         )
         cState = cute.make_identity_tensor((self.mma_tiler_kv[0], self.mma_tiler_kv[1]))
-        tiled_state_r2t = state_tmem_copy(
-            self.mma_tiler_kv, self.acc_dtype, False, tCtState, tCtState_mn_view
-        )
+        tiled_state_r2t = state_tmem_copy(self.acc_dtype, False, tCtState_mn_view)
         thr_state_r2t = tiled_state_r2t.get_slice(cg1_tidx)
         tRT_tCtState = thr_state_r2t.partition_D(tCtState_mn_view)
         tRT_tCcState = thr_state_r2t.partition_S(cState)
@@ -3577,13 +3576,13 @@ class GatedDeltaNetChunkedKernel:
         for sub in cutlass.range(tGR_tCrState.shape[2]):
             # 1. Load S_init state_dtype GMEM -> state_dtype registers
             cute.autovec_copy(
-                tGR_tCgState[None, 0, sub],
-                tGR_tCrState[None, 0, sub],
+                tGR_tCgState[None, None, sub],
+                tGR_tCrState[None, None, sub],
                 l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
             )
             if cutlass.const_expr(self.acc_dtype != self.state_dtype):
-                tRT_tCrState[None, 0, sub].store(
-                    tGR_tCrState[None, 0, sub].load().to(self.acc_dtype)
+                tRT_tCrState[None, None, sub].store(
+                    tGR_tCrState[None, None, sub].load().to(self.acc_dtype)
                 )
             else:
                 tRT_tCrState = tGR_tCrState
@@ -3591,8 +3590,8 @@ class GatedDeltaNetChunkedKernel:
             # 2. fp32 registers -> state TMEM; signal kv_acc (GEMM 7 accumulates dS on top)
             cute.copy(
                 tiled_state_r2t,
-                tRT_tCrState[None, 0, sub],
-                tRT_tCtState[None, 0, sub, kv_acc_handle.index],
+                tRT_tCrState[None, None, sub],
+                tRT_tCtState[None, None, sub, kv_acc_handle.index],
             )
         cute.arch.fence_view_async_tmem_store()
 
@@ -3673,9 +3672,7 @@ class GatedDeltaNetChunkedKernel:
             (self.mma_tiler_kv[0], self.mma_tiler_kv[1])
         )
 
-        tiled_state_t2r = state_tmem_copy(
-            self.mma_tiler_kv, self.acc_dtype, True, tCtState, tCtState_mn_view
-        )
+        tiled_state_t2r = state_tmem_copy(self.acc_dtype, True, tCtState_mn_view)
         thr_state_t2r = tiled_state_t2r.get_slice(cg1_tidx)
         tTR_tCtState = thr_state_t2r.partition_S(tCtState_mn_view)
         tTR_tCcState = thr_state_t2r.partition_D(tCcState)
@@ -3688,12 +3685,12 @@ class GatedDeltaNetChunkedKernel:
         for sub in cutlass.range(tTR_rState.shape[2]):
             cute.copy(
                 tiled_state_t2r,
-                tTR_tCtState[None, 0, sub, kv_acc_handle.index],
-                tTR_rState[None, 0, sub],
+                tTR_tCtState[None, None, sub, kv_acc_handle.index],
+                tTR_rState[None, None, sub],
             )
             if cutlass.const_expr(self.acc_dtype != self.state_dtype):
-                tRG_rState[None, 0, sub].store(
-                    tTR_rState[None, 0, sub].load().to(self.state_dtype)
+                tRG_rState[None, None, sub].store(
+                    tTR_rState[None, None, sub].load().to(self.state_dtype)
                 )
             else:
                 tRG_rState = tTR_rState
@@ -3708,8 +3705,8 @@ class GatedDeltaNetChunkedKernel:
                         )
                         tSgCheckpoints = thr_state_t2r.partition_D(gS_checkpoints)
                         cute.autovec_copy(
-                            tRG_rState[None, 0, sub],
-                            tSgCheckpoints[None, 0, sub],
+                            tRG_rState[None, None, sub],
+                            tSgCheckpoints[None, None, sub],
                             l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                         )
             if cutlass.const_expr(self.store_final_state):
@@ -3724,8 +3721,8 @@ class GatedDeltaNetChunkedKernel:
                 )
                 tRG_tCgState = thr_state_t2r.partition_D(gS_out)
                 cute.autovec_copy(
-                    tRG_rState[None, 0, sub],
-                    tRG_tCgState[None, 0, sub],
+                    tRG_rState[None, None, sub],
+                    tRG_tCgState[None, None, sub],
                     l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                 )
         kv_acc_handle.release()
@@ -3798,12 +3795,25 @@ class GatedDeltaNetChunkedKernel:
         tCcState = cute.make_identity_tensor(
             (self.mma_tiler_kv[0], self.mma_tiler_kv[1])
         )
-        tiled_state_t2r = state_tmem_copy(
-            self.mma_tiler_kv, self.acc_dtype, True, tCtState, tCtState_mn_view
-        )
-        tiled_state_r2t = state_tmem_copy(
-            self.mma_tiler_kv, self.acc_dtype, False, tCtState, tCtState_mn_view
-        )
+        # The per-chunk state round trip keeps 32x32b at M = 128: the 16-datapath
+        # atoms of state_tmem_copy made single 8K-32K-token sequences up to 6%
+        # slower here (GB200, DK = DV = 128).  M = 64 needs them.
+        if cutlass.const_expr(self.mma_tiler_kv[0] == 64):
+            tiled_state_t2r = state_tmem_copy(self.acc_dtype, True, tCtState_mn_view)
+            tiled_state_r2t = state_tmem_copy(self.acc_dtype, False, tCtState_mn_view)
+        else:
+            tiled_state_t2r = tcgen05.make_tmem_copy(
+                cute.make_copy_atom(
+                    tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
+                ),
+                tCtState[(None, None), 0, 0, 0],
+            )
+            tiled_state_r2t = tcgen05.make_tmem_copy(
+                cute.make_copy_atom(
+                    tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
+                ),
+                tCtState[(None, None), 0, 0, 0],
+            )
         thr_state_t2r = tiled_state_t2r.get_slice(cg1_tidx)
         thr_state_r2t = tiled_state_r2t.get_slice(cg1_tidx)
         tTR_tCtState = thr_state_t2r.partition_S(tCtState_mn_view)
@@ -3828,17 +3838,17 @@ class GatedDeltaNetChunkedKernel:
         tCcState_inp = cute.make_identity_tensor(
             (self.mma_tiler_qs[0], self.mma_tiler_qs[2])
         )
+        # Paired with tiled_state_t2r: tRT_rState_inp is filled from tTR_rState
+        # by a whole-tensor .store(.load()), which pairs them by element index,
+        # so the value layouts must be equal.  See the copy-atom note in
+        # compute_group_1_chunk.
         if cutlass.const_expr(self.mma_tiler_qs[0] == 64):
-            # Paired with tiled_state_t2r's Ld16x256b(Rep 8): tRT_rState_inp is
-            # filled from tTR_rState by a whole-tensor .store(.load()), which
-            # pairs them by element index, so the value layouts must be equal.
-            # See the copy-atom note in compute_group_1_chunk.
+            # Pairs with Ld16x256b(Rep 8).
             atom_state_inp_r2t = cute.make_copy_atom(
-                tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8)),
-                self.io_dtype,
+                tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8)), self.io_dtype
             )
         else:
-            # Pairs with Ld32x32b(Rep 32); both give ((32,1),1,4) at M=128.
+            # Pairs with Ld32x32b(Rep 32); both give ((32,1),1,4) at M = 128.
             atom_state_inp_r2t = cute.make_copy_atom(
                 tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), self.io_dtype
             )
@@ -4065,16 +4075,16 @@ class GatedDeltaNetChunkedKernel:
             state_inp_ready_producer.advance()
             cute.copy(
                 tiled_state_t2r,
-                tTR_tCtState[None, 0, None, kv_prev_handle.index],
-                tTR_rState[None, 0, None],
+                tTR_tCtState[None, None, None, kv_prev_handle.index],
+                tTR_rState[None, None, None],
             )
-            tRT_rState_inp[None, 0, None].store(
-                tTR_rState[None, 0, None].load().to(self.io_dtype)
+            tRT_rState_inp[None, None, None].store(
+                tTR_rState[None, None, None].load().to(self.io_dtype)
             )
             cute.copy(
                 tiled_state_inp_r2t,
-                tRT_rState_inp[None, 0, None],
-                tRT_tCtState_inp[None, 0, None, state_inp_handle.index],
+                tRT_rState_inp[None, None, None],
+                tRT_tCtState_inp[None, None, None, state_inp_handle.index],
             )
             cute.arch.fence_view_async_tmem_store()
             state_inp_handle.commit()
@@ -4090,24 +4100,24 @@ class GatedDeltaNetChunkedKernel:
                             )
                             tSgCheckpoints = thr_state_t2r.partition_D(gS_checkpoints)
                             if cutlass.const_expr(self.state_dtype != self.acc_dtype):
-                                tRG_rState[None, 0, None].store(
-                                    tTR_rState[None, 0, None]
+                                tRG_rState[None, None, None].store(
+                                    tTR_rState[None, None, None]
                                     .load()
                                     .to(self.state_dtype)
                                 )
                             else:
                                 tRG_rState = tTR_rState
                             cute.autovec_copy(
-                                tRG_rState[None, 0, None],
-                                tSgCheckpoints[None, 0, None],
+                                tRG_rState[None, None, None],
+                                tSgCheckpoints[None, None, None],
                                 l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                             )
             for k in cutlass.range(cute.size(tTR_rState), vectorize=True):
                 tTR_rState[k] = tTR_rState[k] * cumprod_total
             cute.copy(
                 tiled_state_r2t,
-                tTR_rState[None, 0, None],
-                tRT_tCtState[None, 0, None, kv_prev_handle.index],
+                tTR_rState[None, None, None],
+                tRT_tCtState[None, None, None, kv_prev_handle.index],
             )
             if cutlass.const_expr(self.enable_checkpoints):
                 if checkpoint_token > 0:
