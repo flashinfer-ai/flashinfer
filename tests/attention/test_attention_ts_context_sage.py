@@ -285,7 +285,8 @@ def test_context_sage_prepared_scales_match_reference(
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
     )
-    wrapper = _plan(sage=config, **shape)
+    # A Sage plan without an output dtype writes BF16.
+    wrapper = _plan(sage=config, out_dtype=None, **shape)
     params = _random_params(config, **shape)
     q = torch.randn((batch_size, seq_len_q, num_qo_heads, _HEAD_DIM), device="cuda").to(
         _FP8

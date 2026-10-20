@@ -428,7 +428,8 @@ def _v_dtype_follows_qk(q_dtype: torch.dtype, v_dtype: torch.dtype) -> bool:
 def _validate_qkv_dtype(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
     """Validate run-time Q/K/V tensor dtypes.
 
-    Q and K must match; V may differ only for the QK-BF16/PV-FP8 path.
+    Q and K must match; V may differ only for the QK-BF16/PV-FP8 path and
+    for Int8 Q/K with E4M3 V.
     """
     _dtype_key(q.dtype)
     if q.dtype != k.dtype:
@@ -2774,9 +2775,11 @@ class BatchPrefillTSWrapper:
             must currently equal ``q_dtype``.
         v_dtype : torch.dtype, optional
             Value dtype; defaults to ``k_dtype``. May differ from
-            ``k_dtype`` only for the QK-BF16/PV-FP8 combination.
+            ``k_dtype`` only for the QK-BF16/PV-FP8 combination and for a
+            Sage plan's ``int8`` Q/K, which take ``float8_e4m3fn`` V.
         out_dtype : torch.dtype, optional
-            Output dtype; defaults to ``q_dtype``.
+            Output dtype; defaults to ``q_dtype``, or to ``torch.bfloat16``
+            for a Sage plan.
         packed : bool
             Whether run tensors use packed ``[total_tokens, H, D]`` storage.
         mask_type : {"dense", "causal", "variable_window"}
@@ -2791,11 +2794,18 @@ class BatchPrefillTSWrapper:
         sage : SageAttentionConfig, optional
             Sage attention recipe: 8-bit Q/K with per-block scales, E4M3 V with
             per-channel scales and FP8 P. Requires a dense, fixed-length,
-            head-dim-128 plan with ``float8_e4m3fn`` Q/K/V and a 16-bit output.
-            Every ``run`` then supplies the scales as ``SageAttentionParams``.
+            head-dim-128 plan with ``float8_e4m3fn`` Q/K, or ``int8`` Q/K on
+            SM100a, ``float8_e4m3fn`` V and a 16-bit output. Every ``run``
+            then supplies the scales as ``SageAttentionParams``.
         """
 
-        resolved_out_dtype = q_dtype if out_dtype is None else out_dtype
+        if out_dtype is not None:
+            resolved_out_dtype = out_dtype
+        elif sage is not None:
+            # As in block-sparse Sage plans; an 8-bit output is not a recipe.
+            resolved_out_dtype = torch.bfloat16
+        else:
+            resolved_out_dtype = q_dtype
         resolved_v_dtype = k_dtype if v_dtype is None else v_dtype
         if k_dtype != q_dtype:
             raise NotImplementedError(
