@@ -251,6 +251,10 @@ SM120_FAMILY_M537: Final = 2
 # whether it wins on a card nobody measured.
 SM120_FAMILY_CUBLASLT: Final = 3
 SM120_FAMILY_SMALL_M_PACKED: Final = 4
+# Warp-specialized rank-128 large-M producer (persistent grid, producer warp +
+# mbarrier stage ring). Tiling = (tile M, tile K, stages * 100 + quantize
+# warps); the address-policy slot carries the grid mode.
+SM120_FAMILY_WS_RANK128: Final = 5
 
 # M537 and packed small-M producers share the lane-packed L2T layout. Other
 # families read row-major L2T, so the selected family determines preprocessing.
@@ -268,6 +272,44 @@ SM120_M537_TILING: Final[tuple[int, int, int]] = (1024, 24, 16)
 def sm120_m537_is_valid(m: int, k: int) -> bool:
     """Whether the M537 producer family exists for this shape."""
     return m == SM120_M537_M and k in (5120, 5376, 7168)
+
+
+# Mirrors FI_SVDQ_RANK128_WS_TILINGS in nvfp4_smooth_quantize_lora_down_ws_sm120.cuh.
+SM120_RANK128_WS_TILING_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
+    (160, 64, 205),
+    (160, 64, 210),
+    (128, 64, 204),
+    (96, 64, 303),
+    (96, 64, 306),
+    (64, 64, 304),
+    (160, 64, 405),
+    (64, 128, 204),
+    (64, 128, 208),
+    (32, 128, 304),
+    (32, 256, 204),
+    (32, 256, 208),
+    (64, 192, 206),
+    (96, 128, 206),
+)
+SM120_WS_GRID_MODES: Final[tuple[int, ...]] = (0,)
+_WS_RANK: Final = 128
+_WS_DOWN_WARPS: Final = 8
+
+
+def _ws_shared_bytes(tile_m: int, tile_k: int, stages: int) -> int:
+    """Mirrors WsConfig::kSmemBytes (128-byte-swizzled TMA tiles, 1 KB aligned)."""
+    stage = (tile_m * tile_k * 2 + _WS_RANK * tile_k * 2 + tile_k * 2 + 1023) // 1024 * 1024
+    return 1024 + stages * stage + 2 * stages * 8
+
+
+def sm120_ws_tiling_is_valid(m: int, k: int, tile_m: int, tile_k: int, packed: int) -> bool:
+    """Python counterpart of launch_ws_kernel's guards."""
+    stages, quant_warps = divmod(packed, 100)
+    if tile_k % 64 or m <= 0 or k <= 0 or k % tile_k or m > (1 << 30):
+        return False
+    if stages <= 0 or quant_warps <= 0 or tile_m % 32:
+        return False
+    return _ws_shared_bytes(tile_m, tile_k, stages) <= _STAGED_B_SHARED_LIMIT
 
 
 def sm120_small_m_tiling_is_valid(
@@ -332,8 +374,15 @@ def sm120_producer_variants(
     if rank == 64:
         return large + small
     if rank == 128:
-        # Only the large-M producer stages wide fragments.
-        return large
+        # Only the large-M producers stage wide fragments. The warp-specialized
+        # family follows the shared ladder so existing indices keep their meaning.
+        ws = tuple(
+            (SM120_FAMILY_WS_RANK128, tiling, grid_mode)
+            for tiling in SM120_RANK128_WS_TILING_LADDER
+            if sm120_ws_tiling_is_valid(m, k, *tiling)
+            for grid_mode in SM120_WS_GRID_MODES
+        )
+        return large + ws
     m537 = (
         ((SM120_FAMILY_M537, SM120_M537_TILING, 0),)
         if sm120_m537_is_valid(m, k)
@@ -367,7 +416,7 @@ def sm120_variant_reads_kmajor_l2t(m: int, k: int, variant: int, rank: int = 32)
     Mirrors large_m_kmajor_l2() in nvfp4_smooth_quantize_lora_down_sm120.cuh.
     """
     family, _, _ = sm120_decode_producer_variant(m, k, variant, rank)
-    return family == SM120_FAMILY_LARGE_M and rank > 64
+    return family in (SM120_FAMILY_LARGE_M, SM120_FAMILY_WS_RANK128) and rank > 64
 
 
 def sm120_producer_variant_count(m: int, k: int, rank: int = 32) -> int:

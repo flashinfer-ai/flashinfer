@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <limits>
 
+#include "flashinfer/gemm/nvfp4_smooth_quantize_lora_down_ws_sm120.cuh"
 #include "flashinfer/gemm/nvfp4_smooth_quantize_sm100.cuh"
 
 namespace flashinfer::gemm {
@@ -1466,6 +1467,8 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_dyn_sm120(
 //   family 1 row-major small-M (a, b, c = block threads, down tile cols, rows/quant block)
 //   family 2 fixed-M537 with packed L2T (a, b, c = block threads, down warps, rows/quant block)
 //   family 4 packed small-M (same tiling fields as family 1)
+//   family 5 warp-specialized rank-128 large-M (a, b, c = tile M, tile K,
+//            stages * 100 + quantize warps; address_policy = grid mode)
 // Family 3 uses the separate cuBLASLt prefix entry.
 template <int Rank = 32>
 inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
@@ -1478,8 +1481,14 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
   if constexpr (Rank == 64) {
     if (family != 0 && family != 1) return cudaErrorInvalidValue;
   }
-  // Rank 128 has the large-M (eight wide down warps) family only.
+  // Rank 128 has the large-M (eight wide down warps) and the warp-specialized
+  // large-M families only.
   if constexpr (Rank == 128) {
+    if (family == 5) {
+      return nvfp4_smooth_quantize_lora_down_ws_rank128_sm120(
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, a, b, c,
+          address_policy, stream);
+    }
     if (family != 0) return cudaErrorInvalidValue;
   }
   if (family == 2) {
