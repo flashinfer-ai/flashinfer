@@ -2625,11 +2625,11 @@ class FmhaDecodeConfig:
     def uses_two_inst_tmem_p(self) -> bool:
         """Whether a two-instance Keeps profile uses the TMEM-P overlay.
 
-        Dense 16-bit Q128/KV128 and the other unstreamed profiles publish a
-        complete packed-P row per pipeline token. Streamed profiles use the
-        same S-to-P aliasing contract but stream four independently ready K32
-        fragments (see ``streams_tmem_p_fragments``). Q64/KV128 keeps the base
-        kernel's faster SMEM-P cadence.
+        Unstreamed profiles publish a complete packed-P row per pipeline
+        token. Streamed profiles use the same S-to-P aliasing contract but
+        stream four independently ready K32 fragments (see
+        ``streams_tmem_p_fragments``). Q64/KV128 keeps the base kernel's
+        faster SMEM-P cadence.
         """
         # Two-instance Keeps keeps stats outside S, so both static and persistent
         # work tiles can overlay P on the consumed S instance. The split K/V
@@ -2660,12 +2660,14 @@ class FmhaDecodeConfig:
 
         A two-instance TMEM-P profile streams for KV256 tiles and block-sparse
         routes, whose loops wait on K/V loads that the earlier PV start hides.
-        It also streams with 8-bit K and V and SMEM softmax stats (the 8-bit
-        Q/K/V and Sage recipes) unless Q-token page membership applies: a
-        dense fragment's keep word is one visible token range and cannot
-        express per-page membership. Dense 16-bit Q128/KV128 (not load-bound),
-        FP8 D64 (softmax stats in TMEM) and QK-BF16/PV-FP8 keep the complete
-        row.
+        Dense KV128 tiles stream too when K and V share a width and the
+        softmax stats travel through SMEM (the 16-bit and 8-bit Q/K/V recipes,
+        including Sage): the PV MMA starts on the first fragment instead of
+        the complete row, and the exponentials share the FMA pipes
+        (``ex2_emulated_pairs``). Q-token page membership keeps the complete
+        row, since a dense fragment's keep word is one visible token range and
+        cannot express per-page membership; so do FP8 D64 (softmax stats in
+        TMEM) and QK-BF16/PV-FP8.
         """
         if not self.uses_two_inst_tmem_p:
             return False
@@ -2673,8 +2675,7 @@ class FmhaDecodeConfig:
             self.tile_size_kv == 256
             or self.use_block_sparse
             or (
-                self.k_dtype.width == 8
-                and self.v_dtype.width == 8
+                self.k_dtype.width == self.v_dtype.width
                 and self.keeps_stats_via_smem
                 and not self.uses_q_token_kv_block_sparse_page_membership
             )
