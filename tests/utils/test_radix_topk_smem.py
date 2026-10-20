@@ -20,25 +20,35 @@ import torch
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("op", ["renorm", "mask"])
+@pytest.mark.parametrize(
+    "op,deterministic", [("renorm", False), ("renorm", True), ("mask", False)]
+)
+@pytest.mark.parametrize("ctas", [1, 5])
 @pytest.mark.parametrize("per_row_k", [False, True])
 @pytest.mark.parametrize("cuda_graph", [False, True])
-def test_radix_top_k_static_shared_memory(dtype, op, per_row_k, cuda_graph):
+def test_radix_top_k_static_shared_memory(
+    dtype, op, deterministic, ctas, per_row_k, cuda_graph
+):
     device = torch.device("cuda:0")
     properties = torch.cuda.get_device_properties(device)
     if properties.multi_processor_count <= 16:
         pytest.skip("multi-CTA radix top-k requires more than 16 SMs")
 
-    # The old launcher gave the dynamic ordered-value array all of the remaining
-    # opt-in space, without accounting for the kernel's static shared scratch.
-    # An odd vocabulary selects VEC_SIZE=1. Five equally sized chunks fill that
-    # space on this device, so static scratch makes the unpatched launch fail.
-    fixed_smem = 2080  # two 256-bin histograms, five scalars, aligned to 16 B
+    # Center a small sweep on the old dynamic budget. Unlike a single exact
+    # boundary, this also catches nearby failures if the fixed layout changes.
+    fixed_smem = 2080
     item_size = torch.empty((), dtype=dtype).element_size()
     chunk_size = (properties.shared_memory_per_block_optin - fixed_smem) // item_size
-    vocab_size = 5 * chunk_size - 1
-    assert vocab_size % 2 == 1
+    for delta in range(-256, 257, 32):
+        vocab_size = ctas * (chunk_size + delta) - 1
+        _check_radix_boundary(
+            dtype, op, deterministic, per_row_k, cuda_graph, device, vocab_size
+        )
 
+
+def _check_radix_boundary(
+    dtype, op, deterministic, per_row_k, cuda_graph, device, vocab_size
+):
     generator = torch.Generator(device=device).manual_seed(42)
     inputs = torch.rand((4, vocab_size), device=device, generator=generator)
     # Make the top ten values distinct even after casting to half precision.
@@ -59,7 +69,11 @@ def test_radix_top_k_static_shared_memory(dtype, op, per_row_k, cuda_graph):
     if op == "renorm":
         expected = torch.where(keep, reference_input, 0)
         expected = expected / expected.sum(dim=-1, keepdim=True)
-        run = flashinfer.sampling.top_k_renorm_probs
+
+        def run(inputs, k):
+            return flashinfer.sampling.top_k_renorm_probs(
+                inputs, k, is_deterministic=deterministic
+            )
     else:
         expected = torch.where(keep, reference_input, float("-inf"))
         run = flashinfer.sampling.top_k_mask_logits
@@ -70,6 +84,8 @@ def test_radix_top_k_static_shared_memory(dtype, op, per_row_k, cuda_graph):
     for _ in range(3):
         actual = run(inputs, k)
     torch.cuda.synchronize(device)
+    if deterministic:
+        torch.testing.assert_close(run(inputs, k), actual, atol=0, rtol=0)
     if cuda_graph:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -84,3 +100,63 @@ def test_radix_top_k_static_shared_memory(dtype, op, per_row_k, cuda_graph):
         assert torch.equal(actual > 0, keep)
     else:
         assert torch.equal(torch.isfinite(actual), keep)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("op", ["basic", "page_table", "ragged"])
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("cuda_graph", [False, True])
+def test_radix_top_k_transform_shared_memory(
+    monkeypatch, dtype, op, deterministic, cuda_graph
+):
+    monkeypatch.setenv("FLASHINFER_TOPK_ALGO", "multi_cta")
+    device = torch.device("cuda:0")
+    properties = torch.cuda.get_device_properties(device)
+    if properties.multi_processor_count <= 16:
+        pytest.skip("multi-CTA radix top-k requires more than 16 SMs")
+    item_size = torch.empty((), dtype=dtype).element_size()
+    capacity = (properties.shared_memory_per_block_optin - 2080) // item_size
+    for delta in (-32, 0, 32):
+        size = 5 * (capacity + delta) - 1
+        scores = torch.rand((4, size), device=device, dtype=dtype)
+        scores[:, :10] = torch.arange(2, 12, device=device, dtype=dtype)
+        lengths = torch.full((4,), size, device=device, dtype=torch.int32)
+        offsets = torch.arange(4, device=device, dtype=torch.int32) * size
+        page_table = (
+            torch.arange(size, device=device, dtype=torch.int32)
+            .expand(4, -1)
+            .contiguous()
+        )
+
+        def run():
+            if op == "basic":
+                return flashinfer.top_k(scores, 10, deterministic=deterministic)[1]
+            if op == "page_table":
+                return flashinfer.top_k_page_table_transform(
+                    scores, page_table, lengths, 10, deterministic=deterministic
+                )
+            return flashinfer.top_k_ragged_transform(
+                scores, offsets, lengths, 10, deterministic=deterministic
+            )
+
+        expected = torch.arange(
+            10, device=device, dtype=torch.int64 if op == "basic" else torch.int32
+        ).expand(4, -1)
+        if op == "ragged":
+            expected = expected + offsets[:, None]
+        actual = run()
+        torch.cuda.synchronize(device)
+        if deterministic:
+            torch.testing.assert_close(run(), actual, atol=0, rtol=0)
+        if cuda_graph:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                actual = run()
+            for _ in range(3):
+                graph.replay()
+                torch.cuda.synchronize(device)
+                torch.testing.assert_close(
+                    actual.sort(-1).values, expected, atol=0, rtol=0
+                )
+        else:
+            torch.testing.assert_close(actual.sort(-1).values, expected, atol=0, rtol=0)
