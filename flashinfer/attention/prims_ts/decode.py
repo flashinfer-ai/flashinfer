@@ -325,9 +325,8 @@ def _planned_kv_domain_has_unpaired_tail(
     """Return whether the planned K domain ends with one inactive KV instance."""
 
     tile_size_kv = int(config.tile_size_kv)
-    num_insts_kv = int(config.num_insts_kv)
     total_kv_tiles = (max_kv_len + tile_size_kv - 1) // tile_size_kv
-    return total_kv_tiles % num_insts_kv != 0
+    return total_kv_tiles % int(config.kv_tiles_per_loop) != 0
 
 
 def _align_up(value: int, alignment: int = _WORKSPACE_ALIGNMENT) -> int:

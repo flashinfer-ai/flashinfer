@@ -672,6 +672,11 @@ class FmhaDecodeConfig:
     # (K0/V0 and K1/V1) let two parallel SoftmaxTask groups consume alternating
     # tiles, improving SM utilization when tile_size_q is tiny.
     num_insts_kv: int = 2  # K/V instances per loop step
+    # Query-paired topology: the two instances are two consecutive Q tiles of
+    # one KV head that share every K/V tile (one K and one V load per tile,
+    # QK0/QK1 and PV0/PV1 from the same stages, one output tile each) instead
+    # of two halves of one Q tile's KV range. Dense Keeps Q128/KV128 only.
+    query_paired: bool = False
 
     # ------------------------------------------------------------------
     # Data types
@@ -1036,8 +1041,8 @@ class FmhaDecodeConfig:
         return self.q_tokens_per_cta
 
     @property
-    def num_q_ctas(self) -> int:
-        """Return Q-CTA groups per ``(batch, KV head)`` launch tile.
+    def num_q_tiles(self) -> int:
+        """Return Q tiles per ``(batch, KV head)`` launch tile.
 
         Shape-aware decode configs always carry a positive head ratio. Keep
         raw shape-less configs conservative so this scheduling predicate can
@@ -1051,6 +1056,34 @@ class FmhaDecodeConfig:
             groups_tokens_heads_q=self.groups_tokens_heads_q,
         )
         return max(q_geometry.num_q_ctas(self.max_seq_len_q), 1)
+
+    @property
+    def q_groups_per_cta(self) -> int:
+        """Return the Q tiles one CTA owns: two when query-paired, else one."""
+        return 2 if self.query_paired else 1
+
+    @property
+    def num_q_ctas(self) -> int:
+        """Return Q CTAs per ``(batch, KV head)`` launch tile."""
+        return (self.num_q_tiles + self.q_groups_per_cta - 1) // self.q_groups_per_cta
+
+    @property
+    def kv_tiles_per_loop(self) -> int:
+        """Return the K/V tiles one loop iteration advances.
+
+        Each instance takes its own tile per iteration, except in the
+        query-paired topology, where both instances read the same tile.
+        """
+        return 1 if self.query_paired else self.num_insts_kv
+
+    def kv_inst_tile_offset(self, inst_id: int) -> int:
+        """Return instance ``inst_id``'s tile offset within a loop iteration."""
+        return 0 if self.query_paired else inst_id
+
+    @property
+    def merges_kv_instances(self) -> bool:
+        """Whether two K/V instances' partial O tiles merge into one output tile."""
+        return self.num_insts_kv != 1 and not self.query_paired
 
     @property
     def has_single_q_cta(self) -> bool:
@@ -1527,6 +1560,16 @@ class FmhaDecodeConfig:
         return self.smem_q_tile_bytes // self.q_dtype_bytes
 
     @property
+    def smem_q_stage_bytes(self) -> int:
+        """Return the bytes of one Q pipeline stage: the CTA's Q tiles."""
+        return self.smem_q_tile_bytes * self.q_groups_per_cta
+
+    @property
+    def smem_q_stage_elements(self) -> int:
+        """Return Q elements in one Q pipeline stage."""
+        return self.smem_q_stage_bytes // self.q_dtype_bytes
+
+    @property
     def use_parallel_separate_reduction(self) -> bool:
         """Use the production standalone reducer for separate-GMEM modes."""
         return self.use_separate_reduction_kernel
@@ -1874,11 +1917,12 @@ class FmhaDecodeConfig:
         """Return static KV tiles assigned to one split CTA."""
         if not self.use_split_kv:
             return self.total_kv_tiles
-        tiles_per_cta_group = self.splits_kv * self.num_insts_kv
+        tiles_per_loop = self.kv_tiles_per_loop
+        tiles_per_cta_group = self.splits_kv * tiles_per_loop
         num_groups = (
             self.total_kv_tiles + tiles_per_cta_group - 1
         ) // tiles_per_cta_group
-        return max(self.num_insts_kv, num_groups * self.num_insts_kv)
+        return max(tiles_per_loop, num_groups * tiles_per_loop)
 
     @property
     def inferred_kv_stages(self) -> int:
@@ -1889,7 +1933,7 @@ class FmhaDecodeConfig:
             // Q_ROW_ALIGNMENT_BYTES
         ) * Q_ROW_ALIGNMENT_BYTES
         fixed_bytes = (
-            q_row_bytes * self.tile_size_q * self.q_stages
+            q_row_bytes * self.tile_size_q * self.q_groups_per_cta * self.q_stages
             + self.correction_sum_scratch_entries * FP32_BYTES
         )
         if not self.uses_tmem_p:
@@ -2253,7 +2297,7 @@ class FmhaDecodeConfig:
     @property
     def has_odd_kv_tail(self) -> bool:
         """Whether the K/V tile count leaves an unpaired tail instance."""
-        return (self.total_kv_tiles % self.num_insts_kv) != 0
+        return (self.total_kv_tiles % self.kv_tiles_per_loop) != 0
 
     @property
     def uses_uniform_causal_mask(self) -> bool:
@@ -2684,7 +2728,7 @@ class FmhaDecodeConfig:
         )
         q_rows = layout.q_rows
         assert q_rows.tokens_per_tile == self.q_tokens_per_cta
-        assert q_rows.tiles == self.num_q_ctas
+        assert q_rows.tiles == self.num_q_tiles
         return layout
 
     def sage_k_groups_per_fragment(self, proxy: bool = False) -> int:
@@ -3438,7 +3482,7 @@ def _validate_kv256_static_config(cfg: FmhaDecodeConfig) -> None:
             f"kv_stages={cfg.kv_stages}"
         )
     pipeline_smem_bytes = (
-        cfg.q_stages * cfg.smem_q_tile_bytes + cfg.kv_stages * cfg.smem_kv_tile_bytes
+        cfg.q_stages * cfg.smem_q_stage_bytes + cfg.kv_stages * cfg.smem_kv_tile_bytes
     )
     pipeline_smem_budget_bytes = TOTAL_SMEM_BUDGET_KIB * BYTES_PER_KIB
     if pipeline_smem_bytes > pipeline_smem_budget_bytes:
@@ -4584,16 +4628,6 @@ def _should_auto_select_launch_mode(
     )
 
 
-def _num_q_tiles_for_launch(cfg: FmhaDecodeConfig) -> int:
-    """Return the physical Q-CTA multiplicity for launch occupancy."""
-    q_geometry = make_q_tile_geometry(
-        rows_per_cta=cfg.tile_size_q,
-        heads_q_per_kv=cfg.heads_q_per_kv,
-        groups_tokens_heads_q=cfg.groups_tokens_heads_q,
-    )
-    return max(q_geometry.num_q_ctas(cfg.max_seq_len_q), 1)
-
-
 def _apply_auto_launch_mode(
     cfg: FmhaDecodeConfig,
     *,
@@ -4619,7 +4653,7 @@ def _apply_auto_launch_mode(
         batch_size=batch_size,
         num_heads_kv=num_heads_kv,
         seq_len_kv=seq_len_kv,
-        num_q_tiles=_num_q_tiles_for_launch(cfg),
+        num_q_tiles=cfg.num_q_ctas,
         tile_size_kv=cfg.tile_size_kv,
         split_kv=split_kv,
     )
@@ -4699,7 +4733,7 @@ def _apply_split_kv_config(
         num_heads_kv=num_heads_kv,
         tile_size_kv=cfg.tile_size_kv,
         num_insts_kv=cfg.num_insts_kv,
-        num_q_tiles=_num_q_tiles_for_launch(cfg),
+        num_q_tiles=cfg.num_q_ctas,
         requested_splits_kv=splits_kv,
         max_splits_kv=max_splits_kv,
         min_loop_iters_per_split=min_loop_iters_per_split,
@@ -4826,6 +4860,36 @@ def _validate_mixed_kv_dtype_profile(cfg: FmhaDecodeConfig) -> None:
         )
 
 
+def _validate_query_paired_config(cfg: FmhaDecodeConfig, split_kv_mode: str) -> None:
+    """Reject a query-paired config outside the dense Keeps Q128/KV128 schedule."""
+    if (
+        not cfg.use_keeps_mma_ab
+        or not cfg.groups_tokens_heads_q
+        or cfg.tile_size_q != 128
+        or cfg.tile_size_kv != 128
+        or cfg.num_insts_kv != 2
+        or cfg.headdim != 128
+        or cfg.head_dim_per_stage_kv != 0
+    ):
+        raise ValueError(
+            "query_paired requires the grouped Keeps Q128/KV128 headdim-128 "
+            "profile with two instances"
+        )
+    if (
+        cfg.use_block_sparse
+        or cfg.mask_type != DENSE
+        or cfg.use_split_kv
+        or split_kv_mode != "disabled"
+        or cfg.use_transform_kv
+        or cfg.use_paged_kv
+        or cfg.use_sliding_window_causal
+    ):
+        raise ValueError(
+            "query_paired supports dense contiguous K/V only: no block-sparse "
+            "routes, causal or window masks, paged K/V, split-KV or transform-KV"
+        )
+
+
 def _validate_profile_support(
     *,
     cfg: FmhaDecodeConfig,
@@ -4845,6 +4909,8 @@ def _validate_profile_support(
     _validate_mixed_kv_dtype_profile(cfg)
     if cfg.o_stages != cfg.num_insts_kv:
         raise ValueError("fmha_decode requires o_stages == num_insts_kv")
+    if cfg.query_paired:
+        _validate_query_paired_config(cfg, split_kv_mode)
     _validate_kv256_static_config(cfg)
     if cfg.mask_type not in (DENSE, CAUSAL):
         raise ValueError("mask_type must be DENSE or CAUSAL")

@@ -74,7 +74,6 @@ from .fmha_decode_constants import (
     KV_KIND_K,
     KV_KIND_V,
     KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES,
-    MAX_KV_STAGE_SMEM_KIB,
     SMEM_CAPACITY_KIB,
 )
 from .fmha_decode_resources import (
@@ -96,7 +95,8 @@ from .fmha_decode_resources import (
     TmemTransformedKvResource,
 )
 from .fmha_decode_resources.helpers_common import (
-    _q_group_token_base,
+    _q_cta_first_token,
+    _q_cta_kv_domain_token_base,
     _q_seq_bounds,
 )
 from .fmha_decode_resources.helpers_kv_tile_idx import _runtime_active_splits_kv
@@ -233,15 +233,16 @@ def _stages_page_ids_per_tile(uses_paired_page_offset_resources: bool) -> bool:
     return uses_paired_page_offset_resources
 
 
-def _compute_decode_gen_loop_domain(total_kv_tiles: int, num_insts_kv: int) -> int:
+def _compute_decode_gen_loop_domain(total_kv_tiles: int, kv_tiles_per_loop: int) -> int:
     """Number of post-head steady-state iterations.
 
-    HEAD consumes the first `num_insts_kv` K tiles. The remaining tiles are
-    processed in staggered groups of `num_insts_kv`, so odd tail groups still
-    need one final loop iteration, matching the schedule's pull-down behavior.
+    HEAD consumes the first `kv_tiles_per_loop` K tiles. The remaining tiles
+    are processed in staggered groups of `kv_tiles_per_loop`, so odd tail
+    groups still need one final loop iteration, matching the schedule's
+    pull-down behavior.
     """
-    remaining_kv_tiles = max(total_kv_tiles - num_insts_kv, 0)
-    return (remaining_kv_tiles + num_insts_kv - 1) // num_insts_kv
+    remaining_kv_tiles = max(total_kv_tiles - kv_tiles_per_loop, 0)
+    return (remaining_kv_tiles + kv_tiles_per_loop - 1) // kv_tiles_per_loop
 
 
 def _compute_total_kv_tiles(seq_len_kv: int, tile_size_kv: int) -> int:
@@ -312,12 +313,10 @@ def _compute_local_kv_tiles(cfg: FmhaDecodeConfig, total_kv_tiles: int) -> int:
     """KV tiles covered by each CtaKv in split-KV mode."""
     if not cfg.use_split_kv:
         return total_kv_tiles
-    tiles_per_cta_group = cfg.splits_kv * cfg.num_insts_kv
+    tiles_per_loop = cfg.kv_tiles_per_loop
+    tiles_per_cta_group = cfg.splits_kv * tiles_per_loop
     num_groups = (total_kv_tiles + tiles_per_cta_group - 1) // tiles_per_cta_group
-    return max(
-        cfg.num_insts_kv,
-        num_groups * cfg.num_insts_kv,
-    )
+    return max(tiles_per_loop, num_groups * tiles_per_loop)
 
 
 def _build_decode_gen_schedule(
@@ -514,7 +513,7 @@ def _build_decode_gen_schedule(
         else SignalingThreads.All
     )
     q_bytes_per_load_warp = (
-        cfg.smem_q_tile_bytes // cfg.load_num_warps if cfg.load_num_warps > 1 else None
+        cfg.smem_q_stage_bytes // cfg.load_num_warps if cfg.load_num_warps > 1 else None
     )
 
     # ------------------------------------------------------------------
@@ -528,10 +527,11 @@ def _build_decode_gen_schedule(
     use_one_inst_qkv = cfg.use_keeps_mma_ab and cfg.num_insts_kv == 1
     # K and V of different byte widths take the split-resource paths with one
     # K ring and one V ring, each shared by both K/V instances; equal widths
-    # (including Int8 K with E4M3 V) share one ring.
+    # (including Int8 K with E4M3 V) share one ring. Paired Q tiles read the
+    # same K/V tiles, so their two instances share the rings as well.
     use_shared_inst_kv_rings = (
         cfg.k_dtype_bytes != cfg.v_dtype_bytes and cfg.tile_size_kv != 256
-    )
+    ) or cfg.query_paired
     one_inst_tmem_stages = 2 if use_one_inst_qkv else 1
     # Keep complete head-dimension rounds in each balanced K/V ring. FP8's
     # smaller stage tiles can prefetch farther without increasing the budget.
@@ -589,12 +589,9 @@ def _build_decode_gen_schedule(
         else max((split_total_v_stages + cfg.num_insts_kv - 2) // cfg.num_insts_kv, 1)
     )
     if use_shared_inst_kv_rings and not use_one_inst_qkv:
-        # One K and one V stage per unit of depth.
-        shared_inst_kv_stages = max(
-            (MAX_KV_STAGE_SMEM_KIB * BYTES_PER_KIB)
-            // (cfg.smem_k_tile_bytes + cfg.smem_v_tile_bytes),
-            1,
-        )
+        # The K ring and the V ring each take half of ``kv_stages``, whose
+        # budget already holds every Q tile of the CTA.
+        shared_inst_kv_stages = max(cfg.kv_stages // 2, 1)
         split_k0_stages = shared_inst_kv_stages
         split_v0_stages = shared_inst_kv_stages
     use_ordered_softmax_barrier = (
@@ -654,7 +651,7 @@ def _build_decode_gen_schedule(
 
     smem_q_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
         num_stages=cfg.q_stages,
-        num_bytes=cfg.smem_q_tile_bytes,
+        num_bytes=cfg.smem_q_stage_bytes,
         producer_group=tma_producer,
         consumer_group=umma_hw,
         cta_layout_vmnk=cta_layout,
@@ -1603,7 +1600,7 @@ def _build_decode_gen_schedule(
     # counts, the final wave still requires one additional loop iteration so
     # that inst0 can process the last K/V tile.
     local_kv_tiles = _compute_local_kv_tiles(cfg, total_kv_tiles)
-    loop_domain = _compute_decode_gen_loop_domain(local_kv_tiles, cfg.num_insts_kv)
+    loop_domain = _compute_decode_gen_loop_domain(local_kv_tiles, cfg.kv_tiles_per_loop)
 
     load_domain = loop_domain
     mma_domain = loop_domain
@@ -2821,7 +2818,7 @@ def _run_decode_gen_active(
             cfg,
             runtime_seq_len_kv,
             seq_len_q,
-            _q_group_token_base(cfg, q_group_idx),
+            _q_cta_kv_domain_token_base(cfg, q_group_idx),
         )
         split_idx = cute.arch.block_idx()[0] % Int32(cfg.splits_kv)
         run_task_graph = cute.arch.make_warp_uniform(
@@ -3151,8 +3148,8 @@ def decode_gen_kernel(
     if cutlass.const_expr(not cfg.use_persistent_scheduler):
         if cutlass.const_expr(cfg.use_variable_seqlens_q):
             q_token_offset, seq_len_q = _q_seq_bounds(cfg, g_cu_seqlens_q, b_idx)
-        q_token_base = _q_group_token_base(cfg, q_group_idx)
-        q_tile_is_active = q_token_base < seq_len_q
+        q_token_base = _q_cta_kv_domain_token_base(cfg, q_group_idx)
+        q_tile_is_active = _q_cta_first_token(cfg, q_group_idx) < seq_len_q
 
     # Persistent block coordinates identify physical workers rather than
     # logical tiles; their WorkQueue owns the equivalent Q predicate. Split-KV
@@ -3550,15 +3547,13 @@ def fmha_decode_launch(
                 cfg.heads_q_per_kv,
                 cfg.q_tma_tokens_per_cta,
             )
-            q_groups = Int32(
-                (cfg.max_seq_len_q + cfg.q_tokens_per_cta - 1) // cfg.q_tokens_per_cta
-            )
+            q_tiles = Int32(cfg.num_q_tiles)
         else:
             q_box_dims = (tma_box0_q, cfg.tile_size_q, 1)
             head_ctas_per_token = Int32(
                 (cfg.heads_q_per_kv + cfg.tile_size_q - 1) // cfg.tile_size_q
             )
-            q_groups = Int32(cfg.max_seq_len_q) * head_ctas_per_token
+            q_tiles = Int32(cfg.max_seq_len_q) * head_ctas_per_token
         if cutlass.const_expr(cfg.uses_q_token_kv_block_sparse_page_route):
             # A partial group may read the next sequence into inactive Q rows.
             # QK/softmax/PV rows are independent; row masks and guarded stores
@@ -3593,12 +3588,10 @@ def fmha_decode_launch(
                 cfg.q_tokens_per_cta,
                 1,
             )
-            q_groups = Int32(
-                (cfg.max_seq_len_q + cfg.q_tokens_per_cta - 1) // cfg.q_tokens_per_cta
-            )
+            q_tiles = Int32(cfg.num_q_tiles)
         else:
             q_box_dims = (tma_box0_q, cfg.tile_size_q, 1, 1, 1)
-            q_groups = (
+            q_tiles = (
                 (h_r + Int32(cfg.tile_size_q - 1)) // Int32(cfg.tile_size_q)
             ) * q_seq
         tma_desc_q = create_tensor_map_tiled_from_view(
@@ -3687,6 +3680,10 @@ def fmha_decode_launch(
             swizzle=cuda.TensorMapSwizzle.none,
         )
 
+    # One CTA owns ``q_groups_per_cta`` consecutive Q tiles.
+    q_groups = q_tiles
+    if cutlass.const_expr(cfg.q_groups_per_cta > 1):
+        q_groups = cute.ceil_div(q_tiles, cfg.q_groups_per_cta)
     grid_x = q_groups
     if cutlass.const_expr(cfg.use_split_kv):
         grid_x = q_groups * Int32(cfg.splits_kv)
