@@ -1523,7 +1523,8 @@ def cutlass_fused_moe(
           environment variables.
         - ``None``: 4over6 off, environment ignored.
         - :class:`NVFP44Over6Config`: that recipe. The caller's
-          ``fc2_act_global_scale`` must be built for the same ``e4m3_max``.
+          ``fc2_act_global_scale``, and ``fc1_act_global_scale`` when
+          ``input`` is BF16, must be built for the same ``e4m3_max``.
 
     Returns
     -------

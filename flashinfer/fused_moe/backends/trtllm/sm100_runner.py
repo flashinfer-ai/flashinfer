@@ -135,7 +135,6 @@ class MoERunner(TunableRunner):
             int(self.weight_layout),
             bool(self.use_packed_weights),
             bool(self.use_per_token_scaling),
-            int(self.nvfp4_4over6_code),
         )
 
     def _make_tuning_config(

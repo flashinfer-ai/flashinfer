@@ -2015,6 +2015,7 @@ def _nvfp4_4over6_axis() -> Const:
             "NVFP4 4over6 recipe as the nvfp4_4over6_code() wire code (0 = off); "
             "absent when the call left nvfp4_4over6 unset."
         ),
+        abbrev="r4o6",
         extract=_nvfp4_4over6_axis_value,
     )
 

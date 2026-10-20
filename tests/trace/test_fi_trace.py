@@ -1690,12 +1690,12 @@ def test_cutlass_fused_moe_fi_trace_nvfp4_4over6_axis():
 
     off = trace(**kwargs, nvfp4_4over6=None)
     assert off["axes"]["nvfp4_4over6"]["value"] == 0
-    assert off["name"] == "cutlass_fused_moe_e4_h256_i512_topk2_nvfp4_4over60"
+    assert off["name"] == "cutlass_fused_moe_e4_h256_i512_topk2_r4o60"
 
     recipe = NVFP44Over6Config(e4m3_max=256)
     pinned = trace(**kwargs, nvfp4_4over6=recipe)
     assert pinned["axes"]["nvfp4_4over6"]["value"] == nvfp4_4over6_code(recipe)
-    assert pinned["name"].endswith(f"_nvfp4_4over6{nvfp4_4over6_code(recipe)}")
+    assert pinned["name"].endswith(f"_r4o6{nvfp4_4over6_code(recipe)}")
 
 
 def test_fi_trace_filename_matches_definition_name(tmp_path):

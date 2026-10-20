@@ -1,5 +1,5 @@
 {
-  "name": "trtllm_fp4_block_scale_routed_moe_topk2_e8_h1024_act3_nvfp4_4over61",
+  "name": "trtllm_fp4_block_scale_routed_moe_topk2_e8_h1024_act3_r4o61",
   "description": "TRT-LLM NvFP4 block-scale MoE with precomputed topk_ids.",
   "op_type": "moe",
   "tags": [
