@@ -426,7 +426,26 @@ test "${{PIP_BUILD_CONSTRAINT}}" = /tmp/original-build-constraint
     assert trap_marker.is_file()
 
 
-def test_sccache_setup_uses_server_side_compilation(tmp_path):
+def _sccache_free_env():
+    """Return os.environ without the sccache state of an enclosing CI lane.
+
+    The GPU lanes run pytest under scripts/run_with_test_sccache.sh, which
+    exports the real cache prefix, stats directory, launchers and AWS keys.
+    Shell tests that inherit them write into the lane's stats directory (and,
+    with a real sccache on PATH, could reach its server).
+    """
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(("SCCACHE_", "AWS_", "FLASHINFER_SCCACHE_"))
+        and name not in ("FLASHINFER_NVCC_LAUNCHER", "FLASHINFER_CXX_LAUNCHER")
+    }
+
+
+def test_sccache_setup_uses_server_side_compilation(tmp_path, monkeypatch):
+    # Simulate running inside a wrapped GPU lane; the test must not touch it.
+    lane_stats_dir = tmp_path / "lane-stats"
+    monkeypatch.setenv("SCCACHE_STATS_DIR", str(lane_stats_dir))
     common_script = (
         Path(__file__).resolve().parents[2] / "scripts" / "jit_cache_build_common.sh"
     )
@@ -453,7 +472,9 @@ test "${{FLASHINFER_CXX_LAUNCHER}}" = sccache
 test "${{FLASHINFER_NVCC_LAUNCHER}}" = sccache
 """
 
-    subprocess.run(["bash", "-c", script], check=True)
+    subprocess.run(["bash", "-c", script], check=True, env=_sccache_free_env())
+
+    assert not lane_stats_dir.exists()
 
 
 def _write_test_sccache_fakes(
@@ -514,20 +535,12 @@ def _write_test_sccache_fakes(
     )
     child.chmod(0o755)
     env = {
-        **os.environ,
+        **_sccache_free_env(),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "CUDA_HOME": str(tmp_path / "cuda"),
         "FLASHINFER_WORKSPACE_BASE": str(tmp_path / "home"),
         "SCCACHE_STATS_DIR": str(tmp_path / "stats"),
     }
-    for name in (
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "SCCACHE_BASEDIRS",
-        "FLASHINFER_NVCC_LAUNCHER",
-        "FLASHINFER_CXX_LAUNCHER",
-    ):
-        env.pop(name, None)
     return child, sccache_log, tar_log, env
 
 
