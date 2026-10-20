@@ -43,7 +43,6 @@ from flashinfer.fused_moe.cake_kimi_k3_situ import (
     _prepared,
     _route,
     _selector,
-    _workspace_layout,
 )
 from flashinfer.jit.cake_kimi_k3_situ import (
     CARRIED_PROGRAMS,
@@ -64,19 +63,10 @@ LARGE_TOKENS = (8192, 16384)
 # SM count of the B200 and B300 parts the FC2 pools were sized on.
 REFERENCE_SM_COUNT = 148
 
-# Architectures whose single-token route is the fused quantization + routing
-# FC1 (three kernels) -- both today; an architecture outside this set would run
-# the separate quantization + router kernel (four kernels, the "m1" selector).
-FUSED_M1_ARCHES = ("sm_100a", "sm_103a")
 # Architectures whose 8- and 16-token routes run the FC1 + FC2 programs with evict_first cache
 # hints on their weight-stream TMA loads (four kernels) -- sm_100a today; sm_103a keeps the
 # "n8_feature" / "n8_w2a_m16" routes.
 SMALL_L2POLICY_ARCHES = ("sm_100a",)
-# Architectures whose 8192- and 16384-token route stores the FC2 result as an
-# 8-bit per-tile partial with per-tile FP32 scales (eight kernels) -- both
-# today; an architecture outside this set would run the pre-shuffled
-# scale-factor route (nine kernels, the "large_c7" selector).
-LARGE_Q8I_ARCHES = ("sm_100a", "sm_103a")
 # Architectures and token counts whose large route runs the routing histogram
 # and scatter kernels with per-CTA shared-memory privatization and block
 # reservation (1024 routed pairs per CTA; the "large_q8i_p1024" selector) --
@@ -97,7 +87,7 @@ MID_Q8I_TOKENS = (4096,)
 # Token counts with a route of their own; every other count runs the generic
 # pipeline of its tile-N bucket (8 / 16 / 32 / 128).
 ROUTED = {
-    1: "m1",
+    1: "m1_s2a",
     8: "n8_feature",
     16: "n8_w2a_m16",
     32: "m64_claim8",
@@ -108,8 +98,8 @@ ROUTED = {
     1024: "n32_claim8",
     2048: "mid_work5fd",
     4096: "mid_work5fd",
-    8192: "large_c7",
-    16384: "large_c7",
+    8192: "large_q8i",
+    16384: "large_q8i",
 }
 GENERIC_STAGES = [
     "route_reset",
@@ -124,7 +114,6 @@ GENERIC_STAGES = [
 # The seven-stage large route: quantization + routing-table reset fused in one launch.
 QR_GENERIC_STAGES = ["quant_reset"] + GENERIC_STAGES[2:]
 STAGES_BY_SELECTOR = {
-    "m1": ["quant_route", "fc1", "fc2", "finalize"],
     "m1_s2a": ["fc1", "fc2", "finalize"],
     "n8_feature": ["quant_route", "fc1", "fc2", "finalize"],
     "n8_w2a_m16": ["quant_route", "fc1", "fc2", "finalize"],
@@ -134,7 +123,6 @@ STAGES_BY_SELECTOR = {
     "n32_claim8": ["quant", "fused_router", "fc1", "fc2", "finalize"],
     "mid_work5fd": GENERIC_STAGES,
     "mid_q8i": GENERIC_STAGES,
-    "large_c7": GENERIC_STAGES[:5] + ["sfb_shuffle"] + GENERIC_STAGES[5:],
     "large_q8i": GENERIC_STAGES,
     "large_q8i_p1024": GENERIC_STAGES,
     "large_q8i_p512fh2qr": QR_GENERIC_STAGES,
@@ -156,14 +144,10 @@ def _expected_selector(arch, num_tokens):
         return "n8_feature_ef_f2e"
     if num_tokens == 16 and arch in SMALL_L2POLICY_ARCHES:
         return "n8_w2a_m16_ef_f2e"
-    if num_tokens == 1 and arch in FUSED_M1_ARCHES:
-        return "m1_s2a"
     if num_tokens in LARGE_P512FH2QR_TOKENS and arch in LARGE_P512FH2QR_ARCHES:
         return "large_q8i_p512fh2qr"
     if num_tokens in LARGE_P1024_TOKENS and arch in LARGE_P1024_ARCHES:
         return "large_q8i_p1024"
-    if num_tokens in LARGE_TOKENS and arch in LARGE_Q8I_ARCHES:
-        return "large_q8i"
     if num_tokens in MID_Q8I_TOKENS and arch in MID_Q8I_ARCHES:
         return "mid_q8i"
     return ROUTED.get(num_tokens, _tile_bucket(num_tokens))
@@ -234,22 +218,6 @@ def test_cake_situ_workspace_size_holds_every_smaller_shape():
         for max_tokens in (t, t + 1, t + 128, t + 255, 16384):
             if max_tokens <= 16384:
                 assert _workspace_size(max_num_tokens=max_tokens) >= at_t
-
-
-def test_cake_situ_workspace_layout_has_no_pre_shuffled_scale_factors():
-    # No delivered architecture's selector of 8192 / 16384 tokens is the
-    # pre-shuffled scale-factor route any more, so the architecture-independent
-    # layout of those token counts carries no ``sfb_shuffled`` images (the
-    # INT8 partial and its per-tile scales are carved out of the BF16
-    # expert-output scratch); every other token count keeps its layout.
-    for num_tokens, expected_tiles in ((8192, 1913), (16384, 2937)):
-        tile_n, _, max_tiles = _geometry(num_tokens)
-        assert (tile_n, max_tiles) == (128, expected_tiles)
-        layout, nbytes = _workspace_layout(num_tokens)
-        assert "sfb_shuffled" not in layout
-        assert nbytes >= max(start + size for start, size, _, _ in layout.values())
-    for num_tokens in (1, 8, 16, 64, 256, 512, 2048, 4096, 8191, 8193):
-        assert "sfb_shuffled" not in _workspace_layout(num_tokens)[0]
 
 
 @pytest.mark.parametrize("arch", ARCHES)
@@ -758,30 +726,22 @@ def test_cake_situ_every_route_eager_and_external_graph(
             )
             assert bindings[stage]["total_pairs"] == prepared["total_pairs"]
     if num_tokens == 1:
-        # The single-token route quantizes and routes inside the FC1 prologue on
-        # the fused architectures (three launches; the FC1 binding carries the
-        # activations, the activation scale and the expert ids) and through the
-        # separate quantization + router kernel elsewhere (four launches).
+        # The single-token route quantizes and routes inside the FC1 prologue
+        # (three launches; the FC1 binding carries the activations, the
+        # activation scale and the expert ids).
         options = _options(x, ids, route_weights, output, weights, workspace)
         bindings = _cake_situ_stage_bindings(options, prepared)
-        fused = arch in FUSED_M1_ARCHES
-        assert prepared["selector"] == ("m1_s2a" if fused else "m1")
+        assert prepared["selector"] == "m1_s2a"
         assert list(bindings) == STAGES_BY_SELECTOR[prepared["selector"]]
-        assert ("x" in bindings["fc1"]) == fused
-        if fused:
-            assert bindings["fc1"]["x"].data_ptr() == x.data_ptr()
-            assert bindings["fc1"]["topk_ids"].data_ptr() == ids.data_ptr()
-            assert (
-                bindings["fc1"]["qx"].data_ptr()
-                == options["quant_scales"][0].data_ptr()
-            )
-            assert bindings["fc1"]["grid"] == (
-                INTERMEDIATE // 64,
-                prepared["max_tiles"],
-                1,
-            )
-        else:
-            assert bindings["quant_route"]["x"] is x
+        assert "x" in bindings["fc1"]
+        assert bindings["fc1"]["x"].data_ptr() == x.data_ptr()
+        assert bindings["fc1"]["topk_ids"].data_ptr() == ids.data_ptr()
+        assert bindings["fc1"]["qx"].data_ptr() == options["quant_scales"][0].data_ptr()
+        assert bindings["fc1"]["grid"] == (
+            INTERMEDIATE // 64,
+            prepared["max_tiles"],
+            1,
+        )
     if prepared["selector"] in (
         "large_q8i",
         "large_q8i_p1024",
@@ -790,7 +750,7 @@ def test_cake_situ_every_route_eager_and_external_graph(
     ):
         # The FC2 stage stores an 8-bit per-tile partial and its per-tile FP32
         # scales inside the BF16 expert-output scratch, and the finalize reads
-        # the same two views: no pre-shuffled scale-factor images are bound.
+        # the same two views.
         options = _options(x, ids, route_weights, output, weights, workspace)
         bindings = _cake_situ_stage_bindings(options, prepared)
         views = _cake_situ_workspace_views(workspace, num_tokens)
@@ -808,7 +768,6 @@ def test_cake_situ_every_route_eager_and_external_graph(
         assert bindings["fc2"]["C_tma"].data_ptr() == partial.data_ptr()
         assert bindings["finalize"]["expert_output"].data_ptr() == partial.data_ptr()
         assert bindings["finalize"]["partial_scale"].data_ptr() == scales.data_ptr()
-        assert "SFBS" not in bindings["fc1"] and "sfb_shuffle" not in bindings
 
     expected = _trtllm_reference(x, ids, route_weights, weights)
     # Ensure an all-zero output could not satisfy the FP4 absolute tolerance.
