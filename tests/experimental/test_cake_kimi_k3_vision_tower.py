@@ -573,6 +573,56 @@ def test_export_rows_plan_onto_registered_programs(arch):
             assert cake_jit.MODULES[name]["arg_plan"] in cake_jit.ARG_PLANS
 
 
+def test_registry_keys_and_programs_agree():
+    """Every logical kernel key of an architecture names a registered program built for
+    it (and ``kernel_module_name`` returns that program), every registered program is
+    reached by a key on each architecture it is built for, and a key an architecture lacks
+    is rejected the way the host plan expects."""
+    assert tuple(cake_jit.KERNELS) == cake_jit.ARCHES
+    reached = {name: set() for name in cake_jit.MODULES}
+    for arch, table in cake_jit.KERNELS.items():
+        assert list(table) == sorted(table)
+        for key, name in table.items():
+            record = cake_jit.MODULES[name]
+            assert arch in record["arches"], (arch, key, name)
+            assert record["arg_plan"] in cake_jit.ARG_PLANS, (arch, key, name)
+            assert cake_jit.kernel_module_name(arch, key) == name
+            reached[name].add(arch)
+    for name, record in cake_jit.MODULES.items():
+        assert reached[name] == set(record["arches"]), name
+    every_key = {key for table in cake_jit.KERNELS.values() for key in table}
+    for arch, table in cake_jit.KERNELS.items():
+        for key in sorted(every_key - set(table)):
+            assert not cake_jit.route_available(arch, (key,))
+            with pytest.raises(NotImplementedError):
+                cake_jit.kernel_module_name(arch, key)
+    with pytest.raises(NotImplementedError):
+        cake_jit.kernel_module_name("sm_90a", cake_jit.MERGE_KERNEL_KEY)
+
+
+def test_spec_content_digest_is_a_pure_function_of_its_inputs():
+    """The content digest in a program's JIT library name is stable across computations
+    and changes with any source byte, the source order, the architecture or a compile
+    flag, so an edited source never reuses a cached library."""
+    sources = [b"kernel source\n", b"binding source\n"]
+    flags = ["flag_a", "flag_b"]
+    digest = cake_jit.spec_content_digest(sources, "sm_100a", flags)
+    assert len(digest) == 12 and int(digest, 16) >= 0
+    assert digest == cake_jit.spec_content_digest(
+        [bytes(s) for s in sources], "sm_100a", list(flags)
+    )
+    others = [
+        ([sources[0], b"binding Source\n"], "sm_100a", flags),
+        (sources[::-1], "sm_100a", flags),
+        ([b"".join(sources)], "sm_100a", flags),
+        (sources, "sm_103a", flags),
+        (sources, "sm_100a", flags[:1]),
+        (sources, "sm_100a", ["flag_afl", "ag_b"]),
+    ]
+    digests = {cake_jit.spec_content_digest(*other) for other in others}
+    assert len(digests | {digest}) == len(others) + 1
+
+
 @pytest.mark.parametrize("label,grids", list(CONTRACT_GRIDS.items()))
 def test_attention_plan(label, grids):
     cu = cu_seqlens_of(grids)

@@ -53,7 +53,7 @@ lists every logical kernel the plan rule can select per architecture (the
 GEMM tile / PDL census, the attention-form census over single segments up to
 70016 tokens and the exported rows, the merge kernels).  The export registers
 the programs its rows launch: the 22 rows of the evaluation contract (the
-acceptance denominator) plus six export-only *coverage* rows
+acceptance denominator) plus seven export-only *coverage* rows
 (`COVERAGE_ROW_GRIDS`; validated bitwise against the source tower, not part
 of the acceptance geomean) that reach the keys no contract row exercises
 (half-N twins at token counts outside the rows, the plain two-tile form on
@@ -133,12 +133,18 @@ allocation in `launch()`. Benchmark against the HF torch chain with the
 FlashInfer ragged BF16 attention route:
 `benchmarks/bench_cake_kimi_k3_vision_tower.py`.
 
-The generated sources under `csrc/cake_kimi_k3_vision_tower/` and the
-`MODULES` / `ARG_PLANS` / `KERNELS` registries in `cake_jit.py` are Cake
-exporter output, hand-folded here pending exporter support; apart from the
-fold described next they are not edited by hand. One source pair is one
-program, built for every architecture it lists (`MODULES[name]["arches"]`)
-with FlashInfer's exact `sm100a` / `sm103a` flag set of the device it runs on.
+The generated sources under `csrc/cake_kimi_k3_vision_tower/` are Cake exporter
+output; the five attention sources described below are hand-folded pending
+exporter support. `cake_jit.py` registers the programs in a form that is also
+hand-folded pending exporter support: one `_PROGRAMS` row per program
+(architectures, compile flags, argument plan), the five `ARG_PLANS`, and the
+`KERNELS` table both architectures share plus the per-architecture entries (4
+SM103-only keys), expanded into `MODULES` / `KERNELS` at import. A program's
+JIT library is named after a content hash of its sources, architecture and
+compile flags, so this registry form rebuilds every program once and an edited
+source never reuses a cached library. One source pair is one program, built for
+every architecture it lists (`MODULES[name]["arches"]`) with FlashInfer's exact
+`sm100a` / `sm103a` flag set of the device it runs on.
 The five attention forms both architectures share (`ring3`, `ring3:split`,
 `ring3:wide`, `tiles2`, `tiles2:wide`) are one source each with compile-time
 architecture arms (`#if __CUDA_ARCH__ == 1000`: SM100 text first, then the
