@@ -274,6 +274,15 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
     _mega_key: Optional[tuple]
     _mega: Optional[_CompiledMega]
 
+    @staticmethod
+    def _launch_cache_key(inputs: MegaMoEHopperFp8Inputs, num_tokens: int) -> tuple:
+        # Separate combine can write a shorter output view while the dispatch
+        # tensors retain their full symmetric capacity and the same pointers.
+        return MegaMoEHopperFp8Frontend._launch_cache_key(inputs, num_tokens) + (
+            tuple(inputs.output_activation.shape),
+            tuple(inputs.output_activation.stride()),
+        )
+
     def apply_knobs(self, knobs: Optional[dict]) -> None:
         """Apply only declared MXFP4 tactics; reject stale/cache-only fields."""
         if knobs is None:
@@ -591,12 +600,6 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
                 (buf_tokens, c.num_topk),
                 torch.float32,
             ),
-            (
-                "output_activation",
-                inputs.output_activation,
-                (buf_tokens, c.hidden),
-                torch.bfloat16,
-            ),
         )
         for name, tensor, token_shape, dtype in token_contracts:
             require_cuda(name, tensor)
@@ -606,6 +609,22 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
                 )
             if tensor.dtype != dtype:
                 raise ValueError(f"{name} must have dtype {dtype}, got {tensor.dtype}.")
+
+        output = inputs.output_activation
+        require_cuda("output_activation", output)
+        if (
+            output.ndim != 2
+            or output.shape[1] != c.hidden
+            or not 0 < output.shape[0] <= buf_tokens
+            or (c.in_kernel_fc2_reduce and output.shape[0] != buf_tokens)
+        ):
+            raise ValueError(
+                "output_activation must have the full buffer shape for in-kernel "
+                "combine, or a nonempty prefix of its rows for separate combine; "
+                f"got {tuple(output.shape)} for ({buf_tokens}, {c.hidden})."
+            )
+        if output.dtype != torch.bfloat16:
+            raise ValueError(f"output_activation must be bfloat16, got {output.dtype}.")
 
         e = c.num_experts_per_rank
         packed_weight_contracts = (
@@ -1240,8 +1259,13 @@ def hopper_mxfp4_mega_moe(
         symm_buffer._frontend.set_gate_up_clamp(clamp)
 
     inputs = _build_mxfp4_inputs(symm_buffer, transformed_l1, transformed_l2)
-    # Launch the full padded workspace.  topk_idx[n:] == -1 masks tail rows;
-    # this matches the kernel-team fused driver and keeps compile shape stable.
+    if n > 0 and not symm_buffer._frontend.config.in_kernel_fc2_reduce:
+        # Only final combine uses this view. Dispatch and peer FC2 writes retain
+        # the full capacity, including when different ranks have different n.
+        inputs.output_activation = inputs.output_activation[:n]
+    # Keep the collective launch at full capacity, including empty ranks that
+    # may serve peer experts. Empty outputs retain the existing reducer path,
+    # whose launcher requires a nonzero grid.
     out = symm_buffer._frontend.run(inputs, num_tokens=None, sync=False)
     if y is None:
         result = out[:n] if out is not None else symm_buffer.output_activation[:0]

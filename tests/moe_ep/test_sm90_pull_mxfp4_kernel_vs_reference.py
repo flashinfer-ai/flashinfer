@@ -501,5 +501,41 @@ def test_sm90_mxfp4_kernel_matches_independent_reference(
         )
         torch.testing.assert_close(actual, y_reference, rtol=3.0e-2, atol=2.0e-2)
         assert relative_l2.item() < 0.035
+
+        # Shrink/grow at the same workspace address, then replay the small
+        # graph after a larger launch. Padded output rows must remain untouched.
+        saved_routes = symm_buffer.topk_idx.clone()
+        small_graph = torch.cuda.CUDAGraph()
+        for live in (1, n):
+            symm_buffer.topk_idx.copy_(saved_routes)
+            symm_buffer.topk_idx[live:].fill_(-1)
+            symm_buffer.output_activation.fill_(float("nan"))
+            result = pkg.hopper_mxfp4_mega_moe(
+                None,
+                transformed_l1,
+                transformed_l2,
+                symm_buffer,
+                num_tokens=live,
+                sync=True,
+            )
+            assert torch.equal(result, y_first[:live])
+            assert symm_buffer.output_activation[live:].isnan().all()
+            if live == 1:
+                with torch.cuda.graph(small_graph):
+                    small_output = pkg.hopper_mxfp4_mega_moe(
+                        None,
+                        transformed_l1,
+                        transformed_l2,
+                        symm_buffer,
+                        num_tokens=live,
+                    )
+        symm_buffer.topk_idx[1:].fill_(-1)
+        for _ in range(3):
+            symm_buffer.output_activation.fill_(float("nan"))
+            small_graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(small_output, y_first[:1])
+            assert symm_buffer.output_activation[1:].isnan().all()
+        small_graph.reset()
     finally:
         symm_buffer.destroy()
