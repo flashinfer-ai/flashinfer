@@ -13,6 +13,7 @@ from flashinfer.mla import (
     batch_decode_sparse_mla_dsv4,
     trtllm_batch_decode_sparse_mla_dsv4,
 )
+from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
 from flashinfer.utils import get_compute_capability
 
 
@@ -208,13 +209,13 @@ def test_dsv4_backend_resolution_is_explicit(monkeypatch):
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "auto")
         == "sparse"
     )
-    with pytest.raises(ValueError, match="requires SM100/SM103, got SM120"):
+    with pytest.raises(ValueError, match="requires SM100/SM103/SM107, got SM120"):
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cute-dsl")
 
     monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 1))
     with pytest.raises(ValueError, match="supports SM100/SM103"):
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "auto")
-    with pytest.raises(ValueError, match="requires SM100/SM103, got SM101"):
+    with pytest.raises(ValueError, match="requires SM100/SM103/SM107, got SM101"):
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cute-dsl")
 
     monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 7))
@@ -226,8 +227,10 @@ def test_dsv4_backend_resolution_is_explicit(monkeypatch):
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), sm100_default)
         == sm100_default
     )
-    with pytest.raises(ValueError, match="requires SM100/SM103, got SM107"):
+    assert (
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cute-dsl")
+        == "cute-dsl"
+    )
     with pytest.raises(
         ValueError, match="requires SM100/SM103 or SM120/SM121, got SM107"
     ):
@@ -716,15 +719,20 @@ def _reference_hca(
     return output
 
 
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     "compare_trtllm", (False, True), ids=("pytorch-reference", "trtllm-parity")
 )
 def test_cute_dsl_hca_fp8_to_bf16_correctness(monkeypatch, compare_trtllm):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
-        pytest.skip("CuTe DSL HCA requires SM100/SM103")
+    if get_compute_capability(torch.device("cuda")) not in (
+        (10, 0),
+        (10, 3),
+        (10, 7),
+    ):
+        pytest.skip("CuTe DSL HCA requires SM100/SM103/SM107")
+    if not is_cute_dsl_arch_supported(*get_compute_capability(torch.device("cuda"))):
+        pytest.skip("the installed CuTe DSL cannot target this device")
     pytest.importorskip("cutlass")
 
     torch.manual_seed(17)
@@ -1023,7 +1031,6 @@ def test_cute_dsl_hca_fp8_to_bf16_correctness(monkeypatch, compare_trtllm):
     assert torch.isneginf(captured["lse"]).all()
 
 
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     ("num_heads", "window_page_size", "compressed_page_size"),
     ((64, 32, 128), (128, 32, 16), (128, 16, 32)),
@@ -1033,8 +1040,14 @@ def test_cute_dsl_hca_partial_head_tile_and_empty_attention(
 ):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
-        pytest.skip("CuTe DSL HCA requires SM100/SM103")
+    if get_compute_capability(torch.device("cuda")) not in (
+        (10, 0),
+        (10, 3),
+        (10, 7),
+    ):
+        pytest.skip("CuTe DSL HCA requires SM100/SM103/SM107")
+    if not is_cute_dsl_arch_supported(*get_compute_capability(torch.device("cuda"))):
+        pytest.skip("the installed CuTe DSL cannot target this device")
     pytest.importorskip("cutlass")
 
     torch.manual_seed(23)

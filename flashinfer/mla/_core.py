@@ -1298,8 +1298,8 @@ def _resolve_dsv4_sparse_mla_backend(
 ) -> Literal["trtllm-gen", "cute-dsl", "sparse", "cake"]:
     cc = get_compute_capability(device)
     is_sm100_family = cc in ((10, 0), (10, 3), (10, 7))
-    # CuTe DSL HCA and the SM100 CAKE kernels require SM100/SM103;
-    # only the prebuilt cubin backend additionally covers SM107.
+    # The SM100 CAKE kernels require SM100/SM103; the prebuilt cubin backend and
+    # CuTe DSL HCA also cover SM107.
     is_sm100_or_sm103 = cc in ((10, 0), (10, 3))
     is_sm120_family = cc in ((12, 0), (12, 1))
     if requested_backend == "auto":
@@ -1320,9 +1320,9 @@ def _resolve_dsv4_sparse_mla_backend(
         raise ValueError(
             f"backend={requested_backend!r} requires SM100/SM103/SM107, got SM{cc[0]}{cc[1]}"
         )
-    if requested_backend == "cute-dsl" and not is_sm100_or_sm103:
+    if requested_backend == "cute-dsl" and not is_sm100_family:
         raise ValueError(
-            f"backend='cute-dsl' requires SM100/SM103, got SM{cc[0]}{cc[1]}"
+            f"backend='cute-dsl' requires SM100/SM103/SM107, got SM{cc[0]}{cc[1]}"
         )
     if requested_backend == "sparse" and not is_sm120_family:
         raise ValueError(f"backend='sparse' requires SM120/SM121, got SM{cc[0]}{cc[1]}")
@@ -1949,7 +1949,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     the packed backend's final base-2 LSE and finite-sink semantics are
     documented in :meth:`SparseMLASm120Wrapper.run`.
 
-    With ``backend="cute-dsl"`` on SM100/SM103, this calls the DeepSeek V4
+    With ``backend="cute-dsl"`` on SM100/SM103/SM107, this calls the DeepSeek V4
     HCA kernel. Its SWA stream consumes arbitrary physical token-row indices,
     matching the TRTLLM-GEN dynamic-token-sparse ABI, while its compressed
     stream consumes physical page IDs. HCA currently accepts dense FP8 E4M3
