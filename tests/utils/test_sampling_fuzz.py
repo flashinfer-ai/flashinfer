@@ -17,7 +17,7 @@ import math
 import os
 import random
 from dataclasses import dataclass, field, replace
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import pytest
 import torch
@@ -933,6 +933,440 @@ def test_sampling_distribution(sc, indices_dtype):
         f"  target={[round(x, 4) for x in target.tolist()]}\n"
         f"  freq={[round(x, 4) for x in (counts / counts.sum()).tolist()]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Chain speculative sampling. The CPU oracle mirrors the kernel's two acceptance
+# passes: the emitted count stops at the first rejection, while the accepted count
+# evaluates that position and every later draft independently with fresh draws.
+# GPU cases stay in this fuzzer and reuse its ledger and statistical gate.
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ChainReferenceResult:
+    output_token_ids: Tuple[int, ...]
+    accepted_token_num: int
+    emitted_draft_token_num: int
+    correction_distribution: torch.Tensor
+
+
+def reference_chain_positive_residual(
+    draft_probs: torch.Tensor, target_probs: torch.Tensor
+) -> torch.Tensor:
+    """Normalized ``max(target - draft, 0)`` in float64 on CPU."""
+    draft = draft_probs.detach().to("cpu", torch.float64)
+    target = target_probs.detach().to("cpu", torch.float64)
+    if draft.ndim != 1 or draft.shape != target.shape:
+        raise ValueError("draft and target must be equal-length 1-D tensors")
+    weights = torch.clamp(target - draft, min=0)
+    if not bool(torch.isfinite(weights).all()) or weights.sum().item() <= 0:
+        raise ValueError("positive residual must have finite, nonzero mass")
+    return weights / weights.sum()
+
+
+def _reference_chain_draw(weights: torch.Tensor, uniform: float) -> int:
+    if not 0 <= uniform < 1:
+        raise ValueError("uniform draw must be in [0, 1)")
+    weights = weights.detach().to("cpu", torch.float64)
+    if weights.ndim != 1 or weights.sum().item() <= 0:
+        raise ValueError("sampling weights must be a nonempty 1-D tensor")
+    threshold = uniform * weights.sum().item()
+    for token_id, cumulative in enumerate(torch.cumsum(weights, dim=0).tolist()):
+        if cumulative > threshold:
+            return token_id
+    raise AssertionError("reference draw did not select a token")
+
+
+def reference_chain_speculative_sampling(
+    draft_probs: torch.Tensor,
+    draft_token_ids: Sequence[int],
+    target_probs: torch.Tensor,
+    acceptance_uniforms: Sequence[float],
+    correction_uniform: float,
+) -> ChainReferenceResult:
+    """Pure-CPU reference for one chain request with explicit random draws."""
+    draft = draft_probs.detach().to("cpu", torch.float64)
+    target = target_probs.detach().to("cpu", torch.float64)
+    num_speculative = len(draft_token_ids)
+    if draft.ndim != 2 or target.ndim != 2:
+        raise ValueError("draft and target probabilities must be 2-D")
+    if draft.shape[0] != num_speculative or target.shape[0] != num_speculative + 1:
+        raise ValueError("target must have exactly one bonus row")
+    if draft.shape[1] != target.shape[1]:
+        raise ValueError("draft and target vocabulary sizes must match")
+    if not bool(torch.isfinite(draft).all() and torch.isfinite(target).all()):
+        raise ValueError("probabilities must be finite")
+    if bool((draft < 0).any() or (target < 0).any()):
+        raise ValueError("probabilities must be nonnegative")
+    if not torch.allclose(
+        draft.sum(1), torch.ones(num_speculative, dtype=torch.float64)
+    ):
+        raise ValueError("draft rows must sum to one")
+    if not torch.allclose(
+        target.sum(1), torch.ones(num_speculative + 1, dtype=torch.float64)
+    ):
+        raise ValueError("target rows must sum to one")
+    if any(token < 0 or token >= draft.shape[1] for token in draft_token_ids):
+        raise ValueError("draft token id out of range")
+
+    draws = iter(acceptance_uniforms)
+
+    def next_acceptance_draw() -> float:
+        try:
+            uniform = float(next(draws))
+        except StopIteration as exc:
+            raise ValueError("not enough acceptance draws") from exc
+        if not 0 <= uniform < 1:
+            raise ValueError("acceptance draw must be in [0, 1)")
+        return uniform
+
+    output = [-1] * (num_speculative + 1)
+    first_rejection = num_speculative
+    for pos, draft_id in enumerate(draft_token_ids):
+        if next_acceptance_draw() * draft[pos, draft_id] < target[pos, draft_id]:
+            output[pos] = draft_id
+        else:
+            first_rejection = pos
+            break
+
+    emitted = first_rejection
+    accepted = first_rejection
+    for pos in range(first_rejection, num_speculative):
+        draft_id = draft_token_ids[pos]
+        if next_acceptance_draw() * draft[pos, draft_id] < target[pos, draft_id]:
+            accepted += 1
+
+    if first_rejection == num_speculative:
+        correction = target[-1] / target[-1].sum()
+    else:
+        correction = reference_chain_positive_residual(
+            draft[first_rejection], target[first_rejection]
+        )
+    output[first_rejection] = _reference_chain_draw(correction, correction_uniform)
+    return ChainReferenceResult(tuple(output), accepted, emitted, correction)
+
+
+@dataclass(frozen=True)
+class ChainCfg:
+    case: str
+    deterministic: bool
+    seed: int
+    offset: int
+
+    @property
+    def label(self) -> str:
+        mode = "det" if self.deterministic else "nondet"
+        return f"{self.case}_{mode}_seed{self.seed}_offset{self.offset}"
+
+
+_CHAIN_LEDGER = FuzzLedger("chain-speculative-sampling")
+_CHAIN_FORCED_CONFIGS = [
+    ChainCfg(case, deterministic, 0xC0DE, 17)
+    for case in ("first_rejection", "middle_rejection", "all_accepted")
+    for deterministic in (True, False)
+]
+_CHAIN_RNG_CASES = ((0xC0DE, 0), (0xC0DE, 97), (0xFACE, 1024))
+_CHAIN_DISTRIBUTION_CONFIGS = [
+    ChainCfg(case, deterministic, seed, offset)
+    for case in ("correction", "bonus")
+    for deterministic in (True, False)
+    for seed, offset in _CHAIN_RNG_CASES
+]
+_CHAIN_SAMPLE_COUNT = 1 << 15
+_CHAIN_ALPHA_PER = ALPHA_FAMILY / len(_CHAIN_DISTRIBUTION_CONFIGS)
+
+
+def _chain_forced_inputs(case: str, batch_size: int = 4):
+    num_speculative = 3
+    vocab = 4
+    draft = torch.zeros(
+        batch_size, num_speculative, vocab, dtype=_DTYPE, device=_DEVICE
+    )
+    draft[:, :, 0] = 1
+    target = torch.zeros(
+        batch_size, num_speculative + 1, vocab, dtype=_DTYPE, device=_DEVICE
+    )
+    draft_ids = torch.zeros(
+        batch_size, num_speculative, dtype=torch.int32, device=_DEVICE
+    )
+    if case == "first_rejection":
+        target[:, 0, 1] = 1
+        target[:, 1:3, 0] = 1
+        target[:, 3, 2] = 1
+        expected = ([1, -1, -1, -1], 2, 0)
+    elif case == "middle_rejection":
+        target[:, 0, 0] = 1
+        target[:, 1, 1] = 1
+        target[:, 2, 0] = 1
+        target[:, 3, 2] = 1
+        expected = ([0, 1, -1, -1], 2, 1)
+    elif case == "all_accepted":
+        target[:, :3, 0] = 1
+        target[:, 3, 3] = 1
+        expected = ([0, 0, 0, 3], 3, 3)
+    else:
+        raise ValueError(case)
+    return draft, draft_ids, target, expected
+
+
+def _assert_chain_forced_result(
+    output: torch.Tensor,
+    accepted: torch.Tensor,
+    emitted: torch.Tensor,
+    expected_tokens: Sequence[int],
+    expected_accepted: int,
+    expected_emitted: int,
+    label: str,
+) -> None:
+    expected_output = torch.tensor(
+        expected_tokens, dtype=torch.int32, device=output.device
+    ).expand_as(output)
+    assert torch.equal(output, expected_output), label
+    assert torch.equal(accepted, torch.full_like(accepted, expected_accepted)), label
+    assert torch.equal(emitted, torch.full_like(emitted, expected_emitted)), label
+
+
+@_GPU_ONLY
+@pytest.mark.parametrize(
+    "cfg", _CHAIN_FORCED_CONFIGS, ids=[cfg.label for cfg in _CHAIN_FORCED_CONFIGS]
+)
+def test_chain_sampling_forced_contract(cfg: ChainCfg):
+    """First/middle rejection and all-accepted keep outputs and counters distinct."""
+    _CHAIN_LEDGER.xfail_if_quarantined(cfg)
+    draft, draft_ids, target, expected = _chain_forced_inputs(cfg.case)
+    expected_tokens, accepted_increment, emitted_increment = expected
+    accepted_base, emitted_base = 11, 7
+    accepted = torch.full(
+        (draft.size(0),), accepted_base, dtype=torch.int32, device=_DEVICE
+    )
+    emitted = torch.full(
+        (draft.size(0),), emitted_base, dtype=torch.int32, device=_DEVICE
+    )
+    output, returned_accepted, returned_emitted = (
+        _flashinfer().sampling.chain_speculative_sampling(
+            draft,
+            draft_ids,
+            target,
+            accepted,
+            emitted,
+            deterministic=cfg.deterministic,
+            seed=cfg.seed,
+            offset=cfg.offset,
+        )
+    )
+    torch.cuda.synchronize()
+    assert returned_accepted.data_ptr() == accepted.data_ptr(), cfg.label
+    assert returned_emitted.data_ptr() == emitted.data_ptr(), cfg.label
+    _assert_chain_forced_result(
+        output,
+        accepted,
+        emitted,
+        expected_tokens,
+        accepted_base + accepted_increment,
+        emitted_base + emitted_increment,
+        cfg.label,
+    )
+
+
+def _chain_distribution_inputs(case: str):
+    batch_size = _CHAIN_SAMPLE_COUNT
+    vocab = 4
+    if case == "correction":
+        draft_row = torch.tensor([0.5, 0.1, 0.2, 0.2], dtype=_DTYPE)
+        target_row = torch.tensor([0.0, 0.4, 0.3, 0.3], dtype=_DTYPE)
+        bonus_row = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=_DTYPE)
+        draft = draft_row.view(1, 1, vocab).expand(batch_size, 1, vocab)
+        target = (
+            torch.stack((target_row, bonus_row))
+            .unsqueeze(0)
+            .expand(batch_size, 2, vocab)
+        )
+        expected = reference_chain_positive_residual(draft_row, target_row)
+        sample_column, accepted_increment, emitted_increment = 0, 0, 0
+    elif case == "bonus":
+        draft_row = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=_DTYPE)
+        verify_row = draft_row.clone()
+        bonus_row = torch.tensor([0.1, 0.2, 0.3, 0.4], dtype=_DTYPE)
+        draft = draft_row.view(1, 1, vocab).expand(batch_size, 1, vocab)
+        target = (
+            torch.stack((verify_row, bonus_row))
+            .unsqueeze(0)
+            .expand(batch_size, 2, vocab)
+        )
+        expected = reference_normalize(bonus_row)
+        sample_column, accepted_increment, emitted_increment = 1, 1, 1
+    else:
+        raise ValueError(case)
+    draft_ids = torch.zeros(batch_size, 1, dtype=torch.int32)
+    return (
+        draft.contiguous().to(_DEVICE),
+        draft_ids.to(_DEVICE),
+        target.contiguous().to(_DEVICE),
+        expected,
+        sample_column,
+        accepted_increment,
+        emitted_increment,
+    )
+
+
+def _assert_chain_distribution_fit(
+    counts: torch.Tensor, expected: torch.Tensor, label: str
+) -> None:
+    assert int(counts[expected == 0].sum()) == 0, label
+    result = chi_square_gof(counts, expected)
+    significant = result.p_value < _CHAIN_ALPHA_PER
+    large_effect = result.tvd > TVD_FLOOR or result.max_resid > RESID_FLOOR
+    assert not (significant and large_effect), (
+        f"{label}: chain distribution mismatch\n"
+        f"  chi2={result.statistic:.2f} dof={result.dof} "
+        f"p={result.p_value:.3e} alpha_per={_CHAIN_ALPHA_PER:.2e} "
+        f"tvd={result.tvd:.4f} max_resid={result.max_resid:.2f}\n"
+        f"  target={[round(x, 4) for x in expected.tolist()]}\n"
+        f"  freq={[round(x, 4) for x in (counts / counts.sum()).tolist()]}"
+    )
+
+
+@_GPU_ONLY
+@pytest.mark.parametrize(
+    "cfg",
+    _CHAIN_DISTRIBUTION_CONFIGS,
+    ids=[cfg.label for cfg in _CHAIN_DISTRIBUTION_CONFIGS],
+)
+def test_chain_sampling_distribution(cfg: ChainCfg):
+    """Correction and bonus draws match their distinct target distributions."""
+    _CHAIN_LEDGER.xfail_if_quarantined(cfg)
+    (
+        draft,
+        draft_ids,
+        target,
+        expected,
+        sample_column,
+        accepted_increment,
+        emitted_increment,
+    ) = _chain_distribution_inputs(cfg.case)
+    output, accepted, emitted = _flashinfer().sampling.chain_speculative_sampling(
+        draft,
+        draft_ids,
+        target,
+        deterministic=cfg.deterministic,
+        seed=cfg.seed,
+        offset=cfg.offset,
+    )
+    torch.cuda.synchronize()
+    assert output.shape == (_CHAIN_SAMPLE_COUNT, 2), cfg.label
+    assert output.dtype == torch.int32, cfg.label
+    assert bool((accepted == accepted_increment).all()), cfg.label
+    assert bool((emitted == emitted_increment).all()), cfg.label
+    if cfg.case == "correction":
+        assert bool((output[:, 1] == -1).all()), cfg.label
+    else:
+        assert bool((output[:, 0] == 0).all()), cfg.label
+    samples = output[:, sample_column]
+    assert bool(((samples >= 0) & (samples < expected.numel())).all()), cfg.label
+    counts = torch.bincount(samples.long(), minlength=expected.numel()).cpu()
+    _assert_chain_distribution_fit(counts, expected, cfg.label)
+
+
+def _cpu_chain_case(case: str) -> ChainReferenceResult:
+    if case == "first_rejection":
+        draft = torch.tensor([[1.0, 0.0, 0.0], [0.4, 0.3, 0.3], [0.4, 0.3, 0.3]])
+        target = torch.tensor(
+            [
+                [0.0, 1.0, 0.0],
+                [0.5, 0.2, 0.3],
+                [0.5, 0.2, 0.3],
+                [0.1, 0.2, 0.7],
+            ]
+        )
+        draws = [0.1, 0.9, 0.9, 0.9]
+        correction_uniform = 0.5
+    elif case == "middle_rejection":
+        draft = torch.tensor([[0.4, 0.3, 0.3], [0.8, 0.1, 0.1], [0.6, 0.2, 0.2]])
+        target = torch.tensor(
+            [
+                [0.5, 0.2, 0.3],
+                [0.4, 0.35, 0.25],
+                [0.3, 0.4, 0.3],
+                [0.1, 0.2, 0.7],
+            ]
+        )
+        draws = [0.9, 0.9, 0.1, 0.9]
+        correction_uniform = 0.2
+    elif case == "all_accepted":
+        draft = torch.tensor([[0.4, 0.3, 0.3]] * 3)
+        target = torch.tensor(
+            [
+                [0.5, 0.2, 0.3],
+                [0.5, 0.2, 0.3],
+                [0.5, 0.2, 0.3],
+                [0.1, 0.2, 0.7],
+            ]
+        )
+        draws = [0.9, 0.9, 0.9]
+        correction_uniform = 0.5
+    else:
+        raise ValueError(case)
+    return reference_chain_speculative_sampling(
+        draft, [0, 0, 0], target, draws, correction_uniform
+    )
+
+
+def test_chain_reference_first_rejection_separates_counters():
+    result = _cpu_chain_case("first_rejection")
+    assert result.output_token_ids == (1, -1, -1, -1)
+    assert result.accepted_token_num == 2
+    assert result.emitted_draft_token_num == 0
+
+
+def test_chain_reference_middle_rejection_keeps_padding():
+    result = _cpu_chain_case("middle_rejection")
+    assert result.output_token_ids == (0, 1, -1, -1)
+    assert result.accepted_token_num == 2
+    assert result.emitted_draft_token_num == 1
+
+
+def test_chain_reference_all_accepted_uses_bonus():
+    result = _cpu_chain_case("all_accepted")
+    assert result.output_token_ids == (0, 0, 0, 2)
+    assert result.accepted_token_num == result.emitted_draft_token_num == 3
+    torch.testing.assert_close(
+        result.correction_distribution,
+        torch.tensor([0.1, 0.2, 0.7], dtype=torch.float64),
+    )
+
+
+def test_chain_reference_normalizes_positive_residual():
+    residual = reference_chain_positive_residual(
+        torch.tensor([0.5, 0.1, 0.4]), torch.tensor([0.0, 0.4, 0.6])
+    )
+    torch.testing.assert_close(
+        residual, torch.tensor([0.0, 0.6, 0.4], dtype=torch.float64)
+    )
+
+
+def test_chain_distribution_gate_rejects_target_only_correction():
+    residual = torch.tensor([0.0, 0.6, 0.2, 0.2], dtype=torch.float64)
+    target_only = torch.tensor([0.0, 0.4, 0.3, 0.3], dtype=torch.float64)
+    counts = (target_only * _CHAIN_SAMPLE_COUNT).round().to(torch.int64)
+    counts[target_only.argmax()] += _CHAIN_SAMPLE_COUNT - int(counts.sum())
+    with pytest.raises(AssertionError, match="chain distribution mismatch"):
+        _assert_chain_distribution_fit(counts, residual, "target-only mutant")
+
+
+def test_chain_reference_detects_collapsed_counter_mutant():
+    result = _cpu_chain_case("first_rejection")
+    output = torch.tensor([result.output_token_ids], dtype=torch.int32)
+    emitted = torch.tensor([result.emitted_draft_token_num], dtype=torch.int32)
+    collapsed_accepted = emitted.clone()
+    with pytest.raises(AssertionError):
+        _assert_chain_forced_result(
+            output,
+            collapsed_accepted,
+            emitted,
+            result.output_token_ids,
+            result.accepted_token_num,
+            result.emitted_draft_token_num,
+            "collapsed-counter mutant",
+        )
 
 
 def test_statistical_machinery():
