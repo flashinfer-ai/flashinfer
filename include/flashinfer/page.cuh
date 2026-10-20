@@ -708,10 +708,8 @@ cudaError_t NVFP4QuantizeAppendPagedKVCacheWithSlotMapping(
 }
 
 // Block-wide max reduction. ``kNumThreads`` must equal ``blockDim.x``. ``red`` is
-// shared scratch of at least ``(kNumThreads + 31) / 32`` floats. Pass a distinct
-// buffer per reduction: the trailing barrier only orders barrier arrival, so a
-// second reduction on the same buffer could write partials before a slow warp
-// has read the first result.
+// shared scratch of at least ``(kNumThreads + 31) / 32`` floats; pass a distinct
+// buffer per reduction.
 template <uint32_t kNumThreads>
 __device__ __forceinline__ float fp8_pth_block_max(float val, float* red) {
 #pragma unroll
