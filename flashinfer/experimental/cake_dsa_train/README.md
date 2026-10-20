@@ -326,6 +326,10 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
   int32 global key rows, `topk_length` and the validity rules as above.
   `softmax_scale` defaults to `1 / 16`.
 * Backend entries (`cake_backend`): `forward_nope`, `backward_nope`,
+  `forward_nope_varlen` (the packed forward without autograd: the public
+  entry's index route by table size; returns `(out, lse, o_lo, indices,
+  topk_length)`, the global rows and lengths `backward_nope` takes with
+  `num_segments = cu_seqlens_k.numel() - 1` and a caller-zeroed `dkv_acc`),
   `prepare_dsa_nope_train` / `DSANopeTrainRunner`, `dsa_nope_train_workspace_size`,
   `validate_dsa_nope_inputs`, `DSASparseAttentionNopeFunction` (12 forward inputs,
   gradients for `q` and `kv` only).  The binding cache is shared; the NoPE keys are
@@ -367,6 +371,14 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
   arguments before the first launch, so no host work sits between the two.
   `causal=True` drops keys after the query's own position, query segments are
   tails of their key prefix.  The NoPE entries have no torch fallback.
+* Backward host order: the autograd wrappers settle their backward at forward
+  time (the binding key without `dout`, the operands autograd does not save,
+  the caller's `dkv_acc` validated once), so the backward's host work before
+  its first launch is the key completion with `dout`'s geometry, the binding
+  lookup, the `dq` / `delta` allocations and the value binding; the zero fills
+  of the FP32 buffers the call owns and the delta / main stages then follow
+  back to back, with no allocation, validation or synchronization between the
+  launches.  The kernel-level `backward_nope` keeps the same launch order.
   Every call checks the structure of the prefix sums (`validate_cu_seqlens`:
   contiguous int32 `[num_docs + 1]` of one length) and never synchronizes with
   the device; `check_cu_seqlens=True` also checks their values -- start at 0,
