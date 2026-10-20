@@ -282,6 +282,12 @@ PACKAGES: tuple[Package, ...] = (
         "cake_jit.py",
         refs_generic,
     ),
+    Package(
+        "flashinfer.experimental.cake_stepfun_moe",
+        "flashinfer/experimental/cake_stepfun_moe",
+        "cake_jit.py",
+        refs_moe_grouped_gemm,
+    ),
 )
 
 
