@@ -48,6 +48,7 @@ def test_a10g_coverage_and_t4_scope(tmp_path):
             "batch_decode_kernels",
             "batch_prefill_kernels",
             "block_sparse",
+            "cake_vsa_planning",
             "deepseek_mla",
             "logits_cap",
             "mla_page",
@@ -67,7 +68,7 @@ def test_a10g_coverage_and_t4_scope(tmp_path):
         "cli": ["cli_cmds", "cli_cmds_gpu"],
         "moe": ["bgmv_moe", "bgmv_moe_lora_delta"],
         "gemm": ["group_gemm"],
-        "experimental": ["experimental_api"],
+        "experimental": ["cake_vsa_sm90", "experimental_api"],
     }
     files = {
         f"tests/{folder}/test_{name}.py"
