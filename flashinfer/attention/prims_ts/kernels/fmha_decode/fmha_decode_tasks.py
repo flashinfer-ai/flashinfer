@@ -1594,33 +1594,38 @@ def create_page_offsets_task_split_kv(
 ) -> Task:
     """Prefetch split-KV K/V page windows with independent consumer state."""
 
+    # One K and one V label per K/V tile of a loop step: both instances' tiles,
+    # or the single tile a query-paired CTA loads for both of its Q tiles.
+    kv_labels = (("load_k0", "load_v0"), ("load_k1", "load_v1"))[
+        : cfg.kv_tiles_per_loop
+    ]
+
     def page_offsets_schedule_body(
         smem_page_offsets_k: MemoryResource,
         smem_page_offsets_v: MemoryResource,
         membership_lifetime: MemoryResource | None,
     ) -> None:
-        """Publish one page-offset stage for every paired K/V tile."""
+        """Publish one page-offset stage for every K/V tile the loads issue."""
         if membership_lifetime is not None:
             membership_lifetime.acquire()
         smem_page_offsets_k.init_load_state()
         smem_page_offsets_v.init_load_state()
 
-        # HEAD: publish the initial K0/K1 pair as two independent stages.
-        _page_offsets_produce(smem_page_offsets_k, "load_k0", FmhaStage.Head)
-        if membership_lifetime is not None:
-            membership_lifetime.commit()
-        _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Head)
+        # HEAD: publish the initial K tiles as independent stages.
+        for tile_idx, (load_k, _) in enumerate(kv_labels):
+            _page_offsets_produce(smem_page_offsets_k, load_k, FmhaStage.Head)
+            if tile_idx == 0 and membership_lifetime is not None:
+                membership_lifetime.commit()
 
         # LOOP: mirror LoadTask's cross-resource consumption order exactly.
         with domain_loop(0, domain, 1, unroll=1):
-            _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Loop)
-            _page_offsets_produce(smem_page_offsets_k, "load_k0", FmhaStage.Loop)
-            _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Loop)
-            _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Loop)
+            for load_k, load_v in kv_labels:
+                _page_offsets_produce(smem_page_offsets_v, load_v, FmhaStage.Loop)
+                _page_offsets_produce(smem_page_offsets_k, load_k, FmhaStage.Loop)
 
-        # TAIL: drain V0/V1 through distinct page-offset stages.
-        _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Tail)
-        _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Tail)
+        # TAIL: drain the V tiles through distinct page-offset stages.
+        for _, load_v in kv_labels:
+            _page_offsets_produce(smem_page_offsets_v, load_v, FmhaStage.Tail)
 
     @_schedule_with_optional_resources
     def page_offsets_schedule(

@@ -1,8 +1,10 @@
-"""Query-paired dense Q128 plans of the PrimTS decode kernel.
+"""Query-paired Q128 plans of the PrimTS decode kernel.
 
 A query-paired plan runs two consecutive Q128 tiles of one sequence and KV
 head on one CTA, each K/V instance owning a tile over the whole K/V stream.
-Sage recipes are covered in ``test_attention_ts_sage.py``.
+Dense block-sparse wrapper plans pair contiguous K/V; paged decode plans pair
+when ``query_paired=True`` and the launch qualifies. Sage recipes are covered
+in ``test_attention_ts_sage.py``.
 """
 
 from __future__ import annotations
@@ -12,11 +14,25 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from flashinfer.attention.prims_ts import _block_sparse
+from flashinfer.attention.prims_ts import (
+    _block_sparse,
+    get_prims_ts_batch_decode_workspace_size,
+    prepare_prims_ts_batch_decode_with_kv_cache,
+)
+from flashinfer.attention.prims_ts import decode as decode_module
 from flashinfer.attention.prims_ts.block_sparse import BlockSparseTSWrapper
 from tests.attention.test_attention_ts_block_sparse import (
     _HEAD_DIM,
     _REQUIRES_PRIMTS_GPU,
+)
+from tests.attention.test_attention_ts_decode import (
+    _assert_case_correct,
+    _exercise_public_paths,
+    _make_decode_case,
+    _pack_decode_case,
+    _plan_case,
+    _run_case,
+    _seq_lens_from_csr,
 )
 
 sparse_config = _block_sparse.config
@@ -199,3 +215,245 @@ def test_query_paired_plan_rejects_other_profiles(
     )
     with pytest.raises(NotImplementedError, match=match):
         BlockSparseTSWrapper().plan(**{**arguments, **overrides})
+
+
+@dataclass(frozen=True)
+class _PagedPairedCase:
+    """One paged decode problem whose Q tiles fill a wave of CTAs when paired."""
+
+    name: str
+    heads_q_per_kv: int
+    seq_len_q: int
+    num_kv_heads: int = 8
+    batch_size: int = 16
+    page_size: int = 32
+    mask_type: str = "dense"
+    dtype: torch.dtype = torch.bfloat16
+    # Per-request Q lengths of a packed batch, cycled over the batch.
+    q_lens: tuple[int, ...] | None = None
+
+    @property
+    def kv_lens(self) -> tuple[int, ...]:
+        # Ragged lengths; the longest makes the first CTA of a 64-token causal
+        # request stream one K/V tile its first Q tile cannot see.
+        return tuple(1072 - 97 * (i % 7) for i in range(self.batch_size))
+
+
+_PAGED_CASES = (
+    _PagedPairedCase("bf16_group8_three_tiles", heads_q_per_kv=8, seq_len_q=48),
+    _PagedPairedCase(
+        "fp16_group8_causal_page16",
+        heads_q_per_kv=8,
+        seq_len_q=64,
+        page_size=16,
+        mask_type="causal",
+        dtype=torch.float16,
+    ),
+    # One token per Q tile: five tiles leave the last CTA's second tile past
+    # the sequence.
+    _PagedPairedCase(
+        "bf16_group128_causal_page64",
+        heads_q_per_kv=128,
+        seq_len_q=5,
+        num_kv_heads=4,
+        page_size=64,
+        mask_type="causal",
+    ),
+    # 96 heads leave 32 padding rows in each one-token Q tile.
+    _PagedPairedCase(
+        "bf16_group96_page128",
+        heads_q_per_kv=96,
+        seq_len_q=4,
+        num_kv_heads=4,
+        page_size=128,
+    ),
+    _PagedPairedCase(
+        "bf16_group8_packed_causal",
+        heads_q_per_kv=8,
+        seq_len_q=64,
+        mask_type="causal",
+        q_lens=(64, 5, 33, 48, 17),
+    ),
+)
+
+
+def _paged_decode_case(case: _PagedPairedCase):
+    """Build ``case``'s inputs and reference; packed cases also return Q offsets."""
+
+    decode_case = _make_decode_case(
+        kv_lens=case.kv_lens,
+        num_qo_heads=case.heads_q_per_kv * case.num_kv_heads,
+        num_kv_heads=case.num_kv_heads,
+        head_dim=_HEAD_DIM,
+        seq_len_q=case.seq_len_q,
+        page_size=case.page_size,
+        qkv_dtype=case.dtype,
+        output_dtype=case.dtype,
+        cache_form="tuple",
+        mask_type=case.mask_type,
+        device="cuda",
+        seed=20261020,
+    )
+    if case.q_lens is None:
+        return decode_case, None
+    q_lens = [case.q_lens[i % len(case.q_lens)] for i in range(case.batch_size)]
+    return _pack_decode_case(decode_case, q_lens)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("case", _PAGED_CASES, ids=lambda case: case.name)
+@torch.no_grad()
+def test_paged_query_paired_public_paths(case: _PagedPairedCase) -> None:
+    """A paired paged plan matches FP32 attention eagerly, standalone and in a graph."""
+
+    decode_case, qo_indptr = _paged_decode_case(case)
+    seq_lens = _seq_lens_from_csr(
+        decode_case.paged_kv_indptr,
+        decode_case.paged_kv_last_page_len,
+        case.page_size,
+    )
+    wrapper = _plan_case(
+        decode_case,
+        max_kv_len=max(case.kv_lens),
+        qo_indptr=qo_indptr,
+        max_seq_len_q=case.seq_len_q,
+        query_paired=True,
+    )
+    policy = dict(wrapper._policy)
+    assert policy["query_paired"] is True
+    assert policy["tile_size_q"] == 128
+    _exercise_public_paths(
+        wrapper,
+        decode_case,
+        seq_lens,
+        max_kv_len=max(case.kv_lens),
+        exercise_all_paths=True,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=case.seq_len_q,
+    )
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@torch.no_grad()
+def test_prepared_paged_query_paired_matches_wrapper() -> None:
+    """A prepared paired launch reproduces the paired wrapper, eagerly and in a graph."""
+
+    case = _PagedPairedCase(
+        "bf16_group8_causal", heads_q_per_kv=8, seq_len_q=48, mask_type="causal"
+    )
+    decode_case, _ = _paged_decode_case(case)
+    seq_lens = _seq_lens_from_csr(
+        decode_case.paged_kv_indptr,
+        decode_case.paged_kv_last_page_len,
+        case.page_size,
+    )
+    max_kv_len = max(case.kv_lens)
+    wrapper = _plan_case(decode_case, max_kv_len=max_kv_len, query_paired=True)
+    assert dict(wrapper._policy)["query_paired"] is True
+    expected = _run_case(wrapper, decode_case)
+
+    workspace = torch.zeros(
+        get_prims_ts_batch_decode_workspace_size(
+            case.batch_size,
+            case.heads_q_per_kv * case.num_kv_heads,
+            case.num_kv_heads,
+            _HEAD_DIM,
+            case.page_size,
+            max_kv_len,
+            seq_len_q=case.seq_len_q,
+            q_dtype=case.dtype,
+            out_dtype=case.dtype,
+            mask_type=case.mask_type,
+            device="cuda",
+            query_paired=True,
+        ),
+        dtype=torch.int8,
+        device="cuda",
+    )
+    out = torch.empty_like(expected)
+    prepared = prepare_prims_ts_batch_decode_with_kv_cache(
+        decode_case.q,
+        decode_case.paged_kv_cache,
+        workspace,
+        decode_case.block_tables,
+        seq_lens,
+        max_kv_len,
+        out=out,
+        seq_len_q=case.seq_len_q,
+        out_dtype=case.dtype,
+        mask_type=case.mask_type,
+        page_size=case.page_size,
+        query_paired=True,
+    )
+    run_args = dict(
+        bmm1_scale=decode_case.bmm1_scale, bmm2_scale=decode_case.bmm2_scale
+    )
+    assert prepared.run(decode_case.q, out=out, **run_args) is out
+    torch.cuda.synchronize()
+    _assert_case_correct(out, decode_case)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    graph_out = torch.full_like(expected, float("nan"))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        prepared.run(decode_case.q, out=graph_out, **run_args)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_out, expected, rtol=0, atol=0)
+
+
+_PAIRED_DECODE_SHAPE = dict(
+    batch_size=16,
+    num_qo_heads=64,
+    num_kv_heads=8,
+    head_dim=_HEAD_DIM,
+    page_size=32,
+    max_kv_len=4096,
+    seq_len_q=48,
+    q_dtype_key="bfloat16",
+    k_dtype_key="bfloat16",
+    v_dtype_key="bfloat16",
+    output_dtype_key="bfloat16",
+    kv_layout="HND",
+    mask_type="causal",
+    use_packed_q=False,
+    window_left=-1,
+)
+
+
+def _paged_policy(query_paired: bool | None, **changes: object) -> dict[str, object]:
+    shape = {**_PAIRED_DECODE_SHAPE, **changes}
+    spec = decode_module._resolve_decode_launch_spec(
+        torch.cuda.current_device(), **shape, query_paired=query_paired
+    )
+    return dict(spec.policy)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    ("query_paired", "changes"),
+    (
+        pytest.param(None, {}, id="none-plans-unpaired"),
+        pytest.param(False, {}, id="false"),
+        pytest.param(True, {"seq_len_q": 16}, id="one-q-tile"),
+        pytest.param(True, {"batch_size": 1, "num_kv_heads": 1}, id="small-grid"),
+        pytest.param(True, {"window_left": 511}, id="sliding-window"),
+        pytest.param(True, {"head_dim": 256}, id="head-dim-256"),
+    ),
+)
+def test_paged_query_paired_plans_unpaired_when_unsupported(
+    query_paired: bool | None, changes: dict[str, object]
+) -> None:
+    """Pairing falls back to an unpaired plan and records that in the policy."""
+
+    assert _paged_policy(True)["query_paired"] is True
+    assert _paged_policy(query_paired, **changes)["query_paired"] is False
+
+
+def test_paged_query_paired_must_be_a_bool() -> None:
+    with pytest.raises(TypeError, match="query_paired"):
+        decode_module._resolve_decode_launch_spec(
+            0, **_PAIRED_DECODE_SHAPE, query_paired="yes"
+        )

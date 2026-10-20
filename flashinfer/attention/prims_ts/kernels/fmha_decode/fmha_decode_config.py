@@ -4891,7 +4891,7 @@ def _validate_mixed_kv_dtype_profile(cfg: FmhaDecodeConfig) -> None:
 
 
 def _validate_query_paired_config(cfg: FmhaDecodeConfig, split_kv_mode: str) -> None:
-    """Reject a query-paired config outside the dense Keeps Q128/KV128 schedule."""
+    """Reject a query-paired config outside the grouped Keeps Q128/KV128 schedule."""
     if (
         not cfg.use_keeps_mma_ab
         or not cfg.groups_tokens_heads_q
@@ -4905,17 +4905,18 @@ def _validate_query_paired_config(cfg: FmhaDecodeConfig, split_kv_mode: str) -> 
             "query_paired requires the grouped Keeps Q128/KV128 headdim-128 "
             "profile with two instances"
         )
+    if not cfg._uses_contiguous_grouped_keeps_recipe:
+        raise ValueError("query_paired supports FP16, BF16 and Sage recipes")
     if (
         cfg.use_block_sparse
         or cfg.use_split_kv
         or split_kv_mode != "disabled"
         or cfg.use_transform_kv
-        or cfg.use_paged_kv
         or cfg.use_sliding_window_causal
     ):
         raise ValueError(
-            "query_paired supports contiguous K/V only: no block-sparse routes, "
-            "sliding windows, paged K/V, split-KV or transform-KV"
+            "query_paired supports no block-sparse routes, sliding windows, "
+            "split-KV or transform-KV"
         )
 
 
