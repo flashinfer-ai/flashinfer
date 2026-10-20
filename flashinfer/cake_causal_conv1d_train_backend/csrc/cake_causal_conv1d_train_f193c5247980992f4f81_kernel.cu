@@ -320,12 +320,12 @@ kernel_cake_causal_conv1d_train_f193c5247980992f4f81(__nv_bfloat16* __restrict__
             if (interior != 0) {
                 #pragma unroll
                 for (int u = 0; u < 8; u++) {
-                    __int128_t _smem_b128_2;
-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_2) : "r"(sbase + u * 2048));
-                    *reinterpret_cast<uint32_t*>(&pk[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[0];
-                    *reinterpret_cast<uint32_t*>(&pk[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[1];
-                    *reinterpret_cast<uint32_t*>(&pk[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[2];
-                    *reinterpret_cast<uint32_t*>(&pk[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[3];
+                    __int128_t _smem_raw_2;
+                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_2) : "r"(sbase + u * 2048));
+                    pk[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[0];
+                    pk[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[1];
+                    pk[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[2];
+                    pk[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[3];
                     #pragma unroll
                     for (int kk = 0; kk < 4; kk++) {
                         win[u % 4 * 8 + 2 * kk] = __uint_as_float(pk[kk] << 16);
@@ -366,12 +366,12 @@ kernel_cake_causal_conv1d_train_f193c5247980992f4f81(__nv_bfloat16* __restrict__
                 for (int u_1 = 0; u_1 < 8; u_1++) {
                     if (rows_k_1 > u_1) {
                         int tcur = tb + u_1;
-                        __int128_t _smem_b128_3;
-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_3) : "r"(sbase + u_1 * 2048));
-                        *reinterpret_cast<uint32_t*>(&pk[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[0];
-                        *reinterpret_cast<uint32_t*>(&pk[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[1];
-                        *reinterpret_cast<uint32_t*>(&pk[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[2];
-                        *reinterpret_cast<uint32_t*>(&pk[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[3];
+                        __int128_t _smem_raw_3;
+                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_3) : "r"(sbase + u_1 * 2048));
+                        pk[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[0];
+                        pk[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[1];
+                        pk[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[2];
+                        pk[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[3];
                         #pragma unroll
                         for (int kk_2 = 0; kk_2 < 4; kk_2++) {
                             win[u_1 % 4 * 8 + 2 * kk_2] = __uint_as_float(pk[kk_2] << 16);
