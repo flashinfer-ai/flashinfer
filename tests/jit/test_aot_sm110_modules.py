@@ -51,7 +51,6 @@ NOT_SM110_MODULES = {
     "gen_trtllm_gen_fused_moe_sm100_module",
     "gen_trtllm_gen_routing_module",
     "gen_tgv_gemm_sm10x_module",
-    "gen_moe_utils_module",
     "gen_trtllm_mnnvl_comm_module",
 }
 
@@ -208,7 +207,6 @@ def test_shared_generators_target_sm110(monkeypatch, module, generator):
     [
         ("flashinfer.jit.gemm.core", "gen_gemm_sm100_module"),
         ("flashinfer.jit.gemm.core", "gen_gemm_sm100_module_cutlass_nvfp4_svdquant"),
-        ("flashinfer.jit.moe_utils", "gen_moe_utils_module"),
         ("flashinfer.jit.comm", "gen_trtllm_mnnvl_comm_module"),
     ],
 )
