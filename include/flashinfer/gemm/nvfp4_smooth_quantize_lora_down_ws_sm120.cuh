@@ -569,10 +569,14 @@ inline cudaError_t launch_ws_kernel(void const* x, void const* pre_quant_scale,
   X(32, 64, 4, 2, 0)                  \
   X(32, 64, 4, 4, 0)
 
+// A template so that only the rank-128 module, whose dispatch names it inside
+// `if constexpr (Rank == 128)`, instantiates these kernels.
+template <int Rank>
 inline cudaError_t nvfp4_smooth_quantize_lora_down_ws_rank128_sm120(
     void const* x, void const* pre_quant_scale, float const* global_scale, void* xq, void* sf,
     void const* l2t_kmajor, void* down, int m, int k, int tile_m, int tile_k,
     int packed_tiling, int grid_mode, cudaStream_t stream) {
+  static_assert(Rank == smooth_quantize_lora_down_ws_sm120_detail::kRank);
   namespace ws = smooth_quantize_lora_down_ws_sm120_detail;
   // The third tiling field packs down layout * 1000 + stages * 100 + quant
   // warps; down layout 0 = 2x4 down warps (rows x columns), 1 = 2x8, 2 = 1x8.

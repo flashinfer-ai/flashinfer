@@ -1485,7 +1485,7 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
   // large-M families only.
   if constexpr (Rank == 128) {
     if (family == 5) {
-      return nvfp4_smooth_quantize_lora_down_ws_rank128_sm120(
+      return nvfp4_smooth_quantize_lora_down_ws_rank128_sm120<Rank>(
           x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, a, b, c,
           address_policy, stream);
     }
