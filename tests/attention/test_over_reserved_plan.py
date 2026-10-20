@@ -14,6 +14,7 @@ DEVICE = "cuda:0"
 
 
 def _make_inputs(batch_size, kv_len, qo_len, page_size, surplus_pages, seed=0):
+    """Build paged KV cache inputs with surplus trailing pages."""
     torch.manual_seed(seed)
     pages = (kv_len + page_size - 1) // page_size + surplus_pages
     kv_cache = torch.randn(
@@ -46,6 +47,7 @@ def _make_inputs(batch_size, kv_len, qo_len, page_size, surplus_pages, seed=0):
 
 
 def _plan_kwargs(split_pages, window_left=-1):
+    """Return plan() keyword arguments for split or unsplit KV."""
     kwargs = dict(
         causal=True,
         window_left=window_left,
@@ -59,6 +61,7 @@ def _plan_kwargs(split_pages, window_left=-1):
 
 
 def _plan(wrapper, inputs, page_size, split_pages, window_left=-1):
+    """Plan the paged prefill wrapper on the given inputs."""
     q, kv_cache, qo_indptr, kv_indptr, kv_indices, last_page_len, _ = inputs
     wrapper.plan(
         qo_indptr,
@@ -74,6 +77,7 @@ def _plan(wrapper, inputs, page_size, split_pages, window_left=-1):
 
 
 def _run(workspace, inputs, page_size, split_pages, window_left=-1):
+    """Plan and run paged FA2 prefill, returning float32 outputs."""
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         workspace, "NHD", backend="fa2"
     )
@@ -90,6 +94,7 @@ def _skip_unless_counts_differ(pages, page_size, split_pages, kv_len=KV_LEN):
 
 
 def _assert_close(out, reference):
+    """Assert output matches the unsplit reference within bf16 tolerance."""
     torch.testing.assert_close(
         out, reference, rtol=2e-2, atol=2e-2 * reference.abs().max().item()
     )
@@ -235,6 +240,7 @@ def test_batch_prefill_ragged_split_kv_matches_unsplit(qo_len, split_tokens):
     workspace = torch.zeros(256 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
 
     def run(split):
+        """Plan and run ragged FA2 prefill with the given split size."""
         wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
             workspace, "NHD", backend="fa2"
         )
