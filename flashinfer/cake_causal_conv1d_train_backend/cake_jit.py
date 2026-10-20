@@ -52,11 +52,12 @@ The program name ``cake_causal_conv1d_train_<20 hex>`` is the first twenty hex
 digits of the SHA-256 of the compact JSON ``{"build": <build keywords, sorted>,
 "module": <dotted kernel module>}`` of the kernel the program was rendered
 from; the forward is built with its kernel file's default keywords; the
-backward with ``vec=8`` (eight channels, 16-byte vectors, per thread) on
-sm_100a and sm_103a, with ``vec=8, min_blocks=2`` (two CTAs per SM) on
-sm_107a, and the big-channel backward (the program the ``channels_at_least``
-rule selects) with ``vec=8, copy="tma2d", stage_tokens=8, min_blocks=2``
-(eight-token stages, two CTAs per SM).
+backward with ``vec=8, copy="tma2d"`` (eight channels, 16-byte vectors, per
+thread; 2-D TMA row copies) on sm_100a and sm_103a, with ``vec=8,
+min_blocks=2`` (two CTAs per SM) on sm_107a, and the big-channel backward
+(the program the ``channels_at_least`` rule selects) with ``vec=8,
+copy="tma2d", stage_tokens=8, min_blocks=2`` (eight-token stages, two CTAs
+per SM).
 """
 
 from __future__ import annotations

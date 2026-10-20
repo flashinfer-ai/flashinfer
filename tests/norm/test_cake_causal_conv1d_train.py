@@ -681,6 +681,10 @@ def test_workspace_bytes_and_layout() -> None:
     record = loader.workspace_record(arch)
     owners = loader.workspace_owners(arch)
     assert record in owners
+    assert record is loader.MODULES[_fallback_program(arch)], (
+        "the public workspace size is the fallback program's, unchanged by the"
+        " programs a channel count selects"
+    )
     assert record["grid_rule"]["ctas_per_sm"] == max(
         owner["grid_rule"]["ctas_per_sm"] for owner in owners
     )
