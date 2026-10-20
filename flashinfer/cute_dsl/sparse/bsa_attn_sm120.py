@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 import math
 from typing import Optional, Tuple
 
@@ -145,7 +144,7 @@ def _prepare_sm120_sparse_metadata(
 _sm120_compile_cache = get_jit_cache("bsa_fwd_sm120")
 
 
-@functools.cache
+@flashinfer_api
 def bsa_attn_sm120_blk64_fwd(
     q: torch.Tensor,
     k: torch.Tensor,

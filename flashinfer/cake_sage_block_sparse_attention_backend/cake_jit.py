@@ -1631,12 +1631,13 @@ def _sm120_index() -> dict[tuple[int, int, int, int, int], str]:
     index: dict[tuple[int, int, int, int, int], str] = {}
     for name in records_of_role("attention_sm120"):
         rule = MODULES[name]["select_rule"]
-        key = tuple(int(rule[flag]) for flag in SM120_FLAGS)
+        a, b, c, d, e = (int(rule[flag]) for flag in SM120_FLAGS)
+        key = (a, b, c, d, e)
         if key in index:
             raise RuntimeError(
                 f"two SM120 records select the same specialization {key}: {index[key]} and {name}"
             )
-        index[key] = name  # type: ignore[index]
+        index[key] = name
     return index
 
 
