@@ -4,6 +4,7 @@ For development, the easiest way to install flashinfer is through editable insta
 
 ```
 git clone git@github.com:flashinfer-ai/flashinfer.git --recursive
+cd flashinfer
 pip install --no-build-isolation -e . -v
 ```
 
