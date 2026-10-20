@@ -146,6 +146,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "ct_vec"],
             ["parameter", "n_sub"],
             ["parameter", "n_ch_tiles"],
+            ["buffer", "x_map"],
+            ["buffer", "dy_map"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
