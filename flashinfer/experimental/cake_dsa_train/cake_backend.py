@@ -4010,6 +4010,10 @@ NOPE_FWD_CONVERT_ARGS = (
     "causal",
     "convert",
 )
+# Index tables (``T x K_slots``) below this many slots take the converting forward: one launch, so no host gap
+# between a preparation launch and the forward.  At or above it the preparation stage runs first and the forward
+# takes its rows: on large tables the preparation kernel converts faster than the forward's own producer path.
+NOPE_CONVERT_SLOT_LIMIT = 1 << 20
 _INT32_MAX = 2**31 - 1
 
 
@@ -4052,23 +4056,43 @@ def _nope_arch(tensor: torch.Tensor) -> str:
     return arch_for(tensor.device)
 
 
+def nope_varlen_index_mode(
+    num_queries: int, topk: int, *, caller_lengths: bool = False
+) -> str:
+    """The packed entry's index route for a ``[num_queries, topk]`` per-document index table, from its size alone
+    (no device or registry access): ``"kernel"`` -- the forward converts the rows itself, one launch -- below
+    :data:`NOPE_CONVERT_SLOT_LIMIT` slots without caller lengths; ``"index_prep"`` -- one launch of the
+    index-preparation stage, then the forward over its rows -- at or above it, and always with a caller-given
+    ``topk_length`` (the converting forward derives the lengths itself)."""
+    if caller_lengths:
+        return "index_prep"
+    small = int(num_queries) * int(topk) < NOPE_CONVERT_SLOT_LIMIT
+    return "kernel" if small else "index_prep"
+
+
 def varlen_index_mode(
     gather_kv_indices: torch.Tensor, *, caller_lengths: bool = False
 ) -> str:
-    """How the packed entry turns per-document index rows on ``gather_kv_indices``'s device into global key rows:
-    ``"kernel"`` when the registered forward program converts them itself (:func:`nope_fwd_converts_indices`; it
-    derives the row lengths, so not with caller lengths), else ``"index_prep"`` -- one launch of the record's
-    index-preparation stage right before the forward.  Raises ``NotImplementedError`` for a host tensor, a device
-    the NoPE record does not serve, or a registered program that offers neither.  The torch formulation
+    """The route :func:`nope_varlen_index_mode` selects for ``gather_kv_indices`` (``[T, K_slots]`` on a served
+    device), restricted to what the registered program offers: a program without the converting forward
+    (:func:`nope_fwd_converts_indices`) takes ``"index_prep"`` at every size, one without the index-preparation
+    stage takes ``"kernel"`` (never with caller lengths).  Raises ``NotImplementedError`` for a host tensor, a
+    device the NoPE record does not serve, or a program with neither.  The torch formulation
     :func:`offset_gather_kv_indices` is the rope entry's glue and the tests' reference, not a runtime mode of the
     NoPE entries."""
     _nope_arch(gather_kv_indices)
+    if gather_kv_indices.dim() != 2:
+        raise ValueError("gather_kv_indices must be [T, K_slots]")
+    num_rows, topk = (int(d) for d in gather_kv_indices.shape)
+    preferred = nope_varlen_index_mode(num_rows, topk, caller_lengths=caller_lengths)
     converts = nope_fwd_converts_indices()
-    if converts and not caller_lengths:
-        return "kernel"
     record = cake_jit.record(cake_jit.NOPE_PROGRAM)
+    if preferred == "kernel" and converts:
+        return "kernel"
     if NOPE_INDEX_PREP_STAGE in record:
         return "index_prep"
+    if converts and not caller_lengths:
+        return "kernel"
     if converts:
         raise NotImplementedError(
             "a caller-given topk_length with the converting NoPE forward needs the index-preparation stage "
@@ -4364,8 +4388,9 @@ def dsa_sparse_attention_nope_varlen(
     check_cu_seqlens: bool = False,
 ):
     """Packed multi-document NoPE form: per-document key indices are turned into global key rows on device --
-    one launch of the record's index-preparation stage right before the forward kernel, or the forward kernel
-    itself when the program converts them (:func:`varlen_index_mode`); bitwise the :func:`offset_gather_kv_indices`
+    the forward kernel itself below :data:`NOPE_CONVERT_SLOT_LIMIT` slots (``T x K_slots``), else one launch of
+    the record's index-preparation stage right before it (:func:`nope_varlen_index_mode`; a caller-given
+    ``topk_length`` always takes the preparation launch); bitwise the :func:`offset_gather_kv_indices`
     rule -- then the flat kernels run over the packed rows.  Query and key
     segment lengths may differ (the query segment is the tail of its key prefix); ``causal=True`` also drops
     selected keys after the query's own position ``(seqlen_k - seqlen_q) + local_q``.  ``max_seqlen_q/k`` are

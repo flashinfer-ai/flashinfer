@@ -4006,6 +4006,50 @@ def test_nope_index_prep_launch_values(monkeypatch):
     assert calls == []
 
 
+def test_nope_varlen_index_mode_follows_the_table_size(monkeypatch):
+    """The route from the table size alone (``nope_varlen_index_mode``, no device access): the converting forward
+    below ``NOPE_CONVERT_SLOT_LIMIT`` slots, the preparation launch at or above it and always with caller lengths;
+    ``varlen_index_mode`` applies it to the tensor's shape.  Through the packed entry (stand-in launches) a table at
+    the limit is the stage, then the forward over its rows with ``convert = 0``; one slot per row below it is the
+    forward alone with ``convert = 1``."""
+    limit = cake_backend.NOPE_CONVERT_SLOT_LIMIT
+    mode = cake_backend.nope_varlen_index_mode
+    assert limit == 1 << 20
+    assert mode(1024, 1023) == "kernel" and mode(1024, 1024) == "index_prep"
+    assert mode(1, 1) == "kernel" and mode(0, 2176) == "kernel"
+    assert mode(16263, 2176) == "index_prep"
+    assert mode(4, 3, caller_lengths=True) == "index_prep"
+    calls = []
+    _stand_in_index_prep(monkeypatch, calls)
+    assert (
+        cake_backend.nope_fwd_converts_indices()
+    )  # the shipped tables carry the conversion operands
+    large = torch.zeros(1024, 1024, dtype=torch.int32, device="cuda")
+    small = large[:, :1023]
+    assert cake_backend.varlen_index_mode(large) == "index_prep"
+    assert cake_backend.varlen_index_mode(small) == "kernel"
+    assert cake_backend.varlen_index_mode(small, caller_lengths=True) == "index_prep"
+    with pytest.raises(ValueError, match=r"\[T, K_slots\]"):
+        cake_backend.varlen_index_mode(large[0])
+    cu_q = torch.tensor([0, 1024], dtype=torch.int32, device="cuda")
+    cu_k = torch.tensor([0, 1024], dtype=torch.int32, device="cuda")
+    q, kv, _ = _nope_host_inputs(total_q=1024, total_k=1024, topk=1024, device="cuda")
+    varlen = cake_backend.dsa_sparse_attention_nope_varlen
+    varlen(q, kv, large, cu_q, cu_k)
+    assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "nope_fwd"]
+    prep, fwd = calls[0][1], calls[1][1]
+    assert (prep["num_rows"], prep["topk"], prep["write_out"]) == (1024, 1024, 1)
+    assert fwd["convert"] == 0 and fwd["indices"].data_ptr() == prep["out"].data_ptr()
+    assert fwd["topk_length"] is prep["topk_length"]
+    assert (fwd["has_topk_length"], fwd["derive_length"]) == (1, 0)
+    del calls[:]
+    varlen(q, kv, small, cu_q, cu_k)
+    assert [c[0] for c in calls] == ["nope_fwd"]
+    fwd = calls[0][1]
+    assert fwd["convert"] == 1 and (fwd["idx_stride"], fwd["topk"]) == (1024, 1023)
+    assert (fwd["has_topk_length"], fwd["derive_length"]) == (1, 1)
+
+
 def test_nope_packed_entry_lets_a_converting_forward_program_skip_the_stage(
     monkeypatch,
 ):
@@ -5245,13 +5289,19 @@ def test_nope_index_prep_reads_strided_and_offset_index_views_in_place():
     [
         ([300, 517, 0, 1024], [400, 517, 64, 2048], 200, False),
         ([256, 128], [512, 512], 96, True),
+        (
+            [640, 512],
+            [1024, 1024],
+            1024,
+            False,
+        ),  # at or above the slot limit: the preparation launch route
     ],
 )
 def test_nope_packed_entry_with_on_device_index_prep_is_bitwise_the_glue_path(
     seqs_q, seqs_k, topk, causal
 ):
-    """The backend's packed entry (index preparation on device, the forward right after it) against the explicit
-    torch glue plus the flat entry: ``out``, ``lse`` and ``dq`` bitwise; ``dkv`` (FP32 atomics into a caller buffer
+    """The backend's packed entry (the converting forward below the slot limit, the index-preparation launch and
+    the forward over its rows at or above it) against the explicit torch glue plus the flat entry: ``out``, ``lse`` and ``dq`` bitwise; ``dkv`` (FP32 atomics into a caller buffer
     on both sides) within the summation-order spread."""
     _require_nope_index_prep()
     _require_nope_program(backward=True)

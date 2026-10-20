@@ -350,18 +350,21 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
   main stage through a stride-carrying tensor map, the delta stage through the
   token / head strides (elements) and the element offset the launcher passes
   (`dout_token_stride`, `dout_head_stride`, `dout_offset = 0`).  No host copy.
-* Varlen: per-document indices become global key rows on device.  The forward
-  program converts them itself (`cu_seqlens_q`, `cu_seqlens_k`, `indices_out`,
-  `num_docs`, `search_iters`, `causal`, `convert` at the end of its launch
-  arguments; `convert = 1` reads the per-document rows at any row stride,
-  writes the global rows the backward consumes and derives the per-row
-  lengths), so the packed forward is one launch -- seventeen with the torch
-  glue `offset_gather_kv_indices`, which the rope varlen entry keeps; the
-  results are bitwise equal.  With a caller-given `topk_length` the record's
-  index-preparation stage runs instead (`index_prep`: one warp per index row,
-  four rows per 128-thread CTA, any index row stride read in place) right
-  before the forward kernel -- the host prepares the forward's plan, outputs
-  and launch arguments first, so no host work sits between the two launches.
+* Varlen: per-document indices become global key rows on device, by table
+  size (`nope_varlen_index_mode`).  Below `NOPE_CONVERT_SLOT_LIMIT` (2^20)
+  index slots (`T * K_slots`) the forward program converts them itself
+  (`cu_seqlens_q`, `cu_seqlens_k`, `indices_out`, `num_docs`, `search_iters`,
+  `causal`, `convert` at the end of its launch arguments; `convert = 1` reads
+  the per-document rows at any row stride, writes the global rows the backward
+  consumes and derives the per-row lengths): the packed forward is one launch
+  -- seventeen with the torch glue `offset_gather_kv_indices`, which the rope
+  varlen entry keeps; the results are bitwise equal.  At or above the limit,
+  and always with a caller-given `topk_length`, the record's index-preparation
+  stage runs first (`index_prep`: one warp per index row, four rows per
+  128-thread CTA, any index row stride read in place; on large tables it
+  converts faster than the forward's own producer path) and the forward takes
+  its rows -- the host prepares the forward's plan, outputs and launch
+  arguments before the first launch, so no host work sits between the two.
   `causal=True` drops keys after the query's own position, query segments are
   tails of their key prefix.  The NoPE entries have no torch fallback.
   Every call checks the structure of the prefix sums (`validate_cu_seqlens`:
@@ -389,9 +392,9 @@ the SM count is read once per device), `nope_bwd_compact` (the rope compaction k
 `nope_bwd_main_pass` / `nope_bwd_main_pass_natural` (the key-range-pass forms)
 and `nope_bwd_cast` (the rope cast kernel with `rope_groups = 0`, grid
 `ceil(num_kv * 16 / 256)`).  `index_prep` (own kernel, 128 threads, grid
-`ceil(T / 4)`) is the packed entry's index preparation when the caller gives
-`topk_length`; it is launched before `nope_fwd` and is not part of the flat
-step.  The key-range-pass policy of the record plans one
+`ceil(T / 4)`) is the packed entry's index preparation at or above
+`NOPE_CONVERT_SLOT_LIMIT` slots or when the caller gives `topk_length`; it is
+launched before `nope_fwd` and is not part of the flat step.  The key-range-pass policy of the record plans one
 pass on every row (`max_passes` 1, no per-architecture rules: one pass measured
 fastest on every row, build and GPU of this form), so the single-pass main stage
 is the default and `dq_partial` is not allocated; `key_passes=n` on the entry

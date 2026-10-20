@@ -1599,11 +1599,12 @@ def _cuda_kernel_names(fn) -> list[str]:
     ]
 
 
-def test_nope_public_packed_forward_is_one_index_launch_and_the_kernel():
-    """The public packed entry's forward launches the index-preparation stage and the forward kernel, nothing else
-    (the torch glue it replaces is sixteen launches) -- or the forward kernel alone when the program converts the
-    rows itself; the flat entry launches the forward kernel alone -- the row lengths are derived in-kernel, no
-    separate derivation runs."""
+def test_nope_public_packed_forward_launch_count_follows_the_table_size():
+    """The public packed entry's forward is one launch (the forward kernel converts the per-document rows itself)
+    below ``NOPE_CONVERT_SLOT_LIMIT`` index slots and two (the index-preparation stage, then the forward kernel) at
+    or above it -- the expectation derived from the same rule, ``nope_varlen_index_mode``; the torch glue it replaces
+    is sixteen launches; the flat entry launches the forward kernel alone (the row lengths are derived in-kernel, no
+    separate derivation runs)."""
     _require_nope_program()
     if not cake_backend.nope_index_prep_available(torch.device("cuda")):
         pytest.skip(
@@ -1611,29 +1612,43 @@ def test_nope_public_packed_forward_is_one_index_launch_and_the_kernel():
         )
     if not _cuda_kernel_names(lambda: torch.ones(8, device="cuda").add_(1)):
         pytest.skip("the torch profiler records no CUDA kernels in this environment")
-    inp = _nope_inputs(
-        [300, 517, 0, 1024], [400, 517, 64, 2048], seed=NOPE_SEED + 7, topk=200
-    )
+    cases = [
+        _nope_inputs(
+            [300, 517, 0, 1024], [400, 517, 64, 2048], seed=NOPE_SEED + 7, topk=200
+        ),  # 1841 x 200 slots
+        _nope_inputs(
+            [640, 512], [1024, 1024], seed=NOPE_SEED + 8, topk=1024
+        ),  # 1152 x 1024 slots
+    ]
+    seen = set()
+    for inp in cases:
+        T, K = (int(d) for d in inp.idx_local.shape)
+        mode = cake_backend.nope_varlen_index_mode(T, K)
+        assert mode == cake_backend.varlen_index_mode(inp.idx_local)
+        seen.add(mode)
 
-    def packed():
-        return dsa_sparse_attention_nope_varlen(
-            inp.q, inp.kv, inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k
-        )
+        def packed(inp=inp):
+            return dsa_sparse_attention_nope_varlen(
+                inp.q, inp.kv, inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k
+            )
 
-    with _quiet_experimental():
-        packed()  # plan and module load
-        names = _cuda_kernel_names(packed)
-        flat = _cuda_kernel_names(
-            lambda: dsa_sparse_attention_nope(inp.q, inp.kv, inp.idx_global)
+        with _quiet_experimental():
+            packed()  # plan and module load
+            names = _cuda_kernel_names(packed)
+            flat = _cuda_kernel_names(
+                lambda inp=inp: dsa_sparse_attention_nope(inp.q, inp.kv, inp.idx_global)
+            )
+        expected = {"kernel": 1, "index_prep": 2}[mode]
+        assert len(names) == expected and len(flat) == 1 and names[-1] == flat[0], (
+            mode,
+            names,
+            flat,
         )
+    assert seen == {"kernel", "index_prep"}
+    inp = cases[0]
     glue = _cuda_kernel_names(
         lambda: offset_gather_kv_indices(
             inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k, return_topk_length=True
         )
-    )
-    expected = 1 if cake_backend.varlen_index_mode(inp.idx_local) == "kernel" else 2
-    assert len(names) == expected and len(flat) == 1 and names[-1] == flat[0], (
-        names,
-        flat,
     )
     assert len(glue) >= 10
