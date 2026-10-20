@@ -132,6 +132,8 @@ SM120_RANK128_STAGED_B_GEOMETRY_LADDER: Final[tuple[tuple[int, int, int], ...]] 
     (384, 64, 64),
     (384, 80, 64),
     (416, 80, 64),
+    (768, 160, 64),
+    (832, 160, 64),
 )
 # One down warp's staged slice: 16 columns x (64 + 8) bf16.
 _STAGED_B_SLICE_BYTES: Final = 16 * (64 + 8) * 2
@@ -151,7 +153,24 @@ SM120_ADDRESS_POLICIES: Final[tuple[int, ...]] = (0, 1)  # 0 recompute, 1 accumu
 _GEOMETRY_SF_VEC: Final = 16
 _GEOMETRY_ELEM_BYTES: Final = 2
 _GEOMETRY_SHARED_LIMIT: Final = 48 * 1024
+_STAGED_B_SHARED_LIMIT: Final = 99 * 1024
 _GEOMETRY_MMA_N: Final = 8
+
+
+def _staged_b_row_split(tile_m: int) -> int:
+    """Mirrors staged_b_row_split(): above 80 rows two down-warp sets share B."""
+    return 2 if tile_m > 80 else 1
+
+
+def _staged_b_shared_bytes(tile_m: int, tile_k: int, long_k: bool) -> int:
+    """Mirrors staged_b_shared_bytes() (dynamic shared memory of the staged kernel)."""
+    sf = 2 * (tile_m * (tile_k // _GEOMETRY_SF_VEC) if long_k else 1)
+    return (
+        2 * tile_m * (tile_k + 8) * _GEOMETRY_ELEM_BYTES
+        + 2 * tile_k * _GEOMETRY_ELEM_BYTES
+        + (sf + 15) // 16 * 16
+        + 8 * _STAGED_B_SLICE_BYTES
+    )
 
 
 def sm120_producer_geometry_is_valid(
@@ -168,17 +187,23 @@ def sm120_producer_geometry_is_valid(
         return False
     if tile_k % (4 * _GEOMETRY_SF_VEC):
         return False
-    if not (0 < tile_m <= 80 and tile_m % 16 == 0):
+    staged = _stages_b(rank, tile_k)
+    max_tile_m = 160 if staged else 80
+    if not (0 < tile_m <= max_tile_m and tile_m % 16 == 0):
         return False
     # Mirrors large_m_down_warps(): one n8 fragment per down warp up to rank 64,
     # eight wide down warps above it.
     down_warps = min(rank // _GEOMETRY_MMA_N, 8)
+    if staged:
+        if tile_m % (16 * _staged_b_row_split(tile_m)):
+            return False
+        down_warps *= _staged_b_row_split(tile_m)
     quant_threads = block_threads - down_warps * 32
     if block_threads % 32 or quant_threads <= 0:
         return False
     sf_cols_per_tile = tile_k // _GEOMETRY_SF_VEC
     # The staged-B kernel's quantize loop tolerates a remainder.
-    if (tile_m * sf_cols_per_tile) % quant_threads and not _stages_b(rank, tile_k):
+    if (tile_m * sf_cols_per_tile) % quant_threads and not staged:
         return False
     long_k = k >= 8192
     padded_m = (m + 127) // 128 * 128
@@ -187,11 +212,12 @@ def sm120_producer_geometry_is_valid(
         prefetch_lines = k * rank * _GEOMETRY_ELEM_BYTES // 128
         if grid_blocks * block_threads < prefetch_lines:
             return False
+    if staged:
+        return _staged_b_shared_bytes(tile_m, tile_k, long_k) <= _STAGED_B_SHARED_LIMIT
     shared_bytes = (
         2 * tile_m * (tile_k + 8) * _GEOMETRY_ELEM_BYTES
         + 2 * tile_k * _GEOMETRY_ELEM_BYTES
         + 2 * ((tile_m * sf_cols_per_tile) if long_k else 1)
-        + (down_warps * _STAGED_B_SLICE_BYTES if _stages_b(rank, tile_k) else 0)
     )
     return shared_bytes <= _GEOMETRY_SHARED_LIMIT
 

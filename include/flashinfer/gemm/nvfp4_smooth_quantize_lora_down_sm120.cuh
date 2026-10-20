@@ -1006,18 +1006,32 @@ constexpr bool large_m_stages_b(int rank, int tile_k) { return rank > 64 && tile
 constexpr int kStagedBCols = 16;
 constexpr int kStagedBStride = 64 + 8;
 constexpr int kStagedBSliceBytes = kStagedBCols * kStagedBStride * 2;
+constexpr int kStagedBSlices = 8;  // Rank / kStagedBCols column groups at rank 128
+// A row tile above 80 rows is split between two sets of eight down warps that
+// share each column group's B slice: the CTA reads L2T once for twice the rows,
+// halving the L2T traffic per row (one CTA per SM, dynamic shared memory).
+constexpr int staged_b_row_split(int tile_m) { return tile_m > 80 ? 2 : 1; }
+constexpr int staged_b_down_warps(int tile_m) { return kStagedBSlices * staged_b_row_split(tile_m); }
+constexpr int staged_b_shared_bytes(int tile_m, int tile_k, bool long_k) {
+  return 2 * tile_m * (tile_k + 8) * 2 + 2 * tile_k * 2 +
+         (2 * (long_k ? tile_m * (tile_k / 16) : 1) + 15) / 16 * 16 +
+         kStagedBSlices * kStagedBSliceBytes;
+}
 
+// Copies part `part` of `parts` of one column group's B slice for one k tile.
+template <int Parts>
 __device__ __forceinline__ void copy_b_slice_async(quant::Type const* __restrict__ l2t_kmajor,
-                                                   quant::Type* __restrict__ slice, int warp,
-                                                   int lane, int tile_k, int K) {
+                                                   quant::Type* __restrict__ slice, int col_group,
+                                                   int part, int lane, int tile_k, int K) {
   constexpr int kChunksPerCol = 64 / 8;
-  constexpr int kChunks = kStagedBCols * kChunksPerCol;
+  constexpr int kChunks = kStagedBCols * kChunksPerCol / Parts;
 #pragma unroll
-  for (int chunk = lane; chunk < kChunks; chunk += 32) {
+  for (int i = lane; i < kChunks; i += 32) {
+    int const chunk = part * kChunks + i;
     int const col = chunk / kChunksPerCol;
     int const k8 = (chunk % kChunksPerCol) * 8;
     quant::Type const* source =
-        l2t_kmajor + static_cast<std::int64_t>(warp * kStagedBCols + col) * K + tile_k + k8;
+        l2t_kmajor + static_cast<std::int64_t>(col_group * kStagedBCols + col) * K + tile_k + k8;
     std::uint32_t const shared_address =
         static_cast<std::uint32_t>(__cvta_generic_to_shared(slice + col * kStagedBStride + k8));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
@@ -1031,17 +1045,18 @@ __device__ __forceinline__ void copy_b_slice_async(quant::Type const* __restrict
 // warps' B source differs. Sized for two CTAs per SM.
 template <int BlockThreads, bool LongK, int KernelTileM, int KernelTileK, DynAddress Policy,
           int Rank>
-__global__ __launch_bounds__(BlockThreads, 2) void
+__global__ __launch_bounds__(BlockThreads, 3 - staged_b_row_split(KernelTileM)) void
     nvfp4_smooth_quantize_lora_down_large_m_staged_b_sm120_kernel(
         quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
         float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
         std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
         quant::Type* __restrict__ down, int M, int K) {
   constexpr int kRank = Rank;
-  constexpr int kDownWarps = large_m_down_warps(Rank);
-  constexpr int kFrags = Rank / (8 * kDownWarps);
+  constexpr int kRowSplit = staged_b_row_split(KernelTileM);
+  constexpr int kDownWarps = staged_b_down_warps(KernelTileM);
+  constexpr int kFrags = kStagedBCols / 8;
   static_assert(large_m_stages_b(Rank, KernelTileK) && large_m_kmajor_l2(Rank));
-  static_assert(kFrags * 8 == kStagedBCols);
+  static_assert(Rank == kStagedBSlices * kStagedBCols);
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
   constexpr int kKernelTileM = KernelTileM;
   constexpr bool kUseStreamingX = LongK;
@@ -1050,17 +1065,32 @@ __global__ __launch_bounds__(BlockThreads, 2) void
   constexpr int kTileStride = kTileK + 8;
   constexpr int kSfColsPerTile = kTileK / quant::SF_VEC_SIZE;
   constexpr int kKSteps = kTileK / 16;
-  constexpr int kMBlocks = kKernelTileM / 16;
-  static_assert(kKernelTileM % 16 == 0);
+  constexpr int kWarpRows = kKernelTileM / kRowSplit;
+  constexpr int kMBlocks = kWarpRows / 16;
+  static_assert(kWarpRows % 16 == 0);
   int const kPaddedM = (M + 127) / 128 * 128;
   // The quantize loop strides by kKernelQuantThreads and bounds-checks every
   // item, so a tile whose items do not divide across the quantize threads only
   // leaves some threads one item short.
   int const kSfCols = K / quant::SF_VEC_SIZE;
-  __shared__ __align__(16) quant::Type x_tiles[2][kKernelTileM * kTileStride];
-  __shared__ __align__(16) quant::Type scale_tiles[2][kTileK];
-  __shared__ __align__(4) std::uint8_t sf_tiles[2][LongK ? kKernelTileM * kSfColsPerTile : 1];
-  __shared__ __align__(16) quant::Type b_tiles[kDownWarps][kStagedBCols * kStagedBStride];
+  // Dynamic shared memory, carved in the order of staged_b_shared_bytes():
+  // x_tiles[2][TM * stride], scale_tiles[2][TK], sf_tiles[2][...] (16-byte
+  // padded), b_tiles[kStagedBSlices][kStagedBCols * kStagedBStride].
+  extern __shared__ __align__(16) std::uint8_t staged_smem[];
+  using XTile = quant::Type[kKernelTileM * kTileStride];
+  using ScaleTile = quant::Type[kTileK];
+  using SfTile = std::uint8_t[LongK ? kKernelTileM * kSfColsPerTile : 1];
+  using BSlice = quant::Type[kStagedBCols * kStagedBStride];
+  constexpr int kXBytes = 2 * kKernelTileM * kTileStride * 2;
+  constexpr int kScaleBytes = 2 * kTileK * 2;
+  constexpr int kSfBytes = (2 * (LongK ? kKernelTileM * kSfColsPerTile : 1) + 15) / 16 * 16;
+  XTile* const x_tiles = reinterpret_cast<XTile*>(staged_smem);
+  ScaleTile* const scale_tiles = reinterpret_cast<ScaleTile*>(staged_smem + kXBytes);
+  SfTile* const sf_tiles = reinterpret_cast<SfTile*>(staged_smem + kXBytes + kScaleBytes);
+  BSlice* const b_tiles =
+      reinterpret_cast<BSlice*>(staged_smem + kXBytes + kScaleBytes + kSfBytes);
+  static_assert(kXBytes + kScaleBytes + kSfBytes + kStagedBSlices * kStagedBSliceBytes ==
+                staged_b_shared_bytes(KernelTileM, KernelTileK, LongK));
 
   int const thread = static_cast<int>(threadIdx.x);
   int const warp = thread / 32;
@@ -1093,8 +1123,11 @@ __global__ __launch_bounds__(BlockThreads, 2) void
       x, x_tiles[0], row_base, 0, thread, l2_evict_first_policy, M, K);
   copy_pre_quant_scale_tile_async_dyn<LongK, KernelTileK, Rank>(pre_quant_scale, scale_tiles[0], 0,
                                                                 thread);
+  int const col_group = warp % kStagedBSlices;
+  int const row_part = warp / kStagedBSlices;
   if (warp < kDownWarps) {
-    copy_b_slice_async(l2t_smoothed, b_tiles[warp], warp, lane, 0, K);
+    copy_b_slice_async<kRowSplit>(l2t_smoothed, b_tiles[col_group], col_group, row_part, lane, 0,
+                                  K);
   }
   commit_x_tile_async();
   wait_x_tile_async();
@@ -1117,7 +1150,7 @@ __global__ __launch_bounds__(BlockThreads, 2) void
     std::uint8_t* sf_tile = sf_tiles[tile_buffer];
 
     if (warp < kDownWarps) {
-      quant::Type* const slice = b_tiles[warp];
+      quant::Type* const slice = b_tiles[col_group];
       std::uint32_t b0[kKSteps][kFrags];
       std::uint32_t b1[kKSteps][kFrags];
 #pragma unroll
@@ -1129,12 +1162,17 @@ __global__ __launch_bounds__(BlockThreads, 2) void
           b1[ks][f] = base::load_bf16_pair(b_base + 8);
         }
       }
-      // The slice belongs to this warp alone: once every lane holds its
-      // fragments the next tile's copy can land in the same buffer, and the
-      // end-of-tile cp.async wait covers it together with the x tile.
-      __syncwarp();
+      // Once every warp reading this slice holds its fragments, the next tile's
+      // copy can land in the same buffer; the end-of-tile cp.async wait and
+      // barrier cover it together with the x tile.
+      if constexpr (kRowSplit == 1) {
+        __syncwarp();
+      } else {
+        asm volatile("bar.sync %0, %1;\n" : : "r"(1 + col_group), "n"(32 * kRowSplit));
+      }
       if (next_tile_k < K) {
-        copy_b_slice_async(l2t_smoothed, slice, warp, lane, next_tile_k, K);
+        copy_b_slice_async<kRowSplit>(l2t_smoothed, slice, col_group, row_part, lane, next_tile_k,
+                                      K);
         commit_x_tile_async();
       }
 #pragma unroll
@@ -1142,7 +1180,8 @@ __global__ __launch_bounds__(BlockThreads, 2) void
         int const local_k = ks * 16;
 #pragma unroll
         for (int mb = 0; mb < kMBlocks; ++mb) {
-          quant::Type const* a_base = x_tile + (mb * 16 + group) * kTileStride + local_k + pair_col;
+          quant::Type const* a_base =
+              x_tile + (row_part * kWarpRows + mb * 16 + group) * kTileStride + local_k + pair_col;
           std::uint32_t const a0 = base::load_bf16_pair(a_base);
           std::uint32_t const a1 = base::load_bf16_pair(a_base + 8 * kTileStride);
           std::uint32_t const a2 = base::load_bf16_pair(a_base + 8);
@@ -1226,10 +1265,10 @@ __global__ __launch_bounds__(BlockThreads, 2) void
   if (warp < kDownWarps) {
 #pragma unroll
     for (int f = 0; f < kFrags; ++f) {
-      int const col = (warp * kFrags + f) * 8 + pair_col;
+      int const col = (col_group * kFrags + f) * 8 + pair_col;
 #pragma unroll
       for (int mb = 0; mb < kMBlocks; ++mb) {
-        int const row_lo = row_base + mb * 16 + group;
+        int const row_lo = row_base + row_part * kWarpRows + mb * 16 + group;
         int const row_hi = row_lo + 8;
         if (row_lo < M) {
           store_down_pair<false>(down + static_cast<std::int64_t>(row_lo) * kRank + col,
@@ -1271,10 +1310,16 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
   constexpr int kSharedBytes =
       2 * kKernelTileM * (TileK + 8) * static_cast<int>(sizeof(quant::Type)) +
       2 * TileK * static_cast<int>(sizeof(quant::Type)) +
-      2 * (LongK ? kKernelTileM * kSfColsPerTile : 1) +
-      (large_m_stages_b(Rank, TileK) ? kDownWarps * kStagedBSliceBytes : 0);
-  if constexpr ((!large_m_stages_b(Rank, TileK) && (kKernelTileM * kSfColsPerTile) % kQuantThreads != 0) ||
-                kSharedBytes > 48 * 1024) {
+      2 * (LongK ? kKernelTileM * kSfColsPerTile : 1);
+  // The staged-B kernel takes its shared memory dynamically (up to the 99 KB a
+  // CTA may opt into) and tolerates a quantize-item remainder.
+  constexpr bool kStagedB = large_m_stages_b(Rank, TileK);
+  constexpr int kStagedSharedBytes = staged_b_shared_bytes(TileM, TileK, LongK);
+  constexpr bool kInvalid =
+      kStagedB ? (BlockThreads <= staged_b_down_warps(TileM) * 32 || kStagedSharedBytes > 99 * 1024 ||
+                  TileM % (16 * staged_b_row_split(TileM)) != 0)
+               : ((kKernelTileM * kSfColsPerTile) % kQuantThreads != 0 || kSharedBytes > 48 * 1024);
+  if constexpr (kInvalid) {
     return cudaErrorInvalidValue;
   } else {
     // What the templated kernel asserted at compile time is a precondition here.
@@ -1292,11 +1337,17 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
         return cudaErrorInvalidValue;
       }
     }
-    if constexpr (large_m_stages_b(Rank, TileK)) {
-      nvfp4_smooth_quantize_lora_down_large_m_staged_b_sm120_kernel<BlockThreads, LongK,
-                                                                    kKernelTileM, TileK, Policy,
-                                                                    Rank>
-          <<<grid_blocks, BlockThreads, 0, stream>>>(
+    if constexpr (kStagedB) {
+      auto* const kernel =
+          nvfp4_smooth_quantize_lora_down_large_m_staged_b_sm120_kernel<BlockThreads, LongK,
+                                                                        kKernelTileM, TileK,
+                                                                        Policy, Rank>;
+      if constexpr (kStagedSharedBytes > 48 * 1024) {
+        static cudaError_t const attribute_status = cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kStagedSharedBytes);
+        if (attribute_status != cudaSuccess) return attribute_status;
+      }
+      kernel<<<grid_blocks, BlockThreads, kStagedSharedBytes, stream>>>(
               static_cast<quant::Type const*>(x),
               static_cast<quant::Type const*>(pre_quant_scale), global_scale,
               static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
@@ -1363,7 +1414,9 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
   X(352, 48, 64)                               \
   X(384, 64, 64)                               \
   X(384, 80, 64)                               \
-  X(416, 80, 64)
+  X(416, 80, 64)                               \
+  X(768, 160, 64)                              \
+  X(832, 160, 64)
 
 template <int Rank = 32>
 inline cudaError_t nvfp4_smooth_quantize_lora_down_dyn_sm120(
