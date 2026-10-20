@@ -320,11 +320,10 @@ def program_for(
     The candidates are the rows of (family, world size, input format, output
     format) compiled for ``target``; when they carry phase-B variants the one
     of :func:`select_bv` is kept, and when they carry a residual-prefetch form
-    the one of :func:`select_prefetch`.  The re-arm form and the fused norm's
-    poll form follow from the registry's per-target rows (a target has either
-    the bulk or the register-store form of a variant, and either the grouped
-    or the probe-all poll of a fused-norm input format), so this function
-    never restates those rules.
+    the one of :func:`select_prefetch`.  The per-target forms -- the one-shot
+    kernel's row-scale poll and re-arm, the two-shot re-arm, the fused norm's
+    poll and quantizing pass 2 -- follow from the registry's rows (a target
+    builds exactly one form of each), so this function never restates them.
     """
 
     candidates = programs(

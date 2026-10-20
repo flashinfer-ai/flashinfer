@@ -58,6 +58,13 @@ REGISTER_STORE_VARIANTS = set().union(*REGISTER_STORE_FORMS.values())
 # The targets whose NVFP4-input fused-norm programs probe the peer row's six pairs at once ("_pa"), from
 # their own measurement; the others (sm_107a, and every BF16-input program) poll in two-pair groups.
 PROBE_ALL_TARGETS = ("sm_100a", "sm_103a")
+# The one-shot BF16 kernel's form per target, from each target's own measurement: sm_103a reads the peer's
+# row scale beside the data probe ("_rso"), sm_107a re-arms with register stores ("_rst"), sm_100a ships
+# the baseline's forms; the NVFP4 one-shot kernel ships one text for all three.
+ONESHOT_BF16_FORMS = {"sm_100a": "", "sm_103a": "_rso", "sm_107a": "_rst"}
+# The targets whose BF16-input fused-norm programs with NVFP4 / MXFP8 output build the packed quantizing
+# pass 2 ("_qp"), from their own measurement; sm_107a and every other build use the FP32 tree.
+PACKED_QUANT_TARGETS = ("sm_100a", "sm_103a")
 CAPACITIES = (4, 1024, 4096, 16384, 100000)
 SOURCE_DIR = "csrc/cake_fp4_allreduce"
 MAX_DYNAMIC_SMEM_BYTES = 232448  # the opt-in limit of SM100 / SM103 / SM107
@@ -68,13 +75,17 @@ ROTATION = 3
 
 
 def _expected_program_ids() -> set[str]:
-    ids = {f"tp2_oneshot_{fmt}" for fmt in INPUT_FORMATS}
+    ids = {"tp2_oneshot_nvfp4"}
+    ids |= {f"tp2_oneshot_bf16{form}" for form in ONESHOT_BF16_FORMS.values()}
     ids |= {f"tp4_twoshot_{fmt}_bv{bv}" for fmt in INPUT_FORMATS for bv in BVS}
     ids |= {f"tp4_twoshot_{fmt}_bv{bv}_rst" for fmt, bv in REGISTER_STORE_VARIANTS}
     ids |= {f"tp2_rmsnorm_{i}_{o}" for i in INPUT_FORMATS for o in OUTPUT_FORMATS}
     ids |= {f"tp2_rmsnorm_{i}_{o}_pf" for i in INPUT_FORMATS for o in OUTPUT_FORMATS}
     ids |= {f"tp2_rmsnorm_nvfp4_{o}_pa" for o in OUTPUT_FORMATS}
     ids |= {f"tp2_rmsnorm_nvfp4_{o}_pa_pf" for o in OUTPUT_FORMATS}
+    ids |= {
+        f"tp2_rmsnorm_bf16_{o}_qp{pf}" for o in ("nvfp4", "mxfp8") for pf in ("", "_pf")
+    }
     return ids
 
 
@@ -117,7 +128,7 @@ def _expected_params(
 
 def test_registry_lists_every_program_with_the_contract_parameters() -> None:
     assert set(PROGRAMS) == _expected_program_ids()
-    assert len(PROGRAMS) == 31
+    assert len(PROGRAMS) == 37
     keys = {
         "family",
         "world_size",
@@ -125,7 +136,9 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
         "output_format",
         "bv",
         "reset",
+        "rs_poll",
         "poll",
+        "quant",
         "prefetch",
         "targets",
         "kernel_symbol",
@@ -167,19 +180,37 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
         assert tuple(record["targets"]) and set(record["targets"]) <= set(TARGETS)
         if world_size == 4:
             assert record["bv"] in BVS
-            assert record["reset"] in ("bulk", "st")
+            assert record["reset"] in ("bulk", "st") and record["rs_poll"] is None
             assert program.endswith("_rst") == (record["reset"] == "st")
             assert program.startswith(f"tp4_twoshot_{input_format}_bv{record['bv']}")
+        elif family == "allreduce":
+            # The one-shot kernel's lever forms: "_rso" for the overlapped row-scale poll, then "_rst" for a
+            # register-store re-arm off the BF16 baseline (the NVFP4 kernel re-arms with register stores).
+            assert record["bv"] is None
+            assert record["rs_poll"] in ("first", "overlap")
+            assert record["reset"] in ("bulk", "st")
+            baseline_reset = {"bf16": "bulk", "nvfp4": "st"}[input_format]
+            suffix = ("_rso" if record["rs_poll"] == "overlap" else "") + (
+                "" if record["reset"] == baseline_reset else "_rst"
+            )
+            assert program == f"tp2_oneshot_{input_format}{suffix}", program
         else:
             assert record["bv"] is None and record["reset"] is None
+            assert record["rs_poll"] is None
         if family == "rmsnorm":
             assert record["prefetch"] in (False, True)
             assert program.endswith("_pf") == record["prefetch"], program
-            assert record["poll"] in ("grouped", "all")
             stem = program[: -len("_pf")] if record["prefetch"] else program
+            # The quantizing pass-2 form exists for the NVFP4 / MXFP8 outputs only ("_qp" for the packed form).
+            assert (record["quant"] is None) == (output_format == "bf16"), program
+            assert record["quant"] in (None, "f32", "packed"), program
+            assert stem.endswith("_qp") == (record["quant"] == "packed"), program
+            stem = stem[: -len("_qp")] if record["quant"] == "packed" else stem
+            assert record["poll"] in ("grouped", "all")
             assert stem.endswith("_pa") == (record["poll"] == "all"), program
         else:
             assert record["prefetch"] is None and record["poll"] is None
+            assert record["quant"] is None
     assert {
         target for record in PROGRAMS.values() for target in record["targets"]
     } == set(TARGETS)
@@ -223,16 +254,35 @@ def test_two_shot_programs_cover_every_variant_once_per_target() -> None:
                 assert f"{bulk}_rst" not in PROGRAMS
 
 
-def test_one_shot_programs_serve_every_target() -> None:
-    for program, record in PROGRAMS.items():
-        if record["family"] == "allreduce" and record["world_size"] == 2:
-            assert set(record["targets"]) == set(TARGETS), program
+def test_one_shot_programs_serve_every_target_once() -> None:
+    """On each target one one-shot program serves each input format: the NVFP4 kernel's single text, and for
+    BF16 input the form that target measured ("_rso" on sm_103a, "_rst" on sm_107a, the baseline on sm_100a)."""
+    for target in TARGETS:
+        for input_format in INPUT_FORMATS:
+            matching = [
+                program
+                for program, record in PROGRAMS.items()
+                if record["family"] == "allreduce"
+                and record["world_size"] == 2
+                and record["input_format"] == input_format
+                and target in record["targets"]
+            ]
+            form = ONESHOT_BF16_FORMS[target] if input_format == "bf16" else ""
+            assert matching == [f"tp2_oneshot_{input_format}{form}"], (
+                target,
+                input_format,
+                matching,
+            )
+    assert PROGRAMS["tp2_oneshot_nvfp4"]["targets"] == TARGETS
+    for target, form in ONESHOT_BF16_FORMS.items():
+        assert PROGRAMS[f"tp2_oneshot_bf16{form}"]["targets"] == (target,)
 
 
 def test_fused_norm_programs_cover_every_form_once_per_target() -> None:
-    """On each target one program serves each (input format, output format, prefetch form), in the poll form
-    that target measured: the probe-all poll ("_pa") for NVFP4 input on sm_100a / sm_103a, the two-pair groups
-    otherwise."""
+    """On each target one program serves each (input format, output format, prefetch form), in the poll and
+    quantizing forms that target measured: the probe-all poll ("_pa") for NVFP4 input on sm_100a / sm_103a and
+    the two-pair groups otherwise; the packed quantizing pass 2 ("_qp") for BF16 input with NVFP4 / MXFP8 output
+    on sm_100a / sm_103a and the FP32 tree otherwise."""
     for target in TARGETS:
         for input_format in INPUT_FORMATS:
             for output_format in OUTPUT_FORMATS:
@@ -258,12 +308,26 @@ def test_fused_norm_programs_cover_every_form_once_per_target() -> None:
                     assert PROGRAMS[program]["poll"] == (
                         "all" if probe_all else "grouped"
                     )
-                    suffix = ("_pa" if probe_all else "") + ("_pf" if prefetch else "")
+                    packed = (
+                        input_format == "bf16"
+                        and output_format != "bf16"
+                        and target in PACKED_QUANT_TARGETS
+                    )
+                    assert PROGRAMS[program]["quant"] == (
+                        None
+                        if output_format == "bf16"
+                        else ("packed" if packed else "f32")
+                    )
+                    suffix = (
+                        ("_pa" if probe_all else "")
+                        + ("_qp" if packed else "")
+                        + ("_pf" if prefetch else "")
+                    )
                     assert (
                         program == f"tp2_rmsnorm_{input_format}_{output_format}{suffix}"
                     )
-    # The probe-all form ships for the targets that measured it, the grouped form for the others; the BF16-input
-    # programs have one form for all three targets.
+    # The probe-all form ships for the targets that measured it, the grouped form for the others; the packed
+    # quantizing pass 2 likewise; the BF16 -> BF16 programs have one form for all three targets.
     for output_format in OUTPUT_FORMATS:
         for pf in ("", "_pf"):
             assert (
@@ -273,10 +337,20 @@ def test_fused_norm_programs_cover_every_form_once_per_target() -> None:
             assert PROGRAMS[f"tp2_rmsnorm_nvfp4_{output_format}{pf}"][
                 "targets"
             ] == tuple(t for t in TARGETS if t not in PROBE_ALL_TARGETS)
-            assert (
-                PROGRAMS[f"tp2_rmsnorm_bf16_{output_format}{pf}"]["targets"] == TARGETS
-            )
             assert f"tp2_rmsnorm_bf16_{output_format}_pa{pf}" not in PROGRAMS
+            assert f"tp2_rmsnorm_nvfp4_{output_format}_qp{pf}" not in PROGRAMS
+            assert f"tp2_rmsnorm_nvfp4_{output_format}_pa_qp{pf}" not in PROGRAMS
+            if output_format == "bf16":
+                assert PROGRAMS[f"tp2_rmsnorm_bf16_bf16{pf}"]["targets"] == TARGETS
+                assert f"tp2_rmsnorm_bf16_bf16_qp{pf}" not in PROGRAMS
+            else:
+                assert (
+                    PROGRAMS[f"tp2_rmsnorm_bf16_{output_format}_qp{pf}"]["targets"]
+                    == PACKED_QUANT_TARGETS
+                )
+                assert PROGRAMS[f"tp2_rmsnorm_bf16_{output_format}{pf}"][
+                    "targets"
+                ] == tuple(t for t in TARGETS if t not in PACKED_QUANT_TARGETS)
 
 
 def _checkout_source_dir() -> Path:
@@ -647,6 +721,7 @@ def test_program_for_two_shot_picks_the_targets_re_arm_form(
 @pytest.mark.parametrize("target", TARGETS)
 def test_program_for_one_shot_and_fused_norm(target: str) -> None:
     for input_format in INPUT_FORMATS:
+        form = ONESHOT_BF16_FORMS[target] if input_format == "bf16" else ""
         for rows in (3, 1031, 2048, 2664, 4096, 4291, 4292, 16384):
             suffix = "_pf" if loader.select_prefetch(rows, 148) else ""
             assert (rows in (2664, 4096, 4291)) == bool(suffix)
@@ -660,12 +735,19 @@ def test_program_for_one_shot_and_fused_norm(target: str) -> None:
                     grid=148,
                     target=target,
                 )
-                == f"tp2_oneshot_{input_format}"
+                == f"tp2_oneshot_{input_format}{form}"
             )
             poll = (
                 "_pa" if input_format == "nvfp4" and target in PROBE_ALL_TARGETS else ""
             )
             for output_format in OUTPUT_FORMATS:
+                quant = (
+                    "_qp"
+                    if input_format == "bf16"
+                    and output_format != "bf16"
+                    and target in PACKED_QUANT_TARGETS
+                    else ""
+                )
                 assert (
                     loader.program_for(
                         family="rmsnorm",
@@ -676,7 +758,7 @@ def test_program_for_one_shot_and_fused_norm(target: str) -> None:
                         grid=148,
                         target=target,
                     )
-                    == f"tp2_rmsnorm_{input_format}_{output_format}{poll}{suffix}"
+                    == f"tp2_rmsnorm_{input_format}_{output_format}{poll}{quant}{suffix}"
                 )
     with pytest.raises(ValueError):
         loader.program_for(
