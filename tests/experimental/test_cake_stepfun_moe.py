@@ -584,8 +584,15 @@ def test_host_plan_formulas_match_the_reference():
 
 def test_package_sources_carry_no_target_minor_and_no_fast_math():
     """No delivered source of the package names the retired per-arch minor macro or enables fast math
-    (the loader's ``use_fast_math=False`` keyword is the one spelling that may appear)."""
-    checked = 0
+    (the loader's ``use_fast_math=False`` keyword is the one spelling that may appear).  The scan
+    covers every source ``build.json`` names (a binding shared by several entries counts once) and,
+    beyond those, at least the manifest, the runtime-check header and the two shared headers."""
+    manifest_sources = {
+        source
+        for entry in cake_build.libraries_by_name().values()
+        for source in entry["sources"]
+    }
+    checked: set[str] = set()
     for path in sorted(PACKAGE_DIR.rglob("*")):
         if (
             path.suffix not in (".py", ".cu", ".cuh", ".h", ".json")
@@ -595,8 +602,9 @@ def test_package_sources_carry_no_target_minor_and_no_fast_math():
         text = path.read_text(errors="replace")
         assert RETIRED_MINOR_MACRO not in text, path
         assert "--use_fast_math" not in text and "use_fast_math=True" not in text, path
-        checked += 1
-    assert checked >= 2 * len(loader.PROGRAMS) + 4
+        checked.add(path.relative_to(PACKAGE_DIR).as_posix())
+    assert manifest_sources <= checked
+    assert len(checked) >= len(manifest_sources) + 4
 
 
 def test_program_rows_expand_over_the_shared_argument_plans():
