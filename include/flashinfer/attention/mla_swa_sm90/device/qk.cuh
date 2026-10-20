@@ -11,6 +11,42 @@ __forceinline__ __device__ void execute_qk_program(MMA& mma, A const& a, B const
   }
 }
 
+template <class T, class KV, class Plan>
+__forceinline__ __device__ void clear_masked_kv_rows(KV& sKV, Plan& plan, int page_idx,
+                                                     int local_page, int m_block_idx, int s_q,
+                                                     int cache_len, int window_size, int idx) {
+  // Qualified Hq64 and M8/16/32 keep each CTA within one query token.
+  // QK has finished reading this page; existing P-publication barriers order
+  // these stores before PV. Never modify global KV or a future-page buffer.
+  static_assert(64 % T::BLOCK_M == 0);
+  const int q_pos = cache_len - s_q + m_block_idx * T::BLOCK_M / 64;
+  const int left = max(q_pos - window_size + 1, 0);
+  const int valid_begin = min(max(left - page_idx * T::BLOCK_N, 0), T::BLOCK_N);
+  const int valid_end = min(max(q_pos + 1 - page_idx * T::BLOCK_N, valid_begin), T::BLOCK_N);
+  const int masked_rows = valid_begin + T::BLOCK_N - valid_end;
+  if (masked_rows == 0) return;
+  // Eight BF16 elements fit one aligned 16-byte store within a swizzle atom.
+  constexpr int vector_width = 8;
+  const uint4 zero = make_uint4(0, 0, 0, 0);
+  for (int i = idx * vector_width; i < masked_rows * T::HEAD_DIM_V; i += 128 * vector_width) {
+    const int row = i / T::HEAD_DIM_V;
+    const int token = row < valid_begin ? row : valid_end + row - valid_begin;
+    const int feature = i % T::HEAD_DIM_V;
+    if constexpr (T::LOOKAHEAD_K > 0) {
+      if ((local_page & 1) != 0 && feature >= (T::NUM_V_TILES - T::LOOKAHEAD_K) * T::TILE_K) {
+        const int slot = feature / T::TILE_K - (T::NUM_V_TILES - T::LOOKAHEAD_K);
+        Tensor aux =
+            make_tensor(make_smem_ptr(plan.aux_kv[slot].data()), typename T::SmemLayoutKVSlice{});
+        *reinterpret_cast<uint4*>(&aux(token, feature % T::TILE_K)) = zero;
+        continue;
+      }
+    }
+    *reinterpret_cast<uint4*>(&sKV(token, feature)) = zero;
+  }
+  // WGMMA reads through the async proxy, unlike the generic shared stores.
+  cutlass::arch::fence_view_async_shared();
+}
+
 // One common role loop. Accumulators are scoped to their actual role; the
 // three protocols only select publication/wait/producer operations.
 template <int QKSlices, class T, class TMA, class SQ, class KV, class P, class V, class Plan>
@@ -70,6 +106,8 @@ __forceinline__ __device__ void run_qk_role(
         issue_kv_tma_async<16, false, T>(sKV, plan, next_physical_page, lane, free_phase,
                                          tma_params);
       }
+      clear_masked_kv_rows<T>(sKV, plan, page_idx, page_idx - start_page, m_block_idx, s_q,
+                              cache_len, window_size, idx_in_warpgroup);
       if constexpr (C::M == 8) {
         register_fragment_softmax<T>(score, sP, plan, physical_page, page_idx, m_block_idx,
                                      total_rows, s_q, num_heads, cache_len, window_size,

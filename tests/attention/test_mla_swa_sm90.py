@@ -77,6 +77,32 @@ def test_correctness(tactic, sq, offset):
     assert_accuracy(args[-1], args)
 
 
+@pytest.mark.parametrize("tactic", range(6))
+@pytest.mark.parametrize("sq", [1, 4])
+@pytest.mark.parametrize("context", [63, 65, 191, 255, 511, 1024, 1025, 1055, 1087])
+def test_nonfinite_masked_cache_slots(tactic, sq, context):
+    args = inputs(sq=sq, context=context)
+    kv, table = args[1], args[3]
+    tokens = torch.arange(table.shape[1] * 64, device=kv.device).reshape(-1, 64)
+    poison = torch.tensor(
+        [float("nan"), float("inf"), -float("inf")],
+        device=kv.device,
+        dtype=kv.dtype,
+    ).repeat(363)[:1088]
+    for b in range(table.shape[0]):
+        # Poison only slots excluded by every query in the request. Valid
+        # K/V values must remain finite; the last sq tokens are not padding.
+        left = max(context - sq - 512, 0)
+        masked = (tokens < left) | (tokens >= context)
+        page_values = kv[table[b].long()].clone()
+        page_values[masked] = poison
+        kv[table[b].long()] = page_values
+    original = kv.clone()
+    _runner(0.0625, 512)(args, tactic=tactic)
+    assert_accuracy(args[-1], args)
+    torch.testing.assert_close(kv, original, rtol=0, atol=0, equal_nan=True)
+
+
 @pytest.mark.parametrize("b", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("sq", [1, 4])
 def test_graph_and_dummy_rows(b, sq):

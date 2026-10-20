@@ -27,6 +27,7 @@ _DEFAULT_TACTICS = {
 }
 
 
+@flashinfer_api
 def get_mla_swa_workspace_size_bytes(
     batch_size: int, q_len_per_req: int, num_q_heads: int = 64
 ) -> int:
@@ -266,6 +267,8 @@ def batch_decode_with_kv_cache_mla_swa(
     kv_cache : torch.Tensor
         BF16 contiguous ``[num_pages, 64, 1088]``. The first 1024 features
         are both latent K and V; the last 64 features are positional K.
+        Attended K/V values must be finite. Masked page slots need not be
+        initialized; they do not contribute even if they contain NaN or Inf.
     workspace_buffer : torch.Tensor
         Caller-owned CUDA uint8 buffer sized by :func:`get_mla_swa_workspace_size_bytes`.
         Do not share writable workspace across concurrent calls/streams.
