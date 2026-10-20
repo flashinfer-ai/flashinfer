@@ -4,8 +4,10 @@
 sequence, both FlashInfer cache layouts, the functional entry point and the wrapper; the routed cells of the vendored decode
 levers (the 64-column tile in one token unit at q_len 3 / 4, two token units at q_len 8, the unpacked tile at q_len 32, the paged
 prefill route of a part-filling batch), the lowered small-M decode chain against its fused-fork control arm, the ``(k, v)`` pair
-at page 64 / 128, the explicit split and the unsplit tile (the gate as its own launch), the separate cache-write launch, the
-run-time typed declines, a cached step under ``set_sync_debug_mode("error")`` and the compiled-plan cache's reload path."""
+at page 64 / 128, the explicit split and the unsplit tile (the gate as its own launch), the separate cache-write launch (the
+explicit control), the default decode chain -- programmatic dependent launch on, the write-through folded into the norm + RoPE
+launch -- bitwise the plain chain, the run-time typed declines, a cached step under ``set_sync_debug_mode("error")`` and the
+compiled-plan cache's reload path."""
 
 import pytest
 import torch
@@ -154,15 +156,22 @@ def test_wrapper_plan_run_and_the_declaration_facts():
         and plan.declaration["decode_route"]["tile"] == "decode_d256_f16"
     )
     # the vendored decode levers' default chain at decode row counts (batch x q_len <= 128): stage (1) lowered to the small-M
-    # slab GEMM, the norm + RoPE pass and the separate cache write; the sigmoid gate still rides the split combine
+    # slab GEMM and the norm + RoPE pass, the paged write-through folded into that launch below 128 rows (no separate
+    # cache-write stage; the cuDNN Frontend default since d8b0a7ed5), programmatic dependent launch on the decode tile's routes
+    # on cc 10.7 (use_pdl=None resolves True); the sigmoid gate still rides the split combine
     d = plan.declaration
     assert (
         d["gate_fused"]
         and d["decode_split_kv"] >= 2
         and d["fuse_norm_rope_effective"] is False
     ), d
-    assert d["cache_write_fused"] is False and {"_QkNormRope", "_CacheWrite"} <= set(
-        d["stages"]
+    assert d["cache_write_fused"] is False and d["cache_write_in_norm_rope"] is True, d
+    assert "_QkNormRope" in d["stages"] and "_CacheWrite" not in d["stages"], d
+    assert (
+        d["use_pdl_requested"] is None
+        and d["use_pdl"] is True
+        and d["use_pdl_effective"] is True
+        and {"qk_norm_rope", "sdpa"} <= set(d["pdl_stages"])
     ), d
     assert (
         d["decode_route"]["kv_streams"] == 1
@@ -335,11 +344,11 @@ def test_decode_64_column_tile_in_one_token_unit(name, q_len):
 
 
 def test_decode_lowered_chain_against_the_fused_fork_control_arm():
-    """At decode row counts the vendored declaration lowers stage (1) to the unfused chain (the small-M slab GEMM, the norm +
-    RoPE pass, the separate cache write: the step measured faster on the cuDNN Frontend side); ``fuse_norm_rope_small_m=True``
-    (through the adapter's test hook) keeps the fused fork with the write-through folded into its epilogue -- the control arm.
-    Both hold the oracle, the two chains agree (two roundings of stage (1): not bitwise), and the stage lists are the two
-    chains'."""
+    """At decode row counts the vendored declaration lowers stage (1) to the unfused chain (the small-M slab GEMM and the norm +
+    RoPE pass with the paged write-through folded into it below 128 rows: the step measured faster on the cuDNN Frontend side);
+    ``fuse_norm_rope_small_m=True`` (through the adapter's test hook) keeps the fused fork with the write-through folded into its
+    epilogue -- the control arm.  Both hold the oracle, the two chains agree (two roundings of stage (1): not bitwise), and the
+    stage lists are the two chains'."""
     from flashinfer.experimental.qwen_3_5_block import api as _api
     from tests.test_helpers.qwen_3_5_block_reference import cosine
 
@@ -362,8 +371,10 @@ def test_decode_lowered_chain_against_the_fused_fork_control_arm():
     )
     d, c = dflt.declaration, ctl.declaration
     assert d["fuse_norm_rope_effective"] is False and d["cache_write_fused"] is False, d
-    assert d["stages"][:3] == ["_Projection", "_QkNormRope", "_CacheWrite"], d["stages"]
+    assert d["cache_write_in_norm_rope"] is True and "_CacheWrite" not in d["stages"], d
+    assert d["stages"][:3] == ["_Projection", "_QkNormRope", "_Sdpa"], d["stages"]
     assert c["fuse_norm_rope_effective"] is True and c["cache_write_fused"] is True, c
+    assert c["cache_write_in_norm_rope"] is False, c
     assert c["stages"][0] == "_FusedQkvProjection" and not (
         {"_QkNormRope", "_CacheWrite"} & set(c["stages"])
     ), c["stages"]
@@ -476,9 +487,10 @@ def test_decode_unsplit_tile_runs_the_gate_as_its_own_launch():
 
 
 def test_decode_separate_cache_write_launch():
-    """The write-through as its own launch: the default at decode row counts (the lowered chain) and, by the explicit
-    ``fuse_cache_write=False`` on the vendored declaration through the adapter's test hook, on every decode plan -- the vendored
-    ``kernels/cache_write.py`` arm writes the pools the oracle predicts."""
+    """The write-through as its own launch, by the explicit ``fuse_cache_write=False`` on the vendored declaration through the
+    adapter's test hook (the A/B control: since cuDNN Frontend d8b0a7ed5 the default folds it into the norm + RoPE launch below
+    128 rows, and the explicit False keeps the separate launch on every decode plan) -- the vendored ``kernels/cache_write.py``
+    arm writes the pools the oracle predicts."""
     from flashinfer.experimental.qwen_3_5_block import api as _api
 
     g = _geometry("24_2")
@@ -498,6 +510,7 @@ def test_decode_separate_cache_write_launch():
     )
     d = plan.declaration
     assert d["cache_write_fused"] is False and "_CacheWrite" in d["stages"], d
+    assert d["cache_write_in_norm_rope"] is False, d
     assert d["fuse_norm_rope_effective"] is False, d
     out = _run(plan, case)
     case.check_out(out, label="decode separate cache write")
@@ -505,8 +518,72 @@ def test_decode_separate_cache_write_launch():
     assert (case.kv_cache[0] == 0).all(), "the NULL page must never be written"
 
 
+def test_decode_default_chain_is_bitwise_the_plain_chain():
+    """The vendored defaults of the decode step on cc 10.7 (cuDNN Frontend d8b0a7ed5): programmatic dependent launch on the decode
+    tile's routes (``use_pdl=None`` resolves True) and the paged write-through folded into the norm + RoPE launch below 128 rows
+    (``fuse_cache_write_small_m=None``: no separate cache-write stage, one launch fewer per step).  Both are performance-only: the
+    default plan reads them back and is BITWISE the plain chain declared through the adapter's test hook (``use_pdl=False``,
+    ``fuse_cache_write_small_m=False``: the switched stages launch plain, the separate cache write runs) on ``out`` and on the
+    pools; both hold the oracle."""
+    from flashinfer.experimental.qwen_3_5_block import api as _api
+
+    g = _geometry("24_2")
+    case = PagedCase(g, (300, 77), (2, 2), page_size=16, layout="NHD", seed=53)
+    common = dict(
+        geometry=g,
+        device="cuda",
+        weights=case.weights,
+        w_o=case.w_o,
+        kv_cache=case.kv_cache,
+        page_size=16,
+        batch_size=2,
+        q_len_per_req=2,
+        block_table=case.block_table,
+    )
+    dflt = _api.prepare("decode", **common)
+    plain = _api.prepare(
+        "decode",
+        _declaration_overrides={"use_pdl": False, "fuse_cache_write_small_m": False},
+        **common,
+    )
+    d, p = dflt.declaration, plain.declaration
+    assert (
+        d["decode_route"]["tile"] == "decode_d256_f16"
+        and d["fuse_norm_rope_effective"] is False
+    ), d
+    assert (
+        d["use_pdl_requested"] is None
+        and d["use_pdl"] is True
+        and d["use_pdl_effective"] is True
+        and {"qk_norm_rope", "sdpa"} <= set(d["pdl_stages"])
+    ), d
+    assert d["cache_write_in_norm_rope"] is True and "_CacheWrite" not in d["stages"], d
+    assert (
+        p["use_pdl_requested"] is False
+        and p["use_pdl"] is False
+        and p["use_pdl_effective"] is False
+        and p["pdl_stages"] == []
+    ), p
+    assert p["cache_write_in_norm_rope"] is False and "_CacheWrite" in p["stages"], p
+    assert len(d["stages"]) == len(p["stages"]) - 1, (d["stages"], p["stages"])
+    a = _run(dflt, case)
+    case.check_out(a, label="decode default chain (PDL, folded write-through)")
+    case.check_written_rows(label="decode default chain (PDL, folded write-through)")
+    pools_default = case.kv_cache.clone()
+    b = _run(plain, case)
+    case.check_out(b, label="decode plain chain (control)")
+    case.check_written_rows(label="decode plain chain (control)")
+    assert torch.equal(a, b), (
+        "the default chain and the plain chain compute the same bytes"
+    )
+    assert torch.equal(pools_default, case.kv_cache), (
+        "the folded write-through and the separate launch write the same pool bytes"
+    )
+
+
 def test_vendored_cache_write_launcher_pins_every_operand_to_one_device():
-    """The vendored ``kernels/cache_write.py`` launcher (the ``_CacheWrite`` stage's kernel; patch P4): every operand on the
+    """The vendored ``kernels/cache_write.py`` launcher (the ``_CacheWrite`` stage's kernel; its one-device check was carried as
+    patch P4 until cuDNN Frontend landed it -- byte-faithful since the ``d8b0a7ed5`` re-vendor): every operand on the
     sources' CUDA device, typed and named, before any launch -- a CPU ``slot_mapping`` used to pass the dtype / rank / length checks
     and reach the kernel as a host address.  The block's own execute preflight pins the pools and the slot mapping to ``h``'s device,
     so the route was guarded; this is the launcher's standalone contract.  The well-formed launch still runs.  The vendored

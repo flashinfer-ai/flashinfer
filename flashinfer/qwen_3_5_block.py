@@ -265,7 +265,8 @@ def prepare_qwen_3_5_block_bf16(
     -------
     Qwen35BlockPlan
         ``plan.run(...)`` launches it; ``plan.workspace_size``, ``plan.declaration`` (the form, the compiled-in facts, the
-        stages, the decode route, the out-projection tile and ``live_rows_multiple`` of an extend plan, the cache roots) and
+        stages, the decode route, the programmatic-dependent-launch and write-through readbacks of a decode plan, the
+        out-projection tile and ``live_rows_multiple`` of an extend plan, the cache roots) and
         ``plan.supports(...)`` describe it.  On an extend plan of at most 128 tokens every ``num_actual_tokens`` must be a
         multiple of ``plan.live_rows_multiple`` (the widest epilogue vector that divides the capacity; 32 on a 64- or 128-token
         bf16 plan): the small-capacity out-projection tile takes the token rows as its epilogue-vector axis; a typed

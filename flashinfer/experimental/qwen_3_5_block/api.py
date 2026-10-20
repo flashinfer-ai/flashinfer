@@ -994,12 +994,22 @@ def prepare(
         gate_fused=bool(getattr(blk, "gate_fused", False)),
         cache_write_fused=bool(getattr(blk, "cache_write_fused", False)),
         # what runs for stage (1): the fused norm + RoPE projection fork, or -- at decode row counts (B x q_len <= 128), the
-        # vendored declaration's own lowering -- the small-M slab GEMM, the norm + RoPE pass and the separate cache write
+        # vendored declaration's own lowering -- the small-M slab GEMM and the norm + RoPE pass, with the paged write-through
+        # folded into that launch below 128 rows (`cache_write_in_norm_rope`) and the separate cache write past them
         fuse_norm_rope_effective=bool(
             getattr(
                 blk, "fuse_norm_rope_effective", getattr(blk, "fuse_norm_rope", False)
             )
         ),
+        # the vendored defaults of the decode step, read back (the block passes neither knob; both are performance-only: the
+        # same bytes land in `out` and in the pools either way) -- where the lowered chain's write-through runs, and programmatic
+        # dependent launch: `use_pdl` the resolved switch (`None` resolves True on the decode tile's routes on cc 10.7, False
+        # everywhere else), the declaration as given, the stages launching with the attribute, whether every switched stage does
+        cache_write_in_norm_rope=bool(getattr(blk, "cache_write_in_norm_rope", False)),
+        use_pdl=bool(getattr(blk, "use_pdl", False)),
+        use_pdl_requested=getattr(blk, "use_pdl_requested", None),
+        use_pdl_effective=bool(getattr(blk, "use_pdl_effective", False)),
+        pdl_stages=list(getattr(blk, "pdl_stages", ())),
         decode_split_kv=getattr(blk, "decode_split_kv", None),
         decode_route=None
         if route is None

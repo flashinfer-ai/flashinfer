@@ -15,7 +15,8 @@ output, in bf16 on SM107 (Rubin, compute capability 10.7):
 hidden_states [T, d_model]
   -> (1) QKV + gate projection            W_qkvg [n_qkvg, d_model], bands Q | GATE | K | V
   -> (2)+(3) QK-RMSNorm + partial RoPE     fused into (1)'s epilogue (zero-centred norm weights as (1 + w); rope_dim leading dims rotate)
-  -> (4w) paged-KV write-through           post-RoPE K / V rows into the serving stack's cache at slot_mapping (folded into (1))
+  -> (4w) paged-KV write-through           post-RoPE K / V rows into the serving stack's cache at slot_mapping (folded into (1), or into
+                                           (2)+(3)'s launch on the lowered decode chain below 128 rows)
   -> (4) GQA attention, head dim 256       over the step's own tokens (prefill) or the cache (extend / decode), causal, bottom-right diagonal
   -> (5) O *= sigmoid(GATE)                in (4)'s epilogue (prefill / extend) or in the decode split's combine
   -> (6) out projection                    W_o [d_model, H_q * 256]
@@ -37,6 +38,14 @@ convenience form: they keep a small LRU (32 entries, one per shape bucket, each 
 a plan compiles in, so a serving stack's shape buckets need no bookkeeping of their own; a plan a CUDA graph was captured over
 outlives its eviction (rules 6 and 7 of "Capture and replay"), and `flashinfer.experimental.qwen_3_5_block.api.clear_plan_cache()`
 is the one call that drops them all.
+
+**The decode step on cc 10.7 runs the cuDNN Frontend defaults** (vendored as they are, none of them passed by this block): at decode row
+counts (`batch x q_len <= 128`) stage (1) is lowered to the small-M slab GEMM and a norm + RoPE pass, and below 128 rows (or at `q_len`
+1) that pass also writes the pools -- no separate cache-write launch, six launches per step with the split combine instead of seven --
+and the chain's norm + RoPE pass, decode tile and split combine launch as programmatic dependent launches (the FROST GEMM stages do
+regardless). Both are performance-only (`out` and the pools are bitwise the plain chain; tested) and both read back in
+`plan.declaration`: `cache_write_in_norm_rope`, `use_pdl` (the resolved switch), `use_pdl_requested` (`None` = the default),
+`use_pdl_effective` and `pdl_stages`; `"_CacheWrite"` is absent from `stages` where the write-through is folded in.
 
 ## A step, vLLM-shaped
 
@@ -184,16 +193,20 @@ The backend is a subset of the cuDNN Frontend Python package vendored byte-faith
 chain's norm + RoPE pass and cache write --, the FROST SDPA adapter with its configuration tables (the shared d128-family table and the
 two backward configuration tables the forward configs import at module level: geometry and validators, no backward kernel) and its
 SM107 prefill / decode tiles and SM100 split combine, the FROST GEMM compiler and its kernel templates, the `tile_dsl` helpers; every file keeps its NVIDIA SPDX header, MIT or
-Apache-2.0), with only the import roots rewritten and seven declared patches (P0-P2, exact text, replace the nanobind extension's
-seams, P3 rewords twenty-two comment lines that named internal hosts, file paths or workflow vocabulary, P4 carries the cache-write
-launcher's one-device check ahead of its upstream landing, P5-P6 prune what the subset does not carry -- the `gemm` package's lazy
-exports and the sm120 arch family; all listed in `_cudnn_frost/VENDOR.md`; per-file digests in `_cudnn_frost/VENDOR_MANIFEST.json`).
+Apache-2.0), with only the import roots rewritten and six declared patches (P0-P2, exact text, replace the nanobind extension's
+seams, P3 rewords twenty-two comment lines that named internal hosts, file paths or workflow vocabulary, P5-P6 prune what the subset
+does not carry -- the `gemm` package's lazy exports and the sm120 arch family; P4, which carried the cache-write launcher's
+one-device check ahead of its upstream landing, is retired now that the pinned commit carries it; all listed in
+`_cudnn_frost/VENDOR.md`; per-file digests in `_cudnn_frost/VENDOR_MANIFEST.json`).
 Pinned revision: cuDNN Frontend
-`c9f3118a1` (1.32.0: the Rubin decode levers -- the 64-column decode tile, the decode-grid split combine and its lean group
-walk, the lowered small-M decode chain -- plus, since the previous vendoring, independent K / V paged-pool layouts (HND / NHD per
-pool, bound and validated per operand), the split-prefix scheduling of paged packed attention (long-KV requests first, work-prefix
-task lookup), the closed scheduler-reader and barrier back-edges of the SM100 / SM107 prefill tiles, and the shared d128-family
-configuration tables); `qwen_3_5_block_support(...).source` reports it at runtime. The deployed process never imports the
+`d8b0a7ed5` (1.32.0: the Rubin decode levers -- the 64-column decode tile, the decode-grid split combine and its lean group
+walk, the lowered small-M decode chain --, independent K / V paged-pool layouts (HND / NHD per pool, bound and validated per
+operand), the split-prefix scheduling of paged packed attention (long-KV requests first, work-prefix task lookup), the closed
+scheduler-reader and barrier back-edges of the SM100 / SM107 prefill tiles, the shared d128-family configuration tables, and, since
+the previous vendoring, the decode step's measured defaults on cc 10.7 -- programmatic dependent launch on the decode tile's routes
+and the paged write-through folded into the norm + RoPE launch below 128 rows --, the cache-write launcher's one-device check, the
+SM120 templates' split-KV with an attention sink (declared, not served here) and the graph API's serialization and topology
+additions); `qwen_3_5_block_support(...).source` reports it at runtime. The deployed process never imports the
 `cudnn` package nor the cuDNN library: the one native piece of that route, the SDPA launch binder, is served in Python
 (`_sdpa_binder.py`, built on cuDNN Frontend's own retired Python binder implementation vendored from its test tree). The
 kernels keep living in cuDNN Frontend and are re-vendored deliberately: the exporter, the closure list and the tracer live in
@@ -206,7 +219,9 @@ kernels keep living in cuDNN Frontend and are re-vendored deliberately: the expo
 padded sequences, decode `q_len` 1 and 4 on the packed tile, 3 / 4 on the 64-column tile in one token unit, 8 on two token units
 and 32 on the unpacked tile, the paged prefill route of a part-filling batch (32 / 2 at batch 32, `q_len` 8), the lowered small-M
 decode chain against its fused-fork control arm, the split model, an explicit
-split and the unsplit tile with the gate as its own launch, the separate cache-write launch, extend behind prefixes and as two
+split and the unsplit tile with the gate as its own launch, the separate cache-write launch and the default decode chain --
+programmatic dependent launch on, the write-through folded into the norm + RoPE launch -- bitwise the plain chain, extend behind
+prefixes and as two
 chunks, the bounded token count and the small-capacity plans' live-row rule), CUDA-graph capture of the FIRST run of every form
 under `set_sync_debug_mode("error")` replayed bitwise (decode also over a new step), the functional decode captured through the
 plan cache and replayed bitwise after 33 more buckets evicted its plan and storage of the workspace's size was reallocated (the
@@ -221,8 +236,10 @@ cudnn-frontend package; the public and internal CI matrices have no SM107 runner
 envelope declines by target.
 
 No performance number is claimed in this draft. The Rubin decode levers (the 64-column decode tile, the decode-grid split combine
-and its lean group walk, the lowered small-M decode chain) landed on the cuDNN Frontend side on 2026-10-16 and are vendored here;
-a fused decode step is still in flight there and will be re-vendored before the final review.
+and its lean group walk, the lowered small-M decode chain) landed on the cuDNN Frontend side on 2026-10-16 and are vendored here,
+as are the decode step's measured defaults of 2026-10-20 (programmatic dependent launch on the decode tile's routes, the paged
+write-through folded into the norm + RoPE launch: six launches per step instead of seven on cc 10.7); the branch keeps re-vendoring
+at each cuDNN Frontend release before the final review.
 
 Owner: @RomanAnders90. Tracking issue: #6805. Graduation intent: re-vendor at each cuDNN Frontend
 release while the decode levers land, finalise the signatures with the vLLM integration, then graduate to a stable
