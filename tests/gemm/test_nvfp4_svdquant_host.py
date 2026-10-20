@@ -300,6 +300,39 @@ def test_auto_linear_measures_both_native_prefixes(auto_backend_case):
     assert all(size == 10 for _, size in profiles)
 
 
+@pytest.mark.parametrize(
+    "auto_backend_case", [(64, 128, 3072, 96), (64, 128, 3072, 128)], indirect=True
+)
+@pytest.mark.parametrize("operation", ["gemm", "linear"])
+def test_auto_skips_native_build_for_unsupported_rank(auto_backend_case, operation):
+    from flashinfer import autotune
+
+    _, call, _, builds, _ = auto_backend_case
+    with autotune(True):
+        assert torch.all(call(operation) == 1)
+    assert not builds, "no native tactic stages this rank; do not load the module"
+
+
+@pytest.mark.parametrize("rank", [96, 128])
+def test_explicit_cutlass_rejects_unsupported_rank_before_build(
+    auto_backend_case, rank
+):
+    _, _, _, builds, _ = auto_backend_case
+    m, n, k = 64, 128, 3072
+    with pytest.raises(ValueError, match="Problem size is not supported"):
+        gemm_svdquant.mm_nvfp4_svdquant(
+            torch.zeros((m, k // 2), dtype=torch.uint8),
+            torch.zeros((n, k // 2), dtype=torch.uint8),
+            torch.zeros(gemm_svdquant._swizzled_sf_size(m, k // 16), dtype=torch.uint8),
+            torch.zeros(gemm_svdquant._swizzled_sf_size(n, k // 16), dtype=torch.uint8),
+            torch.ones(1),
+            torch.zeros((m, rank), dtype=torch.bfloat16),
+            torch.zeros((n, rank), dtype=torch.bfloat16),
+            backend="cutlass-sm120",
+        )
+    assert not builds
+
+
 @pytest.mark.parametrize("index", [1, 2, 3, 5, 6, 8])
 def test_auto_linear_validates_before_tuning(auto_backend_case, index):
     _, call, profiles, builds, operands = auto_backend_case

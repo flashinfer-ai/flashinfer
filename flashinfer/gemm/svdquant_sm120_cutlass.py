@@ -61,6 +61,7 @@ _SM120_LINEAR_ROUTE_V7_MKR = _sm120_routes.SM120_LINEAR_ROUTE_V7_MKR
 _SM120_LINEAR_ROUTE_V8_MKR = _sm120_routes.SM120_LINEAR_ROUTE_V8_MKR
 _SM120_LINEAR_ROUTE_V9_MKR = _sm120_routes.SM120_LINEAR_ROUTE_V9_MKR
 _SM120_TACTIC_ABI_VERSION = _sm120_routes.SM120_TACTIC_ABI_VERSION
+_SM120_CUTLASS_LORA_RANKS = _sm120_routes.SM120_CUTLASS_LORA_RANKS
 _sm120_linear_route_abi_version = _sm120_routes.sm120_linear_route_abi_version
 _sm120_tactic_abi_version = _sm120_routes.sm120_tactic_abi_version
 
@@ -213,7 +214,7 @@ def _sm120_fused_linear_supported(m: int, k: int, rank: int) -> bool:
     as a candidate instead of being excluded by a list, and the tuner drops it
     if it loses.
     """
-    if rank not in (32, 64):
+    if rank not in _SM120_CUTLASS_LORA_RANKS:
         return False
     return bool(_sm120_producer_variants(m, k, rank))
 
@@ -941,7 +942,7 @@ def svdquant_linear(
     m, k = x.shape if x.ndim == 2 else (-1, -1)
     n = weight_fp4.shape[0] if weight_fp4.ndim == 2 else -1
     rank = l2t_smoothed.shape[1] if l2t_smoothed.ndim == 2 else -1
-    if rank not in (32, 64):
+    if rank not in _SM120_CUTLASS_LORA_RANKS:
         raise ValueError(
             "the SM120 CUTLASS SVDQuant linear backend supports LoRA ranks "
             f"32 and 64, got {rank}"

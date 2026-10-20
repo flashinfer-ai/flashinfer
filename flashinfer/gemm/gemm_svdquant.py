@@ -681,8 +681,14 @@ def _cute_dsl_nvfp4_svdquant_requirement(*args, **kwargs):
 
 
 @supported_compute_capability([120])
-def _cutlass_sm120_nvfp4_svdquant_requirement(*args, **kwargs):
-    return True
+def _cutlass_sm120_nvfp4_svdquant_requirement(
+    a, b, a_sf, b_sf, alpha, d, l1, bias=None, **kwargs
+):
+    # Other ranks would build a module with no tactic to offer; refuse them here
+    # so neither explicit nor auto selection reaches the JIT build.
+    from .svdquant_sm120_routes import SM120_CUTLASS_LORA_RANKS
+
+    return d.ndim == 2 and d.shape[1] in SM120_CUTLASS_LORA_RANKS
 
 
 def _heuristic_func_nvfp4_svdquant(
@@ -1134,11 +1140,13 @@ def svdquant_linear(
     out: torch.Tensor
         Output tensor, shape ``(m, n)`` bf16.
     """
+    from .svdquant_sm120_routes import SM120_CUTLASS_LORA_RANKS
+
     if (
         backend == "auto"
         and get_compute_capability(x.device) == (12, 0)
         and l2t_smoothed.ndim == 2
-        and l2t_smoothed.shape[1] in (32, 64)
+        and l2t_smoothed.shape[1] in SM120_CUTLASS_LORA_RANKS
     ):
         from .svdquant_sm120_auto import linear_auto
 
