@@ -486,8 +486,7 @@ def generated_program_available(device) -> bool:
 
 def route_program(arch: str, route: str) -> str:
     """Return the generated program serving ``route`` on ``arch``."""
-    table = ROUTES.get(arch, ROUTES)  # per-arch tables only when they differ
-    program = table.get(route)
+    program = ROUTES.get(route)
     if program is None or arch not in PROGRAMS[program]["arches"]:
         raise NotImplementedError(
             f"no generated contiguous grouped FP8 GEMM program is registered for "
