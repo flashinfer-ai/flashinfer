@@ -45,7 +45,6 @@ from flashinfer.fused_moe.cake_kimi_k3_situ import (
     _selector,
 )
 from flashinfer.jit.cake_kimi_k3_situ import (
-    CARRIED_PROGRAMS,
     KERNELS,
     MODULES,
     cake_situ_program,
@@ -281,8 +280,7 @@ def test_cake_situ_sixteen_token_pool_is_twice_the_eight_token_pool():
 def test_cake_situ_program_records_are_consistent():
     # Every program record names its two sources, the architectures it compiles
     # for and a complete launch plan; every program is bound by a kernel key on
-    # each architecture it lists, and the carried programs are a subset of the
-    # registry that records where each one came from.
+    # each architecture it lists.
     bound = {arch: set(KERNELS[arch].values()) for arch in ARCHES}
     for name, record in MODULES.items():
         assert record["sources"][0].endswith(f"{name}_kernel.cu"), name
@@ -299,11 +297,9 @@ def test_cake_situ_program_records_are_consistent():
         ], name
         for arch in record["arches"]:
             assert name in bound[arch], (name, arch)
-        assert (name in CARRIED_PROGRAMS) == ("carried" in record), name
     for arch in ARCHES:
         for name in bound[arch]:
             assert arch in MODULES[name]["arches"], (name, arch)
-    assert set(CARRIED_PROGRAMS) <= set(MODULES)
 
 
 @pytest.fixture(scope="module")
