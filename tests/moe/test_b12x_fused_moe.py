@@ -251,6 +251,72 @@ def test_w4a16_quant_mode_selects_internal_workspace(monkeypatch):
 
 
 @cute_dsl_available
+def test_capacity_growth_never_frees_a_capture_pinned_workspace(monkeypatch):
+    """A workspace served during CUDA graph capture must survive FIFO eviction.
+
+    Replaying a captured CUDA graph touches the workspace buffers by raw
+    address. A capacity growth retires the cached workspace, and the FIFO
+    holds only _RETIRED_WORKSPACES_MAX of them, so capture-time cache hits
+    are pinned: eviction must never free one.
+    """
+    import weakref
+
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    class FakeWorkspace:
+        def __init__(self, routed_rows):
+            self.routed_rows_capacity = routed_rows
+            self.max_rows = routed_rows
+
+    cache_before = dict(moe_dispatch._WORKSPACE_CACHE)
+    retired_before = list(moe_dispatch._RETIRED_WORKSPACES)
+    pinned_before = list(moe_dispatch._GRAPH_PINNED_WORKSPACES)
+
+    def fake_allocate(**kwargs):
+        return FakeWorkspace(kwargs["routed_rows"])
+
+    monkeypatch.setattr(moe_dispatch, "allocate_sm120_moe_workspace", fake_allocate)
+
+    def call(routed_rows):
+        return moe_dispatch._get_cached_workspace(
+            backend="w4a16",
+            state_E=4,
+            weight_E=4,
+            routed_rows=routed_rows,
+            k=256,
+            n=192,
+            num_topk=2,
+            device=torch.device("cpu"),
+            quant_mode="w4a16",
+        )
+
+    try:
+        # Warm up outside capture, then let capture pin the cached workspace.
+        warm = call(16)
+        monkeypatch.setattr(moe_dispatch, "_is_cuda_graph_capturing", lambda: True)
+        assert call(16) is warm
+
+        # Nine growth retirements on one cache key: the FIFO (max 8) evicts
+        # the oldest retired workspace -- the pinned one. It must stay alive.
+        monkeypatch.setattr(moe_dispatch, "_is_cuda_graph_capturing", lambda: False)
+        unpinned = None
+        for i, rows in enumerate((32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)):
+            ws = call(rows)
+            if i == 0:
+                unpinned = ws
+        assert weakref.ref(warm)() is not None
+
+        # One more retirement evicts the oldest unpinned workspace as before.
+        call(16384)
+        assert weakref.ref(unpinned)() is None
+    finally:
+        moe_dispatch._WORKSPACE_CACHE.clear()
+        moe_dispatch._WORKSPACE_CACHE.update(cache_before)
+        moe_dispatch._RETIRED_WORKSPACES[:] = retired_before
+        moe_dispatch._GRAPH_PINNED_WORKSPACES[:] = pinned_before
+
+
+@cute_dsl_available
 def test_sm120_backend_cutovers_are_precision_specific(monkeypatch):
     """W4A16 bypasses NVFP4 static/dynamic cutovers via quant_mode."""
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch

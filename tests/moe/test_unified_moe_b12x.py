@@ -116,9 +116,7 @@ class TestB12xUnifiedValidation:
                 source_format=source_format,
             )
 
-    @pytest.mark.parametrize(
-        "source_format", ["modelopt_e4m3_k32", "e4m3_k32"]
-    )
+    @pytest.mark.parametrize("source_format", ["modelopt_e4m3_k32", "e4m3_k32"])
     def test_w4a16_e4m3_k32_rejects_expert_count_mismatch(self, source_format):
         """The E4M3 K/32 validator must cross-check scales against the weights.
 
@@ -131,14 +129,16 @@ class TestB12xUnifiedValidation:
             prepare_w4a16_packed_weights,
         )
 
-        # 2-expert geometry: w13 [E, 2*32, 64], w2 [E, 64, 32] (K divisible by 32).
-        w13_fp4 = torch.zeros(2, 64, 64, dtype=torch.uint8)
+        # 2-expert geometry: logical w13 [E, 2*32, 64], w2 [E, 64, 32]; packed
+        # E2M1 stores K/2 bytes, so w13_fp4 rows carry 32 bytes.
+        w13_fp4 = torch.zeros(2, 64, 32, dtype=torch.uint8)
         w13_scales = torch.zeros(3, 64, 2, dtype=torch.float8_e4m3fn)
         w2_fp4 = torch.zeros(2, 64, 16, dtype=torch.uint8)
         w2_scales = torch.zeros(2, 64, 1, dtype=torch.float8_e4m3fn)
         globals_fp32 = torch.ones(2, dtype=torch.float32)
         with pytest.raises(
-            ValueError, match=r"w13_blockscale must have shape \[E, 64, 2\] for 2 experts"
+            ValueError,
+            match=r"w13_blockscale must have shape \[E, 64, 2\] for 2 experts",
         ):
             prepare_w4a16_packed_weights(
                 w13_fp4,
@@ -1131,7 +1131,7 @@ class TestUnifiedB12xConformance:
             top_k=2,
             seed=321,
         )
-        if variant is QuantVariant.W4A16:
+        if variant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
             tensors["w1_alpha"].fill_(1.75)
             tensors["w2_alpha"].fill_(0.75)
         layer, act_pack, weight_pack = _make_b12x_layer_and_packs(
@@ -1219,9 +1219,7 @@ class TestUnifiedB12xConformance:
 
         torch.testing.assert_close(outputs[0], outputs[1], rtol=0.05, atol=0.05)
 
-    @pytest.mark.parametrize(
-        "source_format", ["modelopt_e4m3_k32", "e4m3_k32"]
-    )
+    @pytest.mark.parametrize("source_format", ["modelopt_e4m3_k32", "e4m3_k32"])
     def test_w4a16_e4m3_k32_matches_bf16_reference(self, source_format):
         """The native K/32 wrapper arm must reconstruct the bf16 MoE output.
 
