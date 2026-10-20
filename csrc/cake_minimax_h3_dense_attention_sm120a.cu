@@ -430,7 +430,6 @@ kernel_minimax_h3_dense_attention(const __grid_constant__ CUtensorMap Q_map, con
             q_tile_idx = item_id % (unsigned int)num_q_tiles;
         }
         int q_tile_base = q_tile_idx * 128;
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         if (warp == 0) {
             if (elect_sync()) {
                 mbarrier_arrive_expect_tx(q_full_addr, 32768);
@@ -2546,6 +2545,9 @@ kernel_minimax_h3_dense_attention(const __grid_constant__ CUtensorMap Q_map, con
                 reinterpret_cast<int4*>(O + ((q_pos_11 * NUM_HEADS_CONST + head_idx) * 128 + lane % 8 * 8 + 64))[0] = reinterpret_cast<int4*>(o_vec)[0];
             }
         }
+        // Every thread orders its generic-proxy accesses of q_smem (Q scaling, the O staging) before the barrier
+        // that the next work item's TMA refill of q_smem follows.
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         __syncthreads();
     }
 
