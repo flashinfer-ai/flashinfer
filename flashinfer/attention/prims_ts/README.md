@@ -300,7 +300,9 @@ proxy summaries or their represented mass.
 `block_sparse_attention(..., use_block_sparse=False)` run dense attention over
 the whole contiguous K/V sequence with the same Q-tile selection. A dense plan
 owns no route workspace, and its `run` takes Q/K/V only, plus `sage=` for a
-Sage plan.
+Sage plan. A dense plan may omit `q_block_size` and `kv_block_size`; each then
+defaults to 128, which selects the Q128/KV128 tile. Block-sparse plans require
+both.
 
 Every plan takes `softmax_rescale_threshold_log2` (0 to 8, default 8). On the
 Q64/KV256 and Q128/KV128 tiles of block-sparse plans, and on dense Q64/KV256

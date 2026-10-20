@@ -28,6 +28,7 @@ from ..sage.config import SageAttentionConfig, validate_sage_recipe
 from .common import (
     _PREPARED_KV_ROUTE_SIZE,
     _SIGNED_INT32_MAX,
+    _resolve_plan_block_sizes,
     _select_block_sparse_q_tile_size,
     _validate_sparse_kv_block_size,
 )
@@ -421,8 +422,8 @@ def _validate_block_sparse_static_profile(
     num_qo_heads: int,
     num_kv_heads: int,
     head_dim: int,
-    q_block_size: int,
-    kv_block_size: int,
+    q_block_size: int | None,
+    kv_block_size: int | None,
     use_kv_valid_bits: bool,
     mask_type: Literal["dense", "causal"],
     q_dtype: torch.dtype,
@@ -464,6 +465,9 @@ def _validate_block_sparse_static_profile(
             )
     if not isinstance(use_kv_valid_bits, bool):
         raise TypeError("use_kv_valid_bits must be a bool")
+    q_block_size, kv_block_size = _resolve_plan_block_sizes(
+        q_block_size, kv_block_size, use_block_sparse=use_block_sparse
+    )
     kv_block_size = _validate_sparse_kv_block_size(kv_block_size)
     if num_qo_heads % num_kv_heads != 0:
         raise ValueError("num_qo_heads must be divisible by num_kv_heads")
