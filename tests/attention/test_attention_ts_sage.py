@@ -107,6 +107,8 @@ class _SageCase:
     tiny_q_scales: bool = False
     # One routing pattern serves every KV head.
     share_pattern_across_kv_heads: bool = False
+    # Each CTA of a dense Q128 plan finalizes two consecutive Q tiles.
+    query_paired: bool = False
 
     @property
     def num_kv_blocks(self) -> int:
@@ -169,6 +171,39 @@ _DENSE_CASES = (
         qk_dtype=torch.int8,
         out_dtype=torch.float16,
         sage=SageAttentionConfig(q_block_size=4, k_block_size=1),
+        persistent=True,
+    ),
+    # Three Q128 tiles per sequence pair the first two and leave the third
+    # instance-1 slot past the end of Q.
+    _SageCase(
+        "q128_fp8_k16_mean_paired",
+        **_Q128,
+        sage=SageAttentionConfig(v_mean=True),
+        query_paired=True,
+    ),
+    _SageCase(
+        "q128_fp8_k4_q4_paired_persistent",
+        **_Q128,
+        sage=SageAttentionConfig(q_block_size=4, k_block_size=4),
+        query_paired=True,
+        persistent=True,
+    ),
+    # INT8 scores of both paired instances seed from one bias tile.
+    _SageCase(
+        "q128_int8_k1_q4_paired",
+        **_Q128,
+        qk_dtype=torch.int8,
+        out_dtype=torch.float16,
+        sage=SageAttentionConfig(q_block_size=4, k_block_size=1),
+        query_paired=True,
+    ),
+    _SageCase(
+        "q128_int8_k16_mean_paired_persistent",
+        **_Q128,
+        qk_dtype=torch.int8,
+        out_dtype=torch.float16,
+        sage=SageAttentionConfig(v_mean=True),
+        query_paired=True,
         persistent=True,
     ),
     # A zero threshold keeps exact KV256 anchors and P at the full E4M3 range.
@@ -426,6 +461,7 @@ def _plan(case: _SageCase, *, max_blocks_per_row: int | None = None):
                 o_data_type=case.out_dtype,
                 sage_config=case.sage,
                 softmax_rescale_threshold_log2=case.softmax_rescale_threshold_log2,
+                query_paired=case.query_paired,
                 **route_kwargs,
             )
     finally:
@@ -484,8 +520,9 @@ def _row_folds(case: _SageCase, exact_blocks):
 
     A route (a dense tile) packs ``kv_tile`` tokens of the exact blocks or
     ``kv_tile`` summaries, in K64 atoms; exact routes come first. K/V instance
-    ``route % 2`` owns a route and, on KV256, spatial half ``atom % 2`` splits
-    it into two streams, each folding its half of the route at once.
+    ``route % 2`` owns a route (a query-paired instance owns every route) and,
+    on KV256, spatial half ``atom % 2`` splits it into two streams, each
+    folding its half of the route at once.
     """
 
     kv_block, atoms_per_route = case.kv_block_size, case.kv_tile // 64
@@ -519,7 +556,8 @@ def _row_folds(case: _SageCase, exact_blocks):
         for half in range(halves):
             indices = [index for atom in atoms[half::halves] for index in atom]
             if indices:
-                stream = route_idx % 2 * halves + half
+                routes_per_step = 1 if case.query_paired else 2
+                stream = route_idx % routes_per_step * halves + half
                 yield stream, source, torch.tensor(indices, device="cuda")
 
 

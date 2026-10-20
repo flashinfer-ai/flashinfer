@@ -302,6 +302,15 @@ the whole contiguous K/V sequence with the same Q-tile selection. A dense plan
 owns no route workspace, and its `run` takes Q/K/V only, plus `sage=` for a
 Sage plan.
 
+A dense Q128 plan (`head_dim=128`, `q_block_size * Hq / Hkv >= 128`) accepts
+`query_paired=True`: each CTA then processes two consecutive Q128 tiles of one
+sequence and KV head over a single K/V stream, with each K/V instance of the
+kernel owning one Q tile for the whole sequence instead of alternating K/V
+tiles of one Q tile. Every K/V tile is loaded once for both tiles, which
+helps when K/V loads bound the kernel (16-bit K/V on long sequences). Pairing
+halves the CTA count, so it suits grids that still fill the GPU; a sequence
+with an odd number of Q tiles leaves the second instance of its last CTA idle.
+
 Every plan takes `softmax_rescale_threshold_log2` (0 to 8, default 8). On the
 Q64/KV256 and Q128/KV128 tiles of block-sparse plans, and on dense Q64/KV256
 plans, a row keeps its softmax exponent anchor while a tile raises the row

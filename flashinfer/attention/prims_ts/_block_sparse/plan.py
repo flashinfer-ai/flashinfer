@@ -304,6 +304,7 @@ def _build_block_sparse_plan_state(
             v_dtype_key=static.v_dtype_key,
             sage=static.sage,
             softmax_rescale_threshold_log2=static.softmax_rescale_threshold_log2,
+            query_paired=static.query_paired,
         )
         policy = (
             *spec.policy,
