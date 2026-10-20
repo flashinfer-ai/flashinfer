@@ -23,7 +23,7 @@ context kernels read it; each kernel fixes the parameters of its own reads
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from flashinfer.utils import ceil_div, round_up
 
@@ -61,8 +61,9 @@ class _SageKSection:
     length: int
     block_size: int
     source_block_size: int
-    word_offset: int
     tile_atoms: int = 1
+    # First word in the sequence's words; ``_SageScaleLayout`` places it.
+    word_offset: int = 0
 
     @property
     def words_per_atom(self) -> int:
@@ -125,8 +126,9 @@ class _SageQSection:
     q_block_size: int
     heads_q_per_kv: int
     rows_per_tile: int
-    word_offset: int
     heads_interleaved: bool
+    # First word in the sequence's words; ``_SageScaleLayout`` places it.
+    word_offset: int = 0
 
     def __post_init__(self) -> None:
         if self.tokens_per_tile < 1 or self.rows_per_tile % _FLOAT4_WORDS:
@@ -196,7 +198,8 @@ class _SageVSection:
 
     headdim: int
     has_mean: bool
-    word_offset: int
+    # First word in the sequence's words; ``_SageScaleLayout`` places it.
+    word_offset: int = 0
 
     def __post_init__(self) -> None:
         if self.headdim % _FLOAT4_WORDS:
@@ -244,50 +247,21 @@ class _SageScaleLayout:
     16-byte ``cp.async``.
     """
 
-    seq_len_kv: int
-    k_block_size: int
-    # Summary sequence length of a proxy plan, else zero.
-    num_summaries: int
-    k_summary_block_size: int
-    k_tokens_block_size: int
-    summaries_block_size: int
-    seq_len_q: int
-    q_block_size: int
-    heads_q_per_kv: int
-    # Rows of a Q tile and whether a tile interleaves the heads of its KV
-    # head (``_SageQSection``).
-    q_tile_rows: int
-    q_heads_interleaved: bool
-    headdim: int
-    v_mean: bool
-    # Atoms per K tile of the reader; the K-token atoms are padded to whole
-    # tiles (``_SageKSection.tile_atoms``).
-    k_tile_atoms: int = 1
+    k_tokens: _SageKSection
+    q_rows: _SageQSection
+    v_rows: _SageVSection
+    # A proxy plan's summary atoms, else ``None``.
+    summaries: _SageKSection | None = None
 
-    @property
-    def k_tokens(self) -> _SageKSection:
-        """Return the K-token section, which starts a sequence's words."""
-
-        return _SageKSection(
-            length=self.seq_len_kv,
-            block_size=self.k_tokens_block_size,
-            source_block_size=self.k_block_size,
-            word_offset=0,
-            tile_atoms=self.k_tile_atoms,
-        )
-
-    @property
-    def summaries(self) -> _SageKSection | None:
-        """Return a proxy plan's summary section, which follows the K tokens."""
-
-        if self.num_summaries == 0:
-            return None
-        return _SageKSection(
-            length=self.num_summaries,
-            block_size=self.summaries_block_size,
-            source_block_size=self.k_summary_block_size,
-            word_offset=self.k_tokens.words,
-        )
+    def __post_init__(self) -> None:
+        # Place the sections in buffer order; each starts where the last ends.
+        word_offset = 0
+        for name in ("k_tokens", "summaries", "q_rows", "v_rows"):
+            section = getattr(self, name)
+            if section is None:
+                continue
+            object.__setattr__(self, name, replace(section, word_offset=word_offset))
+            word_offset += section.words
 
     @property
     def k_sections(self) -> tuple[_SageKSection, ...]:
@@ -295,30 +269,6 @@ class _SageScaleLayout:
 
         summaries = self.summaries
         return (self.k_tokens,) if summaries is None else (self.k_tokens, summaries)
-
-    @property
-    def q_rows(self) -> _SageQSection:
-        """Return the Q section, which follows the K sections."""
-
-        return _SageQSection(
-            seq_len_q=self.seq_len_q,
-            q_block_size=self.q_block_size,
-            heads_q_per_kv=self.heads_q_per_kv,
-            rows_per_tile=self.q_tile_rows,
-            word_offset=sum(section.words for section in self.k_sections),
-            heads_interleaved=self.q_heads_interleaved,
-        )
-
-    @property
-    def v_rows(self) -> _SageVSection:
-        """Return the V section, which follows the Q rows."""
-
-        q_rows = self.q_rows
-        return _SageVSection(
-            headdim=self.headdim,
-            has_mean=self.v_mean,
-            word_offset=q_rows.word_offset + q_rows.words,
-        )
 
     @property
     def sequence_words(self) -> int:

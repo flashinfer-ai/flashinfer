@@ -60,11 +60,11 @@ def validate_context_sage_layout(layout: _SageScaleLayout, kv_tile_n: int) -> No
     The K-token atoms must be padded to whole K tiles, since the softmax
     addresses each tile's atoms without clamping.
     """
-    if layout.k_tile_atoms * _SAGE_ATOM_TOKENS != kv_tile_n:
+    if layout.k_tokens.tile_atoms * _SAGE_ATOM_TOKENS != kv_tile_n:
         raise ValueError(
             "the Sage K-token atoms must be padded to the kernel's K tiles"
         )
-    if layout.q_heads_interleaved:
+    if layout.q_rows.heads_interleaved:
         raise ValueError("the context kernel reads one Q head per 128 Q rows")
 
 
@@ -97,7 +97,7 @@ def sage_k_transport(layout: _SageScaleLayout) -> SageKTransport:
 
 def sage_k_tile_words(layout: _SageScaleLayout) -> int:
     """Return the ``sfK`` words of one K tile: its atoms, each padded to float4s."""
-    return layout.k_tile_atoms * layout.k_tokens.atom_words
+    return layout.k_tokens.tile_atoms * layout.k_tokens.atom_words
 
 
 def sage_k_tile_bytes(layout: _SageScaleLayout) -> int:
@@ -242,13 +242,13 @@ def load_sage_v_channels(
         scale_vec = _load_float4_at(channel_address + Int64(channel * 4))
         for elem in cutlass.range_constexpr(_FLOAT4_WORDS):
             scale_values += (Float32(scale_vec[elem]),)
-        if cutlass.const_expr(layout.v_mean):
+        if cutlass.const_expr(layout.v_rows.has_mean):
             mean_vec = _load_float4_at(
                 channel_address + Int64(mean_bytes + channel * 4)
             )
             for elem in cutlass.range_constexpr(_FLOAT4_WORDS):
                 mean_values += (Float32(mean_vec[elem]),)
     scales = cutlass.Vector.from_elements(scale_values, Float32)
-    if cutlass.const_expr(layout.v_mean):
+    if cutlass.const_expr(layout.v_rows.has_mean):
         return scales, cutlass.Vector.from_elements(mean_values, Float32)
     return scales, None

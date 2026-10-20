@@ -2224,7 +2224,10 @@ def _check_sage_attention(cfg: FmhaConfig) -> None:
         raise ValueError(
             "Sage attention requires E4M3 V with a 16-bit output (P in SMEM)"
         )
-    if layout.headdim != cfg.pv_mma_tiler[1] or layout.q_tile_rows != cfg.q_tile_m:
+    if (
+        layout.v_rows.headdim != cfg.pv_mma_tiler[1]
+        or layout.q_rows.rows_per_tile != cfg.q_tile_m
+    ):
         raise ValueError("the Sage scale layout does not match the kernel's tiles")
 
 

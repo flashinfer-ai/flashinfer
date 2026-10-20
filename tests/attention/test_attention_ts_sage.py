@@ -833,7 +833,6 @@ def test_sage_q_rows_round_trip(heads_interleaved: bool) -> None:
         q_block_size=2,
         heads_q_per_kv=4,
         rows_per_tile=64 if heads_interleaved else 128,
-        word_offset=0,
         heads_interleaved=heads_interleaved,
     )
     for head in range(rows.heads_q_per_kv):
@@ -860,7 +859,6 @@ def test_sage_q_rows_pad_grouped_tiles() -> None:
         q_block_size=1,
         heads_q_per_kv=7,
         rows_per_tile=128,
-        word_offset=0,
         heads_interleaved=True,
     )
     assert rows.tokens_per_tile == 18

@@ -172,6 +172,6 @@ def reference_sage_scales(
     q_words = params.q_scale[heads[None], slots[:, tokens][:, None]]
     v_rows = layout.v_rows
     sequences[:, :, q_rows.word_offset : v_rows.word_offset] = q_words.flatten(2)
-    rows = (params.v_scale,) + ((params.v_mean,) if layout.v_mean else ())
+    rows = (params.v_scale,) + ((params.v_mean,) if layout.v_rows.has_mean else ())
     sequences[:, :, v_rows.word_offset :] = torch.cat(rows, dim=-1)
     return sequences.flatten()

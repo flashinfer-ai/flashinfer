@@ -58,7 +58,13 @@ from .sage.config import (
     validate_sage_recipe,
     _validate_int8_qk_device,
 )
-from .sage.layout import _SAGE_ATOM_TOKENS, _SageScaleLayout
+from .sage.layout import (
+    _SAGE_ATOM_TOKENS,
+    _SageKSection,
+    _SageQSection,
+    _SageScaleLayout,
+    _SageVSection,
+)
 
 
 if TYPE_CHECKING:
@@ -1770,22 +1776,20 @@ def _context_sage_layout(geometry: _ContextPlanGeometry) -> _SageScaleLayout:
 
     sage = geometry.sage
     return _SageScaleLayout(
-        seq_len_kv=geometry.max_seq_len_k,
-        k_block_size=sage.k_block_size,
-        # No summaries: their block sizes follow the K blocks, so recipes that
-        # differ only in k_summary_block_size share one layout and compilation.
-        num_summaries=0,
-        k_summary_block_size=sage.k_block_size,
-        k_tokens_block_size=sage.k_block_size,
-        summaries_block_size=sage.k_block_size,
-        seq_len_q=geometry.max_seq_len_q,
-        q_block_size=sage.q_block_size,
-        heads_q_per_kv=geometry.num_qo_heads // geometry.num_kv_heads,
-        q_tile_rows=_CONTEXT_TILE_SIZE_Q,
-        q_heads_interleaved=False,
-        headdim=geometry.head_dim,
-        v_mean=sage.v_mean,
-        k_tile_atoms=_CONTEXT_KV_TILE_N // _SAGE_ATOM_TOKENS,
+        k_tokens=_SageKSection(
+            length=geometry.max_seq_len_k,
+            block_size=sage.k_block_size,
+            source_block_size=sage.k_block_size,
+            tile_atoms=_CONTEXT_KV_TILE_N // _SAGE_ATOM_TOKENS,
+        ),
+        q_rows=_SageQSection(
+            seq_len_q=geometry.max_seq_len_q,
+            q_block_size=sage.q_block_size,
+            heads_q_per_kv=geometry.num_qo_heads // geometry.num_kv_heads,
+            rows_per_tile=_CONTEXT_TILE_SIZE_Q,
+            heads_interleaved=False,
+        ),
+        v_rows=_SageVSection(headdim=geometry.head_dim, has_mean=sage.v_mean),
     )
 
 
@@ -1831,14 +1835,14 @@ def _get_compiled_sage_prepare(
             assumed_align=16,
         )
 
-    v_rows_shape = (cute.sym_int(), num_kv_heads, layout.headdim)
+    v_rows_shape = (cute.sym_int(), num_kv_heads, layout.v_rows.headdim)
     with torch.cuda.device(device_index):
         return cute.compile(
             prepare_adapter,
             fake_compact((num_qo_heads, cute.sym_int())),
             fake_compact((num_kv_heads, cute.sym_int())),
             fake_compact(v_rows_shape),
-            fake_compact(v_rows_shape) if layout.v_mean else None,
+            fake_compact(v_rows_shape) if layout.v_rows.has_mean else None,
             fake_compact((cute.sym_int(),)),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options=_COMPILE_OPTIONS,

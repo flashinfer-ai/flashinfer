@@ -35,7 +35,14 @@ from ..._block_sparse.common import (
     _select_block_sparse_q_tile_size,
     _validate_sparse_kv_block_size,
 )
-from ...sage.layout import _SAGE_ATOM_MIN_WORDS, _SAGE_ATOM_TOKENS, _SageScaleLayout
+from ...sage.layout import (
+    _SAGE_ATOM_MIN_WORDS,
+    _SAGE_ATOM_TOKENS,
+    _SageKSection,
+    _SageQSection,
+    _SageScaleLayout,
+    _SageVSection,
+)
 from ...sage.modes import SageScoreScaling
 from ...split_kv_mode_policy import select_split_kv_modes
 from ..tcgen05_compat import ldtm_stat_supported
@@ -2663,25 +2670,31 @@ class FmhaDecodeConfig:
         assert self.use_sage_attention and self.groups_tokens_heads_q
         assert self.keeps_atom_tokens == _SAGE_ATOM_TOKENS
         assert self.keeps_fragments_per_atom == _SAGE_ATOM_MIN_WORDS
-        num_summaries = 0
+        summaries = None
         if self.use_block_sparse_proxy_routes:
             num_summaries, _ = _block_sparse_proxy_summary_geometry(
                 seq_len_kv, self.kv_block_size
             )
+            summaries = _SageKSection(
+                length=num_summaries,
+                block_size=self.sage_k_scale_block_size(proxy=True),
+                source_block_size=self.sage_k_summary_block_size,
+            )
         layout = _SageScaleLayout(
-            seq_len_kv=seq_len_kv,
-            k_block_size=self.sage_k_block_size,
-            num_summaries=num_summaries,
-            k_summary_block_size=self.sage_k_summary_block_size,
-            k_tokens_block_size=self.sage_k_scale_block_size(),
-            summaries_block_size=self.sage_k_scale_block_size(proxy=True),
-            seq_len_q=self.max_seq_len_q,
-            q_block_size=self.sage_q_block_size,
-            heads_q_per_kv=self.heads_q_per_kv,
-            q_tile_rows=self.tile_size_q,
-            q_heads_interleaved=True,
-            headdim=self.headdim,
-            v_mean=self.sage_v_mean,
+            k_tokens=_SageKSection(
+                length=seq_len_kv,
+                block_size=self.sage_k_scale_block_size(),
+                source_block_size=self.sage_k_block_size,
+            ),
+            q_rows=_SageQSection(
+                seq_len_q=self.max_seq_len_q,
+                q_block_size=self.sage_q_block_size,
+                heads_q_per_kv=self.heads_q_per_kv,
+                rows_per_tile=self.tile_size_q,
+                heads_interleaved=True,
+            ),
+            v_rows=_SageVSection(headdim=self.headdim, has_mean=self.sage_v_mean),
+            summaries=summaries,
         )
         q_rows = layout.q_rows
         assert q_rows.tokens_per_tile == self.q_tokens_per_cta
