@@ -67,10 +67,11 @@ ONESHOT_BF16_FORMS = {"sm_100a": "", "sm_103a": "_rso", "sm_107a": "_rst"}
 PACKED_QUANT_TARGETS = ("sm_100a", "sm_103a")
 # The (input format, output format) fused-norm programs each target builds with the permuted pass-1 sum of
 # squares ("_sop": the lane's loaded chunk order), from its own measurement: every build of sm_107a, every
-# build but nvfp4 -> bf16 of sm_103a, none of sm_100a; the others accumulate in the row's chunk order
+# build but nvfp4 -> bf16 of sm_103a and sm_100a; the others accumulate in the row's chunk order
 # ("natural").  The reference sums in the order of the selected program's record.
 PERMUTED_SS_FORMS = {
-    "sm_100a": set(),
+    "sm_100a": {(i, o) for i in INPUT_FORMATS for o in OUTPUT_FORMATS}
+    - {("nvfp4", "bf16")},
     "sm_103a": {(i, o) for i in INPUT_FORMATS for o in OUTPUT_FORMATS}
     - {("nvfp4", "bf16")},
     "sm_107a": {(i, o) for i in INPUT_FORMATS for o in OUTPUT_FORMATS},
@@ -161,7 +162,7 @@ def _expected_params(
 
 def test_registry_lists_every_program_with_the_contract_parameters() -> None:
     assert set(PROGRAMS) == _expected_program_ids()
-    assert len(PROGRAMS) == 47
+    assert len(PROGRAMS) == 37
     keys = {
         "family",
         "world_size",
@@ -324,8 +325,8 @@ def test_fused_norm_programs_cover_every_form_once_per_target() -> None:
     quantizing and sum-of-squares forms that target measured: the probe-all poll ("_pa") for NVFP4 input on
     sm_100a / sm_103a and the two-pair groups otherwise; the packed quantizing pass 2 ("_qp") for BF16 input with
     NVFP4 / MXFP8 output on sm_100a / sm_103a and the FP32 tree otherwise; the permuted pass-1 sum of squares
-    ("_sop") for every build of sm_107a and every build but nvfp4 -> bf16 of sm_103a, the row's chunk order
-    otherwise."""
+    ("_sop") for every build of sm_107a and every build but nvfp4 -> bf16 of sm_103a and sm_100a, the row's
+    chunk order otherwise."""
     for target in TARGETS:
         for input_format in INPUT_FORMATS:
             for output_format in OUTPUT_FORMATS:
@@ -386,23 +387,26 @@ def test_fused_norm_programs_cover_every_form_once_per_target() -> None:
             if program == f"tp2_rmsnorm_{i}_{o}{_fused_norm_suffix(t, i, o, pf)}"
         ), program
     for pf in ("", "_pf"):
-        assert PROGRAMS[f"tp2_rmsnorm_bf16_bf16{pf}"]["targets"] == ("sm_100a",)
-        assert PROGRAMS[f"tp2_rmsnorm_bf16_bf16_sop{pf}"]["targets"] == (
-            "sm_103a",
-            "sm_107a",
-        )
+        assert f"tp2_rmsnorm_bf16_bf16{pf}" not in PROGRAMS
+        assert PROGRAMS[f"tp2_rmsnorm_bf16_bf16_sop{pf}"]["targets"] == TARGETS
         assert (
             PROGRAMS[f"tp2_rmsnorm_nvfp4_bf16_pa{pf}"]["targets"] == PROBE_ALL_TARGETS
         )
         assert PROGRAMS[f"tp2_rmsnorm_nvfp4_bf16_sop{pf}"]["targets"] == ("sm_107a",)
         for output_format in ("nvfp4", "mxfp8"):
             quantized = f"tp2_rmsnorm_bf16_{output_format}"
-            assert PROGRAMS[f"{quantized}_qp{pf}"]["targets"] == ("sm_100a",)
-            assert PROGRAMS[f"{quantized}_qp_sop{pf}"]["targets"] == ("sm_103a",)
+            assert f"{quantized}_qp{pf}" not in PROGRAMS
+            assert PROGRAMS[f"{quantized}_qp_sop{pf}"]["targets"] == (
+                "sm_100a",
+                "sm_103a",
+            )
             assert PROGRAMS[f"{quantized}_sop{pf}"]["targets"] == ("sm_107a",)
             records = f"tp2_rmsnorm_nvfp4_{output_format}"
-            assert PROGRAMS[f"{records}_pa{pf}"]["targets"] == ("sm_100a",)
-            assert PROGRAMS[f"{records}_pa_sop{pf}"]["targets"] == ("sm_103a",)
+            assert f"{records}_pa{pf}" not in PROGRAMS
+            assert PROGRAMS[f"{records}_pa_sop{pf}"]["targets"] == (
+                "sm_100a",
+                "sm_103a",
+            )
             assert PROGRAMS[f"{records}_sop{pf}"]["targets"] == ("sm_107a",)
             assert f"{quantized}{pf}" not in PROGRAMS
             assert f"{records}{pf}" not in PROGRAMS
@@ -413,6 +417,13 @@ def test_fused_norm_programs_cover_every_form_once_per_target() -> None:
         assert f"tp2_rmsnorm_bf16_bf16_qp{pf}" not in PROGRAMS
         assert f"tp2_rmsnorm_nvfp4_bf16{pf}" not in PROGRAMS
         assert f"tp2_rmsnorm_nvfp4_bf16_pa_sop{pf}" not in PROGRAMS
+    # The natural order survives on one build only: nvfp4 -> bf16 on sm_100a / sm_103a.
+    natural = {
+        program
+        for program, record in PROGRAMS.items()
+        if record["ss_order"] == "natural"
+    }
+    assert natural == {"tp2_rmsnorm_nvfp4_bf16_pa", "tp2_rmsnorm_nvfp4_bf16_pa_pf"}
 
 
 def _checkout_source_dir() -> Path:
