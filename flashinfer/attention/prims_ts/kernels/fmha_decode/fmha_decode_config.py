@@ -4877,7 +4877,6 @@ def _validate_query_paired_config(cfg: FmhaDecodeConfig, split_kv_mode: str) -> 
         )
     if (
         cfg.use_block_sparse
-        or cfg.mask_type != DENSE
         or cfg.use_split_kv
         or split_kv_mode != "disabled"
         or cfg.use_transform_kv
@@ -4885,8 +4884,8 @@ def _validate_query_paired_config(cfg: FmhaDecodeConfig, split_kv_mode: str) -> 
         or cfg.use_sliding_window_causal
     ):
         raise ValueError(
-            "query_paired supports dense contiguous K/V only: no block-sparse "
-            "routes, causal or window masks, paged K/V, split-KV or transform-KV"
+            "query_paired supports contiguous K/V only: no block-sparse routes, "
+            "sliding windows, paged K/V, split-KV or transform-KV"
         )
 
 

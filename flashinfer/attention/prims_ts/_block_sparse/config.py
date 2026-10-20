@@ -417,15 +417,14 @@ def _resolve_plan_dtypes(
 def _validate_query_paired_profile(
     *,
     use_block_sparse: bool,
-    mask_type: str,
     q_tile_size: int,
 ) -> None:
     """Reject a query-paired plan outside the dense Q128 path."""
 
-    if use_block_sparse or mask_type != "dense":
+    if use_block_sparse:
         raise NotImplementedError(
             "query_paired requires a dense, contiguous K/V plan "
-            "(use_block_sparse=False, mask_type='dense')"
+            "(use_block_sparse=False)"
         )
     if q_tile_size != 128:
         raise NotImplementedError(
@@ -531,7 +530,6 @@ def _validate_block_sparse_static_profile(
     if query_paired:
         _validate_query_paired_profile(
             use_block_sparse=use_block_sparse,
-            mask_type=mask_type,
             q_tile_size=q_tile_size,
         )
     return _BlockSparseStaticProfile(

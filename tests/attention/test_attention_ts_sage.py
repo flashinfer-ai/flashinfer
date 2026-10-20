@@ -206,6 +206,25 @@ _DENSE_CASES = (
         query_paired=True,
         persistent=True,
     ),
+    # 536 K/V tokens give the first CTA's second Q tile one more K/V tile
+    # than its first.
+    _SageCase(
+        "q128_fp8_k1_causal_paired",
+        **{**_Q128, "seq_len_kv": 536},
+        sage=SageAttentionConfig(k_block_size=1),
+        mask_type="causal",
+        query_paired=True,
+    ),
+    _SageCase(
+        "q128_int8_k16_mean_causal_paired_persistent",
+        **{**_Q128, "seq_len_kv": 536},
+        qk_dtype=torch.int8,
+        out_dtype=torch.float16,
+        sage=SageAttentionConfig(v_mean=True),
+        mask_type="causal",
+        query_paired=True,
+        persistent=True,
+    ),
     # A zero threshold keeps exact KV256 anchors and P at the full E4M3 range.
     _SageCase(
         "kv256_fp8_k16_exact_anchors_persistent",

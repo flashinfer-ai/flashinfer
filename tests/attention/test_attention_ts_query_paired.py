@@ -33,6 +33,7 @@ class _PairedCase:
     batch_size: int = 2
     num_kv_heads: int = 2
     persistent: bool = False
+    mask_type: str = "dense"
 
     @property
     def num_qo_heads(self) -> int:
@@ -46,6 +47,35 @@ _CASES = (
     _PairedCase("three_tiles_fp16", seq_len_q=48, seq_len_kv=640, dtype=torch.float16),
     _PairedCase(
         "three_tiles_persistent", seq_len_q=48, seq_len_kv=1000, persistent=True
+    ),
+    # The first Q tile sees K/V up to 1024, the second one more K/V tile.
+    _PairedCase(
+        "causal_one_cta_extra_kv_tile",
+        seq_len_q=32,
+        seq_len_kv=1040,
+        mask_type="causal",
+    ),
+    # Only the first of the two CTAs streams a K/V tile its first Q tile
+    # cannot see.
+    _PairedCase(
+        "causal_two_ctas_extra_kv_tile",
+        seq_len_q=64,
+        seq_len_kv=1072,
+        mask_type="causal",
+    ),
+    _PairedCase(
+        "causal_three_tiles_fp16",
+        seq_len_q=48,
+        seq_len_kv=640,
+        dtype=torch.float16,
+        mask_type="causal",
+    ),
+    _PairedCase(
+        "causal_two_ctas_persistent",
+        seq_len_q=64,
+        seq_len_kv=1072,
+        mask_type="causal",
+        persistent=True,
     ),
 )
 
@@ -75,6 +105,7 @@ def _plan(case: _PairedCase, *, query_paired: bool) -> BlockSparseTSWrapper:
                 64,
                 device=torch.device("cuda", 0),
                 use_block_sparse=False,
+                mask_type=case.mask_type,
                 q_data_type=case.dtype,
                 query_paired=query_paired,
             )
@@ -87,11 +118,17 @@ def _plan(case: _PairedCase, *, query_paired: bool) -> BlockSparseTSWrapper:
     return wrapper
 
 
-def _reference(q, k, v, sm_scale: float) -> torch.Tensor:
+def _reference(q, k, v, sm_scale: float, mask_type: str) -> torch.Tensor:
     group = q.shape[2] // k.shape[2]
     k_heads = k.float().repeat_interleave(group, dim=2)
     v_heads = v.float().repeat_interleave(group, dim=2)
     scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), k_heads) * sm_scale
+    if mask_type == "causal":
+        # Query i sees the keys up to its own position at the end of K/V.
+        seq_len_q, seq_len_kv = q.shape[1], k.shape[1]
+        last_keys = torch.arange(seq_len_q, device=q.device) + seq_len_kv - seq_len_q
+        hidden = torch.arange(seq_len_kv, device=q.device) > last_keys[:, None]
+        scores = scores.masked_fill(hidden, float("-inf"))
     return torch.einsum("bhqk,bkhd->bqhd", scores.softmax(dim=-1), v_heads)
 
 
@@ -123,7 +160,10 @@ def test_query_paired_matches_unpaired(case: _PairedCase) -> None:
     assert torch.isfinite(paired).all()
     torch.testing.assert_close(paired.float(), unpaired.float(), rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(
-        paired.float(), _reference(q, k, v, sm_scale), rtol=2e-2, atol=2e-2
+        paired.float(),
+        _reference(q, k, v, sm_scale, case.mask_type),
+        rtol=2e-2,
+        atol=2e-2,
     )
 
 
@@ -135,7 +175,6 @@ def test_query_paired_matches_unpaired(case: _PairedCase) -> None:
             "dense, contiguous",
             id="sparse",
         ),
-        pytest.param({"mask_type": "causal"}, "dense, contiguous", id="causal"),
         pytest.param({"num_qo_heads": 2, "q_block_size": 32}, "Q128", id="q64-tile"),
     ),
 )
