@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 import json
 import math
@@ -216,8 +217,8 @@ class WorkerGPUFootprint:
 def measure_worker_gpu_footprint(
     device: object = None,
     *,
-    torch_module: object | None = None,
-    nvml_module: object | None = None,
+    torch_module: Any | None = None,
+    nvml_module: Any | None = None,
     pid: int | None = None,
 ) -> WorkerGPUFootprint:
     """Measure allocator and process-visible GPU memory for this worker.
@@ -232,7 +233,7 @@ def measure_worker_gpu_footprint(
             import torch as torch_module
         except ImportError as exc:
             raise RuntimeError("PyTorch is required to measure GPU memory") from exc
-    cuda = getattr(torch_module, "cuda")
+    cuda = torch_module.cuda
     resolved_device = cuda.current_device() if device is None else device
     allocated = int(cuda.memory_allocated(resolved_device))
     reserved = int(cuda.memory_reserved(resolved_device))
@@ -256,7 +257,7 @@ def _nvml_process_memory(
     device: object,
     properties: object,
     *,
-    nvml_module: object | None,
+    nvml_module: Any | None,
     pid: int,
 ) -> int | None:
     if nvml_module is None:
@@ -272,7 +273,7 @@ def _nvml_process_memory(
         handle = nvml_handle_for_uuid(
             nvml_module, "" if uuid is None else uuid, index=int(device)
         )
-        processes: list[object] = []
+        processes: list[Any] = []
         for getter_name in (
             "nvmlDeviceGetComputeRunningProcesses_v3",
             "nvmlDeviceGetComputeRunningProcesses_v2",
@@ -289,22 +290,20 @@ def _nvml_process_memory(
             except Exception:
                 continue
         usages = {
-            int(getattr(process, "usedGpuMemory"))
+            int(process.usedGpuMemory)
             for process in processes
             if int(getattr(process, "pid", -1)) == pid
             and isinstance(getattr(process, "usedGpuMemory", None), int)
-            and int(getattr(process, "usedGpuMemory")) >= 0
-            and int(getattr(process, "usedGpuMemory")) < (1 << 63)
+            and int(process.usedGpuMemory) >= 0
+            and int(process.usedGpuMemory) < (1 << 63)
         }
         return max(usages) if usages else None
     except Exception:
         return None
     finally:
         if initialized:
-            try:
+            with suppress(Exception):
                 nvml_module.nvmlShutdown()
-            except Exception:
-                pass
 
 
 def derive_safe_worker_cap(
@@ -426,9 +425,7 @@ def select_compile_scaling_knee(
     best_throughput = max(point.throughput_per_minute for point in usable)
     threshold = (1.0 - minimum_gain) * best_throughput
     return next(
-        point.workers
-        for point in usable
-        if point.throughput_per_minute >= threshold
+        point.workers for point in usable if point.throughput_per_minute >= threshold
     )
 
 
@@ -644,8 +641,7 @@ class CalibrationData:
             (
                 point
                 for point in self.compile_scaling
-                if point.workers == self.worker_count
-                and point.worker_gpu_footprints
+                if point.workers == self.worker_count and point.worker_gpu_footprints
             ),
             None,
         )
@@ -712,9 +708,8 @@ def compatibility_mismatches(
     for field_name in _SCHEMA_FIELDS["environment"]:
         if field_name in _UNCHECKED_ENVIRONMENT_FIELDS:
             continue
-        if (
-            field_name in _OPTIONAL_ENVIRONMENT_FIELDS
-            and (saved[field_name] is None or observed[field_name] is None)
+        if field_name in _OPTIONAL_ENVIRONMENT_FIELDS and (
+            saved[field_name] is None or observed[field_name] is None
         ):
             continue
         if field_name == "driver" and saved[field_name] == "unknown":

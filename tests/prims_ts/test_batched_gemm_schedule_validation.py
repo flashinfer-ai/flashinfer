@@ -202,6 +202,83 @@ def test_batch_m_accepts_full_m_epilogue_tile(use_tma_store):
 
 
 @pytest.mark.parametrize(
+    ("dtype_name", "mma_k", "tile_k", "act_name", "problem_n", "accepted"),
+    (
+        ("E2M1", 64, 256, "SWIGLU", 496, False),
+        ("E2M1", 64, 256, "SWIGLU", 512, True),
+        ("E4M3", 32, 128, "RELU2", 127, False),
+        ("E4M3", 32, 128, "RELU2", 128, True),
+        ("BF16", 16, 128, "NONE", 127, False),
+        ("BF16", 16, 128, "NONE", 128, True),
+    ),
+)
+def test_batch_m_output_rows_require_16_byte_alignment(
+    dtype_name, mma_k, tile_k, act_name, problem_n, accepted
+):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        ActKind,
+        BatchMode,
+        DType,
+        SfLayout,
+        make_config,
+        uniform_pipeline_stage_overrides,
+        validate_config,
+    )
+
+    dtype = int(getattr(DType, dtype_name))
+    cfg = make_config(
+        batch_mode=int(BatchMode.BATCH_M),
+        transpose_mma_output=0,
+        dtype_a=dtype,
+        dtype_b=dtype,
+        dtype_c=dtype,
+        tile_n=128,
+        tile_k=tile_k,
+        mma_m=256,
+        mma_n=128,
+        mma_k=mma_k,
+        umma_cta_count=2,
+        epi_tile_m=128,
+        epi_tile_n=64,
+        tile_scheduler=1,
+        num_stages_tmem_acc=2,
+        use_unroll_loop_2x_for_mma=0,
+        act_kind=int(getattr(ActKind, act_name)),
+        route_act=0,
+        use_tma_store=0,
+        use_global_scales=1,
+        sf_layout_b=int(SfLayout.R128c4),
+        sf_layout_c=int(SfLayout.R8c4),
+        **uniform_pipeline_stage_overrides(2),
+    )
+
+    if accepted:
+        validate_config(cfg, problem_mnk=(128, problem_n, 512))
+    else:
+        with pytest.raises(ValueError, match="output rows must be 16-byte aligned"):
+            validate_config(cfg, problem_mnk=(128, problem_n, 512))
+
+
+def test_batch_n_does_not_require_16_byte_output_rows():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        ActKind,
+        DType,
+        make_config,
+        validate_config,
+    )
+
+    cfg = make_config(
+        dtype_a=int(DType.BF16),
+        dtype_b=int(DType.BF16),
+        dtype_c=int(DType.BF16),
+        mma_k=16,
+        act_kind=int(ActKind.SWIGLU),
+    )
+
+    validate_config(cfg, problem_mnk=(128, 504, 512))
+
+
+@pytest.mark.parametrize(
     ("argv", "expected"),
     (
         ([], 32),
@@ -783,10 +860,7 @@ def test_trtllm_equiv_task_manager_smem_matches_kernel_allocation():
     )
     _, _, smem_allocator, _ = _build_schedule_validate(cfg, num_k_tiles=16)
 
-    assert (
-        smem_allocator.total_smem_bytes + smem_allocator.barrier_smem_bytes
-        == 217616
-    )
+    assert smem_allocator.total_smem_bytes + smem_allocator.barrier_smem_bytes == 217616
     assert [
         (r.name, r.pipeline_config.num_stages)
         for r in smem_allocator._barrier_resources
@@ -2002,9 +2076,7 @@ def test_clustered_swap_ab_tma_gather_splits_b_smem_across_ctas(tile_n):
         ),
     ),
 )
-def test_r128c4_sfb_utccp_offsets_cover_tmem(
-    kind, tile_n, tile_k, mma_k, expected
-):
+def test_r128c4_sfb_utccp_offsets_cover_tmem(kind, tile_n, tile_k, mma_k, expected):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
         SfLayout,
@@ -2014,9 +2086,7 @@ def test_r128c4_sfb_utccp_offsets_cover_tmem(
     )
 
     dtype_a, dtype_b = (
-        (DType.MXE2M1, DType.MXE4M3)
-        if kind == "mx"
-        else (DType.E2M1, DType.E2M1)
+        (DType.MXE2M1, DType.MXE4M3) if kind == "mx" else (DType.E2M1, DType.E2M1)
     )
     cfg = make_config(
         sm_arch=107,
@@ -2033,8 +2103,7 @@ def test_r128c4_sfb_utccp_offsets_cover_tmem(
     )
     num_copies = cfg.tmem_sfb_cols // TMEM_SF_UTCCP_COLS_PER_COPY
     offsets = tuple(
-        sfb_r128c4_utccp_offsets(cfg, copy_idx)
-        for copy_idx in range(num_copies)
+        sfb_r128c4_utccp_offsets(cfg, copy_idx) for copy_idx in range(num_copies)
     )
 
     assert cfg.uses_n_major_r128c4_sfb_utccp
@@ -2042,9 +2111,7 @@ def test_r128c4_sfb_utccp_offsets_cover_tmem(
     written_cols = [
         col
         for _, tmem_delta in offsets
-        for col in range(
-            tmem_delta, tmem_delta + TMEM_SF_UTCCP_COLS_PER_COPY
-        )
+        for col in range(tmem_delta, tmem_delta + TMEM_SF_UTCCP_COLS_PER_COPY)
     ]
     assert len(written_cols) == len(set(written_cols))
     assert set(written_cols) == set(range(cfg.tmem_sfb_cols))

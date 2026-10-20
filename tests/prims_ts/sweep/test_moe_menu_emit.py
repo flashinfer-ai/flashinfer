@@ -41,9 +41,7 @@ def test_activation_normalized_identity_is_class_scoped():
         "tile_k": 512,
     }
     candidate = Candidate(options=options, tile_n=8)
-    gated = menu_candidate_id(
-        candidate, fc="fc1", activation_class_name="gated"
-    )
+    gated = menu_candidate_id(candidate, fc="fc1", activation_class_name="gated")
     elementwise = menu_candidate_id(
         candidate, fc="fc1", activation_class_name="elementwise"
     )
@@ -180,9 +178,7 @@ def test_emit_replaces_dtype_slice_and_inherits_shared_variants(tmp_path):
     )
     emitted = json.loads(out_path.read_text())
     fc1 = _target_rows(emitted, "fc1")
-    assert {
-        (row["fused_act"], row["act"], row["eltwise_act_type"]) for row in fc1
-    } == {
+    assert {(row["fused_act"], row["act"], row["eltwise_act_type"]) for row in fc1} == {
         (True, "swiglu", "none"),
         (True, "geglu", "none"),
         (False, "none", "relu2"),

@@ -149,9 +149,7 @@ def _resolve_template(
     result: dict[str, object] = {}
     parent = raw.get("_template")
     if parent is not None:
-        result.update(
-            _resolve_template(str(parent), templates, stack=(*stack, name))
-        )
+        result.update(_resolve_template(str(parent), templates, stack=(*stack, name)))
     result.update({key: value for key, value in raw.items() if key != "_template"})
     return result
 
@@ -339,9 +337,7 @@ def _target_row_indices(
             fc, _ = _row_slice(row)
             matches.append(_matches_dtype(row, dtype, fc))
         if any(matches) and not all(matches):
-            raise ValueError(
-                f"configs[{index}] mixes {dtype} and non-{dtype} options"
-            )
+            raise ValueError(f"configs[{index}] mixes {dtype} and non-{dtype} options")
         if matches and all(matches):
             indices.append(index)
             expanded.extend(rows)
@@ -478,7 +474,7 @@ def _selected_geometries(
     # A persistent base receives this exact sibling from the runtime.  Avoid
     # emitting the sibling explicitly when its base is already selected.
     redundant_twins = set()
-    for key, value in tuple(grouped.items()):
+    for _key, value in tuple(grouped.items()):
         twin = runtime_twin(value["options"])
         if twin is None:
             continue
@@ -489,9 +485,7 @@ def _selected_geometries(
         value["classes"].update(explicit_twin["classes"])
         value["rank"] = min(int(value["rank"]), int(explicit_twin["rank"]))
         redundant_twins.add(twin_key)
-    return [
-        value for key, value in grouped.items() if key not in redundant_twins
-    ]
+    return [value for key, value in grouped.items() if key not in redundant_twins]
 
 
 def _auto_field_value(cfg: Any, field: str) -> int:
@@ -664,8 +658,7 @@ def _resolve_activation_mode(
     return (
         "per-class"
         if any(
-            entry.get("fc") == "fc1"
-            and entry.get("activation_class") == "elementwise"
+            entry.get("fc") == "fc1" and entry.get("activation_class") == "elementwise"
             for entry in selected
         )
         else "shared"
@@ -740,9 +733,9 @@ def _expected_sets(
     activations: Mapping[str, Sequence[tuple[object, str, str]]],
     per_token: Mapping[str, Sequence[tuple[object | None, object | None]]],
 ) -> dict[tuple[str, str, object | None], set[str]]:
-    explicit: dict[
-        tuple[str, str, object | None], list[dict[str, object]]
-    ] = collections.defaultdict(list)
+    explicit: dict[tuple[str, str, object | None], list[dict[str, object]]] = (
+        collections.defaultdict(list)
+    )
     for geometry in geometries:
         fc = str(geometry["fc"])
         activation_values: Sequence[Sequence[object] | None] = (
@@ -773,10 +766,7 @@ def _expected_sets(
                     )
                 )
     return {
-        key: {
-            _runtime_identity(value, fc=key[0])
-            for value in _runtime_options(values)
-        }
+        key: {_runtime_identity(value, fc=key[0]) for value in _runtime_options(values)}
         for key, values in explicit.items()
     }
 
@@ -1003,11 +993,7 @@ def _compact_members(
             if block_key not in compact:
                 compact[block_key] = [[members[0][column] for column in block]]
             continue
-        if (
-            key in explicit
-            or key not in inherited
-            or inherited[key] != members[0][key]
-        ):
+        if key in explicit or key not in inherited or inherited[key] != members[0][key]:
             compact[key] = members[0][key]
     if len(joint) > 1:
         compact[",".join(joint)] = [
@@ -1229,9 +1215,9 @@ def _actual_sets(
     dict[tuple[str, str, object | None], set[str]],
     collections.Counter[str],
 ]:
-    explicit: dict[
-        tuple[str, str, object | None], list[dict[str, object]]
-    ] = collections.defaultdict(list)
+    explicit: dict[tuple[str, str, object | None], list[dict[str, object]]] = (
+        collections.defaultdict(list)
+    )
     counts: collections.Counter[str] = collections.Counter()
     for row in rows:
         fc, _ = _row_slice(row)
@@ -1248,17 +1234,12 @@ def _actual_sets(
         )
         per_token = row.get("use_per_token_sf_b")
         key = (fc, activation.lower(), per_token)
-        value = {
-            key: item for key, item in row.items() if key != "_comment"
-        }
+        value = {key: item for key, item in row.items() if key != "_comment"}
         identity = _runtime_identity(value, fc=fc)
         counts[identity] += 1
         explicit[key].append(value)
     actual = {
-        key: {
-            _runtime_identity(value, fc=key[0])
-            for value in _runtime_options(values)
-        }
+        key: {_runtime_identity(value, fc=key[0]) for value in _runtime_options(values)}
         for key, values in explicit.items()
     }
     return actual, counts
@@ -1267,15 +1248,11 @@ def _actual_sets(
 def _verify_tile_pairing(
     expected: Mapping[tuple[str, str, object | None], set[str]],
 ) -> None:
-    fc2_sets = [
-        values for (fc, _, _), values in expected.items() if fc == "fc2"
-    ]
+    fc2_sets = [values for (fc, _, _), values in expected.items() if fc == "fc2"]
     if not fc2_sets:
         raise ValueError("emitted menu has no FC2 runtime configs")
     fc2_tiles = {
-        int(json.loads(value)["tile_n"])
-        for values in fc2_sets
-        for value in values
+        int(json.loads(value)["tile_n"]) for values in fc2_sets for value in values
     }
     for (fc, activation, per_token), values in expected.items():
         if fc != "fc1":
@@ -1335,12 +1312,8 @@ def _verify_output(
 def _print_pair_summary(
     actual: Mapping[tuple[str, str, object | None], set[str]],
 ) -> None:
-    fc2 = next(
-        values for (fc, _, _), values in actual.items() if fc == "fc2"
-    )
-    fc2_by_tile = collections.Counter(
-        int(json.loads(value)["tile_n"]) for value in fc2
-    )
+    fc2 = next(values for (fc, _, _), values in actual.items() if fc == "fc2")
+    fc2_by_tile = collections.Counter(int(json.loads(value)["tile_n"]) for value in fc2)
     print("Runtime autotune pairs by tile_n:")
     for (fc, activation, per_token), values in sorted(actual.items(), key=str):
         if fc != "fc1":
@@ -1356,9 +1329,7 @@ def _print_pair_summary(
         for tile in sorted(set(fc1_by_tile) | set(fc2_by_tile)):
             pairs = fc1_by_tile[tile] * fc2_by_tile[tile]
             total += pairs
-            rendered.append(
-                f"N{tile}:{fc1_by_tile[tile]}x{fc2_by_tile[tile]}={pairs}"
-            )
+            rendered.append(f"N{tile}:{fc1_by_tile[tile]}x{fc2_by_tile[tile]}={pairs}")
         print(f"  {label}: {', '.join(rendered)}; total={total}")
 
 
@@ -1416,9 +1387,7 @@ def emit_menu_prefix(
     floor_size = int(order.get("floor_size", 0))
     entries = list(order.get("entries", ()))
     if n < floor_size:
-        raise ValueError(
-            f"N={n} is below the mandatory floor of {floor_size} entries"
-        )
+        raise ValueError(f"N={n} is below the mandatory floor of {floor_size} entries")
     if n > len(entries):
         raise ValueError(f"N={n} exceeds the selected order length {len(entries)}")
     selected = entries[:n]
@@ -1439,11 +1408,7 @@ def emit_menu_prefix(
     if not indices:
         raise ValueError(f"base config has no {dtype} slice")
     base_quant_keys = {
-        fc: {
-            _quant_key(row)
-            for row in base_rows
-            if _row_slice(row)[0] == fc
-        }
+        fc: {_quant_key(row) for row in base_rows if _row_slice(row)[0] == fc}
         for fc in ("fc1", "fc2")
     }
     for fc, quant_key in selected_quant_keys.items():

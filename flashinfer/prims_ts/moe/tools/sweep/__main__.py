@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
 from dataclasses import replace
 import json
 import os
@@ -92,7 +93,6 @@ from .menu_retime import collect_menu_candidates, run_menu_retime
 from .menu_select import load_joint_inputs, select_joint_menu
 from .shapes import (
     MODEL_PRESETS,
-    build_sweep_shapes,
     default_global_num_tokens,
     resolve_activation_params,
 )
@@ -112,9 +112,7 @@ _CUDA_ARCH_ENV = {
 
 class _ArgumentParser(argparse.ArgumentParser):
     def __init__(self, *args, **kwargs) -> None:
-        kwargs.setdefault(
-            "formatter_class", argparse.ArgumentDefaultsHelpFormatter
-        )
+        kwargs.setdefault("formatter_class", argparse.ArgumentDefaultsHelpFormatter)
         super().__init__(*args, **kwargs)
 
 
@@ -368,9 +366,7 @@ def _environment_fingerprint(gpu: str = "0") -> EnvironmentFingerprint:
                 (
                     index
                     for index in range(torch.cuda.device_count())
-                    if str(
-                        getattr(torch.cuda.get_device_properties(index), "uuid", "")
-                    )
+                    if str(getattr(torch.cuda.get_device_properties(index), "uuid", ""))
                     == resolved_gpu
                 ),
                 torch.cuda.current_device(),
@@ -497,12 +493,16 @@ def _run_calibration(args) -> CalibrationData:
     points: list[CompileScalingPoint] = []
     shape_costs: list[ShapeGPUCost] = []
     peak_gpu_memory_bytes = 0
-    with tempfile.TemporaryDirectory(prefix="flashinfer-sweep-calibrate-") as root:
+    with (
+        tempfile.TemporaryDirectory(prefix="flashinfer-sweep-calibrate-") as root,
+        ExitStack() as cleanup,
+    ):
         # Compile jobs alternate FC1 and FC2, so each engine needs at most half
         # of the largest aggregate concurrency under test.
         per_fc_workers = max(1, (max(worker_counts) + 1) // 2)
-        engines = [
-            SweepEngine(
+        engines = []
+        for fc in ("fc1", "fc2"):
+            engine = SweepEngine(
                 _sweep_options(
                     args,
                     out_dir=Path(root) / fc,
@@ -510,8 +510,8 @@ def _run_calibration(args) -> CalibrationData:
                     workers=per_fc_workers,
                 )
             )
-            for fc in ("fc1", "fc2")
-        ]
+            cleanup.callback(engine.close)
+            engines.append(engine)
         candidate_sets = [list(engine.candidates.values()) for engine in engines]
         if any(not candidates for candidates in candidate_sets):
             raise RuntimeError("calibration found no FC1 or FC2 candidates")
@@ -524,16 +524,12 @@ def _run_calibration(args) -> CalibrationData:
             (engine, candidates[-1])
             for engine, candidates in zip(engines, candidate_sets, strict=True)
         ]
-        warmup_jobs = [
-            job for _ in range(per_fc_workers) for job in warmup_candidates
-        ]
+        warmup_jobs = [job for _ in range(per_fc_workers) for job in warmup_candidates]
         measured_candidate_sets = [candidates[:-1] for candidates in candidate_sets]
         jobs = [
             (engine, candidates[index])
             for index in range(max(len(values) for values in measured_candidate_sets))
-            for engine, candidates in zip(
-                engines, measured_candidate_sets, strict=True
-            )
+            for engine, candidates in zip(engines, measured_candidate_sets, strict=True)
             if index < len(candidates)
         ]
         fitted_worker_counts = _fit_calibration_worker_counts(
@@ -731,8 +727,6 @@ def _run_calibration(args) -> CalibrationData:
         ),
         metadata={"peak_gpu_memory_bytes": peak_gpu_memory_bytes},
     )
-    for engine in engines:
-        engine.close()
     return calibration
 
 
@@ -852,9 +846,7 @@ def _cmd_menu_retime(args) -> int:
 
 
 def _cmd_menu_select(args) -> int:
-    candidates, shapes, timings, cost, deployments = load_joint_inputs(
-        args.retime_dir
-    )
+    candidates, shapes, timings, cost, deployments = load_joint_inputs(args.retime_dir)
     manifest_path = args.retime_dir / "menu_manifest.json"
     input_manifest = (
         json.loads(manifest_path.read_text(encoding="utf-8"))

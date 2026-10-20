@@ -145,6 +145,7 @@ def test_localization_support_accepts_mixed_backends(bench, monkeypatch):
     bench._validate_localization_support(
         backends=["trtllm", "prims_ts"],
         quant_mode="BF16",
+        activation_type=bench.ActivationType.Swiglu,
         localizations=["none", "tp_n_tp_n"],
     )
 
@@ -156,8 +157,26 @@ def test_localization_support_rejects_deepseek_fp8_block(bench):
         bench._validate_localization_support(
             backends=["trtllm", "prims_ts"],
             quant_mode="Fp8-Block",
+            activation_type=bench.ActivationType.Swiglu,
             localizations=["tp_n_tp_n"],
         )
+
+
+def test_localization_support_rejects_non_gated_activation_first(bench):
+    with pytest.raises(ValueError, match="only gated activations; got Relu2"):
+        bench._validate_localization_support(
+            backends=["prims_ts"],
+            quant_mode="Fp8-Block",
+            activation_type=bench.ActivationType.Relu2,
+            localizations=["tp_n_tp_n"],
+        )
+
+    bench._validate_localization_support(
+        backends=["prims_ts"],
+        quant_mode="BF16",
+        activation_type=bench.ActivationType.Relu2,
+        localizations=["none"],
+    )
 
 
 def test_localized_setup_forwards_fp4_activation_parameters(bench, monkeypatch):

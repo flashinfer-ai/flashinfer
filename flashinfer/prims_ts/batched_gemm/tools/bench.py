@@ -517,7 +517,7 @@ def _trtllm_gen_command(
     _append_optional_option(
         cmd, "-perTokenSfDtype", generated_options, "perTokenSfDtype"
     )
-    if dtype_a == int(DType.E4M3) and dtype_b == int(DType.E4M3):
+    if dtype_a == "e4m3" and dtype_b == "e4m3":
         _append_option(cmd, "-quantScaleC", generated_options.get("quantScaleC", 1))
     _append_option(cmd, "-tileM", 128)
     _append_option(cmd, "-tileN", kwargs["tile_n"])

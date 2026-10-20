@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union, cast
 
 import torch
 
@@ -259,10 +259,14 @@ def _prims_ts_fp8_per_tensor_scale_moe_impl(
         require_partition_pair("gemm1_weights", gemm1_weights)
         require_partition_pair("gemm2_weights", gemm2_weights)
     gemm1_for_validation = (
-        gemm1_weights[0] if partition_resources is not None else gemm1_weights
+        cast(Sequence[torch.Tensor], gemm1_weights)[0]
+        if partition_resources is not None
+        else cast(torch.Tensor, gemm1_weights)
     )
     gemm2_for_validation = (
-        gemm2_weights[0] if partition_resources is not None else gemm2_weights
+        cast(Sequence[torch.Tensor], gemm2_weights)[0]
+        if partition_resources is not None
+        else cast(torch.Tensor, gemm2_weights)
     )
     if gemm1_for_validation.dtype != torch.float8_e4m3fn:
         raise ValueError("gemm1_weights must be float8_e4m3fn")
@@ -1067,10 +1071,14 @@ def _prims_ts_fp8_block_scale_moe_impl(
         require_partition_pair("gemm2_weights", gemm2_weights)
         require_partition_pair("gemm2_weights_scale", gemm2_weights_scale)
     gemm1_for_validation = (
-        gemm1_weights[0] if partition_resources is not None else gemm1_weights
+        cast(Sequence[torch.Tensor], gemm1_weights)[0]
+        if partition_resources is not None
+        else cast(torch.Tensor, gemm1_weights)
     )
     gemm2_for_validation = (
-        gemm2_weights[0] if partition_resources is not None else gemm2_weights
+        cast(Sequence[torch.Tensor], gemm2_weights)[0]
+        if partition_resources is not None
+        else cast(torch.Tensor, gemm2_weights)
     )
     gemm1_scale_for_validation = (
         gemm1_weights_scale[0]

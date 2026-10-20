@@ -207,11 +207,7 @@ def code_fingerprint() -> dict[str, object]:
         -1
         if status is None
         else sorted(
-            {
-                line[3:]
-                for line in status.splitlines()
-                if len(line) > 3 and line[3:]
-            }
+            {line[3:] for line in status.splitlines() if len(line) > 3 and line[3:]}
         )
     )
     return {
@@ -957,11 +953,7 @@ def summarize_gpu_clocks(
             "median_sm_clock_mhz": statistics.median(clocks),
             "max_sm_clock_mhz": max(clocks),
             "max_rated_sm_clock_mhz": max(
-                (
-                    maximum
-                    for _, maximum, _ in samples
-                    if maximum is not None
-                ),
+                (maximum for _, maximum, _ in samples if maximum is not None),
                 default=None,
             ),
             "low_clock_count": low_count,
@@ -998,11 +990,7 @@ def _prune_failed_finalists(
     """Remove failed finalists from both selection inputs."""
 
     return (
-        [
-            candidate
-            for candidate in candidates
-            if candidate.candidate_id not in failed
-        ],
+        [candidate for candidate in candidates if candidate.candidate_id not in failed],
         {
             candidate_id: dict(row)
             for candidate_id, row in timings.items()
@@ -1679,9 +1667,8 @@ class SweepEngine:
                 )
             history = list(prior_manifest.get("resume_history", ()))
             prior_code = dict(prior_manifest.get("code", {}))
-            code_changed = (
-                prior_code.get("prims_ts_source_digest")
-                != self.code.get("prims_ts_source_digest")
+            code_changed = prior_code.get("prims_ts_source_digest") != self.code.get(
+                "prims_ts_source_digest"
             )
             if code_changed and options.strict_resume:
                 raise ValueError(
@@ -1806,15 +1793,11 @@ class SweepEngine:
                         self._search_loop_seconds[str(name)] = float(
                             values.get("seconds", 0.0)
                         )
-                        self._search_loop_calls[str(name)] = int(
-                            values.get("calls", 0)
-                        )
+                        self._search_loop_calls[str(name)] = int(values.get("calls", 0))
             if checkpoint.sequence > len(self.records):
                 raise ValueError("checkpoint sequence is ahead of the results journal")
             tail = self.records[checkpoint.sequence :]
-            search_tail = [
-                record for record in tail if record.get("phase") == "search"
-            ]
+            search_tail = [record for record in tail if record.get("phase") == "search"]
             if search_tail:
                 # A crash can happen after durable result appends but before
                 # the next atomic checkpoint. Reconcile those records instead
@@ -1923,14 +1906,11 @@ class SweepEngine:
                 "phase": phase,
                 "search": self.search.to_dict(),
                 "seed_candidates": [
-                    _candidate_payload(candidate)
-                    for candidate in self._seed_candidates
+                    _candidate_payload(candidate) for candidate in self._seed_candidates
                 ],
                 "seed_selection_complete": self._seed_selection_complete,
                 "incumbent_ids": sorted(self.incumbent_ids),
-                "incumbents_dropped_by_cap": sorted(
-                    self._incumbents_dropped_by_cap
-                ),
+                "incumbents_dropped_by_cap": sorted(self._incumbents_dropped_by_cap),
                 "rejection_reasons": self._rejection_reasons,
                 "parent_moves": {
                     "duplicate_limit": self._parent_moves.duplicate_limit,
@@ -2113,9 +2093,7 @@ class SweepEngine:
             if self._search_loop_active_since is not None:
                 active_seconds = now - self._search_loop_active_since
                 wall_seconds += active_seconds
-                worker_capacity_seconds += (
-                    active_seconds * self.options.worker_count
-                )
+                worker_capacity_seconds += active_seconds * self.options.worker_count
             worker_busy_seconds = self._search_worker_busy_seconds
             phase_seconds = dict(self._search_loop_seconds)
             phase_calls = dict(self._search_loop_calls)
@@ -2131,9 +2109,7 @@ class SweepEngine:
             "worker_capacity_seconds": worker_capacity_seconds,
             "worker_utilization": worker_utilization,
             "profiled_main_thread_seconds": profiled_seconds,
-            "unprofiled_main_thread_seconds": max(
-                0.0, wall_seconds - profiled_seconds
-            ),
+            "unprofiled_main_thread_seconds": max(0.0, wall_seconds - profiled_seconds),
             "phases": {
                 name: {
                     "seconds": seconds,
@@ -2375,11 +2351,9 @@ class SweepEngine:
                 if measurement.get("status") != "ok":
                     continue
                 shape_key = str(measurement["shape_id"])
-                self._confirm_timings[(candidate_id, shape_key)] = (
-                    TimingValue.measured(
-                        float(measurement["median_us"]),
-                        float(measurement.get("mad_us") or 0.0),
-                    )
+                self._confirm_timings[(candidate_id, shape_key)] = TimingValue.measured(
+                    float(measurement["median_us"]),
+                    float(measurement.get("mad_us") or 0.0),
                 )
 
     def _record(
@@ -2404,7 +2378,9 @@ class SweepEngine:
             "timestamp": time.time(),
             "resume_segment": self.resume_segment,
             "environment_digest": (
-                None if self.calibration is None else self.calibration.environment.digest
+                None
+                if self.calibration is None
+                else self.calibration.environment.digest
             ),
         }
         low_clocks = [
@@ -2423,8 +2399,7 @@ class SweepEngine:
         if low_clocks and now - self._last_clock_warning >= 300.0:
             current, maximum = min(low_clocks, key=lambda value: value[0] / value[1])
             self._progress(
-                f"WARNING: low GPU SM clock {current}/{maximum} MHz "
-                f"during {phase}",
+                f"WARNING: low GPU SM clock {current}/{maximum} MHz during {phase}",
                 force=True,
             )
             self._last_clock_warning = now
@@ -3285,9 +3260,7 @@ class SweepEngine:
                 force=True,
             )
             phase_started = time.monotonic()
-            interim = self._select_menu(
-                portfolio_candidates, portfolio_shapes, timings
-            )
+            interim = self._select_menu(portfolio_candidates, portfolio_shapes, timings)
             self._record_search_phase("select_menu", phase_started)
             best = self._best_by_shape(timings)
             groups = sorted(
@@ -3364,10 +3337,7 @@ class SweepEngine:
                 time.monotonic() + max(1.0, 0.25 * max_batch),
             )
             phase_started = time.monotonic()
-            while (
-                len(proposed) < max_batch
-                and time.monotonic() < proposal_deadline
-            ):
+            while len(proposed) < max_batch and time.monotonic() < proposal_deadline:
                 active_shares = {
                     key: share
                     for key, share in shares.items()
@@ -3754,9 +3724,7 @@ class SweepEngine:
                     waited_records = self._harvest_search_inflight(
                         writer, wait_for_one=True
                     )
-                    self._process_adaptive_records(
-                        waited_records, timings_before_wait
-                    )
+                    self._process_adaptive_records(waited_records, timings_before_wait)
                     self._record_search_phase("harvest_wait", phase_started)
                     empty_rounds = 0
                     continue
@@ -3839,9 +3807,7 @@ class SweepEngine:
 
     def _seed(self, writer: JSONLWriter, protocol: TimingProtocol) -> None:
         self._progress("seed: generating fixed incumbent variants", force=True)
-        portfolio_candidates, _, timings = self._timing_inputs(
-            phase="search"
-        )
+        portfolio_candidates, _, timings = self._timing_inputs(phase="search")
         if not portfolio_candidates:
             return
         scores = {
@@ -4678,9 +4644,7 @@ class SweepEngine:
         return ""
 
     @classmethod
-    def _retime_incomplete_reason(
-        cls, record: Mapping[str, object] | None
-    ) -> str:
+    def _retime_incomplete_reason(cls, record: Mapping[str, object] | None) -> str:
         if record is None:
             return "candidate was not re-timed before the deadline"
         if _is_cuda_oom(record):
@@ -4815,8 +4779,7 @@ class SweepEngine:
         return {
             "incumbent": {
                 "selected_entries": sum(
-                    candidate_id in self.incumbent_ids
-                    for candidate_id in selected_ids
+                    candidate_id in self.incumbent_ids for candidate_id in selected_ids
                 ),
             },
             "seed": {

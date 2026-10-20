@@ -24,6 +24,7 @@ def _experts_by_token(token_layout, num_tokens):
     for expert_idx, token_idx in zip(
         token_layout.expanded_to_expert,
         token_layout.expanded_to_token,
+        strict=True,
     ):
         if expert_idx >= 0:
             experts[token_idx].append(expert_idx)

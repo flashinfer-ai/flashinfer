@@ -297,9 +297,7 @@ def select_greedy_menu(
                 winner = candidate
                 winner_objective = trial_objective
                 winner_gain = gain
-        if winner is None or (
-            min_gain is not None and winner_gain + 1e-15 < min_gain
-        ):
+        if winner is None or (min_gain is not None and winner_gain + 1e-15 < min_gain):
             break
         selected.append(winner.candidate_id)
         used[winner.tile_n] += 1
@@ -454,9 +452,7 @@ def build_final_retime_pool(
     for candidate_id in incumbents:
         add(candidate_id, "incumbent")
 
-    ranked_by_shape: list[
-        tuple[Identifier, list[tuple[float, int, Identifier]]]
-    ] = []
+    ranked_by_shape: list[tuple[Identifier, list[tuple[float, int, Identifier]]]] = []
     for shape in shapes:
         ranked = sorted(
             (
@@ -485,11 +481,7 @@ def build_final_retime_pool(
     near_best_by_shape: list[tuple[Identifier, list[Identifier]]] = []
     for shape_id, ranked in ranked_by_shape:
         limit = ranked[0][0] * (1.0 + near_best_fraction)
-        near_best = [
-            candidate_id
-            for time, _, candidate_id in ranked
-            if time <= limit
-        ]
+        near_best = [candidate_id for time, _, candidate_id in ranked if time <= limit]
         if max_near_best_per_shape is not None:
             near_best = near_best[:max_near_best_per_shape]
         near_best_by_shape.append((shape_id, near_best))

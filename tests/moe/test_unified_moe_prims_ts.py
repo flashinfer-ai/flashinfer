@@ -664,9 +664,7 @@ class TestPrimsTsUnifiedGpu:
             for key, value in prepare_kwargs.items()
             if key == "hidden_states_scale_global"
         }
-        x_q, x_scale = PrimsTsConfig.prepare_activations(
-            x, quant=quant, **act_kwargs
-        )
+        x_q, x_scale = PrimsTsConfig.prepare_activations(x, quant=quant, **act_kwargs)
         prims_view = PrimsTsConfig.prepare_weights(
             w1.clone(),
             w2.clone(),

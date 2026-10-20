@@ -325,9 +325,7 @@ def _get_localized_domains(
     if domain_count < 0:
         detail = str(module.last_error())
         suffix = f": {detail}" if detail else ""
-        raise LocalityDomainError(
-            f"failed to query CUDA locality-domain count{suffix}"
-        )
+        raise LocalityDomainError(f"failed to query CUDA locality-domain count{suffix}")
     if domain_count < _DOMAIN_COUNT:
         detail = str(module.last_error())
         suffix = f": {detail}" if detail else ""

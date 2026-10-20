@@ -27,21 +27,39 @@ from typing import Mapping, Sequence
 from .utils import git_output, nvml_driver_version, nvml_handle_for_uuid
 
 
+def _json_safe(value: object) -> object:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Mapping):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 def _atomic_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        delete=False,
-    ) as handle:
-        json.dump(value, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-        temporary = Path(handle.name)
-    os.replace(temporary, path)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(
+                _json_safe(value), handle, indent=2, sort_keys=True, allow_nan=False
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
 
 
 def make_summary(
@@ -139,11 +157,7 @@ def capture_environment_provenance(
         -1
         if status is None
         else sorted(
-            {
-                line[3:]
-                for line in status.splitlines()
-                if len(line) > 3 and line[3:]
-            }
+            {line[3:] for line in status.splitlines() if len(line) > 3 and line[3:]}
         )
     )
     provenance.update(
@@ -190,9 +204,7 @@ def capture_environment_provenance(
                     uuid_text = f"GPU-{uuid_text}"
             else:
                 uuid_text = ""
-            handle = nvml_handle_for_uuid(
-                pynvml, uuid_text, index=device_index
-            )
+            handle = nvml_handle_for_uuid(pynvml, uuid_text, index=device_index)
             provenance["gpu_clock_mhz"] = int(
                 pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM)
             )
@@ -688,10 +700,7 @@ def _gpu_clock_rows(summary: Mapping[str, object]) -> list[list[str]]:
             continue
         reasons = values.get("clock_event_reasons", {})
         reason_text = (
-            ", ".join(
-                f"{name}={count}"
-                for name, count in sorted(reasons.items())
-            )
+            ", ".join(f"{name}={count}" for name, count in sorted(reasons.items()))
             if isinstance(reasons, Mapping) and reasons
             else "—"
         )

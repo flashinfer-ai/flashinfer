@@ -629,10 +629,16 @@ def _validate_localization_support(
     *,
     backends: list[str],
     quant_mode: str,
+    activation_type: int,
     localizations: list[Localization],
 ) -> None:
     if all(localization == "none" for localization in localizations):
         return
+    activation = ActivationType(activation_type)
+    if not activation.is_gated:
+        raise ValueError(
+            f"Localized MoE supports only gated activations; got {activation.name}"
+        )
     family = _op_family(quant_mode)
     if not any((backend, family) in _LOCALIZED_OPS for backend in backends):
         if family == "fp8_deepseek":
@@ -967,6 +973,7 @@ def bench_trtllm_gen_fused_moe_autotuner_bf16(
     _validate_localization_support(
         backends=backends,
         quant_mode="BF16",
+        activation_type=activation_type,
         localizations=resolved_localizations,
     )
     _report_skipped_localizations(
@@ -1125,6 +1132,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
     _validate_localization_support(
         backends=backends,
         quant_mode=quant_mode,
+        activation_type=activation_type,
         localizations=resolved_localizations,
     )
     _report_skipped_localizations(
@@ -1233,9 +1241,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
     else:  # MxFP8xMxFP8
         w13, w13_scale = mxfp8_quantize(w13, True)
         w2, w2_scale = mxfp8_quantize(w2, True)
-        w13_scale = w13_scale.view(torch.uint8).reshape(
-            num_experts, gemm1_rows, -1
-        )
+        w13_scale = w13_scale.view(torch.uint8).reshape(num_experts, gemm1_rows, -1)
         w2_scale = w2_scale.view(torch.uint8).reshape(num_experts, hidden_size, -1)
         w13, w2 = _shuffle_fp8_major_k(w13, w2, activation_type=activation_type)
 
@@ -1449,6 +1455,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
     _validate_localization_support(
         backends=backends,
         quant_mode=quant_mode,
+        activation_type=activation_type,
         localizations=resolved_localizations,
     )
     _report_skipped_localizations(
@@ -1475,9 +1482,9 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
     # --- num_tokens-independent setup ---
     is_gated = ActivationType(activation_type).is_gated
     gemm1_rows = intermediate_size * (2 if is_gated else 1)
-    w13 = torch.randn(
-        local_num_experts, gemm1_rows, hidden_size, device=device
-    ).to(torch.bfloat16)
+    w13 = torch.randn(local_num_experts, gemm1_rows, hidden_size, device=device).to(
+        torch.bfloat16
+    )
     w2 = torch.randn(
         local_num_experts, hidden_size, intermediate_size, device=device
     ).to(torch.bfloat16)
@@ -2046,6 +2053,7 @@ if __name__ == "__main__":
     _validate_localization_support(
         backends=backends,
         quant_mode=args.quant_mode,
+        activation_type=args.activation_type,
         localizations=localizations,
     )
     args.intermediate_size //= args.tp

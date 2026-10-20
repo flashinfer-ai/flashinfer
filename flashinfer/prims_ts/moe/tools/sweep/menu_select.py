@@ -191,12 +191,8 @@ def deployment_buckets_from_target(
         top_k = int(raw_deployment["top_k"])
         class_name = activation_class(str(raw_deployment["activation"]))
         deployment_weight = float(raw_deployment.get("weight", 1.0))
-        raw_points = raw_deployment.get(
-            "parallelism", raw_deployment.get("tp_ep", ())
-        )
-        if not isinstance(raw_points, Sequence) or isinstance(
-            raw_points, (str, bytes)
-        ):
+        raw_points = raw_deployment.get("parallelism", raw_deployment.get("tp_ep", ()))
+        if not isinstance(raw_points, Sequence) or isinstance(raw_points, (str, bytes)):
             continue
         for raw_point in raw_points:
             if not isinstance(raw_point, Mapping):
@@ -268,9 +264,7 @@ def deployment_buckets_from_shapes(
     for (deployment, model, class_name, tp, ep), values in sorted(grouped.items()):
         # Routing variants repeat the same runtime token bucket. Count each
         # token/window once, while retaining the full group's aggregate weight.
-        token_windows = {
-            (shape.tokens, shape.selected_tile_ns) for shape in values
-        }
+        token_windows = {(shape.tokens, shape.selected_tile_ns) for shape in values}
         result.append(
             DeploymentBuckets(
                 deployment=deployment,
@@ -279,9 +273,7 @@ def deployment_buckets_from_shapes(
                 tp=tp,
                 ep=ep,
                 weight=math.fsum(shape.weight for shape in values),
-                windows=_collapse_windows(
-                    window for _tokens, window in token_windows
-                ),
+                windows=_collapse_windows(window for _tokens, window in token_windows),
             )
         )
     return tuple(result)
@@ -396,9 +388,9 @@ def load_joint_inputs(
                 float(row["median_us"]), float(row.get("mad_us") or 0.0)
             )
         elif row.get("status") == "not_applicable":
-            timings.setdefault(candidate_id, {})[
-                shape_key
-            ] = TimingValue.not_applicable()
+            timings.setdefault(candidate_id, {})[shape_key] = (
+                TimingValue.not_applicable()
+            )
         else:
             timings.setdefault(candidate_id, {})[shape_key] = TimingValue.failed()
     # Absence still means the candidate was outside that sub-run's coverage.
@@ -440,9 +432,9 @@ class _TimingIndex:
         groups: dict[tuple[str, str | None, int], list[str]] = {}
         for candidate_id, candidate in candidates.items():
             class_name = candidate.activation_class if candidate.fc == "fc1" else None
-            groups.setdefault(
-                (candidate.fc, class_name, candidate.tile_n), []
-            ).append(candidate_id)
+            groups.setdefault((candidate.fc, class_name, candidate.tile_n), []).append(
+                candidate_id
+            )
 
         def ranked(
             key: tuple[str, str | None, int], shape_id: str
@@ -504,8 +496,7 @@ def _shape_time(
                 candidate_id
                 for candidate_id in selected
                 if candidates[candidate_id].fc == "fc1"
-                and candidates[candidate_id].activation_class
-                == shape.activation_class
+                and candidates[candidate_id].activation_class == shape.activation_class
                 and candidates[candidate_id].tile_n == tile_n
             ),
             shape_id=shape.shape_id,
@@ -580,7 +571,7 @@ def autotune_cost(
         if candidate.fc == "fc1":
             value["classes"].add(str(candidate.activation_class))
     redundant_twins = set()
-    for key, value in tuple(grouped.items()):
+    for _key, value in tuple(grouped.items()):
         twin = runtime_twin(value["options"])
         if twin is None:
             continue
@@ -629,9 +620,7 @@ def autotune_cost(
     per_deployment = []
     for deployment in deployments:
         reachable_tiles = {
-            tile_n
-            for window, _count in deployment.windows
-            for tile_n in window
+            tile_n for window, _count in deployment.windows for tile_n in window
         }
         kernels = set()
         for tile_n in reachable_tiles:
@@ -648,8 +637,7 @@ def autotune_cost(
             # It is profiled once per bucket in addition to the Cartesian menu.
             pairs += count * (menu_pairs + int(menu_pairs > 0))
         seconds = (
-            len(kernels) * cost.seconds_per_compile
-            + pairs * cost.seconds_per_pair
+            len(kernels) * cost.seconds_per_compile + pairs * cost.seconds_per_pair
         )
         per_deployment.append(
             DeploymentCost(
@@ -672,8 +660,7 @@ def autotune_cost(
             return 0.0
         return (
             math.fsum(
-                value.weight * float(getattr(value, field))
-                for value in per_deployment
+                value.weight * float(getattr(value, field)) for value in per_deployment
             )
             / total_weight
         )
@@ -682,9 +669,7 @@ def autotune_cost(
         runtime_kernels=len(all_kernels),
         deployment_kernels_mean=weighted_mean("kernels"),
         deployment_pairs_mean=weighted_mean("pairs"),
-        deployment_pairs_max=max(
-            (value.pairs for value in per_deployment), default=0
-        ),
+        deployment_pairs_max=max((value.pairs for value in per_deployment), default=0),
         deployment_seconds_mean=weighted_mean("seconds"),
         deployment_seconds_max=max(
             (value.seconds for value in per_deployment), default=0.0
@@ -935,15 +920,13 @@ def _extra_tile_floor_moves(
             }
             if not tile_best:
                 raise ValueError(
-                    f"no measured floor pair for class={class_name}, "
-                    f"tile_n={tile_n}"
+                    f"no measured floor pair for class={class_name}, tile_n={tile_n}"
                 )
             plausible = {
                 shape_id: shape
                 for shape_id, shape in eligible.items()
                 if shape_id in tile_best
-                and tile_best[shape_id]
-                <= plausible_ratio * global_best[shape_id]
+                and tile_best[shape_id] <= plausible_ratio * global_best[shape_id]
             }
             relevant = plausible or eligible
 
@@ -968,8 +951,7 @@ def _extra_tile_floor_moves(
                         best_move = (left, right)
             if best_move is None:
                 raise ValueError(
-                    f"no measured floor pair for class={class_name}, "
-                    f"tile_n={tile_n}"
+                    f"no measured floor pair for class={class_name}, tile_n={tile_n}"
                 )
             additions = set(best_move) - selected
             if additions:
@@ -1016,7 +998,7 @@ def select_joint_menu(
     shapes: Mapping[str, JointShape],
     timings: Mapping[str, Mapping[str, TimingValue]],
     *,
-    cost: AutotuneCost = AutotuneCost(),
+    cost: AutotuneCost | None = None,
     deployments: Sequence[DeploymentBuckets] | None = None,
     order_by: str = "cost",
     compute_lomo: bool = True,
@@ -1025,6 +1007,8 @@ def select_joint_menu(
 ) -> JointSelection:
     """Build a nested, floor-preserving, noise-gated joint menu."""
 
+    if cost is None:
+        cost = AutotuneCost()
     if order_by not in ("cost", "gain"):
         raise ValueError("order_by must be 'cost' or 'gain'")
     resolved_floor_tile_ns = tuple(sorted(set(int(value) for value in floor_tile_ns)))
@@ -1074,12 +1058,10 @@ def select_joint_menu(
                 reason=reason,
                 marginal_gain=max(group_gain, previous.objective - current.objective),
                 delta_kernels=(
-                    current.deployment_kernels_mean
-                    - previous.deployment_kernels_mean
+                    current.deployment_kernels_mean - previous.deployment_kernels_mean
                 ),
                 delta_pairs=(
-                    current.deployment_pairs_mean
-                    - previous.deployment_pairs_mean
+                    current.deployment_pairs_mean - previous.deployment_pairs_mean
                 ),
                 metrics=current,
             )
@@ -1198,8 +1180,7 @@ def select_joint_menu(
             if gain <= 1e-15:
                 continue
             delta_seconds = (
-                current.deployment_seconds_mean
-                - previous.deployment_seconds_mean
+                current.deployment_seconds_mean - previous.deployment_seconds_mean
             )
             delta_raw = (
                 current.deployment_pairs_mean
@@ -1236,6 +1217,7 @@ def select_joint_menu(
         )
 
     lomo: dict[str, Mapping[str, object]] = {}
+
     def lomo_group(shape: JointShape) -> str:
         return shape.model or shape.deployment
 

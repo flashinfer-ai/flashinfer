@@ -1495,9 +1495,7 @@ class TestMxFc1QuantizedEpilogue:
         )
 
         input_dtype = DType.MXE2M1 if dtype_a == "mxfp4" else DType.MXE4M3
-        output_sf_layout = (
-            SfLayout.R8c4 if sf_layout_c == "r8c4" else SfLayout.R128c4
-        )
+        output_sf_layout = SfLayout.R8c4 if sf_layout_c == "r8c4" else SfLayout.R128c4
         load_stages = 4 if tile_n > epi_tile_n else 5
         cfg = {
             **_mx_fc1_base(dtype_a=input_dtype),

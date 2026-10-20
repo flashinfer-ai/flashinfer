@@ -642,9 +642,7 @@ def is_applicable(
     )
     token_capacity = token_ctas * cfg.token_tile_size
     problem_m, problem_n = (
-        (out_hidden, token_capacity)
-        if cfg.is_swap_ab
-        else (token_capacity, out_hidden)
+        (out_hidden, token_capacity) if cfg.is_swap_ab else (token_capacity, out_hidden)
     )
     try:
         validate_launch_grid(
@@ -687,37 +685,121 @@ def _register_roles(cfg) -> list[tuple[str, int, int, int, str | None]]:
 
     layout = cfg.warp_layout
     roles = [
-        ("load_a", layout.load_a_warp_idx, layout.num_load_a_warps, cfg.load_a_task_regs, "load_a_regs"),
-        ("load_b", layout.load_b_warp_idx, layout.num_load_b_warps, cfg.load_b_task_regs, "load_b_regs"),
+        (
+            "load_a",
+            layout.load_a_warp_idx,
+            layout.num_load_a_warps,
+            cfg.load_a_task_regs,
+            "load_a_regs",
+        ),
+        (
+            "load_b",
+            layout.load_b_warp_idx,
+            layout.num_load_b_warps,
+            cfg.load_b_task_regs,
+            "load_b_regs",
+        ),
         ("mma", layout.mma_warp_idx, layout.num_mma_warps, cfg.mma_regs, "mma_regs"),
-        ("epilogue", layout.epilogue_warp_idx, layout.num_epilogue_warps, layout.epilogue_regs, "epilogue_regs"),
+        (
+            "epilogue",
+            layout.epilogue_warp_idx,
+            layout.num_epilogue_warps,
+            layout.epilogue_regs,
+            "epilogue_regs",
+        ),
     ]
     if cfg.has_input_block_scaling and not cfg.fuse_operand_sf_loads:
         roles.extend(
             (
-                ("load_sfa", layout.load_sfa_warp_idx, layout.num_load_sfa_warps, cfg.load_sfa_task_regs, "load_sfa_regs"),
-                ("load_sfb", layout.load_sfb_warp_idx, layout.num_load_sfb_warps, cfg.load_sfb_task_regs, "load_sfb_regs"),
+                (
+                    "load_sfa",
+                    layout.load_sfa_warp_idx,
+                    layout.num_load_sfa_warps,
+                    cfg.load_sfa_task_regs,
+                    "load_sfa_regs",
+                ),
+                (
+                    "load_sfb",
+                    layout.load_sfb_warp_idx,
+                    layout.num_load_sfb_warps,
+                    cfg.load_sfb_task_regs,
+                    "load_sfb_regs",
+                ),
             )
         )
     if cfg.has_input_block_scaling and not cfg.fuse_sf_copy_to_mma:
-        roles.append(("copy_sfa", layout.copy_sfa_warp_idx, layout.num_copy_sfa_warps, cfg.copy_sfa_task_regs, "copy_sf_regs"))
+        roles.append(
+            (
+                "copy_sfa",
+                layout.copy_sfa_warp_idx,
+                layout.num_copy_sfa_warps,
+                cfg.copy_sfa_task_regs,
+                "copy_sf_regs",
+            )
+        )
         if not cfg.use_combined_sfab_copy:
-            roles.append(("copy_sfb", layout.copy_sfb_warp_idx, layout.num_copy_sfb_warps, cfg.copy_sfb_task_regs, "copy_sf_regs"))
+            roles.append(
+                (
+                    "copy_sfb",
+                    layout.copy_sfb_warp_idx,
+                    layout.num_copy_sfb_warps,
+                    cfg.copy_sfb_task_regs,
+                    "copy_sf_regs",
+                )
+            )
     if cfg.has_cast_a:
         roles.extend(
             (
-                ("load_sfa", layout.load_sfa_warp_idx, layout.num_load_sfa_warps, cfg.load_sfa_task_regs, "load_sfa_regs"),
-                ("cast_a", layout.cast_a_warp_idx_first, layout.num_cast_a_warps, cfg.cast_a_regs, "cast_a_regs"),
+                (
+                    "load_sfa",
+                    layout.load_sfa_warp_idx,
+                    layout.num_load_sfa_warps,
+                    cfg.load_sfa_task_regs,
+                    "load_sfa_regs",
+                ),
+                (
+                    "cast_a",
+                    layout.cast_a_warp_idx_first,
+                    layout.num_cast_a_warps,
+                    cfg.cast_a_regs,
+                    "cast_a_regs",
+                ),
             )
         )
     if cfg.has_gather and cfg.uses_two_cta_mma and layout.num_sync_warps > 0:
-        roles.append(("sync", layout.sync_warp_idx, layout.num_sync_warps, cfg.sync_regs, None))
+        roles.append(
+            ("sync", layout.sync_warp_idx, layout.num_sync_warps, cfg.sync_regs, None)
+        )
     if cfg.use_deepseek_fp8:
-        roles.append(("load_sfab", layout.load_sfab_warp_idx, layout.num_load_sfab_warps, cfg.load_sfab_regs, "load_sfab_regs"))
+        roles.append(
+            (
+                "load_sfab",
+                layout.load_sfab_warp_idx,
+                layout.num_load_sfab_warps,
+                cfg.load_sfab_regs,
+                "load_sfab_regs",
+            )
+        )
     if layout.num_padding_warps > 0:
-        roles.append(("padding", layout.padding_warp_idx, layout.num_padding_warps, cfg.padding_regs, "padding_regs"))
+        roles.append(
+            (
+                "padding",
+                layout.padding_warp_idx,
+                layout.num_padding_warps,
+                cfg.padding_regs,
+                "padding_regs",
+            )
+        )
     if cfg.is_persistent:
-        roles.append(("workid", layout.workid_warp_idx, layout.num_workid_warps, cfg.workid_regs, "workid_regs"))
+        roles.append(
+            (
+                "workid",
+                layout.workid_warp_idx,
+                layout.num_workid_warps,
+                cfg.workid_regs,
+                "workid_regs",
+            )
+        )
     return roles
 
 
@@ -761,9 +843,7 @@ def warp_group_register_conflicts(cfg) -> list[str]:
     for _name, start, count, regs, _field in active_roles:
         for warp in range(start, start + count):
             per_warp_regs[warp].add(regs)
-    total_registers = sum(
-        max(registers, default=0) * 32 for registers in per_warp_regs
-    )
+    total_registers = sum(max(registers, default=0) * 32 for registers in per_warp_regs)
     if total_registers > 65536:
         errors.append(
             f"CTA register allocation {total_registers} exceeds 65536 registers"
@@ -1334,9 +1414,7 @@ def generate_move(
     if move_kind not in MOVE_KINDS:
         raise ValueError(f"unknown move kind {move_kind!r}")
     if move_kind in STAGE_MOVE_KINDS:
-        raise ValueError(
-            f"{move_kind} must be selected from enumerate_stage_neighbors"
-        )
+        raise ValueError(f"{move_kind} must be selected from enumerate_stage_neighbors")
     if context is not None and move_kind not in applicable_move_kinds(
         context, (move_kind,)
     ):

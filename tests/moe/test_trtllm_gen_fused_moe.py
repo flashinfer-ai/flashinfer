@@ -54,7 +54,7 @@ from tests.moe.trtllm_gen_fused_moe_utils import (
     trtllm_fp8_block_scale_routed_moe,
 )
 
-pytestmark = pytest.mark.long_running
+pytestmark = [pytest.mark.long_running, pytest.mark.host_memory_heavy]
 
 
 @pytest.fixture(scope="module")

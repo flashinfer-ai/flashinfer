@@ -21,7 +21,7 @@ from dataclasses import asdict, dataclass
 from importlib.metadata import PackageNotFoundError, version
 import statistics
 import time
-from typing import Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from .defaults import ROUTING_SEED, SEARCH_REPEAT_ITERS, SEARCH_WARMUP_ITERS
 from .space import ConfigContext, MaterializedCandidate, is_applicable
@@ -182,12 +182,8 @@ def _gpu_clock_sample() -> tuple[int | None, int | None, tuple[str, ...]]:
             _NVML_MODULE = pynvml
         assert _NVML_MODULE is not None and _NVML_HANDLE is not None
         nvml = _NVML_MODULE
-        current = int(
-            nvml.nvmlDeviceGetClockInfo(_NVML_HANDLE, nvml.NVML_CLOCK_SM)
-        )
-        maximum = int(
-            nvml.nvmlDeviceGetMaxClockInfo(_NVML_HANDLE, nvml.NVML_CLOCK_SM)
-        )
+        current = int(nvml.nvmlDeviceGetClockInfo(_NVML_HANDLE, nvml.NVML_CLOCK_SM))
+        maximum = int(nvml.nvmlDeviceGetMaxClockInfo(_NVML_HANDLE, nvml.NVML_CLOCK_SM))
         reason_bits = 0
         for getter_name in (
             "nvmlDeviceGetCurrentClocksEventReasons",
@@ -239,9 +235,7 @@ def _time_with_flashinfer(
             # CUPTI does not need graph replay to remove CPU launch overhead.
             # Constructing the driver stream here also keeps the launch on
             # the stream that the timing utility made current.
-            current_stream = cuda_drv.CUstream(
-                torch.cuda.current_stream().cuda_stream
-            )
+            current_stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
             compiled_fn(*_launch_arg_tuple(io, current_stream))
 
         samples_ms = bench_gpu_time(
@@ -380,6 +374,7 @@ def evaluate_candidate(
                     lock_wait_ms += (time.perf_counter() - lock_started) * 1000.0
                     lock_hold_started = time.perf_counter()
                     for shape in group_shapes:
+                        shape_attrs: Any = shape
                         shape_id = _shape_id(shape)
                         timed_shape_index += 1
                         if progress is not None:
@@ -389,9 +384,9 @@ def evaluate_candidate(
                             )
                         started = time.perf_counter()
                         io = _build_launch_io(
-                            num_experts=int(getattr(shape, "local_num_experts")),
-                            num_tokens=int(getattr(shape, "timing_num_tokens")),
-                            top_k=int(getattr(shape, "top_k")),
+                            num_experts=int(shape_attrs.local_num_experts),
+                            num_tokens=int(shape_attrs.timing_num_tokens),
+                            top_k=int(shape_attrs.top_k),
                             problem_n=_problem_dimension(shape, context.fc, "n"),
                             problem_k=problem_k,
                             **_routing_kwargs(shape),
@@ -409,9 +404,7 @@ def evaluate_candidate(
                             samples, backend = _time_with_flashinfer(
                                 compiled_fn, io, stream, protocol
                             )
-                            sm_clock, sm_clock_max, clock_reasons = (
-                                _gpu_clock_sample()
-                            )
+                            sm_clock, sm_clock_max, clock_reasons = _gpu_clock_sample()
                             median = statistics.median(samples)
                             measurements.append(
                                 ShapeMeasurement(
@@ -439,9 +432,7 @@ def evaluate_candidate(
                                     io_build_ms=io_build_ms,
                                 )
                             )
-                    lock_hold_ms += (
-                        time.perf_counter() - lock_hold_started
-                    ) * 1000.0
+                    lock_hold_ms += (time.perf_counter() - lock_hold_started) * 1000.0
     except Exception as exc:
         return Evaluation(
             candidate_id=candidate.candidate.candidate_id,
@@ -539,13 +530,14 @@ def reference_check_candidate(
     applicable, _ = is_applicable(candidate, context, shape)
     if not applicable:
         return False
+    shape_attrs: Any = shape
     return reference_check(
-            num_experts=int(getattr(shape, "local_num_experts")),
-            num_tokens=int(getattr(shape, "timing_num_tokens")),
-            top_k=int(getattr(shape, "top_k")),
-            problem_n=_problem_dimension(shape, context.fc, "n"),
-            problem_k=_problem_dimension(shape, context.fc, "k"),
-            **_routing_kwargs(shape),
-            **_activation_value_kwargs(context),
-            **dict(candidate.kwargs),
-        )
+        num_experts=int(shape_attrs.local_num_experts),
+        num_tokens=int(shape_attrs.timing_num_tokens),
+        top_k=int(shape_attrs.top_k),
+        problem_n=_problem_dimension(shape, context.fc, "n"),
+        problem_k=_problem_dimension(shape, context.fc, "k"),
+        **_routing_kwargs(shape),
+        **_activation_value_kwargs(context),
+        **dict(candidate.kwargs),
+    )

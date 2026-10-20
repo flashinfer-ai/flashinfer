@@ -195,9 +195,7 @@ def _selected_tile_ns(
         return (supported_tiles[-1],)
     if num_local_experts <= 0:
         raise ValueError(f"num_local_experts must be positive, got {num_local_experts}")
-    selection_experts = (
-        num_local_experts if num_experts is None else int(num_experts)
-    )
+    selection_experts = num_local_experts if num_experts is None else int(num_experts)
     if selection_experts <= 0:
         raise ValueError(f"num_experts must be positive, got {selection_experts}")
     avg_tokens_per_expert = float(num_tokens * top_k) / float(selection_experts)
@@ -437,6 +435,7 @@ def _json_act_kind(options: dict[str, object]) -> int:
     if eltwise_act == "silu":
         return int(_ActKind.SILU)
     return int(_ActKind.NONE)
+
 
 def _resolve_moe_sm_arch(sm_arch: int | None = None) -> int:
     """Resolve the architecture used to select and materialize MoE configs."""
@@ -879,9 +878,9 @@ def _resolve_moe_json_config_pair(
         config_pairs.sort(
             key=lambda pair: (
                 not _bool_value(
-                    _json_config_by_global_index(
-                        pair[0], sm_arch=sm_arch
-                    ).options.get("transpose_mma_output", True)
+                    _json_config_by_global_index(pair[0], sm_arch=sm_arch).options.get(
+                        "transpose_mma_output", True
+                    )
                 ),
                 int(
                     _json_config_by_global_index(

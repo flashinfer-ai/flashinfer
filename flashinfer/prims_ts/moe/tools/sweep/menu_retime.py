@@ -96,9 +96,7 @@ def normalize_activation_options(options: Mapping[str, object]) -> dict[str, obj
     """Remove runtime activation spelling from a geometry candidate."""
 
     return {
-        key: value
-        for key, value in options.items()
-        if key not in _ACTIVATION_FIELDS
+        key: value for key, value in options.items() if key not in _ACTIVATION_FIELDS
     }
 
 
@@ -234,10 +232,7 @@ def collect_run_candidates(
                 f"{run_dir}: dtype={dtype} conflicts with target "
                 f"dtype={normalize_dtype(expected_dtype)}"
             )
-        if (
-            expected_quant_keys is not None
-            and quant_key != expected_quant_keys[fc]
-        ):
+        if expected_quant_keys is not None and quant_key != expected_quant_keys[fc]:
             raise ValueError(
                 f"{run_dir}: quantization context conflicts with target {fc}: "
                 f"{quant_key} != {expected_quant_keys[fc]}"
@@ -362,9 +357,7 @@ def collect_menu_candidates(
     return tuple(combined[key] for key in sorted(combined))
 
 
-def _deployment_shapes(
-    target: MenuTarget, deployment: DeploymentTarget, *, fc: str
-):
+def _deployment_shapes(target: MenuTarget, deployment: DeploymentTarget, *, fc: str):
     return build_deployment_shapes(target, deployment, fc=fc)
 
 
@@ -445,21 +438,16 @@ class RetimeEngine(SweepEngine):
         selected = [
             item
             for item in candidates
-            if item.fc == fc
-            and (fc == "fc2" or item.activation_class == class_name)
+            if item.fc == fc and (fc == "fc2" or item.activation_class == class_name)
         ]
         explicit = {item.candidate.candidate_id: item.candidate for item in selected}
         # Preserve candidates recovered from a prior journal, then add this
         # invocation's explicit pool.
         self.candidates.update(explicit)
         self.incumbent_ids = {
-            item.candidate.candidate_id
-            for item in selected
-            if item.shipped_incumbent
+            item.candidate.candidate_id for item in selected if item.shipped_incumbent
         }
-        self.menu_candidates = {
-            item.candidate.candidate_id: item for item in selected
-        }
+        self.menu_candidates = {item.candidate.candidate_id: item for item in selected}
         self.menu_label = f"{deployment.name}/{fc}"
         self._shape_labels = {
             shape_id(shape, fc): (
@@ -492,9 +480,7 @@ class RetimeEngine(SweepEngine):
         menu_identity = json.loads(json.dumps(menu_identity))
         prior_identity = manifest.get("menu_retime")
         if resume and prior_identity is not None and prior_identity != menu_identity:
-            raise ValueError(
-                f"{out_dir}: resume candidate pool or deployment changed"
-            )
+            raise ValueError(f"{out_dir}: resume candidate pool or deployment changed")
         manifest["menu_retime"] = menu_identity
         atomic_write_json(self.manifest_path, manifest)
 
@@ -653,9 +639,7 @@ def _matrix_rows(
             shape = shape_index.get(shape_key, {})
             status = measurement.get("status")
             error = measurement.get("error")
-            if status == "ok" and reference_status.get(
-                candidate.candidate_id
-            ) != "ok":
+            if status == "ok" and reference_status.get(candidate.candidate_id) != "ok":
                 status = "reference_failed"
                 error = (
                     f"reference status="
@@ -740,9 +724,7 @@ def run_menu_retime(
     }
     if resume:
         if not menu_manifest_path.exists():
-            raise FileNotFoundError(
-                f"cannot resume without {menu_manifest_path.name}"
-            )
+            raise FileNotFoundError(f"cannot resume without {menu_manifest_path.name}")
         prior = json.loads(menu_manifest_path.read_text(encoding="utf-8"))
         for field in ("target", "candidate_ids", "quant_contexts", "calibration"):
             if prior.get(field) != menu_manifest[field]:

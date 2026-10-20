@@ -124,9 +124,7 @@ def test_context_rejects_activation_params_for_unsupported_activation():
         (8, 160, (16, 32, 64, 128)),
     ],
 )
-def test_dsv4_tile_windows_follow_actual_rows_per_expert(
-    ep, timing_tokens, expected
-):
+def test_dsv4_tile_windows_follow_actual_rows_per_expert(ep, timing_tokens, expected):
     shape = model_moe_shape(
         model="deepseek-v4-pro-nvfp4",
         tp=ep,

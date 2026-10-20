@@ -41,9 +41,7 @@ _requires_sm100_or_sm103_tactic = pytest.mark.skipif(
 )
 
 
-def _find_bs1_ldgsts_persistent_pair(
-    sm_arch: int = 100, *, enable_pdl: bool = False
-):
+def _find_bs1_ldgsts_persistent_pair(sm_arch: int = 100, *, enable_pdl: bool = False):
     tactics = valid_prims_ts_nvfp4_moe_tactics(
         sm_arch=sm_arch,
         num_tokens=1,
@@ -123,9 +121,7 @@ def test_fc2_without_early_exit_does_not_skip_pdl_wait():
         pytest.param(True, True, id="true-rejected"),
     ),
 )
-def test_nvfp4_fc2_json_can_only_opt_out_of_skip_early_exit_pdl(
-    json_value, raises
-):
+def test_nvfp4_fc2_json_can_only_opt_out_of_skip_early_exit_pdl(json_value, raises):
     pair = _find_bs1_ldgsts_persistent_pair()
     assert pair is not None
     json_cfg = _json_config_by_global_index(

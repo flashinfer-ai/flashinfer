@@ -244,15 +244,10 @@ class TmemSfBResource(MemoryResource):
                         // self.cfg.input_sf_block_size_b
                         // TMEM_SF_PACK_SIZE_BYTES
                     )
-                    assert num_s2t_iters == (
-                        self.cfg.tile_n // 128
-                    ) * num_utccp_k, (
-                        "R128c4 SFB UTCCP copies must cover every "
-                        "(N block, K group)"
+                    assert num_s2t_iters == (self.cfg.tile_n // 128) * num_utccp_k, (
+                        "R128c4 SFB UTCCP copies must cover every (N block, K group)"
                     )
-                    increment, tmem_delta = sfb_r128c4_utccp_offsets(
-                        self.cfg, s2t_idx
-                    )
+                    increment, tmem_delta = sfb_r128c4_utccp_offsets(self.cfg, s2t_idx)
                 else:
                     tmem_delta = s2t_idx * TMEM_SF_UTCCP_COLS_PER_COPY
                     # R128c4 stores each 128-row block's K groups contiguously,
@@ -267,11 +262,7 @@ class TmemSfBResource(MemoryResource):
                     increment = 32 * (
                         s2t_idx // row_blocks + k_groups * (s2t_idx % row_blocks)
                     )
-                tmem_addr = (
-                    self.sfb_tmem_addr_base
-                    + sf_stage_col_offset
-                    + tmem_delta
-                )
+                tmem_addr = self.sfb_tmem_addr_base + sf_stage_col_offset + tmem_delta
                 tmem_ptr = prims.make_tmem_ptr(tmem_addr, cutlass.Int32)
                 desc_s2t = desc_s2t_base + increment
                 if prims.elect_sync():
@@ -400,15 +391,10 @@ class TmemSfABResource(MemoryResource):
                         // self.cfg.input_sf_block_size_b
                         // TMEM_SF_PACK_SIZE_BYTES
                     )
-                    assert num_sfb_iters == (
-                        self.cfg.tile_n // 128
-                    ) * num_utccp_k, (
-                        "R128c4 SFB UTCCP copies must cover every "
-                        "(N block, K group)"
+                    assert num_sfb_iters == (self.cfg.tile_n // 128) * num_utccp_k, (
+                        "R128c4 SFB UTCCP copies must cover every (N block, K group)"
                     )
-                    increment, tmem_delta = sfb_r128c4_utccp_offsets(
-                        self.cfg, s2t_idx
-                    )
+                    increment, tmem_delta = sfb_r128c4_utccp_offsets(self.cfg, s2t_idx)
                 else:
                     increment = 32 * s2t_idx
                     tmem_delta = s2t_idx * TMEM_SF_UTCCP_COLS_PER_COPY

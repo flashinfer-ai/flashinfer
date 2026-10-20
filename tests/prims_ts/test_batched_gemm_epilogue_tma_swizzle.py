@@ -321,9 +321,7 @@ def test_swap_16bit_cached_smem_offsets_match_general_formula(
         box_rows = cfg.swap_tma_store_rows
         row_block, row_in_block = divmod(row, box_rows)
         box_stride = cfg.epi_tile_n * box_rows
-        offset_bytes = (
-            row_block * box_stride + col * box_rows + row_in_block
-        ) * 2
+        offset_bytes = (row_block * box_stride + col * box_rows + row_in_block) * 2
         swizzle_row = offset_bytes // 128
         if cfg.c_tma_swizzle_bytes % 128 == 0:
             swizzle_mask = swizzle_row % 8 * 16
@@ -378,10 +376,7 @@ def test_swap_deepseek_two_epilogue_store_covers_warpgroup_m_share(
     assert cfg.has_deepseek_fp8_two_epilogue
     assert cfg.swap_tma_store_tile_rows == cfg.tile_m // 2
     assert cfg.c_tma_swizzle_bytes == expected_swizzle_bytes
-    assert (
-        cfg.swap_tma_store_rows * cfg.swap_tma_store_row_passes
-        == cfg.tile_m // 2
-    )
+    assert cfg.swap_tma_store_rows * cfg.swap_tma_store_row_passes == cfg.tile_m // 2
     assert cfg.swap_tma_store_rows * cfg.dtype_c_bits // 8 <= 128
 
 

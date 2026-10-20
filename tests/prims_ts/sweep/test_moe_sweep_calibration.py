@@ -29,12 +29,18 @@ def test_calibration_worker_limit_applies_to_probes_and_saved_recommendations():
         8,
         16,
     )
-    assert _fit_calibration_worker_counts(
-        (1, 2, 4, 8, 16), available_jobs=45
-    ) == (1, 2, 4, 8, 16)
-    assert _fit_calibration_worker_counts(
-        (1, 2, 4, 8, 16), available_jobs=15
-    ) == (1, 2, 4)
+    assert _fit_calibration_worker_counts((1, 2, 4, 8, 16), available_jobs=45) == (
+        1,
+        2,
+        4,
+        8,
+        16,
+    )
+    assert _fit_calibration_worker_counts((1, 2, 4, 8, 16), available_jobs=15) == (
+        1,
+        2,
+        4,
+    )
     noise = derive_noise_band([10.0, 10.1, 9.9])
     calibration = CalibrationData(
         environment=_environment(),
@@ -183,8 +189,7 @@ def test_calibration_stops_after_failed_worker_point_and_uses_evaluate_memory(
             self.options = options
             self.shapes = [SimpleNamespace(selected_tile_ns=(128,))]
             self.candidates = {
-                f"candidate-{index}": SimpleNamespace(tile_n=128)
-                for index in range(4)
+                f"candidate-{index}": SimpleNamespace(tile_n=128) for index in range(4)
             }
 
         def dispatch(

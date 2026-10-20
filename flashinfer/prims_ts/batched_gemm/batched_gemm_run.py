@@ -363,14 +363,11 @@ def _sample_zipf_experts(
     # Finish with exact weighted-without-replacement draws to guarantee progress.
     while len(selected) < top_k:
         remaining = [
-            expert_idx
-            for expert_idx in population
-            if expert_idx not in selected_set
+            expert_idx for expert_idx in population if expert_idx not in selected_set
         ]
         first_rank = remaining[0] + 1
         remaining_weights = [
-            ((expert_idx + 1) / first_rank) ** -alpha
-            for expert_idx in remaining
+            ((expert_idx + 1) / first_rank) ** -alpha for expert_idx in remaining
         ]
         expert_idx = rng.choices(remaining, weights=remaining_weights, k=1)[0]
         selected.append(expert_idx)
@@ -406,8 +403,7 @@ def _make_token_layout_cached(
     for token_idx in range(num_tokens):
         if routing == "balanced_round_robin":
             token_experts = tuple(
-                (token_idx * top_k + k_idx) % num_experts
-                for k_idx in range(top_k)
+                (token_idx * top_k + k_idx) % num_experts for k_idx in range(top_k)
             )
         elif routing == "uniform":
             token_experts = tuple(rng.sample(range(num_experts), top_k))
@@ -483,8 +479,7 @@ def _make_token_layout(
         raise ValueError(f"tile_size must be positive, got {tile_size}")
     if cluster_dim_in_token <= 0:
         raise ValueError(
-            "cluster_dim_in_token must be positive, "
-            f"got {cluster_dim_in_token}"
+            f"cluster_dim_in_token must be positive, got {cluster_dim_in_token}"
         )
     if top_k > num_experts:
         raise ValueError(f"top_k must be in [1, num_experts], got {top_k}")
@@ -3398,9 +3393,7 @@ def reference_check(
                         dtype=torch.long,
                         device=device,
                     )
-                    value = value * per_token_sf_b_torch[sf_indices].float().view(
-                        1, -1
-                    )
+                    value = value * per_token_sf_b_torch[sf_indices].float().view(1, -1)
                 ref_gemm[:, expanded_indices] = value
             else:
                 value = activation_rows @ weights_ref.T
@@ -3614,8 +3607,8 @@ def reference_check(
     max_rel = None
     if nonzero_ref.any().item():
         max_rel = (
-            diff[nonzero_ref] / ref_active.float().abs()[nonzero_ref]
-        ).max().item()
+            (diff[nonzero_ref] / ref_active.float().abs()[nonzero_ref]).max().item()
+        )
     ref_max = ref_active.float().abs().max().item()
     out_max = c_compare_active.float().abs().max().item()
     print(

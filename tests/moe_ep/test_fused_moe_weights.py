@@ -160,9 +160,7 @@ class TestMaterializeFusedMoeWeights:
         local_n, hidden, intermediate = 2, 256, 128
         activation = SwiGLU() if activation_name == "swiglu" else ReLU2()
         gemm1_rows = intermediate * (2 if activation.is_gated else 1)
-        w13 = torch.randn(local_n, gemm1_rows, hidden, device=device).to(
-            torch.bfloat16
-        )
+        w13 = torch.randn(local_n, gemm1_rows, hidden, device=device).to(torch.bfloat16)
         w2 = torch.randn(local_n, hidden, intermediate, device=device).to(
             torch.bfloat16
         )

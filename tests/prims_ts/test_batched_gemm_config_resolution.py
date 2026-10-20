@@ -276,9 +276,7 @@ def test_nvfp4_block_length_must_agree_with_descriptors(operand):
 
 
 def test_overlap_requires_explicit_sf_copy_fusion():
-    cfg = _clustered(
-        tile_n=256, mma_n=256, epi_tile_n=64, use_max_tmem_overlap=1
-    )
+    cfg = _clustered(tile_n=256, mma_n=256, epi_tile_n=64, use_max_tmem_overlap=1)
     with pytest.raises(ValueError, match="requires fuse_sf_copy_to_mma=1"):
         validate_config(cfg)
     validate_config(replace(cfg, fuse_sf_copy_to_mma=1))
@@ -401,9 +399,7 @@ def test_streamed_gated_batch_m_rejects_overlap_and_nvfp4_tma():
     ("dtype", "tile_k", "mma_k"),
     ((DType.BF16, 64, 16), (DType.E4M3, 128, 32)),
 )
-def test_unscaled_batch_m_overlap_uses_accumulator_only_window(
-    dtype, tile_k, mma_k
-):
+def test_unscaled_batch_m_overlap_uses_accumulator_only_window(dtype, tile_k, mma_k):
     cfg = _bf16_batch_m(
         dtype_a=int(dtype),
         dtype_b=int(dtype),
@@ -662,10 +658,7 @@ def test_non_gated_output_block_scaling_reserves_each_warpgroup_tma_stage():
         * cfg.num_epilogue_warpgroups
         * cfg.num_swap_ab_nongated_quant_tma_stages
     )
-    assert (
-        replace(cfg, num_stages_c_smem=3).num_swap_ab_nongated_quant_tma_stages
-        == 1
-    )
+    assert replace(cfg, num_stages_c_smem=3).num_swap_ab_nongated_quant_tma_stages == 1
 
 
 def test_compile_identity_uses_effective_assignments_and_shape_specialization():

@@ -562,9 +562,7 @@ def testTrtllmFp4BlockScaleMoe(args):
     weight_layout = args.weight_layout
     is_cuda_graph_compatible = not args.no_cuda_graph
     activation_type = args.activation_type
-    gemm1_rows = intermediate_size * (
-        2 if is_gated_activation(activation_type) else 1
-    )
+    gemm1_rows = intermediate_size * (2 if is_gated_activation(activation_type) else 1)
     res = []
 
     backends = ["trtllm"]

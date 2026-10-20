@@ -31,9 +31,7 @@ def _fmt(value: float, digits: int = 4) -> str:
     return "∞" if not math.isfinite(value) else f"{value:.{digits}f}x"
 
 
-def _incumbent_metrics(
-    selection: JointSelection, cost: AutotuneCost
-):
+def _incumbent_metrics(selection: JointSelection, cost: AutotuneCost):
     incumbent_ids = {
         candidate_id
         for candidate_id, candidate in selection.candidates.items()
@@ -74,9 +72,7 @@ def _knee(
     boundaries = []
     for index, entry in enumerate(selection.order):
         next_entry = (
-            selection.order[index + 1]
-            if index + 1 < len(selection.order)
-            else None
+            selection.order[index + 1] if index + 1 < len(selection.order) else None
         )
         grouped = entry.reason == "greedy_pair" or entry.reason.startswith("floor:")
         if grouped and next_entry is not None and next_entry.reason == entry.reason:
@@ -200,9 +196,7 @@ def selection_payload(
                 "options": dict(candidate.options),
                 "provenance": list(candidate.provenance),
                 "shipped_incumbent": candidate.shipped_incumbent,
-                "standalone_regret": _standalone_score(
-                    selection, entry.candidate_id
-                ),
+                "standalone_regret": _standalone_score(selection, entry.candidate_id),
                 "reason": entry.reason,
                 "marginal_gain": entry.marginal_gain,
                 "delta_kernels": entry.delta_kernels,
@@ -276,8 +270,7 @@ def selection_payload(
         "not_selected": sorted(set(selection.candidates) - set(all_ids)),
         "leave_one_model_out": selection.leave_one_model_out,
         "breakdowns": {
-            str(n): _breakdown(selection, all_ids[:n], cost=cost)
-            for n in checkpoints
+            str(n): _breakdown(selection, all_ids[:n], cost=cost) for n in checkpoints
         },
     }
 
@@ -357,8 +350,7 @@ def write_menu_report(
         "| N | Added | FC/class/tile | Geomean regret | p95 | Worst | "
         "Speedup vs shipped | Held-out geo / worst | Kernels | "
         "Pairs/deployment mean / max | Autotune/deployment mean / max |",
-        "| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | "
-        "---: | ---: |",
+        "| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for entry in payload["entries"]:
         metrics = entry["metrics"]
@@ -391,10 +383,7 @@ def write_menu_report(
     )
     checkpoint_rows = [
         ("Shipped incumbents", payload["incumbent_breakdown"]),
-        *[
-            (f"N={n}", rows)
-            for n, rows in payload["breakdowns"].items()
-        ],
+        *[(f"N={n}", rows) for n, rows in payload["breakdowns"].items()],
     ]
     for label, rows in checkpoint_rows:
         lines.extend(
@@ -403,8 +392,7 @@ def write_menu_report(
                 "",
                 "| Deployment | TP:EP | Class | Geomean regret | p95 | Worst | "
                 "Covered | Kernels | Pairs | Estimated autotune |",
-                "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | "
-                "---: | ---: |",
+                "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
         for row in rows:

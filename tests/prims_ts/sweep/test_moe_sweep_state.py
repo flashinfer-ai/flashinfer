@@ -32,6 +32,8 @@ from flashinfer.prims_ts.moe.tools.sweep.db import (
     read_jsonl,
     recover_jsonl,
 )
+
+
 def test_sweep_package_import_does_not_eagerly_import_submodules() -> None:
     completed = subprocess.run(
         [

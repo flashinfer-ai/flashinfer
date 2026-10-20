@@ -93,9 +93,8 @@ class ParallelismTarget:
             raise ValueError("tokens must be a non-empty list of positive integers")
         if len(set(self.tokens)) != len(self.tokens):
             raise ValueError("tokens must not contain duplicates")
-        if (
-            self.tune_max_num_tokens is not None
-            and self.tune_max_num_tokens < max(self.tokens)
+        if self.tune_max_num_tokens is not None and self.tune_max_num_tokens < max(
+            self.tokens
         ):
             raise ValueError(
                 "tune_max_num_tokens must be at least the largest target token count"
@@ -129,12 +128,15 @@ class DeploymentTarget:
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("deployment name must not be empty")
-        if min(
-            self.hidden_size,
-            self.intermediate_size,
-            self.num_experts,
-            self.top_k,
-        ) <= 0:
+        if (
+            min(
+                self.hidden_size,
+                self.intermediate_size,
+                self.num_experts,
+                self.top_k,
+            )
+            <= 0
+        ):
             raise ValueError("model dimensions, experts, and top_k must be positive")
         if not self.parallelism:
             raise ValueError("deployment must contain at least one TP:EP target")
@@ -361,7 +363,7 @@ def build_deployment_shapes(
             * token_weight
             / token_weight_sum
             * routing_share
-            for token, token_weight in zip(point.tokens, raw_token_weights)
+            for token, token_weight in zip(point.tokens, raw_token_weights, strict=True)
         }
         for routing in target.routings:
             kwargs: dict[str, object] = {

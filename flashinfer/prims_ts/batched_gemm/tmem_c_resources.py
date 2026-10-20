@@ -486,9 +486,7 @@ class TmemCResource(MemoryResource):
                     // self.cfg.input_sf_block_size_b
                     // TMEM_SF_PACK_SIZE_BYTES
                 )
-                assert num_sfb_iters == (
-                    self.cfg.tile_n // 128
-                ) * num_utccp_k, (
+                assert num_sfb_iters == (self.cfg.tile_n // 128) * num_utccp_k, (
                     "R128c4 SFB UTCCP copies must cover every (N block, K group)"
                 )
                 increment_s2t, sfb_tmem_delta = sfb_r128c4_utccp_offsets(
@@ -570,9 +568,7 @@ class TmemCResource(MemoryResource):
         """Execute MMA (accumulates across K-tiles). Branches on BF16 vs FP4."""
         desc_a_mma = desc_a_mma_base
         desc_b_mma = desc_b_mma_base
-        stage_col_offset = (
-            stage_info.stage_idx * self.cfg.tmem_overlap_window_cols
-        )
+        stage_col_offset = stage_info.stage_idx * self.cfg.tmem_overlap_window_cols
         if cutlass.const_expr(self.cfg.uses_tmem_overlap_window):
             stage_col_offset += self._mma_local_idx * Int32(
                 self.cfg.tile_n - self.cfg.epi_tile_n
@@ -897,9 +893,7 @@ class TmemCResource(MemoryResource):
         """
         base_col = self.tmem_raw_addr & 0xFFFF
         base_row = self.tmem_raw_addr >> 16
-        stage_col_offset = (
-            stage_info.stage_idx * self.cfg.tmem_overlap_window_cols
-        )
+        stage_col_offset = stage_info.stage_idx * self.cfg.tmem_overlap_window_cols
 
         warp_idx = cute.arch.warp_idx()
         warp_in_group = warp_idx % self.cfg.warp_layout.num_epilogue_warps
@@ -1048,11 +1042,9 @@ class TmemCResource(MemoryResource):
                     ],
                 )
             if cutlass.const_expr(self.cfg.has_gated_epilogue):
-                col_offset = (
-                    tmem_group_idx * Int32(self.cfg.epi_tile_n)
-                    + step_idx
-                    * Int32(self.cfg.non_swap_gated_accumulator_cols_per_step)
-                )
+                col_offset = tmem_group_idx * Int32(
+                    self.cfg.epi_tile_n
+                ) + step_idx * Int32(self.cfg.non_swap_gated_accumulator_cols_per_step)
                 # Keep the output index group-major; GmemC converts each step
                 # to its first TMEM fragment index.
                 output_group_idx = (

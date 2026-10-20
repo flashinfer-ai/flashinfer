@@ -858,6 +858,40 @@ def test_partitioned_runner_rejects_non_gated_activation():
         )
 
 
+@pytest.mark.parametrize(
+    "runner_name",
+    [
+        "PrimsTsPartitionedBf16MoERunner",
+        "PrimsTsPartitionedNvfp4MoERunner",
+        "PrimsTsPartitionedMxfp4Mxfp8MoERunner",
+        "PrimsTsPartitionedMxfp4Bf16MoERunner",
+        "PrimsTsPartitionedFp8PerTensorMoERunner",
+        "PrimsTsPartitionedFp8BlockScaleMoERunner",
+    ],
+)
+@pytest.mark.parametrize(
+    "activation_type",
+    [ActivationType.Identity, ActivationType.Silu, ActivationType.Relu2],
+)
+def test_partitioned_runner_rejects_non_gated_activation_at_construction(
+    runner_name, activation_type
+):
+    with pytest.raises(
+        NotImplementedError,
+        match=f"requires a gated activation, got {activation_type.name}",
+    ):
+        getattr(runner_module, runner_name)(
+            None,
+            top_k=2,
+            num_local_experts=8,
+            hidden_size=1024,
+            intermediate_size=512,
+            num_experts=8,
+            activation_type=activation_type.value,
+            **_partition_runner_kwargs(),
+        )
+
+
 def test_partitioned_runner_rejects_bias_before_launch():
     runner = PrimsTsBf16MoERunner(
         None,

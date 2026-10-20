@@ -276,9 +276,7 @@ def _validate_sf_c_m_offset(
     if offset < 0:
         raise ValueError(f"{fc} sf_c_m_offset must be non-negative, got {offset}")
     if offset and (not cfg.is_swap_ab or not cfg.has_output_block_scaling):
-        raise ValueError(
-            f"{fc} sf_c_m_offset requires swapAB block-scaled C output"
-        )
+        raise ValueError(f"{fc} sf_c_m_offset requires swapAB block-scaled C output")
     if cfg.has_output_block_scaling:
         block_size = int(cfg.output_sf_block_size_c)
         if not cfg.has_gated_epilogue and int(logical_output_m) % block_size:

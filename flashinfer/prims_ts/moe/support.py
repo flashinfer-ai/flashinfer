@@ -163,9 +163,8 @@ def _device_supports_prims_ts(device: torch.device) -> bool:
     if device.type != "cuda" or not torch.cuda.is_available():
         return False
     compute_capability = get_compute_capability(device)
-    return (
-        compute_capability in _PRIMS_TS_ARCHS
-        and is_prims_ts_arch_available(*compute_capability)
+    return compute_capability in _PRIMS_TS_ARCHS and is_prims_ts_arch_available(
+        *compute_capability
     )
 
 

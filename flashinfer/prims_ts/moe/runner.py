@@ -3362,6 +3362,11 @@ class _PartitionedPrimsTsRunnerMixin:
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
+        if not _is_gated_activation(int(self.activation_type)):
+            raise NotImplementedError(
+                "MoE partitioning currently requires a gated activation, got "
+                f"{self.activation_type.name}"
+            )
         if partition_strategy not in ("tp_n_tp_n", "tp_n_tp_k"):
             raise ValueError(
                 f"Unsupported MoE partition strategy {partition_strategy!r}"

@@ -1852,19 +1852,18 @@ class GmemCResource(MemoryResource):
         calls_per_box = tma_store_cols // step_output_cols
         tile_output_col_base = tile_coord_n * Int32(self.cfg.tile_n // 2)
         local_output_col = output_col_base - tile_output_col_base
-        step_in_box = (
-            local_output_col % Int32(tma_store_cols)
-        ) // Int32(step_output_cols)
+        step_in_box = (local_output_col % Int32(tma_store_cols)) // Int32(
+            step_output_cols
+        )
         box_elems = self.cfg.epi_tile_m * tma_store_cols
-        smem_group_elem_offset = (
-            warpgroup_idx
-            * Int32(box_elems * self.cfg.num_stages_c_smem)
+        smem_group_elem_offset = warpgroup_idx * Int32(
+            box_elems * self.cfg.num_stages_c_smem
         )
         smem_stage_idx = Int32(0)
         if cutlass.const_expr(self.cfg.uses_non_swap_c_tma_ring):
-            smem_stage_idx = (
-                self._c_tma_call_idx // Int32(calls_per_box)
-            ) % Int32(self.cfg.num_stages_c_smem)
+            smem_stage_idx = (self._c_tma_call_idx // Int32(calls_per_box)) % Int32(
+                self.cfg.num_stages_c_smem
+            )
         smem_base = self.sC.subview(
             smem_group_elem_offset + smem_stage_idx * Int32(box_elems)
         )
@@ -1878,9 +1877,7 @@ class GmemCResource(MemoryResource):
         # The first writer into a box waits until its selected stage is no
         # longer read by TMA. Later calls fill disjoint column slices.
         if step_in_box == Int32(0):
-            prims.cp_async_bulk_wait_group(
-                self.cfg.num_stages_c_smem - 1, read=True
-            )
+            prims.cp_async_bulk_wait_group(self.cfg.num_stages_c_smem - 1, read=True)
             prims.barrier_cta_sync(
                 barrier_id=store_barrier_id,
                 thread_count=self.cfg.epilogue_threads_per_warpgroup,
@@ -2440,9 +2437,7 @@ class GmemCResource(MemoryResource):
         return self._reduce_positive_max_lanes(val, True)
 
     @cute.jit
-    def _reduce_positive_max_lanes(
-        self, val, include_xor16: cutlass.Constexpr[bool]
-    ):
+    def _reduce_positive_max_lanes(self, val, include_xor16: cutlass.Constexpr[bool]):
         """Butterfly-reduce a non-negative maximum across 4 or 8 lane groups."""
         for lane_mask in (4, 8):
             other = prims.shfl_sync(
@@ -3137,20 +3132,16 @@ class GmemCResource(MemoryResource):
                 scale_c,
                 scale_c,
             )
-        block_absmax0 = self._reduce_positive_max_lanes(
-            local_absmax0, include_xor16
-        )
-        block_absmax1 = self._reduce_positive_max_lanes(
-            local_absmax1, include_xor16
-        )
+        block_absmax0 = self._reduce_positive_max_lanes(local_absmax0, include_xor16)
+        block_absmax1 = self._reduce_positive_max_lanes(local_absmax1, include_xor16)
         sf0, sf1 = self._fmul2(
             block_absmax0,
             block_absmax1,
             Float32(1.0 / 6.0),
             Float32(1.0 / 6.0),
         )
-        sf_packed2, sf_rounded0, sf_rounded1 = (
-            _convert_f32x2_to_e4m3x2_and_back(sf0, sf1)
+        sf_packed2, sf_rounded0, sf_rounded1 = _convert_f32x2_to_e4m3x2_and_back(
+            sf0, sf1
         )
         sf_for_rcp0 = cute.math.max(sf_rounded0, Float32(1.0e-12))
         sf_for_rcp1 = cute.math.max(sf_rounded1, Float32(1.0e-12))
@@ -3176,9 +3167,7 @@ class GmemCResource(MemoryResource):
         return output_scale0, sf_packed0, output_scale1, sf_packed1
 
     @cute.jit
-    def _mx_output_scale_pair_from_absmax(
-        self, block_absmax0, block_absmax1, scale_c
-    ):
+    def _mx_output_scale_pair_from_absmax(self, block_absmax0, block_absmax1, scale_c):
         """Compute two UE8M0 scales and matching MX output multipliers."""
         max_pow2_rcp = Float32(1.0 / 256.0)
         if cutlass.const_expr(self.cfg.uses_mxfp4_output_quant):
@@ -3245,12 +3234,8 @@ class GmemCResource(MemoryResource):
         n_local_col,
     ):
         """Scale and pack four consecutive non-gated rows as two NVFP4 bytes."""
-        scaled0, scaled1 = self._fmul2(
-            result0, result1, output_scale, output_scale
-        )
-        scaled2, scaled3 = self._fmul2(
-            result2, result3, output_scale, output_scale
-        )
+        scaled0, scaled1 = self._fmul2(result0, result1, output_scale, output_scale)
+        scaled2, scaled3 = self._fmul2(result2, result3, output_scale, output_scale)
         packed01 = _convert_f32x2_to_e2m1x2(scaled1, scaled0)
         packed23 = _convert_f32x2_to_e2m1x2(scaled3, scaled2)
         if cutlass.const_expr(self._use_swap_ab_quant_tma_store()):
@@ -3307,12 +3292,8 @@ class GmemCResource(MemoryResource):
         n_local_col,
     ):
         """Scale and pack four consecutive non-gated rows as MXE4M3 bytes."""
-        scaled0, scaled1 = self._fmul2(
-            result0, result1, output_scale, output_scale
-        )
-        scaled2, scaled3 = self._fmul2(
-            result2, result3, output_scale, output_scale
-        )
+        scaled0, scaled1 = self._fmul2(result0, result1, output_scale, output_scale)
+        scaled2, scaled3 = self._fmul2(result2, result3, output_scale, output_scale)
         packed01 = self._pack_swap_ab_fp8_gated_tma_pair(scaled0, scaled1)
         packed23 = self._pack_swap_ab_fp8_gated_tma_pair(scaled2, scaled3)
         if cutlass.const_expr(self._use_swap_ab_quant_tma_store()):
@@ -3602,9 +3583,7 @@ class GmemCResource(MemoryResource):
                 sf_values[sf_base : sf_base + sf_values_in_group], selector
             )
             sf_slot = Int32(sf_base) + selector
-            sf_col_offset = (
-                sf_slot // Int32(2)
-            ) * Int32(8) + sf_slot % Int32(2)
+            sf_col_offset = (sf_slot // Int32(2)) * Int32(8) + sf_slot % Int32(2)
             n_local_col = (lane_id & Int32(3)) * Int32(2) + sf_col_offset
             n_col = n_tile_base + n_local_col
             if (
@@ -3848,9 +3827,7 @@ class GmemCResource(MemoryResource):
                 tmem_col = base_tmem_col + col_off + Int32(col_sub)
                 reg0 = group * 4 + col_sub
                 reg1 = group * 4 + 2 + col_sub
-                result0 = self._maybe_apply_per_token_sf_a(
-                    t2r_rmem[reg0], base_row_idx
-                )
+                result0 = self._maybe_apply_per_token_sf_a(t2r_rmem[reg0], base_row_idx)
                 result1 = self._maybe_apply_per_token_sf_a(
                     t2r_rmem[reg1], base_row_idx + Int32(1)
                 )
@@ -3863,12 +3840,8 @@ class GmemCResource(MemoryResource):
                 if cutlass.const_expr(self.cfg.has_per_token_sf_b):
                     local_token_col = n_subtile_offset + tmem_col
                     token_sf = self._load_per_token_sf_b(local_token_col)
-                    result0, result1 = self._fmul2(
-                        result0, result1, token_sf, token_sf
-                    )
-                    result2, result3 = self._fmul2(
-                        result2, result3, token_sf, token_sf
-                    )
+                    result0, result1 = self._fmul2(result0, result1, token_sf, token_sf)
+                    result2, result3 = self._fmul2(result2, result3, token_sf, token_sf)
                 result0 = self._maybe_add_bias_m(
                     result0,
                     expert_idx,
@@ -4416,8 +4389,7 @@ class GmemCResource(MemoryResource):
                         if (warp_in_epi4 & Int32(1)) == Int32(0):
                             self._store_swap_ab_quant_sf_epi32(
                                 mx_sf_c_vals,
-                                (m_tile_base >> Int32(1))
-                                + warp_in_epi4 * Int32(16),
+                                (m_tile_base >> Int32(1)) + warp_in_epi4 * Int32(16),
                                 n_tile_base,
                                 n_subtile_offset,
                                 token_limit,
@@ -4428,8 +4400,7 @@ class GmemCResource(MemoryResource):
                         if (warp_in_epi4 & Int32(1)) == Int32(0):
                             self._store_swap_ab_quant_sf_epi64(
                                 mx_sf_c_vals,
-                                (m_tile_base >> Int32(1))
-                                + warp_in_epi4 * Int32(16),
+                                (m_tile_base >> Int32(1)) + warp_in_epi4 * Int32(16),
                                 n_tile_base,
                                 n_subtile_offset,
                                 token_limit,
@@ -5202,9 +5173,7 @@ class GmemCResource(MemoryResource):
                 smem_group_offset = warpgroup_idx * group_stride_elems
                 tma_smem_base_even = (
                     smem_group_offset
-                    + self._bf16_tma_smem_element_offset(
-                        base_row_idx, base_tmem_col
-                    )
+                    + self._bf16_tma_smem_element_offset(base_row_idx, base_tmem_col)
                 )
                 tma_smem_base_odd = (
                     smem_group_offset
@@ -5307,8 +5276,7 @@ class GmemCResource(MemoryResource):
                                 else:
                                     smem_offset = tma_smem_base_odd
                                 smem_offset += Int32(
-                                    group
-                                    * self.cfg.swap_tma_store_col_group_step_elems
+                                    group * self.cfg.swap_tma_store_col_group_step_elems
                                 )
                             else:
                                 group_stride_elems = Int32(
@@ -5351,9 +5319,7 @@ class GmemCResource(MemoryResource):
                                 val_f32, expert_idx, m_row, m_local_row
                             )
                             if cutlass.const_expr(is_eltwise_act):
-                                val_f32 = self._apply_eltwise_act(
-                                    val_f32, scale_gate
-                                )
+                                val_f32 = self._apply_eltwise_act(val_f32, scale_gate)
                             val_f32 = self._maybe_apply_scale_c(val_f32, scale_c)
                             val_out = self._to_output_value(val_f32)
                             flat_idx = n_col * self._c_pitch(output_m) + m_row

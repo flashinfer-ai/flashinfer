@@ -70,8 +70,7 @@ def _inputs():
     }
     timings = {
         candidate_id: {
-            shape_id: TimingValue.measured(time, spread)
-            for shape_id in shapes
+            shape_id: TimingValue.measured(time, spread) for shape_id in shapes
         }
         for candidate_id, (time, spread) in values.items()
     }
@@ -145,9 +144,7 @@ def test_lomo_groups_multiple_deployments_of_the_same_model():
 
 def test_floor_rejects_candidates_without_joint_measurements():
     candidates, shapes, timings = _inputs()
-    timings["a8"] = {
-        shape_id: TimingValue.not_applicable() for shape_id in shapes
-    }
+    timings["a8"] = {shape_id: TimingValue.not_applicable() for shape_id in shapes}
 
     with pytest.raises(ValueError, match="no measured floor pair"):
         select_joint_menu(candidates, shapes, timings)
@@ -155,9 +152,7 @@ def test_floor_rejects_candidates_without_joint_measurements():
 
 def test_floor_skips_group_without_any_measurement():
     candidates, shapes, timings = _inputs()
-    shapes["dark"] = replace(
-        _shape("dark", "model-c"), activation_class="elementwise"
-    )
+    shapes["dark"] = replace(_shape("dark", "model-c"), activation_class="elementwise")
 
     selection = select_joint_menu(candidates, shapes, timings)
 
@@ -175,12 +170,8 @@ def test_extra_tile_floor_keeps_pair_that_never_wins():
     }
     candidates["a32"] = _candidate("a32", "fc1", 32)
     candidates["b32"] = _candidate("b32", "fc2", 32)
-    timings["a32"] = {
-        shape_id: TimingValue.measured(20.0, 0.1) for shape_id in shapes
-    }
-    timings["b32"] = {
-        shape_id: TimingValue.measured(20.0, 0.1) for shape_id in shapes
-    }
+    timings["a32"] = {shape_id: TimingValue.measured(20.0, 0.1) for shape_id in shapes}
+    timings["b32"] = {shape_id: TimingValue.measured(20.0, 0.1) for shape_id in shapes}
 
     selection = select_joint_menu(
         candidates,

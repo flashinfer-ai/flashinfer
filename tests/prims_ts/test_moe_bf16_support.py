@@ -244,11 +244,7 @@ def test_nvfp4_tile32_packed_gather_uses_two_warps(sm_arch):
             continue
         pair = map_trtllm_nvfp4_moe_tactic(tactic, **kwargs)
         fc1 = pair.fc1.cfg.build()
-        if not (
-            fc1.has_gather
-            and fc1.is_swap_ab
-            and not fc1.fuse_operand_sf_loads
-        ):
+        if not (fc1.has_gather and fc1.is_swap_ab and not fc1.fuse_operand_sf_loads):
             continue
         compute_warp_layout(fc1)
         assert fc1.warp_layout.num_load_b_warps == 2

@@ -79,10 +79,7 @@ from flashinfer.prims_ts.moe.tools.sweep.search import (
     rank_parents_by_mean_regret,
     select_parent_pool,
 )
-from flashinfer.prims_ts.moe.tools.sweep.shapes import (
-    build_sweep_shapes,
-    model_moe_shape,
-)
+from flashinfer.prims_ts.moe.tools.sweep.shapes import model_moe_shape
 from flashinfer.prims_ts.moe.tools.sweep.space import Candidate as SpaceCandidate
 
 
@@ -294,10 +291,7 @@ def test_shape_label_includes_k_and_parallelism() -> None:
         routing="uniform",
     )
 
-    assert (
-        _shape_label(shape, "fc2")
-        == "T=64 E=112 N=3584 K=7168 TP/EP=2/4 R=uniform"
-    )
+    assert _shape_label(shape, "fc2") == "T=64 E=112 N=3584 K=7168 TP/EP=2/4 R=uniform"
 
 
 def test_search_failure_summary_includes_errors_ooms_and_cuda_faults() -> None:
@@ -1495,9 +1489,7 @@ def test_failed_confirmation_remains_reportable_as_unconfirmed() -> None:
         TimingProtocol(warmup_iters=0, repeat_iters=1),
     )
 
-    assert sweep.search.pending_confirmations == {
-        candidate.candidate_id: [shape_key]
-    }
+    assert sweep.search.pending_confirmations == {candidate.candidate_id: [shape_key]}
 
 
 def test_exhausted_parent_cannot_survive_on_impossible_crossover() -> None:

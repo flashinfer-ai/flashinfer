@@ -77,10 +77,7 @@ MODEL_PRESETS: Mapping[str, ModelPreset] = {
         top_k=8,
         prims_ts_activation="Swiglu",
         trtllm_activation="Swiglu",
-        note=(
-            "NvFP4 DeepSeek-V3/R1 routed experts; the shared expert is "
-            "excluded."
-        ),
+        note=("NvFP4 DeepSeek-V3/R1 routed experts; the shared expert is excluded."),
     ),
     "deepseek-v4-pro-nvfp4": ModelPreset(
         quant_mode="NvFP4xNvFP4",
@@ -204,9 +201,7 @@ MODEL_PRESETS: Mapping[str, ModelPreset] = {
         gemm1_alpha=1.702,
         gemm1_beta=1.0,
         gemm1_clamp_limit=7.0,
-        note=(
-            "MiniMax-M3-MXFP8 routed experts; the shared expert is excluded."
-        ),
+        note=("MiniMax-M3-MXFP8 routed experts; the shared expert is excluded."),
     ),
     "nemotron-3.5-lightning-nvfp4": ModelPreset(
         quant_mode="NvFP4xNvFP4",

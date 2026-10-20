@@ -174,18 +174,14 @@ def tmem_sf_cols(tile_mn: int, tile_k: int, sf_vec_size: int, mma_k: int) -> int
     return mma_scale_groups * tmem_sf_col_stride(tile_mn, mma_k, sf_vec_size)
 
 
-def sfb_r128c4_utccp_offsets(
-    cfg: BatchedGemmConfig, copy_idx: int
-) -> tuple[int, int]:
+def sfb_r128c4_utccp_offsets(cfg: BatchedGemmConfig, copy_idx: int) -> tuple[int, int]:
     """Return the SMEM and TMEM offsets for one R128c4 SFB UTCCP copy.
 
     R128c4 SMEM stores complete 128-row blocks in N-major order, while the
     TMEM scale-factor layout interleaves those blocks within each MMA K group.
     The returned pair is ``(SMEM descriptor increment, TMEM column delta)``.
     """
-    num_utccp_k = (
-        cfg.tile_k // cfg.input_sf_block_size_b // TMEM_SF_PACK_SIZE_BYTES
-    )
+    num_utccp_k = cfg.tile_k // cfg.input_sf_block_size_b // TMEM_SF_PACK_SIZE_BYTES
     i_mn, utccp_idx_k = divmod(copy_idx, num_utccp_k)
     vec4_groups_per_mma = cfg.tmem_sf_vec4_groups_per_mma("b")
     ki, vi = divmod(utccp_idx_k, vec4_groups_per_mma)
@@ -1834,9 +1830,7 @@ class BatchedGemmConfig:
             if not self.is_swap_ab:
                 bytes_per_group = self.non_swap_gated_tma_box_bytes
             return (
-                bytes_per_group
-                * self.num_stages_c_smem
-                * self.num_epilogue_warpgroups
+                bytes_per_group * self.num_stages_c_smem * self.num_epilogue_warpgroups
             )
         stage_bytes = self.num_bytes_c_per_stage * self.num_stages_c_smem
         if self.use_tma_store and self.has_output_block_scaling and self.is_swap_ab:
@@ -1848,14 +1842,9 @@ class BatchedGemmConfig:
             reduction_scratch_bytes = 0
             if self.has_gated_epilogue and self.uses_mx_output_quant:
                 reduction_scratch_bytes = (
-                    max(1, self.epi_tile_n // 8)
-                    * 32
-                    * 4
-                    * self.num_epilogue_warpgroups
+                    max(1, self.epi_tile_n // 8) * 32 * 4 * self.num_epilogue_warpgroups
                 )
-            stage_bytes = max(
-                stage_bytes, packed_store_bytes + reduction_scratch_bytes
-            )
+            stage_bytes = max(stage_bytes, packed_store_bytes + reduction_scratch_bytes)
         return stage_bytes
 
     @property
@@ -3418,6 +3407,18 @@ def validate_config(
                     f"multiple of {shuffle_block}, got {problem_n}"
                 )
 
+    if not cfg.is_swap_ab and problem_mnk is not None:
+        _, problem_n, _ = problem_mnk
+        if isinstance(problem_n, int):
+            output_n = problem_n // 2 if cfg.has_gated_epilogue else problem_n
+            required_output_multiple = 128 // cfg.dtype_c_bits
+            if output_n % required_output_multiple != 0:
+                raise ValueError(
+                    "Batch-M output rows must be 16-byte aligned; "
+                    f"output width {output_n} with {cfg.dtype_c_bits}-bit elements "
+                    f"must be a multiple of {required_output_multiple}. Pad problem N."
+                )
+
     if (
         not cfg.is_swap_ab
         and cfg.has_gated_epilogue
@@ -3498,14 +3499,8 @@ def validate_config(
             f"epi_tile_n must divide tile_n, got tile_n={cfg.tile_n}, "
             f"epi_tile_n={cfg.epi_tile_n}"
         )
-    if (
-        cfg.is_swap_ab
-        and cfg.has_output_block_scaling
-        and not cfg.has_gated_epilogue
-    ):
-        output_cols_per_call = (
-            cfg.epi_tile_n * cfg.num_epilogue_warpgroups
-        )
+    if cfg.is_swap_ab and cfg.has_output_block_scaling and not cfg.has_gated_epilogue:
+        output_cols_per_call = cfg.epi_tile_n * cfg.num_epilogue_warpgroups
         if cfg.tile_n % output_cols_per_call != 0:
             raise ValueError(
                 "Non-gated swapAB output block scaling requires "
@@ -4224,7 +4219,7 @@ def validate_launch_grid(
         early_exit_max_token_ctas=early_exit_max_token_ctas,
     )
     axis_names = ("x", "y", "z")
-    for axis, value, limit in zip(axis_names, grid, CUDA_GRID_DIM_LIMITS):
+    for axis, value, limit in zip(axis_names, grid, CUDA_GRID_DIM_LIMITS, strict=True):
         if value <= limit:
             continue
         raster_order = "along-M" if cfg.raster_along_m else "along-N"
