@@ -3930,14 +3930,15 @@ def test_attention_ts_decode_kv256_uses_fragment_ready_p_policy() -> None:
 def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
     persistent: bool,
 ) -> None:
-    """KV256 and FP8 Q128 stream score fragments; dense 16-bit Q128 does not.
+    """KV256 and BF16/FP8 Q128 stream score fragments; FP8 D64 Q128 does not.
 
     Streamed profiles share one rolled fragment loop whose geometry follows
     the fragment register count, so the profile property and the fragment
     count are pinned together. They also run their two softmax groups
-    unordered. KV256 tiles and block-sparse routes stream, as do profiles with
-    8-bit K and V and SMEM softmax stats such as FP8 Q128/KV128; dense 16-bit
-    Q128/KV128 keeps the complete P row.
+    unordered. KV256 tiles and block-sparse routes stream, as do Q128/KV128
+    profiles whose K and V share a width and whose softmax stats travel
+    through SMEM, such as BF16 and FP8 at head dim 128; FP8 at head dim 64
+    keeps its stats in TMEM and the complete P row.
     """
 
     kv256 = _make_contiguous_kv256_config(persistent=persistent)
@@ -3949,12 +3950,20 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
 
     q128 = _make_contiguous_keeps_config(dtype=BFloat16, tile_size_q=128)
     assert q128.tile_size_kv == 128 and q128.uses_two_inst_tmem_p
-    assert not q128.streams_tmem_p_fragments
-    assert q128.num_softmax_score_fragments == 1
+    assert q128.streams_tmem_p_fragments
+    assert q128.num_softmax_score_fragments == 4
+    assert not q128.uses_ordered_softmax_barrier
 
     q128_fp8 = _make_contiguous_keeps_config(dtype=Float8E4M3FN, tile_size_q=128)
     assert q128_fp8.uses_two_inst_tmem_p
     assert q128_fp8.streams_tmem_p_fragments
+
+    d64_fp8 = _make_contiguous_keeps_config(
+        dtype=Float8E4M3FN, tile_size_q=128, headdim=64
+    )
+    assert d64_fp8.uses_two_inst_tmem_p and not d64_fp8.keeps_stats_via_smem
+    assert not d64_fp8.streams_tmem_p_fragments
+    assert d64_fp8.num_softmax_score_fragments == 1
 
 
 def test_attention_ts_decode_arch_config_args_follow_softmax_hardware() -> None:
