@@ -20,7 +20,10 @@ Sources live under ``csrc/cake_sage_block_sparse_attention``:
 * ``sm_120a/`` -- the SM120 (RTX PRO 6000 / RTX 5090) ``mma.sync`` kernels, one
   kernel source per specialization of the five metadata flags and one launcher
   source shared by all of them (the kernel symbol is passed as a compile
-  definition).
+  definition).  The SM120 table transcribes exporter output, hand-folded here
+  pending exporter support: the dispatcher never sets
+  ``CONTIGUOUS_BLOCK_INDICES`` without ``UNIFORM_NONEMPTY``, so the five
+  ``(..., 0, 1)`` specializations are not shipped.
 * ``sm_100a/`` -- the SM100-family (B200 / B300) variable-shape ``tcgen05``
   attention kernel plus the two fused Sage-FP8 quantization kernels, one
   kernel/launcher pair per stage, compiled for ``sm_100a`` and ``sm_103a``
@@ -42,7 +45,6 @@ from .core import (
     sm120a_nvcc_flags,
 )
 
-_GENERATED_ROOT = "csrc/cake_sage_block_sparse_attention"
 _PREFIX = "cake_sage_block_sparse_attention"
 _COMPILE_FLAGS = ("--use_fast_math",)
 
@@ -50,25 +52,24 @@ _COMPILE_FLAGS = ("--use_fast_math",)
 #  CONTIGUOUS_BLOCK_INDICES) -> SM120 kernel source under sm_120a/. The five flags
 # are folded into the generated kernel body; every reachable combination has one
 # entry, and the kernel symbol is ``kernel_<source stem without _kernel>``.
+# CONTIGUOUS_BLOCK_INDICES is set only together with UNIFORM_NONEMPTY: with no
+# block to load, the contiguous specialization writes the same zeros as its
+# (..., 0, 0) sibling, so ``_sm120_module_key`` in
+# ``flashinfer.cute_dsl.sparse.bsa_attn_sm120`` clears the flag instead.
 SM120_MODULES: dict[tuple[int, int, int, int, int], str] = {
     (0, 0, 0, 0, 0): "cake_sage_block_sparse_attention_c214204e0e4b13466e20_kernel.cu",
-    (0, 0, 0, 0, 1): "cake_sage_block_sparse_attention_0f9c7da2c88932b636d1_kernel.cu",
     (0, 0, 0, 1, 0): "cake_sage_block_sparse_attention_5e1d9bd7d208ae70cfc3_kernel.cu",
     (0, 0, 0, 1, 1): "cake_sage_block_sparse_attention_883c6c3450cc823b2d9b_kernel.cu",
     (0, 0, 1, 0, 0): "cake_sage_block_sparse_attention_ac8c0628f84e77fb565d_kernel.cu",
-    (0, 0, 1, 0, 1): "cake_sage_block_sparse_attention_33204ab76367b6d9b25f_kernel.cu",
     (0, 0, 1, 1, 0): "cake_sage_block_sparse_attention_0a00c8bb89c685b0c222_kernel.cu",
     (0, 0, 1, 1, 1): "cake_sage_block_sparse_attention_2adb38e9fb64cab29bf4_kernel.cu",
     (0, 1, 0, 0, 0): "cake_sage_block_sparse_attention_70d9ca316721813db07f_kernel.cu",
-    (0, 1, 0, 0, 1): "cake_sage_block_sparse_attention_4379d118d88e49a36ec3_kernel.cu",
     (0, 1, 0, 1, 0): "cake_sage_block_sparse_attention_08683144a7b6c64433ad_kernel.cu",
     (0, 1, 0, 1, 1): "cake_sage_block_sparse_attention_aa9589fa9d54f340e6b1_kernel.cu",
     (0, 2, 0, 0, 0): "cake_sage_block_sparse_attention_6a1fcc34a68d31545b23_kernel.cu",
-    (0, 2, 0, 0, 1): "cake_sage_block_sparse_attention_59d2437f3af320cc32c8_kernel.cu",
     (0, 2, 0, 1, 0): "cake_sage_block_sparse_attention_3e61674cc1a4b6793646_kernel.cu",
     (0, 2, 0, 1, 1): "cake_sage_block_sparse_attention_8b24fd2b689f1ead23c9_kernel.cu",
     (0, 3, 0, 0, 0): "cake_sage_block_sparse_attention_82751a008faeeeb37778_kernel.cu",
-    (0, 3, 0, 0, 1): "cake_sage_block_sparse_attention_184ad19669dcb84b24ff_kernel.cu",
     (0, 3, 0, 1, 0): "cake_sage_block_sparse_attention_a17d0e6f30423c654a19_kernel.cu",
     (0, 3, 0, 1, 1): "cake_sage_block_sparse_attention_813b7e41eaabcd64b34d_kernel.cu",
     (1, 0, 0, 0, 0): "cake_sage_block_sparse_attention_386f636f65fcfae07807_kernel.cu",

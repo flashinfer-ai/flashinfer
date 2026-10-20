@@ -20,11 +20,13 @@ import pytest
 import torch
 
 from flashinfer.cute_dsl.sparse.bsa_attn_sm120 import (
+    _sm120_module_key,
     bsa_attn_sm120_blk64_sage_fwd,
 )
+from flashinfer.jit.cake_sage_block_sparse_attention import SM120_MODULES
 
 
-pytestmark = pytest.mark.skipif(
+requires_sm120 = pytest.mark.skipif(
     not torch.cuda.is_available()
     or tuple(int(value) for value in torch.cuda.get_device_capability()) != (12, 0),
     reason="generated Sage block-sparse attention requires compute capability 12.0",
@@ -720,6 +722,7 @@ def _aligned_workspace(*, device):
     return storage, workspace
 
 
+@requires_sm120
 @pytest.mark.parametrize("case", _CASES, ids=[case["name"] for case in _CASES])
 def test_cake_sage_block_sparse_attention(case):
     params = dict(case["params"])
@@ -777,3 +780,68 @@ def test_cake_sage_block_sparse_attention(case):
         (3.0e-3, 0.0) if bool(params["position_sensitive"]) else (1.0e-2, 1.0e-2)
     )
     torch.testing.assert_close(returned.float(), expected.float(), atol=atol, rtol=rtol)
+
+
+# Public-argument combinations that decide the SM120 specialization; the entry
+# point rejects ``contiguous_block_indices`` without ``uniform_block_count``
+# before dispatch, so that pair is left out.  ``seqlen_k`` 320 is a multiple of
+# the 64-token block, 257 is not.
+_DISPATCH_INPUTS = [
+    {
+        "has_block_nums": has_block_nums,
+        "block_sizes_mode": block_sizes_mode,
+        "seqlen_k": seqlen_k,
+        "uniform_block_count": uniform_block_count,
+        "contiguous_block_indices": contiguous_block_indices,
+        "block_sparse_num": block_sparse_num,
+    }
+    for has_block_nums in (False, True)
+    for block_sizes_mode in range(4)
+    for seqlen_k in (320, 257)
+    for uniform_block_count in (False, True)
+    for contiguous_block_indices in (False, True)
+    for block_sparse_num in (0, 3)
+    if uniform_block_count or not contiguous_block_indices
+]
+
+
+def test_sm120_module_table_names_are_distinct():
+    # One generated source (and so one JIT module name) per specialization.
+    names = [source.removesuffix("_kernel.cu") for source in SM120_MODULES.values()]
+    assert len(set(names)) == len(SM120_MODULES)
+    assert all(name.startswith("cake_sage_block_sparse_attention_") for name in names)
+
+
+def test_sm120_dispatch_keys_match_the_module_table():
+    # Every table row is reachable from some public-argument combination, and
+    # every reachable combination has a row.
+    keys = {}
+    for inputs in _DISPATCH_INPUTS:
+        keys.setdefault(_sm120_module_key(**inputs), []).append(inputs)
+    assert set(keys) == set(SM120_MODULES)
+
+
+@pytest.mark.parametrize("seqlen_k", (320, 257))
+@pytest.mark.parametrize("block_sizes_mode", range(4))
+def test_sm120_empty_contiguous_selection_uses_the_sibling_module(
+    block_sizes_mode, seqlen_k
+):
+    # With no block to load the contiguous specialization never differs from
+    # its (..., 0, 0) sibling, so the dispatcher clears the flag; it stays set
+    # as soon as the uniform count is positive.
+    inputs = {
+        "has_block_nums": False,
+        "block_sizes_mode": block_sizes_mode,
+        "seqlen_k": seqlen_k,
+        "uniform_block_count": True,
+        "block_sparse_num": 0,
+    }
+    key = _sm120_module_key(contiguous_block_indices=True, **inputs)
+    assert key[3:] == (0, 0)
+    assert key == _sm120_module_key(contiguous_block_indices=False, **inputs)
+    assert key in SM120_MODULES
+    nonempty = _sm120_module_key(
+        contiguous_block_indices=True, **{**inputs, "block_sparse_num": 3}
+    )
+    assert nonempty[:3] == key[:3]
+    assert nonempty[3:] == (1, 1)
