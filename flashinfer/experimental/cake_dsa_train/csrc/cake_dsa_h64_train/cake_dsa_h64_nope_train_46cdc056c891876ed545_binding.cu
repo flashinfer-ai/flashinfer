@@ -23,7 +23,7 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap kv_latent, const __grid_constant__ CUtensorMap out, __nv_bfloat16* __restrict__ o_lo, float* __restrict__ lse, int* __restrict__ indices, int* __restrict__ topk_length, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int derive_length, float scale_log2);
+extern "C" __global__ void kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap kv_latent, const __grid_constant__ CUtensorMap out, __nv_bfloat16* __restrict__ o_lo, float* __restrict__ lse, int* __restrict__ indices, int* __restrict__ topk_length, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int derive_length, float scale_log2, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, int* __restrict__ indices_out, int num_docs, int search_iters, int causal, int convert);
 
 namespace cake_binding_kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545 {
 
@@ -170,7 +170,7 @@ CUtensorMap EncodeTma_out(const TensorView& t) {
   return map;
 }
 
-void Run(TensorView a_q_latent, TensorView a_kv_latent, TensorView a_out, TensorView a_o_lo, TensorView a_lse, TensorView a_indices, TensorView a_topk_length, int64_t a_num_queries, int64_t a_num_kv, int64_t a_topk, int64_t a_idx_stride, int64_t a_indices_offset, int64_t a_has_topk_length, int64_t a_derive_length, double a_scale_log2, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView a_q_latent, TensorView a_kv_latent, TensorView a_out, TensorView a_o_lo, TensorView a_lse, TensorView a_indices, TensorView a_topk_length, int64_t a_num_queries, int64_t a_num_kv, int64_t a_topk, int64_t a_idx_stride, int64_t a_indices_offset, int64_t a_has_topk_length, int64_t a_derive_length, double a_scale_log2, TensorView a_cu_seqlens_q, TensorView a_cu_seqlens_k, TensorView a_indices_out, int64_t a_num_docs, int64_t a_search_iters, int64_t a_causal, int64_t a_convert, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_q_latent.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_q_latent, "q_latent");
@@ -208,6 +208,24 @@ void Run(TensorView a_q_latent, TensorView a_kv_latent, TensorView a_out, Tensor
   TVM_FFI_CHECK(a_derive_length >= -2147483648LL && a_derive_length <= 2147483647LL, ValueError)
       << KERNEL_NAME << ": 'derive_length' = " << a_derive_length
       << " is outside the i32 range [-2147483648, 2147483647]";
+  check_cuda_tensor(a_cu_seqlens_q, "cu_seqlens_q");
+  check_dtype(a_cu_seqlens_q, DLDataType{kDLInt, 32, 1}, "cu_seqlens_q");
+  check_cuda_tensor(a_cu_seqlens_k, "cu_seqlens_k");
+  check_dtype(a_cu_seqlens_k, DLDataType{kDLInt, 32, 1}, "cu_seqlens_k");
+  check_cuda_tensor(a_indices_out, "indices_out");
+  check_dtype(a_indices_out, DLDataType{kDLInt, 32, 1}, "indices_out");
+  TVM_FFI_CHECK(a_num_docs >= -2147483648LL && a_num_docs <= 2147483647LL, ValueError)
+      << KERNEL_NAME << ": 'num_docs' = " << a_num_docs
+      << " is outside the i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(a_search_iters >= -2147483648LL && a_search_iters <= 2147483647LL, ValueError)
+      << KERNEL_NAME << ": 'search_iters' = " << a_search_iters
+      << " is outside the i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(a_causal >= -2147483648LL && a_causal <= 2147483647LL, ValueError)
+      << KERNEL_NAME << ": 'causal' = " << a_causal
+      << " is outside the i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(a_convert >= -2147483648LL && a_convert <= 2147483647LL, ValueError)
+      << KERNEL_NAME << ": 'convert' = " << a_convert
+      << " is outside the i32 range [-2147483648, 2147483647]";
   check_same_device(a_kv_latent, a_q_latent, "kv_latent", "q_latent");
   check_same_device(a_out, a_q_latent, "out", "q_latent");
   check_contiguous(a_o_lo, "o_lo");
@@ -217,6 +235,12 @@ void Run(TensorView a_q_latent, TensorView a_kv_latent, TensorView a_out, Tensor
   check_same_device(a_indices, a_q_latent, "indices", "q_latent");
   check_contiguous(a_topk_length, "topk_length");
   check_same_device(a_topk_length, a_q_latent, "topk_length", "q_latent");
+  check_contiguous(a_cu_seqlens_q, "cu_seqlens_q");
+  check_same_device(a_cu_seqlens_q, a_q_latent, "cu_seqlens_q", "q_latent");
+  check_contiguous(a_cu_seqlens_k, "cu_seqlens_k");
+  check_same_device(a_cu_seqlens_k, a_q_latent, "cu_seqlens_k", "q_latent");
+  check_contiguous(a_indices_out, "indices_out");
+  check_same_device(a_indices_out, a_q_latent, "indices_out", "q_latent");
   TVM_FFI_CHECK((a_topk >= 1), ValueError)
       << KERNEL_NAME << ": requires (topk >= 1)";
   TVM_FFI_CHECK((a_num_kv >= 1), ValueError)
@@ -253,7 +277,14 @@ void Run(TensorView a_q_latent, TensorView a_kv_latent, TensorView a_out, Tensor
   int32_t v_has_topk_length = static_cast<int32_t>(a_has_topk_length);
   int32_t v_derive_length = static_cast<int32_t>(a_derive_length);
   float v_scale_log2 = static_cast<float>(a_scale_log2);
-  void* kernel_args[] = {&v_q_latent, &v_kv_latent, &v_out, &v_o_lo, &v_lse, &v_indices, &v_topk_length, &v_num_queries, &v_num_kv, &v_topk, &v_idx_stride, &v_indices_offset, &v_has_topk_length, &v_derive_length, &v_scale_log2};
+  void* v_cu_seqlens_q = DataPtr(a_cu_seqlens_q);
+  void* v_cu_seqlens_k = DataPtr(a_cu_seqlens_k);
+  void* v_indices_out = DataPtr(a_indices_out);
+  int32_t v_num_docs = static_cast<int32_t>(a_num_docs);
+  int32_t v_search_iters = static_cast<int32_t>(a_search_iters);
+  int32_t v_causal = static_cast<int32_t>(a_causal);
+  int32_t v_convert = static_cast<int32_t>(a_convert);
+  void* kernel_args[] = {&v_q_latent, &v_kv_latent, &v_out, &v_o_lo, &v_lse, &v_indices, &v_topk_length, &v_num_queries, &v_num_kv, &v_topk, &v_idx_stride, &v_indices_offset, &v_has_topk_length, &v_derive_length, &v_scale_log2, &v_cu_seqlens_q, &v_cu_seqlens_k, &v_indices_out, &v_num_docs, &v_search_iters, &v_causal, &v_convert};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
   config.blockDim = dim3(320, 1, 1);

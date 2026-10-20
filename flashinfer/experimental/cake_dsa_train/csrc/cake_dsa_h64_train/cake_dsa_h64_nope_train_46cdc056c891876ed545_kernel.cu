@@ -82,6 +82,12 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_LEN_CELLS_OFF 223408
 #define SMEM_LEN_CELLS_STAGE_BYTES 8
 #define SMEM_LEN_CELLS_STRIDE 8
+#define SMEM_BASE_CELLS_OFF 223416
+#define SMEM_BASE_CELLS_STAGE_BYTES 8
+#define SMEM_BASE_CELLS_STRIDE 8
+#define SMEM_BOUND_CELLS_OFF 223424
+#define SMEM_BOUND_CELLS_STAGE_BYTES 8
+#define SMEM_BOUND_CELLS_STRIDE 8
 #define SMEM_TOTAL 223488
 #define THREADS 320
 #define LAUNCH_MIN_BLOCKS 1
@@ -238,7 +244,7 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(320, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap kv_latent, const __grid_constant__ CUtensorMap out, __nv_bfloat16* __restrict__ o_lo, float* __restrict__ lse, int* __restrict__ indices, int* __restrict__ topk_length, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int derive_length, float scale_log2)
+kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap kv_latent, const __grid_constant__ CUtensorMap out, __nv_bfloat16* __restrict__ o_lo, float* __restrict__ lse, int* __restrict__ indices, int* __restrict__ topk_length, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int derive_length, float scale_log2, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, int* __restrict__ indices_out, int num_docs, int search_iters, int causal, int convert)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -295,6 +301,10 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
     const int clc_payload_addr = smem + 223360;
     int* len_cells = reinterpret_cast<int*>(smem_raw + 223408);
     const int len_cells_addr = smem + 223408;
+    int* base_cells = reinterpret_cast<int*>(smem_raw + 223416);
+    const int base_cells_addr = smem + 223416;
+    int* bound_cells = reinterpret_cast<int*>(smem_raw + 223424);
+    const int bound_cells_addr = smem + 223424;
     if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&q_latent))) : "memory"); }
     if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&kv_latent))) : "memory"); }
     if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&out))) : "memory"); }
@@ -2642,6 +2652,12 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                 int _max_41 = (((active_0_1 + 63) / 64) > (2) ? ((active_0_1 + 63) / 64) : (2));
                 int blocks_1 = _max_41;
                 long long row_base = (long long)indices_offset + (long long)query_1 * (long long)idx_stride;
+                int key_base = 0;
+                int bound = num_kv - 1;
+                if (derive_length != 0) {
+                    key_base = base_cells[outer_1 & 1];
+                    bound = bound_cells[outer_1 & 1];
+                }
                 #pragma unroll 1
                 for (int block_1 = 0; block_1 < blocks_1; block_1++) {
                     if (elect_sync()) {
@@ -2650,295 +2666,719 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                         int largest = -1;
                         int whole_tile = active_0_1 >= block_1 * 64 + 64 && ((idx_stride | indices_offset) & 7) == 0;
                         if (whole_tile != 0) {
-                            int _vec_load_0[4];
-                            {
-                                const int4* _ivptr_0 = reinterpret_cast<const int4*>(indices + (row_base + (long long)(block_1 * 64 + producer_warp * 4)) + 0);
-                                int4 _ivld_0;
-                                _ivld_0 = *_ivptr_0;
-                                _vec_load_0[0 + 0] = _ivld_0.x;
-                                _vec_load_0[0 + 1] = _ivld_0.y;
-                                _vec_load_0[0 + 2] = _ivld_0.z;
-                                _vec_load_0[0 + 3] = _ivld_0.w;
+                            if (convert != 0) {
+                                int _vec_load_0[4];
+                                {
+                                    const int4* _ivptr_0 = reinterpret_cast<const int4*>(indices + (row_base + (long long)(block_1 * 64 + producer_warp * 4)) + 0);
+                                    int4 _ivld_0;
+                                    _ivld_0 = *_ivptr_0;
+                                    _vec_load_0[0 + 0] = _ivld_0.x;
+                                    _vec_load_0[0 + 1] = _ivld_0.y;
+                                    _vec_load_0[0 + 2] = _ivld_0.z;
+                                    _vec_load_0[0 + 3] = _ivld_0.w;
+                                }
+                                int vals[4];
+                                vals[0] = -1;
+                                if (_vec_load_0[0] >= 0 && _vec_load_0[0] <= bound) {
+                                    vals[0] = _vec_load_0[0] + key_base;
+                                }
+                                idx[0] = vals[0];
+                                vals[1] = -1;
+                                if (_vec_load_0[1] >= 0 && _vec_load_0[1] <= bound) {
+                                    vals[1] = _vec_load_0[1] + key_base;
+                                }
+                                idx[1] = vals[1];
+                                vals[2] = -1;
+                                if (_vec_load_0[2] >= 0 && _vec_load_0[2] <= bound) {
+                                    vals[2] = _vec_load_0[2] + key_base;
+                                }
+                                idx[2] = vals[2];
+                                vals[3] = -1;
+                                if (_vec_load_0[3] >= 0 && _vec_load_0[3] <= bound) {
+                                    vals[3] = _vec_load_0[3] + key_base;
+                                }
+                                idx[3] = vals[3];
+                                int _max_42 = ((vals[0]) > (vals[1]) ? (vals[0]) : (vals[1]));
+                                int _max_43 = ((vals[2]) > (vals[3]) ? (vals[2]) : (vals[3]));
+                                int _max_44 = ((_max_42) > (_max_43) ? (_max_42) : (_max_43));
+                                int _max_45 = ((largest) > (_max_44) ? (largest) : (_max_44));
+                                largest = _max_45;
+                                int _min_4 = ((vals[0]) < (vals[1]) ? (vals[0]) : (vals[1]));
+                                int _min_5 = ((vals[2]) < (vals[3]) ? (vals[2]) : (vals[3]));
+                                int _min_6 = ((_min_4) < (_min_5) ? (_min_4) : (_min_5));
+                                int _min_7 = ((smallest) < (_min_6) ? (smallest) : (_min_6));
+                                smallest = _min_7;
+                                int _vec_load_1[4];
+                                {
+                                    const int4* _ivptr_1 = reinterpret_cast<const int4*>(indices + (row_base + (long long)(block_1 * 64 + 16 + producer_warp * 4)) + 0);
+                                    int4 _ivld_1;
+                                    _ivld_1 = *_ivptr_1;
+                                    _vec_load_1[0 + 0] = _ivld_1.x;
+                                    _vec_load_1[0 + 1] = _ivld_1.y;
+                                    _vec_load_1[0 + 2] = _ivld_1.z;
+                                    _vec_load_1[0 + 3] = _ivld_1.w;
+                                }
+                                int vals_0[4];
+                                vals_0[0] = -1;
+                                if (_vec_load_1[0] >= 0 && _vec_load_1[0] <= bound) {
+                                    vals_0[0] = _vec_load_1[0] + key_base;
+                                }
+                                idx[4] = vals_0[0];
+                                vals_0[1] = -1;
+                                if (_vec_load_1[1] >= 0 && _vec_load_1[1] <= bound) {
+                                    vals_0[1] = _vec_load_1[1] + key_base;
+                                }
+                                idx[5] = vals_0[1];
+                                vals_0[2] = -1;
+                                if (_vec_load_1[2] >= 0 && _vec_load_1[2] <= bound) {
+                                    vals_0[2] = _vec_load_1[2] + key_base;
+                                }
+                                idx[6] = vals_0[2];
+                                vals_0[3] = -1;
+                                if (_vec_load_1[3] >= 0 && _vec_load_1[3] <= bound) {
+                                    vals_0[3] = _vec_load_1[3] + key_base;
+                                }
+                                idx[7] = vals_0[3];
+                                int _max_46 = ((vals_0[0]) > (vals_0[1]) ? (vals_0[0]) : (vals_0[1]));
+                                int _max_47 = ((vals_0[2]) > (vals_0[3]) ? (vals_0[2]) : (vals_0[3]));
+                                int _max_48 = ((_max_46) > (_max_47) ? (_max_46) : (_max_47));
+                                int _max_49 = ((largest) > (_max_48) ? (largest) : (_max_48));
+                                largest = _max_49;
+                                int _min_8 = ((vals_0[0]) < (vals_0[1]) ? (vals_0[0]) : (vals_0[1]));
+                                int _min_9 = ((vals_0[2]) < (vals_0[3]) ? (vals_0[2]) : (vals_0[3]));
+                                int _min_10 = ((_min_8) < (_min_9) ? (_min_8) : (_min_9));
+                                int _min_11 = ((smallest) < (_min_10) ? (smallest) : (_min_10));
+                                smallest = _min_11;
+                                int _vec_load_2[4];
+                                {
+                                    const int4* _ivptr_2 = reinterpret_cast<const int4*>(indices + (row_base + (long long)(block_1 * 64 + 32 + producer_warp * 4)) + 0);
+                                    int4 _ivld_2;
+                                    _ivld_2 = *_ivptr_2;
+                                    _vec_load_2[0 + 0] = _ivld_2.x;
+                                    _vec_load_2[0 + 1] = _ivld_2.y;
+                                    _vec_load_2[0 + 2] = _ivld_2.z;
+                                    _vec_load_2[0 + 3] = _ivld_2.w;
+                                }
+                                int vals_1[4];
+                                vals_1[0] = -1;
+                                if (_vec_load_2[0] >= 0 && _vec_load_2[0] <= bound) {
+                                    vals_1[0] = _vec_load_2[0] + key_base;
+                                }
+                                idx[8] = vals_1[0];
+                                vals_1[1] = -1;
+                                if (_vec_load_2[1] >= 0 && _vec_load_2[1] <= bound) {
+                                    vals_1[1] = _vec_load_2[1] + key_base;
+                                }
+                                idx[9] = vals_1[1];
+                                vals_1[2] = -1;
+                                if (_vec_load_2[2] >= 0 && _vec_load_2[2] <= bound) {
+                                    vals_1[2] = _vec_load_2[2] + key_base;
+                                }
+                                idx[10] = vals_1[2];
+                                vals_1[3] = -1;
+                                if (_vec_load_2[3] >= 0 && _vec_load_2[3] <= bound) {
+                                    vals_1[3] = _vec_load_2[3] + key_base;
+                                }
+                                idx[11] = vals_1[3];
+                                int _max_50 = ((vals_1[0]) > (vals_1[1]) ? (vals_1[0]) : (vals_1[1]));
+                                int _max_51 = ((vals_1[2]) > (vals_1[3]) ? (vals_1[2]) : (vals_1[3]));
+                                int _max_52 = ((_max_50) > (_max_51) ? (_max_50) : (_max_51));
+                                int _max_53 = ((largest) > (_max_52) ? (largest) : (_max_52));
+                                largest = _max_53;
+                                int _min_12 = ((vals_1[0]) < (vals_1[1]) ? (vals_1[0]) : (vals_1[1]));
+                                int _min_13 = ((vals_1[2]) < (vals_1[3]) ? (vals_1[2]) : (vals_1[3]));
+                                int _min_14 = ((_min_12) < (_min_13) ? (_min_12) : (_min_13));
+                                int _min_15 = ((smallest) < (_min_14) ? (smallest) : (_min_14));
+                                smallest = _min_15;
+                                int _vec_load_3[4];
+                                {
+                                    const int4* _ivptr_3 = reinterpret_cast<const int4*>(indices + (row_base + (long long)(block_1 * 64 + 48 + producer_warp * 4)) + 0);
+                                    int4 _ivld_3;
+                                    _ivld_3 = *_ivptr_3;
+                                    _vec_load_3[0 + 0] = _ivld_3.x;
+                                    _vec_load_3[0 + 1] = _ivld_3.y;
+                                    _vec_load_3[0 + 2] = _ivld_3.z;
+                                    _vec_load_3[0 + 3] = _ivld_3.w;
+                                }
+                                int vals_2[4];
+                                vals_2[0] = -1;
+                                if (_vec_load_3[0] >= 0 && _vec_load_3[0] <= bound) {
+                                    vals_2[0] = _vec_load_3[0] + key_base;
+                                }
+                                idx[12] = vals_2[0];
+                                vals_2[1] = -1;
+                                if (_vec_load_3[1] >= 0 && _vec_load_3[1] <= bound) {
+                                    vals_2[1] = _vec_load_3[1] + key_base;
+                                }
+                                idx[13] = vals_2[1];
+                                vals_2[2] = -1;
+                                if (_vec_load_3[2] >= 0 && _vec_load_3[2] <= bound) {
+                                    vals_2[2] = _vec_load_3[2] + key_base;
+                                }
+                                idx[14] = vals_2[2];
+                                vals_2[3] = -1;
+                                if (_vec_load_3[3] >= 0 && _vec_load_3[3] <= bound) {
+                                    vals_2[3] = _vec_load_3[3] + key_base;
+                                }
+                                idx[15] = vals_2[3];
+                                int _max_54 = ((vals_2[0]) > (vals_2[1]) ? (vals_2[0]) : (vals_2[1]));
+                                int _max_55 = ((vals_2[2]) > (vals_2[3]) ? (vals_2[2]) : (vals_2[3]));
+                                int _max_56 = ((_max_54) > (_max_55) ? (_max_54) : (_max_55));
+                                int _max_57 = ((largest) > (_max_56) ? (largest) : (_max_56));
+                                largest = _max_57;
+                                int _min_16 = ((vals_2[0]) < (vals_2[1]) ? (vals_2[0]) : (vals_2[1]));
+                                int _min_17 = ((vals_2[2]) < (vals_2[3]) ? (vals_2[2]) : (vals_2[3]));
+                                int _min_18 = ((_min_16) < (_min_17) ? (_min_16) : (_min_17));
+                                int _min_19 = ((smallest) < (_min_18) ? (smallest) : (_min_18));
+                                smallest = _min_19;
+                            } else {
+                                int _vec_load_4[4];
+                                {
+                                    const int4* _ivptr_4 = reinterpret_cast<const int4*>(indices + (row_base + (long long)(block_1 * 64 + producer_warp * 4)) + 0);
+                                    int4 _ivld_4;
+                                    _ivld_4 = *_ivptr_4;
+                                    _vec_load_4[0 + 0] = _ivld_4.x;
+                                    _vec_load_4[0 + 1] = _ivld_4.y;
+                                    _vec_load_4[0 + 2] = _ivld_4.z;
+                                    _vec_load_4[0 + 3] = _ivld_4.w;
+                                }
+                                idx[0] = _vec_load_4[0];
+                                idx[1] = _vec_load_4[1];
+                                idx[2] = _vec_load_4[2];
+                                idx[3] = _vec_load_4[3];
+                                int _max_58 = ((_vec_load_4[0]) > (_vec_load_4[1]) ? (_vec_load_4[0]) : (_vec_load_4[1]));
+                                int _max_59 = ((_vec_load_4[2]) > (_vec_load_4[3]) ? (_vec_load_4[2]) : (_vec_load_4[3]));
+                                int _max_60 = ((_max_58) > (_max_59) ? (_max_58) : (_max_59));
+                                int _max_61 = ((largest) > (_max_60) ? (largest) : (_max_60));
+                                largest = _max_61;
+                                int _min_20 = ((_vec_load_4[0]) < (_vec_load_4[1]) ? (_vec_load_4[0]) : (_vec_load_4[1]));
+                                int _min_21 = ((_vec_load_4[2]) < (_vec_load_4[3]) ? (_vec_load_4[2]) : (_vec_load_4[3]));
+                                int _min_22 = ((_min_20) < (_min_21) ? (_min_20) : (_min_21));
+                                int _min_23 = ((smallest) < (_min_22) ? (smallest) : (_min_22));
+                                smallest = _min_23;
+                                int _vec_load_5[4];
+                                {
+                                    const int4* _ivptr_5 = reinterpret_cast<const int4*>(indices + (row_base + (long long)(block_1 * 64 + 16 + producer_warp * 4)) + 0);
+                                    int4 _ivld_5;
+                                    _ivld_5 = *_ivptr_5;
+                                    _vec_load_5[0 + 0] = _ivld_5.x;
+                                    _vec_load_5[0 + 1] = _ivld_5.y;
+                                    _vec_load_5[0 + 2] = _ivld_5.z;
+                                    _vec_load_5[0 + 3] = _ivld_5.w;
+                                }
+                                idx[4] = _vec_load_5[0];
+                                idx[5] = _vec_load_5[1];
+                                idx[6] = _vec_load_5[2];
+                                idx[7] = _vec_load_5[3];
+                                int _max_62 = ((_vec_load_5[0]) > (_vec_load_5[1]) ? (_vec_load_5[0]) : (_vec_load_5[1]));
+                                int _max_63 = ((_vec_load_5[2]) > (_vec_load_5[3]) ? (_vec_load_5[2]) : (_vec_load_5[3]));
+                                int _max_64 = ((_max_62) > (_max_63) ? (_max_62) : (_max_63));
+                                int _max_65 = ((largest) > (_max_64) ? (largest) : (_max_64));
+                                largest = _max_65;
+                                int _min_24 = ((_vec_load_5[0]) < (_vec_load_5[1]) ? (_vec_load_5[0]) : (_vec_load_5[1]));
+                                int _min_25 = ((_vec_load_5[2]) < (_vec_load_5[3]) ? (_vec_load_5[2]) : (_vec_load_5[3]));
+                                int _min_26 = ((_min_24) < (_min_25) ? (_min_24) : (_min_25));
+                                int _min_27 = ((smallest) < (_min_26) ? (smallest) : (_min_26));
+                                smallest = _min_27;
+                                int _vec_load_6[4];
+                                {
+                                    const int4* _ivptr_6 = reinterpret_cast<const int4*>(indices + (row_base + (long long)(block_1 * 64 + 32 + producer_warp * 4)) + 0);
+                                    int4 _ivld_6;
+                                    _ivld_6 = *_ivptr_6;
+                                    _vec_load_6[0 + 0] = _ivld_6.x;
+                                    _vec_load_6[0 + 1] = _ivld_6.y;
+                                    _vec_load_6[0 + 2] = _ivld_6.z;
+                                    _vec_load_6[0 + 3] = _ivld_6.w;
+                                }
+                                idx[8] = _vec_load_6[0];
+                                idx[9] = _vec_load_6[1];
+                                idx[10] = _vec_load_6[2];
+                                idx[11] = _vec_load_6[3];
+                                int _max_66 = ((_vec_load_6[0]) > (_vec_load_6[1]) ? (_vec_load_6[0]) : (_vec_load_6[1]));
+                                int _max_67 = ((_vec_load_6[2]) > (_vec_load_6[3]) ? (_vec_load_6[2]) : (_vec_load_6[3]));
+                                int _max_68 = ((_max_66) > (_max_67) ? (_max_66) : (_max_67));
+                                int _max_69 = ((largest) > (_max_68) ? (largest) : (_max_68));
+                                largest = _max_69;
+                                int _min_28 = ((_vec_load_6[0]) < (_vec_load_6[1]) ? (_vec_load_6[0]) : (_vec_load_6[1]));
+                                int _min_29 = ((_vec_load_6[2]) < (_vec_load_6[3]) ? (_vec_load_6[2]) : (_vec_load_6[3]));
+                                int _min_30 = ((_min_28) < (_min_29) ? (_min_28) : (_min_29));
+                                int _min_31 = ((smallest) < (_min_30) ? (smallest) : (_min_30));
+                                smallest = _min_31;
+                                int _vec_load_7[4];
+                                {
+                                    const int4* _ivptr_7 = reinterpret_cast<const int4*>(indices + (row_base + (long long)(block_1 * 64 + 48 + producer_warp * 4)) + 0);
+                                    int4 _ivld_7;
+                                    _ivld_7 = *_ivptr_7;
+                                    _vec_load_7[0 + 0] = _ivld_7.x;
+                                    _vec_load_7[0 + 1] = _ivld_7.y;
+                                    _vec_load_7[0 + 2] = _ivld_7.z;
+                                    _vec_load_7[0 + 3] = _ivld_7.w;
+                                }
+                                idx[12] = _vec_load_7[0];
+                                idx[13] = _vec_load_7[1];
+                                idx[14] = _vec_load_7[2];
+                                idx[15] = _vec_load_7[3];
+                                int _max_70 = ((_vec_load_7[0]) > (_vec_load_7[1]) ? (_vec_load_7[0]) : (_vec_load_7[1]));
+                                int _max_71 = ((_vec_load_7[2]) > (_vec_load_7[3]) ? (_vec_load_7[2]) : (_vec_load_7[3]));
+                                int _max_72 = ((_max_70) > (_max_71) ? (_max_70) : (_max_71));
+                                int _max_73 = ((largest) > (_max_72) ? (largest) : (_max_72));
+                                largest = _max_73;
+                                int _min_32 = ((_vec_load_7[0]) < (_vec_load_7[1]) ? (_vec_load_7[0]) : (_vec_load_7[1]));
+                                int _min_33 = ((_vec_load_7[2]) < (_vec_load_7[3]) ? (_vec_load_7[2]) : (_vec_load_7[3]));
+                                int _min_34 = ((_min_32) < (_min_33) ? (_min_32) : (_min_33));
+                                int _min_35 = ((smallest) < (_min_34) ? (smallest) : (_min_34));
+                                smallest = _min_35;
                             }
-                            idx[0] = _vec_load_0[0];
-                            idx[1] = _vec_load_0[1];
-                            idx[2] = _vec_load_0[2];
-                            idx[3] = _vec_load_0[3];
-                            int _max_42 = ((_vec_load_0[0]) > (_vec_load_0[1]) ? (_vec_load_0[0]) : (_vec_load_0[1]));
-                            int _max_43 = ((_vec_load_0[2]) > (_vec_load_0[3]) ? (_vec_load_0[2]) : (_vec_load_0[3]));
-                            int _max_44 = ((_max_42) > (_max_43) ? (_max_42) : (_max_43));
-                            int _max_45 = ((largest) > (_max_44) ? (largest) : (_max_44));
-                            largest = _max_45;
-                            int _min_4 = ((_vec_load_0[0]) < (_vec_load_0[1]) ? (_vec_load_0[0]) : (_vec_load_0[1]));
-                            int _min_5 = ((_vec_load_0[2]) < (_vec_load_0[3]) ? (_vec_load_0[2]) : (_vec_load_0[3]));
-                            int _min_6 = ((_min_4) < (_min_5) ? (_min_4) : (_min_5));
-                            int _min_7 = ((smallest) < (_min_6) ? (smallest) : (_min_6));
-                            smallest = _min_7;
-                            int _vec_load_1[4];
-                            {
-                                const int4* _ivptr_1 = reinterpret_cast<const int4*>(indices + (row_base + (long long)(block_1 * 64 + 16 + producer_warp * 4)) + 0);
-                                int4 _ivld_1;
-                                _ivld_1 = *_ivptr_1;
-                                _vec_load_1[0 + 0] = _ivld_1.x;
-                                _vec_load_1[0 + 1] = _ivld_1.y;
-                                _vec_load_1[0 + 2] = _ivld_1.z;
-                                _vec_load_1[0 + 3] = _ivld_1.w;
-                            }
-                            idx[4] = _vec_load_1[0];
-                            idx[5] = _vec_load_1[1];
-                            idx[6] = _vec_load_1[2];
-                            idx[7] = _vec_load_1[3];
-                            int _max_46 = ((_vec_load_1[0]) > (_vec_load_1[1]) ? (_vec_load_1[0]) : (_vec_load_1[1]));
-                            int _max_47 = ((_vec_load_1[2]) > (_vec_load_1[3]) ? (_vec_load_1[2]) : (_vec_load_1[3]));
-                            int _max_48 = ((_max_46) > (_max_47) ? (_max_46) : (_max_47));
-                            int _max_49 = ((largest) > (_max_48) ? (largest) : (_max_48));
-                            largest = _max_49;
-                            int _min_8 = ((_vec_load_1[0]) < (_vec_load_1[1]) ? (_vec_load_1[0]) : (_vec_load_1[1]));
-                            int _min_9 = ((_vec_load_1[2]) < (_vec_load_1[3]) ? (_vec_load_1[2]) : (_vec_load_1[3]));
-                            int _min_10 = ((_min_8) < (_min_9) ? (_min_8) : (_min_9));
-                            int _min_11 = ((smallest) < (_min_10) ? (smallest) : (_min_10));
-                            smallest = _min_11;
-                            int _vec_load_2[4];
-                            {
-                                const int4* _ivptr_2 = reinterpret_cast<const int4*>(indices + (row_base + (long long)(block_1 * 64 + 32 + producer_warp * 4)) + 0);
-                                int4 _ivld_2;
-                                _ivld_2 = *_ivptr_2;
-                                _vec_load_2[0 + 0] = _ivld_2.x;
-                                _vec_load_2[0 + 1] = _ivld_2.y;
-                                _vec_load_2[0 + 2] = _ivld_2.z;
-                                _vec_load_2[0 + 3] = _ivld_2.w;
-                            }
-                            idx[8] = _vec_load_2[0];
-                            idx[9] = _vec_load_2[1];
-                            idx[10] = _vec_load_2[2];
-                            idx[11] = _vec_load_2[3];
-                            int _max_50 = ((_vec_load_2[0]) > (_vec_load_2[1]) ? (_vec_load_2[0]) : (_vec_load_2[1]));
-                            int _max_51 = ((_vec_load_2[2]) > (_vec_load_2[3]) ? (_vec_load_2[2]) : (_vec_load_2[3]));
-                            int _max_52 = ((_max_50) > (_max_51) ? (_max_50) : (_max_51));
-                            int _max_53 = ((largest) > (_max_52) ? (largest) : (_max_52));
-                            largest = _max_53;
-                            int _min_12 = ((_vec_load_2[0]) < (_vec_load_2[1]) ? (_vec_load_2[0]) : (_vec_load_2[1]));
-                            int _min_13 = ((_vec_load_2[2]) < (_vec_load_2[3]) ? (_vec_load_2[2]) : (_vec_load_2[3]));
-                            int _min_14 = ((_min_12) < (_min_13) ? (_min_12) : (_min_13));
-                            int _min_15 = ((smallest) < (_min_14) ? (smallest) : (_min_14));
-                            smallest = _min_15;
-                            int _vec_load_3[4];
-                            {
-                                const int4* _ivptr_3 = reinterpret_cast<const int4*>(indices + (row_base + (long long)(block_1 * 64 + 48 + producer_warp * 4)) + 0);
-                                int4 _ivld_3;
-                                _ivld_3 = *_ivptr_3;
-                                _vec_load_3[0 + 0] = _ivld_3.x;
-                                _vec_load_3[0 + 1] = _ivld_3.y;
-                                _vec_load_3[0 + 2] = _ivld_3.z;
-                                _vec_load_3[0 + 3] = _ivld_3.w;
-                            }
-                            idx[12] = _vec_load_3[0];
-                            idx[13] = _vec_load_3[1];
-                            idx[14] = _vec_load_3[2];
-                            idx[15] = _vec_load_3[3];
-                            int _max_54 = ((_vec_load_3[0]) > (_vec_load_3[1]) ? (_vec_load_3[0]) : (_vec_load_3[1]));
-                            int _max_55 = ((_vec_load_3[2]) > (_vec_load_3[3]) ? (_vec_load_3[2]) : (_vec_load_3[3]));
-                            int _max_56 = ((_max_54) > (_max_55) ? (_max_54) : (_max_55));
-                            int _max_57 = ((largest) > (_max_56) ? (largest) : (_max_56));
-                            largest = _max_57;
-                            int _min_16 = ((_vec_load_3[0]) < (_vec_load_3[1]) ? (_vec_load_3[0]) : (_vec_load_3[1]));
-                            int _min_17 = ((_vec_load_3[2]) < (_vec_load_3[3]) ? (_vec_load_3[2]) : (_vec_load_3[3]));
-                            int _min_18 = ((_min_16) < (_min_17) ? (_min_16) : (_min_17));
-                            int _min_19 = ((smallest) < (_min_18) ? (smallest) : (_min_18));
-                            smallest = _min_19;
-                        } else {
+                        } else if (convert != 0) {
                             int position = block_1 * 64 + producer_warp * 4;
-                            int _min_20 = ((position) < (topk - 1) ? (position) : (topk - 1));
-                            int clamped = _min_20;
-                            int value = indices[row_base + (long long)clamped];
+                            int _min_36 = ((position) < (topk - 1) ? (position) : (topk - 1));
+                            int clamped = _min_36;
+                            int raw = indices[row_base + (long long)clamped];
+                            int value = -1;
+                            if (raw >= 0 && raw <= bound) {
+                                value = raw + key_base;
+                            }
                             if (position >= active_0_1) {
                                 value = -1;
                             }
                             idx[0] = value;
-                            int _max_58 = ((largest) > (value) ? (largest) : (value));
-                            largest = _max_58;
-                            int _min_21 = ((smallest) < (value) ? (smallest) : (value));
-                            smallest = _min_21;
+                            int _max_74 = ((largest) > (value) ? (largest) : (value));
+                            largest = _max_74;
+                            int _min_37 = ((smallest) < (value) ? (smallest) : (value));
+                            smallest = _min_37;
                             int position_0 = block_1 * 64 + producer_warp * 4 + 1;
-                            int _min_22 = ((position_0) < (topk - 1) ? (position_0) : (topk - 1));
-                            int clamped_1 = _min_22;
-                            int value_2 = indices[row_base + (long long)clamped_1];
+                            int _min_38 = ((position_0) < (topk - 1) ? (position_0) : (topk - 1));
+                            int clamped_1 = _min_38;
+                            int raw_2 = indices[row_base + (long long)clamped_1];
+                            int value_3 = -1;
+                            if (raw_2 >= 0 && raw_2 <= bound) {
+                                value_3 = raw_2 + key_base;
+                            }
                             if (position_0 >= active_0_1) {
+                                value_3 = -1;
+                            }
+                            idx[1] = value_3;
+                            int _max_75 = ((largest) > (value_3) ? (largest) : (value_3));
+                            largest = _max_75;
+                            int _min_39 = ((smallest) < (value_3) ? (smallest) : (value_3));
+                            smallest = _min_39;
+                            int position_4 = block_1 * 64 + producer_warp * 4 + 2;
+                            int _min_40 = ((position_4) < (topk - 1) ? (position_4) : (topk - 1));
+                            int clamped_5 = _min_40;
+                            int raw_6 = indices[row_base + (long long)clamped_5];
+                            int value_7 = -1;
+                            if (raw_6 >= 0 && raw_6 <= bound) {
+                                value_7 = raw_6 + key_base;
+                            }
+                            if (position_4 >= active_0_1) {
+                                value_7 = -1;
+                            }
+                            idx[2] = value_7;
+                            int _max_76 = ((largest) > (value_7) ? (largest) : (value_7));
+                            largest = _max_76;
+                            int _min_41 = ((smallest) < (value_7) ? (smallest) : (value_7));
+                            smallest = _min_41;
+                            int position_8 = block_1 * 64 + producer_warp * 4 + 3;
+                            int _min_42 = ((position_8) < (topk - 1) ? (position_8) : (topk - 1));
+                            int clamped_9 = _min_42;
+                            int raw_10 = indices[row_base + (long long)clamped_9];
+                            int value_11 = -1;
+                            if (raw_10 >= 0 && raw_10 <= bound) {
+                                value_11 = raw_10 + key_base;
+                            }
+                            if (position_8 >= active_0_1) {
+                                value_11 = -1;
+                            }
+                            idx[3] = value_11;
+                            int _max_77 = ((largest) > (value_11) ? (largest) : (value_11));
+                            largest = _max_77;
+                            int _min_43 = ((smallest) < (value_11) ? (smallest) : (value_11));
+                            smallest = _min_43;
+                            int position_12 = block_1 * 64 + 16 + producer_warp * 4;
+                            int _min_44 = ((position_12) < (topk - 1) ? (position_12) : (topk - 1));
+                            int clamped_13 = _min_44;
+                            int raw_14 = indices[row_base + (long long)clamped_13];
+                            int value_15 = -1;
+                            if (raw_14 >= 0 && raw_14 <= bound) {
+                                value_15 = raw_14 + key_base;
+                            }
+                            if (position_12 >= active_0_1) {
+                                value_15 = -1;
+                            }
+                            idx[4] = value_15;
+                            int _max_78 = ((largest) > (value_15) ? (largest) : (value_15));
+                            largest = _max_78;
+                            int _min_45 = ((smallest) < (value_15) ? (smallest) : (value_15));
+                            smallest = _min_45;
+                            int position_16 = block_1 * 64 + 16 + producer_warp * 4 + 1;
+                            int _min_46 = ((position_16) < (topk - 1) ? (position_16) : (topk - 1));
+                            int clamped_17 = _min_46;
+                            int raw_18 = indices[row_base + (long long)clamped_17];
+                            int value_19 = -1;
+                            if (raw_18 >= 0 && raw_18 <= bound) {
+                                value_19 = raw_18 + key_base;
+                            }
+                            if (position_16 >= active_0_1) {
+                                value_19 = -1;
+                            }
+                            idx[5] = value_19;
+                            int _max_79 = ((largest) > (value_19) ? (largest) : (value_19));
+                            largest = _max_79;
+                            int _min_47 = ((smallest) < (value_19) ? (smallest) : (value_19));
+                            smallest = _min_47;
+                            int position_20 = block_1 * 64 + 16 + producer_warp * 4 + 2;
+                            int _min_48 = ((position_20) < (topk - 1) ? (position_20) : (topk - 1));
+                            int clamped_21 = _min_48;
+                            int raw_22 = indices[row_base + (long long)clamped_21];
+                            int value_23 = -1;
+                            if (raw_22 >= 0 && raw_22 <= bound) {
+                                value_23 = raw_22 + key_base;
+                            }
+                            if (position_20 >= active_0_1) {
+                                value_23 = -1;
+                            }
+                            idx[6] = value_23;
+                            int _max_80 = ((largest) > (value_23) ? (largest) : (value_23));
+                            largest = _max_80;
+                            int _min_49 = ((smallest) < (value_23) ? (smallest) : (value_23));
+                            smallest = _min_49;
+                            int position_24 = block_1 * 64 + 16 + producer_warp * 4 + 3;
+                            int _min_50 = ((position_24) < (topk - 1) ? (position_24) : (topk - 1));
+                            int clamped_25 = _min_50;
+                            int raw_26 = indices[row_base + (long long)clamped_25];
+                            int value_27 = -1;
+                            if (raw_26 >= 0 && raw_26 <= bound) {
+                                value_27 = raw_26 + key_base;
+                            }
+                            if (position_24 >= active_0_1) {
+                                value_27 = -1;
+                            }
+                            idx[7] = value_27;
+                            int _max_81 = ((largest) > (value_27) ? (largest) : (value_27));
+                            largest = _max_81;
+                            int _min_51 = ((smallest) < (value_27) ? (smallest) : (value_27));
+                            smallest = _min_51;
+                            int position_28 = block_1 * 64 + 32 + producer_warp * 4;
+                            int _min_52 = ((position_28) < (topk - 1) ? (position_28) : (topk - 1));
+                            int clamped_29 = _min_52;
+                            int raw_30 = indices[row_base + (long long)clamped_29];
+                            int value_31 = -1;
+                            if (raw_30 >= 0 && raw_30 <= bound) {
+                                value_31 = raw_30 + key_base;
+                            }
+                            if (position_28 >= active_0_1) {
+                                value_31 = -1;
+                            }
+                            idx[8] = value_31;
+                            int _max_82 = ((largest) > (value_31) ? (largest) : (value_31));
+                            largest = _max_82;
+                            int _min_53 = ((smallest) < (value_31) ? (smallest) : (value_31));
+                            smallest = _min_53;
+                            int position_32 = block_1 * 64 + 32 + producer_warp * 4 + 1;
+                            int _min_54 = ((position_32) < (topk - 1) ? (position_32) : (topk - 1));
+                            int clamped_33 = _min_54;
+                            int raw_34 = indices[row_base + (long long)clamped_33];
+                            int value_35 = -1;
+                            if (raw_34 >= 0 && raw_34 <= bound) {
+                                value_35 = raw_34 + key_base;
+                            }
+                            if (position_32 >= active_0_1) {
+                                value_35 = -1;
+                            }
+                            idx[9] = value_35;
+                            int _max_83 = ((largest) > (value_35) ? (largest) : (value_35));
+                            largest = _max_83;
+                            int _min_55 = ((smallest) < (value_35) ? (smallest) : (value_35));
+                            smallest = _min_55;
+                            int position_36 = block_1 * 64 + 32 + producer_warp * 4 + 2;
+                            int _min_56 = ((position_36) < (topk - 1) ? (position_36) : (topk - 1));
+                            int clamped_37 = _min_56;
+                            int raw_38 = indices[row_base + (long long)clamped_37];
+                            int value_39 = -1;
+                            if (raw_38 >= 0 && raw_38 <= bound) {
+                                value_39 = raw_38 + key_base;
+                            }
+                            if (position_36 >= active_0_1) {
+                                value_39 = -1;
+                            }
+                            idx[10] = value_39;
+                            int _max_84 = ((largest) > (value_39) ? (largest) : (value_39));
+                            largest = _max_84;
+                            int _min_57 = ((smallest) < (value_39) ? (smallest) : (value_39));
+                            smallest = _min_57;
+                            int position_40 = block_1 * 64 + 32 + producer_warp * 4 + 3;
+                            int _min_58 = ((position_40) < (topk - 1) ? (position_40) : (topk - 1));
+                            int clamped_41 = _min_58;
+                            int raw_42 = indices[row_base + (long long)clamped_41];
+                            int value_43 = -1;
+                            if (raw_42 >= 0 && raw_42 <= bound) {
+                                value_43 = raw_42 + key_base;
+                            }
+                            if (position_40 >= active_0_1) {
+                                value_43 = -1;
+                            }
+                            idx[11] = value_43;
+                            int _max_85 = ((largest) > (value_43) ? (largest) : (value_43));
+                            largest = _max_85;
+                            int _min_59 = ((smallest) < (value_43) ? (smallest) : (value_43));
+                            smallest = _min_59;
+                            int position_44 = block_1 * 64 + 48 + producer_warp * 4;
+                            int _min_60 = ((position_44) < (topk - 1) ? (position_44) : (topk - 1));
+                            int clamped_45 = _min_60;
+                            int raw_46 = indices[row_base + (long long)clamped_45];
+                            int value_47 = -1;
+                            if (raw_46 >= 0 && raw_46 <= bound) {
+                                value_47 = raw_46 + key_base;
+                            }
+                            if (position_44 >= active_0_1) {
+                                value_47 = -1;
+                            }
+                            idx[12] = value_47;
+                            int _max_86 = ((largest) > (value_47) ? (largest) : (value_47));
+                            largest = _max_86;
+                            int _min_61 = ((smallest) < (value_47) ? (smallest) : (value_47));
+                            smallest = _min_61;
+                            int position_48 = block_1 * 64 + 48 + producer_warp * 4 + 1;
+                            int _min_62 = ((position_48) < (topk - 1) ? (position_48) : (topk - 1));
+                            int clamped_49 = _min_62;
+                            int raw_50 = indices[row_base + (long long)clamped_49];
+                            int value_51 = -1;
+                            if (raw_50 >= 0 && raw_50 <= bound) {
+                                value_51 = raw_50 + key_base;
+                            }
+                            if (position_48 >= active_0_1) {
+                                value_51 = -1;
+                            }
+                            idx[13] = value_51;
+                            int _max_87 = ((largest) > (value_51) ? (largest) : (value_51));
+                            largest = _max_87;
+                            int _min_63 = ((smallest) < (value_51) ? (smallest) : (value_51));
+                            smallest = _min_63;
+                            int position_52 = block_1 * 64 + 48 + producer_warp * 4 + 2;
+                            int _min_64 = ((position_52) < (topk - 1) ? (position_52) : (topk - 1));
+                            int clamped_53 = _min_64;
+                            int raw_54 = indices[row_base + (long long)clamped_53];
+                            int value_55 = -1;
+                            if (raw_54 >= 0 && raw_54 <= bound) {
+                                value_55 = raw_54 + key_base;
+                            }
+                            if (position_52 >= active_0_1) {
+                                value_55 = -1;
+                            }
+                            idx[14] = value_55;
+                            int _max_88 = ((largest) > (value_55) ? (largest) : (value_55));
+                            largest = _max_88;
+                            int _min_65 = ((smallest) < (value_55) ? (smallest) : (value_55));
+                            smallest = _min_65;
+                            int position_56 = block_1 * 64 + 48 + producer_warp * 4 + 3;
+                            int _min_66 = ((position_56) < (topk - 1) ? (position_56) : (topk - 1));
+                            int clamped_57 = _min_66;
+                            int raw_58 = indices[row_base + (long long)clamped_57];
+                            int value_59 = -1;
+                            if (raw_58 >= 0 && raw_58 <= bound) {
+                                value_59 = raw_58 + key_base;
+                            }
+                            if (position_56 >= active_0_1) {
+                                value_59 = -1;
+                            }
+                            idx[15] = value_59;
+                            int _max_89 = ((largest) > (value_59) ? (largest) : (value_59));
+                            largest = _max_89;
+                            int _min_67 = ((smallest) < (value_59) ? (smallest) : (value_59));
+                            smallest = _min_67;
+                        } else {
+                            int position_1 = block_1 * 64 + producer_warp * 4;
+                            int _min_68 = ((position_1) < (topk - 1) ? (position_1) : (topk - 1));
+                            int clamped_2 = _min_68;
+                            int value_1 = indices[row_base + (long long)clamped_2];
+                            if (position_1 >= active_0_1) {
+                                value_1 = -1;
+                            }
+                            idx[0] = value_1;
+                            int _max_90 = ((largest) > (value_1) ? (largest) : (value_1));
+                            largest = _max_90;
+                            int _min_69 = ((smallest) < (value_1) ? (smallest) : (value_1));
+                            smallest = _min_69;
+                            int position_0_1 = block_1 * 64 + producer_warp * 4 + 1;
+                            int _min_70 = ((position_0_1) < (topk - 1) ? (position_0_1) : (topk - 1));
+                            int clamped_1_1 = _min_70;
+                            int value_2 = indices[row_base + (long long)clamped_1_1];
+                            if (position_0_1 >= active_0_1) {
                                 value_2 = -1;
                             }
                             idx[1] = value_2;
-                            int _max_59 = ((largest) > (value_2) ? (largest) : (value_2));
-                            largest = _max_59;
-                            int _min_23 = ((smallest) < (value_2) ? (smallest) : (value_2));
-                            smallest = _min_23;
+                            int _max_91 = ((largest) > (value_2) ? (largest) : (value_2));
+                            largest = _max_91;
+                            int _min_71 = ((smallest) < (value_2) ? (smallest) : (value_2));
+                            smallest = _min_71;
                             int position_3 = block_1 * 64 + producer_warp * 4 + 2;
-                            int _min_24 = ((position_3) < (topk - 1) ? (position_3) : (topk - 1));
-                            int clamped_4 = _min_24;
+                            int _min_72 = ((position_3) < (topk - 1) ? (position_3) : (topk - 1));
+                            int clamped_4 = _min_72;
                             int value_5 = indices[row_base + (long long)clamped_4];
                             if (position_3 >= active_0_1) {
                                 value_5 = -1;
                             }
                             idx[2] = value_5;
-                            int _max_60 = ((largest) > (value_5) ? (largest) : (value_5));
-                            largest = _max_60;
-                            int _min_25 = ((smallest) < (value_5) ? (smallest) : (value_5));
-                            smallest = _min_25;
+                            int _max_92 = ((largest) > (value_5) ? (largest) : (value_5));
+                            largest = _max_92;
+                            int _min_73 = ((smallest) < (value_5) ? (smallest) : (value_5));
+                            smallest = _min_73;
                             int position_6 = block_1 * 64 + producer_warp * 4 + 3;
-                            int _min_26 = ((position_6) < (topk - 1) ? (position_6) : (topk - 1));
-                            int clamped_7 = _min_26;
+                            int _min_74 = ((position_6) < (topk - 1) ? (position_6) : (topk - 1));
+                            int clamped_7 = _min_74;
                             int value_8 = indices[row_base + (long long)clamped_7];
                             if (position_6 >= active_0_1) {
                                 value_8 = -1;
                             }
                             idx[3] = value_8;
-                            int _max_61 = ((largest) > (value_8) ? (largest) : (value_8));
-                            largest = _max_61;
-                            int _min_27 = ((smallest) < (value_8) ? (smallest) : (value_8));
-                            smallest = _min_27;
+                            int _max_93 = ((largest) > (value_8) ? (largest) : (value_8));
+                            largest = _max_93;
+                            int _min_75 = ((smallest) < (value_8) ? (smallest) : (value_8));
+                            smallest = _min_75;
                             int position_9 = block_1 * 64 + 16 + producer_warp * 4;
-                            int _min_28 = ((position_9) < (topk - 1) ? (position_9) : (topk - 1));
-                            int clamped_10 = _min_28;
-                            int value_11 = indices[row_base + (long long)clamped_10];
+                            int _min_76 = ((position_9) < (topk - 1) ? (position_9) : (topk - 1));
+                            int clamped_10 = _min_76;
+                            int value_11_1 = indices[row_base + (long long)clamped_10];
                             if (position_9 >= active_0_1) {
-                                value_11 = -1;
+                                value_11_1 = -1;
                             }
-                            idx[4] = value_11;
-                            int _max_62 = ((largest) > (value_11) ? (largest) : (value_11));
-                            largest = _max_62;
-                            int _min_29 = ((smallest) < (value_11) ? (smallest) : (value_11));
-                            smallest = _min_29;
-                            int position_12 = block_1 * 64 + 16 + producer_warp * 4 + 1;
-                            int _min_30 = ((position_12) < (topk - 1) ? (position_12) : (topk - 1));
-                            int clamped_13 = _min_30;
-                            int value_14 = indices[row_base + (long long)clamped_13];
-                            if (position_12 >= active_0_1) {
+                            idx[4] = value_11_1;
+                            int _max_94 = ((largest) > (value_11_1) ? (largest) : (value_11_1));
+                            largest = _max_94;
+                            int _min_77 = ((smallest) < (value_11_1) ? (smallest) : (value_11_1));
+                            smallest = _min_77;
+                            int position_12_1 = block_1 * 64 + 16 + producer_warp * 4 + 1;
+                            int _min_78 = ((position_12_1) < (topk - 1) ? (position_12_1) : (topk - 1));
+                            int clamped_13_1 = _min_78;
+                            int value_14 = indices[row_base + (long long)clamped_13_1];
+                            if (position_12_1 >= active_0_1) {
                                 value_14 = -1;
                             }
                             idx[5] = value_14;
-                            int _max_63 = ((largest) > (value_14) ? (largest) : (value_14));
-                            largest = _max_63;
-                            int _min_31 = ((smallest) < (value_14) ? (smallest) : (value_14));
-                            smallest = _min_31;
+                            int _max_95 = ((largest) > (value_14) ? (largest) : (value_14));
+                            largest = _max_95;
+                            int _min_79 = ((smallest) < (value_14) ? (smallest) : (value_14));
+                            smallest = _min_79;
                             int position_15 = block_1 * 64 + 16 + producer_warp * 4 + 2;
-                            int _min_32 = ((position_15) < (topk - 1) ? (position_15) : (topk - 1));
-                            int clamped_16 = _min_32;
+                            int _min_80 = ((position_15) < (topk - 1) ? (position_15) : (topk - 1));
+                            int clamped_16 = _min_80;
                             int value_17 = indices[row_base + (long long)clamped_16];
                             if (position_15 >= active_0_1) {
                                 value_17 = -1;
                             }
                             idx[6] = value_17;
-                            int _max_64 = ((largest) > (value_17) ? (largest) : (value_17));
-                            largest = _max_64;
-                            int _min_33 = ((smallest) < (value_17) ? (smallest) : (value_17));
-                            smallest = _min_33;
+                            int _max_96 = ((largest) > (value_17) ? (largest) : (value_17));
+                            largest = _max_96;
+                            int _min_81 = ((smallest) < (value_17) ? (smallest) : (value_17));
+                            smallest = _min_81;
                             int position_18 = block_1 * 64 + 16 + producer_warp * 4 + 3;
-                            int _min_34 = ((position_18) < (topk - 1) ? (position_18) : (topk - 1));
-                            int clamped_19 = _min_34;
+                            int _min_82 = ((position_18) < (topk - 1) ? (position_18) : (topk - 1));
+                            int clamped_19 = _min_82;
                             int value_20 = indices[row_base + (long long)clamped_19];
                             if (position_18 >= active_0_1) {
                                 value_20 = -1;
                             }
                             idx[7] = value_20;
-                            int _max_65 = ((largest) > (value_20) ? (largest) : (value_20));
-                            largest = _max_65;
-                            int _min_35 = ((smallest) < (value_20) ? (smallest) : (value_20));
-                            smallest = _min_35;
+                            int _max_97 = ((largest) > (value_20) ? (largest) : (value_20));
+                            largest = _max_97;
+                            int _min_83 = ((smallest) < (value_20) ? (smallest) : (value_20));
+                            smallest = _min_83;
                             int position_21 = block_1 * 64 + 32 + producer_warp * 4;
-                            int _min_36 = ((position_21) < (topk - 1) ? (position_21) : (topk - 1));
-                            int clamped_22 = _min_36;
-                            int value_23 = indices[row_base + (long long)clamped_22];
+                            int _min_84 = ((position_21) < (topk - 1) ? (position_21) : (topk - 1));
+                            int clamped_22 = _min_84;
+                            int value_23_1 = indices[row_base + (long long)clamped_22];
                             if (position_21 >= active_0_1) {
-                                value_23 = -1;
+                                value_23_1 = -1;
                             }
-                            idx[8] = value_23;
-                            int _max_66 = ((largest) > (value_23) ? (largest) : (value_23));
-                            largest = _max_66;
-                            int _min_37 = ((smallest) < (value_23) ? (smallest) : (value_23));
-                            smallest = _min_37;
-                            int position_24 = block_1 * 64 + 32 + producer_warp * 4 + 1;
-                            int _min_38 = ((position_24) < (topk - 1) ? (position_24) : (topk - 1));
-                            int clamped_25 = _min_38;
-                            int value_26 = indices[row_base + (long long)clamped_25];
-                            if (position_24 >= active_0_1) {
+                            idx[8] = value_23_1;
+                            int _max_98 = ((largest) > (value_23_1) ? (largest) : (value_23_1));
+                            largest = _max_98;
+                            int _min_85 = ((smallest) < (value_23_1) ? (smallest) : (value_23_1));
+                            smallest = _min_85;
+                            int position_24_1 = block_1 * 64 + 32 + producer_warp * 4 + 1;
+                            int _min_86 = ((position_24_1) < (topk - 1) ? (position_24_1) : (topk - 1));
+                            int clamped_25_1 = _min_86;
+                            int value_26 = indices[row_base + (long long)clamped_25_1];
+                            if (position_24_1 >= active_0_1) {
                                 value_26 = -1;
                             }
                             idx[9] = value_26;
-                            int _max_67 = ((largest) > (value_26) ? (largest) : (value_26));
-                            largest = _max_67;
-                            int _min_39 = ((smallest) < (value_26) ? (smallest) : (value_26));
-                            smallest = _min_39;
+                            int _max_99 = ((largest) > (value_26) ? (largest) : (value_26));
+                            largest = _max_99;
+                            int _min_87 = ((smallest) < (value_26) ? (smallest) : (value_26));
+                            smallest = _min_87;
                             int position_27 = block_1 * 64 + 32 + producer_warp * 4 + 2;
-                            int _min_40 = ((position_27) < (topk - 1) ? (position_27) : (topk - 1));
-                            int clamped_28 = _min_40;
+                            int _min_88 = ((position_27) < (topk - 1) ? (position_27) : (topk - 1));
+                            int clamped_28 = _min_88;
                             int value_29 = indices[row_base + (long long)clamped_28];
                             if (position_27 >= active_0_1) {
                                 value_29 = -1;
                             }
                             idx[10] = value_29;
-                            int _max_68 = ((largest) > (value_29) ? (largest) : (value_29));
-                            largest = _max_68;
-                            int _min_41 = ((smallest) < (value_29) ? (smallest) : (value_29));
-                            smallest = _min_41;
+                            int _max_100 = ((largest) > (value_29) ? (largest) : (value_29));
+                            largest = _max_100;
+                            int _min_89 = ((smallest) < (value_29) ? (smallest) : (value_29));
+                            smallest = _min_89;
                             int position_30 = block_1 * 64 + 32 + producer_warp * 4 + 3;
-                            int _min_42 = ((position_30) < (topk - 1) ? (position_30) : (topk - 1));
-                            int clamped_31 = _min_42;
+                            int _min_90 = ((position_30) < (topk - 1) ? (position_30) : (topk - 1));
+                            int clamped_31 = _min_90;
                             int value_32 = indices[row_base + (long long)clamped_31];
                             if (position_30 >= active_0_1) {
                                 value_32 = -1;
                             }
                             idx[11] = value_32;
-                            int _max_69 = ((largest) > (value_32) ? (largest) : (value_32));
-                            largest = _max_69;
-                            int _min_43 = ((smallest) < (value_32) ? (smallest) : (value_32));
-                            smallest = _min_43;
+                            int _max_101 = ((largest) > (value_32) ? (largest) : (value_32));
+                            largest = _max_101;
+                            int _min_91 = ((smallest) < (value_32) ? (smallest) : (value_32));
+                            smallest = _min_91;
                             int position_33 = block_1 * 64 + 48 + producer_warp * 4;
-                            int _min_44 = ((position_33) < (topk - 1) ? (position_33) : (topk - 1));
-                            int clamped_34 = _min_44;
-                            int value_35 = indices[row_base + (long long)clamped_34];
+                            int _min_92 = ((position_33) < (topk - 1) ? (position_33) : (topk - 1));
+                            int clamped_34 = _min_92;
+                            int value_35_1 = indices[row_base + (long long)clamped_34];
                             if (position_33 >= active_0_1) {
-                                value_35 = -1;
+                                value_35_1 = -1;
                             }
-                            idx[12] = value_35;
-                            int _max_70 = ((largest) > (value_35) ? (largest) : (value_35));
-                            largest = _max_70;
-                            int _min_45 = ((smallest) < (value_35) ? (smallest) : (value_35));
-                            smallest = _min_45;
-                            int position_36 = block_1 * 64 + 48 + producer_warp * 4 + 1;
-                            int _min_46 = ((position_36) < (topk - 1) ? (position_36) : (topk - 1));
-                            int clamped_37 = _min_46;
-                            int value_38 = indices[row_base + (long long)clamped_37];
-                            if (position_36 >= active_0_1) {
+                            idx[12] = value_35_1;
+                            int _max_102 = ((largest) > (value_35_1) ? (largest) : (value_35_1));
+                            largest = _max_102;
+                            int _min_93 = ((smallest) < (value_35_1) ? (smallest) : (value_35_1));
+                            smallest = _min_93;
+                            int position_36_1 = block_1 * 64 + 48 + producer_warp * 4 + 1;
+                            int _min_94 = ((position_36_1) < (topk - 1) ? (position_36_1) : (topk - 1));
+                            int clamped_37_1 = _min_94;
+                            int value_38 = indices[row_base + (long long)clamped_37_1];
+                            if (position_36_1 >= active_0_1) {
                                 value_38 = -1;
                             }
                             idx[13] = value_38;
-                            int _max_71 = ((largest) > (value_38) ? (largest) : (value_38));
-                            largest = _max_71;
-                            int _min_47 = ((smallest) < (value_38) ? (smallest) : (value_38));
-                            smallest = _min_47;
+                            int _max_103 = ((largest) > (value_38) ? (largest) : (value_38));
+                            largest = _max_103;
+                            int _min_95 = ((smallest) < (value_38) ? (smallest) : (value_38));
+                            smallest = _min_95;
                             int position_39 = block_1 * 64 + 48 + producer_warp * 4 + 2;
-                            int _min_48 = ((position_39) < (topk - 1) ? (position_39) : (topk - 1));
-                            int clamped_40 = _min_48;
+                            int _min_96 = ((position_39) < (topk - 1) ? (position_39) : (topk - 1));
+                            int clamped_40 = _min_96;
                             int value_41 = indices[row_base + (long long)clamped_40];
                             if (position_39 >= active_0_1) {
                                 value_41 = -1;
                             }
                             idx[14] = value_41;
-                            int _max_72 = ((largest) > (value_41) ? (largest) : (value_41));
-                            largest = _max_72;
-                            int _min_49 = ((smallest) < (value_41) ? (smallest) : (value_41));
-                            smallest = _min_49;
+                            int _max_104 = ((largest) > (value_41) ? (largest) : (value_41));
+                            largest = _max_104;
+                            int _min_97 = ((smallest) < (value_41) ? (smallest) : (value_41));
+                            smallest = _min_97;
                             int position_42 = block_1 * 64 + 48 + producer_warp * 4 + 3;
-                            int _min_50 = ((position_42) < (topk - 1) ? (position_42) : (topk - 1));
-                            int clamped_43 = _min_50;
+                            int _min_98 = ((position_42) < (topk - 1) ? (position_42) : (topk - 1));
+                            int clamped_43 = _min_98;
                             int value_44 = indices[row_base + (long long)clamped_43];
                             if (position_42 >= active_0_1) {
                                 value_44 = -1;
                             }
                             idx[15] = value_44;
-                            int _max_73 = ((largest) > (value_44) ? (largest) : (value_44));
-                            largest = _max_73;
-                            int _min_51 = ((smallest) < (value_44) ? (smallest) : (value_44));
-                            smallest = _min_51;
+                            int _max_105 = ((largest) > (value_44) ? (largest) : (value_44));
+                            largest = _max_105;
+                            int _min_99 = ((smallest) < (value_44) ? (smallest) : (value_44));
+                            smallest = _min_99;
                         }
                         int skip = (smallest == num_kv || largest == -1) && block_1 >= 3;
                         if (block_1 == 1) {
@@ -3141,17 +3581,17 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                         int len_slot_2 = outer_2 & 1;
                         unsigned int len_phase_2 = outer_2 >> 1 & 1;
                         mbarrier_wait(len_ready_addr + (len_slot_2) * 8, len_phase_2);
-                        int _max_74 = ((len_cells[len_slot_2]) > (0) ? (len_cells[len_slot_2]) : (0));
-                        int _min_52 = ((_max_74) < (topk) ? (_max_74) : (topk));
-                        active_2 = _min_52;
+                        int _max_106 = ((len_cells[len_slot_2]) > (0) ? (len_cells[len_slot_2]) : (0));
+                        int _min_100 = ((_max_106) < (topk) ? (_max_106) : (topk));
+                        active_2 = _min_100;
                     } else if (has_topk_length != 0) {
-                        int _max_75 = ((topk_length[query_2]) > (0) ? (topk_length[query_2]) : (0));
-                        int _min_53 = ((_max_75) < (topk) ? (_max_75) : (topk));
-                        active_2 = _min_53;
+                        int _max_107 = ((topk_length[query_2]) > (0) ? (topk_length[query_2]) : (0));
+                        int _min_101 = ((_max_107) < (topk) ? (_max_107) : (topk));
+                        active_2 = _min_101;
                     }
                     int active_0_2 = active_2;
-                    int _max_76 = (((active_0_2 + 63) / 64) > (2) ? ((active_0_2 + 63) / 64) : (2));
-                    int blocks_2 = _max_76;
+                    int _max_108 = (((active_0_2 + 63) / 64) > (2) ? ((active_0_2 + 63) / 64) : (2));
+                    int blocks_2 = _max_108;
                     int q_slot = (cursor_2 + 1) % 3;
                     if (outer_2 == 0) {
                         asm volatile(
@@ -3661,25 +4101,29 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                         int len_slot_3 = outer_3 & 1;
                         unsigned int len_phase_3 = outer_3 >> 1 & 1;
                         mbarrier_wait(len_ready_addr + (len_slot_3) * 8, len_phase_3);
-                        int _max_77 = ((len_cells[len_slot_3]) > (0) ? (len_cells[len_slot_3]) : (0));
-                        int _min_54 = ((_max_77) < (topk) ? (_max_77) : (topk));
-                        active_3 = _min_54;
+                        int _max_109 = ((len_cells[len_slot_3]) > (0) ? (len_cells[len_slot_3]) : (0));
+                        int _min_102 = ((_max_109) < (topk) ? (_max_109) : (topk));
+                        active_3 = _min_102;
                     } else if (has_topk_length != 0) {
-                        int _max_78 = ((topk_length[query_3]) > (0) ? (topk_length[query_3]) : (0));
-                        int _min_55 = ((_max_78) < (topk) ? (_max_78) : (topk));
-                        active_3 = _min_55;
+                        int _max_110 = ((topk_length[query_3]) > (0) ? (topk_length[query_3]) : (0));
+                        int _min_103 = ((_max_110) < (topk) ? (_max_110) : (topk));
+                        active_3 = _min_103;
                     }
                     int active_0_3 = active_3;
-                    int _max_79 = (((active_0_3 + 63) / 64) > (2) ? ((active_0_3 + 63) / 64) : (2));
-                    int blocks_3 = _max_79;
+                    int _max_111 = (((active_0_3 + 63) / 64) > (2) ? ((active_0_3 + 63) / 64) : (2));
+                    int blocks_3 = _max_111;
                     long long row_base_1 = (long long)indices_offset + (long long)query_3 * (long long)idx_stride;
+                    int bound_1 = num_kv - 1;
+                    if (derive_length != 0) {
+                        bound_1 = bound_cells[outer_3 & 1];
+                    }
                     #pragma unroll 1
                     for (int block_3 = 0; block_3 < blocks_3; block_3++) {
                         unsigned int mask = 0;
-                        int position_1 = block_3 * 64 + lane * 8;
+                        int position_2 = block_3 * 64 + lane * 8;
                         int whole_tile_1 = active_0_3 >= block_3 * 64 + 64 && ((idx_stride | indices_offset) & 7) == 0;
                         if (whole_tile_1 != 0) {
-                            int _vec_load_4[8];
+                            int _vec_load_8[8];
                             {
                                 uint32_t _iv_0_0;
                                 uint32_t _iv_0_1;
@@ -3690,87 +4134,87 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                                 uint32_t _iv_0_6;
                                 uint32_t _iv_0_7;
                                 asm volatile("ld.global.nc.L1::evict_first.L2::evict_normal.L2::256B.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                    : "=r"(_iv_0_0), "=r"(_iv_0_1), "=r"(_iv_0_2), "=r"(_iv_0_3), "=r"(_iv_0_4), "=r"(_iv_0_5), "=r"(_iv_0_6), "=r"(_iv_0_7) : "l"((const void*)(indices + (row_base_1 + (long long)position_1) + (0))) : "memory");
-                                _vec_load_4[0 + 0] = (int32_t)_iv_0_0;
-                                _vec_load_4[0 + 1] = (int32_t)_iv_0_1;
-                                _vec_load_4[0 + 2] = (int32_t)_iv_0_2;
-                                _vec_load_4[0 + 3] = (int32_t)_iv_0_3;
-                                _vec_load_4[0 + 4] = (int32_t)_iv_0_4;
-                                _vec_load_4[0 + 5] = (int32_t)_iv_0_5;
-                                _vec_load_4[0 + 6] = (int32_t)_iv_0_6;
-                                _vec_load_4[0 + 7] = (int32_t)_iv_0_7;
+                                    : "=r"(_iv_0_0), "=r"(_iv_0_1), "=r"(_iv_0_2), "=r"(_iv_0_3), "=r"(_iv_0_4), "=r"(_iv_0_5), "=r"(_iv_0_6), "=r"(_iv_0_7) : "l"((const void*)(indices + (row_base_1 + (long long)position_2) + (0))) : "memory");
+                                _vec_load_8[0 + 0] = (int32_t)_iv_0_0;
+                                _vec_load_8[0 + 1] = (int32_t)_iv_0_1;
+                                _vec_load_8[0 + 2] = (int32_t)_iv_0_2;
+                                _vec_load_8[0 + 3] = (int32_t)_iv_0_3;
+                                _vec_load_8[0 + 4] = (int32_t)_iv_0_4;
+                                _vec_load_8[0 + 5] = (int32_t)_iv_0_5;
+                                _vec_load_8[0 + 6] = (int32_t)_iv_0_6;
+                                _vec_load_8[0 + 7] = (int32_t)_iv_0_7;
                             }
-                            if (_vec_load_4[0] >= 0 && _vec_load_4[0] < num_kv) {
+                            if (_vec_load_8[0] >= 0 && _vec_load_8[0] <= bound_1) {
                                 mask = mask | 1;
                             }
-                            if (_vec_load_4[1] >= 0 && _vec_load_4[1] < num_kv) {
+                            if (_vec_load_8[1] >= 0 && _vec_load_8[1] <= bound_1) {
                                 mask = mask | 2;
                             }
-                            if (_vec_load_4[2] >= 0 && _vec_load_4[2] < num_kv) {
+                            if (_vec_load_8[2] >= 0 && _vec_load_8[2] <= bound_1) {
                                 mask = mask | 4;
                             }
-                            if (_vec_load_4[3] >= 0 && _vec_load_4[3] < num_kv) {
+                            if (_vec_load_8[3] >= 0 && _vec_load_8[3] <= bound_1) {
                                 mask = mask | 8;
                             }
-                            if (_vec_load_4[4] >= 0 && _vec_load_4[4] < num_kv) {
+                            if (_vec_load_8[4] >= 0 && _vec_load_8[4] <= bound_1) {
                                 mask = mask | 16;
                             }
-                            if (_vec_load_4[5] >= 0 && _vec_load_4[5] < num_kv) {
+                            if (_vec_load_8[5] >= 0 && _vec_load_8[5] <= bound_1) {
                                 mask = mask | 32;
                             }
-                            if (_vec_load_4[6] >= 0 && _vec_load_4[6] < num_kv) {
+                            if (_vec_load_8[6] >= 0 && _vec_load_8[6] <= bound_1) {
                                 mask = mask | 64;
                             }
-                            if (_vec_load_4[7] >= 0 && _vec_load_4[7] < num_kv) {
+                            if (_vec_load_8[7] >= 0 && _vec_load_8[7] <= bound_1) {
                                 mask = mask | 128;
                             }
                         } else {
-                            int _min_56 = ((position_1) < (topk - 1) ? (position_1) : (topk - 1));
-                            int clamped_2 = _min_56;
-                            int value_1 = indices[row_base_1 + (long long)clamped_2];
-                            if (value_1 >= 0 && value_1 < num_kv && active_0_3 > position_1) {
+                            int _min_104 = ((position_2) < (topk - 1) ? (position_2) : (topk - 1));
+                            int clamped_3 = _min_104;
+                            int value_4 = indices[row_base_1 + (long long)clamped_3];
+                            if (value_4 >= 0 && value_4 <= bound_1 && active_0_3 > position_2) {
                                 mask = mask | 1;
                             }
-                            int _min_57 = ((position_1 + 1) < (topk - 1) ? (position_1 + 1) : (topk - 1));
-                            int clamped_0 = _min_57;
+                            int _min_105 = ((position_2 + 1) < (topk - 1) ? (position_2 + 1) : (topk - 1));
+                            int clamped_0 = _min_105;
                             int value_1_1 = indices[row_base_1 + (long long)clamped_0];
-                            if (value_1_1 >= 0 && value_1_1 < num_kv && active_0_3 > position_1 + 1) {
+                            if (value_1_1 >= 0 && value_1_1 <= bound_1 && active_0_3 > position_2 + 1) {
                                 mask = mask | 2;
                             }
-                            int _min_58 = ((position_1 + 2) < (topk - 1) ? (position_1 + 2) : (topk - 1));
-                            int clamped_2_1 = _min_58;
-                            int value_3 = indices[row_base_1 + (long long)clamped_2_1];
-                            if (value_3 >= 0 && value_3 < num_kv && active_0_3 > position_1 + 2) {
+                            int _min_106 = ((position_2 + 2) < (topk - 1) ? (position_2 + 2) : (topk - 1));
+                            int clamped_2_1 = _min_106;
+                            int value_3_1 = indices[row_base_1 + (long long)clamped_2_1];
+                            if (value_3_1 >= 0 && value_3_1 <= bound_1 && active_0_3 > position_2 + 2) {
                                 mask = mask | 4;
                             }
-                            int _min_59 = ((position_1 + 3) < (topk - 1) ? (position_1 + 3) : (topk - 1));
-                            int clamped_4_1 = _min_59;
+                            int _min_107 = ((position_2 + 3) < (topk - 1) ? (position_2 + 3) : (topk - 1));
+                            int clamped_4_1 = _min_107;
                             int value_5_1 = indices[row_base_1 + (long long)clamped_4_1];
-                            if (value_5_1 >= 0 && value_5_1 < num_kv && active_0_3 > position_1 + 3) {
+                            if (value_5_1 >= 0 && value_5_1 <= bound_1 && active_0_3 > position_2 + 3) {
                                 mask = mask | 8;
                             }
-                            int _min_60 = ((position_1 + 4) < (topk - 1) ? (position_1 + 4) : (topk - 1));
-                            int clamped_6 = _min_60;
-                            int value_7 = indices[row_base_1 + (long long)clamped_6];
-                            if (value_7 >= 0 && value_7 < num_kv && active_0_3 > position_1 + 4) {
+                            int _min_108 = ((position_2 + 4) < (topk - 1) ? (position_2 + 4) : (topk - 1));
+                            int clamped_6 = _min_108;
+                            int value_7_1 = indices[row_base_1 + (long long)clamped_6];
+                            if (value_7_1 >= 0 && value_7_1 <= bound_1 && active_0_3 > position_2 + 4) {
                                 mask = mask | 16;
                             }
-                            int _min_61 = ((position_1 + 5) < (topk - 1) ? (position_1 + 5) : (topk - 1));
-                            int clamped_8 = _min_61;
+                            int _min_109 = ((position_2 + 5) < (topk - 1) ? (position_2 + 5) : (topk - 1));
+                            int clamped_8 = _min_109;
                             int value_9 = indices[row_base_1 + (long long)clamped_8];
-                            if (value_9 >= 0 && value_9 < num_kv && active_0_3 > position_1 + 5) {
+                            if (value_9 >= 0 && value_9 <= bound_1 && active_0_3 > position_2 + 5) {
                                 mask = mask | 32;
                             }
-                            int _min_62 = ((position_1 + 6) < (topk - 1) ? (position_1 + 6) : (topk - 1));
-                            int clamped_10_1 = _min_62;
-                            int value_11_1 = indices[row_base_1 + (long long)clamped_10_1];
-                            if (value_11_1 >= 0 && value_11_1 < num_kv && active_0_3 > position_1 + 6) {
+                            int _min_110 = ((position_2 + 6) < (topk - 1) ? (position_2 + 6) : (topk - 1));
+                            int clamped_10_1 = _min_110;
+                            int value_11_2 = indices[row_base_1 + (long long)clamped_10_1];
+                            if (value_11_2 >= 0 && value_11_2 <= bound_1 && active_0_3 > position_2 + 6) {
                                 mask = mask | 64;
                             }
-                            int _min_63 = ((position_1 + 7) < (topk - 1) ? (position_1 + 7) : (topk - 1));
-                            int clamped_12 = _min_63;
+                            int _min_111 = ((position_2 + 7) < (topk - 1) ? (position_2 + 7) : (topk - 1));
+                            int clamped_12 = _min_111;
                             int value_13 = indices[row_base_1 + (long long)clamped_12];
-                            if (value_13 >= 0 && value_13 < num_kv && active_0_3 > position_1 + 7) {
+                            if (value_13 >= 0 && value_13 <= bound_1 && active_0_3 > position_2 + 7) {
                                 mask = mask | 128;
                             }
                         }
@@ -3853,62 +4297,520 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                     unsigned int outer_phase_5 = 0;
                     int lane16 = lane - 16;
                     int scan_aligned = ((idx_stride | indices_offset) & 7) == 0;
+                    int out_vec = (topk & 3) == 0;
                     #pragma unroll 1
                     for (int outer_5 = 0; outer_5 < num_queries; outer_5++) {
                         if (derive_length != 0) {
                             long long row_base_2 = (long long)indices_offset + (long long)query_4 * (long long)idx_stride;
+                            long long out_base = (long long)query_4 * (long long)topk;
+                            int key_base_1 = 0;
+                            int bound_2 = num_kv - 1;
+                            if (convert != 0) {
+                                int lo = 0;
+                                int hi = num_docs;
+                                #pragma unroll 1
+                                for (int it = 0; it < search_iters; it++) {
+                                    int mid = (lo + hi) / 2;
+                                    int _vec_load_9[1];
+                                    {
+                                        _vec_load_9[0] = *reinterpret_cast<const int*>(cu_seqlens_q + (long long)mid + 0);
+                                    }
+                                    int go_lo = (int)(mid > lo && _vec_load_9[0] <= query_4);
+                                    int go_hi = (int)(mid > lo && _vec_load_9[0] > query_4);
+                                    lo = ((go_lo != 0) ? mid : lo);
+                                    hi = ((go_hi != 0) ? mid : hi);
+                                }
+                                int _vec_load_10[1];
+                                {
+                                    _vec_load_10[0] = *reinterpret_cast<const int*>(cu_seqlens_k + (long long)lo + 0);
+                                }
+                                int _vec_load_11[1];
+                                {
+                                    _vec_load_11[0] = *reinterpret_cast<const int*>(cu_seqlens_k + (long long)(lo + 1) + 0);
+                                }
+                                key_base_1 = _vec_load_10[0];
+                                int k_end = _vec_load_11[0];
+                                bound_2 = k_end - key_base_1 - 1;
+                                if (causal != 0) {
+                                    int _vec_load_12[1];
+                                    {
+                                        _vec_load_12[0] = *reinterpret_cast<const int*>(cu_seqlens_q + (long long)(lo + 1) + 0);
+                                    }
+                                    bound_2 = k_end - _vec_load_12[0] + query_4 - key_base_1;
+                                }
+                            }
                             int last = 0;
                             int n_full = topk / 128;
                             if (scan_aligned == 0) {
                                 n_full = 0;
                             }
-                            #pragma unroll 4
-                            for (int g = 0; g < n_full; g++) {
-                                int spos = g * 128 + lane16 * 8;
-                                int _vec_load_5[8];
-                                {
-                                    uint32_t _iv_1_0;
-                                    uint32_t _iv_1_1;
-                                    uint32_t _iv_1_2;
-                                    uint32_t _iv_1_3;
-                                    uint32_t _iv_1_4;
-                                    uint32_t _iv_1_5;
-                                    uint32_t _iv_1_6;
-                                    uint32_t _iv_1_7;
-                                    asm volatile("ld.global.nc.L1::evict_first.L2::evict_normal.L2::256B.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                        : "=r"(_iv_1_0), "=r"(_iv_1_1), "=r"(_iv_1_2), "=r"(_iv_1_3), "=r"(_iv_1_4), "=r"(_iv_1_5), "=r"(_iv_1_6), "=r"(_iv_1_7) : "l"((const void*)(indices + (row_base_2 + (long long)spos) + (0))) : "memory");
-                                    _vec_load_5[0 + 0] = (int32_t)_iv_1_0;
-                                    _vec_load_5[0 + 1] = (int32_t)_iv_1_1;
-                                    _vec_load_5[0 + 2] = (int32_t)_iv_1_2;
-                                    _vec_load_5[0 + 3] = (int32_t)_iv_1_3;
-                                    _vec_load_5[0 + 4] = (int32_t)_iv_1_4;
-                                    _vec_load_5[0 + 5] = (int32_t)_iv_1_5;
-                                    _vec_load_5[0 + 6] = (int32_t)_iv_1_6;
-                                    _vec_load_5[0 + 7] = (int32_t)_iv_1_7;
+                            if (convert != 0) {
+                                int n_batch = n_full / 4;
+                                #pragma unroll 1
+                                for (int b = 0; b < n_batch; b++) {
+                                    int spos = b * 4 * 128 + lane16 * 8;
+                                    int _vec_load_13[8];
+                                    {
+                                        uint32_t _iv_1_0;
+                                        uint32_t _iv_1_1;
+                                        uint32_t _iv_1_2;
+                                        uint32_t _iv_1_3;
+                                        uint32_t _iv_1_4;
+                                        uint32_t _iv_1_5;
+                                        uint32_t _iv_1_6;
+                                        uint32_t _iv_1_7;
+                                        asm volatile("ld.global.nc.L1::evict_first.L2::evict_normal.L2::256B.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                                            : "=r"(_iv_1_0), "=r"(_iv_1_1), "=r"(_iv_1_2), "=r"(_iv_1_3), "=r"(_iv_1_4), "=r"(_iv_1_5), "=r"(_iv_1_6), "=r"(_iv_1_7) : "l"((const void*)(indices + (row_base_2 + (long long)spos) + (0))) : "memory");
+                                        _vec_load_13[0 + 0] = (int32_t)_iv_1_0;
+                                        _vec_load_13[0 + 1] = (int32_t)_iv_1_1;
+                                        _vec_load_13[0 + 2] = (int32_t)_iv_1_2;
+                                        _vec_load_13[0 + 3] = (int32_t)_iv_1_3;
+                                        _vec_load_13[0 + 4] = (int32_t)_iv_1_4;
+                                        _vec_load_13[0 + 5] = (int32_t)_iv_1_5;
+                                        _vec_load_13[0 + 6] = (int32_t)_iv_1_6;
+                                        _vec_load_13[0 + 7] = (int32_t)_iv_1_7;
+                                    }
+                                    int spos_0 = (b * 4 + 1) * 128 + lane16 * 8;
+                                    int _vec_load_14[8];
+                                    {
+                                        uint32_t _iv_2_0;
+                                        uint32_t _iv_2_1;
+                                        uint32_t _iv_2_2;
+                                        uint32_t _iv_2_3;
+                                        uint32_t _iv_2_4;
+                                        uint32_t _iv_2_5;
+                                        uint32_t _iv_2_6;
+                                        uint32_t _iv_2_7;
+                                        asm volatile("ld.global.nc.L1::evict_first.L2::evict_normal.L2::256B.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                                            : "=r"(_iv_2_0), "=r"(_iv_2_1), "=r"(_iv_2_2), "=r"(_iv_2_3), "=r"(_iv_2_4), "=r"(_iv_2_5), "=r"(_iv_2_6), "=r"(_iv_2_7) : "l"((const void*)(indices + (row_base_2 + (long long)spos_0) + (0))) : "memory");
+                                        _vec_load_14[0 + 0] = (int32_t)_iv_2_0;
+                                        _vec_load_14[0 + 1] = (int32_t)_iv_2_1;
+                                        _vec_load_14[0 + 2] = (int32_t)_iv_2_2;
+                                        _vec_load_14[0 + 3] = (int32_t)_iv_2_3;
+                                        _vec_load_14[0 + 4] = (int32_t)_iv_2_4;
+                                        _vec_load_14[0 + 5] = (int32_t)_iv_2_5;
+                                        _vec_load_14[0 + 6] = (int32_t)_iv_2_6;
+                                        _vec_load_14[0 + 7] = (int32_t)_iv_2_7;
+                                    }
+                                    int spos_1 = (b * 4 + 2) * 128 + lane16 * 8;
+                                    int _vec_load_15[8];
+                                    {
+                                        uint32_t _iv_3_0;
+                                        uint32_t _iv_3_1;
+                                        uint32_t _iv_3_2;
+                                        uint32_t _iv_3_3;
+                                        uint32_t _iv_3_4;
+                                        uint32_t _iv_3_5;
+                                        uint32_t _iv_3_6;
+                                        uint32_t _iv_3_7;
+                                        asm volatile("ld.global.nc.L1::evict_first.L2::evict_normal.L2::256B.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                                            : "=r"(_iv_3_0), "=r"(_iv_3_1), "=r"(_iv_3_2), "=r"(_iv_3_3), "=r"(_iv_3_4), "=r"(_iv_3_5), "=r"(_iv_3_6), "=r"(_iv_3_7) : "l"((const void*)(indices + (row_base_2 + (long long)spos_1) + (0))) : "memory");
+                                        _vec_load_15[0 + 0] = (int32_t)_iv_3_0;
+                                        _vec_load_15[0 + 1] = (int32_t)_iv_3_1;
+                                        _vec_load_15[0 + 2] = (int32_t)_iv_3_2;
+                                        _vec_load_15[0 + 3] = (int32_t)_iv_3_3;
+                                        _vec_load_15[0 + 4] = (int32_t)_iv_3_4;
+                                        _vec_load_15[0 + 5] = (int32_t)_iv_3_5;
+                                        _vec_load_15[0 + 6] = (int32_t)_iv_3_6;
+                                        _vec_load_15[0 + 7] = (int32_t)_iv_3_7;
+                                    }
+                                    int spos_2 = (b * 4 + 3) * 128 + lane16 * 8;
+                                    int _vec_load_16[8];
+                                    {
+                                        uint32_t _iv_4_0;
+                                        uint32_t _iv_4_1;
+                                        uint32_t _iv_4_2;
+                                        uint32_t _iv_4_3;
+                                        uint32_t _iv_4_4;
+                                        uint32_t _iv_4_5;
+                                        uint32_t _iv_4_6;
+                                        uint32_t _iv_4_7;
+                                        asm volatile("ld.global.nc.L1::evict_first.L2::evict_normal.L2::256B.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                                            : "=r"(_iv_4_0), "=r"(_iv_4_1), "=r"(_iv_4_2), "=r"(_iv_4_3), "=r"(_iv_4_4), "=r"(_iv_4_5), "=r"(_iv_4_6), "=r"(_iv_4_7) : "l"((const void*)(indices + (row_base_2 + (long long)spos_2) + (0))) : "memory");
+                                        _vec_load_16[0 + 0] = (int32_t)_iv_4_0;
+                                        _vec_load_16[0 + 1] = (int32_t)_iv_4_1;
+                                        _vec_load_16[0 + 2] = (int32_t)_iv_4_2;
+                                        _vec_load_16[0 + 3] = (int32_t)_iv_4_3;
+                                        _vec_load_16[0 + 4] = (int32_t)_iv_4_4;
+                                        _vec_load_16[0 + 5] = (int32_t)_iv_4_5;
+                                        _vec_load_16[0 + 6] = (int32_t)_iv_4_6;
+                                        _vec_load_16[0 + 7] = (int32_t)_iv_4_7;
+                                    }
+                                    int outv[8];
+                                    outv[0] = -1;
+                                    if (_vec_load_13[0] >= 0 && _vec_load_13[0] <= bound_2) {
+                                        outv[0] = _vec_load_13[0] + key_base_1;
+                                        last = spos + 1;
+                                    }
+                                    outv[1] = -1;
+                                    if (_vec_load_13[1] >= 0 && _vec_load_13[1] <= bound_2) {
+                                        outv[1] = _vec_load_13[1] + key_base_1;
+                                        last = spos + 1 + 1;
+                                    }
+                                    outv[2] = -1;
+                                    if (_vec_load_13[2] >= 0 && _vec_load_13[2] <= bound_2) {
+                                        outv[2] = _vec_load_13[2] + key_base_1;
+                                        last = spos + 2 + 1;
+                                    }
+                                    outv[3] = -1;
+                                    if (_vec_load_13[3] >= 0 && _vec_load_13[3] <= bound_2) {
+                                        outv[3] = _vec_load_13[3] + key_base_1;
+                                        last = spos + 3 + 1;
+                                    }
+                                    outv[4] = -1;
+                                    if (_vec_load_13[4] >= 0 && _vec_load_13[4] <= bound_2) {
+                                        outv[4] = _vec_load_13[4] + key_base_1;
+                                        last = spos + 4 + 1;
+                                    }
+                                    outv[5] = -1;
+                                    if (_vec_load_13[5] >= 0 && _vec_load_13[5] <= bound_2) {
+                                        outv[5] = _vec_load_13[5] + key_base_1;
+                                        last = spos + 5 + 1;
+                                    }
+                                    outv[6] = -1;
+                                    if (_vec_load_13[6] >= 0 && _vec_load_13[6] <= bound_2) {
+                                        outv[6] = _vec_load_13[6] + key_base_1;
+                                        last = spos + 6 + 1;
+                                    }
+                                    outv[7] = -1;
+                                    if (_vec_load_13[7] >= 0 && _vec_load_13[7] <= bound_2) {
+                                        outv[7] = _vec_load_13[7] + key_base_1;
+                                        last = spos + 7 + 1;
+                                    }
+                                    if (out_vec != 0) {
+                                        {
+                                            int4 _iv4 = make_int4(outv[0 + 0], outv[0 + 1], outv[0 + 2], outv[0 + 3]);
+                                            *reinterpret_cast<int4*>(indices_out + out_base + (long long)spos) = _iv4;
+                                        }
+                                        {
+                                            int4 _iv4 = make_int4(outv[4 + 0], outv[4 + 1], outv[4 + 2], outv[4 + 3]);
+                                            *reinterpret_cast<int4*>(indices_out + out_base + (long long)spos + 4) = _iv4;
+                                        }
+                                    } else {
+                                        indices_out[out_base + (long long)spos] = outv[0];
+                                        indices_out[out_base + (long long)(spos + 1)] = outv[1];
+                                        indices_out[out_base + (long long)(spos + 2)] = outv[2];
+                                        indices_out[out_base + (long long)(spos + 3)] = outv[3];
+                                        indices_out[out_base + (long long)(spos + 4)] = outv[4];
+                                        indices_out[out_base + (long long)(spos + 5)] = outv[5];
+                                        indices_out[out_base + (long long)(spos + 6)] = outv[6];
+                                        indices_out[out_base + (long long)(spos + 7)] = outv[7];
+                                    }
+                                    int outv_3[8];
+                                    outv_3[0] = -1;
+                                    if (_vec_load_14[0] >= 0 && _vec_load_14[0] <= bound_2) {
+                                        outv_3[0] = _vec_load_14[0] + key_base_1;
+                                        last = spos_0 + 1;
+                                    }
+                                    outv_3[1] = -1;
+                                    if (_vec_load_14[1] >= 0 && _vec_load_14[1] <= bound_2) {
+                                        outv_3[1] = _vec_load_14[1] + key_base_1;
+                                        last = spos_0 + 1 + 1;
+                                    }
+                                    outv_3[2] = -1;
+                                    if (_vec_load_14[2] >= 0 && _vec_load_14[2] <= bound_2) {
+                                        outv_3[2] = _vec_load_14[2] + key_base_1;
+                                        last = spos_0 + 2 + 1;
+                                    }
+                                    outv_3[3] = -1;
+                                    if (_vec_load_14[3] >= 0 && _vec_load_14[3] <= bound_2) {
+                                        outv_3[3] = _vec_load_14[3] + key_base_1;
+                                        last = spos_0 + 3 + 1;
+                                    }
+                                    outv_3[4] = -1;
+                                    if (_vec_load_14[4] >= 0 && _vec_load_14[4] <= bound_2) {
+                                        outv_3[4] = _vec_load_14[4] + key_base_1;
+                                        last = spos_0 + 4 + 1;
+                                    }
+                                    outv_3[5] = -1;
+                                    if (_vec_load_14[5] >= 0 && _vec_load_14[5] <= bound_2) {
+                                        outv_3[5] = _vec_load_14[5] + key_base_1;
+                                        last = spos_0 + 5 + 1;
+                                    }
+                                    outv_3[6] = -1;
+                                    if (_vec_load_14[6] >= 0 && _vec_load_14[6] <= bound_2) {
+                                        outv_3[6] = _vec_load_14[6] + key_base_1;
+                                        last = spos_0 + 6 + 1;
+                                    }
+                                    outv_3[7] = -1;
+                                    if (_vec_load_14[7] >= 0 && _vec_load_14[7] <= bound_2) {
+                                        outv_3[7] = _vec_load_14[7] + key_base_1;
+                                        last = spos_0 + 7 + 1;
+                                    }
+                                    if (out_vec != 0) {
+                                        {
+                                            int4 _iv4 = make_int4(outv_3[0 + 0], outv_3[0 + 1], outv_3[0 + 2], outv_3[0 + 3]);
+                                            *reinterpret_cast<int4*>(indices_out + out_base + (long long)spos_0) = _iv4;
+                                        }
+                                        {
+                                            int4 _iv4 = make_int4(outv_3[4 + 0], outv_3[4 + 1], outv_3[4 + 2], outv_3[4 + 3]);
+                                            *reinterpret_cast<int4*>(indices_out + out_base + (long long)spos_0 + 4) = _iv4;
+                                        }
+                                    } else {
+                                        indices_out[out_base + (long long)spos_0] = outv_3[0];
+                                        indices_out[out_base + (long long)(spos_0 + 1)] = outv_3[1];
+                                        indices_out[out_base + (long long)(spos_0 + 2)] = outv_3[2];
+                                        indices_out[out_base + (long long)(spos_0 + 3)] = outv_3[3];
+                                        indices_out[out_base + (long long)(spos_0 + 4)] = outv_3[4];
+                                        indices_out[out_base + (long long)(spos_0 + 5)] = outv_3[5];
+                                        indices_out[out_base + (long long)(spos_0 + 6)] = outv_3[6];
+                                        indices_out[out_base + (long long)(spos_0 + 7)] = outv_3[7];
+                                    }
+                                    int outv_4[8];
+                                    outv_4[0] = -1;
+                                    if (_vec_load_15[0] >= 0 && _vec_load_15[0] <= bound_2) {
+                                        outv_4[0] = _vec_load_15[0] + key_base_1;
+                                        last = spos_1 + 1;
+                                    }
+                                    outv_4[1] = -1;
+                                    if (_vec_load_15[1] >= 0 && _vec_load_15[1] <= bound_2) {
+                                        outv_4[1] = _vec_load_15[1] + key_base_1;
+                                        last = spos_1 + 1 + 1;
+                                    }
+                                    outv_4[2] = -1;
+                                    if (_vec_load_15[2] >= 0 && _vec_load_15[2] <= bound_2) {
+                                        outv_4[2] = _vec_load_15[2] + key_base_1;
+                                        last = spos_1 + 2 + 1;
+                                    }
+                                    outv_4[3] = -1;
+                                    if (_vec_load_15[3] >= 0 && _vec_load_15[3] <= bound_2) {
+                                        outv_4[3] = _vec_load_15[3] + key_base_1;
+                                        last = spos_1 + 3 + 1;
+                                    }
+                                    outv_4[4] = -1;
+                                    if (_vec_load_15[4] >= 0 && _vec_load_15[4] <= bound_2) {
+                                        outv_4[4] = _vec_load_15[4] + key_base_1;
+                                        last = spos_1 + 4 + 1;
+                                    }
+                                    outv_4[5] = -1;
+                                    if (_vec_load_15[5] >= 0 && _vec_load_15[5] <= bound_2) {
+                                        outv_4[5] = _vec_load_15[5] + key_base_1;
+                                        last = spos_1 + 5 + 1;
+                                    }
+                                    outv_4[6] = -1;
+                                    if (_vec_load_15[6] >= 0 && _vec_load_15[6] <= bound_2) {
+                                        outv_4[6] = _vec_load_15[6] + key_base_1;
+                                        last = spos_1 + 6 + 1;
+                                    }
+                                    outv_4[7] = -1;
+                                    if (_vec_load_15[7] >= 0 && _vec_load_15[7] <= bound_2) {
+                                        outv_4[7] = _vec_load_15[7] + key_base_1;
+                                        last = spos_1 + 7 + 1;
+                                    }
+                                    if (out_vec != 0) {
+                                        {
+                                            int4 _iv4 = make_int4(outv_4[0 + 0], outv_4[0 + 1], outv_4[0 + 2], outv_4[0 + 3]);
+                                            *reinterpret_cast<int4*>(indices_out + out_base + (long long)spos_1) = _iv4;
+                                        }
+                                        {
+                                            int4 _iv4 = make_int4(outv_4[4 + 0], outv_4[4 + 1], outv_4[4 + 2], outv_4[4 + 3]);
+                                            *reinterpret_cast<int4*>(indices_out + out_base + (long long)spos_1 + 4) = _iv4;
+                                        }
+                                    } else {
+                                        indices_out[out_base + (long long)spos_1] = outv_4[0];
+                                        indices_out[out_base + (long long)(spos_1 + 1)] = outv_4[1];
+                                        indices_out[out_base + (long long)(spos_1 + 2)] = outv_4[2];
+                                        indices_out[out_base + (long long)(spos_1 + 3)] = outv_4[3];
+                                        indices_out[out_base + (long long)(spos_1 + 4)] = outv_4[4];
+                                        indices_out[out_base + (long long)(spos_1 + 5)] = outv_4[5];
+                                        indices_out[out_base + (long long)(spos_1 + 6)] = outv_4[6];
+                                        indices_out[out_base + (long long)(spos_1 + 7)] = outv_4[7];
+                                    }
+                                    int outv_5[8];
+                                    outv_5[0] = -1;
+                                    if (_vec_load_16[0] >= 0 && _vec_load_16[0] <= bound_2) {
+                                        outv_5[0] = _vec_load_16[0] + key_base_1;
+                                        last = spos_2 + 1;
+                                    }
+                                    outv_5[1] = -1;
+                                    if (_vec_load_16[1] >= 0 && _vec_load_16[1] <= bound_2) {
+                                        outv_5[1] = _vec_load_16[1] + key_base_1;
+                                        last = spos_2 + 1 + 1;
+                                    }
+                                    outv_5[2] = -1;
+                                    if (_vec_load_16[2] >= 0 && _vec_load_16[2] <= bound_2) {
+                                        outv_5[2] = _vec_load_16[2] + key_base_1;
+                                        last = spos_2 + 2 + 1;
+                                    }
+                                    outv_5[3] = -1;
+                                    if (_vec_load_16[3] >= 0 && _vec_load_16[3] <= bound_2) {
+                                        outv_5[3] = _vec_load_16[3] + key_base_1;
+                                        last = spos_2 + 3 + 1;
+                                    }
+                                    outv_5[4] = -1;
+                                    if (_vec_load_16[4] >= 0 && _vec_load_16[4] <= bound_2) {
+                                        outv_5[4] = _vec_load_16[4] + key_base_1;
+                                        last = spos_2 + 4 + 1;
+                                    }
+                                    outv_5[5] = -1;
+                                    if (_vec_load_16[5] >= 0 && _vec_load_16[5] <= bound_2) {
+                                        outv_5[5] = _vec_load_16[5] + key_base_1;
+                                        last = spos_2 + 5 + 1;
+                                    }
+                                    outv_5[6] = -1;
+                                    if (_vec_load_16[6] >= 0 && _vec_load_16[6] <= bound_2) {
+                                        outv_5[6] = _vec_load_16[6] + key_base_1;
+                                        last = spos_2 + 6 + 1;
+                                    }
+                                    outv_5[7] = -1;
+                                    if (_vec_load_16[7] >= 0 && _vec_load_16[7] <= bound_2) {
+                                        outv_5[7] = _vec_load_16[7] + key_base_1;
+                                        last = spos_2 + 7 + 1;
+                                    }
+                                    if (out_vec != 0) {
+                                        {
+                                            int4 _iv4 = make_int4(outv_5[0 + 0], outv_5[0 + 1], outv_5[0 + 2], outv_5[0 + 3]);
+                                            *reinterpret_cast<int4*>(indices_out + out_base + (long long)spos_2) = _iv4;
+                                        }
+                                        {
+                                            int4 _iv4 = make_int4(outv_5[4 + 0], outv_5[4 + 1], outv_5[4 + 2], outv_5[4 + 3]);
+                                            *reinterpret_cast<int4*>(indices_out + out_base + (long long)spos_2 + 4) = _iv4;
+                                        }
+                                    } else {
+                                        indices_out[out_base + (long long)spos_2] = outv_5[0];
+                                        indices_out[out_base + (long long)(spos_2 + 1)] = outv_5[1];
+                                        indices_out[out_base + (long long)(spos_2 + 2)] = outv_5[2];
+                                        indices_out[out_base + (long long)(spos_2 + 3)] = outv_5[3];
+                                        indices_out[out_base + (long long)(spos_2 + 4)] = outv_5[4];
+                                        indices_out[out_base + (long long)(spos_2 + 5)] = outv_5[5];
+                                        indices_out[out_base + (long long)(spos_2 + 6)] = outv_5[6];
+                                        indices_out[out_base + (long long)(spos_2 + 7)] = outv_5[7];
+                                    }
                                 }
-                                if (_vec_load_5[0] >= 0 && _vec_load_5[0] < num_kv) {
-                                    last = spos + 1;
+                                #pragma unroll 1
+                                for (int r = 0; r < n_full - n_batch * 4; r++) {
+                                    int spos_3 = (n_batch * 4 + r) * 128 + lane16 * 8;
+                                    int _vec_load_17[8];
+                                    {
+                                        uint32_t _iv_5_0;
+                                        uint32_t _iv_5_1;
+                                        uint32_t _iv_5_2;
+                                        uint32_t _iv_5_3;
+                                        uint32_t _iv_5_4;
+                                        uint32_t _iv_5_5;
+                                        uint32_t _iv_5_6;
+                                        uint32_t _iv_5_7;
+                                        asm volatile("ld.global.nc.L1::evict_first.L2::evict_normal.L2::256B.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                                            : "=r"(_iv_5_0), "=r"(_iv_5_1), "=r"(_iv_5_2), "=r"(_iv_5_3), "=r"(_iv_5_4), "=r"(_iv_5_5), "=r"(_iv_5_6), "=r"(_iv_5_7) : "l"((const void*)(indices + (row_base_2 + (long long)spos_3) + (0))) : "memory");
+                                        _vec_load_17[0 + 0] = (int32_t)_iv_5_0;
+                                        _vec_load_17[0 + 1] = (int32_t)_iv_5_1;
+                                        _vec_load_17[0 + 2] = (int32_t)_iv_5_2;
+                                        _vec_load_17[0 + 3] = (int32_t)_iv_5_3;
+                                        _vec_load_17[0 + 4] = (int32_t)_iv_5_4;
+                                        _vec_load_17[0 + 5] = (int32_t)_iv_5_5;
+                                        _vec_load_17[0 + 6] = (int32_t)_iv_5_6;
+                                        _vec_load_17[0 + 7] = (int32_t)_iv_5_7;
+                                    }
+                                    int outv_1[8];
+                                    outv_1[0] = -1;
+                                    if (_vec_load_17[0] >= 0 && _vec_load_17[0] <= bound_2) {
+                                        outv_1[0] = _vec_load_17[0] + key_base_1;
+                                        last = spos_3 + 1;
+                                    }
+                                    outv_1[1] = -1;
+                                    if (_vec_load_17[1] >= 0 && _vec_load_17[1] <= bound_2) {
+                                        outv_1[1] = _vec_load_17[1] + key_base_1;
+                                        last = spos_3 + 1 + 1;
+                                    }
+                                    outv_1[2] = -1;
+                                    if (_vec_load_17[2] >= 0 && _vec_load_17[2] <= bound_2) {
+                                        outv_1[2] = _vec_load_17[2] + key_base_1;
+                                        last = spos_3 + 2 + 1;
+                                    }
+                                    outv_1[3] = -1;
+                                    if (_vec_load_17[3] >= 0 && _vec_load_17[3] <= bound_2) {
+                                        outv_1[3] = _vec_load_17[3] + key_base_1;
+                                        last = spos_3 + 3 + 1;
+                                    }
+                                    outv_1[4] = -1;
+                                    if (_vec_load_17[4] >= 0 && _vec_load_17[4] <= bound_2) {
+                                        outv_1[4] = _vec_load_17[4] + key_base_1;
+                                        last = spos_3 + 4 + 1;
+                                    }
+                                    outv_1[5] = -1;
+                                    if (_vec_load_17[5] >= 0 && _vec_load_17[5] <= bound_2) {
+                                        outv_1[5] = _vec_load_17[5] + key_base_1;
+                                        last = spos_3 + 5 + 1;
+                                    }
+                                    outv_1[6] = -1;
+                                    if (_vec_load_17[6] >= 0 && _vec_load_17[6] <= bound_2) {
+                                        outv_1[6] = _vec_load_17[6] + key_base_1;
+                                        last = spos_3 + 6 + 1;
+                                    }
+                                    outv_1[7] = -1;
+                                    if (_vec_load_17[7] >= 0 && _vec_load_17[7] <= bound_2) {
+                                        outv_1[7] = _vec_load_17[7] + key_base_1;
+                                        last = spos_3 + 7 + 1;
+                                    }
+                                    if (out_vec != 0) {
+                                        {
+                                            int4 _iv4 = make_int4(outv_1[0 + 0], outv_1[0 + 1], outv_1[0 + 2], outv_1[0 + 3]);
+                                            *reinterpret_cast<int4*>(indices_out + out_base + (long long)spos_3) = _iv4;
+                                        }
+                                        {
+                                            int4 _iv4 = make_int4(outv_1[4 + 0], outv_1[4 + 1], outv_1[4 + 2], outv_1[4 + 3]);
+                                            *reinterpret_cast<int4*>(indices_out + out_base + (long long)spos_3 + 4) = _iv4;
+                                        }
+                                    } else {
+                                        indices_out[out_base + (long long)spos_3] = outv_1[0];
+                                        indices_out[out_base + (long long)(spos_3 + 1)] = outv_1[1];
+                                        indices_out[out_base + (long long)(spos_3 + 2)] = outv_1[2];
+                                        indices_out[out_base + (long long)(spos_3 + 3)] = outv_1[3];
+                                        indices_out[out_base + (long long)(spos_3 + 4)] = outv_1[4];
+                                        indices_out[out_base + (long long)(spos_3 + 5)] = outv_1[5];
+                                        indices_out[out_base + (long long)(spos_3 + 6)] = outv_1[6];
+                                        indices_out[out_base + (long long)(spos_3 + 7)] = outv_1[7];
+                                    }
                                 }
-                                if (_vec_load_5[1] >= 0 && _vec_load_5[1] < num_kv) {
-                                    last = spos + 1 + 1;
-                                }
-                                if (_vec_load_5[2] >= 0 && _vec_load_5[2] < num_kv) {
-                                    last = spos + 2 + 1;
-                                }
-                                if (_vec_load_5[3] >= 0 && _vec_load_5[3] < num_kv) {
-                                    last = spos + 3 + 1;
-                                }
-                                if (_vec_load_5[4] >= 0 && _vec_load_5[4] < num_kv) {
-                                    last = spos + 4 + 1;
-                                }
-                                if (_vec_load_5[5] >= 0 && _vec_load_5[5] < num_kv) {
-                                    last = spos + 5 + 1;
-                                }
-                                if (_vec_load_5[6] >= 0 && _vec_load_5[6] < num_kv) {
-                                    last = spos + 6 + 1;
-                                }
-                                if (_vec_load_5[7] >= 0 && _vec_load_5[7] < num_kv) {
-                                    last = spos + 7 + 1;
+                            } else {
+                                #pragma unroll 4
+                                for (int g = 0; g < n_full; g++) {
+                                    int spos_4 = g * 128 + lane16 * 8;
+                                    int _vec_load_18[8];
+                                    {
+                                        uint32_t _iv_6_0;
+                                        uint32_t _iv_6_1;
+                                        uint32_t _iv_6_2;
+                                        uint32_t _iv_6_3;
+                                        uint32_t _iv_6_4;
+                                        uint32_t _iv_6_5;
+                                        uint32_t _iv_6_6;
+                                        uint32_t _iv_6_7;
+                                        asm volatile("ld.global.nc.L1::evict_first.L2::evict_normal.L2::256B.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                                            : "=r"(_iv_6_0), "=r"(_iv_6_1), "=r"(_iv_6_2), "=r"(_iv_6_3), "=r"(_iv_6_4), "=r"(_iv_6_5), "=r"(_iv_6_6), "=r"(_iv_6_7) : "l"((const void*)(indices + (row_base_2 + (long long)spos_4) + (0))) : "memory");
+                                        _vec_load_18[0 + 0] = (int32_t)_iv_6_0;
+                                        _vec_load_18[0 + 1] = (int32_t)_iv_6_1;
+                                        _vec_load_18[0 + 2] = (int32_t)_iv_6_2;
+                                        _vec_load_18[0 + 3] = (int32_t)_iv_6_3;
+                                        _vec_load_18[0 + 4] = (int32_t)_iv_6_4;
+                                        _vec_load_18[0 + 5] = (int32_t)_iv_6_5;
+                                        _vec_load_18[0 + 6] = (int32_t)_iv_6_6;
+                                        _vec_load_18[0 + 7] = (int32_t)_iv_6_7;
+                                    }
+                                    if (_vec_load_18[0] >= 0 && _vec_load_18[0] <= bound_2) {
+                                        last = spos_4 + 1;
+                                    }
+                                    if (_vec_load_18[1] >= 0 && _vec_load_18[1] <= bound_2) {
+                                        last = spos_4 + 1 + 1;
+                                    }
+                                    if (_vec_load_18[2] >= 0 && _vec_load_18[2] <= bound_2) {
+                                        last = spos_4 + 2 + 1;
+                                    }
+                                    if (_vec_load_18[3] >= 0 && _vec_load_18[3] <= bound_2) {
+                                        last = spos_4 + 3 + 1;
+                                    }
+                                    if (_vec_load_18[4] >= 0 && _vec_load_18[4] <= bound_2) {
+                                        last = spos_4 + 4 + 1;
+                                    }
+                                    if (_vec_load_18[5] >= 0 && _vec_load_18[5] <= bound_2) {
+                                        last = spos_4 + 5 + 1;
+                                    }
+                                    if (_vec_load_18[6] >= 0 && _vec_load_18[6] <= bound_2) {
+                                        last = spos_4 + 6 + 1;
+                                    }
+                                    if (_vec_load_18[7] >= 0 && _vec_load_18[7] <= bound_2) {
+                                        last = spos_4 + 7 + 1;
+                                    }
                                 }
                             }
                             int tail0 = n_full * 128 + lane16;
@@ -3916,30 +4818,37 @@ kernel_cake_dsa_h64_nope_train_46cdc056c891876ed545(const __grid_constant__ CUte
                             #pragma unroll 1
                             for (int t = 0; t < n_tail; t++) {
                                 int pos = tail0 + t * 16;
-                                int value_4 = indices[row_base_2 + (long long)pos];
-                                if (value_4 >= 0 && value_4 < num_kv) {
+                                int value_6 = indices[row_base_2 + (long long)pos];
+                                int converted = -1;
+                                if (value_6 >= 0 && value_6 <= bound_2) {
+                                    converted = value_6 + key_base_1;
                                     last = pos + 1;
+                                }
+                                if (convert != 0) {
+                                    indices_out[out_base + (long long)pos] = converted;
                                 }
                             }
                             int part = last;
                             int _shfl_xor_0 = __shfl_xor_sync(4294901760u, part, 8);
                             int peer_1 = _shfl_xor_0;
-                            int _max_80 = ((part) > (peer_1) ? (part) : (peer_1));
-                            part = _max_80;
+                            int _max_112 = ((part) > (peer_1) ? (part) : (peer_1));
+                            part = _max_112;
                             int _shfl_xor_1 = __shfl_xor_sync(4294901760u, part, 4);
                             int peer_0 = _shfl_xor_1;
-                            int _max_81 = ((part) > (peer_0) ? (part) : (peer_0));
-                            part = _max_81;
+                            int _max_113 = ((part) > (peer_0) ? (part) : (peer_0));
+                            part = _max_113;
                             int _shfl_xor_2 = __shfl_xor_sync(4294901760u, part, 2);
                             int peer_1_1 = _shfl_xor_2;
-                            int _max_82 = ((part) > (peer_1_1) ? (part) : (peer_1_1));
-                            part = _max_82;
+                            int _max_114 = ((part) > (peer_1_1) ? (part) : (peer_1_1));
+                            part = _max_114;
                             int _shfl_xor_3 = __shfl_xor_sync(4294901760u, part, 1);
                             int peer_2 = _shfl_xor_3;
-                            int _max_83 = ((part) > (peer_2) ? (part) : (peer_2));
-                            part = _max_83;
+                            int _max_115 = ((part) > (peer_2) ? (part) : (peer_2));
+                            part = _max_115;
                             if (lane == 16) {
                                 len_cells[outer_5 & 1] = part;
+                                base_cells[outer_5 & 1] = key_base_1;
+                                bound_cells[outer_5 & 1] = bound_2;
                                 topk_length[(long long)query_4] = part;
                                 mbarrier_arrive(len_ready_addr + (outer_5 & 1) * 8);
                             }
