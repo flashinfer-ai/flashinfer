@@ -283,6 +283,12 @@ kernel_cake_dense_projection_gemm_14192244441c1003db74(const __grid_constant__ C
                     }
                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
                 }
+                #pragma unroll
+                for (int _xs = 0; _xs < 7; _xs++) {
+                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
+                    load_stage += 1;
+                    if (load_stage == 7) { load_stage = 0; _phase_mma_done ^= 1; }
+                }
             }
         }
     }
