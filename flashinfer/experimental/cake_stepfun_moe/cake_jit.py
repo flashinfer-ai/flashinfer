@@ -1137,8 +1137,12 @@ _STAGE_CONSTANTS: dict[str, dict[str, Any]] = {
     "finalize": {},
 }
 # program -> kernel symbol, for a program whose build.json entry compiles the
-# kernel source of a twin program (``kernel_<program>`` otherwise)
-_KERNEL_OVERRIDES: dict[str, str] = {}
+# kernel source of a twin program (``kernel_<program>`` otherwise): the float32-
+# scores cooperative routing program launches its bf16-scores twin's kernel (the
+# exported kernels differed only in the type of the unread ``scores`` parameter)
+_KERNEL_OVERRIDES: dict[str, str] = {
+    "cake_stepfun_moe_9a305f39c4182bc865be": "kernel_cake_stepfun_moe_85e03fcd251dde9ebf18",
+}
 
 _ROUTING_ROWS: dict[str, tuple[tuple[str, str | None], tuple[str, str, int, int]]] = {
     digest: (group, row)

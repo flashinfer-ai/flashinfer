@@ -635,6 +635,32 @@ def test_program_rows_expand_over_the_shared_argument_plans():
     assert used == set(range(len(plans)))
 
 
+def test_folded_programs_launch_the_kernel_of_their_twin():
+    """A program whose ``_KERNEL_OVERRIDES`` entry names another program's kernel is a fold of
+    twin kernels: both records share the stage, argument plan and launch shape; every
+    ``build.json`` entry of the folded program compiles the twin's kernel source next to the
+    folded program's own binding; and that binding declares and launches the twin's symbol,
+    never one of its own."""
+    libraries = cake_build.libraries_by_name()
+    for program, kernel in loader._KERNEL_OVERRIDES.items():
+        twin = kernel.removeprefix("kernel_")
+        assert twin in loader.PROGRAMS and twin != program, program
+        record, twin_record = loader.PROGRAMS[program], loader.PROGRAMS[twin]
+        assert record["unit"]["stage"] == twin_record["unit"]["stage"], program
+        assert record["arg_plan"] == twin_record["arg_plan"], program
+        assert record["launch"] == twin_record["launch"], program
+        binding_tu = f"csrc/cake_stepfun_moe/{program}_binding.cu"
+        for arch in record["arches"]:
+            entry = libraries[loader.library_name(program, arch)]
+            twin_entry = libraries[loader.library_name(twin, arch)]
+            assert entry["sources"][0] == twin_entry["sources"][0], (program, arch)
+            assert entry["sources"][1] == binding_tu, (program, arch)
+        binding = (PACKAGE_DIR / binding_tu).read_text(errors="replace")
+        assert re.search(rf'extern "C" __global__ void {kernel}\(', binding), program
+        assert f"reinterpret_cast<const void*>({kernel})" in binding, program
+        assert "kernel_" + program not in binding, program
+
+
 def _content_digest(items) -> str:
     """SHA-256 over ``items`` (``str`` or ``bytes``), each framed by its byte length as eight
     little-endian bytes: the ``closure_sha256`` definition of ``build.json``."""
