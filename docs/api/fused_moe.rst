@@ -316,6 +316,7 @@ TensorRT-LLM Fused MoE
     trtllm_fp8_per_tensor_scale_routed_moe
     trtllm_mxint4_block_scale_moe
     trtllm_mxint4_block_scale_routed_moe
+    trtllm_fused_moe_workspace_size
 
 AlphaMoE FP8 Block-Scaled MoE (SM100/SM103)
 --------------------------------------------
