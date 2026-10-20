@@ -1128,7 +1128,10 @@ def _silu_and_mul_mxfp8_experts_quantize_reference(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Reference for silu_and_mul_mxfp8_experts_quantize in a plain layout.
 
-    NaN and infinities become NaN here; the kernel quantizes them to 448.
+    Matches the kernel bit for bit on bf16 inputs, except that NaN and
+    infinities become NaN here and 448 in the kernel; on fp16 inputs a value
+    can also differ by one E4M3 step.
+
     Returns ``x_q [B, M, K]`` (fp8_e4m3fn) and ``sf [B, M, K // 32]`` (UE8M0
     bytes) for every row, without the K padding, scale swizzle or grouped GEMM
     permutation; only the first ``min(mask[i], M)`` rows of expert ``i`` match

@@ -1017,16 +1017,20 @@ def _grouped_mxfp8_scales(sf: torch.Tensor, m: int, k: int) -> torch.Tensor:
 @pytest.mark.parametrize(
     "batch_shape",
     [
-        # More experts than one warp scans at a time.
+        # As many experts as one warp scans at a time, then one more.
+        (32, 64, 128),
+        (33, 64, 128),
+        # More experts than one warp scans at a time; the last group is partial.
+        (100, 64, 128),
         (1024, 200, 128),
         # More valid rows than the grid holds at once.
         (2, 8192, 1024),
     ],
 )
-@pytest.mark.parametrize("skewed", [False, True])
+@pytest.mark.parametrize("rows_in", ["spread", "first", "last"])
 @pytest.mark.parametrize("use_silu_and_mul", [True, False])
 @torch.inference_mode()
-def test_mxfp8_experts_quantize_grid_stride(batch_shape, skewed, use_silu_and_mul):
+def test_mxfp8_experts_quantize_grid_stride(batch_shape, rows_in, use_silu_and_mul):
     """Every valid row is quantized exactly, however the rows spread over the experts."""
     _skip_unless_grouped_backend("cuda")
 
@@ -1034,13 +1038,14 @@ def test_mxfp8_experts_quantize_grid_stride(batch_shape, skewed, use_silu_and_mu
     b, m, k = batch_shape
     in_k = 2 * k if use_silu_and_mul else k
     a = torch.randn((b, m, in_k), dtype=torch.bfloat16, device="cuda") * 4
-    if skewed:
-        # Only the last expert has rows.
-        mask = torch.zeros((b,), dtype=torch.int32, device="cuda")
-        mask[-1] = m
-    else:
+    if rows_in == "spread":
         mask = torch.randint(0, m + 1, (b,), dtype=torch.int32, device="cuda")
         mask[0] = m
+        mask[2::3] = 0  # Some experts have no rows.
+    else:
+        # Only the first or the last expert has rows.
+        mask = torch.zeros((b,), dtype=torch.int32, device="cuda")
+        mask[0 if rows_in == "first" else -1] = m
 
     out, out_scale = _run_mxfp8_experts_quantize(a, mask, use_silu_and_mul)
 
@@ -1065,44 +1070,51 @@ def test_mxfp8_experts_quantize_grid_stride(batch_shape, skewed, use_silu_and_mu
     )
 
 
+@pytest.mark.parametrize("use_silu_and_mul", [True, False])
 @torch.inference_mode()
-def test_mxfp8_grouped_quantize_cuda_non_finite():
+def test_mxfp8_experts_quantize_non_finite(use_silu_and_mul):
     """NaN and infinities quantize to 448 with the scales of ``mxfp8_quantize``."""
     _skip_unless_grouped_backend("cuda")
 
     torch.manual_seed(0)
     b, m, k = 2, 128, 256
-    x = torch.randn((b, m, k), dtype=torch.bfloat16, device="cuda") * 4
-    x[0, 0, 0] = float("nan")
-    x[0, 1, 3] = float("inf")
-    x[0, 1, 9] = float("-inf")
-    x[1, 7, 200] = float("-inf")
-    x[1, 127, 255] = float("nan")
+    in_k = 2 * k if use_silu_and_mul else k
+    a = torch.randn((b, m, in_k), dtype=torch.bfloat16, device="cuda") * 4
+    # Gate values, then up values when fused.
+    a[0, 0, 0] = float("nan")
+    a[0, 1, 3] = float("inf")
+    a[0, 1, 9] = float("-inf")
+    a[1, 7, 200] = float("-inf")
+    a[1, 64, in_k - 7] = float("inf")
+    a[1, 127, in_k - 1] = float("nan")
     mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
 
-    out, out_scale = mxfp8_grouped_quantize(x, mask, backend="cuda")
+    out, out_scale = _run_mxfp8_experts_quantize(a, mask, use_silu_and_mul)
     out = out.permute(2, 0, 1).contiguous().view(torch.uint8)
     out_scale = _grouped_mxfp8_scales(out_scale, m, k)
     assert out[0, 0, 0].item() == 0x7E  # E4M3 448
     for i in range(b):
-        ref_out, ref_scale = mxfp8_quantize(x[i], is_sf_swizzled_layout=False)
+        x = silu_and_mul(a[i]) if use_silu_and_mul else a[i]
+        ref_out, ref_scale = mxfp8_quantize(x, is_sf_swizzled_layout=False)
         torch.testing.assert_close(out[i], ref_out.view(torch.uint8), rtol=0, atol=0)
         torch.testing.assert_close(
             out_scale[i], ref_scale.view(m, k // 32), rtol=0, atol=0
         )
 
 
+@pytest.mark.parametrize("b", [3, 40])
 @pytest.mark.parametrize("use_silu_and_mul", [True, False])
 @torch.inference_mode()
-def test_mxfp8_experts_quantize_mask_out_of_range(use_silu_and_mul):
+def test_mxfp8_experts_quantize_mask_out_of_range(b, use_silu_and_mul):
     """``mask`` values are clamped to ``[0, M]``: larger values select every row."""
     _skip_unless_grouped_backend("cuda")
 
     torch.manual_seed(0)
-    b, m, k = 3, 200, 160
+    m, k = 200, 160
     in_k = 2 * k if use_silu_and_mul else k
     a = torch.randn((b, m, in_k), dtype=torch.bfloat16, device="cuda")
-    mask = torch.tensor([m + 5, -3, 2**31 - 1], dtype=torch.int32, device="cuda")
+    mask_values = [m + 5, -3, 2**31 - 1] * (b // 3) + [m + 5] * (b % 3)
+    mask = torch.tensor(mask_values, dtype=torch.int32, device="cuda")
     full_mask = torch.full((b,), m, dtype=torch.int32, device="cuda")
 
     got_q, got_sf = _run_mxfp8_experts_quantize(a, mask, use_silu_and_mul)
@@ -1110,18 +1122,19 @@ def test_mxfp8_experts_quantize_mask_out_of_range(use_silu_and_mul):
     torch.cuda.synchronize()  # Surface out-of-bounds accesses.
 
     padded_k = (k + 127) // 128 * 128
-    got_q = got_q.permute(2, 0, 1).contiguous().view(torch.uint8)
-    ref_q = ref_q.permute(2, 0, 1).contiguous().view(torch.uint8)
-    got_sf = got_sf.permute(5, 2, 4, 0, 1, 3)
-    ref_sf = ref_sf.permute(5, 2, 4, 0, 1, 3)
-    for i in (0, 2):
-        torch.testing.assert_close(got_q[i], ref_q[i], rtol=0, atol=0)
-        torch.testing.assert_close(
-            _unswizzle_mxfp8_scales_128x4(got_sf[i], m, padded_k),
-            _unswizzle_mxfp8_scales_128x4(ref_sf[i], m, padded_k),
-            rtol=0,
-            atol=0,
-        )
+    selected = mask > 0
+    torch.testing.assert_close(
+        got_q.permute(2, 0, 1)[selected].view(torch.uint8),
+        ref_q.permute(2, 0, 1)[selected].view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        _grouped_mxfp8_scales(got_sf, m, padded_k)[selected],
+        _grouped_mxfp8_scales(ref_sf, m, padded_k)[selected],
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.parametrize("batch_shape", [(0, 16, 64), (2, 0, 64), (2, 16, 0)])
