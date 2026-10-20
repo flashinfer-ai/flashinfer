@@ -564,6 +564,58 @@ CASES = [
         ),
         id="decode-paged-bf16-m16-ragged",
     ),
+    # Persistent K-major prefill route: paged GQA-16 above 64 pages, paged
+    # GQA-8 at 64 pages (captured) and flat GQA-16 above 64 KV blocks, every
+    # batch with a request below the long route's 8192-query threshold.
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="paged",
+            q_lens=[700, 300],
+            kv_lens=[8320, 8300],
+            num_q_heads=16,
+            num_kv_heads=1,
+            topk=16,
+            causal=True,
+            seed=71,
+        ),
+        id="prefill-paged-bf16-gqa16-kmaj-persistent",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="paged",
+            q_lens=[900, 300],
+            kv_lens=[8192, 7000],
+            num_q_heads=16,
+            num_kv_heads=2,
+            topk=16,
+            causal=True,
+            seed=73,
+            cuda_graph=True,
+        ),
+        id="prefill-paged-bf16-gqa8-kmaj-persistent-graph",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="flat_varlen",
+            q_lens=[1024],
+            kv_lens=[8320],
+            num_q_heads=16,
+            num_kv_heads=1,
+            topk=16,
+            causal=True,
+            seed=75,
+        ),
+        id="prefill-flat-bf16-gqa16-kmaj-persistent",
+    ),
 ]
 
 
