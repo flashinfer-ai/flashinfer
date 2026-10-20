@@ -3050,6 +3050,7 @@ kernel_cake_fmha_decode_balanced_bf16(const __grid_constant__ CUtensorMap Qt, co
                 block_end_l = (int)block_end_6_4;
                 n_chunks_l = (int)n_chunks_8_4;
                 uniform_l = (int)plan_flags_12_4;
+                uniform_l = (int)plan_flags_12_4 & 1;
             }
         }
     }
