@@ -84,6 +84,9 @@ from .comm import gen_trtllm_comm_module as gen_trtllm_comm_module
 from .comm import gen_vllm_comm_module as gen_vllm_comm_module
 from .comm import gen_pcie_ipc_comm_module as gen_pcie_ipc_comm_module
 from .comm import gen_moe_alltoall_module as gen_moe_alltoall_module
+from .comm import (
+    gen_moe_ep_nvlink_one_sided_module as gen_moe_ep_nvlink_one_sided_module,
+)
 from .comm import gen_dcp_alltoall_module as gen_dcp_alltoall_module
 from .dsv3_optimizations import (
     gen_dsv3_router_gemm_module as gen_dsv3_router_gemm_module,
@@ -145,19 +148,10 @@ from .cake_kda import (
     load_cake_kda_m128_unbounded_softplus_module as load_cake_kda_m128_unbounded_softplus_module,
 )
 from .cake_fused_moe_warp_decode import (
-    CakeWarpDecodeTarget as CakeWarpDecodeTarget,
-)
-from .cake_fused_moe_warp_decode import (
     gen_cake_fused_moe_warp_decode_module as gen_cake_fused_moe_warp_decode_module,
 )
 from .cake_fused_moe_warp_decode import (
     get_cake_fused_moe_warp_decode_module as get_cake_fused_moe_warp_decode_module,
-)
-from .cake_fused_moe_warp_decode import (
-    get_cake_fused_moe_warp_decode_uri as get_cake_fused_moe_warp_decode_uri,
-)
-from .cake_fused_moe_warp_decode import (
-    load_cake_fused_moe_warp_decode_module as load_cake_fused_moe_warp_decode_module,
 )
 from .flash_kda import (
     gen_flash_kda_m64_module as gen_flash_kda_m64_module,

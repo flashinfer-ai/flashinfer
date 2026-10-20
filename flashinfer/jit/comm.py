@@ -291,11 +291,12 @@ def gen_pcie_ipc_ag_rs_module() -> JitSpec:
 
 
 def gen_ulysses_a2a_module() -> JitSpec:
-    from .cake_ulysses import generated_ulysses_spec
+    """The portable NVLink Ulysses all-to-all (``csrc/ulysses_all_to_all.cu``).
 
-    generated = generated_ulysses_spec()
-    if generated is not None:
-        return generated
+    The exported Cake programs for SM100 / SM103 live in the self-contained
+    package ``flashinfer.cake_ulysses_backend`` and are loaded by its own
+    ``cake_build`` loader, not through this spec.
+    """
     return gen_jit_spec(
         "ulysses_a2a",
         [
@@ -373,6 +374,39 @@ def gen_moe_alltoall_module(target: MoeAlltoAllTarget = "legacy") -> JitSpec:
             *arch_flags,
             "-DENABLE_BF16",
         ],
+    )
+
+
+def gen_moe_ep_nvlink_one_sided_module() -> JitSpec:
+    """NVLink one-sided MoE all-to-all behind ``flashinfer.moe_ep.NVLinkOneSidedAlltoAll``.
+
+    Includes the CFT counted-write path, which is compiled in when the CUDA
+    toolkit provides the logical-endpoint API (13.4+) and resolved from the
+    driver at runtime.
+    """
+    nv_internal = jit_env.FLASHINFER_CSRC_DIR / "nv_internal"
+    common = nv_internal / "cpp" / "common"
+    return gen_jit_spec(
+        "moe_ep_nvlink_one_sided_alltoall",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "moe_ep_nvlink_one_sided_alltoall.cu",
+            nv_internal
+            / "tensorrt_llm"
+            / "kernels"
+            / "moe"
+            / "communication"
+            / "moeAlltoAllKernels.cu",
+            common / "envUtils.cpp",
+            common / "tllmException.cpp",
+            common / "logger.cpp",
+            common / "stringUtils.cpp",
+        ],
+        extra_include_paths=[
+            str(nv_internal),
+            str(nv_internal / "include"),
+        ],
+        extra_cuda_cflags=["-DENABLE_BF16"],
+        extra_ldflags=["-lcuda"],
     )
 
 

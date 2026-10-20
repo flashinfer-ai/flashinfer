@@ -24,6 +24,8 @@ negative ``dt_bias`` so most gates sit in ``(-0.5, 0]``, wide beta logits up to
 sigmoid ~0.99, nonzero initial state) and checks both the ``recurrent_kda``
 facade (BF16 state pool) and the prepared BF16 export (FP32 state pool) against
 an FP64 token-by-token recurrence.  Non-finite output is a hard failure.
+The last section runs the prepared export at the head counts of other TP
+ranks (24, 64, 96) and on plain state pools without ``state_indices``.
 """
 
 import math
@@ -372,3 +374,229 @@ def test_prepared_bf16_export_long_bounded_rows_keep_fp32_state_carrier(
     assert str(call.schedule) == "fused_m64_independent_dvsplit_fp32_state", str(
         call.schedule
     )
+
+
+# ---------------------------------------------------------------------------
+# Head counts beyond the 12-head rank, and plain state pools.
+#
+# The prepared-path tests above and in the neighbouring files use H in
+# {1, 6, 12, 16} and always pass ``state_indices``.  The cases below run the
+# same trained statistics (the per-head tables repeat every 12 heads) through
+# the bodies that had no test: the register-inverse direct N32 row for
+# H >= 24, the SM103a-only prediction-first row, the one-wave M64 split at
+# H = 64, and the direct route without ``state_indices`` (slot i serves
+# sequence i; the serving ABI runs with ``use_state_indices=0``).  Inputs use
+# the fixed ``[B, T, H, 128]`` layout; the expected schedule and module of
+# every case are the planner's selection for that layout under the current
+# route rules, the same for 148, 152 and 160 SMs.
+# ---------------------------------------------------------------------------
+
+M64_SPLIT = (
+    "fused_m64_independent_dvsplit_fp32_state",
+    "cake_kda_bf16_5535e79c76a18330f6f1",
+)
+DIRECT_CHUNK32 = ("fused_direct_m128", "cake_kda_bf16_02c6dae5d13691ae05c3")
+DIRECT_REGISTER_INVERSE = (
+    "fused_direct_m128",
+    "cake_kda_bf16_2064d4aca94aef841cf8",
+)
+PREDICTION_FIRST = (
+    "fused_prediction_first_direct_m128",
+    "cake_kda_bf16_c410d3932af8bc84666e",
+)
+# the same two bodies writing BF16 checkpoint rows every 64 tokens
+CHECKPOINT_REGISTER_INVERSE = (
+    "fused_checkpoint_direct_m128_n32",
+    "cake_kda_bf16_2064d4aca94aef841cf8",
+)
+CHECKPOINT_PREDICTION_FIRST = (
+    "fused_checkpoint_direct_m128_n32",
+    "cake_kda_bf16_c410d3932af8bc84666e",
+)
+UNBOUNDED_CARRIER = (
+    "fused_unbounded_softplus_direct_m128_fp32_carrier",
+    "cake_kda_bf16_893740628d53688ac269",
+)
+# multi-wave grids at 256+ tokens: the register-inverse body on SM100a, the
+# prediction-first body on SM103a (its only architecture)
+DIRECT_BY_ARCH = {(10, 0): DIRECT_REGISTER_INVERSE, (10, 3): PREDICTION_FIRST}
+CHECKPOINT_BY_ARCH = {
+    (10, 0): CHECKPOINT_REGISTER_INVERSE,
+    (10, 3): CHECKPOINT_PREDICTION_FIRST,
+}
+
+
+def _assert_selected(selected, expected):
+    if isinstance(expected, dict):
+        expected = expected[torch.cuda.get_device_capability()]
+    assert selected == expected, f"selected {selected}, expected {expected}"
+
+
+def _run_fixed_layout_export(inp, *, batch, heads, lower_bound, indexed, checkpoints):
+    """Prepared export on the fixed ``[B, T, H, 128]`` layout, FP32 in-place pool.
+
+    Returns the selected ``(schedule, module)``, the output, the pool rows the
+    call owns (indexed, or slot == sequence) and the checkpoint arguments.
+    """
+    tokens = inp["q"].shape[1] // batch
+
+    def fixed(t):
+        return t.view(batch, tokens, *t.shape[2:])
+
+    if indexed:
+        indices = torch.arange(batch, device="cuda", dtype=torch.int32) + 1
+        rows = indices.long()
+    else:
+        indices = None
+        rows = torch.arange(batch, device="cuda")
+    pool = torch.zeros(
+        (batch + 2 if indexed else batch, heads, HEAD_DIM, HEAD_DIM), device="cuda"
+    )
+    pool[rows] = inp["state"]
+    out = torch.empty(
+        (batch, tokens, heads, HEAD_DIM), device="cuda", dtype=torch.bfloat16
+    )
+    kwargs = {}
+    if checkpoints:
+        per_sequence = (tokens + 63) // 64
+        kwargs = dict(
+            state_checkpoints=torch.empty(
+                (batch * per_sequence, heads, HEAD_DIM, HEAD_DIM),
+                device="cuda",
+                dtype=torch.bfloat16,
+            ),
+            checkpoint_cu_starts=per_sequence
+            * torch.arange(batch + 1, device="cuda", dtype=torch.int64),
+            checkpoint_every_n_tokens=64,
+        )
+    call = prepare_bf16_kda_prefill(
+        fixed(inp["q"]),
+        fixed(inp["k"]),
+        fixed(inp["v"]),
+        fixed(inp["g"]),
+        fixed(inp["beta"]),
+        A_log=inp["A_log"],
+        dt_bias=inp["dt_bias"],
+        out=out,
+        initial_state=pool,
+        final_state=pool,
+        scale=None,
+        lower_bound=lower_bound,
+        state_indices=indices,
+        beta_is_logit=True,
+        **kwargs,
+    )
+    selected = (str(call.schedule), call.module.name)
+    try:
+        call.launch()
+        torch.cuda.synchronize()
+    finally:
+        call.close()
+    return selected, out, pool[rows], kwargs
+
+
+def _check_against_fp64(inp, reference, out, final, kwargs):
+    expected_out, expected_final = reference
+    _check("output", out.reshape(expected_out.shape), expected_out)
+    _check("final_state", final, expected_final)
+    if kwargs:
+        first = kwargs["state_checkpoints"][kwargs["checkpoint_cu_starts"][:-1]]
+        _check("checkpoint0", first, inp["state"].bfloat16().double(), tol=1e-6)
+
+
+HEAD_COUNT_CASES = [
+    # one wave on every SM count (2 * B * H <= 148): the M64 value split
+    pytest.param(1, 64, 512, False, 4420, M64_SPLIT, id="bs1_h64_t512"),
+    pytest.param(2, 24, 256, True, 4421, M64_SPLIT, id="bs2_h24_t256_cp64"),
+    # sequences under 256 tokens: the plain chunk-32 direct body
+    pytest.param(2, 64, 128, False, 4422, DIRECT_CHUNK32, id="bs2_h64_t128"),
+    # multi-wave grids at 256+ tokens
+    pytest.param(4, 24, 1024, False, 4423, DIRECT_BY_ARCH, id="bs4_h24_t1024"),
+    pytest.param(2, 64, 1024, False, 4424, DIRECT_BY_ARCH, id="bs2_h64_t1024"),
+    pytest.param(1, 96, 1024, False, 4425, DIRECT_BY_ARCH, id="bs1_h96_t1024"),
+    pytest.param(2, 64, 512, True, 4426, CHECKPOINT_BY_ARCH, id="bs2_h64_t512_cp64"),
+]
+
+
+@pytest.mark.parametrize(
+    ("batch", "heads", "tokens", "checkpoints", "seed", "expected"),
+    HEAD_COUNT_CASES,
+)
+def test_prepared_bf16_export_head_counts_match_fp64_recurrence(
+    batch, heads, tokens, checkpoints, seed, expected
+):
+    inp = trained_gate_inputs(lengths=(tokens,) * batch, heads=heads, seed=seed)
+    selected, out, final, kwargs = _run_fixed_layout_export(
+        inp,
+        batch=batch,
+        heads=heads,
+        lower_bound=LOWER_BOUND,
+        indexed=True,
+        checkpoints=checkpoints,
+    )
+    _assert_selected(selected, expected)
+    _check_against_fp64(inp, fp64_reference(inp), out, final, kwargs)
+
+
+PLAIN_POOL_CASES = [
+    # the direct route on a pool with one slot per sequence
+    pytest.param(
+        8,
+        16,
+        1024,
+        LOWER_BOUND,
+        False,
+        4440,
+        DIRECT_REGISTER_INVERSE,
+        id="bs8_h16_t1024",
+    ),
+    pytest.param(
+        2, 64, 512, LOWER_BOUND, False, 4441, DIRECT_BY_ARCH, id="bs2_h64_t512"
+    ),
+    pytest.param(
+        4, 24, 256, LOWER_BOUND, True, 4442, CHECKPOINT_BY_ARCH, id="bs4_h24_t256_cp64"
+    ),
+    # the one-wave split reads the pool rows directly
+    pytest.param(2, 24, 512, LOWER_BOUND, False, 4443, M64_SPLIT, id="bs2_h24_t512"),
+    # unbounded softplus gate: the FP32-carrier body (no FP64 reference here;
+    # the indexed call is the oracle)
+    pytest.param(
+        1, 16, 1024, None, False, 4444, UNBOUNDED_CARRIER, id="bs1_h16_t1024_unbounded"
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("batch", "heads", "tokens", "lower_bound", "checkpoints", "seed", "expected"),
+    PLAIN_POOL_CASES,
+)
+def test_prepared_bf16_export_without_state_indices_matches_indexed_call(
+    batch, heads, tokens, lower_bound, checkpoints, seed, expected
+):
+    """``state_indices=None`` runs the body of the indexed call bit for bit."""
+    inp = trained_gate_inputs(lengths=(tokens,) * batch, heads=heads, seed=seed)
+    reference = fp64_reference(inp) if lower_bound == LOWER_BOUND else None
+    runs = {}
+    for indexed in (True, False):
+        selected, out, final, kwargs = _run_fixed_layout_export(
+            inp,
+            batch=batch,
+            heads=heads,
+            lower_bound=lower_bound,
+            indexed=indexed,
+            checkpoints=checkpoints,
+        )
+        _assert_selected(selected, expected)
+        assert torch.isfinite(out).all() and torch.isfinite(final).all()
+        if reference is not None:
+            _check_against_fp64(inp, reference, out, final, kwargs)
+        runs[indexed] = (out, final, kwargs.get("state_checkpoints"))
+    for name, plain, indexed in zip(
+        ("out", "final_state", "checkpoints"), runs[False], runs[True], strict=True
+    ):
+        if plain is None:
+            continue
+        # bit patterns, as the plan-cache rebind tests compare them
+        assert torch.equal(plain.view(torch.uint8), indexed.view(torch.uint8)), (
+            f"{name} differs between the plain and the indexed call"
+        )

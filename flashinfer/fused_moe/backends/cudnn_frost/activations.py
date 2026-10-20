@@ -25,11 +25,12 @@ ACTIVATIONS = {
     "silu": SiLU,
     "identity": Identity,
 }
+_DEFAULT_ACTIVATIONS = {name: cls() for name, cls in ACTIVATIONS.items()}
 
 
 def activation_name(activation):
     for name, cls in ACTIVATIONS.items():
-        if type(activation) is cls and activation == cls():
+        if type(activation) is cls and activation == _DEFAULT_ACTIVATIONS[name]:
             return name
     raise NotImplementedError(
         "cuDNN Frost selected sources require default activation parameters; "
@@ -44,4 +45,4 @@ def contract_activation(contract):
 
 
 def is_gated(name):
-    return ACTIVATIONS[name]().is_gated
+    return _DEFAULT_ACTIVATIONS[name].is_gated

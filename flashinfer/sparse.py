@@ -1701,11 +1701,11 @@ class VariableBlockSparseAttentionWrapper:
             per query block; small selections (at most 6 blocks per query block and a
             grid that fits one wave) route to a one-CTA-per-query-block kernel with the
             plan passed in the kernel parameter bank, everything else to the persistent
-            kernel), or ``cake_cute`` (the same kernels and planner, built from their
-            CuTe DSL rendering; needs the optional ``nvidia-cutlass-dsl`` package).
-            Defaults to ``auto``. Automatic selection never selects ``cake`` or
-            ``cake_cute``.  If set to ``auto``, the function will automatically choose the
-            backend based on the device architecture and kernel availability.
+            kernel).  ``cake_cute`` is accepted as an alias of ``cake`` (the name of
+            its former CuTe DSL build).  Defaults to ``auto``. Automatic selection
+            never selects ``cake``.  If set to ``auto``, the function will
+            automatically choose the backend based on the device architecture and
+            kernel availability.
         """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
@@ -1713,11 +1713,14 @@ class VariableBlockSparseAttentionWrapper:
             float_workspace_buffer.numel() * float_workspace_buffer.element_size()
         )
         self._cake_vsa_sm90_plan: Optional[Any] = None
-        if backend in ("cake", "cake_cute"):
-            # The Cake SM90 routes consume the caller's block mask directly and
-            # never invoke the generic sparse planner: skip its per-wrapper
-            # 8 MiB device/host workspaces.  ``cake_cute`` runs the same
-            # kernels built from their CuTe DSL rendering.
+        if backend == "cake_cute":
+            # Alias kept for callers of the removed CuTe DSL build of the same
+            # kernels.
+            backend = "cake"
+        if backend == "cake":
+            # The Cake SM90 route consumes the caller's block mask directly and
+            # never invokes the generic sparse planner: skip its per-wrapper
+            # 8 MiB device/host workspaces.
             self._backend = backend
             return
         self._int_workspace_buffer = torch.empty(
@@ -1853,7 +1856,7 @@ class VariableBlockSparseAttentionWrapper:
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = q_data_type
 
-        if self._backend in ("cake", "cake_cute"):
+        if self._backend == "cake":
             from .cake_vsa_sm90 import create_plan
 
             if self._cake_vsa_sm90_plan is not None:
@@ -1875,7 +1878,6 @@ class VariableBlockSparseAttentionWrapper:
                 q_data_type=q_data_type,
                 kv_data_type=kv_data_type,
                 non_blocking=non_blocking,
-                engine="cute" if self._backend == "cake_cute" else "cuda",
             )
             self._sm_scale = self._cake_vsa_sm90_plan.sm_scale
             return
@@ -2119,12 +2121,12 @@ class VariableBlockSparseAttentionWrapper:
             * The attention output, shape: ``[num_qo_heads, qo_len, head_dim]``.
             * The logsumexp of the attention logits, shape: ``[num_qo_heads, qo_len]``.
 
-            For ``backend="cake"`` / ``"cake_cute"`` the output follows the same DPS ABI
+            For ``backend="cake"`` the output follows the same DPS ABI
             (``out`` is ``[H*M, 1, head_dim]``) and the return value is the HND view
             ``[H, M, head_dim]``; ``out`` must be contiguous and must not overlap
             ``q``/``k``/``v``.
         """
-        if self._backend in ("cake", "cake_cute"):
+        if self._backend == "cake":
             if self._cake_vsa_sm90_plan is None:
                 raise RuntimeError("Call plan() successfully before run()")
             return self._cake_vsa_sm90_plan.run(

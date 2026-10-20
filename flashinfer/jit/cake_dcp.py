@@ -122,6 +122,10 @@ def _get_dcp_sources(
 # world and (split-KV families) the split count are defined on the compile line
 # (``-DNAME=value``), so one module per program, target and constant set.  The
 # program name is the delivered-text identity the exporter assigned.
+# The programs of a family compile one folded kernel source
+# (``cuda/dcp_spec/<family>_kernel.cu``; fp8_d256 one per architecture) and one
+# folded binding source; the ``-DCAKE_FMHA_DCP_*`` values in a program's
+# ``compile_flags`` select its text (its kernel symbol stays its own).
 
 DcpStaticFamily = Literal["bf16_v1", "bf16_v4", "fp8_d128", "fp8_d256"]
 DCP_STATIC_FAMILIES: tuple[str, ...] = ("bf16_v1", "bf16_v4", "fp8_d128", "fp8_d256")
@@ -246,9 +250,10 @@ def _load_dcp_spec_static_module(
 # ---------------------------------------------------------------------------
 #
 # Each family ships shape-independent programs for both architectures
-# (``cuda/dcp_spec/<family>/kernel.cu``, or one ``kernel_<key><value>.cu`` per
-# program of a family with ``program_variants``; the shared-base prologue is
-# switched by ``__CUDA_ARCH__``).  Its 32- and 64-row packed instances are the
+# (``cuda/dcp_spec/<family>/kernel.cu``; a family with ``program_variants``
+# folds its programs into that one source and ``-DCAKE_FMHA_DCP_<KEY>=<value>``
+# selects the program's text; the shared-base prologue is switched by
+# ``__CUDA_ARCH__``).  Its 32- and 64-row packed instances are the
 # manifest members' ``defines`` (``-DN_ROWS=32`` / ``64``), selected by the
 # packed-row tile the request's speculative rows need; batch, heads, lengths,
 # rank and world are runtime kernel arguments.
@@ -272,8 +277,9 @@ def dcp_balanced_program_variants(family: str) -> Optional[Mapping[str, Any]]:
     """The ``program_variants`` block of a balanced family, or ``None`` when the family ships one program.
 
     A family with program variants ships one traced program per value of its
-    selector ``key`` (each a ``-DN_ROWS`` body of its own) and the host selects
-    the program from launch metadata (:func:`flashinfer.cake_dcp.dcp_balanced_program`).
+    selector ``key`` (folded into one source, ``-DCAKE_FMHA_DCP_<KEY>`` selects
+    the program's text) and the host selects the program from launch metadata
+    (:func:`flashinfer.cake_dcp.dcp_balanced_program`).
     """
 
     route = get_dcp_spec_registry()["balanced_routes"].get(family)
@@ -312,6 +318,18 @@ def _balanced_selector(
     if variants is not None:
         selector[str(variants["key"])] = int(program)  # type: ignore[arg-type]
     return selector
+
+
+def _balanced_program_defines(family: str, program: Optional[int]) -> list[str]:
+    """``-DCAKE_FMHA_DCP_<KEY>=<program>`` for a family with ``program_variants``.
+
+    Its programs share one folded source; the define selects the program's text.
+    """
+
+    variants = dcp_balanced_program_variants(family)
+    if variants is None or program is None:
+        return []
+    return [f"-DCAKE_FMHA_DCP_{str(variants['key']).upper()}={int(program)}"]
 
 
 def get_dcp_spec_balanced_uri(
@@ -379,6 +397,7 @@ def gen_dcp_spec_balanced_module(
         extra_cuda_cflags=[
             *_DCP_SPEC_NVCC_FLAGS[target],
             *(f"-D{name}={value}" for name, value in sorted(defines.items())),
+            *_balanced_program_defines(family, program),
             f"-DCAKE_FMHA_DCP_BALANCED_LAUNCH={manifest_family['launch_binding']}",
         ],
         extra_include_paths=[csrc_dir, jit_env.FLASHINFER_CSRC_DIR],

@@ -51,6 +51,7 @@ from ..cute_dsl_primitives import (
     store_lamport_sentinel_u32x4,
     store_shared_cluster_f32,
 )
+from ..static_fp8_epilogue import store_rmsnorm_output
 
 LAMPORT_GENERATIONS = 3
 NEXT_STAGE = 0
@@ -746,9 +747,6 @@ class _LamportResidualRMSNormDeviceKernel:
         self.weight_bias = weight_bias
         self.add_residual = add_residual
         self.write_residual_output = write_residual_output
-        # When False the collective stops after the Lamport reduce (+ residual)
-        # and the cluster sum-of-squares, its barrier and the norm store are
-        # never emitted.
         self.apply_rms_norm = apply_rms_norm
         self.enable_pdl = enable_pdl
         self.fragments = hidden // VEC_BF16
@@ -769,6 +767,8 @@ class _LamportResidualRMSNormDeviceKernel:
         gamma: cute.Tensor,
         residual_output: cute.Tensor,
         norm_output: cute.Tensor,
+        norm_output_bf16: cute.Tensor | None,
+        output_scale: cute.Tensor | None,
         stage_state: cute.Tensor,
         m: Int32,
         stream: cuda.CUstream,
@@ -779,6 +779,8 @@ class _LamportResidualRMSNormDeviceKernel:
             gamma,
             residual_output,
             norm_output,
+            norm_output_bf16,
+            output_scale,
             stage_state,
         ).launch(
             grid=(m, self.cluster_size, 1),
@@ -797,6 +799,8 @@ class _LamportResidualRMSNormDeviceKernel:
         gamma: cute.Tensor,
         residual_output: cute.Tensor,
         norm_output: cute.Tensor,
+        norm_output_bf16: cute.Tensor | None,
+        output_scale: cute.Tensor | None,
         stage_state: cute.Tensor,
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
@@ -805,6 +809,11 @@ class _LamportResidualRMSNormDeviceKernel:
         rank_lane = tidx % self.rank_lanes
         group = tidx // self.rank_lanes
         base_fragment = cluster_rank * self.groups_per_cta + group
+        if cutlass.const_expr(self.apply_rms_norm):
+            # Every peer must have started before the RMS partial sums are
+            # stored into its shared memory; the matching wait sits just
+            # before that first remote store.
+            cute.arch.cluster_arrive_relaxed()
 
         prenorm_fragments = cute.make_rmem_tensor(
             cute.make_layout(
@@ -836,15 +845,16 @@ class _LamportResidualRMSNormDeviceKernel:
             fragment = base_fragment + trip * self.fragment_stride
             if fragment < self.fragments and rank_lane == 0:
                 gamma_element = Int64(fragment) * VEC_BF16
-                gamma_pointer = cute.make_ptr(
-                    BFloat16,
-                    (gamma.iterator + gamma_element).llvm_ptr,
-                    cute.AddressSpace.gmem,
-                    assumed_align=16,
-                )
-                gamma_fragments[trip, None].store(
-                    packed_u32x4_to_bf16x8(load_global_u32x4(gamma_pointer))
-                )
+                if cutlass.const_expr(self.apply_rms_norm):
+                    gamma_pointer = cute.make_ptr(
+                        BFloat16,
+                        (gamma.iterator + gamma_element).llvm_ptr,
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    gamma_fragments[trip, None].store(
+                        packed_u32x4_to_bf16x8(load_global_u32x4(gamma_pointer))
+                    )
                 if cutlass.const_expr(self.add_residual):
                     residual_element = Int64(token) * self.hidden + gamma_element
                     residual_pointer = cute.make_ptr(
@@ -953,11 +963,12 @@ class _LamportResidualRMSNormDeviceKernel:
                         Int64((contribution_mailbox.iterator + source_element).toint())
                     )
 
-        thread_sum = Float32(0.0)
-        for trip in cutlass.range_constexpr(self.trips):
-            fragment = base_fragment + trip * self.fragment_stride
-            if fragment < self.fragments and rank_lane == 0:
-                if cutlass.const_expr(self.apply_rms_norm):
+        # Without the norm, the reduced sum in residual_output is the result.
+        if cutlass.const_expr(self.apply_rms_norm):
+            thread_sum = Float32(0.0)
+            for trip in cutlass.range_constexpr(self.trips):
+                fragment = base_fragment + trip * self.fragment_stride
+                if fragment < self.fragments and rank_lane == 0:
                     values = prenorm_fragments[trip, None].load().to(Float32)
                     thread_sum = thread_sum + (values * values).reduce(
                         cute.ReductionOp.ADD,
@@ -965,18 +976,15 @@ class _LamportResidualRMSNormDeviceKernel:
                         reduction_profile=0,
                     )
 
-        smem = cutlass.utils.SmemAllocator()
-        warp_sums = smem.allocate_array(Float32, self.warps)
-        cluster_sums = smem.allocate_array(Float32, self.cluster_size)
-        if cutlass.const_expr(self.apply_rms_norm):
+            smem = cutlass.utils.SmemAllocator()
+            warp_sums = smem.allocate_array(Float32, self.warps)
+            cluster_sums = smem.allocate_array(Float32, self.cluster_size)
             cta_sum = _group_leader_block_sum(
                 thread_sum,
                 warp_sums,
                 self.warps,
                 self.rank_lanes,
             )
-            # Peer CTAs must exist before accessing their distributed shared memory.
-            cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
             if tidx < self.cluster_size:
                 local_slot = cluster_sums + cluster_rank
@@ -1009,7 +1017,10 @@ class _LamportResidualRMSNormDeviceKernel:
                     output_element = (
                         Int64(token) * self.hidden + Int64(fragment) * VEC_BF16
                     )
-                    store_global_u32x4(
-                        Int64((norm_output.iterator + output_element).toint()),
+                    store_rmsnorm_output(
                         bf16x8_to_packed_u32x4(result),
+                        norm_output,
+                        Int64(output_element),
+                        output_scale,
+                        norm_output_bf16,
                     )

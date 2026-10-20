@@ -123,6 +123,12 @@ CAKE_KDA_DECODE_VARIANT_METADATA: dict[
     ),
 }
 
+# The four direct T=1 schedules share one frozen body. The rendered binding
+# defines CAKE_KDA_DECODE_VALUE_SPLIT, CAKE_KDA_DECODE_WARPS_PER_CTA and
+# CAKE_KDA_DECODE_LAUNCH_THREADS before it includes the body, which selects
+# the split- and warp-specific lines from them.
+CAKE_KDA_DECODE_BODY_FILE = "cake_kda_decode_d128_t1_unbounded_softplus_direct.cu"
+
 
 def get_cake_kda_decode_uri(
     variant: CakeKDADecodeVariant, target: CakeKDADecodeTarget
@@ -141,14 +147,11 @@ def get_cake_kda_decode_uri(
     return f"cake_kda_decode_{variant}_{target}"
 
 
-def _get_binding_cu(
-    variant: CakeKDADecodeVariant,
-    metadata: CakeKDADecodeVariantMetadata,
-) -> str:
-    """Render the generic binding translation unit for one frozen body."""
+def _get_binding_cu(metadata: CakeKDADecodeVariantMetadata) -> str:
+    """Render the generic binding translation unit for one frozen schedule."""
 
     defines: list[tuple[str, str | int]] = [
-        ("CAKE_KDA_DECODE_BODY_FILE", f'"cake_kda_decode_{variant}.cu"'),
+        ("CAKE_KDA_DECODE_BODY_FILE", f'"{CAKE_KDA_DECODE_BODY_FILE}"'),
         ("CAKE_KDA_DECODE_HEAD_DIM", metadata.head_dim),
         ("CAKE_KDA_DECODE_TOKENS", metadata.tokens),
         ("CAKE_KDA_DECODE_GATE_KIND", metadata.gate_kind),
@@ -174,7 +177,7 @@ def gen_cake_kda_decode_module(
     """
 
     csrc_dir = _get_csrc_dir()
-    body = csrc_dir / f"cake_kda_decode_{variant}.cu"
+    body = csrc_dir / CAKE_KDA_DECODE_BODY_FILE
     if not body.exists():
         raise FileNotFoundError(f"frozen CakeKDA decode body source not found: {body}")
     binding_header = csrc_dir / "cake_kda_decode_binding.cuh"
@@ -186,7 +189,7 @@ def gen_cake_kda_decode_module(
     metadata = CAKE_KDA_DECODE_VARIANT_METADATA[variant]
     uri = get_cake_kda_decode_uri(variant, target)
     binding = jit_env.FLASHINFER_GEN_SRC_DIR / uri / "cake_kda_decode_binding.cu"
-    write_if_different(binding, _get_binding_cu(variant, metadata))
+    write_if_different(binding, _get_binding_cu(metadata))
 
     spec = gen_kda_jit_spec(
         name=uri,
@@ -224,6 +227,7 @@ def get_cake_kda_decode_module(
 
 
 __all__ = [
+    "CAKE_KDA_DECODE_BODY_FILE",
     "CAKE_KDA_DECODE_DIRECT_VARIANTS",
     "CAKE_KDA_DECODE_VARIANT_METADATA",
     "CAKE_KDA_DECODE_VARIANTS",

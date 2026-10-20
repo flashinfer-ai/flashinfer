@@ -21,52 +21,57 @@ limitations under the License.
 # registered generated programs and skip otherwise.  Opt-in heavy variant:
 # ``FLASHINFER_CAKE_DSA_INDEXER_FULL=1`` runs the recorded packed key geometry
 # through the FP64 reference (minutes on B200).
+#
+# This suite exercises the package alone: it names the package once, through
+# ``tests.test_helpers.cake_package``, and imports nothing else from flashinfer,
+# so a build that vendors the package under another import path runs it
+# unchanged after pointing that table entry at its package.  The flashinfer
+# public entry point (``flashinfer.dsa_indexer``) and its experimental-API
+# warning contract are covered by ``test_cake_dsa_indexer_api.py``.
 
-import contextlib
 import os
-import warnings
+import re
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
-from flashinfer.api_logging import ExperimentalWarning
-from flashinfer.experimental.cake_dsa_indexer import cake_backend, cake_jit, cake_policy
-from flashinfer.experimental.cake_dsa_indexer.cake_backend import (
-    ABI_CONTRACT,
-    CONTRACT_SCALARS,
-    CONTRACT_TENSORS,
-    HEAD_DIM,
-    MAX_TOP_K,
-    NUM_HEADS,
-    SUPPORTED_COMPUTE_CAPABILITIES,
-    ZERO_SIGN_POLICIES,
-    arch_for,
-    bind_program,
-    dsa_indexer_workspace_size,
-    generated_program_available,
-    plan_dsa_indexer_topk,
-    policy_for,
-    prepare_dsa_indexer_topk,
-    program_for,
-    record_zero_sign_policy,
-    validate_dsa_indexer_inputs,
-    visible_key_count,
-    visible_key_counts,
-)
-from flashinfer.experimental.cake_dsa_indexer.cake_policy import (
-    MERGE_KEY,
-    POLICY_FIELDS,
-    DispatchPolicy,
-    finalize_grid,
-    finalize_key,
-    scan_key,
-    select_program,
-    stage_slug,
-)
 
-from tests.test_helpers import cake_dsa_indexer_program_levers as levers
 from tests.test_helpers import cake_dsa_indexer_reference as ref
+from tests.test_helpers.cake_package import cake_package
+
+cake_backend = cake_package("cake_dsa_indexer", "cake_backend")
+cake_build = cake_package("cake_dsa_indexer", "cake_build")
+cake_jit = cake_package("cake_dsa_indexer", "cake_jit")
+cake_policy = cake_package("cake_dsa_indexer", "cake_policy")
+ABI_CONTRACT = cake_backend.ABI_CONTRACT
+CONTRACT_SCALARS = cake_backend.CONTRACT_SCALARS
+CONTRACT_TENSORS = cake_backend.CONTRACT_TENSORS
+HEAD_DIM = cake_backend.HEAD_DIM
+MAX_TOP_K = cake_backend.MAX_TOP_K
+NUM_HEADS = cake_backend.NUM_HEADS
+SUPPORTED_COMPUTE_CAPABILITIES = cake_backend.SUPPORTED_COMPUTE_CAPABILITIES
+ZERO_SIGN_POLICIES = cake_backend.ZERO_SIGN_POLICIES
+arch_for = cake_backend.arch_for
+bind_program = cake_backend.bind_program
+dsa_indexer_workspace_size = cake_backend.dsa_indexer_workspace_size
+generated_program_available = cake_backend.generated_program_available
+plan_dsa_indexer_topk = cake_backend.plan_dsa_indexer_topk
+policy_for = cake_backend.policy_for
+prepare_dsa_indexer_topk = cake_backend.prepare_dsa_indexer_topk
+program_for = cake_backend.program_for
+record_zero_sign_policy = cake_backend.record_zero_sign_policy
+validate_dsa_indexer_inputs = cake_backend.validate_dsa_indexer_inputs
+visible_key_count = cake_backend.visible_key_count
+visible_key_counts = cake_backend.visible_key_counts
+MERGE_KEY = cake_policy.MERGE_KEY
+POLICY_FIELDS = cake_policy.POLICY_FIELDS
+DispatchPolicy = cake_policy.DispatchPolicy
+finalize_grid = cake_policy.finalize_grid
+finalize_key = cake_policy.finalize_key
+scan_key = cake_policy.scan_key
+select_program = cake_policy.select_program
+stage_slug = cake_policy.stage_slug
 
 FULL = os.environ.get("FLASHINFER_CAKE_DSA_INDEXER_FULL", "0") not in (
     "",
@@ -190,13 +195,6 @@ def _require_program():
         pytest.skip("generated DSA indexer programs not registered for this device")
 
 
-@contextlib.contextmanager
-def _quiet_experimental():
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        yield
-
-
 def _run(inputs: ref.IndexerInputs, **extra):
     out = cake_backend.dsa_indexer_topk(
         inputs.q,
@@ -256,12 +254,6 @@ def _independent_membership_check(
 # ---------------------------------------------------------------------------
 
 
-def test_public_api_is_marked_experimental():
-    from flashinfer.dsa_indexer import dsa_indexer_topk
-
-    assert dsa_indexer_topk.is_experimental
-
-
 def test_registry_records_are_well_formed():
     if not cake_jit.PROGRAM_KEYS:
         # placeholder registry: every architecture reports the missing programs by name
@@ -296,17 +288,24 @@ def test_registry_records_are_well_formed():
                     or key in CONTRACT_SCALARS
                     or key in ("num_queries", "num_keys")
                 ), (role, arg)
-    root = cake_jit.__file__.rsplit("/", 1)[0] + "/csrc"
+    # build.json (``cake_build``) is the only record of what to compile; the registry names its
+    # entries ``<library>_<arch>``
+    package = cake_jit.__file__.rsplit("/", 1)[0]
+    manifest = cake_build.manifest()
+    libraries = {entry["name"]: entry for entry in manifest["libraries"]}
+    assert len(libraries) == len(manifest["libraries"])  # names unique
+    assert set(cake_jit.ARCHES) <= set(manifest["arch_flags"])
     for name, record in cake_jit.PROGRAMS.items():
         assert record["role"] in cake_jit.STAGES, name
         assert record["arches"] and set(record["arches"]) <= set(cake_jit.ARCHES), name
-        assert all(
-            os.path.isfile(os.path.join(root, src)) for src in record["sources"]
-        ), name
-        assert (
-            len(record["launch"]["block"]) == 3
-            and len(record["launch"]["cluster"]) == 3
-        ), name
+        assert record["library"] == name
+        for arch in record["arches"]:
+            entry = libraries[f"{record['library']}_{arch}"]
+            assert entry["arch"] == arch, name
+            assert entry["sources"] and all(
+                os.path.isfile(os.path.join(package, src)) for src in entry["sources"]
+            ), name
+            assert len(entry["closure_sha256"]) == 64, name
     for arch, keys in cake_jit.PROGRAM_KEYS.items():
         assert arch in cake_jit.ARCHES
         policy = policy_for(arch)
@@ -360,14 +359,6 @@ def test_registry_records_are_well_formed():
             assert arch in record["arches"], (arch, key, name)
             assert record["role"] == key.split(":", 1)[0], (arch, key, name)
             assert stage_slug(key).isidentifier(), key
-            if key.startswith("scan:pair_"):
-                assert record["launch"]["cluster"] == [2, 1, 1], (arch, key)
-        assert set(levers.PROGRAM_LEVERS[arch]) == set(scan_keys), arch
-        fields = {frozenset(record) for record in levers.PROGRAM_LEVERS[arch].values()}
-        assert len(fields) == 1, arch  # one lever record shape per architecture
-        assert {"kind", "block_q", "tile_unroll", "snake", "sample_fit"} <= next(
-            iter(fields)
-        ), arch
         for top_k in (1, 256, 1024, 2048, 4096):
             assert finalize_key(policy.finalize_threads_for(top_k)) in keys, (
                 arch,
@@ -420,6 +411,160 @@ def test_registry_records_are_well_formed():
                     ), (arch, top_k, num_keys, segments, bound, bulk_form)
         # the merge program is one text: every architecture registers the same merge program name
         assert cake_jit.PROGRAMS[keys[MERGE_KEY]]["role"] == "merge"
+
+
+_PROGRAM_KERNEL_FLAG = "-DCAKE_PROGRAM_KERNEL="
+_PROGRAM_KERNEL_DEFAULT = "#define CAKE_PROGRAM_KERNEL "
+
+
+def test_shared_kernel_sources_keep_distinct_symbols():
+    # Programs that differ only in their constants (scan lever twins, finalize
+    # groups) build one kernel translation unit: the program whose source it is
+    # names its symbol through the file's ``CAKE_PROGRAM_KERNEL`` default, every
+    # other entry names its own symbol on the compile line.  All libraries of one
+    # architecture load into one process, so every entry must still produce
+    # ``kernel_<program>``.
+    package = cake_jit.__file__.rsplit("/", 1)[0]
+    symbols = {}
+    for entry in cake_build.manifest()["libraries"]:
+        name, arch = entry["name"], entry["arch"]
+        assert name.endswith(f"_{arch}"), name
+        program = name[: -len(arch) - 1]
+        kernel_source = entry["sources"][0]
+        assert kernel_source.endswith("_kernel.cu"), (name, kernel_source)
+        with open(os.path.join(package, kernel_source)) as source:
+            defaults = [
+                line[len(_PROGRAM_KERNEL_DEFAULT) :].strip()
+                for line in source
+                if line.startswith(_PROGRAM_KERNEL_DEFAULT)
+            ]
+        flags = [f for f in entry["nvcc_flags"] if f.startswith(_PROGRAM_KERNEL_FLAG)]
+        assert len(flags) <= 1 and len(defaults) <= 1, (name, flags, defaults)
+        if program in kernel_source:
+            # the file's own program: a default, when present, names its own symbol
+            assert defaults in ([], [f"kernel_{program}"]), (name, defaults)
+        else:
+            # another program's translation unit: the symbol comes from the compile line
+            assert flags, (name, kernel_source)
+        if flags:
+            symbol = flags[0][len(_PROGRAM_KERNEL_FLAG) :]
+        else:
+            symbol = defaults[0] if defaults else f"kernel_{program}"
+        assert symbol == f"kernel_{program}", (name, symbol)
+        symbols.setdefault(program, set()).add(symbol)
+    assert set(symbols) == set(cake_jit.PROGRAMS)
+    assert len({s for group in symbols.values() for s in group}) == len(symbols)
+
+
+_PROGRAM_SHIM_FLAG = "-DCAKE_PROGRAM_SHIM="
+_PROGRAM_SHIM_DEFAULT = "#define CAKE_PROGRAM_SHIM "
+_HOST_SHIM_NAMESPACE = re.compile(r"^cake_host_shim_[0-9a-f]{16}$")
+_PROGRAM_IDENTIFIER = re.compile(
+    r"cake_dsa_indexer_topk_[0-9a-f]{20}|cake_host_shim_[0-9a-f]{16}"
+)
+_CHECK_OPEN = re.compile(r"\bTVM_FFI_CHECK(?:_CUDA_ERROR)?\(")
+
+
+def _check_conditions(text):
+    # Every ``TVM_FFI_CHECK(`` condition of ``text`` as ``#cond`` stringizes it
+    # (unexpanded): balanced parentheses, string literals skipped, multi-line aware.
+    conditions = []
+    for match in _CHECK_OPEN.finditer(text):
+        start = match.end()
+        depth, quoted, i = 1, False, start
+        while depth and i < len(text):
+            c = text[i]
+            if quoted:
+                if c == "\\":
+                    i += 1
+                elif c == '"':
+                    quoted = False
+            elif c == '"':
+                quoted = True
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            i += 1
+        assert depth == 0, text[start : start + 80]
+        conditions.append(text[start : i - 1])
+    return conditions
+
+
+def test_shared_binding_sources_keep_distinct_namespaces():
+    # Programs whose exported binding text differs only in the kernel symbol, the
+    # host-shim namespace and the launch constants build one binding translation
+    # unit: it declares and launches ``CAKE_PROGRAM_KERNEL`` and exports ``run`` from
+    # namespace ``CAKE_PROGRAM_SHIM``, both defaulting to the program the file was
+    # exported for; every other entry names its own symbol and namespace on the
+    # compile line.  All libraries of one architecture load into one process, so
+    # every entry must still export a distinct namespace, and no check condition may
+    # spell a macro (``TVM_FFI_CHECK`` stringizes its condition unexpanded).
+    package = cake_jit.__file__.rsplit("/", 1)[0]
+    with open(
+        os.path.join(
+            package, "csrc/cake_dsa_indexer_topk/cake_dsa_indexer_topk_host_common.cuh"
+        )
+    ) as header:
+        assert not [c for c in _check_conditions(header.read()) if "CAKE_" in c]
+    namespaces = {}
+    for entry in cake_build.manifest()["libraries"]:
+        name, arch = entry["name"], entry["arch"]
+        program = name[: -len(arch) - 1]
+        binding_source = entry["sources"][1]
+        assert binding_source.endswith("_binding.cu"), (name, entry["sources"])
+        with open(os.path.join(package, binding_source)) as source:
+            text = source.read()
+        lines = text.splitlines()
+        assert lines.count("namespace CAKE_PROGRAM_SHIM {") == 1, name
+        assert 'extern "C" __global__ void CAKE_PROGRAM_KERNEL(' in text, name
+        assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_PROGRAM_SHIM::Run);" in text
+        assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, " in text, name
+        assert not [
+            c for c in _check_conditions(text) if "CAKE_" in c or "SMEM_TOTAL" in c
+        ], name
+        kernel_defaults = [
+            line[len(_PROGRAM_KERNEL_DEFAULT) :].strip()
+            for line in lines
+            if line.startswith(_PROGRAM_KERNEL_DEFAULT)
+        ]
+        shim_defaults = [
+            line[len(_PROGRAM_SHIM_DEFAULT) :].strip()
+            for line in lines
+            if line.startswith(_PROGRAM_SHIM_DEFAULT)
+        ]
+        assert len(kernel_defaults) == 1 and len(shim_defaults) == 1, name
+        # every other mention of a program identifier goes through the two macros
+        assert not [
+            line
+            for line in lines
+            if _PROGRAM_IDENTIFIER.search(line)
+            and not line.startswith(("#define CAKE_PROGRAM_", "//"))
+        ], name
+        shim_flags = [
+            f for f in entry["nvcc_flags"] if f.startswith(_PROGRAM_SHIM_FLAG)
+        ]
+        kernel_flags = [
+            f for f in entry["nvcc_flags"] if f.startswith(_PROGRAM_KERNEL_FLAG)
+        ]
+        assert len(shim_flags) <= 1 and len(kernel_flags) <= 1, (name, entry)
+        if program in binding_source:
+            # the file's own program: the defaults name it; a flag, when present, agrees
+            assert kernel_defaults == [f"kernel_{program}"], (name, kernel_defaults)
+            assert shim_flags in ([], [_PROGRAM_SHIM_FLAG + shim_defaults[0]]), name
+        else:
+            # another program's translation unit: symbol and namespace come from the
+            # compile line
+            assert kernel_flags == [f"{_PROGRAM_KERNEL_FLAG}kernel_{program}"], name
+            assert shim_flags, (name, binding_source)
+        namespace = (
+            shim_flags[0][len(_PROGRAM_SHIM_FLAG) :] if shim_flags else shim_defaults[0]
+        )
+        assert _HOST_SHIM_NAMESPACE.match(namespace), (name, namespace)
+        namespaces.setdefault(program, set()).add(namespace)
+    assert set(namespaces) == set(cake_jit.PROGRAMS)
+    assert all(len(found) == 1 for found in namespaces.values()), namespaces
+    assert len({next(iter(found)) for found in namespaces.values()}) == len(namespaces)
 
 
 def test_policy_record_round_trip_and_validation():
@@ -1265,9 +1410,8 @@ def test_bind_program_orders_arguments_and_fails_closed(monkeypatch):
         "fake",
         {
             "role": "scan",
-            "sources": [],
+            "library": "fake",
             "arches": ["sm_100a"],
-            "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
         },
     )
     values = {
@@ -2028,61 +2172,6 @@ def test_empty_rows_and_no_keys_are_all_padding():
     _judge_ok((indices, scores), ref.select_reference(inputs))
 
 
-def test_public_entry_point_matches_backend_and_warns_once():
-    _require_program()
-    from flashinfer.dsa_indexer import dsa_indexer_topk, dsa_indexer_topk_workspace_size
-
-    inputs = ref.make_random_inputs(
-        [200, 300], [200, 2500], top_k=128, seed=70, device="cuda"
-    )
-    expected = _run(inputs)
-    with pytest.warns(ExperimentalWarning):
-        got = dsa_indexer_topk(
-            inputs.q,
-            inputs.k,
-            inputs.w,
-            inputs.cu_seqlens_q,
-            inputs.cu_seqlens_k,
-            **inputs.kwargs(),
-        )
-    assert ref.same_bits(got, expected)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", ExperimentalWarning)
-        again = dsa_indexer_topk(
-            inputs.q,
-            inputs.k,
-            inputs.w,
-            inputs.cu_seqlens_q,
-            inputs.cu_seqlens_k,
-            **inputs.kwargs(),
-            max_seqlen_q=max(inputs.seg_q_len),
-            max_seqlen_k=max(inputs.seg_k_len),
-        )
-    assert ref.same_bits(again, expected)
-    assert dsa_indexer_topk_workspace_size(
-        inputs.num_queries,
-        inputs.num_keys,
-        inputs.num_segments,
-        top_k=128,
-        device=inputs.device,
-    ) == dsa_indexer_workspace_size(
-        inputs.num_queries,
-        inputs.num_keys,
-        inputs.num_segments,
-        top_k=128,
-        device=inputs.device,
-    )
-    with pytest.raises(ValueError, match="backend"), _quiet_experimental():
-        dsa_indexer_topk(
-            inputs.q,
-            inputs.k,
-            inputs.w,
-            inputs.cu_seqlens_q,
-            inputs.cu_seqlens_k,
-            backend="other",
-        )
-
-
 def test_persistent_rank_finalize_follows_the_architecture_cap():
     """Lever FRP-K (round 39): the persistent two-row pipelined rank finalize serves the staged bulk slab calls up to the
     architecture's ``rank_persist_max_k`` (sm_107a: 2048) and launches ``min(rows, rank_persist_ctas_per_sm x SMs)`` CTAs; every
@@ -2223,3 +2312,23 @@ def test_prepared_calls_perform_no_device_queries_after_warm_up(monkeypatch):
     torch.cuda.synchronize()
     assert boom.call_count == 0
     assert ref.same_bits(again, expected) and ref.same_bits(captured, expected)
+
+
+def test_policy_is_validated_once_per_architecture(monkeypatch):
+    """The registry record is process-immutable: ``policy_for`` validates it once per architecture, the planning
+    path re-validates nothing, and an unregistered architecture keeps raising by name."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    validate = mock.Mock(wraps=DispatchPolicy.from_record)
+    monkeypatch.setattr(DispatchPolicy, "from_record", validate)
+    for arch in cake_jit.ARCHES:
+        policy = policy_for(arch)
+        validate.reset_mock()
+        assert policy_for(arch) is policy
+        plan_dsa_indexer_topk(
+            1024, 4096, 1, top_k=256, arch=arch, num_sms=_FROZEN_GRIDS[arch][0]
+        )
+        assert validate.call_count == 0, arch
+    for _ in range(2):
+        with pytest.raises(NotImplementedError, match="5676"):
+            policy_for("sm_90a")

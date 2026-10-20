@@ -46,8 +46,11 @@ q_indptr[b + 1]`` and has position ``r + seq_lens[b] - q_indptr[b + 1]``
 Supported: ``(Hq, Hkv) in {(8, 1), (64, 8)}``, head_dim 128, BF16 input, FP8
 E4M3 output, SM90 (H100/H200), SM100 (B200) and SM103 (B300).  The kernel is
 generated from the Cake schedule
-``flashinfer_blackwell_fused_qk_rmsnorm_rope_fp8_paged_kv_append``; sources and
-manifest live under ``csrc/cake_fused_qk_rope_fp8_append`` (JIT-only).  The call
+``flashinfer_blackwell_fused_qk_rmsnorm_rope_fp8_paged_kv_append``: the generated
+loader :mod:`flashinfer.jit.cake_fused_qk_rope_fp8_append` publishes it as the
+program ``FP8_E4M3``, whose two translation units live under
+``csrc/cake_fused_qk_rope_fp8_append``, and :mod:`flashinfer.jit.cake_program`
+builds one JIT module ``<program>_<target>_<digest>`` per exact target.  The call
 is CUDA-graph capturable: every launch argument is a by-value scalar or a tensor
 pointer, no host synchronisation, workspace or extra kernel is involved.
 """
@@ -58,18 +61,17 @@ import math
 from typing import Any, Optional, Tuple
 
 import torch
+import tvm_ffi
 
-from .jit.cake_fused_qk_rope_fp8_append import (
-    STAGES,
-    arch_for,
-    load_cake_fused_qk_rope_fp8_append_module,
-)
+from .jit.cake_fused_qk_rope_fp8_append import FP8_E4M3
+from .jit.cake_program import CAPABILITY_TARGET
 from .utils import get_compute_capability
 
 HEAD_DIM = 128
 FP8_MAX = 448.0
 SUPPORTED_HEADS = ((8, 1), (64, 8))
-_STAGE = STAGES[0]
+# The binding's argument order: the 17 tensors, the 13 scalars, then grid_x, grid_y, grid_z.
+_ARG_NAMES: tuple[str, ...] = FP8_E4M3.args
 
 
 def launch_plan(num_rows: int, num_requests: int, num_kv_heads: int) -> dict[str, Any]:
@@ -84,6 +86,23 @@ def launch_plan(num_rows: int, num_requests: int, num_kv_heads: int) -> dict[str
 def _check(cond: bool, message: str) -> None:
     if not cond:
         raise ValueError(message)
+
+
+def _target(device: torch.device) -> str:
+    """The exact target the program ships for ``device``."""
+    major, minor = get_compute_capability(device)
+    target = FP8_E4M3.target_for((major, minor))
+    if target is None:
+        supported = ", ".join(
+            f"{t} ({cc_major}.{cc_minor})"
+            for (cc_major, cc_minor), t in CAPABILITY_TARGET.items()
+            if t in FP8_E4M3.targets
+        )
+        raise ValueError(
+            f"cake_fused_qk_rope_fp8_append has no cubin for compute capability {major}.{minor}; "
+            f"supported: {supported}"
+        )
+    return target
 
 
 def _heads_from_packed_qkv(
@@ -334,10 +353,11 @@ def cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
         _check(t.is_contiguous(), f"{name} must be contiguous")
         _check(t.device == device, f"{name} must be on {device}")
 
-    arch = arch_for(get_compute_capability(device))
-    module, record = load_cake_fused_qk_rope_fp8_append_module(_STAGE, arch)
+    # The target build is built and loaded once per process by the program constant.
+    entry = FP8_E4M3.entry(_target(device))
     plan = launch_plan(num_rows, num_requests, num_kv_heads)
-    scalars = {
+    values = {
+        **tensors,
         "num_rows": num_rows,
         "num_requests": num_requests,
         "num_q_heads": num_q_heads,
@@ -355,20 +375,14 @@ def cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
         "grid_y": plan["grid"][1],
         "grid_z": plan["grid"][2],
     }
-    args = []
-    for kind, name in record["arg_plan"]:
-        if name in tensors:
-            args.append(tensors[name])
-        elif name in scalars:
-            args.append(scalars[name])
-        else:
-            raise RuntimeError(
-                f"generated module expects unknown argument {name!r} ({kind})"
-            )
-    import tvm_ffi
-
+    try:
+        args = [values[name] for name in _ARG_NAMES]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"generated module expects unknown argument {exc.args[0]!r}"
+        ) from None
     with torch.cuda.device(device), tvm_ffi.use_torch_stream():
-        getattr(module, str(record["ffi_entry"]))(*args)
+        entry(*args)
     return out_q, q_scale, split_k_flag
 
 

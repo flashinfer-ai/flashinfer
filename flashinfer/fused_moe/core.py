@@ -1808,7 +1808,13 @@ def get_trtllm_moe_sm100_module():
 
 @functools.cache
 def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
-    module = gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=enable_rubin)
+    return _build_trtllm_moe_namespace(
+        gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=enable_rubin)
+    )
+
+
+def _build_trtllm_moe_namespace(module):
+    """Build and load a trtllm-gen fused-MoE JIT module and wrap its operations."""
     moe_op = module.build_and_load()
     for library_path in module.get_library_paths():
         setup_cubin_loader(str(library_path))
