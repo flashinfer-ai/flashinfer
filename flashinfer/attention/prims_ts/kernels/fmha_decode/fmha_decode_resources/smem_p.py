@@ -745,7 +745,7 @@ class SmemPResource(DecodeGenResourceBase):
             p1 = Float32(s_arr[value_idx + 1])
             if cutlass.const_expr(
                 _pair_uses_ex2_emulation(
-                    pair_idx, pairs_per_fragment, self.cfg.ex2_emulated_pairs
+                    pair_idx, pairs_per_fragment, self.cfg.fragment_ex2_emulated_pairs
                 )
             ):
                 p0, p1 = _ex2_emulation_packed_f32x2(p0, p1)

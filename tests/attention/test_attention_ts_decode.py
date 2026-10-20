@@ -3975,13 +3975,16 @@ def test_attention_ts_decode_arch_config_args_follow_softmax_hardware() -> None:
     """
 
     arch_args = fmha_decode_config.arch_config_args
-    assert arch_args((10, 0)) == {"ex2_emulated_pairs": 4, "uses_ldtm_stat": False}
+    assert arch_args((10, 0)) == {"ex2_emulated_pairs": 6, "uses_ldtm_stat": False}
     assert arch_args((10, 3)) == {
         "ex2_emulated_pairs": 0,
         "uses_ldtm_stat": tcgen05_compat.dsl_supports_ldtm_stat(),
     }
     cfg = _make_contiguous_kv256_config(persistent=False)
-    assert cfg.ex2_emulated_pairs == 4 and not cfg.uses_ldtm_stat
+    assert cfg.ex2_emulated_pairs == 6 and not cfg.uses_ldtm_stat
+    assert cfg.fragment_ex2_emulated_pairs == 4
+    q128 = _make_contiguous_keeps_config(dtype=BFloat16, tile_size_q=128)
+    assert q128.fragment_ex2_emulated_pairs == 6
 
 
 def test_attention_ts_decode_kv256_static_skips_unmodeled_fragment_alias_check() -> (
