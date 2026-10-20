@@ -55,21 +55,29 @@ def single_head_paged_mqa_logits(
         raise RuntimeError("single_head_paged_mqa_logits needs CuTe DSL 4.7 or newer")
     from ..cute_dsl.launch import argument_kind, compiled
     from .kernels import single_head_scorer
+    from .kernels.single_head_scorer import (
+        CTAS_PER_SM,
+        DIM,
+        MAX_ROWS,
+        PAGE,
+        TILE,
+        TILES_PER_CTA,
+    )
 
     max_context = scores.shape[1]
     batch, width = requests.shape[0], block_table.shape[1]
     if min(batch, max_context, key_cache.shape[0], width) <= 0:
         raise ValueError("queries, keys, scores and the block table must be nonempty")
     rows = scores.shape[0] // batch
-    if not 1 <= rows <= 8 or rows * batch != scores.shape[0]:
+    if not 1 <= rows <= MAX_ROWS or rows * batch != scores.shape[0]:
         raise ValueError("each request must serve 1 to 8 query rows")
     if query.shape[0] != scores.shape[0] or context_lengths.shape[0] != batch:
         raise ValueError("Mismatched query rows, scores, lengths or requests")
-    if max_context > 64 * width:
+    if max_context > PAGE * width:
         raise ValueError("The block table must cover the context capacity")
-    if {query.dtype, key_cache.dtype} != {torch.bfloat16} or query.shape[1] != 128:
+    if {query.dtype, key_cache.dtype} != {torch.bfloat16} or query.shape[1] != DIM:
         raise ValueError("Queries and keys must be BF16 of dimension 128")
-    if key_cache.shape[1:] != (64, 128) or key_cache.stride()[1:] != (128, 1):
+    if key_cache.shape[1:] != (PAGE, DIM) or key_cache.stride()[1:] != (DIM, 1):
         raise ValueError("Keys must be [pages, 64, 128], each page's keys contiguous")
     if get_compute_capability(query.device)[0] != 10:
         raise ValueError("single_head_paged_mqa_logits requires SM10x")
@@ -79,9 +87,9 @@ def single_head_paged_mqa_logits(
     # CTAs per request group: two per SM in all, and enough that a CTA's run over
     # the whole capacity fits the TILES_PER_CTA tiles whose pages it stages (the
     # lengths stay on the device). CTAs past a group's length exit right away.
-    key_tiles = (max_context + 127) // 128
-    runs = -(-key_tiles // single_head_scorer.TILES_PER_CTA)
-    workers = max(2 * get_device_sm_count(query.device) // batch, runs, 1)
+    key_tiles = (max_context + TILE - 1) // TILE
+    runs = -(-key_tiles // TILES_PER_CTA)
+    workers = max(CTAS_PER_SM * get_device_sm_count(query.device) // batch, runs, 1)
     args = (query, key_cache, *tensors[1:], max_context, workers)
     kinds = tuple(map(argument_kind, args))
     function = compiled(
