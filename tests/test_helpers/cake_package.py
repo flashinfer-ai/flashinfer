@@ -17,6 +17,7 @@ PACKAGES: dict[str, str] = {
     "cake_rmsnorm_train": "flashinfer.cake_rmsnorm_train_backend",
     "cake_causal_conv1d_train": "flashinfer.cake_causal_conv1d_train_backend",
     "cake_ulysses": "flashinfer.cake_ulysses_backend",
+    "cake_fused_qk_rope_append": "flashinfer.cake_fused_qk_rope_append_backend",
     "cake_sage_block_sparse_attention": "flashinfer.cake_sage_block_sparse_attention_backend",
     "cake_dsa_train": "flashinfer.experimental.cake_dsa_train",
     "cake_dsa_indexer": "flashinfer.experimental.cake_dsa_indexer",
