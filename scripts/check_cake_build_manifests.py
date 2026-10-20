@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check the build manifests of the Cake-exported packages (flashinfer-ai/flashinfer#6553).
 
-Eight packages ship generated CUDA sources under ``csrc/`` together with a build
+The Cake packages below ship generated CUDA sources under ``csrc/`` together with a build
 manifest ``build.json`` (schema ``cake-build/1``) -- the only record of what to
 compile -- and a byte-identical ``cake_build.py`` loader that loads the prebuilt
 library under ``aot/`` when present and otherwise JIT-builds the manifest entry
@@ -235,10 +235,11 @@ class Package:
     refs: Callable[[Path, str], set[str]]
 
 
-# dsa_train, kda_train, dsa_indexer, the rmsnorm, the causal conv1d, the ulysses and the NVFP4 SVDQuant GEMM backends
-# are read with the generic walker (a mapping carrying ``library`` under an ``arches`` / ``arch`` scope).  Their
-# exporters' registry shapes fit it: a record carries ``arches`` and either ``library`` itself (dsa_indexer PROGRAMS,
-# rmsnorm, causal conv1d, ulysses and svdquant MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
+# dsa_train, kda_train, dsa_indexer, the rmsnorm, the causal conv1d, the ulysses, the NVFP4 SVDQuant GEMM and the Sage
+# block-sparse attention backends are read with the generic walker (a mapping carrying ``library`` under an ``arches`` /
+# ``arch`` scope).  Their exporters' registry shapes fit it: a record carries ``arches`` and either ``library`` itself
+# (dsa_indexer PROGRAMS, rmsnorm, causal conv1d, ulysses, svdquant and Sage block-sparse attention MODULES) or per-stage
+# sub-records carrying ``library`` (dsa_train).
 PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.cake_rmsnorm_train_backend",
@@ -255,6 +256,12 @@ PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.cake_ulysses_backend",
         "flashinfer/cake_ulysses_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.cake_sage_block_sparse_attention_backend",
+        "flashinfer/cake_sage_block_sparse_attention_backend",
         "cake_jit.py",
         refs_generic,
     ),
