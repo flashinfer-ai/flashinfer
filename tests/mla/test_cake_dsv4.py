@@ -1311,6 +1311,11 @@ _HOST_TMA_SOURCE_TENSORS = frozenset(
         "main_cache_g4f",
         "extra_cache_g4d",
         "extra_cache_g4f",
+        # NVFP4 prefill bodies: the pools' scale-row views (run_cake_dsv4_nvfp4
+        # builds them beside the data-row views the SWA_cache / compressed_KV_cache
+        # aliases carry).
+        "SWA_sf",
+        "compressed_KV_sf",
     }
 )
 

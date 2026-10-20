@@ -319,7 +319,7 @@ def test_nvfp4_variant_names():
         assert cake._nvfp4_variant_name(member) == f"nvfp4_decode_{member}"
     with pytest.raises(ValueError, match="unknown NVFP4 family member"):
         cake._nvfp4_variant_name("merge")
-    assert len(set(_NVFP4_VARIANTS)) == len(_NVFP4_VARIANTS) == 8
+    assert len(set(_NVFP4_VARIANTS)) == len(_NVFP4_VARIANTS) == 10
     for arch in ("sm_100a", "sm_103a"):
         assert set(_NVFP4_VARIANTS) <= set(_ARCH_REGISTRATIONS[arch]["variants"])
 
@@ -379,6 +379,21 @@ def test_workspace_layout_lse_region_is_opt_in():
     assert with_lse.lse[1] == -(-(32 * 128 * 4) // 128) * 128
     assert with_lse.total_bytes == base.total_bytes + with_lse.lse[1]
     assert with_lse.lse[0] % 128 == 0
+    assert with_lse.packed_query == (with_lse.total_bytes, 0)
+    assert with_lse.prefill_lens == (with_lse.total_bytes, 0)
+
+
+def test_workspace_layout_prefill_regions_are_opt_in():
+    base = cake_dsv4_workspace_layout(256, 64, 1, with_lse=True)
+    prefill = cake_dsv4_workspace_layout(256, 64, 1, with_lse=True, with_prefill=True)
+    assert (base.partial_lse, base.lse) == (prefill.partial_lse, prefill.lse)
+    assert prefill.packed_query == (base.total_bytes, 256 * 64 * 384)
+    assert prefill.prefill_lens == (
+        base.total_bytes + 256 * 64 * 384,
+        2 * (-(-(256 * 4) // 128) * 128),
+    )
+    assert prefill.total_bytes == prefill.prefill_lens[0] + prefill.prefill_lens[1]
+    assert prefill.packed_query[0] % 128 == 0 and prefill.prefill_lens[0] % 128 == 0
 
 
 def test_workspace_bytes_nvfp4_bound():
@@ -388,16 +403,29 @@ def test_workspace_bytes_nvfp4_bound():
         32, 128, 512, torch.bfloat16, kv_cache_format="nvfp4", extra_topk=512
     )
     assert (
-        nvfp4_bytes == cake_dsv4_workspace_layout(32, 128, 8, with_lse=True).total_bytes
+        nvfp4_bytes
+        == cake_dsv4_workspace_layout(
+            32, 128, 8, with_lse=True, with_prefill=True
+        ).total_bytes
     )
     capped = get_cake_dsv4_workspace_bytes(
         1, 128, 2048, torch.bfloat16, kv_cache_format="nvfp4", extra_topk=2048
     )
-    assert capped == cake_dsv4_workspace_layout(1, 128, 12, with_lse=True).total_bytes
+    assert (
+        capped
+        == cake_dsv4_workspace_layout(
+            1, 128, 12, with_lse=True, with_prefill=True
+        ).total_bytes
+    )
     pinned = get_cake_dsv4_workspace_bytes(
         32, 128, 512, torch.bfloat16, kv_cache_format="nvfp4", num_splits=2
     )
-    assert pinned == cake_dsv4_workspace_layout(32, 128, 2, with_lse=True).total_bytes
+    assert (
+        pinned
+        == cake_dsv4_workspace_layout(
+            32, 128, 2, with_lse=True, with_prefill=True
+        ).total_bytes
+    )
     with pytest.raises(ValueError, match="BF16 query"):
         get_cake_dsv4_workspace_bytes(
             32, 128, 512, torch.float8_e4m3fn, kv_cache_format="nvfp4"
@@ -430,6 +458,30 @@ def test_nvfp4_argument_vocabulary():
         assert cake.canonical_arg_name("tma_buffer", name) == canonical
         assert cake.is_bindable_arg("tma_buffer", name)
     assert cake.is_bindable_arg("parameter", "heads_per_cta")
+    # NVFP4 prefill bodies.
+    for name, canonical in (
+        ("tmap_q_sf", "Q"),
+        ("tmap_swa_sf", "SWA_sf"),
+        ("tmap_compressed_sf", "compressed_KV_sf"),
+        ("tmap_o", "O"),
+    ):
+        assert cake.canonical_arg_name("tma_buffer", name) == canonical
+        assert cake.is_bindable_arg("tma_buffer", name)
+    for name in ("LSE", "extra_topk_lens", "swa_indices", "sparse_topk_lens"):
+        assert cake.is_bindable_arg("buffer", name)
+    for name in (
+        "swa_page_log2",
+        "swa_pitch_units",
+        "swa_footer_units",
+        "compressed_page_log2",
+        "compressed_pitch_units",
+        "compressed_footer_units",
+        "swa_width",
+        "compressed_width",
+        "total_work_items",
+        "max_q_len",
+    ):
+        assert cake.is_bindable_arg("parameter", name)
     for name in (
         "tiles_per_split",
         "total_tiles",

@@ -524,6 +524,75 @@ _PLAN_NVFP4_SWAP = _PLAN_NVFP4_TILE + (
 )
 _PLAN_NVFP4_TILE_OC = _PLAN_NVFP4_TILE + (("parameter", "o_chunks"),)
 _PLAN_NVFP4_PV = _PLAN_NVFP4_G4 + (("parameter", "tile_n"),)
+# NVFP4 prefill bodies: the caller-packed NVFP4 query through two tensor maps (data and scale rows),
+# the pools through 32-byte-pitch row views (data and footer rows), one CTA (h64) or one two-CTA
+# cluster (h128) per query token; both write the final O and the base-2 LSE directly.
+_PLAN_NVFP4_H64_PREFILL = (
+    ("tma_buffer", "tmap_q"),
+    ("tma_buffer", "tmap_q_sf"),
+    ("tma_buffer", "tmap_swa_kv"),
+    ("tma_buffer", "tmap_compressed_kv"),
+    ("tma_buffer", "tmap_swa_sf"),
+    ("tma_buffer", "tmap_compressed_sf"),
+    ("buffer", "O"),
+    ("buffer", "LSE"),
+    ("buffer", "swa_indices"),
+    ("buffer", "compressed_indices"),
+    ("buffer", "sparse_topk_lens"),
+    ("buffer", "sinks"),
+    ("buffer", "bmm1_scale"),
+    ("buffer", "bmm2_scale"),
+    ("parameter", "num_heads"),
+    ("parameter", "swa_index_stride"),
+    ("parameter", "compressed_index_stride"),
+    ("parameter", "sparse_topk_lens_offset"),
+    ("parameter", "num_query_tokens"),
+    ("parameter", "has_sinks"),
+    ("parameter", "swa_page_log2"),
+    ("parameter", "swa_pitch_units"),
+    ("parameter", "swa_footer_units"),
+    ("parameter", "compressed_page_log2"),
+    ("parameter", "compressed_pitch_units"),
+    ("parameter", "compressed_footer_units"),
+    ("parameter", "swa_width"),
+    ("parameter", "compressed_width"),
+    ("buffer", "extra_topk_lens"),
+)
+_PLAN_NVFP4_H128_PREFILL = (
+    ("tma_buffer", "tmap_q"),
+    ("tma_buffer", "tmap_q_sf"),
+    ("tma_buffer", "tmap_swa_kv"),
+    ("tma_buffer", "tmap_compressed_kv"),
+    ("tma_buffer", "tmap_swa_sf"),
+    ("tma_buffer", "tmap_compressed_sf"),
+    ("tma_buffer", "tmap_o"),
+    ("buffer", "O"),
+    ("buffer", "LSE"),
+    ("buffer", "swa_indices"),
+    ("buffer", "compressed_indices"),
+    ("buffer", "sparse_topk_lens"),
+    ("buffer", "sinks"),
+    ("buffer", "bmm1_scale"),
+    ("buffer", "bmm2_scale"),
+    ("parameter", "num_heads"),
+    ("parameter", "swa_index_stride"),
+    ("parameter", "compressed_index_stride"),
+    ("parameter", "sparse_topk_lens_offset"),
+    ("parameter", "num_query_tokens"),
+    ("parameter", "sparse_topk"),
+    ("parameter", "has_sinks"),
+    ("parameter", "total_work_items"),
+    ("parameter", "max_q_len"),
+    ("parameter", "swa_page_log2"),
+    ("parameter", "swa_pitch_units"),
+    ("parameter", "swa_footer_units"),
+    ("parameter", "compressed_page_log2"),
+    ("parameter", "compressed_pitch_units"),
+    ("parameter", "compressed_footer_units"),
+    ("parameter", "swa_width"),
+    ("parameter", "compressed_width"),
+    ("buffer", "extra_topk_lens"),
+)
 
 # NVFP4 decode family: one record per member, shared by both architectures (their
 # registrations differ only in the identity that names the JIT module). The templated
@@ -610,6 +679,47 @@ _NVFP4_IDENTITIES = {
     },
 }
 
+# NVFP4 prefill family: the H <= 64 body is one source for both architectures; the two-CTA H128 body
+# traces a different schedule per architecture (score reduction, index-pipe arrival), so each has its own.
+_NVFP4_PREFILL_RECORDS = {
+    "sm_100a": {
+        "nvfp4_h64_prefill": {
+            "arg_plan": _PLAN_NVFP4_H64_PREFILL + _GRID,
+            "identity": "9ae6a874d6a3b64e8443859e7dc6f8217f0a3dee3990c2535795d336b95bfb43",
+            "sources": [
+                "common/cake_dsv4_nvfp4_h64_prefill_kernel.cu",
+                "common/cake_dsv4_nvfp4_h64_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_h128_prefill": {
+            "arg_plan": _PLAN_NVFP4_H128_PREFILL + _GRID,
+            "identity": "628f04200c39f9a66fa7b54acfc529360a542c5d01db503f07a85a62a4b941a6",
+            "sources": [
+                "sm_100a/cake_dsv4_nvfp4_h128_prefill_kernel.cu",
+                "sm_100a/cake_dsv4_nvfp4_h128_prefill_binding.cu",
+            ],
+        },
+    },
+    "sm_103a": {
+        "nvfp4_h64_prefill": {
+            "arg_plan": _PLAN_NVFP4_H64_PREFILL + _GRID,
+            "identity": "9ae6a874d6a3b64e8443859e7dc6f8217f0a3dee3990c2535795d336b95bfb43",
+            "sources": [
+                "common/cake_dsv4_nvfp4_h64_prefill_kernel.cu",
+                "common/cake_dsv4_nvfp4_h64_prefill_binding.cu",
+            ],
+        },
+        "nvfp4_h128_prefill": {
+            "arg_plan": _PLAN_NVFP4_H128_PREFILL + _GRID,
+            "identity": "bea11d16f966df76a81764df4167dd1b92d162ab1aed009ec5b8e56af9cbcd96",
+            "sources": [
+                "sm_103a/cake_dsv4_nvfp4_h128_prefill_kernel.cu",
+                "sm_103a/cake_dsv4_nvfp4_h128_prefill_binding.cu",
+            ],
+        },
+    },
+}
+
 
 def _nvfp4_variants(arch: str) -> dict[str, dict[str, object]]:
     """The NVFP4 records of one architecture (CUDA 13.4: PTX ISA 9.4 QMUL4)."""
@@ -621,6 +731,13 @@ def _nvfp4_variants(arch: str) -> dict[str, dict[str, object]]:
             "min_cuda_version": "13.4",
         }
         for variant, record in _NVFP4_RECORDS.items()
+    } | {
+        variant: {
+            **record,
+            "compile_flags": ["--use_fast_math"],
+            "min_cuda_version": "13.4",
+        }
+        for variant, record in _NVFP4_PREFILL_RECORDS[arch].items()
     }
 
 

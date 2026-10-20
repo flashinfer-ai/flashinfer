@@ -137,6 +137,18 @@ an unexported variant raises ``NotImplementedError``. Splits write
 ``partial_O [T, H, S, 512]`` BF16 and ``partial_lse [T, H, S]`` FP32 into the
 workspace; the final base-2 LSE lives in an extra ``lse`` region appended
 after ``partial_lse`` (:func:`cake_dsv4_workspace_layout` ``with_lse=True``).
+
+From 128 metadata rows on, the route runs the NVFP4 prefill bodies instead
+(Cake ``flashinfer_blackwell_trtllm_sparse_mla_dsv4_nvfp4_{h64,h128}_prefill``):
+``nvfp4_h64_prefill`` (``H <= 64``, one CTA per query token, the heads
+duplicated on the two 64-row halves of a block-scaled M128 QK) and
+``nvfp4_h128_prefill`` (``H128``, one two-CTA cluster per token, 64 heads per
+CTA). They take the query in the cache's NVFP4 row format, so the host packs it
+into the workspace with the NVFP4 cache pack kernel first (``packed_query``
+region, :func:`cake_dsv4_workspace_layout` ``with_prefill=True``), read the
+pools through 32-byte-pitch data-row and scale-row tensor maps, and write the
+final BF16 output and base-2 LSE directly (no split, no merge); the LSE lands
+in the same ``lse`` region as the decode family's.
 """
 
 from __future__ import annotations
@@ -243,6 +255,16 @@ _NVFP4_PV_PLAN_MERGE_US = 1.5
 # Split merge (Cake MERGE_HEADS_PER_CTA / merge_heads_per_cta): 16 warps per CTA, one (token, head) per warp;
 # heads_per_cta is the smallest power of two whose grid T x ceil(H / hpc) stays within one CTA per SM (round 45).
 _NVFP4_MERGE_HEADS_PER_CTA = 16
+# NVFP4 prefill bodies: from _NVFP4_PREFILL_MIN_TOKENS metadata rows on, the route
+# runs one CTA (H <= 64) or one two-CTA cluster (H128) per query token over the
+# caller-packed NVFP4 query instead of the decode family (see the module docstring).
+_NVFP4_PREFILL_MIN_TOKENS = 128
+_NVFP4_VARIANT_H64_PREFILL = "nvfp4_h64_prefill"
+_NVFP4_VARIANT_H128_PREFILL = "nvfp4_h128_prefill"
+_NVFP4_H64_PREFILL_MAX_HEADS = 64
+_NVFP4_DATA_BYTES = 352  # E2M1 NoPE codes and BF16 RoPE dims of one NVFP4 row
+_NVFP4_SF_BYTES = 32  # the row's 28 E4M3 scales and 4 pad bytes
+_NVFP4_ROW_PITCH = 32  # pitch of the pool row views the prefill tensor maps read
 
 
 # Work feed of the BF16/H128 persistent prefill body (mirrors the Cake seed's
@@ -551,6 +573,11 @@ class WorkspaceLayout:
     # Final base-2 LSE f32 [T * H]; only carved for the NVFP4 route
     # (``with_lse=True``), otherwise an empty region at the layout end.
     lse: tuple[int, int] = (0, 0)
+    # NVFP4 prefill bodies (``with_prefill=True``): the packed NVFP4 query
+    # uint8 [T * H, 384] and two int32 [T] length vectors the host fills when
+    # the caller passes none; otherwise empty regions at the layout end.
+    packed_query: tuple[int, int] = (0, 0)
+    prefill_lens: tuple[int, int] = (0, 0)
 
 
 def cake_dsv4_workspace_layout(
@@ -560,6 +587,7 @@ def cake_dsv4_workspace_layout(
     *,
     num_query_offsets: int = 0,
     with_lse: bool = False,
+    with_prefill: bool = False,
 ) -> WorkspaceLayout:
     """Deterministic carve of ``workspace_buffer`` for one launch shape.
 
@@ -568,8 +596,9 @@ def cake_dsv4_workspace_layout(
     counters immediately. ``num_query_offsets`` (``batch_size + 1`` for a
     row-tiled chunk after the first, else 0) sizes the int32 region after
     ``partial_lse`` that holds the chunk's shifted ``cum_seq_lens_q``.
-    ``with_lse`` appends the NVFP4 route's final-LSE region after that; the
-    default layout is unchanged.
+    ``with_lse`` appends the NVFP4 route's final-LSE region after that, and
+    ``with_prefill`` the NVFP4 prefill bodies' packed-query and length regions
+    after the LSE; the default layout is unchanged.
     """
     tokens = _positive_int(num_query_tokens, "num_query_tokens")
     heads = _positive_int(num_heads, "num_heads")
@@ -597,14 +626,22 @@ def cake_dsv4_workspace_layout(
     final_lse_bytes = (
         _align_up(tokens * heads * torch.float32.itemsize) if with_lse else 0
     )
+    packed_query_offset = final_lse_offset + final_lse_bytes
+    packed_query_bytes = (
+        _align_up(tokens * heads * _NVFP4_TOKEN_BYTES) if with_prefill else 0
+    )
+    lens_offset = packed_query_offset + packed_query_bytes
+    lens_bytes = 2 * _align_up(tokens * torch.int32.itemsize) if with_prefill else 0
     return WorkspaceLayout(
         descriptor_slab=(_DESCRIPTOR_SLAB_OFFSET, _DESCRIPTOR_SLAB_BYTES),
         counters=(_COUNTER_OFFSET, _COUNTER_REGION_BYTES),
         partial_o=(o_offset, o_bytes),
         partial_lse=(lse_offset, lse_bytes),
         query_offsets=(offsets_offset, offsets_bytes),
-        total_bytes=final_lse_offset + final_lse_bytes,
+        total_bytes=lens_offset + lens_bytes,
         lse=(final_lse_offset, final_lse_bytes),
+        packed_query=(packed_query_offset, packed_query_bytes),
+        prefill_lens=(lens_offset, lens_bytes),
     )
 
 
@@ -640,7 +677,10 @@ def get_cake_dsv4_workspace_bytes(
     ``num_splits`` if given, else ``min(ceil(sparse_topk / 128) +
     ceil(extra_topk / 128), 12)`` (the plan never exceeds the candidate tile
     count or the kernel's 12-split cap), and a final-LSE region
-    ``align128(num_query_tokens * num_heads * 4)`` is appended.
+    ``align128(num_query_tokens * num_heads * 4)`` is appended, then the
+    prefill bodies' packed-query region ``align128(num_query_tokens * num_heads
+    * 384)`` and two ``align128(num_query_tokens * 4)`` length regions (the
+    bound covers the decode family and the prefill bodies alike).
     """
     if dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError(f"unsupported CAKE DSv4 dtype: {dtype}")
@@ -665,7 +705,7 @@ def get_cake_dsv4_workspace_bytes(
             else _positive_int(num_splits, "num_splits")
         )
         return cake_dsv4_workspace_layout(
-            num_query_tokens, num_heads, splits, with_lse=True
+            num_query_tokens, num_heads, splits, with_lse=True, with_prefill=True
         ).total_bytes
     if kv_cache_format != "fp8":
         raise ValueError(f"unsupported CAKE DSv4 kv_cache_format: {kv_cache_format!r}")
@@ -799,6 +839,12 @@ def _ensure_counters_zeroed(
 
 _TMA_SOURCE_ALIASES: Mapping[str, str] = {
     "tmap_q": "Q",
+    # The NVFP4 prefill bodies read the packed query [tokens, heads, 384] through
+    # a data map and a scale map over the same rows, and each pool through a
+    # data-row map and a scale-row map (``_nvfp4_pool_row_views``).
+    "tmap_q_sf": "Q",
+    "tmap_swa_sf": "SWA_sf",
+    "tmap_compressed_sf": "compressed_KV_sf",
     "tmap_swa_k": "SWA_cache",
     "tmap_swa_v": "SWA_cache",
     "tmap_swa_kv": "SWA_cache",
@@ -859,6 +905,11 @@ _TENSOR_VALUE_NAMES = frozenset(
         "main_cache_g4f",
         "extra_cache_g4d",
         "extra_cache_g4f",
+        # NVFP4 prefill bodies (pool scale-row views, the final LSE, the extra table's lengths).
+        "SWA_sf",
+        "compressed_KV_sf",
+        "LSE",
+        "extra_topk_lens",
     }
 )
 # Kernel parameters bound as Python floats (the NVFP4 members take the LSE
@@ -897,6 +948,15 @@ _SCALAR_VALUE_NAMES = frozenset(
         # Retrace knobs of the templated NVFP4 members (runtime instantiation switch).
         "tile_n",
         "o_chunks",
+        # NVFP4 prefill bodies: pool geometry in 32-byte units and the two table widths.
+        "swa_page_log2",
+        "swa_pitch_units",
+        "swa_footer_units",
+        "compressed_page_log2",
+        "compressed_pitch_units",
+        "compressed_footer_units",
+        "swa_width",
+        "compressed_width",
         *_FLOAT_SCALAR_VALUE_NAMES,
     }
 )
@@ -2274,7 +2334,12 @@ def _nvfp4_variant_name(member: str) -> str:
 # Every decode variant a plan can select (the host names them statically so the export can check that each
 # generated program is bindable).
 _NVFP4_DECODE_VARIANTS = tuple(_NVFP4_MEMBER_VARIANTS.values())
-_NVFP4_VARIANTS = (*_NVFP4_DECODE_VARIANTS, _NVFP4_VARIANT_MERGE)
+_NVFP4_VARIANTS = (
+    *_NVFP4_DECODE_VARIANTS,
+    _NVFP4_VARIANT_MERGE,
+    _NVFP4_VARIANT_H64_PREFILL,
+    _NVFP4_VARIANT_H128_PREFILL,
+)
 
 
 def _nvfp4_split_shape(total_tiles: int, num_splits: int) -> tuple[int, int]:
@@ -2708,10 +2773,12 @@ def run_cake_dsv4_nvfp4(
     the module docstring); ``swa_page_size`` / ``compressed_page_size`` are
     required for 2-D ``[pages, bytes]`` pools and otherwise checked against the
     geometry. ``query`` / ``out`` may carry more rows than ``T``; rows ``>= T``
-    are untouched. ``max_q_len``, ``cum_seq_lens_q`` and ``seq_lens`` are
-    accepted for surface parity with :func:`run_cake_dsv4` but unused: the
-    kernels consume flat token coordinates. The base-2 LSE is written to the
-    workspace (not returned). No device memory is allocated.
+    are untouched. ``cum_seq_lens_q`` and ``seq_lens`` are accepted for surface
+    parity with :func:`run_cake_dsv4` but unused, and ``max_q_len`` is only a
+    work-mapping constant of the prefill bodies: the kernels consume flat token
+    coordinates. Calls with ``T >= 128`` rows run the NVFP4 prefill bodies
+    (:func:`_nvfp4_prefill`), smaller ones the decode family. The base-2 LSE is
+    written to the workspace (not returned). No device memory is allocated.
     """
     if backend != "cake":
         raise ValueError(f"expected backend='cake', got {backend!r}")
@@ -2842,17 +2909,42 @@ def run_cake_dsv4_nvfp4(
             f"workspace_buffer must be on {device}, got {workspace_buffer.device}"
         )
     raw = _workspace_bytes(workspace_buffer)
+    prefill = num_query_tokens >= _NVFP4_PREFILL_MIN_TOKENS
     layout = cake_dsv4_workspace_layout(
-        num_query_tokens, num_heads, num_splits, with_lse=True
+        num_query_tokens, num_heads, num_splits, with_lse=True, with_prefill=prefill
     )
     _require_workspace_bytes(raw, layout.total_bytes)
-    partial_o, partial_lse = _partial_views(
-        raw, out_rows, num_query_tokens, num_heads, num_splits
-    )
     lse_offset, lse_bytes = layout.lse
     lse_out = raw[
         lse_offset : lse_offset + num_query_tokens * num_heads * torch.float32.itemsize
     ].view(torch.float32)
+    if prefill:
+        _nvfp4_prefill(
+            arch=arch,
+            workspace=workspace_buffer,
+            raw=raw,
+            layout=layout,
+            query_rows=query_rows,
+            out_rows=out_rows,
+            lse_out=lse_out,
+            main=(main_flat, main_page_size, main_page_stride),
+            extra=(extra_flat, extra_page_size, extra_page_stride),
+            main_indices=main_indices,
+            extra_indices=extra_indices,
+            main_lengths=main_lengths,
+            extra_lengths=extra_lengths,
+            main_width=main_width,
+            extra_width=extra_width,
+            sinks=sinks,
+            sink_tensor=sink_tensor,
+            scale1=scale1,
+            scale2=scale2,
+            max_q_len=max_q_len,
+        )
+        return out
+    partial_o, partial_lse = _partial_views(
+        raw, out_rows, num_query_tokens, num_heads, num_splits
+    )
     if num_splits == 1:
         # The decode member writes the final output and base-2 LSE directly.
         partial_lse = lse_out
@@ -2929,6 +3021,180 @@ def run_cake_dsv4_nvfp4(
         launches.append(launcher.variant(_NVFP4_VARIANT_MERGE, grid=plan.merge_grid))
     launcher.run(*launches)
     return out
+
+
+def _nvfp4_pool_row_views(flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Row views of a flat NVFP4 pool (``[pages, page_stride]`` uint8) for the prefill bodies' tensor maps: the
+    352-byte data rows and the 32-byte scale rows, both on a 32-byte pitch (token ``t`` of page ``p`` is data row
+    ``p * page_stride / 32 + 11 t`` and scale row ``p * page_stride / 32 + 11 * page_size + t``).  The data rows
+    overlap and must stay inside the storage."""
+    raw = flat.reshape(-1)
+    n = raw.numel()
+    data = raw.as_strided(
+        ((n - _NVFP4_DATA_BYTES) // _NVFP4_ROW_PITCH + 1, _NVFP4_DATA_BYTES),
+        (_NVFP4_ROW_PITCH, 1),
+    )
+    scales = raw.as_strided(
+        (n // _NVFP4_ROW_PITCH, _NVFP4_SF_BYTES), (_NVFP4_ROW_PITCH, 1)
+    )
+    return data, scales
+
+
+def _nvfp4_pool_geometry(
+    page_size: int, page_stride: int, *, name: str
+) -> tuple[int, int, int]:
+    """``(page_log2, pitch_units, footer_units)`` of a pool for the prefill bodies: the page size as a shift, the
+    page stride and the offset of the page's scale rows in 32-byte units."""
+    if page_stride % _NVFP4_ROW_PITCH:
+        raise ValueError(
+            f"{name}: page stride {page_stride} B must be a multiple of {_NVFP4_ROW_PITCH}"
+        )
+    return (
+        _log2_page_size(page_size, name=name),
+        page_stride // _NVFP4_ROW_PITCH,
+        (_NVFP4_DATA_BYTES // _NVFP4_ROW_PITCH) * page_size,
+    )
+
+
+def _nvfp4_pack_query(query_rows: torch.Tensor, packed: torch.Tensor) -> torch.Tensor:
+    """Quantize the BF16 query rows ``[T, H, 512]`` into ``packed`` (uint8, ``T * H * 384`` bytes of the workspace)
+    with the NVFP4 cache pack kernel, one row per page of one token: a row is exactly the cache ABI's token record
+    (352 data bytes, 32 scale bytes), which is what the prefill bodies read.  Returns the ``[T, H, 384]`` view."""
+    from ._sparse_mla_sm120._execution import (
+        get_sparse_mla_dsv4_nvfp4_cache_ops_module,
+    )
+
+    tokens, heads = int(query_rows.shape[0]), int(query_rows.shape[1])
+    rows = tokens * heads
+    latent = query_rows.reshape(rows, 1, _HEAD_DIM)
+    cache = packed.view(rows, 1, 1, _NVFP4_TOKEN_BYTES)
+    get_sparse_mla_dsv4_nvfp4_cache_ops_module().sparse_mla_sm120_nvfp4_quantize_pack(
+        latent, cache
+    )
+    return packed.view(tokens, heads, _NVFP4_TOKEN_BYTES)
+
+
+def _nvfp4_prefill(
+    *,
+    arch: str,
+    workspace: torch.Tensor,
+    raw: torch.Tensor,
+    layout: WorkspaceLayout,
+    query_rows: torch.Tensor,
+    out_rows: torch.Tensor,
+    lse_out: torch.Tensor,
+    main: tuple[torch.Tensor, int, int],
+    extra: tuple[torch.Tensor, int, int],
+    main_indices: torch.Tensor,
+    extra_indices: torch.Tensor,
+    main_lengths: Optional[torch.Tensor],
+    extra_lengths: Optional[torch.Tensor],
+    main_width: int,
+    extra_width: int,
+    sinks: Optional[torch.Tensor],
+    sink_tensor: torch.Tensor,
+    scale1: torch.Tensor,
+    scale2: torch.Tensor,
+    max_q_len: Optional[int],
+) -> None:
+    """Launch one of the NVFP4 prefill bodies on ``num_query_tokens`` rows.
+
+    ``H <= 64`` runs the single-CTA ``nvfp4_h64_prefill`` body (one CTA per
+    query token), ``H128`` the two-CTA ``nvfp4_h128_prefill`` body (one cluster
+    per token). Both read the query packed to the NVFP4 row format in the
+    workspace (:func:`_nvfp4_pack_query`), the pools through 32-byte-pitch data
+    and scale row views, and write the final BF16 output and base-2 LSE
+    directly. A table without a caller length vector gets one filled in the
+    workspace (every entry the table width).
+    """
+    num_query_tokens, num_heads = int(query_rows.shape[0]), int(query_rows.shape[1])
+    variant = (
+        _NVFP4_VARIANT_H64_PREFILL
+        if num_heads <= _NVFP4_H64_PREFILL_MAX_HEADS
+        else _NVFP4_VARIANT_H128_PREFILL
+    )
+    _require_nvfp4_variant(variant, arch=arch)
+
+    packed_offset, packed_bytes = layout.packed_query
+    packed = raw[
+        packed_offset : packed_offset
+        + num_query_tokens * num_heads * _NVFP4_TOKEN_BYTES
+    ]
+    q_packed = _nvfp4_pack_query(query_rows, packed)
+
+    lens_offset, lens_bytes = layout.prefill_lens
+    half = lens_bytes // 2
+
+    def lengths(given: Optional[torch.Tensor], width: int, slot: int) -> torch.Tensor:
+        if given is not None:
+            return given
+        start = lens_offset + slot * half
+        view = raw[start : start + num_query_tokens * torch.int32.itemsize].view(
+            torch.int32
+        )
+        view.fill_(width)
+        return view
+
+    main_lens = lengths(main_lengths, main_width, 0)
+    extra_lens = lengths(extra_lengths, extra_width, 1) if extra_width else main_lens
+
+    main_flat, main_page_size, main_page_stride = main
+    main_data, main_sf = _nvfp4_pool_row_views(main_flat)
+    main_page_log2, main_pitch_units, main_footer_units = _nvfp4_pool_geometry(
+        main_page_size, main_page_stride, name="swa_kv_cache"
+    )
+    if extra_width:
+        extra_flat, extra_page_size, extra_page_stride = extra
+        extra_data, extra_sf = _nvfp4_pool_row_views(extra_flat)
+        extra_page_log2, extra_pitch_units, extra_footer_units = _nvfp4_pool_geometry(
+            extra_page_size, extra_page_stride, name="compressed_kv_cache"
+        )
+    else:
+        extra_data, extra_sf = main_data, main_sf
+        extra_page_log2, extra_pitch_units, extra_footer_units = (
+            main_page_log2,
+            main_pitch_units,
+            main_footer_units,
+        )
+
+    values: dict[str, Any] = {
+        "Q": q_packed,
+        "SWA_cache": main_data,
+        "SWA_sf": main_sf,
+        "compressed_KV_cache": extra_data,
+        "compressed_KV_sf": extra_sf,
+        "O": out_rows,
+        "LSE": lse_out,
+        "swa_indices": main_indices,
+        "compressed_indices": extra_indices,
+        "sparse_topk_lens": main_lens,
+        "extra_topk_lens": extra_lens,
+        "sinks": sink_tensor,
+        "bmm1_scale": scale1,
+        "bmm2_scale": scale2,
+        "num_heads": num_heads,
+        "swa_index_stride": int(main_indices.stride(0)),
+        "compressed_index_stride": int(extra_indices.stride(0)),
+        "sparse_topk_lens_offset": 0,
+        "num_query_tokens": num_query_tokens,
+        "sparse_topk": main_width + extra_width,
+        "has_sinks": int(sinks is not None),
+        # Work items are query tokens; the body maps item (x, z) to token z * max_q_len + x
+        # and the launch keeps every item in x, so max_q_len only has to be positive.
+        "total_work_items": num_query_tokens,
+        "max_q_len": int(max_q_len) if max_q_len is not None else num_query_tokens,
+        "swa_page_log2": main_page_log2,
+        "swa_pitch_units": main_pitch_units,
+        "swa_footer_units": main_footer_units,
+        "compressed_page_log2": extra_page_log2,
+        "compressed_pitch_units": extra_pitch_units,
+        "compressed_footer_units": extra_footer_units,
+        "swa_width": main_width,
+        "compressed_width": extra_width,
+    }
+    launcher = _Launcher(arch=arch, workspace=workspace, raw=raw, values=values)
+    ctas = 1 if variant == _NVFP4_VARIANT_H64_PREFILL else 2
+    launcher.run(launcher.variant(variant, grid=(num_query_tokens * ctas, 1, 1)))
 
 
 def _nvfp4_gather4_views(flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
