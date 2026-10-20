@@ -3809,6 +3809,8 @@ def _stand_in_nope_program(monkeypatch, calls: list) -> dict:
         return SimpleNamespace(run=run)
 
     monkeypatch.setattr(cake_jit, "load_cake_dsa_train_module", load)
+    # the recording entries take the host tensors as they are: the tvm-ffi conversion stands in as identity
+    monkeypatch.setattr(cake_backend, "_ffi_tensor", lambda tensor: tensor)
     cake_backend.BINDING_CACHE.clear()
     return record
 
@@ -4158,6 +4160,65 @@ def test_nope_autograd_backward_is_settled_at_forward_and_launches_back_to_back(
     assert all(k in ("alloc", "fill") for k in kinds[1:-1]) and "fill" in kinds, events
     assert events[3][1] == (S, D_LATENT)
     assert tuple(dq2.shape) == (T, NUM_HEADS, D_LATENT)
+
+
+def test_nope_index_prep_route_issues_the_forward_with_nothing_left_to_do(
+    monkeypatch,
+):
+    """On the preparation route the packed entry allocates every buffer, binds the forward's values and converts
+    its tensor operands before the stage launch; between the two launches nothing runs but the forward's binding
+    call.  The kernel route keeps its single launch without any conversion."""
+    calls = []
+    _stand_in_index_prep(monkeypatch, calls)
+    events = []
+    real_alloc = cake_backend._alloc
+
+    def alloc(*args, **kwargs):
+        events.append("alloc")
+        return real_alloc(*args, **kwargs)
+
+    def convert(tensor):
+        events.append("convert")
+        return tensor
+
+    monkeypatch.setattr(cake_backend, "_alloc", alloc)
+    monkeypatch.setattr(cake_backend, "_ffi_tensor", convert)
+    for stage in (NOPE_INDEX_PREP_STAGE, "nope_fwd"):
+        real_launch = cake_launch.LAUNCH[stage]
+
+        def launch(run, values, grid, _real=real_launch, _stage=stage):
+            events.append(("launch", _stage))
+            return _real(run, values, grid)
+
+        monkeypatch.setitem(cake_launch.LAUNCH, stage, launch)
+    local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
+    T, K = (int(d) for d in local.shape)
+    q, kv, _ = _nope_host_inputs(total_q=T, total_k=18, topk=K, device="cuda")
+    mine = torch.full((T,), 2, dtype=torch.int32, device="cuda")
+    for _ in range(
+        2
+    ):  # the first call plans, the second hits the binding cache: same launch order
+        del events[:], calls[:]
+        out, lse, o_lo, indices, lengths = cake_backend.forward_nope_varlen(
+            q, kv, local, cu_q, cu_k, causal=True, topk_length=mine
+        )
+        first = events.index(("launch", NOPE_INDEX_PREP_STAGE))
+        assert events[first:] == [
+            ("launch", NOPE_INDEX_PREP_STAGE),
+            ("launch", "nope_fwd"),
+        ], events
+        before = events[:first]
+        assert "convert" in before and before.count("alloc") >= 5, events
+        assert lengths is mine and [c[0] for c in calls] == [
+            NOPE_INDEX_PREP_STAGE,
+            "nope_fwd",
+        ]
+        assert calls[1][1]["out"] is out and calls[1][1]["indices"] is indices
+    # the kernel route: one launch from the host tensors, nothing converted
+    del events[:], calls[:]
+    cake_backend.forward_nope_varlen(q, kv, local, cu_q, cu_k, causal=True)
+    assert [e for e in events if e != "alloc"] == [("launch", "nope_fwd")], events
+    assert [c[0] for c in calls] == ["nope_fwd"]
 
 
 def test_nope_kernel_level_packed_forward_is_the_public_entry_without_autograd(

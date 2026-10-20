@@ -368,7 +368,10 @@ out = dsa_sparse_attention_nope_varlen(q, kv, gather_kv_indices, cu_seqlens_q, c
   128-thread CTA, any index row stride read in place; on large tables it
   converts faster than the forward's own producer path) and the forward takes
   its rows -- the host prepares the forward's plan, outputs and launch
-  arguments before the first launch, so no host work sits between the two.
+  arguments and converts its operands before the first launch, then issues
+  the forward from those pre-bound values inside the same stream context, so
+  only the forward's binding call sits between the two launches (it hides
+  behind the stage's kernel).
   `causal=True` drops keys after the query's own position, query segments are
   tails of their key prefix.  The NoPE entries have no torch fallback.
 * Backward host order: the autograd wrappers settle their backward at forward

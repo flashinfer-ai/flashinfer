@@ -1326,6 +1326,22 @@ def _ffi_stream_context(index: int):
     return tvm_ffi.use_raw_stream(device, raw)
 
 
+def _ffi_tensor(tensor: torch.Tensor) -> Any:
+    """The tvm-ffi view of ``tensor`` (zero-copy: the same pointer, shape, strides and dtype the binding reads when
+    it converts a torch tensor itself).  Module attribute so tests can stand it in."""
+    return tvm_ffi.from_dlpack(tensor.detach() if tensor.requires_grad else tensor)
+
+
+def _ffi_values(values: dict[str, Any]) -> dict[str, Any]:
+    """``values`` with every tensor converted to its tvm-ffi view now: a launch issued later over the result costs
+    its binding call alone (no per-operand conversion), which is how the packed entry issues the forward right
+    after the index-preparation launch."""
+    return {
+        name: _ffi_tensor(value) if isinstance(value, torch.Tensor) else value
+        for name, value in values.items()
+    }
+
+
 @dataclass(frozen=True)
 class _StageEntry:
     """The loaded entry of one stage for one architecture: generated launcher, binding entry, grid."""
@@ -3567,6 +3583,20 @@ class _NopeBinding(_Binding):
         issues the forward stage.  The varlen entry binds first, launches its index preparation and then calls
         ``launch()``, so the forward kernel follows that launch with no host work in between.  ``extra``: further
         launch values (the operands of a forward program that converts per-document index rows itself)."""
+        (out, lse, o_lo), values = self._forward_values(
+            q_latent, kv_latent, indices, topk_length, extra
+        )
+        stages = self.plan.forward_stages
+
+        def launch() -> None:
+            self._run(values, stages)
+
+        return (out, lse, o_lo), launch
+
+    def _forward_values(
+        self, q_latent, kv_latent, indices, topk_length, extra=None
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], dict[str, Any]]:
+        """The forward's fresh outputs and its bound launch values."""
         T, device = self.plan.num_queries, q_latent.device
         out = _alloc((T, NUM_HEADS, D_LATENT), torch.bfloat16, device)
         lse = _alloc((T, NUM_HEADS), torch.float32, device)
@@ -3583,12 +3613,30 @@ class _NopeBinding(_Binding):
         values = _bound_values_nope(self.plan, t)
         if extra:
             values.update(extra)
-        stages = self.plan.forward_stages
+        return (out, lse, o_lo), values
 
-        def launch() -> None:
-            self._run(values, stages)
-
-        return (out, lse, o_lo), launch
+    def prebound_forward(
+        self, q_latent, kv_latent, indices, topk_length, extra=None
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], tuple[_Launch, ...]]:
+        """``((out, lse, o_lo), launches)``: as :meth:`prepared_forward`, with every tensor operand converted to its
+        tvm-ffi view now and the forward's stage entries bound to those values.  Each launch, issued by the caller
+        inside its own FFI stream context, costs one binding call and nothing else: the packed entry issues the
+        forward this way right after the index-preparation launch."""
+        (out, lse, o_lo), values = self._forward_values(
+            q_latent, kv_latent, indices, topk_length, extra
+        )
+        plan, values = self.plan, _ffi_values(values)
+        launches = []
+        for key in plan.forward_stages:
+            if isinstance(key, tuple):
+                stage, chunk, index = key
+                e = plan.entries[(stage, chunk)]
+                bound = dict(values, **_ffi_values(plan.pass_overrides[chunk][index]))
+                launches.append(_Launch(stage, e.launcher, e.run, bound, e.grid))
+            else:
+                e = plan.entries[key]
+                launches.append(_Launch(key, e.launcher, e.run, values, e.grid))
+        return (out, lse, o_lo), tuple(launches)
 
     def forward(self, q_latent, kv_latent, indices, topk_length):
         outputs, launch = self.prepared_forward(
@@ -4349,7 +4397,7 @@ def _check_gather_kv_indices(
         )
 
 
-def _launch_index_prep(
+def _index_prep_launch(
     arch: str,
     gather_kv_indices: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
@@ -4358,8 +4406,9 @@ def _launch_index_prep(
     causal: bool,
     out: torch.Tensor,
     topk_length: torch.Tensor,
-) -> None:
-    """One launch of the index-preparation stage over the per-document rows ``gather_kv_indices`` (int32
+) -> _Launch:
+    """The bound launch (not yet issued; the caller provides the FFI stream context) of one index-preparation
+    stage call over the per-document rows ``gather_kv_indices`` (int32
     ``[T, K_slots]``, ``T >= 1``, any row stride, on a device the stage serves) with the prefix sums: the global
     key rows (invalid slots ``-1``) go to the caller's contiguous int32 ``out [T, K_slots]``, the row lengths (last
     valid slot + 1) to the caller's int32 ``topk_length [T]``.  Row ``t`` belongs to the last document ``n`` with
@@ -4399,8 +4448,31 @@ def _launch_index_prep(
         cake_jit.NOPE_PROGRAM,
         index_prep_grid(num_rows),
     )
+    return _Launch(NOPE_INDEX_PREP_STAGE, entry.launcher, entry.run, values, entry.grid)
+
+
+def _launch_index_prep(
+    arch: str,
+    gather_kv_indices: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    *,
+    causal: bool,
+    out: torch.Tensor,
+    topk_length: torch.Tensor,
+) -> None:
+    """:func:`_index_prep_launch` issued inside the FFI stream context of the index rows' device."""
+    launch = _index_prep_launch(
+        arch,
+        gather_kv_indices,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        causal=causal,
+        out=out,
+        topk_length=topk_length,
+    )
     with _ffi_stream_context(_device_index(gather_kv_indices.device)):
-        entry.launcher(entry.run, values, entry.grid)
+        launch()
 
 
 def nope_globalize_indices(
@@ -4458,9 +4530,10 @@ def _packed_forward_nope(
 ):
     """The packed forward over per-document index rows, ``(out, lse, o_lo, indices, lengths)``: the plan, the
     outputs and the launch values are settled before the first launch; ``mode == "index_prep"`` issues the
-    preparation launch into the fresh ``indices`` / ``lengths`` right before the forward, ``mode == "kernel"`` lets
-    the forward convert the rows itself (``convert = 1``, the lengths derived).  ``indices`` (global key rows) and
-    ``lengths`` are what the backward reads."""
+    preparation launch into the fresh ``indices`` / ``lengths`` and then the forward from pre-converted operands
+    (:meth:`_NopeBinding.prebound_forward`) with nothing else in between, ``mode == "kernel"`` lets the forward
+    convert the rows itself (``convert = 1``, the lengths derived) in its single launch.  ``indices`` (global key
+    rows) and ``lengths`` are what the backward reads."""
     arch = _nope_arch(gather_kv_indices)
     num_rows, topk = int(q_latent.shape[0]), int(gather_kv_indices.shape[1])
     device = q_latent.device
@@ -4511,20 +4584,31 @@ def _packed_forward_nope(
         ),
         _NopeBinding,
     )
-    (out, lse, o_lo), launch = binding.prepared_forward(
-        q_latent, kv_latent, plan_indices, lengths, extra
-    )
-    if mode != "kernel":
-        _launch_index_prep(
-            arch,
-            gather_kv_indices,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            causal=causal,
-            out=indices,
-            topk_length=derived,
+    if mode == "kernel":
+        (out, lse, o_lo), launch = binding.prepared_forward(
+            q_latent, kv_latent, plan_indices, lengths, extra
         )
-    launch()
+        launch()
+        return out, lse, o_lo, indices, lengths
+    # the preparation route: every allocation, launch value and operand conversion of both launches first, then
+    # -- inside one stream context -- the stage launch and the pre-bound forward launch with nothing in between
+    # (the forward's binding call is all that separates them, so it hides behind the stage's kernel)
+    (out, lse, o_lo), launches = binding.prebound_forward(
+        q_latent, kv_latent, indices, lengths
+    )
+    prep = _index_prep_launch(
+        arch,
+        gather_kv_indices,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        causal=causal,
+        out=indices,
+        topk_length=derived,
+    )
+    with _ffi_stream_context(_device_index(device)):
+        prep()
+        for launch in launches:
+            launch()
     return out, lse, o_lo, indices, lengths
 
 
