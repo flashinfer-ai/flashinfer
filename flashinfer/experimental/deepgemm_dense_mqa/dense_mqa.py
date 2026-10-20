@@ -29,6 +29,18 @@ the CTA-scan classes ``le768:short`` (FP8) / ``le1024:short`` (FP4)). A class
 is named by its query-BLOCK ceiling and served while the KV length is within
 the catalog policy's bound for that class (``fused_*_max_kv``); above the
 bound the two-launch route of the same query count serves the call.
+
+64-head routes are ONE logits launch each: the grid-stride production text
+(the ``q1`` and ``<tier>`` routes, no metadata buffer), its one-split text
+(the ``:short`` routes: ``K <= policy.dense_short.max_kv`` and at least two
+query blocks) or -- where the catalog carries ``policy.dense_kvsplit`` -- the
+production text under its in-kernel KV-split plan (the ``:kvsplit`` routes:
+``K > dense_kvsplit.min_kv`` and fewer query blocks than the architecture's
+catalogued SM count ``dense_kvsplit.sm_count[arch]``; the plan text of the
+query count -- ``q1`` / ``qle128`` / ``qle2048`` -- recomputes the tiered
+schedule in every CTA and writes it into the plan's own ``metadata`` buffer,
+launch grid = the SM count).  The KV-split gate is the only SM-count dependent
+rule and is applied at the catalogued count, not the device's.
 """
 
 from __future__ import annotations
@@ -38,7 +50,7 @@ import json
 from pathlib import Path
 
 _ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
-CATALOG_SCHEMA = "dense_mqa.v10"
+CATALOG_SCHEMA = "dense_mqa.v11"
 NUM_HEADS = 32  # default head count of the public helpers
 BLOCK_QH = 128  # query rows x heads per MMA tile
 BLOCK_Q = BLOCK_QH // NUM_HEADS
@@ -266,6 +278,13 @@ def _route_name_on(precision, queries, keys, num_heads, arch, *, qle2048_max_kv=
             if queries == 1
             else f"{prefix}:{metadata_tier(queries, num_heads)}"
         )
+    if num_heads != NUM_HEADS:
+        # the in-kernel KV-split plan of a gated 64-head call (K > dense_kvsplit.min_kv: disjoint from the one-split rule)
+        plan = h64_kvsplit_plan(queries, keys, num_heads, arch=arch)
+        if plan == "q1":
+            return f"{prefix}:q1:kvsplit"
+        if plan is not None:
+            return f"{prefix}:{kind}:{plan}:kvsplit"
     if queries == 1:
         if num_heads == NUM_HEADS and keys <= policy["fused_q1_max_kv"]:
             return f"{prefix}:q1:short"
@@ -320,7 +339,13 @@ def route_name(precision, queries, keys, num_heads=NUM_HEADS):
     of the shared block ceilings (``le8`` / ``le64`` / ``le1024`` / ``any`` for 64
     heads); a 64-head call with ``K <= policy.dense_short.max_kv`` and at least
     ``policy.dense_short.min_q_blocks`` query blocks names the one-split
-    ``:short`` route of its kind (:func:`h64_short_shape`). Whether the catalog
+    ``:short`` route of its kind (:func:`h64_short_shape`), and a 64-head call
+    with ``K > policy.dense_kvsplit.min_kv`` and fewer query blocks than the
+    architecture's catalogued SM count names the in-kernel KV-split route of its
+    plan text -- ``fp8:h64:q1:kvsplit`` or ``fp8:h64:{full,partial}:{qle128,qle2048}:kvsplit``
+    (:func:`h64_kvsplit_plan`; the one SM-count dependent rule, so a query count
+    the catalogued counts disagree on has no logical route -- ``ValueError``,
+    pass the device to :func:`served_route`). Whether the catalog
     ships the route is a separate question (:func:`dense_route_available`), and
     which route the device is served is :func:`served_route`.
 
@@ -350,7 +375,7 @@ def route_name(precision, queries, keys, num_heads=NUM_HEADS):
     if len(set(verdicts.values())) != 1:
         raise ValueError(
             f"dense MQA route of {(precision, num_heads, queries, keys)} differs by architecture {verdicts} "
-            "(policy.single_launch_precedence); pass arch=device_arch(device) to served_route"
+            "(policy.single_launch_precedence / policy.dense_kvsplit.sm_count); pass arch=device_arch(device) to served_route"
         )
     return next(iter(verdicts.values()))
 
@@ -383,9 +408,98 @@ def h64_short_shape(queries, keys, num_heads=64):
     return keys <= int(short["max_kv"]) and blocks >= int(short["min_q_blocks"])
 
 
-def _h64_tier_fallback(precision, queries, num_heads, route):
+def _h64_tier_fallback(
+    precision, queries, num_heads, route, arch=None, *, shipped=True
+):
     kind = route.split(":")[-2]
-    return f"{_route_prefix(precision, num_heads)}:{kind}:{metadata_tier(queries, num_heads)}"
+    return _h64_grid_stride_route(
+        precision, queries, num_heads, kind, arch, shipped=shipped
+    )
+
+
+def _h64_grid_stride_route(
+    precision, queries, num_heads, kind, arch=None, *, shipped=True
+):
+    """The grid-stride tier route of ``kind`` (``full`` / ``partial``) a withheld or uncatalogued 64-head ``:short`` /
+    ``:kvsplit`` call is served by: among the tier of the query count (:func:`metadata_tier`) and the wider tiers up
+    to ``:any``, the first route the catalog carries and ``arch`` admits, else the first the catalog carries (the
+    caller's admission check then refuses the call) -- a fallback always names a program the catalog ships, never a
+    tier it leaves unshipped.  ``shipped=False`` returns the query count's tier route regardless (the export's own
+    resolution).  ``arch=None`` requires the architectures to agree on the admission of every tier consulted."""
+    prefix = _route_prefix(precision, num_heads)
+    tier = metadata_tier(queries, num_heads)
+    if not shipped:
+        return f"{prefix}:{kind}:{tier}"
+    bq = block_q(num_heads)
+    tiers = [
+        "any" if max_blocks is None else f"le{int(max_blocks) * bq}"
+        for max_blocks in _catalog()["policy"]["metadata_tier_blocks"]
+    ]
+    routes = _catalog()["routes"]
+    candidates = [
+        f"{prefix}:{kind}:{candidate}"
+        for candidate in tiers[tiers.index(tier) :]
+        if f"{prefix}:{kind}:{candidate}" in routes
+    ]
+    if not candidates:
+        raise ValueError(
+            f"the catalog ships no grid-stride {kind} route for {queries} queries of {num_heads} heads"
+        )
+    for route in candidates:
+        if _admitted(route, arch):
+            return route
+    return candidates[0]
+
+
+def h64_kvsplit_plan(queries, keys, num_heads=64, *, arch):
+    """The shape-only gate of the 64-head in-kernel KV-split routes (``policy.dense_kvsplit``) at the catalogued SM
+    count of ``arch`` (``dense_kvsplit.sm_count[arch]``; no device query -- a device whose SM count differs from its
+    architecture's entry is routed as the catalogue says, the program takes the launch grid at runtime): the plan
+    text (``q1`` / ``qle128`` / ``qle2048``, the inclusive query bands ``dense_kvsplit.plans``) when
+    ``K > dense_kvsplit.min_kv`` and ``ceil(Q / block_q) < sm_count``, else ``None`` (the grid-stride route).
+    ``None`` as well for 32 heads, when the catalog has no ``dense_kvsplit`` policy, or when the catalogued SM count
+    exceeds ``dense_kvsplit.max_sms`` (the plan's CTA bound)."""
+    gate = _catalog()["policy"].get("dense_kvsplit")
+    if gate is None or num_heads == NUM_HEADS:
+        return None
+    counts = gate["sm_count"]
+    if arch not in counts:
+        raise ValueError(f"arch must be one of {sorted(counts)}, got {arch!r}")
+    sm_count = int(counts[arch])
+    if sm_count > int(gate["max_sms"]):
+        return None
+    bq = block_q(num_heads)
+    blocks = (queries + bq - 1) // bq
+    if blocks >= sm_count or keys <= int(gate["min_kv"]):
+        return None
+    for plan, (low, high) in gate["plans"].items():
+        if int(low) <= queries <= int(high):
+            return plan
+    return None
+
+
+def _h64_kvsplit_fallback(
+    precision, queries, num_heads, route, arch=None, *, shipped=True
+):
+    """The grid-stride route a ``:kvsplit`` route the catalog does not carry or ``arch`` withholds is served by
+    (``policy.dense_kvsplit.fallback == "tier"``): the ``q1`` route for the Q = 1 closed form, else the shipped tier
+    route of the same query count and block kind (:func:`_h64_grid_stride_route`: the next wider tier where the
+    catalog leaves the query count's own tier unshipped or ``arch`` withholds it)."""
+    parts = route.split(":")
+    prefix = _route_prefix(precision, num_heads)
+    if parts[-2] == "q1":
+        return f"{prefix}:q1"
+    return _h64_grid_stride_route(
+        precision, queries, num_heads, parts[-3], arch, shipped=shipped
+    )
+
+
+def route_owns_metadata(route, num_heads=NUM_HEADS):
+    """True when a plan on ``route`` owns a ``metadata`` buffer: every route of a head count whose schedule runs a
+    metadata stage (:func:`schedules_metadata`: the 32-head routes, their ``:short`` routes write the buffer
+    in-kernel) and the 64-head ``:kvsplit`` routes (the plan text writes the tiered schedule into it in-kernel;
+    ``metadata_words(Q, num_sms, 64)`` int32 words).  The other 64-head routes have no buffer."""
+    return bool(schedules_metadata(num_heads)) or str(route).endswith(":kvsplit")
 
 
 def served_route(precision, queries, keys, num_heads=NUM_HEADS, *, arch=None):
@@ -395,9 +509,11 @@ def served_route(precision, queries, keys, num_heads=NUM_HEADS, *, arch=None):
     in the tier's order or by the two-launch tier route of its query count) -- and (ii) a 64-head ``:short`` route the
     catalog does not carry or ``arch`` withholds (``policy.dense_admission``) is served by the tier route of the same
     query count -- the production program the tier table admits -- never by the stock kernel
-    (``policy.dense_short.fallback == "tier"``). ``arch=None`` is accepted only where the architectures agree (on the
-    fused Q <= 2048 bound for ``keys``, on the tier's precedence and on the short route's admission; ``ValueError``
-    otherwise, as :func:`_admitted`)."""
+    (``policy.dense_short.fallback == "tier"``), and (iii) a 64-head ``:kvsplit`` route the catalog does not carry or
+    ``arch`` withholds is served by the grid-stride ``q1`` / tier route of the same query count
+    (``policy.dense_kvsplit.fallback == "tier"``). ``arch=None`` is accepted only where the architectures agree (on the
+    fused Q <= 2048 bound for ``keys``, on the tier's precedence, on the KV-split gate at their catalogued SM counts and
+    on the short / KV-split route's admission; ``ValueError`` otherwise, as :func:`_admitted`)."""
     arches = sorted(_catalog()["arches"])
     if arch is None:
         verdicts = {
@@ -406,8 +522,8 @@ def served_route(precision, queries, keys, num_heads=NUM_HEADS, *, arch=None):
         if len(set(verdicts.values())) != 1:
             raise ValueError(
                 f"dense MQA route of {(precision, num_heads, queries, keys)} is served per architecture as {verdicts} "
-                f"(policy.fused_qle2048_max_kv {_fused_qle2048_bounds()} / policy.single_launch_precedence); "
-                "pass arch=device_arch(device)"
+                f"(policy.fused_qle2048_max_kv {_fused_qle2048_bounds()} / policy.single_launch_precedence / "
+                "policy.dense_kvsplit.sm_count); pass arch=device_arch(device)"
             )
         route = next(iter(verdicts.values()))
     else:
@@ -416,17 +532,27 @@ def served_route(precision, queries, keys, num_heads=NUM_HEADS, *, arch=None):
         route = _route_name_on(precision, queries, keys, num_heads, arch)
     if num_heads != NUM_HEADS and route.endswith(":short"):
         if route not in _catalog()["routes"] or not _admitted(route, arch):
-            return _h64_tier_fallback(precision, queries, num_heads, route)
+            return _h64_tier_fallback(precision, queries, num_heads, route, arch)
+    if num_heads != NUM_HEADS and route.endswith(":kvsplit"):
+        if route not in _catalog()["routes"] or not _admitted(route, arch):
+            return _h64_kvsplit_fallback(precision, queries, num_heads, route, arch)
     return route
 
 
 def _export_route(precision, queries, keys, num_heads=NUM_HEADS):
     """The route the export resolves for a point (admission is routing policy, not a precondition of the
-    program): :func:`route_name`, or the tier route when a 64-head ``:short`` route has no catalog record."""
+    program): :func:`route_name`, or the grid-stride route when a 64-head ``:short`` / ``:kvsplit`` route has no catalog
+    record."""
     route = route_name(precision, queries, keys, num_heads)
-    short = num_heads != NUM_HEADS and route.endswith(":short")
-    if short and route not in _catalog()["routes"]:
-        return _h64_tier_fallback(precision, queries, num_heads, route)
+    if num_heads != NUM_HEADS and route not in _catalog()["routes"]:
+        if route.endswith(":short"):
+            return _h64_tier_fallback(
+                precision, queries, num_heads, route, shipped=False
+            )
+        if route.endswith(":kvsplit"):
+            return _h64_kvsplit_fallback(
+                precision, queries, num_heads, route, shipped=False
+            )
     return route
 
 
@@ -611,8 +737,9 @@ def metadata_tier(queries, num_heads=NUM_HEADS):
 
 def schedules_metadata(num_heads=NUM_HEADS):
     """True when the routes of ``num_heads`` run a metadata stage (the shipped 32-head schedule). The
-    64-head programs are single-stage: gridDim-strided over the tiles, no metadata program, their
-    ``ScheduleMeta`` operand bound to ``ks`` and unused."""
+    64-head programs are single-stage: no metadata program; the grid-stride and one-split texts bind their
+    ``ScheduleMeta`` operand to ``ks`` and never read it, the ``:kvsplit`` plan texts write their schedule into the
+    plan's own buffer (:func:`route_owns_metadata`)."""
     records = _catalog()["routes"].values()
     return any(
         int(record["num_heads"]) == int(num_heads)
@@ -661,8 +788,9 @@ def stage_bindings(
     queries, keys = starts.numel(), kv.shape[0]
     bq = block_q(num_heads)
     blocks = (queries + bq - 1) // bq
-    # Single-stage routes (the 64-head programs) have no metadata buffer: their ScheduleMeta operand is
-    # bound to ks and never read; the producer plan is unused.
+    # Single-stage routes without a metadata buffer (the 64-head grid-stride and one-split programs) bind their
+    # ScheduleMeta operand to ks and never read it; the producer plan is unused.  A 64-head ``:kvsplit`` plan passes
+    # the buffer its program writes in-kernel (``route_owns_metadata``).
     schedule_meta = (metadata if metadata is not None else starts).view(torch.uint32)
     producer = dict(
         Starts=starts.view(torch.uint32),
@@ -771,13 +899,17 @@ class DenseMqaPlan:
     FP32 with physical row stride logits_stride(K) = align8(K + 256); consume
     output[:, :K] (``logical_output``). On the 32-head routes every cell of the
     output is written by each submission (``clean_logits == "fused"``); the
-    64-head routes are single-stage without a metadata buffer (``metadata`` must
-    be None, ``plan.metadata`` is None, the program is gridDim-strided over the
-    tiles from the ``sm_count`` launch grid) and store raw tiles only (cells
-    outside the windows are unspecified); the 32-head ``:short`` routes (fused
-    single-query chain, in-kernel warp / CTA scan classes, the fused tiered
+    64-head routes are single-stage and store raw tiles only (cells outside the
+    windows are unspecified): the grid-stride and one-split routes have no
+    metadata buffer (``metadata`` must be None, ``plan.metadata`` is None, the
+    program is gridDim-strided over the tiles from the ``sm_count`` launch grid),
+    the ``:kvsplit`` routes own the ``metadata_words(Q, num_sms, 64)`` int32
+    buffer their plan text writes in-kernel (``metadata`` may be passed or is
+    allocated; the plan is one launch of ``sm_count`` CTAs and a CTA budget above
+    ``policy.dense_kvsplit.max_sms`` is refused); the 32-head ``:short`` routes
+    (fused single-query chain, in-kernel warp / CTA scan classes, the fused tiered
     ``fp8:qle128:short`` / ``fp8:qle2048:short`` texts) have no metadata stage but
-    still own the buffer their program writes in-kernel.
+    still own the buffer their program writes in-kernel (:func:`route_owns_metadata`).
     FP4 output storage must include the final query tile.
     """
 
@@ -957,12 +1089,19 @@ class DenseMqaPlan:
             raise ValueError(
                 f"FP4 output backing storage must include the final {bq}-row tile"
             )
-        # The metadata buffer belongs to the head count's schedule, not to the route's stage list: the
-        # shipped 32-head ``:short`` routes (fp8:q1:short, fp8:q128:short, the le32 / le768 / le1024 scan
-        # classes, fp4:q1:short) have no metadata stage yet WRITE their schedule into ScheduleMeta
-        # in-kernel, so every 32-head plan owns the buffer; the 64-head
-        # programs never touch it (ScheduleMeta bound to ks).
-        if schedules_metadata(num_heads):
+        # The metadata buffer belongs to the route's program, not to the route's stage list: the shipped 32-head
+        # ``:short`` routes (fp8:q1:short, fp8:q128:short, the le32 / le768 / le1024 scan classes, fp4:q1:short)
+        # have no metadata stage yet WRITE their schedule into ScheduleMeta in-kernel, so every 32-head plan owns
+        # the buffer; so does a 64-head ``:kvsplit`` plan (the plan text recomputes the tiered schedule in every CTA
+        # and writes it; ``route_owns_metadata``); the other 64-head programs never touch it (ScheduleMeta bound to ks).
+        if self.route_name.endswith(":kvsplit"):
+            max_sms = int(_catalog()["policy"]["dense_kvsplit"]["max_sms"])
+            if num_sms > max_sms:
+                raise ValueError(
+                    f"route {self.route_name}: the in-kernel KV-split plan runs on at most {max_sms} CTAs "
+                    f"(policy.dense_kvsplit.max_sms); sm_count = {num_sms}"
+                )
+        if route_owns_metadata(self.route_name, num_heads):
             words = metadata_words(queries, num_sms, num_heads)
             if metadata is None:
                 metadata = torch.empty(words, dtype=torch.int32, device=q.device)
