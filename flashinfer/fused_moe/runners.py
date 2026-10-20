@@ -6969,6 +6969,11 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
         return self.cake_family
 
     def _check_support(self) -> None:
+        # Fused shared experts are rejected before the base checks so the
+        # rejection reads like every other non-supporting backend's whatever
+        # activation the configuration names: the Cake family serves SwiGLUStep
+        # only, and the base order would report the activation first.
+        self._assert_shared_experts_supported()
         super()._check_support()
         from ..tllm_enums import RoutingMethodType
         from .api import _resolve_cake_stepfun_knobs
@@ -6986,12 +6991,6 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
             raise NotImplementedError(
                 f"{type(self).__name__} routes with RoutingMethodType.Renormalize "
                 f"only, got {routing.method!r}."
-            )
-        if self.config.experts.num_fused_shared_experts:
-            raise NotImplementedError(
-                f"{type(self).__name__} does not support fused shared experts "
-                "(num_fused_shared_experts="
-                f"{self.config.experts.num_fused_shared_experts})."
             )
         # FLASHINFER_CAKE_STEPFUN_FULL_PATH (``0`` names the removed FC1-only
         # hybrid and raises), the reserved overlap SMs of the cooperative router

@@ -697,8 +697,15 @@ def test_config_is_explicit_exact_sm100_sm103_and_stepfun_only():
 
 
 @pytest.mark.parametrize("precision", list(PRECISIONS))
-def test_fused_shared_experts_are_rejected_by_every_family(precision):
-    """The Cake router serves routed experts only: no family accepts fused shared experts."""
+@pytest.mark.parametrize(
+    "activation", [SwiGLUStep(), SwiGLU()], ids=["swiglu_step", "swiglu"]
+)
+def test_fused_shared_experts_are_rejected_by_every_family(precision, activation):
+    """The Cake router serves routed experts only: no family accepts fused shared experts.
+
+    The rejection names the shared experts whatever activation the configuration
+    carries: ``tests/moe/test_unified_moe.py`` checks every non-supporting backend
+    with the default ``SwiGLU``, which the Cake family does not serve either."""
     spec = PRECISIONS[precision]
     assert spec.runner_cls.supports_fused_shared_experts is False
     assert CakeStepFunRunner.supports_fused_shared_experts is False
@@ -715,13 +722,15 @@ def test_fused_shared_experts_are_rejected_by_every_family(precision):
         experts=ExpertConfig(
             intermediate_size=I, local_num_experts=E, num_fused_shared_experts=1
         ),
-        activation=SwiGLUStep(),
+        activation=activation,
         backend=CAKE,
         execution=ExecutionConfig(enable_pdl=True, tune_max_num_tokens=8),
     )
     runner = CakeStepFunRunner(config, torch.device("cpu"))
     assert type(runner) is spec.runner_cls
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(
+        NotImplementedError, match="does not support fused shared experts"
+    ):
         runner.check_support()
 
 
