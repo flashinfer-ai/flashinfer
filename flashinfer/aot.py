@@ -193,10 +193,6 @@ from .jit.cake_sparse_mla_sm120_dsv41_mixed import (
     gen_cake_sparse_mla_sm120_dsv41_mixed_module,
 )
 from .jit.cake_concat_mla_kv_quant_fp8 import gen_concat_mla_kv_quant_fp8_aot_modules
-from .jit.cake_fused_qk_rope_fp8_append import (
-    # Aliased to the gen_*_modules form the CPU AOT tests stub by name.
-    aot_specs as gen_cake_fused_qk_rope_fp8_append_aot_modules,
-)
 from .jit.cake_grouped_mxfp8_quantize import (
     aot_specs as gen_cake_grouped_mxfp8_quantize_aot_modules,
 )
@@ -741,16 +737,6 @@ def gen_all_modules(
     # programs (other targets JIT it on first use).
     if has_sm100a_exact or has_sm103a_exact:
         jit_specs.append(gen_mla_kv_pack_fp8_module())
-    # Cake fused QK RMSNorm + NeoX RoPE + FP8 E4M3 quantize + paged KV append: one
-    # program, one library per exact target (module ``<program>_<target>_<digest>``).
-    # The sm_90a row follows the fa3 precedent (``has_sm90``: no exact sm90a flag
-    # exists); the Blackwell rows use the exact flags like the Cake programs above.
-    if has_sm90:
-        jit_specs.extend(gen_cake_fused_qk_rope_fp8_append_aot_modules("sm_90a"))
-    if has_sm100a_exact:
-        jit_specs.extend(gen_cake_fused_qk_rope_fp8_append_aot_modules("sm_100a"))
-    if has_sm103a_exact:
-        jit_specs.extend(gen_cake_fused_qk_rope_fp8_append_aot_modules("sm_103a"))
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
     blackwell_msa_targets: tuple[tuple[BlackwellMSATarget, bool], ...] = (
