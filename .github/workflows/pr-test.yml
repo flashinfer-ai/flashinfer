@@ -505,17 +505,18 @@ jobs:
           fi
 
       - name: Make JUnit XML readable
-        if: ${{ always() && (matrix.kind == 'h100' || startsWith(matrix.script, 'task_jit_run_tests_part')) }}
+        if: ${{ always() && matrix.kind != 'aot' }}
         run: |
           if [ -d junit ]; then
             sudo chmod -R a+rX junit
           fi
 
       - name: Upload JUnit XML and telemetry
-        if: ${{ always() && (matrix.kind == 'h100' || startsWith(matrix.script, 'task_jit_run_tests_part')) }}
+        if: ${{ always() && matrix.kind != 'aot' }}
         uses: actions/upload-artifact@v4
         with:
-          name: junit-${{ matrix.kind == 'h100' && 'h100' || matrix.script }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # Targeted A10G and T4 rows run the same script, so non-H100 names add the SM.
+          name: junit-${{ matrix.kind == 'h100' && 'h100' || format('{0}-{1}', matrix.script, matrix.runner[4]) }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             junit/**/*.xml
             junit/**/*.telemetry.json

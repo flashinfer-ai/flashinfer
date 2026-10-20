@@ -172,6 +172,7 @@ class _FakeSpec(jit_core.JitSpec):
 def test_build_and_load_records_build_time(tmp_path, monkeypatch):
     log = tmp_path / "builds.jsonl"
     monkeypatch.setenv("FLASHINFER_JIT_BUILD_LOG", str(log))
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
     spec = _FakeSpec(tmp_path)
     assert spec.build_and_load() == "built"
     assert spec.build_and_load() == "cached"  # a cache hit is not a build
@@ -185,6 +186,7 @@ def test_build_and_load_records_build_time(tmp_path, monkeypatch):
 
 def test_build_log_is_off_by_default(tmp_path, monkeypatch):
     monkeypatch.delenv("FLASHINFER_JIT_BUILD_LOG", raising=False)
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
     monkeypatch.chdir(tmp_path)
     _FakeSpec(tmp_path).build_and_load()
     assert not list(tmp_path.glob("*.jsonl"))
