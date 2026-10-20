@@ -18,11 +18,7 @@ typedef signed char int8_t;
 typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
 typedef unsigned int uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
 typedef unsigned long uint64_t;
-#endif
 static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int int32_t;
 typedef short int int16_t;
@@ -35,13 +31,7 @@ struct __align__(64) CakeTensorMap64 {
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
 
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) {
-  uint64_t opaque[16];
-} CUtensorMap;
-#else
 #include <cuda.h>
-#endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
 static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap),
@@ -1336,7 +1326,6 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2069e62b1
         float2 _pair_scale_even2_0 = make_float2(row_scale[0], row_scale[0]);
         float2 _pair_scale_odd2_0 = make_float2(row_scale[1], row_scale[1]);
         float2* _pair_scale_src2_0 = reinterpret_cast<float2*>(&(output + 0)[0]);
-#if __CUDA_ARCH__ >= 1000
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_0[0])
                      : "l"(*(unsigned long long*)&_pair_scale_even2_0));
@@ -1349,22 +1338,11 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2069e62b1
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_0[3])
                      : "l"(*(unsigned long long*)&_pair_scale_odd2_0));
-#else
-        (output + 0)[0] *= row_scale[0];
-        (output + 0)[1] *= row_scale[0];
-        (output + 0)[2] *= row_scale[1];
-        (output + 0)[3] *= row_scale[1];
-        (output + 0)[4] *= row_scale[0];
-        (output + 0)[5] *= row_scale[0];
-        (output + 0)[6] *= row_scale[1];
-        (output + 0)[7] *= row_scale[1];
-#endif
       }
       {
         float2 _pair_scale_even2_1 = make_float2(row_scale[0], row_scale[0]);
         float2 _pair_scale_odd2_1 = make_float2(row_scale[1], row_scale[1]);
         float2* _pair_scale_src2_1 = reinterpret_cast<float2*>(&(output + 8)[0]);
-#if __CUDA_ARCH__ >= 1000
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_1[0])
                      : "l"(*(unsigned long long*)&_pair_scale_even2_1));
@@ -1377,22 +1355,11 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2069e62b1
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_1[3])
                      : "l"(*(unsigned long long*)&_pair_scale_odd2_1));
-#else
-        (output + 8)[0] *= row_scale[0];
-        (output + 8)[1] *= row_scale[0];
-        (output + 8)[2] *= row_scale[1];
-        (output + 8)[3] *= row_scale[1];
-        (output + 8)[4] *= row_scale[0];
-        (output + 8)[5] *= row_scale[0];
-        (output + 8)[6] *= row_scale[1];
-        (output + 8)[7] *= row_scale[1];
-#endif
       }
       {
         float2 _pair_scale_even2_2 = make_float2(row_scale[0], row_scale[0]);
         float2 _pair_scale_odd2_2 = make_float2(row_scale[1], row_scale[1]);
         float2* _pair_scale_src2_2 = reinterpret_cast<float2*>(&(output + 16)[0]);
-#if __CUDA_ARCH__ >= 1000
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_2[0])
                      : "l"(*(unsigned long long*)&_pair_scale_even2_2));
@@ -1405,22 +1372,11 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2069e62b1
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_2[3])
                      : "l"(*(unsigned long long*)&_pair_scale_odd2_2));
-#else
-        (output + 16)[0] *= row_scale[0];
-        (output + 16)[1] *= row_scale[0];
-        (output + 16)[2] *= row_scale[1];
-        (output + 16)[3] *= row_scale[1];
-        (output + 16)[4] *= row_scale[0];
-        (output + 16)[5] *= row_scale[0];
-        (output + 16)[6] *= row_scale[1];
-        (output + 16)[7] *= row_scale[1];
-#endif
       }
       {
         float2 _pair_scale_even2_3 = make_float2(row_scale[0], row_scale[0]);
         float2 _pair_scale_odd2_3 = make_float2(row_scale[1], row_scale[1]);
         float2* _pair_scale_src2_3 = reinterpret_cast<float2*>(&(output + 24)[0]);
-#if __CUDA_ARCH__ >= 1000
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_3[0])
                      : "l"(*(unsigned long long*)&_pair_scale_even2_3));
@@ -1433,22 +1389,11 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2069e62b1
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_3[3])
                      : "l"(*(unsigned long long*)&_pair_scale_odd2_3));
-#else
-        (output + 24)[0] *= row_scale[0];
-        (output + 24)[1] *= row_scale[0];
-        (output + 24)[2] *= row_scale[1];
-        (output + 24)[3] *= row_scale[1];
-        (output + 24)[4] *= row_scale[0];
-        (output + 24)[5] *= row_scale[0];
-        (output + 24)[6] *= row_scale[1];
-        (output + 24)[7] *= row_scale[1];
-#endif
       }
       {
         float2 _pair_scale_even2_4 = make_float2(row_scale[0], row_scale[0]);
         float2 _pair_scale_odd2_4 = make_float2(row_scale[1], row_scale[1]);
         float2* _pair_scale_src2_4 = reinterpret_cast<float2*>(&(output + 32)[0]);
-#if __CUDA_ARCH__ >= 1000
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_4[0])
                      : "l"(*(unsigned long long*)&_pair_scale_even2_4));
@@ -1461,22 +1406,11 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2069e62b1
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_4[3])
                      : "l"(*(unsigned long long*)&_pair_scale_odd2_4));
-#else
-        (output + 32)[0] *= row_scale[0];
-        (output + 32)[1] *= row_scale[0];
-        (output + 32)[2] *= row_scale[1];
-        (output + 32)[3] *= row_scale[1];
-        (output + 32)[4] *= row_scale[0];
-        (output + 32)[5] *= row_scale[0];
-        (output + 32)[6] *= row_scale[1];
-        (output + 32)[7] *= row_scale[1];
-#endif
       }
       {
         float2 _pair_scale_even2_5 = make_float2(row_scale[0], row_scale[0]);
         float2 _pair_scale_odd2_5 = make_float2(row_scale[1], row_scale[1]);
         float2* _pair_scale_src2_5 = reinterpret_cast<float2*>(&(output + 40)[0]);
-#if __CUDA_ARCH__ >= 1000
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_5[0])
                      : "l"(*(unsigned long long*)&_pair_scale_even2_5));
@@ -1489,22 +1423,11 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2069e62b1
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_5[3])
                      : "l"(*(unsigned long long*)&_pair_scale_odd2_5));
-#else
-        (output + 40)[0] *= row_scale[0];
-        (output + 40)[1] *= row_scale[0];
-        (output + 40)[2] *= row_scale[1];
-        (output + 40)[3] *= row_scale[1];
-        (output + 40)[4] *= row_scale[0];
-        (output + 40)[5] *= row_scale[0];
-        (output + 40)[6] *= row_scale[1];
-        (output + 40)[7] *= row_scale[1];
-#endif
       }
       {
         float2 _pair_scale_even2_6 = make_float2(row_scale[0], row_scale[0]);
         float2 _pair_scale_odd2_6 = make_float2(row_scale[1], row_scale[1]);
         float2* _pair_scale_src2_6 = reinterpret_cast<float2*>(&(output + 48)[0]);
-#if __CUDA_ARCH__ >= 1000
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_6[0])
                      : "l"(*(unsigned long long*)&_pair_scale_even2_6));
@@ -1517,22 +1440,11 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2069e62b1
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_6[3])
                      : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-#else
-        (output + 48)[0] *= row_scale[0];
-        (output + 48)[1] *= row_scale[0];
-        (output + 48)[2] *= row_scale[1];
-        (output + 48)[3] *= row_scale[1];
-        (output + 48)[4] *= row_scale[0];
-        (output + 48)[5] *= row_scale[0];
-        (output + 48)[6] *= row_scale[1];
-        (output + 48)[7] *= row_scale[1];
-#endif
       }
       {
         float2 _pair_scale_even2_7 = make_float2(row_scale[0], row_scale[0]);
         float2 _pair_scale_odd2_7 = make_float2(row_scale[1], row_scale[1]);
         float2* _pair_scale_src2_7 = reinterpret_cast<float2*>(&(output + 56)[0]);
-#if __CUDA_ARCH__ >= 1000
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_7[0])
                      : "l"(*(unsigned long long*)&_pair_scale_even2_7));
@@ -1545,16 +1457,6 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2069e62b1
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_7[3])
                      : "l"(*(unsigned long long*)&_pair_scale_odd2_7));
-#else
-        (output + 56)[0] *= row_scale[0];
-        (output + 56)[1] *= row_scale[0];
-        (output + 56)[2] *= row_scale[1];
-        (output + 56)[3] *= row_scale[1];
-        (output + 56)[4] *= row_scale[0];
-        (output + 56)[5] *= row_scale[0];
-        (output + 56)[6] *= row_scale[1];
-        (output + 56)[7] *= row_scale[1];
-#endif
       }
     }
     pack_values[0] = scores[0];
