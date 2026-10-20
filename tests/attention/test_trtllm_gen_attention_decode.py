@@ -1191,6 +1191,34 @@ def test_trtllm_batch_decode_same_dtype_gqa_grouping(q_len_per_req: int):
     )
 
 
+@pytest.mark.parametrize("q_len_per_req", [1, 2, 3, 4, 5, 7, 8, None])
+@pytest.mark.parametrize(
+    "batch_size,max_in_kv_len", [(1, 257), (1, 8193), (8, 8193), (64, 8193), (256, 257)]
+)
+def test_trtllm_batch_decode_nvfp4_grouped_causal(
+    q_len_per_req: int | None, batch_size: int, max_in_kv_len: int
+):
+    # Q=1 covers the fallback; None covers mixed lengths within the grouped tiles.
+    _test_trtllm_batch_decode(
+        backend="trtllm-gen",
+        kv_layout="HND",
+        batch_size=batch_size,
+        q_len_per_req=q_len_per_req,
+        page_size=64,
+        num_kv_heads=2,
+        head_grp_size=16,
+        window_left=-1,
+        q_dtype="fp8",
+        o_dtype="fp8",
+        kv_dtype="nvfp4",
+        enable_pdl=None,
+        enable_sink=False,
+        max_in_kv_len=max_in_kv_len,
+        head_dim=128,
+        max_q_len=8 if q_len_per_req is None else None,
+    )
+
+
 # Cross both head dimensions with every sampled configuration; keep a normal
 # softmax case so mixed-dtype configurations survive the softmax-mode skip.
 @pytest.mark.parametrize("head_dim", [128, 256])

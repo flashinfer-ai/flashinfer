@@ -1178,6 +1178,29 @@ class TllmGenFmhaKernel {
     int& tileSizeQ = selectKernelParams.mTileSizeQ;
     selectKernelParams.mGroupsTokensHeadsQ = false;
 
+    // The exported causal FP4 tiles group four or eight tokens with 16 query heads.
+    // Keep the validated batch range; smaller tiles are absent from this cubin inventory.
+    if ((mSM == kSM_100 || mSM == kSM_103) && mDtypeQ == DATA_TYPE_E4M3 &&
+        mDtypeK == DATA_TYPE_E2M1 && mDtypeV == DATA_TYPE_E2M1 && mDtypeOut == DATA_TYPE_E4M3 &&
+        params.mQkvLayout == QkvLayout::PagedKv &&
+        params.mMaskType == TrtllmGenAttentionMaskType::Causal && params.mMaxSeqLenQ > 1 &&
+        params.mMaxSeqLenQ <= 8 && params.mBatchSize > 0 && params.mBatchSize <= 256 &&
+        params.mHeadDimQk == 128 && params.mHeadDimV == 128 && params.mNumHeadsQ == 32 &&
+        params.mNumHeadsKv == 2 && params.mNumTokensPerPage == 64 &&
+        params.mMaxSeqLenKv <= params.mAttentionWindowSize &&
+        params.mChunkedAttentionSize == INT_MAX && !params.mSkipsSoftmaxWhenPossible &&
+        !params.mUseBlockSparseAttention && !params.isSparseMla() && !params.mUseFp16Softmax &&
+        !params.mUsesSpcompress && params.lsePtr == nullptr &&
+        params.ptrAttentionSinks == nullptr && params.customMaskPtr == nullptr &&
+        params.mUsesSharedPagedKvIdx && !params.mHasSlidingWindowKvPool &&
+        mNumEltsPerSageAttnBlkQ == 0 && mNumEltsPerSageAttnBlkK == 0 &&
+        mNumEltsPerSageAttnBlkP == 0 && mNumEltsPerSageAttnBlkV == 0) {
+      selectKernelParams.mGroupsTokensHeadsQ = true;
+      tileSizeQ = params.mMaxSeqLenQ <= 4 ? 64 : 128;
+      kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+      return;
+    }
+
     // Generic mixed precision kernels don't work with groupsTokensHeadsQ = true. BF16Q+FP8KV
     // transform paths present BF16 K to BMM1, so they can use the grouped-token cubins.
     if (!supportsGqaGroupingTokensHeadsQ(selectKernelParams)) {
@@ -1365,6 +1388,9 @@ class TllmGenFmhaKernel {
       cuErrCheck(cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
 
       setupKernelSmem(funcInfo.mDeviceFunction, kernelMeta);
+      if (mDtypeK == DATA_TYPE_E2M1 && kernelMeta.mGroupsTokensHeadsQ) {
+        IKL_LOG_INFO("Loaded grouped NVFP4 FMHA kernel: %s", kernelMeta.mFuncName);
+      }
 
       // Cache the loaded function.
       mFunctions[hashId] = funcInfo;

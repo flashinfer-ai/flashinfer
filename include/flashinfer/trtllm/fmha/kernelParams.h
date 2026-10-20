@@ -197,6 +197,8 @@ struct KernelParams {
   // Whether the indices for K & V pages are shared as unified index.
   // true -> vLLM/FlashInfer; false -> TRT-LLM.
   bool mUsesSharedPagedKvIdx{true};
+  // Match the appended generator ABI field; zero preserves exact row-max correction.
+  float mSkipCorrThreshold{0.f};
 
   // Create the TMA shape/stride for Q.
   template <class FmhaOptions>
