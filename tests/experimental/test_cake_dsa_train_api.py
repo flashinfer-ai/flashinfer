@@ -1383,11 +1383,11 @@ def test_nope_public_entries_forward_their_keywords_to_the_backend(monkeypatch):
         dkv_dst_map=None,
         dkv_direct=False,
         check_dst_map=True,
-        check_cu_seqlens=True,
+        check_cu_seqlens=False,
     )
     with _quiet_experimental():
-        dsa_sparse_attention_nope_varlen(q, kv, idx, cu_q, cu_k, check_cu_seqlens=False)
-    assert seen["varlen"][7]["check_cu_seqlens"] is False
+        dsa_sparse_attention_nope_varlen(q, kv, idx, cu_q, cu_k, check_cu_seqlens=True)
+    assert seen["varlen"][7]["check_cu_seqlens"] is True
 
 
 def test_nope_autograd_matches_explicit_backward_and_casts_kv_grad_to_the_leaf():
@@ -1532,9 +1532,10 @@ def test_nope_varlen_causal_tail_of_prefix_drops_future_keys():
 
 
 def test_nope_varlen_rejects_inconsistent_cu_seqlens_through_the_public_entry():
-    """A key window shorter than the packed keys, a query segment longer than its key prefix and a non-monotonic
-    prefix sum raise ``ValueError`` before any launch; ``check_cu_seqlens=False`` keeps the structural checks only,
-    so the shorter window runs (its documents see fewer keys: the caller's responsibility)."""
+    """With ``check_cu_seqlens=True`` a key window shorter than the packed keys, a query segment longer than its key
+    prefix and a non-monotonic prefix sum raise ``ValueError`` before any launch; the default keeps the structural
+    checks only (the value check synchronizes with the device), so the shorter window runs (its documents see fewer
+    keys: the caller's responsibility)."""
     _require_nope_program()
     inp = _nope_inputs([256, 128], [512, 512], seed=NOPE_SEED + 4, topk=96)
     cu_q, cu_k = inp.cu_seqlens_q, inp.cu_seqlens_k
@@ -1546,10 +1547,17 @@ def test_nope_varlen_rejects_inconsistent_cu_seqlens_through_the_public_entry():
     short[-1] = inp.total_k - 64
     with _quiet_experimental():
         with pytest.raises(ValueError, match=r"cu_seqlens_k\[-1\]"):
-            dsa_sparse_attention_nope_varlen(inp.q, inp.kv, inp.idx_local, cu_q, short)
+            dsa_sparse_attention_nope_varlen(
+                inp.q, inp.kv, inp.idx_local, cu_q, short, check_cu_seqlens=True
+            )
         with pytest.raises(ValueError, match="seqlen_q"):
             dsa_sparse_attention_nope_varlen(
-                inp.q, inp.kv, inp.idx_local, cu_q, i32(0, 200, inp.total_k)
+                inp.q,
+                inp.kv,
+                inp.idx_local,
+                cu_q,
+                i32(0, 200, inp.total_k),
+                check_cu_seqlens=True,
             )
         with pytest.raises(ValueError, match="non-decreasing"):
             dsa_sparse_attention_nope_varlen(
@@ -1558,13 +1566,74 @@ def test_nope_varlen_rejects_inconsistent_cu_seqlens_through_the_public_entry():
                 inp.idx_local,
                 i32(0, 300, 256, inp.total_q),
                 i32(0, 512, 512, inp.total_k),
+                check_cu_seqlens=True,
             )
         with pytest.raises(ValueError, match="int32"):
             dsa_sparse_attention_nope_varlen(
-                inp.q, inp.kv, inp.idx_local, cu_q.long(), cu_k, check_cu_seqlens=False
+                inp.q, inp.kv, inp.idx_local, cu_q.long(), cu_k
+            )
+        with pytest.raises(ValueError, match="must be contiguous"):
+            dsa_sparse_attention_nope_varlen(
+                inp.q, inp.kv, inp.idx_local, torch.stack([cu_q, cu_q], 1)[:, 0], cu_k
             )
         out = dsa_sparse_attention_nope_varlen(
-            inp.q, inp.kv, inp.idx_local, cu_q, short, check_cu_seqlens=False
+            inp.q, inp.kv, inp.idx_local, cu_q, short
         )
     torch.cuda.synchronize()
     assert tuple(out.shape) == (inp.total_q, NUM_HEADS, D_LATENT)
+
+
+def _cuda_kernel_names(fn) -> list[str]:
+    """Names of the CUDA kernels one call of ``fn`` launches (torch profiler; memcpy / memset activities excluded)."""
+    from torch.profiler import ProfilerActivity, profile
+
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    return [
+        e.name
+        for e in prof.events()
+        if e.device_type == torch.autograd.DeviceType.CUDA
+        and not e.name.startswith(("Memcpy", "Memset"))
+    ]
+
+
+def test_nope_public_packed_forward_is_one_index_launch_and_the_kernel():
+    """The public packed entry's forward launches the index-preparation stage and the forward kernel, nothing else
+    (the torch glue it replaces is sixteen launches) -- or the forward kernel alone when the program converts the
+    rows itself; the flat entry launches the forward kernel alone -- the row lengths are derived in-kernel, no
+    separate derivation runs."""
+    _require_nope_program()
+    if not cake_backend.nope_index_prep_available(torch.device("cuda")):
+        pytest.skip(
+            "the NoPE record does not register the index-preparation stage on this checkout"
+        )
+    if not _cuda_kernel_names(lambda: torch.ones(8, device="cuda").add_(1)):
+        pytest.skip("the torch profiler records no CUDA kernels in this environment")
+    inp = _nope_inputs(
+        [300, 517, 0, 1024], [400, 517, 64, 2048], seed=NOPE_SEED + 7, topk=200
+    )
+
+    def packed():
+        return dsa_sparse_attention_nope_varlen(
+            inp.q, inp.kv, inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k
+        )
+
+    with _quiet_experimental():
+        packed()  # plan and module load
+        names = _cuda_kernel_names(packed)
+        flat = _cuda_kernel_names(
+            lambda: dsa_sparse_attention_nope(inp.q, inp.kv, inp.idx_global)
+        )
+    glue = _cuda_kernel_names(
+        lambda: offset_gather_kv_indices(
+            inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k, return_topk_length=True
+        )
+    )
+    expected = 1 if cake_backend.varlen_index_mode(inp.idx_local) == "kernel" else 2
+    assert len(names) == expected and len(flat) == 1 and names[-1] == flat[0], (
+        names,
+        flat,
+    )
+    assert len(glue) >= 10

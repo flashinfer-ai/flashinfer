@@ -2461,6 +2461,8 @@ workspace_layout_nope = cake_backend.workspace_layout_nope
 dsa_nope_train_workspace_size = cake_backend.dsa_nope_train_workspace_size
 forward_binding_key_nope = cake_backend.forward_binding_key_nope
 backward_binding_key_nope = cake_backend.backward_binding_key_nope
+NOPE_INDEX_PREP_STAGE = cake_backend.NOPE_INDEX_PREP_STAGE
+nope_globalize_indices = cake_backend.nope_globalize_indices
 
 # The kernels' argument lists of the NoPE stages (the generated launchers bind them by name, in this order; the
 # delta, compaction and cast stages are the rope program's kernels and keep their lists).
@@ -2809,7 +2811,10 @@ def test_registry_programs_are_well_formed(program):
     order = cake_jit.STAGES_OF[program]
     stages = cake_jit.registered_stages(program)
     assert stages == tuple(s for s in order if s in stages)  # launch order
-    assert tuple(record["stages"]) == stages
+    # the NoPE record's stage list leads with the index-preparation program, which is not an attention stage the
+    # backend plans (``registered_stages`` is those, in launch order)
+    prefix = (NOPE_INDEX_PREP_STAGE,) if NOPE_INDEX_PREP_STAGE in record else ()
+    assert tuple(record["stages"]) == prefix + stages
     assert set(record["arches"]) == {"sm_100a", "sm_103a", "sm_107a"}
     manifest = cake_build.manifest()
     libraries = {entry["name"]: entry for entry in manifest["libraries"]}
@@ -3155,18 +3160,240 @@ def test_validate_cu_seqlens_checks_structure_and_values():
 
 
 def test_nope_varlen_backend_entry_checks_cu_seqlens_before_any_device_work():
-    """The backend's varlen entry validates the prefix sums first (host tensors: nothing else would run), and
-    ``check_cu_seqlens=False`` skips the value checks only."""
+    """The backend's varlen entry validates the prefix sums first (host tensors: nothing else would run): their
+    structure on every call, their values with ``check_cu_seqlens=True`` (the default leaves the values to the
+    caller: that check synchronizes with the device)."""
     q, kv, idx = _nope_host_inputs()
     varlen = cake_backend.dsa_sparse_attention_nope_varlen
     with pytest.raises(ValueError, match=r"cu_seqlens_k\[-1\]"):
-        varlen(q, kv, idx, _i32(0, 8), _i32(0, 12), 8, 12)
+        varlen(q, kv, idx, _i32(0, 8), _i32(0, 12), 8, 12, check_cu_seqlens=True)
     with pytest.raises(ValueError, match="seqlen_q"):
-        varlen(q, kv, idx, _i32(0, 6, 8), _i32(0, 4, 16), 8, 16)
+        varlen(q, kv, idx, _i32(0, 6, 8), _i32(0, 4, 16), 8, 16, check_cu_seqlens=True)
     with pytest.raises(ValueError, match="non-decreasing"):
-        varlen(q, kv, idx, _i32(0, 5, 3, 8), _i32(0, 5, 10, 16), 8, 16)
+        varlen(
+            q,
+            kv,
+            idx,
+            _i32(0, 5, 3, 8),
+            _i32(0, 5, 10, 16),
+            8,
+            16,
+            check_cu_seqlens=True,
+        )
     with pytest.raises(ValueError, match="same documents"):
-        varlen(q, kv, idx, _i32(0, 3, 8), _i32(0, 16), 8, 16, check_cu_seqlens=False)
+        varlen(q, kv, idx, _i32(0, 3, 8), _i32(0, 16), 8, 16)
+    with pytest.raises(ValueError, match="cu_seqlens_q must be contiguous"):
+        varlen(q, kv, idx, _i32(0, 0, 3, 3, 8, 8)[::2], _i32(0, 5, 16), 8, 16)
+    with pytest.raises(ValueError, match="gather_kv_indices must be an int32"):
+        varlen(q, kv, idx[:4], _i32(0, 3, 8), _i32(0, 5, 16), 8, 16)
+
+
+# --- packed form: on-device index preparation (host layer) ---
+
+# The index-preparation kernel's argument list (the generated launcher binds these names positionally, then the
+# grid); the export writes the real tables, the stand-in below mirrors them.
+INDEX_PREP_ARGS = (
+    "indices",
+    "cu_seqlens_q",
+    "cu_seqlens_k",
+    "out",
+    "topk_length",
+    "num_rows",
+    "topk",
+    "idx_stride",
+    "indices_offset",
+    "num_docs",
+    "search_iters",
+    "causal",
+    "has_docs",
+    "flat_bound",
+    "write_out",
+    "grid_x",
+    "grid_y",
+    "grid_z",
+)
+_INDEX_PREP_STAND_IN = {
+    "module": f"{NOPE_PROGRAM}_stand_in_index_prep",
+    "library": f"{NOPE_PROGRAM}_stand_in_index_prep",
+    "ffi_entry": "run",
+    "launch": {
+        "block": [128, 1, 1],
+        "cluster": [1, 1, 1],
+        "cooperative": False,
+        "dynamic_smem_bytes": 0,
+        "use_pdl": False,
+    },
+}
+
+
+def _index_prep_example():
+    """The four-document example of the causal glue test: tail segments, an empty query segment, a fully masked
+    row, a repeated key."""
+    cu_q = _i32(0, 3, 5, 5, 9)
+    cu_k = _i32(0, 5, 11, 14, 18)
+    local = torch.tensor(
+        [
+            [0, 1, 2, -1, 4],
+            [1, 0, 3, 4, -1],
+            [2, 1, 0, 4, 5],
+            [4, 5, 3, -1, 6],
+            [5, 4, 0, 6, -1],
+            [0, 1, 2, 3, -1],
+            [3, 2, 1, 0, 4],
+            [-1, -1, -1, -1, -1],
+            [3, 0, 1, 2, 3],
+        ],
+        dtype=torch.int32,
+    )
+    return local, cu_q, cu_k
+
+
+def test_index_prep_grid_and_search_iters():
+    grid = cake_backend.index_prep_grid
+    assert [grid(n) for n in (0, 1, 4, 5, 16263)] == [
+        (1, 1, 1),
+        (1, 1, 1),
+        (1, 1, 1),
+        (2, 1, 1),
+        (4066, 1, 1),
+    ]
+    iters = cake_backend.index_prep_search_iters
+    assert [iters(n) for n in (1, 2, 3, 4, 5, 8, 9, 512)] == [1, 2, 3, 3, 4, 4, 5, 10]
+    for n in (1, 2, 3, 7, 9, 100, 1023, 1024, 1025):
+        assert iters(n) == (0 if n == 1 else math.ceil(math.log2(n))) + 1
+
+
+def test_index_storage_alias_covers_strided_and_offset_views():
+    """The kernel addresses its index operand as flat storage (row ``t`` at ``indices_offset + t * idx_stride``):
+    the host passes the contiguous 1-D span the rows occupy from the vector-aligned element at or below the view's
+    start, so column slices, every-other-row views and views inside a larger storage are read in place."""
+    T, K = 6, 5
+    alias = cake_backend._index_storage_alias
+    base = torch.arange(T * (K + 8), dtype=torch.int32).view(T, K + 8)
+    view, offset, stride = alias(base[:, :K])
+    assert view.dim() == 1 and view.stride() == (1,) and view.is_contiguous()
+    assert (offset, stride, view.numel()) == (0, K + 8, (T - 1) * (K + 8) + K)
+    assert view.data_ptr() == base.data_ptr()
+    view, offset, stride = alias(base[:, 3 : 3 + K])
+    assert (offset, stride, view.numel()) == (3, K + 8, 3 + (T - 1) * (K + 8) + K)
+    assert view.data_ptr() == base.data_ptr()
+    for t in range(T):
+        row = view[offset + t * stride : offset + t * stride + K]
+        assert torch.equal(row, base[t, 3 : 3 + K])
+    view, offset, stride = alias(
+        base[:, 8 : 8 + K]
+    )  # a vector-aligned start folds into the pointer
+    assert (offset, stride) == (0, K + 8) and view.data_ptr() == base[:, 8:].data_ptr()
+    flat = torch.zeros(T, K, dtype=torch.int32)
+    view, offset, stride = alias(flat)
+    assert (offset, stride, view.numel()) == (0, K, T * K)
+    assert view.data_ptr() == flat.data_ptr()
+    assert alias(flat[:1])[2] == K  # one row: the width stands as its stride
+    view, offset, stride = alias(torch.zeros(2 * T, K, dtype=torch.int32)[::2])
+    assert (offset, stride, view.numel()) == (0, 2 * K, (T - 1) * 2 * K + K)
+    inside = torch.zeros(T * K + 13, dtype=torch.int32)[13:].view(T, K)
+    view, offset, stride = alias(inside)
+    assert (offset, stride) == (5, K) and view.data_ptr() == inside.data_ptr() - 5 * 4
+
+
+def test_nope_index_prep_checks_structure_first_and_refuses_host_tensors():
+    """The structural checks of the index operands come first (host tensors: nothing else would run); a host tensor
+    with valid structure is refused -- the NoPE entries have no torch fallback -- except ``T == 0``, which needs no
+    launch; the torch formulation stays the tests' reference."""
+    local, cu_q, cu_k = _index_prep_example()
+    with pytest.raises(ValueError, match="int32"):
+        nope_globalize_indices(local.long(), cu_q, cu_k)
+    with pytest.raises(ValueError, match="same documents"):
+        nope_globalize_indices(local, cu_q, cu_k[:-1])
+    with pytest.raises(ValueError, match="cu_seqlens_k must be an int32"):
+        nope_globalize_indices(local, cu_q, cu_k.view(1, -1))
+    strided = torch.stack([cu_q, cu_q], 1)[:, 0]
+    with pytest.raises(ValueError, match="cu_seqlens_q must be contiguous"):
+        nope_globalize_indices(local, strided, cu_k)
+    with pytest.raises(ValueError, match="cu_seqlens_q must be contiguous"):
+        validate_cu_seqlens(strided, cu_k, 9, 18)
+    with pytest.raises(NotImplementedError, match="CUDA"):
+        nope_globalize_indices(local, cu_q, cu_k, causal=True)
+    with pytest.raises(NotImplementedError, match="CUDA"):
+        cake_backend.varlen_index_mode(local)
+    empty = nope_globalize_indices(local[:0], _i32(0, 0), _i32(0, 18))
+    assert tuple(empty[0].shape) == (0, 5) and tuple(empty[1].shape) == (0,)
+    assert empty[0].dtype == torch.int32 and empty[1].dtype == torch.int32
+    # the reference rule the stage is held to, on this example
+    strict, lengths = offset_gather_kv_indices(
+        local, cu_q, cu_k, causal=True, return_topk_length=True
+    )
+    assert torch.equal(
+        strict, globalize_gather_indices_loop(local, cu_q, cu_k, causal=True)
+    )
+    assert lengths.tolist() == [3, 3, 4, 3, 3, 1, 4, 0, 5]
+
+
+def test_nope_record_registers_the_index_prep_stage_first():
+    """The shipped NoPE record carries the index-preparation stage ahead of ``nope_fwd`` (it runs before it), with the
+    128-thread block the kernel declares, and the generated tables bind its fifteen arguments in the kernel's order
+    followed by the grid; the grid rule is one CTA per four rows."""
+    record = cake_jit.record(NOPE_PROGRAM)
+    assert record["stages"][0] == NOPE_INDEX_PREP_STAGE
+    stage = record[NOPE_INDEX_PREP_STAGE]
+    assert stage["library"] == stage["module"] and stage["ffi_entry"] == "run"
+    assert stage["launch"]["block"] == [128, 1, 1]
+    assert stage["launch"]["cluster"] == [1, 1, 1]
+    assert stage["launch"]["dynamic_smem_bytes"] == 0
+    assert not stage["launch"]["cooperative"] and not stage["launch"]["use_pdl"]
+    assert tuple(cake_launch.STAGE_ARGS[NOPE_INDEX_PREP_STAGE]) == INDEX_PREP_ARGS
+    for T in (0, 1, 4, 5, 16263):
+        assert cake_launch.GRID[NOPE_INDEX_PREP_STAGE](T, 0, 0) == (
+            cake_backend.index_prep_grid(T)
+        )
+    values = {name: object() for name in INDEX_PREP_ARGS[:-3]}
+    recorder = _Recorder()
+    cake_launch.LAUNCH[NOPE_INDEX_PREP_STAGE](recorder, values, (9, 1, 1))
+    assert recorder.calls == [
+        tuple(values[name] for name in INDEX_PREP_ARGS[:-3]) + (9, 1, 1)
+    ]
+    for arch in record["arches"]:
+        assert cake_jit.library_name(NOPE_INDEX_PREP_STAGE, arch, NOPE_PROGRAM) == (
+            f"{stage['library']}_{arch}"
+        )
+
+
+def test_nope_index_prep_availability_and_mode_follow_the_record(monkeypatch):
+    """Without the stage in the record the packed entry refuses on a served device (no torch fallback); with it,
+    the mode is ``"index_prep"``; a forward program advertising the conversion operands takes precedence
+    (``"kernel"``)."""
+    record = dict(cake_jit.record(NOPE_PROGRAM))
+    record.pop(NOPE_INDEX_PREP_STAGE, None)
+    monkeypatch.setitem(cake_jit.MODULES, NOPE_PROGRAM, record)
+    assert cake_backend.nope_index_prep_available(torch.device("cuda")) is False
+    converts = all(
+        name in cake_launch.STAGE_ARGS["nope_fwd"]
+        for name in cake_backend.NOPE_FWD_CONVERT_ARGS
+    )
+    assert cake_backend.nope_fwd_converts_indices() is converts
+    if not _device_supported():
+        return
+    idx = torch.zeros(4, 3, dtype=torch.int32, device="cuda")
+    if converts:
+        assert cake_backend.varlen_index_mode(idx) == "kernel"
+    else:
+        with pytest.raises(NotImplementedError, match="index-preparation"):
+            cake_backend.varlen_index_mode(idx)
+        with pytest.raises(NotImplementedError, match="index-preparation"):
+            nope_globalize_indices(idx, idx.new_tensor([0, 4]), idx.new_tensor([0, 8]))
+    record[NOPE_INDEX_PREP_STAGE] = dict(_INDEX_PREP_STAND_IN)
+    assert cake_backend.nope_index_prep_available(torch.device("cuda")) is True
+    assert cake_backend.varlen_index_mode(idx) == (
+        "kernel" if converts else "index_prep"
+    )
+    monkeypatch.setitem(
+        cake_launch.STAGE_ARGS,
+        "nope_fwd",
+        list(cake_launch.STAGE_ARGS["nope_fwd"])
+        + list(cake_backend.NOPE_FWD_CONVERT_ARGS),
+    )
+    assert cake_backend.nope_fwd_converts_indices()
+    assert cake_backend.varlen_index_mode(idx) == "kernel"
 
 
 def test_kv_latent_rows_squeezes_the_one_head_form_only():
@@ -3653,6 +3880,171 @@ def test_nope_plan_forward_launch_values(monkeypatch):
         v["has_topk_length"],
         v["derive_length"],
     ) == (1, 1)
+
+
+def _stand_in_index_prep(monkeypatch, calls: list) -> dict:
+    """The stand-in NoPE program (:func:`_stand_in_nope_program`) completed with the index-preparation stage: a
+    recording launch entry, and a launcher over :data:`INDEX_PREP_ARGS` in the generated tables (the export writes
+    the real ones with the stage)."""
+    record = _stand_in_nope_program(monkeypatch, calls)
+    record[NOPE_INDEX_PREP_STAGE] = dict(_INDEX_PREP_STAND_IN)
+    record["stages"] = list(record["stages"]) + [NOPE_INDEX_PREP_STAGE]
+    names = INDEX_PREP_ARGS[:-3]
+
+    def launch(run, values, grid):
+        run(*(values[name] for name in names), *grid)
+
+    monkeypatch.setitem(cake_launch.LAUNCH, NOPE_INDEX_PREP_STAGE, launch)
+    monkeypatch.setitem(
+        cake_launch.GRID,
+        NOPE_INDEX_PREP_STAGE,
+        lambda num_queries, num_kv, topk: cake_backend.index_prep_grid(num_queries),
+    )
+    monkeypatch.setitem(
+        cake_launch.STAGE_ARGS, NOPE_INDEX_PREP_STAGE, list(INDEX_PREP_ARGS)
+    )
+    return record
+
+
+def test_nope_index_prep_launch_values(monkeypatch):
+    """The stage's launch values from the host -- the flat alias of the index rows with their offset and stride, the
+    caller-allocated outputs, the document count and its search depth, the causal flag, the document-mode constants,
+    the four-rows-per-CTA grid -- and the packed entry: the stage, then the forward over its outputs, nothing else."""
+    calls = []
+    _stand_in_index_prep(monkeypatch, calls)
+    local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
+    T, K = (int(d) for d in local.shape)
+    assert cake_backend.varlen_index_mode(local) == "index_prep"
+    indices, lengths = nope_globalize_indices(local, cu_q, cu_k, causal=True)
+    assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE]
+    v = calls[0][1]
+    assert v["indices"].dim() == 1 and v["indices"].numel() == T * K
+    assert v["indices"].data_ptr() == local.data_ptr()
+    assert v["cu_seqlens_q"] is cu_q and v["cu_seqlens_k"] is cu_k
+    assert v["out"] is indices and v["topk_length"] is lengths
+    assert indices.dtype == torch.int32 and tuple(indices.shape) == (T, K)
+    assert indices.is_contiguous() and lengths.dtype == torch.int32
+    assert tuple(lengths.shape) == (T,)
+    assert (v["num_rows"], v["topk"], v["idx_stride"], v["indices_offset"]) == (
+        T,
+        K,
+        K,
+        0,
+    )
+    assert (v["num_docs"], v["search_iters"], v["causal"]) == (4, 3, 1)
+    assert (v["has_docs"], v["flat_bound"], v["write_out"]) == (1, 0, 1)
+    assert (v["grid_x"], v["grid_y"], v["grid_z"]) == (-(-T // 4), 1, 1)
+    # causal off; a column slice of a wider buffer is read in place through the flat alias
+    wide = torch.zeros(T, K + 8, dtype=torch.int32, device="cuda")
+    wide[:, 3 : 3 + K] = local
+    nope_globalize_indices(wide[:, 3 : 3 + K], cu_q, cu_k)
+    v = calls[-1][1]
+    assert v["causal"] == 0 and (v["idx_stride"], v["indices_offset"]) == (K + 8, 3)
+    assert v["indices"].data_ptr() == wide.data_ptr()
+    assert v["indices"].numel() == 3 + (T - 1) * (K + 8) + K
+    # T == 0: no launch, empty results
+    del calls[:]
+    empty = nope_globalize_indices(
+        local[:0], cu_q.new_tensor([0, 0]), cu_k.new_tensor([0, 18])
+    )
+    assert calls == [] and tuple(empty[0].shape) == (0, K) and empty[1].numel() == 0
+    # the packed entry: the stage, then the forward over its outputs; caller lengths take precedence
+    q, kv, _ = _nope_host_inputs(total_q=T, total_k=18, topk=K, device="cuda")
+    varlen = cake_backend.dsa_sparse_attention_nope_varlen
+    out, lse = varlen(q, kv, local, cu_q, cu_k, causal=True, return_lse=True)
+    assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "nope_fwd"]
+    prep, fwd = calls[0][1], calls[1][1]
+    assert prep["causal"] == 1 and prep["out"].data_ptr() == fwd["indices"].data_ptr()
+    assert fwd["topk_length"] is prep["topk_length"]
+    assert fwd["out"] is out and fwd["lse"] is lse
+    assert (fwd["has_topk_length"], fwd["derive_length"]) == (1, 0)
+    assert (fwd["num_queries"], fwd["num_kv"], fwd["topk"]) == (T, 18, K)
+    assert (fwd["idx_stride"], fwd["indices_offset"]) == (K, 0)
+    # (the converting program's operands ride along in the launch values with convert = 0; a launcher without the
+    # names does not pass them, so they are asserted with the extended tables in the converting-program test)
+    mine = torch.full((T,), 2, dtype=torch.int32, device="cuda")
+    del calls[:]
+    varlen(q, kv, local, cu_q, cu_k, topk_length=mine)
+    assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "nope_fwd"]
+    assert calls[1][1]["topk_length"] is mine and calls[0][1]["topk_length"] is not mine
+    assert calls[0][1]["causal"] == 0
+    # T == 0 through the entry: nothing launched; a non-contiguous prefix sum is refused before any launch
+    del calls[:]
+    out = varlen(
+        q[:0], kv, local[:0], cu_q.new_tensor([0, 0]), cu_k.new_tensor([0, 18])
+    )
+    assert calls == [] and tuple(out.shape) == (0, NUM_HEADS, D_LATENT)
+    with pytest.raises(ValueError, match="cu_seqlens_q must be contiguous"):
+        varlen(q, kv, local, torch.stack([cu_q, cu_q], 1)[:, 0], cu_k)
+    assert calls == []
+
+
+def test_nope_packed_entry_lets_a_converting_forward_program_skip_the_stage(
+    monkeypatch,
+):
+    """When the forward program appends the conversion operands, the packed entry launches the forward alone over
+    the per-document rows (their own stride and offset) with the prefix sums, the document count and search depth,
+    the causal flag, ``convert = 1``, the fresh global-row buffer the backward reads and derived lengths; with
+    caller lengths it keeps the index-preparation launch and passes ``convert = 0``; a flat forward passes
+    ``convert = 0`` with valid pointers for the operands it never reads."""
+    calls = []
+    _stand_in_index_prep(monkeypatch, calls)
+    names = list(cake_launch.STAGE_ARGS["nope_fwd"])
+    extended = names[:-3] + list(cake_backend.NOPE_FWD_CONVERT_ARGS) + names[-3:]
+    monkeypatch.setitem(cake_launch.STAGE_ARGS, "nope_fwd", extended)
+
+    def launch(run, values, grid):
+        run(*(values[name] for name in extended[:-3]), *grid)
+
+    monkeypatch.setitem(cake_launch.LAUNCH, "nope_fwd", launch)
+    local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
+    T, K = (int(d) for d in local.shape)
+    assert cake_backend.varlen_index_mode(local) == "kernel"
+    assert cake_backend.varlen_index_mode(local, caller_lengths=True) == "index_prep"
+    wide = torch.zeros(T, K + 8, dtype=torch.int32, device="cuda")
+    wide[:, 3 : 3 + K] = local
+    q, kv, _ = _nope_host_inputs(total_q=T, total_k=18, topk=K, device="cuda")
+    varlen = cake_backend.dsa_sparse_attention_nope_varlen
+    varlen(q, kv, wide[:, 3 : 3 + K], cu_q, cu_k, causal=True)
+    assert [c[0] for c in calls] == ["nope_fwd"]
+    v = calls[0][1]
+    assert (v["convert"], v["causal"], v["num_docs"], v["search_iters"]) == (1, 1, 4, 3)
+    assert v["cu_seqlens_q"] is cu_q and v["cu_seqlens_k"] is cu_k
+    assert v["indices"].data_ptr() == wide.data_ptr()
+    assert (v["idx_stride"], v["indices_offset"]) == (K + 8, 3)
+    assert tuple(v["indices_out"].shape) == (T, K) and v["indices_out"].is_contiguous()
+    assert v["indices_out"].dtype == torch.int32
+    assert (v["has_topk_length"], v["derive_length"]) == (1, 1)
+    assert tuple(v["topk_length"].shape) == (T,)
+    # caller lengths: the stage prepares the rows, the forward takes them with convert = 0
+    mine = torch.full((T,), 2, dtype=torch.int32, device="cuda")
+    del calls[:]
+    varlen(q, kv, local, cu_q, cu_k, topk_length=mine)
+    assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "nope_fwd"]
+    prep, fwd = calls[0][1], calls[1][1]
+    assert fwd["topk_length"] is mine and (
+        fwd["has_topk_length"],
+        fwd["derive_length"],
+    ) == (1, 0)
+    assert fwd["convert"] == 0 and fwd["causal"] == 0
+    assert fwd["indices"].data_ptr() == prep["out"].data_ptr()
+    assert fwd["indices_out"].data_ptr() == prep["out"].data_ptr()
+    assert (fwd["num_docs"], fwd["search_iters"]) == (1, 1)
+    for name in ("cu_seqlens_q", "cu_seqlens_k"):
+        assert (
+            fwd[name].dtype == torch.int32
+            and fwd[name].is_cuda
+            and fwd[name].numel() >= 2
+        )
+    # a flat forward over global rows: convert = 0, the index operand doubles as indices_out
+    del calls[:]
+    idx = torch.zeros(T, K, dtype=torch.int32, device="cuda")
+    forward_nope(q, kv, idx)
+    v = calls[-1][1]
+    assert calls[-1][0] == "nope_fwd" and v["convert"] == 0
+    assert v["indices_out"].data_ptr() == idx.data_ptr()
+    assert (v["num_docs"], v["search_iters"], v["causal"]) == (1, 1, 0)
+    assert v["cu_seqlens_q"].dtype == torch.int32 and v["cu_seqlens_q"].numel() == 2
 
 
 def test_nope_plan_backward_fresh_and_accumulate_by_the_direct_rule(monkeypatch):
@@ -4712,3 +5104,179 @@ def test_nope_backend_entry_squeezes_the_one_head_kv():
     )
     with pytest.raises(ValueError, match="kv_latent"):
         cake_backend.dsa_sparse_attention_nope(inp.q, two_heads, inp.idx_global)
+
+
+# --- packed form: the index-preparation stage against the torch formulation (GPU; skips until the stage ships) ---
+
+
+def _require_nope_index_prep():
+    _require_nope_program()
+    if not cake_backend.nope_index_prep_available(torch.device("cuda")):
+        pytest.skip(
+            "the NoPE record does not register the index-preparation stage on this checkout"
+        )
+
+
+_INDEX_PREP_CASES = [
+    # (seqs_q, seqs_k, K_slots): the sanitizer batch (an empty query segment, keys longer than queries); a tail
+    # segment with a scalar-path width; one slot; seven slots with an empty segment; one document; the profiled
+    # width 2176 and the odd 2177; nine documents (a deeper search); no query rows at all
+    ((96, 160, 0, 64), (96, 320, 0, 512), 192),
+    ((37, 5), (37, 300), 100),
+    ((9,), (40,), 1),
+    ((9, 0, 3), (40, 8, 3), 7),
+    ((300,), (300,), 128),
+    ((33, 70), (500, 70), 2176),
+    ((33, 70), (500, 70), 2177),
+    ((3, 11, 0, 7, 1, 20, 4, 9, 13), (50, 11, 4, 70, 1, 900, 4, 9, 300), 520),
+    ((0, 0), (5, 7), 16),
+]
+
+
+def _prefix(seqs):
+    cu = [0]
+    for n in seqs:
+        cu.append(cu[-1] + int(n))
+    return torch.tensor(cu, dtype=torch.int32, device="cuda")
+
+
+def _index_prep_case(seqs_q, seqs_k, topk, *, seed):
+    """Per-document int32 rows with negatives and out-of-range slots, the first row of every document fully masked,
+    and the prefix sums, on the device."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    cu_q, cu_k = _prefix(seqs_q), _prefix(seqs_k)
+    local = torch.empty(int(sum(seqs_q)), topk, dtype=torch.int32, device="cuda")
+    start = 0
+    for lq, lk in zip(seqs_q, seqs_k, strict=True):
+        local[start : start + lq] = torch.randint(
+            -3, lk + 4, (lq, topk), device="cuda", generator=gen, dtype=torch.int32
+        )
+        if lq:
+            local[start] = -1
+        start += lq
+    return local, cu_q, cu_k
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("seqs_q, seqs_k, topk", _INDEX_PREP_CASES)
+def test_nope_index_prep_matches_the_torch_glue_bitwise(seqs_q, seqs_k, topk, causal):
+    """One launch of the stage against ``offset_gather_kv_indices(..., return_topk_length=True)`` and the loop
+    reference: global rows and row lengths bitwise, under both causal settings."""
+    _require_nope_index_prep()
+    local, cu_q, cu_k = _index_prep_case(
+        seqs_q, seqs_k, topk, seed=NOPE_SEED + 500 + topk
+    )
+    assert cake_backend.varlen_index_mode(local) in ("index_prep", "kernel")
+    got_idx, got_len = nope_globalize_indices(local, cu_q, cu_k, causal=causal)
+    want_idx, want_len = offset_gather_kv_indices(
+        local, cu_q, cu_k, causal=causal, return_topk_length=True
+    )
+    torch.cuda.synchronize()
+    assert got_idx.dtype == torch.int32 and got_len.dtype == torch.int32
+    assert torch.equal(got_idx, want_idx) and torch.equal(got_len, want_len)
+    assert torch.equal(got_len, derive_topk_length(got_idx, int(cu_k[-1])))
+    assert torch.equal(
+        got_idx.cpu(), globalize_gather_indices_loop(local, cu_q, cu_k, causal=causal)
+    )
+
+
+def test_nope_index_prep_reads_strided_and_offset_index_views_in_place():
+    """Column slices of wider buffers (vector-aligned and not), every-other-row views and a view inside a larger
+    storage: read in place through the flat alias, bitwise the glue."""
+    _require_nope_index_prep()
+    local, cu_q, cu_k = _index_prep_case(
+        (96, 160, 0, 64), (96, 320, 0, 512), 128, seed=NOPE_SEED + 7
+    )
+    T, K = (int(d) for d in local.shape)
+    want = offset_gather_kv_indices(
+        local, cu_q, cu_k, causal=True, return_topk_length=True
+    )
+
+    def check(view):
+        assert view.data_ptr() != local.data_ptr()
+        got = nope_globalize_indices(view, cu_q, cu_k, causal=True)
+        torch.cuda.synchronize()
+        assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
+
+    for width, start in ((K + 8, 3), (K + 8, 8), (K + 4, 4), (K + 16, 0), (2 * K, K)):
+        wide = torch.full((T, width), -7, dtype=torch.int32, device="cuda")
+        wide[:, start : start + K] = local
+        check(wide[:, start : start + K])
+    every_other = torch.full((2 * T, K), -7, dtype=torch.int32, device="cuda")
+    every_other[::2] = local
+    check(every_other[::2])
+    buf = torch.full((T * K + 13,), -7, dtype=torch.int32, device="cuda")
+    inside = buf[13:].view(T, K)
+    inside.copy_(local)
+    check(inside)
+
+
+@pytest.mark.parametrize(
+    "seqs_q, seqs_k, topk, causal",
+    [
+        ([300, 517, 0, 1024], [400, 517, 64, 2048], 200, False),
+        ([256, 128], [512, 512], 96, True),
+    ],
+)
+def test_nope_packed_entry_with_on_device_index_prep_is_bitwise_the_glue_path(
+    seqs_q, seqs_k, topk, causal
+):
+    """The backend's packed entry (index preparation on device, the forward right after it) against the explicit
+    torch glue plus the flat entry: ``out``, ``lse`` and ``dq`` bitwise; ``dkv`` (FP32 atomics into a caller buffer
+    on both sides) within the summation-order spread."""
+    _require_nope_index_prep()
+    _require_nope_program(backward=True)
+    inp = nope_ref.make_nope_inputs(
+        seqs_q, seqs_k, seed=NOPE_SEED + 600 + topk, topk=topk, index="iid"
+    )
+    local = inp.idx_local
+    if causal:  # random rows, so the causal rule drops keys
+        gen = torch.Generator(device="cuda").manual_seed(NOPE_SEED + 601)
+        local = torch.full_like(inp.idx_local, -1)
+        for d, (lq, lk) in enumerate(zip(seqs_q, seqs_k, strict=True)):
+            rows = slice(int(inp.cu_seqlens_q[d]), int(inp.cu_seqlens_q[d + 1]))
+            local[rows] = torch.randint(
+                0, lk, (lq, topk), device="cuda", generator=gen
+            ).to(torch.int32)
+    S = inp.total_k
+
+    def run(fused):
+        leaves = [t.detach().clone().requires_grad_() for t in (inp.q, inp.kv)]
+        acc = torch.zeros(S, D_LATENT, device="cuda")
+        if fused:
+            assert cake_backend.varlen_index_mode(local) in ("index_prep", "kernel")
+            out, lse = cake_backend.dsa_sparse_attention_nope_varlen(
+                leaves[0],
+                leaves[1],
+                local,
+                inp.cu_seqlens_q,
+                inp.cu_seqlens_k,
+                causal=causal,
+                return_lse=True,
+                dkv_acc=acc,
+            )
+        else:
+            idx, lengths = offset_gather_kv_indices(
+                local,
+                inp.cu_seqlens_q,
+                inp.cu_seqlens_k,
+                causal=causal,
+                return_topk_length=True,
+            )
+            out, lse = cake_backend.dsa_sparse_attention_nope(
+                leaves[0],
+                leaves[1],
+                idx,
+                topk_length=lengths,
+                return_lse=True,
+                dkv_acc=acc,
+                num_segments=len(seqs_q),
+            )
+        (dq,) = torch.autograd.grad(out, [leaves[0]], inp.dout)
+        torch.cuda.synchronize()
+        return out, lse, dq, acc
+
+    fused, glue = run(True), run(False)
+    for a, b in zip(fused[:3], glue[:3], strict=True):
+        assert torch.equal(a, b)
+    assert rel_l2(fused[3], glue[3]) < 1e-5  # FP32 atomics: summation order only

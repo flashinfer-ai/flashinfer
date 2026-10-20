@@ -517,7 +517,7 @@ def dsa_sparse_attention_nope_varlen(
     dkv_dst_map: Optional[torch.Tensor] = None,
     dkv_direct: Optional[bool] = None,
     check_dst_map: Optional[bool] = None,
-    check_cu_seqlens: bool = True,
+    check_cu_seqlens: bool = False,
 ):
     r"""Packed multi-document form of :func:`dsa_sparse_attention_nope` (SM100 /
     SM103 / SM107).
@@ -545,21 +545,24 @@ def dsa_sparse_attention_nope_varlen(
     device of ``q``, starting at 0 and non-decreasing, ``cu_seqlens_q[-1] ==
     T`` (the packed rows of ``q``), ``cu_seqlens_k[-1] == S`` (the packed rows
     of ``kv``; a shorter or longer key window is not accepted) and ``seqlen_q
-    <= seqlen_k`` for every document.  They are checked on every call
-    (``check_cu_seqlens``), because a violation is otherwise not detected on
-    device: a document with ``seqlen_k < seqlen_q`` gives negative own
-    positions (all-invalid rows under ``causal``), a non-monotonic prefix sum
-    an asynchronous device-side index error.
+    <= seqlen_k`` for every document.  Their structure (contiguous int32
+    ``[num_docs + 1]`` of one length) is checked on every call; their values
+    only with ``check_cu_seqlens=True``, since that check synchronizes with
+    the device, and a violation is otherwise not detected on device: a
+    document with ``seqlen_k < seqlen_q`` gives negative own positions
+    (all-invalid rows under ``causal``), a non-monotonic prefix sum assigns
+    rows to the wrong document.  The per-document rows are turned into global
+    key rows on device, in one launch right before the forward kernel.
 
     Parameters
     ----------
     check_cu_seqlens : bool
-        ``True`` (default) checks the values of ``cu_seqlens_q`` /
-        ``cu_seqlens_k`` against the invariants above at the cost of one
-        device-to-host copy per call (skipped during CUDA-graph capture, where
-        no synchronization is possible; the eager call captured was checked).
-        ``False`` keeps the structural checks (dtype, rank, length, device)
-        only -- for a timed loop over inputs validated once.
+        ``True`` checks the values of ``cu_seqlens_q`` / ``cu_seqlens_k``
+        against the invariants above at the cost of one blocking device-to-host
+        copy per call, before any launch (skipped during CUDA-graph capture,
+        where no synchronization is possible; the eager call captured was
+        checked).  ``False`` (default) keeps the structural checks (dtype,
+        rank, length, contiguity, device) only.
     causal : bool
         With ``False`` (default) the index row is taken as is -- only ``-1`` /
         out-of-range slots are dropped.  With ``True`` a slot that selects a

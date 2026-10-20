@@ -1198,10 +1198,10 @@ def validate_cu_seqlens(
 ) -> None:
     """Check the packed-batch invariants of a varlen call; raises ``ValueError`` naming the argument.
 
-    Structure (host side, always): both int32 1-D ``[num_docs + 1]`` tensors of one length (at least two entries)
-    on one device.  Values (one device-to-host copy; ``values=False`` skips them, and they are skipped during
-    CUDA-graph capture, where a synchronization is not possible -- a capture replays the geometry of the eager
-    call that was validated before it): both start at 0 and are non-decreasing, ``cu_seqlens_q[-1] == num_queries``
+    Structure (host side, always): both contiguous int32 1-D ``[num_docs + 1]`` tensors of one length (at least two
+    entries) on one device.  Values (one blocking device-to-host copy; ``values=False`` skips them, and they are
+    skipped during CUDA-graph capture, where a synchronization is not possible -- a capture replays the geometry of
+    the eager call that was validated before it): both start at 0 and are non-decreasing, ``cu_seqlens_q[-1] == num_queries``
     (the packed query rows ``T``) and ``cu_seqlens_k[-1] == num_kv`` (the packed key rows ``S``; a shorter or longer
     key window is not accepted), and every document has ``seqlen_q <= seqlen_k`` (the query segment is the tail of
     its key prefix).
@@ -1214,6 +1214,8 @@ def validate_cu_seqlens(
             or cu.numel() < 2
         ):
             raise ValueError(f"{name} must be an int32 [num_docs + 1] tensor")
+        if not cu.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
     if cu_seqlens_q.numel() != cu_seqlens_k.numel():
         raise ValueError(
             "cu_seqlens_q and cu_seqlens_k must describe the same documents"
@@ -3125,6 +3127,13 @@ def _plan_nope(
         has_dst_map=scalars["has_dst_map"],
         accumulate=scalars["accumulate"],
         derive_length=int(derive_length),
+        # a forward program that converts per-document index rows itself (NOPE_FWD_CONVERT_ARGS) takes these
+        # too; a plan over global rows passes ``convert = 0`` (the per-document operands are never read; the
+        # launcher of a program without them ignores them)
+        num_docs=1,
+        search_iters=1,
+        causal=0,
+        convert=0,
         # main-stage accumulator geometry: the caller's rows (their stride, the map flag) or the fresh
         # contiguous [S, 512] buffer on a direct binding, the private permuted accumulator otherwise
         **_main_accumulator_constants_nope(
@@ -3238,6 +3247,19 @@ def _plan_nope(
     )
 
 
+_INERT_CU_SEQLENS: dict[str, torch.Tensor] = {}
+
+
+def _inert_cu_seqlens(device: torch.device) -> torch.Tensor:
+    """Cached int32 ``[2]`` constant on ``device``: the prefix-sum operands of a forward launch over global rows
+    (``convert = 0``), where a converting program needs valid pointers it never reads."""
+    key = str(device)
+    t = _INERT_CU_SEQLENS.get(key)
+    if t is None:
+        t = _INERT_CU_SEQLENS[key] = torch.zeros(2, dtype=torch.int32, device=device)
+    return t
+
+
 def _bound_values_nope(plan: _Plan, t: dict[str, torch.Tensor]) -> dict[str, Any]:
     """Launch values of a NoPE ``plan`` over the tensors ``t`` (the kernels' own argument names).
 
@@ -3249,6 +3271,10 @@ def _bound_values_nope(plan: _Plan, t: dict[str, torch.Tensor]) -> dict[str, Any
     indices, _ = _pointer_operand(t["indices"])
     values: dict[str, Any] = dict(plan.constants)
     values.update(t, indices=indices)
+    # the converting forward's pointer operands under ``convert = 0``: the index operand stands as ``indices_out``
+    # and a per-device int32 constant as the prefix sums (valid pointers the kernel never reads)
+    inert_cu = _inert_cu_seqlens(t["indices"].device)
+    values.update(indices_out=indices, cu_seqlens_q=inert_cu, cu_seqlens_k=inert_cu)
     if plan.backward:
         dst_map = (
             t["dkv_dst_map"] if t.get("dkv_dst_map") is not None else t["topk_length"]
@@ -3518,7 +3544,13 @@ class _NopeBinding(_Binding):
 
     __slots__ = ()
 
-    def forward(self, q_latent, kv_latent, indices, topk_length):
+    def prepared_forward(
+        self, q_latent, kv_latent, indices, topk_length, extra=None
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], Callable[[], None]]:
+        """``((out, lse, o_lo), launch)``: the forward's outputs allocated and its launch values bound; ``launch()``
+        issues the forward stage.  The varlen entry binds first, launches its index preparation and then calls
+        ``launch()``, so the forward kernel follows that launch with no host work in between.  ``extra``: further
+        launch values (the operands of a forward program that converts per-document index rows itself)."""
         T, device = self.plan.num_queries, q_latent.device
         out = _alloc((T, NUM_HEADS, D_LATENT), torch.bfloat16, device)
         lse = _alloc((T, NUM_HEADS), torch.float32, device)
@@ -3532,8 +3564,22 @@ class _NopeBinding(_Binding):
             lse=lse,
             o_lo=o_lo,
         )
-        self._run(_bound_values_nope(self.plan, t), self.plan.forward_stages)
-        return out, lse, o_lo
+        values = _bound_values_nope(self.plan, t)
+        if extra:
+            values.update(extra)
+        stages = self.plan.forward_stages
+
+        def launch() -> None:
+            self._run(values, stages)
+
+        return (out, lse, o_lo), launch
+
+    def forward(self, q_latent, kv_latent, indices, topk_length):
+        outputs, launch = self.prepared_forward(
+            q_latent, kv_latent, indices, topk_length
+        )
+        launch()
+        return outputs
 
     def backward(
         self,
@@ -3865,25 +3911,30 @@ class DSASparseAttentionNopeFunction(torch.autograd.Function):
             )
         if dout is None:  # out unused downstream
             return (None,) * 12
-        q_latent, kv_latent, indices, out, lse, o_lo, topk_length = ctx.saved_tensors
-        dq, dkv = backward_nope(
-            q_latent,
-            kv_latent,
-            indices,
-            out,
-            o_lo,
-            lse,
-            dout,
-            topk_length=topk_length if ctx.has_topk_length else None,
-            softmax_scale=ctx.softmax_scale,
-            key_passes=ctx.key_passes,
-            dkv_acc=ctx.dkv_acc,
-            dkv_dst_map=ctx.dkv_dst_map,
-            num_segments=ctx.num_segments,
-            dkv_direct=ctx.dkv_direct,
-            check_dst_map=ctx.check_dst_map,
-        )
-        return (dq, dkv) + (None,) * 10
+        return _nope_backward_from_ctx(ctx, dout) + (None,) * 10
+
+
+def _nope_backward_from_ctx(ctx, dout) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """``(dq, dkv)`` of the NoPE autograd wrappers: :func:`backward_nope` over the saved inputs and forward outputs
+    with the options the forward remembered on ``ctx``."""
+    q_latent, kv_latent, indices, out, lse, o_lo, topk_length = ctx.saved_tensors
+    return backward_nope(
+        q_latent,
+        kv_latent,
+        indices,
+        out,
+        o_lo,
+        lse,
+        dout,
+        topk_length=topk_length if ctx.has_topk_length else None,
+        softmax_scale=ctx.softmax_scale,
+        key_passes=ctx.key_passes,
+        dkv_acc=ctx.dkv_acc,
+        dkv_dst_map=ctx.dkv_dst_map,
+        num_segments=ctx.num_segments,
+        dkv_direct=ctx.dkv_direct,
+        check_dst_map=ctx.check_dst_map,
+    )
 
 
 def dsa_sparse_attention_nope(
@@ -3936,6 +3987,362 @@ def dsa_sparse_attention_nope(
     return (out, lse) if return_lse else out
 
 
+# ---------------------------------------------------------------------------
+# Packed form: on-device index preparation
+# ---------------------------------------------------------------------------
+
+# The NoPE record's index-preparation stage (``"index_prep"``, first in the record's stage list: it runs before
+# ``nope_fwd``): one warp per index row, INDEX_PREP_ROWS_PER_CTA rows per 128-thread CTA.  Its torch formulation,
+# ``offset_gather_kv_indices``, stays the rope varlen entry's glue and the reference the tests hold the stage to.
+NOPE_INDEX_PREP_STAGE = "index_prep"
+INDEX_PREP_ROWS_PER_CTA = 4
+# Launch arguments a forward program that converts the per-document rows itself appends to its argument list
+# (``cake_launch.STAGE_ARGS["nope_fwd"]``), in this order: the prefix sums, the global-row output the backward
+# consumes, the document count and its search depth, the causal flag, and ``convert`` (0: global rows in, the
+# per-document operands never read; 1: per-document rows in, the lengths derived in-kernel).  The packed entry then
+# needs no index-preparation launch.
+NOPE_FWD_CONVERT_ARGS = (
+    "cu_seqlens_q",
+    "cu_seqlens_k",
+    "indices_out",
+    "num_docs",
+    "search_iters",
+    "causal",
+    "convert",
+)
+_INT32_MAX = 2**31 - 1
+
+
+def index_prep_grid(num_rows: int) -> tuple[int, int, int]:
+    """Launch grid of the index-preparation stage over ``num_rows`` index rows: one CTA per four rows."""
+    return (max(1, -(-int(num_rows) // INDEX_PREP_ROWS_PER_CTA)), 1, 1)
+
+
+def index_prep_search_iters(num_docs: int) -> int:
+    """Bisection steps of the index-preparation kernel that always converge on a row's document among
+    ``num_docs``: ``ceil(log2(num_docs)) + 1`` (``1`` for one document)."""
+    return (max(int(num_docs), 1) - 1).bit_length() + 1
+
+
+def nope_index_prep_available(device: Optional[torch.device] = None) -> bool:
+    """Whether the NoPE record serves ``device`` with the index-preparation stage."""
+    try:
+        _, record = record_for(device, cake_jit.NOPE_PROGRAM)
+    except NotImplementedError:
+        return False
+    return NOPE_INDEX_PREP_STAGE in record
+
+
+def nope_fwd_converts_indices() -> bool:
+    """Whether the registered NoPE forward program converts per-document index rows itself: its launch argument
+    list carries :data:`NOPE_FWD_CONVERT_ARGS`."""
+    args = cake_launch.STAGE_ARGS.get(cake_jit.NOPE_FORWARD_STAGES[0], ())
+    return all(name in args for name in NOPE_FWD_CONVERT_ARGS)
+
+
+def _nope_arch(tensor: torch.Tensor) -> str:
+    """Architecture tag of the NoPE record serving ``tensor``'s device; ``NotImplementedError`` for a host tensor or a
+    device the record does not serve."""
+    if not tensor.is_cuda:
+        raise NotImplementedError(
+            "the NoPE DSA sparse-attention training entries need CUDA tensors on a compute capability "
+            "10.0 / 10.3 / 10.7 device"
+        )
+    record_for(tensor.device, cake_jit.NOPE_PROGRAM)
+    return arch_for(tensor.device)
+
+
+def varlen_index_mode(
+    gather_kv_indices: torch.Tensor, *, caller_lengths: bool = False
+) -> str:
+    """How the packed entry turns per-document index rows on ``gather_kv_indices``'s device into global key rows:
+    ``"kernel"`` when the registered forward program converts them itself (:func:`nope_fwd_converts_indices`; it
+    derives the row lengths, so not with caller lengths), else ``"index_prep"`` -- one launch of the record's
+    index-preparation stage right before the forward.  Raises ``NotImplementedError`` for a host tensor, a device
+    the NoPE record does not serve, or a registered program that offers neither.  The torch formulation
+    :func:`offset_gather_kv_indices` is the rope entry's glue and the tests' reference, not a runtime mode of the
+    NoPE entries."""
+    _nope_arch(gather_kv_indices)
+    converts = nope_fwd_converts_indices()
+    if converts and not caller_lengths:
+        return "kernel"
+    record = cake_jit.record(cake_jit.NOPE_PROGRAM)
+    if NOPE_INDEX_PREP_STAGE in record:
+        return "index_prep"
+    if converts:
+        raise NotImplementedError(
+            "a caller-given topk_length with the converting NoPE forward needs the index-preparation stage "
+            f"{NOPE_INDEX_PREP_STAGE!r}, which the registered program {cake_jit.NOPE_PROGRAM!r} does not carry"
+        )
+    raise NotImplementedError(
+        f"the registered NoPE DSA training program {cake_jit.NOPE_PROGRAM!r} has neither the index-preparation "
+        f"stage {NOPE_INDEX_PREP_STAGE!r} nor a forward that converts per-document index rows "
+        f"(registered stages: {tuple(record.get('stages', ()))})"
+    )
+
+
+def _index_storage_alias(indices: torch.Tensor) -> tuple[torch.Tensor, int, int]:
+    """``(flat view, element offset, row stride)`` of an int32 ``[T, K_slots]`` index tensor for the
+    index-preparation kernel, which addresses its index operand as flat storage (row ``t`` at
+    ``indices_offset + t * idx_stride``): the stride-1 view of the storage span the rows occupy, from the
+    vector-aligned element at or below the tensor's start (:data:`POINTER_GRANULE`), and the offset of row 0 within
+    it.  Any row stride is read in place -- a column slice of a wider index buffer included -- and the view is
+    contiguous by construction (the FFI boundary takes contiguous tensors)."""
+    num_rows, topk = (int(d) for d in indices.shape)
+    stride = int(indices.stride(0)) if num_rows > 1 else topk
+    offset = indices.storage_offset() % POINTER_GRANULE
+    span = offset + (num_rows - 1) * stride + topk
+    view = indices.as_strided((span,), (1,), indices.storage_offset() - offset)
+    return view, offset, stride
+
+
+def _check_int32(name: str, value: int) -> int:
+    if not -_INT32_MAX - 1 <= int(value) <= _INT32_MAX:
+        raise ValueError(f"{name} = {value} does not fit the kernel's int32 argument")
+    return int(value)
+
+
+def _check_gather_kv_indices(
+    gather_kv_indices: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    num_rows: Optional[int] = None,
+) -> None:
+    """Structure of the packed entry's index operands: int32 ``[T, K_slots]`` rows (``T == num_rows`` when given)
+    and contiguous int32 ``[num_docs + 1]`` prefix sums of one length."""
+    if (
+        gather_kv_indices.ndim != 2
+        or gather_kv_indices.dtype != torch.int32
+        or (num_rows is not None and int(gather_kv_indices.shape[0]) != num_rows)
+    ):
+        raise ValueError("gather_kv_indices must be an int32 [T, topk] tensor")
+    for name, cu in (("cu_seqlens_q", cu_seqlens_q), ("cu_seqlens_k", cu_seqlens_k)):
+        if cu.ndim != 1 or cu.dtype != torch.int32 or cu.numel() < 2:
+            raise ValueError(f"{name} must be an int32 [num_docs + 1] tensor")
+        if not cu.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    if cu_seqlens_q.numel() != cu_seqlens_k.numel():
+        raise ValueError(
+            "cu_seqlens_q and cu_seqlens_k must describe the same documents"
+        )
+
+
+def _launch_index_prep(
+    arch: str,
+    gather_kv_indices: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    *,
+    causal: bool,
+    out: torch.Tensor,
+    topk_length: torch.Tensor,
+) -> None:
+    """One launch of the index-preparation stage over the per-document rows ``gather_kv_indices`` (int32
+    ``[T, K_slots]``, ``T >= 1``, any row stride, on a device the stage serves) with the prefix sums: the global
+    key rows (invalid slots ``-1``) go to the caller's contiguous int32 ``out [T, K_slots]``, the row lengths (last
+    valid slot + 1) to the caller's int32 ``topk_length [T]``.  Row ``t`` belongs to the last document ``n`` with
+    ``cu_seqlens_q[n] <= t``; a slot is valid iff ``0 <= idx <= bound`` with the query's own key position as the
+    bound under ``causal`` and ``seqlen_k - 1`` otherwise, and maps to ``idx + cu_seqlens_k[n]``."""
+    num_rows, topk = (int(d) for d in gather_kv_indices.shape)
+    alias, offset, stride = _index_storage_alias(gather_kv_indices)
+    for name, value in (
+        ("T", num_rows),
+        ("K_slots", topk),
+        ("the index row stride", stride),
+    ):
+        _check_int32(name, value)
+    num_docs = int(cu_seqlens_q.numel()) - 1
+    values = dict(
+        indices=alias,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        out=out,
+        topk_length=topk_length,
+        num_rows=num_rows,
+        topk=topk,
+        idx_stride=stride,
+        indices_offset=offset,
+        num_docs=num_docs,
+        search_iters=index_prep_search_iters(num_docs),
+        causal=int(bool(causal)),
+        has_docs=1,
+        flat_bound=0,
+        write_out=1,
+    )
+    # the grid is the stage's own rule (one CTA per four rows), given explicitly
+    entry = _stage_entry(
+        NOPE_INDEX_PREP_STAGE,
+        arch,
+        dict(num_queries=num_rows, num_kv=0, topk=topk),
+        cake_jit.NOPE_PROGRAM,
+        index_prep_grid(num_rows),
+    )
+    with _ffi_stream_context(_device_index(gather_kv_indices.device)):
+        entry.launcher(entry.run, values, entry.grid)
+
+
+def nope_globalize_indices(
+    gather_kv_indices: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    *,
+    causal: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(indices, topk_length)`` of per-document index rows in one launch of the index-preparation stage: the
+    global key rows of ``gather_kv_indices`` (int32 ``[T, K_slots]``, any row stride; invalid slots ``-1``) under
+    the rule of :func:`offset_gather_kv_indices` -- the query segment is the tail of its key prefix, ``causal``
+    drops keys after the query's own position -- and the per-row ``topk_length`` (last valid slot + 1).  Pure
+    integer work: bitwise what ``offset_gather_kv_indices(..., causal=causal, return_topk_length=True)`` returns.
+    ``T == 0`` returns empty results without a launch; otherwise the device must be served by the NoPE record with
+    the stage (``NotImplementedError``).  The prefix sums are checked for structure here (contiguous int32
+    ``[num_docs + 1]``) and for their values by :func:`validate_cu_seqlens`; a violation that passes is not
+    detected on device (a row past ``cu_seqlens_q[-1]`` is assigned to the last document).
+    """
+    _check_gather_kv_indices(gather_kv_indices, cu_seqlens_q, cu_seqlens_k)
+    num_rows, topk = (int(d) for d in gather_kv_indices.shape)
+    device = gather_kv_indices.device
+    if num_rows == 0:
+        return _alloc((0, topk), torch.int32, device), _alloc((0,), torch.int32, device)
+    arch = _nope_arch(gather_kv_indices)
+    if NOPE_INDEX_PREP_STAGE not in cake_jit.record(cake_jit.NOPE_PROGRAM):
+        raise NotImplementedError(
+            f"the registered NoPE DSA training program {cake_jit.NOPE_PROGRAM!r} has no "
+            f"index-preparation stage {NOPE_INDEX_PREP_STAGE!r}"
+        )
+    out = _alloc((num_rows, topk), torch.int32, device)
+    topk_length = _alloc((num_rows,), torch.int32, device)
+    _launch_index_prep(
+        arch,
+        gather_kv_indices,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        causal=causal,
+        out=out,
+        topk_length=topk_length,
+    )
+    return out, topk_length
+
+
+class DSASparseAttentionNopeVarlenFunction(torch.autograd.Function):
+    """Autograd wrapper of the packed NoPE form with on-device index preparation.
+
+    Fifteen forward inputs ``(q_latent, kv_latent, gather_kv_indices, cu_seqlens_q, cu_seqlens_k, causal,
+    topk_length, softmax_scale, key_passes, dkv_acc, dkv_dst_map, num_segments, dkv_direct, check_dst_map,
+    mode)``; returns ``(out, lse)``.  The forward turns the per-document rows into global key rows on device --
+    ``mode == "index_prep"``: one launch of the index-preparation stage into a fresh ``indices [T, K_slots]`` and
+    the row lengths; ``mode == "kernel"``: the forward kernel reads the per-document rows and writes the global
+    rows to ``indices_out`` itself -- and the forward kernel follows with no host work in between: the plan
+    lookup, the output allocation and the forward's launch values are prepared before the first launch, and
+    nothing on the path synchronizes with the device.  The backward is that of
+    :class:`DSASparseAttentionNopeFunction` over the saved global rows and lengths.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q_latent,
+        kv_latent,
+        gather_kv_indices,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        causal,
+        topk_length,
+        softmax_scale,
+        key_passes=None,
+        dkv_acc=None,
+        dkv_dst_map=None,
+        num_segments=1,
+        dkv_direct=None,
+        check_dst_map=False,
+        mode="index_prep",
+    ):
+        arch = _nope_arch(gather_kv_indices)
+        num_rows, topk = int(q_latent.shape[0]), int(gather_kv_indices.shape[1])
+        device = q_latent.device
+        scale = float(softmax_scale)
+        indices = _alloc(
+            (num_rows, topk), torch.int32, device
+        )  # the global key rows: the backward's operand
+        derived = _alloc(
+            (num_rows,), torch.int32, device
+        )  # the row lengths the preparation writes
+        lengths = derived if topk_length is None else topk_length
+        if mode == "kernel":
+            # the forward reads the per-document rows (any row stride) and writes the global rows and the row
+            # lengths itself (``convert = 1`` derives the lengths: the entry selects this mode without caller lengths)
+            if topk_length is not None:
+                raise ValueError(
+                    "the converting NoPE forward derives the row lengths itself: no caller topk_length in kernel mode"
+                )
+            num_docs = int(cu_seqlens_q.numel()) - 1
+            plan_indices, derive = gather_kv_indices, True
+            extra = dict(
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                indices_out=indices,
+                num_docs=num_docs,
+                search_iters=index_prep_search_iters(num_docs),
+                causal=int(bool(causal)),
+                convert=1,
+            )
+        else:
+            plan_indices, derive, extra = indices, False, None
+        key = forward_binding_key_nope(
+            q_latent, kv_latent, plan_indices, lengths, scale, derive
+        )
+        binding = _binding(
+            key,
+            lambda: _plan_nope(
+                q_latent,
+                kv_latent,
+                plan_indices,
+                topk_length=lengths,
+                dout=None,
+                softmax_scale=scale,
+                outputs={},
+                backward=False,
+                key_passes=None,
+                derive_topk_length=derive,
+            ),
+            _NopeBinding,
+        )
+        (out, lse, o_lo), launch = binding.prepared_forward(
+            q_latent, kv_latent, plan_indices, lengths, extra
+        )
+        if mode != "kernel":
+            _launch_index_prep(
+                arch,
+                gather_kv_indices,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                causal=causal,
+                out=indices,
+                topk_length=derived,
+            )
+        launch()
+        ctx.set_materialize_grads(False)
+        ctx.softmax_scale = scale
+        ctx.key_passes = key_passes
+        ctx.num_segments = int(num_segments)
+        ctx.has_topk_length = True
+        ctx.dkv_acc = dkv_acc
+        ctx.dkv_dst_map = dkv_dst_map
+        ctx.dkv_direct = dkv_direct
+        ctx.check_dst_map = check_dst_map
+        ctx.save_for_backward(q_latent, kv_latent, indices, out, lse, o_lo, lengths)
+        return out, lse
+
+    @staticmethod
+    def backward(ctx, dout, dlse=None):
+        if dlse is not None:
+            raise NotImplementedError(
+                "gradients through lse are not supported; only out is differentiable"
+            )
+        if dout is None:  # out unused downstream
+            return (None,) * 15
+        return _nope_backward_from_ctx(ctx, dout) + (None,) * 13
+
+
 def dsa_sparse_attention_nope_varlen(
     q_latent: torch.Tensor,
     kv_latent: torch.Tensor,
@@ -3954,49 +4361,69 @@ def dsa_sparse_attention_nope_varlen(
     dkv_dst_map: Optional[torch.Tensor] = None,
     dkv_direct: Optional[bool] = None,
     check_dst_map: bool = False,
-    check_cu_seqlens: bool = True,
+    check_cu_seqlens: bool = False,
 ):
-    """Packed multi-document NoPE form: per-document key indices are offset by ``cu_seqlens_k`` on device
-    (:func:`offset_gather_kv_indices`; this glue counts in the step time), then the flat kernels run over the
-    packed rows.  Query and key segment lengths may differ (the query segment is the tail of its key prefix);
-    ``causal=True`` also drops selected keys after the query's own position ``(seqlen_k - seqlen_q) + local_q``.
-    ``max_seqlen_q/k`` are accepted for signature parity and not used on the host.  The segment count
-    ``len(cu_seqlens_k) - 1`` is passed on as ``num_segments``.  ``check_cu_seqlens`` (default ``True``) runs
-    :func:`validate_cu_seqlens` -- int32 prefix sums starting at 0, non-decreasing, ``cu_seqlens_q[-1] == T``,
-    ``cu_seqlens_k[-1] == S``, ``seqlen_q <= seqlen_k`` per document -- at the cost of one device-to-host copy
-    (skipped during CUDA-graph capture); ``False`` keeps the structural checks only.  Other arguments as in
-    :func:`dsa_sparse_attention_nope`."""
+    """Packed multi-document NoPE form: per-document key indices are turned into global key rows on device --
+    one launch of the record's index-preparation stage right before the forward kernel, or the forward kernel
+    itself when the program converts them (:func:`varlen_index_mode`); bitwise the :func:`offset_gather_kv_indices`
+    rule -- then the flat kernels run over the packed rows.  Query and key
+    segment lengths may differ (the query segment is the tail of its key prefix); ``causal=True`` also drops
+    selected keys after the query's own position ``(seqlen_k - seqlen_q) + local_q``.  ``max_seqlen_q/k`` are
+    accepted for signature parity and not used on the host.  The segment count ``len(cu_seqlens_k) - 1`` is passed
+    on as ``num_segments``.  Every call checks the structure of the prefix sums (contiguous int32
+    ``[num_docs + 1]`` of one length) and nothing on the path synchronizes with the device; ``check_cu_seqlens=True``
+    also checks their values (:func:`validate_cu_seqlens`: start at 0, non-decreasing, ``cu_seqlens_q[-1] == T``,
+    ``cu_seqlens_k[-1] == S``, ``seqlen_q <= seqlen_k`` per document) at the cost of one blocking device-to-host
+    copy before any launch (skipped during CUDA-graph capture); the default leaves those invariants to the caller,
+    as a violation is otherwise not detected on device.  Other arguments as in :func:`dsa_sparse_attention_nope`.
+    """
     del max_seqlen_q, max_seqlen_k
+    kv_latent = _kv_latent_rows(kv_latent)
+    num_queries = int(q_latent.shape[0])
     validate_cu_seqlens(
         cu_seqlens_q,
         cu_seqlens_k,
-        int(q_latent.shape[0]),
-        int(_kv_latent_rows(kv_latent).shape[0]),
+        num_queries,
+        int(kv_latent.shape[0]),
         values=check_cu_seqlens,
     )
-    if topk_length is None:
-        indices, topk_length = offset_gather_kv_indices(
+    _check_gather_kv_indices(gather_kv_indices, cu_seqlens_q, cu_seqlens_k, num_queries)
+    num_segments = int(cu_seqlens_k.numel()) - 1
+    if softmax_scale is None:
+        softmax_scale = NOPE_SOFTMAX_SCALE
+    if (
+        num_queries == 0
+    ):  # no rows: nothing to offset, nothing launched downstream either
+        return dsa_sparse_attention_nope(
+            q_latent,
+            kv_latent,
             gather_kv_indices,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            causal=causal,
-            return_topk_length=True,
+            topk_length=topk_length,
+            softmax_scale=softmax_scale,
+            return_lse=return_lse,
+            key_passes=key_passes,
+            dkv_acc=dkv_acc,
+            dkv_dst_map=dkv_dst_map,
+            num_segments=num_segments,
+            dkv_direct=dkv_direct,
+            check_dst_map=check_dst_map,
         )
-    else:
-        indices = offset_gather_kv_indices(
-            gather_kv_indices, cu_seqlens_q, cu_seqlens_k, causal=causal
-        )
-    return dsa_sparse_attention_nope(
+    mode = varlen_index_mode(gather_kv_indices, caller_lengths=topk_length is not None)
+    out, lse = DSASparseAttentionNopeVarlenFunction.apply(
         q_latent,
         kv_latent,
-        indices,
-        topk_length=topk_length,
-        softmax_scale=softmax_scale,
-        return_lse=return_lse,
-        key_passes=key_passes,
-        dkv_acc=dkv_acc,
-        dkv_dst_map=dkv_dst_map,
-        num_segments=int(cu_seqlens_k.numel()) - 1,
-        dkv_direct=dkv_direct,
-        check_dst_map=check_dst_map,
+        gather_kv_indices,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        bool(causal),
+        topk_length,
+        float(softmax_scale),
+        key_passes,
+        dkv_acc,
+        dkv_dst_map,
+        num_segments,
+        dkv_direct,
+        check_dst_map,
+        mode,
     )
+    return (out, lse) if return_lse else out
