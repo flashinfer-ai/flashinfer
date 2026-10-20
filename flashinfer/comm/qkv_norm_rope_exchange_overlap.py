@@ -309,17 +309,17 @@ class QkvNormRopeExchangeOverlap:
     The Cake backend selects its producer build per architecture and world size
     (``flashinfer.jit.cake_qkv_norm_rope_exchange_overlap.PRODUCER_VARIANT_DEFAULT_BY_ARCH_WORLD``: SM100 groups of
     8 ranks run the ``bulk_ow256`` build -- wide operand loads and bulk row stores --, SM100 groups of 4 ranks and
-    SM103 groups of 8 or 4 ranks the ``ow256`` build -- wide operand loads --, groups of 2 ranks, SM90 and SM107 the
-    baseline build).  Every build stores identical bits; the wide-load builds require 32-byte-aligned ``cos_sin``
-    and norm-weight tensors (a misaligned view raises and names the opt-out).  The environment variable
-    ``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT`` (``auto`` / ``shipped`` / a delivered build name) overrides the
-    selection for a session, rank-uniformly; the baseline build is delivered beside every variant, and a build that
-    is not delivered for the session's tile width raises and names the delivered ones.  The host plan's group
-    scaling follows the same keying (``cake_qkv_exchange_plan.GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD``: ``2`` on SM100
-    groups of 4 and 2 ranks and on SM103, ``1`` otherwise -- SM100 groups of 8 ranks, SM90 and SM107; it applies to
-    grouped rows with ``hidden >= 6144`` and
-    changes the tile order only); ``FLASHINFER_QKV_EXCHANGE_GROUP_M_SCALE`` (``auto`` / ``1`` / ``2`` / ``4``)
-    overrides it for a session, rank-uniformly.
+    SM103 groups of 8 or 4 ranks the ``ow256`` build -- wide operand loads --, SM107 groups of 4 ranks the ``bulk``
+    build -- bulk row stores --, groups of 2 ranks and SM90 the baseline build).  Every build stores identical bits;
+    the wide-load builds require 32-byte-aligned ``cos_sin`` and norm-weight tensors (a misaligned view raises and
+    names the opt-out).  The environment variable ``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT`` (``auto`` /
+    ``shipped`` / a delivered build name) overrides the selection for a session, rank-uniformly; the baseline build is
+    delivered beside every variant, and a build that is not delivered for the session's tile width raises and names
+    the delivered ones.  The host plan's group scaling follows the same keying
+    (``cake_qkv_exchange_plan.GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD``: ``2`` on SM100 groups of 4 and 2 ranks and on
+    SM103, ``1`` otherwise -- SM100 groups of 8 ranks, SM90 and SM107; it applies to grouped rows with
+    ``hidden >= 6144`` and changes the tile order only); ``FLASHINFER_QKV_EXCHANGE_GROUP_M_SCALE`` (``auto`` / ``1`` /
+    ``2`` / ``4``) overrides it for a session, rank-uniformly.
 
     The Cake backend also applies per-architecture row-count gates to each call's host plan
     (``cake_qkv_exchange_plan.SHAPE_GATE_DEFAULT_BY_ARCH``; SM100 / SM103: a call with ``batch * s_local <= 4096``

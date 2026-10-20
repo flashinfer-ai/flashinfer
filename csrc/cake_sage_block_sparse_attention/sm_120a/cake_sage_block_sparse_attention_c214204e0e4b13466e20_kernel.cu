@@ -14,15 +14,37 @@
  * limitations under the License.
  */
 
+// Exporter output, hand-folded here pending exporter support: the module text is
+// selected by per-module compile definitions. CAKE_SAGE_SM120_KERNEL names the kernel
+// symbol of the module being built; the five CAKE_SAGE_* flag macros below select the
+// specialization of the metadata flags (HAS_BLOCK_NUMS, BLOCK_SIZES_MODE 0-3,
+// FULL_K64_TILES, UNIFORM_NONEMPTY, CONTIGUOUS_BLOCK_INDICES) whose text is compiled.
+// Every default below describes the (0, 0, 0, 0, 0) specialization, whose text this
+// file carries verbatim outside the conditional arms.
+#ifndef CAKE_SAGE_SM120_KERNEL
+#define CAKE_SAGE_SM120_KERNEL kernel_cake_sage_block_sparse_attention_c214204e0e4b13466e20
+#endif
+#ifndef CAKE_SAGE_HAS_BLOCK_NUMS
+#define CAKE_SAGE_HAS_BLOCK_NUMS 0
+#endif
+#ifndef CAKE_SAGE_BLOCK_SIZES_MODE
+#define CAKE_SAGE_BLOCK_SIZES_MODE 0
+#endif
+#ifndef CAKE_SAGE_FULL_K64_TILES
+#define CAKE_SAGE_FULL_K64_TILES 0
+#endif
+#ifndef CAKE_SAGE_UNIFORM_NONEMPTY
+#define CAKE_SAGE_UNIFORM_NONEMPTY 0
+#endif
+#ifndef CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+#define CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES 0
+#endif
+
 typedef signed char int8_t;
 typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
 typedef unsigned int uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
 typedef unsigned long uint64_t;
-#endif
 static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int int32_t;
 typedef short int int16_t;
@@ -35,25 +57,13 @@ struct __align__(64) CakeTensorMap64 {
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
 
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) {
-  uint64_t opaque[16];
-} CUtensorMap;
-#else
 #include <cuda.h>
-#endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
 static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap),
               "CakeTensorMap alignment must cover the CUtensorMap CUDA ABI");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
-
-__device__ __forceinline__ int make_warp_uniform(int x) {
-  int result;
-  asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;" : "=r"(result) : "r"(x));
-  return result;
-}
 
 #define CAKE_INF CUDART_INF_F
 
@@ -77,36 +87,6 @@ __device__ __forceinline__ void mbarrier_init_owner_lane(void* mbar_ptr, uint32_
   __mbarrier_init(reinterpret_cast<__mbarrier_t*>(mbar_ptr), count);
 }
 
-__device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
-  uint32_t token;
-  asm volatile(
-      "{\n\t"
-      ".reg .pred P1;\n\t"
-      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-      " P1, [%1], %2;\n\t"
-      "selp.u32 %0, 1, 0, P1;\n\t"
-      "}\n"
-      : "=r"(token)
-      : "r"(mbar_addr), "r"(phase)
-      : "memory");
-  return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int phase) {
-  uint32_t token;
-  asm volatile(
-      "{\n\t"
-      ".reg .pred P1;\n\t"
-      "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-      " P1, [%1], %2;\n\t"
-      "selp.u32 %0, 1, 0, P1;\n\t"
-      "}\n"
-      : "=r"(token)
-      : "r"(mbar_addr), "r"(phase)
-      : "memory");
-  return token;
-}
-
 // CTA-local pipelines have short, resident producer/consumer edges.  Omitting
 // suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
 // explicit loop still makes this helper blocking until acquire succeeds.
@@ -123,148 +103,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
       "}\n" ::"r"(mbar_addr),
       "r"(phase)
       : "memory");
-}
-
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
-  asm volatile(
-      "{\n\t"
-      ".reg .pred P1;\n\t"
-      "LAB_WAIT_RELAXED:\n\t"
-      "mbarrier.try_wait.parity.shared::cta.b64"
-      " P1, [%0], %1, 10000000;\n\t"
-      "@P1 bra.uni DONE_RELAXED;\n\t"
-      "bra.uni LAB_WAIT_RELAXED;\n\t"
-      "DONE_RELAXED:\n\t"
-      "}\n" ::"r"(mbar_addr),
-      "r"(phase)
-      : "memory");
-}
-
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-__device__ __forceinline__ void mbarrier_wait_suspend(int mbar_addr, int phase,
-                                                      uint32_t suspend_time_hint) {
-  asm volatile(
-      "{\n\t"
-      ".reg .pred P1;\n\t"
-      "LAB_WAIT_SUSPEND:\n\t"
-      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-      " P1, [%0], %1, %2;\n\t"
-      "@P1 bra.uni DONE_SUSPEND;\n\t"
-      "bra.uni LAB_WAIT_SUSPEND;\n\t"
-      "DONE_SUSPEND:\n\t"
-      "}\n" ::"r"(mbar_addr),
-      "r"(phase), "r"(suspend_time_hint)
-      : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
-  asm volatile(
-      "{\n\t"
-      ".reg .pred P1;\n\t"
-      "LAB_WAIT_CLUSTER:\n\t"
-      "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-      " P1, [%0], %1;\n\t"
-      "@P1 bra.uni DONE_CLUSTER;\n\t"
-      "bra.uni LAB_WAIT_CLUSTER;\n\t"
-      "DONE_CLUSTER:\n\t"
-      "}\n" ::"r"(mbar_addr),
-      "r"(phase)
-      : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_hint(int mbar_addr, int phase,
-                                                   uint32_t suspend_time_hint) {
-  asm volatile(
-      "{\n\t"
-      ".reg .pred P1;\n\t"
-      ".reg .u32 WAIT_ADDR;\n\t"
-      "mov.u32 WAIT_ADDR, %0;\n\t"
-      "LAB_WAIT_HINT:\n\t"
-      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-      " P1, [WAIT_ADDR], %1, %2;\n\t"
-      "@P1 bra.uni DONE_HINT;\n\t"
-      "bra.uni LAB_WAIT_HINT;\n\t"
-      "DONE_HINT:\n\t"
-      "}\n" ::"r"(mbar_addr),
-      "r"(phase), "r"(suspend_time_hint)
-      : "memory");
-}
-
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
-__device__ __forceinline__ void mbarrier_wait_relaxed_hint(int mbar_addr, int phase,
-                                                           uint32_t suspend_time_hint) {
-  asm volatile(
-      "{\n\t"
-      ".reg .pred P1;\n\t"
-      "LAB_WAIT_RELAXED_HINT:\n\t"
-      "mbarrier.try_wait.parity.shared::cta.b64"
-      " P1, [%0], %1, %2;\n\t"
-      "@P1 bra DONE_RELAXED_HINT;\n\t"
-      "bra LAB_WAIT_RELAXED_HINT;\n\t"
-      "DONE_RELAXED_HINT:\n\t"
-      "}\n" ::"r"(mbar_addr),
-      "r"(phase), "r"(suspend_time_hint));
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster_hint(int mbar_addr, int phase,
-                                                           uint32_t suspend_time_hint) {
-  asm volatile(
-      "{\n\t"
-      ".reg .pred P1;\n\t"
-      "LAB_WAIT_CLUSTER_HINT:\n\t"
-      "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-      " P1, [%0], %1, %2;\n\t"
-      "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
-      "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
-      "DONE_CLUSTER_HINT:\n\t"
-      "}\n" ::"r"(mbar_addr),
-      "r"(phase), "r"(suspend_time_hint)
-      : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
-  if (token == 0) {
-    mbarrier_wait(mbar_addr, phase);
-  }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_suspend(int mbar_addr, int phase,
-                                                            uint32_t token,
-                                                            uint32_t suspend_time_hint) {
-  if (token == 0) {
-    mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
-  }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase,
-                                                            uint32_t token) {
-  if (token == 0) {
-    mbarrier_wait_cluster(mbar_addr, phase);
-  }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_hint(int mbar_addr, int phase, uint32_t token,
-                                                         uint32_t suspend_time_hint) {
-  if (token == 0) {
-    mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
-  }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(int mbar_addr, int phase,
-                                                                 uint32_t token,
-                                                                 uint32_t suspend_time_hint) {
-  if (token == 0) {
-    mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
-  }
-}
-
-__device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
-  asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::"r"(mbar_addr) : "memory");
 }
 
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
@@ -292,37 +130,6 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
   return c;
 }
 
-__device__ __forceinline__ void fence_async_shared() {
-  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-}
-
-__device__ __forceinline__ uint64_t desc_encode(uint64_t x) { return (x & 0x3FFFFULL) >> 4ULL; }
-
-__device__ __forceinline__ uint64_t make_smem_desc(int addr) {
-  const int SBO = 1024;
-  return desc_encode(addr) | (desc_encode(SBO) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
-}
-
-__device__ __forceinline__ void tma_4d_gmem2smem(int dst, const void* tmap_ptr, int x, int y, int z,
-                                                 int w, int mbar_addr) {
-  asm volatile(
-      "cp.async.bulk.tensor.4d.shared::cta.global"
-      ".mbarrier::complete_tx::bytes"
-      " [%0], [%1, {%2, %3, %4, %5}], [%6];" ::"r"(dst),
-      "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(w), "r"(mbar_addr)
-      : "memory");
-}
-
-__device__ __forceinline__ void tma_5d_gmem2smem(int dst, const void* tmap_ptr, int x, int y, int z,
-                                                 int w, int v, int mbar_addr) {
-  asm volatile(
-      "cp.async.bulk.tensor.5d.shared::cta.global"
-      ".mbarrier::complete_tx::bytes"
-      " [%0], [%1, {%2, %3, %4, %5, %6}], [%7];" ::"r"(dst),
-      "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(w), "r"(v), "r"(mbar_addr)
-      : "memory");
-}
-
 __device__ __forceinline__ void tma_store_5d(const void* tmap, int x, int y, int z, int w, int v,
                                              unsigned smem_addr) {
   asm volatile(
@@ -334,8 +141,7 @@ __device__ __forceinline__ void tma_store_5d(const void* tmap, int x, int y, int
 
 extern "C" {
 
-__global__
-__launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0e4b13466e20(
+__global__ __launch_bounds__(128, 3) void CAKE_SAGE_SM120_KERNEL(
     const __grid_constant__ CUtensorMap Q_map, const __grid_constant__ CUtensorMap K_map,
     const __grid_constant__ CUtensorMap V_map, const __grid_constant__ CUtensorMap O_map,
     float* __restrict__ q_scale, float* __restrict__ k_scale, float* __restrict__ v_scale,
@@ -395,6 +201,11 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0
   int q_base = q_block * 64;
   int metadata_row = (batch * num_heads + head) * ((seqlen_q + 64 - 1) / 64) + q_block;
   int selected_count = block_sparse_num;
+#if CAKE_SAGE_HAS_BLOCK_NUMS
+  {
+    selected_count = q2k_block_nums[metadata_row];
+  }
+#endif
   int index_base = metadata_row * q2k_capacity;
   if (warp == 0 && lane == 0 && q_block == 0) {
     asm volatile("prefetch.tensormap [%0];" ::"l"((uint64_t)((&Q_map))) : "memory");
@@ -421,6 +232,51 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0
   }
   int first_physical = 0;
   {
+#if CAKE_SAGE_UNIFORM_NONEMPTY && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+    {
+      if (lane == 0) {
+        first_physical = q2k_block_index[index_base + selected_count - 1];
+      }
+      int _shfl_0 = __shfl_sync(0xFFFFFFFF, first_physical, 0);
+      first_physical = _shfl_0;
+    }
+    if (warp == 0) {
+      if (elect_sync()) {
+        mbarrier_arrive_expect_tx(k_full_addr, 8192);
+        asm volatile(
+            "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+            " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::"r"(k_smem_addr),
+            "l"((&K_map)), "r"(0), "r"(first_physical * 64), "r"(head), "r"(batch),
+            "r"(k_full_addr), "l"(0x14F0000000000000ULL)
+            : "memory");
+        mbarrier_arrive_expect_tx(v_full_addr, 8192);
+        asm volatile(
+            "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+            " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::"r"(v_tma_smem_addr),
+            "l"((&V_map)), "r"(first_physical * 64), "r"(0), "r"(head), "r"(batch),
+            "r"(v_full_addr), "l"(0x14F0000000000000ULL)
+            : "memory");
+#elif CAKE_SAGE_UNIFORM_NONEMPTY
+    {
+      first_physical = q2k_block_index[index_base + selected_count - 1];
+    }
+    if (warp == 0) {
+      if (elect_sync()) {
+        mbarrier_arrive_expect_tx(k_full_addr, 8192);
+        asm volatile(
+            "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+            " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::"r"(k_smem_addr),
+            "l"((&K_map)), "r"(0), "r"(first_physical * 64), "r"(head), "r"(batch),
+            "r"(k_full_addr), "l"(0x14F0000000000000ULL)
+            : "memory");
+        mbarrier_arrive_expect_tx(v_full_addr, 8192);
+        asm volatile(
+            "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+            " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::"r"(v_tma_smem_addr),
+            "l"((&V_map)), "r"(first_physical * 64), "r"(0), "r"(head), "r"(batch),
+            "r"(v_full_addr), "l"(0x14F0000000000000ULL)
+            : "memory");
+#else
     if (selected_count > 0) {
       first_physical = q2k_block_index[index_base + selected_count - 1];
       if (warp == 0) {
@@ -442,6 +298,7 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0
               "r"(v_full_addr), "l"(0x14F0000000000000ULL)
               : "memory");
         }
+#endif
       }
     }
   }
@@ -883,6 +740,7 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0
     float k_scale_value = _shfl_2;
     float score_scale_log2 = q_softmax_log2 * k_scale_value;
     int valid_tokens = 64;
+#if !CAKE_SAGE_FULL_K64_TILES
     {
       valid_tokens = seqlen_k - current_physical * 64;
       if (valid_tokens > 64) {
@@ -892,18 +750,51 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0
         valid_tokens = 0;
       }
       {
+#if CAKE_SAGE_BLOCK_SIZES_MODE == 1
+        int _min_0 =
+            ((valid_tokens) < (block_sizes[current_physical]) ? (valid_tokens)
+                                                              : (block_sizes[current_physical]));
+        valid_tokens = _min_0;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 2
+        {
+          int _min_1 = ((valid_tokens) < (block_sizes[batch * num_k_blocks + current_physical])
+                            ? (valid_tokens)
+                            : (block_sizes[batch * num_k_blocks + current_physical]));
+          valid_tokens = _min_1;
+        }
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 3
+        {
+          {
+            int _min_2 =
+                ((valid_tokens) <
+                         (block_sizes[(batch * num_heads + head) * num_k_blocks + current_physical])
+                     ? (valid_tokens)
+                     : (block_sizes[(batch * num_heads + head) * num_k_blocks + current_physical]));
+            valid_tokens = _min_2;
+          }
+        }
+#else
         {
         }
+#endif
       }
       if (valid_tokens < 0) {
         valid_tokens = 0;
       }
     }
+#endif
     int preload_count = load_count + 1;
     int next_physical = 0;
     if (preload_count < selected_count) {
       {
+#if CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        next_physical = current_physical - 1;
+        if (next_physical < 0) {
+          next_physical = next_physical + num_k_blocks;
+        }
+#else
         next_physical = q2k_block_index[index_base + selected_count - 1 - preload_count];
+#endif
       }
       __syncthreads();
       if (warp == 0) {
@@ -1349,7 +1240,6 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0
         float2 _pair_scale_even2_0 = make_float2(row_scale[0], row_scale[0]);
         float2 _pair_scale_odd2_0 = make_float2(row_scale[1], row_scale[1]);
         float2* _pair_scale_src2_0 = reinterpret_cast<float2*>(&(output + 0)[0]);
-#if __CUDA_ARCH__ >= 1000
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_0[0])
                      : "l"(*(unsigned long long*)&_pair_scale_even2_0));
@@ -1362,22 +1252,11 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_0[3])
                      : "l"(*(unsigned long long*)&_pair_scale_odd2_0));
-#else
-        (output + 0)[0] *= row_scale[0];
-        (output + 0)[1] *= row_scale[0];
-        (output + 0)[2] *= row_scale[1];
-        (output + 0)[3] *= row_scale[1];
-        (output + 0)[4] *= row_scale[0];
-        (output + 0)[5] *= row_scale[0];
-        (output + 0)[6] *= row_scale[1];
-        (output + 0)[7] *= row_scale[1];
-#endif
       }
       {
         float2 _pair_scale_even2_1 = make_float2(row_scale[0], row_scale[0]);
         float2 _pair_scale_odd2_1 = make_float2(row_scale[1], row_scale[1]);
         float2* _pair_scale_src2_1 = reinterpret_cast<float2*>(&(output + 8)[0]);
-#if __CUDA_ARCH__ >= 1000
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_1[0])
                      : "l"(*(unsigned long long*)&_pair_scale_even2_1));
@@ -1390,22 +1269,11 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_1[3])
                      : "l"(*(unsigned long long*)&_pair_scale_odd2_1));
-#else
-        (output + 8)[0] *= row_scale[0];
-        (output + 8)[1] *= row_scale[0];
-        (output + 8)[2] *= row_scale[1];
-        (output + 8)[3] *= row_scale[1];
-        (output + 8)[4] *= row_scale[0];
-        (output + 8)[5] *= row_scale[0];
-        (output + 8)[6] *= row_scale[1];
-        (output + 8)[7] *= row_scale[1];
-#endif
       }
       {
         float2 _pair_scale_even2_2 = make_float2(row_scale[0], row_scale[0]);
         float2 _pair_scale_odd2_2 = make_float2(row_scale[1], row_scale[1]);
         float2* _pair_scale_src2_2 = reinterpret_cast<float2*>(&(output + 16)[0]);
-#if __CUDA_ARCH__ >= 1000
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_2[0])
                      : "l"(*(unsigned long long*)&_pair_scale_even2_2));
@@ -1418,22 +1286,11 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_2[3])
                      : "l"(*(unsigned long long*)&_pair_scale_odd2_2));
-#else
-        (output + 16)[0] *= row_scale[0];
-        (output + 16)[1] *= row_scale[0];
-        (output + 16)[2] *= row_scale[1];
-        (output + 16)[3] *= row_scale[1];
-        (output + 16)[4] *= row_scale[0];
-        (output + 16)[5] *= row_scale[0];
-        (output + 16)[6] *= row_scale[1];
-        (output + 16)[7] *= row_scale[1];
-#endif
       }
       {
         float2 _pair_scale_even2_3 = make_float2(row_scale[0], row_scale[0]);
         float2 _pair_scale_odd2_3 = make_float2(row_scale[1], row_scale[1]);
         float2* _pair_scale_src2_3 = reinterpret_cast<float2*>(&(output + 24)[0]);
-#if __CUDA_ARCH__ >= 1000
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_3[0])
                      : "l"(*(unsigned long long*)&_pair_scale_even2_3));
@@ -1446,22 +1303,11 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_3[3])
                      : "l"(*(unsigned long long*)&_pair_scale_odd2_3));
-#else
-        (output + 24)[0] *= row_scale[0];
-        (output + 24)[1] *= row_scale[0];
-        (output + 24)[2] *= row_scale[1];
-        (output + 24)[3] *= row_scale[1];
-        (output + 24)[4] *= row_scale[0];
-        (output + 24)[5] *= row_scale[0];
-        (output + 24)[6] *= row_scale[1];
-        (output + 24)[7] *= row_scale[1];
-#endif
       }
       {
         float2 _pair_scale_even2_4 = make_float2(row_scale[0], row_scale[0]);
         float2 _pair_scale_odd2_4 = make_float2(row_scale[1], row_scale[1]);
         float2* _pair_scale_src2_4 = reinterpret_cast<float2*>(&(output + 32)[0]);
-#if __CUDA_ARCH__ >= 1000
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_4[0])
                      : "l"(*(unsigned long long*)&_pair_scale_even2_4));
@@ -1474,22 +1320,11 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_4[3])
                      : "l"(*(unsigned long long*)&_pair_scale_odd2_4));
-#else
-        (output + 32)[0] *= row_scale[0];
-        (output + 32)[1] *= row_scale[0];
-        (output + 32)[2] *= row_scale[1];
-        (output + 32)[3] *= row_scale[1];
-        (output + 32)[4] *= row_scale[0];
-        (output + 32)[5] *= row_scale[0];
-        (output + 32)[6] *= row_scale[1];
-        (output + 32)[7] *= row_scale[1];
-#endif
       }
       {
         float2 _pair_scale_even2_5 = make_float2(row_scale[0], row_scale[0]);
         float2 _pair_scale_odd2_5 = make_float2(row_scale[1], row_scale[1]);
         float2* _pair_scale_src2_5 = reinterpret_cast<float2*>(&(output + 40)[0]);
-#if __CUDA_ARCH__ >= 1000
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_5[0])
                      : "l"(*(unsigned long long*)&_pair_scale_even2_5));
@@ -1502,22 +1337,11 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_5[3])
                      : "l"(*(unsigned long long*)&_pair_scale_odd2_5));
-#else
-        (output + 40)[0] *= row_scale[0];
-        (output + 40)[1] *= row_scale[0];
-        (output + 40)[2] *= row_scale[1];
-        (output + 40)[3] *= row_scale[1];
-        (output + 40)[4] *= row_scale[0];
-        (output + 40)[5] *= row_scale[0];
-        (output + 40)[6] *= row_scale[1];
-        (output + 40)[7] *= row_scale[1];
-#endif
       }
       {
         float2 _pair_scale_even2_6 = make_float2(row_scale[0], row_scale[0]);
         float2 _pair_scale_odd2_6 = make_float2(row_scale[1], row_scale[1]);
         float2* _pair_scale_src2_6 = reinterpret_cast<float2*>(&(output + 48)[0]);
-#if __CUDA_ARCH__ >= 1000
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_6[0])
                      : "l"(*(unsigned long long*)&_pair_scale_even2_6));
@@ -1530,22 +1354,11 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_6[3])
                      : "l"(*(unsigned long long*)&_pair_scale_odd2_6));
-#else
-        (output + 48)[0] *= row_scale[0];
-        (output + 48)[1] *= row_scale[0];
-        (output + 48)[2] *= row_scale[1];
-        (output + 48)[3] *= row_scale[1];
-        (output + 48)[4] *= row_scale[0];
-        (output + 48)[5] *= row_scale[0];
-        (output + 48)[6] *= row_scale[1];
-        (output + 48)[7] *= row_scale[1];
-#endif
       }
       {
         float2 _pair_scale_even2_7 = make_float2(row_scale[0], row_scale[0]);
         float2 _pair_scale_odd2_7 = make_float2(row_scale[1], row_scale[1]);
         float2* _pair_scale_src2_7 = reinterpret_cast<float2*>(&(output + 56)[0]);
-#if __CUDA_ARCH__ >= 1000
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_7[0])
                      : "l"(*(unsigned long long*)&_pair_scale_even2_7));
@@ -1558,16 +1371,6 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0
         asm volatile("mul.rn.ftz.f32x2 %0, %0, %1;"
                      : "+l"(*(unsigned long long*)&_pair_scale_src2_7[3])
                      : "l"(*(unsigned long long*)&_pair_scale_odd2_7));
-#else
-        (output + 56)[0] *= row_scale[0];
-        (output + 56)[1] *= row_scale[0];
-        (output + 56)[2] *= row_scale[1];
-        (output + 56)[3] *= row_scale[1];
-        (output + 56)[4] *= row_scale[0];
-        (output + 56)[5] *= row_scale[0];
-        (output + 56)[6] *= row_scale[1];
-        (output + 56)[7] *= row_scale[1];
-#endif
       }
     }
     pack_values[0] = scores[0];

@@ -19,6 +19,16 @@ tactic tuning and timing: the default warm policy does not flush L2, while
 the cold policy flushes before each sample. Tuning uses multiple graph replays
 to select tactics for the same execution regime as timing. The report contains
 all samples and paired bootstrap intervals across round medians.
+
+The ``cake`` arm (``--backends trtllm cake``) runs the full Cake path of
+``flashinfer.experimental.cake_stepfun_moe`` (cake-build/1 programs: routing,
+FC1, requantization, FC2, finalize) through ``CakeStepFunConfig``.
+``--full-path`` is the facade knob (``auto`` / ``1`` run the full path; ``0``
+names the retired FC1-only hybrid and raises); the manifest identity of the
+package is recorded in ``metadata.json``. ``--no-cuda-graph`` times eager
+launches instead of a graph replay (the default and the protocol fields are
+unchanged). A Step limit of ``inf`` is accepted and runs as ``FLT_MAX`` (the
+kernels' "no clamp" value).
 """
 
 from __future__ import annotations
@@ -28,6 +38,7 @@ import csv
 import dataclasses
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -42,6 +53,7 @@ import torch
 import flashinfer
 from flashinfer.artifacts import ArtifactPath, CheckSumHash
 from flashinfer.autotuner import AutoTuner, autotune
+from flashinfer.experimental.cake_stepfun_moe import cake_build
 from flashinfer.jit.env import FLASHINFER_CUBIN_DIR
 from flashinfer.fused_moe import (
     BackendOptions,
@@ -86,16 +98,21 @@ MODES = {
 }
 # The per-tensor FP8 mode is opt-in; the default precision set is unchanged.
 DEFAULT_PRECISIONS = ("bf16", "mxfp8", "nvfp4")
-# Alternative FC1 backends measured next to the native trtllm-gen kernels on the
+# Alternative backends measured next to the native trtllm-gen kernels on the
 # same weights, activations and autotune policy. Cake serves every precision.
 BACKENDS = {
     "trtllm": None,
     "cake": (CakeStepFunConfig, CakeStepFunRunner),
 }
+# ``--full-path`` -> the ``CakeStepFunConfig.full_path`` keyword (``None`` lets the
+# facade resolve ``FLASHINFER_CAKE_STEPFUN_FULL_PATH``; the facade raises for ``0``).
+FULL_PATH = {"auto": None, "1": True, "0": False}
 # Per-tensor FP8 calibration as in the FlashInfer tests: 448 / amax(sample) for
 # the activations and 448 / 256 for the FC1 output (StepFun is bounded by L^2).
 FP8_CALIBRATION_TOKENS = 2048
 FP8_INTERMEDIATE_SCALE_GLOBAL = 448.0 / 256.0
+# The public spelling of "no clamp": a Step limit of inf runs as FLT_MAX.
+FLT_MAX = float(torch.finfo(torch.float32).max)
 
 
 def baseline_variant(precision):
@@ -121,6 +138,15 @@ def parse_args():
         choices=tuple(BACKENDS),
         default=["trtllm"],
         help="FC1 backends measured on the same inputs (the cake arm serves every precision).",
+    )
+    parser.add_argument(
+        "--full-path",
+        choices=tuple(FULL_PATH),
+        default="auto",
+        help=(
+            "CakeStepFunConfig.full_path of the cake arm: auto / 1 run the full Cake path, "
+            "0 names the retired FC1-only hybrid and raises."
+        ),
     )
     parser.add_argument(
         "--skip-native-baseline",
@@ -151,6 +177,12 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=1091)
     parser.add_argument("--pdl", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cupti", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--cuda-graph",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Time one CUDA graph replay per sample (default); --no-cuda-graph times eager launches.",
+    )
     parser.add_argument("--regression-threshold", type=float, default=0.05)
     parser.add_argument(
         "--check-performance",
@@ -178,8 +210,8 @@ def parse_args():
         parser.error("hidden and intermediate must be divisible by 128")
     if args.top_k > args.experts or args.experts > 256:
         parser.error("require top-k <= experts <= 256")
-    if any(not 0 < limit < float("inf") for limit in args.step_limits):
-        parser.error("Step limits must be positive and finite")
+    if any(not limit > 0 or math.isnan(limit) for limit in args.step_limits):
+        parser.error("Step limits must be positive (inf runs as FLT_MAX)")
     if args.rounds < 3 or args.regression_threshold < 0:
         parser.error("require rounds >= 3 and regression-threshold >= 0")
     if args.cache_policy == "cold" and not args.cupti:
@@ -208,6 +240,51 @@ def json_default(value):
 def tensor_digest(tensor):
     data = tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
     return hashlib.sha256(data).hexdigest()
+
+
+def cake_package_identity():
+    """The cake-build/1 identity of the Cake StepFun package: the manifest digest without its
+    ``generator`` block (Cake ``cake_build_manifest.identity_digest``), the producing Cake
+    revision and the entry count."""
+    manifest = cake_build.manifest()
+    document = {key: value for key, value in manifest.items() if key != "generator"}
+    text = (
+        json.dumps(
+            document, indent=2, sort_keys=True, ensure_ascii=True, allow_nan=False
+        )
+        + "\n"
+    )
+    generator = manifest.get("generator", {})
+    return {
+        "package": manifest.get("package"),
+        "schema": manifest.get("schema"),
+        "manifest_identity": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "manifest_identity_method": "manifest_without_generator_sha256",
+        "cake_revision": generator.get("cake_revision"),
+        "rendered_at": generator.get("rendered_at"),
+        "generator_cuda": generator.get("cuda"),
+        "libraries": len(manifest.get("libraries", [])),
+    }
+
+
+def tactic_descriptor(arm, tactic):
+    """What a tactic names on each arm: the Cake arm's int FC1 / FC2 plan tile (the ``plan`` of
+    ``prepare_stepfun_moe``, one of ``cake_backend.plans_for``), the native arm's ``[tile, config
+    index]`` pair of the trtllm-gen batched-GEMM tactic space; ``-1`` is the runner's default."""
+    if not isinstance(tactic, (bool, int)):
+        # The native tactic arrives as a tvm-ffi ``Array`` row of ``trtllm_get_valid_moe_configs``
+        # (a ``Sequence``, not a ``list``/``tuple``); a cached one as a tuple.  Read any sequence.
+        tactic = [int(v) for v in tactic]
+        if len(tactic) >= 2:
+            return {
+                "kind": "trtllm_tactic",
+                "tile": int(tactic[0]),
+                "index": int(tactic[1]),
+            }
+        return {"kind": "default", "tactic": tactic}
+    if arm == "cake" and int(tactic) != -1:
+        return {"kind": "cake_plan", "tile": int(tactic)}
+    return {"kind": "default", "tactic": tactic}
 
 
 def make_activations(args, tokens, backend, quant, hidden_states_scale_global=None):
@@ -246,14 +323,14 @@ def make_activations(args, tokens, backend, quant, hidden_states_scale_global=No
 
 
 # StepFun routes with Renormalize (top-k, then softmax over the selected experts):
-# the production StepFun path and tests/moe/test_cake_stepfun_fused_moe.py use it,
-# the Cake full path serves it only (CakeStepFunRunner._check_support), and the
-# native trtllm runners accept it for every precision measured here. Both arms
-# share it so the pair compares the same routing semantics.
+# the production StepFun path and tests/experimental/test_cake_stepfun_moe_api.py
+# use it, the Cake full path serves it only, and the native trtllm runners accept
+# it for every precision measured here. Both arms share it so the pair compares
+# the same routing semantics.
 ROUTING_METHOD = RoutingMethodType.Renormalize
 
 
-def make_config(args, tokens, backend, quant, activation):
+def make_config(args, tokens, backend, quant, activation, backend_kwargs=None):
     return MoEConfig(
         routing=RoutingConfig(
             num_experts=args.experts, top_k=args.top_k, method=ROUTING_METHOD
@@ -263,7 +340,7 @@ def make_config(args, tokens, backend, quant, activation):
             intermediate_size=args.intermediate, local_num_experts=args.experts
         ),
         activation=activation,
-        backend=BackendOptions(candidates=(backend(),)),
+        backend=BackendOptions(candidates=(backend(**(backend_kwargs or {})),)),
         execution=ExecutionConfig(enable_pdl=args.pdl, tune_max_num_tokens=tokens),
     )
 
@@ -271,7 +348,8 @@ def make_config(args, tokens, backend, quant, activation):
 def make_candidate(
     args, tokens, runner_cls, backend, quant, activation, base_view, act, arm="trtllm"
 ):
-    config = make_config(args, tokens, backend, quant, activation)
+    backend_kwargs = {"full_path": FULL_PATH[args.full_path]} if arm == "cake" else None
+    config = make_config(args, tokens, backend, quant, activation, backend_kwargs)
     runner = runner_cls(config, torch.device("cuda", torch.cuda.current_device()))
     runner.check_support()
     runner.build()
@@ -319,7 +397,7 @@ def make_candidate(
     # policy; change only the copied config, preserving its input/routing rules.
     tuning_config = dataclasses.replace(
         runner.tuning_config_for(packed),
-        use_cuda_graph=True,
+        use_cuda_graph=args.cuda_graph,
         use_cold_l2_cache=args.cache_policy == "cold",
         use_cold_l2_graph_replay=False,
         cuda_graph_profile_replays=args.tuning_graph_replays,
@@ -354,7 +432,7 @@ def measure(args, candidate):
             dry_run_iters=args.warmups,
             repeat_iters=args.iterations,
             enable_cupti=args.cupti,
-            use_cuda_graph=True,
+            use_cuda_graph=args.cuda_graph,
             cold_l2_cache=args.cache_policy == "cold",
         )
     messages = [str(w.message) for w in caught]
@@ -364,10 +442,11 @@ def measure(args, candidate):
             "CUPTI fell back to graph events without an L2 flush; "
             "cannot measure the requested cold cache policy"
         )
+    launch = "cuda_graph" if args.cuda_graph else "eager"
     method = (
-        "cupti_activity_span_cuda_graph"
+        f"cupti_activity_span_{launch}"
         if args.cupti and not fallback
-        else "cuda_events_cuda_graph"
+        else f"cuda_events_{launch}"
     )
     samples = [float(value) * 1000 for value in times]
     if not samples or min(samples) <= 0:
@@ -446,17 +525,26 @@ def main():
         "cold_l2_cache": args.cache_policy == "cold",
         "autotune": "independent per activation, precision, backend, token count",
         "backends": list(args.backends),
+        "full_path": args.full_path,
+        "cake_stepfun_moe": cake_package_identity()
+        if "cake" in args.backends
+        else None,
+        "tactic_format": {
+            "trtllm": "[tile, config index] of the trtllm-gen batched-GEMM tactic space",
+            "cake": "int FC1 / FC2 plan tile of cake_backend.plans_for (routing, FC1, requant, FC2, finalize on Cake kernels)",
+        },
         "tuning_policy": {
             "timer": "AutoTuner-selected v1 CUDA graph timer",
             "requested_timer_environment": os.environ.get("FLASHINFER_AUTOTUNE_TIMER"),
             "cold_l2_cache": args.cache_policy == "cold",
+            "use_cuda_graph": args.cuda_graph,
             "use_cold_l2_graph_replay": False,
             "cuda_graph_profile_replays": args.tuning_graph_replays,
             "profiling_repeat": args.tuning_repeat,
         },
         "measurement_policy": {
             "requested_timer": "cupti" if args.cupti else "cuda_events",
-            "use_cuda_graph": True,
+            "use_cuda_graph": args.cuda_graph,
             "cold_l2_cache": args.cache_policy == "cold",
             "samples_per_round": args.iterations,
             "actual_methods": [],
@@ -473,6 +561,8 @@ def main():
                 "FLASHINFER_WORKSPACE_BASE",
                 "FLASHINFER_CUDA_ARCH_LIST",
                 "FLASHINFER_FORCE_MOE_KERNELS",
+                "FLASHINFER_CAKE_STEPFUN_FULL_PATH",
+                "FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS",
             )
         },
     }
@@ -515,7 +605,10 @@ def main():
         json.dumps(metadata, indent=2, default=json_default) + "\n"
     )
     step_variants = {
-        f"step_limit_{limit:g}": SwiGLUStep(limit=limit) for limit in args.step_limits
+        f"step_limit_{limit:g}": SwiGLUStep(
+            limit=FLT_MAX if math.isinf(limit) else limit
+        )
+        for limit in args.step_limits
     }
     baselines = {"oai": SwiGLU(alpha=1.702, beta=1.0, limit=7.0), "swiglu": SwiGLU()}
     rows = []
@@ -615,9 +708,10 @@ def main():
                         round_medians[name].append(med)
                         methods[name].add(method)
                         actual_methods.add(method)
+                        arm = name.split(":", 1)[0] if ":" in name else "trtllm"
                         record = dict(
                             precision=precision,
-                            backend=name.split(":", 1)[0] if ":" in name else "trtllm",
+                            backend=arm,
                             tokens=tokens,
                             variant=name,
                             activation=repr(variant_of[name]),
@@ -629,6 +723,9 @@ def main():
                             warnings=messages,
                             hashes=hashes,
                             tactic=candidates[name][2],
+                            tactic_descriptor=tactic_descriptor(
+                                arm, candidates[name][2]
+                            ),
                             cache_policy=args.cache_policy,
                             tuning_graph_replays=args.tuning_graph_replays,
                             tuning_repeat=args.tuning_repeat,

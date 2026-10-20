@@ -48,13 +48,23 @@
 #define SMEM_S_WSC_STAGE_BYTES 512
 #define SMEM_S_WSC_STRIDE 512
 #define SMEM_TOTAL 208128
+#ifndef TILE_UNROLL
 #define TILE_UNROLL 2
+#endif
 #define LAUNCH_MIN_BLOCKS 1
+
+// Shared by every build.json entry that lists this translation unit in its sources: the entry's
+// compile definitions select the tile unroll (-DTILE_UNROLL=<n>; the define above is guarded) and
+// the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>; every library of the family exports
+// a distinct kernel); the defaults name this file's own program.
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_dsa_indexer_topk_3c6dc460295ddf3c44de
+#endif
 
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsa_indexer_topk_3c6dc460295ddf3c44de(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int check_period, int grid_ctas, float softmax_scale, int n_split)
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int check_period, int grid_ctas, float softmax_scale, int n_split)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);

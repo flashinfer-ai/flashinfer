@@ -89,6 +89,7 @@ CASES = (
     (1000, 256, (27,) * 37 + (1,)),
     (4097, 1024, (0, 4097, 0)),
     (4097, 2048, (1000, 0, 3, 3094)),
+    (4097, 768, (1000, 0, 3, 3094)),
 )
 LARGE_CASE = (262401, 8192, "perf")
 LARGE_CASE_FREE_BYTES = 40 * 2**30
@@ -561,8 +562,8 @@ def test_workspace_bytes_and_layout() -> None:
             == -(-grid // n_ch_tiles)
         )
         assert small == layout["total_bytes"] == 4 * WIDTH * C * layout["rows"]
-    # One channel tile holds up to threads x vec channels (a partial row per CTA): 512 for the backward's four
-    # channels per thread; 8192 channels are sixteen tiles; C = 136 is 34 channel vectors (three sub-tiles of 34).
+    # One channel tile holds up to threads x vec channels (a partial row per CTA): 1024 for the backward's eight
+    # channels per thread; 8192 channels are eight tiles; C = 136 is 17 channel vectors (seven sub-tiles of 17).
     vec, threads = geometry["vec"], geometry["threads"]
     assert loader.channel_split(threads * vec, geometry=geometry) == (threads, 1, 1)
     assert loader.channel_split(8192, geometry=geometry) == (

@@ -97,6 +97,8 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.experimental.cake_kimi_k3_attn_res" = ["csrc/**"]
 # Generated sources for the experimental exact-SM100a/SM103a Kimi-K3 FP8 projection backend, compiled on demand.
 "flashinfer.experimental.kimi_k3_fp8_projection" = ["csrc/**"]
+# Generated sources for the experimental exact-SM100a/SM103a per-token NVFP4 quantizer and GEMM backend, compiled on demand.
+"flashinfer.experimental.cake_nvfp4_per_token" = ["csrc/**"]
 # Route catalog of the experimental SM120 paged MQA-logits export, read at runtime next to its module.
 "flashinfer.experimental.deepgemm_sm120_paged_mqa_logits" = ["*.json"]
 # Route catalog of the experimental SM100/SM103 dense and paged MQA-logits export, read at runtime
@@ -125,6 +127,8 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.experimental.cake_moe_grouped_gemm" = ["csrc/**", "build.json"]
 # Generated sources for the experimental exact-SM100a/SM107a dense projection GEMM backend.
 "flashinfer.experimental.dense_projection_gemm" = ["csrc/**", "build.json"]
+# Generated sources for the experimental exact-SM100a/SM103a StepFun fused-MoE backend (cake-build/1).
+"flashinfer.experimental.cake_stepfun_moe" = ["csrc/**", "build.json"]
 # Standalone cuDNN Frost Python sources and the native MoE adapter, compiled on first use.
 "flashinfer.fused_moe.backends.cudnn_frost" = ["artifacts/*/*.json", "artifacts/*/sources/*.py", "csrc/**"]
 # Generated sources for the experimental exact-SM110 GQA decode backend.
