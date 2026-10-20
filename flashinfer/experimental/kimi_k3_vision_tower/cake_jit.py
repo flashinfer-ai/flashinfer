@@ -28,13 +28,19 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # Explicit target-owned registration of the generated programs of the
 # Kimi-K3 vision tower (MoonViT-3D encoder + PatchMergerV2; SM100 / SM103).
 #
-# ``_PROGRAMS`` holds one row per generated program (a kernel plus its host
-# binding), keyed by the program digest: the architectures the source is built
-# for (``arches``; the loader compiles it with the exact flag set of the device
-# it runs on), the extra compile flags and the name of its argument plan in
-# ``ARG_PLANS``.  ``_module`` expands a row into the ``MODULES`` record the
-# host launcher reads: the two translation units under ``csrc/`` follow from
-# the program name and every program exports the ``run`` entry.  One source
+# ``_PROGRAMS`` holds one row per generated program (a kernel plus the shared
+# host launcher), keyed by the program digest: the architectures the source is
+# built for (``arches``; the loader compiles it with the exact flag set of the
+# device it runs on), the extra compile flags and the name of its argument plan
+# in ``ARG_PLANS``.  ``_LAUNCH`` holds the program's launch row: the host-shim
+# namespace id, the dynamic shared memory, the block and cluster extents, the
+# ``B`` TMA box extent and the rank of the ``A`` / ``A2`` descriptors.
+# ``_module`` expands the two rows into the ``MODULES`` record the package
+# backend (``cake_backend``) reads: the kernel translation unit under
+# ``csrc/`` follows from the program name, the second translation unit is the
+# shared launcher ``cake_kimi_k3_vision_tower_launcher.cu`` whose text the
+# compile definitions of ``launch_definitions`` select from the launch row,
+# and every program exports the ``run`` entry.  One source
 # serves every architecture it lists; a program listed for one architecture
 # only is a form the host plan selects on that architecture alone (the plain
 # one-tile and two-tile-split attention forms exist on SM103 only).  The five
@@ -48,9 +54,9 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # ``grid``), keyed by the program kind that uses it.
 #
 # ``KERNELS`` maps ``"<arch>"`` to the logical kernel key -> program
-# assignment the host launcher resolves at preparation, expanded from the
-# table both architectures share (``_KERNELS_SHARED``) and the entries of
-# one architecture (``_KERNELS_ARCH``):
+# assignment the package backend (``cake_backend``) resolves at preparation,
+# expanded from the table both architectures share (``_KERNELS_SHARED``) and
+# the entries of one architecture (``_KERNELS_ARCH``):
 #
 # * ``gemm:<variant>:<tile>``   the fused tcgen05 BF16 GEMM family
 #   (``pos``, ``norm_qkv_rope``, ``residual_wo``, ``norm_gelu``,
@@ -82,13 +88,15 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 #
 # The rows, ``ARG_PLANS`` and the two ``KERNELS`` tables are exporter output,
 # hand-folded here pending exporter support: the export writes one verbose
-# record per program; the row form and the builders below are the fold, and the
-# five attention rows that list both architectures are the former SM100-only
-# attention programs folded into their SM103 twins (``KERNELS["sm_100a"]``
-# names the twins for those keys).  The JIT library of a program is named after
-# a content digest of its sources, architecture and compile flags
-# (``spec_content_digest``), so an edited source or flag set builds into a
-# fresh library and no stale library is served by name.
+# record and one host binding per program; the row form, the builders below
+# and the shared launcher are the fold, and the five attention rows that list
+# both architectures are the former SM100-only attention programs folded into
+# their SM103 twins (``KERNELS["sm_100a"]`` names the twins for those keys).
+# The JIT library of a program is named after a content digest of its sources
+# (the kernel and the launcher), architecture and compile flags including the
+# launch definitions (``spec_content_digest``), so an edited source, flag or
+# launch value builds into a fresh library and no stale library is served by
+# name.
 ARCHES = ("sm_100a", "sm_103a")
 ARCH_NVCC_FLAGS = {
     "sm_100a": sm100a_nvcc_flags,
@@ -105,6 +113,7 @@ _GEMM_FLAGS = ("--use_fast_math",)
 _ATTENTION_FLAGS = ("--use_fast_math", "--ptxas-options=--opt-level=1")
 _PROGRAM_PREFIX = "cake_kimi_k3_vision_tower_"
 _SOURCE_DIR = "cake_kimi_k3_vision_tower"
+_LAUNCHER = "cake_kimi_k3_vision_tower_launcher.cu"
 
 # One row per generated program, keyed by its digest:
 # ``(arches, compile_flags, arg_plan)``.
@@ -189,20 +198,133 @@ _PROGRAMS: dict[str, _Row] = {
 }
 
 
+# One launch row per program, keyed by its digest: ``(shim, smem, block,
+# cluster, b_box_n, a_tma_rank)`` -- the host-shim namespace id
+# (``cake_host_shim_<shim>``), the dynamic shared memory in bytes (0: no
+# opt-in call), the block and cluster extents (cluster 0: no cluster
+# attributes), and for the GEMM programs the second extent of the ``B`` TMA
+# box and the rank of the ``A`` / ``A2`` descriptors (2 for the position-table
+# GEMMs; 0 / 0 on the other plans).  ``launch_definitions`` turns a row into
+# the compile definitions that select the program in the shared launcher.
+_Launch = tuple[str, int, int, int, int, int]
+_LAUNCH: dict[str, _Launch] = {
+    "05528121bdb20ac63f4a": ("7d8fc7395c45e73e", 216064, 512, 2, 0, 0),
+    "08d980e26f7723727971": ("7576d3f4b0fac5b7", 222208, 192, 2, 64, 3),
+    "0edb981e0644cf0bc327": ("198d00e3ecd4ac41", 222208, 192, 0, 64, 3),
+    "1111425111141a4c76aa": ("dfd34d8535f49b02", 230400, 320, 2, 64, 3),
+    "153c43aa8701296c68b2": ("c874a62f27a83f6b", 216064, 512, 2, 0, 0),
+    "1d473f131d0bf9fe2508": ("5c44901376d07ecf", 230400, 320, 0, 128, 2),
+    "22ce0ac3a66ecbb5f1de": ("87f35ee4a144a728", 222208, 192, 2, 64, 3),
+    "23237a8f58b5d594d271": ("5ea87cb8cb64d006", 186368, 512, 2, 0, 0),
+    "233a1176df61a9a0c965": ("fa2b4d3e435417dc", 230400, 192, 0, 64, 3),
+    "271dc4ac70c5d911e926": ("65b90d750ede7499", 230400, 320, 2, 128, 3),
+    "27e643774380ec1f4d0d": ("1d3f3a346e8f762b", 230400, 320, 2, 64, 3),
+    "2c6f70951276ee4ad16a": ("78f96b8e256b3d3b", 230400, 192, 2, 128, 3),
+    "2d6aef50287c307414cf": ("44bf29a72e78a684", 222208, 192, 4, 64, 3),
+    "305b1af2834f5df4a215": ("81b4b133183462f2", 222208, 192, 2, 32, 3),
+    "3192e923fe894b0e2b76": ("8073879de4f53802", 230400, 192, 0, 64, 3),
+    "34fb28355074f71ead09": ("d433dd6c559db20b", 222208, 320, 2, 64, 3),
+    "37082353724ecfc06b4b": ("5c87fd3f172bfaee", 230400, 192, 0, 128, 3),
+    "383aff1079a05f46ee76": ("34346dd0570619dd", 222208, 320, 2, 32, 3),
+    "3bce5c6a1f5bf7453e9c": ("6376bc43cb6037da", 222208, 192, 0, 64, 3),
+    "3c66a23ea8d562de0cca": ("3766ffa31e3d47bd", 222208, 192, 0, 64, 3),
+    "3fa4eee3bd95517c6334": ("53660391cad1a155", 230400, 192, 0, 64, 3),
+    "444f24ac65b233f0870e": ("ac0ac1385f66e78a", 230400, 320, 0, 128, 3),
+    "500195ea53ac5c8b3237": ("14f47ea68aed5e0f", 230400, 320, 2, 128, 3),
+    "500a20583d1bf09bca00": ("e23ea69a11a80ab3", 230400, 320, 2, 128, 3),
+    "549562cf9e312aa6b3cd": ("fa5c13716937cc68", 222208, 192, 0, 64, 3),
+    "578a6bdda6a300f3ad5b": ("7acdd718642ba5a9", 230400, 192, 0, 64, 3),
+    "588033a85f785e5ab47e": ("2141bc6ac9fe2524", 230400, 192, 2, 128, 3),
+    "5932b4a4ba51246a1b70": ("93dae893eebc053b", 222208, 192, 2, 32, 3),
+    "5d0c411d41b3acc90942": ("2f658940e16b57f9", 222208, 192, 2, 64, 3),
+    "5f015168b8e10231ef00": ("3b6165dc499da7c4", 230400, 192, 0, 128, 3),
+    "6493b5e12e1dff606c6d": ("939f92be41f3cabb", 222208, 192, 2, 64, 3),
+    "6a51ed9304f30c8815cc": ("7271d7c44ee413c5", 186368, 512, 2, 0, 0),
+    "71ff4f073d1a66f79bd1": ("5102bd2b27138b69", 230400, 192, 0, 128, 3),
+    "7315eace6540f14b3ad9": ("a2c7f7d66e05af7d", 222208, 192, 2, 64, 3),
+    "756759066a3ea781e5d0": ("c027936a8c03a466", 222208, 320, 2, 32, 3),
+    "77bc888412b990ccbb9b": ("1e1c8cf78538e618", 230400, 320, 2, 128, 3),
+    "7994f90134f7dadf4bd4": ("22dfe45bc3cd06f7", 222208, 320, 2, 64, 3),
+    "7bd7dea39285bd36a559": ("82e775f8eb1362bf", 230400, 320, 2, 128, 3),
+    "7d1fd2b79d6a381fc4ac": ("2f32d34986d30d39", 0, 128, 0, 0, 0),
+    "7d601111390a7f44c612": ("c41d9dd9d40461a9", 222208, 192, 0, 64, 2),
+    "872157e810f7de49c890": ("f95c24ca0f0974f4", 230400, 192, 2, 64, 3),
+    "8b3fb47bc4fd2f09dde3": ("ad41a821f8b08fd6", 183296, 512, 2, 0, 0),
+    "901428864fefe2c56b14": ("5a872abb85c1a15a", 183296, 512, 2, 0, 0),
+    "91336598d9b2fdc0508a": ("92031d49739d0571", 222208, 192, 4, 64, 3),
+    "938f1e0c1b33d616fea7": ("dfc6fb81124c44e9", 0, 128, 0, 0, 0),
+    "989472145506999c2ebb": ("d2c7961b9283dd7d", 230400, 320, 2, 128, 3),
+    "99833ffa0cdf69c0acc7": ("1ff3bf8f51728853", 222208, 192, 0, 64, 3),
+    "a4adf8330da8ca78e7a3": ("22c9963a2404d08c", 230400, 192, 2, 128, 3),
+    "a7c57693ffc21df68ada": ("6748f0b868d9f979", 231424, 320, 0, 64, 3),
+    "b2eeaf27a8eaffecafa2": ("075a9afbafd47713", 222208, 192, 0, 64, 3),
+    "b8e7e62f4c62c1cc15de": ("402d2f37fc598319", 230400, 192, 2, 32, 3),
+    "b9768b899c32133e295e": ("e40a27743b8a4c7a", 230400, 192, 2, 64, 3),
+    "baca276f87b855ba86ee": ("ade3b61493a43859", 186368, 512, 2, 0, 0),
+    "c13cb49b638bcff4e175": ("b7dd38ea9f144c33", 230400, 192, 2, 32, 3),
+    "c55f4fa4ba71d511955e": ("c424747b3ae39d18", 230400, 192, 0, 64, 3),
+    "c69ccc304ef4503e90fe": ("07cf7402376ef315", 230400, 192, 2, 128, 3),
+    "c907c55838c4fa0f4292": ("f8750c9708ce9a2c", 183296, 512, 2, 0, 0),
+    "cdba842167bb848c365a": ("7fae5399ca5bd132", 230400, 192, 0, 128, 3),
+    "ceb72031b5bae82ea07e": ("e3bf4e493abf38a9", 230400, 192, 0, 64, 3),
+    "d027933e3830a35dbcaa": ("fd4f3d1d68330926", 230400, 192, 0, 128, 3),
+    "d8e69a7d4433d7fe81a5": ("31f9ab769e8c9dae", 230400, 320, 2, 64, 3),
+    "db2e4e6986f3081ba04c": ("14635f125ce24906", 230400, 192, 2, 64, 3),
+    "dfe112d51921ab20f27d": ("569e58d4a49cb426", 230400, 320, 0, 128, 3),
+    "e0b196f00aea91ddbf42": ("d46b775a463ee26c", 0, 128, 0, 0, 0),
+    "e0ffb5db037008a9ae4f": ("7965db0c415a7da4", 230400, 320, 2, 64, 3),
+    "e23e007914f3e62dc498": ("a8fc9f2746ae73d2", 230400, 192, 2, 64, 3),
+    "e29b6e2b82f24c223c3c": ("28fa81701907155e", 216064, 512, 2, 0, 0),
+    "e4470b785885e4cf8e34": ("d558b67cdb940317", 230400, 320, 2, 64, 3),
+    "ec6b4fe4671efd0cf5b4": ("ac213a7a44607cd8", 222208, 192, 0, 64, 3),
+    "ee92e52df4965a9d956c": ("a27aba56fedb5cc9", 230400, 192, 2, 128, 3),
+    "eff7e7abe0f9d89c58d7": ("5ffdd00bcfeda7bc", 230400, 320, 0, 128, 3),
+    "f3a513bb9c3f5376a578": ("34a2bff793dee3fd", 230400, 320, 2, 64, 3),
+    "f4b3b1373781bf4578ad": ("69a91f7779304f39", 230400, 192, 2, 128, 3),
+    "f6147e75f57721f530db": ("8f6802c7e996fc3d", 222208, 192, 2, 64, 3),
+    "f6e7c197edcd927c1ff4": ("c1e8ad144854fe19", 230400, 192, 0, 128, 3),
+    "fb3646f34c27b5490c69": ("a916797a5524d066", 230400, 192, 2, 128, 3),
+}
+
+
 def _sources(name: str) -> list[str]:
     """The translation units of program ``name`` under ``csrc/``: its kernel
-    and its host binding, compiled together into one library."""
-    return [f"{_SOURCE_DIR}/{name}_kernel.cu", f"{_SOURCE_DIR}/{name}_binding.cu"]
+    and the shared host launcher, compiled together into one library."""
+    return [f"{_SOURCE_DIR}/{name}_kernel.cu", f"{_SOURCE_DIR}/{_LAUNCHER}"]
+
+
+def launch_definitions(name: str) -> list[str]:
+    """The compile definitions that make the shared launcher the host binding
+    of program ``name``: its kernel symbol, host-shim namespace, argument plan
+    and launch row (``_LAUNCH``).  A pure function of the registry rows."""
+    digest = name[len(_PROGRAM_PREFIX) :]
+    _arches, _compile_flags, arg_plan = _PROGRAMS[digest]
+    shim, smem, block, cluster, b_box_n, a_tma_rank = _LAUNCH[digest]
+    definitions = [
+        f"-DCAKE_PROGRAM_KERNEL=kernel_{name}",
+        f"-DCAKE_PROGRAM_SHIM=cake_host_shim_{shim}",
+        f"-DCAKE_PLAN_{arg_plan.upper()}=1",
+        f"-DCAKE_DYNAMIC_SMEM={smem}",
+        f"-DCAKE_BLOCK_X={block}",
+        f"-DCAKE_CLUSTER_X={cluster}",
+    ]
+    if arg_plan == "gemm":
+        definitions += [
+            f"-DCAKE_B_BOX_N={b_box_n}",
+            f"-DCAKE_A_TMA_RANK={a_tma_rank}",
+        ]
+    return definitions
 
 
 def _module(digest: str, row: _Row) -> dict[str, Any]:
-    """The ``MODULES`` record of the program with ``digest`` from its row."""
+    """The ``MODULES`` record of the program with ``digest`` from its rows."""
     arches, compile_flags, arg_plan = row
+    name = f"{_PROGRAM_PREFIX}{digest}"
     return {
         "role": "kernel",
-        "sources": _sources(f"{_PROGRAM_PREFIX}{digest}"),
+        "sources": _sources(name),
         "arches": list(arches),
-        "compile_flags": list(compile_flags),
+        "compile_flags": [*compile_flags, *launch_definitions(name)],
         "ffi_entry": "run",
         "arg_plan": arg_plan,
     }
