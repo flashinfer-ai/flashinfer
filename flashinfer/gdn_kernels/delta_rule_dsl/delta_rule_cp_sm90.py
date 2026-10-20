@@ -3635,7 +3635,6 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
             scale,
             math_tidx,
             wg_idx,
-            self.first_q_in_blk(0),
         )
         self.maybe_store_checkpoint(
             tKVrKV,
@@ -3693,7 +3692,6 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                 scale,
                 math_tidx,
                 wg_idx,
-                self.first_q_in_blk(blk),
             )
             self.maybe_store_checkpoint(
                 tKVrKV,
@@ -3754,7 +3752,6 @@ class CPDeltaRulePrefillSm90(_FullyFusedDeltaRuleSm90):
                 scale,
                 math_tidx,
                 wg_idx,
-                self.first_q_in_blk(last_blk),
             )
             self.maybe_store_checkpoint(
                 tKVrKV,
