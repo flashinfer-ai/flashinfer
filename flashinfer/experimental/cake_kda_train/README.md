@@ -53,7 +53,8 @@ ws = kda_train_workspace(S, num_docs, H, device, backward=True, save_mode="light
   is follow from `S`, `num_docs`, `H` and the device's SM count alone.
 * Repeated calls on the same inputs give bitwise the same outputs: the kernels
   reduce in a fixed order and use no atomic adds.  The backward from the saved
-  set and the checkpoint replay (`saved=None`) give bitwise the same gradients.
+  set (with or without the saved segment states) and the checkpoint replay
+  (`saved=None`) give bitwise the same gradients.
 * Limits: `H * 128 * 64 < 2**31` (`H <= 262143`; the public contract covers
   `H` in 1..64); `R * H * 64 < 2**31` over the padded rows `R = 64 * NC_pad` of
   the intra-chunk buffers (at `H = 64` that is `S` up to about 524k tokens; the
@@ -68,24 +69,44 @@ ws = kda_train_workspace(S, num_docs, H, device, backward=True, save_mode="light
 
 | field | content |
 |---|---|
-| `version` | `1` (`save_mode="light"`, the default) or `2` (`save_mode="tape"`) |
+| `version` | `3` (`save_mode="light"`, the default) or `2` (`save_mode="tape"`); version 1 (the light set without the segment states) is no longer produced or accepted |
 | `Aqk`, `Akk` | BF16 `[S, H, 64]` on the token rows: row `t` holds the 64 chunk-local columns of its chunk (zeros above the diagonal and past the chunk end) |
 | `tables` | `(chunk_bos, chunk_len, seq_chunk_start, seq_order[, seg_chunk_start])`: int32 views of one device buffer (`NC_pad`, `NC_pad`, `num_docs + 1`, `num_docs` and, on the segmented route, `NSEG + 1` entries), or `None` (the backward rebuilds them from `cu_seqlens`) |
 | `S`, `H`, `num_docs`, `scale` | the problem the set belongs to |
 | `h`, `v_new` | version 2 only: the forward's state tape BF16 `[NC_pad, H, 128, 128]` and `v_new` BF16 `[R, H, 128]` on the internal layout |
 | `seg_m` | version 2 on the segmented route: the segment transfers FP32 `[NSEG, H, 128, 128]` the backward's reverse carry reads; `None` on the serial route |
+| `hseg` | version 3 on the segmented route when `S >= 384 * NSEG`: the carried initial state of every segment, FP32 `[NSEG, H, 128, 128]` (the backward's recurrence recompute walks from it: pass 2 alone); `None` otherwise |
+| `seg_state` | version 3, idem: FP32 `[2, NSEG, H, 128, 128]`, `[0]` the segment offsets, `[1]` the segment transfers the backward's reverse carry reads; `None` otherwise |
 
 `kda_train_saved_bytes(S, H) = 256 * S * H` bytes (`Aqk` and `Akk`);
-`kda_train_saved_bytes(S, H, num_docs, save_mode=...)` adds the tables and,
-for `"tape"`, the version-2 tensors (768 B more per internal token-head plus
-the segment transfers).  Every tensor of the set is allocated by the call that
-writes it: a saved set can go to a backward on any workspace of the same
-problem.  A caller may keep only `Aqk` / `Akk` (`tables=None`).  With
-`save_for_backward=False` the token-row `Aqk` / `Akk` are not written and the
-backward must replay (`saved=None`: table, prep and intra recompute them).
-From a version-2 set the backward skips its recurrence recompute (WY still
-runs for `w`); from a version-1 set or on the replay path it recomputes `h`
-and `v_new` in its workspace.
+`kda_train_saved_bytes(S, H, num_docs, save_mode=...)` adds the tables and
+the mode's extra tensors: for `"light"` (version 3) the segment-boundary
+states, `3 * NSEG * H * 65536` bytes (`hseg` and the `seg_state` pair, FP32
+`[128, 128]` per segment and head) on the segmented route (`H <= 8`) when
+`S >= 384 * NSEG`, nothing otherwise; for `"tape"` the version-2 tensors
+(768 B more per internal token-head plus the segment transfers).  The size
+rule (`cake_backend.seg_states_saved(S, NSEG)`,
+`SEG_SAVE_MIN_TOKENS_PER_SEG = 384`) saves the states exactly when they are
+no larger than the `Aqk` / `Akk` set (`3 * NSEG * H * 65536 <= 2 * S * H *
+256`).  With `NSEG = num_docs * P` and `P = clamp(ceil(4 * sm_count /
+(num_docs * H)), 1, 64)`, `NSEG * H` is about `4 * sm_count` for
+`num_docs * H >= 10`, so the states cost about `12 * sm_count * 64 KiB`
+(115 MiB on a 152-SM device) independent of `S`, and the threshold is about
+58k tokens at `H = 4` (four documents), 29k at `H = 8` and `384 * 64 *
+num_docs` tokens where `P` is capped at 64 (24576 for one document at
+`H = 1`, 98304 for four); the contract's performance shapes (`S` around
+240k-260k tokens) all save, a pack of a few thousand tokens does not.  Every
+tensor of the set is allocated by the call that writes it: a saved set can go
+to a backward on any workspace of the same problem.  A caller may keep only
+`Aqk` / `Akk` (`tables=None`).  With `save_for_backward=False` the token-row
+`Aqk` / `Akk` are not written and the backward must replay (`saved=None`:
+table, prep and intra recompute them).  From a version-2 set the backward
+skips its recurrence recompute (WY still runs for `w`); from a version-3 set
+with the states its recurrence recompute is pass 2 alone from `hseg` and the
+reverse carry reads `seg_state[1]`; from a version-3 set without them or on
+the replay path it recomputes the states, `h` and `v_new` in its workspace.
+The gradients are bitwise the same on every path; the backward writes nothing
+into the saved set.
 
 ### Workspace (`KdaWorkspace`)
 
@@ -133,10 +154,14 @@ pass 1 walks every segment from zero and from the identity (grid
 `seg_carry` chains them within each document (one CTA per document and head;
 TF32 tensor-core products, FP32 accumulation) into the carried initial state of
 every segment, and `fwdh_v3` pass 2 walks from those states (grid `NSEG * H`)
-writing the `h` / `v_new` tapes.
+writing the `h` / `v_new` tapes.  With `save_mode="light"` and `S >= 384 *
+NSEG` the offsets / transfers and the carried states are written into the
+saved set's `seg_state` / `hseg` instead of the workspace (the same launches).
 
-Backward from a version-1 saved set (eight launches; twelve on the segmented
-route): `bwd_prep` (`g8` at >= 256 CTAs, `g8s` with two CTAs per chunk at
+Backward from a version-3 saved set (eight launches; on the segmented route
+twelve, or ten when the set carries the segment-boundary states: `fwdh_v3`
+pass 2 alone from the saved `hseg`, the reverse `seg_carry` reading the saved
+transfers): `bwd_prep` (`g8` at >= 256 CTAs, `g8s` with two CTAs per chunk at
 128..255, else `v2`; copies the saved `Aqk` / `Akk` onto the chunk layout),
 `wy`, `fwdh` (as above), `dav` (`dA_qk` and the first part of `dv`; one CTA per
 chunk pair), the adjoint recurrence `dhu` (the state gradient `dh` and `dv2`:

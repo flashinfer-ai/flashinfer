@@ -92,9 +92,11 @@ def chunk_kda_fwd(
     workspace : KdaWorkspace, optional
         A reused workspace from :func:`kda_train_workspace`; without one this call allocates its own.
     save_mode : str, optional
-        ``"light"`` (saved set version 1: ``Aqk`` / ``Akk`` and the tables, 256 B per token-head) or ``"tape"``
-        (version 2: also the forward's state tape and ``v_new``, 768 B more per token-head, so the backward skips
-        its recurrence recompute); ``None`` takes the workspace's default (``"light"`` without one).
+        ``"light"`` (saved set version 3: ``Aqk`` / ``Akk`` and the tables, 256 B per token-head, plus the
+        segment-boundary states on the segmented route when ``S >= 384 * NSEG``, so the backward skips the
+        forward half of its recurrence recompute) or ``"tape"`` (version 2: also the forward's state tape and
+        ``v_new``, 768 B more per token-head, so the backward skips the whole recompute); ``None`` takes the
+        workspace's default (``"light"`` without one).
 
     Returns
     -------
@@ -139,7 +141,7 @@ def chunk_kda_bwd(
     dout : torch.Tensor
         BF16 gradient of ``out``, laid out like ``v``.
     saved : KdaChunkSaved, optional
-        The forward's saved set (version 1 or 2); ``None`` recomputes it from the inputs (checkpoint replay).
+        The forward's saved set (version 3 or 2); ``None`` recomputes it from the inputs (checkpoint replay).
     scale : float, optional
         The forward's scale; ``128 ** -0.5`` when ``None``.
     workspace : KdaWorkspace, optional

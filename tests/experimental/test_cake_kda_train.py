@@ -388,10 +388,17 @@ def test_plan_follows_the_chunk_bound_formulas() -> None:
                         p.record(stage), p.NC_pad, N, heads, sm, p.NSEG, launch
                     )
             seg = p.recur == "seg"
+            # These packs are far below the size rule (S < 384 * NSEG): the light forward saves no segment
+            # states and the backward recomputes them (the launch counts without the states).
+            assert p.seg_save is False
             assert p.launch_count("fwd") == (9 if seg else 6)
             assert p.launch_count("bwd") == (12 if seg else 8)
             assert p.launch_count("bwd", tables=False) == (14 if seg else 9)
             assert p.launch_count("bwd", tape=True) == (9 if seg else 7)
+            assert p.launch_count("bwd", states=True) == (10 if seg else 8)
+            assert p.launch_count("bwd", tables=False, states=True) == (
+                12 if seg else 9
+            )
             assert p.launch_count("replay") == (15 if seg else 10)
             assert set(p.stages()) == {s for s, r in p.records.items() if r}
             assert set(p.stages(backward=False)) == {
@@ -405,6 +412,25 @@ def test_plan_follows_the_chunk_bound_formulas() -> None:
             cake_backend.plan(*bad)
     with pytest.raises(ValueError, match="int32"):
         cake_backend.plan(64, 1, 2**31 // (D * BT), 148)
+
+
+def test_seg_state_rule_is_a_pure_function_of_the_scalars() -> None:
+    rule, k = cake_backend.seg_states_saved, cake_backend.SEG_SAVE_MIN_TOKENS_PER_SEG
+    assert k == 384
+    assert cake_backend.SAVED_VERSION == 3 and cake_backend.SAVED_VERSION_TAPE == 2
+    for nseg in (1, 64, 153, 256):
+        assert rule(k * nseg, nseg) is True and rule(k * nseg - 1, nseg) is False
+    assert rule(10**9, 0) is False  # the serial route has no segment states
+    for n, h, sm in ((1, 1, 148), (4, 4, 152), (3, 8, 148), (4, 1, 152)):
+        nseg = cake_backend.plan(1, n, h, sm).NSEG  # independent of S
+        assert (
+            nseg
+            == cake_backend.plan(k * nseg, n, h, sm).NSEG
+            == n * min(SEG_P_MAX, max(1, -(-SEG_SLOT_FACTOR * sm // (n * h))))
+        )
+        assert cake_backend.plan(k * nseg, n, h, sm).seg_save is True
+        assert cake_backend.plan(k * nseg - 1, n, h, sm).seg_save is False
+    assert cake_backend.plan(10**6, 1, 16, 148).seg_save is False  # the serial route
 
 
 def test_byte_queries_follow_the_arena_layout() -> None:
@@ -444,9 +470,18 @@ def test_byte_queries_follow_the_arena_layout() -> None:
         )
         tables = cake_backend.tables_bytes(S, N, heads, sm_count=148)
         assert tables == p.table_words() * 4 and tables % cake_backend.ALIGN == 0
+        # light (version 3): the segment-boundary states (three FP32 state blocks) join the set when the size
+        # rule holds: of these rows only the large segmented one (H = 4), not the small packs or the serial H = 64
+        states = (
+            3 * p.NSEG * heads * D * D * 4
+            if cake_backend.seg_states_saved(S, p.NSEG)
+            else 0
+        )
+        assert p.seg_save == (S >= 384 * p.NSEG > 0)
+        assert (states > 0) == (S > 200_000 and heads == 4)
         assert (
             cake_backend.saved_bytes(S, heads, N, sm_count=148)
-            == 256 * S * heads + tables
+            == 256 * S * heads + tables + states
         )
         tape_bytes = cake_backend.saved_bytes(
             S, heads, N, save_mode="tape", sm_count=148
@@ -470,8 +505,13 @@ def test_byte_queries_follow_the_arena_layout() -> None:
         )
         assert (
             report["arena_bwd"] == p.workspace_bytes("bwd")
-            and report["saved"] == 256 * S * heads + tables
+            and report["saved"] == 256 * S * heads + tables + states
         )
+        assert report["seg_states_saved"] == (states > 0)
+        assert report["saved_seg_state_bytes"] == states
+        tape_report = cake_backend.memory_report(S, N, heads, "tape", sm_count=148)
+        assert tape_report["saved"] == tape_bytes
+        assert tape_report["saved_seg_state_bytes"] == 2 * p.NSEG * heads * D * D * 4
         assert report["bwd_total"] == report["arena_bwd"] + report["out_bwd"]
         if (
             S > 200_000
@@ -479,6 +519,8 @@ def test_byte_queries_follow_the_arena_layout() -> None:
             assert report["arena_bwd"] < 85 * GiB
     with pytest.raises(ValueError, match="needs num_docs"):
         cake_backend.saved_bytes(64, 1, save_mode="tape")
+    with pytest.raises(ValueError, match="save_mode"):
+        cake_backend.saved_bytes(64, 1, save_mode="full")
     with pytest.raises(ValueError, match="save_mode"):
         cake_backend.workspace_bytes(64, 1, 1, save_mode="full", sm_count=148)
     with pytest.raises(ValueError, match="layout mode"):
@@ -920,6 +962,8 @@ def test_operand_checks(device, manifest) -> None:
     with pytest.raises(ValueError, match="cu_seqlens"):
         cake_backend.chunk_kda_fwd(q, k, v, g, beta, cu.to(torch.int64))
     _, saved = cake_backend.chunk_kda_fwd(q, k, v, g, beta, cu)
+    assert saved.version == cake_backend.SAVED_VERSION == 3
+    # version 1 (the light set without the segment states) is no longer accepted
     with pytest.raises(ValueError, match="version"):
         cake_backend.chunk_kda_bwd(
             q,
@@ -929,7 +973,45 @@ def test_operand_checks(device, manifest) -> None:
             beta,
             cu,
             dout,
-            saved=KdaChunkSaved(3, saved.Aqk, saved.Akk, None, 65, heads, 1, SCALE),
+            saved=KdaChunkSaved(1, saved.Aqk, saved.Akk, None, 65, heads, 1, SCALE),
+        )
+    # a version-3 set carries hseg and seg_state together, with the plan's shapes
+    nseg = cake_backend.plan(65, 1, heads, cake_jit.sm_count(device.index)).NSEG
+    block = torch.zeros((nseg, heads, D, D), dtype=torch.float32, device=device)
+    with pytest.raises(ValueError, match="together or neither"):
+        cake_backend.chunk_kda_bwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu,
+            dout,
+            saved=KdaChunkSaved(
+                3, saved.Aqk, saved.Akk, None, 65, heads, 1, SCALE, hseg=block
+            ),
+        )
+    with pytest.raises(ValueError, match="saved.seg_state"):
+        cake_backend.chunk_kda_bwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu,
+            dout,
+            saved=KdaChunkSaved(
+                3,
+                saved.Aqk,
+                saved.Akk,
+                None,
+                65,
+                heads,
+                1,
+                SCALE,
+                hseg=block,
+                seg_state=block,
+            ),
         )
     with pytest.raises(ValueError, match="needs h and v_new"):
         cake_backend.chunk_kda_bwd(
@@ -952,7 +1034,7 @@ def test_operand_checks(device, manifest) -> None:
             cu,
             dout,
             saved=KdaChunkSaved(
-                1, saved.Aqk, saved.Akk, saved.tables[:2], 65, heads, 1, SCALE
+                3, saved.Aqk, saved.Akk, saved.tables[:2], 65, heads, 1, SCALE
             ),
         )
     with pytest.raises(ValueError, match="saved: for"):
@@ -964,11 +1046,159 @@ def test_operand_checks(device, manifest) -> None:
             beta,
             cu,
             dout,
-            saved=KdaChunkSaved(1, saved.Aqk, saved.Akk, None, 64, heads, 1, SCALE),
+            saved=KdaChunkSaved(3, saved.Aqk, saved.Akk, None, 64, heads, 1, SCALE),
         )
     out, _ = cake_backend.chunk_kda_fwd(q, k, v, g, beta, cu, save_for_backward=False)
     assert out.shape == (65, heads, D)
     assert cake_backend.is_supported(device)
+
+
+# The size rule's smallest instances: one document at H = 1 and two documents at H = 2 cap P at 64 on any device
+# with at least 16 SMs, so NSEG = 64 * num_docs and the threshold is 384 * NSEG tokens (24576 and 49152).
+STATE_SHAPES = [(1, 1), (2, 2)]
+
+
+def _split(S: int, num_docs: int) -> tuple[int, ...]:
+    base = S // num_docs
+    return tuple(base + (1 if i < S % num_docs else 0) for i in range(num_docs))
+
+
+@pytest.mark.parametrize(("num_docs", "heads"), STATE_SHAPES, ids=["n1-h1", "n2-h2"])
+def test_light_saved_set_carries_the_segment_states_above_the_size_rule(
+    device, manifest, num_docs, heads
+) -> None:
+    from torch.utils.checkpoint import checkpoint
+
+    sm = cake_jit.sm_count(device.index)
+    nseg = cake_backend.plan(1, num_docs, heads, sm).NSEG  # independent of S
+    assert nseg == 64 * num_docs
+    threshold = cake_backend.SEG_SAVE_MIN_TOKENS_PER_SEG * nseg
+    block = nseg * heads * D * D * 4
+
+    def run(S: int, saves: bool) -> None:
+        lengths = _split(S, num_docs)
+        inputs = make_inputs(lengths, heads, device)
+        q, k, v, g, beta, cu, dout = (
+            inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
+        )
+        launched: list[str] = []
+
+        def recording(name, values, *, grid, device_index):
+            launched.append(name)
+            cake_jit.run_module(name, values, grid=grid, device_index=device_index)
+
+        ws = KdaWorkspace.for_problem(S, num_docs, heads, device, launcher=recording)
+        p = ws.plan
+        assert p.recur == "seg" and nseg == p.NSEG and p.seg_save is saves
+        assert cake_backend.seg_states_saved(S, nseg) is saves
+        # (a) the saved set: the states present exactly at and above the threshold, the bytes as the query says
+        out, saved = cake_backend.chunk_kda_fwd(q, k, v, g, beta, cu, workspace=ws)
+        # saving the states adds no launch
+        assert len(launched) == p.launch_count("fwd") == 9
+        assert saved.version == cake_backend.SAVED_VERSION
+        tables = p.table_words() * 4
+        expected_bytes = 256 * S * heads + tables + (3 * block if saves else 0)
+        assert (
+            cake_backend.saved_bytes(S, heads, num_docs, sm_count=sm) == expected_bytes
+        )
+        report = cake_backend.memory_report(S, num_docs, heads, sm_count=sm)
+        assert report["seg_states_saved"] is saves
+        assert report["saved_seg_state_bytes"] == (3 * block if saves else 0)
+        assert report["saved"] == expected_bytes
+        if not saves:
+            assert saved.hseg is None and saved.seg_state is None
+        else:
+            assert saved.hseg.shape == (nseg, heads, D, D)
+            assert saved.seg_state.shape == (2, nseg, heads, D, D)
+            assert saved.hseg.dtype == saved.seg_state.dtype == torch.float32
+            arena_lo, arena_hi = ws.arena.data_ptr(), ws.arena.data_ptr() + ws.bytes
+            for t in (saved.hseg, saved.seg_state):
+                assert not (arena_lo <= t.data_ptr() < arena_hi)
+            owned = (saved.Aqk, saved.Akk, saved.hseg, saved.seg_state)
+            assert (
+                sum(t.numel() * t.element_size() for t in owned) + tables
+                == expected_bytes
+            )
+            states_before = (saved.hseg.clone(), saved.seg_state.clone())
+        # the backward from the set: the recurrence as pass 2 alone with the states, the full recompute without
+        launched.clear()
+        grads = cake_backend.chunk_kda_bwd(
+            q, k, v, g, beta, cu, dout, saved=saved, workspace=ws
+        )
+        grads = [t.clone() for t in grads]
+        recurrence = ["fwdh_v3"] if saves else ["fwdh_v3", "seg_carry", "fwdh_v3"]
+        tail = [
+            "dav",
+            "dhu_v3",
+            "seg_carry",
+            "dhu_v3",
+            "dqkg",
+            "glm_intra",
+            "gate_epilogue",
+        ]
+        assert launched == [p.record("bwd_prep"), "wy", *recurrence, *tail]
+        assert len(launched) == p.launch_count("bwd") == (10 if saves else 12)
+        # (b) the gradients from the saved states equal the checkpoint replay's bitwise, and those from the same
+        # set stripped of its states (the recompute path) and from a tape-mode workspace
+        replay = cake_backend.chunk_kda_bwd(
+            q, k, v, g, beta, cu, dout, saved=None, workspace=ws
+        )
+        stripped = KdaChunkSaved(
+            saved.version,
+            saved.Aqk,
+            saved.Akk,
+            saved.tables,
+            saved.S,
+            saved.H,
+            saved.num_docs,
+            saved.scale,
+        )
+        from_stripped = cake_backend.chunk_kda_bwd(
+            q, k, v, g, beta, cu, dout, saved=stripped, workspace=ws
+        )
+        tape_ws = KdaWorkspace.for_problem(S, num_docs, heads, device, save_mode="tape")
+        from_tape_ws = cake_backend.chunk_kda_bwd(
+            q, k, v, g, beta, cu, dout, saved=saved, workspace=tape_ws
+        )
+        for other in (replay, from_stripped, from_tape_ws):
+            for mine, theirs in zip(grads, other, strict=True):
+                assert torch.equal(mine, theirs)
+        if saves:  # the backward writes nothing into the saved set
+            assert torch.equal(saved.hseg, states_before[0])
+            assert torch.equal(saved.seg_state, states_before[1])
+        # the tape set is unchanged by the rule: version 2 with seg_m, without the version-3 fields
+        _, saved_t = cake_backend.chunk_kda_fwd(
+            q, k, v, g, beta, cu, workspace=ws, save_mode="tape"
+        )
+        assert saved_t.version == cake_backend.SAVED_VERSION_TAPE
+        assert (
+            saved_t.seg_m is not None
+            and saved_t.hseg is None
+            and saved_t.seg_state is None
+        )
+        # (c) the autograd node packs and unpacks the states (or their absence); the checkpoint path re-runs the
+        # forward and gives the same gradients
+        expected = (grads[0], grads[1], grads[2], grads[4], grads[3])
+        for wrap in (False, True):
+            leaves = [
+                inputs[n].detach().clone().requires_grad_(True)
+                for n in ("q", "k", "v", "g", "beta")
+            ]
+            if wrap:
+                o = checkpoint(
+                    lambda *a: cake_backend.chunk_kda(*a, cu, workspace=ws),
+                    *leaves,
+                    use_reentrant=False,
+                )
+            else:
+                o = cake_backend.chunk_kda(*leaves, cu, workspace=ws)
+            assert torch.equal(o, out)
+            o.backward(dout)
+            for leaf, want in zip(leaves, expected, strict=True):
+                assert torch.equal(leaf.grad, want)
+
+    run(threshold - 1, False)  # the longest pack that recomputes the states
+    run(threshold, True)  # the shortest pack that saves them
 
 
 def test_plan_limits_cover_the_kernels_int32_offsets() -> None:
