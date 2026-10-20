@@ -67,6 +67,10 @@ from .cake_jit import (
 )
 
 _LOG2E = 1.4426950408889634
+#: The kernels address Q, K, V, O, the scales and the block-index tensors through 32-bit element offsets
+#: (``int`` row bases), so a tensor they index holds at most this many elements; the host refuses larger
+#: tensors before any launch.
+MAX_FLAT_ELEMENTS = 2**31 - 1
 SM100_CAPABILITIES: frozenset[tuple[int, int]] = frozenset(
     capability
     for capability, arch in ARCH_BY_CAPABILITY.items()
@@ -119,6 +123,16 @@ def _sm100_arch(device_index: int) -> str:
     return arch
 
 
+def _check_flat_indexable(name: str, tensor: torch.Tensor) -> None:
+    """Refuse a tensor the kernels could not address with their 32-bit element offsets."""
+    numel = tensor.numel()
+    if numel > MAX_FLAT_ELEMENTS:
+        raise ValueError(
+            f"{name} has {numel} elements (shape {tuple(tensor.shape)}); the kernels index it "
+            f"with 32-bit element offsets, so it may hold at most {MAX_FLAT_ELEMENTS} elements"
+        )
+
+
 def _check_tensor(
     name: str, tensor: torch.Tensor, device: torch.device, dtype, shape=None
 ) -> None:
@@ -128,6 +142,7 @@ def _check_tensor(
         raise ValueError(f"{name} must live on {device}")
     if not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
+    _check_flat_indexable(name, tensor)
     if tensor.dtype != dtype:
         raise TypeError(f"{name} must use {dtype}, got {tensor.dtype}")
     if shape is not None and tuple(tensor.shape) != tuple(shape):
@@ -347,8 +362,11 @@ def sage_fp8_quantize_sm100(
     Returns ``(q8, k8, v8, q_scale[B,H,Sq], k_scale[B,Hkv,ceil(Sk/16)], v_scale[B,Hkv,128])``
     with symmetric E4M3 quantization: per-token Q scales (``amax/448``), per-16-token
     K scales (shared by the 16 tokens and all 128 channels of a KV head) and per-channel V
-    scales over the whole sequence.  Scales are bit-exact with the torch recipe
-    ``amax.clamp_min(1e-12) / 448``; two kernel launches plus one ``zero_`` on the V amax scratch.
+    scales over the whole sequence.  A scale is ``max(amax, 1e-6) / 448``: the kernels floor the
+    absolute maximum at ``1e-6`` (``fmaxf``) before the division, so the torch recipe
+    ``amax.clamp_min(1e-12) / 448`` matches bit for bit except where ``amax < 1e-6``.  Two kernel
+    launches plus one ``zero_`` on the V amax scratch.  Each input (and so each FP8 output) holds at
+    most ``2**31 - 1`` elements: the kernels index them with 32-bit offsets.
     """
     for name, t in (("q", q), ("k", k), ("v", v)):
         if not isinstance(t, torch.Tensor) or t.ndim != 4:
@@ -477,6 +495,7 @@ def bsa_attn_sm120_blk64_sage_fwd_cake(
     for name, tensor in tensors.items():
         if tensor.device != device or not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous on {device}")
+        _check_flat_indexable(name, tensor)
 
     device_index = _device_index(device)
     arch = _loader.device_arch(device_index)
