@@ -939,7 +939,9 @@ def test_cudnn_routing_weight_modes(key, mode):
 
 
 @pytest.mark.parametrize("key", _FAMILY_PARAMS)
-@pytest.mark.parametrize("local", ((0, 8), (2, 4), (6, 2)), ids=lambda l: f"experts{l}")
+@pytest.mark.parametrize(
+    "local", ((0, 8), (2, 4), (6, 2), (5, 1)), ids=lambda l: f"experts{l}"
+)
 def test_cudnn_expert_parallel_shard(key, local):
     """Only the local shard's assignments are computed; the rest map to row -1."""
     family = _FAMILIES[key]

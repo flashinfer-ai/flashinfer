@@ -9390,9 +9390,10 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
 
     Every expert segment is padded to ``_segment_alignment`` rows; padding rows
     are computed but never read back. Stage buffers hold the token bucket's
-    worst-case row count and every stage covers all of it: cuDNN's grouped GEMM
-    takes segment starts only, so the last expert's segment runs to the end of
-    the buffer.
+    worst-case row count and every stage covers all of it: the cuDNN grouped
+    GEMM offsets (``_cudnn_moe_first_token_offset``: segment starts, or explicit
+    boundaries ending at the buffer's row count) run the last expert's segment
+    to the end of the buffer.
     """
 
     supported_routing_modes = (
