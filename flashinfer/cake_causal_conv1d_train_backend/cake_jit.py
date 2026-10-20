@@ -39,8 +39,10 @@ workspace rows); everything else derives from them.
 The program name ``cake_causal_conv1d_train_<20 hex>`` is the first twenty hex
 digits of the SHA-256 of the compact JSON ``{"build": <build keywords, sorted>,
 "module": <dotted kernel module>}`` of the kernel the program was rendered
-from; the forward is built with its kernel file's default keywords and the
-backward with ``vec=4`` (four channels, 8-byte vectors, per thread).
+from; the forward is built with its kernel file's default keywords; the
+backward with ``vec=8`` (eight channels, 16-byte vectors, per thread) on
+sm_100a and sm_103a, and with ``vec=8, min_blocks=2`` (two CTAs per SM) on
+sm_107a.
 """
 
 from __future__ import annotations
@@ -124,10 +126,82 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "fwd",
         "workspace_rule": None,
     },
-    "cake_causal_conv1d_train_fca4a5467470b5e55f31": {
+    "cake_causal_conv1d_train_a578fae272376f2d9537": {
         "arches": [
             "sm_100a",
             "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "dw"],
+            ["buffer", "partial"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        # Cooperative (a grid-wide barrier precedes the fixed-order dweight
+        # reduction): the grid is exactly the co-resident CTA count.
+        # ``ctas_per_sm``: 3 CTAs per SM (168 registers at 128 threads, the
+        # launch bound; ncu launch__occupancy_limit_registers), the occupancy
+        # query's answer on B200 and GB300.
+        "grid_rule": {
+            "cooperative": True,
+            "ctas_per_sm": 3,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_train_a578fae272376f2d9537",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_a578fae272376f2d9537",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": True,
+            "dynamic_smem_bytes": 50176,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_a578fae272376f2d9537",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dw": "dw",
+            "dx": "dx",
+            "dy": "dy",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "partial": "partial",
+            "search_steps": "search_steps",
+            "w": "w",
+            "x": "x",
+        },
+        "role": "bwd",
+        # The FP32 ``partial`` workspace: ``[ceil(grid / n_ch_tiles), C, taps]``
+        # rows (row ``b // n_ch_tiles`` belongs to CTA ``b``) the kernel fully
+        # writes and reduces in a fixed order; nothing is zeroed by the host.
+        "workspace_rule": {
+            "kind": "partial_rows",
+            "taps": 4,
+        },
+    },
+    "cake_causal_conv1d_train_a93b636beb1d573942bf": {
+        "arches": [
             "sm_107a",
         ],
         "arg_plan": [
@@ -152,28 +226,30 @@ MODULES: dict[str, dict[str, Any]] = {
         "ffi_entry": "run",
         # Cooperative (a grid-wide barrier precedes the fixed-order dweight
         # reduction): the grid is exactly the co-resident CTA count.
-        # ``ctas_per_sm``: 4 CTAs per SM measured on B200 and GB300 (128
-        # registers at 128 threads, the launch bound; ncu
-        # launch__occupancy_limit_registers); sm_107a is taken as the same.
+        # ``ctas_per_sm``: 2 CTAs per SM, the program's ``min_blocks`` 2 launch
+        # bound (234 registers at 128 threads; ncu
+        # launch__occupancy_limit_registers), the occupancy query's answer on
+        # R200; the ``min_blocks`` 3 build of the other two architectures
+        # measured 10 % slower at C = 128 on its 212 SMs.
         "grid_rule": {
             "cooperative": True,
-            "ctas_per_sm": 4,
+            "ctas_per_sm": 2,
             "geometry": {
                 "threads": 128,
-                "vec": 4,
+                "vec": 8,
             },
             "kind": "co_resident",
         },
-        "kernel": "cake_causal_conv1d_train_fca4a5467470b5e55f31",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_fca4a5467470b5e55f31",
+        "kernel": "cake_causal_conv1d_train_a93b636beb1d573942bf",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_a93b636beb1d573942bf",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": True,
-            "dynamic_smem_bytes": 8192,
+            "dynamic_smem_bytes": 50176,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_fca4a5467470b5e55f31",
+        "library": "cake_causal_conv1d_train_a93b636beb1d573942bf",
         "logical": {
             "C": "C",
             "S": "S",
@@ -204,7 +280,7 @@ MODULES: dict[str, dict[str, Any]] = {
 ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_100a": {
         "bwd": [
-            "cake_causal_conv1d_train_fca4a5467470b5e55f31",
+            "cake_causal_conv1d_train_a578fae272376f2d9537",
         ],
         "fwd": [
             "cake_causal_conv1d_train_f193c5247980992f4f81",
@@ -212,7 +288,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
     },
     "sm_103a": {
         "bwd": [
-            "cake_causal_conv1d_train_fca4a5467470b5e55f31",
+            "cake_causal_conv1d_train_a578fae272376f2d9537",
         ],
         "fwd": [
             "cake_causal_conv1d_train_f193c5247980992f4f81",
@@ -220,7 +296,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
     },
     "sm_107a": {
         "bwd": [
-            "cake_causal_conv1d_train_fca4a5467470b5e55f31",
+            "cake_causal_conv1d_train_a93b636beb1d573942bf",
         ],
         "fwd": [
             "cake_causal_conv1d_train_f193c5247980992f4f81",
@@ -242,9 +318,9 @@ KINDS = ("fwd", "bwd")
 # The convolution width: ``weight`` and ``dweight`` are ``[C, WIDTH]`` and tap
 # ``WIDTH - 1`` multiplies the current token.
 WIDTH = 4
-# A forward thread owns one 16-byte vector of eight BF16 channels and a
-# backward thread one 8-byte vector of four, so ``C`` is a multiple of eight;
-# the ``vec`` of every record's geometry divides this.
+# A forward thread and a backward thread each own one 16-byte vector of
+# eight BF16 channels, so ``C`` is a multiple of eight; the ``vec`` of every
+# record's geometry divides this.
 CHANNEL_MULTIPLE = 8
 # The kernels take ``S``, ``C`` and the plan scalars as 32-bit integers.
 INT32_MAX = 2**31 - 1
