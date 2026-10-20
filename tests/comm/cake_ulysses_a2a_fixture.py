@@ -545,7 +545,9 @@ def prepare(
 ):
     """Allocate a case once; reuse its tensors and IPC state for every call."""
     if nvlink_kernel not in NVLINK_KERNELS:
-        raise ValueError(f"nvlink_kernel must be one of {NVLINK_KERNELS}, got {nvlink_kernel!r}")
+        raise ValueError(
+            f"nvlink_kernel must be one of {NVLINK_KERNELS}, got {nvlink_kernel!r}"
+        )
     group = dist.group.WORLD if group is None else group
     world = dist.get_world_size(group=group)
     if world != shape["world_size"]:

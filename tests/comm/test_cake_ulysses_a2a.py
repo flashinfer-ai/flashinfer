@@ -56,10 +56,15 @@ def test_generated_ulysses_portfolio(world_size, nvlink_kernel):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"requires {world_size} GPUs")
     if nvlink_kernel == "cake":
-        if torch.cuda.get_device_capability(0) not in pkg.SUPPORTED_COMPUTE_CAPABILITIES:
+        if (
+            torch.cuda.get_device_capability(0)
+            not in pkg.SUPPORTED_COMPUTE_CAPABILITIES
+        ):
             pytest.skip("the Cake portfolio targets Blackwell SM100/SM103")
         if not cake_route_available(world_size):
-            pytest.skip("build.json delivers no library for this device yet (the export run fills it)")
+            pytest.skip(
+                "build.json delivers no library for this device yet (the export run fills it)"
+            )
     multi_process_parallel(world_size, _correctness_worker, (nvlink_kernel,))
 
 
@@ -101,7 +106,10 @@ def test_records_cover_the_portfolio_once():
     for name, record in loader.MODULES.items():
         direction = "scatter" if record["mode"] == 0 else "gather"
         assert name == f"{direction}_{record['dtype']}_w{record['world_size']}"
-        assert loader.record_for(record["dtype"], record["world_size"], record["mode"]) is record
+        assert (
+            loader.record_for(record["dtype"], record["world_size"], record["mode"])
+            is record
+        )
         assert record["library"] == record["kernel"]
         assert re.fullmatch(r"cake_ulysses_a2a_[0-9a-f]{20}", record["library"])
         assert record["kernel_symbol"] == f"kernel_{record['library']}"
@@ -120,7 +128,11 @@ def test_records_cover_the_portfolio_once():
         assert kinds <= {"buffer", "parameter", "peer_table"}
         logical = record["logical"]
         assert {key for _, key in plan[:-3]} == set(logical)
-        vocabulary = set(loader.LOGICAL_TENSORS) | set(loader.LOGICAL_PEER_TABLES) | set(loader.LOGICAL_SCALARS)
+        vocabulary = (
+            set(loader.LOGICAL_TENSORS)
+            | set(loader.LOGICAL_PEER_TABLES)
+            | set(loader.LOGICAL_SCALARS)
+        )
         assert set(logical.values()) <= vocabulary
         for kind, key in plan[:-3]:
             if kind == "peer_table":
@@ -154,9 +166,25 @@ def test_plan_arguments_follow_the_record():
         "D": 128,
     }
     args = loader.plan_arguments(record, values)
-    assert args == ["INP", "OUT", "STAGING", "SIGNALS", "SELF", 3, 1, 5, 6, 128, 148, 1, 1]
+    assert args == [
+        "INP",
+        "OUT",
+        "STAGING",
+        "SIGNALS",
+        "SELF",
+        3,
+        1,
+        5,
+        6,
+        128,
+        148,
+        1,
+        1,
+    ]
     with pytest.raises(ValueError, match="needs 'out'"):
-        loader.plan_arguments(record, {key: value for key, value in values.items() if key != "out"})
+        loader.plan_arguments(
+            record, {key: value for key, value in values.items() if key != "out"}
+        )
 
 
 def test_peer_tables_and_signal_constants():
@@ -182,14 +210,26 @@ def test_route_requires_delivered_libraries(monkeypatch):
     scatter = loader.library_name(loader.record_name("bf16", 2, 0), "sm_100a")
     gather = loader.library_name(loader.record_name("bf16", 2, 1), "sm_100a")
     monkeypatch.setattr(cake_build, "libraries_by_name", lambda: {})
-    assert not loader.route_applies(device_capability=(10, 0), dtype="bf16", world_size=2)
+    assert not loader.route_applies(
+        device_capability=(10, 0), dtype="bf16", world_size=2
+    )
     monkeypatch.setattr(cake_build, "libraries_by_name", lambda: {scatter: {}})
-    assert not loader.route_applies(device_capability=(10, 0), dtype="bf16", world_size=2)
-    monkeypatch.setattr(cake_build, "libraries_by_name", lambda: {scatter: {}, gather: {}})
+    assert not loader.route_applies(
+        device_capability=(10, 0), dtype="bf16", world_size=2
+    )
+    monkeypatch.setattr(
+        cake_build, "libraries_by_name", lambda: {scatter: {}, gather: {}}
+    )
     assert loader.route_applies(device_capability=(10, 0), dtype="bf16", world_size=2)
-    assert not loader.route_applies(device_capability=(10, 0), dtype="bf16", world_size=4)
-    assert not loader.route_applies(device_capability=(10, 3), dtype="bf16", world_size=2)
-    assert not loader.route_applies(device_capability=(9, 0), dtype="bf16", world_size=2)
+    assert not loader.route_applies(
+        device_capability=(10, 0), dtype="bf16", world_size=4
+    )
+    assert not loader.route_applies(
+        device_capability=(10, 3), dtype="bf16", world_size=2
+    )
+    assert not loader.route_applies(
+        device_capability=(9, 0), dtype="bf16", world_size=2
+    )
     with pytest.raises(RuntimeError):
         loader.library_name(loader.record_name("bf16", 2, 0), "sm_90a")
 
@@ -214,7 +254,9 @@ def test_registry_records_reference_the_build_manifest():
         pytest.skip("build.json delivers no library yet (the export run fills it)")
     referenced = set()
     for name, record in loader.MODULES.items():
-        assert not {"sources", "source_sha256", "compile_flags", "cache_names"} & set(record), name
+        assert not {"sources", "source_sha256", "compile_flags", "cache_names"} & set(
+            record
+        ), name
         for arch in record["arches"]:
             library = loader.library_name(name, arch)
             referenced.add(library)

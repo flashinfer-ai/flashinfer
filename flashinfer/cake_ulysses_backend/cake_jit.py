@@ -1224,7 +1224,9 @@ def record_for(dtype: str, world_size: int, mode: int) -> dict[str, Any]:
     return record
 
 
-def route_applies(*, device_capability: Sequence[int], dtype: str, world_size: int) -> bool:
+def route_applies(
+    *, device_capability: Sequence[int], dtype: str, world_size: int
+) -> bool:
     """Whether the verified export owns both collectives of one communicator on a device.
 
     True when the device is an exported architecture and ``build.json`` delivers
@@ -1246,7 +1248,9 @@ def launch_grid(record: dict[str, Any]) -> tuple[int, int, int]:
 
     rule = record["grid_rule"]
     if rule.get("kind") != "fixed":
-        raise RuntimeError(f"unsupported grid rule {rule!r}; the package launches fixed grids")
+        raise RuntimeError(
+            f"unsupported grid rule {rule!r}; the package launches fixed grids"
+        )
     grid = tuple(int(value) for value in rule["grid"])
     if len(grid) != 3 or min(grid) < 1:
         raise RuntimeError(f"grid rule names an invalid grid {rule['grid']!r}")

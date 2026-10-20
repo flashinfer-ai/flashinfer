@@ -59,9 +59,7 @@ def dtype_name(dtype: torch.dtype) -> str:
 
     name = _DTYPE_NAMES.get(dtype)
     if name is None:
-        raise ValueError(
-            f"dtype must be one of {tuple(_DTYPE_NAMES)}, got {dtype!r}"
-        )
+        raise ValueError(f"dtype must be one of {tuple(_DTYPE_NAMES)}, got {dtype!r}")
     return name
 
 
@@ -127,7 +125,11 @@ def peer_table(addresses: Sequence[int]) -> torch.Tensor:
 
 
 class _DLDataType(ctypes.Structure):
-    _fields_ = [("code", ctypes.c_uint8), ("bits", ctypes.c_uint8), ("lanes", ctypes.c_uint16)]
+    _fields_ = [
+        ("code", ctypes.c_uint8),
+        ("bits", ctypes.c_uint8),
+        ("lanes", ctypes.c_uint16),
+    ]
 
 
 class _DLDevice(ctypes.Structure):
@@ -274,7 +276,11 @@ class CakeUlyssesA2A:
             sentinels = {key: object() for key in _PER_CALL}
             template = cake_jit.plan_arguments(record, {**fixed, **sentinels})
             slots = tuple(
-                next(index for index, value in enumerate(template) if value is sentinels[key])
+                next(
+                    index
+                    for index, value in enumerate(template)
+                    if value is sentinels[key]
+                )
                 for key in _PER_CALL
             )
             module = cake_jit.load(record_name, arch)

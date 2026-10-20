@@ -105,10 +105,13 @@ def main():
                         outputs=portable.outputs,
                     )
                 cases["nccl"] = prepare(
-                    shape, backend="nccl", inputs=portable.inputs, outputs=portable.outputs
+                    shape,
+                    backend="nccl",
+                    inputs=portable.inputs,
+                    outputs=portable.outputs,
                 )
                 results = {}
-                for name, case in cases.items():
+                for _name, case in cases.items():
                     case.check()
                 for name, case in cases.items():
                     results[name] = _measure(case, barrier_group, args)
