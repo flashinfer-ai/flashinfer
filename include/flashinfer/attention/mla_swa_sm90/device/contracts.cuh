@@ -10,7 +10,7 @@ template <typename T>
 struct DsmDirectAccumLayout {
   static constexpr int kPvGroups = T::Config::PvWG;
   static constexpr int kSlicesPerPvGroup = mla_swa::PVOwnership<typename T::Config>::MaxSlices;
-  static constexpr int kPayloadWordsPerThreadPerSlice = 1 ? 4 : 2;
+  static constexpr int kPayloadWordsPerThreadPerSlice = 4;
   static constexpr int kThreadsPerWarpgroup = 128;
   static constexpr int kMailboxWords =
       kPvGroups * kSlicesPerPvGroup * kPayloadWordsPerThreadPerSlice * kThreadsPerWarpgroup;

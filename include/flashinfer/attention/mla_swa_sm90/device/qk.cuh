@@ -28,20 +28,31 @@ __forceinline__ __device__ void clear_masked_kv_rows(KV& sKV, Plan& plan, int pa
   // Eight BF16 elements fit one aligned 16-byte store within a swizzle atom.
   constexpr int vector_width = 8;
   const uint4 zero = make_uint4(0, 0, 0, 0);
-  for (int i = idx * vector_width; i < masked_rows * T::HEAD_DIM_V; i += 128 * vector_width) {
-    const int row = i / T::HEAD_DIM_V;
-    const int token = row < valid_begin ? row : valid_end + row - valid_begin;
-    const int feature = i % T::HEAD_DIM_V;
-    if constexpr (T::LOOKAHEAD_K > 0) {
-      if ((local_page & 1) != 0 && feature >= (T::NUM_V_TILES - T::LOOKAHEAD_K) * T::TILE_K) {
-        const int slot = feature / T::TILE_K - (T::NUM_V_TILES - T::LOOKAHEAD_K);
-        Tensor aux =
-            make_tensor(make_smem_ptr(plan.aux_kv[slot].data()), typename T::SmemLayoutKVSlice{});
-        *reinterpret_cast<uint4*>(&aux(token, feature % T::TILE_K)) = zero;
-        continue;
+  if constexpr (T::BLOCK_M == 8) {
+    // Fixed feature ownership avoids per-token index arithmetic in M8.
+    // M16/M32 keep their measured faster mapping.
+    static_assert(T::HEAD_DIM_V == 128 * vector_width && T::LOOKAHEAD_K == 0);
+    const int feature = idx * vector_width;
+    for (int token = 0; token < valid_begin; ++token)
+      *reinterpret_cast<uint4*>(&sKV(token, feature)) = zero;
+    for (int token = valid_end; token < T::BLOCK_N; ++token)
+      *reinterpret_cast<uint4*>(&sKV(token, feature)) = zero;
+  } else {
+    for (int i = idx * vector_width; i < masked_rows * T::HEAD_DIM_V; i += 128 * vector_width) {
+      const int row = i / T::HEAD_DIM_V;
+      const int token = row < valid_begin ? row : valid_end + row - valid_begin;
+      const int feature = i % T::HEAD_DIM_V;
+      if constexpr (T::LOOKAHEAD_K > 0) {
+        if ((local_page & 1) != 0 && feature >= (T::NUM_V_TILES - T::LOOKAHEAD_K) * T::TILE_K) {
+          const int slot = feature / T::TILE_K - (T::NUM_V_TILES - T::LOOKAHEAD_K);
+          Tensor aux =
+              make_tensor(make_smem_ptr(plan.aux_kv[slot].data()), typename T::SmemLayoutKVSlice{});
+          *reinterpret_cast<uint4*>(&aux(token, feature % T::TILE_K)) = zero;
+          continue;
+        }
       }
+      *reinterpret_cast<uint4*>(&sKV(token, feature)) = zero;
     }
-    *reinterpret_cast<uint4*>(&sKV(token, feature)) = zero;
   }
   // WGMMA reads through the async proxy, unlike the generic shared stores.
   cutlass::arch::fence_view_async_shared();
