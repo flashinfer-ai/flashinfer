@@ -218,12 +218,14 @@ Persistence and orchestration stay separate responsibilities.
 - **Shared filesystem**: per-entry publication prevents torn entries. It does not provide a
   snapshot across ranks: concurrent publishers or an interrupted run can produce mixed hits.
 - **Profiling participation**: with `set_autotune_process_group`, each profile first reduces
-  its hit flag. Only an all-hit group skips profiling; any miss makes all ranks discard that
+  its hit flag and a digest of the cached runner/tactic. Only an all-hit group with matching
+  selections skips profiling; any miss or disagreement makes all ranks discard that
   profile's old runner entries and re-profile. Invalidation covers memory and persistence so
   a different runner can win without an older entry taking precedence after reload. These
   collectives run only during tuning, outside CUDA Graph capture. The framework must still
   ensure matching op/profile/candidate order and skip lists across the group.
-- **In-session rank consistency**: ranks may still hold divergent locally-measured winners until
+- **In-session rank consistency**: coordinated tuning re-profiles divergent cached winners and
+  tactic shortlists. Independent tuning without a process group can still diverge until
   `autotune_v2_reload()` runs — a finalize step (tune → barrier → reload) that drops in-process
   winners and ephemeral tactic shortlists, bulk re-hydrates the attached store's final
   published state into memory, and thereby makes shared keys use the store's final tactics

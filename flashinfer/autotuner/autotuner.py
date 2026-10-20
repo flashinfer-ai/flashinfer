@@ -1144,7 +1144,9 @@ def set_autotune_process_group(
     ranks that requires identical: ``get_valid_tactics`` and shape buckets;
     ``skip_ops`` (a skipped op returns before the tactic loop, doing zero
     reduces). Cache hits are coordinated per profile: if any rank misses,
-    every rank profiles again. Set the group from the first ``choose_one``;
+    every rank profiles again. Cached runner/tactic selections must also agree;
+    disagreement triggers the same coordinated re-profile. Set the group from
+    the first ``choose_one``;
     distributed tuning must run outside CUDA Graph capture. Input
     synthesis and ``do_preparation`` OOMs are reduced across the group before
     tactic profiling, giving every rank the same fallback decision.
@@ -1181,7 +1183,8 @@ def _sync_oom_across_tune_group(local_oom: bool) -> bool:
     return bool(oom_flag.item())
 
 
-def _all_ranks_hit_cache(local_hit: bool) -> bool:
+def _all_ranks_hit_cache(local_hit: bool, selection: Any = None) -> bool:
+    """Reuse cached results only when every rank has the same selection."""
     if _tune_process_group is None:
         return local_hit
     if torch.cuda.is_current_stream_capturing():
@@ -1194,9 +1197,29 @@ def _all_ranks_hit_cache(local_hit: bool) -> bool:
 
     backend = str(dist.get_backend(_tune_process_group)).lower()
     device = "cuda" if backend == "nccl" else "cpu"
-    hit = torch.tensor([int(local_hit)], dtype=torch.int32, device=device)
-    dist.all_reduce(hit, op=dist.ReduceOp.MIN, group=_tune_process_group)
-    return bool(hit.item())
+    digest = bytes(32)
+    if local_hit:
+        try:
+            encoded = json.dumps(
+                _tactic_to_json(selection),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode()
+            digest = hashlib.sha256(encoded).digest()
+        except (TypeError, ValueError):
+            # An unrepresentable selection cannot establish agreement. Every
+            # rank still joins the collective and takes the re-profile path.
+            local_hit = False
+    # Packing the digest and its negation checks both min and max using the
+    # existing single collective, including when some ranks miss the cache.
+    agreement = torch.tensor(
+        [int(local_hit), *digest, *(-value for value in digest)],
+        dtype=torch.int32,
+        device=device,
+    )
+    dist.all_reduce(agreement, op=dist.ReduceOp.MIN, group=_tune_process_group)
+    return bool(agreement[0].item()) and torch.equal(agreement[1:33], -agreement[33:])
 
 
 @dataclass(frozen=True)
@@ -2377,7 +2400,12 @@ class AutoTuner:
                         inputs=inputs,
                         require_profiling_policy=True,
                     )
-                    if not _all_ranks_hit_cache(is_cache_hit):
+                    selection = (
+                        (runner_id, type(runners[runner_id]).__name__, tactic)
+                        if is_cache_hit
+                        else None
+                    )
+                    if not _all_ranks_hit_cache(is_cache_hit, selection):
                         if _tune_process_group is not None:
                             self._discard_profile_cache(
                                 custom_op,
@@ -2739,7 +2767,10 @@ class AutoTuner:
             )
             policy = self._profiling_policy(tuning_config)
             cached = self._ranked_tactics_cache.get(cache_key)
-            if _all_ranks_hit_cache(cached is not None and cached[0] == policy):
+            if _all_ranks_hit_cache(
+                cached is not None and cached[0] == policy,
+                (type(runner).__name__, k, cached[1][:k]) if cached else None,
+            ):
                 assert cached is not None
                 return list(cached[1][:k])
             self._ranked_tactics_cache.pop(cache_key, None)

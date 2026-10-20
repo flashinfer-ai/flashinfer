@@ -497,14 +497,16 @@ import torch
 import torch.distributed as dist
 from flashinfer.autotuner import AutoTuner, TunableRunner, TuningConfig, autotune, set_autotune_process_group
 from flashinfer.autotune_cache import autotune_v2, autotune_v2_reload, ManagedAutotuneCache
+from flashinfer.autotuner.autotuner import _all_ranks_hit_cache
 
 rank = int(os.environ["RANK"])
 case = os.environ["CACHE_CASE"]
+world_size = int(os.environ["WORLD_SIZE"])
 root = Path(os.environ["CASE_ROOT"])
 
 class RunnerA(TunableRunner):
     def get_cache_key_extras(self, inputs):
-        return (0 if case == "concurrent_publish" else rank,)
+        return (0 if case in ("concurrent_publish", "all_hit_stale_memory") else rank,)
     def get_valid_tactics(self, inputs, profile):
         return [0, 1]
     def forward(self, inputs, tactic=-1):
@@ -527,14 +529,14 @@ def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
     dist.all_reduce(elapsed)
     if case == "failed_profile":
         return float("inf")
-    return elapsed.item() / 2
+    return elapsed.item() / world_size
 
 AutoTuner._profile_single_kernel = profile
 # CPU tests replace only CUDA measurement/capture queries; cache lookup,
 # invalidation, publication, choose_one and distributed collectives are real.
 torch.cuda.is_current_stream_capturing = lambda: False
 dist.init_process_group("gloo", init_method="file://" + str(root / "rendezvous"),
-                        rank=rank, world_size=2, timeout=datetime.timedelta(seconds=30))
+                        rank=rank, world_size=world_size, timeout=datetime.timedelta(seconds=30))
 try:
     context = (autotune(True) if case in ("partial_memory", "partial_file")
                else autotune_v2(cache_root=root / "cache"))
@@ -543,15 +545,25 @@ try:
                                    runners[0].get_cache_key_extras(inputs))
         policy = tuner._profiling_policy(config)
         store = tuner._active_managed_store
-        if case == "all_hit" or (rank == 0 and case not in ("all_miss", "concurrent_publish")):
+        all_hit = case in ("all_hit", "all_hit_different_tactics", "all_hit_different_runners", "all_hit_stale_memory")
+        if all_hit or (rank == 0 and case not in ("all_miss", "concurrent_publish")):
             if case == "partial_memory":
                 tuner._winner_cache()[key] = (0, None)
             elif case == "partial_file":
                 tuner._file_configs[key.file_key] = ("RunnerA", 0)
             else:
-                store.publish(key.file_key, "RunnerA", 0, key_fields=key.key_fields,
+                if case == "all_hit_different_runners" and rank == 1:
+                    key = tuner._get_cache_key(op, runners[1], (inputs[0].shape,), config,
+                                              runners[1].get_cache_key_extras(inputs))
+                cached_tactic = rank if case == "all_hit_different_tactics" else 0
+                store.publish(key.file_key, key.runner_class_name, cached_tactic, key_fields=key.key_fields,
                               profiling_policy=policy)
         dist.barrier()
+        if case == "all_hit_stale_memory":
+            # The shared artifact is identical, but process-local memoized
+            # winners may still differ before the final managed-cache reload.
+            tuner._winner_cache()[key] = (rank % 2, None)
+            tuner._profiling_cache_policies[(tuner._winner_cache_identity(), key)] = policy
         search = tuner.search_cache
         first = True
         def ordered_search(*args, **kwargs):
@@ -561,7 +573,7 @@ try:
             first = False
             if case != "concurrent_publish":
                 result = search(*args, **kwargs)
-                expected_hit = case == "all_hit" or (rank == 0 and case != "all_miss")
+                expected_hit = all_hit or (rank == 0 and case != "all_miss")
                 assert result[0] == expected_hit, (rank, case, result)
                 return result
             if rank == 0:
@@ -579,13 +591,28 @@ try:
             return result
         tuner.search_cache = ordered_search
         set_autotune_process_group(dist.group.WORLD)
+        if case == "all_hit":
+            # Persistent JSON lists and in-memory tuples describe the same
+            # compound tactic. A bad value on one rank must still participate
+            # in the reduce, and must not poison the following agreement.
+            compound = (16, (32, 64), None) if rank == 0 else [16, [32, 64], None]
+            assert _all_ranks_hit_cache(True, ("RunnerA", compound))
+            for invalid in (object(), float("nan")):
+                assert not _all_ranks_hit_cache(True, invalid if rank == 1 else 0)
+            assert _all_ranks_hit_cache(True, ("RunnerA", 0))
         # A nested rank_tactics shortlist has its own process-local cache.
         ranked_key = tuner._get_cache_key("test::ranked", runners[0],
             (inputs[0].shape,), config, runners[0].get_cache_key_extras(inputs))
         if rank == 0:
             tuner._ranked_tactics_cache[ranked_key] = (policy, (1, 0))
+        elif case in ("ranked_different_order", "ranked_all_hit"):
+            tuner._ranked_tactics_cache[ranked_key] = (
+                policy, (0, 1) if case == "ranked_different_order" else (1, 0))
         ranked = tuner.rank_tactics("test::ranked", [runners[0]], config, inputs, k=2)
-        assert ranked == ([-1] if case == "failed_profile" else [0, 1])
+        expected_ranked = ([-1] if case == "failed_profile" else
+                           [1, 0] if case == "ranked_all_hit" else [0, 1])
+        assert ranked == expected_ranked
+        assert bool(calls) == (case != "ranked_all_hit")
         calls.clear()
         expected = ("RunnerA", 0) if case == "all_hit" else (
             ("RunnerA", -1) if case == "failed_profile" else ("RunnerB", 1))
@@ -635,6 +662,11 @@ finally:
     "case",
     [
         "all_hit",
+        "all_hit_different_tactics",
+        "all_hit_different_runners",
+        "all_hit_stale_memory",
+        "ranked_different_order",
+        "ranked_all_hit",
         "all_miss",
         "partial_memory",
         "partial_file",
@@ -643,16 +675,18 @@ finally:
         "failed_profile",
     ],
 )
-def test_cache_hit_disagreement_reprofiles_together(tmp_path, case):
-    """Real two-rank lookup/collectives converge despite partial or racing caches."""
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_cache_hit_disagreement_reprofiles_together(tmp_path, case, world_size):
+    """Group lookups converge despite partial, racing, or divergent caches."""
     processes = []
     deadline = time.monotonic() + 120
     try:
-        for rank in range(2):
+        for rank in range(world_size):
             env = dict(
                 os.environ,
                 RANK=str(rank),
                 CACHE_CASE=case,
+                WORLD_SIZE=str(world_size),
                 CASE_ROOT=str(tmp_path),
                 TORCH_DISTRIBUTED_DEBUG="DETAIL",
             )
