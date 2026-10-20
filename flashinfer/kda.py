@@ -270,7 +270,8 @@ def recurrent_kda(
             Scale factor for queries. If ``None``, defaults to ``1 / sqrt(K)``.
         initial_state (Optional[torch.Tensor]):
             Initial state of shape ``[N, HV, V, K]``. Eligible prefill
-            backends accept bfloat16 or float32; other modes may be stricter.
+            backends accept bfloat16 or float32; decode, speculative decode and
+            packed calls with no more tokens than sequences require bfloat16.
             If ``None``, zero-initialized. Updated in-place. For
             batched spec decode without ``cu_seqlens``, ``N`` is the packed
             checkpoint-slot count ``B * (1 + num_spec_tokens)`` when

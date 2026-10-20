@@ -2620,3 +2620,58 @@ def test_spec_decode_batched_auto_ssi():
     )
     assert final_state is tri_state_pool
     assert final_state.shape == (n_pool, HV, D, D)
+
+
+def _one_token_per_sequence_inputs(num_seqs, H, D, state_dtype):
+    device = "cuda"
+    torch.manual_seed(0)
+    q = torch.randn(1, num_seqs, H, D, device=device, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    g = torch.randn_like(q)
+    beta = torch.randn(1, num_seqs, H, device=device, dtype=torch.bfloat16)
+    A_log = torch.randn(H, device=device, dtype=torch.float32)
+    dt_bias = torch.randn(H * D, device=device, dtype=torch.float32)
+    pool = torch.randn(num_seqs + 2, H, D, D, device=device).to(state_dtype) * 0.1
+    cu_seqlens = torch.arange(num_seqs + 1, device=device, dtype=torch.int32)
+    state_indices = torch.arange(1, num_seqs + 1, device=device, dtype=torch.int32)
+    return q, k, v, g, beta, A_log, dt_bias, pool, cu_seqlens, state_indices
+
+
+def _run_one_token_per_sequence(inputs, dt_bias, pool):
+    q, k, v, g, beta, A_log, _, _, cu_seqlens, state_indices = inputs
+    out, _ = recurrent_kda(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=pool,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=state_indices,
+        use_gate_in_kernel=True,
+        lower_bound=-5.0,
+        beta_is_logit=True,
+    )
+    return out
+
+
+@pytest.mark.parametrize("num_seqs", [4, 32])
+def test_one_token_per_sequence_accepts_2d_dt_bias(num_seqs):
+    H, D = 8, 128
+    inputs = _one_token_per_sequence_inputs(num_seqs, H, D, torch.bfloat16)
+    dt_bias, pool = inputs[6], inputs[7]
+    pool_2d = pool.clone()
+    out_flat = _run_one_token_per_sequence(inputs, dt_bias, pool)
+    out_2d = _run_one_token_per_sequence(inputs, dt_bias.view(H, D), pool_2d)
+    torch.testing.assert_close(out_2d, out_flat, rtol=0, atol=0)
+    torch.testing.assert_close(pool_2d, pool, rtol=0, atol=0)
+
+
+def test_one_token_per_sequence_rejects_fp32_state():
+    H, D = 8, 128
+    inputs = _one_token_per_sequence_inputs(4, H, D, torch.float32)
+    with pytest.raises(TypeError, match="bfloat16 state"):
+        _run_one_token_per_sequence(inputs, inputs[6], inputs[7])
