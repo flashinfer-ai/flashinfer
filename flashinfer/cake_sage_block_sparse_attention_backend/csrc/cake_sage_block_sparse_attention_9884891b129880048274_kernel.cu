@@ -241,7 +241,7 @@ __device__ __forceinline__ void softmax_block_sum(const float* sv, float2* acc) 
     const float2* sv2 = reinterpret_cast<const float2*>(sv);
     #pragma unroll
     for (int j = 0; j < 16; j++) {
-        asm("add.f32x2 %0, %1, %2;"
+        asm("add.rn.ftz.f32x2 %0, %1, %2;"
             : "+l"(reinterpret_cast<uint64_t&>(*acc))
             : "l"(reinterpret_cast<uint64_t&>(*acc)),
               "l"(reinterpret_cast<const uint64_t&>(sv2[j])));
