@@ -1596,22 +1596,26 @@ def create_page_offsets_task_split_kv(
         smem_page_offsets_k.init_load_state()
         smem_page_offsets_v.init_load_state()
 
-        # HEAD: publish the initial K0/K1 pair as two independent stages.
+        # HEAD: publish the initial K0/K1 pair as two independent stages. A
+        # query-paired CTA loads one K/V tile per step for both of its Q tiles.
         _page_offsets_produce(smem_page_offsets_k, "load_k0", FmhaStage.Head)
         if membership_lifetime is not None:
             membership_lifetime.commit()
-        _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Head)
+        if not cfg.query_paired:
+            _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Head)
 
         # LOOP: mirror LoadTask's cross-resource consumption order exactly.
         with domain_loop(0, domain, 1, unroll=1):
             _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Loop)
             _page_offsets_produce(smem_page_offsets_k, "load_k0", FmhaStage.Loop)
-            _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Loop)
-            _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Loop)
+            if not cfg.query_paired:
+                _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Loop)
+                _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Loop)
 
         # TAIL: drain V0/V1 through distinct page-offset stages.
         _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Tail)
-        _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Tail)
+        if not cfg.query_paired:
+            _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Tail)
 
     @_schedule_with_optional_resources
     def page_offsets_schedule(

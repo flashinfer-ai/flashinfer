@@ -1,8 +1,10 @@
-"""Query-paired dense Q128 plans of the PrimTS decode kernel.
+"""Query-paired Q128 plans of the PrimTS decode kernel.
 
 A query-paired plan runs two consecutive Q128 tiles of one sequence and KV
 head on one CTA, each K/V instance owning a tile over the whole K/V stream.
-Sage recipes are covered in ``test_attention_ts_sage.py``.
+Dense block-sparse wrapper plans pair contiguous K/V; paged decode plans pair
+when ``query_paired=True`` and the launch qualifies. Sage recipes are covered
+in ``test_attention_ts_sage.py``.
 """
 
 from __future__ import annotations
@@ -17,6 +19,14 @@ from flashinfer.attention.prims_ts.block_sparse import BlockSparseTSWrapper
 from tests.attention.test_attention_ts_block_sparse import (
     _HEAD_DIM,
     _REQUIRES_PRIMTS_GPU,
+)
+from tests.attention.test_attention_ts_decode import (
+    _FP8,
+    _exercise_public_paths,
+    _make_decode_case,
+    _pack_decode_case,
+    _plan_case,
+    _seq_lens_from_csr,
 )
 
 
@@ -134,3 +144,119 @@ def test_dense_plan_matches_fp32(case: _PairedCase, query_paired: bool) -> None:
     assert out.dtype == case.dtype
     expected = _reference(q, k, v, sm_scale, case.mask_type)
     torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
+
+
+@dataclass(frozen=True)
+class _PagedPairedCase:
+    """One paged decode problem whose Q tiles fill a wave of CTAs when paired."""
+
+    name: str
+    heads_q_per_kv: int
+    seq_len_q: int
+    num_kv_heads: int = 8
+    batch_size: int = 16
+    page_size: int = 32
+    mask_type: str = "dense"
+    dtype: torch.dtype = torch.bfloat16
+    output_dtype: torch.dtype | None = None
+    head_dim: int = _HEAD_DIM
+    # Per-request Q lengths of a packed batch, cycled over the batch.
+    q_lens: tuple[int, ...] | None = None
+
+    @property
+    def kv_lens(self) -> tuple[int, ...]:
+        # Ragged lengths; the longest makes the first CTA of a 64-token causal
+        # request stream one K/V tile its first Q tile cannot see.
+        return tuple(1072 - 97 * (i % 7) for i in range(self.batch_size))
+
+
+_PAGED_CASES = (
+    _PagedPairedCase("bf16_group8_three_tiles", heads_q_per_kv=8, seq_len_q=48),
+    # One token per Q tile: five tiles leave the last CTA's second tile past
+    # the sequence.
+    _PagedPairedCase(
+        "bf16_group128_causal_page64",
+        heads_q_per_kv=128,
+        seq_len_q=5,
+        num_kv_heads=4,
+        page_size=64,
+        mask_type="causal",
+    ),
+    _PagedPairedCase(
+        "bf16_group8_packed_causal",
+        heads_q_per_kv=8,
+        seq_len_q=64,
+        mask_type="causal",
+        q_lens=(64, 5, 33, 48, 17),
+    ),
+    # Paired FP8 CTAs beyond one wave run on the persistent scheduler.
+    _PagedPairedCase(
+        "fp8_group8_persistent", heads_q_per_kv=8, seq_len_q=48, dtype=_FP8
+    ),
+    _PagedPairedCase(
+        "fp8_head_dim64_group128_bf16_output",
+        heads_q_per_kv=128,
+        seq_len_q=5,
+        num_kv_heads=4,
+        dtype=_FP8,
+        output_dtype=torch.bfloat16,
+        head_dim=64,
+    ),
+)
+
+
+def _paged_decode_case(case: _PagedPairedCase):
+    """Build ``case``'s inputs and reference; packed cases also return Q offsets."""
+
+    decode_case = _make_decode_case(
+        kv_lens=case.kv_lens,
+        num_qo_heads=case.heads_q_per_kv * case.num_kv_heads,
+        num_kv_heads=case.num_kv_heads,
+        head_dim=case.head_dim,
+        seq_len_q=case.seq_len_q,
+        page_size=case.page_size,
+        qkv_dtype=case.dtype,
+        output_dtype=case.output_dtype or case.dtype,
+        cache_form="tuple",
+        mask_type=case.mask_type,
+        device="cuda",
+        seed=20261020,
+    )
+    if case.q_lens is None:
+        return decode_case, None
+    q_lens = [case.q_lens[i % len(case.q_lens)] for i in range(case.batch_size)]
+    return _pack_decode_case(decode_case, q_lens)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("case", _PAGED_CASES, ids=lambda case: case.name)
+@torch.no_grad()
+def test_paged_query_paired_public_paths(case: _PagedPairedCase) -> None:
+    """A paired paged plan matches FP32 attention eagerly, standalone and in a graph."""
+
+    decode_case, qo_indptr = _paged_decode_case(case)
+    seq_lens = _seq_lens_from_csr(
+        decode_case.paged_kv_indptr,
+        decode_case.paged_kv_last_page_len,
+        case.page_size,
+    )
+    wrapper = _plan_case(
+        decode_case,
+        max_kv_len=max(case.kv_lens),
+        qo_indptr=qo_indptr,
+        max_seq_len_q=case.seq_len_q,
+        query_paired=True,
+    )
+    policy = dict(wrapper._policy)
+    assert policy["query_paired"] is True
+    assert policy["tile_size_q"] == 128
+    _exercise_public_paths(
+        wrapper,
+        decode_case,
+        seq_lens,
+        max_kv_len=max(case.kv_lens),
+        exercise_all_paths=True,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=case.seq_len_q,
+    )

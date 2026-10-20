@@ -1605,6 +1605,7 @@ def _plan_case(
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
     dynamic_kv: bool = False,
+    query_paired: Optional[bool] = None,
 ):
     wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
     seq_len_q = 1 if case.q.ndim == 3 else int(case.q.shape[1])
@@ -1630,6 +1631,7 @@ def _plan_case(
         mask_type=case.mask_type,
         window_left=case.window_left,
         seq_lens=None if dynamic_kv else seq_lens.cpu(),
+        query_paired=query_paired,
     )
     return wrapper
 
@@ -1707,6 +1709,7 @@ def _run_standalone(
     page_size: Optional[int] = None,
     storage_page_size: Optional[int] = None,
     validate: bool = True,
+    query_paired: Optional[bool] = None,
 ):
     """Run the caller-workspace public entry point for wrapper parity."""
 
@@ -1732,6 +1735,7 @@ def _run_standalone(
             kv_layout="HND",
             storage_page_size=storage_page_size,
             device=case.q.device,
+            query_paired=query_paired,
         )
         workspace = torch.zeros(workspace_size, dtype=torch.int8, device=case.q.device)
     else:
@@ -1758,6 +1762,7 @@ def _run_standalone(
         kv_layout="HND",
         page_size=page_size,
         validate=validate,
+        query_paired=query_paired,
     )
     assert result is output
     return output
@@ -1809,15 +1814,18 @@ def _exercise_public_paths(
     """Always check eager; reserve standalone/graph parity for anchor rows."""
 
     if case.q.dtype == _FP8:
+        # FP8 probabilities round per online-softmax stream; a query-paired
+        # instance folds every K/V tile of its rows into one stream.
         policy = dict(wrapper._policy)
         case = _with_reference(
             case,
             qo_indptr=qo_indptr,
             splits_kv=int(policy["splits_kv"]),
-            num_insts_kv=int(policy["num_insts_kv"]),
+            num_insts_kv=1 if policy["query_paired"] else int(policy["num_insts_kv"]),
             q_tokens_per_cta=(
                 int(policy["tile_size_q"])
                 // (case.q.shape[-2] // case.k_cache.shape[1])
+                * (2 if policy["query_paired"] else 1)
                 if policy["groups_tokens_heads_q"]
                 else 1
             ),
@@ -1841,6 +1849,7 @@ def _exercise_public_paths(
         max_kv_len=max_kv_len,
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
+        query_paired=dict(wrapper._policy)["query_paired"],
     )
     _assert_case_correct(standalone, case)
     torch.testing.assert_close(standalone, eager, rtol=0, atol=0)
@@ -2670,6 +2679,7 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "out_dtype",
         "page_size",
         "split_kv",
+        "query_paired",
         "workspace_buffer",
         "max_kv_len",
         "validate",
@@ -2700,6 +2710,7 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "workspace_buffer",
         "storage_page_size",
         "split_kv",
+        "query_paired",
         "validate",
         "initialize_workspace",
     )
