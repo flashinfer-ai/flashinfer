@@ -34,36 +34,6 @@ _NVCC_FLAGS = {"sm100a": sm100a_nvcc_flags, "sm103a": sm103a_nvcc_flags}
 _TARGET_ARCH: dict[BlackwellMSATarget, str] = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
 
 MODULES: dict[str, dict[str, Any]] = {
-    "cake_blackwell_msa_02eac1ffa510c1f3d961": {
-        "sources": [
-            "blackwell_msa/cake_blackwell_msa_02eac1ffa510c1f3d961_kernel.cu",
-            "blackwell_msa/cake_blackwell_msa_02eac1ffa510c1f3d961_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": "prefill_union",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_blackwell_msa_044ebdf2b23464ba3049": {
-        "sources": [
-            "blackwell_msa/cake_blackwell_msa_044ebdf2b23464ba3049_kernel.cu",
-            "blackwell_msa/cake_blackwell_msa_044ebdf2b23464ba3049_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": "prefill_union",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_blackwell_msa_04f607bad91a7de6910b": {
-        "sources": [
-            "blackwell_msa/cake_blackwell_msa_04f607bad91a7de6910b_kernel.cu",
-            "blackwell_msa/cake_blackwell_msa_04f607bad91a7de6910b_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": "prefill_union",
-        "arches": ["sm_100a", "sm_103a"],
-    },
     "cake_blackwell_msa_077434d0c6f2e2ac8a55": {
         "sources": [
             "blackwell_msa/cake_blackwell_msa_077434d0c6f2e2ac8a55_kernel.cu",
@@ -84,20 +54,20 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "decode_fp8_q1_paged_xform2",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_blackwell_msa_0e42bddc8e39e77775dc": {
+    "cake_blackwell_msa_1befeb7dca7d89f3cfe0": {
         "sources": [
-            "blackwell_msa/cake_blackwell_msa_0e42bddc8e39e77775dc_kernel.cu",
-            "blackwell_msa/cake_blackwell_msa_0e42bddc8e39e77775dc_binding.cu",
+            "blackwell_msa/cake_blackwell_msa_1befeb7dca7d89f3cfe0_kernel.cu",
+            "blackwell_msa/cake_blackwell_msa_1befeb7dca7d89f3cfe0_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": "prefill_union",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_blackwell_msa_1befeb7dca7d89f3cfe0": {
+    "cake_blackwell_msa_20713d97bf7ec5870ba6": {
         "sources": [
-            "blackwell_msa/cake_blackwell_msa_1befeb7dca7d89f3cfe0_kernel.cu",
-            "blackwell_msa/cake_blackwell_msa_1befeb7dca7d89f3cfe0_binding.cu",
+            "blackwell_msa/cake_blackwell_msa_20713d97bf7ec5870ba6_kernel.cu",
+            "blackwell_msa/cake_blackwell_msa_20713d97bf7ec5870ba6_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -154,10 +124,20 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "decode_fp8_q1_flat_xform2",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_blackwell_msa_39657d215e82b0d3aa39": {
+    "cake_blackwell_msa_2c6c28f3426d43dfacef": {
         "sources": [
-            "blackwell_msa/cake_blackwell_msa_39657d215e82b0d3aa39_kernel.cu",
-            "blackwell_msa/cake_blackwell_msa_39657d215e82b0d3aa39_binding.cu",
+            "blackwell_msa/cake_blackwell_msa_2c6c28f3426d43dfacef_kernel.cu",
+            "blackwell_msa/cake_blackwell_msa_2c6c28f3426d43dfacef_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": "prefill_union",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_blackwell_msa_2e2829495fada198276d": {
+        "sources": [
+            "blackwell_msa/cake_blackwell_msa_2e2829495fada198276d_kernel.cu",
+            "blackwell_msa/cake_blackwell_msa_2e2829495fada198276d_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -204,6 +184,16 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "long_bf16_reverse_reduce",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_blackwell_msa_72887ed545b602f140b5": {
+        "sources": [
+            "blackwell_msa/cake_blackwell_msa_72887ed545b602f140b5_kernel.cu",
+            "blackwell_msa/cake_blackwell_msa_72887ed545b602f140b5_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": "prefill_union",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_blackwell_msa_74572ca8a8bc44c5f461": {
         "sources": [
             "blackwell_msa/cake_blackwell_msa_74572ca8a8bc44c5f461_kernel.cu",
@@ -212,6 +202,16 @@ MODULES: dict[str, dict[str, Any]] = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": "prefill_union",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_blackwell_msa_7afe577ff5e2215ed7e8": {
+        "sources": [
+            "blackwell_msa/cake_blackwell_msa_7afe577ff5e2215ed7e8_kernel.cu",
+            "blackwell_msa/cake_blackwell_msa_7afe577ff5e2215ed7e8_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": "topk_select_streaming",
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_msa_8828a5c33a15158853e5": {
@@ -234,10 +234,20 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "topk_select",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_blackwell_msa_9c2eacf905b06a86fca3": {
+    "cake_blackwell_msa_9cdd36a12bed06a3ef4d": {
         "sources": [
-            "blackwell_msa/cake_blackwell_msa_9c2eacf905b06a86fca3_kernel.cu",
-            "blackwell_msa/cake_blackwell_msa_9c2eacf905b06a86fca3_binding.cu",
+            "blackwell_msa/cake_blackwell_msa_9cdd36a12bed06a3ef4d_kernel.cu",
+            "blackwell_msa/cake_blackwell_msa_9cdd36a12bed06a3ef4d_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": "prefill_union",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_blackwell_msa_c02c1e8c177a57c5fdc3": {
+        "sources": [
+            "blackwell_msa/cake_blackwell_msa_c02c1e8c177a57c5fdc3_kernel.cu",
+            "blackwell_msa/cake_blackwell_msa_c02c1e8c177a57c5fdc3_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -274,24 +284,14 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "prefill_union",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_blackwell_msa_cc96ea7befd47c2a0b22": {
+    "cake_blackwell_msa_d15d3c1bc7b5a8a1dc7f": {
         "sources": [
-            "blackwell_msa/cake_blackwell_msa_cc96ea7befd47c2a0b22_kernel.cu",
-            "blackwell_msa/cake_blackwell_msa_cc96ea7befd47c2a0b22_binding.cu",
+            "blackwell_msa/cake_blackwell_msa_d15d3c1bc7b5a8a1dc7f_kernel.cu",
+            "blackwell_msa/cake_blackwell_msa_d15d3c1bc7b5a8a1dc7f_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "arg_plan": "prefill_union",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_blackwell_msa_d03b9d08c1e9314fbc4a": {
-        "sources": [
-            "blackwell_msa/cake_blackwell_msa_d03b9d08c1e9314fbc4a_kernel.cu",
-            "blackwell_msa/cake_blackwell_msa_d03b9d08c1e9314fbc4a_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": "topk_select_streaming",
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_blackwell_msa_d24af147efd25f98362a": {
@@ -314,10 +314,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "decode_m16",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_blackwell_msa_e9c87303e5be2b03a12c": {
+    "cake_blackwell_msa_e69a884ed1e49bf5e2c1": {
         "sources": [
-            "blackwell_msa/cake_blackwell_msa_e9c87303e5be2b03a12c_kernel.cu",
-            "blackwell_msa/cake_blackwell_msa_e9c87303e5be2b03a12c_binding.cu",
+            "blackwell_msa/cake_blackwell_msa_e69a884ed1e49bf5e2c1_kernel.cu",
+            "blackwell_msa/cake_blackwell_msa_e69a884ed1e49bf5e2c1_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -614,21 +614,21 @@ ROUTES: dict[str, dict[str, str]] = {
         "long_bf16_reverse:paged:gqa8:main": "cake_blackwell_msa_c3da0a7883053ffdf6fe",
         "long_bf16_reverse:paged:gqa8:reduce": "cake_blackwell_msa_711d5eeebecfcde61503",
         "prefill_union:bfloat16:bfloat16:flat:gqa0:any:main": "cake_blackwell_msa_1befeb7dca7d89f3cfe0",
-        "prefill_union:bfloat16:bfloat16:flat:gqa16:any:main": "cake_blackwell_msa_044ebdf2b23464ba3049",
-        "prefill_union:bfloat16:bfloat16:flat:gqa8:any:main": "cake_blackwell_msa_0e42bddc8e39e77775dc",
+        "prefill_union:bfloat16:bfloat16:flat:gqa16:any:main": "cake_blackwell_msa_d15d3c1bc7b5a8a1dc7f",
+        "prefill_union:bfloat16:bfloat16:flat:gqa8:any:main": "cake_blackwell_msa_e69a884ed1e49bf5e2c1",
         "prefill_union:bfloat16:bfloat16:paged:gqa0:any:main": "cake_blackwell_msa_8828a5c33a15158853e5",
-        "prefill_union:bfloat16:bfloat16:paged:gqa16:any:main": "cake_blackwell_msa_e9c87303e5be2b03a12c",
-        "prefill_union:bfloat16:bfloat16:paged:gqa16:causal_large:main": "cake_blackwell_msa_39657d215e82b0d3aa39",
-        "prefill_union:bfloat16:bfloat16:paged:gqa16:causal_mask64:main": "cake_blackwell_msa_9c2eacf905b06a86fca3",
-        "prefill_union:bfloat16:bfloat16:paged:gqa8:any:main": "cake_blackwell_msa_04f607bad91a7de6910b",
-        "prefill_union:bfloat16:float8_e4m3fn:flat:gqa0:any:main": "cake_blackwell_msa_cc96ea7befd47c2a0b22",
-        "prefill_union:bfloat16:float8_e4m3fn:paged:gqa0:any:main": "cake_blackwell_msa_02eac1ffa510c1f3d961",
+        "prefill_union:bfloat16:bfloat16:paged:gqa16:any:main": "cake_blackwell_msa_2c6c28f3426d43dfacef",
+        "prefill_union:bfloat16:bfloat16:paged:gqa16:causal_large:main": "cake_blackwell_msa_72887ed545b602f140b5",
+        "prefill_union:bfloat16:bfloat16:paged:gqa16:causal_mask64:main": "cake_blackwell_msa_2e2829495fada198276d",
+        "prefill_union:bfloat16:bfloat16:paged:gqa8:any:main": "cake_blackwell_msa_c02c1e8c177a57c5fdc3",
+        "prefill_union:bfloat16:float8_e4m3fn:flat:gqa0:any:main": "cake_blackwell_msa_20713d97bf7ec5870ba6",
+        "prefill_union:bfloat16:float8_e4m3fn:paged:gqa0:any:main": "cake_blackwell_msa_9cdd36a12bed06a3ef4d",
         "prefill_union:float16:float16:flat:gqa0:any:main": "cake_blackwell_msa_74572ca8a8bc44c5f461",
         "prefill_union:float16:float16:paged:gqa0:any:main": "cake_blackwell_msa_c6ed8357874024ae9789",
         "topk_select:main": "cake_blackwell_msa_c14b5fe5d3aa9f47ab07",
         "topk_select_keq:main": "cake_blackwell_msa_89539a2a0a479c9002e5",
         "topk_select_q32:main": "cake_blackwell_msa_f756fe7c24c2f8829427",
-        "topk_select_streaming:main": "cake_blackwell_msa_d03b9d08c1e9314fbc4a",
+        "topk_select_streaming:main": "cake_blackwell_msa_7afe577ff5e2215ed7e8",
     },
     "sm103a": {
         "decode_fp8_q1:q1_flat_xform2:main": "cake_blackwell_msa_2949bc72ee78a52859c9",
@@ -647,21 +647,21 @@ ROUTES: dict[str, dict[str, str]] = {
         "long_bf16_reverse:paged:gqa8:main": "cake_blackwell_msa_c3da0a7883053ffdf6fe",
         "long_bf16_reverse:paged:gqa8:reduce": "cake_blackwell_msa_711d5eeebecfcde61503",
         "prefill_union:bfloat16:bfloat16:flat:gqa0:any:main": "cake_blackwell_msa_1befeb7dca7d89f3cfe0",
-        "prefill_union:bfloat16:bfloat16:flat:gqa16:any:main": "cake_blackwell_msa_044ebdf2b23464ba3049",
-        "prefill_union:bfloat16:bfloat16:flat:gqa8:any:main": "cake_blackwell_msa_0e42bddc8e39e77775dc",
+        "prefill_union:bfloat16:bfloat16:flat:gqa16:any:main": "cake_blackwell_msa_d15d3c1bc7b5a8a1dc7f",
+        "prefill_union:bfloat16:bfloat16:flat:gqa8:any:main": "cake_blackwell_msa_e69a884ed1e49bf5e2c1",
         "prefill_union:bfloat16:bfloat16:paged:gqa0:any:main": "cake_blackwell_msa_8828a5c33a15158853e5",
-        "prefill_union:bfloat16:bfloat16:paged:gqa16:any:main": "cake_blackwell_msa_e9c87303e5be2b03a12c",
-        "prefill_union:bfloat16:bfloat16:paged:gqa16:causal_large:main": "cake_blackwell_msa_39657d215e82b0d3aa39",
-        "prefill_union:bfloat16:bfloat16:paged:gqa16:causal_mask64:main": "cake_blackwell_msa_9c2eacf905b06a86fca3",
-        "prefill_union:bfloat16:bfloat16:paged:gqa8:any:main": "cake_blackwell_msa_04f607bad91a7de6910b",
-        "prefill_union:bfloat16:float8_e4m3fn:flat:gqa0:any:main": "cake_blackwell_msa_cc96ea7befd47c2a0b22",
-        "prefill_union:bfloat16:float8_e4m3fn:paged:gqa0:any:main": "cake_blackwell_msa_02eac1ffa510c1f3d961",
+        "prefill_union:bfloat16:bfloat16:paged:gqa16:any:main": "cake_blackwell_msa_2c6c28f3426d43dfacef",
+        "prefill_union:bfloat16:bfloat16:paged:gqa16:causal_large:main": "cake_blackwell_msa_72887ed545b602f140b5",
+        "prefill_union:bfloat16:bfloat16:paged:gqa16:causal_mask64:main": "cake_blackwell_msa_2e2829495fada198276d",
+        "prefill_union:bfloat16:bfloat16:paged:gqa8:any:main": "cake_blackwell_msa_c02c1e8c177a57c5fdc3",
+        "prefill_union:bfloat16:float8_e4m3fn:flat:gqa0:any:main": "cake_blackwell_msa_20713d97bf7ec5870ba6",
+        "prefill_union:bfloat16:float8_e4m3fn:paged:gqa0:any:main": "cake_blackwell_msa_9cdd36a12bed06a3ef4d",
         "prefill_union:float16:float16:flat:gqa0:any:main": "cake_blackwell_msa_74572ca8a8bc44c5f461",
         "prefill_union:float16:float16:paged:gqa0:any:main": "cake_blackwell_msa_c6ed8357874024ae9789",
         "topk_select:main": "cake_blackwell_msa_f35ca4f807d8df7077ed",
         "topk_select_keq:main": "cake_blackwell_msa_89539a2a0a479c9002e5",
         "topk_select_q32:main": "cake_blackwell_msa_f756fe7c24c2f8829427",
-        "topk_select_streaming:main": "cake_blackwell_msa_d03b9d08c1e9314fbc4a",
+        "topk_select_streaming:main": "cake_blackwell_msa_7afe577ff5e2215ed7e8",
     },
 }
 
