@@ -86,6 +86,22 @@ extern "C" __global__ void kernel_cake_all_gather_matmul_9d5d20282a6a1082a079(
     __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready,
     unsigned int ready_target, int rank, int M, int scratch_pitch, int signal_rows, int n_tiles,
     int remote_order);
+extern "C" __global__ void kernel_cake_all_gather_matmul_a0785a42337a41e57f18(
+    unsigned int* __restrict__ inp, long long* __restrict__ payload_peers,
+    long long* __restrict__ signal_peers, unsigned int* __restrict__ counters,
+    unsigned int ready_target, int rank, int rows, int chunk_rows, int num_chunks);
+extern "C" __global__ void kernel_cake_all_gather_matmul_c4d3d85b74918e225506(
+    const __grid_constant__ CUtensorMap A_local, const __grid_constant__ CUtensorMap A_scratch,
+    const __grid_constant__ CUtensorMap B, __nv_bfloat16* __restrict__ C,
+    __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready,
+    unsigned int ready_target, int rank, int M, int scratch_pitch, int signal_rows, int n_tiles,
+    int remote_order);
+extern "C" __global__ void kernel_cake_all_gather_matmul_60cbe405e11489692148(
+    const __grid_constant__ CUtensorMap A_local, const __grid_constant__ CUtensorMap A_scratch,
+    const __grid_constant__ CUtensorMap B, __nv_bfloat16* __restrict__ C,
+    __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready,
+    unsigned int ready_target, int rank, int M, int scratch_pitch, int signal_rows, int n_tiles,
+    int remote_order);
 
 namespace cake_host_shim_seq_e847f4186119977a {
 
@@ -914,6 +930,36 @@ constexpr unsigned kMainCg2DynamicSmem = 197632u;
 constexpr unsigned kMainCg2s1DynamicSmem = 0u;
 constexpr unsigned kMainCg2s2DynamicSmem = 197632u;
 
+// Per-K-slice readiness twins of this sequence's class: a call of exactly kKslicePaddedRows[i] padded
+// rows on the SM push route (slice point i) publishes kKsliceS[i] readiness words per (peer, chunk)
+// through the push twin of its launched program family (kKslicePushWide[i] names the family) and runs
+// the main twin j of the point with kKsliceMainBlockN[j] / kKsliceMainForm[j] equal to the call's width
+// and form (kKsliceMainPoint[j] == i; every width and form a call at those rows can resolve to has one).
+// The main twins read A and B through the base program's tensor maps (the same boxes) and keep their
+// own symbols and footprints; a trailing 0 entry keeps every table well-formed.
+constexpr bool kHasKslice = true;
+constexpr int kKslicePointCount = 1;
+constexpr int64_t kKslicePaddedRows[kKslicePointCount + 1] = {512, 0};
+constexpr int64_t kKsliceS[kKslicePointCount + 1] = {4, 0};
+constexpr bool kKslicePushWide[kKslicePointCount + 1] = {true, false};
+constexpr int kKsliceMainCount = 2;
+constexpr int kKsliceMainPoint[kKsliceMainCount + 1] = {0, 0, 0};
+constexpr int64_t kKsliceMainBlockN[kKsliceMainCount + 1] = {256, 128, 0};
+constexpr int64_t kKsliceMainForm[kKsliceMainCount + 1] = {0, 0, 0};
+constexpr unsigned kKsliceMainDynamicSmem[kKsliceMainCount + 1] = {197632u, 197632u, 0u};
+constexpr int kslice_point(int64_t padded_rows) {
+  for (int i = 0; i < kKslicePointCount; ++i) {
+    if (kKslicePaddedRows[i] == padded_rows) return i;
+  }
+  return -1;
+}
+constexpr int kslice_main(int point, int64_t block_n, int64_t form) {
+  for (int j = 0; j < kKsliceMainCount; ++j) {
+    if (kKsliceMainPoint[j] == point && kKsliceMainBlockN[j] == block_n && kKsliceMainForm[j] == form) return j;
+  }
+  return -1;
+}
+
 // A tensor map is a pure function of the source's address, extents and
 // strides, so the encoder output is cached on that key: the bound weight and
 // the symmetric scratch hit on every call, the activation hits whenever the
@@ -1057,6 +1103,54 @@ inline MainProgram main_program() {
   return program;
 }
 
+// The per-K-slice readiness main twins (own symbols; the base program's width, form and launch), one per
+// twin index of the tables above, and the per-call selection by padded rows, block_n and main_form.
+inline MainProgram main_program_kslice_0() {
+  MainProgram program{};
+  program.kernel = reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_c4d3d85b74918e225506);
+  program.dynamic_smem = kKsliceMainDynamicSmem[0];
+  static const bool smem_ready =
+      CakeSetMaxDynamicSmem(program.kernel, static_cast<int>(program.dynamic_smem));
+  (void)smem_ready;
+  return program;
+}
+inline MainProgram main_program_kslice_1() {
+  MainProgram program{};
+  program.kernel = reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_60cbe405e11489692148);
+  program.dynamic_smem = kKsliceMainDynamicSmem[1];
+  static const bool smem_ready =
+      CakeSetMaxDynamicSmem(program.kernel, static_cast<int>(program.dynamic_smem));
+  (void)smem_ready;
+  return program;
+}
+inline MainProgram main_program_kslice(int64_t padded_rows, int64_t block_n, int64_t form) {
+  const int point = kslice_point(padded_rows);
+  const int twin = point < 0 ? -1 : kslice_main(point, block_n, form);
+  TVM_FFI_CHECK(twin >= 0, ValueError)
+      << "this route ships no per-K-slice readiness main twin of block_n=" << block_n
+      << " and main_form=" << form << " at " << padded_rows << " padded rows";
+  switch (twin) {
+    case 0:
+      return main_program_kslice_0();
+    case 1:
+      return main_program_kslice_1();
+    default:
+      TVM_FFI_THROW(RuntimeError) << "per-K-slice readiness main twin index " << twin << " has no program";
+      return MainProgram{};
+  }
+}
+
+// The per-K-slice push twin of each slice point (the twin of the point's launched program family).
+inline const void* kslice_push_kernel(int point) {
+  switch (point) {
+    case 0:
+      return reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_a0785a42337a41e57f18);
+    default:
+      TVM_FFI_THROW(RuntimeError) << "per-K-slice readiness slice point " << point << " has no push twin";
+      return nullptr;
+  }
+}
+
 inline void launch_main(const void* kernel, unsigned dynamic_smem, const CUtensorMap& a_local,
                         const CUtensorMap& a_scratch, const CUtensorMap& b, void* c,
                         void* scratch_payload, unsigned int* ready, uint32_t ready_target,
@@ -1121,6 +1215,8 @@ struct Call {
   int64_t chunk_rows;
   int64_t num_chunks;
   dim3 grid;
+  // Readiness words per (peer, chunk) of the call: 1, or kKsliceS[point] on a slice point (set by RunPush).
+  int64_t kslices = 1;
   CakePeerPointerTableHost<8> flags;
 };
 
@@ -1265,7 +1361,8 @@ inline void launch_main_for(const Call& call, const TensorView& inp, const Tenso
                          : call.form == kMainFormCg2   ? b_cg2_cache.get(weight, cg2::EncodeTma_B)
                          : n128_main                   ? b128_cache.get(weight, n128::EncodeTma_B)
                                                        : b_cache.get(weight, EncodeTma_B);
-  const MainProgram program = call.form == kMainFormCg2s1 ? main_program<kBlockN, kMainFormCg2s1>()
+  const MainProgram program = call.kslices > 1 ? main_program_kslice(call.padded_rows, call.block_n, call.form)
+                              : call.form == kMainFormCg2s1 ? main_program<kBlockN, kMainFormCg2s1>()
                               : call.form == kMainFormCg2s2 ? main_program<kBlockN, kMainFormCg2s2>()
                               : call.form == kMainFormCg2   ? main_program<kBlockN, kMainFormCg2>()
                               : n128_main                   ? main_program<128>()
@@ -1412,6 +1509,7 @@ inline bool set_push_carveout() {
   }
   set_push_carveout_for(reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_40242e9c64d6e66af6f5), "peer push");
   set_push_carveout_for(reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3), "wide peer push");
+  set_push_carveout_for(reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_a0785a42337a41e57f18), "per-K-slice peer push");
   return true;
 }
 
@@ -1488,6 +1586,30 @@ void RunPush(TensorView inp, TensorView scratch, TensorView weight, TensorView o
                         : (wide_push ? kPushWideCtasPerPeer : kPushCtasPerPeer);
     const void* push_kernel = wide_push ? reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3)
                                         : reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_40242e9c64d6e66af6f5);
+
+    // Per-K-slice readiness: a call of exactly a slice point's padded rows launches the push twin of the
+    // launched program family and, below, the main twin of the call's width and form (every width and form
+    // a call at the point can resolve to has one); both need kKsliceS[point] times the readiness words and
+    // ticket counters.
+    const int kslice_point_index = kslice_point(call.padded_rows);
+    if (kslice_point_index >= 0) {
+      const int64_t kslices = kKsliceS[kslice_point_index];
+      TVM_FFI_CHECK(wide_push == kKslicePushWide[kslice_point_index], RuntimeError)
+          << "the per-K-slice push twin of this route at " << call.padded_rows << " padded rows is the "
+          << (kKslicePushWide[kslice_point_index] ? "wide" : "one-vector")
+          << " program, but the call's launch selected the other family";
+      TVM_FFI_CHECK(kslice_main(kslice_point_index, call.block_n, call.form) >= 0, ValueError)
+          << "this route ships no per-K-slice readiness main twin of block_n=" << call.block_n
+          << " and main_form=" << call.form << " at " << call.padded_rows << " padded rows";
+      TVM_FFI_CHECK(counters.numel() >= (kWorldSize - 1) * call.num_chunks * kslices, ValueError)
+          << "push counters need at least " << ((kWorldSize - 1) * call.num_chunks * kslices)
+          << " words for " << kslices << " readiness slices";
+      TVM_FFI_CHECK(ready.numel() >= kWorldSize * call.num_chunks * kslices, ValueError)
+          << "the readiness pad view needs at least " << (kWorldSize * call.num_chunks * kslices)
+          << " words for " << kslices << " readiness slices";
+      push_kernel = kslice_push_kernel(kslice_point_index);
+      call.kslices = kslices;
+    }
     cudaLaunchConfig_t config{};
     config.gridDim = dim3(push_ctas_per_peer, static_cast<uint32_t>(kWorldSize - 1), 1u);
     config.blockDim = dim3(kPushThreads, 1u, 1u);

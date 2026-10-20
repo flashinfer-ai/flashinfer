@@ -163,7 +163,11 @@ def test_route_table_covers_every_world_size_dtype_layout_and_phase():
         f"main_{dtype_name}_ws{world_size}_{b_layout}_{form}"
         for world_size, dtype_name, b_layout, form in _cg2s_programs()
     }
-    assert len(loader.ROUTES) == 2 + 12 + 2 + len(twins) + len(pairs) + len(spills)
+    kslice_routes = {key for key in loader.ROUTES if loader._is_kslice_stage(key)}
+    expected_routes = (
+        2 + 12 + 2 + len(twins) + len(pairs) + len(spills) + len(kslice_routes)
+    )
+    assert len(loader.ROUTES) == expected_routes
     # ws2 never has a twin: asking for one names the missing route.
     with pytest.raises(ValueError, match="main_bfloat16_ws2_n_major_n128"):
         loader.main_program(2, "bfloat16", "n_major", block_n=128)
@@ -200,6 +204,7 @@ def test_n128_table_lists_ws4_and_ws8_classes_per_architecture_under_the_frozen_
         "sm_100a": [],
         "sm_103a": [[4, 512, 16, 8]],
     }
+    assert loader.PUSH_KSLICES_BY_ARCH == {"sm_100a": [], "sm_103a": [[8, 512, 4]]}
     assert loader.MAIN_BLOCK_NS == (256, 128) and loader.BLOCK_N == 256
     for arch in loader.ARCH_FLAGS:
         classes = _n128_classes(arch)
@@ -436,6 +441,44 @@ def test_every_route_has_one_host_sequence_per_architecture():
                     assert row["programs"][f"main_{form}"] == spill
                     assert arch in loader.PROGRAMS[spill]["arches"]
                     route.add(spill)
+            # The per-K-slice readiness twins of the class's slice points on this
+            # architecture travel with the sequence under their ``_ks<S>`` stage
+            # names: the push twin of each point's launched program family and the
+            # main twin of every width and form a call at a point can resolve to
+            # (each a delivered program of this architecture); a class without a
+            # point carries none.
+            kslice_stages = {
+                stage: program
+                for stage, program in row["programs"].items()
+                if loader._is_kslice_stage(stage)
+            }
+            slice_rows = [
+                row_entry
+                for row_entry in loader.push_kslice_rows(arch)
+                if row_entry[0] == world_size
+            ]
+            assert bool(kslice_stages) is bool(slice_rows)
+            for stage, program in kslice_stages.items():
+                base, _separator, slices = stage.rpartition("_ks")
+                assert int(slices) in {k_slices for _ws, _rows, k_slices in slice_rows}
+                assert arch in loader.PROGRAMS[program]["arches"]
+                if base in ("peer_push", "peer_push_wide"):
+                    assert program == loader.ROUTES[stage]
+                else:
+                    block_n = 128 if base.startswith("main_n128") else 256
+                    if base in ("main", "main_n128"):
+                        form = "cg1"
+                    else:
+                        form = base[len("main_") :]
+                    assert program == loader.main_program(
+                        world_size,
+                        dtype_name,
+                        b_layout,
+                        block_n=block_n,
+                        form=form,
+                        k_slices=int(slices),
+                    )
+                route.add(program)
             assert len(programs) == len(route) and set(programs) == route
     assert set(loader.SEQUENCES) == expected
     with pytest.raises(ValueError, match="host sequence"):
@@ -593,6 +636,115 @@ def test_push_launch_rows_give_the_sm_103a_four_rank_512_row_calls_sixteen_wide_
             loader.push_launch(512, 2, world_size=4, arch=arch)
         with pytest.raises(ValueError, match="no SM push launch rows"):
             loader.push_launch_rows(arch)
+
+
+def test_push_kslices_table_lists_the_eight_rank_512_row_calls_at_four_slices_on_sm_103a():
+    """``PUSH_KSLICES_BY_ARCH`` (per-K-slice readiness on the SM push chain) lists one
+    row: on ``sm_103a`` the SM-push calls of world size 8 and exactly 512 padded rows
+    publish four readiness words per (peer, chunk) -- the host sequence launches their
+    ``_ks4`` push and main twins -- and every other call on either architecture
+    publishes one; the backend sizes a workspace by the widest call of its capacity
+    (the pitch's chunk count wherever the row is out of reach or narrower) and a
+    captured call clears ``world_size * num_chunks * k_slices`` words. An arch outside
+    the table raises."""
+
+    assert loader.PUSH_KSLICES_BY_ARCH == {"sm_100a": [], "sm_103a": [[8, 512, 4]]}
+    assert loader.push_kslice_rows("sm_103a") == ((8, 512, 4),)
+    assert loader.push_kslice_rows("sm_100a") == ()
+    assert loader.push_kslices(512, world_size=8, arch="sm_103a") == 4
+    assert loader.max_push_kslices(8, "sm_103a") == 4
+    for arch in _BOTH:
+        for world_size in (2, 4, 8):
+            for padded in (128, 256, 384, 512, 640, 1024, 2432, 65536):
+                listed = (arch, world_size, padded) == ("sm_103a", 8, 512)
+                assert loader.push_kslices(
+                    padded, world_size=world_size, arch=arch
+                ) == (4 if listed else 1)
+                chunks = loader.chunk_plan(padded)[2]
+                reached = (arch, world_size) == ("sm_103a", 8) and padded >= 512
+                assert loader.push_signal_slots(
+                    padded, world_size=world_size, arch=arch
+                ) == (max(chunks, 4) if reached else chunks)
+            if (arch, world_size) != ("sm_103a", 8):
+                assert loader.max_push_kslices(world_size, arch) == 1
+        assert backend._readiness_words(4, 512, arch) == 4 * loader.chunk_plan(512)[2]
+        assert (
+            backend._readiness_words(4, 65536, arch) == 4 * loader.chunk_plan(65536)[2]
+        )
+    assert backend._readiness_words(8, 512, "sm_100a") == 8
+    assert backend._readiness_words(8, 512, "sm_103a") == 32
+    for arch in ("sm_90a", "sm_120a", ""):
+        with pytest.raises(ValueError, match="no SM push readiness slice rows"):
+            loader.push_kslices(512, world_size=4, arch=arch)
+        with pytest.raises(ValueError, match="no SM push readiness slice rows"):
+            loader.push_kslice_rows(arch)
+        with pytest.raises(ValueError, match="no SM push readiness slice rows"):
+            loader.max_push_kslices(8, arch)
+        with pytest.raises(ValueError, match="no SM push readiness slice rows"):
+            loader.push_signal_slots(512, world_size=8, arch=arch)
+    with pytest.raises(ValueError, match="pitch must be positive"):
+        loader.push_signal_slots(0, world_size=8, arch="sm_103a")
+
+
+def test_push_signal_slots_size_the_readiness_pad_by_the_widest_call_of_the_capacity():
+    """With the ``sm_103a`` readiness slice row, a workspace is sized by the largest
+    words-per-rank-row count any call up to its pitch publishes: the row's chunk count
+    times its slice count once the pitch can serve the row, the pitch's own chunk count
+    wherever that is larger (a large workspace never grows past the one-word sizing) or
+    the row is out of reach; the other world sizes and the other architecture keep the
+    chunk count. ``_publish_scratch`` refuses a signal pad too small for the widened
+    view and sizes the generation's ticket counters by the same count."""
+
+    slots = loader.push_signal_slots
+    assert loader.max_push_kslices(8, "sm_103a") == 4
+    assert loader.max_push_kslices(4, "sm_103a") == 1
+    assert loader.max_push_kslices(8, "sm_100a") == 1
+    assert slots(128, world_size=8, arch="sm_103a") == 1
+    assert slots(384, world_size=8, arch="sm_103a") == 1
+    for pitch in (512, 640, 2048, 2432, 2560, 7296):
+        assert slots(pitch, world_size=8, arch="sm_103a") == 4, pitch
+    assert loader.chunk_plan(7296)[2] == 3 and loader.chunk_plan(7424)[2] == 4
+    assert slots(7424, world_size=8, arch="sm_103a") == 4
+    assert slots(9856, world_size=8, arch="sm_103a") == 5
+    assert loader.chunk_plan(65536)[2] == 27
+    assert slots(65536, world_size=8, arch="sm_103a") == 27
+    for pitch in (128, 512, 2048, 65536):
+        chunks = loader.chunk_plan(pitch)[2]
+        for world_size in (2, 4):
+            assert slots(pitch, world_size=world_size, arch="sm_103a") == chunks
+        assert slots(pitch, world_size=8, arch="sm_100a") == chunks
+    assert backend._readiness_words(8, 512, "sm_103a") == 32
+    assert backend._readiness_words(8, 512, "sm_100a") == 8
+    assert backend._readiness_words(8, 65536, "sm_103a") == 8 * 27
+    # Publication at 512 rows per peer on eight ranks: 32 words (128 bytes) must fit the pad.
+    call = backend._Call(0, 0, 8, "g", "bfloat16", "sm_103a", 512, 1280, "k_major")
+
+    class _PadHandle(_GrowthHandle):
+        def __init__(self, signal_pad_size):
+            self.signal_pad_size = signal_pad_size
+
+    workspace = _published_workspace(push_buffers=None)
+    workspace.world_size, workspace.arch = 8, "sm_103a"
+    scratch = torch.empty(8, 512, 8, dtype=torch.bfloat16)
+    backend._publish_scratch(workspace, call, 512, scratch, _PadHandle(2048))
+    assert workspace.max_chunks == 1 and workspace.signal_slots == 4
+    assert tuple(workspace.signal_pad.shape) == (32,)
+    workspace = _published_workspace(push_buffers=None)
+    workspace.world_size, workspace.arch = 8, "sm_103a"
+    with pytest.raises(RuntimeError, match="cannot hold 32 readiness words"):
+        backend._publish_scratch(workspace, call, 512, scratch, _PadHandle(64))
+    # The same pitch on the other architecture keeps the one-word view and never reads the pad size.
+    workspace = _published_workspace(push_buffers=None)
+    workspace.world_size = 8
+    backend._publish_scratch(
+        workspace,
+        backend._Call(0, 0, 8, "g", "bfloat16", "sm_100a", 512, 1280, "k_major"),
+        512,
+        scratch,
+        _GrowthHandle(),
+    )
+    assert workspace.max_chunks == 1 and workspace.signal_slots == 1
+    assert tuple(workspace.signal_pad.shape) == (8,)
 
 
 def test_main_programs_share_one_block_and_dynamic_shared_memory_contract():
@@ -876,6 +1028,25 @@ _INVENTORY_ROWS = (
         "tail_ws8_bf16_m125_n2048",
         (125, 2048, 8, "bfloat16", "n_major"),
         _N128,
+    ),
+    # The sm_103a-only ws8 512-row readiness-coverage rows: 32 / 64 N256 tiles
+    # (one wave on the twin too) route the two bf16 rows to the twin; the fp16
+    # n_major row (160 tiles, two waves) stays at 256, and its class has no
+    # delivered twin on sm_103a anyway.
+    (
+        "kmajor_ws8_bf16_m512_n256",
+        (512, 256, 8, "bfloat16", "k_major"),
+        {"sm_103a": 128},
+    ),
+    (
+        "tp8_correctness_bf16_m512_n512",
+        (512, 512, 8, "bfloat16", "n_major"),
+        {"sm_103a": 128},
+    ),
+    (
+        "tp8_correctness_fp16_m512_n1280",
+        (512, 1280, 8, "float16", "n_major"),
+        {"sm_103a": 256},
     ),
     # 320 N256 tiles = three waves: beyond the cap of both architectures.
     (
@@ -1406,8 +1577,9 @@ def test_n128_classes_are_exactly_the_classes_of_the_routed_inventory_rows():
             if widths.get(arch) == 128
         }
         assert _n128_classes(arch) == routed, arch
-    # Eight routed rows define five classes on sm_100a; the three one-wave rows
-    # define three on sm_103a (a subset of the sm_100a classes).
+    # Eight routed rows define five classes on sm_100a; the five one-wave rows
+    # (three M=125 rows, two ws8 512-row coverage rows) define three on sm_103a
+    # (a subset of the sm_100a classes).
     assert len(_n128_classes("sm_100a")) == 5
     assert len(_n128_classes("sm_103a")) == 3
     assert _n128_classes("sm_103a") < _n128_classes("sm_100a")
@@ -1905,7 +2077,12 @@ def test_captured_call_clears_only_its_readiness_words_with_a_stream_memset(
     )
     pad = torch.zeros(4 * 8, dtype=torch.uint32)
     workspace = backend._Workspace(
-        dtype=torch.bfloat16, rank=0, world_size=4, device_index=0, signal_pad=pad
+        dtype=torch.bfloat16,
+        rank=0,
+        world_size=4,
+        device_index=0,
+        arch="sm_100a",
+        signal_pad=pad,
     )
     backend._clear_readiness(workspace, 4 * 3)
     assert calls == [(pad, 0, 0, 12)]
@@ -1927,7 +2104,7 @@ def test_workspace_materializes_the_sm_push_tables_at_prepare_time():
     and only when that route is reachable for the prepared group."""
 
     workspace = backend._Workspace(
-        dtype=torch.bfloat16, rank=1, world_size=4, device_index=0
+        dtype=torch.bfloat16, rank=1, world_size=4, device_index=0, arch="sm_100a"
     )
     resolved = []
     workspace.push_tables = lambda: resolved.append(True)
@@ -1979,6 +2156,7 @@ def _published_workspace(push_buffers):
         rank=0,
         world_size=2,
         device_index=0,
+        arch="sm_100a",
     )
     workspace.pitch = 512
     workspace.scratch = torch.empty(2, 512, 8, dtype=torch.bfloat16)
@@ -2169,7 +2347,12 @@ def test_prepared_launcher_serves_every_row_count_up_to_its_capacity(monkeypatch
     call = backend._validate(sample, weight, _fake_group(8, 3))
     state = backend._LaunchState(rank=3, world_size=8)
     workspace = backend._Workspace(
-        dtype=torch.bfloat16, rank=3, world_size=8, device_index=0, pitch=2048
+        dtype=torch.bfloat16,
+        rank=3,
+        world_size=8,
+        device_index=0,
+        arch="sm_103a",
+        pitch=2048,
     )
     group = _fake_group(8, 3)
     launcher = backend._PreparedLauncher(
@@ -2205,7 +2388,12 @@ def test_prepared_launcher_serves_every_row_count_up_to_its_capacity(monkeypatch
 def test_launch_refuses_a_workspace_smaller_than_the_padded_rows():
     state = backend._LaunchState(rank=0, world_size=2)
     workspace = backend._Workspace(
-        dtype=torch.bfloat16, rank=0, world_size=2, device_index=0, pitch=128
+        dtype=torch.bfloat16,
+        rank=0,
+        world_size=2,
+        device_index=0,
+        arch="sm_100a",
+        pitch=128,
     )
     call = backend._Call(0, 0, 2, "g", "bfloat16", "sm_100a", 129, 2048, "n_major")
     with pytest.raises(
@@ -2280,6 +2468,7 @@ def _launch_fixture(
         rank=1,
         world_size=world_size,
         device_index=0,
+        arch=arch,
         pitch=max(2048, backend.loader.padded_rows(rows)),
     )
     # The launch reads the device facts once (the SM count bounds the grid);
@@ -2586,18 +2775,21 @@ def test_launch_passes_the_loader_tile_width_and_form_after_grid_z_on_both_route
 
 
 @pytest.mark.parametrize(
-    "rows, n, world_size, arch, entry, target_index",
+    "rows, n, world_size, arch, entry, target_index, k_slices",
     [
-        (1025, 2048, 4, "sm_100a", "run", 12),
-        (512, 1280, 8, "sm_103a", "run_push", 13),
+        (1025, 2048, 4, "sm_100a", "run", 12, 1),
+        (512, 1280, 8, "sm_103a", "run_push", 13, 4),
     ],
 )
 def test_captured_launch_publishes_the_sentinel_and_clears_its_words_on_both_routes(
-    monkeypatch, rows, n, world_size, arch, entry, target_index
+    monkeypatch, rows, n, world_size, arch, entry, target_index, k_slices
 ):
     """Under capture both routes pass the sentinel as ``ready_target``, leave the
     eager epoch untouched, skip ``record_stream`` and clear exactly the
-    ``world_size * num_chunks`` words the peers wrote, after the sequence."""
+    ``world_size * num_chunks * k_slices`` words the peers wrote (the readiness
+    slice table's count of the SM push call -- four words per (peer, chunk) on
+    the eight-rank 512-row call of ``sm_103a`` -- and one word per (peer, chunk)
+    off the table), after the sequence."""
 
     call, state, workspace, sequence = _launch_fixture(
         monkeypatch, rows=rows, n=n, world_size=world_size, arch=arch
@@ -2614,7 +2806,13 @@ def test_captured_launch_publishes_the_sentinel_and_clears_its_words_on_both_rou
     assert args[target_index] == backend._CAPTURE_READY_TARGET
     assert state.ready_epoch == 0
     assert inp.streams == []
-    assert cleared == [(workspace, world_size * backend.loader.chunk_plan(rows)[2])]
+    assert (
+        loader.push_kslices(loader.padded_rows(rows), world_size=world_size, arch=arch)
+        == k_slices
+    )
+    assert cleared == [
+        (workspace, world_size * backend.loader.chunk_plan(rows)[2] * k_slices)
+    ]
     assert state.next_phase == 1 and state.poisoned is False
     assert workspace.captured is True
 
