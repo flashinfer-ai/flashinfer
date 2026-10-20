@@ -3930,8 +3930,9 @@ class BatchDecodePagedTSWrapper:
         query_paired : bool, optional
             Run two consecutive grouped Keeps Q128 tiles of one request and KV
             head per CTA over one K/V stream (True) when the launch supports
-            it: a 16-bit head-dim-128 recipe without a sliding window, two Q
-            tiles in a request, and enough Q tiles to fill one wave of CTAs.
+            it: an FP16, BF16 or FP8 recipe with head dim 128 (64 or 128 for
+            FP8) and no sliding window, two Q tiles in a request, and enough Q
+            tiles to fill one wave of CTAs.
             Otherwise, and for ``None`` (default) and False, the plan runs
             unpaired; its policy records the outcome.
         validate : bool

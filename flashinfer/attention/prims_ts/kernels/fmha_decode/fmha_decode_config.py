@@ -4898,15 +4898,21 @@ def _validate_query_paired_config(cfg: FmhaDecodeConfig, split_kv_mode: str) -> 
         or cfg.tile_size_q != 128
         or cfg.tile_size_kv != 128
         or cfg.num_insts_kv != 2
-        or cfg.headdim != 128
+        or cfg.headdim not in (64, 128)
         or cfg.head_dim_per_stage_kv != 0
     ):
         raise ValueError(
-            "query_paired requires the grouped Keeps Q128/KV128 headdim-128 "
-            "profile with two instances"
+            "query_paired requires the grouped Keeps Q128/KV128 profile with "
+            "two instances and head dim 64 or 128"
         )
-    if not cfg._uses_contiguous_grouped_keeps_recipe:
-        raise ValueError("query_paired supports FP16, BF16 and Sage recipes")
+    if not (
+        cfg._uses_contiguous_grouped_keeps_recipe
+        or (
+            cfg.use_paged_kv
+            and cfg._grouped_keeps_profile_key in _GROUPED_KEEPS_PAGED_FP8_PROFILES
+        )
+    ):
+        raise ValueError("query_paired supports FP16, BF16, Sage and paged FP8 recipes")
     if (
         cfg.use_block_sparse
         or cfg.use_split_kv

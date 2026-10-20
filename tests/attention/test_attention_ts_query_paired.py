@@ -26,6 +26,7 @@ from tests.attention.test_attention_ts_block_sparse import (
     _REQUIRES_PRIMTS_GPU,
 )
 from tests.attention.test_attention_ts_decode import (
+    _FP8,
     _assert_case_correct,
     _exercise_public_paths,
     _make_decode_case,
@@ -229,8 +230,14 @@ class _PagedPairedCase:
     page_size: int = 32
     mask_type: str = "dense"
     dtype: torch.dtype = torch.bfloat16
+    output_dtype: torch.dtype | None = None
+    head_dim: int = _HEAD_DIM
     # Per-request Q lengths of a packed batch, cycled over the batch.
     q_lens: tuple[int, ...] | None = None
+
+    @property
+    def out_dtype(self) -> torch.dtype:
+        return self.dtype if self.output_dtype is None else self.output_dtype
 
     @property
     def kv_lens(self) -> tuple[int, ...]:
@@ -274,6 +281,52 @@ _PAGED_CASES = (
         mask_type="causal",
         q_lens=(64, 5, 33, 48, 17),
     ),
+    # Paged FP8 pairs at page size 32. Paired CTAs beyond one wave run on the
+    # persistent scheduler; eight requests keep them within one static wave.
+    _PagedPairedCase(
+        "fp8_group8_persistent", heads_q_per_kv=8, seq_len_q=48, dtype=_FP8
+    ),
+    _PagedPairedCase(
+        "fp8_group8_static_bf16_output",
+        heads_q_per_kv=8,
+        seq_len_q=48,
+        batch_size=8,
+        dtype=_FP8,
+        output_dtype=torch.bfloat16,
+    ),
+    _PagedPairedCase(
+        "fp8_group32_causal_fp16_output",
+        heads_q_per_kv=32,
+        seq_len_q=12,
+        mask_type="causal",
+        dtype=_FP8,
+        output_dtype=torch.float16,
+    ),
+    _PagedPairedCase(
+        "fp8_group128_causal",
+        heads_q_per_kv=128,
+        seq_len_q=5,
+        num_kv_heads=4,
+        mask_type="causal",
+        dtype=_FP8,
+    ),
+    _PagedPairedCase(
+        "fp8_head_dim64_causal",
+        heads_q_per_kv=8,
+        seq_len_q=48,
+        mask_type="causal",
+        dtype=_FP8,
+        head_dim=64,
+    ),
+    _PagedPairedCase(
+        "fp8_head_dim64_group128_bf16_output",
+        heads_q_per_kv=128,
+        seq_len_q=5,
+        num_kv_heads=4,
+        dtype=_FP8,
+        output_dtype=torch.bfloat16,
+        head_dim=64,
+    ),
 )
 
 
@@ -284,11 +337,11 @@ def _paged_decode_case(case: _PagedPairedCase):
         kv_lens=case.kv_lens,
         num_qo_heads=case.heads_q_per_kv * case.num_kv_heads,
         num_kv_heads=case.num_kv_heads,
-        head_dim=_HEAD_DIM,
+        head_dim=case.head_dim,
         seq_len_q=case.seq_len_q,
         page_size=case.page_size,
         qkv_dtype=case.dtype,
-        output_dtype=case.dtype,
+        output_dtype=case.out_dtype,
         cache_form="tuple",
         mask_type=case.mask_type,
         device="cuda",
@@ -359,12 +412,12 @@ def test_prepared_paged_query_paired_matches_wrapper() -> None:
             case.batch_size,
             case.heads_q_per_kv * case.num_kv_heads,
             case.num_kv_heads,
-            _HEAD_DIM,
+            case.head_dim,
             case.page_size,
             max_kv_len,
             seq_len_q=case.seq_len_q,
             q_dtype=case.dtype,
-            out_dtype=case.dtype,
+            out_dtype=case.out_dtype,
             mask_type=case.mask_type,
             device="cuda",
             query_paired=True,
@@ -382,7 +435,7 @@ def test_prepared_paged_query_paired_matches_wrapper() -> None:
         max_kv_len,
         out=out,
         seq_len_q=case.seq_len_q,
-        out_dtype=case.dtype,
+        out_dtype=case.out_dtype,
         mask_type=case.mask_type,
         page_size=case.page_size,
         query_paired=True,
@@ -441,6 +494,8 @@ def _paged_policy(query_paired: bool | None, **changes: object) -> dict[str, obj
         pytest.param(True, {"batch_size": 1, "num_kv_heads": 1}, id="small-grid"),
         pytest.param(True, {"window_left": 511}, id="sliding-window"),
         pytest.param(True, {"head_dim": 256}, id="head-dim-256"),
+        # Head dim 64 pairs only the paged FP8 recipe.
+        pytest.param(True, {"head_dim": 64}, id="bf16-head-dim-64"),
     ),
 )
 def test_paged_query_paired_plans_unpaired_when_unsupported(
