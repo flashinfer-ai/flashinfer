@@ -25,6 +25,9 @@
 // act [M, K] fp16/bf16, weight [N, K] fp8 e4m3, scale one fp32 value, bias [N] in act's
 // dtype, out [M, N] in act's dtype; everything contiguous, on one device, 16-byte aligned.
 // The workspace is a byte buffer of any dtype (the kernels take a void* and a byte count).
+// `out` and the workspace are written while the inputs are still being read (other tiles,
+// the split-K reduction), so neither may share bytes with act / weight / scale / bias, nor
+// with each other; the inputs may alias one another freely.
 
 #include <cstdint>
 
@@ -36,6 +39,24 @@
 #define W8A16_CHECK_ALIGNED(x)                                          \
   TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>((x).data_ptr()) % 16 == 0) \
       << #x " must start at a 16-byte aligned address (storage offset of a view)"
+
+// [begin, end) of the bytes a contiguous tensor covers (none for an empty one).
+struct W8A16ByteSpan {
+  uintptr_t begin = 0, end = 0;
+};
+inline W8A16ByteSpan W8A16SpanOf(const TensorView& t) {
+  W8A16ByteSpan s;
+  if (t.numel() == 0) return s;
+  s.begin = reinterpret_cast<uintptr_t>(t.data_ptr());
+  s.end = s.begin + static_cast<uintptr_t>(t.numel()) * (t.dtype().bits / 8);
+  return s;
+}
+inline void W8A16CheckDisjoint(const char* written, const W8A16ByteSpan& w, const char* read,
+                               const W8A16ByteSpan& r) {
+  TVM_FFI_ICHECK(w.begin >= w.end || r.begin >= r.end || w.begin >= r.end || r.begin >= w.end)
+      << written << " must not overlap " << read << " in memory (" << written
+      << " is written while " << read << " is still being read)";
+}
 
 // The validated operands of one call, as the kernels take them.
 struct W8A16Operands {
@@ -121,6 +142,21 @@ inline W8A16Operands W8A16CheckOperands(const TensorView& out, const TensorView&
     ops.workspace = wsv.data_ptr();
     ops.workspace_bytes = static_cast<size_t>(wsv.numel()) * (wsv.dtype().bits / 8);
   }
+  // Aliasing: the two buffers the call writes against everything it reads.
+  const W8A16ByteSpan out_span = W8A16SpanOf(out);
+  const W8A16ByteSpan ws_span =
+      workspace.has_value() ? W8A16SpanOf(workspace.value()) : W8A16ByteSpan{};
+  W8A16CheckDisjoint("out", out_span, "act", W8A16SpanOf(act));
+  W8A16CheckDisjoint("out", out_span, "weight", W8A16SpanOf(weight));
+  W8A16CheckDisjoint("out", out_span, "scale", W8A16SpanOf(scale));
+  W8A16CheckDisjoint("workspace", ws_span, "act", W8A16SpanOf(act));
+  W8A16CheckDisjoint("workspace", ws_span, "weight", W8A16SpanOf(weight));
+  W8A16CheckDisjoint("workspace", ws_span, "scale", W8A16SpanOf(scale));
+  W8A16CheckDisjoint("workspace", ws_span, "out", out_span);
+  if (bias.has_value()) {
+    W8A16CheckDisjoint("out", out_span, "bias", W8A16SpanOf(bias.value()));
+    W8A16CheckDisjoint("workspace", ws_span, "bias", W8A16SpanOf(bias.value()));
+  }
   ops.device_id = act.device().device_id;
   ops.num_sms = W8A16NumSms(ops.device_id);
   return ops;
@@ -138,6 +174,14 @@ inline void W8A16CheckPlan(cudaError_t status, int64_t algo, int first_code, int
       << "the split-K variant (algo " << algo << ") cannot slice K=" << K << ": " << slice_rule;
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "w8a16_fp8_gemm could not resolve a variant: " << cudaGetErrorString(status);
+}
+
+// Turns the status of W8A16Fp8GemmSm90WorkspaceBytes / W8A16Fp8GemmSm100WorkspaceBytes into
+// an error: the only failure is a byte count that leaves the signed 64-bit range the query
+// returns in (`splits` x M x N fp32 partials of a forced split-K at extreme dimensions).
+inline void W8A16CheckWorkspaceBytes(cudaError_t status, int64_t M, int64_t N, int splits) {
+  TVM_FFI_ICHECK(status == cudaSuccess) << "the workspace for M=" << M << ", N=" << N << " in "
+                                        << splits << " K-slices exceeds the 64-bit byte range";
 }
 
 #endif  // FLASHINFER_CSRC_W8A16_FP8_GEMM_CHECKS_H_

@@ -35,17 +35,17 @@ namespace flashinfer::gemm {
 // and, for 5 / 6, a decomposition).  Codes 8-13 belonged to variants that measured slower on
 // every row and were removed; never reuse them.
 enum class W8A16Sm100Algo {
-  kAuto = 0,
-  k2SM256x128 = 1,
-  k1SM128x128 = 2,
-  k2SM256x256 = 3,
-  k2SM256x192 = 4,
-  k2SM256x128SplitK = 5,
-  k2SM256x128StreamK = 6,
-  k2SM256x160 = 7,
+  Auto = 0,
+  TwoSM256x128 = 1,
+  OneSM128x128 = 2,
+  TwoSM256x256 = 3,
+  TwoSM256x192 = 4,
+  TwoSM256x128SplitK = 5,
+  TwoSM256x128StreamK = 6,
+  TwoSM256x160 = 7,
 };
-constexpr int kW8A16Sm100MaxAlgoCode = 7;
-constexpr int kW8A16Sm100MaxSplits = 8;
+constexpr int W8A16Sm100MaxAlgoCode = 7;
+constexpr int W8A16Sm100MaxSplits = 8;
 
 // Split count for the 256x128 2SM tile.  Two cases split:
 //   1. an under-filled grid, fewer cluster tiles than half the resident clusters: the
@@ -54,10 +54,11 @@ constexpr int kW8A16Sm100MaxSplits = 8;
 //   2. a long K (>= 100 k-tiles) whose partial last wave the split removes: the smallest
 //      split that keeps >= 50 k-tiles per slice and cuts the modelled mainloop (waves x
 //      k-tiles per slice) by at least 15%.
-// Short-K problems never split: the fp32 partials (one M x N write and read per slice)
-// cost more than the fill buys (5-25% slower at K <= 8192).  Every K-slice is a whole number
-// of 128-deep k-tiles (all batches share one slice length) and at most kW8A16Sm100MaxSplits
-// slices.  1 = do not split.
+// A filled grid with a short K does not split: the fp32 partials (one M x N write and read
+// per slice) cost more than the fill buys (5-25% slower at K <= 8192).  Case 1 does split a
+// short K (down to two k-tiles per slice) because there the idle clusters are free.  Every
+// K-slice is a whole number of 128-deep k-tiles (all batches share one slice length) and
+// at most W8A16Sm100MaxSplits slices.  1 = do not split.
 inline int W8A16Sm100SplitK(int M, int N, int K, int num_sms) {
   if (K % 128 != 0) return 1;
   const long long clusters = num_sms > 1 ? num_sms / 2 : 1;
@@ -65,7 +66,7 @@ inline int W8A16Sm100SplitK(int M, int N, int K, int num_sms) {
   const int ktiles = K / 128;
   if (units * 2 <= clusters) {
     int best = 1;
-    for (int s = 2; s <= kW8A16Sm100MaxSplits; ++s) {
+    for (int s = 2; s <= W8A16Sm100MaxSplits; ++s) {
       if (ktiles % s != 0 || ktiles / s < 2 || units * s > clusters) continue;
       best = s;
     }
@@ -73,7 +74,7 @@ inline int W8A16Sm100SplitK(int M, int N, int K, int num_sms) {
   }
   if (ktiles >= 100) {
     const long long waves1 = (units + clusters - 1) / clusters;
-    for (int s = 2; s <= kW8A16Sm100MaxSplits; ++s) {
+    for (int s = 2; s <= W8A16Sm100MaxSplits; ++s) {
       if (ktiles % s != 0 || ktiles / s < 50) continue;
       const long long waves = (units * s + clusters - 1) / clusters;
       if (waves * (ktiles / s) * 100 <= waves1 * ktiles * 85) return s;
@@ -85,13 +86,13 @@ inline int W8A16Sm100SplitK(int M, int N, int K, int num_sms) {
 // Split count actually used by the split-K variant: the model's choice, or, when the
 // variant is forced through `algo` on a grid the model would not split, the smallest
 // s >= 2 that divides the k-tile count.  0 = K cannot be split (not a multiple of 128, or
-// a k-tile count with no divisor in 2..kW8A16Sm100MaxSplits).
+// a k-tile count with no divisor in 2..W8A16Sm100MaxSplits).
 inline int W8A16Sm100SplitsFor(int M, int N, int K, int num_sms) {
   const int s = W8A16Sm100SplitK(M, N, K, num_sms);
   if (s >= 2) return s;
   const int ktiles = K / 128;
   if (K % 128 != 0 || ktiles < 2) return 0;
-  for (int c = 2; c <= kW8A16Sm100MaxSplits; ++c) {
+  for (int c = 2; c <= W8A16Sm100MaxSplits; ++c) {
     if (ktiles % c == 0) return c;
   }
   return 0;
@@ -122,11 +123,11 @@ inline W8A16Sm100Algo W8A16Sm100PickAlgo(int M, int N, int K, int num_sms) {
   // variant runs twice the MMA for the same bytes; the 1SM 128x128 tile has no padding
   // there (kernel / cuBLAS 1.00-1.01 vs 1.09-1.27 for the 2SM variants at large M).  Small
   // M on such a row stays with split-K below.
-  if (N <= 128 && M >= 16384) return W8A16Sm100Algo::k1SM128x128;
+  if (N <= 128 && M >= 16384) return W8A16Sm100Algo::OneSM128x128;
   // A mostly-empty last wave over deep tiles is balanced by stream-K.
-  if (W8A16Sm100UseStreamK(M, N, K, num_sms)) return W8A16Sm100Algo::k2SM256x128StreamK;
+  if (W8A16Sm100UseStreamK(M, N, K, num_sms)) return W8A16Sm100Algo::TwoSM256x128StreamK;
   // Under-filled grids and long-K partial waves split K instead of choosing between tiles.
-  if (W8A16Sm100SplitK(M, N, K, num_sms) > 1) return W8A16Sm100Algo::k2SM256x128SplitK;
+  if (W8A16Sm100SplitK(M, N, K, num_sms) > 1) return W8A16Sm100Algo::TwoSM256x128SplitK;
 
   // Wave-fill model over the three 2SM tile heights: waves x rows per tile / efficiency,
   // with the efficiency factors (128: 1.00, 160: 0.96, 192: 1.02) fitted on back-to-back
@@ -146,9 +147,9 @@ inline W8A16Sm100Algo W8A16Sm100PickAlgo(int M, int N, int K, int num_sms) {
   const double c128 = cost(128, 1.00);
   const double c160 = cost(160, 0.96);
   const double c192 = cost(192, 1.02);
-  if (c192 <= c128 && c192 <= c160) return W8A16Sm100Algo::k2SM256x192;
-  if (c160 < c128) return W8A16Sm100Algo::k2SM256x160;
-  return W8A16Sm100Algo::k2SM256x128;
+  if (c192 <= c128 && c192 <= c160) return W8A16Sm100Algo::TwoSM256x192;
+  if (c160 < c128) return W8A16Sm100Algo::TwoSM256x160;
+  return W8A16Sm100Algo::TwoSM256x128;
 }
 
 // What runs for one problem: the variant and, for the split-K variant, the slice count.
@@ -157,7 +158,7 @@ struct W8A16Sm100Plan {
   int splits;  // >= 2 for the split-K variant, 1 otherwise
 };
 
-// Resolves the caller's `algo` code (0 = the launcher's choice, 1..kW8A16Sm100MaxAlgoCode =
+// Resolves the caller's `algo` code (0 = the launcher's choice, 1..W8A16Sm100MaxAlgoCode =
 // that variant) and the problem to the plan both the workspace query and the launch use.
 //   cudaErrorInvalidValue: `algo_code` is not a variant.
 //   cudaErrorNotSupported: the split-K variant forced on a K that cannot be sliced (see
@@ -166,48 +167,49 @@ inline cudaError_t W8A16Sm100Resolve(int M, int N, int K, int num_sms, int64_t a
                                      W8A16Sm100Plan* plan) {
   if (algo_code == 0) {
     plan->algo = W8A16Sm100PickAlgo(M, N, K, num_sms);
-  } else if (algo_code >= 1 && algo_code <= kW8A16Sm100MaxAlgoCode) {
+  } else if (algo_code >= 1 && algo_code <= W8A16Sm100MaxAlgoCode) {
     plan->algo = static_cast<W8A16Sm100Algo>(algo_code);
   } else {
     return cudaErrorInvalidValue;
   }
   plan->splits = 1;
-  if (plan->algo == W8A16Sm100Algo::k2SM256x128SplitK) {
+  if (plan->algo == W8A16Sm100Algo::TwoSM256x128SplitK) {
     plan->splits = W8A16Sm100SplitsFor(M, N, K, num_sms);
     if (plan->splits < 2) return cudaErrorNotSupported;
   }
   return cudaSuccess;
 }
 
-// Workspace bytes of the plan's variant for this problem.
+// Workspace bytes of the plan's variant for this problem.  cudaErrorInvalidValue when the
+// size leaves the signed 64-bit range (see W8A16Sm100Gemm::WorkspaceBytes).
 template <typename T>
-size_t W8A16Fp8GemmSm100WorkspaceBytes(const W8A16Sm100Plan& plan, int M, int N, int K,
-                                       int device_id, int num_sms) {
+cudaError_t W8A16Fp8GemmSm100WorkspaceBytes(const W8A16Sm100Plan& plan, int M, int N, int K,
+                                            int device_id, int num_sms, size_t* bytes) {
   using D = W8A16Decomposition;
   switch (plan.algo) {
-    case W8A16Sm100Algo::k2SM256x128SplitK:
+    case W8A16Sm100Algo::TwoSM256x128SplitK:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128, D::SplitK>::WorkspaceBytes(
-          M, N, K, device_id, num_sms, plan.splits);
-    case W8A16Sm100Algo::k2SM256x128StreamK:
+          M, N, K, device_id, num_sms, plan.splits, bytes);
+    case W8A16Sm100Algo::TwoSM256x128StreamK:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128, D::StreamK>::WorkspaceBytes(
-          M, N, K, device_id, num_sms);
-    case W8A16Sm100Algo::k1SM128x128:
-      return W8A16Sm100Gemm<T, W8A16Sm100Cfg1SM128x128>::WorkspaceBytes(M, N, K, device_id,
-                                                                        num_sms);
-    case W8A16Sm100Algo::k2SM256x256:
-      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x256>::WorkspaceBytes(M, N, K, device_id,
-                                                                        num_sms);
-    case W8A16Sm100Algo::k2SM256x192:
-      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x192>::WorkspaceBytes(M, N, K, device_id,
-                                                                        num_sms);
-    case W8A16Sm100Algo::k2SM256x160:
-      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x160>::WorkspaceBytes(M, N, K, device_id,
-                                                                        num_sms);
-    case W8A16Sm100Algo::k2SM256x128:
-      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128>::WorkspaceBytes(M, N, K, device_id,
-                                                                        num_sms);
+          M, N, K, device_id, num_sms, 1, bytes);
+    case W8A16Sm100Algo::OneSM128x128:
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg1SM128x128>::WorkspaceBytes(M, N, K, device_id, num_sms,
+                                                                        1, bytes);
+    case W8A16Sm100Algo::TwoSM256x256:
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x256>::WorkspaceBytes(M, N, K, device_id, num_sms,
+                                                                        1, bytes);
+    case W8A16Sm100Algo::TwoSM256x192:
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x192>::WorkspaceBytes(M, N, K, device_id, num_sms,
+                                                                        1, bytes);
+    case W8A16Sm100Algo::TwoSM256x160:
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x160>::WorkspaceBytes(M, N, K, device_id, num_sms,
+                                                                        1, bytes);
+    case W8A16Sm100Algo::TwoSM256x128:
+      return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128>::WorkspaceBytes(M, N, K, device_id, num_sms,
+                                                                        1, bytes);
     default:
-      return 0;
+      return cudaErrorInvalidValue;
   }
 }
 
@@ -218,31 +220,31 @@ cudaError_t W8A16Fp8GemmSm100(const W8A16Sm100Plan& plan, const T* act, const __
                               cudaStream_t stream) {
   using D = W8A16Decomposition;
   switch (plan.algo) {
-    case W8A16Sm100Algo::k2SM256x128SplitK:
+    case W8A16Sm100Algo::TwoSM256x128SplitK:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128, D::SplitK>::Run(
           act, weight, scale, bias, out, M, N, K, workspace, workspace_bytes, device_id, num_sms,
           stream, plan.splits);
-    case W8A16Sm100Algo::k2SM256x128StreamK:
+    case W8A16Sm100Algo::TwoSM256x128StreamK:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128, D::StreamK>::Run(
           act, weight, scale, bias, out, M, N, K, workspace, workspace_bytes, device_id, num_sms,
           stream);
-    case W8A16Sm100Algo::k1SM128x128:
+    case W8A16Sm100Algo::OneSM128x128:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg1SM128x128>::Run(act, weight, scale, bias, out, M, N, K,
                                                              workspace, workspace_bytes, device_id,
                                                              num_sms, stream);
-    case W8A16Sm100Algo::k2SM256x256:
+    case W8A16Sm100Algo::TwoSM256x256:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x256>::Run(act, weight, scale, bias, out, M, N, K,
                                                              workspace, workspace_bytes, device_id,
                                                              num_sms, stream);
-    case W8A16Sm100Algo::k2SM256x192:
+    case W8A16Sm100Algo::TwoSM256x192:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x192>::Run(act, weight, scale, bias, out, M, N, K,
                                                              workspace, workspace_bytes, device_id,
                                                              num_sms, stream);
-    case W8A16Sm100Algo::k2SM256x160:
+    case W8A16Sm100Algo::TwoSM256x160:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x160>::Run(act, weight, scale, bias, out, M, N, K,
                                                              workspace, workspace_bytes, device_id,
                                                              num_sms, stream);
-    case W8A16Sm100Algo::k2SM256x128:
+    case W8A16Sm100Algo::TwoSM256x128:
       return W8A16Sm100Gemm<T, W8A16Sm100Cfg2SM256x128>::Run(act, weight, scale, bias, out, M, N, K,
                                                              workspace, workspace_bytes, device_id,
                                                              num_sms, stream);

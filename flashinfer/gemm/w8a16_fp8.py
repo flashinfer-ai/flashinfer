@@ -67,6 +67,28 @@ def _check_aligned(t: torch.Tensor, name: str) -> None:
         )
 
 
+def _byte_span(t: torch.Tensor) -> Optional[tuple]:
+    """``[begin, end)`` of the bytes a contiguous tensor covers; None when empty."""
+    if t.numel() == 0:
+        return None
+    begin = t.data_ptr()
+    return begin, begin + t.numel() * t.element_size()
+
+
+def _check_disjoint(
+    written_name: str, written: torch.Tensor, read_name: str, read: torch.Tensor
+) -> None:
+    """``written`` is overwritten while ``read`` is still being read, so the two
+    must not share a byte (checked on the contiguous spans; nothing here is a
+    strided view)."""
+    w, r = _byte_span(written), _byte_span(read)
+    if w is not None and r is not None and w[0] < r[1] and r[0] < w[1]:
+        raise ValueError(
+            f"{written_name} must not overlap {read_name} in memory ({written_name} "
+            f"is written while {read_name} is still being read)"
+        )
+
+
 def get_w8a16_fp8_gemm_module(
     device: Optional[torch.device] = None, act_dtype: torch.dtype = torch.bfloat16
 ):
@@ -287,10 +309,10 @@ def w8a16_fp8_gemm(
         few microseconds of host time).  A caller that wants a fixed memory
         budget sizes one buffer once and passes it to every call, under these
         rules: the call overwrites the buffer (nothing in it survives), it
-        must not overlap ``act`` / ``weight`` / ``bias`` / ``out``, and two
-        calls may share one buffer only if they are ordered on one stream or
-        synchronised, since a call still running on another stream would be
-        reading partials the next call overwrites.
+        must not share memory with any other argument (see the aliasing rule
+        under Notes), and two calls may share one buffer only if they are
+        ordered on one stream or synchronised, since a call still running on
+        another stream would be reading partials the next call overwrites.
     algo: Optional[str]
         Pins one kernel variant instead of the launcher's choice: a key of
         ``W8A16_FP8_GEMM_ALGOS_SM100`` on Blackwell or of
@@ -319,7 +341,13 @@ def w8a16_fp8_gemm(
     empty output without launching.
     Nothing is copied on the caller's behalf: a non-contiguous ``act`` or
     ``out`` is rejected (call ``.contiguous()`` yourself if a copy is
-    acceptable).  On Hopper the launcher picks a CUTLASS tile and
+    acceptable).  Aliasing: the two buffers the call writes, ``out`` and
+    ``workspace``, must not share any bytes with ``act`` / ``weight`` /
+    ``weight_scale`` / ``bias`` or with each other (tiles still reading an
+    input would see it overwritten; the split-K reduction reads the scale after
+    the partials are written), and a call whose buffers overlap is rejected
+    with a ValueError.  The inputs may alias one another freely (they are only
+    read).  On Hopper the launcher picks a CUTLASS tile and
     decomposition (plain, stream-K or split-K) from a cost model; split-K and
     stream-K runs go through scratch memory (``workspace``, or a buffer this
     function allocates).  On Blackwell it picks from the same kind of model
@@ -396,6 +424,17 @@ def w8a16_fp8_gemm(
     _check_aligned(weight, "weight")
     if bias is not None:
         _check_aligned(bias, "bias")
+    # Aliasing: the two buffers the call writes against everything it reads (and each
+    # other).  Inputs may alias one another; the empty act / out of an M == 0 call
+    # cover no bytes and so overlap nothing.
+    reads = [("act", act), ("weight", weight), ("weight_scale", weight_scale)]
+    if bias is not None:
+        reads.append(("bias", bias))
+    for name, t in reads:
+        _check_disjoint("out", out, name, t)
+    if workspace is not None:
+        for name, t in reads + [("out", out)]:
+            _check_disjoint("workspace", workspace, name, t)
     if m == 0:
         # Nothing to compute; the tile schedulers would divide by zero tiles.
         # Everything above applies to the empty call too; only act and out are

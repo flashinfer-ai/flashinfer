@@ -82,7 +82,7 @@ def gen_w8a16_fp8_gemm_sm100_module(
         _gen_sources(
             uri,
             act_dtype,
-            ["w8a16_fp8_gemm_sm100.cu", "w8a16_fp8_gemm_sm100_jit_binding.cu"],
+            ["w8a16_fp8_gemm_sm100.cu", "w8a16_fp8_gemm_jit_binding.cu"],
         ),
         extra_cuda_cflags=nvcc_flags
         + ["-DENABLE_BF16", "-DENABLE_FP8", "-DCUTLASS_ENABLE_GDC_FOR_SM100=1"],

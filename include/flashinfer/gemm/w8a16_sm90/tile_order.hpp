@@ -18,8 +18,8 @@
 
 // Tile walk order of the Hopper persistent schedulers: which operand's tiles consecutive
 // CTAs take, and how many tiles are grouped so that the operand slab they share stays in L2.
-// Pure functions of the problem shape; the measurements behind each rule are in
-// benchmarks/w8a16_fp8_gemm_ladder.md.
+// Pure functions of the problem shape; each rule was measured on the Cosmos3-Super shapes
+// with benchmarks/bench_w8a16_fp8_gemm.py (H100 / H200).
 
 #include "cutlass/gemm/kernel/tile_scheduler.hpp"
 #include "flashinfer/gemm/w8a16_common.hpp"
@@ -31,7 +31,7 @@ namespace flashinfer::gemm {
 // tiles of one weight tile) whenever there are at least as many weight tiles as activation
 // tiles (N >= M/2), and for this operand layout that is 2x slower once the activation
 // outgrows L2; "m" is never worse than the heuristic on the benchmark grid.
-inline constexpr cutlass::gemm::kernel::detail::RasterOrderOptions kW8A16Sm90Raster =
+inline constexpr cutlass::gemm::kernel::detail::RasterOrderOptions W8A16Sm90Raster =
     cutlass::gemm::kernel::detail::RasterOrderOptions::AlongM;
 
 // L2 tile-group size handed to CUTLASS's own schedulers (the stream-K variants and any
@@ -42,7 +42,7 @@ inline constexpr cutlass::gemm::kernel::detail::RasterOrderOptions kW8A16Sm90Ras
 // group buys nothing on top, so it is off; the plain persistent variants get their L2
 // grouping from W8A16Sm90GroupedTileScheduler instead, which does not pad
 // (W8A16Sm90PickGroup below).
-inline constexpr int kW8A16Sm90CutlassSwizzle = 1;
+inline constexpr int W8A16Sm90CutlassSwizzle = 1;
 
 // L2 group of the grouped scheduler.  Ungrouped, the 132 CTAs in flight cover about one
 // activation tile and every activation tile re-reads the whole weight; that only matters

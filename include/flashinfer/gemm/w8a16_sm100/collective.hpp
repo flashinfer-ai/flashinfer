@@ -449,7 +449,7 @@ public:
     // L2 eviction priority of the A (weight) and B (activation) TMA loads
     // (cute::TMA::CacheHintSm100 values).  FlashInfer addition: the weight is re-read once
     // per activation tile, the activation once per weight tile; the launcher passes the
-    // constants of tile_order.hpp (kW8A16Sm100WeightCacheHint / kW8A16Sm100ActCacheHint).
+    // constants of tile_order.hpp (W8A16Sm100WeightCacheHint / W8A16Sm100ActCacheHint).
     uint64_t cache_hint_a{static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL)};
     uint64_t cache_hint_b{static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL)};
   };
@@ -1036,10 +1036,10 @@ public:
     // k-block mode (TMEM-A path: ((Copy,#Copy),MMA_Rest,MMA_M_Rest,MMA_K_Rest) with
     // MMA_K_Rest = 8 for a 128-wide k-tile) when it divides evenly, otherwise the
     // chunk mode 1 (smem-A path: ((1,8),8,1,1), K_Rest = 1).
-    constexpr bool kSplitOnK = (K_BLOCK_MAX % NumTransformationGroups == 0);
-    constexpr int kSplitExtent = kSplitOnK ? K_BLOCK_MAX : size<1>(tArA);
-    static_assert(kSplitExtent % NumTransformationGroups == 0, "fragment splits evenly across the transform warpgroups");
-    constexpr int kPerGroup = kSplitExtent / NumTransformationGroups;
+    constexpr bool SplitOnK = (K_BLOCK_MAX % NumTransformationGroups == 0);
+    constexpr int SplitExtent = SplitOnK ? K_BLOCK_MAX : size<1>(tArA);
+    static_assert(SplitExtent % NumTransformationGroups == 0, "fragment splits evenly across the transform warpgroups");
+    constexpr int PerGroup = SplitExtent / NumTransformationGroups;
     static_assert(KernelConversionMode == ConversionMode::DirectConvert,
                   "the split transform only carries the no-scale path (scales are per-k-block tensors)");
 
@@ -1066,12 +1066,12 @@ public:
       auto curr_transform2mma_pipeline_producer_state = transform2mma_pipeline_producer_state;
 
       auto transform_half = [&](auto group) {
-        constexpr int kFirst = decltype(group)::value * kPerGroup;
-        if constexpr (kSplitOnK) {
+        constexpr int FirstKBlock = decltype(group)::value * PerGroup;
+        if constexpr (SplitOnK) {
           // Copy this warpgroup's k-blocks of the input A matrix from SMEM
           CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < kPerGroup; ++i) {
-            copy(AutoVectorizingCopy{}, tAsA(_,_,_,kFirst + i,load2transform_consumer_index), tArA(_,_,_,kFirst + i));
+          for (int i = 0; i < PerGroup; ++i) {
+            copy(AutoVectorizingCopy{}, tAsA(_,_,_,FirstKBlock + i,load2transform_consumer_index), tArA(_,_,_,FirstKBlock + i));
           }
 
           // Loads from SMEM are done (all transform warps). Signal the mainloop load as early as possible
@@ -1080,33 +1080,33 @@ public:
 
           // Dequantize this warpgroup's k-blocks in RF and store them into Smem or Tmem
           CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < kPerGroup; ++i) {
-            Utils::dequantize_A_kblock_for_transform(tArA, tArACompute, partitioned_extra_info, kFirst + i);
-            copy(dst_copy_A, tArACompute(_,_,_,kFirst + i), tAsACompute(_,_,_,kFirst + i,transform2mma_producer_index));
+          for (int i = 0; i < PerGroup; ++i) {
+            Utils::dequantize_A_kblock_for_transform(tArA, tArACompute, partitioned_extra_info, FirstKBlock + i);
+            copy(dst_copy_A, tArACompute(_,_,_,FirstKBlock + i), tAsACompute(_,_,_,FirstKBlock + i,transform2mma_producer_index));
           }
         }
         else {
           // Split along the chunk mode; each chunk still carries the (unit) k-block mode,
           // re-expressed as a rank-4 view so the converter's k_block indexing applies.
           CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < kPerGroup; ++i) {
-            copy(AutoVectorizingCopy{}, tAsA(_,kFirst + i,_,_,load2transform_consumer_index), tArA(_,kFirst + i,_,_));
+          for (int i = 0; i < PerGroup; ++i) {
+            copy(AutoVectorizingCopy{}, tAsA(_,FirstKBlock + i,_,_,load2transform_consumer_index), tArA(_,FirstKBlock + i,_,_));
           }
 
           transform_bar.sync();
           load2transform_pipeline.consumer_release(curr_load2transform_pipeline_consumer_state);
 
           CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < kPerGroup; ++i) {
-            auto src_chunk = tArA(_,kFirst + i,_,_);
-            auto dst_chunk = tArACompute(_,kFirst + i,_,_);
+          for (int i = 0; i < PerGroup; ++i) {
+            auto src_chunk = tArA(_,FirstKBlock + i,_,_);
+            auto dst_chunk = tArACompute(_,FirstKBlock + i,_,_);
             auto src4 = make_tensor(src_chunk.data(), make_layout(append(src_chunk.shape(), _1{}), append(src_chunk.stride(), _0{})));
             auto dst4 = make_tensor(dst_chunk.data(), make_layout(append(dst_chunk.shape(), _1{}), append(dst_chunk.stride(), _0{})));
             CUTLASS_PRAGMA_UNROLL
             for (int k_block = 0; k_block < K_BLOCK_MAX; ++k_block) {
               Utils::dequantize_A_kblock_for_transform(src4, dst4, partitioned_extra_info, k_block);
             }
-            copy(dst_copy_A, tArACompute(_,kFirst + i,_,_), tAsACompute(_,kFirst + i,_,_,transform2mma_producer_index));
+            copy(dst_copy_A, tArACompute(_,FirstKBlock + i,_,_), tAsACompute(_,FirstKBlock + i,_,_,transform2mma_producer_index));
           }
         }
       };

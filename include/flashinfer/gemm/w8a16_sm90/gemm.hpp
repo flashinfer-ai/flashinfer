@@ -144,26 +144,26 @@ struct W8A16Sm90Gemm {
   using LayoutB = cutlass::layout::ColumnMajor;
   // D [M', N'] column-major == out[M, N] row-major.
   using LayoutD = cutlass::layout::ColumnMajor;
-  static constexpr int kAlignA = 128 / cutlass::sizeof_bits<ElementW>::value;    // 16
-  static constexpr int kAlignB = 128 / cutlass::sizeof_bits<ElementAct>::value;  // 8
-  static constexpr int kAlignD = 128 / cutlass::sizeof_bits<ElementD>::value;    // 8
+  static constexpr int AlignA = 128 / cutlass::sizeof_bits<ElementW>::value;    // 16
+  static constexpr int AlignB = 128 / cutlass::sizeof_bits<ElementAct>::value;  // 8
+  static constexpr int AlignD = 128 / cutlass::sizeof_bits<ElementD>::value;    // 8
 
   // D = alpha * acc + bias[row]; alpha is the per-tensor weight scale, bias is per M' (= N).
   // Split-K partials: D = acc (fp32); scale and bias are applied in the reduce.
   using FusionOp = std::conditional_t<
       IsSplitK, cutlass::epilogue::fusion::LinearCombination<float, float, void, float>,
       cutlass::epilogue::fusion::LinCombPerRowBias<ElementD, ElementCompute, ElementBias, ElementD,
-                                                   float, kAlignD>>;
+                                                   float, AlignD>>;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, typename Cfg::TileShape,
       typename Cfg::ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto,
-      ElementAccumulator, ElementCompute, void, LayoutD, kAlignD, ElementD, LayoutD, kAlignD,
+      ElementAccumulator, ElementCompute, void, LayoutD, AlignD, ElementD, LayoutD, AlignD,
       typename Cfg::EpilogueSchedule, FusionOp>::CollectiveOp;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-      cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, cute::tuple<ElementW>, LayoutA, kAlignA,
-      ElementAct, LayoutB, kAlignB, ElementAccumulator, typename Cfg::TileShape,
+      cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, cute::tuple<ElementW>, LayoutA, AlignA,
+      ElementAct, LayoutB, AlignB, ElementAccumulator, typename Cfg::TileShape,
       typename Cfg::ClusterShape,
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
           sizeof(typename CollectiveEpilogue::SharedStorage))>,
@@ -228,8 +228,8 @@ struct W8A16Sm90Gemm {
     // its L2 group size through max_swizzle_size, CUTLASS's own schedulers get 1 (no
     // grouping, no padding).
     args.scheduler.max_swizzle_size =
-        IsGrouped ? W8A16Sm90PickGroup(M, N, K, Cfg::W) : kW8A16Sm90CutlassSwizzle;
-    args.scheduler.raster_order = kW8A16Sm90Raster;
+        IsGrouped ? W8A16Sm90PickGroup(M, N, K, Cfg::W) : W8A16Sm90CutlassSwizzle;
+    args.scheduler.raster_order = W8A16Sm90Raster;
     if constexpr (IsStreamK) {
       // CUTLASS's heuristic decomposition (data-parallel full waves, stream-K tail) with
       // the deterministic (K-ordered) peer reduction; the other modes never measured
@@ -241,16 +241,26 @@ struct W8A16Sm90Gemm {
     return args;
   }
 
-  static size_t PartialsBytes(int M, int N, int splits) {
-    return IsSplitK && splits > 1 ? static_cast<size_t>(splits) * M * N * sizeof(float) : 0;
-  }
-
   // CUTLASS workspace (persistent scheduler: usually 0; stream-K: the peers' fp32
-  // partials plus per-tile barriers), rounded to 256 B, then the split-K fp32 partials.
-  static size_t WorkspaceBytes(int M, int N, int K, int device_id, int num_sms, int splits = 1) {
+  // partials plus per-tile barriers), rounded to 256 B, then the split-K fp32 partials
+  // (`splits` x M x N floats).  cudaErrorInvalidValue when the total leaves the signed
+  // 64-bit range the workspace query reports in (checked arithmetic: the admitted
+  // dimensions reach INT32_MAX each); `*bytes` is left untouched then.
+  static cudaError_t WorkspaceBytes(int M, int N, int K, int device_id, int num_sms, int splits,
+                                    size_t* bytes) {
     auto args = MakeArguments(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, device_id,
                               num_sms, splits);
-    return W8A16Align256(Gemm::get_workspace_size(args)) + PartialsBytes(M, N, splits);
+    uint64_t total = W8A16Align256(Gemm::get_workspace_size(args));
+    if (IsSplitK && splits > 1) {
+      uint64_t partials = static_cast<uint64_t>(splits) * sizeof(float);
+      if (!W8A16CheckedMul(partials, static_cast<uint64_t>(M), &partials) ||
+          !W8A16CheckedMul(partials, static_cast<uint64_t>(N), &partials) ||
+          !W8A16CheckedAdd(total, partials, &total)) {
+        return cudaErrorInvalidValue;
+      }
+    }
+    *bytes = static_cast<size_t>(total);
+    return cudaSuccess;
   }
 
   static cudaError_t Run(const T* act, const __nv_fp8_e4m3* weight, const float* scale,
@@ -263,7 +273,11 @@ struct W8A16Sm90Gemm {
       auto probe = MakeArguments(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, device_id,
                                  num_sms, splits);
       const size_t cutlass_ws = W8A16Align256(Gemm::get_workspace_size(probe));
-      if (cutlass_ws + PartialsBytes(M, N, splits) > workspace_bytes) return cudaErrorInvalidValue;
+      size_t need = 0;
+      if (WorkspaceBytes(M, N, K, device_id, num_sms, splits, &need) != cudaSuccess ||
+          need > workspace_bytes) {
+        return cudaErrorInvalidValue;
+      }
       d_out = static_cast<char*>(workspace) + cutlass_ws;
     }
     auto args = MakeArguments(act, weight, scale, bias, d_out, M, N, K, device_id, num_sms, splits);

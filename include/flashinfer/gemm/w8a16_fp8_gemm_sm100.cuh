@@ -18,7 +18,7 @@
 
 // W8A16 GEMM for Blackwell (sm_100a): FlashInfer's fork of CUTLASS's mixed-input kernel
 // with two transform warpgroups and a menu of tiles, picked per problem by a wave-fill cost
-// model (measurements in benchmarks/w8a16_fp8_gemm_ladder.md).
+// model fitted to measurements on the Cosmos3-Super shapes (benchmarks/bench_w8a16_fp8_gemm.py).
 //
 //   out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
 //

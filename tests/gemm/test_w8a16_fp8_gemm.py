@@ -191,6 +191,112 @@ def test_w8a16_fp8_gemm_workspace_bytes_extreme_dims():
         w8a16_fp8_gemm_workspace_bytes(big + 1, 8, 16, dev)
 
 
+def test_w8a16_fp8_gemm_workspace_bytes_splitk_overflow():
+    """A forced split-K at extreme dimensions asks for `splits x M x N` fp32 partials,
+    which leaves the signed 64-bit range the query returns in (M = N ~ 2^31 gives 2^65
+    bytes before the split count); the query must say so instead of wrapping around
+    and reporting a small number.  Smaller dimensions still report the exact size."""
+    dev = torch.device("cuda")
+    major = get_compute_capability(dev)[0]
+    algo = {9: "128x128_splitk", 10: "2sm256x128_splitk"}[major]
+    big = 2**31 - 1
+    with pytest.raises(Exception, match="exceeds the 64-bit byte range"):
+        w8a16_fp8_gemm_workspace_bytes(big, 2**31 - 8, 1024, dev, algo)
+    with pytest.raises(Exception, match="exceeds the 64-bit byte range"):
+        w8a16_fp8_gemm_workspace_bytes(2**30, 2**30, 1024, dev, algo)
+    # 2 slices x 2^20 x 2^20 floats = 8 GiB: fits the range, so it is reported exactly
+    # (plus the CUTLASS scheduler workspace, if any), even though no one would allocate it.
+    assert w8a16_fp8_gemm_workspace_bytes(2**20, 2**20, 1024, dev, algo) >= 8 * 2**30
+    # The launcher's own choice at the extreme dimensions never picks a split it cannot
+    # size (the Hopper cost model's partials cap is evaluated without overflowing).
+    assert w8a16_fp8_gemm_workspace_bytes(big, 2**31 - 8, 1024, dev) >= 0
+
+
+def test_w8a16_fp8_gemm_rejects_aliasing():
+    """The two buffers a call writes (out, workspace) must not share bytes with anything
+    it reads, or with each other; inputs may alias one another.  Checked before launch,
+    including on an empty call."""
+    torch.manual_seed(0)
+    dev = torch.device("cuda")
+    major = get_compute_capability(dev)[0]
+    algo = {9: "128x128_splitk", 10: "2sm256x128_splitk"}[major]
+    m, n, k = 256, 1024, 5120
+    act = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
+    w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
+    ref = w8a16_fp8_gemm(act, w_fp8, scale, algo=algo)
+    need = w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo)
+    assert need > 0
+
+    # out aliasing an input: a square problem lets out = act pass every shape check,
+    # as does a window of the same storage that only partly covers act.
+    sq = torch.randn(1536, 1024, device=dev, dtype=torch.bfloat16)
+    w_sq, s_sq = _quantize(torch.randn(1024, 1024, device=dev) * 0.02)
+    with pytest.raises(ValueError, match="out must not overlap act"):
+        w8a16_fp8_gemm(sq[:1024], w_sq, s_sq, out=sq[:1024])
+    with pytest.raises(ValueError, match="out must not overlap act"):
+        w8a16_fp8_gemm(sq[:1024], w_sq, s_sq, out=sq[512:])
+    out_buf = torch.empty(m, n, device=dev, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="out must not overlap bias"):
+        w8a16_fp8_gemm(act, w_fp8, scale, bias=out_buf[0], out=out_buf)
+
+    # workspace aliasing the scale: the split-K reduction reads the scale after the
+    # partials have been written over it.
+    ws_f32 = torch.empty(need // 4 + 4, device=dev, dtype=torch.float32)
+    ws_f32[0] = scale[0]
+    with pytest.raises(ValueError, match="workspace must not overlap weight_scale"):
+        w8a16_fp8_gemm(act, w_fp8, ws_f32[:1], algo=algo, workspace=ws_f32)
+    # workspace containing out / weight / act / bias.
+    buf = torch.empty(
+        need + max(m * n * 2, m * k * 2, n * k) + 4096, device=dev, dtype=torch.uint8
+    )
+    out_in_buf = buf[: m * n * 2].view(torch.bfloat16).view(m, n)
+    with pytest.raises(ValueError, match="workspace must not overlap out"):
+        w8a16_fp8_gemm(act, w_fp8, scale, algo=algo, out=out_in_buf, workspace=buf)
+    with pytest.raises(ValueError, match="workspace must not overlap weight"):
+        w8a16_fp8_gemm(
+            act,
+            buf[: n * k].view(torch.float8_e4m3fn).view(n, k),
+            scale,
+            algo=algo,
+            workspace=buf,
+        )
+    with pytest.raises(ValueError, match="workspace must not overlap act"):
+        w8a16_fp8_gemm(
+            buf[: m * k * 2].view(torch.bfloat16).view(m, k),
+            w_fp8,
+            scale,
+            algo=algo,
+            workspace=buf,
+        )
+    with pytest.raises(ValueError, match="workspace must not overlap bias"):
+        w8a16_fp8_gemm(
+            act,
+            w_fp8,
+            scale,
+            bias=buf[: n * 2].view(torch.bfloat16),
+            algo=algo,
+            workspace=buf,
+        )
+    # The empty call checks the same rule for the buffers that do have bytes.
+    with pytest.raises(ValueError, match="workspace must not overlap weight_scale"):
+        w8a16_fp8_gemm(act[:0], w_fp8, ws_f32[:1], algo=algo, workspace=ws_f32)
+
+    # Inputs may alias one another (bias as a row of act), and a workspace that merely
+    # sits next to out in one allocation is fine.
+    bias = act[0, :n]  # contiguous row slice, 16-byte aligned
+    assert torch.equal(
+        w8a16_fp8_gemm(act, w_fp8, scale, bias=bias, algo=algo),
+        w8a16_fp8_gemm(act, w_fp8, scale, bias=bias.clone(), algo=algo),
+    )
+    ws_after = buf[m * n * 2 :]
+    assert torch.equal(
+        w8a16_fp8_gemm(
+            act, w_fp8, scale, algo=algo, out=out_in_buf, workspace=ws_after
+        ),
+        ref,
+    )
+
+
 def test_w8a16_fp8_gemm_rejects_bad_inputs():
     dev = torch.device("cuda")
     act = torch.randn(4, 64, device=dev, dtype=torch.bfloat16)

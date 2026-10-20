@@ -41,7 +41,7 @@ void w8a16_fp8_gemm(TensorView out, TensorView act, TensorView weight, TensorVie
       W8A16CheckOperands(out, act, weight, scale, bias, workspace, W8A16_ACT_DTYPE_CODE);
   gemm::W8A16Sm100Plan plan;
   W8A16CheckPlan(gemm::W8A16Sm100Resolve(ops.M, ops.N, ops.K, ops.num_sms, algo, &plan), algo,
-                 FirstAlgoCode, gemm::kW8A16Sm100MaxAlgoCode, ops.K, SliceRule);
+                 FirstAlgoCode, gemm::W8A16Sm100MaxAlgoCode, ops.K, SliceRule);
 
   ffi::CUDADeviceGuard device_guard(ops.device_id);
   const cudaStream_t stream = get_stream(act.device());
@@ -65,10 +65,13 @@ int64_t w8a16_fp8_gemm_workspace_bytes(int64_t M, int64_t N, int64_t K, int64_t 
   gemm::W8A16Sm100Plan plan;
   W8A16CheckPlan(gemm::W8A16Sm100Resolve(static_cast<int>(M), static_cast<int>(N),
                                          static_cast<int>(K), num_sms, algo, &plan),
-                 algo, FirstAlgoCode, gemm::kW8A16Sm100MaxAlgoCode, K, SliceRule);
+                 algo, FirstAlgoCode, gemm::W8A16Sm100MaxAlgoCode, K, SliceRule);
   // Both activation dtypes share the mainloop / epilogue layout, so the answer is the same
   // from either dtype's module.
-  return static_cast<int64_t>(gemm::W8A16Fp8GemmSm100WorkspaceBytes<W8A16ActType>(
-      plan, static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-      static_cast<int>(device_id), num_sms));
+  size_t bytes = 0;
+  W8A16CheckWorkspaceBytes(gemm::W8A16Fp8GemmSm100WorkspaceBytes<W8A16ActType>(
+                               plan, static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                               static_cast<int>(device_id), num_sms, &bytes),
+                           M, N, plan.splits);
+  return static_cast<int64_t>(bytes);
 }

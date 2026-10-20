@@ -17,7 +17,8 @@
 #define FLASHINFER_GEMM_W8A16_SM100_TILE_ORDER_HPP_
 
 // Tile walk order and TMA cache hints of the Blackwell W8A16 kernels.  Pure functions of the
-// problem shape; the measurements behind each rule are in benchmarks/w8a16_fp8_gemm_ladder.md.
+// problem shape; each rule was measured on the Cosmos3-Super shapes with
+// benchmarks/bench_w8a16_fp8_gemm.py (B200).
 
 #include <cstdint>
 
@@ -29,15 +30,15 @@ namespace flashinfer::gemm {
 
 // Which axis consecutive clusters walk fastest: CUTLASS's heuristic.  Forcing "m" (weight
 // tiles fastest) or "n" never beat it on the benchmark grid.
-inline constexpr cutlass::gemm::kernel::detail::RasterOrderOptions kW8A16Sm100Raster =
+inline constexpr cutlass::gemm::kernel::detail::RasterOrderOptions W8A16Sm100Raster =
     cutlass::gemm::kernel::detail::RasterOrderOptions::Heuristic;
 
 // L2 eviction priority of the weight (A) and activation (B) TMA loads: normal for both.
 // Evict-last on the weight and evict-first on the activation did not move the time on the
 // rows whose weight fits L2 but is evicted by the activation stream.
-inline constexpr uint64_t kW8A16Sm100WeightCacheHint =
+inline constexpr uint64_t W8A16Sm100WeightCacheHint =
     static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL);
-inline constexpr uint64_t kW8A16Sm100ActCacheHint =
+inline constexpr uint64_t W8A16Sm100ActCacheHint =
     static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL);
 
 // L2 tile group (CUTLASS's max_swizzle_size).  With a group S the in-flight clusters cover
@@ -54,8 +55,8 @@ inline constexpr uint64_t kW8A16Sm100ActCacheHint =
 // remapped), so no padding guard is needed.
 inline int W8A16Sm100PickSwizzle(int M, int N, int K) {
   const long long weight_bytes = static_cast<long long>(N) * K;  // e4m3: one byte each
-  constexpr long long kHalfL2 = 64ll << 20;
-  if (weight_bytes < kHalfL2 || M < 4096) return 0;
+  constexpr long long HalfL2 = 64ll << 20;
+  if (weight_bytes < HalfL2 || M < 4096) return 0;
   const long long band_bytes = 24ll << 20;
   const long long s = (band_bytes + 128ll * K) / (256ll * K);
   return static_cast<int>(s < 2 ? 2 : s > 16 ? 16 : s);

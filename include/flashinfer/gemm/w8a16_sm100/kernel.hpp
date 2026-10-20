@@ -126,7 +126,7 @@ public:
   static constexpr uint32_t NumEpilogueLoadThreads    = NumThreadsPerWarp;                             // 1 warp
   static constexpr uint32_t NumEpilogueThreads        = CollectiveMainloop::NumAccumThreads;           // 4 warps
   static constexpr uint32_t NumEpilogueWarps          = NumEpilogueThreads / NumThreadsPerWarp;
-  static constexpr uint32_t NumTransformationThreads  = CollectiveMainloop::NumTransformationThreads;  // 4 warps
+  static constexpr uint32_t NumTransformationThreads  = CollectiveMainloop::NumTransformationThreads;  // 8 warps (two transform warpgroups)
   static constexpr uint32_t NumMainloopLoadBThreads   = NumThreadsPerWarp;                            // 1 warp
 
   static constexpr uint32_t MaxThreadsPerBlock = NumSchedThreads +

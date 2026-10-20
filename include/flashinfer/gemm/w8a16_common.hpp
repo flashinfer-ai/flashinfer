@@ -59,6 +59,22 @@ inline long long W8A16Tiles(long long dim, long long tile) { return (dim + tile 
 // CUTLASS workspace sizes are rounded up to 256 bytes before the split-K partials follow.
 inline size_t W8A16Align256(size_t bytes) { return (bytes + 255) / 256 * 256; }
 
+// Workspace sizes are reported through a signed 64-bit FFI return, and the launchers admit
+// every dimension up to INT32_MAX, so `splits * M * N * sizeof(float)` can leave even 64 bits
+// in a workspace query that allocates nothing.  These multiply / add within [0, INT64_MAX]
+// and report false (leaving `*out` untouched) when the result would not fit.
+constexpr uint64_t W8A16MaxWorkspaceBytes = static_cast<uint64_t>(INT64_MAX);
+inline bool W8A16CheckedMul(uint64_t a, uint64_t b, uint64_t* out) {
+  if (a != 0 && b > W8A16MaxWorkspaceBytes / a) return false;
+  *out = a * b;
+  return true;
+}
+inline bool W8A16CheckedAdd(uint64_t a, uint64_t b, uint64_t* out) {
+  if (a > W8A16MaxWorkspaceBytes || b > W8A16MaxWorkspaceBytes - a) return false;
+  *out = a + b;
+  return true;
+}
+
 // Split-K reduce: out[i] = T(sum_s ws[s][i] * scale + bias[i % N]), 8 elements per thread
 // (two 16 B loads per split, one 16 B store).  Requires N % 8 == 0 (the launcher checks it)
 // and hence M * N % 8 == 0.

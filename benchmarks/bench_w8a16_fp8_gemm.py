@@ -20,7 +20,8 @@ W8A16 FP8 GEMM benchmark on the Cosmos3-Super Linear shapes.
 The weight is FP8 e4m3 with ONE per-tensor fp32 scale (the layout TRT-LLM's
 FP8QDQ loader produces); the activation is bf16 or fp16, the output is the
 activation dtype.  TRT-LLM's ``W8A16FP8LinearMethod.apply`` today is a
-cast-copy -- ``weight.to(dtype).mul_(scale)`` then ``F.linear`` -- and this
+cast-copy -- ``weight.to(dtype).mul_(scale.to(dtype))`` then ``F.linear``: the
+scale is rounded to the activation dtype, then the product is -- and this
 script benchmarks the FlashInfer fused kernel (``flashinfer.gemm.w8a16_fp8_gemm``,
 weight dequantized on the fly, never materialised) against it.
 
@@ -39,9 +40,10 @@ not exceed ``--tol-mult`` times the cast-copy path's own error against that
 reference, with a small absolute floor.  Both accumulate in fp32 on the tensor
 cores and differ from the fp32 reference by the order of that reduction (tile
 and split boundaries) and by the single rounding of the result to the output
-dtype; the cast-copy path additionally rounds ``weight * scale`` to the
-activation dtype before the GEMM, where the kernel applies the fp32 scale to
-the fp32 accumulator.  A failing shape is marked FAIL and the exit status is 1.
+dtype; the cast-copy path additionally rounds the scale itself and then
+``weight * scale`` to the activation dtype before the GEMM, where the kernel
+applies the fp32 scale to the fp32 accumulator.  A failing shape is marked FAIL
+and the exit status is 1; so is a requested kernel column that cannot run.
 
 Shapes
 ------
@@ -359,14 +361,17 @@ def make_kernel(
     bias,
     algo: str | None = None,
     out: torch.Tensor | None = None,
-) -> Callable[[], torch.Tensor] | None:
+) -> Callable[[], torch.Tensor]:
     """FlashInfer kernel; ``algo`` pins a kernel variant (``--algo``; Hopper or
-    Blackwell names)."""
+    Blackwell names).  A kernel column was asked for, so an import failure is a
+    failure of the run (not a silently skipped column)."""
     try:
         from flashinfer.gemm import w8a16_fp8_gemm
     except ImportError as e:
-        print(f"# WARNING: flashinfer.gemm import failed: {e!r}", file=sys.stderr)
-        return None
+        raise RuntimeError(
+            "the kernel column was requested but flashinfer.gemm.w8a16_fp8_gemm "
+            f"cannot be imported: {e!r}"
+        ) from e
     if out is None:
         out = torch.empty(
             act.shape[0], w_fp8.shape[0], dtype=act.dtype, device=act.device
@@ -445,15 +450,7 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
         # 4.5 GB output do not fit in 80 GB.
         if kernel_out is None:
             kernel_out = torch.empty(m, n, dtype=dtype, device=dev)
-        fn = make_kernel(act, w_fp8, scale, bias, algo=algo, out=kernel_out)
-        if fn is None:
-            print(
-                "# WARNING: flashinfer.gemm.w8a16_fp8_gemm not available; "
-                f"{name} column skipped",
-                file=sys.stderr,
-            )
-        else:
-            impls[name] = fn
+        impls[name] = make_kernel(act, w_fp8, scale, bias, algo=algo, out=kernel_out)
 
     us: dict[str, float] = {}
     max_abs: dict[str, float] = {}
@@ -469,8 +466,8 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
     # per-row ratios.
     names = list(impls)
     # Steady-state recipe (--warmup-seconds / --burst-seconds): a short burst never reaches
-    # the 700 W power cap and measures the boost clock instead (benchmarks/
-    # w8a16_fp8_gemm_ladder.md, recipe experiment).  Heat the GPU with an untimed burst of the
+    # the 700 W power cap and measures the boost clock instead (the recipe experiment in
+    # benchmarks/w8a16_fp8_gemm_ladder.md).  Heat the GPU with an untimed burst of the
     # first column, then size each timed burst by time rather than by launch count.
     iters_by_name = {name: args.iters for name in names}
     if args.burst_seconds > 0:
@@ -520,10 +517,11 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
     passed: bool | None = None
     kernel_cols = [c for c in impls if c.startswith("kernel")]
     if kernel_cols:
-        # Both the kernel and the cast-copy differ from fp32 only by 16-bit
-        # accumulation order; demand the kernel be no worse than that path
-        # (with a floor so an exactly-fp32-accumulating reference isn't
-        # penalised for a tiny cast-copy error).
+        # Both accumulate in fp32 and differ from the fp32 reference by the reduction
+        # order and the one output rounding (the cast-copy also by rounding the scaled
+        # weight to 16 bits); demand the kernel be no worse than that path (with a
+        # floor so an exactly-fp32-accumulating reference isn't penalised for a tiny
+        # cast-copy error).
         cast_err = max_abs.get("cast")
         if cast_err is None:
             # cast column not requested: compute it once for the gate only.
@@ -781,7 +779,7 @@ def main(argv=None) -> int:
                 problems.append((name, tp, n, k))
 
     rows: list[Row] = []
-    # Rows stream out as they finish (the naive rungs take a long time on the
+    # Rows stream out as they finish (the cast-copy baseline takes a long time on the
     # large shapes); the CSV is written once at the end.
     print(table_header(args), flush=True)
     try:
@@ -798,6 +796,10 @@ def main(argv=None) -> int:
     failed = [r for r in rows if r.passed is False]
     if failed:
         print(f"# CORRECTNESS GATE FAILED on {len(failed)} shape(s)", file=sys.stderr)
+        return 1
+    # A requested kernel column that produced no verdict is a failed run, not a pass.
+    if _kernel_variants(args) and any(r.passed is None for r in rows):
+        print("# kernel column requested but not gated on every row", file=sys.stderr)
         return 1
     return 0
 
