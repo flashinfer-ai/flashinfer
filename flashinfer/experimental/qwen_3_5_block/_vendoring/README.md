@@ -5,7 +5,7 @@ from a cuDNN Frontend checkout, and the two scripts that compute its closure lis
 
 | file | what |
 |---|---|
-| `vendor.py` | reads every file of `closure.json` from the pinned commit (`git show <commit>:<path>`), rewrites the `cudnn` import roots to the vendored package, applies the declared patches P0-P6, writes the shim, `VENDOR.md` and `VENDOR_MANIFEST.json`; `--selftest` imports the result with the real `cudnn` package shadowed and declares the three serving forms |
+| `vendor.py` | reads every file of `closure.json` from the pinned commit (`git show <commit>:<path>`), rewrites the `cudnn` import roots to the vendored package, applies the declared patches P0-P3 and P5-P6 (P4 is retired), writes the shim, `VENDOR.md` and `VENDOR_MANIFEST.json`; `--selftest` imports the result with the real `cudnn` package shadowed and declares the three serving forms |
 | `closure.json` | the closure list: every vendored file with its module, licence and the sha256 of its blob at the pinned commit, plus the same digest pin for the file vendored from the FE test tree (`extra_files`); the exporter stops on any digest that moved |
 | `nanobind_enums.json` | the extension's enum tables and binder capability flags the shim spells; read live from a cuDNN Frontend install when one is importable, else from this copy |
 | `build_closure.py` | computes `closure.json` from the import traces plus a static module-level import check (the EXTRA / EXCLUDE policy is at its top) |
@@ -31,5 +31,6 @@ python build_closure.py --fe <checkout> --traces traces/ --out closure.json --co
 
 Then re-run `vendor.py`, update `README.md` / `NOTICE` where they quote file counts or the pinned commit, and re-run
 `tests/experimental/qwen_3_5_block/` on a cc 10.7 device.  Patch P3 (internal names in comments) is dropped once the upstream
-files are scrubbed; P4 (the cache-write launcher's one-device check) once the upstream fix is in the pinned commit; P5 / P6 (the
+files are scrubbed; P4 (the cache-write launcher's one-device check, carried ahead of its upstream landing) was retired at the
+`d8b0a7ed5` re-vendor, where the pinned commit carries the fix -- the id stays retired, never reused; P5 / P6 (the
 `gemm` package's lazy exports, the sm120 arch family) stay as long as the closure leaves those paths out.

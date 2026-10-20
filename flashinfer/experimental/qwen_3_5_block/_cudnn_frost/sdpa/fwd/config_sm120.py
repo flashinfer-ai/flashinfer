@@ -224,10 +224,11 @@ def validate_params(
         # Each of these would need extra machinery in the combine pass.
         if params.thd_varlen:
             raise ValueError("SM120 SDPA: split_kv > 1 is dense-only (THD packs its own flat grid)")
-        if params.has_sink:
-            # The sink logit is folded into the softmax denominator per tile, so
+        if params.has_sink and params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
+            # The half templates write sink-free partials and the combine folds
+            # the sink once; the FP8 templates fold it in their epilogue, so
             # every split would add its own copy of it.
-            raise ValueError("SM120 SDPA: split_kv > 1 with an attention sink is not supported")
+            raise ValueError("SM120 SDPA: split_kv > 1 with an attention sink is served by the FP16/BF16 templates only")
         if params.sched_policy != SCHED_NATURAL:
             # The split index rides the NATURAL grid's batch axis (y = batch +
             # split*B); LPT / LPT_L2 flatten the grid to 1-D and derive the batch

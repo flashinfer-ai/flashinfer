@@ -623,6 +623,31 @@ EXTEND_PDL_STAGES = ("qk_norm_rope", "cache_write", "sigmoid_gate")
 """The EXTEND form's stages that take the switch: stage (4), the paged d256 prefill tile, carries no sites and launches plain (the
 link serializes; the chain stays correct); ``ExtendEnvelope.pdl_stages`` carries this tuple."""
 
+DECODE_PDL_DEFAULT_CCS: Tuple[Tuple[int, int], ...] = ((10, 7),)
+"""The parts on which the AUTO reading of ``use_pdl`` (``None``, the default) resolves True on the dense DECODE form's decode-tile
+routes for the bf16 / f16 block (no ``quant``, no e4m3 cache, no ``QsaSpec``): programmatic dependent launch over the block's own chain
+-- the norm + RoPE pass, the separate cache write, the decode tile and its split combine.  Measured on a 212-SM cc 10.7 part as a
+1.1-1.5 us saving per decode step at B 1 (B 1 x KV 4K: +5.0 %, 32K +4.0 %, 128K +2.5 %; +2.8 % geomean over the B 1 .. 4 cells) and flat
+within the control pair where the tile dominates, no cell losing beyond its pair; every ``griddepcontrol`` site of the chain audited
+(each role's first dependent read behind its own wait, no global write above a wait, every release after its kernel's wait).  Every
+other part keeps False until measured there; an explicit ``use_pdl=True`` / ``False`` is honoured on every part.  The FROST GEMM stages
+(the slab GEMM, the out projection, its split-K reducer) launch with the attribute regardless of the switch (their templates' own
+constant) and are neither listed by ``pdl_stages`` nor counted by ``use_pdl_effective``."""
+
+CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS = 128
+"""The AUTO reading of ``fuse_cache_write_small_m`` (``None``, the default) folds the paged K / V write-through into the norm + RoPE
+launch (``kernels/qk_norm_rope_tma.py``'s pool-write arm: one launch fewer, the pools bitwise the separate write) wherever the arm is
+served and the step's token rows ``T = B x S_q`` are below this bound OR ``S_q == 1`` (a one-token-per-sequence step, measured to B 128 --
+past it the rule is reachable only under an explicit ``fuse_norm_rope=False``, since the C0 lowering hands rows > 128 to the fused fork,
+which owns its own write-through); at
+``T >= 128`` with ``S_q > 1`` the separate cache-write launch runs (the chain as before).  The rule is the measurement on a 212-SM cc 10.7
+part: the arm wins on every B 1 .. 4 cell (+1.1 .. +3.2 % per decode step on the plain chain, +2.4 .. +4.9 % with PDL on; B 1 x KV 4K
+32.2 -> 31.4 us), at B 32 x S_q 1 and B 128 x S_q 1 (the PDL + write-through step +6.9 % / +2.5 % against +2.2 % / +1.8 % from PDL alone),
+and loses 0.7-2.7 us per step at B 32 .. 128 x S_q 4 (128-512 rows), where the per-row pool write inside the norm + RoPE kernel costs more
+than the write kernel it replaces.  Performance-only (the same bytes land in the pools and the slab either way); an explicit ``True`` /
+``False`` is honoured wherever the arm is served, and an explicit ``fuse_cache_write=False`` (the separate launch asked for by name) keeps
+the AUTO fold off."""
+
 
 def _resolve_decode_route_policy(policy: Optional[str]) -> str:
     """``None`` = the default policy; a known policy name as is; anything else a typed ``ValueError`` naming the vocabulary."""
@@ -930,6 +955,12 @@ class DecodeEnvelope:
     # appended (2026-10-15): the stage kinds that take the ``use_pdl`` switch on this form (:data:`DECODE_PDL_STAGES`; stage (4) on a
     # decode-tile route only -- ``DecodeRoute.pdl_capable`` per route); empty under ``sparse_core`` (the switch is a typed decline there).
     pdl_stages: Tuple[str, ...] = ()
+    # appended (2026-10-19): the AUTO reading of ``use_pdl`` (None) on THIS part for a SERVED form -- True on the parts of
+    # :data:`DECODE_PDL_DEFAULT_CCS` when ``served`` (the bf16 / f16 block over pools in the activation dtype), False wherever the form is
+    # not served (another part, an unserved dtype, a geometry row, no DSL target) and under ``sparse_core``.  A FORM-level reading: the
+    # per-step one is ``pdl_default and route(s_q, batch).pdl_capable`` (stage (4) takes the switch on a decode-tile route only; a
+    # prefill-route step launches plain and resolves False).  An explicit ``use_pdl`` outranks it.
+    pdl_default: bool = False
 
 
 @dataclass(frozen=True)
@@ -3820,12 +3851,15 @@ class _QkNormRope(_Stage):
         stages: int = _QK_NORM_ROPE_STAGES,
         use_pdl: bool = False,
         dynamic_token_stride: bool = True,
+        page_size: int = 0,  # APPENDED: > 0 = the pool-write arm (the paged K / V write-through folded into this launch; the TMA kernel only)
     ) -> None:
         self.geom = geometry
         self.batch = int(batch)
         self.seq_len = int(seq_len)
         self.dtype = dtype
         self.want_rstd = bool(want_rstd)
+        self.page_size = int(page_size)
+        self._recipes = None  # the pool-write arm: {slot dtype: recipe} (both slot widths compiled, Rule 4)
         self.threads_per_cta = int(threads_per_cta)
         self.rows_per_group = int(rows_per_group)
         self.defer_secondary_loads = bool(defer_secondary_loads)
@@ -3929,6 +3963,16 @@ class _QkNormRope(_Stage):
 
             g = self.geom
             _tma_validate(g.d_head, g.rope_dim, g.h_q, g.h_kv, self.resolve_tile_rows(), self.threads_per_cta)
+            if self.page_size:
+                from .kernels.cache_write import validate_cache_write_shape
+
+                validate_cache_write_shape(g.d_head, self.page_size, self.threads_per_cta)
+        elif self.page_size:
+            raise NotImplementedError(
+                f"{self.name}: the paged write-through folded into the norm + RoPE launch is an arm of the TMA kernel (sm_90+, a geometry its tiling "
+                f"fits), and the dense DECODE form's unfused chain is served on cc 10.7, where that kernel runs; this device resolves the stage to "
+                f"the LDG kernel, which has no such arm -- declare fuse_cache_write_small_m=False (the separate cache-write launch)"
+            )
         else:
             from .kernels.qk_norm_rope import validate_shape
 
@@ -3940,7 +3984,7 @@ class _QkNormRope(_Stage):
         if self._impl == "tma":
             from .kernels.qk_norm_rope_tma import compile_qk_norm_rope_tma
 
-            self._recipe = compile_qk_norm_rope_tma(
+            common = dict(
                 dtype=self.dtype,
                 h_q=g.h_q,
                 h_kv=g.h_kv,
@@ -3954,7 +3998,18 @@ class _QkNormRope(_Stage):
                 apply_norm=g.qk_norm,
                 use_pdl=self.use_pdl,
             )
+            if self.page_size:
+                # the pool-write arm: both slot widths compiled (int32 and int64 are the two the serving stacks hand over; the dtype is a
+                # compile key), so execute dispatches on a guaranteed cache hit whichever one arrives (the separate stage's rule)
+                self._recipes = {
+                    dt: compile_qk_norm_rope_tma(pool_write=True, page_size=self.page_size, slot_dtype=dt, **common) for dt in (torch.int32, torch.int64)
+                }
+                self._recipe = self._recipes[torch.int32]
+            else:
+                self._recipe = compile_qk_norm_rope_tma(**common)
             return
+        if self.page_size:
+            raise NotImplementedError(f"{self.name}: the pool-write arm exists on the TMA kernel only (check_support names it); impl={self._impl!r}")
         from .kernels.qk_norm_rope import compile_qk_norm_rope
 
         self._recipe = compile_qk_norm_rope(
@@ -3979,7 +4034,12 @@ class _QkNormRope(_Stage):
         from .kernels.qk_norm_rope import moved_bytes
 
         g = self.geom
-        return moved_bytes(self.batch * self.seq_len, g.h_q, g.h_kv, g.d_head, elem_bytes=2, want_rstd=self.want_rstd)
+        t = self.batch * self.seq_len
+        total = moved_bytes(t, g.h_q, g.h_kv, g.d_head, elem_bytes=2, want_rstd=self.want_rstd)
+        if self.page_size:
+            # the pool-write arm: the V band read once, the K and V rows written to the pools, one slot per token (int32 counted)
+            total += 3 * t * g.h_kv * g.d_head * 2 + t * 4
+        return total
 
     def execute(
         self,
@@ -3995,6 +4055,12 @@ class _QkNormRope(_Stage):
         rstd_k: Optional[torch.Tensor] = None,  # [B, S, H_kv] fp32
         current_stream=None,
         flat: bool = False,  # accepted and ignored: rank decides
+        # APPENDED (the pool-write arm, page_size > 0): the V band [B, S, H_kv, D] / [T, H_kv, D], the two pools [P, H_kv, page_size, D]
+        # and the slot map [T] -- REQUIRED there, refused otherwise (both directions typed).
+        v: Optional[torch.Tensor] = None,
+        k_cache: Optional[torch.Tensor] = None,
+        v_cache: Optional[torch.Tensor] = None,
+        slot_mapping: Optional[torch.Tensor] = None,
     ) -> None:
         """Flatten ``[B, S, ...]`` to ``[T, ...]`` and launch.
 
@@ -4028,9 +4094,22 @@ class _QkNormRope(_Stage):
                 return None
             return x if x.ndim == 3 else x.view(t, h, g.d_head)
 
+        pool_kw = {}
+        recipe = self._recipe
+        if self.page_size:
+            if v is None or k_cache is None or v_cache is None or slot_mapping is None:
+                raise ValueError(f"{self.name}: the pool-write arm needs v, k_cache, v_cache and slot_mapping at every execute (Rule 1: no silent fallback)")
+            if slot_mapping.dtype not in self._recipes:
+                raise ValueError(f"{self.name}: slot_mapping must be int32 or int64, got {slot_mapping.dtype}")
+            recipe = self._recipes[slot_mapping.dtype]
+            pool_kw = dict(v=_flat(v, g.h_kv), k_cache=k_cache, v_cache=v_cache, slot_mapping=slot_mapping)
+        elif v is not None or k_cache is not None or v_cache is not None or slot_mapping is not None:
+            raise ValueError(
+                f"{self.name}: v / k_cache / v_cache / slot_mapping belong to the pool-write arm (page_size > 0); this stage would silently ignore them"
+            )
         runner = run_qk_norm_rope_tma if self._impl == "tma" else run_qk_norm_rope
         runner(
-            self._recipe,
+            recipe,
             _flat(q, g.h_q),
             _flat(k, g.h_kv),
             _flat(q if q_out is None else q_out, g.h_q),
@@ -4042,6 +4121,7 @@ class _QkNormRope(_Stage):
             None if rstd_q is None else rstd_q.view(t, g.h_q),
             None if rstd_k is None else rstd_k.view(t, g.h_kv),
             stream=stream,
+            **pool_kw,
         )
 
 
@@ -6314,9 +6394,13 @@ class GatedAttentionBlockFwd(APIBase):
     names the kernel per ``(group, S_q)``; a wider dense step is a typed decline -- the EXTEND form's packed business) -- so
     the pipeline is ``(1)+(2)+(3) -> (4w) -> (4) [+ combine] -> (5) -> (6)``, five launches with ``fuse_norm_rope`` -- past decode row
     counts: at ``B x S_q <= 128`` (``kernels.proj_gemm.SMALL_M_MAX``) the declaration LOWERS stage (1) to the unfused chain, ``(1) -> (2)+(3)
-    -> (4w) -> (4) [+ combine] -> (5) -> (6)`` (the small-M route's slab GEMM, the norm + RoPE pass, the separate cache write: the measured
-    faster step; ``fuse_norm_rope_effective`` reads it back, ``fuse_norm_rope_small_m=True`` keeps the fused fork for the A/B, as does an
-    explicit ``fuse_cache_write=True`` -- the write-through arm lives in the fork and the request outranks the lowering).
+    -> (4w) -> (4) [+ combine] -> (5) -> (6)`` (the small-M route's slab GEMM, the norm + RoPE pass with the paged write-through folded in
+    -- ``fuse_cache_write_small_m``, by default below :data:`CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS` rows or at ``S_q = 1``, the separate
+    cache write past it --: the measured faster step; ``fuse_norm_rope_effective`` / ``cache_write_in_norm_rope`` read it back,
+    ``fuse_norm_rope_small_m=True`` keeps the fused fork for the A/B, as does an explicit ``fuse_cache_write=True`` -- the write-through arm
+    lives in the fork and the request outranks the lowering).  Programmatic dependent launch is the form's default on its decode-tile routes
+    on cc 10.7 (``use_pdl=None`` -> True, :data:`DECODE_PDL_DEFAULT_CCS`; ``use_pdl=False`` the plain chain): the norm + RoPE pass, the tile
+    and its combine launch with the attribute, the FROST GEMM stages do regardless; ``pdl_stages`` / ``use_pdl_effective`` read it back.
     ``fuse_gate`` then rides the split COMBINE on the decode tile (``gate_fused``; the tile has no gate seams, the combine
     multiplies the merged fp32 value by ``sigmoid(G)`` before the single cast) and is its own launch on an unsplit tile.
     The pools' and the table's strides are the same declaration samples as the EXTEND form's (a row-sliced table at any row
@@ -6522,7 +6606,9 @@ class GatedAttentionBlockFwd(APIBase):
         # APPENDED (serving): WHERE the paged KV-cache write-through runs under paged_kv_page_size > 0.  None = AUTO: folded into the fused
         # projection's epilogue wherever that arm serves (fuse_norm_rope=True, bf16 / f16 activations, no indexer band -- both serving forms as
         # declared today: EXTEND 4 -> 3 stages with fuse_gate, DECODE 5 -> 4), the separate cache-write launch everywhere else; False = the
-        # separate launch always (the A/B control and the fallback); True = the fused arm, a typed decline on a form it cannot serve.  A
+        # separate launch always (the A/B control and the fallback; on the DECODE form's unfused chain it also keeps the AUTO small-M fold of
+        # fuse_cache_write_small_m=None off -- an explicit fuse_cache_write_small_m names that arm itself and is followed either way); True =
+        # the fused arm, a typed decline on a form it cannot serve.  A
         # performance-only knob: the pools hold the SAME bytes either way (the pool row is the slab row, bitwise).  At decode row counts
         # an explicit True is the REQUEST that keeps the fused fork the AUTO lowering (fuse_norm_rope_small_m=None) would otherwise replace
         # (user request > heuristic proposal); only the explicit contradiction fuse_norm_rope_small_m=False + fuse_cache_write=True declines.
@@ -6545,28 +6631,46 @@ class GatedAttentionBlockFwd(APIBase):
         # (the same function under every width -- the SDPA suite's cross-form bitwise pins); `DecodeRoute.q_tile_max` reads it back and
         # the stage hands it to the adapter so the compiled width is the declared one.  Module docstring, "The DECODE form".
         decode_q_tile_max: Optional[int] = None,
-        # APPENDED (MEASUREMENT PROTOTYPE, performance-only): programmatic dependent launch over the block's own launch chain.  True launches
-        # the norm + RoPE, cache-write, sigmoid-gate, d256 decode-tile and split-combine kernels with the programmatic-stream-serialization
-        # attribute and traces their griddepcontrol pair (a wait before the first global read of a predecessor's output, a release after the
-        # prologue); the FROST GEMM templates already launch that way (their module constant USE_PDL).  The same kernels, the same math:
-        # `out` is BITWISE the use_pdl=False block's, eagerly and under CUDA-graph capture.  Served for the bf16 / f16 block (no quant, no e4m3
-        # KV cache, no QsaSpec: a typed decline).  A PER-STAGE fact (2026-10-15): a stage whose kernel carries no sites -- the paged d256
-        # prefill tile of the DECODE form's prefill route and of the EXTEND form, the dense prefill tiles under kv_source="self" -- launches
-        # plain and the link serializes there (correct by PDL's semantics: its successor's wait blocks on full completion); the switch is
-        # never forwarded to such a kernel.  `pdl_stages` reads back the stages launching with the attribute, `use_pdl_effective` whether
-        # every switched stage of the chain does; `DecodeRoute.pdl_capable`, `DecodeEnvelope.pdl_stages` and `ExtendEnvelope.pdl_stages`
-        # say so before anything is declared.
-        use_pdl: bool = False,
+        # APPENDED (performance-only): programmatic dependent launch over the block's own launch chain.  None = AUTO (2026-10-19): True on the
+        # dense DECODE form's decode-tile routes for the bf16 / f16 block on the parts of DECODE_PDL_DEFAULT_CCS (cc 10.7, where the default
+        # was measured: 1.1-1.5 us per decode step at B 1, no cell losing beyond its control pair), False everywhere else -- the EXTEND form,
+        # kv_source="self", the DECODE form's prefill route, every other part -- until measured there; `use_pdl_requested` keeps the value as
+        # declared, `use_pdl` the resolved one.  True launches the norm + RoPE, cache-write, sigmoid-gate, d256 decode-tile and split-combine
+        # kernels with the programmatic-stream-serialization attribute and traces their griddepcontrol pair (a wait before the first global
+        # read of a predecessor's output, a release after the prologue); False is the plain chain on every part.  The FROST GEMM templates
+        # launch with the attribute regardless (their module constant USE_PDL).  The same kernels, the same math: `out` is BITWISE the
+        # use_pdl=False block's, eagerly and under CUDA-graph capture.  An explicit True is served for the bf16 / f16 block only (no quant, no
+        # e4m3 KV cache, no QsaSpec: a typed decline; pools in the activation dtype, kv_cache_dtype None or that dtype, are the bf16 / f16
+        # block); AUTO reads False on those pipelines and never True where the explicit True is refused.  A PER-STAGE fact (2026-10-15): a stage whose
+        # kernel carries no sites -- the paged d256 prefill tile of the DECODE form's prefill route and of the EXTEND form, the dense prefill
+        # tiles under kv_source="self" -- launches plain and the link serializes there (correct by PDL's semantics: its successor's wait
+        # blocks on full completion); the switch is never forwarded to such a kernel.  `pdl_stages` reads back the stages launching with the
+        # attribute, `use_pdl_effective` whether every switched stage of the chain does; `DecodeRoute.pdl_capable`, `DecodeEnvelope.pdl_stages`
+        # / `.pdl_default` and `ExtendEnvelope.pdl_stages` say so before anything is declared.
+        use_pdl: Optional[bool] = None,
         # APPENDED (2026-10-15; the DECODE form only; performance-only): WHETHER the fused norm + RoPE projection runs at DECODE ROW COUNTS
         # (T = B x S_q <= kernels.proj_gemm.SMALL_M_MAX = 128 on the dense DECODE form, bf16 / f16, no indexer band, 16-bit pools) when
         # fuse_norm_rope=True.  None = AUTO = False: stage (1) is LOWERED to the unfused chain there -- the small-M route's slab GEMM, the
-        # norm + RoPE pass, the separate cache write (seven launches with the split combine) -- because the 256-wide fused fork pads one
-        # token tile and streams its weight at a fraction of the machine (the measured "route + unfused" step is the faster one at B 1 ..
+        # norm + RoPE pass with the cache write folded in (`fuse_cache_write_small_m`'s default; six launches with the split combine) --
+        # because the 256-wide fused fork pads one token tile and streams its weight at a fraction of the machine (the measured "route +
+        # unfused" step is the faster one at B 1 ..
         # 32), unless an explicit fuse_cache_write=True asks for the fork's write-through arm (the request outranks the lowering);
         # True = the fused fork as declared (the former behaviour; the A/B's control arm).  `fuse_norm_rope` stays what was declared,
         # `fuse_norm_rope_effective` reads back what runs (`cache_write_fused` follows it: the write-through arm lives in the fork).  Refused
         # (typed) with fuse_norm_rope=False and off the dense DECODE form.  Module docstring, "The DECODE form".
         fuse_norm_rope_small_m: Optional[bool] = None,
+        # APPENDED (2026-10-16; the DECODE form's unfused chain; performance-only): WHERE the paged KV-cache write-through runs when stage (1)
+        # is the unfused chain at decode row counts (the C0 lowering above, or fuse_norm_rope=False) on the dense DECODE form, bf16 / f16,
+        # no quant, no indexer band, 16-bit pools, the TMA norm + RoPE kernel.  None = AUTO (2026-10-19): the MEASURED rule -- folded in
+        # where the arm is served and T = B x S_q < CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS (128) or S_q == 1, the separate cache-write launch
+        # (the chain as before: seven launches with the split combine) at T >= 128 with S_q > 1, where the arm measured slower, and wherever
+        # an explicit fuse_cache_write=False asked for the separate launch by name (user request > heuristic proposal); True = the
+        # write-through FOLDED INTO the norm + RoPE launch (kernels/qk_norm_rope_tma.py's pool-write arm: the slab's V band copied and the
+        # post-RoPE K / V rows written to the pools from the same tiles, the separate cache-write stage not built -- six launches), a typed
+        # decline on a form that cannot serve it (the fused fork, a quantized pipeline, the e4m3 cache, the indexer band, the EXTEND / packed
+        # forms, a geometry the TMA tiling does not fit); False = the separate launch always.  The same bytes land in the pools and the slab
+        # either way (the pools bitwise the separate write).  `cache_write_in_norm_rope` reads back what runs.
+        fuse_cache_write_small_m: Optional[bool] = None,
     ):
         """Validate the declaration -- the dtype / ``quant`` / scale-blob halves, the fusion and save-mode knobs against
         ``save_for_backward``, the THD envelope, the paged-cache write-through -- normalise the samples, record the knobs and
@@ -6576,16 +6680,23 @@ class GatedAttentionBlockFwd(APIBase):
         self.geom = geometry
         self.dtype = sample_h.dtype
         self.device = sample_h.device
-        # Programmatic dependent launch over the chain (the constructor's note): the bf16 / f16 block only -- the quantized pipelines'
-        # quantize stages, the e4m3 write-through and the sparse core carry no griddepcontrol sites yet, so none of those chains overlaps
-        # at its attention link and the switch is a typed decline there (the per-stage form below is the bf16 / f16 chains', whose one
-        # site-less link is a prefill tile).  The FIRST decline of such a declaration, so the message names the switch rather than a
-        # later check's vocabulary.
+        # Programmatic dependent launch over the chain (the constructor's note): the bf16 / f16 block only -- pools in the activation dtype
+        # (`kv_cache_dtype` None or that dtype: the same block) -- because the quantized pipelines' quantize stages, the e4m3 write-through
+        # and the sparse core carry no griddepcontrol sites yet, so none of those chains overlaps at its attention link and the switch is a
+        # typed decline there (the per-stage form below is the bf16 / f16 chains', whose one site-less link is a prefill tile).  The FIRST
+        # decline of such a declaration, so the message names the switch rather than a later check's vocabulary; a 16-bit kv_cache_dtype that
+        # is not the activation dtype passes here and hears the attribute's own ValueError below.  None = AUTO: nothing to decline here;
+        # resolved from the form's facts below (`_pdl_default`), before any stage is built, and only INSIDE the domain this decline admits
+        # (the two readings of the knob answer for one domain) -- `use_pdl_requested` keeps the declaration, `use_pdl` the resolved switch
+        # every stage reads.
+        if use_pdl is not None and not isinstance(use_pdl, bool):
+            raise TypeError(f"use_pdl must be None (auto), True or False, got {type(use_pdl).__name__}")
+        self.use_pdl_requested: Optional[bool] = use_pdl
         self.use_pdl = bool(use_pdl)
-        if self.use_pdl and (quant is not None or kv_cache_dtype is not None or geometry.qsa is not None):
+        if self.use_pdl and (quant is not None or kv_cache_dtype not in (None, torch.bfloat16, torch.float16) or geometry.qsa is not None):
             raise NotImplementedError(
-                "use_pdl=True is served for the bf16 / f16 block only (no quant / QuantSpec, no kv_cache_dtype, no QsaSpec): those pipelines' "
-                "stages carry no programmatic-dependent-launch sites; declare use_pdl=False"
+                "use_pdl=True is served for the bf16 / f16 block only (no quant / QuantSpec, no e4m3 KV cache -- kv_cache_dtype None or the "
+                "activation dtype --, no QsaSpec): those pipelines' stages carry no programmatic-dependent-launch sites; declare use_pdl=False"
             )
         # FP8: `h` and both weights arrive as e4m3 with a QuantSpec; every
         # activation the block's own kernels touch (slab, O, out, cos/sin, norm
@@ -6822,6 +6933,12 @@ class GatedAttentionBlockFwd(APIBase):
             # seq_lens_present=True whatever was passed (the dense padding mask it names IS the per-sequence KV length -- bound to
             # the KV side only here).
             self.seq_lens_present = True
+        # PDL BY DEFAULT (2026-10-19): the AUTO reading of `use_pdl` resolves here, once the form is known and before any stage is built --
+        # True on the dense DECODE form's decode-tile routes for the bf16 / f16 block on the parts of DECODE_PDL_DEFAULT_CCS (its docstring:
+        # the measured default), False everywhere else; an explicit value was kept above.  A device-side fact read once (the sample's
+        # device), like the stages' own arch gates; a CPU sample (a host-side declaration) reads False.
+        if use_pdl is None:
+            self.use_pdl = self._pdl_default(quant)
         # C0 (2026-10-15): at DECODE ROW COUNTS the declaration `fuse_norm_rope=True` LOWERS stage (1) to the unfused chain.  The 256-wide
         # fused fork pads a decode step's handful of rows to one 256-row token tile and streams the slab weight from a quarter of the SMs
         # (the measured step at B 1 x KV 4K: the fork ~25 us against the small-M route's slab GEMM + norm / RoPE + cache write ~12 us of
@@ -6962,6 +7079,13 @@ class GatedAttentionBlockFwd(APIBase):
                 w_dtype=quant.w_qkvg_dtype if mxfp8 else None,
             )
             self._norm_rope = _QkNormRope(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, want_rstd=want_rstd, use_pdl=self.use_pdl)
+        # (4w) on the unfused chain at decode row counts: the paged write-through folded into the norm + RoPE launch (the constructor's
+        # `fuse_cache_write_small_m` note).  Decided here, after the norm + RoPE stage exists (its TMA tiling must fit the geometry) and
+        # before the separate cache-write stage is built (not built when this arm runs: a stage that never runs is not in `_stages`).
+        self.fuse_cache_write_small_m: Optional[bool] = fuse_cache_write_small_m
+        self.cache_write_in_norm_rope: bool = self._resolve_cache_write_small_m(fuse_cache_write_small_m, quant)
+        if self.cache_write_in_norm_rope:
+            self._norm_rope.page_size = self.paged_kv_page_size
         # Stage (3b) exists ONLY to give the SDPA a compact V. In-place needs no
         # such thing, so the stage is not built at all rather than built and
         # skipped -- a stage that is never run should not be in `_stages`,
@@ -7104,7 +7228,8 @@ class GatedAttentionBlockFwd(APIBase):
         # the declaration carries a page size; not built rather than built and skipped (it would still compile).
         # Not built when the fused projection's epilogue writes the pools (cache_write_fused): a stage that never runs is not in `_stages`.
         # Under kv_cache_dtype=e4m3 the write-through QUANTIZES (two per-tensor casts + the bit copy through the pools' bf16 views).
-        if not self.paged_kv_page_size or self.cache_write_fused:
+        # Nor when the norm + RoPE launch writes them (cache_write_in_norm_rope).
+        if not self.paged_kv_page_size or self.cache_write_fused or self.cache_write_in_norm_rope:
             self._cache_write = None
         elif self.kv_cache_e4m3:
             self._cache_write = _QuantizedCacheWrite(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, page_size=self.paged_kv_page_size)
@@ -7199,7 +7324,8 @@ class GatedAttentionBlockFwd(APIBase):
         # The programmatic-dependent-launch readback (the switch is per stage): the stages that launch with the attribute, and whether
         # every switched stage of the chain does (False with a plain link: the prefill tile of the DECODE form's prefill route or of the
         # EXTEND form, or a stage the switch is not threaded to -- the V compaction of inplace_qkv=False, the training copies).  The
-        # FROST GEMM stages launch with the attribute by their own constant and are not switched: neither listed nor counted.
+        # FROST GEMM stages launch with the attribute by their own constant and are not switched: neither listed nor counted.  `use_pdl`
+        # is the RESOLVED switch (None resolved by `_pdl_default`), `use_pdl_requested` the declaration as given.
         switched = tuple(st for st in self._stages if hasattr(st, "use_pdl"))
         self.pdl_stages: Tuple[str, ...] = tuple(st.name for st in switched if st.use_pdl)
         self.use_pdl_effective: bool = self.use_pdl and bool(switched) and all(st.use_pdl for st in switched)
@@ -7360,6 +7486,78 @@ class GatedAttentionBlockFwd(APIBase):
                 "forward keeps its K / V in the SavedForBackward record, not in a paged pool"
             )
         return page_size
+
+    def _pdl_default(self, quant) -> bool:
+        """The AUTO reading of ``use_pdl`` (None): True iff this is the dense DECODE form on a decode-tile route (``DecodeRoute.pdl_capable``:
+        the tile and its split combine carry the griddepcontrol pair), the bf16 / f16 block (no ``quant``, no e4m3 cache, no ``QsaSpec``) and
+        the sample's device is one of :data:`DECODE_PDL_DEFAULT_CCS` (cc 10.7, where the default was measured); False everywhere else -- the
+        EXTEND form, ``kv_source="self"``, the DECODE form's prefill route, the quantized pipelines, every other part and no CUDA device.
+        Never True where an explicit True is refused: the two readings of the knob answer for ONE domain (no ``quant``, pools in the
+        activation dtype -- ``kv_cache_dtype`` None or that dtype --, no ``QsaSpec``), the AUTO one narrowed further by route and part."""
+        return bool(
+            self.decode_route is not None
+            and self.decode_route.pdl_capable
+            and quant is None
+            and not self.kv_cache_e4m3
+            and self.qsa is None
+            and self.dtype in (torch.bfloat16, torch.float16)
+            and _device_cc_of(self.device) in DECODE_PDL_DEFAULT_CCS
+        )
+
+    def _resolve_cache_write_small_m(self, requested: Optional[bool], quant) -> bool:
+        """Whether the paged write-through runs INSIDE the norm + RoPE launch (``fuse_cache_write_small_m``: None = AUTO -- the measured rule
+        of :data:`CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS`: folded in at ``T = B x S_q < 128`` rows or at ``S_q == 1``, the separate launch at
+        ``T >= 128`` with ``S_q > 1``, and the separate launch wherever an explicit ``fuse_cache_write=False`` asked for it by name: the request
+        outranks the AUTO fold --, True / False by name -- this arm's own knob, the strongest request, followed under either reading of
+        ``fuse_cache_write``; ``TypeError`` otherwise).  Served on the dense DECODE form's UNFUSED chain with
+        paged pools in the activation dtype (bf16 / f16, no quant, no indexer band, no e4m3 cache) when the TMA norm + RoPE kernel tiles the
+        geometry; AUTO reads False everywhere else and an explicit True is a typed decline naming the reason.  Device-free (the arch half --
+        sm_90+ for the TMA kernel -- is the stage's ``check_support``; the dense DECODE form itself is served on cc 10.7 only)."""
+        if requested is not None and not isinstance(requested, bool):
+            raise TypeError(f"fuse_cache_write_small_m must be None (auto), True or False, got {type(requested).__name__}")
+        if requested is None:
+            # an explicit fuse_cache_write=False asks for the separate cache-write launch by name: the request outranks the AUTO fold
+            # (user request > heuristic proposal, as the constructor applies it to fuse_cache_write=True); the row rule decides otherwise
+            want = self.fuse_cache_write is not False and (self.seq_len == 1 or self.batch * self.seq_len < CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS)
+        else:
+            want = requested
+        if not want:
+            return False
+        why = None
+        if not self.paged_kv_page_size:
+            why = "needs paged_kv_page_size > 0 (there is no write-through to fold)"
+        elif self.decode_route is None:
+            why = (
+                "is the dense DECODE form's arm (kv_source='paged' on a dense bf16 / f16 declaration without a QsaSpec); the EXTEND / packed forms, the "
+                "write-through on the block's own K / V and the block-sparse decode mode keep their separate cache-write launch"
+            )
+        elif self._norm_rope is None:
+            why = "folds the write-through into the UNFUSED chain's norm + RoPE launch, and this declaration runs the fused projection fork (which owns the write-through: fuse_cache_write)"
+        # The three rows below are GUARDS no declaration reaches through the constructor today: the write-through's own quant decline
+        # (`_check_cache_write_declaration`) and the no-dense-route row above (a QsaSpec geometry, with or without the indexer band, and the
+        # e4m3 cache ride the block-sparse decode mode) speak first.  Kept so the resolver stays honest on its own facts should a form admit
+        # one of those pipelines onto a decode route; the host cell pins their text on the resolver directly.
+        elif quant is not None:
+            why = f"serves the bf16 / f16 pipeline only, got quant={type(quant).__name__}"
+        elif self.geom.index_band:
+            why = "with an indexer band the raw indexer key's pool is the separate cache-write launch's; declare fuse_cache_write_small_m=False (or None)"
+        elif self.kv_cache_e4m3:
+            why = "with kv_cache_dtype=torch.float8_e4m3fn the write-through QUANTIZES (its own stage); declare fuse_cache_write_small_m=False (or None)"
+        elif self.act_dtype not in (torch.bfloat16, torch.float16):
+            why = f"serves bf16 / f16 activations, got {self.act_dtype}"
+        else:
+            from .kernels.qk_norm_rope_tma import validate_shape as _tma_validate
+
+            g = self.geom
+            try:
+                _tma_validate(g.d_head, g.rope_dim, g.h_q, g.h_kv, self._norm_rope.resolve_tile_rows(), self._norm_rope.threads_per_cta)
+            except (ValueError, NotImplementedError) as exc:
+                why = f"is an arm of the TMA norm + RoPE kernel, whose tiling does not fit this geometry ({exc}); the LDG kernel has no such arm"
+        if why is None:
+            return True
+        if requested is True:
+            raise NotImplementedError(f"fuse_cache_write_small_m=True {why}")
+        return False  # AUTO: the separate launch where the arm is not served (the fused fork, the EXTEND / packed forms, a quantized pipeline, ...)
 
     def _check_fuse_cache_write_declaration(self, fuse_cache_write, quant) -> Optional[bool]:
         """``fuse_cache_write`` at declaration: None / True / False (``TypeError`` otherwise); True on a pipeline the fused projection's
@@ -7907,7 +8105,9 @@ class GatedAttentionBlockFwd(APIBase):
         ``device_cc`` (appended) overrides the device's compute capability for a host-side reading of another part's envelope;
         ``decode_route_policy`` (appended) is the policy ``decode.routes`` / ``decode.route()`` are read under (``None`` = the default,
         :data:`DEFAULT_DECODE_ROUTE_POLICY`; ``decode.policy`` names it); ``decode_q_tile_max`` (appended) the width cap they are read
-        under (``None`` = the whole single-unit table; ``decode.q_tile_max`` names it)."""
+        under (``None`` = the whole single-unit table; ``decode.q_tile_max`` names it); ``decode.pdl_default`` (appended) is the AUTO
+        reading of ``use_pdl`` on this part for a served dense form (:data:`DECODE_PDL_DEFAULT_CCS`; False where ``decode.served`` is False
+        or under ``sparse_core``) -- the per-step reading is ``decode.pdl_default and decode.route(s_q, batch).pdl_capable``."""
         from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
         policy = _resolve_decode_route_policy(decode_route_policy)
@@ -7985,6 +8185,10 @@ class GatedAttentionBlockFwd(APIBase):
             claimed_max_s_q=DECODE_CLAIMED_MAX_S_Q,
             q_tile_max=q_tile_max,
             pdl_stages=() if sparse else DECODE_PDL_STAGES,
+            # the AUTO reading of the switch on this part for a SERVED dense form (the measured default on cc 10.7): False wherever the form
+            # is not served (`decode_reason`: another part, an unserved dtype, a geometry row, no DSL target) and under the sparse core; the
+            # per-step reading is `pdl_default and route(s_q, batch).pdl_capable`
+            pdl_default=(decode_reason is None) and (not sparse) and cc in DECODE_PDL_DEFAULT_CCS,
         )
         forms = tuple(nm for nm, env in (("extend", extend), ("decode", decode)) if env.served)
         return ServingEnvelope(
@@ -8933,6 +9137,10 @@ class GatedAttentionBlockFwd(APIBase):
                 rstd_k=rstd_k,
                 current_stream=stream,
                 flat=True,
+                # (4w) folded in (cache_write_in_norm_rope): the slab's V band is copied and the post-RoPE K / V rows are written to the
+                # pools from the same tiles -- the pool row is bitwise the slab row stage (4) reads; the slot map is the LIVE-ROW view, as
+                # the separate stage takes it.
+                **({"v": v_src[:rows], "k_cache": k_cache, "v_cache": v_cache, "slot_mapping": slot_live} if self.cache_write_in_norm_rope else {}),
             )
         if sv is not None and sv.gate_dst is not None:
             # (3g) TRAINING, gate-copy save mode: the slab's GATE band -> the compact

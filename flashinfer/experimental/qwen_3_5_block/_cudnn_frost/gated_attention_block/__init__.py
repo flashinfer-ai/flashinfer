@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .api import (
+    CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS,
     DECODE_CLAIMED_MAX_N_Q,
     DECODE_CLAIMED_MAX_S_Q,
     DECODE_MAX_ROWS,
     DECODE_MAX_S_Q,
+    DECODE_PDL_DEFAULT_CCS,
     DECODE_PREFILL_ROUTE_MIN_CTAS,
     DECODE_PREFILL_TILE_ROWS,
     DECODE_ROUTE_POLICIES,
@@ -39,10 +41,12 @@ from .api import (
 # [vendor.py P0] the training half (api_bwd) is not vendored.
 
 __all__ = [
+    "CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS",
     "DECODE_CLAIMED_MAX_N_Q",
     "DECODE_CLAIMED_MAX_S_Q",
     "DECODE_MAX_ROWS",
     "DECODE_MAX_S_Q",
+    "DECODE_PDL_DEFAULT_CCS",
     "DECODE_PREFILL_ROUTE_MIN_CTAS",
     "DECODE_PREFILL_TILE_ROWS",
     "DECODE_ROUTE_POLICIES",

@@ -27,6 +27,6 @@ The Qwen 3.5 gated attention block (flashinfer/experimental/qwen_3_5_block/_cudn
 cuDNN Frontend Python package (python/cudnn and one file of its test tree), Copyright (c) 2024-2026 NVIDIA
 CORPORATION & AFFILIATES, vendored byte-faithfully with its import roots rewritten; each file keeps its own
 SPDX header: 59 files under the MIT License (licenses/LICENSE.cudnn-frontend-MIT.txt), 43 under Apache-2.0
-and one under "Apache-2.0 AND MIT". The pinned revision, the per-file digests and the four declared patches
+and one under "Apache-2.0 AND MIT". The pinned revision, the per-file digests and the declared patches
 are listed in that directory's VENDOR.md and VENDOR_MANIFEST.json.
-Source: https://github.com/NVIDIA/cudnn-frontend/tree/c9f3118a1de6550a60a7dcc12cf05dcccab41292
+Source: https://github.com/NVIDIA/cudnn-frontend/tree/d8b0a7ed56cd8e62bc1e05f367f339624f6dbb4e

@@ -60,6 +60,32 @@ the ideal for 32 lanes x 16 B. TMA's 128 B swizzle would not improve it, and
 the thread-per-row alternative it is designed against would be 4x worse (16
 wavefronts) because a 512-byte row stride is a multiple of the 128-byte bank
 cycle.
+
+**The pool-write arm (``pool_write``: the serving DECODE step's norm + RoPE + V copy +
+paged K / V write in ONE launch).**  With the two pools and the slot map bound, the flat
+tile space grows a third band: Q tiles, K tiles, then V tiles -- the slab's V band
+``[T, H_kv, D]`` through its own load descriptor with the K box, so the V band has exactly
+the K band's tile count.  A V tile is loaded and COPIED (its row maths is traced like a K
+row's and discarded: the warp collectives stay unconditional, nothing of it is stored); a K
+tile is normed and rotated as before.  Every K / V row then goes to ``pool[slot //
+page_size, head, slot % page_size, :]`` at ``slot = slot_mapping[token]`` from the SAME
+lanes, 32 lanes x 16 B ``st.global.v4`` per 512-B row: the K words are the bf16 pair-rounds
+(``cvt.rn.bf16x2.f32``) of the very fp32 this thread hands ``sOut[s]`` -- the vector store's
+own rounding, so the pool row is the slab row, bitwise -- and the V words are the 16 B TMA
+laid into ``sIn[s]`` (``ld.shared.v4``: a bit copy, no cast).  The predicate is
+``cache_write.py``'s, verbatim: the row's token inside ``T`` (TMA zero-filled the band's
+overshoot) AND ``0 <= slot < n_slots`` -- a negative slot is the serving stacks' padding
+convention, a slot at or past the smaller pool's capacity a caller-contract violation;
+neither writes.  The slot loads (one broadcast ``ld.global`` per row; a Q tile reads slot 0
+and discards it, so the loads are unconditional) are issued BEFORE the tile's mbarrier wait
+and ride in registers across it.  A V tile issues no slab TMA store and writes no rstd.
+**Barrier table delta: none** -- no new mbarrier; the pool stores are generic-proxy stores
+from registers inside the compute phase, before the fence + barrier that frees ``sIn[s]``;
+nothing reads ``sOut[s]`` back, so the drain and the slab store are as before.  **SMEM delta:
+none** -- the slots ride in ``rows_per_warp`` Int64 registers per lane, not in an SMEM
+array.  The launch attribute and the ``griddepcontrol`` pair are the shipped ones (the wait
+before the ring fill, which the slot loads follow; the release right after the wait).
+Exclusive with the e4m3 and MX epilogues; refused with the LDG kernel (no arm there).
 """
 
 import hashlib
@@ -92,8 +118,24 @@ from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.pointwis
     pack_u16x2,
 )
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.sf_layout import SF_ATOM_BYTES, SF_ATOM_COLS, SF_ATOM_LINE_BYTES, SF_ATOM_LINE_ROWS
-from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.tma import ld_global_v4, st_global, st_global_v2, tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.tma import (
+    ld_global,
+    ld_global_v2,
+    ld_global_v4,
+    ld_shared_v4,
+    st_global,
+    st_global_v2,
+    st_global_v4,
+    tma_load_tile,
+    tma_store_commit,
+    tma_store_tile,
+    tma_store_wait,
+)
 
+from ..cache_write_contract import _SLOT_DTYPES, check_pool, check_slot_mapping
+from .cache_write import _fake_pool as _fake_kv_pool
+from .cache_write import _fake_slot as _fake_slot_map
+from .cache_write import validate_cache_write_shape
 from .qk_norm_rope import check_norm_weights_match_recipe
 from .quantize import check_scalar_slot, require_fp8_cvt
 from .quantize_mxfp8 import SF_BLOCK, SF_TILE_ROWS, n_sf_tiles, sf_bytes, sf_tile_bytes
@@ -333,6 +375,11 @@ FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:1
 #   sRedCol  Fp32   WARPS*D                  lane: its 8     every lane: the    32 B             NONE: a warp's 32 lanes write
 #                                            running |max|   other warps' 8     (2 x 16-B       D contiguous fp32 = 1 KiB = 8
 #                                            at warp*D + d0  fp32 at w*D + d0   vectors)        full bank cycles (ideal)
+#
+#   THE POOL-WRITE ARM (pool_write; module docstring): NO new row in either table.  The paged K / V stores are generic-proxy
+#   st.global.v4 from registers inside the compute phase (between the mbarrier wait and the post-compute fence + barrier that
+#   frees sIn[s]); the slot values ride in registers (rows_per_warp Int64 per lane); a V tile neither TMA-stores nor writes rstd.
+#   SUM(issuing lanes) == init count: unchanged, mb_full 1 == 1.
 # ---------------------------------------------------------------------------
 
 
@@ -433,6 +480,8 @@ def _issue_tile_load(
     tile_rows: cutlass.Constexpr[int],
     q_tiles_per_token: cutlass.Constexpr[int],
     toks_per_ktile: cutlass.Constexpr[int],
+    n_qk_tiles=None,  # APPENDED (the pool-write arm): the first V tile; None = no V band
+    tma_v=None,  # APPENDED: the V band's GmemTileTma (the K box)
 ):
     """Arm the tile's mbar and fire both subtile TMAs into it.
 
@@ -461,7 +510,14 @@ def _issue_tile_load(
             mb_ptr,
         )
     else:
-        tma_load_tile(handle, tma_k(cutlass.Int32(0), cutlass.Int32(0), (tile_idx - n_q_tiles) * cutlass.Int32(toks_per_ktile)), mb_ptr)
+        if cutlass.const_expr(tma_v is not None):
+            # the pool-write arm: the K band's tiles, then the V band's (the same box, each relative to its band's first tile)
+            if tile_idx < n_qk_tiles:
+                tma_load_tile(handle, tma_k(cutlass.Int32(0), cutlass.Int32(0), (tile_idx - n_q_tiles) * cutlass.Int32(toks_per_ktile)), mb_ptr)
+            else:
+                tma_load_tile(handle, tma_v(cutlass.Int32(0), cutlass.Int32(0), (tile_idx - n_qk_tiles) * cutlass.Int32(toks_per_ktile)), mb_ptr)
+        else:
+            tma_load_tile(handle, tma_k(cutlass.Int32(0), cutlass.Int32(0), (tile_idx - n_q_tiles) * cutlass.Int32(toks_per_ktile)), mb_ptr)
 
 
 @cute.jit
@@ -501,6 +557,14 @@ def qk_norm_rope_tma_body(
     sOut_raw,  # io-dtype SMEM Array, stages_o * tile_elems (the output ring; None under the e4m3 epilogue)
     sRstd,  # fp32 SMEM Array, stages * tile_rows (None without rstd)
     mb_full,  # Int64 SMEM Array, stages (the ring's full barriers)
+    # -- APPENDED: the pool-write arm (module docstring).  Every one None / 0 under the shipped arms, so the positional callers read as before. --
+    tma_v=None,  # GmemTileTma over the V band [T, H_kv, D] (the K box): the V tiles' loads
+    mPoolK=None,  # [P, H_kv, page_size, D], the first three strides symbolic, D contiguous: the K pool
+    mPoolV=None,  # the V pool (its own strides)
+    mSlot=None,  # [T] int32 / int64: the flat slot of every token
+    n_slots=None,  # Int64: P x page_size of the SMALLER pool -- a slot outside [0, n_slots) writes nothing
+    page_size: cutlass.Constexpr[int] = 0,
+    slot_i64: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Grid-stride over tiles, ``stages``-deep TMA ring, warp-per-row compute.
 
@@ -532,6 +596,11 @@ def qk_norm_rope_tma_body(
     want_rstd = cutlass.const_expr(apply_norm and mRstdQ is not None)
     # The e4m3 epilogue (module docstring): q8 / k8 bound = no output ring, no TMA store, a direct 8-B store per lane.
     fp8_out = cutlass.const_expr(mQ8 is not None)
+    # The pool-write arm (module docstring): the K band's post-RoPE rows and the V band's rows go to the paged pools from this launch.
+    pool_write = cutlass.const_expr(mPoolK is not None)
+    # Q tiles, K tiles, then -- under the arm -- the V tiles, as many as the K tiles: the K / V boundary is n_q + (n_tiles - n_q) / 2
+    # (tile_counts(pool_write=True) builds n_tiles that way); without the arm every tile past the Q band is a K tile.
+    n_qk_tiles = ((n_tiles + n_q_tiles) // cutlass.Int32(2)) if cutlass.const_expr(pool_write) else n_tiles
 
     io_dtype = mQ.element_type  # a trace-time type object, NOT a const_expr candidate
 
@@ -571,6 +640,8 @@ def qk_norm_rope_tma_body(
                 tile_rows,
                 q_tiles_per_token,
                 toks_per_ktile,
+                n_qk_tiles,
+                tma_v,
             )
 
     full_state = PipelineState.start(phase=0)
@@ -592,6 +663,33 @@ def qk_norm_rope_tma_body(
     while tile < n_tiles:
         s = full_state.idx
         so = out_state.idx
+        is_q = tile < n_q_tiles  # ONE warp-uniform decision per TILE
+        tok_q = tile // cutlass.Int32(q_tiles_per_token)
+        head0_q = (tile % cutlass.Int32(q_tiles_per_token)) * cutlass.Int32(tile_rows)
+        if cutlass.const_expr(pool_write):
+            is_v = tile >= n_qk_tiles  # the V band: ONE warp-uniform decision per TILE, like is_q
+            is_kv = tile >= n_q_tiles  # a K or a V tile: the rows that go to the pools
+            kv_tile0 = n_qk_tiles if is_v else n_q_tiles
+        else:
+            kv_tile0 = n_q_tiles
+        tok0_k = (tile - kv_tile0) * cutlass.Int32(toks_per_ktile)  # the first token of a K (or V) tile
+        if cutlass.const_expr(pool_write):
+            # The slots of this tile's rows, loaded BEFORE the TMA wait and kept in registers across it: one broadcast ld.global per
+            # row (every lane of the warp reads its row's token; a Q tile reads slot 0 and discards it -- a select keeps the loads
+            # unconditional).  int64: two 32-bit halves recombined, so the 64-bit value is what the range check sees and a slot
+            # >= 2^31 can never alias an in-range one; int32: one word, sign-extended (cache_write.py's rule, verbatim).
+            slots = []
+            for u in cutlass.range_constexpr(rows_per_warp):
+                r = warp_id + cutlass.Int32(u * warps)
+                tok_s = tok0_k + r // cutlass.Int32(h_kv_ct)
+                tok_s = tok_s if tok_s < n_tokens else n_tokens - cutlass.Int32(1)  # a padded K / V row: a valid address, its store predicated off
+                tok_s = cutlass.Int32(0) if is_q else tok_s
+                s_addr = mSlot.iterator.toint() + tok_s.to(cutlass.Int64) * (cutlass.Int64(8) if cutlass.const_expr(slot_i64) else cutlass.Int64(4))
+                if cutlass.const_expr(slot_i64):
+                    lo, hi = ld_global_v2(s_addr, cutlass.Int32)
+                    slots.append((hi.to(cutlass.Int64) * cutlass.Int64(1 << 32)) + (lo.to(cutlass.Int64) & cutlass.Int64(0xFFFFFFFF)))
+                else:
+                    slots.append(ld_global(s_addr, cutlass.Int32).to(cutlass.Int64))
         wait(mb_full.subview(s), full_state.phase)
         full_state = advance(full_state, stages)
         out_state = advance(out_state, stages_o)
@@ -613,6 +711,8 @@ def qk_norm_rope_tma_body(
                     tile_rows,
                     q_tiles_per_token,
                     toks_per_ktile,
+                    n_qk_tiles,
+                    tma_v,
                 )
 
         # sOut[s]'s PREVIOUS store must have drained before any lane rewrites
@@ -635,10 +735,6 @@ def qk_norm_rope_tma_body(
                     tma_store_wait(stages_o - 1)
             nvvm.barrier_cta_sync()
 
-        is_q = tile < n_q_tiles  # ONE warp-uniform decision per TILE
-        tok_q = tile // cutlass.Int32(q_tiles_per_token)
-        head0_q = (tile % cutlass.Int32(q_tiles_per_token)) * cutlass.Int32(tile_rows)
-        tok0_k = (tile - n_q_tiles) * cutlass.Int32(toks_per_ktile)
         scale_t = scale_q if is_q else scale_k  # the e4m3 epilogue's per-TILE scale (an unused 1.0 otherwise)
 
         for u in cutlass.range_constexpr(rows_per_warp):
@@ -739,6 +835,35 @@ def qk_norm_rope_tma_body(
                     st_global_v2(dst8, packed8, cutlass.Int32)
             else:
                 sOut_raw.store(cutlass.Vector.from_elements(tuple(ys), cutlass.Float32).to(io_dtype), off_out, vector_size=ELEMS_PER_ACCESS, alignment=16)
+            if cutlass.const_expr(pool_write):
+                # The paged write of this row (K and V tiles; a Q tile's row is dead by the predicate): this thread's 16 B to
+                # pool[page, head, off, lane*8 : +8] at slot = slot_mapping[token], page = slot // page_size, off = slot % page_size.
+                # The K words are the bf16 pair-rounds of the very fp32 this thread just handed sOut[s] (cvt.rn.bf16x2.f32 == the
+                # vector store's rounding: the pool row is the slab row, bitwise); the V words are the 16 B TMA laid into sIn[s]
+                # (ld.shared.v4: a bit copy).  Everything is formed unconditionally and the band SELECTS -- no assignment inside a
+                # dynamic branch (the DSL joins such a name as None on the other path), only the store is predicated, cache_write.py's
+                # way: a K / V tile AND the row's token inside T (TMA zero-filled the band's overshoot) AND 0 <= slot < n_slots; a dead
+                # row's page / off are garbage its predicated store ignores.
+                pw_k = [fp32_to_fp16(ys[2 * i], ys[2 * i + 1], dtype=io_dtype) for i in range(ELEMS_PER_ACCESS // 2)]
+                pw_v = ld_shared_v4(sIn_raw.data_ptr(off_in), cutlass.Int32)
+                pw_words = [pw_v[i] if is_v else pw_k[i] for i in range(WORDS_PER_ACCESS)]
+                pw_slot = slots[u]
+                pw_live = is_kv & (tok_k_raw < n_tokens) & (pw_slot >= cutlass.Int64(0)) & (pw_slot < n_slots)
+                pw_slot32 = pw_slot.to(cutlass.Int32)  # an in-range slot fits 32 bits; the divide by the constexpr page size strength-reduces
+                pw_page = pw_slot32 // cutlass.Int32(page_size)
+                pw_off = pw_slot32 - pw_page * cutlass.Int32(page_size)
+                pw_head = r % cutlass.Int32(h_kv_ct)
+                pw_base = mPoolV.iterator.toint() if is_v else mPoolK.iterator.toint()
+                pw_s0 = cutlass.Int64(mPoolV.stride[0]) if is_v else cutlass.Int64(mPoolK.stride[0])
+                pw_s1 = cutlass.Int64(mPoolV.stride[1]) if is_v else cutlass.Int64(mPoolK.stride[1])
+                pw_s2 = cutlass.Int64(mPoolV.stride[2]) if is_v else cutlass.Int64(mPoolK.stride[2])
+                pw_dst = (
+                    pw_base
+                    + (pw_page.to(cutlass.Int64) * pw_s0 + pw_head.to(cutlass.Int64) * pw_s1 + pw_off.to(cutlass.Int64) * pw_s2) * cutlass.Int64(BPE)
+                    + lane.to(cutlass.Int64) * cutlass.Int64(ELEMS_PER_ACCESS * BPE)
+                )
+                if pw_live:
+                    st_global_v4(pw_dst, pw_words, cutlass.Int32)
             if cutlass.const_expr(want_rstd):
                 # gathered here, emitted below as ONE coalesced store for the
                 # whole tile -- not one 4-byte scattered store per row
@@ -777,6 +902,8 @@ def qk_norm_rope_tma_body(
                     tile_rows,
                     q_tiles_per_token,
                     toks_per_ktile,
+                    n_qk_tiles,
+                    tma_v,
                 )
 
         if cutlass.const_expr(not fp8_out):
@@ -788,10 +915,17 @@ def qk_norm_rope_tma_body(
                             tma_qo(cutlass.Int32(0), head0_q, tok_q),
                         )
                     else:
-                        tma_store_tile(
-                            _tile_handle(sOut_raw, so * cutlass.Int32(tile_elems), tile_elems, subtiles, subtile_elems),
-                            tma_ko(cutlass.Int32(0), cutlass.Int32(0), tok0_k),
-                        )
+                        if cutlass.const_expr(pool_write):
+                            if tile < n_qk_tiles:  # a V tile leaves nothing in the slab (V was never moved); the K store is as before
+                                tma_store_tile(
+                                    _tile_handle(sOut_raw, so * cutlass.Int32(tile_elems), tile_elems, subtiles, subtile_elems),
+                                    tma_ko(cutlass.Int32(0), cutlass.Int32(0), tok0_k),
+                                )
+                        else:
+                            tma_store_tile(
+                                _tile_handle(sOut_raw, so * cutlass.Int32(tile_elems), tile_elems, subtiles, subtile_elems),
+                                tma_ko(cutlass.Int32(0), cutlass.Int32(0), tok0_k),
+                            )
                     tma_store_commit()
 
         if cutlass.const_expr(want_rstd):
@@ -801,7 +935,10 @@ def qk_norm_rope_tma_body(
                     idx = (tok_q * cutlass.Int32(h_q_ct) + head0_q + lane) if is_q else (tok0_k * cutlass.Int32(h_kv_ct) + lane)
                     rbase = mRstdQ.iterator.toint() if is_q else mRstdK.iterator.toint()
                     val = sRstd.subview(s * cutlass.Int32(tile_rows) + lane).load()
-                    if tok_l < n_tokens:  # K's last tile may overshoot; Q never does
+                    rstd_row = tok_l < n_tokens  # K's last tile may overshoot; Q never does
+                    if cutlass.const_expr(pool_write):
+                        rstd_row = rstd_row & (tile < n_qk_tiles)  # a V tile's row maths is discarded: it has no rstd
+                    if rstd_row:
                         st_global(rbase + idx.to(cutlass.Int64) * cutlass.Int64(4), val, cutlass.Float32)
 
         if cutlass.const_expr(refill_pos == REFILL_LATE):
@@ -821,6 +958,8 @@ def qk_norm_rope_tma_body(
                     tile_rows,
                     q_tiles_per_token,
                     toks_per_ktile,
+                    n_qk_tiles,
+                    tma_v,
                 )
         if cutlass.const_expr(refill_pos == REFILL_TOP):
             prev_s = s
@@ -1273,8 +1412,18 @@ def frost_qk_norm_rope_tma(
     batch: cutlass.Int32,
     n_blk: cutlass.Int32,
     n_sft: cutlass.Int32,
+    # APPENDED: the pool-write arm (module docstring; mPoolK bound = the arm): the two pools, the slot map, the V band's load descriptor
+    # (a placeholder -- K's -- under the other arms, never touched), the slot capacity and the two compile keys of the paged write.
+    mPoolK: Optional[cute.Tensor],
+    mPoolV: Optional[cute.Tensor],
+    mSlot: Optional[cute.Tensor],
+    tma_v_desc: cutlass.GridConstant[tmap.TensorMap],
+    n_slots: cutlass.Int64,
+    page_size: cutlass.Constexpr[int],
+    slot_i64: cutlass.Constexpr[bool],
     # APPENDED: programmatic dependent launch (the launch attribute is set by qk_norm_rope_tma_launch under the same flag): the wait
-    # precedes the bodies' ring fill (their first global read: the slab bands a projection launch wrote), the release follows it.
+    # precedes the bodies' ring fill (their first global read: the slab bands a projection launch wrote) and the pool-write arm's slot
+    # loads, the release follows it.
     use_pdl: cutlass.Constexpr[bool] = False,
 ) -> None:
     """The standalone launch shape of :func:`qk_norm_rope_tma_body` (the SMEM rings allocated here -- the SMEM buffer table --,
@@ -1285,6 +1434,7 @@ def frost_qk_norm_rope_tma(
     apply_norm = cutlass.const_expr(mWq is not None)
     want_rstd = cutlass.const_expr(apply_norm and mRstdQ is not None)
     fp8_out = cutlass.const_expr(mQ8 is not None and not mx_out)
+    pool_write = cutlass.const_expr(mPoolK is not None)  # the pool-write arm (bf16 / f16 TMA store only)
     io_dtype = mQ.element_type  # a trace-time type object, NOT a const_expr candidate
     sIn_raw = cutlass.Array(io_dtype, stages * tile_elems, alignment=128, space=cutlass.AddressSpace.smem)
     # The output ring exists only for the bf16 TMA store: the e4m3 and the MX epilogues store straight to GMEM.
@@ -1380,6 +1530,13 @@ def frost_qk_norm_rope_tma(
             sOut_raw,
             sRstd,
             mb_full,
+            GmemTileTma(tma_v_desc) if cutlass.const_expr(pool_write) else None,
+            mPoolK,
+            mPoolV,
+            mSlot,
+            n_slots,
+            page_size,
+            slot_i64,
         )
 
 
@@ -1425,6 +1582,15 @@ def qk_norm_rope_tma_launch(
     batch: cutlass.Int32,
     n_blk: cutlass.Int32,
     n_sft: cutlass.Int32,
+    # -- APPENDED: the pool-write arm's operands (pool_k bound = the arm): the V band [T, H_kv, D] (its own load descriptor, the K box),
+    # the two pools [P, H_kv, page_size, D], the slot map [T], the slot capacity, and the page size / slot width (compile keys) --
+    v: Optional[cute.Tensor],
+    pool_k: Optional[cute.Tensor],
+    pool_v: Optional[cute.Tensor],
+    slot: Optional[cute.Tensor],
+    n_slots: cutlass.Int64,
+    page_size: cutlass.Constexpr[int],
+    slot_i64: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
     use_pdl: cutlass.Constexpr[bool] = False,  # APPENDED: the programmatic-dependent-launch form (attribute + the kernel's griddepcontrol pair)
 ):
@@ -1455,8 +1621,12 @@ def qk_norm_rope_tma_launch(
     stride ``N``, batch stride ``S * N``) and BOTH boxes are ``(1, 32, 1, GRANU)`` -- one head x 32 tokens,
     coordinates ``(d, h, s, b)`` -- so TMA clips every tile at ``S`` (a block never straddles a batch) and
     zero-fills the ragged tail; the output descriptors are placeholders as under the e4m3 epilogue.
+
+    Under the pool-write arm (``pool_k`` bound) a FIFTH load descriptor covers the V band with the K box (``v`` is the ``[T, H_kv, D]``
+    band at the slab's token stride); under the other arms that slot carries the K descriptor again, a placeholder the kernel never touches.
     """
     mx_out = cutlass.const_expr(sf_q is not None)
+    pool_write = cutlass.const_expr(pool_k is not None)
     if cutlass.const_expr(mx_out):
         box_q = (1, MX_TILE_TOKENS, 1, TMA_GRANU_ELEMS)
         box_k = (1, MX_TILE_TOKENS, 1, TMA_GRANU_ELEMS)
@@ -1513,6 +1683,13 @@ def qk_norm_rope_tma_launch(
         batch,
         n_blk,
         n_sft,
+        pool_k,
+        pool_v,
+        slot,
+        mk(v if cutlass.const_expr(pool_write) else k, box_k),
+        n_slots,
+        page_size,
+        slot_i64,
         use_pdl,
     ).launch(grid=(n_ctas, 1, 1), block=(threads_per_cta, 1, 1), stream=stream, use_pdl=use_pdl)
 
@@ -1547,6 +1724,11 @@ class QkNormRopeTmaRecipe(NamedTuple):
     mx_out: bool = False
     # Appended (default = today's artifact): the programmatic-dependent-launch form traced (the launch attribute + the griddepcontrol pair).
     use_pdl: bool = False
+    # Appended (default = today's artifact): the pool-write arm traced (module docstring): ``v`` (the V band), ``k_cache`` / ``v_cache``
+    # and ``slot_mapping`` REQUIRED at execute (refused otherwise); ``page_size`` and ``slot_dtype`` are its compile keys.
+    pool_write: bool = False
+    page_size: int = 0
+    slot_dtype: object = None
 
 
 def _fake(dtype, shape, stride_order):
@@ -1581,15 +1763,16 @@ def _fake_slot():
     return cute.runtime.make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=4)
 
 
-def tile_counts(t: int, h_q: int, h_kv: int, tile_rows: int) -> tuple[int, int]:
+def tile_counts(t: int, h_q: int, h_kv: int, tile_rows: int, pool_write: bool = False) -> tuple[int, int]:
     """(n_q_tiles, n_tiles). A Q tile is ``tile_rows`` heads of one token; a K
     tile is ``tile_rows // h_kv`` whole tokens, so its LAST tile may overshoot
     ``T`` -- TMA clips the store against the descriptor extent and the rstd
-    write is predicated."""
+    write is predicated.  ``pool_write`` (appended): the V band's tiles follow
+    the K band's, as many again (the kernel reads the K / V boundary off that)."""
     n_q = t * (h_q // tile_rows)
     toks_per_ktile = tile_rows // h_kv
     n_k = (t + toks_per_ktile - 1) // toks_per_ktile
-    return n_q, n_q + n_k
+    return n_q, n_q + n_k + (n_k if pool_write else 0)
 
 
 def compile_qk_norm_rope_tma(
@@ -1612,6 +1795,9 @@ def compile_qk_norm_rope_tma(
     fp8_out: bool = False,
     mx_out: bool = False,
     use_pdl: bool = False,
+    pool_write: bool = False,
+    page_size: int = 0,
+    slot_dtype=torch.int32,
 ) -> QkNormRopeTmaRecipe:
     """Build the TMA artifact from shapes alone. ``apply_norm=False`` traces the
     RoPE-only kernel (weights traced as ``None``, no rstd allowed) and is part
@@ -1625,7 +1811,12 @@ def compile_qk_norm_rope_tma(
     sf_k_T`` + ``batch`` / ``seq_len`` REQUIRED at execute, the bf16 outputs, the
     per-tensor scales and the rstd refused; needs the fp8 ``cvt`` and the e8m0 one
     (sm_100+); exclusive with ``fp8_out``; ``tile_rows`` is validated for the
-    shipped arms only (the MX tile is 32 tokens whatever it says).  In the key."""
+    shipped arms only (the MX tile is 32 tokens whatever it says).  In the key.
+    ``pool_write`` (appended) traces the pool-write arm (module docstring): the V
+    band, ``k_cache`` / ``v_cache`` (``[P, H_kv, page_size, D]``, D contiguous) and
+    ``slot_mapping`` (``[T]`` of ``slot_dtype``) become REQUIRED at execute; ``page_size``
+    (the in-kernel divide) and ``slot_dtype`` are compile keys; exclusive with the two
+    quantizing epilogues.  In the key."""
     if not isinstance(mx_out, bool):
         raise ValueError(f"mx_out must be a bool (whether the MX epilogue is traced), got {mx_out!r}")
     if not isinstance(fp8_out, bool):
@@ -1643,6 +1834,18 @@ def compile_qk_norm_rope_tma(
         validate_shape(d, rope_dim, h_q, h_kv, tile_rows, threads_per_cta)
     if fp8_out:
         require_fp8_cvt("compile_qk_norm_rope_tma(fp8_out=True)")
+    if not isinstance(pool_write, bool):
+        raise ValueError(f"pool_write must be a bool (whether the paged K / V write is traced into the launch), got {pool_write!r}")
+    if pool_write:
+        if fp8_out or mx_out:
+            raise ValueError(
+                "pool_write=True (the paged K / V write from the norm + RoPE launch) is an arm of the bf16 / f16 TMA store; it is exclusive with fp8_out / mx_out"
+            )
+        validate_cache_write_shape(d, int(page_size), threads_per_cta)
+        if slot_dtype not in _SLOT_DTYPES:
+            raise ValueError(f"pool_write=True: slot_dtype must be torch.int32 or torch.int64 (a compile key), got {slot_dtype}")
+    else:
+        page_size, slot_dtype = 0, None  # not traced: one key for every shipped-arm artifact whatever the caller spelled
     # None means the DEFAULT, not "match stages" -- otherwise changing
     # DEFAULT_STAGES_O silently does nothing for every caller that omits it,
     # which is exactly what happened when it moved 2 -> 1.
@@ -1683,6 +1886,9 @@ def compile_qk_norm_rope_tma(
         bool(fp8_out),
         bool(mx_out),
         bool(use_pdl),
+        bool(pool_write),
+        int(page_size),
+        str(slot_dtype),
     )
     if key not in compiled_cache:
         # The dict stays the in-process memo; behind it sits the persistent compiled-plan cache (``cudnn.frost.compiled_cache``),
@@ -1712,6 +1918,13 @@ def compile_qk_norm_rope_tma(
             if mx_out
             else [None] * 6
         )
+        # the pool-write arm's operands, traced ONLY under pool_write: the V band (a [T, H_kv, D] view at a symbolic token stride), the
+        # two pools (cache_write.py's fakes: P and the first three strides symbolic, D contiguous) and the slot map of the keyed width
+        pools = (
+            [_fake_thd(dtype, tok, h_kv, d), _fake_kv_pool(dtype, h_kv, page_size, d), _fake_kv_pool(dtype, h_kv, page_size, d), _fake_slot_map(slot_dtype)]
+            if pool_write
+            else [None] * 4
+        )
         compiled_cache[key] = compile_cached(
             qk_norm_rope_tma_launch,
             *dense,
@@ -1739,6 +1952,10 @@ def compile_qk_norm_rope_tma(
             cutlass.Int32(0),  # batch    )
             cutlass.Int32(0),  # n_blk    )
             cutlass.Int32(0),  # n_sft    )
+            *pools,
+            cutlass.Int64(0),  # n_slots: runtime (the smaller pool's capacity)
+            int(page_size),
+            slot_dtype == torch.int64,
             _FAKE_STREAM,
             bool(use_pdl),
             options="--enable-tvm-ffi",
@@ -1761,6 +1978,9 @@ def compile_qk_norm_rope_tma(
         fp8_out=bool(fp8_out),
         mx_out=bool(mx_out),
         use_pdl=bool(use_pdl),
+        pool_write=bool(pool_write),
+        page_size=int(page_size),
+        slot_dtype=slot_dtype,
     )
 
 
@@ -1846,6 +2066,10 @@ def run_qk_norm_rope_tma(
     sf_k_T=None,
     batch=None,
     seq_len=None,
+    v=None,
+    k_cache=None,
+    v_cache=None,
+    slot_mapping=None,
 ) -> None:
     """The lowered launch. ``w_q``/``w_k`` are both ``None`` for a RoPE-only
     recipe (``r.apply_norm`` False) and both tensors otherwise -- checked, both
@@ -1860,7 +2084,12 @@ def run_qk_norm_rope_tma(
     ``sf_k`` (the SDPA rowwise SF tiles), ``q_T8`` / ``k_T8`` (the COLUMNWISE payloads, compact ``[T, H, D]``), ``sf_q_T`` / ``sf_k_T``
     (the D-plane-major atoms) and ``batch`` / ``seq_len`` (``T == batch * seq_len``) are REQUIRED; ``q_out`` / ``k_out``,
     ``scale_q`` / ``scale_k`` and the rstd outputs are refused.  Every SF blob is ``B*H*ceil(S/128)*4*D`` bytes.  Without ``mx_out``
-    the eight MX operands must be ``None``."""
+    the eight MX operands must be ``None``.
+
+    Appended, checked BOTH ways against ``r.pool_write``: under the pool-write arm ``v`` (the ``[T, H_kv, D]`` V band at any 16-B-aligned
+    token stride), ``k_cache`` / ``v_cache`` (``[P, H_kv, page_size, D]``, the cache-write contract) and ``slot_mapping`` (``[T]`` of the
+    recipe's slot dtype) are REQUIRED; the kernel range-checks every slot against the SMALLER pool's capacity.  Without it all four must be
+    ``None``."""
     t = int(q.shape[0])
     check_norm_weights_match_recipe(r.apply_norm, w_q, w_k)
     if r.want_rstd and (rstd_q is None or rstd_k is None):
@@ -1932,6 +2161,11 @@ def run_qk_norm_rope_tma(
             cutlass.Int32(batch),
             cutlass.Int32(n_blk),
             cutlass.Int32(n_sft),
+            None,  # the pool-write arm's operands: absent from the MX arm (v, k_cache, v_cache, slot_mapping, n_slots)
+            None,
+            None,
+            None,
+            cutlass.Int64(0),
             cuda.CUstream(int(stream)),
         )
         return
@@ -1940,7 +2174,35 @@ def run_qk_norm_rope_tma(
             "this artifact was compiled WITHOUT the MX epilogue (mx_out=False); passing sf_q / q_T8 / sf_q_T / sf_k / k_T8 / sf_k_T / batch / seq_len would "
             "silently ignore them (Rule 1)"
         )
-    n_q_tiles, n_tiles = tile_counts(t, r.h_q, r.h_kv, r.tile_rows)
+    pool_write = bool(getattr(r, "pool_write", False))
+    pool_ops = (("v", v), ("k_cache", k_cache), ("v_cache", v_cache), ("slot_mapping", slot_mapping))
+    n_slots = 0
+    if pool_write:
+        if any(x is None for _, x in pool_ops):
+            raise ValueError(
+                "this artifact was compiled WITH the pool-write arm (pool_write=True): v (the V band [T, H_kv, D]), k_cache, v_cache and slot_mapping "
+                "must all be bound at execute (Rule 1: no silent fallback)"
+            )
+        if v.dtype != q.dtype or v.dim() != 3 or tuple(int(x) for x in v.shape) != (t, r.h_kv, r.d) or int(v.stride(1)) != r.d or int(v.stride(2)) != 1:
+            raise ValueError(
+                f"v must be the [T={t}, H_kv={r.h_kv}, D={r.d}] V band of q's dtype with contiguous heads (strides (*, {r.d}, 1)), got {v.dtype} "
+                f"{tuple(v.shape)} strides {tuple(v.stride())}"
+            )
+        if (int(v.stride(0)) * v.element_size()) % 16 or v.data_ptr() % 16 or v.device != q.device:
+            raise ValueError(f"v rows must be 16-byte aligned on q's device (token stride {v.stride(0)} elements, data_ptr {v.data_ptr():#x}, {v.device})")
+        check_pool(k_cache, "k_cache", h=r.h_kv, page_size=r.page_size, d=r.d, dtype=q.dtype, device=q.device)
+        check_pool(v_cache, "v_cache", h=r.h_kv, page_size=r.page_size, d=r.d, dtype=q.dtype, device=q.device)
+        check_slot_mapping(slot_mapping, "slot_mapping", t=t, device=q.device)
+        if slot_mapping.dtype != r.slot_dtype:
+            raise ValueError(f"slot_mapping is {slot_mapping.dtype} but this artifact was compiled for {r.slot_dtype}; the slot dtype is a compile key")
+        # the capacity the kernel range-checks every slot against: the SMALLER pool's (cache_write.py's rule)
+        n_slots = min(int(k_cache.shape[0]), int(v_cache.shape[0])) * r.page_size
+    elif any(x is not None for _, x in pool_ops):
+        raise ValueError(
+            "this artifact was compiled WITHOUT the pool-write arm (pool_write=False); passing v / k_cache / v_cache / slot_mapping would silently ignore "
+            "them (Rule 1)"
+        )
+    n_q_tiles, n_tiles = tile_counts(t, r.h_q, r.h_kv, r.tile_rows, pool_write=pool_write)
     if fp8_out:
         if q8 is None or k8 is None or scale_q is None or scale_k is None:
             raise ValueError(
@@ -1994,6 +2256,11 @@ def run_qk_norm_rope_tma(
         cutlass.Int32(0),
         cutlass.Int32(0),
         cutlass.Int32(0),
+        v,  # the pool-write arm's operands (None under the shipped arms)
+        k_cache,
+        v_cache,
+        slot_mapping,
+        cutlass.Int64(n_slots),
         cuda.CUstream(int(stream)),
     )
 

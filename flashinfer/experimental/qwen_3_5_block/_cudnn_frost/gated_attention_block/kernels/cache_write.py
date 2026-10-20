@@ -24,6 +24,13 @@ two pre-development tables of a FROST kernel (barriers, SMEM buffers) are empty 
 
 Traffic per launch: ``n_ops * T * H * D * elem`` read + the same written, plus ``T`` slot reads.  The roofline term is
 HBM bytes; no perf claim is made here until one is measured on an exclusive GPU.
+
+Programmatic dependent launch (``use_pdl``): the ``griddepcontrol.wait`` precedes the first dependent read (the slot map and the
+source rows, both written by earlier kernels of the stream) and the ``launch_dependents`` release sits RIGHT AFTER it -- the
+streaming-kernel placement: the dependent's own wait still blocks on this grid's full completion and memory flush, so an early
+release costs nothing in correctness and lets the dependent's prologue (the decode tile's TMEM allocation, descriptor prefetch,
+barrier init) overlap this write instead of following it.  It used to sit at the kernel's END, after the stores, which only
+delayed that prologue by the whole write.
 """
 
 import hashlib
@@ -95,7 +102,10 @@ def frost_cache_write(
     ``D``, ``slot_mapping`` and the compile-time ``page_size``; their pools may differ in strides.
     """
     if cutlass.const_expr(use_pdl):
+        # The wait before the first dependent read (the slot map, the source rows); the release right after it (module docstring):
+        # the dependent's wait blocks on this grid's completion + flush regardless, so nothing below needs to precede the release.
         wait_on_dependent_grids()
+        launch_dependent_grids()
 
     lanes = cutlass.const_expr(lanes_per_row(d))
     chunks = cutlass.const_expr(vec_chunks(d))
@@ -173,9 +183,6 @@ def frost_cache_write(
             for c in cutlass.range_constexpr(chunks):
                 coff = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
                 st_global_v4(dsts[r] + coff, srcs[r][c], cutlass.Int32)
-
-    if cutlass.const_expr(use_pdl):
-        launch_dependent_grids()
 
 
 @cute.jit

@@ -2583,11 +2583,12 @@ class pygraph:
 
         return json.dumps(self.inspect(), default=str, indent=2)
 
-    def serialize(self):
-        """Serialize the graph (classic passthrough).
+    def serialize(self, *, as_bytes: bool = False):
+        """Serialize the graph's cuDNN backend execution plan.
 
-        Returns the C++ binding's serialized form unchanged; C++
-        ``deserialize`` accepts exactly this form back.
+        Returns a list of byte values by default. Set ``as_bytes=True`` to
+        return the same binary data as compact ``bytes`` without constructing
+        a Python list. ``deserialize`` accepts either representation.
         """
         if self._lowered_graph is None:
             # Serialization is the cuDNN graph format by definition — lower on
@@ -2603,7 +2604,7 @@ class pygraph:
                 self._lowered_graph = self._lower_to_cpp()
                 self._lowered_graph.validate()
                 self._verify_uid_ownership()
-        return self._lowered_graph.serialize()
+        return self._lowered_graph.serialize(as_bytes=as_bytes)
 
     def deserialize(self, *args, **kwargs) -> None:
         """Deserialize a graph. This is the one genuinely ambiguous classic
@@ -2611,7 +2612,8 @@ class pygraph:
         so it stays a passthrough. The handle can arrive as the first positional
         or as the ``handle_`` keyword (the pybind overload's name); unwrap a
         Handle to its backend int and leave the ``data`` blob (the other overload)
-        untouched."""
+        untouched. Binary data may be ``bytes`` or the legacy list of byte
+        values; JSON strings retain their structural-graph meaning."""
         if args and isinstance(args[0], Handle):
             args = (args[0].backend_handle,) + args[1:]
         if isinstance(kwargs.get("handle_"), Handle):

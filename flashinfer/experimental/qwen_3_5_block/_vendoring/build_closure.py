@@ -28,7 +28,7 @@ ap.add_argument("--fe", required=True)
 ap.add_argument("--traces", required=True)
 ap.add_argument("--out", required=True)
 ap.add_argument("--tables", default=None)
-ap.add_argument("--commit", default="c9f3118a1")
+ap.add_argument("--commit", default="d8b0a7ed5")
 args = ap.parse_args()
 FE = Path(args.fe)
 PKG = FE / "python" / "cudnn"
@@ -93,7 +93,7 @@ EXTRA = {
     "cudnn.gemm.frost.kernel_templates.dynamic_scheduler_counter_initialization": "17 lines; the kernel_templates package's second shared template (imported by rendered sources of other pipelines; kept so the package is whole)",
     # the separate launches the block's own declaration rules select off the fused arms (lazily imported by gated_attention_block/api.py):
     "cudnn.gated_attention_block.kernels.elementwise": "the sigmoid-gate launch (_SigmoidGate): what the DECODE form runs when the decode tile runs unsplit (decode_split_kv=1), where the gate cannot ride the split combine",
-    "cudnn.gated_attention_block.kernels.cache_write": "the separate paged write-through launch (_CacheWrite): what runs when the write-through is not folded into the fused projection's epilogue (fuse_cache_write=False)",
+    "cudnn.gated_attention_block.kernels.cache_write": "the separate paged write-through launch (_CacheWrite): what runs when the write-through is folded neither into the fused projection's epilogue nor into the norm + RoPE launch (fuse_cache_write=False, or 128+ rows with q_len > 1 on the lowered decode chain); also a module-level dependency of the TMA norm + RoPE kernel's pool-write arm",
     "cudnn.gated_attention_block.kernels.qk_norm_rope": "the shared helpers of the two launches above (ACCESS_BYTES, lanes_per_row, vec_chunks, ...) and the ldg norm + RoPE arm of the unfused chain",
 }
 TEST_HELPERS = {
