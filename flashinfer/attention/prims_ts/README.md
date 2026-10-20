@@ -335,10 +335,8 @@ both.
 
 A dense Q128 plan (`head_dim=128`, `q_block_size * Hq / Hkv >= 128`) accepts
 `query_paired=True`: each CTA then runs two consecutive Q128 tiles of one
-sequence and KV head over a single K/V stream and loads each K/V tile once for
-both. Pairing halves the CTA count, so it suits grids that still fill the GPU.
-A causal CTA streams the K/V range of its later Q tile, and the earlier tile
-masks the keys past its own range.
+sequence and KV head over a single K/V stream; see
+[Query pairing](kernels/fmha_decode/README.md#query-pairing).
 
 Every plan takes `softmax_rescale_threshold_log2` (0 to 8, default 8). On the
 Q64/KV256 and Q128/KV128 tiles of dense and block-sparse plans, a row keeps its
@@ -663,6 +661,7 @@ pytest -q \
   tests/attention/test_attention_ts_block_sparse.py \
   tests/attention/test_attention_ts_features.py \
   tests/attention/test_attention_ts_mla_decode.py \
+  tests/attention/test_attention_ts_query_paired.py \
   tests/attention/test_attention_ts_sage.py \
   tests/attention/test_attention_ts_context_sage.py \
   tests/attention/test_attention_ts_vc.py

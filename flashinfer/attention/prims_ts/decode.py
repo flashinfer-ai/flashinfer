@@ -3935,14 +3935,10 @@ class BatchDecodePagedTSWrapper:
             frozen for the lifetime of the plan.
         query_paired : bool, optional
             Run two consecutive grouped Keeps Q128 tiles of one request and KV
-            head per CTA over one K/V stream. True pairs when the launch
-            supports it: an FP16, BF16 or FP8 recipe with head dim 128 (64 or
-            128 for FP8, which pairs only fixed-Q page-32 launches) and no
-            sliding window, two Q tiles in a request, and enough Q tiles to
-            fill one wave of CTAs. ``None`` (default) pairs when the automatic
-            tile selection for fixed multi-token page-32 launches scores the
-            paired tile cheapest; False never pairs. The plan's policy records
-            the outcome.
+            head per CTA over one K/V stream when the launch supports it (True),
+            never (False), or when the automatic tile selection prefers it
+            (``None``, default); the decode README's Query pairing section lists
+            the launches that pair. The plan's policy records the outcome.
         validate : bool
             Validate static geometry and caller scratch. Defaults to ``True``.
             Disable only for previously validated inputs and warmed topology.
