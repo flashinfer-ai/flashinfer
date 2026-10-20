@@ -235,10 +235,10 @@ class Package:
     refs: Callable[[Path, str], set[str]]
 
 
-# dsa_train, kda_train, dsa_indexer, the rmsnorm, the causal conv1d and the ulysses backends are read with the
-# generic walker (a mapping carrying ``library`` under an ``arches`` / ``arch`` scope).  Their exporters' registry
-# shapes fit it: a record carries ``arches`` and either ``library`` itself (dsa_indexer PROGRAMS, rmsnorm, causal
-# conv1d and ulysses MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
+# dsa_train, kda_train, dsa_indexer, the rmsnorm, the causal conv1d, the ulysses and the NVFP4 SVDQuant GEMM backends
+# are read with the generic walker (a mapping carrying ``library`` under an ``arches`` / ``arch`` scope).  Their
+# exporters' registry shapes fit it: a record carries ``arches`` and either ``library`` itself (dsa_indexer PROGRAMS,
+# rmsnorm, causal conv1d, ulysses and svdquant MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
 PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.cake_rmsnorm_train_backend",
@@ -305,6 +305,12 @@ PACKAGES: tuple[Package, ...] = (
         "flashinfer/experimental/cake_stepfun_moe",
         "cake_jit.py",
         refs_stepfun,
+    ),
+    Package(
+        "flashinfer.cake_nvfp4_svdquant_gemm_backend",
+        "flashinfer/cake_nvfp4_svdquant_gemm_backend",
+        "cake_jit.py",
+        refs_generic,
     ),
 )
 

@@ -25,6 +25,7 @@ PACKAGES: dict[str, str] = {
     "cake_mok_bf16": "flashinfer.experimental.cake_mok_bf16",
     "cake_kda_train": "flashinfer.experimental.cake_kda_train",
     "cake_stepfun_moe": "flashinfer.experimental.cake_stepfun_moe",
+    "cake_nvfp4_svdquant_gemm": "flashinfer.cake_nvfp4_svdquant_gemm_backend",
 }
 
 
