@@ -516,7 +516,79 @@ def prims_ts_fp8_per_tensor_scale_moe(
     fc1_per_channel_weight_scale: Optional[torch.Tensor] = None,
     fc2_per_channel_weight_scale: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
-    """FP8 per-tensor-scaled MoE using Prims-TS."""
+    r"""FP8 per-tensor-scaled MoE using Prims-TS on SM100/SM103/SM107.
+
+    Same arguments and return value as
+    :func:`~flashinfer.fused_moe.trtllm_fp8_per_tensor_scale_moe`.
+
+    Parameters
+    ----------
+    routing_logits : torch.Tensor
+        ``[seq_len, num_experts]`` routing logits.
+    routing_bias : Optional[torch.Tensor]
+        Optional ``[num_experts]`` routing bias.
+    hidden_states : torch.Tensor
+        ``float8_e4m3fn`` activations.
+    gemm1_weights : torch.Tensor
+        ``float8_e4m3fn`` FC1 weights.
+    output1_scales_scalar : torch.Tensor
+        Per-expert FC1 output scales.
+    output1_scales_gate_scalar : torch.Tensor
+        Per-expert FC1 gate scales.
+    gemm2_weights : torch.Tensor
+        ``float8_e4m3fn`` FC2 weights.
+    output2_scales_scalar : torch.Tensor
+        Per-expert FC2 output scales.
+    num_experts : int
+        Total number of experts.
+    top_k : int
+        Experts selected per token.
+    n_group : Optional[int]
+        Number of expert groups.
+    topk_group : Optional[int]
+        Groups considered for top-k routing.
+    intermediate_size : int
+        Intermediate (FFN) width.
+    local_expert_offset : int
+        Global offset of the first local expert.
+    local_num_experts : int
+        Number of experts resident on this device.
+    routed_scaling_factor : Optional[float]
+        Optional routing scale.
+    use_routing_scales_on_input : bool
+        Apply routing scales on the input path when ``True``.
+    routing_method_type : int
+        Routing method selector (default ``0``).
+    do_finalize : bool
+        If ``True``, return the finalized MoE output.
+    enable_pdl : Optional[bool]
+        Enable Programmatic Dependent Launch when supported.
+    tune_max_num_tokens : int
+        Autotune token-bucket upper bound (default ``8192``).
+    activation_type : int
+        Activation enum value (default Swiglu).
+    norm_topk_prob : bool
+        Normalize top-k routing probabilities.
+    routing_replay_out : Optional[torch.Tensor]
+        Optional buffer that captures selected expert IDs.
+    output : Optional[torch.Tensor]
+        Optional in-place output tensor.
+    gemm1_clamp_limit : Optional[torch.Tensor]
+        Reserved for TRTLLM signature compatibility; must be ``None``.
+        This Prims-TS API does not support SwiGLUStep limits.
+    weight_layout : int
+        Prims-TS weight layout enum value (default ``MajorK``). Keyword-only.
+    fc1_per_channel_weight_scale : Optional[torch.Tensor]
+        Optional per-channel FC1 weight scales. Keyword-only.
+    fc2_per_channel_weight_scale : Optional[torch.Tensor]
+        Optional per-channel FC2 weight scales. Keyword-only.
+
+    Returns
+    -------
+    torch.Tensor or List[torch.Tensor]
+        Same return contract as
+        :func:`~flashinfer.fused_moe.trtllm_fp8_per_tensor_scale_moe`.
+    """
 
     return _prims_ts_fp8_per_tensor_scale_moe_impl(
         routing_logits=routing_logits,
@@ -587,7 +659,90 @@ def prims_ts_fp8_per_tensor_scale_moe_partitioned(
     *,
     weight_layout: int = 0,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
-    """Run partitioned FP8 per-tensor MoE with caller-owned payloads."""
+    r"""Run partitioned FP8 per-tensor MoE with caller-owned payloads.
+
+    Same computation as
+    :func:`~flashinfer.fused_moe.prims_ts_fp8_per_tensor_scale_moe`, split
+    across two green-context partitions on SM100/SM103/SM107. Per-channel
+    weight-scale vectors and ``gemm1_clamp_limit`` are not supported.
+
+    Parameters
+    ----------
+    routing_logits : Optional[torch.Tensor]
+        ``[seq_len, num_experts]`` routing logits, or ``None`` when using
+        precomputed routing.
+    routing_bias : Optional[torch.Tensor]
+        Optional ``[num_experts]`` routing bias.
+    topk_ids : Optional[torch.Tensor]
+        ``int32`` precomputed routing when ``routing_logits`` is ``None``:
+        packed ``(expert_id, weight)`` values when ``expert_weights`` is
+        ``None``, otherwise unpacked expert indices.
+    expert_weights : Optional[torch.Tensor]
+        Precomputed routing weights for unpacked ``topk_ids``.
+    hidden_states : torch.Tensor
+        ``float8_e4m3fn`` activations.
+    gemm1_weights : Sequence[torch.Tensor]
+        Two ``float8_e4m3fn`` FC1 shards, one per partition, sharded with
+        ``flashinfer.prims_ts.moe.shard_prepared_moe_weights``.
+    output1_scales_scalar : torch.Tensor
+        Per-expert FC1 output scales.
+    output1_scales_gate_scalar : torch.Tensor
+        Per-expert FC1 gate scales.
+    gemm2_weights : Sequence[torch.Tensor]
+        Two ``float8_e4m3fn`` FC2 shards.
+    output2_scales_scalar : torch.Tensor
+        Per-expert FC2 output scales.
+    num_experts : int
+        Total number of experts.
+    top_k : int
+        Experts selected per token.
+    n_group : Optional[int]
+        Number of expert groups.
+    topk_group : Optional[int]
+        Groups considered for top-k routing.
+    intermediate_size : int
+        Unsharded intermediate (FFN) width.
+    local_expert_offset : int
+        Global offset of the first local expert.
+    local_num_experts : int
+        Number of experts resident on this device.
+    partition_resources : MoePartitionResources
+        Caller-owned green-context streams and reusable fork/join events.
+        Construct before CUDA graph capture and keep alive for every launch
+        or replay that uses it.
+    partition_strategy : PartitionStrategy
+        ``"tp_n_tp_n"`` splits FC2 output rows; ``"tp_n_tp_k"`` splits FC2
+        K. FC1 rows are split in both. Must match the weight sharding.
+    routed_scaling_factor : Optional[float]
+        Optional routing scale.
+    use_routing_scales_on_input : bool
+        Apply routing scales on the input path when ``True``; requires
+        ``routing_logits``.
+    routing_method_type : int
+        Routing method selector (default ``0``).
+    do_finalize : bool
+        If ``True``, return the finalized MoE output.
+    enable_pdl : Optional[bool]
+        Enable Programmatic Dependent Launch when supported.
+    tune_max_num_tokens : int
+        Autotune token-bucket upper bound (default ``8192``).
+    activation_type : int
+        Activation enum value (default Swiglu).
+    norm_topk_prob : bool
+        Normalize top-k routing probabilities.
+    routing_replay_out : Optional[torch.Tensor]
+        Optional buffer that captures selected expert IDs.
+    output : Optional[torch.Tensor]
+        Optional in-place output tensor.
+    weight_layout : int
+        Prims-TS weight layout enum value (default ``MajorK``). Keyword-only.
+
+    Returns
+    -------
+    torch.Tensor or List[torch.Tensor]
+        Same return contract as
+        :func:`~flashinfer.fused_moe.prims_ts_fp8_per_tensor_scale_moe`.
+    """
 
     return _prims_ts_fp8_per_tensor_scale_moe_impl(
         routing_logits=routing_logits,
@@ -1321,10 +1476,97 @@ def prims_ts_fp8_block_scale_moe_partitioned(
     gemm1_beta: Optional[torch.Tensor] = None,
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
-    """Run partitioned MXFP8 block-scale MoE with caller-owned payloads.
+    r"""Run partitioned MXFP8 block-scale MoE with caller-owned payloads.
 
-    DeepSeek FP8 has a distinct activation/scale layout and is not supported
-    by partitioned execution.
+    Same computation as
+    :func:`~flashinfer.fused_moe.prims_ts_fp8_block_scale_moe`, split across
+    two green-context partitions on SM100/SM103/SM107. DeepSeek FP8 has a
+    distinct activation/scale layout and is not supported by partitioned
+    execution.
+
+    Parameters
+    ----------
+    routing_logits : Optional[torch.Tensor]
+        ``[seq_len, num_experts]`` routing logits, or ``None`` when using
+        precomputed routing.
+    routing_bias : Optional[torch.Tensor]
+        Optional ``[num_experts]`` routing bias.
+    topk_ids : Optional[torch.Tensor]
+        ``int32`` precomputed routing when ``routing_logits`` is ``None``:
+        packed ``(expert_id, weight)`` values when ``expert_weights`` is
+        ``None``, otherwise unpacked expert indices.
+    expert_weights : Optional[torch.Tensor]
+        Precomputed routing weights for unpacked ``topk_ids``.
+    hidden_states : torch.Tensor
+        ``float8_e4m3fn`` MXFP8 activations.
+    hidden_states_scale : torch.Tensor
+        Block scales for ``hidden_states``.
+    gemm1_weights : Sequence[torch.Tensor]
+        Two FC1 shards, one per partition, sharded with
+        ``flashinfer.prims_ts.moe.shard_prepared_moe_weights``.
+    gemm1_weights_scale : Sequence[torch.Tensor]
+        Two FC1 block-scale shards.
+    gemm2_weights : Sequence[torch.Tensor]
+        Two FC2 shards.
+    gemm2_weights_scale : Sequence[torch.Tensor]
+        Two FC2 block-scale shards.
+    num_experts : int
+        Total number of experts.
+    top_k : int
+        Experts selected per token.
+    n_group : Optional[int]
+        Number of expert groups.
+    topk_group : Optional[int]
+        Groups considered for top-k routing.
+    intermediate_size : int
+        Unsharded intermediate (FFN) width.
+    local_expert_offset : int
+        Global offset of the first local expert.
+    local_num_experts : int
+        Number of experts resident on this device.
+    partition_resources : MoePartitionResources
+        Caller-owned green-context streams and reusable fork/join events.
+        Construct before CUDA graph capture and keep alive for every launch
+        or replay that uses it.
+    partition_strategy : PartitionStrategy
+        ``"tp_n_tp_n"`` splits FC2 output rows; ``"tp_n_tp_k"`` splits FC2
+        K. FC1 rows are split in both. Must match the weight sharding.
+    routed_scaling_factor : Optional[float]
+        Optional routing scale.
+    routing_method_type : int
+        Routing method selector (default ``0``).
+    use_shuffled_weight : bool
+        Whether weights use the shuffled layout (default ``True``).
+    weight_layout : int
+        Weight layout enum value (default ``MajorK``).
+    do_finalize : bool
+        If ``True``, return the finalized MoE output.
+    enable_pdl : Optional[bool]
+        Enable Programmatic Dependent Launch when supported.
+    tune_max_num_tokens : int
+        Autotune token-bucket upper bound (default ``8192``).
+    fp8_quantization_type : Fp8QuantizationType
+        Block-scale recipe; only ``MxFp8`` (the default) is supported.
+    activation_type : int
+        Activation enum value (default Swiglu).
+    norm_topk_prob : bool
+        Normalize top-k routing probabilities.
+    routing_replay_out : Optional[torch.Tensor]
+        Optional buffer that captures selected expert IDs.
+    output : Optional[torch.Tensor]
+        Optional in-place output tensor.
+    gemm1_alpha : Optional[torch.Tensor]
+        Optional per-expert SwiGLU alpha.
+    gemm1_beta : Optional[torch.Tensor]
+        Optional per-expert SwiGLU beta.
+    gemm1_clamp_limit : Optional[torch.Tensor]
+        Optional per-expert clamp limit.
+
+    Returns
+    -------
+    torch.Tensor or List[torch.Tensor]
+        Same return contract as
+        :func:`~flashinfer.fused_moe.prims_ts_fp8_block_scale_moe`.
     """
 
     routing_mode = (

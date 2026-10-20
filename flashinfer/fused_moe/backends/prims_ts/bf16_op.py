@@ -393,7 +393,87 @@ def prims_ts_bf16_moe_partitioned(
     gemm1_beta: Optional[torch.Tensor] = None,
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
-    """Run two-way BF16 Prims-TS MoE with caller-owned shards and streams."""
+    r"""Run two-way BF16 Prims-TS MoE with caller-owned shards and streams.
+
+    Same computation as :func:`~flashinfer.fused_moe.prims_ts_bf16_moe`, split
+    across two green-context partitions on SM100/SM103/SM107.
+
+    Parameters
+    ----------
+    routing_logits : Optional[torch.Tensor]
+        ``[seq_len, num_experts]`` routing logits, or ``None`` when using
+        precomputed routing.
+    routing_bias : Optional[torch.Tensor]
+        Optional ``[num_experts]`` routing bias.
+    topk_ids : Optional[torch.Tensor]
+        ``int32`` precomputed routing when ``routing_logits`` is ``None``:
+        packed ``(expert_id, weight)`` values when ``expert_weights`` is
+        ``None``, otherwise unpacked expert indices.
+    expert_weights : Optional[torch.Tensor]
+        Precomputed routing weights for unpacked ``topk_ids``.
+    hidden_states : torch.Tensor
+        ``[seq_len, hidden_size]`` BF16 activations.
+    gemm1_weights : Sequence[torch.Tensor]
+        Two prepared FC1 shards, one per partition, sharded with
+        ``flashinfer.prims_ts.moe.shard_prepared_moe_weights``.
+    gemm2_weights : Sequence[torch.Tensor]
+        Two prepared FC2 shards, one per partition.
+    num_experts : int
+        Total number of experts.
+    top_k : int
+        Experts selected per token.
+    n_group : Optional[int]
+        Number of expert groups (DeepSeek-style routing).
+    topk_group : Optional[int]
+        Groups considered for top-k routing.
+    intermediate_size : int
+        Unsharded intermediate (FFN) width.
+    local_expert_offset : int
+        Global offset of the first local expert.
+    local_num_experts : int
+        Number of experts resident on this device.
+    partition_resources : MoePartitionResources
+        Caller-owned green-context streams and reusable fork/join events.
+        Construct before CUDA graph capture and keep alive for every launch
+        or replay that uses it.
+    partition_strategy : PartitionStrategy
+        ``"tp_n_tp_n"`` splits FC2 output rows; ``"tp_n_tp_k"`` splits FC2
+        K. FC1 rows are split in both. Must match the weight sharding.
+    routed_scaling_factor : Optional[float]
+        Optional routing scale.
+    routing_method_type : int
+        Routing method selector (default ``0``).
+    use_shuffled_weight : bool
+        Whether weights use the shuffled MajorK layout (default ``True``).
+    weight_layout : int
+        Weight layout enum value (default ``MajorK``).
+    do_finalize : bool
+        If ``True``, return the finalized MoE output.
+    enable_pdl : Optional[bool]
+        Enable Programmatic Dependent Launch when supported.
+    tune_max_num_tokens : int
+        Autotune token-bucket upper bound (default ``8192``).
+    activation_type : int
+        Activation enum value (default Swiglu).
+    norm_topk_prob : bool
+        Normalize top-k routing probabilities.
+    routing_replay_out : Optional[torch.Tensor]
+        Optional buffer that captures selected expert IDs.
+    output : Optional[torch.Tensor]
+        Optional in-place ``[seq_len, hidden_size]`` output.
+    gemm1_alpha : Optional[torch.Tensor]
+        Optional per-expert SwiGLU alpha.
+    gemm1_beta : Optional[torch.Tensor]
+        Optional per-expert SwiGLU beta.
+    gemm1_clamp_limit : Optional[torch.Tensor]
+        Optional per-expert clamp limit.
+
+    Returns
+    -------
+    torch.Tensor or List[torch.Tensor]
+        Same return contract as
+        :func:`~flashinfer.fused_moe.prims_ts_bf16_moe`.
+    """
 
     result = prims_ts_bf16_moe_op(
         routing_logits=routing_logits,

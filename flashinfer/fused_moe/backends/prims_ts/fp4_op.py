@@ -442,7 +442,101 @@ def prims_ts_fp4_block_scale_moe_partitioned(
     gemm1_beta: Optional[torch.Tensor] = None,
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
-    """Run two-way FP4 Prims-TS MoE with caller-owned shards and streams."""
+    r"""Run two-way FP4 Prims-TS MoE with caller-owned shards and streams.
+
+    Same computation as
+    :func:`~flashinfer.fused_moe.prims_ts_fp4_block_scale_moe`, split across
+    two green-context partitions on SM100/SM103/SM107.
+
+    Parameters
+    ----------
+    routing_logits : Optional[torch.Tensor]
+        ``[seq_len, num_experts]`` routing logits, or ``None`` when using
+        precomputed routing.
+    routing_bias : Optional[torch.Tensor]
+        Optional ``[num_experts]`` routing bias.
+    topk_ids : Optional[torch.Tensor]
+        ``int32`` precomputed routing when ``routing_logits`` is ``None``:
+        packed ``(expert_id, weight)`` values when ``topk_weights`` is
+        ``None``, otherwise unpacked expert indices.
+    topk_weights : Optional[torch.Tensor]
+        Precomputed routing weights for unpacked ``topk_ids``.
+    hidden_states : torch.Tensor
+        Activations (NVFP4 packed ``uint8``, MXFP8, or BF16 depending on mode).
+    hidden_states_scale : Optional[torch.Tensor]
+        Block scales for ``hidden_states``; ``None`` for BF16 activations.
+    gemm1_weights : Sequence[torch.Tensor]
+        Two packed FP4 FC1 shards, one per partition, sharded with
+        ``flashinfer.prims_ts.moe.shard_prepared_moe_weights``.
+    gemm1_weights_scale : Sequence[torch.Tensor]
+        Two FC1 block-scale shards.
+    gemm2_weights : Sequence[torch.Tensor]
+        Two packed FP4 FC2 shards.
+    gemm2_weights_scale : Sequence[torch.Tensor]
+        Two FC2 block-scale shards.
+    output1_scale_scalar : torch.Tensor
+        Per-expert FC1 output scale.
+    output1_scale_gate_scalar : torch.Tensor
+        Per-expert FC1 gate scale.
+    output2_scale_scalar : torch.Tensor
+        Per-expert FC2 output scale.
+    num_experts : int
+        Total number of experts.
+    top_k : int
+        Experts selected per token.
+    n_group : Optional[int]
+        Number of expert groups.
+    topk_group : Optional[int]
+        Groups considered for top-k routing.
+    intermediate_size : int
+        Unsharded intermediate (FFN) width.
+    local_expert_offset : int
+        Global offset of the first local expert.
+    local_num_experts : int
+        Number of experts resident on this device.
+    partition_resources : MoePartitionResources
+        Caller-owned green-context streams and reusable fork/join events.
+        Construct before CUDA graph capture and keep alive for every launch
+        or replay that uses it.
+    partition_strategy : PartitionStrategy
+        ``"tp_n_tp_n"`` splits FC2 output rows; ``"tp_n_tp_k"`` splits FC2
+        K. FC1 rows are split in both. Must match the weight sharding.
+    routed_scaling_factor : Optional[float]
+        Optional routing scale.
+    routing_method_type : int
+        Routing method selector (default ``0``).
+    weight_layout : int
+        Weight layout enum value (default ``MajorK``).
+    do_finalize : bool
+        If ``True``, return the finalized MoE output.
+    enable_pdl : Optional[bool]
+        Enable Programmatic Dependent Launch when supported.
+    activation_type : int
+        Activation enum value (default Swiglu).
+    per_token_scale : Optional[torch.Tensor]
+        Must be ``None``; per-token FC1-output requantization is not
+        supported by partitioned execution.
+    output : Optional[torch.Tensor]
+        Optional in-place output tensor.
+    tune_max_num_tokens : int
+        Autotune token-bucket upper bound (default ``8192``).
+    norm_topk_prob : bool
+        Normalize top-k routing probabilities.
+    routing_replay_out : Optional[torch.Tensor]
+        Optional buffer that captures selected expert IDs.
+    gemm1_alpha : Optional[torch.Tensor]
+        Optional per-expert SwiGLU / SiTU alpha.
+    gemm1_beta : Optional[torch.Tensor]
+        Optional per-expert SwiGLU / SiTU beta.
+    gemm1_clamp_limit : Optional[torch.Tensor]
+        Optional per-expert clamp limit.
+
+    Returns
+    -------
+    List[torch.Tensor]
+        Same return contract as
+        :func:`~flashinfer.fused_moe.prims_ts_fp4_block_scale_moe`.
+    """
 
     if enable_pdl is None:
         enable_pdl = device_support_pdl(hidden_states.device)
