@@ -123,8 +123,8 @@ void Run(TensorView a_q_in, TensorView a_k_in, TensorView a_v_in, TensorView a_q
   void* kernel_args[] = {&v_q_in, &v_k_in, &v_v_in, &v_q_out, &v_k_out, &v_q_scale, &v_k_scale, &v_v_amax, &v_seqlen_q, &v_seqlen_k, &v_num_heads, &v_num_kv_heads, &v_grid_heads, &v_k_scale_groups, &v_chunks_per_bh, &v_q_chunks, &v_k_chunks};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
-  config.blockDim = dim3(256, 1, 1);
-  config.dynamicSmemBytes = 4224;
+  config.blockDim = dim3(128, 1, 1);
+  config.dynamicSmemBytes = 2176;
   config.stream = stream;
   CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_sage_block_sparse_attention_ac8d3223970f7e4fddd8), kernel_args),
             "cudaLaunchKernelExC");

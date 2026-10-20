@@ -49,13 +49,21 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
-#define THREADS 256
+#define THREADS 128
 
 #include <math_constants.h>
 
+
+__device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
+    __nv_bfloat162_raw raw;
+    raw.x = static_cast<unsigned short>(v);
+    raw.y = static_cast<unsigned short>(v >> 16);
+    return __nv_bfloat162(raw);
+}
+
 extern "C" {
 
-__global__ __launch_bounds__(256) void
+__global__ __launch_bounds__(128) void
 kernel_cake_sage_block_sparse_attention_ce646595859ababcf2bd(__nv_bfloat16* __restrict__ v_in, uint8_t* __restrict__ v_out, float* __restrict__ v_amax, float* __restrict__ v_scale, int seqlen_k, int num_heads, int chunks_per_bh)
 {
     const int tid = threadIdx.x;
@@ -69,84 +77,102 @@ kernel_cake_sage_block_sparse_attention_ce646595859ababcf2bd(__nv_bfloat16* __re
     const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
-    int bh = bid / chunks_per_bh;
-    int chunk = bid % chunks_per_bh;
-    int batch = bh / num_heads;
-    int head = bh % num_heads;
+    int head = bid % num_heads;
+    int batch_chunk = bid / num_heads;
+    int chunk = batch_chunk % chunks_per_bh;
+    int batch = batch_chunk / chunks_per_bh;
+    int bh = batch * num_heads + head;
     int warp_0 = warp;
     int lane_1 = lane;
-    int token_in_warp = lane_1 / 16;
-    int channel0 = lane_1 % 16 * 8;
-    int chunk_base = chunk * 64;
-    float amax[8];
-    {
-        float4 _v4 = *reinterpret_cast<const float4*>(v_amax + (bh * 128 + channel0) + 0);
-        amax[0 + 0] = _v4.x;
-        amax[0 + 1] = _v4.y;
-        amax[0 + 2] = _v4.z;
-        amax[0 + 3] = _v4.w;
-    }
-    {
-        float4 _v4 = *reinterpret_cast<const float4*>(v_amax + (bh * 128 + channel0 + 4) + 0);
-        amax[4 + 0] = _v4.x;
-        amax[4 + 1] = _v4.y;
-        amax[4 + 2] = _v4.z;
-        amax[4 + 3] = _v4.w;
-    }
-    float inv[8];
+    int half = lane_1 / 8;
+    int sub = lane_1 % 8;
+    int channel0 = sub * 16;
+    int token0 = chunk * 64 + warp_0 * 16 + half;
+    unsigned int vw[32];
+    int v_off[4];
+    int v_ok[4];
     #pragma unroll
-    for (int item = 0; item < 8; item++) {
-        float _fmax_0 = fmaxf(amax[item], 1e-06f);
-        inv[item] = 448.0f / _fmax_0;
+    for (int p = 0; p < 4; p++) {
+        int token = token0 + p * 4;
+        int in_range = ((token < seqlen_k) ? 1 : 0);
+        int load_token = ((in_range != 0) ? token : seqlen_k - 1);
+        int offset = ((batch * seqlen_k + load_token) * num_heads + head) * 128 + channel0;
+        v_ok[p] = in_range;
+        v_off[p] = offset;
+        {
+            asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
+                : "=r"(vw[p * 8 + 0]), "=r"(vw[p * 8 + 1]), "=r"(vw[p * 8 + 2]), "=r"(vw[p * 8 + 3]), "=r"(vw[p * 8 + 4]), "=r"(vw[p * 8 + 5]), "=r"(vw[p * 8 + 6]), "=r"(vw[p * 8 + 7]) : "l"((const void*)((const char*)(v_in + offset + 0) + 0)), "l"(0x12F0000000000000ULL) : "memory");
+        }
     }
-    if (chunk == 0 && tid < 16) {
+    float amax[16];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        {
+            float4 _v4 = *reinterpret_cast<const float4*>(v_amax + (bh * 128 + channel0 + 4 * j) + 0);
+            amax[4 * j + 0] = _v4.x;
+            amax[4 * j + 1] = _v4.y;
+            amax[4 * j + 2] = _v4.z;
+            amax[4 * j + 3] = _v4.w;
+        }
+    }
+    float inv[16];
+    #pragma unroll
+    for (int j_1 = 0; j_1 < 16; j_1++) {
+        float _fmax_0 = fmaxf(amax[j_1], 1e-06f);
+        inv[j_1] = 448.0f / _fmax_0;
+    }
+    if (chunk == 0 && tid < 8) {
         #pragma unroll
-        for (int item_1 = 0; item_1 < 8; item_1++) {
-            float _fmax_1 = fmaxf(amax[item_1], 1e-06f);
-            v_scale[bh * 128 + channel0 + item_1] = _fmax_1 / 448.0f;
+        for (int j_2 = 0; j_2 < 16; j_2++) {
+            float _fmax_1 = fmaxf(amax[j_2], 1e-06f);
+            v_scale[bh * 128 + channel0 + j_2] = _fmax_1 / 448.0f;
         }
     }
     #pragma unroll
-    for (int step = 0; step < 4; step++) {
-        int token = chunk_base + step * 16 + warp_0 * 2 + token_in_warp;
-        if (token < seqlen_k) {
-            int offset = ((batch * seqlen_k + token) * num_heads + head) * 128 + channel0;
-            float _vec_load_0[8];
+    for (int p_1 = 0; p_1 < 4; p_1++) {
+        float values[16];
+        #pragma unroll
+        for (int j_3 = 0; j_3 < 8; j_3++) {
+            float2 _cvt_f32_0 = __bfloat1622float2(__as_bf16x2(vw[p_1 * 8 + j_3]));
+            values[2 * j_3] = _cvt_f32_0.x;
+            values[2 * j_3 + 1] = _cvt_f32_0.y;
+        }
+        #pragma unroll
+        for (int j_4 = 0; j_4 < 16; j_4++) {
+            values[j_4] = values[j_4] * inv[j_4];
+        }
+        if (v_ok[p_1] != 0) {
             {
-                const uint4* _vptr_2 = reinterpret_cast<const uint4*>(v_in + offset + 0);
-                uint4 _vld_2[1];
-                #pragma unroll
-                for (int _blk = 0; _blk < 1; _blk++) {
-                    _vld_2[_blk] = _vptr_2[_blk];
-                    uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2[_blk]);
-                    #pragma unroll
-                    for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) << 16);
-                        (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) & 0xffff0000u);
-                    }
-                }
-            }
-            #pragma unroll
-            for (int item_2 = 0; item_2 < 8; item_2++) {
-                _vec_load_0[item_2] = _vec_load_0[item_2] * inv[item_2];
-            }
-            {
-                unsigned int _fp8_pk[2];
+                unsigned int _fp8_pk[4];
                 asm("{\n\t"
                     ".reg .b16 _lo, _hi;\n\t"
                     "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
                     "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                     "mov.b32 %0, {_lo, _hi};\n\t"
                     "}\n"
-                    : "=r"(_fp8_pk[0]) : "f"(_vec_load_0[0 + 0]), "f"(_vec_load_0[0 + 1]), "f"(_vec_load_0[0 + 2]), "f"(_vec_load_0[0 + 3]));
+                    : "=r"(_fp8_pk[0]) : "f"(values[0 + 0]), "f"(values[0 + 1]), "f"(values[0 + 2]), "f"(values[0 + 3]));
                 asm("{\n\t"
                     ".reg .b16 _lo, _hi;\n\t"
                     "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
                     "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                     "mov.b32 %0, {_lo, _hi};\n\t"
                     "}\n"
-                    : "=r"(_fp8_pk[1]) : "f"(_vec_load_0[0 + 4]), "f"(_vec_load_0[0 + 5]), "f"(_vec_load_0[0 + 6]), "f"(_vec_load_0[0 + 7]));
-                *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(v_out + offset) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
+                    : "=r"(_fp8_pk[1]) : "f"(values[0 + 4]), "f"(values[0 + 5]), "f"(values[0 + 6]), "f"(values[0 + 7]));
+                asm("{\n\t"
+                    ".reg .b16 _lo, _hi;\n\t"
+                    "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                    "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                    "mov.b32 %0, {_lo, _hi};\n\t"
+                    "}\n"
+                    : "=r"(_fp8_pk[2]) : "f"(values[0 + 8]), "f"(values[0 + 9]), "f"(values[0 + 10]), "f"(values[0 + 11]));
+                asm("{\n\t"
+                    ".reg .b16 _lo, _hi;\n\t"
+                    "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                    "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                    "mov.b32 %0, {_lo, _hi};\n\t"
+                    "}\n"
+                    : "=r"(_fp8_pk[3]) : "f"(values[0 + 12]), "f"(values[0 + 13]), "f"(values[0 + 14]), "f"(values[0 + 15]));
+                *reinterpret_cast<uint4*>(reinterpret_cast<unsigned char*>(v_out + v_off[p_1]) + (0)) = *reinterpret_cast<uint4*>(_fp8_pk);
             }
         }
     }
