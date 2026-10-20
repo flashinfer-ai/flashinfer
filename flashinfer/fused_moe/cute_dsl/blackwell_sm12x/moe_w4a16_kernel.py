@@ -381,7 +381,11 @@ def _candidate_tile_fits(
         or int(tile_k) % scale_group_size != 0
     ):
         return False
-    if int(tile_n) < 64 or int(tile_k) < 64 or int(cta_threads) < 128:
+    # The TC-decode ultra-wide FC2 configuration uses tile_n=512 and
+    # tile_k=32 (256 CTA threads). The scale-group and alignment checks above
+    # already ensure that smaller tiles are unsupported, so the lower bound
+    # here must admit the 32-wide K tile selected by the autotuner.
+    if int(tile_n) < 64 or int(tile_k) < 32 or int(cta_threads) < 128:
         return False
     smem_bytes = _shared_memory_footprint(
         cta_m_blocks=cta_m_blocks,
