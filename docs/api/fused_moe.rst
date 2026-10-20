@@ -691,8 +691,8 @@ LoRA stay out of scope.
 Prims-TS Fused MoE
 ------------------
 
-Experimental Blackwell (SM100) Prims-TS backends.  Public entry points match
-the corresponding ``trtllm_*`` APIs.
+Experimental SM100, SM103, and SM107 Prims-TS backends.  Public entry points
+match the corresponding ``trtllm_*`` APIs.
 
 .. autosummary::
     :toctree: ../generated

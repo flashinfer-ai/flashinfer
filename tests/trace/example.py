@@ -119,6 +119,10 @@ prims_ts_paged_block_sparse_combined_h8_kv8_d128_qb64_kb64_ps64.json
 prims_ts_paged_block_sparse_tuple_h8_kv8_d128_qb64_kb64_ps64.json
 prims_ts_paged_block_sparse_wrapper_combined_h8_kv8_d128_ps64.json
 prims_ts_paged_block_sparse_wrapper_tuple_h8_kv8_d128_ps64.json
+prims_ts_bf16_moe_partitioned_topk2_e8_h1024_i512_p2.json
+prims_ts_fp4_block_scale_moe_partitioned_topk2_e8_h1024_i512_p2.json
+prims_ts_fp8_block_scale_moe_partitioned_topk2_e8_h1024_i512_p2.json
+prims_ts_fp8_per_tensor_scale_moe_partitioned_topk2_e8_h1024_i512_p2.json
 quantize_nvfp4_smooth_N3072.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
@@ -199,6 +203,7 @@ from flashinfer.comm import (
 )
 from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 from flashinfer.fi_trace import fi_trace
+from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
 from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from flashinfer.mla import BatchMLAPagedAttentionWrapper
 from flashinfer.prefill import (
@@ -206,6 +211,7 @@ from flashinfer.prefill import (
     BatchPrefillWithRaggedKVCacheWrapper,
     fmha_v2_prefill_sm120,
 )
+from flashinfer.prims_ts.moe import MoePartitionResources
 from flashinfer.utils import is_sm100a_supported
 from tests.trace.example_moe_layer import generate as generate_moe_layer_traces
 
@@ -2072,6 +2078,167 @@ flashinfer.prims_ts_fp4_block_scale_moe.fi_trace(
 flashinfer.prims_ts_fp4_block_scale_routed_moe.fi_trace(
     topk_ids=_pts_moe_packed_topk,
     **_pts_moe_fp4_common,
+)
+
+# Partitioned Prims-TS APIs consume two prepared MajorK shards and caller-owned
+# streams. Use TP-N/TP-K here so FC1 is split by output rows while FC2 is split
+# by reduction K, matching the public two-way partition contract.
+_pts_partition_device = torch.device("cuda", torch.cuda.current_device())
+_pts_properties = torch.cuda.get_device_properties(_pts_partition_device)
+_pts_green_streams, _pts_green_resources = split_device_green_ctx_by_sm_count(
+    _pts_partition_device, [_pts_properties.multi_processor_count // 2]
+)
+_pts_partition_resources = MoePartitionResources(
+    streams=(_pts_green_streams[0], _pts_green_streams[1])
+)
+_pts_partition_common = dict(
+    routing_logits=_pts_moe_logits,
+    routing_bias=_pts_moe_bias,
+    topk_ids=None,
+    hidden_states=_pts_moe_hidden_bf16,
+    num_experts=_pts_moe_E,
+    top_k=_pts_moe_K,
+    n_group=None,
+    topk_group=None,
+    intermediate_size=_pts_moe_I,
+    local_expert_offset=0,
+    local_num_experts=_pts_moe_E,
+    partition_resources=_pts_partition_resources,
+    partition_strategy="tp_n_tp_k",
+    routed_scaling_factor=None,
+    routing_method_type=1,
+)
+_pts_partition_w1_bf16 = tuple(
+    torch.empty(
+        _pts_moe_E,
+        _pts_moe_I,
+        _pts_moe_H,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    for _ in range(2)
+)
+_pts_partition_w2_bf16 = tuple(
+    torch.empty(
+        _pts_moe_E,
+        _pts_moe_H,
+        _pts_moe_I // 2,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    for _ in range(2)
+)
+flashinfer.prims_ts_bf16_moe_partitioned.fi_trace(
+    expert_weights=None,
+    gemm1_weights=_pts_partition_w1_bf16,
+    gemm2_weights=_pts_partition_w2_bf16,
+    **_pts_partition_common,
+)
+
+_pts_partition_w1_fp8 = tuple(
+    shard.to(torch.float8_e4m3fn) for shard in _pts_partition_w1_bf16
+)
+_pts_partition_w2_fp8 = tuple(
+    shard.to(torch.float8_e4m3fn) for shard in _pts_partition_w2_bf16
+)
+flashinfer.prims_ts_fp8_per_tensor_scale_moe_partitioned.fi_trace(
+    expert_weights=None,
+    gemm1_weights=_pts_partition_w1_fp8,
+    output1_scales_scalar=_pts_moe_tensor_scales,
+    output1_scales_gate_scalar=_pts_moe_tensor_scales,
+    gemm2_weights=_pts_partition_w2_fp8,
+    output2_scales_scalar=_pts_moe_tensor_scales,
+    use_routing_scales_on_input=False,
+    **{
+        **_pts_partition_common,
+        "hidden_states": _pts_moe_hidden_fp8,
+    },
+)
+
+_pts_partition_w1_fp4 = tuple(
+    torch.empty(
+        _pts_moe_E,
+        _pts_moe_I,
+        _pts_moe_H // 2,
+        dtype=torch.uint8,
+        device=device,
+    )
+    for _ in range(2)
+)
+_pts_partition_w2_fp4 = tuple(
+    torch.empty(
+        _pts_moe_E,
+        _pts_moe_H,
+        _pts_moe_I // 4,
+        dtype=torch.uint8,
+        device=device,
+    )
+    for _ in range(2)
+)
+_pts_partition_w1_fp4_scale = tuple(
+    torch.empty(
+        _pts_moe_E * _pts_moe_I * (_pts_moe_H // 16),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    for _ in range(2)
+)
+_pts_partition_w2_fp4_scale = tuple(
+    torch.empty(
+        _pts_moe_E * _pts_moe_H * ((_pts_moe_I // 2) // 16),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    for _ in range(2)
+)
+flashinfer.prims_ts_fp4_block_scale_moe_partitioned.fi_trace(
+    topk_weights=None,
+    hidden_states_scale=_pts_moe_hidden_fp4_scale.reshape(-1),
+    gemm1_weights=_pts_partition_w1_fp4,
+    gemm1_weights_scale=_pts_partition_w1_fp4_scale,
+    gemm2_weights=_pts_partition_w2_fp4,
+    gemm2_weights_scale=_pts_partition_w2_fp4_scale,
+    output1_scale_scalar=_pts_moe_tensor_scales,
+    output1_scale_gate_scalar=_pts_moe_tensor_scales,
+    output2_scale_scalar=_pts_moe_tensor_scales,
+    **{
+        **_pts_partition_common,
+        "hidden_states": _pts_moe_hidden_fp4,
+    },
+)
+
+_pts_partition_hidden_mxfp8_scale = torch.empty(
+    _pts_moe_T * (_pts_moe_H // 32),
+    dtype=torch.uint8,
+    device=device,
+)
+_pts_partition_w1_fp8_scale = tuple(
+    torch.empty(
+        _pts_moe_E * _pts_moe_I * (_pts_moe_H // 32),
+        dtype=torch.uint8,
+        device=device,
+    )
+    for _ in range(2)
+)
+_pts_partition_w2_fp8_scale = tuple(
+    torch.empty(
+        _pts_moe_E * _pts_moe_H * ((_pts_moe_I // 2) // 32),
+        dtype=torch.uint8,
+        device=device,
+    )
+    for _ in range(2)
+)
+flashinfer.prims_ts_fp8_block_scale_moe_partitioned.fi_trace(
+    expert_weights=None,
+    hidden_states_scale=_pts_partition_hidden_mxfp8_scale,
+    gemm1_weights=_pts_partition_w1_fp8,
+    gemm1_weights_scale=_pts_partition_w1_fp8_scale,
+    gemm2_weights=_pts_partition_w2_fp8,
+    gemm2_weights_scale=_pts_partition_w2_fp8_scale,
+    **{
+        **_pts_partition_common,
+        "hidden_states": _pts_moe_hidden_fp8,
+    },
 )
 
 # ── Summary ───────────────────────────────────────────────────────────────────

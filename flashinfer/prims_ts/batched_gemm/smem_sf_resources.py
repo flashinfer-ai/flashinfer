@@ -42,8 +42,17 @@ from .batched_gemm_config import (
     SfSmemToTmemCopy,
     TMEM_SF_PACK_SIZE_BYTES,
 )
+from .batched_gemm_cga import (
+    CgaPolicy,
+    cga_tma_masks,
+    has_multiple_umma_atoms,
+    needs_extended_tma_multicast,
+)
+from .mixed_cga_ts import override_tma_umma_pipeline, override_umma_atom_pipeline
 from .gmem_ab_resources import nonnegative_div, nonnegative_mod
+from .smem_descriptor import build_tcgen05_smem_desc
 from cutlass.experimental import primitives as prims
+from cutlass.pipeline.sm100 import PipelineTmaUmma
 
 Constexpr = cutlass.Constexpr
 
@@ -58,12 +67,22 @@ class SmemSfAResource(MemoryResource):
     _alloc_sfa: Constexpr[Optional[SmemAllocation]] = None
     desc_a_s2t_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     smem_sfa_stage_ptr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    mixed_cga_policy: Constexpr[int] = int(CgaPolicy.MCAST_A)
+    mixed_cga_kind: Constexpr[str] = "sfa"
+
+    def create_pipeline(self, pipeline_config):
+        result = super().create_pipeline(pipeline_config)
+        if has_multiple_umma_atoms(self.cfg) and isinstance(result, PipelineTmaUmma):
+            # SFA's payload may be local, but a TMA-to-UMMA pipeline must still
+            # route its barriers to the current physical 2-CTA atom.
+            return override_tma_umma_pipeline(self.cfg, result, "sfa")
+        return result
 
     def __post_init__(self):
         if self._alloc_sfa is None:
             self._alloc_sfa = SmemAllocation(
                 f"{self.name}_sfa",
-                size_bytes=self.cfg.num_bytes_sfa_per_stage
+                size_bytes=self.cfg.smem_sfa_stage_stride_bytes
                 * self.cfg.num_stages_smem_sfa,
                 alignment=1024,
             )
@@ -113,12 +132,12 @@ class SmemSfAResource(MemoryResource):
         """TMA load SFA into SMEM using the descriptor's coordinate rank."""
         # Split R128c4 coords: (0, 0, sfk_block, outer_tile). The generated
         # descriptor uses a split (256, 2) leading tile to satisfy TMA.
-        sf_vec_size = self.cfg.sf_vec_size
+        sf_vec_size = self.cfg.input_sf_block_size_a
         sfk_block = coord_sfa_k * Int32(
             self.cfg.tile_k // sf_vec_size // TMEM_SF_PACK_SIZE_BYTES
         )
         stage_base = self.smem_buf.subview(
-            self.cfg.num_bytes_sfa_per_stage * stage_info.stage_idx
+            self.cfg.smem_sfa_stage_stride_bytes * stage_info.stage_idx
         )
         if prims.elect_sync():
             if cutlass.const_expr(
@@ -153,13 +172,29 @@ class SmemSfAResource(MemoryResource):
                 barrier,
                 [],
             )
-        elif cutlass.const_expr(self.cfg.has_cluster):
+        elif cutlass.const_expr(self.cfg.uses_two_cta_mma):
+            if cutlass.const_expr(needs_extended_tma_multicast(self.cfg, "sfa")):
+                cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+                mcast_mask, _, _, _ = cga_tma_masks(self.cfg, "sfa")
+                lead_cta_rank = (cta_rank // Int32(2)) * Int32(2)
+                barrier = prims.mapa(barrier, lead_cta_rank)
+                barrier = prims.cvta_to(barrier, prims.CvtaSpace.SHARED)
+                prims.cp_async_bulk_tensor_shared_cluster_global(
+                    smem_dst,
+                    tma_desc,
+                    coords,
+                    barrier,
+                    [],
+                    multicast_mask=mcast_mask,
+                    group=self.cfg.cta_group,
+                )
+                return
             if cutlass.const_expr(self.cfg.is_mx_mma):
                 cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
                 mcast_mask = Int32(1) << cta_rank
-                lead_cta_rank = nonnegative_div(cta_rank, self.cfg.cluster_m) * Int32(
-                    self.cfg.cluster_m
-                )
+                lead_cta_rank = nonnegative_div(
+                    cta_rank, self.cfg.umma_cta_count
+                ) * Int32(self.cfg.umma_cta_count)
                 barrier = prims.mapa(barrier, lead_cta_rank)
                 barrier = prims.cvta_to(barrier, prims.CvtaSpace.SHARED)
                 prims.cp_async_bulk_tensor_shared_cluster_global(
@@ -174,8 +209,8 @@ class SmemSfAResource(MemoryResource):
                 return
             cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
             mcast_mask = Int32(1) << cta_rank
-            lead_cta_rank = nonnegative_div(cta_rank, self.cfg.cluster_m) * Int32(
-                self.cfg.cluster_m
+            lead_cta_rank = nonnegative_div(cta_rank, self.cfg.umma_cta_count) * Int32(
+                self.cfg.umma_cta_count
             )
             barrier = prims.mapa(barrier, lead_cta_rank)
             barrier = prims.cvta_to(barrier, prims.CvtaSpace.SHARED)
@@ -201,9 +236,10 @@ class SmemSfAResource(MemoryResource):
     def build_sfa_s2t_desc(self, stage_info: StageInfo) -> tuple[Int64, Int64]:
         """Build SMEM descriptor for S2T copy of SFA."""
         stage_base = self.smem_buf.subview(
-            self.cfg.num_bytes_sfa_per_stage * stage_info.stage_idx
+            self.cfg.smem_sfa_stage_stride_bytes * stage_info.stage_idx
         )
-        desc_s2t = prims.Tcgen05SmemDesc.build(
+        desc_s2t = build_tcgen05_smem_desc(
+            self.cfg,
             stage_base,
             leading_byte_offset=16,
             stride_byte_offset=128,
@@ -221,17 +257,31 @@ class SmemSfBResource(MemoryResource):
     smem_buf: Any = None
     _alloc_sfb: Constexpr[Optional[SmemAllocation]] = None
     desc_b_s2t_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    smem_sfb_stage_ptr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    mixed_cga_policy: Constexpr[int] = int(CgaPolicy.MCAST_SFB)
+    mixed_cga_kind: Constexpr[str] = "sfb"
+
+    def create_pipeline(self, pipeline_config):
+        result = super().create_pipeline(pipeline_config)
+        if has_multiple_umma_atoms(self.cfg) and isinstance(result, PipelineTmaUmma):
+            # Keep barrier routing atom-relative independently of SFB payload
+            # multicast; compact/local non-UMMA pipelines fail the type check.
+            return override_tma_umma_pipeline(self.cfg, result, "sfb")
+        return result
 
     def __post_init__(self):
         if self._alloc_sfb is None:
             self._alloc_sfb = SmemAllocation(
                 f"{self.name}_sfb",
-                size_bytes=self.cfg.num_bytes_sfb_per_stage
+                size_bytes=self.cfg.smem_sfb_stage_stride_bytes
                 * self.cfg.num_stages_smem_sfb,
                 alignment=1024,
             )
         self.desc_b_s2t_base = TaskLocalVariable(
             dtype=Int64, default=Int64(0), docs="S2T descriptor for SFB."
+        )
+        self.smem_sfb_stage_ptr = TaskLocalVariable(
+            dtype=Int64, default=Int64(0), docs="SMEM stage pointer for SFB."
         )
 
     def get_smem_requirements(self):
@@ -272,15 +322,15 @@ class SmemSfBResource(MemoryResource):
     ) -> None:
         """TMA load SFB into SMEM using the descriptor's coordinate rank."""
         # MX uses 32 elements per scale, NVFP4 uses 16.
-        sf_vec_size = self.cfg.sf_vec_size
+        sf_vec_size = self.cfg.input_sf_block_size_a
         sfk_block = coord_sfb_k * Int32(
             self.cfg.tile_k // sf_vec_size // TMEM_SF_PACK_SIZE_BYTES
         )
         stage_base = self.smem_buf.subview(
-            self.cfg.num_bytes_sfb_per_stage * stage_info.stage_idx
+            self.cfg.smem_sfb_stage_stride_bytes * stage_info.stage_idx
         )
         if prims.elect_sync():
-            if cutlass.const_expr(self.cfg.uses_rank4_sfb_tma):
+            if cutlass.const_expr(self.cfg.uses_split_r128c4_sfb_tma_desc):
                 outer_tile = coord_sfb_mn * Int32((self.cfg.tile_n + 127) // 128)
                 self._tma_load(
                     stage_base,
@@ -307,7 +357,7 @@ class SmemSfBResource(MemoryResource):
     @cute.jit
     def _tma_load(self, smem_dst, tma_desc, coords, barrier):
         """Single-CTA or per-CTA cluster TMA load for SFB."""
-        if cutlass.const_expr(self.cfg.has_cluster):
+        if cutlass.const_expr(self.cfg.uses_two_cta_mma):
             if cutlass.const_expr(
                 self.cfg.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
                 and self.cfg.smem_sfb_layout == int(SfLayout.R8c4)
@@ -323,12 +373,28 @@ class SmemSfBResource(MemoryResource):
                     [],
                 )
                 return
+            if cutlass.const_expr(needs_extended_tma_multicast(self.cfg, "sfb")):
+                cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+                mcast_mask, _, _, _ = cga_tma_masks(self.cfg, "sfb")
+                lead_cta_rank = (cta_rank // Int32(2)) * Int32(2)
+                barrier = prims.mapa(barrier, lead_cta_rank)
+                barrier = prims.cvta_to(barrier, prims.CvtaSpace.SHARED)
+                prims.cp_async_bulk_tensor_shared_cluster_global(
+                    smem_dst,
+                    tma_desc,
+                    coords,
+                    barrier,
+                    [],
+                    multicast_mask=mcast_mask,
+                    group=self.cfg.cta_group,
+                )
+                return
             if cutlass.const_expr(self.cfg.is_mx_mma):
                 cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
                 mcast_mask = Int32(1) << cta_rank
-                lead_cta_rank = nonnegative_div(cta_rank, self.cfg.cluster_m) * Int32(
-                    self.cfg.cluster_m
-                )
+                lead_cta_rank = nonnegative_div(
+                    cta_rank, self.cfg.umma_cta_count
+                ) * Int32(self.cfg.umma_cta_count)
                 barrier = prims.mapa(barrier, lead_cta_rank)
                 barrier = prims.cvta_to(barrier, prims.CvtaSpace.SHARED)
                 prims.cp_async_bulk_tensor_shared_cluster_global(
@@ -343,8 +409,8 @@ class SmemSfBResource(MemoryResource):
                 return
             cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
             mcast_mask = Int32(1) << cta_rank
-            lead_cta_rank = nonnegative_div(cta_rank, self.cfg.cluster_m) * Int32(
-                self.cfg.cluster_m
+            lead_cta_rank = nonnegative_div(cta_rank, self.cfg.umma_cta_count) * Int32(
+                self.cfg.umma_cta_count
             )
             barrier = prims.mapa(barrier, lead_cta_rank)
             barrier = prims.cvta_to(barrier, prims.CvtaSpace.SHARED)
@@ -365,20 +431,21 @@ class SmemSfBResource(MemoryResource):
                 barrier,
             )
 
-    @consumer_work(returns=desc_b_s2t_base)
+    @consumer_work(returns=(desc_b_s2t_base, smem_sfb_stage_ptr))
     @cute.jit
-    def build_sfb_s2t_desc(self, stage_info: StageInfo) -> Int64:
+    def build_sfb_s2t_desc(self, stage_info: StageInfo) -> tuple[Int64, Int64]:
         """Build SMEM descriptor for S2T copy of SFB."""
         stage_base = self.smem_buf.subview(
-            self.cfg.num_bytes_sfb_per_stage * stage_info.stage_idx
+            self.cfg.smem_sfb_stage_stride_bytes * stage_info.stage_idx
         )
-        desc_s2t = prims.Tcgen05SmemDesc.build(
+        desc_s2t = build_tcgen05_smem_desc(
+            self.cfg,
             stage_base,
             leading_byte_offset=16,
             stride_byte_offset=128,
             layout=0,
         )
-        return desc_s2t
+        return desc_s2t, Int64(stage_base.data_ptr().toint())
 
 
 # Module-level TMA gather4 helpers (shared with smem_ab_resources)
@@ -425,18 +492,19 @@ class SmemSfGatherResource(MemoryResource):
     desc_a_s2t_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     smem_sfa_stage_ptr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     desc_b_s2t_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    smem_sfb_stage_ptr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
 
     def __post_init__(self):
         if self._alloc_sf is None:
             is_b = self._operand == "b"
-            nbytes = (
-                self.cfg.num_bytes_sfb_per_stage
+            stage_stride = (
+                self.cfg.smem_sfb_stage_stride_bytes
                 if is_b
-                else self.cfg.num_bytes_sfa_per_stage
+                else self.cfg.smem_sfa_stage_stride_bytes
             )
             self._alloc_sf = SmemAllocation(
                 f"{self.name}_sf_g4",
-                size_bytes=nbytes
+                size_bytes=stage_stride
                 * (
                     self.cfg.num_stages_smem_sfb
                     if is_b
@@ -452,6 +520,9 @@ class SmemSfGatherResource(MemoryResource):
         )
         self.desc_b_s2t_base = TaskLocalVariable(
             dtype=Int64, default=Int64(0), docs="S2T descriptor for gathered SFB."
+        )
+        self.smem_sfb_stage_ptr = TaskLocalVariable(
+            dtype=Int64, default=Int64(0), docs="SMEM stage pointer for gathered SFB."
         )
 
     def get_smem_requirements(self):
@@ -469,7 +540,9 @@ class SmemSfGatherResource(MemoryResource):
         tile_rows = self.cfg.tile_n if is_b else self.cfg.tile_m
         num_gather4 = tile_rows // 4
         num_load_warps = (
-            self.cfg.num_load_sfb_warps if is_b else self.cfg.num_load_sfa_warps
+            self.cfg.warp_layout.num_load_sfb_warps
+            if is_b
+            else self.cfg.warp_layout.num_load_sfa_warps
         )
         route_cache_groups = max(
             1, (num_gather4 + num_load_warps - 1) // num_load_warps
@@ -521,25 +594,23 @@ class SmemSfGatherResource(MemoryResource):
                 coord_mn = tile_coord_n * Int32(self.cfg.tile_n)
             else:
                 coord_mn = tile_coord_n
-            num_load_warps = self.cfg.num_load_sfb_warps
-            load_warp_idx = self.cfg.load_sfb_warp_idx
+            num_load_warps = self.cfg.warp_layout.num_load_sfb_warps
+            load_warp_idx = self.cfg.warp_layout.load_sfb_warp_idx
         else:
             coord_mn = tile_coord_m * Int32(self.cfg.tile_m)
-            num_load_warps = self.cfg.num_load_sfa_warps
-            load_warp_idx = self.cfg.load_sfa_warp_idx
+            num_load_warps = self.cfg.warp_layout.num_load_sfa_warps
+            load_warp_idx = self.cfg.warp_layout.load_sfa_warp_idx
 
         num_gather4 = tile_rows // 4
         route_cache_groups = max(
             1, (num_gather4 + num_load_warps - 1) // num_load_warps
         )
         token_tile = coord_mn // Int32(tile_rows)
+        token_cga = token_tile // Int32(self.cfg.token_cluster_dim)
         tile_limit = Int32(tile_rows)
         if cutlass.const_expr(self.mn_limit is not None):
             tile_limit = self._local_tile_limit(
-                self.mn_limit.load(
-                    idx=token_tile // Int32(self.cfg.token_metadata_stride),
-                    vector_size=1,
-                )[0],
+                self.mn_limit.load(idx=token_cga, vector_size=1)[0],
                 token_tile,
                 tile_rows,
             )
@@ -571,16 +642,15 @@ class SmemSfGatherResource(MemoryResource):
     def _producer_work_impl(self, stage_info: StageInfo, coord_k, coord_mn) -> None:
         """TMA gather4 for SF: load routed SF rows."""
         is_b = cutlass.const_expr(self._operand == "b")
-        tile_rows = self.cfg.tile_n if is_b else self.cfg.tile_m
-        bytes_per_stage = (
-            self.cfg.num_bytes_sfb_per_stage
+        stage_stride = (
+            self.cfg.smem_sfb_stage_stride_bytes
             if is_b
-            else self.cfg.num_bytes_sfa_per_stage
+            else self.cfg.smem_sfa_stage_stride_bytes
         )
-
-        stage_base = self.smem_buf.subview(bytes_per_stage * stage_info.stage_idx)
+        stage_base = self.smem_buf.subview(stage_stride * stage_info.stage_idx)
 
         # SF elements per row = tile_k / sf_block_size.
+        tile_rows = self.cfg.tile_n if is_b else self.cfg.tile_m
         sf_block_size = (
             self.cfg.input_sf_block_size_b if is_b else self.cfg.input_sf_block_size_a
         )
@@ -588,10 +658,14 @@ class SmemSfGatherResource(MemoryResource):
         # Each gather4 loads 4 rows × sf_k SF elements (E4M3 = 1 byte each)
         num_gather4 = tile_rows // 4
         num_load_warps = (
-            self.cfg.num_load_sfb_warps if is_b else self.cfg.num_load_sfa_warps
+            self.cfg.warp_layout.num_load_sfb_warps
+            if is_b
+            else self.cfg.warp_layout.num_load_sfa_warps
         )
         load_warp_idx = (
-            self.cfg.load_sfb_warp_idx if is_b else self.cfg.load_sfa_warp_idx
+            self.cfg.warp_layout.load_sfb_warp_idx
+            if is_b
+            else self.cfg.warp_layout.load_sfa_warp_idx
         )
         warp_batches = (num_gather4 + num_load_warps - 1) // num_load_warps
 
@@ -632,13 +706,14 @@ class SmemSfGatherResource(MemoryResource):
     def _build_desc_impl(self, stage_info: StageInfo):
         """Build SMEM descriptor for S2T copy of gathered SF."""
         is_b = cutlass.const_expr(self._operand == "b")
-        bytes_per_stage = (
-            self.cfg.num_bytes_sfb_per_stage
+        stage_stride = (
+            self.cfg.smem_sfb_stage_stride_bytes
             if is_b
-            else self.cfg.num_bytes_sfa_per_stage
+            else self.cfg.smem_sfa_stage_stride_bytes
         )
-        stage_base = self.smem_buf.subview(bytes_per_stage * stage_info.stage_idx)
-        desc_s2t = prims.Tcgen05SmemDesc.build(
+        stage_base = self.smem_buf.subview(stage_stride * stage_info.stage_idx)
+        desc_s2t = build_tcgen05_smem_desc(
+            self.cfg,
             stage_base,
             leading_byte_offset=16,
             stride_byte_offset=128,
@@ -679,12 +754,12 @@ class SmemSfGatherAResource(SmemSfGatherResource):
     def build_sfa_s2t_desc(self, stage_info: StageInfo) -> tuple[Int64, Int64]:
         desc = self._build_desc_impl(stage_info)
         is_b = cutlass.const_expr(self._operand == "b")
-        nbytes = (
-            self.cfg.num_bytes_sfb_per_stage
+        stage_stride = (
+            self.cfg.smem_sfb_stage_stride_bytes
             if is_b
-            else self.cfg.num_bytes_sfa_per_stage
+            else self.cfg.smem_sfa_stage_stride_bytes
         )
-        stage_base = self.smem_buf.subview(nbytes * stage_info.stage_idx)
+        stage_base = self.smem_buf.subview(stage_stride * stage_info.stage_idx)
         return desc, Int64(stage_base.data_ptr().toint())
 
 
@@ -710,10 +785,19 @@ class SmemSfGatherBResource(SmemSfGatherResource):
     ) -> None:
         self._producer_work_impl(stage_info, coord_sfb_k, coord_sfb_mn)
 
-    @consumer_work(returns=SmemSfGatherResource.desc_b_s2t_base)
+    @consumer_work(
+        returns=(
+            SmemSfGatherResource.desc_b_s2t_base,
+            SmemSfGatherResource.smem_sfb_stage_ptr,
+        )
+    )
     @cute.jit
-    def build_sfb_s2t_desc(self, stage_info: StageInfo) -> Int64:
-        return self._build_desc_impl(stage_info)
+    def build_sfb_s2t_desc(self, stage_info: StageInfo) -> tuple[Int64, Int64]:
+        desc = self._build_desc_impl(stage_info)
+        stage_base = self.smem_buf.subview(
+            self.cfg.smem_sfb_stage_stride_bytes * stage_info.stage_idx
+        )
+        return desc, Int64(stage_base.data_ptr().toint())
 
 
 # ---------------------------------------------------------------------------
@@ -746,6 +830,13 @@ class SmemSfLdgstsResource(MemoryResource):
     desc_a_s2t_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     smem_sfa_stage_ptr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     desc_b_s2t_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    smem_sfb_stage_ptr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+
+    def create_pipeline(self, pipeline_config):
+        result = super().create_pipeline(pipeline_config)
+        if has_multiple_umma_atoms(self.cfg):
+            return override_umma_atom_pipeline(result)
+        return result
 
     @property
     def uses_async_load_pipeline(self) -> bool:
@@ -866,14 +957,14 @@ class SmemSfLdgstsResource(MemoryResource):
                 )
         if self._alloc_sf is None:
             is_b = self._operand == "b"
-            nbytes = (
-                self.cfg.num_bytes_sfb_per_stage
+            stage_stride = (
+                self.cfg.smem_sfb_stage_stride_bytes
                 if is_b
-                else self.cfg.num_bytes_sfa_per_stage
+                else self.cfg.smem_sfa_stage_stride_bytes
             )
             self._alloc_sf = SmemAllocation(
                 f"{self.name}_sf_ldg",
-                size_bytes=nbytes
+                size_bytes=stage_stride
                 * (
                     self.cfg.num_stages_smem_sfb
                     if is_b
@@ -889,6 +980,9 @@ class SmemSfLdgstsResource(MemoryResource):
         )
         self.desc_b_s2t_base = TaskLocalVariable(
             dtype=Int64, default=Int64(0), docs="S2T descriptor for LDGSTS SFB."
+        )
+        self.smem_sfb_stage_ptr = TaskLocalVariable(
+            dtype=Int64, default=Int64(0), docs="SMEM stage pointer for LDGSTS SFB."
         )
 
     def get_smem_requirements(self):
@@ -909,7 +1003,9 @@ class SmemSfLdgstsResource(MemoryResource):
         )
         sf_k = self.cfg.tile_k // sf_block_size
         num_load_warps = (
-            self.cfg.num_load_sfb_warps if is_b else self.cfg.num_load_sfa_warps
+            self.cfg.warp_layout.num_load_sfb_warps
+            if is_b
+            else self.cfg.warp_layout.num_load_sfa_warps
         )
         num_threads = max(1, num_load_warps) * 32
         elts_per_load = 4
@@ -962,12 +1058,12 @@ class SmemSfLdgstsResource(MemoryResource):
                 coord_mn = tile_coord_n * Int32(self.cfg.tile_n)
             else:
                 coord_mn = tile_coord_n
-            load_warp_idx = self.cfg.load_sfb_warp_idx
-            num_load_warps = self.cfg.num_load_sfb_warps
+            load_warp_idx = self.cfg.warp_layout.load_sfb_warp_idx
+            num_load_warps = self.cfg.warp_layout.num_load_sfb_warps
         else:
             coord_mn = tile_coord_m
-            load_warp_idx = self.cfg.load_sfa_warp_idx
-            num_load_warps = self.cfg.num_load_sfa_warps
+            load_warp_idx = self.cfg.warp_layout.load_sfa_warp_idx
+            num_load_warps = self.cfg.warp_layout.num_load_sfa_warps
 
         num_threads = max(1, num_load_warps) * 32
         loads_per_thread = (total_elts + num_threads * elts_per_load - 1) // (
@@ -979,11 +1075,9 @@ class SmemSfLdgstsResource(MemoryResource):
             tile_limit_idx = nonnegative_div(coord_mn, tile_rows)
         else:
             tile_limit_idx = coord_mn
+        tile_limit_cga_idx = nonnegative_div(tile_limit_idx, self.cfg.token_cluster_dim)
         self.tile_limit = self._local_tile_limit(
-            self.mn_limit.load(
-                idx=tile_limit_idx // Int32(self.cfg.token_metadata_stride),
-                vector_size=1,
-            )[0],
+            self.mn_limit.load(idx=tile_limit_cga_idx, vector_size=1)[0],
             tile_limit_idx,
             tile_rows,
         )
@@ -1020,10 +1114,10 @@ class SmemSfLdgstsResource(MemoryResource):
         the following tcgen05_cp path can consume it.
         """
         is_b = cutlass.const_expr(self._operand == "b")
-        bytes_per_stage = (
-            self.cfg.num_bytes_sfb_per_stage
+        stage_stride = (
+            self.cfg.smem_sfb_stage_stride_bytes
             if is_b
-            else self.cfg.num_bytes_sfa_per_stage
+            else self.cfg.smem_sfa_stage_stride_bytes
         )
         tile_rows = self.cfg.tile_n if is_b else self.cfg.tile_m
         sf_block_size = (
@@ -1036,14 +1130,18 @@ class SmemSfLdgstsResource(MemoryResource):
         use_r128c4 = cutlass.const_expr((not is_b) or self.cfg.tile_n >= 128)
 
         stage_idx = stage_info.stage_idx
-        stage_base = self.smem_buf.subview(bytes_per_stage * stage_idx)
+        stage_base = self.smem_buf.subview(stage_stride * stage_idx)
 
         tidx, _, _ = cute.arch.thread_idx()
         load_warp_idx = (
-            self.cfg.load_sfb_warp_idx if is_b else self.cfg.load_sfa_warp_idx
+            self.cfg.warp_layout.load_sfb_warp_idx
+            if is_b
+            else self.cfg.warp_layout.load_sfa_warp_idx
         )
         num_load_warps = (
-            self.cfg.num_load_sfb_warps if is_b else self.cfg.num_load_sfa_warps
+            self.cfg.warp_layout.num_load_sfb_warps
+            if is_b
+            else self.cfg.warp_layout.num_load_sfa_warps
         )
         local_tid = tidx - Int32(load_warp_idx * 32)
 
@@ -1110,7 +1208,7 @@ class SmemSfLdgstsResource(MemoryResource):
         # Clustered AsyncThread commits the cp.async group here, on the issue
         # side.  The named producer work "drain_loop"/"drain_tail" throttles/
         # drains before publishing the lagging stage.
-        if cutlass.const_expr(self.cfg.has_cluster):
+        if cutlass.const_expr(self.cfg.uses_two_cta_mma):
             if cutlass.const_expr(self.uses_async_load_pipeline):
                 pass
             else:
@@ -1121,7 +1219,7 @@ class SmemSfLdgstsResource(MemoryResource):
     def drain_loop(self, stage_info: StageInfo) -> None:
         """Drain producer cp.async work before producer_commit (loop phase)."""
         del stage_info
-        if cutlass.const_expr(self.cfg.has_cluster):
+        if cutlass.const_expr(self.cfg.uses_two_cta_mma):
             if cutlass.const_expr(self.uses_async_load_pipeline):
                 pass
             else:
@@ -1131,6 +1229,11 @@ class SmemSfLdgstsResource(MemoryResource):
                     cute.arch.cp_async_wait_group(1)
                 else:
                     cute.arch.cp_async_wait_group(2)
+                # The following AsyncThread producer commit is routed to the
+                # leading CTA and releases a 2-CTA UMMA consumer.  Publish the
+                # completed cp.async writes to that cluster-scoped async proxy
+                # before contributing this thread's full-barrier arrival.
+                prims.fence_proxy_async_release_sync_restrict()
         else:
             cute.arch.fence_view_async_shared()
 
@@ -1140,11 +1243,12 @@ class SmemSfLdgstsResource(MemoryResource):
         self, stage_info: StageInfo, *, prefetch_idx: cutlass.Constexpr[int]
     ) -> None:
         """Drain producer cp.async work before producer_commit (tail phase)."""
-        if cutlass.const_expr(self.cfg.has_cluster):
+        if cutlass.const_expr(self.cfg.uses_two_cta_mma):
             if cutlass.const_expr(self.uses_async_load_pipeline):
                 pass
             else:
                 self._tail_cp_async_wait_group(stage_info, prefetch_idx)
+                prims.fence_proxy_async_release_sync_restrict()
         else:
             cute.arch.fence_view_async_shared()
 
@@ -1152,22 +1256,24 @@ class SmemSfLdgstsResource(MemoryResource):
     def _build_desc_impl(self, stage_info: StageInfo):
         """Build SMEM descriptor for S2T copy of gathered SF (block-shuffled layout)."""
         is_b = cutlass.const_expr(self._operand == "b")
-        bytes_per_stage = (
-            self.cfg.num_bytes_sfb_per_stage
+        stage_stride = (
+            self.cfg.smem_sfb_stage_stride_bytes
             if is_b
-            else self.cfg.num_bytes_sfa_per_stage
+            else self.cfg.smem_sfa_stage_stride_bytes
         )
-        stage_base = self.smem_buf.subview(bytes_per_stage * stage_info.stage_idx)
+        stage_base = self.smem_buf.subview(stage_stride * stage_info.stage_idx)
         use_r128c4 = cutlass.const_expr((not is_b) or self.cfg.tile_n >= 128)
         if cutlass.const_expr(use_r128c4):
-            desc_s2t = prims.Tcgen05SmemDesc.build(
+            desc_s2t = build_tcgen05_smem_desc(
+                self.cfg,
                 stage_base,
                 leading_byte_offset=16,
                 stride_byte_offset=128,
                 layout=0,
             )
         else:
-            desc_s2t = prims.Tcgen05SmemDesc.build(
+            desc_s2t = build_tcgen05_smem_desc(
+                self.cfg,
                 stage_base,
                 leading_byte_offset=16,
                 stride_byte_offset=128,
@@ -1208,12 +1314,12 @@ class SmemSfLdgstsAResource(SmemSfLdgstsResource):
     def build_sfa_s2t_desc(self, stage_info: StageInfo) -> tuple[Int64, Int64]:
         desc = self._build_desc_impl(stage_info)
         is_b = cutlass.const_expr(self._operand == "b")
-        nbytes = (
-            self.cfg.num_bytes_sfb_per_stage
+        stage_stride = (
+            self.cfg.smem_sfb_stage_stride_bytes
             if is_b
-            else self.cfg.num_bytes_sfa_per_stage
+            else self.cfg.smem_sfa_stage_stride_bytes
         )
-        stage_base = self.smem_buf.subview(nbytes * stage_info.stage_idx)
+        stage_base = self.smem_buf.subview(stage_stride * stage_info.stage_idx)
         return desc, Int64(stage_base.data_ptr().toint())
 
 
@@ -1239,7 +1345,16 @@ class SmemSfLdgstsBResource(SmemSfLdgstsResource):
     ) -> None:
         self._producer_work_impl(stage_info, coord_sfb_k, coord_sfb_mn)
 
-    @consumer_work(returns=SmemSfLdgstsResource.desc_b_s2t_base)
+    @consumer_work(
+        returns=(
+            SmemSfLdgstsResource.desc_b_s2t_base,
+            SmemSfLdgstsResource.smem_sfb_stage_ptr,
+        )
+    )
     @cute.jit
-    def build_sfb_s2t_desc(self, stage_info: StageInfo) -> Int64:
-        return self._build_desc_impl(stage_info)
+    def build_sfb_s2t_desc(self, stage_info: StageInfo) -> tuple[Int64, Int64]:
+        desc = self._build_desc_impl(stage_info)
+        stage_base = self.smem_buf.subview(
+            self.cfg.smem_sfb_stage_stride_bytes * stage_info.stage_idx
+        )
+        return desc, Int64(stage_base.data_ptr().toint())

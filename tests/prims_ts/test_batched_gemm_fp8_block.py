@@ -48,7 +48,6 @@ def _common_fp8_base(**overrides):
         tile_scheduler=int(TileScheduler.PERSISTENT),
         dtype_a=int(DType.E4M3),
         dtype_b=int(DType.E4M3),
-        tile_m=128,
         epi_tile_m=128,
         mma_k=32,
         num_stages_tmem_acc=2,
@@ -81,9 +80,8 @@ def _deepseek_fp8_fc1_variant():
         tile_k=128,
         **uniform_pipeline_stage_overrides(4),
         mma_m=64,
-        cluster_m=1,
+        umma_cta_count=1,
         use_deepseek_fp8=1,
-        num_load_sfab_warps=1,
         num_load_b_warps=2,
         epilogue_regs=160,
         mma_regs=48,
@@ -113,9 +111,8 @@ def _deepseek_fp8_fc2_variant():
         tile_k=128,
         **uniform_pipeline_stage_overrides(4),
         mma_m=64,
-        cluster_m=1,
+        umma_cta_count=1,
         use_deepseek_fp8=1,
-        num_load_sfab_warps=1,
         num_stages_c_smem=1,
         epilogue_regs=160,
         mma_regs=48,
@@ -147,16 +144,11 @@ def _mx_fc1_base():
         route_act=int(RouteImpl.TMA),
         route_sfs_act=int(RouteImpl.LDGSTS),
         act_kind=int(ActKind.SWIGLU),
-        tile_m=128,
         mma_m=128,
         mma_k=32,
         dtype_a=int(DType.MXE4M3),
         dtype_b=int(DType.MXE4M3),
         dtype_c=int(DType.MXE4M3),
-        sf_bits=8,
-        sf_block_size_a=32,
-        sf_block_size_b=32,
-        sf_block_size_c=32,
         sf_layout_a=int(SfLayout.R128c4),
         sf_layout_b=int(SfLayout.LINEAR),
         sf_layout_c=int(SfLayout.R8c4),
@@ -174,7 +166,7 @@ def _mx_fc1_base():
         copy_sf_regs=48,
         workid_regs=48,
         padding_regs=48,
-        gather_regs=48,
+        load_b_regs=48,
     )
 
 
@@ -188,17 +180,13 @@ def _mx_fc2_base():
     return dict(
         batch_mode=0,
         route_act=0,
-        route_sfs_act=0,
+        route_sfs_act=-1,
         act_kind=0,
-        tile_m=128,
         mma_m=128,
         mma_k=32,
         dtype_a=int(DType.MXE4M3),
         dtype_b=int(DType.MXE4M3),
         dtype_c=int(DType.BF16),
-        sf_bits=8,
-        sf_block_size_a=32,
-        sf_block_size_b=32,
         sf_layout_a=int(SfLayout.R128c4),
         sf_layout_b=int(SfLayout.R8c4),
         epilogue_regs=128,
@@ -244,6 +232,71 @@ def test_deepseek_fp8_fc2_correctness_small(tile_n):
     )
 
 
+@pytest.mark.parametrize(
+    "num_tokens",
+    [128, 100],
+    ids=["full-tiles", "partial-tiles"],
+)
+@pytest.mark.parametrize(
+    "token_capacity",
+    [None, 1472],
+    ids=["routed-capacity", "worst-case-capacity"],
+)
+@pytest.mark.parametrize(
+    ("stage", "problem_n"),
+    [
+        pytest.param("fc1", 1024, id="fc1"),
+        pytest.param("fc2", 512, id="fc2"),
+    ],
+)
+def test_deepseek_fp8_moe_default_config_realistic_shape(
+    stage, problem_n, token_capacity, num_tokens
+):
+    """Check each GEMM at the shape used by the DeepSeek MoE smoke test.
+
+    The small tests above cover one expert, top-1 routing, and one 128-wide K
+    tile. The MoE uses 64 experts, top-8 routing, K=512, and the mapped
+    default tactic, which exercises substantially more routing metadata and
+    pipeline iterations. Keeping FC1 and FC2 as separate parameter cases tells
+    us whether either standalone GEMM fails before activation and finalization.
+
+    128 tokens spread over 64 experts at top-8 gives every expert 16 tokens, a
+    multiple of the token tile, so that routing has neither padding nor a
+    partial tile and its padded count is exact. Real MoE routing has both, so
+    the two extra axes reintroduce them: ``partial-tiles`` drops to 100 tokens,
+    leaving each expert 12 or 13 of its 16 padded rows and every second tile
+    partially valid, and ``worst-case-capacity`` declares a token extent wider
+    than the routed count, which the MoE runner must do because that count is
+    only known on the device.
+    """
+    _require_sm100()
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
+    from flashinfer.prims_ts.moe.config_mapper import (
+        map_trtllm_deepseek_fp8_moe_tactic,
+    )
+
+    # Map at the MoE's token count regardless of the routing axis, so every
+    # case runs the exact kernel configuration the MoE uses.
+    pair = map_trtllm_deepseek_fp8_moe_tactic(
+        [-1, -1],
+        num_tokens=128,
+        top_k=8,
+        num_local_experts=64,
+        enable_pdl=True,
+    )
+    config_spec = pair.fc1.cfg if stage == "fc1" else pair.fc2.cfg
+
+    assert reference_check(
+        num_experts=64,
+        num_tokens=num_tokens,
+        top_k=8,
+        problem_n=problem_n,
+        problem_k=512,
+        token_capacity=token_capacity,
+        **config_spec.kwargs,
+    )
+
+
 def test_mxfp8_mxfp8_fc2_tile8_correctness():
     _require_sm100()
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import TileScheduler
@@ -280,7 +333,7 @@ def test_mxfp8_mxfp8_fc1_tile32_correctness():
         "tile_k": 256,
         **uniform_pipeline_stage_overrides(5),
         "mma_m": 256,
-        "cluster_m": 2,
+        "umma_cta_count": 2,
     }
     assert reference_check(
         num_experts=2,

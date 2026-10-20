@@ -250,18 +250,14 @@ class SmemDeepSeekSfAbResource(MemoryResource):
         )
 
         expert_idx = Int32(0)
+        token_cga = token_tile // Int32(self.cfg.token_cluster_dim)
         if cutlass.const_expr(self.tile_idx_view is not None):
-            expert_idx = self.tile_idx_view.load(
-                idx=token_tile // Int32(self.cfg.token_metadata_stride), vector_size=1
-            )[0]
+            expert_idx = self.tile_idx_view.load(idx=token_cga, vector_size=1)[0]
         tile_rows = self.cfg.tile_n if self.cfg.is_swap_ab else self.cfg.tile_m
         token_limit = Int32(tile_rows)
         if cutlass.const_expr(self.mn_limit_view is not None):
             token_limit = self._local_tile_limit(
-                self.mn_limit_view.load(
-                    idx=token_tile // Int32(self.cfg.token_metadata_stride),
-                    vector_size=1,
-                )[0],
+                self.mn_limit_view.load(idx=token_cga, vector_size=1)[0],
                 token_tile,
                 tile_rows,
             )
@@ -308,7 +304,7 @@ class SmemDeepSeekSfAbResource(MemoryResource):
         )
 
         tidx, _, _ = cute.arch.thread_idx()
-        local_tid = tidx - Int32(self.cfg.load_sfab_warp_idx * 32)
+        local_tid = tidx - Int32(self.cfg.warp_layout.load_sfab_warp_idx * 32)
         k_block = stage_info.loop_offset
 
         num_act_load_iters = (self.cfg.num_dsfp8_act_sfs_per_stage + 31) // 32
@@ -406,11 +402,11 @@ class SmemDeepSeekSfAbResource(MemoryResource):
             tidx, _, _ = cute.arch.thread_idx()
             lane_id = tidx % Int32(32)
             warp_idx = cute.arch.warp_idx()
-            warp_in_epi = warp_idx - Int32(self.cfg.epilogue_warp_idx)
+            warp_in_epi = warp_idx - Int32(self.cfg.warp_layout.epilogue_warp_idx)
             warp_in_epi = cute.arch.make_warp_uniform(warp_in_epi)
             warpgroup_idx = warp_in_epi // Int32(4)
             warpgroup_idx = cute.arch.make_warp_uniform(warpgroup_idx)
-            warpgroup_count = max(1, self.cfg.num_epilogue_warps // 4)
+            warpgroup_count = max(1, self.cfg.warp_layout.num_epilogue_warps // 4)
             n_subtile_offset = t2r_output_call_idx * Int32(
                 self.cfg.epi_tile_n * warpgroup_count
             ) + warpgroup_idx * Int32(self.cfg.epi_tile_n)
@@ -439,7 +435,7 @@ class SmemDeepSeekSfAbResource(MemoryResource):
             )
 
         warp_idx = cute.arch.warp_idx()
-        warp_in_epi = warp_idx - Int32(self.cfg.epilogue_warp_idx)
+        warp_in_epi = warp_idx - Int32(self.cfg.warp_layout.epilogue_warp_idx)
         warp_in_epi = cute.arch.make_warp_uniform(warp_in_epi)
         lane_id = cute.arch.lane_idx()
         row_in_tile = warp_in_epi * Int32(32) + lane_id
