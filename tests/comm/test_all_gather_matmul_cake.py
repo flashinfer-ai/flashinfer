@@ -202,7 +202,7 @@ def test_n128_table_lists_ws4_and_ws8_classes_per_architecture_under_the_frozen_
     assert loader.SM_PUSH_BANDS_BY_ARCH == {"sm_100a": [], "sm_103a": [[8, 1024, 1619]]}
     assert loader.PUSH_LAUNCH_ROWS_BY_ARCH == {
         "sm_100a": [],
-        "sm_103a": [[4, 512, 16, 8]],
+        "sm_103a": [[4, 512, 16, 8], [8, 1024, 16, 8]],
     }
     assert loader.PUSH_KSLICES_BY_ARCH == {"sm_100a": [], "sm_103a": [[8, 512, 4]]}
     assert loader.MAIN_BLOCK_NS == (256, 128) and loader.BLOCK_N == 256
@@ -566,7 +566,8 @@ def test_barrier_and_push_programs_use_static_shared_memory_only():
 def test_push_launch_follows_the_per_peer_payload():
     # 128 padded rows x K x 2 B = 2 MiB per peer keep the 32-CTA launch; 512 rows
     # (8 MiB) take the wide launch; the threshold itself is on the wide side. The
-    # eight-rank calls have no launch row on either architecture.
+    # eight-rank calls of these row counts have no launch row on either
+    # architecture (the eight-rank launch row sits at 1024 padded rows, below).
     assert loader.push_payload_bytes(128, 2) == 2 * 1024 * 1024
     assert loader.push_payload_bytes(512, 2) == 8 * 1024 * 1024
     for arch in _BOTH:
@@ -590,16 +591,23 @@ def test_push_launch_follows_the_per_peer_payload():
     assert loader.PUSH_CARVEOUT == -1
 
 
-def test_push_launch_rows_give_the_sm_103a_four_rank_512_row_calls_sixteen_wide_ctas():
+def test_push_launch_rows_give_the_sm_103a_listed_calls_sixteen_wide_ctas():
     """``PUSH_LAUNCH_ROWS_BY_ARCH`` replaces the payload rule for exactly the listed
     (world size, padded rows): on ``sm_103a`` the four-rank calls of exactly 512
-    padded rows launch 16 CTAs per peer of the wide program (the rule's 8 x 8
-    elsewhere); the four-rank 128-row calls keep 32 x 1, every eight-rank call and
-    every ``sm_100a`` call the payload rule. An arch outside the table raises."""
+    padded rows and the eight-rank calls of exactly 1024 padded rows (the SM push
+    band row) launch 16 CTAs per peer of the wide program (the rule's 8 x 8
+    elsewhere); the four-rank 128-row calls keep 32 x 1, every other call of either
+    world size and every ``sm_100a`` call the payload rule. An arch outside the
+    table raises."""
 
-    assert loader.push_launch_rows("sm_103a") == ((4, 512, 16, 8),)
+    assert loader.push_launch_rows("sm_103a") == ((4, 512, 16, 8), (8, 1024, 16, 8))
     assert loader.push_launch_rows("sm_100a") == ()
     assert loader.push_launch(512, 2, world_size=4, arch="sm_103a") == (
+        "peer_push_wide",
+        16,
+        8,
+    )
+    assert loader.push_launch(1024, 2, world_size=8, arch="sm_103a") == (
         "peer_push_wide",
         16,
         8,
@@ -610,12 +618,29 @@ def test_push_launch_rows_give_the_sm_103a_four_rank_512_row_calls_sixteen_wide_
         16,
         8,
     )
+    assert loader.push_launch(1024, 4, world_size=8, arch="sm_103a") == (
+        "peer_push_wide",
+        16,
+        8,
+    )
     assert loader.push_launch(512, 2, world_size=4, arch="sm_100a") == (
         "peer_push_wide",
         8,
         8,
     )
+    assert loader.push_launch(1024, 2, world_size=8, arch="sm_100a") == (
+        "peer_push_wide",
+        8,
+        8,
+    )
+    # Each row is keyed on its own world size: the other world size at the same
+    # row count keeps the payload rule.
     assert loader.push_launch(512, 2, world_size=8, arch="sm_103a") == (
+        "peer_push_wide",
+        8,
+        8,
+    )
+    assert loader.push_launch(1024, 2, world_size=4, arch="sm_103a") == (
         "peer_push_wide",
         8,
         8,
@@ -627,6 +652,12 @@ def test_push_launch_rows_give_the_sm_103a_four_rank_512_row_calls_sixteen_wide_
     )
     for rows in (256, 384, 640, 1024):
         assert loader.push_launch(rows, 2, world_size=4, arch="sm_103a") == (
+            "peer_push_wide",
+            8,
+            8,
+        )
+    for rows in (256, 384, 512, 640, 1152, 2048):
+        assert loader.push_launch(rows, 2, world_size=8, arch="sm_103a") == (
             "peer_push_wide",
             8,
             8,
@@ -1790,9 +1821,16 @@ def test_sm_push_bands_route_the_sm_103a_eight_rank_1024_row_calls_up_to_n_1619(
     assert (
         loader.uses_sm_push(rows=1025, world_size=8, cols=1280, arch="sm_103a") is False
     )
-    # The band row's per-peer payload (1024 x 8192 x 2 B = 16 MiB) selects the wide push launch.
+    # The band row's per-peer payload (1024 x 8192 x 2 B = 16 MiB) selects the wide
+    # push program; on sm_103a its launch row raises the CTAs per peer from the
+    # rule's 8 to 16, on sm_100a (no row, no band) the pure rule keeps 8 x 8.
     assert loader.push_payload_bytes(1024, 2) == 16 * 1024 * 1024
     assert loader.push_launch(1024, 2, world_size=8, arch="sm_103a") == (
+        "peer_push_wide",
+        16,
+        loader.PUSH_WIDE_UNROLL,
+    )
+    assert loader.push_launch(1024, 2, world_size=8, arch="sm_100a") == (
         "peer_push_wide",
         loader.PUSH_WIDE_CTAS_PER_PEER,
         loader.PUSH_WIDE_UNROLL,
