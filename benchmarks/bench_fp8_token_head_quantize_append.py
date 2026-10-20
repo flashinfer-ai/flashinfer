@@ -80,11 +80,10 @@ def _cos(a, b):
 
 
 def _rel_l2_err(a, b):
-    # Magnitude-sensitive complement to _cos: cosine is blind to uniform
-    # (re)scales, so a stored-scale/data mismatch passes cos but not this.
-    # FP8 e4m3 rounding keeps this ~2-4% on random data; 0.1 has wide margin.
-    # Flatten first (as _cos does): the identity slot mapping above makes the
-    # paged and token layouts agree in flat order.
+    # Magnitude-sensitive complement to _cos: cosine normalizes away uniform
+    # (re)scales. FP8 e4m3 rounding keeps this ~2-4% on random data, so 0.1
+    # has wide margin. Flatten first: with identity slots, paged and token
+    # layouts agree in flat order.
     a, b = a.flatten().float(), b.flatten().float()
     return (torch.norm(a - b) / torch.norm(b)).item()
 
