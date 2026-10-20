@@ -321,7 +321,9 @@ setup_sccache() {
   fi
   (( _sccache_xtrace )) && set -x
 
-  sccache --start-server
+  # Explicit return: a caller that guards setup_sccache with `if` runs it with
+  # errexit off, and must still see a failed startup.
+  sccache --start-server || return $?
   sccache --zero-stats
   export FLASHINFER_SCCACHE_ACTIVE=true
   echo "sccache version: $(sccache --version)"

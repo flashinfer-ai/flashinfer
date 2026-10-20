@@ -456,27 +456,51 @@ test "${{FLASHINFER_NVCC_LAUNCHER}}" = sccache
     subprocess.run(["bash", "-c", script], check=True)
 
 
-def _write_test_sccache_fakes(tmp_path, sccache_version):
+def _write_test_sccache_fakes(
+    tmp_path, sccache_version, *, serve_archive=False, start_server_fails=False
+):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     sccache_log = tmp_path / "sccache.log"
     sccache = fake_bin / "sccache"
+    start_server_status = 1 if start_server_fails else 0
     sccache.write_text(
         "#!/bin/bash\n"
         f'echo "$*" >> "{sccache_log}"\n'
         f'if [ "$1" = --version ]; then echo "sccache {sccache_version}"; fi\n'
         'if [ "$1" = --show-stats ]; then echo "Cache hits 1"; fi\n'
+        f'if [ "$1" = --start-server ]; then exit {start_server_status}; fi\n'
     )
-    # Fail any download so a version mismatch takes the fail-open path offline.
+    # Downloads fail by default so a version mismatch takes the fail-open path
+    # offline. serve_archive instead "downloads" an archive whose published
+    # checksum does not match, which must stop the install before extraction.
     curl = fake_bin / "curl"
-    curl.write_text("#!/bin/bash\nexit 22\n")
+    if serve_archive:
+        curl.write_text(
+            "#!/bin/bash\n"
+            'while [ "$#" -gt 0 ]; do\n'
+            '  case "$1" in -o) out=$2; shift 2 ;; *) url=$1; shift ;; esac\n'
+            "done\n"
+            'case "$url" in\n'
+            '  *.sha256) echo "0000000000000000000000000000000000000000000000000000000000000000  x" > "$out" ;;\n'
+            '  *) echo "not the published archive" > "$out" ;;\n'
+            "esac\n"
+        )
+    else:
+        curl.write_text("#!/bin/bash\nexit 22\n")
+    tar_log = tmp_path / "tar.log"
+    tar = fake_bin / "tar"
+    tar.write_text(f'#!/bin/bash\necho "$*" >> "{tar_log}"\n')
+    # Pin a supported architecture so every host reaches the checksum check.
+    uname = fake_bin / "uname"
+    uname.write_text("#!/bin/bash\necho x86_64\n")
     cuda_bin = tmp_path / "cuda" / "bin"
     cuda_bin.mkdir(parents=True)
     nvcc = cuda_bin / "nvcc"
     nvcc.write_text(
         "#!/bin/bash\necho 'Cuda compilation tools, release 12.9, V12.9.86'\n"
     )
-    for executable in (sccache, curl, nvcc):
+    for executable in (sccache, curl, tar, uname, nvcc):
         executable.chmod(0o755)
     child = tmp_path / "lane.sh"
     child.write_text(
@@ -504,7 +528,7 @@ def _write_test_sccache_fakes(tmp_path, sccache_version):
         "FLASHINFER_CXX_LAUNCHER",
     ):
         env.pop(name, None)
-    return child, sccache_log, env
+    return child, sccache_log, tar_log, env
 
 
 def _run_with_test_sccache(tmp_path, child, env):
@@ -520,8 +544,16 @@ def _run_with_test_sccache(tmp_path, child, env):
     )
 
 
+def _assert_ran_uncached(result):
+    assert result.returncode == 7, result.stdout + result.stderr
+    assert "running without the compiler cache" in result.stdout
+    assert "nvcc_launcher=\n" in result.stdout
+    assert "cxx_launcher=\n" in result.stdout
+    assert "args=--workers-per-gpu 2\n" in result.stdout
+
+
 def test_gpu_lane_sccache_wrapper_enables_cache_and_keeps_exit_code(tmp_path):
-    child, sccache_log, env = _write_test_sccache_fakes(tmp_path, "0.18.0")
+    child, sccache_log, _, env = _write_test_sccache_fakes(tmp_path, "0.18.0")
 
     result = _run_with_test_sccache(tmp_path, child, env)
 
@@ -531,7 +563,7 @@ def test_gpu_lane_sccache_wrapper_enables_cache_and_keeps_exit_code(tmp_path):
     )
     assert lines["nvcc_launcher"] == "sccache"
     assert lines["cxx_launcher"] == "sccache"
-    assert lines["prefix"].startswith("cuda129-")
+    assert lines["prefix"] == "cuda129-x86_64"
     jit_root = (tmp_path / "home" / ".cache" / "flashinfer").resolve()
     assert lines["basedirs"] == f"{tmp_path.resolve()}:{jit_root}"
     assert lines["args"] == "--workers-per-gpu 2"
@@ -541,15 +573,48 @@ def test_gpu_lane_sccache_wrapper_enables_cache_and_keeps_exit_code(tmp_path):
     assert (tmp_path / "stats" / "sccache-stats.txt").read_text() == "Cache hits 1\n"
 
 
-def test_gpu_lane_sccache_wrapper_fails_open_when_install_fails(tmp_path):
-    child, sccache_log, env = _write_test_sccache_fakes(tmp_path, "0.0.0")
+def test_gpu_lane_sccache_wrapper_fails_open_when_download_fails(tmp_path):
+    child, sccache_log, _, env = _write_test_sccache_fakes(tmp_path, "0.0.0")
 
     result = _run_with_test_sccache(tmp_path, child, env)
 
-    assert result.returncode == 7, result.stdout + result.stderr
-    assert "running without the compiler cache" in result.stdout
-    assert "nvcc_launcher=\n" in result.stdout
+    _assert_ran_uncached(result)
     assert "--start-server" not in sccache_log.read_text().splitlines()
+
+
+def test_gpu_lane_sccache_wrapper_rejects_checksum_mismatch(tmp_path):
+    child, sccache_log, tar_log, env = _write_test_sccache_fakes(
+        tmp_path, "0.0.0", serve_archive=True
+    )
+
+    result = _run_with_test_sccache(tmp_path, child, env)
+
+    _assert_ran_uncached(result)
+    # A failed `sha256sum -c` must stop the install before extraction.
+    assert not tar_log.exists()
+    assert "--start-server" not in sccache_log.read_text().splitlines()
+
+
+def test_gpu_lane_sccache_wrapper_fails_open_without_nvcc(tmp_path):
+    child, sccache_log, _, env = _write_test_sccache_fakes(tmp_path, "0.18.0")
+    (tmp_path / "cuda" / "bin" / "nvcc").unlink()
+
+    result = _run_with_test_sccache(tmp_path, child, env)
+
+    _assert_ran_uncached(result)
+    assert "--start-server" not in sccache_log.read_text().splitlines()
+
+
+def test_gpu_lane_sccache_wrapper_fails_open_when_server_start_fails(tmp_path):
+    child, sccache_log, _, env = _write_test_sccache_fakes(
+        tmp_path, "0.18.0", start_server_fails=True
+    )
+
+    result = _run_with_test_sccache(tmp_path, child, env)
+
+    _assert_ran_uncached(result)
+    assert "--start-server" in sccache_log.read_text().splitlines()
+    assert not (tmp_path / "stats" / "sccache-stats.txt").exists()
 
 
 @pytest.mark.parametrize(
