@@ -984,7 +984,7 @@ SM_PUSH_BANDS_BY_ARCH: dict[str, list[list[int]]] = {
 # never the payload rule alone.
 PUSH_LAUNCH_ROWS_BY_ARCH: dict[str, list[list[int]]] = {
     "sm_100a": [],
-    "sm_103a": [[4, 512, 16, 8]],
+    "sm_103a": [[4, 512, 16, 8], [8, 1024, 16, 8]],
 }
 # Per-architecture SM push readiness slice rows ``[world_size, padded_rows,
 # k_slices]`` (copied from the kernel module): an SM-push call of exactly

@@ -1098,10 +1098,10 @@ constexpr int64_t kPushPayloadThresholdBytes = 4194304;
 // per-architecture table): a call of exactly kPushLaunchRowRows[i] padded rows launches
 // kPushLaunchRowCtas[i] CTAs per peer of the wide program (kPushLaunchRowWide[i]) or of the
 // one-vector program, whatever its payload (a trailing 0 entry keeps an empty table well-formed).
-constexpr int kPushLaunchRowCount = 0;
-constexpr int64_t kPushLaunchRowRows[kPushLaunchRowCount + 1] = {0};
-constexpr unsigned kPushLaunchRowCtas[kPushLaunchRowCount + 1] = {0u};
-constexpr bool kPushLaunchRowWide[kPushLaunchRowCount + 1] = {false};
+constexpr int kPushLaunchRowCount = 1;
+constexpr int64_t kPushLaunchRowRows[kPushLaunchRowCount + 1] = {1024, 0};
+constexpr unsigned kPushLaunchRowCtas[kPushLaunchRowCount + 1] = {16u, 0u};
+constexpr bool kPushLaunchRowWide[kPushLaunchRowCount + 1] = {true, false};
 constexpr int push_launch_row(int64_t padded_rows) {
   for (int i = 0; i < kPushLaunchRowCount; ++i) {
     if (kPushLaunchRowRows[i] == padded_rows) return i;
