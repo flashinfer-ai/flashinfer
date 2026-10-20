@@ -79,6 +79,16 @@ def _cos(a, b):
     ).item()
 
 
+def _rel_l2_err(a, b):
+    # Magnitude-sensitive complement to _cos: cosine is blind to uniform
+    # (re)scales, so a stored-scale/data mismatch passes cos but not this.
+    # FP8 e4m3 rounding keeps this ~2-4% on random data; 0.1 has wide margin.
+    # Flatten first (as _cos does): the identity slot mapping above makes the
+    # paged and token layouts agree in flat order.
+    a, b = a.flatten().float(), b.flatten().float()
+    return (torch.norm(a - b) / torch.norm(b)).item()
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="FP8 per-(token, head) quantize-and-append paged KV cache writer"
@@ -92,7 +102,7 @@ def main():
     ap.add_argument("--head-dims", type=int, nargs="+", default=[128])
     ap.add_argument("--num-kv-heads", type=int, default=8)
     ap.add_argument("--page-size", type=int, default=16)
-    ap.add_argument("--dtypes", nargs="+", default=["fp16"])
+    ap.add_argument("--dtypes", nargs="+", choices=["fp16", "bf16"], default=["fp16"])
     ap.add_argument("--layouts", nargs="+", default=["NHD"])
     ap.add_argument("--dry-run-ms", type=int, default=25)
     ap.add_argument("--repeat-ms", type=int, default=100)
@@ -131,8 +141,13 @@ def main():
         fi_kd = _dequant(k_slot[..., :hd].view(FP8), k_sf)
         fi_vd = _dequant(v_slot[..., :hd].view(FP8), v_sf)
         ck, cv = _cos(fi_kd, k.float()), _cos(fi_vd, v.float())
-        print(f"check: cos(fi_k,k)={ck:.5f} cos(fi_v,v)={cv:.5f}")
+        ek, ev = _rel_l2_err(fi_kd, k.float()), _rel_l2_err(fi_vd, v.float())
+        print(
+            f"check: cos(fi_k,k)={ck:.5f} cos(fi_v,v)={cv:.5f} | "
+            f"rel_l2(k)={ek:.4f} rel_l2(v)={ev:.4f}"
+        )
         assert min(ck, cv) > 0.999, "correctness check failed"
+        assert max(ek, ev) < 0.1, "dequant magnitude check failed (bad scale?)"
 
     nkv, page = args.num_kv_heads, args.page_size
     for kv_layout in args.layouts:
