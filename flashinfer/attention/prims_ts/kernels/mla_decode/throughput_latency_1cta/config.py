@@ -795,11 +795,9 @@ def resolve_runtime_cluster_reduction_mode(
     cfg: MlaConfig | None,
     *,
     reduction_mode: str | None,
-    hardware_info,
-    stream=None,
     log=None,
 ) -> str | None:
-    """Query cluster occupancy and return the final runtime reduction mode."""
+    """Use cached device occupancy to resolve the runtime reduction mode."""
 
     if (
         cfg is None
@@ -810,7 +808,9 @@ def resolve_runtime_cluster_reduction_mode(
 
     cluster_shape = cluster_reduction_cluster_shape(cfg)
     cluster_size = cluster_shape[0] * cluster_shape[1] * cluster_shape[2]
-    active_clusters = hardware_info.get_max_active_clusters(cluster_size, stream)
+    from ...._hardware import get_max_active_clusters
+
+    active_clusters = get_max_active_clusters(cluster_size)
     cluster_count = cluster_reduction_cluster_count(cfg)
     if log is not None:
         log(
