@@ -199,47 +199,47 @@ _SCAN_MODULES = {
     "exact_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_bbd73b5202",
 }
 _EXACTFUSED_MODULES = {
-    "exactfused_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_8c7b44b307",
-    "exactfused_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_f98626e987",
-    "exactfused_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_2782e6a1e7",
-    "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_c5f2bbb929",
-    "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_bb3b8a1290",
-    "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_1fbd76a85d",
-    "exactfused_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_a4621a6ee2",
-    "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_eafa9cec60",
-    "exactfused_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_8ed0414605",
-    "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_7e139175b9",
-    "exactfused_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_a7396a5cd1",
+    "exactfused_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_b9b1004bf9",
+    "exactfused_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_ca0e86b85e",
+    "exactfused_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_c0c70bdc72",
+    "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_2e60cd811b",
+    "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_9f26678a99",
+    "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_33156e24a3",
+    "exactfused_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_b23fda648d",
+    "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_96d2060d32",
+    "exactfused_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_1b6ebc1d72",
+    "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_b13ad21c49",
+    "exactfused_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_079bcfe4b5",
 }
 _CHUNKPAR_MODULES = {
-    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_v3_bf16_batched_85d05a5141",
-    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_v3_f16_batched_3118613692",
-    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_v3_f32_batched_2adb79440d",
-    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_v3_bf16_varlen_91d9111991",
-    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_v3_f16_varlen_761c3270bf",
-    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_v3_f32_varlen_8afaff0cb5",
+    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_v3_bf16_batched_22e35cf4ea",
+    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_v3_f16_batched_f383a3a64e",
+    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_v3_f32_batched_84131101e6",
+    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_v3_bf16_varlen_2a29ec0757",
+    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_v3_f16_varlen_247f589535",
+    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_v3_f32_varlen_bbe331b2df",
 }
 _EXACTPRE_MODULES = {
-    "exactpre_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_60326178ad",
-    "exactpre_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_0486a24953",
-    "exactpre_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_990e95d826",
-    "exactpre_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_a3449eb47f",
-    "exactpre_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_e3f2303844",
-    "exactpre_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_4a14185e67",
-    "exactpre_bf16_batched_tail": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_tail_db861d91ee",
-    "exactpre_bf16_varlen_tail": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_fdfc5e2e6f",
-    "exactpre_f16_batched_tail": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_tail_b1586273cc",
-    "exactpre_f16_varlen_tail": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tail_6d0511175a",
-    "exactpre_f32_batched_tail": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_tail_9cb8638680",
-    "exactpre_f32_varlen_tail": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tail_4cced11b0f",
+    "exactpre_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_42e1969ba8",
+    "exactpre_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_da7c5004dc",
+    "exactpre_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_9df4f49711",
+    "exactpre_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_6a9d60dc45",
+    "exactpre_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_d2d517f5a8",
+    "exactpre_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_4d4d183c65",
+    "exactpre_bf16_batched_tail": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_tail_83e285944e",
+    "exactpre_bf16_varlen_tail": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_920a72bca9",
+    "exactpre_f16_batched_tail": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_tail_8c871220a8",
+    "exactpre_f16_varlen_tail": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tail_58fa3281d0",
+    "exactpre_f32_batched_tail": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_tail_da634e043c",
+    "exactpre_f32_varlen_tail": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tail_3db510fd81",
 }
 _CHUNKPAR3_MODULES = {
-    "chunkpar3_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_d1ba6a2f08",
-    "chunkpar3_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_c124c3a358",
-    "chunkpar3_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_d6b516653c",
-    "chunkpar3_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_8542a9b27b",
-    "chunkpar3_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_7e262cf9d5",
-    "chunkpar3_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_7fc246a37c",
+    "chunkpar3_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_2d0d9e4b72",
+    "chunkpar3_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_e1869cbee5",
+    "chunkpar3_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_4b726bb26f",
+    "chunkpar3_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_3b884ec056",
+    "chunkpar3_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_a3f2b783ec",
+    "chunkpar3_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_d031378b2d",
 }
 # The fused programs of the seq_idx triple form deriving its table
 # (``exactmeta_*``): the ``exactfused_*`` varlen main kernels -- the same
@@ -248,11 +248,11 @@ _CHUNKPAR3_MODULES = {
 # preprocess.  Refreshed by the Cake export together with the exactfused
 # varlen entries (an exactmeta entry always equals its exactfused twin).
 _EXACTMETA_MODULES = {
-    "exactmeta_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_c5f2bbb929",
-    "exactmeta_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_bb3b8a1290",
-    "exactmeta_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_1fbd76a85d",
-    "exactmeta_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_eafa9cec60",
-    "exactmeta_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_7e139175b9",
+    "exactmeta_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_2e60cd811b",
+    "exactmeta_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_9f26678a99",
+    "exactmeta_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_33156e24a3",
+    "exactmeta_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_96d2060d32",
+    "exactmeta_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_b13ad21c49",
 }
 # The one-launch fused varlen programs (``exactone_*``): the exact scan's fused
 # varlen entries as SM103 renders them -- the main kernel's CTA prologue
@@ -263,11 +263,11 @@ _EXACTMETA_MODULES = {
 # render: its sources are the ``exactone_*`` entries of ``_SM107_MODULES``.
 # Refreshed by the Cake export; seed identities until it fills them.
 _EXACTONE_MODULES = {
-    "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_22b56edf7a",
-    "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_d294c9019e",
-    "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_a44539089a",
-    "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_0ea2f04df1",
-    "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_c99424e391",
+    "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_2e93602110",
+    "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_417e094e67",
+    "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_71ead26645",
+    "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_1100526c71",
+    "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_948223063c",
 }
 # sm_107a (Rubin) device modules of the exported programs, filled by the Cake
 # export: the tcgen05 SMEM descriptor address field is 15 bits on sm_107a
@@ -282,51 +282,51 @@ _EXACTONE_MODULES = {
 # table in-kernel; an ``exactmeta_*`` entry always equals its ``exactfused_*``
 # varlen twin.
 _SM107_MODULES = {
-    "exactfused_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_f13183e6a1",
-    "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_2d5cb59346",
-    "exactfused_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_4b3914f176",
-    "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_7fb91bb6f2",
-    "exactfused_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_1bc323f61f",
-    "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_8ed847c643",
-    "exactfused_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_3dc3d34077",
-    "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_66b8bd4f9f",
-    "exactfused_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_beaa6c0634",
-    "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_cb5a7c4eff",
-    "exactfused_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_1f7505eacf",
-    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_v3_bf16_batched_0dbe1ddb35",
-    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_v3_bf16_varlen_73e1fa1e8b",
-    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_v3_f16_batched_bba26a1e7b",
-    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_v3_f16_varlen_4a41373610",
-    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_v3_f32_batched_5394d76cd0",
-    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_v3_f32_varlen_4248999288",
-    "exactpre_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_cb5e8e04f4",
-    "exactpre_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_7477f7179b",
-    "exactpre_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_c2308748ef",
-    "exactpre_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_8d7007b9c3",
-    "exactpre_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_88a1af468a",
-    "exactpre_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_bd9b159b8f",
-    "exactpre_bf16_batched_tail": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_tail_79a1e86066",
-    "exactpre_bf16_varlen_tail": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_f2b8226a51",
-    "exactpre_f16_batched_tail": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_tail_80dd0f122a",
-    "exactpre_f16_varlen_tail": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tail_fcce4c4920",
-    "exactpre_f32_batched_tail": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_tail_911ae0f1c3",
-    "exactpre_f32_varlen_tail": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tail_17781c9d04",
-    "chunkpar3_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_2905988f95",
-    "chunkpar3_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_01a42c5976",
-    "chunkpar3_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_617667906e",
-    "chunkpar3_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_c710487fff",
-    "chunkpar3_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_796c446558",
-    "chunkpar3_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_95d4c416ce",
-    "exactmeta_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_2d5cb59346",
-    "exactmeta_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_7fb91bb6f2",
-    "exactmeta_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_8ed847c643",
-    "exactmeta_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_66b8bd4f9f",
-    "exactmeta_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_cb5a7c4eff",
-    "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_a536b8b6e8",
-    "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_d6103de117",
-    "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_539c003e6b",
-    "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_b68ce1e618",
-    "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_f2717ae6c0",
+    "exactfused_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_100dc8e269",
+    "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_09cfaa7d95",
+    "exactfused_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_25d35c0e5e",
+    "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_963449dd82",
+    "exactfused_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_07dd4b7294",
+    "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_4055fb7a96",
+    "exactfused_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_8ba4668b69",
+    "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_ded2a71f22",
+    "exactfused_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_afda1f5e56",
+    "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_ebe1153e72",
+    "exactfused_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_6fc0aa6820",
+    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_v3_bf16_batched_89335ff8cc",
+    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_v3_bf16_varlen_bf5f8f29cc",
+    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_v3_f16_batched_e8be793ca1",
+    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_v3_f16_varlen_84798a1f04",
+    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_v3_f32_batched_024862c2bd",
+    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_v3_f32_varlen_ac35f60385",
+    "exactpre_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_3b705e14ef",
+    "exactpre_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_cfc501cc89",
+    "exactpre_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_b42c33f5c7",
+    "exactpre_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_655d231457",
+    "exactpre_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_fd1935e9ef",
+    "exactpre_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_97f655eea0",
+    "exactpre_bf16_batched_tail": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_tail_3fd9e931b6",
+    "exactpre_bf16_varlen_tail": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_27bbc1baeb",
+    "exactpre_f16_batched_tail": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_tail_e999a6d69e",
+    "exactpre_f16_varlen_tail": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tail_a4fea4e834",
+    "exactpre_f32_batched_tail": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_tail_13208c67e3",
+    "exactpre_f32_varlen_tail": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tail_4717832a2d",
+    "chunkpar3_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_749b4edb36",
+    "chunkpar3_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_5eeb718279",
+    "chunkpar3_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_d12003e26c",
+    "chunkpar3_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_61d13103d0",
+    "chunkpar3_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_d6b16f8316",
+    "chunkpar3_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_a10f24bf56",
+    "exactmeta_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_09cfaa7d95",
+    "exactmeta_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_963449dd82",
+    "exactmeta_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_4055fb7a96",
+    "exactmeta_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_ded2a71f22",
+    "exactmeta_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_ebe1153e72",
+    "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_5b650e6211",
+    "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_e0ec22c79d",
+    "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_75d76aff25",
+    "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_c0be08ce76",
+    "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_cdfc327504",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
@@ -969,6 +969,20 @@ _CHUNK_PARALLEL_SMALL_ITEMS = 32
 _CHUNK_PARALLEL_LARGE_ITEMS = 128
 _CHUNK_PARALLEL_SELECTION_MARGIN = 1.05
 _CHUNK_PARALLEL_WORKSPACE_CAP_BYTES = 256 << 20
+# Per-capability cap: sm_107a admits 8192-tile calls (384 MiB) -- 1 sequence x
+# 1024 chunks or 4 x 256 chunks at 8 heads -- which the exact scan serves 2-7x
+# slower; the workspace is grow-only per device, so the cap bounds that growth.
+_CHUNK_PARALLEL_WORKSPACE_CAP_BYTES_BY_CAPABILITY = {(10, 7): 512 << 20}
+
+
+def chunk_parallel_workspace_cap_bytes(capability) -> int:
+    """Workspace cap of the chunk-parallel regime for ``capability``."""
+
+    return _CHUNK_PARALLEL_WORKSPACE_CAP_BYTES_BY_CAPABILITY.get(
+        (int(capability[0]), int(capability[1])), _CHUNK_PARALLEL_WORKSPACE_CAP_BYTES
+    )
+
+
 # Third cost arm: the three-phase program's own
 # calibrated constants (``CHUNK_PARALLEL_COST_MODEL_US`` of the Cake seed
 # module flashinfer_blackwell_mamba_ssd_combined_chunk_parallel_seed_v1, round
@@ -1380,7 +1394,8 @@ def chunk_parallel_family(
     predicted = quantities["predicted_us"]
     chunk_parallel = (
         quantities["work_items"] < quantities["sm_count"]
-        and quantities["workspace_bytes"] <= _CHUNK_PARALLEL_WORKSPACE_CAP_BYTES
+        and quantities["workspace_bytes"]
+        <= chunk_parallel_workspace_cap_bytes(capability)
         and min(predicted["chunk_parallel"], predicted["three_phase"])
         * _CHUNK_PARALLEL_SELECTION_MARGIN
         <= predicted["exact_scan"]
@@ -1547,28 +1562,125 @@ def two_kernel_family(*, mode_varlen: bool, num_sequences: int, seqlen: int) -> 
 _TAIL_MIN_CHUNKS = 16
 
 
+@dataclass(frozen=True)
+class _TailFullGridRule:
+    """Admission of a two-kernel call whose balanced persistent grid is the
+    full device (``_persistent_grid_size`` returned ``sm_count``: on 212 SMs
+    every item count above 212 except multiples the balancing rule accepts,
+    e.g. 256, 512, 640) to the ``_tail`` pair program.  The persistent program
+    then runs ``ceil(items / sm_count)`` item waves, the last one ragged; the
+    pair program runs ``ceil(items / pairs) / 2`` half-item rounds and saves
+    the difference.  Measured on R200 (CAKE-2549 round 9, lease 799171: the
+    item ladder 128..256 and the (items x chunks x form) grid, main-kernel
+    medians, cold L2): the pair render costs more per item than the ring
+    render -- ``render_penalty`` is that measured ratio minus one (batched
+    ~1.5-5 us per launch, up to 1/12 of an item at 16 chunks; varlen 4-11 us
+    per item, up to 1/5) -- and the split item of an odd pair hands its scan
+    state over at the cost of about one chunk step.  The route is taken only
+    where the saved waves exceed both: 256 items (2 waves vs 1.5 rounds) win
+    on every form (1.04-1.26x), 512 and 640 items win on the batched form
+    only (1.06-1.13x; the varlen pair render loses 0.90-0.99x there), and
+    equal makespans (384, 768, 1024, 2048 items) lose by the overhead.  The
+    varlen chunk floor is 8: 256-item varlen calls of 8 chunks win 1.03-1.08x
+    (perf_varlen_32x8, nem_v1024x2) and no varlen call above one item per SM
+    with 8 chunks lies inside the fused window; the batched floor stays 16
+    (an 8-chunk batched call up to 256 items is a fused-window call)."""
+
+    min_chunks_batched: int
+    min_chunks_varlen: int
+    render_penalty_batched: float
+    render_penalty_varlen: float
+
+    def min_chunks(self, mode_varlen: bool) -> int:
+        return self.min_chunks_varlen if mode_varlen else self.min_chunks_batched
+
+    def render_penalty(self, mode_varlen: bool) -> float:
+        return (
+            self.render_penalty_varlen if mode_varlen else self.render_penalty_batched
+        )
+
+
+# sm_107a (R200, 212 SMs) only; the Blackwell rule keeps the balanced-grid
+# condition (no entry: a full grid never takes the pair program).
+_TAIL_FULL_GRID_RULES: dict[tuple[int, int], _TailFullGridRule] = {
+    (10, 7): _TailFullGridRule(
+        min_chunks_batched=16,
+        min_chunks_varlen=8,
+        render_penalty_batched=1 / 12,
+        render_penalty_varlen=1 / 5,
+    ),
+}
+
+
+def tail_full_grid_rule(capability) -> Optional[_TailFullGridRule]:
+    """The full-grid admission rule of ``capability`` (``None``: none)."""
+
+    return _TAIL_FULL_GRID_RULES.get((int(capability[0]), int(capability[1])))
+
+
+def _full_grid_tail_selected(
+    *,
+    rule: _TailFullGridRule,
+    total_work: int,
+    chunks_per_item: int,
+    sm_count: int,
+    mode_varlen: bool,
+) -> bool:
+    """:class:`_TailFullGridRule` on a call whose balanced grid is the full
+    device: the pair makespan (half-item rounds) grown by the measured render
+    penalty, plus one chunk step of hand-off when the pair with the most items
+    splits one, must stay below the persistent program's item waves."""
+
+    if chunks_per_item < rule.min_chunks(mode_varlen):
+        return False
+    pairs = sm_count // 2
+    pair_rounds = -(-total_work // pairs)
+    persistent_makespan = -(-total_work // sm_count)
+    pair_makespan = pair_rounds / 2
+    hand_off = (pair_rounds % 2) / chunks_per_item
+    return (
+        pair_makespan * (1.0 + rule.render_penalty(mode_varlen)) + hand_off
+        < persistent_makespan
+    )
+
+
 def _tail_grid_size(*, sm_count: int) -> int:
     """Grid of a ``_tail`` program: one 2-CTA cluster per SM pair."""
 
     return 2 * (sm_count // 2)
 
 
-def tail_selected(*, total_work: int, chunks_per_item: int, sm_count: int) -> bool:
+def tail_selected(
+    *,
+    total_work: int,
+    chunks_per_item: int,
+    sm_count: int,
+    mode_varlen: bool = False,
+    full_grid_rule: Optional[_TailFullGridRule] = None,
+) -> bool:
     """Whether a two-kernel exact-scan call of ``total_work`` (sequence, head)
     items with ``chunks_per_item`` host-known chunks per item
     (:func:`host_chunks_per_item`) runs the ``_tail`` pair program on a device
     of ``sm_count`` SMs: a tail wave exists (the balanced persistent grid is
     below one CTA per SM), the chunk floor is met and ``ceil(items / pairs) /
     2`` (half items count) is below the persistent program's ``ceil(items /
-    grid)``."""
+    grid)``.  A call whose balanced grid is the full device takes the pair
+    program only under ``full_grid_rule`` (:class:`_TailFullGridRule`, the
+    sm_107a admission; ``None`` -- the Blackwell default -- never)."""
 
     pairs = sm_count // 2
     if pairs < 1 or total_work <= sm_count:
         return False
-    if chunks_per_item < _TAIL_MIN_CHUNKS:
-        return False
     balanced_grid = _persistent_grid_size(total_work=total_work, sm_count=sm_count)
     if balanced_grid >= sm_count:
+        return full_grid_rule is not None and _full_grid_tail_selected(
+            rule=full_grid_rule,
+            total_work=total_work,
+            chunks_per_item=chunks_per_item,
+            sm_count=sm_count,
+            mode_varlen=mode_varlen,
+        )
+    if chunks_per_item < _TAIL_MIN_CHUNKS:
         return False
     persistent_makespan = -(-total_work // balanced_grid)
     pair_makespan = -(-total_work // pairs) / 2
@@ -2373,6 +2485,8 @@ class CakeSSDCombined:
                     seqlen=batch * seqlen if self.has_varlen else seqlen,
                 ),
                 sm_count=sm_count,
+                mode_varlen=self.has_varlen,
+                full_grid_rule=tail_full_grid_rule(capability),
             )
         )
         variant = (

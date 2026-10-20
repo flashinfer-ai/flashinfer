@@ -1524,6 +1524,10 @@ def create_epilogue_task(
             with domain_loop(0, num_k_tiles, 1):
                 pass
             _epilogue_tail(tmem, gmem)
+        if cfg.uses_non_swap_tma_store:
+            gmem.drain_non_swap_tma_stores()
+        if cfg.is_swap_ab and cfg.use_tma_store:
+            gmem.drain_swap_ab_tma_stores()
 
     def _epilogue_tail(tmem, gmem) -> None:
         tmem.try_wait()
@@ -1728,6 +1732,9 @@ def create_epilogue_task_dsfp8(
                         t2r_output_call_idx=acc_tok[2],
                         subtile_idx=0,
                     )
+
+        if cfg.is_swap_ab and cfg.use_tma_store:
+            gmem.drain_swap_ab_tma_stores()
 
     captured_schedule = _call_schedule_with_optional_work_queue(
         epi_schedule,

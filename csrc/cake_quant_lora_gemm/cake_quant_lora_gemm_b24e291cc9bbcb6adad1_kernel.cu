@@ -126,6 +126,8 @@ kernel_cake_quant_lora_gemm_b24e291cc9bbcb6adad1(unsigned int M, unsigned int N,
     unsigned int n_pairs = (n_tiles + 1) / 2;
     unsigned int total_tiles = p_count + tail * n_pairs;
     unsigned int tiles_per_group = group_m * n_tiles;
+    unsigned int per_strip = pairs * 5;
+    unsigned int strip_w = 5;
     unsigned int num_k_stages = (K + 127) / 128;
     asm volatile("griddepcontrol.wait;" ::: "memory");
     float alpha_v = a_scale[0] * b_scale[0];
@@ -157,15 +159,16 @@ kernel_cake_quant_lora_gemm_b24e291cc9bbcb6adad1(unsigned int M, unsigned int N,
                         unsigned int n0_lead_p = u_p * 2 * 192;
                         unsigned int n0_peer_p = n0_lead_p + 192;
                         if (p_count > t_p) {
-                            unsigned int g_p = t_p / tiles_per_group;
-                            unsigned int l_p = t_p - g_p * tiles_per_group;
-                            unsigned int _min_0 = ((group_m) < (pairs - g_p * group_m) ? (group_m) : (pairs - g_p * group_m));
-                            unsigned int gsz_p = _min_0;
-                            unsigned int mp_p = g_p * group_m + l_p % gsz_p;
-                            unsigned int nt_p = l_p / gsz_p;
-                            m0_lead_p = mp_p * 256;
-                            n0_lead_p = nt_p * 192;
-                            n0_peer_p = nt_p * 192;
+                            unsigned int s_t = t_p / per_strip;
+                            unsigned int l_t = t_p - s_t * per_strip;
+                            unsigned int _min_0 = ((n_tiles - s_t * 5) < (strip_w) ? (n_tiles - s_t * 5) : (strip_w));
+                            unsigned int w_t = _min_0;
+                            unsigned int mpf_t = l_t / w_t;
+                            unsigned int nt_t = s_t * 5 + (l_t - mpf_t * w_t);
+                            unsigned int mp_t = (((s_t & 1) != 0) ? pairs - 1 - mpf_t : mpf_t);
+                            m0_lead_p = mp_t * 256;
+                            n0_lead_p = nt_t * 192;
+                            n0_peer_p = nt_t * 192;
                         }
                         for (unsigned int k_p = 0; k_p < num_k_stages; k_p++) {
                             unsigned int stage_p = rs_p;
@@ -177,23 +180,23 @@ kernel_cake_quant_lora_gemm_b24e291cc9bbcb6adad1(unsigned int M, unsigned int N,
                                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3}], [%4], %5;"
                                         :: "r"(smem_a_addr + stage_p * 40960), "l"((uint64_t)((&A))), "r"(k_p * 128), "r"(m0_lead_p),
-                                           "r"(full_addr + (stage_p) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                           "r"(full_addr + (stage_p) * 8), "l"(0x12F0000000000000ULL) : "memory");
                                     asm volatile(
                                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
                                         " [%0], [%1, {%2, %3}], [%4], %5, %6;"
                                         :: "r"(smem_b_addr + stage_p * 40960), "l"((&W)), "r"(k_p * 128), "r"(n0_lead_p),
-                                           "r"(full_addr + (stage_p) * 8), "h"((uint16_t)(3)), "l"(0x12F0000000000000ULL) : "memory");
+                                           "r"(full_addr + (stage_p) * 8), "h"((uint16_t)(3)), "l"(0x14F0000000000000ULL) : "memory");
                                 } else {
                                     asm volatile(
                                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
                                         " [%0], [%1, {%2, %3}], [%4], %5, %6;"
                                         :: "r"(smem_a_addr + stage_p * 40960), "l"((&A)), "r"(k_p * 128), "r"(m0_lead_p),
-                                           "r"(full_addr + (stage_p) * 8), "h"((uint16_t)(3)), "l"(0x14F0000000000000ULL) : "memory");
+                                           "r"(full_addr + (stage_p) * 8), "h"((uint16_t)(3)), "l"(0x12F0000000000000ULL) : "memory");
                                     asm volatile(
                                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3}], [%4], %5;"
                                         :: "r"(smem_b_addr + stage_p * 40960), "l"((uint64_t)((&W))), "r"(k_p * 128), "r"(n0_lead_p),
-                                           "r"(full_addr + (stage_p) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                                           "r"(full_addr + (stage_p) * 8), "l"(0x14F0000000000000ULL) : "memory");
                                 }
                             }
                             if (rank_cta == 1) {
@@ -202,13 +205,13 @@ kernel_cake_quant_lora_gemm_b24e291cc9bbcb6adad1(unsigned int M, unsigned int N,
                                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3}], [%4], %5;"
                                         :: "r"(smem_a_addr + stage_p * 40960), "l"((uint64_t)((&A))), "r"(k_p * 128), "r"(m0_lead_p + 128),
-                                           "r"(full_addr + (stage_p) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                           "r"(full_addr + (stage_p) * 8), "l"(0x12F0000000000000ULL) : "memory");
                                 } else {
                                     asm volatile(
                                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3}], [%4], %5;"
                                         :: "r"(smem_b_addr + stage_p * 40960), "l"((uint64_t)((&W))), "r"(k_p * 128), "r"(n0_peer_p),
-                                           "r"(full_addr + (stage_p) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                                           "r"(full_addr + (stage_p) * 8), "l"(0x14F0000000000000ULL) : "memory");
                                 }
                             }
                             mbarrier_arrive_expect_tx(full_addr + (stage_p) * 8, 40960);
@@ -226,23 +229,23 @@ kernel_cake_quant_lora_gemm_b24e291cc9bbcb6adad1(unsigned int M, unsigned int N,
                                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3}], [%4], %5;"
                                         :: "r"(smem_d_addr + stage_pl * 40960), "l"((uint64_t)((&D))), "r"(s_p * 64), "r"(m0_lead_p),
-                                           "r"(full_addr + (stage_pl) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                           "r"(full_addr + (stage_pl) * 8), "l"(0x12F0000000000000ULL) : "memory");
                                     asm volatile(
                                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
                                         " [%0], [%1, {%2, %3}], [%4], %5, %6;"
                                         :: "r"(smem_bl_addr + stage_pl * 40960), "l"((&BL)), "r"(s_p * 64), "r"(n0_lead_p),
-                                           "r"(full_addr + (stage_pl) * 8), "h"((uint16_t)(3)), "l"(0x12F0000000000000ULL) : "memory");
+                                           "r"(full_addr + (stage_pl) * 8), "h"((uint16_t)(3)), "l"(0x14F0000000000000ULL) : "memory");
                                 } else {
                                     asm volatile(
                                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint"
                                         " [%0], [%1, {%2, %3}], [%4], %5, %6;"
                                         :: "r"(smem_d_addr + stage_pl * 40960), "l"((&D)), "r"(s_p * 64), "r"(m0_lead_p),
-                                           "r"(full_addr + (stage_pl) * 8), "h"((uint16_t)(3)), "l"(0x14F0000000000000ULL) : "memory");
+                                           "r"(full_addr + (stage_pl) * 8), "h"((uint16_t)(3)), "l"(0x12F0000000000000ULL) : "memory");
                                     asm volatile(
                                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3}], [%4], %5;"
                                         :: "r"(smem_bl_addr + stage_pl * 40960), "l"((uint64_t)((&BL))), "r"(s_p * 64), "r"(n0_lead_p),
-                                           "r"(full_addr + (stage_pl) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                                           "r"(full_addr + (stage_pl) * 8), "l"(0x14F0000000000000ULL) : "memory");
                                 }
                             }
                             if (rank_cta == 1) {
@@ -251,13 +254,13 @@ kernel_cake_quant_lora_gemm_b24e291cc9bbcb6adad1(unsigned int M, unsigned int N,
                                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3}], [%4], %5;"
                                         :: "r"(smem_d_addr + stage_pl * 40960), "l"((uint64_t)((&D))), "r"(s_p * 64), "r"(m0_lead_p + 128),
-                                           "r"(full_addr + (stage_pl) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                           "r"(full_addr + (stage_pl) * 8), "l"(0x12F0000000000000ULL) : "memory");
                                 } else {
                                     asm volatile(
                                         "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3}], [%4], %5;"
                                         :: "r"(smem_bl_addr + stage_pl * 40960), "l"((uint64_t)((&BL))), "r"(s_p * 64), "r"(n0_peer_p),
-                                           "r"(full_addr + (stage_pl) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                                           "r"(full_addr + (stage_pl) * 8), "l"(0x14F0000000000000ULL) : "memory");
                                 }
                             }
                             mbarrier_arrive_expect_tx(full_addr + (stage_pl) * 8, 40960);
@@ -299,14 +302,15 @@ kernel_cake_quant_lora_gemm_b24e291cc9bbcb6adad1(unsigned int M, unsigned int N,
                 unsigned int zero_c = 0;
                 unsigned int row_lim_c = ((n_sel_c < n_tiles) ? M : zero_c);
                 if (p_count > t_c) {
-                    unsigned int g_c = t_c / tiles_per_group;
-                    unsigned int l_c = t_c - g_c * tiles_per_group;
-                    unsigned int _min_1 = ((group_m) < (pairs - g_c * group_m) ? (group_m) : (pairs - g_c * group_m));
-                    unsigned int gsz_c = _min_1;
-                    unsigned int mp_c = g_c * group_m + l_c % gsz_c;
-                    unsigned int nt_c = l_c / gsz_c;
-                    m0_c = (mp_c * 2 + rank_cta) * 128;
-                    n0_c = nt_c * 192;
+                    unsigned int s_t_1 = t_c / per_strip;
+                    unsigned int l_t_1 = t_c - s_t_1 * per_strip;
+                    unsigned int _min_1 = ((n_tiles - s_t_1 * 5) < (strip_w) ? (n_tiles - s_t_1 * 5) : (strip_w));
+                    unsigned int w_t_1 = _min_1;
+                    unsigned int mpf_t_1 = l_t_1 / w_t_1;
+                    unsigned int nt_t_1 = s_t_1 * 5 + (l_t_1 - mpf_t_1 * w_t_1);
+                    unsigned int mp_t_1 = (((s_t_1 & 1) != 0) ? pairs - 1 - mpf_t_1 : mpf_t_1);
+                    m0_c = (mp_t_1 * 2 + rank_cta) * 128;
+                    n0_c = nt_t_1 * 192;
                     row_lim_c = M;
                 }
                 acc_fin[0] = 0.0f;

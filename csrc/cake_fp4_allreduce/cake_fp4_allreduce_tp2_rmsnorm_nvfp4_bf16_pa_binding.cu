@@ -39,7 +39,7 @@ constexpr int64_t kHidden = 6144;
 constexpr int64_t kTableEntries = 4;
 constexpr int64_t kCtrlWords = 4;
 constexpr unsigned kThreads = 288;
-constexpr unsigned kDynamicSmemBytes = 211456;
+constexpr unsigned kDynamicSmemBytes = 195072;
 
 int64_t byte_size(const TensorView& t) { return t.numel() * get_element_size(t); }
 

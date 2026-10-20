@@ -42,14 +42,7 @@ namespace flashinfer {
 
 namespace btg = batchedGemm::trtllm::gen;
 
-// Routing stage of the fused-MoE launchers: the trtllm-gen router, or the exported Cake StepFun
-// routing kernels when the module is built with -DCAKE_STEPFUN_FULL (the Cake router serves
-// RoutingMethodType::Renormalize from logits and rejects every other configuration).
-#ifdef CAKE_STEPFUN_FULL
-using RoutingRunner = tensorrt_llm::kernels::trtllmgen_moe::cake_stepfun::RoutingRunner;
-#else
 using RoutingRunner = tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner;
-#endif
 using tensorrt_llm::kernels::trtllmgen_moe::MoE::ActivationType;
 using tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs;
 using tensorrt_llm::kernels::trtllmgen_moe::Routing::RoutingMethodType;
@@ -1056,17 +1049,20 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
          "ActivationType::SwigluStep with MxFp8.";
 }
 
-std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_tile_nums,
+std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& ascending_supported_tile_sizes,
                                        int64_t const num_tokens, int64_t const top_k,
-                                       int64_t const num_local_experts) {
-  TVM_FFI_ICHECK(!supported_tile_nums.empty()) << "supported_tile_nums must not be empty.";
+                                       int64_t const num_local_experts,
+                                       int const num_smaller_tile_candidates = 2) {
+  TVM_FFI_ICHECK(!ascending_supported_tile_sizes.empty())
+      << "ascending_supported_tile_sizes must not be empty.";
   TVM_FFI_ICHECK(num_tokens >= 0) << "num_tokens must be non-negative.";
   TVM_FFI_ICHECK(top_k > 0) << "top_k must be positive.";
   TVM_FFI_ICHECK(num_local_experts > 0) << "num_local_experts must be positive.";
-  TVM_FFI_ICHECK(std::is_sorted(supported_tile_nums.begin(), supported_tile_nums.end()))
-      << "supported_tile_nums must be sorted.";
-  TVM_FFI_ICHECK(supported_tile_nums.front() > 0)
-      << "supported_tile_nums must contain only positive values.";
+  TVM_FFI_ICHECK(
+      std::is_sorted(ascending_supported_tile_sizes.begin(), ascending_supported_tile_sizes.end()))
+      << "ascending_supported_tile_sizes must be sorted.";
+  TVM_FFI_ICHECK(ascending_supported_tile_sizes.front() > 0)
+      << "ascending_supported_tile_sizes must contain only positive values.";
   double const avg_tokens_per_expert =
       static_cast<double>(num_tokens) * static_cast<double>(top_k) / num_local_experts;
   // NOTE: This differs from Python AutoTuner bucketing:
@@ -1075,45 +1071,53 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_til
   // Because they bucket different quantities, cache bucket and runtime tile candidates can
   // diverge; launcher-side tactic resolution handles that mismatch.
   auto it = std::lower_bound(
-      supported_tile_nums.begin(), supported_tile_nums.end(), avg_tokens_per_expert,
+      ascending_supported_tile_sizes.begin(), ascending_supported_tile_sizes.end(),
+      avg_tokens_per_expert,
       [](int32_t tile, double average) { return static_cast<double>(tile) < average; });
-  if (it == supported_tile_nums.end()) {
-    it = std::prev(supported_tile_nums.end());
+  if (it == ascending_supported_tile_sizes.end()) {
+    it = std::prev(ascending_supported_tile_sizes.end());
   }
 
   // Candidate tile set centered on the heuristic tile.
   // This function returns nearby candidates (not a single final tile):
-  //   center, +1, +2, and -1 neighbors when available.
+  //   center, +1, +2, and up to num_smaller_tile_candidates smaller neighbors when available.
   // Final tile choice is made later (autotuner-provided tile if valid, otherwise fallback policy).
   std::set<int32_t> selected_tile_nums;
   selected_tile_nums.insert(*it);
-  if (std::next(it) != supported_tile_nums.end()) {
+  if (std::next(it) != ascending_supported_tile_sizes.end()) {
     selected_tile_nums.insert(*std::next(it));
-    if (std::next(std::next(it)) != supported_tile_nums.end()) {
+    if (std::next(std::next(it)) != ascending_supported_tile_sizes.end()) {
       selected_tile_nums.insert(*std::next(std::next(it)));
     }
   }
-  if (it != supported_tile_nums.begin()) {
-    selected_tile_nums.insert(*std::prev(it));
+  // Walk down the ascending tile ladder (checked sorted above) to add up to
+  // num_smaller_tile_candidates tiles below the covering tile. The tuner receives two so that
+  // adding a tile to the ladder (e.g. 192) does not push the best smaller tile out of its window;
+  // the default-tactic path keeps one.
+  auto down = it;
+  for (int i = 0; i < num_smaller_tile_candidates && down != ascending_supported_tile_sizes.begin();
+       ++i) {
+    down = std::prev(down);
+    selected_tile_nums.insert(*down);
   }
 
   return selected_tile_nums;
 }
 
-int64_t selectDefaultTileN(std::vector<int32_t> const& supported_tile_nums,
+int64_t selectDefaultTileN(std::vector<int32_t> const& ascending_supported_tile_sizes,
                            int64_t const num_tokens, int64_t const top_k,
                            int64_t const num_local_experts) {
-  auto selected = computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
+  auto selected =
+      computeSelectedTileN(ascending_supported_tile_sizes, num_tokens, top_k, num_local_experts, 1);
   TVM_FFI_ICHECK(!selected.empty()) << "No selected tile_N candidates for current MoE input.";
   return *selected.begin();
 }
 
 // Resolve the (tile_N, config) pair passed from Python side, applying fallback logic
 // when tile_N is -1.
-std::pair<int64_t, int64_t> resolveMoeTileAndConfig(Array<int64_t> const& config_index,
-                                                    std::vector<int32_t> const& supported_tile_nums,
-                                                    int64_t const num_tokens, int64_t const top_k,
-                                                    int64_t const num_local_experts) {
+std::pair<int64_t, int64_t> resolveMoeTileAndConfig(
+    Array<int64_t> const& config_index, std::vector<int32_t> const& ascending_supported_tile_sizes,
+    int64_t const num_tokens, int64_t const top_k, int64_t const num_local_experts) {
   // Python side convention: tactic is [tile_N, config]
   TVM_FFI_ICHECK(config_index.size() == 2)
       << "Invalid tactic, expected to be [tile_N, config], but got array of size "
@@ -1124,47 +1128,12 @@ std::pair<int64_t, int64_t> resolveMoeTileAndConfig(Array<int64_t> const& config
   if (tile_N == -1 || config == -1) {
     // Use fallback tactic
     auto const default_tile_N =
-        selectDefaultTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
+        selectDefaultTileN(ascending_supported_tile_sizes, num_tokens, top_k, num_local_experts);
     return {default_tile_N, -1};
   }
 
   return {tile_N, config};
 }
-
-#ifdef CAKE_STEPFUN_FC1
-// The trtllm-gen tile ladder restricted to the tiles whose Cake kernels this module exports for the
-// family in every Cake stage (FC1; FC2 as well on the full path). The tactic windows
-// (computeSelectedTileN) and the default-tactic fallback (selectDefaultTileN) run on this ladder,
-// so neither names a tile without a kernel; a ladder without any exported tile is an error (the
-// Cake StepFun backend has no native fallback). The runner is built exactly as the launcher builds
-// it for the forward, so the answer is the one prepare_moe() would reach.
-std::vector<int32_t> cakeStepFunTileLadder(std::vector<int32_t> const& ladder, btg::Dtype dtypeAct,
-                                           btg::Dtype dtypeWeights, bool useDeepSeekFp8,
-                                           ActivationType activationType, bool useShuffledMatrix,
-                                           batchedGemm::gemm::MatrixLayout weightLayout,
-                                           batchedGemm::gemm::BiasType gemm1BiasType,
-                                           bool usePerTokenScalingGemm1,
-                                           bool usePerTokenScalingGemm2) {
-  std::vector<int32_t> exported;
-  std::string ladderText;
-  for (int32_t tile : ladder) {
-    ladderText += (ladderText.empty() ? "" : ", ") + std::to_string(tile);
-    tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner runner(
-        dtypeAct, dtypeWeights, useDeepSeekFp8, tile, activationType, useShuffledMatrix,
-        weightLayout, gemm1BiasType, usePerTokenScalingGemm1, usePerTokenScalingGemm2, false,
-        false);
-    if (runner.hasPassingConfigs()) exported.push_back(tile);
-  }
-  TVM_FFI_ICHECK(!exported.empty())
-      << "The Cake StepFun module exports no kernel for any tile of the trtllm-gen ladder {"
-      << ladderText << "} for dtype_act=" << static_cast<int>(dtypeAct)
-      << ", dtype_weights=" << static_cast<int>(dtypeWeights)
-      << ", activation_type=" << static_cast<int>(activationType)
-      << ", per_token_scaling=" << usePerTokenScalingGemm1
-      << " (the Cake StepFun backend has no native fallback).";
-  return exported;
-}
-#endif
 
 // Validate the FC1 bias tensor against the selected BiasType. Currently only
 // BiasType::None and BiasType::Mn are exercised from the flashinfer MoE path
@@ -1995,17 +1964,6 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
-#ifdef CAKE_STEPFUN_FC1
-    // Cake-only tile 256: the native ladder stops at 128; the Cake module exports
-    // bf16 / fp8 per-tensor FC1 + FC2 tile-256 units. Appended as a probe rung:
-    // cakeStepFunTileLadder keeps it only where both stages export the unit, and the ladder stays
-    // sorted for computeSelectedTileN.
-    supported_tile_nums.push_back(256);
-    supported_tile_nums = cakeStepFunTileLadder(
-        supported_tile_nums, btg::Dtype::Bfloat16, btg::Dtype::Bfloat16, false,
-        static_cast<ActivationType>(act_type), use_shuffled_weight,
-        static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout), gemm1_bias_type, false, false);
-#endif
     std::set<int32_t> selected_tile_nums =
         computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
 
@@ -3092,7 +3050,7 @@ Array<Tensor> trtllm_moe_run_routing(
   }
 
   auto const num_tokens = hidden_states.size(0);
-  std::vector<int32_t> supported_tile_nums{8, 16, 32, 64, 128, 256};
+  std::vector<int32_t> supported_tile_nums{8, 16, 32, 64, 128, 192, 256};
   auto const [tile_N, config] = resolveMoeTileAndConfig(moe_tactic, supported_tile_nums, num_tokens,
                                                         top_k, local_num_experts);
   (void)config;
@@ -3711,17 +3669,6 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
-#ifdef CAKE_STEPFUN_FC1
-    // Cake-only tile 256: the native ladder stops at 128; the Cake module exports
-    // bf16 / fp8 per-tensor FC1 + FC2 tile-256 units. Appended as a probe rung:
-    // cakeStepFunTileLadder keeps it only where both stages export the unit, and the ladder stays
-    // sorted for computeSelectedTileN.
-    supported_tile_nums.push_back(256);
-    supported_tile_nums = cakeStepFunTileLadder(
-        supported_tile_nums, dtype_act, dtype_weights, false, static_cast<ActivationType>(act_type),
-        use_shuffled_weight, static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout),
-        batchedGemm::gemm::BiasType::None, use_routing_scales_on_input, false);
-#endif
     std::set<int32_t> selected_tile_nums =
         computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
 
@@ -4567,12 +4514,6 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     auto activation_type = validateAndCastActivationType(act_type);
 
     auto supported_tile_nums = getSupportedTileNums(quantization_type);
-#ifdef CAKE_STEPFUN_FC1
-    supported_tile_nums = cakeStepFunTileLadder(
-        supported_tile_nums, dtype_act, dtype_weights,
-        quantization_type == Fp8QuantizationType::DeepSeekFp8, activation_type, use_shuffled_weight,
-        static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout), gemm1_bias_type, false, false);
-#endif
     std::set<int32_t> selected_tile_nums =
         computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
 
@@ -4858,18 +4799,10 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     std::vector<int32_t> tiles(mBaseSupportedTileNums.begin(), mBaseSupportedTileNums.end());
     if (dtype_act != btg::Dtype::Bfloat16) {
       tiles.push_back(128);
-#ifndef TLLM_RUBIN_FEATURES
-      // Keep tactic enumeration aligned with the public BMM artifact. The
-      // previously separate Rubin BMM pin had no 192-tile FP4 kernels (its only
-      // 192-tile kernels were FP8), and launchers are built eagerly for every
-      // advertised tile, so advertising 192 there failed runner construction
-      // outright. The consolidated multi-arch BMM pin does ship sm107a 192-tile
-      // FP4 kernels, so this guard can be dropped once Rubin is re-verified.
       if ((dtype_weights == btg::Dtype::E2m1 && dtype_act == btg::Dtype::E2m1) ||
           (dtype_weights == btg::Dtype::MxE2m1 && dtype_act == btg::Dtype::MxE4m3)) {
         tiles.push_back(192);
       }
-#endif
       tiles.push_back(256);
     }
     return tiles;
@@ -5279,12 +5212,6 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> tile_sizes = getSupportedTileNums(dtype_act, dtype_weights);
-#ifdef CAKE_STEPFUN_FC1
-    tile_sizes = cakeStepFunTileLadder(
-        tile_sizes, dtype_act, dtype_weights, false, static_cast<ActivationType>(act_type), true,
-        batchedGemm::gemm::MatrixLayout::MajorK, gemm1_bias_type, use_per_token_scaling,
-        use_per_token_scaling && dtype_act == btg::Dtype::E2m1);
-#endif
     std::set<int32_t> selected_tile_nums =
         computeSelectedTileN(tile_sizes, num_tokens, top_k, num_local_experts);
 
@@ -5356,17 +5283,6 @@ Array<Tensor> trtllm_bf16_moe(
   // Calculate supported tile sizes
   std::vector<int32_t> mSupportedTileN(Bf16MoeLauncher::mSupportedTileNums.begin(),
                                        Bf16MoeLauncher::mSupportedTileNums.end());
-#ifdef CAKE_STEPFUN_FC1
-  // Cake-only tile 256: the native ladder stops at 128; the Cake module exports
-  // bf16 / fp8 per-tensor FC1 + FC2 tile-256 units. Appended as a probe rung: cakeStepFunTileLadder
-  // keeps it only where both stages export the unit, and the ladder stays sorted for
-  // computeSelectedTileN.
-  mSupportedTileN.push_back(256);
-  mSupportedTileN = cakeStepFunTileLadder(
-      mSupportedTileN, btg::Dtype::Bfloat16, btg::Dtype::Bfloat16, false, activation,
-      use_shuffled_weight, static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout),
-      gemm1_bias_type_enum, false, false);
-#endif
   // Build launchers for ALL supported tiles (not just the computeSelectedTileN subset)
   // so that autotuner-cached tactics always find their tile_N in the map.
   // Launcher creation is cheap (no GPU allocation until run()), so this is safe.
@@ -5482,17 +5398,6 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
   // Calculate supported tile sizes
   std::vector<int32_t> mSupportedTileN(Fp8PerTensorLauncher::mSupportedTileNums.begin(),
                                        Fp8PerTensorLauncher::mSupportedTileNums.end());
-#ifdef CAKE_STEPFUN_FC1
-  // Cake-only tile 256: the native ladder stops at 128; the Cake module exports
-  // bf16 / fp8 per-tensor FC1 + FC2 tile-256 units. Appended as a probe rung: cakeStepFunTileLadder
-  // keeps it only where both stages export the unit, and the ladder stays sorted for
-  // computeSelectedTileN.
-  mSupportedTileN.push_back(256);
-  mSupportedTileN = cakeStepFunTileLadder(
-      mSupportedTileN, btg::Dtype::E4m3, btg::Dtype::E4m3, false, activation, use_shuffled_weight,
-      static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout),
-      batchedGemm::gemm::BiasType::None, use_routing_scales_on_input, false);
-#endif
   // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
 
   // Create a map of launchers for each tile size
@@ -5613,17 +5518,6 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_routed_moe(
   // Calculate supported tile sizes
   std::vector<int32_t> mSupportedTileN(Fp8PerTensorLauncher::mSupportedTileNums.begin(),
                                        Fp8PerTensorLauncher::mSupportedTileNums.end());
-#ifdef CAKE_STEPFUN_FC1
-  // Cake-only tile 256: the native ladder stops at 128; the Cake module exports
-  // bf16 / fp8 per-tensor FC1 + FC2 tile-256 units. Appended as a probe rung: cakeStepFunTileLadder
-  // keeps it only where both stages export the unit, and the ladder stays sorted for
-  // computeSelectedTileN.
-  mSupportedTileN.push_back(256);
-  mSupportedTileN = cakeStepFunTileLadder(
-      mSupportedTileN, btg::Dtype::E4m3, btg::Dtype::E4m3, false, activation, use_shuffled_weight,
-      static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout),
-      batchedGemm::gemm::BiasType::None, use_routing_scales_on_input, false);
-#endif
   // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
 
   // Create a map of launchers for each tile size
@@ -5835,13 +5729,6 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   int64_t const totalLocalExperts = local_num_experts + nFusedShared;
 
   auto supported_tile_nums = Fp8BlockScaleLauncher::getSupportedTileNums(quantization_type);
-#ifdef CAKE_STEPFUN_FC1
-  supported_tile_nums = cakeStepFunTileLadder(
-      supported_tile_nums, dtype_act, dtype_weights,
-      quantization_type == Fp8QuantizationType::DeepSeekFp8, activation_type, use_shuffled_weight,
-      static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout), gemm1_bias_type_enum, false,
-      false);
-#endif
   // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
 
   // Create a map of launchers for each tile size
@@ -6032,12 +5919,6 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   // Determine supported tile sizes
   std::vector<int32_t> mSupportedTileN =
       FP4BlockScaleLauncher::getSupportedTileNums(mDtypeAct, mDtypeWeights);
-#ifdef CAKE_STEPFUN_FC1
-  mSupportedTileN = cakeStepFunTileLadder(
-      mSupportedTileN, mDtypeAct, mDtypeWeights, false, static_cast<ActivationType>(act_type), true,
-      batchedGemm::gemm::MatrixLayout::MajorK, gemm1_bias_type_enum, per_token_scales.has_value(),
-      per_token_scales.has_value() && mDtypeAct == btg::Dtype::E2m1);
-#endif
   // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
 
   // Create a map of launchers for each tile size

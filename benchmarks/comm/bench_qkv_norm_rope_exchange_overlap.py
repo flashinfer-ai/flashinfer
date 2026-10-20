@@ -34,8 +34,12 @@ table and ends with this rank's head band of the whole sequence):
 - ``b4_nccl``: the same operators, then
   ``parallel_wrapper.ulysses_a2a_in(fuse_qkv=True)`` (NCCL all-to-all).
 
-The Ulysses communicators of B1-B3 use ``backend="auto"`` (the NVLink kernels on
-SM100 / SM103, NCCL elsewhere); the JSON records the backend they resolved.
+The Ulysses communicators of B1-B3 default to ``ULYSSES_BACKEND_DEFAULT_BY_ARCH``
+(``"auto"`` on SM90 / SM100 / SM103: the NVLink kernels on SM100 / SM103, NCCL on
+SM90; ``"nccl"`` on SM107, where the NVLink Ulysses kernels are unverified and
+the export protocol measures B1-B3 on NCCL, so both measurements of an arm use
+the same exchange backend); ``--ulysses-backend`` overrides it and the JSON
+records both the requested and the resolved backend.
 ``--fold-barrier auto|0|1`` selects the fused arm's launch path (the
 architecture default, the separate barrier kernel, or the producer with the
 folded rendezvous); the JSON records the resolved path and its launch count.
@@ -82,11 +86,35 @@ import torch.nn.functional as functional
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from flashinfer.comm import QkvNormRopeExchangeOverlap, UlyssesCommunicator
+from flashinfer.jit import cake_qkv_norm_rope_exchange_overlap as loader
 from flashinfer.norm import rmsnorm
 from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
 from flashinfer.testing import bench_gpu_time_with_cupti
 
 HEAD_DIM = 128
+# B1-B3 communicator backend when ``--ulysses-backend`` is not given: FlashInfer's
+# own resolution where it agrees with the export protocol's measurement, the
+# protocol's pinned backend elsewhere (SM107: NCCL until the NVLink Ulysses path
+# is verified there).
+ULYSSES_BACKEND_DEFAULT_BY_ARCH: dict[str, str] = {
+    "sm_90a": "auto",
+    "sm_100a": "auto",
+    "sm_103a": "auto",
+    "sm_107a": "nccl",
+}
+
+
+def default_ulysses_backend(arch: str | None) -> str:
+    """Default B1-B3 backend of the device architecture (see the module docstring)."""
+
+    if arch not in ULYSSES_BACKEND_DEFAULT_BY_ARCH:
+        raise RuntimeError(
+            f"no delivered fused QKV exchange programs for architecture {arch!r}; "
+            "pass --ulysses-backend explicitly to benchmark the per-operator arms"
+        )
+    return ULYSSES_BACKEND_DEFAULT_BY_ARCH[arch]
+
+
 EPS = 1e-6
 # Calls of an arm per timed iteration (``two_calls``): the fused session launches ``producer_fold0`` / ``producer_fold1``
 # on alternating calls (``barrier_p0`` / ``barrier_p1`` with ``--fold-barrier 0``), and ``bench_gpu_time_with_cupti``
@@ -302,10 +330,13 @@ def build_arms(group, device, rank, world_size, hidden, rows, args):
     info = {
         "fused_backend": session.backend,
         "fused_backend_reason": session.backend_reason,
+        "ulysses_backend_requested": args.ulysses_backend,
         "fused_fold_barrier": fused_info.get("fold_barrier"),
         "fused_fold_barrier_requested": fused_info.get("fold_barrier_requested"),
         "fused_launches_per_call": fused_info.get("launches_per_call"),
         "fused_shape_gates": fused_info.get("shape_gates"),
+        "fused_producer_variant": fused_info.get("producer_variant"),
+        "fused_group_m_scale": fused_info.get("group_m_scale"),
         "fused_prepared_row_plans": fused_info.get("prepared_row_plans"),
         "ulysses_backend": comm_in.backend,
         "b3_schedule": list(schedule),
@@ -410,9 +441,9 @@ def main():
     )
     parser.add_argument(
         "--ulysses-backend",
-        default="auto",
+        default=None,
         choices=("auto", "nvlink", "nccl"),
-        help="B1-B3 communicators",
+        help="B1-B3 communicators (default: ULYSSES_BACKEND_DEFAULT_BY_ARCH of the device)",
     )
     parser.add_argument(
         "--fold-barrier",
@@ -443,6 +474,10 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
+    if args.ulysses_backend is None:
+        args.ulysses_backend = default_ulysses_backend(
+            loader.device_facts(local_rank).arch
+        )
     dist.init_process_group("nccl", device_id=device)
     group = dist.group.WORLD
     rows_out = []
