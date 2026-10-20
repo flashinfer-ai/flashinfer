@@ -1,10 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Fuse post-amax MXFP4 activation quantization without changing normal rounding.
+"""Safe MXFP4 activation quantization and BF16 input staging.
 
-This module does not compute the row reduction. The caller supplies contiguous
-FP32 input and its existing Torch absmax. Compilation is cached by static hidden
-width and device, with symbolic token count and the TVM-FFI current stream.
+The FP32 quantizer consumes a supplied absmax. The BF16 stager reduces each
+finite input row directly before applying the same safe quantization math.
+Compilation uses symbolic token counts and the TVM-FFI current stream.
 """
 
 import functools
@@ -52,6 +52,35 @@ def _div_rn(a: Float32, b: Float32):
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
+
+
+@cute.jit
+def _safe_scale(row_amax: Float32):
+    # Match the existing Torch scalar division and tiny-value rescaling exactly.
+    d = _mul_rn(row_amax, Float32(1.0 / _E4M3_MAX))
+    if d < Float32(_LEGACY_EPS):
+        d = Float32(_LEGACY_EPS)
+    tiny = (row_amax > Float32(0.0)) & (row_amax < Float32(_TINY_AMAX))
+    q = Float32(0.0)
+    if tiny:
+        safe_amax = row_amax
+        if safe_amax < Float32(_MIN_AMAX):
+            safe_amax = Float32(_MIN_AMAX)
+        q = _div_rn(Float32(_E4M3_MAX), safe_amax)
+        if q > Float32(_FP32_MAX):
+            q = Float32(_FP32_MAX)
+        d = _div_rn(Float32(1.0), q)
+    return d, q, tiny
+
+
+@cute.jit
+def _safe_scaled_value(value: Float32, d: Float32, q: Float32, tiny):
+    scaled = Float32(0.0)
+    if tiny:
+        scaled = _mul_rn(value, q)
+    else:
+        scaled = _div_rn(value, d)
+    return scaled
 
 
 class _SafeE4M3Quantize:
@@ -107,25 +136,8 @@ class _SafeE4M3Quantize:
             row_amax = amax[row, 0]
             value = x[row, col]
 
-            # Torch CUDA division by a CPU scalar uses multiplication by its
-            # FP32 reciprocal. div.rn(amax, 448) can differ by one ULP here.
-            d = _mul_rn(row_amax, Float32(1.0 / _E4M3_MAX))
-            if d < Float32(_LEGACY_EPS):
-                d = Float32(_LEGACY_EPS)
-
-            scaled = Float32(0.0)
-            if (row_amax > Float32(0.0)) & (row_amax < Float32(_TINY_AMAX)):
-                safe_amax = row_amax
-                if safe_amax < Float32(_MIN_AMAX):
-                    safe_amax = Float32(_MIN_AMAX)
-                q = _div_rn(Float32(_E4M3_MAX), safe_amax)
-                if q > Float32(_FP32_MAX):
-                    q = Float32(_FP32_MAX)
-                d = _div_rn(Float32(1.0), q)
-                scaled = _mul_rn(value, q)
-            else:
-                # Do not replace this tensor/tensor division with value*rcp(d).
-                scaled = _div_rn(value, d)
+            d, q, tiny = _safe_scale(row_amax)
+            scaled = _safe_scaled_value(value, d, q, tiny)
 
             payload[row, col] = scaled.to(cutlass.Float8E4M3FN)
             if col == Int64(0):
@@ -256,6 +268,132 @@ def quantize_and_stage_from_amax(
     with torch.cuda.device(x.device):
         compiled = _compiled_stager(x.shape[1], topk_ids.shape[1], x.device.index)
         compiled(x, amax, payload, scales, topk_ids, topk_weights, ids_out, weights_out)
+
+
+class _BF16SafeStager:
+    """One CTA per live row, with separate CTAs clearing padded routing rows."""
+
+    def __init__(self, hidden: int, top_k: int):
+        self.hidden = hidden
+        self.top_k = top_k
+        self.threads = 256
+        self.slots = (hidden + self.threads - 1) // self.threads
+
+    @cute.jit
+    def __call__(
+        self, x, payload, scales, topk_ids, topk_weights, ids_out, weights_out, stream
+    ):
+        tokens = Int64(cute.size(x, mode=[0]))
+        tail = (Int64(cute.size(ids_out, mode=[0])) - tokens) * self.top_k
+        self.kernel(
+            x, payload, scales, topk_ids, topk_weights, ids_out, weights_out
+        ).launch(
+            grid=(tokens + (tail + self.threads - 1) // self.threads, 1, 1),
+            block=(self.threads, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(self, x, payload, scales, topk_ids, topk_weights, ids_out, weights_out):
+        tid = cute.arch.thread_idx()[0]
+        row = cute.arch.block_idx()[0]
+        tokens = cute.size(x, mode=[0])
+        if row < tokens:
+            values = cute.make_rmem_tensor((self.slots,), Float32)
+            local_max = Float32(0.0)
+            for slot in cutlass.range_constexpr(self.slots):
+                col = tid + slot * self.threads
+                value = Float32(0.0)
+                if col < self.hidden:
+                    value = Float32(x[row, col])
+                values[slot] = value
+                magnitude = Float32(
+                    llvm.inline_asm(
+                        Float32.mlir_type,
+                        [value.ir_value()],
+                        "abs.f32 $0, $1;",
+                        "=f,f",
+                        has_side_effects=False,
+                        is_align_stack=False,
+                        asm_dialect=llvm.AsmDialect.AD_ATT,
+                    )
+                )
+                if magnitude > local_max:
+                    local_max = magnitude
+            for index in cutlass.range_constexpr(5):
+                peer = cute.arch.shuffle_sync_bfly(local_max, offset=1 << index)
+                if peer > local_max:
+                    local_max = peer
+            smem = cutlass.utils.SmemAllocator()
+            partials = smem.allocate_array(Float32, self.threads // 32)
+            lane = tid % 32
+            if lane == 0:
+                partials[tid // 32] = local_max
+            cute.arch.sync_threads()
+            row_amax = Float32(0.0)
+            if lane < self.threads // 32:
+                row_amax = partials[lane]
+            for index in cutlass.range_constexpr(5):
+                peer = cute.arch.shuffle_sync_bfly(row_amax, offset=1 << index)
+                if peer > row_amax:
+                    row_amax = peer
+            d, q, tiny = _safe_scale(row_amax)
+            for slot in cutlass.range_constexpr(self.slots):
+                col = tid + slot * self.threads
+                if col < self.hidden:
+                    scaled = _safe_scaled_value(values[slot], d, q, tiny)
+                    payload[row, col] = scaled.to(cutlass.Float8E4M3FN)
+            if tid < 4:
+                scales[row, tid] = d
+            for slot in cutlass.range_constexpr(
+                (self.top_k + self.threads - 1) // self.threads
+            ):
+                col = tid + slot * self.threads
+                if col < self.top_k:
+                    ids_out[row, col] = topk_ids[row, col]
+                    weights_out[row, col] = topk_weights[row, col]
+        else:
+            index = Int64(row - tokens) * self.threads + tid
+            tail = Int64(cute.size(ids_out, mode=[0]) - tokens) * self.top_k
+            if index < tail:
+                ids_out[tokens + index // self.top_k, index % self.top_k] = Int64(-1)
+
+
+@functools.cache
+def _compiled_bf16_stager(hidden: int, top_k: int, device_index: int):
+    del device_index
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "BF16 safe staging requires eager warmup before CUDA Graph capture"
+        )
+    tokens, capacity = cute.sym_int(), cute.sym_int()
+
+    def tensor(dtype, shape, alignment):
+        return cute.runtime.make_fake_compact_tensor(
+            dtype, shape, stride_order=(1, 0), assumed_align=alignment
+        )
+
+    return cute.compile(
+        _BF16SafeStager(hidden, top_k),
+        tensor(cutlass.BFloat16, (tokens, hidden), 2),
+        tensor(cutlass.Float8E4M3FN, (capacity, hidden), 1),
+        tensor(Float32, (capacity, 4), 4),
+        tensor(Int64, (tokens, top_k), 8),
+        tensor(Float32, (tokens, top_k), 4),
+        tensor(Int64, (capacity, top_k), 8),
+        tensor(Float32, (capacity, top_k), 4),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
+def quantize_and_stage_bf16(
+    x, payload, scales, topk_ids, topk_weights, ids_out, weights_out
+):
+    """Read finite BF16 rows, reduce amax and stage into validated buffers."""
+    with torch.cuda.device(x.device):
+        compiled = _compiled_bf16_stager(x.shape[1], topk_ids.shape[1], x.device.index)
+        compiled(x, payload, scales, topk_ids, topk_weights, ids_out, weights_out)
 
 
 __all__ = ["quantize_from_amax"]

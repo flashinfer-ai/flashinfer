@@ -175,6 +175,9 @@ def stage_mega_moe_inputs(
         and hidden_states.is_cuda
         and hidden_states.dtype == torch.bfloat16
         and hidden_states.shape[1] > 0
+        # The row kernel uses 32-bit live-row offsets; retain the fallback
+        # when any live tensor would exceed that indexing range.
+        and num_tokens * max(hidden_states.shape[1], topk_ids.shape[1], 4) <= 2**31 - 1
         and topk_ids.shape[0] == num_tokens
         and topk_ids.shape[1] > 0
         and topk_ids.dtype == torch.int64
@@ -192,13 +195,10 @@ def stage_mega_moe_inputs(
             )
         )
     ):
-        from .safe_quantize import quantize_and_stage_from_amax
+        from .safe_quantize import quantize_and_stage_bf16
 
-        fp32 = hidden_states.to(torch.float32)
-        absmax = fp32.abs().amax(dim=1, keepdim=True)
-        quantize_and_stage_from_amax(
-            fp32,
-            absmax,
+        quantize_and_stage_bf16(
+            hidden_states,
             x_fp8,
             x_sf,
             topk_ids,

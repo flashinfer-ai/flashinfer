@@ -57,6 +57,9 @@ def test_safe_staging_reuses_workspace_across_graphs(hidden, topk):
     x[0].zero_()
     x[1].mul_(1e-32)
     x[2, 0] = -128
+    # Reduction must retain finite BF16 extremes, including subnormals.
+    x[3].fill_(2.0**-133)
+    x[4].fill_(-torch.finfo(torch.bfloat16).max)
     ids = torch.randint(-1, 64, (33, topk), device="cuda")
     weights = torch.randn((33, topk), device="cuda")
     outputs, guards = _workspace(65, hidden, topk)
@@ -76,6 +79,7 @@ def test_safe_staging_reuses_workspace_across_graphs(hidden, topk):
     graphs = {}
     for n in (33, 1):
         stage(n)
+        assert safe._compiled_bf16_stager.cache_info().currsize > 0
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             stage(n)
@@ -119,7 +123,7 @@ def test_safe_staging_preserves_strided_workspace_fallback(monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail("Unsupported layouts must retain the existing staging path")
 
-    monkeypatch.setattr(safe, "quantize_and_stage_from_amax", forbidden)
+    monkeypatch.setattr(safe, "quantize_and_stage_bf16", forbidden)
     staging.stage_mega_moe_inputs(
         x, weights, ids, *outputs, quantize_input=True, safe_quantization=True
     )
