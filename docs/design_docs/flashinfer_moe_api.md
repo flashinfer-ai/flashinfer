@@ -849,7 +849,8 @@ and `NVFP4×NVFP4` (also with `per_token_scale`). Every stage of the forward --
 routing (`Renormalize`), FC1 with the StepFun epilogue, the NVFP4 per-token
 requantization, FC2 and finalize -- is an exported Cake kernel of the cake-build/1
 package `flashinfer.experimental.cake_stepfun_moe` (`build.json` + the shared
-`cake_build.py` loader + one TVM-FFI binding per kernel); the stage sequence,
+`cake_build.py` loader + a TVM-FFI binding per kernel, shared where only its
+compile definitions differ); the stage sequence,
 the launch grids, the buffer set and the tile choice are the package's Python
 `cake_backend.py`, and `flashinfer.fused_moe` keeps a thin facade
 (`CakeStepFunConfig`, `CakeStepFunRunner` and its four family runners). It is not
