@@ -2343,6 +2343,20 @@ class FmhaDecodeConfig:
         return self._grouped_keeps_profile_key in profiles
 
     @property
+    def _uses_paged_16bit_keeps_q128_recipe(self) -> bool:
+        """Whether a paged Keeps Q128 config uses an FP16/BF16 recipe.
+
+        These recipes run the contiguous FP16/BF16 resources with the paged
+        FP8 Q128 K/V loads.
+        """
+        return (
+            self.use_paged_kv
+            and self.use_keeps_mma_ab
+            and self.tile_size_q == 128
+            and self._grouped_keeps_profile_key in _CONTIGUOUS_GROUPED_KEEPS_PROFILES
+        )
+
+    @property
     def _kv256_dtypes_qualified(self) -> bool:
         """Whether the Q64/KV256 profile is qualified for this dtype combination."""
         if self.use_sage_attention:
@@ -2352,6 +2366,9 @@ class FmhaDecodeConfig:
     @property
     def supports_auto_grouped_keeps(self) -> bool:
         """Whether grouped Keeps is also qualified for automatic selection."""
+        if self._uses_paged_16bit_keeps_q128_recipe:
+            # Only a configuration that pins the tile runs it.
+            return False
         if (
             self.use_paged_kv
             and self.tile_size_kv == 128
@@ -3073,6 +3090,19 @@ class FmhaDecodeConfig:
                         self.use_split_kv
                         and self.splits_kv > 1
                         and self.max_splits_kv >= self.splits_kv
+                    )
+                )
+            )
+
+        if self._uses_paged_16bit_keeps_q128_recipe:
+            return (
+                direct
+                and self.mask_type in (DENSE, CAUSAL)
+                and not any(
+                    (
+                        self.use_persistent_scheduler,
+                        self.use_sliding_window_causal,
+                        self.use_attention_sinks,
                     )
                 )
             )
