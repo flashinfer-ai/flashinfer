@@ -24,7 +24,7 @@ from flashinfer.fused_moe import (
     trtllm_fp8_block_scale_routed_moe,
     trtllm_fused_moe_workspace_size,
 )
-from flashinfer.tllm_enums import SfLayout
+from flashinfer.tllm_enums import RoutingInputMode, RoutingMethodType, SfLayout
 from flashinfer.utils import get_compute_capability
 
 QUANT_MODES = [
@@ -292,6 +292,47 @@ def test_workspace_size_accepts_real_weights():
         assert trtllm_fused_moe_workspace_size(
             *args, quant_mode=quant_mode, **weights
         ) == trtllm_fused_moe_workspace_size(*args, quant_mode=quant_mode)
+
+
+def _native_fp8_per_tensor_routed_query(weights_dtype: torch.dtype) -> int:
+    """Size query through the exported routed FP8 entry point with Llama4 unpacked routing."""
+    from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
+
+    fp8, num_tokens = torch.float8_e4m3fn, 64
+
+    def empty(*shape, dtype=fp8):
+        return torch.empty(*shape, dtype=dtype, device="cuda")
+
+    scale = torch.ones(NUM_EXPERTS, device="cuda")
+    result = get_trtllm_moe_sm100_module().moe_op.trtllm_fp8_per_tensor_scale_routed_moe(
+        int(RoutingInputMode.UnpackedPrecomputed),
+        torch.zeros(num_tokens, 1, dtype=torch.int32, device="cuda"),  # expert ids
+        torch.ones(num_tokens, 1, dtype=weights_dtype, device="cuda"),  # weights
+        None,  # routing_bias
+        empty(num_tokens, HIDDEN),
+        empty(NUM_EXPERTS, 2 * INTER, HIDDEN),
+        scale, scale,
+        empty(NUM_EXPERTS, HIDDEN, INTER),
+        scale,
+        empty(num_tokens, HIDDEN, dtype=torch.bfloat16),  # output
+        NUM_EXPERTS, 1, None, None, INTER, 0, NUM_EXPERTS, None,
+        True,  # use_routing_scales_on_input
+        int(RoutingMethodType.Llama4),
+        True, False, [-1, -1],  # do_finalize, enable_pdl, config_index
+        ActivationType.Swiglu.value, True, None, [], [], False, None,
+        None, True,  # workspace_buffer, query_workspace_size
+    )  # fmt: skip
+    return int(torch.from_dlpack(result[0]).item())
+
+
+def test_native_size_query_skips_device_work():
+    """Llama4 FP32 routing weights are cast to BF16 during launch; a size query must
+    count the cast's destination without launching the cast into a null pointer."""
+    fp32_bytes = _native_fp8_per_tensor_routed_query(torch.float32)
+    torch.cuda.synchronize()  # an illegal address from the cast would surface here
+    bf16_bytes = _native_fp8_per_tensor_routed_query(torch.bfloat16)
+    # FP32 weights add the BF16 routing-scale tensor that the cast would fill.
+    assert fp32_bytes > bf16_bytes > 0, (fp32_bytes, bf16_bytes)
 
 
 def test_workspace_size_rejects_invalid_arguments():

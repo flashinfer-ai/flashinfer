@@ -1204,7 +1204,8 @@ class FusedMoeLauncher {
    * non-owning views into a caller-owned workspace_buffer, so the caller must keep that buffer
    * alive and stream-ordered across the launch; a tensor that no longer fits is allocated per
    * call instead. Measure and carve walk the same allocation code, which is what keeps
-   * trtllm_fused_moe_workspace_size() in sync with the launch.
+   * trtllm_fused_moe_workspace_size() in sync with the launch. While measuring(), the prepare_*
+   * code must only allocate: any device work on a measured tensor would dereference null.
    */
   class TensorAllocator {
    public:
@@ -1216,6 +1217,7 @@ class FusedMoeLauncher {
     void begin_carve(void* base, int64_t capacity) { reset(Mode::kCarve, base, capacity); }
     void end() { reset(Mode::kAlloc, nullptr, 0); }
     int64_t used() const { return used_; }
+    bool measuring() const { return mode_ == Mode::kMeasure; }
 
     Tensor alloc(tvm::ffi::Shape shape, DLDataType dtype, DLDevice device) {
       if (mode_ == Mode::kAlloc) {
@@ -3664,8 +3666,11 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
         auto const& weights = expert_weights.value();
         routing_scales =
             _alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
-        cast_fp32_to_bf16(routing_scales.data_ptr(), weights.data_ptr(), weights.numel(),
-                          get_stream(hidden_states.device()));
+        // A size query only counts routing_scales; it has no storage to cast into.
+        if (!scratch_.measuring()) {
+          cast_fp32_to_bf16(routing_scales.data_ptr(), weights.data_ptr(), weights.numel(),
+                            get_stream(hidden_states.device()));
+        }
         workspace.token_scales = routing_scales.data_ptr();
       } else {
         workspace.token_scales = workspace.expert_weights;
