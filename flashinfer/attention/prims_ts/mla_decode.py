@@ -1459,11 +1459,8 @@ def _launch_mla_decode(
         runtime.sparse_inputs,
         runtime.bmm1_scale,
         runtime.bmm2_scale,
-        **(
-            {"output_quant_args": runtime.output_quant_args}
-            if runtime.output_quant_args is not None
-            else {}
-        ),
+        # The compiled ABI retains this argument even when quantization is disabled.
+        runtime.output_quant_args,
     )
     return runtime.out
 
