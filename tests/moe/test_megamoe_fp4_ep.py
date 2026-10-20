@@ -4,6 +4,7 @@ import pytest
 
 from flashinfer.jit.megamoe import get_megamoe_sm90_nvfp4_uri
 from flashinfer.megamoe import select_fused_plan
+from flashinfer.megamoe.heuristics import SMEM_CAPACITY, _fused_smem_bytes
 
 
 @pytest.mark.parametrize("num_sms", [78, 132])
@@ -101,6 +102,8 @@ def test_counter_policy_limits(num_sms):
         (4096, 1408, 128, 8),  # GLM-4.5-Air
         (2048, 768, 128, 8),  # Qwen3-30B-A3B
         (4096, 1024, 512, 10),  # Qwen3.5-397B-A17B
+        (4096, 1024, 8192, 8),  # expert table alone overflows the BM64 pipeline
+        (7168, 2048, 2048, 8),
     ],
 )
 def test_untuned_geometry_plans_are_legal(num_sms, hidden, intermediate, experts, topk):
@@ -113,9 +116,7 @@ def test_untuned_geometry_plans_are_legal(num_sms, hidden, intermediate, experts
         assert not plan.rs_swap_ab
         legal = {8: (3, 4), 16: (3,), 24: (3,), 64: (3,)}[plan.block_m]
         assert plan.num_stages in legal, (tokens, plan)
-        if plan.block_m == 8 and plan.num_stages == 4:
-            rows = hidden * (1 if plan.single_active_dispatch_warp else 2)
-            assert -(-experts * 4 // 1024) * 1024 + -(-rows // 1024) * 1024 <= 8400
+        assert _fused_smem_bytes(plan, num_sms, experts, hidden) <= SMEM_CAPACITY
         assert not plan.push_dispatch or (hidden % 1024 == 0 and tokens <= 32), tokens
 
 
