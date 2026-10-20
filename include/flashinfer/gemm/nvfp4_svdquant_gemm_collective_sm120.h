@@ -108,6 +108,10 @@
 namespace cutlass::gemm::collective {
 using namespace cute;
 
+#ifndef SVDQ_SM120_LORA_LDSM
+#define SVDQ_SM120_LORA_LDSM 1
+#endif
+
 namespace svdquant_sm120_detail {
 
 // Extract the AtomLayoutMNK / PermutationMNK a TiledMMA was built with so the LoRA bf16
@@ -132,6 +136,19 @@ struct MaybeLoRaSmemSwizzle {
 template <class Layout>
 struct MaybeLoRaSmemSwizzle<true, Layout> {
   using type = decltype(cute::composition(cute::Swizzle<3, 3, 3>{}, Layout{}));
+};
+
+// K128 stages hold 64-byte bf16 rows: the TMA 64-byte swizzle (bytes
+// Swizzle<2,4,3>, bf16 Swizzle<2,3,3>) makes eight consecutive rows of one
+// 16-byte column land in eight distinct bank quads, so ldmatrix is conflict-free.
+template <bool Enable, class Layout>
+struct MaybeLoRaSmemSwizzle64 {
+  using type = Layout;
+};
+
+template <class Layout>
+struct MaybeLoRaSmemSwizzle64<true, Layout> {
+  using type = decltype(cute::composition(cute::Swizzle<2, 3, 3>{}, Layout{}));
 };
 
 }  // namespace svdquant_sm120_detail
@@ -406,18 +423,29 @@ struct CollectiveMmaLoRaSm120 {
 
   static constexpr bool EnableLoRaSmemSwizzle = Row80ProductionTraits_;
   static constexpr bool UseRow80SideSlot = UseDedicatedLoRaTma && Row80ProductionTraits_;
-  static constexpr bool UseLoRaSmemSwizzle =
+  static constexpr bool UseLoRaSmemSwizzle128 =
       EnableLoRaSmemSwizzle &&
       (LoRaPath_ == Sm120LoRaPath::kByteExactMainloop || UseRow80SideSlot) && LoRaStorageK == 64;
+  // Multi-chunk ranks on K128 stages (rank 64 and up) fold LoRaChunks stage-wide
+  // chunks in mma_lora. Their 64-byte rows are read with ldmatrix through a
+  // 64-byte swizzle; with narrow unswizzled LDS the tail showed 2.5x the shared
+  // bank conflicts and mio_throttle 0.35 -> 0.97 at rank 128. Single-chunk
+  // (rank-32) builds keep their layout and copies.
+  static constexpr bool UseLoRaSmemSwizzle64 =
+      SVDQ_SM120_LORA_LDSM && LoRaPath_ == Sm120LoRaPath::kByteExactMainloop &&
+      LoRaStorageK == 32 && LoRaChunks > 1;
+  static constexpr bool UseLoRaSmemSwizzle = UseLoRaSmemSwizzle128 || UseLoRaSmemSwizzle64;
   // Row80ProductionTraits_ is the production-row80 selector passed by the driver.
   // Keep the bias prefetch tied to that exact tactic instead of the optional
   // build-wide swizzle diagnostic above.
   static constexpr bool UseRow80BiasPrefetch = Row80ProductionTraits_;
-  using SmemLayoutD = typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle<UseLoRaSmemSwizzle,
-                                                                           SmemLayoutDLinear>::type;
+  using SmemLayoutD = typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle64<
+          UseLoRaSmemSwizzle64, typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle<
+                                    UseLoRaSmemSwizzle128, SmemLayoutDLinear>::type>::type;
   using SmemLayoutL1 =
-      typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle<UseLoRaSmemSwizzle,
-                                                           SmemLayoutL1Linear>::type;
+      typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle64<
+          UseLoRaSmemSwizzle64, typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle<
+                                    UseLoRaSmemSwizzle128, SmemLayoutL1Linear>::type>::type;
 
   // Rank-32 payload view of the same overlay: K extent LoRaK, row stride kept at
   // LoRaStorageK so rows still hop over the TMA zero-filled tail columns. Where
@@ -429,11 +457,13 @@ struct CollectiveMmaLoRaSm120 {
       make_shape(shape<1>(TileShape{}), Int<LoRaChunkK>{}, Int<DispatchPolicy::Stages>{}),
       make_stride(Int<LoRaStorageK>{}, Int<1>{}, Int<BStageBf16Elems>{})));
   using SmemLayoutDPayload =
-      typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle<UseLoRaSmemSwizzle,
-                                                           SmemLayoutDPayloadLinear>::type;
+      typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle64<
+          UseLoRaSmemSwizzle64, typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle<
+                                    UseLoRaSmemSwizzle128, SmemLayoutDPayloadLinear>::type>::type;
   using SmemLayoutL1Payload =
-      typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle<UseLoRaSmemSwizzle,
-                                                           SmemLayoutL1PayloadLinear>::type;
+      typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle64<
+          UseLoRaSmemSwizzle64, typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle<
+                                    UseLoRaSmemSwizzle128, SmemLayoutL1PayloadLinear>::type>::type;
 
   static_assert(cosize_v<SmemLayoutD> == cosize_v<SmemLayoutDLinear>,
                 "D swizzle must preserve the byte-exact stage overlay size");
@@ -1642,14 +1672,17 @@ struct CollectiveMmaLoRaSm120 {
     Tensor tCrD = thread_lora.partition_fragment_A(sD(_, _, Int<0>{}));    // (MMA,MMA_M,MMA_K)
     Tensor tCrL1 = thread_lora.partition_fragment_B(sL1(_, _, Int<0>{}));  // (MMA,MMA_N,MMA_K)
 
-    auto smem_tiled_copy_D = make_tiled_copy_A(
-        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<32>, cutlass::bfloat16_t>{}, lora_mma);
+    using LoRaSmemCopyOp =
+        cute::conditional_t<UseLoRaSmemSwizzle64, SM75_U32x4_LDSM_N,
+                            AutoVectorizingCopyWithAssumedAlignment<32>>;
+    auto smem_tiled_copy_D =
+        make_tiled_copy_A(Copy_Atom<LoRaSmemCopyOp, cutlass::bfloat16_t>{}, lora_mma);
     auto smem_thr_copy_D = smem_tiled_copy_D.get_thread_slice(thread_idx);
     Tensor tCsD = smem_thr_copy_D.partition_S(sD);
     Tensor tCrD_copy_view = smem_thr_copy_D.retile_D(tCrD);
 
-    auto smem_tiled_copy_L1 = make_tiled_copy_B(
-        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<32>, cutlass::bfloat16_t>{}, lora_mma);
+    auto smem_tiled_copy_L1 =
+        make_tiled_copy_B(Copy_Atom<LoRaSmemCopyOp, cutlass::bfloat16_t>{}, lora_mma);
     auto smem_thr_copy_L1 = smem_tiled_copy_L1.get_thread_slice(thread_idx);
     Tensor tCsL1 = smem_thr_copy_L1.partition_S(sL1);
     Tensor tCrL1_copy_view = smem_thr_copy_L1.retile_D(tCrL1);
