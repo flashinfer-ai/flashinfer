@@ -49,8 +49,8 @@ repos:
     rev: v5.0.0
     hooks:
       - id: check-added-large-files
-        # Required generated CuTe sources and Frost catalogs; retain other checks.
-        exclude: ^flashinfer/(?:experimental/cake_mxfp8_megamoe_ep16/kernels/fused_(?:cta0|all_ctas)\.py|fused_moe/backends/cudnn_frost/artifacts/[^/]+/cudnn_frost_selected_kernels\.json)$
+        # Required Frost catalogs; retain other checks.
+        exclude: ^flashinfer/fused_moe/backends/cudnn_frost/artifacts/[^/]+/cudnn_frost_selected_kernels\.json$
       - id: check-case-conflict
       - id: check-merge-conflict
       - id: check-symlinks
