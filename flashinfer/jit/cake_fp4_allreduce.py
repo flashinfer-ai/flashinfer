@@ -322,8 +322,9 @@ def program_for(
     of :func:`select_bv` is kept, and when they carry a residual-prefetch form
     the one of :func:`select_prefetch`.  The per-target forms -- the one-shot
     kernel's row-scale poll and re-arm, the two-shot re-arm, the fused norm's
-    poll and quantizing pass 2 -- follow from the registry's rows (a target
-    builds exactly one form of each), so this function never restates them.
+    poll, quantizing pass 2 and sum-of-squares order -- follow from the
+    registry's rows (a target builds exactly one form of each), so this
+    function never restates them.
     """
 
     candidates = programs(
