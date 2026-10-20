@@ -160,6 +160,8 @@ def _source(
         try:
             with os.fdopen(fd, "w") as stream:
                 stream.write(source)
+            # mkstemp creates 0600; a shared JIT cache must be readable by other users.
+            os.chmod(temporary, 0o644)
             os.replace(temporary, path)
         finally:
             Path(temporary).unlink(missing_ok=True)

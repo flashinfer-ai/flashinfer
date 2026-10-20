@@ -17,6 +17,7 @@ from flashinfer.fused_moe.backends.cudnn_frost.manifest import (
     write_manifest,
 )
 from flashinfer.fused_moe.backends.cudnn_frost.runtime import artifact_root
+from flashinfer.fused_moe.backends.cudnn_frost import source_template
 from flashinfer.fused_moe.backends.cudnn_frost.source_template import render_source
 
 
@@ -30,6 +31,18 @@ def payload():
     second["id"] = "second"
     second["contract"]["n"] *= 2
     return {**original, "kernels": [first, second]}
+
+
+def test_materialized_source_is_readable_by_other_users(tmp_path, monkeypatch):
+    # The generated-source cache can be shared between CI users.
+    import flashinfer.jit.env as jit_env
+
+    monkeypatch.setattr(jit_env, "FLASHINFER_GEN_SRC_DIR", tmp_path)
+    monkeypatch.setattr(source_template, "render_source", lambda text, _: text)
+    template = tmp_path / "template.py"
+    template.write_text("KERNEL = 1\n")
+    path, _ = source_template.materialize_source(template, {})
+    assert path.stat().st_mode & 0o777 == 0o644
 
 
 def test_catalog_shares_implementations_without_merging_shape_contracts(payload):

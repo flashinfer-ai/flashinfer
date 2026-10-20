@@ -206,6 +206,9 @@ def _compile_cubin(
                     raise RuntimeError(
                         f"failed to compile {source.name} for {arch}:\n{result.stdout}"
                     )
+                # NamedTemporaryFile creates 0600 and nvcc keeps that mode; a
+                # shared JIT cache must be readable by other users.
+                os.chmod(temporary, 0o644)
                 os.replace(temporary, cubin)
             finally:
                 temporary.unlink(missing_ok=True)

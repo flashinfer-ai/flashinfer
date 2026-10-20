@@ -2221,6 +2221,9 @@ def test_compile_cubin_adds_manifest_header_include_paths(
     )
 
     assert cubin == b"cubin"
+    # The JIT cache can be shared between CI users.
+    cubin_path = cake_gdn._cubin_path(source, arch="sm_100a", digest="digest")
+    assert cubin_path.stat().st_mode & 0o777 == 0o644
     assert calls[0][0] == [
         str(nvcc),
         "--cubin",
