@@ -477,6 +477,11 @@ def _moe_core_impl(
                 "locality-domain localization requires use_fused_finalize=True; the "
                 "deterministic path's moe_unpermute reduction is not split-aware."
             )
+        if not hasattr(torch.cuda, "execute_on_streams"):
+            raise RuntimeError(
+                "Localized MoE execution requires torch.cuda.execute_on_streams. "
+                "Please install a PyTorch build that provides this API."
+            )
         # The generic async-memset path cannot be composed with the localized
         # fork/join. The localized path orders its optional memset stream
         # explicitly below.
@@ -1631,7 +1636,8 @@ def cute_dsl_fused_moe(
         (for example ``GreenContext.Stream()``). Work is forked from and
         joined to the caller's current stream with
         ``torch.cuda.execute_on_streams``. Localized execution requires a
-        PyTorch build providing this API.
+        PyTorch build providing this API and raises ``RuntimeError`` if it
+        is unavailable. Non-localized execution does not require this API.
     localized_sm_count : Optional[int]
         Number of SMs available to each locality-domain stream, used to size
         the persistent kernel grid.
