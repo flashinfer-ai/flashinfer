@@ -70,13 +70,16 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
   // TMA_STATE_ROWS: rows of DIM per TMA transaction in the horizontal kernel. Must be a
   // multiple of ROWS_PER_PASS. Larger values = fewer barrier syncs but more smem per stage.
   constexpr int TMA_STATE_ROWS = 2 * horiz::ROWS_PER_PASS;
+  // The vertical and horizontal kernels load a whole head (DIM rows) as one TMA box, and a TMA
+  // box dimension holds at most 256 elements.
+  constexpr int kMaxTmaBoxDim = 256;
 #endif
   // ── Auto algorithm selection ──────────────────────────────────────────────
   if (algorithm == SSUAlgorithm::kAuto) {
 #ifdef FLASHINFER_MAMBA_ENABLE_SM100
-    // Horizontal/vertical kernels don't support scaleState or varlen, and horizontal needs
-    // DIM divisible by TMA_STATE_ROWS
-    if (scaleState || params.cu_seqlens || DIM % TMA_STATE_ROWS != 0)
+    // Horizontal/vertical kernels don't support scaleState or varlen, horizontal needs
+    // DIM divisible by TMA_STATE_ROWS, and both need DIM <= kMaxTmaBoxDim
+    if (scaleState || params.cu_seqlens || DIM % TMA_STATE_ROWS != 0 || DIM > kMaxTmaBoxDim)
       algorithm = SSUAlgorithm::kSimple;
     else
       algorithm = (params.batch >= 32) ? SSUAlgorithm::kHorizontal : SSUAlgorithm::kSimple;
@@ -114,6 +117,8 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
     constexpr int kVerticalDimAlignment = warpSize;  // epilogue: elemsPerThread = DIM / warpSize
     FLASHINFER_CHECK(DIM % kVerticalDimAlignment == 0,
                      "Vertical kernel requires DIM divisible by 32 (warpSize), got DIM=", DIM);
+    FLASHINFER_CHECK(DIM <= kMaxTmaBoxDim, "Vertical kernel requires DIM <= ", kMaxTmaBoxDim,
+                     " (TMA box limit), got DIM=", DIM);
     FLASHINFER_CHECK(
         DSTATE % warpSize == 0,
         "Vertical kernel requires DSTATE divisible by 32 (warpSize), got DSTATE=", DSTATE);
@@ -125,7 +130,8 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
 
     // The kernel static_asserts that each of its 4 compute warps gets a multiple of 4 rows,
     // and it splits DSTATE over the lanes, so only instantiate it for supported shapes.
-    if constexpr (DIM % kVerticalDimAlignment == 0 && DSTATE % warpSize == 0) {
+    if constexpr (DIM % kVerticalDimAlignment == 0 && DIM <= kMaxTmaBoxDim &&
+                  DSTATE % warpSize == 0) {
       dispatchRatio(
           params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, [&]<int HEADS_PER_GROUP>() {
             using namespace vertical_constants;
@@ -190,12 +196,14 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
     constexpr int NUM_IN_STAGES = 2;
     FLASHINFER_CHECK(DIM % TMA_STATE_ROWS == 0, "Horizontal kernel requires DIM divisible by ",
                      TMA_STATE_ROWS, " (TMA_STATE_ROWS = 2 * ROWS_PER_PASS), got DIM=", DIM);
+    FLASHINFER_CHECK(DIM <= kMaxTmaBoxDim, "Horizontal kernel requires DIM <= ", kMaxTmaBoxDim,
+                     " (TMA box limit), got DIM=", DIM);
     FLASHINFER_CHECK(!scaleState, "horizontal algorithm does not support scaled (quantized) state");
     FLASHINFER_CHECK(params.cu_seqlens == nullptr,
                      "horizontal algorithm does not support varlen (cu_seqlens)");
 
     // The kernel static_asserts DIM % TMA_STATE_ROWS == 0, so only instantiate it then.
-    if constexpr (DIM % TMA_STATE_ROWS == 0) {
+    if constexpr (DIM % TMA_STATE_ROWS == 0 && DIM <= kMaxTmaBoxDim) {
       dispatchRatio(
           params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, [&]<int HEADS_PER_GROUP>() {
             constexpr int HEADS_PER_CTA = 1;

@@ -52,6 +52,9 @@ def _skip_unsupported_dim(algorithm, dim):
     # Vertical needs dim divisible by warpSize (32); horizontal by TMA_STATE_ROWS (32).
     if algorithm in ("vertical", "horizontal") and dim % 32 != 0:
         pytest.skip(f"{algorithm} kernel requires dim divisible by 32, got {dim}")
+    # Both load a whole head as one TMA box, which holds at most 256 elements per dimension.
+    if algorithm in ("vertical", "horizontal") and dim > 256:
+        pytest.skip(f"{algorithm} kernel requires dim <= 256, got {dim}")
 
 
 class TestSelectiveStateUpdateMTP:
