@@ -183,6 +183,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dw": "dw",
             "dx": "dx",
             "dy": "dy",
+            "dy_map": "dy",
             "n_ch_tiles": "n_ch_tiles",
             "n_sub": "n_sub",
             "num_docs": "num_docs",
@@ -190,6 +191,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "search_steps": "search_steps",
             "w": "w",
             "x": "x",
+            "x_map": "x",
         },
         "role": "bwd",
         # The FP32 ``partial`` workspace: ``[ceil(grid / n_ch_tiles), C, taps]``
