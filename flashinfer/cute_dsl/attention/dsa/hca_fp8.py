@@ -54,6 +54,11 @@ from .hca_helpers import (
 )
 from .gather4_utils import make_gather4_2sm_tma_atom
 
+# An older DSL has no sm_107; fall back to the sm_103 bounds so it behaves exactly
+# as before.
+_ARCH_SM107 = getattr(Arch, "sm_107", Arch.sm_103f)
+_ARCH_SM107F = getattr(Arch, "sm_107f", Arch.sm_103f)
+
 """
 A Heavily Compressed Attention (HCA) kernel using FP8 input and FP8 or BF16
 output for the NVIDIA Blackwell SM100 architecture using CuTe DSL.
@@ -3043,11 +3048,12 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
 
         row_max_new = row_max
         arch = BaseDSL._get_dsl().get_arch_enum()
-        # SM100 and SM103 only. SM107 is served by the prebuilt-cubin backend;
-        # this kernel was not found to be faster there or to add functionality,
-        # so it has no SM107 arm. Any other arch must fail here, because with no
+        # SM100, SM103 and SM107. Any other arch must fail here, because with no
         # matching arm the accumulator fragment is never written.
-        if cutlass.const_expr(arch >= Arch.sm_100 and arch <= Arch.sm_100f):
+        if cutlass.const_expr(
+            (arch >= Arch.sm_100 and arch <= Arch.sm_100f)
+            or (arch >= _ARCH_SM107 and arch <= _ARCH_SM107F)
+        ):
             cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
                 if apply_mask:
@@ -3085,7 +3091,7 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
                 row_max_new = cute.arch.fmax(row_max_new, tTR_rMax[0])
         else:
             raise NotImplementedError(
-                f"HCA softmax supports sm_100 and sm_103 only, got {arch}"
+                f"HCA softmax supports sm_100, sm_103 and sm_107 only, got {arch}"
             )
 
         cute.arch.fence_view_async_tmem_load()
