@@ -70,11 +70,15 @@ def test_flat_offset_guard_refuses_tensors_beyond_int32():
     )
 
     assert MAX_FLAT_ELEMENTS == 2**31 - 1
-    rows = MAX_FLAT_ELEMENTS // 128 + 1  # 16,777,216 rows of 128 channels: 2**31 elements, one past the limit
+    rows = (
+        MAX_FLAT_ELEMENTS // 128 + 1
+    )  # 16,777,216 rows of 128 channels: 2**31 elements, one past the limit
     meta = torch.device("meta")
     too_big = torch.empty((1, rows, 1, 128), device=meta, dtype=torch.float8_e4m3fn)
     assert too_big.numel() == MAX_FLAT_ELEMENTS + 1
-    with pytest.raises(ValueError, match=r"q has 2147483648 elements \(shape \(1, 16777216, 1, 128\)\)"):
+    with pytest.raises(
+        ValueError, match=r"q has 2147483648 elements \(shape \(1, 16777216, 1, 128\)\)"
+    ):
         _check_flat_indexable("q", too_big)
     with pytest.raises(ValueError, match="32-bit element offsets"):
         _check_tensor("q", too_big, meta, torch.float8_e4m3fn)
@@ -82,5 +86,6 @@ def test_flat_offset_guard_refuses_tensors_beyond_int32():
     assert largest.numel() == MAX_FLAT_ELEMENTS - 127
     _check_flat_indexable("q", largest)
     _check_tensor("q", largest, meta, torch.float8_e4m3fn, (1, rows - 1, 1, 128))
-    _check_flat_indexable("out", torch.empty((2, 3, 4, 128), device=meta, dtype=torch.bfloat16))
-
+    _check_flat_indexable(
+        "out", torch.empty((2, 3, 4, 128), device=meta, dtype=torch.bfloat16)
+    )
