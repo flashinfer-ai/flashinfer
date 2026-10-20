@@ -3789,7 +3789,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type mma_tiler_mn: Tuple[int, int]
         :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
         :type cluster_shape_mn: Tuple[int, int]
-        :param gated: Whether the fused activation is gated (SwiGLU family)
+        :param gated: Whether the fused activation is gated (SwiGLU family).
+            Non-gated ones (e.g. ReLU2 in Nemotron MoE models) also allow N=192.
         :type gated: bool
 
         :return: True if the mma tiler and cluster shape are valid, False otherwise
@@ -3954,7 +3955,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type b_major: str
         :param c_major: The major axis of the C tensor
         :type c_major: str
-        :param gated: Whether the fused activation is gated (SwiGLU family)
+        :param gated: Whether the fused activation is gated (SwiGLU family).
+            Non-gated ones (e.g. ReLU2 in Nemotron MoE models) also allow N=192.
         :type gated: bool
 
         :return: True if the gemm can be implemented, False otherwise
