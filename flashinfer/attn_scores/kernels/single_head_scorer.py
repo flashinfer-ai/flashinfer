@@ -44,6 +44,12 @@ SMEM_RESERVED_PER_CTA = 1024  # bytes the driver keeps per CTA
 # a tile): 256 in decode, so a run covers 32K keys, and 128 in select.
 TILES_PER_CTA = 256
 SELECT_TILES_PER_CTA = 128
+# Select's repair radix-selects a missed row's cutoff one digit per sweep. A row's
+# BINS digit counts reuse its four threads' staged scores (64 KB / 128 rows = 128
+# words), so a digit is 7 bits and 32-bit scores take 5 sweeps.
+DIGIT = 7
+BINS = 1 << DIGIT
+PASSES = (32 + DIGIT - 1) // DIGIT
 # NVFP4 values (E2M1, two to a byte) come with one E4M3 scale per 16.
 SCALE_TYPE = cutlass.Float8E4M3FN
 SCALE_VECTOR = 16
@@ -106,7 +112,8 @@ class PagedScorer:
 
     "select" puts the queries on the TMEM lanes (M = 128 rows, N = 128 keys)
     over 512 threads, each comparing its row's 32 scores of a tile (warpgroup g
-    owns keys 32 g .. 32 g + 31) to the row's threshold.
+    owns keys 32 g .. 32 g + 31) to the row's threshold. With ``arrivals``, the
+    last of a tile's CTAs repairs the rows that miss (see the sweep loop).
     """
 
     def __init__(self, mode: str, rows: int, nvfp4: bool):
@@ -139,6 +146,8 @@ class PagedScorer:
         block_table: cute.Tensor,
         thresholds: Optional[cute.Tensor],
         counters: Optional[cute.Tensor],
+        arrivals: Optional[cute.Tensor],
+        ranges: Optional[cute.Tensor],
         output: cute.Tensor,
         key_rows: cutlass.Int32,
         workers: cutlass.Int32,
@@ -260,6 +269,8 @@ class PagedScorer:
             block_table,
             thresholds,
             counters,
+            arrivals,
+            ranges,
             output,
             layout_key,
             layout_query,
@@ -293,6 +304,8 @@ class PagedScorer:
         block_table: cute.Tensor,
         thresholds: Optional[cute.Tensor],
         counters: Optional[cute.Tensor],
+        arrivals: Optional[cute.Tensor],
+        ranges: Optional[cute.Tensor],
         output: cute.Tensor,
         layout_key: cute.ComposedLayout,
         layout_query: cute.ComposedLayout,
@@ -358,6 +371,10 @@ class PagedScorer:
         first_tile = worker * run
         tile_count = cutlass.min(run, job_tiles - first_tile)
         if tile_count <= 0:
+            if cutlass.const_expr(ranges is not None):
+                if job_tiles == 0 and worker == 0 and thread < TILE:
+                    ranges[0, my_row] = ties  # no keys: an empty range
+                    ranges[1, my_row] = ties
             if warp == 0:
                 # tmem.free() counts columns while tracing; the final one needs them.
                 cute.arch.dealloc_tmem(base, self.tmem_columns)
@@ -421,13 +438,11 @@ class PagedScorer:
         else:
             fragment_query = tiled_mma.make_fragment_A(shared_query)
             fragment_key = tiled_mma.make_fragment_B(shared_key)
-        # The run's page indices: 0 past the job's end, whose entries go unread.
+        # The run's page indices (a repair sweep reads the table).
         request_row = request.to(cutlass.Int64) * block_table.shape[1]
+        paging = (tile_pages, pages, request_row, job_end)
         for slot in cutlass.range(thread, PAGES_PER_TILE * tile_count, self.threads):
-            block, page = first_tile * PAGES_PER_TILE + slot, cutlass.Int32(0)
-            if block * PAGE < job_end:
-                page = pages[request_row + block]
-            tile_pages[slot] = page
+            tile_pages[slot] = self.page(paging, 1, first_tile * PAGES_PER_TILE + slot)
         # NVFP4's query scales in the MMA's order: row r's scale words w = 0, 1
         # at w * 128 + (r % 32) * 4 + r // 32.
         if cutlass.const_expr(self.scaled):
@@ -525,14 +540,14 @@ class PagedScorer:
                 partition_scales(shared_query_scales, scale_query),
                 partition_scales(shared_key_scales, scale_key),
             )
-            scale_loads = (key_scales, shared_key_scales, tile_pages, key_pipeline)
+            scale_loads = (key_scales, shared_key_scales, paging, key_pipeline)
         # Decode's keys are the MMA's A operand, select's queries.
         mma: tuple = (tiled_mma, accumulator, fragment_key, fragment_query)
         mma += (scale_key, scale_query, copies)
         if cutlass.const_expr(not self.decode):
             mma = (tiled_mma, accumulator, fragment_query, fragment_key)
             mma += (scale_query, scale_key, copies)
-        key_loads = (tma_key, load_key_src, load_key_dst, tile_pages)
+        key_loads = (tma_key, load_key_src, load_key_dst, paging)
         # Tile t + stages - 1 loads into the stage of tile t - 1, whose MMA is done.
         ahead = self.stages - 1
         scale_stage = pipeline.make_pipeline_state(
@@ -555,49 +570,169 @@ class PagedScorer:
                     load_query_dst[None, 0],
                     tma_bar_ptr=query_empty.barrier,
                 )
-            for step in cutlass.range(-ahead, tile_count + 1):
-                if step > 0:
-                    acc_full = acc_consumer.wait_and_advance()
-                    cute.copy(tiled_copy, source, registers)
-                    cute.arch.fence_view_async_tmem_load()
-                    acc_full.release()
-                if step + ahead >= 0 and step + ahead < tile_count:
-                    if warp == 0:
-                        key_empty = key_producer.acquire_and_advance()
-                        self.load_keys(key_empty, key_loads, step + ahead)
-                    if cutlass.const_expr(self.scaled):
+            # Sweep 0 is this CTA's run. With `arrivals`, the last of a tile's
+            # active CTAs then checks its rows, and if one misses, sweeps all of
+            # the tile's keys again for the rows that miss (the others' ends are
+            # 0). The first PASSES sweeps radix-select the row's rank-th largest
+            # score one digit at a time, among keys whose ordered bits match
+            # `value` on `mask`, and a last sweep selects at it. This is FlashInfer
+            # #2215's radix select over CTAs, handed to the last CTA instead of
+            # barriers, since the grid can exceed residency. Between sweeps, the
+            # staged scores hold the arrival count and repair flag, then digit counts.
+            words = cute.make_tensor(
+                cute.recast_ptr(staged.iterator, dtype=cutlass.Int32),
+                cute.make_layout(KEY_GROUP * self.threads),
+            )
+            row_bins = cute.recast_ptr(staged.iterator, dtype=cutlass.Int32) + (
+                local_thread * BINS
+            )
+            is_last_cta, row_missed = cutlass.Boolean(False), cutlass.Boolean(False)
+            rank, mask, value = cutlass.Int32(0), cutlass.Uint32(0), cutlass.Uint32(0)
+            sweep, sweeps = cutlass.Int32(0), cutlass.Int32(1)
+            while sweep < sweeps:
+                counting_sweep = sweep > 0 and sweep + 1 < sweeps
+                digit = cutlass.max(sweep - 1, 0)
+                digit_shift = cutlass.max(32 - DIGIT * (digit + 1), 0)
+                digit_mask = (
+                    cutlass.Int32(1) << (32 - DIGIT * digit - digit_shift)
+                ) - 1
+                for step in cutlass.range(-ahead, tile_count + 1):
+                    if step > 0:
+                        acc_full = acc_consumer.wait_and_advance()
+                        cute.copy(tiled_copy, source, registers)
+                        cute.arch.fence_view_async_tmem_load()
+                        acc_full.release()
+                    if step + ahead >= 0 and step + ahead < tile_count:
+                        if warp == 0:
+                            key_empty = key_producer.acquire_and_advance()
+                            self.load_keys(key_empty, key_loads, sweep, step + ahead)
+                        if cutlass.const_expr(self.scaled):
+                            if thread < TILE:
+                                tile = step + ahead
+                                self.load_scales(
+                                    scale_loads, sweep, tile, scale_stage, thread
+                                )
+                                scale_stage.advance()
+                    if warp == 0 and step >= 0 and step < tile_count:
+                        if sweep == 0 and step == 0:
+                            query_consumer.wait_and_advance()
+                        self.mma(
+                            mma,
+                            acc_producer.acquire_and_advance(),
+                            key_consumer.wait_and_advance(),
+                            sweep == 0 and step == 0,
+                        )
+                    if step > 0:
+                        tile = first_tile + step - 1
+                        key_base = tile * TILE + key_group * KEY_GROUP
+                        limit = cutlass.min(
+                            cutlass.max(my_end - key_base, 0), KEY_GROUP
+                        )
+                        if counting_sweep:
+                            field = cutlass.Uint32(digit_mask)
+                            self.count_keys(
+                                registers,
+                                limit,
+                                mask,
+                                value,
+                                digit_shift,
+                                field,
+                                row_bins,
+                            )
+                        # Keys at or past my_end are neither; only tiles that
+                        # straddle a row end (of any row in this warp) check it.
+                        elif cute.arch.vote_all_sync(tile * TILE + TILE <= my_end):
+                            self.select_keys(
+                                registers,
+                                my_threshold,
+                                KEY_GROUP,
+                                key_base,
+                                selection,
+                                thread,
+                            )
+                        else:
+                            self.select_keys(
+                                registers,
+                                my_threshold,
+                                limit,
+                                key_base,
+                                selection,
+                                thread,
+                            )
+                cute.arch.barrier()
+                if cutlass.const_expr(arrivals is not None):
+                    if sweep == 0:
+                        # Every CTA's candidates, ties and counts are in memory
+                        # before its arrival; the last active CTA reads them. As
+                        # in RadixGroupResetStateLastCTA (include/flashinfer/
+                        # topk.cuh), the last CTA to arrive finishes the work and
+                        # resets the count. Thus no CTA waits on another.
+                        if thread == 0:
+                            words[0] = cute.arch.atomic_add(
+                                (arrivals.iterator + job).llvm_ptr,
+                                cutlass.Int32(1),
+                                sem="acq_rel",
+                                scope="gpu",
+                            )
+                            words[1] = 0
+                        cute.arch.barrier()
+                        arrived_before = words[0]
+                        is_last_cta = arrived_before == (job_tiles + run - 1) // run - 1
+                        if is_last_cta:
+                            above, tied = self.read_counters(row_counters)
+                            rank = cutlass.min(my_end, ties)
+                            row_missed = (
+                                above > capacity
+                                or above + cutlass.min(tied, ties) < rank
+                            )
+                            if row_missed:
+                                words[1] = 1
+                        cute.arch.barrier()
+                        sweeps += (PASSES + 1) * words[1]
+                        first_tile, tile_count = cutlass.Int32(0), job_tiles
+                        if not row_missed:
+                            my_end = 0
+                    if counting_sweep and row_missed:
+                        # The digit holding the row's rank-th largest score, from
+                        # the top (the row's four threads alike).
+                        above, chosen = cutlass.Int32(0), cutlass.Int32(-1)
+                        for bin in cutlass.range(digit_mask, -1, -1):
+                            here = words[local_thread * BINS + bin]
+                            if chosen < 0 and above + here >= rank:
+                                chosen = bin
+                                rank -= above
+                            above += here
+                        value |= cutlass.Uint32(chosen) << digit_shift
+                        mask |= cutlass.Uint32(digit_mask) << digit_shift
+                    cute.arch.barrier()
+                    # Before the next sweep: zero counts; after the last digit,
+                    # the cutoff.
+                    if sweep + 1 < sweeps:
+                        for i in cutlass.range(thread, TILE * BINS, self.threads):
+                            words[i] = 0
+                    if counting_sweep and sweep == PASSES and row_missed:
+                        my_threshold = self.unordered(value)
                         if thread < TILE:
-                            tile = step + ahead
-                            self.load_scales(scale_loads, tile, scale_stage, thread)
-                            scale_stage.advance()
-                if warp == 0 and step >= 0 and step < tile_count:
-                    if step == 0:
-                        query_consumer.wait_and_advance()
-                    self.mma(
-                        mma,
-                        acc_producer.acquire_and_advance(),
-                        key_consumer.wait_and_advance(),
-                        step == 0,
-                    )
-                if step > 0:
-                    tile = first_tile + step - 1
-                    key_base = tile * TILE + key_group * KEY_GROUP
-                    limit = cutlass.min(cutlass.max(my_end - key_base, 0), KEY_GROUP)
-                    # Keys at or past my_end are neither; only tiles that
-                    # straddle a row end (of any row in this warp) check it.
-                    if cute.arch.vote_all_sync(tile * TILE + TILE <= my_end):
-                        self.select_keys(
-                            registers,
-                            my_threshold,
-                            KEY_GROUP,
-                            key_base,
-                            selection,
-                            thread,
-                        )
-                    else:
-                        self.select_keys(
-                            registers, my_threshold, limit, key_base, selection, thread
-                        )
+                            zeros = cute.make_tensor(
+                                row_counters, cute.make_layout(COUNTERS)
+                            )
+                            zeros[0] = 0
+                            zeros[1] = 0
+                            cute.make_tensor(thresholds.iterator, flat_int64)[
+                                my_row
+                            ] = my_threshold
+                    cute.arch.barrier()
+                sweep += 1
+            # The tile's rows' Top-K ranges over their written slots, and the
+            # arrival count back to zero.
+            if cutlass.const_expr(arrivals is not None):
+                if is_last_cta:
+                    if thread < TILE:
+                        above, tied = self.read_counters(row_counters)
+                        ranges[0, my_row] = ties - cutlass.min(tied, ties)
+                        ranges[1, my_row] = ties + cutlass.min(above, capacity)
+                    if thread == 0:
+                        arrivals[job] = 0
         elif warp == LOAD_WARP:
             query_empty = query_producer.acquire_and_advance()
             cute.copy(
@@ -607,7 +742,7 @@ class PagedScorer:
                 tma_bar_ptr=query_empty.barrier,
             )
             for tile in cutlass.range(tile_count):
-                self.load_keys(key_producer.acquire_and_advance(), key_loads, tile)
+                self.load_keys(key_producer.acquire_and_advance(), key_loads, 0, tile)
         elif warp == MMA_WARP:
             query_consumer.wait_and_advance()
             for tile in cutlass.range(tile_count):
@@ -620,13 +755,15 @@ class PagedScorer:
         elif warp < STORE_WARPS:
             if cutlass.const_expr(self.scaled):
                 for slot in cutlass.range(cutlass.min(ahead, tile_count)):
-                    self.load_scales(scale_loads, slot, scale_stage, thread)
+                    self.load_scales(scale_loads, 0, slot, scale_stage, thread)
                     scale_stage.advance()
             scores = cute.make_tensor(output.iterator, flat_int64)  # [rows, keys]
             for tile in cutlass.range(tile_count):
                 if cutlass.const_expr(self.scaled):
                     if tile + ahead < tile_count:
-                        self.load_scales(scale_loads, tile + ahead, scale_stage, thread)
+                        self.load_scales(
+                            scale_loads, 0, tile + ahead, scale_stage, thread
+                        )
                         scale_stage.advance()
                 acc_full = acc_consumer.wait_and_advance()
                 cute.copy(
@@ -652,14 +789,16 @@ class PagedScorer:
         tmem.free(base)
 
     @cute.jit
-    def load_keys(self, key_empty, loads: tuple, tile: cutlass.Int32):
-        """Decode's warp 5, select's warp 0: TMA the run's tile `tile` into the
-        stage `key_empty`."""
-        tma_key, sources, destinations, tile_pages = loads
+    def load_keys(self, key_empty, loads: tuple, sweep, tile: cutlass.Int32):
+        """Decode's warp 5, select's warp 0: TMA the sweep's tile `tile` into
+        the stage `key_empty`."""
+        tma_key, sources, destinations, paging = loads
         for part in cutlass.range(PAGES_PER_TILE, unroll_full=True):
             cute.copy(
                 tma_key,
-                sources[None, 0, 0, tile_pages[tile * PAGES_PER_TILE + part]],
+                sources[
+                    None, 0, 0, self.page(paging, sweep, tile * PAGES_PER_TILE + part)
+                ],
                 destinations[None, part, key_empty.index],
                 tma_bar_ptr=key_empty.barrier,
             )
@@ -702,14 +841,14 @@ class PagedScorer:
         acc_empty.commit()
 
     @cute.jit
-    def load_scales(self, loads: tuple, tile, stage, thread: cutlass.Int32):
-        """NVFP4, warps 0-3: once the key stage is free, thread k copies key k's
-        two scale words (8 scales) of the run's tile `tile` by cp.async, counted
-        in on the stage's full barrier. As the query's, word w goes to
+    def load_scales(self, loads: tuple, sweep, tile, stage, thread: cutlass.Int32):
+        """NVFP4, threads 0-127: once the key stage is free, thread k copies key
+        k's two scale words (8 scales) of the sweep's tile `tile` by cp.async,
+        counted in on the stage's full barrier. As the query's, word w goes to
         w * 128 + (k % 32) * 4 + k // 32 of the stage's 256."""
-        key_scales, shared_key_scales, tile_pages, keys = loads
+        key_scales, shared_key_scales, paging, keys = loads
         keys.sync_object_empty.wait(stage.index, stage.phase)
-        page = tile_pages[tile * 2 + thread // 64]
+        page = self.page(paging, sweep, tile * PAGES_PER_TILE + thread // PAGE)
         source = cute.recast_ptr(key_scales.iterator, dtype=cutlass.Uint32) + (
             page.to(cutlass.Int64) * (key_scales.stride[0] // 4)
             + thread % PAGE * SCALE_WORDS
@@ -727,6 +866,65 @@ class PagedScorer:
                 cute.make_tensor(place + word * TILE, cute.make_layout(1)),
             )
         cute.arch.cp_async_mbarrier_arrive_noinc(keys.producer_get_barrier(stage))
+
+    @cute.jit
+    def page(self, paging: tuple, sweep, slot: cutlass.Int32) -> cutlass.Int32:
+        """Page `slot` (of keys and of their scales alike): sweep 0's staged one,
+        a repair sweep's from the table, 0 past the job's end (never read)."""
+        tile_pages, table, row, job_end = paging
+        page = cutlass.Int32(0)
+        if sweep == 0:
+            page = tile_pages[slot]
+        elif slot * PAGE < job_end:
+            page = table[row + slot]
+        return page
+
+    @cute.jit
+    def read_counters(
+        self, row_counters: cute.Pointer
+    ) -> tuple[cutlass.Int32, cutlass.Int32]:
+        """A row's (candidates, ties) counts as other CTAs left them."""
+        load = cute.arch.load
+        above = load(row_counters, cutlass.Int32, sem="relaxed", scope="gpu")
+        tied = load(row_counters + 1, cutlass.Int32, sem="relaxed", scope="gpu")
+        return above, tied
+
+    @cute.jit
+    def ordered(self, score: cutlass.Float32) -> cutlass.Uint32:
+        """A score's 32 bits, flipped so that their unsigned order is float order.
+        This is CUB's radix-sort float key (Traits<float>::TwiddleIn). Thus the
+        radix select can count the scores a digit at a time."""
+        bits = score.bitcast(cutlass.Uint32)
+        return bits ^ (cutlass.Uint32(0x80000000) + (bits >> 31) * 0x7FFFFFFF)
+
+    @cute.jit
+    def unordered(self, value: cutlass.Uint32) -> cutlass.Float32:
+        """The float whose ordered bits are `value`."""
+        bits = value ^ (cutlass.Uint32(0xFFFFFFFF) - (value >> 31) * 0x7FFFFFFF)
+        return bits.bitcast(cutlass.Float32)
+
+    @cute.jit
+    def count_keys(
+        self,
+        registers: cute.Tensor,
+        limit: cutlass.Int32,
+        mask: cutlass.Uint32,
+        value: cutlass.Uint32,
+        digit_shift: cutlass.Int32,
+        field: cutlass.Uint32,
+        row_bins: cute.Pointer,
+    ):
+        """A thread's first `limit` scores of its row: each one whose ordered
+        bits match `value` on `mask` counts in its row's bin of the next digit
+        (the `field` bits from `digit_shift`)."""
+        for j in cutlass.range_constexpr(KEY_GROUP):
+            if j < limit:
+                bits = self.ordered(registers[j])
+                if bits & mask == value:
+                    digit = ((bits >> digit_shift) & field).to(cutlass.Int32)
+                    cute.arch.atomic_add(
+                        (row_bins + digit).llvm_ptr, cutlass.Int32(1), scope="cta"
+                    )
 
     @cute.jit
     def select_keys(
