@@ -73,6 +73,7 @@ KEY_LANES = 16
 LANE_VALUES = DIM // KEY_LANES
 LANES_PER_SCALE = SCALE_VECTOR // LANE_VALUES
 WRITE_KEYS_PER_CTA = TILE // KEY_LANES
+THRESHOLD_ROWS_PER_CTA = 4  # thresholds_kernel: a warp per row
 
 
 @cute.jit
@@ -1074,6 +1075,74 @@ def index_k_write_kernel(
         key_cache[page, row, part] = packed.to(cutlass.Int32)
         if part % 2 == 0:
             key_scales[page, row, part // 2] = scale.to(cutlass.Uint8)
+
+
+@cute.kernel
+def key_sample_kernel(
+    key_cache: cute.Tensor,
+    key_scales: Optional[cute.Tensor],
+    block_table: cute.Tensor,
+    offsets: cute.Tensor,
+    sample_ends: cute.Tensor,
+    sample_keys: cute.Tensor,
+    sample_scales: Optional[cute.Tensor],
+    samples: cutlass.Constexpr[int],
+    run_keys: cutlass.Constexpr[int],
+    width: cutlass.Constexpr[int],
+):
+    """Copy request r's sampled keys and their scales (NVFP4) into its row of
+    sample slots: slot s < sample_ends[r] gets the key at offsets[s] into run
+    s // samples of run_keys keys, its `width` stored values and its 8 scales."""
+    request, tile, _ = cute.arch.block_idx()
+    slot = tile * TILE + cute.arch.thread_idx()[0]
+    if slot < sample_ends[request]:
+        key = slot // samples * run_keys + offsets[slot].to(cutlass.Int32)
+        page = block_table[request, key // PAGE]
+        values = cute.local_tile(key_cache[page, key % PAGE, None], (width,), (0,))
+        values = values.load()
+        if cutlass.const_expr(key_scales is not None):
+            scales = cute.local_tile(
+                key_scales[page, key % PAGE, None], (SCALES_PER_KEY,), (0,)
+            )
+            cute.local_tile(
+                sample_scales[request, slot, None], (SCALES_PER_KEY,), (0,)
+            ).store(scales.load())
+        cute.local_tile(sample_keys[request, slot, None], (width,), (0,)).store(values)
+
+
+@cute.kernel
+def thresholds_kernel(
+    sample_scores: cute.Tensor,
+    sample_top: cute.Tensor,
+    thresholds: cute.Tensor,
+    counters: cute.Tensor,
+    rank: cutlass.Constexpr[int],
+):
+    """Store the least of row r's Top-`rank` sampled scores as its threshold and
+    zero its counters. A -1 position (a row with fewer samples) reads as -inf;
+    so does a NaN score, which dummy or capture passes can feed from
+    uninitialized memory. One warp per row, four per CTA."""
+    lane, warp = cute.arch.lane_idx(), cute.arch.warp_idx()
+    row = cute.arch.block_idx()[0] * THRESHOLD_ROWS_PER_CTA + warp
+    if row < sample_top.shape[0]:
+        scores = cute.make_rmem_tensor(((rank + 31) // 32,), cutlass.Float32)
+        for i in cutlass.range_constexpr((rank + 31) // 32):
+            scores[i] = cutlass.Float32(float("inf"))  # past rank
+            if lane + 32 * i < rank:
+                scores[i] = cutlass.Float32(float("-inf"))
+                position = sample_top[row, lane + 32 * i]
+                if position >= 0:
+                    scores[i] = sample_scores[row, position]
+        least = cutlass.Float32(float("inf"))
+        for i in cutlass.range_constexpr((rank + 31) // 32):
+            if scores[i] != scores[i]:
+                scores[i] = cutlass.Float32(float("-inf"))
+            least = cute.arch.fmin(least, scores[i])
+        least = cute.arch.warp_reduction(least, cute.arch.fmin)
+        if lane == 0:
+            thresholds[row] = least
+        if lane < COUNTERS:
+            counters[row, lane] = 0
 
 
 # One scorer per mode, query rows per job and key format, so each compiles once.

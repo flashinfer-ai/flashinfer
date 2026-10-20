@@ -21,9 +21,11 @@ from .attn_scores import (
     precompile_paged_mqa_logits,
 )
 from .single_head import (
+    gather_key_sample,
     quantize_write_index_k_nvfp4,
     single_head_paged_mqa_logits,
     single_head_paged_mqa_threshold_select,
+    thresholds_from_sample,
 )
 
 __all__ = [
@@ -36,4 +38,6 @@ __all__ = [
     "quantize_write_index_k_nvfp4",
     "single_head_paged_mqa_logits",
     "single_head_paged_mqa_threshold_select",
+    "thresholds_from_sample",
+    "gather_key_sample",
 ]

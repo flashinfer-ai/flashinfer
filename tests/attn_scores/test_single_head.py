@@ -9,9 +9,11 @@ import torch
 
 from flashinfer import nvfp4_kv_dequantize
 from flashinfer.attn_scores import (
+    gather_key_sample,
     quantize_write_index_k_nvfp4,
     single_head_paged_mqa_logits,
     single_head_paged_mqa_threshold_select,
+    thresholds_from_sample,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -251,6 +253,83 @@ def test_single_head_paged_mqa_threshold_select_matches_reference_and_replay(
     requested.copy_(scores.nan_to_num(0).masked_fill(~valid, 0).median(1).values)
     graph.replay()
     check(scores, valid)
+
+
+@pytest.mark.parametrize("far", [False, True])
+@pytest.mark.parametrize("keys", ["bf16", "nvfp4"])
+@torch.inference_mode()
+def test_gather_key_sample_matches_reference(keys, far) -> None:
+    """Slots below a request's sample end get the key, and its scales, at their
+    offset into their run of pages; the rest stay untouched. `far`: the pages
+    sit past the first 2**31 bytes of the key cache."""
+    torch.manual_seed(0)
+    nvfp4, samples, run_keys, lengths = keys == "nvfp4", 3, 128, [1, 200, 4097, 8193]
+    blocks = -(-max(lengths) // 64)
+    pages = len(lengths) * blocks
+    values, scales = rows_of(nvfp4, 64 * pages)
+    key_cache, key_scales = values.view(pages, 64, -1), None
+    table = torch.randperm(pages, device="cuda").int().view(-1, blocks)
+    if nvfp4:
+        key_scales = scales.view(pages, 64, 8)
+    if far:
+        skip = 2**31 // (key_cache[0].numel() * key_cache.element_size())
+        key_cache = torch.cat(
+            (key_cache.new_zeros(skip, 64, key_cache.shape[2]), key_cache)
+        )
+        if nvfp4:
+            key_scales = torch.cat((key_scales.new_zeros(skip, 64, 8), key_scales))
+        table += skip
+    capacity = 128 * -(-max(lengths) * samples // (128 * run_keys))
+    offsets = torch.randint(run_keys, (capacity,), dtype=torch.uint8, device="cuda")
+    ends = [length // run_keys * samples for length in lengths]
+    shape = (len(ends), capacity)
+    sample_keys = torch.full((*shape, key_cache.shape[2]), 85, device="cuda")
+    sample_keys = sample_keys.to(key_cache.dtype)
+    sample_scales = None
+    if nvfp4:
+        sample_scales = torch.full((*shape, 8), 85, dtype=torch.uint8, device="cuda")
+        sample_scales = sample_scales.view(torch.float8_e4m3fn)
+    expected = [t if t is None else t.clone() for t in (sample_keys, sample_scales)]
+    for request, end in enumerate(ends):
+        key = torch.arange(end, device="cuda") // samples * run_keys
+        key += offsets[:end].long()
+        page = table[request, key // 64].long()
+        expected[0][request, :end] = key_cache[page, key % 64]
+        if nvfp4:
+            expected[1][request, :end] = key_scales[page, key % 64]
+    gather_key_sample(
+        *(key_cache, table, offsets, torch.tensor(ends, device="cuda").int()),
+        sample_keys=sample_keys,
+        samples_per_run=samples,
+        pages_per_run=run_keys // 64,
+        key_scales=key_scales,
+        sample_scales=sample_scales,
+    )
+    assert torch.equal(sample_keys.view(torch.uint8), expected[0].view(torch.uint8))
+    if nvfp4:
+        got = sample_scales.view(torch.uint8)
+        assert torch.equal(got, expected[1].view(torch.uint8))
+
+
+@torch.inference_mode()
+def test_thresholds_from_sample_matches_reference() -> None:
+    """A row's threshold is the least of its sampled scores at its Top
+    positions, a -1 position or a NaN score reading as -inf; its counters are
+    zeroed."""
+    torch.manual_seed(0)
+    rows, samples, rank = 77, 300, 40
+    scores = torch.randn(rows, samples, device="cuda")
+    scores[3, 5] = torch.nan
+    top = torch.rand(rows, samples, device="cuda").argsort(1)[:, :rank].int()
+    top[3, 0] = 5  # a NaN score
+    top[7, -4:] = -1  # a row with fewer samples
+    thresholds = torch.empty(rows, device="cuda")
+    counters = torch.full((rows, 2), 7, dtype=torch.int32, device="cuda")
+    thresholds_from_sample(scores, top, thresholds=thresholds, counters=counters)
+    picked = scores.gather(1, top.clamp(min=0).long()).masked_fill(top < 0, -torch.inf)
+    expected = torch.where(picked.isnan(), -torch.inf, picked).amin(1)
+    assert torch.equal(thresholds, expected)
+    assert bool((counters == 0).all())
 
 
 def e2m1(x: torch.Tensor) -> torch.Tensor:
