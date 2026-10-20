@@ -294,12 +294,95 @@ MODULES: dict[str, dict[str, Any]] = {
             "taps": 4,
         },
     },
+    # Rendered by the exporter from the family adapter's scaffold: the backward
+    # with stage_tokens 8, copy tma2d, min_blocks 2 (2 CTAs per SM); it runs when
+    # C >= select_rule.channels[arch], else the fallback record (no rule) runs.
+    "cake_causal_conv1d_train_90351ecca30604957251": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "dw"],
+            ["buffer", "partial"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["buffer", "x_map"],
+            ["buffer", "dy_map"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": True,
+            "ctas_per_sm": 2,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_train_90351ecca30604957251",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_90351ecca30604957251",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": True,
+            "dynamic_smem_bytes": 82944,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_90351ecca30604957251",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dw": "dw",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_map": "dy",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "partial": "partial",
+            "search_steps": "search_steps",
+            "w": "w",
+            "x": "x",
+            "x_map": "x",
+        },
+        "role": "bwd",
+        "select_rule": {
+            "channels": {
+                "sm_100a": 512,
+                "sm_103a": 512,
+                "sm_107a": 1024,
+            },
+            "kind": "channels_at_least",
+        },
+        "workspace_rule": {
+            "kind": "partial_rows",
+            "taps": 4,
+        },
+    },
 }
 
 ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_100a": {
         "bwd": [
             "cake_causal_conv1d_train_21cc8e5b2b49282a47ef",
+            "cake_causal_conv1d_train_90351ecca30604957251",
         ],
         "fwd": [
             "cake_causal_conv1d_train_f193c5247980992f4f81",
@@ -308,6 +391,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_103a": {
         "bwd": [
             "cake_causal_conv1d_train_21cc8e5b2b49282a47ef",
+            "cake_causal_conv1d_train_90351ecca30604957251",
         ],
         "fwd": [
             "cake_causal_conv1d_train_f193c5247980992f4f81",
@@ -316,6 +400,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_107a": {
         "bwd": [
             "cake_causal_conv1d_train_a93b636beb1d573942bf",
+            "cake_causal_conv1d_train_90351ecca30604957251",
         ],
         "fwd": [
             "cake_causal_conv1d_train_f193c5247980992f4f81",
