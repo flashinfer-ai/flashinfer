@@ -30,6 +30,7 @@ PACKAGES: dict[str, str] = {
     "cake_nvfp4_svdquant_gemm": "flashinfer.cake_nvfp4_svdquant_gemm_backend",
     "cake_fused_qk_rope_fp8_append": "flashinfer.cake_fused_qk_rope_fp8_append_backend",
     "nvfp4_attention": "flashinfer.experimental.nvfp4_attention",
+    "cake_vsa_sm90": "flashinfer.cake_vsa_sm90_backend",
 }
 
 
