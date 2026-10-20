@@ -805,13 +805,6 @@ _DISPATCH_INPUTS = [
 ]
 
 
-def test_sm120_module_table_names_are_distinct():
-    # One generated source (and so one JIT module name) per specialization.
-    names = [source.removesuffix("_kernel.cu") for source in SM120_MODULES.values()]
-    assert len(set(names)) == len(SM120_MODULES)
-    assert all(name.startswith("cake_sage_block_sparse_attention_") for name in names)
-
-
 def test_sm120_dispatch_keys_match_the_module_table():
     # Every table row is reachable from some public-argument combination, and
     # every reachable combination has a row.

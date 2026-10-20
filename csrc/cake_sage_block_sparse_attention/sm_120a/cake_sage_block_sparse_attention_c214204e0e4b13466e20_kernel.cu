@@ -14,6 +14,32 @@
  * limitations under the License.
  */
 
+// Exporter output, hand-folded here pending exporter support: the module text is
+// selected by per-module compile definitions. CAKE_SAGE_SM120_KERNEL names the kernel
+// symbol of the module being built; the five CAKE_SAGE_* flag macros below select the
+// specialization of the metadata flags (HAS_BLOCK_NUMS, BLOCK_SIZES_MODE 0-3,
+// FULL_K64_TILES, UNIFORM_NONEMPTY, CONTIGUOUS_BLOCK_INDICES) whose text is compiled.
+// Every default below describes the (0, 0, 0, 0, 0) specialization, whose text this
+// file carries verbatim outside the conditional arms.
+#ifndef CAKE_SAGE_SM120_KERNEL
+#define CAKE_SAGE_SM120_KERNEL kernel_cake_sage_block_sparse_attention_c214204e0e4b13466e20
+#endif
+#ifndef CAKE_SAGE_HAS_BLOCK_NUMS
+#define CAKE_SAGE_HAS_BLOCK_NUMS 0
+#endif
+#ifndef CAKE_SAGE_BLOCK_SIZES_MODE
+#define CAKE_SAGE_BLOCK_SIZES_MODE 0
+#endif
+#ifndef CAKE_SAGE_FULL_K64_TILES
+#define CAKE_SAGE_FULL_K64_TILES 0
+#endif
+#ifndef CAKE_SAGE_UNIFORM_NONEMPTY
+#define CAKE_SAGE_UNIFORM_NONEMPTY 0
+#endif
+#ifndef CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+#define CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES 0
+#endif
+
 typedef signed char int8_t;
 typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
@@ -115,8 +141,7 @@ __device__ __forceinline__ void tma_store_5d(const void* tmap, int x, int y, int
 
 extern "C" {
 
-__global__
-__launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0e4b13466e20(
+__global__ __launch_bounds__(128, 3) void CAKE_SAGE_SM120_KERNEL(
     const __grid_constant__ CUtensorMap Q_map, const __grid_constant__ CUtensorMap K_map,
     const __grid_constant__ CUtensorMap V_map, const __grid_constant__ CUtensorMap O_map,
     float* __restrict__ q_scale, float* __restrict__ k_scale, float* __restrict__ v_scale,
@@ -176,6 +201,11 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0
   int q_base = q_block * 64;
   int metadata_row = (batch * num_heads + head) * ((seqlen_q + 64 - 1) / 64) + q_block;
   int selected_count = block_sparse_num;
+#if CAKE_SAGE_HAS_BLOCK_NUMS
+  {
+    selected_count = q2k_block_nums[metadata_row];
+  }
+#endif
   int index_base = metadata_row * q2k_capacity;
   if (warp == 0 && lane == 0 && q_block == 0) {
     asm volatile("prefetch.tensormap [%0];" ::"l"((uint64_t)((&Q_map))) : "memory");
@@ -202,6 +232,51 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0
   }
   int first_physical = 0;
   {
+#if CAKE_SAGE_UNIFORM_NONEMPTY && CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+    {
+      if (lane == 0) {
+        first_physical = q2k_block_index[index_base + selected_count - 1];
+      }
+      int _shfl_0 = __shfl_sync(0xFFFFFFFF, first_physical, 0);
+      first_physical = _shfl_0;
+    }
+    if (warp == 0) {
+      if (elect_sync()) {
+        mbarrier_arrive_expect_tx(k_full_addr, 8192);
+        asm volatile(
+            "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+            " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::"r"(k_smem_addr),
+            "l"((&K_map)), "r"(0), "r"(first_physical * 64), "r"(head), "r"(batch),
+            "r"(k_full_addr), "l"(0x14F0000000000000ULL)
+            : "memory");
+        mbarrier_arrive_expect_tx(v_full_addr, 8192);
+        asm volatile(
+            "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+            " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::"r"(v_tma_smem_addr),
+            "l"((&V_map)), "r"(first_physical * 64), "r"(0), "r"(head), "r"(batch),
+            "r"(v_full_addr), "l"(0x14F0000000000000ULL)
+            : "memory");
+#elif CAKE_SAGE_UNIFORM_NONEMPTY
+    {
+      first_physical = q2k_block_index[index_base + selected_count - 1];
+    }
+    if (warp == 0) {
+      if (elect_sync()) {
+        mbarrier_arrive_expect_tx(k_full_addr, 8192);
+        asm volatile(
+            "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+            " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::"r"(k_smem_addr),
+            "l"((&K_map)), "r"(0), "r"(first_physical * 64), "r"(head), "r"(batch),
+            "r"(k_full_addr), "l"(0x14F0000000000000ULL)
+            : "memory");
+        mbarrier_arrive_expect_tx(v_full_addr, 8192);
+        asm volatile(
+            "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+            " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::"r"(v_tma_smem_addr),
+            "l"((&V_map)), "r"(first_physical * 64), "r"(0), "r"(head), "r"(batch),
+            "r"(v_full_addr), "l"(0x14F0000000000000ULL)
+            : "memory");
+#else
     if (selected_count > 0) {
       first_physical = q2k_block_index[index_base + selected_count - 1];
       if (warp == 0) {
@@ -223,6 +298,7 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0
               "r"(v_full_addr), "l"(0x14F0000000000000ULL)
               : "memory");
         }
+#endif
       }
     }
   }
@@ -664,6 +740,7 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0
     float k_scale_value = _shfl_2;
     float score_scale_log2 = q_softmax_log2 * k_scale_value;
     int valid_tokens = 64;
+#if !CAKE_SAGE_FULL_K64_TILES
     {
       valid_tokens = seqlen_k - current_physical * 64;
       if (valid_tokens > 64) {
@@ -673,18 +750,51 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_c214204e0
         valid_tokens = 0;
       }
       {
+#if CAKE_SAGE_BLOCK_SIZES_MODE == 1
+        int _min_0 =
+            ((valid_tokens) < (block_sizes[current_physical]) ? (valid_tokens)
+                                                              : (block_sizes[current_physical]));
+        valid_tokens = _min_0;
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 2
+        {
+          int _min_1 = ((valid_tokens) < (block_sizes[batch * num_k_blocks + current_physical])
+                            ? (valid_tokens)
+                            : (block_sizes[batch * num_k_blocks + current_physical]));
+          valid_tokens = _min_1;
+        }
+#elif CAKE_SAGE_BLOCK_SIZES_MODE == 3
+        {
+          {
+            int _min_2 =
+                ((valid_tokens) <
+                         (block_sizes[(batch * num_heads + head) * num_k_blocks + current_physical])
+                     ? (valid_tokens)
+                     : (block_sizes[(batch * num_heads + head) * num_k_blocks + current_physical]));
+            valid_tokens = _min_2;
+          }
+        }
+#else
         {
         }
+#endif
       }
       if (valid_tokens < 0) {
         valid_tokens = 0;
       }
     }
+#endif
     int preload_count = load_count + 1;
     int next_physical = 0;
     if (preload_count < selected_count) {
       {
+#if CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES
+        next_physical = current_physical - 1;
+        if (next_physical < 0) {
+          next_physical = next_physical + num_k_blocks;
+        }
+#else
         next_physical = q2k_block_index[index_base + selected_count - 1 - preload_count];
+#endif
       }
       __syncthreads();
       if (warp == 0) {
