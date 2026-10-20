@@ -197,6 +197,9 @@ from .jit.cake_fused_qk_rope_fp8_append import (
     # Aliased to the gen_*_modules form the CPU AOT tests stub by name.
     aot_specs as gen_cake_fused_qk_rope_fp8_append_aot_modules,
 )
+from .jit.cake_grouped_mxfp8_quantize import (
+    aot_specs as gen_cake_grouped_mxfp8_quantize_aot_modules,
+)
 from .jit.mla_kv_pack import gen_mla_kv_pack_fp8_module
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
@@ -783,6 +786,14 @@ def gen_all_modules(
         jit_specs.extend(gen_cake_minimax_h3_qkv_quantize_pack_aot_modules("sm_100a"))
     if has_sm103a_exact:
         jit_specs.extend(gen_cake_minimax_h3_qkv_quantize_pack_aot_modules("sm_103a"))
+
+    # Cake grouped MXFP8 quantize (backend="cake" of mxfp8_grouped_quantize):
+    # the bfloat16 and float16 programs, one library each per exact Blackwell
+    # target; the loader spells the targets "sm_100a" / "sm_103a".
+    if has_sm100a_exact:
+        jit_specs.extend(gen_cake_grouped_mxfp8_quantize_aot_modules("sm_100a"))
+    if has_sm103a_exact:
+        jit_specs.extend(gen_cake_grouped_mxfp8_quantize_aot_modules("sm_103a"))
 
     # Register the physical source-closed portfolio independently for each
     # exact Blackwell target. Each JitSpec contains one generated selector TU.
