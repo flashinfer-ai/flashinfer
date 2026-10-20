@@ -596,18 +596,20 @@ def test_producer_key_grammar():
     """Producer route keys: ``producer_bn<bn>[_pair][_<variant>][_fold<phase>]``; ``parse_producer_key`` is the
     inverse and refuses every other spelling."""
 
-    assert loader.PRODUCER_VARIANTS == ("", "ow256", "bulk_ow256")
+    assert loader.PRODUCER_VARIANTS == ("", "ow256", "bulk_ow256", "bulk")
     assert loader.SHIPPED_VARIANT == ""
     assert loader.PRODUCER_VARIANT_OPERAND_LOAD_WIDTH == {
         "": 128,
         "ow256": 256,
         "bulk_ow256": 256,
+        "bulk": 128,
     }
     assert loader.producer_key(256, True) == "producer_bn256_pair"
     assert loader.producer_key(128, False) == "producer_bn128"
     assert (
         loader.producer_key(256, True, "bulk_ow256") == "producer_bn256_pair_bulk_ow256"
     )
+    assert loader.producer_key(256, True, "bulk") == "producer_bn256_pair_bulk"
     assert loader.producer_key(128, False, "ow256") == "producer_bn128_ow256"
     assert loader.fold_producer_key(128, True, 1) == "producer_bn128_pair_fold1"
     assert loader.fold_producer_key(256, False, 0) == "producer_bn256_fold0"
@@ -618,6 +620,10 @@ def test_producer_key_grammar():
     assert (
         loader.fold_producer_key(256, True, 0, "bulk_ow256")
         == "producer_bn256_pair_bulk_ow256_fold0"
+    )
+    assert (
+        loader.fold_producer_key(256, True, 1, "bulk")
+        == "producer_bn256_pair_bulk_fold1"
     )
     parse = loader.parse_producer_key
     for block_n in plans.BLOCK_N_CHOICES:
@@ -663,8 +669,8 @@ def test_producer_variant_default_table():
         "sm_90a": {2: "", 4: "", 8: ""},
         "sm_100a": {2: "", 4: "ow256", 8: "bulk_ow256"},
         "sm_103a": {2: "", 4: "ow256", 8: "ow256"},
-        # SM107 ships the baseline build only (no variant measured there)
-        "sm_107a": {2: "", 4: "", 8: ""},
+        # SM107: groups of 4 ranks run the bulk-row-store build (measured there); 2 ranks the baseline build
+        "sm_107a": {2: "", 4: "bulk", 8: ""},
     }
     assert set(table) == set(loader.ARCH_FLAGS) == set(loader.ROUTES)
     for arch, row in table.items():
@@ -753,7 +759,7 @@ def test_producer_variant_resolution(monkeypatch):
                             resolve(arch, world_size, block_n)
                 monkeypatch.setenv(env, "shipped")
                 assert resolve(arch, world_size, block_n) == ("", "env")
-                for name in ("ow256", "bulk_ow256"):
+                for name in ("ow256", "bulk_ow256", "bulk"):
                     monkeypatch.setenv(env, name)
                     if name in delivered:
                         assert resolve(arch, world_size, block_n) == (name, "env")
@@ -1659,7 +1665,8 @@ def _run_worker(rank, world_size, port):
         # 8. The two opt-outs -- the baseline producer build (``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT=shipped``)
         #    and the baseline group scaling (``FLASHINFER_QKV_EXCHANGE_GROUP_M_SCALE=1``) -- against the
         #    (architecture, world size) defaults: bitwise-equal outputs; the bound producer programs differ exactly
-        #    where the default build is a variant, whose wide operand loads refuse a misaligned ``cos_sin`` view.
+        #    where the default build is a variant; a wide-load default (operand load width 256) additionally refuses a
+        #    misaligned ``cos_sin`` view.
         batch, s_local = 1, 512
         x, w_qkv, q_scale, k_scale, cos_sin = _operands(
             device, batch=batch, s_local=s_local, hidden=hidden, seed=41 + rank
