@@ -1408,9 +1408,12 @@ def _resolve_decode_launch_spec(
                 share_pattern_across_kv_heads=share_pattern_across_kv_heads,
             )
         else:
-            config_overrides = {"use_pdl": use_pdl}
+            config_overrides: dict[str, object] = {"use_pdl": use_pdl}
             if use_packed_q:
                 config_overrides["use_variable_seqlens_q"] = True
+            if query_paired is False:
+                # The grouped-Q cost model may pair Q tiles unless told not to.
+                config_overrides["query_paired"] = False
             cfg = make_config(config_overrides)
 
             # A grouped fixed-Q launch can leave most of the first service wave
@@ -3741,9 +3744,9 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
         Independent of packed/fixed Q. Match workspace sizing's value.
     query_paired : bool, optional
         Run two consecutive grouped Keeps Q128 tiles of one request and KV
-        head per CTA over one K/V stream when the launch supports it (True);
-        ``None`` (default) and False plan unpaired. Match workspace sizing's
-        value.
+        head per CTA over one K/V stream when the launch supports it (True),
+        never (False), or when the automatic tile selection prefers it
+        (``None``, default). Match workspace sizing's value.
 
     Returns
     -------
@@ -3929,12 +3932,14 @@ class BatchDecodePagedTSWrapper:
             frozen for the lifetime of the plan.
         query_paired : bool, optional
             Run two consecutive grouped Keeps Q128 tiles of one request and KV
-            head per CTA over one K/V stream (True) when the launch supports
-            it: an FP16, BF16 or FP8 recipe with head dim 128 (64 or 128 for
-            FP8) and no sliding window, two Q tiles in a request, and enough Q
-            tiles to fill one wave of CTAs.
-            Otherwise, and for ``None`` (default) and False, the plan runs
-            unpaired; its policy records the outcome.
+            head per CTA over one K/V stream. True pairs when the launch
+            supports it: an FP16, BF16 or FP8 recipe with head dim 128 (64 or
+            128 for FP8, which pairs only fixed-Q page-32 launches) and no
+            sliding window, two Q tiles in a request, and enough Q tiles to
+            fill one wave of CTAs. ``None`` (default) pairs when the automatic
+            tile selection for fixed multi-token page-32 launches scores the
+            paired tile cheapest; False never pairs. The plan's policy records
+            the outcome.
         validate : bool
             Validate static geometry and caller scratch. Defaults to ``True``.
             Disable only for previously validated inputs and warmed topology.
@@ -4420,8 +4425,8 @@ def batch_decode_with_paged_kv_cache(
         independently of packed/fixed query storage.
     query_paired : bool, optional
         Run two consecutive grouped Keeps Q128 tiles of one request and KV
-        head per CTA when the launch supports it (True); ``None`` (default)
-        and False plan unpaired.
+        head per CTA when the launch supports it (True), never (False), or
+        when the automatic tile selection prefers it (``None``, default).
     workspace_buffer : torch.Tensor, optional
         Zero-initialized caller-owned byte scratch; re-zero when layout inputs
         (including batch size) change. Exclusive to one in-flight launch/graph.

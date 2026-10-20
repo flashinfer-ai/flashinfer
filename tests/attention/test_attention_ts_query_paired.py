@@ -3,8 +3,9 @@
 A query-paired plan runs two consecutive Q128 tiles of one sequence and KV
 head on one CTA, each K/V instance owning a tile over the whole K/V stream.
 Dense block-sparse wrapper plans pair contiguous K/V; paged decode plans pair
-when ``query_paired=True`` and the launch qualifies. Sage recipes are covered
-in ``test_attention_ts_sage.py``.
+when ``query_paired=True`` and the launch qualifies, or when the automatic
+selection pairs a ``None`` plan. Sage recipes are covered in
+``test_attention_ts_sage.py``.
 """
 
 from __future__ import annotations
@@ -486,25 +487,23 @@ def _paged_policy(query_paired: bool | None, **changes: object) -> dict[str, obj
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize(
-    ("query_paired", "changes"),
+    "changes",
     (
-        pytest.param(None, {}, id="none-plans-unpaired"),
-        pytest.param(False, {}, id="false"),
-        pytest.param(True, {"seq_len_q": 16}, id="one-q-tile"),
-        pytest.param(True, {"batch_size": 1, "num_kv_heads": 1}, id="small-grid"),
-        pytest.param(True, {"window_left": 511}, id="sliding-window"),
-        pytest.param(True, {"head_dim": 256}, id="head-dim-256"),
+        pytest.param({"seq_len_q": 16}, id="one-q-tile"),
+        pytest.param({"batch_size": 1, "num_kv_heads": 1}, id="small-grid"),
+        pytest.param({"window_left": 511}, id="sliding-window"),
+        pytest.param({"head_dim": 256}, id="head-dim-256"),
         # Head dim 64 pairs only the paged FP8 recipe.
-        pytest.param(True, {"head_dim": 64}, id="bf16-head-dim-64"),
+        pytest.param({"head_dim": 64}, id="bf16-head-dim-64"),
     ),
 )
 def test_paged_query_paired_plans_unpaired_when_unsupported(
-    query_paired: bool | None, changes: dict[str, object]
+    changes: dict[str, object],
 ) -> None:
     """Pairing falls back to an unpaired plan and records that in the policy."""
 
     assert _paged_policy(True)["query_paired"] is True
-    assert _paged_policy(query_paired, **changes)["query_paired"] is False
+    assert _paged_policy(True, **changes)["query_paired"] is False
 
 
 def test_paged_query_paired_must_be_a_bool() -> None:
@@ -512,3 +511,46 @@ def test_paged_query_paired_must_be_a_bool() -> None:
         decode_module._resolve_decode_launch_spec(
             0, **_PAIRED_DECODE_SHAPE, query_paired="yes"
         )
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    ("changes", "model_pairs"),
+    (
+        # 8192 unpaired CTAs take twice the waves of the 4096 paired ones.
+        pytest.param({"batch_size": 64, "seq_len_q": 256}, True, id="pairs"),
+        # 1024 unpaired CTAs take seven waves; 512 paired ones still take four.
+        pytest.param({"seq_len_q": 128}, False, id="unpaired"),
+    ),
+)
+def test_paged_query_paired_none_follows_the_cost_model(
+    changes: dict[str, object], model_pairs: bool
+) -> None:
+    """None pairs when the grouped-Q cost model scores the paired tile cheapest."""
+
+    shape = {"max_kv_len": 8192, **changes}
+    assert _paged_policy(None, **shape)["query_paired"] is model_pairs
+    assert _paged_policy(True, **shape)["query_paired"] is True
+    assert _paged_policy(False, **shape)["query_paired"] is False
+
+
+def test_grouped_q_candidates_pair_keeps_q128_tiles() -> None:
+    """The paired Keeps Q128 candidate covers two Q tiles per CTA."""
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+        enumerate_grouped_q_mma_candidates,
+    )
+
+    candidates = enumerate_grouped_q_mma_candidates(
+        heads_q_per_kv=8, seq_len_q=48, query_paired=True
+    )
+    paired = [candidate for candidate in candidates if candidate.query_paired]
+    assert [(c.variant, c.tile_size_q, c.q_tiles) for c in paired] == [
+        ("keeps_mma_ab", 128, 3)
+    ]
+    assert paired[0].ctas_per_kv_head == 2
+    # One Q tile leaves nothing to pair.
+    single = enumerate_grouped_q_mma_candidates(
+        heads_q_per_kv=8, seq_len_q=16, query_paired=True
+    )
+    assert not any(candidate.query_paired for candidate in single)
