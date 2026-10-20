@@ -1015,6 +1015,7 @@ kernel_cake_kimi_k3_attn_res_a15c9b10e0c06764bb50(__nv_bfloat16* __restrict__ ou
                     }
                 }
             }
+            mbarrier_wait(output_norm_ready_addr, 0);
             asm volatile("barrier.sync 9, 288;" ::: "memory");
         }
     }
