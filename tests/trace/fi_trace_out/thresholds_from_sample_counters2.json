@@ -1,0 +1,74 @@
+{
+  "name": "thresholds_from_sample_counters2",
+  "description": "Each query row's threshold as the least of its sampled Top scores, with its threshold-select counters zeroed.",
+  "op_type": "thresholds_from_sample",
+  "tags": [
+    "fi_api:flashinfer.attn_scores.single_head.thresholds_from_sample",
+    "arch:sm100",
+    "arch:sm103"
+  ],
+  "axes": {
+    "rows": {
+      "type": "var",
+      "description": "Query rows."
+    },
+    "samples": {
+      "type": "var",
+      "description": "Sampled scores per row."
+    },
+    "rank": {
+      "type": "var",
+      "description": "Top positions per row."
+    },
+    "counters": {
+      "type": "const",
+      "value": 2,
+      "description": "Candidate and tie counts."
+    }
+  },
+  "inputs": {
+    "sample_scores": {
+      "shape": [
+        "rows",
+        "samples"
+      ],
+      "dtype": "float32"
+    },
+    "sample_top": {
+      "shape": [
+        "rows",
+        "rank"
+      ],
+      "dtype": "int32"
+    },
+    "thresholds": {
+      "shape": [
+        "rows"
+      ],
+      "dtype": "float32"
+    },
+    "counters": {
+      "shape": [
+        "rows",
+        "counters"
+      ],
+      "dtype": "int32"
+    }
+  },
+  "outputs": {
+    "thresholds": {
+      "shape": [
+        "rows"
+      ],
+      "dtype": "float32"
+    },
+    "counters": {
+      "shape": [
+        "rows",
+        "counters"
+      ],
+      "dtype": "int32"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}
