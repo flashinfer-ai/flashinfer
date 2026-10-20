@@ -37,6 +37,7 @@ gdn_prefill_qk4_v8_d128.json
 gdn_prefill_gates_q4_k4_v8_d128.json
 gdn2_prefill_qk4_v8_d128.json
 gdp_prefill_n2_qk4_v8_d128.json
+gather_key_sample_page_size64_dim128.json
 group_union_masks_top_k2048.json
 recurrent_kda_q8_v16_d128.json
 packed_kda_decode_h12_d128.json
@@ -127,6 +128,7 @@ silu_and_mul_nvfp4_quantize_k16384.json
 single_head_paged_mqa_logits_page_size64_dim128.json
 single_head_paged_mqa_logits_page_size64_dim64.json
 single_head_paged_mqa_threshold_select_page_size64_dim128_counters2_pair2.json
+thresholds_from_sample_counters2.json
 token_sparse_kv_indices_top_k2048_lists2.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
@@ -3006,9 +3008,11 @@ group_union_masks.fi_trace(
 
 # ── Single-head paged MQA logits ──────────────────────────────────────────────
 from flashinfer.attn_scores import (
+    gather_key_sample,
     quantize_write_index_k_nvfp4,
     single_head_paged_mqa_logits,
     single_head_paged_mqa_threshold_select,
+    thresholds_from_sample,
 )
 
 single_head_paged_mqa_logits.fi_trace(
@@ -3055,4 +3059,23 @@ single_head_paged_mqa_threshold_select.fi_trace(
     top_k=2048,
     arrivals=torch.zeros(2, dtype=torch.int32),
     ranges=torch.empty(2, 256, dtype=torch.int32),
+)
+
+gather_key_sample.fi_trace(
+    save_dir=SAVE_DIR,
+    key_cache=torch.empty(64, 64, 128, dtype=torch.bfloat16),
+    block_table=torch.empty(2, 32, dtype=torch.int32),
+    offsets=torch.empty(128, dtype=torch.uint8),
+    sample_ends=torch.empty(2, dtype=torch.int32),
+    sample_keys=torch.empty(2, 128, 128, dtype=torch.bfloat16),
+    samples_per_run=3,
+    pages_per_run=2,
+)
+
+thresholds_from_sample.fi_trace(
+    save_dir=SAVE_DIR,
+    sample_scores=torch.empty(256, 128),
+    sample_top=torch.empty(256, 64, dtype=torch.int32),
+    thresholds=torch.empty(256),
+    counters=torch.empty(256, 2, dtype=torch.int32),
 )

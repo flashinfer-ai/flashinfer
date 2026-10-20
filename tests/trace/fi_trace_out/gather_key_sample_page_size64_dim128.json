@@ -1,0 +1,116 @@
+{
+  "name": "gather_key_sample_page_size64_dim128",
+  "description": "A strided random sample of each request's paged BF16 or NVFP4 keys, copied into dense sample rows.",
+  "op_type": "gather_key_sample",
+  "tags": [
+    "fi_api:flashinfer.attn_scores.single_head.gather_key_sample",
+    "arch:sm100",
+    "arch:sm103"
+  ],
+  "axes": {
+    "pages": {
+      "type": "var",
+      "description": "Key cache pages."
+    },
+    "page_size": {
+      "type": "const",
+      "value": 64,
+      "description": "Keys per page."
+    },
+    "dim": {
+      "type": "const",
+      "value": 128,
+      "description": "Elements per key: 128 BF16, or 64 NVFP4 bytes."
+    },
+    "scales": {
+      "type": "var",
+      "description": "NVFP4's E4M3 scales per key, one per 16 values."
+    },
+    "requests": {
+      "type": "var",
+      "description": "Block-table rows, one sample row each."
+    },
+    "blocks": {
+      "type": "var",
+      "description": "64-key blocks per request."
+    },
+    "capacity": {
+      "type": "var",
+      "description": "Sample slots per request, in 128-key tiles."
+    }
+  },
+  "inputs": {
+    "key_cache": {
+      "shape": [
+        "pages",
+        "page_size",
+        "dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "block_table": {
+      "shape": [
+        "requests",
+        "blocks"
+      ],
+      "dtype": "int32"
+    },
+    "offsets": {
+      "shape": [
+        "capacity"
+      ],
+      "dtype": "uint8"
+    },
+    "sample_ends": {
+      "shape": [
+        "requests"
+      ],
+      "dtype": "int32"
+    },
+    "sample_keys": {
+      "shape": [
+        "requests",
+        "capacity",
+        "dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "samples_per_run": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "pages_per_run": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "key_scales": {
+      "shape": [
+        "pages",
+        "page_size",
+        "scales"
+      ],
+      "dtype": "unknown",
+      "optional": true
+    },
+    "sample_scales": {
+      "shape": [
+        "requests",
+        "capacity",
+        "scales"
+      ],
+      "dtype": "unknown",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "sample_keys": {
+      "shape": [
+        "requests",
+        "capacity",
+        "dim"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}
