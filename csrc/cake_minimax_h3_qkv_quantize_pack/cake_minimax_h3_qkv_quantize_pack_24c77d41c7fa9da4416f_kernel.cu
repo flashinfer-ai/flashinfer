@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -50,12 +50,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 256
-#ifndef P
-#error "P is a downstream specialization of this program; define it on the compile line"
-#endif
-#ifndef HEADS_PER_DESTINATION
-#error "HEADS_PER_DESTINATION is a downstream specialization of this program; define it on the compile line"
-#endif
+#define P 8
+#define HEADS_PER_DESTINATION 7
+#define LAUNCH_MIN_BLOCKS 5
 
 #include <math_constants.h>
 
@@ -65,10 +62,14 @@ __device__ __forceinline__ float approx_rcp(float x) {
     return y;
 }
 
+
+
+// ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
+
 extern "C" {
 
-__global__ __launch_bounds__(256, 5) void
-kernel_cake_minimax_h3_qkv_quantize_pack_a2de736b0ea8278e8c65(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, float* __restrict__ out_global_scale, uint8_t* __restrict__ out_q, uint8_t* __restrict__ out_sf, int M, int token_stride, int head_stride, int ROWS_PER_DESTINATION, int SCALE_STRIDE)
+__global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
+kernel_cake_minimax_h3_qkv_quantize_pack_24c77d41c7fa9da4416f(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, float* __restrict__ out_global_scale, uint8_t* __restrict__ out_q, uint8_t* __restrict__ out_sf, int M, int token_stride, int head_stride, int ROWS_PER_DESTINATION, int SCALE_STRIDE)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -154,14 +155,15 @@ kernel_cake_minimax_h3_qkv_quantize_pack_a2de736b0ea8278e8c65(__nv_bfloat16* __r
                     asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_0) : "h"((uint16_t)(_bf16_max_0)));
                     float amax = _cvt_f32_bf16_0;
                     float sf_value = global_scale * (amax * rcp_six);
-                    float _fp8_rt_0;
                     uint16_t _e4m3x2_1;
-                    uint32_t _f16x2_1;
-                    asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(sf_value));
-                    asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
-                    uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
-                    asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
-                    float sf_rounded = _fp8_rt_0;
+                    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(sf_value));
+                    uint8_t _e4m3_scalar_0 = (uint8_t)_e4m3x2_1;
+                    uint32_t _f16x2_decode_2;
+                    float _fp8_decode_0;
+                    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_2) : "h"(_e4m3x2_1));
+                    uint16_t _f16_decode_2 = (uint16_t)_f16x2_decode_2;
+                    asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_decode_0) : "h"(_f16_decode_2));
+                    float sf_rounded = _fp8_decode_0;
                     float _rcp_2 = approx_rcp(sf_rounded * global_scale_rcp);
                     float _min_0 = fminf(_rcp_2, 3.4028234663852886e+38f);
                     float output_scale = _min_0;
@@ -173,10 +175,10 @@ kernel_cake_minimax_h3_qkv_quantize_pack_a2de736b0ea8278e8c65(__nv_bfloat16* __r
                         float _cvt_f32_bf16_2;
                         asm("cvt.f32.bf16 %0, %1;" : "=f"(_cvt_f32_bf16_2) : "h"((uint16_t)(words[i_1 * 8 + j_1] >> 16)));
                         float2 _f2_1 = make_float2(_cvt_f32_bf16_1, _cvt_f32_bf16_2);
-                        float2 _mul_f32x2_0;
-                        asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_0) : "l"(*(const unsigned long long*)&_f2_1), "l"(*(const unsigned long long*)&_f2_0));
-                        quant_values[2 * j_1] = _mul_f32x2_0.x;
-                        quant_values[2 * j_1 + 1] = _mul_f32x2_0.y;
+                        float2 scaled;
+                        asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled) : "l"(*(const unsigned long long*)&_f2_1), "l"(*(const unsigned long long*)&_f2_0));
+                        quant_values[2 * j_1] = scaled.x;
+                        quant_values[2 * j_1 + 1] = scaled.y;
                     }
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed[0]) : "f"(quant_values[0]), "f"(quant_values[1]), "f"(quant_values[2]), "f"(quant_values[3]), "f"(quant_values[4]), "f"(quant_values[5]), "f"(quant_values[6]), "f"(quant_values[7]));
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed[1]) : "f"(quant_values[8]), "f"(quant_values[9]), "f"(quant_values[10]), "f"(quant_values[11]), "f"(quant_values[12]), "f"(quant_values[13]), "f"(quant_values[14]), "f"(quant_values[15]));
