@@ -33,6 +33,11 @@ Schedule phase terms follow TS schedule-builder naming. HEAD is the one-time
 schedule before the repeated K/V tile loop, LOOP is the repeated K/V tile body,
 and TAIL is the one-time cleanup and drain after LOOP exits.
 
+VC-Attention is the low-bit attention recipe of Li et al. 2026, arXiv
+2609.15810, value smoothing with a softmax cast. Names with the ``vc`` prefix
+belong to that recipe. E4M3 V is stored as residuals around each 128-token
+tile mean, which the kernel restores inside the online softmax.
+
 Feature Support Matrix:
 
   | Feature          | Support                                                                                       |
@@ -683,6 +688,8 @@ def build_context_task_manager(
     tma_k_desc: cutlass.Pointer | None,
     tma_v_desc: cutlass.Pointer | None,
     tma_o_desc: cutlass.Pointer | None,
+    tma_mu_desc: cutlass.Pointer | None = None,
+    vc_repair_tiles: int = 0,
     cum_seqlen_q: cute.Tensor | None,
     cum_seqlen_k: cute.Tensor | None,
     variable_window_token_starts: cute.Tensor | None = None,
@@ -695,8 +702,6 @@ def build_context_task_manager(
     block_table_row_stride: int | Int32 = 0,
     g_seq_lens_kv: cute.Pointer | None = None,
     max_seq_len_kv: int | Int32 | None = None,
-    tma_mu_desc: cutlass.Pointer | None = None,
-    vc_repair_tiles: int = 0,
     num_kv_tiles: int | Int32,
     q_offset: int | Int32,
     domain_n_kwargs: DomainKwargs,
@@ -743,6 +748,12 @@ def build_context_task_manager(
         TMA descriptor pointers for Q, K, V, O.
     cum_seqlen_q, cum_seqlen_k : cute.Tensor, optional
         Cumulative sequence-length metadata for varlen launches.
+    tma_mu_desc : cutlass.Pointer, optional
+        TMA descriptor of the VC-Attention tile-mean operands, the B operand of
+        the mean UMMA step. None unless the kernel restores means.
+    vc_repair_tiles : int
+        VC-Attention repair tiles appended to the K/V sequence, kept out of
+        the softmax denominator. Zero without V repair.
     num_kv_tiles : int or Int32
         Number of KV tiles in the loop domain.
     q_offset : int or Int32
@@ -1088,9 +1099,13 @@ def build_context_task_manager(
             name="smem_v",
             **kv_resource_kwargs,
         )
-    # Mu is the per-tile mean of V. It is a UMMA operand like K and V,
-    # so it must sit in shared memory. The load warp stages it beside
-    # each V tile and the UMMA warp consumes it.
+    # Mu is the per-tile mean of V. V tile t is stored as E4M3 residuals
+    # V8_t = V_t - mu_t, so the PV product splits into
+    #   O = sum_t P_t V8_t + sum_t rowsum(P_t) mu_t
+    # and the second term is a bf16 K=16 UMMA per group of sixteen tiles with
+    # the row sums as A and the means as B. Mu is therefore a UMMA operand
+    # like K and V and must sit in shared memory. The load warp stages it
+    # beside each V tile and the UMMA warp consumes it.
     smem_mu: SmemMuResource | None = None
     if cfg.vc_restores_means:
         smem_mu_pipeline_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
@@ -2030,7 +2045,7 @@ def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
     if cfg.vc_restores_means and n_stages < 2:
         # The tail holds the last two tile-mean operands at once.
         raise ValueError(
-            f"VC-Attention-QK16 needs at least 2 stages per K/V ring, but the "
+            f"VC-Attention needs at least 2 stages per K/V ring, but the "
             f"shared-memory budget of {budget_bytes} bytes fits only {n_stages}"
         )
     cfg.kv_stage_k = n_stages
@@ -2723,6 +2738,8 @@ def build_fmha_task_manager(
         tma_k_desc=tma_k_desc,
         tma_v_desc=tma_v_desc,
         tma_o_desc=tma_o_desc,
+        tma_mu_desc=tma_mu_desc,
+        vc_repair_tiles=vc_repair_tiles,
         cum_seqlen_q=cum_seqlen_q,
         cum_seqlen_k=cum_seqlen_k,
         variable_window_token_starts=variable_window_token_starts,
@@ -2735,8 +2752,6 @@ def build_fmha_task_manager(
         block_table_row_stride=block_table_row_stride,
         g_seq_lens_kv=g_seq_lens_kv,
         max_seq_len_kv=max_seq_len_kv,
-        tma_mu_desc=tma_mu_desc,
-        vc_repair_tiles=vc_repair_tiles,
         num_kv_tiles=domain_num_kv_tiles,
         q_offset=effective_q_offset,
         domain_n_kwargs=domain_policy.domain_n_kwargs,
@@ -2967,7 +2982,7 @@ class FmhaTs:
             cfg.num_regs_correction = 88
             cfg.num_regs_other = 56
         cfg.enable_skip_correction = enable_skip_correction
-        # VC-Attention-QK16 skips no correction. The skip keeps a stale row max,
+        # VC-Attention skips no correction. The skip keeps a stale row max,
         # under which a larger score codes past VC_EXPCAST_CODE_BIAS and out of
         # the E4M3 range. The exact per-tile max keeps every code at or below it.
         if enable_skip_correction and not cfg.vc_attention:
@@ -3140,7 +3155,7 @@ class FmhaTs:
     ) -> None:
         """Set up TMA descriptors, compute grid, and launch the kernel.
 
-        VC-Attention-QK16 adds two inputs. The tile means are the bf16 UMMA
+        VC-Attention adds two inputs. The tile means are the bf16 UMMA
         operands packed by the host, sixteen tiles per group. The repair tile
         count is a compile-time constant giving how many outlier tiles end
         the K/V loop of an outlier plan.
@@ -3365,11 +3380,11 @@ class FmhaTs:
                 l2_promotion=cuda.TensorMapL2Promotion.none,
             )
 
-        # VC-Attention-QK16 tile-mean operands, one packed tile per K/V tile.
+        # VC-Attention tile-mean operands, one packed tile per K/V tile.
         tma_mu_desc = tma_v_desc
         if cutlass.const_expr(cfg.vc_restores_means):
             if cutlass.const_expr(vc_mu is None):
-                raise ValueError("VC-Attention-QK16 requires vc_mu")
+                raise ValueError("VC-Attention requires vc_mu")
             mu_rows, mu_cols = vc_mean_operand_shape(cfg.pv_mma_tiler[1])
             tma_mu_desc = cuda.create_tensor_map_tiled_from_view(
                 vc_mu,
@@ -3472,6 +3487,7 @@ class FmhaTs:
             tma_k_desc,
             tma_v_desc,
             tma_o_desc,
+            tma_mu_desc,
             tile_sched_params,
             scale_softmax_log2,
             output_scale,
@@ -3488,7 +3504,6 @@ class FmhaTs:
             variable_window_token_ends,
             variable_window_cta_starts,
             Int32(s_q),
-            tma_mu_desc,
             vc_repair_tiles,
             self.is_persistent,
             self.is_clc_dynamic,
@@ -3510,6 +3525,7 @@ class FmhaTs:
         tma_k_desc: cutlass.GridConstant[cuda.TensorMap],
         tma_v_desc: cutlass.GridConstant[cuda.TensorMap],
         tma_o_desc: cutlass.GridConstant[cuda.TensorMap],
+        tma_mu_desc: cutlass.GridConstant[cuda.TensorMap],
         tile_sched_params: (
             utils.PersistentTileSchedulerParams
             | utils.ClcDynamicPersistentTileSchedulerParams
@@ -3530,7 +3546,6 @@ class FmhaTs:
         variable_window_token_ends: cute.Tensor | None,
         variable_window_cta_starts: cute.Tensor | None,
         variable_window_q_stride: Int32,
-        tma_mu_desc: cutlass.GridConstant[cuda.TensorMap],
         vc_repair_tiles: cutlass.Constexpr[int] = 0,
         is_persistent: cutlass.Constexpr[bool] = True,
         is_clc_dynamic: cutlass.Constexpr[bool] = False,

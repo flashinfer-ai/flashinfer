@@ -23,7 +23,7 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 
 | Kernel | Guide | Public APIs |
 | --- | --- | --- |
-| FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md), [VC-Attention-QK16](#vc-attention-qk16) below | `BatchPrefillTSWrapper`, `batch_prefill`, `VCAttentionConfig`, `VCAttentionParams`, `VCAttentionPreprocessor`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache` |
+| FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md), [VC-Attention](#vc-attention) below | `BatchPrefillTSWrapper`, `batch_prefill`, `VCAttentionConfig`, `VCAttentionParams`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache` |
 | FMHA decode | [Task-Scheduled FMHA Decode](kernels/fmha_decode/README.md) | `BatchDecodePagedTSWrapper`, `batch_decode_with_paged_kv_cache`, `get_prims_ts_batch_decode_workspace_size`, `prepare_prims_ts_batch_decode_with_kv_cache` |
 | QToken-KvBlock-Sparse-Attention | [Packed-prefill and fixed-decode example](https://github.com/PerkzZheng/prims-ts-examples/blob/main/q_token_kv_block_sparse_attention.py) | `QTokenKvBlockSparsePagedTSWrapper`, `q_token_kv_block_sparse_attention_with_paged_kv_cache`, `get_q_token_kv_block_sparse_workspace_size`, `suggest_q_token_kv_block_sparse_group_size`, `validate_q_token_kv_block_sparse_group_size`, `make_q_token_kv_block_sparse_qo_indptr` |
 | Block-sparse FMHA | [Sage attention](#sage-attention) below | `BlockSparseTSWrapper`, `block_sparse_attention`, `SageAttentionConfig`, `SageAttentionParams`; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
@@ -453,9 +453,9 @@ out = wrapper.run(
 its recipe is `sage_config` or, when omitted, the default recipe with a V mean
 exactly when `sage.v_mean` is set.
 
-## VC-Attention-QK16
+## VC-Attention
 
-VC-Attention-QK16, a bf16 Q/K adaptation of
+VC-Attention, an adaptation of
 [Li et al., 2026](https://arxiv.org/html/2609.15810v1), runs the dense
 fixed-length context kernel (`BatchPrefillTSWrapper` and `batch_prefill`) with
 bf16 Q and K, E4M3 V with value smoothing, and a direct probability cast.
@@ -477,7 +477,9 @@ operands with the paper's V-Smooth schedule: grouping and demeaning run on the
 first `smooth_step_fraction` of the denoising steps, the permutation is
 refreshed every `perm_refresh_every` steps inside that window and kept
 afterwards. `vc_quantize` runs the same preparation without the schedule, and
-`vc_reference` is its torch reference.
+`vc_reference` is its torch reference. The `vc_attention` package holds the
+operand contract, the quantizer in `quantization` and its CuTe DSL kernels in
+`prepare`.
 
 | Input | Supported values |
 | --- | --- |

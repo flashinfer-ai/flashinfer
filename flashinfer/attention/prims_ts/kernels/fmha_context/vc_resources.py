@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""VC-Attention-QK16 operands and helpers of the context kernel.
+"""VC-Attention operands and helpers of the context kernel.
 
-VC-Attention-QK16 stores E4M3 V as residuals around the bf16 mean of each
+VC-Attention stores E4M3 V as residuals around the bf16 mean of each
 128-token K/V tile and restores the mean inside the online softmax with one
 bf16 K=16 UMMA step per tile, ``O += rowsum(P_tile) * mean_tile``.
 :class:`SmemMuResource` is the TMA-fed ring of the ``mean_tile`` operands. The
-ExpCast helpers code the probabilities directly as E4M3 bytes and accumulate
-the quantized row sums that become the step's A operand.
+ExpCast helpers in ``helpers`` code the probabilities directly as E4M3 bytes
+and accumulate the quantized row sums that become the step's A operand.
 The resources in ``fmha_resources`` own the row-sum operand (behind the
 SMEM P tile), the exp2 and store paths and the mean UMMA issue.
 """
@@ -30,7 +30,7 @@ from typing import Any, Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float16, Float32, Int16, Int32, Uint32
+from cutlass import Int16, Int32
 from cutlass.cutlass_dsl import Constexpr
 from cutlass.experimental import primitives as prims
 from cutlass.experimental.task_scheduling.enums import WorkAttr
@@ -46,13 +46,13 @@ from cutlass.experimental.task_scheduling.resources import (
 
 from ..placeholder_helpers import _placeholder_smem_array
 
-# VC-Attention-QK16 mean-restore operands of the bf16 K=16 UMMA step that adds
+# VC-Attention mean-restore operands of the bf16 K=16 UMMA step that adds
 # ``rowsum(P_tile) * mean_tile`` into O. Unswizzled K-major 32-byte rows with
 # LBO 128 between the two K core matrices and SBO 256 between 8-row groups.
 VC_MEAN_TILE_LBO = 128
 VC_MEAN_TILE_SBO = 256
 
-# ExpCast-FP8 (VC-Attention-QK16). An E4M3 byte read as an integer equals
+# ExpCast-FP8 (VC-Attention). An E4M3 byte read as an integer equals
 # ``8*log2(v) + 56 + eps``. With ``u`` the log2-domain probability and the
 # paper's 2^8 P scaling, ``code = round(8*u + VC_EXPCAST_CODE_BIAS)`` replaces
 # exp2 and the E4M3 cast by one FMA. beta is the paper's centering of
@@ -67,86 +67,8 @@ VC_EXPCAST_CODE_BIAS = (
 )
 
 
-@cute.jit
-def _split_bf16_hi_lo_word(value: Float32) -> Int32:
-    """Pack ``value`` as two bf16 halves: low 16 bits = truncated high part,
-    high 16 bits = truncated remainder ``value - hi``."""
-    bits = cutlass.Vector.from_elements((value,), Float32).bitcast(Uint32)[0]
-    hi_bits = bits >> Uint32(16)
-    hi = cutlass.Vector.from_elements((hi_bits << Uint32(16),), Uint32).bitcast(
-        Float32
-    )[0]
-    lo_bits = cutlass.Vector.from_elements((value - hi,), Float32).bitcast(Uint32)[0]
-    word = hi_bits | (lo_bits & Uint32(0xFFFF0000))
-    return cutlass.Vector.from_elements((word,), Uint32).bitcast(Int32)[0]
-
-
-@cute.jit
-def _expcast_e4m3_quad_relu(
-    c0: Float32,
-    c1: Float32,
-    c2: Float32,
-    c3: Float32,
-    acc01: Int32,
-    acc23: Int32,
-    init: Constexpr[bool],
-) -> tuple[Int32, Int32, Int32]:
-    """ExpCast four unclamped codes into one packed E4M3 word and accumulate
-    their values into two f16x2 row-sum registers.
-
-    With ``init`` the quad starts a chain and the accumulators are ignored. The
-    returned sums are then the quantized values themselves.
-
-    ``c = 8 * (s * scale - m) + VC_EXPCAST_CODE_BIAS``
-
-    ``cvt.rn.relu.f16x2.f32`` packs a pair and clamps underflow to code 0, an
-    f16 FMA adds 1024 so the low byte of each half is the rounded code, one
-    ``prmt`` gathers the four bytes, and the E4M3-pair to f16x2 conversion
-    with one f16 FMA per pair accumulates the quantized values.
-    """
-    sum_pair = (
-        "mov.b32 {$w1}, v01;\n            mov.b32 {$w2}, v23;"
-        if init
-        else "fma.rn.f16x2 {$w1}, v01, one2, {$r4};\n"
-        "            fma.rn.f16x2 {$w2}, v23, one2, {$r5};"
-    )
-    return cute.arch.inline_ptx(
-        """
-        {
-            .reg .b32 h01, h23, y01, y23, v01, v23, one2, k1024;
-            .reg .b16 c01, c23;
-            mov.b32 one2, 0x3C003C00;
-            mov.b32 k1024, 0x64006400;
-            cvt.rn.relu.f16x2.f32 h01, {$r1}, {$r0};
-            cvt.rn.relu.f16x2.f32 h23, {$r3}, {$r2};
-            fma.rn.f16x2 y01, h01, one2, k1024;
-            fma.rn.f16x2 y23, h23, one2, k1024;
-            prmt.b32 {$w0}, y01, y23, 0x6420;
-            mov.b32 {c01, c23}, {$w0};
-            cvt.rn.f16x2.e4m3x2 v01, c01;
-            cvt.rn.f16x2.e4m3x2 v23, c23;
-            """
-        + sum_pair
-        + """
-        }""",
-        write_only_types=[Int32, Int32, Int32],
-        read_only_args=[c0, c1, c2, c3, acc01, acc23],
-    )
-
-
-@cute.jit
-def _f16x2_sum4(a0: Int32, a1: Int32, a2: Int32, a3: Int32) -> Float32:
-    """fp32 sum of the eight fp16 halves of four f16x2 registers."""
-    f = []
-    for word in (a0, a1, a2, a3):
-        halves = cutlass.Vector.from_elements((word,), Int32).bitcast(Float16)
-        f.append(halves[0].to(Float32))
-        f.append(halves[1].to(Float32))
-    return ((f[0] + f[1]) + (f[2] + f[3])) + ((f[4] + f[5]) + (f[6] + f[7]))
-
-
 # ---------------------------------------------------------------------------
-# SmemMuResource -- VC-Attention-QK16 bf16 tile-mean operand ring
+# SmemMuResource -- VC-Attention bf16 tile-mean operand ring
 # ---------------------------------------------------------------------------
 @dataclass(kw_only=True)
 class SmemMuResource(MemoryResource):
@@ -292,34 +214,20 @@ class SmemMuResource(MemoryResource):
         kv_head_coord: Int32,
         batch_coord: Int32,
         kv_tile_start: Int32,
+        is_tail: Constexpr[bool] = False,
     ) -> None:
         """TMA-load the mean operand of the group holding K/V tile ``loop_offset - 1``.
 
         A group's mean step is issued one tile late, beside PV of the tile after
-        the group, so the ring runs one tile behind V.
+        the group, so the ring runs one tile behind V. The tail call loads the
+        group of the last tile for the tail mean step.
         """
-        tile_idx = cute.math.max(
-            kv_tile_start + stage_info.loop_offset - Int32(1), Int32(0)
-        )
-        self._tma_load_tile(
-            stage_info,
-            tile_idx // Int32(VC_MEAN_GROUP_TILES),
-            kv_head_coord,
-            batch_coord,
-        )
-
-    @producer_work
-    @cute.jit
-    def mu_load_last(
-        self,
-        stage_info: StageInfo,
-        *,
-        kv_head_coord: Int32,
-        batch_coord: Int32,
-        kv_tile_start: Int32,
-    ) -> None:
-        """TMA-load the mean operand of the last group for the tail mean step."""
-        tile_idx = kv_tile_start + Int32(stage_info.loop_end) - Int32(1)
+        if cutlass.const_expr(is_tail):
+            tile_idx = kv_tile_start + Int32(stage_info.loop_end) - Int32(1)
+        else:
+            tile_idx = cute.math.max(
+                kv_tile_start + stage_info.loop_offset - Int32(1), Int32(0)
+            )
         self._tma_load_tile(
             stage_info,
             tile_idx // Int32(VC_MEAN_GROUP_TILES),

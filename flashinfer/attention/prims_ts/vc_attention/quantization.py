@@ -12,32 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""VC-Attention-QK16 host-side preprocessing for the prims_ts context kernel.
+"""VC-Attention quantization of K and V for the prims_ts context kernel.
 
-VC-Attention-QK16 adds two changes on the value side of attention: a token
+VC-Attention adds two changes on the value side of attention: a token
 permutation that groups similar value rows into the same 128-token K/V tile,
 and per-tile value smoothing. Each V tile is stored as E4M3 residuals around
-its tile mean; the kernel restores the mean inside the online softmax as
-``O += rowsum(P_tile) * mean_tile`` (one bf16 K=16 UMMA step per tile), so the
-residual quantization error no longer carries the value DC component. This
-variant keeps Q and K in bf16. Only P and V are E4M3.
+its tile mean and the kernel restores the mean inside the online softmax, so
+the residual quantization error no longer carries the value DC component.
 
-This module provides the preprocessing:
+* ``vc_token_permutation`` runs an online k-means over value rows, one
+  permutation per batch and head, applied to K and V. Attention is invariant
+  to a common key and value permutation.
+* ``vc_quantize`` permutes K, subtracts the V tile means, quantizes the
+  residuals per channel to E4M3 and packs the kernel operands with the CuTe
+  DSL kernels of ``prepare``.
+* ``vc_quantize_repair`` writes V repair rows instead of tile means.
+* ``VCAttentionPreprocessor`` applies the paper's V-Smooth schedule over the
+  denoising steps on top of ``vc_quantize``.
 
-* ``vc_token_permutation`` -- online k-means over value rows, one
-  permutation per (batch, head), applied to K and V (attention is invariant to
-  a common key/value permutation);
-* ``vc_quantize`` -- K permutation, V tile-mean subtraction, per-channel
-  E4M3 residual quantization, and the packed kernel operands, as two CuTe DSL
-  kernels;
-* ``vc_quantize_repair`` -- V repair rows instead of tile means;
-* ``VCAttentionPreprocessor`` -- the paper's V-Smooth schedule over the
-  denoising steps on top of ``vc_quantize``;
-* ``vc_reference`` -- the fp32 attention over the dequantized operands.
-
-The kernel takes the means and the per-channel V scale through
-``BatchPrefillTSWrapper.run`` (``vc=VCAttentionParams(...)``), which folds the
-scale into ``output_scale``.
+The operand contract the kernel consumes is defined in
+``flashinfer.attention.prims_ts.vc_attention``.
 """
 
 from __future__ import annotations
@@ -47,15 +41,13 @@ from dataclasses import dataclass
 
 import torch
 
-# The K/V tile whose value mean the kernel restores, its only supported size.
-VC_K_BLOCK_SIZE = 128
-# K of the bf16 UMMA mean step, one kind::f16 K step.
-VC_MEAN_MMA_K = 16
-# Mean UMMA steps issued back to back per group of tiles; each tile takes two of a
-# step's 16 K slots (bf16 hi/lo row sum).
-VC_MEAN_OPERANDS = 2
-VC_MEAN_GROUP_TILES = VC_MEAN_OPERANDS * VC_MEAN_MMA_K // 2
-E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+from . import (
+    VC_HEAD_DIM,
+    VC_K_BLOCK_SIZE,
+    VCAttentionParams,
+    vc_repair_tiles,
+)
+
 # V-Smooth schedule. The paper groups and demeans on the first quarter of the
 # denoising steps and keeps the permutation afterwards. The refresh cadence
 # inside that window and the k-means size are not fixed by the paper. 64
@@ -68,144 +60,9 @@ VC_KMEANS_CLUSTERS = 64
 VC_KMEANS_ITERS = 3
 
 
-def vc_mean_group_shape(head_dim: int) -> tuple[int, int]:
-    """Shape of the packed mean operands of one tile group: the ``VC_MEAN_OPERANDS``
-    operands of ``vc_mean_operand_shape`` stacked along the row axis."""
-    rows, cols = vc_mean_operand_shape(head_dim)
-    return (VC_MEAN_OPERANDS * rows, cols)
-
-
-def vc_mean_operand_shape(head_dim: int) -> tuple[int, int]:
-    """Shape of one packed bf16 ``[head_dim x VC_MEAN_MMA_K]`` mean operand, in
-    rows of 256 elements (the kernel's 512-byte TMA box row)."""
-    return (head_dim * VC_MEAN_MMA_K // 256, 256)
-
-
-@dataclass(frozen=True)
-class VCAttentionConfig:
-    """Compile-time VC-Attention-QK16 recipe of one plan.
-
-    With demean on, the default, the kernel restores the tile means. Each
-    128-token K/V tile stores E4M3 residuals around its bf16 mean and the
-    kernel adds the mean back. With demean off the means are zero and the
-    kernel skips that step. This is the plan for the steps after the V-Smooth
-    window. The demean flag changes per denoising step while a plan is
-    compiled once, so a caller holds one plan of each kind.
-
-    A positive repair tile count selects V repair and needs demean off. The
-    preprocessor appends that many 128-row tiles of the largest quantization
-    residuals after the sequence and the kernel adds them to the output. Each
-    repair tile costs one extra K/V tile of attention work. Budgets of two to
-    five percent of the sequence were used so far and the count cannot exceed
-    the number of sequence tiles.
-    """
-
-    demean: bool = True
-    repair_tiles: int = 0
-
-    def __post_init__(self) -> None:
-        if self.repair_tiles < 0:
-            raise ValueError(f"repair_tiles must be >= 0, got {self.repair_tiles}")
-        if self.repair_tiles and self.demean:
-            raise ValueError("repair_tiles requires demean=False")
-
-
-def vc_repair_tiles(seq_len_kv: int, budget: float) -> int:
-    """Repair tiles of a V repair run, whole 128-row tiles holding the selected
-    tokens, ``budget`` times the sequence length rounded and at least one."""
-    if not (0.0 < budget < 1.0):
-        raise ValueError(f"budget must be in (0, 1), got {budget}")
-    return _blocks(max(1, round(budget * seq_len_kv)), VC_K_BLOCK_SIZE)
-
-
-def vc_repair_kv_len(seq_len_kv: int, repair_tiles: int) -> int:
-    """K/V rows of a V repair run, the sequence zero-padded to whole tiles plus
-    the repair tiles."""
-    return (_blocks(seq_len_kv, VC_K_BLOCK_SIZE) + repair_tiles) * VC_K_BLOCK_SIZE
-
-
-@dataclass(frozen=True)
-class VCAttentionParams:
-    """Per-run VC-Attention-QK16 operands beyond ``q``, the permuted ``k`` and the
-    E4M3 ``v`` residuals.
-
-    ``v_scale`` is the ``[B, Hkv, D]`` fp32 per-channel E4M3 residual scale.
-    ``tile_means`` is the packed bf16 mean operand ``[B, Hkv,
-    ceil(num_kv_tiles / 16), 16, 256]`` the preparation writes, the means
-    already divided by ``v_scale``. The scale must be positive and finite. The
-    kernel does not check it. A plan with demean off takes no ``tile_means``.
-    """
-
-    v_scale: torch.Tensor
-    tile_means: torch.Tensor | None
-
-
-def vc_scale_shapes(
-    config: VCAttentionConfig,
-    *,
-    batch_size: int,
-    seq_len_kv: int,
-    num_kv_heads: int,
-    head_dim: int,
-) -> dict[str, tuple[int, ...]]:
-    """Return the shape of every ``VCAttentionParams`` tensor a plan consumes, by field name."""
-    if not config.demean:
-        return {"v_scale": (batch_size, num_kv_heads, head_dim)}
-    num_kv_tiles = _blocks(seq_len_kv, VC_K_BLOCK_SIZE)
-    return {
-        "v_scale": (batch_size, num_kv_heads, head_dim),
-        "tile_means": (
-            batch_size,
-            num_kv_heads,
-            _blocks(num_kv_tiles, VC_MEAN_GROUP_TILES),
-            *vc_mean_group_shape(head_dim),
-        ),
-    }
-
-
-_VC_PARAM_DTYPES = {
-    "v_scale": torch.float32,
-    "tile_means": torch.bfloat16,
-}
-
-
-def validate_vc_params(
-    params: VCAttentionParams,
-    expected_shapes: dict[str, tuple[int, ...]],
-    *,
-    device: torch.device,
-) -> None:
-    """Validate the operands of one run against the plan's expected shapes.
-
-    ``expected_shapes`` is the plan's ``vc_scale_shapes`` result.
-    """
-    if not isinstance(params, VCAttentionParams):
-        raise TypeError("vc must be a VCAttentionParams instance")
-    if "tile_means" not in expected_shapes and params.tile_means is not None:
-        raise ValueError("tile_means must be None on a plan with demean off")
-    for name, expected_shape in expected_shapes.items():
-        tensor = getattr(params, name)
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"{name} must be a torch.Tensor")
-        if tensor.dtype != _VC_PARAM_DTYPES[name]:
-            raise ValueError(
-                f"{name} must have dtype {_VC_PARAM_DTYPES[name]}, got {tensor.dtype}"
-            )
-        if tuple(tensor.shape) != tuple(expected_shape):
-            raise ValueError(
-                f"{name} must have shape {tuple(expected_shape)}, got {tuple(tensor.shape)}"
-            )
-        if not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous")
-        if tensor.data_ptr() % 16 != 0:
-            raise ValueError(f"{name} data pointer must be 16-byte aligned")
-        if tensor.device != device:
-            raise ValueError(f"{name} must be on device {device}, got {tensor.device}")
-
-
 @dataclass(frozen=True)
 class VCAttentionOperands:
-    """Everything one VC-Attention-QK16 forward needs beyond ``q``, in kernel layout.
+    """Everything one VC-Attention forward needs beyond ``q``, in kernel layout.
 
     ``k`` is the bf16 input in permuted token order; ``v`` is E4M3
     ``[B, S, H, D]`` in the same order holding the tile residuals
@@ -232,13 +89,9 @@ class VCAttentionOperands:
     seq_len_kv: int | None = None  # K/V tokens before the repair tiles and padding
 
     @property
-    def params(self) -> "VCAttentionParams":
+    def params(self) -> VCAttentionParams:
         """The per-run operands ``BatchPrefillTSWrapper.run`` takes as ``vc``."""
         return VCAttentionParams(v_scale=self.v_scale, tile_means=self.mu)
-
-
-def _blocks(length: int, block: int) -> int:
-    return (length + block - 1) // block
 
 
 @torch.no_grad()
@@ -326,19 +179,34 @@ def vc_token_permutation(
 
 
 @torch.no_grad()
+def _check_inputs(k: torch.Tensor, v: torch.Tensor) -> None:
+    """K and V must be CUDA bf16 or fp16 ``[B, S, H, D]`` tensors of matching
+    shape and dtype with the head dimension the kernels support."""
+    if k.dim() != 4 or k.shape != v.shape or k.dtype != v.dtype:
+        raise ValueError("k and v must be [B, S, H, D] with matching shapes and dtype")
+    if (
+        k.shape[-1] != VC_HEAD_DIM
+        or k.dtype not in (torch.bfloat16, torch.float16)
+        or not k.is_cuda
+    ):
+        raise ValueError(
+            f"VC-Attention preparation needs CUDA bf16/fp16 inputs with head_dim {VC_HEAD_DIM}, "
+            f"got {k.dtype} {tuple(k.shape)} on {k.device}"
+        )
+
+
 def vc_quantize_repair(
     k: torch.Tensor, v: torch.Tensor, *, budget: float
 ) -> VCAttentionOperands:
-    """Turn ``[B, S, H, D]`` K/V into VC-Attention-QK16 V repair operands.
+    """Turn ``[B, S, H, D]`` K/V into VC-Attention V repair operands.
 
     Values are quantized to E4M3 in input order with one scale per batch,
     head and channel. The ``budget`` fraction of tokens with the largest
     residual energy per batch and head gets a repair row, a copy of the key
     with the E4M3 residual of the value.
     """
-    if k.dim() != 4 or k.shape != v.shape:
-        raise ValueError("k and v must be [B, S, H, D] with matching shapes")
-    from .kernels.vc_prepare import vc_prepare
+    _check_inputs(k, v)
+    from .prepare import vc_prepare
 
     b, s_k, h, d = k.shape
     repair_tiles = vc_repair_tiles(s_k, budget)
@@ -382,7 +250,7 @@ def vc_quantize(
     generator: torch.Generator | None = None,
     demean: bool = True,
 ) -> VCAttentionOperands:
-    """Turn ``[B, S, H, D]`` K/V into VC-Attention-QK16 kernel operands.
+    """Turn ``[B, S, H, D]`` K/V into VC-Attention kernel operands.
 
     Keys are permuted with the values and kept in their dtype. Values are
     permuted, split into 128-token tile means and residuals (``demean=False``
@@ -390,9 +258,8 @@ def vc_quantize(
     scale per (batch, head, channel), returned as ``v_scale`` for the run's
     ``vc`` operands.
     """
-    if k.dim() != 4 or k.shape != v.shape:
-        raise ValueError("k and v must be [B, S, H, D] with matching shapes")
-    from .kernels.vc_prepare import vc_prepare
+    _check_inputs(k, v)
+    from .prepare import vc_prepare
 
     if perm is None:
         perm = vc_token_permutation(v, iters=kmeans_iters, generator=generator)[0]
@@ -504,67 +371,14 @@ class VCAttentionPreprocessor:
         return vc_quantize(k, v, perm=perm, demean=smooth)
 
 
-@torch.no_grad()
-def vc_reference(
-    q: torch.Tensor, ops: VCAttentionOperands, *, sm_scale: float | None = None
-) -> torch.Tensor:  # noqa: D401
-    """fp32 attention of ``q`` over the dequantized VC operands (what the kernel
-    computes, up to E4M3 P rounding), as ``[B, S_q, H, D]`` fp32."""
-    b, s_k, h, d = ops.k.shape
-    if sm_scale is None:
-        sm_scale = 1.0 / math.sqrt(d)
-    q = q.float()
-    k = ops.k.float()
-    v = ops.v.float() * ops.v_scale.unsqueeze(1)
-    repairs_v = ops.repair_tiles > 0
-    if repairs_v:
-        # Repair rows add to the numerator only, the zero padding of the partial
-        # last tile is masked, and the denominator runs over the original tokens.
-        repair = ops.repair_tiles * VC_K_BLOCK_SIZE
-        whole = ops.seq_len_kv // VC_K_BLOCK_SIZE * VC_K_BLOCK_SIZE
-        end = ops.seq_len_kv + repair
-        row = torch.arange(s_k, device=k.device)
-        original = (row < whole) | ((row >= whole + repair) & (row < end))
-        scores = torch.einsum("bqhd,bkhd->bhqk", q, k) * sm_scale
-        scores = scores.masked_fill(row >= end, -torch.inf)
-        weights = torch.exp(scores - scores.amax(dim=-1, keepdim=True))
-        out = torch.einsum("bhqk,bkhd->bqhd", weights, v)
-        denom = weights[..., original].sum(dim=-1).permute(0, 2, 1)  # [B, Sq, H]
-        return out / denom.unsqueeze(-1)
-    # The kernel restores bf16(mean / v_scale) * v_scale, per channel.
-    vs = ops.v_scale.reshape(b, ops.k.shape[2], 1, d)  # [B, H, 1, D]
-    mean = (ops.mean / vs).to(torch.bfloat16).float() * vs
-    mean_tokens = mean.permute(0, 2, 1, 3).repeat_interleave(VC_K_BLOCK_SIZE, dim=1)[
-        :, :s_k
-    ]
-    v = v + mean_tokens
-    scores = torch.einsum("bqhd,bkhd->bhqk", q, k) * sm_scale
-    probs = torch.softmax(scores, dim=-1)
-    return torch.einsum("bhqk,bkhd->bqhd", probs, v)
-
-
 __all__ = [
-    "E4M3_MAX",
-    "VC_K_BLOCK_SIZE",
     "VC_KMEANS_CLUSTERS",
     "VC_KMEANS_ITERS",
     "VC_PERM_REFRESH_EVERY",
     "VC_SMOOTH_STEP_FRACTION",
-    "VC_MEAN_MMA_K",
-    "VCAttentionConfig",
     "VCAttentionOperands",
-    "VCAttentionParams",
     "VCAttentionPreprocessor",
-    "validate_vc_params",
     "vc_quantize",
-    "vc_mean_group_shape",
-    "vc_mean_operand_shape",
-    "VC_MEAN_GROUP_TILES",
-    "VC_MEAN_OPERANDS",
     "vc_quantize_repair",
-    "vc_reference",
-    "vc_repair_kv_len",
-    "vc_repair_tiles",
-    "vc_scale_shapes",
     "vc_token_permutation",
 ]

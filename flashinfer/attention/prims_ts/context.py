@@ -147,7 +147,7 @@ class _ContextPlanGeometry:
     causal_single_kv_tile: bool
     packed_dense_k_mask: bool
     head_dim_vo: int | None = None
-    # VC-Attention-QK16 recipe, or ``None`` for a plain plan.
+    # VC-Attention recipe, or ``None`` for a plain plan.
     vc: Optional[VCAttentionConfig] = None
 
 
@@ -163,6 +163,7 @@ class _ContextPlanState:
     variable_window_cta_starts: torch.Tensor
     compiled: Callable[..., None]
     policy: tuple[tuple[str, object], ...]
+    # Expected shapes of the VC run operands, checked by a validating run.
     vc_scale_shapes: Optional[dict[str, tuple[int, ...]]] = None
     # Output scale of VC runs: the per-channel V scale times the planned or passed scale.
     vc_output_scale: Optional[torch.Tensor] = None
@@ -244,6 +245,7 @@ class _ContextCompileSpec:
     scheduler: _ContextScheduler
     head_dim_vo: int | None = None
     two_cta_umma: bool = False
+    # VC-Attention recipe of the plan. None compiles the plain kernel.
     vc: Optional[VCAttentionConfig] = None
 
 
@@ -1609,7 +1611,7 @@ def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
     The two-CTA launch is non-persistent with heads on grid Y and batch on
     grid Z. CUDA limits grid Y and Z to 65,535. Oversized geometries keep the
     persistent flattened grid so the valid int32 plans stay launchable."""
-    # VC-Attention-QK16 always runs two-CTA. With P in SMEM, the bf16 K ring,
+    # VC-Attention always runs two-CTA. With P in SMEM, the bf16 K ring,
     # tile-mean ring and row-sum operands leave room for one K/V stage per CTA
     # at one CTA and three in the halved form. The VC tail needs two.
     return (
@@ -1963,7 +1965,7 @@ def _get_compiled_context(
     vc_mu_fake = None
     if vc_attention:
         if packed:
-            raise RuntimeError("VC-Attention-QK16 context requires fixed tensors")
+            raise RuntimeError("VC-Attention context requires fixed tensors")
         if compile_spec.vc.demean:
             vc_mu_fake = fake_compact(
                 cutlass.BFloat16,
@@ -2575,7 +2577,7 @@ class BatchPrefillTSWrapper:
     ) -> None:
         """Compile one reusable specialization from explicit static geometry.
 
-        ``vc_config`` selects the VC-Attention-QK16 recipe. Q and K stay bf16
+        ``vc_config`` selects the VC-Attention recipe. Q and K stay bf16
         and V is E4M3, stored as per-128-token-tile residuals whose bf16 tile
         means the kernel restores. Every :meth:`run` then supplies the permuted
         K, the E4M3 V and ``vc=VCAttentionParams(...)``.
@@ -2629,7 +2631,7 @@ class BatchPrefillTSWrapper:
         output_scale : float
             Scale applied to the attention output.
         vc_config : VCAttentionConfig, optional
-            The VC-Attention-QK16 recipe. Requires fixed dense tensors, head_dim
+            The VC-Attention recipe. Requires fixed dense tensors, head_dim
             128, equal Q and K/V head counts, bf16 Q/K and E4M3 V.
         """
 
@@ -2821,7 +2823,7 @@ class BatchPrefillTSWrapper:
         if (vc is None) == (geometry.vc is not None):
             raise ValueError(
                 "vc=VCAttentionParams(...) is required by a VC plan and rejected "
-                "by a plan without VC-Attention-QK16"
+                "by a plan without VC-Attention"
             )
         vc_output_scale: Optional[torch.Tensor] = None
         vc_mu: Optional[torch.Tensor] = None

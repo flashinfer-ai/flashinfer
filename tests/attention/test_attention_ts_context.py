@@ -724,7 +724,7 @@ def test_attention_ts_context_public_surfaces_hide_internal_tuning() -> None:
     allowed_exact_names = {
         # This is caller-owned variable-window metadata, not a tuning control.
         "variable_window_cta_starts",
-        # The VC-Attention-QK16 recipe of a plan, a numerics contract.
+        # The VC-Attention recipe of a plan, a numerics contract.
         "vc_config",
     }
     violations = []

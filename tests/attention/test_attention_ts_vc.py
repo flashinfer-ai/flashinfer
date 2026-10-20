@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""VC-Attention-QK16 (bf16 Q/K with E4M3 V tile residuals) for the PrimTS context kernel."""
+"""VC-Attention for the PrimTS context kernel."""
 
 from __future__ import annotations
 
@@ -31,9 +31,13 @@ pytest.importorskip(
 from flashinfer.attention.prims_ts import (
     BatchPrefillTSWrapper,
     VCAttentionConfig,
-    VCAttentionPreprocessor,
     batch_prefill,
     vc_attention as vca,
+)
+from flashinfer.attention.prims_ts.vc_attention.quantization import (
+    VCAttentionPreprocessor,
+    vc_quantize,
+    vc_quantize_repair,
 )
 
 from tests.attention.test_attention_ts_context import _REQUIRES_CONTEXT_GPU
@@ -161,9 +165,9 @@ def _plan(
 def _run_case(case: _VCCase):
     q, k, v = _random_inputs(case.batch_size, case.seq_len, case.num_heads)
     if case.repair_budget:
-        ops = vca.vc_quantize_repair(k, v, budget=case.repair_budget)
+        ops = vc_quantize_repair(k, v, budget=case.repair_budget)
     else:
-        ops = vca.vc_quantize(k, v)
+        ops = vc_quantize(k, v)
     sm_scale = 1.0 / math.sqrt(_HEAD_DIM)
     if case.one_shot:
         out = batch_prefill(q, ops.k, ops.v, sm_scale=sm_scale, vc=ops.params)
@@ -239,7 +243,7 @@ def test_vc_mean_step():
     with demean off equals the means plan fed zero tile means and differs from a
     run whose means are non-zero."""
     q, k, v = _random_inputs(1, 1024, 2)
-    ops = vca.vc_quantize(k, v)
+    ops = vc_quantize(k, v)
     wrapper = BatchPrefillTSWrapper()
     _plan(wrapper, batch_size=1, seq_len=1024, num_heads=2)
     outs = {}
@@ -253,7 +257,7 @@ def test_vc_mean_step():
         rtol=0,
         atol=1.6e-2,
     )
-    plain = vca.vc_quantize(k, v, perm=ops.perm, demean=False)
+    plain = vc_quantize(k, v, perm=ops.perm, demean=False)
     assert plain.params.tile_means is None
     wrapper_off = BatchPrefillTSWrapper()
     _plan(
@@ -319,7 +323,7 @@ def test_vc_plan_rejects_unsupported_recipes(overrides, error, match):
 @_REQUIRES_CONTEXT_GPU
 def test_vc_run_rejects_mismatched_operands():
     q, k, v = _random_inputs(1, 1024, 2)
-    ops = vca.vc_quantize(k, v)
+    ops = vc_quantize(k, v)
     wrapper = BatchPrefillTSWrapper()
     _plan(wrapper, batch_size=1, seq_len=1024, num_heads=2)
     good = ops.params
@@ -346,7 +350,7 @@ def test_vc_run_rejects_mismatched_operands():
         plain.run(q, ops.k, ops.v, vc=good)
     with pytest.raises(ValueError, match="vc_config requires"):
         batch_prefill(q, k, v.to(_FP8), vc_config=VCAttentionConfig())
-    repair = vca.vc_quantize_repair(k, v, budget=0.02)
+    repair = vc_quantize_repair(k, v, budget=0.02)
     with pytest.raises(NotImplementedError, match="does not run V repair"):
         batch_prefill(q, repair.k, repair.v, vc=repair.params)
     with pytest.raises(NotImplementedError, match="does not run V repair"):
