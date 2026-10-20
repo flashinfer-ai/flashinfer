@@ -477,15 +477,15 @@ def test_unit_blocks_carry_the_stage_facts():
 
 
 def test_launchers_follow_the_argument_plans():
-    """``cake_launch`` renders one positional launcher per program whose argument order is the
-    program's ``arg_plan`` (grid triple last); ``STAGE_ARGS`` lists exactly that order."""
+    """``cake_launch.LAUNCH`` holds one positional launcher per program, derived from the
+    program's ``arg_plan``: ``run`` receives ``values[<name>]`` for every non-grid slot in
+    plan order, then the grid triple (the plan's trailing three slots)."""
     cake_launch = cake_package("cake_stepfun_moe", "cake_launch")
-    assert (
-        set(cake_launch.LAUNCH) == set(loader.PROGRAMS) == set(cake_launch.STAGE_ARGS)
-    )
+    assert set(cake_launch.LAUNCH) == set(loader.PROGRAMS)
     for program, record in loader.PROGRAMS.items():
+        kinds = [kind for kind, _name in record["arg_plan"]]
         names = [name for _kind, name in record["arg_plan"]]
-        assert cake_launch.STAGE_ARGS[program] == names, program
+        assert kinds[-3:] == ["grid"] * 3 and "grid" not in kinds[:-3], program
         assert names[-3:] == ["grid_x", "grid_y", "grid_z"]
         seen = []
 

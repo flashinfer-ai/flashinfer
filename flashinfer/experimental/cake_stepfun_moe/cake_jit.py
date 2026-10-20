@@ -27,7 +27,7 @@ from . import cake_build
 # ``PROGRAMS``: one record per physical program -- one kernel source plus its
 # host binding, shared by every architecture in ``arches`` -- with its
 # architecture-free ``library`` stem, FFI entry, argument plan (the binding's
-# positional order; ``cake_launch.LAUNCH[program]`` spells it), launch shape
+# positional order; ``cake_launch`` derives the launcher from it), launch shape
 # and the stage metadata ``unit`` (stage, family / tile or variant, dtypes,
 # the storage dtype the binding checks per tensor argument, ...).  What to
 # compile (the translation units, the compile flags, the per-architecture
