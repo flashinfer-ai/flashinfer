@@ -60,9 +60,13 @@ inline constexpr int kW8A16Sm90CutlassSwizzle = 1;
 // 0.67 -> 0.87 GB at group 4).  M below 16384 stays ungrouped too: at M = 4096 / 8192 the
 // group cuts DRAM reads 20-30% but the time does not move (+-1%), so those rows keep H3's
 // exact schedule.
+// Tile count along one dimension.  The launcher admits dimensions up to INT32_MAX, so
+// `(dim + tile - 1)` is formed in 64 bits: as int it overflows for dim > INT32_MAX - tile.
+inline long long W8A16Sm90Tiles(long long dim, long long tile) { return (dim + tile - 1) / tile; }
+
 inline int W8A16Sm90PickGroup(int M, int N, int K, int tile_w) {
   const long long weight_bytes = 1LL * N * K;
-  const int tiles_w = (N + tile_w - 1) / tile_w;
+  const long long tiles_w = W8A16Sm90Tiles(N, tile_w);
   if (weight_bytes < 40LL * 1000 * 1000 || M < 16384) return 1;
   return tiles_w >= 64 ? 4 : 2;
 }

@@ -56,6 +56,10 @@ inline constexpr uint64_t kW8A16Sm100ActCacheHint =
 // So: grouped when the weight is at least half of L2 and there are >= 32 activation tiles,
 // else the plain raster.  The sm100 scheduler does not pad the tile grid to the swizzle
 // (residual tiles are simply not remapped), so no padding guard is needed.
+// Tile count along one dimension.  The launcher admits dimensions up to INT32_MAX, so
+// `(dim + tile - 1)` is formed in 64 bits: as int it overflows for dim > INT32_MAX - tile.
+inline long long W8A16Sm100Tiles(long long dim, long long tile) { return (dim + tile - 1) / tile; }
+
 inline int W8A16Sm100PickSwizzle(int M, int N, int K) {
   const long long weight_bytes = static_cast<long long>(N) * K;  // e4m3: one byte each
   constexpr long long kHalfL2 = 64ll << 20;

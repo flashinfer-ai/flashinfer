@@ -174,6 +174,23 @@ def test_w8a16_fp8_gemm_caller_workspace():
     )
 
 
+def test_w8a16_fp8_gemm_workspace_bytes_extreme_dims():
+    """The workspace query runs the dispatch cost models without allocating anything,
+    so it reaches dimensions the launcher admits (<= INT32_MAX) that no tensor would:
+    the tile-count ceil divisions must not overflow there (reviewer finding, UBSan)."""
+    dev = torch.device("cuda")
+    big = 2**31 - 1
+    for m, n, k in [
+        (big, 8, 16),
+        (big, 2**31 - 8, 16),
+        (8, 2**31 - 8, 25600),
+        (big, 8, 25600),
+    ]:
+        assert w8a16_fp8_gemm_workspace_bytes(m, n, k, dev) >= 0
+    with pytest.raises(ValueError, match="<= 2147483647"):
+        w8a16_fp8_gemm_workspace_bytes(big + 1, 8, 16, dev)
+
+
 def test_w8a16_fp8_gemm_rejects_bad_inputs():
     dev = torch.device("cuda")
     act = torch.randn(4, 64, device=dev, dtype=torch.bfloat16)
@@ -184,6 +201,14 @@ def test_w8a16_fp8_gemm_rejects_bad_inputs():
         w8a16_fp8_gemm(act, w_fp8.to(torch.bfloat16), scale)
     with pytest.raises(ValueError):
         w8a16_fp8_gemm(act[:, :32], w_fp8, scale)
+    # No implicit cast of the scale: the caller passes float32 or casts it.
+    for bad in (scale.half(), scale.to(torch.bfloat16), scale.double()):
+        with pytest.raises(ValueError, match="weight_scale must be float32"):
+            w8a16_fp8_gemm(act, w_fp8, bad)
+    assert torch.equal(
+        w8a16_fp8_gemm(act, w_fp8, scale.half().float()),
+        w8a16_fp8_gemm(act, w_fp8, scale.half().float().reshape(())),
+    )
 
 
 @pytest.mark.parametrize("n,k", [(1024, 5128), (1028, 5120)])

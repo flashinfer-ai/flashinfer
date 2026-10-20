@@ -135,8 +135,8 @@ inline W8A16Sm90Algo W8A16Sm90PickByCost(int M, int N, int K, int num_sms) {
   const double sms = std::max(num_sms, 1);
   const int ktiles = K / W8A16Sm90::TileK;
   auto tiles_of = [&](const W8A16Sm90TileCost& t) {
-    return static_cast<double>((N + t.tile_w - 1) / t.tile_w) *
-           static_cast<double>((M + t.tile_a - 1) / t.tile_a);
+    return static_cast<double>(W8A16Sm90Tiles(N, t.tile_w)) *
+           static_cast<double>(W8A16Sm90Tiles(M, t.tile_a));
   };
   A best = A::k128x256;
   double best_us = 1e30;
@@ -188,8 +188,8 @@ inline double W8A16Sm90SplitUs(int M, int N, int K, int num_sms, int tile_w, int
           : W8A16Sm90TileCost{W8A16Sm90Algo::k128x128SplitK, W8A16Sm90::CooperativeW,
                               W8A16Sm90::TileA128, 7.45, false};
   (void)tile_w;
-  const double tiles = static_cast<double>((N + t.tile_w - 1) / t.tile_w) *
-                       static_cast<double>((M + t.tile_a - 1) / t.tile_a);
+  const double tiles = static_cast<double>(W8A16Sm90Tiles(N, t.tile_w)) *
+                       static_cast<double>(W8A16Sm90Tiles(M, t.tile_a));
   return std::ceil(tiles * s / std::max(num_sms, 1)) *
              W8A16Sm90TileUs(t, static_cast<double>(K) / s) +
          2.0 + 2e-6 * static_cast<double>(M) * N * s;
@@ -204,8 +204,8 @@ inline double W8A16Sm90SplitUs(int M, int N, int K, int num_sms, int tile_w, int
 inline W8A16Sm90Algo W8A16Sm90PickAlgo(int M, int N, int K, int num_sms, int algo = 0) {
   const W8A16Sm90Algo forced = W8A16Sm90AlgoFromCode(algo);
   if (forced != W8A16Sm90Algo::kAuto) return forced;
-  const long long units = 1LL * ((N + W8A16Sm90::CooperativeW - 1) / W8A16Sm90::CooperativeW) *
-                          ((M + W8A16Sm90::TileA256 - 1) / W8A16Sm90::TileA256);
+  const long long units =
+      W8A16Sm90Tiles(N, W8A16Sm90::CooperativeW) * W8A16Sm90Tiles(M, W8A16Sm90::TileA256);
   const double waves = static_cast<double>(units) / std::max(num_sms, 1);
   const double frac = waves - std::floor(waves);
   if (M <= 8192) return W8A16Sm90PickByCost(M, N, K, num_sms);

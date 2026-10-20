@@ -1173,7 +1173,10 @@ public:
         // For M=128 with 2CTA MMA atoms, the TMEM tensor for A has a duplicated allocation.
         // Instead of allocation a 64x16 TMEM tensor, we have a 128x16 allocation
         // See: TmemAllocMode::Duplicated.
-        Tensor tensor_input2x = [&] () constexpr {
+        // Qualified on purpose: this generic lambda is bound at instantiation, when the
+        // launcher TU's global `Tensor` alias (tvm_ffi_utils.h) is also visible and some nvcc
+        // front ends (CUDA 13.2 on aarch64) report the name as ambiguous.
+        cute::Tensor tensor_input2x = [&] () constexpr {
         if constexpr (decltype(size<0,0>(fragment_compute) == Int<128>{} && size<0,0>(tensor_input) == Int<64>{})::value) {
           return make_tensor(tensor_input.data(),
                              logical_product(tensor_input.layout(),

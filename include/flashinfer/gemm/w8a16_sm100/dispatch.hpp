@@ -67,7 +67,7 @@ inline W8A16Sm100Tile W8A16Sm100TileFromCode(int code) {
 inline int W8A16Sm100SplitK(int M, int N, int K, int num_sms) {
   if (K % 128 != 0) return 1;
   const long long clusters = num_sms > 1 ? num_sms / 2 : 1;
-  const long long units = static_cast<long long>((N + 255) / 256) * ((M + 127) / 128);
+  const long long units = W8A16Sm100Tiles(N, 256) * W8A16Sm100Tiles(M, 128);
   const int ktiles = K / 128;
   if (units * 2 <= clusters) {
     int best = 1;
@@ -115,7 +115,7 @@ inline int W8A16Sm100SplitsFor(int M, int N, int K, int num_sms) {
 inline bool W8A16Sm100UseStreamK(int M, int N, int K, int num_sms) {
   if (K % 128 != 0 || K / 128 < 64) return false;
   const long long clusters = num_sms > 1 ? num_sms / 2 : 1;
-  const long long units = static_cast<long long>((N + 255) / 256) * ((M + 127) / 128);
+  const long long units = W8A16Sm100Tiles(N, 256) * W8A16Sm100Tiles(M, 128);
   if (units * 2 <= clusters) return false;
   const long long waves = (units + clusters - 1) / clusters;
   const long long tail = units - (waves - 1) * clusters;  // tiles in the last wave
@@ -158,9 +158,9 @@ inline W8A16Sm100Tile W8A16Sm100PickTile(int M, int N, int K, int num_sms, int a
   // N <= 4096.
   (void)K;
   const long long clusters = num_sms > 1 ? num_sms / 2 : 1;
-  const long long w_tiles = (N + 255) / 256;
+  const long long w_tiles = W8A16Sm100Tiles(N, 256);
   auto cost = [&](int tile_a, double eff) {
-    const long long units = w_tiles * ((M + tile_a - 1) / tile_a);
+    const long long units = w_tiles * W8A16Sm100Tiles(M, tile_a);
     return static_cast<double>((units + clusters - 1) / clusters) * tile_a / eff;
   };
   const double c128 = cost(128, 1.00);

@@ -152,12 +152,18 @@ def w8a16_fp8_gemm_workspace_bytes(
     return _workspace_bytes(m, n, k, device.index, algo_code, act_dtype)
 
 
+_INT32_MAX = 2**31 - 1
+
+
 def _check_dims(m: int, n: int, k: int) -> None:
     """Shape rules shared by the call and the workspace query (``m == 0`` is legal
     and handled by the caller; ``n`` / ``k`` of zero are not: the tile schedulers
     divide by the tile counts)."""
     if m < 0 or n <= 0 or k <= 0:
         raise ValueError(f"need M >= 0, N > 0, K > 0, got M={m} N={n} K={k}")
+    if max(m, n, k) > _INT32_MAX:
+        # The kernels index with 32-bit ints; the launchers check the same bound.
+        raise ValueError(f"M, N, K must be <= {_INT32_MAX}, got M={m} N={n} K={k}")
     if k % 16 != 0:
         raise ValueError(
             f"K must be a multiple of 16 (16-byte TMA rows of fp8), got K={k}"
@@ -328,8 +334,9 @@ def w8a16_fp8_gemm(
     m = act.numel() // k if k else 0
     _check_dims(m, n, k)
     if weight_scale.dtype != torch.float32:
-        weight_scale = weight_scale.to(torch.float32)
-    weight_scale = weight_scale.reshape(1)
+        # No implicit conversions either: the caller casts if they want that.
+        raise ValueError(f"weight_scale must be float32, got {weight_scale.dtype}")
+    weight_scale = weight_scale.reshape(1)  # () or (1,): a view either way
     device = _resolve_device(act.device)
     algo_code = _algo_code(algo, device)
 
