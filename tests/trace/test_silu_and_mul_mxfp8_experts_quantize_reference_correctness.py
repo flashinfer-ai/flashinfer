@@ -8,6 +8,7 @@ import torch
 
 from tests.trace.reference_utils import (
     _assert_finite,
+    _check,
     _skip_if_not_sm100,
     _unswizzle_mxfp8_scales_128x4,
 )
@@ -34,6 +35,32 @@ def test_silu_and_mul_mxfp8_experts_quantize_reference_correctness(shape_kwargs)
     _assert_matches_reference(a, mask, trace)
 
 
+@torch.inference_mode()
+def test_silu_and_mul_mxfp8_experts_quantize_check():
+    """The template check compares the valid rows and nothing past them."""
+    _skip_if_not_sm100()
+    import flashinfer
+    from flashinfer.trace.templates.quantize import (
+        silu_and_mul_mxfp8_experts_quantize_trace as trace,
+    )
+
+    a = trace.init(B=2, M=128, K_doubled=512)["a"]
+    a[0, 0, 0] = float("inf")  # NaN in the reference, 448 in the kernel.
+    mask = torch.tensor([128, 5], dtype=torch.int32, device=a.device)
+    ref = trace.reference(a, mask)
+    out, sf = flashinfer.silu_and_mul_mxfp8_experts_quantize(a, mask)
+    assert trace.check(ref, (out, sf), mask=mask)
+
+    out_bytes = out.view(torch.uint8)
+    out_bytes[5, 0, 1] ^= 1  # Past the valid rows of expert 1.
+    assert trace.check(ref, (out, sf), mask=mask)
+    out_bytes[4, 0, 1] ^= 1
+    assert not trace.check(ref, (out, sf), mask=mask)
+    out_bytes[4, 0, 1] ^= 1
+    sf[0, 0, 0, 0, 0, 0] ^= 1
+    assert not trace.check(ref, (out, sf), mask=mask)
+
+
 def _assert_matches_reference(a, mask, trace):
     import flashinfer
 
@@ -58,3 +85,4 @@ def _assert_matches_reference(a, mask, trace):
         torch.testing.assert_close(
             scale_bytes[:valid, : k // 32], sf_ref[i, :valid], rtol=0, atol=0
         )
+    _check(trace, (q_ref, sf_ref), (out, sf), mask=mask)

@@ -1153,6 +1153,39 @@ _bind_trace_reference_dependencies(
 )
 
 
+@torch.no_grad()
+def _silu_and_mul_mxfp8_experts_quantize_check(
+    reference_outputs, actual_outputs, *, mask=None, **_unused
+) -> bool:
+    """Compare the valid rows bit for bit in the reference's plain layout.
+
+    Undoes the grouped GEMM permutation, K padding and scale swizzle of the
+    actual outputs, then compares the first ``min(mask[i], M)`` rows of each
+    expert ``i``, or every row without ``mask``. Where the reference value is
+    NaN, the actual value must be +-448.
+    """
+    q_ref, sf_ref = reference_outputs
+    q, sf = actual_outputs
+    b, m, k = q_ref.shape
+    if q.dim() != 3 or q.shape[0] != m or q.shape[1] < k or q.shape[2] != b:
+        return False
+    if sf.dim() != 6 or sf.shape[5] != b:
+        return False
+    q = q.permute(2, 0, 1)[:, :, :k]
+    rm, rk = sf.shape[2], sf.shape[4]
+    sf = sf.permute(5, 2, 1, 0, 4, 3).reshape(b, rm * 128, rk * 4)[:, :m, : k // 32]
+    num_rows = torch.full((b,), m) if mask is None else mask.clamp(0, m)
+    valid = torch.arange(m, device=q.device) < num_rows.to(q.device).unsqueeze(1)
+    q, q_ref = q[valid].view(torch.uint8), q_ref[valid]
+    is_nan = q_ref.float().isnan()
+    q_ref = q_ref.view(torch.uint8)
+    return (
+        torch.equal(q[~is_nan], q_ref[~is_nan])
+        and bool(((q[is_nan] & 0x7F) == 0x7E).all())
+        and torch.equal(sf[valid], sf_ref[valid])
+    )
+
+
 def _silu_and_mul_mxfp8_experts_quantize_init(
     *,
     B,
@@ -1235,6 +1268,7 @@ silu_and_mul_mxfp8_experts_quantize_trace = TraceTemplate(
     ],
     tags=["status:verified", "fused", "quantization:mxfp8", "moe"],
     reference=_silu_and_mul_mxfp8_experts_quantize_reference,
+    check=_silu_and_mul_mxfp8_experts_quantize_check,
     init=_silu_and_mul_mxfp8_experts_quantize_init,
 )
 
