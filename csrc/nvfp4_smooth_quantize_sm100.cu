@@ -45,8 +45,8 @@ int32_t getMultiProcessorCount(int32_t device_index) {
 }
 
 #if defined(FLASHINFER_ENABLE_SVDQ_SM120_K1_K2_FUSION)
-#if defined(SVDQ_SM120_LORA_RANK) && SVDQ_SM120_LORA_RANK == 64
-constexpr int kSm120PrefixRank = 64;
+#if defined(SVDQ_SM120_LORA_RANK) && (SVDQ_SM120_LORA_RANK == 64 || SVDQ_SM120_LORA_RANK == 128)
+constexpr int kSm120PrefixRank = SVDQ_SM120_LORA_RANK;
 #else
 constexpr int kSm120PrefixRank = 32;
 #endif

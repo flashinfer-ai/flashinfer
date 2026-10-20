@@ -498,6 +498,12 @@ __device__ __forceinline__ std::uint64_t make_l2_evict_first_policy() {
   return policy;
 }
 
+// LoRA-down warps of the large-M producer. Up to rank 64 every warp owns one
+// n8 column fragment (Rank / 8 warps). Wider ranks keep eight down warps and
+// give each one Rank / 64 adjacent fragments, so the CTA keeps room for its
+// quantize warps and one A fragment load feeds several MMAs.
+constexpr int large_m_down_warps(int rank) { return rank <= 64 ? rank / 8 : 8; }
+
 template <bool UsePackedStore>
 __device__ __forceinline__ void store_down_pair(quant::Type* destination, float low, float high) {
   if constexpr (UsePackedStore) {
@@ -532,7 +538,7 @@ __device__ __forceinline__ void copy_x_tile_async_dyn(quant::Type const* __restr
                                                       quant::Type* __restrict__ x_tile,
                                                       int row_base, int tile_k, int thread,
                                                       std::uint64_t l2_policy, int M, int K) {
-  constexpr int kDownWarps = Rank / 8;
+  constexpr int kDownWarps = large_m_down_warps(Rank);
   constexpr int kKernelTileM = KernelTileM;
   constexpr bool kUseStreamingX = LongK;
   constexpr int kKernelQuantThreads = BlockThreads - kDownWarps * 32;
@@ -604,7 +610,7 @@ template <bool LongK, int KernelTileK = 128, int Rank = 32>
 __device__ __forceinline__ void copy_pre_quant_scale_tile_async_dyn(
     quant::Type const* __restrict__ pre_quant_scale, quant::Type* __restrict__ scale_tile,
     int tile_k, int thread) {
-  constexpr int kDownWarps = Rank / 8;
+  constexpr int kDownWarps = large_m_down_warps(Rank);
   constexpr int kTileK = KernelTileK;
   constexpr int kLoadItems = kTileK / 8;
   int const load_thread = LongK ? thread - kDownWarps * 32 : thread;
@@ -628,8 +634,11 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
     quant::Type* __restrict__ down, int M, int K) {
   constexpr int kRank = Rank;
-  constexpr int kDownWarps = Rank / 8;
-  static_assert(Rank == 32 || Rank == 64);
+  constexpr int kDownWarps = large_m_down_warps(Rank);
+  static_assert(Rank == 32 || Rank == 64 || Rank == 128);
+  // n8 column fragments per down warp; 1 keeps the rank-32/64 code path verbatim.
+  constexpr int kFrags = Rank / (8 * kDownWarps);
+  static_assert(kFrags * 8 * kDownWarps == Rank);
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
   constexpr int kKernelTileM = KernelTileM;
   constexpr bool kUseStreamingX = LongK;
@@ -689,6 +698,10 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn
   float d17 = 0.0f;
   float d18 = 0.0f;
   float d19 = 0.0f;
+  // Wide-rank accumulators: [fragment][m16 block][mma.sync C register].
+  constexpr int kMBlocks = kKernelTileM / 16;
+  static_assert(kFrags == 1 || kKernelTileM % 16 == 0);
+  float wide_acc[kFrags == 1 ? 1 : kFrags][kFrags == 1 ? 1 : kMBlocks][4] = {};
 
   copy_x_tile_async_dyn<BlockThreads, LongK, KernelTileM, KernelTileK, Policy, Rank>(
       x, x_tiles[0], row_base, 0, thread, l2_evict_first_policy, M, K);
@@ -715,51 +728,84 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn
     std::uint8_t* sf_tile = sf_tiles[tile_buffer];
 
     if (warp < kDownWarps) {
+      if constexpr (kFrags == 1) {
 #pragma unroll
-      for (int local_k = 0; local_k < kTileK; local_k += 16) {
-        quant::Type const* a_base = x_tile + group * kTileStride + local_k + pair_col;
-        std::uint32_t const a0 = base::load_bf16_pair(a_base);
-        std::uint32_t const a1 = base::load_bf16_pair(a_base + 8 * kTileStride);
-        std::uint32_t const a2 = base::load_bf16_pair(a_base + 8);
-        std::uint32_t const a3 = base::load_bf16_pair(a_base + 8 * kTileStride + 8);
+        for (int local_k = 0; local_k < kTileK; local_k += 16) {
+          quant::Type const* a_base = x_tile + group * kTileStride + local_k + pair_col;
+          std::uint32_t const a0 = base::load_bf16_pair(a_base);
+          std::uint32_t const a1 = base::load_bf16_pair(a_base + 8 * kTileStride);
+          std::uint32_t const a2 = base::load_bf16_pair(a_base + 8);
+          std::uint32_t const a3 = base::load_bf16_pair(a_base + 8 * kTileStride + 8);
 
-        int const b_col = warp * 8 + group;
-        int const b_row = tile_k + local_k + pair_col;
-        quant::Type const* b_base = l2t_smoothed + static_cast<std::int64_t>(b_row) * kRank + b_col;
-        std::uint32_t const b0 = base::pack_bf16_pair(b_base, b_base + kRank);
-        std::uint32_t const b1 = base::pack_bf16_pair(b_base + 8 * kRank, b_base + 9 * kRank);
-        base::mma_m16n8k16_row_col(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
-        if constexpr (kKernelTileM >= 32) {
-          quant::Type const* a_upper = a_base + 16 * kTileStride;
-          std::uint32_t const a4 = base::load_bf16_pair(a_upper);
-          std::uint32_t const a5 = base::load_bf16_pair(a_upper + 8 * kTileStride);
-          std::uint32_t const a6 = base::load_bf16_pair(a_upper + 8);
-          std::uint32_t const a7 = base::load_bf16_pair(a_upper + 8 * kTileStride + 8);
-          base::mma_m16n8k16_row_col(d4, d5, d6, d7, a4, a5, a6, a7, b0, b1);
+          int const b_col = warp * 8 + group;
+          int const b_row = tile_k + local_k + pair_col;
+          quant::Type const* b_base = l2t_smoothed + static_cast<std::int64_t>(b_row) * kRank + b_col;
+          std::uint32_t const b0 = base::pack_bf16_pair(b_base, b_base + kRank);
+          std::uint32_t const b1 = base::pack_bf16_pair(b_base + 8 * kRank, b_base + 9 * kRank);
+          base::mma_m16n8k16_row_col(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
+          if constexpr (kKernelTileM >= 32) {
+            quant::Type const* a_upper = a_base + 16 * kTileStride;
+            std::uint32_t const a4 = base::load_bf16_pair(a_upper);
+            std::uint32_t const a5 = base::load_bf16_pair(a_upper + 8 * kTileStride);
+            std::uint32_t const a6 = base::load_bf16_pair(a_upper + 8);
+            std::uint32_t const a7 = base::load_bf16_pair(a_upper + 8 * kTileStride + 8);
+            base::mma_m16n8k16_row_col(d4, d5, d6, d7, a4, a5, a6, a7, b0, b1);
+          }
+          if constexpr (kKernelTileM >= 48) {
+            quant::Type const* a_lower = a_base + 32 * kTileStride;
+            std::uint32_t const a8 = base::load_bf16_pair(a_lower);
+            std::uint32_t const a9 = base::load_bf16_pair(a_lower + 8 * kTileStride);
+            std::uint32_t const a10 = base::load_bf16_pair(a_lower + 8);
+            std::uint32_t const a11 = base::load_bf16_pair(a_lower + 8 * kTileStride + 8);
+            base::mma_m16n8k16_row_col(d8, d9, d10, d11, a8, a9, a10, a11, b0, b1);
+          }
+          if constexpr (kKernelTileM >= 64) {
+            quant::Type const* a_bottom = a_base + 48 * kTileStride;
+            std::uint32_t const a12 = base::load_bf16_pair(a_bottom);
+            std::uint32_t const a13 = base::load_bf16_pair(a_bottom + 8 * kTileStride);
+            std::uint32_t const a14 = base::load_bf16_pair(a_bottom + 8);
+            std::uint32_t const a15 = base::load_bf16_pair(a_bottom + 8 * kTileStride + 8);
+            base::mma_m16n8k16_row_col(d12, d13, d14, d15, a12, a13, a14, a15, b0, b1);
+          }
+          if constexpr (kKernelTileM >= 80) {
+            quant::Type const* a_tail = a_base + 64 * kTileStride;
+            std::uint32_t const a16 = base::load_bf16_pair(a_tail);
+            std::uint32_t const a17 = base::load_bf16_pair(a_tail + 8 * kTileStride);
+            std::uint32_t const a18 = base::load_bf16_pair(a_tail + 8);
+            std::uint32_t const a19 = base::load_bf16_pair(a_tail + 8 * kTileStride + 8);
+            base::mma_m16n8k16_row_col(d16, d17, d18, d19, a16, a17, a18, a19, b0, b1);
+          }
         }
-        if constexpr (kKernelTileM >= 48) {
-          quant::Type const* a_lower = a_base + 32 * kTileStride;
-          std::uint32_t const a8 = base::load_bf16_pair(a_lower);
-          std::uint32_t const a9 = base::load_bf16_pair(a_lower + 8 * kTileStride);
-          std::uint32_t const a10 = base::load_bf16_pair(a_lower + 8);
-          std::uint32_t const a11 = base::load_bf16_pair(a_lower + 8 * kTileStride + 8);
-          base::mma_m16n8k16_row_col(d8, d9, d10, d11, a8, a9, a10, a11, b0, b1);
-        }
-        if constexpr (kKernelTileM >= 64) {
-          quant::Type const* a_bottom = a_base + 48 * kTileStride;
-          std::uint32_t const a12 = base::load_bf16_pair(a_bottom);
-          std::uint32_t const a13 = base::load_bf16_pair(a_bottom + 8 * kTileStride);
-          std::uint32_t const a14 = base::load_bf16_pair(a_bottom + 8);
-          std::uint32_t const a15 = base::load_bf16_pair(a_bottom + 8 * kTileStride + 8);
-          base::mma_m16n8k16_row_col(d12, d13, d14, d15, a12, a13, a14, a15, b0, b1);
-        }
-        if constexpr (kKernelTileM >= 80) {
-          quant::Type const* a_tail = a_base + 64 * kTileStride;
-          std::uint32_t const a16 = base::load_bf16_pair(a_tail);
-          std::uint32_t const a17 = base::load_bf16_pair(a_tail + 8 * kTileStride);
-          std::uint32_t const a18 = base::load_bf16_pair(a_tail + 8);
-          std::uint32_t const a19 = base::load_bf16_pair(a_tail + 8 * kTileStride + 8);
-          base::mma_m16n8k16_row_col(d16, d17, d18, d19, a16, a17, a18, a19, b0, b1);
+      } else {
+        // Wide rank: one A fragment per m16 block feeds kFrags adjacent n8 MMAs.
+#pragma unroll
+        for (int local_k = 0; local_k < kTileK; local_k += 16) {
+          int const b_row = tile_k + local_k + pair_col;
+          std::uint32_t b0[kFrags];
+          std::uint32_t b1[kFrags];
+#pragma unroll
+          for (int f = 0; f < kFrags; ++f) {
+            int const b_col = (warp * kFrags + f) * 8 + group;
+            quant::Type const* b_base =
+                l2t_smoothed + static_cast<std::int64_t>(b_row) * kRank + b_col;
+            b0[f] = base::pack_bf16_pair(b_base, b_base + kRank);
+            b1[f] = base::pack_bf16_pair(b_base + 8 * kRank, b_base + 9 * kRank);
+          }
+#pragma unroll
+          for (int mb = 0; mb < kMBlocks; ++mb) {
+            quant::Type const* a_base =
+                x_tile + (mb * 16 + group) * kTileStride + local_k + pair_col;
+            std::uint32_t const a0 = base::load_bf16_pair(a_base);
+            std::uint32_t const a1 = base::load_bf16_pair(a_base + 8 * kTileStride);
+            std::uint32_t const a2 = base::load_bf16_pair(a_base + 8);
+            std::uint32_t const a3 = base::load_bf16_pair(a_base + 8 * kTileStride + 8);
+#pragma unroll
+            for (int f = 0; f < kFrags; ++f) {
+              base::mma_m16n8k16_row_col(wide_acc[f][mb][0], wide_acc[f][mb][1],
+                                         wide_acc[f][mb][2], wide_acc[f][mb][3], a0, a1, a2, a3,
+                                         b0[f], b1[f]);
+            }
+          }
         }
       }
     } else {
@@ -831,7 +877,26 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn
     }
   }
 
-  if (warp < kDownWarps) {
+  if (warp < kDownWarps && kFrags > 1) {
+    // Wide rank: each thread owns a bf16 pair per (fragment, m16 block, row half).
+#pragma unroll
+    for (int f = 0; f < kFrags; ++f) {
+      int const col = (warp * kFrags + f) * 8 + pair_col;
+#pragma unroll
+      for (int mb = 0; mb < kMBlocks; ++mb) {
+        int const row_lo = row_base + mb * 16 + group;
+        int const row_hi = row_lo + 8;
+        if (row_lo < M) {
+          store_down_pair<false>(down + static_cast<std::int64_t>(row_lo) * kRank + col,
+                                 wide_acc[f][mb][0], wide_acc[f][mb][1]);
+        }
+        if (row_hi < M) {
+          store_down_pair<false>(down + static_cast<std::int64_t>(row_hi) * kRank + col,
+                                 wide_acc[f][mb][2], wide_acc[f][mb][3]);
+        }
+      }
+    }
+  } else if (warp < kDownWarps) {
     constexpr bool kUsePackedDownStore = false;
     int const row0 = row_base + group;
     int const row1 = row0 + 8;
@@ -909,7 +974,7 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
                                              void const* l2t_smoothed, void* down, int m, int k,
                                              cudaStream_t stream) {
   constexpr int kRank = Rank;
-  constexpr int kDownWarps = Rank / 8;
+  constexpr int kDownWarps = large_m_down_warps(Rank);
   // KernelLaunchGeometry passes TileM straight through; the kernel's default
   // template argument (K >= 8192 ? 80 : kTileM) is never what the launcher uses.
   constexpr int kKernelTileM = TileM;
@@ -982,6 +1047,7 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
   X(1024, 16, 16)
 
 // Rank 64 reserves eight warps for LoRA-down; the remaining warps quantize.
+// Rank 128 reuses the same eight down warps, each owning two n8 fragments.
 #define FI_SVDQ_RANK64_LARGE_M_GEOMETRIES(X) \
   X(320, 16, 128)                            \
   X(320, 32, 128)                            \
@@ -1019,7 +1085,7 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_dyn_sm120(
                                                     Rank>(x, pre_quant_scale, global_scale, xq,    \
                                                           sf, l2t_smoothed, down, m, k, stream);   \
   }
-  if constexpr (Rank == 64) {
+  if constexpr (Rank >= 64) {
     FI_SVDQ_RANK64_LARGE_M_GEOMETRIES(FI_SVDQ_DYN_CASE)
   } else {
     FI_SVDQ_LARGE_M_GEOMETRIES(FI_SVDQ_DYN_CASE)
@@ -1047,6 +1113,10 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
   using large_m::DynAddress;
   if constexpr (Rank == 64) {
     if (family != 0 && family != 1) return cudaErrorInvalidValue;
+  }
+  // Rank 128 has the large-M (eight wide down warps) family only.
+  if constexpr (Rank == 128) {
+    if (family != 0) return cudaErrorInvalidValue;
   }
   if (family == 2) {
     // One M, parameterised on K: the role split bakes M in, so this family
@@ -1080,15 +1150,18 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
 #undef FI_SVDQ_PACKED_SMALL_CASE
     return cudaErrorInvalidValue;
   }
-  if (family == 1) {
+  // The small-M kernel stages one n8 fragment per warp (rank 32/64 only).
+  if constexpr (Rank <= 64) {
+    if (family == 1) {
 #define FI_SVDQ_SMALL_CASE(BT, DTC, RPQB)                                            \
   if (a == (BT) && b == (DTC) && c == (RPQB)) {                                      \
     return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, false, Rank>(    \
         x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream); \
   }
-    FI_SVDQ_SMALL_M_TILINGS(FI_SVDQ_SMALL_CASE)
+      FI_SVDQ_SMALL_M_TILINGS(FI_SVDQ_SMALL_CASE)
 #undef FI_SVDQ_SMALL_CASE
-    return cudaErrorInvalidValue;
+      return cudaErrorInvalidValue;
+    }
   }
   return nvfp4_smooth_quantize_lora_down_dyn_sm120<Rank>(x, pre_quant_scale, global_scale, xq, sf,
                                                          l2t_smoothed, down, m, k, a, b, c, stream,
@@ -1129,12 +1202,14 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
   }
 #define FI_SVDQ_TRY_LARGE(BT, TM, TK) FI_SVDQ_TRY(0, BT, TM, TK)
 #define FI_SVDQ_TRY_SMALL(BT, DTC, RPQB) FI_SVDQ_TRY(1, BT, DTC, RPQB)
-  if constexpr (Rank == 64) {
+  if constexpr (Rank >= 64) {
     FI_SVDQ_RANK64_LARGE_M_GEOMETRIES(FI_SVDQ_TRY_LARGE)
   } else {
     FI_SVDQ_LARGE_M_GEOMETRIES(FI_SVDQ_TRY_LARGE)
   }
-  FI_SVDQ_SMALL_M_TILINGS(FI_SVDQ_TRY_SMALL)
+  if constexpr (Rank <= 64) {
+    FI_SVDQ_SMALL_M_TILINGS(FI_SVDQ_TRY_SMALL)
+  }
 #undef FI_SVDQ_TRY_SMALL
 #undef FI_SVDQ_TRY_LARGE
 #undef FI_SVDQ_TRY

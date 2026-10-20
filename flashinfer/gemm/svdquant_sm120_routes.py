@@ -26,6 +26,7 @@ SM120_TACTIC_ABI_VERSION: Final = 3
 SM120_LINEAR_ROUTE_ABI_VERSION: Final = 5
 SM120_PACKED_SMALL_M_ROUTE_ABI_VERSION: Final = 10
 SM120_RANK64_FUSED_ROUTE_ABI_VERSION: Final = 11
+SM120_RANK128_FUSED_ROUTE_ABI_VERSION: Final = 12
 
 # Historical route versions remain the fallback for shapes without the new
 # packed small-M family. Candidate admission below determines the v10 scope.
@@ -80,6 +81,8 @@ def sm120_linear_route_abi_version(m: int, k: int, rank: int) -> int:
     """Return the persistent route namespace for one exact linear shape."""
     if rank == 64:
         return SM120_RANK64_FUSED_ROUTE_ABI_VERSION
+    if rank == 128:
+        return SM120_RANK128_FUSED_ROUTE_ABI_VERSION
     if rank == 32 and any(
         family == SM120_FAMILY_SMALL_M_PACKED
         for family, _, _ in sm120_producer_variants(m, k)
@@ -148,7 +151,10 @@ def sm120_producer_geometry_is_valid(
         return False
     if not (0 < tile_m <= 80 and tile_m % 16 == 0):
         return False
-    quant_threads = block_threads - (rank // _GEOMETRY_MMA_N) * 32
+    # Mirrors large_m_down_warps(): one n8 fragment per down warp up to rank 64,
+    # eight wide down warps above it.
+    down_warps = min(rank // _GEOMETRY_MMA_N, 8)
+    quant_threads = block_threads - down_warps * 32
     if block_threads % 32 or quant_threads <= 0:
         return False
     sf_cols_per_tile = tile_k // _GEOMETRY_SF_VEC
@@ -260,7 +266,7 @@ def sm120_producer_variants(
         return ()
     geometries = (
         SM120_RANK64_PRODUCER_GEOMETRY_LADDER
-        if rank == 64
+        if rank >= 64
         else SM120_PRODUCER_GEOMETRY_LADDER
     )
     large = tuple(
@@ -276,6 +282,9 @@ def sm120_producer_variants(
     )
     if rank == 64:
         return large + small
+    if rank == 128:
+        # Only the large-M producer stages wide fragments.
+        return large
     m537 = (
         ((SM120_FAMILY_M537, SM120_M537_TILING, 0),)
         if sm120_m537_is_valid(m, k)
