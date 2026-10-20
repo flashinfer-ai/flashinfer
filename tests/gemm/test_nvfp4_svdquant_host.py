@@ -888,29 +888,29 @@ def test_sm120_candidate_set_carries_no_shape_fitted_pruning(monkeypatch):
 # workspace size, never its packed kernel id, raster or swizzle fields.
 
 
-def test_sm120_tuned_linear_route_bypasses_repeated_autotuner_lookup():
-    """A tuned exact-shape winner should dispatch directly after the first lookup."""
+def test_sm120_linear_chooser_asks_the_tuner_on_every_call():
+    """No local cache may answer for the tuner: a replaced winner takes effect."""
 
     class FakeTuner:
-        is_tuning_mode = True
+        is_tuning_mode = False
 
         def __init__(self):
             self.calls = 0
+            self.winner = 43
 
         def choose_one(self, op_name, runners, tuning_config, inputs):
             self.calls += 1
-            return runners[1], 43
+            return runners[1], self.winner
 
     tuner = FakeTuner()
     runners = [object(), object()]
-    inputs = [torch.empty(16, dtype=torch.uint8)]
-    svdquant_sm120_cutlass._SM120_LINEAR_DISPATCH_CACHE.clear()
-    try:
-        first = svdquant_sm120_cutlass._choose_sm120_linear_runner(
+
+    def choose():
+        return svdquant_sm120_cutlass._choose_sm120_linear_runner(
             tuner,
             runners,
             object(),
-            inputs,
+            [torch.empty(16, dtype=torch.uint8)],
             device="cuda:0",
             m=256,
             n=3072,
@@ -918,49 +918,17 @@ def test_sm120_tuned_linear_route_bypasses_repeated_autotuner_lookup():
             rank=32,
             enable_pdl=False,
             has_bias=True,
-        )
-        tuner.is_tuning_mode = False
-        second = svdquant_sm120_cutlass._choose_sm120_linear_runner(
-            tuner,
-            runners,
-            object(),
-            inputs,
-            device="cuda:0",
-            m=256,
-            n=3072,
-            k=12288,
-            rank=32,
-            enable_pdl=False,
-            has_bias=True,
-        )
-        third = svdquant_sm120_cutlass._choose_sm120_linear_runner(
-            tuner,
-            runners,
-            object(),
-            inputs,
-            device="cuda:0",
-            m=256,
-            n=3072,
-            k=12288,
-            rank=32,
-            enable_pdl=False,
-            has_bias=False,
         )
 
-        assert first == second == third == (runners[1], 43)
-        assert tuner.calls == 2, "bias/no-bias profiles must not share a dispatch entry"
-    finally:
-        svdquant_sm120_cutlass._SM120_LINEAR_DISPATCH_CACHE.clear()
+    assert choose() == choose() == (runners[1], 43)
+    # What AutoTuner.clear_cache() followed by load_configs() does to a winner.
+    tuner.winner = 0
+    assert choose() == (runners[1], 0)
+    assert tuner.calls == 3
 
 
 def _sm120_linear_op_name_in_use(m, k, rank, n=5376, enable_pdl=False):
-    """Drive the production chooser and return the op name it actually used.
-
-    Reads the name off both seams at once: what `choose_one` is keyed by (the
-    persistent autotune cache) and what the in-process dispatch cache is keyed
-    by. They must be one computed value, or a shape could profile under one name
-    and replay under another.
-    """
+    """Drive the production chooser and return the op name the tuner was asked."""
 
     class RecordingTuner:
         is_tuning_mode = True
@@ -973,30 +941,21 @@ def _sm120_linear_op_name_in_use(m, k, rank, n=5376, enable_pdl=False):
             return runners[0], 9
 
     tuner = RecordingTuner()
-    runners = [object()]
-    svdquant_sm120_cutlass._SM120_LINEAR_DISPATCH_CACHE.clear()
-    try:
-        svdquant_sm120_cutlass._choose_sm120_linear_runner(
-            tuner,
-            runners,
-            object(),
-            [torch.empty(16, dtype=torch.uint8)],
-            device="cuda:0",
-            m=m,
-            n=n,
-            k=k,
-            rank=rank,
-            enable_pdl=enable_pdl,
-            has_bias=False,
-        )
-        (op_name,) = tuner.op_names
-        (cache_key,) = svdquant_sm120_cutlass._SM120_LINEAR_DISPATCH_CACHE
-        assert cache_key[0] == op_name, (
-            "the dispatch cache and the tuner key must share one computed name"
-        )
-        return op_name
-    finally:
-        svdquant_sm120_cutlass._SM120_LINEAR_DISPATCH_CACHE.clear()
+    svdquant_sm120_cutlass._choose_sm120_linear_runner(
+        tuner,
+        [object()],
+        object(),
+        [torch.empty(16, dtype=torch.uint8)],
+        device="cuda:0",
+        m=m,
+        n=n,
+        k=k,
+        rank=rank,
+        enable_pdl=enable_pdl,
+        has_bias=False,
+    )
+    (op_name,) = tuner.op_names
+    return op_name
 
 
 # Representative row-52 route used by the PDL key tests below.
@@ -1154,7 +1113,6 @@ def test_sm120_linear_always_reaches_the_tuner(monkeypatch, m, n, k):
     monkeypatch.setattr(
         gemm_svdquant.AutoTuner, "get", classmethod(lambda cls: Tuner())
     )
-    svdquant_sm120_cutlass._SM120_LINEAR_DISPATCH_CACHE.clear()
 
     x = torch.zeros((m, k), dtype=torch.bfloat16)
     weight = SimpleNamespace(ndim=2, shape=(n, k // 2))
@@ -1180,7 +1138,6 @@ def test_sm120_linear_always_reaches_the_tuner(monkeypatch, m, n, k):
     assert outputs and out is outputs[-1]
     assert launched and launched[0][1] == 7, "the tactic must be the tuner's answer"
     assert Tuner.seen, "the tuner was never consulted"
-    svdquant_sm120_cutlass._SM120_LINEAR_DISPATCH_CACHE.clear()
 
 
 def test_sm120_linear_route_pool(monkeypatch):
@@ -2271,7 +2228,6 @@ def workspace_case(
     monkeypatch.setattr(backend, "_sm120_workspace_budget_bytes", lambda *args: 16)
     monkeypatch.setattr(backend, "_SM120_WORKSPACE_BUDGET_CACHE", {})
     monkeypatch.setattr(backend, "_SM120_WORKSPACE_BYTES_CACHE", {})
-    monkeypatch.setattr(backend, "_SM120_LINEAR_DISPATCH_CACHE", {})
     x = torch.zeros((m, k), dtype=torch.bfloat16)
     weight = torch.empty((n, k // 2), dtype=torch.uint8)
     sf = torch.empty(128 * (k // 16), dtype=torch.uint8)
@@ -2350,12 +2306,12 @@ def test_cached_tactic_must_fit_actual_workspace(
     runner(case.inputs, tactic=tactic)
 
 
-def test_linear_dispatch_cache_rechecks_smaller_workspace(
+def test_linear_chooser_rechecks_smaller_workspace(
     workspace_case: _WorkspaceCase,
 ) -> None:
     case = workspace_case
     if len(case.inputs) != 14:
-        pytest.skip("linear-only dispatch cache")
+        pytest.skip("linear-only chooser")
     tuner = AutoTuner()
     key = tuner._get_cache_key(
         case.op_name, case.runner, tuple(t.shape for t in case.inputs), case.config, ()
@@ -2384,6 +2340,38 @@ def test_linear_dispatch_cache_rechecks_smaller_workspace(
     runner, tactic = choose()
     assert tactic != case.large_tactic
     runner(case.inputs, tactic=tactic)
+
+
+def test_linear_chooser_follows_tuner_cache_clear(
+    workspace_case: _WorkspaceCase,
+) -> None:
+    case = workspace_case
+    if len(case.inputs) != 14:
+        pytest.skip("linear-only chooser")
+    tuner = AutoTuner()
+    key = tuner._get_cache_key(
+        case.op_name, case.runner, tuple(t.shape for t in case.inputs), case.config, ()
+    )
+    tuner.profiling_cache[key] = (case.large_tactic, None)
+
+    def choose() -> int:
+        return svdquant_sm120_cutlass._choose_sm120_linear_runner(
+            tuner,
+            [case.runner],
+            case.config,
+            case.inputs,
+            device=case.inputs[0].device,
+            m=64,
+            n=128,
+            k=3072,
+            rank=case.inputs[5].shape[1],
+            enable_pdl=False,
+            has_bias=True,
+        )[1]
+
+    assert choose() == case.large_tactic
+    tuner.clear_cache()
+    assert choose() == -1, "a cleared tuner must not keep serving its old winner"
 
 
 @pytest.mark.parametrize("source", ("bundled", "fallback"))

@@ -707,9 +707,6 @@ def _sm120_linear_op_name(m: int, k: int, rank: int, *, enable_pdl: bool) -> str
     return f"{name}_pdl" if enable_pdl else name
 
 
-_SM120_LINEAR_DISPATCH_CACHE: dict[tuple, tuple[int, int]] = {}
-
-
 _SM120_TUNING_BUDGET_US: Final = 20_000.0
 
 
@@ -751,42 +748,48 @@ def _choose_sm120_linear_runner(
     enable_pdl: bool,
     has_bias: bool,
 ) -> tuple[TunableRunner, int]:
-    """Choose once per exact shape, then bypass repeated shape-key construction."""
-    # One computed name for both seams: the persistent autotune record below and
-    # the in-process dispatch cache. If they ever diverged, a shape could profile
-    # under one name and replay under another.
-    op_name = _sm120_linear_op_name(m, k, rank, enable_pdl=enable_pdl)
-    cache_key = (
-        op_name,
-        device,
-        m,
-        n,
-        k,
-        rank,
-        enable_pdl,
-        has_bias,
-        # A resized buffer must revalidate the winner before bypassing the tuner.
-        inputs[-1].numel() * inputs[-1].element_size(),
-    )
-    if not tuner.is_tuning_mode:
-        cached = _SM120_LINEAR_DISPATCH_CACHE.get(cache_key)
-        if cached is not None:
-            runner_id, tactic = cached
-            return runners[runner_id], tactic
+    """Return the AutoTuner's (runner, tactic) for this linear call.
 
+    The tactic is checked against the workspace actually passed in, since a
+    winner tuned with a larger buffer may not fit this one. ``device``, ``n``
+    and ``has_bias`` are not needed for that; they are accepted so that a
+    per-shape cache can be keyed on them (see below).
+    """
+    # Performance note: this asks the AutoTuner on every eager call, which costs
+    # ~7 us of host time (64x3072x3072, rank 32), almost all of it in
+    # AutoTuner.choose_one(). Remembering the winner per shape in a dict here
+    # would cut that to ~1 us and makes small eager linears (~20 us end to end)
+    # 1.4-1.6x faster. It makes no measurable difference once a call takes
+    # ~70 us or more, and none under CUDA Graph replay, which skips this code.
+    #
+    # Such a dict must not outlive what the tuner knows. With a plain dict, a
+    # shape keeps its first winner even after the tuner's answer changes:
+    #   - AutoTuner.clear_cache() or load_configs() replaces the stored winner;
+    #   - autotune(skip_ops=...) asks for the fallback tactic instead;
+    #   - autotune(tuning_buckets=..., round_up=..., cuda_graph_profile_replays=...)
+    #     or an autotune_v2 measurement policy changes which entry is looked up.
+    #
+    # Recommended if the saving is needed:
+    #   1. First, make AutoTuner.choose_one() cheaper when not tuning; every
+    #      operator benefits and nothing here has to track tuner state.
+    #   2. Otherwise, cache here with all three conditions handled:
+    #      - key on (op name, device, m, n, k, rank, enable_pdl, has_bias,
+    #        workspace bytes), i.e. this function's arguments plus
+    #        inputs[-1].numel() * inputs[-1].element_size();
+    #      - add the tuner's state generation to the key. The AutoTuner has no
+    #        such counter today: add one that every winner write increments
+    #        (clear_cache, load_configs, profiling and record publication);
+    #      - skip the cache whenever skip_ops, a tuning override or a
+    #        measurement policy is active, or the tuner is in tuning mode;
+    #      - store only tactics that pass _svdquant_workspace_safe_tactic.
+    op_name = _sm120_linear_op_name(m, k, rank, enable_pdl=enable_pdl)
     runner, tactic = tuner.choose_one(
         op_name,
         runners,
         tuning_config,
         inputs,
     )
-    tactic = _svdquant_workspace_safe_tactic(runner, inputs, tactic)
-    if tactic >= 0:
-        runner_id = next(
-            index for index, candidate in enumerate(runners) if candidate is runner
-        )
-        _SM120_LINEAR_DISPATCH_CACHE[cache_key] = (runner_id, tactic)
-    return runner, tactic
+    return runner, _svdquant_workspace_safe_tactic(runner, inputs, tactic)
 
 
 def _svdquant_tuning_config(backend_key: str) -> TuningConfig:

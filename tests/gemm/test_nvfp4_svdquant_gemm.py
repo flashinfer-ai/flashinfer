@@ -4962,7 +4962,6 @@ def test_rank64_complete_linear_with_fused_runner_only(
         return [backend._sm120_fused_linear_runner(enable_pdl, device, rank)]
 
     monkeypatch.setattr(backend, "_cached_sm120_linear_runners", fused_runners)
-    monkeypatch.setattr(backend, "_SM120_LINEAR_DISPATCH_CACHE", {})
     backend.AutoTuner.get().clear_cache()
     try:
         _check_linear_graph_replay(64, shape, True, True)
