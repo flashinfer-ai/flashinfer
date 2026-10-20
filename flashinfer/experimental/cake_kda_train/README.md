@@ -89,13 +89,15 @@ rule (`cake_backend.seg_states_saved(S, NSEG)`,
 `SEG_SAVE_MIN_TOKENS_PER_SEG = 384`) saves the states exactly when they are
 no larger than the `Aqk` / `Akk` set (`3 * NSEG * H * 65536 <= 2 * S * H *
 256`).  With `NSEG = num_docs * P` and `P = clamp(ceil(4 * sm_count /
-(num_docs * H)), 1, 64)`, `NSEG * H` is about `4 * sm_count` for
-`num_docs * H >= 10`, so the states cost about `12 * sm_count * 64 KiB`
-(115 MiB on a 152-SM device) independent of `S`, and the threshold is about
-58k tokens at `H = 4` (four documents), 29k at `H = 8` and `384 * 64 *
-num_docs` tokens where `P` is capped at 64 (24576 for one document at
-`H = 1`, 98304 for four); the contract's performance shapes (`S` around
-240k-260k tokens) all save, a pack of a few thousand tokens does not.  Every
+(num_docs * H)), 1, 64)` (at most 38 with `num_docs * H <= 4`), `NSEG * H` is
+about `4 * sm_count` for `num_docs * H >= 10`, so the states cost about
+`12 * sm_count * 64 KiB` (115 MiB on a 152-SM device) independent of `S`, and
+the threshold is about 58k tokens at `H = 4` (four documents), 29k at `H = 8`,
+`384 * 38 * num_docs` tokens with at most four chains (14592 for one document
+at `H = 1`, 58368 for four) and `384 * 64 * num_docs` tokens where `P` is
+capped at 64 (196608 for eight documents at `H = 1`); the contract's
+performance shapes (`S` around 240k-260k tokens) all save, a pack of a few
+thousand tokens does not.  Every
 tensor of the set is allocated by the call that writes it: a saved set can go
 to a backward on any workspace of the same problem.  A caller may keep only
 `Aqk` / `Akk` (`tables=None`).  With `save_for_backward=False` the token-row
@@ -138,25 +140,32 @@ Forward (six launches; nine on the segmented route): `table` (chunk tables
 from `cu_seqlens`, one CTA) and, on the segmented route, `seg_table` (the
 segment table, one CTA), `fwd_prep` (`bulk` at >= 256 chunk-head CTAs, else
 `split` with two CTAs per chunk: the gated keys / values of the GLM contract on
-the chunk layout), `fwd_intra` (the intra-chunk `Aqk` / `Akk` and, with
-`save_for_backward`, their token-row copies), `wy` (the WY representation `u`,
+the chunk layout, and of the gate prefix only the chunk-final row `fwdh`
+reads), `fwd_intra` (the intra-chunk `Aqk` / `Akk` and, with
+`save_for_backward`, their token-row copies; it rebuilds the gate prefix from
+the token-row `g` in shared memory), `wy` (the WY representation `u`,
 `w`; one CTA per chunk pair), the state recurrence `fwdh` and `fwd_o` (the
 output; persistent grid of `min(NC_pad * H, sm_count)` CTAs).
 
 The state recurrence has two routes, chosen by the head count alone.  With
 `H > 8` the serial walk over each document's chunk chain runs: `fwdh_v2` with
-four CTAs per document and head when `num_docs * H * 4 <= 4 * sm_count`, else
-`fwdh_v1` with two.  With `H <= 8` the segmented route runs: every document is
-cut into `P = clamp(ceil(4 * sm_count / (num_docs * H)), 1, 64)` chunk-aligned
-segments (`NSEG = num_docs * P` pseudo-sequences, `seg_chunk_start`), `fwdh_v3`
-pass 1 walks every segment from zero and from the identity (grid
-`2 * NSEG * H`: the segment offsets and transfers, FP32 `[128, 128]` each),
-`seg_carry` chains them within each document (one CTA per document and head;
-TF32 tensor-core products, FP32 accumulation) into the carried initial state of
-every segment, and `fwdh_v3` pass 2 walks from those states (grid `NSEG * H`)
-writing the `h` / `v_new` tapes.  With `save_mode="light"` and `S >= 384 *
-NSEG` the offsets / transfers and the carried states are written into the
-saved set's `seg_state` / `hseg` instead of the workspace (the same launches).
+four CTAs per document and head (32 value columns each) when `num_docs * H *
+4 <= 4 * sm_count`, else `fwdh_v1` with two CTAs of 64 columns; the two are
+one kernel built at the two widths.  With `H <= 8` the segmented route runs:
+every document is cut into `P` chunk-aligned segments (`NSEG = num_docs * P`
+pseudo-sequences, `seg_chunk_start`) with `P = clamp(ceil(4 * sm_count /
+(num_docs * H)), 1, 64)`, capped at 38 when `num_docs * H <= 4` (with few
+chains the shorter carry, 37 steps instead of 63, outweighs the lost
+parallelism of the segment walks; `cake_jit.SEGMENTS`); `fwdh_v3` pass 1
+walks every segment from zero and from
+the identity (grid `2 * NSEG * H`: the segment offsets and transfers, FP32
+`[128, 128]` each), `seg_carry` chains them within each document (one CTA per
+document and head; TF32 tensor-core products, FP32 accumulation) into the
+carried initial state of every segment, and `fwdh_v3` pass 2 walks from those
+states (grid `NSEG * H`) writing the `h` / `v_new` tapes.  With
+`save_mode="light"` and `S >= 384 * NSEG` the offsets / transfers and the
+carried states are written into the saved set's `seg_state` / `hseg` instead
+of the workspace (the same launches).
 
 Backward from a version-3 saved set (eight launches; on the segmented route
 twelve, or ten when the set carries the segment-boundary states: `fwdh_v3`
@@ -165,12 +174,14 @@ transfers): `bwd_prep` (`g8` at >= 256 CTAs, `g8s` with two CTAs per chunk at
 128..255, else `v2`; copies the saved `Aqk` / `Akk` onto the chunk layout),
 `wy`, `fwdh` (as above), `dav` (`dA_qk` and the first part of `dv`; one CTA per
 chunk pair), the adjoint recurrence `dhu` (the state gradient `dh` and `dv2`:
-`dhu_v2` with four CTAs per document and head when `num_docs * H * 4 <=
-sm_count`, else `dhu_v1`, for `H > 8`; for `H <= 8` `dhu_v3` pass 1 in reverse
-from zero, `seg_carry` in reverse with the forward's transfers, `dhu_v3` pass 2
-from the carried adjoint states), `dqkg` (fused dq / dk / dg / dbeta partials
-and `dA_kk`; persistent grid of `min(NC_pad * H, sm_count)` CTAs), `glm_intra`
-(the intra-chunk terms and the GLM gate chain) and `gate_epilogue` (the
+`dhu_v2` with four CTAs per document and head (32 value columns each) when
+`num_docs * H * 4 <= 4 * sm_count`, else `dhu_v1` with two CTAs of 64 columns,
+for `H > 8`, one kernel at two widths like `fwdh`; for `H <= 8` `dhu_v3` pass 1
+in reverse from zero, `seg_carry` in reverse with the forward's transfers,
+`dhu_v3` pass 2 from the carried adjoint states), `dqkg` (fused dq / dk / dg /
+dbeta partials and `dA_kk`; persistent grid of `min(NC_pad * H, sm_count)`
+CTAs), `glm_intra` (the intra-chunk terms and the GLM gate chain; TF32
+tensor-core products with FP32 accumulation) and `gate_epilogue` (the
 token-row `dg` and `dbeta`).  One launch more (two on the segmented route) when
 the saved set carries no tables; from a version-2 saved set `fwdh` is skipped
 (seven / nine launches); on the checkpoint replay path (`saved=None`) `table`
@@ -182,6 +193,29 @@ The selection and grid rules are data in `cake_jit.MODULES` (`select_rule`,
 are evaluated by `cake_jit.select_record` / `launch_grid` / `segment_plan`;
 `cake_backend.plan(S, num_docs, H, sm_count)` resolves them once per problem,
 and `Plan.launch_count(boundary)` is the launch count of each boundary.
+
+### Programs by stage
+
+21 programs from 19 kernels: the serial state recurrences (`fwdh_v1` /
+`fwdh_v2`, `dhu_v1` / `dhu_v2`) are one kernel each, built at 64 and at 32
+value columns per CTA (two and four CTAs per document and head).
+
+| stage | records | dispatch |
+|---|---|---|
+| `table` | `table` | every call |
+| `seg_table` | `seg_table` | segmented route (`H <= 8`) |
+| `fwd_prep` | `fwd_prep_bulk`, `fwd_prep_split` | `bulk` at >= 256 chunk-head CTAs, else `split` |
+| `fwd_intra` | `fwd_intra` | forward, and the checkpoint replay |
+| `wy` | `wy` | forward and backward |
+| `fwdh` | `fwdh_v1` (64 columns), `fwdh_v2` (32 columns), `fwdh_v3` | serial `v2` when `num_docs * H * 4 <= 4 * sm_count`, else `v1` (`H > 8`); segmented `v3`, two passes (`H <= 8`) |
+| `seg_carry` | `seg_carry` | segmented route, between the two passes |
+| `fwd_o` | `fwd_o` | forward |
+| `bwd_prep` | `bwd_prep_v2`, `bwd_prep_g8`, `bwd_prep_g8s` | `g8` at >= 256 chunk-head CTAs, `g8s` at 128..255, else `v2` |
+| `dav` | `dav` | backward |
+| `dhu` | `dhu_v1` (64 columns), `dhu_v2` (32 columns), `dhu_v3` | serial `v2` when `num_docs * H * 4 <= 4 * sm_count`, else `v1` (`H > 8`); segmented `v3`, two passes (`H <= 8`) |
+| `dqkg` | `dqkg` | backward |
+| `glm_intra` | `glm_intra` | backward |
+| `gate_epilogue` | `gate_epilogue` | backward |
 
 ## Layout of this package
 

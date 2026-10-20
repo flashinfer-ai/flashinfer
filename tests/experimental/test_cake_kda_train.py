@@ -56,13 +56,15 @@ FWD_BULK_MIN_CTAS = 256
 G8_MIN_CTAS = 256
 G8S_MIN_CTAS = 128
 FWDH_V2_CTAS_PER_SM = 4
-DHU_V2_CTAS_PER_SM = 1
+DHU_V2_CTAS_PER_SM = 4
 RECUR_SLICES = {"v1": 2, "v2": 4}
 # The segmented recurrences: at most SEG_MAX_H heads, clamp(ceil(SEG_SLOT_FACTOR * sm / (N * H)), 1, SEG_P_MAX)
-# segments per document.
+# segments per document, at most SEG_P_SMALL of them with N * H <= SEG_P_SMALL_MAX_NH (document, head) chains.
 SEG_MAX_H = 8
 SEG_SLOT_FACTOR = 4
 SEG_P_MAX = 64
+SEG_P_SMALL = 38
+SEG_P_SMALL_MAX_NH = 4
 OPTIONAL_STAGES = ("seg_table", "seg_carry")
 
 # Small packings: single documents around the chunk length, packs with unaligned tails, a zero-length document
@@ -135,6 +137,8 @@ def test_registry_records_are_well_formed() -> None:
         "max_heads": SEG_MAX_H,
         "slot_factor": SEG_SLOT_FACTOR,
         "max_segments": SEG_P_MAX,
+        "small_segments": SEG_P_SMALL,
+        "small_max_chains": SEG_P_SMALL_MAX_NH,
     }
     stages = set()
     tensors, scalars = set(cake_jit.LOGICAL_TENSORS), set(cake_jit.LOGICAL_SCALARS)
@@ -223,6 +227,8 @@ def test_registry_records_are_well_formed() -> None:
 def _expected_segments(n: int, h: int, sm: int) -> tuple[str, int, int]:
     if h <= SEG_MAX_H:
         p = min(SEG_P_MAX, max(1, -(-SEG_SLOT_FACTOR * sm // (n * h))))
+        if n * h <= SEG_P_SMALL_MAX_NH:
+            p = min(p, SEG_P_SMALL)
         return "seg", p, n * p
     return "serial", 1, 0
 
@@ -357,6 +363,22 @@ def test_segmented_grids_need_segments_and_a_known_launch() -> None:
         cake_jit.segment_plan(0, 4, 148)
 
 
+def test_few_chains_cap_the_segment_count() -> None:
+    # Four documents at H = 1 (four chains): 38 segments per document (NSEG = 152)
+    # instead of the clamp's 64, a 37-step carry chain instead of 63; eight chains
+    # keep the clamp.  A host-plan constant: no record changes with it.
+    for sm in (132, 148, 152, 160):
+        assert cake_jit.segment_plan(4, 1, sm) == ("seg", 38, 152)
+        assert cake_jit.segment_plan(1, 4, sm) == ("seg", 38, 38)
+        assert cake_jit.segment_plan(8, 1, sm) == ("seg", 64, 512)
+        assert cake_jit.segment_plan(2, 4, sm) == ("seg", 64, 128)
+        p = cake_backend.plan(1024, 4, 1, sm)
+        assert (p.recur, p.P, p.NSEG) == ("seg", 38, 152)
+        assert cake_backend.plan(1024, 8, 1, sm).P == 64
+    # below the clamp the cap is inert: four chains on a 32-SM device give 32
+    assert cake_jit.segment_plan(4, 1, 32) == ("seg", 32, 128)
+
+
 def test_pairs_grid_needs_an_even_chunk_bound() -> None:
     with pytest.raises(ValueError, match="not even"):
         cake_jit.launch_grid(
@@ -426,7 +448,7 @@ def test_seg_state_rule_is_a_pure_function_of_the_scalars() -> None:
         assert (
             nseg
             == cake_backend.plan(k * nseg, n, h, sm).NSEG
-            == n * min(SEG_P_MAX, max(1, -(-SEG_SLOT_FACTOR * sm // (n * h))))
+            == _expected_segments(n, h, sm)[2]
         )
         assert cake_backend.plan(k * nseg, n, h, sm).seg_save is True
         assert cake_backend.plan(k * nseg - 1, n, h, sm).seg_save is False
@@ -1053,8 +1075,9 @@ def test_operand_checks(device, manifest) -> None:
     assert cake_backend.is_supported(device)
 
 
-# The size rule's smallest instances: one document at H = 1 and two documents at H = 2 cap P at 64 on any device
-# with at least 16 SMs, so NSEG = 64 * num_docs and the threshold is 384 * NSEG tokens (24576 and 49152).
+# The size rule's smallest instances: one document at H = 1 and two documents at H = 2 have at most four chains,
+# so P = SEG_P_SMALL on any device with at least 38 SMs, NSEG = 38 * num_docs and the threshold is 384 * NSEG
+# tokens (14592 and 29184).
 STATE_SHAPES = [(1, 1), (2, 2)]
 
 
@@ -1071,7 +1094,7 @@ def test_light_saved_set_carries_the_segment_states_above_the_size_rule(
 
     sm = cake_jit.sm_count(device.index)
     nseg = cake_backend.plan(1, num_docs, heads, sm).NSEG  # independent of S
-    assert nseg == 64 * num_docs
+    assert nseg == SEG_P_SMALL * num_docs
     threshold = cake_backend.SEG_SAVE_MIN_TOKENS_PER_SEG * nseg
     block = nseg * heads * D * D * 4
 

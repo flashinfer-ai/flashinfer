@@ -39,8 +39,10 @@ serial route).
 
 The state recurrences (``fwdh``, ``dhu``) have two forms.  With more than
 ``SEGMENTS["max_heads"]`` heads the serial walk over each document's chunk
-chain runs (``fwdh_v2`` / ``dhu_v2`` when their one-wave form fits the device,
-else ``fwdh_v1`` / ``dhu_v1``).  With at most that many heads the segmented
+chain runs: ``fwdh_v2`` / ``dhu_v2`` (four CTAs of 32 value columns per
+document and head) when their one-wave form fits the device, else ``fwdh_v1``
+/ ``dhu_v1`` (two CTAs of 64 columns); each pair is one kernel built at the
+two widths.  With at most that many heads the segmented
 route runs: every document is cut into ``segments`` chunk-aligned segments
 (:func:`segment_plan`; ``seg_table`` writes the segment table), the ``v3``
 program walks every segment in parallel (pass 1: the per-segment transfer and
@@ -118,8 +120,17 @@ OPTIONAL_STAGES = ("seg_table", "seg_carry")
 # ``max_heads``): with at most ``max_heads`` heads every document is cut into
 # ``clamp(ceil(slot_factor * sm_count / (num_seqs * num_heads)), 1,
 # max_segments)`` segments, so the segment walks fill about ``slot_factor / 2``
-# waves of the device's SMs at two CTAs per SM.
-SEGMENTS = {"max_heads": 8, "slot_factor": 4, "max_segments": 64}
+# waves of the device's SMs at two CTAs per SM.  With at most
+# ``small_max_chains`` (document, head) chains the count is capped at
+# ``small_segments``: the carry chain then takes 37 steps instead of 63, which
+# outweighs the lost parallelism of the segment walks.
+SEGMENTS = {
+    "max_heads": 8,
+    "slot_factor": 4,
+    "max_segments": 64,
+    "small_segments": 38,
+    "small_max_chains": 4,
+}
 
 # Logical argument names the host backend binds; every record maps its kernel
 # parameter names onto this vocabulary (``record["logical"]``).  ``aqk_src`` /
@@ -315,7 +326,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_train_1a75278374f576e3e925",
+        "kernel_symbol": "kernel_cake_kda_train_d5660cf9f80dc66248ca",
         "launch": {
             "block": (512, 1, 1),
             "cluster": (1, 1, 1),
@@ -323,7 +334,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 36864,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_1a75278374f576e3e925",
+        "library": "cake_kda_train_d5660cf9f80dc66248ca",
         "logical": {
             "beta": "beta",
             "chunk_bos": "chunk_bos",
@@ -371,7 +382,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 2},
-        "kernel_symbol": "kernel_cake_kda_train_d8f2320a3b5d72e9fd1c",
+        "kernel_symbol": "kernel_cake_kda_train_786e47d493c49202746d",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -379,7 +390,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 36864,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_d8f2320a3b5d72e9fd1c",
+        "library": "cake_kda_train_786e47d493c49202746d",
         "logical": {
             "beta": "beta",
             "chunk_bos": "chunk_bos",
@@ -407,7 +418,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": [
             ["buffer", "q"],
             ["buffer", "k"],
-            ["buffer", "gk"],
+            ["buffer", "g"],
             ["buffer", "beta"],
             ["buffer", "chunk_bos"],
             ["buffer", "chunk_len"],
@@ -427,7 +438,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_train_6e17ba1f5255e2a02f99",
+        "kernel_symbol": "kernel_cake_kda_train_306aae2e2c82a3f0d3db",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -435,7 +446,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 75008,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_6e17ba1f5255e2a02f99",
+        "library": "cake_kda_train_306aae2e2c82a3f0d3db",
         "logical": {
             "akk_ext": "akk_ext",
             "akk_int": "akk_int",
@@ -444,7 +455,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "beta": "beta",
             "chunk_bos": "chunk_bos",
             "chunk_len": "chunk_len",
-            "gk": "gk",
+            "g": "g",
             "group": "group",
             "k": "k",
             "num_heads": "num_heads",
@@ -511,7 +522,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 2},
-        "kernel_symbol": "kernel_cake_kda_train_342d70d93ebddee6a622",
+        "kernel_symbol": "kernel_cake_kda_train_2917914a1e3754ccb29a",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -519,7 +530,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 91136,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_342d70d93ebddee6a622",
+        "library": "cake_kda_train_2917914a1e3754ccb29a",
         "logical": {
             "gk": "gk",
             "h_out": "h",
@@ -551,7 +562,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 4},
-        "kernel_symbol": "kernel_cake_kda_train_67a40c79b332f9cf84a1",
+        "kernel_symbol": "kernel_cake_kda_train_92cbb09e833f6b267e8b",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -559,7 +570,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 78848,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_67a40c79b332f9cf84a1",
+        "library": "cake_kda_train_92cbb09e833f6b267e8b",
         "logical": {
             "gk": "gk",
             "h_out": "h",
@@ -604,7 +615,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [2, 1]},
-        "kernel_symbol": "kernel_cake_kda_train_27ed8ad8a98451b3225c",
+        "kernel_symbol": "kernel_cake_kda_train_4d5747ddbfa915b5a163",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -612,7 +623,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_27ed8ad8a98451b3225c",
+        "library": "cake_kda_train_4d5747ddbfa915b5a163",
         "logical": {
             "eye": "eye",
             "gk": "gk",
@@ -650,15 +661,15 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "docs_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_63b327543acec30ccf16",
+        "kernel_symbol": "kernel_cake_kda_train_56de21f4c00e805321dc",
         "launch": {
-            "block": (192, 1, 1),
+            "block": (576, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 197632,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_63b327543acec30ccf16",
+        "library": "cake_kda_train_56de21f4c00e805321dc",
         "logical": {
             "b": "carry_b",
             "h_out": "carry_out",
@@ -1016,15 +1027,15 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 2},
-        "kernel_symbol": "kernel_cake_kda_train_55f24533bf5a9e11bca7",
+        "kernel_symbol": "kernel_cake_kda_train_71d4af02c1baa5148600",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 140288,
+            "dynamic_smem_bytes": 82944,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_55f24533bf5a9e11bca7",
+        "library": "cake_kda_train_71d4af02c1baa5148600",
         "logical": {
             "dh_out": "dh",
             "do_tma": "do_int",
@@ -1062,15 +1073,15 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 4},
-        "kernel_symbol": "kernel_cake_kda_train_e06f36b004d0c953a36d",
+        "kernel_symbol": "kernel_cake_kda_train_0ea173162573b1521e36",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 119808,
+            "dynamic_smem_bytes": 66560,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_e06f36b004d0c953a36d",
+        "library": "cake_kda_train_0ea173162573b1521e36",
         "logical": {
             "dh_out": "dh",
             "do_tma": "do_int",
@@ -1088,7 +1099,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "all_of",
             "rules": [
                 {"kind": "heads_above", "min": 8},
-                {"kind": "slots_at_most", "slices": 4, "ctas_per_sm": 1},
+                {"kind": "slots_at_most", "slices": 4, "ctas_per_sm": 4},
             ],
         },
         "stage": "dhu",
@@ -1120,7 +1131,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [1, 1]},
-        "kernel_symbol": "kernel_cake_kda_train_1eb0799e453deee24f9b",
+        "kernel_symbol": "kernel_cake_kda_train_340466b2bf3aad16d9a5",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -1128,7 +1139,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_1eb0799e453deee24f9b",
+        "library": "cake_kda_train_340466b2bf3aad16d9a5",
         "logical": {
             "dh_out": "dh",
             "dht": "dhseg",
@@ -1250,15 +1261,15 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_train_30cb08c6a4c77c18cc5c",
+        "kernel_symbol": "kernel_cake_kda_train_69c9a9af4a77508b1e38",
         "launch": {
-            "block": (256, 1, 1),
+            "block": (288, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 104704,
+            "dynamic_smem_bytes": 115200,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_30cb08c6a4c77c18cc5c",
+        "library": "cake_kda_train_69c9a9af4a77508b1e38",
         "logical": {
             "beta": "beta_int",
             "chunk_bos": "chunk_bos",
@@ -1377,9 +1388,11 @@ def _admits(
 def segment_plan(num_seqs: int, num_heads: int, sm_count: int) -> tuple[str, int, int]:
     """``(route, segments, num_segments)`` of the state recurrences: ``("seg", P,
     num_seqs * P)`` with ``P = clamp(ceil(slot_factor * sm_count / (num_seqs *
-    num_heads)), 1, max_segments)`` when ``num_heads <= SEGMENTS["max_heads"]``,
-    else the serial walk ``("serial", 1, 0)``.  A pure function of the scalars,
-    the same bound the ``heads_at_most`` rules of the segmented records read.
+    num_heads)), 1, max_segments)``, capped at ``small_segments`` when
+    ``num_seqs * num_heads <= small_max_chains``, when ``num_heads <=
+    SEGMENTS["max_heads"]``, else the serial walk ``("serial", 1, 0)``.  A pure
+    function of the scalars, the same bound the ``heads_at_most`` rules of the
+    segmented records read.
     """
     n, h, sm = int(num_seqs), int(num_heads), int(sm_count)
     if n < 1 or h < 1 or sm < 1:
@@ -1391,6 +1404,8 @@ def segment_plan(num_seqs: int, num_heads: int, sm_count: int) -> tuple[str, int
         return ("serial", 1, 0)
     segments = -(-int(SEGMENTS["slot_factor"]) * sm // (n * h))
     segments = min(int(SEGMENTS["max_segments"]), max(1, segments))
+    if n * h <= int(SEGMENTS["small_max_chains"]):
+        segments = min(segments, int(SEGMENTS["small_segments"]))
     return ("seg", segments, n * segments)
 
 
