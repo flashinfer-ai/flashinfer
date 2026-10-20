@@ -1,8 +1,9 @@
 import functools
 from types import SimpleNamespace
-from typing import Literal, Optional, Tuple
+from typing import Dict, Literal, Optional, Tuple
 
 import torch
+import tvm_ffi
 
 from ..api_logging import flashinfer_api
 from ..cutile import is_cuda_tile_available
@@ -10,6 +11,11 @@ from ..trace.templates.quantize import (
     mxfp8_grouped_quantize_trace,
     mxfp8_quantize_trace,
 )
+from ..jit.cake_grouped_mxfp8_quantize import (
+    BF16 as _CAKE_GROUPED_MXFP8_BF16,
+    F16 as _CAKE_GROUPED_MXFP8_F16,
+)
+from ..jit.cake_program import CakeProgram
 from ..jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from ..utils import (
     device_support_pdl,
@@ -379,6 +385,158 @@ def get_mxfp8_grouped_quantization_module():
     )
 
 
+# Generated Cake programs of the grouped MXFP8 quantizer, one per input dtype.
+# Both read two-byte elements through one bfloat16 pointer (the float16
+# program widens with its own conversion), so the host selects the program by
+# dtype and passes float16 storage as a bfloat16 view.  Each program ships for
+# exact compute capability 10.0 (sm_100a) and 10.3 (sm_103a) only.
+_CAKE_GROUPED_MXFP8_PROGRAMS: Dict[torch.dtype, CakeProgram] = {
+    torch.bfloat16: _CAKE_GROUPED_MXFP8_BF16,
+    torch.float16: _CAKE_GROUPED_MXFP8_F16,
+}
+_CAKE_QUANT_BLOCK = 32
+# One block row per M and one grid slice per B: CUDA caps grid.y and grid.z at 65535.
+_CAKE_MAX_GRID_YZ = 65535
+_CAKE_SCALE_TILE = 128
+
+
+def _cake_grouped_mxfp8_device_index(device: torch.device) -> int:
+    if device.type != "cuda":
+        raise RuntimeError(
+            f"the Cake grouped MXFP8 backend requires a CUDA device, got {device}"
+        )
+    return torch.cuda.current_device() if device.index is None else device.index
+
+
+@functools.cache
+def _cake_grouped_mxfp8_capability(device_index: int) -> Tuple[int, int]:
+    major, minor = torch.cuda.get_device_capability(device_index)
+    return int(major), int(minor)
+
+
+def _cake_grouped_mxfp8_target(program: CakeProgram, device: torch.device) -> str:
+    """The exact compile target of ``program`` on ``device`` (capability cached per device index)."""
+    major, minor = _cake_grouped_mxfp8_capability(
+        _cake_grouped_mxfp8_device_index(device)
+    )
+    target = program.target_for((major, minor))
+    if target is None:
+        raise RuntimeError(
+            f"the Cake grouped MXFP8 backend requires exact compute capability 10.0 or 10.3, got {major}.{minor}"
+        )
+    return target
+
+
+def is_cake_grouped_mxfp8_quantize_available(
+    dtype: torch.dtype, device: torch.device
+) -> bool:
+    """Whether a generated program serves ``dtype`` on ``device`` (no I/O; the capability query is cached)."""
+    program = _CAKE_GROUPED_MXFP8_PROGRAMS.get(dtype)
+    if program is None or device.type != "cuda":
+        return False
+    try:
+        _cake_grouped_mxfp8_target(program, device)
+    except RuntimeError:
+        return False
+    return True
+
+
+def cake_grouped_mxfp8_quantize_grid(
+    program: CakeProgram, b: int, m: int, blocks_per_row: int
+) -> Tuple[int, int, int]:
+    """Launch grid ``(grid_x, grid_y, grid_z)`` of ``program`` for ``b`` groups of
+    ``m`` rows with ``blocks_per_row`` quantization blocks per row.
+
+    One thread per block along x in CTAs of ``program.block[0]`` threads (the
+    last CTA of a row is partial when ``blocks_per_row`` is not a multiple of
+    the CTA width), one CTA row per M and one grid slice per group.
+    """
+    threads = program.block[0]
+    return ((blocks_per_row + threads - 1) // threads, m, b)
+
+
+def cake_grouped_mxfp8_quantize_launch(
+    a: torch.Tensor,
+    mask: torch.Tensor,
+    quantized: torch.Tensor,
+    scales: torch.Tensor,
+) -> None:
+    """Quantize ``a`` ``[B, M, K]`` into the caller-owned ``quantized``
+    ``[B, M, padded_K]`` (E4M3) and ``scales`` ``[B, padded_M, padded_K / 32]``
+    (UE8M0 bytes in the 128x4 grouped-GEMM layout) on the current stream.
+
+    No allocation, no synchronization; the generated binding checks the tensor
+    dtypes, devices and contiguity and the host checks the shapes here, so
+    callers pass contiguous tensors of exactly these shapes.  Empty problems
+    (``B == 0`` or ``M == 0``) write nothing.
+    """
+    b, m, k = a.shape
+    if b == 0 or m == 0:
+        return
+    if k % _CAKE_QUANT_BLOCK != 0:
+        raise ValueError(f"K must be divisible by {_CAKE_QUANT_BLOCK}, got {k}")
+    if m > _CAKE_MAX_GRID_YZ or b > _CAKE_MAX_GRID_YZ:
+        raise ValueError(
+            f"B and M must not exceed the CUDA grid limit {_CAKE_MAX_GRID_YZ}, got B={b}, M={m}"
+        )
+    program = _CAKE_GROUPED_MXFP8_PROGRAMS.get(a.dtype)
+    if program is None:
+        raise TypeError(f"unsupported Cake grouped MXFP8 input dtype: {a.dtype}")
+    target = _cake_grouped_mxfp8_target(program, a.device)
+    # The binding validates dtype, device, contiguity and scalar ranges; the
+    # shapes the kernel's scalars are derived from are validated here.
+    quantized_shape = tuple(quantized.shape)
+    scales_shape = tuple(scales.shape)
+    padded_k = quantized_shape[2] if len(quantized_shape) == 3 else 0
+    padded_m = scales_shape[1] if len(scales_shape) == 3 else 0
+    if tuple(mask.shape) != (b,):
+        raise ValueError(f"mask must have shape [B] = [{b}], got {list(mask.shape)}")
+    if (
+        quantized_shape != (b, m, padded_k)
+        or padded_k % _CAKE_SCALE_TILE
+        or padded_k < max(k, _CAKE_SCALE_TILE)
+    ):
+        raise ValueError(
+            "quantized must have shape [B, M, padded_K] with padded_K a positive "
+            f"multiple of {_CAKE_SCALE_TILE} and >= K={k}, got {list(quantized_shape)}"
+        )
+    blocks_per_row = padded_k // _CAKE_QUANT_BLOCK
+    if (
+        scales_shape != (b, padded_m, blocks_per_row)
+        or padded_m % _CAKE_SCALE_TILE
+        or padded_m < m
+    ):
+        raise ValueError(
+            "scales must have shape [B, padded_M, padded_K / 32] with padded_M a "
+            f"multiple of {_CAKE_SCALE_TILE} and >= M={m}, got {list(scales_shape)}"
+        )
+    pm_tiles = padded_m // _CAKE_SCALE_TILE
+    pk_tiles = padded_k // _CAKE_SCALE_TILE
+    grid_x, grid_y, grid_z = cake_grouped_mxfp8_quantize_grid(
+        program, b, m, blocks_per_row
+    )
+    values = dict(
+        x=a if a.dtype == torch.bfloat16 else a.view(torch.bfloat16),
+        mask=mask,
+        quantized=quantized,
+        scales=scales.view(b, pm_tiles, pk_tiles, 32, 4, 4),
+        M=m,
+        K=k,
+        PADDED_K=padded_k,
+        PM_TILES=pm_tiles,
+        PK_TILES=pk_tiles,
+        BLOCKS_PER_ROW=blocks_per_row,
+        TOTAL_TASKS=b * m * blocks_per_row,
+        grid_x=grid_x,
+        grid_y=grid_y,
+        grid_z=grid_z,
+    )
+    entry = program.entry(target)
+    arguments = [values[name] for name in program.args]
+    with tvm_ffi.use_torch_stream():
+        entry(*arguments)
+
+
 @functools.cache
 def get_cake_mxfp8_grouped_quantization_module():
     """Register the generated Cake grouped MXFP8 op and fake metadata twin."""
@@ -391,10 +549,6 @@ def get_cake_mxfp8_grouped_quantization_module():
         a: torch.Tensor,
         mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        from ..jit.cake_grouped_mxfp8_quantize import (
-            cake_grouped_mxfp8_quantize_launch,
-        )
-
         b, m, k = a.shape
         padded_k = _round_up(k, 128)
         padded_m = _round_up(m, 128)
@@ -441,10 +595,6 @@ def _mxfp8_grouped_quantize_cake(
 
     if backend != "cake":
         raise ValueError(f"internal Cake dispatch received backend={backend!r}")
-    from ..jit.cake_grouped_mxfp8_quantize import (
-        is_cake_grouped_mxfp8_quantize_available,
-    )
-
     if not is_cake_grouped_mxfp8_quantize_available(a.dtype, a.device):
         raise RuntimeError(
             "backend='cake' requires float16 or bfloat16 input on a device of "
