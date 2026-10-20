@@ -477,6 +477,12 @@ kernel_minimax_h3_out_proj_bf16(const __grid_constant__ CUtensorMap A, const __g
                     }
                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
                 }
+                #pragma unroll 1
+                for (int _ = 0; _ < 7; _++) {
+                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
+                    load_stage += 1;
+                    if (load_stage == 7) { load_stage = 0; _phase_mma_done ^= 1; }
+                }
             }
         }
     }
@@ -1302,6 +1308,12 @@ kernel_minimax_h3_out_proj_e4m3(const __grid_constant__ CUtensorMap A, const __g
                         break;
                     }
                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                }
+                #pragma unroll 1
+                for (int _ = 0; _ < 3; _++) {
+                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
+                    load_stage += 1;
+                    if (load_stage == 3) { load_stage = 0; _phase_mma_done ^= 1; }
                 }
             }
         }
@@ -2176,6 +2188,12 @@ kernel_minimax_h3_out_proj_e2m1(const __grid_constant__ CUtensorMap A, const __g
                         break;
                     }
                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                }
+                #pragma unroll 1
+                for (int _ = 0; _ < 5; _++) {
+                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
+                    load_stage += 1;
+                    if (load_stage == 5) { load_stage = 0; _phase_mma_done ^= 1; }
                 }
             }
         }
