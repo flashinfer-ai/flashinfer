@@ -907,6 +907,22 @@ def test_run_returns_caller_owned_output_and_lse_by_identity(monkeypatch):
     assert actual_lse is lse
 
 
+def test_explicit_fa2_run_does_not_prepare_tuning_inputs(monkeypatch):
+    import flashinfer.mla as mla
+
+    _patch_fake_fa_module(monkeypatch, _FakeBatchMLAModule())
+    wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
+    wrapper.plan(metadata=_dense_metadata(), **COMMON_PLAN_KWARGS)
+    query, kv_cache = _packed_inputs()
+    monkeypatch.setattr(
+        wrapper._planned_backend,
+        "_prepare_planned_inputs",
+        lambda *args: pytest.fail("eager run must not prepare tuning inputs"),
+    )
+    out = torch.empty(2, 16, 8, dtype=torch.bfloat16)
+    assert wrapper.run(query=query, kv_cache=kv_cache, out=out) is out
+
+
 def _cutlass_plan_kwargs(page_size=64):
     import flashinfer.mla as mla
 
@@ -1294,6 +1310,7 @@ def test_structural_parser_rejects_malformed_tuple_grammar(value, match):
         ("rank", "rank 3"),
         ("leading_shape", "shapes must match"),
         ("dtype", "dtypes must match"),
+        ("device", "devices must match"),
         ("width", "last dimensions"),
     ],
 )
@@ -1308,6 +1325,8 @@ def test_split_structural_inputs_are_validated(mutation, match):
         right = torch.empty(1, 3, 2, dtype=torch.bfloat16)
     elif mutation == "dtype":
         right = right.float()
+    elif mutation == "device":
+        right = torch.empty_like(right, device="meta")
     elif mutation == "width":
         right = torch.empty(2, 3, 3, dtype=torch.bfloat16)
 

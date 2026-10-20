@@ -43,13 +43,23 @@ LEDGER = FuzzLedger(
             backend="cutlass",
             reason="#6741: CUTLASS does not validate page indices against the runtime KV pool",
             quarantine=True,
-        )
+        ),
+        Finding(
+            match=lambda phase: phase == "poisoned_padding",
+            backend="cutlass",
+            reason="#6860: CUTLASS MLA propagates NaNs from last-page tails and dense-table padding",
+            quarantine=True,
+        ),
+        Finding(
+            match=lambda phase: phase == "poisoned_padding",
+            backend="cute-dsl-monolithic",
+            reason="#6861: CuTe DSL monolithic MLA propagates padding NaNs into valid output",
+            quarantine=True,
+        ),
     ],
 )
-OUTPUT_TOLERANCES = {
-    torch.bfloat16: dict(atol=1e-3, rtol=1e-2),
-    torch.float16: dict(atol=2e-4, rtol=2e-3),
-}
+UNIT_ROUNDOFF = {torch.bfloat16: 2**-8, torch.float16: 2**-11}
+BOUND_FACTOR = 8
 
 
 @dataclass(frozen=True)
@@ -79,6 +89,13 @@ class Problem:
     pages: tuple[tuple[int, ...], ...]
     metadata: object
     nan_page: int
+
+
+@dataclass
+class Reference:
+    out: torch.Tensor
+    lse: torch.Tensor
+    magnitude: torch.Tensor
 
 
 def sample_config(seed, backend):
@@ -208,7 +225,7 @@ def make_problem(cfg, device="cuda", *, poison_padding=True):
 def reference_mla(p):
     """Gather logical requests independently of the wrapper's metadata lowering."""
     cfg = p.config
-    outputs, lses, start = [], [], 0
+    outputs, lses, magnitudes, start = [], [], [], 0
     for q_length, kv_length, ids in zip(
         cfg.q_lengths, cfg.kv_lengths, p.pages, strict=True
     ):
@@ -224,10 +241,12 @@ def reference_mla(p):
             kpos = torch.arange(kv_length, device=query.device)[None, :]
             scores.masked_fill_(kpos > kv_length - q_length + qpos, -float("inf"))
         lse = torch.logsumexp(scores, dim=-1).T
-        outputs.append(torch.einsum("hqk,kd->qhd", scores.softmax(-1), ckv))
+        probs = scores.softmax(-1)
+        outputs.append(torch.einsum("hqk,kd->qhd", probs, ckv))
+        magnitudes.append(torch.einsum("hqk,kd->qhd", probs, ckv.abs()))
         lses.append(lse / math.log(2) if cfg.lse_mode == "base2" else lse)
         start += q_length
-    return torch.cat(outputs), torch.cat(lses)
+    return Reference(torch.cat(outputs), torch.cat(lses), torch.cat(magnitudes))
 
 
 def _plan_kwargs(p):
@@ -294,15 +313,42 @@ def _crc(tensor):
 
 
 def _check_numeric(out, lse, p, reference):
-    expected, expected_lse = reference
-    assert torch.isfinite(expected).all()
+    assert torch.isfinite(reference.out).all()
     assert torch.isfinite(out).all()
-    torch.testing.assert_close(
-        out.float(), expected, **OUTPUT_TOLERANCES[p.config.dtype]
+    error = (out.float() - reference.out).abs()
+    bound = (
+        BOUND_FACTOR
+        * UNIT_ROUNDOFF[p.config.dtype]
+        * (reference.magnitude + reference.out.abs())
     )
+    exceeded = error > bound
+    if exceeded.any():
+        ratio = torch.where(
+            bound > 0,
+            error / bound,
+            torch.where(error == 0, 0.0, float("inf")),
+        )
+        index = tuple(int(i) for i in torch.unravel_index(ratio.argmax(), ratio.shape))
+        raise AssertionError(
+            f"{int(exceeded.sum())}/{error.numel()} elements exceed the rounding bound; "
+            f"max ratio={float(ratio[index]):.6g} at {index}, "
+            f"error={float(error[index]):.6g}, bound={float(bound[index]):.6g}"
+        )
     if p.config.lse_mode != "none":
-        assert torch.isfinite(expected_lse).all() and torch.isfinite(lse).all()
-        torch.testing.assert_close(lse, expected_lse, atol=1e-3, rtol=1e-3)
+        assert torch.isfinite(reference.lse).all() and torch.isfinite(lse).all()
+        # FA2 also sums rounded exp(score - max) weights for the normalizer.
+        # Their relative sum error is at most u + N * eta: the sum is >= 1,
+        # and eta = tiny * u bounds subnormal rounding per weight.
+        u = UNIT_ROUNDOFF[p.config.dtype]
+        relative_sum_error = u * (
+            1 + max(p.config.kv_lengths) * torch.finfo(p.config.dtype).tiny
+        )
+        rounding_bound = -math.log1p(-relative_sum_error)
+        if p.config.lse_mode == "base2":
+            rounding_bound /= math.log(2)
+        torch.testing.assert_close(
+            lse, reference.lse, atol=1e-3 + rounding_bound, rtol=1e-3
+        )
 
 
 def _run_and_check(p, wrapper):
@@ -387,7 +433,11 @@ def test_mla_fuzz_valid(seed, backend, workspace):
     cfg = sample_config(seed, backend)
     with _case(cfg, backend):
         control = make_problem(cfg, poison_padding=False)
-        _run_and_check(control, _wrapper(control, backend, workspace))
+        control_wrapper = _wrapper(control, backend, workspace)
+        _run_and_check(control, control_wrapper)
+        LEDGER.xfail_if_quarantined(
+            "poisoned_padding", control_wrapper._planned_backend_name
+        )
         p = make_problem(cfg)
         _run_and_check(p, _wrapper(p, backend, workspace))
 
@@ -671,9 +721,61 @@ def test_mla_reference_detects_missing_kv(dtype, length, loss):
     else:
         removed = 1 if loss == "last_token" else length // 8
         broken = replace(p, config=replace(cfg, kv_lengths=(length - removed,)))
-    out, lse = reference_mla(broken)
+    broken_reference = reference_mla(broken)
     with pytest.raises(AssertionError):
-        _check_numeric(out.to(dtype), lse, p, reference)
+        _check_numeric(
+            broken_reference.out.to(dtype), broken_reference.lse, p, reference
+        )
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("length", (128, 4096))
+def test_mla_reference_accepts_rounded_pv(dtype, length):
+    cfg = Config(79, (1,), (length,), heads=4, dtype=dtype, lse_mode="none")
+    p = make_problem(cfg, "cpu")
+    kv = p.cache[list(p.pages[0])].reshape(-1, CKV + KPE)[:length].float()
+    probs = (
+        torch.einsum("qhd,kd->hqk", p.q.float(), kv) / math.sqrt(128 + KPE)
+    ).softmax(-1)
+    out = torch.einsum(
+        "hqk,kd->qhd", probs.to(dtype).float(), kv[:, :CKV].to(dtype).float()
+    ).to(dtype)
+    _check_numeric(out, None, p, reference_mla(p))
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+def test_mla_reference_zero_bound_requires_exact_output(dtype):
+    p = make_problem(
+        Config(0, (1,), (1,), heads=1, dtype=dtype, lse_mode="none"), "cpu"
+    )
+    p.cache.zero_()
+    reference = reference_mla(p)
+    out = reference.out.to(dtype)
+    _check_numeric(out, None, p, reference)
+    out[0, 0, 0] = torch.finfo(dtype).tiny
+    with pytest.raises(AssertionError, match="max ratio=inf"):
+        _check_numeric(out, None, p, reference)
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("lse_mode", ("base2", "basee"))
+def test_mla_reference_accepts_rounded_lse(dtype, lse_mode):
+    p = make_problem(
+        Config(0, (1,), (2,), heads=1, dtype=dtype, lse_mode=lse_mode), "cpu"
+    )
+    # Zero values and a score shift make the exact output and LSE both zero.
+    # The second exponential lies just below a dtype rounding midpoint.
+    weights = torch.tensor(
+        [1.0, 0.5 + 0.49 * UNIT_ROUNDOFF[dtype]], dtype=torch.float64
+    )
+    lse = weights.to(dtype).double().sum().log() - weights.sum().log()
+    if lse_mode == "base2":
+        lse /= math.log(2)
+    out = torch.zeros((1, 1, CKV), dtype=dtype)
+    reference = Reference(out.float(), torch.zeros((1, 1)), out.float())
+    _check_numeric(out, lse.float().reshape(1, 1), p, reference)
+    with pytest.raises(AssertionError):
+        _check_numeric(out, torch.full((1, 1), 0.1), p, reference)
 
 
 @pytest.mark.parametrize("causal", (False, True))
@@ -689,15 +791,15 @@ def test_mla_reference_uniform(causal, lse_mode):
             page, offset = ids[token // cfg.page_size], token % cfg.page_size
             p.cache[page, offset].zero_()
             p.cache[page, offset, 0] = value
-    out, lse = reference_mla(p)
-    expected_out = torch.zeros_like(out)
+    reference = reference_mla(p)
+    expected_out = torch.zeros_like(reference.out)
     expected_out[:, 0, 0] = torch.tensor([1.5 if causal else 7 / 3, 7 / 3, 12])
-    torch.testing.assert_close(out, expected_out, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(reference.out, expected_out, atol=1e-6, rtol=1e-6)
     lengths = [2, 3, 2] if causal else [3, 3, 2]
     expected = torch.tensor(lengths, dtype=torch.float32).log()[:, None]
     if lse_mode == "base2":
         expected /= math.log(2)
-    torch.testing.assert_close(lse, expected, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(reference.lse, expected, atol=1e-6, rtol=1e-6)
 
 
 def test_mla_reference_pe_and_fp8_scales():
@@ -710,12 +812,17 @@ def test_mla_reference_pe_and_fp8_scales():
     p.cache[page, 0, :CKV] = 2
     p.cache[page, 1, :CKV] = 4
     p.cache[page, 1, CKV] = 1
-    out, lse = reference_mla(p)
+    reference = reference_mla(p)
     logits = torch.tensor([0.0, float(p.q[0, 0, CKV]) * 2 / math.sqrt(128 + KPE)])
     value = logits.softmax(0) @ torch.tensor([1.0, 2.0])
-    torch.testing.assert_close(out, value.expand_as(out), atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(
-        lse, logits.logsumexp(0).expand_as(lse), atol=1e-6, rtol=1e-6
+        reference.out, value.expand_as(reference.out), atol=1e-6, rtol=1e-6
+    )
+    torch.testing.assert_close(
+        reference.lse,
+        logits.logsumexp(0).expand_as(reference.lse),
+        atol=1e-6,
+        rtol=1e-6,
     )
 
 

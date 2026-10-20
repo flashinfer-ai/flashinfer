@@ -7,7 +7,7 @@ you may not use this file except in compliance with the License.
 
 import functools
 import math
-from typing import Callable, ClassVar, Optional, Protocol, Tuple, TypeVar, Union
+from typing import Callable, ClassVar, Optional, Protocol, Tuple, TypeVar, Union, cast
 
 import torch
 
@@ -990,6 +990,24 @@ class _BatchMLAPagedAttentionFaBackendBase(
                 buffer.copy_(original)
             raise
 
+    def _check_planned_geometry(self, q_nope, ckv_cache):
+        # Structural resolution already checked ranks, widths and matching
+        # prefix shapes/devices within each split pair. Only plan facts remain.
+        if q_nope.shape[:2] != self._planned_query_shape:
+            raise ValueError(
+                "q_nope rows and heads must match the planned query shape."
+            )
+        cache_shape = ckv_cache.shape
+        if cache_shape[1] != self._page_size:
+            raise ValueError("ckv_cache page size must match the planned page_size.")
+        if q_nope.device != self.device or ckv_cache.device != self.device:
+            raise ValueError(
+                "q_nope and ckv_cache must be on the planned workspace device."
+            )
+        page_min, required_pages = self._planned_kv_page_range
+        if page_min < 0 or cache_shape[0] < required_pages:
+            raise ValueError("KV cache does not cover the planned CSR page indices.")
+
     def run_from_wrapper(
         self,
         *,
@@ -1028,12 +1046,9 @@ class _BatchMLAPagedAttentionFaBackendBase(
             )
         if bmm1_scale is not None or bmm2_scale is not None:
             raise ValueError("BMM scales are not supported with an fa2/fa3 backend.")
-        prepared = self._prepare_planned_inputs((query, kv_cache, out, lse))
-        if prepared is None:
-            raise ValueError(
-                f"Current query/KV cache/out/lse layout is unsupported by the selected {self._backend} MLA backend."
-            )
-        (q_nope, q_pe), (ckv_cache, kpe_cache) = prepared
+        q_nope, q_pe = cast(tuple[torch.Tensor, torch.Tensor], query)
+        ckv_cache, kpe_cache = cast(tuple[torch.Tensor, torch.Tensor], kv_cache)
+        self._check_planned_geometry(q_nope, ckv_cache)
         return self._run_generated_fa(
             q_nope=q_nope,
             q_pe=q_pe,
@@ -1158,6 +1173,12 @@ class _BatchMLAPagedAttentionFaBackendBase(
         if tactic != -1:
             raise ValueError(f"Unsupported {self._backend} MLA tactic: {tactic!r}.")
         query, kv_cache, out, lse, sinks = inputs[:5]
+        prepared = self._prepare_planned_inputs(inputs)
+        if prepared is None:
+            raise ValueError(
+                f"Current tensor layout is unsupported by the selected {self._backend} MLA backend."
+            )
+        query, kv_cache = prepared
         return self.run_from_wrapper(
             query=query,
             kv_cache=kv_cache,
