@@ -241,6 +241,17 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         quantize_input: bool,
     ) -> None:
         num_tokens = t.hidden_states.shape[0]
+        # The layer runs validate_forward() only for the first forward of a
+        # workspace (later forwards are gated on a stable input signature that
+        # does not cover this optional tensor).  Presence and metadata of the
+        # per-token scale are per-forward facts -- a forward that omits it
+        # would otherwise silently reuse the previous batch's scales -- so
+        # re-check them here on every staging.  Metadata only; no device work.
+        validate_fc1_activation_per_token_scale(
+            t.fc1_activation_per_token_scale,
+            num_tokens=num_tokens,
+            enabled=self._kernel_config.enable_fc1_activation_per_token_scale,
+        )
         if quantize_input:
             stage_mega_moe_inputs(
                 t.hidden_states,
@@ -294,8 +305,10 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 destinations.append(destination)
                 sources.append(source)
         if t.fc1_activation_per_token_scale is not None:
-            # Validated in validate_forward (shape (num_tokens,), fp32, enabled);
-            # only the live [:num_tokens] rows of the per-token plane are staged.
+            # Validated above (shape (num_tokens,), fp32, enabled); only the live
+            # [:num_tokens] rows of the per-token plane are staged.  Strided
+            # sources are fine here: copy_ honours the source stride and the
+            # workspace plane is contiguous.
             destinations.append(workspace.fc1_activation_per_token_scale[:num_tokens])
             sources.append(t.fc1_activation_per_token_scale)
         if sources:

@@ -1810,3 +1810,9 @@ def test_nvfp4_shim_per_token_scale_input_validation():
         on._validate_inputs(make_inputs(scale[: tokens // 2]), num_tokens=tokens)
     with pytest.raises(ValueError, match="float32"):
         on._validate_inputs(make_inputs(scale.to(torch.bfloat16)), num_tokens=tokens)
+    # The dispatch warps read the scale as a flat fp32 plane (base + token*4),
+    # so a strided view of the right shape/dtype must be rejected, not misread.
+    strided = torch.ones(2 * tokens, dtype=torch.float32, device=dev)[::2]
+    assert strided.shape == (tokens,)
+    with pytest.raises(ValueError, match="contiguous"):
+        on._validate_inputs(make_inputs(strided), num_tokens=tokens)

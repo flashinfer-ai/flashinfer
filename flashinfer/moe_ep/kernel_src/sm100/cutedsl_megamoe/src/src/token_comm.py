@@ -1157,6 +1157,8 @@ class TokenInPullTokenBackPush:
                         input_fc1_activation_per_token_scale_buffer is not None
                     ):
                         # Per-token (not per-route): one fp32 per source token.
+                        # Flat ``base + token * 4`` addressing: the user tensor
+                        # must be a contiguous (T,) fp32 plane (host-checked).
                         act_scale_addr = (
                             inp_act_scale_local_base
                             + cur_peer_offset

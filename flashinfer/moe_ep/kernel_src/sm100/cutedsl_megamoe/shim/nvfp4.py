@@ -257,9 +257,10 @@ class MegaMoENvfp4Inputs:
     must be allocated via NVSHMEM (or plain CUDA when ``MEGA_NO_DIST=1``).
     Weights and epilogue scalars are rank-local.
 
-    ``fc1_activation_per_token_scale`` is an optional ``(T,)`` fp32 per-token
-    scale folded into the fc1 dequant before the clamp / gated activation;
-    required iff ``MegaMoENvfp4Config.enable_fc1_activation_per_token_scale``.
+    ``fc1_activation_per_token_scale`` is an optional contiguous ``(T,)`` fp32
+    per-token scale folded into the fc1 dequant before the clamp / gated
+    activation; required iff
+    ``MegaMoENvfp4Config.enable_fc1_activation_per_token_scale``.
 
     ``output_activation`` is the kernel's single 2D ``(T, hidden)`` bf16 output;
     the kernel reduces the top-k combine internally (the drop replaced the old
@@ -904,6 +905,14 @@ class MegaMoENvfp4Frontend:
                 raise ValueError(
                     "fc1_activation_per_token_scale must be float32, "
                     f"got {scale.dtype}."
+                )
+            # The dispatch warps address the peer's scale as ``base + token * 4``
+            # (one fp32 per token, no stride operand), so a strided view would
+            # silently read the wrong elements.
+            if scale.stride() != (1,):
+                raise ValueError(
+                    "fc1_activation_per_token_scale must be contiguous (unit "
+                    f"stride), got stride {tuple(scale.stride())}."
                 )
         elif scale is not None:
             raise ValueError(

@@ -574,6 +574,36 @@ def _run_mega_layer(
         # kernel's tail cleanup of its workspace counters/flags -- this is the
         # regression guard for that contract.
         y_layer2 = mega.forward(t)
+        if per_token_scale:
+            # Steady-state forwards skip validate_forward (the layer gates it on
+            # a stable input signature that does not include this tensor); the
+            # backend must still reject a forward that omits the required scale
+            # instead of silently reusing the previous batch's values.
+            from flashinfer.moe_ep import MoEEpConfigError
+
+            t_missing = MoEEpTensors(
+                hidden_states=t_hidden,
+                topk_ids=problem["topk_ids"],
+                topk_weights=problem["topk_weights"],
+                scales=t_scales,
+                **tensor_kwargs,
+            )
+            with pytest.raises(MoEEpConfigError, match="required"):
+                mega.forward(t_missing)
+            t_short = MoEEpTensors(
+                hidden_states=t_hidden,
+                topk_ids=problem["topk_ids"],
+                topk_weights=problem["topk_weights"],
+                scales=t_scales,
+                fc1_activation_per_token_scale=problem[
+                    "fc1_activation_per_token_scale"
+                ][: problem["num_tokens"] // 2],
+                **tensor_kwargs,
+            )
+            with pytest.raises(MoEEpConfigError, match="shape"):
+                mega.forward(t_short)
+            # The session is still healthy after the rejected forwards.
+            torch.testing.assert_close(mega.forward(t), y_layer, atol=0.0, rtol=0.0)
 
         if check_output_view:
             assert mega.supports_output_view
