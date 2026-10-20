@@ -226,6 +226,13 @@ def build_case(
 def make_call(
     case: Case, operation: Operation, backend: Backend, enable_pdl: bool
 ) -> Call:
+    if backend.startswith("native-"):
+        from svdquant_sm120_native import native_call, native_operands
+
+        launch, _ = native_call(
+            backend, native_operands(case), quantize=operation == "linear"
+        )
+        return Call(launch, ())
     operands: tuple[torch.Tensor, ...]
     match operation:
         case "gemm":

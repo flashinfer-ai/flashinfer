@@ -147,8 +147,20 @@ def run_operation(
         torch.cuda.synchronize()
         tuning_time_s[backend] = time.perf_counter() - tuning_started
     with tuning_context(policy, tuning=False):
-        accuracy = compare_outputs(calls["cute-dsl"](), calls["cutlass-sm120"]())
-        auto_accuracy = compare_outputs(calls["cute-dsl"](), calls["auto"]())
+        # Native omits smoothing and LoRA, so it is compared only with itself.
+        svdq = [b for b in BACKENDS if not b.startswith("native-")]
+        native = [b for b in BACKENDS if b.startswith("native-")]
+        reference = calls[svdq[0]]()
+        accuracies = {
+            backend: asdict(compare_outputs(reference, calls[backend]()))
+            for backend in svdq[1:]
+        }
+        if len(native) > 1:
+            native_reference = calls[native[0]]().clone()
+            for backend in native[1:]:
+                accuracies[backend] = asdict(
+                    compare_outputs(native_reference, calls[backend]())
+                )
         graph_calls = (
             1
             if options.cold_l2
@@ -233,14 +245,15 @@ def run_operation(
             "repeat_ms": options.repeat_ms,
             "trial_order": orders,
             "trial_windows": trial_windows,
-            "accuracy": asdict(accuracy),
-            "auto_accuracy": asdict(auto_accuracy),
+            "backends": list(BACKENDS),
+            "accuracy": accuracies,
             "samples_us": samples,
             "trial_medians_us": trial_medians,
             "median_us": medians,
-            "cutlass_speedup": medians["cute-dsl"] / medians["cutlass-sm120"],
-            "auto_over_best_explicit": medians["auto"]
-            / min(medians["cute-dsl"], medians["cutlass-sm120"]),
+            "speedup_vs_reference": {
+                backend: medians[BACKENDS[0]] / medians[backend]
+                for backend in BACKENDS[1:]
+            },
         }
         stream.write(json.dumps(record, allow_nan=False) + "\n")
         stream.flush()
@@ -258,7 +271,8 @@ def run_operation(
                 encoding="utf-8",
             )
         print(
-            f"RESULT {shape} {operation}: {record['cutlass_speedup']:.3f}x CUTLASS speedup",
+            f"RESULT {shape} {operation} r{case.l1.shape[1]}: "
+            + " ".join(f"{b}={medians[b]:.2f}us" for b in BACKENDS),
             file=sys.stderr,
             flush=True,
         )
