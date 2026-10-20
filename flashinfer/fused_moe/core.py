@@ -3096,6 +3096,7 @@ def _build_trtllm_moe_namespace(module):
         routing_replay_out: Optional[torch.Tensor] = None,
         valid_hidden_size: Optional[int] = None,
         valid_intermediate_size: Optional[int] = None,
+        num_active_tokens: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         # Determine routing mode: compute from logits or use pre-computed
         if routing_logits is None:
@@ -3131,10 +3132,15 @@ def _build_trtllm_moe_namespace(module):
                 num_tokens, output_width, do_finalize, hidden_states.device
             )
         elif do_finalize:
+            # bf16 is the kernel's native output; fp32 is converted on the finalize store.
+            if output.dtype not in (torch.bfloat16, torch.float32):
+                raise ValueError(
+                    f"output must be bfloat16 or float32, got {output.dtype}"
+                )
             check_shape_dtype_device(
                 output,
                 None,
-                torch.bfloat16,
+                output.dtype,
                 hidden_states.device,
                 "output",
             )
@@ -3313,6 +3319,7 @@ def _build_trtllm_moe_namespace(module):
                 False,
                 valid_hidden_size,
                 valid_intermediate_size,
+                num_active_tokens,
             )
             # Reconstruct the public result without exposing dtype-specific body workspaces.
             return _unpack_trtllm_moe_output(
@@ -3415,9 +3422,10 @@ def _build_trtllm_moe_namespace(module):
         routing_replay_out: Optional[torch.Tensor] = None,
         valid_hidden_size: Optional[int] = None,
         valid_intermediate_size: Optional[int] = None,
+        num_active_tokens: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         # Acknowledge mutation-only and fallback-only controls without executing the native op.
-        _ = routing_replay_out, valid_intermediate_size
+        _ = routing_replay_out, valid_intermediate_size, num_active_tokens
         # GEMM2 computes roundUp(valid_hidden_size, 128) columns, but finalize hands
         # back only the leading valid_hidden_size of them -- mirror the eager op so
         # torch.compile sees the same output shape.
@@ -5856,6 +5864,7 @@ def trtllm_fp8_block_scale_moe(
     *,
     gemm1_bias: Optional[torch.Tensor] = None,
     gemm2_bias: Optional[torch.Tensor] = None,
+    num_active_tokens: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     r"""FP8 block-scaled MoE operation.
 
@@ -6007,6 +6016,15 @@ def trtllm_fp8_block_scale_moe(
         (keyword-only).  This tensor must be in the same row layout as
         ``gemm2_weights``.
 
+    num_active_tokens : Optional[torch.Tensor]
+        Device int32 scalar: the number of leading rows of ``hidden_states`` that hold
+        tokens. The routing, activation and finalize kernels skip the rows at or beyond it
+        (their routing ids may be stale) and leave them untouched in ``output``, and the
+        finalize runs a persistent grid sized by the SM count. Use it when a CUDA graph is
+        captured over a fixed-size buffer whose live prefix changes from step to step.
+        ``None`` treats every row as live. Pass a ``float32`` ``output`` to have the
+        finalize write fp32 directly.
+
     Returns
     -------
     torch.Tensor or List[torch.Tensor]
@@ -6072,6 +6090,7 @@ def trtllm_fp8_block_scale_moe(
         routing_replay_out,
         valid_hidden_size,
         valid_intermediate_size,
+        num_active_tokens,
     )
 
     if do_finalize:
@@ -6116,6 +6135,7 @@ def trtllm_fp8_block_scale_routed_moe(
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
     valid_hidden_size: Optional[int] = None,
     valid_intermediate_size: Optional[int] = None,
+    num_active_tokens: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     r"""Pre-routed FP8 block-scaled MoE operation.
 
@@ -6265,6 +6285,15 @@ def trtllm_fp8_block_scale_routed_moe(
         ``intermediate_size`` is treated as padded and only the valid region is
         computed.  Default ``None`` (use the full ``intermediate_size``).
 
+    num_active_tokens : Optional[torch.Tensor]
+        Device int32 scalar: the number of leading rows of ``hidden_states`` that hold
+        tokens. The routing, activation and finalize kernels skip the rows at or beyond it
+        (their routing ids may be stale) and leave them untouched in ``output``, and the
+        finalize runs a persistent grid sized by the SM count. Use it when a CUDA graph is
+        captured over a fixed-size buffer whose live prefix changes from step to step.
+        ``None`` treats every row as live. Pass a ``float32`` ``output`` to have the
+        finalize write fp32 directly.
+
     Returns
     -------
     torch.Tensor or List[torch.Tensor]
@@ -6320,6 +6349,7 @@ def trtllm_fp8_block_scale_routed_moe(
         None,  # routing_replay_out is not exposed by this routed wrapper
         valid_hidden_size,
         valid_intermediate_size,
+        num_active_tokens,
     )
 
     if do_finalize and gemm1_lora_delta is None:

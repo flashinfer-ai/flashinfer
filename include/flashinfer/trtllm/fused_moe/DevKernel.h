@@ -48,6 +48,17 @@ namespace moe::dev {
 
 #define LAUNCH_ESC(...) __VA_ARGS__
 
+#if defined(__CUDACC__)
+// Tokens the activation / finalize kernels visit: the host count, clamped by the optional device
+// count (rows at or beyond it hold no token).
+template <typename Params>
+__device__ __forceinline__ int32_t activeTokenCount(Params const& params) {
+  return params.numActiveTokensPtr == nullptr
+             ? params.numTokens
+             : min(params.numTokens, __ldg(params.numActiveTokensPtr));
+}
+#endif
+
 #define LAUNCH_PDL(data, coopLaunch, types, kernel, numBlocks, numThreads, smemSize, stream) \
   cudaLaunchConfig_t config{};                                                               \
   config.gridDim = numBlocks;                                                                \
@@ -116,27 +127,46 @@ namespace moe::dev {
     FLASHINFER_WARN("Unsupported dtypeElt");                                                      \
   }
 
-#define LAUNCH_EXPW(data, kernel, topK, numBlocks, numThreads, smemSize, stream)                  \
-  if (data.mDtypeElt == tg::Dtype::Fp16 && data.mDtypeExpW == tg::Dtype::Fp32) {                  \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::half_t, float, topK), kernel, numBlocks,          \
-               numThreads, smemSize, stream);                                                     \
-  } else if (data.mDtypeElt == tg::Dtype::E4m3 && data.mDtypeExpW == tg::Dtype::Fp32) {           \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::float_e4m3_t, float, topK), kernel, numBlocks,    \
-               numThreads, smemSize, stream);                                                     \
-  } else if (data.mDtypeElt == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Fp32) {       \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::bfloat16_t, float, topK), kernel, numBlocks,      \
-               numThreads, smemSize, stream);                                                     \
-  } else if (data.mDtypeElt == tg::Dtype::Fp16 && data.mDtypeExpW == tg::Dtype::Bfloat16) {       \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::half_t, cutlass::bfloat16_t, topK), kernel,       \
-               numBlocks, numThreads, smemSize, stream);                                          \
-  } else if (data.mDtypeElt == tg::Dtype::E4m3 && data.mDtypeExpW == tg::Dtype::Bfloat16) {       \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::float_e4m3_t, cutlass::bfloat16_t, topK), kernel, \
-               numBlocks, numThreads, smemSize, stream);                                          \
-  } else if (data.mDtypeElt == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Bfloat16) {   \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::bfloat16_t, cutlass::bfloat16_t, topK), kernel,   \
-               numBlocks, numThreads, smemSize, stream);                                          \
-  } else {                                                                                        \
-    FLASHINFER_WARN("Unsupported pair");                                                          \
+// Finalize launches: KernelParams<elt, out, expW, topK, pdl>. The output type is the element type
+// unless Data::mDtypeOut asks for fp32 (bf16 / fp16 elements only).
+#define LAUNCH_EXPW_TYPED(data, kernel, typeElt, typeOut, topK, numBlocks, numThreads, smemSize, \
+                          stream)                                                                \
+  if (data.mDtypeExpW == tg::Dtype::Fp32) {                                                      \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(typeElt, typeOut, float, topK), kernel, numBlocks,        \
+               numThreads, smemSize, stream);                                                    \
+  } else if (data.mDtypeExpW == tg::Dtype::Bfloat16) {                                           \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(typeElt, typeOut, cutlass::bfloat16_t, topK), kernel,     \
+               numBlocks, numThreads, smemSize, stream);                                         \
+  } else {                                                                                       \
+    FLASHINFER_WARN("Unsupported dtypeExpW");                                                    \
+  }
+
+#define LAUNCH_EXPW_ELT(data, kernel, typeElt, topK, numBlocks, numThreads, smemSize, stream) \
+  if (data.mDtypeOut == tg::Dtype::Fp32) {                                                    \
+    LAUNCH_EXPW_TYPED(data, kernel, typeElt, float, topK, numBlocks, numThreads, smemSize,    \
+                      stream);                                                                \
+  } else if (data.mDtypeOut == tg::Dtype::Void || data.mDtypeOut == data.mDtypeElt) {         \
+    LAUNCH_EXPW_TYPED(data, kernel, typeElt, typeElt, topK, numBlocks, numThreads, smemSize,  \
+                      stream);                                                                \
+  } else {                                                                                    \
+    FLASHINFER_WARN("Unsupported dtypeOut");                                                  \
+  }
+
+#define LAUNCH_EXPW(data, kernel, topK, numBlocks, numThreads, smemSize, stream)                   \
+  if (data.mDtypeElt == tg::Dtype::Fp16) {                                                         \
+    LAUNCH_EXPW_ELT(data, kernel, cutlass::half_t, topK, numBlocks, numThreads, smemSize, stream); \
+  } else if (data.mDtypeElt == tg::Dtype::E4m3) {                                                  \
+    if (data.mDtypeOut == tg::Dtype::Void || data.mDtypeOut == tg::Dtype::E4m3) {                  \
+      LAUNCH_EXPW_TYPED(data, kernel, cutlass::float_e4m3_t, cutlass::float_e4m3_t, topK,          \
+                        numBlocks, numThreads, smemSize, stream);                                  \
+    } else {                                                                                       \
+      FLASHINFER_WARN("Unsupported dtypeOut for e4m3 elements");                                   \
+    }                                                                                              \
+  } else if (data.mDtypeElt == tg::Dtype::Bfloat16) {                                              \
+    LAUNCH_EXPW_ELT(data, kernel, cutlass::bfloat16_t, topK, numBlocks, numThreads, smemSize,      \
+                    stream);                                                                       \
+  } else {                                                                                         \
+    FLASHINFER_WARN("Unsupported dtypeElt");                                                       \
   }
 
 #define LAUNCH_TOPK_EXPW(data, kernel, numBlocks, numThreads, smemSize, stream) \
@@ -174,6 +204,8 @@ struct Data {
 
   int32_t innerDim;
   int32_t numTokens;
+  // Optional device count of leading live tokens; see MoERunnerArgs::num_active_tokens_ptr.
+  int32_t const* numActiveTokensPtr = nullptr;
   int32_t topK;
   int32_t* expandedIdxToPermutedIdx;
 
@@ -206,6 +238,7 @@ struct KernelParams {
 
   int32_t innerDim;
   int32_t numTokens;
+  int32_t const* numActiveTokensPtr = nullptr;
   int32_t topK;
   int32_t* expandedIdxToPermutedIdx;
 
@@ -229,6 +262,7 @@ struct KernelParams {
 
     params.innerDim = data.innerDim;
     params.numTokens = data.numTokens;
+    params.numActiveTokensPtr = data.numActiveTokensPtr;
     params.topK = data.topK;
     params.totalNumPaddedTokens = data.totalNumPaddedTokens;
 
@@ -375,6 +409,8 @@ namespace tg = batchedGemm::trtllm::gen;
 
 struct Data {
   tg::Dtype mDtypeElt{tg::Dtype::Fp16};
+  // Output element type: Void means mDtypeElt; Fp32 converts bf16 / fp16 inputs on store.
+  tg::Dtype mDtypeOut{tg::Dtype::Void};
   tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
   bool mUsePdl{false};
   bool mUseDeepSeekFp8{false};
@@ -388,6 +424,8 @@ struct Data {
   int32_t* expandedIdxToPermutedIdx;
 
   int32_t numTokens;
+  // Optional device count of leading live tokens; rows at or beyond it are not written.
+  int32_t const* numActiveTokensPtr = nullptr;
   int32_t numExperts;
   int32_t topK;
   // Final output row width of the MoE block.
@@ -397,16 +435,18 @@ struct Data {
   int32_t const* totalNumPaddedTokens;
 };
 
-template <typename Type_, typename TypeExpW_, int TopKUnrollFactor_, bool UsePdl_>
+template <typename Type_, typename TypeOut_, typename TypeExpW_, int TopKUnrollFactor_,
+          bool UsePdl_>
 struct KernelParams {
   using Type = Type_;
+  using TypeOut = TypeOut_;
   using TypeExpW = TypeExpW_;
   static constexpr int TopKUnrollFactor = TopKUnrollFactor_;
   static constexpr bool UsePdl = UsePdl_;
 
   Type const* inPtr;
   TypeExpW const* expertWeightsPtr;
-  Type* outPtr;
+  TypeOut* outPtr;
 
   float* inDqSfsPtr = nullptr;
   float* outDqSfsPtr = nullptr;
@@ -416,6 +456,7 @@ struct KernelParams {
   int32_t hiddenDim;
   int32_t hiddenDimPadded;
   int32_t numTokens;
+  int32_t const* numActiveTokensPtr = nullptr;
   int32_t numExperts;
   int32_t topK;
   int32_t const* totalNumPaddedTokens;
@@ -425,7 +466,8 @@ struct KernelParams {
 
     params.inPtr = (Type*)data.inPtr;
     params.expertWeightsPtr = (TypeExpW*)data.expertWeightsPtr;
-    params.outPtr = (Type*)data.outPtr;
+    params.outPtr = (TypeOut*)data.outPtr;
+    params.numActiveTokensPtr = data.numActiveTokensPtr;
     params.inDqSfsPtr = data.inDqSfsPtr;
     params.outDqSfsPtr = data.outDqSfsPtr;
 

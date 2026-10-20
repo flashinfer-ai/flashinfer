@@ -107,6 +107,10 @@ struct DataBase {
   // Metadata
   //
   int32_t mNumTokens;
+  // Optional device int32 count of leading tokens that carry routing. Tokens at or beyond it are
+  // skipped (their ids may be stale), so a CUDA graph captured over a fixed buffer pays for the
+  // live prefix only. Null means every one of mNumTokens tokens is live.
+  int32_t const* mPtrNumActiveTokens{nullptr};
   int32_t mNumExperts;
   int32_t mTopK;
   int32_t mTileTokensDim;
@@ -157,6 +161,7 @@ struct KernelParamsBase {
 
   // Public scalar members
   int32_t mNumTokens = 0;
+  int32_t const* mPtrNumActiveTokens = nullptr;
   int32_t mNumExperts = 0;
 
   int32_t mPaddingLog2 = -1;
@@ -198,6 +203,7 @@ struct KernelParamsBase {
     mPtrNumTokensPerExpert = data.mPtrNumTokensPerExpert;
 
     mNumTokens = data.mNumTokens;
+    mPtrNumActiveTokens = data.mPtrNumActiveTokens;
     mNumExperts = data.mNumExperts;
 
     mPaddingLog2 = data.mPaddingLog2;
@@ -212,6 +218,16 @@ struct KernelParamsBase {
     mTotalExpertsPerToken = data.mTotalExpertsPerToken;
   }
 };
+
+#if defined(__CUDACC__)
+// Tokens that carry routing: the host count, clamped by the optional device count.
+template <typename KernelParams>
+__device__ __forceinline__ int32_t routingActiveTokenCount(KernelParams const& params) {
+  return params.mPtrNumActiveTokens == nullptr
+             ? params.mNumTokens
+             : min(params.mNumTokens, __ldg(params.mPtrNumActiveTokens));
+}
+#endif
 
 namespace routingPrecomputed {
 

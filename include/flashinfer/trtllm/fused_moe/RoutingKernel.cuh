@@ -314,7 +314,7 @@ __device__ void routingPermutation(KernelParams params,
   __shared__ typename Scan::TempStorage tempStorage;
 
   uint32_t const clusterThreadIdx = NumThreads * clusterBlockRank + threadIdx.x;
-  auto expandedIdxSize = params.mNumTokens * params.mTopK;
+  auto expandedIdxSize = routingActiveTokenCount(params) * params.mTopK;
 
   // number of experts may exceed number of threads — size by MaxNumExperts
   __shared__ int32_t __attribute((aligned(128))) smemExpertCount[MaxNumExperts];
@@ -423,7 +423,8 @@ __device__ void routingPermutation(KernelParams params,
 #pragma unroll
       for (int rank = 0; rank < NumBlocksPerCluster; rank++) {
         int32_t const* remoteSmem = cg::cluster_group::map_shared_rank(smemExpertCount, rank);
-        expertCounts[rank] = rank * NumWarps < params.mNumTokens ? remoteSmem[expert] : 0;
+        expertCounts[rank] =
+            rank * NumWarps < routingActiveTokenCount(params) ? remoteSmem[expert] : 0;
       }
 
       // Compute an exclusive prefix sum of the block-local count.
@@ -604,7 +605,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
   }
 #endif  // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 
-  uint32_t const expandedIdxSize = params.mNumTokens * params.mTopK;
+  uint32_t const expandedIdxSize = routingActiveTokenCount(params) * params.mTopK;
   uint32_t const localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
 
   // Use NumThreadsBlock (actual thread count) for grid-stride addressing
@@ -695,7 +696,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
 
   int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
 
-  uint32_t const expandedIdxSize = params.mNumTokens * params.mTopK;
+  uint32_t const expandedIdxSize = routingActiveTokenCount(params) * params.mTopK;
   uint32_t const numTiles =
       (expandedIdxSize + MaxExpandedIdxPerBlock - 1) / (MaxExpandedIdxPerBlock);
 
@@ -1022,7 +1023,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
 
   int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
 
-  auto expandedIdxSize = params.mNumTokens * params.mTopK;
+  auto expandedIdxSize = routingActiveTokenCount(params) * params.mTopK;
 
   // Expanded-index assignment. The default grid stride spreads one CTA's
   // indices over the whole batch; since an expert's rows are laid out in CTA

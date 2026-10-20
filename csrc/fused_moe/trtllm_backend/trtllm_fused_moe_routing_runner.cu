@@ -61,7 +61,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  int32_t* numNonExitingCtas, btg::Dtype dtypeElt, btg::Dtype dtypeBias,
                  bool useRoutingScalesOnInput, bool useDeepSeekFp8,
                  RoutingMethodType routingMethodType, cudaStream_t stream, btg::Dtype dtypeLogits,
-                 bool normTopkProb, int16_t* routing_replay_out, bool enable_pdl) {
+                 bool normTopkProb, int16_t* routing_replay_out, bool enable_pdl,
+                 int32_t const* numActiveTokensPtr) {
   if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1) {
     // Only the grouped DeepSeek kernel below populates the fused shared-expert
     // slots; routingCustom leaves them untouched, so reject rather than return
@@ -103,6 +104,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
 
     routingData.mNumTokens = numTokens;
+    routingData.mPtrNumActiveTokens = numActiveTokensPtr;
     routingData.mNumExperts = numExperts;
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
@@ -146,6 +148,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
 
     routingData.mNumTokens = numTokens;
+    routingData.mPtrNumActiveTokens = numActiveTokensPtr;
     routingData.mNumExperts = numExperts;
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
@@ -187,6 +190,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
     routingData.mPtrTopKIds = expertIds;
     routingData.mNumTokens = numTokens;
+    routingData.mPtrNumActiveTokens = numActiveTokensPtr;
     routingData.mNumExperts = numExperts;
     routingData.mNumFusedSharedExperts = numFusedSharedExpert;
     routingData.mNumExpertGroups = nGroup;
@@ -247,6 +251,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
     routingData.mPtrTopKIds = expertIds;
     routingData.mNumTokens = numTokens;
+    routingData.mPtrNumActiveTokens = numActiveTokensPtr;
     routingData.mNumExperts = numExperts;
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
@@ -338,6 +343,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     // Inputs
     //
     routingData.mNumTokens = numTokens;
+    routingData.mPtrNumActiveTokens = numActiveTokensPtr;
     routingData.mNumExperts = numExperts;
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);

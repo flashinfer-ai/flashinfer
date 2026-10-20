@@ -150,7 +150,8 @@ class Runner {
            batchedGemm::trtllm::gen::Dtype dtypeBias, bool useRoutingScalesOnInput,
            bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream,
            batchedGemm::trtllm::gen::Dtype dtypeLogits, bool normTopkProb = true,
-           int16_t* routing_replay_out = nullptr, bool enable_pdl = true);
+           int16_t* routing_replay_out = nullptr, bool enable_pdl = true,
+           int32_t const* numActiveTokensPtr = nullptr);
 
  private:
   friend class MoE::Runner;
@@ -386,6 +387,12 @@ struct MoERunnerArgs {
   btg::Dtype mDtypeElt{btg::Dtype::Void};
   btg::Dtype mDtypeExpW{btg::Dtype::Bfloat16};
   btg::Dtype mDtypeOut{btg::Dtype::Bfloat16};
+  // Finalize output type: Void keeps mDtypeOut, Fp32 writes the finalized rows as fp32 (GEMM2
+  // still produces mDtypeOut; the finalize converts on store).
+  btg::Dtype mDtypeFinalizeOut{btg::Dtype::Void};
+  // Optional device int32 count of leading live tokens, see Routing DataBase::mPtrNumActiveTokens.
+  // Routing, activation and finalize skip the rows at or beyond it.
+  int32_t const* num_active_tokens_ptr{nullptr};
 
   // Apply routing scale factors to input activations
   bool mUseRoutingScalesOnInput{false};

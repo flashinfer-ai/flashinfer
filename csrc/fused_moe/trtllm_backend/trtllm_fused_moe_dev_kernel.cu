@@ -106,7 +106,7 @@ __global__ void activationKernel(KernelParams params) {
   }
 #endif
 
-  for (int tokenIdx = blockIdx.z; tokenIdx < params.numTokens; tokenIdx += gridDim.z) {
+  for (int tokenIdx = blockIdx.z; tokenIdx < activeTokenCount(params); tokenIdx += gridDim.z) {
     // Look over experts per token
     for (int k = blockIdx.y; k < params.topK; k += gridDim.y) {
       int const expandedIdx = tokenIdx * params.topK + k;
@@ -267,7 +267,7 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
 
   // Loop over tokens
   for (int k = blockIdx.z; k < params.topK; k += gridDim.z) {
-    for (int tokenCtaIdx = blockIdx.y * NumTokensPerCta; tokenCtaIdx < params.numTokens;
+    for (int tokenCtaIdx = blockIdx.y * NumTokensPerCta; tokenCtaIdx < activeTokenCount(params);
          tokenCtaIdx += gridDim.y * NumTokensPerCta) {
       for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.innerDim / 2;
            hiddenIdx += blockDim.x * gridDim.x) {
@@ -287,7 +287,7 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
 #pragma unroll
         for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
           int const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
-          if (tokenIdx >= params.numTokens) {
+          if (tokenIdx >= activeTokenCount(params)) {
             break;
           }
 
@@ -335,7 +335,7 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
         for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
           if (threadIdx.x == 0) {
             auto const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
-            if (tokenIdx >= params.numTokens) {
+            if (tokenIdx >= activeTokenCount(params)) {
               break;
             }
             int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
@@ -357,7 +357,7 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
 #pragma unroll
         for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
           auto const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
-          if (tokenIdx >= params.numTokens) {
+          if (tokenIdx >= activeTokenCount(params)) {
             break;
           }
           int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
@@ -677,6 +677,7 @@ namespace tg = batchedGemm::trtllm::gen;
 template <typename KernelParams>
 __global__ void finalizeKernel(KernelParams params) {
   using Type = typename KernelParams::Type;
+  using TypeOut = typename KernelParams::TypeOut;
   using TypeExpW = typename KernelParams::TypeExpW;
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
@@ -686,7 +687,7 @@ __global__ void finalizeKernel(KernelParams params) {
   }
 #endif
 
-  for (int tokenIdx = blockIdx.y; tokenIdx < params.numTokens; tokenIdx += gridDim.y) {
+  for (int tokenIdx = blockIdx.y; tokenIdx < activeTokenCount(params); tokenIdx += gridDim.y) {
     // Loop over hidden dim
     for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.hiddenDim;
          hiddenIdx += blockDim.x * gridDim.x) {
@@ -711,7 +712,7 @@ __global__ void finalizeKernel(KernelParams params) {
         }
       }
 
-      params.outPtr[tokenIdx * params.hiddenDim + hiddenIdx] = static_cast<Type>(data);
+      params.outPtr[tokenIdx * params.hiddenDim + hiddenIdx] = static_cast<TypeOut>(data);
     }
   }
 }
@@ -841,6 +842,7 @@ struct FinalizeTraits<4, TypeExpW_> {
 template <typename KernelParams>
 __global__ void finalizeKernelVecLoad(KernelParams params) {
   using Type = typename KernelParams::Type;
+  using TypeOut = typename KernelParams::TypeOut;
   using TypeExpW = typename KernelParams::TypeExpW;
   int constexpr TopKUnrollFactor = KernelParams::TopKUnrollFactor;
 
@@ -860,10 +862,9 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
   // Load 128-bits per thread, according to the smallest data type we read/write
   constexpr int64_t FINALIZE_ELEM_PER_THREAD = 128 / cutlass::sizeof_bits<Type>::value;
   using InputElem = cutlass::Array<Type, FINALIZE_ELEM_PER_THREAD>;
-  using OutputElem = cutlass::Array<Type, FINALIZE_ELEM_PER_THREAD>;
+  using OutputElem = cutlass::Array<TypeOut, FINALIZE_ELEM_PER_THREAD>;
   using ComputeElem = cutlass::Array<float, FINALIZE_ELEM_PER_THREAD>;
 
-  int64_t const tokenIdx = blockIdx.x;
   int64_t const startOffset = threadIdx.x;
   int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
   int64_t const numElemsInPaddedCol = params.hiddenDimPadded / FINALIZE_ELEM_PER_THREAD;
@@ -873,23 +874,8 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
   __shared__ ScalePackedType scaleArrSmem[MaxTopK / TopKUnrollFactor];
   __shared__ IdxPackedType permutedIdxArrSmem[MaxTopK / TopKUnrollFactor];
 
-  for (int kChunkIdx = threadIdx.x; kChunkIdx < params.topK / TopKUnrollFactor;
-       kChunkIdx += blockDim.x) {
-    int const expandedIdx = tokenIdx * params.topK + kChunkIdx * TopKUnrollFactor;
-    auto permutedIdxPacked = reinterpret_cast<IdxPackedType const*>(
-        params.expandedIdxToPermutedIdx)[expandedIdx / TopKUnrollFactor];
-    auto scalePacked = useScale ? reinterpret_cast<ScalePackedType const*>(
-                                      params.expertWeightsPtr)[expandedIdx / TopKUnrollFactor]
-                                : ScalePackedType{TypeExpW(1.f)};
-
-    scaleArrSmem[kChunkIdx] = scalePacked;
-    permutedIdxArrSmem[kChunkIdx] = permutedIdxPacked;
-  }
-
-  auto const offset = tokenIdx * params.hiddenDim;
-  Type* outputPtr = params.outPtr + offset;
-  auto* outElemPtr = reinterpret_cast<OutputElem*>(outputPtr);
   auto const* inElemPtr = reinterpret_cast<InputElem const*>(params.inPtr);
+  int64_t const numLiveTokens = activeTokenCount(params);
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   // wait on primary kernel when using PDL
@@ -897,44 +883,69 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
     cudaGridDependencySynchronize();
   }
 #endif
-  __syncthreads();
 
-  for (int elemIndex = startOffset; elemIndex < numElemsInCol; elemIndex += stride) {
-    ComputeElem threadOutput;
-    threadOutput.fill(0);
-    for (int kChunkIdx = 0; kChunkIdx < params.topK / TopKUnrollFactor; kChunkIdx++) {
-      auto permutedIdxArr = *reinterpret_cast<IdxArrayType const*>(&permutedIdxArrSmem[kChunkIdx]);
-      InputElem inputElemArr[TopKUnrollFactor];
-#pragma unroll
-      for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
-        auto const permutedIdx = permutedIdxArr[ki];
-        if (permutedIdx == -1) {
-          continue;
-        }
+  // One block per live token per iteration; the launcher sizes the grid by the SM count when a
+  // device token count is given, so no block is spent on the rows past it.
+  for (int64_t tokenIdx = blockIdx.x; tokenIdx < numLiveTokens; tokenIdx += gridDim.x) {
+    for (int kChunkIdx = threadIdx.x; kChunkIdx < params.topK / TopKUnrollFactor;
+         kChunkIdx += blockDim.x) {
+      int const expandedIdx = tokenIdx * params.topK + kChunkIdx * TopKUnrollFactor;
+      auto permutedIdxPacked = reinterpret_cast<IdxPackedType const*>(
+          params.expandedIdxToPermutedIdx)[expandedIdx / TopKUnrollFactor];
+      auto scalePacked = useScale ? reinterpret_cast<ScalePackedType const*>(
+                                        params.expertWeightsPtr)[expandedIdx / TopKUnrollFactor]
+                                  : ScalePackedType{TypeExpW(1.f)};
 
-        auto const* inputPermutedPtr = inElemPtr + permutedIdx * numElemsInPaddedCol;
-
-        float4 input =
-            vectorizedLoadPtx(reinterpret_cast<float4 const*>(&inputPermutedPtr[elemIndex]));
-        inputElemArr[ki] = *reinterpret_cast<InputElem const*>(&input);
-      }
-      auto scaleArr = *reinterpret_cast<ScaleArrayType const*>(&scaleArrSmem[kChunkIdx]);
-      auto const scaleFloatArr =
-          arrayConvert<ScaleArrayType, cutlass::Array<float, TopKUnrollFactor>>(scaleArr);
-
-#pragma unroll
-      for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
-        auto const permutedIdx = permutedIdxArr[ki];
-        if (permutedIdx == -1) {
-          continue;
-        }
-        auto scale = useScale ? scaleFloatArr[ki] : 1.0f;
-        ComputeElem expertResult = arrayConvert<InputElem, ComputeElem>(inputElemArr[ki]);
-        threadOutput = threadOutput + scale * expertResult;
-      }
+      scaleArrSmem[kChunkIdx] = scalePacked;
+      permutedIdxArrSmem[kChunkIdx] = permutedIdxPacked;
     }
-    OutputElem outputElem = arrayConvert<ComputeElem, OutputElem>(threadOutput);
-    outElemPtr[elemIndex] = outputElem;
+
+    auto const offset = tokenIdx * params.hiddenDim;
+    TypeOut* outputPtr = params.outPtr + offset;
+    auto* outElemPtr = reinterpret_cast<OutputElem*>(outputPtr);
+
+    __syncthreads();
+
+    for (int elemIndex = startOffset; elemIndex < numElemsInCol; elemIndex += stride) {
+      ComputeElem threadOutput;
+      threadOutput.fill(0);
+      for (int kChunkIdx = 0; kChunkIdx < params.topK / TopKUnrollFactor; kChunkIdx++) {
+        auto permutedIdxArr =
+            *reinterpret_cast<IdxArrayType const*>(&permutedIdxArrSmem[kChunkIdx]);
+        InputElem inputElemArr[TopKUnrollFactor];
+#pragma unroll
+        for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
+          auto const permutedIdx = permutedIdxArr[ki];
+          if (permutedIdx == -1) {
+            continue;
+          }
+
+          auto const* inputPermutedPtr = inElemPtr + permutedIdx * numElemsInPaddedCol;
+
+          float4 input =
+              vectorizedLoadPtx(reinterpret_cast<float4 const*>(&inputPermutedPtr[elemIndex]));
+          inputElemArr[ki] = *reinterpret_cast<InputElem const*>(&input);
+        }
+        auto scaleArr = *reinterpret_cast<ScaleArrayType const*>(&scaleArrSmem[kChunkIdx]);
+        auto const scaleFloatArr =
+            arrayConvert<ScaleArrayType, cutlass::Array<float, TopKUnrollFactor>>(scaleArr);
+
+#pragma unroll
+        for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
+          auto const permutedIdx = permutedIdxArr[ki];
+          if (permutedIdx == -1) {
+            continue;
+          }
+          auto scale = useScale ? scaleFloatArr[ki] : 1.0f;
+          ComputeElem expertResult = arrayConvert<InputElem, ComputeElem>(inputElemArr[ki]);
+          threadOutput = threadOutput + scale * expertResult;
+        }
+      }
+      OutputElem outputElem = arrayConvert<ComputeElem, OutputElem>(threadOutput);
+      outElemPtr[elemIndex] = outputElem;
+    }
+    // The next token refills the shared index / scale arrays.
+    __syncthreads();
   }
 }
 
@@ -1059,7 +1070,7 @@ __global__ void finalizeDeepSeekKernel(KernelParams params) {
   }
 #endif
 
-  for (int tokenIdx = blockIdx.y; tokenIdx < params.numTokens; tokenIdx += gridDim.y) {
+  for (int tokenIdx = blockIdx.y; tokenIdx < activeTokenCount(params); tokenIdx += gridDim.y) {
     // Loop over hidden dim
     for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.hiddenDim;
          hiddenIdx += blockDim.x * gridDim.x) {
@@ -1108,6 +1119,10 @@ __global__ void finalizeDeepSeekKernel(KernelParams params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 void run(Data const& data, void* stream) {
+  FLASHINFER_CHECK(data.mDtypeOut == tg::Dtype::Void || data.mDtypeOut == data.mDtypeElt ||
+                       (data.mDtypeOut == tg::Dtype::Fp32 && !data.mUseDeepSeekFp8 &&
+                        data.mDtypeElt != tg::Dtype::E4m3),
+                   "finalize: fp32 output needs bf16 / fp16 inputs");
   if (data.mUseDeepSeekFp8) {
     int const numThreads = 128;
     int const numBlocksX = (data.hiddenDim - 1 + numThreads) / numThreads;
@@ -1155,7 +1170,19 @@ void run(Data const& data, void* stream) {
           data.topK <= MaxTopK,
           "Finalize kernel with vectorized loading is not supported for this TopK value: %d",
           data.topK);
-      LAUNCH_TOPK_EXPW(data, finalizeKernelVecLoad, /*numBlocks=*/data.numTokens,
+      // With a device token count the kernel strides over the live tokens, so a persistent grid
+      // (8 blocks per SM) replaces the one-block-per-buffer-row launch.
+      int numBlocksVec = data.numTokens;
+      if (data.numActiveTokensPtr != nullptr) {
+        static int const numSms = [] {
+          int device = 0, sms = 0;
+          CHECK_CUDA_ERROR(cudaGetDevice(&device));
+          CHECK_CUDA_ERROR(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+          return sms;
+        }();
+        numBlocksVec = std::min(data.numTokens, 8 * numSms);
+      }
+      LAUNCH_TOPK_EXPW(data, finalizeKernelVecLoad, /*numBlocks=*/numBlocksVec,
                        /*numThreads=*/FINALIZE_THREADS_PER_BLOCK, 0, stream);
     }
   }

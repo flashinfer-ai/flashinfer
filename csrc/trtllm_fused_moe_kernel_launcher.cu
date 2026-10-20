@@ -1668,7 +1668,7 @@ class FusedMoeLauncher {
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
         use_routing_scales_on_input, use_deep_seek_fp8,
         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
-        norm_topk_prob, replay_ptr, enable_pdl);
+        norm_topk_prob, replay_ptr, enable_pdl, args->num_active_tokens_ptr);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -2113,7 +2113,7 @@ class StagedMoeLauncher : public FusedMoeLauncher {
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
         use_routing_scales_on_input, routing_use_deep_seek_fp8(),
         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
-        norm_topk_prob, replay_ptr, enable_pdl);
+        norm_topk_prob, replay_ptr, enable_pdl, args->num_active_tokens_ptr);
   }
 
   Tensor expert_weights_tensor() const { return FusedMoeLauncher::expert_weights; }
@@ -4477,7 +4477,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
         use_routing_scales_on_input, use_deep_seek_fp8,
         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
-        norm_topk_prob, replay_ptr, enable_pdl);
+        norm_topk_prob, replay_ptr, enable_pdl, args->num_active_tokens_ptr);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -5163,23 +5163,23 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       replay_ptr = reinterpret_cast<int16_t*>(routing_replay_out.value().data_ptr());
     }
 
-    routing_runner.run(args->routing_logits, args->routing_bias, args->num_tokens,
-                       args->num_experts, args->top_k, args->num_fused_shared_experts,
-                       args->n_group, args->topk_group, args->local_expert_offset,
-                       args->local_num_experts, args->routed_scaling_factor,
-                       static_cast<int*>(topk_ids.data_ptr()),
-                       static_cast<int*>(expert_count_histogram.data_ptr()),
-                       static_cast<int*>(total_num_padded_tokens.data_ptr()),
-                       static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
-                       static_cast<int*>(permuted_idx_to_expanded_idx_ptr()),
-                       static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_ids_param,
-                       expert_weights_param, static_cast<int*>(num_tokens_per_expert.data_ptr()),
-                       static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
-                       static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
-                       static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt,
-                       mRoutingBiasDtype, use_routing_scales_on_input, use_deep_seek_fp8,
-                       static_cast<RoutingMethodType>(routing_method_type), routing_stream,
-                       mRoutingLogitsDtype, norm_topk_prob, replay_ptr, enable_pdl);
+    routing_runner.run(
+        args->routing_logits, args->routing_bias, args->num_tokens, args->num_experts, args->top_k,
+        args->num_fused_shared_experts, args->n_group, args->topk_group, args->local_expert_offset,
+        args->local_num_experts, args->routed_scaling_factor,
+        static_cast<int*>(topk_ids.data_ptr()),
+        static_cast<int*>(expert_count_histogram.data_ptr()),
+        static_cast<int*>(total_num_padded_tokens.data_ptr()),
+        static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
+        static_cast<int*>(permuted_idx_to_expanded_idx_ptr()),
+        static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_ids_param,
+        expert_weights_param, static_cast<int*>(num_tokens_per_expert.data_ptr()),
+        static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
+        static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
+        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
+        use_routing_scales_on_input, use_deep_seek_fp8,
+        static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
+        norm_topk_prob, replay_ptr, enable_pdl, args->num_active_tokens_ptr);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -5644,7 +5644,8 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     bool enable_pdl, Array<int64_t> config_index, Fp8QuantizationType quantization_type,
     int64_t act_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out,
     Array<Tensor> da_routing_metadata, Array<Tensor> da_body_workspace, bool is_da_body_preparation,
-    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size) {
+    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size,
+    Optional<TensorView> num_active_tokens) {
   auto activation_type = validateAndCastActivationType(act_type);
   validateFp8BlockScaleGemm1ActivationParams(gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
                                              quantization_type, activation_type);
@@ -5712,6 +5713,22 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
 
   auto const num_tokens = hidden_states.size(0);
   auto const hidden_size = hidden_states.size(1);
+  int32_t const* num_active_tokens_ptr = nullptr;
+  if (num_active_tokens.has_value()) {
+    TVM_FFI_ICHECK_EQ(num_active_tokens.value().dtype(), dl_int32)
+        << "num_active_tokens must be int32.";
+    TVM_FFI_ICHECK_EQ(num_active_tokens.value().numel(), 1)
+        << "num_active_tokens must hold a single count.";
+    TVM_FFI_ICHECK_EQ(num_active_tokens.value().device().device_id,
+                      hidden_states.device().device_id)
+        << "num_active_tokens must live on the hidden_states device.";
+    num_active_tokens_ptr = static_cast<int32_t const*>(num_active_tokens.value().data_ptr());
+  }
+  // A float32 output is produced by the finalize converting on store; GEMM2 still runs bf16.
+  TVM_FFI_ICHECK(output.dtype() == dl_bfloat16 || output.dtype() == dl_float32)
+      << "output must be bfloat16 or float32.";
+  btg::Dtype const finalize_out_dtype =
+      output.dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Void;
   TVM_FFI_ICHECK(!(gemm1_lora_delta.has_value() && gemm1_bias.has_value()))
       << "gemm1_lora_delta and per-expert gemm1_bias cannot both be provided.";
   auto const gemm1_bias_type_enum = gemm1_lora_delta.has_value()
@@ -5756,6 +5773,8 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     args->do_finalize = do_finalize;
     args->output = output.data_ptr();
     args->output_scale = nullptr;
+    args->num_active_tokens_ptr = num_active_tokens_ptr;
+    args->mDtypeFinalizeOut = finalize_out_dtype;
     set_valid_moe_dims(*args, output.size(1), valid_hidden_size, valid_intermediate_size);
 
     // Create and initialize launcher for this tile size
