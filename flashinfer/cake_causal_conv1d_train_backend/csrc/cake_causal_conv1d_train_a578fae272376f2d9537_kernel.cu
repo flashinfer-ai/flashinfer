@@ -665,13 +665,8 @@ kernel_cake_causal_conv1d_train_a578fae272376f2d9537(__nv_bfloat16* __restrict__
             }
             #pragma unroll
             for (int s = 0; s < 2; s++) {
-                #pragma unroll
-                for (int cv = 6; cv < 12; cv++) {
-                    if (1 << cv <= 128) {
-                        if (sub == s && ct_vec == 1 << cv) {
-                            asm volatile("barrier.sync %0, %1;" :: "r"(1 + s), "r"(1 << cv) : "memory");
-                        }
-                    }
+                if (sub == s) {
+                    asm volatile("barrier.sync %0, %1;" :: "r"(1 + s), "r"(ct_vec) : "memory");
                 }
             }
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
