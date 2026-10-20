@@ -360,8 +360,10 @@ jobs:
       TEST_PATH_ARG: ${{ matrix.test_path }}
       # GPU lanes route their JIT compiles through the AOT lanes' S3 sccache.
       # On unless the repository variable FLASHINFER_GPU_TEST_SCCACHE is '0',
-      # which turns it off for A/B timing without a code change.
-      GPU_TEST_SCCACHE: ${{ matrix.kind != 'aot' && vars.FLASHINFER_GPU_TEST_SCCACHE != '0' && '1' || '0' }}
+      # which turns it off for A/B timing without a code change. The `|| '1'`
+      # matters: an unset variable is null, and `null != '0'` is false because
+      # mismatched types are compared as numbers (null and '0' both become 0).
+      GPU_TEST_SCCACHE: ${{ matrix.kind != 'aot' && (vars.FLASHINFER_GPU_TEST_SCCACHE || '1') != '0' && '1' || '0' }}
     steps:
       - name: Cleanup
         if: matrix.kind != 'h100'
