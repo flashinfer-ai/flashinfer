@@ -1781,7 +1781,7 @@ def _context_sage_layout(geometry: _ContextPlanGeometry) -> _SageScaleLayout:
         seq_len_q=geometry.max_seq_len_q,
         q_block_size=sage.q_block_size,
         heads_q_per_kv=geometry.num_qo_heads // geometry.num_kv_heads,
-        q_tokens_per_tile=_CONTEXT_TILE_SIZE_Q,
+        q_tile_rows=_CONTEXT_TILE_SIZE_Q,
         q_heads_interleaved=False,
         headdim=geometry.head_dim,
         v_mean=sage.v_mean,

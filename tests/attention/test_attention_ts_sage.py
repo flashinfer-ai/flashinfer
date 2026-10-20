@@ -826,7 +826,7 @@ def test_sage_q_rows_round_trip(heads_interleaved: bool) -> None:
         seq_len_q=300,
         q_block_size=2,
         heads_q_per_kv=4,
-        tokens_per_tile=16 if heads_interleaved else 128,
+        rows_per_tile=64 if heads_interleaved else 128,
         word_offset=0,
         heads_interleaved=heads_interleaved,
     )
@@ -839,6 +839,29 @@ def test_sage_q_rows_round_trip(heads_interleaved: bool) -> None:
             tile = rows.tile_index(head, token_tile)
             assert 0 <= tile < rows.tiles and 0 <= row < rows.rows_per_tile
             assert rows.row_token_and_head(tile, row) == (token, head)
+
+
+def test_sage_q_rows_pad_grouped_tiles() -> None:
+    """A grouped tile whose token rows do not fill it keeps its full row stride.
+
+    Seven Q heads per KV head put 18 tokens, 126 rows, in a Q128 tile; its two
+    padding rows decode to the tokens after the tile, whose scales stay
+    finite, and the next tile starts 128 words later.
+    """
+
+    rows = _SageQSection(
+        seq_len_q=40,
+        q_block_size=1,
+        heads_q_per_kv=7,
+        rows_per_tile=128,
+        word_offset=0,
+        heads_interleaved=True,
+    )
+    assert rows.tokens_per_tile == 18
+    assert rows.tiles == 3 and rows.words == 3 * 128
+    assert rows.row_token_and_head(1, 0) == (18, 0)
+    assert rows.row_token_and_head(0, 126) == (18, 0)
+    assert rows.row_token_and_head(0, 127) == (18, 1)
 
 
 @pytest.mark.parametrize(

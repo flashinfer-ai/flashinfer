@@ -105,24 +105,26 @@ class _SageKSection:
 class _SageQSection:
     """The ``sfQ`` words of a sequence's Q tiles: one word per row of each tile.
 
-    A Q tile is what one softmax instance reads: ``rows_per_tile`` rows, row
-    ``r`` of tile ``t`` at word ``word_offset + t * rows_per_tile + r``, in
-    the order the softmax lanes read them. With ``heads_interleaved`` (the
-    decode kernel's grouped tile) a tile holds ``tokens_per_tile`` tokens of
-    each of the ``heads_q_per_kv`` Q heads of its KV head, row ``r`` being
-    token ``r // heads_q_per_kv`` of local head ``r % heads_q_per_kv``.
-    Otherwise (the context kernel's tile) a tile holds ``tokens_per_tile``
-    tokens of one Q head: tile ``h * token_tiles + i`` is token range ``i`` of
-    local head ``h`` and row ``r`` its token ``r``. The word is that head's
-    scale of the token's ``q_block_size`` block; a row whose token lies past
-    the sequence's end takes the last token's, so a masked row keeps a
-    finite positive scale.
+    A Q tile is what one softmax instance reads: ``rows_per_tile`` rows, its
+    MMA M extent, row ``r`` of tile ``t`` at word ``word_offset + t *
+    rows_per_tile + r``, in the order the softmax lanes read them. With
+    ``heads_interleaved`` (the decode kernel's grouped tile) a tile holds
+    ``tokens_per_tile`` tokens of each of the ``heads_q_per_kv`` Q heads of
+    its KV head, row ``r`` being token ``r // heads_q_per_kv`` of local head
+    ``r % heads_q_per_kv``; when those rows do not fill the tile, its
+    remaining padding rows decode to the tokens after it. Otherwise (the
+    context kernel's tile) a tile holds ``rows_per_tile`` tokens of one Q
+    head: tile ``h * token_tiles + i`` is token range ``i`` of local head
+    ``h`` and row ``r`` its token ``r``. The word is that head's scale of the
+    token's ``q_block_size`` block; a row whose token lies past the
+    sequence's end takes the last token's, so a masked or padding row keeps
+    a finite positive scale.
     """
 
     seq_len_q: int
     q_block_size: int
     heads_q_per_kv: int
-    tokens_per_tile: int
+    rows_per_tile: int
     word_offset: int
     heads_interleaved: bool
 
@@ -131,17 +133,18 @@ class _SageQSection:
             raise ValueError("sfQ tiles hold whole float4s of at least one token")
 
     @property
+    def tokens_per_tile(self) -> int:
+        """Return the tokens of each Q head that one tile holds."""
+
+        if self.heads_interleaved:
+            return self.rows_per_tile // self.heads_q_per_kv
+        return self.rows_per_tile
+
+    @property
     def token_tiles(self) -> int:
         """Return the ``tokens_per_tile`` token ranges of the sequence, the last possibly partial."""
 
         return ceil_div(self.seq_len_q, self.tokens_per_tile)
-
-    @property
-    def rows_per_tile(self) -> int:
-        """Return the rows of one tile: its tokens of each head it holds."""
-
-        heads = self.heads_q_per_kv if self.heads_interleaved else 1
-        return self.tokens_per_tile * heads
 
     @property
     def tiles(self) -> int:
@@ -251,9 +254,9 @@ class _SageScaleLayout:
     seq_len_q: int
     q_block_size: int
     heads_q_per_kv: int
-    # Q tokens per Q tile, per head, and whether a tile interleaves the heads
-    # of its KV head (``_SageQSection``).
-    q_tokens_per_tile: int
+    # Rows of a Q tile and whether a tile interleaves the heads of its KV
+    # head (``_SageQSection``).
+    q_tile_rows: int
     q_heads_interleaved: bool
     headdim: int
     v_mean: bool
@@ -301,7 +304,7 @@ class _SageScaleLayout:
             seq_len_q=self.seq_len_q,
             q_block_size=self.q_block_size,
             heads_q_per_kv=self.heads_q_per_kv,
-            tokens_per_tile=self.q_tokens_per_tile,
+            rows_per_tile=self.q_tile_rows,
             word_offset=sum(section.words for section in self.k_sections),
             heads_interleaved=self.q_heads_interleaved,
         )
