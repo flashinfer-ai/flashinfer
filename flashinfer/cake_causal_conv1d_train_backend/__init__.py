@@ -293,8 +293,9 @@ def _partial_view(
     nbytes = partial_bytes(record, C, rows)
     if ws.numel() < nbytes:
         raise ValueError(
-            f"workspace holds {ws.numel()} bytes; this call needs {nbytes} "
-            "(cake_causal_conv1d_train_backward_workspace_bytes)"
+            f"workspace holds {ws.numel()} bytes; this call needs at least "
+            f"{nbytes}; allocate "
+            "cake_causal_conv1d_train_backward_workspace_bytes(S, C, device) bytes"
         )
     taps = int(record["workspace_rule"]["taps"])
     return ws[:nbytes].view(torch.float32).view(rows, C, taps)

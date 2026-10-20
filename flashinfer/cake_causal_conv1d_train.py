@@ -145,6 +145,14 @@ def cake_causal_conv1d_train_backward(
     the SiLU derivative of the rounded value (policy A), then produces ``dx``
     and the FP32 weight gradient in one cooperative launch.
 
+    The architecture's backward route may ship several programs of the kernel;
+    a call runs exactly one, chosen by ``C`` through a host-side rule of the
+    backend's registry (never the data), so a given ``(S, C, device)`` always
+    runs the same program.  Before capturing a CUDA Graph, build every library
+    of the device's architecture (the backend's ``cake_jit.specs_for_arch``)
+    so that no JIT build happens inside the capture; the captured graph holds
+    the program selected for its shape.
+
     Parameters
     ----------
     x, weight, cu_seqlens
@@ -156,7 +164,10 @@ def cake_causal_conv1d_train_backward(
         Caller-owned ``uint8`` buffer from
         :func:`cake_causal_conv1d_train_backward_workspace` (the per-CTA FP32
         ``dweight`` partials; fully written by the kernel, so it needs no
-        zeroing); allocated when omitted.
+        zeroing); allocated when omitted.  Its size
+        (:func:`cake_causal_conv1d_train_backward_workspace_bytes`) is the
+        maximum over the architecture's backward programs, so one buffer
+        serves whichever program ``C`` selects.
     dx, dweight : torch.Tensor, optional
         Preallocated outputs: BF16 of ``x``'s shape and FP32 ``[C, 4]``, both
         contiguous.

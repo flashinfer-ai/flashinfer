@@ -459,6 +459,11 @@ def selected_modules(
             fallback.append(name)
         elif _admits(rule, arch=arch, C=C):
             positive.append(name)
+    if len(fallback) != 1:
+        raise RuntimeError(
+            f"the exported backward route on {arch} declares {len(fallback)} fallback "
+            "programs (records without a select_rule); expected exactly one"
+        )
     if len(positive) > 1:
         raise RuntimeError(
             f"the exported backward route on {arch} selects {len(positive)} programs "
@@ -466,11 +471,6 @@ def selected_modules(
         )
     if positive:
         return (positive[0],)
-    if len(fallback) != 1:
-        raise RuntimeError(
-            f"the exported backward route on {arch} declares {len(fallback)} fallback "
-            "programs (records without a select_rule); expected exactly one"
-        )
     return (fallback[0],)
 
 
