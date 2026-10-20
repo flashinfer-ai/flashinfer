@@ -193,23 +193,31 @@ def test_w8a16_fp8_gemm_workspace_bytes_extreme_dims():
 
 def test_w8a16_fp8_gemm_workspace_bytes_splitk_overflow():
     """A forced split-K at extreme dimensions asks for `splits x M x N` fp32 partials,
-    which leaves the signed 64-bit range the query returns in (M = N ~ 2^31 gives 2^65
-    bytes before the split count); the query must say so instead of wrapping around
-    and reporting a small number.  Smaller dimensions still report the exact size."""
+    which leaves the signed 64-bit range the query returns in (M = N ~ 2^31 gives
+    ~2^64 bytes per slice); the query must say so instead of wrapping around and
+    reporting a small number.  Smaller dimensions still report the exact size, and the
+    split policies themselves must not overflow on the way there (the Blackwell long-K
+    rule multiplies tile counts by k-tile counts: large M, N and K together)."""
     dev = torch.device("cuda")
     major = get_compute_capability(dev)[0]
     algo = {9: "128x128_splitk", 10: "2sm256x128_splitk"}[major]
     big = 2**31 - 1
-    with pytest.raises(Exception, match="exceeds the 64-bit byte range"):
-        w8a16_fp8_gemm_workspace_bytes(big, 2**31 - 8, 1024, dev, algo)
-    with pytest.raises(Exception, match="exceeds the 64-bit byte range"):
-        w8a16_fp8_gemm_workspace_bytes(2**30, 2**30, 1024, dev, algo)
-    # 2 slices x 2^20 x 2^20 floats = 8 GiB: fits the range, so it is reported exactly
-    # (plus the CUTLASS scheduler workspace, if any), even though no one would allocate it.
-    assert w8a16_fp8_gemm_workspace_bytes(2**20, 2**20, 1024, dev, algo) >= 8 * 2**30
+    for m, n, k in [
+        (big, 2**31 - 8, 1024),
+        (2**30, 2**30, 1024),
+        (2**30, 2**30, 2**30),  # long K: the Blackwell wave-fill split rule runs too
+        (big, 2**31 - 8, 2**31 - 2**16),
+    ]:
+        with pytest.raises(Exception, match="exceeds the 64-bit byte range"):
+            w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo)
+    # 2 slices x 2^20 x 2^20 floats = 2^43 bytes (8 TiB): fits the range, so it is
+    # reported exactly (plus the CUTLASS scheduler workspace, if any), even though no
+    # one would allocate it.  The forced split on this short K is the smallest, 2.
+    assert w8a16_fp8_gemm_workspace_bytes(2**20, 2**20, 1024, dev, algo) >= 2**43
     # The launcher's own choice at the extreme dimensions never picks a split it cannot
     # size (the Hopper cost model's partials cap is evaluated without overflowing).
-    assert w8a16_fp8_gemm_workspace_bytes(big, 2**31 - 8, 1024, dev) >= 0
+    for m, n, k in [(big, 2**31 - 8, 1024), (2**30, 2**30, 2**30)]:
+        assert w8a16_fp8_gemm_workspace_bytes(m, n, k, dev) >= 0
 
 
 def test_w8a16_fp8_gemm_rejects_aliasing():

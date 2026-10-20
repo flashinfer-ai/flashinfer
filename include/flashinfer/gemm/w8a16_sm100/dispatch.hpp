@@ -77,7 +77,10 @@ inline int W8A16Sm100SplitK(int M, int N, int K, int num_sms) {
     for (int s = 2; s <= W8A16Sm100MaxSplits; ++s) {
       if (ktiles % s != 0 || ktiles / s < 50) continue;
       const long long waves = (units * s + clusters - 1) / clusters;
-      if (waves * (ktiles / s) * 100 <= waves1 * ktiles * 85) return s;
+      // waves x (ktiles / s) <= 0.85 x waves1 x ktiles, with the common factor ktiles / s
+      // divided out: the full products overflow 64 bits at large M, N and K together
+      // (units up to 2^47, ktiles up to 2^24), the reduced ones stay below 2^58.
+      if (waves * 100 <= waves1 * s * 85) return s;
     }
   }
   return 1;
