@@ -274,26 +274,27 @@ def sm120_m537_is_valid(m: int, k: int) -> bool:
     return m == SM120_M537_M and k in (5120, 5376, 7168)
 
 
-# Mirrors FI_SVDQ_RANK128_WS_TILINGS in nvfp4_smooth_quantize_lora_down_ws_sm120.cuh.
+# Mirrors FI_SVDQ_RANK128_WS_TILINGS in nvfp4_smooth_quantize_lora_down_ws_sm120.cuh:
+# (tile M, tile K, down layout * 1000 + stages * 100 + quantize warps), down
+# layout 0 = 2x4 down warps (rows x columns), 1 = 2x8, 2 = 1x8.
 SM120_RANK128_WS_TILING_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
+    (160, 64, 1205),
     (160, 64, 205),
-    (160, 64, 210),
+    (160, 64, 1210),
+    (144, 64, 2209),
     (128, 64, 204),
-    (96, 64, 303),
     (96, 64, 306),
+    (96, 64, 1303),
+    (80, 64, 2305),
     (64, 64, 304),
-    (160, 64, 405),
-    (64, 128, 204),
-    (64, 128, 208),
-    (32, 128, 304),
-    (32, 256, 204),
-    (32, 256, 208),
-    (64, 192, 206),
-    (96, 128, 206),
+    (64, 64, 1304),
+    (48, 64, 2403),
+    (32, 64, 402),
+    (32, 64, 404),
 )
+# Grid mode (the address-policy slot): 0 = one CTA per SM.
 SM120_WS_GRID_MODES: Final[tuple[int, ...]] = (0,)
 _WS_RANK: Final = 128
-_WS_DOWN_WARPS: Final = 8
 
 
 def _ws_shared_bytes(tile_m: int, tile_k: int, stages: int) -> int:
@@ -304,10 +305,8 @@ def _ws_shared_bytes(tile_m: int, tile_k: int, stages: int) -> int:
 
 def sm120_ws_tiling_is_valid(m: int, k: int, tile_m: int, tile_k: int, packed: int) -> bool:
     """Python counterpart of launch_ws_kernel's guards."""
-    stages, quant_warps = divmod(packed, 100)
-    if tile_k % 64 or m <= 0 or k <= 0 or k % tile_k or m > (1 << 30):
-        return False
-    if stages <= 0 or quant_warps <= 0 or tile_m % 32:
+    stages = packed // 100 % 10
+    if tile_k % 64 or m <= 0 or k <= 0 or k % tile_k or m > (1 << 30) or stages <= 0:
         return False
     return _ws_shared_bytes(tile_m, tile_k, stages) <= _STAGED_B_SHARED_LIMIT
 
