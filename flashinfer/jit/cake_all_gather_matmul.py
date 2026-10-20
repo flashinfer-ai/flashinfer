@@ -307,6 +307,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
+    "cake_all_gather_matmul_ea2faa64e8c1ea61c8b8": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ea2faa64e8c1ea61c8b8_kernel.cu",
+        ],
+        "arches": ["sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
     "cake_all_gather_matmul_ef0a40fd8365adef0679": {
         "sources": [
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ef0a40fd8365adef0679_kernel.cu",
@@ -359,6 +367,7 @@ ROUTES: dict[str, str] = {
     "main_bfloat16_ws4_k_major_cg2": "cake_all_gather_matmul_18bb325baf7347c5f496",
     "main_bfloat16_ws4_k_major_cg2s2": "cake_all_gather_matmul_b9a6204da826be87d972",
     "main_bfloat16_ws4_k_major_n128": "cake_all_gather_matmul_52f3fc23159650a89719",
+    "main_bfloat16_ws4_k_major_po": "cake_all_gather_matmul_ea2faa64e8c1ea61c8b8",
     "main_bfloat16_ws4_n_major": "cake_all_gather_matmul_dba24f495a33b1a179e7",
     "main_bfloat16_ws8_k_major": "cake_all_gather_matmul_a55baa3bdb6ce5b39f7e",
     "main_bfloat16_ws8_k_major_cg2": "cake_all_gather_matmul_17f60837feb11a634b34",
@@ -511,6 +520,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_52f3fc23159650a89719_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_18bb325baf7347c5f496_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_b9a6204da826be87d972_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ea2faa64e8c1ea61c8b8_kernel.cu",
             "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_bfloat16_ws4_k_major_sm_103a.cu",
         ],
         "arches": ["sm_103a"],
@@ -526,6 +536,7 @@ SEQUENCES: dict[str, dict[str, Any]] = {
             "main_n128": "cake_all_gather_matmul_52f3fc23159650a89719",
             "main_cg2": "cake_all_gather_matmul_18bb325baf7347c5f496",
             "main_cg2s2": "cake_all_gather_matmul_b9a6204da826be87d972",
+            "main_po": "cake_all_gather_matmul_ea2faa64e8c1ea61c8b8",
         },
     },
     "bfloat16_ws4_n_major_sm_100a": {
@@ -1068,6 +1079,24 @@ CG2_SPILL_POINTS: dict[str, list[list[Any]]] = {
         [8, "bfloat16", "k_major", 512, 7168, "cg2s2"],
     ],
 }
+# Classes ``[world_size, dtype, b_layout, form]`` with a delivered tile-order
+# main (``form`` ``po`` / ``pi``: the one-CTA N256 main with another tile ->
+# (peer, B panel) map of its persistent walk; the one-CTA launch), per
+# architecture; ``main_form`` selects a point's program only inside this table.
+ORDER_CLASSES: dict[str, list[list[Any]]] = {
+    "sm_100a": [],
+    "sm_103a": [[4, "bfloat16", "k_major", "po"]],
+}
+# Frozen refinement of the one-CTA selection, copied from the kernel module:
+# ``[world_size, dtype, b_layout, padded_rows, n, form]`` points per
+# architecture (an architecture without one lists nothing; ``padded_rows`` is
+# always 128, the one-M-tile geometry the twins are authored for); an N256 call
+# the pair rule leaves on the one-CTA program runs the point's tile-order twin
+# iff its class, ``ceil128(rows)`` and exact ``N`` match a point.
+TILE_ORDER_POINTS: dict[str, list[list[Any]]] = {
+    "sm_100a": [],
+    "sm_103a": [[4, "bfloat16", "k_major", 128, 14336, "po"]],
+}
 
 SOURCE_PACKAGE = "cake_all_gather_matmul"
 # The kernels are tcgen05 / TMEM code; one source serves both capabilities,
@@ -1089,13 +1118,15 @@ BLOCK_N = 256
 # ``_n128`` twin ``main_block_n`` selects per call.
 MAIN_BLOCK_NS: tuple[int, ...] = (256, 128)
 # Forms of the delivered N256 main: the one-CTA program (``cg1``), its CTA-pair
-# twin (``cg2``, ``tcgen05.mma.cta_group::2``) and the twin's spill-wave N-split
-# pair twins (``cg2s1`` / ``cg2s2``) ``main_form`` selects per call; the index
-# of a form here is the positional form code the host sequence takes
-# (``main_form_code``). Every pair form launches clusters of
-# ``CG2_CLUSTER_DIMS`` CTAs (the pair).
-MAIN_FORMS: tuple[str, ...] = ("cg1", "cg2", "cg2s1", "cg2s2")
+# twin (``cg2``, ``tcgen05.mma.cta_group::2``), the twin's spill-wave N-split
+# pair twins (``cg2s1`` / ``cg2s2``) and the one-CTA program's tile-order twins
+# (``po`` / ``pi``) ``main_form`` selects per call; the index of a form here is
+# the positional form code the host sequence takes (``main_form_code``). Every
+# pair form launches clusters of ``CG2_CLUSTER_DIMS`` CTAs (the pair); the
+# tile-order forms take the one-CTA launch and grid.
+MAIN_FORMS: tuple[str, ...] = ("cg1", "cg2", "cg2s1", "cg2s2", "po", "pi")
 PAIR_FORMS: tuple[str, ...] = ("cg2", "cg2s1", "cg2s2")
+ORDER_FORMS: tuple[str, ...] = ("po", "pi")
 CG2_CLUSTER_DIMS: tuple[int, int, int] = (2, 1, 1)
 # Rows pushed per peer chunk (19 * BLOCK_M); the main kernel consumes chunk
 # ``c`` of a peer after the matching readiness word reaches the launch epoch.
@@ -1263,6 +1294,47 @@ def _cg2s_classes(arch: str) -> frozenset[tuple[int, str, str, str]]:
     )
 
 
+def _order_classes(arch: str) -> frozenset[tuple[int, str, str, str]]:
+    """``(world_size, dtype, b_layout, form)`` classes with a delivered tile-order
+    main on ``arch`` (the emitted ``ORDER_CLASSES`` table); an unknown arch
+    raises."""
+
+    if arch not in ORDER_CLASSES:
+        raise ValueError(
+            f"ORDER_CLASSES has no entry for arch {arch!r} "
+            f"(known: {sorted(ORDER_CLASSES)})"
+        )
+    return frozenset(
+        (int(world_size), str(dtype_name), str(b_layout), str(form))
+        for world_size, dtype_name, b_layout, form in ORDER_CLASSES[arch]
+    )
+
+
+def _tile_order_point(
+    arch: str,
+    world_size: int,
+    dtype_name: str,
+    b_layout: str,
+    padded: int,
+    cols: int,
+) -> str | None:
+    """Form of the tile-order point of ``TILE_ORDER_POINTS`` that names the class,
+    padded rows and exact ``N`` on ``arch``, or ``None`` when no point does; an
+    unknown arch raises."""
+
+    if arch not in TILE_ORDER_POINTS:
+        raise ValueError(
+            f"TILE_ORDER_POINTS has no entry for arch {arch!r} "
+            f"(known: {sorted(TILE_ORDER_POINTS)})"
+        )
+    key = (int(world_size), str(dtype_name), str(b_layout), int(padded), int(cols))
+    for entry in TILE_ORDER_POINTS[arch]:
+        world, dtype, layout, rows, n, form = entry
+        if (int(world), str(dtype), str(layout), int(rows), int(n)) == key:
+            return str(form)
+    return None
+
+
 def _cg2_spill_point(
     arch: str,
     world_size: int,
@@ -1338,8 +1410,8 @@ def main_form(
     b_layout: str,
     block_n: int,
 ) -> str:
-    """Form (``"cg1"``, ``"cg2"``, ``"cg2s1"`` or ``"cg2s2"``) of the main program
-    for one call.
+    """Form (``"cg1"``, ``"cg2"``, ``"cg2s1"``, ``"cg2s2"``, ``"po"`` or ``"pi"``)
+    of the main program for one call.
 
     The CTA-pair twin (``cg2``) is selected for an N256 call whose
     ``(world_size, dtype_name, b_layout)`` class has a measured rectangle on
@@ -1351,9 +1423,12 @@ def main_form(
     point's spill-wave N-split pair program instead, when that program is
     delivered for the class there (``CG2S_CLASSES``). A 128-wide call, a class
     without a rectangle and a call outside every rectangle of its class run
-    the one-CTA program. The rule mirrors the kernel module's ``main_form``
-    with its frozen region and point tables; an unknown arch raises, never
-    defaults."""
+    the one-CTA program -- or, when the N256 call's class, ``ceil128(rows)``
+    and exact ``n`` name a point of ``TILE_ORDER_POINTS`` on ``arch`` whose
+    program is delivered for the class there (``ORDER_CLASSES``), the point's
+    tile-order twin of the one-CTA program (the same launch and grid). The
+    rule mirrors the kernel module's ``main_form`` with its frozen region and
+    point tables; an unknown arch raises, never defaults."""
 
     if arch not in CG2_REGIONS:
         raise ValueError(
@@ -1371,10 +1446,13 @@ def main_form(
         min_rows <= padded <= max_rows and min_cols <= cols <= max_cols
         for min_rows, max_rows, min_cols, max_cols in rectangles
     )
+    key = (int(world_size), str(dtype_name), str(b_layout))
     if not (qualify and delivered):
+        order = _tile_order_point(arch, world_size, dtype_name, b_layout, padded, cols)
+        if order is not None and (*key, order) in _order_classes(arch):
+            return order
         return "cg1"
     point = _cg2_spill_point(arch, world_size, dtype_name, b_layout, padded, cols)
-    key = (int(world_size), str(dtype_name), str(b_layout))
     if point is not None and (*key, point) in _cg2s_classes(arch):
         return point
     return "cg2"
@@ -1382,8 +1460,8 @@ def main_form(
 
 def main_form_code(form: str) -> int:
     """The positional form code the host sequence takes after ``block_n``: 0 the
-    one-CTA main, 1 the CTA-pair twin, 2 / 3 its spill-wave N-split pair twins
-    (the index into ``MAIN_FORMS``)."""
+    one-CTA main, 1 the CTA-pair twin, 2 / 3 its spill-wave N-split pair twins,
+    4 / 5 the one-CTA main's tile-order twins (the index into ``MAIN_FORMS``)."""
 
     return MAIN_FORMS.index(_check_form(form))
 
@@ -1417,11 +1495,16 @@ def main_grid(
     each CTA striding over the arrival-ordered tile list. Every pair form (the
     CTA-pair twin and its spill-wave N-split twins) launches an even grid of
     ``2 * min(pair_tiles, SMs / 2)`` CTAs, each cluster striding over the
-    pair-tile list."""
+    pair-tile list. The tile-order twins take the one-CTA grid at the public
+    width."""
 
     if int(world_size) <= 0 or int(sm_count) <= 0:
         message = "the persistent main grid needs a positive world_size and sm_count"
         raise ValueError(message)
+    if _check_form(form) in ORDER_FORMS and _check_block_n(block_n) != 256:
+        raise ValueError(
+            f"the tile-order mains exist at block_n=256 only, got {block_n}"
+        )
     if _check_form(form) in PAIR_FORMS:
         if _check_block_n(block_n) != 256:
             raise ValueError(
@@ -1647,11 +1730,16 @@ def _main_route_key(
 ) -> str:
     """``ROUTES`` key of one main program (``_n128`` suffix for the 128-wide twin,
     ``_cg2`` for the CTA-pair twin of the N256 main, ``_cg2s1`` / ``_cg2s2`` for
-    its spill-wave N-split twins, ``_ks<S>`` last for a per-K-slice readiness twin)."""
+    its spill-wave N-split twins, ``_po`` / ``_pi`` for the one-CTA main's
+    tile-order twins, ``_ks<S>`` last for a per-K-slice readiness twin)."""
 
     width = "" if _check_block_n(block_n) == 256 else f"_n{block_n}"
     if _check_form(form) in PAIR_FORMS and block_n != 256:
         raise ValueError(f"the CTA-pair main exists at block_n=256 only, got {block_n}")
+    if form in ORDER_FORMS and block_n != 256:
+        raise ValueError(
+            f"the tile-order mains exist at block_n=256 only, got {block_n}"
+        )
     pair = "" if form == "cg1" else f"_{form}"
     slices = "" if int(k_slices) == 1 else f"_ks{int(k_slices)}"
     return f"main_{dtype_name}_ws{int(world_size)}_{b_layout}{width}{pair}{slices}"
@@ -1666,8 +1754,8 @@ def main_program(
     k_slices: int = 1,
 ) -> str:
     """The main program of one route at tile width ``block_n`` (256, or the delivered
-    ``_n128`` twin), form (``cg1``, the delivered ``_cg2`` CTA-pair twin, or a
-    delivered spill-wave N-split twin) and readiness slice count (1, or a delivered
+    ``_n128`` twin), form (``cg1``, the delivered ``_cg2`` CTA-pair twin, a
+    delivered spill-wave N-split twin or a delivered tile-order twin) and readiness slice count (1, or a delivered
     per-K-slice ``_ks<S>`` twin of that program); a class without that program
     raises ``ValueError``."""
 
@@ -1732,10 +1820,11 @@ def sequence_programs(sequence: str) -> tuple[str, ...]:
     barrier phases, both SM push programs, the N256 main, then the ``_n128`` main
     when the row's ``programs`` carry ``main_n128``, then the ``_cg2`` main when
     they carry ``main_cg2``, then the spill-wave N-split mains when they carry
-    ``main_cg2s1`` / ``main_cg2s2``, then every per-K-slice readiness twin they
-    carry -- the ``_ks<S>`` push twin of each slice point, then the ``_ks<S>``
-    main twin of every width and form a call at a point can resolve to -- in the
-    row's order)."""
+    ``main_cg2s1`` / ``main_cg2s2``, then the tile-order mains when they carry
+    ``main_po`` / ``main_pi`` (``ORDER_FORMS`` order), then every per-K-slice
+    readiness twin they carry -- the ``_ks<S>`` push twin of each slice point,
+    then the ``_ks<S>`` main twin of every width and form a call at a point can
+    resolve to -- in the row's order)."""
 
     row = SEQUENCES[sequence]
     programs = [
@@ -1752,6 +1841,11 @@ def sequence_programs(sequence: str) -> tuple[str, ...]:
     for stage in ("main_cg2s1", "main_cg2s2"):
         if stage in row["programs"]:
             programs.append(row["programs"][stage])
+    # The tile-order twins of the sequence's (class, form) with a routed point, when it has any: ``main_po`` /
+    # ``main_pi`` in ``ORDER_FORMS`` order (none for a class without a point).
+    for form in ORDER_FORMS:
+        if f"main_{form}" in row["programs"]:
+            programs.append(row["programs"][f"main_{form}"])
     # The per-K-slice readiness twins of the sequence's slice points (the push twin of
     # each point, then the main twins), when it has any: every ``_ks<S>`` stage, in order.
     for stage, program in row["programs"].items():
@@ -1824,7 +1918,10 @@ __all__ = [
     "K",
     "MAIN_BLOCK_NS",
     "MAIN_FORMS",
+    "ORDER_CLASSES",
+    "ORDER_FORMS",
     "PAIR_FORMS",
+    "TILE_ORDER_POINTS",
     "MAIN_THREADS",
     "N128_CLASSES",
     "N128_MAX_WAVES_BY_ARCH",

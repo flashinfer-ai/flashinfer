@@ -1613,6 +1613,10 @@ def chunk_gated_delta_rule(
                 "the state pool ([N_pool, H, V, K]); refusing to auto-allocate a "
                 "compact [num_seqs, ...] tensor that would be indexed out of bounds."
             )
+        # No pool to read from or write to: the slot ids would only index the
+        # compact scratch state the SM90/SM120 kernels still store into.
+        if initial_state is None and output_state is None:
+            state_indices = None
     if (
         use_qk_l2norm_in_kernel
         and _arch_major in (9, 10, 12)
@@ -1856,9 +1860,16 @@ def chunk_gated_delta_rule(
         if chunk_gated_delta_rule_sm90 is None:
             raise NotImplementedError("SM90 GDN prefill DSL kernel is unavailable")
 
+        # The kernel always stores the final state, to
+        # output_state[state_indices[i]] when indexed, so scratch for a
+        # read-only pool must span the pool, as on SM120.
         if output_state is None:
             output_state = torch.empty(
-                (num_seqs, num_sab_heads, head_size, head_size),
+                (
+                    initial_state.shape
+                    if state_indices is not None and initial_state is not None
+                    else (num_seqs, num_sab_heads, head_size, head_size)
+                ),
                 dtype=torch.float32,
                 device=device,
             )

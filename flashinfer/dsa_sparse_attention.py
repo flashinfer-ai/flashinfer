@@ -346,6 +346,263 @@ def dsa_sparse_attention_varlen(
     )
 
 
+@flashinfer_experimental_api(feature=_FEATURE)
+def dsa_sparse_attention_nope(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    topk_length: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    return_lse: bool = False,
+    key_passes: Optional[int] = None,
+    backend: str = "cake",
+    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_dst_map: Optional[torch.Tensor] = None,
+    dkv_direct: Optional[bool] = None,
+    check_dst_map: Optional[bool] = None,
+):
+    r"""Differentiable top-k sparse MLA attention without a rope part (NoPE:
+    the whole score is the 512-dimensional latent product) for training, 64
+    query heads, SM100 / SM103 / SM107 only.
+
+    ``O = softmax(softmax_scale * (q . kv^T)) . kv`` over the keys a row's
+    ``indices`` select (K = V = the shared latent ``kv``).  The native kernels
+    of this form read no rope operands and produce one combined gradient per
+    key row, ``dkv = dK + dV``, natural layout, FP32.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        BF16 ``[T, 64, 512]`` absorbed query latents; contiguous or a strided
+        token / head view (unit innermost stride, head and token strides
+        positive multiples of 8 elements, head stride at least 512,
+        16-byte-aligned base), consumed in place.
+    kv : torch.Tensor
+        BF16 ``[S, 512]`` shared key/value latent, or its one-head form
+        ``[S, 1, 512]`` (squeezed to ``[S, 512]`` on the host; the gradient
+        reaches the ``[S, 1, 512]`` leaf through that view).
+    indices : torch.Tensor
+        int32 ``[T, K_slots]`` **global** key rows into ``kv``.  Any
+        ``K_slots >= 1`` (the slot count is a per-row capacity, not a
+        multiple of anything); ``-1`` or a value ``>= S`` marks an invalid
+        slot, anywhere in the row.  A row whose every slot is invalid gives
+        ``out = 0``, ``lse = -inf`` and zero gradients.
+    topk_length : Optional[torch.Tensor]
+        int32 ``[T]``; slots ``>= topk_length[t]`` are invalid regardless of
+        their content.  Without it the per-row lengths are derived by the
+        forward kernel while it runs and saved for the backward.
+    softmax_scale : Optional[float]
+        Defaults to ``1 / 16`` (``512 ** -0.5`` of the latent width is not
+        used: the absorbed queries of this form carry their own scale).
+    return_lse : bool
+        Also return the natural-log logsumexp ``[T, 64]`` FP32 of the scaled
+        scores over the valid keys (``-inf`` for fully masked rows).
+    key_passes : Optional[int]
+        Number of key-range passes of the backward's main stage.  ``None``
+        (default) applies the registered policy of this program, which plans
+        one pass on every row (one pass measured fastest on every shape of
+        this form); ``1`` forces the single pass; a larger value forces that
+        many passes (``<= S``) over slices of the key range, each pass's FP32
+        accumulator slice sized at 2048 B per key.  The passes carry dQ
+        through an FP32 partial in the workspace (``T * 131,072`` B plus
+        ``T * (4 * K_slots + 4)`` B, ``T <= 4736`` tokens per chunk at
+        ``K_slots`` 2048 / 2176); dQ stays bitwise deterministic and the
+        dK + dV accumulation is unchanged.
+    backend : str
+        Only ``"cake"``.
+    dkv_acc : Optional[torch.Tensor]
+        Caller-owned FP32 ``[S_dst, >= 512]`` buffer (row stride a multiple of
+        4 elements and at least 512, 16-byte-aligned base) into which the
+        backward accumulates ``dK + dV`` in place (``+=`` into columns
+        ``0:512``; the caller zeroes it).  When given, the ``kv`` gradient of
+        the autograd call is ``None``.  Chunked backward passes over one long
+        row accumulate into one such buffer in FP32 with no intermediate
+        rounding.
+    dkv_dst_map : Optional[torch.Tensor]
+        int32 ``[S]`` destination row of ``dkv_acc`` for every key row
+        (default identity).  Repeated destinations are allowed and combined
+        with FP32 atomics.  Every value must lie in ``[0, S_dst)``; the kernel
+        does not range-check the map (see ``check_dst_map``).
+    dkv_direct : Optional[bool]
+        How the backward accumulates ``dK + dV`` into its natural FP32 buffer
+        (``dkv_acc`` or the fresh ``dkv``) when the registered program has the
+        natural-layout main stages.  ``None`` (default) reads
+        ``FLASHINFER_CAKE_DSA_DKV_DIRECT``: ``auto`` (its default) applies the
+        record's rule -- the main stage adds into the buffer directly (no
+        permuted accumulator, no cast launch) when the row has at least
+        ``dkv_direct.min_keys_per_query`` keys per query token, 1 for this
+        program (every row with at least as many keys as query tokens; the
+        direct path measured faster than the permuted drain on every such
+        row), so only a problem with more query rows than keys takes the
+        cast --, ``1`` forces the direct path whenever the stages are
+        registered, ``0`` always takes the accumulate-and-cast path; any
+        other value raises ``ValueError``.  ``True`` / ``False`` select the path explicitly and
+        ignore the variable.  Both paths add the same FP32 contributions into
+        the same rows (another summation order).
+    check_dst_map : Optional[bool]
+        Validate the values of ``dkv_dst_map`` on every backward (one device
+        synchronization), raising ``ValueError`` on a violation.  ``None``
+        (default) reads ``FLASHINFER_CAKE_DSA_CHECK_DST_MAP`` (unset, empty
+        or ``0`` = no check); ``True`` / ``False`` decide explicitly.
+
+    Returns
+    -------
+    out : torch.Tensor
+        BF16 ``[T, 64, 512]``; zero for fully masked rows.
+    lse : torch.Tensor
+        Only with ``return_lse=True``.
+
+    Gradients flow to ``q`` and ``kv``.  ``dq`` is BF16 and bitwise
+    deterministic.  ``dkv`` is accumulated in FP32 by the kernels' atomics
+    (run-to-run spread within FP32 rounding) and handed over in FP32: through
+    ``dkv_acc`` when given, otherwise as the ``kv`` gradient -- which the
+    autograd engine casts to the dtype of the ``kv`` leaf (BF16 for a BF16
+    leaf); call ``flashinfer.experimental.cake_dsa_train.cake_backend.backward_nope``
+    or pass ``dkv_acc`` to keep the FP32 values.  BF16 operands into the tensor
+    cores, FP32 accumulation and statistics; the backward recomputes the scores
+    from the BF16 inputs and forms the exact ``delta`` from the saved output
+    residual.  The kernels apply no positional mask: the index rows define the
+    key set.
+
+    The incoming ``dout`` may be a head-major view (strides ``[512, T * 512,
+    1]``, the layout an output projection hands back) or any strided
+    ``[T, 64, 512]`` view under the layout rules of ``q`` (unit channel
+    stride, token and head strides multiples of 8 elements, 16-byte base): it
+    is read in place -- the main stage through a stride-carrying tensor map,
+    the delta stage through the token and head strides it receives -- with no
+    host copy.
+
+    Host side as in :func:`dsa_sparse_attention`: the inputs are validated and
+    bound on the first call for an input binding; later calls with the same
+    binding launch from the remembered argument plans (the same
+    ``BINDING_CACHE``, under keys disjoint from the rope entries).
+    """
+    if dkv_direct is None:
+        dkv_direct = _dkv_direct_from_environment()
+    if check_dst_map is None:
+        check_dst_map = _check_dst_map_from_environment()
+    return _backend(backend).dsa_sparse_attention_nope(
+        q,
+        kv,
+        indices,
+        topk_length=topk_length,
+        softmax_scale=softmax_scale,
+        return_lse=return_lse,
+        key_passes=key_passes,
+        dkv_acc=dkv_acc,
+        dkv_dst_map=dkv_dst_map,
+        dkv_direct=dkv_direct,
+        check_dst_map=check_dst_map,
+    )
+
+
+@flashinfer_experimental_api(feature=_FEATURE)
+def dsa_sparse_attention_nope_varlen(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    gather_kv_indices: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    *,
+    causal: bool = False,
+    topk_length: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    return_lse: bool = False,
+    key_passes: Optional[int] = None,
+    backend: str = "cake",
+    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_dst_map: Optional[torch.Tensor] = None,
+    dkv_direct: Optional[bool] = None,
+    check_dst_map: Optional[bool] = None,
+    check_cu_seqlens: bool = False,
+):
+    r"""Packed multi-document form of :func:`dsa_sparse_attention_nope` (SM100 /
+    SM103 / SM107).
+
+    Documents are packed along the first dimension of ``q`` (``T =
+    cu_seqlens_q[-1]``) and of ``kv`` (``S = cu_seqlens_k[-1]``; ``[S, 512]``
+    or ``[S, 1, 512]``); ``cu_seqlens_q`` and ``cu_seqlens_k`` are independent
+    and query and key lengths may differ per document: the query segment is
+    the tail of its key prefix, so query ``local_q`` of document ``d`` sits at
+    key position ``(seqlen_k[d] - seqlen_q[d]) + local_q``.
+    ``gather_kv_indices`` ``[T, K_slots]`` int32 hold key positions relative
+    to the row's document (``-1`` or ``>= seqlen_k[d]`` invalid; any ``K_slots
+    >= 1``) and are offset by ``cu_seqlens_k`` on device before the flat
+    kernels run (this glue counts in the step time).  Zero-length query
+    segments contribute no rows; a row whose every slot is invalid gives
+    ``out = 0``, ``lse = -inf`` and zero gradients.  The kernels apply no
+    positional mask of their own; the offset index rows define the key sets.
+    ``max_seqlen_q`` / ``max_seqlen_k`` are accepted for signature parity with
+    other varlen attention entry points and are not read on the host.  Other
+    arguments, the ``1 / 16`` default scale, the FP32 ``dK + dV`` semantics and
+    the returns as in :func:`dsa_sparse_attention_nope`.
+
+    ``cu_seqlens_q`` and ``cu_seqlens_k`` are caller-owned prefix sums with
+    these invariants: int32 ``[num_docs + 1]`` tensors of one length on the
+    device of ``q``, starting at 0 and non-decreasing, ``cu_seqlens_q[-1] ==
+    T`` (the packed rows of ``q``), ``cu_seqlens_k[-1] == S`` (the packed rows
+    of ``kv``; a shorter or longer key window is not accepted) and ``seqlen_q
+    <= seqlen_k`` for every document.  Their structure (contiguous int32
+    ``[num_docs + 1]`` of one length) is checked on every call; their values
+    only with ``check_cu_seqlens=True``, since that check synchronizes with
+    the device, and a violation is otherwise not detected on device: a
+    document with ``seqlen_k < seqlen_q`` gives negative own positions
+    (all-invalid rows under ``causal``), a non-monotonic prefix sum assigns
+    rows to the wrong document.  The per-document rows are turned into global
+    key rows on device, in one launch right before the forward kernel.
+
+    Parameters
+    ----------
+    check_cu_seqlens : bool
+        ``True`` checks the values of ``cu_seqlens_q`` / ``cu_seqlens_k``
+        against the invariants above at the cost of one blocking device-to-host
+        copy per call, before any launch (skipped during CUDA-graph capture,
+        where no synchronization is possible; the eager call captured was
+        checked).  ``False`` (default) keeps the structural checks (dtype,
+        rank, length, contiguity, device) only.
+    causal : bool
+        With ``False`` (default) the index row is taken as is -- only ``-1`` /
+        out-of-range slots are dropped.  With ``True`` a slot that selects a
+        key after the query's own position (``idx > (seqlen_k[d] -
+        seqlen_q[d]) + local_q``) is invalid too, so a top-k selector need not
+        enforce causality itself.
+    dkv_direct : Optional[bool]
+        As in :func:`dsa_sparse_attention_nope`: ``None`` (default) reads
+        ``FLASHINFER_CAKE_DSA_DKV_DIRECT``; ``True`` / ``False`` decide
+        explicitly.
+    check_dst_map : Optional[bool]
+        As in :func:`dsa_sparse_attention_nope`: ``None`` (default) reads
+        ``FLASHINFER_CAKE_DSA_CHECK_DST_MAP``; ``True`` validates the values of
+        ``dkv_dst_map`` on every backward, ``False`` never does.
+    """
+    if dkv_direct is None:
+        dkv_direct = _dkv_direct_from_environment()
+    if check_dst_map is None:
+        check_dst_map = _check_dst_map_from_environment()
+    return _backend(backend).dsa_sparse_attention_nope_varlen(
+        q,
+        kv,
+        gather_kv_indices,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        causal=causal,
+        topk_length=topk_length,
+        softmax_scale=softmax_scale,
+        return_lse=return_lse,
+        key_passes=key_passes,
+        dkv_acc=dkv_acc,
+        dkv_dst_map=dkv_dst_map,
+        dkv_direct=dkv_direct,
+        check_dst_map=check_dst_map,
+        check_cu_seqlens=check_cu_seqlens,
+    )
+
+
 # Read once at import: a malformed value fails here, naming the variable, not
 # on the first call.  Applied to the backend's cache by ``_cake_backend``.
 _BINDING_CACHE_CAPACITY = _binding_cache_capacity_from_environment()
