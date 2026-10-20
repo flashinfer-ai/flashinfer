@@ -1,5 +1,6 @@
 import importlib.util
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -61,3 +62,77 @@ def test_dependency_resolution_error_is_not_retried(wheel_builder):
 
     env.install.assert_called_once()
     wheel_builder.time.sleep.assert_not_called()
+
+
+def _fake_python(tmp_path, body):
+    """A stand-in interpreter that records `-m pip install ...` invocations."""
+    log = tmp_path / "pip.log"
+    python = tmp_path / "python"
+    python.write_text(f'#!/bin/bash\necho "$*" >> "{log}"\n{body}\n')
+    python.chmod(0o755)
+    return python, log
+
+
+def test_current_interpreter_install_retries_interrupted_pip(wheel_builder, tmp_path):
+    attempts = tmp_path / "attempts"
+    python, log = _fake_python(
+        tmp_path,
+        f'echo x >> "{attempts}"\n'
+        f'if [ "$(wc -l < "{attempts}")" -lt 2 ]; then\n'
+        '  echo "ReadTimeoutError: read timed out" >&2; exit 1\n'
+        "fi",
+    )
+    env = wheel_builder.CurrentInterpreterEnv()
+    env.python_executable = str(python)
+
+    wheel_builder.install_build_requirements(env, {"torch", "ninja"})
+
+    assert log.read_text().splitlines() == ["-m pip install ninja torch"] * 2
+    wheel_builder.time.sleep.assert_called_once_with(10)
+
+
+def test_current_interpreter_install_skips_empty_requirements(wheel_builder, tmp_path):
+    python, log = _fake_python(tmp_path, "exit 1")
+    env = wheel_builder.CurrentInterpreterEnv()
+    env.python_executable = str(python)
+
+    wheel_builder.install_build_requirements(env, set())
+
+    assert not log.exists()
+
+
+def test_build_wheel_runs_in_current_interpreter(wheel_builder, monkeypatch, tmp_path):
+    """The build must not create a PEP 517 isolated env: its random path would
+    leak into compile commands and defeat sccache across runs."""
+    calls = []
+
+    class FakeBuilder:
+        build_system_requires = {"setuptools>=77", "torch"}
+
+        def __init__(self, source_dir, python_executable):
+            calls.append(("init", source_dir, python_executable))
+
+        def get_requires_for_build(self, distribution):
+            calls.append(("requires", distribution))
+            return {"nvidia-cutlass-dsl>=4.6.2a0"}
+
+        def build(self, distribution, output_directory):
+            calls.append(("build", distribution, output_directory))
+            return "dist/provider.whl"
+
+    build_module = type(sys)("build")
+    build_module.ProjectBuilder = FakeBuilder
+    monkeypatch.setitem(sys.modules, "build", build_module)
+    installs = []
+    monkeypatch.setattr(
+        wheel_builder.CurrentInterpreterEnv,
+        "install",
+        lambda self, requirements: installs.append(set(requirements)),
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert wheel_builder.build_wheel() == "dist/provider.whl"
+
+    assert calls[0] == ("init", ".", sys.executable)
+    assert installs == [{"setuptools>=77", "torch"}, {"nvidia-cutlass-dsl>=4.6.2a0"}]
+    assert calls[-1] == ("build", "wheel", str(tmp_path.resolve() / "dist"))

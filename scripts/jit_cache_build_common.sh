@@ -97,8 +97,9 @@ validate_jit_cache_cuda_toolchain() {
   echo "nvcc CUDA version check passed: ${nvcc_cuda_version}"
 }
 
-# Install the matrix-selected PyTorch build environment and constrain the
-# isolated PEP 517 build to that exact distribution.
+# Install the matrix-selected PyTorch build environment and constrain every
+# later pip install, including the wheel's build requirements, to that exact
+# distribution.
 #
 # Args:
 #   $1 - Python executable used to invoke the build frontend.
