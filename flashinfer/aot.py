@@ -174,9 +174,8 @@ from .jit.cake_minimax_h3_nvfp4 import (
     MiniMaxH3Nvfp4Target,
     gen_minimax_h3_nvfp4_aot_modules,
 )
-from .jit.cake_minimax_h3_qkv_pack import (
-    MiniMaxH3QkvPackTarget,
-    gen_minimax_h3_qkv_pack_aot_modules,
+from .jit.cake_minimax_h3_qkv_quantize_pack import (
+    aot_specs as gen_cake_minimax_h3_qkv_quantize_pack_aot_modules,
 )
 from .jit.mla import (
     gen_mla_module,
@@ -778,15 +777,12 @@ def gen_all_modules(
         if enabled:
             jit_specs.extend(gen_minimax_h3_nvfp4_aot_modules(minimax_h3_nvfp4_target))
 
-    minimax_h3_qkv_pack_targets: tuple[tuple[MiniMaxH3QkvPackTarget, bool], ...] = (
-        ("sm100a", sm_capabilities.get("sm100a_exact", False)),
-        ("sm103a", sm_capabilities.get("sm103a_exact", False)),
-    )
-    for minimax_h3_qkv_pack_target, enabled in minimax_h3_qkv_pack_targets:
-        if enabled:
-            jit_specs.extend(
-                gen_minimax_h3_qkv_pack_aot_modules(minimax_h3_qkv_pack_target)
-            )
+    # Cake MiniMax-H3 QKV quantize-and-pack: eight generated programs (NVFP4 /
+    # MXFP8 x P in 1, 2, 4, 8), each an exact sm_100a / sm_103a library.
+    if has_sm100a_exact:
+        jit_specs.extend(gen_cake_minimax_h3_qkv_quantize_pack_aot_modules("sm_100a"))
+    if has_sm103a_exact:
+        jit_specs.extend(gen_cake_minimax_h3_qkv_quantize_pack_aot_modules("sm_103a"))
 
     # Register the physical source-closed portfolio independently for each
     # exact Blackwell target. Each JitSpec contains one generated selector TU.

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -50,12 +50,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 256
-#ifndef P
-#error "P is a downstream specialization of this program; define it on the compile line"
-#endif
-#ifndef HEADS_PER_DESTINATION
-#error "HEADS_PER_DESTINATION is a downstream specialization of this program; define it on the compile line"
-#endif
+#define P 8
+#define HEADS_PER_DESTINATION 7
+#define LAUNCH_MIN_BLOCKS 5
 
 #include <math_constants.h>
 
@@ -90,8 +87,8 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(256, 5) void
-kernel_cake_minimax_h3_qkv_quantize_pack_766995e25961b5cee390(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, uint8_t* __restrict__ out_q, uint8_t* __restrict__ out_sf, int M, int token_stride, int head_stride, int ROWS_PER_DESTINATION, int SCALE_STRIDE)
+__global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
+kernel_cake_minimax_h3_qkv_quantize_pack_14c89d4596a3b1552b0b(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, uint8_t* __restrict__ out_q, uint8_t* __restrict__ out_sf, int M, int token_stride, int head_stride, int ROWS_PER_DESTINATION, int SCALE_STRIDE)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
