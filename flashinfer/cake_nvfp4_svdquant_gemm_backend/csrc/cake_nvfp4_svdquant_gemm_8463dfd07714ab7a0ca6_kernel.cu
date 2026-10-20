@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 by FlashInfer team.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -68,8 +68,12 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_OUT_OFF 203776
 #define SMEM_SMEM_OUT_STAGE_BYTES 8192
 #define SMEM_SMEM_OUT_STRIDE 8192
-#define SMEM_TOTAL 220160
+#define SMEM_SMEM_BIAS_PAIRS_OFF 220160
+#define SMEM_SMEM_BIAS_PAIRS_STAGE_BYTES 256
+#define SMEM_SMEM_BIAS_PAIRS_STRIDE 256
+#define SMEM_TOTAL 220416
 #define THREADS 256
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -253,8 +257,8 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__ __launch_bounds__(256, 1) void
-kernel_cake_nvfp4_svdquant_gemm_6de02866152adf3cb1ac(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap D, const __grid_constant__ CUtensorMap L1, float* __restrict__ alpha, __nv_bfloat16* __restrict__ bias, const __grid_constant__ CUtensorMap out, int M, int N, int K_tiles, int rank_tiles, int grid_n, int has_bias)
+__global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
+kernel_cake_nvfp4_svdquant_gemm_8463dfd07714ab7a0ca6(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap D, const __grid_constant__ CUtensorMap L1, float* __restrict__ alpha, __nv_bfloat16* __restrict__ bias, const __grid_constant__ CUtensorMap out, int M, int N, int K_tiles, int rank_tiles, int grid_n, int has_bias)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -294,6 +298,8 @@ kernel_cake_nvfp4_svdquant_gemm_6de02866152adf3cb1ac(const __grid_constant__ CUt
     const int smem_l1_addr = smem + 9216;
     __nv_bfloat16* smem_out = reinterpret_cast<__nv_bfloat16*>(smem_raw + 203776);
     const int smem_out_addr = smem + 203776;
+    unsigned int* smem_bias_pairs = reinterpret_cast<unsigned int*>(smem_raw + 220160);
+    const int smem_bias_pairs_addr = smem + 220160;
 
     // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 23 barriers)
     // Mbarriers at smem_raw[0..184)
@@ -381,7 +387,7 @@ kernel_cake_nvfp4_svdquant_gemm_6de02866152adf3cb1ac(const __grid_constant__ CUt
                         uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_0) | ((uint64_t)0x80004020 << 32);
 
                         tcgen05_mma_mxf4nvf4_bs(tmem_accum, a_desc + 0, b_desc + 0,
-                            0x8200480U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, ((((1) ? init_flag : 0)) ? 0 : 1));
+                            0x8200480U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, ((init_flag) ? 0 : 1));
                     }
                 }
                 int _mma_a_lo_1 = make_warp_uniform((((smem_a_addr + 32) >> 4) & 0x3FFF) + (mma_stage) * 1152);
@@ -392,7 +398,7 @@ kernel_cake_nvfp4_svdquant_gemm_6de02866152adf3cb1ac(const __grid_constant__ CUt
                         uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_1) | ((uint64_t)0x80004020 << 32);
 
                         tcgen05_mma_mxf4nvf4_bs(tmem_accum, a_desc + 0, b_desc + 0,
-                            0x8200480U, tmem_tmem_sfa + 4 + 0, tmem_tmem_sfb + 4 + 0, ((((0) ? init_flag : 0)) ? 0 : 1));
+                            0x8200480U, tmem_tmem_sfa + 4 + 0, tmem_tmem_sfb + 4 + 0, 1);
                     }
                 }
                 elect_commit(tma_empty_addr + (mma_stage) * 8);
@@ -490,12 +496,26 @@ kernel_cake_nvfp4_svdquant_gemm_6de02866152adf3cb1ac(const __grid_constant__ CUt
             int bid_n_1 = bid - bid_m_1 * grid_n;
             int off_m_1 = bid_m_1 * 128;
             int off_n_1 = bid_n_1 * 128;
+            int epi_tid = epi_warp * 32 + lane;
+            if (epi_tid < 64) {
+                unsigned int staged_bias_pair = 0;
+                if (has_bias != 0) {
+                    unsigned int _vec_load_0[2];
+                    {
+                        uint32_t _bf16x2_bits_0;
+                        _bf16x2_bits_0 = *reinterpret_cast<const uint32_t*>(bias + off_n_1 + epi_tid * 2);
+                        _vec_load_0[0] = _bf16x2_bits_0;
+                    }
+                    staged_bias_pair = _vec_load_0[0];
+                }
+                smem_bias_pairs[epi_tid] = staged_bias_pair;
+            }
+            asm volatile("barrier.sync 1, 128;" ::: "memory");
             unsigned int _phase_acc_full_0 = 0;
             mbarrier_wait(acc_full_addr, _phase_acc_full_0);
             _phase_acc_full_0 ^= 1;
             asm volatile("tcgen05.fence::after_thread_sync;");
             float alpha_value = alpha[0];
-            unsigned int store_stage = 0;
             #pragma unroll
             for (int subtile = 0; subtile < 4; subtile++) {
                 int tmem_addr = taddr + (unsigned int)(epi_warp * 32 << 16) + (unsigned int)(subtile * 32);
@@ -505,17 +525,20 @@ kernel_cake_nvfp4_svdquant_gemm_6de02866152adf3cb1ac(const __grid_constant__ CUt
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                     : "=f"(_tmem_load_0[0]), "=f"(_tmem_load_0[1]), "=f"(_tmem_load_0[2]), "=f"(_tmem_load_0[3]), "=f"(_tmem_load_0[4]), "=f"(_tmem_load_0[5]), "=f"(_tmem_load_0[6]), "=f"(_tmem_load_0[7]), "=f"(_tmem_load_0[8]), "=f"(_tmem_load_0[9]), "=f"(_tmem_load_0[10]), "=f"(_tmem_load_0[11]), "=f"(_tmem_load_0[12]), "=f"(_tmem_load_0[13]), "=f"(_tmem_load_0[14]), "=f"(_tmem_load_0[15]), "=f"(_tmem_load_0[16]), "=f"(_tmem_load_0[17]), "=f"(_tmem_load_0[18]), "=f"(_tmem_load_0[19]), "=f"(_tmem_load_0[20]), "=f"(_tmem_load_0[21]), "=f"(_tmem_load_0[22]), "=f"(_tmem_load_0[23]), "=f"(_tmem_load_0[24]), "=f"(_tmem_load_0[25]), "=f"(_tmem_load_0[26]), "=f"(_tmem_load_0[27]), "=f"(_tmem_load_0[28]), "=f"(_tmem_load_0[29]), "=f"(_tmem_load_0[30]), "=f"(_tmem_load_0[31])
                     : "r"(tmem_addr));
-                asm volatile("tcgen05.wait::ld.sync.aligned;");
-                unsigned int bias_pair_lane = 0;
-                if (has_bias != 0) {
-                    unsigned int _vec_load_0[2];
-                    {
-                        uint32_t _bf16x2_bits_0;
-                        _bf16x2_bits_0 = *reinterpret_cast<const uint32_t*>(bias + off_n_1 + subtile * 32 + (lane & 15) * 2);
-                        _vec_load_0[0] = _bf16x2_bits_0;
-                    }
-                    bias_pair_lane = _vec_load_0[0];
-                }
+                unsigned int bias_pairs[16];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[0])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(0) + 3]))
+                    : "r"(smem_bias_pairs_addr + (unsigned int)(subtile * 16 * 4)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[4])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(4) + 3]))
+                    : "r"(smem_bias_pairs_addr + (unsigned int)((subtile * 16 + 4) * 4)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[8])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(8) + 3]))
+                    : "r"(smem_bias_pairs_addr + (unsigned int)((subtile * 16 + 8) * 4)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[12])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(12) + 3]))
+                    : "r"(smem_bias_pairs_addr + (unsigned int)((subtile * 16 + 12) * 4)));
+                asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                 float result[32];
                 unsigned int bias_pair = 0;
                 unsigned int bias_lo_bits = 0;
@@ -524,18 +547,15 @@ kernel_cake_nvfp4_svdquant_gemm_6de02866152adf3cb1ac(const __grid_constant__ CUt
                 float bias_hi = 0.0f;
                 #pragma unroll
                 for (int j = 0; j < 16; j++) {
-                    if (has_bias != 0) {
-                        unsigned int _shfl_0 = __shfl_sync(0xFFFFFFFF, bias_pair_lane, j);
-                        bias_pair = _shfl_0;
-                        bias_lo_bits = bias_pair << 16;
-                        bias_lo = reinterpret_cast<float*>(&bias_lo_bits)[0];
-                        bias_hi_bits = bias_pair & 4294901760u;
-                        bias_hi = reinterpret_cast<float*>(&bias_hi_bits)[0];
-                    }
-                    result[2 * j] = _tmem_load_0[2 * j] * alpha_value + bias_lo;
-                    result[2 * j + 1] = _tmem_load_0[2 * j + 1] * alpha_value + bias_hi;
+                    bias_pair = bias_pairs[j];
+                    bias_lo_bits = bias_pair << 16;
+                    bias_lo = reinterpret_cast<float*>(&bias_lo_bits)[0];
+                    bias_hi_bits = bias_pair & 4294901760u;
+                    bias_hi = reinterpret_cast<float*>(&bias_hi_bits)[0];
+                    result[2 * j] = __fmaf_rn(_tmem_load_0[2 * j], alpha_value, bias_lo);
+                    result[2 * j + 1] = __fmaf_rn(_tmem_load_0[2 * j + 1], alpha_value, bias_hi);
                 }
-                uint32_t result_bf16[16];
+                unsigned int result_bf16[16];
                 #pragma unroll
                 for (int _lp = 0; _lp < 16; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(result[_lp*2 + 0], result[_lp*2+1 + 0]));
@@ -543,10 +563,11 @@ kernel_cake_nvfp4_svdquant_gemm_6de02866152adf3cb1ac(const __grid_constant__ CUt
                 }
                 if (subtile > 0) {
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                     if (warp == 4) {
                         if (elect_sync()) {
-                            tma_store_2d((&out), off_n_1 + (subtile - 1) * 32, off_m_1, smem_out_addr + store_stage * 8192);
+                            tma_store_2d((&out), off_n_1 + (subtile - 1) * 32, off_m_1, smem_out_addr + (unsigned int)((subtile - 1) % 2 * 8192));
                         }
                     }
                     if (warp == 4) {
@@ -554,8 +575,9 @@ kernel_cake_nvfp4_svdquant_gemm_6de02866152adf3cb1ac(const __grid_constant__ CUt
                         asm volatile("cp.async.bulk.wait_group.read 1;");
                     }
                     asm volatile("barrier.sync 1, 128;" ::: "memory");
-                    store_stage = store_stage ^ 1;
+                    asm volatile("tcgen05.fence::after_thread_sync;");
                 }
+                unsigned int store_stage = subtile % 2;
                 int out_stage_row = store_stage * 128 + (unsigned int)(epi_warp * 32) + (unsigned int)lane;
                 unsigned int out_abs = smem_out_addr + (unsigned int)(out_stage_row * 64);
                 unsigned int out_swz = out_abs / 8 & 48;
@@ -565,10 +587,11 @@ kernel_cake_nvfp4_svdquant_gemm_6de02866152adf3cb1ac(const __grid_constant__ CUt
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row * 64) + (48 ^ out_swz)))), "r"(result_bf16[12]), "r"(result_bf16[13]), "r"(result_bf16[14]), "r"(result_bf16[15]) : "memory");
             }
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            asm volatile("tcgen05.fence::before_thread_sync;");
             asm volatile("barrier.sync 1, 128;" ::: "memory");
             if (warp == 4) {
                 if (elect_sync()) {
-                    tma_store_2d((&out), off_n_1 + 96, off_m_1, smem_out_addr + store_stage * 8192);
+                    tma_store_2d((&out), off_n_1 + 96, off_m_1, smem_out_addr + 8192);
                 }
             }
             if (warp == 4) {
@@ -583,6 +606,7 @@ kernel_cake_nvfp4_svdquant_gemm_6de02866152adf3cb1ac(const __grid_constant__ CUt
     }
 
     // Cleanup
+    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
     __syncthreads(); // barrier before TMEM dealloc
 
     if (warp == 0) {
