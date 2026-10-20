@@ -14,12 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import hashlib
+import inspect
+import json
+import pathlib
 import re
 
 import pytest
 import torch
 
 from flashinfer.experimental.cake_kimi_k3_attn_res import cake_backend as cb
+from flashinfer.experimental.cake_kimi_k3_attn_res import cake_jit
 from flashinfer.experimental.cake_kimi_k3_attn_res.cake_backend import (
     ARCHES,
     HIDDEN_SIZE,
@@ -31,7 +36,7 @@ from flashinfer.experimental.cake_kimi_k3_attn_res.cake_backend import (
     reference_kimi_k3_attn_res,
 )
 from flashinfer.experimental.cake_kimi_k3_attn_res.cake_jit import KERNELS, MODULES
-from flashinfer.kimi_k3_attn_res import kimi_k3_attn_res, prepare_kimi_k3_attn_res
+from flashinfer.kimi_k3_attn_res import prepare_kimi_k3_attn_res
 
 # The Kimi-K3 AttnRes evaluation contract: output within (atol 8e-2, rtol 3e-2)
 # of the independent FP32 reference; prefix / snapshot bank bit-exact.
@@ -343,16 +348,27 @@ def test_snapshot_write_fallback_stays_in_the_write_family(monkeypatch):
 
 
 def test_plan_route_bootstrap_variants():
+    # The bootstrap key encodes the semantics (K, delta, snapshot write, output norm) and never
+    # substitutes; the three registered variants are K0 without delta with the write, K4
+    # without delta and K8 without the output norm.
     plan = plan_route(
-        None, 0, 17, 4, False, has_delta=False, block_write_idx=4, common_path=False
+        None, 0, 1, 0, False, has_delta=False, block_write_idx=0, common_path=False
     )
     assert plan.kind == "direct"
-    assert plan.kernel_key == "direct:k4_d0_w1_n1"
+    assert plan.kernel_key == "direct:k0_d0_w1_n1"
+    assert plan.grid_x == 1 and plan.threads == 256
+    plan = plan_route(None, 0, 17, 4, False, has_delta=False, common_path=False)
+    assert plan.kind == "direct"
+    assert plan.kernel_key == "direct:k4_d0_w0_n1"
     assert plan.grid_x == 17 and plan.threads == 256
     plan = plan_route(
         "sm_100a", SM_COUNT, 7, 8, True, apply_output_norm=False, common_path=False
     )
     assert plan.kernel_key == "direct:k8_d1_w0_n0"
+    if MODULES:
+        registered = ("direct:k0_d0_w1_n1", "direct:k4_d0_w0_n1", "direct:k8_d1_w0_n0")
+        for arch in ARCHES:
+            assert all(key in KERNELS[arch] for key in registered)
 
 
 def test_plan_route_rejects_bad_shapes():
@@ -470,8 +486,126 @@ def test_registered_keys_cover_the_measured_grid_when_programs_exist(arch, sm_co
                     plan.kernel_key,
                 )
     for record in MODULES.values():
-        assert record["tma_workspace_bytes"] == 0
+        assert record["arg_plan"] in cake_jit.ARG_PLANS
         assert record["arches"] and set(record["arches"]) <= set(ARCHES)
+
+
+_PROGRAM_MACRO_DEFAULT = re.compile(
+    r"^#define (CAKE_PROGRAM_KERNEL|CAKE_PROGRAM_SHIM) (\w+)$", re.M
+)
+
+
+def _program_identity(name, record):
+    """(kernel symbol, declared kernel symbol, host-shim namespace) of a record's build.
+
+    A ``-DCAKE_PROGRAM_*`` entry of ``compile_flags`` wins, else the ``#ifndef``
+    default of the translation unit, else the literal the exported source spells.
+    """
+    root = pathlib.Path(cake_jit.__file__).resolve().parent / "csrc"
+    kernel, binding = (root / relative for relative in record["sources"])
+    assert kernel.is_file() and binding.is_file(), (name, record["sources"])
+    kernel_text = kernel.read_text(encoding="utf-8")
+    binding_text = binding.read_text(encoding="utf-8")
+    flags = dict(
+        flag[2:].split("=", 1)
+        for flag in record["compile_flags"]
+        if flag.startswith("-DCAKE_PROGRAM_")
+    )
+    kernel_defaults = dict(_PROGRAM_MACRO_DEFAULT.findall(kernel_text))
+    binding_defaults = dict(_PROGRAM_MACRO_DEFAULT.findall(binding_text))
+    defined = re.search(r"^(kernel_\w+)\(", kernel_text, re.M)
+    declared = re.search(r'^extern "C" __global__ void (\w+)\(', binding_text, re.M)
+    namespace = re.search(r"^namespace (\w+) \{$", binding_text, re.M)
+    return (
+        flags.get(
+            "CAKE_PROGRAM_KERNEL",
+            kernel_defaults.get("CAKE_PROGRAM_KERNEL", defined and defined.group(1)),
+        ),
+        flags.get(
+            "CAKE_PROGRAM_KERNEL",
+            binding_defaults.get("CAKE_PROGRAM_KERNEL", declared and declared.group(1)),
+        ),
+        flags.get(
+            "CAKE_PROGRAM_SHIM",
+            binding_defaults.get("CAKE_PROGRAM_SHIM", namespace and namespace.group(1)),
+        ),
+    )
+
+
+def test_shared_sources_keep_distinct_program_symbols():
+    """Every JIT library of the family loads into one process, so no two records may
+    export one kernel symbol or host-shim namespace.  Every record selects its own
+    through ``-DCAKE_PROGRAM_KERNEL`` / ``-DCAKE_PROGRAM_SHIM`` in ``compile_flags``
+    (the launch bindings take nothing else); a shared kernel file's ``#ifndef``
+    default names the program that owns it."""
+    shims = set()
+    for name, record in MODULES.items():
+        defined, declared, shim = _program_identity(name, record)
+        assert defined == declared == f"kernel_{name}", (name, defined, declared)
+        assert shim and shim.startswith("cake_host_shim_"), (name, shim)
+        shims.add(shim)
+    assert len(shims) == len(MODULES)
+
+
+_BINDING_REQUIRED_MACRO = re.compile(r"^#ifndef (\w+)\n#error ", re.M)
+_KERNEL_LAUNCH_BOUNDS = re.compile(r"__launch_bounds__\((\d+)")
+_KERNEL_CLUSTER_DIMS = re.compile(r"__cluster_dims__\((\d+),")
+_KERNEL_SMEM_TOTAL = re.compile(r"^#define SMEM_TOTAL (\d+)$", re.M)
+
+
+def test_launch_bindings_take_each_record_from_its_compile_flags():
+    """One launch binding per argument plan.  Every record selects its program through
+    the ``-D`` flags the registry derives from its rows: kernel symbol, host-shim
+    namespace, dynamic shared memory bytes, CTA threads and cluster size, which must
+    agree with the record's device source.  ``TVM_FFI_CHECK`` stringises its condition
+    unexpanded, so the bindings keep those macros out of its conditions."""
+    root = pathlib.Path(cake_jit.__file__).resolve().parent / "csrc"
+    required = {}
+    for plan in cake_jit.ARG_PLANS:
+        binding = f"cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_{plan}_binding.cu"
+        text = (root / binding).read_text(encoding="utf-8")
+        required[binding] = set(_BINDING_REQUIRED_MACRO.findall(text))
+        assert required[binding] == {
+            "CAKE_PROGRAM_KERNEL",
+            "CAKE_PROGRAM_SHIM",
+            "CAKE_BIND_SMEM",
+            "CAKE_BIND_THREADS",
+            "CAKE_BIND_CLUSTER",
+        }, binding
+        for line in text.splitlines():
+            if line.lstrip().startswith("TVM_FFI_CHECK("):
+                assert not set(re.findall(r"\w+", line)) & required[binding], line
+    for name, record in MODULES.items():
+        kernel, binding = record["sources"]
+        assert binding.endswith(f"_{record['arg_plan']}_binding.cu"), name
+        defines = dict(
+            flag[2:].split("=", 1)
+            for flag in record["compile_flags"]
+            if flag.startswith("-D")
+        )
+        missing = required[binding] - set(defines)
+        assert not missing, (name, missing)
+        assert defines["CAKE_PROGRAM_KERNEL"] == f"kernel_{name}", name
+        kernel_text = (root / kernel).read_text(encoding="utf-8")
+        bounds = {int(n) for n in _KERNEL_LAUNCH_BOUNDS.findall(kernel_text)}
+        cluster = {int(n) for n in _KERNEL_CLUSTER_DIMS.findall(kernel_text)} or {1}
+        totals = _KERNEL_SMEM_TOTAL.findall(kernel_text)
+        assert bounds == {int(defines["CAKE_BIND_THREADS"])}, (name, bounds)
+        assert cluster == {int(defines["CAKE_BIND_CLUSTER"])}, (name, cluster)
+        assert totals == [defines["CAKE_BIND_SMEM"]], (name, totals)
+
+
+def test_registry_rows_expand_to_the_pinned_records():
+    """``MODULES`` is built from the ``_PROGRAMS`` and ``_BINDINGS`` rows.  This digest
+    of its canonical JSON pins the expanded dict (91 records), so neither a row nor
+    the builder can drift silently.  After an intended registry change, recompute it
+    as the sha256 of ``json.dumps(MODULES, sort_keys=True, separators=(",", ":"))``."""
+    assert len(MODULES) == 91
+    canonical = json.dumps(MODULES, sort_keys=True, separators=(",", ":"))
+    assert (
+        hashlib.sha256(canonical.encode()).hexdigest()
+        == "5532eeed7f2c964b21841e177b1c29c98917e4a894ff003ac6477fbc3f96664c"
+    )
 
 
 # Every token count a decoder step can present in the small / mid range, plus the measured
@@ -541,6 +675,82 @@ def test_every_common_path_route_resolves_to_a_registered_program(arch, sm_count
                 K,
                 pdl,
             )
+
+
+# First token count of every dense route band: the M at which ``plan_route`` changes its kernel
+# key on some architecture, SM count in SM_COUNTS or PDL setting, per K.  The bands follow the
+# route tables (the small-M table and its cluster / chunk / fast-math bands, the round-r5 cells,
+# the release bands, the nc / depth edges, the two native cells) and, for K8 on sm_100a, the SM
+# count itself (the release flips at M = SMs + 1).  ``test_gpu_rows_are_the_route_band_starts``
+# recomputes the set from the tables.
+# fmt: off
+_ROUTE_BAND_START_ROWS = {
+    0: (1, 257, 513),
+    1: (
+        1, 513, 768, 1024, 1025, 1537, 2048, 2049, 3072, 3073, 4096, 4097, 8192, 8193,
+        12288, 12289, 16384,
+    ),
+    2: (1, 192, 193, 257, 384, 385, 512, 513, 768, 769, 1537, 2049, 4096, 4097),
+    3: (1, 3, 256, 257, 385, 769, 4096, 4097),
+    4: (1, 5, 17, 129, 256, 257, 512, 513, 1024, 1025, 1537, 2048, 2049, 4096, 4097),
+    5: (1, 5, 17, 33, 129, 192, 193, 384, 512, 513, 768, 769, 1024, 1025, 1536, 4096, 4097),
+    6: (1, 2, 5, 17, 33, 129, 192, 193, 384, 513),
+    7: (1, 5, 17, 33, 65, 129, 193, 385, 513, 768, 769),
+    8: (1, 3, 6, 7, 17, 65, 149, 153, 256, 257, 512, 769, 1536, 1537),
+}
+# fmt: on
+
+# Every registered program is exercised at the edge of the band that selects it, plus a few
+# measured cells and off-grid token counts.
+GPU_ROWS = sorted(
+    {(M, K) for K, starts in _ROUTE_BAND_START_ROWS.items() for M in starts}
+    | {
+        (16, 8),
+        (64, 4),
+        (256, 1),
+        (512, 1),
+        # off-grid token counts (registered-variant fallback where this checkout lacks the exact program)
+        (7, 5),
+        (64, 6),
+        (128, 7),
+        (140, 4),
+        (200, 8),
+        (300, 3),
+        (300, 5),
+        (1000, 1),
+        (1000, 2),
+        (16384, 8),
+    }
+)
+
+
+def _table_edge_token_counts(m_max: int = TOKEN_COUNTS[-1]) -> list[int]:
+    """Every token count at which the route can change its kernel key, with its neighbours: the
+    small / mid range, every integer literal of the planner (table edges, cells, minimum /
+    maximum M, the balanced-grid bounds) and the SM counts.  A band can only start at one of
+    these, so sweeping them finds every band start of M 1..``m_max``."""
+    literals = {int(n) for n in re.findall(r"\b\d+\b", inspect.getsource(cb))}
+    counts = set(range(1, 601)) | {m_max}
+    for edge in literals | set(TOKEN_COUNTS) | set(SM_COUNTS):
+        counts |= {edge - 1, edge, edge + 1}
+    return sorted(M for M in counts if 1 <= M <= m_max)
+
+
+def test_gpu_rows_are_the_route_band_starts():
+    rows = set()
+    token_counts = _table_edge_token_counts()
+    for arch in ARCHES:
+        for sm_count in SM_COUNTS:
+            for K in range(MAX_BLOCKS + 1):
+                for pdl in (False, True):
+                    previous = None
+                    for M in token_counts:
+                        key = plan_route(arch, sm_count, M, K, pdl).kernel_key
+                        if key != previous:
+                            rows.add((M, K))
+                            previous = key
+    expected = {(M, K) for K, starts in _ROUTE_BAND_START_ROWS.items() for M in starts}
+    assert rows == expected, (sorted(rows - expected), sorted(expected - rows))
 
 
 # ---------------------------------------------------------------------------
@@ -625,46 +835,6 @@ def _check(inputs, expected):
     )
 
 
-def _route_band_start_rows(m_max: int = 16384):
-    """(M, K) of every token count where the dense route changes its kernel key on any
-    architecture / PDL setting: the first row of every route band, so each registered
-    program is exercised at the edge of the band that selects it."""
-    rows = set()
-    for arch in ARCHES:
-        for sm_count in SM_COUNTS:
-            for K in range(MAX_BLOCKS + 1):
-                for pdl in (False, True):
-                    previous = None
-                    for M in range(1, m_max + 1):
-                        key = plan_route(arch, sm_count, M, K, pdl).kernel_key
-                        if key != previous:
-                            rows.add((M, K))
-                            previous = key
-    return rows
-
-
-GPU_ROWS = sorted(
-    _route_band_start_rows()
-    | {
-        (16, 8),
-        (64, 4),
-        (256, 1),
-        (512, 1),
-        # off-grid token counts (registered-variant fallback where this checkout lacks the exact program)
-        (7, 5),
-        (64, 6),
-        (128, 7),
-        (140, 4),
-        (200, 8),
-        (300, 3),
-        (300, 5),
-        (1000, 1),
-        (1000, 2),
-        (16384, 8),
-    }
-)
-
-
 @pytest.mark.parametrize("pdl", [False, True])
 @pytest.mark.parametrize("M,K", GPU_ROWS)
 def test_matches_reference(M, K, pdl):
@@ -700,7 +870,6 @@ def test_matches_reference(M, K, pdl):
     "M,K,has_delta,write_idx,apply_output_norm",
     [
         (1, 0, False, 0, True),
-        (17, 4, True, 2, True),
         (17, 4, False, -1, True),
         (7, 8, True, -1, False),
     ],
@@ -781,25 +950,16 @@ def test_snapshot_write_matches_reference_on_the_write_variants(M, K, pdl):
     )
 
 
-def test_row_padded_layout_takes_the_bootstrap():
-    device, arch = _device_arch()
+def test_row_padded_layout_leaves_the_dense_path():
+    # A row-padded operand leaves the dense path for the bootstrap.  Its variant with
+    # delta and the output norm (direct:k4_d1_w0_n1) has no registered program, so
+    # preparing the call raises NotImplementedError instead of launching.
+    _device_arch()
     inputs = _make_inputs(5, 4, row_padding=64)
-    assert not common_path_eligible(
-        **{k: v for k, v in inputs.items() if k not in ("num_blocks",)},
-        num_blocks=4,
-        block_write_idx=-1,
-    )
-    if not cb.generated_program_available(device, 5, 4, common_path=False):
-        pytest.skip("bootstrap program not registered")
-    expected = _clone(inputs)
-    reference_kimi_k3_attn_res(
-        **{k: v for k, v in expected.items() if k != "num_blocks"}, num_blocks=4
-    )
-    kimi_k3_attn_res(
-        **{k: v for k, v in inputs.items() if k != "num_blocks"}, num_blocks=4
-    )
-    torch.cuda.synchronize()
-    _check(inputs, expected)
+    kwargs = {k: v for k, v in inputs.items() if k != "num_blocks"}
+    assert not common_path_eligible(**kwargs, num_blocks=4, block_write_idx=-1)
+    with pytest.raises(NotImplementedError):
+        prepare_kimi_k3_attn_res(**kwargs, num_blocks=4)
 
 
 def test_launch_makes_no_allocation_and_replays_in_a_graph():

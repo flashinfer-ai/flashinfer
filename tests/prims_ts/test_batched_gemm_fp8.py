@@ -176,10 +176,10 @@ def _non_swap_fp8_fc1_variant(*, use_tma_store):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import BatchMode
 
     return _fc1_variant(
-        16,
+        128,
         128,
         5,
-        16,
+        128,
         128,
         1,
     ) | {
@@ -193,10 +193,10 @@ def _non_swap_fp8_relu2_variant(*, use_tma_store):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import BatchMode
 
     return _fp8_relu2_variant(
-        16,
+        128,
         128,
         5,
-        16,
+        128,
         128,
         1,
     ) | {
@@ -399,6 +399,22 @@ def test_fp8_fc1_non_swap_plain_output_correctness(use_tma_store):
         problem_n=128,
         problem_k=128,
         **_non_swap_fp8_fc1_variant(use_tma_store=use_tma_store),
+    )
+
+
+def test_fp8_tma_ring_reuse_across_odd_subtile_count():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
+
+    cfg = _fc1_variant(192, 128, 4, 64, 256, 2)
+    cfg.update(tile_scheduler=1, use_tma_store=1, num_stages_c_smem=2)
+    assert reference_check(
+        num_experts=7,
+        num_tokens=4097,
+        top_k=3,
+        problem_n=1024,
+        problem_k=512,
+        repeat_launches=5,
+        **cfg,
     )
 
 

@@ -14,9 +14,8 @@
 
 """Tests for FP4 NVF4 (E2M1 data, E4M3 scale factors) FC2 BatchedGemm TS kernel.
 
-Covers variant table rows 31-54 (FC2_LL) and 55-58 (FC2_HT):
-  tile_n ∈ {8, 16, 32}, tile_k ∈ {256, 512}, stages ∈ {5, 9},
-  static/persistent, 1-CTA/2-CTA.
+Covers shuffled BatchM N128 and BatchN high-throughput variants with
+K256/K512 tiles, static/persistent scheduling, and one/two-CTA clusters.
 
 Run with: pytest tests/prims_ts/test_batched_gemm_fp4_fc2.py -v
 Requires: CUDA GPU with SM100A+ (B200 Blackwell)
@@ -53,12 +52,12 @@ def _skip_sm107_gpu_kernels(request):
         pytest.skip("Prims-TS FP4 FC2 supports SM100 and SM103, not SM107")
 
 
-# FP4 FC2 LowLatency base config (rows 31-54).
+# FP4 FC2 BatchM base config with block-shuffled weights.
 # tmem_sfa/sfb_cols = tile_k / mma_k * 4 = num_kblocks * 4
 FP4_FC2_LL = dict(
     route_act=0,
     act_kind=0,
-    sf_layout_b=1,
+    sf_layout_b=int(SfLayout.R128c4),
     cluster_m=1,
     tile_m=128,
     mma_m=128,
@@ -140,7 +139,7 @@ def _run_fp4_fc2(
 
 
 class TestFp4Fc2Validation:
-    def test_validate_tile8_k256(self):
+    def test_validate_tile128_k256(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
             build_batched_gemm_task_manager,
         )
@@ -149,22 +148,22 @@ class TestFp4Fc2Validation:
             num_experts=2,
             num_tokens=256,
             top_k=1,
-            tile_n=8,
-            mma_n=8,
-            epi_tile_n=8,
+            tile_n=128,
+            mma_n=128,
+            epi_tile_n=128,
             tile_k=256,
             **uniform_pipeline_stage_overrides(5),
             num_stages_tmem_acc=1,
             **FP4_FC2_LL,
         )
 
-    def test_validate_tile16_k512(self):
+    def test_validate_tile128_k512(self):
         """tile_k=512 uses separate CopySf plus 256-K TMA boxes."""
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
             build_batched_gemm_task_manager,
         )
 
-        tile_n = 16
+        tile_n = 128
         tile_k = 512
         build_batched_gemm_task_manager(
             num_experts=2,
@@ -174,7 +173,7 @@ class TestFp4Fc2Validation:
             mma_n=tile_n,
             epi_tile_n=tile_n,
             tile_k=tile_k,
-            **uniform_pipeline_stage_overrides(5),
+            **uniform_pipeline_stage_overrides(3),
             num_stages_tmem_acc=1,
             **FP4_FC2_LL,
         )
@@ -188,7 +187,7 @@ class TestFp4Fc2Validation:
                 mma_n=tile_n,
                 epi_tile_n=tile_n,
                 tile_k=tile_k,
-                **uniform_pipeline_stage_overrides(5),
+                **uniform_pipeline_stage_overrides(3),
                 num_stages_tmem_acc=1,
                 sf_layout_a=int(SfLayout.R8c4),
                 **FP4_FC2_LL,
@@ -212,31 +211,28 @@ class TestFp4Fc2Validation:
                 tile_k=tile_k,
                 **uniform_pipeline_stage_overrides(5),
                 num_stages_tmem_acc=1,
-                **FP4_FC2_LL,
+                **{**FP4_FC2_LL, "sf_layout_b": int(SfLayout.R8c4)},
             )
 
 
 class TestFp4Fc2LLStatic:
-    """FP4 FC2 LowLatency static scheduler (rows 31, 33, 35, 37, 39, 41, 43, 45, 47, 49, 51, 53)."""
+    """FP4 FC2 BatchM with the static scheduler."""
 
-    def test_tile8_k256_s5(self):
-        _run_fp4_fc2(tile_n=8, tile_k=256, pipeline_stages=5)
+    def test_tile128_k256_s5_tma_store(self):
+        _run_fp4_fc2(tile_n=128, tile_k=256, pipeline_stages=5, use_tma_store=1)
 
-    def test_tile8_k256_s5_tma_store(self):
-        _run_fp4_fc2(tile_n=8, tile_k=256, pipeline_stages=5, use_tma_store=1)
+    def test_tile128_k256_s5_b_sf_128x4(self):
+        _run_fp4_fc2(tile_n=128, tile_k=256, pipeline_stages=5)
 
-    def test_tile8_k256_s5_b_sf_8x4(self):
-        _run_fp4_fc2(tile_n=8, tile_k=256, pipeline_stages=5)
+    def test_tile128_k256_s5_bias_m(self):
+        _run_fp4_fc2(tile_n=128, tile_k=256, pipeline_stages=5, bias_type=1)
 
-    def test_tile8_k256_s5_bias_m(self):
-        _run_fp4_fc2(tile_n=8, tile_k=256, pipeline_stages=5, bias_type=1)
-
-    def test_tile8_k256_s5_global_scale_c(self):
+    def test_tile128_k256_s5_global_scale_c(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
 
-        tile_n = 8
+        tile_n = 128
         tile_k = 256
         common = dict(
             num_experts=2,
@@ -262,18 +258,18 @@ class TestFp4Fc2LLStatic:
             atol=0.25,
         )
 
-    def test_tile8_k256_s5_tma_oob_opt_partial_m_tile(self):
+    def test_tile128_k256_s5_tma_oob_opt_partial_m_tile(self):
         _run_fp4_fc2(
-            tile_n=8,
+            tile_n=128,
             tile_k=256,
             pipeline_stages=5,
             num_experts=1,
             num_tokens=160,
         )
 
-    def test_tile8_k256_s5_nonrounded_topk_expanded_layout(self):
+    def test_tile128_k256_s5_nonrounded_topk_expanded_layout(self):
         _run_fp4_fc2(
-            tile_n=8,
+            tile_n=128,
             tile_k=256,
             pipeline_stages=5,
             num_experts=3,
@@ -281,12 +277,12 @@ class TestFp4Fc2LLStatic:
             top_k=2,
         )
 
-    def test_tile8_k256_s5_early_exit_overestimated_token_grid(self):
+    def test_tile128_k256_s5_early_exit_overestimated_token_grid(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
 
-        tile_n = 8
+        tile_n = 128
         tile_k = 256
         result = reference_check(
             num_experts=4,
@@ -304,14 +300,11 @@ class TestFp4Fc2LLStatic:
         )
         assert result
 
-    def test_tile16_k256_s5(self):
-        _run_fp4_fc2(tile_n=16, tile_k=256, pipeline_stages=5)
+    def test_tile128_k256_s5(self):
+        _run_fp4_fc2(tile_n=128, tile_k=256, pipeline_stages=5)
 
-    def test_tile32_k256_s5(self):
-        _run_fp4_fc2(tile_n=32, tile_k=256, pipeline_stages=5)
-
-    def test_tile8_k512_s5(self):
-        _run_fp4_fc2(tile_n=8, tile_k=512, pipeline_stages=5, num_tokens=128)
+    def test_tile128_k512_s3(self):
+        _run_fp4_fc2(tile_n=128, tile_k=512, pipeline_stages=3, num_tokens=128)
 
     def test_tile8_k512_s5_per_token_sfb(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
@@ -346,70 +339,49 @@ class TestFp4Fc2LLStatic:
             **cfg,
         )
 
-    def test_tile16_k512_s5_cluster2(self):
-        _run_fp4_fc2(tile_n=16, tile_k=512, pipeline_stages=5, cluster_m=2)
-
-    def test_tile32_k512_s5_cluster2(self):
-        _run_fp4_fc2(tile_n=32, tile_k=512, pipeline_stages=5, cluster_m=2)
-
-    def test_tile8_k256_s9(self):
-        _run_fp4_fc2(tile_n=8, tile_k=256, pipeline_stages=9)
+    def test_tile128_k512_s3_cluster2(self):
+        _run_fp4_fc2(tile_n=128, tile_k=512, pipeline_stages=3, cluster_m=2)
 
 
 class TestFp4Fc2LLPersistent:
-    """FP4 FC2 LowLatency persistent (rows 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54)."""
+    """FP4 FC2 BatchM with persistent scheduling."""
 
-    def test_tile8_k256_persistent(self):
-        _run_fp4_fc2(tile_n=8, tile_k=256, pipeline_stages=5, tile_scheduler=1)
-
-    def test_tile8_k512_persistent(self):
+    def test_tile128_k512_persistent(self):
         _run_fp4_fc2(
-            tile_n=8,
+            tile_n=128,
             tile_k=512,
-            pipeline_stages=5,
+            pipeline_stages=2,
             tile_scheduler=1,
             num_tokens=128,
         )
 
-    def test_tile8_k256_s9_persistent(self):
-        _run_fp4_fc2(tile_n=8, tile_k=256, pipeline_stages=9, tile_scheduler=1)
-
-    def test_tile8_k256_persistent_tma_store(self):
+    def test_tile128_k256_persistent_tma_store(self):
         _run_fp4_fc2(
-            tile_n=8,
+            tile_n=128,
             tile_k=256,
             pipeline_stages=5,
             tile_scheduler=1,
             use_tma_store=1,
         )
 
-    def test_tile16_k256_persistent(self):
-        _run_fp4_fc2(tile_n=16, tile_k=256, pipeline_stages=5, tile_scheduler=1)
+    def test_tile128_k256_persistent(self):
+        _run_fp4_fc2(tile_n=128, tile_k=256, pipeline_stages=4, tile_scheduler=1)
 
-    def test_tile16_k512_persistent_cluster2(self):
+    def test_tile128_k256_persistent_pdl(self):
         _run_fp4_fc2(
-            tile_n=16,
-            tile_k=512,
-            pipeline_stages=5,
-            tile_scheduler=1,
-            cluster_m=2,
-        )
-
-    def test_tile16_k256_persistent_pdl(self):
-        _run_fp4_fc2(
-            tile_n=16,
+            tile_n=128,
             tile_k=256,
-            pipeline_stages=5,
+            pipeline_stages=4,
             tile_scheduler=1,
             use_pdl=1,
         )
 
-    def test_tile16_k256_persistent_early_exit(self):
+    def test_tile128_k256_persistent_early_exit(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
         )
 
-        tile_n = 16
+        tile_n = 128
         tile_k = 256
         result = reference_check(
             num_experts=4,
@@ -419,7 +391,7 @@ class TestFp4Fc2LLPersistent:
             mma_n=tile_n,
             epi_tile_n=tile_n,
             tile_k=tile_k,
-            **uniform_pipeline_stage_overrides(5),
+            **uniform_pipeline_stage_overrides(4),
             tile_scheduler=1,
             num_stages_tmem_acc=2,
             use_early_exit=1,
@@ -427,11 +399,11 @@ class TestFp4Fc2LLPersistent:
         )
         assert result
 
-    def test_tile32_k512_persistent_cluster2(self):
+    def test_tile128_k512_persistent_cluster2(self):
         _run_fp4_fc2(
-            tile_n=32,
+            tile_n=128,
             tile_k=512,
-            pipeline_stages=5,
+            pipeline_stages=2,
             tile_scheduler=1,
             cluster_m=2,
         )
@@ -440,8 +412,8 @@ class TestFp4Fc2LLPersistent:
 class TestFp4Fc2MultiExpert:
     """FP4 FC2 with multiple experts."""
 
-    def test_4experts_tile16(self):
-        _run_fp4_fc2(tile_n=16, tile_k=256, num_experts=4, num_tokens=512)
+    def test_4experts_tile128(self):
+        _run_fp4_fc2(tile_n=128, tile_k=256, num_experts=4, num_tokens=512)
 
 
 class TestFp4Fc2HT:
