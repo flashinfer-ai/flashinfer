@@ -32,6 +32,9 @@ _NEG = -3.0e38
 # rescales, whereas an inf never recovers.
 _PMAX_LOG2 = 15.0
 
+_F8_LO = -448.0  # e4m3 finite range; clamping maps a NaN page byte into it
+_F8_HI = 448.0
+
 
 # H100: 132 SMs, 228 KiB of shared memory per SM.
 _NUM_SM = 132
@@ -605,7 +608,13 @@ class MsaSparseDecode:
 
             vbf = cute.make_rmem_tensor(cute.make_layout(VW), pdt)
             for c in cutlass.range_constexpr(NCV):
-                vbf.store(vf8[(None, c)].load().to(pdt))
+                # Rows of the final page past seqused_k are uninitialised in
+                # vLLM. The score mask only sanitises scores, and 0 * NaN = NaN
+                # in the PV gemm, so a NaN V byte reaches the output. Clamping
+                # into the e4m3 range clears it: fmax(NaN, x) returns x.
+                for e in cutlass.range_constexpr(VW):
+                    xv = cutlass.Float32(vf8[e, c])
+                    vbf[e] = cute.arch.fmin(cute.arch.fmax(xv, _F8_LO), _F8_HI).to(pdt)
                 cute.autovec_copy(vbf, dst[None, c, 0])
 
             # Online softmax with a one-tile-lagged offset: the running max is
