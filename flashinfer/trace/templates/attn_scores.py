@@ -657,7 +657,7 @@ single_head_paged_mqa_logits_trace = TraceTemplate(
     op_type="single_head_paged_mqa_logits",
     description=(
         "Single-head paged MQA logits: FP32 dot products of query rows with their "
-        "request's paged BF16 keys (no head weights or ReLU). SM100/SM103."
+        "request's paged BF16 or NVFP4 keys (no head weights or ReLU). SM100/SM103."
     ),
     axes={
         "rows": Var(description="Query rows, 1 to 8 per request group."),
@@ -667,7 +667,8 @@ single_head_paged_mqa_logits_trace = TraceTemplate(
         "blocks": Var(description="64-key blocks per request."),
         "max_context": Var(description="Score columns: the context capacity."),
         "page_size": Const(description="Keys per page."),
-        "dim": Const(description="Key and query dimension."),
+        "dim": Const(description="Elements per key: 128 BF16, or 64 NVFP4 bytes."),
+        "scales": Var(description="NVFP4's E4M3 scales per key, one per 16 values."),
     },
     inputs={
         "query": Tensor(["rows", "dim"]),
@@ -676,7 +677,38 @@ single_head_paged_mqa_logits_trace = TraceTemplate(
         "context_lengths": Tensor(["groups"]),
         "requests": Tensor(["groups"]),
         "scores": Tensor(["rows", "max_context"]),
+        "query_scales": Tensor(["rows", "scales"], optional=True),
+        "key_scales": Tensor(["pages", "page_size", "scales"], optional=True),
     },
     outputs={"scores": Tensor(["rows", "max_context"], dtype="float32")},
+    tags=["arch:sm100", "arch:sm103"],
+)
+
+
+quantize_write_index_k_nvfp4_trace = TraceTemplate(
+    op_type="quantize_write_index_k_nvfp4",
+    description=(
+        "Indexer keys quantized to NVFP4 (E4M3 scale per 16 values) and written "
+        "at their slots of a 64-key paged cache."
+    ),
+    axes={
+        "tokens": Var(description="Keys to write."),
+        "dim": Const(description="Key dimension."),
+        "slots": Var(description="Slot mapping entries, one or more per key."),
+        "pages": Var(description="Key cache pages."),
+        "page_size": Const(description="Keys per page."),
+        "packed_dim": Const(description="Packed NVFP4 bytes per key."),
+        "scales": Const(description="E4M3 scales per key, one per 16 values."),
+    },
+    inputs={
+        "key": Tensor(["tokens", "dim"]),
+        "slots": Tensor(["slots"]),
+        "key_cache": Tensor(["pages", "page_size", "packed_dim"]),
+        "key_scales": Tensor(["pages", "page_size", "scales"]),
+    },
+    outputs={
+        "key_cache": Tensor(["pages", "page_size", "packed_dim"], dtype="uint8"),
+        "key_scales": Tensor(["pages", "page_size", "scales"], dtype="float8_e4m3fn"),
+    },
     tags=["arch:sm100", "arch:sm103"],
 )
