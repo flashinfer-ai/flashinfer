@@ -180,9 +180,10 @@ addresses after capture; later tuning requires another handle. Destroy a handle
 collectively only after retiring its referencing graphs and synchronizing all
 work that uses it. A store/policy switch or `autotune_v2_reload()` invalidates
 the automatic selection's local identity.
-Automatic handles reject the offline `live_tokens` profile hint. Their lookup
-uses the actual batch passed to warmup, taking the maximum live count across
-EP ranks. `layer.get_tuned_knobs(workspace=handle)` returns that handle's selected
+Automatic handles accept the offline `live_tokens` profile hint but warn at
+creation that it does not affect automatic selection. Their lookup uses the
+actual warmup or forward batch, taking the maximum live count across EP ranks.
+`layer.get_tuned_knobs(workspace=handle)` returns that handle's selected
 configuration; omitting `workspace` returns the default workspace's result.
 Neither getter allocates or performs selection.
 Warm up again before capture after changing the cache or measurement policy.

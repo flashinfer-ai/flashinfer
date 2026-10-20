@@ -232,8 +232,8 @@ class MoEEpMegaLayer(nn.Module):
         ``live_tokens=None`` selects full capacity, even when the layer has a
         different default tuning profile. Handles retain their compiled tactics
         and stable addresses.
-        Automatic handles do not accept ``live_tokens``; pass the intended
-        workload to ``warmup`` for automatic selection.
+        Automatic handles warn when ``live_tokens`` is supplied because
+        selection uses the actual warmup or forward batch size.
         Call collectively with matching arguments on all EP ranks before
         capture.
         """
@@ -260,9 +260,11 @@ class MoEEpMegaLayer(nn.Module):
             raise MoEEpConfigError("This backend does not support live-token tuning")
         automatic = automatic and knobs is None
         if automatic and live_tokens is not None:
-            raise MoEEpConfigError(
-                "live_tokens selects an offline profile; automatic workspaces use "
-                "the batch passed to warmup() instead"
+            warnings.warn(
+                "live_tokens is ignored for automatic tuning; selection uses "
+                "the actual warmup or forward batch size",
+                UserWarning,
+                stacklevel=2,
             )
         profile_key = (max_tokens_per_rank, live_tokens)
         if not automatic and any(

@@ -1001,13 +1001,17 @@ def test_auto_handles_and_default_replacement_retain_old_storage():
     layer._megakernel_config = SimpleNamespace(knobs="auto")
     layer._kernel.supports_auto_workspaces = True
     layer._kernel.supports_live_token_tuning = True
+    first_raw = object()
     with (
-        mock.patch.object(layer._kernel, "prepare_workspace") as allocate,
-        pytest.raises(ValueError, match="live_tokens selects an offline profile"),
+        mock.patch.object(layer._kernel, "validate_init"),
+        mock.patch.object(
+            layer._kernel, "prepare_workspace", return_value=first_raw
+        ) as allocate,
+        pytest.warns(UserWarning, match="live_tokens is ignored for automatic tuning"),
     ):
-        layer.create_workspace(64, live_tokens=8)
-    allocate.assert_not_called()
-    first, first_raw, _, _ = _create_workspace(layer, 64)
+        first = layer.create_workspace(64, live_tokens=8)
+    allocate.assert_called_once()
+    assert first.live_tokens == 8
     second, second_raw, _, _ = _create_workspace(layer, 64)
     assert first_raw is not second_raw
     assert layer._resolve_workspace(first)[1] is first_raw
