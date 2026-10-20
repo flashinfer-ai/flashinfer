@@ -999,6 +999,70 @@ def test_rows_residency_grid_needs_no_routing_and_stays_in_the_valid_range() -> 
                 )
 
 
+# One cuda::atomic_ref operation on a pointer of unknown address space, as in NCCL's Device API.
+_ATOMIC_REF_PROBE = r"""
+#include <cuda/atomic>
+extern "C" __global__ void probe(unsigned* const* pointers) {
+  cuda::atomic_ref<unsigned, cuda::thread_scope_system> a(*pointers[threadIdx.x]);
+  a.fetch_add(1u, cuda::memory_order_relaxed);
+}
+"""
+
+
+def test_device_flags_compile_out_the_libcudacxx_automatic_storage_check(
+    tmp_path,
+) -> None:
+    """The device build's flags must remove libcu++'s automatic-storage test from cuda::atomic_ref.
+
+    The libcu++ headers of CUDA >= 13.2 give every atomic on a generic pointer an
+    ``isspacep.local`` test plus a local-memory fallback, which spills the persistent kernel
+    (#6755).  ``_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE`` is an internal libcu++ macro: if a later
+    release renames it, this test fails on that toolkit.  Toolkits whose headers have no such
+    test (CUDA 13.0 / 13.1) skip.
+    """
+    import subprocess
+
+    from flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe.shim import cake_jit
+
+    nvcc = cake_jit._nvcc()
+    source = tmp_path / "atomic_ref_probe.cu"
+    source.write_text(_ATOMIC_REF_PROBE)
+    device_defines = [f for f in cake_jit._NVCC_FLAGS if f.startswith("-D")]
+    assert "-D_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE" in device_defines
+
+    def ptx(*defines: str) -> str:
+        try:
+            completed = subprocess.run(
+                [
+                    nvcc,
+                    "-ptx",
+                    "-arch=compute_120a",
+                    "-std=c++17",
+                    "-O3",
+                    *defines,
+                    str(source),
+                    "-o",
+                    "-",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            pytest.skip(f"nvcc not runnable: {nvcc}")
+        assert completed.returncode == 0, completed.stderr
+        return completed.stdout
+
+    if "isspacep.local" not in ptx():
+        pytest.skip(
+            f"nvcc {cake_jit.nvcc_version()}: libcu++ has no automatic-storage check"
+        )
+    assert "isspacep.local" not in ptx(*device_defines), (
+        f"nvcc {cake_jit.nvcc_version()}: the device flags no longer compile out libcu++'s "
+        "automatic-storage check (was _CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE renamed?)"
+    )
+
+
 def test_transport_session_close_after_process_group_destroyed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

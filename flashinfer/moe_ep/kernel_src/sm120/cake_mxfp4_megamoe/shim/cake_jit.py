@@ -78,6 +78,11 @@ _NVCC_FLAGS = (
     "--generate-code=arch=compute_120a,code=sm_120a",
     "-std=c++17",
     "-O3",
+    # Skip libcu++'s automatic-storage test in cuda::atomic_ref (CUDA >= 13.3 headers): NCCL's
+    # device-API atomics never target automatic storage.  The source defines it too, right
+    # before nccl_device.h; the flag keeps it in force should a libcu++ header ever be
+    # included earlier.
+    "-D_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE",
 )
 EXPECTED_NCCL_VERSION_INTEGER = 23007  # NCCL 2.30.7: GIN device API
 # NCCL GIN backends a device module can be built for, keyed by name, with the session's

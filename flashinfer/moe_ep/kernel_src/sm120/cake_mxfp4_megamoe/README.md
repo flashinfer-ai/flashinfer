@@ -157,15 +157,19 @@ that spills, naming its GIN backend, registers, stack and local bytes and the nv
 workspace re-checks every loaded instance (`CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES <= 8`, the
 GPI fence's stack frame).
 
-**libcu++ automatic-storage check.** The device source defines
-`_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE` before it includes `nccl_device.h`.  The libcu++ headers
-of CUDA 13.3 test every `cuda::atomic_ref` operation for a local-memory (automatic storage)
-address and carry a local-memory fallback for it.  NCCL's Device API uses `cuda::atomic_ref` for
-its proxy queues, signals and counters, and with the fallback 34 of the 352 instances above
-spill one register at EP 8 / 16 (`m64_copier`, `m128_nocopier`, `m128_copier` at the
-DeepSeek-V3, Qwen3 and DeepSeek-V4.1-Flash geometries).  Those atomics only ever address
-NCCL-owned device or host-pinned memory.  The headers of CUDA 13.0 and 13.1 skip the check
-unconditionally and do not know this macro, so their output is unchanged by it.
+**libcu++ automatic-storage check.** The device build defines
+`_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE`, both on the `nvcc` command line (`shim/cake_jit.py`)
+and in the source right before it includes `nccl_device.h`, so other builds of the source get it
+too.  From CUDA 13.2 on, the libcu++ headers test every `cuda::atomic_ref` operation on a
+generic pointer for a local-memory (automatic storage) address and carry a local-memory fallback
+for it.  NCCL's Device API uses `cuda::atomic_ref` for its proxy queues, signals and counters.
+With the fallback, CUDA 13.3.73 spills one register in 34 of the 352 EP 4 / 8 / 16 instances of
+the matrix above (`m64_copier`, `m128_nocopier` and `m128_copier` at the DeepSeek-V3, Qwen3 and
+DeepSeek-V4.1-Flash geometries).  Those atomics only ever address NCCL-owned device or host-pinned
+memory.  The headers of CUDA 13.0 and 13.1 skip the check unconditionally and do not know this
+macro, so their output is unchanged by it.  The macro is internal to libcu++, so a host test
+compiles one `cuda::atomic_ref` operation with the active toolkit and fails if the device flags
+no longer remove the check.
 
 ## Manifest schema (`cake-sm120-megamoe-manifest/3`)
 
@@ -208,10 +212,12 @@ division and remainder); nothing is `eval`-ed.
   `-lcuda`).  The device build uses the compiler and headers of one release, found through
   `CUDA_HOME`.  All multi-GPU tests run with **13.0.88**.  The register grid above compiles
   spill-free with 13.0.48, 13.0.88, 13.1.80, 13.1.115, 13.2.51, 13.2.78, 13.2.86, 13.3.33,
-  13.3.73, 13.4.59 and 13.4.92 (compile only for the releases other than 13.0.88).  Code built
-  by the releases after 13.0 ran about 5-8 % slower in our EP 8 DeepSeek-V4-Flash measurements
-  (most at 512-1024 tokens per rank, within a few percent at 4096), with or without spills, so
-  13.0 remains the recommended device compiler.  On any other release `validate_init` refuses a
+  13.3.73, 13.4.59 and 13.4.92 (compile only for the releases other than 13.0.88 and 13.3.73).
+  Code built by the releases after 13.0 runs slower, with or without spills, by an amount that
+  depends on the shape and the GPU: on 110-SM GPUs at EP 8, DeepSeek-V4-Flash built by 13.1-13.4
+  was 5-15 % slower at 512-1024 tokens per rank and 0-3 % slower at 4096; on 188-SM GPUs at EP 4,
+  DeepSeek-V4-Flash and V4.1-Flash built by 13.3.73 were 10-15 % slower at 1024-4096 tokens per
+  rank and DeepSeek-V3 was on par.  13.0 remains the recommended device compiler.  On any other release `validate_init` refuses a
   spilling build with the nvcc release in the message; point `CUDA_HOME` at a release listed
   above and clear the JIT cache.
 * An initialized `torch.distributed` **NCCL** process group for the EP domain (the session adopts
