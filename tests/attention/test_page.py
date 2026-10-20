@@ -817,3 +817,417 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_all_negative(
     assert torch.equal(v_cache, v_cache_before)
     assert torch.equal(k_scales, k_scales_before)
     assert torch.equal(v_scales, v_scales_before)
+
+
+def _fp8_pth_scale_ref(x, fp8_max):
+    # per-(row, head) absmax scale, mirroring the kernel's fmaxf(amax / fp8_max, 1e-12)
+    return (x.abs().float().amax(dim=-1) / fp8_max).clamp(min=1e-12)
+
+
+def _fp8_pth_to_slot_major(x, kv_layout):
+    # NHD [pages, page_size, nkv, ...] / HND [pages, nkv, page_size, ...] ->
+    # slot-major [pages * page_size, nkv, ...]
+    if kv_layout == "HND":
+        x = x.transpose(1, 2).contiguous()
+    return x.reshape(-1, *x.shape[2:])
+
+
+def _fp8_pth_carve_sf(slot, head_dim):
+    # Carve the float32 scale view out of the inline slot (matches the read path).
+    return slot[..., head_dim : head_dim + 4].view(torch.float32).squeeze(-1)
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping(
+    kv_layout, dtype, head_dim, slot_dtype, fp8_dtype
+):
+    device = "cuda:0"
+    torch.manual_seed(42)
+    nnz_kv = 16
+    num_kv_heads = 4
+    page_size = 4
+    max_num_pages = 8
+    fp8_max = 448.0 if fp8_dtype == torch.float8_e4m3fn else 57344.0
+
+    k_append = torch.randn(nnz_kv, num_kv_heads, head_dim, device=device, dtype=dtype)
+    v_append = torch.randn_like(k_append)
+
+    if kv_layout == "NHD":
+        slot_shape = (max_num_pages, page_size, num_kv_heads, head_dim + 16)
+    else:
+        slot_shape = (max_num_pages, num_kv_heads, page_size, head_dim + 16)
+    k_slot = torch.zeros(slot_shape, dtype=torch.uint8, device=device)
+    v_slot = torch.zeros_like(k_slot)
+
+    capacity = max_num_pages * page_size
+    slot_mapping = torch.randperm(capacity, device=device)[:nnz_kv].to(slot_dtype)
+    slot_mapping[5] = -1  # one padded row
+
+    flashinfer.fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping(
+        k_append,
+        v_append,
+        slot_mapping,
+        (k_slot, v_slot),
+        (_fp8_pth_carve_sf(k_slot, head_dim), _fp8_pth_carve_sf(v_slot, head_dim)),
+        kv_layout=kv_layout,
+        kv_data_type=fp8_dtype,
+    )
+
+    k_data = _fp8_pth_to_slot_major(k_slot[..., :head_dim].view(fp8_dtype), kv_layout)
+    v_data = _fp8_pth_to_slot_major(v_slot[..., :head_dim].view(fp8_dtype), kv_layout)
+    k_sf = _fp8_pth_to_slot_major(_fp8_pth_carve_sf(k_slot, head_dim), kv_layout)
+    v_sf = _fp8_pth_to_slot_major(_fp8_pth_carve_sf(v_slot, head_dim), kv_layout)
+
+    valid = slot_mapping >= 0
+    valid_slots = slot_mapping[valid].long()
+
+    # Scales match the per-(token, head) absmax reference within 1 ulp.
+    assert torch.allclose(
+        k_sf[valid_slots],
+        _fp8_pth_scale_ref(k_append[:nnz_kv][valid], fp8_max),
+        rtol=2e-7,
+        atol=0.0,
+    )
+    assert torch.allclose(
+        v_sf[valid_slots],
+        _fp8_pth_scale_ref(v_append[:nnz_kv][valid], fp8_max),
+        rtol=2e-7,
+        atol=0.0,
+    )
+
+    # FP8 data matches a reference re-quantized with the written scale.
+    k_ref = (k_append[:nnz_kv][valid].float() / k_sf[valid_slots].unsqueeze(-1)).to(
+        fp8_dtype
+    )
+    v_ref = (v_append[:nnz_kv][valid].float() / v_sf[valid_slots].unsqueeze(-1)).to(
+        fp8_dtype
+    )
+    assert (k_data[valid_slots] == k_ref).float().mean().item() > 0.995
+    assert (v_data[valid_slots] == v_ref).float().mean().item() > 0.995
+
+    # Dequant round-trip recovers the input to within FP8 precision.
+    cos_floor = 0.999 if fp8_dtype == torch.float8_e4m3fn else 0.95
+    for data, sf, src in ((k_data, k_sf, k_append), (v_data, v_sf, v_append)):
+        deq = data[valid_slots].float() * sf[valid_slots].unsqueeze(-1)
+        target = src[:nnz_kv][valid].float().flatten().unsqueeze(0)
+        cos = torch.nn.functional.cosine_similarity(deq.flatten().unsqueeze(0), target)
+        assert cos.item() > cos_floor
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+def test_fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_all_negative(
+    kv_layout, slot_dtype
+):
+    device = "cuda:0"
+    nnz_kv = 4
+    num_kv_heads = 2
+    head_dim = 64
+    page_size = 1
+    max_num_pages = 4
+    k_append = torch.randn(
+        nnz_kv, num_kv_heads, head_dim, device=device, dtype=torch.float16
+    )
+    v_append = torch.randn_like(k_append)
+
+    if kv_layout == "NHD":
+        slot_shape = (max_num_pages, page_size, num_kv_heads, head_dim + 16)
+    else:
+        slot_shape = (max_num_pages, num_kv_heads, page_size, head_dim + 16)
+    k_slot = torch.full(slot_shape, 0xAB, dtype=torch.uint8, device=device)
+    v_slot = torch.full_like(k_slot, 0xCD)
+    slot_mapping = torch.full((nnz_kv,), -1, dtype=slot_dtype, device=device)
+    k_before, v_before = k_slot.clone(), v_slot.clone()
+
+    flashinfer.fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping(
+        k_append,
+        v_append,
+        slot_mapping,
+        (k_slot, v_slot),
+        (_fp8_pth_carve_sf(k_slot, head_dim), _fp8_pth_carve_sf(v_slot, head_dim)),
+        kv_layout=kv_layout,
+        kv_data_type="e4m3",
+    )
+
+    assert torch.equal(k_slot, k_before)
+    assert torch.equal(v_slot, v_before)
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+def test_fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_out_of_range(
+    kv_layout, slot_dtype
+):
+    device = "cuda:0"
+    nnz_kv = 4
+    num_kv_heads = 2
+    head_dim = 64
+    page_size = 2
+    max_num_pages = 2
+    capacity = max_num_pages * page_size
+    k_append = torch.randn(
+        nnz_kv, num_kv_heads, head_dim, device=device, dtype=torch.float16
+    )
+    v_append = torch.randn_like(k_append)
+
+    if kv_layout == "NHD":
+        slot_shape = (max_num_pages, page_size, num_kv_heads, head_dim + 16)
+    else:
+        slot_shape = (max_num_pages, num_kv_heads, page_size, head_dim + 16)
+    k_slot = torch.full(slot_shape, 0xAB, dtype=torch.uint8, device=device)
+    v_slot = torch.full_like(k_slot, 0xCD)
+    slot_mapping = torch.tensor(
+        [capacity, capacity + 1, -1, capacity + 8], dtype=slot_dtype, device=device
+    )
+    k_before, v_before = k_slot.clone(), v_slot.clone()
+
+    flashinfer.fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping(
+        k_append,
+        v_append,
+        slot_mapping,
+        (k_slot, v_slot),
+        (_fp8_pth_carve_sf(k_slot, head_dim), _fp8_pth_carve_sf(v_slot, head_dim)),
+        kv_layout=kv_layout,
+        kv_data_type="e4m3",
+    )
+
+    assert torch.equal(k_slot, k_before)
+    assert torch.equal(v_slot, v_before)
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+def test_fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_pad_untouched(
+    kv_layout,
+):
+    device = "cuda:0"
+    nnz_kv = 2
+    num_kv_heads = 1
+    head_dim = 128
+    page_size = 2
+    max_num_pages = 1
+    k_append = torch.randn(
+        nnz_kv, num_kv_heads, head_dim, device=device, dtype=torch.float16
+    )
+    v_append = torch.randn_like(k_append)
+
+    if kv_layout == "NHD":
+        slot_shape = (max_num_pages, page_size, num_kv_heads, head_dim + 16)
+    else:
+        slot_shape = (max_num_pages, num_kv_heads, page_size, head_dim + 16)
+    k_slot = torch.full(slot_shape, 0xAB, dtype=torch.uint8, device=device)
+    v_slot = torch.full_like(k_slot, 0xCD)
+    slot_mapping = torch.arange(nnz_kv, dtype=torch.int32, device=device)
+
+    flashinfer.fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping(
+        k_append,
+        v_append,
+        slot_mapping,
+        (k_slot, v_slot),
+        (_fp8_pth_carve_sf(k_slot, head_dim), _fp8_pth_carve_sf(v_slot, head_dim)),
+        kv_layout=kv_layout,
+        kv_data_type="e4m3",
+    )
+
+    # The 12 pad bytes after the scale stay at the sentinel; the data region was written.
+    assert bool((k_slot[..., head_dim + 4 : head_dim + 16] == 0xAB).all())
+    assert bool((v_slot[..., head_dim + 4 : head_dim + 16] == 0xCD).all())
+    assert not bool((k_slot[..., :head_dim] == 0xAB).all())
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+def test_fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_page_size_one(
+    kv_layout,
+):
+    device = "cuda:0"
+    torch.manual_seed(42)
+    nnz_kv = 4
+    num_kv_heads = 2
+    head_dim = 64
+    page_size = 1
+    max_num_pages = 8
+    k_append = torch.randn(
+        nnz_kv, num_kv_heads, head_dim, device=device, dtype=torch.float16
+    )
+    v_append = torch.randn_like(k_append)
+
+    if kv_layout == "NHD":
+        slot_shape = (max_num_pages, page_size, num_kv_heads, head_dim + 16)
+    else:
+        slot_shape = (max_num_pages, num_kv_heads, page_size, head_dim + 16)
+    k_slot = torch.zeros(slot_shape, dtype=torch.uint8, device=device)
+    v_slot = torch.zeros_like(k_slot)
+    slot_mapping = torch.tensor([0, 3, 5, -1], dtype=torch.int32, device=device)
+
+    flashinfer.fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping(
+        k_append,
+        v_append,
+        slot_mapping,
+        (k_slot, v_slot),
+        (_fp8_pth_carve_sf(k_slot, head_dim), _fp8_pth_carve_sf(v_slot, head_dim)),
+        kv_layout=kv_layout,
+        kv_data_type="e4m3",
+    )
+
+    k_data = _fp8_pth_to_slot_major(
+        k_slot[..., :head_dim].view(torch.float8_e4m3fn), kv_layout
+    )
+    k_sf = _fp8_pth_to_slot_major(_fp8_pth_carve_sf(k_slot, head_dim), kv_layout)
+    valid = slot_mapping >= 0
+    valid_slots = slot_mapping[valid].long()
+    assert torch.allclose(
+        k_sf[valid_slots],
+        _fp8_pth_scale_ref(k_append[valid], 448.0),
+        rtol=2e-7,
+        atol=0.0,
+    )
+    deq = k_data[valid_slots].float() * k_sf[valid_slots].unsqueeze(-1)
+    cos = torch.nn.functional.cosine_similarity(
+        deq.flatten().unsqueeze(0), k_append[valid].float().flatten().unsqueeze(0)
+    )
+    assert cos.item() > 0.999
+
+
+def test_fp8_pth_quantize_append_paged_kv_cache_rejects_bad_inputs():
+    device = "cuda:0"
+    head_dim = 64
+    num_kv_heads = 1
+    page_size = 1
+    max_num_pages = 1
+    k_append = torch.randn(
+        1, num_kv_heads, head_dim, device=device, dtype=torch.float16
+    )
+    v_append = torch.randn_like(k_append)
+    slot_mapping = torch.zeros(1, dtype=torch.int32, device=device)
+
+    def make_slots():
+        shape = (max_num_pages, page_size, num_kv_heads, head_dim + 16)
+        k_slot = torch.zeros(shape, dtype=torch.uint8, device=device)
+        v_slot = torch.zeros_like(k_slot)
+        return (k_slot, v_slot), (
+            _fp8_pth_carve_sf(k_slot, head_dim),
+            _fp8_pth_carve_sf(v_slot, head_dim),
+        )
+
+    # append must be fp16/bf16
+    slots, sf = make_slots()
+    with pytest.raises(ValueError, match="float16 or bfloat16"):
+        flashinfer.fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping(
+            k_append.float(), v_append, slot_mapping, slots, sf, kv_layout="NHD"
+        )
+    # slot_mapping must be int32/int64
+    slots, sf = make_slots()
+    with pytest.raises(ValueError, match="int32 or int64"):
+        flashinfer.fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping(
+            k_append, v_append, slot_mapping.float(), slots, sf, kv_layout="NHD"
+        )
+    # cache must be uint8
+    k_f = torch.zeros(
+        max_num_pages, page_size, num_kv_heads, head_dim + 16, device=device
+    )
+    v_f = torch.zeros_like(k_f)
+    with pytest.raises(ValueError, match="uint8"):
+        flashinfer.fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping(
+            k_append,
+            v_append,
+            slot_mapping,
+            (k_f, v_f),
+            (_fp8_pth_carve_sf(k_f, head_dim), _fp8_pth_carve_sf(v_f, head_dim)),
+            kv_layout="NHD",
+        )
+    # sf must be float32
+    slots, sf = make_slots()
+    k_sf_bad = torch.zeros(
+        max_num_pages, page_size, num_kv_heads, device=device, dtype=torch.float16
+    )
+    with pytest.raises(ValueError, match="float32"):
+        flashinfer.fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping(
+            k_append, v_append, slot_mapping, slots, (k_sf_bad, sf[1]), kv_layout="NHD"
+        )
+    # kv_data_type must be e4m3/e5m2
+    slots, sf = make_slots()
+    with pytest.raises(ValueError, match="kv_data_type"):
+        flashinfer.fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping(
+            k_append,
+            v_append,
+            slot_mapping,
+            slots,
+            sf,
+            kv_layout="NHD",
+            kv_data_type="fp16",
+        )
+
+
+@pytest.mark.parametrize("head_dim", [64, 512])
+def test_fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_cuda_graph_capture(
+    head_dim,
+):
+    device = "cuda:0"
+    nnz_kv = 4
+    num_kv_heads = 2
+    page_size = 1
+    max_num_pages = 4
+    k_append = torch.randn(
+        nnz_kv, num_kv_heads, head_dim, device=device, dtype=torch.float16
+    )
+    v_append = torch.randn_like(k_append)
+    k_slot = torch.zeros(
+        max_num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim + 16,
+        dtype=torch.uint8,
+        device=device,
+    )
+    v_slot = torch.zeros_like(k_slot)
+    slot_mapping = torch.arange(nnz_kv, dtype=torch.int32, device=device)
+    kv_cache_sf = (
+        _fp8_pth_carve_sf(k_slot, head_dim),
+        _fp8_pth_carve_sf(v_slot, head_dim),
+    )
+
+    def run(k, v, k_slot, v_slot, sf):
+        flashinfer.fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping(
+            k,
+            v,
+            slot_mapping,
+            (k_slot, v_slot),
+            sf,
+            kv_layout="NHD",
+            kv_data_type="e4m3",
+        )
+
+    # Warm up, then capture.
+    run(k_append, v_append, k_slot, v_slot, kv_cache_sf)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(k_append, v_append, k_slot, v_slot, kv_cache_sf)
+
+    # The graph reads the input storage in place: re-randomize it, replay, and
+    # compare the result against a fresh eager run (bit-exact: the scale is
+    # computed on device and the FP8 conversion is deterministic; head_dim 512
+    # uses a two-warp block).
+    k_append.normal_()
+    v_append.normal_()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    k_ref_slot = torch.zeros_like(k_slot)
+    v_ref_slot = torch.zeros_like(v_slot)
+    run(
+        k_append,
+        v_append,
+        k_ref_slot,
+        v_ref_slot,
+        (
+            _fp8_pth_carve_sf(k_ref_slot, head_dim),
+            _fp8_pth_carve_sf(v_ref_slot, head_dim),
+        ),
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(k_slot, k_ref_slot)
+    assert torch.equal(v_slot, v_ref_slot)

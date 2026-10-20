@@ -515,6 +515,145 @@ nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_trace = TraceTemplate(
 )
 
 
+def _fp8_pth_paged_cache_shapes(
+    num_pages, page_size, num_kv_heads, head_dim, kv_layout
+):
+    slot_last = head_dim + 16
+    if kv_layout == "HND":
+        slot_shape = (num_pages, num_kv_heads, page_size, slot_last)
+        sf_shape = (num_pages, num_kv_heads, page_size)
+    else:
+        slot_shape = (num_pages, page_size, num_kv_heads, slot_last)
+        sf_shape = (num_pages, page_size, num_kv_heads)
+    return slot_shape, sf_shape
+
+
+def _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init(
+    *,
+    nnz_kv: int,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    page_size: int = 16,
+    num_pages: int = 4,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping``."""
+    if head_dim % 16 != 0:
+        raise ValueError("head_dim must be divisible by 16 for the FP8 inline slot")
+    torch.manual_seed(seed)
+    num_pages = max(num_pages, math.ceil(max(nnz_kv, 1) / page_size))
+    append_key = torch.randn(
+        nnz_kv, num_kv_heads, head_dim, dtype=torch.float16, device=device
+    )
+    append_value = torch.randn_like(append_key)
+    slot_shape, sf_shape = _fp8_pth_paged_cache_shapes(
+        num_pages, page_size, num_kv_heads, head_dim, "NHD"
+    )
+    k_slot = torch.zeros(slot_shape, dtype=torch.uint8, device=device)
+    v_slot = torch.zeros_like(k_slot)
+    # Scale views are the inline 4-byte float32 region of the same uint8 slot.
+    k_sf = k_slot[..., head_dim : head_dim + 4].view(torch.float32).squeeze(-1)
+    v_sf = v_slot[..., head_dim : head_dim + 4].view(torch.float32).squeeze(-1)
+    slot_mapping = torch.arange(nnz_kv, dtype=torch.int32, device=device)
+    return {
+        "append_key": append_key,
+        "append_value": append_value,
+        "slot_mapping": slot_mapping,
+        "paged_kv_cache": (k_slot, v_slot),
+        "kv_cache_sf": (k_sf, v_sf),
+    }
+
+
+cast(
+    Any,
+    _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init,
+)._trace_init_dependencies = (_fp8_pth_paged_cache_shapes,)
+
+
+fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_trace = TraceTemplate(
+    op_type="page_append",
+    name_prefix="fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping",
+    description=(
+        "Quantize fp16/bf16 K/V rows into an FP8 per-(token, head) paged KV cache "
+        "using a flat slot_mapping array, writing the e4m3/e5m2 data and the "
+        "float32 scale into one inline slot. Negative slots are ignored."
+    ),
+    axes={
+        "nnz_kv": Var(description="Total K/V tokens to append."),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+        "slot_last": Const(abbrev="sl"),
+        "num_pages": Var(),
+        "page_size": Const(abbrev="ps"),
+    },
+    inputs={
+        "append_key": Tensor(["nnz_kv", "num_kv_heads", "head_dim"]),
+        "append_value": Tensor(["nnz_kv", "num_kv_heads", "head_dim"]),
+        "slot_mapping": Tensor(["nnz_kv"], dtype="int32"),
+        "paged_k_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads", "slot_last"],
+            dtype="uint8",
+            param="paged_kv_cache",
+            tuple_idx=0,
+        ),
+        "paged_v_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads", "slot_last"],
+            dtype="uint8",
+            param="paged_kv_cache",
+            tuple_idx=1,
+        ),
+        "k_scale_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads"],
+            dtype="float32",
+            param="kv_cache_sf",
+            tuple_idx=0,
+        ),
+        "v_scale_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads"],
+            dtype="float32",
+            param="kv_cache_sf",
+            tuple_idx=1,
+        ),
+    },
+    outputs={
+        "paged_k_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads", "slot_last"],
+            dtype="uint8",
+            param="paged_kv_cache",
+            tuple_idx=0,
+            description="Updated inline-slot K cache (in-place).",
+        ),
+        "paged_v_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads", "slot_last"],
+            dtype="uint8",
+            param="paged_kv_cache",
+            tuple_idx=1,
+            description="Updated inline-slot V cache (in-place).",
+        ),
+        "k_scale_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads"],
+            dtype="float32",
+            param="kv_cache_sf",
+            tuple_idx=0,
+            description="Updated K scale view (in-place).",
+        ),
+        "v_scale_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads"],
+            dtype="float32",
+            param="kv_cache_sf",
+            tuple_idx=1,
+            description="Updated V scale view (in-place).",
+        ),
+    },
+    constraints=[
+        "slot_last == head_dim + 16",
+    ],
+    tags=["status:verified"],
+    init=_fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init,
+)
+
+
 @torch.no_grad()
 def _append_paged_mla_kv_cache_reference(
     append_ckv,
