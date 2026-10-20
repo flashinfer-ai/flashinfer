@@ -56,6 +56,14 @@ try:
 except ImportError:
     GDN_DECODE_BF16_STATE_AVAILABLE = False
 
+# Rubin-tuned (SM107) T=1 BF16 state kernel
+try:
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state_rubin import (
+        gated_delta_rule_t1_rubin as gdn_decode_bf16_state_t1_rubin,
+    )
+except (ImportError, RuntimeError):
+    gdn_decode_bf16_state_t1_rubin = None
+
 
 def _skip_if_not_sm90_or_later():
     """Skip test if not Hopper (SM90+) or Blackwell (SM100+) architecture."""
@@ -2014,15 +2022,22 @@ def _test_gdn_decode_bf16_state_t1_kernel(
     alpha: bool,
     beta: bool,
     seed: int | None = None,
+    kernel: str = "generic",
 ):
     """Test BF16 state kernel for T=1.
 
     Both kernel and reference use bf16 h state so the comparison is apples-to-apples.
+    ``kernel="rubin"`` runs the Rubin-tuned T=1 kernel (SM107) instead of the generic one.
     """
     _skip_if_not_sm90_or_later()
 
     if not GDN_DECODE_BF16_STATE_AVAILABLE:
         pytest.skip("BF16 state kernel not available")
+    if kernel == "rubin" and gdn_decode_bf16_state_t1_rubin is None:
+        pytest.skip("Rubin BF16 state kernel not available")
+    kernel_fn = (
+        gdn_decode_bf16_state_t1_rubin if kernel == "rubin" else gdn_decode_bf16_state
+    )
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -2066,7 +2081,7 @@ def _test_gdn_decode_bf16_state_t1_kernel(
     # non-pool semantics.
     our_state = input_state_kernel.clone()
     indices = torch.arange(batch_size, dtype=torch.int32, device=device)
-    our_o = gdn_decode_bf16_state(
+    our_o = kernel_fn(
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,
@@ -2140,7 +2155,11 @@ def _test_gdn_decode_bf16_state_t1_kernel(
 # One B per _get_bf16_mtp_config bucket, at both HV=32 and HV=64.
 @pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 32])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
+@pytest.mark.parametrize(
+    "kernel", ["generic", pytest.param("rubin", marks=pytest.mark.arch_rubin)]
+)
 def test_gdn_decode_bf16_state_t1_kernel(
+    kernel: str,
     dtype: str,
     num_q_heads: int,
     num_k_heads: int,
@@ -2164,7 +2183,43 @@ def test_gdn_decode_bf16_state_t1_kernel(
         alpha,
         beta,
         seed,
+        kernel,
     )
+
+
+def test_pretranspose_backend_rubin_rejected_off_sm107():
+    """backend="rubin" and the Rubin kernel itself are gated to compute capability 10.7."""
+    _skip_if_not_sm90_or_later()
+    if gdn_decode_bf16_state_t1_rubin is None:
+        pytest.skip("Rubin BF16 state kernel not available")
+    if get_compute_capability(torch.device("cuda")) == (10, 7):
+        pytest.skip("runs on GPUs other than SM107")
+    B, H, HV, K = 8, 16, 64, 128
+    device = torch.device("cuda")
+    q = torch.randn(B, 1, H, K, dtype=torch.bfloat16, device=device)
+    k = torch.randn(B, 1, H, K, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, 1, HV, K, dtype=torch.bfloat16, device=device)
+    a = torch.randn(B, 1, HV, dtype=torch.bfloat16, device=device)
+    b = torch.randn(B, 1, HV, dtype=torch.bfloat16, device=device)
+    A_log = torch.randn(HV, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
+    state = torch.randn(B, HV, K, K, dtype=torch.bfloat16, device=device)
+    with pytest.raises(ValueError, match="10.7"):
+        gated_delta_rule_decode_pretranspose(
+            q, k, v, state, A_log, a, dt_bias, b, backend="rubin"
+        )
+    with pytest.raises(ValueError, match="10.7"):
+        gdn_decode_bf16_state_t1_rubin(
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=state,
+            initial_state_indices=torch.arange(B, dtype=torch.int32, device=device),
+        )
 
 
 # ============================================================================
