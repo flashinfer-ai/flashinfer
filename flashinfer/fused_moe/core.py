@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     ClassVar,
     Dict,
     List,
@@ -7668,9 +7669,10 @@ def _trtllm_fused_moe_workspace_size_impl(
     The native query only builds launchers and walks their allocation code; it
     never launches a kernel or reads tensor data. Large operands are therefore
     passed as stride-0 views of one element whose shapes and dtypes carry the
-    metadata the entry point inspects, unless the caller gave the real weights. Routing is given as logits with no
-    precomputed weights, the mode in which the launchers also allocate the
-    routing-weight buffer, so the result bounds every routing input mode.
+    metadata the entry point inspects, unless the caller gave the real weights.
+    Routing is given as logits with no precomputed weights, the mode in which
+    the launchers also allocate the routing-weight buffer, so the result bounds
+    every routing input mode.
     """
 
     def stub(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
@@ -7688,278 +7690,135 @@ def _trtllm_fused_moe_workspace_size_impl(
     T, H, I = num_tokens, hidden_size, intermediate_size
     E_local = local_num_experts + num_fused_shared_experts
     I_gemm1 = I * (2 if is_gated_activation(activation_type) else 1)
-    routing_logits = stub((T, num_experts), torch.float32)
-    output = stub((T, valid_hidden_size or H), torch.bfloat16)
     fp8 = torch.float8_e4m3fn
-    # Routing knobs the size does not depend on.
-    n_group = topk_group = routed_scaling_factor = None
-    routing_method_type = int(RoutingMethodType.Default)
+    logits = stub((T, num_experts), torch.float32)
+    output = stub((T, valid_hidden_size or H), torch.bfloat16)
+    method = int(RoutingMethodType.Default)
     tactic = [-1, -1]
-    no_da: Tuple[List[torch.Tensor], List[torch.Tensor], bool] = ([], [], False)
+    # Argument runs every entry point takes in this order; the size depends on none of the
+    # routing knobs. The empty precomputed routing selects the routing-from-logits path.
+    no_routing = (empty(torch.int32), empty(torch.bfloat16))  # expert ids, weights
+    # n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
+    # routed_scaling_factor
+    experts = (None, None, I, 0, local_num_experts, None)
+    launch = (True, False)  # do_finalize, enable_pdl
+    # norm_topk_prob, routing_replay_out, then no DA metadata, body workspace or preparation
+    ordinary: Tuple[Any, ...] = (True, None, [], [], False)
+    valid = (valid_hidden_size, valid_intermediate_size)
+    w1 = functools.partial(or_stub, gemm1_weights)
+    w1_scale = functools.partial(or_stub, gemm1_weights_scale)
+    w2 = functools.partial(or_stub, gemm2_weights)
+    w2_scale = functools.partial(or_stub, gemm2_weights_scale)
 
+    fn: Callable[..., Any]
+    args: Tuple[Any, ...]
     if quant_mode == "bf16":
-        result = moe_op.trtllm_bf16_moe(
-            int(RoutingInputMode.FromLogits),
-            routing_logits,
-            None,  # routing_bias
-            empty(torch.int32),  # expert_indices
-            empty(torch.bfloat16),  # expert_weights
+        fn = moe_op.trtllm_bf16_moe
+        args = (
+            int(RoutingInputMode.FromLogits), logits, None, *no_routing,
             stub((T, H), torch.bfloat16),
-            or_stub(gemm1_weights, (E_local, I_gemm1, H), torch.bfloat16),
-            or_stub(gemm2_weights, (E_local, H, I), torch.bfloat16),
-            None,  # gemm1_lora_delta
-            None,  # gemm1_alpha
-            None,  # gemm1_beta
-            None,  # gemm1_clamp_limit
-            output,
-            num_experts,
-            top_k,
-            n_group,
-            topk_group,
-            I,
-            0,  # local_expert_offset
-            local_num_experts,
-            routed_scaling_factor,
-            routing_method_type,
-            use_shuffled_weight,
-            weight_layout,
-            True,  # do_finalize
-            False,  # enable_pdl
-            tactic,
-            activation_type,
-            True,  # norm_topk_prob
-            None,  # routing_replay_out
-            *no_da,
-            None,  # workspace_buffer
-            True,  # query_workspace_size
-        )
+            w1((E_local, I_gemm1, H), torch.bfloat16),
+            w2((E_local, H, I), torch.bfloat16),
+            None, None, None, None,  # gemm1 lora_delta, alpha, beta, clamp_limit
+            output, num_experts, top_k, *experts, method,
+            use_shuffled_weight, weight_layout, *launch, tactic, activation_type,
+            *ordinary,
+        )  # fmt: skip
     elif quant_mode == "fp8_per_tensor":
         scale = stub((local_num_experts,), torch.float32)
-        result = moe_op.trtllm_fp8_per_tensor_scale_moe(
-            routing_logits,
-            None,  # routing_bias
-            stub((T, H), fp8),
-            or_stub(gemm1_weights, (E_local, I_gemm1, H), fp8),
-            scale,
-            scale,
-            or_stub(gemm2_weights, (E_local, H, I), fp8),
-            scale,
-            output,
-            num_experts,
-            top_k,
-            n_group,
-            topk_group,
-            I,
-            0,  # local_expert_offset
-            local_num_experts,
-            routed_scaling_factor,
-            use_routing_scales_on_input,
-            routing_method_type,
-            True,  # do_finalize
-            False,  # enable_pdl
-            tactic,
-            activation_type,
-            True,  # norm_topk_prob
-            None,  # routing_replay_out
-            *no_da,
+        fn = moe_op.trtllm_fp8_per_tensor_scale_moe
+        args = (
+            logits, None, stub((T, H), fp8),
+            w1((E_local, I_gemm1, H), fp8), scale, scale,
+            w2((E_local, H, I), fp8), scale,
+            output, num_experts, top_k, *experts,
+            use_routing_scales_on_input, method, *launch, tactic, activation_type,
+            *ordinary,
             None,  # gemm1_clamp_limit
-            None,  # workspace_buffer
-            True,  # query_workspace_size
-        )
+        )  # fmt: skip
     elif quant_mode == "fp8_per_channel":
-        result = moe_op.trtllm_fp8_per_channel_scale_moe(
-            routing_logits,
-            empty(torch.int32),  # expert_indices
-            empty(torch.bfloat16),  # expert_weights
-            None,  # routing_bias
-            stub((T, H), fp8),
-            stub((T,), torch.float32),  # hidden_states_scale
-            or_stub(gemm1_weights, (E_local, I_gemm1, H), fp8),
-            or_stub(gemm1_weights_scale, (E_local, I_gemm1), torch.float32),
-            stub((E_local,), torch.float32),
-            stub((E_local,), torch.float32),
-            or_stub(gemm2_weights, (E_local, H, I), fp8),
-            or_stub(gemm2_weights_scale, (E_local, H), torch.float32),
-            stub((E_local,), torch.float32),
-            output,
-            num_experts,
-            top_k,
-            n_group,
-            topk_group,
-            I,
-            0,  # local_expert_offset
-            local_num_experts,
-            routed_scaling_factor,
-            use_routing_scales_on_input,
-            routing_method_type,
-            True,  # do_finalize
-            False,  # enable_pdl
-            tactic,
-            activation_type,
+        scale = stub((E_local,), torch.float32)
+        fn = moe_op.trtllm_fp8_per_channel_scale_moe
+        args = (
+            logits, *no_routing, None,
+            stub((T, H), fp8), stub((T,), torch.float32),
+            w1((E_local, I_gemm1, H), fp8), w1_scale((E_local, I_gemm1), torch.float32),
+            scale, scale,
+            w2((E_local, H, I), fp8), w2_scale((E_local, H), torch.float32), scale,
+            output, num_experts, top_k, *experts,
+            use_routing_scales_on_input, method, *launch, tactic, activation_type,
             True,  # norm_topk_prob
-            None,  # workspace_buffer
-            True,  # query_workspace_size
-        )
+        )  # fmt: skip
     elif quant_mode in ("fp8_block_scale", "mxfp8"):
-        deepseek = quant_mode == "fp8_block_scale"
-        if deepseek:
+        if quant_mode == "fp8_block_scale":  # DeepSeek FP8: float32 128-block scales
+            quantization = Fp8QuantizationType.DeepSeekFp8
             hidden_scale = stub((H // 128, T), torch.float32)
-            w1_scale = or_stub(
-                gemm1_weights_scale, (E_local, I_gemm1 // 128, H // 128), torch.float32
+            scales = (
+                w1_scale((E_local, I_gemm1 // 128, H // 128), torch.float32),
+                w2_scale((E_local, H // 128, I // 128), torch.float32),
             )
-            w2_scale = or_stub(
-                gemm2_weights_scale, (E_local, H // 128, I // 128), torch.float32
-            )
-        else:
+        else:  # MXFP8: uint8 32-element scales, fixed shuffled MajorK weights
+            quantization = Fp8QuantizationType.MxFp8
+            use_shuffled_weight, weight_layout = True, int(WeightLayout.MajorK)
             hidden_scale = stub((T * H // 32,), torch.uint8)
-            w1_scale = or_stub(
-                gemm1_weights_scale, (E_local * I_gemm1 * H // 32,), torch.uint8
+            scales = (
+                w1_scale((E_local * I_gemm1 * H // 32,), torch.uint8),
+                w2_scale((E_local * H * I // 32,), torch.uint8),
             )
-            w2_scale = or_stub(
-                gemm2_weights_scale, (E_local * H * I // 32,), torch.uint8
-            )
-        result = moe_op.trtllm_fp8_block_scale_moe(
-            int(RoutingInputMode.FromLogits),
-            routing_logits,
-            empty(torch.int32),  # expert_indices
-            empty(torch.bfloat16),  # expert_weights
-            None,  # routing_bias
-            stub((T, H), fp8),
-            hidden_scale,
-            or_stub(gemm1_weights, (E_local, I_gemm1, H), fp8),
-            w1_scale,
-            None,  # gemm1_lora_delta
-            None,  # gemm1_bias
-            None,  # gemm1_alpha
-            None,  # gemm1_beta
-            None,  # gemm1_clamp_limit
-            or_stub(gemm2_weights, (E_local, H, I), fp8),
-            w2_scale,
+        fn = moe_op.trtllm_fp8_block_scale_moe
+        args = (
+            int(RoutingInputMode.FromLogits), logits, *no_routing, None,
+            stub((T, H), fp8), hidden_scale,
+            w1((E_local, I_gemm1, H), fp8), scales[0],
+            None, None, None, None, None,  # gemm1 lora_delta, bias, alpha, beta, clamp
+            w2((E_local, H, I), fp8), scales[1],
             None,  # gemm2_bias
-            output,
-            num_experts,
-            top_k,
-            num_fused_shared_experts,
-            n_group,
-            topk_group,
-            I,
-            0,  # local_expert_offset
-            local_num_experts,
-            routed_scaling_factor,
-            routing_method_type,
-            use_shuffled_weight if deepseek else True,
-            weight_layout if deepseek else int(WeightLayout.MajorK),
-            True,  # do_finalize
-            False,  # enable_pdl
-            tactic,
-            int(
-                Fp8QuantizationType.DeepSeekFp8
-                if deepseek
-                else Fp8QuantizationType.MxFp8
-            ),
-            activation_type,
-            True,  # norm_topk_prob
-            None,  # routing_replay_out
-            *no_da,
-            valid_hidden_size,
-            valid_intermediate_size,
-            None,  # workspace_buffer
-            True,  # query_workspace_size
-        )
+            output, num_experts, top_k, num_fused_shared_experts, *experts, method,
+            use_shuffled_weight, weight_layout, *launch, tactic, int(quantization),
+            activation_type, *ordinary, *valid,
+        )  # fmt: skip
     elif quant_mode in ("nvfp4", "mxfp4_mxfp8", "mxfp4_bf16"):
         # The entry point derives both block-scale vector sizes from scale numel.
-        w_sf_vec = 16 if quant_mode == "nvfp4" else 32
-        if quant_mode == "nvfp4":
-            hidden_states = stub((T, H // 2), torch.uint8)
-            hidden_scale = stub((T * H // 16,), fp8)
-        elif quant_mode == "mxfp4_mxfp8":
-            hidden_states = stub((T, H), fp8)
-            hidden_scale = stub((T * H // 32,), torch.uint8)
-        else:
-            hidden_states = stub((T, H), torch.bfloat16)
-            hidden_scale = None
+        sf_vec = 16 if quant_mode == "nvfp4" else 32
+        hidden_states, hidden_scale = {
+            "nvfp4": (stub((T, H // 2), torch.uint8), stub((T * H // 16,), fp8)),
+            "mxfp4_mxfp8": (stub((T, H), fp8), stub((T * H // 32,), torch.uint8)),
+            "mxfp4_bf16": (stub((T, H), torch.bfloat16), None),
+        }[quant_mode]
+        # FP4 always fills caller-owned routing buffers, so they cannot be placeholders.
         total_top_k = top_k + num_fused_shared_experts
-        result = moe_op.trtllm_fp4_block_scale_moe(
-            int(RoutingInputMode.FromLogits),
-            routing_logits,
+        routing = (
             torch.empty(T, total_top_k, dtype=torch.int32, device=device),
             torch.empty(T, total_top_k, dtype=torch.bfloat16, device=device),
-            None,  # routing_bias
-            hidden_states,
-            hidden_scale,
-            or_stub(gemm1_weights, (E_local, I_gemm1, H // 2), torch.uint8),
-            or_stub(gemm1_weights_scale, (E_local * I_gemm1 * H // w_sf_vec,), fp8),
-            None,  # gemm1_bias
-            None,  # gemm1_lora_delta
-            None,  # gemm1_alpha
-            None,  # gemm1_beta
-            None,  # gemm1_clamp_limit
-            or_stub(gemm2_weights, (E_local, H, I // 2), torch.uint8),
-            or_stub(gemm2_weights_scale, (E_local * H * I // w_sf_vec,), fp8),
-            None,  # gemm2_bias
-            None,  # output1_scale_scalar
-            None,  # output1_scale_gate_scalar
-            None,  # output2_scale_scalar
+        )
+        fn = moe_op.trtllm_fp4_block_scale_moe
+        args = (
+            int(RoutingInputMode.FromLogits), logits, *routing, None,
+            hidden_states, hidden_scale,
+            w1((E_local, I_gemm1, H // 2), torch.uint8),
+            w1_scale((E_local * I_gemm1 * H // sf_vec,), fp8),
+            None, None, None, None, None,  # gemm1 bias, lora_delta, alpha, beta, clamp
+            w2((E_local, H, I // 2), torch.uint8),
+            w2_scale((E_local * H * I // sf_vec,), fp8),
+            None, None, None, None,  # gemm2_bias, output1/output1_gate/output2 scales
             stub((T,), torch.float32) if use_per_token_scale else None,
-            num_experts,
-            top_k,
-            num_fused_shared_experts,
-            n_group,
-            topk_group,
-            I,
-            0,  # local_expert_offset
-            local_num_experts,
-            routed_scaling_factor,
-            routing_method_type,
-            True,  # do_finalize
-            False,  # enable_pdl
-            activation_type,
-            output,
-            tactic,
-            True,  # norm_topk_prob
-            None,  # routing_replay_out
-            *no_da,
-            valid_hidden_size,
-            valid_intermediate_size,
-            None,  # workspace_buffer
-            True,  # query_workspace_size
-        )
+            num_experts, top_k, num_fused_shared_experts, *experts, method, *launch,
+            activation_type, output, tactic, *ordinary, *valid,
+        )  # fmt: skip
     else:  # mxint4
-        result = moe_op.trtllm_mxint4_block_scale_moe(
-            routing_logits,
-            None,  # routing_bias
-            empty(torch.int32),  # expert_indices
-            empty(torch.bfloat16),  # expert_weights
-            stub((T, H), torch.bfloat16),
-            or_stub(gemm1_weights, (E_local, I_gemm1, H // 2), torch.uint8),
-            or_stub(gemm1_weights_scale, (E_local * 2 * I * H // 32,), torch.bfloat16),
-            None,  # gemm1_alpha
-            None,  # gemm1_beta
-            None,  # gemm1_clamp_limit
-            None,  # gemm1_lora_delta
-            or_stub(gemm2_weights, (E_local, H, I // 2), torch.uint8),
-            or_stub(gemm2_weights_scale, (E_local * H * I // 32,), torch.bfloat16),
-            num_experts,
-            top_k,
-            n_group,
-            topk_group,
-            I,
-            0,  # local_expert_offset
-            local_num_experts,
-            routed_scaling_factor,
-            routing_method_type,
-            True,  # do_finalize
-            False,  # enable_pdl
-            output,
-            tactic,
-            True,  # norm_topk_prob
-            None,  # routing_replay_out
-            *no_da,
-            valid_hidden_size,
-            valid_intermediate_size,
-            None,  # workspace_buffer
-            True,  # query_workspace_size
-        )
+        fn = moe_op.trtllm_mxint4_block_scale_moe
+        args = (
+            logits, None, *no_routing, stub((T, H), torch.bfloat16),
+            w1((E_local, I_gemm1, H // 2), torch.uint8),
+            w1_scale((E_local * 2 * I * H // 32,), torch.bfloat16),
+            None, None, None, None,  # gemm1 alpha, beta, clamp_limit, lora_delta
+            w2((E_local, H, I // 2), torch.uint8),
+            w2_scale((E_local * H * I // 32,), torch.bfloat16),
+            num_experts, top_k, *experts, method, *launch, output, tactic,
+            *ordinary, *valid,
+        )  # fmt: skip
+    # Every entry point ends with (workspace_buffer, query_workspace_size).
+    result = fn(*args, None, True)
     return int(_torch_view_of_ffi_tensor(result[0]).item())
 
 
