@@ -205,6 +205,18 @@ def refs_moe_grouped_gemm(package_dir: Path, loader: str) -> set[str]:
     return refs
 
 
+def refs_stepfun(package_dir: Path, loader: str) -> set[str]:
+    """Compact rows keyed by the 20-hex program digest (``_PROGRAMS``; the library stem is
+    ``_PREFIX + digest``), every program built for every architecture of ``ARCHES``."""
+    literals = module_literals(package_dir / loader)
+    prefix, arches = literals["_PREFIX"], literals["ARCHES"]
+    return {
+        f"{prefix}{digest}_{arch}"
+        for digest in literals["_PROGRAMS"]
+        for arch in arches
+    }
+
+
 def refs_mok_bf16(package_dir: Path, loader: str) -> set[str]:
     """``sources.json``: role -> {library, arches, arguments}."""
     registry = json.loads((package_dir / loader).read_text())
@@ -286,7 +298,7 @@ PACKAGES: tuple[Package, ...] = (
         "flashinfer.experimental.cake_stepfun_moe",
         "flashinfer/experimental/cake_stepfun_moe",
         "cake_jit.py",
-        refs_moe_grouped_gemm,
+        refs_stepfun,
     ),
 )
 

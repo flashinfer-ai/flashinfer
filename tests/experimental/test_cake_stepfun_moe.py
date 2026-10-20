@@ -45,6 +45,7 @@ covered by ``test_cake_stepfun_moe_api.py``.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import os
@@ -72,6 +73,13 @@ PRECISIONS = tuple(ref.PRECISION_FAMILY)
 PACKAGE_DIR = Path(pkg.__file__).resolve().parent
 STAGE_TABLE_SIZES = {"routing": 50, "fc1": 26, "requant": 2, "fc2": 27, "finalize": 4}
 ROUTE_COUNT = 135
+ARG_PLAN_COUNT = 20
+# The export's measurement catalogue (``ROUTES``), delivered with the tests.
+ROUTES_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "test_helpers"
+    / "cake_stepfun_moe_routes.json"
+)
 CAKE_KERNEL_SYMBOL = re.compile(r"\bkernel_cake_stepfun_moe_[0-9a-f]+\b")
 # The retired per-arch minor macro: its name must not appear in any delivered source.
 RETIRED_MINOR_MACRO = "TARGET" + "_MINOR"
@@ -269,10 +277,19 @@ def _capture(launch, outputs):
 # ---------------------------------------------------------------------------------------------
 
 
+def _defines_kernel(text: str, symbol: str) -> bool:
+    """``text`` holds the ``__global__`` definition (parameter list followed by a body) of
+    ``symbol``; a binding's ``extern "C" __global__ void symbol(...);`` declaration does not match."""
+    pattern = rf"__global__[^;{{}}]*?\bvoid\s+{re.escape(symbol)}\s*\([^;{{}}]*\)\s*\{{"
+    return re.search(pattern, text) is not None
+
+
 def test_manifest_entries_are_the_registry_programs_on_both_architectures():
     """Every program is built once per architecture: ``build.json`` holds exactly the 222 entries
-    ``cake_jit.library_name`` resolves, each with the program's two translation units, digests over
-    the delivered bytes, a 64-hex closure digest, the ``run`` entry and no fast-math flag."""
+    ``cake_jit.library_name`` resolves, each naming a delivered kernel translation unit that defines
+    the record's kernel symbol and a delivered binding translation unit exporting ``run``, digests
+    keyed by exactly those sources, a 64-hex closure digest, string flags without fast math and the
+    ``run`` entry."""
     manifest = cake_build.manifest()
     assert manifest["schema"] == "cake-build/1"
     assert manifest["package"] == pkg.__name__
@@ -285,20 +302,29 @@ def test_manifest_entries_are_the_registry_programs_on_both_architectures():
         for arch in record["arches"]
     }
     assert set(libraries) == expected and len(libraries) == 2 * len(loader.PROGRAMS)
+    texts: dict[str, str] = {}
     for name, entry in libraries.items():
         program = name.rsplit("_sm_", 1)[0]
         record = loader.PROGRAMS[program]
         assert record["library"] == program and record["ffi_entry"] == "run"
         assert entry["arch"] in record["arches"] and name.endswith("_" + entry["arch"])
         assert entry["entry"] == "run"
-        assert entry["sources"] == [
-            f"csrc/cake_stepfun_moe/{program}_kernel.cu",
-            f"csrc/cake_stepfun_moe/{program}_binding.cu",
-        ]
+        kernel_tu, binding_tu = entry["sources"]
+        assert kernel_tu.startswith("csrc/cake_stepfun_moe/"), name
+        assert kernel_tu.endswith("_kernel.cu"), name
+        assert binding_tu.startswith("csrc/cake_stepfun_moe/"), name
+        assert binding_tu.endswith("_binding.cu"), name
         assert set(entry["sha256"]) == set(entry["sources"])
         for source in entry["sources"]:
             assert (PACKAGE_DIR / source).is_file(), source
+            if source not in texts:
+                texts[source] = (PACKAGE_DIR / source).read_text(errors="replace")
+        assert _defines_kernel(texts[kernel_tu], record["kernel"]), name
+        assert re.search(
+            r"TVM_FFI_DLL_EXPORT_TYPED_FUNC\(\s*run\s*,", texts[binding_tu]
+        ), name
         assert re.fullmatch(r"[0-9a-f]{64}", entry["closure_sha256"])
+        assert all(isinstance(flag, str) for flag in entry["nvcc_flags"]), name
         assert "--use_fast_math" not in entry["nvcc_flags"]
         assert not any("fast_math" in flag for flag in entry["nvcc_flags"])
     assert (PACKAGE_DIR / "csrc" / "cake_ffi_checks.h").is_file()
@@ -307,7 +333,8 @@ def test_manifest_entries_are_the_registry_programs_on_both_architectures():
 def test_stage_tables_and_routes_cover_every_program_once():
     """The five dispatcher tables hold program names only, in the production order and counts (50 /
     26 / 2 / 27 / 4); with the two histogram pre units of the cooperative rows they name every
-    program exactly once.  Every program is reachable from a route and every route stage names a
+    program exactly once.  Every program is reachable from a route of the export's measurement
+    catalogue (``tests/test_helpers/cake_stepfun_moe_routes.json``) and every route stage names a
     registered program delivered for the route's architectures."""
     assert tuple(loader.STAGE_TABLES) == loader.STAGE_ORDER
     named = Counter()
@@ -325,9 +352,10 @@ def test_stage_tables_and_routes_cover_every_program_once():
     assert all(count == 1 for count in named.values()), named.most_common(3)
     with pytest.raises(KeyError):
         loader.programs_of("gemm")
-    assert len(loader.ROUTES) == ROUTE_COUNT
+    routes = json.loads(ROUTES_PATH.read_text())
+    assert len(routes) == ROUTE_COUNT
     reachable = set()
-    for name, route in loader.ROUTES.items():
+    for name, route in routes.items():
         assert route["kind"] in ("fc1", "fc2", "routing", "requant", "finalize", "full")
         assert name.startswith(route["kind"] + "_")
         stages = [stage["name"] for stage in route["stages"]]
@@ -387,7 +415,9 @@ def test_unit_blocks_carry_the_stage_facts():
             "arches",
             "unit",
         )
-        assert record["kernel"] == "kernel_" + program
+        assert record["kernel"] == loader._KERNEL_OVERRIDES.get(
+            program, "kernel_" + program
+        )
         assert set(record["launch"]) == {"block", "cluster"}
         assert all(len(record["launch"][k]) == 3 for k in ("block", "cluster"))
         kinds = [kind for kind, _ in record["arg_plan"]]
@@ -567,6 +597,71 @@ def test_package_sources_carry_no_target_minor_and_no_fast_math():
         assert "--use_fast_math" not in text and "use_fast_math=True" not in text, path
         checked += 1
     assert checked >= 2 * len(loader.PROGRAMS) + 4
+
+
+def test_program_rows_expand_over_the_shared_argument_plans():
+    """Every ``PROGRAMS`` record is expanded from a compact row: its argument plan is one of the
+    shared ``ARG_PLANS`` (20 distinct ``[kind, name]`` sequences, each serving at least one
+    program), the tensor-map operands of that plan are exactly the keys of ``unit["tma_ranks"]``,
+    and the derived fields hold -- ``library`` is the program name, ``ffi_entry`` is ``run``,
+    ``arches`` is ``ARCHES``, ``kernel`` is ``kernel_<program>`` unless ``_KERNEL_OVERRIDES`` names
+    the kernel of another registered program, and ``unit_key`` is ``[stage, family, tile_n]`` for
+    the GEMM stages and ``[stage, variant]`` otherwise."""
+    plans = loader.ARG_PLANS
+    assert len(plans) == ARG_PLAN_COUNT
+    assert len({json.dumps(plan) for plan in plans}) == len(plans)
+    kernels = {"kernel_" + program for program in loader.PROGRAMS}
+    for program, kernel in loader._KERNEL_OVERRIDES.items():
+        assert program in loader.PROGRAMS and kernel in kernels, program
+        assert kernel != "kernel_" + program, program
+    used = set()
+    for program, record in loader.PROGRAMS.items():
+        index = plans.index(record["arg_plan"])
+        used.add(index)
+        tma_operands = {
+            name for kind, name in record["arg_plan"] if kind == "tma_buffer"
+        }
+        assert set(record["unit"]["tma_ranks"]) == tma_operands, program
+        assert record["library"] == program and record["ffi_entry"] == "run"
+        assert record["arches"] == list(loader.ARCHES)
+        assert record["kernel"] == loader._KERNEL_OVERRIDES.get(
+            program, "kernel_" + program
+        )
+        unit = record["unit"]
+        if unit["stage"] in ("fc1", "fc2"):
+            assert unit["unit_key"] == [unit["stage"], unit["family"], unit["tile_n"]]
+        else:
+            assert unit["unit_key"] == [unit["stage"], unit["variant"]]
+    assert used == set(range(len(plans)))
+
+
+def _content_digest(items) -> str:
+    """SHA-256 over ``items`` (``str`` or ``bytes``), each framed by its byte length as eight
+    little-endian bytes: the ``closure_sha256`` definition of ``build.json``."""
+    digest = hashlib.sha256()
+    for item in items:
+        data = item if isinstance(item, bytes) else item.encode()
+        digest.update(len(data).to_bytes(8, "little"))
+        digest.update(data)
+    return digest.hexdigest()
+
+
+def test_manifest_digests_are_recomputed_from_the_delivered_sources():
+    """Every ``build.json`` entry seals its delivery: ``sha256[source]`` is the SHA-256 of the
+    delivered bytes and ``closure_sha256`` -- the salt of the entry's JIT library name -- is the
+    content digest over [entry name, architecture, each nvcc flag, then each source's
+    package-relative path and bytes], so a changed source, flag or source set names a fresh
+    build."""
+    for name, entry in cake_build.libraries_by_name().items():
+        items = [name, entry["arch"], *entry["nvcc_flags"]]
+        for source in entry["sources"]:
+            data = (PACKAGE_DIR / source).read_bytes()
+            assert entry["sha256"][source] == hashlib.sha256(data).hexdigest(), (
+                name,
+                source,
+            )
+            items += [source, data]
+        assert entry["closure_sha256"] == _content_digest(items), name
 
 
 # ---------------------------------------------------------------------------------------------
