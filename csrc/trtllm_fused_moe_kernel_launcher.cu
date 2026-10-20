@@ -3014,7 +3014,7 @@ Array<Tensor> trtllm_moe_run_routing(
   }
 
   auto const num_tokens = hidden_states.size(0);
-  std::vector<int32_t> supported_tile_nums{8, 16, 32, 64, 128, 256};
+  std::vector<int32_t> supported_tile_nums{8, 16, 32, 64, 128, 192, 256};
   auto const [tile_N, config] = resolveMoeTileAndConfig(moe_tactic, supported_tile_nums, num_tokens,
                                                         top_k, local_num_experts);
   (void)config;
