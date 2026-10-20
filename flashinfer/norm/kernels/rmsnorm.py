@@ -107,12 +107,8 @@ class RMSNormKernel:
     def _compute_cluster_n(H: int, dtype: cutlass.Numeric, sm_version: int) -> int:
         """Compute optimal cluster size based on H and device shared memory.
 
-        The budget is half the opt-in limit, the same threshold
-        ``use_async_copy`` uses.  A tile that fits the full limit but not the
-        half one would keep ``cluster_n`` at 1 while disabling cp.async -- and
-        with it the pass-2 shared-memory reload -- leaving every thread to
-        carry its whole fragment across the reduction barrier, which spills to
-        local memory once the fragment exceeds the register file.
+        The budget is the half-limit that gates ``use_async_copy``, so a cluster
+        size that fits here also fits the cp.async budget.
         """
         if sm_version < 90:
             return 1
@@ -132,7 +128,8 @@ class RMSNormKernel:
             if smem_needed <= max_smem_bytes and best_fit == 1:
                 best_fit = cluster_n
 
-        return best_fit
+        # Widest split, but only when it divides H; otherwise the best divisor.
+        return 16 if H % 16 == 0 else best_fit
 
     @staticmethod
     def _estimate_smem_bytes(H: int, cluster_n: int, elem_size: int) -> int:

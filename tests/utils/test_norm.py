@@ -211,18 +211,30 @@ def test_rmsnorm_output_contract(shape, dtype, padded, pattern):
 
 @pytest.mark.parametrize(
     "hidden_size",
-    [8192, 16384, 32768, 40960, 49152, 57344, 58112, 65536, 98304, 131072, 262144],
+    # The last two are not multiples of 16 and exercise the divisor fallback.
+    [
+        8192,
+        16384,
+        32768,
+        40960,
+        49152,
+        57344,
+        58112,
+        65536,
+        98304,
+        131072,
+        262144,
+        100001,
+        2097160,
+    ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_norm_cluster_budget_keeps_async_copy(hidden_size, dtype):
     """A cluster size that fits the cp.async budget must be the one chosen.
 
-    ``RMSNormKernel._compute_cluster_n`` sizes the shared-memory tile that
-    ``use_async_copy`` gates, and pass 2 reloads ``x`` from that tile.  When a
-    cluster size exists whose tile fits half the opt-in limit but a smaller one
-    is returned, ``cp.async`` stays off while the per-thread fragment is still
-    large, so the fragment has to survive the reduction barrier in registers and
-    spills to local memory once it exceeds the register file.
+    ``_compute_cluster_n`` sizes the shared-memory tile that ``use_async_copy``
+    gates; picking a smaller size turns cp.async off while the per-thread
+    fragment is still large, which spills to local memory.
     """
     cutlass = pytest.importorskip("cutlass")
     from flashinfer.norm.kernels.rmsnorm import RMSNormKernel
@@ -236,8 +248,12 @@ def test_norm_cluster_budget_keeps_async_copy(hidden_size, dtype):
     if kernel.sm_version < 90:
         pytest.skip("cluster reduction requires SM90+")
 
+    # A cluster that does not divide H leaves the row tail uncovered.
+    assert hidden_size % kernel.cluster_n == 0
+
     elem_size = cute_dtype.width // 8
-    optin = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+    device = torch.cuda.current_device()
+    optin = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
     affordable = [
         cluster_n
         for cluster_n in (1, 2, 4, 8, 16)
@@ -246,7 +262,10 @@ def test_norm_cluster_budget_keeps_async_copy(hidden_size, dtype):
         <= optin // 2
     ]
     if not affordable:
-        return  # too large for the occupancy target; the fallback path applies
+        pytest.skip(
+            f"no cluster_n fits the occupancy target at hidden_size={hidden_size}; "
+            f"got cluster_n={kernel.cluster_n}"
+        )
 
     assert kernel.cluster_n in affordable, (
         f"cluster_n={kernel.cluster_n} for hidden_size={hidden_size} {dtype}: "
@@ -254,6 +273,43 @@ def test_norm_cluster_budget_keeps_async_copy(hidden_size, dtype):
         f"{'on' if kernel.use_async_copy else 'off'}"
     )
     assert kernel.use_async_copy
+
+
+@pytest.mark.parametrize(
+    "hidden_size,dtype",
+    [
+        (65536, torch.float16),  # cluster_n=2
+        (58112, torch.bfloat16),  # cluster_n=2 at the cp.async threshold
+        (131072, torch.float16),  # cluster_n=4
+        (163840, torch.float32),  # cluster_n=8
+        (524288, torch.float16),  # cluster_n=16
+        (1048576, torch.float16),  # cluster_n=16 with cp.async off
+    ],
+)
+def test_norm_large_hidden_size(hidden_size, dtype):
+    """Run the per-row layouts chosen for large hidden sizes on real data.
+
+    One case per cluster size the kernel selects above the cp.async threshold,
+    including the no-candidate-fit fallback.  The layout is per row, so a small
+    batch still exercises the same cluster and cp.async configuration.
+    """
+    from flashinfer.norm import _use_cuda_norm
+
+    # The public entry point falls back to the CUDA JIT norm kernels when the
+    # CuTe DSL cannot target this device, or when the env var forces it; those
+    # layouts are not the ones under test here.
+    if _use_cuda_norm(torch.device("cuda", torch.cuda.current_device())):
+        pytest.skip("CuTe-DSL RMSNorm is not the active path on this device")
+
+    x = torch.randn(2, hidden_size, device="cuda", dtype=dtype)
+    w = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+    y_ref = llama_rms_norm(x, w)
+    y = flashinfer.norm.rmsnorm(x, w)
+
+    # Scale with the storage dtype; bf16 rounding is ~1.6e-2 at this size.
+    tol = max(1e-3, 4 * torch.finfo(dtype).eps)
+    torch.testing.assert_close(y_ref, y, rtol=tol, atol=tol)
 
 
 @parametrize_product(
