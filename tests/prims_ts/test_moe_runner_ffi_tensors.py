@@ -1082,15 +1082,29 @@ def test_partition_pair_failure_exits_launch_guard(monkeypatch):
     assert guard_events == ["enter", "exit"]
 
 
-def test_partitioned_runner_rejects_unsupported_architecture(monkeypatch):
+@pytest.mark.parametrize("capability", [(9, 0), (10, 0), (10, 3), (12, 0)])
+def test_partitioned_runner_rejects_unsupported_architecture(monkeypatch, capability):
     tensor = SimpleNamespace(device=torch.device("cuda"))
     monkeypatch.setattr(
         "flashinfer.prims_ts.moe.partition.get_compute_capability",
-        lambda device: (9, 0),
+        lambda device: capability,
     )
 
-    with pytest.raises(NotImplementedError, match="SM100, SM103, or SM107"):
+    major, minor = capability
+    with pytest.raises(
+        NotImplementedError, match=f"only supported on SM107 .*got SM{major}{minor}"
+    ):
         validate_partition_arch(tensor)
+
+
+def test_partitioned_runner_accepts_sm107(monkeypatch):
+    tensor = SimpleNamespace(device=torch.device("cuda"))
+    monkeypatch.setattr(
+        "flashinfer.prims_ts.moe.partition.get_compute_capability",
+        lambda device: (10, 7),
+    )
+
+    validate_partition_arch(tensor)
 
 
 def test_torch_tensor_is_preserved():

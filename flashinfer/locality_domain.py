@@ -24,6 +24,8 @@ from typing import Any, Literal, Sequence, cast
 import torch
 from packaging.version import Version
 
+from .utils import get_compute_capability
+
 
 SmSplit = Literal["backfill", "strict"]
 _SM_SPLITS = ("backfill", "strict")
@@ -156,6 +158,16 @@ def _validate_sm_split(sm_split: str) -> SmSplit:
 
 
 def _preflight(device: torch.device) -> None:
+    # Resolve the device before compiling, so invalid ordinals fail cleanly.
+    try:
+        major, minor = get_compute_capability(device)
+    except Exception as exc:
+        raise LocalityDomainError(f"cannot access CUDA device {device}: {exc}") from exc
+    if (major, minor) != (10, 7):
+        raise LocalityDomainError(
+            "CUDA locality domains are only supported on SM107 (Rubin); "
+            f"device {device} is SM{major}{minor}"
+        )
     if _cuda_pluggable_allocator() is None:
         raise LocalityDomainError(
             "the installed PyTorch does not expose "
@@ -184,11 +196,6 @@ def _preflight(device: torch.device) -> None:
             "CUDA locality domains require CUDA 13.4 toolkit headers for JIT "
             f"compilation, but found CUDA {cuda_version}"
         )
-    # Resolve the device before compiling, so invalid ordinals fail cleanly.
-    try:
-        torch.cuda.get_device_properties(device)
-    except Exception as exc:
-        raise LocalityDomainError(f"cannot access CUDA device {device}: {exc}") from exc
 
 
 @functools.cache

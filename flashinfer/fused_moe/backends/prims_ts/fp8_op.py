@@ -351,7 +351,6 @@ def _prims_ts_fp8_per_tensor_scale_moe_impl(
         hidden_states=hidden_states,
     )
 
-    moe_op = _get_moe_op()
     runner_cls = PrimsTsFp8PerTensorMoERunner
     partition_kwargs = {}
     partition_call_kwargs = {}
@@ -396,6 +395,7 @@ def _prims_ts_fp8_per_tensor_scale_moe_impl(
             partition_fc1_scales=None,
             partition_fc2_scales=None,
         )
+    moe_op = _get_moe_op()
     moe_runner = runner_cls(
         moe_op,
         top_k=top_k,
@@ -676,7 +676,7 @@ def prims_ts_fp8_per_tensor_scale_moe_partitioned(
 
     Same computation as
     :func:`~flashinfer.fused_moe.prims_ts_fp8_per_tensor_scale_moe`, split
-    across two green-context partitions on SM100/SM103/SM107. Per-channel
+    across two green-context partitions on SM107 (Rubin) only. Per-channel
     weight-scale vectors and ``gemm1_clamp_limit`` are not supported.
 
     Parameters
@@ -1306,7 +1306,6 @@ def _prims_ts_fp8_block_scale_moe_impl(
         hidden_states=hidden_states,
     )
 
-    moe_op = _get_moe_op()
     runner_cls = PrimsTsFp8BlockScaleMoERunner
     partition_kwargs = {}
     partition_call_kwargs = {}
@@ -1359,6 +1358,7 @@ def _prims_ts_fp8_block_scale_moe_impl(
             partition_fc1_scales=gemm1_weights_scale,
             partition_fc2_scales=gemm2_weights_scale,
         )
+    moe_op = _get_moe_op()
     moe_runner = runner_cls(
         moe_op,
         top_k=top_k,
@@ -1495,7 +1495,7 @@ def prims_ts_fp8_block_scale_moe_partitioned(
 
     Same computation as
     :func:`~flashinfer.fused_moe.prims_ts_fp8_block_scale_moe`, split across
-    two green-context partitions on SM100/SM103/SM107. DeepSeek FP8 has a
+    two green-context partitions on SM107 (Rubin) only. DeepSeek FP8 has a
     distinct activation/scale layout and is not supported by partitioned
     execution.
 

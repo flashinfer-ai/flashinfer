@@ -158,8 +158,8 @@ def _require_prims_ts(kind: str) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     capability = get_compute_capability(_DEVICE)
-    if capability not in ((10, 0), (10, 3), (10, 7)):
-        pytest.skip("Prims-TS MoE partitioning requires SM100, SM103, or SM107")
+    if capability != (10, 7):
+        pytest.skip("Prims-TS MoE partitioning requires SM107")
     if not is_prims_ts_available():
         pytest.skip("Prims-TS dependencies are unavailable")
 
@@ -758,6 +758,61 @@ def _comparison_output(
         .mul(expert_weights.float().reshape(num_tokens, _TOP_K, 1))
         .sum(dim=1)
     )
+
+
+def test_partitioned_call_rejects_non_sm107() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if get_compute_capability(_DEVICE) == (10, 7):
+        pytest.skip("requires a non-SM107 device")
+    streams, green_resources = _green_partition_streams()
+    assert green_resources  # Keep resources alive through the call.
+    resources = MoePartitionResources(streams=streams)
+    num_tokens = 4
+    hidden_states = torch.zeros(
+        (num_tokens, _HIDDEN_SIZE), dtype=torch.bfloat16, device=_DEVICE
+    )
+    routing_logits = torch.zeros(
+        (num_tokens, _NUM_EXPERTS), dtype=torch.bfloat16, device=_DEVICE
+    )
+    fc1 = [
+        torch.empty(
+            (_NUM_EXPERTS, _INTERMEDIATE_SIZE, _HIDDEN_SIZE),
+            dtype=torch.bfloat16,
+            device=_DEVICE,
+        )
+        for _ in range(2)
+    ]
+    fc2 = [
+        torch.empty(
+            (_NUM_EXPERTS, _HIDDEN_SIZE // 2, _INTERMEDIATE_SIZE),
+            dtype=torch.bfloat16,
+            device=_DEVICE,
+        )
+        for _ in range(2)
+    ]
+
+    with pytest.raises(NotImplementedError, match="only supported on SM107"):
+        prims_ts_bf16_moe_partitioned(
+            routing_logits=routing_logits,
+            routing_bias=None,
+            topk_ids=None,
+            expert_weights=None,
+            hidden_states=hidden_states,
+            gemm1_weights=fc1,
+            gemm2_weights=fc2,
+            num_experts=_NUM_EXPERTS,
+            top_k=_TOP_K,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=_INTERMEDIATE_SIZE,
+            local_expert_offset=0,
+            local_num_experts=_NUM_EXPERTS,
+            partition_resources=resources,
+            partition_strategy="tp_n_tp_n",
+            routing_method_type=RoutingMethodType.Renormalize.value,
+            enable_pdl=False,
+        )
 
 
 @pytest.mark.parametrize("case", _EXECUTION_CASES)

@@ -30,6 +30,7 @@ import os
 import random
 
 from ..cutlass_dsl import task_scheduling_scope
+from ..utils import is_prims_ts_arch_available
 
 
 def _cute_compile_options() -> str:
@@ -2005,6 +2006,11 @@ def _resolve_runtime_sm_arch(cfg_overrides: dict) -> dict:
     detected = major * 10 + minor
     if detected not in (100, 103, 107):
         return cfg_overrides
+    if not is_prims_ts_arch_available(major, minor):
+        hint = "; install a Rubin-capable DSL" if (major, minor) == (10, 7) else ""
+        raise RuntimeError(
+            f"the installed CuTe DSL cannot natively target SM{detected}{hint}"
+        )
     resolved = dict(cfg_overrides)
     resolved["sm_arch"] = detected
     return resolved

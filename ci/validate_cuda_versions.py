@@ -19,10 +19,10 @@ CUDNN_PATTERN = re.compile(r"^[0-9]+(?:\.[0-9]+){3}$")
 ARCHITECTURE_PATTERN = re.compile(r"^[0-9]+\.[0-9]+[af]?$")
 DEPENDENCY_PACKAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 DEPENDENCY_VERSION_PATTERN = re.compile(
-    r"^(?P<release>[0-9]+(?:\.[0-9]+)*)(?:(?P<phase>\.dev|a|b|rc)(?P<serial>[0-9]+))?$"
+    r"^(?P<release>[0-9]+(?:\.[0-9]+)*)(?:(?P<phase>a|b|rc)(?P<serial>[0-9]+))?$"
 )
 DEPENDENCY_SPECIFIER_PATTERN = re.compile(
-    r"^(?P<operator>==|>=)(?P<version>[0-9]+(?:\.[0-9]+)*(?:(?:\.dev|a|b|rc)[0-9]+)?)$"
+    r"^(?P<operator>==|>=)(?P<version>[0-9]+(?:\.[0-9]+)*(?:(?:a|b|rc)[0-9]+)?)$"
 )
 DEPENDENCY_EXTRA_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 CUDA_MAJOR_PATTERN = re.compile(r"^[0-9]+$")
@@ -125,7 +125,7 @@ def _version_key(version: str) -> tuple[int, ...]:
     release = tuple(int(part) for part in match.group("release").split("."))
     release = (*release, *(0 for _ in range(4 - len(release))))
     phase = match.group("phase")
-    phase_rank = {".dev": 0, "a": 1, "b": 2, "rc": 3, None: 4}[phase]
+    phase_rank = {"a": 0, "b": 1, "rc": 2, None: 3}[phase]
     serial = int(match.group("serial") or 0)
     return (*release, phase_rank, serial)
 

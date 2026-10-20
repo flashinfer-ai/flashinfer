@@ -161,7 +161,6 @@ def prims_ts_bf16_moe_op(
         )
     )
 
-    moe_op = _get_moe_op()
     runner_cls = PrimsTsBf16MoERunner
     partition_kwargs = {}
     partition_call_kwargs = {}
@@ -200,6 +199,7 @@ def prims_ts_bf16_moe_op(
             partition_fc1_scales=None,
             partition_fc2_scales=None,
         )
+    moe_op = _get_moe_op()
     moe_runner = runner_cls(
         moe_op,
         top_k=top_k,
@@ -395,8 +395,8 @@ def prims_ts_bf16_moe_partitioned(
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     r"""Run two-way BF16 Prims-TS MoE with caller-owned shards and streams.
 
-    Same computation as :func:`~flashinfer.fused_moe.prims_ts_bf16_moe`, split
-    across two green-context partitions on SM100/SM103/SM107.
+    Same computation as :func:`~flashinfer.fused_moe.prims_ts_bf16_moe`,     split
+    across two green-context partitions on SM107 (Rubin) only.
 
     Parameters
     ----------

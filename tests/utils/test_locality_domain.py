@@ -24,15 +24,41 @@ import pytest
 import torch
 
 
+def _mock_compute_capability(monkeypatch, locality_domain, capability) -> None:
+    monkeypatch.setattr(
+        locality_domain, "get_compute_capability", lambda device: capability
+    )
+
+
 def _mock_allocator_apis(monkeypatch, locality_domain) -> None:
+    _mock_compute_capability(monkeypatch, locality_domain, (10, 7))
     monkeypatch.setattr(locality_domain, "_cuda_pluggable_allocator", lambda: object)
     monkeypatch.setattr(locality_domain, "_mem_pool", lambda: object)
     monkeypatch.setattr(locality_domain, "_use_mem_pool", lambda: object)
 
 
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (12, 0)])
+def test_preflight_rejects_non_sm107_before_compiling(monkeypatch, capability):
+    import flashinfer.locality_domain as locality_domain
+
+    _mock_compute_capability(monkeypatch, locality_domain, capability)
+
+    def _unexpected_toolkit_query():
+        raise AssertionError("architecture check must run before toolkit checks")
+
+    monkeypatch.setattr(locality_domain, "_get_cuda_version", _unexpected_toolkit_query)
+    major, minor = capability
+    with pytest.raises(
+        locality_domain.LocalityDomainError,
+        match=f"only supported on SM107 .* is SM{major}{minor}",
+    ):
+        locality_domain._preflight(torch.device("cuda:0"))
+
+
 def test_preflight_rejects_missing_pluggable_allocator(monkeypatch):
     import flashinfer.locality_domain as locality_domain
 
+    _mock_compute_capability(monkeypatch, locality_domain, (10, 7))
     monkeypatch.setattr(locality_domain, "_cuda_pluggable_allocator", lambda: None)
     with pytest.raises(
         locality_domain.LocalityDomainError,

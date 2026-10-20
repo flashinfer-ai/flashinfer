@@ -446,7 +446,7 @@ def prims_ts_fp4_block_scale_moe_partitioned(
 
     Same computation as
     :func:`~flashinfer.fused_moe.prims_ts_fp4_block_scale_moe`, split across
-    two green-context partitions on SM100/SM103/SM107.
+    two green-context partitions on SM107 (Rubin) only.
 
     Parameters
     ----------

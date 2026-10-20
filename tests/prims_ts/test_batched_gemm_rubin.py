@@ -91,17 +91,35 @@ def test_rubin_architecture_limits():
 
 
 def test_runtime_architecture_detection(monkeypatch):
-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
-        _resolve_runtime_sm_arch,
+    from flashinfer.prims_ts.batched_gemm import (
+        batched_gemm_run,
     )
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 7))
-    assert _resolve_runtime_sm_arch({"tile_n": 64}) == {
+    monkeypatch.setattr(
+        batched_gemm_run, "is_prims_ts_arch_available", lambda major, minor: True
+    )
+    assert batched_gemm_run._resolve_runtime_sm_arch({"tile_n": 64}) == {
         "tile_n": 64,
         "sm_arch": 107,
     }
-    assert _resolve_runtime_sm_arch({"sm_arch": 100}) == {"sm_arch": 100}
+    assert batched_gemm_run._resolve_runtime_sm_arch({"sm_arch": 100}) == {
+        "sm_arch": 100
+    }
+
+
+def test_runtime_architecture_detection_rejects_missing_native_target(monkeypatch):
+    from flashinfer.prims_ts.batched_gemm import batched_gemm_run
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 7))
+    monkeypatch.setattr(
+        batched_gemm_run, "is_prims_ts_arch_available", lambda major, minor: False
+    )
+
+    with pytest.raises(RuntimeError, match="cannot natively target SM107"):
+        batched_gemm_run._resolve_runtime_sm_arch({"tile_n": 64})
 
 
 @pytest.mark.parametrize(

@@ -47,7 +47,7 @@ _SUPPORTED_ACTIVATIONS = (
 _PRIMS_TS_ARCHS = ((10, 0), (10, 3), (10, 7))
 _UNSUPPORTED_DEVICE_REASON = (
     "requires an SM100, SM103, or SM107 CUDA device that the installed "
-    "CuTe DSL can natively target"
+    "CuTe DSL can natively target; on SM107, install a Rubin-capable DSL"
 )
 
 

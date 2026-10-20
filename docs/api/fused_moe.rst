@@ -707,7 +707,8 @@ match the corresponding ``trtllm_*`` APIs.
     prims_ts_fp8_per_tensor_scale_moe
 
 The ``*_partitioned`` variants split one MoE layer across two green-context
-streams with caller-owned weight shards (see
+streams with caller-owned weight shards and are supported on SM107 (Rubin)
+only (see
 ``flashinfer.prims_ts.moe.MoePartitionResources`` and
 ``flashinfer.prims_ts.moe.shard_prepared_moe_weights``):
 

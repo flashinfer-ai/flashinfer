@@ -101,11 +101,10 @@ def validate_partition_arch(tensor: torch.Tensor) -> None:
     if tensor.device.type != "cuda":
         return
     major, minor = get_compute_capability(tensor.device)
-    sm_arch = major * 10 + minor
-    if sm_arch not in (100, 103, 107):
+    if (major, minor) != (10, 7):
         raise NotImplementedError(
-            "Prims-TS MoE partitioning requires SM100, SM103, or SM107, "
-            f"got SM{sm_arch}"
+            "Prims-TS partitioned MoE (uGPU locality domains) is only supported on "
+            f"SM107 (Rubin); got SM{major}{minor}"
         )
 
 
