@@ -311,7 +311,9 @@ helps when K/V loads bound the kernel (16-bit K/V on long sequences). Pairing
 halves the CTA count, so it suits grids that still fill the GPU; a sequence
 with an odd number of Q tiles leaves the second instance of its last CTA idle.
 Causal plans pair too: the CTA streams the K/V range of its later Q tile, and
-the earlier tile masks the extra K/V tile that range can add.
+the earlier tile masks the extra K/V tile that range can add. Paged decode
+plans pair the same way; see
+[Query pairing](kernels/fmha_decode/README.md#query-pairing).
 
 Every plan takes `softmax_rescale_threshold_log2` (0 to 8, default 8). On the
 Q64/KV256 and Q128/KV128 tiles of block-sparse plans, and on dense Q64/KV256
@@ -502,5 +504,6 @@ pytest -q \
   tests/attention/test_attention_ts_block_sparse.py \
   tests/attention/test_attention_ts_features.py \
   tests/attention/test_attention_ts_mla_decode.py \
+  tests/attention/test_attention_ts_query_paired.py \
   tests/attention/test_attention_ts_sage.py
 ```
