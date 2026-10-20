@@ -1,7 +1,14 @@
 import functools
+import threading
 
 from .jit.core import logger
 from .jit.tllm_utils import gen_trtllm_utils_module
+
+
+# functools.cache does not stop concurrent first calls from each running the
+# loader, so serialize them; otherwise every waiting thread would rerun a
+# failed build and log its own warning.
+_load_lock = threading.Lock()
 
 
 @functools.cache
@@ -24,7 +31,8 @@ def _load_trtllm_utils_module():
 
 
 def get_trtllm_utils_module():
-    module, error = _load_trtllm_utils_module()
+    with _load_lock:
+        module, error = _load_trtllm_utils_module()
     if error is not None:
         raise RuntimeError(
             "JIT module trtllm_utils failed to build earlier in this process"
