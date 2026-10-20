@@ -3384,8 +3384,9 @@ class TmemSPResource(MemoryResource):
         """Cache this lane's Sage ``sfQ`` word and the work tile's first ``sfK`` atom.
 
         The lane's Q row is row ``(warp % 4) * 32 + lane`` of token range
-        ``2 * seq + q_half`` of head ``head``, which is local head ``head %
-        h_r`` of KV head ``head // h_r``; ``_SageQSection.tile_index`` names
+        ``2 * seq + q_half``, at most the head's last token range, of head
+        ``head``, which is local head ``head % h_r`` of KV head ``head //
+        h_r``; ``_SageQSection.tile_index`` names
         the prepared Q tile holding it. The ``sfK`` atoms are the
         sequence's K-token section (``_SageKSection``), padded to whole K
         tiles; the max pass addresses each tile's atoms from the first one.
@@ -3406,7 +3407,13 @@ class TmemSPResource(MemoryResource):
             kv_head_idx=kv_head_coord,
             num_kv_heads=self.num_kv_heads,
         )
-        token_tile = seq_coord * Int32(cfg.work_tile_q_seq_tiles) + Int32(self.q_half)
+        # The second Q half of a sequence's last work tile can start past its
+        # last Q tile; its rows are past the sequence and their output is
+        # dropped, so it reads the head's last tile instead of the next one's.
+        token_tile = cute.math.min(
+            seq_coord * Int32(cfg.work_tile_q_seq_tiles) + Int32(self.q_half),
+            Int32(layout.q_rows.token_tiles - 1),
+        )
         sage_q_scale = load_sage_q_scale(
             layout,
             self.sage_scales,
