@@ -63,7 +63,7 @@ import math
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TypeVar, overload
 
 import torch
 import tvm_ffi
@@ -2429,11 +2429,22 @@ class _BindingCache:
 BINDING_CACHE = _BindingCache()
 
 
+_BindingT = TypeVar("_BindingT", bound="_Binding")
+
+
+@overload
+def _binding(key: tuple, make_plan: Callable[[], _Plan]) -> _Binding: ...
+
+
+@overload
 def _binding(
-    key: tuple, make_plan: Callable[[], _Plan], binding_cls: type = _Binding
-) -> _Binding:
+    key: tuple, make_plan: Callable[[], _Plan], binding_cls: type[_BindingT]
+) -> _BindingT: ...
+
+
+def _binding(key, make_plan, binding_cls=_Binding):
     """The cached binding of ``key``, planned on a miss (a ``binding_cls`` instance: :class:`_Binding`, or
-    :class:`_NopeBinding` for the NoPE entries).
+    :class:`_NopeBinding` for the NoPE entries; the overloads give the call site that class).
 
     During CUDA-graph capture the plan is built privately and neither read from
     nor stored in the cache: its ``topk_length`` vector would live in the graph's
@@ -3349,7 +3360,9 @@ class DSANopeTrainRunner(DSATrainRunner):
 
     fresh_dkv: bool = False
 
-    def backward(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    # The NoPE runner returns ``(dq, dkv)`` by contract (class docstring); the base runner's
+    # ``(dq_latent, dq_rope, dkv_latent, dk_rope)`` tuple has no rope members here.
+    def backward(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:  # type: ignore[override]
         if not self.has_backward:
             raise NotImplementedError(
                 "this runner was prepared without the backward (pass dout / backward=True)"
