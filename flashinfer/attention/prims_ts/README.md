@@ -333,6 +333,13 @@ Sage plan. A dense plan may omit `q_block_size` and `kv_block_size`; each then
 defaults to 128, which selects the Q128/KV128 tile. Block-sparse plans require
 both.
 
+A dense Q128 plan (`head_dim=128`, `q_block_size * Hq / Hkv >= 128`) accepts
+`query_paired=True`: each CTA then runs two consecutive Q128 tiles of one
+sequence and KV head over a single K/V stream and loads each K/V tile once for
+both. Pairing halves the CTA count, so it suits grids that still fill the GPU.
+A causal CTA streams the K/V range of its later Q tile, and the earlier tile
+masks the keys past its own range.
+
 Every plan takes `softmax_rescale_threshold_log2` (0 to 8, default 8). On the
 Q64/KV256 and Q128/KV128 tiles of dense and block-sparse plans, a row keeps its
 softmax exponent anchor while a tile raises the row maximum by at most that

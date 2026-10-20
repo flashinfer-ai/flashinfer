@@ -173,6 +173,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         o_data_type: torch.dtype | None = None,
         sage_config: SageAttentionConfig | None = None,
         softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
+        query_paired: bool = False,
     ) -> None:
         """Choose a legal profile and allocate reusable routing capacity.
 
@@ -194,6 +195,9 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         Sage plan. A dense plan may omit ``q_block_size`` and
         ``kv_block_size``; each then defaults to 128, which selects the
         Q128/KV128 Keeps tile. A block-sparse plan requires both.
+        ``query_paired=True`` makes each CTA of a dense plan process two
+        consecutive Q128 tiles over one K/V stream; it requires
+        ``head_dim=128`` and a Q128 tile (``q_block_size * Hq / Hkv >= 128``).
 
         ``share_pattern_across_kv_heads=False`` retains independent per-KV-head
         patterns. True uses a singleton head axis in BSR/bitmask inputs and
@@ -299,6 +303,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             sage=sage_config,
             use_block_sparse=use_block_sparse,
             softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+            query_paired=query_paired,
         )
         if use_proxy_routes and static.mask_type != "dense":
             raise ValueError("block-sparse proxy routes require mask_type='dense'")
