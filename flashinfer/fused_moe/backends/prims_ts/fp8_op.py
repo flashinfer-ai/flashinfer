@@ -519,6 +519,7 @@ def prims_ts_fp8_per_tensor_scale_moe(
     routing_replay_out: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
+    workspace_buffer: Optional[torch.Tensor] = None,
     *,
     weight_layout: int = 0,
     fc1_per_channel_weight_scale: Optional[torch.Tensor] = None,
@@ -584,6 +585,9 @@ def prims_ts_fp8_per_tensor_scale_moe(
     gemm1_clamp_limit : Optional[torch.Tensor]
         Reserved for TRTLLM signature compatibility; must be ``None``.
         This Prims-TS API does not support SwiGLUStep limits.
+    workspace_buffer : Optional[torch.Tensor]
+        Reserved for TRTLLM signature compatibility; must be ``None``.
+        This Prims-TS API does not take a caller-owned workspace.
     weight_layout : int
         Prims-TS weight layout enum value (default ``MajorK``). Keyword-only.
     fc1_per_channel_weight_scale : Optional[torch.Tensor]
@@ -627,6 +631,7 @@ def prims_ts_fp8_per_tensor_scale_moe(
         routing_replay_out=routing_replay_out,
         output=output,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        workspace_buffer=workspace_buffer,
         weight_layout=weight_layout,
         fc1_per_channel_weight_scale=fc1_per_channel_weight_scale,
         fc2_per_channel_weight_scale=fc2_per_channel_weight_scale,
