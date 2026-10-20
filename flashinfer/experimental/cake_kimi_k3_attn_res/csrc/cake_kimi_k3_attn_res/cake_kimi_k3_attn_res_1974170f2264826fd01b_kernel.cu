@@ -1025,6 +1025,7 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
                     }
                 }
             }
+            mbarrier_wait(output_norm_ready_addr, 0);
             asm volatile("barrier.sync 9, 288;" ::: "memory");
         }
     }

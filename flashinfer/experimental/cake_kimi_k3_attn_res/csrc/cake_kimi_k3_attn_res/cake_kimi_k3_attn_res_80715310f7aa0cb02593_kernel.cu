@@ -577,6 +577,7 @@ kernel_cake_kimi_k3_attn_res_80715310f7aa0cb02593(__nv_bfloat16* __restrict__ ou
                 consumer_stage += 1;
                 if (consumer_stage == 2) { consumer_stage = 0; consumer_phase ^= 1; }
             }
+            mbarrier_wait(output_norm_ready_addr, 0);
         }
     }
 
