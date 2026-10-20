@@ -612,10 +612,11 @@ def _cp_delta_rule_rejection_reason(
     # DV=64 with DK=128); every other CP route requires DK=DV=128.
     head_sizes = (q.shape[-1], v.shape[-1])
     if arch_major in (9, 10) and not use_gdn_cp_backend:
-        if head_sizes not in ((128, 128), (128, 64), (64, 64)):
+        if head_sizes not in CHUNKED_PREFILL_HEAD_SIZES:
             return (
                 "CP delta rule supports (head_size, head_size_v) in "
-                f"{{(128, 128), (128, 64), (64, 64)}}, got {head_sizes}"
+                f"{sorted(CHUNKED_PREFILL_HEAD_SIZES, reverse=True)}, "
+                f"got {head_sizes}"
             )
     elif head_sizes != (128, 128):
         return (
@@ -689,7 +690,8 @@ def chunk_gated_delta_rule(
         Values of shape ``[total_seq_len, num_v_heads, head_size_v]``.  Must
         be contiguous and on CUDA.  ``head_size_v`` must not exceed
         ``head_size``; ``head_size_v < head_size`` (a rectangular state) is
-        implemented by the SM90 and SM100 chunked kernels only.
+        implemented by the SM90 and SM100 chunked and CuTe-DSL CP kernels
+        only.
     g : torch.Tensor, optional
         Forget gate (alpha) of shape ``[total_seq_len, num_sab_heads]``
         where ``num_sab_heads = max(num_q_heads, num_v_heads)``.  Must be
@@ -893,8 +895,8 @@ def chunk_gated_delta_rule(
     num_v_heads = v.size(1)
     head_size = q.size(2)
     # Rectangular state: the value and output head dim may be narrower than the
-    # key one. Only the SM90 and SM100 chunked kernels implement
-    # head_size_v < head_size; CP and SM120 reject it below.
+    # key one. Only the SM90 and SM100 chunked and CuTe-DSL CP kernels
+    # implement head_size_v < head_size; the other routes reject it below.
     head_size_v = v.size(2)
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
