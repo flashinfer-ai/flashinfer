@@ -55,7 +55,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
-kernel_cake_deepgemm_dense_mqa_0ad2c368d6fd4693236d(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap SF_KV, float* __restrict__ Logits, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, int seq_len, int seq_len_kv, int stride_logits, int num_q_blocks, unsigned int* __restrict__ ScheduleMeta)
+kernel_cake_deepgemm_dense_mqa_2ad6fa9cd6e58b3ffe90(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap SF_KV, float* __restrict__ Logits, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, int seq_len, int seq_len_kv, int stride_logits, int num_q_blocks, unsigned int* __restrict__ ScheduleMeta)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -129,6 +129,67 @@ kernel_cake_deepgemm_dense_mqa_0ad2c368d6fd4693236d(const __grid_constant__ CUte
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&SF_Q))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&SF_KV))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Weights))) : "memory"); }
+    if (tid == 352) {
+        unsigned int _min_2 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
+        unsigned int start_0 = _min_2;
+        unsigned int _min_3 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
+        unsigned int end_1 = _min_3;
+        unsigned int base_2 = start_0 / 4 * 4;
+        unsigned int work_3 = (end_1 - base_2 + 255) / 256;
+        unsigned int _min_4 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
+        unsigned int start_4 = _min_4;
+        unsigned int _min_5 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
+        unsigned int end_5 = _min_5;
+        unsigned int base_6 = start_4 / 4 * 4;
+        unsigned int work_7 = (end_5 - base_6 + 255) / 256;
+        unsigned int total_work = work_7;
+        unsigned int total_cost = total_work;
+        if (total_work != 0) {
+            total_cost += 1;
+        }
+        unsigned int quotient = total_cost / (unsigned int)SM_COUNT;
+        unsigned int remainder = total_cost % (unsigned int)SM_COUNT;
+        int _min_6 = ((bid) < (remainder) ? (bid) : (remainder));
+        unsigned int begin = (unsigned int)bid * quotient + (unsigned int)_min_6;
+        int _min_7 = ((bid + 1) < (remainder) ? (bid + 1) : (remainder));
+        unsigned int end_8 = (unsigned int)(bid + 1) * quotient + (unsigned int)_min_7;
+        unsigned int first_q = 1;
+        unsigned int first_split = 0;
+        unsigned int begin_coord = total_work;
+        unsigned int end_coord = total_work;
+        if (begin != total_cost) {
+            first_q = 0;
+            unsigned int _max_0 = ((begin) > (1) ? (begin) : (1));
+            unsigned int _min_8 = ((_max_0 - 1) < (total_work - 1) ? (_max_0 - 1) : (total_work - 1));
+            first_split = _min_8;
+            begin_coord = first_split;
+        }
+        if (end_8 != total_cost) {
+            unsigned int _max_1 = ((end_8) > (1) ? (end_8) : (1));
+            unsigned int _min_9 = ((_max_1 - 1) < (total_work - 1) ? (_max_1 - 1) : (total_work - 1));
+            end_coord = _min_9;
+        }
+        unsigned int remaining = end_coord - begin_coord;
+        unsigned int pq_remaining = remaining;
+        if (pq_remaining != 0) {
+            int pq_kv_row = (int)(base_2 + first_split * 256);
+            unsigned int pq_block = 0;
+            unsigned int pq_q_first = 0;
+            if (bid == 0) {
+                pq_q_first = 1;
+            }
+            asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&KV))), "r"((int)(0)), "r"((int)(pq_kv_row)) : "memory");
+            asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&SF_KV))), "r"((int)(0)), "r"((int)(pq_kv_row / 4)) : "memory");
+            if (pq_q_first != 0) {
+                int pf_q_row = (int)(pq_block * 128);
+                int pf_sfq_row = (int)(pq_block * 32);
+                int pf_w_row = (int)(pq_block * 4);
+                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&Q))), "r"((int)(0)), "r"((int)(pf_q_row)) : "memory");
+                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&SF_Q))), "r"((int)(0)), "r"((int)(pf_sfq_row)) : "memory");
+                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&Weights))), "r"((int)(0)), "r"((int)(pf_w_row)) : "memory");
+            }
+        }
+    }
 
     // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 32 barriers)
     // Mbarriers at smem_raw[205824..206080)
@@ -203,48 +264,48 @@ kernel_cake_deepgemm_dense_mqa_0ad2c368d6fd4693236d(const __grid_constant__ CUte
     const int tmem_tmem_sf_kv = taddr + 388;
     asm volatile("griddepcontrol.wait;" ::: "memory");
     if (tid == 0) {
-        unsigned int _min_2 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
-        unsigned int start_0 = _min_2;
-        unsigned int _min_3 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
-        unsigned int end_1 = _min_3;
-        unsigned int base_2 = start_0 / 4 * 4;
-        unsigned int work_3 = (end_1 - base_2 + 255) / 256;
-        unsigned int total_work = work_3;
-        unsigned int total_cost = total_work;
-        if (total_work != 0) {
-            total_cost += 1;
+        unsigned int _min_10 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
+        unsigned int start_0_1 = _min_10;
+        unsigned int _min_11 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
+        unsigned int end_1_1 = _min_11;
+        unsigned int base_2_1 = start_0_1 / 4 * 4;
+        unsigned int work_3_1 = (end_1_1 - base_2_1 + 255) / 256;
+        unsigned int total_work_1 = work_3_1;
+        unsigned int total_cost_1 = total_work_1;
+        if (total_work_1 != 0) {
+            total_cost_1 += 1;
         }
-        unsigned int quotient = total_cost / (unsigned int)SM_COUNT;
-        unsigned int remainder = total_cost % (unsigned int)SM_COUNT;
-        int _min_4 = ((bid) < (remainder) ? (bid) : (remainder));
-        unsigned int begin = (unsigned int)bid * quotient + (unsigned int)_min_4;
-        int _min_5 = ((bid + 1) < (remainder) ? (bid + 1) : (remainder));
-        unsigned int end_4 = (unsigned int)(bid + 1) * quotient + (unsigned int)_min_5;
-        unsigned int first_q = 1;
-        unsigned int first_split = 0;
-        unsigned int begin_coord = total_work;
-        unsigned int end_coord = total_work;
-        if (begin != total_cost) {
-            first_q = 0;
-            unsigned int _max_0 = ((begin) > (1) ? (begin) : (1));
-            unsigned int _min_6 = ((_max_0 - 1) < (total_work - 1) ? (_max_0 - 1) : (total_work - 1));
-            first_split = _min_6;
-            begin_coord = first_split;
+        unsigned int quotient_1 = total_cost_1 / (unsigned int)SM_COUNT;
+        unsigned int remainder_1 = total_cost_1 % (unsigned int)SM_COUNT;
+        int _min_12 = ((bid) < (remainder_1) ? (bid) : (remainder_1));
+        unsigned int begin_1 = (unsigned int)bid * quotient_1 + (unsigned int)_min_12;
+        int _min_13 = ((bid + 1) < (remainder_1) ? (bid + 1) : (remainder_1));
+        unsigned int end_4 = (unsigned int)(bid + 1) * quotient_1 + (unsigned int)_min_13;
+        unsigned int first_q_1 = 1;
+        unsigned int first_split_1 = 0;
+        unsigned int begin_coord_1 = total_work_1;
+        unsigned int end_coord_1 = total_work_1;
+        if (begin_1 != total_cost_1) {
+            first_q_1 = 0;
+            unsigned int _max_2 = ((begin_1) > (1) ? (begin_1) : (1));
+            unsigned int _min_14 = ((_max_2 - 1) < (total_work_1 - 1) ? (_max_2 - 1) : (total_work_1 - 1));
+            first_split_1 = _min_14;
+            begin_coord_1 = first_split_1;
         }
-        if (end_4 != total_cost) {
-            unsigned int _max_1 = ((end_4) > (1) ? (end_4) : (1));
-            unsigned int _min_7 = ((_max_1 - 1) < (total_work - 1) ? (_max_1 - 1) : (total_work - 1));
-            end_coord = _min_7;
+        if (end_4 != total_cost_1) {
+            unsigned int _max_3 = ((end_4) > (1) ? (end_4) : (1));
+            unsigned int _min_15 = ((_max_3 - 1) < (total_work_1 - 1) ? (_max_3 - 1) : (total_work_1 - 1));
+            end_coord_1 = _min_15;
         }
-        unsigned int remaining = end_coord - begin_coord;
-        ScheduleMeta[2 * bid] = first_q;
-        ScheduleMeta[2 * bid + 1] = first_split;
-        ScheduleMeta[2 * SM_COUNT + bid] = remaining;
+        unsigned int remaining_1 = end_coord_1 - begin_coord_1;
+        ScheduleMeta[2 * bid] = first_q_1;
+        ScheduleMeta[2 * bid + 1] = first_split_1;
+        ScheduleMeta[2 * SM_COUNT + bid] = remaining_1;
         if (bid == 0) {
-            unsigned int _min_8 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
-            unsigned int start_1 = _min_8;
-            unsigned int _min_9 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
-            unsigned int end_2 = _min_9;
+            unsigned int _min_16 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
+            unsigned int start_1 = _min_16;
+            unsigned int _min_17 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
+            unsigned int end_2 = _min_17;
             unsigned int base_3 = start_1 / 4 * 4;
             unsigned int work_4 = (end_2 - base_3 + 255) / 256;
             ScheduleMeta[(3 * SM_COUNT + 1) / 2 * 2] = base_3;
@@ -265,52 +326,52 @@ kernel_cake_deepgemm_dense_mqa_0ad2c368d6fd4693236d(const __grid_constant__ CUte
             unsigned int wg_idx = make_warp_uniform(warp / 4);
             unsigned int math_q_stage = 0;
             unsigned int math_tmem_stage = wg_idx;
-            unsigned int first_q_1 = bid;
+            unsigned int first_q_2 = bid;
             unsigned int q_step = num_bids;
             unsigned int split_offset = 0;
-            unsigned int remaining_1 = 0;
-            unsigned int _min_41 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
-            unsigned int start_0_1 = _min_41;
-            unsigned int _min_42 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
-            unsigned int end_1_1 = _min_42;
-            unsigned int base_2_1 = start_0_1 / 4 * 4;
-            unsigned int work_3_1 = (end_1_1 - base_2_1 + 255) / 256;
-            unsigned int total_work_1 = work_3_1;
-            unsigned int total_cost_1 = total_work_1;
-            if (total_work_1 != 0) {
-                total_cost_1 += 1;
+            unsigned int remaining_2 = 0;
+            unsigned int _min_49 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
+            unsigned int start_0_2 = _min_49;
+            unsigned int _min_50 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
+            unsigned int end_1_2 = _min_50;
+            unsigned int base_2_2 = start_0_2 / 4 * 4;
+            unsigned int work_3_2 = (end_1_2 - base_2_2 + 255) / 256;
+            unsigned int total_work_2 = work_3_2;
+            unsigned int total_cost_2 = total_work_2;
+            if (total_work_2 != 0) {
+                total_cost_2 += 1;
             }
-            unsigned int quotient_1 = total_cost_1 / (unsigned int)SM_COUNT;
-            unsigned int remainder_1 = total_cost_1 % (unsigned int)SM_COUNT;
-            int _min_43 = ((bid) < (remainder_1) ? (bid) : (remainder_1));
-            unsigned int begin_1 = (unsigned int)bid * quotient_1 + (unsigned int)_min_43;
-            int _min_44 = ((bid + 1) < (remainder_1) ? (bid + 1) : (remainder_1));
-            unsigned int end_4_1 = (unsigned int)(bid + 1) * quotient_1 + (unsigned int)_min_44;
+            unsigned int quotient_2 = total_cost_2 / (unsigned int)SM_COUNT;
+            unsigned int remainder_2 = total_cost_2 % (unsigned int)SM_COUNT;
+            int _min_51 = ((bid) < (remainder_2) ? (bid) : (remainder_2));
+            unsigned int begin_2 = (unsigned int)bid * quotient_2 + (unsigned int)_min_51;
+            int _min_52 = ((bid + 1) < (remainder_2) ? (bid + 1) : (remainder_2));
+            unsigned int end_4_1 = (unsigned int)(bid + 1) * quotient_2 + (unsigned int)_min_52;
             unsigned int first_q_5 = 1;
-            unsigned int first_split_1 = 0;
-            unsigned int begin_coord_1 = total_work_1;
-            unsigned int end_coord_1 = total_work_1;
-            if (begin_1 != total_cost_1) {
+            unsigned int first_split_2 = 0;
+            unsigned int begin_coord_2 = total_work_2;
+            unsigned int end_coord_2 = total_work_2;
+            if (begin_2 != total_cost_2) {
                 first_q_5 = 0;
-                unsigned int _max_9 = ((begin_1) > (1) ? (begin_1) : (1));
-                unsigned int _min_45 = ((_max_9 - 1) < (total_work_1 - 1) ? (_max_9 - 1) : (total_work_1 - 1));
-                first_split_1 = _min_45;
-                begin_coord_1 = first_split_1;
+                unsigned int _max_11 = ((begin_2) > (1) ? (begin_2) : (1));
+                unsigned int _min_53 = ((_max_11 - 1) < (total_work_2 - 1) ? (_max_11 - 1) : (total_work_2 - 1));
+                first_split_2 = _min_53;
+                begin_coord_2 = first_split_2;
             }
-            if (end_4_1 != total_cost_1) {
-                unsigned int _max_10 = ((end_4_1) > (1) ? (end_4_1) : (1));
-                unsigned int _min_46 = ((_max_10 - 1) < (total_work_1 - 1) ? (_max_10 - 1) : (total_work_1 - 1));
-                end_coord_1 = _min_46;
+            if (end_4_1 != total_cost_2) {
+                unsigned int _max_12 = ((end_4_1) > (1) ? (end_4_1) : (1));
+                unsigned int _min_54 = ((_max_12 - 1) < (total_work_2 - 1) ? (_max_12 - 1) : (total_work_2 - 1));
+                end_coord_2 = _min_54;
             }
-            unsigned int remaining_6 = end_coord_1 - begin_coord_1;
-            first_q_1 = first_q_5;
-            split_offset = first_split_1;
-            remaining_1 = remaining_6;
+            unsigned int remaining_6 = end_coord_2 - begin_coord_2;
+            first_q_2 = first_q_5;
+            split_offset = first_split_2;
+            remaining_2 = remaining_6;
             q_step = 1;
-            unsigned int first_q_7 = first_q_1;
+            unsigned int first_q_7 = first_q_2;
             unsigned int q_step_8 = q_step;
             unsigned int split_offset_9 = split_offset;
-            unsigned int remaining_10 = remaining_1;
+            unsigned int remaining_10 = remaining_2;
             unsigned int _phase_q_full = 0;
             unsigned int _phase_umma_full = 0;
             #pragma unroll 1
@@ -321,17 +382,17 @@ kernel_cake_deepgemm_dense_mqa_0ad2c368d6fd4693236d(const __grid_constant__ CUte
                 int q_start = q_block_idx * 4;
                 int kv_start = 0;
                 unsigned int num_kv_blocks = 0;
-                unsigned int _min_47 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
-                unsigned int start_1_1 = _min_47;
-                unsigned int _min_48 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
-                unsigned int end_2_1 = _min_48;
+                unsigned int _min_55 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
+                unsigned int start_1_1 = _min_55;
+                unsigned int _min_56 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
+                unsigned int end_2_1 = _min_56;
                 unsigned int base_3_1 = start_1_1 / 4 * 4;
                 unsigned int work_4_1 = (end_2_1 - base_3_1 + 255) / 256;
                 kv_start = base_3_1 + split_offset_9 * 256;
                 unsigned int span_splits = work_4_1;
                 if (split_offset_9 < span_splits) {
-                    unsigned int _min_49 = ((span_splits - split_offset_9) < (remaining_10) ? (span_splits - split_offset_9) : (remaining_10));
-                    num_kv_blocks = _min_49;
+                    unsigned int _min_57 = ((span_splits - split_offset_9) < (remaining_10) ? (span_splits - split_offset_9) : (remaining_10));
+                    num_kv_blocks = _min_57;
                 }
                 remaining_10 -= num_kv_blocks;
                 split_offset_9 = 0;
@@ -426,52 +487,52 @@ kernel_cake_deepgemm_dense_mqa_0ad2c368d6fd4693236d(const __grid_constant__ CUte
             unsigned int load_q_stage = 0;
             unsigned int _phase_q_empty = 1;
             if (elect_sync()) {
-                unsigned int first_q_2 = bid;
+                unsigned int first_q_3 = bid;
                 unsigned int q_step_1 = num_bids;
                 unsigned int split_offset_1 = 0;
-                unsigned int remaining_2 = 0;
-                unsigned int _min_14 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
-                unsigned int start_0_2 = _min_14;
-                unsigned int _min_15 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
-                unsigned int end_1_2 = _min_15;
-                unsigned int base_2_2 = start_0_2 / 4 * 4;
-                unsigned int work_3_2 = (end_1_2 - base_2_2 + 255) / 256;
-                unsigned int total_work_2 = work_3_2;
-                unsigned int total_cost_2 = total_work_2;
-                if (total_work_2 != 0) {
-                    total_cost_2 += 1;
+                unsigned int remaining_3 = 0;
+                unsigned int _min_22 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
+                unsigned int start_0_3 = _min_22;
+                unsigned int _min_23 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
+                unsigned int end_1_3 = _min_23;
+                unsigned int base_2_3 = start_0_3 / 4 * 4;
+                unsigned int work_3_3 = (end_1_3 - base_2_3 + 255) / 256;
+                unsigned int total_work_3 = work_3_3;
+                unsigned int total_cost_3 = total_work_3;
+                if (total_work_3 != 0) {
+                    total_cost_3 += 1;
                 }
-                unsigned int quotient_2 = total_cost_2 / (unsigned int)SM_COUNT;
-                unsigned int remainder_2 = total_cost_2 % (unsigned int)SM_COUNT;
-                int _min_16 = ((bid) < (remainder_2) ? (bid) : (remainder_2));
-                unsigned int begin_2 = (unsigned int)bid * quotient_2 + (unsigned int)_min_16;
-                int _min_17 = ((bid + 1) < (remainder_2) ? (bid + 1) : (remainder_2));
-                unsigned int end_4_2 = (unsigned int)(bid + 1) * quotient_2 + (unsigned int)_min_17;
+                unsigned int quotient_3 = total_cost_3 / (unsigned int)SM_COUNT;
+                unsigned int remainder_3 = total_cost_3 % (unsigned int)SM_COUNT;
+                int _min_24 = ((bid) < (remainder_3) ? (bid) : (remainder_3));
+                unsigned int begin_3 = (unsigned int)bid * quotient_3 + (unsigned int)_min_24;
+                int _min_25 = ((bid + 1) < (remainder_3) ? (bid + 1) : (remainder_3));
+                unsigned int end_4_2 = (unsigned int)(bid + 1) * quotient_3 + (unsigned int)_min_25;
                 unsigned int first_q_5_1 = 1;
-                unsigned int first_split_2 = 0;
-                unsigned int begin_coord_2 = total_work_2;
-                unsigned int end_coord_2 = total_work_2;
-                if (begin_2 != total_cost_2) {
+                unsigned int first_split_3 = 0;
+                unsigned int begin_coord_3 = total_work_3;
+                unsigned int end_coord_3 = total_work_3;
+                if (begin_3 != total_cost_3) {
                     first_q_5_1 = 0;
-                    unsigned int _max_3 = ((begin_2) > (1) ? (begin_2) : (1));
-                    unsigned int _min_18 = ((_max_3 - 1) < (total_work_2 - 1) ? (_max_3 - 1) : (total_work_2 - 1));
-                    first_split_2 = _min_18;
-                    begin_coord_2 = first_split_2;
+                    unsigned int _max_5 = ((begin_3) > (1) ? (begin_3) : (1));
+                    unsigned int _min_26 = ((_max_5 - 1) < (total_work_3 - 1) ? (_max_5 - 1) : (total_work_3 - 1));
+                    first_split_3 = _min_26;
+                    begin_coord_3 = first_split_3;
                 }
-                if (end_4_2 != total_cost_2) {
-                    unsigned int _max_4 = ((end_4_2) > (1) ? (end_4_2) : (1));
-                    unsigned int _min_19 = ((_max_4 - 1) < (total_work_2 - 1) ? (_max_4 - 1) : (total_work_2 - 1));
-                    end_coord_2 = _min_19;
+                if (end_4_2 != total_cost_3) {
+                    unsigned int _max_6 = ((end_4_2) > (1) ? (end_4_2) : (1));
+                    unsigned int _min_27 = ((_max_6 - 1) < (total_work_3 - 1) ? (_max_6 - 1) : (total_work_3 - 1));
+                    end_coord_3 = _min_27;
                 }
-                unsigned int remaining_6_1 = end_coord_2 - begin_coord_2;
-                first_q_2 = first_q_5_1;
-                split_offset_1 = first_split_2;
-                remaining_2 = remaining_6_1;
+                unsigned int remaining_6_1 = end_coord_3 - begin_coord_3;
+                first_q_3 = first_q_5_1;
+                split_offset_1 = first_split_3;
+                remaining_3 = remaining_6_1;
                 q_step_1 = 1;
-                unsigned int first_q_7_1 = first_q_2;
+                unsigned int first_q_7_1 = first_q_3;
                 unsigned int q_step_8_1 = q_step_1;
                 unsigned int split_offset_9_1 = split_offset_1;
-                unsigned int remaining_10_1 = remaining_2;
+                unsigned int remaining_10_1 = remaining_3;
                 #pragma unroll 1
                 for (unsigned int q_block_idx_1 = first_q_7_1; q_block_idx_1 < num_q_blocks; q_block_idx_1 += q_step_8_1) {
                     if (remaining_10_1 == 0) {
@@ -480,17 +541,17 @@ kernel_cake_deepgemm_dense_mqa_0ad2c368d6fd4693236d(const __grid_constant__ CUte
                     int q_start_1 = q_block_idx_1 * 4;
                     int kv_start_1 = 0;
                     unsigned int num_kv_blocks_1 = 0;
-                    unsigned int _min_20 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
-                    unsigned int start_1_2 = _min_20;
-                    unsigned int _min_21 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
-                    unsigned int end_2_2 = _min_21;
+                    unsigned int _min_28 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
+                    unsigned int start_1_2 = _min_28;
+                    unsigned int _min_29 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
+                    unsigned int end_2_2 = _min_29;
                     unsigned int base_3_2 = start_1_2 / 4 * 4;
                     unsigned int work_4_2 = (end_2_2 - base_3_2 + 255) / 256;
                     kv_start_1 = base_3_2 + split_offset_9_1 * 256;
                     unsigned int span_splits_1 = work_4_2;
                     if (split_offset_9_1 < span_splits_1) {
-                        unsigned int _min_22 = ((span_splits_1 - split_offset_9_1) < (remaining_10_1) ? (span_splits_1 - split_offset_9_1) : (remaining_10_1));
-                        num_kv_blocks_1 = _min_22;
+                        unsigned int _min_30 = ((span_splits_1 - split_offset_9_1) < (remaining_10_1) ? (span_splits_1 - split_offset_9_1) : (remaining_10_1));
+                        num_kv_blocks_1 = _min_30;
                     }
                     remaining_10_1 -= num_kv_blocks_1;
                     split_offset_9_1 = 0;
@@ -512,52 +573,52 @@ kernel_cake_deepgemm_dense_mqa_0ad2c368d6fd4693236d(const __grid_constant__ CUte
     if (warp == 9) {
         { // load_kv_main
             unsigned int load_kv_stage = 0;
-            unsigned int first_q_3 = bid;
+            unsigned int first_q_4 = bid;
             unsigned int q_step_2 = num_bids;
             unsigned int split_offset_2 = 0;
-            unsigned int remaining_3 = 0;
-            unsigned int _min_23 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
-            unsigned int start_0_3 = _min_23;
-            unsigned int _min_24 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
-            unsigned int end_1_3 = _min_24;
-            unsigned int base_2_3 = start_0_3 / 4 * 4;
-            unsigned int work_3_3 = (end_1_3 - base_2_3 + 255) / 256;
-            unsigned int total_work_3 = work_3_3;
-            unsigned int total_cost_3 = total_work_3;
-            if (total_work_3 != 0) {
-                total_cost_3 += 1;
+            unsigned int remaining_4 = 0;
+            unsigned int _min_31 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
+            unsigned int start_0_4 = _min_31;
+            unsigned int _min_32 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
+            unsigned int end_1_4 = _min_32;
+            unsigned int base_2_4 = start_0_4 / 4 * 4;
+            unsigned int work_3_4 = (end_1_4 - base_2_4 + 255) / 256;
+            unsigned int total_work_4 = work_3_4;
+            unsigned int total_cost_4 = total_work_4;
+            if (total_work_4 != 0) {
+                total_cost_4 += 1;
             }
-            unsigned int quotient_3 = total_cost_3 / (unsigned int)SM_COUNT;
-            unsigned int remainder_3 = total_cost_3 % (unsigned int)SM_COUNT;
-            int _min_25 = ((bid) < (remainder_3) ? (bid) : (remainder_3));
-            unsigned int begin_3 = (unsigned int)bid * quotient_3 + (unsigned int)_min_25;
-            int _min_26 = ((bid + 1) < (remainder_3) ? (bid + 1) : (remainder_3));
-            unsigned int end_4_3 = (unsigned int)(bid + 1) * quotient_3 + (unsigned int)_min_26;
+            unsigned int quotient_4 = total_cost_4 / (unsigned int)SM_COUNT;
+            unsigned int remainder_4 = total_cost_4 % (unsigned int)SM_COUNT;
+            int _min_33 = ((bid) < (remainder_4) ? (bid) : (remainder_4));
+            unsigned int begin_4 = (unsigned int)bid * quotient_4 + (unsigned int)_min_33;
+            int _min_34 = ((bid + 1) < (remainder_4) ? (bid + 1) : (remainder_4));
+            unsigned int end_4_3 = (unsigned int)(bid + 1) * quotient_4 + (unsigned int)_min_34;
             unsigned int first_q_5_2 = 1;
-            unsigned int first_split_3 = 0;
-            unsigned int begin_coord_3 = total_work_3;
-            unsigned int end_coord_3 = total_work_3;
-            if (begin_3 != total_cost_3) {
+            unsigned int first_split_4 = 0;
+            unsigned int begin_coord_4 = total_work_4;
+            unsigned int end_coord_4 = total_work_4;
+            if (begin_4 != total_cost_4) {
                 first_q_5_2 = 0;
-                unsigned int _max_5 = ((begin_3) > (1) ? (begin_3) : (1));
-                unsigned int _min_27 = ((_max_5 - 1) < (total_work_3 - 1) ? (_max_5 - 1) : (total_work_3 - 1));
-                first_split_3 = _min_27;
-                begin_coord_3 = first_split_3;
+                unsigned int _max_7 = ((begin_4) > (1) ? (begin_4) : (1));
+                unsigned int _min_35 = ((_max_7 - 1) < (total_work_4 - 1) ? (_max_7 - 1) : (total_work_4 - 1));
+                first_split_4 = _min_35;
+                begin_coord_4 = first_split_4;
             }
-            if (end_4_3 != total_cost_3) {
-                unsigned int _max_6 = ((end_4_3) > (1) ? (end_4_3) : (1));
-                unsigned int _min_28 = ((_max_6 - 1) < (total_work_3 - 1) ? (_max_6 - 1) : (total_work_3 - 1));
-                end_coord_3 = _min_28;
+            if (end_4_3 != total_cost_4) {
+                unsigned int _max_8 = ((end_4_3) > (1) ? (end_4_3) : (1));
+                unsigned int _min_36 = ((_max_8 - 1) < (total_work_4 - 1) ? (_max_8 - 1) : (total_work_4 - 1));
+                end_coord_4 = _min_36;
             }
-            unsigned int remaining_6_2 = end_coord_3 - begin_coord_3;
-            first_q_3 = first_q_5_2;
-            split_offset_2 = first_split_3;
-            remaining_3 = remaining_6_2;
+            unsigned int remaining_6_2 = end_coord_4 - begin_coord_4;
+            first_q_4 = first_q_5_2;
+            split_offset_2 = first_split_4;
+            remaining_4 = remaining_6_2;
             q_step_2 = 1;
-            unsigned int first_q_7_2 = first_q_3;
+            unsigned int first_q_7_2 = first_q_4;
             unsigned int q_step_8_2 = q_step_2;
             unsigned int split_offset_9_2 = split_offset_2;
-            unsigned int remaining_10_2 = remaining_3;
+            unsigned int remaining_10_2 = remaining_4;
             unsigned int _phase_kv_empty = 1;
             #pragma unroll 1
             for (unsigned int q_block_idx_2 = first_q_7_2; q_block_idx_2 < num_q_blocks; q_block_idx_2 += q_step_8_2) {
@@ -567,17 +628,17 @@ kernel_cake_deepgemm_dense_mqa_0ad2c368d6fd4693236d(const __grid_constant__ CUte
                 int q_start_2 = q_block_idx_2 * 4;
                 int kv_start_2 = 0;
                 unsigned int num_kv_blocks_2 = 0;
-                unsigned int _min_29 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
-                unsigned int start_1_3 = _min_29;
-                unsigned int _min_30 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
-                unsigned int end_2_3 = _min_30;
+                unsigned int _min_37 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
+                unsigned int start_1_3 = _min_37;
+                unsigned int _min_38 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
+                unsigned int end_2_3 = _min_38;
                 unsigned int base_3_3 = start_1_3 / 4 * 4;
                 unsigned int work_4_3 = (end_2_3 - base_3_3 + 255) / 256;
                 kv_start_2 = base_3_3 + split_offset_9_2 * 256;
                 unsigned int span_splits_2 = work_4_3;
                 if (split_offset_9_2 < span_splits_2) {
-                    unsigned int _min_31 = ((span_splits_2 - split_offset_9_2) < (remaining_10_2) ? (span_splits_2 - split_offset_9_2) : (remaining_10_2));
-                    num_kv_blocks_2 = _min_31;
+                    unsigned int _min_39 = ((span_splits_2 - split_offset_9_2) < (remaining_10_2) ? (span_splits_2 - split_offset_9_2) : (remaining_10_2));
+                    num_kv_blocks_2 = _min_39;
                 }
                 remaining_10_2 -= num_kv_blocks_2;
                 split_offset_9_2 = 0;
@@ -606,52 +667,52 @@ kernel_cake_deepgemm_dense_mqa_0ad2c368d6fd4693236d(const __grid_constant__ CUte
             unsigned int mma_kv_stage = 0;
             unsigned int mma_tmem_stage = 0;
             bool _elect_sync_0 = elect_sync();
-            unsigned int first_q_4 = bid;
+            unsigned int first_q_6 = bid;
             unsigned int q_step_3 = num_bids;
             unsigned int split_offset_3 = 0;
-            unsigned int remaining_4 = 0;
-            unsigned int _min_32 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
-            unsigned int start_0_4 = _min_32;
-            unsigned int _min_33 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
-            unsigned int end_1_4 = _min_33;
-            unsigned int base_2_4 = start_0_4 / 4 * 4;
-            unsigned int work_3_4 = (end_1_4 - base_2_4 + 255) / 256;
-            unsigned int total_work_4 = work_3_4;
-            unsigned int total_cost_4 = total_work_4;
-            if (total_work_4 != 0) {
-                total_cost_4 += 1;
+            unsigned int remaining_5 = 0;
+            unsigned int _min_40 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
+            unsigned int start_0_5 = _min_40;
+            unsigned int _min_41 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
+            unsigned int end_1_5 = _min_41;
+            unsigned int base_2_5 = start_0_5 / 4 * 4;
+            unsigned int work_3_5 = (end_1_5 - base_2_5 + 255) / 256;
+            unsigned int total_work_5 = work_3_5;
+            unsigned int total_cost_5 = total_work_5;
+            if (total_work_5 != 0) {
+                total_cost_5 += 1;
             }
-            unsigned int quotient_4 = total_cost_4 / (unsigned int)SM_COUNT;
-            unsigned int remainder_4 = total_cost_4 % (unsigned int)SM_COUNT;
-            int _min_34 = ((bid) < (remainder_4) ? (bid) : (remainder_4));
-            unsigned int begin_4 = (unsigned int)bid * quotient_4 + (unsigned int)_min_34;
-            int _min_35 = ((bid + 1) < (remainder_4) ? (bid + 1) : (remainder_4));
-            unsigned int end_4_4 = (unsigned int)(bid + 1) * quotient_4 + (unsigned int)_min_35;
+            unsigned int quotient_5 = total_cost_5 / (unsigned int)SM_COUNT;
+            unsigned int remainder_5 = total_cost_5 % (unsigned int)SM_COUNT;
+            int _min_42 = ((bid) < (remainder_5) ? (bid) : (remainder_5));
+            unsigned int begin_5 = (unsigned int)bid * quotient_5 + (unsigned int)_min_42;
+            int _min_43 = ((bid + 1) < (remainder_5) ? (bid + 1) : (remainder_5));
+            unsigned int end_4_4 = (unsigned int)(bid + 1) * quotient_5 + (unsigned int)_min_43;
             unsigned int first_q_5_3 = 1;
-            unsigned int first_split_4 = 0;
-            unsigned int begin_coord_4 = total_work_4;
-            unsigned int end_coord_4 = total_work_4;
-            if (begin_4 != total_cost_4) {
+            unsigned int first_split_5 = 0;
+            unsigned int begin_coord_5 = total_work_5;
+            unsigned int end_coord_5 = total_work_5;
+            if (begin_5 != total_cost_5) {
                 first_q_5_3 = 0;
-                unsigned int _max_7 = ((begin_4) > (1) ? (begin_4) : (1));
-                unsigned int _min_36 = ((_max_7 - 1) < (total_work_4 - 1) ? (_max_7 - 1) : (total_work_4 - 1));
-                first_split_4 = _min_36;
-                begin_coord_4 = first_split_4;
+                unsigned int _max_9 = ((begin_5) > (1) ? (begin_5) : (1));
+                unsigned int _min_44 = ((_max_9 - 1) < (total_work_5 - 1) ? (_max_9 - 1) : (total_work_5 - 1));
+                first_split_5 = _min_44;
+                begin_coord_5 = first_split_5;
             }
-            if (end_4_4 != total_cost_4) {
-                unsigned int _max_8 = ((end_4_4) > (1) ? (end_4_4) : (1));
-                unsigned int _min_37 = ((_max_8 - 1) < (total_work_4 - 1) ? (_max_8 - 1) : (total_work_4 - 1));
-                end_coord_4 = _min_37;
+            if (end_4_4 != total_cost_5) {
+                unsigned int _max_10 = ((end_4_4) > (1) ? (end_4_4) : (1));
+                unsigned int _min_45 = ((_max_10 - 1) < (total_work_5 - 1) ? (_max_10 - 1) : (total_work_5 - 1));
+                end_coord_5 = _min_45;
             }
-            unsigned int remaining_6_3 = end_coord_4 - begin_coord_4;
-            first_q_4 = first_q_5_3;
-            split_offset_3 = first_split_4;
-            remaining_4 = remaining_6_3;
+            unsigned int remaining_6_3 = end_coord_5 - begin_coord_5;
+            first_q_6 = first_q_5_3;
+            split_offset_3 = first_split_5;
+            remaining_5 = remaining_6_3;
             q_step_3 = 1;
-            unsigned int first_q_7_3 = first_q_4;
+            unsigned int first_q_7_3 = first_q_6;
             unsigned int q_step_8_3 = q_step_3;
             unsigned int split_offset_9_3 = split_offset_3;
-            unsigned int remaining_10_3 = remaining_4;
+            unsigned int remaining_10_3 = remaining_5;
             unsigned int _phase_q_full_1 = 0;
             unsigned int _phase_kv_full = 0;
             unsigned int _phase_umma_empty = 1;
@@ -663,17 +724,17 @@ kernel_cake_deepgemm_dense_mqa_0ad2c368d6fd4693236d(const __grid_constant__ CUte
                 int q_start_3 = q_block_idx_3 * 4;
                 int kv_start_3 = 0;
                 unsigned int num_kv_blocks_3 = 0;
-                unsigned int _min_38 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
-                unsigned int start_1_4 = _min_38;
-                unsigned int _min_39 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
-                unsigned int end_2_4 = _min_39;
+                unsigned int _min_46 = (((unsigned int)cu_seq_len_k_start[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_start[0]) : ((unsigned int)seq_len_kv));
+                unsigned int start_1_4 = _min_46;
+                unsigned int _min_47 = (((unsigned int)cu_seq_len_k_end[0]) < ((unsigned int)seq_len_kv) ? ((unsigned int)cu_seq_len_k_end[0]) : ((unsigned int)seq_len_kv));
+                unsigned int end_2_4 = _min_47;
                 unsigned int base_3_4 = start_1_4 / 4 * 4;
                 unsigned int work_4_4 = (end_2_4 - base_3_4 + 255) / 256;
                 kv_start_3 = base_3_4 + split_offset_9_3 * 256;
                 unsigned int span_splits_3 = work_4_4;
                 if (split_offset_9_3 < span_splits_3) {
-                    unsigned int _min_40 = ((span_splits_3 - split_offset_9_3) < (remaining_10_3) ? (span_splits_3 - split_offset_9_3) : (remaining_10_3));
-                    num_kv_blocks_3 = _min_40;
+                    unsigned int _min_48 = ((span_splits_3 - split_offset_9_3) < (remaining_10_3) ? (span_splits_3 - split_offset_9_3) : (remaining_10_3));
+                    num_kv_blocks_3 = _min_48;
                 }
                 remaining_10_3 -= num_kv_blocks_3;
                 split_offset_9_3 = 0;
@@ -793,8 +854,8 @@ kernel_cake_deepgemm_dense_mqa_0ad2c368d6fd4693236d(const __grid_constant__ CUte
                     unsigned int q_block_idx_4 = 0;
                     int clean_begin = clean_task % clean_tiles_per_row * 1024;
                     int clean_end_raw = clean_begin + 1024;
-                    int _min_10 = ((clean_end_raw) < (stride_logits) ? (clean_end_raw) : (stride_logits));
-                    int clean_end = _min_10;
+                    int _min_18 = ((clean_end_raw) < (stride_logits) ? (clean_end_raw) : (stride_logits));
+                    int clean_end = _min_18;
                     int q_start_4 = q_block_idx_4 * 4;
                     int ks0 = cu_seq_len_k_start[q_start_4];
                     int ke0 = cu_seq_len_k_end[q_start_4];
@@ -807,11 +868,11 @@ kernel_cake_deepgemm_dense_mqa_0ad2c368d6fd4693236d(const __grid_constant__ CUte
                     #pragma unroll 1
                     for (int qi = 0; qi < 1; qi++) {
                         unsigned long long row_base = (unsigned long long)(q_start_4 + qi) * (unsigned long long)stride_logits;
-                        int _min_11 = ((kv_start_4) < (clean_end) ? (kv_start_4) : (clean_end));
+                        int _min_19 = ((kv_start_4) < (clean_end) ? (kv_start_4) : (clean_end));
                         int aligned_start = (clean_begin + 3) / 4 * 4;
-                        int aligned_end = _min_11 / 4 * 4;
+                        int aligned_end = _min_19 / 4 * 4;
                         if (aligned_start >= aligned_end) {
-                            for (int j = clean_begin + lane; j < _min_11; j += 32) {
+                            for (int j = clean_begin + lane; j < _min_19; j += 32) {
                                 *(reinterpret_cast<float*>(Logits + (row_base + (unsigned long long)j)) + (0)) = -CUDART_INF_F;
                             }
                             __syncwarp();
@@ -819,14 +880,14 @@ kernel_cake_deepgemm_dense_mqa_0ad2c368d6fd4693236d(const __grid_constant__ CUte
                             for (int j_1 = clean_begin + lane; j_1 < aligned_start; j_1 += 32) {
                                 *(reinterpret_cast<float*>(Logits + (row_base + (unsigned long long)j_1)) + (0)) = -CUDART_INF_F;
                             }
-                            for (int j_2 = aligned_end + lane; j_2 < _min_11; j_2 += 32) {
+                            for (int j_2 = aligned_end + lane; j_2 < _min_19; j_2 += 32) {
                                 *(reinterpret_cast<float*>(Logits + (row_base + (unsigned long long)j_2)) + (0)) = -CUDART_INF_F;
                             }
                             __syncwarp();
                             if (elect_sync()) {
                                 for (int j_3 = aligned_start; j_3 < aligned_end; j_3 += 1024) {
-                                    int _min_12 = ((aligned_end - j_3) < (1024) ? (aligned_end - j_3) : (1024));
-                                    int bulk_elems = _min_12;
+                                    int _min_20 = ((aligned_end - j_3) < (1024) ? (aligned_end - j_3) : (1024));
+                                    int bulk_elems = _min_20;
                                     {
                                         void* _cpbulk_dst_0 = reinterpret_cast<void*>(Logits + (row_base + (unsigned long long)j_3));
                                         asm volatile(
@@ -839,16 +900,16 @@ kernel_cake_deepgemm_dense_mqa_0ad2c368d6fd4693236d(const __grid_constant__ CUte
                             }
                             __syncwarp();
                         }
-                        int _max_2 = ((coverage_end) > (clean_begin) ? (coverage_end) : (clean_begin));
-                        int aligned_start_0 = (_max_2 + 3) / 4 * 4;
+                        int _max_4 = ((coverage_end) > (clean_begin) ? (coverage_end) : (clean_begin));
+                        int aligned_start_0 = (_max_4 + 3) / 4 * 4;
                         int aligned_end_1 = clean_end / 4 * 4;
                         if (aligned_start_0 >= aligned_end_1) {
-                            for (int j_4 = _max_2 + lane; j_4 < clean_end; j_4 += 32) {
+                            for (int j_4 = _max_4 + lane; j_4 < clean_end; j_4 += 32) {
                                 *(reinterpret_cast<float*>(Logits + (row_base + (unsigned long long)j_4)) + (0)) = -CUDART_INF_F;
                             }
                             __syncwarp();
                         } else {
-                            for (int j_5 = _max_2 + lane; j_5 < aligned_start_0; j_5 += 32) {
+                            for (int j_5 = _max_4 + lane; j_5 < aligned_start_0; j_5 += 32) {
                                 *(reinterpret_cast<float*>(Logits + (row_base + (unsigned long long)j_5)) + (0)) = -CUDART_INF_F;
                             }
                             for (int j_6 = aligned_end_1 + lane; j_6 < clean_end; j_6 += 32) {
@@ -857,8 +918,8 @@ kernel_cake_deepgemm_dense_mqa_0ad2c368d6fd4693236d(const __grid_constant__ CUte
                             __syncwarp();
                             if (elect_sync()) {
                                 for (int j_7 = aligned_start_0; j_7 < aligned_end_1; j_7 += 1024) {
-                                    int _min_13 = ((aligned_end_1 - j_7) < (1024) ? (aligned_end_1 - j_7) : (1024));
-                                    int bulk_elems_1 = _min_13;
+                                    int _min_21 = ((aligned_end_1 - j_7) < (1024) ? (aligned_end_1 - j_7) : (1024));
+                                    int bulk_elems_1 = _min_21;
                                     {
                                         void* _cpbulk_dst_1 = reinterpret_cast<void*>(Logits + (row_base + (unsigned long long)j_7));
                                         asm volatile(
