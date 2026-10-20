@@ -5,6 +5,7 @@
 
 """Direct public-API tests for the frozen GDN non-CP non-CP GDN prefill routes."""
 
+import functools
 import itertools
 import math
 import os
@@ -812,8 +813,30 @@ def _forbidden_sync_names(names):
     ]
 
 
+@functools.cache
+def _profiler_records_cuda():
+    """CUPTI can fail to initialize even when CUDA execution works."""
+    value = torch.ones(1, device="cuda")
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as profile:
+        value.cpu()
+    return any(
+        event.device_type == torch.autograd.DeviceType.CUDA
+        for event in profile.events()
+    )
+
+
 def _profile_window(fn):
     """Names of the CUDA runtime/device events of ``fn`` (CPU events inside its window)."""
+
+    if not _profiler_records_cuda():
+        pytest.skip(
+            "CUDA profiler records no device activities; CUPTI may be unavailable"
+        )
 
     with (
         torch.profiler.profile(
@@ -896,10 +919,8 @@ def test_public_cake_gdn_prefill_performs_no_device_to_host_sync(
     assert torch.equal(case["output"], expected_out)
     assert torch.equal(case["output_state"], expected_state)
 
-    # The detector sees an explicit host synchronization (positive control).
-    # Profilers on some CUDA/PyTorch combinations report ``Tensor.cpu()`` only
-    # as aten::to/_to_copy, without a Memcpy DtoH or cudaMemcpy event.
-    control = _profile_window(torch.cuda.synchronize)
+    # The detector sees a device-to-host copy and its synchronization.
+    control = _profile_window(lambda: case["cu_seqlens"].cpu())
     assert _forbidden_sync_names(control), control
     # The route itself reports none.
     names = _profile_window(lambda: _launch(case, **public_kwargs))
@@ -1374,6 +1395,11 @@ def _live_arch(case):
 
 def _device_kernel_names(fn):
     """Names of the device kernels ``fn`` launches (profiler CUDA activities; copies excluded)."""
+
+    if not _profiler_records_cuda():
+        pytest.skip(
+            "CUDA profiler records no device activities; CUPTI may be unavailable"
+        )
 
     with torch.profiler.profile(
         activities=[
