@@ -109,6 +109,13 @@ def _skip_sm107_unimplemented_moe_features(request):
     if request.node.function.__name__ == "test_geglu_tanh_accuracy":
         pytest.skip("SM107 gather grouped GEMM does not implement GeGLU-tanh")
 
+    # Pins the recipe through the per-token path, which SM107 does not have.
+    if request.node.function.__name__ == "test_cute_dsl_pinned_recipe_matches_env":
+        pytest.skip(
+            "SM107 gather grouped GEMM has no a_per_token_scale pointer "
+            "(11 wrapper pointers vs Blackwell's 12)"
+        )
+
     if (
         request.node.function.__name__
         == "test_deterministic_finalize_numerical_accuracy"
