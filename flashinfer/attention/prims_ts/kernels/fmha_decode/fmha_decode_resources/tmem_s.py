@@ -869,7 +869,10 @@ class TmemSResource(DecodeGenResourceBase):
             assert not cfg.uses_int32_scores, (
                 "staged head-dim BMM1 does not seed scores"
             )
-            mma_k_steps = cfg.head_dim_kv_stage // _mma_k_step_qk(cfg)
+            mma_k_steps = min(
+                cfg.head_dim_kv_stage,
+                cfg.headdim - head_dim_stage_idx * cfg.head_dim_kv_stage,
+            ) // _mma_k_step_qk(cfg)
             if prims.elect_sync():
                 # Peel the first MMA so overwrite-vs-accumulate remains a
                 # compile-time value rather than loop-carried state.

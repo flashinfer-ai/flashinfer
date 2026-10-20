@@ -157,6 +157,15 @@ wrapper.plan(...)  # geometry, capacity, dtypes, workspace; outside capture
 wrapper.run(...)   # live indexer IDs and request metadata; graph hot path
 ```
 
+`count_current_block_in_topk=True` preserves the completed-block selection
+contract and appends the current block only while it is incomplete. Set False
+to select up to `block_topk` historical blocks and always append the current
+block, including when its last token completes it. For query position `p`,
+the live ID prefix then has `min(block_topk, p // kv_block_size)` entries,
+all strictly less than `p // kv_block_size`. No live-count tensor is required.
+Pass the same option to workspace sizing and planning. Both modes accept
+independent per-KV-head patterns and fixed or packed queries.
+
 `plan` binds the single caller-owned byte workspace and fixes
 `batch_size`, `group_size`, head geometry, `block_topk`,
 `max_seq_len_kv`, dtypes, and packed-versus-fixed Q layout. The first eager
@@ -174,6 +183,19 @@ layout, using the same value for workspace sizing and planning. Q lengths need n
 be divisible by a suggested group: packed mode permits a shorter final route,
 while fixed mode may append consecutive semantic dummy rows and discard their
 outputs.
+
+For request-aligned fixed Q, `run(..., seq_lens=kv_lengths)` may omit
+`token_to_request` and `query_positions`. `kv_lengths` is a contiguous CUDA
+Int32/Int64 `[B]` tensor including the request's `Nq * G` query tokens.
+The existing attention/metadata kernels derive request IDs and positions
+without allocating per-token metadata or launching another preparation
+kernel. Nonpositive KV lengths mark inactive requests; positive lengths must
+cover all query tokens. Packed Q and arbitrary mappings continue to accept
+explicit per-token metadata.
+
+Packed Q uses a bounded `[D, Hq, total_q_tokens]` TensorMap. Per-route masks
+handle tiles crossing a request boundary, and the physical token extent
+bounds the final tile. FP8 queries need no extra tail allocation or staging copy.
 
 `split_kv=False` selects nonsplit execution and omits reduction scratch;
 `split_kv=True` permits useful automatic splitting. The caller chooses the
@@ -204,11 +226,18 @@ membership storage is retained until all softmax consumers finish the item.
 The same paths support fixed and packed Q, including partial and empty packed
 groups. `split_kv=False` disables splitting, not persistent scheduling.
 
-The production specialization supports D64/D128/D256, matching FP16/BF16
+The production specialization supports D64/D128/D192/D256, matching FP16/BF16
 Q/K/V/output, or FP8 E4M3 Q/K/V with FP16/BF16 output. It is causal and
 non-windowed, uses KV128 for Q1--Q8, and requires
 `group_size * (Hq / Hkv) <= TileQ128`. Groups exceeding 64 token/head rows
 use TileQ128; per-fragment query membership still occupies one byte.
+Equal Q/K/V D192 uses the same sparse dtype contract, with native
+192-channel global tensors and internal
+head-dimension staging. FP8 uses 128-wide K/V stages; Q staging rounds to
+256 elements internally, with the last 64 supplied by TMA zero fill. The D192
+BF16/FP8 paths and bounded packed-Q loads are additionally tested on GB300/SM103
+with CUDA graphs and allocation-boundary checks. Decode's
+native logical HND cache views can use strided NHD/interleaved physical storage.
 The pure-host
 `suggest_q_token_kv_block_sparse_group_size` helper takes a caller-cached SM
 count and prefers the largest legal group that can fill one service wave using
