@@ -18,21 +18,25 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
+#if defined(__CUDACC_RTC__)
+typedef unsigned long long uint64_t;
+#else
 typedef unsigned long      uint64_t;
+#endif
 static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-template <int N>
-struct __align__(128) CakeTensorMapPack { CakeTensorMap maps[N]; };
 
+#if defined(__CUDACC_RTC__)
+typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+#else
 #include <cuda.h>
+#endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap alignment must cover the CUtensorMap CUDA ABI");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -43,6 +47,16 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
+#define CAKE_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define SMEM_RED_OFF 0
+#define SMEM_RED_STAGE_BYTES 128
+#define SMEM_RED_STRIDE 128
+#define SMEM_VMAX_SMEM_OFF 128
+#define SMEM_VMAX_SMEM_STAGE_BYTES 4096
+#define SMEM_VMAX_SMEM_STRIDE 4096
+#define SMEM_TOTAL 4224
+#define THREADS 256
 
 #include <math_constants.h>
 
@@ -52,17 +66,23 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
     return c;
 }
 
-__device__ __forceinline__ void mul_f32x2_inplace(float2* a, float2 b) {
+
+
+
+
+
+__device__ __forceinline__ void mul_f32x2_noftz_inplace(float2* a, float2 b) {
     asm("mul.rn.f32x2 %0, %0, %1;"
         : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
 }
+
 
 // ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
 
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_sage_block_sparse_attention_e46b194b07d454419fba(__nv_bfloat16* __restrict__ q_in, __nv_bfloat16* __restrict__ k_in, __nv_bfloat16* __restrict__ v_in, uint8_t* __restrict__ q_out, uint8_t* __restrict__ k_out, float* __restrict__ q_scale, float* __restrict__ k_scale, float* __restrict__ v_amax, int seqlen_q, int seqlen_k, int num_heads, int num_kv_heads, int grid_heads, int k_scale_groups, int chunks_per_bh, int q_chunks, int k_chunks)
+kernel_cake_sage_block_sparse_attention_ac8d3223970f7e4fddd8(__nv_bfloat16* __restrict__ q_in, __nv_bfloat16* __restrict__ k_in, __nv_bfloat16* __restrict__ v_in, uint8_t* __restrict__ q_out, uint8_t* __restrict__ k_out, float* __restrict__ q_scale, float* __restrict__ k_scale, float* __restrict__ v_amax, int seqlen_q, int seqlen_k, int num_heads, int num_kv_heads, int grid_heads, int k_scale_groups, int chunks_per_bh, int q_chunks, int k_chunks)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -79,6 +99,8 @@ kernel_cake_sage_block_sparse_attention_e46b194b07d454419fba(__nv_bfloat16* __re
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // Kernel setup ops
     float* red = reinterpret_cast<float*>(smem_raw + 0);
@@ -115,13 +137,8 @@ kernel_cake_sage_block_sparse_attention_e46b194b07d454419fba(__nv_bfloat16* __re
                     uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        asm volatile(
-                            "{\n\t"
-                            "shl.b32 %0, %2, 16;\n\t"
-                            "and.b32 %1, %2, 0xffff0000;\n\t"
-                            "}\n"
-                            : "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[1])
-                            : "r"(_vpairs_0[_pair]));
+                        (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
+                        (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
                     }
                 }
             }
@@ -151,10 +168,17 @@ kernel_cake_sage_block_sparse_attention_e46b194b07d454419fba(__nv_bfloat16* __re
             amax = _fmax_4;
             float _fmax_5 = fmaxf(amax, 1e-06f);
             amax = _fmax_5;
+            #if __CUDA_ARCH__ >= 1000
             const float2 _scale2_1 = {448.0f / amax, 448.0f / amax};
             #pragma unroll
             for (int _ls = 0; _ls < 4; _ls++)
-                mul_f32x2_inplace(&reinterpret_cast<float2*>(_vec_load_0)[_ls], _scale2_1);
+                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_vec_load_0)[_ls], _scale2_1);
+            #else
+            #pragma unroll
+            for (int _ls = 0; _ls < 8; _ls++) {
+                _vec_load_0[_ls] = _vec_load_0[_ls] * 448.0f / amax;
+            }
+            #endif
             if (in_range != 0) {
                 {
                     unsigned int _fp8_pk[2];
@@ -207,13 +231,8 @@ kernel_cake_sage_block_sparse_attention_e46b194b07d454419fba(__nv_bfloat16* __re
                     uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        asm volatile(
-                            "{\n\t"
-                            "shl.b32 %0, %2, 16;\n\t"
-                            "and.b32 %1, %2, 0xffff0000;\n\t"
-                            "}\n"
-                            : "=f"((&_vec_load_1[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_1[0 + _blk * 8 + _pair * 2])[1])
-                            : "r"(_vpairs_2[_pair]));
+                        (&_vec_load_1[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) << 16);
+                        (&_vec_load_1[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) & 0xffff0000u);
                     }
                 }
             }
@@ -227,13 +246,8 @@ kernel_cake_sage_block_sparse_attention_e46b194b07d454419fba(__nv_bfloat16* __re
                     uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        asm volatile(
-                            "{\n\t"
-                            "shl.b32 %0, %2, 16;\n\t"
-                            "and.b32 %1, %2, 0xffff0000;\n\t"
-                            "}\n"
-                            : "=f"((&_vec_load_2[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_2[0 + _blk * 8 + _pair * 2])[1])
-                            : "r"(_vpairs_3[_pair]));
+                        (&_vec_load_2[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) << 16);
+                        (&_vec_load_2[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) & 0xffff0000u);
                     }
                 }
             }
@@ -283,10 +297,17 @@ kernel_cake_sage_block_sparse_attention_e46b194b07d454419fba(__nv_bfloat16* __re
             float _fmax_14 = fmaxf(group_max, 1e-06f);
             group_max = _fmax_14;
             if (in_range_1 != 0) {
+                #if __CUDA_ARCH__ >= 1000
                 const float2 _scale2_4 = {448.0f / group_max, 448.0f / group_max};
                 #pragma unroll
                 for (int _ls = 0; _ls < 4; _ls++)
-                    mul_f32x2_inplace(&reinterpret_cast<float2*>(_vec_load_1)[_ls], _scale2_4);
+                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_vec_load_1)[_ls], _scale2_4);
+                #else
+                #pragma unroll
+                for (int _ls = 0; _ls < 8; _ls++) {
+                    _vec_load_1[_ls] = _vec_load_1[_ls] * 448.0f / group_max;
+                }
+                #endif
                 {
                     unsigned int _fp8_pk[2];
                     asm("{\n\t"
@@ -340,3 +361,4 @@ kernel_cake_sage_block_sparse_attention_e46b194b07d454419fba(__nv_bfloat16* __re
 }
 
 } // extern "C"
+

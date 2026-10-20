@@ -23,6 +23,9 @@ import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 
 from flashinfer.api_logging import flashinfer_api
+from flashinfer.cake_sage_block_sparse_attention_backend.cake_jit import (  # noqa: F401
+    sm120_module_key as _sm120_module_key,  # the package's specialization rule, under the SM120 tests' name
+)
 
 from .bsa_utils.cache_utils import get_jit_cache
 from .bsa_utils.testing import is_fake_mode
@@ -143,12 +146,6 @@ _sm120_compile_cache = get_jit_cache("bsa_fwd_sm120")
 
 
 @functools.cache
-def _device_capability(device_index: int) -> tuple[int, int]:
-    major, minor = torch.cuda.get_device_capability(device_index)
-    return int(major), int(minor)
-
-
-@flashinfer_api
 def bsa_attn_sm120_blk64_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -358,226 +355,8 @@ def bsa_attn_sm120_blk64_fwd(
     return out, lse if return_lse else None
 
 
-def _sm120_module_key(
-    *,
-    has_block_nums: bool,
-    block_sizes_mode: int,
-    seqlen_k: int,
-    uniform_block_count: bool,
-    contiguous_block_indices: bool,
-    block_sparse_num: int,
-) -> tuple[int, int, int, int, int]:
-    """Select the generated SM120 kernel specialization for one call.
-
-    The key is ``(HAS_BLOCK_NUMS, BLOCK_SIZES_MODE, FULL_K64_TILES,
-    UNIFORM_NONEMPTY, CONTIGUOUS_BLOCK_INDICES)``.  Per-row counts are unused
-    under a uniform count, whole 64-token K tiles are only assumed without
-    declared block sizes, and a contiguous selection only changes the kernel
-    once a row has a block to load: with ``block_sparse_num == 0`` every
-    specialization writes zeros, so the contiguous flag is cleared together
-    with ``UNIFORM_NONEMPTY``.
-    """
-    uniform_nonempty = int(uniform_block_count and block_sparse_num > 0)
-    return (
-        int(has_block_nums and not uniform_block_count),
-        int(block_sizes_mode),
-        int(block_sizes_mode == 0 and seqlen_k % _BLOCK_SIZE == 0),
-        uniform_nonempty,
-        int(contiguous_block_indices and uniform_nonempty),
-    )
-
-
-def _bsa_attn_sm120_blk64_sage_fwd_cake(
-    q_int8: torch.Tensor,
-    k_int8: torch.Tensor,
-    v_fp8: torch.Tensor,
-    q_scale: torch.Tensor,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
-    q2k_block_index: torch.Tensor,
-    block_sparse_num: int,
-    block_sizes: Optional[torch.Tensor] = None,
-    q2k_block_nums: Optional[torch.Tensor] = None,
-    softmax_scale: Optional[float] = None,
-    *,
-    out: torch.Tensor,
-    tma_descriptor_workspace: Optional[torch.Tensor] = None,
-    uniform_block_count: bool = False,
-    contiguous_block_indices: bool = False,
-    backend: str = "cake",
-) -> torch.Tensor:
-    """Run prequantized SM120 Sage block-sparse attention.
-
-    All CUDA storage is caller-owned. ``out`` is contiguous BF16 BHSD.
-    Tensor-map descriptors are passed by value as grid-constant kernel
-    parameters; ``tma_descriptor_workspace`` is accepted and ignored.
-    Q/K use contiguous INT8 BHSD, V uses contiguous FP8 E4M3 HDS, and the
-    operation supports MHA, head dimension 128, non-causal forward without LSE.
-    """
-    import tvm_ffi  # noqa: PLC0415
-
-    from flashinfer.jit.cake_sage_block_sparse_attention import (  # noqa: PLC0415
-        load_cake_sage_block_sparse_attention_module,
-    )
-
-    if backend != "cake":
-        raise ValueError(f"unsupported SM120 Sage backend: {backend!r}")
-    if (
-        type(uniform_block_count) is not bool
-        or type(contiguous_block_indices) is not bool
-    ):
-        raise TypeError("uniform_block_count and contiguous_block_indices must be bool")
-    if contiguous_block_indices and not uniform_block_count:
-        raise ValueError("contiguous_block_indices requires uniform_block_count")
-    if not isinstance(block_sparse_num, int) or isinstance(block_sparse_num, bool):
-        raise TypeError("block_sparse_num must be an integer")
-
-    tensors = {
-        "q_int8": q_int8,
-        "k_int8": k_int8,
-        "v_fp8": v_fp8,
-        "q_scale": q_scale,
-        "k_scale": k_scale,
-        "v_scale": v_scale,
-        "q2k_block_index": q2k_block_index,
-        "out": out,
-    }
-    if not all(isinstance(value, torch.Tensor) for value in tensors.values()):
-        raise TypeError("all input and output values must be torch.Tensor")
-    device = q_int8.device
-    if device.type != "cuda" or device.index != torch.cuda.current_device():
-        raise ValueError("q_int8 must use the current CUDA device")
-    for name, tensor in tensors.items():
-        if tensor.device != device or not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous on {device}")
-
-    capability = _device_capability(device.index)
-    if capability != (12, 0):
-        raise RuntimeError(
-            f"SM120 Sage attention requires compute capability 12.0, got {capability}"
-        )
-    if q_int8.dtype != torch.int8 or k_int8.dtype != torch.int8:
-        raise TypeError("q_int8 and k_int8 must use torch.int8")
-    if v_fp8.dtype != torch.float8_e4m3fn:
-        raise TypeError("v_fp8 must use torch.float8_e4m3fn")
-    if out.dtype != torch.bfloat16:
-        raise TypeError("out must use torch.bfloat16")
-    for name, tensor in (
-        ("q_scale", q_scale),
-        ("k_scale", k_scale),
-        ("v_scale", v_scale),
-    ):
-        if tensor.dtype != torch.float32:
-            raise TypeError(f"{name} must use torch.float32")
-    if q_int8.ndim != 4:
-        raise ValueError("q_int8 must be rank-4 BHSD")
-    batch, heads, seqlen_q, head_dim = (int(value) for value in q_int8.shape)
-    if batch < 1 or heads < 1 or seqlen_q < 1 or head_dim != 128:
-        raise ValueError("q_int8 must have positive B/H/Sq and head dimension 128")
-    if (
-        k_int8.ndim != 4
-        or tuple(k_int8.shape[:2]) != (batch, heads)
-        or int(k_int8.shape[3]) != 128
-    ):
-        raise ValueError("k_int8 must be BHSD MHA with head dimension 128")
-    seqlen_k = int(k_int8.shape[2])
-    if seqlen_k < 1:
-        raise ValueError("seqlen_k must be positive")
-    q_blocks = _ceil_div(seqlen_q, _BLOCK_SIZE)
-    k_blocks = _ceil_div(seqlen_k, _BLOCK_SIZE)
-    padded_k = k_blocks * _BLOCK_SIZE
-    if tuple(v_fp8.shape) != (batch, heads, 128, padded_k):
-        raise ValueError("v_fp8 must use contiguous HDS [B,H,128,padded_Sk]")
-    if tuple(out.shape) != (batch, heads, seqlen_q, 128):
-        raise ValueError("out must be contiguous BF16 BHSD [B,H,Sq,128]")
-    if tuple(q_scale.shape) != (batch, heads, _ceil_div(seqlen_q, 128) * 4):
-        raise ValueError("q_scale has an invalid shape")
-    if tuple(k_scale.shape) != (batch, heads, k_blocks):
-        raise ValueError("k_scale has an invalid shape")
-    if tuple(v_scale.shape) != (batch, heads, 128):
-        raise ValueError("v_scale has an invalid shape")
-    if q2k_block_index.ndim != 4 or tuple(q2k_block_index.shape[:3]) != (
-        batch,
-        heads,
-        q_blocks,
-    ):
-        raise ValueError("q2k_block_index must be [B,H,ceil(Sq/64),capacity]")
-    if q2k_block_index.dtype != torch.int32 or int(q2k_block_index.shape[-1]) < 1:
-        raise ValueError("q2k_block_index must be int32 with positive capacity")
-    q2k_capacity = int(q2k_block_index.shape[-1])
-    if not 0 <= block_sparse_num <= q2k_capacity:
-        raise ValueError("block_sparse_num must be in [0, q2k capacity]")
-
-    if q2k_block_nums is not None:
-        if (
-            not isinstance(q2k_block_nums, torch.Tensor)
-            or q2k_block_nums.device != device
-            or not q2k_block_nums.is_contiguous()
-            or q2k_block_nums.dtype != torch.int32
-            or tuple(q2k_block_nums.shape) != (batch, heads, q_blocks)
-        ):
-            raise ValueError("q2k_block_nums must be contiguous int32 [B,H,Q64]")
-    q2k_nums_arg = q2k_block_index if q2k_block_nums is None else q2k_block_nums
-
-    block_sizes_mode = 0
-    if block_sizes is not None:
-        if not isinstance(block_sizes, torch.Tensor) or block_sizes.device != device:
-            raise ValueError("block_sizes must be a CUDA tensor on the input device")
-        if block_sizes.dtype != torch.int32 or not block_sizes.is_contiguous():
-            raise ValueError("block_sizes must be contiguous int32")
-        expected = {
-            1: (k_blocks,),
-            2: (batch, k_blocks),
-            3: (batch, heads, k_blocks),
-        }.get(block_sizes.ndim)
-        if expected is None or tuple(block_sizes.shape) != expected:
-            raise ValueError("block_sizes must have the canonical 1D, 2D, or 3D shape")
-        block_sizes_mode = int(block_sizes.ndim)
-    block_sizes_arg = q2k_block_index if block_sizes is None else block_sizes
-
-    if softmax_scale is None:
-        softmax_scale = head_dim**-0.5
-    if isinstance(softmax_scale, bool) or not isinstance(softmax_scale, (int, float)):
-        raise TypeError("softmax_scale must be a number")
-    if not math.isfinite(float(softmax_scale)) or float(softmax_scale) <= 0.0:
-        raise ValueError("softmax_scale must be finite and positive")
-
-    module = load_cake_sage_block_sparse_attention_module(
-        *_sm120_module_key(
-            has_block_nums=q2k_block_nums is not None,
-            block_sizes_mode=block_sizes_mode,
-            seqlen_k=seqlen_k,
-            uniform_block_count=uniform_block_count,
-            contiguous_block_indices=contiguous_block_indices,
-            block_sparse_num=block_sparse_num,
-        )
-    )
-    with tvm_ffi.use_torch_stream():
-        module.run(
-            q_int8,
-            k_int8,
-            v_fp8.view(torch.uint8),
-            out,
-            q_scale,
-            k_scale,
-            v_scale,
-            q2k_block_index,
-            q2k_nums_arg,
-            block_sizes_arg,
-            seqlen_q,
-            seqlen_k,
-            heads,
-            q2k_capacity,
-            k_blocks,
-            block_sparse_num,
-            float(softmax_scale),
-            q_blocks,
-            heads,
-            batch,
-        )
-    return out
-
-
+# ``_sm120_module_key`` (imported above) is the package registry's specialization
+# rule, kept under this name for the SM120 tests.
 _sm120_sage_compile_cache = get_jit_cache("bsa_fwd_sm120_sage")
 
 
@@ -705,7 +484,11 @@ def bsa_attn_sm120_blk64_sage_fwd(
     if backend == "cake":
         if out is None:
             raise ValueError("backend='cake' requires a caller-owned out tensor")
-        return _bsa_attn_sm120_blk64_sage_fwd_cake(
+        from flashinfer.cake_sage_block_sparse_attention_backend import (  # noqa: PLC0415
+            bsa_attn_sm120_blk64_sage_fwd_cake,
+        )
+
+        return bsa_attn_sm120_blk64_sage_fwd_cake(
             q_int8,
             k_int8,
             v_fp8,
