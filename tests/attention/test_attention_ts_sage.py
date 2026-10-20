@@ -496,17 +496,6 @@ def _row_folds(case: _SageCase, exact_blocks):
                 yield stream, source, torch.tensor(indices, device="cuda")
 
 
-def _anchor_headroom_log2(case: _SageCase) -> float:
-    """Binades the kernel lets a stream's exponent anchor lag its row maximum.
-
-    KV256 tiles and block-sparse routes defer anchor updates by the plan's
-    rescale threshold; other launches anchor on the exact running maximum.
-    """
-    if case.kv_tile == 256 or case.routes != "dense":
-        return case.softmax_rescale_threshold_log2
-    return 0.0
-
-
 @torch.no_grad()
 def _reference(
     case: _SageCase, q, k, v, params, *, sm_scale, patterns, summaries, valid
@@ -518,7 +507,9 @@ def _reference(
     probability by that mass. Rows without visible mass stay zero.
     """
 
-    headroom = _anchor_headroom_log2(case)
+    # Every Sage plan runs a Keeps tile, which lets a stream's exponent anchor
+    # lag its row maximum by the plan's rescale threshold.
+    headroom = case.softmax_rescale_threshold_log2
     # The decode kernel's P scale.
     p_scale = E4M3_MAX * 2.0**-headroom
     q_real = dequantize(q, params.q_scale, case.sage.q_block_size)

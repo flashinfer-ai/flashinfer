@@ -334,10 +334,10 @@ defaults to 128, which selects the Q128/KV128 tile. Block-sparse plans require
 both.
 
 Every plan takes `softmax_rescale_threshold_log2` (0 to 8, default 8). On the
-Q64/KV256 and Q128/KV128 tiles of block-sparse plans, and on dense Q64/KV256
-plans, a row keeps its softmax exponent anchor while a tile raises the row
-maximum by at most that many binades, so the accumulated output is not
-rescaled; 0 rescales on every new maximum.
+Q64/KV256 and Q128/KV128 tiles of dense and block-sparse plans, a row keeps its
+softmax exponent anchor while a tile raises the row maximum by at most that
+many binades, so the accumulated output is not rescaled; 0 rescales on every
+new maximum.
 
 ## Sage attention
 
@@ -424,7 +424,7 @@ the scores in place in the max pass, which costs more per score.
 | Split-KV | Rejected: only the direct output store applies `sfV` and `v_mean` | No split-KV launch |
 | K transport | `RING` for every K block size: the load warp stages each K tile's scales in shared memory | `GLOBAL` for 4-token and coarser blocks: the softmax loads them before the score wait; `RING` for 1-token blocks |
 | Score scaling | `BLOCK` for 4-token and coarser blocks; `DEQUANTIZED` for 1-token blocks | `BLOCK` per 16-column block for 16-token and coarser blocks; `DEQUANTIZED` for 4- and 1-token blocks |
-| P scale `C` | `448 * 2**-h`, with `h` the plan's `softmax_rescale_threshold_log2` (default 8) on Q64/KV256 tiles and block-sparse plans, and 0 elsewhere | 1: the lazy correction lets `p` reach `2**8` |
+| P scale `C` | `448 * 2**-h`, with `h` the plan's `softmax_rescale_threshold_log2` (default 8) | 1: the lazy correction lets `p` reach `2**8` |
 
 Masks and scheduling otherwise follow each kernel's 16-bit plans. In the
 decode kernel the default threshold quantizes FP8 P at
