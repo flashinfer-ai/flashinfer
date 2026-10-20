@@ -428,6 +428,10 @@ _GROUPED_Q_REDUCTION_COST = {
     128: 1.32,
 }
 _GROUPED_Q_REDUCTION_SEQ_LEN_FACTOR = 128.0
+# A 16-bit Keeps Q128 CTA costs 1.88x (B200) and 1.93x (GB300) the Q64/KV256
+# CTA that the Q64 factor stands for after the KV256 promotion, so its factor
+# is that ratio of the Q64 factor rather than the shared TileQ128 factor.
+_GROUPED_Q_16BIT_KEEPS_Q128_MAINLOOP_COST = 3.2
 
 
 def enumerate_grouped_q_mma_candidates(
@@ -475,17 +479,19 @@ def make_grouped_q_launch_candidate(
     batch_size: int,
     num_heads_kv: int,
     service_capacity: int,
+    mainloop_cost: float,
 ) -> GroupedQLaunchCandidate:
     """Build one empirical grouped-Q launch-cost record.
 
     The model follows the measured GQA-generation cost structure:
 
-    ``(mainloop_factor[TileQ] * seq_len_per_cta_kv +``
+    ``(mainloop_cost * seq_len_per_cta_kv +``
     `` reduction_factor[TileQ] * 128 * splits_kv) * waves``.
 
-    This is a small deterministic default heuristic. It deliberately uses the
-    same factors for every dtype; the production profile validator still
-    determines which actual-dtype recipes are legal.
+    This is a small deterministic default heuristic. ``mainloop_cost`` is the
+    TileQ factor, shared by every dtype except recipes measured separately;
+    the production profile validator still determines which actual-dtype
+    recipes are legal.
     """
     if splits_kv <= 0:
         raise ValueError("splits_kv must be positive")
@@ -507,7 +513,7 @@ def make_grouped_q_launch_candidate(
     launched_ctas = base_ctas * splits_kv
     waves = (launched_ctas + service_capacity - 1) // service_capacity
     modeled_time = (
-        _GROUPED_Q_MAINLOOP_COST[candidate.tile_size_q] * seq_len_per_cta_kv
+        mainloop_cost * seq_len_per_cta_kv
         + _GROUPED_Q_REDUCTION_COST[candidate.tile_size_q]
         * _GROUPED_Q_REDUCTION_SEQ_LEN_FACTOR
         * splits_kv
@@ -2357,6 +2363,24 @@ class FmhaDecodeConfig:
         )
 
     @property
+    def _in_grouped_q_selection_scope(self) -> bool:
+        """Whether the grouped-Q cost model may select this launch's Q tile.
+
+        It covers fixed multi-token grouped launches over page-32 K/V without
+        sliding windows or attention sinks; the selector also requires the
+        caller to leave the MMA and launch fields unpinned.
+        """
+        return (
+            self.groups_tokens_heads_q
+            and self.use_paged_kv
+            and self.num_tokens_per_page == 32
+            and not self.use_variable_seqlens_q
+            and self.max_seq_len_q > 1
+            and not self.use_sliding_window_causal
+            and not self.use_attention_sinks
+        )
+
+    @property
     def _kv256_dtypes_qualified(self) -> bool:
         """Whether the Q64/KV256 profile is qualified for this dtype combination."""
         if self.use_sage_attention:
@@ -2367,8 +2391,8 @@ class FmhaDecodeConfig:
     def supports_auto_grouped_keeps(self) -> bool:
         """Whether grouped Keeps is also qualified for automatic selection."""
         if self._uses_paged_16bit_keeps_q128_recipe:
-            # Only a configuration that pins the tile runs it.
-            return False
+            # Only the grouped-Q cost model compares this tile with the others.
+            return self._in_grouped_q_selection_scope and self.supports_grouped_keeps
         if (
             self.use_paged_kv
             and self.tile_size_kv == 128
@@ -4375,6 +4399,9 @@ def _resolve_grouped_q_launch_candidates(
         )
     except ValueError:
         return ()
+    mainloop_cost = _GROUPED_Q_MAINLOOP_COST[candidate.tile_size_q]
+    if probe._uses_paged_16bit_keeps_q128_recipe:
+        mainloop_cost = _GROUPED_Q_16BIT_KEEPS_Q128_MAINLOOP_COST
 
     split_candidates = enumerate_auto_splits_kv(
         seq_len_kv=seq_len_kv,
@@ -4413,6 +4440,7 @@ def _resolve_grouped_q_launch_candidates(
                 batch_size=batch_size,
                 num_heads_kv=num_heads_kv,
                 service_capacity=service_capacity,
+                mainloop_cost=mainloop_cost,
             )
         )
     return tuple(recipes)
@@ -4443,14 +4471,7 @@ def _apply_auto_grouped_q_mma_config(
     if (
         not auto_tuner
         or split_kv_mode != "disabled"
-        or seq_len_q <= 1
-        or cfg.use_variable_seqlens_q
-        or not cfg.groups_tokens_heads_q
-        or not cfg.use_paged_kv
-        or cfg.num_tokens_per_page != 32
-        or cfg.mask_type != CAUSAL
-        or cfg.use_sliding_window_causal
-        or cfg.use_attention_sinks
+        or not cfg._in_grouped_q_selection_scope
         or bool(_MMA_SELECTION_FIELDS & explicit_fields)
         or bool(_LAUNCH_SELECTION_FIELDS & explicit_fields)
         or splits_kv != -1
@@ -5419,10 +5440,10 @@ def make_decode_config(
     2. Fill profile-derived defaults: dtype fields, paged-KV metadata, the
        dense/causal mask, sliding-window flags, attention-sink flags, default
        grouped-Q metadata for fixed or packed launches, and the SMEM-derived
-       KV stage count. For an unpinned fixed multi-Q paged-causal page-32
-       launch, the Q selector first enumerates Swaps8/16/32 and Keeps64/128
-       tiles and every useful direct/split recipe through the first
-       capacity-crossing fanout.
+       KV stage count. For an unpinned fixed multi-Q paged page-32 launch
+       with a dense or causal mask, the Q selector first enumerates
+       Swaps8/16/32 and Keeps64/128 tiles and every useful direct/split
+       recipe through the first capacity-crossing fanout.
        Production-valid recipes minimize the empirical TileQ
        mainloop-plus-reduction proxy using their actual Q-grid CTA waves.
        Only a selected Q64 Keeps recipe may then promote a qualified FP16/BF16

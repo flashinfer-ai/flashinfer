@@ -7870,7 +7870,8 @@ def test_attention_ts_decode_q64_kv256_boundaries(
         assert policy["use_split_kv"] is False
 
 
-# Grouped Keeps Q128 on 16-bit paged K/V runs only when a configuration pins it.
+# Pins grouped Keeps Q128 on 16-bit paged K/V; automatic selection takes it only
+# for fixed multi-token page-32 launches.
 _EXPLICIT_PAGED_16BIT_Q128_PROFILE = {
     "use_keeps_mma_ab": True,
     "tile_size_q": 128,
@@ -7966,33 +7967,36 @@ def test_attention_ts_decode_explicit_16bit_paged_keeps_q128(
     assert policy["groups_tokens_heads_q"] is True
 
 
-@_REQUIRES_PRIMTS_GPU
-def test_attention_ts_decode_16bit_paged_keeps_q128_is_explicit_only() -> None:
-    """Automatic selection never picks the grouped 16-bit paged Keeps Q128 tile."""
-
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+def test_attention_ts_decode_16bit_paged_keeps_q128_automatic_scope(
+    monkeypatch,
+) -> None:
+    """The grouped-Q cost model scores 16-bit paged Keeps Q128 for fixed multi-Q page 32."""
 
     shape = dict(
-        seq_len_q=48,
+        seq_len_q=64,
         seq_len_kv=8192,
-        batch_size=8,
+        batch_size=16,
         num_heads_q=64,
         num_heads_kv=8,
-        q_dtype=BFloat16,
-        k_dtype=BFloat16,
-        v_dtype=BFloat16,
-        o_dtype=BFloat16,
-        qkv_layout="pagedKv",
         num_tokens_per_page=32,
-        mask_type="causal",
     )
-    pinned = fmha_decode_config.make_decode_config(
-        128, args=_EXPLICIT_PAGED_16BIT_Q128_PROFILE, **shape
+    pinned = _make_auto_kv_tile_config(
+        monkeypatch, args=_EXPLICIT_PAGED_16BIT_Q128_PROFILE, **shape
     )
-    assert pinned.supports_grouped_keeps
-    assert not pinned.supports_auto_grouped_keeps
-    automatic = fmha_decode_config.make_decode_config(128, **shape)
-    assert not (automatic.use_keeps_mma_ab and automatic.tile_size_q == 128)
+    assert pinned.supports_auto_grouped_keeps
+    for changes in ({"seq_len_q": 1}, {"num_tokens_per_page": 64}):
+        other = _make_auto_kv_tile_config(
+            monkeypatch,
+            args=_EXPLICIT_PAGED_16BIT_Q128_PROFILE,
+            **{**shape, **changes},
+        )
+        assert other.supports_grouped_keeps
+        assert not other.supports_auto_grouped_keeps
+    # Dense multi-Q launches take the cost model's tile instead of a head band.
+    automatic = _make_auto_kv_tile_config(monkeypatch, **shape)
+    assert automatic.use_keeps_mma_ab
+    assert automatic.tile_size_q == 128
+    assert automatic.groups_tokens_heads_q
 
 
 @_REQUIRES_PRIMTS_GPU
