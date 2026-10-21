@@ -22,7 +22,7 @@ authors = [{ name = "FlashInfer team" }]
 license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
-license-files = ["LICENSE", "LICENSE*.txt", "licenses/LICENSE.kda-for-kda"]
+license-files = ["LICENSE", "LICENSE*.txt", "licenses/LICENSE.kda-for-kda", "licenses/LICENSE.cudnn-frontend-MIT.txt"]
 
 [project.optional-dependencies]
 b12x = ["torch>=2.12.0", "nvidia-cutlass-dsl==4.7.1", "nvidia-cutlass-dsl-libs-base==4.7.1", "nvidia-cutlass-dsl-libs-core==4.7.1", "nvidia-cutlass-dsl-libs-cu12==4.7.1", "nvidia-cutlass-dsl-libs-cu13==4.7.1", "rich>=13", "safetensors>=0.6"]
@@ -88,13 +88,15 @@ exclude = [
 "flashinfer.cake_rmsnorm_train_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_causal_conv1d_train_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_ulysses_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_fused_qk_rope_append_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_nvfp4_svdquant_gemm_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_sage_block_sparse_attention_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_fused_qk_rope_fp8_append_backend" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_dsa_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_kda_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_lm_head_loss" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_mok_bf16" = ["csrc/*.cu", "csrc/*/*.cu", "csrc/*.h", "sources.json", "build.json", "README.md"]
-"flashinfer.experimental.nvfp4_attention" = ["csrc/**"]
+"flashinfer.experimental.nvfp4_attention" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_mla_varq_dcp_decode" = ["csrc/**"]
 "flashinfer.experimental.cake_mla_nvfp4_paged_decode" = ["csrc/**"]
 "flashinfer.experimental.msa_nvfp4_decode" = ["csrc/**"]
@@ -146,6 +148,9 @@ exclude = [
 "flashinfer.experimental.sm110_gqa_decode" = ["csrc/**"]
 # Frozen native sources and manifest for the exact-SM110 XQA backend.
 "flashinfer.experimental.sm110_xqa" = ["csrc/**"]
+# The Qwen 3.5 gated attention block: the feature README and the vendored cuDNN Frontend tree's provenance files.
+"flashinfer.experimental.qwen_3_5_block" = ["README.md"]
+"flashinfer.experimental.qwen_3_5_block._cudnn_frost" = ["VENDOR.md", "VENDOR_MANIFEST.json"]
 # Raw CUDA sources for the SM90 push-style FP8 mega-MoE drop, JIT-compiled at
 # runtime; registered so non-editable installs ship them (PR #4069).
 "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe" = [
@@ -232,6 +237,8 @@ exclude = [
   # Same class: a CuTe DSL kernel body, kept byte-faithful to the artifact its
   # kernel-level numbers were measured on.
   "flashinfer/msa_ops/cute_dsl/sparse_decode_nvfp4_sm100.py",
+  # The vendored cuDNN Frontend tree of the Qwen 3.5 gated attention block (see the ruff exclude note).
+  "flashinfer/experimental/qwen_3_5_block/_cudnn_frost/",
   "build/",
 ]
 
@@ -266,6 +273,9 @@ extend-exclude = [
   "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py",
   "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py",
   "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py",
+  # cuDNN Frontend sources vendored byte-faithfully for the Qwen 3.5 gated attention block (re-vendored as a clean
+  # drop; the digests in its VENDOR_MANIFEST.json cover the files as written). The adapter beside it stays linted.
+  "flashinfer/experimental/qwen_3_5_block/_cudnn_frost/",
 ]
 force-exclude = true
 

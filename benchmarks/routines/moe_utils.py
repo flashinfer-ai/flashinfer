@@ -30,8 +30,6 @@ from typing import Optional, Tuple
 
 import torch
 
-import triton
-import triton.language as tl
 
 from flashinfer import fp4_quantize, shuffle_matrix_a
 from flashinfer.fused_moe import WeightLayout, convert_to_block_layout
@@ -320,148 +318,6 @@ def dequantize_fp8(
     return (tensor_fp8.float() * scale.float()).to(dtype)
 
 
-def dequantize_fp8_block_scale(
-    tensor_fp8: torch.Tensor,
-    block_scales: torch.Tensor,
-    block_size: int = 128,
-    dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """
-    Dequantize block-scaled FP8 tensor back to high precision.
-
-    Args:
-        tensor_fp8: FP8 quantized tensor [num_tokens, hidden_size]
-        block_scales: Block scales [hidden_size // block_size, num_tokens]
-        block_size: Number of elements per scale block
-        dtype: Output dtype
-
-    Returns:
-        Dequantized tensor in specified dtype
-    """
-    num_tokens, hidden_size = tensor_fp8.shape
-    num_blocks = hidden_size // block_size
-
-    # Reshape tensor for block-wise dequantization
-    reshaped = tensor_fp8.float().reshape(num_tokens, num_blocks, block_size)
-
-    # Transpose scales from [num_blocks, num_tokens] to [num_tokens, num_blocks]
-    block_scales_t = block_scales.transpose(0, 1).contiguous()
-
-    # Apply scales
-    scales_expanded = block_scales_t.unsqueeze(-1)  # [num_tokens, num_blocks, 1]
-    dequantized = reshaped * scales_expanded
-
-    return dequantized.reshape(num_tokens, hidden_size).to(dtype)
-
-
-@triton.jit
-def _pack_topk_ids_kernel(
-    expert_ids_ptr,  # [total_tokens, top_k] int32/int64
-    expert_weights_ptr,  # [total_tokens, top_k] float32
-    output_ptr,  # [total_tokens, top_k] int32
-    local_expert_offset,  # scalar int
-    stride_ids_row,  # stride for expert_ids row dimension
-    stride_ids_col,  # stride for expert_ids col dimension
-    stride_weights_row,  # stride for weights row dimension
-    stride_weights_col,  # stride for weights col dimension
-    n_rows,
-    n_cols,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """
-    Fused kernel to pack expert IDs with actual weights into packed format:
-    packed = ((expert_id - local_offset) << 16) | (weight_as_bf16 bits)
-
-    This eliminates:
-    - dtype conversion kernel (float32 -> bf16)
-    - subtraction, shift, view, cast, bitwise_or kernels
-    All fused into a single kernel.
-    """
-    pid = tl.program_id(0)
-
-    # Calculate row and column from linear index
-    linear_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    row_idx = linear_idx // n_cols
-    col_idx = linear_idx % n_cols
-
-    mask = linear_idx < (n_rows * n_cols)
-
-    # Compute actual memory offset using strides for expert_ids
-    ids_offset = row_idx * stride_ids_row + col_idx * stride_ids_col
-    weights_offset = row_idx * stride_weights_row + col_idx * stride_weights_col
-
-    # Load expert IDs and compute local IDs
-    expert_ids = tl.load(expert_ids_ptr + ids_offset, mask=mask)
-    local_ids = expert_ids - local_expert_offset
-
-    # Load weights as float32 and convert to bf16 bits
-    weights_f32 = tl.load(expert_weights_ptr + weights_offset, mask=mask)
-    # Convert to bf16, then reinterpret as int16
-    weights_bf16 = weights_f32.to(tl.bfloat16)
-    weights_int16 = weights_bf16.to(tl.int16, bitcast=True)
-    weights_int32 = weights_int16.to(tl.int32) & 0xFFFF
-
-    # Pack: (local_id << 16) | weight_bits
-    packed = (local_ids.to(tl.int32) << 16) | weights_int32
-
-    # Output is always contiguous
-    tl.store(output_ptr + linear_idx, packed, mask=mask)
-
-
-def pack_topk_ids_triton(
-    expert_ids: torch.Tensor,
-    expert_weights: torch.Tensor,
-    local_expert_offset: int,
-    output: torch.Tensor = None,
-) -> torch.Tensor:
-    """
-    Pack expert IDs with actual weights into packed format using a fused Triton kernel.
-
-    This fused kernel handles:
-    - Non-contiguous input tensors via strides
-    - float32 -> bf16 conversion for weights
-    - Packing: (expert_id - offset) << 16 | weight_bf16_bits
-
-    Args:
-        expert_ids: [total_tokens, top_k] expert indices (int32 or int64), can be non-contiguous
-        expert_weights: [total_tokens, top_k] routing weights (float32), can be non-contiguous
-        local_expert_offset: offset to subtract from global expert IDs
-        output: optional pre-allocated output tensor [total_tokens, top_k] int32
-
-    Returns:
-        packed_topk_ids: [total_tokens, top_k] int32 where each element is
-                         ((expert_id - offset) << 16) | (weight_bf16 as int16)
-    """
-    assert expert_ids.ndim == 2
-    assert expert_weights.ndim == 2
-    assert expert_ids.shape == expert_weights.shape
-    n_rows, n_cols = expert_ids.shape
-
-    if output is None:
-        output = torch.empty(
-            n_rows, n_cols, dtype=torch.int32, device=expert_ids.device
-        )
-
-    n_elements = n_rows * n_cols
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
-
-    _pack_topk_ids_kernel[grid](
-        expert_ids,
-        expert_weights,
-        output,
-        local_expert_offset,
-        expert_ids.stride(0),
-        expert_ids.stride(1),
-        expert_weights.stride(0),
-        expert_weights.stride(1),
-        n_rows,
-        n_cols,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-    return output
-
-
 def calculate_moe_tflops(
     num_tokens: int,
     hidden_size: int,
@@ -630,11 +486,7 @@ def add_common_moe_args(parser: argparse.ArgumentParser) -> None:
     """
     Add common MoE CLI arguments to a parser.
 
-    This adds arguments shared between moe.py and moe_comm.py:
-    - num_tokens, hidden_size, num_experts, top_k, input_dtype
-
-    In constrast to moe.py, intermediate_size is only optional for moe_comm.py,
-    hence not counted as a common argument.
+    Adds num_tokens, hidden_size, num_experts, top_k and input_dtype.
 
     Args:
         parser: ArgumentParser to add arguments to
@@ -730,52 +582,3 @@ def create_moe_output_scale_scalars(
     )
     output2_scale_scalar = torch.ones(num_experts, device=device, dtype=torch.float32)
     return output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar
-
-
-def quantize_and_pack_nvfp4(
-    tensor: torch.Tensor,
-    global_scale: Optional[torch.Tensor] = None,
-    use_ue8m0: bool = False,
-    is_sf_swizzled_layout: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Quantize tensor to NVFP4 and pack into communication-ready format.
-
-    This wraps quantize_fp4 and performs the reshaping needed for MoE kernels:
-    - Packs 2 FP4 values into 1 byte (uint8)
-    - Reshapes block scales appropriately
-
-    Args:
-        tensor: Input tensor [num_tokens, hidden_size]
-        global_scale: Optional pre-computed global scale. If None, computed from tensor.
-        use_ue8m0: Whether to use UE8M0 format
-        is_sf_swizzled_layout: Whether to use swizzled layout for scale factors.
-                               Use False for activations, True for weights.
-
-    Returns:
-        Tuple of (quantized_packed, block_scales, global_scale)
-        - quantized_packed: uint8 tensor [num_tokens, hidden_size // 2]
-        - block_scales: float8_e4m3fn tensor [num_tokens, hidden_size // 16]
-        - global_scale: float32 scalar tensor
-    """
-    sf_vec_size = 16
-    num_tokens, hidden_size = tensor.shape
-
-    # Quantize using the standard FP4 quantization
-    quantized, block_scales, global_scale = quantize_fp4(
-        tensor, global_scale, use_ue8m0, is_sf_swizzled_layout
-    )
-
-    # Pack 2 FP4 values into 1 byte
-    quantized_packed = quantized.view(torch.uint8).reshape(num_tokens, hidden_size // 2)
-
-    # Reshape block scales
-    block_scales_reshaped = block_scales.view(torch.float8_e4m3fn).reshape(
-        num_tokens, hidden_size // sf_vec_size
-    )
-
-    # Validate scale shape
-    expected_scale_elems = (num_tokens * hidden_size) // sf_vec_size
-    assert block_scales_reshaped.numel() == expected_scale_elems, "Invalid scale shape"
-
-    return quantized_packed, block_scales_reshaped, global_scale

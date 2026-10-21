@@ -252,6 +252,13 @@ def pytest_collection_modifyitems(config, items):
             if mk not in item.keywords:
                 continue
             if "WORLD_SIZE" not in os.environ:
+                # Runners that exist only to run multi-rank tests set this so
+                # that a missing launcher fails instead of skipping silently.
+                if os.environ.get("FAIL_ON_DISTRIBUTED_SKIP") == "1":
+                    raise pytest.UsageError(
+                        f"{item.nodeid} needs a torchrun or MPI launch "
+                        "(WORLD_SIZE unset)"
+                    )
                 # Multi-rank tests must be launched via torchrun (see
                 # tests/moe_ep/run_tests.sh); under plain pytest auto-discovery
                 # (e.g. CI unit-test sweeps) they would hang on dist init.
