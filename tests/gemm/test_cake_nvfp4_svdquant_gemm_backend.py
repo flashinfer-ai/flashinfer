@@ -25,7 +25,8 @@ layout, ``2 randn`` low-rank factors, ``4 randn`` bias): every element within
 ``atol 1 + rtol 0.1`` and a signal-to-quantization-noise ratio above 40 dB.
 The matrix covers the family's 28 performance rows (every shipped program),
 the off-table rows ``M in {128, 129, 135, 191, 200, 333, 2048, 4097}`` x
-``rank in {32, 64, 96, 128}`` x bias at ``N = K = 3072``, the named
+``rank in {32, 64, 96, 128}`` x bias at ``N = K = 3072``, the per-K routing of
+the M 129 rows and the output-store form of the 2-CTA routes, the named
 ``ValueError`` of each shape rule, the host plan (route table, grid rules,
 raster groups, scale-factor views), CUDA Graph capture and replay (bitwise
 equal to eager, two layers interleaved in one graph and in alternating
@@ -116,13 +117,17 @@ CONTRACT_N = 3072
 CONTRACT_K = 3072
 RANKS = (32, 64, 96, 128)
 # Coverage rows: the programs the two lists above do not reach under the
-# current route table (tactic 25: K 12288 at rank 32 between M 256 and 4095).
-# Update them when the route table changes; ``test_matrix_reaches_every_program``
-# says when a program is missed.
+# current route table (tactic 25: K 12288 at rank 32 between M 256 and 4095;
+# the rank 64 / 96 tail-split builds; the hinted-store persistent builds of
+# ranks 64 / 96 / 128 at a deep K).  Update them when the route table changes;
+# ``test_matrix_reaches_every_program`` says when a program is missed.
 COVERAGE_ROWS: tuple[tuple[int, int, int, int, bool], ...] = (
     (333, 3072, 12288, 32, True),
     (6912, 3072, 12288, 64, True),
     (6912, 3072, 12288, 96, True),
+    (4096, 3072, 12288, 64, True),
+    (4096, 3072, 12288, 96, True),
+    (4096, 3072, 12288, 128, True),
 )
 CONTRACT_ROWS: tuple[tuple[int, int, int, int, bool], ...] = tuple(
     (m, CONTRACT_N, CONTRACT_K, rank, bias)
@@ -154,6 +159,17 @@ GRAPH_ROWS = (
     (6912, 3072, 12288, 32, True),
 )
 GRAPH_REPLAYS = 3
+# The build keywords of the 64-row tactic-14 program per K class of the M 129
+# rows: the K12288 class (K >= 12288, K % 256 == 0) and every other K.
+M129_FORM_K3072 = {"prologue": "overlap", "epi": "fused64"}
+M129_FORM_K12288 = {"prologue": "overlap", "epi": "fused64", "a_mcast": False}
+# The 2-CTA programs' output-store forms by launch: the kernel hints its stores
+# when ``K_tiles >= 24`` or ``w_tiles >= 24`` on 256-wide tiles.
+OUT_HINT_MIN_TILES = 24
+
+
+def _hinted_launch(n: int, k: int) -> bool:
+    return k // 256 >= OUT_HINT_MIN_TILES or -(-n // 256) >= OUT_HINT_MIN_TILES
 
 
 def _device() -> torch.device:
@@ -564,6 +580,86 @@ def test_raster_group_follows_its_table() -> None:
     assert loader.raster_group(m=16384, n=12288, k=12288, rank=32) == 2
     assert loader.raster_group(m=4096, n=3072, k=3072, rank=32) == 8
     assert loader.raster_group(m=6912, n=3072, k=3072, rank=128) == 8
+
+
+def test_two_cta_routes_pick_the_store_form_of_the_launch() -> None:
+    """Every 2-CTA route (whole-tile and tail-split) lands on the build whose
+    ``out_store`` matches the kernel's hint rule for that launch, and both forms
+    are reached by the performance rows."""
+    forms = set()
+    for row in (*PERF_ROWS, *CONTRACT_ROWS, *COVERAGE_ROWS):
+        m, n, k, rank, bias = row
+        record = loader.MODULES[_route(row)]
+        if record["plan"]["grid_rule"] not in ("pair_persistent", "pair_tailsplit"):
+            continue
+        build = record["build"]
+        assert build["rank"] == rank, _row_id(row)
+        expected = "v8hint" if _hinted_launch(n, k) else "v8"
+        assert build["out_store"] == expected, (_row_id(row), build)
+        if row in PERF_ROWS:
+            forms.add(build["out_store"])
+    assert forms == {"v8", "v8hint"}
+    # The boundary of the hint rule on the whole-tile program: 23 vs 24 tiles.
+    for (n, k), form in (
+        ((3072, 5888), "v8"),
+        ((3072, 6144), "v8hint"),
+        ((5888, 3072), "v8"),
+        ((6016, 3072), "v8hint"),
+    ):
+        name = loader.select_record(m=4096, n=n, k=k, rank=32, has_bias=True)
+        record = loader.MODULES[name]
+        assert record["plan"]["grid_rule"] == "pair_persistent", (n, k)
+        assert record["build"]["out_store"] == form, (n, k, record["build"])
+    # Every tail-split route is a hinted launch, so the program ships hinted only.
+    for record in loader.MODULES.values():
+        if record["plan"]["grid_rule"] == "pair_tailsplit":
+            assert record["build"]["out_store"] == "v8hint"
+
+
+@pytest.mark.parametrize("bias", [False, True], ids=["nobias", "bias"])
+def test_m129_rows_route_by_k_class(bias) -> None:
+    """The M 129 / N 3072 rows take the 64-row tactic-14 build of their K class:
+    the K12288 form for K >= 12288 with K % 256 == 0, the K3072 form otherwise
+    (including K % 256 != 0 and the K between the two classes); the bias form
+    follows the problem."""
+    for k, form in (
+        (3072, M129_FORM_K3072),
+        (3200, M129_FORM_K3072),
+        (6144, M129_FORM_K3072),
+        (12288, M129_FORM_K12288),
+        (12416, M129_FORM_K3072),
+        (24576, M129_FORM_K12288),
+    ):
+        name = loader.select_record(m=129, n=3072, k=k, rank=32, has_bias=bias)
+        record = loader.MODULES[name]
+        assert record["build"] == {"bias": bias, **form}, (k, bias, record["build"])
+        assert record["plan"]["variant"] == ("bias" if bias else "nobias")
+        assert record["plan"]["block_m"] == 64 and record["plan"]["block_k"] == 128
+
+
+def test_out_ptr_binds_the_out_tensor() -> None:
+    """The register-direct store builds take the raw ``out`` pointer as the
+    trailing ``out_ptr`` parameter after ``L1_tail``; its logical name is ``out``,
+    so the host passes the ``out`` tensor twice (as the tensor map and the
+    pointer).  No other record has the parameter."""
+    assert loader.PARAMETER_LOGICAL["out_ptr"] == "out"
+    with_ptr = {
+        name for name, record in loader.MODULES.items() if "out_ptr" in record["logical"]
+    }
+    assert with_ptr
+    for name, record in loader.MODULES.items():
+        direct = record["build"].get("out_store") in ("v8", "v8hint")
+        assert (name in with_ptr) == direct, name
+        if not direct:
+            continue
+        assert record["logical"]["out_ptr"] == "out"
+        plan = [tuple(pair) for pair in record["arg_plan"]]
+        assert plan.index(("buffer", "out_ptr")) == plan.index(("buffer", "L1_tail")) + 1
+        assert plan[-3:] == [("grid", "grid_x"), ("grid", "grid_y"), ("grid", "grid_z")]
+        logical = [
+            logical for logical, _axis in loader._argument_plan(name) if logical is not None
+        ]
+        assert logical.count("out") == 2, name
 
 
 @pytest.mark.parametrize("has_bias", [False, True])
