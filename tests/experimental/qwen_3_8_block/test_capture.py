@@ -38,10 +38,22 @@ def _prepare(case, g, **kw):
     )
 
 
+def _pages(lens, page_size=16):
+    return sum(-(-L // page_size) for L in lens)
+
+
 def test_decode_first_run_captured_replays_bitwise_eager_and_over_a_new_step():
     g = _geometry()
+    lens_a, lens_b = (303, 2300, 0, 77), (304, 2301, 1000, 0)
+    # the two steps share the pools: the first case carries the spare pages the second step's longer sequences need
     case = Qsa38PagedCase(
-        g, (303, 2300, 0, 77), 4, page_size=16, seed=21, table_width=160
+        g,
+        lens_a,
+        4,
+        page_size=16,
+        seed=21,
+        table_width=160,
+        extra_pages=_pages(lens_b) - _pages(lens_a) + 2,
     )
     case.prime()
     plan = _prepare(case, g, ring_slots=True)
@@ -137,15 +149,13 @@ def test_decode_first_run_captured_replays_bitwise_eager_and_over_a_new_step():
         # a NEW step through the captured tensors: new lengths / slots / ring slots / inputs (the 77-token entry padded away, the padded one live)
         sib = Qsa38PagedCase(
             g,
-            (304, 2301, 1000, 0),
+            lens_b,
             4,
             page_size=16,
             seed=22,
             table_width=160,
             weights=(case.weights38, case.w_o),
-            extra_pages=case.num_pages
-            - 1
-            - sum(-(-L // 16) for L in (304, 2301, 1000, 0)),
+            extra_pages=2,
         )
         sib.prime()
         assert (

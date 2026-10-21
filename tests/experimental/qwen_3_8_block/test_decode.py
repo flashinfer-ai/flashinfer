@@ -26,11 +26,13 @@ GEOMETRIES = {
     ),  # Qwen3.8-Flash-Next at TP 1
     "12_1": dict(
         d_model=2560, num_qo_heads=12, num_kv_heads=1
-    ),  # TP 2 (declared, unmeasured)
+    ),  # TP 2: declined by name (the slab N 7296 is off the capture-safe projection route)
     "6_1": dict(
         d_model=2560, num_qo_heads=6, num_kv_heads=1
-    ),  # TP 4 (declared, unmeasured)
+    ),  # TP 4: declined by name (N 4224)
 }
+SERVED = ("24_2",)
+SHARDS = ("12_1", "6_1")
 # one KV tile with a tail, a long sequence past the identity bound (2051 visible tokens: the list no longer holds every block), a
 # PADDED entry (block 0, slot -1, seq_len 0, ring block 0), a sequence whose step completes a block
 LENS = (100, 2300, 0, 303)
@@ -121,7 +123,7 @@ def _check_step(case, plan, out, label):
     return stats, completed
 
 
-@pytest.mark.parametrize("name", sorted(GEOMETRIES))
+@pytest.mark.parametrize("name", SERVED)
 @pytest.mark.parametrize("q_len", [1, 4])
 def test_decode_matches_the_two_stage_oracle(name, q_len):
     g = _geometry(name)
@@ -159,6 +161,36 @@ def test_decode_matches_the_two_stage_oracle(name, q_len):
     assert completed == want, (completed, want)
     assert plan.supports(hidden_states=case.hidden_states, **case.decode_args())
     assert not plan.supports(hidden_states=case.hidden_states[:1], **case.decode_args())
+
+
+@pytest.mark.parametrize("name", SHARDS)
+def test_tp_shard_slabs_are_declined_by_name(name, monkeypatch):
+    """The TP 2 / TP 4 shard geometries: the probe declines them under ``proj_slab_route`` (their slabs are off the capture-safe
+    small-M projection route on this part -- the vendored route's own arithmetic at the device's SM count), and ``prepare`` raises the
+    same typed ``NotImplementedError`` before any vendored declaration."""
+    from flashinfer.experimental.qwen_3_8_block import api as impl
+    from flashinfer.experimental.qwen_3_8_block import support
+    from flashinfer.qwen_3_8_block import qwen_3_8_block_support
+
+    g = _geometry(name)
+    sup = qwen_3_8_block_support(torch.device("cuda", 0), g)
+    sm = torch.cuda.get_device_properties(0).multi_processor_count
+    assert (
+        not sup.served
+        and sup.reason == sup.decode.declines[support.PROJ_SLAB_ROUTE_KEY]
+    )
+    assert f"N={g.n_qkvg}" in sup.reason and f"{sm}-SM" in sup.reason
+    assert qwen_3_8_block_support(torch.device("cuda", 0), _geometry("24_2")).served
+
+    def reached():
+        raise AssertionError(
+            "the vendored declaration was reached for a shard the route gate declines"
+        )
+
+    monkeypatch.setattr(impl, "_frost_block", reached)
+    case = Qsa38PagedCase(g, (64,), 1, page_size=16, seed=31)
+    with pytest.raises(NotImplementedError, match="small-M projection route"):
+        _plan(case, g)
 
 
 @pytest.mark.parametrize("page", [32, 64, 128])
@@ -327,16 +359,39 @@ def test_launch_census_matches_the_declaration():
     case.prime()
     plan = _plan(case, g)
     _run(plan, case)  # warm (the launch stream, the first-execute paths)
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA]
-    ) as prof:
-        _run(plan, case)
-    kernels = [
-        e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
-    ]
-    names = [e.name for e in kernels]
+
+    def census(**outputs):
+        case.reset_outputs()  # the test's own sentinel fills: outside the profiled window
+        torch.cuda.synchronize()
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA]
+        ) as prof:
+            plan.run(
+                case.hidden_states,
+                None,
+                None,
+                case.weights38,
+                case.w_o,
+                **case.decode_args(),
+                **outputs,
+            )
+            torch.cuda.synchronize()
+        return [
+            e.name
+            for e in prof.events()
+            if e.device_type == torch.autograd.DeviceType.CUDA
+        ]
+
+    # the serving path (no optional outputs) and the test path (the list requested) issue the SAME launches: the list is written by
+    # the top-k itself, no fill / memset of its own
+    names = census()
+    with_list = census(
+        block_ids_out=case.block_ids_out, block_lens_out=case.block_lens_out
+    )
+    assert len(with_list) == len(names), (with_list, names)
     memops = [n for n in names if "memset" in n.lower() or "memcpy" in n.lower()]
     assert not memops, f"memset / memcpy on the execute path: {memops}"
+    assert not [n for n in names if "FillFunctor" in n], names
     assert len(names) == plan.declaration["launches_per_execute"], (
         len(names),
         plan.declaration["launches_per_execute"],
@@ -365,8 +420,13 @@ def test_three_carried_steps_with_a_rejected_draft():
 
     g = _geometry("24_2")
     S0 = 302
-    case = Qsa38PagedCase(g, (S0 + 1,), 1, page_size=16, seed=8, table_width=24)
+    case = Qsa38PagedCase(g, (S0 + 1,), 1, page_size=16, seed=8, table_width=24, cap=8)
     case.prime()  # the prefix 0 .. 301 primed; the step's row is position 302
+    # the stream grows to 310 tokens: positions 304 .. 309 live in a twentieth page the 303-token case never mapped -- hand it one of
+    # the case's spare pages (the table has room: width 24)
+    spare = sorted(set(range(1, case.num_pages)) - set(case.pages[0]))
+    case.pages[0].append(spare[0])
+    case.block_table[0, len(case.pages[0]) - 1] = spare[0]
     plans = {1: _plan(case, g), 4: None}
     L = S0 + 1
     h_acc = case.h_full[
@@ -404,6 +464,7 @@ def test_three_carried_steps_with_a_rejected_draft():
             seed=8,
             table_width=24,
             weights=(case.weights38, case.w_o),
+            cap=8,
         )
         nxt.refs[0] = ref
         nxt.h_full[0] = h_full

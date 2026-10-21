@@ -63,6 +63,9 @@ INDEX_PAGE_SIZES: Tuple[int, ...] = (
 #: the capture-safe projection route: the band slab GEMM runs the 128-row swap-AB tile at ``batch x q_len <= 128`` rows (past it the
 #: graph route, which creates its handle eagerly and cannot live in a CUDA graph) -- the vendored ``kernels/proj_gemm.SMALL_M_MAX``
 DECODE_CAPTURE_ROWS_MAX = 128
+#: the FlashInfer-side decline (not an envelope row): a tensor-parallel shard whose dense projection is off the capture-safe
+#: small-M route of the vendored projection GEMM on the device (the probe lists it under this key; ``prepare`` raises it typed)
+PROJ_SLAB_ROUTE_KEY = "proj_slab_route"
 #: the decline keys of the README's Errors table every re-vendor must keep publishing under ``decode.declines``
 DECLINE_KEYS: Tuple[str, ...] = (
     "indexer_f16",
@@ -118,6 +121,57 @@ def top_k_reason(top_k: int) -> Optional[str]:
             f"top_k must be a multiple of {align} in [{lo}, {hi}] (blocks per row: the sparse core's per-row index staging, copied in "
             f"16-byte units), got top_k={top_k}"
         )
+    return None
+
+
+def _sm_count(device) -> Optional[int]:
+    """The SM count of ``device`` (the projection route's one-wave arithmetic), or None without a CUDA device (the CPU probe never
+    reaches the route gate: the device gate declines first)."""
+    dev = torch.device(device)
+    if dev.type != "cuda" or not torch.cuda.is_available():
+        return None
+    try:
+        index = dev.index if dev.index is not None else torch.cuda.current_device()
+        return int(torch.cuda.get_device_properties(index).multi_processor_count)
+    except Exception:  # noqa: BLE001 -- a device the driver does not describe: no route verdict (the device gate speaks)
+        return None
+
+
+def proj_route_reason(
+    geometry, device, dtype: torch.dtype = torch.bfloat16
+) -> Optional[str]:
+    """Why the block's two dense projections at this geometry cannot take the capture-safe route on ``device``, or None.
+
+    The vendored projection GEMM serves a CAPTURED decode step on its small-M route only (the graph route creates a cuDNN handle at the
+    first execute per stream, which cannot happen inside a CUDA-graph capture), and that route names a tile for an N that 256 divides,
+    or that 128 divides where its 64-row weight tiles overflow one wave of the part's SMs -- the vendored rule's own arithmetic
+    (``kernels.proj_gemm.small_m_tile_config``) is asked here, at ``m = 1``, with the device's SM count.  The TP 1 Flash-Next slab
+    (N 13952 = 109 x 128, 218 64-row tiles) is on the route on every served part; the TP 2 / TP 4 shard slabs (N 7296 / 4224) are not.
+    Imports the vendored tree (host arithmetic only; called after the device gate passed)."""
+    sm = _sm_count(device)
+    if sm is None:
+        return None
+    from ..qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.proj_gemm import (
+        small_m_tile_config,
+    )
+
+    d = int(geometry.head_dim)
+    for label, n, k in (
+        (
+            "the fused QKV + gate + indexer-band slab",
+            int(geometry.n_qkvg),
+            int(geometry.d_model),
+        ),
+        ("the out projection", int(geometry.d_model), int(geometry.num_qo_heads) * d),
+    ):
+        if small_m_tile_config(1, n, k, dtype=dtype, sm_count=sm) is None:
+            return (
+                f"{label} [rows, {k}] x [{k}, {n}] (N={n}) is off the capture-safe small-M projection route on this {sm}-SM part: the "
+                "route names a tile for an N that 256 divides, or that 128 divides where its 64-row weight tiles overflow one wave "
+                "(the TP 1 slab, N 13952); any other N resolves to the graph route, whose first execute creates a cuDNN handle and "
+                "cannot live in a CUDA graph. The TP 1 (24 / 2) geometry is served; this tensor-parallel shard is not -- run the block "
+                "at TP 1, or keep the serving stack's own attention for the shard"
+            )
     return None
 
 
@@ -406,10 +460,18 @@ def _frost_decode_table(
             "indexer_e4m3_pool",
             f"kv_cache_dtype={kv_cache_dtype} is not served under the in-block indexer (served: {d.kv_cache_dtypes})",
         )
+    declines = dict(d.declines)
+    route = proj_route_reason(geometry, device, dtype)
+    if (
+        route is not None
+    ):  # the FlashInfer-side row: the shard's slab off the capture-safe projection route on this device
+        declines[PROJ_SLAB_ROUTE_KEY] = route
+        if served:
+            served, reason = False, route
     return dict(
         served=served,
         reason=reason,
-        declines=dict(d.declines),
+        declines=declines,
         kv_cache_dtypes=tuple(d.kv_cache_dtypes),
         index_sources=tuple(d.index_sources),
         index_list_forms=tuple(d.index_list_forms),
@@ -512,7 +574,8 @@ def check_vendored_rules() -> Dict[str, Any]:
     at bf16 with ``device_cc=(10, 7)`` -- device-free -- yields the indexer rows every mirrored constant is compared with
     (``index_head_dims``, ``index_kv_heads``, ``index_block_sizes``, ``index_top_k_range``, ``index_query_rows_max``,
     ``index_state_rows_extra``, ``index_page_sizes``), the scorer's row rule as BEHAVIOUR (``validate_params`` over q_len 1 .. 20 at
-    4 heads against ``decode_max_q_len``), the capture-safe row bound (``kernels.proj_gemm.SMALL_M_MAX``) and, behaviourally, every
+    4 heads against ``decode_max_q_len``), the capture-safe row bound (``kernels.proj_gemm.SMALL_M_MAX``), the projection route's verdicts
+    (``small_m_tile_config``: the 24 / 2 slab on it, the shard slabs off it) and, behaviourally, every
     decline key the README's Errors table names present in ``decode.declines``.  Once per process (the probe's vendored read,
     ``api.prepare``); returns the tree's constants.  Raises ``RuntimeError`` naming every drifted fact."""
     from ..qwen_3_5_block._cudnn_frost.gated_attention_block import (
@@ -571,6 +634,28 @@ def check_vendored_rules() -> Dict[str, Any]:
         drift.append(
             f"decode.declines lacks the row(s) {missing} the README's Errors table names"
         )
+    # the projection route's verdicts the probe rests on (the vendored rule's own arithmetic at m = 1): the 24 / 2 slab ON the
+    # small-M route at every served part's SM count, the TP 2 / TP 4 shard slabs OFF it (the README's TP note)
+    for sm in (148, 204, 212):
+        if (
+            proj_gemm.small_m_tile_config(
+                1, g.n_qkvg, g.d_model, dtype=torch.bfloat16, sm_count=sm
+            )
+            is None
+        ):
+            drift.append(
+                f"the 24 / 2 slab (N {g.n_qkvg}) is off the small-M projection route at m=1 on a {sm}-SM part"
+            )
+    for n in (7296, 4224):
+        if (
+            proj_gemm.small_m_tile_config(
+                1, n, g.d_model, dtype=torch.bfloat16, sm_count=204
+            )
+            is not None
+        ):
+            drift.append(
+                f"the shard slab N {n} is ON the small-M projection route at m=1 on a 204-SM part: the README's TP note is stale"
+            )
     if drift:
         raise RuntimeError(
             "qwen_3_8_block: the indexer rules support.py mirrors differ from the vendored cuDNN Frontend tree's; the gate "
@@ -593,6 +678,7 @@ def require_served(
         or dtype_reason(dtype)
         or device_reason(device)
         or cutedsl_reason()
+        or proj_route_reason(geometry, device, dtype)
     )
     if reason is not None:
         raise NotImplementedError(f"qwen_3_8_block ({form}): {reason}")

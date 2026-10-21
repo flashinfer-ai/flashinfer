@@ -9,6 +9,7 @@ cache dtypes x page sizes (the device capability mocked to Rubin: the real decla
 compiled), the Errors table's keys against ``decode.declines``, and -- on the GPU -- that a declined geometry is typed BEFORE any vendored
 code is reached."""
 
+import contextlib
 from unittest import mock
 
 import pytest
@@ -35,8 +36,10 @@ GRID = [
     (dict(index_list_form="shared"), 1, 16, False),
     (dict(index_cache_dtype=torch.float8_e4m3fn), 1, 16, False),
     (dict(index_cache_dtype=torch.bfloat16), 1, 16, True),
-    (dict(num_qo_heads=12, num_kv_heads=1), 1, 16, True),  # the TP 2 shard
-    (dict(num_qo_heads=6, num_kv_heads=1), 4, 16, True),  # the TP 4 shard
+    # the TP 2 / TP 4 shards: the declaration admits them, the probe declines them by name -- their slabs (N 7296 / 4224) are off
+    # the capture-safe small-M projection route (`proj_slab_route`, decided at the part's SM count; mocked to 204 below)
+    (dict(num_qo_heads=12, num_kv_heads=1), 1, 16, False),
+    (dict(num_qo_heads=6, num_kv_heads=1), 4, 16, False),
     (dict(top_k=256), 1, 16, True),
     (dict(top_k=516), 1, 16, False),
     (dict(rope_dim=128), 1, 16, True),
@@ -110,7 +113,19 @@ def _rubin_mocks():
         mock.patch("torch.cuda.is_available", return_value=True),
         mock.patch.object(frost_device, "ambient_device", return_value=0),
         mock.patch.object(frost_device, "compute_capability", return_value=(10, 7)),
+        # the projection route gate asks the part's SM count: a 204-SM Rubin part (the 24 / 2 slab on the route, the shards off it)
+        mock.patch(
+            "flashinfer.experimental.qwen_3_8_block.support._sm_count", return_value=204
+        ),
     )
+
+
+@contextlib.contextmanager
+def _rubin():
+    with contextlib.ExitStack() as stack:
+        for patch in _rubin_mocks():
+            stack.enter_context(patch)
+        yield
 
 
 def test_vendored_rule_tripwire_passes_and_fires_on_a_drift_of_every_mirrored_constant():
@@ -185,8 +200,7 @@ def test_probe_verdict_matches_the_vendored_declaration(over, q_len, page, serve
             blk._check_declaration()
         except (ValueError, NotImplementedError) as exc:
             decl_ok, why = False, f"{type(exc).__name__}: {exc}"
-    p1, p2, p3, p4 = _rubin_mocks()
-    with p1, p2, p3, p4:
+    with _rubin():
         sup = qwen_3_8_block_support(torch.device("cuda", 0), g)
     if not sup.cutedsl_ok:
         from flashinfer.experimental.qwen_3_8_block import support
@@ -215,8 +229,7 @@ def test_every_errors_table_key_is_a_decline_row_and_the_texts_are_the_envelope_
     from flashinfer.qwen_3_8_block import qwen_3_8_block_support
 
     g = _geometry()
-    p1, p2, p3, p4 = _rubin_mocks()
-    with p1, p2, p3, p4:
+    with _rubin():
         sup = qwen_3_8_block_support(torch.device("cuda", 0), g)
         if not sup.cutedsl_ok:
             pytest.skip(support.cutedsl_reason())
@@ -234,6 +247,21 @@ def test_every_errors_table_key_is_a_decline_row_and_the_texts_are_the_envelope_
     assert (
         sup.index_query_rows_max == env.index_query_rows_max == 64
         and sup.fuse_prepare_default == env.fuse_prepare_default
+    )
+    # the FlashInfer-side row: absent at TP 1, present (and the verdict) for a shard whose slab is off the projection route
+    assert support.PROJ_SLAB_ROUTE_KEY not in sup.decode.declines
+    with _rubin():
+        shard = qwen_3_8_block_support(
+            torch.device("cuda", 0), _geometry(num_qo_heads=12, num_kv_heads=1)
+        )
+    assert (
+        not shard.served
+        and shard.reason == shard.decode.declines[support.PROJ_SLAB_ROUTE_KEY]
+    )
+    assert (
+        "N=7296" in shard.reason
+        and "204-SM" in shard.reason
+        and "small-M projection route" in shard.reason
     )
 
 
