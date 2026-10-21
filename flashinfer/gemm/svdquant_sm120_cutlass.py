@@ -154,12 +154,75 @@ def _pack_sm120_m537_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
     )
 
 
+# Layouts built once by prepare_svdquant_l2t(), keyed by the source storage.
+# A hit needs the same live tensor object and, for tensors that carry one, the
+# version it was prepared at; inference tensors carry none, and preparing one is
+# the caller's promise to prepare again after changing it.
+_SM120_PREPARED_L2T: dict[
+    tuple, tuple[weakref.ReferenceType, Optional[int], dict[str, torch.Tensor]]
+] = {}
+
+
+def _prepared_l2t_key(l2t_smoothed: torch.Tensor) -> tuple:
+    return (
+        l2t_smoothed.device,
+        l2t_smoothed.data_ptr(),
+        tuple(l2t_smoothed.shape),
+        tuple(l2t_smoothed.stride()),
+        l2t_smoothed.dtype,
+    )
+
+
+def _prepared_l2t_layout(
+    l2t_smoothed: torch.Tensor, layout: str
+) -> Optional[torch.Tensor]:
+    entry = _SM120_PREPARED_L2T.get(_prepared_l2t_key(l2t_smoothed))
+    if entry is None or entry[0]() is not l2t_smoothed:
+        return None
+    if entry[1] is not None and entry[1] != int(l2t_smoothed._version):
+        return None
+    return entry[2].get(layout)
+
+
+def prepare_sm120_l2t(l2t_smoothed: torch.Tensor) -> None:
+    """Build every L2T layout an SM120 fused producer may read for this matrix.
+
+    Which layout a call reads depends on M through the tuned producer, so the
+    rank-32 packed layout (for K in the packed set) and the rank-128 K-major
+    layout are both built when they can apply.
+    """
+    rank = l2t_smoothed.shape[1]
+    layouts: dict[str, torch.Tensor] = {}
+    if rank == 32 and l2t_smoothed.shape[0] in _SM120_M537_PACKED_L2T_K:
+        layouts["m537"] = _pack_sm120_m537_l2t(l2t_smoothed)
+    if rank > 64:
+        layouts["kmajor"] = _pack_sm120_kmajor_l2t(l2t_smoothed)
+    key = _prepared_l2t_key(l2t_smoothed)
+    if not layouts:
+        _SM120_PREPARED_L2T.pop(key, None)
+        return
+
+    def discard(dead_ref: weakref.ReferenceType, *, key: tuple = key) -> None:
+        current = _SM120_PREPARED_L2T.get(key)
+        if current is not None and current[0] is dead_ref:
+            _SM120_PREPARED_L2T.pop(key, None)
+
+    version = None if l2t_smoothed.is_inference() else int(l2t_smoothed._version)
+    _SM120_PREPARED_L2T[key] = (weakref.ref(l2t_smoothed, discard), version, layouts)
+
+
 def _cached_l2t_pack(
     l2t_smoothed: torch.Tensor,
     pack: Callable[[torch.Tensor], torch.Tensor],
     cache: OrderedDict[int, tuple[weakref.ReferenceType, int, torch.Tensor]],
+    layout: str,
 ) -> torch.Tensor:
     """Cache one L2T layout transform per source tensor; invalidate on mutation."""
+    # A layout built by prepare_svdquant_l2t() also serves graph capture and
+    # inference tensors, which otherwise repack on every call (and replay).
+    prepared = _prepared_l2t_layout(l2t_smoothed, layout)
+    if prepared is not None:
+        return prepared
     # Capture the pack so graph replay observes weight updates without Python
     # cache lookups. Keep graph-owned buffers out of the eager cache as well.
     # Inference tensors have no version counter and must also be repacked.
@@ -197,7 +260,7 @@ def _cached_l2t_pack(
 def _cached_sm120_m537_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
     """Cache the M537 / packed-small-M L2T pack."""
     return _cached_l2t_pack(
-        l2t_smoothed, _pack_sm120_m537_l2t, _SM120_M537_PACKED_L2T_CACHE
+        l2t_smoothed, _pack_sm120_m537_l2t, _SM120_M537_PACKED_L2T_CACHE, "m537"
     )
 
 
@@ -214,7 +277,7 @@ def _pack_sm120_kmajor_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
 def _cached_sm120_kmajor_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
     """Cache the K-major L2T the wide-rank large-M producer reads."""
     return _cached_l2t_pack(
-        l2t_smoothed, _pack_sm120_kmajor_l2t, _SM120_KMAJOR_L2T_CACHE
+        l2t_smoothed, _pack_sm120_kmajor_l2t, _SM120_KMAJOR_L2T_CACHE, "kmajor"
     )
 
 

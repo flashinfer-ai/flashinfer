@@ -1101,7 +1101,10 @@ def svdquant_linear(
     The invariant per-layer transforms must be prepared offline by the caller:
     ``l2t_smoothed = (pre_quant_scale[:, None] * svdquant_lora_a.T).to(bf16)`` with shape
     ``(k, r)`` and ``l1_scaled = (svdquant_lora_b / alpha).to(bf16)`` with shape ``(n, r)``,
-    where the LoRA rank ``r`` is a positive multiple of 32.
+    where the LoRA rank ``r`` is a positive multiple of 32. On SM120, also pass
+    ``l2t_smoothed`` through :func:`prepare_svdquant_l2t` once at load time; this is
+    required for CUDA graph capture and ``torch.inference_mode`` not to re-layout it
+    on every call.
 
     Parameters
     ----------
@@ -1205,3 +1208,41 @@ def svdquant_linear(
         enable_pdl=enable_pdl,
         backend=backend,
     )
+
+
+@flashinfer_api
+def prepare_svdquant_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
+    r"""Prepare a layer's ``l2t_smoothed`` once, at weight-load time.
+
+    Some SM120 fused producers read L2T in a layout other than ``(k, r)``
+    row-major: K-major for rank 128 at large M, a lane-packed layout for rank 32
+    on some K. Without preparation :func:`svdquant_linear` derives that layout per
+    call and caches it by tensor identity and version, which cannot apply inside
+    CUDA graph capture or to inference tensors -- there the transform runs on
+    every call and every graph replay. Preparing builds every layout the tuned
+    producers may read, once, and :func:`svdquant_linear` reuses it in all modes.
+
+    Returns ``l2t_smoothed`` itself; pass that same tensor to
+    :func:`svdquant_linear`. Prepare again after modifying it in place. On
+    devices other than SM120 this is a no-op.
+
+    Parameters
+    ----------
+    l2t_smoothed: torch.Tensor
+        ``pre_quant_scale[:, None] * L2ᵀ``, shape ``(k, r)`` bf16, contiguous.
+
+    Returns
+    -------
+    l2t_smoothed: torch.Tensor
+        The input tensor.
+    """
+    if l2t_smoothed.is_cuda and get_compute_capability(l2t_smoothed.device) == (12, 0):
+        if l2t_smoothed.ndim != 2 or not l2t_smoothed.is_contiguous():
+            raise ValueError(
+                "prepare_svdquant_l2t expects a contiguous (k, r) tensor, got "
+                f"shape {tuple(l2t_smoothed.shape)}"
+            )
+        from .svdquant_sm120_cutlass import prepare_sm120_l2t
+
+        prepare_sm120_l2t(l2t_smoothed)
+    return l2t_smoothed
