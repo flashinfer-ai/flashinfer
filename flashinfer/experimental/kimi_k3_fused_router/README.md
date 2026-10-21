@@ -61,11 +61,15 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
   the portable cluster size; the generated program sets the non-portable
   cluster-size attribute on that kernel before launching it, and preparation
   requires the driver to admit at least one such cluster on the device.
-- One source per kernel serves both architectures (architecture-specific
-  lines sit behind `__CUDA_ARCH__` guards) and both route block alignments
-  (`-DBLOCK_M=8` / `-DBLOCK_M=16` on the compile line); the registry in
-  `cake_jit.py` lists each program once and maps the per-architecture
-  dispatch keys to it.
+- Every kernel source serves both architectures (the architecture-specific
+  lines of the L, LP and M arms sit behind `__CUDA_ARCH__` guards) and both
+  route block alignments (`-DBLOCK_M=8` / `-DBLOCK_M=16` on the compile
+  line). The registry in `cake_jit.py` lists each program (a kernel source
+  with its launcher) once and maps the per-architecture dispatch keys to
+  it; the L, LP and M arms keep one program per architecture, and the two
+  programs of such an arm compile the same kernel source, the SM103
+  program selecting its own kernel symbol through the `CAKE_PROGRAM_KERNEL`
+  compile definition.
 - Nothing is planned on the host and nothing is allocated at launch: a
   prepared runner (or a CUDA Graph capturing it) replays for new `logits` /
   `bias` values written into the same buffers.

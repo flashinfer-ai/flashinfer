@@ -36,7 +36,11 @@ from ...jit.utils import write_if_different
 # units and the shared headers they include).  One source serves every listed
 # architecture: architecture-specific lowering lines sit behind
 # ``__CUDA_ARCH__`` guards inside the source and the loader compiles it with
-# the flag set of the device it runs on.  Programs whose persistent grid is
+# the flag set of the device it runs on.  Where the two records of one arm
+# (one per architecture: the plan builders L, LP and M) share a kernel
+# source, the SM103 record names its own kernel symbol through the
+# ``CAKE_PROGRAM_KERNEL`` compile definition in its ``compile_flags``; the
+# source defines the SM100 symbol by default.  Programs whose persistent grid is
 # bounded by the driver's co-resident cluster capacity (the 4-CTA-cluster arms
 # and the 16-CTA cluster of the sixteen-token kernel) also carry the
 # declaration of their kernel; the occupancy unit below forwards it to
@@ -169,10 +173,12 @@ MODULES: dict[str, dict[str, Any]] = {
         "num_tokens": None,
         "arches": ["sm_103a"],
         "sources": [
-            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_60dbc59ea4518ad97b9f_kernel.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_e9d0e24ee4dbca06542a_kernel.cu",
             "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_60dbc59ea4518ad97b9f_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fused_router_60dbc59ea4518ad97b9f",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "logits"],
@@ -206,10 +212,12 @@ MODULES: dict[str, dict[str, Any]] = {
         "num_tokens": None,
         "arches": ["sm_103a"],
         "sources": [
-            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_708d694a9c7844cdce53_kernel.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_b68f1c43a8ff937bf31b_kernel.cu",
             "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_708d694a9c7844cdce53_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fused_router_708d694a9c7844cdce53",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "logits"],
@@ -243,10 +251,12 @@ MODULES: dict[str, dict[str, Any]] = {
         "num_tokens": None,
         "arches": ["sm_103a"],
         "sources": [
-            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_71d1c647e2fbe0eeb09d_kernel.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_045ff7650cba571a4f5a_kernel.cu",
             "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_71d1c647e2fbe0eeb09d_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fused_router_71d1c647e2fbe0eeb09d",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "logits"],
