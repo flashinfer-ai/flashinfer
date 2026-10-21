@@ -13,12 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Tests for the SM100 eight-peer Cake fused norm-combine export.
+Tests for the SM100 / SM103 eight-peer Cake fused norm-combine export.
 
-The CPU tests check the verified module inventory, the token dispatch, the
-workspace layout helper and the argument validation of the public API.  The
-distributed test runs the public API on eight SM100 GPUs against an
-independent PyTorch reference of the same math."""
+The CPU tests check the token dispatch, the build-target scope, the persistent
+grid rule, the workspace layout helper and the argument validation of the
+public API.  The distributed test runs the public API on eight SM100 or eight
+SM103 GPUs against an independent PyTorch reference of the same math."""
 
 from __future__ import annotations
 
@@ -42,58 +42,6 @@ RTOL = 1e-2
 WORKER_TIMEOUT_SECONDS = 20 * 60
 
 
-def test_module_inventory_is_verified_source_only() -> None:
-    assert loader.MODULES
-    assert set(loader.ROUTES) == {loader.VARIANT_ONE_SHOT, loader.VARIANT_OWNER_REDUCE}
-    assert set(loader.ROUTES.values()) == set(loader.MODULES)
-    for name, record in loader.MODULES.items():
-        assert name.startswith("cake_") and record["cache_name"].startswith("cake_")
-        assert record["kernel_symbol"].startswith("kernel_cake_")
-        assert record["ffi_entry"] == "run"
-        paths = loader.verified_sources(name)
-        assert len(paths) == 2 and all(path.suffix == ".cu" for path in paths)
-        kinds = {kind for kind, _key in record["arg_plan"]}
-        assert kinds == {"buffer", "parameter", "grid"}
-        assert {key for kind, key in record["arg_plan"] if kind == "buffer"} == {
-            "x",
-            "residual",
-            "weight",
-            "norm_out",
-            "residual_out",
-            "collective_out",
-            "workspace",
-        }
-        assert {key for kind, key in record["arg_plan"] if kind == "parameter"} == {
-            "rank",
-            "tokens",
-            "epsilon",
-        }
-        assert record["arg_plan"][-3:] == [
-            ("grid", "grid_x"),
-            ("grid", "grid_y"),
-            ("grid", "grid_z"),
-        ]
-        launch = record["launch"]
-        assert launch["use_pdl"] is True
-        assert launch["cooperative"] is False
-        assert tuple(launch["cluster"]) == (1, 1, 1)
-    one_shot = loader.MODULES[loader.ROUTES[loader.VARIANT_ONE_SHOT]]["launch"]
-    owner = loader.MODULES[loader.ROUTES[loader.VARIANT_OWNER_REDUCE]]["launch"]
-    # The one-shot half runs both tracks concurrently (two 160-thread halves);
-    # the owner reduce keeps the source's 160-thread row.
-    assert tuple(one_shot["block"]) == (320, 1, 1)
-    assert tuple(owner["block"]) == (160, 1, 1)
-
-
-def test_jit_spec_math_flags_follow_the_source_build() -> None:
-    # The source arm compiles the same translation units without fast-math unless
-    # the recorded compile flags say otherwise; the JIT build must not add it.
-    for name, record in loader.MODULES.items():
-        flags = loader.spec(name).extra_cuda_cflags or []
-        fast = any(flag in ("-use_fast_math", "--use_fast_math") for flag in flags)
-        assert fast == ("--use_fast_math" in record["compile_flags"]), name
-
-
 @pytest.mark.parametrize(
     "tokens,expected",
     [
@@ -102,14 +50,16 @@ def test_jit_spec_math_flags_follow_the_source_build() -> None:
         (64, loader.VARIANT_ONE_SHOT),
         (255, loader.VARIANT_ONE_SHOT),
         (256, loader.VARIANT_OWNER_REDUCE),
-        (1024, loader.VARIANT_OWNER_REDUCE),
-        (2048, loader.VARIANT_OWNER_REDUCE),
+        (1023, loader.VARIANT_OWNER_REDUCE),
+        (1024, loader.VARIANT_PIPELINED),
+        (2048, loader.VARIANT_PIPELINED),
     ],
 )
 def test_token_dispatch(tokens: int, expected: str) -> None:
     assert loader.LARGE_MIN_TOKENS == 256
+    assert loader.WIDE_MIN_TOKENS == 1024
     assert loader.select_variant(tokens) == expected
-    assert loader.route_module_name(tokens) == loader.ROUTES[expected]
+    assert expected in loader.VARIANTS
     assert api.select_variant(tokens) == expected
 
 
@@ -119,19 +69,91 @@ def test_token_dispatch_rejects_non_positive_counts(tokens) -> None:
         loader.select_variant(tokens)
 
 
-def test_route_scope_is_eight_sm100_peers_with_hidden_2560() -> None:
-    assert loader.route_applies(
-        world_size=8, device_capability=(10, 0), hidden_dim=2560
+@pytest.mark.parametrize(
+    "tokens,capacity,expected",
+    [
+        (1, 1184, 1),
+        (1184, 1184, 1184),
+        (1185, 1184, 1183),
+        (2048, 1184, 1183),
+        (2048, 1185, 1185),
+        (2048, 2, 1),
+    ],
+)
+def test_persistent_grid_is_every_token_or_the_largest_odd_co_resident_grid(
+    tokens: int, capacity: int, expected: int
+) -> None:
+    assert loader.persistent_grid(tokens, capacity) == expected
+
+
+def test_grid_rules_size_the_persistent_grid_from_the_queried_capacity() -> None:
+    assert loader.launch_grid_x(2048, {"kind": "per_token"}) == 2048
+    for variant in (loader.VARIANT_ONE_SHOT, loader.VARIANT_OWNER_REDUCE):
+        assert loader.VARIANTS[variant]["grid_rule"] == {"kind": "per_token"}
+        assert "capacity_receipt" not in loader.VARIANTS[variant]
+    wide = loader.VARIANTS[loader.VARIANT_PIPELINED]
+    rule = wide["grid_rule"]
+    assert rule == {"kind": "co_resident"}
+    receipt = wide["capacity_receipt"]
+    assert receipt["ctas_per_sm"] >= 1 and receipt["sm_count"] >= 1
+    pinned = receipt["ctas_per_sm"] * receipt["sm_count"]
+    assert loader.launch_grid_x(2048, rule, capacity=pinned) == loader.persistent_grid(
+        2048, pinned
     )
-    assert not loader.route_applies(
-        world_size=4, device_capability=(10, 0), hidden_dim=2560
-    )
-    assert not loader.route_applies(
-        world_size=8, device_capability=(10, 3), hidden_dim=2560
-    )
-    assert not loader.route_applies(
-        world_size=8, device_capability=(10, 0), hidden_dim=4096
-    )
+    assert loader.launch_grid_x(1, rule, capacity=pinned) == 1
+    assert loader.launch_grid_x(2048, rule, capacity=1185) == 1185
+    with pytest.raises(ValueError):
+        loader.launch_grid_x(8, rule)
+    with pytest.raises(ValueError):
+        loader.launch_grid_x(8, {"kind": "unknown"})
+    with pytest.raises(ValueError):
+        loader.co_resident_capacity(loader.VARIANT_ONE_SHOT, 0)
+    assert loader.OCCUPANCY_SOURCE.endswith("cake_fused_norm_combine_occupancy.cu")
+
+
+def _pin_build_targets(monkeypatch, arch_list: str) -> None:
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", arch_list)
+    loader.target_capabilities.cache_clear()
+
+
+def test_route_scope_is_eight_sm100_or_sm103_peers_with_hidden_2560(
+    monkeypatch,
+) -> None:
+    _pin_build_targets(monkeypatch, "9.0 10.0 10.3 12.0f")
+    try:
+        assert loader.target_capabilities() == ((10, 0), (10, 3))
+        assert loader.supported_capability((10, 0)) == (10, 0)
+        assert loader.supported_capability((10, 3)) == (10, 3)
+        for capability in ((9, 0), (12, 0), (12, 1)):
+            assert loader.supported_capability(capability) is None
+        for capability in ((10, 0), (10, 3)):
+            assert loader.route_applies(
+                world_size=8, device_capability=capability, hidden_dim=2560
+            )
+            assert not loader.route_applies(
+                world_size=4, device_capability=capability, hidden_dim=2560
+            )
+            assert not loader.route_applies(
+                world_size=8, device_capability=capability, hidden_dim=4096
+            )
+        for capability in ((9, 0), (12, 0), (12, 1)):
+            assert not loader.route_applies(
+                world_size=8, device_capability=capability, hidden_dim=2560
+            )
+        gencode = [flag for flag in loader.nvcc_flags() if flag.startswith("-gencode=")]
+        assert gencode == [
+            "-gencode=arch=compute_100a,code=sm_100a",
+            "-gencode=arch=compute_103a,code=sm_103a",
+        ]
+        # A target list without an SM103 entry leaves B300 outside the route.
+        _pin_build_targets(monkeypatch, "10.0")
+        assert loader.target_capabilities() == ((10, 0),)
+        assert loader.supported_capability((10, 3)) is None
+        assert not loader.route_applies(
+            world_size=8, device_capability=(10, 3), hidden_dim=2560
+        )
+    finally:
+        loader.target_capabilities.cache_clear()
 
 
 def test_workspace_layout_matches_the_kernel_contract() -> None:
@@ -321,6 +343,17 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             group=dist.group.WORLD,
             device=device,
         )
+        # The persistent grid is sized from the driver's occupancy answer for
+        # the compiled kernel; on a device with the recorded SM count that
+        # answer must reproduce the delivered capacity receipt.
+        capacity = loader.co_resident_capacity(loader.VARIANT_PIPELINED, rank)
+        receipt = loader.VARIANTS[loader.VARIANT_PIPELINED]["capacity_receipt"]
+        assert capacity >= 1, capacity
+        if loader.device_facts(rank).sm_count == receipt["sm_count"]:
+            assert capacity == receipt["ctas_per_sm"] * receipt["sm_count"], (
+                capacity,
+                receipt,
+            )
         epsilon = 1e-6
         for tokens in TOKENS_UNDER_TEST:
             generator = torch.Generator(device="cpu").manual_seed(
@@ -379,14 +412,20 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         dist.destroy_process_group()
 
 
-def _sm100_eight_gpu_node() -> bool:
+def _exported_eight_gpu_node() -> bool:
     if not torch.cuda.is_available() or torch.cuda.device_count() < 8:
         return False
-    return all(torch.cuda.get_device_capability(index) == (10, 0) for index in range(8))
+    capabilities = {
+        tuple(torch.cuda.get_device_capability(index)) for index in range(8)
+    }
+    return len(capabilities) == 1 and capabilities.issubset(
+        loader.SUPPORTED_CAPABILITIES
+    )
 
 
 @pytest.mark.skipif(
-    not _sm100_eight_gpu_node(), reason="requires eight SM100 GPUs on one node"
+    not _exported_eight_gpu_node(),
+    reason="requires eight SM100 or eight SM103 GPUs on one node",
 )
 def test_eight_peer_fused_norm_combine_matches_the_reference() -> None:
     world_size = 8

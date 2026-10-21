@@ -196,6 +196,8 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         apply_topk_in_fc1: bool = True,
         swiglu_alpha: Optional[float] = None,
         swiglu_beta: Optional[float] = None,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
         gate_up_clamp: Optional[float] = None,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         flag_batch: int = 1,
@@ -286,6 +288,8 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             apply_topk_in_fc1=apply_topk_in_fc1,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
             gate_up_clamp=gate_up_clamp,
             epi_flag_batch=epi_flag_batch,
         )
@@ -592,6 +596,9 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 16,
             ),
         ]
+        # Bound CTA0's scan to decode capacities; prefill keeps full-grid routing.
+        if self.max_tokens_per_rank <= 1024:
+            specs.append(_RegionSpec("dispatch_route_extent", cutlass.Int32, (2,), 16))
         if self.token_back_enabled:
             # Per-expert fc2 completion gate consumed by the token-back push
             # (DATA and/or SF).  Published by the fc2 epilogue for every enabled
@@ -978,6 +985,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             f"_fc2out{self.fc2_output_dtype.__name__}_combine{self.combine_format}_sfvec{self.sf_vec_size}"
             f"_acc{self.acc_dtype.__name__}_swiglua{self.swiglu_alpha}"
             f"_swiglub{self.swiglu_beta}_clamp{self.gate_up_clamp}_epiflag{epiflag}"
+            f"_situ{self.situ_beta}_linear{self.situ_linear_beta}"
             # MegaMoE-specific constexpr:
             f"_ep_{self.world_size}_topk_{self.num_topk}_maxtoken_{self.max_tokens_per_rank}"
             f"_flagbatch_{self.flag_batch}"
@@ -1467,6 +1475,10 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             grid_sync_counter=grid_sync_counter,
             local_zero_prefix=local_zero_prefix,
             shared_zero_prefix=shared_zero_prefix,
+            dispatch_route_extent=(
+                self._view_local(local_workspace, "dispatch_route_extent")
+                if cutlass.const_expr(self.max_tokens_per_rank <= 1024) else None
+            ),
             peer_rank_ptr_mapper=peer_rank_ptr_mapper,
             world_size=self.world_size,
             local_rank=peer_rank_ptr_mapper_host.rank_idx,
@@ -1543,12 +1555,18 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 self.num_topk,
                 self.combine_format,
                 sm_arch=get_cutedsl_target_arch(),
+                num_experts=self.num_total_experts,
             )(
                 combine_target,
                 combine_sf,
                 output_activation,
                 score,
                 stream,
+                topk_indices=(
+                    topk_idx
+                    if cutlass.const_expr(not self.combine_format.is_quantized)
+                    else None
+                ),
             )
 
     # =========================================================================

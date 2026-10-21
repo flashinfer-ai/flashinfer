@@ -220,7 +220,7 @@ _FLASH_KDA_PERSISTENT_TASK_REFILL_CHUNKS = 2
 _flash_kda_tensor_cache: dict[tuple, torch.Tensor] = {}
 _flash_kda_tensor_cache_lock = threading.Lock()
 
-_PackedMetadataSignature = tuple[int, int, int, int, bool]
+_PackedMetadataSignature = tuple[Optional[int], int, int, int, bool]
 _PersistentTaskPlan = tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
 _PackedTaskMetadata = tuple[
     tuple[int, ...],
@@ -539,25 +539,29 @@ class _RecurrentKDAPrefillWorkspaceBase:
 
 
 class RecurrentKDAPrefillWorkspace(_RecurrentKDAPrefillWorkspaceBase):
-    """Caller-owned storage required for recurrent-KDA CUDA graph capture.
+    """Caller-owned storage for native recurrent-KDA CUDA graph capture.
+
+    Auto-selected cuDNN leaves this workspace unused and manages its own scratch.
 
     Construct one workspace per captured
     :func:`flashinfer.kda.recurrent_kda` invocation on the graph's CUDA
     device. Warm it by invoking that function eagerly with the exact tensors
-    and capture stream, then synchronize that stream before capture. The
-    workspace owns optional final-state scratch, backend metadata, TMA
+    and capture stream, then synchronize that stream before capture. Packed
+    offsets must retain their warmed values through capture and replay.
+    Inference tensors have no version counter, so their offsets are reread on
+    every eager call.
+
+    The workspace owns optional final-state scratch, backend metadata, TMA
     descriptors, and schedule-specific scratch for the lifetime of the graph.
     On SM100-family devices this includes beta padding, M64/M128-N32/M128-N16
     and BT64 descriptor storage, small-BH packet-ring storage, and BT16
     prepare/chain metadata, factors, and independent descriptor storage.
-    Persistent M128 is an eager-only B200/GB200 route; explicit workspaces use
-    non-persistent direct, M64, small-BH, or eligible BT16 schedules so graph
-    capture never synchronizes sequence lengths to construct host task bins.
+    Cake's persistent M128 route is eager-only; its explicit workspaces use
+    non-persistent schedules to avoid reading sequence lengths on the host.
 
-    A workspace binds to its first stream. Once it participates in capture it
-    cannot be passed to Python again, either eagerly or in another capture.
-    Graph replay does not invoke Python and remains valid for the lifetime of
-    the workspace.
+    Native use binds the workspace to its first stream. After native capture,
+    another native Python call cannot reuse it. Graph replay remains valid
+    for the lifetime of the workspace.
     """
 
 
@@ -2648,8 +2652,10 @@ def _cached_packed_task_metadata(
 ) -> _PackedTaskMetadata:
     """Cache host-built sequence order and optional persistent task bins."""
 
+    version = None if cu_seqlens.is_inference() else int(cu_seqlens._version)
+    capturing = torch.cuda.is_current_stream_capturing()
     signature = (
-        int(cu_seqlens._version),
+        version,
         total_tokens,
         num_heads,
         sm_count,
@@ -2658,12 +2664,13 @@ def _cached_packed_task_metadata(
     with workspace._packed_metadata_lock:
         cached_metadata = workspace._packed_metadata
         if (
-            workspace._packed_metadata_tensor is cu_seqlens
+            (version is not None or capturing)
+            and workspace._packed_metadata_tensor is cu_seqlens
             and workspace._packed_metadata_signature == signature
             and cached_metadata is not None
         ):
             return cached_metadata
-        if torch.cuda.is_current_stream_capturing():
+        if capturing:
             raise RuntimeError(
                 "packed recurrent_kda prefill metadata is not warmed for "
                 "CUDA graph capture; eagerly invoke the same offsets once "
@@ -3138,6 +3145,23 @@ def _bind_workspace(
         )
 
 
+def _tensor_byte_range(tensor: torch.Tensor) -> tuple[int, int]:
+    start = tensor.data_ptr()
+    if tensor.is_contiguous():
+        return start, start + tensor.nbytes
+    span = 1 + sum(
+        (size - 1) * stride
+        for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+        if size > 0
+    )
+    return start, start + span * tensor.element_size()
+
+
+def _overlaps_range(start: int, end: int, tensor: torch.Tensor) -> bool:
+    other_start, other_end = _tensor_byte_range(tensor)
+    return start < other_end and other_start < end
+
+
 def _storage_ranges_overlap(
     left: torch.Tensor,
     right: torch.Tensor,
@@ -3145,23 +3169,11 @@ def _storage_ranges_overlap(
     if left.device != right.device or left.numel() == 0 or right.numel() == 0:
         return False
 
-    def storage_end(tensor: torch.Tensor) -> int:
-        max_element_offset = sum(
-            (size - 1) * stride
-            for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
-            if size > 0
-        )
-        return tensor.data_ptr() + (max_element_offset + 1) * tensor.element_size()
-
-    left_start = left.data_ptr()
-    right_start = right.data_ptr()
-    left_end = storage_end(left)
-    right_end = storage_end(right)
-    return left_start < right_end and right_start < left_end
+    return _overlaps_range(*_tensor_byte_range(left), right)
 
 
 def _check_output_does_not_overlap_inputs(
-    output: torch.Tensor,
+    output: Optional[torch.Tensor],
     *,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3170,6 +3182,10 @@ def _check_output_does_not_overlap_inputs(
     beta: torch.Tensor,
     initial_state: Optional[torch.Tensor],
 ) -> None:
+    if output is None or output.numel() == 0:
+        return
+    output_device = output.device
+    output_start, output_end = _tensor_byte_range(output)
     for name, tensor in (
         ("q", q),
         ("k", k),
@@ -3178,7 +3194,9 @@ def _check_output_does_not_overlap_inputs(
         ("beta", beta),
         ("initial_state", initial_state),
     ):
-        if tensor is not None and _storage_ranges_overlap(output, tensor):
+        if tensor is None or tensor.device != output_device or tensor.numel() == 0:
+            continue
+        if _overlaps_range(output_start, output_end, tensor):
             raise ValueError(
                 f"output must not overlap {name} for frozen recurrent_kda prefill"
             )
@@ -5492,10 +5510,13 @@ def _generated_affine_state_indices_i64(
 ) -> torch.Tensor:
     """Return the warmed int64 carrier used by the affine state scatter."""
 
-    source_version = int(state_indices._version)
+    source_version = (
+        None if state_indices.is_inference() else int(state_indices._version)
+    )
     destination_ptr = plan.state_indices_i64.data_ptr()
     if not (
         not capturing
+        and source_version is not None
         and workspace._generated_affine_state_indices_tensor is state_indices
         and workspace._generated_affine_state_indices_version == source_version
         and workspace._generated_affine_state_indices_destination_ptr == destination_ptr
@@ -6179,7 +6200,7 @@ def _run_flash_kda_prefill(
     else:
         out_buf = output
     _check_output_does_not_overlap_inputs(
-        out_buf,
+        output,
         q=q,
         k=k,
         v=v,
@@ -7461,9 +7482,19 @@ class KDAPrefillPlanCache:
         self._bytes: dict[object, int] = {}
         self.bytes = 0
         self.hits = 0
+        self.fast_hits = 0
         self.misses = 0
         self.uncacheable = 0
         self.evictions = 0
+        # Last hit: (address-level signature, entry).  A repeat call whose
+        # caller tensors kept their addresses, layouts and dtypes needs no
+        # rebind at all (static buffers, CUDA-graph style loops, allocator
+        # reuse between forwards), so ``get`` answers it from this memo.
+        self._last_fast = None
+        self._last_entry = None
+        # Address-level facts of the inputs each entry is currently bound to;
+        # a hit rebinds only the inputs whose facts changed.
+        self._facts: dict[object, tuple] = {}
 
     def __len__(self):
         return len(self._entries)
@@ -7475,12 +7506,19 @@ class KDAPrefillPlanCache:
                 close()
         self._entries.clear()
         self._bytes.clear()
+        self._facts.clear()
         self.bytes = 0
+        self._last_fast = None
+        self._last_entry = None
 
     def _evict_oldest(self):
         key, (evicted, _) = self._entries.popitem(last=False)
         self.bytes -= self._bytes.pop(key, 0)
+        self._facts.pop(key, None)
         self.evictions += 1
+        if self._last_entry is not None and self._last_entry[0] is evicted:
+            self._last_fast = None
+            self._last_entry = None
         close = getattr(evicted, "close", None)
         if callable(close):
             close()
@@ -7500,19 +7538,68 @@ class KDAPrefillPlanCache:
         graph replays with self-contained descriptor contents.
         """
         import torch
-        from .cake_kda_tf32_runtime import rebind_prepared_launch
+        from .cake_kda_tf32_runtime import (
+            AFFINE_DEFERRED_PARTS,
+            REBIND_INPUT_NAMES,
+            rebind_prepared_launch,
+            rebind_signature_and_facts,
+        )
 
-        key = self._key(inputs, **scalars)
+        signature, facts = rebind_signature_and_facts(inputs)
+        scalar_key = tuple(sorted(scalars.items()))
+        fast = (facts, scalar_key)
+        if fast == self._last_fast:
+            # Same addresses, layouts, dtypes and scalars as the previous hit:
+            # the prepared launch is already bound to these tensors.
+            prepared, _ = self._last_entry
+            if torch.cuda.is_current_stream_capturing():
+                getattr(prepared, "_impl", prepared)._descriptors_stale = True
+            self.hits += 1
+            self.fast_hits += 1
+            return prepared
+        key = (signature, scalar_key)
         entry = self._entries.get(key)
         if entry is None:
             return None
         self._entries.move_to_end(key)
         prepared, plan = entry
         owner = getattr(prepared, "_impl", prepared)
-        tma_moved = rebind_prepared_launch(owner, plan, inputs, signature=key[0])
-        if tma_moved or torch.cuda.is_current_stream_capturing():
+        bound = self._facts.get(key)
+        if bound == facts:
+            # Bound to exactly these tensors already (another entry was hit in
+            # between); nothing to re-point.
+            self.fast_hits += 1
+        else:
+            changed = None
+            if bound is not None:
+                # Same structural key, so only addresses can differ: re-point
+                # the views and addresses of the moved inputs only.
+                changed = frozenset(
+                    name
+                    for name, before, after in zip(
+                        REBIND_INPUT_NAMES, bound, facts, strict=True
+                    )
+                    if before != after
+                )
+            # The rebind marks the launches whose descriptor sources moved.
+            rebind_prepared_launch(
+                owner,
+                plan,
+                inputs,
+                signature=key[0],
+                changed=changed,
+                addresses=facts,
+                defer_parts=AFFINE_DEFERRED_PARTS if hasattr(owner, "_main") else (),
+            )
+            self._facts[key] = facts
+        if torch.cuda.is_current_stream_capturing():
+            # A captured launch always re-encodes so the graph replays with
+            # self-contained descriptor contents; outside capture the rebind
+            # marked exactly the launches whose descriptor sources moved.
             owner._descriptors_stale = True
         self.hits += 1
+        self._last_fast = fast
+        self._last_entry = entry
         return prepared
 
     def put(self, prepared, inputs, *, retained_bytes: int = 0, **scalars):
@@ -7523,7 +7610,10 @@ class KDAPrefillPlanCache:
         evicts least-recently-used entries until both the entry count and the
         byte budget hold, always keeping the newest entry.
         """
-        from .cake_kda_tf32_runtime import capture_rebind_plan
+        from .cake_kda_tf32_runtime import (
+            capture_rebind_plan,
+            rebind_signature_and_facts,
+        )
 
         owner = getattr(prepared, "_impl", prepared)
         if not (hasattr(owner, "args") or hasattr(owner, "_main")):
@@ -7533,7 +7623,10 @@ class KDAPrefillPlanCache:
         key = self._key(inputs, **scalars)
         if key in self._entries:
             self.bytes -= self._bytes.pop(key, 0)
+        self._last_fast = None
+        self._last_entry = None
         self._entries[key] = (prepared, plan)
+        self._facts[key] = rebind_signature_and_facts(inputs)[1]
         self._entries.move_to_end(key)
         self._bytes[key] = int(retained_bytes)
         self.bytes += int(retained_bytes)
@@ -7610,8 +7703,14 @@ def _prepare_kda_prefill(
                 checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
                 in_place_state=initial_state is final_state,
             )
-            with torch.cuda.device(q.device):
+            # ``torch.cuda.device`` costs several microseconds per entry; the
+            # hit path only needs it when another device is current.
+            device_index = q.get_device()
+            if torch.cuda.current_device() == device_index:
                 cached = plan_cache.get(cache_inputs, **cache_scalars)
+            else:
+                with torch.cuda.device(device_index):
+                    cached = plan_cache.get(cache_inputs, **cache_scalars)
             if cached is not None:
                 return cached
 

@@ -87,7 +87,7 @@ def stubbed_fleet_registry():
     """Inject a stub Fleet class that records dispatch/combine/destroy calls."""
     from unittest import mock
 
-    from flashinfer.moe_ep.core.comm.fleet import _BACKEND_REGISTRY
+    from flashinfer.moe_ep.core.comm.fleet import _FLEET_REGISTRY
 
     log: list[str] = []
 
@@ -127,20 +127,20 @@ def stubbed_fleet_registry():
         def destroy(self):
             log.append("destroy")
 
-    saved_nccl = _BACKEND_REGISTRY.get("nccl_ep")
-    saved_nixl = _BACKEND_REGISTRY.get("nixl_ep")
-    _BACKEND_REGISTRY["nccl_ep"] = _StubFleet
-    _BACKEND_REGISTRY["nixl_ep"] = _StubFleet
+    saved_nccl = _FLEET_REGISTRY.get("nccl_ep")
+    saved_nixl = _FLEET_REGISTRY.get("nixl_ep")
+    _FLEET_REGISTRY["nccl_ep"] = _StubFleet
+    _FLEET_REGISTRY["nixl_ep"] = _StubFleet
     with mock.patch("flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend"):
         yield log
     if saved_nccl is not None:
-        _BACKEND_REGISTRY["nccl_ep"] = saved_nccl
+        _FLEET_REGISTRY["nccl_ep"] = saved_nccl
     else:
-        _BACKEND_REGISTRY.pop("nccl_ep", None)
+        _FLEET_REGISTRY.pop("nccl_ep", None)
     if saved_nixl is not None:
-        _BACKEND_REGISTRY["nixl_ep"] = saved_nixl
+        _FLEET_REGISTRY["nixl_ep"] = saved_nixl
     else:
-        _BACKEND_REGISTRY.pop("nixl_ep", None)
+        _FLEET_REGISTRY.pop("nixl_ep", None)
 
 
 def pytest_sessionfinish(session, exitstatus):

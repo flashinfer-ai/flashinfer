@@ -21,7 +21,6 @@ from .version import __version__ as __version__
 from .version import __git_commit__ as __git_commit__
 from .version import __git_version__ as __git_version__  # backward compat
 
-
 from . import jit as jit
 from .activation import gelu_and_mul as gelu_and_mul
 from .activation import gelu_tanh_and_mul as gelu_tanh_and_mul
@@ -115,6 +114,12 @@ from .quantization.fp4_quantization import (
     nvfp4_kv_dequantize_paged,
     nvfp4_kv_quantize,
 )
+from .quantization.nvfp4_quantization_utils import (
+    NVFP44Over6Config,
+    NVFP44Over6ErrMode,
+    make_nvfp4_global_scale,
+    resolve_nvfp4_4over6,
+)
 from .quantization.fp8_quantization import (
     mxfp8_dequantize_host,
     mxfp8_grouped_quantize,
@@ -130,6 +135,8 @@ from .attn_scores import fp8_paged_mqa_logits as fp8_paged_mqa_logits
 from .attn_scores import precompile_paged_mqa_logits as precompile_paged_mqa_logits
 from .fused_moe import (
     cutlass_fused_moe,
+    cudnn_frost_grouped_gemm1_swiglu,
+    cudnn_frost_grouped_gemm1_swiglu_workspace_size,
     reorder_rows_for_gated_act_gemm,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
@@ -199,19 +206,24 @@ from .gdn_kernels.experimental import (
     gdn_fused_decode_step as gdn_fused_decode_step,
     gdn_fused_decode_step_supported as gdn_fused_decode_step_supported,
 )
-from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_bf16 as bmm_bf16
 from .gemm import bmm_fp8 as bmm_fp8
 from .gemm import bmm_mxfp8 as bmm_mxfp8
 from .gemm import mm_bf16 as mm_bf16
+from .gemm import mm_bf16_fp4 as mm_bf16_fp4
 from .gemm import mm_fp4 as mm_fp4
+from .gemm import mm_fp8 as mm_fp8
+from .gemm import mm_fp8_lora as mm_fp8_lora
+from .gemm import mm_mxfp8 as mm_mxfp8
+from .gemm import mm_nvfp4_lora as mm_nvfp4_lora
 from .gemm import mm_nvfp4_svdquant as mm_nvfp4_svdquant
 from .gemm import nvfp4_quantize_smooth as nvfp4_quantize_smooth
-from .gemm import svdquant_linear as svdquant_linear
-from .gemm import mm_bf16_fp4 as mm_bf16_fp4
 from .gemm import prepare_bf16_fp4_weights as prepare_bf16_fp4_weights
-from .gemm import mm_fp8 as mm_fp8
-from .gemm import mm_mxfp8 as mm_mxfp8
+from .gemm import prepare_nvfp4_lora_adapter as prepare_nvfp4_lora_adapter
+from .gemm import PreparedNvFp4LoraAdapter as PreparedNvFp4LoraAdapter
+from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
+from .gemm import StaleAdapterError as StaleAdapterError
+from .gemm import svdquant_linear as svdquant_linear
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
 from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
 from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8
@@ -244,6 +256,70 @@ from .norm import rmsnorm as rmsnorm
 from .norm import rmsnorm_quant as rmsnorm_quant
 from .norm import fused_rmsnorm_silu as fused_rmsnorm_silu
 from .norm import fused_qk_rmsnorm_rope as fused_qk_rmsnorm_rope
+from .cake_rmsnorm_train import CakeRMSNormFunction as CakeRMSNormFunction
+from .cake_rmsnorm_train import cake_rmsnorm as cake_rmsnorm
+from .cake_rmsnorm_train import (
+    cake_rmsnorm_train_backward as cake_rmsnorm_train_backward,
+)
+from .cake_rmsnorm_train import (
+    cake_rmsnorm_train_backward_workspace_bytes as cake_rmsnorm_train_backward_workspace_bytes,
+)
+from .cake_rmsnorm_train import (
+    cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
+)
+from .cake_causal_conv1d_train import (
+    CakeCausalConv1dFunction as CakeCausalConv1dFunction,
+)
+from .cake_causal_conv1d_train import cake_causal_conv1d as cake_causal_conv1d
+from .cake_causal_conv1d_train import (
+    cake_causal_conv1d_train_backward as cake_causal_conv1d_train_backward,
+)
+from .cake_causal_conv1d_train import (
+    cake_causal_conv1d_train_backward_workspace_bytes as cake_causal_conv1d_train_backward_workspace_bytes,
+)
+from .cake_causal_conv1d_train import (
+    cake_causal_conv1d_train_forward as cake_causal_conv1d_train_forward,
+)
+from .cake_mhc_train import CakeMHCTrainFinishFunction as CakeMHCTrainFinishFunction
+from .cake_mhc_train import CakeMHCTrainPrepareFunction as CakeMHCTrainPrepareFunction
+from .cake_mhc_train import (
+    cake_mhc_train_backward_finish as cake_mhc_train_backward_finish,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_backward_prepare as cake_mhc_train_backward_prepare,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_backward_workspace_bytes as cake_mhc_train_backward_workspace_bytes,
+)
+from .cake_mhc_train import cake_mhc_train_finish as cake_mhc_train_finish
+from .cake_mhc_train import (
+    cake_mhc_train_forward_finish as cake_mhc_train_forward_finish,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_forward_prepare as cake_mhc_train_forward_prepare,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_forward_stats as cake_mhc_train_forward_stats,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_forward_workspace_bytes as cake_mhc_train_forward_workspace_bytes,
+)
+from .cake_mhc_train import cake_mhc_train_prepare as cake_mhc_train_prepare
+from .cake_gdp import (
+    cake_gated_delta_product_mtp as cake_gated_delta_product_mtp,
+)
+from .norm import gated_residual_rmsnorm as gated_residual_rmsnorm
+from .norm import gated_residual_next_rmsnorm as gated_residual_next_rmsnorm
+from .norm import rmsnorm_sigmoid_gate as rmsnorm_sigmoid_gate
+from .norm import (
+    supports_gated_residual_next_rmsnorm as supports_gated_residual_next_rmsnorm,
+)
+from .norm import (
+    supports_gated_residual_rmsnorm as supports_gated_residual_rmsnorm,
+)
+from .norm import (
+    supports_rmsnorm_sigmoid_gate as supports_rmsnorm_sigmoid_gate,
+)
 from . import nvfp4_attention_sm120 as nvfp4_attention_sm120
 from .nvfp4_attention_sm120 import (
     nvfp4_attention_sm120_fwd as nvfp4_attention_sm120_fwd,
@@ -345,6 +421,7 @@ from .trtllm_low_latency_gemm import (
     prepare_low_latency_gemm_weights as prepare_low_latency_gemm_weights,
 )
 from .utils import next_positive_power_of_2 as next_positive_power_of_2
+from .mla_kv_pack import concat_mla_kv_quant_fp8 as concat_mla_kv_quant_fp8
 from .xqa import xqa as xqa
 from .xqa import xqa_mla as xqa_mla
 from . import mamba as mamba
@@ -423,3 +500,4 @@ from .kda_prefill import KDAPrefillPlanCache as KDAPrefillPlanCache
 from .kda_prefill import (
     kda_prefill_supports_fp32_checkpoints as kda_prefill_supports_fp32_checkpoints,
 )
+from . import megamoe as megamoe

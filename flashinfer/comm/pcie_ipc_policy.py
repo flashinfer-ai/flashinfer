@@ -37,10 +37,11 @@ from enum import IntEnum
 from functools import lru_cache
 from typing import Optional
 
+from .pcie_ipc_collectives._constants import AR_MAX_BLOCKS, PACK_BYTES
 
-# Block counts above this are never useful on either fabric and the workspace
-# is sized for it.
-MAX_BLOCKS = 128
+
+# Preserve the existing AllReduce policy name and configurable workspace default.
+MAX_BLOCKS = AR_MAX_BLOCKS
 
 
 class IpcVariant(IntEnum):
@@ -103,7 +104,7 @@ def _admits(world_size: int, numel: int, elem_size: int) -> bool:
     """
     if world_size not in (2, 4, 8):
         return False
-    pack_elems = 16 // elem_size
+    pack_elems = PACK_BYTES // elem_size
     # Matches the launcher's own check; the kernels address whole 16-byte packs.
     if numel % pack_elems != 0:
         return False
@@ -190,7 +191,8 @@ def _is_launchable(
         # pcie_ipc_ce_ring.cuh says why, and how far that has been established.
         if world_size == 2:
             return False
-        if not 0 < config.blocks <= CE_MAX_PIECES:
+        # The launcher checks blocks <= max_blocks for every variant.
+        if not 0 < config.blocks <= min(CE_MAX_PIECES, max_blocks):
             return False
         # The ring is bound by the fabric rather than by the SM, so the add
         # kernel's geometry is not worth a search dimension. The SM variants
@@ -198,7 +200,7 @@ def _is_launchable(
         if config.threads != CE_THREADS:
             return False
         if numel is not None:
-            pack_elems = 16 // elem_size
+            pack_elems = PACK_BYTES // elem_size
             # The island schedule splits into four chunks whatever the world size.
             shards = (
                 4 if config.variant == IpcVariant.COPY_ENGINE_ISLAND else world_size

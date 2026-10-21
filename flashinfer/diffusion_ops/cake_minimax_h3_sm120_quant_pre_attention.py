@@ -30,6 +30,7 @@ MINIMAX_H3_NUM_HEADS = 56
 MINIMAX_H3_HEAD_DIM = 128
 MINIMAX_H3_QKV_WIDTH = MINIMAX_H3_NUM_HEADS * 3 * MINIMAX_H3_HEAD_DIM  # 21504
 MINIMAX_H3_ROPE_DIM = 96
+MINIMAX_H3_ADALN_ROWS = 9  # the fused norm/AdaLN kernels index a fixed 9-row table
 MINIMAX_H3_SF_BLOCK = 16
 MINIMAX_H3_DEFAULT_EPS = 1.0e-5
 MINIMAX_H3_MAX_ROWS = 1 << 24
@@ -121,25 +122,19 @@ def _check_common(
     _require(
         "x_norm_weight", x_norm_weight, torch.bfloat16, (MINIMAX_H3_HIDDEN,), device
     )
-    if (
-        adaln_scale.ndim != 2
-        or adaln_scale.shape[1] != MINIMAX_H3_HIDDEN
-        or adaln_scale.shape[0] < 1
-    ):
-        raise ValueError(f"adaln_scale must be [rows, {MINIMAX_H3_HIDDEN}]")
-    adaln_rows = int(adaln_scale.shape[0])
+    # The norm/AdaLN kernels index a fixed 9-row table (MINIMAX_H3_ADALN_ROWS).
     _require(
         "adaln_scale",
         adaln_scale,
         torch.bfloat16,
-        (adaln_rows, MINIMAX_H3_HIDDEN),
+        (MINIMAX_H3_ADALN_ROWS, MINIMAX_H3_HIDDEN),
         device,
     )
     _require(
         "adaln_shift",
         adaln_shift,
         torch.bfloat16,
-        (adaln_rows, MINIMAX_H3_HIDDEN),
+        (MINIMAX_H3_ADALN_ROWS, MINIMAX_H3_HIDDEN),
         device,
     )
     _require("adaln_index", adaln_index, torch.int32, (rows,), device)
@@ -534,6 +529,7 @@ def minimax_h3_fp8_pre_attention(
 
         n   = bf16(rmsnorm(x, eps) * x_norm_weight)
         a   = bf16(adaln_shift[i] + n * bf16(1 + adaln_scale[i]))    # i = adaln_index[t]
+        a[i outside [0, 9)] = 0                                      # device-side guard
         a_q = e4m3(a / s_t),  s_t = amax_t(|a|) / 448                 # per-token activation scale
         y   = bf16(a_q @ qkv_weight_q^T * s_t * qkv_weight_scale)     # [M, 56 heads x (Q, K, V) x 128]
         q   = rope(bf16(rmsnorm(y_q, eps) * q_norm_weight)),  k likewise with k_norm_weight,  v = y_v
@@ -549,7 +545,11 @@ def minimax_h3_fp8_pre_attention(
     x_norm_weight : torch.Tensor
         BF16 ``[5376]`` pre-norm weight.
     adaln_scale, adaln_shift : torch.Tensor
-        BF16 ``[rows, 5376]`` AdaLN modulation tables; ``adaln_index`` (int32 ``[M]``) selects a row per token.
+        BF16 ``[9, 5376]`` AdaLN modulation tables (``MINIMAX_H3_ADALN_ROWS`` rows: the fused
+        kernels index a fixed 9-row table).
+    adaln_index : torch.Tensor
+        Int32 ``[M]`` indices selecting one AdaLN modulation row per token; a token whose index
+        lies outside ``[0, 9)`` gets a zero modulated activation.
     qkv_weight_q, qkv_weight_scale : torch.Tensor
         ``float8_e4m3fn [21504, 5376]`` and FP32 ``[21504]`` from :func:`quantize_minimax_h3_qkv_weight_fp8`.
         Output column ``h * 384 + kind * 128 + d`` is channel ``d`` of head ``h`` for ``kind`` 0 = Q, 1 = K, 2 = V.
@@ -566,6 +566,10 @@ def minimax_h3_fp8_pre_attention(
         (row-major) with the caller's per-tensor ``*_global_scale`` (FlashInfer ``fp4_quantize`` semantics).
     q, k, v, q_sf, k_sf, v_sf : Optional[torch.Tensor]
         Optional pre-allocated outputs; allocated when omitted.
+    q_descale, k_descale, v_descale : Optional[Scalar]
+        Per-tensor E4M3 dequantization scales required when ``out_mode == "e4m3"``.
+    q_global_scale, k_global_scale, v_global_scale : Optional[Scalar]
+        NVFP4 global scales required when ``out_mode == "nvfp4"``.
     act_q, act_scale : Optional[torch.Tensor]
         Optional stage-1 workspaces (``float8_e4m3fn [M, 5376]``, FP32 ``[M]``); allocated when omitted.
 
@@ -698,14 +702,48 @@ def minimax_h3_nvfp4_pre_attention(
 
     Parameters
     ----------
-    qkv_weight_q, qkv_weight_sf, qkv_weight_global_scale
+    x : torch.Tensor
+        BF16 ``[M, 5376]`` hidden states.
+    x_norm_weight : torch.Tensor
+        BF16 ``[5376]`` pre-norm weight.
+    adaln_scale, adaln_shift : torch.Tensor
+        BF16 ``[9, 5376]`` AdaLN modulation tables (``MINIMAX_H3_ADALN_ROWS`` rows: the fused
+        kernels index a fixed 9-row table).
+    adaln_index : torch.Tensor
+        Int32 ``[M]`` indices selecting one AdaLN modulation row per token; a token whose index
+        lies outside ``[0, 9)`` gets a zero modulated activation.
+    qkv_weight_q, qkv_weight_sf : torch.Tensor
         Outputs of :func:`quantize_minimax_h3_qkv_weight_nvfp4`.
+    qkv_weight_global_scale : Scalar
+        NVFP4 weight global scale as a float or single-element tensor.
     act_global_scale : torch.Tensor
         FP32 ``[1]`` CUDA tensor ``448 * 6 / amax`` of the calibrated normalized activation
         (:func:`nvfp4_global_scale_from_amax`); read on the device, no host synchronization.
+    q_norm_weight, k_norm_weight : torch.Tensor
+        BF16 ``[128]`` per-head RMSNorm weights.
+    rope_cos_sin : torch.Tensor
+        BF16 ``[M, 96]`` tensor storing ``[cos(48), sin(48)]`` per token.
+    eps : float
+        RMSNorm epsilon for both the pre-norm and the Q/K norms.
+    out_mode : str
+        Output format: ``"bf16"``, ``"e4m3"``, or ``"nvfp4"``. Shapes and quantization
+        conventions match :func:`minimax_h3_fp8_pre_attention`.
     alpha : Optional[float]
         ``1 / (act_global_scale * qkv_weight_global_scale)``.  Pass it explicitly to avoid the host
         synchronization needed to read the global scales; derived from them when omitted.
+    q, k, v : Optional[torch.Tensor]
+        Optional pre-allocated outputs; allocated when omitted.
+    q_sf, k_sf, v_sf : Optional[torch.Tensor]
+        Optional pre-allocated NVFP4 scale outputs; used only when
+        ``out_mode == "nvfp4"`` and ignored for other output modes. Allocated
+        when omitted in NVFP4 mode.
+    q_descale, k_descale, v_descale : Optional[Scalar]
+        Per-tensor E4M3 dequantization scales required when ``out_mode == "e4m3"``.
+    q_global_scale, k_global_scale, v_global_scale : Optional[Scalar]
+        NVFP4 global scales required when ``out_mode == "nvfp4"``.
+    act_q, act_sf : Optional[torch.Tensor]
+        Optional stage-1 workspaces (packed E2M1 ``uint8 [M, 2688]`` and UE4M3 scales
+        ``uint8 [M, 336]``); allocated when omitted.
 
     Returns
     -------
@@ -808,6 +846,7 @@ def minimax_h3_nvfp4_pre_attention(
 
 
 __all__ = [
+    "MINIMAX_H3_ADALN_ROWS",
     "MINIMAX_H3_DEFAULT_EPS",
     "MINIMAX_H3_HEAD_DIM",
     "MINIMAX_H3_HIDDEN",

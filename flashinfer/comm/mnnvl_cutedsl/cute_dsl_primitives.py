@@ -33,53 +33,22 @@ L2_EVICT_FIRST = 0x12F0000000000000
 @dsl_user_op
 def load_global_u32x4(
     pointer: cute.Pointer,
+    predicate: Int32 | None = None,
     *,
     volatile: cutlass.Constexpr[bool] = False,
     loc=None,
     ip=None,
 ):
-    address = pointer.toint(loc=loc, ip=ip)
-    if volatile:
-        opcode = "ld.volatile.global.v4.u32"
-    else:
-        opcode = "ld.global.v4.u32"
-    loaded = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32()] * 4),
-        [address.ir_value(loc=loc, ip=ip)],
-        f"{opcode} {{$0, $1, $2, $3}}, [$4];",
-        "=r,=r,=r,=r,l",
-        has_side_effects=volatile,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    packed = vector.from_elements(
-        ir.VectorType.get([4], T.i32(), loc=loc),
-        [
-            llvm.extractvalue(T.i32(), loaded, [index], loc=loc, ip=ip)
-            for index in range(4)
-        ],
-        loc=loc,
-        ip=ip,
-    )
-    return cute.TensorSSA(packed, 4, Uint32)
+    """Load four words; an omitted predicate loads normally, false returns zeros."""
 
-
-@dsl_user_op
-def load_global_u32x4_predicated(
-    pointer: cute.Pointer,
-    predicate: Int32,
-    *,
-    loc=None,
-    ip=None,
-):
+    predicate = Int32(1) if predicate is None else Int32(predicate)
     address = pointer.toint(loc=loc, ip=ip)
+    opcode = "ld.volatile.global.v4.u32" if volatile else "ld.global.v4.u32"
     loaded = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32()] * 4),
         [
             address.ir_value(loc=loc, ip=ip),
-            Int32(predicate).ir_value(loc=loc, ip=ip),
+            predicate.ir_value(loc=loc, ip=ip),
         ],
         (
             "{\n\t"
@@ -89,11 +58,11 @@ def load_global_u32x4_predicated(
             "@!p mov.u32 $1, 0;\n\t"
             "@!p mov.u32 $2, 0;\n\t"
             "@!p mov.u32 $3, 0;\n\t"
-            "@p ld.global.v4.u32 {$0, $1, $2, $3}, [$4];\n\t"
+            f"@p {opcode} {{$0, $1, $2, $3}}, [$4];\n\t"
             "}"
         ),
         "=r,=r,=r,=r,l,r",
-        has_side_effects=False,
+        has_side_effects=volatile,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
@@ -799,12 +768,35 @@ def remote_release_add1_u32(address: Int64, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
-def ldmc_bf16x8(address: Int64, *, loc=None, ip=None):
+def ldmc_bf16x8(
+    address: Int64,
+    predicate: Int32 | None = None,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Reduce-load eight BF16s; an omitted predicate loads, false returns zeros."""
+
+    predicate = Int32(1) if predicate is None else Int32(predicate)
     loaded = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32()] * 4),
-        [address.ir_value(loc=loc, ip=ip)],
-        "multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,l",
+        [
+            address.ir_value(loc=loc, ip=ip),
+            predicate.ir_value(loc=loc, ip=ip),
+        ],
+        (
+            "{\n\t"
+            ".reg .pred p;\n\t"
+            "setp.ne.s32 p, $5, 0;\n\t"
+            "@!p mov.u32 $0, 0;\n\t"
+            "@!p mov.u32 $1, 0;\n\t"
+            "@!p mov.u32 $2, 0;\n\t"
+            "@!p mov.u32 $3, 0;\n\t"
+            "@p multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 "
+            "{$0, $1, $2, $3}, [$4];\n\t"
+            "}"
+        ),
+        "=r,=r,=r,=r,l,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -861,16 +853,78 @@ def stmc_bf16x4(address: Int64, values, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
-def stmc_bf16x8(address: Int64, values, *, loc=None, ip=None) -> None:
+def stmc_bf16x8(
+    address: Int64,
+    values,
+    predicate: Int32 | None = None,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Multicast-store eight BF16s; an omitted predicate stores, false skips."""
+
+    predicate = Int32(1) if predicate is None else Int32(predicate)
     words = [values[index].ir_value(loc=loc, ip=ip) for index in range(4)]
     llvm.inline_asm(
         None,
-        [address.ir_value(loc=loc, ip=ip), *words],
-        "multimem.st.relaxed.sys.global.v4.bf16x2 [$0], {$1, $2, $3, $4};",
-        "l,r,r,r,r",
+        [
+            address.ir_value(loc=loc, ip=ip),
+            *words,
+            predicate.ir_value(loc=loc, ip=ip),
+        ],
+        (
+            "{\n\t"
+            ".reg .pred p;\n\t"
+            "setp.ne.s32 p, $5, 0;\n\t"
+            "@p multimem.st.relaxed.sys.global.v4.bf16x2 "
+            "[$0], {$1, $2, $3, $4};\n\t"
+            "}"
+        ),
+        "l,r,r,r,r,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
         ip=ip,
     )
+
+
+@cute.jit
+def load_f32x8(base: cute.Tensor, offset: Int64):
+    pointer = cute.make_ptr(
+        Float32,
+        (base.iterator + offset).llvm_ptr,
+        cute.AddressSpace.gmem,
+        assumed_align=32,
+    )
+    fragment = cute.make_rmem_tensor(cute.make_layout((VEC_BF16,)), Float32)
+    cute.autovec_copy(
+        cute.make_tensor(pointer, cute.make_layout((VEC_BF16,))), fragment
+    )
+    return fragment.load()
+
+
+@cute.jit
+def store_f32x8(base: cute.Tensor, offset: Int64, values) -> None:
+    pointer = cute.make_ptr(
+        Float32,
+        (base.iterator + offset).llvm_ptr,
+        cute.AddressSpace.gmem,
+        assumed_align=32,
+    )
+    fragment = cute.make_rmem_tensor(cute.make_layout((VEC_BF16,)), Float32)
+    fragment.store(values)
+    cute.autovec_copy(
+        fragment, cute.make_tensor(pointer, cute.make_layout((VEC_BF16,)))
+    )
+
+
+@cute.jit
+def load_bf16x8_as_f32(base: cute.Tensor, offset: Int64):
+    pointer = cute.make_ptr(
+        BFloat16,
+        (base.iterator + offset).llvm_ptr,
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    return packed_u32x4_to_bf16x8(load_global_u32x4(pointer)).to(Float32)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import gc
 import weakref
 from collections import OrderedDict
@@ -29,11 +30,22 @@ from flashinfer.fused_moe import (
     RoutingInputMode,
     RoutingMethodType,
     SiLU,
+    SiTU,
     SwiGLU,
     TrtllmFp4Config,
 )
 from flashinfer.fused_moe.api import _DEFAULT_BACKEND
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+from tests.moe.cake_warp_decode_reference import (
+    TARGETS,
+    Fixture,
+    Geometry as _GpuGeometry,
+    assert_close,
+    prepare_fixture,
+    prepare_launch,
+    reference,
+    run_cake,
+)
 
 
 @dataclass
@@ -57,6 +69,7 @@ class _Module:
         self.prepare_calls = []
         self.release_calls = []
         self.run_calls = []
+        self.parameter_run_calls = []
         self.next_receipt = 1
         self.live_receipts = set()
         self.release_error: Exception | None = None
@@ -86,37 +99,22 @@ class _Module:
         if self.run_error is not None:
             raise self.run_error
 
+    def cake_fused_moe_warp_decode_with_activation_params(self, *args) -> None:
+        self.parameter_run_calls.append(args)
+        if self.run_error is not None:
+            raise self.run_error
 
-def test_jit_resolves_target_owned_shared_binding_paths(tmp_path):
-    csrc_dir = tmp_path / "csrc" / "fused_moe" / "warp_decode"
-    relative_paths = [
-        "csrc/fused_moe/warp_decode/cake_warp_decode_binding.cu",
-        "csrc/fused_moe/warp_decode/cake_warp_decode_contract.cuh",
-        "flashinfer/jit/cake_fused_moe_warp_decode.py",
-    ]
-    for relative in relative_paths:
-        path = tmp_path / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("// sealed target-owned source\n", encoding="utf-8")
 
-    receipt = {
-        "delivery": "target_owned_shared",
-        "paths": relative_paths,
-        "generated_source_witness": {"bytes": 1, "sha256": "0" * 64},
-    }
-    assert cake_warp_decode_jit._resolve_export_binding_paths(
-        csrc_dir, receipt, "modules[0].translation_units.binding"
-    ) == tuple((tmp_path / relative).resolve() for relative in relative_paths)
-    assert cake_warp_decode_jit._resolve_export_binding_paths(
-        csrc_dir, relative_paths[0], "modules[0].translation_units.binding"
-    ) == ((tmp_path / relative_paths[0]).resolve(),)
-
-    with pytest.raises(ValueError, match="paths must be a non-empty array"):
-        cake_warp_decode_jit._resolve_export_binding_paths(
-            csrc_dir,
-            {"delivery": "target_owned_shared", "paths": []},
-            "modules[0].translation_units.binding",
-        )
+@pytest.mark.parametrize("target", ["sm100a", "sm103a"])
+def test_jit_device_sources_resolve_and_share_common_kernels(target):
+    csrc_dir = cake_warp_decode_jit._get_cake_fused_moe_warp_decode_csrc_dir()
+    sources = cake_warp_decode_jit._device_sources(csrc_dir, target)
+    names = [source.name for source in sources]
+    assert sources and len(set(names)) == len(names)
+    assert set(cake_warp_decode_jit._COMMON_SOURCES) <= set(names)
+    assert set(cake_warp_decode_jit._NO_FAST_MATH_SOURCES) <= set(names)
+    with pytest.raises(FileNotFoundError, match="device sources not found"):
+        cake_warp_decode_jit._device_sources(csrc_dir / "missing", target)
 
 
 def test_jit_prefers_checkout_sources_when_editable_data_is_staged(
@@ -230,6 +228,12 @@ def _weight_pack(
     }
     if activation.is_gated:
         view["gemm1_alpha"] = _TensorSpec((num_experts,), torch.float32)
+    if isinstance(activation, SiTU) or (
+        isinstance(activation, SwiGLU) and activation != SwiGLU()
+    ):
+        view["gemm1_beta"] = _TensorSpec((num_experts,), torch.float32)
+    if isinstance(activation, SwiGLU) and activation != SwiGLU():
+        view["gemm1_clamp_limit"] = _TensorSpec((num_experts,), torch.float32)
     if extra:
         view.update(extra)
     weights = MoEWeightPack()
@@ -279,7 +283,26 @@ def test_runner_build_passes_its_explicit_target_and_device(
     [
         (None, SwiGLU(), 2048, 512, 512),
         (SwiGLU(), SwiGLU(), 2048, 1536, 60),
+        (None, SwiGLU(), 2560, 768, 384),
+        (SwiGLU(), SwiGLU(), 2560, 768, 384),
         (SiLU(), SiLU(), 6144, 1536, 192),
+        (None, SwiGLU(), 2048, 768, 128),
+        (SwiGLU(), SwiGLU(), 4096, 1536, 128),
+        (SwiGLU(), SwiGLU(), 2048, 512, 256),
+        (SwiGLU(), SwiGLU(), 4096, 1024, 512),
+        (SwiGLU(), SwiGLU(), 3072, 1536, 256),
+        (SwiGLU(), SwiGLU(), 4096, 512, 512),
+        (None, SwiGLU(), 4096, 256, 512),
+        (SwiGLU(), SwiGLU(), 3072, 768, 256),
+        (None, SwiGLU(), 3072, 384, 256),
+        (
+            SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
+            SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
+            6144,
+            3072,
+            128,
+        ),
+        (SiTU(), SiTU(), 3584, 3072, 896),
     ],
 )
 def test_config_preparation_delegates_to_trtllm_physical_view(
@@ -329,6 +352,21 @@ def test_config_preparation_delegates_to_trtllm_physical_view(
         (SiLU(), 2048, 1536, 60),
         (SwiGLU(), 6144, 1536, 192),
         (SwiGLU(alpha=2.0), 2048, 1536, 60),
+        (SiLU(), 2560, 768, 384),
+        (SwiGLU(alpha=2.0), 2560, 768, 384),
+        (SiLU(), 2048, 768, 128),
+        (SwiGLU(alpha=2.0), 4096, 1536, 128),
+        (SiLU(), 2048, 512, 256),
+        (SiLU(), 4096, 1024, 512),
+        (SiLU(), 3072, 1536, 256),
+        (SiLU(), 4096, 512, 512),
+        (SwiGLU(alpha=2.0), 4096, 256, 512),
+        (SiLU(), 3072, 768, 256),
+        (SwiGLU(alpha=2.0), 3072, 384, 256),
+        (SwiGLU(), 6144, 3072, 128),
+        (SwiGLU(), 3584, 3072, 896),
+        (SwiGLU(alpha=1.702, beta=0.0, limit=7.0), 6144, 3072, 128),
+        (SiTU(gate_scale=1.0), 3584, 3072, 896),
     ],
 )
 def test_config_preparation_rejects_activation_geometry_cross_product(
@@ -409,20 +447,69 @@ def test_support_rejects_nonexact_architectures(device_arch):
 
 
 @pytest.mark.parametrize("device_arch", [100, 103])
-def test_support_accepts_exact_architectures(device_arch):
-    runner, _ = _runner(device_arch=device_arch)
+@pytest.mark.parametrize(
+    "intermediate_size,num_experts,top_k",
+    [
+        (1536, 60, 4),
+        (768, 384, 4),
+        (768, 128, 8),
+        (1536, 128, 8),
+        (512, 256, 8),
+        (1024, 512, 10),
+        (1536, 256, 8),
+    ],
+)
+def test_support_accepts_exact_architectures(
+    device_arch, intermediate_size, num_experts, top_k
+):
+    runner, _ = _runner(
+        _config(
+            intermediate_size=intermediate_size, num_experts=num_experts, top_k=top_k
+        ),
+        device_arch=device_arch,
+    )
     runner._check_support()
 
 
-def test_pack_reuses_prepared_workspace_and_preserves_ffi_order():
-    runner, module = _runner()
-    act = _activation_pack()
-    weights, view = _weight_pack()
+@pytest.mark.parametrize("device_arch", [100, 103])
+@pytest.mark.parametrize(
+    "hidden_size,intermediate_size,num_experts,top_k",
+    [
+        (2048, 1536, 60, 4),
+        (2560, 768, 384, 4),
+        (2048, 768, 128, 8),
+        (4096, 1536, 128, 8),
+        (2048, 512, 256, 8),
+        (4096, 1024, 512, 10),
+        (3072, 1536, 256, 8),
+        (4096, 512, 512, 10),
+        (4096, 256, 512, 10),
+        (3072, 768, 256, 8),
+        (3072, 384, 256, 8),
+    ],
+)
+def test_pack_reuses_prepared_workspace_and_preserves_ffi_order(
+    device_arch, hidden_size, intermediate_size, num_experts, top_k
+):
+    runner, module = _runner(
+        _config(
+            intermediate_size=intermediate_size, num_experts=num_experts, top_k=top_k
+        ),
+        device_arch=device_arch,
+    )
+    act = _activation_pack(hidden_size=hidden_size, top_k=top_k)
+    weights, view = _weight_pack(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+    )
 
     first = runner.pack_inputs(act, weights)
     second = runner.pack_inputs(act, weights)
 
-    assert module.size_calls == [(7, 2048, 1536, 60, 4)]
+    assert module.size_calls == [
+        (7, hidden_size, intermediate_size, num_experts, top_k)
+    ]
     assert len(module.prepare_calls) == 1
     assert first[1] is second[1]
     assert first[0] is not second[0]
@@ -447,6 +534,94 @@ def test_pack_reuses_prepared_workspace_and_preserves_ffi_order():
     assert len(module.prepare_calls) == 2
     assert runner.forward(first) is first[0]
     assert module.run_calls == [tuple([*first, 2, True])]
+
+
+@pytest.mark.parametrize("device_arch", [100, 103])
+@pytest.mark.parametrize(
+    "activation,hidden_size,num_experts,top_k",
+    [
+        (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 128, 4),
+        (SiTU(gate_scale=4.0, linear_scale=25.0), 3584, 896, 16),
+    ],
+)
+def test_parameterized_pack_forwards_live_activation_tensors(
+    device_arch, activation, hidden_size, num_experts, top_k
+):
+    runner, module = _runner(
+        _config(
+            intermediate_size=3072,
+            num_experts=num_experts,
+            top_k=top_k,
+            activation=activation,
+        ),
+        device_arch=device_arch,
+    )
+    runner._check_support()
+    act = _activation_pack(hidden_size=hidden_size, top_k=top_k)
+    weights, view = _weight_pack(
+        hidden_size=hidden_size,
+        intermediate_size=3072,
+        num_experts=num_experts,
+        activation=activation,
+    )
+    inputs = runner.pack_inputs(act, weights)
+    assert len(inputs) == 16
+    assert inputs[13] is view["gemm1_alpha"]
+    assert inputs[14] is view["gemm1_beta"]
+    assert inputs[15] is view.get("gemm1_clamp_limit")
+    assert module.size_calls == [(7, hidden_size, 3072, num_experts, top_k)]
+    assert runner.forward(inputs) is inputs[0]
+    assert module.run_calls == []
+    assert module.parameter_run_calls == [tuple([*inputs, 1, True])]
+
+
+@pytest.mark.parametrize(
+    "activation,hidden_size,num_experts,top_k,missing_key",
+    [
+        (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 128, 4, "gemm1_alpha"),
+        (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 128, 4, "gemm1_beta"),
+        (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 128, 4, "gemm1_clamp_limit"),
+        (SiTU(), 3584, 896, 16, "gemm1_alpha"),
+        (SiTU(), 3584, 896, 16, "gemm1_beta"),
+    ],
+)
+def test_parameterized_pack_requires_prepared_activation_tensors(
+    activation, hidden_size, num_experts, top_k, missing_key
+):
+    runner, module = _runner(
+        _config(
+            intermediate_size=3072,
+            num_experts=num_experts,
+            top_k=top_k,
+            activation=activation,
+        )
+    )
+    act = _activation_pack(hidden_size=hidden_size, top_k=top_k)
+    weights, view = _weight_pack(
+        hidden_size=hidden_size,
+        intermediate_size=3072,
+        num_experts=num_experts,
+        activation=activation,
+    )
+    del view[missing_key]
+    with pytest.raises(KeyError, match=missing_key):
+        runner.pack_inputs(act, weights)
+    assert module.prepare_calls == []
+
+
+def test_situ_pack_rejects_unconsumed_clamp_override():
+    runner, _ = _runner(
+        _config(intermediate_size=3072, num_experts=896, top_k=16, activation=SiTU())
+    )
+    weights, _ = _weight_pack(
+        hidden_size=3584,
+        intermediate_size=3072,
+        num_experts=896,
+        activation=SiTU(),
+        extra={"gemm1_clamp_limit": _TensorSpec((896,), torch.float32)},
+    )
+    with pytest.raises(ValueError, match="gemm1_clamp_limit"):
+        runner.pack_inputs(_activation_pack(hidden_size=3584, top_k=16), weights)
 
 
 def test_silu_pack_uses_nongated_rows_and_preserves_ffi_order():
@@ -530,6 +705,11 @@ def test_silu_pack_rejects_gated_rows_and_alpha():
             2048,
         ),
         (_config(), 6144),
+        (_config(intermediate_size=768, num_experts=384), 2048),
+        (
+            _config(intermediate_size=768, num_experts=384, activation=SiLU()),
+            2560,
+        ),
     ],
 )
 def test_pack_rejects_activation_geometry_cross_product(config, hidden_size):
@@ -920,3 +1100,123 @@ def test_pack_rejects_mode_tokens_weights_and_extra_fields():
     )
     with pytest.raises(ValueError, match="does not accept bias"):
         runner.pack_inputs(_activation_pack(), weights_with_bias)
+
+
+# ---------------------------------------------------------------------------
+# GPU numerical parity on exact SM100 / SM103 devices.
+#
+# The fixture, the public TRT-LLM NVFP4 reference and the launch helpers live in
+# tests/moe/cake_warp_decode_reference.py and are shared with the clamped SM100
+# test. The TRT-LLM NVFP4 routed MoE is the public reference for the SwiGLU and
+# SiTU geometries. The standalone SiLU geometry has no public NVFP4 peer, so its
+# rows check finiteness and launch-to-launch repeatability only.
+# ---------------------------------------------------------------------------
+
+_GPU_SEED = 20260205
+
+
+# Token counts are the schedule / route-packer boundaries of each geometry plus
+# the rows that reach kernels no boundary row launches (named by the short hash
+# of their generated source file).
+_GPU_GEOMETRIES = (
+    _GpuGeometry("e512_i512_k10", 2048, 512, 512, 10, (1, 2, 22, 23, 32)),
+    _GpuGeometry("e60_i1536_k4", 2048, 1536, 60, 4, (1, 7, 8, 10, 11, 12, 16, 17, 32)),
+    _GpuGeometry("e192_i1536_k4_silu", 6144, 1536, 192, 4, (1, 2, 32), SiLU()),
+    _GpuGeometry("e384_i768_k4", 2560, 768, 384, 4, (1, 2, 32)),
+    # T7: sm100 FC2 5c23234a. T11: sm103 FC1 5304d683. T18: sm100 finalize
+    # f5eac8f9. T21: sm103 FC2 c5afe5ba.
+    _GpuGeometry(
+        "e128_i768_k8", 2048, 768, 128, 8, (1, 2, 7, 8, 9, 10, 11, 16, 18, 21, 32)
+    ),
+    _GpuGeometry("e128_i1536_k8", 4096, 1536, 128, 8, (1, 2, 32)),
+    # T16: sm103 FC1 57d9c60c and FC2 8acc0c77.
+    _GpuGeometry("e256_i512_k8", 2048, 512, 256, 8, (1, 2, 16, 32)),
+    _GpuGeometry("e512_i1024_k10", 4096, 1024, 512, 10, (1, 2, 32)),
+    _GpuGeometry("e256_i1536_k8", 3072, 1536, 256, 8, (1, 2, 32)),
+    _GpuGeometry(
+        "e128_i3072_k4_swiglu_oa",
+        6144,
+        3072,
+        128,
+        4,
+        # T5: sm100 FC1 5312a738 and FC2 8acc0c77; sm103 FC2 8acc0c77.
+        (1, 2, 5, 32),
+        SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
+    ),
+    _GpuGeometry(
+        "e896_i3072_k16_situ",
+        3584,
+        3072,
+        896,
+        16,
+        # T3: sm100 finalize fc64115f.
+        (1, 2, 3, 32),
+        SiTU(gate_scale=4.0, linear_scale=25.0),
+    ),
+    # Sharded per-partition slices (fused route packing on every token count).
+    _GpuGeometry("h4096_e512_i512_k10", 4096, 512, 512, 10, (1, 2, 16, 32)),
+    _GpuGeometry("h4096_e512_i256_k10", 4096, 256, 512, 10, (1, 2, 16, 32)),
+    _GpuGeometry("h3072_e256_i768_k8", 3072, 768, 256, 8, (1, 2, 16, 32)),
+    _GpuGeometry("h3072_e256_i384_k8", 3072, 384, 256, 8, (1, 2, 16, 32)),
+)
+_GPU_ROWS = [
+    pytest.param(geometry, num_tokens, id=f"{geometry.name}-t{num_tokens:02d}")
+    for geometry in _GPU_GEOMETRIES
+    for num_tokens in geometry.token_counts
+]
+
+
+def _gpu_target() -> str:
+    if not torch.cuda.is_available():
+        pytest.skip("Cake warp decode GPU parity requires a CUDA device")
+    capability = torch.cuda.get_device_capability(torch.device("cuda"))
+    if capability not in TARGETS:
+        pytest.skip(
+            "Cake warp decode GPU parity requires exact SM100 or SM103, "
+            f"got SM{capability[0]}{capability[1]}"
+        )
+    return TARGETS[capability]
+
+
+@functools.lru_cache(maxsize=1)
+def _gpu_fixture(geometry_name: str) -> Fixture:
+    """Prepare one geometry with the shared harness, seeded by its matrix index.
+
+    One geometry is cached at a time: the largest geometry holds tens of GB of
+    expert weights, and the parity rows are ordered geometry-major.
+    """
+    index, geometry = next(
+        (index, geometry)
+        for index, geometry in enumerate(_GPU_GEOMETRIES)
+        if geometry.name == geometry_name
+    )
+    return prepare_fixture(geometry, _GPU_SEED + index)
+
+
+@pytest.mark.parametrize("geometry,num_tokens", _GPU_ROWS)
+def test_gpu_output_matches_public_nvfp4_reference(geometry, num_tokens):
+    target = _gpu_target()
+    device = torch.device("cuda")
+    fixture = _gpu_fixture(geometry.name)
+    module = cake_warp_decode_jit.get_cake_fused_moe_warp_decode_module(
+        target, device=device
+    )
+    output, workspace, receipt = prepare_launch(module, fixture, num_tokens)
+    try:
+        first = run_cake(
+            module, fixture, num_tokens, output, workspace, receipt
+        ).clone()
+        output.fill_(float("nan"))
+        second = run_cake(
+            module, fixture, num_tokens, output, workspace, receipt
+        ).clone()
+        torch.cuda.synchronize(device)
+    finally:
+        module.cake_fused_moe_warp_decode_release_workspace(receipt)
+
+    assert torch.isfinite(first.float()).all()
+    assert torch.equal(second, first), "repeated launch changed the output"
+    if geometry.has_public_reference:
+        expected = reference(fixture, num_tokens)
+        torch.cuda.synchronize(device)
+        assert_close(first, expected)

@@ -1,0 +1,802 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+from __future__ import annotations
+
+import functools
+from typing import Any
+
+from . import cake_build
+
+# Registry of the generated Cake DSA indexer programs.  The kernel and
+# launcher sources, this registry and ``build.json`` are exporter output,
+# hand-folded here pending exporter support: programs that differ only in
+# their constants or lever text share one translation unit, and each
+# ``build.json`` entry selects its program through its own ``-D``
+# definitions.
+#
+# Every program is one device translation unit plus one host binding, shared
+# by the architectures listed in its record; a program that differs from a
+# sibling only in its constants (a scan lever twin, a rank-finalize program of
+# the same window form, a CUB finalize program) builds the sibling's kernel
+# translation unit, and a program whose binding text equals a sibling's up to
+# the kernel symbol, the host-shim namespace and the launch constants builds
+# the sibling's binding -- each with the compile definitions of its
+# ``build.json`` entry.  ``build.json`` next to this file
+# (schema ``cake-build/1``, read by ``cake_build``) is the only record of what
+# to compile: one entry ``<library>_<arch>`` per program and architecture with
+# its sources, nvcc flags and digests.  ``cake_build.load_library`` serves the
+# prebuilt ``aot/<entry>.so`` when a builder compiled it and otherwise
+# JIT-builds the entry through FlashInfer.  ``ARG_PLANS`` holds the one
+# argument order per stage role (``scan``: a persistent fused scoring /
+# selection program; ``merge``: the split-range merge; ``finalize``: the
+# ascending-id row sort by CUB block radix sort; ``finalize_rank``: the same
+# sort as a prefix-popcount rank scatter), ``PROGRAMS`` every program once
+# with its role, its architecture-free ``library`` stem and its
+# architectures, ``PROGRAM_KEYS`` the program of every host dispatch key per
+# architecture (see ``cake_policy``), ``POLICY`` the per-architecture host
+# dispatch record and ``NUMERICS`` the documented numerics of the programs.
+# The launch geometry of a program (block, cluster, dynamic shared memory) is
+# fixed in its host binding.
+ARCHES = ("sm_100a", "sm_103a", "sm_107a")
+STAGES: list[str] = ["scan", "merge", "finalize", "finalize_rank"]
+ABI: str = "dsa_indexer_v2"
+NUMERICS: dict[str, str] = {"zero_sign_policy": "positive_accumulator"}
+FFI_ENTRY: str = "run"
+ARG_PLANS: dict[str, list[list[str]]] = {
+    "scan": [
+        ["tma_buffer", "Q"],
+        ["tma_buffer", "K"],
+        ["tma_buffer", "W"],
+        ["buffer", "cu_seqlens_q"],
+        ["buffer", "cu_seqlens_k"],
+        ["buffer", "q_offsets"],
+        ["buffer", "Indices"],
+        ["buffer", "Scores"],
+        ["buffer", "Cand"],
+        ["parameter", "num_segments"],
+        ["parameter", "top_k"],
+        ["parameter", "ratio"],
+        ["parameter", "has_offsets"],
+        ["parameter", "cand_cap"],
+        ["parameter", "first_cap"],
+        ["parameter", "sample_tiles_max"],
+        ["parameter", "sample_shift_permille"],
+        ["parameter", "check_period"],
+        ["parameter", "grid_ctas"],
+        ["parameter", "softmax_scale"],
+        ["parameter", "n_split"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "merge": [
+        ["buffer", "Staging"],
+        ["buffer", "Indices"],
+        ["buffer", "Scores"],
+        ["parameter", "top_k"],
+        ["parameter", "n_split"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "finalize": [
+        ["buffer", "Indices"],
+        ["buffer", "Scores"],
+        ["parameter", "top_k"],
+        ["parameter", "key_bits"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "finalize_rank": [
+        ["buffer", "Indices"],
+        ["buffer", "Scores"],
+        ["buffer", "cu_seqlens_q"],
+        ["buffer", "cu_seqlens_k"],
+        ["parameter", "top_k"],
+        ["parameter", "num_segments"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+}
+PROGRAMS: dict[str, dict[str, Any]] = {
+    "cake_dsa_indexer_topk_0d38735ee8e81ae6f5e8": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_0d38735ee8e81ae6f5e8",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_110194b650e766125f9f": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_110194b650e766125f9f",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_1b6af9940d486a0832d9": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_1b6af9940d486a0832d9",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_23a4ebeaa3ba23c23c80": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_23a4ebeaa3ba23c23c80",
+        "arches": ["sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_2581ee71bf5e5ecd2556": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_2581ee71bf5e5ecd2556",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_dsa_indexer_topk_2d40b7d91582905f31c3": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_2d40b7d91582905f31c3",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_2de9f2d0467668d46463": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_2de9f2d0467668d46463",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_38109fa62ccefe5460c2": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_38109fa62ccefe5460c2",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_dsa_indexer_topk_384649a6eee3c6a35aa4": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_384649a6eee3c6a35aa4",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_3bd43d833b5d53e81dbe": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_3bd43d833b5d53e81dbe",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_3c6dc460295ddf3c44de": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_3c6dc460295ddf3c44de",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_dsa_indexer_topk_3c9bece1433e9cf03979": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_3c9bece1433e9cf03979",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_401fb46fc3a69d791fdd": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_401fb46fc3a69d791fdd",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_dsa_indexer_topk_44163f96c12681e411cc": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_44163f96c12681e411cc",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_4c792ffa06c1b93d77fa": {
+        "role": "finalize",
+        "library": "cake_dsa_indexer_topk_4c792ffa06c1b93d77fa",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_506cb2b2c57f0a514cde": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_506cb2b2c57f0a514cde",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_521027e8563a9664acef": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_521027e8563a9664acef",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_dsa_indexer_topk_55767b3e4f028548bd92": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_55767b3e4f028548bd92",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_578634f8fe7efda0f97c": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_578634f8fe7efda0f97c",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_58f1c8a36e2cf5f302ae": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_58f1c8a36e2cf5f302ae",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_5c6e55c74de033e5f7af": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_5c6e55c74de033e5f7af",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_60b4f87115fbecd243e2": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_60b4f87115fbecd243e2",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_616b9e7f58f356a9e146": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_616b9e7f58f356a9e146",
+        "arches": ["sm_100a"],
+    },
+    "cake_dsa_indexer_topk_69d2d7c68ccceb095540": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_69d2d7c68ccceb095540",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_7286faf88e17986cff38": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_7286faf88e17986cff38",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_74f132250e5e565dfcc9": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_74f132250e5e565dfcc9",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_75842ae0f80e05addeaa": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_75842ae0f80e05addeaa",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_763009af2c0de13ffc29": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_763009af2c0de13ffc29",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_7d1b556b2aedea7f5249": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_7d1b556b2aedea7f5249",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_808a62a6315ae38034c6": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_808a62a6315ae38034c6",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_dsa_indexer_topk_81ccb257c7338a468c3b": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_81ccb257c7338a468c3b",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_88619e22363515835efe": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_88619e22363515835efe",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_88f7b0c3c31837a87b60": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_88f7b0c3c31837a87b60",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_dsa_indexer_topk_8a91a587122e3032ace6": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_8a91a587122e3032ace6",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_8f8c393ea106e74d70e9": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_8f8c393ea106e74d70e9",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_90c88df0fd82d4908fca": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_90c88df0fd82d4908fca",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_dsa_indexer_topk_93373e506f0537a0ed67": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_93373e506f0537a0ed67",
+        "arches": ["sm_100a"],
+    },
+    "cake_dsa_indexer_topk_942797c60bc61df40715": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_942797c60bc61df40715",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_96c30b1f33d2a094d9b9": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_96c30b1f33d2a094d9b9",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_99af5257f5e28006f79e": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_99af5257f5e28006f79e",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_9b89c92489b0e60d8ee7": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_9b89c92489b0e60d8ee7",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_9c823649b35909199596": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_9c823649b35909199596",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_9cc421366d6079aa6ca8": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_9cc421366d6079aa6ca8",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_9f4b76cb713088f1285d": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_9f4b76cb713088f1285d",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_a42ccc07b6379bcf9549": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_a42ccc07b6379bcf9549",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_a64563a936f84ea4d9f5": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_a64563a936f84ea4d9f5",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_aa0bedf1a5601a3c55be": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_aa0bedf1a5601a3c55be",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_aacebef79deb11b3aea9": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_aacebef79deb11b3aea9",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_af8d290aa9010d180ed0": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_af8d290aa9010d180ed0",
+        "arches": ["sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_afa89b4033e466d158b1": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_afa89b4033e466d158b1",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_b8440d1d1d54917a47d7": {
+        "role": "merge",
+        "library": "cake_dsa_indexer_topk_b8440d1d1d54917a47d7",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_bbc99b799b2c58f8401f": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_bbc99b799b2c58f8401f",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_c02bcf153cf2ddae3b58": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_c02bcf153cf2ddae3b58",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_c496f83c2e9979f7830a": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_c496f83c2e9979f7830a",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_cb8c20570699061f544d": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_cb8c20570699061f544d",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_cf92373ea526254d61a0": {
+        "role": "finalize",
+        "library": "cake_dsa_indexer_topk_cf92373ea526254d61a0",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_d0b7ecc9edbdcd71b2d7": {
+        "role": "finalize",
+        "library": "cake_dsa_indexer_topk_d0b7ecc9edbdcd71b2d7",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_d121d20b4ff827b4b6d2": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_d121d20b4ff827b4b6d2",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_dsa_indexer_topk_d965d76ede39f71e674b": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_d965d76ede39f71e674b",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_e13c66d0acb361a94a1b": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_e13c66d0acb361a94a1b",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_dsa_indexer_topk_e1e316281190b2a3203b": {
+        "role": "finalize",
+        "library": "cake_dsa_indexer_topk_e1e316281190b2a3203b",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_e3bb94a1bd63e4b54a08": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_e3bb94a1bd63e4b54a08",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_e7860bf225417a2a3b51": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_e7860bf225417a2a3b51",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_e983ae66ae1ef4d182e5": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_e983ae66ae1ef4d182e5",
+        "arches": ["sm_107a"],
+    },
+    "cake_dsa_indexer_topk_ed1192a18ca915b70af7": {
+        "role": "finalize",
+        "library": "cake_dsa_indexer_topk_ed1192a18ca915b70af7",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
+    "cake_dsa_indexer_topk_f244c85e76fde1284ab2": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_topk_f244c85e76fde1284ab2",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_dsa_indexer_topk_fad73cb8b09709a23920": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_fad73cb8b09709a23920",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_dsa_indexer_topk_fbcc24125a5af183d1dc": {
+        "role": "scan",
+        "library": "cake_dsa_indexer_topk_fbcc24125a5af183d1dc",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+}
+PROGRAM_KEYS: dict[str, dict[str, str]] = {
+    "sm_100a": {
+        "finalize:t128": "cake_dsa_indexer_topk_ed1192a18ca915b70af7",
+        "finalize:t256": "cake_dsa_indexer_topk_d0b7ecc9edbdcd71b2d7",
+        "finalize:t32": "cake_dsa_indexer_topk_e1e316281190b2a3203b",
+        "finalize:t512": "cake_dsa_indexer_topk_4c792ffa06c1b93d77fa",
+        "finalize:t64": "cake_dsa_indexer_topk_cf92373ea526254d61a0",
+        "finalize_rank:t256:w131072:two:staged": "cake_dsa_indexer_topk_bbc99b799b2c58f8401f",
+        "finalize_rank:t256:w131072:two:staged:bulk": "cake_dsa_indexer_topk_8a91a587122e3032ace6",
+        "finalize_rank:t256:w131072:two:staged:i16": "cake_dsa_indexer_topk_578634f8fe7efda0f97c",
+        "finalize_rank:t256:w131072:two:staged:i16:bulk": "cake_dsa_indexer_topk_d965d76ede39f71e674b",
+        "finalize_rank:t256:w16384:staged": "cake_dsa_indexer_topk_55767b3e4f028548bd92",
+        "finalize_rank:t256:w16384:staged:bulk": "cake_dsa_indexer_topk_f244c85e76fde1284ab2",
+        "finalize_rank:t256:w16384:staged:i16": "cake_dsa_indexer_topk_aacebef79deb11b3aea9",
+        "finalize_rank:t256:w16384:staged:i16:bulk": "cake_dsa_indexer_topk_2d40b7d91582905f31c3",
+        "finalize_rank:t256:w262144:two:staged": "cake_dsa_indexer_topk_a42ccc07b6379bcf9549",
+        "finalize_rank:t256:w262144:two:staged:bulk": "cake_dsa_indexer_topk_60b4f87115fbecd243e2",
+        "finalize_rank:t256:w262144:two:staged:i16": "cake_dsa_indexer_topk_75842ae0f80e05addeaa",
+        "finalize_rank:t256:w262144:two:staged:i16:bulk": "cake_dsa_indexer_topk_69d2d7c68ccceb095540",
+        "finalize_rank:t256:w524288:two:staged": "cake_dsa_indexer_topk_cb8c20570699061f544d",
+        "finalize_rank:t256:w524288:two:staged:bulk": "cake_dsa_indexer_topk_c496f83c2e9979f7830a",
+        "finalize_rank:t256:w524288:two:staged:i16": "cake_dsa_indexer_topk_e3bb94a1bd63e4b54a08",
+        "finalize_rank:t256:w524288:two:staged:i16:bulk": "cake_dsa_indexer_topk_44163f96c12681e411cc",
+        "finalize_rank:t256:w65536:staged": "cake_dsa_indexer_topk_9b89c92489b0e60d8ee7",
+        "finalize_rank:t256:w65536:staged:bulk": "cake_dsa_indexer_topk_38109fa62ccefe5460c2",
+        "finalize_rank:t256:w65536:staged:i16": "cake_dsa_indexer_topk_c02bcf153cf2ddae3b58",
+        "finalize_rank:t256:w65536:staged:i16:bulk": "cake_dsa_indexer_topk_96c30b1f33d2a094d9b9",
+        "finalize_rank:t256:w8192:staged": "cake_dsa_indexer_topk_58f1c8a36e2cf5f302ae",
+        "finalize_rank:t256:w8192:staged:bulk": "cake_dsa_indexer_topk_2581ee71bf5e5ecd2556",
+        "merge": "cake_dsa_indexer_topk_b8440d1d1d54917a47d7",
+        "scan:l6:u1:s0:f0": "cake_dsa_indexer_topk_401fb46fc3a69d791fdd",
+        "scan:l6:u1:s0:f1": "cake_dsa_indexer_topk_d121d20b4ff827b4b6d2",
+        "scan:narrow:u1:s0:f0": "cake_dsa_indexer_topk_93373e506f0537a0ed67",
+        "scan:narrow:u1:s0:f1": "cake_dsa_indexer_topk_616b9e7f58f356a9e146",
+        "scan:pair_l6:u1:s0:f0": "cake_dsa_indexer_topk_90c88df0fd82d4908fca",
+        "scan:pair_l6:u1:s0:f1": "cake_dsa_indexer_topk_88f7b0c3c31837a87b60",
+        "scan:split_l6:u1:s0:f0": "cake_dsa_indexer_topk_fbcc24125a5af183d1dc",
+        "scan:split_narrow:u1:s0:f0": "cake_dsa_indexer_topk_521027e8563a9664acef",
+        "scan:wide:u1:s0:f0": "cake_dsa_indexer_topk_fad73cb8b09709a23920",
+        "scan:wide:u1:s0:f1": "cake_dsa_indexer_topk_e13c66d0acb361a94a1b",
+        "scan:wide:u2:s0:f0": "cake_dsa_indexer_topk_3c6dc460295ddf3c44de",
+        "scan:wide:u2:s0:f1": "cake_dsa_indexer_topk_808a62a6315ae38034c6",
+    },
+    "sm_103a": {
+        "finalize:t128": "cake_dsa_indexer_topk_ed1192a18ca915b70af7",
+        "finalize:t256": "cake_dsa_indexer_topk_d0b7ecc9edbdcd71b2d7",
+        "finalize:t32": "cake_dsa_indexer_topk_e1e316281190b2a3203b",
+        "finalize:t512": "cake_dsa_indexer_topk_4c792ffa06c1b93d77fa",
+        "finalize:t64": "cake_dsa_indexer_topk_cf92373ea526254d61a0",
+        "finalize_rank:t256:w131072:two:staged": "cake_dsa_indexer_topk_bbc99b799b2c58f8401f",
+        "finalize_rank:t256:w131072:two:staged:bulk": "cake_dsa_indexer_topk_8a91a587122e3032ace6",
+        "finalize_rank:t256:w131072:two:staged:i16": "cake_dsa_indexer_topk_578634f8fe7efda0f97c",
+        "finalize_rank:t256:w131072:two:staged:i16:bulk": "cake_dsa_indexer_topk_d965d76ede39f71e674b",
+        "finalize_rank:t256:w16384:staged": "cake_dsa_indexer_topk_55767b3e4f028548bd92",
+        "finalize_rank:t256:w16384:staged:bulk": "cake_dsa_indexer_topk_f244c85e76fde1284ab2",
+        "finalize_rank:t256:w16384:staged:i16": "cake_dsa_indexer_topk_aacebef79deb11b3aea9",
+        "finalize_rank:t256:w16384:staged:i16:bulk": "cake_dsa_indexer_topk_2d40b7d91582905f31c3",
+        "finalize_rank:t256:w262144:two:staged": "cake_dsa_indexer_topk_a42ccc07b6379bcf9549",
+        "finalize_rank:t256:w262144:two:staged:bulk": "cake_dsa_indexer_topk_60b4f87115fbecd243e2",
+        "finalize_rank:t256:w262144:two:staged:i16": "cake_dsa_indexer_topk_75842ae0f80e05addeaa",
+        "finalize_rank:t256:w262144:two:staged:i16:bulk": "cake_dsa_indexer_topk_69d2d7c68ccceb095540",
+        "finalize_rank:t256:w524288:two:staged": "cake_dsa_indexer_topk_cb8c20570699061f544d",
+        "finalize_rank:t256:w524288:two:staged:bulk": "cake_dsa_indexer_topk_c496f83c2e9979f7830a",
+        "finalize_rank:t256:w524288:two:staged:i16": "cake_dsa_indexer_topk_e3bb94a1bd63e4b54a08",
+        "finalize_rank:t256:w524288:two:staged:i16:bulk": "cake_dsa_indexer_topk_44163f96c12681e411cc",
+        "finalize_rank:t256:w65536:staged": "cake_dsa_indexer_topk_9b89c92489b0e60d8ee7",
+        "finalize_rank:t256:w65536:staged:bulk": "cake_dsa_indexer_topk_38109fa62ccefe5460c2",
+        "finalize_rank:t256:w65536:staged:i16": "cake_dsa_indexer_topk_c02bcf153cf2ddae3b58",
+        "finalize_rank:t256:w65536:staged:i16:bulk": "cake_dsa_indexer_topk_96c30b1f33d2a094d9b9",
+        "finalize_rank:t256:w8192:staged": "cake_dsa_indexer_topk_58f1c8a36e2cf5f302ae",
+        "finalize_rank:t256:w8192:staged:bulk": "cake_dsa_indexer_topk_2581ee71bf5e5ecd2556",
+        "merge": "cake_dsa_indexer_topk_b8440d1d1d54917a47d7",
+        "scan:l6:u1:s0:f0": "cake_dsa_indexer_topk_401fb46fc3a69d791fdd",
+        "scan:l6:u1:s0:f1": "cake_dsa_indexer_topk_d121d20b4ff827b4b6d2",
+        "scan:narrow:u1:s0:f0": "cake_dsa_indexer_topk_23a4ebeaa3ba23c23c80",
+        "scan:narrow:u1:s0:f1": "cake_dsa_indexer_topk_af8d290aa9010d180ed0",
+        "scan:pair_l6:u1:s0:f0": "cake_dsa_indexer_topk_90c88df0fd82d4908fca",
+        "scan:pair_l6:u1:s0:f1": "cake_dsa_indexer_topk_88f7b0c3c31837a87b60",
+        "scan:split_l6:u1:s0:f0": "cake_dsa_indexer_topk_fbcc24125a5af183d1dc",
+        "scan:split_narrow:u1:s0:f0": "cake_dsa_indexer_topk_521027e8563a9664acef",
+        "scan:wide:u1:s0:f0": "cake_dsa_indexer_topk_fad73cb8b09709a23920",
+        "scan:wide:u1:s0:f1": "cake_dsa_indexer_topk_e13c66d0acb361a94a1b",
+        "scan:wide:u2:s0:f0": "cake_dsa_indexer_topk_3c6dc460295ddf3c44de",
+        "scan:wide:u2:s0:f1": "cake_dsa_indexer_topk_808a62a6315ae38034c6",
+    },
+    "sm_107a": {
+        "finalize:t128": "cake_dsa_indexer_topk_ed1192a18ca915b70af7",
+        "finalize:t256": "cake_dsa_indexer_topk_d0b7ecc9edbdcd71b2d7",
+        "finalize:t32": "cake_dsa_indexer_topk_e1e316281190b2a3203b",
+        "finalize:t512": "cake_dsa_indexer_topk_4c792ffa06c1b93d77fa",
+        "finalize:t64": "cake_dsa_indexer_topk_cf92373ea526254d61a0",
+        "finalize_rank:t256:w131072:two:staged": "cake_dsa_indexer_topk_bbc99b799b2c58f8401f",
+        "finalize_rank:t256:w131072:two:staged:bulk": "cake_dsa_indexer_topk_8a91a587122e3032ace6",
+        "finalize_rank:t256:w131072:two:staged:i16": "cake_dsa_indexer_topk_578634f8fe7efda0f97c",
+        "finalize_rank:t256:w131072:two:staged:i16:bulk": "cake_dsa_indexer_topk_d965d76ede39f71e674b",
+        "finalize_rank:t256:w16384:staged": "cake_dsa_indexer_topk_55767b3e4f028548bd92",
+        "finalize_rank:t256:w16384:staged:bulk:persist": "cake_dsa_indexer_topk_7286faf88e17986cff38",
+        "finalize_rank:t256:w16384:staged:i16": "cake_dsa_indexer_topk_aacebef79deb11b3aea9",
+        "finalize_rank:t256:w16384:staged:i16:bulk": "cake_dsa_indexer_topk_2d40b7d91582905f31c3",
+        "finalize_rank:t256:w262144:two:staged": "cake_dsa_indexer_topk_a42ccc07b6379bcf9549",
+        "finalize_rank:t256:w262144:two:staged:bulk": "cake_dsa_indexer_topk_60b4f87115fbecd243e2",
+        "finalize_rank:t256:w262144:two:staged:i16": "cake_dsa_indexer_topk_75842ae0f80e05addeaa",
+        "finalize_rank:t256:w262144:two:staged:i16:bulk": "cake_dsa_indexer_topk_69d2d7c68ccceb095540",
+        "finalize_rank:t256:w524288:two:staged": "cake_dsa_indexer_topk_cb8c20570699061f544d",
+        "finalize_rank:t256:w524288:two:staged:bulk": "cake_dsa_indexer_topk_c496f83c2e9979f7830a",
+        "finalize_rank:t256:w524288:two:staged:i16": "cake_dsa_indexer_topk_e3bb94a1bd63e4b54a08",
+        "finalize_rank:t256:w524288:two:staged:i16:bulk": "cake_dsa_indexer_topk_44163f96c12681e411cc",
+        "finalize_rank:t256:w65536:staged": "cake_dsa_indexer_topk_9b89c92489b0e60d8ee7",
+        "finalize_rank:t256:w65536:staged:bulk:persist": "cake_dsa_indexer_topk_8f8c393ea106e74d70e9",
+        "finalize_rank:t256:w65536:staged:i16": "cake_dsa_indexer_topk_c02bcf153cf2ddae3b58",
+        "finalize_rank:t256:w65536:staged:i16:bulk": "cake_dsa_indexer_topk_96c30b1f33d2a094d9b9",
+        "finalize_rank:t256:w8192:staged": "cake_dsa_indexer_topk_58f1c8a36e2cf5f302ae",
+        "finalize_rank:t256:w8192:staged:bulk:persist": "cake_dsa_indexer_topk_aa0bedf1a5601a3c55be",
+        "merge": "cake_dsa_indexer_topk_b8440d1d1d54917a47d7",
+        "scan:l6:u1:s0:f0": "cake_dsa_indexer_topk_3c9bece1433e9cf03979",
+        "scan:l6:u1:s0:f1": "cake_dsa_indexer_topk_110194b650e766125f9f",
+        "scan:l6:u1:s1:f1": "cake_dsa_indexer_topk_384649a6eee3c6a35aa4",
+        "scan:narrow:u1:s0:f0": "cake_dsa_indexer_topk_23a4ebeaa3ba23c23c80",
+        "scan:narrow:u1:s0:f1": "cake_dsa_indexer_topk_af8d290aa9010d180ed0",
+        "scan:narrow:u1:s1:f1": "cake_dsa_indexer_topk_506cb2b2c57f0a514cde",
+        "scan:narrow:u2:s0:f0": "cake_dsa_indexer_topk_2de9f2d0467668d46463",
+        "scan:pair_l6:u1:s0:f0": "cake_dsa_indexer_topk_7d1b556b2aedea7f5249",
+        "scan:pair_l6:u1:s0:f1": "cake_dsa_indexer_topk_9f4b76cb713088f1285d",
+        "scan:pair_l6:u1:s1:f1": "cake_dsa_indexer_topk_88619e22363515835efe",
+        "scan:pair_narrow:u1:s1:f1": "cake_dsa_indexer_topk_0d38735ee8e81ae6f5e8",
+        "scan:pair_narrow:u2:s0:f0": "cake_dsa_indexer_topk_a64563a936f84ea4d9f5",
+        "scan:pair_narrow:u2:s0:f1": "cake_dsa_indexer_topk_942797c60bc61df40715",
+        "scan:pair_wide:u1:s1:f0": "cake_dsa_indexer_topk_74f132250e5e565dfcc9",
+        "scan:pair_wide:u1:s1:f1": "cake_dsa_indexer_topk_1b6af9940d486a0832d9",
+        "scan:pair_wide:u2:s0:f0": "cake_dsa_indexer_topk_3bd43d833b5d53e81dbe",
+        "scan:pair_wide:u2:s0:f1": "cake_dsa_indexer_topk_9c823649b35909199596",
+        "scan:split_narrow:u1:s0:f0": "cake_dsa_indexer_topk_9cc421366d6079aa6ca8",
+        "scan:split_wide:u1:s0:f0": "cake_dsa_indexer_topk_763009af2c0de13ffc29",
+        "scan:split_wide:u2:s0:f0": "cake_dsa_indexer_topk_81ccb257c7338a468c3b",
+        "scan:wide:u1:s0:f0": "cake_dsa_indexer_topk_5c6e55c74de033e5f7af",
+        "scan:wide:u1:s0:f1": "cake_dsa_indexer_topk_e983ae66ae1ef4d182e5",
+        "scan:wide:u1:s1:f0": "cake_dsa_indexer_topk_99af5257f5e28006f79e",
+        "scan:wide:u1:s1:f1": "cake_dsa_indexer_topk_e7860bf225417a2a3b51",
+        "scan:wide:u2:s0:f0": "cake_dsa_indexer_topk_afa89b4033e466d158b1",
+    },
+}
+POLICY: dict[str, dict[str, Any]] = {
+    "sm_100a": {
+        "tile_keys": 128,
+        "block_q_narrow": 4,
+        "block_q_wide": 8,
+        "block_q_l6": 6,
+        "candidate_entry_bytes": 8,
+        "candidate_multiplier": 4,
+        "candidate_slack": 128,
+        "cand_mult_rule": [384.0, 8],
+        "cand_cap_floor": 8192,
+        "l6_rule": [256.0, 512],
+        "wide_rule": [6.0, 300.0],
+        "split_max": 32,
+        "split_min_range_tiles": 64,
+        "split_wave_rule": None,
+        "pair_rule": [128.0, 256.0, 512],
+        "snake_default": False,
+        "snake_rule": None,
+        "tile_unroll_default": 1,
+        "tile_unroll_factor": 2,
+        "tile_unroll_rule": [["wide"], 256, False],
+        "sample_fit_max_mean_tiles": 512.0,
+        "sample_tiles_max": 32,
+        "sample_tiles_short_units": 16,
+        "sample_dispatch_mean_tiles_max": 640.0,
+        "sample_tiles_tiny_units": 8,
+        "sample_dispatch_tiny_tiles_max": 128.0,
+        "sample_shift_permille": 250,
+        "check_period_max": 32,
+        "check_period_knob_max": 64,
+        "check_period_cap_divisor": 512,
+        "check_period_kind_overrides": {},
+        "finalize_items": 8,
+        "finalize_threads_fit": [32, 64, 128],
+        "finalize_threads_small": 256,
+        "finalize_top_k_small": 2048,
+        "finalize_threads": 512,
+        "finalize_fit": True,
+        "finalize_exact_key_bits": True,
+        "rank_finalize": True,
+        "rank_window_variants": [8192, 16384, 65536, 131072, 262144, 524288],
+        "rank_top_k_min": 1025,
+        "rank_rule": [524288, 262144],
+        "rank_staged": True,
+        "rank_staged_rule": [262144],
+        "rank_seg_window": True,
+        "rank_window_variants_seg_only": [131072],
+        "rank_two_level": True,
+        "rank_two_level_window_variants": [131072, 262144, 524288, 1048576],
+        "rank_slab_window_max": 65536,
+        "rank_two_level_rule": [524288],
+        "rank_two_level_staged_rule": [524288],
+        "rank_bulk_io": True,
+        "rank_bulk_align_bytes": 16,
+        "rank_t16": True,
+        "rank_t16_slots": [4096],
+        "rank_persist_max_k": 0,
+        "rank_persist_ctas_per_sm": 4,
+    },
+    "sm_103a": {
+        "tile_keys": 128,
+        "block_q_narrow": 4,
+        "block_q_wide": 8,
+        "block_q_l6": 6,
+        "candidate_entry_bytes": 8,
+        "candidate_multiplier": 4,
+        "candidate_slack": 128,
+        "cand_mult_rule": [384.0, 8],
+        "cand_cap_floor": 8192,
+        "l6_rule": [1024.0, 512],
+        "wide_rule": [6.0, 300.0],
+        "split_max": 32,
+        "split_min_range_tiles": 64,
+        "split_wave_rule": None,
+        "pair_rule": [64.0, 1024.0, 512],
+        "snake_default": False,
+        "snake_rule": None,
+        "tile_unroll_default": 1,
+        "tile_unroll_factor": 2,
+        "tile_unroll_rule": [["wide"], 256, False],
+        "sample_fit_max_mean_tiles": 512.0,
+        "sample_tiles_max": 32,
+        "sample_tiles_short_units": 16,
+        "sample_dispatch_mean_tiles_max": 640.0,
+        "sample_tiles_tiny_units": 8,
+        "sample_dispatch_tiny_tiles_max": 128.0,
+        "sample_shift_permille": 250,
+        "check_period_max": 32,
+        "check_period_knob_max": 64,
+        "check_period_cap_divisor": 512,
+        "check_period_kind_overrides": {"wide": 32},
+        "finalize_items": 8,
+        "finalize_threads_fit": [32, 64, 128],
+        "finalize_threads_small": 256,
+        "finalize_top_k_small": 2048,
+        "finalize_threads": 512,
+        "finalize_fit": True,
+        "finalize_exact_key_bits": True,
+        "rank_finalize": True,
+        "rank_window_variants": [8192, 16384, 65536, 131072, 262144, 524288],
+        "rank_top_k_min": 1025,
+        "rank_rule": [524288, 262144],
+        "rank_staged": True,
+        "rank_staged_rule": [262144],
+        "rank_seg_window": True,
+        "rank_window_variants_seg_only": [131072],
+        "rank_two_level": True,
+        "rank_two_level_window_variants": [131072, 262144, 524288, 1048576],
+        "rank_slab_window_max": 65536,
+        "rank_two_level_rule": [524288],
+        "rank_two_level_staged_rule": [524288],
+        "rank_bulk_io": True,
+        "rank_bulk_align_bytes": 16,
+        "rank_t16": True,
+        "rank_t16_slots": [4096],
+        "rank_persist_max_k": 0,
+        "rank_persist_ctas_per_sm": 4,
+    },
+    "sm_107a": {
+        "tile_keys": 128,
+        "block_q_narrow": 4,
+        "block_q_wide": 8,
+        "block_q_l6": 6,
+        "candidate_entry_bytes": 8,
+        "candidate_multiplier": 4,
+        "candidate_slack": 128,
+        "cand_mult_rule": [384.0, 8],
+        "cand_cap_floor": 8192,
+        "l6_rule": [64.0, 0],
+        "wide_rule": [2.0, 250.0],
+        "split_max": 32,
+        "split_min_range_tiles": 64,
+        "split_wave_rule": [1000, 0.12],
+        "pair_rule": [0.0, 4096.0, 512],
+        "snake_default": False,
+        "snake_rule": [
+            ["l6", "narrow", "pair_l6", "pair_narrow", "pair_wide", "wide"],
+            32.0,
+            128.0,
+            0.5,
+        ],
+        "tile_unroll_default": 1,
+        "tile_unroll_factor": 2,
+        "tile_unroll_rule": [
+            ["narrow", "pair_narrow", "pair_wide", "split_wide", "wide"],
+            512,
+            True,
+        ],
+        "sample_fit_max_mean_tiles": 512.0,
+        "sample_tiles_max": 32,
+        "sample_tiles_short_units": 16,
+        "sample_dispatch_mean_tiles_max": 640.0,
+        "sample_tiles_tiny_units": 8,
+        "sample_dispatch_tiny_tiles_max": 128.0,
+        "sample_shift_permille": 250,
+        "check_period_max": 32,
+        "check_period_knob_max": 64,
+        "check_period_cap_divisor": 512,
+        "check_period_kind_overrides": {},
+        "finalize_items": 8,
+        "finalize_threads_fit": [32, 64, 128],
+        "finalize_threads_small": 256,
+        "finalize_top_k_small": 2048,
+        "finalize_threads": 512,
+        "finalize_fit": True,
+        "finalize_exact_key_bits": True,
+        "rank_finalize": True,
+        "rank_window_variants": [8192, 16384, 65536, 131072, 262144, 524288],
+        "rank_top_k_min": 1025,
+        "rank_rule": [524288, 262144],
+        "rank_staged": True,
+        "rank_staged_rule": [262144],
+        "rank_seg_window": True,
+        "rank_window_variants_seg_only": [131072],
+        "rank_two_level": True,
+        "rank_two_level_window_variants": [131072, 262144, 524288, 1048576],
+        "rank_slab_window_max": 65536,
+        "rank_two_level_rule": [524288],
+        "rank_two_level_staged_rule": [524288],
+        "rank_bulk_io": True,
+        "rank_bulk_align_bytes": 16,
+        "rank_t16": True,
+        "rank_t16_slots": [4096],
+        "rank_persist_max_k": 2048,
+        "rank_persist_ctas_per_sm": 4,
+    },
+}
+TRACKING_ISSUE = "flashinfer-ai/flashinfer#5676"
+
+
+def library_name(program: str, arch: str) -> str:
+    """The ``build.json`` entry of ``program`` for ``arch``: ``<library>_<arch>``."""
+    record = PROGRAMS[program]
+    if arch not in record["arches"]:
+        raise ValueError(f"program {program!r} is not built for {arch!r}")
+    return f"{record['library']}_{arch}"
+
+
+@functools.cache
+def load_program(program: str, arch: str):
+    """The library of ``program`` for ``arch``: prebuilt ``aot/`` else a JIT build."""
+    return cake_build.load_library(library_name(program, arch))

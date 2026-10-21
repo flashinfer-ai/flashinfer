@@ -406,7 +406,7 @@ def _block_sparse_route_schema(
         )
         inputs["v_summary"] = Tensor(
             ["batch_size", "num_kv_blocks", "num_kv_heads", "head_dim"],
-            description="Per-block summed V vectors for proxy routes.",
+            description="Per-block mean V vectors for proxy routes.",
         )
         constraints.extend(
             [
@@ -466,14 +466,24 @@ def _prims_ts_sparse_pattern_trace(
 
 
 def _make_prims_ts_block_sparse_trace(
-    *, sparse_format: str, use_proxy_routes: bool, wrapper: bool
+    *,
+    sparse_format: str,
+    use_proxy_routes: bool,
+    wrapper: bool,
+    use_block_sparse: bool = True,
 ) -> TraceTemplate:
-    route_axes, route_inputs, route_constraints, suffix = _block_sparse_route_schema(
-        sparse_format, use_proxy_routes, kv_len_axis="seq_len_kv"
-    )
-    route_name = "BSR" if sparse_format == "bsr" else "bitmask"
-    if use_proxy_routes:
-        route_name += " proxy"
+    """Describe one contiguous mode: a route frontend, or dense attention."""
+    if use_block_sparse:
+        route_axes, route_inputs, route_constraints, suffix = (
+            _block_sparse_route_schema(
+                sparse_format, use_proxy_routes, kv_len_axis="seq_len_kv"
+            )
+        )
+        route_name = "BSR" if sparse_format == "bsr" else "bitmask"
+        if use_proxy_routes:
+            route_name += " proxy"
+    else:
+        route_axes, route_inputs, route_constraints, suffix = {}, {}, [], "_dense"
     axes: dict[str, Var | Const] = {
         "batch_size": Var(description="Number of requests."),
         "seq_len_q": Var(description="Fixed query length per request."),
@@ -531,18 +541,51 @@ def _make_prims_ts_block_sparse_trace(
         "kv_valid_bits is None or num_kv_valid_words == (seq_len_kv + 31) // 32",
         *route_constraints,
     ]
-    if wrapper:
-        description = (
-            "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact "
-            f"BSHD Q/K/V and live per-KV-head {route_name} metadata. Block "
-            "geometry and mask type are retained by plan() and represented "
-            "as optional trace context."
-        )
+    if use_block_sparse:
+        tags = [
+            "backend:prims-ts",
+            "sparse:block",
+            f"sparse-format:{sparse_format}",
+            "routes:proxy" if use_proxy_routes else "routes:exact",
+            "status:experimental",
+        ]
+        if wrapper:
+            description = (
+                "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact "
+                f"BSHD Q/K/V and live per-KV-head {route_name} metadata. Block "
+                "geometry and mask type are retained by plan() and represented "
+                "as optional trace context."
+            )
+        else:
+            description = (
+                "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact "
+                f"BSHD Q/K/V and per-KV-head {route_name} metadata."
+            )
     else:
-        description = (
-            "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact "
-            f"BSHD Q/K/V and per-KV-head {route_name} metadata."
+        # A dense run takes Q/K/V only: no route metadata or token mask.
+        del axes["num_kv_valid_words"]
+        del inputs["kv_valid_bits"]
+        constraints.remove(
+            "kv_valid_bits is None or num_kv_valid_words == (seq_len_kv + 31) // 32"
         )
+        tags = [
+            "backend:prims-ts",
+            "sparse:none",
+            "routes:dense",
+            "status:experimental",
+        ]
+        if wrapper:
+            description = (
+                "Reusable PrimTS dense MHA/GQA/MQA attention over compact BSHD "
+                "Q/K/V, the dense mode of the block-sparse wrapper. Block geometry "
+                "and mask type are retained by plan() and represented as optional "
+                "trace context."
+            )
+        else:
+            description = (
+                "One-shot PrimTS dense MHA/GQA/MQA attention over compact BSHD "
+                "Q/K/V, the dense mode of the block-sparse API."
+            )
     return TraceTemplate(
         op_type="block_sparse",
         name_prefix=f"prims_ts_block_sparse{'_wrapper' if wrapper else ''}{suffix}",
@@ -557,13 +600,7 @@ def _make_prims_ts_block_sparse_trace(
             )
         },
         constraints=constraints,
-        tags=[
-            "backend:prims-ts",
-            "sparse:block",
-            f"sparse-format:{sparse_format}",
-            "routes:proxy" if use_proxy_routes else "routes:exact",
-            "status:experimental",
-        ],
+        tags=tags,
     )
 
 
@@ -576,11 +613,16 @@ _PRIMS_TS_BLOCK_SPARSE_TRACES = {
     for sparse_format, use_proxy_routes in _BLOCK_SPARSE_ROUTE_MODES
 }
 prims_ts_block_sparse_trace = _PRIMS_TS_BLOCK_SPARSE_TRACES[("bsr", False)]
+_PRIMS_TS_DENSE_TRACE = _make_prims_ts_block_sparse_trace(
+    sparse_format="bsr", use_proxy_routes=False, wrapper=False, use_block_sparse=False
+)
 
 
 def prims_ts_block_sparse_trace_dispatch(**kwargs):
-    """Select a contiguous one-shot schema from its explicit route mode."""
+    """Select a contiguous one-shot schema from its explicit mode arguments."""
 
+    if not kwargs.get("use_block_sparse", True):
+        return _PRIMS_TS_DENSE_TRACE
     sparse_format = kwargs.get("sparse_format", "bsr")
     use_proxy_routes = kwargs.get("use_proxy_routes", False)
     return _prims_ts_sparse_pattern_trace(
@@ -594,7 +636,7 @@ prims_ts_block_sparse_trace_dispatch.templates = [  # type: ignore[attr-defined]
     _prims_ts_sparse_pattern_trace(template, shared, bound=False)
     for template in _PRIMS_TS_BLOCK_SPARSE_TRACES.values()
     for shared in (False, True)
-]
+] + [_PRIMS_TS_DENSE_TRACE]
 
 
 def _make_prims_ts_paged_block_sparse_trace(
@@ -796,6 +838,9 @@ _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES = {
     )
     for sparse_format, use_proxy_routes in _BLOCK_SPARSE_ROUTE_MODES
 }
+_PRIMS_TS_DENSE_WRAPPER_TRACE = _make_prims_ts_block_sparse_trace(
+    sparse_format="bsr", use_proxy_routes=False, wrapper=True, use_block_sparse=False
+)
 
 
 def _require_prims_ts_block_sparse_wrapper_state(
@@ -820,6 +865,8 @@ def prims_ts_block_sparse_wrapper_trace_dispatch(**kwargs):
     """Trace a planned contiguous block-sparse wrapper run."""
 
     state = _require_prims_ts_block_sparse_wrapper_state(kwargs, "BlockSparseTSWrapper")
+    if not getattr(state, "use_block_sparse", True):
+        return _PRIMS_TS_DENSE_WRAPPER_TRACE
     route_mode = (
         state.sparse_format,  # type: ignore[attr-defined]
         state.use_proxy_routes,  # type: ignore[attr-defined]
@@ -835,7 +882,7 @@ prims_ts_block_sparse_wrapper_trace_dispatch.templates = [  # type: ignore[attr-
     _prims_ts_sparse_pattern_trace(template, shared, bound=True)
     for template in _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES.values()
     for shared in (False, True)
-]
+] + [_PRIMS_TS_DENSE_WRAPPER_TRACE]
 
 
 _PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES = {
@@ -906,9 +953,31 @@ def _fmha_q_schema(q_mode: str):
     )
 
 
+class _FmhaDecodeTraceTemplatePatch(TraceTemplate):
+    """Preserve unpacked decode names while distinguishing packed NVFP4."""
+
+    def definition_name(self, axis_values: dict[str, int]) -> str:
+        name = super().definition_name(axis_values)
+        head_dim = axis_values.get("head_dim")
+        storage_head_dim = axis_values.get("kv_storage_head_dim")
+        if (
+            head_dim is not None
+            and storage_head_dim is not None
+            and storage_head_dim * 2 == head_dim
+        ):
+            return f"{name}_nvfp4"
+        return name
+
+
 def _add_fmha_cache_schema(
     inputs, axes, *, cache_param: str, combined: bool, encoded_page_size: int = 0
 ):
+    axes["kv_storage_head_dim"] = Const(
+        abbrev="", description="Stored K/V width; D/2 for packed NVFP4."
+    )
+    axes["kv_scale_groups"] = Var(
+        description="NVFP4 scale groups; one per 16 logical values."
+    )
     storage_axis = "storage_page_size" if encoded_page_size else "page_size"
     if encoded_page_size:
         axes["storage_page_size"] = axes["page_size"]
@@ -927,17 +996,17 @@ def _add_fmha_cache_schema(
                 "kv_planes",
                 "num_kv_heads",
                 storage_axis,
-                "head_dim",
+                "kv_storage_head_dim",
             ]
         )
         return
     inputs["k_cache"] = Tensor(
-        ["num_pages", "num_kv_heads", storage_axis, "head_dim"],
+        ["num_pages", "num_kv_heads", storage_axis, "kv_storage_head_dim"],
         param=cache_param,
         tuple_idx=0,
     )
     inputs["v_cache"] = Tensor(
-        ["num_pages", "num_kv_heads", storage_axis, "head_dim"],
+        ["num_pages", "num_kv_heads", storage_axis, "kv_storage_head_dim"],
         param=cache_param,
         tuple_idx=1,
     )
@@ -1006,30 +1075,35 @@ def _fmha_trace_variant(kwargs, *, query_param: str, cache_param: str, plan_stat
         output_dtype = requested_out_dtype
     elif isinstance(getattr(plan_state, "output_dtype", None), torch.dtype):
         # Reusable wrappers retain the planned output dtype.  In particular,
-        # an FP8-input plan may allocate FP16 output even though run() has no
+        # an FP8-input plan may allocate FP16/BF16 output even though run() has no
         # out_dtype argument and the caller omits an explicit out buffer.
         output_dtype = plan_state.output_dtype
     elif isinstance(query, torch.Tensor):
         output_dtype = query.dtype
     else:
         output_dtype = None
-    fp16_output = (
-        isinstance(query, torch.Tensor)
+    output_dtype = (
+        str(output_dtype).removeprefix("torch.")
+        if isinstance(query, torch.Tensor)
         and query.dtype == torch.float8_e4m3fn
-        and output_dtype == torch.float16
+        and output_dtype in (torch.float16, torch.bfloat16)
+        else None
     )
-    return isinstance(kwargs.get(cache_param), torch.Tensor), fp16_output, q_mode
+    return isinstance(kwargs.get(cache_param), torch.Tensor), output_dtype, q_mode
 
 
 # fi_trace retains builders by template identity, so repeated traces must reuse
 # their templates, including each supported encoded fragment size.
 @lru_cache(maxsize=None)
 def _make_attention_ts_decode_trace(
-    *, combined: bool, fp16_output: bool, q_mode: str, encoded_page_size: int = 0
+    *, combined: bool, output_dtype: str | None, q_mode: str, encoded_page_size: int = 0
 ):
     cache_form = "combined" if combined else "tuple"
+    storage_axis = "storage_page_size" if encoded_page_size else "page_size"
     page_suffix = f"_encoded_page{encoded_page_size}" if encoded_page_size else ""
-    output_suffix = "_fp16_output" if fp16_output else ""
+    output_suffix = {None: "", "float16": "_fp16_output", "bfloat16": "_bf16_output"}[
+        output_dtype
+    ]
     q_axes, q_shape, output_shape, q_suffix = _fmha_q_schema(q_mode)
     axes: dict[str, Var | Const] = {
         **q_axes,
@@ -1064,6 +1138,20 @@ def _make_attention_ts_decode_trace(
             "qo_indptr": Tensor(
                 ["len_qo_indptr"], dtype="int32", optional=q_mode != _Q_PACKED
             ),
+            "k_sf_cache": Tensor(
+                ["num_pages", "num_kv_heads", storage_axis, "kv_scale_groups"],
+                dtype="float8_e4m3fn",
+                param="kv_scale_factors",
+                tuple_idx=0,
+                optional=True,
+            ),
+            "v_sf_cache": Tensor(
+                ["num_pages", "num_kv_heads", storage_axis, "kv_scale_groups"],
+                dtype="float8_e4m3fn",
+                param="kv_scale_factors",
+                tuple_idx=1,
+                optional=True,
+            ),
             "seq_len_q": Scalar("int32", optional=True),
             "max_seq_len_q": Scalar("int32", optional=True),
             "mask_type": Scalar("string", optional=True),
@@ -1084,6 +1172,8 @@ def _make_attention_ts_decode_trace(
     constraints = [
         "head_dim in (64, 128, 256)",
         "page_size in (4, 8, 16, 32, 64, 128)",
+        "kv_storage_head_dim in (head_dim, head_dim // 2)",
+        "k_sf_cache is None or kv_scale_groups * 16 == head_dim",
         *(
             ["storage_page_size > page_size", "storage_page_size % page_size == 0"]
             if encoded_page_size
@@ -1110,7 +1200,7 @@ def _make_attention_ts_decode_trace(
         constraints.append("seq_len_q >= 2")
     else:
         constraints.append("seq_len_q == 1")
-    return TraceTemplate(
+    return _FmhaDecodeTraceTemplatePatch(
         op_type="gqa_paged",
         name_prefix=f"attention_ts_decode_{cache_form}{page_suffix}{output_suffix}{q_suffix}",
         description=(
@@ -1124,8 +1214,8 @@ def _make_attention_ts_decode_trace(
         outputs={
             "output": Tensor(
                 output_shape,
-                dtype="float16" if fp16_output else None,
-                dtype_from=None if fp16_output else "q",
+                dtype=output_dtype,
+                dtype_from=None if output_dtype else "q",
                 param="out",
             )
         },
@@ -1137,14 +1227,19 @@ def _make_attention_ts_decode_trace(
 # Representative native/encoded layouts suffice for discovery. Other supported
 # fragment sizes are built lazily by the cached factories during dispatch.
 _ATTENTION_TS_DECODE_TRACES = {
-    (combined, fp16_output, q_mode, encoded_page_size): _make_attention_ts_decode_trace(
+    (
+        combined,
+        output_dtype,
+        q_mode,
+        encoded_page_size,
+    ): _make_attention_ts_decode_trace(
         combined=combined,
-        fp16_output=fp16_output,
+        output_dtype=output_dtype,
         q_mode=q_mode,
         encoded_page_size=encoded_page_size,
     )
     for combined in (False, True)
-    for fp16_output in (False, True)
+    for output_dtype in (None, "float16", "bfloat16")
     for q_mode in (_Q_FIXED_ONE, _Q_FIXED_MULTI, _Q_PACKED)
     for encoded_page_size in (0, 4)
 }
@@ -1153,12 +1248,12 @@ _ATTENTION_TS_DECODE_TRACES = {
 def attention_ts_decode_trace_dispatch(**kwargs):
     """Select one-shot FMHA storage, cache, and output-dtype schema."""
 
-    combined, fp16_output, q_mode = _fmha_trace_variant(
+    combined, output_dtype, q_mode = _fmha_trace_variant(
         kwargs, query_param="q", cache_param="paged_kv_cache"
     )
     return _make_attention_ts_decode_trace(
         combined=combined,
-        fp16_output=fp16_output,
+        output_dtype=output_dtype,
         q_mode=q_mode,
         encoded_page_size=_fmha_encoded_page_size(kwargs, cache_param="paged_kv_cache"),
     )
@@ -1172,7 +1267,7 @@ attention_ts_decode_trace_dispatch.templates = list(  # type: ignore[attr-define
 def _make_prims_ts_decode_wrapper_trace(
     *,
     combined: bool,
-    fp16_output: bool,
+    output_dtype: str | None,
     q_mode: str,
     mask_type: str,
     window_left: int,
@@ -1187,8 +1282,11 @@ def _make_prims_ts_decode_wrapper_trace(
     """Describe one plan-bound ``BatchDecodePagedTSWrapper.run`` call."""
 
     cache_form = "combined" if combined else "tuple"
+    storage_axis = "storage_page_size" if encoded_page_size else "page_size"
     page_suffix = f"_encoded_page{encoded_page_size}" if encoded_page_size else ""
-    output_suffix = "_fp16_output" if fp16_output else ""
+    output_suffix = {None: "", "float16": "_fp16_output", "bfloat16": "_bf16_output"}[
+        output_dtype
+    ]
     q_axes, q_shape, output_shape, q_suffix = _fmha_q_schema(q_mode)
     axes: dict[str, Var | Const] = {
         **q_axes,
@@ -1275,6 +1373,20 @@ def _make_prims_ts_decode_wrapper_trace(
                 optional=q_mode != _Q_PACKED,
                 description="Cumulative Q offsets required by a packed-Q run.",
             ),
+            "k_sf_cache": Tensor(
+                ["num_pages", "num_kv_heads", storage_axis, "kv_scale_groups"],
+                dtype="float8_e4m3fn",
+                param="kv_scale_factors",
+                tuple_idx=0,
+                optional=True,
+            ),
+            "v_sf_cache": Tensor(
+                ["num_pages", "num_kv_heads", storage_axis, "kv_scale_groups"],
+                dtype="float8_e4m3fn",
+                param="kv_scale_factors",
+                tuple_idx=1,
+                optional=True,
+            ),
             "bmm1_scale": Scalar("float32", optional=True),
             "bmm2_scale": Scalar("float32", optional=True),
             "validate": Scalar(
@@ -1287,6 +1399,8 @@ def _make_prims_ts_decode_wrapper_trace(
     constraints = [
         "head_dim in (64, 128, 256)",
         "page_size in (4, 8, 16, 32, 64, 128)",
+        "kv_storage_head_dim in (head_dim, head_dim // 2)",
+        "k_sf_cache is None or kv_scale_groups * 16 == head_dim",
         *(
             ["storage_page_size > page_size", "storage_page_size % page_size == 0"]
             if encoded_page_size
@@ -1311,7 +1425,7 @@ def _make_prims_ts_decode_wrapper_trace(
         constraints.append("kv_planes == 2")
     if q_mode == _Q_FIXED_MULTI:
         constraints.append("seq_len_q >= 2")
-    return TraceTemplate(
+    return _FmhaDecodeTraceTemplatePatch(
         op_type="gqa_paged",
         name_prefix=(
             f"prims_ts_decode_wrapper_{cache_form}{page_suffix}{output_suffix}{q_suffix}_{mask_type}"
@@ -1335,8 +1449,8 @@ def _make_prims_ts_decode_wrapper_trace(
         outputs={
             "output": Tensor(
                 output_shape,
-                dtype="float16" if fp16_output else None,
-                dtype_from=None if fp16_output else "q",
+                dtype=output_dtype,
+                dtype_from=None if output_dtype else "q",
                 param="out",
             )
         },
@@ -1358,13 +1472,13 @@ def _make_prims_ts_decode_wrapper_trace(
 _PRIMS_TS_DECODE_WRAPPER_TRACE_EXAMPLES = {
     (
         combined,
-        fp16_output,
+        output_dtype,
         q_mode,
         plan_owns_seq_lens,
         encoded_page_size,
     ): _make_prims_ts_decode_wrapper_trace(
         combined=combined,
-        fp16_output=fp16_output,
+        output_dtype=output_dtype,
         q_mode=q_mode,
         mask_type="dense",
         window_left=-1,
@@ -1376,7 +1490,7 @@ _PRIMS_TS_DECODE_WRAPPER_TRACE_EXAMPLES = {
         encoded_page_size=encoded_page_size,
     )
     for combined in (False, True)
-    for fp16_output in (False, True)
+    for output_dtype in (None, "float16", "bfloat16")
     for q_mode in (_Q_FIXED_ONE, _Q_FIXED_MULTI, _Q_PACKED)
     for encoded_page_size in (0, 4)
     for plan_owns_seq_lens in (False, True)
@@ -1389,7 +1503,7 @@ _PRIMS_TS_DECODE_WRAPPER_TRACE_EXAMPLES = {
 def _get_prims_ts_decode_wrapper_trace(
     *,
     combined: bool,
-    fp16_output: bool,
+    output_dtype: str | None,
     q_mode: str,
     mask_type: str,
     window_left: int,
@@ -1405,7 +1519,7 @@ def _get_prims_ts_decode_wrapper_trace(
 
     return _make_prims_ts_decode_wrapper_trace(
         combined=combined,
-        fp16_output=fp16_output,
+        output_dtype=output_dtype,
         q_mode=q_mode,
         mask_type=mask_type,
         window_left=window_left,
@@ -1467,7 +1581,7 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
         wrapper_name="BatchDecodePagedTSWrapper",
         names=required_metadata,
     )
-    combined, fp16_output, q_mode = _fmha_trace_variant(
+    combined, output_dtype, q_mode = _fmha_trace_variant(
         kwargs,
         query_param="q",
         cache_param="paged_kv_cache",
@@ -1490,7 +1604,7 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
     )
     return _get_prims_ts_decode_wrapper_trace(
         combined=combined,
-        fp16_output=fp16_output,
+        output_dtype=output_dtype,
         q_mode=q_mode,
         mask_type=str(state.mask_type),
         window_left=int(state.window_left),
@@ -4783,6 +4897,114 @@ concat_mla_k_trace = TraceTemplate(
 )
 concat_mla_k_trace.axes["num_heads_broadcast"] = Const(
     description="Always 1 (k_rope is shared across heads).", abbrev=""
+)
+
+
+# ── Concat + fp8 quantize MLA K/V (DeepSeek / Kimi context chunks) ───────────
+
+
+@torch.no_grad()
+def _concat_mla_kv_quant_fp8_reference(
+    kv_nope, k_pe, key=None, value=None, nope_dim=128, **_unused
+):
+    """Reference for concat_mla_kv_quant_fp8: saturating fp8 e4m3 cast of
+    ``kv_nope = [k_nope | v]`` and of the head-shared ``k_pe``, laid out as
+    ``key = [k_nope ‖ broadcast(k_pe)]`` and ``value = v``.
+
+    Layouts:
+      - kv_nope: [num_tokens, num_heads, nope_dim + v_dim]  bf16
+      - k_pe:    [num_tokens, rope_dim]                     bf16 (shared across heads)
+      - key:     [num_tokens, num_heads, nope_dim + rope_dim]  float8_e4m3fn
+      - value:   [num_tokens, num_heads, v_dim]                float8_e4m3fn
+    ``Tensor.to(float8_e4m3fn)`` saturates on torch >= 2.13 (finite overflow
+    and +-inf -> +-448, NaN -> NaN); the kernel is byte-exact with that cast.
+    """
+    fp8 = torch.float8_e4m3fn
+    num_tokens, num_heads, _ = kv_nope.shape
+    k_pe = k_pe.reshape(num_tokens, 1, k_pe.shape[-1])
+    kv_fp8 = kv_nope.to(fp8)
+    key_out = torch.cat(
+        [kv_fp8[..., :nope_dim], k_pe.to(fp8).expand(num_tokens, num_heads, -1)],
+        dim=-1,
+    )
+    value_out = kv_fp8[..., nope_dim:].contiguous()
+    if key is not None:
+        key.copy_(key_out)
+        key_out = key
+    if value is not None:
+        value.copy_(value_out)
+        value_out = value
+    return key_out, value_out
+
+
+def _concat_mla_kv_quant_fp8_init(
+    *,
+    num_tokens: int,
+    num_heads: int = 12,
+    kv_dim: int = 256,
+    rope_dim: int = 64,
+    qk_dim: int = 0,  # derived: nope_dim + rope_dim
+    v_dim: int = 0,  # derived: kv_dim - nope_dim
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.concat_mla_kv_quant_fp8``."""
+    del qk_dim, v_dim
+    torch.manual_seed(seed)
+    kv_nope = torch.randn(
+        num_tokens, num_heads, kv_dim, dtype=torch.bfloat16, device=device
+    )
+    k_pe = torch.randn(num_tokens, rope_dim, dtype=torch.bfloat16, device=device)
+    return {"kv_nope": kv_nope, "k_pe": k_pe}
+
+
+concat_mla_kv_quant_fp8_trace = TraceTemplate(
+    op_type="mla_paged",
+    name_prefix="concat_mla_kv_quant_fp8",
+    description=(
+        "MLA context K/V pack with fp8 e4m3 quantization: casts the per-head "
+        "``kv_nope = [k_nope | v]`` projection and the head-shared RoPE key "
+        "``k_pe`` to float8_e4m3fn (saturating) and writes ``key = [k_nope ‖ "
+        "k_pe]`` and ``value = v`` as contiguous buffers for a ragged MLA "
+        "prefill kernel, in one memory pass."
+    ),
+    axes={
+        "num_tokens": Var(),
+        "num_heads": Const(abbrev="h"),
+        "kv_dim": Const(
+            description="nope_dim + v_dim (kv_nope last dim).", abbrev="kv"
+        ),
+        "rope_dim": Const(abbrev="rope"),
+        # Output-only dims (derived: qk_dim = nope_dim + rope_dim, v_dim =
+        # kv_dim - nope_dim; nope_dim defaults to 128).
+        "qk_dim": Var(description="nope_dim + rope_dim (key last dim)."),
+        "v_dim": Var(description="kv_dim - nope_dim (value last dim)."),
+    },
+    inputs={
+        "kv_nope": Tensor(
+            ["num_tokens", "num_heads", "kv_dim"],
+            description="[k_nope | v] per head, bf16.",
+        ),
+        "k_pe": Tensor(
+            ["num_tokens", "rope_dim"],
+            description="RoPE'd key shared across heads, bf16.",
+        ),
+    },
+    outputs={
+        "key": Tensor(
+            ["num_tokens", "num_heads", "qk_dim"],
+            dtype="float8_e4m3fn",
+            description="[k_nope ‖ k_pe] per head, saturating e4m3.",
+        ),
+        "value": Tensor(
+            ["num_tokens", "num_heads", "v_dim"],
+            dtype="float8_e4m3fn",
+            description="v per head, saturating e4m3.",
+        ),
+    },
+    tags=["status:verified", "mla"],
+    reference=_concat_mla_kv_quant_fp8_reference,
+    init=_concat_mla_kv_quant_fp8_init,
 )
 
 
