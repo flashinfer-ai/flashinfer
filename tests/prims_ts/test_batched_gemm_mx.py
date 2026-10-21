@@ -32,6 +32,8 @@ import torch
 
 from flashinfer.utils import is_sm100a_supported
 
+from tests.prims_ts.dsl_version import requires_dsl_4_8_for_c_partition_offset
+
 from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
     ActKind,
     uniform_pipeline_stage_overrides,
@@ -1463,6 +1465,7 @@ class TestMxFc1QuantizedEpilogue:
         )
         assert result
 
+    @requires_dsl_4_8_for_c_partition_offset
     @pytest.mark.parametrize(
         "dtype_a,use_tma_store,tile_n,epi_tile_n,umma_cta_count,mma_m,sf_layout_c",
         (
