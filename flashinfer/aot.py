@@ -170,9 +170,8 @@ from .jit.cake_minimax_h3_mxfp8 import (
     MiniMaxH3Mxfp8Target,
     gen_minimax_h3_mxfp8_aot_modules,
 )
-from .jit.cake_minimax_h3_nvfp4 import (
-    MiniMaxH3Nvfp4Target,
-    gen_minimax_h3_nvfp4_aot_modules,
+from .jit.cake_minimax_h3_nvfp4_pre_attention import (
+    aot_specs as gen_cake_minimax_h3_nvfp4_pre_attention_aot_modules,
 )
 from .jit.cake_minimax_h3_qkv_quantize_pack import (
     aot_specs as gen_cake_minimax_h3_qkv_quantize_pack_aot_modules,
@@ -758,13 +757,12 @@ def gen_all_modules(
         if enabled:
             jit_specs.extend(gen_minimax_h3_mxfp8_aot_modules(minimax_h3_target))
 
-    minimax_h3_nvfp4_targets: tuple[tuple[MiniMaxH3Nvfp4Target, bool], ...] = (
-        ("sm100a", sm_capabilities.get("sm100a_exact", False)),
-        ("sm103a", sm_capabilities.get("sm103a_exact", False)),
-    )
-    for minimax_h3_nvfp4_target, enabled in minimax_h3_nvfp4_targets:
-        if enabled:
-            jit_specs.extend(gen_minimax_h3_nvfp4_aot_modules(minimax_h3_nvfp4_target))
+    # Cake MiniMax-H3 NVFP4 pre-attention: the norm stage and, per output
+    # format, the fused GEMM of each exact sm_100a / sm_103a target.
+    if has_sm100a_exact:
+        jit_specs.extend(gen_cake_minimax_h3_nvfp4_pre_attention_aot_modules("sm_100a"))
+    if has_sm103a_exact:
+        jit_specs.extend(gen_cake_minimax_h3_nvfp4_pre_attention_aot_modules("sm_103a"))
 
     # Cake MiniMax-H3 QKV quantize-and-pack: eight generated programs (NVFP4 /
     # MXFP8 x P in 1, 2, 4, 8), each an exact sm_100a / sm_103a library.
