@@ -151,7 +151,7 @@ def prefer_direct_bf16_gemm_sm100(m: int, n: int, k: int) -> bool:
     M = 2 with larger N, M = 1 with K < 5120, and K = 40960 are left out
     because the Split-K default can be faster there.
     """
-    if not 1 <= m <= _MAX_M or n <= 0:
+    if not 1 <= m <= _MAX_M or n <= 0 or k <= 0:
         return False
     if k % (_SUPPORTED_BLOCK_SIZES[0] * _VECTOR_WIDTH):
         return False

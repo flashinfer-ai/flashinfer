@@ -2308,14 +2308,11 @@ def _cute_dsl_splitk_bf16_gemm_runner(
                 default = default_tactic(m, n, k)
             except ValueError:
                 return []
+            # Pruning reads the SM count and cluster capacity of the current device.
+            with torch.cuda.device(a.device):
+                tactics = autotune_tactics(m, n, k)
             return list(
-                dict.fromkeys(
-                    astuple(config)
-                    for config in (
-                        default,
-                        *autotune_tactics(m, n, k),
-                    )
-                )
+                dict.fromkeys(astuple(config) for config in (default, *tactics))
             )
 
         def forward(
