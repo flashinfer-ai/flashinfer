@@ -656,7 +656,8 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill(
     )
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(our_o, ref_o, atol=4e-2, rtol=4e-2)
+    # The output scales with `scale` (~1e-2 at 1/sqrt(DK)), so its atol does too.
+    torch.testing.assert_close(our_o, ref_o, atol=4e-2 * scale, rtol=4e-2)
     torch.testing.assert_close(our_state, ref_state, atol=4e-2, rtol=4e-2)
 
 
@@ -770,7 +771,8 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill_unequal_heads(
     )
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(our_o, ref_o, atol=4e-2, rtol=4e-2)
+    # The output scales with `scale` (~1e-2 at 1/sqrt(DK)), so its atol does too.
+    torch.testing.assert_close(our_o, ref_o, atol=4e-2 * scale, rtol=4e-2)
     torch.testing.assert_close(our_state, ref_state, atol=4e-2, rtol=4e-2)
 
 
@@ -833,7 +835,8 @@ def test_cp_delta_rule_kernel_chain_long_small_bh_matches_non_cp_prefill(
     ref_o, ref_state = _run_non_cp_prefill(q, k, v, alpha, beta, cu_seqlens, scale)
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(our_o, ref_o, atol=5e-2, rtol=5e-2)
+    # The output scales with `scale` (~1e-2 at 1/sqrt(DK)), so its atol does too.
+    torch.testing.assert_close(our_o, ref_o, atol=5e-2 * scale, rtol=5e-2)
     torch.testing.assert_close(our_state, ref_state, atol=5e-2, rtol=5e-2)
 
 
@@ -883,7 +886,7 @@ def test_cp_delta_rule_e2e_with_initial_state(
             dtype=torch.float32,
             device=device,
         )
-        * 0.02
+        * 0.5
     )
 
     our_o = torch.empty(
@@ -911,7 +914,8 @@ def test_cp_delta_rule_e2e_with_initial_state(
     )
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(our_o, ref_o, atol=5e-2, rtol=5e-2)
+    # The output scales with `scale` (~1e-2 at 1/sqrt(DK)), so its atol does too.
+    torch.testing.assert_close(our_o, ref_o, atol=5e-2 * scale, rtol=5e-2)
     torch.testing.assert_close(our_state, ref_state, atol=5e-2, rtol=5e-2)
 
 
@@ -1018,7 +1022,8 @@ def test_cp_delta_rule_e2e(
         atol_state = 1e-3
         rtol_state = 1e-3
 
-    torch.testing.assert_close(our_o, ref_o, atol=atol_o, rtol=rtol_o)
+    # The output scales with `scale` (~1e-2 at 1/sqrt(DK)), so its atol does too.
+    torch.testing.assert_close(our_o, ref_o, atol=atol_o * scale, rtol=rtol_o)
     torch.testing.assert_close(our_state, ref_state, atol=atol_state, rtol=rtol_state)
 
 
@@ -1082,7 +1087,8 @@ def test_cp_delta_rule_public_wrapper_matches_non_cp_prefill(
     )
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(our_o, ref_o, atol=4e-2, rtol=4e-2)
+    # The output scales with `scale` (~1e-2 at 1/sqrt(DK)), so its atol does too.
+    torch.testing.assert_close(our_o, ref_o, atol=4e-2 * scale, rtol=4e-2)
     torch.testing.assert_close(our_state, ref_state, atol=4e-2, rtol=4e-2)
 
 
@@ -1101,6 +1107,7 @@ def test_cp_delta_rule_external_state_dtype(
     dtype = torch.bfloat16
     head_size = 128
     num_heads = 1
+    scale = 1.0 / math.sqrt(head_size)
     num_seqs = len(seq_lens)
     total_seqlen = sum(seq_lens)
     cu_seqlens = _make_cu_seqlens(seq_lens, device)
@@ -1110,7 +1117,7 @@ def test_cp_delta_rule_external_state_dtype(
             seq_lens, num_heads, num_heads, num_heads, head_size, dtype=dtype
         )
         initial_state = (
-            torch.randn(num_seqs, num_heads, head_size, head_size) * 0.01
+            torch.randn(num_seqs, num_heads, head_size, head_size) * 0.5
         ).to(state_dtype)
     q = q.contiguous()
     k = torch.nn.functional.normalize(k.float(), p=2.0, dim=-1).to(dtype).contiguous()
@@ -1128,7 +1135,7 @@ def test_cp_delta_rule_external_state_dtype(
         v,
         alpha,
         beta,
-        1.0 / math.sqrt(head_size),
+        scale,
         initial_state,
         True,
         cu_seqlens,
@@ -1144,7 +1151,7 @@ def test_cp_delta_rule_external_state_dtype(
         v,
         alpha,
         beta,
-        1.0 / math.sqrt(head_size),
+        scale,
         initial_state,
         True,
         cu_seqlens,
@@ -1155,5 +1162,6 @@ def test_cp_delta_rule_external_state_dtype(
     )
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(our_o, ref_o, atol=4e-2, rtol=4e-2)
+    # The output scales with `scale` (~1e-2 at 1/sqrt(DK)), so its atol does too.
+    torch.testing.assert_close(our_o, ref_o, atol=4e-2 * scale, rtol=4e-2)
     torch.testing.assert_close(our_state, ref_state, atol=4e-2, rtol=4e-2)

@@ -267,16 +267,21 @@ def test_prefill_block_end_decay(qkv_factory, seed=0):
     )
 
 
+@pytest.mark.parametrize("use_cp", [False, True], ids=lambda cp: f"cp{int(cp)}")
 @pytest.mark.parametrize("head_size, head_size_v", [(96, 96), (64, 128)])
-def test_prefill_rejects_unsupported_head_sizes(head_size, head_size_v):
+def test_prefill_rejects_unsupported_head_sizes(head_size, head_size_v, use_cp):
     """Every arch path raises NotImplementedError, not an assert, for a pair it lacks."""
     _skip_if_unsupported()
+    if use_cp and is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("SM12x CP rejects non-128 heads as a CP dispatch reason")
     device = torch.device("cuda")
     q = torch.randn(64, 1, head_size, dtype=torch.bfloat16, device=device)
     v = torch.randn(64, 1, head_size_v, dtype=torch.bfloat16, device=device)
     cu_seqlens = torch.tensor([0, 64], dtype=torch.int64, device=device)
     with pytest.raises(NotImplementedError, match="head_size"):
-        chunk_gated_delta_rule(q, q, v, cu_seqlens=cu_seqlens, use_cp=False)
+        chunk_gated_delta_rule(
+            q, q, v, cu_seqlens=cu_seqlens, use_cp=use_cp, max_seqlen=64
+        )
 
 
 @pytest.mark.parametrize("beta", [False, True])
@@ -1010,8 +1015,11 @@ def _test_checkpoint(
 
 
 @pytest.mark.parametrize("checkpoint_every_n_tokens", [64, 128])
-@pytest.mark.parametrize("head_size", [128])
-@pytest.mark.parametrize("head_size_v", [128, 64], ids=lambda d: f"dv{d}")
+@pytest.mark.parametrize(
+    "head_size, head_size_v",
+    [(128, 128), (128, 64), (64, 64)],
+    ids=["dk128-dv128", "dk128-dv64", "dk64-dv64"],
+)
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [(4, 1, 1), (2, 2, 4)],
