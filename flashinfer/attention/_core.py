@@ -384,6 +384,19 @@ class BatchAttention:
         return out, lse
 
 
+def _fold_qk_scale(args: tuple, q_scale: Any, k_scale: Any) -> Tuple[tuple, Any, Any]:
+    # The sink kernel reads sm_scale from run(q, paged_kv_cache, sinks, sm_scale). The parents
+    # fold q_scale and k_scale only into their own sm_scale, which the kernel never sees once
+    # the caller passes one, so the positional sm_scale has to carry them.
+    if len(args) < 2:
+        return args, q_scale, k_scale
+    sm_scale = args[1]
+    for scale in (q_scale, k_scale):
+        if scale is not None:
+            sm_scale *= scale
+    return (args[0], sm_scale, *args[2:]), None, None
+
+
 class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper):
     r"""
     Wrapper for prefill and decode attention with paged KV-cache that adds support for
@@ -498,6 +511,20 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
         }
         return backend, jit_args, jit_kwargs
 
+    def run(
+        self,
+        q: torch.Tensor,
+        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        *args: Any,
+        q_scale: Optional[Union[float, torch.Tensor]] = None,
+        k_scale: Optional[Union[float, torch.Tensor]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        args, q_scale, k_scale = _fold_qk_scale(args, q_scale, k_scale)
+        return super().run(
+            q, paged_kv_cache, *args, q_scale=q_scale, k_scale=k_scale, **kwargs
+        )
+
 
 class BatchDecodeWithAttentionSinkWrapper(BatchDecodeWithPagedKVCacheWrapper):
     r"""Decode counterpart of :class:`BatchAttentionWithAttentionSinkWrapper`.
@@ -550,6 +577,20 @@ class BatchDecodeWithAttentionSinkWrapper(BatchDecodeWithPagedKVCacheWrapper):
                 "Attention-sink decode applies no position encoding; "
                 "pos_encoding_mode must be 'NONE'."
             )
+
+    def run(
+        self,
+        q: torch.Tensor,
+        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        *args: Any,
+        q_scale: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        **kwargs: Any,
+    ) -> Any:
+        args, q_scale, k_scale = _fold_qk_scale(args, q_scale, k_scale)
+        return super().run(
+            q, paged_kv_cache, *args, q_scale=q_scale, k_scale=k_scale, **kwargs
+        )
 
 
 # The parent's ``run`` carries ``@flashinfer_api(trace=gqa_paged_prefill_trace)``.

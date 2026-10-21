@@ -1151,7 +1151,7 @@ def test_attention_sink_nvfp4_kv(window_left):
         *(16, 8, 128, 16),
     )
 
-    def run(cls, qo_len, kv, kv_cache_sf=None):
+    def run(cls, q, kv, kv_cache_sf=None, **scales):
         kw = dict(window_left=window_left, q_data_type=torch.bfloat16)
         kw.update(kv_data_type=kv[0].dtype)
         wrapper = cls(torch.empty(128 << 20, dtype=torch.uint8, device=device), "HND",
@@ -1159,17 +1159,24 @@ def test_attention_sink_nvfp4_kv(window_left):
         if cls is flashinfer.BatchDecodeWithAttentionSinkWrapper:
             wrapper.plan(*plan_args, **kw)
         else:
-            qo_indptr = torch.arange(4, dtype=torch.int32) * qo_len
+            qo_indptr = torch.arange(4, dtype=torch.int32) * (len(q) // 3)
             wrapper.plan(qo_indptr, *plan_args, causal=True, **kw)
-        return wrapper.run(qs[qo_len], kv, sink, 128**-0.5, kv_cache_sf=kv_cache_sf)
+        return wrapper.run(q, kv, sink, 128**-0.5, kv_cache_sf=kv_cache_sf, **scales)
 
     for cls, qo_len in (
         (flashinfer.BatchDecodeWithAttentionSinkWrapper, 1),
         (flashinfer.BatchAttentionWithAttentionSinkWrapper, 33),
     ):
-        out = run(cls, qo_len, (k[0], v[0]), (k[1], v[1]))
-        ref = run(flashinfer.BatchAttentionWithAttentionSinkWrapper, qo_len, kv_ref)
-        torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+        q = qs[qo_len]
+        # Powers of two keep the scaled bf16 reference exact.
+        for sq, sk, sv in ((None, None, None), (0.25, 0.5, 2.0)):
+            scales = dict(q_scale=sq, k_scale=sk, v_scale=sv)
+            out = run(cls, q, (k[0], v[0]), (k[1], v[1]), **scales)
+            kv_s = (kv_ref[0] * (sk or 1), kv_ref[1] * (sv or 1))
+            ref = run(
+                flashinfer.BatchAttentionWithAttentionSinkWrapper, q * (sq or 1), kv_s
+            )
+            torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":
