@@ -352,8 +352,8 @@ void chain_speculative_sampling(TensorView draft_probs, TensorView draft_token_i
                                 Optional<TensorView> maybe_seed_arr, uint64_t seed_val,
                                 Optional<TensorView> maybe_offset_arr, uint64_t offset_val,
                                 bool row_independent_rng) {
-  CHECK_INPUT(draft_probs);
-  CHECK_INPUT(draft_token_ids);
+  CHECK_CUDA(draft_probs);
+  CHECK_CUDA(draft_token_ids);
   CHECK_INPUT(target_probs);
   CHECK_DEVICE(draft_token_ids, draft_probs);
   CHECK_DEVICE(target_probs, draft_probs);
@@ -363,10 +363,16 @@ void chain_speculative_sampling(TensorView draft_probs, TensorView draft_token_i
   CHECK_DIM(3, draft_probs);      // draft_probs: (batch_size, num_speculate_tokens, vocab_size)
   CHECK_DIM(2, draft_token_ids);  // draft_token_ids: (batch_size, num_speculate_tokens)
   CHECK_DIM(3, target_probs);  // target_probs: (batch_size, num_speculate_tokens + 1, vocab_size)
+  // Empty draft tensors are never read and may have arbitrary strides.
+  if (draft_probs.size(1) > 0) {
+    CHECK_CONTIGUOUS(draft_probs);
+    CHECK_CONTIGUOUS(draft_token_ids);
+  }
   unsigned int batch_size = draft_probs.size(0);
   unsigned int num_speculate_tokens = draft_probs.size(1);
   unsigned int vocab_size = draft_probs.size(2);
   TVM_FFI_ICHECK_EQ(batch_size, draft_token_ids.size(0));
+  TVM_FFI_ICHECK_EQ(num_speculate_tokens, draft_token_ids.size(1));
   TVM_FFI_ICHECK_EQ(batch_size, target_probs.size(0));
   TVM_FFI_ICHECK_EQ(num_speculate_tokens + 1, target_probs.size(1));
   TVM_FFI_ICHECK_EQ(vocab_size, target_probs.size(2));
