@@ -149,6 +149,7 @@ def test_flashinfer_schedulers_own_their_work_tile_type():
     _run_isolated(
         """
 import importlib
+import importlib.util
 
 import cutlass.experimental.task_scheduling.enums  # noqa: F401
 from cutlass import Boolean, Int32
@@ -163,10 +164,13 @@ for name in (
     "flashinfer.cute_dsl.sparse.sm100_blk64.tile_scheduler",
     "flashinfer.cute_dsl.sparse.sm100_blk128.tile_scheduler",
 ):
-    try:
-        module = importlib.import_module(name)
-    except ImportError:  # sm100_blk128 needs the optional quack-kernels
+    # Only sm100_blk128 has an optional dependency (quack-kernels); any other
+    # import failure must fail the test.
+    if name.endswith(".sm100_blk128.tile_scheduler") and (
+        importlib.util.find_spec("quack") is None
+    ):
         continue
+    module = importlib.import_module(name)
     assert issubclass(module.WorkTileInfo, Owned)
     assert not issubclass(module.WorkTileInfo, Shared)
     classes.append(module.WorkTileInfo)
