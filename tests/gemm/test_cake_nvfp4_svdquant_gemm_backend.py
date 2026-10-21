@@ -644,7 +644,9 @@ def test_out_ptr_binds_the_out_tensor() -> None:
     pointer).  No other record has the parameter."""
     assert loader.PARAMETER_LOGICAL["out_ptr"] == "out"
     with_ptr = {
-        name for name, record in loader.MODULES.items() if "out_ptr" in record["logical"]
+        name
+        for name, record in loader.MODULES.items()
+        if "out_ptr" in record["logical"]
     }
     assert with_ptr
     for name, record in loader.MODULES.items():
@@ -654,10 +656,14 @@ def test_out_ptr_binds_the_out_tensor() -> None:
             continue
         assert record["logical"]["out_ptr"] == "out"
         plan = [tuple(pair) for pair in record["arg_plan"]]
-        assert plan.index(("buffer", "out_ptr")) == plan.index(("buffer", "L1_tail")) + 1
+        assert (
+            plan.index(("buffer", "out_ptr")) == plan.index(("buffer", "L1_tail")) + 1
+        )
         assert plan[-3:] == [("grid", "grid_x"), ("grid", "grid_y"), ("grid", "grid_z")]
         logical = [
-            logical for logical, _axis in loader._argument_plan(name) if logical is not None
+            logical
+            for logical, _axis in loader._argument_plan(name)
+            if logical is not None
         ]
         assert logical.count("out") == 2, name
 

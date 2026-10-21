@@ -1315,13 +1315,18 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "build": {"a_mcast": False, "bias": True, "epi": "fused64", "prologue": "overlap"},
+        "build": {
+            "a_mcast": False,
+            "bias": True,
+            "epi": "fused64",
+            "prologue": "overlap",
+        },
         "ffi_entry": "run",
         "kernel": "cake_nvfp4_svdquant_gemm_ddd4cfba045b7f6dd01f",
         "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_ddd4cfba045b7f6dd01f",  # derived; rewritten by the exporter
         "launch": {  # derived; rewritten by the exporter
             "block": (256, 1, 1),
-            "cluster": (1, 2, 1),
+            "cluster": (1, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 210048,
             "use_pdl": False,
@@ -1381,13 +1386,18 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "build": {"a_mcast": False, "bias": False, "epi": "fused64", "prologue": "overlap"},
+        "build": {
+            "a_mcast": False,
+            "bias": False,
+            "epi": "fused64",
+            "prologue": "overlap",
+        },
         "ffi_entry": "run",
         "kernel": "cake_nvfp4_svdquant_gemm_2ff8759348db39de3101",
         "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_2ff8759348db39de3101",  # derived; rewritten by the exporter
         "launch": {  # derived; rewritten by the exporter
             "block": (256, 1, 1),
-            "cluster": (1, 2, 1),
+            "cluster": (1, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 210048,
             "use_pdl": False,
