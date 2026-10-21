@@ -35,6 +35,8 @@ PACKAGES: dict[str, str] = {
     "cake_vsa_sm90": "flashinfer.cake_vsa_sm90_backend",
     "cake_gdp": "flashinfer.cake_gdp_backend",
     "deepgemm_fp8_gemm": "flashinfer.experimental.deepgemm_fp8_gemm",
+    "deepgemm_batched_gemm": "flashinfer.experimental.deepgemm_batched_gemm",
+    "sm110_xqa": "flashinfer.experimental.sm110_xqa",
 }
 
 

@@ -28,7 +28,8 @@ compiled it and otherwise through FlashInfer's JIT from the same sources and
 flags, verifying every source digest before the first build.
 
 A record is one *stage*: the persistent kernel (``attention``, its
-queue-scheduled twin ``attention_queue``) or one variant of the small-selection
+queue-scheduled twin ``attention_queue``, its compact static form
+``attention_compact``) or one variant of the small-selection
 kernel (``small_k<kmax>[s][c<cluster>]``: ``kmax`` selected KV blocks per CTA,
 ``s`` the split-KV variant with a plan-owned workspace, ``c<n>`` the
 thread-block-cluster variant, ``sc<n>`` the split-cluster variant whose slices
@@ -119,6 +120,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tl": "tl",
         },
         "route": {
+            "compact": False,
             "kind": "persistent",
             "queue": False,
         },
@@ -179,8 +181,70 @@ MODULES: dict[str, dict[str, Any]] = {
             "tl": "tl",
         },
         "route": {
+            "compact": False,
             "kind": "persistent",
             "queue": True,
+        },
+        "workspace_rule": {
+            "dbg_words": 64,
+            "kind": "persistent",
+            "tl_words": 8,
+        },
+    },
+    "attention_compact": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "Vt"],
+            ["buffer", "O"],
+            ["buffer", "meta"],
+            ["param_array", "hdr"],
+            ["parameter", "tile_stride"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["buffer", "dbg"],
+            ["buffer", "tl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_ctas",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_0f730e6ab6a65c1e7199",
+        "kernel_symbol": "kernel_cake_vsa_sm90_0f730e6ab6a65c1e7199",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 232064,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_0f730e6ab6a65c1e7199",
+        "logical": {
+            "K": "k",
+            "O": "out",
+            "Q": "q",
+            "Vt": "v",
+            "dbg": "dbg",
+            "hdr": "hdr",
+            "meta": "meta",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+            "tile_stride": "tile_stride",
+            "tl": "tl",
+        },
+        "route": {
+            "compact": True,
+            "kind": "persistent",
+            "queue": False,
         },
         "workspace_rule": {
             "dbg_words": 64,
@@ -1005,7 +1069,7 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
 # The stages in registry order; the two persistent stages and the fifteen
 # shipped small-selection variants.
 STAGES: tuple[str, ...] = tuple(MODULES)
-PERSISTENT_STAGES = ("attention", "attention_queue")
+PERSISTENT_STAGES = ("attention", "attention_queue", "attention_compact")
 SMALL_STAGES: tuple[str, ...] = tuple(
     name for name in MODULES if MODULES[name]["route"]["kind"] == "small"
 )
@@ -1055,10 +1119,14 @@ def stage_record(name: str) -> dict[str, Any]:
     return record
 
 
-def persistent_stage(queue: bool) -> str:
-    """The persistent kernel's stage: the queue-scheduled twin when ``queue``."""
+def persistent_stage(queue: bool, compact: bool = False) -> str:
+    """The persistent kernel's stage: the queue-scheduled twin when ``queue``, the compact
+    static program when ``compact`` (uniform pair plans of short tiles with many tiles per
+    CTA; see ``cake_planner.COMPACT_MAX_TILE_POS``)."""
 
-    return "attention_queue" if queue else "attention"
+    if queue:
+        return "attention_queue"
+    return "attention_compact" if compact else "attention"
 
 
 def small_stage(kmax: int, split: bool = False, cluster: int = 0) -> str:

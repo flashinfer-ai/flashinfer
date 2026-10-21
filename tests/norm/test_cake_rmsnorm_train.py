@@ -316,11 +316,11 @@ def test_forward_backward_match_fp64(hidden: int, rows: int) -> None:
     _check_case(hidden, rows)
 
 
-def _forward_switch_rows(arch: str, hidden: int, residual: bool) -> tuple[int, ...]:
-    """Row counts on both sides of every forward program switch point of one route (and a single row)."""
+def _switch_rows(arch: str, hidden: int, kind: str, residual: bool) -> tuple[int, ...]:
+    """Row counts on both sides of every program switch point of one route (and a single row)."""
 
     switches = set()
-    for name in loader.route_modules(arch, hidden, "fwd", residual):
+    for name in loader.route_modules(arch, hidden, kind, residual):
         rule = loader.MODULES[name]["select_rule"]
         if rule is None:
             continue
@@ -361,7 +361,7 @@ def test_forward_programs_switch_on_row_count(hidden: int, residual: bool) -> No
     names = loader.route_modules(arch, hidden, "fwd", residual)
     eps = EPS[hidden]
     launched = set()
-    for rows in _forward_switch_rows(arch, hidden, residual):
+    for rows in _switch_rows(arch, hidden, "fwd", residual):
         selected = loader.selected_modules(arch, hidden, "fwd", residual, rows=rows)
         assert len(selected) == 1, (
             f"hidden={hidden} residual={residual} rows={rows}: {selected}"
@@ -380,6 +380,26 @@ def test_forward_programs_switch_on_row_count(hidden: int, residual: bool) -> No
             assert torch.equal(outputs[2], h_new_ref), f"h_new {label}"
     assert launched == set(names), (
         f"hidden={hidden} residual={residual}: never launched {set(names) - launched}"
+    )
+
+
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES)
+def test_backward_programs_switch_on_row_count(hidden: int) -> None:
+    """Exactly one backward program runs per call, every exported backward program
+    runs for some row count, and forward + backward match the FP64 reference on
+    both sides of each switch point."""
+
+    _skip_unless_hidden(hidden)
+    arch = loader.arch_for_capability(_capability())
+    names = loader.route_modules(arch, hidden, "bwd", False)
+    launched = set()
+    for rows in _switch_rows(arch, hidden, "bwd", False):
+        selected = loader.selected_modules(arch, hidden, "bwd", False, rows=rows)
+        assert len(selected) == 1, f"hidden={hidden} rows={rows}: {selected}"
+        launched.add(selected[0])
+        _check_case(hidden, rows)
+    assert launched == set(names), (
+        f"hidden={hidden}: never launched {set(names) - launched}"
     )
 
 
