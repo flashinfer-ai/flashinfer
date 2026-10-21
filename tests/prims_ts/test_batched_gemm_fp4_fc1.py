@@ -32,6 +32,8 @@ import torch
 
 from flashinfer.utils import is_sm100a_supported
 
+from tests.prims_ts.dsl_version import requires_dsl_4_8_for_c_partition_offset
+
 from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
     uniform_pipeline_stage_overrides,
     ActKind,
@@ -449,6 +451,7 @@ class TestFp4Fc1GPU:
         tolerance = max(0.75, out_bf16.float().abs().max().item() * 0.35)
         assert diff.max().item() < tolerance
 
+    @requires_dsl_4_8_for_c_partition_offset
     @pytest.mark.parametrize(
         "tile_n,epi_tile_n,use_tma_store,sf_layout_c,umma_cta_count,mma_m",
         (

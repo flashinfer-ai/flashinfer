@@ -24,6 +24,8 @@ import torch
 
 from flashinfer.utils import is_sm100a_supported
 
+from tests.prims_ts.dsl_version import requires_dsl_4_8_for_c_partition_offset
+
 from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
     uniform_pipeline_stage_overrides,
 )
@@ -231,6 +233,7 @@ def test_stride_wider_buffer_nvfp4_output(sf_layout_name):
     assert _run(_fc1_nvfp4_out(sf_layout=sf_layout), 128)
 
 
+@requires_dsl_4_8_for_c_partition_offset
 @pytest.mark.parametrize("sf_layout_name", ("R8c4", "R128c4"))
 def test_partition_offset_nvfp4_output(sf_layout_name):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import SfLayout
@@ -243,6 +246,7 @@ def test_stride_equal_to_width_mxfp8_output():
     assert _run(_fc1_mxfp8_out(), 64)
 
 
+@requires_dsl_4_8_for_c_partition_offset
 @pytest.mark.parametrize("offset", (64, 192))
 def test_partition_offset_mxfp8_output(offset):
     assert _run(_fc1_mxfp8_out(), 384, offset=offset, problem_n=384)
