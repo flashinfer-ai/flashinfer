@@ -289,7 +289,7 @@ class TestSplitLayerRouting:
 
 
 class _FakeCakeOps:
-    """Records the ``moe_a2a_*`` ops CakeAlltoAll calls; dispatch returns zeros."""
+    """Records the kernel operations CakeAlltoAll calls; dispatch returns zeros."""
 
     def __init__(self) -> None:
         self.calls: dict = {}
@@ -315,17 +315,15 @@ class _FakeCakeOps:
 @pytest.fixture
 def fake_cake(monkeypatch):
     import flashinfer.comm.mnnvl as mnnvl
-    import flashinfer.comm.trtllm_moe_alltoall as a2a
+    from flashinfer.moe_ep.backends.split.comm.cake import kernels as a2a
     from flashinfer.comm.mapping import Mapping
     from flashinfer.moe_ep.backends.split.comm.cake import communication as cake
 
     ops = _FakeCakeOps()
-    monkeypatch.setattr(
-        a2a, "moe_a2a_get_workspace_size_per_rank", ops.workspace_size_per_rank
-    )
-    monkeypatch.setattr(a2a, "moe_a2a_dispatch", ops.dispatch)
-    monkeypatch.setattr(a2a, "moe_a2a_sanitize_expert_ids", ops.sanitize)
-    monkeypatch.setattr(a2a, "moe_a2a_combine", ops.combine)
+    monkeypatch.setattr(a2a, "workspace_size_per_rank", ops.workspace_size_per_rank)
+    monkeypatch.setattr(a2a, "dispatch", ops.dispatch)
+    monkeypatch.setattr(a2a, "sanitize_expert_ids", ops.sanitize)
+    monkeypatch.setattr(a2a, "combine", ops.combine)
     monkeypatch.setattr(mnnvl.MnnvlMemory, "initialize", staticmethod(lambda: None))
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
 
@@ -371,8 +369,7 @@ def test_cake_sizes_dispatch_by_format(fake_cake) -> None:
         _params(hidden_size=64, dispatch_format=QuantFormat.NVFP4),
         "cake",
     )
-    args, kwargs = fake_cake.calls["workspace_size"]
-    assert kwargs["backend"] == "cake"
+    args, _ = fake_cake.calls["workspace_size"]
     _, _, dispatch_bytes, combine_bytes, _ = args
     # NVFP4 values and scales, then int32 ids and FP32 weights for top_k=2.
     assert dispatch_bytes == 32 + 4 + 2 * 4 * 2
@@ -403,12 +400,11 @@ def test_cake_payload_plumbing(fake_cake) -> None:
         torch.int32,
         torch.float32,
     ]
-    assert kwargs["backend"] == "cake"
     # enable_pdl=None leaves the choice to the ops (device_support_pdl).
     assert kwargs["enable_pdl"] is None
     sanitized_ids, invalid_id, kwargs = fake_cake.calls["sanitize"]
     assert sanitized_ids.dtype == torch.int32 and sanitized_ids.shape == (2, 2, 2)
-    assert invalid_id == -1 and kwargs["backend"] == "cake"
+    assert invalid_id == -1
     assert kwargs["enable_pdl"] is None
     assert result.tokens_per_rank == 2
     assert result.hidden_states.shape == (4, 8)
@@ -425,7 +421,7 @@ def test_cake_payload_plumbing(fake_cake) -> None:
     # is the region pinned at allocation, not the offset dispatch returned.
     assert args[-2] == comm._state["combine_offset"] != 0
     assert args[-1] is True
-    assert kwargs["use_low_precision"] is True and kwargs["backend"] == "cake"
+    assert kwargs["use_low_precision"] is True
 
     comm.dispatch(hidden, ids, weights)
     comm.combine(torch.zeros(6, 8, dtype=torch.bfloat16))
@@ -589,7 +585,9 @@ def fake_one_sided(monkeypatch):
             return "the workspace is not shared through FABRIC handles"
         return probe["reason"]
 
-    monkeypatch.setattr(one_sided, "get_nvlink_one_sided_module", lambda: module)
+    monkeypatch.setattr(
+        one_sided, "get_nvlink_one_sided_alltoall_module", lambda: module
+    )
     monkeypatch.setattr(
         one_sided, "layout_constants", lambda: SimpleNamespace(**_ONE_SIDED_LAYOUT)
     )
@@ -827,26 +825,28 @@ def test_nvlink_one_sided_validates_config(fake_one_sided) -> None:
 
 def test_nvlink_two_sided_marks_padding_rows_invalid(monkeypatch) -> None:
     import flashinfer.comm.mnnvl as mnnvl
-    import flashinfer.comm.trtllm_alltoall as two_sided_ops
     from flashinfer.comm.mapping import Mapping
     from flashinfer.moe_ep.backends.split.comm.nvlink_two_sided import (
         communication as two_sided,
     )
+    from flashinfer.moe_ep.backends.split.comm.nvlink_two_sided import (
+        kernels as two_sided_ops,
+    )
 
     calls: dict = {"comm": []}
 
-    def moe_prepare(*args):
+    def prepare(*args):
         calls["prepare"] = args
         recv_ids = torch.tensor([[1, 3], [4, 4], [4, 4]], dtype=torch.int32)
         indices = [torch.zeros(1, dtype=torch.int32) for _ in range(5)]
         return (recv_ids, torch.ones(3, 2), *indices, None)
 
-    def moe_comm(x, send_cumsum, send_indices, output, *args):
+    def alltoallv(x, send_cumsum, send_indices, output, *args):
         calls["comm"].append((x, output, args))
         output.fill_(1.0)
 
-    monkeypatch.setattr(two_sided_ops, "moe_prepare", moe_prepare)
-    monkeypatch.setattr(two_sided_ops, "moe_comm", moe_comm)
+    monkeypatch.setattr(two_sided_ops, "prepare", prepare)
+    monkeypatch.setattr(two_sided_ops, "alltoallv", alltoallv)
     monkeypatch.setattr(mnnvl.MnnvlMemory, "initialize", staticmethod(lambda: None))
     monkeypatch.setattr(
         NVLinkTwoSidedAlltoAll,

@@ -15,6 +15,8 @@ limitations under the License.
 """
 
 import math
+import re
+from pathlib import Path
 
 import pytest
 import torch
@@ -571,6 +573,105 @@ def test_export_rows_plan_onto_registered_programs(arch):
             name = cake_jit.kernel_module_name(arch, stage_key)
             assert arch in cake_jit.MODULES[name]["arches"], (label, stage_key)
             assert cake_jit.MODULES[name]["arg_plan"] in cake_jit.ARG_PLANS
+
+
+def test_registry_keys_and_programs_agree():
+    """Every logical kernel key of an architecture names a registered program built for
+    it (and ``kernel_module_name`` returns that program), every registered program is
+    reached by a key on each architecture it is built for, and a key an architecture lacks
+    is rejected the way the host plan expects."""
+    assert tuple(cake_jit.KERNELS) == cake_jit.ARCHES
+    reached = {name: set() for name in cake_jit.MODULES}
+    for arch, table in cake_jit.KERNELS.items():
+        assert list(table) == sorted(table)
+        for key, name in table.items():
+            record = cake_jit.MODULES[name]
+            assert arch in record["arches"], (arch, key, name)
+            assert record["arg_plan"] in cake_jit.ARG_PLANS, (arch, key, name)
+            assert cake_jit.kernel_module_name(arch, key) == name
+            reached[name].add(arch)
+    for name, record in cake_jit.MODULES.items():
+        assert reached[name] == set(record["arches"]), name
+    every_key = {key for table in cake_jit.KERNELS.values() for key in table}
+    for arch, table in cake_jit.KERNELS.items():
+        for key in sorted(every_key - set(table)):
+            assert not cake_jit.route_available(arch, (key,))
+            with pytest.raises(NotImplementedError):
+                cake_jit.kernel_module_name(arch, key)
+    with pytest.raises(NotImplementedError):
+        cake_jit.kernel_module_name("sm_90a", cake_jit.MERGE_KERNEL_KEY)
+
+
+def test_spec_content_digest_is_a_pure_function_of_its_inputs():
+    """The content digest in a program's JIT library name is stable across computations
+    and changes with any source byte, the source order, the architecture or a compile
+    flag, so an edited source never reuses a cached library."""
+    sources = [b"kernel source\n", b"binding source\n"]
+    flags = ["flag_a", "flag_b"]
+    digest = cake_jit.spec_content_digest(sources, "sm_100a", flags)
+    assert len(digest) == 12 and int(digest, 16) >= 0
+    assert digest == cake_jit.spec_content_digest(
+        [bytes(s) for s in sources], "sm_100a", list(flags)
+    )
+    others = [
+        ([sources[0], b"binding Source\n"], "sm_100a", flags),
+        (sources[::-1], "sm_100a", flags),
+        ([b"".join(sources)], "sm_100a", flags),
+        (sources, "sm_103a", flags),
+        (sources, "sm_100a", flags[:1]),
+        (sources, "sm_100a", ["flag_afl", "ag_b"]),
+    ]
+    digests = {cake_jit.spec_content_digest(*other) for other in others}
+    assert len(digests | {digest}) == len(others) + 1
+
+
+def test_launch_definitions_select_each_program_in_the_shared_launcher():
+    """Every program's compile definitions name its own kernel symbol and a
+    host-shim namespace, exactly one argument plan and the launch values the
+    shared launcher reads; the (symbol, namespace) pairs are distinct across the
+    registry and the definitions close the program's compile flags."""
+    launcher = "cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_launcher.cu"
+    pairs = set()
+    for name, record in cake_jit.MODULES.items():
+        definitions = cake_jit.launch_definitions(name)
+        assert all(d.startswith("-D") and "=" in d for d in definitions)
+        values = dict(d[2:].split("=", 1) for d in definitions)
+        assert len(values) == len(definitions)
+        assert values["CAKE_PROGRAM_KERNEL"] == f"kernel_{name}"
+        assert re.fullmatch(r"cake_host_shim_[0-9a-f]{16}", values["CAKE_PROGRAM_SHIM"])
+        plans = [k for k in values if k.startswith("CAKE_PLAN_")]
+        assert plans == [f"CAKE_PLAN_{record['arg_plan'].upper()}"]
+        assert int(values["CAKE_BLOCK_X"]) > 0
+        assert int(values["CAKE_DYNAMIC_SMEM"]) >= 0
+        assert int(values["CAKE_CLUSTER_X"]) in (0, 2, 4)
+        if record["arg_plan"] == "gemm":
+            assert int(values["CAKE_B_BOX_N"]) in (32, 64, 128)
+            assert int(values["CAKE_A_TMA_RANK"]) in (2, 3)
+        else:
+            assert "CAKE_B_BOX_N" not in values and "CAKE_A_TMA_RANK" not in values
+        assert record["compile_flags"][-len(definitions) :] == definitions
+        assert record["sources"] == [
+            f"cake_kimi_k3_vision_tower/{name}_kernel.cu",
+            launcher,
+        ]
+        pairs.add((values["CAKE_PROGRAM_KERNEL"], values["CAKE_PROGRAM_SHIM"]))
+    assert len(pairs) == len(cake_jit.MODULES)
+    assert len({shim for _symbol, shim in pairs}) == len(cake_jit.MODULES)
+
+
+def test_shared_launcher_reads_every_launch_definition():
+    """Every macro the registry defines for a program is read by the shared
+    launcher or its TMA-encode header, and no per-program binding is left
+    (pure text; no module is built)."""
+    package = Path(cake_jit.__file__).resolve().parent
+    csrc = package / "csrc" / "cake_kimi_k3_vision_tower"
+    text = (csrc / "cake_kimi_k3_vision_tower_launcher.cu").read_text()
+    text += (csrc / "cake_kimi_k3_vision_tower_tma_encode.cuh").read_text()
+    names = set(re.findall(r"\bCAKE_[A-Z0-9_]+\b", text))
+    for name in cake_jit.MODULES:
+        for definition in cake_jit.launch_definitions(name):
+            assert definition[2:].split("=", 1)[0] in names, definition
+    assert not list(csrc.glob("*_binding.cu"))
 
 
 @pytest.mark.parametrize("label,grids", list(CONTRACT_GRIDS.items()))

@@ -7146,6 +7146,7 @@ using tvm::ffi::Optional;
 namespace {
 
 constexpr int64_t kHidden = 5376;
+constexpr int64_t kAdalnRows = 9;  // rows of the AdaLN tables indexed by the norm/AdaLN kernels
 constexpr int64_t kNumHeads = 56;
 constexpr int64_t kHeadDim = 128;
 constexpr int64_t kQkvWidth = 21504;
@@ -7244,11 +7245,15 @@ CommonArgs CheckCommon(const TensorView& x, const TensorView& x_norm_weight, con
   args.out_mode = static_cast<int>(out_mode);
   CheckTensor(x, "x", args.device, dl_bfloat16, {args.rows, kHidden});
   CheckTensor(x_norm_weight, "x_norm_weight", args.device, dl_bfloat16, {kHidden});
-  TVM_FFI_CHECK(adaln_scale.ndim() == 2 && adaln_scale.size(0) >= 1 && adaln_scale.size(1) == kHidden, ValueError)
-      << "adaln_scale must be [rows, 5376]";
-  const int64_t adaln_rows = adaln_scale.size(0);
-  CheckTensor(adaln_scale, "adaln_scale", args.device, dl_bfloat16, {adaln_rows, kHidden});
-  CheckTensor(adaln_shift, "adaln_shift", args.device, dl_bfloat16, {adaln_rows, kHidden});
+  TVM_FFI_CHECK(adaln_scale.ndim() == 2 && adaln_scale.size(1) == kHidden, ValueError)
+      << "adaln_scale must be [" << kAdalnRows << ", 5376]";
+  // The norm/AdaLN kernels index a 9-row table and zero the activation of indices outside [0, 9):
+  // a shorter table would be read past its end, a longer one would silently drop its extra rows.
+  TVM_FFI_CHECK(adaln_scale.size(0) == kAdalnRows, ValueError)
+      << "adaln_scale must have exactly " << kAdalnRows << " rows (the norm/AdaLN kernels index a "
+      << kAdalnRows << "-row table), got " << adaln_scale.size(0);
+  CheckTensor(adaln_scale, "adaln_scale", args.device, dl_bfloat16, {kAdalnRows, kHidden});
+  CheckTensor(adaln_shift, "adaln_shift", args.device, dl_bfloat16, {kAdalnRows, kHidden});
   CheckTensor(adaln_index, "adaln_index", args.device, dl_int32, {args.rows});
   CheckTensor(q_norm_weight, "q_norm_weight", args.device, dl_bfloat16, {kHeadDim});
   CheckTensor(k_norm_weight, "k_norm_weight", args.device, dl_bfloat16, {kHeadDim});

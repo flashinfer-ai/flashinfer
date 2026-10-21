@@ -45,10 +45,81 @@
 #define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
+// Compile-line definitions (the catalog's compile_flags of every route that
+// shares this text).
+//
+// PAGE_KV: KV rows per block-table page, 64 or 128.  A page holds PAGE_KV fused
+// rows (128 FP8 bytes each) followed by PAGE_KV FP32 scales, and the kernel
+// walks 64-row KV tiles, so a page spans PAGE_KV / 64 tiles: the block table is
+// indexed by bt_tile / (PAGE_KV / 64), a tile's row offset inside its page is
+// tile % (PAGE_KV / 64) * 64, and the FP32 scales of a page start at float
+// column PAGE_KV * 32 of the KV_scales view.  The #if branches at the three KV
+// walk sites (two warp groups each) spell those expressions out at PAGE_KV = 64
+// and 128, so each value compiles to the text that was delivered per page size.
+#ifndef PAGE_KV
+#error "PAGE_KV (KV rows per page, 64 or 128) must be defined on the compile line"
+#endif
+#if PAGE_KV != 64 && PAGE_KV != 128
+#error "PAGE_KV must be 64 or 128"
+#endif
+
+// NEXT_N: query tokens per request, 2 to 6.  This text scores two tokens per
+// Q atom, so a request spans NEXT_N_ATOMS = ceil(NEXT_N / 2) atoms and, for
+// odd NEXT_N, the last atom (index NEXT_N_LAST_ATOM = NEXT_N_ATOMS - 1) carries
+// one token.  The Q-atom index arithmetic (four sites) and the one-token guards
+// (two warp groups) use these literals, so each NEXT_N compiles to the text
+// that was delivered for it.
+#ifndef NEXT_N
+#error "NEXT_N (query tokens per request, 2 to 6) must be defined on the compile line"
+#endif
+#if NEXT_N == 2
+#define NEXT_N_ATOMS 1
+#elif NEXT_N == 3
+#define NEXT_N_ATOMS 2
+#define NEXT_N_LAST_ATOM 1
+#elif NEXT_N == 4
+#define NEXT_N_ATOMS 2
+#elif NEXT_N == 5
+#define NEXT_N_ATOMS 3
+#define NEXT_N_LAST_ATOM 2
+#elif NEXT_N == 6
+#define NEXT_N_ATOMS 3
+#else
+#error "NEXT_N must be 2, 3, 4, 5 or 6"
+#endif
+
+// Program identity: each define set of this shared text keeps the kernel symbol of the per-route
+// unit it replaced, so every JIT module built from the text exports its own kernel symbol (the
+// modules share one process; a shared symbol would resolve a launcher to another module's kernel).
+#if PAGE_KV == 128 && NEXT_N == 2
+#define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_sm120_paged_mqa_logits_8d79b478f63f44cb7d98
+#elif PAGE_KV == 128 && NEXT_N == 3
+#define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_sm120_paged_mqa_logits_f226809c7eb14d82590f
+#elif PAGE_KV == 128 && NEXT_N == 4
+#define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_sm120_paged_mqa_logits_4299a4cc747e7b2e43e3
+#elif PAGE_KV == 128 && NEXT_N == 5
+#define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_sm120_paged_mqa_logits_914d22a1a6471c5ead33
+#elif PAGE_KV == 128 && NEXT_N == 6
+#define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_sm120_paged_mqa_logits_f1f65bb5c88948f7ad6a
+#elif PAGE_KV == 64 && NEXT_N == 2
+#define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290
+#elif PAGE_KV == 64 && NEXT_N == 3
+#define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_sm120_paged_mqa_logits_7815fd7569dfb2d23562
+#elif PAGE_KV == 64 && NEXT_N == 4
+#define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_sm120_paged_mqa_logits_fe33f48c482d06204e6e
+#elif PAGE_KV == 64 && NEXT_N == 5
+#define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_sm120_paged_mqa_logits_66fc6cf67f2ab2d9b47a
+#elif PAGE_KV == 64 && NEXT_N == 6
+#define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_sm120_paged_mqa_logits_6d434c007d52a2d48dc4
+#else
+#error "no exported program for this PAGE_KV / NEXT_N"
+#endif
+
+
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights, float* __restrict__ Logits, int* __restrict__ context_lens, int* __restrict__ block_table, int* __restrict__ schedule_meta, int logits_stride, int block_table_stride)
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights, float* __restrict__ Logits, int* __restrict__ context_lens, int* __restrict__ block_table, int* __restrict__ schedule_meta, int logits_stride, int block_table_stride)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -156,10 +227,15 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290(const __grid_co
             int q_stop = ((end_kv > 0) ? end_q + 1 : end_q);
             #pragma unroll 1
             for (int q_atom = start_q; q_atom < q_stop; q_atom++) {
+                #if NEXT_N_ATOMS == 1
                 int q_idx = q_atom;
                 int atom_in_q = 0;
-                int tok = q_idx * 2 + atom_in_q * 2;
-                int ctx_last = context_lens[q_idx * 2 + 2 - 1];
+                #else
+                int q_idx = q_atom / NEXT_N_ATOMS;
+                int atom_in_q = q_atom % NEXT_N_ATOMS;
+                #endif
+                int tok = q_idx * NEXT_N + atom_in_q * 2;
+                int ctx_last = context_lens[q_idx * NEXT_N + NEXT_N - 1];
                 int num_kv = (ctx_last + 64 - 1) / 64;
                 int lo = ((q_atom == start_q) ? start_kv : 0);
                 int hi = ((q_atom == end_q) ? end_kv : num_kv);
@@ -367,6 +443,11 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290(const __grid_co
                     : "r"(b_addr_h_68)
                     : "memory");
                 int n_tok_m = 2;
+                #if NEXT_N % 2 == 1
+                if (atom_in_q == NEXT_N_LAST_ATOM) {
+                    n_tok_m = 1;
+                }
+                #endif
                 #pragma unroll 1
                 for (int kv_idx = lo; kv_idx < hi; kv_idx += 2) {
                     {
@@ -448,6 +529,9 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290(const __grid_co
                     int out0 = kv_offset + quad;
                     *(reinterpret_cast<float*>(Logits + out0) + (0)) = v0;
                     *(reinterpret_cast<float*>(Logits + (out0 + 8)) + (0)) = v1;
+                    #if NEXT_N % 2 == 1
+                    if (n_tok_m > 1) {
+                    #endif
                     float partial0_0 = 0.0f;
                     float partial1_1 = 0.0f;
                     #pragma unroll
@@ -520,6 +604,9 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290(const __grid_co
                     int out0_4 = kv_offset + logits_stride + quad;
                     *(reinterpret_cast<float*>(Logits + out0_4) + (0)) = v0_2;
                     *(reinterpret_cast<float*>(Logits + (out0_4 + 8)) + (0)) = v1_3;
+                    #if NEXT_N % 2 == 1
+                    }
+                    #endif
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive(kv_empty_g0_addr + (kv_stage_m) * 8);
                     kv_stage_m += 1;
@@ -560,10 +647,15 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290(const __grid_co
             int q_stop_1 = ((end_kv_1 > 0) ? end_q_1 + 1 : end_q_1);
             #pragma unroll 1
             for (int q_atom_1 = start_q_1; q_atom_1 < q_stop_1; q_atom_1++) {
+                #if NEXT_N_ATOMS == 1
                 int q_idx_1 = q_atom_1;
                 int atom_in_q_1 = 0;
-                int tok_1 = q_idx_1 * 2 + atom_in_q_1 * 2;
-                int ctx_last_1 = context_lens[q_idx_1 * 2 + 2 - 1];
+                #else
+                int q_idx_1 = q_atom_1 / NEXT_N_ATOMS;
+                int atom_in_q_1 = q_atom_1 % NEXT_N_ATOMS;
+                #endif
+                int tok_1 = q_idx_1 * NEXT_N + atom_in_q_1 * 2;
+                int ctx_last_1 = context_lens[q_idx_1 * NEXT_N + NEXT_N - 1];
                 int num_kv_1 = (ctx_last_1 + 64 - 1) / 64;
                 int lo_1 = ((q_atom_1 == start_q_1) ? start_kv_1 : 0);
                 int hi_1 = ((q_atom_1 == end_q_1) ? end_kv_1 : num_kv_1);
@@ -771,6 +863,11 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290(const __grid_co
                     : "r"(b_addr_h_68_1)
                     : "memory");
                 int n_tok_m_1 = 2;
+                #if NEXT_N % 2 == 1
+                if (atom_in_q_1 == NEXT_N_LAST_ATOM) {
+                    n_tok_m_1 = 1;
+                }
+                #endif
                 #pragma unroll 1
                 for (int kv_idx_1 = lo_1; kv_idx_1 < hi_1; kv_idx_1 += 2) {
                     {
@@ -852,6 +949,9 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290(const __grid_co
                     int out0_1 = kv_offset_1 + quad_1;
                     *(reinterpret_cast<float*>(Logits + out0_1) + (0)) = v0_1;
                     *(reinterpret_cast<float*>(Logits + (out0_1 + 8)) + (0)) = v1_1;
+                    #if NEXT_N % 2 == 1
+                    if (n_tok_m_1 > 1) {
+                    #endif
                     float partial0_0_1 = 0.0f;
                     float partial1_1_1 = 0.0f;
                     #pragma unroll
@@ -924,6 +1024,9 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290(const __grid_co
                     int out0_4_1 = kv_offset_1 + logits_stride + quad_1;
                     *(reinterpret_cast<float*>(Logits + out0_4_1) + (0)) = v0_2_1;
                     *(reinterpret_cast<float*>(Logits + (out0_4_1 + 8)) + (0)) = v1_3_1;
+                    #if NEXT_N % 2 == 1
+                    }
+                    #endif
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive(kv_empty_g1_addr + (kv_stage_m_1) * 8);
                     kv_stage_m_1 += 1;
@@ -951,10 +1054,15 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290(const __grid_co
             int q_stop_2 = ((end_kv_2 > 0) ? end_q_2 + 1 : end_q_2);
             #pragma unroll 1
             for (int q_atom_2 = start_q_2; q_atom_2 < q_stop_2; q_atom_2++) {
+                #if NEXT_N_ATOMS == 1
                 int q_idx_2 = q_atom_2;
                 int atom_in_q_2 = 0;
-                int tok_2 = q_idx_2 * 2 + atom_in_q_2 * 2;
-                int ctx_last_2 = context_lens[q_idx_2 * 2 + 2 - 1];
+                #else
+                int q_idx_2 = q_atom_2 / NEXT_N_ATOMS;
+                int atom_in_q_2 = q_atom_2 % NEXT_N_ATOMS;
+                #endif
+                int tok_2 = q_idx_2 * NEXT_N + atom_in_q_2 * 2;
+                int ctx_last_2 = context_lens[q_idx_2 * NEXT_N + NEXT_N - 1];
                 int num_kv_2 = (ctx_last_2 + 64 - 1) / 64;
                 int lo_2 = ((q_atom_2 == start_q_2) ? start_kv_2 : 0);
                 int hi_2 = ((q_atom_2 == end_q_2) ? end_kv_2 : num_kv_2);
@@ -980,20 +1088,32 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290(const __grid_co
                         int bt_tile = tile + bt_lane * 2;
                         bt_cache = 0;
                         if (bt_tile < num_kv_2) {
+                            #if PAGE_KV == 64
                             bt_cache = block_table[bt_row + bt_tile];
+                            #else
+                            bt_cache = block_table[bt_row + bt_tile / 2];
+                            #endif
                         }
                     }
                     int _shfl_0 = __shfl_sync(0xFFFFFFFF, bt_cache, bt_ptr);
                     int kv_block = _shfl_0;
                     bt_ptr += 1;
+                    #if PAGE_KV == 64
                     int page_off = 0;
+                    #else
+                    int page_off = tile % 2 * 64;
+                    #endif
                     {
                         mbarrier_wait(kv_empty_g0_addr + (kv_stage) * 8, kv_phase);
                     }
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(kv_full_g0_addr + (kv_stage) * 8, 8448);
                         tma_3d_gmem2smem(smem_kv_g0_addr + kv_stage * 8192, (&KV), 0, page_off, kv_block, kv_full_g0_addr + (kv_stage) * 8);
+                        #if PAGE_KV == 64
                         tma_2d_gmem2smem(smem_sc_g0_addr + kv_stage * 1024, (&KV_scales), 2048 + page_off, kv_block, kv_full_g0_addr + (kv_stage) * 8);
+                        #else
+                        tma_2d_gmem2smem(smem_sc_g0_addr + kv_stage * 1024, (&KV_scales), 4096 + page_off, kv_block, kv_full_g0_addr + (kv_stage) * 8);
+                        #endif
                     }
                     kv_stage += 1;
                     if (kv_stage == 3) { kv_stage = 0; kv_phase ^= 1; }
@@ -1016,10 +1136,15 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290(const __grid_co
             int q_stop_3 = ((end_kv_3 > 0) ? end_q_3 + 1 : end_q_3);
             #pragma unroll 1
             for (int q_atom_3 = start_q_3; q_atom_3 < q_stop_3; q_atom_3++) {
+                #if NEXT_N_ATOMS == 1
                 int q_idx_3 = q_atom_3;
                 int atom_in_q_3 = 0;
-                int tok_3 = q_idx_3 * 2 + atom_in_q_3 * 2;
-                int ctx_last_3 = context_lens[q_idx_3 * 2 + 2 - 1];
+                #else
+                int q_idx_3 = q_atom_3 / NEXT_N_ATOMS;
+                int atom_in_q_3 = q_atom_3 % NEXT_N_ATOMS;
+                #endif
+                int tok_3 = q_idx_3 * NEXT_N + atom_in_q_3 * 2;
+                int ctx_last_3 = context_lens[q_idx_3 * NEXT_N + NEXT_N - 1];
                 int num_kv_3 = (ctx_last_3 + 64 - 1) / 64;
                 int lo_3 = ((q_atom_3 == start_q_3) ? start_kv_3 : 0);
                 int hi_3 = ((q_atom_3 == end_q_3) ? end_kv_3 : num_kv_3);
@@ -1035,20 +1160,32 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_4c1edb9d3eb963e12290(const __grid_co
                         int bt_tile_1 = tile_1 + bt_lane_1 * 2;
                         bt_cache_1 = 0;
                         if (bt_tile_1 < num_kv_3) {
+                            #if PAGE_KV == 64
                             bt_cache_1 = block_table[bt_row_1 + bt_tile_1];
+                            #else
+                            bt_cache_1 = block_table[bt_row_1 + bt_tile_1 / 2];
+                            #endif
                         }
                     }
                     int _shfl_1 = __shfl_sync(0xFFFFFFFF, bt_cache_1, bt_ptr_1);
                     int kv_block_1 = _shfl_1;
                     bt_ptr_1 += 1;
+                    #if PAGE_KV == 64
                     int page_off_1 = 0;
+                    #else
+                    int page_off_1 = tile_1 % 2 * 64;
+                    #endif
                     {
                         mbarrier_wait(kv_empty_g1_addr + (kv_stage_1) * 8, kv_phase_1);
                     }
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(kv_full_g1_addr + (kv_stage_1) * 8, 8448);
                         tma_3d_gmem2smem(smem_kv_g1_addr + kv_stage_1 * 8192, (&KV), 0, page_off_1, kv_block_1, kv_full_g1_addr + (kv_stage_1) * 8);
+                        #if PAGE_KV == 64
                         tma_2d_gmem2smem(smem_sc_g1_addr + kv_stage_1 * 1024, (&KV_scales), 2048 + page_off_1, kv_block_1, kv_full_g1_addr + (kv_stage_1) * 8);
+                        #else
+                        tma_2d_gmem2smem(smem_sc_g1_addr + kv_stage_1 * 1024, (&KV_scales), 4096 + page_off_1, kv_block_1, kv_full_g1_addr + (kv_stage_1) * 8);
+                        #endif
                     }
                     kv_stage_1 += 1;
                     if (kv_stage_1 == 3) { kv_stage_1 = 0; kv_phase_1 ^= 1; }

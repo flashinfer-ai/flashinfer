@@ -28,7 +28,7 @@
 
 #include <cstdint>
 
-#include "cake_deepgemm_sm120_paged_mqa_logits_host_common.cuh"
+#include "experimental/cake_host_common.cuh"
 
 extern "C" __global__ void kernel_cake_deepgemm_sm120_paged_mqa_logits_f48f226f30690af34bd7(int* __restrict__ context_lens, int* __restrict__ schedule_meta, int batch_size, int next_n, int num_next_n_atoms, int split_kv, int num_sms);
 

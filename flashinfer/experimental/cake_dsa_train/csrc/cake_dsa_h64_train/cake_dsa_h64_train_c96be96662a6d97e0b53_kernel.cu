@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,17 +14,49 @@
  * limitations under the License.
  */
 
-// Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
-#include "cake_dsa_h64_train_device_common.cuh"
+typedef signed char        int8_t;
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+#if defined(__CUDACC_RTC__)
+typedef unsigned long long uint64_t;
+#else
+typedef unsigned long      uint64_t;
+#endif
+static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
+typedef signed int         int32_t;
+typedef short int          int16_t;
+struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+
+#if defined(__CUDACC_RTC__)
+typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+#else
+#include <cuda.h>
+#endif
+
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 256
 #define LAUNCH_MIN_BLOCKS 1
 
+#include <math_constants.h>
+
 extern "C" {
 
-__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
+__global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
 kernel_cake_dsa_h64_train_c96be96662a6d97e0b53(float* __restrict__ src_latent, float* __restrict__ src_rope, __nv_bfloat16* __restrict__ dst_latent, __nv_bfloat16* __restrict__ dst_rope, float* __restrict__ dst_latent_f32, float* __restrict__ dst_rope_f32, int latent_groups, int rope_groups, int out_f32, float* __restrict__ dst_packed, int dst_row_stride, int* __restrict__ dst_map, int has_dst_map, int accumulate)
 {
     const int tid = threadIdx.x;
@@ -173,72 +205,70 @@ kernel_cake_dsa_h64_train_c96be96662a6d97e0b53(float* __restrict__ src_latent, f
         nat[31] = vals[31];
         if (accumulate != 0) {
             float lnz = 1.0f;
-            {
-                float _fabs_0 = fabsf(vals[0]);
-                lnz = _fabs_0;
-                float _fabs_1 = fabsf(vals[1]);
-                lnz = lnz + _fabs_1;
-                float _fabs_2 = fabsf(vals[2]);
-                lnz = lnz + _fabs_2;
-                float _fabs_3 = fabsf(vals[3]);
-                lnz = lnz + _fabs_3;
-                float _fabs_4 = fabsf(vals[4]);
-                lnz = lnz + _fabs_4;
-                float _fabs_5 = fabsf(vals[5]);
-                lnz = lnz + _fabs_5;
-                float _fabs_6 = fabsf(vals[6]);
-                lnz = lnz + _fabs_6;
-                float _fabs_7 = fabsf(vals[7]);
-                lnz = lnz + _fabs_7;
-                float _fabs_8 = fabsf(vals[8]);
-                lnz = lnz + _fabs_8;
-                float _fabs_9 = fabsf(vals[9]);
-                lnz = lnz + _fabs_9;
-                float _fabs_10 = fabsf(vals[10]);
-                lnz = lnz + _fabs_10;
-                float _fabs_11 = fabsf(vals[11]);
-                lnz = lnz + _fabs_11;
-                float _fabs_12 = fabsf(vals[12]);
-                lnz = lnz + _fabs_12;
-                float _fabs_13 = fabsf(vals[13]);
-                lnz = lnz + _fabs_13;
-                float _fabs_14 = fabsf(vals[14]);
-                lnz = lnz + _fabs_14;
-                float _fabs_15 = fabsf(vals[15]);
-                lnz = lnz + _fabs_15;
-                float _fabs_16 = fabsf(vals[16]);
-                lnz = lnz + _fabs_16;
-                float _fabs_17 = fabsf(vals[17]);
-                lnz = lnz + _fabs_17;
-                float _fabs_18 = fabsf(vals[18]);
-                lnz = lnz + _fabs_18;
-                float _fabs_19 = fabsf(vals[19]);
-                lnz = lnz + _fabs_19;
-                float _fabs_20 = fabsf(vals[20]);
-                lnz = lnz + _fabs_20;
-                float _fabs_21 = fabsf(vals[21]);
-                lnz = lnz + _fabs_21;
-                float _fabs_22 = fabsf(vals[22]);
-                lnz = lnz + _fabs_22;
-                float _fabs_23 = fabsf(vals[23]);
-                lnz = lnz + _fabs_23;
-                float _fabs_24 = fabsf(vals[24]);
-                lnz = lnz + _fabs_24;
-                float _fabs_25 = fabsf(vals[25]);
-                lnz = lnz + _fabs_25;
-                float _fabs_26 = fabsf(vals[26]);
-                lnz = lnz + _fabs_26;
-                float _fabs_27 = fabsf(vals[27]);
-                lnz = lnz + _fabs_27;
-                float _fabs_28 = fabsf(vals[28]);
-                lnz = lnz + _fabs_28;
-                float _fabs_29 = fabsf(vals[29]);
-                lnz = lnz + _fabs_29;
-                float _fabs_30 = fabsf(vals[30]);
-                lnz = lnz + _fabs_30;
-                float _fabs_31 = fabsf(vals[31]);
-                lnz = lnz + _fabs_31;
-            }
+            float _fabs_0 = fabsf(vals[0]);
+            lnz = _fabs_0;
+            float _fabs_1 = fabsf(vals[1]);
+            lnz = lnz + _fabs_1;
+            float _fabs_2 = fabsf(vals[2]);
+            lnz = lnz + _fabs_2;
+            float _fabs_3 = fabsf(vals[3]);
+            lnz = lnz + _fabs_3;
+            float _fabs_4 = fabsf(vals[4]);
+            lnz = lnz + _fabs_4;
+            float _fabs_5 = fabsf(vals[5]);
+            lnz = lnz + _fabs_5;
+            float _fabs_6 = fabsf(vals[6]);
+            lnz = lnz + _fabs_6;
+            float _fabs_7 = fabsf(vals[7]);
+            lnz = lnz + _fabs_7;
+            float _fabs_8 = fabsf(vals[8]);
+            lnz = lnz + _fabs_8;
+            float _fabs_9 = fabsf(vals[9]);
+            lnz = lnz + _fabs_9;
+            float _fabs_10 = fabsf(vals[10]);
+            lnz = lnz + _fabs_10;
+            float _fabs_11 = fabsf(vals[11]);
+            lnz = lnz + _fabs_11;
+            float _fabs_12 = fabsf(vals[12]);
+            lnz = lnz + _fabs_12;
+            float _fabs_13 = fabsf(vals[13]);
+            lnz = lnz + _fabs_13;
+            float _fabs_14 = fabsf(vals[14]);
+            lnz = lnz + _fabs_14;
+            float _fabs_15 = fabsf(vals[15]);
+            lnz = lnz + _fabs_15;
+            float _fabs_16 = fabsf(vals[16]);
+            lnz = lnz + _fabs_16;
+            float _fabs_17 = fabsf(vals[17]);
+            lnz = lnz + _fabs_17;
+            float _fabs_18 = fabsf(vals[18]);
+            lnz = lnz + _fabs_18;
+            float _fabs_19 = fabsf(vals[19]);
+            lnz = lnz + _fabs_19;
+            float _fabs_20 = fabsf(vals[20]);
+            lnz = lnz + _fabs_20;
+            float _fabs_21 = fabsf(vals[21]);
+            lnz = lnz + _fabs_21;
+            float _fabs_22 = fabsf(vals[22]);
+            lnz = lnz + _fabs_22;
+            float _fabs_23 = fabsf(vals[23]);
+            lnz = lnz + _fabs_23;
+            float _fabs_24 = fabsf(vals[24]);
+            lnz = lnz + _fabs_24;
+            float _fabs_25 = fabsf(vals[25]);
+            lnz = lnz + _fabs_25;
+            float _fabs_26 = fabsf(vals[26]);
+            lnz = lnz + _fabs_26;
+            float _fabs_27 = fabsf(vals[27]);
+            lnz = lnz + _fabs_27;
+            float _fabs_28 = fabsf(vals[28]);
+            lnz = lnz + _fabs_28;
+            float _fabs_29 = fabsf(vals[29]);
+            lnz = lnz + _fabs_29;
+            float _fabs_30 = fabsf(vals[30]);
+            lnz = lnz + _fabs_30;
+            float _fabs_31 = fabsf(vals[31]);
+            lnz = lnz + _fabs_31;
             if (lnz != 0.0f) {
                 int lrow = g / 16;
                 if (has_dst_map != 0) {
@@ -600,72 +630,70 @@ kernel_cake_dsa_h64_train_c96be96662a6d97e0b53(float* __restrict__ src_latent, f
         rnat[31] = rvals[31];
         if (accumulate != 0) {
             float rnz = 1.0f;
-            {
-                float _fabs_32 = fabsf(rvals[0]);
-                rnz = _fabs_32;
-                float _fabs_33 = fabsf(rvals[1]);
-                rnz = rnz + _fabs_33;
-                float _fabs_34 = fabsf(rvals[2]);
-                rnz = rnz + _fabs_34;
-                float _fabs_35 = fabsf(rvals[3]);
-                rnz = rnz + _fabs_35;
-                float _fabs_36 = fabsf(rvals[4]);
-                rnz = rnz + _fabs_36;
-                float _fabs_37 = fabsf(rvals[5]);
-                rnz = rnz + _fabs_37;
-                float _fabs_38 = fabsf(rvals[6]);
-                rnz = rnz + _fabs_38;
-                float _fabs_39 = fabsf(rvals[7]);
-                rnz = rnz + _fabs_39;
-                float _fabs_40 = fabsf(rvals[8]);
-                rnz = rnz + _fabs_40;
-                float _fabs_41 = fabsf(rvals[9]);
-                rnz = rnz + _fabs_41;
-                float _fabs_42 = fabsf(rvals[10]);
-                rnz = rnz + _fabs_42;
-                float _fabs_43 = fabsf(rvals[11]);
-                rnz = rnz + _fabs_43;
-                float _fabs_44 = fabsf(rvals[12]);
-                rnz = rnz + _fabs_44;
-                float _fabs_45 = fabsf(rvals[13]);
-                rnz = rnz + _fabs_45;
-                float _fabs_46 = fabsf(rvals[14]);
-                rnz = rnz + _fabs_46;
-                float _fabs_47 = fabsf(rvals[15]);
-                rnz = rnz + _fabs_47;
-                float _fabs_48 = fabsf(rvals[16]);
-                rnz = rnz + _fabs_48;
-                float _fabs_49 = fabsf(rvals[17]);
-                rnz = rnz + _fabs_49;
-                float _fabs_50 = fabsf(rvals[18]);
-                rnz = rnz + _fabs_50;
-                float _fabs_51 = fabsf(rvals[19]);
-                rnz = rnz + _fabs_51;
-                float _fabs_52 = fabsf(rvals[20]);
-                rnz = rnz + _fabs_52;
-                float _fabs_53 = fabsf(rvals[21]);
-                rnz = rnz + _fabs_53;
-                float _fabs_54 = fabsf(rvals[22]);
-                rnz = rnz + _fabs_54;
-                float _fabs_55 = fabsf(rvals[23]);
-                rnz = rnz + _fabs_55;
-                float _fabs_56 = fabsf(rvals[24]);
-                rnz = rnz + _fabs_56;
-                float _fabs_57 = fabsf(rvals[25]);
-                rnz = rnz + _fabs_57;
-                float _fabs_58 = fabsf(rvals[26]);
-                rnz = rnz + _fabs_58;
-                float _fabs_59 = fabsf(rvals[27]);
-                rnz = rnz + _fabs_59;
-                float _fabs_60 = fabsf(rvals[28]);
-                rnz = rnz + _fabs_60;
-                float _fabs_61 = fabsf(rvals[29]);
-                rnz = rnz + _fabs_61;
-                float _fabs_62 = fabsf(rvals[30]);
-                rnz = rnz + _fabs_62;
-                float _fabs_63 = fabsf(rvals[31]);
-                rnz = rnz + _fabs_63;
-            }
+            float _fabs_32 = fabsf(rvals[0]);
+            rnz = _fabs_32;
+            float _fabs_33 = fabsf(rvals[1]);
+            rnz = rnz + _fabs_33;
+            float _fabs_34 = fabsf(rvals[2]);
+            rnz = rnz + _fabs_34;
+            float _fabs_35 = fabsf(rvals[3]);
+            rnz = rnz + _fabs_35;
+            float _fabs_36 = fabsf(rvals[4]);
+            rnz = rnz + _fabs_36;
+            float _fabs_37 = fabsf(rvals[5]);
+            rnz = rnz + _fabs_37;
+            float _fabs_38 = fabsf(rvals[6]);
+            rnz = rnz + _fabs_38;
+            float _fabs_39 = fabsf(rvals[7]);
+            rnz = rnz + _fabs_39;
+            float _fabs_40 = fabsf(rvals[8]);
+            rnz = rnz + _fabs_40;
+            float _fabs_41 = fabsf(rvals[9]);
+            rnz = rnz + _fabs_41;
+            float _fabs_42 = fabsf(rvals[10]);
+            rnz = rnz + _fabs_42;
+            float _fabs_43 = fabsf(rvals[11]);
+            rnz = rnz + _fabs_43;
+            float _fabs_44 = fabsf(rvals[12]);
+            rnz = rnz + _fabs_44;
+            float _fabs_45 = fabsf(rvals[13]);
+            rnz = rnz + _fabs_45;
+            float _fabs_46 = fabsf(rvals[14]);
+            rnz = rnz + _fabs_46;
+            float _fabs_47 = fabsf(rvals[15]);
+            rnz = rnz + _fabs_47;
+            float _fabs_48 = fabsf(rvals[16]);
+            rnz = rnz + _fabs_48;
+            float _fabs_49 = fabsf(rvals[17]);
+            rnz = rnz + _fabs_49;
+            float _fabs_50 = fabsf(rvals[18]);
+            rnz = rnz + _fabs_50;
+            float _fabs_51 = fabsf(rvals[19]);
+            rnz = rnz + _fabs_51;
+            float _fabs_52 = fabsf(rvals[20]);
+            rnz = rnz + _fabs_52;
+            float _fabs_53 = fabsf(rvals[21]);
+            rnz = rnz + _fabs_53;
+            float _fabs_54 = fabsf(rvals[22]);
+            rnz = rnz + _fabs_54;
+            float _fabs_55 = fabsf(rvals[23]);
+            rnz = rnz + _fabs_55;
+            float _fabs_56 = fabsf(rvals[24]);
+            rnz = rnz + _fabs_56;
+            float _fabs_57 = fabsf(rvals[25]);
+            rnz = rnz + _fabs_57;
+            float _fabs_58 = fabsf(rvals[26]);
+            rnz = rnz + _fabs_58;
+            float _fabs_59 = fabsf(rvals[27]);
+            rnz = rnz + _fabs_59;
+            float _fabs_60 = fabsf(rvals[28]);
+            rnz = rnz + _fabs_60;
+            float _fabs_61 = fabsf(rvals[29]);
+            rnz = rnz + _fabs_61;
+            float _fabs_62 = fabsf(rvals[30]);
+            rnz = rnz + _fabs_62;
+            float _fabs_63 = fabsf(rvals[31]);
+            rnz = rnz + _fabs_63;
             if (rnz != 0.0f) {
                 int rg = g - latent_groups;
                 int rrow = rg / 2;
@@ -898,3 +926,4 @@ kernel_cake_dsa_h64_train_c96be96662a6d97e0b53(float* __restrict__ src_latent, f
 }
 
 } // extern "C"
+
