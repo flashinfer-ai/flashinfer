@@ -3058,14 +3058,10 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         tiled_o_r2s = cute.make_tiled_copy_D(atom_o_r2s, tiled_o_t2r)
         thr_o_r2s = tiled_o_r2s.get_slice(cg1_tidx)
         tCsO = thr_o_r2s.partition_D(sO)
-        # The transformed/partitioned view no longer carries the base SMEM
-        # alignment proof. ldmatrix/stmatrix require 128-bit-aligned pointers.
-        tCsO = cute.make_tensor(tCsO.iterator.align(16), tCsO.layout)
 
         sub_tile_size = 32
         sV_vt_view = utils.gemm.sm100.transform_partitioned_tensor_layout(sV)
         tCsV = thr_v_s2r.partition_S(sV_vt_view)
-        tCsV = cute.make_tensor(tCsV.iterator.align(16), tCsV.layout)
 
         rCumprod = cute.make_rmem_tensor((1, cute.size(tTR_tCcShared)), self.acc_dtype)
         tGrCumprod = thr_shared_t2r.partition_D(rCumprod)
