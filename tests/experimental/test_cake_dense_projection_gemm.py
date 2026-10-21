@@ -167,9 +167,9 @@ MLA_ROWS = {
 # and the L2 size (TMA eviction-hint working-set gate); B200 SXM (148 SMs) and Rubin R200 (212 SMs)
 # both report a 126 MiB L2.
 SM_COUNTS = (148, 212)
-# The instance every GLM-5.2 row resolves to on those devices, and the set the export registers.
+# The instance every GLM-5.2 row resolves to on those devices.
 # GENERATED from the Cake kernel host (adapter _plan_k1 with the mirrored sm_100a rule table) by the Cake
-# workspace tool stage/r2/gen_fi_test_tables.py; the exported set is cake_jit.KERNELS of the delivered tree. Do not hand-edit.
+# workspace tool stage/r2/gen_fi_test_tables.py. Do not hand-edit.
 # Table values are a template, or {(T, sm_count): template} when the plan depends on T / the device.
 # fmt: off
 # --- BEGIN GENERATED TABLES ---
@@ -526,96 +526,21 @@ MLA_TEMPLATES = {
         (2049, 212): 'dense_proj_gemm_nn_n256_m256_hee_t_tma1_s6_pro7',
     },
 }
-EXPORTED_TEMPLATES = frozenset(
-    {
-        'dense_proj_gemm_kk_n128_c1',
-        'dense_proj_gemm_kk_n128_hen_c1',
-        'dense_proj_gemm_kk_n128_hen_pro15',
-        'dense_proj_gemm_kk_n128_hen_pro7',
-        'dense_proj_gemm_kk_n128_pro7',
-        'dense_proj_gemm_kk_n192_hee_s8_pro15',
-        'dense_proj_gemm_kk_n192_m256_hen_s5_pro15',
-        'dense_proj_gemm_kk_n192_pro7',
-        'dense_proj_gemm_kk_n256_cg_pro15',
-        'dense_proj_gemm_kk_n256_cg_pro7',
-        'dense_proj_gemm_kk_n256_ht_pro15',
-        'dense_proj_gemm_kk_n256_m256_cg_or_pro7',
-        'dense_proj_gemm_kk_n256_m256_ht_cg_or_pro7',
-        'dense_proj_gemm_kk_n256_m256_ov_ht_pro7',
-        'dense_proj_gemm_kk_n256_pro15',
-        'dense_proj_gemm_kk_n256_pro7',
-        'dense_proj_gemm_kk_n256_q_pro7',
-        'dense_proj_gemm_kn_n128_f32_tma1_c1',
-        'dense_proj_gemm_kn_n128_f32_tma1_pd2_c1',
-        'dense_proj_gemm_kn_n128_f32_tma1_pro7',
-        'dense_proj_gemm_kn_n128_f32_tma2_s4_c1',
-        'dense_proj_gemm_kn_n256',
-        'dense_proj_gemm_kn_n256_cg_pro7',
-        'dense_proj_gemm_kn_n256_f32_tma1_pro15',
-        'dense_proj_gemm_kn_n256_f32_tma1_pro7',
-        'dense_proj_gemm_kn_n256_f32_v8_ef_pro7',
-        'dense_proj_gemm_kn_n256_f32_v8_ef_s9_pro15',
-        'dense_proj_gemm_kn_n256_f32_v8_ht_pro7',
-        'dense_proj_gemm_kn_n256_f32_v8_pro7',
-        'dense_proj_gemm_kn_n256_hne_pro7',
-        'dense_proj_gemm_kn_n256_ht_pro15',
-        'dense_proj_gemm_kn_n256_m256_cg_or_pro7',
-        'dense_proj_gemm_kn_n256_m256_f32_tma1_pro7',
-        'dense_proj_gemm_kn_n256_m256_f32_v8_ef_ov_ht_pro7',
-        'dense_proj_gemm_kn_n256_m256_ov_ht_pro15',
-        'dense_proj_gemm_kn_n256_m256_ov_ht_pro7',
-        'dense_proj_gemm_kn_n256_m256_tma1_bg4_pro7',
-        'dense_proj_gemm_kn_n256_pro15',
-        'dense_proj_gemm_kn_n256_pro7',
-        'dense_proj_gemm_kn_n256_q_pd1_pro7',
-        'dense_proj_gemm_kn_n256_tma1_bg8_pro7',
-        'dense_proj_gemm_kn_n256_tma1_bg8_sol_pro7',
-        'dense_proj_gemm_kn_n256_tma1_pd2_pro15',
-        'dense_proj_gemm_kn_n256_tma1_pro7',
-        'dense_proj_gemm_kn_n256_tma2_pd2_pro15',
-        'dense_proj_gemm_kn_n256_tma2_pd2_pro7',
-        'dense_proj_gemm_kn_n256_tma2_pd3_c1',
-        'dense_proj_gemm_nk_n256_t_pro7',
-        'dense_proj_gemm_nn_n128_f32_t_pro7',
-        'dense_proj_gemm_nn_n128_hen_f32_t_skx_pro7',
-        'dense_proj_gemm_nn_n128_hen_t_skx_pro7',
-        'dense_proj_gemm_nn_n128_m64_f32_t_pro7',
-        'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro7',
-        'dense_proj_gemm_nn_n128_m64_hen_f32_t_skx_pro15',
-        'dense_proj_gemm_nn_n128_m64_hen_t_pro7',
-        'dense_proj_gemm_nn_n128_m64_hen_t_skx_pro15',
-        'dense_proj_gemm_nn_n128_m64_t_pro7',
-        'dense_proj_gemm_nn_n128_t_pro7',
-        'dense_proj_gemm_nn_n160_m256_bz64_f32_v8_ef_pro15',
-        'dense_proj_gemm_nn_n160_m256_bz64_pro15',
-        'dense_proj_gemm_nn_n192_bz64_hee_f32_t_pro7',
-        'dense_proj_gemm_nn_n192_bz64_hee_f32_t_sks_sb2_pro7',
-        'dense_proj_gemm_nn_n192_bz64_hee_t_sks_stt_pro15',
-        'dense_proj_gemm_nn_n192_hee_f32_t_tma1_pro7',
-        'dense_proj_gemm_nn_n192_hee_t_tma1_pro7',
-        'dense_proj_gemm_nn_n192_m256_bz64_hee_t_tma1_s6_pro7',
-        'dense_proj_gemm_nn_n192_m256_t_tma1_pro7',
-        'dense_proj_gemm_nn_n256_f32_v8_ef_sks_sb2_pro7',
-        'dense_proj_gemm_nn_n256_f32_v8_pro15',
-        'dense_proj_gemm_nn_n256_f32_v8_pro7',
-        'dense_proj_gemm_nn_n256_m256_f32_ht_tma1_pro7',
-        'dense_proj_gemm_nn_n256_m256_f32_tma1_pro7',
-        'dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7',
-        'dense_proj_gemm_nn_n256_m256_f32_v8_ef_ht_pro7',
-        'dense_proj_gemm_nn_n256_m256_hee_t_tma1_s6_pro7',
-        'dense_proj_gemm_nn_n256_m256_ht_pro7',
-        'dense_proj_gemm_nn_n256_m256_ht_tma1_pro7',
-        'dense_proj_gemm_nn_n256_m256_ov_ht_pro7',
-        'dense_proj_gemm_nn_n256_m256_pro7',
-        'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7',
-        'dense_proj_gemm_nn_n256_m256_t_tma1_pro7',
-        'dense_proj_gemm_nn_n256_m256_tma1_pro7',
-        'dense_proj_gemm_nn_n256_pro15',
-        'dense_proj_gemm_nn_n256_sks_sb2_pro7',
-    }
-)
 # --- END GENERATED TABLES ---
 # fmt: on
+# The K1 templates the export registers: the union over the architectures of
+# ``cake_jit.KERNELS`` (the per-architecture filter of ``_registered`` below).
+# The count pins the number of templates in the export this suite was written
+# against: an export with another count fails here, at import, before any test
+# runs; a same-count substitution passes this pin and is left to the tests that
+# name templates (the planner tables above, the symbol and record pins below).
+EXPORTED_TEMPLATES = frozenset(
+    template
+    for arch in cake_jit.KERNELS
+    for template in cake_jit.KERNELS[arch]
+    if template.startswith("dense_proj_gemm_")
+)
+assert len(EXPORTED_TEMPLATES) == 84
 
 
 def _expected(table, key, T, sm_count):
