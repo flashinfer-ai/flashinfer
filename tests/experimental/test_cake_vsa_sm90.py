@@ -75,6 +75,8 @@ POOL_RAGGED_MIN_TILES = planner.POOL_RAGGED_MIN_TILES
 POOL_ROUNDS = planner.POOL_ROUNDS
 POOL_SMALL_MIN_TILES = planner.POOL_SMALL_MIN_TILES
 POOL_SMALL_TILE_POS = planner.POOL_SMALL_TILE_POS
+COMPACT_MAX_TILE_POS = planner.COMPACT_MAX_TILE_POS
+COMPACT_MIN_TILES = planner.COMPACT_MIN_TILES
 _schedule_feasible = planner._schedule_feasible
 _split_ingest_kb = planner._split_ingest_kb
 plan_small = planner.plan_small
@@ -562,7 +564,7 @@ def test_stage_table_builds_every_stage_from_the_shared_launcher():
     assert manifest["package"] == pkg.__name__ == "flashinfer.cake_vsa_sm90_backend"
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
-    assert len(loader.STAGES) == 17 and set(loader.STAGES) == set(loader.MODULES)
+    assert len(loader.STAGES) == 18 and set(loader.STAGES) == set(loader.MODULES)
     referenced = set()
     for stage in loader.STAGES:
         record = loader.stage_record(stage)
@@ -617,8 +619,12 @@ def test_stage_table_geometry_matches_the_stage_names():
         assert set(record["logical"]) == {name for kind, name in plan if kind != "grid"}
         assert route == loader.route_of(stage)
         if stage.startswith("attention"):
-            assert route == {"kind": "persistent", "queue": stage == "attention_queue"}
-            assert stage == loader.persistent_stage(route["queue"])
+            assert route == {
+                "compact": stage == "attention_compact",
+                "kind": "persistent",
+                "queue": stage == "attention_queue",
+            }
+            assert stage == loader.persistent_stage(route["queue"], route["compact"])
             assert (tuple(launch["block"]), tuple(launch["cluster"])) == (
                 (384, 1, 1),
                 (1, 1, 1),
@@ -676,7 +682,11 @@ def test_stage_table_geometry_matches_the_stage_names():
         assert loader.launch_grid(stage, {"num_ctas": 7, "num_items": 9}) == (
             (7, 1, 1) if route["kind"] == "persistent" else (9, 1, 1)
         )
-    assert set(loader.PERSISTENT_STAGES) == {"attention", "attention_queue"}
+    assert set(loader.PERSISTENT_STAGES) == {
+        "attention",
+        "attention_queue",
+        "attention_compact",
+    }
     assert set(loader.SMALL_STAGES) == (
         {loader.small_stage(k) for k in SMALL_KMAX_VARIANTS}
         | {loader.small_stage(k, split=True) for k in SPLIT_KMAX_VARIANTS}
@@ -724,7 +734,7 @@ def test_build_manifest_pins_the_numerics_flags():
     assert not any(
         flag.startswith(numerics) for flag in manifest["common"]["nvcc_flags"]
     )
-    assert len(manifest["libraries"]) == 17
+    assert len(manifest["libraries"]) == 18
     for entry in manifest["libraries"]:
         assert entry["nvcc_flags"] == ["--use_fast_math"], entry["name"]
         assert entry["nvcc_flags_if"] == [], entry["name"]
@@ -833,6 +843,52 @@ def _decode_tiles(plan):
                     entries.extend((int(w & 0xFFFF), int(w >> 16)))
                 owns.append(entries[:n_own])
             yield head, qb0, qb1, mode, positions, owns
+
+
+def _disjoint_mask(h, mb, k):
+    """Query block ``qb`` of every head selects blocks ``qb * k .. qb * k + k - 1``: no (head, block) is read twice."""
+    mask = torch.zeros((h, mb, mb * k), dtype=torch.bool)
+    for qb in range(mb):
+        mask[:, qb, qb * k : (qb + 1) * k] = True
+    return mask
+
+
+def _hint_words(plan):
+    hdr = plan["hdr"].view(planner.HDR_CTAS, planner.HDR_WORDS)
+    assert int(hdr[plan["num_ctas"] :].abs().sum()) == 0, "unused CTA headers stay zero"
+    return hdr[: plan["num_ctas"], planner.HDR_KV_HINT]
+
+
+def test_kv_hint_rule_no_reuse_plan_is_evict_first():
+    plan = plan_vsa_sm90(_disjoint_mask(2, 8, 4), sms=132)
+    assert plan["kv_hint"] == 1
+    assert bool((_hint_words(plan) == 1).all())
+
+
+def test_kv_hint_rule_full_reuse_plan_is_evict_last():
+    # every query block of a head selects the same 8 blocks: touched = 8 per head, streamed >= 8 x 8 per head
+    mask = torch.zeros((2, 16, 32), dtype=torch.bool)
+    mask[:, :, :8] = True
+    plan = plan_vsa_sm90(mask, sms=132)
+    assert plan["kv_hint"] == 0
+    assert bool((_hint_words(plan) == 0).all())
+
+
+def test_kv_hint_rule_threshold():
+    # streamed / touched <= 1.25 -> evict_first (1); above -> evict_last (0); the pair-tile layout lists two blocks
+    # per position, -1 marks an empty slot
+    mask = torch.zeros((1, 1, 4), dtype=torch.bool)
+    mask[0, 0, :4] = True  # touched = 4
+    assert (
+        planner.kv_l2_hint(mask, [[0, 1, 2, 3, 0]]) == 1
+    )  # 5 streamed, 5 * 4 <= 5 * 4
+    assert (
+        planner.kv_l2_hint(mask, [[0, 1, 2, 3, 0, 1]]) == 0
+    )  # 6 streamed, 6 * 4 > 5 * 4
+    assert (
+        planner.kv_l2_hint(mask, [[0, 1, -1, 2, 3, -1]]) == 1
+    )  # empty slots do not stream
+    assert planner.HDR_KV_HINT == 11 and planner.HDR_WORDS == 12
 
 
 @pytest.mark.parametrize(
@@ -1090,6 +1146,51 @@ def test_plan_queue_threshold_and_tiny_tile_exception(monkeypatch):
     assert plan_vsa_sm90(big, sms=132)["queue"]
     monkeypatch.setattr(module, "POOL_SMALL_MIN_TILES", 9)
     assert not plan_vsa_sm90(big, sms=132)["queue"]
+
+
+def test_plan_compact_route_rule(monkeypatch):
+    """Uniform pair plans of short tiles with many tiles per CTA run the compact static program
+    (tiles of at most COMPACT_MAX_TILE_POS ring positions, at least COMPACT_MIN_TILES tiles per
+    CTA): h16-m8192-k5 (1024 pair tiles of <= 6 positions, 7..8 per CTA) measured -3 % with the
+    lever form of the static kernel and 1.002..1.005 x without it, while 8-position pair tiles at
+    4 per CTA (h32-m2048-k8) gain 2.6 % with the levers; split, ragged, queue and short plans keep
+    their programs."""
+    module = planner
+
+    assert (COMPACT_MAX_TILE_POS, COMPACT_MIN_TILES) == (6, 4)
+    k5_mask = _topk_mask(16, 128, 128, 5)  # h16-m8192-n8192-k5
+    k5 = plan_vsa_sm90(k5_mask, sms=132)
+    assert k5["mode"] == "pair" and not k5["queue"] and k5["compact"]
+    assert min(map(len, k5["tile_lists"])) >= COMPACT_MIN_TILES
+    assert max(p for t in _cta_tiles(k5) for _, p in t) <= COMPACT_MAX_TILE_POS
+    k8 = plan_vsa_sm90(
+        _topk_mask(32, 32, 32, 8), sms=132
+    )  # h32-m2048-n2048-k8: 8-position pair tiles
+    assert k8["mode"] == "pair" and not k8["queue"] and not k8["compact"]
+    assert max(p for t in _cta_tiles(k8) for _, p in t) > COMPACT_MAX_TILE_POS
+    assert not plan_vsa_sm90(k5_mask, mode="split", sms=132)["compact"]
+    ragged = k5_mask.clone()
+    ragged[:, ::2] &= ~_topk_mask(16, 64, 128, 1).repeat_interleave(1, dim=1)[
+        :, : ragged[:, ::2].shape[1]
+    ]
+    assert (
+        int(ragged.sum(-1).min()) < 5
+        and not plan_vsa_sm90(ragged, mode="pair", sms=132)["compact"]
+    )
+    short = plan_vsa_sm90(
+        _topk_mask(16, 32, 128, 5), mode="pair", sms=132
+    )  # 256 pair tiles on 128 CTAs: fewer than 4 per CTA (mode=None picks split)
+    assert short["mode"] == "pair" and not short["compact"]
+    assert min(map(len, short["tile_lists"])) < COMPACT_MIN_TILES
+    long = plan_vsa_sm90(
+        _topk_mask(16, 256, 128, 5), sms=132
+    )  # >= POOL_MIN_TILES per CTA: queue, not compact
+    assert long["queue"] and not long["compact"]
+    monkeypatch.setattr(module, "COMPACT_MIN_TILES", 9)
+    assert not plan_vsa_sm90(k5_mask, sms=132)["compact"]
+    monkeypatch.setattr(module, "COMPACT_MIN_TILES", 4)
+    monkeypatch.setattr(module, "COMPACT_MAX_TILE_POS", 4)
+    assert not plan_vsa_sm90(k5_mask, sms=132)["compact"]
 
 
 def test_plan_ragged_queue_threshold_and_pool_order():
