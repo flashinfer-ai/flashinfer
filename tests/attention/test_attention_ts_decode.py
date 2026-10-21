@@ -2001,26 +2001,23 @@ def _exercise_auto_case(
     return policy
 
 
-def _exercise_explicit_kv256_case(
+def _exercise_explicit_profile_case(
     monkeypatch: pytest.MonkeyPatch,
     case: _DecodeCase,
+    explicit_profile: dict[str, object],
     *,
+    qo_indptr: Optional[torch.Tensor] = None,
+    max_seq_len_q: Optional[int] = None,
     exercise_all_paths: bool = False,
 ) -> dict[str, object]:
-    """Run a public path with the qualified logical KV256 profile pinned."""
+    """Run a public path with ``explicit_profile`` pinned over automatic selection."""
 
     from flashinfer.attention.prims_ts import decode as decode_module
     from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
 
     original_make_decode_config = fmha_decode_config.make_decode_config
-    explicit_profile = {
-        "use_keeps_mma_ab": True,
-        "tile_size_q": 64,
-        "tile_size_kv": 256,
-        "groups_tokens_heads_q": True,
-    }
 
-    def _make_explicit_kv256_config(*args, **kwargs):
+    def _make_explicit_config(*args, **kwargs):
         source = kwargs.get("args")
         kwargs["args"] = (
             explicit_profile if source is None else (source, explicit_profile)
@@ -2030,18 +2027,41 @@ def _exercise_explicit_kv256_case(
     monkeypatch.setattr(
         fmha_decode_config,
         "make_decode_config",
-        _make_explicit_kv256_config,
+        _make_explicit_config,
     )
     decode_module._resolve_decode_launch_spec.cache_clear()
     decode_module._get_compiled_decode.cache_clear()
     try:
         return _exercise_auto_case(
             case,
+            qo_indptr=qo_indptr,
+            max_seq_len_q=max_seq_len_q,
             exercise_all_paths=exercise_all_paths,
         )
     finally:
         decode_module._resolve_decode_launch_spec.cache_clear()
         decode_module._get_compiled_decode.cache_clear()
+
+
+def _exercise_explicit_kv256_case(
+    monkeypatch: pytest.MonkeyPatch,
+    case: _DecodeCase,
+    *,
+    exercise_all_paths: bool = False,
+) -> dict[str, object]:
+    """Run a public path with the qualified logical KV256 profile pinned."""
+
+    return _exercise_explicit_profile_case(
+        monkeypatch,
+        case,
+        {
+            "use_keeps_mma_ab": True,
+            "tile_size_q": 64,
+            "tile_size_kv": 256,
+            "groups_tokens_heads_q": True,
+        },
+        exercise_all_paths=exercise_all_paths,
+    )
 
 
 @torch.no_grad()
@@ -8277,6 +8297,137 @@ def test_attention_ts_decode_q64_kv256_boundaries(
     assert policy["use_persistent_scheduler"] is persistent
     if persistent:
         assert policy["use_split_kv"] is False
+
+
+# Pins grouped Keeps Q128 on 16-bit paged K/V; automatic selection takes it only
+# for fixed multi-token page-32 launches.
+_EXPLICIT_PAGED_16BIT_Q128_PROFILE = {
+    "use_keeps_mma_ab": True,
+    "tile_size_q": 128,
+    "groups_tokens_heads_q": True,
+    "use_persistent_scheduler": False,
+}
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    (
+        "dtype",
+        "heads_q_per_kv",
+        "seq_len_q",
+        "q_lens",
+        "mask_type",
+        "page_size",
+        "kv_lens",
+    ),
+    (
+        pytest.param(
+            torch.bfloat16, 8, 48, None, "causal", 32, (1040, 300), id="bf16-group8"
+        ),
+        pytest.param(
+            torch.float16, 8, 17, None, "dense", 16, (777, 64), id="fp16-page16"
+        ),
+        # 96 heads leave 32 structural padding rows in the tile.
+        pytest.param(
+            torch.float16, 96, 3, None, "dense", 64, (900, 450), id="fp16-group96"
+        ),
+        pytest.param(
+            torch.bfloat16,
+            128,
+            5,
+            None,
+            "causal",
+            128,
+            (1000, 2048),
+            id="bf16-group128-page128",
+        ),
+        pytest.param(
+            torch.bfloat16,
+            8,
+            48,
+            (37, 5),
+            "causal",
+            32,
+            (1000, 300),
+            id="bf16-packed",
+        ),
+    ),
+)
+def test_attention_ts_decode_explicit_16bit_paged_keeps_q128(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+    heads_q_per_kv: int,
+    seq_len_q: int,
+    q_lens: tuple[int, ...] | None,
+    mask_type: str,
+    page_size: int,
+    kv_lens: tuple[int, ...],
+):
+    """A pinned grouped Keeps Q128 tile runs FP16/BF16 paged K/V."""
+
+    case = _make_decode_case(
+        kv_lens=kv_lens,
+        num_qo_heads=2 * heads_q_per_kv,
+        num_kv_heads=2,
+        head_dim=128,
+        seq_len_q=seq_len_q,
+        page_size=page_size,
+        qkv_dtype=dtype,
+        output_dtype=dtype,
+        cache_form="tuple",
+        mask_type=mask_type,
+        device="cuda",
+        seed=20261020 + heads_q_per_kv,
+    )
+    qo_indptr = None
+    if q_lens is not None:
+        case, qo_indptr = _pack_decode_case(case, q_lens)
+
+    policy = _exercise_explicit_profile_case(
+        monkeypatch,
+        case,
+        _EXPLICIT_PAGED_16BIT_Q128_PROFILE,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=None if q_lens is None else seq_len_q,
+    )
+
+    assert policy["mma_variant"] == "keeps_mma_ab"
+    assert policy["tile_size_q"] == 128
+    assert policy["groups_tokens_heads_q"] is True
+
+
+def test_attention_ts_decode_16bit_paged_keeps_q128_automatic_scope(
+    monkeypatch,
+) -> None:
+    """The grouped-Q cost model scores 16-bit paged Keeps Q128 for fixed multi-Q launches."""
+
+    shape = dict(
+        seq_len_q=64,
+        seq_len_kv=8192,
+        batch_size=16,
+        num_heads_q=64,
+        num_heads_kv=8,
+        num_tokens_per_page=32,
+    )
+    for page in (16, 32, 64):
+        pinned = _make_auto_kv_tile_config(
+            monkeypatch,
+            args=_EXPLICIT_PAGED_16BIT_Q128_PROFILE,
+            **{**shape, "num_tokens_per_page": page},
+        )
+        assert pinned.supports_auto_grouped_keeps
+    single_token = _make_auto_kv_tile_config(
+        monkeypatch,
+        args=_EXPLICIT_PAGED_16BIT_Q128_PROFILE,
+        **{**shape, "seq_len_q": 1},
+    )
+    assert single_token.supports_grouped_keeps
+    assert not single_token.supports_auto_grouped_keeps
+    # Dense multi-Q launches take the cost model's tile instead of a head band.
+    automatic = _make_auto_kv_tile_config(monkeypatch, **shape)
+    assert automatic.use_keeps_mma_ab
+    assert automatic.tile_size_q == 128
+    assert automatic.groups_tokens_heads_q
 
 
 @_REQUIRES_PRIMTS_GPU
