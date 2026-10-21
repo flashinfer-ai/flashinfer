@@ -19,6 +19,7 @@ from __future__ import annotations
 import math
 import os
 import random
+from contextlib import nullcontext
 
 import torch
 import pytest
@@ -67,22 +68,6 @@ def _skip_if_cp_unsupported():
         return
     if not (is_sm90a_supported(device) or is_sm12x_supported(device)):
         pytest.skip("CP GDN prefill requires SM8x, SM90, SM100, or SM12x")
-
-
-def _skip_if_fp8_state_unsupported(state_dtype: torch.dtype):
-    """Skip an FP8 state on parts with no FP8 convert.
-
-    Converting to or from FP8 is a single instruction from SM89 on; SM80 and
-    SM86 have neither that nor a software path in the kernel.
-    """
-    if state_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
-        return
-    capability = torch.cuda.get_device_capability(torch.device("cuda"))
-    if capability < (8, 9):
-        pytest.skip(
-            f"{state_dtype} state needs compute capability 8.9+, "
-            f"got {capability[0]}.{capability[1]}"
-        )
 
 
 def _skip_if_not_sm100():
@@ -452,12 +437,16 @@ def test_prefill_kernel_zero_length_sequence(
     torch.testing.assert_close(our_o, ref_o, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize(
+    "state_source", ["caller", "allocated", "allocated_from_initial"]
+)
 @pytest.mark.parametrize("use_cp", [False, True])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_prefill_zero_length_sequence_state_untouched(
     qkv_factory,
     dtype: str,
     use_cp: bool,
+    state_source: str,
     scale: float = 0.1,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
@@ -484,6 +473,9 @@ def test_prefill_zero_length_sequence_state_untouched(
         alpha = torch.rand(seq_len, num_heads)
         beta = torch.rand(seq_len, num_heads)
         cu_seq_lens = torch.tensor([0, seq_len, seq_len], dtype=torch.int64)
+        initial_state = None
+        if state_source == "allocated_from_initial":
+            initial_state = torch.randn(2, num_heads, head_size, head_size) * 0.05
 
     our_o = torch.empty([seq_len, num_heads, head_size], dtype=q.dtype, device=q.device)
     our_state = torch.empty(
@@ -493,27 +485,35 @@ def test_prefill_zero_length_sequence_state_untouched(
     )
     our_state.fill_(sentinel)
 
-    chunk_gated_delta_rule(
+    _, out_state = chunk_gated_delta_rule(
         q,
         k,
         v,
         alpha,
         beta,
         scale,
-        None,
+        initial_state,
         True,
         cu_seq_lens,
         use_qk_l2norm_in_kernel=False,
         output=our_o,
-        output_state=our_state,
+        output_state=our_state if state_source == "caller" else None,
         use_cp=use_cp,
         max_seqlen=seq_len,
     )
     torch.cuda.synchronize()
 
+    # Nothing writes the empty row: it keeps the caller's buffer, and a buffer
+    # allocated here starts as the initial state, or as zeros without one.
+    if state_source == "caller":
+        want = torch.full_like(our_state[1], sentinel)
+    elif initial_state is None:
+        want = torch.zeros_like(our_state[1])
+    else:
+        want = initial_state[1]
     torch.testing.assert_close(
-        our_state[1],
-        torch.full_like(our_state[1], sentinel),
+        out_state[1],
+        want,
         atol=0,
         rtol=0,
     )
@@ -746,9 +746,11 @@ def _test_checkpoint(
     checkpoint_every_n_tokens: int,
     seed: int | None = None,
     use_cp: bool = False,
+    cp_chunk_mult: int = 1,
 ):
     """Test state checkpointing by comparing against prefix-based reference runs."""
     _skip_if_unsupported()
+    cp_chunk_len = checkpoint_every_n_tokens * cp_chunk_mult if use_cp else None
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -815,7 +817,7 @@ def _test_checkpoint(
         checkpoint_cu_starts=checkpoint_cu_starts,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         use_cp=use_cp,
-        _cp_chunk_len=checkpoint_every_n_tokens if use_cp else None,
+        _cp_chunk_len=cp_chunk_len,
         max_seqlen=max(seq_lens),
     )
     torch.cuda.synchronize()
@@ -861,7 +863,7 @@ def _test_checkpoint(
                 output=prefix_o,
                 output_state=prefix_state,
                 use_cp=use_cp,
-                _cp_chunk_len=checkpoint_every_n_tokens if use_cp else None,
+                _cp_chunk_len=cp_chunk_len,
             )
             torch.cuda.synchronize()
 
@@ -882,7 +884,8 @@ def _test_checkpoint(
 )
 @pytest.mark.parametrize("seq_lens", [[256], [128, 256, 512]])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-@pytest.mark.parametrize("use_cp", [False, True])
+# A chunk of three checkpoint intervals stores mid-chunk as well as at its end.
+@pytest.mark.parametrize("use_cp, cp_chunk_mult", [(False, 1), (True, 1), (True, 3)])
 def test_checkpoint_correctness(
     qkv_factory,
     dtype: str,
@@ -893,14 +896,11 @@ def test_checkpoint_correctness(
     seq_lens: list[int],
     checkpoint_every_n_tokens: int,
     use_cp: bool,
+    cp_chunk_mult: int,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
-    if use_cp and not (
-        is_sm90a_supported(torch.device("cuda"))
-        or is_sm100a_supported(torch.device("cuda"))
-        or is_sm12x_supported(torch.device("cuda"))
-    ):
-        pytest.skip("CP state checkpointing requires SM90, SM100, or SM120")
+    if use_cp:
+        _skip_if_cp_unsupported()
     scale = 1.0 / math.sqrt(head_size)
     _test_checkpoint(
         qkv_factory,
@@ -914,6 +914,7 @@ def test_checkpoint_correctness(
         checkpoint_every_n_tokens,
         seed,
         use_cp=use_cp,
+        cp_chunk_mult=cp_chunk_mult,
     )
 
 
@@ -1063,113 +1064,38 @@ def test_checkpoint_wrong_dtype(qkv_factory):
         )
 
 
-@pytest.mark.parametrize("state_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
-def test_fp8_state_rejected_without_fp8_convert(state_dtype):
-    """An FP8 state is refused where the hardware cannot convert to it.
+@pytest.mark.parametrize("name", ["state_checkpoints", "checkpoint_cu_starts"])
+def test_checkpoint_non_contiguous_rejected(name):
+    """A strided checkpoint tensor is refused rather than mishandled.
 
-    Converting to or from FP8 is a single instruction starting at SM89, and
-    there is no software path in the kernel. Without this the request reaches
-    the compiler and comes back as a bare "NVVM backend compilation failed",
-    which names no argument. The counterpart on parts that do have the
-    instruction is that the request must still be accepted, so this asserts
-    both directions.
+    ``reshape(-1)`` would copy ``state_checkpoints`` into a temporary, and a
+    kernel compiled for a unit-stride ``checkpoint_cu_starts`` would misread it.
     """
     _skip_if_unsupported()
     device = torch.device("cuda")
-    capability = torch.cuda.get_device_capability(device)
-    seq_len = 64
-
-    def run():
-        """One call with the parametrized shape, returning what it wrote."""
-        return chunk_gated_delta_rule(
-            torch.zeros(seq_len, 1, 128, dtype=torch.bfloat16, device=device),
-            torch.zeros(seq_len, 1, 128, dtype=torch.bfloat16, device=device),
-            torch.zeros(seq_len, 1, 128, dtype=torch.bfloat16, device=device),
+    H, D = 2, 128
+    seq_len, every = 256, 64
+    num_checkpoints = seq_len // every
+    zeros = torch.zeros(seq_len, H, D, dtype=torch.bfloat16, device=device)
+    checkpoint_args = {
+        "state_checkpoints": torch.zeros(
+            num_checkpoints, H, D, D, dtype=torch.float32, device=device
+        ),
+        "checkpoint_cu_starts": torch.tensor(
+            [0, num_checkpoints], dtype=torch.int64, device=device
+        ),
+    }
+    # The same values, read as every other element of a buffer twice as long.
+    checkpoint_args[name] = checkpoint_args[name].repeat_interleave(2, dim=0)[::2]
+    assert not checkpoint_args[name].is_contiguous()
+    with pytest.raises(RuntimeError, match=f"{name} must be contiguous"):
+        chunk_gated_delta_rule(
+            zeros,
+            zeros,
+            zeros,
             cu_seqlens=torch.tensor([0, seq_len], dtype=torch.int64, device=device),
-            output_state=torch.zeros(1, 1, 128, 128, dtype=state_dtype, device=device),
-            output_final_state=True,
-        )
-
-    if capability < (8, 9):
-        with pytest.raises(NotImplementedError, match="FP8 conversion"):
-            run()
-    else:
-        run()
-        torch.cuda.synchronize()
-
-
-def test_checkpoint_non_contiguous_rejected(qkv_factory):
-    """A non-contiguous checkpoint tensor is refused, not silently dropped.
-
-    ``state_checkpoints`` reaches the kernel as ``reshape(-1)``, which returns
-    a copy when the tensor is not contiguous. The kernel then writes every
-    checkpoint into a temporary that is freed on return: measured, a pool
-    sliced as ``pool[::2]`` came back with 0 of 4 checkpoints written and
-    nothing raised.
-
-    ``checkpoint_cu_starts`` is passed unreshaped, so that is not its failure
-    mode. It is rejected because ``mark_layout_dynamic`` bakes a unit stride
-    whenever a dimension has one while the compile cache keys on dtypes and
-    tile config without strides -- so a contiguous first call would bake
-    stride 1 and a later strided one would reuse that kernel.
-    """
-    _skip_if_unsupported()
-    device = torch.device("cuda")
-    H, D = 2, 128
-    seq_len, every = 256, 64
-    num_checkpoints = seq_len // every
-    zeros = torch.zeros(seq_len, H, D, dtype=torch.bfloat16, device=device)
-    cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int64, device=device)
-    cu_starts = torch.tensor([0, num_checkpoints], dtype=torch.int64, device=device)
-    # Same shape and dtype as the accepted form, sliced so it is not contiguous.
-    sliced = torch.zeros(
-        num_checkpoints * 2, H, D, D, dtype=torch.float32, device=device
-    )[::2]
-    assert not sliced.is_contiguous()
-    with pytest.raises(RuntimeError, match="state_checkpoints must be contiguous"):
-        chunk_gated_delta_rule(
-            zeros,
-            zeros,
-            zeros,
-            cu_seqlens=cu_seqlens,
-            state_checkpoints=sliced,
-            checkpoint_cu_starts=cu_starts,
             checkpoint_every_n_tokens=every,
-        )
-
-
-def test_checkpoint_cu_starts_non_contiguous_rejected(qkv_factory):
-    """A strided ``checkpoint_cu_starts`` is refused too, for its own reason.
-
-    Unlike ``state_checkpoints`` this one is passed unreshaped, so nothing is
-    copied. It is rejected because the kernel's layout is marked dynamic and
-    the compile cache does not key on strides: a contiguous first call bakes a
-    unit stride into the cached kernel, and a later strided call reuses it and
-    reads the wrong offsets.
-    """
-    _skip_if_unsupported()
-    device = torch.device("cuda")
-    H, D = 2, 128
-    seq_len, every = 256, 64
-    num_checkpoints = seq_len // every
-    zeros = torch.zeros(seq_len, H, D, dtype=torch.bfloat16, device=device)
-    cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int64, device=device)
-    checkpoints = torch.zeros(
-        num_checkpoints, H, D, D, dtype=torch.float32, device=device
-    )
-    strided_starts = torch.tensor(
-        [0, -1, num_checkpoints, -1], dtype=torch.int64, device=device
-    )[::2]
-    assert not strided_starts.is_contiguous()
-    with pytest.raises(RuntimeError, match="checkpoint_cu_starts must be contiguous"):
-        chunk_gated_delta_rule(
-            zeros,
-            zeros,
-            zeros,
-            cu_seqlens=cu_seqlens,
-            state_checkpoints=checkpoints,
-            checkpoint_cu_starts=strided_starts,
-            checkpoint_every_n_tokens=every,
+            **checkpoint_args,
         )
 
 
@@ -1333,89 +1259,113 @@ def test_prefill_kernel_state_dtype(
     use_cp: bool,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
-    """A caller state dtype other than the accumulator's."""
-    _skip_if_fp8_state_unsupported(state_dtype)
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
-    _test_prefill_kernel_state_dtype(
-        qkv_factory,
-        dtype,
-        state_dtype,
-        num_q_heads,
-        num_k_heads,
-        num_v_heads,
-        head_size,
-        seq_lens,
-        scale,
-        use_cp,
-        seed=seed,
+    # Before SM89 there is no FP8 convert, so an FP8 state is refused up front.
+    fp8_refused = state_dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and (
+        torch.cuda.get_device_capability() < (8, 9)
     )
-
-
-@pytest.mark.parametrize("with_initial_state", [False, True])
-def test_prefill_zero_length_sequence_state_is_defined_when_allocated_here(
-    qkv_factory,
-    with_initial_state: bool,
-    scale: float = 0.1,
-    seed: int = int(os.environ.get("SEED", "0")),
-):
-    """A row nothing writes still has to hold something.
-
-    Every kernel here guards its body on the sequence being non-empty, so a
-    zero-token sequence never writes its row of `output_state`. The companion
-    test above covers the caller-supplied buffer, where keeping what the caller
-    put there is the point. This covers the other half: when the entry point
-    allocates the buffer, `torch.empty` left that row as uninitialised memory
-    and returned it as a state.
-    """
-    _skip_if_unsupported()
-
-    random.seed(seed)
-    torch.random.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-
-    head_size = 128
-    num_heads = 2
-    seq_lens = [96, 0, 300]
-    total = sum(seq_lens)
-    device = torch.device("cuda")
-
-    with device:
-        q, k, v = qkv_factory(
-            [total], num_heads, num_heads, num_heads, head_size, torch.bfloat16
+    with (
+        pytest.raises(NotImplementedError, match="FP8 conversion")
+        if fp8_refused
+        else nullcontext()
+    ):
+        _test_prefill_kernel_state_dtype(
+            qkv_factory,
+            dtype,
+            state_dtype,
+            num_q_heads,
+            num_k_heads,
+            num_v_heads,
+            head_size,
+            seq_lens,
+            scale,
+            use_cp,
+            seed=seed,
         )
-        k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
-        alpha = torch.rand(total, num_heads)
-        beta = torch.rand(total, num_heads)
-        cu_seq_lens = torch.tensor([0, 96, 96, 396], dtype=torch.int64)
-        initial_state = None
-        if with_initial_state:
-            initial_state = (
-                torch.randn(
-                    len(seq_lens), num_heads, head_size, head_size, dtype=torch.float32
-                )
-                * 0.05
-            )
 
-    # Repeated, because uninitialised memory is only reliably caught by getting
-    # a different answer twice from the same inputs.
-    seen = []
-    for _ in range(4):
-        _, state = chunk_gated_delta_rule(
+
+@pytest.mark.parametrize(
+    "cu_seqlens_cpu, max_seqlen, error, match",
+    [
+        ([0, 192], None, NotImplementedError, "num_seqs \\+ 1"),
+        ([0, 200, 192], None, NotImplementedError, "monotonic"),
+        ([1, 64, 192], None, NotImplementedError, "monotonic"),
+        ([0, 64, 191], None, NotImplementedError, "monotonic"),
+        ([0, 64, 192], 96, ValueError, "smaller than the longest"),
+    ],
+)
+def test_sm8x_cu_seqlens_cpu_is_checked_on_its_own(
+    cu_seqlens_cpu, max_seqlen, error, match
+):
+    """A host copy that cannot describe the batch is refused before a launch.
+
+    It is checked on its own, never against the device `cu_seqlens`."""
+    device = torch.device("cuda")
+    if get_compute_capability(device)[0] != 8:
+        pytest.skip("only the SM8x prefill routes on cu_seqlens_cpu")
+    zeros = torch.zeros(192, 1, 128, dtype=torch.bfloat16, device=device)
+    with pytest.raises(error, match=match):
+        chunk_gated_delta_rule(
+            zeros,
+            zeros,
+            zeros,
+            cu_seqlens=torch.tensor([0, 64, 192], dtype=torch.int64, device=device),
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            max_seqlen=max_seqlen,
+        )
+
+
+def test_sm80_v32_matches_v64(qkv_factory, monkeypatch):
+    """The V32 specialization, on the one shape that selects it, against V64.
+
+    Only `cu_seqlens_cpu` tells the dispatcher the longest sequence, so the
+    same call without it runs V64; the spy checks the kernel V32 asked for.
+    """
+    device = torch.device("cuda")
+    if get_compute_capability(device) != (8, 0):
+        pytest.skip("V32 is selected on compute capability 8.0 only")
+    from flashinfer.gdn_kernels.delta_rule_dsl import delta_rule_sm80
+
+    v32_applies = delta_rule_sm80._v32_applies
+    taken = []
+    monkeypatch.setattr(
+        delta_rule_sm80,
+        "_v32_applies",
+        lambda **kwargs: taken.append(v32_applies(**kwargs)) or taken[-1],
+    )
+    torch.manual_seed(0)
+    seq_len, head_size = 8192, 128
+    with device:
+        q, k, v = qkv_factory([seq_len], 4, 4, 16, head_size, torch.bfloat16)
+        k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
+        alpha = torch.rand(seq_len, 16)
+        beta = torch.rand(seq_len, 16)
+        initial_state = (torch.randn(1, 16, head_size, head_size) * 0.01).to(
+            torch.bfloat16
+        )
+        cu_seq_lens = torch.tensor([0, seq_len], dtype=torch.int64)
+
+    runs = [
+        chunk_gated_delta_rule(
             q,
             k,
             v,
             alpha,
             beta,
-            scale,
+            1.0 / math.sqrt(head_size),
             initial_state,
             True,
             cu_seq_lens,
+            use_qk_l2norm_in_kernel=False,
+            output_state=torch.empty_like(initial_state),
+            use_cp=False,
+            cu_seqlens_cpu=cu_seqlens_cpu,
         )
-        torch.cuda.synchronize()
-        seen.append(state[1].clone())
+        for cu_seqlens_cpu in ([0, seq_len], None)
+    ]
+    torch.cuda.synchronize()
 
-    for later in seen[1:]:
-        torch.testing.assert_close(seen[0], later, atol=0.0, rtol=0.0)
-
-    want = initial_state[1] if with_initial_state else torch.zeros_like(seen[0])
-    torch.testing.assert_close(seen[0], want, atol=0.0, rtol=0.0)
+    assert taken == [True, False]
+    (v32_o, v32_state), (v64_o, v64_state) = runs
+    assert torch.equal(v32_o, v64_o)
+    assert torch.equal(v32_state, v64_state)

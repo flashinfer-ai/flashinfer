@@ -882,6 +882,7 @@ def _allocate_output_state(
     device,
     initial_state: Optional[torch.Tensor],
     state_indices: Optional[torch.Tensor],
+    returned: bool = True,
 ) -> torch.Tensor:
     """Allocate the final-state buffer with every row already defined.
 
@@ -908,12 +909,17 @@ def _allocate_output_state(
     the two are copied row for row and a batch-shaped buffer against a
     pool-shaped source is a `copy_` that raises. It is computed here rather than
     at each of the five call sites, two of which had it hardcoded to the batch.
+
+    A buffer that is not `returned` is scratch the kernel stores into and the
+    caller never reads, so it keeps that shape and is left uninitialised.
     """
     shape = (
         initial_state.shape
         if state_indices is not None and initial_state is not None
         else (num_seqs, num_sab_heads, head_size, head_size)
     )
+    if not returned:
+        return torch.empty(shape, dtype=torch.float32, device=device)
     if initial_state is None:
         return torch.zeros(shape, dtype=torch.float32, device=device)
     out = torch.empty(shape, dtype=torch.float32, device=device)
@@ -970,12 +976,6 @@ def _cp_delta_rule_rejection_reason(
             "CP delta rule is currently implemented only for SM8x, SM90, "
             "SM100, and SM120"
         )
-    if (
-        checkpoint_every_n_tokens > 0
-        or state_checkpoints is not None
-        or checkpoint_cu_starts is not None
-    ) and arch_major not in (9, 10, 12):
-        return "CP delta rule does not support state checkpointing yet"
     if q.shape[-1] != 128:
         return f"CP delta rule only supports head_size=128, got {q.shape[-1]}"
     if q.dtype not in (torch.float16, torch.bfloat16):
@@ -1183,7 +1183,7 @@ def chunk_gated_delta_rule(
         num_sab_heads, head_size, head_size]``. May be float32, bfloat16,
         float16, float8_e4m3fn, or float8_e5m2. Required when
         ``checkpoint_every_n_tokens > 0``. Context-parallel checkpointing is
-        currently supported on SM90, SM100, and SM120.
+        currently supported on SM8x, SM90, SM100, and SM120.
     checkpoint_cu_starts : torch.Tensor, optional
         Cumulative checkpoint counts of shape ``[num_seqs + 1]``, int32 or
         int64 on the same CUDA device as ``q``.
@@ -1359,9 +1359,7 @@ def chunk_gated_delta_rule(
       flashinfer-python[cu13]``).
     - On SM8x the state may not be FP8: converting to or from it is a single
       instruction starting at SM89, and there is no software path here.  SM89
-      itself is unaffected.  CP state checkpointing is not offered on SM8x: a
-      call that asks for it falls back to the non-CP path under
-      ``use_cp="auto"`` and is rejected under ``use_cp=True``.
+      itself is unaffected.
     - ``use_cp="auto"`` selects CP on compute capability 8.0 when the caller
       passes the exact longest sequence and it is at least 8192 tokens, and
       ``num_seqs * max(num_q_heads, num_v_heads)`` is at most 8 -- long
@@ -1883,20 +1881,13 @@ def chunk_gated_delta_rule(
             state_indices_kwargs = (
                 {"state_indices": state_indices} if state_indices is not None else {}
             )
-            # SM80 goes through the pointer entries and the shared invocation
-            # context: the same four kernels, entered with pointers and extents
-            # instead of tensor descriptors. It is measured at 0.775 ms against
-            # 0.883 for the tensor entries on `1x8192 h2` and byte-identical to
-            # them. Private to this call -- the public signature has no ABI
-            # switch, and there is nothing for a caller to choose between.
-            abi_kwargs = {"_ptr_abi": True} if _arch_major == 8 else {}
             checkpoint_kwargs = (
                 {
                     "state_checkpoints": state_checkpoints,
                     "checkpoint_cu_starts": checkpoint_cu_starts,
                     "checkpoint_every_n_tokens": checkpoint_every_n_tokens,
                 }
-                if _arch_major in (9, 10, 12)
+                if _arch_major in (8, 9, 10, 12)
                 else {}
             )
             cp_delta_rule_dsl(
@@ -1914,7 +1905,6 @@ def chunk_gated_delta_rule(
                 cp_chunk_len=_cp_chunk_len,
                 **state_indices_kwargs,
                 **checkpoint_kwargs,
-                **abi_kwargs,
             )
             if output_final_state:
                 return output, output_state
@@ -2015,6 +2005,7 @@ def chunk_gated_delta_rule(
                 device,
                 initial_state,
                 state_indices,
+                returned=output_final_state,
             )
         chunk_gated_delta_rule_sm80(
             output,
@@ -2045,6 +2036,7 @@ def chunk_gated_delta_rule(
                 device,
                 initial_state,
                 state_indices,
+                returned=output_final_state,
             )
         chunk_gated_delta_rule_sm120(
             output,
@@ -2078,6 +2070,7 @@ def chunk_gated_delta_rule(
                 device,
                 initial_state,
                 state_indices,
+                returned=output_final_state,
             )
 
         chunk_gated_delta_rule_sm90(

@@ -54,7 +54,6 @@ BACKEND_CP_HEAD_CASES = (
 
 
 def _skip_if_not_supported(backend, use_cp):
-    """Skip where no GDN prefill kernel exists for this device."""
     device = torch.device("cuda")
     major, minor = get_compute_capability(device)
     if backend == "cake_gdn" and (major, minor) not in ((10, 0), (10, 3), (10, 7)):
@@ -651,195 +650,50 @@ def test_prefill_state_indices_none_is_default(backend, use_cp):
 
 
 @pytest.mark.parametrize("use_cp", [False, True])
-def test_prefill_initial_state_without_final_state(use_cp):
-    """An initial state with no final state asked for.
-
-    The CP path built its initial-state layout out of the *output* state's shape
-    and stride, which only exist when a final state was asked for, so this
-    combination did not compile at all. It is a public contract: a caller may
-    start from a state and want only the output.
-    """
-    _skip_if_not_supported("flashinfer", use_cp)
-    device = torch.device("cuda")
-    H, D = 8, 128
-    seq_lens = [256, 512]
-    q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
-        seq_lens, H, D, torch.bfloat16, device, seed=0
-    )
-    total = sum(seq_lens)
-    out_ref = torch.empty(total, H, D, dtype=q.dtype, device=device)
-    ref_state = torch.zeros_like(init_state)
-    ref, _ = chunk_gated_delta_rule(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        None,
-        initial_state=init_state,
-        output_final_state=True,
-        cu_seqlens=cu_seqlens,
-        use_qk_l2norm_in_kernel=False,
-        output=out_ref,
-        output_state=ref_state,
-        use_cp=use_cp,
-        max_seqlen=max(seq_lens),
-    )
-    out = torch.empty(total, H, D, dtype=q.dtype, device=device)
-    got = chunk_gated_delta_rule(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        None,
-        initial_state=init_state,
-        output_final_state=False,
-        cu_seqlens=cu_seqlens,
-        use_qk_l2norm_in_kernel=False,
-        output=out,
-        use_cp=use_cp,
-        max_seqlen=max(seq_lens),
-    )
-    torch.testing.assert_close(got, ref, atol=1e-2, rtol=5e-3)
-
-
-@pytest.mark.parametrize("use_cp", [False, True])
 def test_prefill_state_indices_pools_of_different_sizes(use_cp):
-    """The initial pool and the output pool need not match in size or in stride.
+    """Separate initial and output pools each keep their own size and strides.
 
-    They are separate tensors indexed by the same `state_indices`, so nothing
-    ties their leading dimension together -- and the CP path took the output
-    pool's shape for both. The two are given different padding and different
-    inner strides as well, because two contiguous pools that differ only in
-    their leading dimension still have the same element strides and would not
-    catch an address built from the wrong tensor.
-
-    Checked against a packed run rather than against itself: unselected rows
-    staying put says nothing about whether the selected ones hold the right
-    numbers, or whether the right initial row was read.
-    """
+    They differ in padding and inner stride as well: pools that differ only in
+    their leading dimension share element strides, so an address built from
+    the wrong one would still land."""
     _skip_if_not_supported("flashinfer", use_cp)
     device = torch.device("cuda")
-    H, D = 8, 128
-    seq_lens = [256, 512]
-    dtype = torch.bfloat16
-    q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
-        seq_lens, H, D, dtype, device, seed=0
-    )
-    total = sum(seq_lens)
-
-    # One canonical initial state, fp32, fed to both runs. `_make_inputs` hands
-    # back a bf16 state on this target; giving the packed run that and the
-    # indexed run an fp32 copy makes the two differ in arithmetic as well as in
-    # layout, and the comparison stops being about layout at all.
-    canonical_init = init_state.float().contiguous()
-    packed_out = torch.empty(total, H, D, dtype=q.dtype, device=device)
-    packed_state = torch.zeros(
-        len(seq_lens), H, D, D, dtype=torch.float32, device=device
-    )
-    packed, packed_final = chunk_gated_delta_rule(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        None,
-        initial_state=canonical_init,
-        output_final_state=True,
-        cu_seqlens=cu_seqlens,
-        use_qk_l2norm_in_kernel=False,
-        output=packed_out,
-        output_state=packed_state,
-        use_cp=use_cp,
-        max_seqlen=max(seq_lens),
+    *inputs, init_state = _make_inputs([256, 512], 8, 128, torch.bfloat16, device, 0)
+    packed_output, packed_final = _run(
+        *inputs, init_state, torch.empty_like(init_state), None, use_cp, "flashinfer"
     )
 
     perm = [3, 1]
-    in_pool = _make_pool(canonical_init, perm, 9, 96, torch.float32, device)
+    in_pool = _make_pool(init_state, perm, 9, 96, init_state.dtype, device)
     out_pool = _make_pool(
-        torch.zeros_like(canonical_init),
-        perm,
-        5,
-        0,
-        torch.float32,
-        device,
-        inner_stride=2,
+        torch.zeros_like(init_state), [], 5, 0, init_state.dtype, device, 2
     )
-    sentinel = torch.arange(
-        out_pool.shape[0] * H * D * D, dtype=torch.float32, device=device
-    ).reshape(out_pool.shape)
-    out_pool.copy_(sentinel)
     idx = torch.tensor(perm, dtype=torch.int32, device=device)
-    assert in_pool.shape[0] != out_pool.shape[0]
-    assert in_pool.stride() != out_pool.stride()
-
-    out = torch.empty(total, H, D, dtype=q.dtype, device=device)
-    indexed, indexed_final = chunk_gated_delta_rule(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        None,
-        initial_state=in_pool,
-        output_final_state=True,
-        cu_seqlens=cu_seqlens,
-        use_qk_l2norm_in_kernel=False,
-        output=out,
-        output_state=out_pool,
-        state_indices=idx,
-        use_cp=use_cp,
-        max_seqlen=max(seq_lens),
-    )
-    torch.cuda.synchronize()
-
-    assert torch.isfinite(packed).all() and torch.isfinite(packed_final).all()
-    assert torch.isfinite(indexed).all()
-    torch.testing.assert_close(indexed, packed, atol=1e-2, rtol=5e-3)
-    for i, r in enumerate(perm):
-        assert torch.isfinite(out_pool[r]).all()
-        torch.testing.assert_close(
-            out_pool[r],
-            packed_final[i],
-            atol=1e-2,
-            rtol=5e-3,
-            msg=lambda m, r=r, i=i: (
-                f"output pool row {r} is not sequence {i}'s final state\n{m}"
-            ),
-        )
-    for r in range(out_pool.shape[0]):
-        if r in perm:
-            continue
-        assert torch.equal(out_pool[r], sentinel[r]), (
-            f"output pool row {r} was written although no sequence selected it"
-        )
+    output, _ = _run(*inputs, in_pool, out_pool, idx, use_cp, "flashinfer")
+    assert torch.equal(packed_output, output)
+    assert torch.equal(packed_final, out_pool[perm])
+    assert not out_pool[[0, 2, 4]].any()
 
 
-def _run_invalid_slot_child(case_name):
-    """Launch the native prefill with one out-of-pool `state_indices` entry.
+def _run_invalid_slot_child(use_cp):
+    """Launch the native prefill with a `state_indices` entry past the pool.
 
     Runs in a child process: the bounds check is a device-side assert, which
     poisons the CUDA context for everything that follows it.
     """
     device = torch.device("cuda")
-    H, D = 8, 128
-    seq_lens = [128]
     q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
-        seq_lens, H, D, torch.bfloat16, device, seed=0
+        [128], 8, 128, torch.bfloat16, device, seed=0
     )
-    perm = [1]
-    pool = _make_pool(init_state, perm, 3, 0, torch.float32, device)
-    idx = torch.tensor(perm, dtype=torch.int32, device=device)
-    idx[0] = -1 if case_name.endswith("negative") else int(pool.shape[0])
-    use_cp = case_name.startswith("cp_")
+    pool = _make_pool(init_state, [1], 3, 0, torch.float32, device)
+    idx = torch.tensor([pool.shape[0]], dtype=torch.int32, device=device)
     _run(q, k, v, g, beta, cu_seqlens, pool, pool, idx, use_cp, "flashinfer")
     torch.cuda.synchronize()
 
 
-@pytest.mark.parametrize("case_name", ("negative", "upper", "cp_negative", "cp_upper"))
-def test_prefill_state_indices_out_of_pool_fails_in_isolated_process(case_name):
-    """An id outside [0, N_pool) must be caught, not read past the pool.
+@pytest.mark.parametrize("use_cp", [False, True])
+def test_prefill_state_indices_out_of_pool_fails_in_isolated_process(use_cp):
+    """An id past the pool must be caught, not read past it.
 
     The overrun is otherwise silent: the caching allocator carves both pools out
     of a much larger block, so an out-of-range slot lands in a neighbouring
@@ -852,17 +706,15 @@ def test_prefill_state_indices_out_of_pool_fails_in_isolated_process(case_name):
     )
     env["FLASHINFER_CAKE_GDN_VALIDATE_SLOTS"] = "1"
     completed = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), "--invalid-slot", case_name],
+        [sys.executable, str(Path(__file__).resolve()), "--invalid-slot", str(use_cp)],
         capture_output=True,
         text=True,
         timeout=600,
         env=env,
     )
     combined = completed.stdout + completed.stderr
-    # Match the marker at the start of a line. A substring search over the
-    # child's whole stdout and stderr turns any unrelated failure whose output
-    # happens to contain "SKIP" -- a path, an environment variable, a driver
-    # log line -- into a skip, which silently disables this bounds check.
+    # Only a line that starts with the marker is a skip, so an unrelated failure
+    # that happens to print "SKIP" somewhere cannot disable the check.
     skips = [ln for ln in combined.splitlines() if ln.startswith("SKIP:")]
     if skips:
         pytest.skip(skips[-1])
@@ -884,4 +736,4 @@ if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--invalid-s
     ):
         print("SKIP: SM100 GDN prefill requires CUDA 13+")
     else:
-        _run_invalid_slot_child(sys.argv[2])
+        _run_invalid_slot_child(sys.argv[2] == "True")

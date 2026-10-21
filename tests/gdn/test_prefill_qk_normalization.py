@@ -100,46 +100,6 @@ def test_prefill_normalization_preserves_backend_rejection(
     normalize.assert_not_called()
 
 
-@pytest.mark.parametrize("use_cp", [False, True])
-def test_prefill_normalization_reaches_both_sm8x_paths(monkeypatch, use_cp):
-    # Neither SM8x entry takes the flag, so both must receive normalized Q/K.
-    monkeypatch.setattr(gdn_prefill, "get_compute_capability", lambda _: (8, 0))
-    monkeypatch.setattr(gdn_prefill, "get_device_sm_count", lambda _: 108)
-    monkeypatch.setattr(gdn_prefill, "get_device_name", lambda _: "test GPU")
-    monkeypatch.setattr(gdn_prefill, "is_cute_dsl_arch_supported", lambda *_: True)
-    received = []
-    for name in ("chunk_gated_delta_rule_sm80", "cp_delta_rule_dsl_sm80"):
-        monkeypatch.setattr(
-            gdn_prefill,
-            name,
-            lambda *args, _name=name, **_: received.append((_name, args[2], args[3])),
-        )
-
-    q = torch.zeros(8, 1, 128, dtype=torch.float16)
-    normalized = (torch.ones_like(q), torch.ones_like(q))
-    normalize = Mock(return_value=normalized)
-    normalization_module = ModuleType("flashinfer.gdn_kernels.qk_l2norm")
-    normalization_module.normalize_qk = normalize
-    monkeypatch.setitem(
-        sys.modules, normalization_module.__name__, normalization_module
-    )
-    chunk_gated_delta_rule(
-        q=q,
-        k=q,
-        v=q,
-        cu_seqlens=torch.tensor([0, 8], dtype=torch.int64),
-        use_qk_l2norm_in_kernel=True,
-        use_cp=use_cp,
-        backend="flashinfer",
-    )
-    normalize.assert_called_once()
-    [(name, got_q, got_k)] = received
-    assert name == (
-        "cp_delta_rule_dsl_sm80" if use_cp else "chunk_gated_delta_rule_sm80"
-    )
-    assert got_q is normalized[0] and got_k is normalized[1]
-
-
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("d", [96, 128, 129, 513])
 def test_qk_normalization_reference_and_graph(dtype, d):

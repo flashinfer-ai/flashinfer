@@ -70,6 +70,7 @@ from .delta_rule_sm80 import THREADS_PER_WARP_GROUP as _FUSED_WG_THREADS
 from .delta_rule_sm80 import _BLK_V as _FUSED_BLK_V
 from .delta_rule_sm80 import _FullyFusedDeltaRuleSm80
 from .delta_rule_sm80 import _check_load_alignment
+from .delta_rule_sm80 import _check_state_dtype_supported
 from .helpers import (
     SM80,
     load_tensor_as_a,
@@ -198,8 +199,7 @@ class _CPInvocation:
             raise RuntimeError(
                 f"the pointer entry promises {align}-byte alignment for "
                 f"{name}, and its data_ptr() is {addr % align} bytes past it; "
-                f"pass an aligned buffer or use the tensor entry, which lets "
-                f"the DSL derive the alignment"
+                "pass an aligned buffer"
             )
         key = (addr, dtype, align)
         got = self._ptrs.get(key)
@@ -214,8 +214,8 @@ class _CPInvocation:
 def _ptr_factory(_ctx, device, _stream, promises):
     """How the pointer entries make their pointers, with or without a context.
 
-    Standalone: `_check_ptr_abi` up front, exactly as before -- the alignment
-    promises and the current-stream rule, neither behind `_skip_check`.
+    Standalone: `_check_ptr_abi` up front -- the alignment promises and the
+    current-stream rule, neither behind `_skip_check`.
 
     Inside a composition: the context checks each promise where the pointer is
     made, and reuses one wrapper per distinct `(address, dtype, alignment)`.
@@ -228,10 +228,7 @@ def _ptr_factory(_ctx, device, _stream, promises):
     _check_ptr_abi(device, _stream, *promises)
 
     def mk(dtype, tensor, align, name):
-        """Make one gmem pointer for a tensor, at the alignment the layout claims.
-
-        Closed over the context so repeated entries share one checked pointer
-        per (address, dtype, alignment) instead of rebuilding it per stage."""
+        """Make one gmem pointer for a tensor, at the alignment the layout claims."""
         return cute.runtime.make_ptr(
             dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=align
         )
@@ -261,8 +258,7 @@ def _check_ptr_abi(device, stream, *promises):
             raise RuntimeError(
                 f"the pointer entry promises {want}-byte alignment for {name}, "
                 f"and its data_ptr() is {addr % want} bytes past it; pass an "
-                f"aligned buffer or use the tensor entry, which lets the DSL "
-                f"derive the alignment"
+                "aligned buffer"
             )
     if stream is None:
         return
@@ -303,9 +299,8 @@ def _resolve_stream(_ctx, device, _stream):
 def _compile_and_launch(kernel, args, compile_options):
     """Compile once per (kernel, options), then launch.
 
-    Only the pointer entries take this path. Their compile-time and run-time
-    arguments are the same tuple, where a tensor entry has to build DLPack
-    views for the compile and pass the tensors themselves to the call.
+    The compile-time and run-time arguments are the same tuple of pointers
+    and extents.
     """
     compiled = get_cached_compile(kernel, compile_options)
     if compiled is None:
@@ -1486,11 +1481,6 @@ class CPDeltaRuleTPrecomputePtrSm80(CPDeltaRuleTPrecomputeSm80):
     buffer and the extents that are not compile-time constants -- and rebuilds
     the same layouts inside the JIT, where they cost nothing. The kernel body
     is inherited unchanged; only the way its arguments arrive differs.
-
-    A separate class rather than a flag, so the two entries cannot share a
-    compile-cache entry: `manual_cache_key` puts `type(self).__mro__` in the
-    key, and a flag named only in a base class's call is invisible to a
-    subclass that calls it again.
     """
 
     @cute.jit
@@ -1508,7 +1498,7 @@ class CPDeltaRuleTPrecomputePtrSm80(CPDeltaRuleTPrecomputeSm80):
         num_seqs: cutlass.Int32,
         stream,
     ):
-        # The same three views the tensor entry is handed, rebuilt here.
+        # The three views the base `__call__` takes, built here.
         # `k` arrives as (D, token, head) over the caller's (token, head, D)
         # storage: D contiguous is what the 128-bit cp.async needs on its fast
         # axis, and it is a view, not a copy.
@@ -1542,11 +1532,8 @@ class CPDeltaRuleTPrecomputePtrSm80(CPDeltaRuleTPrecomputeSm80):
 
 
 @functools.cache
-def _get_t_precompute_kernel(kernel_dtype, cu_seqlens_dtype, ptr_abi):
-    """`ptr_abi` picks the pointer twin. Same specialization axes either way,
-    and the flag is part of the cache key, so the two never share a build."""
-    cls = CPDeltaRuleTPrecomputePtrSm80 if ptr_abi else CPDeltaRuleTPrecomputeSm80
-    return cls(
+def _get_t_precompute_kernel(kernel_dtype, cu_seqlens_dtype):
+    return CPDeltaRuleTPrecomputePtrSm80(
         kernel_dtype, cu_seqlens_dtype=integer_dtype_to_cutlass(cu_seqlens_dtype)
     )
 
@@ -1558,18 +1545,10 @@ def cp_delta_rule_t_precompute_dsl_sm80(
     total_seqlen: int,
     max_seqlen: int | None = None,
     *,
-    # Opt-in, and off by default until the four entries have all moved: this
-    # entry's arguments arrive as pointers and extents rather than as tensors.
-    _ptr_abi: bool = False,
     # One composition call's shared state, or None for a standalone
     # call. Never built here: see `_CPInvocation`.
     _ctx: "_CPInvocation | None" = None,
     _skip_check: bool = False,
-    # When given, the arguments this entry would hand the compiled kernel
-    # are appended to it and nothing is launched. That is how a prepared
-    # execution is built: explicitly, at this layer, rather than by patching
-    # the DSL's own classes from outside. The tuple is (compiled, args), and
-    # the caller owns whatever it keeps alive.
     _device=None,
     _stream=None,
 ):
@@ -1643,10 +1622,6 @@ def cp_delta_rule_t_precompute_dsl_sm80(
     if total_t_blocks == 0:
         return t
 
-    # (D, token, head) over the same storage: d is contiguous, which is what the
-    # 128-bit cp.async needs on its fast axis.
-    k_dhs = k.as_strided((d, total_seqlen, num_k_heads), (1, num_k_heads * d, d))
-
     kernel_dtype = {
         torch.float16: cutlass.Float16,
         torch.bfloat16: cutlass.BFloat16,
@@ -1655,68 +1630,36 @@ def cp_delta_rule_t_precompute_dsl_sm80(
     compile_options = (
         _ctx.compile_options if _ctx is not None else _sm80_cp_compile_options(device)
     )
-    if _ptr_abi:
-        # Pointers and extents instead of tensors. The kernel body is the same
-        # one; only the argument conversion the DSL does per call is gone. See
-        # `CPDeltaRuleTPrecomputePtrSm80`.
-        #
-        mk = _ptr_factory(
-            _ctx,
-            device,
-            _stream,
-            (
-                ("k", k, 16),
-                ("beta", beta, 16),
-                ("cu_seqlens", cu_seqlens, 8),
-                ("t", t, 128),
-            ),
-        )
-        kernel = _get_t_precompute_kernel(kernel_dtype, cu_seqlens.dtype, True)
-        args = (
-            mk(kernel_dtype, k, 16, "k"),
-            mk(cutlass.Float32, beta, 16, "beta"),
-            mk(kernel_dtype, t, 128, "t"),
-            mk(integer_dtype_to_cutlass(cu_seqlens.dtype), cu_seqlens, 8, "cu_seqlens"),
-            cutlass.Int32(total_seqlen),
-            cutlass.Int32(num_k_heads),
-            cutlass.Int32(num_sab_heads),
-            cutlass.Int32(total_t_blocks),
-            cutlass.Int32(max_t_blocks_per_seq),
-            cutlass.Int32(num_seqs),
-            stream,
-        )
-        _compile_and_launch(kernel, args, compile_options)
-        return t
-    kernel = _get_t_precompute_kernel(kernel_dtype, cu_seqlens.dtype, False)
-    compiled = get_cached_compile(kernel, compile_options)
-    if compiled is None:
-        from_dlpack = cute.runtime.from_dlpack
-        kernel_args = (
-            from_dlpack(k_dhs, assumed_align=16).mark_layout_dynamic(leading_dim=0),
-            from_dlpack(beta.reshape(-1), assumed_align=16).mark_layout_dynamic(),
-            from_dlpack(t.view(-1), assumed_align=128).mark_layout_dynamic(),
-            from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
-            cutlass.Int32(num_k_heads),
-            cutlass.Int32(num_sab_heads),
-            cutlass.Int32(total_t_blocks),
-            cutlass.Int32(max_t_blocks_per_seq),
-            cutlass.Int32(num_seqs),
-            stream,
-        )
-        compiled = cached_compile(kernel, *kernel_args, compile_options=compile_options)
-    call_args = (
-        k_dhs,
-        beta.reshape(-1),
-        t.view(-1),
-        cu_seqlens,
-        num_k_heads,
-        num_sab_heads,
-        total_t_blocks,
-        max_t_blocks_per_seq,
-        num_seqs,
+    # Pointers and extents instead of tensors. The kernel body is the same
+    # one; only the argument conversion the DSL does per call is gone. See
+    # `CPDeltaRuleTPrecomputePtrSm80`.
+    #
+    mk = _ptr_factory(
+        _ctx,
+        device,
+        _stream,
+        (
+            ("k", k, 16),
+            ("beta", beta, 16),
+            ("cu_seqlens", cu_seqlens, 8),
+            ("t", t, 128),
+        ),
+    )
+    kernel = _get_t_precompute_kernel(kernel_dtype, cu_seqlens.dtype)
+    args = (
+        mk(kernel_dtype, k, 16, "k"),
+        mk(cutlass.Float32, beta, 16, "beta"),
+        mk(kernel_dtype, t, 128, "t"),
+        mk(integer_dtype_to_cutlass(cu_seqlens.dtype), cu_seqlens, 8, "cu_seqlens"),
+        cutlass.Int32(total_seqlen),
+        cutlass.Int32(num_k_heads),
+        cutlass.Int32(num_sab_heads),
+        cutlass.Int32(total_t_blocks),
+        cutlass.Int32(max_t_blocks_per_seq),
+        cutlass.Int32(num_seqs),
         stream,
     )
-    compiled(*call_args)
+    _compile_and_launch(kernel, args, compile_options)
     return t
 
 
@@ -1750,9 +1693,8 @@ class CPDeltaRuleMNPrecomputePtrSm80(CPDeltaRuleMNPrecomputeSm80):
         num_seqs: cutlass.Int32,
         stream,
     ):
-        # (D, token, head) over the caller's (token, head, D) storage, as the
-        # tensor entry builds with `as_strided`: D contiguous is what the
-        # 128-bit cp.async needs on its fast axis.
+        # (D, token, head) over the caller's (token, head, D) storage: D
+        # contiguous is what the 128-bit cp.async needs on its fast axis.
         g_k = cute.make_tensor(
             k_ptr,
             cute.make_layout(
@@ -1798,11 +1740,8 @@ class CPDeltaRuleMNPrecomputePtrSm80(CPDeltaRuleMNPrecomputeSm80):
 
 
 @functools.cache
-def _get_mn_precompute_kernel(kernel_dtype, cu_seqlens_dtype, ptr_abi):
-    """`ptr_abi` picks the pointer twin. Same specialization axes either way,
-    and the flag is part of the cache key, so the two never share a build."""
-    cls = CPDeltaRuleMNPrecomputePtrSm80 if ptr_abi else CPDeltaRuleMNPrecomputeSm80
-    return cls(
+def _get_mn_precompute_kernel(kernel_dtype, cu_seqlens_dtype):
+    return CPDeltaRuleMNPrecomputePtrSm80(
         kernel_dtype, cu_seqlens_dtype=integer_dtype_to_cutlass(cu_seqlens_dtype)
     )
 
@@ -1817,17 +1756,10 @@ def cp_delta_rule_mn_precompute_dsl_sm80(
     cp_chunk_len: int = 4096,
     max_seqlen: int | None = None,
     *,
-    # Opt-in; see `CPDeltaRuleMNPrecomputePtrSm80`.
-    _ptr_abi: bool = False,
     # One composition call's shared state, or None for a standalone
     # call. Never built here: see `_CPInvocation`.
     _ctx: "_CPInvocation | None" = None,
     _skip_check: bool = False,
-    # When given, the arguments this entry would hand the compiled kernel
-    # are appended to it and nothing is launched. That is how a prepared
-    # execution is built: explicitly, at this layer, rather than by patching
-    # the DSL's own classes from outside. The tuple is (compiled, args), and
-    # the caller owns whatever it keeps alive.
     _device=None,
     _stream=None,
 ):
@@ -1918,11 +1850,6 @@ def cp_delta_rule_mn_precompute_dsl_sm80(
     if total_cp_chunks == 0:
         return transfer_VK, state_VK
 
-    # (D, token, head): d contiguous, which is what the 128-bit cp.async needs
-    # on its fast axis.
-    k_dhs = k.as_strided((d, total_seqlen, num_k_heads), (1, num_k_heads * d, d))
-    v_dhs = v.as_strided((d, total_seqlen, num_v_heads), (1, num_v_heads * d, d))
-
     kernel_dtype = {
         torch.float16: cutlass.Float16,
         torch.bfloat16: cutlass.BFloat16,
@@ -1931,85 +1858,41 @@ def cp_delta_rule_mn_precompute_dsl_sm80(
     compile_options = (
         _ctx.compile_options if _ctx is not None else _sm80_cp_compile_options(device)
     )
-    if _ptr_abi:
-        mk = _ptr_factory(
-            _ctx,
-            device,
-            _stream,
-            (
-                ("k", k, 16),
-                ("v", v, 16),
-                ("alpha", alpha, 16),
-                ("t", t, 16),
-                ("transfer_VK", transfer_VK, 16),
-                ("state_VK", state_VK, 16),
-                ("cu_seqlens", cu_seqlens, 8),
-            ),
-        )
-        kernel = _get_mn_precompute_kernel(kernel_dtype, cu_seqlens.dtype, True)
-        args = (
-            mk(kernel_dtype, k, 16, "k"),
-            mk(kernel_dtype, v, 16, "v"),
-            mk(kernel_dtype, t, 16, "t"),
-            mk(cutlass.Float32, alpha, 16, "alpha"),
-            mk(cutlass.Float32, transfer_VK, 16, "transfer_VK"),
-            mk(cutlass.Float32, state_VK, 16, "state_VK"),
-            mk(integer_dtype_to_cutlass(cu_seqlens.dtype), cu_seqlens, 8, "cu_seqlens"),
-            cutlass.Int32(total_seqlen),
-            cutlass.Int32(cp_chunk_len),
-            cutlass.Int32(num_k_heads),
-            cutlass.Int32(num_v_heads),
-            cutlass.Int32(num_sab_heads),
-            cutlass.Int32(total_cp_chunks),
-            cutlass.Int32(total_t_blocks),
-            cutlass.Int32(max_cp_chunks_per_seq),
-            cutlass.Int32(num_seqs),
-            stream,
-        )
-        _compile_and_launch(kernel, args, compile_options)
-        return transfer_VK, state_VK
-    kernel = _get_mn_precompute_kernel(kernel_dtype, cu_seqlens.dtype, False)
-    compiled = get_cached_compile(kernel, compile_options)
-    if compiled is None:
-        from_dlpack = cute.runtime.from_dlpack
-        kernel_args = (
-            from_dlpack(k_dhs, assumed_align=16).mark_layout_dynamic(leading_dim=0),
-            from_dlpack(v_dhs, assumed_align=16).mark_layout_dynamic(leading_dim=0),
-            from_dlpack(t.view(-1), assumed_align=16).mark_layout_dynamic(),
-            from_dlpack(alpha.view(-1), assumed_align=16).mark_layout_dynamic(),
-            from_dlpack(transfer_VK.view(-1), assumed_align=16).mark_layout_dynamic(),
-            from_dlpack(state_VK.view(-1), assumed_align=16).mark_layout_dynamic(),
-            from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
-            cutlass.Int32(cp_chunk_len),
-            cutlass.Int32(num_k_heads),
-            cutlass.Int32(num_v_heads),
-            cutlass.Int32(num_sab_heads),
-            cutlass.Int32(total_cp_chunks),
-            cutlass.Int32(total_t_blocks),
-            cutlass.Int32(max_cp_chunks_per_seq),
-            cutlass.Int32(num_seqs),
-            stream,
-        )
-        compiled = cached_compile(kernel, *kernel_args, compile_options=compile_options)
-    call_args = (
-        k_dhs,
-        v_dhs,
-        t.view(-1),
-        alpha.view(-1),
-        transfer_VK.view(-1),
-        state_VK.view(-1),
-        cu_seqlens,
-        cp_chunk_len,
-        num_k_heads,
-        num_v_heads,
-        num_sab_heads,
-        total_cp_chunks,
-        total_t_blocks,
-        max_cp_chunks_per_seq,
-        num_seqs,
+    mk = _ptr_factory(
+        _ctx,
+        device,
+        _stream,
+        (
+            ("k", k, 16),
+            ("v", v, 16),
+            ("alpha", alpha, 16),
+            ("t", t, 16),
+            ("transfer_VK", transfer_VK, 16),
+            ("state_VK", state_VK, 16),
+            ("cu_seqlens", cu_seqlens, 8),
+        ),
+    )
+    kernel = _get_mn_precompute_kernel(kernel_dtype, cu_seqlens.dtype)
+    args = (
+        mk(kernel_dtype, k, 16, "k"),
+        mk(kernel_dtype, v, 16, "v"),
+        mk(kernel_dtype, t, 16, "t"),
+        mk(cutlass.Float32, alpha, 16, "alpha"),
+        mk(cutlass.Float32, transfer_VK, 16, "transfer_VK"),
+        mk(cutlass.Float32, state_VK, 16, "state_VK"),
+        mk(integer_dtype_to_cutlass(cu_seqlens.dtype), cu_seqlens, 8, "cu_seqlens"),
+        cutlass.Int32(total_seqlen),
+        cutlass.Int32(cp_chunk_len),
+        cutlass.Int32(num_k_heads),
+        cutlass.Int32(num_v_heads),
+        cutlass.Int32(num_sab_heads),
+        cutlass.Int32(total_cp_chunks),
+        cutlass.Int32(total_t_blocks),
+        cutlass.Int32(max_cp_chunks_per_seq),
+        cutlass.Int32(num_seqs),
         stream,
     )
-    compiled(*call_args)
+    _compile_and_launch(kernel, args, compile_options)
     return transfer_VK, state_VK
 
 
@@ -2390,7 +2273,7 @@ class CPDeltaRuleFixupSimtSm80(KeyedCompileMixin):
 class CPDeltaRuleFixupPtrSm80(CPDeltaRuleFixupSimtSm80):
     """The SIMT fixup, entered through pointers instead of tensors.
 
-    Every compile-time specialization the tensor entry has is kept on the
+    Every compile-time specialization of the base kernel is kept on the
     instance -- `needs_initial_state`, `use_state_indices`,
     `initial_state_dtype`, `initial_state_inner_strides`, `rows_per_cta`, the
     index dtypes -- so nothing here is a runtime branch on a nullable pointer.
@@ -2410,8 +2293,8 @@ class CPDeltaRuleFixupPtrSm80(CPDeltaRuleFixupSimtSm80):
       `initial_state` is the only one whose *layout* is read: `shape[0]`,
       `shape[1]` and `stride`, because the pool is the caller's and its rows
       are addressed through `state_indices`. Those arrive as scalars, with the
-      inner strides taken from the specialization when it fixes them, so the
-      layout is as static here as it is on the tensor path.
+      inner strides taken from the specialization when it fixes them, so that
+      layout stays static.
     """
 
     @cute.jit
@@ -2483,36 +2366,6 @@ class CPDeltaRuleFixupPtrSm80(CPDeltaRuleFixupSimtSm80):
 
 
 @functools.cache
-def _get_fixup_ptr_kernel(
-    needs_initial_state,
-    initial_state_dtype,
-    kernel_kind,
-    use_state_indices,
-    cu_seqlens_dtype,
-    state_indices_dtype,
-    initial_state_inner_strides,
-):
-    """The pointer twin of `_get_fixup_kernel`, with the same specializations."""
-    if kernel_kind not in ("simt_row4", "simt_row8"):
-        raise ValueError(
-            f"the SM80 CP fixup builds simt_row4 and simt_row8, got {kernel_kind}"
-        )
-    return CPDeltaRuleFixupPtrSm80(
-        needs_initial_state=needs_initial_state,
-        initial_state_dtype=state_dtype_to_cutlass(initial_state_dtype),
-        rows_per_cta=4 if kernel_kind == "simt_row4" else 8,
-        use_state_indices=use_state_indices,
-        cu_seqlens_dtype=integer_dtype_to_cutlass(cu_seqlens_dtype),
-        state_indices_dtype=(
-            integer_dtype_to_cutlass(state_indices_dtype)
-            if state_indices_dtype is not None
-            else None
-        ),
-        initial_state_inner_strides=initial_state_inner_strides,
-    )
-
-
-@functools.cache
 def _get_fixup_kernel(
     needs_initial_state,
     initial_state_dtype,
@@ -2532,13 +2385,17 @@ def _get_fixup_kernel(
         raise ValueError(
             f"the SM80 CP fixup builds simt_row4 and simt_row8, got {kernel_kind}"
         )
-    return CPDeltaRuleFixupSimtSm80(
+    return CPDeltaRuleFixupPtrSm80(
         needs_initial_state=needs_initial_state,
         initial_state_dtype=state_dtype_to_cutlass(initial_state_dtype),
         rows_per_cta=4 if kernel_kind == "simt_row4" else 8,
         use_state_indices=use_state_indices,
-        cu_seqlens_dtype=cu_seqlens_dtype,
-        state_indices_dtype=state_indices_dtype,
+        cu_seqlens_dtype=integer_dtype_to_cutlass(cu_seqlens_dtype),
+        state_indices_dtype=(
+            integer_dtype_to_cutlass(state_indices_dtype)
+            if state_indices_dtype is not None
+            else None
+        ),
         initial_state_inner_strides=initial_state_inner_strides,
     )
 
@@ -2552,17 +2409,10 @@ def cp_delta_rule_fixup_dsl_sm80(
     initial_state: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
     *,
-    # Opt-in; see `CPDeltaRuleFixupPtrSm80`.
-    _ptr_abi: bool = False,
     # One composition call's shared state, or None for a standalone
     # call. Never built here: see `_CPInvocation`.
     _ctx: "_CPInvocation | None" = None,
     _skip_check: bool = False,
-    # When given, the arguments this entry would hand the compiled kernel
-    # are appended to it and nothing is launched. That is how a prepared
-    # execution is built: explicitly, at this layer, rather than by patching
-    # the DSL's own classes from outside. The tuple is (compiled, args), and
-    # the caller owns whatever it keeps alive.
     _kernel_kind: str | None = None,
     _device=None,
     _stream=None,
@@ -2662,15 +2512,6 @@ def cp_delta_rule_fixup_dsl_sm80(
         return fixed_state
 
     stream = _resolve_stream(_ctx, device, _stream)
-    d = local_transfer.shape[-1]
-    local_transfer_tma = local_transfer.as_strided(
-        (d, d, num_heads, total_cp_chunks),
-        (d, 1, d * d, num_heads * d * d),
-    )
-    local_state_tma = local_state.as_strided(
-        (d, d, num_heads, total_cp_chunks),
-        (d, 1, d * d, num_heads * d * d),
-    )
 
     needs_initial_state = initial_state is not None
     use_state_indices = state_indices is not None
@@ -2694,128 +2535,63 @@ def cp_delta_rule_fixup_dsl_sm80(
             else None
         ),
     )
-    if _ptr_abi:
-        mk = _ptr_factory(
-            _ctx,
-            device,
-            _stream,
+    mk = _ptr_factory(
+        _ctx,
+        device,
+        _stream,
+        (
+            ("local_transfer", local_transfer, 128),
+            ("local_state", local_state, 128),
+            ("fixed_state", fixed_state, 128),
+            ("cu_seqlens", cu_seqlens, 8),
+            ("initial_state", initial_state, 16),
             (
-                ("local_transfer", local_transfer, 128),
-                ("local_state", local_state, 128),
-                ("fixed_state", fixed_state, 128),
-                ("cu_seqlens", cu_seqlens, 8),
-                ("initial_state", initial_state, 16),
-                (
-                    "state_indices",
-                    state_indices,
-                    state_indices.element_size() if use_state_indices else 1,
-                ),
-            ),
-        )
-        kernel = _get_fixup_ptr_kernel(*spec)
-        state_cutlass = state_dtype_to_cutlass(
-            initial_state.dtype if needs_initial_state else torch.float32
-        )
-        # Inactive optional slots still get a valid address -- the workspace's
-        # -- and the kernel only reads them under `const_expr`.
-        placeholder = local_transfer
-        args = (
-            mk(cutlass.Float32, local_transfer, 128, "local_transfer"),
-            mk(cutlass.Float32, local_state, 128, "local_state"),
-            mk(
-                state_cutlass,
-                initial_state if needs_initial_state else placeholder,
-                16,
-                "initial_state",
-            ),
-            mk(
-                integer_dtype_to_cutlass(
-                    state_indices.dtype if use_state_indices else torch.int32
-                ),
-                state_indices if use_state_indices else placeholder,
-                4,
                 "state_indices",
+                state_indices,
+                state_indices.element_size() if use_state_indices else 1,
             ),
-            mk(cutlass.Float32, fixed_state, 128, "fixed_state"),
-            mk(integer_dtype_to_cutlass(cu_seqlens.dtype), cu_seqlens, 8, "cu_seqlens"),
-            cutlass.Int32(initial_state.shape[0] if needs_initial_state else 1),
-            cutlass.Int32(initial_state.shape[1] if needs_initial_state else 1),
-            cutlass.Int32(initial_state.stride(0) if needs_initial_state else 1),
-            cutlass.Int32(initial_state.stride(1) if needs_initial_state else 1),
-            cutlass.Int32(cp_chunk_len),
-            cutlass.Int32(total_cp_chunks),
-            cutlass.Int32(num_seqs),
-            cutlass.Int32(num_heads),
-            stream,
-        )
-        opts = (
-            _ctx.compile_options
-            if _ctx is not None
-            else _sm80_cp_compile_options(device)
-        )
-        _compile_and_launch(kernel, args, opts)
-        return fixed_state
-    kernel = _get_fixup_kernel(*spec)
-    compiled = get_cached_compile(
-        kernel,
-        _ctx.compile_options if _ctx is not None else _sm80_cp_compile_options(device),
+        ),
     )
-    if compiled is None:
-        from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
-            *args, **{**kwargs, "enable_tvm_ffi": True}
-        )
-        initial_state_cute = (
-            from_dlpack(initial_state, assumed_align=16).mark_layout_dynamic()
-            if needs_initial_state
-            else None
-        )
-        state_indices_cute = (
-            from_dlpack(state_indices, assumed_align=4).mark_layout_dynamic()
-            if use_state_indices
-            else None
-        )
-        kernel_args = (
-            from_dlpack(local_transfer_tma, assumed_align=128).mark_layout_dynamic(
-                leading_dim=1
+    kernel = _get_fixup_kernel(*spec)
+    state_cutlass = state_dtype_to_cutlass(
+        initial_state.dtype if needs_initial_state else torch.float32
+    )
+    # Inactive optional slots still get a valid address -- the workspace's
+    # -- and the kernel only reads them under `const_expr`.
+    placeholder = local_transfer
+    args = (
+        mk(cutlass.Float32, local_transfer, 128, "local_transfer"),
+        mk(cutlass.Float32, local_state, 128, "local_state"),
+        mk(
+            state_cutlass,
+            initial_state if needs_initial_state else placeholder,
+            16,
+            "initial_state",
+        ),
+        mk(
+            integer_dtype_to_cutlass(
+                state_indices.dtype if use_state_indices else torch.int32
             ),
-            from_dlpack(local_state_tma, assumed_align=128).mark_layout_dynamic(
-                leading_dim=1
-            ),
-            initial_state_cute,
-            state_indices_cute,
-            from_dlpack(
-                fixed_state.reshape(-1), assumed_align=128
-            ).mark_layout_dynamic(),
-            from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
-            cutlass.Int32(cp_chunk_len),
-            cutlass.Int32(total_cp_chunks),
-            cutlass.Int32(num_seqs),
-            cutlass.Int32(num_heads),
-            stream,
-        )
-        compiled = cached_compile(
-            kernel,
-            *kernel_args,
-            compile_options=(
-                _ctx.compile_options
-                if _ctx is not None
-                else _sm80_cp_compile_options(device)
-            ),
-        )
-    call_args = (
-        local_transfer_tma,
-        local_state_tma,
-        initial_state if needs_initial_state else None,
-        state_indices if use_state_indices else None,
-        fixed_state.reshape(-1),
-        cu_seqlens,
-        cp_chunk_len,
-        total_cp_chunks,
-        num_seqs,
-        num_heads,
+            state_indices if use_state_indices else placeholder,
+            4,
+            "state_indices",
+        ),
+        mk(cutlass.Float32, fixed_state, 128, "fixed_state"),
+        mk(integer_dtype_to_cutlass(cu_seqlens.dtype), cu_seqlens, 8, "cu_seqlens"),
+        cutlass.Int32(initial_state.shape[0] if needs_initial_state else 1),
+        cutlass.Int32(initial_state.shape[1] if needs_initial_state else 1),
+        cutlass.Int32(initial_state.stride(0) if needs_initial_state else 1),
+        cutlass.Int32(initial_state.stride(1) if needs_initial_state else 1),
+        cutlass.Int32(cp_chunk_len),
+        cutlass.Int32(total_cp_chunks),
+        cutlass.Int32(num_seqs),
+        cutlass.Int32(num_heads),
         stream,
     )
-    compiled(*call_args)
+    opts = (
+        _ctx.compile_options if _ctx is not None else _sm80_cp_compile_options(device)
+    )
+    _compile_and_launch(kernel, args, opts)
     return fixed_state
 
 
@@ -4142,8 +3918,7 @@ class CPDeltaRulePrefillPtrSm80(CPDeltaRulePrefillSm80):
     What has to arrive is decided by what the kernel body reads:
 
       q, k, v, o and t are used through their layouts, so the extents and the
-      strides of the `as_strided` views the tensor entry builds are rebuilt
-      here, with the same leading dimensions;
+      strides of the views the base `__call__` takes are built here;
 
       `state` and `initial_state` are the two whose *pool* shape and stride
       the body reads -- separately, because they need not be the same tensor
@@ -4153,7 +3928,7 @@ class CPDeltaRulePrefillPtrSm80(CPDeltaRulePrefillSm80):
       alpha, fixed_state, checkpoints, checkpoint starts and cu_seqlens are
       flat or read for their iterator, so a pointer and an extent suffice.
 
-    `store_final_state=False` keeps the tensor entry's contract that
+    `store_final_state=False` keeps the base kernel's contract that
     `state_arg` aliases `fixed_state`: the same pointer is passed, and the body
     never addresses it, because `gStateKV` is only built under
     `const_expr(self.store_final_state)`.
@@ -4201,9 +3976,8 @@ class CPDeltaRulePrefillPtrSm80(CPDeltaRulePrefillSm80):
     ):
         D = cutlass.const_expr(self.D)
         one = cute.make_layout(1)
-        # The five `as_strided` views the tensor entry builds, with the same
-        # leading dimension in each: q is (token, d, head) with d contiguous
-        # on mode 1, the rest put d on mode 0.
+        # The five views the base `__call__` takes: q is (token, d, head)
+        # with d contiguous on mode 1, the rest put d on mode 0.
         g_q = cute.make_tensor(
             q_ptr,
             cute.make_layout(
@@ -4261,7 +4035,7 @@ class CPDeltaRulePrefillPtrSm80(CPDeltaRulePrefillSm80):
                 cute.make_layout((state_rows, state_heads, D, D), stride=strides),
             )
         else:
-            # Aliases `fixed_state`, as on the tensor path, and is never
+            # Aliases `fixed_state` and is never
             # addressed: `gStateKV` is built only under `store_final_state`.
             g_state = cute.make_tensor(state_ptr, one)
         if cutlass.const_expr(self.needs_init_state and self.needs_initial_state):
@@ -4339,12 +4113,8 @@ def _get_prefill_kernel(
     checkpoint_cu_starts_dtype,
     state_inner_strides,
     initial_state_inner_strides,
-    ptr_abi,
 ):
-    """`ptr_abi` picks the pointer twin. The thirteen specialization axes are
-    the same for both, and the flag is part of the cache key."""
-    cls = CPDeltaRulePrefillPtrSm80 if ptr_abi else CPDeltaRulePrefillSm80
-    return cls(
+    return CPDeltaRulePrefillPtrSm80(
         kernel_dtype,
         needs_initial_state=needs_initial_state,
         store_final_state=store_final_state,
@@ -4381,17 +4151,10 @@ def cp_delta_rule_prefill_dsl_sm80(
     checkpoint_cu_starts: torch.Tensor | None = None,
     checkpoint_every_n_tokens: int = 0,
     *,
-    # Opt-in; see `CPDeltaRulePrefillPtrSm80`.
-    _ptr_abi: bool = False,
     # One composition call's shared state, or None for a standalone
     # call. Never built here: see `_CPInvocation`.
     _ctx: "_CPInvocation | None" = None,
     _skip_check: bool = False,
-    # When given, the arguments this entry would hand the compiled kernel
-    # are appended to it and nothing is launched. That is how a prepared
-    # execution is built: explicitly, at this layer, rather than by patching
-    # the DSL's own classes from outside. The tuple is (compiled, args), and
-    # the caller owns whatever it keeps alive.
     _device=None,
     _stream=None,
 ):
@@ -4597,31 +4360,6 @@ def cp_delta_rule_prefill_dsl_sm80(
     )
     if total_cp_chunks == 0:
         return
-    q_tma = q.as_strided(
-        (total_seqlen, d, num_q_heads),
-        (num_q_heads * d, 1, d),
-    )
-    k_tma = k.as_strided(
-        (d, total_seqlen, num_k_heads),
-        (1, num_k_heads * d, d),
-    )
-    v_tma = v.as_strided(
-        (d, total_seqlen, num_v_heads),
-        (1, num_v_heads * d, d),
-    )
-    o_tma = o.as_strided(
-        (d, total_seqlen, num_sab_heads),
-        (1, num_sab_heads * d, d),
-    )
-    t_tma = t.as_strided(
-        (64, 64, num_sab_heads, total_t_blocks),
-        (
-            64,
-            1,
-            64 * 64,
-            num_sab_heads * 64 * 64,
-        ),
-    )
 
     kernel_dtype = {
         torch.float16: cutlass.Float16,
@@ -4662,222 +4400,119 @@ def cp_delta_rule_prefill_dsl_sm80(
         ),
     )
     state_arg = state if store_final_state else fixed_state
-    if _ptr_abi:
-        mk = _ptr_factory(
-            _ctx,
-            device,
-            _stream,
+    mk = _ptr_factory(
+        _ctx,
+        device,
+        _stream,
+        (
+            ("q", q, 16),
+            ("k", k, 16),
+            ("v", v, 16),
+            ("o", o, 16),
+            ("t", t, 16),
+            ("alpha", alpha, 16),
+            ("state_arg", state_arg, 16),
+            ("fixed_state", fixed_state, 16),
+            ("cu_seqlens", cu_seqlens, 8),
+            ("initial_state", initial_state if needs_initial_state else None, 16),
             (
-                ("q", q, 16),
-                ("k", k, 16),
-                ("v", v, 16),
-                ("o", o, 16),
-                ("t", t, 16),
-                ("alpha", alpha, 16),
-                ("state_arg", state_arg, 16),
-                ("fixed_state", fixed_state, 16),
-                ("cu_seqlens", cu_seqlens, 8),
-                ("initial_state", initial_state if needs_initial_state else None, 16),
-                (
-                    "state_indices",
-                    state_indices if use_state_indices else None,
-                    state_indices.element_size() if use_state_indices else 1,
-                ),
-                (
-                    "state_checkpoints",
-                    state_checkpoints if needs_checkpointing else None,
-                    16,
-                ),
-                (
-                    "checkpoint_cu_starts",
-                    checkpoint_cu_starts if needs_checkpointing else None,
-                    8,
-                ),
-            ),
-        )
-        kernel = _get_prefill_kernel(kernel_dtype, **spec, ptr_abi=True)
-        state_cutlass = state_dtype_to_cutlass(
-            state.dtype if store_final_state else torch.float32
-        )
-        init_cutlass = state_dtype_to_cutlass(
-            initial_state.dtype if needs_initial_state else torch.float32
-        )
-        ckpt_cutlass = state_dtype_to_cutlass(
-            state_checkpoints.dtype if needs_checkpointing else torch.float32
-        )
-        # Inactive optional slots get an address that is valid and aligned --
-        # the workspace's -- and the kernel body reads them only under
-        # `const_expr`.
-        placeholder = fixed_state
-        args = (
-            mk(kernel_dtype, q, 16, "q"),
-            mk(kernel_dtype, k, 16, "k"),
-            mk(kernel_dtype, v, 16, "v"),
-            mk(kernel_dtype, t, 16, "t"),
-            mk(kernel_dtype, o, 16, "o"),
-            mk(cutlass.Float32, alpha, 16, "alpha"),
-            mk(state_cutlass, state_arg, 16, "state_arg"),
-            mk(cutlass.Float32, fixed_state, 16, "fixed_state"),
-            mk(
-                init_cutlass,
-                initial_state if needs_initial_state else placeholder,
-                16,
-                "initial_state",
-            ),
-            mk(
-                integer_dtype_to_cutlass(
-                    state_indices.dtype if use_state_indices else torch.int32
-                ),
-                state_indices if use_state_indices else placeholder,
-                4,
                 "state_indices",
+                state_indices if use_state_indices else None,
+                state_indices.element_size() if use_state_indices else 1,
             ),
-            mk(
-                ckpt_cutlass,
-                state_checkpoints if needs_checkpointing else placeholder,
-                16,
+            (
                 "state_checkpoints",
+                state_checkpoints if needs_checkpointing else None,
+                16,
             ),
-            mk(
-                integer_dtype_to_cutlass(
-                    checkpoint_cu_starts.dtype if needs_checkpointing else torch.int32
-                ),
-                checkpoint_cu_starts if needs_checkpointing else placeholder,
-                8,
+            (
                 "checkpoint_cu_starts",
+                checkpoint_cu_starts if needs_checkpointing else None,
+                8,
             ),
-            mk(integer_dtype_to_cutlass(cu_seqlens.dtype), cu_seqlens, 8, "cu_seqlens"),
-            cutlass.Float32(scale),
-            cutlass.Int32(total_seqlen),
-            cutlass.Int32(total_t_blocks),
-            cutlass.Int32(state.shape[0] if store_final_state else 1),
-            cutlass.Int32(state.shape[1] if store_final_state else 1),
-            cutlass.Int32(state.stride(0) if store_final_state else 1),
-            cutlass.Int32(state.stride(1) if store_final_state else 1),
-            cutlass.Int32(initial_state.shape[0] if needs_initial_state else 1),
-            cutlass.Int32(initial_state.shape[1] if needs_initial_state else 1),
-            cutlass.Int32(initial_state.stride(0) if needs_initial_state else 1),
-            cutlass.Int32(initial_state.stride(1) if needs_initial_state else 1),
-            cutlass.Int32(num_q_heads),
-            cutlass.Int32(num_k_heads),
-            cutlass.Int32(num_v_heads),
-            cutlass.Int32(num_sab_heads),
-            cutlass.Int32(num_seqs),
-            cutlass.Int32(state_checkpoints.shape[0] if needs_checkpointing else 1),
-            cutlass.Int32(checkpoint_every_n_tokens),
-            cutlass.Int32(cp_chunk_len),
-            cutlass.Int32(total_cp_chunks),
-            int(kernel.num_v_splits * num_sab_heads * max_cp_chunks_per_seq),
-            int(num_seqs),
-            stream,
-        )
-        opts = (
-            _ctx.compile_options
-            if _ctx is not None
-            else _sm80_cp_compile_options(device)
-        )
-        _compile_and_launch(kernel, args, opts)
-        return
-    kernel = _get_prefill_kernel(kernel_dtype, **spec, ptr_abi=False)
-    compiled = get_cached_compile(
-        kernel,
-        _ctx.compile_options if _ctx is not None else _sm80_cp_compile_options(device),
+        ),
     )
-    if compiled is None:
-        from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
-            *args, **{**kwargs, "enable_tvm_ffi": True}
-        )
-        initial_state_cute = (
-            from_dlpack(initial_state, assumed_align=16).mark_layout_dynamic()
-            if needs_initial_state
-            else None
-        )
-        state_indices_cute = (
-            from_dlpack(state_indices, assumed_align=4).mark_layout_dynamic()
-            if use_state_indices
-            else None
-        )
-        total_checkpoints = state_checkpoints.shape[0] if needs_checkpointing else 1
-        state_checkpoints_cute = (
-            from_dlpack(
-                state_checkpoints.reshape(-1), assumed_align=16
-            ).mark_layout_dynamic()
-            if needs_checkpointing
-            else None
-        )
-        checkpoint_cu_cute = (
-            from_dlpack(checkpoint_cu_starts, assumed_align=8).mark_layout_dynamic()
-            if needs_checkpointing
-            else None
-        )
-        kernel_args = (
-            from_dlpack(q_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-            from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
-            from_dlpack(v_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
-            from_dlpack(t_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1),
-            from_dlpack(o_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
-            from_dlpack(alpha.reshape(-1), assumed_align=16).mark_layout_dynamic(),
-            from_dlpack(state_arg, assumed_align=16).mark_layout_dynamic(),
-            from_dlpack(
-                fixed_state.reshape(-1), assumed_align=16
-            ).mark_layout_dynamic(),
-            initial_state_cute,
-            state_indices_cute,
-            state_checkpoints_cute,
-            checkpoint_cu_cute,
-            from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
-            cutlass.Float32(scale),
-            cutlass.Int32(num_q_heads),
-            cutlass.Int32(num_k_heads),
-            cutlass.Int32(num_v_heads),
-            cutlass.Int32(num_sab_heads),
-            cutlass.Int32(num_seqs),
-            cutlass.Int32(total_checkpoints),
-            cutlass.Int32(checkpoint_every_n_tokens),
-            cutlass.Int32(cp_chunk_len),
-            cutlass.Int32(total_cp_chunks),
-            int(kernel.num_v_splits * num_sab_heads * max_cp_chunks_per_seq),
-            int(num_seqs),
-            stream,
-        )
-        compiled = cached_compile(
-            kernel,
-            *kernel_args,
-            compile_options=(
-                _ctx.compile_options
-                if _ctx is not None
-                else _sm80_cp_compile_options(device)
+    kernel = _get_prefill_kernel(kernel_dtype, **spec)
+    state_cutlass = state_dtype_to_cutlass(
+        state.dtype if store_final_state else torch.float32
+    )
+    init_cutlass = state_dtype_to_cutlass(
+        initial_state.dtype if needs_initial_state else torch.float32
+    )
+    ckpt_cutlass = state_dtype_to_cutlass(
+        state_checkpoints.dtype if needs_checkpointing else torch.float32
+    )
+    # Inactive optional slots get an address that is valid and aligned --
+    # the workspace's -- and the kernel body reads them only under
+    # `const_expr`.
+    placeholder = fixed_state
+    args = (
+        mk(kernel_dtype, q, 16, "q"),
+        mk(kernel_dtype, k, 16, "k"),
+        mk(kernel_dtype, v, 16, "v"),
+        mk(kernel_dtype, t, 16, "t"),
+        mk(kernel_dtype, o, 16, "o"),
+        mk(cutlass.Float32, alpha, 16, "alpha"),
+        mk(state_cutlass, state_arg, 16, "state_arg"),
+        mk(cutlass.Float32, fixed_state, 16, "fixed_state"),
+        mk(
+            init_cutlass,
+            initial_state if needs_initial_state else placeholder,
+            16,
+            "initial_state",
+        ),
+        mk(
+            integer_dtype_to_cutlass(
+                state_indices.dtype if use_state_indices else torch.int32
             ),
-        )
-    call_args = (
-        q_tma,
-        k_tma,
-        v_tma,
-        t_tma,
-        o_tma,
-        alpha.reshape(-1),
-        state_arg,
-        fixed_state.reshape(-1),
-        initial_state if needs_initial_state else None,
-        state_indices if use_state_indices else None,
-        state_checkpoints.reshape(-1) if needs_checkpointing else None,
-        checkpoint_cu_starts if needs_checkpointing else None,
-        cu_seqlens,
-        scale,
-        num_q_heads,
-        num_k_heads,
-        num_v_heads,
-        num_sab_heads,
-        num_seqs,
-        state_checkpoints.shape[0] if needs_checkpointing else 1,
-        checkpoint_every_n_tokens,
-        cp_chunk_len,
-        total_cp_chunks,
+            state_indices if use_state_indices else placeholder,
+            4,
+            "state_indices",
+        ),
+        mk(
+            ckpt_cutlass,
+            state_checkpoints if needs_checkpointing else placeholder,
+            16,
+            "state_checkpoints",
+        ),
+        mk(
+            integer_dtype_to_cutlass(
+                checkpoint_cu_starts.dtype if needs_checkpointing else torch.int32
+            ),
+            checkpoint_cu_starts if needs_checkpointing else placeholder,
+            8,
+            "checkpoint_cu_starts",
+        ),
+        mk(integer_dtype_to_cutlass(cu_seqlens.dtype), cu_seqlens, 8, "cu_seqlens"),
+        cutlass.Float32(scale),
+        cutlass.Int32(total_seqlen),
+        cutlass.Int32(total_t_blocks),
+        cutlass.Int32(state.shape[0] if store_final_state else 1),
+        cutlass.Int32(state.shape[1] if store_final_state else 1),
+        cutlass.Int32(state.stride(0) if store_final_state else 1),
+        cutlass.Int32(state.stride(1) if store_final_state else 1),
+        cutlass.Int32(initial_state.shape[0] if needs_initial_state else 1),
+        cutlass.Int32(initial_state.shape[1] if needs_initial_state else 1),
+        cutlass.Int32(initial_state.stride(0) if needs_initial_state else 1),
+        cutlass.Int32(initial_state.stride(1) if needs_initial_state else 1),
+        cutlass.Int32(num_q_heads),
+        cutlass.Int32(num_k_heads),
+        cutlass.Int32(num_v_heads),
+        cutlass.Int32(num_sab_heads),
+        cutlass.Int32(num_seqs),
+        cutlass.Int32(state_checkpoints.shape[0] if needs_checkpointing else 1),
+        cutlass.Int32(checkpoint_every_n_tokens),
+        cutlass.Int32(cp_chunk_len),
+        cutlass.Int32(total_cp_chunks),
         int(kernel.num_v_splits * num_sab_heads * max_cp_chunks_per_seq),
         int(num_seqs),
         stream,
     )
-    compiled(*call_args)
+    opts = (
+        _ctx.compile_options if _ctx is not None else _sm80_cp_compile_options(device)
+    )
+    _compile_and_launch(kernel, args, opts)
+    return
 
 
 def cp_delta_rule_dsl_sm80(
@@ -4899,13 +4534,6 @@ def cp_delta_rule_dsl_sm80(
     max_seqlen: int | None = None,
     cp_chunk_len: int | None = None,
     cp_chunk_len_granularity: int = CP_CHUNK_LEN_GRANULARITY,
-    # Threaded to all four stages. With a sink the stages record what they
-    # would launch and launch nothing, so the workspaces come back allocated
-    # and unfilled -- which is all a plan needs, since it keeps the argument
-    # descriptors rather than their contents.
-    # Opt-in for all four stages at once. Off by default: the entries
-    # are proven one at a time and nothing public reaches this yet.
-    _ptr_abi: bool = False,
 ):
     """Run the CP SM80 delta-rule prefill pipeline on flat varlen tensors.
 
@@ -5066,6 +4694,12 @@ def cp_delta_rule_dsl_sm80(
             raise RuntimeError(
                 f"checkpoint_cu_starts must have shape {(num_seqs + 1,)} and an integer dtype"
             )
+    _check_state_dtype_supported(
+        device,
+        state=state,
+        initial_state=initial_state,
+        state_checkpoints=state_checkpoints if needs_checkpointing else None,
+    )
     for name, tensor in (
         ("q", q),
         ("k", k),
@@ -5092,21 +4726,17 @@ def cp_delta_rule_dsl_sm80(
     # its chunk geometry, and one alignment-checked pointer per distinct
     # buffer. A stage called on its own gets no context and keeps its own
     # `_check_ptr_abi`.
-    ctx = (
-        _CPInvocation(
-            device=device,
-            stream=stream,
-            compile_options=_sm80_cp_compile_options(device),
-            total_t_blocks=workspace_num_chunks_host(cu_seqlens, 64, total_seqlen),
-            total_cp_chunks=workspace_num_chunks_host(
-                cu_seqlens, cp_chunk_len, total_seqlen
-            ),
-            max_t_blocks_per_seq=max_num_chunks_host(max_seqlen, 64),
-            max_cp_chunks_per_seq=max_num_chunks_host(max_seqlen, cp_chunk_len),
-            cp_chunk_len=cp_chunk_len,
-        )
-        if _ptr_abi
-        else None
+    ctx = _CPInvocation(
+        device=device,
+        stream=stream,
+        compile_options=_sm80_cp_compile_options(device),
+        total_t_blocks=workspace_num_chunks_host(cu_seqlens, 64, total_seqlen),
+        total_cp_chunks=workspace_num_chunks_host(
+            cu_seqlens, cp_chunk_len, total_seqlen
+        ),
+        max_t_blocks_per_seq=max_num_chunks_host(max_seqlen, 64),
+        max_cp_chunks_per_seq=max_num_chunks_host(max_seqlen, cp_chunk_len),
+        cp_chunk_len=cp_chunk_len,
     )
 
     t = cp_delta_rule_t_precompute_dsl_sm80(
@@ -5118,7 +4748,6 @@ def cp_delta_rule_dsl_sm80(
         _skip_check=True,
         _device=device,
         _stream=stream,
-        _ptr_abi=_ptr_abi,
         _ctx=ctx,
     )
     local_transfer, local_state = cp_delta_rule_mn_precompute_dsl_sm80(
@@ -5133,7 +4762,6 @@ def cp_delta_rule_dsl_sm80(
         _skip_check=True,
         _device=device,
         _stream=stream,
-        _ptr_abi=_ptr_abi,
         _ctx=ctx,
     )
     fixed_state = cp_delta_rule_fixup_dsl_sm80(
@@ -5147,7 +4775,6 @@ def cp_delta_rule_dsl_sm80(
         _skip_check=True,
         _device=device,
         _stream=stream,
-        _ptr_abi=_ptr_abi,
         _ctx=ctx,
     )
 
@@ -5173,6 +4800,5 @@ def cp_delta_rule_dsl_sm80(
         _skip_check=True,
         _device=device,
         _stream=stream,
-        _ptr_abi=_ptr_abi,
         _ctx=ctx,
     )
