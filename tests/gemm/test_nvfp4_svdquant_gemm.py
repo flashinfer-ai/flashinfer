@@ -56,6 +56,8 @@ from flashinfer.utils import device_support_pdl, get_compute_capability
 # Shared references and public operators across backends.
 
 _RANK = SVDQUANT_LORA_RANK_GRANULARITY  # base rank == the collective's rank granularity
+# Rows per block for full-output SQNR; ~0.5 GB of fp32 per block at n = 28672.
+_SQNR_CHUNK_ROWS = 4096
 
 
 def test_nvfp4_svdquant_backend_arch_support():
@@ -140,7 +142,23 @@ def _skip_unless_sm120():
         )
 
 
-def _sqnr_db(ref: torch.Tensor, got: torch.Tensor) -> float:
+def _sqnr_db(
+    ref: torch.Tensor, got: torch.Tensor, chunk_rows: int | None = None
+) -> float:
+    if chunk_rows is not None:
+        # Row blocks bound the fp32 temporaries to one block, for outputs too
+        # large to hold several full-size copies. Ratio of sums = ratio of means.
+        signal = torch.zeros((), dtype=torch.float64, device=ref.device)
+        noise = torch.zeros_like(signal)
+        for ref_rows, got_rows in zip(
+            ref.split(chunk_rows), got.split(chunk_rows), strict=True
+        ):
+            ref_rows = ref_rows.float()
+            signal += ref_rows.square().sum(dtype=torch.float64)
+            noise += (ref_rows - got_rows.float()).square().sum(dtype=torch.float64)
+        if noise == 0:
+            return float("inf")
+        return float(10 * torch.log10(signal / noise))
     err = (ref - got).float()
     noise = (err**2).mean()
     if noise == 0:
@@ -1448,7 +1466,13 @@ def test_mm_nvfp4_svdquant_model_shapes(m, n, k, use_bias):
     _skip_unless_sm120_table()
     torch.manual_seed(3)
     p = _make_gemm_problem(m, n, k, rank=_RANK)
-    ref = p["ref_bias"] if use_bias else p["ref"]
+    # The largest shapes need ~9.5 GB per fp32 m x n tensor, and run beside the
+    # shared SVDQuant workspace earlier tests leave allocated. Keep one
+    # reference, release each output once checked, and compare in row blocks.
+    ref, ref_bias = p.pop("ref"), p.pop("ref_bias")
+    if use_bias:
+        ref = ref_bias
+    del ref_bias
     bias = p["bias"] if use_bias else None
 
     device = p["xq"].device
@@ -1466,7 +1490,8 @@ def test_mm_nvfp4_svdquant_model_shapes(m, n, k, use_bias):
             out=out,
             backend="cutlass-sm120",
         )
-    assert _sqnr_db(ref, out.float()) > 40.0
+    assert _sqnr_db(ref, out, chunk_rows=_SQNR_CHUNK_ROWS) > 40.0
+    del out
 
     replay = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
     mm_nvfp4_svdquant(
@@ -1481,7 +1506,8 @@ def test_mm_nvfp4_svdquant_model_shapes(m, n, k, use_bias):
         out=replay,
         backend="cutlass-sm120",
     )
-    assert _sqnr_db(ref, replay.float()) > 40.0
+    assert _sqnr_db(ref, replay, chunk_rows=_SQNR_CHUNK_ROWS) > 40.0
+    del replay
 
     module = _svdquant_module()
     out0 = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
@@ -1500,7 +1526,7 @@ def test_mm_nvfp4_svdquant_model_shapes(m, n, k, use_bias):
         0,
         device_support_pdl(device),
     )
-    assert _sqnr_db(ref, out0.float()) > 40.0
+    assert _sqnr_db(ref, out0, chunk_rows=_SQNR_CHUNK_ROWS) > 40.0
 
 
 def _decode_row(module, tactic):
