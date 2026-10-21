@@ -413,7 +413,7 @@ def test_nvfp4_split_materialization_rejects_unsupported_contracts(changes):
     )
 
 
-def test_compact_w4a8_has_only_its_supported_dynamic_route():
+def test_compact_w4a8_has_only_its_supported_dynamic_routes():
     from b12x.moe.fused_moe._tuning import TUNING
 
     query = replace(
@@ -433,7 +433,10 @@ def test_compact_w4a8_has_only_its_supported_dynamic_route():
             config.route_planner,
         )
         for config in configs
-    } == {("dynamic", 16, "grouped", "internal")}
+    } == {
+        ("dynamic", 16, "grouped", "internal"),
+        ("dynamic", 64, "grouped", "internal"),
+    }
 
 
 @pytest.mark.parametrize("heads", (1, 12, 16, 20, 32))
