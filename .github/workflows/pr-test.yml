@@ -480,6 +480,16 @@ jobs:
           if [ "${MATRIX_KIND}" = "h100" ]; then
             TEST_RUNNER_ARGS+=(--workers-per-gpu 2)
           fi
+          DOCKER_ARGS=()
+          if [ "${MATRIX_KIND}" = "gpu" ] && [ "${TEST_SCRIPT}" = "task_run_unit_tests.sh" ]; then
+            # Targeted A10G/T4 runs compile with the same Ninja parallelism as the
+            # bare-run shard scripts (MAX_JOBS=nproc) instead of test_utils.sh's
+            # 12 GB-per-nvcc budget, which was sized for H100 and resolves to
+            # MAX_JOBS=1 on these 8-vCPU / 30 GiB runners. The shard scripts have
+            # run these files at nproc without an OOM, and a 9-job targeted run of
+            # test_batch_prefill_kernels.py peaked at 12.3 GiB process-tree RSS.
+            DOCKER_ARGS+=(-e MAX_JOBS "$(nproc)")
+          fi
           if [ -n "${TEST_PATH_ARG:-}" ]; then
             # Read into an array and expand quoted, rather than relying on word
             # splitting: this keeps the shell safe on its own terms instead of
@@ -492,9 +502,9 @@ jobs:
             # to unit_test_runner.py, whose parser takes the scope as an option (or the
             # TEST_PATH env var, which ci/bash.sh does not forward into the container).
             # Bare paths fail argument-preflight with "unrecognized arguments".
-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}" --test-path "${TEST_TARGETS[@]}"
+            bash ci/bash.sh "${DOCKER_IMAGE}" "${DOCKER_ARGS[@]}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}" --test-path "${TEST_TARGETS[@]}"
           else
-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}"
+            bash ci/bash.sh "${DOCKER_IMAGE}" "${DOCKER_ARGS[@]}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}"
           fi
 
       - name: Make JUnit XML readable
