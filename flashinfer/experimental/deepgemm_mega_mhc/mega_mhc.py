@@ -25,6 +25,10 @@ SPLIT_BARRIER_WORDS = 2 * (MAX_TOKENS // 64) * 16
 # (cake_mega_mhc_134570ae7cc112e9d84e_binding.cu): the exported bindings differed only in the
 # kernel symbol they launch and their host-shim namespace id, so load_program passes
 # the record's kernel_symbol as the CAKE_PROGRAM_KERNEL compile definition.
+# The four 40-split records build from the 27-split kernel source of their class:
+# the two sources differed only at sites now behind `#if NUM_SPLITS == 40` arms, which
+# the route's NUM_SPLITS define selects; each record keeps its own kernel symbol, so
+# the kept sources spell their kernel name through CAKE_PROGRAM_KERNEL as well.
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_134570ae7cc112e9d84e": {
         "sources": [
@@ -76,7 +80,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "cake_mega_mhc_41df2a8c4d3c4849adbf": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_41df2a8c4d3c4849adbf_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b8c6c9ebebc80eb063b8_kernel.cu",
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_41df2a8c4d3c4849adbf",
@@ -112,7 +116,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "cake_mega_mhc_a5521c9dfaf81d2c0f1f": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_a5521c9dfaf81d2c0f1f_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_43b829c4b071416a4595_kernel.cu",
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_a5521c9dfaf81d2c0f1f",
@@ -160,7 +164,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "cake_mega_mhc_c7892aa3a7b985dcac4a": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_c7892aa3a7b985dcac4a_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_407321791585dc9fc44b_kernel.cu",
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_c7892aa3a7b985dcac4a",
@@ -184,7 +188,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "cake_mega_mhc_f7107723c112a3b117a9": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_f7107723c112a3b117a9_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_dc85bbfab3b20cf209fc_kernel.cu",
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_f7107723c112a3b117a9",
@@ -455,7 +459,8 @@ def select_program(hidden, splits, shifted, shared_sf):
 @functools.cache
 def load_program(name, arch, num_sms, defines):
     """Build ``name`` for ``arch`` with the route's defines, ``NUM_SMS`` and the program's
-    kernel symbol (``CAKE_PROGRAM_KERNEL``, read by the shared binding) on the compile line."""
+    kernel symbol (``CAKE_PROGRAM_KERNEL``, read by the shared binding and by the kernel
+    sources shared between a 27-split and a 40-split program) on the compile line."""
     from flashinfer.jit import env
     from flashinfer.jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
