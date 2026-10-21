@@ -117,10 +117,6 @@ _HINT_DEFAULT = "none"
 # Proxy-score decode program coordinates.
 _PROXY_HEADS = (1, 2, 4)
 _PROXY_QLENS = (1, 2, 3, 4)
-# Every program family declares a trace carrier parameter (``TRACE=0`` compiles the
-# stamp stores out, the parameter stays in the kernel signature); one never-written
-# 16-word buffer per device satisfies it (the largest stamp count of the families is 14).
-_TRACE_WORDS = 16
 
 
 def is_hopper_msa_device(device: torch.device | str) -> bool:
@@ -373,26 +369,6 @@ def _program(route: str) -> _Program:
 
 def _route_available(route: str) -> bool:
     return route in ROUTES
-
-
-_trace_carriers: dict[int, torch.Tensor] = {}
-_trace_carriers_lock = threading.Lock()
-
-
-def _trace_carrier(device: torch.device) -> torch.Tensor:
-    """The never-written trace buffer every program takes, allocated once per device."""
-
-    index = _device_index(device)
-    with _trace_carriers_lock:
-        tensor = _trace_carriers.get(index)
-        if tensor is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "Hopper MSA programs must run eagerly once per device before CUDA graph capture"
-                )
-            tensor = torch.zeros((_TRACE_WORDS,), dtype=torch.uint64, device=device)
-            _trace_carriers[index] = tensor
-    return tensor
 
 
 _int32_dummies: dict[int, torch.Tensor] = {}
@@ -667,7 +643,7 @@ def _decode_template(
     device_index: int,
 ) -> _Launch:
     """The launch of one decode geometry resolved once: program, grid and the per-plan arguments (kernel scalars,
-    the trace carrier, the retained split scratch).  Pure in its key; the per-call tensors join at launch time.
+    the retained split scratch).  Pure in its key; the per-call tensors join at launch time.
     A first use under CUDA-graph capture raises exactly as the eager-first rules of the buffers did (nothing cached)."""
 
     plan = plan_sparse_decode(
@@ -688,7 +664,6 @@ def _decode_template(
         max_pages=max_pages,
         num_chunks=plan.chunks,
         zero_u32=0,
-        trace=_trace_carrier(device),
     )
     if plan.persist:
         # One CTA per residency slot loops over the items: the item count is a kernel scalar, no split scratch.
@@ -941,7 +916,6 @@ def _proxy_decode_template(
         total_q=total_q,
         batch_fast=1 if batch_fast else 0,
         evict_first=1 if evict_first else 0,
-        trace=_trace_carrier(torch.device("cuda", device_index)),
     )
     program = _program(
         proxy_route(q_dtype=q_dtype, num_q_heads=num_q_heads, max_seqlen_q=max_seqlen_q)
@@ -1078,12 +1052,10 @@ def hopper_msa_proxy_score_decode(
         per_head_contiguous=per_head.is_contiguous(),
         q_offset_meta=_optional_meta(q_offset),
     )
-    if q.dtype == torch.float8_e4m3fn:
-        q2 = q.view(torch.uint8).view(total_q * num_q_heads, _HEAD_DIM)
-        k2 = k.view(torch.uint8).view(num_pages * _BLOCK_SIZE, _HEAD_DIM)
-    else:
-        q2 = q.view(total_q * num_q_heads, _HEAD_DIM)
-        k2 = k.view(num_pages * _BLOCK_SIZE, _HEAD_DIM)
+    # The program declares its query and index-cache tensor maps in the cache's dtype (fp8 e4m3 or bf16) and the
+    # binding checks for it: the 2-D views keep the dtype.
+    q2 = q.view(total_q * num_q_heads, _HEAD_DIM)
+    k2 = k.view(num_pages * _BLOCK_SIZE, _HEAD_DIM)
     launch = _proxy_decode_template(
         q_dtype=q.dtype,
         num_q_heads=num_q_heads,
@@ -1725,7 +1697,6 @@ def _proxy_prefill_template(
         total_q=total_q,
         num_heads=hq,
         nsplit=plan.nsplit,
-        trace=_trace_carrier(torch.device("cuda", device_index)),
     )
     return _program(plan.route).bind(plan.grid(hq=hq, batch=batch), constants)
 
@@ -1884,11 +1855,10 @@ def hopper_msa_proxy_score_prefill(
         has_qoff=q_offset is not None,
         device_index=_device_index(q.device),
     )
+    # The program declares its query and index-cache tensor maps fp8 e4m3 and the binding checks for it.
     launch(
-        Q=q.view(torch.uint8),
-        K=k.view(torch.uint8).view(
-            num_pages * int(k.shape[1]) * _BLOCK_SIZE, _HEAD_DIM
-        ),
+        Q=q,
+        K=k.view(num_pages * int(k.shape[1]) * _BLOCK_SIZE, _HEAD_DIM),
         out=per_head,
         cu_seqlens_q=cu_seqlens_q,
         page_table=page_table,
@@ -2387,7 +2357,6 @@ def _prefill_template(
         max_pages=max_pages,
         use_q_offset=1 if use_q_offset else 0,
         zero_u32=0,
-        trace=_trace_carrier(torch.device("cuda", device_index)),
     )
     return _program(plan.route).bind((groups, num_kv_heads, 1), constants)
 
@@ -2568,10 +2537,17 @@ def hopper_msa_sparse_attention(
     scale = (
         1.0 / math.sqrt(_HEAD_DIM) if softmax_scale is None else float(softmax_scale)
     )
+    # v1 declares its K / V tensor maps fp8 e4m3 (the cache's dtype), v2 reads the same halves as uint8 bytes; the
+    # binding checks the dtype its program declares, so the views follow the planned kernel.
+    plan = plan_sparse_prefill(
+        num_q_heads=num_q_heads, num_kv_heads=num_kv_heads, max_pages=max_pages
+    )
+    kv_dtype = torch.float8_e4m3fn if plan.impl == "v1" else torch.uint8
     launch(
+        Q=q,
         Q32=q.view(torch.uint32),
-        K=k.view(torch.uint8),
-        V=v.view(torch.uint8),
+        K=k.view(kv_dtype),
+        V=v.view(kv_dtype),
         O=out,
         q2k_indices=q2k_indices,
         cu_seqlens_q=cu_seqlens_q,
