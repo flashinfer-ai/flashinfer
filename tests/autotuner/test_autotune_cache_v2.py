@@ -10,6 +10,7 @@ No GPU is required — profiling is monkeypatched and inputs are CPU tensors.
 """
 
 import json
+from dataclasses import replace
 
 import pytest
 import torch
@@ -1169,7 +1170,6 @@ def test_retuning_different_runner_returns_new_winner(cache_root, monkeypatch):
             0,
         )
     (old_entry,) = _entry_files(cache_root)
-    before = old_entry.read_bytes()
     calls = _install_fake_profile(monkeypatch, {-1: 5.0, 0: 2.0, 1: 1.0})
     with autotune_v2(), autotune(cuda_graph_profile_replays=20):
         assert AutoTuner.get().choose_one(_OP, runners, config, inputs) == (
@@ -1177,8 +1177,12 @@ def test_retuning_different_runner_returns_new_winner(cache_root, monkeypatch):
             1,
         )
         assert calls
-    assert len(_entry_files(cache_root)) == 2
-    assert old_entry.read_bytes() == before
+    assert len(_entry_files(cache_root)) == 1
+    assert not old_entry.exists()
+    assert AutoTuner.get().choose_one(_OP, runners, config, inputs) == (runners[1], 1)
+    tuner = _fresh_process()
+    with autotune_v2(mode="replay"):
+        assert tuner.choose_one(_OP, runners, config, inputs) == (runners[1], 1)
 
 
 @pytest.mark.parametrize("unknown_policy", [False, True])
@@ -1233,3 +1237,60 @@ def test_pcie_lookup_without_tune_group_reuses_managed_entry(
                 )
         assert tuner._winner_cache()
     assert calls == []
+
+
+@pytest.mark.parametrize("storage", ["legacy", "managed"])
+def test_retuned_runner_survives_serving_and_restart(cache_root, monkeypatch, storage):
+    from contextlib import nullcontext
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        "flashinfer.autotuner._collect_metadata",
+        lambda: {"gpu": "test GPU", "flashinfer_version": "test"},
+    )
+
+    class RunnerA(DummyRunner):
+        pass
+
+    class RunnerB(DummyRunner):
+        pass
+
+    runners = [RunnerA((0,)), RunnerB((0,))]
+    inputs = [torch.ones(1)]
+    before = TuningConfig(use_cuda_graph=True)
+    after = replace(before, cuda_graph_profile_replays=2)
+
+    def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
+        want_b = tuning_config.cuda_graph_profile_replays == 2
+        return 1.0 if isinstance(runner, RunnerB) == want_b else 2.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    context = autotune_v2 if storage == "managed" else autotune
+    paths = [str(cache_root / name) for name in ("first.json", "second.json")]
+    tuner = AutoTuner.get()
+    with context():
+        assert tuner.choose_one(_OP, runners, before, inputs)[0] is runners[0]
+        unrelated_tactic = tuner.choose_one("unrelated", [runners[0]], before, inputs)[
+            1
+        ]
+    if storage == "legacy":
+        for path in paths:
+            tuner.save_configs(path)
+        tuner = _fresh_process()
+        assert tuner.load_configs(paths[0])
+    with context():
+        assert tuner.choose_one(_OP, runners, after, inputs)[0] is runners[1]
+    assert tuner.choose_one(_OP, runners, after, inputs)[0] is runners[1]
+    if storage == "legacy":
+        for path in paths:
+            tuner.save_configs(path)
+    for path in paths if storage == "legacy" else [None]:
+        tuner = _fresh_process()
+        if path is not None:
+            assert tuner.load_configs(path)
+        with autotune_v2(mode="replay") if storage == "managed" else nullcontext():
+            assert tuner.choose_one(_OP, runners, after, inputs)[0] is runners[1]
+            assert (
+                tuner.choose_one("unrelated", [runners[0]], before, inputs)[1]
+                == unrelated_tactic
+            )
