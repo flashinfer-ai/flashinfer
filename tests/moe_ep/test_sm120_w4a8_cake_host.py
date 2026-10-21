@@ -850,7 +850,7 @@ def test_device_resource_check_rejects_spills_at_every_rank_count(ranks: int) ->
     )
 
 
-def test_gin_backend_builds() -> None:
+def test_gin_backend_builds(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     from flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe import (
         AOT_DEVICE_PARAMETERS,
         GIN_BACKENDS,
@@ -858,6 +858,7 @@ def test_gin_backend_builds() -> None:
         gen_cake_sm120_megamoe_kernel_module,
         gin_backend_name,
     )
+    from flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe.shim import cake_jit
 
     # ncclGinType_t values: 2 proxy, 3 GDAKI, 4 GPI; anything else fails closed.
     assert [gin_backend_name(t) for t in (2, 3, 4)] == ["proxy", "gdaki", "gpi"]
@@ -871,7 +872,17 @@ def test_gin_backend_builds() -> None:
         for b in GIN_BACKENDS
     }
     assert len(names) == len(GIN_BACKENDS)
-    # AOT packages every backend's build of the default parameter sets.
+    # AOT packages every backend's build of the default parameter sets.  The binding spec
+    # records the NCCL 2.30.7 include and library paths; without the wheel (CI's CUDA 12.9
+    # image carries NCCL 2.29.7) stand-ins serve, as the spec is generated here, not built.
+    try:
+        cake_jit.nccl_installation()
+    except RuntimeError:
+        monkeypatch.setattr(
+            cake_jit,
+            "nccl_installation",
+            lambda: (tmp_path / "include", tmp_path / "libnccl.so.2"),
+        )
     assert len(gen_cake_sm120_megamoe_aot_modules()) == 1 + len(
         AOT_DEVICE_PARAMETERS
     ) * len(GIN_BACKENDS)
@@ -1018,7 +1029,8 @@ def test_device_flags_compile_out_the_libcudacxx_automatic_storage_check(
     ``isspacep.local`` test plus a local-memory fallback, which spills the persistent kernel
     (#6755).  ``_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE`` is an internal libcu++ macro: if a later
     release renames it, this test fails on that toolkit.  Toolkits whose headers have no such
-    test (CUDA 13.0 / 13.1) skip.
+    test (CUDA 13.0 / 13.1) skip, as do CUDA 12 toolkits, which the device build does not
+    support (their libcu++ spells the macro ``_LIBCUDACXX_ATOMIC_UNSAFE_AUTOMATIC_STORAGE``).
     """
     import subprocess
 
@@ -1029,6 +1041,12 @@ def test_device_flags_compile_out_the_libcudacxx_automatic_storage_check(
     source.write_text(_ATOMIC_REF_PROBE)
     device_defines = [f for f in cake_jit._NVCC_FLAGS if f.startswith("-D")]
     assert "-D_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE" in device_defines
+    release = cake_jit.nvcc_version()
+    if release != "unknown" and int(release.split(".")[0]) < 13:
+        pytest.skip(
+            f"nvcc {release}: the device build needs a CUDA 13 toolkit (CUDA 12's libcu++ "
+            "spells the macro _LIBCUDACXX_ATOMIC_UNSAFE_AUTOMATIC_STORAGE)"
+        )
 
     def ptx(*defines: str) -> str:
         try:
