@@ -15,13 +15,13 @@ limitations under the License.
 """
 
 import contextlib
+import inspect
 import math
 import os
 import re
 import subprocess
 import sys
 import threading
-import warnings
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,41 +29,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from flashinfer.api_logging import ExperimentalWarning
-from flashinfer.chunked_lm_head import chunked_lm_head_logprob, chunked_lm_head_loss
-from flashinfer.experimental.cake_lm_head_loss import cake_backend, cake_jit
-from flashinfer.experimental.cake_lm_head_loss.cake_backend import (
-    ABI_CONTRACT,
-    COMMON_SCALARS,
-    COMMON_TENSORS,
-    CONTRACT_ALIASES,
-    MODE_CE,
-    MODE_NONE,
-    MODE_POLICY,
-    STAGE_TENSORS,
-    SUPPORTED_ABIS,
-    SUPPORTED_COMPUTE_CAPABILITIES,
-    WORKSPACE_ALIGN,
-    BindingCache,
-    Geometry,
-    bind_stage,
-    cluster_resident,
-    forward_binding_key,
-    generated_program_available,
-    grid_dims,
-    lm_head_loss_workspace_size,
-    logprob_backward_binding_key,
-    memory_report,
-    plan_chunks,
-    prepare_lm_head_loss,
-    recommended_k_slices,
-    record_abi,
-    stage_values,
-    stages_for_entry,
-    validate_lm_head_inputs,
-    wave_efficiency,
-    workspace_layout,
-)
 from tests.test_helpers.cake_lm_head_loss_reference import (
     DEFAULT_H,
     DEFAULT_V,
@@ -75,6 +40,46 @@ from tests.test_helpers.cake_lm_head_loss_reference import (
     reference_unchunked,
     rel_l2,
 )
+from tests.test_helpers.cake_package import cake_package
+
+# Backend suite: the package is named once, through ``cake_package``; nothing else of flashinfer is imported here (a
+# build that vendors the package under another import path runs this file unchanged after pointing the ``PACKAGES``
+# entry at it).  The tests of the public entry points ``flashinfer.chunked_lm_head`` -- their experimental marking and
+# the FLASHINFER_CAKE_LM_HEAD_LOSS_* environment variables they read -- live in ``test_cake_lm_head_loss_api.py``.
+pkg = cake_package("cake_lm_head_loss")
+cake_backend = cake_package("cake_lm_head_loss", "cake_backend")
+cake_build = cake_package("cake_lm_head_loss", "cake_build")
+cake_jit = cake_package("cake_lm_head_loss", "cake_jit")
+ABI_CONTRACT = cake_backend.ABI_CONTRACT
+COMMON_SCALARS = cake_backend.COMMON_SCALARS
+COMMON_TENSORS = cake_backend.COMMON_TENSORS
+CONTRACT_ALIASES = cake_backend.CONTRACT_ALIASES
+MODE_CE = cake_backend.MODE_CE
+MODE_NONE = cake_backend.MODE_NONE
+MODE_POLICY = cake_backend.MODE_POLICY
+STAGE_TENSORS = cake_backend.STAGE_TENSORS
+SUPPORTED_ABIS = cake_backend.SUPPORTED_ABIS
+SUPPORTED_COMPUTE_CAPABILITIES = cake_backend.SUPPORTED_COMPUTE_CAPABILITIES
+WORKSPACE_ALIGN = cake_backend.WORKSPACE_ALIGN
+BindingCache = cake_backend.BindingCache
+Geometry = cake_backend.Geometry
+bind_stage = cake_backend.bind_stage
+cluster_resident = cake_backend.cluster_resident
+forward_binding_key = cake_backend.forward_binding_key
+generated_program_available = cake_backend.generated_program_available
+grid_dims = cake_backend.grid_dims
+lm_head_loss_workspace_size = cake_backend.lm_head_loss_workspace_size
+logprob_backward_binding_key = cake_backend.logprob_backward_binding_key
+memory_report = cake_backend.memory_report
+plan_chunks = cake_backend.plan_chunks
+prepare_lm_head_loss = cake_backend.prepare_lm_head_loss
+recommended_k_slices = cake_backend.recommended_k_slices
+record_abi = cake_backend.record_abi
+stage_values = cake_backend.stage_values
+stages_for_entry = cake_backend.stages_for_entry
+validate_lm_head_inputs = cake_backend.validate_lm_head_inputs
+wave_efficiency = cake_backend.wave_efficiency
+workspace_layout = cake_backend.workspace_layout
 
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 20260930
@@ -125,22 +130,15 @@ def _require_program(*, entry: str = "loss"):
 
 
 def _require_hidden_count():
-    """Skip when the hidden valid-row count does not run on this device with the nvcc this checkout invokes
-    (``cake_jit.toolchain_runs_hidden_count``: sm_103a on nvcc 13.0.x takes the host-count path)."""
+    """Skip when the hidden valid-row count does not run on this device with the CUDA toolkit that built
+    this checkout's libraries (``cake_jit.toolchain_runs_hidden_count``: sm_103a on CUDA 13.0 takes the
+    host-count path)."""
     arch = cake_backend.arch_for(torch.device("cuda"))
     if not cake_jit.toolchain_runs_hidden_count(arch):
         pytest.skip(
-            f"the hidden valid-row count does not run on {arch} with nvcc {cake_jit.get_cuda_version()}"
+            f"the hidden valid-row count does not run on {arch} with CUDA "
+            f"{'.'.join(map(str, cake_build.record_cuda_version(arch)))}"
         )
-
-
-@contextlib.contextmanager
-def _quiet_experimental():
-    # The experimental banner fires once per process; the API's opt-in is
-    # exercised by test_public_api_is_marked_experimental.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        yield
 
 
 @contextlib.contextmanager
@@ -172,51 +170,48 @@ def _run(
     scale=None,
     compact_rows=None,
     fuse_dw_cast=None,
+    **switches,
 ):
-    """One forward + backward through the autograd entry points; ``backend="cake"`` goes
-    through the public module.  Returns ``loss`` / ``logp`` / ``dX`` / ``dW`` and the leaves."""
+    """One forward + backward through the backend's autograd entry points (``backend="cake"`` runs the generated
+    program; the public module ``flashinfer.chunked_lm_head`` is a pass-through to these two functions, tested in
+    ``test_cake_lm_head_loss_api.py``).  ``switches``: the remaining switch keywords (``dx_finalize``, ``dw_stream``,
+    ``hidden_count``, ``gemm_tuning``), passed through.  Returns ``loss`` / ``logp`` / ``dX`` / ``dW`` and the
+    leaves."""
     X = inp.X.detach().requires_grad_(train_x)
     W = inp.W.detach().requires_grad_(train_w)
-    loss_fn = (
-        chunked_lm_head_loss if backend == "cake" else cake_backend.chunked_lm_head_loss
-    )
-    logprob_fn = (
-        chunked_lm_head_logprob
-        if backend == "cake"
-        else cake_backend.chunked_lm_head_logprob
-    )
-    with _quiet_experimental():
-        if entry == "loss":
-            loss, logp = loss_fn(
-                X,
-                W,
-                inp.labels,
-                objective=inp.objective,
-                loss_div=inp.loss_div if inp.objective == "ce" else None,
-                infer_logp=inp.infer_logp,
-                loss_weights=inp.loss_weights,
-                chunk_size=C,
-                return_logp=True,
-                grad_weight_dtype=grad_weight_dtype,
-                backend=backend,
-                compact_rows=compact_rows,
-                fuse_dw_cast=fuse_dw_cast,
-            )
-            if train_x or train_w:
-                (loss if scale is None else loss * scale).backward()
-        else:
-            logp = logprob_fn(
-                X,
-                W,
-                inp.labels,
-                chunk_size=C,
-                backend=backend,
-                compact_rows=compact_rows,
-                fuse_dw_cast=fuse_dw_cast,
-            )
-            loss = (logp.detach() * inp.dlogp)[inp.valid].sum()
-            if train_x or train_w:
-                logp.backward(inp.dlogp if scale is None else inp.dlogp * scale)
+    if entry == "loss":
+        loss, logp = cake_backend.chunked_lm_head_loss(
+            X,
+            W,
+            inp.labels,
+            objective=inp.objective,
+            loss_div=inp.loss_div if inp.objective == "ce" else None,
+            infer_logp=inp.infer_logp,
+            loss_weights=inp.loss_weights,
+            chunk_size=C,
+            return_logp=True,
+            grad_weight_dtype=grad_weight_dtype,
+            backend=backend,
+            compact_rows=compact_rows,
+            fuse_dw_cast=fuse_dw_cast,
+            **switches,
+        )
+        if train_x or train_w:
+            (loss if scale is None else loss * scale).backward()
+    else:
+        logp = cake_backend.chunked_lm_head_logprob(
+            X,
+            W,
+            inp.labels,
+            chunk_size=C,
+            backend=backend,
+            compact_rows=compact_rows,
+            fuse_dw_cast=fuse_dw_cast,
+            **switches,
+        )
+        loss = (logp.detach() * inp.dlogp)[inp.valid].sum()
+        if train_x or train_w:
+            logp.backward(inp.dlogp if scale is None else inp.dlogp * scale)
     if DEV.type == "cuda":
         torch.cuda.synchronize()
     return dict(loss=loss.detach(), logp=logp.detach(), dX=X.grad, dW=W.grad, X=X, W=W)
@@ -274,21 +269,6 @@ def _same(a, b) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def test_public_api_is_marked_experimental():
-    assert chunked_lm_head_loss.is_experimental is True
-    assert chunked_lm_head_logprob.is_experimental is True
-    assert "SM100" in chunked_lm_head_loss.__doc__
-    assert "SM100" in chunked_lm_head_logprob.__doc__
-    X = torch.zeros(4, H_HOST, dtype=torch.bfloat16)
-    W = torch.zeros(V_HOST, H_HOST, dtype=torch.bfloat16)
-    labels = torch.zeros(4, dtype=torch.int64)
-    # the public module serves the cake backend only
-    with pytest.raises(ValueError, match="backend"):
-        chunked_lm_head_loss(X, W, labels, loss_div=1.0, backend="reference")
-    with pytest.raises(ValueError, match="backend"):
-        chunked_lm_head_logprob(X, W, labels, backend="reference")
-
-
 def test_registry_records_are_well_formed():
     assert cake_jit.STAGES == (
         "gather_rows_bf16",
@@ -325,11 +305,16 @@ def test_registry_records_are_well_formed():
     )
     assert set(STAGE_TENSORS) == set(cake_jit.STAGES)
     assert set(CONTRACT_ALIASES.values()) <= set().union(*_STAGE_VALUES.values())
+    # build.json (``cake_build``) is the only record of what to compile; the registry names its
+    # entries ``<library>_<arch>`` per stage
+    manifest = cake_build.manifest()
+    libraries = {entry["name"]: entry for entry in manifest["libraries"]}
+    assert len(libraries) == len(manifest["libraries"])  # names unique
+    package = Path(cake_jit.__file__).resolve().parent
     for name, record in cake_jit.MODULES.items():
-        assert record["arch"] in cake_jit.ARCH_NVCC_FLAGS
+        assert record["arch"] in manifest["arch_flags"]
         assert record["arch"] in SUPPORTED_COMPUTE_CAPABILITIES.values()
         assert record_abi(record) in SUPPORTED_ABIS
-        assert len(record["closure_sha256"]) == 64
         assert (
             cake_jit.select_module(record["arch"], *cake_jit.record_geometry(record))
             == name
@@ -353,10 +338,19 @@ def test_registry_records_are_well_formed():
         for stage in stages:
             physical = record[stage]
             assert physical["module"] and physical["ffi_entry"]
-            assert len(physical["sources"]) == 2
-            assert all(s.startswith("cake_lm_head_loss/") for s in physical["sources"])
-            assert isinstance(physical["compile_flags"], list)
-            assert len(physical["closure_sha256"]) == 64
+            unit = physical["module"].removeprefix("cake_lm_head_loss_")
+            assert physical["library"] == cake_jit.library_stem(unit)
+            entry = libraries[cake_jit.library_name(name, stage)]
+            assert entry["arch"] == record["arch"]
+            assert entry["path"] == f"aot/{entry['name']}.so"
+            assert entry["entry"] == physical["ffi_entry"]
+            assert isinstance(entry["nvcc_flags"], list)
+            assert len(entry["closure_sha256"]) == 64
+            assert len(entry["sources"]) == 2
+            assert all(
+                s.startswith("csrc/cake_lm_head_loss/") for s in entry["sources"]
+            )
+            assert set(entry["sha256"]) == set(entry["sources"])
             kinds = {kind for kind, _ in physical["arg_plan"]}
             assert kinds <= {"buffer", "tma_buffer", "workspace", "parameter", "grid"}
             names = [n for _, n in physical["arg_plan"]]
@@ -371,12 +365,11 @@ def test_registry_records_are_well_formed():
                     )
             assert int(physical.get("tma_workspace_bytes", 0)) >= 0
             assert int(physical.get("workspace_bytes", 0)) >= 0
-            unit = physical["module"].removeprefix("cake_lm_head_loss_")
-            kernel, launch = physical["sources"]
+            kernel, launch = (s.removeprefix("csrc/") for s in entry["sources"])
             # one architecture-neutral translation unit per kernel (no architecture directory)
             assert kernel == f"cake_lm_head_loss/cake_lm_head_loss_{unit}_kernel.cu"
             assert launch == f"cake_lm_head_loss/cake_lm_head_loss_{unit}_launch.cu"
-            csrc = Path(cake_jit.__file__).resolve().parent / "csrc"
+            csrc = package / "csrc"
             assert (csrc / kernel).is_file() and (csrc / launch).is_file()
             symbol = f"kernel_{physical['module']}"
             assert symbol in (csrc / kernel).read_text()
@@ -407,16 +400,15 @@ def test_registry_records_are_well_formed():
         )
         == cake_jit.MODULES
     )
-    shim_dir = (
-        Path(cake_jit.__file__).resolve().parent / "csrc" / "cake_lm_head_loss" / "shim"
-    )
+    shim_dir = package / "csrc" / "cake_lm_head_loss" / "shim"
     used = set()
-    for record in cake_jit.MODULES.values():
+    for name, record in cake_jit.MODULES.items():
         for stage in record["stages"]:
+            launch = libraries[cake_jit.library_name(name, stage)]["sources"][1]
             used.add(
                 re.search(
                     r'#include "cake_lm_head_loss/shim/([^"]+)"',
-                    (shim_dir.parent.parent / record[stage]["sources"][1]).read_text(),
+                    (package / launch).read_text(),
                 ).group(1)
             )
     if cake_jit.MODULES:
@@ -541,7 +533,7 @@ def test_stages_for_entry():
         "row_grad",
         "gemm_dw_cast_bf16",
     )
-    # the default form follows the environment knob
+    # the default form is the documented default
     assert stages_for_entry("loss") == stages_for_entry(
         "loss", fuse_dw_cast=cake_backend.fuse_dw_cast_default()
     )
@@ -1937,24 +1929,13 @@ def test_make_plan_explicit_gemm_tuning_wins_over_the_rules():
     ) == {"dw": {"epi_store": "tma", "group_m": None}}
 
 
-def test_gemm_tuning_default_env(monkeypatch):
-    monkeypatch.delenv(cake_backend.GEMM_TUNING_ENV, raising=False)
+def test_gemm_tuning_default_is_no_knob():
+    """``gemm_tuning`` is a keyword: ``None`` (the default) pins nothing and the backend reads no environment variable;
+    the knobs are part of the binding key; an explicit knob plans the pinned variant on the reference path."""
     assert (
         cake_backend.gemm_tuning_default() == {}
         and cake_backend._resolve_gemm_tuning(None) == {}
     )
-    monkeypatch.setenv(
-        cake_backend.GEMM_TUNING_ENV,
-        '{"logits": {"group_m": 16}, "dx": {"tile_n": 256}}',
-    )
-    assert cake_backend.gemm_tuning_default() == {
-        "logits": {"group_m": 16},
-        "dx": {"tile_n": 256},
-    }
-    monkeypatch.setenv(cake_backend.GEMM_TUNING_ENV, "not json")
-    with pytest.raises(ValueError, match="JSON"):
-        cake_backend.gemm_tuning_default()
-    monkeypatch.setenv(cake_backend.GEMM_TUNING_ENV, '{"dx": {"tile_n": 256}}')
     kw = _valid_call(T=8)
     X, W, labels = kw["X"], kw["W"], kw["labels"]
     common = dict(
@@ -1968,13 +1949,13 @@ def test_gemm_tuning_default_env(monkeypatch):
         grad_weight_dtype=torch.bfloat16,
         entry="loss",
     )
-    env_key = forward_binding_key(
+    default_key = forward_binding_key(
         X, W, labels, **common
-    )  # the environment's knobs are part of the binding
-    assert env_key == forward_binding_key(
+    )  # the knobs are part of the binding
+    assert default_key == forward_binding_key(X, W, labels, gemm_tuning={}, **common)
+    assert default_key != forward_binding_key(
         X, W, labels, gemm_tuning={"dx": {"tile_n": 256}}, **common
     )
-    assert env_key != forward_binding_key(X, W, labels, gemm_tuning={}, **common)
     # the reference path with an explicit knob plans the pinned variant; the reference engine runs its base stage
     inp = _host_inputs(37)
     common = dict(
@@ -1995,33 +1976,38 @@ def test_gemm_tuning_default_env(monkeypatch):
         stage_values("gemm_dx", narrow.tensors, narrow.plan, 0)
 
 
-def test_toolchain_workaround_flags(monkeypatch):
-    """The CUDA 13.0 ptxas workaround (``-Xptxas -O0``) applies to the sm_103a programs on nvcc 13.0.x only."""
-    from packaging.version import Version
-
-    for version, expected in (
-        ("13.0", ["-Xptxas", "-O0"]),
-        ("12.9", []),
-        ("13.1", []),
-        ("13.4", []),
-    ):
-        monkeypatch.setattr(cake_jit, "get_cuda_version", lambda v=version: Version(v))
-        assert cake_jit.toolchain_workaround_flags("sm_103a") == expected, version
-        assert cake_jit.toolchain_workaround_flags("sm_100a") == [], version
+def test_toolchain_workaround_flags():
+    """The CUDA 13.0 ptxas workaround (``-Xptxas -O0``) is build data: every sm_103a entry of ``build.json``
+    carries it under ``nvcc_flags_if`` for CUDA 13.0 only, and no sm_100a entry carries it."""
+    workaround = {"cuda": "==13.0", "flags": ["-Xptxas", "-O0"]}
+    entries = cake_build.manifest()["libraries"]
+    for arch in sorted({record["arch"] for record in cake_jit.MODULES.values()}):
+        of_arch = [entry for entry in entries if entry["arch"] == arch]
+        assert of_arch, arch
+        for entry in of_arch:
+            assert "-Xptxas" not in entry["nvcc_flags"], entry["name"]
+            conditional = [
+                item for item in entry["nvcc_flags_if"] if item["cuda"] == "==13.0"
+            ]
+            if arch == "sm_103a":
+                assert conditional == [workaround], entry["name"]
+            else:
+                assert workaround not in entry["nvcc_flags_if"], entry["name"]
 
 
 def test_toolchain_runs_hidden_count(monkeypatch):
-    """On nvcc 13.0.x the sm_103a calls take the host-count path; every other architecture / toolchain pair runs the
-    hidden valid-row count."""
-    from packaging.version import Version
-
+    """On CUDA 13.0 the sm_103a calls take the host-count path; every other architecture / toolchain pair runs
+    the hidden valid-row count.  The toolkit version is ``cake_build.record_cuda_version`` (the toolkit that
+    built the prebuilt libraries, else the local one)."""
     for version, sm_103a in (
-        ("13.0", False),
-        ("12.9", True),
-        ("13.1", True),
-        ("13.4", True),
+        ((13, 0), False),
+        ((12, 9), True),
+        ((13, 1), True),
+        ((13, 4), True),
     ):
-        monkeypatch.setattr(cake_jit, "get_cuda_version", lambda v=version: Version(v))
+        monkeypatch.setattr(
+            cake_build, "record_cuda_version", lambda arch, v=version: v
+        )
         assert cake_jit.toolchain_runs_hidden_count("sm_103a") is sm_103a, version
         assert cake_jit.toolchain_runs_hidden_count("sm_100a") is True, version
 
@@ -2355,17 +2341,14 @@ def _fake_record(arg_plan):
         "stages": ["row_grad"],
         "row_grad": {
             "module": "fake",
-            "sources": ["cake_lm_head_loss/fake/a.cu", "cake_lm_head_loss/fake/b.cu"],
-            "compile_flags": [],
+            "library": "cake_lm_head_loss_fake",
             "ffi_entry": "run",
             "arg_plan": arg_plan,
-            "closure_sha256": "0" * 64,
             "tma_workspace_bytes": 0,
             "workspace_bytes": 0,
             "grid": ["rows_c", 1, 1],
             "launch": {"block": [128, 1, 1], "cluster": [1, 1, 1]},
         },
-        "closure_sha256": "0" * 64,
     }
 
 
@@ -2648,20 +2631,34 @@ def test_binding_cache_is_lru_and_bounded():
     assert not BindingCache(capacity=1, enabled=False).enabled
 
 
-def test_binding_cache_capacity_from_environment(monkeypatch):
-    env = cake_backend.BINDING_CACHE_CAPACITY_ENV
-    monkeypatch.delenv(env, raising=False)
+def test_binding_cache_configure():
+    """The binding cache is configured through keywords and :meth:`BindingCache.configure` (the public module applies
+    its two environment variables through it at import): a positive-integer capacity, evicting the least recently used
+    bindings when it shrinks; ``enabled=False`` bypasses the cache and drops the remembered bindings."""
     assert BindingCache().capacity == cake_backend.BINDING_CACHE_DEFAULT_CAPACITY == 64
-    assert cake_backend.BINDING_CACHE.capacity >= 1
-    monkeypatch.setenv(env, "5")
-    assert cake_backend.binding_cache_capacity() == 5 and BindingCache().capacity == 5
+    assert BindingCache().enabled and cake_backend.BINDING_CACHE.capacity >= 1
     assert BindingCache(capacity=3).capacity == 3  # an explicit capacity wins
-    monkeypatch.setenv(env, " ")
-    assert BindingCache().capacity == 64
-    for bad in ("0", "-1", "many", "2.5"):
-        monkeypatch.setenv(env, bad)
+    cache = BindingCache(capacity=4)
+    for i in range(4):
+        cache.remember(("fwd", i), SimpleNamespace(owned_bytes=1))
+    # a hit refreshes ("fwd", 0): ("fwd", 1) is now the least recently used
+    assert cache.lookup(("fwd", 0)) is not None
+    assert cache.configure(capacity=2) is cache and cache.capacity == 2
+    assert len(cache) == 2 and list(cache._bindings) == [("fwd", 3), ("fwd", 0)]
+    cache.configure(capacity=8)
+    assert cache.capacity == 8 and len(cache) == 2  # growing evicts nothing
+    cache.configure(enabled=False)
+    assert not cache.enabled and len(cache) == 0 and cache.capacity == 8
+    cache.configure(enabled=True)
+    assert cache.enabled and cache.capacity == 8
+    cache.configure()  # nothing changes
+    assert cache.enabled and cache.capacity == 8
+    for bad in (0, -1, "5", "many", 2.5, True, [5]):
         with pytest.raises(ValueError, match="positive integer"):
-            BindingCache()
+            cache.configure(capacity=bad)
+    assert cache.capacity == 8
+    with pytest.raises(ValueError, match="positive integer"):
+        BindingCache(capacity=0)
 
 
 HOST_SHAPES = [(1, 16), (5, 4), (37, 16), (64, 64), (65, 64), (200, 64)]
@@ -2838,13 +2835,14 @@ def test_grad_weight_dtype_fp32():
     # the autograd entry cannot return an FP32 dW for a BF16 leaf (the engine casts to the leaf's dtype)
     with pytest.raises(ValueError, match="W.dtype"):
         _run(inp, 64, grad_weight_dtype=torch.float32)
-    with pytest.raises(ValueError, match="W.dtype"), _quiet_experimental():
-        chunked_lm_head_loss(
+    with pytest.raises(ValueError, match="W.dtype"):
+        cake_backend.chunked_lm_head_loss(
             inp.X,
             inp.W,
             inp.labels,
             loss_div=inp.loss_div,
             grad_weight_dtype=torch.float32,
+            backend="reference",
         )
     # the explicit pair: FP32 accumulators, one cast to the requested dtype
     fr = cake_backend.forward_loss(
@@ -3299,46 +3297,24 @@ def test_valid_row_index_and_scatter():
     assert tuple(empty.shape) == (5, 2) and torch.all(empty == 0)
 
 
-def test_compact_rows_default_env(monkeypatch):
-    monkeypatch.delenv(cake_backend.COMPACT_ROWS_ENV, raising=False)
+def test_switch_defaults_are_constants():
+    """Every switch is a keyword whose ``None`` selects a constant, documented default; the package reads no
+    environment variable (the public module ``flashinfer.chunked_lm_head`` owns the A/B variables)."""
     assert cake_backend.compact_rows_default() is True
-    monkeypatch.setenv(cake_backend.COMPACT_ROWS_ENV, "0")
-    assert cake_backend.compact_rows_default() is False
-    monkeypatch.setenv(cake_backend.COMPACT_ROWS_ENV, "1")
-    assert cake_backend.compact_rows_default() is True
-
-
-def test_fuse_dw_cast_default_env(monkeypatch):
-    monkeypatch.delenv(cake_backend.FUSE_DW_CAST_ENV, raising=False)
+    assert cake_backend._resolve_compact(None) is True
+    assert cake_backend._resolve_compact(False) is False
     assert cake_backend.fuse_dw_cast_default() is True
-    monkeypatch.setenv(cake_backend.FUSE_DW_CAST_ENV, "0")
-    assert cake_backend.fuse_dw_cast_default() is False
-    assert cake_backend._resolve_fuse(None) is False and cake_backend._resolve_fuse(
-        True
-    )
-    assert "gemm_dw_cast_bf16" not in stages_for_entry("loss")
-    monkeypatch.setenv(cake_backend.FUSE_DW_CAST_ENV, "1")
-    assert cake_backend.fuse_dw_cast_default() is True
+    assert cake_backend._resolve_fuse(None) is True
     assert cake_backend._resolve_fuse(False) is False
     assert "gemm_dw_cast_bf16" in stages_for_entry("loss")
-
-
-def test_dx_finalize_default_env(monkeypatch):
-    monkeypatch.delenv(cake_backend.DX_FINALIZE_ENV, raising=False)
+    assert "gemm_dw_cast_bf16" not in stages_for_entry("loss", fuse_dw_cast=False)
     assert cake_backend.dx_finalize_default() is True
     assert cake_backend.DX_FINALIZE_STAGES == ("slab_sum", "scale_cast_scatter_bf16")
-    monkeypatch.setenv(cake_backend.DX_FINALIZE_ENV, "0")
-    assert cake_backend.dx_finalize_default() is False
-    assert cake_backend._resolve_dx_finalize(None) is False
-    assert cake_backend._resolve_dx_finalize(True) is True
-    monkeypatch.setenv(cake_backend.DX_FINALIZE_ENV, "1")
-    assert cake_backend.dx_finalize_default() is True
+    assert cake_backend._resolve_dx_finalize(None) is True
     assert cake_backend._resolve_dx_finalize(False) is False
-
-
-def test_hidden_count_default_env(monkeypatch):
-    monkeypatch.delenv(cake_backend.HIDDEN_COUNT_ENV, raising=False)
     assert cake_backend.hidden_count_default() is True
+    assert cake_backend._resolve_hidden_count(None) is True
+    assert cake_backend._resolve_hidden_count(False) is False
     assert cake_backend.HIDDEN_COUNT_STAGE == "gather_rows_bf16"
     assert cake_backend.HIDDEN_COUNT_STAGE in cake_jit.BASE_STAGES
     assert cake_backend.HIDDEN_COUNT_STAGE in cake_jit.ROW_STAGES
@@ -3348,10 +3324,50 @@ def test_hidden_count_default_env(monkeypatch):
         "count",
         "out",
     )
-    monkeypatch.setenv(cake_backend.HIDDEN_COUNT_ENV, "0")
-    assert cake_backend.hidden_count_default() is False
-    monkeypatch.setenv(cake_backend.HIDDEN_COUNT_ENV, "1")
-    assert cake_backend.hidden_count_default() is True
+    assert cake_backend.gemm_tuning_default() == {}
+    for module in (cake_backend, cake_jit, cake_build, pkg):
+        source = inspect.getsource(module)
+        assert "os.environ" not in source and "getenv" not in source, module.__name__
+    # the memory report and the stage list follow the same defaults
+    assert memory_report(16231, DEFAULT_H, DEFAULT_V, 4096)["fuse_dw_cast"] is True
+    assert memory_report(4097, DEFAULT_H, DEFAULT_V, 4096, valid_rows=3892)[
+        "dx_finalize"
+    ]
+
+
+def test_switch_keywords_reach_the_autograd_entries():
+    """The autograd entry points take every switch as a keyword and resolve it once: on the reference backend the
+    non-default values of the inert switches give bitwise the default results, and an unknown ``dw_stream`` is a
+    ``ValueError`` from both entries."""
+    inp = _host_inputs(37)
+    base = _run(inp, 16, compact_rows=True)
+    other = _run(
+        inp,
+        16,
+        compact_rows=True,
+        dx_finalize=False,
+        dw_stream=False,
+        hidden_count=False,
+        gemm_tuning={},
+    )
+    for key in ("loss", "logp", "dX", "dW"):
+        assert torch.equal(base[key], other[key]), key
+    lp = _run(inp, 16, entry="logprob", compact_rows=True)
+    lp_other = _run(
+        inp,
+        16,
+        entry="logprob",
+        compact_rows=True,
+        dx_finalize=False,
+        dw_stream=True,
+        hidden_count=False,
+        gemm_tuning={},
+    )
+    for key in ("logp", "dX", "dW"):
+        assert torch.equal(lp[key], lp_other[key]), key
+    for entry in ("loss", "logprob"):
+        with pytest.raises(ValueError, match="dw_stream"):
+            _run(inp, 16, entry=entry, dw_stream="sometimes")
 
 
 def test_compaction_index_matches_nonzero():
@@ -3478,9 +3494,7 @@ def test_hidden_count_eligibility_rules(monkeypatch):
     (``HIDDEN_COUNT_MIN_CHUNKS``: one- and two-chunk calls cannot hide the path's fixed host cost behind chunk 0's GEMM
     and take the previous path), ``T > 0``, an ``X`` the GEMM reads in place (no contiguous copy, a 16-byte-aligned
     base) and a toolchain whose sm_103a code runs it (not nvcc 13.0.x)."""
-    from packaging.version import Version
-
-    monkeypatch.setattr(cake_jit, "get_cuda_version", lambda: Version("13.4"))
+    monkeypatch.setattr(cake_build, "record_cuda_version", lambda arch: (13, 4))
     assert cake_backend.HIDDEN_COUNT_MIN_CHUNKS == 3
     name = "cake_lm_head_loss_fake"
 
@@ -3549,10 +3563,10 @@ def test_hidden_count_eligibility_rules(monkeypatch):
     sm_103a = dict(full, arch="sm_103a")
     monkeypatch.setitem(cake_jit.MODULES, name, sm_103a)
     assert elig(short, X, sm_103a, name, stats=True)  # the same rules on sm_103a
-    monkeypatch.setattr(cake_jit, "get_cuda_version", lambda: Version("13.0"))
+    monkeypatch.setattr(cake_build, "record_cuda_version", lambda arch: (13, 0))
     assert not elig(
         short, X, sm_103a, name, stats=True
-    )  # nvcc 13.0.x: the sm_103a calls take the host-count path
+    )  # CUDA 13.0: the sm_103a calls take the host-count path
     monkeypatch.setitem(cake_jit.MODULES, name, full)
     assert elig(short, X, full, name, stats=True)  # sm_100a is not affected
 
@@ -3596,8 +3610,7 @@ def test_hidden_count_switch_is_inert_on_the_reference_backend(
     inp = _host_inputs(T, objective, ignore_frac=ignore)
     out = {}
     for env in ("0", "1"):
-        monkeypatch.setenv(cake_backend.HIDDEN_COUNT_ENV, env)
-        out[env] = _run(inp, C, entry=entry, compact_rows=True)
+        out[env] = _run(inp, C, entry=entry, compact_rows=True, hidden_count=env == "1")
         _check_dtypes(out[env], inp)
         assert torch.all(out[env]["dX"][~inp.valid] == 0)
     for key in ("loss", "logp", "dX", "dW"):
@@ -3709,10 +3722,8 @@ _DX_FINALIZE_CASES = [  # (objective, entry, ignored fraction): multi-chunk + ta
     _DX_FINALIZE_CASES,
     ids=["_".join(c) for c in _DX_FINALIZE_CASES],
 )
-def test_dx_finalize_switch_is_bitwise_on_the_reference_backend(
-    objective, entry, frac, monkeypatch
-):
-    """The fused dX finalize off (``0``: cast + zero fill + ``index_copy_``) and on (one-pass scatter) through the
+def test_dx_finalize_switch_is_bitwise_on_the_reference_backend(objective, entry, frac):
+    """The fused dX finalize off (``dx_finalize=False``: cast + zero fill + ``index_copy_``) and on (one-pass scatter) through the
     autograd entry points and the explicit pair, on the reference backend: ``loss`` / ``logp`` / ``dX`` / ``dW``
     bitwise; the valid-row mask accompanies the compact index exactly when the rows are compacted and the switch is on;
     the all-ignored call returns zeros without the mask being read."""
@@ -3729,8 +3740,7 @@ def test_dx_finalize_switch_is_bitwise_on_the_reference_backend(
     compacted = n_valid < T
     out = {}
     for env in ("0", "1"):
-        monkeypatch.setenv(cake_backend.DX_FINALIZE_ENV, env)
-        result = _run(inp, C, entry=entry, compact_rows=True)
+        result = _run(inp, C, entry=entry, compact_rows=True, dx_finalize=env == "1")
         _check_dtypes(result, inp)
         assert torch.all(result["dX"][~inp.valid] == 0)
         if entry == "loss":
@@ -3745,6 +3755,7 @@ def test_dx_finalize_switch_is_bitwise_on_the_reference_backend(
                 chunk_size=C,
                 backend="reference",
                 compact_rows=True,
+                dx_finalize=env == "1",
             )
             assert (fr.row_index is None) == (not compacted)
             assert (fr.row_valid is not None) == (env == "1" and compacted)
@@ -3894,12 +3905,14 @@ def test_dx_finalize_plan_keys():
         stage_values("scale_cast_scatter_bf16", on.tensors, on.plan, "dx")
 
 
-def test_dw_stream_default_env(monkeypatch):
-    """The dW side-stream knob: unset / ``auto`` = calls of :data:`DW_STREAM_MIN_CHUNKS` (three) or more chunks,
-    ``1`` = every multi-chunk call, ``0`` = never; a one-chunk call never (its only accumulate is deferred to the
-    backward)."""
+def test_dw_stream_keyword_modes():
+    """The dW side-stream keyword and its modes: ``None`` / ``"auto"`` = calls of :data:`DW_STREAM_MIN_CHUNKS` (three)
+    or more chunks, ``True`` / ``"1"`` = every multi-chunk call, ``False`` / ``"0"`` = never; a one-chunk call never
+    (its only accumulate is deferred to the backward); any other value is a ``ValueError``."""
     assert cake_backend.DW_STREAM_MIN_CHUNKS == 3
-    monkeypatch.delenv(cake_backend.DW_STREAM_ENV, raising=False)
+    assert cake_backend.DW_STREAM_MODES == ("0", "1", "auto")
+    for value in (None, "auto", " AUTO "):
+        assert cake_backend.dw_stream_mode(value) == "auto"
     assert cake_backend.dw_stream_mode() == "auto"
     assert [cake_backend.dw_side_stream(n) for n in (0, 1, 2, 3, 4, 8)] == [
         False,
@@ -3909,30 +3922,31 @@ def test_dw_stream_default_env(monkeypatch):
         True,
         True,
     ]
-    for value in ("0", "false", "off", "no", " OFF "):
-        monkeypatch.setenv(cake_backend.DW_STREAM_ENV, value)
-        assert cake_backend.dw_stream_mode() == "0"
-        assert not any(cake_backend.dw_side_stream(n) for n in (1, 2, 3, 8))
-    for value in ("1", "true", "on", "yes", " On "):
-        monkeypatch.setenv(cake_backend.DW_STREAM_ENV, value)
-        assert cake_backend.dw_stream_mode() == "1"
-        assert [cake_backend.dw_side_stream(n) for n in (1, 2, 3)] == [
+    for value in (False, "0"):
+        assert cake_backend.dw_stream_mode(value) == "0"
+        assert not any(cake_backend.dw_side_stream(n, value) for n in (1, 2, 3, 8))
+    for value in (True, "1"):
+        assert cake_backend.dw_stream_mode(value) == "1"
+        assert [cake_backend.dw_side_stream(n, value) for n in (1, 2, 3)] == [
             False,
             True,
             True,
         ]
-    for value in ("auto", "AUTO", "", "anything-else"):
-        monkeypatch.setenv(cake_backend.DW_STREAM_ENV, value)
-        assert cake_backend.dw_stream_mode() == "auto"
-        assert [cake_backend.dw_side_stream(n) for n in (2, 3)] == [False, True]
+    for mode in cake_backend.DW_STREAM_MODES:
+        assert cake_backend.dw_stream_mode(mode) == mode  # idempotent on a mode
+    for bad in ("on", "off", "yes", "no", "", "anything-else", 0, 1, 2.0, [True]):
+        with pytest.raises(ValueError, match="dw_stream"):
+            cake_backend.dw_stream_mode(bad)
+        with pytest.raises(ValueError, match="dw_stream"):
+            cake_backend.dw_side_stream(3, bad)
 
 
-def test_dw_stream_schedule_keys(monkeypatch):
+def test_dw_stream_schedule_keys():
     """The side-stream placement over the launch keys: joins at the first key of every chunk after the first and
     before the keys that follow the chunk loop, forks at each chunk's ``row_grad``, sides at the per-chunk
     accumulates only -- a deferred last chunk's cast GEMM and the flat casts stay on the caller's stream; ``None``
-    for the loss entry's cast keys, for a plan without ``dW`` and whenever the rule says no.  The reference runner
-    takes no part (host operators on one stream)."""
+    for the loss entry's cast keys, for a plan without ``dW`` and whenever the ``dw_stream`` keyword or the rule says
+    no.  The reference runner takes no part (host operators on one stream)."""
     g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
 
     def plan_for(T, *, entry="loss", fuse=True, need_dw=True):
@@ -3956,7 +3970,6 @@ def test_dw_stream_schedule_keys(monkeypatch):
                 first.setdefault(index, pos)
         return first
 
-    monkeypatch.delenv(cake_backend.DW_STREAM_ENV, raising=False)
     three = plan_for(
         10000
     )  # chunks (0, 4096), (4096, 4096), (8192, 1808); the last deferred
@@ -3998,21 +4011,27 @@ def test_dw_stream_schedule_keys(monkeypatch):
     assert (
         cake_backend.side_stream_schedule(two, cake_backend.forward_keys(two)) is None
     )
-    monkeypatch.setenv(cake_backend.DW_STREAM_ENV, "1")
     _, forks_2, sides_2 = cake_backend.side_stream_schedule(
-        two, cake_backend.forward_keys(two)
+        two, cake_backend.forward_keys(two), dw_stream=True
     )
     assert len(sides_2) == 1 and len(forks_2) == 2
-    monkeypatch.setenv(cake_backend.DW_STREAM_ENV, "0")
-    assert cake_backend.side_stream_schedule(three, fwd) is None
+    assert cake_backend.side_stream_schedule(three, fwd, dw_stream=False) is None
+    assert cake_backend.side_stream_schedule(three, fwd, "0") is None
+    assert cake_backend.side_stream_schedule(three, fwd, "auto") == (
+        joins,
+        forks,
+        sides,
+    )
     inp = _host_inputs(37)
     common = dict(
         objective="ce", loss_div=inp.loss_div, chunk_size=16, backend="reference"
     )
     results = []
-    for value in ("0", "1"):
-        monkeypatch.setenv(cake_backend.DW_STREAM_ENV, value)
-        runner = prepare_lm_head_loss(inp.X, inp.W, inp.labels, **common)
+    for value in (False, True):
+        runner = prepare_lm_head_loss(
+            inp.X, inp.W, inp.labels, dw_stream=value, **common
+        )
+        assert runner.dw_stream == cake_backend.dw_stream_mode(value)
         runner.step(torch.tensor(3.0))
         results.append(
             (runner.loss.clone(), runner.dx_out.clone(), runner.dw_out.clone())
@@ -4833,8 +4852,8 @@ def test_device_grad_weight_dtype_fp32(glm_weight):
     _require_program(entry="loss")
     inp = _device_inputs(4097, W=glm_weight)
     bf16 = _run(inp, 4096, backend="cake")
-    with pytest.raises(ValueError, match="W.dtype"), _quiet_experimental():
-        chunked_lm_head_loss(
+    with pytest.raises(ValueError, match="W.dtype"):
+        cake_backend.chunked_lm_head_loss(
             inp.X.detach().requires_grad_(),
             inp.W,
             inp.labels,
@@ -5119,10 +5138,11 @@ def test_device_compaction_parity(glm_weight):
 
 
 def test_device_dw_stream_switch_is_bitwise(glm_weight, monkeypatch):
-    """The dW side stream (``FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM``) off, forced on and at the ``auto`` rule,
-    through the autograd entry points and a prepared runner: ``loss`` / ``logp`` / ``dX`` / ``dW`` bitwise for both
-    entries (only the launch stream of the per-chunk accumulate differs); the launches of a call with the side stream
-    enter exactly two streams, those of a single-stream call one; the remembered binding serves every mode."""
+    """The dW side stream (the ``dw_stream`` keyword) off, forced on and at the ``auto`` rule, through the autograd
+    entry points and a prepared runner: ``loss`` / ``logp`` / ``dX`` / ``dW`` bitwise for both entries (only the
+    launch stream of the per-chunk accumulate differs); the launches of a call with the side stream enter exactly two
+    streams, those of a single-stream call one; the remembered binding serves every mode (the mode is a launch
+    placement, not part of the binding)."""
     _require_program(entry="loss")
     streams: list[int] = []
     real = cake_backend._ffi_stream_context
@@ -5140,19 +5160,25 @@ def test_device_dw_stream_switch_is_bitwise(glm_weight, monkeypatch):
     )  # 8265 valid rows = three chunks: auto = on
     assert int(two.valid.sum()) == 4750 and int(three.valid.sum()) == 8265
     out = {}
-    for name, inp, env, expect in (
-        ("two_off", two, "0", 1),
-        ("two_on", two, "1", 2),
+    for name, inp, mode, expect in (
+        ("two_off", two, False, 1),
+        ("two_on", two, True, 2),
         ("two_auto", two, "auto", 1),
         ("three_off", three, "0", 1),
-        ("three_auto", three, "auto", 2),
+        ("three_auto", three, None, 2),
     ):
-        monkeypatch.setenv(cake_backend.DW_STREAM_ENV, env)
         streams.clear()
-        res = _run(inp, 4096, backend="cake", compact_rows=True)
+        res = _run(inp, 4096, backend="cake", compact_rows=True, dw_stream=mode)
         assert len(set(streams)) == expect, (name, len(set(streams)))
         streams.clear()
-        lp = _run(inp, 4096, entry="logprob", backend="cake", compact_rows=True)
+        lp = _run(
+            inp,
+            4096,
+            entry="logprob",
+            backend="cake",
+            compact_rows=True,
+            dw_stream=mode,
+        )
         assert len(set(streams)) == expect, (name, "logprob", len(set(streams)))
         _check_dtypes(res, inp)
         out[name] = (res, lp)
@@ -5176,10 +5202,10 @@ def test_device_dw_stream_switch_is_bitwise(glm_weight, monkeypatch):
         compact_rows=True,
     )
     runner = prepare_lm_head_loss(three.X, three.W, three.labels, **kw)
-    assert runner.plan.num_chunks == 3
+    assert runner.plan.num_chunks == 3 and runner.dw_stream == "auto"
     steps = {}
     for env, expect in (("0", 1), ("auto", 2), ("1", 2)):
-        monkeypatch.setenv(cake_backend.DW_STREAM_ENV, env)
+        runner.dw_stream = env  # the mode of the following launches (``dw_stream`` of prepare_lm_head_loss)
         streams.clear()
         runner.step()
         torch.cuda.synchronize()
@@ -5199,15 +5225,14 @@ def test_device_dw_stream_switch_is_bitwise(glm_weight, monkeypatch):
 _FRESH_PROCESS_SCRIPT = """
 import sys, torch
 sys.path.insert(0, {root!r})
-from flashinfer.chunked_lm_head import chunked_lm_head_logprob
 from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
+from tests.test_helpers.cake_package import cake_package
+cake_backend = cake_package("cake_lm_head_loss", "cake_backend")
 W = make_inputs(1, seed={seed_w}, device="cuda", ignore_frac=0.0).W  # the module fixture's weight
 inp = make_inputs({T}, seed={seed}, device="cuda", W=W, ignore_frac=0.05)
 X = inp.X.detach().requires_grad_(True)
 W = inp.W.detach().requires_grad_(True)
-import warnings
-warnings.simplefilter("ignore")
-logp = chunked_lm_head_logprob(X, W, inp.labels, chunk_size={C}, backend="cake")
+logp = cake_backend.chunked_lm_head_logprob(X, W, inp.labels, chunk_size={C}, backend="cake")
 dX, dW = torch.autograd.grad(logp, (X, W), inp.dlogp)
 torch.cuda.synchronize()
 torch.save(dict(logp=logp.detach().cpu(), dX=dX.cpu(), dW=dW.cpu()), {out!r})
@@ -5226,11 +5251,10 @@ def test_device_logprob_grad_from_fresh_thread_and_process(glm_weight, tmp_path)
     def grad_path():
         X = inp.X.detach().requires_grad_(True)
         W = inp.W.detach().requires_grad_(True)
-        with _quiet_experimental():
-            logp = chunked_lm_head_logprob(
-                X, W, inp.labels, chunk_size=C, backend="cake"
-            )
-            dX, dW = torch.autograd.grad(logp, (X, W), inp.dlogp)
+        logp = cake_backend.chunked_lm_head_logprob(
+            X, W, inp.labels, chunk_size=C, backend="cake"
+        )
+        dX, dW = torch.autograd.grad(logp, (X, W), inp.dlogp)
         torch.cuda.synchronize()
         return dict(logp=logp.detach(), dX=dX, dW=dW)
 
@@ -5438,8 +5462,8 @@ def test_device_fused_dw_cast_is_bitwise(glm_weight):
 
 
 def test_device_dx_finalize_is_bitwise(glm_weight, monkeypatch):
-    """The fused dX finalize on the generated program: switch ``0`` (host ``add_`` chain, cast, zero fill,
-    ``index_copy_``) and ``1`` (``slab_sum`` + ``scale_cast_scatter_bf16``) give bitwise the same ``loss`` / ``logp`` /
+    """The fused dX finalize on the generated program: ``dx_finalize=False`` (host ``add_`` chain, cast, zero fill,
+    ``index_copy_``) and ``True`` (``slab_sum`` + ``scale_cast_scatter_bf16``) give bitwise the same ``loss`` / ``logp`` /
     ``dX`` / ``dW`` on both entries, with and without ignored rows (S >= 2: the chunk loops slice their dX GEMMs; S = 1:
     the switch is a no-op); the fused path binds the slab kernel for the sliced chunks and launches the scatter once per
     compacted dX output; the previous path binds neither."""
@@ -5476,13 +5500,20 @@ def test_device_dx_finalize_is_bitwise(glm_weight, monkeypatch):
         del probe
         out = {}
         for env in ("0", "1"):
-            monkeypatch.setenv(cake_backend.DX_FINALIZE_ENV, env)
+            switch = env == "1"
             with _cache(False):
                 bound.clear()
                 res = {
-                    "loss": _run(inp, 4096, backend="cake", compact_rows=True),
+                    "loss": _run(
+                        inp, 4096, backend="cake", compact_rows=True, dx_finalize=switch
+                    ),
                     "logprob": _run(
-                        inp, 4096, entry="logprob", backend="cake", compact_rows=True
+                        inp,
+                        4096,
+                        entry="logprob",
+                        backend="cake",
+                        compact_rows=True,
+                        dx_finalize=switch,
                     ),
                 }
                 fr = cake_backend.forward_loss(
@@ -5494,6 +5525,7 @@ def test_device_dx_finalize_is_bitwise(glm_weight, monkeypatch):
                     chunk_size=1000,
                     backend="cake",
                     compact_rows=True,
+                    dx_finalize=switch,
                 )
                 assert (fr.row_index is not None) == compacted
                 assert (fr.row_valid is not None) == (env == "1" and compacted)
@@ -5528,7 +5560,6 @@ def test_device_dx_finalize_is_bitwise(glm_weight, monkeypatch):
         assert torch.all(out["1"]["loss"]["dX"][~inp.valid] == 0)
     # the kernels against the torch forms: slab_sum over a prepared runner's workspace (the 4097-row loop: a one-row
     # tail chunk, K-sliced on every supported device), the scatter eagerly
-    monkeypatch.setenv(cake_backend.DX_FINALIZE_ENV, "1")
     inp = make_inputs(4097, seed=SEED + 50, device=CUDA, W=glm_weight, ignore_frac=0.0)
     common = dict(
         objective="ce", loss_div=inp.loss_div, chunk_size=4096, backend="cake"
@@ -5670,8 +5701,8 @@ def test_device_hidden_count_kernels_match_torch(glm_weight):
 
 
 def test_device_hidden_count_switch_is_bitwise(glm_weight, monkeypatch):
-    """The hidden valid-row count on the generated program: switch ``0`` (the count and the index on the host before
-    the first launch) and ``1`` (device compaction, chunk 0's gather kernel and device-count logits GEMM queued before
+    """The hidden valid-row count on the generated program: ``hidden_count=False`` (the count and the index on the host
+    before the first launch) and ``True`` (device compaction, chunk 0's gather kernel and device-count logits GEMM queued before
     the count is read) give bitwise the same ``loss`` / ``logp`` / ``dX`` / ``dW`` on both entries over the three
     outcomes (some rows ignored, none, all) and over one-, two-, three- and four-chunk calls -- the count serves three
     chunks and more (``HIDDEN_COUNT_MIN_CHUNKS``), the shorter calls take the host-count path on either value; with the
@@ -5733,18 +5764,31 @@ def test_device_hidden_count_switch_is_bitwise(glm_weight, monkeypatch):
         n_valid = int(inp.valid.sum())
         out = {}
         for env in ("0", "1"):
-            monkeypatch.setenv(cake_backend.HIDDEN_COUNT_ENV, env)
+            switch = env == "1"
             monkeypatch.setattr(
                 cake_backend,
                 "valid_rows",
-                refuse_valid_rows if env == "1" and hidden else real_valid_rows,
+                refuse_valid_rows if switch and hidden else real_valid_rows,
             )
             with _cache(False):
                 log.clear()
-                res = {"loss": _run(inp, 4096, backend="cake", compact_rows=True)}
+                res = {
+                    "loss": _run(
+                        inp,
+                        4096,
+                        backend="cake",
+                        compact_rows=True,
+                        hidden_count=switch,
+                    )
+                }
                 if objective == "ce":
                     res["logprob"] = _run(
-                        inp, 4096, entry="logprob", backend="cake", compact_rows=True
+                        inp,
+                        4096,
+                        entry="logprob",
+                        backend="cake",
+                        compact_rows=True,
+                        hidden_count=switch,
                     )
                 fr = cake_backend.forward_loss(
                     inp.X,
@@ -5757,6 +5801,7 @@ def test_device_hidden_count_switch_is_bitwise(glm_weight, monkeypatch):
                     chunk_size=4096,
                     backend="cake",
                     compact_rows=True,
+                    hidden_count=switch,
                 )
                 torch.cuda.synchronize()
             binds = [s for kind, s in log if kind == "bind"]
@@ -5805,16 +5850,16 @@ def test_device_hidden_count_switch_is_bitwise(glm_weight, monkeypatch):
                 assert _same(a, b), (T, objective, ignore, entry, key)
     monkeypatch.setattr(cake_backend, "valid_rows", real_valid_rows)
     # the remembered binding of the hidden-count path: a hit is bitwise the validating call
-    monkeypatch.setenv(cake_backend.HIDDEN_COUNT_ENV, "1")
     inp = make_inputs(8193, seed=SEED + 63, device=CUDA, W=glm_weight, ignore_frac=0.05)
+    kw = dict(backend="cake", compact_rows=True, hidden_count=True)
     with _cache(True) as cache:
         cache.clear()
-        first = _run(inp, 4096, backend="cake", compact_rows=True)
-        second = _run(inp, 4096, backend="cake", compact_rows=True)
+        first = _run(inp, 4096, **kw)
+        second = _run(inp, 4096, **kw)
         assert cache.hits >= 1 and len(cache) >= 1
         for key in ("loss", "logp", "dX", "dW"):
             assert torch.equal(first[key], second[key]), key
-        lp1 = _run(inp, 4096, entry="logprob", backend="cake", compact_rows=True)
-        lp2 = _run(inp, 4096, entry="logprob", backend="cake", compact_rows=True)
+        lp1 = _run(inp, 4096, entry="logprob", **kw)
+        lp2 = _run(inp, 4096, entry="logprob", **kw)
         for key in ("logp", "dX", "dW"):
             assert torch.equal(lp1[key], lp2[key]), key

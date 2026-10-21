@@ -6,17 +6,15 @@ The reference follows the MoK recipe in schedule order: x, the SwiGLU
 activation, the score-scaled dY and d_gate/d_up are MXFP8 (32-element blocks
 along K), routed weights are caller-prequantized, GEMMs accumulate in FP32 on
 dequantized operands and round to BF16, and the shared expert stays BF16.
+
+Backend suite: the package is imported only through
+:func:`tests.test_helpers.cake_package.cake_package`; the :mod:`flashinfer.mok`
+wrapper is covered by ``test_mok_bf16_api.py``.
 """
 
 import pytest
 import torch
 
-from flashinfer.experimental.cake_mok_bf16._kernels import (
-    MoKBackwardMXFP8,
-    MoKForwardMXFP8,
-    MoKRecomputeMXFP8,
-)
-from flashinfer.mok import quantize_mok_mxfp8_weights
 from tests.experimental._mok_reference import (
     mxfp8_dequantize as dequantize,
     mxfp8_quantize as quantize,
@@ -24,6 +22,14 @@ from tests.experimental._mok_reference import (
     single_rank_schedule,
     swiglu,
 )
+from tests.test_helpers.cake_package import cake_package
+
+kernels = cake_package("cake_mok_bf16", "_kernels")
+api = cake_package("cake_mok_bf16", "api")
+MoKBackwardMXFP8 = kernels.MoKBackwardMXFP8
+MoKForwardMXFP8 = kernels.MoKForwardMXFP8
+MoKRecomputeMXFP8 = kernels.MoKRecomputeMXFP8
+quantize_mok_mxfp8_weights = api.quantize_mok_mxfp8_weights
 
 LIMITS = pytest.mark.parametrize("swiglu_limit", [None, 0.75], ids=["plain", "clamped"])
 

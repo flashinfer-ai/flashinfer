@@ -71,8 +71,8 @@ are designed to co-exist, and neither supersedes the other.
 cuDNN Frost backend
 ~~~~~~~~~~~~~~~~~~~
 
-Frost is a stable ``MoELayer`` backend on SM107a, with additional BF16 support
-on SM120a. Its four configs are included in the default backend list and can
+Frost is a stable ``MoELayer`` backend on SM107a and SM120a. Its four configs
+are included in the default backend list and can
 also be selected through ``BackendOptions``. Candidates with unavailable weight
 views or unsupported input shapes are skipped. It does not require
 ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS``.
@@ -145,6 +145,8 @@ layer.
 
 The validated SM107 dependency baseline is PyTorch 2.14.1, CuTe DSL 4.8.0, TVM-FFI
 0.1.14.post1, and external PTXAS 13.4.92. CUDA 13.5 PTXAS is also validated.
+The SM120 kernels were validated with PyTorch 2.14.0, CuTe DSL 4.7.1, TVM-FFI
+0.1.13.post3, and CUDA 13.4 with the bundled assembler.
 Runtime checks additionally require the DSL
 primitives and PyTorch CUDA Graph resource-retention APIs used by the backend.
 Older dependencies remain usable by other FlashInfer backends; these requirements
@@ -160,13 +162,13 @@ skips unavailable Frost candidates; explicit selection reports the missing requi
 Both external PTXAS and the bundled assembler must report CUDA 13.4 or newer.
 There is no patch-level minimum.
 Use the latest assembler patch release for SM107 tensor-map updates.
-SM120 BF16 kernels do not update tensor maps and retain capability-based compiler
+SM120 kernels do not update tensor maps and retain capability-based compiler
 admission without this SM107-specific assembler minimum.
 
 Prepare and optionally autotune before CUDA Graph capture. Frozen device sources
 ship in the wheel and are compiled for the requested geometry into the writable
 FlashInfer cache. The four fixed routing/finalize adapters are also registered
-for SM107 AOT builds, and the BF16 adapter is registered for SM120 AOT builds.
+for SM107 and SM120 AOT builds.
 Geometry-specialized DSL kernels retain source/JIT delivery.
 No runtime cuDNN Frontend installation is required.
 
@@ -234,12 +236,13 @@ Multi-LoRA MoE (BGMV)
 Batched Gather-Matrix-Vector kernels for serving multiple LoRA adapters on
 top of a Mixture-of-Experts layer (shrink + expand).
 
-:func:`prepare_bgmv_moe` returns a graph-replayable plan. On SM90, SM100 and
-SM103 devices the generated Cake programs serve one LoRA slice with rank 8, 16,
-32 or 64 and any hidden size that is a positive multiple of 8 (hidden 2688 and
-3072 at rank 32 use the specialized measured bodies at up to 2048 tokens, ``plan.variant ==
-"specialized"``; everything else the runtime-hidden generic bundles,
-``plan.variant == "generic"``); the output has one owner per token, so replays
+:func:`prepare_bgmv_moe` returns a graph-replayable plan. On SM90, SM100, SM103
+and SM107 devices the generated Cake programs serve one LoRA slice with rank 8,
+16, 32 or 64 and any hidden size that is a positive multiple of 8 (hidden 2688
+and 3072 at rank 32 use the specialized measured bodies at 32 to 1024 tokens on
+SM100, SM103 and SM107, ``plan.variant == "specialized"``; everything else, SM90
+included, the runtime-hidden generic bundles, ``plan.variant == "generic"``);
+the output has one owner per token, so replays
 are bitwise reproducible. Arbitrary pair order (for example expert-sorted
 dispatch) is served through a token->pair route index that the shrink kernels
 publish and the expand kernels read in O(1) per CTA; the generic shrink splits the hidden
@@ -313,6 +316,7 @@ TensorRT-LLM Fused MoE
     trtllm_fp8_per_tensor_scale_routed_moe
     trtllm_mxint4_block_scale_moe
     trtllm_mxint4_block_scale_routed_moe
+    trtllm_fused_moe_workspace_size
 
 AlphaMoE FP8 Block-Scaled MoE (SM100/SM103)
 --------------------------------------------

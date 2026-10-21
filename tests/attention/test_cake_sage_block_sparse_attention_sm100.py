@@ -12,18 +12,33 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+Backend suite of the SM100 / SM103 programs of the Cake Sage block-sparse
+attention package: the Sage-FP8 block-sparse attention forward against an
+exact-P dequantized reference, the fused quantizer against the torch recipe,
+the one-launch and CUDA-Graph contract of the host path, and the package's
+``build.json`` contract.  It imports the package only through
+``tests.test_helpers.cake_package`` and nothing else from flashinfer; the
+flashinfer public routes are covered by
+``test_cake_sage_block_sparse_attention_sm100_api.py``.
 """
 
 import math
+import re
+from pathlib import Path
 
 import pytest
 import torch
 
-from flashinfer.cute_dsl.sparse.bsa_sage_sm100_cake import (
-    bsa_attn_sm100_sage_fwd_cake,
-    is_cake_sage_sm100_supported,
-    sage_fp8_quantize_sm100,
-)
+from tests.test_helpers.cake_package import cake_package
+
+pkg = cake_package("cake_sage_block_sparse_attention")
+cake_build = cake_package("cake_sage_block_sparse_attention", "cake_build")
+loader = cake_package("cake_sage_block_sparse_attention", "cake_jit")
+
+bsa_attn_sm100_sage_fwd_cake = pkg.bsa_attn_sm100_sage_fwd_cake
+is_cake_sage_sm100_supported = pkg.is_cake_sage_sm100_supported
+sage_fp8_quantize_sm100 = pkg.sage_fp8_quantize_sm100
 
 _HEAD_DIM = 128
 _BLOCK = 64
@@ -33,6 +48,19 @@ requires_sm100 = pytest.mark.skipif(
     not is_cake_sage_sm100_supported(),
     reason="Cake Sage-FP8 block-sparse attention requires SM100 or SM103",
 )
+
+
+@pytest.fixture(autouse=True, scope="module")
+def warmup_jit():
+    # Build the local architecture's libraries that have no prebuilt file before
+    # the first test, through the spec objects the package's loader itself builds
+    # on first use (``cake_build.load_library``); a prebuilt or already cached
+    # library loads without compiling.
+    if is_cake_sage_sm100_supported():
+        arch = loader.arch_for_capability(torch.cuda.get_device_capability())
+        for spec in loader.specs_for_arch(arch):
+            spec.build_and_load()
+    yield
 
 
 def _ceil_div(a, b):
@@ -145,13 +173,17 @@ def _reference(
 
 
 _CASES = [
-    # name, batch, heads, kv_heads, sq, sk, selected, per_row, empty_row, block_sizes_rank, valid_last, lse
-    ("aligned_b1_h8_s256", 1, 8, 8, 256, 256, 2, False, False, 0, None, False),
-    ("ragged_q_k_rank1_lse", 2, 3, 3, 257, 1000, 6, False, False, 1, 17, True),
-    ("per_row_counts_empty_row", 2, 4, 4, 320, 1024, 8, True, True, 0, None, True),
-    ("gqa_h4_hkv2_rank3", 1, 4, 2, 100, 257, 4, True, False, 3, 33, False),
-    ("gqa_h8_hkv1_rank2", 2, 8, 1, 65, 96, 2, False, False, 2, 32, True),
-    ("dense_b1_h4_s1024", 1, 4, 4, 1024, 1024, 16, False, False, 0, None, False),
+    # name, batch, heads, kv_heads, sq, sk, selected, per_row, empty_row, block_sizes_rank, valid_last, lse, q_gain
+    ("aligned_b1_h8_s256", 1, 8, 8, 256, 256, 2, False, False, 0, None, False, 1.0),
+    ("ragged_q_k_rank1_lse", 2, 3, 3, 257, 1000, 6, False, False, 1, 17, True, 1.0),
+    ("per_row_counts_empty_row", 2, 4, 4, 320, 1024, 8, True, True, 0, None, True, 1.0),
+    ("gqa_h4_hkv2_rank3", 1, 4, 2, 100, 257, 4, True, False, 3, 33, False, 1.0),
+    ("gqa_h8_hkv1_rank2", 2, 8, 1, 65, 96, 2, False, False, 2, 32, True, 1.0),
+    ("dense_b1_h4_s1024", 1, 4, 4, 1024, 1024, 16, False, False, 0, None, False, 1.0),
+    # A peaked softmax: Q scaled by 3 before quantization concentrates each row on
+    # one token, so a one-count row quantizes a dominant P entry (the shape of the
+    # SM100 hybrid-exp2 regression); rank-2 block sizes cut the last block to 40.
+    ("peaked_gqa_h6_hkv3_rank2", 3, 6, 3, 320, 1024, 5, False, False, 2, 40, True, 3.0),
 ]
 
 
@@ -169,11 +201,14 @@ def _make_case(case, device):
         rank,
         valid_last,
         use_lse,
+        q_gain,
     ) = case
     g = torch.Generator(device=device).manual_seed(abs(hash(name)) % (2**31))
     q = torch.randn(
         (batch, sq, heads, _HEAD_DIM), device=device, generator=g
     ).bfloat16()
+    if q_gain != 1.0:
+        q = (q.float() * q_gain).bfloat16()
     k = torch.randn(
         (batch, sk, kv_heads, _HEAD_DIM), device=device, generator=g
     ).bfloat16()
@@ -220,17 +255,8 @@ def _make_case(case, device):
     )
 
 
-@requires_sm100
-@pytest.mark.parametrize("case", _CASES, ids=[c[0] for c in _CASES])
-def test_cake_sage_sm100_matches_reference(case):
-    device = torch.device("cuda")
-    c = _make_case(case, device)
-    out, lse = bsa_attn_sm100_sage_fwd_cake(
-        c["q8"],
-        c["k8"],
-        c["v8"],
-        c["index"],
-        c["sel"],
+def _run(c, **overrides):
+    kwargs = dict(
         q_scale=c["q_scale"],
         k_scale=c["k_scale"],
         v_scale=c["v_scale"],
@@ -239,6 +265,18 @@ def test_cake_sage_sm100_matches_reference(case):
         softmax_scale=c["scale"],
         return_lse=c["use_lse"],
     )
+    kwargs.update(overrides)
+    return bsa_attn_sm100_sage_fwd_cake(
+        c["q8"], c["k8"], c["v8"], c["index"], c["sel"], **kwargs
+    )
+
+
+@requires_sm100
+@pytest.mark.parametrize("case", _CASES, ids=[c[0] for c in _CASES])
+def test_cake_sage_sm100_matches_reference(case):
+    device = torch.device("cuda")
+    c = _make_case(case, device)
+    out, lse = _run(c)
     torch.cuda.synchronize()
     ref, ref_lse = _reference(
         c["q8"],
@@ -264,74 +302,159 @@ def test_cake_sage_sm100_matches_reference(case):
 
 
 @requires_sm100
-def test_cake_sage_sm100_matches_cute_backend():
-    from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk64 import bsa_attn_sm100_blk64_fwd
-
-    device = torch.device("cuda")
-    c = _make_case(
-        ("cross_b1_h8_s512", 1, 8, 8, 512, 512, 4, False, False, 0, None, True), device
-    )
-    common = dict(
-        q_scale=c["q_scale"],
-        k_scale=c["k_scale"],
-        softmax_scale=c["scale"],
-        return_lse=True,
-    )
-    out_cake, lse_cake = bsa_attn_sm100_blk64_fwd(
-        c["q8"],
-        c["k8"],
-        c["v8"],
-        c["index"],
-        c["sel"],
-        v_scale=c["v_scale"],
-        backend="cake",
-        **common,
-    )
-    out_cute, lse_cute = bsa_attn_sm100_blk64_fwd(
-        c["q8"],
-        c["k8"],
-        c["v8"],
-        c["index"],
-        c["sel"],
-        v_scale=c["v_scale"][0],
-        backend="cute",
-        **common,
-    )
-    torch.cuda.synchronize()
-    torch.testing.assert_close(out_cake.float(), out_cute.float(), atol=5e-2, rtol=5e-2)
-    torch.testing.assert_close(lse_cake, lse_cute, atol=1e-2, rtol=1e-2)
-
-
-@requires_sm100
 def test_cake_sage_sm100_v_scale_without_batch_axis():
     device = torch.device("cuda")
     c = _make_case(
-        ("vscale_hd_b1_h4", 1, 4, 4, 192, 320, 3, False, False, 0, None, False), device
+        ("vscale_hd_b1_h4", 1, 4, 4, 192, 320, 3, False, False, 0, None, False, 1.0),
+        device,
     )
-    out_b, _ = bsa_attn_sm100_sage_fwd_cake(
-        c["q8"],
-        c["k8"],
-        c["v8"],
-        c["index"],
-        c["sel"],
-        q_scale=c["q_scale"],
-        k_scale=c["k_scale"],
-        v_scale=c["v_scale"],
-        softmax_scale=c["scale"],
-    )
-    out_hd, _ = bsa_attn_sm100_sage_fwd_cake(
-        c["q8"],
-        c["k8"],
-        c["v8"],
-        c["index"],
-        c["sel"],
-        q_scale=c["q_scale"],
-        k_scale=c["k_scale"],
-        v_scale=c["v_scale"][0].contiguous(),
-        softmax_scale=c["scale"],
-    )
+    out_b, _ = _run(c)
+    out_hd, _ = _run(c, v_scale=c["v_scale"][0].contiguous())
     torch.cuda.synchronize()
     assert torch.equal(out_b, out_hd)
+
+
+def _cuda_kernel_names(fn) -> list[str]:
+    """CUDA kernel names of one call of ``fn`` (memcpy / memset activities excluded).  The profiler's
+    warm-up step runs one call whose records are discarded: CUDA activity collection starts
+    asynchronously once the profiler is entered."""
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1),
+    ) as profile:
+        fn()
+        torch.cuda.synchronize()
+        profile.step()
+        fn()
+        torch.cuda.synchronize()
+    return [
+        event.name
+        for event in profile.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+        and not event.name.startswith(("Memcpy", "Memset"))
+    ]
+
+
+@requires_sm100
+def test_cake_sage_sm100_launches_one_kernel_per_call():
+    """The attention call is one kernel: the TMA descriptors travel by value in the
+    kernel parameters, so no upload kernel precedes the attention kernel.  The
+    quantizer is its two kernels behind the zero-fill of its V amax scratch
+    (``torch.zeros``, a torch fill kernel)."""
+    device = torch.device("cuda")
+    c = _make_case(
+        ("one_launch_b2_h4", 2, 4, 2, 257, 1000, 6, True, True, 2, 40, True, 1.0),
+        device,
+    )
+    out = torch.empty_like(c["q8"], dtype=torch.bfloat16)
+    lse = torch.empty(c["q_scale"].shape, dtype=torch.float32, device=device)
+    names = _cuda_kernel_names(lambda: _run(c, out=out, lse=lse))
+    symbol = loader.MODULES["attention"]["kernel_symbol"]
+    assert names == [symbol], names
+    g = torch.Generator(device=device).manual_seed(11)
+    q, k, v = (
+        torch.randn(s, device=device, generator=g).bfloat16()
+        for s in (
+            (1, 300, 4, _HEAD_DIM),
+            (1, 500, 2, _HEAD_DIM),
+            (1, 500, 2, _HEAD_DIM),
+        )
+    )
+    names = _cuda_kernel_names(lambda: sage_fp8_quantize_sm100(q, k, v))
+    kernels = [name for name in names if name.startswith("kernel_")]
+    assert kernels == [
+        loader.MODULES["quantize_qk_vamax"]["kernel_symbol"],
+        loader.MODULES["quantize_v"]["kernel_symbol"],
+    ], names
+    assert len(names) == len(kernels) + 1 and "Fill" in names[0], names
+
+
+@requires_sm100
+def test_cake_sage_sm100_cuda_graph_replay_matches_eager():
+    """A captured call replays the descriptor bytes it captured: the replay writes
+    the same bits as the eager call on the captured buffers, and again after the
+    inputs are rewritten in place (the maps address the buffers, not a snapshot)."""
+    device = torch.device("cuda")
+    c = _make_case(
+        ("graph_b2_h4_hkv2", 2, 4, 2, 320, 1024, 8, True, True, 3, 33, True, 1.0),
+        device,
+    )
+    out_eager = torch.empty_like(c["q8"], dtype=torch.bfloat16)
+    lse_eager = torch.empty(c["q_scale"].shape, dtype=torch.float32, device=device)
+    out_graph = torch.empty_like(out_eager)
+    lse_graph = torch.empty_like(lse_eager)
+    _run(c, out=out_eager, lse=lse_eager)
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        _run(c, out=out_graph, lse=lse_graph)  # warm-up on the capture stream
+        stream.synchronize()
+        out_graph.zero_()
+        lse_graph.zero_()
+        with torch.cuda.graph(graph, stream=stream):
+            _run(c, out=out_graph, lse=lse_graph)
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(out_graph).item() == 0  # capture launched nothing
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out_graph, out_eager)
+    assert torch.equal(lse_graph, lse_eager)
+    # Rewrite the inputs in place; the replay reads the new contents through the captured maps.
+    c["q8"].copy_(c["q8"].flip(1))
+    c["q_scale"].copy_(c["q_scale"].flip(-1))
+    _run(c, out=out_eager, lse=lse_eager)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out_graph, out_eager)
+    assert torch.equal(lse_graph, lse_eager)
+
+
+@requires_sm100
+def test_run_module_matches_the_host_api():
+    """The generic ``run_module`` (logical names through the record's ``arg_plan``)
+    launches what the host API binds positionally: the same bits."""
+    device = torch.device("cuda")
+    c = _make_case(
+        ("run_module_b1_h4_hkv2", 1, 4, 2, 100, 257, 4, True, False, 3, 33, True, 1.0),
+        device,
+    )
+    out_api, lse_api = _run(c)
+    batch, sq, heads, _ = c["q8"].shape
+    sk, kv_heads = c["k8"].shape[1], c["k8"].shape[2]
+    q_blocks, k_blocks = _ceil_div(sq, _BLOCK), _ceil_div(sk, _BLOCK)
+    out = torch.empty_like(out_api)
+    lse = torch.empty_like(lse_api)
+    values = {
+        "q": c["q8"].view(torch.uint8),
+        "k": c["k8"].view(torch.uint8),
+        "v": c["v8"].view(torch.uint8),
+        "out": out,
+        "lse": lse,
+        "q_scale": c["q_scale"],
+        "k_scale": c["k_scale"],
+        "v_scale": c["v_scale"],
+        "block_index": c["index"],
+        "block_nums": c["block_nums"],
+        "block_sizes": c["block_sizes"],
+        "seqlen_q": sq,
+        "seqlen_k": sk,
+        "num_heads": heads,
+        "num_kv_heads": kv_heads,
+        "q_blocks": q_blocks,
+        "k_blocks": k_blocks,
+        "k_scale_groups": _ceil_div(sk, _K_GROUP),
+        "capacity": int(c["index"].shape[-1]),
+        "block_sparse_num": int(c["index"].shape[-1]),
+        "has_block_nums": 1,
+        "block_sizes_mode": 3,
+        "v_scale_batch_stride": kv_heads * _HEAD_DIM,
+        "total_tiles": batch * heads * q_blocks,
+        "softmax_scale_log2": c["scale"] * 1.4426950408889634,
+        "return_lse": 1,
+    }
+    loader.run_module("attention", values, device_index=torch.cuda.current_device())
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_api) and torch.equal(lse, lse_api)
 
 
 @requires_sm100
@@ -372,3 +495,98 @@ def test_sage_fp8_quantize_sm100_matches_torch(shape):
         assert mismatch == 0, (
             f"{name}: {mismatch} elements differ by more than one E4M3 step"
         )
+
+
+# Flag macros of the shared SM120 kernel source, in ``SM120_FLAGS`` order.
+_SM120_FLAG_MACROS = (
+    "CAKE_SAGE_HAS_BLOCK_NUMS",
+    "CAKE_SAGE_BLOCK_SIZES_MODE",
+    "CAKE_SAGE_FULL_K64_TILES",
+    "CAKE_SAGE_UNIFORM_NONEMPTY",
+    "CAKE_SAGE_CONTIGUOUS_BLOCK_INDICES",
+)
+
+
+def test_registry_records_reference_the_build_manifest() -> None:
+    """Every ``MODULES`` record names its ``build.json`` library and nothing to compile.
+
+    The manifest (schema ``cake-build/1``) carries exactly one entry per (library,
+    architecture) the registry references, each with the kernel and binding
+    sources under ``csrc/`` of this package, their digests and a closure digest;
+    the registry itself records the host plan only.  Every entry of this family
+    is compiled with ``--use_fast_math``, the numerics its kernels were validated
+    with.
+    """
+
+    manifest = cake_build.manifest()
+    assert manifest["schema"] == "cake-build/1"
+    assert manifest["package"] == pkg.__name__
+    assert set(manifest["arch_flags"]) == set(loader.ARCHES)
+    libraries = cake_build.libraries_by_name()
+    package = Path(cake_build.__file__).parent
+    default = loader.MODULES[loader.SM120_RECORDS[(0, 0, 0, 0, 0)]]["library"]
+    sm120_sources = [f"csrc/{default}_kernel.cu", f"csrc/{default}_binding.cu"]
+    referenced = set()
+    for name, record in loader.MODULES.items():
+        assert record["role"] in loader.ROLES, name
+        assert record["kernel_symbol"] == f"kernel_{record['library']}", name
+        assert not {"sources", "source_sha256", "compile_flags", "cache_names"} & set(
+            record
+        ), name
+        assert set(record["arches"]) <= set(manifest["arch_flags"]), name
+        plan = [tuple(pair) for pair in record["arg_plan"]]
+        assert plan[-3:] == [("grid", "grid_x"), ("grid", "grid_y"), ("grid", "grid_z")]
+        for kind, key in plan[:-3]:
+            assert kind in ("buffer", "parameter"), (name, kind, key)
+            assert record["logical"][key] in (
+                loader.LOGICAL_TENSORS + loader.LOGICAL_SCALARS
+            ), (name, key)
+        for arch in record["arches"]:
+            library = loader.library_name(name, arch)
+            referenced.add(library)
+            entry = libraries[library]
+            assert entry["arch"] == arch
+            assert entry["entry"] == "run"
+            if record["role"] == "attention_sm120":
+                # One kernel source and one launcher serve every SM120 specialization;
+                # each library compiles them under its own definitions: the kernel
+                # symbol, then the five flag macros in select_rule order.
+                assert entry["sources"] == sm120_sources
+                key = [int(record["select_rule"][flag]) for flag in loader.SM120_FLAGS]
+                assert entry["nvcc_flags"] == [
+                    "--use_fast_math",
+                    f"-DCAKE_SAGE_SM120_KERNEL=kernel_{record['library']}",
+                    *(
+                        f"-D{macro}={value}"
+                        for macro, value in zip(_SM120_FLAG_MACROS, key, strict=True)
+                    ),
+                ]
+            else:
+                assert entry["sources"] == [
+                    f"csrc/{record['library']}_kernel.cu",
+                    f"csrc/{record['library']}_binding.cu",
+                ]
+                assert entry["nvcc_flags"] == ["--use_fast_math"]
+            assert set(entry["sha256"]) == set(entry["sources"])
+            for source in entry["sources"]:
+                assert (package / source).is_file(), source
+            assert re.fullmatch(r"[0-9a-f]{64}", entry["closure_sha256"])
+    assert referenced == set(libraries)
+    assert (package / "csrc" / "cake_ffi_checks.h").is_file()
+    sm120 = loader.records_of_role("attention_sm120")
+    assert len(sm120) == 20 and len(loader.SM120_RECORDS) == 20
+    # contiguous_block_indices is specialized only together with uniform_nonempty
+    assert all(key[3] >= key[4] for key in loader.SM120_RECORDS)
+    assert (
+        len(
+            {
+                libraries[loader.library_name(n, "sm_120a")]["closure_sha256"]
+                for n in sm120
+            }
+        )
+        == 20
+    )
+    assert all(loader.MODULES[name]["arches"] == ["sm_120a"] for name in sm120)
+    assert [
+        loader.MODULES[name]["arches"] for name in loader.records_of_role("attention")
+    ] == [["sm_100a", "sm_103a"]]

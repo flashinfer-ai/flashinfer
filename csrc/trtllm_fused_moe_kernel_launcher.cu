@@ -41,6 +41,8 @@
 namespace flashinfer {
 
 namespace btg = batchedGemm::trtllm::gen;
+
+using RoutingRunner = tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner;
 using tensorrt_llm::kernels::trtllmgen_moe::MoE::ActivationType;
 using tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs;
 using tensorrt_llm::kernels::trtllmgen_moe::Routing::RoutingMethodType;
@@ -1047,17 +1049,20 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
          "ActivationType::SwigluStep with MxFp8.";
 }
 
-std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_tile_nums,
+std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& ascending_supported_tile_sizes,
                                        int64_t const num_tokens, int64_t const top_k,
-                                       int64_t const num_local_experts) {
-  TVM_FFI_ICHECK(!supported_tile_nums.empty()) << "supported_tile_nums must not be empty.";
+                                       int64_t const num_local_experts,
+                                       int const num_smaller_tile_candidates = 2) {
+  TVM_FFI_ICHECK(!ascending_supported_tile_sizes.empty())
+      << "ascending_supported_tile_sizes must not be empty.";
   TVM_FFI_ICHECK(num_tokens >= 0) << "num_tokens must be non-negative.";
   TVM_FFI_ICHECK(top_k > 0) << "top_k must be positive.";
   TVM_FFI_ICHECK(num_local_experts > 0) << "num_local_experts must be positive.";
-  TVM_FFI_ICHECK(std::is_sorted(supported_tile_nums.begin(), supported_tile_nums.end()))
-      << "supported_tile_nums must be sorted.";
-  TVM_FFI_ICHECK(supported_tile_nums.front() > 0)
-      << "supported_tile_nums must contain only positive values.";
+  TVM_FFI_ICHECK(
+      std::is_sorted(ascending_supported_tile_sizes.begin(), ascending_supported_tile_sizes.end()))
+      << "ascending_supported_tile_sizes must be sorted.";
+  TVM_FFI_ICHECK(ascending_supported_tile_sizes.front() > 0)
+      << "ascending_supported_tile_sizes must contain only positive values.";
   double const avg_tokens_per_expert =
       static_cast<double>(num_tokens) * static_cast<double>(top_k) / num_local_experts;
   // NOTE: This differs from Python AutoTuner bucketing:
@@ -1066,45 +1071,53 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_til
   // Because they bucket different quantities, cache bucket and runtime tile candidates can
   // diverge; launcher-side tactic resolution handles that mismatch.
   auto it = std::lower_bound(
-      supported_tile_nums.begin(), supported_tile_nums.end(), avg_tokens_per_expert,
+      ascending_supported_tile_sizes.begin(), ascending_supported_tile_sizes.end(),
+      avg_tokens_per_expert,
       [](int32_t tile, double average) { return static_cast<double>(tile) < average; });
-  if (it == supported_tile_nums.end()) {
-    it = std::prev(supported_tile_nums.end());
+  if (it == ascending_supported_tile_sizes.end()) {
+    it = std::prev(ascending_supported_tile_sizes.end());
   }
 
   // Candidate tile set centered on the heuristic tile.
   // This function returns nearby candidates (not a single final tile):
-  //   center, +1, +2, and -1 neighbors when available.
+  //   center, +1, +2, and up to num_smaller_tile_candidates smaller neighbors when available.
   // Final tile choice is made later (autotuner-provided tile if valid, otherwise fallback policy).
   std::set<int32_t> selected_tile_nums;
   selected_tile_nums.insert(*it);
-  if (std::next(it) != supported_tile_nums.end()) {
+  if (std::next(it) != ascending_supported_tile_sizes.end()) {
     selected_tile_nums.insert(*std::next(it));
-    if (std::next(std::next(it)) != supported_tile_nums.end()) {
+    if (std::next(std::next(it)) != ascending_supported_tile_sizes.end()) {
       selected_tile_nums.insert(*std::next(std::next(it)));
     }
   }
-  if (it != supported_tile_nums.begin()) {
-    selected_tile_nums.insert(*std::prev(it));
+  // Walk down the ascending tile ladder (checked sorted above) to add up to
+  // num_smaller_tile_candidates tiles below the covering tile. The tuner receives two so that
+  // adding a tile to the ladder (e.g. 192) does not push the best smaller tile out of its window;
+  // the default-tactic path keeps one.
+  auto down = it;
+  for (int i = 0; i < num_smaller_tile_candidates && down != ascending_supported_tile_sizes.begin();
+       ++i) {
+    down = std::prev(down);
+    selected_tile_nums.insert(*down);
   }
 
   return selected_tile_nums;
 }
 
-int64_t selectDefaultTileN(std::vector<int32_t> const& supported_tile_nums,
+int64_t selectDefaultTileN(std::vector<int32_t> const& ascending_supported_tile_sizes,
                            int64_t const num_tokens, int64_t const top_k,
                            int64_t const num_local_experts) {
-  auto selected = computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
+  auto selected =
+      computeSelectedTileN(ascending_supported_tile_sizes, num_tokens, top_k, num_local_experts, 1);
   TVM_FFI_ICHECK(!selected.empty()) << "No selected tile_N candidates for current MoE input.";
   return *selected.begin();
 }
 
 // Resolve the (tile_N, config) pair passed from Python side, applying fallback logic
 // when tile_N is -1.
-std::pair<int64_t, int64_t> resolveMoeTileAndConfig(Array<int64_t> const& config_index,
-                                                    std::vector<int32_t> const& supported_tile_nums,
-                                                    int64_t const num_tokens, int64_t const top_k,
-                                                    int64_t const num_local_experts) {
+std::pair<int64_t, int64_t> resolveMoeTileAndConfig(
+    Array<int64_t> const& config_index, std::vector<int32_t> const& ascending_supported_tile_sizes,
+    int64_t const num_tokens, int64_t const top_k, int64_t const num_local_experts) {
   // Python side convention: tactic is [tile_N, config]
   TVM_FFI_ICHECK(config_index.size() == 2)
       << "Invalid tactic, expected to be [tile_N, config], but got array of size "
@@ -1115,7 +1128,7 @@ std::pair<int64_t, int64_t> resolveMoeTileAndConfig(Array<int64_t> const& config
   if (tile_N == -1 || config == -1) {
     // Use fallback tactic
     auto const default_tile_N =
-        selectDefaultTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
+        selectDefaultTileN(ascending_supported_tile_sizes, num_tokens, top_k, num_local_experts);
     return {default_tile_N, -1};
   }
 
@@ -1152,6 +1165,72 @@ inline void check_gemm1_bias_mn(Optional<TensorView> const& gemm1_bias,
 
 class FusedMoeLauncher {
  protected:
+  /**
+   * Bump allocator for the internal scratch tensors of one ordinary MoE launch.
+   *
+   * kAlloc keeps the historical per-call allocation. kMeasure only sums the bytes a launch would
+   * carve; its tensors carry a null data pointer and must never reach a kernel. kCarve returns
+   * non-owning views into a caller-owned workspace_buffer, so the caller must keep that buffer
+   * alive and stream-ordered across the launch; a tensor that no longer fits is allocated per
+   * call instead. Measure and carve walk the same allocation code, which is what keeps
+   * trtllm_fused_moe_workspace_size() in sync with the launch. While measuring(), the prepare_*
+   * code must only allocate: any device work on a measured tensor would dereference null.
+   */
+  class TensorAllocator {
+   public:
+    // Every carve starts on a 256-byte boundary: TMA descriptors need 16 B and the batched GEMM
+    // workspaces were sized against the caching allocator's (>= 512 B) block alignment.
+    static constexpr int64_t kAlignment = 256;
+
+    void begin_measure() { reset(Mode::kMeasure, nullptr, 0); }
+    void begin_carve(void* base, int64_t capacity) { reset(Mode::kCarve, base, capacity); }
+    void end() { reset(Mode::kAlloc, nullptr, 0); }
+    int64_t used() const { return used_; }
+    bool measuring() const { return mode_ == Mode::kMeasure; }
+
+    Tensor alloc(tvm::ffi::Shape shape, DLDataType dtype, DLDevice device) {
+      if (mode_ == Mode::kAlloc) {
+        return alloc_tensor(shape, dtype, device);
+      }
+      int64_t numel = 1;
+      for (size_t i = 0; i < shape.size(); ++i) {
+        numel *= shape[i];
+      }
+      int64_t const nbytes = (numel * dtype.bits * dtype.lanes + 7) / 8;
+      int64_t const offset = (used_ + kAlignment - 1) / kAlignment * kAlignment;
+      if (mode_ == Mode::kCarve && offset + nbytes > capacity_) {
+        // A launch above the token count the buffer was sized for (such as a larger autotuning
+        // bucket) allocates what does not fit; the views carved so far stay valid.
+        return alloc_tensor(shape, dtype, device);
+      }
+      used_ = offset + nbytes;
+      void* data = mode_ == Mode::kCarve ? static_cast<char*>(base_) + offset : nullptr;
+      return Tensor::FromNDAlloc(ViewAlloc{data}, shape, dtype, device);
+    }
+
+   private:
+    enum class Mode { kAlloc, kMeasure, kCarve };
+
+    /** NDAllocator that aliases existing storage and never frees it. */
+    struct ViewAlloc {
+      void* data;
+      void AllocData(DLTensor* tensor) { tensor->data = data; }
+      void FreeData(DLTensor* /*tensor*/) {}
+    };
+
+    void reset(Mode mode, void* base, int64_t capacity) {
+      mode_ = mode;
+      base_ = base;
+      capacity_ = capacity;
+      used_ = 0;
+    }
+
+    Mode mode_{Mode::kAlloc};
+    void* base_{nullptr};
+    int64_t capacity_{0};
+    int64_t used_{0};
+  };
+
   Optional<TensorView> routing_logits;
   Optional<TensorView> routing_bias;
   TensorView hidden_states;
@@ -1189,6 +1268,15 @@ class FusedMoeLauncher {
 
   int64_t intermediate_size_factor{2};
 
+  // Internal scratch allocator and the optional caller-owned buffer it carves from.
+  TensorAllocator scratch_;
+  Optional<TensorView> workspace_buffer_;
+
+  /** Allocate one internal scratch tensor; see TensorAllocator for the per-call modes. */
+  Tensor _alloc_tensor(tvm::ffi::Shape shape, DLDataType dtype, DLDevice device) {
+    return scratch_.alloc(shape, dtype, device);
+  }
+
  public:
   // Constructor that initializes all TensorView members
   FusedMoeLauncher(const Optional<TensorView>& routing_logits,
@@ -1223,6 +1311,33 @@ class FusedMoeLauncher {
  public:
   void set_routing_replay_out(const Optional<TensorView>& replay_out) {
     routing_replay_out = replay_out;
+  }
+
+  /** Carve the scratch of the next ordinary run() from a caller-owned 1-D byte buffer. */
+  void set_workspace_buffer(Optional<TensorView> const& buffer) { workspace_buffer_ = buffer; }
+
+  /**
+   * Scratch footprint of an ordinary run() of this tile, measured by the allocation code itself.
+   * It depends on the tile, not the tactic: every shipped batched-GEMM config needs a zero-byte
+   * workspace, so the tile's default tactic stands for all of them, and a tactic that ever needs
+   * more allocates the excess per call (see TensorAllocator). Returns 0 when the tile has no
+   * runnable tactic, since such a tile can never be selected.
+   */
+  int64_t measure_workspace_size() {
+    int64_t tactic = -1;
+    try {
+      prepare_moe_runner(tactic);
+    } catch (std::exception const&) {
+      // Some advertised tiles have no kernels, or no valid tactic, for this problem; run()
+      // would reject them the same way.
+      return 0;
+    }
+    scratch_.begin_measure();
+    prepare_routing();
+    prepare_moe(tactic);
+    int64_t const bytes = scratch_.used();
+    scratch_.end();
+    return bytes;
   }
 
  protected:
@@ -1429,45 +1544,45 @@ class FusedMoeLauncher {
     int32_t const totalNumExperts = args->num_experts + args->num_fused_shared_experts;
 
     // Allocate routing phase workspace tensors
-    num_tokens_per_expert = alloc_tensor({totalNumExperts}, dl_int32, hidden_states.device());
+    num_tokens_per_expert = _alloc_tensor({totalNumExperts}, dl_int32, hidden_states.device());
     int32_t max_num_padded_tokens =
         tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
             args->num_tokens, totalExpertsPerToken, totalNumExperts, tile_tokens_dim);
 
-    total_num_padded_tokens = alloc_tensor({1}, dl_int32, hidden_states.device());
+    total_num_padded_tokens = _alloc_tensor({1}, dl_int32, hidden_states.device());
 
     expanded_idx_to_permuted_idx =
-        alloc_tensor({args->num_tokens * totalExpertsPerToken}, dl_int32, hidden_states.device());
+        _alloc_tensor({args->num_tokens * totalExpertsPerToken}, dl_int32, hidden_states.device());
 
     // WAR: the routed batched-GEMM kernels read one int32 past the end of the route map.
     // TODO: drop the +1 once the fixed kernel cubins land.
     permuted_idx_to_token_idx =
-        alloc_tensor({max_num_padded_tokens + 1}, dl_int32, hidden_states.device());
+        _alloc_tensor({max_num_padded_tokens + 1}, dl_int32, hidden_states.device());
 
     if (gemm1_bias_type == batchedGemm::gemm::BiasType::Mn) {
       permuted_idx_to_expanded_idx =
-          alloc_tensor({max_num_padded_tokens}, dl_int32, hidden_states.device());
+          _alloc_tensor({max_num_padded_tokens}, dl_int32, hidden_states.device());
     }
 
     expert_indexes =
-        alloc_tensor({args->num_tokens, totalExpertsPerToken}, dl_int32, hidden_states.device());
+        _alloc_tensor({args->num_tokens, totalExpertsPerToken}, dl_int32, hidden_states.device());
 
     // expert_weights allocation should be done by derived class since data type could vary
 
     int64_t const size_of_expert_count_histogram = std::max(totalNumExperts * 2, 256 * 2);
-    expert_count_histogram = alloc_tensor({size_of_expert_count_histogram},
-                                          dl_int32,  // 256 is the max number of threads per block
-                                                     // and max number of experts
-                                          hidden_states.device());
+    expert_count_histogram = _alloc_tensor({size_of_expert_count_histogram},
+                                           dl_int32,  // 256 is the max number of threads per block
+                                                      // and max number of experts
+                                           hidden_states.device());
 
     int32_t max_num_ctas = tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
         args->num_tokens, totalExpertsPerToken, totalNumExperts, tile_tokens_dim);
 
-    cta_idx_xy_to_batch_idx = alloc_tensor({max_num_ctas}, dl_int32, hidden_states.device());
+    cta_idx_xy_to_batch_idx = _alloc_tensor({max_num_ctas}, dl_int32, hidden_states.device());
 
-    cta_idx_xy_to_mn_limit = alloc_tensor({max_num_ctas}, dl_int32, hidden_states.device());
+    cta_idx_xy_to_mn_limit = _alloc_tensor({max_num_ctas}, dl_int32, hidden_states.device());
 
-    num_non_exiting_ctas = alloc_tensor({1}, dl_int32, hidden_states.device());
+    num_non_exiting_ctas = _alloc_tensor({1}, dl_int32, hidden_states.device());
 
     workspace.total_num_padded_tokens = static_cast<int*>(total_num_padded_tokens.data_ptr());
     workspace.total_max_padded_tokens = max_num_padded_tokens;
@@ -1585,10 +1700,35 @@ class FusedMoeLauncher {
   void prepare_moe_common(int64_t& moe_tactic) {
     prepare_moe_runner(moe_tactic);
     auto workspace_sizes = moe_runner->getWorkspaceSizeInBytes(*args, moe_tactic);
-    workspace_fc1 = alloc_tensor({std::get<0>(workspace_sizes)}, dl_int8, hidden_states.device());
-    workspace_fc2 = alloc_tensor({std::get<1>(workspace_sizes)}, dl_int8, hidden_states.device());
+    workspace_fc1 = _alloc_tensor({std::get<0>(workspace_sizes)}, dl_int8, hidden_states.device());
+    workspace_fc2 = _alloc_tensor({std::get<1>(workspace_sizes)}, dl_int8, hidden_states.device());
     workspace.bmm1_workspace = workspace_fc1.data_ptr();
     workspace.bmm2_workspace = workspace_fc2.data_ptr();
+  }
+
+  /** Carve this launch's scratch from the caller-owned workspace_buffer, if one is attached. */
+  void bind_workspace_buffer(bool return_activation_output) {
+    if (!workspace_buffer_.has_value()) {
+      return;
+    }
+    // Intermediates returned to the caller would alias the next launch that shares the buffer.
+    TVM_FFI_ICHECK(args->do_finalize && !return_activation_output)
+        << "workspace_buffer requires do_finalize=True and is incompatible with "
+           "gemm1_lora_delta, because returned intermediates cannot live in a shared workspace.";
+    auto const& buffer = workspace_buffer_.value();
+    TVM_FFI_ICHECK(buffer.dtype() == dl_uint8 || buffer.dtype() == dl_int8)
+        << "workspace_buffer dtype must be uint8 or int8, got " << buffer.dtype();
+    TVM_FFI_ICHECK_EQ(buffer.ndim(), 1)
+        << "workspace_buffer must be 1-D, got ndim=" << buffer.ndim();
+    TVM_FFI_ICHECK(buffer.IsContiguous()) << "workspace_buffer must be contiguous.";
+    TVM_FFI_ICHECK(buffer.device().device_type == kDLCUDA &&
+                   buffer.device().device_id == hidden_states.device().device_id)
+        << "workspace_buffer must be on the same CUDA device as hidden_states.";
+    TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(buffer.data_ptr()) % TensorAllocator::kAlignment,
+                      0)
+        << "workspace_buffer must be " << TensorAllocator::kAlignment
+        << "-byte aligned (torch.empty on CUDA satisfies this).";
+    scratch_.begin_carve(buffer.data_ptr(), buffer.size(0));
   }
 
   /** Bind one tile's graph-stable routing metadata to the common MoE workspace. */
@@ -1627,10 +1767,11 @@ class FusedMoeLauncher {
                                   bool return_activation_output = false) {
     ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
     check_routing();
+    bind_workspace_buffer(return_activation_output);
     prepare_routing();
 
     // Execute routing
-    tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+    RoutingRunner routing_runner(tile_tokens_dim);
     cudaStream_t routing_stream = get_stream(hidden_states.device());
 
     int32_t* expert_ids_param = precomputed_expert_ids();
@@ -1828,7 +1969,7 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
       // logits dtype); a fp32 alloc would mislabel bf16 data when this buffer is
       // surfaced to the caller verbatim on do_finalize=false. See #3595.
       FusedMoeLauncher::expert_weights =
-          alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
+          _alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
       workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
     }
   }
@@ -1875,10 +2016,10 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
     int32_t max_num_padded_tokens_gemm2 =
         tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
             max_num_padded_tokens, hidden_size_output, btg::dtypeGetNumBits(btg::Dtype::Bfloat16));
-    gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size}, dl_bfloat16,
-                                hidden_states.device());
-    gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, hidden_size_output}, dl_bfloat16,
-                                hidden_states.device());
+    gemm1_output = _alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size},
+                                 dl_bfloat16, hidden_states.device());
+    gemm2_output = _alloc_tensor({max_num_padded_tokens_gemm2, hidden_size_output}, dl_bfloat16,
+                                 hidden_states.device());
 
     workspace.hidden_states_scale_linear = nullptr;
     workspace.gemm1_output = gemm1_output.data_ptr();
@@ -2072,7 +2213,7 @@ class StagedMoeLauncher : public FusedMoeLauncher {
   void prepare_moe(int64_t& /*moe_tactic*/) override {}
 
   void run_routing_kernel(bool enable_pdl, bool use_routing_scales_on_input = false) {
-    tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+    RoutingRunner routing_runner(tile_tokens_dim);
     cudaStream_t routing_stream = get_stream(hidden_states.device());
     bool const has_precomputed_indices = expert_indices.ndim() == 2 && expert_indices.size(0) > 0;
     bool const has_precomputed_weights = expert_weights.ndim() == 2 && expert_weights.size(0) > 0;
@@ -3037,7 +3178,7 @@ Array<Tensor> trtllm_moe_run_routing(
   }
 
   auto const num_tokens = hidden_states.size(0);
-  std::vector<int32_t> supported_tile_nums{8, 16, 32, 64, 128, 256};
+  std::vector<int32_t> supported_tile_nums{8, 16, 32, 64, 128, 192, 256};
   auto const [tile_N, config] = resolveMoeTileAndConfig(moe_tactic, supported_tile_nums, num_tokens,
                                                         top_k, local_num_experts);
   (void)config;
@@ -3475,16 +3616,19 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
       workspace.expert_weights = const_cast<void*>(weights.data_ptr());
     } else {
       FusedMoeLauncher::expert_weights =
-          alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
+          _alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
       workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
     }
     if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
       if (is_unpacked_routing() && expert_weights.value().dtype() == dl_float32) {
         auto const& weights = expert_weights.value();
         routing_scales =
-            alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
-        cast_fp32_to_bf16(routing_scales.data_ptr(), weights.data_ptr(), weights.numel(),
-                          get_stream(hidden_states.device()));
+            _alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
+        // A size query only counts routing_scales; it has no storage to cast into.
+        if (!scratch_.measuring()) {
+          cast_fp32_to_bf16(routing_scales.data_ptr(), weights.data_ptr(), weights.numel(),
+                            get_stream(hidden_states.device()));
+        }
         workspace.token_scales = routing_scales.data_ptr();
       } else {
         workspace.token_scales = workspace.expert_weights;
@@ -3546,17 +3690,17 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     int32_t max_num_padded_tokens_gemm1 = workspace.total_max_padded_tokens + args->num_experts;
     int32_t max_num_padded_tokens_gemm2 = workspace.total_max_padded_tokens;
 
-    gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, 2 * args->intermediate_size},
-                                dl_uint8, hidden_states.device());
+    gemm1_output = _alloc_tensor({max_num_padded_tokens_gemm1, 2 * args->intermediate_size},
+                                 dl_uint8, hidden_states.device());
     gemm1_output_scale =
-        alloc_tensor({2 * args->intermediate_size / 128, max_num_padded_tokens_gemm1}, dl_float32,
-                     hidden_states.device());
+        _alloc_tensor({2 * args->intermediate_size / 128, max_num_padded_tokens_gemm1}, dl_float32,
+                      hidden_states.device());
 
     // gemm2_output is GEMM2's destination and finalize reads it at the GEMM2 stride, so it must
     // be sized by GEMM2's N, not by the (possibly narrower) caller output width.
     auto const hidden_size_output = gemm2_output_hidden_size();
-    gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, hidden_size_output}, dl_bfloat16,
-                                hidden_states.device());
+    gemm2_output = _alloc_tensor({max_num_padded_tokens_gemm2, hidden_size_output}, dl_bfloat16,
+                                 hidden_states.device());
 
     workspace.hidden_states_scale_linear = nullptr;
     workspace.gemm1_output = gemm1_output.data_ptr();
@@ -3775,7 +3919,7 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
       workspace.expert_weights = const_cast<void*>(expert_weights_.data_ptr());
     } else {
       FusedMoeLauncher::expert_weights =
-          alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
+          _alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
       workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
     }
 
@@ -3868,15 +4012,15 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
             workspace.total_max_padded_tokens, args->hidden_size,
             btg::dtypeGetNumBits(btg::Dtype::Bfloat16));
 
-    gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size}, dl_bfloat16,
-                                hidden_states.device());
-    activation_output = alloc_tensor({max_num_padded_tokens_activation, args->intermediate_size},
-                                     dl_uint8, hidden_states.device());
+    gemm1_output = _alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size},
+                                 dl_bfloat16, hidden_states.device());
+    activation_output = _alloc_tensor({max_num_padded_tokens_activation, args->intermediate_size},
+                                      dl_uint8, hidden_states.device());
     activation_output_scale =
-        alloc_tensor({max_num_padded_tokens_activation}, dl_float32, hidden_states.device());
+        _alloc_tensor({max_num_padded_tokens_activation}, dl_float32, hidden_states.device());
 
-    gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, args->hidden_size}, dl_bfloat16,
-                                hidden_states.device());
+    gemm2_output = _alloc_tensor({max_num_padded_tokens_gemm2, args->hidden_size}, dl_bfloat16,
+                                 hidden_states.device());
 
     workspace.hidden_states_scale_linear = nullptr;
     workspace.gemm1_output = gemm1_output.data_ptr();
@@ -4135,8 +4279,8 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
       // (always Bfloat16, never the logits dtype); a fp32 alloc would mislabel
       // bf16 data when this buffer is surfaced to the caller verbatim on
       // do_finalize=false. See #3595.
-      FusedMoeLauncher::expert_weights = alloc_tensor({args->num_tokens, totalExpertsPerToken},
-                                                      dl_bfloat16, hidden_states.device());
+      FusedMoeLauncher::expert_weights = _alloc_tensor({args->num_tokens, totalExpertsPerToken},
+                                                       dl_bfloat16, hidden_states.device());
       workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
     } else {
       if (is_unpacked_routing()) {
@@ -4262,34 +4406,34 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     auto const gemm1_output_hidden = quantization_type == Fp8QuantizationType::DeepSeekFp8
                                          ? intermediate_size_factor * args->intermediate_size
                                          : args->intermediate_size;
-    gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden}, dl_uint8,
-                                hidden_states.device());
+    gemm1_output = _alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden}, dl_uint8,
+                                 hidden_states.device());
 
     if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
-      gemm1_output_scale = alloc_tensor({intermediate_size_factor * args->intermediate_size / 128,
-                                         workspace.total_max_padded_tokens},
-                                        dl_float32, hidden_states.device());
+      gemm1_output_scale = _alloc_tensor({intermediate_size_factor * args->intermediate_size / 128,
+                                          workspace.total_max_padded_tokens},
+                                         dl_float32, hidden_states.device());
     } else if (quantization_type == Fp8QuantizationType::MxFp8) {
       // MxFP8 fuses the activation so no need for intermediate_size_factor
       int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(max_num_padded_tokens_gemm1,
                                                                   args->intermediate_size / 32);
-      gemm1_output_scale = alloc_tensor({sf_size}, dl_uint8, hidden_states.device());
+      gemm1_output_scale = _alloc_tensor({sf_size}, dl_uint8, hidden_states.device());
     }
 
     // DeepSeek FP8 doesn't fuse the activation
     if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
-      activation_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size},
-                                       dl_uint8, hidden_states.device());
+      activation_output = _alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size},
+                                        dl_uint8, hidden_states.device());
       activation_output_scale =
-          alloc_tensor({args->intermediate_size / 128, max_num_padded_tokens_gemm1}, dl_float32,
-                       hidden_states.device());
+          _alloc_tensor({args->intermediate_size / 128, max_num_padded_tokens_gemm1}, dl_float32,
+                        hidden_states.device());
     }
 
     // gemm2_output is GEMM2's destination and finalize reads it at the GEMM2 stride, so it must
     // be sized by GEMM2's N, not by the (possibly narrower) caller output width.
     auto const hidden_size_output = gemm2_output_hidden_size();
-    gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, hidden_size_output}, dl_bfloat16,
-                                hidden_states.device());
+    gemm2_output = _alloc_tensor({max_num_padded_tokens_gemm2, hidden_size_output}, dl_bfloat16,
+                                 hidden_states.device());
 
     workspace.hidden_states_scale_linear = nullptr;
     workspace.gemm1_output = gemm1_output.data_ptr();
@@ -4435,10 +4579,11 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
                           bool return_activation_output = false) override {
     ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
     check_routing();
+    bind_workspace_buffer(return_activation_output);
     prepare_routing();
 
     cudaStream_t routing_stream = get_stream(hidden_states.device());
-    tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+    RoutingRunner routing_runner(tile_tokens_dim);
 
     bool use_precomputed = has_precomputed(expert_indices);
     // When using pre-computed routing, pass nullptr as routing_logits to tell the
@@ -4631,7 +4776,7 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
       // bf16 data when this buffer is surfaced to the caller verbatim on
       // do_finalize=false. See #3595.
       FusedMoeLauncher::expert_weights =
-          alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
+          _alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
       workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
     }
   }
@@ -4681,15 +4826,15 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
             btg::dtypeGetNumBits(btg::Dtype::Bfloat16));  // Output is always BF16
 
     auto const gemm1_output_hidden = args->intermediate_size;
-    gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden}, dl_bfloat16,
-                                hidden_states.device());
+    gemm1_output = _alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden}, dl_bfloat16,
+                                 hidden_states.device());
 
     // Allocate gemm2_output
     // gemm2_output is GEMM2's destination and finalize reads it at the GEMM2 stride, so it must
     // be sized by GEMM2's N, not by the (possibly narrower) caller output width.
     auto const hidden_size_output = gemm2_output_hidden_size();
-    gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, hidden_size_output}, dl_bfloat16,
-                                hidden_states.device());
+    gemm2_output = _alloc_tensor({max_num_padded_tokens_gemm2, hidden_size_output}, dl_bfloat16,
+                                 hidden_states.device());
 
     // Setup workspace pointers
     workspace.hidden_states_scale_linear = nullptr;  // MxInt4 doesn't use linear scale
@@ -4786,18 +4931,10 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     std::vector<int32_t> tiles(mBaseSupportedTileNums.begin(), mBaseSupportedTileNums.end());
     if (dtype_act != btg::Dtype::Bfloat16) {
       tiles.push_back(128);
-#ifndef TLLM_RUBIN_FEATURES
-      // Keep tactic enumeration aligned with the public BMM artifact. The
-      // previously separate Rubin BMM pin had no 192-tile FP4 kernels (its only
-      // 192-tile kernels were FP8), and launchers are built eagerly for every
-      // advertised tile, so advertising 192 there failed runner construction
-      // outright. The consolidated multi-arch BMM pin does ship sm107a 192-tile
-      // FP4 kernels, so this guard can be dropped once Rubin is re-verified.
       if ((dtype_weights == btg::Dtype::E2m1 && dtype_act == btg::Dtype::E2m1) ||
           (dtype_weights == btg::Dtype::MxE2m1 && dtype_act == btg::Dtype::MxE4m3)) {
         tiles.push_back(192);
       }
-#endif
       tiles.push_back(256);
     }
     return tiles;
@@ -5022,31 +5159,31 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     if (mDtypeAct == btg::Dtype::E2m1 || mDtypeAct == btg::Dtype::MxE4m3) {
       int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(
           max_num_padded_tokens_gemm1, args->intermediate_size / sf_vec_size);
-      gemm1_output_scale = alloc_tensor({sf_size}, dl_uint8, hidden_states.device());
+      gemm1_output_scale = _alloc_tensor({sf_size}, dl_uint8, hidden_states.device());
     }
     if (!per_token_scales.has_value()) {
-      gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden},
-                                  mDtypeAct == btg::Dtype::Bfloat16 ? dl_bfloat16 : dl_uint8,
-                                  hidden_states.device());
+      gemm1_output = _alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden},
+                                   mDtypeAct == btg::Dtype::Bfloat16 ? dl_bfloat16 : dl_uint8,
+                                   hidden_states.device());
     } else {  // FC1 output is Bfloat16
       TVM_FFI_ICHECK(mDtypeAct == btg::Dtype::E2m1)
           << "NvFP4 MoE: currently only support NvFP4 x NvFP4 when using per-token scaling.";
       // When per-token scales are used, the FC1 output is always BF16 and will be quantized
-      gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size},
-                                  dl_bfloat16, hidden_states.device());
+      gemm1_output = _alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size},
+                                   dl_bfloat16, hidden_states.device());
       // The per-token NvFP4 quant needs to stage the output for running the explicit quant kernel
-      activation_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden}, dl_uint8,
-                                       hidden_states.device());
+      activation_output = _alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden},
+                                        dl_uint8, hidden_states.device());
       per_token_scales_fc2 =
-          alloc_tensor({max_num_padded_tokens_gemm1}, dl_float32, hidden_states.device());
+          _alloc_tensor({max_num_padded_tokens_gemm1}, dl_float32, hidden_states.device());
     }
 
     // Allocate gemm2_output
     // gemm2_output is GEMM2's destination and finalize reads it at the GEMM2 stride, so it must
     // be sized by GEMM2's N, not by the (possibly narrower) caller output width.
     auto const hidden_size_output = gemm2_output_hidden_size();
-    gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, hidden_size_output}, dl_bfloat16,
-                                hidden_states.device());
+    gemm2_output = _alloc_tensor({max_num_padded_tokens_gemm2, hidden_size_output}, dl_bfloat16,
+                                 hidden_states.device());
 
     // Setup workspace pointers
     workspace.hidden_states_scale_linear = nullptr;  // FP4 doesn't use linear scale
@@ -5123,10 +5260,11 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
                           bool return_activation_output = false) override {
     ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
     check_routing();
+    bind_workspace_buffer(return_activation_output);
     prepare_routing();
 
     // Execute routing
-    tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+    RoutingRunner routing_runner(tile_tokens_dim);
     cudaStream_t routing_stream = get_stream(hidden_states.device());
 
     // Set routing kernel parameters based on mode (see RoutingInputMode enum for documentation)
@@ -5236,6 +5374,37 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   }
 };
 
+/** Return a workspace-size query result as a one-element CPU int64 tensor. */
+Array<Tensor> moe_workspace_size_result(int64_t bytes) {
+  Tensor result = alloc_tensor({1}, dl_int64, DLDevice{kDLCPU, 0});
+  static_cast<int64_t*>(result.data_ptr())[0] = bytes;
+  return {result};
+}
+
+/**
+ * Apply the workspace arguments shared by the ordinary MoE entry points. A size query returns
+ * the largest scratch footprint over every tile at this token count, so one buffer fits
+ * whichever tactic the autotuner (or the default heuristic) later selects.
+ * Otherwise the caller-owned buffer, if any, is attached to the selected launcher.
+ */
+template <typename Launcher>
+Optional<Array<Tensor>> apply_moe_workspace_args(
+    std::unordered_map<int32_t, std::unique_ptr<Launcher>> const& launchers, Launcher& selected,
+    Optional<TensorView> const& workspace_buffer, bool query_workspace_size, bool is_da_launch) {
+  if (query_workspace_size) {
+    int64_t bytes = 0;
+    for (auto const& entry : launchers) {
+      bytes = std::max(bytes, entry.second->measure_workspace_size());
+    }
+    return moe_workspace_size_result(bytes);
+  }
+  // DA bodies own graph-stable typed workspaces of their own.
+  TVM_FFI_ICHECK(!workspace_buffer.has_value() || !is_da_launch)
+      << "workspace_buffer is not supported by distribution-aware MoE launches.";
+  selected.set_workspace_buffer(workspace_buffer);
+  return Optional<Array<Tensor>>();
+}
+
 Array<Tensor> trtllm_bf16_moe(
     int64_t routing_input_mode, Optional<TensorView> const& routing_logits,
     Optional<TensorView> const& routing_bias, TensorView const& expert_indices,
@@ -5249,7 +5418,8 @@ Array<Tensor> trtllm_bf16_moe(
     bool use_shuffled_weight, int64_t weight_layout, bool do_finalize, bool enable_pdl,
     Array<int64_t> moe_tactic, int64_t activation_type, bool norm_topk_prob,
     Optional<TensorView> routing_replay_out, Array<Tensor> da_routing_metadata,
-    Array<Tensor> da_body_workspace, bool is_da_body_preparation) {
+    Array<Tensor> da_body_workspace, bool is_da_body_preparation,
+    Optional<TensorView> workspace_buffer, bool query_workspace_size) {
   // Just some basic type validation first and leave more checks to the launcher
   if (routing_logits.has_value()) {
     TVM_FFI_ICHECK(routing_logits.value().dtype() == dl_float32 ||
@@ -5326,6 +5496,12 @@ Array<Tensor> trtllm_bf16_moe(
   FLASHINFER_CHECK(launcher_it != launchers_map.end(),
                    "Internal error: missing BF16 MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
+  if (auto size = apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer,
+                                           query_workspace_size,
+                                           is_da_body_preparation || !da_routing_metadata.empty());
+      size.has_value()) {
+    return size.value();
+  }
 
   if (is_da_body_preparation) {
     TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
@@ -5361,7 +5537,8 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
     bool enable_pdl, Array<int64_t> config_index, int64_t activation_type, bool norm_topk_prob,
     Optional<TensorView> routing_replay_out, Array<Tensor> da_routing_metadata,
     Array<Tensor> da_body_workspace, bool is_da_body_preparation,
-    Optional<TensorView> gemm1_clamp_limit) {
+    Optional<TensorView> gemm1_clamp_limit, Optional<TensorView> workspace_buffer,
+    bool query_workspace_size) {
   // Basic type validation
   auto dtype = hidden_states.dtype();
   auto activation = validateAndCastActivationType(activation_type);
@@ -5438,6 +5615,12 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
   FLASHINFER_CHECK(launcher_it != launchers_map.end(),
                    "Internal error: missing FP8 per-tensor MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
+  if (auto size = apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer,
+                                           query_workspace_size,
+                                           is_da_body_preparation || !da_routing_metadata.empty());
+      size.has_value()) {
+    return size.value();
+  }
 
   if (is_da_body_preparation) {
     TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
@@ -5469,7 +5652,8 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_routed_moe(
     int64_t routing_method_type, bool do_finalize, bool enable_pdl, Array<int64_t> config_index,
     int64_t activation_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out,
     Array<Tensor> da_routing_metadata, Array<Tensor> da_body_workspace, bool is_da_body_preparation,
-    Optional<TensorView> gemm1_clamp_limit) {
+    Optional<TensorView> gemm1_clamp_limit, Optional<TensorView> workspace_buffer,
+    bool query_workspace_size) {
   // Basic type validation
   auto const dtype = hidden_states.dtype();
   auto const activation = validateAndCastActivationType(activation_type);
@@ -5556,6 +5740,12 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_routed_moe(
   FLASHINFER_CHECK(launcher_it != launchers_map.end(),
                    "Internal error: missing FP8 per-tensor MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
+  if (auto size = apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer,
+                                           query_workspace_size,
+                                           is_da_body_preparation || !da_routing_metadata.empty());
+      size.has_value()) {
+    return size.value();
+  }
 
   if (is_da_body_preparation) {
     TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
@@ -5586,7 +5776,8 @@ Array<Tensor> trtllm_fp8_per_channel_scale_moe(
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     bool use_routing_scales_on_input, int64_t routing_method_type, bool do_finalize,
-    bool enable_pdl, Array<int64_t> config_index, int64_t activation_type, bool norm_topk_prob) {
+    bool enable_pdl, Array<int64_t> config_index, int64_t activation_type, bool norm_topk_prob,
+    Optional<TensorView> workspace_buffer, bool query_workspace_size) {
   auto const activation = validateAndCastActivationType(activation_type);
   auto const num_tokens = hidden_states.size(0);
   auto const hidden_size = hidden_states.size(1);
@@ -5595,32 +5786,46 @@ Array<Tensor> trtllm_fp8_per_channel_scale_moe(
 
   std::vector<int32_t> supported_tile_nums(Fp8PerChannelLauncher::mSupportedTileNums.begin(),
                                            Fp8PerChannelLauncher::mSupportedTileNums.end());
+
+  auto make_launcher = [&](int32_t tile) {
+    auto args = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>();
+    args->num_tokens = num_tokens;
+    args->num_experts = num_experts;
+    args->hidden_size = hidden_size;
+    args->hidden_size_output = hidden_size;
+    args->top_k = top_k;
+    args->n_group = n_group.value_or(0);
+    args->topk_group = topk_group.value_or(0);
+    args->local_expert_offset = local_expert_offset;
+    args->local_num_experts = local_num_experts;
+    args->intermediate_size = intermediate_size;
+    args->routed_scaling_factor = routed_scaling_factor.value_or(1.0);
+    args->do_finalize = do_finalize;
+    args->output = output.data_ptr();
+
+    auto launcher = std::make_unique<Fp8PerChannelLauncher>(
+        routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
+        gemm1_per_channel_weight_scale, output1_scales_scalar, output1_scales_gate_scalar,
+        gemm2_weights, gemm2_per_channel_weight_scale, output2_scales_scalar, expert_indices,
+        expert_weights);
+    launcher->init(std::move(args), tile, routing_method_type, use_shuffled_weight, weight_layout,
+                   use_routing_scales_on_input, activation, norm_topk_prob);
+    return launcher;
+  };
+
+  if (query_workspace_size) {
+    // Same bound as apply_moe_workspace_args(): the largest footprint over every tile.
+    int64_t bytes = 0;
+    for (int32_t tile : supported_tile_nums) {
+      bytes = std::max(bytes, make_launcher(tile)->measure_workspace_size());
+    }
+    return moe_workspace_size_result(bytes);
+  }
+
   auto const [tile_N, config] = resolveMoeTileAndConfig(config_index, supported_tile_nums,
                                                         num_tokens, top_k, local_num_experts);
-
-  auto args = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>();
-  args->num_tokens = num_tokens;
-  args->num_experts = num_experts;
-  args->hidden_size = hidden_size;
-  args->hidden_size_output = hidden_size;
-  args->top_k = top_k;
-  args->n_group = n_group.value_or(0);
-  args->topk_group = topk_group.value_or(0);
-  args->local_expert_offset = local_expert_offset;
-  args->local_num_experts = local_num_experts;
-  args->intermediate_size = intermediate_size;
-  args->routed_scaling_factor = routed_scaling_factor.value_or(1.0);
-  args->do_finalize = do_finalize;
-  args->output = output.data_ptr();
-
-  auto launcher = std::make_unique<Fp8PerChannelLauncher>(
-      routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
-      gemm1_per_channel_weight_scale, output1_scales_scalar, output1_scales_gate_scalar,
-      gemm2_weights, gemm2_per_channel_weight_scale, output2_scales_scalar, expert_indices,
-      expert_weights);
-  launcher->init(std::move(args), tile_N, routing_method_type, use_shuffled_weight, weight_layout,
-                 use_routing_scales_on_input, activation, norm_topk_prob);
-
+  auto launcher = make_launcher(static_cast<int32_t>(tile_N));
+  launcher->set_workspace_buffer(workspace_buffer);
   return launcher->run(config, enable_pdl, use_routing_scales_on_input).to_ffi();
 }
 
@@ -5639,7 +5844,8 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     bool enable_pdl, Array<int64_t> config_index, Fp8QuantizationType quantization_type,
     int64_t act_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out,
     Array<Tensor> da_routing_metadata, Array<Tensor> da_body_workspace, bool is_da_body_preparation,
-    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size) {
+    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size,
+    Optional<TensorView> workspace_buffer, bool query_workspace_size) {
   auto activation_type = validateAndCastActivationType(act_type);
   validateFp8BlockScaleGemm1ActivationParams(gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
                                              quantization_type, activation_type);
@@ -5778,6 +5984,12 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   FLASHINFER_CHECK(launcher_it != launchers_map.end(),
                    "Internal error: missing FP8 block-scale MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
+  if (auto size = apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer,
+                                           query_workspace_size,
+                                           is_da_body_preparation || !da_routing_metadata.empty());
+      size.has_value()) {
+    return size.value();
+  }
 
   if (is_da_body_preparation) {
     TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
@@ -5827,7 +6039,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     TensorView output, Array<int64_t> config_index, bool norm_topk_prob,
     Optional<TensorView> routing_replay_out, Array<Tensor> da_routing_metadata,
     Array<Tensor> da_body_workspace, bool is_da_body_preparation,
-    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size) {
+    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size,
+    Optional<TensorView> workspace_buffer, bool query_workspace_size) {
   auto const gemm1_bias_type_enum = gemm1_lora_delta.has_value()
                                         ? batchedGemm::gemm::BiasType::Mn
                                         : batchedGemm::gemm::BiasType::None;
@@ -5971,6 +6184,12 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   FLASHINFER_CHECK(launcher_it != launchers_map.end(),
                    "Internal error: missing FP4 block-scale MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
+  if (auto size = apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer,
+                                           query_workspace_size,
+                                           is_da_body_preparation || !da_routing_metadata.empty());
+      size.has_value()) {
+    return size.value();
+  }
 
   if (is_da_body_preparation) {
     TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
@@ -6010,7 +6229,8 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
     bool enable_pdl, TensorView output, Array<int64_t> config_index, bool norm_topk_prob,
     Optional<TensorView> routing_replay_out, Array<Tensor> da_routing_metadata,
     Array<Tensor> da_body_workspace, bool is_da_body_preparation,
-    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size) {
+    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size,
+    Optional<TensorView> workspace_buffer, bool query_workspace_size) {
   // Determine data types based on input format
   int const num_tokens = hidden_states.size(0);
   int hidden_size = hidden_states.size(1);
@@ -6103,6 +6323,12 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
   FLASHINFER_CHECK(launcher_it != launchers_map.end(),
                    "Internal error: missing MXINT4 block-scale MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
+  if (auto size = apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer,
+                                           query_workspace_size,
+                                           is_da_body_preparation || !da_routing_metadata.empty());
+      size.has_value()) {
+    return size.value();
+  }
 
   if (is_da_body_preparation) {
     TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
@@ -6342,7 +6568,7 @@ void trtllm_moe_canonicalize_routing(
       routing_logits.dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
 
   // Run the production router into graph-stable storage, including its native int16 replay IDs.
-  tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+  RoutingRunner routing_runner(tile_tokens_dim);
   cudaStream_t stream = get_stream(routing_logits.device());
   routing_runner.run(
       const_cast<void*>(routing_logits.data_ptr()),

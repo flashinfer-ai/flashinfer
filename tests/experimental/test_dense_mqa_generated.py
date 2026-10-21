@@ -10,6 +10,7 @@ imports and launches never use it.
 """
 
 import bisect
+import re
 
 import pytest
 import torch
@@ -607,11 +608,8 @@ def test_dense_mqa_sm_count_definition(sm_count):
     )
     assert plan.route_name == "fp8:q1:short"
     assert plan.num_sms == sm_count
-    program = dict(plan.route["stages"])["logits"][arch]
+    program = _runtime.stage_program(plan.route["stages"][0], arch)
     assert plan.program_names == [program]
-    record = _runtime._catalog()["programs"][program]
-    assert record["definitions"] == ["SM_COUNT"]
-    assert _runtime.program_definitions(record, sm_count) == {"SM_COUNT": sm_count}
     assert _runtime.program_spec(arch, program, sm_count).name.endswith(
         f"_sm_count{sm_count}"
     )
@@ -908,21 +906,39 @@ def test_dense_route_table_is_catalog_driven():
     }
     if 64 in _runtime.heads():
         assert _runtime.block_q(64) == 2
-        assert _runtime.route_name("fp8", 16, 4096, 64) == "fp8:h64:full:le64"
-        assert _runtime.route_name("fp8", 3, 4100, 64) == "fp8:h64:partial:le8"
-        assert _runtime.route_name("fp8", 1, 300, 64) == "fp8:h64:q1"
+        # the in-kernel KV-split routes (policy.dense_kvsplit): K > 256 and fewer query blocks than the catalogued
+        # SM count take the production text under the plan of the query count; K <= 256 keeps the one-split /
+        # grid-stride routes, at least as many blocks as SMs the grid-stride tier routes
+        assert _runtime.route_name("fp8", 16, 4096, 64) == "fp8:h64:full:qle128:kvsplit"
+        assert (
+            _runtime.route_name("fp8", 3, 4100, 64) == "fp8:h64:partial:qle128:kvsplit"
+        )
+        assert _runtime.route_name("fp8", 1, 300, 64) == "fp8:h64:q1:kvsplit"
+        assert _runtime.route_name("fp8", 1, 256, 64) == "fp8:h64:q1"
+        assert (
+            _runtime.route_name("fp8", 128, 4100, 64) == "fp8:h64:full:qle2048:kvsplit"
+        )
+        assert (
+            _runtime.route_name("fp8", 129, 4100, 64)
+            == "fp8:h64:partial:qle2048:kvsplit"
+        )
         assert _runtime.route_name("fp8", 1024, 5124, 64) == "fp8:h64:full:le1024"
         assert _runtime.route_name("fp8", 37, 37, 64) == "fp8:h64:partial:short"
         assert _runtime.route_name("fp8", 16, 16, 64) == "fp8:h64:full:short"
         assert _runtime.route_name("fp8", 2, 2, 64) == "fp8:h64:full:le8"
-        assert _runtime.route_name("fp8", 3, 257, 64) == "fp8:h64:partial:le8"
-        # W-dense contract: single-stage gridDim-strided programs, no metadata stage, no query bound.
+        assert (
+            _runtime.route_name("fp8", 3, 257, 64) == "fp8:h64:partial:qle128:kvsplit"
+        )
+        # W-dense contract: single-stage programs, no metadata stage, no query bound; the ``:kvsplit`` plans own
+        # the buffer their text writes in-kernel, the grid-stride / one-split programs have none.
         assert not _runtime.schedules_metadata(64) and _runtime.max_queries(64) is None
+        assert _runtime.route_owns_metadata("fp8:h64:q1:kvsplit", 64)
+        assert not _runtime.route_owns_metadata("fp8:h64:q1", 64)
         # Availability of a 64-head point is decided per architecture (policy.dense_admission).
         for arch in sorted(_runtime._catalog()["arches"]):
             admitted = set(_runtime.h64_admission(arch)["admitted_routes"])
             assert _runtime.dense_route_available(64, 37, 4137, arch=arch) == (
-                "fp8:h64:partial:le64" in admitted
+                "fp8:h64:partial:qle128:kvsplit" in admitted
             )
             assert _runtime.dense_route_available(64, 100_000, 7, arch=arch) == (
                 "fp8:h64:full:any" in admitted
@@ -1099,13 +1115,56 @@ def test_fp8_mqa_logits_graph_replay(queries, keys, heads):
     assert torch.equal(captured, changed) and not torch.equal(captured, eager)
 
 
+_LADDER = re.compile(
+    r"^#(?:el)?if (.+)\n#define CAKE_PROGRAM_KERNEL (\w+)(?:\n#define CAKE_PROGRAM_SHIM (\w+))?",
+    re.MULTILINE,
+)
+
+
+def _program_identity(kernel_text, binding_text, definitions):
+    """``(kernel symbol, host-shim namespace)`` a JIT module built from the two units with
+    ``definitions`` exports: the literal names of a per-route text, or the branch of a shared
+    text's program-identity ladder whose ``MACRO == value`` conjunction holds for exactly these
+    definitions (one branch in the kernel and one in the binding, naming the same kernel)."""
+
+    def select(text, what):
+        branches = _LADDER.findall(text)
+        if not branches:
+            return None
+        hits = [
+            (kernel, shim)
+            for condition, kernel, shim in branches
+            if {k: int(v) for k, v in re.findall(r"(\w+) == (\d+)", condition)}
+            == definitions
+        ]
+        assert len(hits) == 1, (what, definitions, hits)
+        return hits[0]
+
+    kernel, binding = select(kernel_text, "kernel"), select(binding_text, "binding")
+    if kernel is None and binding is None:
+        symbol = re.search(r"^(kernel_cake_\w+)\(", kernel_text, re.MULTILINE).group(1)
+        shim = re.search(
+            r"^namespace (cake_host_shim_[0-9a-f]{16}) \{", binding_text, re.MULTILINE
+        ).group(1)
+        return symbol, shim
+    assert kernel is not None and binding is not None and kernel[0] == binding[0], (
+        kernel,
+        binding,
+    )
+    return binding
+
+
 def test_catalog_programs_are_delivered_and_distinct():
     """Host-only: every program a dense or paged route names is catalogued on exactly the architectures
     the route is delivered on, its generated units exist under FlashInfer's ``csrc`` (a module: its own
-    ``<name>_kernel.cu`` + ``<name>_binding.cu``; a sequence: >= 2 module kernels + its own binding),
-    no two generated kernel units are byte-identical and no generated unit is unreferenced -- a route
+    ``<name>_kernel.cu`` + ``<name>_binding.cu``; a sequence: >= 2 kernels + its own binding),
+    no two generated kernel units are byte-identical, a module record built from a shared parameterised
+    text (``fixed_definitions``) names that text's units, which guard exactly those definitions, no two
+    records build one text with the same definitions, and no generated unit is unreferenced -- a route
     table pointing at a program hash whose units were regenerated under a new hash fails here, not at
-    JIT build time."""
+    JIT build time.  Every standalone module exports its own kernel symbol and host-shim namespace
+    (a shared text selects the per-program names for each definition set through its
+    program-identity ladder)."""
     import hashlib
 
     from flashinfer.jit import env
@@ -1118,16 +1177,33 @@ def test_catalog_programs_are_delivered_and_distinct():
     # table names it (``policy.paged.dynamic_scheduler.static_window_routes``); every
     # other route binds a program on every catalogued architecture.
     text_route_arches = {}
-    for arch, table in catalog["policy"]["paged"]["dynamic_scheduler"][
-        "static_window_routes"
-    ].items():
+    dynamic = catalog["policy"]["paged"]["dynamic_scheduler"]
+    for arch, table in dynamic["static_window_routes"].items():
         for pairs in table.values():
             for _window, named in pairs:
                 text_route_arches.setdefault(named, set()).add(arch)
+    # r4 S5: a table-consuming ``:table`` route is delivered only on the architectures whose
+    # ``sched_meta_windows`` name its static route (both architectures for the n1 and the n4 route today);
+    # r4 H37-A2: a multi-atom rect route only where ``rect_atoms.windows`` name its static route
+    sched_meta = catalog["policy"]["paged"].get("sched_meta") or {}
+    for static, consumer in (sched_meta.get("consumer_routes") or {}).items():
+        text_route_arches[consumer] = {
+            arch
+            for arch, table in (dynamic.get("sched_meta_windows") or {}).items()
+            if static in table
+        }
+    rect_atoms = catalog["policy"]["paged"].get("rect_atoms") or {}
+    for static, rect in (rect_atoms.get("routes") or {}).items():
+        text_route_arches[rect] = {
+            arch
+            for arch, table in (rect_atoms.get("windows") or {}).items()
+            if static in table
+        }
     for table in ("routes", "paged_routes"):
         for route, record in catalog.get(table, {}).items():
             expected = sorted(text_route_arches.get(route, catalog["arches"]))
-            for _stage, by_arch in record["stages"]:
+            for stage in record["stages"]:
+                by_arch = _runtime.stage_programs(stage, catalog["arches"])
                 where = (table, route, by_arch, expected)
                 assert sorted(by_arch) == expected, where
                 for arch, program in by_arch.items():
@@ -1138,23 +1214,49 @@ def test_catalog_programs_are_delivered_and_distinct():
                 table,
                 route,
             )
-    referenced, kernels = set(), {}
+    referenced, kernels, instances, identities = set(), {}, {}, {}
     for name, record in programs.items():
         for source in record["sources"]:
             assert source.startswith("csrc/"), (name, source)
             assert (csrc / source.removeprefix("csrc/")).is_file(), (name, source)
             referenced.add(source)
-        if record.get(
-            "standalone", True
-        ):  # an omitted-binding module carries no closure digest
-            for arch in record["arches"]:
-                assert arch in (record.get("closure_sha256") or {}), (name, arch)
         if record["kind"] == "module":
-            expected = {f"{generated}/{name}_kernel.cu"}
+            fixed = record.get("fixed_definitions", {})
+            text = name
+            if fixed:
+                text = record["sources"][0].rsplit("/", 1)[1].removesuffix("_kernel.cu")
+            expected = {f"{generated}/{text}_kernel.cu"}
             if record["standalone"]:
-                expected.add(f"{generated}/{name}_binding.cu")
+                expected.add(f"{generated}/{text}_binding.cu")
             assert set(record["sources"]) == expected, (name, record["sources"])
-            kernels[f"{generated}/{name}_kernel.cu"] = name
+            kernel = f"{generated}/{text}_kernel.cu"
+            # The text requires exactly the definitions the record fixes (its
+            # ``#ifndef`` guards beyond the runtime-supplied ``SM_COUNT``) and no
+            # two records build one text with the same definitions.
+            guarded = set(
+                re.findall(
+                    r"^#ifndef (\w+)$",
+                    (csrc / kernel.removeprefix("csrc/")).read_text(),
+                    re.MULTILINE,
+                )
+            )
+            assert guarded - {"SM_COUNT"} == set(fixed), (name, guarded)
+            instance = (kernel, tuple(sorted(fixed.items())))
+            assert instance not in instances, (
+                f"{name} builds {text} with {instances[instance]}'s definitions"
+            )
+            instances[instance] = name
+            kernels[kernel] = text
+            if record["standalone"]:
+                identity = _program_identity(
+                    (csrc / kernel.removeprefix("csrc/")).read_text(),
+                    (
+                        csrc / f"{generated}/{text}_binding.cu".removeprefix("csrc/")
+                    ).read_text(),
+                    fixed,
+                )
+                assert identity not in identities.values(), (name, identity)
+                identities[name] = identity
         else:
             assert record["kind"] == "sequence", name
             devices = [s for s in record["sources"] if s.endswith("_kernel.cu")]
@@ -1163,8 +1265,7 @@ def test_catalog_programs_are_delivered_and_distinct():
                 and f"{generated}/{name}_binding.cu" in record["sources"]
             ), name
             for device in devices:
-                owner = device.rsplit("/", 1)[1].removesuffix("_kernel.cu")
-                assert programs.get(owner, {}).get("kind") == "module", (name, device)
+                kernels.setdefault(device, name)
     digests = {}
     for source, name in sorted(kernels.items()):
         digest = hashlib.sha256(
@@ -1192,14 +1293,35 @@ def test_h64_admission_matches_the_catalog_table():
     agree, otherwise the call raises (no silent admit)."""
     catalog = _runtime._catalog()
     arches = sorted(catalog["arches"])
-    tiers = {
-        "fp8:h64:q1",
-        *(
-            f"fp8:h64:{kind}:{tier}"
-            for kind in ("full", "partial")
-            for tier in ("le8", "le64", "le1024", "any", "short")
-        ),
-    }
+    # the in-kernel KV-split routes join the family and the grid-stride tier aliases their gate leaves without a
+    # domain (``policy.dense_kvsplit.unreached_routes``) leave it: the lists name the reached routes exactly
+    gate = catalog["policy"].get("dense_kvsplit")
+    kvsplit = (
+        {
+            "fp8:h64:q1:kvsplit",
+            *(
+                f"fp8:h64:{kind}:{plan}:kvsplit"
+                for kind in ("full", "partial")
+                for plan in ("qle128", "qle2048")
+            ),
+        }
+        if gate is not None
+        else set()
+    )
+    unreached = set(gate["unreached_routes"]) if gate is not None else set()
+    tiers = (
+        {
+            "fp8:h64:q1",
+            *(
+                f"fp8:h64:{kind}:{tier}"
+                for kind in ("full", "partial")
+                for tier in ("le8", "le64", "le1024", "any")
+            ),
+        }
+        - unreached
+        | {f"fp8:h64:{kind}:short" for kind in ("full", "partial")}
+        | kvsplit
+    )
     verdicts, sample = {}, {}
     for arch in arches:
         admission = _runtime.h64_admission(arch)
@@ -1245,6 +1367,57 @@ def test_h64_admission_matches_the_catalog_table():
             route = _runtime.route_name("fp8", queries, max_kv, 64)
             assert not route.endswith(":short")
         assert not _runtime.route_name("fp8", 3, max_kv + 1, 64).endswith(":short")
+        if gate is not None:
+            # The in-kernel KV-split routes (K > dense_kvsplit.min_kv and fewer query blocks than the architecture's
+            # catalogued SM count): served where admitted, otherwise by the grid-stride q1 / tier route of the query
+            # count -- never the stock kernel; the gate is applied at the catalogued count, so the served route of a
+            # point is decided per architecture and dense_route_available follows the served route.
+            assert gate["fallback"] == "tier" and int(gate["min_kv"]) == max_kv
+            sms = int(gate["sm_count"][arch])
+            assert (
+                _runtime.h64_kvsplit_plan(2 * (sms - 1), max_kv + 1, 64, arch=arch)
+                == "qle2048"
+            )
+            assert (
+                _runtime.h64_kvsplit_plan(2 * sms - 1, max_kv + 1, 64, arch=arch)
+                is None
+            )
+            assert _runtime.h64_kvsplit_plan(37, max_kv, 64, arch=arch) is None
+            for queries in (1, 2, 3, 37, 64, 65, 128, 2 * (sms - 1), 2 * sms - 1, 1024):
+                plan = _runtime.h64_kvsplit_plan(queries, max_kv + 1, 64, arch=arch)
+                served = _runtime.served_route(
+                    "fp8", queries, max_kv + 1, 64, arch=arch
+                )
+                kind = "full" if queries % 2 == 0 else "partial"
+                if plan is None:
+                    assert not served.endswith(":kvsplit"), (arch, queries, served)
+                else:
+                    logical = (
+                        "fp8:h64:q1:kvsplit"
+                        if plan == "q1"
+                        else f"fp8:h64:{kind}:{plan}:kvsplit"
+                    )
+                    fallback = (
+                        "fp8:h64:q1"
+                        if plan == "q1"
+                        else f"fp8:h64:{kind}:{_runtime.metadata_tier(queries, 64)}"
+                    )
+                    assert served == (logical if logical in admitted else fallback), (
+                        arch,
+                        queries,
+                        served,
+                    )
+                assert _runtime.dense_route_available(
+                    64, queries, max_kv + 1, arch=arch
+                ) == (served in admitted), (arch, queries, served)
+                if served in admitted:
+                    record = _runtime.route_record(
+                        "fp8", queries, max_kv + 1, 64, arch=arch
+                    )
+                    assert (
+                        record["stages"][0][0] == "logits"
+                        and record["clean_logits"] == "raw"
+                    )
         # 32 heads never take the 64-head one-split route: at this KV length a 32-head call takes its
         # single-launch route -- the v9 in-kernel scan class of its query count, or the r3 fused tiered
         # text where the published order of its tier puts that family first; above the le32 class's
@@ -1306,7 +1479,9 @@ def _route_point(route_name, record):
         # the 64-head one-split routes at K <= dense_short.max_kv
         candidates = [int(policy["dense_short"]["max_kv"])]
     else:
-        candidates = [300]
+        # the 64-head routes at any K: the in-kernel KV-split routes and the le1024 / any tiers at K = 300 (the gate
+        # takes the small query counts there), the grid-stride q1 / full:le8 routes at K = dense_short.max_kv
+        candidates = [300, int(policy["dense_short"]["max_kv"])]
     for keys in candidates:
         for queries in range(1, 4200):
             try:
@@ -1386,9 +1561,11 @@ def test_dense_bindings_cover_every_program_argument():
         else:
             # Every program a stage launches on any architecture binds the same way.
             selections = [
-                (stage, program)
-                for stage, by_arch in record["stages"]
-                for program in sorted(set(by_arch.values()))
+                (stage[0], program)
+                for stage in record["stages"]
+                for program in sorted(
+                    set(_runtime.stage_programs(stage, catalog["arches"]).values())
+                )
             ]
         for stage, program in selections:
             missing = []

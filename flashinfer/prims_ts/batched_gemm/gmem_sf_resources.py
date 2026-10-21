@@ -55,7 +55,6 @@ from cutlass.experimental.task_scheduling.resources import (
 
 from .batched_gemm_config import (
     BatchedGemmConfig,
-    BatchMode,
 )
 
 Constexpr = cutlass.Constexpr
@@ -111,7 +110,10 @@ class GmemSfAResource(MemoryResource):
                     token_tile = tile_coord_n
                 else:
                     token_tile = tile_coord_m
-                expert_idx = self.tile_idx_view.load(idx=token_tile, vector_size=1)[0]
+                expert_idx = self.tile_idx_view.load(
+                    idx=token_tile // Int32(self.cfg.token_metadata_stride),
+                    vector_size=1,
+                )[0]
         self.tile_expert_idx = expert_idx
 
         if cutlass.const_expr(self.cfg.is_swap_ab):
@@ -196,17 +198,14 @@ class GmemSfBResource(MemoryResource):
         if cutlass.const_expr(not self.cfg.is_swap_ab):
             if cutlass.const_expr(self.tile_idx_view is not None):
                 self.tile_expert_idx = self.tile_idx_view.load(
-                    idx=tile_coord_m, vector_size=1
+                    idx=tile_coord_m // Int32(self.cfg.token_metadata_stride),
+                    vector_size=1,
                 )[0]
             elif cutlass.const_expr(self.tile_idx_ptr is not None):
-                if cutlass.const_expr(self.cfg.batch_mode == int(BatchMode.BATCH_N)):
-                    self.tile_expert_idx = (
-                        self.tile_idx_arr.subview(tile_coord_m)
-                    ).load()
-                else:
-                    self.tile_expert_idx = (
-                        self.tile_idx_arr.subview(tile_coord_n)
-                    ).load()
+                self.tile_expert_idx = self.tile_idx_arr.subview(
+                    tile_coord_m // Int32(self.cfg.token_metadata_stride)
+                ).load()
+
         if cutlass.const_expr(self.cfg.has_routed_sfs and self.cfg.is_swap_ab):
             coord_sfb_mn = tile_coord_n * Int32(self.cfg.tile_n)
         elif cutlass.const_expr(not self.cfg.is_swap_ab):

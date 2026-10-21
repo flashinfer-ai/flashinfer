@@ -6,13 +6,11 @@ One ``DataPreprocess`` launch replaces the multi-kernel torch staging path
 (fp32 upcast + ~a dozen elementwise/reduce launches + per-tensor copies) that
 `stage_mega_moe_inputs` used per forward: the kernel reads the bf16 row once,
 quantizes it in smem (NVFP4 per-16 E4M3 scales or MXFP8 per-32 E8M0), and
-repacks routing to the int64/fp32 layout the mega kernels consume.
+repacks routing to the workspace's integer-ID/fp32 layout.
 
-Caching mirrors the mega frontends: one ``cute.compile`` per
-``(topk, hidden, quant_type)`` per process, plus a launch-args cache keyed on
-data pointers + token count + stream, so the steady state is a single cached
-kernel launch (CUDA-graph capturable; compile is guarded by
-:func:`.comm.ensure_not_capturing` and must happen during warmup).
+Compiled stagers are cached by geometry, quantization mode and tensor types
+and layouts. Launch bindings are cached by data pointers, token count, scales
+and stream. Compilation must happen during warmup, before graph capture.
 
 NVFP4 uses the offline (calibrated constant) scale mode; the online amax mode
 exists in the kernel but is not wired here.
@@ -21,6 +19,7 @@ exists in the kernel but is not wired here.
 from __future__ import annotations
 
 import dataclasses
+from functools import cache
 from typing import Any, Optional
 
 import torch
@@ -53,6 +52,45 @@ _LAST_STAGED_N: dict[int, int] = {}
 _GRAPH_CAPTURED_BUFFERS: set[int] = set()
 
 
+@cache
+def _int32_routing_stager_class():
+    """Adapt routing stores for GenPhase without changing the vendored kernel."""
+    import cutlass
+    import cutlass.cute as cute
+    from src.inputs_process import DataPreprocess
+
+    class Int32RoutingDataPreprocess(DataPreprocess):
+        @cute.jit
+        def _repack_routing(
+            self,
+            token_idx,
+            tid,
+            topk_idx,
+            topk_weights,
+            token_padding_info,
+            topk_idx_output,
+            topk_weights_output,
+        ):
+            if tid < cutlass.Int32(self.topk):
+                is_padding = False
+                if cutlass.const_expr(token_padding_info is not None):
+                    is_padding = token_padding_info[token_idx] != cutlass.Int32(0)
+                idx = (
+                    cutlass.Int32(-1)
+                    if is_padding
+                    else cutlass.Int32(topk_idx[token_idx, tid])
+                )
+                weight = (
+                    cutlass.Float32(0.0)
+                    if is_padding
+                    else cutlass.Float32(topk_weights[token_idx, tid])
+                )
+                topk_idx_output[token_idx, tid] = idx
+                topk_weights_output[token_idx, tid] = weight
+
+    return Int32RoutingDataPreprocess
+
+
 def _to_cute(tensor: torch.Tensor, assumed_align: int = 16):
     import cutlass.torch as cutlass_torch
 
@@ -67,9 +105,13 @@ def note_staged_tokens(topk_idx_out: torch.Tensor, num_tokens: int) -> None:
     The torch fallback paths stage live rows and re-mask the full tail; they
     must update the memo so a later fused call cannot skip a fill over rows
     the fallback left live. Unknown buffers default to "assume fully live"
-    (prev_n = capacity), which is always safe.
+    (prev_n = capacity), which is always safe. Captured writers also disable
+    tail memoization because replays update routes without updating the memo.
     """
-    _LAST_STAGED_N[topk_idx_out.data_ptr()] = num_tokens
+    ptr = topk_idx_out.data_ptr()
+    if topk_idx_out.is_cuda and torch.cuda.is_current_stream_capturing():
+        _GRAPH_CAPTURED_BUFFERS.add(ptr)
+    _LAST_STAGED_N[ptr] = num_tokens
 
 
 def staged_tokens(topk_idx_out: torch.Tensor) -> Optional[int]:
@@ -119,6 +161,7 @@ def fused_quant_stage(
     *,
     quant_type: str,
     norm_const: Optional[float] = None,
+    scale_multiplier: Optional[float] = None,
 ) -> None:
     """Quantize + stage one batch into the mega symm-buffer views.
 
@@ -130,6 +173,8 @@ def fused_quant_stage(
 
     ``norm_const`` is the NVFP4 offline per-tensor scale (required for
     ``quant_type="nvfp4"``, rejected otherwise).
+    ``scale_multiplier`` optionally supplies the rounded ``norm_const / 6``
+    factor used by the caller's NVFP4 quantization contract.
     """
     if quant_type not in _QUANT_TYPES:
         raise ValueError(
@@ -142,6 +187,8 @@ def fused_quant_stage(
         raise ValueError(
             f"{quant_type} staging is self-scaled; norm_const must be None"
         )
+    if not is_nvfp4 and scale_multiplier is not None:
+        raise ValueError("scale_multiplier is only supported for NVFP4")
 
     num_tokens, hidden = hidden_states.shape
     capacity = x_out.shape[0]
@@ -172,14 +219,33 @@ def fused_quant_stage(
             f"for hidden={hidden}, {quant_type}."
         )
 
-    key = (topk, hidden, quant_type)
+    # Rubin uses int32 route storage; the original workspace uses int64.
+    # A compiled stager is specialized on these tensor types and layouts.
+    tensor_signature = tuple(
+        (t.dtype, t.device, tuple(t.stride()))
+        for t in (
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            x_out,
+            x_sf_out,
+            topk_idx_out,
+            topk_weights_out,
+        )
+    )
+    key = (topk, hidden, quant_type, tensor_signature, scale_multiplier is not None)
     stager = _STAGERS.get(key)
     if stager is None:
         ensure_not_capturing("fused staging construction")
         from src.inputs_process import DataPreprocess
 
+        stager_class = (
+            _int32_routing_stager_class()
+            if topk_idx_out.dtype == torch.int32
+            else DataPreprocess
+        )
         stager = _CompiledStager(
-            dp=DataPreprocess(topk=topk, hidden=hidden, quant_type=quant_type)
+            dp=stager_class(topk=topk, hidden=hidden, quant_type=quant_type)
         )
         _STAGERS[key] = stager
 
@@ -196,6 +262,7 @@ def fused_quant_stage(
         topk_weights_out.data_ptr(),
         num_tokens,
         norm_const,
+        scale_multiplier,
         stream,
     )
     if stager.compiled is None or stager.launch_key != launch_key:
@@ -213,6 +280,8 @@ def fused_quant_stage(
             cuda_driver.CUstream(stream),
         )
         kwargs = {"offline_norm_const": cutlass.Float32(norm_const)} if is_nvfp4 else {}
+        if scale_multiplier is not None:
+            kwargs["offline_scale_multiplier"] = cutlass.Float32(scale_multiplier)
         if stager.compiled is None:
             ensure_not_capturing("fused staging cute.compile")
             import cutlass.cute as cute

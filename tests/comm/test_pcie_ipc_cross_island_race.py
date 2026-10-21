@@ -45,10 +45,13 @@ from tests.comm.test_pcie_ipc_all_reduce import (
     multi_process_parallel,
 )
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("FLASHINFER_TEST_PCIE_IPC_RACE") != "1",
-    reason="opt-in: needs 8 GPUs and builds two extra JIT modules",
-)
+pytestmark = [
+    pytest.mark.node_exclusive,
+    pytest.mark.skipif(
+        os.environ.get("FLASHINFER_TEST_PCIE_IPC_RACE") != "1",
+        reason="opt-in: needs 8 GPUs and builds two extra JIT modules",
+    ),
+]
 
 _HIDDEN = 6144
 # 100 us reproduced at batch 16 (one collective is ~63 us there); 200 us leaves
