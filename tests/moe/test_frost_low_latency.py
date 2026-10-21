@@ -25,7 +25,7 @@ from flashinfer.fused_moe import (
     SwiGLU,
     TrtllmFp8BlockConfig,
 )
-from flashinfer.autotuner import AutoTuner, autotune
+from flashinfer.autotuner import autotune
 from flashinfer.fused_moe.api import RoutingInputMode
 from flashinfer.fused_moe.backends.frost_low_latency.runner import FrostLowLatencyRunner
 
@@ -115,7 +115,7 @@ def _require_gpu():
         pytest.skip("requires nvidia-cutlass-dsl >= 4.8")
 
 
-def test_frost_cross_backend_latency_tuning(monkeypatch):
+def test_frost_cross_backend_autotuning():
     """Exercise real packing, native/Frost tuning, and the resulting graph."""
     _require_gpu()
     torch.manual_seed(318)
@@ -156,25 +156,8 @@ def test_frost_cross_backend_latency_tuning(monkeypatch):
     ids = torch.arange(k, device=device, dtype=torch.int32)[None, :]
     rw = torch.softmax(torch.randn(1, k, device=device), -1)
     act = MoEActivationPack(q, sf, ids, rw)
-    measured = []
-    tuner = AutoTuner.get()
-    original_profile = tuner.profile_tactic
-
-    def record_profile(runner, inputs, tactic, tuning_config, batches, **kwargs):
-        measured.append(
-            (
-                tuning_config.use_cuda_graph_individual_timing,
-                tuning_config.use_cold_l2_cache,
-            )
-        )
-        return original_profile(
-            runner, inputs, tactic, tuning_config, batches, **kwargs
-        )
-
-    monkeypatch.setattr(tuner, "profile_tactic", record_profile)
     with autotune(True):
         layer(act, weights)
-    assert measured == [(True, False), (True, False)]
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = layer(act, weights)

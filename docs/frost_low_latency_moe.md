@@ -12,16 +12,20 @@ the complete pipelines. The MX untuned default remains Tensor Core; BF16 uses
 shared FMA kernels and independently tunes one, two, four or eight output
 columns per warp in FC1 and FC2.
 
-When Frost is an eligible candidate, `MoELayer` tunes every candidate's tactics
-and the cross-backend choice using individual-call CUDA Graph GPU latency.
-An explicit autotune measurement policy can still override cache or execution
-mode. External event nodes bracket each invocation inside the graph; the median
-excludes Python submission and first-replay initialization. This objective can
-rank FMA and Tensor Core differently from amortized back-to-back replay. The
-autotuner records the timing mode as provenance, so a tuning request remeasures
-a winner selected under the other mode. Layers without an eligible Frost
-candidate retain their existing timing behavior. This remains kernel GPU time,
-not model decode-step latency or throughput.
+Frost uses the existing FlashInfer autotuner. Each runner retains its own
+tuning policy; cross-backend selection measures packing plus forward with the
+existing CUDA Graph benchmark. The shared individual-call timing mode and its
+MoE integration are deferred to separate autotuner work.
+
+The performance tables below are benchmark-selected, fixed-tactic kernel GPU
+measurements from the recorded source revisions. The benchmark scripts retain
+their individual-call event timing and condition-specific tactic sweeps; those
+results do not guarantee that ordinary autotuning selects the same tactics.
+The split leaves device kernels, numerical contracts and default tactics
+unchanged, but changes how automatic selection ranks candidates. Frost's tuning
+cache identity is updated so it does not reuse winners from the deferred timing
+mode. These are kernel GPU measurements, not model decode-step latency or
+throughput.
 
 ```mermaid
 flowchart TD
@@ -273,12 +277,15 @@ graph checks and independent A/A captures accompany the timing. Inspect their
 stability before reporting a speedup; a successful run alone is not qualification.
 
 For cross-backend selection, include e.g. `TrtllmFp4Config()` in `BackendOptions`
-and prepare its weight view too. All eligible candidates then use the same
-warm-cache latency objective by default, including native runners whose own
-default tuning policy uses cold L2. An explicit `MeasurementPolicy` overrides
-that common default for all candidates. A missing fallback does not silently choose an
-unprepared backend; the layer rejects calls with no eligible candidate. The
-same activation pack is reusable across these candidates.
+and prepare its weight view too. Per-runner tuning uses each runner's existing
+cache policy; native runners can default to cold L2 while Frost defaults to warm
+L2. The existing cross-backend comparison uses amortized CUDA Graph GPU time
+for packing plus forward. An explicit `MeasurementPolicy` is handled by the
+existing per-runner autotuner; it does not change this layer-level comparison.
+Use the benchmark's cache-specific sweeps for a common measurement objective.
+A missing fallback does not silently choose an unprepared backend; the layer
+rejects calls with no eligible candidate. The same activation pack is reusable
+across these candidates.
 Cross-backend inputs must satisfy every selected backend's routing contract.
 In particular, use distinct expert IDs within each token when selecting or
 falling back to TRT-LLM. Frost can compute repeated slots independently, but
