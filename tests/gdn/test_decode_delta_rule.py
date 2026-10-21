@@ -1072,10 +1072,13 @@ def _test_verify_kernel_mtp(
     # Rectangular state: values may be narrower than keys.
     V = head_size if head_size_v is None else head_size_v
 
-    # Generate test inputs
+    # Generate test inputs.  q and k are L2-normalized below, so v and the
+    # initial state set the output's size.  At unit scale the output is ~3e-2
+    # RMS, ~0.2 max, and an all-zero output fails atol_o; with v * 0.1 and the
+    # state * 0.01 it was ~5e-4 RMS, and an all-zero output passed.
     q = torch.randn(B, T, H, K, dtype=torch_dtype, device="cuda") * 0.1
     k = torch.randn(B, T, num_k_heads, K, dtype=torch_dtype, device="cuda") * 0.1
-    v = torch.randn(B, T, HV, V, dtype=torch_dtype, device="cuda") * 0.1
+    v = torch.randn(B, T, HV, V, dtype=torch_dtype, device="cuda")
 
     # GDN parameters
     A_log = (
@@ -1101,9 +1104,7 @@ def _test_verify_kernel_mtp(
 
     # Initial state: [pool_size, HV, V, K] for MTP version (K-last layout)
     pool_size = B
-    initial_state = (
-        torch.randn(pool_size, HV, V, K, dtype=torch.float32, device="cuda") * 0.01
-    )
+    initial_state = torch.randn(pool_size, HV, V, K, dtype=torch.float32, device="cuda")
     initial_state_indices = torch.arange(B, dtype=torch.int32, device="cuda")
 
     # Intermediate states buffer (optional)
