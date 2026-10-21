@@ -2262,7 +2262,7 @@ def _build_decode_gen_schedule(
         tmem_allocator.add_resource(transformed_kv)
     tmem_allocator.compute_layout()
     if cfg.use_keeps_mma_ab and not use_one_inst_qkv and not cfg.uses_tmem_p:
-        # Two-inst Keeps with SMEM P (currently Q64) must retain the historical
+        # Two-inst Keeps with SMEM P (Q64/KV128 and 8-bit Q128/KV128) keeps the
         # standalone-first S/O layout after unused stats aliases are removed.
         s0_alloc = tmem_s0.get_tmem_requirements()[0]
         s1_alloc = tmem_s1.get_tmem_requirements()[0]

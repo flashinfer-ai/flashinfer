@@ -3833,7 +3833,7 @@ def test_attention_ts_decode_page4_inert_block_table_row_is_zero() -> None:
     torch.testing.assert_close(output[1], torch.zeros_like(output[1]), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("dtype", (BFloat16, Float8E4M3FN))
+@pytest.mark.parametrize("dtype", (BFloat16,))
 @pytest.mark.parametrize("headdim", (64, 128))
 def test_attention_ts_decode_q128_tmem_p_aliases_consumed_s_region(
     dtype,
@@ -3935,10 +3935,9 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
     Streamed profiles share one rolled fragment loop whose geometry follows
     the fragment register count, so the profile property and the fragment
     count are pinned together. They also run their two softmax groups
-    unordered. KV256 tiles and block-sparse routes stream, as do Q128/KV128
-    profiles whose K and V share a width and whose softmax stats travel
-    through SMEM, such as BF16 and FP8 at head dim 128; FP8 at head dim 64
-    keeps its stats in TMEM and the complete P row.
+    unordered. KV256 tiles and block-sparse routes stream, as do BF16
+    Q128/KV128 tiles; plain FP8 Q128/KV128 tiles stage a complete P row in
+    SMEM instead (``stages_q128_p_in_smem``).
     """
 
     kv256 = _make_contiguous_kv256_config(persistent=persistent)
@@ -3954,16 +3953,35 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
     assert q128.num_softmax_score_fragments == 4
     assert not q128.uses_ordered_softmax_barrier
 
-    q128_fp8 = _make_contiguous_keeps_config(dtype=Float8E4M3FN, tile_size_q=128)
-    assert q128_fp8.uses_two_inst_tmem_p
-    assert q128_fp8.streams_tmem_p_fragments
+    for headdim in (64, 128):
+        q128_fp8 = _make_contiguous_keeps_config(
+            dtype=Float8E4M3FN, tile_size_q=128, headdim=headdim
+        )
+        assert q128_fp8.stages_q128_p_in_smem
+        assert not q128_fp8.uses_tmem_p and not q128_fp8.streams_tmem_p_fragments
+        assert q128_fp8.num_softmax_score_fragments == 1
 
-    d64_fp8 = _make_contiguous_keeps_config(
-        dtype=Float8E4M3FN, tile_size_q=128, headdim=64
+
+@pytest.mark.parametrize("headdim", (64, 128))
+def test_attention_ts_decode_q128_8bit_p_in_smem(headdim: int) -> None:
+    """Plain 8-bit Q128/KV128 tiles stage P in SMEM and leave S to the next QK.
+
+    P owns one SMEM tile per instance, no TMEM P columns are allocated, and
+    the two softmax groups run unordered so each overlaps its own next QK.
+    """
+
+    cfg = _make_contiguous_keeps_config(
+        dtype=Float8E4M3FN, tile_size_q=128, headdim=headdim
     )
-    assert d64_fp8.uses_two_inst_tmem_p and not d64_fp8.keeps_stats_via_smem
-    assert not d64_fp8.streams_tmem_p_fragments
-    assert d64_fp8.num_softmax_score_fragments == 1
+    assert cfg.stages_q128_p_in_smem and not cfg.uses_tmem_p
+    assert not cfg.uses_ordered_softmax_barrier
+    resources, smem_allocator, tmem_allocator = _build_decode_resources(cfg)
+    for name in ("smemP0", "smemP1"):
+        p = resources[name]
+        assert p._tmem_alloc is None
+        assert p._alloc.size_bytes == cfg.smem_p_tile_bytes == 128 * 128
+    assert tmem_allocator.total_tmem_columns == cfg.tmem_total_cols <= 512
+    _assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
 def test_attention_ts_decode_arch_config_args_follow_softmax_hardware() -> None:

@@ -2443,10 +2443,11 @@ class FmhaDecodeConfig:
     @property
     def uses_ordered_softmax_barrier(self) -> bool:
         """Whether this profile selects the ordered P0/P1 softmax barrier."""
-        if self.streams_tmem_p_fragments:
-            # Streamed profiles use independent per-fragment P pipelines.
-            # Ordering the two softmax groups would serialize fragment
-            # production and defeat the intended P/PV overlap.
+        if self.streams_tmem_p_fragments or self.stages_q128_p_in_smem:
+            # Streamed profiles use independent per-fragment P pipelines, and
+            # SMEM-P Q128 tiles overlap each softmax with its own next QK.
+            # Ordering the two softmax groups would make one wait for the other
+            # and defeat that overlap.
             return False
         if self.ordered_softmax_barrier_mode == 2:
             return True
@@ -2573,8 +2574,8 @@ class FmhaDecodeConfig:
         Unstreamed profiles publish a complete packed-P row per pipeline
         token. Streamed profiles use the same S-to-P aliasing contract but
         stream four independently ready K32 fragments (see
-        ``streams_tmem_p_fragments``). Q64/KV128 keeps the base kernel's
-        faster SMEM-P cadence.
+        ``streams_tmem_p_fragments``). Q64/KV128 and the 8-bit Q128/KV128
+        tiles of ``stages_q128_p_in_smem`` stage P in SMEM instead.
         """
         # Two-instance Keeps keeps stats outside S, so both static and persistent
         # work tiles can overlay P on the consumed S instance. The split K/V
@@ -2590,6 +2591,33 @@ class FmhaDecodeConfig:
             and self.num_insts_kv == 2
             and self.o_stages == 2
             and self.tmem_total_cols <= 512
+            and not self.stages_q128_p_in_smem
+        )
+
+    @property
+    def stages_q128_p_in_smem(self) -> bool:
+        """Whether a two-instance Keeps Q128/KV128 tile stages its P in SMEM.
+
+        P aliasing S in TMEM ties each instance's next QK to its PV: the QK
+        may only overwrite S once PV has read the whole P. With P in SMEM,
+        Softmax holds the complete score row in registers and releases S after
+        the max pass, so the MMA warp issues the next QK before this tile's PV
+        and the exponentials overlap that QK. Plain 8-bit Q/K/V tiles take it;
+        an 8-bit P tile fits beside the K/V ring. Sage keeps the streamed TMEM
+        P, whose fragments carry its per-group scales, and so do block-sparse
+        routes.
+        """
+        return (
+            self.use_keeps_mma_ab
+            and self.tile_size_q == 128
+            and self.tile_size_kv == 128
+            and self.head_dim_per_stage_kv == 0
+            and self.num_insts_kv == 2
+            and self.o_stages == 2
+            and self.k_dtype.width == 8
+            and self.v_dtype.width == 8
+            and not self.use_sage_attention
+            and not self.use_block_sparse
         )
 
     @property
