@@ -323,19 +323,13 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
         tTR_tC = thr_t2r.partition_S(tCtC_mn)
         tTR_cC = thr_t2r.partition_D(cC)
         rC = cute.make_rmem_tensor_like(tTR_cC, self.acc_dtype)
+        tCgC = thr_t2r.partition_D(gC)
         if cutlass.const_expr(rows == 64):
-            # Partition GMEM through the MMA's C partition first: a raw (M, N)
-            # tile loses the split-lane ((16,4), N) C mode and gives wrong
-            # per-thread coordinates at M=64.
-            gC_mn = self.transform_partitioned_tensor_layout(
-                tiled_mma.get_slice(0).partition_C(gC)
-            )
-            tCgC = thr_t2r.partition_D(gC_mn)
+            # The 16x256b fragment holds column pairs: no 128-bit stores.
             for sub in cutlass.range(cute.size(rC, mode=[2]), unroll_full=True):
                 cute.copy(tiled_t2r, tTR_tC[None, 0, sub, 0], rC[None, 0, sub])
                 cute.autovec_copy(rC[None, 0, sub], tCgC[None, 0, sub])
         else:
-            tCgC = thr_t2r.partition_D(gC)
             tCgC = cute.make_tensor(tCgC.iterator.align(16), tCgC.layout)
             atom_r2g = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(), self.acc_dtype, num_bits_per_copy=128
@@ -886,7 +880,7 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
         self,
         tidx: cutlass.Int32,
         tmem_ptr: cutlass.Int64,
-        tiled_mma_z,
+        tiled_mma_y,
         tiled_mma_update,
         sV: cute.Tensor,
         sAlpha: cute.Tensor,
@@ -916,7 +910,7 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
                 self.tmem_n_offset,
                 self.tmem_n_inp_offset,
                 tiled_mma_update,
-                tiled_mma_z,
+                tiled_mma_y,
                 tidx,
                 self.DV,
             )
@@ -925,11 +919,11 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
             block_coeff = cutlass.Float32(
                 sAlpha[self.BLK - 1, AlphaProcessor.CUMPROD, alpha_handle.index]
             )
-            # Y is tiled_mma_y's (DV, BLK) accumulator; at DV=64 its split-lane
-            # layout differs from tiled_mma_x's flat M=128 layout.
+            # Y is tiled_mma_y's (DV, BLK) accumulator; its layout differs from
+            # tiled_mma_x's when DV < DK (split-lane M=64 vs flat M=128).
             self._process_y(
                 tmem_ptr,
-                tiled_mma_z,
+                tiled_mma_y,
                 tidx,
                 sV,
                 sAlpha,

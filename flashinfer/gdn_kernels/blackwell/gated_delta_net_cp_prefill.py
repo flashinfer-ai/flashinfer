@@ -2910,7 +2910,8 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         # tRT_rState_inp is filled from tTR_rState element by element, so the
         # register value layouts must match: St16x128b(Rep 8) pairs with
         # Ld16x256b(Rep 8) at M=64, St32x32b(Rep 16) with Ld32x32b(Rep 32).
-        if cutlass.const_expr(self.mma_tiler_qs[0] == 64):
+        # Same test as tiled_state_t2r above, so the pair cannot diverge.
+        if cutlass.const_expr(self.mma_tiler_kv[0] == 64):
             atom_state_inp_r2t = cute.make_copy_atom(
                 tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8)), self.io_dtype
             )

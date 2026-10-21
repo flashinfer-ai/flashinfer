@@ -3840,8 +3840,9 @@ class GatedDeltaNetChunkedKernel:
         # Paired with tiled_state_t2r: tRT_rState_inp is filled from tTR_rState
         # by a whole-tensor .store(.load()), which pairs them by element index,
         # so the value layouts must be equal.  See the copy-atom note in
-        # compute_group_1_chunk.
-        if cutlass.const_expr(self.mma_tiler_qs[0] == 64):
+        # compute_group_1_chunk.  Same test as tiled_state_t2r above, so the
+        # pair cannot diverge.
+        if cutlass.const_expr(self.mma_tiler_kv[0] == 64):
             # Pairs with Ld16x256b(Rep 8).
             atom_state_inp_r2t = cute.make_copy_atom(
                 tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8)), self.io_dtype
