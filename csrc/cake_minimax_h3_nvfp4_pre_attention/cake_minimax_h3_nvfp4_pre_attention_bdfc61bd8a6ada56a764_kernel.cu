@@ -517,6 +517,12 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_bdfc61bd8a6ada56a764(const __grid_con
                     }
                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
                 }
+                #pragma unroll 1
+                for (int _ = 0; _ < 5; _++) {
+                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
+                    load_stage += 1;
+                    if (load_stage == 5) { load_stage = 0; _phase_mma_done ^= 1; }
+                }
             }
         }
     }

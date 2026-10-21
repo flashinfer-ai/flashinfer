@@ -1,0 +1,1371 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Host plan and loader glue of the Cake Ulysses sequence-parallel all-to-all
+kernels for single-node NVLink groups (SM100 / SM103).
+
+Every module below is one mechanically exported production build: a CUDA
+device translation unit plus a tvm-ffi binding compiled together for exactly
+one architecture.  ``MODULES`` carries the host plan only: the kernel's
+``library`` stem, the architectures it is delivered for, its launch record,
+grid rule, the ``(dtype, world_size, mode)`` it moves and the kernel-parameter
+-> logical-argument map.  What to compile -- sources, digests, nvcc flags -- is
+recorded once in ``build.json`` next to this file; :mod:`.cake_build` serves the
+library ``<library>_<arch>`` from a prebuilt ``aot/`` file when a builder
+compiled it and otherwise through FlashInfer's JIT from the same sources and
+flags, verifying every source digest before the first build.
+
+A record is one public collective of one communicator: ``mode`` 0 is
+``scatter_heads`` (``inp [B, S_local, H, D] -> out [B, S_global, H_local, D]``),
+``mode`` 1 is ``gather_heads`` (the exact inverse); ``dtype`` is the element
+type (``bf16`` / ``f16`` / ``f32``) and ``world_size`` the group size (2, 4, 6
+or 8).  Batch, sequence and head counts are runtime scalars, so a changed
+problem size never recompiles anything.
+
+The kernel takes the caller's input and output, two by-value peer tables of
+exactly :data:`PEER_TABLE_CAPACITY` device addresses (rank ``r``'s symmetric
+staging and signal allocations at entry ``r``; unused entries zero), this
+rank's own signal allocation (:data:`SIGNAL_WORDS` ``uint32`` words, zeroed
+once when the communicator is created and owned by the kernel afterwards), the
+rank and the four shape scalars; it writes ``out`` completely, so the host
+issues no copy after the launch.  The launch is a fixed grid
+(:func:`launch_grid`) of ``launch.block`` threads, no dynamic shared memory, no
+PDL, not cooperative.  :mod:`.cake_backend` provisions the tables and the
+signal view from the communicator's IPC allocations and launches through
+:func:`run_module`'s plan.
+
+The program name ``cake_ulysses_a2a_<20 hex>`` is the first twenty hex digits
+of the SHA-256 of the compact JSON ``{"build": {"dtype": ..., "mode": ...,
+"world_size": ...}, "module": <dotted kernel module>}`` of the kernel the
+program was rendered from.
+"""
+
+from __future__ import annotations
+
+import functools
+from typing import Any, Sequence
+
+import tvm_ffi
+
+from . import cake_build
+
+# The derived leaves of every record (``kernel_symbol``, ``launch.block``,
+# ``launch.cluster``, ``launch.cooperative``, ``launch.dynamic_smem_bytes``,
+# ``launch.use_pdl``, ``arg_plan`` and ``logical``) are rewritten by the
+# exporter from the rendered program; every other field is host plan.
+# TODO(cake_ulysses): the exporter also fills ``build.json`` and writes the
+# ``csrc/<library>_kernel.cu`` / ``csrc/<library>_binding.cu`` pair of every
+# record; until it has, ``build.json`` delivers no library, ``route_applies``
+# is False everywhere and the communicator keeps the portable NVLink kernel.
+MODULES: dict[str, dict[str, Any]] = {
+    "scatter_bf16_w2": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "bf16",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_d939511488998464c41d",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_d939511488998464c41d",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_d939511488998464c41d",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 0,
+        "world_size": 2,
+    },
+    "scatter_bf16_w4": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "bf16",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_11d78ca092a8912c0308",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_11d78ca092a8912c0308",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_11d78ca092a8912c0308",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 0,
+        "world_size": 4,
+    },
+    "scatter_bf16_w6": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "bf16",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_3be72f7ec616600aad88",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_3be72f7ec616600aad88",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_3be72f7ec616600aad88",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 0,
+        "world_size": 6,
+    },
+    "scatter_bf16_w8": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "bf16",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_a9f08385aa42aa1770ac",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_a9f08385aa42aa1770ac",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_a9f08385aa42aa1770ac",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 0,
+        "world_size": 8,
+    },
+    "scatter_f16_w2": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "f16",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_142f15f09cced7c946cc",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_142f15f09cced7c946cc",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_142f15f09cced7c946cc",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 0,
+        "world_size": 2,
+    },
+    "scatter_f16_w4": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "f16",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_09991968e23cc520fab9",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_09991968e23cc520fab9",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_09991968e23cc520fab9",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 0,
+        "world_size": 4,
+    },
+    "scatter_f16_w6": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "f16",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_f85956bc62fb2e9207bc",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_f85956bc62fb2e9207bc",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_f85956bc62fb2e9207bc",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 0,
+        "world_size": 6,
+    },
+    "scatter_f16_w8": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "f16",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_f7f09183a63289c534d0",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_f7f09183a63289c534d0",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_f7f09183a63289c534d0",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 0,
+        "world_size": 8,
+    },
+    "scatter_f32_w2": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "f32",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_3ff747cf327267f010f1",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_3ff747cf327267f010f1",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_3ff747cf327267f010f1",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 0,
+        "world_size": 2,
+    },
+    "scatter_f32_w4": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "f32",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_8194888811ccc093eee6",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_8194888811ccc093eee6",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_8194888811ccc093eee6",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 0,
+        "world_size": 4,
+    },
+    "scatter_f32_w6": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "f32",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_22ae90f055f2ec1a80a9",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_22ae90f055f2ec1a80a9",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_22ae90f055f2ec1a80a9",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 0,
+        "world_size": 6,
+    },
+    "scatter_f32_w8": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "f32",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_7e835a88f31b09345a94",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_7e835a88f31b09345a94",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_7e835a88f31b09345a94",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 0,
+        "world_size": 8,
+    },
+    "gather_bf16_w2": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "bf16",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_f2aa1a9c376024631837",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_f2aa1a9c376024631837",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_f2aa1a9c376024631837",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 1,
+        "world_size": 2,
+    },
+    "gather_bf16_w4": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "bf16",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_bfc536d4d1b741ada1e3",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_bfc536d4d1b741ada1e3",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_bfc536d4d1b741ada1e3",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 1,
+        "world_size": 4,
+    },
+    "gather_bf16_w6": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "bf16",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_b42060cb3cd09e87942f",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_b42060cb3cd09e87942f",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_b42060cb3cd09e87942f",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 1,
+        "world_size": 6,
+    },
+    "gather_bf16_w8": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "bf16",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_fb2cfbd40ad2834183a6",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_fb2cfbd40ad2834183a6",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_fb2cfbd40ad2834183a6",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 1,
+        "world_size": 8,
+    },
+    "gather_f16_w2": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "f16",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_cf1e90f88e0835a93858",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_cf1e90f88e0835a93858",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_cf1e90f88e0835a93858",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 1,
+        "world_size": 2,
+    },
+    "gather_f16_w4": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "f16",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_b33cff6002e4846937bf",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_b33cff6002e4846937bf",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_b33cff6002e4846937bf",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 1,
+        "world_size": 4,
+    },
+    "gather_f16_w6": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "f16",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_ae2ea4b9eec4b7b0333f",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_ae2ea4b9eec4b7b0333f",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_ae2ea4b9eec4b7b0333f",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 1,
+        "world_size": 6,
+    },
+    "gather_f16_w8": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "f16",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_e56fbba5639d18797849",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_e56fbba5639d18797849",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_e56fbba5639d18797849",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 1,
+        "world_size": 8,
+    },
+    "gather_f32_w2": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "f32",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_e73adc2b33eecf469adf",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_e73adc2b33eecf469adf",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_e73adc2b33eecf469adf",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 1,
+        "world_size": 2,
+    },
+    "gather_f32_w4": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "f32",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_5eccdff1ab6a54a60530",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_5eccdff1ab6a54a60530",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_5eccdff1ab6a54a60530",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 1,
+        "world_size": 4,
+    },
+    "gather_f32_w6": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "f32",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_ce5d5f0eedfe61a18a15",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_ce5d5f0eedfe61a18a15",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_ce5d5f0eedfe61a18a15",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 1,
+        "world_size": 6,
+    },
+    "gather_f32_w8": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "inp"],
+            ["buffer", "out"],
+            ["peer_table", "staging_peers"],
+            ["peer_table", "signals_peers"],
+            ["buffer", "signals_self"],
+            ["parameter", "pg_rank"],
+            ["parameter", "B"],
+            ["parameter", "S_local"],
+            ["parameter", "H_local"],
+            ["parameter", "D"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "dtype": "f32",
+        "ffi_entry": "run",
+        "grid_rule": {"grid": [148, 1, 1], "kind": "fixed"},
+        "kernel": "cake_ulysses_a2a_647d3cb5b6a2ab67bb2e",
+        "kernel_symbol": "kernel_cake_ulysses_a2a_647d3cb5b6a2ab67bb2e",
+        "launch": {
+            "block": (512, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_ulysses_a2a_647d3cb5b6a2ab67bb2e",
+        "logical": {
+            "B": "B",
+            "D": "D",
+            "H_local": "H_local",
+            "S_local": "S_local",
+            "inp": "inp",
+            "out": "out",
+            "pg_rank": "rank",
+            "signals_peers": "signals_peers",
+            "signals_self": "signals_self",
+            "staging_peers": "staging_peers",
+        },
+        "mode": 1,
+        "world_size": 8,
+    },
+}
+# One verified build per architecture: B200 (``sm_100a``) and B300
+# (``sm_103a``).  Every architecture is compiled with its exact ``-gencode``
+# flag set (``build.json`` ``arch_flags``); there is no family fallback, and a
+# device of another capability keeps FlashInfer's portable NVLink kernel.
+ARCHES = ("sm_100a", "sm_103a")
+ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
+    (10, 0): "sm_100a",
+    (10, 3): "sm_103a",
+}
+DTYPES = ("bf16", "f16", "f32")
+WORLD_SIZES = (2, 4, 6, 8)
+MODES = (0, 1)
+# A peer table holds exactly this many device addresses (one per rank, the
+# rest zero); the kernel reads entries ``0 .. world_size - 1``.
+PEER_TABLE_CAPACITY = 8
+# Every rank's symmetric signal allocation: ``uint32`` words the kernels use
+# for their flags and epochs; zeroed once at communicator creation.
+SIGNAL_WORDS = 864
+SIGNAL_BYTES = 4 * SIGNAL_WORDS
+# The kernels take the shape scalars and the rank as 32-bit integers.
+INT32_MAX = 2**31 - 1
+# Logical argument names the host binds; every module record maps its kernel
+# parameter names onto this vocabulary (``record["logical"]``).
+LOGICAL_TENSORS = (
+    "inp",
+    "out",
+    "signals_self",
+)
+LOGICAL_PEER_TABLES = (
+    "staging_peers",
+    "signals_peers",
+)
+LOGICAL_SCALARS = (
+    "rank",
+    "B",
+    "S_local",
+    "H_local",
+    "D",
+)
+
+
+def arch_for_capability(device_capability: Sequence[int]) -> str | None:
+    """Name the exported architecture for one device capability, if any."""
+
+    values = [int(value) for value in device_capability]
+    if len(values) != 2:
+        return None
+    return ARCH_BY_CAPABILITY.get((values[0], values[1]))
+
+
+def record_name(dtype: str, world_size: int, mode: int) -> str:
+    """The ``MODULES`` key of one collective: ``<scatter|gather>_<dtype>_w<world_size>``."""
+
+    if dtype not in DTYPES:
+        raise ValueError(f"dtype must be one of {DTYPES}, got {dtype!r}")
+    if world_size not in WORLD_SIZES:
+        raise ValueError(f"world_size must be one of {WORLD_SIZES}, got {world_size!r}")
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
+    direction = "scatter" if mode == 0 else "gather"
+    return f"{direction}_{dtype}_w{world_size}"
+
+
+def record_for(dtype: str, world_size: int, mode: int) -> dict[str, Any]:
+    """The module record of one collective (``ValueError`` for a combination the package does not ship)."""
+
+    name = record_name(dtype, world_size, mode)
+    record = MODULES.get(name)
+    if record is None:
+        raise ValueError(f"the package ships no Ulysses all-to-all for {name}")
+    return record
+
+
+def route_applies(
+    *, device_capability: Sequence[int], dtype: str, world_size: int
+) -> bool:
+    """Whether the verified export owns both collectives of one communicator on a device.
+
+    True when the device is an exported architecture and ``build.json`` delivers
+    the scatter and the gather library of ``(dtype, world_size)`` for it.
+    """
+
+    arch = arch_for_capability(device_capability)
+    if arch is None or dtype not in DTYPES or world_size not in WORLD_SIZES:
+        return False
+    delivered = cake_build.libraries_by_name()
+    return all(
+        library_name(record_name(dtype, world_size, mode), arch) in delivered
+        for mode in MODES
+    )
+
+
+def launch_grid(record: dict[str, Any]) -> tuple[int, int, int]:
+    """The launch grid of one module: the record's fixed grid (``grid_rule.kind == "fixed"``)."""
+
+    rule = record["grid_rule"]
+    if rule.get("kind") != "fixed":
+        raise RuntimeError(
+            f"unsupported grid rule {rule!r}; the package launches fixed grids"
+        )
+    grid = tuple(int(value) for value in rule["grid"])
+    if len(grid) != 3 or min(grid) < 1:
+        raise RuntimeError(f"grid rule names an invalid grid {rule['grid']!r}")
+    return grid
+
+
+@functools.cache
+def device_arch(device_index: int) -> str:
+    """Exported architecture of one CUDA device (``RuntimeError`` when it is not an exported target)."""
+
+    import torch
+
+    capability = tuple(torch.cuda.get_device_capability(device_index))
+    arch = arch_for_capability(capability)
+    if arch is None:
+        raise RuntimeError(
+            f"device {device_index} (capability {capability}) is not an exported Cake Ulysses all-to-all target"
+        )
+    return arch
+
+
+def library_name(name: str, arch: str) -> str:
+    """``build.json`` library of module record ``name`` built for ``arch``: ``<library>_<arch>``."""
+
+    record = MODULES[name]
+    if arch not in record["arches"]:
+        raise RuntimeError(
+            f"Cake Ulysses all-to-all module {name} is not delivered for {arch}; "
+            f"its architectures: {record['arches']}"
+        )
+    return f"{record['library']}_{arch}"
+
+
+@functools.cache
+def load(name: str, arch: str) -> Any:
+    """The loaded tvm-ffi module of record ``name`` built for ``arch``.
+
+    The prebuilt ``aot/`` library when a builder compiled it, else FlashInfer's
+    JIT build of the same sources and flags (``cake_build.load_library``).
+    """
+
+    return cake_build.load_library(library_name(name, arch))
+
+
+def specs_for_arch(arch: str) -> list[Any]:
+    """JIT specifications of every ``arch`` library without a prebuilt file (for
+    ahead-of-time warm-up through FlashInfer's ``build_jit_specs``)."""
+
+    return cake_build.jit_specs(arch)
+
+
+def plan_arguments(record: dict[str, Any], values: dict[str, Any]) -> list[Any]:
+    """The positional arguments of the record's ``ffi_entry`` for logical ``values``.
+
+    ``values`` maps the logical names in ``LOGICAL_TENSORS`` /
+    ``LOGICAL_PEER_TABLES`` / ``LOGICAL_SCALARS`` to tensors, CPU int64 peer
+    tables and Python ints; the record maps its kernel parameter names onto that
+    vocabulary and the grid is the record's :func:`launch_grid`.
+    """
+
+    logical = record["logical"]
+    grid = launch_grid(record)
+    grid_values = {"grid_x": grid[0], "grid_y": grid[1], "grid_z": grid[2]}
+    args = []
+    for kind, key in record["arg_plan"]:
+        if kind == "grid":
+            args.append(grid_values[key])
+            continue
+        logical_name = logical[key]
+        if logical_name not in values:
+            raise ValueError(
+                f"module {record['library']} needs {logical_name!r} (kernel parameter {key!r})"
+            )
+        args.append(values[logical_name])
+    return args
+
+
+def run_module(name: str, values: dict[str, Any], *, device_index: int) -> None:
+    """Launch one exported module with logical argument ``values`` on the current torch stream.
+
+    The per-call path of :mod:`.cake_backend` binds the plan once per
+    communicator; this walk of ``arg_plan`` is the generic form for tests and
+    harnesses.
+    """
+
+    record = MODULES[name]
+    args = plan_arguments(record, values)
+    module = load(name, device_arch(device_index))
+    with tvm_ffi.use_torch_stream():
+        getattr(module, record["ffi_entry"])(*args)
+
+
+__all__ = [
+    "ARCHES",
+    "ARCH_BY_CAPABILITY",
+    "DTYPES",
+    "INT32_MAX",
+    "LOGICAL_PEER_TABLES",
+    "LOGICAL_SCALARS",
+    "LOGICAL_TENSORS",
+    "MODES",
+    "MODULES",
+    "PEER_TABLE_CAPACITY",
+    "SIGNAL_BYTES",
+    "SIGNAL_WORDS",
+    "WORLD_SIZES",
+    "arch_for_capability",
+    "device_arch",
+    "launch_grid",
+    "library_name",
+    "load",
+    "plan_arguments",
+    "record_for",
+    "record_name",
+    "route_applies",
+    "run_module",
+    "specs_for_arch",
+]

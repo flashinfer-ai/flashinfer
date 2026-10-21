@@ -626,7 +626,8 @@ The producer build is selected per architecture and world size
 of the JIT loader): on SM100 a group of 8 ranks runs the build with wide
 operand loads and bulk row stores (``bulk_ow256``), a group of 4 ranks the
 build with wide operand loads (``ow256``); on SM103 groups of 8 and 4 ranks run
-``ow256``; groups of 2 ranks, SM90 and SM107 run the baseline build.  Every build
+``ow256``; on SM107 a group of 4 ranks runs the build with bulk row stores
+(``bulk``); groups of 2 ranks and SM90 run the baseline build.  Every build
 stores identical bits; the wide-load builds require 32-byte-aligned ``cos_sin``
 and norm-weight tensors (a misaligned view raises and names the opt-out).  The
 environment variable ``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT`` (``auto`` /
@@ -715,6 +716,12 @@ verified all-pairs NVLink P2P and owns the IPC workspace lifecycle.
 MNNVL (Multi-Node NVLink)
 -------------------------
 
+``MnnvlMemory`` and ``SymmDeviceMemory`` allocate the symmetric memory behind
+the NVLink collectives. The `symmetric memory design notes
+<https://github.com/flashinfer-ai/flashinfer/blob/main/docs/design_docs/symmetric_memory.md>`_
+describe how each lays out its memory and how the ranks choose between FABRIC
+handles and POSIX file descriptors to share it.
+
 .. currentmodule:: flashinfer.comm.mnnvl
 
 Core Classes
@@ -740,46 +747,6 @@ TensorRT-LLM MNNVL AllReduce
     trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant
     trtllm_mnnvl_fused_allreduce_rmsnorm
     mpi_barrier
-
-MNNVL A2A (Throughput Backend)
--------------------------------
-
-These are the kernel-level primitives of the NVLink one-sided MoE all-to-all.
-For the dispatch/combine interface shared by all expert-parallel communication
-backends, use :class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll`, which runs
-newer one-sided kernels (CFT counted writes, up to 256 ranks), or
-:class:`flashinfer.moe_ep.CakeAlltoAll`, which runs these ops with
-``backend="cake"``.
-
-.. currentmodule:: flashinfer.comm
-
-.. autosummary::
-    :toctree: ../generated
-
-    moe_a2a_initialize
-    moe_a2a_dispatch
-    moe_a2a_combine
-    moe_a2a_sanitize_expert_ids
-    moe_a2a_get_workspace_size_per_rank
-    moe_a2a_wrap_payload_tensor_in_workspace
-
-``NVLinkOneSidedAlltoAll`` and ``CakeAlltoAll`` preserve their workspace's CUDA
-virtual addresses across process checkpoint/restore.  After quiescing all work,
-call ``checkpoint_prepare`` to release the non-checkpointable physical MNNVL
-handles, and for ``NVLinkOneSidedAlltoAll`` its CFT logical endpoints.  Then
-call ``checkpoint_restore`` with a fresh communication backend before replaying
-a captured CUDA graph:
-
-.. code-block:: python
-
-    communication.checkpoint_prepare()
-    communication.checkpoint_restore(comm_backend)
-
-Both methods are collective.  Every rank must call them in the same order, and
-``comm_backend`` must reproduce the original rank and world size.
-Repeated calls are no-ops after the workspace reaches the requested state.
-If an exception occurs after physical handle unmapping or remapping begins,
-do not retry or reuse the workspace; restart the affected rank.
 
 DCP All-to-All (Context-Parallel Attention Reduction)
 -----------------------------------------------------

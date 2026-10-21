@@ -55,12 +55,12 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_CTL_STAGE_BYTES 16
 #define SMEM_CTL_STRIDE 16
 #define SMEM_WSM_OFF 13376
-#define SMEM_WSM_STAGE_BYTES 198016
-#define SMEM_WSM_STRIDE 198016
+#define SMEM_WSM_STAGE_BYTES 181632
+#define SMEM_WSM_STRIDE 181632
 #define SMEM_WSM32_OFF 13376
-#define SMEM_WSM32_STAGE_BYTES 198016
-#define SMEM_WSM32_STRIDE 198016
-#define SMEM_TOTAL 211456
+#define SMEM_WSM32_STAGE_BYTES 181632
+#define SMEM_WSM32_STRIDE 181632
+#define SMEM_TOTAL 195072
 #define THREADS 288
 #define LAUNCH_MIN_BLOCKS 1
 
@@ -249,9 +249,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pf(uint8_t* __restrict__ xq, float* __
             if (n > 0 && lane_2 == 0) {
                 long long first_row = (long long)(r0 + warp_1);
                 mbarrier_arrive_expect_tx(rb_full_addr + (warp_1) * 8, 12288);
-                cp_async_bulk_gmem2smem(wsm_addr + (unsigned int)(warp_1 * 24752 + 12464), res_in + (first_row * 6144), 12288, rb_full_addr + (warp_1) * 8);
+                cp_async_bulk_gmem2smem(wsm_addr + (unsigned int)(warp_1 * 22704 + 10416), res_in + (first_row * 6144), 12288, rb_full_addr + (warp_1) * 8);
                 mbarrier_arrive_expect_tx(xb_full_addr + (warp_1) * 8, 3456);
-                cp_async_bulk_gmem2smem(wsm_addr + (unsigned int)(warp_1 * 24752), xq + (first_row * 3456), 3456, xb_full_addr + (warp_1) * 8);
+                cp_async_bulk_gmem2smem(wsm_addr + (unsigned int)(warp_1 * 22704), xq + (first_row * 3456), 3456, xb_full_addr + (warp_1) * 8);
             }
             if (tid == 0) {
                 ctl[0] = ctrl[0];
@@ -263,10 +263,10 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pf(uint8_t* __restrict__ xq, float* __
             unsigned int call = ctl[0];
             unsigned int buf = call % 3;
             int f = lane_2 >> 1 & 3;
-            int xb_off = warp_1 * 24752;
+            int xb_off = warp_1 * 22704;
             int own_off = xb_off + 12288;
             int stg_off = xb_off + 10416;
-            int rb_off = stg_off + 2048;
+            int rb_off = stg_off;
             int peer = 1 - rank;
             long long cap64 = (long long)cap;
             long long rank64 = (long long)rank;
@@ -339,15 +339,10 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pf(uint8_t* __restrict__ xq, float* __
                     long long v_row = v_base + (src64 * cap64 + drow) * 3072;
                     long long s_row = s_base + (src64 * cap64 + drow) * 384;
                     long long m_row = m_base + (src64 * cap64 + drow) * 16;
-                    uint32_t _sysv_poll32_group_0[1];
-                    do {
-                        asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(_sysv_poll32_group_0[0]) : "l"(reinterpret_cast<unsigned int*>(os_rs + m_row)) : "memory");
-                    } while (
-                        (_sysv_poll32_group_0[0] == 0x80000000u)
-                    );
-                    float rs_peer = __uint_as_float(_sysv_poll32_group_0[0]);
-                    float rs_a = ((first) ? own_rs : rs_peer);
-                    float rs_b = ((first) ? rs_peer : own_rs);
+                    unsigned int rsw[1];
+                    uint32_t _sysv_u32_0;
+                    asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(_sysv_u32_0) : "l"(reinterpret_cast<unsigned int*>(os_rs + m_row)) : "memory");
+                    rsw[0] = _sysv_u32_0;
                     float ssx = 0.0f;
                     float ssy = 0.0f;
                     #pragma unroll 1
@@ -379,8 +374,24 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pf(uint8_t* __restrict__ xq, float* __
                             _wire_spend_5 = ((uint32_t)(((uint32_t)((_fp4_wire_scales_0[0] & 0xFFu) == 0xFFu) | (uint32_t)(((_fp4_wire_scales_0[0] >> 8) & 0xFFu) == 0xFFu)) != 0u) << 0) | ((uint32_t)(((uint32_t)((_fp4_wire_scales_0[1] & 0xFFu) == 0xFFu) | (uint32_t)(((_fp4_wire_scales_0[1] >> 8) & 0xFFu) == 0xFFu)) != 0u) << 1);
                         } while ((_wire_vpend_5 | _wire_spend_5) != 0u);
                         if (j0 == 0) {
+                            int _vote_0 = __any_sync(0xFFFFFFFF, rsw[0] == 2147483648u);
+                            int pending = _vote_0;
+                            if (pending != 0) {
+                                uint32_t _sysv_poll32_group_0[1];
+                                do {
+                                    asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(_sysv_poll32_group_0[0]) : "l"(reinterpret_cast<unsigned int*>(os_rs + m_row)) : "memory");
+                                } while (
+                                    (_sysv_poll32_group_0[0] == 0x80000000u)
+                                );
+                                rsw[0] = _sysv_poll32_group_0[0];
+                            }
+                        }
+                        if (j0 == 0) {
                             mbarrier_wait(rb_full_addr + (warp_1) * 8, kd & 1);
                         }
+                        float rs_peer_f = __uint_as_float(rsw[0]);
+                        float rs_a_f = ((first) ? own_rs : rs_peer_f);
+                        float rs_b_f = ((first) ? rs_peer_f : own_rs);
                         unsigned int own[4];
                         unsigned int own_sc[1];
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -407,9 +418,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pf(uint8_t* __restrict__ xq, float* __
                         float _cvt_f32_f16_1;
                         asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_1) : "h"((uint16_t)(_e4m3x2_to_f16x2_0 >> 16)));
                         float _mul_0;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_0) : "f"(_cvt_f32_f16_0), "f"(rs_a));
+                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_0) : "f"(_cvt_f32_f16_0), "f"(rs_a_f));
                         float _mul_1;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_1) : "f"(_cvt_f32_f16_1), "f"(rs_a));
+                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_1) : "f"(_cvt_f32_f16_1), "f"(rs_a_f));
                         float2 _f2_0 = make_float2(_mul_0, _mul_0);
                         float2 scale0 = _f2_0;
                         float2 _f2_1 = make_float2(_mul_1, _mul_1);
@@ -601,9 +612,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pf(uint8_t* __restrict__ xq, float* __
                         float _cvt_f32_f16_3;
                         asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_3) : "h"((uint16_t)(_e4m3x2_to_f16x2_1 >> 16)));
                         float _mul_2;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_2) : "f"(_cvt_f32_f16_2), "f"(rs_b));
+                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_2) : "f"(_cvt_f32_f16_2), "f"(rs_b_f));
                         float _mul_3;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_3) : "f"(_cvt_f32_f16_3), "f"(rs_b));
+                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_3) : "f"(_cvt_f32_f16_3), "f"(rs_b_f));
                         float2 _f2_34 = make_float2(_mul_2, _mul_2);
                         float2 scale0_46 = _f2_34;
                         float2 _f2_35 = make_float2(_mul_3, _mul_3);
@@ -1141,9 +1152,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pf(uint8_t* __restrict__ xq, float* __
                         float _cvt_f32_f16_5;
                         asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_5) : "h"((uint16_t)(_e4m3x2_to_f16x2_2 >> 16)));
                         float _mul_4;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_4) : "f"(_cvt_f32_f16_4), "f"(rs_a));
+                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_4) : "f"(_cvt_f32_f16_4), "f"(rs_a_f));
                         float _mul_5;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_5) : "f"(_cvt_f32_f16_5), "f"(rs_a));
+                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_5) : "f"(_cvt_f32_f16_5), "f"(rs_a_f));
                         float2 _f2_116 = make_float2(_mul_4, _mul_4);
                         float2 scale0_153 = _f2_116;
                         float2 _f2_117 = make_float2(_mul_5, _mul_5);
@@ -1335,9 +1346,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pf(uint8_t* __restrict__ xq, float* __
                         float _cvt_f32_f16_7;
                         asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_7) : "h"((uint16_t)(_e4m3x2_to_f16x2_3 >> 16)));
                         float _mul_6;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_6) : "f"(_cvt_f32_f16_6), "f"(rs_b));
+                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_6) : "f"(_cvt_f32_f16_6), "f"(rs_b_f));
                         float _mul_7;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_7) : "f"(_cvt_f32_f16_7), "f"(rs_b));
+                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_7) : "f"(_cvt_f32_f16_7), "f"(rs_b_f));
                         float2 _f2_150 = make_float2(_mul_6, _mul_6);
                         float2 scale0_203 = _f2_150;
                         float2 _f2_151 = make_float2(_mul_7, _mul_7);
@@ -1896,232 +1907,70 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_bf16_pf(uint8_t* __restrict__ xq, float* __
                     float2 r2 = _f2_232;
                     float2 _f2_233 = make_float2(wbias, wbias);
                     float2 b2 = _f2_233;
-                    #pragma unroll 1
-                    for (int j = 0; j < 6; j++) {
-                        int pp = lane_2 + 32 * j;
-                        unsigned int xk[16];
-                        unsigned int wk[16];
+                    #pragma unroll 24
+                    for (int m = 0; m < 24; m++) {
+                        int c = lane_2 + 32 * m;
+                        unsigned int x4[4];
+                        unsigned int w4[4];
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&xk[0])), "=r"(*reinterpret_cast<uint32_t*>(&xk[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xk[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xk[(0) + 3]))
-                            : "r"(wsm_addr + (unsigned int)(rb_off + 64 * pp + 16 * (f ^ 0))));
+                            : "=r"(*reinterpret_cast<uint32_t*>(&x4[0])), "=r"(*reinterpret_cast<uint32_t*>(&x4[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&x4[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&x4[(0) + 3]))
+                            : "r"(wsm_addr + (unsigned int)(rb_off + 16 * c)));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&wk[0])), "=r"(*reinterpret_cast<uint32_t*>(&wk[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wk[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wk[(0) + 3]))
-                            : "r"(wrow_addr + (unsigned int)(64 * pp + 16 * (f ^ 0))));
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&xk[4])), "=r"(*reinterpret_cast<uint32_t*>(&xk[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xk[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xk[(4) + 3]))
-                            : "r"(wsm_addr + (unsigned int)(rb_off + 64 * pp + 16 * (f ^ 1))));
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&wk[4])), "=r"(*reinterpret_cast<uint32_t*>(&wk[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wk[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wk[(4) + 3]))
-                            : "r"(wrow_addr + (unsigned int)(64 * pp + 16 * (f ^ 1))));
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&xk[8])), "=r"(*reinterpret_cast<uint32_t*>(&xk[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xk[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xk[(8) + 3]))
-                            : "r"(wsm_addr + (unsigned int)(rb_off + 64 * pp + 16 * (f ^ 2))));
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&wk[8])), "=r"(*reinterpret_cast<uint32_t*>(&wk[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wk[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wk[(8) + 3]))
-                            : "r"(wrow_addr + (unsigned int)(64 * pp + 16 * (f ^ 2))));
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&xk[12])), "=r"(*reinterpret_cast<uint32_t*>(&xk[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&xk[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&xk[(12) + 3]))
-                            : "r"(wsm_addr + (unsigned int)(rb_off + 64 * pp + 16 * (f ^ 3))));
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&wk[12])), "=r"(*reinterpret_cast<uint32_t*>(&wk[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wk[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wk[(12) + 3]))
-                            : "r"(wrow_addr + (unsigned int)(64 * pp + 16 * (f ^ 3))));
-                        float y[32];
-                        float2 _f2_234 = make_float2(__uint_as_float(xk[0] << 16), __uint_as_float(xk[0] & 4294901760u));
+                            : "=r"(*reinterpret_cast<uint32_t*>(&w4[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4[(0) + 3]))
+                            : "r"(wrow_addr + (unsigned int)(16 * c)));
+                        float y[8];
+                        float2 _f2_234 = make_float2(__uint_as_float(x4[0] << 16), __uint_as_float(x4[0] & 4294901760u));
                         float2 tz;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&tz) : "l"(*(const unsigned long long*)&_f2_234), "l"(*(const unsigned long long*)&r2));
-                        float2 _f2_235 = make_float2(__uint_as_float(wk[0] << 16), __uint_as_float(wk[0] & 4294901760u));
+                        float2 _f2_235 = make_float2(__uint_as_float(w4[0] << 16), __uint_as_float(w4[0] & 4294901760u));
                         float2 tw = add_f32x2_noftz(b2, _f2_235);
                         float2 t_1;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&t_1) : "l"(*(const unsigned long long*)&tz), "l"(*(const unsigned long long*)&tw));
                         y[0] = t_1.x;
                         y[1] = t_1.y;
-                        float2 _f2_236 = make_float2(__uint_as_float(xk[1] << 16), __uint_as_float(xk[1] & 4294901760u));
+                        float2 _f2_236 = make_float2(__uint_as_float(x4[1] << 16), __uint_as_float(x4[1] & 4294901760u));
                         float2 tz_0;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&tz_0) : "l"(*(const unsigned long long*)&_f2_236), "l"(*(const unsigned long long*)&r2));
-                        float2 _f2_237 = make_float2(__uint_as_float(wk[1] << 16), __uint_as_float(wk[1] & 4294901760u));
+                        float2 _f2_237 = make_float2(__uint_as_float(w4[1] << 16), __uint_as_float(w4[1] & 4294901760u));
                         float2 tw_1 = add_f32x2_noftz(b2, _f2_237);
                         float2 t_2;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&t_2) : "l"(*(const unsigned long long*)&tz_0), "l"(*(const unsigned long long*)&tw_1));
                         y[2] = t_2.x;
                         y[3] = t_2.y;
-                        float2 _f2_238 = make_float2(__uint_as_float(xk[2] << 16), __uint_as_float(xk[2] & 4294901760u));
+                        float2 _f2_238 = make_float2(__uint_as_float(x4[2] << 16), __uint_as_float(x4[2] & 4294901760u));
                         float2 tz_3;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&tz_3) : "l"(*(const unsigned long long*)&_f2_238), "l"(*(const unsigned long long*)&r2));
-                        float2 _f2_239 = make_float2(__uint_as_float(wk[2] << 16), __uint_as_float(wk[2] & 4294901760u));
+                        float2 _f2_239 = make_float2(__uint_as_float(w4[2] << 16), __uint_as_float(w4[2] & 4294901760u));
                         float2 tw_4 = add_f32x2_noftz(b2, _f2_239);
                         float2 t_5;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&t_5) : "l"(*(const unsigned long long*)&tz_3), "l"(*(const unsigned long long*)&tw_4));
                         y[4] = t_5.x;
                         y[5] = t_5.y;
-                        float2 _f2_240 = make_float2(__uint_as_float(xk[3] << 16), __uint_as_float(xk[3] & 4294901760u));
+                        float2 _f2_240 = make_float2(__uint_as_float(x4[3] << 16), __uint_as_float(x4[3] & 4294901760u));
                         float2 tz_6;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&tz_6) : "l"(*(const unsigned long long*)&_f2_240), "l"(*(const unsigned long long*)&r2));
-                        float2 _f2_241 = make_float2(__uint_as_float(wk[3] << 16), __uint_as_float(wk[3] & 4294901760u));
+                        float2 _f2_241 = make_float2(__uint_as_float(w4[3] << 16), __uint_as_float(w4[3] & 4294901760u));
                         float2 tw_7 = add_f32x2_noftz(b2, _f2_241);
                         float2 t_8;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&t_8) : "l"(*(const unsigned long long*)&tz_6), "l"(*(const unsigned long long*)&tw_7));
                         y[6] = t_8.x;
                         y[7] = t_8.y;
-                        float2 _f2_242 = make_float2(__uint_as_float(xk[4] << 16), __uint_as_float(xk[4] & 4294901760u));
-                        float2 tz_9;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&tz_9) : "l"(*(const unsigned long long*)&_f2_242), "l"(*(const unsigned long long*)&r2));
-                        float2 _f2_243 = make_float2(__uint_as_float(wk[4] << 16), __uint_as_float(wk[4] & 4294901760u));
-                        float2 tw_10 = add_f32x2_noftz(b2, _f2_243);
-                        float2 t_11;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&t_11) : "l"(*(const unsigned long long*)&tz_9), "l"(*(const unsigned long long*)&tw_10));
-                        y[8] = t_11.x;
-                        y[9] = t_11.y;
-                        float2 _f2_244 = make_float2(__uint_as_float(xk[5] << 16), __uint_as_float(xk[5] & 4294901760u));
-                        float2 tz_12;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&tz_12) : "l"(*(const unsigned long long*)&_f2_244), "l"(*(const unsigned long long*)&r2));
-                        float2 _f2_245 = make_float2(__uint_as_float(wk[5] << 16), __uint_as_float(wk[5] & 4294901760u));
-                        float2 tw_13 = add_f32x2_noftz(b2, _f2_245);
-                        float2 t_14;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&t_14) : "l"(*(const unsigned long long*)&tz_12), "l"(*(const unsigned long long*)&tw_13));
-                        y[10] = t_14.x;
-                        y[11] = t_14.y;
-                        float2 _f2_246 = make_float2(__uint_as_float(xk[6] << 16), __uint_as_float(xk[6] & 4294901760u));
-                        float2 tz_15;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&tz_15) : "l"(*(const unsigned long long*)&_f2_246), "l"(*(const unsigned long long*)&r2));
-                        float2 _f2_247 = make_float2(__uint_as_float(wk[6] << 16), __uint_as_float(wk[6] & 4294901760u));
-                        float2 tw_16 = add_f32x2_noftz(b2, _f2_247);
-                        float2 t_17;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&t_17) : "l"(*(const unsigned long long*)&tz_15), "l"(*(const unsigned long long*)&tw_16));
-                        y[12] = t_17.x;
-                        y[13] = t_17.y;
-                        float2 _f2_248 = make_float2(__uint_as_float(xk[7] << 16), __uint_as_float(xk[7] & 4294901760u));
-                        float2 tz_18;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&tz_18) : "l"(*(const unsigned long long*)&_f2_248), "l"(*(const unsigned long long*)&r2));
-                        float2 _f2_249 = make_float2(__uint_as_float(wk[7] << 16), __uint_as_float(wk[7] & 4294901760u));
-                        float2 tw_19 = add_f32x2_noftz(b2, _f2_249);
-                        float2 t_20;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&t_20) : "l"(*(const unsigned long long*)&tz_18), "l"(*(const unsigned long long*)&tw_19));
-                        y[14] = t_20.x;
-                        y[15] = t_20.y;
-                        float2 _f2_250 = make_float2(__uint_as_float(xk[8] << 16), __uint_as_float(xk[8] & 4294901760u));
-                        float2 tz_21;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&tz_21) : "l"(*(const unsigned long long*)&_f2_250), "l"(*(const unsigned long long*)&r2));
-                        float2 _f2_251 = make_float2(__uint_as_float(wk[8] << 16), __uint_as_float(wk[8] & 4294901760u));
-                        float2 tw_22 = add_f32x2_noftz(b2, _f2_251);
-                        float2 t_23;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&t_23) : "l"(*(const unsigned long long*)&tz_21), "l"(*(const unsigned long long*)&tw_22));
-                        y[16] = t_23.x;
-                        y[17] = t_23.y;
-                        float2 _f2_252 = make_float2(__uint_as_float(xk[9] << 16), __uint_as_float(xk[9] & 4294901760u));
-                        float2 tz_24;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&tz_24) : "l"(*(const unsigned long long*)&_f2_252), "l"(*(const unsigned long long*)&r2));
-                        float2 _f2_253 = make_float2(__uint_as_float(wk[9] << 16), __uint_as_float(wk[9] & 4294901760u));
-                        float2 tw_25 = add_f32x2_noftz(b2, _f2_253);
-                        float2 t_26;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&t_26) : "l"(*(const unsigned long long*)&tz_24), "l"(*(const unsigned long long*)&tw_25));
-                        y[18] = t_26.x;
-                        y[19] = t_26.y;
-                        float2 _f2_254 = make_float2(__uint_as_float(xk[10] << 16), __uint_as_float(xk[10] & 4294901760u));
-                        float2 tz_27;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&tz_27) : "l"(*(const unsigned long long*)&_f2_254), "l"(*(const unsigned long long*)&r2));
-                        float2 _f2_255 = make_float2(__uint_as_float(wk[10] << 16), __uint_as_float(wk[10] & 4294901760u));
-                        float2 tw_28 = add_f32x2_noftz(b2, _f2_255);
-                        float2 t_29;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&t_29) : "l"(*(const unsigned long long*)&tz_27), "l"(*(const unsigned long long*)&tw_28));
-                        y[20] = t_29.x;
-                        y[21] = t_29.y;
-                        float2 _f2_256 = make_float2(__uint_as_float(xk[11] << 16), __uint_as_float(xk[11] & 4294901760u));
-                        float2 tz_30;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&tz_30) : "l"(*(const unsigned long long*)&_f2_256), "l"(*(const unsigned long long*)&r2));
-                        float2 _f2_257 = make_float2(__uint_as_float(wk[11] << 16), __uint_as_float(wk[11] & 4294901760u));
-                        float2 tw_31 = add_f32x2_noftz(b2, _f2_257);
-                        float2 t_32;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&t_32) : "l"(*(const unsigned long long*)&tz_30), "l"(*(const unsigned long long*)&tw_31));
-                        y[22] = t_32.x;
-                        y[23] = t_32.y;
-                        float2 _f2_258 = make_float2(__uint_as_float(xk[12] << 16), __uint_as_float(xk[12] & 4294901760u));
-                        float2 tz_33;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&tz_33) : "l"(*(const unsigned long long*)&_f2_258), "l"(*(const unsigned long long*)&r2));
-                        float2 _f2_259 = make_float2(__uint_as_float(wk[12] << 16), __uint_as_float(wk[12] & 4294901760u));
-                        float2 tw_34 = add_f32x2_noftz(b2, _f2_259);
-                        float2 t_35;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&t_35) : "l"(*(const unsigned long long*)&tz_33), "l"(*(const unsigned long long*)&tw_34));
-                        y[24] = t_35.x;
-                        y[25] = t_35.y;
-                        float2 _f2_260 = make_float2(__uint_as_float(xk[13] << 16), __uint_as_float(xk[13] & 4294901760u));
-                        float2 tz_36;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&tz_36) : "l"(*(const unsigned long long*)&_f2_260), "l"(*(const unsigned long long*)&r2));
-                        float2 _f2_261 = make_float2(__uint_as_float(wk[13] << 16), __uint_as_float(wk[13] & 4294901760u));
-                        float2 tw_37 = add_f32x2_noftz(b2, _f2_261);
-                        float2 t_38;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&t_38) : "l"(*(const unsigned long long*)&tz_36), "l"(*(const unsigned long long*)&tw_37));
-                        y[26] = t_38.x;
-                        y[27] = t_38.y;
-                        float2 _f2_262 = make_float2(__uint_as_float(xk[14] << 16), __uint_as_float(xk[14] & 4294901760u));
-                        float2 tz_39;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&tz_39) : "l"(*(const unsigned long long*)&_f2_262), "l"(*(const unsigned long long*)&r2));
-                        float2 _f2_263 = make_float2(__uint_as_float(wk[14] << 16), __uint_as_float(wk[14] & 4294901760u));
-                        float2 tw_40 = add_f32x2_noftz(b2, _f2_263);
-                        float2 t_41;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&t_41) : "l"(*(const unsigned long long*)&tz_39), "l"(*(const unsigned long long*)&tw_40));
-                        y[28] = t_41.x;
-                        y[29] = t_41.y;
-                        float2 _f2_264 = make_float2(__uint_as_float(xk[15] << 16), __uint_as_float(xk[15] & 4294901760u));
-                        float2 tz_42;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&tz_42) : "l"(*(const unsigned long long*)&_f2_264), "l"(*(const unsigned long long*)&r2));
-                        float2 _f2_265 = make_float2(__uint_as_float(wk[15] << 16), __uint_as_float(wk[15] & 4294901760u));
-                        float2 tw_43 = add_f32x2_noftz(b2, _f2_265);
-                        float2 t_44;
-                        asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&t_44) : "l"(*(const unsigned long long*)&tz_42), "l"(*(const unsigned long long*)&tw_43));
-                        y[30] = t_44.x;
-                        y[31] = t_44.y;
-                        unsigned int y_bf16[16];
+                        unsigned int y_bf16[4];
                         #pragma unroll
-                        for (int _lp = 0; _lp < 16; _lp++) {
+                        for (int _lp = 0; _lp < 4; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(y[_lp*2 + 0], y[_lp*2+1 + 0]));
                             y_bf16[_lp] = *(uint32_t*)&_bf2;
                         }
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + (f ^ 0)))), "r"(y_bf16[0]), "r"(y_bf16[1]), "r"(y_bf16[2]), "r"(y_bf16[3]) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + (f ^ 1)))), "r"(y_bf16[4]), "r"(y_bf16[5]), "r"(y_bf16[6]), "r"(y_bf16[7]) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + (f ^ 2)))), "r"(y_bf16[8]), "r"(y_bf16[9]), "r"(y_bf16[10]), "r"(y_bf16[11]) : "memory");
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(wsm_addr + (unsigned int)(stg_off + 16 * (4 * lane_2 + (f ^ 3)))), "r"(y_bf16[12]), "r"(y_bf16[13]), "r"(y_bf16[14]), "r"(y_bf16[15]) : "memory");
-                        __syncwarp();
-                        int c = lane_2;
-                        unsigned int w4[4];
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&w4[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4[(0) + 3]))
-                            : "r"(wsm_addr + (unsigned int)(stg_off + 16 * c)));
-                        long long idx = drow * 3072 + (long long)(4 * (128 * j + c));
+                        unsigned int v4[4];
+                        v4[0] = y_bf16[0];
+                        v4[1] = y_bf16[1];
+                        v4[2] = y_bf16[2];
+                        v4[3] = y_bf16[3];
+                        long long idx = drow * 3072 + (long long)(4 * c);
                         {
-                            int4 _iv4 = make_int4(w4[0 + 0], w4[0 + 1], w4[0 + 2], w4[0 + 3]);
+                            int4 _iv4 = make_int4(v4[0 + 0], v4[0 + 1], v4[0 + 2], v4[0 + 3]);
                             *reinterpret_cast<int4*>(reinterpret_cast<int*>(out) + idx) = _iv4;
                         }
-                        int c_45 = lane_2 + 32;
-                        unsigned int w4_46[4];
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&w4_46[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_46[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_46[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_46[(0) + 3]))
-                            : "r"(wsm_addr + (unsigned int)(stg_off + 16 * c_45)));
-                        long long idx_47 = drow * 3072 + (long long)(4 * (128 * j + c_45));
-                        {
-                            int4 _iv4 = make_int4(w4_46[0 + 0], w4_46[0 + 1], w4_46[0 + 2], w4_46[0 + 3]);
-                            *reinterpret_cast<int4*>(reinterpret_cast<int*>(out) + idx_47) = _iv4;
-                        }
-                        int c_48 = lane_2 + 64;
-                        unsigned int w4_49[4];
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&w4_49[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_49[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_49[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_49[(0) + 3]))
-                            : "r"(wsm_addr + (unsigned int)(stg_off + 16 * c_48)));
-                        long long idx_50 = drow * 3072 + (long long)(4 * (128 * j + c_48));
-                        {
-                            int4 _iv4 = make_int4(w4_49[0 + 0], w4_49[0 + 1], w4_49[0 + 2], w4_49[0 + 3]);
-                            *reinterpret_cast<int4*>(reinterpret_cast<int*>(out) + idx_50) = _iv4;
-                        }
-                        int c_51 = lane_2 + 96;
-                        unsigned int w4_52[4];
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&w4_52[0])), "=r"(*reinterpret_cast<uint32_t*>(&w4_52[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w4_52[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w4_52[(0) + 3]))
-                            : "r"(wsm_addr + (unsigned int)(stg_off + 16 * c_51)));
-                        long long idx_53 = drow * 3072 + (long long)(4 * (128 * j + c_51));
-                        {
-                            int4 _iv4 = make_int4(w4_52[0 + 0], w4_52[0 + 1], w4_52[0 + 2], w4_52[0 + 3]);
-                            *reinterpret_cast<int4*>(reinterpret_cast<int*>(out) + idx_53) = _iv4;
-                        }
-                        __syncwarp();
                     }
                     if (n > kd + 1) {
                         __syncwarp();

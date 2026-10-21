@@ -19,3 +19,18 @@ engine declines anything else it cannot serve.
     :toctree: ../generated
 
     chunk_gated_delta_product
+
+Decode and MTP verification (Cake, SM100 / SM103)
+-------------------------------------------------
+
+Gated DeltaProduct decode and multi-token (MTP) verification for Nemotron 4:
+K=128, V=64, one to four Householder steps per token, over an FP32
+pretranspose state pool with indexed read / write / per-token snapshot slots.
+One fused kernel per call; the docstring states the input contracts.
+
+.. currentmodule:: flashinfer.cake_gdp
+
+.. autosummary::
+    :toctree: ../generated
+
+    cake_gated_delta_product_mtp
