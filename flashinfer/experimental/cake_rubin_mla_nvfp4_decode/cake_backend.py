@@ -116,8 +116,9 @@ MLA2_ITEM_COST = 7  # the mixed-cluster kernel's ramp and epilogue per item in 1
 MERGE_BATCH_COST = 1.5  # the merge's second load batch, in tile times, when a row has more than 32 partial slots
 
 # Clusters of four the GPU holds at once and pair clusters on the SMs the fours leave, by SM count, for devices
-# whose occupancy cannot be queried (:func:`device_units_pairs`): R200 at 212 SMs measured 46 fours and 14 pairs.
-UNITS_PAIRS_BY_SM_COUNT: dict[int, tuple[int, int]] = {212: (46, 14)}
+# whose occupancy cannot be queried (:func:`device_units_pairs`): R200 boards measured 50 fours and 4 pairs at 208 SMs
+# and 46 fours and 14 pairs at 212 SMs.
+UNITS_PAIRS_BY_SM_COUNT: dict[int, tuple[int, int]] = {208: (50, 4), 212: (46, 14)}
 
 # A launcher takes a record name, the logical argument values, the plan grid and the device index and runs the
 # program (``cake_jit.run_module``).  The runners hold one so a diagnostic harness can run the same composition

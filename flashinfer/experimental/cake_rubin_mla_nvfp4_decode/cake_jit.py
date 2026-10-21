@@ -55,8 +55,6 @@ from typing import Any
 
 import tvm_ffi
 
-from . import cake_build
-
 # One verified build: R200 (``sm_107a``), compiled with its exact ``-gencode``
 # flag set (``build.json`` ``arch_flags``); no family fallback.
 ARCHES = ("sm_107a",)
@@ -341,7 +339,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cluster": (0, 0, 0),
             "cooperative": False,
             "dynamic_smem_bytes": 0,
-            "use_pdl": False,
+            "use_pdl": True,
         },
         "library": "cake_rubin_mla_nvfp4_decode_6fd468e4645fbef52b7e",
         "logical": {
@@ -368,7 +366,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cluster": (0, 0, 0),
             "cooperative": False,
             "dynamic_smem_bytes": 0,
-            "use_pdl": False,
+            "use_pdl": True,
         },
         "library": "cake_rubin_mla_nvfp4_decode_66cbdc7d0d294087c5da",
         "logical": {
@@ -395,7 +393,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cluster": (0, 0, 0),
             "cooperative": False,
             "dynamic_smem_bytes": 0,
-            "use_pdl": False,
+            "use_pdl": True,
         },
         "library": "cake_rubin_mla_nvfp4_decode_302684a62be285e34842",
         "logical": {
@@ -547,12 +545,20 @@ def load(name: str, arch: str) -> Any:
     """The loaded tvm-ffi module of record ``name`` built for ``arch``: the
     prebuilt ``aot/`` library when a builder compiled it, else FlashInfer's JIT
     build of the same sources and flags (``cake_build.load_library``)."""
+    from . import (
+        cake_build,
+    )  # written by the exporter beside build.json; absent before the first render
+
     return cake_build.load_library(library_name(name, arch))
 
 
 def specs_for_arch(arch: str) -> list[Any]:
     """JIT specifications of every ``arch`` library without a prebuilt file (for
     ahead-of-time warm-up through FlashInfer's ``build_jit_specs``)."""
+    from . import (
+        cake_build,
+    )  # written by the exporter beside build.json; absent before the first render
+
     return cake_build.jit_specs(arch)
 
 
