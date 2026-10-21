@@ -22,7 +22,7 @@ authors = [{ name = "FlashInfer team" }]
 license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
-license-files = ["LICENSE", "LICENSE*.txt", "licenses/LICENSE.kda-for-kda"]
+license-files = ["LICENSE", "LICENSE*.txt", "licenses/LICENSE.kda-for-kda", "licenses/LICENSE.cudnn-frontend-MIT.txt"]
 
 [project.optional-dependencies]
 b12x = ["torch>=2.12.0", "nvidia-cutlass-dsl==4.7.1", "nvidia-cutlass-dsl-libs-base==4.7.1", "nvidia-cutlass-dsl-libs-core==4.7.1", "nvidia-cutlass-dsl-libs-cu12==4.7.1", "nvidia-cutlass-dsl-libs-cu13==4.7.1", "rich>=13", "safetensors>=0.6"]
@@ -81,18 +81,36 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 # Cake-exported packages (flashinfer-ai/flashinfer#6553): the generated csrc tree plus the
 # build manifest (build.json) their cake_build loader reads; prebuilt aot/ libraries never ship.
 "flashinfer.cake_rmsnorm_train_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_causal_conv1d_train_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_ulysses_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_fused_qk_rope_append_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_nvfp4_svdquant_gemm_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_sage_block_sparse_attention_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_fused_qk_rope_fp8_append_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_vsa_sm90_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_gdp_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_mhc_train_backend" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_dsa_train" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake_kda_train" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake_rubin_mla_nvfp4_decode" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_lm_head_loss" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_mok_bf16" = ["csrc/*.cu", "csrc/*/*.cu", "csrc/*.h", "sources.json", "build.json", "README.md"]
-"flashinfer.experimental.nvfp4_attention" = ["csrc/**"]
+"flashinfer.experimental.nvfp4_attention" = ["csrc/**", "build.json"]
+"flashinfer.experimental.deepgemm_fp8_gemm" = ["csrc/**", "build.json", "DEEPGEMM_NOTICE.txt"]
 "flashinfer.experimental.cake_mla_varq_dcp_decode" = ["csrc/**"]
 "flashinfer.experimental.cake_mla_nvfp4_paged_decode" = ["csrc/**"]
 "flashinfer.experimental.msa_nvfp4_decode" = ["csrc/**"]
 "flashinfer.experimental.nvfp4_mla_decode" = ["csrc/**"]
 "flashinfer.experimental.nvfp4_sparse_mla_decode" = ["csrc/**"]
 "flashinfer.experimental.cake_dsa_indexer" = ["csrc/**", "build.json"]
-# Generated sources for the experimental exact-SM100a/SM103a Kimi-K3 attention-residual (AttnRes) backend, compiled on demand.
-"flashinfer.experimental.cake_kimi_k3_attn_res" = ["csrc/**"]
+"flashinfer.experimental.deepgemm_batched_gemm" = ["csrc/**", "build.json", "DEEPGEMM_NOTICE.txt"]
+# Generated sources and the build manifest (build.json) of the experimental exact-SM100a/SM103a Kimi-K3
+# attention-residual (AttnRes) backend; its cake_build loader compiles them on demand, prebuilt aot/ libraries never ship.
+"flashinfer.experimental.cake_kimi_k3_attn_res" = ["csrc/**", "build.json"]
+# Generated sources for the experimental exact-SM100a/SM103a Kimi-K3 FP8 projection backend, compiled on demand.
+"flashinfer.experimental.kimi_k3_fp8_projection" = ["csrc/**"]
+# Generated sources for the experimental exact-SM100a/SM103a per-token NVFP4 quantizer and GEMM backend, compiled on demand.
+"flashinfer.experimental.cake_nvfp4_per_token" = ["csrc/**"]
 # Route catalog of the experimental SM120 paged MQA-logits export, read at runtime next to its module.
 "flashinfer.experimental.deepgemm_sm120_paged_mqa_logits" = ["*.json"]
 # Route catalog of the experimental SM100/SM103 dense and paged MQA-logits export, read at runtime
@@ -114,16 +132,24 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.gdn_kernels.experimental.kernel" = ["*.cu"]
 # Generated sources for the experimental exact-SM103a MXFP8 MegaMoE backend.
 "flashinfer.experimental.cake_mxfp8_megamoe_ep16" = ["csrc/**"]
+# Generated programs, hand-written bindings and manifest of the experimental
+# exact-SM103a W8A8 MXFP8 MegaMoE EP16 backend, compiled on demand.
+"flashinfer.experimental.cake_w8a8_megamoe_ep16" = ["csrc/**"]
 # Generated sources for the experimental exact-SM100a/SM103a/SM107a ragged BF16 MoE grouped GEMM backend.
 "flashinfer.experimental.cake_moe_grouped_gemm" = ["csrc/**", "build.json"]
 # Generated sources for the experimental exact-SM100a/SM107a dense projection GEMM backend.
 "flashinfer.experimental.dense_projection_gemm" = ["csrc/**", "build.json"]
+# Generated sources for the experimental exact-SM100a/SM103a StepFun fused-MoE backend (cake-build/1).
+"flashinfer.experimental.cake_stepfun_moe" = ["csrc/**", "build.json"]
 # Standalone cuDNN Frost Python sources and the native MoE adapter, compiled on first use.
 "flashinfer.fused_moe.backends.cudnn_frost" = ["artifacts/*/*.json", "artifacts/*/sources/*.py", "csrc/**"]
 # Generated sources for the experimental exact-SM110 GQA decode backend.
 "flashinfer.experimental.sm110_gqa_decode" = ["csrc/**"]
 # Frozen native sources and manifest for the exact-SM110 XQA backend.
 "flashinfer.experimental.sm110_xqa" = ["csrc/**"]
+# The Qwen 3.5 gated attention block: the feature README and the vendored cuDNN Frontend tree's provenance files.
+"flashinfer.experimental.qwen_3_5_block" = ["README.md"]
+"flashinfer.experimental.qwen_3_5_block._cudnn_frost" = ["VENDOR.md", "VENDOR_MANIFEST.json"]
 # Raw CUDA sources for the SM90 push-style FP8 mega-MoE drop, JIT-compiled at
 # runtime; registered so non-editable installs ship them (PR #4069).
 "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe" = [
@@ -210,6 +236,8 @@ exclude = [
   # Same class: a CuTe DSL kernel body, kept byte-faithful to the artifact its
   # kernel-level numbers were measured on.
   "flashinfer/msa_ops/cute_dsl/sparse_decode_nvfp4_sm100.py",
+  # The vendored cuDNN Frontend tree of the Qwen 3.5 gated attention block (see the ruff exclude note).
+  "flashinfer/experimental/qwen_3_5_block/_cudnn_frost/",
   "build/",
 ]
 
@@ -244,6 +272,9 @@ extend-exclude = [
   "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py",
   "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py",
   "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py",
+  # cuDNN Frontend sources vendored byte-faithfully for the Qwen 3.5 gated attention block (re-vendored as a clean
+  # drop; the digests in its VENDOR_MANIFEST.json cover the files as written). The adapter beside it stays linted.
+  "flashinfer/experimental/qwen_3_5_block/_cudnn_frost/",
 ]
 force-exclude = true
 

@@ -9,9 +9,7 @@
  *   CAKE_BGMV_MOE_RANK                8, 16, 32 or 64
  *   CAKE_BGMV_MOE_INPUT_DTYPE         dl_bfloat16 or dl_float16
  *   CAKE_BGMV_MOE_CC_MAJOR / _MINOR   compute capability this module was built for
- *   CAKE_BGMV_MOE_SHRINK_DECODE       generated decode shrink kernel (PPB=4, 3 stages)
  *   CAKE_BGMV_MOE_SHRINK_PREFILL      generated prefill shrink kernel (PPB=1, 2 stages)
- *   CAKE_BGMV_MOE_SHRINK_DECODE_PDL   decode shrink + griddepcontrol.launch_dependents (PDL)
  *   CAKE_BGMV_MOE_SHRINK_PREFILL_PDL  prefill shrink + griddepcontrol.launch_dependents (PDL)
  *   CAKE_BGMV_MOE_SHRINK_PREFILL_S3   prefill shrink, 3-stage ring (small grids, lever 11c)
  *   CAKE_BGMV_MOE_SHRINK_PREFILL_S3_PDL  3-stage prefill shrink, PDL form
@@ -52,18 +50,15 @@ constexpr int32_t kRankTile = 8;
 constexpr int32_t kVec = 8;
 constexpr int32_t kShrinkThreads = 128;
 constexpr int32_t kShrinkTileElements = 128 * kVec;  // one vec8 per lane per tile
-constexpr int32_t kShrinkDecodePairsPerBlock = 4;
 // Dynamic shared memory per launch; the generated body records the values its
 // kernels were scheduled with (x/weight cp.async rings plus FP32 partials for
 // the shrink kernels, routed activations plus the route list for expand).
-constexpr int32_t kShrinkDecodeSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_DECODE;
 constexpr int32_t kShrinkPrefillSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL;
-static_assert(CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_DECODE_PDL == kShrinkDecodeSmemBytes,
-              "decode shrink forms must share smem");
 static_assert(CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL_PDL == kShrinkPrefillSmemBytes,
               "prefill shrink forms must share smem");
 // Lever 11c: three-stage prefill ring (one more x + weight stage) for grids of at most
-// kShrinkDeepRingMaxCtas CTAs; shrink form 2 (0 = two-stage prefill, 1 = decode).
+// kShrinkDeepRingMaxCtas CTAs; shrink form 2 (0 = two-stage prefill; form 1, the retired four-pair
+// decode kernel, is rejected).
 constexpr int32_t kShrinkPrefillS3SmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL_S3;
 static_assert(CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL_S3_PDL == kShrinkPrefillS3SmemBytes,
               "three-stage prefill shrink forms must share smem");
@@ -74,7 +69,6 @@ static_assert(kShrinkPrefillRemapSmemBytes == kShrinkPrefillSmemBytes &&
                   CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL_REMAP_PDL == kShrinkPrefillSmemBytes,
               "the bin-ordered prefill shrink forms share the two-stage prefill smem");
 constexpr int32_t kShrinkFormPrefill = 0;
-constexpr int32_t kShrinkFormDecode = 1;
 constexpr int32_t kShrinkFormPrefillS3 = 2;
 constexpr int32_t kExpandT64SmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T64;
 constexpr int32_t kExpandT128SmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T128;
@@ -82,7 +76,6 @@ constexpr int32_t kExpandT64PfSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T64_
 constexpr int32_t kExpandT128PfSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T128_PF;
 static_assert(kExpandT64PfSmemBytes == kExpandT64SmemBytes, "expand T64 forms must share smem");
 static_assert(kExpandT128PfSmemBytes == kExpandT128SmemBytes, "expand T128 forms must share smem");
-static_assert(kShrinkDecodeSmemBytes == 221824, "decode shrink smem layout changed");
 static_assert(kShrinkPrefillSmemBytes == 37120, "prefill shrink smem layout changed");
 static_assert(kRank % kRankTile == 0, "rank must be a multiple of the 8-row shrink tile");
 // Token->pair route index published by the shrink kernels and consumed by the
@@ -95,11 +88,13 @@ constexpr int32_t kRouteIndexHeaderWords = 4;
 constexpr int32_t kRouteIndexWordsPerToken = 3 + kRouteIndexMaxRoutes;
 // Hidden-split shrink workspace appended to the route index (see
 // flashinfer/jit/cake_bgmv_moe.py): FP32 partials [split][pair][64] as raw
-// 32-bit words, then one arrival counter per (pair block, rank block).
+// 32-bit words, then one arrival counter per (pair block, rank block). Only
+// the per-route shrink forms read it; grouped plans allocate the route index alone.
 constexpr int32_t kShrinkSplitMax = 8;
 constexpr int32_t kShrinkSplitMaxPairs = 128;
 constexpr int32_t kShrinkSplitPartialWords = kShrinkSplitMax * kShrinkSplitMaxPairs * 64;
 constexpr int32_t kShrinkSplitCounterWords = kShrinkSplitMaxPairs * (64 / kRankTile);
+constexpr int32_t kShrinkSplitWords = kShrinkSplitPartialWords + kShrinkSplitCounterWords;
 // Pair-grouped pipeline (round 5): routes grouped by their unique (LoRA,
 // expert) pair so each pair's weights are streamed once per tile of
 // kGroupTileTokens routes.  Plan-owned int32 workspace (see
@@ -122,27 +117,22 @@ constexpr int32_t kGroupShrinkRankTiles = kRank / kGroupShrinkRankTile;
 // tiles).  sm_90 pays 2-5 % for the rank-tile loop form itself, so it loops only where the H100
 // sweep showed net gains: one K tile -> the whole rank, two or three K tiles with >= 4 rank tiles
 // -> 4, otherwise one (straight-line path).
+// Both per-CTA policies branch on the compiled target (CAKE_BGMV_MOE_CC_MAJOR): Configure
+// checks that the device matches it, so no run-time capability query is needed.
 inline int32_t GroupShrinkRankTilesPerCta(int32_t num_tiles) {
-  static thread_local int cached_device = -1;
-  static thread_local int cached_major = 0;
-  int device = 0;
-  cudaGetDevice(&device);
-  if (device != cached_device) {
-    cudaDeviceGetAttribute(&cached_major, cudaDevAttrComputeCapabilityMajor, device);
-    cached_device = device;
-  }
-  if (cached_major == 9) {
+  if constexpr (CAKE_BGMV_MOE_CC_MAJOR == 9) {
     if (num_tiles >= 4 || (num_tiles > 1 && kGroupShrinkRankTiles < 4)) return 1;
     return num_tiles == 1 ? kGroupShrinkRankTiles
                           : (kGroupShrinkRankTiles < 4 ? kGroupShrinkRankTiles : 4);
+  } else {
+    const int32_t budget_raw = 16 / num_tiles;
+    const int32_t budget =
+        budget_raw < 1 ? 1
+                       : (budget_raw > kGroupShrinkRankTiles ? kGroupShrinkRankTiles : budget_raw);
+    int32_t per_cta = 1;  // largest power of two <= budget (a divisor of the rank tiles)
+    while (per_cta * 2 <= budget) per_cta *= 2;
+    return per_cta;
   }
-  const int32_t budget_raw = 16 / num_tiles;
-  const int32_t budget =
-      budget_raw < 1 ? 1
-                     : (budget_raw > kGroupShrinkRankTiles ? kGroupShrinkRankTiles : budget_raw);
-  int32_t per_cta = 1;  // largest power of two <= budget (a divisor of the rank tiles)
-  while (per_cta * 2 <= budget) per_cta *= 2;
-  return per_cta;
 }
 // Lever 3: the cp.async operand-ring grouped shrink (tile k+1's x and weight rows land in shared
 // memory while tile k computes) serves rows whose hidden spans more than one 1024-element K tile;
@@ -164,21 +154,18 @@ inline bool GroupShrinkRing(int32_t num_tiles) {
 // of the widened chain, so the rows are bitwise identical.  The jit sets
 // CAKE_BGMV_MOE_GROUP_SHRINK_MIXED to 1 for those bundles (0 elsewhere: sm_90 lacks the
 // instruction, fp16 rows keep the widened chain).
-inline bool GroupShrinkMixed(bool ring) { return CAKE_BGMV_MOE_GROUP_SHRINK_MIXED != 0 && ring; }
+// The body renders, per target, only the grouped-shrink forms these switches let Run select
+// (its #if CAKE_BGMV_MOE_CC_MAJOR gates); Configure and Run branch on the same switches.
+static_assert((CAKE_BGMV_MOE_GROUP_SHRINK_RING_SINGLE_TILE != 0) == (CAKE_BGMV_MOE_CC_MAJOR == 9),
+              "sm_90a, and only sm_90a, selects the operand ring on every row (lever 3c)");
+static_assert(CAKE_BGMV_MOE_GROUP_SHRINK_MIXED == 0 || CAKE_BGMV_MOE_CC_MAJOR >= 10,
+              "the mixed-precision grouped shrink exists on sm_100a and later only (lever 34)");
 // Column blocks (kGroupExpandThreads columns each) one grouped-expand CTA walks.
 // Blackwell: 8 at hidden >= 4096, 4 below (the expand is a per-CTA latency chain; 8 blocks at
 // hidden 2048 leaves too few CTAs); sm_90 rank 64 the same, rank 8-32 2 (neutral at 2-8 on H100).
 inline int32_t GroupExpandColBlocksPerCta(int32_t hidden, int32_t col_blocks) {
-  static thread_local int cached_device = -1;
-  static thread_local int cached_major = 0;
-  int device = 0;
-  cudaGetDevice(&device);
-  if (device != cached_device) {
-    cudaDeviceGetAttribute(&cached_major, cudaDevAttrComputeCapabilityMajor, device);
-    cached_device = device;
-  }
   int32_t per_cta = hidden >= 4096 ? 8 : 4;
-  if (cached_major == 9 && kRank < 32) per_cta = 2;
+  if constexpr (CAKE_BGMV_MOE_CC_MAJOR == 9 && kRank < 32) per_cta = 2;
   if (per_cta > col_blocks) per_cta = col_blocks;
   return per_cta < 1 ? 1 : per_cta;
 }
@@ -193,9 +180,16 @@ constexpr int32_t kGroupCombineThreads = 256;
 constexpr int32_t kGroupHistSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_HIST;
 constexpr int32_t kGroupScanSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCAN;
 constexpr int32_t kGroupScatterSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCATTER;
-constexpr int32_t kShrinkGroupedSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED;
 // Lever 3: the cp.async operand-ring grouped shrink stages two K tiles of x and weight rows.
 constexpr int32_t kShrinkGroupedRingSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING;
+// The register-direct grouped shrink is rendered for fp16 only (the bf16 bundles always select a
+// ring form: lever 3c on sm_90a, lever 34 elsewhere); the bf16 aliases resolve to the ring kernels
+// and share their smem.
+#ifdef CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED
+constexpr int32_t kShrinkGroupedSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED;
+#else
+constexpr int32_t kShrinkGroupedSmemBytes = kShrinkGroupedRingSmemBytes;
+#endif
 // Lever 34: the mixed-precision form's ring holds the weight rows only (fp16 bundles render no
 // mixed form; their aliases resolve to the ring kernels and share its smem).
 #ifdef CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING_MIXED
@@ -209,6 +203,10 @@ static_assert(CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING_MIXED_SINGLE ==
                   kShrinkGroupedRingMixedSmemBytes,
               "the mixed-precision grouped shrink forms must share smem");
 #endif
+// Configure checks the smem opt-in for the operand ring; no other grouped shrink form needs more.
+static_assert(kShrinkGroupedSmemBytes <= kShrinkGroupedRingSmemBytes &&
+                  kShrinkGroupedRingMixedSmemBytes <= kShrinkGroupedRingSmemBytes,
+              "the operand-ring grouped shrink makes the largest dynamic smem request");
 constexpr int32_t kExpandGroupedSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_GROUPED;
 constexpr int32_t kCombineGroupedSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_COMBINE_GROUPED;
 
@@ -296,8 +294,9 @@ inline void CheckCuda(cudaError_t status, const char* operation) {
 }
 
 // Each module is compiled for exactly one target (sm_90a for H100/H200,
-// sm_100a for B200/GB200, sm_103a for B300/GB300). The device must match it;
-// anything else fails closed instead of silently running another cubin.
+// sm_100a for B200/GB200, sm_103a for B300/GB300, sm_107a for Rubin R200).
+// The device must match it; anything else fails closed instead of silently
+// running another cubin.
 inline void CheckCompiledArch(int32_t device_id) {
   int major = 0;
   int minor = 0;
@@ -312,7 +311,7 @@ inline void CheckCompiledArch(int32_t device_id) {
 }
 
 // Called once per loaded module: the device must match the compiled target and
-// the decode shrink needs its opt-in dynamic shared memory.
+// the three-stage prefill and grouped shrink forms need their opt-in dynamic shared memory.
 void Configure() {
   int32_t device_id = 0;
   CheckCuda(cudaGetDevice(&device_id), "cudaGetDevice");
@@ -322,27 +321,26 @@ void Configure() {
   CheckCuda(
       cudaDeviceGetAttribute(&max_dynamic_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_id),
       "cudaDeviceGetAttribute(max opt-in shared memory)");
-  TVM_FFI_ICHECK(max_dynamic_smem >= kShrinkDecodeSmemBytes)
-      << "Cake BGMV MoE decode shrink requires " << kShrinkDecodeSmemBytes
+  // Lever 11c: the three-stage prefill ring exceeds the default 48 KiB carveout.
+  TVM_FFI_ICHECK(max_dynamic_smem >= kShrinkPrefillS3SmemBytes)
+      << "Cake BGMV MoE three-stage prefill shrink requires " << kShrinkPrefillS3SmemBytes
       << " bytes of dynamic shared memory, but device " << device_id << " supports "
       << max_dynamic_smem;
-  CheckCuda(
-      cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_DECODE, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           kShrinkDecodeSmemBytes),
-      "cudaFuncSetAttribute(Cake BGMV MoE decode shrink)");
-  CheckCuda(
-      cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_DECODE_PDL,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, kShrinkDecodeSmemBytes),
-      "cudaFuncSetAttribute(Cake BGMV MoE decode shrink, PDL form)");
-  // Lever 11c: the three-stage prefill ring exceeds the default 48 KiB carveout.
+#if CAKE_BGMV_MOE_CC_MAJOR == 9
+  // The plain-launch form (pdl_mode 0) is rendered for sm_90a only (Run rejects mode 0 elsewhere).
   CheckCuda(
       cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_PREFILL_S3,
                            cudaFuncAttributeMaxDynamicSharedMemorySize, kShrinkPrefillS3SmemBytes),
       "cudaFuncSetAttribute(Cake BGMV MoE three-stage prefill shrink)");
+#endif
   CheckCuda(
       cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_PREFILL_S3_PDL,
                            cudaFuncAttributeMaxDynamicSharedMemorySize, kShrinkPrefillS3SmemBytes),
       "cudaFuncSetAttribute(Cake BGMV MoE three-stage prefill shrink, PDL form)");
+#if defined(CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED) && CAKE_BGMV_MOE_CC_MAJOR >= 10 && \
+    CAKE_BGMV_MOE_GROUP_SHRINK_MIXED == 0
+  // The register-direct form (fp16 bundles of sm_100a and later: sm_90a rings every row, the
+  // bf16 bundles run the mixed-precision ring; CAKE_BGMV_MOE_SHRINK_GROUPED_SINGLE aliases it).
   TVM_FFI_ICHECK(max_dynamic_smem >= kShrinkGroupedSmemBytes)
       << "Cake BGMV MoE grouped shrink requires " << kShrinkGroupedSmemBytes
       << " bytes of dynamic shared memory, but device " << device_id << " supports "
@@ -351,16 +349,14 @@ void Configure() {
       cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_GROUPED,
                            cudaFuncAttributeMaxDynamicSharedMemorySize, kShrinkGroupedSmemBytes),
       "cudaFuncSetAttribute(Cake BGMV MoE grouped shrink)");
-  // Lever 20k: the one-rank-tile-per-CTA form shares the launch constants (rank 8: same kernel).
-  CheckCuda(
-      cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_GROUPED_SINGLE,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, kShrinkGroupedSmemBytes),
-      "cudaFuncSetAttribute(Cake BGMV MoE grouped shrink, single rank tile)");
-  // Lever 3: the operand-ring forms exceed the default 48 KiB carveout.
+#endif
+  // Lever 3: the operand-ring forms exceed the default 48 KiB carveout (the mixed-precision
+  // ring and the register-direct form need less, so this check covers every grouped form).
   TVM_FFI_ICHECK(max_dynamic_smem >= kShrinkGroupedRingSmemBytes)
       << "Cake BGMV MoE grouped shrink (operand ring) requires " << kShrinkGroupedRingSmemBytes
       << " bytes of dynamic shared memory, but device " << device_id << " supports "
       << max_dynamic_smem;
+#if CAKE_BGMV_MOE_GROUP_SHRINK_MIXED == 0
   CheckCuda(cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_GROUPED_RING,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  kShrinkGroupedRingSmemBytes),
@@ -369,19 +365,18 @@ void Configure() {
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  kShrinkGroupedRingSmemBytes),
             "cudaFuncSetAttribute(Cake BGMV MoE grouped shrink, operand ring, single rank tile)");
-  // Lever 34: the mixed-precision ring forms (bf16 bundles; fp16 aliases resolve to the ring
-  // kernels).
-  if (CAKE_BGMV_MOE_GROUP_SHRINK_MIXED != 0) {
-    CheckCuda(cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_GROUPED_RING_MIXED,
-                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                   kShrinkGroupedRingMixedSmemBytes),
-              "cudaFuncSetAttribute(Cake BGMV MoE grouped shrink, mixed-precision ring)");
-    CheckCuda(cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_GROUPED_RING_MIXED_SINGLE,
-                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                   kShrinkGroupedRingMixedSmemBytes),
-              "cudaFuncSetAttribute(Cake BGMV MoE grouped shrink, mixed-precision ring, single "
-              "rank tile)");
-  }
+#else
+  // Lever 34: the bf16 bundles of sm_100a and later render the mixed-precision ring forms only.
+  CheckCuda(cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_GROUPED_RING_MIXED,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 kShrinkGroupedRingMixedSmemBytes),
+            "cudaFuncSetAttribute(Cake BGMV MoE grouped shrink, mixed-precision ring)");
+  CheckCuda(cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_GROUPED_RING_MIXED_SINGLE,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 kShrinkGroupedRingMixedSmemBytes),
+            "cudaFuncSetAttribute(Cake BGMV MoE grouped shrink, mixed-precision ring, single "
+            "rank tile)");
+#endif
   // Lever 30: the rank-64 grouped expand double-buffers its weight stage (two 36 KiB column
   // blocks) and exceeds the default carveout; lower ranks keep register fragments.
   TVM_FFI_ICHECK(max_dynamic_smem >= kExpandGroupedSmemBytes)
@@ -421,8 +416,18 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
          TensorView group_workspace, TensorView group_partials, int64_t order_remap,
          TensorView order_workspace, int64_t pdl_mode, int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
+#if CAKE_BGMV_MOE_CC_MAJOR == 9
   TVM_FFI_ICHECK(pdl_mode >= 0 && pdl_mode <= 2)
       << "pdl_mode must be 0 (off), 1 (early trigger) or 2 (late trigger), got " << pdl_mode;
+#else
+  // The plain-launch shrink and expand forms (mode 0) are rendered for sm_90a only: the host
+  // policy (cake_bgmv_moe_pdl_mode) always launches with PDL on the other targets, so their
+  // bundles omit those forms and a direct request for mode 0 fails closed.
+  TVM_FFI_ICHECK(pdl_mode == 1 || pdl_mode == 2)
+      << "pdl_mode must be 1 (early trigger) or 2 (late trigger) on compute capability "
+      << CAKE_BGMV_MOE_CC_MAJOR << ".x (the plain launch, mode 0, is an sm_90a form), got "
+      << pdl_mode;
+#endif
   TVM_FFI_ICHECK(order_remap == 0 || grouped == 0)
       << "order_remap applies to the per-route pipeline only (grouped must be 0)";
   TVM_FFI_ICHECK(order_remap == 0 || shrink_form == kShrinkFormPrefill)
@@ -506,12 +511,9 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   CheckCompact(route_index, "route_index");
   const int64_t route_words =
       kRouteIndexHeaderWords + static_cast<int64_t>(num_tokens) * kRouteIndexWordsPerToken;
-  TVM_FFI_ICHECK(route_index.ndim() == 1 && route_index.size(0) >= route_words +
-                                                                       kShrinkSplitPartialWords +
-                                                                       kShrinkSplitCounterWords)
+  TVM_FFI_ICHECK(route_index.ndim() == 1 && route_index.size(0) >= route_words)
       << "route_index must hold at least " << kRouteIndexHeaderWords << " + num_tokens * "
-      << kRouteIndexWordsPerToken << " + " << (kShrinkSplitPartialWords + kShrinkSplitCounterWords)
-      << " int32 words";
+      << kRouteIndexWordsPerToken << " int32 words";
 
   TVM_FFI_ICHECK(schedule_value >= static_cast<int64_t>(Schedule::kTokenOwnedT64) &&
                  schedule_value <= static_cast<int64_t>(Schedule::kTokenOwned))
@@ -595,19 +597,31 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
                            1, 1);
     // Lever 20k: one rank tile per CTA takes the straight-line form (sm_90a pays ~10 % per shrink
     // CTA for the loop form at its 128-register budget; the stores are bitwise identical).
+    // The body renders only the grouped-shrink forms this module can select (its
+    // CAKE_BGMV_MOE_CC_MAJOR gates), so the form selection is compiled per target.
+#if CAKE_BGMV_MOE_GROUP_SHRINK_MIXED != 0
+    // Lever 34: the bf16 bundles of sm_100a and later select the ring on every row and run its
+    // mixed-precision form (bitwise identical rows).
+    const auto shrink_kernel = shrink_rt_per_cta == 1
+                                   ? CAKE_BGMV_MOE_SHRINK_GROUPED_RING_MIXED_SINGLE
+                                   : CAKE_BGMV_MOE_SHRINK_GROUPED_RING_MIXED;
+    const int32_t shrink_smem = kShrinkGroupedRingMixedSmemBytes;
+#elif CAKE_BGMV_MOE_CC_MAJOR == 9
+    // Lever 3c: sm_90a selects the operand ring on every row.
+    const auto shrink_kernel = shrink_rt_per_cta == 1 ? CAKE_BGMV_MOE_SHRINK_GROUPED_RING_SINGLE
+                                                      : CAKE_BGMV_MOE_SHRINK_GROUPED_RING;
+    const int32_t shrink_smem = kShrinkGroupedRingSmemBytes;
+#else
+    // fp16 bundles of sm_100a and later: the operand ring on multi-tile rows, the register-direct
+    // form on single-tile rows.
     const bool shrink_ring = GroupShrinkRing(num_tiles);
-    // Lever 34: mixed-precision ring form on the bf16 Blackwell bundles (bitwise identical rows).
-    const bool shrink_mixed = GroupShrinkMixed(shrink_ring);
     const auto shrink_kernel =
-        shrink_mixed  ? (shrink_rt_per_cta == 1 ? CAKE_BGMV_MOE_SHRINK_GROUPED_RING_MIXED_SINGLE
-                                                : CAKE_BGMV_MOE_SHRINK_GROUPED_RING_MIXED)
-        : shrink_ring ? (shrink_rt_per_cta == 1 ? CAKE_BGMV_MOE_SHRINK_GROUPED_RING_SINGLE
-                                                : CAKE_BGMV_MOE_SHRINK_GROUPED_RING)
-                      : (shrink_rt_per_cta == 1 ? CAKE_BGMV_MOE_SHRINK_GROUPED_SINGLE
-                                                : CAKE_BGMV_MOE_SHRINK_GROUPED);
-    const int32_t shrink_smem = shrink_mixed  ? kShrinkGroupedRingMixedSmemBytes
-                                : shrink_ring ? kShrinkGroupedRingSmemBytes
-                                              : kShrinkGroupedSmemBytes;
+        shrink_ring ? (shrink_rt_per_cta == 1 ? CAKE_BGMV_MOE_SHRINK_GROUPED_RING_SINGLE
+                                              : CAKE_BGMV_MOE_SHRINK_GROUPED_RING)
+                    : (shrink_rt_per_cta == 1 ? CAKE_BGMV_MOE_SHRINK_GROUPED_SINGLE
+                                              : CAKE_BGMV_MOE_SHRINK_GROUPED);
+    const int32_t shrink_smem = shrink_ring ? kShrinkGroupedRingSmemBytes : kShrinkGroupedSmemBytes;
+#endif
     CheckCuda(LaunchGroupedPdl(shrink_kernel, shrink_grid, dim3(kShrinkThreads, 1, 1), shrink_smem,
                                stream, shrink_ptr, x_ptr, a_ptr, token_ptr, num_pairs, num_experts,
                                hidden, num_tiles, shrink_rt_per_cta, shrink_rt_groups, ws_ptr,
@@ -647,12 +661,17 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   TVM_FFI_ICHECK(shrink_splits == 1 || num_pairs <= kShrinkSplitMaxPairs)
       << "hidden-split shrink supports at most " << kShrinkSplitMaxPairs << " pairs, got "
       << num_pairs;
-  TVM_FFI_ICHECK(shrink_form >= kShrinkFormPrefill && shrink_form <= kShrinkFormPrefillS3)
-      << "shrink_form must be 0 (two-stage prefill), 1 (decode) or 2 (three-stage prefill), got "
+  TVM_FFI_ICHECK(shrink_form == kShrinkFormPrefill || shrink_form == kShrinkFormPrefillS3)
+      << "shrink_form must be 0 (two-stage prefill) or 2 (three-stage prefill); form 1, the "
+         "retired four-pair decode shrink, is rejected, got "
       << shrink_form;
-  TVM_FFI_ICHECK(shrink_form != kShrinkFormDecode || num_pairs <= 32)
-      << "the decode shrink kernel supports at most 32 pairs, got " << num_pairs;
   const int32_t splits = static_cast<int32_t>(shrink_splits);
+  // The per-route shrink forms append their hidden-split partials and arrival counters to
+  // the route index; the grouped pipeline above never reads them, so its plans omit them.
+  TVM_FFI_ICHECK(route_index.size(0) >= route_words + kShrinkSplitWords)
+      << "route_index must hold at least " << kRouteIndexHeaderWords << " + num_tokens * "
+      << kRouteIndexWordsPerToken << " + " << kShrinkSplitWords
+      << " int32 words for the per-route shrink";
   auto* split_partials = reinterpret_cast<float*>(route_ptr + route_words);
   auto* split_counters = route_ptr + route_words + kShrinkSplitPartialWords;
   // Lever 27: bin-ordered dispatch.  The order_build prologue writes the route
@@ -684,25 +703,10 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   const dim3 shrink_block(kShrinkThreads, 1, 1);
   // Kernel forms by launch mode: the PDL forms carry griddepcontrol (shrink:
   // launch_dependents, early or late by pdl_early; expand: wait after the
-  // register B-row prefetch); the plain forms carry no PDL instruction.
+  // register B-row prefetch); the plain forms carry no PDL instruction and are rendered for
+  // sm_90a only (mode 0 is rejected above on the other targets).
   const bool prefetch_form = pdl_mode != 0;
-  if (shrink_form == kShrinkFormDecode) {
-    const dim3 shrink_grid(
-        (num_pairs + kShrinkDecodePairsPerBlock - 1) / kShrinkDecodePairsPerBlock,
-        kRank / kRankTile, splits);
-    if (prefetch_form) {
-      CAKE_BGMV_MOE_SHRINK_DECODE_PDL<<<shrink_grid, shrink_block, kShrinkDecodeSmemBytes,
-                                        stream>>>(
-          shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
-          num_tokens, route_ptr, kRouteBuild, hidden, num_tiles, split_partials, split_counters,
-          splits, pdl_early, order_ptr, kOrderOffset, route_remap);
-    } else {
-      CAKE_BGMV_MOE_SHRINK_DECODE<<<shrink_grid, shrink_block, kShrinkDecodeSmemBytes, stream>>>(
-          shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
-          num_tokens, route_ptr, kRouteBuild, hidden, num_tiles, split_partials, split_counters,
-          splits, pdl_early, order_ptr, kOrderOffset, route_remap);
-    }
-  } else if (shrink_form == kShrinkFormPrefillS3) {
+  if (shrink_form == kShrinkFormPrefillS3) {
     // Lever 11c: three-stage ring for small grids (same FMA chain per lane: bitwise identical
     // to the two-stage form).
     const dim3 shrink_grid(num_pairs, kRank / kRankTile, splits);
@@ -712,13 +716,16 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
           shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
           num_tokens, route_ptr, kRouteBuild, hidden, num_tiles, split_partials, split_counters,
           splits, pdl_early, order_ptr, kOrderOffset, route_remap);
-    } else {
+    }
+#if CAKE_BGMV_MOE_CC_MAJOR == 9
+    else {
       CAKE_BGMV_MOE_SHRINK_PREFILL_S3<<<shrink_grid, shrink_block, kShrinkPrefillS3SmemBytes,
                                         stream>>>(
           shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
           num_tokens, route_ptr, kRouteBuild, hidden, num_tiles, split_partials, split_counters,
           splits, pdl_early, order_ptr, kOrderOffset, route_remap);
     }
+#endif
   } else if (route_remap != 0) {
     // Lever 27: bin-ordered dispatch forms (the identity forms never read the permutation).
     const dim3 shrink_grid(num_pairs, kRank / kRankTile, splits);
@@ -728,13 +735,16 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
           shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
           num_tokens, route_ptr, kRouteBuild, hidden, num_tiles, split_partials, split_counters,
           splits, pdl_early, order_ptr, kOrderOffset, route_remap);
-    } else {
+    }
+#if CAKE_BGMV_MOE_CC_MAJOR == 9
+    else {
       CAKE_BGMV_MOE_SHRINK_PREFILL_REMAP<<<shrink_grid, shrink_block, kShrinkPrefillSmemBytes,
                                            stream>>>(
           shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
           num_tokens, route_ptr, kRouteBuild, hidden, num_tiles, split_partials, split_counters,
           splits, pdl_early, order_ptr, kOrderOffset, route_remap);
     }
+#endif
   } else {
     const dim3 shrink_grid(num_pairs, kRank / kRankTile, splits);
     if (prefetch_form) {
@@ -743,12 +753,15 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
           shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
           num_tokens, route_ptr, kRouteBuild, hidden, num_tiles, split_partials, split_counters,
           splits, pdl_early, order_ptr, kOrderOffset, route_remap);
-    } else {
+    }
+#if CAKE_BGMV_MOE_CC_MAJOR == 9
+    else {
       CAKE_BGMV_MOE_SHRINK_PREFILL<<<shrink_grid, shrink_block, kShrinkPrefillSmemBytes, stream>>>(
           shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
           num_tokens, route_ptr, kRouteBuild, hidden, num_tiles, split_partials, split_counters,
           splits, pdl_early, order_ptr, kOrderOffset, route_remap);
     }
+#endif
   }
   CheckCuda(cudaGetLastError(), "Cake BGMV MoE generic shrink launch");
 
@@ -775,9 +788,15 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   attrs[0].val.programmaticStreamSerializationAllowed = pdl_mode != 0 ? 1 : 0;
   config.attrs = attrs;
   config.numAttrs = 1;
+#if CAKE_BGMV_MOE_CC_MAJOR == 9
   auto expand_kernel_t64 = prefetch_form ? CAKE_BGMV_MOE_EXPAND_T64_PF : CAKE_BGMV_MOE_EXPAND_T64;
   auto expand_kernel_t128 =
       prefetch_form ? CAKE_BGMV_MOE_EXPAND_T128_PF : CAKE_BGMV_MOE_EXPAND_T128;
+#else
+  // pdl_mode is never 0 here (checked above): only the register-prefetch forms are rendered.
+  auto expand_kernel_t64 = CAKE_BGMV_MOE_EXPAND_T64_PF;
+  auto expand_kernel_t128 = CAKE_BGMV_MOE_EXPAND_T128_PF;
+#endif
 #if CAKE_BGMV_MOE_GENERIC_MERGE_IN_EXPAND
   // Merge-in-expand record: the shrink kernels left the per-split partials in the workspace
   // (splits > 1) and the expand kernels sum them in split order and write shrink_out; with

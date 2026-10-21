@@ -314,6 +314,14 @@ class MoERunner(TunableRunner):
         da_routing_metadata = kwargs.get("da_routing_metadata", ())
         da_body_workspace = kwargs.get("da_body_workspace", ())
         prepare_da_body = do_preparation and bool(da_routing_metadata)
+        # Profiling launches share the caller's workspace so autotuning needs no scratch
+        # beyond it; a bucket larger than the buffer allocates what does not fit. DA bodies
+        # own their typed workspaces.
+        workspace_buffer = (
+            None
+            if da_routing_metadata or da_body_workspace
+            else kwargs.get("workspace_buffer")
+        )
 
         num_tokens = hidden_states.shape[0]
         assert output.shape[0] == num_tokens, (
@@ -401,6 +409,8 @@ class MoERunner(TunableRunner):
                 list(da_routing_metadata),
                 list(da_body_workspace),
                 prepare_da_body,
+                workspace_buffer,
+                False,  # query_workspace_size
             )
             if prepare_da_body or da_routing_metadata:
                 return list(result)
@@ -458,6 +468,8 @@ class MoERunner(TunableRunner):
                     prepare_da_body,
                     kwargs.get("valid_hidden_size"),
                     kwargs.get("valid_intermediate_size"),
+                    workspace_buffer,
+                    False,  # query_workspace_size
                 )
             elif self.fp8_quantization_type == Fp8QuantizationType.PerChannelFp8:
                 result = self.moe_op.trtllm_fp8_per_channel_scale_moe(
@@ -490,6 +502,8 @@ class MoERunner(TunableRunner):
                     [-1, -1] if tactic == -1 else tactic,
                     self.activation_type,
                     kwargs.get("norm_topk_prob", True),
+                    workspace_buffer,
+                    False,  # query_workspace_size
                 )
             else:
                 common_args = (
@@ -521,6 +535,8 @@ class MoERunner(TunableRunner):
                     list(da_body_workspace),
                     prepare_da_body,
                     kwargs.get("gemm1_clamp_limit"),
+                    workspace_buffer,
+                    False,  # query_workspace_size
                 )
                 if routing_logits is None:
                     # FP8 per tensor scale, pre-computed routing.
@@ -580,6 +596,8 @@ class MoERunner(TunableRunner):
                 prepare_da_body,
                 kwargs.get("valid_hidden_size"),
                 kwargs.get("valid_intermediate_size"),
+                workspace_buffer,
+                False,  # query_workspace_size
             )
             if prepare_da_body or da_routing_metadata:
                 return list(result)
@@ -629,6 +647,8 @@ class MoERunner(TunableRunner):
                 prepare_da_body,
                 kwargs.get("valid_hidden_size"),
                 kwargs.get("valid_intermediate_size"),
+                workspace_buffer,
+                False,  # query_workspace_size
             )
             if prepare_da_body or da_routing_metadata:
                 return list(result)
