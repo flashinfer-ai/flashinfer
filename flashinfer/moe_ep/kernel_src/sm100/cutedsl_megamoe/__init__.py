@@ -119,8 +119,23 @@ _LAZY_HELPERS = (
     "compute_megamoe_reference_bf16_mxfp8",
 )
 
+# The next/ export owns a different top-level namespace. Bootstrap it only
+# when the caller explicitly selects GenPhase, preserving legacy imports.
+_GENPHASE_EXPORTS = (
+    "Sm100GenphaseMoeConfig",
+    "Sm100GenphaseSymmBuffer",
+    "preprocess_genphase_weights",
+    "quantize_genphase_mxfp8",
+    "sm100_genphase_mega_launch_thunk",
+    "sm100_genphase_mega_moe",
+)
+
 
 def __getattr__(name):  # PEP 562
+    if name in _GENPHASE_EXPORTS:
+        from .. import next_cutedsl_megamoe
+
+        return getattr(next_cutedsl_megamoe, name)
     if name in _LAZY_HELPERS:
         from .shim import kernel_helpers
 
@@ -213,3 +228,4 @@ __all__ = [
     "_stack_byte_reinterpretable_tensors",
 ]
 __all__ += [name for name in _kernel_helpers.__all__ if name not in __all__]
+__all__ += _GENPHASE_EXPORTS

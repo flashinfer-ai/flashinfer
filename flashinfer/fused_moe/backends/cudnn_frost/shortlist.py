@@ -14,6 +14,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
 
+from .manifest import MANIFEST_FILENAME, read_manifest
+
 _FILENAME = "moe_shortlists.json"
 _TableKey = tuple[str, str, int, int, int, int]
 _ProfileChoices = tuple[tuple[str, ...], tuple[str, ...]]
@@ -22,6 +24,17 @@ _ProfileMap = Mapping[int, _ProfileChoices]
 
 @functools.lru_cache(maxsize=8)
 def _read(roots: tuple[Path, ...]) -> dict:
+    manifests = [root / MANIFEST_FILENAME for root in roots]
+    manifests = [path for path in manifests if path.is_file()]
+    catalog_ids = (
+        {
+            record["id"]
+            for path in manifests
+            for record in read_manifest(path)["kernels"]
+        }
+        if manifests
+        else None
+    )
     tables: dict[
         tuple[str, str, int, int, int, int],
         dict[int, tuple[tuple[str, ...], tuple[str, ...]]],
@@ -56,6 +69,10 @@ def _read(roots: tuple[Path, ...]) -> dict:
                     raise ValueError(
                         "Frost shortlists require one or two distinct stage IDs"
                     )
+                if catalog_ids is not None and any(
+                    identity not in catalog_ids for identity in ids
+                ):
+                    raise ValueError("Frost shortlist references missing kernels")
             profiles = tables.setdefault(key, {})
             if tokens in profiles:
                 raise ValueError("duplicate Frost MoE shortlist profile")

@@ -4,6 +4,8 @@
 
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test_path_scope.sh"
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test_run_status.sh"
 
 # Default environment variables
 : "${JUNIT_DIR:=$(realpath ./junit)}"
@@ -168,6 +170,10 @@ print_test_mode_banner() {
 }
 
 run_pytest_with_file_timeout() {
+    local receipt pytest_status=0
+    receipt=$(test_status_start) || return 3
+    local -a TEST_STATUS_PYTEST_COMMAND
+    test_status_pytest_command "${receipt}"
     local -a timeout_cmd=()
     if [ "$PYTEST_FILE_TIMEOUT_SECONDS" -gt 0 ] 2>/dev/null; then
         if command -v timeout >/dev/null 2>&1; then
@@ -182,7 +188,9 @@ run_pytest_with_file_timeout() {
     fi
 
     # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX and PYTEST_FLAGS need word splitting
-    "${timeout_cmd[@]}" ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "$@"
+    "${timeout_cmd[@]}" ${PYTEST_COMMAND_PREFIX} "${TEST_STATUS_PYTEST_COMMAND[@]}" $PYTEST_FLAGS "$@" || pytest_status=$?
+    test_status_finish "${receipt}" "${pytest_status}" || return 3
+    return "${pytest_status}"
 }
 
 is_pytest_file_timeout_exit() {

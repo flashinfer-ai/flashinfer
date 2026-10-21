@@ -655,4 +655,47 @@ SMALL_CASES = {
         seed=1132008,
         position_in_block="end",
     ),
+    # The world-2 merge geometries the vLLM FULL CUDA-graph ladder reaches on a
+    # 2048-column block table: (8, 8), (4, 8), (2, 8), (2, 6), (1, 6) at 148 and
+    # 152 SMs (the capture-ladder coverage gap of the merge geometries); small contexts keep the cases cheap.
+    "tp2_q4_b10_cols2048": case_params(
+        world_size=2,
+        query_len=4,
+        batch=10,
+        context_tokens=1500,
+        score_columns=2048,
+        seed=1132011,
+    ),
+    "tp2_q4_b20_cols2048": case_params(
+        world_size=2,
+        query_len=4,
+        batch=20,
+        context_tokens=1500,
+        score_columns=2048,
+        seed=1132012,
+    ),
+    "tp2_q4_b40_cols2048": case_params(
+        world_size=2,
+        query_len=4,
+        batch=40,
+        context_tokens=1500,
+        score_columns=2048,
+        seed=1132013,
+    ),
+    "tp2_q4_b52_cols2048": case_params(
+        world_size=2,
+        query_len=4,
+        batch=52,
+        context_tokens=1500,
+        score_columns=2048,
+        seed=1132014,
+    ),
+    "tp2_q4_b88_cols2048": case_params(
+        world_size=2,
+        query_len=4,
+        batch=88,
+        context_tokens=1500,
+        score_columns=2048,
+        seed=1132015,
+    ),
 }

@@ -160,6 +160,20 @@ from .cake_mxfp8_megamoe_ep16 import (
     CakeMxfp8MegaMoeEp16Weights,
     preprocess_cake_mxfp8_megamoe_ep16_weights,
 )
+
+# Experimental backend behind the stable MoEEpMegaLayer API (explicit opt-in by
+# kernel_name; see flashinfer/experimental/cake_w8a8_megamoe_ep16/README.md).
+# The experimental package imports only ``moe_ep`` submodules (``weights``,
+# ``config``, ``core.*``), so this import resolves while this package is still
+# initializing; its backend module registers through backends/mega/kernel/sm103
+# and is lightweight at import time (no tvm-ffi, JIT or NVSHMEM imports).
+from ..experimental.cake_w8a8_megamoe_ep16.cake_config import (
+    Sm103_Mxfp8_Mxfp8_Bf16_Cake_MegaMoeConfig,
+)
+from ..experimental.cake_w8a8_megamoe_ep16.cake_weights import (
+    TransformedCakeW8a8MegaWeights,
+    preprocess_mega_weights as preprocess_sm103_mxfp8_cake_mega_weights,
+)
 from .config import (
     BootstrapConfig,
     CombineInputParams,
@@ -314,10 +328,12 @@ __all__ = [
     "Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
     "Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig",
     "Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig",
+    "Sm103_Mxfp8_Mxfp8_Bf16_Cake_MegaMoeConfig",
     "Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig",
     "Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "Sm120_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "TransformedCakeMegaWeights",
+    "TransformedCakeW8a8MegaWeights",
     "SplitConfig",
     "SplitKernelContext",
     "available_backends",
@@ -341,6 +357,7 @@ __all__ = [
     "preprocess_bf16_nvfp4_cutedsl_mega_weights",
     "preprocess_mxfp8_cutedsl_mega_weights",
     "preprocess_nvfp4_cutedsl_mega_weights",
+    "preprocess_sm103_mxfp8_cake_mega_weights",
     "preprocess_sm120_mxfp4_mxfp8_cake_mega_weights",
     "preprocess_sm120_mxfp4_mxfp8_cutedsl_mega_weights",
     "preprocess_sm120_mxfp8_cutedsl_mega_weights",

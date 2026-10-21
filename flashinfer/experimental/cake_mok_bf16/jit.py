@@ -1,55 +1,42 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""JIT-only loader for the standalone MoK CUDA sources.
+"""Loader of the standalone MoK CUDA libraries.
 
-``sources.json`` maps every kernel role to one or more source variants. A
-variant lists the exact targets it was generated for: kernels whose generated
-code does not depend on the target share one variant, while kernels with
-target-specific schedules (for example the MXFP8 tile width, which follows
-the tensor-memory capacity) carry one variant per target group. The variant
-is selected by the device compute capability and compiled for that target.
+``sources.json`` maps every kernel role to one record: the targets it is
+generated for (``arches``), the argument names of its entry (``arguments``)
+and the architecture-free stem of its library (``library``,
+``cake_mok_<role>``).  ``build.json`` -- read by :mod:`cake_build` -- names
+the per-architecture build ``<library>_<arch>`` (``cake_mok_<role>_<arch>``)
+and is the only record of what to compile (translation units, digests, nvcc
+flags; kernels with target-specific schedules, for example the MXFP8 tile
+width that follows the tensor-memory capacity, list a different kernel source
+per target there).  The build is selected by the device compute capability;
+its library is the prebuilt one under ``aot/`` when the package ships it, else
+FlashInfer's JIT build of the ``build.json`` entry.
 """
 
 from __future__ import annotations
 
 import functools
-import hashlib
 import json
 from pathlib import Path
 
 import torch
 
-from ...jit import env as jit_env
-from ...jit.core import (
-    gen_jit_spec,
-    sm100a_nvcc_flags,
-    sm103a_nvcc_flags,
-    sm107a_nvcc_flags,
-)
+from . import cake_build
 
-_PACKAGE = Path(__file__).resolve().parent
+_PACKAGE = Path(__file__).parent
 _TARGETS = {
-    (10, 0): ("sm_100a", sm100a_nvcc_flags),
-    (10, 3): ("sm_103a", sm103a_nvcc_flags),
-    (10, 7): ("sm_107a", sm107a_nvcc_flags),
+    (10, 0): "sm_100a",
+    (10, 3): "sm_103a",
+    (10, 7): "sm_107a",
 }
-
-
-def _headers():
-    installed = [jit_env.FLASHINFER_CSRC_DIR, jit_env.FLASHINFER_INCLUDE_DIR]
-    if (installed[0] / "tvm_ffi_utils.h").is_file():
-        return installed
-    checkout = _PACKAGE.parents[2]
-    paths = [checkout / "csrc", checkout / "include"]
-    if not (paths[0] / "tvm_ffi_utils.h").is_file():
-        raise FileNotFoundError("FlashInfer JIT headers were not found")
-    return paths
 
 
 class _Kernel:
     def __init__(self, module, arguments):
         self._run = module.run
-        self._arguments = tuple(name for _, name in arguments)
+        self._arguments = tuple(arguments)
 
     def launch(self, *, grid, **arguments):
         arguments.update(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
@@ -66,7 +53,7 @@ def _target(capability):
 
 def target_arch(device=None):
     """Exact generated target (``sm_100a``, ``sm_103a`` or ``sm_107a``) for a device."""
-    return _target(torch.cuda.get_device_capability(device))[0]
+    return _target(torch.cuda.get_device_capability(device))
 
 
 @functools.cache
@@ -74,38 +61,29 @@ def _registry():
     return json.loads((_PACKAGE / "sources.json").read_text())
 
 
-def kernel_spec(role, capability):
-    """Return one content-addressed CUDA build specification."""
-    arch, arch_flags = _target(capability)
-    record = next(
-        (v for v in _registry()[role]["variants"] if arch in v["arches"]), None
-    )
-    if record is None:
+def variant(role, capability):
+    """The ``sources.json`` record of kernel ``role``, checked to be generated
+    for a device of ``capability``: ``{"library": "cake_mok_<role>",
+    "arches": [...], "arguments": [name, ...]}``."""
+    arch = _target(capability)
+    record = _registry()[role]
+    if arch not in record["arches"]:
         raise RuntimeError(f"MoK kernel {role!r} has no generated {arch} variant")
-    sources = [_PACKAGE / "csrc" / name for name in record["sources"]]
-    for source, digest in zip(sources, record["sha256"], strict=True):
-        if hashlib.sha256(source.read_bytes()).hexdigest() != digest:
-            raise RuntimeError(f"MoK source checksum mismatch: {source.name}")
-    flags = [*arch_flags, *record["flags"]]
-    identity = hashlib.sha256(
-        json.dumps([role, record, flags], sort_keys=True).encode()
-    ).hexdigest()
-    spec = gen_jit_spec(
-        f"cake_mok_{role}_{identity}",
-        sources,
-        extra_cuda_cflags=flags,
-        extra_ldflags=["-lcuda"],
-        extra_include_paths=_headers(),
-        use_fast_math=False,
-    )
-    return spec, record["arguments"]
+    return record
+
+
+def library_name(role, capability):
+    """``build.json`` entry of kernel ``role`` on a device of ``capability``:
+    ``<library>_<arch>``, for example ``cake_mok_forward_sm_100a``."""
+    return f"{variant(role, capability)['library']}_{_target(capability)}"
 
 
 @functools.cache
 def _load(role, device):
     with torch.cuda.device(device):
-        spec, arguments = kernel_spec(role, torch.cuda.get_device_capability(device))
-        return _Kernel(spec.build_and_load(), arguments)
+        capability = torch.cuda.get_device_capability(device)
+        module = cake_build.load_library(library_name(role, capability))
+        return _Kernel(module, variant(role, capability)["arguments"])
 
 
 def load_kernel(role):
