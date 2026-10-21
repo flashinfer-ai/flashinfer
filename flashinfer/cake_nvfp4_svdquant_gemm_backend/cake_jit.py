@@ -1290,9 +1290,10 @@ MODULES: dict[str, dict[str, Any]] = {
         },
     },
     # cake_r2 form B for the M 129 rows with K >= 12288 and K % 256 == 0 (the
-    # K12288-class rows): form A without the N-pair cluster (``a_mcast=False``:
-    # each CTA loads its own 64 A rows and the full SFA atom).  Bias build.
-    "cake_nvfp4_svdquant_gemm_ddd4cfba045b7f6dd01f": {
+    # K12288-class rows): form A on 256-wide K boxes (``k_box=256``, four K64
+    # MMA steps per stage), an 11-stage ring (``stages=11``) and the epilogue
+    # staging aliased onto the drained ring (``epi_alias=True``).  Bias build.
+    "cake_nvfp4_svdquant_gemm_233bc54a42d3ffd5567d": {
         "arches": ["sm_100a", "sm_103a"],
         # derived; rewritten by the exporter
         "arg_plan": [
@@ -1316,22 +1317,24 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "build": {
-            "a_mcast": False,
             "bias": True,
             "epi": "fused64",
+            "epi_alias": True,
+            "k_box": 256,
             "prologue": "overlap",
+            "stages": 11,
         },
         "ffi_entry": "run",
-        "kernel": "cake_nvfp4_svdquant_gemm_ddd4cfba045b7f6dd01f",
-        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_ddd4cfba045b7f6dd01f",  # derived; rewritten by the exporter
+        "kernel": "cake_nvfp4_svdquant_gemm_233bc54a42d3ffd5567d",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_233bc54a42d3ffd5567d",  # derived; rewritten by the exporter
         "launch": {  # derived; rewritten by the exporter
             "block": (256, 1, 1),
-            "cluster": (1, 1, 1),
+            "cluster": (1, 2, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 210048,
+            "dynamic_smem_bytes": 226432,
             "use_pdl": False,
         },
-        "library": "cake_nvfp4_svdquant_gemm_ddd4cfba045b7f6dd01f",
+        "library": "cake_nvfp4_svdquant_gemm_233bc54a42d3ffd5567d",
         # derived; rewritten by the exporter
         "logical": {
             "A": "a",
@@ -1363,7 +1366,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
     },
     # Form B without the bias epilogue (``bias=False``); bias-free problems only.
-    "cake_nvfp4_svdquant_gemm_2ff8759348db39de3101": {
+    "cake_nvfp4_svdquant_gemm_d615c1bd45783aae8506": {
         "arches": ["sm_100a", "sm_103a"],
         # derived; rewritten by the exporter
         "arg_plan": [
@@ -1387,22 +1390,24 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "build": {
-            "a_mcast": False,
             "bias": False,
             "epi": "fused64",
+            "epi_alias": True,
+            "k_box": 256,
             "prologue": "overlap",
+            "stages": 11,
         },
         "ffi_entry": "run",
-        "kernel": "cake_nvfp4_svdquant_gemm_2ff8759348db39de3101",
-        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_2ff8759348db39de3101",  # derived; rewritten by the exporter
+        "kernel": "cake_nvfp4_svdquant_gemm_d615c1bd45783aae8506",
+        "kernel_symbol": "kernel_cake_nvfp4_svdquant_gemm_d615c1bd45783aae8506",  # derived; rewritten by the exporter
         "launch": {  # derived; rewritten by the exporter
             "block": (256, 1, 1),
-            "cluster": (1, 1, 1),
+            "cluster": (1, 2, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 210048,
+            "dynamic_smem_bytes": 226432,
             "use_pdl": False,
         },
-        "library": "cake_nvfp4_svdquant_gemm_2ff8759348db39de3101",
+        "library": "cake_nvfp4_svdquant_gemm_d615c1bd45783aae8506",
         # derived; rewritten by the exporter
         "logical": {
             "A": "a",
@@ -1895,7 +1900,7 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
         "k_min": 12288,
         "k_multiple": 256,
         "bias": True,
-        "record": "cake_nvfp4_svdquant_gemm_ddd4cfba045b7f6dd01f",
+        "record": "cake_nvfp4_svdquant_gemm_233bc54a42d3ffd5567d",
     },
     {
         "m_min": 129,
@@ -1905,7 +1910,7 @@ ROUTE_TABLE: tuple[dict[str, Any], ...] = (
         "k_min": 12288,
         "k_multiple": 256,
         "bias": False,
-        "record": "cake_nvfp4_svdquant_gemm_2ff8759348db39de3101",
+        "record": "cake_nvfp4_svdquant_gemm_d615c1bd45783aae8506",
     },
     {
         "m_min": 129,

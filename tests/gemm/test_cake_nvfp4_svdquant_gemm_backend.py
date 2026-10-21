@@ -162,7 +162,13 @@ GRAPH_REPLAYS = 3
 # The build keywords of the 64-row tactic-14 program per K class of the M 129
 # rows: the K12288 class (K >= 12288, K % 256 == 0) and every other K.
 M129_FORM_K3072 = {"prologue": "overlap", "epi": "fused64"}
-M129_FORM_K12288 = {"prologue": "overlap", "epi": "fused64", "a_mcast": False}
+M129_FORM_K12288 = {
+    "prologue": "overlap",
+    "epi": "fused64",
+    "k_box": 256,
+    "stages": 11,
+    "epi_alias": True,
+}
 # The 2-CTA programs' output-store forms by launch: the kernel hints its stores
 # when ``K_tiles >= 24`` or ``w_tiles >= 24`` on 256-wide tiles.
 OUT_HINT_MIN_TILES = 24
