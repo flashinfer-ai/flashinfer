@@ -1114,6 +1114,7 @@ def fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping(
     FP8 data into the paged slot, and writes the float32 scale into the caller's
     scale view. The FP8 data and the scale share one inline slot: the slot's last
     dimension is ``head_dim + 16`` = ``[head_dim FP8][4-byte scale][12-byte pad]``.
+    Supported ``head_dim`` values are 64, 128, 256 and 512.
 
     ``slot_mapping[i]`` is ``page_id * page_size + entry_idx``; negative slots are
     padding and are ignored. ``append_key``/``append_value`` may hold extra padded
