@@ -431,7 +431,6 @@ kernel_minimax_h3_norm_adaln_bf16(__nv_bfloat16* __restrict__ x, __nv_bfloat16* 
 
 #define MINIMAX_H3_FC1_INF CUDART_INF_F
 #define TMEM_NCOLS 512
-#define TMEM_ACCUM_OFFSET 0
 #define NUM_TMA_PIPE_STAGES 7
 #define NUM_MAINLOOP_PIPE_STAGES 2
 #define NUM_WORK_PIPE_STAGES 4
@@ -449,10 +448,8 @@ kernel_minimax_h3_norm_adaln_bf16(__nv_bfloat16* __restrict__ x, __nv_bfloat16* 
 #define BLOCK_N 256
 #define B_HALF_N 128
 #define BLOCK_K 64
-#define MMA_K 16
 #define CTA_GROUP 2
 #define NUM_STAGES 7
-#define NUM_EPILOGUE_WARPS 4
 #define GROUP_M 32
 #define WORK_STAGES 4
 #define WORK_CONSUMERS 290
@@ -959,8 +956,6 @@ kernel_minimax_h3_fc1_swiglu_bf16(const __grid_constant__ CUtensorMap A, const _
 #undef FFN
 #undef GROUP_M
 #undef MINIMAX_H3_FC1_INF
-#undef MMA_K
-#undef NUM_EPILOGUE_WARPS
 #undef NUM_K_ITERS
 #undef NUM_MAINLOOP_PIPE_STAGES
 #undef NUM_STAGES
@@ -977,7 +972,6 @@ kernel_minimax_h3_fc1_swiglu_bf16(const __grid_constant__ CUtensorMap A, const _
 #undef SMEM_WORK_RESPONSE_OFF
 #undef SMEM_WORK_RESPONSE_STAGE_BYTES
 #undef SMEM_WORK_RESPONSE_STRIDE
-#undef TMEM_ACCUM_OFFSET
 #undef TMEM_NCOLS
 #undef WORK_CONSUMERS
 #undef WORK_STAGES
@@ -1303,8 +1297,6 @@ kernel_minimax_h3_norm_adaln_mxfp8(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
 #define SMEM_SMEM_SFA_ALL_STAGE_BYTES 512
 #define SMEM_SMEM_SFA_ALL_STRIDE 47616
 #define SMEM_SMEM_SFA_OFF 46080
-#define SMEM_SMEM_SFA_STAGE_BYTES 512
-#define SMEM_SMEM_SFA_STRIDE 47616
 #define SMEM_SMEM_V6_OFF 46592
 #define SMEM_SMEM_V6_STAGE_BYTES 1024
 #define SMEM_SMEM_V6_STRIDE 47616
@@ -1965,8 +1957,6 @@ kernel_minimax_h3_fc1_swiglu_e4m3(const __grid_constant__ CUtensorMap A, const _
 #undef SMEM_SMEM_SFA_ALL_STAGE_BYTES
 #undef SMEM_SMEM_SFA_ALL_STRIDE
 #undef SMEM_SMEM_SFA_OFF
-#undef SMEM_SMEM_SFA_STAGE_BYTES
-#undef SMEM_SMEM_SFA_STRIDE
 #undef SMEM_SMEM_V2_OFF
 #undef SMEM_SMEM_V2_STAGE_BYTES
 #undef SMEM_SMEM_V2_STRIDE
@@ -2314,8 +2304,6 @@ kernel_minimax_h3_norm_adaln_nvfp4(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
 #define SMEM_SMEM_SFA_ALL_STAGE_BYTES 2048
 #define SMEM_SMEM_SFA_ALL_STRIDE 55296
 #define SMEM_SMEM_V5_OFF 48128
-#define SMEM_SMEM_V5_STAGE_BYTES 4096
-#define SMEM_SMEM_V5_STRIDE 55296
 #define SMEM_SMEM_V6_OFF 52224
 #define SMEM_SMEM_V6_STAGE_BYTES 4096
 #define SMEM_SMEM_V6_STRIDE 55296
@@ -2329,32 +2317,14 @@ kernel_minimax_h3_norm_adaln_nvfp4(__nv_bfloat16* __restrict__ x, __nv_bfloat16*
 #define SMEM_SMEM_V9_STAGE_BYTES 512
 #define SMEM_SMEM_V9_STRIDE 55296
 #define SMEM_SMEM_V10_OFF 47616
-#define SMEM_SMEM_V10_STAGE_BYTES 512
-#define SMEM_SMEM_V10_STRIDE 55296
 #define SMEM_SMEM_V11_OFF 48128
-#define SMEM_SMEM_V11_STAGE_BYTES 1024
-#define SMEM_SMEM_V11_STRIDE 55296
 #define SMEM_SMEM_V12_OFF 49152
-#define SMEM_SMEM_V12_STAGE_BYTES 1024
-#define SMEM_SMEM_V12_STRIDE 55296
 #define SMEM_SMEM_V13_OFF 50176
-#define SMEM_SMEM_V13_STAGE_BYTES 1024
-#define SMEM_SMEM_V13_STRIDE 55296
 #define SMEM_SMEM_V14_OFF 51200
-#define SMEM_SMEM_V14_STAGE_BYTES 1024
-#define SMEM_SMEM_V14_STRIDE 55296
 #define SMEM_SMEM_V15_OFF 52224
-#define SMEM_SMEM_V15_STAGE_BYTES 1024
-#define SMEM_SMEM_V15_STRIDE 55296
 #define SMEM_SMEM_V16_OFF 53248
-#define SMEM_SMEM_V16_STAGE_BYTES 1024
-#define SMEM_SMEM_V16_STRIDE 55296
 #define SMEM_SMEM_V17_OFF 54272
-#define SMEM_SMEM_V17_STAGE_BYTES 1024
-#define SMEM_SMEM_V17_STRIDE 55296
 #define SMEM_SMEM_V18_OFF 55296
-#define SMEM_SMEM_V18_STAGE_BYTES 1024
-#define SMEM_SMEM_V18_STRIDE 55296
 #define SMEM_WORK_RESPONSE_OFF 222208
 #define SMEM_WORK_RESPONSE_STAGE_BYTES 16
 #define SMEM_WORK_RESPONSE_STRIDE 16
@@ -3262,32 +3232,14 @@ kernel_minimax_h3_fc1_swiglu_e2m1(const __grid_constant__ CUtensorMap A, const _
 #undef SMEM_SMEM_SFA_ALL_STAGE_BYTES
 #undef SMEM_SMEM_SFA_ALL_STRIDE
 #undef SMEM_SMEM_V10_OFF
-#undef SMEM_SMEM_V10_STAGE_BYTES
-#undef SMEM_SMEM_V10_STRIDE
 #undef SMEM_SMEM_V11_OFF
-#undef SMEM_SMEM_V11_STAGE_BYTES
-#undef SMEM_SMEM_V11_STRIDE
 #undef SMEM_SMEM_V12_OFF
-#undef SMEM_SMEM_V12_STAGE_BYTES
-#undef SMEM_SMEM_V12_STRIDE
 #undef SMEM_SMEM_V13_OFF
-#undef SMEM_SMEM_V13_STAGE_BYTES
-#undef SMEM_SMEM_V13_STRIDE
 #undef SMEM_SMEM_V14_OFF
-#undef SMEM_SMEM_V14_STAGE_BYTES
-#undef SMEM_SMEM_V14_STRIDE
 #undef SMEM_SMEM_V15_OFF
-#undef SMEM_SMEM_V15_STAGE_BYTES
-#undef SMEM_SMEM_V15_STRIDE
 #undef SMEM_SMEM_V16_OFF
-#undef SMEM_SMEM_V16_STAGE_BYTES
-#undef SMEM_SMEM_V16_STRIDE
 #undef SMEM_SMEM_V17_OFF
-#undef SMEM_SMEM_V17_STAGE_BYTES
-#undef SMEM_SMEM_V17_STRIDE
 #undef SMEM_SMEM_V18_OFF
-#undef SMEM_SMEM_V18_STAGE_BYTES
-#undef SMEM_SMEM_V18_STRIDE
 #undef SMEM_SMEM_V2_OFF
 #undef SMEM_SMEM_V2_STAGE_BYTES
 #undef SMEM_SMEM_V2_STRIDE
@@ -3295,8 +3247,6 @@ kernel_minimax_h3_fc1_swiglu_e2m1(const __grid_constant__ CUtensorMap A, const _
 #undef SMEM_SMEM_V3_STAGE_BYTES
 #undef SMEM_SMEM_V3_STRIDE
 #undef SMEM_SMEM_V5_OFF
-#undef SMEM_SMEM_V5_STAGE_BYTES
-#undef SMEM_SMEM_V5_STRIDE
 #undef SMEM_SMEM_V6_OFF
 #undef SMEM_SMEM_V6_STAGE_BYTES
 #undef SMEM_SMEM_V6_STRIDE
