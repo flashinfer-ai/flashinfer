@@ -38,6 +38,7 @@ pytest.importorskip(
 )
 
 from flashinfer.attention.prims_ts import (
+    dsa as dsa_module,
     prims_ts_dsa_sparse_mla_fp8,
     prims_ts_dsa_sparse_mla_nvfp4,
 )
@@ -527,14 +528,43 @@ def test_prims_ts_dsa_rejects_invalid_arguments(kernel: str, name: str, mutate) 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
 def test_prims_ts_dsa_compiled_kernel_is_shared_across_token_counts() -> None:
-    """The JIT key is (heads, top-k, skip-correction, cache format); T is a runtime extent."""
+    """The JIT key is (heads, top-k, skip-correction, cache format, dequant prefetch); T is a runtime extent.
+
+    Token counts on one side of ``NVFP4_DEQUANT_PREFETCH_MAX_CTAS`` share a kernel; the
+    NVFP4 cache compiles one extra variant above it.
+    """
     device = torch.device("cuda")
+    limit = dsa_module.NVFP4_DEQUANT_PREFETCH_MAX_CTAS
     before = compile_dsa_sparse_kernel.cache_info()
-    for total_q in (1, 7, 150):
+    totals = (1, 7, limit, limit + 1, 150)
+    for total_q in totals:
         fx = build_fixture(Case("shared", total_q=total_q, top_k=256), device)
         _run_nvfp4(fx)
         _run_fp8(fx)
     torch.cuda.synchronize()
     after = compile_dsa_sparse_kernel.cache_info()
-    assert after.misses - before.misses <= 2
-    assert after.hits - before.hits >= 4
+    # fp8, nvfp4 with the prefetch schedule (T <= limit), nvfp4 without it.
+    assert after.misses - before.misses <= 3
+    assert after.hits - before.hits >= 2 * len(totals) - 3
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("case", _NVFP4_CASES, ids=lambda c: c.name)
+def test_prims_ts_dsa_nvfp4_dequant_prefetch_is_bit_identical(
+    case: Case, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The V-slice LDS prefetch only reorders loads: output and LSE match the default schedule bitwise."""
+    device = torch.device("cuda")
+    fx = build_fixture(case, device)
+    results = []
+    for max_ctas in (0, 1 << 20):
+        monkeypatch.setattr(dsa_module, "NVFP4_DEQUANT_PREFETCH_MAX_CTAS", max_ctas)
+        lse = torch.empty(
+            (case.total_q, case.heads), dtype=torch.float32, device=device
+        )
+        out = _run_nvfp4(fx, lse=lse)
+        torch.cuda.synchronize()
+        results.append((out.clone(), lse))
+    assert torch.equal(results[0][0], results[1][0])
+    assert torch.equal(results[0][1], results[1][1])

@@ -2100,7 +2100,67 @@ def create_native_fp4_dequant_task(
         sfr.commit()
         sfl.release()
 
+    def one_tile_prefetch(raw, kv, done, section, inst, sfl, sfr):
+        # ``nvfp4_dequant_prefetch``: the raw / scale LDS of slice v + 1 is issued before
+        # slice v is converted, so each slice's LDS latency hides behind the previous
+        # slice's convert / STS / fence / arrive (two slices live in registers; the
+        # slices alternate between the handle name sets a and b).
+        nslice = cfg.v_head_dim_stages
+        load = {0: raw.load_v_slice_regs_a, 1: raw.load_v_slice_regs_b}
+        conv = {0: kv.dequant_v_native_regs_a, 1: kv.dequant_v_native_regs_b}
+        raw.wait()
+        cur = load[0](section=section, inst=inst, v_idx=0)
+        for v in range(nslice - 1):
+            nxt = load[(v + 1) % 2](section=section, inst=inst, v_idx=v + 1)
+            kv.acquire()
+            if v % 2 == 0:
+                conv[0](
+                    section=section,
+                    v_raw_a=cur[0],
+                    v_scale_a=cur[1],
+                    inst=inst,
+                    v_idx=v,
+                )
+            else:
+                conv[1](
+                    section=section,
+                    v_raw_b=cur[0],
+                    v_scale_b=cur[1],
+                    inst=inst,
+                    v_idx=v,
+                )
+            kv.commit()
+            if v == 0:
+                done.wait()
+                done.bmm1_completed()
+                _write_sfb(sfl, sfr, section, inst, 1)
+                done.release()
+            cur = nxt
+        raw.release()
+        raw.issue_gathers_ahead(section=section, inst=inst)
+        kv.acquire()
+        last = (nslice - 1) % 2
+        if last == 0:
+            conv[0](
+                section=section,
+                v_raw_a=cur[0],
+                v_scale_a=cur[1],
+                inst=inst,
+                v_idx=nslice - 1,
+            )
+        else:
+            conv[1](
+                section=section,
+                v_raw_b=cur[0],
+                v_scale_b=cur[1],
+                inst=inst,
+                v_idx=nslice - 1,
+            )
+        kv.commit()
+
     def one_tile(raw, kv, done, section, inst, sfl, sfr):
+        if cfg.nvfp4_dequant_prefetch:
+            return one_tile_prefetch(raw, kv, done, section, inst, sfl, sfr)
         raw.wait()
         # Slices 0..2 into the V ring; the last slice is staged in registers
         # so the raw stage is released (and the Gather4 of tile t + 2

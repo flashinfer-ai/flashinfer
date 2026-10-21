@@ -154,6 +154,7 @@ def compile_dsa_sparse_kernel(
     enable_skip_correction: bool,
     nvfp4: bool = False,
     residual_dim: int = 64,
+    dequant_prefetch: bool = False,
 ):
     """Compile one token-sparse 1CTA specialization (JIT key = the argument list)."""
 
@@ -191,6 +192,7 @@ def compile_dsa_sparse_kernel(
         is_dynamic_token_sparse=True,
         is_dynamic_token_sparse_nvfp4=nvfp4,
         nvfp4_residual_dim=residual_dim,
+        nvfp4_dequant_prefetch=dequant_prefetch,
     )
     cfg = kernel._make_config()
     if int(cfg.num_ctas_per_seq_kv) != 1:

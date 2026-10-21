@@ -1103,6 +1103,54 @@ class SmemKvResource(MlaResource):
 
     @producer_work
     @cute.jit
+    def dequant_v_native_regs_a(
+        self,
+        stage_info: StageInfo,
+        *,
+        section: cutlass.Constexpr[MlaStage],
+        v_raw_a,
+        v_scale_a,
+        inst: cutlass.Constexpr[int] = 0,
+        v_idx: cutlass.Constexpr[int] = 0,
+    ):
+        """Convert V slice ``v_idx`` from register-staged words (handle set ``a``)."""
+        tile = local_kv_tile_idx(self.cfg, stage_info, inst, 0, section=section)
+        self._dequant_stage(
+            stage_info,
+            0,
+            1,
+            stage_idx=v_idx,
+            section=section,
+            native_tile_idx=tile,
+            preloaded=(v_raw_a, v_scale_a),
+        )
+
+    @producer_work
+    @cute.jit
+    def dequant_v_native_regs_b(
+        self,
+        stage_info: StageInfo,
+        *,
+        section: cutlass.Constexpr[MlaStage],
+        v_raw_b,
+        v_scale_b,
+        inst: cutlass.Constexpr[int] = 0,
+        v_idx: cutlass.Constexpr[int] = 0,
+    ):
+        """Handle set ``b`` of ``dequant_v_native_regs_a``."""
+        tile = local_kv_tile_idx(self.cfg, stage_info, inst, 0, section=section)
+        self._dequant_stage(
+            stage_info,
+            0,
+            1,
+            stage_idx=v_idx,
+            section=section,
+            native_tile_idx=tile,
+            preloaded=(v_raw_b, v_scale_b),
+        )
+
+    @producer_work
+    @cute.jit
     def dequant_v_native_regs(
         self,
         stage_info: StageInfo,
@@ -1887,6 +1935,34 @@ class SmemRawKvResource(SmemKvResource):
                 "Register-staged block-scale words of the last V slice.",
                 "v3_scale",
             ),
+            (
+                "v_raw_a_var",
+                cutlass.Array,
+                None,
+                "Prefetch variant: register-staged raw E2M1 words of an in-flight V slice (set a).",
+                "v_raw_a",
+            ),
+            (
+                "v_scale_a_var",
+                cutlass.Array,
+                None,
+                "Prefetch variant: register-staged block-scale words of an in-flight V slice (set a).",
+                "v_scale_a",
+            ),
+            (
+                "v_raw_b_var",
+                cutlass.Array,
+                None,
+                "Prefetch variant: register-staged raw E2M1 words of an in-flight V slice (set b).",
+                "v_raw_b",
+            ),
+            (
+                "v_scale_b_var",
+                cutlass.Array,
+                None,
+                "Prefetch variant: register-staged block-scale words of an in-flight V slice (set b).",
+                "v_scale_b",
+            ),
         )
     )
 
@@ -1983,6 +2059,57 @@ class SmemRawKvResource(SmemKvResource):
         cfg = self.cfg
         return Int32(cfg.kv_raw_stages * cfg.kv_raw_stage_bytes) + Int32(slot) * Int32(
             cfg.nvfp4_scale_slot_bytes
+        )
+
+    @consumer_work(returns=("v_raw_a", "v_scale_a"))
+    @cute.jit
+    def load_v_slice_regs_a(
+        self,
+        stage_info: StageInfo,
+        *,
+        section: cutlass.Constexpr[MlaStage],
+        inst: cutlass.Constexpr[int] = 0,
+        v_idx: cutlass.Constexpr[int] = 0,
+    ):
+        """Load V slice ``v_idx``'s raw and scale words into registers (handle set ``a``).
+
+        ``nvfp4_dequant_prefetch`` keeps two slices in flight; the schedule builder
+        tracks values by return name, so consecutive slices alternate between the
+        name sets ``a`` and ``b``.
+        """
+        tile = local_kv_tile_idx(self.cfg, stage_info, inst, 0, section=section)
+        return self._dequant_stage(
+            stage_info,
+            0,
+            1,
+            stage_idx=v_idx,
+            section=section,
+            native_tile_idx=tile,
+            preload_only=True,
+            raw_override=self,
+        )
+
+    @consumer_work(returns=("v_raw_b", "v_scale_b"))
+    @cute.jit
+    def load_v_slice_regs_b(
+        self,
+        stage_info: StageInfo,
+        *,
+        section: cutlass.Constexpr[MlaStage],
+        inst: cutlass.Constexpr[int] = 0,
+        v_idx: cutlass.Constexpr[int] = 0,
+    ):
+        """Handle set ``b`` of ``load_v_slice_regs_a``."""
+        tile = local_kv_tile_idx(self.cfg, stage_info, inst, 0, section=section)
+        return self._dequant_stage(
+            stage_info,
+            0,
+            1,
+            stage_idx=v_idx,
+            section=section,
+            native_tile_idx=tile,
+            preload_only=True,
+            raw_override=self,
         )
 
     @consumer_work(returns=("v3_raw", "v3_scale"))

@@ -212,6 +212,10 @@ class MlaConfig:
     # softmax task owns both 64-column halves of every S tile.
     is_dynamic_token_sparse_nvfp4: int = 0
     nvfp4_residual_dim: int = 64
+    # NVFP4 token-sparse only: issue the raw / scale LDS of V slice v + 1 before converting slice v
+    # (two slices live in registers).  Hides the LDS latency of a CTA that runs alone on its SM, so it
+    # pays at small token counts and is neutral at full GPU occupancy (see ``dsa.py``).
+    nvfp4_dequant_prefetch: int = 0
     nvfp4_scale_row_bytes: int = 40
     # Raw K ring: stages, bytes per stage and the transaction bytes declared per
     # stage (>= the gathered bytes so the count splits evenly across the loader
@@ -1643,6 +1647,7 @@ def make_throughput_latency_mla_config(
     is_dynamic_token_sparse: bool = False,
     is_dynamic_token_sparse_nvfp4: bool = False,
     nvfp4_residual_dim: int = 64,
+    nvfp4_dequant_prefetch: bool = False,
 ) -> MlaConfig:
     """Return throughput-latency 1CTA MLA traits for a concrete profile."""
 
@@ -1850,6 +1855,7 @@ def make_throughput_latency_mla_config(
         is_dynamic_token_sparse=int(is_dynamic_token_sparse),
         is_dynamic_token_sparse_nvfp4=int(is_dynamic_token_sparse_nvfp4),
         nvfp4_residual_dim=int(nvfp4_residual_dim),
+        nvfp4_dequant_prefetch=int(nvfp4_dequant_prefetch),
         nvfp4_scale_row_bytes=(576 + nvfp4_residual_dim) // 16,
         nvfp4_scale_slot_bytes=128 * ((576 + nvfp4_residual_dim) // 16),
         tmem_s_cols=tile_size_q,

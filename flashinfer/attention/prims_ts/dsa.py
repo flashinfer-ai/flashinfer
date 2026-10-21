@@ -65,6 +65,14 @@ _SUPPORTED_HEADS = (64, 128)
 _NVFP4_RESIDUAL_DIM = 64
 
 
+# The NVFP4 kernel issues the next V slice's LDS before converting the current one
+# (``nvfp4_dequant_prefetch``) when at most this many CTAs (query tokens x 64-head
+# groups) run.  Measured on B200 (K=2048, one CTA per SM): -5% at 1..32 CTAs, -2% at 64,
+# -1% at 96, neutral from 128 on, so the prefetch variant is only compiled and used
+# below the crossover.
+NVFP4_DEQUANT_PREFETCH_MAX_CTAS = 64
+
+
 def _require(cond: bool, msg: str) -> None:
     if not cond:
         raise ValueError(msg)
@@ -446,6 +454,8 @@ def prims_ts_dsa_sparse_mla_nvfp4(
         enable_skip_correction=skip_corr_threshold > 0.0,
         nvfp4=True,
         residual_dim=residual_dim,
+        dequant_prefetch=query.shape[0] * (num_heads // 64)
+        <= NVFP4_DEQUANT_PREFETCH_MAX_CTAS,
     )
     # s = m * 2**e with m in [1, 2): the exponent folds exactly into the E4M3
     # block scales of the V dequantization; m goes through the PV scale.  QK

@@ -2050,6 +2050,7 @@ class ThroughputLatencyMlaDecodeTs:
         is_dynamic_token_sparse: bool = False,
         is_dynamic_token_sparse_nvfp4: bool = False,
         nvfp4_residual_dim: int = 64,
+        nvfp4_dequant_prefetch: bool = False,
     ):
         """Initialize one selected physical tile profile over logical flat Q rows."""
         import cutlass as _cutlass
@@ -2076,6 +2077,7 @@ class ThroughputLatencyMlaDecodeTs:
         self.is_dynamic_token_sparse = bool(is_dynamic_token_sparse)
         self.is_dynamic_token_sparse_nvfp4 = bool(is_dynamic_token_sparse_nvfp4)
         self.nvfp4_residual_dim = int(nvfp4_residual_dim)
+        self.nvfp4_dequant_prefetch = bool(nvfp4_dequant_prefetch)
         self.logical_num_heads = logical_num_heads
         self.logical_seq_len_q = logical_seq_len_q
         self.tile_size_q = tile_size_q
@@ -2228,6 +2230,7 @@ class ThroughputLatencyMlaDecodeTs:
             is_dynamic_token_sparse=self.is_dynamic_token_sparse,
             is_dynamic_token_sparse_nvfp4=self.is_dynamic_token_sparse_nvfp4,
             nvfp4_residual_dim=self.nvfp4_residual_dim,
+            nvfp4_dequant_prefetch=self.nvfp4_dequant_prefetch,
         )
         if self.sparse_profile is not None:
             cfg = configure_sparse_mla(
