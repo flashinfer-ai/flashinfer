@@ -14,27 +14,33 @@ _in_mem_compile_cache: dict = {}
 
 
 @lru_cache(maxsize=8)
-def _sm12x_gpu_arch_cached(device_type: str, device_index: int | None) -> cute.GPUArch:
+def _gpu_arch_cached(
+    device_type: str, device_index: int | None, family: int, suffix: str
+) -> cute.GPUArch:
     device = (
         torch.device(device_type)
         if device_index is None
         else torch.device(device_type, device_index)
     )
     major, minor = torch.cuda.get_device_capability(device)
-    if major != 12:
+    if major != family:
         raise RuntimeError(
-            f"sm12x_gpu_arch requires an SM12x device, got compute capability "
-            f"{major}.{minor}"
+            f"sm{family}x_gpu_arch requires an SM{family}x device, got compute "
+            f"capability {major}.{minor}"
         )
-    return cute.GPUArch(f"sm_{major}{minor}a")
+    return cute.GPUArch(f"sm_{major}{minor}{suffix}")
+
+
+def _gpu_arch(device: str | torch.device, family: int, suffix: str) -> cute.GPUArch:
+    d = torch.device(device)
+    if d.type == "cuda" and d.index is None:
+        d = torch.device("cuda", torch.cuda.current_device())
+    return _gpu_arch_cached(d.type, d.index, family, suffix)
 
 
 def sm12x_gpu_arch(device: str | torch.device = "cuda") -> cute.GPUArch:
     """Return the on-device CuteDSL arch for SM12x (``sm_120a`` / ``sm_121a``)."""
-    d = torch.device(device)
-    if d.type == "cuda" and d.index is None:
-        d = torch.device("cuda", torch.cuda.current_device())
-    return _sm12x_gpu_arch_cached(d.type, d.index)
+    return _gpu_arch(device, 12, "a")
 
 
 def sm12x_compile_options(
@@ -43,45 +49,11 @@ def sm12x_compile_options(
     return (sm12x_gpu_arch(device),)
 
 
-@lru_cache(maxsize=8)
-def _sm8x_gpu_arch_cached(device_type: str, device_index: int | None) -> cute.GPUArch:
-    """The arch string for one device, cached on its type and index.
-
-    Keyed on the two halves of the device rather than on a `torch.device`,
-    because two equal devices are not the same object and would miss the
-    cache. Refuses anything but compute capability 8.x: the caller asked for
-    SM8x, and returning another arch would compile for a target the kernel was
-    not written against.
-    """
-    device = (
-        torch.device(device_type)
-        if device_index is None
-        else torch.device(device_type, device_index)
-    )
-    major, minor = torch.cuda.get_device_capability(device)
-    if major != 8:
-        raise RuntimeError(
-            f"sm8x_gpu_arch requires an SM8x device, got compute capability "
-            f"{major}.{minor}"
-        )
-    # No architecture-specific suffix before SM90: sm_80 and sm_86 name the
-    # target outright, and asking for sm_80a is not a target the driver has.
-    return cute.GPUArch(f"sm_{major}{minor}")
-
-
-def sm8x_gpu_arch(device: str | torch.device = "cuda") -> cute.GPUArch:
-    """Return the on-device CuteDSL arch for SM8x (``sm_80`` / ``sm_86`` ...)."""
-    d = torch.device(device)
-    if d.type == "cuda" and d.index is None:
-        d = torch.device("cuda", torch.cuda.current_device())
-    return _sm8x_gpu_arch_cached(d.type, d.index)
-
-
 def sm8x_compile_options(
     device: str | torch.device = "cuda",
 ) -> tuple[cute.GPUArch]:
-    """The compile options an SM8x kernel is compiled with: just its arch."""
-    return (sm8x_gpu_arch(device),)
+    # No arch-specific ("a") target exists before SM90.
+    return (_gpu_arch(device, 8, ""),)
 
 
 _TMA_CLUSTER_LOAD = (

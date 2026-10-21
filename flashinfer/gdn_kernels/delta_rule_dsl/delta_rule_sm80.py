@@ -10,12 +10,12 @@ from .alpha import AlphaProcessor
 from .collective_store_sm80 import CollectiveStoreSm80
 from .pipeline_sm80 import PipelineCpAsyncSm80
 from .custom_compile_cache import (
-    KeyedCompileMixin,
     cached_compile,
     get_cached_compile,
     sm8x_compile_options,
 )
 from .collective_inverse_hmma import CollectiveInverse
+from .delta_rule_sm120 import _FullyFusedDeltaRuleSm120
 from .helpers import SM80, state_dtype_to_cutlass
 from .schedule import WorkDesc
 from .varlen_helper import is_integer_dtype
@@ -158,45 +158,11 @@ class MathWarpGroupRole(IntEnum):
 # inside the kernel without any parameter-passing trickery.
 
 
-class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
-    # The sm_90 kernel computes a per-warp-group register budget here and hands
-    # it to setmaxnreg. sm_80 has no such instruction, so there is nothing to
-    # hand it to and the register count is ptxas's alone -- read it from the
-    # compiler, not from a formula. The helper is gone rather than kept unused.
-
-    @staticmethod
-    def can_implement(
-        num_q_heads: int,
-        num_k_heads: int,
-        num_v_heads: int,
-        head_size: int,
-        element_size: int,
-    ) -> bool:
-        """Whether this configuration is one the kernel was built for."""
-        ratio = (
-            num_q_heads // num_v_heads
-            if num_q_heads > num_v_heads
-            else num_v_heads // num_q_heads
-        )
-        is_gva_enabled = num_v_heads > num_q_heads
-
-        is_gqa_like = (
-            (num_k_heads == num_v_heads)
-            and (num_q_heads == ratio * num_k_heads)
-            and (num_q_heads == ratio * num_v_heads)
-        )
-        is_gva_like = (
-            (num_q_heads == num_k_heads)
-            and (num_v_heads == ratio * num_q_heads)
-            and (num_v_heads == ratio * num_k_heads)
-        )
-
-        alignment = 16 // element_size
-        return (
-            ((not is_gva_enabled and is_gqa_like) or (is_gva_enabled and is_gva_like))
-            and (head_size <= 128)
-            and ((head_size % alignment) == 0)
-        )
+class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
+    # The epilogue, masking, decay and alpha/beta loads are the SM120 kernel's
+    # and are inherited; the MMA, copies and pipeline here are sm_80's own.
+    # sm_80 has no setmaxnreg, so the inherited `get_register_requirements` is
+    # never called and the register count is ptxas's alone.
 
     def __init__(
         self,
@@ -487,97 +453,6 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
             tKKrKK_cv3 = thr_store.retile(tKKrKK_cvt)
             cute.copy(tiled_store, tKKrKK_cv3, tKKsKK2)
 
-    # ─── kk_epi ───────────────────────────────────────────────────────────────
-
-    @cute.jit
-    def kk_epi(
-        self,
-        tKKrKK: cute.Tensor,
-        tKKcMkk: cute.Tensor,
-        sAlpha: cute.Tensor,
-        sBeta: cute.Tensor,
-        alpha_stage: cutlass.Int32,
-        beta_stage: cutlass.Int32,
-    ):
-        """Apply the decay ratio and beta to the KK accumulator, in place.
-
-        Two per-element scales the GEMM cannot carry: `exp2` of the cumulative
-        log-decay difference between the two tokens a KK entry pairs, and beta
-        on the row. Both read the coordinate tensor rather than recomputing an
-        index, because the fragment's layout is the MMA's, not the tile's.
-        """
-        if cutlass.const_expr(self.needs_alpha):
-            alpha_cumlog = sAlpha[None, AlphaProcessor.CUMSUM_LOG, alpha_stage]
-            for i in cutlass.range_constexpr(cute.size(tKKrKK)):
-                s, t = tKKcMkk[i]
-                tKKrKK[i] = tKKrKK[i] * cute.math.exp2(
-                    cutlass.Float32(alpha_cumlog[s]) - cutlass.Float32(alpha_cumlog[t]),
-                    fastmath=True,
-                )
-        if cutlass.const_expr(self.needs_beta):
-            beta_row = sBeta[None, beta_stage]
-            for i in cutlass.range_constexpr(cute.size(tKKrKK)):
-                s, _ = tKKcMkk[i]
-                tKKrKK[i] = tKKrKK[i] * cutlass.Float32(beta_row[s])
-
-    # ─── qk_or_kk_mask ────────────────────────────────────────────────────────
-
-    @cute.jit
-    def qk_or_kk_mask(
-        self,
-        frag: cute.Tensor,
-        coord_tensor: cute.Tensor,
-        is_final_block: bool,
-        B: cutlass.Int32,
-    ):
-        """Zero the entries a causal chunk product must not keep.
-
-        Strictly-upper entries always, and on the final block anything whose
-        row or column is past the sequence's own token count -- the tile is
-        read whole, so out-of-range rows hold whatever the zero-fill left and
-        have to be masked rather than skipped.
-        """
-        for i in cutlass.range_constexpr(cute.size(frag)):
-            s, t = coord_tensor[i]
-            pred = s >= t
-            if cutlass.const_expr(is_final_block):
-                pred = pred and (s < B and t < B)
-            if not pred:
-                frag[i] = cutlass.Float32(0.0)
-
-    # ─── qk_epi ───────────────────────────────────────────────────────────────
-
-    @cute.jit
-    def qk_epi(
-        self,
-        tQKrQK: cute.Tensor,
-        tQKcMqk: cute.Tensor,
-        sAlpha: cute.Tensor,
-        alpha_stage: cutlass.Int32,
-        scale: cutlass.Float32,
-    ):
-        """Scale the QK accumulator by the decay ratio and the softmax scale.
-
-        With no gates there is no ratio to apply and the scale is the only
-        factor, which is why the two branches are not one expression.
-        """
-        if cutlass.const_expr(self.needs_alpha):
-            alpha_cumlog = sAlpha[None, AlphaProcessor.CUMSUM_LOG, alpha_stage]
-            for i in cutlass.range_constexpr(cute.size(tQKrQK)):
-                s, t = tQKcMqk[i]
-                tQKrQK[i] = (
-                    tQKrQK[i]
-                    * cute.math.exp2(
-                        cutlass.Float32(alpha_cumlog[s])
-                        - cutlass.Float32(alpha_cumlog[t]),
-                        fastmath=True,
-                    )
-                    * scale
-                )
-        else:
-            for i in cutlass.range_constexpr(cute.size(tQKrQK)):
-                tQKrQK[i] = tQKrQK[i] * scale
-
     # ─── qk_store ─────────────────────────────────────────────────────────────
 
     @cute.jit
@@ -598,97 +473,6 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         for i in cutlass.range_constexpr(cute.size(tQKrQK)):
             tQKrQK_cvt[i] = self.dtype(tQKrQK[i])
         cute.copy(qk_tiled_copy, tQKrQK_cvt_cv, tQKsQK)
-
-    # ─── o1_epi ───────────────────────────────────────────────────────────────
-
-    @cute.jit
-    def o1_epi(
-        self,
-        tOrO: cute.Tensor,
-        tOcO: cute.Tensor,
-        sAlpha: cute.Tensor,
-        alpha_stage: cutlass.Int32,
-        scale: cutlass.Float32,
-    ):
-        """Scale the O1 term by the query token's cumulative decay.
-
-        O1 is the state's contribution, so the factor is the decay from the
-        chunk's start to the query token -- a per-column scale, taken from the
-        coordinate tensor.
-        """
-        if cutlass.const_expr(self.needs_alpha):
-            alpha_cpscale = sAlpha[None, AlphaProcessor.CUMPROD_SCALE, alpha_stage]
-            for i in cutlass.range_constexpr(cute.size(tOrO)):
-                _, tok_q = tOcO[i]
-                tOrO[i] = cutlass.Float32(alpha_cpscale[tok_q]) * tOrO[i]
-        else:
-            for i in cutlass.range_constexpr(cute.size(tOrO)):
-                tOrO[i] = scale * tOrO[i]
-
-    # ─── sk_epi ───────────────────────────────────────────────────────────────
-
-    @cute.jit
-    def sk_epi(
-        self,
-        tSKrSK: cute.Tensor,
-        tSKcSK: cute.Tensor,
-        sAlpha: cute.Tensor,
-        alpha_stage: cutlass.Int32,
-    ):
-        """Scale the S@K term by the key token's cumulative decay."""
-        if cutlass.const_expr(self.needs_alpha):
-            alpha_cp = sAlpha[None, AlphaProcessor.CUMPROD, alpha_stage]
-            for i in cutlass.range_constexpr(cute.size(tSKrSK)):
-                _, tok_kv = tSKcSK[i]
-                tSKrSK[i] = tSKrSK[i] * cutlass.Float32(alpha_cp[tok_kv])
-
-    # ─── sk_load_v ────────────────────────────────────────────────────────────
-
-    @cute.jit
-    def sk_load_v(
-        self,
-        tSKrSK: cute.Tensor,
-        sV_DS: cute.Tensor,
-        sk_tiled_copy_C,
-        sk_thr_copy_C,
-        v_stage: cutlass.Int32,
-    ) -> cute.Tensor:
-        tSKrV = cute.make_fragment_like(tSKrSK, self.dtype)
-        tSKrV_cv = sk_thr_copy_C.retile(tSKrV)
-        tSKsV = sk_thr_copy_C.partition_S(sV_DS)
-        cute.copy(sk_tiled_copy_C, tSKsV[None, None, None, v_stage], tSKrV_cv)
-        return tSKrV
-
-    # ─── kv_decay_v ───────────────────────────────────────────────────────────
-
-    @cute.jit
-    def kv_decay_v(
-        self,
-        tKVrV: cute.Tensor,
-        tKVcV: cute.Tensor,
-        sAlpha: cute.Tensor,
-        alpha_stage: cutlass.Int32,
-        is_final_block: bool,
-        B: cutlass.Int32,
-    ):
-        if cutlass.const_expr(self.needs_alpha):
-            alpha_cumlog = sAlpha[None, AlphaProcessor.CUMSUM_LOG, alpha_stage]
-            block_log = cutlass.Float32(alpha_cumlog[B - cutlass.Int32(1)])
-            for i in cutlass.range_constexpr(cute.size(tKVrV)):
-                _, tok = tKVcV[i]
-                coeff = cute.math.exp2(
-                    block_log - cutlass.Float32(alpha_cumlog[tok]), fastmath=True
-                )
-                if cutlass.const_expr(is_final_block):
-                    if tok >= B:
-                        coeff = cutlass.Float32(0.0)
-                tKVrV[i] = self.dtype(cutlass.Float32(tKVrV[i]) * coeff)
-        else:
-            for i in cutlass.range_constexpr(cute.size(tKVrV)):
-                _, tok = tKVcV[i]
-                if cutlass.const_expr(is_final_block):
-                    if tok >= B:
-                        tKVrV[i] = self.dtype(0.0)
 
     # ─── o_store ──────────────────────────────────────────────────────────────
 
@@ -1059,61 +843,6 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
             beta_pipeline.producer_commit(beta_producer_state)
             beta_producer_state.advance()
         return beta_producer_state
-
-    # ─── load_alpha ───────────────────────────────────────────────────────────
-    # Translates FlatMainloopTmaWarpSpecializedDeltaRule::load_alpha (scalar load).
-    # Caller must sync before calling AlphaProcessor on the loaded data.
-
-    @cute.jit
-    def load_alpha(
-        self,
-        sAlpha: cute.Tensor,
-        g_alpha: cute.Tensor,
-        blk_tok: cutlass.Int32,
-        tok_end,
-        sab_head_idx: cutlass.Int32,
-        num_sab_heads: cutlass.Int32,
-        alpha_stage: cutlass.Int32,
-    ):
-        """Load the alpha channels for one block and derive the cumulative ones."""
-        lane_id = cute.arch.lane_idx()
-        sAlpha_k = sAlpha[None, None, alpha_stage]
-        num_iters = self.BLK_Q // 32
-        for i in cutlass.range_constexpr(num_iters):
-            row = cutlass.Int32(i * 32) + lane_id
-            tok = blk_tok + row
-            if tok < tok_end:
-                sAlpha_k[row, AlphaProcessor.CUMSUM_LOG] = g_alpha[
-                    tok * num_sab_heads + sab_head_idx
-                ]
-            else:
-                sAlpha_k[row, AlphaProcessor.CUMSUM_LOG] = cutlass.Float32(1.0)
-
-    # ─── load_beta ────────────────────────────────────────────────────────────
-    # Translates FlatMainloopTmaWarpSpecializedDeltaRule::load_beta.
-
-    @cute.jit
-    def load_beta(
-        self,
-        sBeta: cute.Tensor,
-        g_beta: cute.Tensor,
-        blk_tok: cutlass.Int32,
-        tok_end,
-        sab_head_idx: cutlass.Int32,
-        num_sab_heads: cutlass.Int32,
-        beta_stage: cutlass.Int32,
-    ):
-        """Load beta for one block."""
-        lane_id = cute.arch.lane_idx()
-        sBeta_k = sBeta[None, beta_stage]
-        num_iters = self.BLK_KV // 32
-        for i in cutlass.range_constexpr(num_iters):
-            row = cutlass.Int32(i * 32) + lane_id
-            tok = blk_tok + row
-            if tok < tok_end:
-                sBeta_k[row] = g_beta[tok * num_sab_heads + sab_head_idx]
-            else:
-                sBeta_k[row] = cutlass.Float32(0.0)
 
     def _k_major_atom_kind(self, elems: int):
         """The widest K-major swizzled atom a row of `elems` can carry.

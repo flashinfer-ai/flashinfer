@@ -32,9 +32,12 @@ try:
     from .jit import cake_gdn as _cake_gdn
 
     _CAKE_GDN_AVAILABLE = True
+    _HostOffsetsError: type[NotImplementedError] = _cake_gdn.CakeGDNUnsupportedError
 except (ImportError, RuntimeError):
     _cake_gdn = None
     _CAKE_GDN_AVAILABLE = False
+    # CakeGDNUnsupportedError's base: SM8x checks host offsets without Cake.
+    _HostOffsetsError = NotImplementedError
 from .utils import get_compute_capability, get_device_name, get_device_sm_count
 from .gdn_kernels import (
     _chunk_gated_delta_rule_gdn_cp_sm100,
@@ -193,7 +196,7 @@ def _cake_gdn_prefill_host_offsets(
             or cu_seqlens_cpu.ndim != 1
             or cu_seqlens_cpu.dtype not in (torch.int32, torch.int64)
         ):
-            raise _cake_gdn.CakeGDNUnsupportedError(
+            raise _HostOffsetsError(
                 "cu_seqlens_cpu must be a one-dimensional int32/int64 CPU tensor"
             )
         values = cu_seqlens_cpu.tolist()
@@ -201,18 +204,18 @@ def _cake_gdn_prefill_host_offsets(
         values = []
         for value in cu_seqlens_cpu:
             if isinstance(value, bool):
-                raise _cake_gdn.CakeGDNUnsupportedError(
+                raise _HostOffsetsError(
                     "cu_seqlens_cpu must hold integer offsets, not bools"
                 )
             try:
                 values.append(operator.index(value))
             except TypeError as exc:
-                raise _cake_gdn.CakeGDNUnsupportedError(
+                raise _HostOffsetsError(
                     "cu_seqlens_cpu must be a CPU integer tensor or a sequence of ints"
                 ) from exc
     offsets = tuple(int(value) for value in values)
     if len(offsets) != num_seqs + 1:
-        raise _cake_gdn.CakeGDNUnsupportedError(
+        raise _HostOffsetsError(
             f"cu_seqlens_cpu must have num_seqs + 1 = {num_seqs + 1} entries, "
             f"got {len(offsets)}"
         )
@@ -221,7 +224,7 @@ def _cake_gdn_prefill_host_offsets(
         or offsets[-1] != total_tokens
         or any(end < start for start, end in zip(offsets, offsets[1:], strict=False))
     ):
-        raise _cake_gdn.CakeGDNUnsupportedError(
+        raise _HostOffsetsError(
             "GDN non-CP prefill requires monotonic cu_seqlens spanning all input tokens"
         )
     return offsets

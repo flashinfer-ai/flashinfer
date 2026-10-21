@@ -2357,6 +2357,9 @@ class CPDeltaRuleFixupHmmaSm90(KeyedCompileMixin):
 
 
 class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
+    # setmaxnreg exists from sm_90 on; the SM80 subclass turns it off.
+    use_setmaxnreg = True
+
     def __init__(
         self,
         needs_initial_state: bool = False,
@@ -2605,7 +2608,8 @@ class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
                 seq_idx + cutlass.Int32(1), seq_end, 0, chunk_len
             )
 
-        cute.arch.setmaxregister_increase(self.registers_per_thread)
+        if cutlass.const_expr(self.use_setmaxnreg):
+            cute.arch.setmaxregister_increase(self.registers_per_thread)
         state_layout = cute.make_layout((self.rows_per_cta, self.D), stride=(self.D, 1))
         out_layout = cute.make_layout(
             (self.D, self.D, num_heads, total_cp_chunks),
