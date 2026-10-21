@@ -899,7 +899,8 @@ def test_cuda_graph_replay_changing_page_table():
     case = _make_case(
         [900, 1800, 2700, 3600], 1, 16, seed=625050, device=device, pool_pages=192
     )
-    out, _, _, g = _run(case, dense=True, graph=True)
+    # The runner outlives the graph: its workspace (partials, plan block) is what the replays read and write.
+    out, _, runner, g = _run(case, dense=True, graph=True)
     ref, _ = _reference(case)
     _check_out(out, ref)
     # New page assignment and cache contents in place; replay must follow the tables.
@@ -926,6 +927,7 @@ def test_cuda_graph_replay_changing_page_table():
     torch.cuda.synchronize()
     ref, _ = _reference(case)
     _check_out(out, ref)
+    del runner
 
 
 def test_launch_allocates_nothing_and_repeats_bitwise():

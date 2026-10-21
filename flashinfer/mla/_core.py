@@ -5039,7 +5039,9 @@ def prepare_cake_mla_nvfp4_paged_decode(
     splits the KV, the merge kernel behind it) with no CUDA allocation and no
     host synchronization, writing the caller-owned ``out`` / ``lse``.  Prepare
     a new runner when shapes, lengths, ``max_seq_len`` or the tensor bindings
-    change.  CUDA Graph ownership remains with the caller.  The call routes on
+    change.  CUDA Graph ownership remains with the caller; a captured
+    ``launch()`` replays through the runner's workspace, so the runner and
+    ``workspace_buffer`` stay alive while the graph is replayed.  The call routes on
     the device's compute capability (10.7: the Rubin package, which takes the
     host length lists and ``cp_interleave`` / ``units`` / ``pairs``; 10.0 /
     10.3: the SM100 / SM103 package).  See :func:`cake_mla_nvfp4_paged_decode`

@@ -48,6 +48,10 @@ runner = prepare_cake_mla_nvfp4_paged_decode(
 runner.launch()   # allocates nothing, synchronizes nothing: capture it in a CUDA graph
 ```
 
+A captured graph replays through the runner's workspace (the partials and the plan
+block): keep the runner, `workspace` and the bound tensors alive while the graph is
+replayed.
+
 ### Contract
 
 | Tensor | Shape | dtype |

@@ -65,7 +65,8 @@ the caller asks for no ``lse`` (the kernel always stores a row's LSE) and the
 int32 plan block ``item_table | q_indptr | row_limit``, uploaded once when the
 runner is prepared (one pinned host-to-device copy).  ``launch()`` allocates
 nothing, synchronizes nothing and reads no device memory, so it is
-CUDA-graph capturable; ``prepare`` is the host-side step (it reads the
+CUDA-graph capturable (a captured graph replays through this workspace: the
+runner outlives the graph); ``prepare`` is the host-side step (it reads the
 device length tensors when their host lists are not given, a documented
 synchronization).  Every launch goes through a ``launcher(record, values,
 grid=, device_index=)``, ``cake_jit.run_module`` by default and injectable for
