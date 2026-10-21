@@ -28,7 +28,7 @@
 
 #include <cstdint>
 
-#include "cake_deepgemm_sparse_mqa_host_common.cuh"
+#include "experimental/cake_host_common.cuh"
 
 extern "C" __global__ void kernel_cake_deepgemm_sparse_mqa_b44642d30195c7f98868(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap KV_TMA, const __grid_constant__ CUtensorMap SF_KV_TMA, uint8_t* __restrict__ KV, unsigned int* __restrict__ SF_KV, unsigned int* __restrict__ Metadata, __nv_bfloat16* __restrict__ Logits, unsigned int logits_stride, unsigned int kv_page_stride_bytes, unsigned int num_sms, unsigned int kv_ef);
 

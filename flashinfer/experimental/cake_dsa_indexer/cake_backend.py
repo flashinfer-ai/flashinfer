@@ -79,6 +79,7 @@ expect (:data:`ABI_CONTRACT`).
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
@@ -218,8 +219,10 @@ def registry_abi() -> str:
     return ABI
 
 
+@functools.cache
 def policy_for(arch: str) -> DispatchPolicy:
-    """The dispatch policy registered for ``arch``; raises when the architecture has no program."""
+    """The dispatch policy registered for ``arch``: the registry record is immutable for the life of the process, so
+    it is validated once per architecture; an architecture without programs raises on every call."""
     record = POLICY.get(arch)
     if record is None:
         raise NotImplementedError(

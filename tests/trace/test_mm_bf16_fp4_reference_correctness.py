@@ -23,6 +23,7 @@ def test_mm_bf16_fp4_reference_correctness(backend, shape_kwargs):
     unswizzles the 128x4 scale buffer).
     """
     import flashinfer
+    from flashinfer.gemm.gemm_bf16_fp4 import _cute_dsl_uses_sm100_layout
     from flashinfer.trace.templates.gemm import (
         mm_bf16_fp4_cudnn_trace,
         mm_bf16_fp4_cute_dsl_sm100_trace,
@@ -34,7 +35,7 @@ def test_mm_bf16_fp4_reference_correctness(backend, shape_kwargs):
         pytest.skip("mm_bf16_fp4 requires a CUDA device")
     if backend == "cudnn":
         tpl = mm_bf16_fp4_cudnn_trace
-    elif torch.cuda.get_device_capability() in ((10, 0), (10, 3)):
+    elif _cute_dsl_uses_sm100_layout(*torch.cuda.get_device_capability()):
         tpl = mm_bf16_fp4_cute_dsl_sm100_trace
     else:
         tpl = mm_bf16_fp4_cute_dsl_trace

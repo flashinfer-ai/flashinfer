@@ -68,7 +68,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_OUTPUT_STATS_STRIDE 64
 #define SMEM_TOTAL 158336
 #define THREADS 288
+#ifndef NUM_BLOCKS
 #define NUM_BLOCKS 2
+#endif
 #define DEFER_TMEM_STORE_WAIT 0
 #define EARLY_CONSUMED_RELEASE 0
 #define LAUNCH_MIN_BLOCKS 1
@@ -219,10 +221,18 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
     return __nv_bfloat162(raw);
 }
 
+// Shared by every record that names this translation unit in its sources: the record's
+// compile_flags may set NUM_BLOCKS (-DNUM_BLOCKS=<K>; the define above is guarded) and
+// rename the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>; every JIT library of
+// the family exports a distinct kernel); the defaults name this file's own program.
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_kimi_k3_attn_res_34ad0cffc89ae1e7aa29
+#endif
+
 extern "C" {
 
 __global__ __launch_bounds__(288, LAUNCH_MIN_BLOCKS) void
-kernel_cake_kimi_k3_attn_res_34ad0cffc89ae1e7aa29(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ prefix, __nv_bfloat16* __restrict__ delta, __nv_bfloat16* __restrict__ blocks, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ qk_weight, __nv_bfloat16* __restrict__ output_norm_weight, unsigned long long blocks_m_stride, unsigned long long blocks_k_stride, float eps, float output_norm_eps, int M)
+CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ prefix, __nv_bfloat16* __restrict__ delta, __nv_bfloat16* __restrict__ blocks, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ qk_weight, __nv_bfloat16* __restrict__ output_norm_weight, unsigned long long blocks_m_stride, unsigned long long blocks_k_stride, float eps, float output_norm_eps, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1013,6 +1023,8 @@ kernel_cake_kimi_k3_attn_res_34ad0cffc89ae1e7aa29(__nv_bfloat16* __restrict__ ou
                     }
                 }
             }
+            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
             asm volatile("barrier.sync 9, 288;" ::: "memory");
             if (consumer_warp == 0) {
                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);

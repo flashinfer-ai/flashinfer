@@ -447,6 +447,36 @@ inline FP4ScaleStrides GetFP4ScaleStrides(const TensorView& sf, flashinfer::QKVL
   return strides;
 }
 
+// Strides for the FP8 per-(token, head) float32 scale tensor. Unlike the NVFP4 scale (whose
+// innermost dim is packed and always contiguous), this tensor may be a non-contiguous view of an
+// inline slot (head-dim stride = slot size), so no innermost-stride check is applied.
+//   2D: ragged/single, NHD [total_tokens, num_kv_heads] / HND [num_kv_heads, total_tokens]
+//   3D: paged, NHD [num_pages, page_size, num_kv_heads] / HND [num_pages, num_kv_heads, page_size]
+inline FP4ScaleStrides GetFP8ScaleStrides(const TensorView& sf, flashinfer::QKVLayout kv_layout) {
+  TVM_FFI_ICHECK(sf.ndim() == 2 || sf.ndim() == 3)
+      << "FP8 scale tensor must be 2D or 3D, got " << sf.ndim() << "D";
+  TVM_FFI_ICHECK(sf.dtype().code == kDLFloat && sf.dtype().bits == 32)
+      << "FP8 scale tensor must be float32, got " << sf.dtype();
+  FP4ScaleStrides strides{0, 0, 0};
+  if (sf.ndim() == 3) {
+    strides.stride_page = static_cast<uint32_t>(sf.stride(0));
+    if (kv_layout == flashinfer::QKVLayout::kHND) {
+      strides.stride_h = static_cast<uint32_t>(sf.stride(1));
+      strides.stride_n = static_cast<uint32_t>(sf.stride(2));
+    } else {
+      strides.stride_n = static_cast<uint32_t>(sf.stride(1));
+      strides.stride_h = static_cast<uint32_t>(sf.stride(2));
+    }
+  } else if (kv_layout == flashinfer::QKVLayout::kHND) {
+    strides.stride_h = static_cast<uint32_t>(sf.stride(0));
+    strides.stride_n = static_cast<uint32_t>(sf.stride(1));
+  } else {
+    strides.stride_n = static_cast<uint32_t>(sf.stride(0));
+    strides.stride_h = static_cast<uint32_t>(sf.stride(1));
+  }
+  return strides;
+}
+
 inline ffi::Tensor alloc_tensor(tvm::ffi::Shape shape, DLDataType dtype, DLDevice device) {
   return ffi::Tensor::FromEnvAlloc(TVMFFIEnvTensorAlloc, shape, dtype, device);
 }

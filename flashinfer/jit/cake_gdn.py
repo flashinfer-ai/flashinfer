@@ -22,6 +22,7 @@ to a cubin with ``nvcc`` and embedded into the rendered host shim.
 
 from __future__ import annotations
 
+import bisect
 import functools
 import hashlib
 import json
@@ -29,6 +30,7 @@ import os
 import re
 import subprocess
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
@@ -56,6 +58,10 @@ class CakeGDNUnsupportedError(NotImplementedError):
 class CakeGDNRoute(NamedTuple):
     route_id: str
     variant_name: str
+    # The record reads int32 or int64 ``cu_seqlens`` / ``state_indices`` / ``checkpoint_cu_starts``
+    # directly (manifest field ``metadata_i64``: every sm_107a non-CP prefill record); the host
+    # passes the caller's buffers without a per-call cast.  False on every other record.
+    metadata_i64: bool = False
 
 
 def _sha256(path: Path) -> str:
@@ -352,33 +358,229 @@ def _power_of_two_log2(value: int) -> int:
     return value.bit_length() - 1 if value > 0 and value & (value - 1) == 0 else -1
 
 
-def _cake_gdn_prefill_grid_x(
-    total_tiles: int, sm_count: int, dvsplit: bool, bound_tokens: int
-) -> int:
-    """Persistent CTA count for ``total_tiles`` work tiles on ``sm_count`` SMs.
+# Host grid rule of the persistent non-CP prefill kernel.  The constants and the decision mirror the Cake
+# generator's grid rule (one source of truth; the exporter's mirror test keeps the copies identical).  Every
+# role of the kernel enumerates ``range(bid, total_tiles, gridDim.x)`` and the tiles are sequence-major
+# (tile ``t`` is sequence ``t // heads``, head ``t % heads``).  Costs are modelled in 64-token-chunk units
+# from host integers only; the kernel binary is unchanged by the grid.  The model is evaluated per sequence
+# (never per tile), so the eager launch path pays a few microseconds per call.
+SHORT_GRID = 128
+# Per-tile fixed cost (prologue, seed, final-state readout) in 64-token chunk units.
+TILE_OVERHEAD_CHUNKS = 4
+# Extra cost of a freshly dispatched CTA over a persistent tile boundary (fitted on the
+# measured Hq16/Hv32 rows: the model is within -1.5 .. +3.1 points of the measured gain).
+DISPATCH_OVERHEAD_CHUNKS = 1
+# One CTA per tile only when the modelled critical path shrinks by at least this.
+RAGGED_MIN_GAIN_PERCENT = 4
 
-    Mirrors the Cake generator program's ``_select_persistent_grid_ctas``
-    exactly; the exporter's mirror test keeps the copies identical.  ``bound_tokens`` is an
-    upper bound on the longest sequence (exact from ``cu_seqlens_cpu``, else
-    the ``max_seqlen`` hint, else the packed token count); it is part of the
-    contract signature and validated by the caller, but the rule below does
-    not depend on it, so a loose bound never changes the grid and the host
-    shim's ``0 < grid_x <= total_tiles`` holds for every input.  DV-split
-    launches and at most 128 tiles take one CTA per tile up to the SM count;
-    otherwise the residency cap G in {128, sm_count} with the smaller per-CTA
-    tile quantum ceil(total_tiles / G) wins and ties keep 128 (grid A/B:
-    1024-tile rows 9-10 % faster on 152 CTAs, 512/256-tile rows ~2 % faster
-    on 128).  The launch (``gdn_prefill.py``) and the variant
-    resolver below (the gate-stream rule) share this one copy.
-    """
 
-    if dvsplit or total_tiles <= 128:
+def _prefill_residency_grid(total_tiles: int, sm_count: int, dvsplit: bool) -> int:
+    """The residency rule: one CTA per tile up to the SM count for DV-split launches or at most
+    128 tiles; otherwise the cap G in {128, sm_count} with the smaller per-CTA tile quantum
+    ceil(total_tiles / G) wins and ties keep 128."""
+
+    if dvsplit or total_tiles <= SHORT_GRID:
         return min(sm_count, total_tiles)
-    g_short = min(128, total_tiles)
+    g_short = min(SHORT_GRID, total_tiles)
     g_sm = min(sm_count, total_tiles)
     if -(-total_tiles // g_sm) < -(-total_tiles // g_short):
         return g_sm
     return g_short
+
+
+def _prefill_tile_chunks(seq_len: int) -> int:
+    """The kernel's chunk count for one sequence: ``2 * ceil(seq_len / 128)`` 64-token chunks
+    (0 for an empty one)."""
+
+    return 2 * (-(-max(int(seq_len), 0) // 128))
+
+
+def _prefill_seq_costs(seq_lens: Sequence[int]) -> list[int]:
+    """One entry per sequence: the cost of each of its tiles (its chunks plus the per-tile
+    overhead); the ``heads`` tiles of a sequence share it."""
+
+    return [_prefill_tile_chunks(length) + TILE_OVERHEAD_CHUNKS for length in seq_lens]
+
+
+def _prefill_strided_critical_path(
+    seq_costs: Sequence[int], heads: int, grid: int
+) -> int:
+    """Persistent schedule: CTA ``b`` runs tiles ``b, b + grid, ...`` back to back; the longest CTA.
+
+    The ``heads`` tiles of sequence ``s`` are the index range ``[s * heads, (s + 1) * heads)``:
+    every CTA gets ``heads // grid`` of them and the ``heads % grid`` residues from
+    ``(s * heads) % grid`` on (wrapping at ``grid``) one more.  The per-CTA sums are therefore a
+    sweep over the 2S range endpoints instead of a pass over the tiles; the maximum of the
+    piecewise-constant sum sits at an endpoint.
+    """
+
+    full, part = divmod(heads, grid)
+    base = full * sum(seq_costs)
+    if part == 0:
+        return base
+    events = []
+    for index, cost in enumerate(seq_costs):
+        start = (index * heads) % grid
+        end = start + part
+        events.append((start, cost))
+        if end <= grid:
+            events.append((end, -cost))
+        else:
+            events.append((0, cost))
+            events.append((end - grid, -cost))
+    events.sort()
+    best = level = 0
+    i, n = 0, len(events)
+    while i < n:
+        pos = events[i][0]
+        while i < n and events[i][0] == pos:
+            level += events[i][1]
+            i += 1
+        if level > best:
+            best = level
+    return base + best
+
+
+def _prefill_dispatch_critical_path(
+    seq_costs: Sequence[int], heads: int, sm_count: int
+) -> int:
+    """One CTA per tile: the tiles are dispatched in index order, one resident CTA per SM, each
+    SM takes the next CTA when free, and every CTA pays ``DISPATCH_OVERHEAD_CHUNKS`` on top of
+    its tile cost -- the makespan of the in-order list schedule on ``min(sm_count, tiles)``
+    machines.
+
+    Exact and group-wise.  The machines' free times are a sorted run-length multiset; a tile
+    starts at the smallest free time.  The ``heads`` equal-cost tiles of one sequence are taken
+    in chunks: the smallest free times within ``p`` (the tile's processing time) of the smallest
+    one.  The completions of such a chunk, all at least ``smallest + p``, cannot precede any
+    start of the chunk, so the chunk reproduces the per-tile schedule exactly (a tie gives the
+    same values either way); its completions are merged back as runs.  A batch of S sequences
+    costs O(S) chunks unless the free times are spread wider than ``p``.
+    """
+
+    total = heads * len(seq_costs)
+    machines = max(1, min(sm_count, total))
+    vals = [0]
+    cnts = [machines]
+    finish = 0
+    for cost in seq_costs:
+        p = cost + DISPATCH_OVERHEAD_CHUNKS
+        need = heads
+        while need:
+            limit = vals[0] + p
+            taken_v: list[int] = []
+            taken_n: list[int] = []
+            i = 0
+            while need and i < len(vals) and vals[i] <= limit:
+                n = cnts[i]
+                taken_v.append(vals[i])
+                if n <= need:
+                    taken_n.append(n)
+                    need -= n
+                    i += 1
+                else:
+                    taken_n.append(need)
+                    cnts[i] = n - need
+                    need = 0
+            if i:
+                del vals[:i]
+                del cnts[:i]
+            done = taken_v[-1] + p
+            if done > finish:
+                finish = done
+            for v, n in zip(taken_v, taken_n, strict=True):
+                w = v + p
+                j = bisect.bisect_left(vals, w)
+                if j < len(vals) and vals[j] == w:
+                    cnts[j] += n
+                else:
+                    vals.insert(j, w)
+                    cnts.insert(j, n)
+    return finish
+
+
+@functools.lru_cache(maxsize=4096)
+def _cake_gdn_prefill_grid_x(
+    total_tiles: int,
+    sm_count: int,
+    dvsplit: bool,
+    bound_tokens: int,
+    host_seq_lens: tuple[int, ...] | None = None,
+) -> int:
+    """Persistent CTA count for ``total_tiles`` work tiles on ``sm_count`` SMs.
+
+    Mirrors the Cake generator's grid rule exactly; the exporter's mirror test keeps the
+    copies identical.  Host integers only: nothing is read back from the device and the
+    kernel binary is unchanged by the grid.  The launch (``gdn_prefill.py``) and the variant
+    resolver below (the gate-stream rule) share this one copy.
+
+    The residency rule (``_prefill_residency_grid``): DV-split launches and at most 128
+    tiles take one CTA per tile up to the SM count; otherwise the cap G in {128, sm_count}
+    with the smaller per-CTA tile quantum ceil(total_tiles / G) wins and ties keep 128
+    (grid A/B: 1024-tile rows 9-10 % faster on 152 CTAs, 512/256-tile rows ~2 % faster
+    on 128).
+
+    The ragged-batch route: ``host_seq_lens`` (the per-sequence token counts in
+    ``cu_seqlens`` order, known only from ``cu_seqlens_cpu``) lets the rule model both
+    schedules in 64-token-chunk units.  The persistent schedule runs tile ``t`` on CTA
+    ``t % grid`` (``_prefill_strided_critical_path``), so a ragged full-DV batch can chain
+    a long tile and further tiles on one CTA while other CTAs idle; with one CTA per tile
+    the hardware dispatches the CTAs in index order onto the free SMs
+    (``_prefill_dispatch_critical_path``).  The rule launches ``total_tiles`` CTAs when the
+    modelled critical path shrinks by at least ``RAGGED_MIN_GAIN_PERCENT``; the grid may
+    then exceed the SM count (one resident CTA per SM).  Equal-length batches never route:
+    with one cost c per tile the strided path is rounds(grid) * c and the dispatched one
+    ceil(tiles / M) * (c + 1), and rounds(grid) <= ceil(tiles / M) by the choice of the
+    residency grid, so they return the residency grid without a model.  Slightly ragged
+    and long-last batches keep the residency grid, as do DV-split launches, batches whose
+    residency grid already gives one CTA per tile and length lists that do not divide
+    ``total_tiles``; without ``host_seq_lens`` the residency rule decides.
+
+    Cost: O(S) for a batch of S sequences in the common case -- the per-sequence costs, the
+    strided path as an endpoint sweep, then exact bounds on the dispatched makespan (at
+    least the longest tile and the work per machine; at most the work per machine plus the
+    longest tile's share of the other machines, the list-scheduling bound) that settle most
+    batches; only the rest run the group-wise dispatch simulation.  The result is memoised
+    on its arguments (``host_seq_lens`` must be a tuple), so the other layers of a step pay
+    a lookup.
+
+    ``bound_tokens`` is an upper bound on the longest sequence (exact from
+    ``cu_seqlens_cpu``, else the ``max_seqlen`` hint, else the packed token count); it is
+    part of the contract signature and validated by the caller, but the rule does not
+    depend on it, so a loose bound never changes the grid.  The result is the residency
+    grid or ``total_tiles``, so the host shim's ``0 < grid_x <= total_tiles`` holds for
+    every input.
+
+    The launch calls this rule with the device's SM count, the resolver with the
+    architecture's nominal active-cluster count.  Near the gain margin the two can differ
+    on a device that exposes fewer SMs than the nominal count (a GB300 with 152 of the
+    nominal 160): the launch grid is authoritative for the workspace; the resolver only
+    picks the body.
+    """
+
+    grid = _prefill_residency_grid(total_tiles, sm_count, dvsplit)
+    if dvsplit or host_seq_lens is None or grid >= total_tiles:
+        return grid
+    num_seqs = len(host_seq_lens)
+    if num_seqs == 0 or total_tiles % num_seqs:
+        return grid
+    costs = _prefill_seq_costs(host_seq_lens)
+    if min(costs) == max(costs):
+        return grid
+    heads = total_tiles // num_seqs
+    strided = _prefill_strided_critical_path(costs, heads, grid)
+    machines = max(1, min(sm_count, total_tiles))
+    longest = max(costs) + DISPATCH_OVERHEAD_CHUNKS
+    work = heads * (sum(costs) + num_seqs * DISPATCH_OVERHEAD_CHUNKS)
+    gain = strided * (100 - RAGGED_MIN_GAIN_PERCENT)
+    if gain < max(longest, -(-work // machines)) * 100:
+        return grid
+    if gain * machines >= (work + longest * (machines - 1)) * 100:
+        return total_tiles
+    dispatch = _prefill_dispatch_critical_path(costs, heads, sm_count)
+    if gain >= dispatch * 100:
+        return total_tiles
+    return grid
 
 
 # Mirror of the Cake program rule ``gate_stream_flat_default`` (exporter ``_prefill_plan``), same constants: the
@@ -470,6 +672,71 @@ def _serves_arch(record: dict[str, Any], arch: CakeGDNArch) -> bool:
     )
 
 
+# Rubin (sm_107a) twins of the sequential (non-CP) prefill kernel, routed per (architecture,
+# shipped schedule): the dvsplit fp32-state schedules run the `l7_vec2` body, the dvsplit
+# bf16-state schedules the `l7b_vec2lp` body (8-byte state I/O on the initial-state
+# load, the final-state store and the checkpoint stores; every arithmetic operation keeps its
+# operands, order and rounding, so the output is bitwise identical to the shipped body).  An
+# indexed-state plan (`USE_STATE_INDICES`) traces its own `_indexed` schedule, keyed as such.
+# Every other shipped schedule runs the `i64meta` body on sm_107a (the per-architecture default,
+# `CAKE_GDN_PREFILL_SEQ_DEFAULT_BODIES`): the same kernel reading int32 or int64 launch metadata
+# directly, so the host passes the caller's `cu_seqlens` / `state_indices` /
+# `checkpoint_cu_starts` without a per-call cast; every sm_107a twin (the routed bodies too)
+# carries that contract (record field `metadata_i64`).  No sm_107a record is a base body.
+# Mirrors `PREFILL_SEQ_ARCH_BODIES` / `PREFILL_SEQ_DEFAULT_BODIES` in
+# the Cake prefill kernel program (the Cake tree cross-checks this copy).
+_SM107A_SEQ_TWINS: dict[str, tuple[str, ...]] = {
+    # fp32-state dvsplit schedules: 8-byte fp32 state I/O
+    "l7_vec2": (
+        "dvsplit",
+        "dvsplit_f16io",
+        "dvsplit_initial",
+        "dvsplit_initial_f16io",
+        "dvsplit_initial_f16io_gatepipe4",
+    ),
+    # bf16 / f16-state dvsplit schedules with shipped records (the bf16 one indexed or
+    # not): the same width lever on the low-precision state loads and stores,
+    # alignment-guarded on the indexed plans
+    "l7b_vec2lp": (
+        "dvsplit_initial_bf16state",
+        "dvsplit_initial_bf16state_indexed",
+    ),
+    # The f16-state schedule runs the smem-staged final-state store twin
+    # (`vec2_state_io_lp` + `st2_stage`) on CC 10.7; a per-plan record whose outputs
+    # are bitwise identical to the shipped body.
+    "st2s_vec2lp": ("dvsplit_initial_f16state",),
+    # The fp8-state (e4m3 / e5m2) schedules run the smem-staged packed final-state store
+    # twin (`st8_stage`) on CC 10.7; per-plan records whose
+    # outputs are bitwise identical to the `i64meta` body they supersede.
+    "st8s_pack": ("dvsplit_initial_e4m3state", "dvsplit_initial_e5m2state"),
+}
+CAKE_GDN_PREFILL_SEQ_ARCH_BODIES: dict[tuple[str, str], str] = {
+    ("sm_107a", f"flashinfer_blackwell_gdn_prefill_{suffix}"): body
+    for body, suffixes in _SM107A_SEQ_TWINS.items()
+    for suffix in suffixes
+}
+# The body of every shipped schedule the table above does not route, per architecture
+# (absent = the shipped schedule itself).
+CAKE_GDN_PREFILL_SEQ_DEFAULT_BODIES: dict[str, str] = {"sm_107a": "i64meta"}
+
+
+def cake_gdn_prefill_seq_schedule(
+    arch: CakeGDNArch, schedule_attr: str, *, use_state_indices: bool
+) -> str:
+    """The sequential prefill schedule `arch` runs for the shipped `schedule_attr`.
+
+    The shipped schedule itself, or its per-architecture twin
+    (`<schedule>_sm107a_<body>`, a record of its own in the manifest): the body
+    `CAKE_GDN_PREFILL_SEQ_ARCH_BODIES` routes, else the architecture's default
+    body (`CAKE_GDN_PREFILL_SEQ_DEFAULT_BODIES`; on sm_107a every schedule is a twin).
+    """
+    symbol = f"{schedule_attr}_indexed" if use_state_indices else schedule_attr
+    body = CAKE_GDN_PREFILL_SEQ_ARCH_BODIES.get(
+        (arch, symbol), CAKE_GDN_PREFILL_SEQ_DEFAULT_BODIES.get(arch, "base")
+    )
+    return schedule_attr if body == "base" else f"{schedule_attr}_sm107a_{body}"
+
+
 def _variant_for(
     *,
     arch: CakeGDNArch,
@@ -546,6 +813,7 @@ def select_cake_gdn_prefill_variant(
     checkpoint_every_n_tokens: int,
     use_state_indices: bool,
     gates_present: bool,
+    host_seq_lens: tuple[int, ...] | None = None,
 ) -> CakeGDNRoute:
     """Resolve host-visible non-CP metadata to one frozen GDN non-CP variant.
 
@@ -567,6 +835,17 @@ def select_cake_gdn_prefill_variant(
     (BF16 I/O and state, heads (4, 4, 8), interval 64, indexed initial and
     final state, DV-split); ``cu_seqlens`` / ``checkpoint_cu_starts``
     consistency is a caller precondition the kernel guards on the device.
+
+    ``host_seq_lens`` is the optional host copy of the per-sequence lengths
+    (a tuple in ``cu_seqlens`` order -- the resolver is memoised, so it must
+    be hashable), derived from ``cu_seqlens_cpu`` only.  It enables the
+    ragged-batch launch grid of ``_cake_gdn_prefill_grid_x`` so the
+    gate-stream twin follows the routed grid.  The resolver evaluates the
+    grid rule with the architecture's nominal active-cluster count while
+    the launch uses the device's SM count; near the gain margin the two can
+    differ on a device that exposes fewer SMs than the nominal count (a
+    GB300 with 152 of the nominal 160) -- the launch grid is authoritative
+    for the workspace, the resolver only picks the body.
     """
 
     if arch not in _ARCH_ACTIVE_CLUSTERS:
@@ -714,10 +993,13 @@ def select_cake_gdn_prefill_variant(
         and num_o_heads == min_heads
     )
     # Mirror of the Cake program rule ``gate_stream_flat_default`` (exporter ``_prefill_plan``): the launch grid
-    # from the architecture's active-cluster count (the same host-static count that decides ``dvsplit``), then the
-    # ``_gatestream_full`` twin for the full-DV stateful bases whose CTAs own several short tiles.
+    # from the architecture's active-cluster count (the same host-static count that decides ``dvsplit``) and
+    # the host sequence lengths when the caller gave them (the ragged-batch route), then the
+    # ``_gatestream_full`` twin for the full-DV stateful bases whose CTAs own several short tiles.  The launch
+    # evaluates the same rule with the device's SM count; near the gain margin the two can differ (a GB300
+    # exposing 152 of the nominal 160 SMs) and the launch grid is authoritative for the workspace.
     grid_x = _cake_gdn_prefill_grid_x(
-        total_tiles, _ARCH_ACTIVE_CLUSTERS[arch], dvsplit, max_seq_len
+        total_tiles, _ARCH_ACTIVE_CLUSTERS[arch], dvsplit, max_seq_len, host_seq_lens
     )
     gate_stream_full = (
         not single_chunk
@@ -755,10 +1037,22 @@ def select_cake_gdn_prefill_variant(
             gate_stream_full=gate_stream_full,
         )
 
-    schedule_attr = _schedule_attr(gate_stream_full=gate_stream_full)
+    # The sm_107a sequential twin of the resolved schedule (`cake_gdn_prefill_seq_schedule`): a
+    # record of its own, applied to the schedule the base rule settles on -- including the
+    # gate-stream twin, whose `_sm107a_i64meta` record is the one that exists on sm_107a (the
+    # gate-stream base record lists the other architectures only), so the gate-stream
+    # fallback below probes the twin-resolved name.
+    def _seq_schedule_attr(*, gate_stream_full: bool) -> str:
+        return cake_gdn_prefill_seq_schedule(
+            arch,
+            _schedule_attr(gate_stream_full=gate_stream_full),
+            use_state_indices=use_state_indices,
+        )
+
+    schedule_attr = _seq_schedule_attr(gate_stream_full=gate_stream_full)
     if (
         gate_stream_full
-        and schedule_attr.endswith("_gatestream_full")
+        and "_gatestream_full" in schedule_attr
         and not _has_variant(
             arch=arch,
             domain="prefill",
@@ -772,7 +1066,7 @@ def select_cake_gdn_prefill_variant(
         # base record, exactly as the route did before the twin existed; only a missing base
         # fails closed below.
         gate_stream_full = False
-        schedule_attr = _schedule_attr(gate_stream_full=False)
+        schedule_attr = _seq_schedule_attr(gate_stream_full=False)
     record = _variant_for(
         arch=arch,
         domain="prefill",
@@ -786,7 +1080,9 @@ def select_cake_gdn_prefill_variant(
     else:
         route = "flashinfer.gdn_prefill.noncp"
     return CakeGDNRoute(
-        f"{route}.{'dvsplit' if dvsplit else 'full_dv'}", record["name"]
+        f"{route}.{'dvsplit' if dvsplit else 'full_dv'}",
+        record["name"],
+        bool(record.get("metadata_i64", False)),
     )
 
 
@@ -835,7 +1131,11 @@ def cake_gdn_prefill_geometries(
     # checkpoints); the geometry terms of the sm_103a rule are the twin
     # record's own specializations.  The other performance twins (gatepipe4,
     # fullgrid_vhold, gate-stream full) are exported for exactly the geometry
-    # triples of their base record.
+    # triples of their base record.  On an architecture whose sequential rule
+    # replaces every base by a per-architecture twin record (sm_107a,
+    # `cake_gdn_prefill_seq_schedule`: the base record does not list it), the
+    # twin records enumerate the contract, so every expected schedule is read
+    # through that rule.
     sm100a_state_inp_late = (
         arch == "sm_100a"
         and dvsplit
@@ -852,17 +1152,21 @@ def cake_gdn_prefill_geometries(
     )
 
     def _source(*, role_rebalanced: bool) -> str:
-        schedule_attr = _prefill_schedule_attr(
-            dvsplit=dvsplit,
-            use_initial_state=use_initial_state,
-            io_dtype=io_dtype,
-            state_dtype=state_dtype,
-            single_chunk=False,
-            gatepipe4=False,
-            fullgrid_vhold=False,
-            sm100a_state_inp_late=sm100a_state_inp_late,
-            sm103a_role_rebalanced=role_rebalanced,
-            gate_stream_full=False,
+        schedule_attr = cake_gdn_prefill_seq_schedule(
+            arch,
+            _prefill_schedule_attr(
+                dvsplit=dvsplit,
+                use_initial_state=use_initial_state,
+                io_dtype=io_dtype,
+                state_dtype=state_dtype,
+                single_chunk=False,
+                gatepipe4=False,
+                fullgrid_vhold=False,
+                sm100a_state_inp_late=sm100a_state_inp_late,
+                sm103a_role_rebalanced=role_rebalanced,
+                gate_stream_full=False,
+            ),
+            use_state_indices=False,
         )
         return f"flashinfer.cake_gdn.generated.prefill:{schedule_attr}"
 
@@ -983,8 +1287,10 @@ def cake_gdn_bf16_t1_route(
 # `tile16_vpre` schedule (every draft token's v values staged in shared memory ahead
 # of the serial recurrence, fully unrolled token loop; bitwise-identical output),
 # B200/B300 keep the shipped body.  Mirrors
-# loom.examples.weave.gdn_decode_pretranspose.select_bf16_verify_tile16_body.
-CAKE_GDN_BF16_VERIFY_TILE16_ARCH_BODIES: dict[str, str] = {"sm_107a": "tile16_vpre"}
+# the Cake decode kernel program's `select_bf16_verify_tile16_body`.
+CAKE_GDN_BF16_VERIFY_TILE16_ARCH_BODIES: dict[str, str] = {
+    "sm_107a": "tile16_vpre_es_pro"
+}
 
 
 def cake_gdn_bf16_verify_tile16_schedule(arch: CakeGDNArch) -> str:
@@ -999,17 +1305,33 @@ def cake_gdn_bf16_verify_tile16_schedule(arch: CakeGDNArch) -> str:
 # barrier, token loop unrolled; bitwise-identical output), every other
 # architecture and every T=1 band row the shipped wide body.  Mirrors
 # `BF16_WIDE_ARCH_BODIES` / `select_bf16_wide_body` of the Cake exporter.
-CAKE_GDN_BF16_WIDE_ARCH_BODIES: dict[str, str] = {"sm_107a": "wide128_vpre"}
+# sm_107a takes the `wide128_vpre_xchg` twin (exchange-based
+# output path of `wide128_vpre`; bitwise-identical output) for the T >= 2 wide rows.
+CAKE_GDN_BF16_WIDE_ARCH_BODIES: dict[str, str] = {"sm_107a": "wide128_vpre_xchg"}
 # The promoted fp32-state MTP update body (B4 T4 with the intermediate-state cache,
 # `..._mtp_t4_splitv8`) is routed per architecture as well: Rubin (sm_107a) runs its
 # `_pro` twin (producer phase parallel over the draft tokens, every independent global
 # load issued before the first reduction; bitwise-identical output), B200 / B300 keep
-# the shipped body.  The verify body `..._mtp_t2_inline_tile8` is the same everywhere.
-# Mirrors the splitv8 entry of `FP32_MTP_ARCH_BODIES` / `select_fp32_mtp_body` in
-# loom.examples.weave.gdn_decode_pretranspose; keyed by architecture here because the
-# table applies to that one base (the resolver consults it for the splitv8 row only).
-CAKE_GDN_FP32_MTP_ARCH_BODIES: dict[str, str] = {
-    "sm_107a": "gdn_decode_pretranspose_mtp_t4_splitv8_pro"
+# the shipped body.  The verify body `..._mtp_t2_inline_tile8` runs its `_bb` twin on
+# Rubin as well (softplus branch as a select, cache-row moves hoisted out of the
+# slot-valid branch, merged output-store conditions; bitwise-identical output).
+# Mirrors `FP32_MTP_ARCH_BODIES` / `select_fp32_mtp_body` in
+# the Cake decode kernel program, keyed by (architecture, base schedule).
+CAKE_GDN_FP32_MTP_ARCH_BODIES: dict[tuple[str, str], str] = {
+    (
+        "sm_107a",
+        "gdn_decode_pretranspose_mtp_t4_splitv8",
+    ): "gdn_decode_pretranspose_mtp_t4_splitv8_pro",
+    # Adopted 2026-10-18, per record: the fp32
+    # MTP tile64 record runs its ``_sl2`` state-load twin on sm_107a.
+    (
+        "sm_107a",
+        "gdn_decode_pretranspose_mtp_t4_splitv2_tile64",
+    ): "gdn_decode_pretranspose_mtp_t4_splitv2_tile64_sl2",
+    (
+        "sm_107a",
+        "gdn_decode_pretranspose_mtp_t2_inline_tile8",
+    ): "gdn_decode_pretranspose_mtp_t2_inline_tile8_bb",
 }
 # The fp32-state T=1 pretranspose body (`..._splitv8`, route `indexed_fp32_t1_splitv8`)
 # is routed per architecture by the state-head count B*HV: Rubin (sm_107a) runs the
@@ -1019,12 +1341,21 @@ CAKE_GDN_FP32_MTP_ARCH_BODIES: dict[str, str] = {
 # on R200 from 256 through 2048 state heads, 11-17 % slower at 32 and 128.  B200 / B300
 # keep `splitv8` at every count.  Mirrors `FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS` /
 # `FP32_T1_SPLITV8_ARCH_BANDS` / `select_fp32_t1_splitv8_route` in
-# loom.examples.weave.gdn_decode_pretranspose (the Cake tree cross-checks these copies).
+# the Cake decode kernel program (the Cake tree cross-checks these copies).
 CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS = 256
+# Rubin register-direct body `splitv8_reg` (eight CTAs per state head, state rows loaded
+# straight into registers) in the band 64 < state heads < 256; `splitv8` up to 64 heads,
+# the `splitv8_tilev32` twin from 256 on.  Bitwise-identical output, only the state load
+# path changes.  Mirrors `FP32_T1_SPLITV8_REG_MIN_STATE_HEADS`.
+# The band takes the `splitv8_reg_ost` twin of `splitv8_reg`
+# (same loads, FMA and reduction order; the warp's four output rows are remapped contiguous so
+# lane 0 issues one 64-bit store instead of four scalar bf16 stores).  Bitwise-identical output.
+CAKE_GDN_FP32_T1_SPLITV8_REG_MIN_STATE_HEADS = 64
 # (largest state-head count of the band or None for the open last band, body)
 CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     "sm_107a": (
-        (CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS - 1, "splitv8"),
+        (CAKE_GDN_FP32_T1_SPLITV8_REG_MIN_STATE_HEADS, "splitv8"),
+        (CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS - 1, "splitv8_reg_ost"),
         (None, "splitv8_tilev32"),
     ),
 }
@@ -1034,6 +1365,7 @@ CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS: dict[str, tuple[tuple[int | None, str], ...
 CAKE_GDN_FP32_T1_CTAS_PER_STATE: dict[str, int] = {
     "gdn_decode_pretranspose_splitv8": 8,
     "gdn_decode_pretranspose_splitv8_tilev32": 4,
+    "gdn_decode_pretranspose_splitv8_reg_ost": 8,  # replaces the unrouted splitv8_reg entry
 }
 
 
@@ -1060,6 +1392,94 @@ def cake_gdn_fp32_t1_ctas_per_state(variant_name: str) -> int:
     if ctas_per_state is None:
         raise CakeGDNUnsupportedError(
             f"{variant_name!r} ({schedule}) is not an fp32-state T=1 pretranspose record"
+        )
+    return ctas_per_state
+
+
+# The fp32-state T=1 K-major (nontranspose) bodies (`direct_fp32_t1_nontranspose_*`) are
+# routed per (architecture, rule band): the shipped `_small` body (eight CTAs per state
+# head) below 32 batch rows and the shipped large body (one CTA per state head) from 32
+# on, except on Rubin (sm_107a), which runs the `mid4` twin in the small band -- four CTAs
+# per state head, each owning one Kx32 value panel over 128-byte state segments -- and the
+# `tilev32_x2` twin in the large band's wave-fit range 32 <= B < 35 -- two CTAs per state
+# head, each owning half of the V ring tiles (the single-CTA grid of 1024 .. 1088 CTAs on
+# 212 SMs becomes 2048 .. 2176 CTAs of half the work; the split pays on this edge of the
+# band only).  Both twins keep the per-lane statements and the accumulation order:
+# bitwise-identical output and state.  B200 / B300 keep the shipped bodies.  The rule
+# band folds onto the band of the shipped body / route id through the `_RULE_BANDS`
+# table, so route ids keep naming `small` / `large` (plus the twin suffix).  Mirrors
+# `NONTRANSPOSE_SMALL_BATCH_THRESHOLD` / `NONTRANSPOSE_LARGE_WAVEFIT_BATCH_LIMIT` /
+# `NONTRANSPOSE_FP32_T1_RULE_BANDS` / `NONTRANSPOSE_FP32_T1_ARCH_BODIES` /
+# `NONTRANSPOSE_FP32_T1_CTAS_PER_STATE` / `select_nontranspose_fp32_t1_body` in
+# the Cake decode kernel program (the Cake tree cross-checks these copies).
+CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_BATCH_THRESHOLD = 32
+CAKE_GDN_NONTRANSPOSE_FP32_T1_LARGE_WAVEFIT_BATCH_LIMIT = (
+    37  # 35 -> 37; see the Cake launcher
+)
+CAKE_GDN_NONTRANSPOSE_FP32_T1_BASE_SCHEDULES: dict[str, str] = {
+    "small": "gdn_decode_nontranspose_fp32_t1_small",
+    "large": "gdn_decode_nontranspose_fp32_t1",
+}
+# (rule band -> band of the shipped body and of the route id)
+CAKE_GDN_NONTRANSPOSE_FP32_T1_RULE_BANDS: dict[str, str] = {
+    "small": "small",
+    "large_wavefit": "large",
+    "large": "large",
+}
+# ((architecture, rule band) -> schedule of the twin the rule routes there)
+CAKE_GDN_NONTRANSPOSE_FP32_T1_ARCH_BODIES: dict[tuple[str, str], str] = {
+    ("sm_107a", "small"): "gdn_decode_nontranspose_fp32_t1_mid4",
+    ("sm_107a", "large_wavefit"): "gdn_decode_nontranspose_fp32_t1_tilev32_x2",
+    # Adopted 2026-10-18: the large band
+    # (B >= 37) runs the ``hqsplit`` recurrence twin on sm_107a.
+    ("sm_107a", "large"): "gdn_decode_nontranspose_fp32_t1_hqsplit",
+}
+# CTAs per state head each nontranspose fp32 T=1 body launches (the host grid is B * HV
+# times this), keyed by the record's schedule.
+CAKE_GDN_NONTRANSPOSE_FP32_T1_CTAS_PER_STATE: dict[str, int] = {
+    "gdn_decode_nontranspose_fp32_t1_small": 8,
+    "gdn_decode_nontranspose_fp32_t1": 1,
+    "gdn_decode_nontranspose_fp32_t1_mid4": 4,
+    "gdn_decode_nontranspose_fp32_t1_tilev32_x2": 2,
+    "gdn_decode_nontranspose_fp32_t1_hqsplit": 1,
+}
+
+
+def cake_gdn_nontranspose_fp32_t1_rule_band(batch_size: int) -> str:
+    """Rule band of ``batch_size`` rows: ``small`` (B < 32), ``large_wavefit`` (32 <= B < 37) or ``large``."""
+
+    if int(batch_size) < CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_BATCH_THRESHOLD:
+        return "small"
+    if int(batch_size) < CAKE_GDN_NONTRANSPOSE_FP32_T1_LARGE_WAVEFIT_BATCH_LIMIT:
+        return "large_wavefit"
+    return "large"
+
+
+def cake_gdn_nontranspose_fp32_t1_route(
+    batch_size: int, arch: CakeGDNArch
+) -> tuple[str, str]:
+    """``(schedule, route id)`` of the fp32-state T=1 K-major decode for ``batch_size`` rows on ``arch``."""
+
+    rule_band = cake_gdn_nontranspose_fp32_t1_rule_band(batch_size)
+    band = CAKE_GDN_NONTRANSPOSE_FP32_T1_RULE_BANDS[rule_band]
+    base = CAKE_GDN_NONTRANSPOSE_FP32_T1_BASE_SCHEDULES[band]
+    schedule = CAKE_GDN_NONTRANSPOSE_FP32_T1_ARCH_BODIES.get((arch, rule_band), base)
+    route = f"flashinfer.gdn_decode.direct_fp32_t1_nontranspose_{band}"
+    if schedule != base:
+        route += "_" + schedule.removeprefix("gdn_decode_nontranspose_fp32_t1_")
+    return schedule, route
+
+
+@functools.cache
+def cake_gdn_nontranspose_fp32_t1_ctas_per_state(variant_name: str) -> int:
+    """CTAs per state head the fp32-state T=1 K-major record ``variant_name`` launches (read from its schedule)."""
+
+    record = _kernel_record(variant_name)
+    schedule = record["source_schedule"].rsplit(":", 1)[-1]
+    ctas_per_state = CAKE_GDN_NONTRANSPOSE_FP32_T1_CTAS_PER_STATE.get(schedule)
+    if ctas_per_state is None:
+        raise CakeGDNUnsupportedError(
+            f"{variant_name!r} ({schedule}) is not an fp32-state T=1 nontranspose record"
         )
     return ctas_per_state
 
@@ -1352,9 +1772,7 @@ def select_cake_gdn_decode_variant(
                 "B4/B16/B64 T4 update rows"
             )
         base_attr, route = selected
-        schedule_attr = base_attr
-        if base_attr == "gdn_decode_pretranspose_mtp_t4_splitv8":
-            schedule_attr = CAKE_GDN_FP32_MTP_ARCH_BODIES.get(arch, base_attr)
+        schedule_attr = CAKE_GDN_FP32_MTP_ARCH_BODIES.get((arch, base_attr), base_attr)
         mtp_specializations: dict[str, int | float] = {
             "H": num_q_heads,
             "HV": num_v_heads,
@@ -1392,12 +1810,10 @@ def select_cake_gdn_decode_variant(
             "splitv8"
         )
     elif layout == "nontranspose":
-        if batch_size < 32:
-            schedule_attr = "gdn_decode_nontranspose_fp32_t1_small"
-            route = "flashinfer.gdn_decode.direct_fp32_t1_nontranspose_small"
-        else:
-            schedule_attr = "gdn_decode_nontranspose_fp32_t1"
-            route = "flashinfer.gdn_decode.direct_fp32_t1_nontranspose_large"
+        # The body follows the batch band per architecture (sm_107a runs the `mid4`
+        # twin below 32 rows); the route id names a twin and the host reads the
+        # record's CTAs per state head for the grid.
+        schedule_attr, route = cake_gdn_nontranspose_fp32_t1_route(batch_size, arch)
     else:
         raise CakeGDNUnsupportedError(f"unsupported decode state layout {layout}")
     record = _variant_for(
@@ -1428,6 +1844,7 @@ __all__ = [
     "CakeGDNUnsupportedError",
     "arch_for_compute_capability",
     "cake_gdn_prefill_geometries",
+    "cake_gdn_prefill_seq_schedule",
     "compile_cake_gdn_cubin",
     "load_cake_gdn_kernel",
     "render_cake_gdn_host_shim",

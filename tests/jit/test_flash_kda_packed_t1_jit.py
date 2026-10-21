@@ -136,6 +136,7 @@ def test_flash_kda_packed_t1_jit_spec_and_frozen_body(
     assert "#define CAKE_KDA_PACKED_T1_THREADS 32" in binding_text
     assert "#define CAKE_KDA_PACKED_T1_SMEM_BYTES 0" in binding_text
     assert "#define CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 0" in binding_text
+    assert "#define CAKE_KDA_PACKED_T1_PAIR_PUBLISH 0" in binding_text
     assert "#define CAKE_KDA_PACKED_T1_LEGACY_ABI 1" in binding_text
     assert '#include "cake_kda_packed_t1_binding.cuh"' in binding_text
     flash_kda_packed_t1.gen_flash_kda_packed_t1_module.cache_clear()

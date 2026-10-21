@@ -10,6 +10,16 @@ import torch.distributed as dist
 from .kernel_helpers import compute_megamoe_reference_sm107_block_scaled
 
 
+def _launch_scalar(symm_buffer, name):
+    """The NVFP4 epilogue scalar tensor the next launch uses: the per-call tensor bound
+    with ``bind_scalars`` (the workspace tensor is then never written) or the
+    workspace's own tensor."""
+    get = getattr(symm_buffer, "_scalar_tensor", None)
+    if get is not None and getattr(symm_buffer, name, None) is not None:
+        return get(name)
+    return getattr(symm_buffer, name, None)
+
+
 def sampled_reference(
     symm_buffer, l1, l2, num_tokens: int, *, process_group=None, sample_size=64
 ):
@@ -81,9 +91,9 @@ def sampled_reference(
             return_fp32=True,
             situ_beta=cfg.situ_beta,
             situ_linear_beta=cfg.situ_linear_beta,
-            fc1_alpha=getattr(symm_buffer, "fc1_alpha", None),
-            fc2_alpha=getattr(symm_buffer, "fc2_alpha", None),
-            fc1_norm_const=getattr(symm_buffer, "fc1_norm_const", None),
+            fc1_alpha=_launch_scalar(symm_buffer, "fc1_alpha"),
+            fc2_alpha=_launch_scalar(symm_buffer, "fc2_alpha"),
+            fc1_norm_const=_launch_scalar(symm_buffer, "fc1_norm_const"),
         )
         if cfg.world_size > 1:
             dist.reduce(

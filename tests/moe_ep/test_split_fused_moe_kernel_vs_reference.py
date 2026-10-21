@@ -222,6 +222,82 @@ def test_split_bf16_kernel_matches_torch_reference():
 
 
 @pytest.mark.arch_blackwell
+@pytest.mark.parametrize("offset", [0, 12])
+@pytest.mark.parametrize("num_tokens", [8, 512])
+def test_split_bf16_masked_routes_cuda_graph(offset, num_tokens):
+    """Remote routes stay excluded when graph inputs change or become empty."""
+    _require_backend(TrtllmBf16Config)
+
+    from dataclasses import replace
+
+    import torch
+
+    from flashinfer.fused_moe.layer import MoELayer
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.bridge import (
+        build_activation_pack_rank_major,
+    )
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.weights import (
+        materialize_fused_moe_weights,
+    )
+
+    x, w13, w2, _, weights = _make_problem()
+    repeats = (num_tokens + NUM_TOKENS - 1) // NUM_TOKENS
+    x = x.repeat(repeats, 1)[:num_tokens]
+    weights = weights.repeat(repeats, 1)[:num_tokens]
+    cfg = _build_moe_config("bf16")
+    cfg = replace(
+        cfg,
+        experts=replace(cfg.experts, local_expert_offset=offset, local_num_experts=4),
+        execution=replace(cfg.execution, tune_max_num_tokens=num_tokens),
+    )
+    wp = materialize_fused_moe_weights(
+        MoEWeightPack(w13=w13[offset : offset + 4], w2=w2[offset : offset + 4]), cfg
+    )
+    layer = MoELayer(cfg)
+    routes = torch.arange(num_tokens * TOP_K, device="cuda").reshape(-1, TOP_K)
+    initial = torch.where(routes % 3 == 0, -1, routes % 4)
+    initial[0] = -1
+    idx = initial.clone()
+
+    def forward():
+        pack = build_activation_pack_rank_major(
+            x.reshape(1, num_tokens, HIDDEN),
+            idx,
+            weights,
+            num_local_experts=4,
+            local_expert_offset=offset,
+            num_experts=NUM_EXPERTS,
+            quant=cfg.quant,
+        )
+        return layer(pack, wp)
+
+    def check(output):
+        reference = _dense_moe_reference(
+            x.float(),
+            w13.float(),
+            w2.float(),
+            idx.clamp_min(0) + offset,
+            torch.where(idx >= 0, weights, 0.0),
+            act_roundtrip=lambda a: a.to(torch.bfloat16).float(),
+        )
+        torch.testing.assert_close(output.float(), reference, rtol=3e-2, atol=3e-2)
+        assert torch.count_nonzero(output[(idx < 0).all(dim=1)]).item() == 0
+
+    for _ in range(3):
+        output = forward()
+    check(output)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = forward()
+    for new_idx in (initial, torch.full_like(idx, -1), (routes + 1) % 4):
+        idx.copy_(new_idx)
+        graph.replay()
+        check(output)
+
+
+@pytest.mark.arch_blackwell
 def test_split_nvfp4_kernel_matches_torch_reference():
     """``trtllm_fp4_routed`` (all experts local) matches the dequant torch oracle."""
     _require_backend(TrtllmFp4Config)

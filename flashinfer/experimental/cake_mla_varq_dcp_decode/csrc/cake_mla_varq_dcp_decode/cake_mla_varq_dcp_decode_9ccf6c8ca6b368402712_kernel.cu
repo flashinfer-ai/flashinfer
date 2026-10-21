@@ -435,7 +435,7 @@ kernel_cake_mla_varq_dcp_decode_9ccf6c8ca6b368402712(const __grid_constant__ CUt
                         int s_wait_phase = pipeline_tile >> 1 & 1;
                         mbarrier_wait(s_full_addr + (phase) * 8, s_wait_phase);
                         int s_off = ((phase != 0) ? 64 : 0);
-                        int s_base = taddr + (unsigned int)s_off + (unsigned int)(n_half * 64) + (unsigned int)(tmem_row_base << 16);
+                        int s_base = taddr + (unsigned int)s_off + (unsigned int)(((warp % 4) * 32) << 16);
                         float _tmem_load_0[64];
                         asm volatile(
                             "tcgen05.ld.sync.aligned.32x32b.x32.b32"

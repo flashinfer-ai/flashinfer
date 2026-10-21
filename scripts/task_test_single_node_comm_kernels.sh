@@ -44,6 +44,8 @@ if [ "$pcie_ipc_gpus" -lt 2 ]; then
 else
   echo "pcie ipc collectives: $pcie_ipc_gpus GPUs visible (8 needed for full coverage)"
   pytest -s tests/comm/test_pcie_ipc_all_reduce.py
+  pytest -s tests/comm/test_pcie_ipc_ce_ring.py
+  pytest -s tests/comm/test_pcie_ipc_compatibility.py
   if [ -n "${FLASHINFER_TEST_PCIE_IPC_ORDERED_4PLUS4:-}" ]; then
     echo "Requiring ordered 4+4 AllGather/ReduceScatter coverage for this lane"
   fi

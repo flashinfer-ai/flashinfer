@@ -18,11 +18,13 @@ Compute-capability 10.0/10.3 backend for MiniMax Sparse Attention.
 The Cake-generated programs behind this module are registered in
 ``flashinfer.jit.blackwell_msa``: ``ROUTES`` maps a logical route
 (``<route key>:<stage>``) to the program that serves it on each target and
-``MODULES`` carries the program's physical argument order.  This module owns
+``MODULES`` names the program's ``ARG_PLANS`` argument plan.  This module owns
 the public semantics only -- argument validation, route selection from the
 inputs, the host-side plan of the long-prefill route and the CUDA-graph
-workspace contract.  There are no environment switches and no shape-exact
-routes: every TopK16 call on a supported device is served by the route its
+workspace contract.  There are no environment switches.  The only shape-exact
+routes are the two FP8-KV single-query decode specializations that
+``force_fused=True`` selects at their exact coordinates (``_fp8_q1_schedule``);
+every other TopK16 call on a supported device is served by the route its
 inputs select.  Compute capability 10.7 is admitted for the packed-NVFP4
 paged-KV routes only.
 
@@ -59,6 +61,7 @@ import torch
 import tvm_ffi
 
 from ..jit.blackwell_msa import (
+    ARG_PLANS,
     MODULES,
     BlackwellMSATarget,
     load_blackwell_msa_module,
@@ -76,22 +79,63 @@ _SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3), (10, 7)}
 _M128_Q_TILE = 256
 _GQA8_Q_TILE = 32
 _GQA16_Q_TILE = 16
+# Lever P-PERS (persistent heavy-first tile loop): the folded-GQA union prefill
+# retraces run a persistent tile loop.  The kernel rebuilds the tile / KV-head
+# extents from its scalar arguments and reads its CTA count from grid_dim.x, so
+# the host launches min(tiles x KV heads, SMs) CTAs on a one-dimensional grid
+# (mirror of ``minimax_sparse_attention_prefill_sm100.union_persistent_grid``;
+# ``_UNION_PERSISTENT_FOLDED`` mirrors the Cake default of
+# ``UNION_PERSISTENT_FOLDED``).  The base grid ``(tiles, heads, 1)`` would run
+# every item ``heads`` times.
+_UNION_PERSISTENT_FOLDED = True
+
+
+def _union_persistent_grid(
+    tiles: int, heads: int, num_sms: int
+) -> tuple[int, int, int]:
+    return (max(1, min(int(tiles) * int(heads), int(num_sms))), 1, 1)
+
+
+def _prefill_launch_grid(
+    *,
+    total_q: int,
+    batch_size: int,
+    folded_gqa_group: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    num_sms: int,
+) -> tuple[int, int, int]:
+    """Launch grid of the prefill programs (mirror of the Cake dispatcher).
+
+    Official grid: x = the compact query-tile upper bound, y = the KV heads of a
+    folded-GQA program or the query heads of a general one.  The folded-GQA
+    union retraces take the persistent grid when ``_UNION_PERSISTENT_FOLDED``.
+    """
+    q_tile = (
+        _GQA8_Q_TILE
+        if folded_gqa_group == 8
+        else _GQA16_Q_TILE
+        if folded_gqa_group == 16
+        else _M128_Q_TILE
+    )
+    tiles = (int(total_q) + q_tile - 1) // q_tile + int(batch_size) - 1
+    heads = int(num_kv_heads) if folded_gqa_group else int(num_q_heads)
+    if folded_gqa_group and _UNION_PERSISTENT_FOLDED:
+        return _union_persistent_grid(tiles, heads, num_sms)
+    return (tiles, heads, 1)
+
+
 _UNIFORM_FP8_EVEN_WAVE_GRID = 128
 
 _LONG_WORK_GROUP_BUCKETS = (128, 64, 32, 16, 8, 4, 2, 1)
 _LONG_GROUP_BOUNDARIES = _LONG_WORK_GROUP_BUCKETS[:-1]
-# Tail-wave split of the long-prefill work list (mirror of the Weave module's WORK_TAIL_SPLIT* constants and of
-# decompose_long_prefill_work / simulate_long_prefill_makespan / tail_split_long_prefill_work; the Cake test
-# loom/tests/test_minimax_sparse_long_prefill_work_plan.py pins the parity).
-_LONG_WORK_TAIL_SPLIT = True
+# Tail-wave split of the long-prefill work list (mirrors the generator's work-plan model).
 _LONG_WORK_TAIL_SPLIT_FIXED_GROUPS = 2
 _LONG_WORK_TAIL_SPLIT_MIN_GROUPS = 32
 _LONG_WORK_TAIL_SPLIT_MAX_ROUNDS = 4
-# Q-resident launch order of the long-prefill work list (lever P1b; mirror of the Weave module's WORK_ORDER_*
-# constants and of first_query_tokens_of_long_prefill_work / order_long_prefill_work_q_resident, pinned by the
-# same Cake test).  Requires the long_prefill_* kernels of this export, which derive the CTA's group count from
-# the item's q_count (the q_group_segment_end_* scalars are bucket counts, not launch-index boundaries).
-_LONG_WORK_ORDER_Q_RESIDENT = True
+# Q-resident launch order of the long-prefill work list (mirrors the generator's work-plan model).  Requires the
+# long_prefill_* kernels of this export, which derive the CTA's group count from the item's q_count (the
+# q_group_segment_end_* scalars are bucket counts, not launch-index boundaries).
 _LONG_WORK_ORDER_Q_WINDOW = 1024
 _LONG_WORK_ORDER_FILL_GROUPS = 128
 _LONG_QSPLIT_Q_MASK = 0x00FF_FFFF
@@ -179,11 +223,6 @@ _TOPK_BMAX_CHUNK_ITERS = 8
 _TOPK_BMAX_WORDS_PER_CHUNK = 64
 _TOPK_STREAM_MAX_ROWS = 512
 _TOPK_STREAM_MAX_NVP = 1024
-# Lever T11b (MSA ceiling Goal round 7): grids of at most _TOPK_SMALL_GRID_MAX_ROWS rows over at most
-# _TOPK_STREAM_MAX_NVP valid pages whose cost-minimal slice streams plan the stage-only S = _TOPK_SMALL_GRID_SLICES
-# split instead (one single-pass CTA per slice; the streaming rule then does not fire).
-_TOPK_SMALL_GRID_MAX_ROWS = 32
-_TOPK_SMALL_GRID_SLICES = 16
 _TOPK_ROUTE_RADIX = "topk_select"
 _TOPK_ROUTE_STREAMING = "topk_select_streaming"
 # 32-query instance (MSA ceiling Goal lever T4): two queries per lane, u16-packed histogram, 2 CTAs/SM.
@@ -204,9 +243,8 @@ def _topk_grid_plan(
     """Shape-only plan: over ``s in (1,2,4,8,16)`` with ``ceil(nvp / s) >= 32`` (else ``s = 1``), ``S`` minimises
     ``ceil(groups * s / W) * (fixed(s) + ceil(nvp / s) + 112 * s)`` with ``fixed(s) = 1536`` for a slice above the
     candidate cap (multi-pass CTA) and ``512`` for a slice within it (stage-only CTA); ``W`` = 444 for the 16-query
-    program, 296 for the 32-query instance ``qpack = 2``; ties: the larger ``s``.  Lever T11b (16-query plan only):
-    when ``total_q * num_heads <= 32``, ``nvp <= 1024``, the minimiser's slice exceeds the cap and the ``S = 16`` grid
-    fits one wave, ``S = 16`` (stage-only) replaces the minimiser.  ``bid = (h * S + s) * num_qtiles + qtile``."""
+    program, 296 for the 32-query instance ``qpack = 2``; ties: the larger ``s``.
+    ``bid = (h * S + s) * num_qtiles + qtile``."""
     total_q = int(total_q)
     num_heads = int(num_heads)
     num_valid_pages = int(num_valid_pages)
@@ -248,21 +286,6 @@ def _topk_grid_plan(
         if best_cost is None or cost <= best_cost:
             best_cost = cost
             num_slices = candidate
-    # Lever T11b (round 7): a small grid whose cost-minimal slice streams (> cap) over the streaming program's nvp
-    # range takes the stage-only S = 16 plan (duplicated verbatim from the module; see its T11b paragraph).
-    if (
-        qpack == 1
-        and total_q * num_heads <= _TOPK_SMALL_GRID_MAX_ROWS
-        and num_valid_pages <= _TOPK_STREAM_MAX_NVP
-        and -(-num_valid_pages // num_slices) > _TOPK_CAND_CAP
-        and groups * _TOPK_SMALL_GRID_SLICES <= wave_ctas
-    ):
-        # here 513 <= nvp <= 1024, so the slice 33..64 is admitted and stage-only
-        assert (
-            _TOPK_SMALL_GRID_SLICES in fitting
-            and -(-num_valid_pages // _TOPK_SMALL_GRID_SLICES) <= _TOPK_CAND_CAP
-        )
-        num_slices = _TOPK_SMALL_GRID_SLICES
     slice_len = -(-num_valid_pages // num_slices)
     grid = groups * num_slices
     slice_k_tiles = -(-slice_len // 16)
@@ -296,9 +319,7 @@ def _topk_route(
     """Shape-only program choice (duplicated verbatim from
     loom/examples/weave/minimax_sparse_topk_select_v2_sm100.py::topk_route): ``topk_select_streaming`` (the
     one-CTA-per-row program) for small latency-bound multi-pass grids -- at most ``_TOPK_STREAM_MAX_ROWS`` rows,
-    at most ``_TOPK_STREAM_MAX_NVP`` valid pages and a planned slice above the candidate cap (lever T11b plans the
-    grids of at most ``_TOPK_SMALL_GRID_MAX_ROWS`` rows of that regime stage-only at ``S = 16``, so they never
-    reach the streaming program); ``topk_select_q32``
+    at most ``_TOPK_STREAM_MAX_NVP`` valid pages and a planned slice above the candidate cap; ``topk_select_q32``
     (the 32-query instance) for an even ``total_q >= _TOPK_Q32_MIN_Q`` whose 32-query plan has a slice in
     ``[_TOPK_Q32_MIN_SLICE, _TOPK_Q32_MAX_SLICE]``; otherwise one of the query-tiled radix select's two 16-query
     production instances by the planned slice (``_topk_radix_route``): ``topk_select_keq`` for a streamed
@@ -479,7 +500,9 @@ def _program(route: str, target: BlackwellMSATarget) -> _Program:
     name = route_program(route, target)
     record = MODULES[name]
     module = load_blackwell_msa_module(name, target)
-    plan = tuple((str(kind), str(argument)) for kind, argument in record["arg_plan"])
+    plan = tuple(
+        (str(kind), str(argument)) for kind, argument in ARG_PLANS[record["arg_plan"]]
+    )
     return _Program(name, getattr(module, record["ffi_entry"]), plan)
 
 
@@ -955,11 +978,9 @@ def _decode_route(*, q_dtype: torch.dtype, k_dtype: torch.dtype, paged: bool) ->
     return f"decode_m16:{_DTYPE_NAMES[q_dtype]}:{_DTYPE_NAMES[k_dtype]}:{layout}"
 
 
-def _long_prefill_route(*, paged: bool, group_size: int, direct_group: bool) -> str:
+def _long_prefill_route(*, paged: bool, group_size: int) -> str:
     layout = "paged" if paged else "flat"
-    return f"long_bf16_reverse:{layout}:gqa{group_size}" + (
-        ":direct_group" if direct_group else ""
-    )
+    return f"long_bf16_reverse:{layout}:gqa{group_size}"
 
 
 def _fp8_q1_schedule(
@@ -1000,6 +1021,41 @@ def _fp8_q1_schedule(
     if not paged and batch_size == 32 and k_outer_dim == 262144 and max_pages == 0:
         return "q1_flat_xform2"
     return ""
+
+
+# Lever D4b(dynpair) ships with the route off by default: the two-token
+# ticket program costs 6-11 % on per-token random block selections.  Turning the mirror
+# on needs a Cake re-export that registers ``decode_uniform_fp8:paged_dynpair`` again
+# (``exports/blackwell_msa/export.PRODUCTION_ROUTE_KEYS``); this package carries only
+# the single-token program.
+_UNIFORM_FP8_DYNPAIR_ROUTE = (
+    False  # mirror of minimax_sparse_attention_sm100.UNIFORM_FP8_DYNPAIR_ROUTE
+)
+_UNIFORM_FP8_SINGLE_ROUTE = "decode_uniform_fp8:paged"
+_UNIFORM_FP8_DYNPAIR_ROUTE_KEY = "decode_uniform_fp8:paged_dynpair"
+
+
+def _uniform_fp8_dynpair(seqlen_q: int) -> bool:
+    """Even ``seqlen_q`` in [2, 32] takes the two-token ticket program when the route is on.
+
+    Mirror of ``minimax_sparse_attention_sm100.uniform_fp8_dynpair_route`` (lever
+    D4b(dynpair), shipped off): query pairs ``(2 i, 2 i + 1)`` never straddle a
+    request; the kernel pairs the two tokens of a ticket when their selected-block lists
+    are equal and runs them one after the other otherwise; the output is bitwise the
+    single-token program's.  Same kernel ABI, grid rule and launch arguments as the
+    single-token route.
+    """
+    seqlen_q = int(seqlen_q)
+    return _UNIFORM_FP8_DYNPAIR_ROUTE and 2 <= seqlen_q <= 32 and seqlen_q % 2 == 0
+
+
+def _uniform_fp8_route(seqlen_q: int) -> str:
+    """Route key of the uniform FP8 Q/K/V paged decode program for ``seqlen_q``."""
+    return (
+        _UNIFORM_FP8_DYNPAIR_ROUTE_KEY
+        if _uniform_fp8_dynpair(seqlen_q)
+        else _UNIFORM_FP8_SINGLE_ROUTE
+    )
 
 
 def _uniform_fp8_decode_grid(
@@ -1635,28 +1691,24 @@ def _build_long_prefill_plan(
     )
     if not work:
         raise ValueError("long prefill requires at least one selected edge")
-    if _LONG_WORK_TAIL_SPLIT:
-        work = _long_prefill_tail_split_work(
-            work, sm_count=int(num_sms), q_tokens_per_group=q_tokens_per_group
-        )
-    if _LONG_WORK_ORDER_Q_RESIDENT:
-        row_starts_host = []
-        for head_counts in counts_host:
-            starts = [0]
-            for count in head_counts:
-                starts.append(starts[-1] + int(count))
-            row_starts_host.append(starts)
-        first_tokens = _long_prefill_first_query_tokens(
-            work, row_starts_host=row_starts_host, q_indices_by_head=q_indices_by_head
-        )
-        work = _long_prefill_order_work_q_resident(
-            work,
-            first_tokens,
-            window=_LONG_WORK_ORDER_Q_WINDOW,
-            fill_groups=min(_LONG_WORK_ORDER_FILL_GROUPS, work_group_cap),
-        )
-    else:
-        work.sort(key=lambda item: item[0], reverse=True)
+    work = _long_prefill_tail_split_work(
+        work, sm_count=int(num_sms), q_tokens_per_group=q_tokens_per_group
+    )
+    row_starts_host = []
+    for head_counts in counts_host:
+        starts = [0]
+        for count in head_counts:
+            starts.append(starts[-1] + int(count))
+        row_starts_host.append(starts)
+    first_tokens = _long_prefill_first_query_tokens(
+        work, row_starts_host=row_starts_host, q_indices_by_head=q_indices_by_head
+    )
+    work = _long_prefill_order_work_q_resident(
+        work,
+        first_tokens,
+        window=_LONG_WORK_ORDER_Q_WINDOW,
+        fill_groups=min(_LONG_WORK_ORDER_FILL_GROUPS, work_group_cap),
+    )
     metadata = torch.tensor(
         [entry for _group, entry in work], dtype=torch.int32, device=q2k_indices.device
     )
@@ -1880,12 +1932,7 @@ def _run_long_prefill(
             dtype=torch.float32,
             device=q.device,
         )
-    direct_group = (
-        target == "sm100a" and paged and group_size == 16 and max_pages == 8192
-    )
-    route = _long_prefill_route(
-        paged=paged, group_size=group_size, direct_group=direct_group
-    )
+    route = _long_prefill_route(paged=paged, group_size=group_size)
     forward_program = _program(f"{route}:main", target)
     combine_program = _program(f"{route}:reduce", target)
     # Flat K/V: a never-dereferenced carrier, the caller's whole contiguous q2k
@@ -2083,17 +2130,13 @@ def _run_prefill(
         dtype=torch.uint8,
         device=q.device,
     )
-    q_tile = (
-        _GQA8_Q_TILE
-        if folded_gqa_group == 8
-        else _GQA16_Q_TILE
-        if folded_gqa_group == 16
-        else _M128_Q_TILE
-    )
-    grid = (
-        (total_q + q_tile - 1) // q_tile + batch_size - 1,
-        num_kv_heads if folded_gqa_group else num_q_heads,
-        1,
+    grid = _prefill_launch_grid(
+        total_q=total_q,
+        batch_size=batch_size,
+        folded_gqa_group=folded_gqa_group,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        num_sms=int(get_device_sm_count(q.device)),
     )
     if cu_k is None:
         # Lever P-H1d: paged prefill without caller offsets binds the all-zero
@@ -2308,7 +2351,7 @@ def _run_fp8_direct(
 ) -> None:
     """One direct FP8-MMA decode program (BF16-Q xform2 or uniform FP8 Q/K/V)."""
 
-    uniform = route == "decode_uniform_fp8:paged"
+    uniform = route in (_UNIFORM_FP8_SINGLE_ROUTE, _UNIFORM_FP8_DYNPAIR_ROUTE_KEY)
     total_q, num_q_heads, _ = (int(value) for value in q.shape)
     num_kv_heads = int(k.shape[1])
     arguments: dict[str, Any] = {
@@ -3024,7 +3067,9 @@ def blackwell_msa_sparse_decode_attention(
                     "force_fused=True, and no explicit q_offset"
                 )
             _run_fp8_direct(
-                route="decode_uniform_fp8:paged", output_scale=output_scale, **common
+                route=_uniform_fp8_route(int(seqlen_q)),
+                output_scale=output_scale,
+                **common,
             )
         else:
             schedule = _fp8_q1_schedule(
