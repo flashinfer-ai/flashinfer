@@ -60,7 +60,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(96) void
-kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084(const __nv_bfloat16* __restrict__ qkv, const float* __restrict__ cos_sin, const int* __restrict__ seq_lens, const int* __restrict__ q_indptr, const int* __restrict__ page_indices, const float* __restrict__ q_norm_weight, const float* __restrict__ k_norm_weight, const float* __restrict__ k_scale, const float* __restrict__ v_scale, const float* __restrict__ q_scale_inv, uint8_t* __restrict__ out_q, uint8_t* key_cache, uint8_t* value_cache, uint8_t* out_k, uint8_t* out_v, float* __restrict__ q_scale, int* __restrict__ split_k_flag, int num_rows, int num_requests, int num_q_heads, int num_kv_heads, int page_size, int max_pages_per_request, int max_seqlen, int max_seqlen_aligned, int quant_policy, int norm_policy, bool is_prefill, bool has_out_kv, float upper_max)
+kernel_cake_fused_qk_rope_fp8_append_ddd22fd7e250b256df9d(const __nv_bfloat16* __restrict__ qkv, const float* __restrict__ cos_sin, const int* __restrict__ seq_lens, const int* __restrict__ q_indptr, const int* __restrict__ page_indices, const float* __restrict__ q_norm_weight, const float* __restrict__ k_norm_weight, const float* __restrict__ k_scale, const float* __restrict__ v_scale, const float* __restrict__ q_scale_inv, uint8_t* __restrict__ out_q, uint8_t* key_cache, uint8_t* value_cache, uint8_t* out_k, uint8_t* out_v, float* __restrict__ q_scale, int* __restrict__ split_k_flag, int num_rows, int num_requests, int num_q_heads, int num_kv_heads, int page_size, int max_pages_per_request, int max_seqlen, int max_seqlen_aligned, int quant_policy, int norm_policy, bool is_prefill, bool has_out_kv, float upper_max)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -83,9 +83,13 @@ kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084(const __nv_bfloat16* _
     int lane_1 = tid_0 % 8;
     int grp_base = tid_0 % 32 - lane_1;
     unsigned int grp_mask = (unsigned int)(255 << grp_base);
-    int kv_head = blockIdx.y;
+    int gy = blockIdx.y;
+    int g_raw = blockIdx.x;
+    int gx = g_raw;
+    int kv_head = gy;
+    int clear_head0 = gy;
     int q_per_kv = num_q_heads / num_kv_heads;
-    int bid_1 = blockIdx.x;
+    int bid_1 = gx;
     bool is_row_cta = bid_1 < num_rows;
     int row = ((is_row_cta) ? bid_1 : 0);
     bool dyn_prefill = quant_policy == 1 && is_prefill;
@@ -256,6 +260,29 @@ kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084(const __nv_bfloat16* _
     if (!is_row_cta && req_id < num_requests) {
         clear_last_pos = seq_lens[req_id] - 1;
     }
+    int g_req = 0;
+    int g_b = 0;
+    int g_e = -1;
+    int g_l = 0;
+    if (is_row_cta) {
+        if (num_rows == num_requests) {
+            g_req = row;
+        } else if (num_rows <= 65536 && num_requests <= 32768) {
+            g_req = row * num_requests / num_rows;
+        } else {
+            g_req = ((row < num_requests) ? row : num_requests - 1);
+        }
+        g_b = q_indptr[g_req];
+        g_e = q_indptr[g_req + 1];
+        g_l = seq_lens[g_req];
+    }
+    int f_phys = 0;
+    if (g_l >= 1) {
+        int f_slot0 = (g_l - 1) / page_size;
+        if (g_l - 1 - f_slot0 * page_size + 1 < page_size) {
+            f_phys = page_indices[row * max_pages_per_request + f_slot0];
+        }
+    }
     bool any_bad = 0;
     #pragma unroll 1
     for (int req = tid_0; req < num_requests; req += 96) {
@@ -264,6 +291,12 @@ kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084(const __nv_bfloat16* _
         int seq_len_r = seq_lens[req];
         bool bad = begin < 0 || end < begin || end > num_rows;
         if (dyn_prefill && end - begin > max_seqlen) {
+            bad = 1;
+        }
+        if (req == 0 && begin != 0) {
+            bad = 1;
+        }
+        if (req == num_requests - 1 && end != num_rows) {
             bad = 1;
         }
         if (bad) {
@@ -277,21 +310,20 @@ kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084(const __nv_bfloat16* _
             }
         }
     }
-    if (tid_0 == 0) {
-        int first = q_indptr[0];
-        int last_ip = q_indptr[num_requests];
-        if (first != 0 || last_ip != num_rows) {
-            any_bad = 1;
-        }
+    if (tid_0 == 0 && num_requests == 0) {
+        any_bad = 1;
     }
-    uint32_t _cta_or_0 = __syncthreads_or(any_bad);
-    unsigned int invalid = _cta_or_0;
-    if (is_row_cta) {
-        if (invalid == 0 && active) {
-            int batch_i = meta[0];
-            int pos = meta[1];
-            int tok = meta[2];
-            long long cache_row = 0;
+    bool have = 0;
+    int batch_i = 0;
+    int pos = 0;
+    int tok = 0;
+    long long cache_row = 0;
+    if (is_row_cta && active) {
+        if (g_b >= 0 && g_b <= row && row < g_e && g_e <= num_rows) {
+            have = 1;
+            batch_i = g_req;
+            pos = row + g_l - g_e;
+            tok = row - g_b;
             if (is_q || is_k) {
                 long long cs_base = (long long)pos * 128 + (long long)(lane_1 * 8);
                 {
@@ -349,6 +381,110 @@ kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084(const __nv_bfloat16* _
                 int phys = page_indices[batch_i * max_pages_per_request + page_slot];
                 cache_row = ((long long)phys * (long long)page_size + (long long)row_in_page) * (long long)(num_kv_heads * 128) + (long long)(kv_head * 128);
             }
+        }
+    }
+    uint32_t _cta_or_0 = __syncthreads_or(any_bad);
+    unsigned int invalid = _cta_or_0;
+    if (tid_0 < 1) {
+        int f_flag = ((invalid != 0) ? -1 : 0);
+        *(reinterpret_cast<int*>(split_k_flag + (row * num_kv_heads + clear_head0 + tid_0)) + (0)) = f_flag;
+    }
+    if (invalid == 0) {
+        int f_from = page_size;
+        if (g_l >= 1) {
+            f_from = g_l - 1 - (g_l - 1) / page_size * page_size + 1;
+        }
+        if (f_from < page_size) {
+            long long f_phys64 = f_phys;
+            unsigned int f_zero[4];
+            #pragma unroll
+            for (int j_2 = 0; j_2 < 4; j_2++) {
+                f_zero[j_2] = 0;
+            }
+            int f_rows = page_size - f_from;
+            int f_items = f_rows * 16;
+            #pragma unroll 1
+            for (int h = 0; h < 1; h++) {
+                long long f_head = (long long)((clear_head0 + h) * 128);
+                #pragma unroll 1
+                for (int item = tid_0; item < f_items; item += 96) {
+                    int f_r = item / 16;
+                    int f_sub = item - f_r * 16;
+                    int f_chunk = f_sub % 8;
+                    long long f_base = (f_phys64 * (long long)page_size + (long long)f_from + (long long)f_r) * (long long)(num_kv_heads * 128) + f_head + (long long)(f_chunk * 16);
+                    if (f_sub < 8) {
+                        reinterpret_cast<int4*>(key_cache + f_base)[0] = reinterpret_cast<int4*>(f_zero)[0];
+                    } else {
+                        reinterpret_cast<int4*>(value_cache + f_base)[0] = reinterpret_cast<int4*>(f_zero)[0];
+                    }
+                }
+            }
+        }
+    }
+    if (is_row_cta) {
+        if (invalid == 0 && active) {
+            if (!have) {
+                batch_i = meta[0];
+                pos = meta[1];
+                tok = meta[2];
+                if (is_q || is_k) {
+                    long long cs_base_1 = (long long)pos * 128 + (long long)(lane_1 * 8);
+                    {
+                        unsigned _v4_14_0;
+                        unsigned _v4_14_1;
+                        unsigned _v4_14_2;
+                        unsigned _v4_14_3;
+                        asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+                            : "=r"(_v4_14_0), "=r"(_v4_14_1), "=r"(_v4_14_2), "=r"(_v4_14_3) : "l"((const void*)(cos_sin + cs_base_1 + (0))) : "memory");
+                        c_lo[0 + 0] = __uint_as_float(_v4_14_0);
+                        c_lo[0 + 1] = __uint_as_float(_v4_14_1);
+                        c_lo[0 + 2] = __uint_as_float(_v4_14_2);
+                        c_lo[0 + 3] = __uint_as_float(_v4_14_3);
+                    }
+                    {
+                        unsigned _v4_15_0;
+                        unsigned _v4_15_1;
+                        unsigned _v4_15_2;
+                        unsigned _v4_15_3;
+                        asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+                            : "=r"(_v4_15_0), "=r"(_v4_15_1), "=r"(_v4_15_2), "=r"(_v4_15_3) : "l"((const void*)(cos_sin + (cs_base_1 + 4) + (0))) : "memory");
+                        c_lo[4 + 0] = __uint_as_float(_v4_15_0);
+                        c_lo[4 + 1] = __uint_as_float(_v4_15_1);
+                        c_lo[4 + 2] = __uint_as_float(_v4_15_2);
+                        c_lo[4 + 3] = __uint_as_float(_v4_15_3);
+                    }
+                    {
+                        unsigned _v4_16_0;
+                        unsigned _v4_16_1;
+                        unsigned _v4_16_2;
+                        unsigned _v4_16_3;
+                        asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+                            : "=r"(_v4_16_0), "=r"(_v4_16_1), "=r"(_v4_16_2), "=r"(_v4_16_3) : "l"((const void*)(cos_sin + (cs_base_1 + 64) + (0))) : "memory");
+                        c_hi[0 + 0] = __uint_as_float(_v4_16_0);
+                        c_hi[0 + 1] = __uint_as_float(_v4_16_1);
+                        c_hi[0 + 2] = __uint_as_float(_v4_16_2);
+                        c_hi[0 + 3] = __uint_as_float(_v4_16_3);
+                    }
+                    {
+                        unsigned _v4_17_0;
+                        unsigned _v4_17_1;
+                        unsigned _v4_17_2;
+                        unsigned _v4_17_3;
+                        asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+                            : "=r"(_v4_17_0), "=r"(_v4_17_1), "=r"(_v4_17_2), "=r"(_v4_17_3) : "l"((const void*)(cos_sin + (cs_base_1 + 64 + 4) + (0))) : "memory");
+                        c_hi[4 + 0] = __uint_as_float(_v4_17_0);
+                        c_hi[4 + 1] = __uint_as_float(_v4_17_1);
+                        c_hi[4 + 2] = __uint_as_float(_v4_17_2);
+                        c_hi[4 + 3] = __uint_as_float(_v4_17_3);
+                    }
+                }
+                if ((is_k || is_v) && !has_out_kv) {
+                    int page_slot_1 = pos / page_size;
+                    int row_in_page_1 = pos - page_slot_1 * page_size;
+                    int phys_1 = page_indices[batch_i * max_pages_per_request + page_slot_1];
+                    cache_row = ((long long)phys_1 * (long long)page_size + (long long)row_in_page_1) * (long long)(num_kv_heads * 128) + (long long)(kv_head * 128);
+                }
+            }
             float x_lo[8];
             float x_hi[8];
             #pragma unroll
@@ -365,10 +501,10 @@ kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084(const __nv_bfloat16* _
                 if (norm_policy == 2) {
                     float ss = 0.0f;
                     #pragma unroll
-                    for (int j_2 = 0; j_2 < 8; j_2++) {
-                        float _fma_0 = __fmaf_rn(x_lo[j_2], x_lo[j_2], ss);
+                    for (int j_3 = 0; j_3 < 8; j_3++) {
+                        float _fma_0 = __fmaf_rn(x_lo[j_3], x_lo[j_3], ss);
                         ss = _fma_0;
-                        float _fma_1 = __fmaf_rn(x_hi[j_2], x_hi[j_2], ss);
+                        float _fma_1 = __fmaf_rn(x_hi[j_3], x_hi[j_3], ss);
                         ss = _fma_1;
                     }
                     float _shfl_xor_0 = __shfl_xor_sync(grp_mask, ss, 4);
@@ -380,25 +516,25 @@ kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084(const __nv_bfloat16* _
                     float _rsqrt_0 = rsqrtf(__fmaf_rn(ss, 0.0078125f, 1e-06f));
                     float inv_rms = _rsqrt_0;
                     #pragma unroll
-                    for (int j_3 = 0; j_3 < 8; j_3++) {
-                        x_lo[j_3] = x_lo[j_3] * (inv_rms * w_lo[j_3]);
-                        x_hi[j_3] = x_hi[j_3] * (inv_rms * w_hi[j_3]);
+                    for (int j_4 = 0; j_4 < 8; j_4++) {
+                        x_lo[j_4] = x_lo[j_4] * (inv_rms * w_lo[j_4]);
+                        x_hi[j_4] = x_hi[j_4] * (inv_rms * w_hi[j_4]);
                     }
                 }
                 #pragma unroll
-                for (int j_4 = 0; j_4 < 8; j_4++) {
-                    float y_lo = __fmaf_rn(x_lo[j_4], c_lo[j_4], -(x_hi[j_4] * c_hi[j_4]));
-                    float y_hi = __fmaf_rn(x_hi[j_4], c_lo[j_4], x_lo[j_4] * c_hi[j_4]);
-                    x_lo[j_4] = y_lo;
-                    x_hi[j_4] = y_hi;
+                for (int j_5 = 0; j_5 < 8; j_5++) {
+                    float y_lo = __fmaf_rn(x_lo[j_5], c_lo[j_5], -(x_hi[j_5] * c_hi[j_5]));
+                    float y_hi = __fmaf_rn(x_hi[j_5], c_lo[j_5], x_lo[j_5] * c_hi[j_5]);
+                    x_lo[j_5] = y_lo;
+                    x_hi[j_5] = y_hi;
                 }
                 if (norm_policy == 1) {
                     float ss1 = 0.0f;
                     #pragma unroll
-                    for (int j_5 = 0; j_5 < 8; j_5++) {
-                        float _fma_2 = __fmaf_rn(x_lo[j_5], x_lo[j_5], ss1);
+                    for (int j_6 = 0; j_6 < 8; j_6++) {
+                        float _fma_2 = __fmaf_rn(x_lo[j_6], x_lo[j_6], ss1);
                         ss1 = _fma_2;
-                        float _fma_3 = __fmaf_rn(x_hi[j_5], x_hi[j_5], ss1);
+                        float _fma_3 = __fmaf_rn(x_hi[j_6], x_hi[j_6], ss1);
                         ss1 = _fma_3;
                     }
                     float _shfl_xor_3 = __shfl_xor_sync(grp_mask, ss1, 4);
@@ -410,9 +546,9 @@ kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084(const __nv_bfloat16* _
                     float _rsqrt_1 = rsqrtf(__fmaf_rn(ss1, 0.0078125f, 1e-06f));
                     float inv_rms1 = _rsqrt_1;
                     #pragma unroll
-                    for (int j_6 = 0; j_6 < 8; j_6++) {
-                        x_lo[j_6] = x_lo[j_6] * (inv_rms1 * w_lo[j_6]);
-                        x_hi[j_6] = x_hi[j_6] * (inv_rms1 * w_hi[j_6]);
+                    for (int j_7 = 0; j_7 < 8; j_7++) {
+                        x_lo[j_7] = x_lo[j_7] * (inv_rms1 * w_lo[j_7]);
+                        x_hi[j_7] = x_hi[j_7] * (inv_rms1 * w_hi[j_7]);
                     }
                 }
             }
@@ -422,11 +558,11 @@ kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084(const __nv_bfloat16* _
                 if (quant_policy == 1) {
                     float m = 1e-06f;
                     #pragma unroll
-                    for (int j_7 = 0; j_7 < 8; j_7++) {
-                        float _fabs_0 = fabsf(x_lo[j_7]);
+                    for (int j_8 = 0; j_8 < 8; j_8++) {
+                        float _fabs_0 = fabsf(x_lo[j_8]);
                         float _fmax_0 = fmaxf(m, _fabs_0);
                         m = _fmax_0;
-                        float _fabs_1 = fabsf(x_hi[j_7]);
+                        float _fabs_1 = fabsf(x_hi[j_8]);
                         float _fmax_1 = fmaxf(m, _fabs_1);
                         m = _fmax_1;
                     }
@@ -462,9 +598,9 @@ kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084(const __nv_bfloat16* _
                 mult = _rcp_2;
             }
             #pragma unroll
-            for (int j_8 = 0; j_8 < 8; j_8++) {
-                x_lo[j_8] = x_lo[j_8] * mult;
-                x_hi[j_8] = x_hi[j_8] * mult;
+            for (int j_9 = 0; j_9 < 8; j_9++) {
+                x_lo[j_9] = x_lo[j_9] * mult;
+                x_hi[j_9] = x_hi[j_9] * mult;
             }
             long long row64 = row;
             if (is_q) {
@@ -676,15 +812,15 @@ kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084(const __nv_bfloat16* _
                     long long phys_last64 = phys_last;
                     unsigned int zero_w[4];
                     #pragma unroll
-                    for (int j_9 = 0; j_9 < 4; j_9++) {
-                        zero_w[j_9] = 0;
+                    for (int j_10 = 0; j_10 < 4; j_10++) {
+                        zero_w[j_10] = 0;
                     }
                     int n_rows = page_size - zero_from;
                     int total_items = n_rows * 16;
                     #pragma unroll 1
-                    for (int item = tid_0; item < total_items; item += 96) {
-                        int r = item / 16;
-                        int sub = item - r * 16;
+                    for (int item_1 = tid_0; item_1 < total_items; item_1 += 96) {
+                        int r = item_1 / 16;
+                        int sub = item_1 - r * 16;
                         int chunk = sub % 8;
                         long long base = (phys_last64 * (long long)page_size + (long long)zero_from + (long long)r) * (long long)(num_kv_heads * 128) + (long long)(kv_head * 128) + (long long)(chunk * 16);
                         if (sub < 8) {

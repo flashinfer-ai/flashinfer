@@ -28,6 +28,7 @@ PACKAGES: dict[str, str] = {
     "cake_kda_train": "flashinfer.experimental.cake_kda_train",
     "cake_stepfun_moe": "flashinfer.experimental.cake_stepfun_moe",
     "cake_nvfp4_svdquant_gemm": "flashinfer.cake_nvfp4_svdquant_gemm_backend",
+    "cake_fused_qk_rope_fp8_append": "flashinfer.cake_fused_qk_rope_fp8_append_backend",
 }
 
 

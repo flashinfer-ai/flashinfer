@@ -44,89 +44,41 @@ q_indptr[b + 1]`` and has position ``r + seq_lens[b] - q_indptr[b + 1]``
 ``(page_indices[b, pos // page_size], pos % page_size, kv_head)``.
 
 Supported: ``(Hq, Hkv) in {(8, 1), (64, 8)}``, head_dim 128, BF16 input, FP8
-E4M3 output, SM90 (H100/H200), SM100 (B200) and SM103 (B300).  The kernel is
-generated from the Cake schedule
-``flashinfer_blackwell_fused_qk_rmsnorm_rope_fp8_paged_kv_append``: the generated
-loader :mod:`flashinfer.jit.cake_fused_qk_rope_fp8_append` publishes it as the
-program ``FP8_E4M3``, whose two translation units live under
-``csrc/cake_fused_qk_rope_fp8_append``, and :mod:`flashinfer.jit.cake_program`
-builds one JIT module ``<program>_<target>_<digest>`` per exact target.  The call
-is CUDA-graph capturable: every launch argument is a by-value scalar or a tensor
-pointer, no host synchronisation, workspace or extra kernel is involved.
+E4M3 output, SM90 (H100/H200), SM100 (B200) and SM103 (B300).  The kernel is a
+Cake program; its generated sources, build manifest and loader live in the
+self-contained package :mod:`flashinfer.cake_fused_qk_rope_fp8_append_backend`
+(built on first use through FlashInfer's JIT, or loaded prebuilt).  Several
+builds of the same schedule are shipped per architecture; the host picks one
+from the architecture, the SM count and the problem's host scalars with the
+Cake stage policy mirrored in
+:func:`flashinfer.cake_fused_qk_rope_fp8_append_backend.stage_for` - every
+build writes bit-identical outputs.  The call is CUDA-graph capturable: every
+launch argument is a by-value scalar or a tensor pointer, no host
+synchronisation, workspace or extra kernel is involved.
 """
 
 from __future__ import annotations
 
-import math
-from typing import Any, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
-import tvm_ffi
 
-from .jit.cake_fused_qk_rope_fp8_append import FP8_E4M3
-from .jit.cake_program import CAPABILITY_TARGET
-from .utils import get_compute_capability
+from . import cake_fused_qk_rope_fp8_append_backend as _backend
+from .api_logging import flashinfer_api
+from .cake_fused_qk_rope_fp8_append_backend import (  # noqa: F401
+    FP8_MAX,
+    HEAD_DIM,
+    SUPPORTED_COMPUTE_CAPABILITIES,
+    SUPPORTED_HEADS,
+    launch_plan,
+)
 
-HEAD_DIM = 128
-FP8_MAX = 448.0
-SUPPORTED_HEADS = ((8, 1), (64, 8))
-# The binding's argument order: the 17 tensors, the 13 scalars, then grid_x, grid_y, grid_z.
-_ARG_NAMES: tuple[str, ...] = FP8_E4M3.args
-
-
-def launch_plan(num_rows: int, num_requests: int, num_kv_heads: int) -> dict[str, Any]:
-    """Grid of the fused kernel (mirrors the Cake kernel's ``launch_plan``).
-
-    One CTA per (packed row, kv head group) plus one CTA per (request, kv head)
-    for the last-page tail clear and ``split_k_flag``.
-    """
-    return {"grid": (num_rows + num_requests, num_kv_heads, 1)}
+# The stable entry point is a real ``def`` here (public-API tooling reads the
+# decorated signature of this module); its body lives in the self-contained
+# backend package next to the generated CUDA sources.
 
 
-def _check(cond: bool, message: str) -> None:
-    if not cond:
-        raise ValueError(message)
-
-
-def _target(device: torch.device) -> str:
-    """The exact target the program ships for ``device``."""
-    major, minor = get_compute_capability(device)
-    target = FP8_E4M3.target_for((major, minor))
-    if target is None:
-        supported = ", ".join(
-            f"{t} ({cc_major}.{cc_minor})"
-            for (cc_major, cc_minor), t in CAPABILITY_TARGET.items()
-            if t in FP8_E4M3.targets
-        )
-        raise ValueError(
-            f"cake_fused_qk_rope_fp8_append has no cubin for compute capability {major}.{minor}; "
-            f"supported: {supported}"
-        )
-    return target
-
-
-def _heads_from_packed_qkv(
-    qkv: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor
-) -> Tuple[int, int]:
-    _check(
-        key_cache.dim() == 4 and value_cache.dim() == 4,
-        "key_cache and value_cache must be NHD [num_pages, page_size, num_kv_heads, 128]",
-    )
-    num_kv_heads = int(key_cache.shape[2])
-    width = int(qkv.shape[1])
-    _check(
-        width % HEAD_DIM == 0 and width // HEAD_DIM > 2 * num_kv_heads,
-        "qkv must be [T, (num_q_heads + 2 * num_kv_heads) * 128]",
-    )
-    num_q_heads = width // HEAD_DIM - 2 * num_kv_heads
-    _check(
-        (num_q_heads, num_kv_heads) in SUPPORTED_HEADS,
-        f"(num_q_heads, num_kv_heads) = ({num_q_heads}, {num_kv_heads}) is not supported; "
-        f"expected one of {SUPPORTED_HEADS}",
-    )
-    return num_q_heads, num_kv_heads
-
-
+@flashinfer_api
 def cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
     qkv: torch.Tensor,
     cos_sin_cache: torch.Tensor,
@@ -205,185 +157,29 @@ def cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
     (out_q, q_scale, split_k_flag)
         The caller-owned buffers when given, otherwise freshly allocated ones.
     """
-    _check(len(paged_kv_cache) == 2, "paged_kv_cache must be (key_cache, value_cache)")
-    key_cache, value_cache = paged_kv_cache
-    _check(quant_policy in (1, 2), "quant_policy must be 1 (dynamic Q) or 2 (static Q)")
-    _check(qk_norm_policy in (0, 1, 2), "qk_norm_policy must be 0, 1 or 2")
-    _check(
-        math.isfinite(upper_max) and 0.0 < upper_max <= FP8_MAX,
-        "upper_max must be finite and in the interval (0, 448]",
+    return _backend.cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
+        qkv,
+        cos_sin_cache,
+        seq_lens,
+        q_indptr,
+        page_indices,
+        paged_kv_cache,
+        is_prefill,
+        k_scale,
+        v_scale,
+        quant_policy,
+        max_seqlen=max_seqlen,
+        upper_max=upper_max,
+        q_scale_inv=q_scale_inv,
+        q_norm_weight=q_norm_weight,
+        k_norm_weight=k_norm_weight,
+        qk_norm_policy=qk_norm_policy,
+        out_q=out_q,
+        out_k=out_k,
+        out_v=out_v,
+        q_scale=q_scale,
+        split_k_flag=split_k_flag,
     )
-    _check(
-        qkv.dim() == 2 and qkv.dtype == torch.bfloat16, "qkv must be a 2-D bf16 tensor"
-    )
-    _check(qkv.is_cuda, "qkv must be a CUDA tensor")
-    device = qkv.device
-    num_q_heads, num_kv_heads = _heads_from_packed_qkv(qkv, key_cache, value_cache)
-    num_rows = int(qkv.shape[0])
-    dyn_prefill = quant_policy == 1 and bool(is_prefill)
-    _check(
-        not dyn_prefill or max_seqlen > 0,
-        "max_seqlen must be positive for dynamic prefill quantization",
-    )
-    _check(
-        cos_sin_cache.dtype == torch.float32
-        and cos_sin_cache.dim() == 2
-        and int(cos_sin_cache.shape[1]) == HEAD_DIM,
-        "cos_sin_cache must be f32 [max_position, 128]",
-    )
-    for name, t in (
-        ("seq_lens", seq_lens),
-        ("q_indptr", q_indptr),
-        ("page_indices", page_indices),
-    ):
-        _check(t.dtype == torch.int32, f"{name} must be int32")
-    num_requests = int(seq_lens.shape[0])
-    _check(
-        seq_lens.dim() == 1
-        and q_indptr.dim() == 1
-        and int(q_indptr.shape[0]) == num_requests + 1,
-        "q_indptr must be [B + 1] and seq_lens [B]",
-    )
-    _check(
-        page_indices.dim() == 2 and int(page_indices.shape[0]) == num_requests,
-        "page_indices must be [B, max_pages]",
-    )
-    for name, t in (("key_cache", key_cache), ("value_cache", value_cache)):
-        _check(
-            t.dtype == torch.float8_e4m3fn
-            and int(t.shape[2]) == num_kv_heads
-            and int(t.shape[3]) == HEAD_DIM,
-            f"{name} must be float8_e4m3fn [num_pages, page_size, num_kv_heads, 128]",
-        )
-    _check(
-        tuple(key_cache.shape) == tuple(value_cache.shape),
-        "key_cache and value_cache must have equal shapes",
-    )
-    page_size = int(key_cache.shape[1])
-    for name, t in (("k_scale", k_scale), ("v_scale", v_scale)):
-        _check(
-            t.dtype == torch.float32 and t.numel() == 1,
-            f"{name} must be a one-element f32 tensor",
-        )
-    if quant_policy == 2:
-        _check(q_scale_inv is not None, "q_scale_inv is required when quant_policy=2")
-        _check(
-            q_scale_inv.dtype == torch.float32 and q_scale_inv.numel() == 1,
-            "q_scale_inv must be a one-element f32 tensor",
-        )
-    else:
-        # Never read by the kernel under quant_policy=1: hand it an existing f32 scalar.
-        q_scale_inv = k_scale
-    if qk_norm_policy != 0:
-        _check(
-            q_norm_weight is not None and k_norm_weight is not None,
-            "q_norm_weight and k_norm_weight are required when qk_norm_policy != 0",
-        )
-    if q_norm_weight is None or k_norm_weight is None:
-        # qk_norm_policy == 0 never reads the weights: hand the kernel an existing f32 [128]
-        # row instead of allocating and filling a tensor on every call (graph-safe).
-        placeholder = cos_sin_cache[0, :HEAD_DIM]
-        q_norm_weight = placeholder if q_norm_weight is None else q_norm_weight
-        k_norm_weight = placeholder if k_norm_weight is None else k_norm_weight
-    for name, w in (("q_norm_weight", q_norm_weight), ("k_norm_weight", k_norm_weight)):
-        _check(
-            w.dtype == torch.float32 and tuple(w.shape) == (HEAD_DIM,),
-            f"{name} must be f32 [128]",
-        )
-    if out_q is None:
-        out_q = torch.empty(
-            (num_rows, num_q_heads, HEAD_DIM), dtype=torch.float8_e4m3fn, device=device
-        )
-    _check(
-        out_q.dtype == torch.float8_e4m3fn
-        and tuple(out_q.shape) == (num_rows, num_q_heads, HEAD_DIM),
-        "out_q must be float8_e4m3fn [T, num_q_heads, 128]",
-    )
-    _check((out_k is None) == (out_v is None), "out_k and out_v must be given together")
-    has_out_kv = out_k is not None
-    for name, t in (("out_k", out_k), ("out_v", out_v)):
-        if t is not None:
-            _check(
-                t.dtype == torch.float8_e4m3fn
-                and tuple(t.shape) == (num_rows, num_kv_heads, HEAD_DIM),
-                f"{name} must be float8_e4m3fn [T, num_kv_heads, 128]",
-            )
-    aligned = (max_seqlen + 127) // 128 * 128 if dyn_prefill else 0
-    if dyn_prefill:
-        q_scale_shape: Tuple[int, ...] = (num_requests, num_q_heads, aligned)
-    elif quant_policy == 1:
-        q_scale_shape = (num_rows, num_q_heads)
-    else:
-        q_scale_shape = (0,)
-    if q_scale is None:
-        q_scale = torch.empty(q_scale_shape, dtype=torch.float32, device=device)
-    _check(
-        q_scale.dtype == torch.float32 and tuple(q_scale.shape) == q_scale_shape,
-        f"q_scale must be f32 {q_scale_shape} for this quant_policy / is_prefill",
-    )
-    if split_k_flag is None:
-        split_k_flag = torch.empty(
-            (num_requests, num_kv_heads), dtype=torch.int32, device=device
-        )
-    _check(
-        split_k_flag.dtype == torch.int32
-        and tuple(split_k_flag.shape) == (num_requests, num_kv_heads),
-        "split_k_flag must be int32 [B, num_kv_heads]",
-    )
-    tensors = {
-        "qkv": qkv,
-        "cos_sin": cos_sin_cache,
-        "seq_lens": seq_lens,
-        "q_indptr": q_indptr,
-        "page_indices": page_indices,
-        "q_norm_weight": q_norm_weight,
-        "k_norm_weight": k_norm_weight,
-        "k_scale": k_scale,
-        "v_scale": v_scale,
-        "q_scale_inv": q_scale_inv,
-        "out_q": out_q,
-        "key_cache": key_cache,
-        "value_cache": value_cache,
-        "out_k": out_k if has_out_kv else key_cache,
-        "out_v": out_v if has_out_kv else value_cache,
-        "q_scale": q_scale,
-        "split_k_flag": split_k_flag,
-    }
-    for name, t in tensors.items():
-        _check(t.is_contiguous(), f"{name} must be contiguous")
-        _check(t.device == device, f"{name} must be on {device}")
-
-    # The target build is built and loaded once per process by the program constant.
-    entry = FP8_E4M3.entry(_target(device))
-    plan = launch_plan(num_rows, num_requests, num_kv_heads)
-    values = {
-        **tensors,
-        "num_rows": num_rows,
-        "num_requests": num_requests,
-        "num_q_heads": num_q_heads,
-        "num_kv_heads": num_kv_heads,
-        "page_size": page_size,
-        "max_pages_per_request": int(page_indices.shape[1]),
-        "max_seqlen": int(max_seqlen),
-        "max_seqlen_aligned": aligned,
-        "quant_policy": int(quant_policy),
-        "norm_policy": int(qk_norm_policy),
-        "is_prefill": bool(is_prefill),
-        "has_out_kv": has_out_kv,
-        "upper_max": float(upper_max),
-        "grid_x": plan["grid"][0],
-        "grid_y": plan["grid"][1],
-        "grid_z": plan["grid"][2],
-    }
-    try:
-        args = [values[name] for name in _ARG_NAMES]
-    except KeyError as exc:
-        raise RuntimeError(
-            f"generated module expects unknown argument {exc.args[0]!r}"
-        ) from None
-    with torch.cuda.device(device), tvm_ffi.use_torch_stream():
-        entry(*args)
-    return out_q, q_scale, split_k_flag
 
 
 __all__ = [

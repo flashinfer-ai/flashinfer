@@ -325,6 +325,12 @@ PACKAGES: tuple[Package, ...] = (
         "cake_jit.py",
         refs_generic,
     ),
+    Package(
+        "flashinfer.cake_fused_qk_rope_fp8_append_backend",
+        "flashinfer/cake_fused_qk_rope_fp8_append_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
 )
 
 
