@@ -221,10 +221,6 @@ from .jit.hash_topk import gen_hash_topk_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
 from .jit.cake_sampling import gen_cake_sampling_module
-from .moe_ep.kernel_src.sm120.cake_mxfp4_megamoe import (
-    cake_sm120_megamoe_available,
-    gen_cake_sm120_megamoe_aot_modules,
-)
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 
 
@@ -1023,6 +1019,13 @@ def gen_all_modules(
                 gen_cudnn_frost_moe_module(dtype, "sm_120a") for dtype in FROST_DTYPES
             )
             jit_specs.append(gen_fp4_quantization_sm120_module())
+            # Imported here: the package import initializes flashinfer.moe_ep (every
+            # MegaMoE backend), which builds without SM120 do not need.
+            from .moe_ep.kernel_src.sm120.cake_mxfp4_megamoe import (
+                cake_sm120_megamoe_available,
+                gen_cake_sm120_megamoe_aot_modules,
+            )
+
             # Cake SM120 MXFP4 x MXFP8 MegaMoE (moe_ep backend sm120_mxfp4_mxfp8_bf16_cake):
             # the binding and the default DeepSeek-V4-Flash device instances.  Both need
             # the NCCL 2.30.7 Device API (headers + library) at build time.
