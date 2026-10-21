@@ -185,9 +185,12 @@ def w8a16_fp8_gemm_workspace_bytes(
     Raises
     ------
     ValueError
-        A shape outside the bounds above, an unknown ``algo``, a non-CUDA
-        device, or (for ``m > 0``) a split-K ``algo`` on a ``k`` that cannot
-        be sliced.
+        A shape outside the bounds above, an unknown ``algo``, or a non-CUDA
+        device.
+    RuntimeError
+        Raised by the native launcher (for ``m > 0``): a split-K ``algo`` on a
+        ``k`` that cannot be sliced, or a byte count that leaves the signed
+        64-bit range.
     """
     device = _resolve_device(device)
     _check_dims(m, n, k)
@@ -279,35 +282,31 @@ def w8a16_fp8_gemm(
     r"""bf16 / fp16 GEMM whose ``[N, K]`` operand is stored as FP8 e4m3 (W8A16).
 
     ``out = act @ (weight.float() * weight_scale).T + bias`` with the weight
-    dequantized inside the kernel; no 16-bit copy of the weight is
-    materialised.  "fp8" says how the weight is *stored* (e4m3 plus one
-    per-tensor scale, the reading of vLLM's ``CompressedTensorsW8A16Fp8``);
-    the arithmetic is a 16-bit GEMM in ``act``'s dtype.  It consumes the same
-    checkpoint tensors as TRT-LLM's ``W8A16FP8LinearMethod`` (an FP8QDQ weight
-    with one per-tensor scale) and replaces its
-    ``weight.to(dtype).mul_(scale)`` followed by ``F.linear``.
+    dequantized inside the kernel; no 16-bit copy of the weight is allocated.
+    "fp8" says how the weight is *stored* (e4m3 plus one per-tensor fp32
+    scale); the arithmetic is a 16-bit GEMM in ``act``'s dtype.
 
     Numerics.  Each e4m3 weight value is converted to ``act``'s dtype exactly
     (every finite e4m3 value is representable in both bf16 and fp16, denormals
     included), the unscaled products are accumulated in fp32, and
-    ``weight_scale`` (fp32) and ``bias`` are applied to the fp32 accumulator
-    before the single rounding to the output dtype.  The TRT-LLM path instead
-    rounds ``weight * scale`` to the activation dtype first, so the two are
-    the same mathematical operation but not bitwise equal; this one carries
-    one rounding fewer.  The weight must be finite: the two e4m3fn NaN
-    encodings (``0x7F``, ``0xFF``) are not checked for (that would cost a
-    device synchronisation per call) and produce an unspecified finite value
-    or NaN depending on the architecture and dtype.
+    ``weight_scale`` and ``bias`` are applied to the fp32 accumulator before
+    the single rounding to the output dtype.  The result is therefore not
+    bitwise equal to a GEMM against a weight pre-scaled and rounded to the
+    activation dtype (``(weight.to(dtype) * scale) @ ...``): that carries one
+    rounding more.  The weight must be finite.  Values are not checked, and a
+    NaN e4m3 encoding yields an unspecified result (a finite value or NaN).
 
     Parameters
     ----------
     act: torch.Tensor
         Activation, shape ``(..., K)``, ``float16`` or ``bfloat16``,
-        contiguous.  Leading dimensions are flattened; a leading dimension of
-        0 returns the empty output without launching.
+        contiguous, on a CUDA device (Hopper or Blackwell; every other tensor
+        must be on the same device).  Leading dimensions are flattened into
+        ``M``; a leading dimension of 0 returns the empty output without
+        launching.
     weight: torch.Tensor
         Weight, shape ``(N, K)`` (``torch.nn.Linear`` layout),
-        ``float8_e4m3fn``, contiguous.
+        ``float8_e4m3fn``, contiguous, on ``act``'s device.
     weight_scale: torch.Tensor
         One ``float32`` value (shape ``()`` or ``(1,)``) on ``act``'s device:
         the per-tensor dequantization scale.
@@ -337,10 +336,10 @@ def w8a16_fp8_gemm(
         (``<weight rows>x<activation rows>[_streamk|_splitk]``).
         ``None`` / ``"auto"`` = the launcher decides.  This is the only
         override; there are no environment variables.  A ``_splitk`` variant
-        is rejected on a ``K`` it cannot slice (Hopper: ``K`` a multiple of
-        64 whose 64-deep tile count divides into 2..8 equal slices of at least
-        8 tiles; Blackwell: ``K`` a multiple of 128 whose 128-deep tile count
-        has a divisor in 2..8).
+        is rejected with a RuntimeError on a ``K`` it cannot slice (Hopper:
+        ``K`` a multiple of 64 whose 64-deep tile count divides into 2..8
+        equal slices of at least 8 tiles; Blackwell: ``K`` a multiple of 128
+        whose 128-deep tile count has a divisor in 2..8).
 
     Notes
     -----
@@ -350,7 +349,8 @@ def w8a16_fp8_gemm(
     fp16 call only the fp16 one) and are not part of the AOT packages.
 
     Shapes and layout: ``K`` must be a multiple of 16 and ``N`` a multiple of
-    8, both non-zero, and every dimension at most ``2**31 - 1``.  Every tensor
+    8, both non-zero, and ``M`` (the product of ``act``'s leading dimensions,
+    not each of them), ``N`` and ``K`` each at most ``2**31 - 1``.  Every tensor
     among ``act`` / ``weight`` / ``bias`` / ``out`` / ``workspace`` must start
     at a 16-byte aligned address (a view into a larger buffer at an odd
     storage offset does not; contiguity alone is not enough).  Nothing is
@@ -377,6 +377,18 @@ def w8a16_fp8_gemm(
     -------
     out: torch.Tensor
         ``(..., N)`` in ``act``'s dtype.
+
+    Raises
+    ------
+    ValueError
+        Any argument outside the contract above (dtype, shape, device,
+        contiguity, alignment, aliasing, an unknown ``algo``, a ``workspace``
+        shorter than the query's answer), before anything is launched.
+    RuntimeError
+        Raised by the native launcher, also before launch: a split-K ``algo``
+        on a ``K`` it cannot slice, or a workspace byte count that leaves the
+        signed 64-bit range.  A launch failure reported by the CUDA runtime
+        surfaces the same way.
     """
     if act.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"act must be float16 or bfloat16, got {act.dtype}")

@@ -141,7 +141,8 @@ inline double W8A16Sm90SplitUs(const W8A16Sm90TileCost& t, int M, int N, int K, 
 }
 
 // Split count for a split-K variant over tile `t`: the s with the smallest modelled time
-// among the legal splits; 1 when none is legal.
+// among the legal splits whose partials fit MaxPartialsBytes; 1 when there is no such s
+// (W8A16Sm90SplitsFor then falls back to a legal split regardless of the cap).
 inline int W8A16Sm90PickSplits(const W8A16Sm90TileCost& t, int M, int N, int K, int num_sms) {
   int best = 1;
   double best_us = 1e30;

@@ -306,7 +306,8 @@ public:
 
   // Thread Counts
   // Two transform warpgroups.  Both map onto the same 128 TMEM lanes (rows); warpgroup g
-  // converts k-blocks [g * K_BLOCK_MAX / 2, (g + 1) * K_BLOCK_MAX / 2).
+  // converts half of the per-thread fragment: along the k-block mode when it divides
+  // evenly, along the chunk mode otherwise (SplitOnK in the transform below).
   static constexpr uint32_t NumTransformationGroups = 2;
   static constexpr uint32_t NumTransformationThreadsPerGroup = 128;
   static constexpr uint32_t NumTransformationThreads = NumTransformationGroups * NumTransformationThreadsPerGroup;
