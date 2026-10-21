@@ -1,172 +1,18 @@
-"""Prepared per-head FP8 projections with BF16 or dynamic FP8 output on SM100a/SM103a."""
+"""Prepared per-head FP8 projections with BF16 or dynamic FP8 output on SM100a/SM103a.
+
+The schedule a projection runs on is selected here (``route_config`` / ``schedule_key``,
+the dispatcher's own heuristic); the selected program, its launch grid and its
+loaded library come from the package registry :mod:`.cake_jit` (``ROUTES``,
+``MODULES``, ``launch_grid``, ``load``).
+"""
 
 from __future__ import annotations
 
-import functools
-from typing import Any
+from . import cake_jit
 
-_ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 # SM counts the two pinned BF16 schedules were selected on (B200, GB300). Other
 # devices route BF16 output to the general schedule, which is not exported.
 PINNED_NUM_SMS = (148, 152)
-
-# Generated programs: one source pair per physical schedule, compiled for every
-# listed architecture with that architecture's exact flags.
-PROGRAMS: dict[str, dict[str, Any]] = {
-    "cake_deepgemm_batched_gemm_1efd947b4839dee22567": {
-        "sources": [
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_1efd947b4839dee22567_kernel.cu",
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_1efd947b4839dee22567_binding.cu",
-        ],
-        "arg_plan": [
-            ["tma_buffer", "A"],
-            ["tma_buffer", "B"],
-            ["tma_buffer", "SFA"],
-            ["tma_buffer", "SFB"],
-            ["tma_buffer", "D"],
-            ["buffer", "SFD"],
-            ["parameter", "M"],
-            ["parameter", "grid_m"],
-            ["parameter", "sfd_stride"],
-            ["parameter", "alpha"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "compile_flags": [],
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_deepgemm_batched_gemm_6829670850e3066e93e7": {
-        "sources": [
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_6829670850e3066e93e7_kernel.cu",
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_6829670850e3066e93e7_binding.cu",
-        ],
-        "arg_plan": [
-            ["tma_buffer", "A"],
-            ["tma_buffer", "B"],
-            ["tma_buffer", "SFA"],
-            ["tma_buffer", "SFB"],
-            ["tma_buffer", "D"],
-            ["buffer", "SFD"],
-            ["parameter", "M"],
-            ["parameter", "grid_m"],
-            ["parameter", "sfd_stride"],
-            ["parameter", "alpha"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "compile_flags": [],
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_deepgemm_batched_gemm_987f610c37757ccda638": {
-        "sources": [
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_987f610c37757ccda638_kernel.cu",
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_987f610c37757ccda638_binding.cu",
-        ],
-        "arg_plan": [
-            ["tma_buffer", "A"],
-            ["tma_buffer", "B"],
-            ["tma_buffer", "SFA"],
-            ["tma_buffer", "SFB"],
-            ["tma_buffer", "D"],
-            ["buffer", "SFD"],
-            ["parameter", "M"],
-            ["parameter", "grid_m"],
-            ["parameter", "sfd_stride"],
-            ["parameter", "alpha"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "compile_flags": [],
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_deepgemm_batched_gemm_b2f37d6d976c59d38208": {
-        "sources": [
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_b2f37d6d976c59d38208_kernel.cu",
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_b2f37d6d976c59d38208_binding.cu",
-        ],
-        "arg_plan": [
-            ["tma_buffer", "A"],
-            ["tma_buffer", "B"],
-            ["tma_buffer", "SFA"],
-            ["tma_buffer", "SFB"],
-            ["tma_buffer", "D"],
-            ["buffer", "SFD"],
-            ["parameter", "M"],
-            ["parameter", "grid_m"],
-            ["parameter", "sfd_stride"],
-            ["parameter", "alpha"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "compile_flags": [],
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_deepgemm_batched_gemm_b679291b28fffdcd58c0": {
-        "sources": [
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_b679291b28fffdcd58c0_kernel.cu",
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_b679291b28fffdcd58c0_binding.cu",
-        ],
-        "arg_plan": [
-            ["tma_buffer", "A"],
-            ["tma_buffer", "B"],
-            ["tma_buffer", "SFA"],
-            ["tma_buffer", "SFB"],
-            ["tma_buffer", "D"],
-            ["buffer", "SFD"],
-            ["parameter", "M"],
-            ["parameter", "grid_m"],
-            ["parameter", "sfd_stride"],
-            ["parameter", "alpha"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "compile_flags": [],
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_deepgemm_batched_gemm_c23320671c92d0bbd890": {
-        "sources": [
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_c23320671c92d0bbd890_kernel.cu",
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_c23320671c92d0bbd890_binding.cu",
-        ],
-        "arg_plan": [
-            ["tma_buffer", "A"],
-            ["tma_buffer", "B"],
-            ["tma_buffer", "SFA"],
-            ["tma_buffer", "SFB"],
-            ["tma_buffer", "D"],
-            ["buffer", "SFD"],
-            ["parameter", "M"],
-            ["parameter", "grid_m"],
-            ["parameter", "sfd_stride"],
-            ["parameter", "alpha"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "compile_flags": [],
-        "arches": ["sm_100a", "sm_103a"],
-    },
-}
-# Schedule key (route, tile, stage count, epilogue) -> program.
-ROUTES: dict[str, str] = {
-    "bf16_t128_bm64_bn128_s10_bf16": "cake_deepgemm_batched_gemm_987f610c37757ccda638",
-    "bf16_t4_bm16_bn128_s12_bf16": "cake_deepgemm_batched_gemm_c23320671c92d0bbd890",
-    "general_bm128_bn128_s5_alpha": "cake_deepgemm_batched_gemm_1efd947b4839dee22567",
-    "n256_bm128_bn256_s5_fp8": "cake_deepgemm_batched_gemm_b679291b28fffdcd58c0",
-    "swap_ab_bm16_bn128_s12_fp8": "cake_deepgemm_batched_gemm_b2f37d6d976c59d38208",
-    "swap_ab_bm64_bn128_s10_fp8": "cake_deepgemm_batched_gemm_6829670850e3066e93e7",
-}
 
 
 def device_arch(device):
@@ -174,17 +20,14 @@ def device_arch(device):
     import torch
 
     device = torch.device(device)
-    catalogued = sorted(
-        {arch for record in PROGRAMS.values() for arch in record["arches"]}
-    )
     if device.type != "cuda":
         raise RuntimeError("Batched FP8 projection requires a CUDA device")
     capability = tuple(torch.cuda.get_device_capability(device))
-    arch = _ARCHES.get(capability)
-    if arch is None or arch not in catalogued:
+    arch = cake_jit.arch_for_capability(capability)
+    if arch is None:
         raise RuntimeError(
             f"Batched FP8 projection has no exported programs for compute capability "
-            f"{capability}; exported architectures: {catalogued}"
+            f"{capability}; exported architectures: {list(cake_jit.ARCHES)}"
         )
     return arch
 
@@ -331,45 +174,11 @@ def route_config(tokens, num_heads, inner, width, num_sms, epilogue, num_stages=
 
 
 def schedule_key(config):
-    """Program key of a route configuration (the ``ROUTES`` key)."""
+    """Program key of a route configuration (the ``cake_jit.ROUTES`` key)."""
     return (
         f"{config['route']}_bm{config['block_m']}_bn{config['block_n']}"
         f"_s{config['num_stages']}_{config['epilogue']}"
     )
-
-
-def _nvcc_flags(arch):
-    from flashinfer.jit.core import sm100a_nvcc_flags, sm103a_nvcc_flags
-
-    return {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}[arch]
-
-
-@functools.cache
-def jit_spec(name, arch):
-    """JIT build specification of program ``name`` for ``arch`` (exact-architecture flags)."""
-    from flashinfer.jit import env
-    from flashinfer.jit.core import gen_jit_spec
-
-    record = PROGRAMS[name]
-    if arch not in record["arches"]:
-        raise RuntimeError(f"program {name} is not exported for {arch}")
-    return gen_jit_spec(
-        name=f"{name}_{arch}",
-        sources=[env.FLASHINFER_CSRC_DIR / path for path in record["sources"]],
-        extra_cuda_cflags=[
-            *_nvcc_flags(arch),
-            *record["compile_flags"],
-            "--device-entity-has-hidden-visibility=false",
-        ],
-        extra_ldflags=["-lcuda"],
-        extra_include_paths=[env.FLASHINFER_CSRC_DIR, env.FLASHINFER_INCLUDE_DIR],
-        use_fast_math=False,
-    )
-
-
-@functools.cache
-def load_program(arch, name):
-    return jit_spec(name, arch).build_and_load()
 
 
 def _pack_scales(scales, padded_rows):
@@ -463,7 +272,7 @@ class BatchedGemmPlan:
         sms = torch.cuda.get_device_properties(aq.device).multi_processor_count
         self.config = route_config(tokens, heads, inner, width, sms, epilogue)
         key = schedule_key(self.config)
-        program = ROUTES.get(key)
+        program = cake_jit.ROUTES.get(key)
         if program is None:
             raise NotImplementedError(
                 f"The {self.config['route']} schedule ({key}) selected for T={tokens}, "
@@ -471,7 +280,11 @@ class BatchedGemmPlan:
                 "is not exported"
             )
         self.program = program
+        record = cake_jit.MODULES[program]
         cfg = self.config
+        # The grid is the registry's rule on the device's SM count (the same
+        # arithmetic ``route_config`` reports as ``grid``).
+        grid = cake_jit.launch_grid(record, tokens=tokens, sm_count=sms)
         dtype = torch.float8_e4m3fn if output_fp8 else torch.bfloat16
         if out is None:
             out = torch.empty((tokens, heads, width), dtype=dtype, device=aq.device)
@@ -522,14 +335,13 @@ class BatchedGemmPlan:
             grid_m=cfg["grid_m"],
             sfd_stride=sf_stride,
             alpha=1.0 if alpha is None else float(alpha),
-            grid_x=cfg["grid"][0],
-            grid_y=cfg["grid"][1],
-            grid_z=cfg["grid"][2],
+            grid_x=grid[0],
+            grid_y=grid[1],
+            grid_z=grid[2],
         )
-        module = load_program(arch, program)
-        record = PROGRAMS[program]
-        args = tuple(self.bindings[name] for _kind, name in record["arg_plan"])
-        self._submission = (module[record["ffi_entry"]], args)
+        module = cake_jit.load(program, arch)
+        args = cake_jit.launch_args(record, self.bindings, grid)
+        self._submission = (getattr(module, record["ffi_entry"]), args)
         self._retained = (module, a, b, out, output_scales, sf_storage, self.bindings)
         self.values, self.scales = out, output_scales
         self.output = (out, output_scales) if output_fp8 else out

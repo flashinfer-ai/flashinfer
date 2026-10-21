@@ -47,6 +47,7 @@ from flashinfer.fused_moe import (
     GeGLU,
     GeGLUTanh,
     Identity,
+    PowLU,
     ReLU,
     ReLU2,
     SiLU,
@@ -505,6 +506,8 @@ class TestReprRoundTrip:
             ReLU2(),
             GeGLUTanh(),
             SwiGLUStep(),
+            PowLU(),
+            PowLU(m=3.5, limit=7.0),
             Identity(),
             GELU(),
             ReLU(),
@@ -1412,6 +1415,7 @@ class TestMoERunnerSupport:
             GeGLUTanh,
             ReLU2,
             SiTU,
+            PowLU,
             Identity,
             GELU,
             ReLU,
@@ -4361,7 +4365,6 @@ class TestFusedSharedExpertsBackendGating:
             if r.supports_fused_shared_experts
         }
         assert supporting == {
-            "CakeStepFunRunner",
             "TrtllmFp4RoutedRunner",
             "TrtllmFp8BlockRunner",
         }, (

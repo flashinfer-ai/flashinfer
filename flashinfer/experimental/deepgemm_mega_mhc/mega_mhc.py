@@ -22,124 +22,172 @@ SPLIT_BARRIER_WORDS = 2 * (MAX_TOKENS // 64) * 16
 # schedule keys (hidden, split count, shifted, shared scale layout) each source
 # serves with its compile-line defines.
 PROGRAMS: dict[str, dict[str, Any]] = {
-    "cake_mega_mhc_078e89653dee8bca9319": {
+    "cake_mega_mhc_134570ae7cc112e9d84e": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_078e89653dee8bca9319_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_078e89653dee8bca9319_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
-        "kernel_symbol": "kernel_cake_mega_mhc_078e89653dee8bca9319",
-        "hidden": 5120,
-        "shifted": True,
-        "shared_sf": True,
-        "shared_sf_block_m": 224,
-        "num_splits": [20, 27],
-    },
-    "cake_mega_mhc_18f70125e9a55ebad54f": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_18f70125e9a55ebad54f_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_18f70125e9a55ebad54f_binding.cu",
-        ],
-        "kernel_symbol": "kernel_cake_mega_mhc_18f70125e9a55ebad54f",
-        "hidden": 5120,
-        "shifted": True,
-        "shared_sf": True,
-        "shared_sf_block_m": 224,
-        "num_splits": [16],
-    },
-    "cake_mega_mhc_35a28241805e52d8d025": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_35a28241805e52d8d025_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_35a28241805e52d8d025_binding.cu",
-        ],
-        "kernel_symbol": "kernel_cake_mega_mhc_35a28241805e52d8d025",
-        "hidden": 5120,
-        "shifted": False,
-        "shared_sf": False,
-        "shared_sf_block_m": 0,
-        "num_splits": [16, 20, 27],
-    },
-    "cake_mega_mhc_45d5adebe0a596a1e4a3": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_45d5adebe0a596a1e4a3_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_45d5adebe0a596a1e4a3_binding.cu",
-        ],
-        "kernel_symbol": "kernel_cake_mega_mhc_45d5adebe0a596a1e4a3",
-        "hidden": 5120,
-        "shifted": False,
-        "shared_sf": False,
-        "shared_sf_block_m": 0,
-        "num_splits": [40],
-    },
-    "cake_mega_mhc_557f419314de9efca58e": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_557f419314de9efca58e_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_557f419314de9efca58e_binding.cu",
-        ],
-        "kernel_symbol": "kernel_cake_mega_mhc_557f419314de9efca58e",
-        "hidden": 5120,
-        "shifted": True,
-        "shared_sf": False,
-        "shared_sf_block_m": 0,
-        "num_splits": [40],
-    },
-    "cake_mega_mhc_7d69b17877f1cfa74fef": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_7d69b17877f1cfa74fef_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_7d69b17877f1cfa74fef_binding.cu",
-        ],
-        "kernel_symbol": "kernel_cake_mega_mhc_7d69b17877f1cfa74fef",
-        "hidden": 5120,
-        "shifted": True,
-        "shared_sf": False,
-        "shared_sf_block_m": 0,
-        "num_splits": [20, 27],
-    },
-    "cake_mega_mhc_b9fd6d16636225d37ec9": {
-        "sources": [
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b9fd6d16636225d37ec9_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b9fd6d16636225d37ec9_binding.cu",
-        ],
-        "kernel_symbol": "kernel_cake_mega_mhc_b9fd6d16636225d37ec9",
+        "kernel_symbol": "kernel_cake_mega_mhc_134570ae7cc112e9d84e",
         "hidden": 5120,
         "shifted": True,
         "shared_sf": False,
         "shared_sf_block_m": 0,
         "num_splits": [16],
     },
-    "cake_mega_mhc_f7faf2e5631cadf7cdd7": {
+    "cake_mega_mhc_1576b7789968f04c8419": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_f7faf2e5631cadf7cdd7_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_f7faf2e5631cadf7cdd7_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_1576b7789968f04c8419_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_1576b7789968f04c8419_binding.cu",
         ],
-        "kernel_symbol": "kernel_cake_mega_mhc_f7faf2e5631cadf7cdd7",
+        "kernel_symbol": "kernel_cake_mega_mhc_1576b7789968f04c8419",
         "hidden": 5120,
         "shifted": False,
         "shared_sf": True,
         "shared_sf_block_m": 224,
-        "num_splits": [16, 20, 27],
+        "num_splits": [16, 20],
     },
-    "cake_mega_mhc_f87d829e07967a853c8e": {
+    "cake_mega_mhc_2b99261aab173a941cb4": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_f87d829e07967a853c8e_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_f87d829e07967a853c8e_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_2b99261aab173a941cb4_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_2b99261aab173a941cb4_binding.cu",
         ],
-        "kernel_symbol": "kernel_cake_mega_mhc_f87d829e07967a853c8e",
+        "kernel_symbol": "kernel_cake_mega_mhc_2b99261aab173a941cb4",
+        "hidden": 5120,
+        "shifted": False,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": [16, 20],
+    },
+    "cake_mega_mhc_407321791585dc9fc44b": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_407321791585dc9fc44b_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_407321791585dc9fc44b_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_407321791585dc9fc44b",
+        "hidden": 5120,
+        "shifted": False,
+        "shared_sf": True,
+        "shared_sf_block_m": 224,
+        "num_splits": [27],
+    },
+    "cake_mega_mhc_41df2a8c4d3c4849adbf": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_41df2a8c4d3c4849adbf_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_41df2a8c4d3c4849adbf_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_41df2a8c4d3c4849adbf",
+        "hidden": 5120,
+        "shifted": True,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": [40],
+    },
+    "cake_mega_mhc_43b829c4b071416a4595": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_43b829c4b071416a4595_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_43b829c4b071416a4595_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_43b829c4b071416a4595",
+        "hidden": 5120,
+        "shifted": True,
+        "shared_sf": True,
+        "shared_sf_block_m": 224,
+        "num_splits": [27],
+    },
+    "cake_mega_mhc_8fd99969edc5072d3477": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_8fd99969edc5072d3477_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_8fd99969edc5072d3477_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_8fd99969edc5072d3477",
+        "hidden": 5120,
+        "shifted": True,
+        "shared_sf": True,
+        "shared_sf_block_m": 224,
+        "num_splits": [16],
+    },
+    "cake_mega_mhc_a5521c9dfaf81d2c0f1f": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_a5521c9dfaf81d2c0f1f_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_a5521c9dfaf81d2c0f1f_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_a5521c9dfaf81d2c0f1f",
         "hidden": 5120,
         "shifted": True,
         "shared_sf": True,
         "shared_sf_block_m": 224,
         "num_splits": [40],
     },
-    "cake_mega_mhc_f9701d865ea1f932513b": {
+    "cake_mega_mhc_b52ed5c3afc2fcbd2d0f": {
         "sources": [
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_f9701d865ea1f932513b_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_f9701d865ea1f932513b_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b52ed5c3afc2fcbd2d0f_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b52ed5c3afc2fcbd2d0f_binding.cu",
         ],
-        "kernel_symbol": "kernel_cake_mega_mhc_f9701d865ea1f932513b",
+        "kernel_symbol": "kernel_cake_mega_mhc_b52ed5c3afc2fcbd2d0f",
+        "hidden": 5120,
+        "shifted": True,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": [20],
+    },
+    "cake_mega_mhc_b73ed09be74eaa063166": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b73ed09be74eaa063166_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b73ed09be74eaa063166_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_b73ed09be74eaa063166",
+        "hidden": 5120,
+        "shifted": True,
+        "shared_sf": True,
+        "shared_sf_block_m": 224,
+        "num_splits": [20],
+    },
+    "cake_mega_mhc_b8c6c9ebebc80eb063b8": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b8c6c9ebebc80eb063b8_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b8c6c9ebebc80eb063b8_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_b8c6c9ebebc80eb063b8",
+        "hidden": 5120,
+        "shifted": True,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": [27],
+    },
+    "cake_mega_mhc_c7892aa3a7b985dcac4a": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_c7892aa3a7b985dcac4a_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_c7892aa3a7b985dcac4a_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_c7892aa3a7b985dcac4a",
         "hidden": 5120,
         "shifted": False,
         "shared_sf": True,
         "shared_sf_block_m": 224,
+        "num_splits": [40],
+    },
+    "cake_mega_mhc_dc85bbfab3b20cf209fc": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_dc85bbfab3b20cf209fc_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_dc85bbfab3b20cf209fc_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_dc85bbfab3b20cf209fc",
+        "hidden": 5120,
+        "shifted": False,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": [27],
+    },
+    "cake_mega_mhc_f7107723c112a3b117a9": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_f7107723c112a3b117a9_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_f7107723c112a3b117a9_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_f7107723c112a3b117a9",
+        "hidden": 5120,
+        "shifted": False,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
         "num_splits": [40],
     },
 }
@@ -149,7 +197,7 @@ ROUTES: list[dict[str, Any]] = [
         "num_splits": 16,
         "shifted": False,
         "shared_sf": False,
-        "program": "cake_mega_mhc_35a28241805e52d8d025",
+        "program": "cake_mega_mhc_2b99261aab173a941cb4",
         "defines": {"NUM_SPLITS": 16, "FP8_NORM_PARTITIONS": 2},
     },
     {
@@ -157,7 +205,7 @@ ROUTES: list[dict[str, Any]] = [
         "num_splits": 16,
         "shifted": False,
         "shared_sf": True,
-        "program": "cake_mega_mhc_f7faf2e5631cadf7cdd7",
+        "program": "cake_mega_mhc_1576b7789968f04c8419",
         "defines": {"NUM_SPLITS": 16, "FP8_NORM_PARTITIONS": 2},
     },
     {
@@ -165,7 +213,7 @@ ROUTES: list[dict[str, Any]] = [
         "num_splits": 16,
         "shifted": True,
         "shared_sf": False,
-        "program": "cake_mega_mhc_b9fd6d16636225d37ec9",
+        "program": "cake_mega_mhc_134570ae7cc112e9d84e",
         "defines": {"NUM_SPLITS": 16, "FP8_NORM_PARTITIONS": 2},
     },
     {
@@ -173,7 +221,7 @@ ROUTES: list[dict[str, Any]] = [
         "num_splits": 16,
         "shifted": True,
         "shared_sf": True,
-        "program": "cake_mega_mhc_18f70125e9a55ebad54f",
+        "program": "cake_mega_mhc_8fd99969edc5072d3477",
         "defines": {"NUM_SPLITS": 16, "FP8_NORM_PARTITIONS": 2},
     },
     {
@@ -181,7 +229,7 @@ ROUTES: list[dict[str, Any]] = [
         "num_splits": 20,
         "shifted": False,
         "shared_sf": False,
-        "program": "cake_mega_mhc_35a28241805e52d8d025",
+        "program": "cake_mega_mhc_2b99261aab173a941cb4",
         "defines": {"NUM_SPLITS": 20, "FP8_NORM_PARTITIONS": 10},
     },
     {
@@ -189,7 +237,7 @@ ROUTES: list[dict[str, Any]] = [
         "num_splits": 20,
         "shifted": False,
         "shared_sf": True,
-        "program": "cake_mega_mhc_f7faf2e5631cadf7cdd7",
+        "program": "cake_mega_mhc_1576b7789968f04c8419",
         "defines": {"NUM_SPLITS": 20, "FP8_NORM_PARTITIONS": 10},
     },
     {
@@ -197,7 +245,7 @@ ROUTES: list[dict[str, Any]] = [
         "num_splits": 20,
         "shifted": True,
         "shared_sf": False,
-        "program": "cake_mega_mhc_7d69b17877f1cfa74fef",
+        "program": "cake_mega_mhc_b52ed5c3afc2fcbd2d0f",
         "defines": {"NUM_SPLITS": 20, "FP8_NORM_PARTITIONS": 10},
     },
     {
@@ -205,7 +253,7 @@ ROUTES: list[dict[str, Any]] = [
         "num_splits": 20,
         "shifted": True,
         "shared_sf": True,
-        "program": "cake_mega_mhc_078e89653dee8bca9319",
+        "program": "cake_mega_mhc_b73ed09be74eaa063166",
         "defines": {"NUM_SPLITS": 20, "FP8_NORM_PARTITIONS": 10},
     },
     {
@@ -213,7 +261,7 @@ ROUTES: list[dict[str, Any]] = [
         "num_splits": 27,
         "shifted": False,
         "shared_sf": False,
-        "program": "cake_mega_mhc_35a28241805e52d8d025",
+        "program": "cake_mega_mhc_dc85bbfab3b20cf209fc",
         "defines": {"NUM_SPLITS": 27, "FP8_NORM_PARTITIONS": 10},
     },
     {
@@ -221,7 +269,7 @@ ROUTES: list[dict[str, Any]] = [
         "num_splits": 27,
         "shifted": False,
         "shared_sf": True,
-        "program": "cake_mega_mhc_f7faf2e5631cadf7cdd7",
+        "program": "cake_mega_mhc_407321791585dc9fc44b",
         "defines": {"NUM_SPLITS": 27, "FP8_NORM_PARTITIONS": 10},
     },
     {
@@ -229,7 +277,7 @@ ROUTES: list[dict[str, Any]] = [
         "num_splits": 27,
         "shifted": True,
         "shared_sf": False,
-        "program": "cake_mega_mhc_7d69b17877f1cfa74fef",
+        "program": "cake_mega_mhc_b8c6c9ebebc80eb063b8",
         "defines": {"NUM_SPLITS": 27, "FP8_NORM_PARTITIONS": 10},
     },
     {
@@ -237,7 +285,7 @@ ROUTES: list[dict[str, Any]] = [
         "num_splits": 27,
         "shifted": True,
         "shared_sf": True,
-        "program": "cake_mega_mhc_078e89653dee8bca9319",
+        "program": "cake_mega_mhc_43b829c4b071416a4595",
         "defines": {"NUM_SPLITS": 27, "FP8_NORM_PARTITIONS": 10},
     },
     {
@@ -245,7 +293,7 @@ ROUTES: list[dict[str, Any]] = [
         "num_splits": 40,
         "shifted": False,
         "shared_sf": False,
-        "program": "cake_mega_mhc_45d5adebe0a596a1e4a3",
+        "program": "cake_mega_mhc_f7107723c112a3b117a9",
         "defines": {"NUM_SPLITS": 40, "FP8_NORM_PARTITIONS": 10},
     },
     {
@@ -253,7 +301,7 @@ ROUTES: list[dict[str, Any]] = [
         "num_splits": 40,
         "shifted": False,
         "shared_sf": True,
-        "program": "cake_mega_mhc_f9701d865ea1f932513b",
+        "program": "cake_mega_mhc_c7892aa3a7b985dcac4a",
         "defines": {"NUM_SPLITS": 40, "FP8_NORM_PARTITIONS": 10},
     },
     {
@@ -261,7 +309,7 @@ ROUTES: list[dict[str, Any]] = [
         "num_splits": 40,
         "shifted": True,
         "shared_sf": False,
-        "program": "cake_mega_mhc_557f419314de9efca58e",
+        "program": "cake_mega_mhc_41df2a8c4d3c4849adbf",
         "defines": {"NUM_SPLITS": 40, "FP8_NORM_PARTITIONS": 10},
     },
     {
@@ -269,7 +317,7 @@ ROUTES: list[dict[str, Any]] = [
         "num_splits": 40,
         "shifted": True,
         "shared_sf": True,
-        "program": "cake_mega_mhc_f87d829e07967a853c8e",
+        "program": "cake_mega_mhc_a5521c9dfaf81d2c0f1f",
         "defines": {"NUM_SPLITS": 40, "FP8_NORM_PARTITIONS": 10},
     },
 ]

@@ -237,12 +237,10 @@ __device__ __forceinline__ void tcgen05_mma_mxf4nvf4_bs_cta2(
 #define BLOCK_N 256
 #define B_HALF_N 128
 #define BLOCK_K 64
-#define MMA_K 16
 #define CTA_GROUP 2
 #define NUM_STAGES 7
 #define GROUP_M 16
 #define WORK_STAGES 4
-#define WORK_CONSUMERS 546
 #define NUM_K_ITERS 112
 #define N_TILES 21
 #define HIDDEN 5376
@@ -476,6 +474,12 @@ kernel_minimax_h3_out_proj_bf16(const __grid_constant__ CUtensorMap A, const __g
                         break;
                     }
                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                }
+                #pragma unroll 1
+                for (int _ = 0; _ < 7; _++) {
+                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
+                    load_stage += 1;
+                    if (load_stage == 7) { load_stage = 0; _phase_mma_done ^= 1; }
                 }
             }
         }
@@ -817,7 +821,6 @@ kernel_minimax_h3_out_proj_bf16(const __grid_constant__ CUtensorMap A, const __g
 #undef GROUP_M
 #undef HIDDEN
 #undef MINIMAX_H3_OUT_PROJ_INF
-#undef MMA_K
 #undef NUM_K_ITERS
 #undef NUM_MAINLOOP_PIPE_STAGES
 #undef NUM_STAGES
@@ -836,7 +839,6 @@ kernel_minimax_h3_out_proj_bf16(const __grid_constant__ CUtensorMap A, const __g
 #undef SMEM_WORK_RESPONSE_STRIDE
 #undef TMEM_ACCUM_OFFSET
 #undef TMEM_NCOLS
-#undef WORK_CONSUMERS
 #undef WORK_STAGES
 #undef epilogue_done_addr
 #undef mainloop_done_addr
@@ -1053,18 +1055,6 @@ kernel_minimax_h3_quant_mxfp8(__nv_bfloat16* __restrict__ attn_out, uint8_t* __r
 #define SMEM_SMEM_SFB_ALL_OFF 67584
 #define SMEM_SMEM_SFB_ALL_STAGE_BYTES 2048
 #define SMEM_SMEM_SFB_ALL_STRIDE 68608
-#define SMEM_SMEM_SFA0_OFF 66560
-#define SMEM_SMEM_SFA0_STAGE_BYTES 512
-#define SMEM_SMEM_SFA0_STRIDE 68608
-#define SMEM_SMEM_SFA1_OFF 67072
-#define SMEM_SMEM_SFA1_STAGE_BYTES 512
-#define SMEM_SMEM_SFA1_STRIDE 68608
-#define SMEM_SMEM_SFB0_OFF 67584
-#define SMEM_SMEM_SFB0_STAGE_BYTES 1024
-#define SMEM_SMEM_SFB0_STRIDE 68608
-#define SMEM_SMEM_SFB1_OFF 68608
-#define SMEM_SMEM_SFB1_STAGE_BYTES 1024
-#define SMEM_SMEM_SFB1_STRIDE 68608
 #define SMEM_WORK_RESPONSE_OFF 206848
 #define SMEM_WORK_RESPONSE_STAGE_BYTES 16
 #define SMEM_WORK_RESPONSE_STRIDE 16
@@ -1302,6 +1292,12 @@ kernel_minimax_h3_out_proj_e4m3(const __grid_constant__ CUtensorMap A, const __g
                         break;
                     }
                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                }
+                #pragma unroll 1
+                for (int _ = 0; _ < 3; _++) {
+                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
+                    load_stage += 1;
+                    if (load_stage == 3) { load_stage = 0; _phase_mma_done ^= 1; }
                 }
             }
         }
@@ -1666,21 +1662,9 @@ kernel_minimax_h3_out_proj_e4m3(const __grid_constant__ CUtensorMap A, const __g
 #undef SMEM_SMEM_B_OFF
 #undef SMEM_SMEM_B_STAGE_BYTES
 #undef SMEM_SMEM_B_STRIDE
-#undef SMEM_SMEM_SFA0_OFF
-#undef SMEM_SMEM_SFA0_STAGE_BYTES
-#undef SMEM_SMEM_SFA0_STRIDE
-#undef SMEM_SMEM_SFA1_OFF
-#undef SMEM_SMEM_SFA1_STAGE_BYTES
-#undef SMEM_SMEM_SFA1_STRIDE
 #undef SMEM_SMEM_SFA_ALL_OFF
 #undef SMEM_SMEM_SFA_ALL_STAGE_BYTES
 #undef SMEM_SMEM_SFA_ALL_STRIDE
-#undef SMEM_SMEM_SFB0_OFF
-#undef SMEM_SMEM_SFB0_STAGE_BYTES
-#undef SMEM_SMEM_SFB0_STRIDE
-#undef SMEM_SMEM_SFB1_OFF
-#undef SMEM_SMEM_SFB1_STAGE_BYTES
-#undef SMEM_SMEM_SFB1_STRIDE
 #undef SMEM_SMEM_SFB_ALL_OFF
 #undef SMEM_SMEM_SFB_ALL_STAGE_BYTES
 #undef SMEM_SMEM_SFB_ALL_STRIDE
@@ -1903,30 +1887,6 @@ kernel_minimax_h3_quant_nvfp4(__nv_bfloat16* __restrict__ attn_out, float* __res
 #define SMEM_SMEM_SFB_ALL_OFF 35840
 #define SMEM_SMEM_SFB_ALL_STAGE_BYTES 4096
 #define SMEM_SMEM_SFB_ALL_STRIDE 38912
-#define SMEM_SMEM_V4_OFF 33792
-#define SMEM_SMEM_V4_STAGE_BYTES 512
-#define SMEM_SMEM_V4_STRIDE 38912
-#define SMEM_SMEM_V5_OFF 34304
-#define SMEM_SMEM_V5_STAGE_BYTES 512
-#define SMEM_SMEM_V5_STRIDE 38912
-#define SMEM_SMEM_V6_OFF 34816
-#define SMEM_SMEM_V6_STAGE_BYTES 512
-#define SMEM_SMEM_V6_STRIDE 38912
-#define SMEM_SMEM_V7_OFF 35328
-#define SMEM_SMEM_V7_STAGE_BYTES 512
-#define SMEM_SMEM_V7_STRIDE 38912
-#define SMEM_SMEM_V8_OFF 35840
-#define SMEM_SMEM_V8_STAGE_BYTES 1024
-#define SMEM_SMEM_V8_STRIDE 38912
-#define SMEM_SMEM_V9_OFF 36864
-#define SMEM_SMEM_V9_STAGE_BYTES 1024
-#define SMEM_SMEM_V9_STRIDE 38912
-#define SMEM_SMEM_V10_OFF 37888
-#define SMEM_SMEM_V10_STAGE_BYTES 1024
-#define SMEM_SMEM_V10_STRIDE 38912
-#define SMEM_SMEM_V11_OFF 38912
-#define SMEM_SMEM_V11_STAGE_BYTES 1024
-#define SMEM_SMEM_V11_STRIDE 38912
 #define SMEM_WORK_RESPONSE_OFF 195584
 #define SMEM_WORK_RESPONSE_STAGE_BYTES 16
 #define SMEM_WORK_RESPONSE_STRIDE 16
@@ -2176,6 +2136,12 @@ kernel_minimax_h3_out_proj_e2m1(const __grid_constant__ CUtensorMap A, const __g
                         break;
                     }
                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                }
+                #pragma unroll 1
+                for (int _ = 0; _ < 5; _++) {
+                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
+                    load_stage += 1;
+                    if (load_stage == 5) { load_stage = 0; _phase_mma_done ^= 1; }
                 }
             }
         }
@@ -2559,30 +2525,6 @@ kernel_minimax_h3_out_proj_e2m1(const __grid_constant__ CUtensorMap A, const __g
 #undef SMEM_SMEM_SFB_ALL_OFF
 #undef SMEM_SMEM_SFB_ALL_STAGE_BYTES
 #undef SMEM_SMEM_SFB_ALL_STRIDE
-#undef SMEM_SMEM_V10_OFF
-#undef SMEM_SMEM_V10_STAGE_BYTES
-#undef SMEM_SMEM_V10_STRIDE
-#undef SMEM_SMEM_V11_OFF
-#undef SMEM_SMEM_V11_STAGE_BYTES
-#undef SMEM_SMEM_V11_STRIDE
-#undef SMEM_SMEM_V4_OFF
-#undef SMEM_SMEM_V4_STAGE_BYTES
-#undef SMEM_SMEM_V4_STRIDE
-#undef SMEM_SMEM_V5_OFF
-#undef SMEM_SMEM_V5_STAGE_BYTES
-#undef SMEM_SMEM_V5_STRIDE
-#undef SMEM_SMEM_V6_OFF
-#undef SMEM_SMEM_V6_STAGE_BYTES
-#undef SMEM_SMEM_V6_STRIDE
-#undef SMEM_SMEM_V7_OFF
-#undef SMEM_SMEM_V7_STAGE_BYTES
-#undef SMEM_SMEM_V7_STRIDE
-#undef SMEM_SMEM_V8_OFF
-#undef SMEM_SMEM_V8_STAGE_BYTES
-#undef SMEM_SMEM_V8_STRIDE
-#undef SMEM_SMEM_V9_OFF
-#undef SMEM_SMEM_V9_STAGE_BYTES
-#undef SMEM_SMEM_V9_STRIDE
 #undef SMEM_TOTAL
 #undef SMEM_WORK_RESPONSE_OFF
 #undef SMEM_WORK_RESPONSE_STAGE_BYTES

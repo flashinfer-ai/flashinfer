@@ -39,17 +39,11 @@ _N8_W2A_M16_TOKENS = (16,)
 _N32_CLAIM8_TOKENS = (512, 1024)
 _MID_WORK5FD_TOKENS = (2048, 4096)
 _LARGE_C7_TOKENS = (8192, 16384)
-# Architectures whose single-token route runs the fused quantization + routing
-# FC1 (three kernels: FC1, FC2, finalize) -- both today; an architecture outside
-# this set would launch the separate single-token quantization + router kernel
-# before the FC1 (four kernels, the "m1" selector).
-_M1_FUSED_ARCHES = ("sm_100a", "sm_103a")
-# Architectures whose 8192- and 16384-token route runs the FC2 that stores an
-# 8-bit per-tile partial with per-tile FP32 scales and the finalize that
-# consumes it (eight kernels) -- both today; an architecture outside this set
-# would run the pre-shuffled scale-factor route (nine kernels, the "large_c7"
-# selector).
-_LARGE_Q8I_ARCHES = ("sm_100a", "sm_103a")
+# Architectures whose 8- and 16-token routes run the FC1 + FC2 programs with evict_first cache
+# hints on their weight-stream TMA loads (the "n8_feature_ef_f2e" / "n8_w2a_m16_ef_f2e"
+# selectors) -- sm_100a today; sm_103a keeps "n8_feature" / "n8_w2a_m16".  Same stage lists
+# and launch arguments as the routes they supersede.
+_SMALL_L2POLICY_ARCHES = ("sm_100a",)
 # Architectures whose 4096-token route runs the same 8-bit per-tile partial FC2
 # and finalize behind the work5fd FC1 (eight kernels); the 2048-token route
 # keeps the BF16 expert output everywhere.
@@ -62,13 +56,20 @@ _MID_Q8I_TOKENS = (4096,)
 # other large row keeps the production routing kernels (256 pairs per CTA).
 _LARGE_P1024_ARCHES = ("sm_100a",)
 _LARGE_P1024_TOKENS = (16384,)
+# Architectures and token counts whose large route fuses the quantization with the
+# routing-table reset and runs the 512-pairs-per-CTA privatized histogram / block-
+# reserved scatter (seven launches; the "large_q8i_p512fh2qr" selector) -- the
+# 8192-token row of sm_100a today.
+_LARGE_P512FH2QR_ARCHES = ("sm_100a",)
+_LARGE_P512FH2QR_TOKENS = (8192,)
 # The 512- and 1024-token routes launch the routing kernel as one thread-block
 # cluster of this many CTAs (the kernel declares the matching cluster size).
 _ROUTE_MC_CLUSTER = 8
 # Routed (token, expert-slot) pairs one CTA of the routing histogram and
 # scatter kernels handles: 256 for the production kernels, 1024 for the
-# per-CTA privatized kernels of the "large_q8i_p1024" selector.
-_ROUTE_PAIRS_PER_CTA = {"large_q8i_p1024": 1024}
+# per-CTA privatized kernels of the "large_q8i_p1024" selector, 512 for those of
+# the "large_q8i_p512fh2qr" selector.
+_ROUTE_PAIRS_PER_CTA = {"large_q8i_p1024": 1024, "large_q8i_p512fh2qr": 512}
 # FC2 device-workfeed pools. The 16-token route runs an FC2 program built for
 # two resident CTAs per SM (__launch_bounds__(512, 2)), so its pool holds
 # 2 * SM // (_H // 128) rows (280 CTAs on a 148-SM part); the 32..256-token
@@ -79,14 +80,9 @@ _ROUTE_PAIRS_PER_CTA = {"large_q8i_p1024": 1024}
 _N8_W2A_M16_FC2_GRID_N_SM_FACTOR = 2
 _M64_CLAIM8_FC2_GRID_N = 12
 _N32_CLAIM8_FC2_GRID_N = 7
-# Pre-shuffled FC1 scale factors (the ``large_c7`` route, which no delivered
-# architecture selects today). The tile-N128 FC1
-# consumes K in steps of 512 elements; for every (N-tile, K-step) the writer
-# emits the 4096-byte shared-memory image FC1 expects (128 rows x 32 bytes).
+# The tile-N128 FC1 consumes K in steps of 512 elements.
 _FC1_K_STEP = 512
 _FC1_K_TILES = _H // _FC1_K_STEP
-_SFB_IMAGE_BYTES = 128 * (_FC1_K_STEP // 16)
-_SFB_IMAGE_BLOCKS = _SFB_IMAGE_BYTES // 512
 
 # --------------------------------------------------------------------------
 # Route table: selector -> (ordered stages, {stage: logical kernel key},
@@ -106,7 +102,10 @@ _GENERIC = (
 _FUSED = ("quant", "fused_router", "fc1", "fc2", "finalize")
 _QUANT_ROUTE = ("quant_route", "fc1", "fc2", "finalize")
 _M1_FUSED = ("fc1", "fc2", "finalize")
-_LARGE = _GENERIC[:5] + ("sfb_shuffle",) + _GENERIC[5:]
+# The seven-stage large route whose quantization and routing-table reset run in
+# one launch (blocks below num_tokens quantize, the trailing blocks reset; the
+# "large_q8i_p512fh2qr" selector).
+_QR_GENERIC = ("quant_reset",) + _GENERIC[2:]
 
 
 def _generic(tile_n, fc1=None, fc2=None, finalize=None, extra=None, stages=_GENERIC):
@@ -121,16 +120,6 @@ def _generic(tile_n, fc1=None, fc2=None, finalize=None, extra=None, stages=_GENE
 
 
 _SELECTORS = {
-    "m1": (
-        _QUANT_ROUTE,
-        {
-            "quant_route": "quant_route:m1",
-            "fc1": "fc1:n8_small",
-            "fc2": "fc2:n8_m1",
-            "finalize": "finalize:feature",
-        },
-        None,
-    ),
     "m1_s2a": (
         _M1_FUSED,
         {
@@ -156,6 +145,26 @@ _SELECTORS = {
             "quant_route": "quant_route:s2b",
             "fc1": "fc1:n8_s3b",
             "fc2": "fc2:n8_w2a_s4",
+            "finalize": "finalize:feature",
+        },
+        "sm2",
+    ),
+    "n8_feature_ef_f2e": (
+        _QUANT_ROUTE,
+        {
+            "quant_route": "quant_route:s2b",
+            "fc1": "fc1:n8_persistent_ef",
+            "fc2": "fc2:n8_workfeed_f2e",
+            "finalize": "finalize:feature",
+        },
+        "sm",
+    ),
+    "n8_w2a_m16_ef_f2e": (
+        _QUANT_ROUTE,
+        {
+            "quant_route": "quant_route:s2b",
+            "fc1": "fc1:n8_persistent_ef",
+            "fc2": "fc2:n8_w2a_s4_f2e",
             "finalize": "finalize:feature",
         },
         "sm2",
@@ -193,16 +202,6 @@ _SELECTORS = {
         ),
         None,
     ),
-    "large_c7": (
-        _LARGE,
-        _generic(
-            128,
-            fc1="fc1:n128_sfbs",
-            extra={"sfb_shuffle": "sfb_shuffle:n128"},
-            stages=_LARGE,
-        ),
-        None,
-    ),
     "large_q8i": (
         _GENERIC,
         _generic(128, fc2="fc2:n128_q8i", finalize="finalize:n128_q8i"),
@@ -218,6 +217,21 @@ _SELECTORS = {
                 "route_histogram": "route_histogram:n128_p1024",
                 "route_scatter": "route_scatter:n128_p1024",
             },
+        ),
+        None,
+    ),
+    "large_q8i_p512fh2qr": (
+        _QR_GENERIC,
+        _generic(
+            128,
+            fc2="fc2:n128_q8i",
+            finalize="finalize:n128_q8i",
+            extra={
+                "quant_reset": "quant_reset:n128_p512fh2qr",
+                "route_histogram": "route_histogram:n128_p512f",
+                "route_scatter": "route_scatter:n128_p512fh2",
+            },
+            stages=_QR_GENERIC,
         ),
         None,
     ),
@@ -245,11 +259,11 @@ def _tile_n(num_tokens):
 def _selector(arch, num_tokens):
     tile_n = _tile_n(num_tokens)
     if num_tokens == 1:
-        return "m1_s2a" if arch in _M1_FUSED_ARCHES else "m1"
+        return "m1_s2a"
     if num_tokens in _N8_W2A_M16_TOKENS:
-        return "n8_w2a_m16"
+        return "n8_w2a_m16_ef_f2e" if arch in _SMALL_L2POLICY_ARCHES else "n8_w2a_m16"
     if num_tokens == 8:
-        return "n8_feature"
+        return "n8_feature_ef_f2e" if arch in _SMALL_L2POLICY_ARCHES else "n8_feature"
     if num_tokens in _FORCED_TILE_N16_TOKENS:
         return "m64_claim8"
     if num_tokens in _N32_CLAIM8_TOKENS:
@@ -259,9 +273,11 @@ def _selector(arch, num_tokens):
             return "mid_q8i"
         return "mid_work5fd"
     if num_tokens in _LARGE_C7_TOKENS:
+        if arch in _LARGE_P512FH2QR_ARCHES and num_tokens in _LARGE_P512FH2QR_TOKENS:
+            return "large_q8i_p512fh2qr"
         if arch in _LARGE_P1024_ARCHES and num_tokens in _LARGE_P1024_TOKENS:
             return "large_q8i_p1024"
-        return "large_q8i" if arch in _LARGE_Q8I_ARCHES else "large_c7"
+        return "large_q8i"
     return tile_n
 
 
@@ -293,10 +309,6 @@ def _fc2_grid_n(selector, max_tiles, sm_count):
     return min(max_tiles, pool)
 
 
-def _sfb_shuffled_bytes(max_tiles):
-    return max_tiles * _FC1_K_TILES * _SFB_IMAGE_BYTES
-
-
 def _workspace_layout(num_tokens, arch=None):
     tile_n, total_pairs, max_tiles = _geometry(num_tokens, arch)
     rows = max_tiles * tile_n
@@ -318,14 +330,11 @@ def _workspace_layout(num_tokens, arch=None):
         ("expert_output", torch.bfloat16, (rows, _H), 2),
     )
     # The layout is architecture-independent: a field that any architecture's
-    # selector of this token count needs (the FC2 work counter; the pre-shuffled
-    # scale images of a ``large_c7`` selector, which no delivered architecture
-    # uses today) is present on both.
+    # selector of this token count needs (the FC2 work counter) is present on
+    # both.
     selectors = {_selector(name, num_tokens) for name in ("sm_100a", "sm_103a")}
     if any(_SELECTORS[selector][2] is not None for selector in selectors):
         fields += (("fc2_work_counter", torch.int32, (1,), 4),)
-    if "large_c7" in selectors:
-        fields += (("sfb_shuffled", torch.uint8, (_sfb_shuffled_bytes(max_tiles),), 1),)
     layout, offset = {}, 0
     for name, dtype, shape, element_bytes in fields:
         offset = (offset + 127) // 128 * 128
@@ -398,14 +407,11 @@ def _cake_situ_workspace_size(options):
     max_tokens = options["max_num_tokens"]
     # ``_workspace_layout`` is not monotonic in ``num_tokens``: the token counts
     # that force tile-N16 need more scratch rows than the tile-N8 counts that
-    # follow them, and an architecture whose large route is ``large_c7`` would
-    # carry ``sfb_shuffled`` on the 8192- and 16384-token layouts (none of the
-    # delivered architectures does today), so a maximum-size buffer covers
-    # every forced and large count at or below ``max_num_tokens`` as well as
-    # ``max_num_tokens`` itself.
+    # follow them, so a maximum-size buffer covers every forced count at or
+    # below ``max_num_tokens`` as well as ``max_num_tokens`` itself.
     return max(
         _workspace_layout(num_tokens)[1]
-        for num_tokens in (max_tokens, *_FORCED_TILE_N16_TOKENS, *_LARGE_C7_TOKENS)
+        for num_tokens in (max_tokens, *_FORCED_TILE_N16_TOKENS)
         if num_tokens <= max_tokens
     )
 
@@ -453,9 +459,8 @@ class _Slot:
 # else in a stage's argument plan is fixed at prepare time.
 _CALL_ARGS = {
     "quant": {"x": "x", "qx": "qx"},
+    "quant_reset": {"x": "x", "qx": "qx"},
     "quant_route": {
-        "x": "x",
-        "qx": "qx",
         "topk_ids": "ids",
         "s2b_x": "x",
         "s2b_qx": "qx",
@@ -533,17 +538,27 @@ def _stage_constants(stage, views, prepared, num_tokens):
             scales=views["x_scales"],
             M=num_tokens,
         )
-    if stage == "quant_route":
-        values = dict(
-            # The single-token program runs one block; the s2b program's block 0
-            # routes and blocks 1..num_tokens quantize.
-            grid=(1, 1, 1) if selector == "m1" else (num_tokens + 1, 1, 1),
+    if stage == "quant_reset":
+        # One launch: blocks 0..num_tokens-1 run the quantization body, the trailing
+        # ceil(reset_items / 256) blocks the routing-table reset body (no counter).
+        reset_items = max(_E, max_tiles * tile_n + 1)
+        return dict(
+            grid=(num_tokens + (reset_items + 255) // 256, 1, 1),
             packed=views["x_packed"],
             scales=views["x_scales"],
+            M=num_tokens,
+            num_experts=_E,
+            max_tiles=max_tiles,
+            tile_n=tile_n,
+            **route_views,
+        )
+    if stage == "quant_route":
+        values = dict(
+            # Block 0 routes and blocks 1..num_tokens quantize.
+            grid=(num_tokens + 1, 1, 1),
             s2b_packed=views["x_packed"],
             s2b_scales=views["x_scales"],
             s2b_num_tokens=num_tokens,
-            M=num_tokens,
             total_pairs=total_pairs,
             num_experts=_E,
             max_tiles=max_tiles,
@@ -603,16 +618,6 @@ def _stage_constants(stage, views, prepared, num_tokens):
             tile_n_shift=tile_n.bit_length() - 1,
             **route_views,
         )
-    if stage == "sfb_shuffle":
-        return dict(
-            grid=(max_tiles, 1, 1),
-            SFB=views["x_scales"],
-            SFBS=views["sfb_shuffled"],
-            K=_H,
-            K_tiles=_FC1_K_TILES,
-            grid_n=max_tiles,
-            **route_views,
-        )
     if stage == "fc1":
         values = dict(
             grid=(_I // 64, max_tiles, 1),
@@ -627,10 +632,6 @@ def _stage_constants(stage, views, prepared, num_tokens):
             K_tiles=_FC1_K_TILES,
             **route_views,
         )
-        if selector == "large_c7":
-            values["SFBS"] = views["sfb_shuffled"].view(
-                max_tiles, _FC1_K_TILES * _SFB_IMAGE_BLOCKS, 2, 256
-            )
         return values
     if stage == "fc2":
         values = dict(
@@ -664,7 +665,14 @@ def _stage_constants(stage, views, prepared, num_tokens):
             values.update(C_tma=partial, C=partial, partial_scale=partial_scale)
         return values
     if stage == "finalize":
-        feature = selector in ("m1", "m1_s2a", "n8_feature", "n8_w2a_m16", "m64_claim8")
+        feature = selector in (
+            "m1_s2a",
+            "n8_feature",
+            "n8_feature_ef_f2e",
+            "n8_w2a_m16",
+            "n8_w2a_m16_ef_f2e",
+            "m64_claim8",
+        )
         vec = 2 if tile_n == 8 else 8
         values = dict(
             grid=(
