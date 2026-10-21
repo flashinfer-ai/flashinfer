@@ -14,10 +14,10 @@
 
 """Materialize the active pages of a paged NVFP4 KV cache as FP8 E4M3.
 
-This is the fallback used when an FP8 attention kernel exists for a shape but
-no kernel consumes NVFP4 K/V directly (for example trtllm-gen context attention
-at head_dim 512). One kernel gathers the pages referenced by a block table,
-writes them to an FP8 K/V cache, and writes the block table that indexes it.
+Frameworks call this when an FP8 attention kernel exists for a shape but no
+kernel reads NVFP4 K/V directly, then pass the FP8 copy to the FP8 kernel. One
+kernel gathers the pages referenced by a block table, writes them to an FP8
+K/V cache, and writes the block table that indexes it.
 
 Only the per-block E4M3 scale is applied (``E2M1 * E4M3 -> E4M3``, the same
 rounding the fused PrimTS decode path performs). The tensor-level K/V scales

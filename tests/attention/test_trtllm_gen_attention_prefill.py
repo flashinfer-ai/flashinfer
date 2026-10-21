@@ -748,20 +748,19 @@ def _test_trtllm_batch_prefill(
 
     if (
         o_dtype != "nvfp4"
+        and kv_dtype != "nvfp4"
         and uses_shared_paged_kv_idx
         and not use_fp16_softmax
         and not uses_spcompress
         and not variable_window
         and window_right < 0
-    ):  # wrapper api does not support fp4 output, two-sided/variable windows, or variant flags.
+    ):  # wrapper api does not support fp4 output/kv, two-sided/variable windows, or variant flags.
         # test wrapper with trtllm-gen backend
         wrapper_trtllm_gen = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout, backend="trtllm-gen"
         )
         plan_params["q_data_type"] = q.dtype
-        plan_params["kv_data_type"] = (
-            kv_cache[0] if isinstance(kv_cache, tuple) else kv_cache
-        ).dtype
+        plan_params["kv_data_type"] = kv_cache.dtype
         plan_params["o_data_type"] = DTYPE_MAP[o_dtype]
         wrapper_trtllm_gen.plan(**plan_params)
         output_wrapper = wrapper_trtllm_gen.run(
@@ -773,17 +772,13 @@ def _test_trtllm_batch_prefill(
             enable_pdl=enable_pdl,
             sinks=(sink if enable_sink else None),
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
-            kv_cache_sf=kv_cache_sf,
         )
         # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
         if v_scale == o_scale == 1.0:
             assert (output_wrapper == output).all()
         else:
-            # FP8 output is re-rounded after the emulated scale: allow one
-            # E4M3 step (2**-3 relative).
-            rtol = 2**-3 if o_dtype == "fp8" else 1e-1
             torch.testing.assert_close(
-                output.float(), output_wrapper.float(), rtol=rtol, atol=1e-1
+                output.float(), output_wrapper.float(), rtol=1e-1, atol=1e-1
             )
 
 
@@ -1352,7 +1347,6 @@ def test_trtllm_batch_prefill_dynamic_page_size_gqa(
         ("fp16", "fp16", "fp16"),
         ("fp8", "fp8", "fp8"),
         ("fp8", "fp8", "bf16"),
-        ("fp8", "nvfp4", "fp8"),
     ],
 )
 @pytest.mark.parametrize("enable_pdl", [None])
@@ -1968,15 +1962,21 @@ def test_trtllm_gen_prefill_glm5(
     torch.testing.assert_close(output_trtllm, output_naive, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("head_dim", [128, 256, 512])
+@pytest.mark.parametrize(
+    "head_dim,materialize", [(128, False), (256, False), (256, True), (512, True)]
+)
 @pytest.mark.parametrize("window_left", [-1, 127])
-def test_trtllm_batch_prefill_nvfp4_kv_matches_reference(head_dim, window_left):
-    """Each output token of NVFP4-KV context attention must closely match a
-    float reference on the dequantized cache, in every head_dim channel.
+def test_trtllm_batch_prefill_nvfp4_kv_matches_reference(
+    head_dim, materialize, window_left
+):
+    """NVFP4-KV context attention must closely match a float reference on the
+    dequantized cache, in every head_dim channel. With ``materialize``, the
+    caller converts the pages to FP8 first and runs the FP8 kernel.
     """
     _skip_if_not_blackwell()
     if head_dim == 512 and window_left >= 0:
         pytest.skip("no head_dim 512 sliding-window context kernels")
+    from flashinfer.quantization.kernels import nvfp4_kv_materialize_fp8
     from tests.quantization.test_nvfp4_kv_materialize import (
         _dequantize_reference,
         _random_cache,
@@ -1996,6 +1996,8 @@ def test_trtllm_batch_prefill_nvfp4_kv_matches_reference(head_dim, window_left):
     )
     k_ref = _dequantize_reference(k_data, k_scales).float()
     v_ref = _dequantize_reference(v_data, v_scales).float()
+    k_scales = k_scales.view(torch.uint8)
+    v_scales = _swizzle_v_scales(v_scales).view(torch.uint8)
 
     page_ids = torch.randperm(num_pages, generator=generator, device=GPU_DEVICE)
     block_tables = torch.zeros(
@@ -2026,15 +2028,36 @@ def test_trtllm_batch_prefill_nvfp4_kv_matches_reference(head_dim, window_left):
     cum_kv = torch.tensor(
         [0, *seq_lens.cumsum(0).tolist()], dtype=torch.int32, device=GPU_DEVICE
     )
+
+    kv_cache, kernel_block_tables = (k_data, v_data), block_tables
+    kv_cache_sf = (k_scales, v_scales)
+    if materialize:
+        # Size the FP8 copy by the pages each request reads.
+        page_indptr = [0, *torch.tensor(num_pages_per_seq).cumsum(0).tolist()]
+        kv_fp8, kernel_block_tables = nvfp4_kv_materialize_fp8(
+            k_data,
+            v_data,
+            k_scales,
+            v_scales,
+            block_tables,
+            seq_lens,
+            max(seq_lens_host),
+            kv_page_indptr=torch.tensor(
+                page_indptr, dtype=torch.int32, device=GPU_DEVICE
+            ),
+            num_pages=page_indptr[-1],
+        )
+        kv_cache, kv_cache_sf = kv_fp8.unbind(dim=1), None
+
     sm_scale = head_dim**-0.5
     out = torch.empty_like(query)
     flashinfer.prefill.trtllm_batch_context_with_kv_cache(
         query=query,
-        kv_cache=(k_data, v_data),
+        kv_cache=kv_cache,
         workspace_buffer=torch.zeros(
             workspace_size, dtype=torch.uint8, device=GPU_DEVICE
         ),
-        block_tables=block_tables,
+        block_tables=kernel_block_tables,
         seq_lens=seq_lens,
         max_q_len=max(q_lens_host),
         max_kv_len=max(seq_lens_host),
@@ -2045,10 +2068,7 @@ def test_trtllm_batch_prefill_nvfp4_kv_matches_reference(head_dim, window_left):
         cum_seq_lens_kv=cum_kv,
         window_left=window_left,
         out=out,
-        kv_cache_sf=(
-            k_scales.view(torch.uint8),
-            _swizzle_v_scales(v_scales).view(torch.uint8),
-        ),
+        kv_cache_sf=kv_cache_sf,
     )
 
     group = num_qo_heads // num_kv_heads
