@@ -742,7 +742,7 @@ def mm_bf16(
         available low-M kernels on their supported buckets and a single
         cuBLASLt fallback runner on each M > 32 bucket, so a single large-M
         warm-up tunes both ranges; the direct kernel is profiled only for
-        M <= 2 or M * N <= 4096, and never with bias.
+        M <= 3 or M * N <= 4096, and never with bias.
         Direct and warp Split-K reuse compiled kernels across M for matching
         tactics, while each M bucket still tunes independently.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.

@@ -133,9 +133,10 @@ def is_direct_bf16_gemm_candidate_sm100(m: int, n: int) -> bool:
     M = 8 each row group also re-reads B.  In a cold-L2 CUPTI sweep on B200
     and B300 (M in {1, 2, 3, 4, 6, 8, 12, 16, 24, 32}, N = 128..8192,
     K = 768..40960, every tactic of all three runners), direct never beat warp /
-    cluster Split-K by more than 1% outside this region.
+    cluster Split-K by more than 1% outside this region.  M <= 3 is profiled
+    regardless of N because direct can still win by a few percent there.
     """
-    return m <= 2 or m * n <= 4096
+    return m <= 3 or m * n <= 4096
 
 
 def prefer_direct_bf16_gemm_sm100(m: int, n: int, k: int) -> bool:

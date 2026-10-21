@@ -221,10 +221,13 @@ _WEIGHT_BYTES_IN_FLIGHT = 9 * 64 * _CTA_K * 2
 def _keep_autotune_tactic(t, default, tactics, m, n, k) -> bool:
     """Keep the tactics that can beat the default; see the rules below.
 
-    A cold-L2 CUPTI sweep of every tactic (B200 and B300, M=1..32,
-    N=128..8192, K=768..40960) kept the best tactic within 2.1% while
-    profiling about 8% of the space.  Winners fill one co-resident wave
-    (clusters must fit their GPC) and keep ~144 KB of weights in flight.
+    The rules are the same on every GPU; SM count and cluster capacity are
+    queried from the device.  Winners fill one co-resident wave (clusters must
+    fit their GPC) and keep at least ~144 KB of weights in flight; GPUs with
+    more bandwidth per SM want deeper rings, so every stage from that target up
+    is kept.  A cold-L2 CUPTI sweep of every tactic (B200 and B300, M=1..32,
+    N=128..8192, K=768..40960) kept the best tactic within 2.1% with only the
+    target stage per config; the deeper stages only add tactics.
     """
     device = _torch.cuda.current_device()
     sm_count = _torch.cuda.get_device_properties(device).multi_processor_count
@@ -285,15 +288,15 @@ def _keep_autotune_tactic(t, default, tactics, m, n, k) -> bool:
             grid(t) >= alpha * best or (t.split_k == 1 and 2 * grid(t) >= best)
         ):
             return False
-    # ab_stages: the shallowest window stage reaching the in-flight target, else
-    # the deepest stage the window allows.
+    # ab_stages: the shallowest window stage reaching the in-flight target and
+    # every deeper one, else the deepest stage the window allows.
     window = sorted(
         x.ab_stages
         for x in tactics
         if x.mma_m == t.mma_m and (x.mma_n, x.split_k) == (t.mma_n, t.split_k)
     )
     deep = [s for s in window if t.mma_m * _CTA_K * 2 * s >= _WEIGHT_BYTES_IN_FLIGHT]
-    return t.ab_stages == (deep[0] if deep else window[-1])
+    return t.ab_stages >= (deep[0] if deep else window[-1])
 
 
 def default_tactic(m: int, n: int, k: int) -> SplitKTactic:
