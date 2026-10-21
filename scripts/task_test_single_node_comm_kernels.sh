@@ -44,6 +44,8 @@ if [ "$pcie_ipc_gpus" -lt 2 ]; then
 else
   echo "pcie ipc collectives: $pcie_ipc_gpus GPUs visible (8 needed for full coverage)"
   pytest -s tests/comm/test_pcie_ipc_all_reduce.py
+  pytest -s tests/comm/test_pcie_ipc_ce_ring.py
+  pytest -s tests/comm/test_pcie_ipc_compatibility.py
   if [ -n "${FLASHINFER_TEST_PCIE_IPC_ORDERED_4PLUS4:-}" ]; then
     echo "Requiring ordered 4+4 AllGather/ReduceScatter coverage for this lane"
   fi
@@ -56,7 +58,14 @@ pytest -s tests/comm/test_trtllm_allreduce_fusion.py
 pytest -s tests/moe/test_trtllm_cutlass_fused_moe.py
 pytest -s tests/comm/test_trtllm_moe_allreduce_fusion.py
 pytest -s tests/comm/test_trtllm_moe_allreduce_fusion_finalize.py
-pytest -s tests/comm/test_trtllm_moe_alltoall.py
+pytest -s tests/comm/test_cake_moe_alltoall.py
+# MoE expert-parallel communication backends (NVLink one-sided, Cake, two-sided)
+pytest -s tests/comm/test_nvlink_two_sided_alltoall.py
+if [ "$pcie_ipc_gpus" -lt 2 ]; then
+  echo "SKIPPING MoEEpCommunication multirank: $pcie_ipc_gpus GPU visible, needs >=2"
+else
+  NPROC_MULTIRANK=$(( pcie_ipc_gpus < 4 ? pcie_ipc_gpus : 4 )) bash tests/moe_ep/run_tests.sh comm
+fi
 # nvshmem ar
 pytest -s tests/comm/test_nvshmem.py
 pytest -s tests/comm/test_nvshmem_allreduce.py

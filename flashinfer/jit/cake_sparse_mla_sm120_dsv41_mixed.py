@@ -29,7 +29,8 @@ from .core import (
 
 # Family name of the generated DeepSeek-V4.1 mixed-cache (528 B FP8 main + 288 B V41_FP4 extra, BF16 Q)
 # sparse-MLA decode kernels. Distinct from ``cake_sparse_mla_dsv4_nvfp4`` (the 384 B NVFP4 family) so the
-# two generated kernel sets never share a translation unit, header, manifest or JIT module name.
+# two generated kernel sets never share a translation unit, kernel header, manifest or JIT module name
+# (the two host bindings share only the hand-written tensor checks in cake_sparse_mla_sm120_host_checks.h).
 _FAMILY = "cake_sparse_mla_dsv41_mixed"
 _SOURCE_SUBDIR = Path("cake_dsv4") / "sm_120a"
 _MANIFEST_NAME = f"{_FAMILY}_manifest.json"

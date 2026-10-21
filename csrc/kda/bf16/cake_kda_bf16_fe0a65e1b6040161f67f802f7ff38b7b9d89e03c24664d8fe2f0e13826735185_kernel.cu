@@ -13,6 +13,22 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#ifndef CAKE_KDA_KERNEL_SYMBOL
+// Fused-M128 KDA prefill body shared by several exported modules. The loader
+// compiles it once per module with -DCAKE_KDA_KERNEL_SYMBOL=<that module's
+// kernel symbol> and one -DCAKE_KDA_<FLAG>=0/1 per flag guarded below; the
+// #if blocks then expand to exactly that module's former generated source.
+#error "CAKE_KDA_KERNEL_SYMBOL must name the module's kernel symbol"
+#endif
+#ifndef CAKE_KDA_AFFINE_MAIN_INDEXED_INITIAL
+#error "CAKE_KDA_AFFINE_MAIN_INDEXED_INITIAL must be 0 or 1"
+#endif
+#ifndef CAKE_KDA_PDL_PUBLISH_FINAL_STATE
+#error "CAKE_KDA_PDL_PUBLISH_FINAL_STATE must be 0 or 1"
+#endif
+#ifndef CAKE_KDA_PDL_WAIT_INITIAL_STATE_F32
+#error "CAKE_KDA_PDL_WAIT_INITIAL_STATE_F32 must be 0 or 1"
+#endif
 
 typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
@@ -1165,7 +1181,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(1024) void
-kernel_cake_kda_bf16_fe0a65e1b6040161f67f802f7ff38b7b9d89e03c24664d8fe2f0e13826735185(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma, __nv_bfloat16* __restrict__ k, CakeTensorMap const* k_tma, __nv_bfloat16* __restrict__ v, CakeTensorMap const* v_tma, __nv_bfloat16* __restrict__ g, CakeTensorMap const* g_tma, __nv_bfloat16* __restrict__ beta, CakeTensorMap const* beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, CakeTensorMap const* out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound, unsigned long long state_indices_addr, unsigned long long state_checkpoints_addr, unsigned long long checkpoint_cu_starts_addr, long long beta_token_stride, long long state_slot_stride, int use_state_indices, int checkpoint_every_n_tokens, long long* __restrict__ cu_chunk_offsets, __nv_bfloat16* __restrict__ chunk_state, unsigned int* __restrict__ state_checkpoint_needed, __nv_bfloat16* __restrict__ tape_qd, __nv_bfloat16* __restrict__ tape_kd, __nv_bfloat16* __restrict__ tape_kr, __nv_bfloat16* __restrict__ tape_j, float* __restrict__ tape_restore_factor, __nv_bfloat16* __restrict__ tape_e, __nv_bfloat16* __restrict__ tape_x, __nv_bfloat16* __restrict__ tape_r, float* __restrict__ norm_inv_out, __nv_bfloat16* __restrict__ decay_out, float* __restrict__ beta_active_out, float* __restrict__ initial_state_f32, unsigned int* __restrict__ zero_workspace, int zero_words, int num_sequences, CakeTensorMap const* state_checkpoints_tma, float* __restrict__ final_state_f32, long long g_token_stride)
+CAKE_KDA_KERNEL_SYMBOL(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma, __nv_bfloat16* __restrict__ k, CakeTensorMap const* k_tma, __nv_bfloat16* __restrict__ v, CakeTensorMap const* v_tma, __nv_bfloat16* __restrict__ g, CakeTensorMap const* g_tma, __nv_bfloat16* __restrict__ beta, CakeTensorMap const* beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, CakeTensorMap const* out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound, unsigned long long state_indices_addr, unsigned long long state_checkpoints_addr, unsigned long long checkpoint_cu_starts_addr, long long beta_token_stride, long long state_slot_stride, int use_state_indices, int checkpoint_every_n_tokens, long long* __restrict__ cu_chunk_offsets, __nv_bfloat16* __restrict__ chunk_state, unsigned int* __restrict__ state_checkpoint_needed, __nv_bfloat16* __restrict__ tape_qd, __nv_bfloat16* __restrict__ tape_kd, __nv_bfloat16* __restrict__ tape_kr, __nv_bfloat16* __restrict__ tape_j, float* __restrict__ tape_restore_factor, __nv_bfloat16* __restrict__ tape_e, __nv_bfloat16* __restrict__ tape_x, __nv_bfloat16* __restrict__ tape_r, float* __restrict__ norm_inv_out, __nv_bfloat16* __restrict__ decay_out, float* __restrict__ beta_active_out, float* __restrict__ initial_state_f32, unsigned int* __restrict__ zero_workspace, int zero_words, int num_sequences, CakeTensorMap const* state_checkpoints_tma, float* __restrict__ final_state_f32, long long g_token_stride)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1404,7 +1420,9 @@ kernel_cake_kda_bf16_fe0a65e1b6040161f67f802f7ff38b7b9d89e03c24664d8fe2f0e138267
     const int tmem_tmem_u2_acc = taddr;
     const int tmem_tmem_out = taddr + 192;
     const int tmem_tmem_state_out = taddr + 64;
+#if CAKE_KDA_PDL_WAIT_INITIAL_STATE_F32
     asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif  // CAKE_KDA_PDL_WAIT_INITIAL_STATE_F32
 
     // ---- Ordered hardware-WG register redistribution ----
     // Dec phase frees registers before any WG attempts inc.
@@ -1440,6 +1458,13 @@ kernel_cake_kda_bf16_fe0a65e1b6040161f67f802f7ff38b7b9d89e03c24664d8fe2f0e138267
             }
             long long initial_state_base = state_base;
             int initial_state_enabled = (int)(use_initial_state != 0);
+#if CAKE_KDA_AFFINE_MAIN_INDEXED_INITIAL
+            {
+                int affine_initial_slot = reinterpret_cast<int*>(state_indices_addr)[seq_idx];
+                initial_state_enabled = (int)(initial_state_enabled != 0 && affine_initial_slot >= 0);
+                initial_state_base = (long long)affine_initial_slot * state_slot_stride + ((long long)head_idx * 128 + (long long)state_row) * 128;
+            }
+#endif  // CAKE_KDA_AFFINE_MAIN_INDEXED_INITIAL
             #pragma unroll
             for (int state_col_block = 0; state_col_block < 4; state_col_block++) {
                 float state_frag[32];
@@ -1766,6 +1791,10 @@ kernel_cake_kda_bf16_fe0a65e1b6040161f67f802f7ff38b7b9d89e03c24664d8fe2f0e138267
                 }
             }
             asm volatile("barrier.sync 9, 128;" ::: "memory");
+#if CAKE_KDA_PDL_PUBLISH_FINAL_STATE
+            __threadfence();
+            asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif  // CAKE_KDA_PDL_PUBLISH_FINAL_STATE
             if (compute_local_warp == 0) {
                 if (elect_sync()) {
                     mbarrier_arrive(tmem_dealloc_ready_addr);

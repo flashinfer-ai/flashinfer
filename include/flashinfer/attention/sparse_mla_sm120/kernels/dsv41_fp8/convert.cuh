@@ -81,26 +81,37 @@ __device__ __forceinline__ void requantize_e2m1_e4m3_g16_to_e4m3_ue8m0_g32(uint4
 
 namespace flashinfer::sparse_mla_sm120::kernels::dsv41_fp8 {
 
-template <typename Resources, typename Valid>
+// Requantizes a raw FP4 slot into FP8 KV rows. A footer-scale slot holds BI
+// data rows followed by BI scale rows; an inline-scale slot holds BI 288B
+// records. Each converted row's UE8M0 scales land at `scales + row *
+// ScaleStride`: the footer kv_sc rows, or the pad after each inline KV row.
+template <typename Resources, bool RawInline, int ScaleStride, typename Valid>
 __device__ void convert_raw(const uint8_t* raw, uint8_t* values, uint8_t* scales, int tid,
                             Valid valid) {
-  using Raw = typename Resources::Raw;
+  using Raw = Dsv41Fp4LayoutT<RawInline>;
   using KV = typename Resources::KV;
   constexpr int Groups = Resources::CONVERSION_GROUPS_PER_ROW;
   for (int task = tid; task < Resources::BI * Groups; task += Resources::GROUP_THREADS) {
     const int row = task / Groups, group = task % Groups;
     auto* dst = values + row * KV::KV_SMEM_STRIDE + group * KV::QUANT_TILE;
-    auto* sc = scales + row * KV::SCALE_BYTES_PER_TOKEN + group;
+    auto* sc = scales + row * ScaleStride + group;
     if (!valid(row)) {
       *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
       *reinterpret_cast<uint4*>(dst + sizeof(uint4)) = make_uint4(0, 0, 0, 0);
       *sc = 0;
     } else {
+      const uint8_t* data;
+      const uint8_t* row_scales;
+      if constexpr (RawInline) {
+        data = raw + Raw::data_offset(row);
+        row_scales = raw + Raw::scale_offset(row);
+      } else {
+        data = raw + row * Raw::DATA_BYTES;
+        row_scales = raw + Resources::RAW_SCALE_OFFSET + row * Raw::SCALE_BYTES;
+      }
       requantize_e2m1_e4m3_g16_to_e4m3_ue8m0_g32(
-          *reinterpret_cast<const uint4*>(raw + row * Raw::DATA_BYTES + group * sizeof(uint4)),
-          *reinterpret_cast<const uint16_t*>(raw + Resources::RAW_SCALE_OFFSET +
-                                             row * Raw::SCALE_BYTES + group * sizeof(uint16_t)),
-          dst, sc);
+          *reinterpret_cast<const uint4*>(data + group * sizeof(uint4)),
+          *reinterpret_cast<const uint16_t*>(row_scales + group * sizeof(uint16_t)), dst, sc);
     }
   }
 }

@@ -148,6 +148,7 @@ def _megakernel_config(quant_kind: str, **overrides):
 
 @pytest.mark.gpu_2
 @pytest.mark.arch_rubin
+@pytest.mark.parametrize("family", ["inference", "genphase"])
 @pytest.mark.parametrize("ikr,early", [(False, True), (False, False), (True, True)])
 @pytest.mark.parametrize(
     "kind,situ,scaled",
@@ -157,7 +158,9 @@ def _megakernel_config(quant_kind: str, **overrides):
     ]
     + [("nvfp4", situ, True) for situ in (False, True)],
 )
-def test_prequantized_situ_and_scaling_multirank(kind, situ, scaled, ikr, early):
+def test_prequantized_situ_and_scaling_multirank(
+    family, kind, situ, scaled, ikr, early
+):
     from flashinfer.moe_ep import PrequantizedMoEWeights
     from tests.moe_ep.sm107_test_utils import (
         assert_reference,
@@ -179,6 +182,14 @@ def test_prequantized_situ_and_scaling_multirank(kind, situ, scaled, ikr, early)
         *(getattr(pack, name)[local] for name in ("w13", "w2", "w13_scale", "w2_scale"))
     )
     kwargs = dict(in_kernel_fc2_reduce=ikr, apply_topk_in_fc1=early)
+    if family == "genphase":
+        # Exercise the multi-rank reset path with the standard N128 geometry,
+        # all four formats, and both separate and in-kernel reduction.
+        kwargs.update(
+            kernel_variant="genphase",
+            cluster_shape_mn=(4, 1),
+            fc2_use_bulk=True,
+        )
     if situ:
         kwargs.update(activation="situ", situ_beta=1.25, situ_linear_beta=0.75)
     if kind == "nvfp4":
@@ -227,7 +238,10 @@ def test_prequantized_situ_and_scaling_multirank(kind, situ, scaled, ikr, early)
                 early=early,
                 scalars=scalars,
             )
-            assert_reference(layer.forward(t), reference, kind)
+            # An odd repeat count exercises the GenPhase grid phase across
+            # calls before the shared workspace changes input/routing state.
+            for _ in range(3 if family == "genphase" else 1):
+                assert_reference(layer.forward(t), reference, kind)
         assert layers[0]._workspace is layers[1]._workspace
     finally:
         for layer in layers:
@@ -527,7 +541,8 @@ def test_moe_ep_sm107_block_scaled_mega_multirank_torch_oracle(
 @pytest.mark.gpu_2
 @pytest.mark.arch_rubin
 @pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
-def test_sm107_pooled_layers_graph_rebinds_weights_and_stream(kind):
+@pytest.mark.parametrize("variant", ["standard", "genphase"])
+def test_sm107_pooled_layers_graph_rebinds_weights_and_stream(kind, variant):
     import torch.distributed as dist
 
     rank, world = _launcher_ranks()
@@ -538,7 +553,14 @@ def test_sm107_pooled_layers_graph_rebinds_weights_and_stream(kind):
     w13, w2, x, ids, scores = _global_problem(world)
     local_experts = NUM_EXPERTS // world
     local = slice(rank * local_experts, (rank + 1) * local_experts)
-    cfg = _megakernel_config(kind)
+    cfg = _megakernel_config(
+        kind,
+        **(
+            dict(kernel_variant="genphase", cluster_shape_mn=(4, 1), fc2_use_bulk=True)
+            if variant == "genphase"
+            else {}
+        ),
+    )
     kernel = create_mega_kernel(cfg)
     runtime = bootstrap_moe_ep_runtime(
         bootstrap, kernel.runtime_requirements(bootstrap)

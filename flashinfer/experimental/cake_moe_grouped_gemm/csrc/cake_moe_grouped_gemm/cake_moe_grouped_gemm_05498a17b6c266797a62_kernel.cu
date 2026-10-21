@@ -115,7 +115,7 @@ kernel_cake_moe_grouped_gemm_05498a17b6c266797a62(float* __restrict__ partials, 
     if (kb_r == 0) {
         kb_r = 1;
     }
-    float acc[EPI_CHUNK];
+    float acc[16];
     #pragma unroll
     for (int i0 = 0; i0 < EPI_CHUNK; i0++) {
         acc[i0] = 0.0f;
@@ -173,22 +173,23 @@ kernel_cake_moe_grouped_gemm_05498a17b6c266797a62(float* __restrict__ partials, 
         {
             {
                 float4 _v4 = make_float4(acc[0 + 0], acc[0 + 1], acc[0 + 2], acc[0 + 3]);
-                *reinterpret_cast<float4*>(C + (e_r * stride_e + (n_block_r * BLOCK_N + row_in_tile) * ldc + k_block_r * WGRAD_TILE + col_r) + 0) = _v4;
+                *reinterpret_cast<float4*>((C + (e_r * stride_e + (n_block_r * BLOCK_N + row_in_tile) * ldc + k_block_r * WGRAD_TILE + col_r)) + 0) = _v4;
             }
             {
                 float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                *reinterpret_cast<float4*>(C + (e_r * stride_e + (n_block_r * BLOCK_N + row_in_tile) * ldc + k_block_r * WGRAD_TILE + col_r + 4) + 0) = _v4;
+                *reinterpret_cast<float4*>((C + (e_r * stride_e + (n_block_r * BLOCK_N + row_in_tile) * ldc + k_block_r * WGRAD_TILE + col_r + 4)) + 0) = _v4;
             }
             {
                 float4 _v4 = make_float4(acc[8 + 0], acc[8 + 1], acc[8 + 2], acc[8 + 3]);
-                *reinterpret_cast<float4*>(C + (e_r * stride_e + (n_block_r * BLOCK_N + row_in_tile) * ldc + k_block_r * WGRAD_TILE + col_r + 8) + 0) = _v4;
+                *reinterpret_cast<float4*>((C + (e_r * stride_e + (n_block_r * BLOCK_N + row_in_tile) * ldc + k_block_r * WGRAD_TILE + col_r + 8)) + 0) = _v4;
             }
             {
                 float4 _v4 = make_float4(acc[12 + 0], acc[12 + 1], acc[12 + 2], acc[12 + 3]);
-                *reinterpret_cast<float4*>(C + (e_r * stride_e + (n_block_r * BLOCK_N + row_in_tile) * ldc + k_block_r * WGRAD_TILE + col_r + 12) + 0) = _v4;
+                *reinterpret_cast<float4*>((C + (e_r * stride_e + (n_block_r * BLOCK_N + row_in_tile) * ldc + k_block_r * WGRAD_TILE + col_r + 12)) + 0) = _v4;
             }
         }
     }
 }
 
 } // extern "C"
+

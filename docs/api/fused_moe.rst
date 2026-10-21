@@ -71,12 +71,11 @@ are designed to co-exist, and neither supersedes the other.
 cuDNN Frost backend
 ~~~~~~~~~~~~~~~~~~~
 
-Frost is a stable ``MoELayer`` backend on SM107a, with additional BF16 support
-on SM120a. It can be selected explicitly
-with ``BackendOptions`` or admitted during autotuning alongside eligible
-backends. It does not require ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS``.
-Cold calls without autotuning use the configured backend pool; automatic Frost
-candidates are first created during autotuning and may be reused afterward.
+Frost is a stable ``MoELayer`` backend on SM107a and SM120a. Its four configs
+are included in the default backend list and can
+also be selected through ``BackendOptions``. Candidates with unavailable weight
+views or unsupported input shapes are skipped. It does not require
+``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS``.
 
 .. list-table:: Supported configurations
    :header-rows: 1
@@ -129,13 +128,25 @@ when both exist, the Frost-named view takes precedence. The public API is:
 The backend requires precomputed routing with contiguous int32 expert IDs and
 FP32 routing weights, and returns finalized BF16 output. It supports the default
 activation contracts; bias, expert parallelism, shared experts, custom activation
-parameters, and routing from logits are unsupported. BF16 uses the measured
-model shortlist. Quantized hidden/intermediate sizes must be divisible by 128;
-artifact and native-plan bounds are checked per call. Configure another backend
-alongside Frost if unsupported calls need a fallback.
+parameters, and routing from logits are unsupported. Hidden/intermediate sizes
+must be positive multiples of 128. All four dtypes use measured model shortlists
+where available and a bounded, factorized tactic search for other supported
+shapes. Local expert counts are limited to 1024 and token counts to the configured
+tuning ceiling, at most 2**20. Kernel identities describe implementation content,
+independently of model dimensions.
+
+Quantized FC1 weight scales accept expert-major or branch-major storage and may
+be updated in place. For CUDA Graph replay, keep tensor pointers, shapes and
+layouts fixed and update tensors before replay on the same stream.
+
+After changing compiler or artifact configuration, call
+``layer.refresh_backends()`` outside CUDA Graph capture, or reconstruct the
+layer.
 
 The validated SM107 dependency baseline is PyTorch 2.14.1, CuTe DSL 4.8.0, TVM-FFI
 0.1.14.post1, and external PTXAS 13.4.92. CUDA 13.5 PTXAS is also validated.
+The SM120 kernels were validated with PyTorch 2.14.0, CuTe DSL 4.7.1, TVM-FFI
+0.1.13.post3, and CUDA 13.4 with the bundled assembler.
 Runtime checks additionally require the DSL
 primitives and PyTorch CUDA Graph resource-retention APIs used by the backend.
 Older dependencies remain usable by other FlashInfer backends; these requirements
@@ -146,21 +157,35 @@ PTXAS executable only supplies the assembler for Frost's DSL kernels.
 
 On SM107, set ``FLASHINFER_CUDNN_FROST_PTXAS=/path/to/ptxas`` when the DSL bundles an older
 assembler. ``CUDA_HOME`` alone does not replace that assembler. Unqualified
-assemblers are rejected before kernel execution, including when reusing a cached
-automatic runner. Automatic selection skips unavailable Frost candidates;
-explicit selection reports the missing requirement.
+assemblers are rejected when building or refreshing a runner. Automatic selection
+skips unavailable Frost candidates; explicit selection reports the missing requirement.
 Both external PTXAS and the bundled assembler must report CUDA 13.4 or newer.
-Admission checks the release version without imposing a patch-level minimum.
+There is no patch-level minimum.
 Use the latest assembler patch release for SM107 tensor-map updates.
-SM120 BF16 kernels do not update tensor maps and retain capability-based compiler
+SM120 kernels do not update tensor maps and retain capability-based compiler
 admission without this SM107-specific assembler minimum.
 
 Prepare and optionally autotune before CUDA Graph capture. Frozen device sources
 ship in the wheel and are compiled for the requested geometry into the writable
 FlashInfer cache. The four fixed routing/finalize adapters are also registered
-for SM107 AOT builds, and the BF16 adapter is registered for SM120 AOT builds.
+for SM107 and SM120 AOT builds.
 Geometry-specialized DSL kernels retain source/JIT delivery.
 No runtime cuDNN Frontend installation is required.
+
+Artifact catalogs use schema v4. Each architecture shares tile definitions;
+gated/non-gated activation groups and compatible store policies expand into
+kernel descriptors during preparation. Sources share exact activation fragments.
+Device occupancy, L2 budget, pipeline stages and workspace are derived once from
+the preparation device. Kernels support symbolic problem sizes with explicit
+alignment and bounds; measured shortlists accelerate selection for known shapes,
+and bounded heuristics supply candidates for other shapes.
+
+Kernel IDs identify logical configurations. Source and compiler fingerprints
+qualify compiled kernels and persisted tuning choices. Artifact tooling should use
+``cudnn_frost.manifest.read_manifest`` and ``write_manifest`` to read expanded
+records and preserve existing dimension catalogs. The reader also accepts schema
+v2/v3 exports; ``dimension_catalog.write_catalog`` factors complete exports into
+the dimension format.
 
 Finalized precomputed ``MoELayer`` calls support ``FLASHINFER_TRACE_DUMP=1`` and
 ``MoELayer.__call__.fi_trace(self=layer, act_pack=activations, weight_pack=weights)``.
@@ -211,12 +236,13 @@ Multi-LoRA MoE (BGMV)
 Batched Gather-Matrix-Vector kernels for serving multiple LoRA adapters on
 top of a Mixture-of-Experts layer (shrink + expand).
 
-:func:`prepare_bgmv_moe` returns a graph-replayable plan. On SM90, SM100 and
-SM103 devices the generated Cake programs serve one LoRA slice with rank 8, 16,
-32 or 64 and any hidden size that is a positive multiple of 8 (hidden 2688 and
-3072 at rank 32 use the specialized measured bodies at up to 2048 tokens, ``plan.variant ==
-"specialized"``; everything else the runtime-hidden generic bundles,
-``plan.variant == "generic"``); the output has one owner per token, so replays
+:func:`prepare_bgmv_moe` returns a graph-replayable plan. On SM90, SM100, SM103
+and SM107 devices the generated Cake programs serve one LoRA slice with rank 8,
+16, 32 or 64 and any hidden size that is a positive multiple of 8 (hidden 2688
+and 3072 at rank 32 use the specialized measured bodies at 32 to 1024 tokens on
+SM100, SM103 and SM107, ``plan.variant == "specialized"``; everything else, SM90
+included, the runtime-hidden generic bundles, ``plan.variant == "generic"``);
+the output has one owner per token, so replays
 are bitwise reproducible. Arbitrary pair order (for example expert-sorted
 dispatch) is served through a token->pair route index that the shrink kernels
 publish and the expand kernels read in O(1) per CTA; the generic shrink splits the hidden
@@ -290,6 +316,7 @@ TensorRT-LLM Fused MoE
     trtllm_fp8_per_tensor_scale_routed_moe
     trtllm_mxint4_block_scale_moe
     trtllm_mxint4_block_scale_routed_moe
+    trtllm_fused_moe_workspace_size
 
 AlphaMoE FP8 Block-Scaled MoE (SM100/SM103)
 --------------------------------------------
@@ -617,11 +644,15 @@ Prims-TS Unified MoE (SM100/SM103)
 
 The Prims-TS runner is an explicit unified-MoE backend for SM100 and SM103.
 Select it with ``PrimsTsConfig()``; it is not in the default backend list.
-MVP coverage is NVFP4×NVFP4 and BF16×BF16. Routing and finalize stay on the
-TRT-LLM Gen path; only the GEMM middle stage uses Prims-TS. The backend
-reuses the physical layouts prepared by ``TrtllmFp4Config`` (MajorK) and
-``TrtllmBf16Config`` (BlockMajorK), so one view can be registered for both
-keys::
+Coverage is NVFP4×NVFP4, MXFP4×MXFP8, MXFP4×BF16, BF16×BF16,
+FP8PerTensor×FP8PerTensor, DeepSeekFp8×DeepSeekFp8, and MXFP8×MXFP8.
+Routing and finalize stay on the TRT-LLM Gen path; only the GEMM middle stage
+uses Prims-TS. NVFP4 and MXFP4 reuse ``TrtllmFp4Config``, BF16 reuses
+``TrtllmBf16Config``, MXFP8 reuses ``TrtllmFp8BlockConfig``, and per-tensor FP8
+reuses ``TrtllmFp8PerTensorConfig``. DeepSeekFp8 activations and scales match
+``TrtllmFp8BlockConfig``, but the weight payloads are shuffled with epilogue
+tile 64 and must not be registered under ``trtllm_fp8_block``. One shared view
+can be registered for both keys::
 
     backend = PrimsTsConfig()
     quant = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
@@ -650,7 +681,7 @@ keys::
     output = MoELayer(config)(activations, weights)
 
 ``intermediate_size`` must be a multiple of 128. Fused shared experts and
-LoRA are out of scope for this MVP.
+LoRA stay out of scope.
 
 .. autosummary::
     :toctree: ../generated
@@ -689,7 +720,7 @@ These symbols are defined in the backend modules and re-exported from
 Standalone TRT-LLM Gen Routing
 ------------------------------
 
-The routing stage the TRT-LLM Gen fused MoE launchers run before their GEMMs,
+The routing stage the TRT-LLM Gen fused MoE launchers run before their GEMMs is
 exposed on its own so expert selection and the permutation/padding bookkeeping
 can be used (and tested) independently of quantization and GEMM configuration.
 
@@ -758,3 +789,18 @@ launch. Use :func:`has_monomoe` to check availability before calling.
     alloc_scratchpad
     interleave_for_tma_wgmma_up
     mono_moe
+
+cuDNN Grouped-GEMM MoE
+----------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    CudnnGroupedGemmBf16Config
+    CudnnGroupedGemmBf16Runner
+    CudnnGroupedGemmFp8PerTensorConfig
+    CudnnGroupedGemmFp8PerTensorRunner
+    CudnnGroupedGemmMxfp8Config
+    CudnnGroupedGemmMxfp8Runner
+    CudnnGroupedGemmNvfp4Config
+    CudnnGroupedGemmNvfp4Runner

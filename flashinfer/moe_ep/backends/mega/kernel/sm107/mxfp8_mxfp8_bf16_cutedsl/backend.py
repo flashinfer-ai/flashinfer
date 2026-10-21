@@ -124,6 +124,36 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             overrides=self._knob_overrides(fleet_params),
         )
 
+    supports_live_token_tuning = True
+    _knob_cache_module = (
+        "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.knob_cache"
+    )
+
+    def _tuning_key(self, fleet_params: FleetParams) -> dict:
+        k = self._kernel_config
+        return dict(
+            dtype=k.kind,
+            world_size=self.ep_world_size,
+            hidden=fleet_params.token_hidden_size,
+            intermediate=k.intermediate_size,
+            num_experts=fleet_params.num_experts,
+            topk=k.top_k,
+            max_tokens=fleet_params.max_tokens_per_rank,
+            allow_nondeterministic=k.in_kernel_fc2_reduce,
+            apply_topk_at_fc1=k.apply_topk_in_fc1,
+            activation=k.activation,
+            kernel_variant=k.kernel_variant,
+            combine_dtype=k.combine_dtype,
+            situ_beta=k.situ_beta,
+            situ_linear_beta=k.situ_linear_beta,
+            gate_up_clamp=_resolve_gate_up_clamp(k),
+        )
+
+    def live_token_buckets(self, fleet_params: FleetParams) -> list[int]:
+        if self._kernel_config.knobs != "cache":
+            return []
+        return super().live_token_buckets(fleet_params)
+
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
         from ......kernel_src.sm107.next_cutedsl_megamoe import (
             Sm107BlockScaledSymmBuffer,
@@ -140,7 +170,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         supported on the engine path — the SM107 session bakes knobs at
         construction; tune offline with ``python -m flashinfer.moe_ep.tune``.
         """
-        from ......kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS, resolve_knobs
+        from ......kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
 
         k = self._kernel_config
         if k.knobs is None:
@@ -154,23 +184,9 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                 )
             return dict(k.knobs)
         if k.knobs == "cache":
-            knobs, source = resolve_knobs(
-                dtype=k.kind,
-                world_size=self.ep_world_size,
-                hidden=fleet_params.token_hidden_size,
-                intermediate=k.intermediate_size,
-                num_experts=fleet_params.num_experts,
-                topk=k.top_k,
-                max_tokens=fleet_params.max_tokens_per_rank,
-                allow_nondeterministic=k.in_kernel_fc2_reduce,
-                apply_topk_at_fc1=k.apply_topk_in_fc1,
-                activation=k.activation,
-                kernel_variant=k.kernel_variant,
-                combine_dtype=k.combine_dtype,
-                situ_beta=k.situ_beta,
-                situ_linear_beta=k.situ_linear_beta,
-                gate_up_clamp=_resolve_gate_up_clamp(k),
-            )
+            knobs = self._workspace_knobs(fleet_params)
+            assert knobs is not None
+            source = "offline cache or heuristic"
             if self.ep_rank == 0:
                 print(
                     f"[{self.kernel_name()}] knobs='cache' resolved via "
@@ -207,7 +223,10 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
         validate_routing_values(
-            t.topk_ids, t.topk_weights, workspace.config.num_total_experts
+            t.topk_ids,
+            t.topk_weights,
+            workspace.config.num_total_experts,
+            workspace=workspace,
         )
         if quantize_input:
             staged = stage_mega_moe_inputs(
@@ -306,7 +325,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             k.cluster_shape_mn,
             k.fallback_cluster_shape_mn,
             k.max_sm_count,
-            knobs_pool_key(k.knobs),
+            knobs_pool_key(self._knob_overrides(fleet_params)),
         )
 
     def _forget_workspace_state(self, workspace: Any) -> None:

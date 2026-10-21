@@ -105,6 +105,31 @@ _TARGET_SOURCES: dict[CakeWarpDecodeTarget, tuple[tuple[str, tuple[str, ...]], .
     "sm100a": (("common", _COMMON_SOURCES), ("sm_100a", _SM100A_SOURCES)),
     "sm103a": (("common", _COMMON_SOURCES), ("sm_103a", _SM103A_SOURCES)),
 }
+# SM100-only clamped-SwiGLU (H=4096, I=2048, E=256, top_k=6) extension. The
+# clamped manifest header dispatches these programs itself; this tuple is only
+# the build inventory, listed in the generator's module order so the generated
+# build file keeps its layout.
+_CLAMPED_E256_SOURCES: tuple[str, ...] = (
+    "device_10.cu",
+    "device_11.cu",
+    "device_02.cu",
+    "device_01.cu",
+    "device_00.cu",
+    "device_06.cu",
+    "device_04.cu",
+    "device_07.cu",
+    "device_05.cu",
+    "device_03.cu",
+    "device_08.cu",
+    "device_09.cu",
+    "device_12.cu",
+    "device_13.cu",
+    "device_14.cu",
+)
+_CLAMPED_E256_HEADERS: tuple[str, ...] = (
+    "declarations.cuh",
+    "dsv4_clamped_e256_manifest.cuh",
+)
 # Every device TU compiles with fast math except the SiTU static FC1 kernel.
 _NO_FAST_MATH_SOURCES: frozenset[str] = frozenset(
     ["cake_warp_decode_958ca99134107b938d76_kernel.cu"]
@@ -166,6 +191,24 @@ def _device_sources(csrc_dir: Path, target: CakeWarpDecodeTarget) -> list[Path]:
     return sources
 
 
+def _load_clamped_e256_sources(
+    csrc_dir: Path, target: CakeWarpDecodeTarget
+) -> list[Path]:
+    """Resolve the SM100-only clamped E256 device translation units."""
+
+    if target != "sm100a":
+        return []
+    directory = csrc_dir / "generated" / "dsv4_clamped_e256"
+    sources = [directory / name for name in _CLAMPED_E256_SOURCES]
+    headers = [directory / name for name in _CLAMPED_E256_HEADERS]
+    missing = [str(path) for path in (*sources, *headers) if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Cake warp-decode clamped E256 sources not found: {missing}"
+        )
+    return sources
+
+
 def get_cake_fused_moe_warp_decode_uri(
     target: CakeWarpDecodeTarget = "sm103a",
 ) -> str:
@@ -185,7 +228,8 @@ def gen_cake_fused_moe_warp_decode_module(
     uri = get_cake_fused_moe_warp_decode_uri(target)
     csrc_dir = _get_cake_fused_moe_warp_decode_csrc_dir()
     generated_dir = csrc_dir / "generated"
-    device_sources = _device_sources(csrc_dir, target)
+    clamped_sources = _load_clamped_e256_sources(csrc_dir, target)
+    device_sources = [*_device_sources(csrc_dir, target), *clamped_sources]
     for source in (
         csrc_dir / _BINDING_SOURCE,
         generated_dir / _GENERATED_MANIFEST,
@@ -197,6 +241,7 @@ def gen_cake_fused_moe_warp_decode_module(
     target_flags = [
         *_TARGET_FLAGS[target],
         f"-DFLASHINFER_CAKE_WARP_DECODE_TARGET_MINOR={_TARGET_MINOR[target]}",
+        f"-DFLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256={int(bool(clamped_sources))}",
     ]
     spec = gen_jit_spec(
         name=uri,

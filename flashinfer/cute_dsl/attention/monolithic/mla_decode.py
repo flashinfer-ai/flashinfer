@@ -44,6 +44,8 @@ from flashinfer.cute_dsl.utils import (
 
 _CUDA_GRID_Y_MAX = 65_535
 _STATIC_REDUCER_MAX_SPLITS = 48
+# Cap for launches with too few work units to fill the GPU at 48 splits.
+_SMALL_LAUNCH_REDUCER_MAX_SPLITS = 128
 
 
 def _validate_nonpersistent_grid_y(
@@ -84,7 +86,21 @@ def _get_reducer_max_splits(split_kv: int) -> int:
     The reducer keeps a set of splits' partials in registers per thread, so
     sizing it to the launch avoids wasting registers when few splits run.
     """
-    return min(_STATIC_REDUCER_MAX_SPLITS, max(4, 1 << (split_kv - 1).bit_length()))
+    cap = (
+        _STATIC_REDUCER_MAX_SPLITS
+        if split_kv <= _STATIC_REDUCER_MAX_SPLITS
+        else _SMALL_LAUNCH_REDUCER_MAX_SPLITS
+    )
+    return min(cap, max(4, 1 << (split_kv - 1).bit_length()))
+
+
+def _reducer_split_cap(num_units: int, max_active_blocks: int) -> int:
+    """Split cap that lets ``num_units`` work units fill every resident 2-CTA cluster."""
+    clusters = max(1, max_active_blocks // 2)
+    return max(
+        _STATIC_REDUCER_MAX_SPLITS,
+        min(_SMALL_LAUNCH_REDUCER_MAX_SPLITS, ceil_div(clusters, max(1, num_units))),
+    )
 
 
 @functools.cache
@@ -124,7 +140,10 @@ def _get_split_kv_and_workspace_size(
             f"[1, {rectangular_q_tiles}], got {occupancy_q_tiles}"
         )
     split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
-        1, occupancy_q_tiles, max_active_blocks, _STATIC_REDUCER_MAX_SPLITS
+        1,
+        occupancy_q_tiles,
+        max_active_blocks,
+        _reducer_split_cap(occupancy_q_tiles, max_active_blocks),
     )
     if max_seq_len is not None:
         if max_seq_len <= 0:

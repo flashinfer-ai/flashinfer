@@ -1954,11 +1954,11 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             )
             resolved_backends[backend] = backend_wrappers[backend]._backend
         elif backend == "cudnn":
-            # cuDNN uses NHD layout and the wrapper API
+            # K/V cache tensors use [pages, heads, page_size, dim] (HND).
             backend_wrappers[backend] = (
                 flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
                     workspace_buffer,
-                    "NHD",
+                    "HND",
                     backend="cudnn",
                 )
             )
@@ -3420,6 +3420,12 @@ def testBatchMLAPagedAttentionWrapper(args):
             torch.float8_e5m2,
         ]:
             print("[INFO] Cutlass MLA backend does not support FP8. Skipping.")
+            remove_cutlass = True
+        if num_qo_heads != 128:
+            print(
+                "[INFO] Cutlass MLA backend requires 128 heads; "
+                f"got {num_qo_heads}. Skipping."
+            )
             remove_cutlass = True
         if remove_cutlass:
             backends.remove("cutlass")
