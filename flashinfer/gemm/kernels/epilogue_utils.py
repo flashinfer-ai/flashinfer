@@ -148,14 +148,22 @@ def epilogue_tma_store_scaled(
         num_threads=32 * len(gemm_kernel.epilogue_warp_id),
     )
 
+    # Split-K kernels expand the scheduler's L by split_k_slices; every K slice
+    # of an output tile reduce-adds into the same C tile (tma_atom_c is then a
+    # TMA reduction store).
+    split_k_slices = getattr(gemm_kernel, "split_k_slices", 1)
+
     work_tile = tile_sched.initial_work_tile_info()
     while work_tile.is_valid_tile:
         # Get tile coord from tile scheduler
         cur_tile_coord = work_tile.tile_idx
+        output_l = cur_tile_coord[2]
+        if const_expr(split_k_slices > 1):
+            output_l = cur_tile_coord[2] // split_k_slices
         mma_tile_coord_mnl = (
             cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
             cur_tile_coord[1],
-            cur_tile_coord[2],
+            output_l,
         )
 
         #
@@ -195,7 +203,7 @@ def epilogue_tma_store_scaled(
             # This is more efficient than converting first, then scaling
             #
             acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-            if output_scale is not None:
+            if const_expr(output_scale is not None):
                 # Scale while still in acc_dtype (Float32) for precision
                 acc_vec = acc_vec * output_scale
             # Now convert to c_dtype and apply epilogue_op
