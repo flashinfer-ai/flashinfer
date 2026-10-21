@@ -305,6 +305,9 @@ from .cake_mhc_train import (
     cake_mhc_train_forward_workspace_bytes as cake_mhc_train_forward_workspace_bytes,
 )
 from .cake_mhc_train import cake_mhc_train_prepare as cake_mhc_train_prepare
+from .cake_gdp import (
+    cake_gated_delta_product_mtp as cake_gated_delta_product_mtp,
+)
 from .norm import gated_residual_rmsnorm as gated_residual_rmsnorm
 from .norm import gated_residual_next_rmsnorm as gated_residual_next_rmsnorm
 from .norm import rmsnorm_sigmoid_gate as rmsnorm_sigmoid_gate
