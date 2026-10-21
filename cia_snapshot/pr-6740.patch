@@ -1,0 +1,396 @@
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_0d77890adbb0f7175149_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_0d77890adbb0f7175149_kernel.cu
+index 4147fe19df1..90fcb9011e6 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_0d77890adbb0f7175149_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_0d77890adbb0f7175149_kernel.cu
+@@ -1071,6 +1071,8 @@ kernel_cake_kimi_k3_attn_res_0d77890adbb0f7175149(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_13cf584a1ad91f2c2137_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_13cf584a1ad91f2c2137_kernel.cu
+index d4eadd5005d..1487bec4cfb 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_13cf584a1ad91f2c2137_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_13cf584a1ad91f2c2137_kernel.cu
+@@ -1096,6 +1096,8 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_27ecb918713280215e50_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_27ecb918713280215e50_kernel.cu
+index 27747f4a951..5a0d08925e7 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_27ecb918713280215e50_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_27ecb918713280215e50_kernel.cu
+@@ -1074,6 +1074,8 @@ kernel_cake_kimi_k3_attn_res_27ecb918713280215e50(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_2d95afccc67d7e5696b6_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_2d95afccc67d7e5696b6_kernel.cu
+index 0badba23347..3368fab9419 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_2d95afccc67d7e5696b6_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_2d95afccc67d7e5696b6_kernel.cu
+@@ -1077,6 +1077,8 @@ kernel_cake_kimi_k3_attn_res_2d95afccc67d7e5696b6(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3249f042c00c3ee119ef_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3249f042c00c3ee119ef_kernel.cu
+index a2fc526fb17..844700c3a65 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3249f042c00c3ee119ef_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3249f042c00c3ee119ef_kernel.cu
+@@ -1034,6 +1034,8 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_34ad0cffc89ae1e7aa29_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_34ad0cffc89ae1e7aa29_kernel.cu
+index 602e14e56e1..f66e6f4e975 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_34ad0cffc89ae1e7aa29_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_34ad0cffc89ae1e7aa29_kernel.cu
+@@ -1023,6 +1023,8 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3912cd6ce83f35c2504d_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3912cd6ce83f35c2504d_kernel.cu
+index 754abc07194..a2f7607a6ec 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3912cd6ce83f35c2504d_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3912cd6ce83f35c2504d_kernel.cu
+@@ -1080,6 +1080,8 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3ccd8bb156fa4071f08c_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3ccd8bb156fa4071f08c_kernel.cu
+index b9ab22bd4cb..1c3d50b227c 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3ccd8bb156fa4071f08c_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3ccd8bb156fa4071f08c_kernel.cu
+@@ -1079,6 +1079,8 @@ kernel_cake_kimi_k3_attn_res_3ccd8bb156fa4071f08c(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_55b1ddf9602fd45a1404_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_55b1ddf9602fd45a1404_kernel.cu
+index cbde8628739..a7c588f96f1 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_55b1ddf9602fd45a1404_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_55b1ddf9602fd45a1404_kernel.cu
+@@ -1061,6 +1061,8 @@ kernel_cake_kimi_k3_attn_res_55b1ddf9602fd45a1404(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_5e7c661caa058a3ed916_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_5e7c661caa058a3ed916_kernel.cu
+index 6e98d71143d..3b7f09cac3b 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_5e7c661caa058a3ed916_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_5e7c661caa058a3ed916_kernel.cu
+@@ -1275,6 +1275,10 @@ kernel_cake_kimi_k3_attn_res_5e7c661caa058a3ed916(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++#if __CUDA_ARCH__ == 1000
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
++#endif
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+ #if __CUDA_ARCH__ == 1000
+             if (consumer_warp == 0) {
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_63d5baa9d0eb595ac0ac_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_63d5baa9d0eb595ac0ac_kernel.cu
+index 676850e5d90..e4151c58cba 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_63d5baa9d0eb595ac0ac_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_63d5baa9d0eb595ac0ac_kernel.cu
+@@ -1087,6 +1087,8 @@ kernel_cake_kimi_k3_attn_res_63d5baa9d0eb595ac0ac(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_74f8cbf06549fb15441f_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_74f8cbf06549fb15441f_kernel.cu
+index 5c1dcd2f255..bf84c3cdd2f 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_74f8cbf06549fb15441f_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_74f8cbf06549fb15441f_kernel.cu
+@@ -1097,6 +1097,8 @@ kernel_cake_kimi_k3_attn_res_74f8cbf06549fb15441f(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_7d9facbe77d92ebf65f1_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_7d9facbe77d92ebf65f1_kernel.cu
+index 89410a17cc2..d9bc022e443 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_7d9facbe77d92ebf65f1_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_7d9facbe77d92ebf65f1_kernel.cu
+@@ -1314,6 +1314,8 @@ kernel_cake_kimi_k3_attn_res_7d9facbe77d92ebf65f1(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_8149765ce4eb797a1263_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_8149765ce4eb797a1263_kernel.cu
+index 38f12a1b6de..606dff18dad 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_8149765ce4eb797a1263_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_8149765ce4eb797a1263_kernel.cu
+@@ -1166,6 +1166,10 @@ kernel_cake_kimi_k3_attn_res_8149765ce4eb797a1263(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++#if __CUDA_ARCH__ == 1000
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
++#endif
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+ #if __CUDA_ARCH__ == 1000
+             if (consumer_warp == 0) {
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_87822e6dd352c14dcd2b_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_87822e6dd352c14dcd2b_kernel.cu
+index 4bf39ec26ea..0fa3ed7e992 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_87822e6dd352c14dcd2b_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_87822e6dd352c14dcd2b_kernel.cu
+@@ -1047,6 +1047,8 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_923c80c79dc7e5f529c3_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_923c80c79dc7e5f529c3_kernel.cu
+index 920d9a607bf..d0a951955bd 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_923c80c79dc7e5f529c3_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_923c80c79dc7e5f529c3_kernel.cu
+@@ -1088,6 +1088,8 @@ kernel_cake_kimi_k3_attn_res_923c80c79dc7e5f529c3(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_970f5ee5b6e600f64d47_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_970f5ee5b6e600f64d47_kernel.cu
+index d0814322a32..36be755bf4b 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_970f5ee5b6e600f64d47_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_970f5ee5b6e600f64d47_kernel.cu
+@@ -1104,6 +1104,8 @@ kernel_cake_kimi_k3_attn_res_970f5ee5b6e600f64d47(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_9f31bc7a05f97159bb96_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_9f31bc7a05f97159bb96_kernel.cu
+index 7d72cf7c020..ce23207b18b 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_9f31bc7a05f97159bb96_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_9f31bc7a05f97159bb96_kernel.cu
+@@ -1059,6 +1059,8 @@ kernel_cake_kimi_k3_attn_res_9f31bc7a05f97159bb96(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_9f673b47d6e8c220ecdd_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_9f673b47d6e8c220ecdd_kernel.cu
+index 64e9048d711..b73f6d8fbc6 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_9f673b47d6e8c220ecdd_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_9f673b47d6e8c220ecdd_kernel.cu
+@@ -1084,6 +1084,8 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_a2129211efec0ffa911f_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_a2129211efec0ffa911f_kernel.cu
+index 5f64fb28b0f..e2e880ff5db 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_a2129211efec0ffa911f_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_a2129211efec0ffa911f_kernel.cu
+@@ -1073,6 +1073,8 @@ kernel_cake_kimi_k3_attn_res_a2129211efec0ffa911f(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_ab92afb21c782d62a0ad_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_ab92afb21c782d62a0ad_kernel.cu
+index c70216b54f9..94c3712c3d2 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_ab92afb21c782d62a0ad_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_ab92afb21c782d62a0ad_kernel.cu
+@@ -1279,6 +1279,10 @@ kernel_cake_kimi_k3_attn_res_ab92afb21c782d62a0ad(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++#if __CUDA_ARCH__ == 1000
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
++#endif
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+ #if __CUDA_ARCH__ == 1000
+             if (consumer_warp == 0) {
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_b885dd8a2d8b94643f50_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_b885dd8a2d8b94643f50_kernel.cu
+index e27701262a2..f9679cba273 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_b885dd8a2d8b94643f50_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_b885dd8a2d8b94643f50_kernel.cu
+@@ -1413,6 +1413,8 @@ kernel_cake_kimi_k3_attn_res_b885dd8a2d8b94643f50(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_bc41069b56c74214c587_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_bc41069b56c74214c587_kernel.cu
+index 693bebbdd2a..5d61a08a4fd 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_bc41069b56c74214c587_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_bc41069b56c74214c587_kernel.cu
+@@ -1085,6 +1085,8 @@ kernel_cake_kimi_k3_attn_res_bc41069b56c74214c587(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_be7bfd8261eeb4e6d8b5_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_be7bfd8261eeb4e6d8b5_kernel.cu
+index 3b1abd19708..5465eb9a2bc 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_be7bfd8261eeb4e6d8b5_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_be7bfd8261eeb4e6d8b5_kernel.cu
+@@ -1072,6 +1072,8 @@ kernel_cake_kimi_k3_attn_res_be7bfd8261eeb4e6d8b5(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_caf1e4d34ba9c3debadd_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_caf1e4d34ba9c3debadd_kernel.cu
+index 4a7cebadf85..d960b77a521 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_caf1e4d34ba9c3debadd_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_caf1e4d34ba9c3debadd_kernel.cu
+@@ -1093,6 +1093,8 @@ kernel_cake_kimi_k3_attn_res_caf1e4d34ba9c3debadd(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_d8a00f7ef7bdcde4db62_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_d8a00f7ef7bdcde4db62_kernel.cu
+index dbbe75d4878..f8765e6ee0d 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_d8a00f7ef7bdcde4db62_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_d8a00f7ef7bdcde4db62_kernel.cu
+@@ -1089,6 +1089,8 @@ kernel_cake_kimi_k3_attn_res_d8a00f7ef7bdcde4db62(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_db8d149a6c5d0a8317fd_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_db8d149a6c5d0a8317fd_kernel.cu
+index 445ff6576d9..e51d280b6c4 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_db8d149a6c5d0a8317fd_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_db8d149a6c5d0a8317fd_kernel.cu
+@@ -1072,6 +1072,8 @@ kernel_cake_kimi_k3_attn_res_db8d149a6c5d0a8317fd(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_e682c53fdd5475bf33f5_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_e682c53fdd5475bf33f5_kernel.cu
+index df2d62826b7..336296d63d7 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_e682c53fdd5475bf33f5_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_e682c53fdd5475bf33f5_kernel.cu
+@@ -1087,6 +1087,8 @@ kernel_cake_kimi_k3_attn_res_e682c53fdd5475bf33f5(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_e95cf8d5c1116af31c5d_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_e95cf8d5c1116af31c5d_kernel.cu
+index a4a44e02a07..d7089331181 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_e95cf8d5c1116af31c5d_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_e95cf8d5c1116af31c5d_kernel.cu
+@@ -1207,6 +1207,8 @@ kernel_cake_kimi_k3_attn_res_e95cf8d5c1116af31c5d(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_fb6f7d32a38cf4bbc808_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_fb6f7d32a38cf4bbc808_kernel.cu
+index ce9fc5add69..b1c18404978 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_fb6f7d32a38cf4bbc808_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_fb6f7d32a38cf4bbc808_kernel.cu
+@@ -1031,6 +1031,8 @@ kernel_cake_kimi_k3_attn_res_fb6f7d32a38cf4bbc808(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 9, 288;" ::: "memory");
+             if (consumer_warp == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);

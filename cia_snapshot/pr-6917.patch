@@ -1,0 +1,144 @@
+diff --git a/flashinfer/triton/kernels/norm.py b/flashinfer/triton/kernels/norm.py
+index a7042999b06..b413791fb52 100644
+--- a/flashinfer/triton/kernels/norm.py
++++ b/flashinfer/triton/kernels/norm.py
+@@ -23,6 +23,7 @@ def rms_norm_kernel(
+     HAS_OUT_SCALE: tl.constexpr,
+     HAS_OUTPUT: tl.constexpr,
+     HAS_RESIDUAL: tl.constexpr,
++    ROUND_BEFORE_WEIGHT: tl.constexpr = False,
+ ) -> None:
+     i = tl.program_id(axis=0).to(tl.int64)
+ 
+@@ -69,9 +70,10 @@ def rms_norm_kernel(
+ 
+         w = tl.load(w_ptr + offsets, mask=mask).to(tl.float32)
+ 
+-        # Multiply x with RMS on float32, but cast to the narrower type before
+-        # multiplying with the weights to replicate the HF behaviour precisely.
+-        result = w * (x * rms)
++        normalized = x * rms
++        if ROUND_BEFORE_WEIGHT:
++            normalized = normalized.to(x_ptr.dtype.element_ty).to(tl.float32)
++        result = w * normalized
+         if HAS_OUT_SCALE:
+             result = scale_and_clamp(result, o_scale, output_dtype)
+         tl.store(o_row + offsets, result, mask=mask)
+diff --git a/flashinfer/triton/norm.py b/flashinfer/triton/norm.py
+index 9ddc2cdbc0e..e78794f2d60 100644
+--- a/flashinfer/triton/norm.py
++++ b/flashinfer/triton/norm.py
+@@ -6,6 +6,7 @@
+ from flashinfer.triton.kernels.norm import rms_norm_kernel
+ 
+ 
++@torch.library.custom_op("flashinfer::triton_rms_norm", mutates_args=("out",))
+ def rms_norm(
+     x: torch.Tensor,
+     weight: torch.Tensor,
+@@ -13,10 +14,14 @@ def rms_norm(
+     eps: float,
+     in_scale: Optional[torch.Tensor] = None,
+     out_scale: Optional[torch.Tensor] = None,
++    *,
++    round_before_weight: bool = False,
+ ) -> None:
+     """RMS norm.
+ 
+     Computes `out[i,j] = x[i,j] * weight[j] / sqrt(eps + sum(x[i]^2) / n)`.
++    With ``round_before_weight``, round the normalized value to the input dtype
++    before multiplying by the weight.
+     """
+ 
+     b, n = x.shape
+@@ -42,10 +47,25 @@ def rms_norm(
+         HAS_OUT_SCALE=out_scale is not None,
+         HAS_OUTPUT=True,
+         HAS_RESIDUAL=False,
++        ROUND_BEFORE_WEIGHT=round_before_weight,
+         num_warps=num_warps,
+     )
+ 
+ 
++@rms_norm.register_fake
++def _rms_norm_fake(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    out: torch.Tensor,
++    eps: float,
++    in_scale: Optional[torch.Tensor] = None,
++    out_scale: Optional[torch.Tensor] = None,
++    *,
++    round_before_weight: bool = False,
++) -> None:
++    pass
++
++
+ def rms_norm_add_residual(
+     x: torch.Tensor,
+     residual: torch.Tensor,
+diff --git a/tests/norm/test_triton_rmsnorm.py b/tests/norm/test_triton_rmsnorm.py
+new file mode 100644
+index 00000000000..4ea9639b1d5
+--- /dev/null
++++ b/tests/norm/test_triton_rmsnorm.py
+@@ -0,0 +1,59 @@
++import pytest
++import torch
++from torch.fx.experimental.proxy_tensor import make_fx
++
++from flashinfer.triton.norm import rms_norm
++
++
++@pytest.mark.parametrize("rows", [1, 4, 4096])
++@pytest.mark.parametrize("width", [512, 1536, 4096])
++@pytest.mark.parametrize("round_before_weight", [False, True])
++@pytest.mark.parametrize("compiled", [False, True])
++@torch.no_grad()
++def test_strided_rmsnorm_graph(rows, width, round_before_weight, compiled):
++    torch.manual_seed(53)
++    stride = max(2048, width + 512)
++    source_storage = torch.empty((rows, stride), device="cuda", dtype=torch.bfloat16)
++    source = source_storage[:, stride - width :]
++    output = torch.empty_like(source)
++    weight = torch.randn(width, device="cuda", dtype=torch.bfloat16)
++    source.normal_()
++
++    def run():
++        rms_norm(source, weight, output, 1e-6, round_before_weight=round_before_weight)
++
++    if compiled:
++        run = torch.compile(make_fx(run)(), fullgraph=True, dynamic=False)
++    run()
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        run()
++    for step in range(3):
++        if step == 0:
++            source[:, ::2] = 1
++            source[:, 1::2] = 2
++        else:
++            source.normal_()
++        value = source.double()
++        normalized = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-6)
++        if round_before_weight:
++            normalized = normalized.to(source.dtype).double()
++        expected = (normalized * weight.double()).to(output.dtype)
++        output.fill_(float("nan"))
++        torch.cuda.synchronize()
++        before = torch.cuda.memory_stats()
++        graph.replay()
++        torch.cuda.synchronize()
++        after = torch.cuda.memory_stats()
++        for key in ("allocation.all.allocated", "allocation.all.freed"):
++            assert before[key] == after[key]
++        if step == 0:
++            torch.testing.assert_close(output, expected, rtol=0, atol=0)
++        else:
++            assert torch.isfinite(output).all()
++            ulps = (
++                output.view(torch.int16).int() - expected.view(torch.int16).int()
++            ).abs()
++            # Rounding before and after weighting permits two BF16 rounding steps.
++            assert ulps.max() <= (2 if round_before_weight else 1)

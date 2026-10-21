@@ -1,0 +1,3115 @@
+diff --git a/csrc/cake_fused_qk_rope_fp8_append/cake_ffi_checks.h b/csrc/cake_fused_qk_rope_fp8_append/cake_ffi_checks.h
+new file mode 100644
+index 00000000000..129288f9432
+--- /dev/null
++++ b/csrc/cake_fused_qk_rope_fp8_append/cake_ffi_checks.h
+@@ -0,0 +1,89 @@
++/*
++ * Copyright (c) 2026 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Host surface of the generated Cake launchers (``*_binding.cu``) for a package built without
++// FlashInfer's csrc: the TVM-FFI / DLPack headers the launchers use, the named tensor-argument
++// checks and the CUDA runtime version the library was compiled against.
++#pragma once
++
++#include <dlpack/dlpack.h>
++#include <tvm/ffi/container/tensor.h>
++#include <tvm/ffi/container/shape.h>
++#include <tvm/ffi/dtype.h>
++#include <tvm/ffi/error.h>
++#include <tvm/ffi/extra/c_env_api.h>
++#include <tvm/ffi/extra/cuda/base.h>
++#include <tvm/ffi/extra/cuda/device_guard.h>
++#include <tvm/ffi/function.h>
++#include <cuda_runtime_api.h>
++
++inline void check_cuda_tensor(const tvm::ffi::TensorView& t, const char* name) {
++  TVM_FFI_CHECK(t.device().device_type == kDLCUDA, ValueError)
++      << name << " must be a CUDA tensor, got device_type=" << static_cast<int>(t.device().device_type);
++}
++
++inline void check_dtype(const tvm::ffi::TensorView& t, DLDataType expected, const char* name) {
++  DLDataType d = t.dtype();
++  TVM_FFI_CHECK(d.code == expected.code && d.bits == expected.bits && d.lanes == expected.lanes, TypeError)
++      << name << " dtype mismatch: expected DLDataType(code=" << static_cast<int>(expected.code)
++      << ", bits=" << static_cast<int>(expected.bits) << ", lanes=" << static_cast<int>(expected.lanes)
++      << "), got (code=" << static_cast<int>(d.code) << ", bits=" << static_cast<int>(d.bits)
++      << ", lanes=" << static_cast<int>(d.lanes) << ")";
++}
++
++inline void check_contiguous(const tvm::ffi::TensorView& t, const char* name) {
++  TVM_FFI_CHECK(t.IsContiguous(), ValueError) << name << " must be contiguous";
++}
++
++inline void check_same_device(const tvm::ffi::TensorView& t, const tvm::ffi::TensorView& reference,
++                              const char* name, const char* reference_name) {
++  TVM_FFI_CHECK(t.device().device_type == reference.device().device_type &&
++                    t.device().device_id == reference.device().device_id,
++                ValueError)
++      << name << " must be on the same device as " << reference_name << ": got device_type="
++      << static_cast<int>(t.device().device_type) << " id=" << t.device().device_id
++      << " versus device_type=" << static_cast<int>(reference.device().device_type)
++      << " id=" << reference.device().device_id;
++}
++
++// Require the dimensions above the last `trailing` dimensions to form one dense
++// row-major chain, so they can be folded into a single logical dimension whose
++// step is stride(-(trailing + 1)). Shape products are stride-independent, so
++// this verifies the physical layout instead of inventing a folded stride.
++inline void check_dense_leading_dims(const tvm::ffi::TensorView& t, int trailing, const char* name) {
++  TVM_FFI_CHECK(trailing > 0 && t.ndim() >= trailing, ValueError)
++      << name << " cannot fold leading dimensions above " << trailing << " trailing dims from ndim=" << t.ndim();
++  int outer_last = t.ndim() - trailing - 1;
++  if (outer_last <= 0) {
++    return;
++  }
++  int64_t step = t.stride(outer_last);
++  TVM_FFI_CHECK(step > 0, ValueError) << name << " physical strides must be positive";
++  int64_t expected = step;
++  for (int axis = outer_last - 1; axis >= 0; --axis) {
++    expected *= t.size(axis + 1);
++    if (t.size(axis) > 1) {
++      TVM_FFI_CHECK(t.stride(axis) == expected, ValueError)
++          << name << " leading dims are not physically foldable above " << trailing
++          << " trailing dims: stride(" << axis << ")=" << t.stride(axis) << ", expected " << expected;
++    }
++  }
++}
++
++// The CUDA runtime this library was compiled against (``CUDART_VERSION``, e.g. 13000 for 13.0); every
++// binding exports it as ``build_cuda_version`` so the package loader can compare it with the prebuilt
++// sidecar before the first launch.
++inline int64_t cake_ffi_build_cuda_version() { return CUDART_VERSION; }
+diff --git a/csrc/cake_fused_qk_rope_fp8_append/cake_fused_qk_rope_fp8_append_binding.cu b/csrc/cake_fused_qk_rope_fp8_append/cake_fused_qk_rope_fp8_append_binding.cu
+deleted file mode 100644
+index f910f128544..00000000000
+--- a/csrc/cake_fused_qk_rope_fp8_append/cake_fused_qk_rope_fp8_append_binding.cu
++++ /dev/null
+@@ -1,251 +0,0 @@
+-/*
+- * Copyright (c) 2026 by FlashInfer team.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *   http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-// Generated by the Cake source exporter; shared by every architecture of the
+-// family.  tvm-ffi direct-source launcher for the Cake kernel
+-// CAKE_KERNEL_SYMBOL (set per module by the JIT loader).
+-#include <cuda.h>
+-#include <cuda_bf16.h>
+-#include <cuda_fp16.h>
+-#include <cuda_runtime.h>
+-
+-#include <cstdint>
+-
+-#include "tvm_ffi_utils.h"
+-
+-// One binding source serves every architecture of the family.  The JIT loader
+-// binds the kernel symbol per module (-DCAKE_KERNEL_SYMBOL=<manifest
+-// kernel_symbol>); the default is the sm_100a module's symbol.  The host shim
+-// namespace is derived from the symbol so that co-loaded modules stay distinct.
+-#ifndef CAKE_KERNEL_SYMBOL
+-#define CAKE_KERNEL_SYMBOL kernel_cake_fused_qk_rope_fp8_append_caf9bdb5445726a94bed
+-#endif
+-#define CAKE_KERNEL_SYMBOL_STRING_(symbol) #symbol
+-#define CAKE_KERNEL_SYMBOL_STRING_EXPAND(symbol) CAKE_KERNEL_SYMBOL_STRING_(symbol)
+-#define CAKE_KERNEL_SYMBOL_STRING CAKE_KERNEL_SYMBOL_STRING_EXPAND(CAKE_KERNEL_SYMBOL)
+-#define CAKE_PASTE_(prefix, symbol) prefix##symbol
+-#define CAKE_PASTE_EXPAND(prefix, symbol) CAKE_PASTE_(prefix, symbol)
+-#define CAKE_HOST_SHIM_NAMESPACE CAKE_PASTE_EXPAND(cake_host_shim_, CAKE_KERNEL_SYMBOL)
+-
+-extern "C" __global__ void CAKE_KERNEL_SYMBOL(
+-    const __nv_bfloat16* __restrict__ qkv, const float* __restrict__ cos_sin,
+-    const int* __restrict__ seq_lens, const int* __restrict__ q_indptr,
+-    const int* __restrict__ page_indices, const float* __restrict__ q_norm_weight,
+-    const float* __restrict__ k_norm_weight, const float* __restrict__ k_scale,
+-    const float* __restrict__ v_scale, const float* __restrict__ q_scale_inv,
+-    uint8_t* __restrict__ out_q, uint8_t* key_cache, uint8_t* value_cache, uint8_t* out_k,
+-    uint8_t* out_v, float* __restrict__ q_scale, int* __restrict__ split_k_flag, int num_rows,
+-    int num_requests, int num_q_heads, int num_kv_heads, int page_size, int max_pages_per_request,
+-    int max_seqlen, int max_seqlen_aligned, int quant_policy, int norm_policy, bool is_prefill,
+-    bool has_out_kv, float upper_max);
+-
+-namespace CAKE_HOST_SHIM_NAMESPACE {
+-
+-using tvm::ffi::TensorView;
+-
+-void Run(TensorView arg_qkv, TensorView arg_cos_sin, TensorView arg_seq_lens,
+-         TensorView arg_q_indptr, TensorView arg_page_indices, TensorView arg_q_norm_weight,
+-         TensorView arg_k_norm_weight, TensorView arg_k_scale, TensorView arg_v_scale,
+-         TensorView arg_q_scale_inv, TensorView arg_out_q, TensorView arg_key_cache,
+-         TensorView arg_value_cache, TensorView arg_out_k, TensorView arg_out_v,
+-         TensorView arg_q_scale, TensorView arg_split_k_flag, int64_t arg_num_rows,
+-         int64_t arg_num_requests, int64_t arg_num_q_heads, int64_t arg_num_kv_heads,
+-         int64_t arg_page_size, int64_t arg_max_pages_per_request, int64_t arg_max_seqlen,
+-         int64_t arg_max_seqlen_aligned, int64_t arg_quant_policy, int64_t arg_norm_policy,
+-         bool arg_is_prefill, bool arg_has_out_kv, double arg_upper_max, int64_t grid_x,
+-         int64_t grid_y, int64_t grid_z) {
+-  DLDevice dev = arg_qkv.device();
+-  tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
+-  check_cuda_tensor(arg_qkv, "qkv");
+-  check_dtype(arg_qkv, DLDataType{kDLBfloat, 16, 1}, "qkv");
+-  check_contiguous(arg_qkv, "qkv");
+-  check_cuda_tensor(arg_cos_sin, "cos_sin");
+-  check_dtype(arg_cos_sin, DLDataType{kDLFloat, 32, 1}, "cos_sin");
+-  check_contiguous(arg_cos_sin, "cos_sin");
+-  check_cuda_tensor(arg_seq_lens, "seq_lens");
+-  check_dtype(arg_seq_lens, DLDataType{kDLInt, 32, 1}, "seq_lens");
+-  check_contiguous(arg_seq_lens, "seq_lens");
+-  check_cuda_tensor(arg_q_indptr, "q_indptr");
+-  check_dtype(arg_q_indptr, DLDataType{kDLInt, 32, 1}, "q_indptr");
+-  check_contiguous(arg_q_indptr, "q_indptr");
+-  check_cuda_tensor(arg_page_indices, "page_indices");
+-  check_dtype(arg_page_indices, DLDataType{kDLInt, 32, 1}, "page_indices");
+-  check_contiguous(arg_page_indices, "page_indices");
+-  check_cuda_tensor(arg_q_norm_weight, "q_norm_weight");
+-  check_dtype(arg_q_norm_weight, DLDataType{kDLFloat, 32, 1}, "q_norm_weight");
+-  check_contiguous(arg_q_norm_weight, "q_norm_weight");
+-  check_cuda_tensor(arg_k_norm_weight, "k_norm_weight");
+-  check_dtype(arg_k_norm_weight, DLDataType{kDLFloat, 32, 1}, "k_norm_weight");
+-  check_contiguous(arg_k_norm_weight, "k_norm_weight");
+-  check_cuda_tensor(arg_k_scale, "k_scale");
+-  check_dtype(arg_k_scale, DLDataType{kDLFloat, 32, 1}, "k_scale");
+-  check_contiguous(arg_k_scale, "k_scale");
+-  check_cuda_tensor(arg_v_scale, "v_scale");
+-  check_dtype(arg_v_scale, DLDataType{kDLFloat, 32, 1}, "v_scale");
+-  check_contiguous(arg_v_scale, "v_scale");
+-  check_cuda_tensor(arg_q_scale_inv, "q_scale_inv");
+-  check_dtype(arg_q_scale_inv, DLDataType{kDLFloat, 32, 1}, "q_scale_inv");
+-  check_contiguous(arg_q_scale_inv, "q_scale_inv");
+-  check_cuda_tensor(arg_out_q, "out_q");
+-  check_dtype(arg_out_q, DLDataType{kDLFloat8_e4m3fn, 8, 1}, "out_q");
+-  check_contiguous(arg_out_q, "out_q");
+-  check_cuda_tensor(arg_key_cache, "key_cache");
+-  check_dtype(arg_key_cache, DLDataType{kDLFloat8_e4m3fn, 8, 1}, "key_cache");
+-  check_contiguous(arg_key_cache, "key_cache");
+-  check_cuda_tensor(arg_value_cache, "value_cache");
+-  check_dtype(arg_value_cache, DLDataType{kDLFloat8_e4m3fn, 8, 1}, "value_cache");
+-  check_contiguous(arg_value_cache, "value_cache");
+-  check_cuda_tensor(arg_out_k, "out_k");
+-  check_dtype(arg_out_k, DLDataType{kDLFloat8_e4m3fn, 8, 1}, "out_k");
+-  check_contiguous(arg_out_k, "out_k");
+-  check_cuda_tensor(arg_out_v, "out_v");
+-  check_dtype(arg_out_v, DLDataType{kDLFloat8_e4m3fn, 8, 1}, "out_v");
+-  check_contiguous(arg_out_v, "out_v");
+-  check_cuda_tensor(arg_q_scale, "q_scale");
+-  check_dtype(arg_q_scale, DLDataType{kDLFloat, 32, 1}, "q_scale");
+-  check_contiguous(arg_q_scale, "q_scale");
+-  check_cuda_tensor(arg_split_k_flag, "split_k_flag");
+-  check_dtype(arg_split_k_flag, DLDataType{kDLInt, 32, 1}, "split_k_flag");
+-  check_contiguous(arg_split_k_flag, "split_k_flag");
+-  TVM_FFI_CHECK(arg_num_rows >= -2147483648LL && arg_num_rows <= 2147483647LL, ValueError)
+-      << "scalar 'num_rows' value " << arg_num_rows
+-      << " is outside i32 range [-2147483648, 2147483647]";
+-  TVM_FFI_CHECK(arg_num_requests >= -2147483648LL && arg_num_requests <= 2147483647LL, ValueError)
+-      << "scalar 'num_requests' value " << arg_num_requests
+-      << " is outside i32 range [-2147483648, 2147483647]";
+-  TVM_FFI_CHECK(arg_num_q_heads >= -2147483648LL && arg_num_q_heads <= 2147483647LL, ValueError)
+-      << "scalar 'num_q_heads' value " << arg_num_q_heads
+-      << " is outside i32 range [-2147483648, 2147483647]";
+-  TVM_FFI_CHECK(arg_num_kv_heads >= -2147483648LL && arg_num_kv_heads <= 2147483647LL, ValueError)
+-      << "scalar 'num_kv_heads' value " << arg_num_kv_heads
+-      << " is outside i32 range [-2147483648, 2147483647]";
+-  TVM_FFI_CHECK(arg_page_size >= -2147483648LL && arg_page_size <= 2147483647LL, ValueError)
+-      << "scalar 'page_size' value " << arg_page_size
+-      << " is outside i32 range [-2147483648, 2147483647]";
+-  TVM_FFI_CHECK(
+-      arg_max_pages_per_request >= -2147483648LL && arg_max_pages_per_request <= 2147483647LL,
+-      ValueError)
+-      << "scalar 'max_pages_per_request' value " << arg_max_pages_per_request
+-      << " is outside i32 range [-2147483648, 2147483647]";
+-  TVM_FFI_CHECK(arg_max_seqlen >= -2147483648LL && arg_max_seqlen <= 2147483647LL, ValueError)
+-      << "scalar 'max_seqlen' value " << arg_max_seqlen
+-      << " is outside i32 range [-2147483648, 2147483647]";
+-  TVM_FFI_CHECK(arg_max_seqlen_aligned >= -2147483648LL && arg_max_seqlen_aligned <= 2147483647LL,
+-                ValueError)
+-      << "scalar 'max_seqlen_aligned' value " << arg_max_seqlen_aligned
+-      << " is outside i32 range [-2147483648, 2147483647]";
+-  TVM_FFI_CHECK(arg_quant_policy >= -2147483648LL && arg_quant_policy <= 2147483647LL, ValueError)
+-      << "scalar 'quant_policy' value " << arg_quant_policy
+-      << " is outside i32 range [-2147483648, 2147483647]";
+-  TVM_FFI_CHECK(arg_norm_policy >= -2147483648LL && arg_norm_policy <= 2147483647LL, ValueError)
+-      << "scalar 'norm_policy' value " << arg_norm_policy
+-      << " is outside i32 range [-2147483648, 2147483647]";
+-  check_same_device(arg_cos_sin, arg_qkv, "cos_sin", "qkv");
+-  check_same_device(arg_seq_lens, arg_qkv, "seq_lens", "qkv");
+-  check_same_device(arg_q_indptr, arg_qkv, "q_indptr", "qkv");
+-  check_same_device(arg_page_indices, arg_qkv, "page_indices", "qkv");
+-  check_same_device(arg_q_norm_weight, arg_qkv, "q_norm_weight", "qkv");
+-  check_same_device(arg_k_norm_weight, arg_qkv, "k_norm_weight", "qkv");
+-  check_same_device(arg_k_scale, arg_qkv, "k_scale", "qkv");
+-  check_same_device(arg_v_scale, arg_qkv, "v_scale", "qkv");
+-  check_same_device(arg_q_scale_inv, arg_qkv, "q_scale_inv", "qkv");
+-  check_same_device(arg_out_q, arg_qkv, "out_q", "qkv");
+-  check_same_device(arg_key_cache, arg_qkv, "key_cache", "qkv");
+-  check_same_device(arg_value_cache, arg_qkv, "value_cache", "qkv");
+-  check_same_device(arg_out_k, arg_qkv, "out_k", "qkv");
+-  check_same_device(arg_out_v, arg_qkv, "out_v", "qkv");
+-  check_same_device(arg_q_scale, arg_qkv, "q_scale", "qkv");
+-  check_same_device(arg_split_k_flag, arg_qkv, "split_k_flag", "qkv");
+-  TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
+-      << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y << ", "
+-      << grid_z << ")";
+-
+-  cudaStream_t stream = (cudaStream_t)TVMFFIEnvGetStream(dev.device_type, dev.device_id);
+-  __nv_bfloat16* p_qkv = static_cast<__nv_bfloat16*>(arg_qkv.data_ptr());
+-  float* p_cos_sin = static_cast<float*>(arg_cos_sin.data_ptr());
+-  int* p_seq_lens = static_cast<int*>(arg_seq_lens.data_ptr());
+-  int* p_q_indptr = static_cast<int*>(arg_q_indptr.data_ptr());
+-  int* p_page_indices = static_cast<int*>(arg_page_indices.data_ptr());
+-  float* p_q_norm_weight = static_cast<float*>(arg_q_norm_weight.data_ptr());
+-  float* p_k_norm_weight = static_cast<float*>(arg_k_norm_weight.data_ptr());
+-  float* p_k_scale = static_cast<float*>(arg_k_scale.data_ptr());
+-  float* p_v_scale = static_cast<float*>(arg_v_scale.data_ptr());
+-  float* p_q_scale_inv = static_cast<float*>(arg_q_scale_inv.data_ptr());
+-  uint8_t* p_out_q = static_cast<uint8_t*>(arg_out_q.data_ptr());
+-  uint8_t* p_key_cache = static_cast<uint8_t*>(arg_key_cache.data_ptr());
+-  uint8_t* p_value_cache = static_cast<uint8_t*>(arg_value_cache.data_ptr());
+-  uint8_t* p_out_k = static_cast<uint8_t*>(arg_out_k.data_ptr());
+-  uint8_t* p_out_v = static_cast<uint8_t*>(arg_out_v.data_ptr());
+-  float* p_q_scale = static_cast<float*>(arg_q_scale.data_ptr());
+-  int* p_split_k_flag = static_cast<int*>(arg_split_k_flag.data_ptr());
+-  int32_t v_num_rows = (int32_t)arg_num_rows;
+-  int32_t v_num_requests = (int32_t)arg_num_requests;
+-  int32_t v_num_q_heads = (int32_t)arg_num_q_heads;
+-  int32_t v_num_kv_heads = (int32_t)arg_num_kv_heads;
+-  int32_t v_page_size = (int32_t)arg_page_size;
+-  int32_t v_max_pages_per_request = (int32_t)arg_max_pages_per_request;
+-  int32_t v_max_seqlen = (int32_t)arg_max_seqlen;
+-  int32_t v_max_seqlen_aligned = (int32_t)arg_max_seqlen_aligned;
+-  int32_t v_quant_policy = (int32_t)arg_quant_policy;
+-  int32_t v_norm_policy = (int32_t)arg_norm_policy;
+-  bool v_is_prefill = (bool)arg_is_prefill;
+-  bool v_has_out_kv = (bool)arg_has_out_kv;
+-  float v_upper_max = (float)arg_upper_max;
+-  void* kargs[] = {&p_qkv,
+-                   &p_cos_sin,
+-                   &p_seq_lens,
+-                   &p_q_indptr,
+-                   &p_page_indices,
+-                   &p_q_norm_weight,
+-                   &p_k_norm_weight,
+-                   &p_k_scale,
+-                   &p_v_scale,
+-                   &p_q_scale_inv,
+-                   &p_out_q,
+-                   &p_key_cache,
+-                   &p_value_cache,
+-                   &p_out_k,
+-                   &p_out_v,
+-                   &p_q_scale,
+-                   &p_split_k_flag,
+-                   &v_num_rows,
+-                   &v_num_requests,
+-                   &v_num_q_heads,
+-                   &v_num_kv_heads,
+-                   &v_page_size,
+-                   &v_max_pages_per_request,
+-                   &v_max_seqlen,
+-                   &v_max_seqlen_aligned,
+-                   &v_quant_policy,
+-                   &v_norm_policy,
+-                   &v_is_prefill,
+-                   &v_has_out_kv,
+-                   &v_upper_max};
+-
+-  dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
+-  dim3 block(96u, 1u, 1u);
+-
+-  cudaError_t launch_status = cudaLaunchKernel(
+-      reinterpret_cast<const void*>(CAKE_KERNEL_SYMBOL),
+-      grid, block, kargs, 0u, stream);
+-  TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
+-      << "cudaLaunchKernel for " CAKE_KERNEL_SYMBOL_STRING " failed: "
+-      << cudaGetErrorString(launch_status);
+-}
+-
+-}  // namespace CAKE_HOST_SHIM_NAMESPACE
+-
+-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_HOST_SHIM_NAMESPACE::Run);
+diff --git a/csrc/cake_fused_qk_rope_fp8_append/cake_fused_qk_rope_fp8_append_e8a15268bf7234456084_binding.cu b/csrc/cake_fused_qk_rope_fp8_append/cake_fused_qk_rope_fp8_append_e8a15268bf7234456084_binding.cu
+new file mode 100644
+index 00000000000..bfad5d4a6fe
+--- /dev/null
++++ b/csrc/cake_fused_qk_rope_fp8_append/cake_fused_qk_rope_fp8_append_e8a15268bf7234456084_binding.cu
+@@ -0,0 +1,188 @@
++/*
++ * Copyright (c) 2026 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Generated by Cake: the tvm-ffi host binding of kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084, for the device source that defines it. Do not edit.
++#include <cuda_runtime.h>
++#include <cuda_bf16.h>
++
++#include "cake_ffi_checks.h"
++
++#include <cstdint>
++
++extern "C" __global__ void kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084(const __nv_bfloat16* __restrict__ qkv, const float* __restrict__ cos_sin, const int* __restrict__ seq_lens, const int* __restrict__ q_indptr, const int* __restrict__ page_indices, const float* __restrict__ q_norm_weight, const float* __restrict__ k_norm_weight, const float* __restrict__ k_scale, const float* __restrict__ v_scale, const float* __restrict__ q_scale_inv, uint8_t* __restrict__ out_q, uint8_t* key_cache, uint8_t* value_cache, uint8_t* out_k, uint8_t* out_v, float* __restrict__ q_scale, int* __restrict__ split_k_flag, int num_rows, int num_requests, int num_q_heads, int num_kv_heads, int page_size, int max_pages_per_request, int max_seqlen, int max_seqlen_aligned, int quant_policy, int norm_policy, bool is_prefill, bool has_out_kv, float upper_max);
++
++namespace cake_binding_kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084 {
++
++using tvm::ffi::TensorView;
++
++constexpr const char* KERNEL_NAME = "kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084";
++
++void CheckCuda(cudaError_t status, const char* what) {
++  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
++      << KERNEL_NAME << ": " << what << " failed: " << cudaGetErrorString(status);
++}
++
++void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t.byte_offset(); }
++
++void Run(TensorView a_qkv, TensorView a_cos_sin, TensorView a_seq_lens, TensorView a_q_indptr, TensorView a_page_indices, TensorView a_q_norm_weight, TensorView a_k_norm_weight, TensorView a_k_scale, TensorView a_v_scale, TensorView a_q_scale_inv, TensorView a_out_q, TensorView a_key_cache, TensorView a_value_cache, TensorView a_out_k, TensorView a_out_v, TensorView a_q_scale, TensorView a_split_k_flag, int64_t a_num_rows, int64_t a_num_requests, int64_t a_num_q_heads, int64_t a_num_kv_heads, int64_t a_page_size, int64_t a_max_pages_per_request, int64_t a_max_seqlen, int64_t a_max_seqlen_aligned, int64_t a_quant_policy, int64_t a_norm_policy, bool a_is_prefill, bool a_has_out_kv, double a_upper_max, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
++  DLDevice dev = a_qkv.device();
++  tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
++  check_cuda_tensor(a_qkv, "qkv");
++  check_dtype(a_qkv, DLDataType{kDLBfloat, 16, 1}, "qkv");
++  check_cuda_tensor(a_cos_sin, "cos_sin");
++  check_dtype(a_cos_sin, DLDataType{kDLFloat, 32, 1}, "cos_sin");
++  check_cuda_tensor(a_seq_lens, "seq_lens");
++  check_dtype(a_seq_lens, DLDataType{kDLInt, 32, 1}, "seq_lens");
++  check_cuda_tensor(a_q_indptr, "q_indptr");
++  check_dtype(a_q_indptr, DLDataType{kDLInt, 32, 1}, "q_indptr");
++  check_cuda_tensor(a_page_indices, "page_indices");
++  check_dtype(a_page_indices, DLDataType{kDLInt, 32, 1}, "page_indices");
++  check_cuda_tensor(a_q_norm_weight, "q_norm_weight");
++  check_dtype(a_q_norm_weight, DLDataType{kDLFloat, 32, 1}, "q_norm_weight");
++  check_cuda_tensor(a_k_norm_weight, "k_norm_weight");
++  check_dtype(a_k_norm_weight, DLDataType{kDLFloat, 32, 1}, "k_norm_weight");
++  check_cuda_tensor(a_k_scale, "k_scale");
++  check_dtype(a_k_scale, DLDataType{kDLFloat, 32, 1}, "k_scale");
++  check_cuda_tensor(a_v_scale, "v_scale");
++  check_dtype(a_v_scale, DLDataType{kDLFloat, 32, 1}, "v_scale");
++  check_cuda_tensor(a_q_scale_inv, "q_scale_inv");
++  check_dtype(a_q_scale_inv, DLDataType{kDLFloat, 32, 1}, "q_scale_inv");
++  check_cuda_tensor(a_out_q, "out_q");
++  check_dtype(a_out_q, DLDataType{kDLFloat8_e4m3fn, 8, 1}, "out_q");
++  check_cuda_tensor(a_key_cache, "key_cache");
++  check_dtype(a_key_cache, DLDataType{kDLFloat8_e4m3fn, 8, 1}, "key_cache");
++  check_cuda_tensor(a_value_cache, "value_cache");
++  check_dtype(a_value_cache, DLDataType{kDLFloat8_e4m3fn, 8, 1}, "value_cache");
++  check_cuda_tensor(a_out_k, "out_k");
++  check_dtype(a_out_k, DLDataType{kDLFloat8_e4m3fn, 8, 1}, "out_k");
++  check_cuda_tensor(a_out_v, "out_v");
++  check_dtype(a_out_v, DLDataType{kDLFloat8_e4m3fn, 8, 1}, "out_v");
++  check_cuda_tensor(a_q_scale, "q_scale");
++  check_dtype(a_q_scale, DLDataType{kDLFloat, 32, 1}, "q_scale");
++  check_cuda_tensor(a_split_k_flag, "split_k_flag");
++  check_dtype(a_split_k_flag, DLDataType{kDLInt, 32, 1}, "split_k_flag");
++  TVM_FFI_CHECK(a_num_rows >= -2147483648LL && a_num_rows <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'num_rows' = " << a_num_rows
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_num_requests >= -2147483648LL && a_num_requests <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'num_requests' = " << a_num_requests
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_num_q_heads >= -2147483648LL && a_num_q_heads <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'num_q_heads' = " << a_num_q_heads
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_num_kv_heads >= -2147483648LL && a_num_kv_heads <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'num_kv_heads' = " << a_num_kv_heads
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_page_size >= -2147483648LL && a_page_size <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'page_size' = " << a_page_size
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_max_pages_per_request >= -2147483648LL && a_max_pages_per_request <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'max_pages_per_request' = " << a_max_pages_per_request
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_max_seqlen >= -2147483648LL && a_max_seqlen <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'max_seqlen' = " << a_max_seqlen
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_max_seqlen_aligned >= -2147483648LL && a_max_seqlen_aligned <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'max_seqlen_aligned' = " << a_max_seqlen_aligned
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_quant_policy >= -2147483648LL && a_quant_policy <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'quant_policy' = " << a_quant_policy
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_norm_policy >= -2147483648LL && a_norm_policy <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'norm_policy' = " << a_norm_policy
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  check_contiguous(a_qkv, "qkv");
++  check_contiguous(a_cos_sin, "cos_sin");
++  check_same_device(a_cos_sin, a_qkv, "cos_sin", "qkv");
++  check_contiguous(a_seq_lens, "seq_lens");
++  check_same_device(a_seq_lens, a_qkv, "seq_lens", "qkv");
++  check_contiguous(a_q_indptr, "q_indptr");
++  check_same_device(a_q_indptr, a_qkv, "q_indptr", "qkv");
++  check_contiguous(a_page_indices, "page_indices");
++  check_same_device(a_page_indices, a_qkv, "page_indices", "qkv");
++  check_contiguous(a_q_norm_weight, "q_norm_weight");
++  check_same_device(a_q_norm_weight, a_qkv, "q_norm_weight", "qkv");
++  check_contiguous(a_k_norm_weight, "k_norm_weight");
++  check_same_device(a_k_norm_weight, a_qkv, "k_norm_weight", "qkv");
++  check_contiguous(a_k_scale, "k_scale");
++  check_same_device(a_k_scale, a_qkv, "k_scale", "qkv");
++  check_contiguous(a_v_scale, "v_scale");
++  check_same_device(a_v_scale, a_qkv, "v_scale", "qkv");
++  check_contiguous(a_q_scale_inv, "q_scale_inv");
++  check_same_device(a_q_scale_inv, a_qkv, "q_scale_inv", "qkv");
++  check_contiguous(a_out_q, "out_q");
++  check_same_device(a_out_q, a_qkv, "out_q", "qkv");
++  check_contiguous(a_key_cache, "key_cache");
++  check_same_device(a_key_cache, a_qkv, "key_cache", "qkv");
++  check_contiguous(a_value_cache, "value_cache");
++  check_same_device(a_value_cache, a_qkv, "value_cache", "qkv");
++  check_contiguous(a_out_k, "out_k");
++  check_same_device(a_out_k, a_qkv, "out_k", "qkv");
++  check_contiguous(a_out_v, "out_v");
++  check_same_device(a_out_v, a_qkv, "out_v", "qkv");
++  check_contiguous(a_q_scale, "q_scale");
++  check_same_device(a_q_scale, a_qkv, "q_scale", "qkv");
++  check_contiguous(a_split_k_flag, "split_k_flag");
++  check_same_device(a_split_k_flag, a_qkv, "split_k_flag", "qkv");
++  TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
++      << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
++  TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)
++      << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") exceeds CUDA's limits";
++  cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(dev.device_type, dev.device_id));
++  void* v_qkv = DataPtr(a_qkv);
++  void* v_cos_sin = DataPtr(a_cos_sin);
++  void* v_seq_lens = DataPtr(a_seq_lens);
++  void* v_q_indptr = DataPtr(a_q_indptr);
++  void* v_page_indices = DataPtr(a_page_indices);
++  void* v_q_norm_weight = DataPtr(a_q_norm_weight);
++  void* v_k_norm_weight = DataPtr(a_k_norm_weight);
++  void* v_k_scale = DataPtr(a_k_scale);
++  void* v_v_scale = DataPtr(a_v_scale);
++  void* v_q_scale_inv = DataPtr(a_q_scale_inv);
++  void* v_out_q = DataPtr(a_out_q);
++  void* v_key_cache = DataPtr(a_key_cache);
++  void* v_value_cache = DataPtr(a_value_cache);
++  void* v_out_k = DataPtr(a_out_k);
++  void* v_out_v = DataPtr(a_out_v);
++  void* v_q_scale = DataPtr(a_q_scale);
++  void* v_split_k_flag = DataPtr(a_split_k_flag);
++  int32_t v_num_rows = static_cast<int32_t>(a_num_rows);
++  int32_t v_num_requests = static_cast<int32_t>(a_num_requests);
++  int32_t v_num_q_heads = static_cast<int32_t>(a_num_q_heads);
++  int32_t v_num_kv_heads = static_cast<int32_t>(a_num_kv_heads);
++  int32_t v_page_size = static_cast<int32_t>(a_page_size);
++  int32_t v_max_pages_per_request = static_cast<int32_t>(a_max_pages_per_request);
++  int32_t v_max_seqlen = static_cast<int32_t>(a_max_seqlen);
++  int32_t v_max_seqlen_aligned = static_cast<int32_t>(a_max_seqlen_aligned);
++  int32_t v_quant_policy = static_cast<int32_t>(a_quant_policy);
++  int32_t v_norm_policy = static_cast<int32_t>(a_norm_policy);
++  bool v_is_prefill = static_cast<bool>(a_is_prefill);
++  bool v_has_out_kv = static_cast<bool>(a_has_out_kv);
++  float v_upper_max = static_cast<float>(a_upper_max);
++  void* kernel_args[] = {&v_qkv, &v_cos_sin, &v_seq_lens, &v_q_indptr, &v_page_indices, &v_q_norm_weight, &v_k_norm_weight, &v_k_scale, &v_v_scale, &v_q_scale_inv, &v_out_q, &v_key_cache, &v_value_cache, &v_out_k, &v_out_v, &v_q_scale, &v_split_k_flag, &v_num_rows, &v_num_requests, &v_num_q_heads, &v_num_kv_heads, &v_page_size, &v_max_pages_per_request, &v_max_seqlen, &v_max_seqlen_aligned, &v_quant_policy, &v_norm_policy, &v_is_prefill, &v_has_out_kv, &v_upper_max};
++  cudaLaunchConfig_t config{};
++  config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
++  config.blockDim = dim3(96, 1, 1);
++  config.dynamicSmemBytes = 0;
++  config.stream = stream;
++  CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084), kernel_args),
++            "cudaLaunchKernelExC");
++}
++
++}  // namespace cake_binding_kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084
++
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_binding_kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084::Run);
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, cake_ffi_build_cuda_version);
+diff --git a/csrc/cake_fused_qk_rope_fp8_append/cake_fused_qk_rope_fp8_append_e8a15268bf7234456084_kernel.cu b/csrc/cake_fused_qk_rope_fp8_append/cake_fused_qk_rope_fp8_append_e8a15268bf7234456084_kernel.cu
+new file mode 100644
+index 00000000000..c91711cc34b
+--- /dev/null
++++ b/csrc/cake_fused_qk_rope_fp8_append/cake_fused_qk_rope_fp8_append_e8a15268bf7234456084_kernel.cu
+@@ -0,0 +1,702 @@
++/*
++ * Copyright (c) 2026 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++typedef signed char        int8_t;
++typedef unsigned char      uint8_t;
++typedef unsigned short     uint16_t;
++typedef unsigned int       uint32_t;
++#if defined(__CUDACC_RTC__)
++typedef unsigned long long uint64_t;
++#else
++typedef unsigned long      uint64_t;
++#endif
++static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
++typedef signed int         int32_t;
++typedef short int          int16_t;
++struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
++static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
++static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
++
++#if defined(__CUDACC_RTC__)
++typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
++#else
++#include <cuda.h>
++#endif
++
++static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++
++__device__ __forceinline__ int make_warp_uniform(int x) {
++    int result;
++    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
++                 : "=r"(result) : "r"(x));
++    return result;
++}
++
++#define CAKE_INF CUDART_INF_F
++#define NUM_MAIN_STAGES 1
++#define SMEM_META_OFF 0
++#define SMEM_META_STAGE_BYTES 16
++#define SMEM_META_STRIDE 16
++#define SMEM_TOTAL 0
++#define THREADS 96
++
++#include <math_constants.h>
++
++extern "C" {
++
++__global__ __launch_bounds__(96) void
++kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084(const __nv_bfloat16* __restrict__ qkv, const float* __restrict__ cos_sin, const int* __restrict__ seq_lens, const int* __restrict__ q_indptr, const int* __restrict__ page_indices, const float* __restrict__ q_norm_weight, const float* __restrict__ k_norm_weight, const float* __restrict__ k_scale, const float* __restrict__ v_scale, const float* __restrict__ q_scale_inv, uint8_t* __restrict__ out_q, uint8_t* key_cache, uint8_t* value_cache, uint8_t* out_k, uint8_t* out_v, float* __restrict__ q_scale, int* __restrict__ split_k_flag, int num_rows, int num_requests, int num_q_heads, int num_kv_heads, int page_size, int max_pages_per_request, int max_seqlen, int max_seqlen_aligned, int quant_policy, int norm_policy, bool is_prefill, bool has_out_kv, float upper_max)
++{
++    const int tid = threadIdx.x;
++    const int warp = make_warp_uniform(tid / 32);
++    const int lane = tid % 32;
++
++    __shared__ __align__(16) unsigned char smem_static_raw[16];
++
++    const int bid = blockIdx.x;
++    const int num_bids = gridDim.x;
++
++    const int cta_rank = 0;
++
++    // Kernel setup ops
++    int* meta = reinterpret_cast<int*>(smem_static_raw + 0);
++    const int meta_addr = (int)(unsigned long long)__cvta_generic_to_shared(meta);
++
++    // === Task calls (dependency order) ===
++    int tid_0 = tid;
++    int slot = tid_0 / 8;
++    int lane_1 = tid_0 % 8;
++    int grp_base = tid_0 % 32 - lane_1;
++    unsigned int grp_mask = (unsigned int)(255 << grp_base);
++    int kv_head = blockIdx.y;
++    int q_per_kv = num_q_heads / num_kv_heads;
++    int bid_1 = blockIdx.x;
++    bool is_row_cta = bid_1 < num_rows;
++    int row = ((is_row_cta) ? bid_1 : 0);
++    bool dyn_prefill = quant_policy == 1 && is_prefill;
++    int width = (num_q_heads + 2 * num_kv_heads) * 128;
++    bool is_q = slot < q_per_kv;
++    bool is_k = slot == 8;
++    bool is_v = slot == 9;
++    bool active = is_q || is_k || is_v;
++    int head_in_row = ((is_q) ? kv_head * q_per_kv + slot : ((is_k) ? num_q_heads + kv_head : num_q_heads + num_kv_heads + kv_head));
++    int lane_lo = ((is_v) ? lane_1 * 16 : lane_1 * 8);
++    int lane_hi = ((is_v) ? lane_1 * 16 + 8 : 64 + lane_1 * 8);
++    unsigned int x_lo_w[4];
++    unsigned int x_hi_w[4];
++    float w_lo[8];
++    float w_hi[8];
++    float c_lo[8];
++    float c_hi[8];
++    #pragma unroll
++    for (int j = 0; j < 4; j++) {
++        x_lo_w[j] = 0;
++        x_hi_w[j] = 0;
++    }
++    #pragma unroll
++    for (int j_1 = 0; j_1 < 8; j_1++) {
++        w_lo[j_1] = 1.0f;
++        w_hi[j_1] = 1.0f;
++        c_lo[j_1] = 1.0f;
++        c_hi[j_1] = 0.0f;
++    }
++    if (is_row_cta && active) {
++        long long src_base = (long long)row * (long long)width + (long long)(head_in_row * 128);
++        {
++            const uint4* _vptr_0 = reinterpret_cast<const uint4*>(qkv + (src_base + (long long)lane_lo) + 0);
++            uint4* _vdst_0 = reinterpret_cast<uint4*>(&x_lo_w[0]);
++            #pragma unroll
++            for (int _blk = 0; _blk < 1; _blk++) {
++                asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
++                    : "=r"(_vdst_0[_blk].x), "=r"(_vdst_0[_blk].y), "=r"(_vdst_0[_blk].z), "=r"(_vdst_0[_blk].w) : "l"((const void*)(_vptr_0 + _blk)) : "memory");
++            }
++        }
++        {
++            const uint4* _vptr_1 = reinterpret_cast<const uint4*>(qkv + (src_base + (long long)lane_hi) + 0);
++            uint4* _vdst_1 = reinterpret_cast<uint4*>(&x_hi_w[0]);
++            #pragma unroll
++            for (int _blk = 0; _blk < 1; _blk++) {
++                asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
++                    : "=r"(_vdst_1[_blk].x), "=r"(_vdst_1[_blk].y), "=r"(_vdst_1[_blk].z), "=r"(_vdst_1[_blk].w) : "l"((const void*)(_vptr_1 + _blk)) : "memory");
++            }
++        }
++        if (norm_policy != 0 && (is_q || is_k)) {
++            if (is_q) {
++                {
++                    unsigned _v4_2_0;
++                    unsigned _v4_2_1;
++                    unsigned _v4_2_2;
++                    unsigned _v4_2_3;
++                    asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
++                        : "=r"(_v4_2_0), "=r"(_v4_2_1), "=r"(_v4_2_2), "=r"(_v4_2_3) : "l"((const void*)(q_norm_weight + (lane_1 * 8) + (0))) : "memory");
++                    w_lo[0 + 0] = __uint_as_float(_v4_2_0);
++                    w_lo[0 + 1] = __uint_as_float(_v4_2_1);
++                    w_lo[0 + 2] = __uint_as_float(_v4_2_2);
++                    w_lo[0 + 3] = __uint_as_float(_v4_2_3);
++                }
++                {
++                    unsigned _v4_3_0;
++                    unsigned _v4_3_1;
++                    unsigned _v4_3_2;
++                    unsigned _v4_3_3;
++                    asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
++                        : "=r"(_v4_3_0), "=r"(_v4_3_1), "=r"(_v4_3_2), "=r"(_v4_3_3) : "l"((const void*)(q_norm_weight + (lane_1 * 8 + 4) + (0))) : "memory");
++                    w_lo[4 + 0] = __uint_as_float(_v4_3_0);
++                    w_lo[4 + 1] = __uint_as_float(_v4_3_1);
++                    w_lo[4 + 2] = __uint_as_float(_v4_3_2);
++                    w_lo[4 + 3] = __uint_as_float(_v4_3_3);
++                }
++                {
++                    unsigned _v4_4_0;
++                    unsigned _v4_4_1;
++                    unsigned _v4_4_2;
++                    unsigned _v4_4_3;
++                    asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
++                        : "=r"(_v4_4_0), "=r"(_v4_4_1), "=r"(_v4_4_2), "=r"(_v4_4_3) : "l"((const void*)(q_norm_weight + (64 + lane_1 * 8) + (0))) : "memory");
++                    w_hi[0 + 0] = __uint_as_float(_v4_4_0);
++                    w_hi[0 + 1] = __uint_as_float(_v4_4_1);
++                    w_hi[0 + 2] = __uint_as_float(_v4_4_2);
++                    w_hi[0 + 3] = __uint_as_float(_v4_4_3);
++                }
++                {
++                    unsigned _v4_5_0;
++                    unsigned _v4_5_1;
++                    unsigned _v4_5_2;
++                    unsigned _v4_5_3;
++                    asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
++                        : "=r"(_v4_5_0), "=r"(_v4_5_1), "=r"(_v4_5_2), "=r"(_v4_5_3) : "l"((const void*)(q_norm_weight + (64 + lane_1 * 8 + 4) + (0))) : "memory");
++                    w_hi[4 + 0] = __uint_as_float(_v4_5_0);
++                    w_hi[4 + 1] = __uint_as_float(_v4_5_1);
++                    w_hi[4 + 2] = __uint_as_float(_v4_5_2);
++                    w_hi[4 + 3] = __uint_as_float(_v4_5_3);
++                }
++            } else {
++                {
++                    unsigned _v4_6_0;
++                    unsigned _v4_6_1;
++                    unsigned _v4_6_2;
++                    unsigned _v4_6_3;
++                    asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
++                        : "=r"(_v4_6_0), "=r"(_v4_6_1), "=r"(_v4_6_2), "=r"(_v4_6_3) : "l"((const void*)(k_norm_weight + (lane_1 * 8) + (0))) : "memory");
++                    w_lo[0 + 0] = __uint_as_float(_v4_6_0);
++                    w_lo[0 + 1] = __uint_as_float(_v4_6_1);
++                    w_lo[0 + 2] = __uint_as_float(_v4_6_2);
++                    w_lo[0 + 3] = __uint_as_float(_v4_6_3);
++                }
++                {
++                    unsigned _v4_7_0;
++                    unsigned _v4_7_1;
++                    unsigned _v4_7_2;
++                    unsigned _v4_7_3;
++                    asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
++                        : "=r"(_v4_7_0), "=r"(_v4_7_1), "=r"(_v4_7_2), "=r"(_v4_7_3) : "l"((const void*)(k_norm_weight + (lane_1 * 8 + 4) + (0))) : "memory");
++                    w_lo[4 + 0] = __uint_as_float(_v4_7_0);
++                    w_lo[4 + 1] = __uint_as_float(_v4_7_1);
++                    w_lo[4 + 2] = __uint_as_float(_v4_7_2);
++                    w_lo[4 + 3] = __uint_as_float(_v4_7_3);
++                }
++                {
++                    unsigned _v4_8_0;
++                    unsigned _v4_8_1;
++                    unsigned _v4_8_2;
++                    unsigned _v4_8_3;
++                    asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
++                        : "=r"(_v4_8_0), "=r"(_v4_8_1), "=r"(_v4_8_2), "=r"(_v4_8_3) : "l"((const void*)(k_norm_weight + (64 + lane_1 * 8) + (0))) : "memory");
++                    w_hi[0 + 0] = __uint_as_float(_v4_8_0);
++                    w_hi[0 + 1] = __uint_as_float(_v4_8_1);
++                    w_hi[0 + 2] = __uint_as_float(_v4_8_2);
++                    w_hi[0 + 3] = __uint_as_float(_v4_8_3);
++                }
++                {
++                    unsigned _v4_9_0;
++                    unsigned _v4_9_1;
++                    unsigned _v4_9_2;
++                    unsigned _v4_9_3;
++                    asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
++                        : "=r"(_v4_9_0), "=r"(_v4_9_1), "=r"(_v4_9_2), "=r"(_v4_9_3) : "l"((const void*)(k_norm_weight + (64 + lane_1 * 8 + 4) + (0))) : "memory");
++                    w_hi[4 + 0] = __uint_as_float(_v4_9_0);
++                    w_hi[4 + 1] = __uint_as_float(_v4_9_1);
++                    w_hi[4 + 2] = __uint_as_float(_v4_9_2);
++                    w_hi[4 + 3] = __uint_as_float(_v4_9_3);
++                }
++            }
++        }
++    }
++    float k_scale_v = 1.0f;
++    float v_scale_v = 1.0f;
++    float q_static = 1.0f;
++    if (is_row_cta) {
++        if (is_k) {
++            k_scale_v = k_scale[0];
++        }
++        if (is_v) {
++            v_scale_v = v_scale[0];
++        }
++        if (is_q && quant_policy == 2) {
++            q_static = q_scale_inv[0];
++        }
++    }
++    int req_id = bid_1 - num_rows;
++    int clear_last_pos = -1;
++    if (!is_row_cta && req_id < num_requests) {
++        clear_last_pos = seq_lens[req_id] - 1;
++    }
++    bool any_bad = 0;
++    #pragma unroll 1
++    for (int req = tid_0; req < num_requests; req += 96) {
++        int begin = q_indptr[req];
++        int end = q_indptr[req + 1];
++        int seq_len_r = seq_lens[req];
++        bool bad = begin < 0 || end < begin || end > num_rows;
++        if (dyn_prefill && end - begin > max_seqlen) {
++            bad = 1;
++        }
++        if (bad) {
++            any_bad = 1;
++        }
++        if (is_row_cta) {
++            if (begin <= row && row < end) {
++                meta[0] = req;
++                meta[1] = row + seq_len_r - end;
++                meta[2] = row - begin;
++            }
++        }
++    }
++    if (tid_0 == 0) {
++        int first = q_indptr[0];
++        int last_ip = q_indptr[num_requests];
++        if (first != 0 || last_ip != num_rows) {
++            any_bad = 1;
++        }
++    }
++    uint32_t _cta_or_0 = __syncthreads_or(any_bad);
++    unsigned int invalid = _cta_or_0;
++    if (is_row_cta) {
++        if (invalid == 0 && active) {
++            int batch_i = meta[0];
++            int pos = meta[1];
++            int tok = meta[2];
++            long long cache_row = 0;
++            if (is_q || is_k) {
++                long long cs_base = (long long)pos * 128 + (long long)(lane_1 * 8);
++                {
++                    unsigned _v4_10_0;
++                    unsigned _v4_10_1;
++                    unsigned _v4_10_2;
++                    unsigned _v4_10_3;
++                    asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
++                        : "=r"(_v4_10_0), "=r"(_v4_10_1), "=r"(_v4_10_2), "=r"(_v4_10_3) : "l"((const void*)(cos_sin + cs_base + (0))) : "memory");
++                    c_lo[0 + 0] = __uint_as_float(_v4_10_0);
++                    c_lo[0 + 1] = __uint_as_float(_v4_10_1);
++                    c_lo[0 + 2] = __uint_as_float(_v4_10_2);
++                    c_lo[0 + 3] = __uint_as_float(_v4_10_3);
++                }
++                {
++                    unsigned _v4_11_0;
++                    unsigned _v4_11_1;
++                    unsigned _v4_11_2;
++                    unsigned _v4_11_3;
++                    asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
++                        : "=r"(_v4_11_0), "=r"(_v4_11_1), "=r"(_v4_11_2), "=r"(_v4_11_3) : "l"((const void*)(cos_sin + (cs_base + 4) + (0))) : "memory");
++                    c_lo[4 + 0] = __uint_as_float(_v4_11_0);
++                    c_lo[4 + 1] = __uint_as_float(_v4_11_1);
++                    c_lo[4 + 2] = __uint_as_float(_v4_11_2);
++                    c_lo[4 + 3] = __uint_as_float(_v4_11_3);
++                }
++                {
++                    unsigned _v4_12_0;
++                    unsigned _v4_12_1;
++                    unsigned _v4_12_2;
++                    unsigned _v4_12_3;
++                    asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
++                        : "=r"(_v4_12_0), "=r"(_v4_12_1), "=r"(_v4_12_2), "=r"(_v4_12_3) : "l"((const void*)(cos_sin + (cs_base + 64) + (0))) : "memory");
++                    c_hi[0 + 0] = __uint_as_float(_v4_12_0);
++                    c_hi[0 + 1] = __uint_as_float(_v4_12_1);
++                    c_hi[0 + 2] = __uint_as_float(_v4_12_2);
++                    c_hi[0 + 3] = __uint_as_float(_v4_12_3);
++                }
++                {
++                    unsigned _v4_13_0;
++                    unsigned _v4_13_1;
++                    unsigned _v4_13_2;
++                    unsigned _v4_13_3;
++                    asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
++                        : "=r"(_v4_13_0), "=r"(_v4_13_1), "=r"(_v4_13_2), "=r"(_v4_13_3) : "l"((const void*)(cos_sin + (cs_base + 64 + 4) + (0))) : "memory");
++                    c_hi[4 + 0] = __uint_as_float(_v4_13_0);
++                    c_hi[4 + 1] = __uint_as_float(_v4_13_1);
++                    c_hi[4 + 2] = __uint_as_float(_v4_13_2);
++                    c_hi[4 + 3] = __uint_as_float(_v4_13_3);
++                }
++            }
++            if ((is_k || is_v) && !has_out_kv) {
++                int page_slot = pos / page_size;
++                int row_in_page = pos - page_slot * page_size;
++                int phys = page_indices[batch_i * max_pages_per_request + page_slot];
++                cache_row = ((long long)phys * (long long)page_size + (long long)row_in_page) * (long long)(num_kv_heads * 128) + (long long)(kv_head * 128);
++            }
++            float x_lo[8];
++            float x_hi[8];
++            #pragma unroll
++            for (int _pair = 0; _pair < 4; _pair++) {
++                (&x_lo[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(x_lo_w[_pair]) << 16);
++                (&x_lo[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(x_lo_w[_pair]) & 0xffff0000u);
++            }
++            #pragma unroll
++            for (int _pair = 0; _pair < 4; _pair++) {
++                (&x_hi[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(x_hi_w[_pair]) << 16);
++                (&x_hi[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(x_hi_w[_pair]) & 0xffff0000u);
++            }
++            if (is_q || is_k) {
++                if (norm_policy == 2) {
++                    float ss = 0.0f;
++                    #pragma unroll
++                    for (int j_2 = 0; j_2 < 8; j_2++) {
++                        float _fma_0 = __fmaf_rn(x_lo[j_2], x_lo[j_2], ss);
++                        ss = _fma_0;
++                        float _fma_1 = __fmaf_rn(x_hi[j_2], x_hi[j_2], ss);
++                        ss = _fma_1;
++                    }
++                    float _shfl_xor_0 = __shfl_xor_sync(grp_mask, ss, 4);
++                    ss = ss + _shfl_xor_0;
++                    float _shfl_xor_1 = __shfl_xor_sync(grp_mask, ss, 2);
++                    ss = ss + _shfl_xor_1;
++                    float _shfl_xor_2 = __shfl_xor_sync(grp_mask, ss, 1);
++                    ss = ss + _shfl_xor_2;
++                    float _rsqrt_0 = rsqrtf(__fmaf_rn(ss, 0.0078125f, 1e-06f));
++                    float inv_rms = _rsqrt_0;
++                    #pragma unroll
++                    for (int j_3 = 0; j_3 < 8; j_3++) {
++                        x_lo[j_3] = x_lo[j_3] * (inv_rms * w_lo[j_3]);
++                        x_hi[j_3] = x_hi[j_3] * (inv_rms * w_hi[j_3]);
++                    }
++                }
++                #pragma unroll
++                for (int j_4 = 0; j_4 < 8; j_4++) {
++                    float y_lo = __fmaf_rn(x_lo[j_4], c_lo[j_4], -(x_hi[j_4] * c_hi[j_4]));
++                    float y_hi = __fmaf_rn(x_hi[j_4], c_lo[j_4], x_lo[j_4] * c_hi[j_4]);
++                    x_lo[j_4] = y_lo;
++                    x_hi[j_4] = y_hi;
++                }
++                if (norm_policy == 1) {
++                    float ss1 = 0.0f;
++                    #pragma unroll
++                    for (int j_5 = 0; j_5 < 8; j_5++) {
++                        float _fma_2 = __fmaf_rn(x_lo[j_5], x_lo[j_5], ss1);
++                        ss1 = _fma_2;
++                        float _fma_3 = __fmaf_rn(x_hi[j_5], x_hi[j_5], ss1);
++                        ss1 = _fma_3;
++                    }
++                    float _shfl_xor_3 = __shfl_xor_sync(grp_mask, ss1, 4);
++                    ss1 = ss1 + _shfl_xor_3;
++                    float _shfl_xor_4 = __shfl_xor_sync(grp_mask, ss1, 2);
++                    ss1 = ss1 + _shfl_xor_4;
++                    float _shfl_xor_5 = __shfl_xor_sync(grp_mask, ss1, 1);
++                    ss1 = ss1 + _shfl_xor_5;
++                    float _rsqrt_1 = rsqrtf(__fmaf_rn(ss1, 0.0078125f, 1e-06f));
++                    float inv_rms1 = _rsqrt_1;
++                    #pragma unroll
++                    for (int j_6 = 0; j_6 < 8; j_6++) {
++                        x_lo[j_6] = x_lo[j_6] * (inv_rms1 * w_lo[j_6]);
++                        x_hi[j_6] = x_hi[j_6] * (inv_rms1 * w_hi[j_6]);
++                    }
++                }
++            }
++            float _rcp_0 = __frcp_rn(v_scale_v);
++            float mult = _rcp_0;
++            if (is_q) {
++                if (quant_policy == 1) {
++                    float m = 1e-06f;
++                    #pragma unroll
++                    for (int j_7 = 0; j_7 < 8; j_7++) {
++                        float _fabs_0 = fabsf(x_lo[j_7]);
++                        float _fmax_0 = fmaxf(m, _fabs_0);
++                        m = _fmax_0;
++                        float _fabs_1 = fabsf(x_hi[j_7]);
++                        float _fmax_1 = fmaxf(m, _fabs_1);
++                        m = _fmax_1;
++                    }
++                    float _shfl_xor_6 = __shfl_xor_sync(grp_mask, m, 4);
++                    float _fmax_2 = fmaxf(m, _shfl_xor_6);
++                    m = _fmax_2;
++                    float _shfl_xor_7 = __shfl_xor_sync(grp_mask, m, 2);
++                    float _fmax_3 = fmaxf(m, _shfl_xor_7);
++                    m = _fmax_3;
++                    float _shfl_xor_8 = __shfl_xor_sync(grp_mask, m, 1);
++                    float _fmax_4 = fmaxf(m, _shfl_xor_8);
++                    m = _fmax_4;
++                    float _fdiv_rn_0 = __fdiv_rn(m, upper_max);
++                    float scale_val = _fdiv_rn_0;
++                    if (lane_1 == 0) {
++                        if (is_prefill) {
++                            if (tok < max_seqlen_aligned) {
++                                long long qs_idx = ((long long)batch_i * (long long)num_q_heads + (long long)head_in_row) * (long long)max_seqlen_aligned + (long long)tok;
++                                *(reinterpret_cast<float*>(q_scale + qs_idx) + (0)) = scale_val;
++                            }
++                        } else {
++                            long long qs_idx2 = (long long)row * (long long)num_q_heads + (long long)head_in_row;
++                            *(reinterpret_cast<float*>(q_scale + qs_idx2) + (0)) = scale_val;
++                        }
++                    }
++                    float _rcp_1 = __frcp_rn(scale_val);
++                    mult = _rcp_1;
++                } else {
++                    mult = q_static;
++                }
++            } else if (is_k) {
++                float _rcp_2 = __frcp_rn(k_scale_v);
++                mult = _rcp_2;
++            }
++            #pragma unroll
++            for (int j_8 = 0; j_8 < 8; j_8++) {
++                x_lo[j_8] = x_lo[j_8] * mult;
++                x_hi[j_8] = x_hi[j_8] * mult;
++            }
++            long long row64 = row;
++            if (is_q) {
++                long long q_dst = (row64 * (long long)num_q_heads + (long long)head_in_row) * 128;
++                {
++                    unsigned int _fp8_pk[2];
++                    asm("{\n\t"
++                        ".reg .b16 _lo, _hi;\n\t"
++                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
++                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
++                        "mov.b32 %0, {_lo, _hi};\n\t"
++                        "}\n"
++                        : "=r"(_fp8_pk[0]) : "f"(x_lo[0 + 0]), "f"(x_lo[0 + 1]), "f"(x_lo[0 + 2]), "f"(x_lo[0 + 3]));
++                    asm("{\n\t"
++                        ".reg .b16 _lo, _hi;\n\t"
++                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
++                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
++                        "mov.b32 %0, {_lo, _hi};\n\t"
++                        "}\n"
++                        : "=r"(_fp8_pk[1]) : "f"(x_lo[0 + 4]), "f"(x_lo[0 + 5]), "f"(x_lo[0 + 6]), "f"(x_lo[0 + 7]));
++                    *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(out_q + (q_dst + (long long)lane_lo)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
++                }
++                {
++                    unsigned int _fp8_pk[2];
++                    asm("{\n\t"
++                        ".reg .b16 _lo, _hi;\n\t"
++                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
++                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
++                        "mov.b32 %0, {_lo, _hi};\n\t"
++                        "}\n"
++                        : "=r"(_fp8_pk[0]) : "f"(x_hi[0 + 0]), "f"(x_hi[0 + 1]), "f"(x_hi[0 + 2]), "f"(x_hi[0 + 3]));
++                    asm("{\n\t"
++                        ".reg .b16 _lo, _hi;\n\t"
++                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
++                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
++                        "mov.b32 %0, {_lo, _hi};\n\t"
++                        "}\n"
++                        : "=r"(_fp8_pk[1]) : "f"(x_hi[0 + 4]), "f"(x_hi[0 + 5]), "f"(x_hi[0 + 6]), "f"(x_hi[0 + 7]));
++                    *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(out_q + (q_dst + (long long)lane_hi)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
++                }
++            } else if (is_k) {
++                if (has_out_kv) {
++                    long long k_dst = (row64 * (long long)num_kv_heads + (long long)kv_head) * 128;
++                    {
++                        unsigned int _fp8_pk[2];
++                        asm("{\n\t"
++                            ".reg .b16 _lo, _hi;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
++                            "mov.b32 %0, {_lo, _hi};\n\t"
++                            "}\n"
++                            : "=r"(_fp8_pk[0]) : "f"(x_lo[0 + 0]), "f"(x_lo[0 + 1]), "f"(x_lo[0 + 2]), "f"(x_lo[0 + 3]));
++                        asm("{\n\t"
++                            ".reg .b16 _lo, _hi;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
++                            "mov.b32 %0, {_lo, _hi};\n\t"
++                            "}\n"
++                            : "=r"(_fp8_pk[1]) : "f"(x_lo[0 + 4]), "f"(x_lo[0 + 5]), "f"(x_lo[0 + 6]), "f"(x_lo[0 + 7]));
++                        *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(out_k + (k_dst + (long long)lane_lo)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
++                    }
++                    {
++                        unsigned int _fp8_pk[2];
++                        asm("{\n\t"
++                            ".reg .b16 _lo, _hi;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
++                            "mov.b32 %0, {_lo, _hi};\n\t"
++                            "}\n"
++                            : "=r"(_fp8_pk[0]) : "f"(x_hi[0 + 0]), "f"(x_hi[0 + 1]), "f"(x_hi[0 + 2]), "f"(x_hi[0 + 3]));
++                        asm("{\n\t"
++                            ".reg .b16 _lo, _hi;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
++                            "mov.b32 %0, {_lo, _hi};\n\t"
++                            "}\n"
++                            : "=r"(_fp8_pk[1]) : "f"(x_hi[0 + 4]), "f"(x_hi[0 + 5]), "f"(x_hi[0 + 6]), "f"(x_hi[0 + 7]));
++                        *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(out_k + (k_dst + (long long)lane_hi)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
++                    }
++                } else {
++                    {
++                        unsigned int _fp8_pk[2];
++                        asm("{\n\t"
++                            ".reg .b16 _lo, _hi;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
++                            "mov.b32 %0, {_lo, _hi};\n\t"
++                            "}\n"
++                            : "=r"(_fp8_pk[0]) : "f"(x_lo[0 + 0]), "f"(x_lo[0 + 1]), "f"(x_lo[0 + 2]), "f"(x_lo[0 + 3]));
++                        asm("{\n\t"
++                            ".reg .b16 _lo, _hi;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
++                            "mov.b32 %0, {_lo, _hi};\n\t"
++                            "}\n"
++                            : "=r"(_fp8_pk[1]) : "f"(x_lo[0 + 4]), "f"(x_lo[0 + 5]), "f"(x_lo[0 + 6]), "f"(x_lo[0 + 7]));
++                        *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(key_cache + (cache_row + (long long)lane_lo)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
++                    }
++                    {
++                        unsigned int _fp8_pk[2];
++                        asm("{\n\t"
++                            ".reg .b16 _lo, _hi;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
++                            "mov.b32 %0, {_lo, _hi};\n\t"
++                            "}\n"
++                            : "=r"(_fp8_pk[0]) : "f"(x_hi[0 + 0]), "f"(x_hi[0 + 1]), "f"(x_hi[0 + 2]), "f"(x_hi[0 + 3]));
++                        asm("{\n\t"
++                            ".reg .b16 _lo, _hi;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
++                            "mov.b32 %0, {_lo, _hi};\n\t"
++                            "}\n"
++                            : "=r"(_fp8_pk[1]) : "f"(x_hi[0 + 4]), "f"(x_hi[0 + 5]), "f"(x_hi[0 + 6]), "f"(x_hi[0 + 7]));
++                        *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(key_cache + (cache_row + (long long)lane_hi)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
++                    }
++                }
++            } else {
++                if (has_out_kv) {
++                    long long v_dst = (row64 * (long long)num_kv_heads + (long long)kv_head) * 128;
++                    {
++                        unsigned int _fp8_pk[2];
++                        asm("{\n\t"
++                            ".reg .b16 _lo, _hi;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
++                            "mov.b32 %0, {_lo, _hi};\n\t"
++                            "}\n"
++                            : "=r"(_fp8_pk[0]) : "f"(x_lo[0 + 0]), "f"(x_lo[0 + 1]), "f"(x_lo[0 + 2]), "f"(x_lo[0 + 3]));
++                        asm("{\n\t"
++                            ".reg .b16 _lo, _hi;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
++                            "mov.b32 %0, {_lo, _hi};\n\t"
++                            "}\n"
++                            : "=r"(_fp8_pk[1]) : "f"(x_lo[0 + 4]), "f"(x_lo[0 + 5]), "f"(x_lo[0 + 6]), "f"(x_lo[0 + 7]));
++                        *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(out_v + (v_dst + (long long)lane_lo)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
++                    }
++                    {
++                        unsigned int _fp8_pk[2];
++                        asm("{\n\t"
++                            ".reg .b16 _lo, _hi;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
++                            "mov.b32 %0, {_lo, _hi};\n\t"
++                            "}\n"
++                            : "=r"(_fp8_pk[0]) : "f"(x_hi[0 + 0]), "f"(x_hi[0 + 1]), "f"(x_hi[0 + 2]), "f"(x_hi[0 + 3]));
++                        asm("{\n\t"
++                            ".reg .b16 _lo, _hi;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
++                            "mov.b32 %0, {_lo, _hi};\n\t"
++                            "}\n"
++                            : "=r"(_fp8_pk[1]) : "f"(x_hi[0 + 4]), "f"(x_hi[0 + 5]), "f"(x_hi[0 + 6]), "f"(x_hi[0 + 7]));
++                        *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(out_v + (v_dst + (long long)lane_hi)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
++                    }
++                } else {
++                    {
++                        unsigned int _fp8_pk[2];
++                        asm("{\n\t"
++                            ".reg .b16 _lo, _hi;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
++                            "mov.b32 %0, {_lo, _hi};\n\t"
++                            "}\n"
++                            : "=r"(_fp8_pk[0]) : "f"(x_lo[0 + 0]), "f"(x_lo[0 + 1]), "f"(x_lo[0 + 2]), "f"(x_lo[0 + 3]));
++                        asm("{\n\t"
++                            ".reg .b16 _lo, _hi;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
++                            "mov.b32 %0, {_lo, _hi};\n\t"
++                            "}\n"
++                            : "=r"(_fp8_pk[1]) : "f"(x_lo[0 + 4]), "f"(x_lo[0 + 5]), "f"(x_lo[0 + 6]), "f"(x_lo[0 + 7]));
++                        *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(value_cache + (cache_row + (long long)lane_lo)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
++                    }
++                    {
++                        unsigned int _fp8_pk[2];
++                        asm("{\n\t"
++                            ".reg .b16 _lo, _hi;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
++                            "mov.b32 %0, {_lo, _hi};\n\t"
++                            "}\n"
++                            : "=r"(_fp8_pk[0]) : "f"(x_hi[0 + 0]), "f"(x_hi[0 + 1]), "f"(x_hi[0 + 2]), "f"(x_hi[0 + 3]));
++                        asm("{\n\t"
++                            ".reg .b16 _lo, _hi;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
++                            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
++                            "mov.b32 %0, {_lo, _hi};\n\t"
++                            "}\n"
++                            : "=r"(_fp8_pk[1]) : "f"(x_hi[0 + 4]), "f"(x_hi[0 + 5]), "f"(x_hi[0 + 6]), "f"(x_hi[0 + 7]));
++                        *reinterpret_cast<uint2*>(reinterpret_cast<unsigned char*>(value_cache + (cache_row + (long long)lane_hi)) + (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
++                    }
++                }
++            }
++        }
++    } else if (req_id < num_requests) {
++        if (tid_0 == 0) {
++            int flag_val = ((invalid != 0) ? -1 : 0);
++            *(reinterpret_cast<int*>(split_k_flag + (req_id * num_kv_heads + kv_head)) + (0)) = flag_val;
++        }
++        if (invalid == 0) {
++            int last_pos = clear_last_pos;
++            if (last_pos >= 0) {
++                int last_slot = last_pos / page_size;
++                int zero_from = last_pos - last_slot * page_size + 1;
++                if (zero_from < page_size) {
++                    int phys_last = page_indices[req_id * max_pages_per_request + last_slot];
++                    long long phys_last64 = phys_last;
++                    unsigned int zero_w[4];
++                    #pragma unroll
++                    for (int j_9 = 0; j_9 < 4; j_9++) {
++                        zero_w[j_9] = 0;
++                    }
++                    int n_rows = page_size - zero_from;
++                    int total_items = n_rows * 16;
++                    #pragma unroll 1
++                    for (int item = tid_0; item < total_items; item += 96) {
++                        int r = item / 16;
++                        int sub = item - r * 16;
++                        int chunk = sub % 8;
++                        long long base = (phys_last64 * (long long)page_size + (long long)zero_from + (long long)r) * (long long)(num_kv_heads * 128) + (long long)(kv_head * 128) + (long long)(chunk * 16);
++                        if (sub < 8) {
++                            reinterpret_cast<int4*>(key_cache + base)[0] = reinterpret_cast<int4*>(zero_w)[0];
++                        } else {
++                            reinterpret_cast<int4*>(value_cache + base)[0] = reinterpret_cast<int4*>(zero_w)[0];
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
++
++} // extern "C"
+diff --git a/csrc/cake_fused_qk_rope_fp8_append/cake_fused_qk_rope_fp8_append_kernel.cu b/csrc/cake_fused_qk_rope_fp8_append/cake_fused_qk_rope_fp8_append_kernel.cu
+deleted file mode 100644
+index 2f3c9174e00..00000000000
+--- a/csrc/cake_fused_qk_rope_fp8_append/cake_fused_qk_rope_fp8_append_kernel.cu
++++ /dev/null
+@@ -1,813 +0,0 @@
+-/*
+- * Copyright (c) 2026 by FlashInfer team.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *   http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-typedef signed char int8_t;
+-typedef unsigned char uint8_t;
+-typedef unsigned short uint16_t;
+-typedef unsigned int uint32_t;
+-#if defined(__CUDACC_RTC__)
+-typedef unsigned long long uint64_t;
+-#else
+-typedef unsigned long uint64_t;
+-#endif
+-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
+-typedef signed int int32_t;
+-typedef short int int16_t;
+-struct __align__(64) CakeTensorMap64 {
+-  uint64_t opaque[16];
+-};
+-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
+-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+-
+-#if defined(__CUDACC_RTC__)
+-typedef struct __align__(128) {
+-  uint64_t opaque[16];
+-} CUtensorMap;
+-#else
+-#include <cuda.h>
+-#endif
+-
+-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+-#include <cuda_bf16.h>
+-#include <cuda_fp8.h>
+-
+-__device__ __forceinline__ int make_warp_uniform(int x) {
+-  int result;
+-  asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;" : "=r"(result) : "r"(x));
+-  return result;
+-}
+-
+-#define CAKE_INF CUDART_INF_F
+-#define NUM_MAIN_STAGES 1
+-#define SMEM_META_OFF 0
+-#define SMEM_META_STAGE_BYTES 16
+-#define SMEM_META_STRIDE 16
+-#define SMEM_TOTAL 0
+-#define THREADS 96
+-
+-#include <math_constants.h>
+-
+-// One device source serves every architecture of the family.  The JIT loader
+-// binds the kernel symbol per module (-DCAKE_KERNEL_SYMBOL=<manifest
+-// kernel_symbol>) so that co-loaded modules keep distinct symbols; the default
+-// is the sm_100a module's symbol.
+-#ifndef CAKE_KERNEL_SYMBOL
+-#define CAKE_KERNEL_SYMBOL kernel_cake_fused_qk_rope_fp8_append_caf9bdb5445726a94bed
+-#endif
+-
+-extern "C" {
+-
+-__global__ __launch_bounds__(96) void CAKE_KERNEL_SYMBOL(
+-    const __nv_bfloat16* __restrict__ qkv, const float* __restrict__ cos_sin,
+-    const int* __restrict__ seq_lens, const int* __restrict__ q_indptr,
+-    const int* __restrict__ page_indices, const float* __restrict__ q_norm_weight,
+-    const float* __restrict__ k_norm_weight, const float* __restrict__ k_scale,
+-    const float* __restrict__ v_scale, const float* __restrict__ q_scale_inv,
+-    uint8_t* __restrict__ out_q, uint8_t* key_cache, uint8_t* value_cache, uint8_t* out_k,
+-    uint8_t* out_v, float* __restrict__ q_scale, int* __restrict__ split_k_flag, int num_rows,
+-    int num_requests, int num_q_heads, int num_kv_heads, int page_size, int max_pages_per_request,
+-    int max_seqlen, int max_seqlen_aligned, int quant_policy, int norm_policy, bool is_prefill,
+-    bool has_out_kv, float upper_max) {
+-  const int tid = threadIdx.x;
+-  const int warp = make_warp_uniform(tid / 32);
+-  const int lane = tid % 32;
+-
+-  __shared__ __align__(16) unsigned char smem_static_raw[16];
+-
+-  const int bid = blockIdx.x;
+-  const int num_bids = gridDim.x;
+-
+-  const int cta_rank = 0;
+-
+-  // Kernel setup ops
+-  int* meta = reinterpret_cast<int*>(smem_static_raw + 0);
+-  const int meta_addr = (int)(unsigned long long)__cvta_generic_to_shared(meta);
+-
+-  // === Task calls (dependency order) ===
+-  int tid_0 = tid;
+-  int slot = tid_0 / 8;
+-  int lane_1 = tid_0 % 8;
+-  int grp_base = tid_0 % 32 - lane_1;
+-  unsigned int grp_mask = (unsigned int)(255 << grp_base);
+-  int kv_head = blockIdx.y;
+-  int q_per_kv = num_q_heads / num_kv_heads;
+-  int bid_1 = blockIdx.x;
+-  bool is_row_cta = bid_1 < num_rows;
+-  int row = ((is_row_cta) ? bid_1 : 0);
+-  bool dyn_prefill = quant_policy == 1 && is_prefill;
+-  int width = (num_q_heads + 2 * num_kv_heads) * 128;
+-  bool is_q = slot < q_per_kv;
+-  bool is_k = slot == 8;
+-  bool is_v = slot == 9;
+-  bool active = is_q || is_k || is_v;
+-  int head_in_row =
+-      ((is_q) ? kv_head * q_per_kv + slot
+-              : ((is_k) ? num_q_heads + kv_head : num_q_heads + num_kv_heads + kv_head));
+-  int lane_lo = ((is_v) ? lane_1 * 16 : lane_1 * 8);
+-  int lane_hi = ((is_v) ? lane_1 * 16 + 8 : 64 + lane_1 * 8);
+-  unsigned int x_lo_w[4];
+-  unsigned int x_hi_w[4];
+-  float w_lo[8];
+-  float w_hi[8];
+-  float c_lo[8];
+-  float c_hi[8];
+-#pragma unroll
+-  for (int j = 0; j < 4; j++) {
+-    x_lo_w[j] = 0;
+-    x_hi_w[j] = 0;
+-  }
+-#pragma unroll
+-  for (int j_1 = 0; j_1 < 8; j_1++) {
+-    w_lo[j_1] = 1.0f;
+-    w_hi[j_1] = 1.0f;
+-    c_lo[j_1] = 1.0f;
+-    c_hi[j_1] = 0.0f;
+-  }
+-  if (is_row_cta && active) {
+-    long long src_base = (long long)row * (long long)width + (long long)(head_in_row * 128);
+-    {
+-      const uint4* _vptr_0 =
+-          reinterpret_cast<const uint4*>(qkv + (src_base + (long long)lane_lo) + 0);
+-      uint4* _vdst_0 = reinterpret_cast<uint4*>(&x_lo_w[0]);
+-#pragma unroll
+-      for (int _blk = 0; _blk < 1; _blk++) {
+-        asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+-                     : "=r"(_vdst_0[_blk].x), "=r"(_vdst_0[_blk].y), "=r"(_vdst_0[_blk].z),
+-                       "=r"(_vdst_0[_blk].w)
+-                     : "l"((const void*)(_vptr_0 + _blk))
+-                     : "memory");
+-      }
+-    }
+-    {
+-      const uint4* _vptr_1 =
+-          reinterpret_cast<const uint4*>(qkv + (src_base + (long long)lane_hi) + 0);
+-      uint4* _vdst_1 = reinterpret_cast<uint4*>(&x_hi_w[0]);
+-#pragma unroll
+-      for (int _blk = 0; _blk < 1; _blk++) {
+-        asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+-                     : "=r"(_vdst_1[_blk].x), "=r"(_vdst_1[_blk].y), "=r"(_vdst_1[_blk].z),
+-                       "=r"(_vdst_1[_blk].w)
+-                     : "l"((const void*)(_vptr_1 + _blk))
+-                     : "memory");
+-      }
+-    }
+-    if (norm_policy != 0 && (is_q || is_k)) {
+-      if (is_q) {
+-        {
+-          unsigned _v4_2_0;
+-          unsigned _v4_2_1;
+-          unsigned _v4_2_2;
+-          unsigned _v4_2_3;
+-          asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+-                       : "=r"(_v4_2_0), "=r"(_v4_2_1), "=r"(_v4_2_2), "=r"(_v4_2_3)
+-                       : "l"((const void*)(q_norm_weight + (lane_1 * 8) + (0)))
+-                       : "memory");
+-          w_lo[0 + 0] = __uint_as_float(_v4_2_0);
+-          w_lo[0 + 1] = __uint_as_float(_v4_2_1);
+-          w_lo[0 + 2] = __uint_as_float(_v4_2_2);
+-          w_lo[0 + 3] = __uint_as_float(_v4_2_3);
+-        }
+-        {
+-          unsigned _v4_3_0;
+-          unsigned _v4_3_1;
+-          unsigned _v4_3_2;
+-          unsigned _v4_3_3;
+-          asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+-                       : "=r"(_v4_3_0), "=r"(_v4_3_1), "=r"(_v4_3_2), "=r"(_v4_3_3)
+-                       : "l"((const void*)(q_norm_weight + (lane_1 * 8 + 4) + (0)))
+-                       : "memory");
+-          w_lo[4 + 0] = __uint_as_float(_v4_3_0);
+-          w_lo[4 + 1] = __uint_as_float(_v4_3_1);
+-          w_lo[4 + 2] = __uint_as_float(_v4_3_2);
+-          w_lo[4 + 3] = __uint_as_float(_v4_3_3);
+-        }
+-        {
+-          unsigned _v4_4_0;
+-          unsigned _v4_4_1;
+-          unsigned _v4_4_2;
+-          unsigned _v4_4_3;
+-          asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+-                       : "=r"(_v4_4_0), "=r"(_v4_4_1), "=r"(_v4_4_2), "=r"(_v4_4_3)
+-                       : "l"((const void*)(q_norm_weight + (64 + lane_1 * 8) + (0)))
+-                       : "memory");
+-          w_hi[0 + 0] = __uint_as_float(_v4_4_0);
+-          w_hi[0 + 1] = __uint_as_float(_v4_4_1);
+-          w_hi[0 + 2] = __uint_as_float(_v4_4_2);
+-          w_hi[0 + 3] = __uint_as_float(_v4_4_3);
+-        }
+-        {
+-          unsigned _v4_5_0;
+-          unsigned _v4_5_1;
+-          unsigned _v4_5_2;
+-          unsigned _v4_5_3;
+-          asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+-                       : "=r"(_v4_5_0), "=r"(_v4_5_1), "=r"(_v4_5_2), "=r"(_v4_5_3)
+-                       : "l"((const void*)(q_norm_weight + (64 + lane_1 * 8 + 4) + (0)))
+-                       : "memory");
+-          w_hi[4 + 0] = __uint_as_float(_v4_5_0);
+-          w_hi[4 + 1] = __uint_as_float(_v4_5_1);
+-          w_hi[4 + 2] = __uint_as_float(_v4_5_2);
+-          w_hi[4 + 3] = __uint_as_float(_v4_5_3);
+-        }
+-      } else {
+-        {
+-          unsigned _v4_6_0;
+-          unsigned _v4_6_1;
+-          unsigned _v4_6_2;
+-          unsigned _v4_6_3;
+-          asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+-                       : "=r"(_v4_6_0), "=r"(_v4_6_1), "=r"(_v4_6_2), "=r"(_v4_6_3)
+-                       : "l"((const void*)(k_norm_weight + (lane_1 * 8) + (0)))
+-                       : "memory");
+-          w_lo[0 + 0] = __uint_as_float(_v4_6_0);
+-          w_lo[0 + 1] = __uint_as_float(_v4_6_1);
+-          w_lo[0 + 2] = __uint_as_float(_v4_6_2);
+-          w_lo[0 + 3] = __uint_as_float(_v4_6_3);
+-        }
+-        {
+-          unsigned _v4_7_0;
+-          unsigned _v4_7_1;
+-          unsigned _v4_7_2;
+-          unsigned _v4_7_3;
+-          asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+-                       : "=r"(_v4_7_0), "=r"(_v4_7_1), "=r"(_v4_7_2), "=r"(_v4_7_3)
+-                       : "l"((const void*)(k_norm_weight + (lane_1 * 8 + 4) + (0)))
+-                       : "memory");
+-          w_lo[4 + 0] = __uint_as_float(_v4_7_0);
+-          w_lo[4 + 1] = __uint_as_float(_v4_7_1);
+-          w_lo[4 + 2] = __uint_as_float(_v4_7_2);
+-          w_lo[4 + 3] = __uint_as_float(_v4_7_3);
+-        }
+-        {
+-          unsigned _v4_8_0;
+-          unsigned _v4_8_1;
+-          unsigned _v4_8_2;
+-          unsigned _v4_8_3;
+-          asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+-                       : "=r"(_v4_8_0), "=r"(_v4_8_1), "=r"(_v4_8_2), "=r"(_v4_8_3)
+-                       : "l"((const void*)(k_norm_weight + (64 + lane_1 * 8) + (0)))
+-                       : "memory");
+-          w_hi[0 + 0] = __uint_as_float(_v4_8_0);
+-          w_hi[0 + 1] = __uint_as_float(_v4_8_1);
+-          w_hi[0 + 2] = __uint_as_float(_v4_8_2);
+-          w_hi[0 + 3] = __uint_as_float(_v4_8_3);
+-        }
+-        {
+-          unsigned _v4_9_0;
+-          unsigned _v4_9_1;
+-          unsigned _v4_9_2;
+-          unsigned _v4_9_3;
+-          asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+-                       : "=r"(_v4_9_0), "=r"(_v4_9_1), "=r"(_v4_9_2), "=r"(_v4_9_3)
+-                       : "l"((const void*)(k_norm_weight + (64 + lane_1 * 8 + 4) + (0)))
+-                       : "memory");
+-          w_hi[4 + 0] = __uint_as_float(_v4_9_0);
+-          w_hi[4 + 1] = __uint_as_float(_v4_9_1);
+-          w_hi[4 + 2] = __uint_as_float(_v4_9_2);
+-          w_hi[4 + 3] = __uint_as_float(_v4_9_3);
+-        }
+-      }
+-    }
+-  }
+-  float k_scale_v = 1.0f;
+-  float v_scale_v = 1.0f;
+-  float q_static = 1.0f;
+-  if (is_row_cta) {
+-    if (is_k) {
+-      k_scale_v = k_scale[0];
+-    }
+-    if (is_v) {
+-      v_scale_v = v_scale[0];
+-    }
+-    if (is_q && quant_policy == 2) {
+-      q_static = q_scale_inv[0];
+-    }
+-  }
+-  int req_id = bid_1 - num_rows;
+-  int clear_last_pos = -1;
+-  if (!is_row_cta && req_id < num_requests) {
+-    clear_last_pos = seq_lens[req_id] - 1;
+-  }
+-  bool any_bad = 0;
+-#pragma unroll 1
+-  for (int req = tid_0; req < num_requests; req += 96) {
+-    int begin = q_indptr[req];
+-    int end = q_indptr[req + 1];
+-    int seq_len_r = seq_lens[req];
+-    bool bad = begin < 0 || end < begin || end > num_rows;
+-    if (dyn_prefill && end - begin > max_seqlen) {
+-      bad = 1;
+-    }
+-    if (bad) {
+-      any_bad = 1;
+-    }
+-    if (is_row_cta) {
+-      if (begin <= row && row < end) {
+-        meta[0] = req;
+-        meta[1] = row + seq_len_r - end;
+-        meta[2] = row - begin;
+-      }
+-    }
+-  }
+-  if (tid_0 == 0) {
+-    int first = q_indptr[0];
+-    int last_ip = q_indptr[num_requests];
+-    if (first != 0 || last_ip != num_rows) {
+-      any_bad = 1;
+-    }
+-  }
+-  uint32_t _cta_or_0 = __syncthreads_or(any_bad);
+-  unsigned int invalid = _cta_or_0;
+-  if (is_row_cta) {
+-    if (invalid == 0 && active) {
+-      int batch_i = meta[0];
+-      int pos = meta[1];
+-      int tok = meta[2];
+-      long long cache_row = 0;
+-      if (is_q || is_k) {
+-        long long cs_base = (long long)pos * 128 + (long long)(lane_1 * 8);
+-        {
+-          unsigned _v4_10_0;
+-          unsigned _v4_10_1;
+-          unsigned _v4_10_2;
+-          unsigned _v4_10_3;
+-          asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+-                       : "=r"(_v4_10_0), "=r"(_v4_10_1), "=r"(_v4_10_2), "=r"(_v4_10_3)
+-                       : "l"((const void*)(cos_sin + cs_base + (0)))
+-                       : "memory");
+-          c_lo[0 + 0] = __uint_as_float(_v4_10_0);
+-          c_lo[0 + 1] = __uint_as_float(_v4_10_1);
+-          c_lo[0 + 2] = __uint_as_float(_v4_10_2);
+-          c_lo[0 + 3] = __uint_as_float(_v4_10_3);
+-        }
+-        {
+-          unsigned _v4_11_0;
+-          unsigned _v4_11_1;
+-          unsigned _v4_11_2;
+-          unsigned _v4_11_3;
+-          asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+-                       : "=r"(_v4_11_0), "=r"(_v4_11_1), "=r"(_v4_11_2), "=r"(_v4_11_3)
+-                       : "l"((const void*)(cos_sin + (cs_base + 4) + (0)))
+-                       : "memory");
+-          c_lo[4 + 0] = __uint_as_float(_v4_11_0);
+-          c_lo[4 + 1] = __uint_as_float(_v4_11_1);
+-          c_lo[4 + 2] = __uint_as_float(_v4_11_2);
+-          c_lo[4 + 3] = __uint_as_float(_v4_11_3);
+-        }
+-        {
+-          unsigned _v4_12_0;
+-          unsigned _v4_12_1;
+-          unsigned _v4_12_2;
+-          unsigned _v4_12_3;
+-          asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+-                       : "=r"(_v4_12_0), "=r"(_v4_12_1), "=r"(_v4_12_2), "=r"(_v4_12_3)
+-                       : "l"((const void*)(cos_sin + (cs_base + 64) + (0)))
+-                       : "memory");
+-          c_hi[0 + 0] = __uint_as_float(_v4_12_0);
+-          c_hi[0 + 1] = __uint_as_float(_v4_12_1);
+-          c_hi[0 + 2] = __uint_as_float(_v4_12_2);
+-          c_hi[0 + 3] = __uint_as_float(_v4_12_3);
+-        }
+-        {
+-          unsigned _v4_13_0;
+-          unsigned _v4_13_1;
+-          unsigned _v4_13_2;
+-          unsigned _v4_13_3;
+-          asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+-                       : "=r"(_v4_13_0), "=r"(_v4_13_1), "=r"(_v4_13_2), "=r"(_v4_13_3)
+-                       : "l"((const void*)(cos_sin + (cs_base + 64 + 4) + (0)))
+-                       : "memory");
+-          c_hi[4 + 0] = __uint_as_float(_v4_13_0);
+-          c_hi[4 + 1] = __uint_as_float(_v4_13_1);
+-          c_hi[4 + 2] = __uint_as_float(_v4_13_2);
+-          c_hi[4 + 3] = __uint_as_float(_v4_13_3);
+-        }
+-      }
+-      if ((is_k || is_v) && !has_out_kv) {
+-        int page_slot = pos / page_size;
+-        int row_in_page = pos - page_slot * page_size;
+-        int phys = page_indices[batch_i * max_pages_per_request + page_slot];
+-        cache_row = ((long long)phys * (long long)page_size + (long long)row_in_page) *
+-                        (long long)(num_kv_heads * 128) +
+-                    (long long)(kv_head * 128);
+-      }
+-      float x_lo[8];
+-      float x_hi[8];
+-#pragma unroll
+-      for (int _pair = 0; _pair < 4; _pair++) {
+-        asm volatile(
+-            "{\n\t"
+-            "shl.b32 %0, %2, 16;\n\t"
+-            "and.b32 %1, %2, 0xffff0000;\n\t"
+-            "}\n"
+-            : "=f"((&x_lo[_pair * 2])[0]), "=f"((&x_lo[_pair * 2])[1])
+-            : "r"(x_lo_w[_pair]));
+-      }
+-#pragma unroll
+-      for (int _pair = 0; _pair < 4; _pair++) {
+-        asm volatile(
+-            "{\n\t"
+-            "shl.b32 %0, %2, 16;\n\t"
+-            "and.b32 %1, %2, 0xffff0000;\n\t"
+-            "}\n"
+-            : "=f"((&x_hi[_pair * 2])[0]), "=f"((&x_hi[_pair * 2])[1])
+-            : "r"(x_hi_w[_pair]));
+-      }
+-      if (is_q || is_k) {
+-        if (norm_policy == 2) {
+-          float ss = 0.0f;
+-#pragma unroll
+-          for (int j_2 = 0; j_2 < 8; j_2++) {
+-            float _fma_0 = __fmaf_rn(x_lo[j_2], x_lo[j_2], ss);
+-            ss = _fma_0;
+-            float _fma_1 = __fmaf_rn(x_hi[j_2], x_hi[j_2], ss);
+-            ss = _fma_1;
+-          }
+-          float _shfl_xor_0 = __shfl_xor_sync(grp_mask, ss, 4);
+-          ss = ss + _shfl_xor_0;
+-          float _shfl_xor_1 = __shfl_xor_sync(grp_mask, ss, 2);
+-          ss = ss + _shfl_xor_1;
+-          float _shfl_xor_2 = __shfl_xor_sync(grp_mask, ss, 1);
+-          ss = ss + _shfl_xor_2;
+-          float _rsqrt_0 = rsqrtf(ss * 0.0078125f + 1e-06f);
+-          float inv_rms = _rsqrt_0;
+-#pragma unroll
+-          for (int j_3 = 0; j_3 < 8; j_3++) {
+-            x_lo[j_3] = x_lo[j_3] * (inv_rms * w_lo[j_3]);
+-            x_hi[j_3] = x_hi[j_3] * (inv_rms * w_hi[j_3]);
+-          }
+-        }
+-#pragma unroll
+-        for (int j_4 = 0; j_4 < 8; j_4++) {
+-          float y_lo = x_lo[j_4] * c_lo[j_4] - x_hi[j_4] * c_hi[j_4];
+-          float y_hi = x_hi[j_4] * c_lo[j_4] + x_lo[j_4] * c_hi[j_4];
+-          x_lo[j_4] = y_lo;
+-          x_hi[j_4] = y_hi;
+-        }
+-        if (norm_policy == 1) {
+-          float ss1 = 0.0f;
+-#pragma unroll
+-          for (int j_5 = 0; j_5 < 8; j_5++) {
+-            float _fma_2 = __fmaf_rn(x_lo[j_5], x_lo[j_5], ss1);
+-            ss1 = _fma_2;
+-            float _fma_3 = __fmaf_rn(x_hi[j_5], x_hi[j_5], ss1);
+-            ss1 = _fma_3;
+-          }
+-          float _shfl_xor_3 = __shfl_xor_sync(grp_mask, ss1, 4);
+-          ss1 = ss1 + _shfl_xor_3;
+-          float _shfl_xor_4 = __shfl_xor_sync(grp_mask, ss1, 2);
+-          ss1 = ss1 + _shfl_xor_4;
+-          float _shfl_xor_5 = __shfl_xor_sync(grp_mask, ss1, 1);
+-          ss1 = ss1 + _shfl_xor_5;
+-          float _rsqrt_1 = rsqrtf(ss1 * 0.0078125f + 1e-06f);
+-          float inv_rms1 = _rsqrt_1;
+-#pragma unroll
+-          for (int j_6 = 0; j_6 < 8; j_6++) {
+-            x_lo[j_6] = x_lo[j_6] * (inv_rms1 * w_lo[j_6]);
+-            x_hi[j_6] = x_hi[j_6] * (inv_rms1 * w_hi[j_6]);
+-          }
+-        }
+-      }
+-      float _rcp_0 = __frcp_rn(v_scale_v);
+-      float mult = _rcp_0;
+-      if (is_q) {
+-        if (quant_policy == 1) {
+-          float m = 1e-06f;
+-#pragma unroll
+-          for (int j_7 = 0; j_7 < 8; j_7++) {
+-            float _fabs_0 = fabsf(x_lo[j_7]);
+-            float _fmax_0 = fmaxf(m, _fabs_0);
+-            m = _fmax_0;
+-            float _fabs_1 = fabsf(x_hi[j_7]);
+-            float _fmax_1 = fmaxf(m, _fabs_1);
+-            m = _fmax_1;
+-          }
+-          float _shfl_xor_6 = __shfl_xor_sync(grp_mask, m, 4);
+-          float _fmax_2 = fmaxf(m, _shfl_xor_6);
+-          m = _fmax_2;
+-          float _shfl_xor_7 = __shfl_xor_sync(grp_mask, m, 2);
+-          float _fmax_3 = fmaxf(m, _shfl_xor_7);
+-          m = _fmax_3;
+-          float _shfl_xor_8 = __shfl_xor_sync(grp_mask, m, 1);
+-          float _fmax_4 = fmaxf(m, _shfl_xor_8);
+-          m = _fmax_4;
+-          float _fdiv_rn_0 = __fdiv_rn(m, upper_max);
+-          float scale_val = _fdiv_rn_0;
+-          if (lane_1 == 0) {
+-            if (is_prefill) {
+-              if (tok < max_seqlen_aligned) {
+-                long long qs_idx =
+-                    ((long long)batch_i * (long long)num_q_heads + (long long)head_in_row) *
+-                        (long long)max_seqlen_aligned +
+-                    (long long)tok;
+-                *(reinterpret_cast<float*>(q_scale + qs_idx) + (0)) = scale_val;
+-              }
+-            } else {
+-              long long qs_idx2 = (long long)row * (long long)num_q_heads + (long long)head_in_row;
+-              *(reinterpret_cast<float*>(q_scale + qs_idx2) + (0)) = scale_val;
+-            }
+-          }
+-          float _rcp_1 = __frcp_rn(scale_val);
+-          mult = _rcp_1;
+-        } else {
+-          mult = q_static;
+-        }
+-      } else if (is_k) {
+-        float _rcp_2 = __frcp_rn(k_scale_v);
+-        mult = _rcp_2;
+-      }
+-#pragma unroll
+-      for (int j_8 = 0; j_8 < 8; j_8++) {
+-        x_lo[j_8] = x_lo[j_8] * mult;
+-        x_hi[j_8] = x_hi[j_8] * mult;
+-      }
+-      long long row64 = row;
+-      if (is_q) {
+-        long long q_dst = (row64 * (long long)num_q_heads + (long long)head_in_row) * 128;
+-        {
+-          unsigned int _fp8_pk[2];
+-          asm("{\n\t"
+-              ".reg .b16 _lo, _hi;\n\t"
+-              "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+-              "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+-              "mov.b32 %0, {_lo, _hi};\n\t"
+-              "}\n"
+-              : "=r"(_fp8_pk[0])
+-              : "f"(x_lo[0 + 0]), "f"(x_lo[0 + 1]), "f"(x_lo[0 + 2]), "f"(x_lo[0 + 3]));
+-          asm("{\n\t"
+-              ".reg .b16 _lo, _hi;\n\t"
+-              "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+-              "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+-              "mov.b32 %0, {_lo, _hi};\n\t"
+-              "}\n"
+-              : "=r"(_fp8_pk[1])
+-              : "f"(x_lo[0 + 4]), "f"(x_lo[0 + 5]), "f"(x_lo[0 + 6]), "f"(x_lo[0 + 7]));
+-          *reinterpret_cast<uint2*>(
+-              reinterpret_cast<unsigned char*>(out_q + (q_dst + (long long)lane_lo)) + (0)) =
+-              *reinterpret_cast<uint2*>(_fp8_pk);
+-        }
+-        {
+-          unsigned int _fp8_pk[2];
+-          asm("{\n\t"
+-              ".reg .b16 _lo, _hi;\n\t"
+-              "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+-              "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+-              "mov.b32 %0, {_lo, _hi};\n\t"
+-              "}\n"
+-              : "=r"(_fp8_pk[0])
+-              : "f"(x_hi[0 + 0]), "f"(x_hi[0 + 1]), "f"(x_hi[0 + 2]), "f"(x_hi[0 + 3]));
+-          asm("{\n\t"
+-              ".reg .b16 _lo, _hi;\n\t"
+-              "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+-              "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+-              "mov.b32 %0, {_lo, _hi};\n\t"
+-              "}\n"
+-              : "=r"(_fp8_pk[1])
+-              : "f"(x_hi[0 + 4]), "f"(x_hi[0 + 5]), "f"(x_hi[0 + 6]), "f"(x_hi[0 + 7]));
+-          *reinterpret_cast<uint2*>(
+-              reinterpret_cast<unsigned char*>(out_q + (q_dst + (long long)lane_hi)) + (0)) =
+-              *reinterpret_cast<uint2*>(_fp8_pk);
+-        }
+-      } else if (is_k) {
+-        if (has_out_kv) {
+-          long long k_dst = (row64 * (long long)num_kv_heads + (long long)kv_head) * 128;
+-          {
+-            unsigned int _fp8_pk[2];
+-            asm("{\n\t"
+-                ".reg .b16 _lo, _hi;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+-                "mov.b32 %0, {_lo, _hi};\n\t"
+-                "}\n"
+-                : "=r"(_fp8_pk[0])
+-                : "f"(x_lo[0 + 0]), "f"(x_lo[0 + 1]), "f"(x_lo[0 + 2]), "f"(x_lo[0 + 3]));
+-            asm("{\n\t"
+-                ".reg .b16 _lo, _hi;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+-                "mov.b32 %0, {_lo, _hi};\n\t"
+-                "}\n"
+-                : "=r"(_fp8_pk[1])
+-                : "f"(x_lo[0 + 4]), "f"(x_lo[0 + 5]), "f"(x_lo[0 + 6]), "f"(x_lo[0 + 7]));
+-            *reinterpret_cast<uint2*>(
+-                reinterpret_cast<unsigned char*>(out_k + (k_dst + (long long)lane_lo)) + (0)) =
+-                *reinterpret_cast<uint2*>(_fp8_pk);
+-          }
+-          {
+-            unsigned int _fp8_pk[2];
+-            asm("{\n\t"
+-                ".reg .b16 _lo, _hi;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+-                "mov.b32 %0, {_lo, _hi};\n\t"
+-                "}\n"
+-                : "=r"(_fp8_pk[0])
+-                : "f"(x_hi[0 + 0]), "f"(x_hi[0 + 1]), "f"(x_hi[0 + 2]), "f"(x_hi[0 + 3]));
+-            asm("{\n\t"
+-                ".reg .b16 _lo, _hi;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+-                "mov.b32 %0, {_lo, _hi};\n\t"
+-                "}\n"
+-                : "=r"(_fp8_pk[1])
+-                : "f"(x_hi[0 + 4]), "f"(x_hi[0 + 5]), "f"(x_hi[0 + 6]), "f"(x_hi[0 + 7]));
+-            *reinterpret_cast<uint2*>(
+-                reinterpret_cast<unsigned char*>(out_k + (k_dst + (long long)lane_hi)) + (0)) =
+-                *reinterpret_cast<uint2*>(_fp8_pk);
+-          }
+-        } else {
+-          {
+-            unsigned int _fp8_pk[2];
+-            asm("{\n\t"
+-                ".reg .b16 _lo, _hi;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+-                "mov.b32 %0, {_lo, _hi};\n\t"
+-                "}\n"
+-                : "=r"(_fp8_pk[0])
+-                : "f"(x_lo[0 + 0]), "f"(x_lo[0 + 1]), "f"(x_lo[0 + 2]), "f"(x_lo[0 + 3]));
+-            asm("{\n\t"
+-                ".reg .b16 _lo, _hi;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+-                "mov.b32 %0, {_lo, _hi};\n\t"
+-                "}\n"
+-                : "=r"(_fp8_pk[1])
+-                : "f"(x_lo[0 + 4]), "f"(x_lo[0 + 5]), "f"(x_lo[0 + 6]), "f"(x_lo[0 + 7]));
+-            *reinterpret_cast<uint2*>(
+-                reinterpret_cast<unsigned char*>(key_cache + (cache_row + (long long)lane_lo)) +
+-                (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
+-          }
+-          {
+-            unsigned int _fp8_pk[2];
+-            asm("{\n\t"
+-                ".reg .b16 _lo, _hi;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+-                "mov.b32 %0, {_lo, _hi};\n\t"
+-                "}\n"
+-                : "=r"(_fp8_pk[0])
+-                : "f"(x_hi[0 + 0]), "f"(x_hi[0 + 1]), "f"(x_hi[0 + 2]), "f"(x_hi[0 + 3]));
+-            asm("{\n\t"
+-                ".reg .b16 _lo, _hi;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+-                "mov.b32 %0, {_lo, _hi};\n\t"
+-                "}\n"
+-                : "=r"(_fp8_pk[1])
+-                : "f"(x_hi[0 + 4]), "f"(x_hi[0 + 5]), "f"(x_hi[0 + 6]), "f"(x_hi[0 + 7]));
+-            *reinterpret_cast<uint2*>(
+-                reinterpret_cast<unsigned char*>(key_cache + (cache_row + (long long)lane_hi)) +
+-                (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
+-          }
+-        }
+-      } else {
+-        if (has_out_kv) {
+-          long long v_dst = (row64 * (long long)num_kv_heads + (long long)kv_head) * 128;
+-          {
+-            unsigned int _fp8_pk[2];
+-            asm("{\n\t"
+-                ".reg .b16 _lo, _hi;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+-                "mov.b32 %0, {_lo, _hi};\n\t"
+-                "}\n"
+-                : "=r"(_fp8_pk[0])
+-                : "f"(x_lo[0 + 0]), "f"(x_lo[0 + 1]), "f"(x_lo[0 + 2]), "f"(x_lo[0 + 3]));
+-            asm("{\n\t"
+-                ".reg .b16 _lo, _hi;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+-                "mov.b32 %0, {_lo, _hi};\n\t"
+-                "}\n"
+-                : "=r"(_fp8_pk[1])
+-                : "f"(x_lo[0 + 4]), "f"(x_lo[0 + 5]), "f"(x_lo[0 + 6]), "f"(x_lo[0 + 7]));
+-            *reinterpret_cast<uint2*>(
+-                reinterpret_cast<unsigned char*>(out_v + (v_dst + (long long)lane_lo)) + (0)) =
+-                *reinterpret_cast<uint2*>(_fp8_pk);
+-          }
+-          {
+-            unsigned int _fp8_pk[2];
+-            asm("{\n\t"
+-                ".reg .b16 _lo, _hi;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+-                "mov.b32 %0, {_lo, _hi};\n\t"
+-                "}\n"
+-                : "=r"(_fp8_pk[0])
+-                : "f"(x_hi[0 + 0]), "f"(x_hi[0 + 1]), "f"(x_hi[0 + 2]), "f"(x_hi[0 + 3]));
+-            asm("{\n\t"
+-                ".reg .b16 _lo, _hi;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+-                "mov.b32 %0, {_lo, _hi};\n\t"
+-                "}\n"
+-                : "=r"(_fp8_pk[1])
+-                : "f"(x_hi[0 + 4]), "f"(x_hi[0 + 5]), "f"(x_hi[0 + 6]), "f"(x_hi[0 + 7]));
+-            *reinterpret_cast<uint2*>(
+-                reinterpret_cast<unsigned char*>(out_v + (v_dst + (long long)lane_hi)) + (0)) =
+-                *reinterpret_cast<uint2*>(_fp8_pk);
+-          }
+-        } else {
+-          {
+-            unsigned int _fp8_pk[2];
+-            asm("{\n\t"
+-                ".reg .b16 _lo, _hi;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+-                "mov.b32 %0, {_lo, _hi};\n\t"
+-                "}\n"
+-                : "=r"(_fp8_pk[0])
+-                : "f"(x_lo[0 + 0]), "f"(x_lo[0 + 1]), "f"(x_lo[0 + 2]), "f"(x_lo[0 + 3]));
+-            asm("{\n\t"
+-                ".reg .b16 _lo, _hi;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+-                "mov.b32 %0, {_lo, _hi};\n\t"
+-                "}\n"
+-                : "=r"(_fp8_pk[1])
+-                : "f"(x_lo[0 + 4]), "f"(x_lo[0 + 5]), "f"(x_lo[0 + 6]), "f"(x_lo[0 + 7]));
+-            *reinterpret_cast<uint2*>(
+-                reinterpret_cast<unsigned char*>(value_cache + (cache_row + (long long)lane_lo)) +
+-                (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
+-          }
+-          {
+-            unsigned int _fp8_pk[2];
+-            asm("{\n\t"
+-                ".reg .b16 _lo, _hi;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+-                "mov.b32 %0, {_lo, _hi};\n\t"
+-                "}\n"
+-                : "=r"(_fp8_pk[0])
+-                : "f"(x_hi[0 + 0]), "f"(x_hi[0 + 1]), "f"(x_hi[0 + 2]), "f"(x_hi[0 + 3]));
+-            asm("{\n\t"
+-                ".reg .b16 _lo, _hi;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+-                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+-                "mov.b32 %0, {_lo, _hi};\n\t"
+-                "}\n"
+-                : "=r"(_fp8_pk[1])
+-                : "f"(x_hi[0 + 4]), "f"(x_hi[0 + 5]), "f"(x_hi[0 + 6]), "f"(x_hi[0 + 7]));
+-            *reinterpret_cast<uint2*>(
+-                reinterpret_cast<unsigned char*>(value_cache + (cache_row + (long long)lane_hi)) +
+-                (0)) = *reinterpret_cast<uint2*>(_fp8_pk);
+-          }
+-        }
+-      }
+-    }
+-  } else if (req_id < num_requests) {
+-    if (tid_0 == 0) {
+-      int flag_val = ((invalid != 0) ? -1 : 0);
+-      *(reinterpret_cast<int*>(split_k_flag + (req_id * num_kv_heads + kv_head)) + (0)) = flag_val;
+-    }
+-    if (invalid == 0) {
+-      int last_pos = clear_last_pos;
+-      if (last_pos >= 0) {
+-        int last_slot = last_pos / page_size;
+-        int zero_from = last_pos - last_slot * page_size + 1;
+-        if (zero_from < page_size) {
+-          int phys_last = page_indices[req_id * max_pages_per_request + last_slot];
+-          long long phys_last64 = phys_last;
+-          unsigned int zero_w[4];
+-#pragma unroll
+-          for (int j_9 = 0; j_9 < 4; j_9++) {
+-            zero_w[j_9] = 0;
+-          }
+-          int n_rows = page_size - zero_from;
+-          int total_items = n_rows * 16;
+-#pragma unroll 1
+-          for (int item = tid_0; item < total_items; item += 96) {
+-            int r = item / 16;
+-            int sub = item - r * 16;
+-            int chunk = sub % 8;
+-            long long base =
+-                (phys_last64 * (long long)page_size + (long long)zero_from + (long long)r) *
+-                    (long long)(num_kv_heads * 128) +
+-                (long long)(kv_head * 128) + (long long)(chunk * 16);
+-            if (sub < 8) {
+-              reinterpret_cast<int4*>(key_cache + base)[0] = reinterpret_cast<int4*>(zero_w)[0];
+-            } else {
+-              reinterpret_cast<int4*>(value_cache + base)[0] = reinterpret_cast<int4*>(zero_w)[0];
+-            }
+-          }
+-        }
+-      }
+-    }
+-  }
+-}
+-
+-}  // extern "C"
+diff --git a/csrc/cake_fused_qk_rope_fp8_append/cake_fused_qk_rope_fp8_append_manifest.json b/csrc/cake_fused_qk_rope_fp8_append/cake_fused_qk_rope_fp8_append_manifest.json
+deleted file mode 100644
+index bfc8bd5bf66..00000000000
+--- a/csrc/cake_fused_qk_rope_fp8_append/cake_fused_qk_rope_fp8_append_manifest.json
++++ /dev/null
+@@ -1,196 +0,0 @@
+-{
+-  "contract": {
+-    "arg_plan": [
+-      [
+-        "buffer",
+-        "qkv"
+-      ],
+-      [
+-        "buffer",
+-        "cos_sin"
+-      ],
+-      [
+-        "buffer",
+-        "seq_lens"
+-      ],
+-      [
+-        "buffer",
+-        "q_indptr"
+-      ],
+-      [
+-        "buffer",
+-        "page_indices"
+-      ],
+-      [
+-        "buffer",
+-        "q_norm_weight"
+-      ],
+-      [
+-        "buffer",
+-        "k_norm_weight"
+-      ],
+-      [
+-        "buffer",
+-        "k_scale"
+-      ],
+-      [
+-        "buffer",
+-        "v_scale"
+-      ],
+-      [
+-        "buffer",
+-        "q_scale_inv"
+-      ],
+-      [
+-        "buffer",
+-        "out_q"
+-      ],
+-      [
+-        "buffer",
+-        "key_cache"
+-      ],
+-      [
+-        "buffer",
+-        "value_cache"
+-      ],
+-      [
+-        "buffer",
+-        "out_k"
+-      ],
+-      [
+-        "buffer",
+-        "out_v"
+-      ],
+-      [
+-        "buffer",
+-        "q_scale"
+-      ],
+-      [
+-        "buffer",
+-        "split_k_flag"
+-      ],
+-      [
+-        "parameter",
+-        "num_rows"
+-      ],
+-      [
+-        "parameter",
+-        "num_requests"
+-      ],
+-      [
+-        "parameter",
+-        "num_q_heads"
+-      ],
+-      [
+-        "parameter",
+-        "num_kv_heads"
+-      ],
+-      [
+-        "parameter",
+-        "page_size"
+-      ],
+-      [
+-        "parameter",
+-        "max_pages_per_request"
+-      ],
+-      [
+-        "parameter",
+-        "max_seqlen"
+-      ],
+-      [
+-        "parameter",
+-        "max_seqlen_aligned"
+-      ],
+-      [
+-        "parameter",
+-        "quant_policy"
+-      ],
+-      [
+-        "parameter",
+-        "norm_policy"
+-      ],
+-      [
+-        "parameter",
+-        "is_prefill"
+-      ],
+-      [
+-        "parameter",
+-        "has_out_kv"
+-      ],
+-      [
+-        "parameter",
+-        "upper_max"
+-      ],
+-      [
+-        "grid",
+-        "grid_x"
+-      ],
+-      [
+-        "grid",
+-        "grid_y"
+-      ],
+-      [
+-        "grid",
+-        "grid_z"
+-      ]
+-    ],
+-    "launch": {
+-      "block": [
+-        96,
+-        1,
+-        1
+-      ],
+-      "cluster": [
+-        1,
+-        1,
+-        1
+-      ],
+-      "cluster_scheduling_policy": "spread",
+-      "cooperative": false,
+-      "dynamic_smem_bytes": 0,
+-      "max_persistent_clusters": null,
+-      "persistent_ctas_per_sm": 1,
+-      "use_pdl": false
+-    },
+-    "operator": "fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache"
+-  },
+-  "files": [
+-    {
+-      "path": "csrc/cake_fused_qk_rope_fp8_append/cake_fused_qk_rope_fp8_append_binding.cu",
+-      "sha256": "3fbe9560358bf096895ca5e3ee53c85a284d6e2d13ba145201e889c37e2458fb"
+-    },
+-    {
+-      "path": "csrc/cake_fused_qk_rope_fp8_append/cake_fused_qk_rope_fp8_append_kernel.cu",
+-      "sha256": "b951468637eae645a75d154a8e612825ef53e5bb4a370fa885986496b0dc8e24"
+-    }
+-  ],
+-  "library": "flashinfer",
+-  "modules": [
+-    {
+-      "builds": {
+-        "sm_100a": {
+-          "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_caf9bdb5445726a94bed",
+-          "name": "cake_fused_qk_rope_fp8_append_caf9bdb5445726a94bed"
+-        },
+-        "sm_103a": {
+-          "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_f2873a52b7d6a3954655",
+-          "name": "cake_fused_qk_rope_fp8_append_f2873a52b7d6a3954655"
+-        },
+-        "sm_90a": {
+-          "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_31cb02d023f2ccb40a0b",
+-          "name": "cake_fused_qk_rope_fp8_append_31cb02d023f2ccb40a0b"
+-        }
+-      },
+-      "compile_flags": [],
+-      "ffi_entry": "run",
+-      "stage": "fp8_e4m3",
+-      "translation_units": {
+-        "binding": "csrc/cake_fused_qk_rope_fp8_append/cake_fused_qk_rope_fp8_append_binding.cu",
+-        "device": "csrc/cake_fused_qk_rope_fp8_append/cake_fused_qk_rope_fp8_append_kernel.cu"
+-      }
+-    }
+-  ],
+-  "name": "cake_fused_qk_rope_fp8_append",
+-  "producer": "cake",
+-  "schema": "cake.library_export.v5"
+-}
+diff --git a/flashinfer/aot.py b/flashinfer/aot.py
+index 24e3d902987..614384fac38 100644
+--- a/flashinfer/aot.py
++++ b/flashinfer/aot.py
+@@ -194,6 +194,10 @@
+     gen_cake_sparse_mla_sm120_dsv41_mixed_module,
+ )
+ from .jit.cake_concat_mla_kv_quant_fp8 import gen_concat_mla_kv_quant_fp8_aot_modules
++from .jit.cake_fused_qk_rope_fp8_append import (
++    # Aliased to the gen_*_modules form the CPU AOT tests stub by name.
++    aot_specs as gen_cake_fused_qk_rope_fp8_append_aot_modules,
++)
+ from .jit.mla_kv_pack import gen_mla_kv_pack_fp8_module
+ from .jit.api_log_stats import gen_api_log_stats_module
+ from .jit.norm import gen_norm_module
+@@ -735,6 +739,16 @@ def gen_all_modules(
+     # programs (other targets JIT it on first use).
+     if has_sm100a_exact or has_sm103a_exact:
+         jit_specs.append(gen_mla_kv_pack_fp8_module())
++    # Cake fused QK RMSNorm + NeoX RoPE + FP8 E4M3 quantize + paged KV append: one
++    # program, one library per exact target (module ``<program>_<target>_<digest>``).
++    # The sm_90a row follows the fa3 precedent (``has_sm90``: no exact sm90a flag
++    # exists); the Blackwell rows use the exact flags like the Cake programs above.
++    if has_sm90:
++        jit_specs.extend(gen_cake_fused_qk_rope_fp8_append_aot_modules("sm_90a"))
++    if has_sm100a_exact:
++        jit_specs.extend(gen_cake_fused_qk_rope_fp8_append_aot_modules("sm_100a"))
++    if has_sm103a_exact:
++        jit_specs.extend(gen_cake_fused_qk_rope_fp8_append_aot_modules("sm_103a"))
+     if has_sm120 or has_sm121:
+         jit_specs.append(gen_nvfp4_attention_sm120_module())
+     blackwell_msa_targets: tuple[tuple[BlackwellMSATarget, bool], ...] = (
+diff --git a/flashinfer/cake_fused_qk_rope_fp8_append.py b/flashinfer/cake_fused_qk_rope_fp8_append.py
+index 6af88d5e225..dc4555ce322 100644
+--- a/flashinfer/cake_fused_qk_rope_fp8_append.py
++++ b/flashinfer/cake_fused_qk_rope_fp8_append.py
+@@ -46,33 +46,32 @@
+ Supported: ``(Hq, Hkv) in {(8, 1), (64, 8)}``, head_dim 128, BF16 input, FP8
+ E4M3 output, SM90 (H100/H200), SM100 (B200) and SM103 (B300).  The kernel is
+ generated from the Cake schedule
+-``flashinfer_blackwell_fused_qk_rmsnorm_rope_fp8_paged_kv_append``; sources and
+-manifest live under ``csrc/cake_fused_qk_rope_fp8_append`` (JIT-only).  The call
++``flashinfer_blackwell_fused_qk_rmsnorm_rope_fp8_paged_kv_append``: the generated
++loader :mod:`flashinfer.jit.cake_fused_qk_rope_fp8_append` publishes it as the
++program ``FP8_E4M3``, whose two translation units live under
++``csrc/cake_fused_qk_rope_fp8_append``, and :mod:`flashinfer.jit.cake_program`
++builds one JIT module ``<program>_<target>_<digest>`` per exact target.  The call
+ is CUDA-graph capturable: every launch argument is a by-value scalar or a tensor
+ pointer, no host synchronisation, workspace or extra kernel is involved.
+ """
+ 
+ from __future__ import annotations
+ 
+-import functools
+ import math
+ from typing import Any, Optional, Tuple
+ 
+ import torch
+ import tvm_ffi
+ 
+-from .jit.cake_fused_qk_rope_fp8_append import (
+-    STAGES,
+-    arch_for,
+-    arg_plan,
+-    load_cake_fused_qk_rope_fp8_append_module,
+-)
++from .jit.cake_fused_qk_rope_fp8_append import FP8_E4M3
++from .jit.cake_program import CAPABILITY_TARGET
+ from .utils import get_compute_capability
+ 
+ HEAD_DIM = 128
+ FP8_MAX = 448.0
+ SUPPORTED_HEADS = ((8, 1), (64, 8))
+-_STAGE = STAGES[0]
++# The binding's argument order: the 17 tensors, the 13 scalars, then grid_x, grid_y, grid_z.
++_ARG_NAMES: tuple[str, ...] = FP8_E4M3.args
+ 
+ 
+ def launch_plan(num_rows: int, num_requests: int, num_kv_heads: int) -> dict[str, Any]:
+@@ -89,14 +88,21 @@ def _check(cond: bool, message: str) -> None:
+         raise ValueError(message)
+ 
+ 
+-@functools.cache
+-def _call_plan(arch: str) -> tuple[Any, tuple[str, ...]]:
+-    """Launch entry and argument order of the ``arch`` build (once per build)."""
+-    module, record = load_cake_fused_qk_rope_fp8_append_module(_STAGE, arch)
+-    return (
+-        getattr(module, str(record["ffi_entry"])),
+-        tuple(str(name) for _kind, name in arg_plan()),
+-    )
++def _target(device: torch.device) -> str:
++    """The exact target the program ships for ``device``."""
++    major, minor = get_compute_capability(device)
++    target = FP8_E4M3.target_for((major, minor))
++    if target is None:
++        supported = ", ".join(
++            f"{t} ({cc_major}.{cc_minor})"
++            for (cc_major, cc_minor), t in CAPABILITY_TARGET.items()
++            if t in FP8_E4M3.targets
++        )
++        raise ValueError(
++            f"cake_fused_qk_rope_fp8_append has no cubin for compute capability {major}.{minor}; "
++            f"supported: {supported}"
++        )
++    return target
+ 
+ 
+ def _heads_from_packed_qkv(
+@@ -347,7 +353,8 @@ def cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
+         _check(t.is_contiguous(), f"{name} must be contiguous")
+         _check(t.device == device, f"{name} must be on {device}")
+ 
+-    entry, arg_names = _call_plan(arch_for(get_compute_capability(device)))
++    # The target build is built and loaded once per process by the program constant.
++    entry = FP8_E4M3.entry(_target(device))
+     plan = launch_plan(num_rows, num_requests, num_kv_heads)
+     values = {
+         **tensors,
+@@ -369,7 +376,7 @@ def cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
+         "grid_z": plan["grid"][2],
+     }
+     try:
+-        args = [values[name] for name in arg_names]
++        args = [values[name] for name in _ARG_NAMES]
+     except KeyError as exc:
+         raise RuntimeError(
+             f"generated module expects unknown argument {exc.args[0]!r}"
+diff --git a/flashinfer/jit/cake_fused_qk_rope_fp8_append.py b/flashinfer/jit/cake_fused_qk_rope_fp8_append.py
+index 313e9dad30b..6b4f13437f9 100644
+--- a/flashinfer/jit/cake_fused_qk_rope_fp8_append.py
++++ b/flashinfer/jit/cake_fused_qk_rope_fp8_append.py
+@@ -11,187 +11,102 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+-"""JIT loader for the generated Cake fused QK RMSNorm + NeoX RoPE + FP8 quantize + paged KV append kernel.
++"""Generated programs of the fused Q/K RMSNorm + NeoX RoPE + FP8 E4M3 quantization + paged
++KV append kernel: one program for every supported architecture (sm_90a, sm_100a,
++sm_103a). The host module ``flashinfer.cake_fused_qk_rope_fp8_append`` computes the grid
++and launches it.
+ 
+-One source-only manifest lives under ``csrc/cake_fused_qk_rope_fp8_append``
+-(``cake_fused_qk_rope_fp8_append_manifest.json``, schema ``cake.library_export.v5``):
+-a single stage (``fp8_e4m3``; head configuration, quantization / norm policies,
+-prefill vs decode and the caller-owned K/V route are launch parameters) whose one
+-record carries a ``builds`` entry (module name, kernel symbol) for each of
+-``sm_90a`` (H100/H200), ``sm_100a`` (B200) and ``sm_103a`` (B300), and
+-``contract.arg_plan`` with the binding's argument order.
+-The three modules compile the same kernel and tvm-ffi binding sources; the only
+-per-architecture inputs are the ``-gencode`` flags and the kernel symbol, which the
+-loader passes as ``-DCAKE_KERNEL_SYMBOL=<kernel_symbol>`` so that every module
+-keeps its own symbol when they are loaded into one process.  The host wrapper
+-lives in :mod:`flashinfer.cake_fused_qk_rope_fp8_append`.
++Generated file: every value below is derived from the exported sources and checked
++against them; do not edit.
+ """
+ 
+ from __future__ import annotations
+ 
+-import functools
+-import hashlib
+-import json
+-import re
+-from pathlib import Path
+-from typing import Any
+-
+-from . import env as jit_env
+-from .core import (
+-    JitSpec,
+-    gen_jit_spec,
+-    logger,
+-    sm90a_nvcc_flags,
+-    sm100a_nvcc_flags,
+-    sm103a_nvcc_flags,
++from . import cake_program
++from .core import JitSpec
++
++FP8_E4M3 = cake_program.CakeProgram(
++    name="cake_fused_qk_rope_fp8_append_e8a15268bf7234456084",
++    operator_dir="cake_fused_qk_rope_fp8_append",
++    kernel="kernel_cake_fused_qk_rope_fp8_append_e8a15268bf7234456084",
++    sources=(
++        "cake_fused_qk_rope_fp8_append_e8a15268bf7234456084_kernel.cu",
++        "cake_fused_qk_rope_fp8_append_e8a15268bf7234456084_binding.cu",
++    ),
++    targets=("sm_90a", "sm_100a", "sm_103a"),
++    compile_options=(
++        ("sm_90a", ()),
++        ("sm_100a", ("--fmad=true",)),
++        ("sm_103a", ("--fmad=true",)),
++    ),
++    args=(
++        "qkv",
++        "cos_sin",
++        "seq_lens",
++        "q_indptr",
++        "page_indices",
++        "q_norm_weight",
++        "k_norm_weight",
++        "k_scale",
++        "v_scale",
++        "q_scale_inv",
++        "out_q",
++        "key_cache",
++        "value_cache",
++        "out_k",
++        "out_v",
++        "q_scale",
++        "split_k_flag",
++        "num_rows",
++        "num_requests",
++        "num_q_heads",
++        "num_kv_heads",
++        "page_size",
++        "max_pages_per_request",
++        "max_seqlen",
++        "max_seqlen_aligned",
++        "quant_policy",
++        "norm_policy",
++        "is_prefill",
++        "has_out_kv",
++        "upper_max",
++        "grid_x",
++        "grid_y",
++        "grid_z",
++    ),
++    tensors=(
++        "qkv",
++        "cos_sin",
++        "seq_lens",
++        "q_indptr",
++        "page_indices",
++        "q_norm_weight",
++        "k_norm_weight",
++        "k_scale",
++        "v_scale",
++        "q_scale_inv",
++        "out_q",
++        "key_cache",
++        "value_cache",
++        "out_k",
++        "out_v",
++        "q_scale",
++        "split_k_flag",
++    ),
++    block=(96, 1, 1),
++    cluster=(1, 1, 1),
++    dynamic_smem_bytes=0,
++    use_pdl=False,
++    cooperative=False,
++    needs_device_linking=False,
+ )
+ 
+-_PACKAGE = "cake_fused_qk_rope_fp8_append"
+-_GENERATED_ROOT = f"csrc/{_PACKAGE}"
+-_MANIFEST_NAME = f"{_PACKAGE}_manifest.json"
+-
+-STAGES = ("fp8_e4m3",)
+-ARCHES = ("sm_90a", "sm_100a", "sm_103a")
+-_NVCC_FLAGS = {
+-    "sm_90a": sm90a_nvcc_flags,
+-    "sm_100a": sm100a_nvcc_flags,
+-    "sm_103a": sm103a_nvcc_flags,
+-}
+-# The shared kernel and binding sources name the kernel through this macro; the
+-# loader binds it per module so that every module keeps a distinct symbol.
+-_KERNEL_SYMBOL_DEFINE = "CAKE_KERNEL_SYMBOL"
+-_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+-
+-
+-def arch_for(compute_capability: tuple[int, int]) -> str:
+-    major, minor = compute_capability
+-    if (major, minor) == (9, 0):
+-        return "sm_90a"
+-    if (major, minor) == (10, 0):
+-        return "sm_100a"
+-    if (major, minor) == (10, 3):
+-        return "sm_103a"
+-    raise ValueError(
+-        f"cake_fused_qk_rope_fp8_append has no cubin for compute capability {major}.{minor}; "
+-        f"supported: sm_90a (9.0), sm_100a (10.0), sm_103a (10.3)"
+-    )
+-
+-
+-def _get_csrc_dir() -> Path:
+-    installed = jit_env.FLASHINFER_CSRC_DIR / _PACKAGE
+-    if (installed / _MANIFEST_NAME).is_file():
+-        return installed
+-    checkout = Path(__file__).resolve().parents[2] / "csrc" / _PACKAGE
+-    if (checkout / _MANIFEST_NAME).is_file():
+-        return checkout
+-    raise FileNotFoundError("Cake fused QK RoPE append sources were not found")
+-
+-
+-def _get_include_dir() -> Path:
+-    if jit_env.FLASHINFER_INCLUDE_DIR.exists():
+-        return jit_env.FLASHINFER_INCLUDE_DIR
+-    checkout = Path(__file__).resolve().parents[2] / "include"
+-    if checkout.exists():
+-        return checkout
+-    raise FileNotFoundError("FlashInfer headers were not found")
+-
+-
+-@functools.cache
+-def _manifest() -> dict[str, Any]:
+-    path = _get_csrc_dir() / _MANIFEST_NAME
+-    value = json.loads(path.read_text(encoding="utf-8"))
+-    if (
+-        value.get("schema") != "cake.library_export.v5"
+-        or value.get("producer") != "cake"
+-        or value.get("library") != "flashinfer"
+-        or value.get("name") != _PACKAGE
+-    ):
+-        raise RuntimeError("invalid Cake fused QK RoPE append manifest")
+-    modules = value.get("modules")
+-    if not isinstance(modules, list) or not modules:
+-        raise RuntimeError("empty Cake fused QK RoPE append module inventory")
+-    return value
+-
+-
+-def arg_plan() -> tuple[tuple[str, str], ...]:
+-    """Binding arguments ``(kind, name)`` in call order (``contract.arg_plan``)."""
+-    plan = _manifest()["contract"]["arg_plan"]
+-    return tuple((str(kind), str(name)) for kind, name in plan)
+-
+-
+-def _record(stage: str, arch: str) -> dict[str, Any]:
+-    """Per-module view of a stage record: its shared fields plus ``builds[arch]``."""
+-    if stage not in STAGES:
+-        raise ValueError(f"unknown stage {stage!r}; expected one of {STAGES}")
+-    if arch not in ARCHES:
+-        raise ValueError(f"unknown arch {arch!r}; expected one of {ARCHES}")
+-    matches = [item for item in _manifest()["modules"] if item.get("stage") == stage]
+-    if len(matches) != 1:
+-        raise RuntimeError(
+-            f"expected one Cake stage record for {stage!r}, got {len(matches)}"
+-        )
+-    record = matches[0]
+-    build = dict(record.get("builds", {})).get(arch)
+-    if not isinstance(build, dict):
+-        raise RuntimeError(f"stage {stage!r} ships no build for {arch}")
+-    view = {key: value for key, value in record.items() if key != "builds"}
+-    return {**view, **build, "arch": arch}
+-
+-
+-def _source_path(relative_path: str) -> Path:
+-    manifest = _manifest()
+-    relative = Path(relative_path)
+-    try:
+-        suffix = relative.relative_to(Path(_GENERATED_ROOT))
+-    except ValueError as exc:
+-        raise RuntimeError(
+-            f"generated source escaped {_GENERATED_ROOT}: {relative_path}"
+-        ) from exc
+-    path = _get_csrc_dir() / suffix
+-    inventory = {item["path"]: item for item in manifest["files"]}
+-    receipt = inventory.get(relative.as_posix())
+-    if not isinstance(receipt, dict) or not path.is_file():
+-        raise FileNotFoundError(
+-            f"generated source is absent from the manifest: {relative_path}"
+-        )
+-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+-    if digest != receipt.get("sha256"):
+-        raise RuntimeError(f"generated source hash mismatch: {relative_path}")
+-    return path
+-
+-
+-def _kernel_symbol_flag(record: dict[str, Any]) -> str:
+-    """``-D`` flag binding the shared sources to this module's kernel symbol."""
+-    symbol = record.get("kernel_symbol")
+-    if not isinstance(symbol, str) or _IDENTIFIER.fullmatch(symbol) is None:
+-        raise RuntimeError(
+-            f"invalid kernel_symbol for module {record.get('name')!r}: {symbol!r}"
+-        )
+-    return f"-D{_KERNEL_SYMBOL_DEFINE}={symbol}"
++PROGRAMS: tuple[cake_program.CakeProgram, ...] = (FP8_E4M3,)
+ 
+ 
+-@functools.cache
+-def gen_cake_fused_qk_rope_fp8_append_module(stage: str, arch: str) -> JitSpec:
+-    record = _record(stage, arch)
+-    units = record["translation_units"]
+-    spec = gen_jit_spec(
+-        name=f"{record['name']}_{arch}",
+-        sources=[_source_path(units["device"]), _source_path(units["binding"])],
+-        extra_cuda_cflags=[
+-            *_NVCC_FLAGS[arch],
+-            *record["compile_flags"],
+-            _kernel_symbol_flag(record),
+-        ],
+-        extra_ldflags=["-lcuda"],
+-        extra_include_paths=[_get_csrc_dir().parent, _get_include_dir()],
+-    )
+-    logger.info("Generated Cake fused QK RoPE append JIT spec: %s", spec.name)
+-    return spec
++def aot_specs(target: str) -> tuple[JitSpec, ...]:
++    """JIT specs of every program shipping ``target``, for the ahead-of-time build."""
++    return cake_program.aot_specs(PROGRAMS, target)
+ 
+ 
+-@functools.cache
+-def load_cake_fused_qk_rope_fp8_append_module(stage: str, arch: str):
+-    """Build and load one module; return ``(module, manifest record)``."""
+-    spec = gen_cake_fused_qk_rope_fp8_append_module(stage, arch)
+-    module = spec.build_and_load()
+-    return module, _record(stage, arch)
++__all__ = ["FP8_E4M3", "PROGRAMS", "aot_specs"]
+diff --git a/flashinfer/jit/cake_program.py b/flashinfer/jit/cake_program.py
+new file mode 100644
+index 00000000000..af89a0f9b8f
+--- /dev/null
++++ b/flashinfer/jit/cake_program.py
+@@ -0,0 +1,242 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++
++Runtime of the generated Cake in-tree loaders.
++
++A generated loader (``flashinfer/jit/cake_<op>.py``) publishes one
++:class:`CakeProgram` constant per exported program: the two CUDA translation
++units under ``csrc/<operator_dir>/`` (the device source and its tvm-ffi
++binding), the exact targets the program ships for, the compile options of
++each target, the binding's argument order and the launch it performs.  The
++constants are data; this module turns one of them into a FlashInfer JIT
++specification (:meth:`CakeProgram.spec`), builds and loads it
++(:meth:`CakeProgram.load`) and lists the specifications an ahead-of-time
++build registers (:func:`aot_specs`).
++
++A program is compiled for exactly one target per library.  The module name
++is ``<program>_<target>_<digest>``, the digest being the first twenty hex
++digits of the SHA-256 over the bytes of the two sources in their listed
++order followed by the compact JSON of the target and its compile options,
++so a changed source or option never reuses a stale library and two targets
++never share one.  The build opts out of FlashInfer's default fast math and
++passes ``--fmad=false`` followed by the target's recorded compile options,
++which reproduces the numerics the sources were validated with.
++
++The Cake exporter writes this file byte-identically into FlashInfer; do not
++edit it in place.
++"""
++
++from __future__ import annotations
++
++import functools
++import hashlib
++import json
++from collections.abc import Sequence
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++from . import env as jit_env
++from .core import (
++    JitSpec,
++    gen_jit_spec,
++    sm90a_nvcc_flags,
++    sm100a_nvcc_flags,
++    sm103a_nvcc_flags,
++    sm107a_nvcc_flags,
++    sm110a_nvcc_flags,
++)
++
++__all__ = [
++    "CAPABILITY_TARGET",
++    "DIGEST_DIGITS",
++    "GRID_ARGS",
++    "TARGET_FLAGS",
++    "CakeProgram",
++    "aot_specs",
++    "content_digest",
++    "operator_csrc_dir",
++]
++
++#: The nvcc flag set of each exact target a program may ship for.
++TARGET_FLAGS: dict[str, Sequence[str]] = {
++    "sm_90a": sm90a_nvcc_flags,
++    "sm_100a": sm100a_nvcc_flags,
++    "sm_103a": sm103a_nvcc_flags,
++    "sm_107a": sm107a_nvcc_flags,
++    "sm_110a": sm110a_nvcc_flags,
++}
++#: The exact target of a device's compute capability.
++CAPABILITY_TARGET: dict[tuple[int, int], str] = {
++    (9, 0): "sm_90a",
++    (10, 0): "sm_100a",
++    (10, 3): "sm_103a",
++    (10, 7): "sm_107a",
++    (11, 0): "sm_110a",
++}
++#: The three grid arguments every binding takes after its host parameters.
++GRID_ARGS: tuple[str, str, str] = ("grid_x", "grid_y", "grid_z")
++#: Hex digits of the content digest in a module name.
++DIGEST_DIGITS = 20
++_FMAD_OFF = "--fmad=false"
++
++
++def operator_csrc_dir(operator_dir: str) -> Path:
++    """The directory holding the sources of ``operator_dir``: the installed
++    ``csrc`` data of the wheel, else the checkout's ``csrc/``."""
++    installed = jit_env.FLASHINFER_CSRC_DIR / operator_dir
++    if installed.is_dir():
++        return installed
++    checkout = Path(__file__).resolve().parents[2] / "csrc" / operator_dir
++    if checkout.is_dir():
++        return checkout
++    raise FileNotFoundError(
++        f"the Cake sources of {operator_dir!r} were not found. Checked:\n"
++        f"  - {installed}\n"
++        f"  - {checkout}"
++    )
++
++
++def content_digest(
++    kernel: bytes, binding: bytes, target: str, options: Sequence[str]
++) -> str:
++    """The first :data:`DIGEST_DIGITS` hex digits of the SHA-256 over the kernel bytes, the binding bytes and
++    ``{"options": [...], "target": "..."}`` as compact sorted JSON, in that order and without separators."""
++    digest = hashlib.sha256()
++    digest.update(kernel)
++    digest.update(binding)
++    identity = {"options": list(options), "target": target}
++    digest.update(
++        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
++    )
++    return digest.hexdigest()[:DIGEST_DIGITS]
++
++
++@dataclass(frozen=True)
++class CakeProgram:
++    """One exported program: its sources, targets, options, argument order and launch.
++
++    Every field is a string, number, boolean or tuple of those, so a constant
++    is hashable (the caches below key on it) and a generated loader spells it
++    as literals.  ``compile_options`` pairs each target with its options;
++    ``args`` are the binding's host parameters in call order followed by the
++    three grid arguments, and ``tensors`` the subset passed as tensors.  The
++    launch fields (``block``, ``cluster``, ``dynamic_smem_bytes``, ``use_pdl``,
++    ``cooperative``) state the launch the binding performs; the grid is the
++    caller's, through the grid arguments.  The host module that owns the
++    operation assembles the positional call from ``args`` once, at
++    preparation, and calls ``entry(target)`` with it; nothing here interprets
++    an argument plan per call.
++    """
++
++    name: str
++    operator_dir: str
++    kernel: str
++    sources: tuple[str, str]
++    targets: tuple[str, ...]
++    compile_options: tuple[tuple[str, tuple[str, ...]], ...]
++    args: tuple[str, ...]
++    tensors: tuple[str, ...]
++    block: tuple[int, int, int]
++    cluster: tuple[int, int, int]
++    dynamic_smem_bytes: int
++    use_pdl: bool
++    cooperative: bool
++    needs_device_linking: bool
++
++    def options_for(self, target: str) -> tuple[str, ...]:
++        """The recorded compile options of ``target``; a target the program does not ship raises ``KeyError``."""
++        if target not in self.targets:
++            raise KeyError(
++                f"{self.name} ships no {target!r} build; its targets are {list(self.targets)}"
++            )
++        return dict(self.compile_options)[target]
++
++    def target_for(self, capability: tuple[int, int]) -> str | None:
++        """The exact target this program ships for a device of ``capability``, or ``None``."""
++        target = CAPABILITY_TARGET.get((int(capability[0]), int(capability[1])))
++        return target if target in self.targets else None
++
++    def source_paths(self) -> tuple[Path, ...]:
++        """The two translation units, under :func:`operator_csrc_dir`."""
++        root = operator_csrc_dir(self.operator_dir)
++        return tuple(root / source for source in self.sources)
++
++    def digest(self, target: str) -> str:
++        """The content digest of the two sources and the target's options (the sources are read once per
++        process)."""
++        kernel, binding = _source_bytes(self)
++        return content_digest(kernel, binding, target, self.options_for(target))
++
++    def module_name(self, target: str) -> str:
++        """``<name>_<target>_<digest>``: the JIT module of this program on ``target``."""
++        return f"{self.name}_{target}_{self.digest(target)}"
++
++    def spec(self, target: str) -> JitSpec:
++        """The JIT specification of this program on ``target`` (one per process)."""
++        return _spec(self, target)
++
++    def load(self, target: str) -> Any:
++        """The built and loaded tvm-ffi module of this program on ``target`` (one per process)."""
++        return _load(self, target)
++
++    def entry(self, target: str) -> Any:
++        """The binding's ``run`` function on ``target``."""
++        return self.load(target).run
++
++    def launch_record(self) -> dict[str, Any]:
++        """The launch the binding performs, as the exporter records it."""
++        return {
++            "block": self.block,
++            "cluster": self.cluster,
++            "cooperative": self.cooperative,
++            "dynamic_smem_bytes": self.dynamic_smem_bytes,
++            "use_pdl": self.use_pdl,
++        }
++
++
++@functools.cache
++def _source_bytes(program: CakeProgram) -> tuple[bytes, bytes]:
++    kernel, binding = program.source_paths()
++    return kernel.read_bytes(), binding.read_bytes()
++
++
++@functools.cache
++def _spec(program: CakeProgram, target: str) -> JitSpec:
++    options = program.options_for(target)
++    return gen_jit_spec(
++        name=program.module_name(target),
++        sources=list(program.source_paths()),
++        extra_cuda_cflags=[*TARGET_FLAGS[target], _FMAD_OFF, *options],
++        extra_include_paths=[operator_csrc_dir(program.operator_dir)],
++        needs_device_linking=program.needs_device_linking,
++        use_fast_math=False,
++    )
++
++
++@functools.cache
++def _load(program: CakeProgram, target: str) -> Any:
++    return program.spec(target).build_and_load()
++
++
++def aot_specs(programs: Sequence[CakeProgram], target: str) -> tuple[JitSpec, ...]:
++    """The JIT specifications of every program of ``programs`` shipping ``target``, in order."""
++    if target not in TARGET_FLAGS:
++        raise ValueError(
++            f"unknown target {target!r}; the targets are {sorted(TARGET_FLAGS)}"
++        )
++    return tuple(
++        program.spec(target) for program in programs if target in program.targets
++    )
+diff --git a/tests/attention/test_cake_fused_qk_rope_fp8_append.py b/tests/attention/test_cake_fused_qk_rope_fp8_append.py
+index 9fad8539805..d5320e2102d 100644
+--- a/tests/attention/test_cake_fused_qk_rope_fp8_append.py
++++ b/tests/attention/test_cake_fused_qk_rope_fp8_append.py
+@@ -7,7 +7,7 @@
+ tails and every untouched byte bitwise.
+ """
+ 
+-from pathlib import Path
++import re
+ 
+ import pytest
+ import torch
+@@ -15,7 +15,8 @@
+ from flashinfer.cake_fused_qk_rope_fp8_append import (
+     cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache as fused_fp8,
+ )
+-from flashinfer.jit import cake_fused_qk_rope_fp8_append as jit_fp8
++from flashinfer.jit import cake_program
++from flashinfer.jit.cake_fused_qk_rope_fp8_append import FP8_E4M3, PROGRAMS
+ from flashinfer.utils import get_compute_capability
+ 
+ HEAD_DIM = 128
+@@ -29,55 +30,61 @@ def _skip_unless_supported():
+     if not torch.cuda.is_available():
+         pytest.skip("CUDA is required")
+     cc = get_compute_capability(torch.device("cuda:0"))
+-    if cc not in ((9, 0), (10, 0), (10, 3)):
++    if FP8_E4M3.target_for(cc) is None:
+         pytest.skip(
+             f"cake_fused_qk_rope_fp8_append has no cubin for compute capability {cc}"
+         )
+ 
+ 
+-def test_shared_sources_bind_one_kernel_symbol_per_module(monkeypatch):
+-    """CPU-only: every architecture compiles the same kernel and binding sources,
+-    and the loader binds each module to its own kernel symbol through a define."""
++def test_program_constant_matches_its_units(monkeypatch):
++    """CPU-only: the loader's one program names the two translation units under its
++    operator directory, the device source defines and the binding declares its kernel
++    symbol, and every target gets its own content-addressed module name."""
+     import flashinfer.jit.core as jit_core
+ 
+     monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+-    define = "-DCAKE_KERNEL_SYMBOL="
+-    sources = set()
+-    symbols = set()
+-    for arch in jit_fp8.ARCHES:
+-        spec = jit_fp8.gen_cake_fused_qk_rope_fp8_append_module(jit_fp8.STAGES[0], arch)
+-        assert spec.name.endswith(f"_{arch}")
+-        # _source_path() checked the manifest sha256 receipt of both sources.
+-        sources.add(tuple(Path(source).resolve() for source in spec.sources))
+-        flags = [flag for flag in spec.extra_cuda_cflags if flag.startswith(define)]
+-        assert len(flags) == 1, spec.extra_cuda_cflags
+-        symbol = flags[0][len(define) :]
+-        assert symbol == "kernel_" + spec.name[: -len(f"_{arch}")]
+-        symbols.add(symbol)
+-    assert len(symbols) == len(jit_fp8.ARCHES)
+-    [(kernel, binding)] = sources
+-    assert kernel.name == "cake_fused_qk_rope_fp8_append_kernel.cu"
+-    assert binding.name == "cake_fused_qk_rope_fp8_append_binding.cu"
++    assert PROGRAMS == (FP8_E4M3,)
++    assert FP8_E4M3.targets == ("sm_90a", "sm_100a", "sm_103a")
++    assert FP8_E4M3.kernel == "kernel_" + FP8_E4M3.name
++    kernel, binding = FP8_E4M3.source_paths()
+     assert kernel.parent == binding.parent
+-    assert kernel.parent.name == "cake_fused_qk_rope_fp8_append"
++    assert kernel.parent == cake_program.operator_csrc_dir(FP8_E4M3.operator_dir)
++    assert (kernel.name, binding.name) == FP8_E4M3.sources
+     kernel_text = kernel.read_text(encoding="utf-8")
+     binding_text = binding.read_text(encoding="utf-8")
+-    assert "void CAKE_KERNEL_SYMBOL(" in kernel_text
+-    assert "void CAKE_KERNEL_SYMBOL(" in binding_text
+-    assert "namespace CAKE_HOST_SHIM_NAMESPACE {" in binding_text
+-    default_symbol = "kernel_cake_fused_qk_rope_fp8_append_caf9bdb5445726a94bed"
+-    for symbol in symbols - {default_symbol}:
+-        assert symbol not in kernel_text and symbol not in binding_text
+-
+-
+-# The 20-hex digest identifies the architecture's build in the Cake export: module
+-# name ``cake_fused_qk_rope_fp8_append_<digest>``, spec name ``<module>_<arch>``,
+-# kernel symbol ``kernel_<module>``.
+-_MODULE_DIGESTS = {
+-    "sm_90a": "31cb02d023f2ccb40a0b",
+-    "sm_100a": "caf9bdb5445726a94bed",
+-    "sm_103a": "f2873a52b7d6a3954655",
+-}
++    # The device source *defines* the kernel (``__global__ __launch_bounds__(N) void
++    # <kernel>(``, whitespace-tolerant); the binding declares it.
++    assert re.search(
++        rf"__global__\s+__launch_bounds__\(\d+\)\s+void\s+{re.escape(FP8_E4M3.kernel)}\(",
++        kernel_text,
++    )
++    assert f'extern "C" __global__ void {FP8_E4M3.kernel}(' in binding_text
++    assert f"namespace cake_binding_{FP8_E4M3.kernel} {{" in binding_text
++    assert (
++        f"TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_binding_{FP8_E4M3.kernel}::Run)"
++        in binding_text
++    )
++    assert '#include "cake_ffi_checks.h"' in binding_text
++    assert "CAKE_KERNEL_SYMBOL" not in kernel_text + binding_text
++    names = set()
++    for target in FP8_E4M3.targets:
++        digest = FP8_E4M3.digest(target)
++        assert len(digest) == cake_program.DIGEST_DIGITS
++        assert digest == cake_program.content_digest(
++            kernel.read_bytes(),
++            binding.read_bytes(),
++            target,
++            FP8_E4M3.options_for(target),
++        )
++        spec = FP8_E4M3.spec(target)
++        assert spec.name == FP8_E4M3.module_name(target)
++        assert spec.name == f"{FP8_E4M3.name}_{target}_{digest}"
++        assert not any(flag.startswith("-DCAKE_") for flag in spec.extra_cuda_cflags)
++        names.add(spec.name)
++    # The target and its options are folded into the digest: one module per target.
++    assert len({FP8_E4M3.digest(t) for t in FP8_E4M3.targets}) == len(FP8_E4M3.targets)
++    assert len(names) == len(FP8_E4M3.targets)
++
+ 
+ _ARG_NAMES = [
+     "qkv",
+@@ -116,9 +123,11 @@ def test_shared_sources_bind_one_kernel_symbol_per_module(monkeypatch):
+ ]
+ 
+ 
+-def test_jit_spec_matches_the_pinned_module_table(monkeypatch):
+-    """CPU-only: spec name, sources and loader flags of every architecture's module
+-    against the manifest's module table (``builds`` of the one stage record)."""
++def test_jit_spec_matches_the_program_constant(monkeypatch):
++    """CPU-only: the JIT spec of every target is built from the program constant alone:
++    its two sources, the target's nvcc flags, ``--fmad=false`` and the recorded compile
++    options, with FlashInfer's default fast math switched off; the binding's argument
++    order and launch are the constant's."""
+     import flashinfer.jit.core as jit_core
+ 
+     monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+@@ -127,21 +136,32 @@ def test_jit_spec_matches_the_pinned_module_table(monkeypatch):
+         "sm_100a": jit_core.sm100a_nvcc_flags,
+         "sm_103a": jit_core.sm103a_nvcc_flags,
+     }
+-    assert set(_MODULE_DIGESTS) == set(jit_fp8.ARCHES)
+-    csrc = jit_fp8._get_csrc_dir()
+-    for arch, digest in sorted(_MODULE_DIGESTS.items()):
+-        module = f"cake_fused_qk_rope_fp8_append_{digest}"
+-        spec = jit_fp8.gen_cake_fused_qk_rope_fp8_append_module("fp8_e4m3", arch)
+-        assert spec.name == f"{module}_{arch}"
+-        assert spec.sources == [
+-            csrc / "cake_fused_qk_rope_fp8_append_kernel.cu",
+-            csrc / "cake_fused_qk_rope_fp8_append_binding.cu",
+-        ]
+-        added = [*arch_flags[arch], f"-DCAKE_KERNEL_SYMBOL=kernel_{module}"]
++    assert {t: cake_program.TARGET_FLAGS[t] for t in FP8_E4M3.targets} == arch_flags
++    assert FP8_E4M3.options_for("sm_90a") == ()
++    assert FP8_E4M3.options_for("sm_100a") == ("--fmad=true",)
++    assert FP8_E4M3.options_for("sm_103a") == ("--fmad=true",)
++    with pytest.raises(KeyError):
++        FP8_E4M3.options_for("sm_120a")
++    for target in FP8_E4M3.targets:
++        spec = FP8_E4M3.spec(target)
++        assert spec.sources == list(FP8_E4M3.source_paths())
++        added = [*arch_flags[target], "--fmad=false", *FP8_E4M3.options_for(target)]
+         assert spec.extra_cuda_cflags[-len(added) :] == added
+         generic = spec.extra_cuda_cflags[: -len(added)]
+-        assert not any(flag.startswith(("-gencode", "-DCAKE_")) for flag in generic)
+-    assert [name for _kind, name in jit_fp8.arg_plan()] == _ARG_NAMES
++        assert not any(flag.startswith("-gencode") for flag in generic)
++        assert "-use_fast_math" not in spec.extra_cuda_cflags
++        assert not spec.extra_ldflags
++        assert spec.needs_device_linking is False
++    assert FP8_E4M3.args == tuple(_ARG_NAMES)
++    assert FP8_E4M3.tensors == tuple(_ARG_NAMES[:17])
++    assert FP8_E4M3.args[-3:] == cake_program.GRID_ARGS
++    assert FP8_E4M3.launch_record() == {
++        "block": (96, 1, 1),
++        "cluster": (1, 1, 1),
++        "cooperative": False,
++        "dynamic_smem_bytes": 0,
++        "use_pdl": False,
++    }
+ 
+ 
+ def rotary_cos_sin_table(

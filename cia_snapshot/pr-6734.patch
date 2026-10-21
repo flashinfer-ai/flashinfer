@@ -1,0 +1,1649 @@
+diff --git a/docs/api/comm.rst b/docs/api/comm.rst
+index 12caa76062dd17c21dbc6c1c5559e3430fccbce4..c713b08fc7f130e7ea4990e07f4a05b956c3a697 100644
+--- a/docs/api/comm.rst
++++ b/docs/api/comm.rst
+@@ -574,6 +574,12 @@ verified all-pairs NVLink P2P and owns the IPC workspace lifecycle.
+ MNNVL (Multi-Node NVLink)
+ -------------------------
+ 
++``MnnvlMemory`` and ``SymmDeviceMemory`` allocate the symmetric memory behind
++the NVLink collectives. The `symmetric memory design notes
++<https://github.com/flashinfer-ai/flashinfer/blob/main/docs/design_docs/symmetric_memory.md>`_
++describe how each lays out its memory and how the ranks choose between FABRIC
++handles and POSIX file descriptors to share it.
++
+ .. currentmodule:: flashinfer.comm.mnnvl
+ 
+ Core Classes
+diff --git a/docs/design_docs/media/symmetric_memory.png b/docs/design_docs/media/symmetric_memory.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..f7e6e06dc59d6f370b343d2c6c53387e0c7522f1
+GIT binary patch
+literal 17341
+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
+TQ3oE&aZ61}Q?X3`eZYSLdOf$c
+
+literal 0
+HcmV?d00001
+
+diff --git a/docs/design_docs/moe_ep_architecture.md b/docs/design_docs/moe_ep_architecture.md
+index 5a1cfb1f055b84b22444014ea861b45d6fc83a04..484059ff84fb63571d29db85f682b8259a6ad4bd 100644
+--- a/docs/design_docs/moe_ep_architecture.md
++++ b/docs/design_docs/moe_ep_architecture.md
+@@ -69,7 +69,8 @@ kind, and both paths hand the inner kernel the same `SplitKernelContext`:
+ - **`MoEEpCommunication`** (`core/comm/communication.py`) is a self-contained
+   dispatch/combine object: one long-lived instance per EP group owns its
+   workspace, and per-step routing state lives in that workspace. The NVLink
+-  backends implement it. `dispatch(hidden_states, topk_ids,
++  backends implement it, with the workspace in
++  [symmetric memory](./symmetric_memory.md). `dispatch(hidden_states, topk_ids,
+   topk_weights, ...)` returns `ep_size * tokens_per_rank` receive rows with
+   their GLOBAL top-k routing (rows without a token carry
+   `MoEEpCommParams.invalid_expert_id`); the expert computation weights and
+diff --git a/docs/design_docs/symmetric_memory.md b/docs/design_docs/symmetric_memory.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..aedcae411a488c2299265b70a47de86fe8d9a41b
+--- /dev/null
++++ b/docs/design_docs/symmetric_memory.md
+@@ -0,0 +1,206 @@
++# Symmetric Memory over NVLink
++
++**Scope**: `MnnvlMemory` and `SymmDeviceMemory` in `flashinfer/comm/mnnvl.py`:
++how they allocate and share memory, their lifecycle and checkpoint/restore, and
++how the NVLink one-sided all-to-all gates CFT on the handle type.
++
++FlashInfer's NVLink collectives work on symmetric memory: every rank of a group
++allocates a buffer of the same size, and every rank maps every peer's buffer
++into its own virtual address space, so a kernel reads and writes peer memory
++with plain loads and stores.
++
++A **group** is the set of ranks that share one allocation: the ranks of the
++`CommBackend` it is allocated over. Allocations are collective over their
++group, and a process can be in several groups at once, for example a TP group
++for all-reduce and an EP group for MoE all-to-all, each with its own
++allocations.
++
++<p align="center"><img src="./media/symmetric_memory.png" alt="Symmetric memory across GPUs" width="600"/></p>
++<p align="center"><em>Symmetric memory registration across GPUs. (Image source: <a href="https://developer.nvidia.com/blog/enabling-fast-inference-and-resilient-training-with-nccl-2-27/">NVIDIA NCCL 2.27 blog</a>)</em></p>
++
++Two classes in [`flashinfer/comm/mnnvl.py`](../../flashinfer/comm/mnnvl.py)
++provide it, `MnnvlMemory` and `SymmDeviceMemory`. They allocate and share the
++physical memory the same way and differ in how they lay it out; the
++[comparison](#comparison) at the end summarizes the differences.
++
++## Allocating and sharing the physical memory
++
++Each rank backs its buffer with `cuMemCreate` and exports a shareable handle;
++the peers import it and map it. The handle type decides how the handles
++travel:
++
++- **FABRIC** handles are opaque bytes that any rank in the NVLink domain can
++  import, on any host. They move through the `CommBackend`'s object
++  collectives. They need an IMEX channel and, across hosts, the `nvidia-imex`
++  service on every node.
++- **POSIX file descriptors** move between processes over AF_UNIX sockets with
++  `SCM_RIGHTS` ([`fd_exchange.py`](../../flashinfer/comm/fd_exchange.py)), so
++  they work only within one host. They need no IMEX channel.
++
++`allocate_mnnvl_handles` does this for both classes. It is collective over the
++group, and every rank of the group always takes the same path:
++
++```text
++allocate_mnnvl_handles(comm, dev_id, make_prop)
++    handle_type, single_host = choose_mnnvl_handle_type(comm, dev_id)
++    attempt(handle_type)
++    if it failed, handle_type is FABRIC and single_host:
++        attempt(POSIX)
++    if it still failed: raise with every rank's error
++
++choose_mnnvl_handle_type(comm, dev_id)      # one allgather of (host, reason, cluster UUID)
++    one host:   FABRIC if every GPU reports FABRIC support, else POSIX
++    many hosts: FABRIC if every GPU reports FABRIC support and the same
++                non-zero NVML fabric cluster UUID, else raise with each rank's reason
++
++attempt(handle_type)                        # _create_and_import_handles
++    create and export this rank's allocation
++    vote; if any rank failed: release, return the errors
++    exchange the handles; import every peer's
++    vote; if any rank failed: release everything, return the errors
++```
++
++Every rank of the group must pick the same handle type, since the two types
++exchange handles through different collectives. Each call therefore decides
++afresh from one allgather over the group, rather than reusing an earlier
++result: a process that already allocated in another group (say, its TP group)
++may have settled on a type that the other ranks of this group (say, its EP
++group) never saw. The votes likewise turn a failure on one rank into the same
++outcome on all of them instead of leaving the others blocked in a collective.
++
++Each caller passes a callback, `make_prop(handle_type)`, that returns the
++allocation properties and size for a handle type; `allocate_mnnvl_handles`
++calls it for each type it attempts, since the handle type is part of the
++properties. `SymmDeviceMemory` sizes its buffer there, including the multicast
++granularity. `MnnvlMemory` must place the allocation in its address reservation
++before the handle type is settled, so it sizes allocations with a granularity
++that fits both handle types.
++
++## `MnnvlMemory`
++
++```python
++MnnvlMemory.initialize()
++MnnvlMemory.set_comm_from_config(mapping, MnnvlConfig(comm_backend=backend))  # optional
++memory = MnnvlMemory(mapping, size)
++workspace = memory.as_torch_strided_tensor(torch.uint8)  # [group_size, size], row i = rank i
++```
++
++The group comes from the `Mapping`, not from the constructor: the first
++allocation splits the communicator into the ranks with the same PP and CP rank,
++ordered by TP rank, i.e. the TP group, which contains the MoE EP group. The
++communicator is MPI unless `set_comm_from_config` supplies another
++`CommBackend`, and it is cached on the class, so every later allocation of the
++process uses the same group. `size` is the bytes per rank and must be equal on
++all ranks; the memory lives on the current CUDA device.
++
++`open_mnnvl_memory` checks that every rank asks for the same size, rounds it
++up to the granularity, reserves a new address range when the current one is
++full, and maps every rank's allocation at `start + i * rank_stride + offset`.
++`allocated_map` keeps a record per allocation (handles, offsets, handle type)
++and `address_refcnt` counts the allocations of each reservation.
++`fabric_handles` tells whether an allocation uses FABRIC handles.
++
++## `SymmDeviceMemory`
++
++```python
++memory = SymmDeviceMemory(
++    buf_size,                 # bytes per rank, equal on all ranks
++    group_size, group_rank,   # this rank's place in the group
++    device_idx,               # the CUDA device to allocate on
++    comm_backend,             # CommBackend of the group; MPI if None
++    enable_multicast=True,
++    allocate_signal_pads=True,
++)
++memory.get_unicast_ptr(i)     # rank i's buffer
++memory.get_multicast_ptr()    # stores reach every rank's buffer
++```
++
++Each instance names its group explicitly: `comm_backend` is the group, and
++`group_size` and `group_rank` must match its size and this rank's rank in it.
++Instances over different backends are independent.
++
++After `allocate_mnnvl_handles`, the unicast buffers are mapped back to back in
++the instance's reservation. With multicast enabled, rank 0 creates the
++multicast object with the same handle type as the unicast buffers and
++broadcasts its handle; every rank imports it, maps it and binds its own buffer
++to it. Each buffer is followed by a signal pad, zeroed by its owner, that the
++all-reduce kernels use for cross-rank flags.
++
++## Lifecycle
++
++```text
++construct (collective) ──► mapped ──► release physical memory (collective) ──► unmapped
++                             ▲                                                    │
++                             └─────── restore over a new CommBackend (collective) ─┘
++
++mapped or unmapped ──► last reference dropped (local) ──► freed
++```
++
++**Creation** is collective over the group: every rank constructs the object
++with the same size, in the same order relative to other collectives on that
++group. The memory starts uninitialized. Each rank initializes its own buffer
++(for example the all-to-all metadata, or `lamport_initialize`), and the group
++must synchronize before any peer writes into it.
++
++**Destruction** happens in `__del__`, when the last Python reference goes away.
++It is local: no collective and no device synchronization.
++
++- `MnnvlMemory` unmaps every rank's segment and releases the handles. The
++  address reservation is freed with its last allocation.
++- `SymmDeviceMemory` additionally unmaps and releases the multicast object and
++  frees its pointer arrays and reservations.
++
++CUDA frees a rank's physical memory only once every rank that imported it has
++unmapped and released it, so a peer that tears down early does not invalidate
++this rank's mappings. The owner must still make sure that no kernel uses the
++memory anymore, on this rank or on its peers. During interpreter shutdown both
++destructors skip the cleanup and leave it to process exit.
++
++**Owners** decide how long the memory lives:
++
++| Owner | Memory | Lifetime |
++|---|---|---|
++| `NVLinkOneSidedAlltoAll`, `CakeAlltoAll` | `MnnvlMemory` workspace shared by the instances of one EP group and layout, refcounted | Freed by `destroy()` of the last instance, after a device synchronization; every rank must have finished its last combine on it |
++| `NVLinkTwoSidedAlltoAll` | Two `MnnvlMemory` workspaces per EP rank and size | Kept for the process and reused by later instances |
++| All-reduce workspaces (`trtllm_ar`, `trtllm_mnnvl_ar`) | `SymmDeviceMemory` | Dropped by the workspace's `destroy()` |
++
++**Checkpoint/restore** releases the physical memory but keeps the virtual
++addresses, so CUDA graphs captured on them stay valid. Both steps are
++collective, and the restored memory is uninitialized.
++
++- `MnnvlMemory`: `unmap_mnnvl_memory` synchronizes the device, waits for every
++  rank, releases the memory and waits again; `remap_mnnvl_memory` allocates
++  over a new `CommBackend` with the same rank and size, which replaces the old
++  one. Both are in
++  [`nvlink_common.py`](../../flashinfer/moe_ep/backends/split/comm/nvlink_common.py).
++- `SymmDeviceMemory`: `_unmap_and_release_handles` synchronizes the device,
++  waits for every rank, then unbinds and releases the multicast object and the
++  unicast buffers; `_create_and_map_handles` allocates them again and rebuilds
++  the multicast object at the same addresses.
++
++The restore runs `allocate_mnnvl_handles` again, so it can settle on a
++different handle type than the original allocation. The workspaces expose
++these steps as `checkpoint_prepare` and `checkpoint_restore` (see
++[`docs/api/comm.rst`](../api/comm.rst)).
++
++## Interaction with CFT counted writes
++
++The NVLink one-sided all-to-all can bind its workspace to CUDA logical
++endpoints (CFT counted writes), which only accept memory shared through
++FABRIC handles. The workspace layout depends on whether CFT is used, so the
++backend decides before allocating, from `MnnvlMemory.uses_fabric_handles` (the
++precheck above). If the allocation then falls back to POSIX file
++descriptors, binding is skipped and the backend uses its fence path.
++
++## Comparison
++
++| | `MnnvlMemory` | `SymmDeviceMemory` |
++|---|---|---|
++| Users | MoE all-to-all workspaces (`flashinfer.moe_ep` NVLink one-sided, Cake, two-sided), `dcp_alltoall` | All-reduce workspaces (`trtllm_ar`, `McastGPUBuffer` for `trtllm_mnnvl_ar`), the SM90 push-style MegaMoE |
++| Group | Derived from a `Mapping` and cached on the class (`MnnvlMemory.get_comm`); one group and one device per process | The `CommBackend` passed to the constructor (MPI by default) |
++| Virtual addresses | One reservation per process, shared by allocations: `group_size * rank_stride` bytes, the stride a multiple of 512 MB; allocations are packed at increasing offsets and the reservation is freed when its last allocation closes | One reservation per instance: `group_size * allocation_size` bytes, rank `i` at offset `i * allocation_size` |
++| Peer `i` of an allocation at `ptr` | `ptr + i * rank_stride` | `get_unicast_ptr(i)` |
++| Multicast | No | Optional: one multicast object bound to every rank's buffer, mapped at `get_multicast_ptr()` |
++| Extras | — | A signal pad after each rank's buffer; Lamport initialization for the one-shot all-reduce |
++| Freed | Local `__del__`; the reservation with its last allocation | Local `__del__`, together with its reservations and multicast object |
++| Checkpoint/restore | `unmap_mnnvl_memory` / `remap_mnnvl_memory` | `_unmap_and_release_handles` / `_create_and_map_handles` |
+diff --git a/flashinfer/comm/mnnvl.py b/flashinfer/comm/mnnvl.py
+index 81aec3ee590419c8a4ee87cbc6947c20455759c9..ad9723b07aacd6a2bac6d3aac014c8efc0faff20 100644
+--- a/flashinfer/comm/mnnvl.py
++++ b/flashinfer/comm/mnnvl.py
+@@ -20,7 +20,7 @@ import socket
+ 
+ from dataclasses import dataclass
+ import sys
+-from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING
++from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
+ import pynvml
+ 
+ logger = logging.getLogger(__name__)
+@@ -194,6 +194,8 @@ class _MnnvlAllocationRecord:
+     start_address: int
+     rank_stride: int
+     address_offset: int
++    # CUmemAllocationHandleType the allocation is shared through.
++    handle_type: Any
+     mapped: bool = True
+ 
+ 
+@@ -235,6 +237,12 @@ class MnnvlMemory:  # type: ignore[no-redef]
+     def mapped(self) -> bool:
+         return MnnvlMemory.allocated_map[self.ptr].mapped
+ 
++    @property
++    def fabric_handles(self) -> bool:
++        """True if the allocation is shared through FABRIC handles, False for
++        POSIX file descriptors."""
++        return MnnvlMemory.allocated_map[self.ptr].handle_type == _FABRIC_HANDLE
++
+     @property
+     def local_mem_handle(self) -> int:
+         """This rank's ``CUmemGenericAllocationHandle`` backing the allocation."""
+@@ -282,75 +290,54 @@ class MnnvlMemory:  # type: ignore[no-redef]
+         MnnvlMemory.comm = comm
+         return comm
+ 
+-    _fabric_supported: bool | None = None
+-
+-    @staticmethod
+-    def _probe_fabric_supported(dev_id: int) -> bool:
+-        """Return True if this rank's GPU supports FABRIC handles and is part of a fabric cluster."""
+-        try:
+-            return is_mnnvl_fabric_supported(dev_id)
+-        except Exception:
+-            return False
+-
+     @staticmethod
+-    def _resolve_fabric_support(comm: CommBackend, dev_id: int) -> bool:
+-        """AND-reduce per-rank FABRIC support and cache the result.
+-
+-        All ranks must take the same handle-exchange path or the collective deadlocks.
++    def uses_fabric_handles(comm: CommBackend, dev_id: int) -> bool:
++        """Return True if MNNVL memory shared over ``comm`` starts with FABRIC
++        handles.
++
++        Collective over ``comm``. This is the precheck of
++        :func:`choose_mnnvl_handle_type`: a FABRIC allocation that fails on a
++        single host still falls back to POSIX file descriptors (see
++        :func:`allocate_mnnvl_handles`), so :attr:`fabric_handles` of an
++        allocation tells what it uses.
+         """
+-        if MnnvlMemory._fabric_supported is not None:
+-            return MnnvlMemory._fabric_supported
+-
+-        local_supported = MnnvlMemory._probe_fabric_supported(dev_id)
+-        agreed = all_ranks_agree(comm, local_supported)
+-
+-        if agreed != local_supported:
+-            logger.warning(
+-                "[MnnvlMemory] FABRIC support probe disagrees across ranks "
+-                f"(local={local_supported}); falling back to "
+-                f"{'FABRIC' if agreed else 'POSIX fd'} on all ranks to keep the "
+-                "handle-exchange path consistent."
+-            )
+-
+-        MnnvlMemory._fabric_supported = agreed
+-        return agreed
++        return choose_mnnvl_handle_type(comm, dev_id)[0] == _FABRIC_HANDLE
+ 
+     @staticmethod
+-    def get_allocation_prop(dev_id: int):
++    def get_allocation_prop(dev_id: int, handle_type: Any):
+         location = cuda.CUmemLocation()
+         location.type = cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+         location.id = dev_id
+         allocation_prop = cuda.CUmemAllocationProp()
+         allocation_prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+         allocation_prop.location = location
+-
+-        use_fabric = (
+-            MnnvlMemory._fabric_supported
+-            if MnnvlMemory._fabric_supported is not None
+-            else MnnvlMemory._probe_fabric_supported(dev_id)
+-        )
+-
+-        if use_fabric:
+-            allocation_prop.requestedHandleTypes = (
+-                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+-            )
+-        else:
+-            allocation_prop.requestedHandleTypes = (
+-                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+-            )
++        allocation_prop.requestedHandleTypes = handle_type
+         return allocation_prop
+ 
+     @staticmethod
+     def get_allocation_granularity(dev_id: int):
++        """Return the recommended granularity of both FABRIC and POSIX file
++        descriptor allocations, so an allocation keeps its size when it falls
++        back from one handle type to the other."""
+         if MnnvlMemory.allocation_granularity != 0:
+             return MnnvlMemory.allocation_granularity
+-        allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
+         option = cuda.CUmemAllocationGranularity_flags(
+             cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
+         )
+-        granularity = checkCudaErrors(
+-            cuda.cuMemGetAllocationGranularity(prop=allocation_prop, option=option)
+-        )
++        granularity = 1
++        for handle_type in (_FABRIC_HANDLE, _POSIX_FD_HANDLE):
++            allocation_prop = MnnvlMemory.get_allocation_prop(dev_id, handle_type)
++            try:
++                handle_granularity = checkCudaErrors(
++                    cuda.cuMemGetAllocationGranularity(
++                        prop=allocation_prop, option=option
++                    )
++                )
++            except RuntimeError:
++                # The driver does not support this handle type.
++                continue
++            # Granularities are powers of two, so the larger is a multiple of both.
++            granularity = max(granularity, handle_granularity)
+         MnnvlMemory.allocation_granularity = granularity
+         return MnnvlMemory.allocation_granularity
+ 
+@@ -361,93 +348,34 @@ class MnnvlMemory:  # type: ignore[no-redef]
+         start_address: int,
+         rank_stride: int,
+         address_offset: int,
+-    ) -> List[Any]:
++    ) -> Tuple[List[Any], Any]:
++        """Back and map every rank's segment; return the handles and their type.
++
++        Collective over ``comm``.
++        """
+         dev = checkCudaErrors(cuda.cuCtxGetDevice())
+         dev_id = int(dev)
+         assert dev_id == MnnvlMemory.dev_id, (
+             f"Different dev_id found dev_id={dev_id} but "
+             f"MnnvlMemory.dev_id={MnnvlMemory.dev_id}"
+         )
+-        comm_rank = comm.Get_rank()
+-        comm_size = comm.Get_size()
+-        allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
+-        allocated_mem_handle = checkCudaErrors(
+-            cuda.cuMemCreate(aligned_size, allocation_prop, flags=0)
+-        )
+-        exported_fabric_handle = checkCudaErrors(
+-            cuda.cuMemExportToShareableHandle(
+-                allocated_mem_handle, allocation_prop.requestedHandleTypes, 0
+-            )
++        mem_handles, handle_type = allocate_mnnvl_handles(
++            comm,
++            dev_id,
++            lambda handle_type: (
++                MnnvlMemory.get_allocation_prop(dev_id, handle_type),
++                aligned_size,
++            ),
+         )
+-        if (
+-            allocation_prop.requestedHandleTypes
+-            == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+-        ):
+-            # tuple (FABRIC) here, list[int] (POSIX fds) below -- widen to Sequence.
+-            all_handles_data: Sequence[Any] = comm.allgather(
+-                exported_fabric_handle.data
+-            )
+-        else:
+-            # The exchange returns our own exported_fd (not a dup) at our rank's
+-            # slot; the mapping loop's finally closes it along with received fds.
+-            exported_fd = int(exported_fabric_handle)
+-            try:
+-                local_host = socket.gethostname()
+-                all_hosts = comm.allgather(local_host)
+-                if len(set(all_hosts)) != 1:
+-                    raise RuntimeError(
+-                        "[MnnvlMemory] POSIX fd exchange via SCM_RIGHTS requires all "
+-                        "ranks to share the same host, but got differing hostnames: "
+-                        f"{all_hosts}. Multi-node MNNVL requires a fabric-capable GPU "
+-                        "setup (CU_MEM_HANDLE_TYPE_FABRIC)."
+-                    )
+-                all_handles_data = exchange_fds(comm, exported_fd)
+-            except BaseException:
+-                os.close(exported_fd)
+-                raise
+-        # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
+-        # can use buf = memoryview(data) to import if using plain buffer for data.
+ 
+         madesc = cuda.CUmemAccessDesc()
+-        madesc.location = allocation_prop.location
++        madesc.location = MnnvlMemory.get_allocation_prop(dev_id, handle_type).location
+         madesc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+-
+-        mem_handles = [None] * comm_size
+-        try:
+-            for i, remote_handle_data in enumerate(all_handles_data):
+-                rank_ptr = start_address + rank_stride * i + address_offset
+-                if i == comm_rank:
+-                    # Local memory mapping
+-                    mem_handles[i] = allocated_mem_handle
+-                    checkCudaErrors(
+-                        cuda.cuMemMap(
+-                            rank_ptr, aligned_size, 0, allocated_mem_handle, 0
+-                        )
+-                    )
+-                else:
+-                    # Fabric memory mapping
+-                    imported_mem_handle = checkCudaErrors(
+-                        cuda.cuMemImportFromShareableHandle(
+-                            remote_handle_data, allocation_prop.requestedHandleTypes
+-                        )
+-                    )
+-                    mem_handles[i] = imported_mem_handle
+-                    checkCudaErrors(
+-                        cuda.cuMemMap(rank_ptr, aligned_size, 0, imported_mem_handle, 0)
+-                    )
+-
+-                checkCudaErrors(
+-                    cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1)
+-                )
+-        finally:
+-            if (
+-                allocation_prop.requestedHandleTypes
+-                == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+-            ):
+-                for shareable_fd in all_handles_data:
+-                    os.close(int(shareable_fd))
+-
+-        return mem_handles
++        for i, mem_handle in enumerate(mem_handles):
++            rank_ptr = start_address + rank_stride * i + address_offset
++            checkCudaErrors(cuda.cuMemMap(rank_ptr, aligned_size, 0, mem_handle, 0))
++            checkCudaErrors(cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1))
++        return mem_handles, handle_type
+ 
+     @staticmethod
+     def new_mnnvl_memory_address(mapping: Mapping, size: int):
+@@ -485,7 +413,6 @@ class MnnvlMemory:  # type: ignore[no-redef]
+         assert all(x == size for x in all_rank_allocate_sizes), (
+             "Not all rank allocating same size."
+         )
+-        MnnvlMemory._resolve_fabric_support(comm, dev_id)
+         granularity = MnnvlMemory.get_allocation_granularity(dev_id)
+         aligned_size = (size + granularity - 1) // granularity * granularity
+ 
+@@ -500,7 +427,7 @@ class MnnvlMemory:  # type: ignore[no-redef]
+             <= MnnvlMemory.current_rank_stride
+         )
+ 
+-        mem_handles = MnnvlMemory._create_and_map_handles(
++        mem_handles, handle_type = MnnvlMemory._create_and_map_handles(
+             comm,
+             aligned_size,
+             MnnvlMemory.current_start_address,
+@@ -518,6 +445,7 @@ class MnnvlMemory:  # type: ignore[no-redef]
+             start_address=MnnvlMemory.current_start_address,
+             rank_stride=MnnvlMemory.current_rank_stride,
+             address_offset=MnnvlMemory.current_mem_offset,
++            handle_type=handle_type,
+         )
+         MnnvlMemory.address_refcnt[MnnvlMemory.current_start_address] = (
+             MnnvlMemory.address_refcnt.get(MnnvlMemory.current_start_address, 0) + 1
+@@ -676,6 +604,212 @@ def all_ranks_support_mnnvl(
+     return all_ranks_agree(comm, local_supported)
+ 
+ 
++_FABRIC_HANDLE = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
++_POSIX_FD_HANDLE = (
++    cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
++)
++_IMEX_HINT = (
++    "FABRIC handles need IMEX channel 0 (/dev/nvidia-caps-imex-channels/channel0; pass it "
++    "into containers with --device or NVIDIA_IMEX_CHANNELS=0) and, across hosts, the "
++    "nvidia-imex service on every node of the NVLink domain."
++)
++
++
++# Warn about a FABRIC fallback once per process; later fallbacks log at debug level.
++_fabric_fallback_warned = False
++
++
++def _local_fabric_status(dev_id: int) -> Tuple[Optional[str], bytes]:
++    """Return why this GPU cannot use FABRIC handles (``None`` if it can) and
++    its NVML fabric cluster UUID (empty unless the fabric state is completed)."""
++    try:
++        supported = checkCudaErrors(
++            cuda.cuDeviceGetAttribute(
++                cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
++                dev_id,
++            )
++        )
++    except RuntimeError as exc:
++        return f"querying the FABRIC handle attribute failed: {exc}", b""
++    if not supported:
++        return "the driver does not support FABRIC handles", b""
++    try:
++        pynvml.nvmlInit()
++        try:
++            handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
++            fabric_info = pynvml.c_nvmlGpuFabricInfoV_t()
++            pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(fabric_info))
++        finally:
++            pynvml.nvmlShutdown()
++    except pynvml.NVMLError:
++        return None, b""
++    if fabric_info.state < pynvml.NVML_GPU_FABRIC_STATE_COMPLETED:
++        return None, b""
++    return None, bytes(fabric_info.clusterUuid)
++
++
++def choose_mnnvl_handle_type(comm: CommBackend, dev_id: int) -> Tuple[Any, bool]:
++    """Choose FABRIC handles or POSIX file descriptors for MNNVL memory shared
++    over ``comm``; return the handle type and whether the group is on a single
++    host.
++
++    Collective over ``comm``; every rank gets the same answer, which depends
++    only on what the ranks report now. On one host, FABRIC is chosen when
++    every GPU reports FABRIC support and POSIX file descriptors otherwise.
++    Across hosts, every GPU must support FABRIC handles and report the same
++    non-zero NVML fabric cluster UUID; otherwise this raises with each rank's
++    reason, since file descriptors cannot cross hosts.
++    """
++    reason, cluster_uuid = _local_fabric_status(dev_id)
++    status = comm.allgather((socket.gethostname(), reason, cluster_uuid))
++    if len({host for host, _, _ in status}) == 1:
++        if all(reason is None for _, reason, _ in status):
++            return _FABRIC_HANDLE, True
++        return _POSIX_FD_HANDLE, True
++    problems = []
++    for rank, (host, reason, uuid) in enumerate(status):
++        if reason is not None:
++            problems.append(f"rank {rank} on {host}: {reason}")
++        elif not any(uuid):
++            problems.append(
++                f"rank {rank} on {host}: the GPU is not in a completed NVLink "
++                "fabric cluster (NVML clusterUuid unset)"
++            )
++    if not problems and len({uuid for _, _, uuid in status}) > 1:
++        problems = [
++            f"rank {rank} on {host}: NVLink fabric cluster {uuid.hex()}"
++            for rank, (host, _, uuid) in enumerate(status)
++        ]
++        problems.insert(0, "the ranks are in different NVLink domains")
++    if problems:
++        raise RuntimeError(
++            "[MNNVL] memory shared across hosts needs FABRIC handles within one "
++            "NVLink domain:\n  " + "\n  ".join(problems) + "\n" + _IMEX_HINT
++        )
++    return _FABRIC_HANDLE, False
++
++
++def _create_and_import_handles(
++    comm: CommBackend, prop: Any, size: int
++) -> Tuple[Optional[List[Any]], List[Optional[str]]]:
++    """Make one attempt to back ``size`` bytes on every rank and import every
++    peer's allocation.
++
++    Collective over ``comm``. Returns the per-rank allocation handles (this
++    rank's own at its index) and each rank's error, which is ``None`` on
++    success. When any rank fails, the handles are ``None`` and everything this
++    rank created or imported is released, so the caller can retry.
++    """
++    rank, size_of_group = comm.Get_rank(), comm.Get_size()
++    handle_type = prop.requestedHandleTypes
++    local_handle = None
++    exported = None
++    error = None
++    try:
++        local_handle = checkCudaErrors(cuda.cuMemCreate(size, prop, 0))
++        exported = checkCudaErrors(
++            cuda.cuMemExportToShareableHandle(local_handle, handle_type, 0)
++        )
++    except RuntimeError as exc:
++        error = f"creating or exporting the allocation failed: {exc}"
++    errors = list(comm.allgather(error))
++    if any(errors):
++        if exported is not None and handle_type == _POSIX_FD_HANDLE:
++            os.close(int(exported))
++        if local_handle is not None:
++            checkCudaErrors(cuda.cuMemRelease(local_handle))
++        return None, errors
++
++    if handle_type == _FABRIC_HANDLE:
++        shareable: Sequence[Any] = comm.allgather(exported.data)
++    else:
++        # The exchange returns this rank's own fd (not a dup) at its index, so
++        # closing every returned fd below closes it exactly once.
++        try:
++            shareable = exchange_fds(comm, int(exported))
++        except BaseException:
++            os.close(int(exported))
++            checkCudaErrors(cuda.cuMemRelease(local_handle))
++            raise
++    handles: List[Any] = [None] * size_of_group
++    handles[rank] = local_handle
++    error = None
++    try:
++        for peer in range(size_of_group):
++            if peer != rank:
++                try:
++                    handles[peer] = checkCudaErrors(
++                        cuda.cuMemImportFromShareableHandle(
++                            shareable[peer], handle_type
++                        )
++                    )
++                except RuntimeError as exc:
++                    error = f"importing the allocation of rank {peer} failed: {exc}"
++                    break
++    finally:
++        if handle_type == _POSIX_FD_HANDLE:
++            for fd in shareable:
++                os.close(int(fd))
++    errors = list(comm.allgather(error))
++    if any(errors):
++        for handle in handles:
++            if handle is not None:
++                checkCudaErrors(cuda.cuMemRelease(handle))
++        return None, errors
++    return handles, errors
++
++
++def _format_rank_errors(errors: Sequence[Optional[str]]) -> str:
++    return "\n".join(
++        f"  rank {rank}: {error}" for rank, error in enumerate(errors) if error
++    )
++
++
++def allocate_mnnvl_handles(
++    comm: CommBackend,
++    dev_id: int,
++    make_prop: Callable[[Any], Tuple[Any, int]],
++) -> Tuple[List[Any], Any]:
++    """Back MNNVL memory on every rank and import every peer's allocation.
++
++    ``make_prop(handle_type)`` returns the ``CUmemAllocationProp`` and the size
++    to allocate with that handle type. Collective over ``comm``. Returns the
++    per-rank allocation handles (this rank's own at its index) and the handle
++    type used: the one :func:`choose_mnnvl_handle_type` picks or, when FABRIC
++    handles fail on a single host (e.g. without an IMEX channel), POSIX file
++    descriptors. Each call decides on its own, so every allocation over a host
++    without usable FABRIC handles tries them first.
++    """
++    global _fabric_fallback_warned
++    handle_type, single_host = choose_mnnvl_handle_type(comm, dev_id)
++    prop, size = make_prop(handle_type)
++    handles, errors = _create_and_import_handles(comm, prop, size)
++    if handles is not None:
++        return handles, handle_type
++    failure = _format_rank_errors(errors)
++    if handle_type == _FABRIC_HANDLE and single_host:
++        log = logger.debug if _fabric_fallback_warned else logger.warning
++        _fabric_fallback_warned = True
++        log(
++            "[MNNVL] FABRIC handles failed on this host; using POSIX file "
++            "descriptors instead:\n%s\n%s",
++            failure,
++            _IMEX_HINT,
++        )
++        handle_type = _POSIX_FD_HANDLE
++        prop, size = make_prop(handle_type)
++        handles, errors = _create_and_import_handles(comm, prop, size)
++        if handles is not None:
++            return handles, handle_type
++        failure = _format_rank_errors(errors)
++    kind = "FABRIC" if handle_type == _FABRIC_HANDLE else "POSIX file descriptor"
++    hint = "\n" + _IMEX_HINT if handle_type == _FABRIC_HANDLE else ""
++    raise RuntimeError(
++        f"[MNNVL] allocating memory shared through {kind} handles failed:\n"
++        f"{failure}{hint}"
++    )
++
++
+ @dataclass(frozen=True)
+ class HandleExchanger:
+     """Exchanges CUDA shareable memory handles across ranks.
+@@ -691,19 +825,6 @@ class HandleExchanger:
+     handle_type: "cuda.CUmemAllocationHandleType"
+ 
+ 
+-def make_handle_exchanger(
+-    comm: CommBackend, rank: int, size: int, dev_id: int
+-) -> HandleExchanger:
+-    """Pick FABRIC vs POSIX-fd handles based on the device's fabric support."""
+-    if is_mnnvl_fabric_supported(dev_id):
+-        handle_type = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+-    else:
+-        handle_type = (
+-            cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+-        )
+-    return HandleExchanger(comm=comm, rank=rank, size=size, handle_type=handle_type)
+-
+-
+ def _handle_is_fabric(ex: HandleExchanger) -> bool:
+     return ex.handle_type == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+ 
+@@ -946,18 +1067,29 @@ class SymmDeviceMemory:
+ 
+     def _create_and_map_handles(self, comm: CommBackend) -> None:
+         """Create physical backing and map it at the reserved addresses."""
+-        # Create handle exchanger
+-        self._exchanger = make_handle_exchanger(
+-            comm, self.group_rank, self.group_size, self.device_idx
+-        )
+-
+         self._verify_cuda_context()
+ 
+-        # Compute allocation size and get allocation properties
+-        allocation_prop, mc_prop = self._get_allocation_prop(self.buf_size)
++        # Allocate and exchange the unicast buffers; this settles the handle
++        # type, which the multicast object then shares.
++        mc_props: Dict[Any, Any] = {}
++
++        def make_prop(handle_type):
++            allocation_prop, mc_props[handle_type] = self._get_allocation_prop(
++                self.buf_size, handle_type
++            )
++            return allocation_prop, self.allocation_size
+ 
+-        # Allocate, exchange, and map unicast buffers
+-        self._allocate_unicast_buffers(allocation_prop)
++        self.uc_handles, handle_type = allocate_mnnvl_handles(
++            comm, self.device_idx, make_prop
++        )
++        self._exchanger = HandleExchanger(
++            comm=comm,
++            rank=self.group_rank,
++            size=self.group_size,
++            handle_type=handle_type,
++        )
++        mc_prop = mc_props[handle_type]
++        self._map_unicast_buffers()
+ 
+         # Setup multicast object, exchange handles, map and bind memory
+         if self._enable_multicast:
+@@ -1007,10 +1139,10 @@ class SymmDeviceMemory:
+         except Exception as e:
+             logger.warning("Error checking CUDA context: %s", e)
+ 
+-    def _get_allocation_prop(self, buf_size: int):
++    def _get_allocation_prop(self, buf_size: int, handle_type: Any):
+         """Compute allocation size and return allocation/multicast properties."""
+         allocation_prop = cuda.CUmemAllocationProp()
+-        allocation_prop.requestedHandleTypes = self._exchanger.handle_type
++        allocation_prop.requestedHandleTypes = handle_type
+         allocation_prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+         allocation_prop.location = cuda.CUmemLocation()
+         allocation_prop.location.type = (
+@@ -1038,7 +1170,7 @@ class SymmDeviceMemory:
+             mc_prop = cuda.CUmulticastObjectProp()
+             mc_prop.numDevices = self.group_size
+             mc_prop.size = self.allocation_size
+-            mc_prop.handleTypes = self._exchanger.handle_type
++            mc_prop.handleTypes = handle_type
+ 
+             # Get multicast granularity and adjust allocation size
+             self._mc_granularity = checkCudaErrors(
+@@ -1051,44 +1183,8 @@ class SymmDeviceMemory:
+ 
+         return allocation_prop, mc_prop
+ 
+-    def _allocate_unicast_buffers(self, allocation_prop):
+-        """Allocate local UC memory, exchange handles with peers, and map memory."""
+-        # Initialize UC handles list
+-        self.uc_handles = [0] * self.group_size
+-
+-        # Allocate local GPU memory
+-        self.uc_handles[self.group_rank] = checkCudaErrors(
+-            cuda.cuMemCreate(self.allocation_size, allocation_prop, 0)
+-        )
+-
+-        # Export local handle to shareable handle
+-        local_shareable_uc_handle = checkCudaErrors(
+-            cuda.cuMemExportToShareableHandle(
+-                self.uc_handles[self.group_rank],
+-                self._exchanger.handle_type,
+-                0,
+-            )
+-        )
+-
+-        # All-gather shareable handles. For POSIX fds, entry[group_rank] is our
+-        # own local_shareable_uc_handle (not a dup), so the cleanup loop below
+-        # closes it exactly once — no separate cleanup of local_shareable_uc_handle.
+-        all_shareable_uc_handles = handle_allgather(
+-            self._exchanger, local_shareable_uc_handle
+-        )
+-        cuda.cuCtxSynchronize()
+-
+-        # Import remote handles
+-        for p in range(self.group_size):
+-            if p != self.group_rank:
+-                self.uc_handles[p] = checkCudaErrors(
+-                    cuda.cuMemImportFromShareableHandle(
+-                        all_shareable_uc_handles[p],
+-                        self._exchanger.handle_type,
+-                    )
+-                )
+-            handle_cleanup(self._exchanger, all_shareable_uc_handles[p])
+-
++    def _map_unicast_buffers(self):
++        """Map every rank's unicast buffer at the reserved addresses."""
+         # Reserve address space for UC pointers
+         if not self.uc_ptrs:
+             self.uc_ptrs = [0] * self.group_size
+diff --git a/flashinfer/moe_ep/backends/split/comm/nvlink_common.py b/flashinfer/moe_ep/backends/split/comm/nvlink_common.py
+index 36a1b4913e7101837db1f8cbbb11e9f23349eac5..05666df0b5330954ae2593708bf2e38cc465fc9b 100644
+--- a/flashinfer/moe_ep/backends/split/comm/nvlink_common.py
++++ b/flashinfer/moe_ep/backends/split/comm/nvlink_common.py
+@@ -154,7 +154,7 @@ def remap_mnnvl_memory(memory: "MnnvlMemory", comm_backend: "CommBackend") -> bo
+             f"{record.comm_rank}/{record.comm_size}"
+         )
+     torch.cuda.synchronize()
+-    record.mem_handles = MnnvlMemory._create_and_map_handles(
++    record.mem_handles, record.handle_type = MnnvlMemory._create_and_map_handles(
+         comm_backend,
+         record.aligned_size,
+         record.start_address,
+diff --git a/flashinfer/moe_ep/backends/split/comm/nvlink_one_sided/communication.py b/flashinfer/moe_ep/backends/split/comm/nvlink_one_sided/communication.py
+index dfd236e4e936e8d84912b08ca52fff89fdff09fd..05b9b7d3a8ba91336bd8f5803145f06c0f43b79d 100644
+--- a/flashinfer/moe_ep/backends/split/comm/nvlink_one_sided/communication.py
++++ b/flashinfer/moe_ep/backends/split/comm/nvlink_one_sided/communication.py
+@@ -69,12 +69,16 @@ def _driver_branch() -> Optional[int]:
+     return int(match.group(1)) if match else None
+ 
+ 
+-def _cft_unsupported_reason(device_index: int) -> Optional[str]:
++def _cft_unsupported_reason(device_index: int, fabric_handles: bool) -> Optional[str]:
+     """Why this rank cannot use CFT counted writes, or ``None`` if it can.
+ 
+-    Never raises: every rank must reach the collective CFT agreement, and a
+-    rank whose probe fails falls back to the fence path with the others.
++    ``fabric_handles`` tells whether the workspace will be shared through
++    FABRIC handles; logical endpoints can only bind such memory. Never raises:
++    every rank must reach the collective CFT agreement, and a rank whose probe
++    fails falls back to the fence path with the others.
+     """
++    if not fabric_handles:
++        return "the workspace is not shared through FABRIC handles"
+     try:
+         return _probe_cft_support(device_index)
+     except Exception as exc:  # NVML, CUDA driver or cuda-python errors alike
+@@ -84,7 +88,7 @@ def _cft_unsupported_reason(device_index: int) -> Optional[str]:
+ def _probe_cft_support(device_index: int) -> Optional[str]:
+     import torch
+ 
+-    from ......comm.mnnvl import cuda, is_mnnvl_fabric_supported
++    from ......comm.mnnvl import cuda
+ 
+     major, minor = torch.cuda.get_device_capability(device_index)
+     if major < 10:
+@@ -95,8 +99,6 @@ def _probe_cft_support(device_index: int) -> Optional[str]:
+     if branch < _CFT_MIN_DRIVER_BRANCH:
+         return f"driver branch {branch} is older than {_CFT_MIN_DRIVER_BRANCH}"
+     try:
+-        if not is_mnnvl_fabric_supported(device_index):
+-            return "the workspace cannot be allocated with fabric handles"
+         attributes = (
+             cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_UNICAST_SUPPORTED,
+             cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_COUNTED_OPS_SUPPORTED,
+@@ -185,10 +187,12 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
+         )
+ 
+         # Every rank must agree on CFT: it changes the workspace layout and
+-        # the endpoint exchange is collective.
++        # the endpoint exchange is collective. The handle type is the one the
++        # workspace allocation will start with; _bind_cft checks the one it ends with.
+         reason = None
+         if config.cft is not False:
+-            reason = _cft_unsupported_reason(device.index)
++            fabric_handles = MnnvlMemory.uses_fabric_handles(comm, device.index)
++            reason = _cft_unsupported_reason(device.index, fabric_handles)
+         cft_capable = all_ranks_agree(comm, config.cft is not False and reason is None)
+         if config.cft is not False and not cft_capable:
+             log = logger.warning if config.cft else logger.info
+@@ -292,6 +296,12 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
+         Collective over the EP group; every rank returns the same result.
+         """
+         cls = type(self)
++        if not mnnvl_mem.fabric_handles:
++            logger.warning(
++                "NVLink one-sided CFT counted writes disabled: the workspace fell "
++                "back to POSIX file descriptors"
++            )
++            return False
+         if cls._CFT_WORKSPACE_KEY is not None:
+             logger.info(
+                 "NVLink one-sided CFT counted writes are bound to another workspace "
+diff --git a/tests/comm/test_mnnvl_handle_type.py b/tests/comm/test_mnnvl_handle_type.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..af146cff75a944960a4c5918010446f884463f13
+--- /dev/null
++++ b/tests/comm/test_mnnvl_handle_type.py
+@@ -0,0 +1,297 @@
++# Copyright (c) 2026 by FlashInfer team.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Handle-type choice and allocation fallback of MNNVL memory, on one process.
++
++``_GroupComm`` stands in for a communicator of several ranks: ``allgather``
++returns this rank's value at its own index and the other ranks' values from a
++script, so collective decisions can be checked without launching ranks.
++"""
++
++import logging
++from types import SimpleNamespace
++
++import pytest
++
++from flashinfer.comm import mnnvl
++
++FABRIC = mnnvl._FABRIC_HANDLE
++POSIX = mnnvl._POSIX_FD_HANDLE
++CLUSTER = bytes(range(1, 17))
++OTHER_CLUSTER = bytes(range(2, 18))
++
++
++class _GroupComm:
++    def __init__(self, rank, peers):
++        # peers(local_value) -> the values of every rank, in rank order.
++        self.rank = rank
++        self.peers = peers
++        self.gathered = []
++
++    def Get_rank(self):
++        return self.rank
++
++    def Get_size(self):
++        return len(self.peers(None))
++
++    def allgather(self, value):
++        values = list(self.peers(value))
++        values[self.rank] = value
++        self.gathered.append(values)
++        return values
++
++
++def _status_comm(statuses):
++    """A rank-0 communicator whose peers report ``statuses`` (host, reason, uuid)."""
++    return _GroupComm(0, lambda value: list(statuses))
++
++
++@pytest.fixture(autouse=True)
++def _one_host(monkeypatch):
++    monkeypatch.setattr(mnnvl.socket, "gethostname", lambda: "node0")
++    monkeypatch.setattr(mnnvl, "_fabric_fallback_warned", False)
++
++
++def _local_status(monkeypatch, reason=None, uuid=CLUSTER):
++    monkeypatch.setattr(mnnvl, "_local_fabric_status", lambda dev_id: (reason, uuid))
++
++
++def test_single_host_prefers_fabric(monkeypatch):
++    _local_status(monkeypatch)
++    comm = _status_comm([("node0", None, b""), ("node0", None, b"")])
++    assert mnnvl.choose_mnnvl_handle_type(comm, 0) == (FABRIC, True)
++
++
++def test_single_host_uses_posix_when_any_rank_lacks_fabric(monkeypatch):
++    _local_status(monkeypatch)
++    comm = _status_comm(
++        [("node0", None, b""), ("node0", "the driver does not support FABRIC", b"")]
++    )
++    assert mnnvl.choose_mnnvl_handle_type(comm, 0) == (POSIX, True)
++
++
++def test_multi_host_needs_one_fabric_cluster(monkeypatch):
++    _local_status(monkeypatch)
++    comm = _status_comm([("node0", None, CLUSTER), ("node1", None, CLUSTER)])
++    assert mnnvl.choose_mnnvl_handle_type(comm, 0) == (FABRIC, False)
++
++
++@pytest.mark.parametrize(
++    ("peer", "message"),
++    [
++        (("node1", "the driver does not support FABRIC handles", b""), "rank 1"),
++        (("node1", None, bytes(16)), "clusterUuid unset"),
++        (("node1", None, OTHER_CLUSTER), "different NVLink domains"),
++    ],
++)
++def test_multi_host_rejects_ranks_outside_the_cluster(monkeypatch, peer, message):
++    _local_status(monkeypatch)
++    comm = _status_comm([("node0", None, CLUSTER), peer])
++    with pytest.raises(RuntimeError, match=message) as error:
++        mnnvl.choose_mnnvl_handle_type(comm, 0)
++    assert "IMEX" in str(error.value)
++
++
++def _attempts(monkeypatch, results):
++    """Script _create_and_import_handles: one (handles, errors) per attempt."""
++    attempts = []
++
++    def attempt(comm, prop, size):
++        attempts.append(prop)
++        return results[len(attempts) - 1]
++
++    monkeypatch.setattr(mnnvl, "_create_and_import_handles", attempt)
++    return attempts
++
++
++def _choose(monkeypatch, handle_type, single_host):
++    monkeypatch.setattr(
++        mnnvl,
++        "choose_mnnvl_handle_type",
++        lambda comm, dev_id: (handle_type, single_host),
++    )
++
++
++_FABRIC_FAILS = (
++    None,
++    [None, "creating or exporting the allocation failed: NOT_PERMITTED"],
++)
++_SUCCEEDS = (["h0", "h1"], [None, None])
++
++
++def _allocate():
++    return mnnvl.allocate_mnnvl_handles(None, 0, lambda handle_type: (handle_type, 64))
++
++
++def test_allocation_uses_the_chosen_type(monkeypatch):
++    _choose(monkeypatch, FABRIC, single_host=True)
++    attempts = _attempts(monkeypatch, [_SUCCEEDS])
++    assert _allocate() == (["h0", "h1"], FABRIC)
++    assert attempts == [FABRIC]
++
++
++def test_single_host_falls_back_to_posix_on_every_allocation(monkeypatch, caplog):
++    # Nothing is remembered between allocations, so ranks that allocate over
++    # different groups always decide alike; each allocation tries FABRIC again.
++    caplog.set_level(logging.DEBUG, logger=mnnvl.logger.name)
++    _choose(monkeypatch, FABRIC, single_host=True)
++    attempts = _attempts(monkeypatch, [_FABRIC_FAILS, _SUCCEEDS] * 2)
++    assert _allocate() == (["h0", "h1"], POSIX)
++    assert _allocate() == (["h0", "h1"], POSIX)
++    assert attempts == [FABRIC, POSIX, FABRIC, POSIX]
++    levels = [r.levelno for r in caplog.records if "rank 1: creating" in r.message]
++    assert levels == [logging.WARNING, logging.DEBUG]
++
++
++@pytest.mark.parametrize(
++    ("handle_type", "single_host"), [(FABRIC, False), (POSIX, True)]
++)
++def test_multi_host_or_posix_allocations_do_not_fall_back(
++    monkeypatch, handle_type, single_host
++):
++    _choose(monkeypatch, handle_type, single_host)
++    attempts = _attempts(monkeypatch, [(None, ["importing failed", None])])
++    with pytest.raises(RuntimeError, match="rank 0: importing failed") as error:
++        _allocate()
++    assert attempts == [handle_type]
++    assert ("IMEX" in str(error.value)) == (handle_type == FABRIC)
++
++
++class _FakeDriver:
++    """The cuda-python calls _create_and_import_handles makes, with failures on demand."""
++
++    def __init__(self, fail_create=False, fail_import=False):
++        self.fail_create = fail_create
++        self.fail_import = fail_import
++        self.released = []
++        self.next_handle = 100
++
++    @staticmethod
++    def _ok(value):
++        return (SimpleNamespace(value=0), value)
++
++    @staticmethod
++    def _error():
++        return (SimpleNamespace(value=1),)
++
++    def cuMemCreate(self, size, prop, flags):
++        if self.fail_create:
++            return self._error()
++        self.next_handle += 1
++        return self._ok(self.next_handle)
++
++    def cuMemExportToShareableHandle(self, handle, handle_type, flags):
++        if handle_type == POSIX:
++            return self._ok(handle + 1000)
++        return self._ok(SimpleNamespace(data=f"export-{handle}".encode()))
++
++    def cuMemImportFromShareableHandle(self, data, handle_type):
++        if self.fail_import:
++            return self._error()
++        self.next_handle += 1
++        return self._ok(self.next_handle)
++
++    def cuMemRelease(self, handle):
++        self.released.append(handle)
++        return (SimpleNamespace(value=0),)
++
++
++@pytest.fixture
++def fake_driver(monkeypatch):
++    def install(**failures):
++        driver = _FakeDriver(**failures)
++        monkeypatch.setattr(mnnvl, "cuda", driver)
++        monkeypatch.setattr(mnnvl, "checkCudaErrors", _check)
++        return driver
++
++    return install
++
++
++def _check(result):
++    if result[0].value:
++        raise RuntimeError("CUDA error")
++    return result[1] if len(result) == 2 else None
++
++
++def _two_rank_comm(peer_error=None):
++    # The peer exports its own data and reports peer_error in every vote.
++    def peers(value):
++        if isinstance(value, bytes):
++            return [value, b"export-peer"]
++        return [value, peer_error]
++
++    return _GroupComm(0, peers)
++
++
++def test_attempt_imports_every_peer(fake_driver):
++    driver = fake_driver()
++    prop = SimpleNamespace(requestedHandleTypes=FABRIC)
++    handles, errors = mnnvl._create_and_import_handles(_two_rank_comm(), prop, 64)
++    assert handles == [101, 102] and errors == [None, None]
++    assert driver.released == []
++
++
++def test_attempt_releases_its_allocation_when_a_peer_fails(fake_driver):
++    driver = fake_driver()
++    prop = SimpleNamespace(requestedHandleTypes=FABRIC)
++    handles, errors = mnnvl._create_and_import_handles(
++        _two_rank_comm(peer_error="creating failed"), prop, 64
++    )
++    assert handles is None and errors == [None, "creating failed"]
++    assert driver.released == [101]
++
++
++def test_attempt_votes_on_a_local_import_failure(fake_driver):
++    driver = fake_driver(fail_import=True)
++    prop = SimpleNamespace(requestedHandleTypes=FABRIC)
++    handles, errors = mnnvl._create_and_import_handles(_two_rank_comm(), prop, 64)
++    assert handles is None and "importing the allocation of rank 1" in errors[0]
++    assert driver.released == [101]
++
++
++def test_attempt_releases_its_allocation_when_the_fd_exchange_fails(
++    fake_driver, monkeypatch
++):
++    driver = fake_driver()
++    closed = []
++    monkeypatch.setattr(mnnvl, "os", SimpleNamespace(close=closed.append))
++
++    def exchange_fds(comm, fd):
++        raise ConnectionError("peer went away")
++
++    monkeypatch.setattr(mnnvl, "exchange_fds", exchange_fds)
++    prop = SimpleNamespace(requestedHandleTypes=POSIX)
++    with pytest.raises(ConnectionError):
++        mnnvl._create_and_import_handles(_two_rank_comm(), prop, 64)
++    assert driver.released == [101] and closed == [1101]
++
++
++@pytest.mark.parametrize(
++    ("granularities", "expected"),
++    [
++        ({FABRIC: 1 << 21, POSIX: 1 << 21}, 1 << 21),
++        ({FABRIC: 1 << 22, POSIX: 1 << 21}, 1 << 22),
++        ({POSIX: 1 << 21}, 1 << 21),
++    ],
++)
++def test_granularity_fits_both_handle_types(monkeypatch, granularities, expected):
++    # A type missing from ``granularities`` is one the driver rejects.
++    def granularity(prop, option):
++        if prop.requestedHandleTypes in granularities:
++            return (SimpleNamespace(value=0), granularities[prop.requestedHandleTypes])
++        return (SimpleNamespace(value=1),)
++
++    monkeypatch.setattr(mnnvl, "checkCudaErrors", _check)
++    monkeypatch.setattr(mnnvl.cuda, "cuMemGetAllocationGranularity", granularity)
++    monkeypatch.setattr(mnnvl.MnnvlMemory, "allocation_granularity", 0)
++    assert mnnvl.MnnvlMemory.get_allocation_granularity(0) == expected
+diff --git a/tests/moe_ep/test_communication.py b/tests/moe_ep/test_communication.py
+index fcce30accc1f17a714d5dd74afa4b5aafb91db5c..3df92af6a376d48ab2356a4364fcf60d69693a69 100644
+--- a/tests/moe_ep/test_communication.py
++++ b/tests/moe_ep/test_communication.py
+@@ -570,7 +570,7 @@ def fake_one_sided(monkeypatch):
+     )
+ 
+     module = _FakeOneSidedModule()
+-    probe: dict = {"reason": None, "probed": 0}
++    probe: dict = {"reason": None, "probed": 0, "fabric_handles": True}
+ 
+     def acquire(self, mapping, comm, metainfo, cft_capable):
+         return {
+@@ -583,8 +583,10 @@ def fake_one_sided(monkeypatch):
+             "cft_ready": cft_capable,
+         }
+ 
+-    def unsupported_reason(device_index):
++    def unsupported_reason(device_index, fabric_handles):
+         probe["probed"] += 1
++        if not fabric_handles:
++            return "the workspace is not shared through FABRIC handles"
+         return probe["reason"]
+ 
+     monkeypatch.setattr(one_sided, "get_nvlink_one_sided_module", lambda: module)
+@@ -619,6 +621,11 @@ def fake_one_sided(monkeypatch):
+         mnnvl.MnnvlMemory, "get_comm", staticmethod(lambda mapping: None)
+     )
+     monkeypatch.setattr(mnnvl, "all_ranks_agree", lambda comm, local: local)
++    monkeypatch.setattr(
++        mnnvl.MnnvlMemory,
++        "uses_fabric_handles",
++        staticmethod(lambda comm, dev_id: probe["fabric_handles"]),
++    )
+     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+     monkeypatch.setattr(flashinfer.utils, "device_support_pdl", lambda device: True)
+     return SimpleNamespace(module=module, probe=probe)
+@@ -660,6 +667,10 @@ def test_nvlink_one_sided_cft_selection(fake_one_sided) -> None:
+     assert not _one_sided().cft_enabled
+ 
+     fake_one_sided.probe["reason"] = None
++    fake_one_sided.probe["fabric_handles"] = False
++    assert not _one_sided().cft_enabled
++
++    fake_one_sided.probe["fabric_handles"] = True
+     comm = _one_sided(use_low_precision_combine=True, cft_max_tokens_for_dispatch=2)
+     assert comm.cft_enabled
+     # FP8 wire format sizes the CFT receive inbox.
+@@ -675,19 +686,19 @@ def test_nvlink_one_sided_enable_pdl_override(fake_one_sided) -> None:
+ 
+ 
+ def test_nvlink_one_sided_cft_probe_failure_falls_back(monkeypatch) -> None:
+-    import flashinfer.comm.mnnvl as mnnvl
+     from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided import (
+         communication as one_sided,
+     )
+ 
+-    def no_fabric_info(device_index):
+-        raise RuntimeError("nvmlDeviceGetGpuFabricInfoV: Not Supported")
++    def no_driver_version():
++        raise RuntimeError("nvmlSystemGetDriverVersion: Uninitialized")
+ 
+     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index: (10, 0))
+-    monkeypatch.setattr(one_sided, "_driver_branch", lambda: 620)
+-    monkeypatch.setattr(mnnvl, "is_mnnvl_fabric_supported", no_fabric_info)
+-    reason = one_sided._cft_unsupported_reason(0)
++    monkeypatch.setattr(one_sided, "_driver_branch", no_driver_version)
++    reason = one_sided._cft_unsupported_reason(0, fabric_handles=True)
+     assert reason is not None and "RuntimeError" in reason
++    # POSIX file descriptor workspaces rule CFT out before any probe runs.
++    assert "FABRIC" in one_sided._cft_unsupported_reason(0, fabric_handles=False)
+ 
+ 
+ def test_nvlink_one_sided_instances_sharing_a_workspace_cannot_interleave(

@@ -1,0 +1,212 @@
+diff --git a/flashinfer/cute_dsl/attention/dsa/hca_fp8.py b/flashinfer/cute_dsl/attention/dsa/hca_fp8.py
+index 67e7fce09ce..45311152ea1 100644
+--- a/flashinfer/cute_dsl/attention/dsa/hca_fp8.py
++++ b/flashinfer/cute_dsl/attention/dsa/hca_fp8.py
+@@ -54,6 +54,11 @@
+ )
+ from .gather4_utils import make_gather4_2sm_tma_atom
+ 
++# An older DSL has no sm_107; fall back to the sm_103 bounds so it behaves exactly
++# as before.
++_ARCH_SM107 = getattr(Arch, "sm_107", Arch.sm_103f)
++_ARCH_SM107F = getattr(Arch, "sm_107f", Arch.sm_103f)
++
+ """
+ A Heavily Compressed Attention (HCA) kernel using FP8 input and FP8 or BF16
+ output for the NVIDIA Blackwell SM100 architecture using CuTe DSL.
+@@ -3043,6 +3048,8 @@ def softmax(
+ 
+         row_max_new = row_max
+         arch = BaseDSL._get_dsl().get_arch_enum()
++        # SM100, SM103 and SM107. Any other arch must fail here, because with no
++        # matching arm the accumulator fragment is never written.
+         if cutlass.const_expr(arch >= Arch.sm_100 and arch <= Arch.sm_100f):
+             cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
+             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+@@ -3051,7 +3058,10 @@ def softmax(
+                     is_valid = cute.elem_less(sparse_k_idx, tile_valid_len)
+                     tTR_rAcc[i] = tTR_rAcc[i] if is_valid else -self.acc_dtype.inf
+             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
+-        elif cutlass.const_expr(arch >= Arch.sm_103 and arch <= Arch.sm_103f):
++        elif cutlass.const_expr(
++            (arch >= Arch.sm_103 and arch <= Arch.sm_103f)
++            or (arch >= _ARCH_SM107 and arch <= _ARCH_SM107F)
++        ):
+             tmem_load_red_atom = cute.make_copy_atom(
+                 tcgen05.copy.LdRed32x32bOp(
+                     tcgen05.copy.Repetition(64), redOp=tcgen05.TmemLoadRedOp.MAX
+@@ -3079,6 +3089,10 @@ def softmax(
+                 )
+             else:
+                 row_max_new = cute.arch.fmax(row_max_new, tTR_rMax[0])
++        else:
++            raise NotImplementedError(
++                f"HCA softmax supports sm_100, sm_103 and sm_107 only, got {arch}"
++            )
+ 
+         cute.arch.fence_view_async_tmem_load()
+         softmax_params.mma_s_pipeline.consumer_release(mma_s_consumer_state)
+diff --git a/flashinfer/cute_dsl/attention/wrappers/batch_hca.py b/flashinfer/cute_dsl/attention/wrappers/batch_hca.py
+index 352686f2708..480e56f8d3e 100644
+--- a/flashinfer/cute_dsl/attention/wrappers/batch_hca.py
++++ b/flashinfer/cute_dsl/attention/wrappers/batch_hca.py
+@@ -24,6 +24,7 @@
+ from flashinfer.cute_dsl.utils import (
+     _as_cute_dsl_workspace_i8,
+     get_max_active_clusters,
++    require_cute_dsl_arch,
+ )
+ 
+ from ..dsa.hca_fp8 import BlackwellHeavilyCompressedAttentionForwardFP8
+@@ -217,9 +218,9 @@ def _compile_hca_kernel(
+     compute_capability: tuple[int, int],
+ ) -> Callable:
+     """Compile and cache one FP8-input/BF16-output HCA kernel."""
+-    if compute_capability not in ((10, 0), (10, 3)):
++    if compute_capability not in ((10, 0), (10, 3), (10, 7)):
+         raise ValueError(
+-            "CuTe DSL HCA compilation requires SM100/SM103, got "
++            "CuTe DSL HCA compilation requires SM100/SM103/SM107, got "
+             f"SM{compute_capability[0]}{compute_capability[1]}"
+         )
+     kernel = BlackwellHeavilyCompressedAttentionForwardFP8(
+@@ -433,11 +434,12 @@ def cute_dsl_hca_decode(
+     if not query.is_cuda:
+         raise ValueError("query must be on a CUDA device")
+     compute_capability = torch.cuda.get_device_capability(query.device)
+-    if compute_capability not in ((10, 0), (10, 3)):
++    if compute_capability not in ((10, 0), (10, 3), (10, 7)):
+         raise ValueError(
+-            "CuTe DSL HCA requires SM100/SM103, got "
++            "CuTe DSL HCA requires SM100/SM103/SM107, got "
+             f"SM{compute_capability[0]}{compute_capability[1]}"
+         )
++    require_cute_dsl_arch(query.device)
+     if not is_causal:
+         raise ValueError("CuTe DSL DSV4 HCA currently supports causal decode only")
+     if not query.is_contiguous():
+diff --git a/flashinfer/mla/_core.py b/flashinfer/mla/_core.py
+index c8e32dabae1..d00da6d856a 100644
+--- a/flashinfer/mla/_core.py
++++ b/flashinfer/mla/_core.py
+@@ -1219,8 +1219,8 @@ def _resolve_dsv4_sparse_mla_backend(
+ ) -> Literal["trtllm-gen", "cute-dsl", "sparse", "cake"]:
+     cc = get_compute_capability(device)
+     is_sm100_family = cc in ((10, 0), (10, 3), (10, 7))
+-    # CuTe DSL HCA and the SM100 CAKE kernels require SM100/SM103;
+-    # only the prebuilt cubin backend additionally covers SM107.
++    # The SM100 CAKE kernels require SM100/SM103; the prebuilt cubin backend and
++    # CuTe DSL HCA also cover SM107.
+     is_sm100_or_sm103 = cc in ((10, 0), (10, 3))
+     is_sm120_family = cc in ((12, 0), (12, 1))
+     if requested_backend == "auto":
+@@ -1241,9 +1241,9 @@ def _resolve_dsv4_sparse_mla_backend(
+         raise ValueError(
+             f"backend={requested_backend!r} requires SM100/SM103/SM107, got SM{cc[0]}{cc[1]}"
+         )
+-    if requested_backend == "cute-dsl" and not is_sm100_or_sm103:
++    if requested_backend == "cute-dsl" and not is_sm100_family:
+         raise ValueError(
+-            f"backend='cute-dsl' requires SM100/SM103, got SM{cc[0]}{cc[1]}"
++            f"backend='cute-dsl' requires SM100/SM103/SM107, got SM{cc[0]}{cc[1]}"
+         )
+     if requested_backend == "sparse" and not is_sm120_family:
+         raise ValueError(f"backend='sparse' requires SM120/SM121, got SM{cc[0]}{cc[1]}")
+@@ -1886,7 +1886,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
+     the packed backend's final base-2 LSE and finite-sink semantics are
+     documented in :meth:`SparseMLASm120Wrapper.run`.
+ 
+-    With ``backend="cute-dsl"`` on SM100/SM103, this calls the DeepSeek V4
++    With ``backend="cute-dsl"`` on SM100/SM103/SM107, this calls the DeepSeek V4
+     HCA kernel. Its SWA stream consumes arbitrary physical token-row indices,
+     matching the TRTLLM-GEN dynamic-token-sparse ABI, while its compressed
+     stream consumes physical page IDs. HCA currently accepts dense FP8 E4M3
+diff --git a/tests/attention/test_cute_dsl_hca_dsv4.py b/tests/attention/test_cute_dsl_hca_dsv4.py
+index b7916b74345..d236d6c995f 100644
+--- a/tests/attention/test_cute_dsl_hca_dsv4.py
++++ b/tests/attention/test_cute_dsl_hca_dsv4.py
+@@ -13,6 +13,7 @@
+     batch_decode_sparse_mla_dsv4,
+     trtllm_batch_decode_sparse_mla_dsv4,
+ )
++from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+ from flashinfer.utils import get_compute_capability
+ 
+ 
+@@ -208,13 +209,13 @@ def test_dsv4_backend_resolution_is_explicit(monkeypatch):
+         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "auto")
+         == "sparse"
+     )
+-    with pytest.raises(ValueError, match="requires SM100/SM103, got SM120"):
++    with pytest.raises(ValueError, match="requires SM100/SM103/SM107, got SM120"):
+         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cute-dsl")
+ 
+     monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 1))
+     with pytest.raises(ValueError, match="supports SM100/SM103"):
+         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "auto")
+-    with pytest.raises(ValueError, match="requires SM100/SM103, got SM101"):
++    with pytest.raises(ValueError, match="requires SM100/SM103/SM107, got SM101"):
+         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cute-dsl")
+ 
+     monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 7))
+@@ -226,8 +227,10 @@ def test_dsv4_backend_resolution_is_explicit(monkeypatch):
+         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), sm100_default)
+         == sm100_default
+     )
+-    with pytest.raises(ValueError, match="requires SM100/SM103, got SM107"):
++    assert (
+         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cute-dsl")
++        == "cute-dsl"
++    )
+     with pytest.raises(
+         ValueError, match="requires SM100/SM103 or SM120/SM121, got SM107"
+     ):
+@@ -716,15 +719,20 @@ def _reference_hca(
+     return output
+ 
+ 
+-@pytest.mark.arch_blackwell
+ @pytest.mark.parametrize(
+     "compare_trtllm", (False, True), ids=("pytorch-reference", "trtllm-parity")
+ )
+ def test_cute_dsl_hca_fp8_to_bf16_correctness(monkeypatch, compare_trtllm):
+     if not torch.cuda.is_available():
+         pytest.skip("CUDA is required")
+-    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+-        pytest.skip("CuTe DSL HCA requires SM100/SM103")
++    if get_compute_capability(torch.device("cuda")) not in (
++        (10, 0),
++        (10, 3),
++        (10, 7),
++    ):
++        pytest.skip("CuTe DSL HCA requires SM100/SM103/SM107")
++    if not is_cute_dsl_arch_supported(*get_compute_capability(torch.device("cuda"))):
++        pytest.skip("the installed CuTe DSL cannot target this device")
+     pytest.importorskip("cutlass")
+ 
+     torch.manual_seed(17)
+@@ -1023,7 +1031,6 @@ def run_and_capture_lse(*kernel_args, **kernel_kwargs):
+     assert torch.isneginf(captured["lse"]).all()
+ 
+ 
+-@pytest.mark.arch_blackwell
+ @pytest.mark.parametrize(
+     ("num_heads", "window_page_size", "compressed_page_size"),
+     ((64, 32, 128), (128, 32, 16), (128, 16, 32)),
+@@ -1033,8 +1040,14 @@ def test_cute_dsl_hca_partial_head_tile_and_empty_attention(
+ ):
+     if not torch.cuda.is_available():
+         pytest.skip("CUDA is required")
+-    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+-        pytest.skip("CuTe DSL HCA requires SM100/SM103")
++    if get_compute_capability(torch.device("cuda")) not in (
++        (10, 0),
++        (10, 3),
++        (10, 7),
++    ):
++        pytest.skip("CuTe DSL HCA requires SM100/SM103/SM107")
++    if not is_cute_dsl_arch_supported(*get_compute_capability(torch.device("cuda"))):
++        pytest.skip("the installed CuTe DSL cannot target this device")
+     pytest.importorskip("cutlass")
+ 
+     torch.manual_seed(23)

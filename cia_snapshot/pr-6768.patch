@@ -1,0 +1,212 @@
+diff --git a/flashinfer/testing/__init__.py b/flashinfer/testing/__init__.py
+index 690f550a2945386d50045453c422406cb5e164c2..4e91120576b922ddb6a44e2c61a3d8e32d98e8a0 100644
+--- a/flashinfer/testing/__init__.py
++++ b/flashinfer/testing/__init__.py
+@@ -25,6 +25,7 @@ from .utils import (
+     bench_gpu_time_with_cupti,
+     bench_gpu_time_with_cuda_event,
+     bench_gpu_time_with_cudagraph,
++    is_compute_sanitizer_active,
+     set_seed,
+     sleep_after_kernel_run,
+ )
+diff --git a/flashinfer/testing/utils.py b/flashinfer/testing/utils.py
+index b6bf4dc8ebcc159be155b37284f0515082134862..7415c99970808c178e04eb30db656c2d9683b8a8 100644
+--- a/flashinfer/testing/utils.py
++++ b/flashinfer/testing/utils.py
+@@ -416,6 +416,22 @@ def dequantize_fp8(x, x_scale, scale_major_mode):
+     return out
+ 
+ 
++def is_compute_sanitizer_active() -> bool:
++    """Detect whether the process runs under compute-sanitizer.
++
++    The tool injects itself through environment variables that child processes
++    inherit, so this also holds inside a subprocess a test spawns. CUDA 13.x
++    uses the NV_SANITIZER_INJECTION_* set; older toolkits use
++    CUDA_INJECTION64_PATH, which Nsight tools set too, hence the value check.
++    """
++    if any(name.startswith("NV_SANITIZER_INJECTION_") for name in os.environ):
++        return True
++    return any(
++        "sanitizer" in os.environ.get(name, "").lower()
++        for name in ("CUDA_INJECTION64_PATH", "NVTX_INJECTION64_PATH")
++    )
++
++
+ def set_seed(random_seed):
+     """
+     Set random seed for reproducibility during testing.
+diff --git a/tests/attention/test_page.py b/tests/attention/test_page.py
+index 9717df3c0869e97c13b175ac16ae69e997946f50..c7191ffd1477d6facd95bbae5e454af118e08314 100644
+--- a/tests/attention/test_page.py
++++ b/tests/attention/test_page.py
+@@ -1,4 +1,3 @@
+-import os
+ import subprocess
+ import sys
+ import textwrap
+@@ -8,6 +7,7 @@ import torch
+ 
+ import flashinfer
+ from flashinfer.fp4_quantization import e2m1_and_ufp8sf_scale_to_float
++from flashinfer.testing import is_compute_sanitizer_active
+ from flashinfer.utils import get_compute_capability
+ 
+ 
+@@ -46,22 +46,6 @@ def _skip_if_fp8_e4m3_scale_unsupported():
+         pytest.skip(f"SM{major}{minor} does not support FP8 E4M3 scale tensors")
+ 
+ 
+-def _is_compute_sanitizer_active() -> bool:
+-    """Detect whether the process runs under compute-sanitizer.
+-
+-    The tool injects itself through environment variables that child processes
+-    inherit, so this also holds inside a subprocess a test spawns. CUDA 13.x
+-    uses the NV_SANITIZER_INJECTION_* set; older toolkits use
+-    CUDA_INJECTION64_PATH, which Nsight tools set too, hence the value check.
+-    """
+-    if any(name.startswith("NV_SANITIZER_INJECTION_") for name in os.environ):
+-        return True
+-    return any(
+-        "sanitizer" in os.environ.get(name, "").lower()
+-        for name in ("CUDA_INJECTION64_PATH", "NVTX_INJECTION64_PATH")
+-    )
+-
+-
+ def _make_small_nvfp4_append_inputs(device="cuda:0"):
+     _skip_if_fp8_e4m3_scale_unsupported()
+ 
+@@ -607,7 +591,7 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_cuda_graph_captu
+ 
+ 
+ @pytest.mark.skipif(
+-    _is_compute_sanitizer_active(),
++    is_compute_sanitizer_active(),
+     reason="the replay below makes the kernel execute its `trap;` guard on purpose, "
+     "which compute-sanitizer reports as errors and slows past this test's timeout",
+ )
+diff --git a/tests/experimental/b12x/sequence/test_embedding.py b/tests/experimental/b12x/sequence/test_embedding.py
+index 4fef59af05bff48dbc4853cddec98928e0dc3143..dbd00e803dcdd251c0f349527dbb9e9d5dbe7468 100644
+--- a/tests/experimental/b12x/sequence/test_embedding.py
++++ b/tests/experimental/b12x/sequence/test_embedding.py
+@@ -2,7 +2,6 @@
+ 
+ from contextlib import contextmanager
+ 
+-import os
+ import subprocess
+ import sys
+ import textwrap
+@@ -11,6 +10,7 @@ import pytest
+ import torch
+ 
+ from b12x.preparation import PreparationSession, PreparedCall
++from flashinfer.testing import is_compute_sanitizer_active
+ 
+ 
+ @contextmanager
+@@ -142,17 +142,8 @@ def test_high_row_offset_is_widened_before_multiplication(id_dtype):
+         graph.reset()
+ 
+ 
+-def _is_compute_sanitizer_active() -> bool:
+-    if any(name.startswith("NV_SANITIZER_INJECTION_") for name in os.environ):
+-        return True
+-    return any(
+-        "sanitizer" in os.environ.get(name, "").lower()
+-        for name in ("CUDA_INJECTION64_PATH", "NVTX_INJECTION64_PATH")
+-    )
+-
+-
+ @pytest.mark.skipif(
+-    _is_compute_sanitizer_active(),
++    is_compute_sanitizer_active(),
+     reason="the intentional device trap is reported as an error by compute-sanitizer",
+ )
+ @pytest.mark.parametrize("bad_id", [-1, 3, 2**32])
+diff --git a/tests/moe_ep/test_sm90_push_fp8_gemm_contract.py b/tests/moe_ep/test_sm90_push_fp8_gemm_contract.py
+index b6ceb6d3287ba5089017055a8c74aa6617489598..2737e5b18e9f92d6c5d4a1cf96d4ac9b4509f98a 100644
+--- a/tests/moe_ep/test_sm90_push_fp8_gemm_contract.py
++++ b/tests/moe_ep/test_sm90_push_fp8_gemm_contract.py
+@@ -13,6 +13,8 @@ from types import SimpleNamespace
+ import pytest
+ import torch
+ 
++from flashinfer.testing import is_compute_sanitizer_active
++
+ pytestmark = pytest.mark.usefixtures("isolated_deep_gemm_cache")
+ 
+ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+@@ -637,6 +639,11 @@ def _assert_device_trap(result: subprocess.CompletedProcess[str], marker: str) -
+         assert bad_marker not in combined, combined[-1500:]
+ 
+ 
++@pytest.mark.skipif(
++    is_compute_sanitizer_active(),
++    reason="the test makes a kernel execute its `trap;` guard on purpose, "
++    "which compute-sanitizer reports as errors",
++)
+ @requires_sm90
+ @pytest.mark.parametrize(
+     "fused,offset_values,marker",
+@@ -691,6 +698,11 @@ print("UNEXPECTED-SURVIVAL")
+     _assert_device_trap(result, marker)
+ 
+ 
++@pytest.mark.skipif(
++    is_compute_sanitizer_active(),
++    reason="the test makes a kernel execute its `trap;` guard on purpose, "
++    "which compute-sanitizer reports as errors",
++)
+ @requires_sm90
+ @pytest.mark.parametrize("fused", [False, True])
+ def test_moe_gemm_offsets_exceed_input_capacity_trap(fused: bool) -> None:
+diff --git a/tests/moe_ep/test_sm90_push_fp8_kernel.py b/tests/moe_ep/test_sm90_push_fp8_kernel.py
+index 20661b7396b5344c38fd09cbe1150ac750830969..02e869b3642883e82ced8c71a8b49e6068d9cce9 100644
+--- a/tests/moe_ep/test_sm90_push_fp8_kernel.py
++++ b/tests/moe_ep/test_sm90_push_fp8_kernel.py
+@@ -11,6 +11,7 @@ import pytest
+ import torch
+ 
+ from ._sm90_push_fp8_reference import dequant_weight_128x128, reference_moe
++from flashinfer.testing import is_compute_sanitizer_active
+ 
+ pytestmark = pytest.mark.usefixtures("isolated_deep_gemm_cache")
+ 
+@@ -735,6 +736,11 @@ def test_ep1_soak() -> None:
+             pending.clear()
+ 
+ 
++@pytest.mark.skipif(
++    is_compute_sanitizer_active(),
++    reason="the test makes a kernel execute its `trap;` guard on purpose, "
++    "which compute-sanitizer reports as errors",
++)
+ @requires_sm90
+ def test_ep1_pool_overflow_traps() -> None:
+     code = r"""
+@@ -768,6 +774,11 @@ print("UNEXPECTED-SURVIVAL")
+     _assert_device_trap(result, "sm90_push: pool overflow")
+ 
+ 
++@pytest.mark.skipif(
++    is_compute_sanitizer_active(),
++    reason="the test makes a kernel execute its `trap;` guard on purpose, "
++    "which compute-sanitizer reports as errors",
++)
+ @requires_sm90
+ def test_ep1_wait_prefix_capacity_corruption_traps() -> None:
+     code = r"""
+@@ -801,6 +812,11 @@ print("UNEXPECTED-SURVIVAL")
+     _assert_device_trap(result, "sm90_push: accumulated row count")
+ 
+ 
++@pytest.mark.skipif(
++    is_compute_sanitizer_active(),
++    reason="the test makes a kernel execute its `trap;` guard on purpose, "
++    "which compute-sanitizer reports as errors",
++)
+ @requires_sm90
+ @pytest.mark.parametrize(
+     "case,marker",

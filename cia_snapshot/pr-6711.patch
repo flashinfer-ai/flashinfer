@@ -1,0 +1,98 @@
+diff --git a/flashinfer/decode.py b/flashinfer/decode.py
+index d3b283c6900..fe73f66663f 100644
+--- a/flashinfer/decode.py
++++ b/flashinfer/decode.py
+@@ -4888,6 +4888,11 @@ def fast_decode_plan(
+     - Remove unnecessary device-to-device copy for the cuda graph buffers.
+     - Remove unnecessary host-to-device copy for the metadata buffers.
+ 
++    Because nothing is copied on the FA2/FA3 path, ``indptr``, ``indices`` and
++    ``last_page_len`` must already be on the wrapper's device there (in
++    CUDA-graph mode, the wrapper's own buffers); a tensor elsewhere raises
++    ``ValueError``. Use ``plan()`` for host metadata.
++
+     cuDNN uses the regular planner to refresh its KV lengths and block table;
+     compatible prepared graphs are still reused. The copy-elision below is
+     specific to the FA2/FA3 module, not cuDNN's metadata contract.
+@@ -4992,6 +4997,22 @@ def fast_decode_plan(
+                 f"this wrapper was planned with {frozen_q_len}, got "
+                 f"{q_len_per_req}. Use a separate wrapper per q_len_per_req."
+             )
++    # fast_decode_plan never copies the metadata: outside CUDA graphs the
++    # tensors become the wrapper's buffers as-is, and inside run() keeps
++    # reading the wrapper's own buffers, so the tensors passed here must be
++    # those buffers. Either way they live on the wrapper's device; plan() is
++    # the path that copies host metadata over. Checked before any plan state
++    # changes.
++    for name, tensor in (
++        ("indptr", indptr),
++        ("indices", indices),
++        ("last_page_len", last_page_len),
++    ):
++        if tensor.device != self.device:
++            raise ValueError(
++                f"{name} must be on the wrapper's device {self.device}, got "
++                f"{tensor.device}; use plan() for host metadata"
++            )
+     is_causal = q_len_per_req > 1
+     self._q_len_per_req = q_len_per_req
+     if logits_soft_cap is None:
+diff --git a/tests/attention/test_batch_decode_kernels.py b/tests/attention/test_batch_decode_kernels.py
+index b44b8ec54ab..004347ceeb2 100644
+--- a/tests/attention/test_batch_decode_kernels.py
++++ b/tests/attention/test_batch_decode_kernels.py
+@@ -1599,3 +1599,54 @@ def plan(wrapper):
+ 
+     o = wrapper.run(q, kv_data)
+     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
++
++
++@pytest.mark.parametrize("use_cuda_graph", [False, True])
++@pytest.mark.parametrize("metadata_device", ["cpu", "cuda:1"])
++def test_fast_decode_plan_rejects_metadata_off_wrapper_device(
++    metadata_device, use_cuda_graph
++):
++    # fast_decode_plan never copies indptr/indices/last_page_len: outside CUDA
++    # graphs they become the wrapper's buffers and off-device metadata reached
++    # the kernel as-is (#6391); inside, run() reads the wrapper's own buffers,
++    # so off-device metadata planned from data run() never sees.
++    if metadata_device == "cuda:1" and torch.cuda.device_count() < 2:
++        pytest.skip("needs a second CUDA device")
++    page_size = 16
++    kv_lens = [40, 90, 64, 200]
++    pages = [(n + page_size - 1) // page_size for n in kv_lens]
++    kv_indptr = torch.tensor([0] + pages, dtype=torch.int32).cumsum(
++        0, dtype=torch.int32
++    )
++    kv_indices = torch.arange(int(kv_indptr[-1]), dtype=torch.int32)
++    kv_last_page_len = torch.tensor(
++        [(n - 1) % page_size + 1 for n in kv_lens], dtype=torch.int32
++    )
++    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
++    graph_buffers = (
++        {
++            "use_cuda_graph": True,
++            "paged_kv_indptr_buffer": torch.empty_like(kv_indptr, device="cuda:0"),
++            "paged_kv_indices_buffer": torch.empty_like(kv_indices, device="cuda:0"),
++            "paged_kv_last_page_len_buffer": torch.empty_like(
++                kv_last_page_len, device="cuda:0"
++            ),
++        }
++        if use_cuda_graph
++        else {}
++    )
++    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
++        workspace_buffer, "NHD", backend="fa2", **graph_buffers
++    )
++    with pytest.raises(ValueError, match="must be on the wrapper's device"):
++        flashinfer.fast_decode_plan(
++            wrapper,
++            kv_indptr.to(metadata_device),
++            kv_indices.to(metadata_device),
++            kv_last_page_len.to(metadata_device),
++            8,
++            2,
++            128,
++            page_size,
++            q_data_type=torch.float16,
++        )

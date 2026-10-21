@@ -1,0 +1,367 @@
+diff --git a/flashinfer/autotuner/autotuner.py b/flashinfer/autotuner/autotuner.py
+index ae319d45596..013dfe080d2 100644
+--- a/flashinfer/autotuner/autotuner.py
++++ b/flashinfer/autotuner/autotuner.py
+@@ -1569,6 +1569,10 @@ def __init__(
+         # This lets a different profiling policy retune the same workload while
+         # keeping the selected tactic reachable after autotune() exits.
+         self._profiling_cache_policies: dict[tuple, tuple | None] = {}
++        # Best measured time per (winner identity, cache key); lets `auto`
++        # rank cached winners of different runners instead of taking the
++        # first runner in list order.
++        self._winner_times: dict[tuple, float] = {}
+         self.is_tuning_mode = False
+         self._active_tuning_contexts = 0
+         # Set after a CUPTI infrastructure failure (e.g. another profiler
+@@ -1986,6 +1990,8 @@ def search_cache(
+                 self.is_tuning_mode and self._active_managed_store is None
+             )
+             runner_keys: list[tuple[int, ProfilingCacheKey]] = []
++            memory_hits: list[tuple[float, int, Any, OptimizationProfile | None]] = []
++            unmeasured_runners = 0
+             for r_id, r in enumerate(runners):
+                 cache_key = AutoTuner._get_cache_key(
+                     custom_op,
+@@ -1995,9 +2001,12 @@ def search_cache(
+                     r.get_cache_key_extras(inputs) if inputs is not None else (),
+                 )
+                 runner_keys.append((r_id, cache_key))
++                time_key = (winner_identity, cache_key)
++                if cache_key not in winners and time_key not in self._winner_times:
++                    unmeasured_runners += 1
+                 if cache_key in winners:
+                     cached_policy = self._profiling_cache_policies.get(
+-                        (winner_identity, cache_key),
++                        time_key,
+                         default_policy if winner_identity is None else None,
+                     )
+                     if check_memory_policy and cached_policy != requested_policy:
+@@ -2009,7 +2018,25 @@ def search_cache(
+                         # Fall through: another runner, a disk source, or
+                         # (in tuning mode) a re-profile may still serve.
+                         continue
+-                    return True, r_id, tactic, stored_profile
++                    memory_hits.append(
++                        (
++                            self._winner_times.get(time_key, float("inf")),
++                            r_id,
++                            tactic,
++                            stored_profile,
++                        )
++                    )
++            # A tuning-mode lookup only counts as a hit when every candidate
++            # runner has been measured for this bucket; otherwise fall through
++            # so choose_one races the missing ones.
++            if memory_hits and not (
++                require_profiling_policy
++                and self.is_tuning_mode
++                and unmeasured_runners > 0
++            ):
++                # Fastest measured winner; list order only breaks ties.
++                _, r_id, tactic, stored_profile = min(memory_hits, key=lambda h: h[0])
++                return True, r_id, tactic, stored_profile
+ 
+             # 2. User-loaded configs (from load_configs or autotune(cache=...)).
+             #    Skipped wholesale when nothing was loaded, so the common
+@@ -2433,6 +2460,8 @@ def choose_one(
+                         min_time = float("inf")
+                         # Initialize runner and tactic as None in case of no valid tactic or runners are found
+                         runner_id, tactic = None, None
++                        # Best (time, tactic) of every runner, for cross-runner ranking.
++                        runner_best: dict[int, tuple[float, Any]] = {}
+                         skipped_count = 0
+                         for r_id, r in enumerate(runners):
+                             runner_preparation_oom = False
+@@ -2554,6 +2583,11 @@ def choose_one(
+                                     # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
+                                     # or some runtime error occurs during profiling.
+                                     time_measured = float("inf")
++                                if (
++                                    time_measured
++                                    < runner_best.get(r_id, (float("inf"), None))[0]
++                                ):
++                                    runner_best[r_id] = (time_measured, tac)
+                                 if time_measured < min_time:
+                                     min_time = time_measured
+                                     runner_id, tactic = r_id, tac
+@@ -2578,6 +2612,15 @@ def choose_one(
+                             self._profiling_cache_policies[
+                                 (self._winner_cache_identity(), cache_key)
+                             ] = profiling_policy
++                            self._record_runner_times(
++                                custom_op,
++                                runners,
++                                p,
++                                tuning_config,
++                                tensors,
++                                runner_best,
++                                runner_id,
++                            )
+                             self._dirty = True
+                             self._dirty_seq += 1
+                             publish_store = self._active_managed_store
+@@ -2634,6 +2677,36 @@ def choose_one(
+ 
+             return runners[runner_id], tactic
+ 
++    def _record_runner_times(
++        self,
++        custom_op,
++        runners,
++        profile,
++        tuning_config,
++        tensors,
++        runner_best: dict[int, tuple[float, Any]],
++        winner_id: int,
++    ) -> None:
++        """Store every raced runner's best time (inf when it had no working tactic).
++
++        A losing runner that already holds a winner entry for this bucket is
++        refreshed to the tactic just measured, so its stored time matches it.
++        """
++        winners = self._winner_cache()
++        identity = self._winner_cache_identity()
++        for r_id, r in enumerate(runners):
++            key = AutoTuner._get_cache_key(
++                custom_op,
++                r,
++                profile.get_opt_shapes(),
++                tuning_config,
++                r.get_cache_key_extras(tensors),
++            )
++            best_time, best_tactic = runner_best.get(r_id, (float("inf"), None))
++            self._winner_times[(identity, key)] = best_time
++            if r_id != winner_id and key in winners and best_time < float("inf"):
++                winners[key] = (best_tactic, profile)
++
+     def _discard_profile_cache(
+         self, custom_op, runners, input_shapes, tuning_config, inputs
+     ) -> None:
+@@ -2655,6 +2728,7 @@ def _discard_profile_cache(
+             )
+             winners.pop(key, None)
+             self._profiling_cache_policies.pop((identity, key), None)
++            self._winner_times.pop((identity, key), None)
+             self._file_configs.pop(key.file_key, None)
+             self._file_config_policies.pop(key.file_key, None)
+             if store is not None:
+@@ -2813,6 +2887,7 @@ def rank_tactics(
+             # profiling_cache is the unpartitioned winner cache, so its
+             # provenance lives under the None winner identity.
+             self._profiling_cache_policies[(None, cache_key)] = policy
++            self._winner_times[(None, cache_key)] = scored[0][0]
+             self._ranked_tactics_cache[cache_key] = (policy, tuple(ranked))
+             self._dirty = True
+             self._dirty_seq += 1
+@@ -3990,6 +4065,7 @@ def clear_cache(self) -> None:
+             self.profiling_cache.clear()
+             self._ranked_tactics_cache.clear()
+             self._profiling_cache_policies.clear()
++            self._winner_times.clear()
+             self._file_configs.clear()
+             self._file_config_policies.clear()
+             self._namespaced_records.clear()
+diff --git a/flashinfer/gemm/gemm_base.py b/flashinfer/gemm/gemm_base.py
+index a96aedf4afa..f115ef85967 100644
+--- a/flashinfer/gemm/gemm_base.py
++++ b/flashinfer/gemm/gemm_base.py
+@@ -1888,6 +1888,31 @@ def _pad_to_multiple(x, multiple):
+     )
+ 
+ 
++# CTA tiles (M, N) of CutlassFp8GemmRunner::getConfigs(), in enumeration order;
++# each tile is followed by its 5 cluster shapes, 1x1x1 first.
++_CUTLASS_FP8_SM100_TILES = (
++    (64, 64),
++    (64, 128),
++    (64, 256),
++    (128, 64),
++    (128, 128),
++    (128, 256),
++)
++_CUTLASS_FP8_SM100_CLUSTERS_PER_TILE = 5
++
++
++def _cutlass_fp8_sm100_default_tactic(batch: int, m: int, n: int, num_sms: int) -> int:
++    """Untuned pick: the largest tile that still gives every SM a CTA (cluster 1x1x1)."""
++    best = 0
++    for idx, (tile_m, tile_n) in enumerate(_CUTLASS_FP8_SM100_TILES):
++        if tile_m > 64 and m <= 64:
++            continue
++        ctas = batch * -(-m // tile_m) * -(-n // tile_n)
++        if ctas >= num_sms:
++            best = idx
++    return best * _CUTLASS_FP8_SM100_CLUSTERS_PER_TILE
++
++
+ @functools.cache
+ def get_gemm_sm100_module_cutlass_fp8():
+     module = gen_gemm_sm100_module_cutlass_fp8().build_and_load()
+@@ -1909,6 +1934,14 @@ def forward(
+                 **kwargs,
+             ) -> torch.Tensor:
+                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
++                if tactic == -1:
++                    # C++ maps -1 to config 0 (64x64 tile) regardless of shape.
++                    tactic = _cutlass_fp8_sm100_default_tactic(
++                        a.shape[0] if a.dim() == 3 else 1,
++                        a.shape[-2],
++                        out.shape[-1],
++                        get_device_sm_count(a.device),
++                    )
+                 module.fp8_gemm(
+                     a,
+                     b.transpose(-2, -1),
+diff --git a/tests/autotuner/test_autotuner_core.py b/tests/autotuner/test_autotuner_core.py
+index 9329c6ce6d7..f7d24834fc7 100644
+--- a/tests/autotuner/test_autotuner_core.py
++++ b/tests/autotuner/test_autotuner_core.py
+@@ -2841,3 +2841,108 @@ def test_cute_dsl_runner_cache_tracks_split_workspace_geometry(
+ 
+     key_small_workspace = _cute_dsl_runner_cache_extras(backend_type, 257, 800_000)
+     assert key_257 != key_small_workspace
++
++
++def test_search_cache_ranks_cached_winners_by_measured_time():
++    """`auto` must serve the fastest cached runner, not the first in list order."""
++
++    class OtherDummyRunner(DummyRunner):
++        pass
++
++    tuner = reset_autotuner()
++    config = TuningConfig()
++    a = DummyRunner()
++    b = OtherDummyRunner()
++    shapes = (torch.Size([8, 16]),)
++
++    key_a = AutoTuner._get_cache_key("dummy", a, shapes, config)
++    key_b = AutoTuner._get_cache_key("dummy", b, shapes, config)
++    tuner.profiling_cache[key_a] = (3, None)
++    tuner._winner_times[(None, key_a)] = 2.0
++    tuner.profiling_cache[key_b] = (5, None)
++    tuner._winner_times[(None, key_b)] = 1.0
++
++    assert tuner.search_cache("dummy", [a, b], shapes, config) == (True, 1, 5, None)
++    assert tuner.search_cache("dummy", [b, a], shapes, config) == (True, 0, 5, None)
++
++    # Entries without a recorded time (legacy / promoted) fall back to list order.
++    tuner._winner_times.clear()
++    assert tuner.search_cache("dummy", [a, b], shapes, config) == (True, 0, 3, None)
++
++
++def test_choose_one_tuning_races_runners_never_measured(monkeypatch):
++    """A winner tuned with runner A alone must not short-circuit `auto` over [A, B]."""
++
++    class OtherDummyRunner(DummyRunner):
++        pass
++
++    tuner = reset_autotuner()
++    config = TuningConfig()
++    a = DummyRunner(valid_tactics=(0,))
++    b = OtherDummyRunner(valid_tactics=(0,))
++    inputs = [torch.empty((16, 32), dtype=torch.float32)]
++    times = {"DummyRunner": 2.0, "OtherDummyRunner": 1.0}
++    profiled: list[str] = []
++
++    def fake_profile(
++        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
++    ):
++        name = type(runner_obj).__name__
++        profiled.append(name)
++        return times[name]
++
++    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
++    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
++
++    with autotune(tune_mode=True):
++        assert tuner.choose_one("dummy_auto", [a], config, inputs)[0] is a
++        assert profiled == ["DummyRunner"]
++
++        # B was never measured for this bucket, so `auto` must race it.
++        runner, _ = tuner.choose_one("dummy_auto", [a, b], config, inputs)
++        assert runner is b
++        assert profiled.count("OtherDummyRunner") == 1
++
++        # Everyone is measured now: a repeat is a pure cache hit.
++        n_profiled = len(profiled)
++        assert tuner.choose_one("dummy_auto", [a, b], config, inputs)[0] is b
++        assert len(profiled) == n_profiled
++
++    # Serving mode agrees, whichever order the caller lists the runners in.
++    assert tuner.choose_one("dummy_auto", [a, b], config, inputs)[0] is b
++    assert tuner.choose_one("dummy_auto", [b, a], config, inputs)[0] is b
++
++
++def test_choose_one_tuning_per_backend_then_auto_picks_fastest(monkeypatch):
++    """Backends tuned one at a time: `auto` ranks their winners without re-profiling."""
++
++    class OtherDummyRunner(DummyRunner):
++        pass
++
++    tuner = reset_autotuner()
++    config = TuningConfig()
++    a = DummyRunner(valid_tactics=(0, 1))
++    b = OtherDummyRunner(valid_tactics=(0, 1))
++    inputs = [torch.empty((16, 32), dtype=torch.float32)]
++    times = {("DummyRunner", 0): 4.0, ("DummyRunner", 1): 2.0}
++    times.update({("OtherDummyRunner", 0): 1.0, ("OtherDummyRunner", 1): 3.0})
++    profiled: list[tuple[str, int]] = []
++
++    def fake_profile(
++        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
++    ):
++        item = (type(runner_obj).__name__, tactic)
++        profiled.append(item)
++        return times[item]
++
++    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
++    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
++
++    with autotune(tune_mode=True):
++        assert tuner.choose_one("dummy_each", [a], config, inputs) == (a, 1)
++        assert tuner.choose_one("dummy_each", [b], config, inputs) == (b, 0)
++        n_profiled = len(profiled)
++        assert tuner.choose_one("dummy_each", [a, b], config, inputs) == (b, 0)
++        assert len(profiled) == n_profiled
++
++    assert tuner.choose_one("dummy_each", [a, b], config, inputs) == (b, 0)
+diff --git a/tests/autotuner/test_autotuner_distributed.py b/tests/autotuner/test_autotuner_distributed.py
+index 23a81813fe0..3e97b0787c5 100644
+--- a/tests/autotuner/test_autotuner_distributed.py
++++ b/tests/autotuner/test_autotuner_distributed.py
+@@ -546,6 +546,11 @@ def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
+         if case == "all_hit" or (rank == 0 and case not in ("all_miss", "concurrent_publish")):
+             if case == "partial_memory":
+                 tuner._winner_cache()[key] = (0, None)
++                # A tuning-mode hit needs every runner measured for the bucket:
++                # give RunnerB a recorded time so rank 0 still hits and rank 1 misses.
++                key_b = tuner._get_cache_key(op, runners[1], (inputs[0].shape,), config,
++                                             runners[1].get_cache_key_extras(inputs))
++                tuner._winner_times[(tuner._winner_cache_identity(), key_b)] = 1.0
+             elif case == "partial_file":
+                 tuner._file_configs[key.file_key] = ("RunnerA", 0)
+             else:
+diff --git a/tests/gemm/test_bmm_fp8.py b/tests/gemm/test_bmm_fp8.py
+index 2dc21110b7b..04668015c99 100644
+--- a/tests/gemm/test_bmm_fp8.py
++++ b/tests/gemm/test_bmm_fp8.py
+@@ -184,3 +184,19 @@ def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_t
+ 
+ if __name__ == "__main__":
+     pytest.main([__file__])
++
++
++def test_cutlass_fp8_sm100_default_tactic_fills_sms():
++    """Untuned CUTLASS picks the largest 1x1x1-cluster tile that still fills every SM."""
++    from flashinfer.gemm.gemm_base import _cutlass_fp8_sm100_default_tactic as pick
++
++    # Weight-streaming shapes keep the 64x64 tile (config 0): nothing bigger fills the GPU.
++    assert pick(1, 1, 8192, 148) == 0
++    assert pick(1, 16, 4384, 148) == 0
++    assert pick(1, 64, 8192, 216) == 0
++    # Short M never gets a 128-row tile; wider N tiles are fine while CTAs >= SMs.
++    assert pick(4, 64, 8192, 216) == 5  # 64x128
++    # Large M: 128x128 when 128x256 would under-fill, 128x256 once it fills.
++    assert pick(1, 512, 8192, 148) == 20
++    assert pick(1, 2048, 8192, 148) == 25
++    assert pick(1, 9216, 1280, 216) == 25

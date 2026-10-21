@@ -1,0 +1,150 @@
+diff --git a/tests/comm/test_trtllm_mnnvl_allreduce.py b/tests/comm/test_trtllm_mnnvl_allreduce.py
+index 6e663ff642..962cd205b2 100644
+--- a/tests/comm/test_trtllm_mnnvl_allreduce.py
++++ b/tests/comm/test_trtllm_mnnvl_allreduce.py
+@@ -18,6 +18,7 @@
+ 
+ # Test helpers
+ from tests.test_helpers.comm import (
++    get_world_size_from_env,
+     init_torch_distributed_from_mpi,
+ )
+ from tests.test_helpers.utils_fp4 import (
+@@ -410,15 +411,17 @@ def run_mnnvl_ar_full(
+     if gpus_per_node == 0:
+         pytest.skip("MNNVL allreduce test requires at least one CUDA device per node")
+ 
++    # Skip before initializing torch.distributed so a skipped test leaves no
++    # process group behind.
++    world_size = get_world_size_from_env()
++    if world_size < 2:
++        pytest.skip(f"This test requires at least 2 ranks, got {world_size}")
++
+     # Initialize torch.distributed (safe to call if already initialized)
+     init_torch_distributed_from_mpi()
+ 
+     # Get rank info from torch.distributed
+     rank = dist.get_rank()
+-    world_size = dist.get_world_size()
+-
+-    if world_size < 2:
+-        pytest.skip(f"This test requires at least 2 ranks, got {world_size}")
+ 
+     mapping = Mapping(
+         world_size=world_size,
+@@ -803,12 +806,13 @@ def test_mnnvl_allreduce_quant_unified(
+     if torch.cuda.device_count() == 0:
+         pytest.skip("MNNVL quant test requires CUDA")
+ 
+-    init_torch_distributed_from_mpi()
+-    rank = dist.get_rank()
+-    world_size = dist.get_world_size()
++    world_size = get_world_size_from_env()
+     if world_size < 2:
+         pytest.skip(f"This test requires at least 2 ranks, got {world_size}")
+ 
++    init_torch_distributed_from_mpi()
++    rank = dist.get_rank()
++
+     mapping = Mapping(
+         world_size=world_size,
+         rank=rank,
+@@ -928,12 +932,13 @@ def test_mnnvl_nvfp4_rejects_fp32(
+     if torch.cuda.device_count() == 0:
+         pytest.skip("MNNVL quant test requires CUDA")
+ 
+-    init_torch_distributed_from_mpi()
+-    rank = dist.get_rank()
+-    world_size = dist.get_world_size()
++    world_size = get_world_size_from_env()
+     if world_size < 2:
+         pytest.skip(f"This test requires at least 2 ranks, got {world_size}")
+ 
++    init_torch_distributed_from_mpi()
++    rank = dist.get_rank()
++
+     mapping = Mapping(
+         world_size=world_size,
+         rank=rank,
+diff --git a/tests/comm/test_trtllm_mnnvl_allreduce_dynamic_fp8_quant.py b/tests/comm/test_trtllm_mnnvl_allreduce_dynamic_fp8_quant.py
+index bc4f19abf1..9efcb84740 100644
+--- a/tests/comm/test_trtllm_mnnvl_allreduce_dynamic_fp8_quant.py
++++ b/tests/comm/test_trtllm_mnnvl_allreduce_dynamic_fp8_quant.py
+@@ -8,7 +8,10 @@
+ 
+ import flashinfer.comm as comm
+ from flashinfer.comm.mnnvl import TorchDistBackend
+-from tests.test_helpers.comm import init_torch_distributed_from_mpi
++from tests.test_helpers.comm import (
++    get_world_size_from_env,
++    init_torch_distributed_from_mpi,
++)
+ 
+ 
+ FP8_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+@@ -98,12 +101,13 @@ def test_mnnvl_allreduce_dynamic_fp8_quant(
+         pytest.skip("requires CUDA")
+ 
+     _prefer_mpi_launcher_env()
+-    init_torch_distributed_from_mpi()
+-    rank = dist.get_rank()
+-    world_size = dist.get_world_size()
++    world_size = get_world_size_from_env()
+     if world_size < 2:
+         pytest.skip(f"requires at least 2 ranks, got {world_size}")
+ 
++    init_torch_distributed_from_mpi()
++    rank = dist.get_rank()
++
+     local_rank = rank % torch.cuda.device_count()
+     torch.cuda.set_device(local_rank)
+     M, H = (16, 4096) if use_oneshot else (128, 4096)
+@@ -187,12 +191,13 @@ def test_mnnvl_allreduce_dynamic_fp8_cuda_graph_replay(use_oneshot: bool) -> Non
+         pytest.skip("requires CUDA")
+ 
+     _prefer_mpi_launcher_env()
+-    init_torch_distributed_from_mpi()
+-    rank = dist.get_rank()
+-    world_size = dist.get_world_size()
++    world_size = get_world_size_from_env()
+     if world_size < 2:
+         pytest.skip(f"requires at least 2 ranks, got {world_size}")
+ 
++    init_torch_distributed_from_mpi()
++    rank = dist.get_rank()
++
+     local_rank = rank % torch.cuda.device_count()
+     torch.cuda.set_device(local_rank)
+     M, H = (16, 4096) if use_oneshot else (128, 4096)
+diff --git a/tests/test_helpers/comm.py b/tests/test_helpers/comm.py
+index e327b0e861..2630cd7a96 100644
+--- a/tests/test_helpers/comm.py
++++ b/tests/test_helpers/comm.py
+@@ -111,6 +111,27 @@ def _get_master_addr():
+     return "localhost"
+ 
+ 
++def get_world_size_from_env():
++    """Get the world size that init_torch_distributed_from_mpi() uses.
++
++    Unlike init_torch_distributed_from_mpi(), this never creates a process
++    group. Tests should check their minimum world size with it and skip
++    *before* initializing torch.distributed: a default process group created
++    by a skipped test is only destroyed at the end of the pytest session
++    (tests/comm/conftest.py), and breaks any later test in the same process
++    that initializes its own default process group.
++
++    Returns:
++        int: world size of the existing default process group, otherwise the
++        launcher's world size (SLURM, torchrun or MPI).
++    """
++    if dist.is_initialized():
++        return dist.get_world_size()
++
++    _, world_size, _ = _get_rank_info_from_env()
++    return world_size
++
++
+ def init_torch_distributed_from_mpi():
+     """Initialize torch.distributed using environment rank info.
+ 

@@ -1,0 +1,205 @@
+diff --git a/flashinfer/moe_ep/backends/split/kernel/fused_moe/backend.py b/flashinfer/moe_ep/backends/split/kernel/fused_moe/backend.py
+index eaf6c3059a6..86abac7266a 100644
+--- a/flashinfer/moe_ep/backends/split/kernel/fused_moe/backend.py
++++ b/flashinfer/moe_ep/backends/split/kernel/fused_moe/backend.py
+@@ -133,6 +133,7 @@ def compute(self, ctx: SplitKernelContext):
+                 ctx.recv_topk_weights,
+                 num_local_experts=self._moe_config.experts.local_num_experts,
+                 local_expert_offset=offset,
++                num_experts=self._moe_config.routing.num_experts,
+                 quant=quant,
+                 per_token_activation=per_token_activation,
+                 mxfp8_dispatch=self._mxfp8_dispatch,
+diff --git a/flashinfer/moe_ep/backends/split/kernel/fused_moe/bridge.py b/flashinfer/moe_ep/backends/split/kernel/fused_moe/bridge.py
+index 74a5327fa50..f0a697e2a77 100644
+--- a/flashinfer/moe_ep/backends/split/kernel/fused_moe/bridge.py
++++ b/flashinfer/moe_ep/backends/split/kernel/fused_moe/bridge.py
+@@ -199,6 +199,7 @@ def build_activation_pack_rank_major(
+     *,
+     num_local_experts: int,
+     local_expert_offset: int = 0,
++    num_experts: Optional[int] = None,
+     quant: "QuantConfig",
+     per_token_activation: bool = False,
+     global_scale: Optional[torch.Tensor] = None,
+@@ -216,13 +217,10 @@ def build_activation_pack_rank_major(
+     in its top-k, weighted and summed (the "pre-reduce across local experts" the
+     layout contract calls for).
+ 
+-    This is the **faithful** path: we drive the unified runner at the model's real
+-    ``top_k`` with ``do_finalize=True`` (which does the per-token weighted sum), and
+-    mask the non-local picks to weight 0 (pointing them at a valid local expert so
+-    indexing stays in range).  ``combine`` then just sums across ranks — the real
+-    weights are applied here, not on receive.  (The runner still evaluates all
+-    ``top_k`` slots per token, so the masked picks cost compute they don't
+-    contribute; an exact local-only gather is a future optimization.)
++    The runner applies the real ``top_k`` weights and sums local contributions;
++    ``combine`` sums across ranks. Masked picks use a valid remote expert ID
++    when ``num_experts`` provides a remote shard, so the runner excludes them
++    from expert compute. Otherwise they use a local ID with zero weight.
+ 
+     Parameters
+     ----------
+@@ -238,6 +236,9 @@ def build_activation_pack_rank_major(
+         Number of experts this rank owns (carried for API symmetry / validation).
+     local_expert_offset : int
+         Global id of this rank's first local expert (see EXPERT_MAJOR builder).
++    num_experts : int, optional
++        Global expert count. Enables exclusion of masked picks from local compute
++        when this rank owns fewer than all experts.
+     quant, per_token_activation, global_scale :
+         Same semantics as :func:`build_activation_pack`.
+     """
+@@ -263,19 +264,15 @@ def build_activation_pack_rank_major(
+             f"{tuple(idx.shape)} / {tuple(weights.shape)}."
+         )
+ 
+-    # The RANK_MAJOR dispatch returns LOCAL expert indices (0-based within this
+-    # rank's experts) for each token's picks, with -1 marking a pick routed to a
+-    # NON-local expert (handled by another rank). Convert local->global
+-    # (idx + local_expert_offset) for the runner, which expects global ids and
+-    # filters by local_expert_offset. Only [0, num_local_experts) is local; -1 and
+-    # any out-of-range id are masked to a valid local id with weight 0, so the
+-    # weighted finalize sum drops them; combine then sums each token's per-rank
+-    # partial reductions across ranks.
++    # Zero weight alone does not skip GEMMs; a remote ID excludes the route.
++    masked_expert = local_expert_offset
++    if num_experts is not None and num_local_experts < num_experts:
++        masked_expert = (local_expert_offset + num_local_experts) % num_experts
+     is_local = (idx >= 0) & (idx < num_local_experts)
+     selected_experts = torch.where(
+         is_local,
+         idx + local_expert_offset,
+-        torch.full_like(idx, local_expert_offset),
++        torch.full_like(idx, masked_expert),
+     ).to(torch.int32)
+     final_scales = torch.where(is_local, weights, torch.zeros_like(weights))
+ 
+diff --git a/tests/moe_ep/test_compute_bridge.py b/tests/moe_ep/test_compute_bridge.py
+index 1fcc929d95b..20f7925929e 100644
+--- a/tests/moe_ep/test_compute_bridge.py
++++ b/tests/moe_ep/test_compute_bridge.py
+@@ -137,6 +137,36 @@ def test_rank_major_masks_out_of_range_local_expert_ids():
+     assert torch.all(pack.topk_weights == 0.0)
+ 
+ 
++@pytest.mark.parametrize(
++    "offset, num_experts, masked_expert",
++    [(0, 16, 4), (8, 16, 12), (12, 16, 0), (0, 4, 0), (8, None, 8)],
++)
++def test_rank_major_excludes_masked_routes(offset, num_experts, masked_expert):
++    idx = torch.tensor([[0, -1, 3, 4], [-1, -1, -1, -1]])
++    weights = torch.tensor([[0.1, 0.2, 0.3, 0.4], [0.4, 0.3, 0.2, 0.1]])
++    x = torch.zeros(1, 2, 64, dtype=torch.bfloat16)
++    pack = build_activation_pack_rank_major(
++        x,
++        idx,
++        weights,
++        num_local_experts=4,
++        local_expert_offset=offset,
++        num_experts=num_experts,
++        quant=QuantConfig(),
++    )
++    expected_ids = torch.tensor(
++        [[offset, masked_expert, offset + 3, masked_expert], [masked_expert] * 4],
++        dtype=torch.int32,
++    )
++    assert torch.equal(pack.topk_ids, expected_ids)
++    torch.testing.assert_close(
++        pack.topk_weights, torch.tensor([[0.1, 0.0, 0.3, 0.0], [0.0] * 4])
++    )
++    if num_experts is not None and num_experts > 4:
++        local = (pack.topk_ids >= offset) & (pack.topk_ids < offset + 4)
++        assert local.sum().item() == 2
++
++
+ def test_build_activation_pack_rank_major_rejects_2d():
+     bad = torch.zeros(8, 128, dtype=torch.bfloat16)
+     idx = torch.zeros(8, 8, dtype=torch.int64)
+diff --git a/tests/moe_ep/test_split_fused_moe_kernel_vs_reference.py b/tests/moe_ep/test_split_fused_moe_kernel_vs_reference.py
+index a893ef385d7..f5d6757fade 100644
+--- a/tests/moe_ep/test_split_fused_moe_kernel_vs_reference.py
++++ b/tests/moe_ep/test_split_fused_moe_kernel_vs_reference.py
+@@ -221,6 +221,82 @@ def test_split_bf16_kernel_matches_torch_reference():
+     torch.testing.assert_close(yk, yr, rtol=3e-2, atol=3e-2)
+ 
+ 
++@pytest.mark.arch_blackwell
++@pytest.mark.parametrize("offset", [0, 12])
++@pytest.mark.parametrize("num_tokens", [8, 512])
++def test_split_bf16_masked_routes_cuda_graph(offset, num_tokens):
++    """Remote routes stay excluded when graph inputs change or become empty."""
++    _require_backend(TrtllmBf16Config)
++
++    from dataclasses import replace
++
++    import torch
++
++    from flashinfer.fused_moe.layer import MoELayer
++    from flashinfer.moe_ep import MoEWeightPack
++    from flashinfer.moe_ep.backends.split.kernel.fused_moe.bridge import (
++        build_activation_pack_rank_major,
++    )
++    from flashinfer.moe_ep.backends.split.kernel.fused_moe.weights import (
++        materialize_fused_moe_weights,
++    )
++
++    x, w13, w2, _, weights = _make_problem()
++    repeats = (num_tokens + NUM_TOKENS - 1) // NUM_TOKENS
++    x = x.repeat(repeats, 1)[:num_tokens]
++    weights = weights.repeat(repeats, 1)[:num_tokens]
++    cfg = _build_moe_config("bf16")
++    cfg = replace(
++        cfg,
++        experts=replace(cfg.experts, local_expert_offset=offset, local_num_experts=4),
++        execution=replace(cfg.execution, tune_max_num_tokens=num_tokens),
++    )
++    wp = materialize_fused_moe_weights(
++        MoEWeightPack(w13=w13[offset : offset + 4], w2=w2[offset : offset + 4]), cfg
++    )
++    layer = MoELayer(cfg)
++    routes = torch.arange(num_tokens * TOP_K, device="cuda").reshape(-1, TOP_K)
++    initial = torch.where(routes % 3 == 0, -1, routes % 4)
++    initial[0] = -1
++    idx = initial.clone()
++
++    def forward():
++        pack = build_activation_pack_rank_major(
++            x.reshape(1, num_tokens, HIDDEN),
++            idx,
++            weights,
++            num_local_experts=4,
++            local_expert_offset=offset,
++            num_experts=NUM_EXPERTS,
++            quant=cfg.quant,
++        )
++        return layer(pack, wp)
++
++    def check(output):
++        reference = _dense_moe_reference(
++            x.float(),
++            w13.float(),
++            w2.float(),
++            idx.clamp_min(0) + offset,
++            torch.where(idx >= 0, weights, 0.0),
++            act_roundtrip=lambda a: a.to(torch.bfloat16).float(),
++        )
++        torch.testing.assert_close(output.float(), reference, rtol=3e-2, atol=3e-2)
++        assert torch.count_nonzero(output[(idx < 0).all(dim=1)]).item() == 0
++
++    for _ in range(3):
++        output = forward()
++    check(output)
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        output = forward()
++    for new_idx in (initial, torch.full_like(idx, -1), (routes + 1) % 4):
++        idx.copy_(new_idx)
++        graph.replay()
++        check(output)
++
++
+ @pytest.mark.arch_blackwell
+ def test_split_nvfp4_kernel_matches_torch_reference():
+     """``trtllm_fp4_routed`` (all experts local) matches the dequant torch oracle."""

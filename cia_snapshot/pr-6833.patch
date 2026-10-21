@@ -1,0 +1,357 @@
+diff --git a/flashinfer/gemm/gemm_base.py b/flashinfer/gemm/gemm_base.py
+index 983f0f806d..33362f8a1f 100644
+--- a/flashinfer/gemm/gemm_base.py
++++ b/flashinfer/gemm/gemm_base.py
+@@ -741,7 +741,8 @@ def mm_bf16(
+         cluster Split-K otherwise. With autotuning, one call profiles the
+         available low-M kernels on their supported buckets and a single
+         cuBLASLt fallback runner on each M > 32 bucket, so a single large-M
+-        warm-up tunes both ranges; with bias the direct kernel is excluded.
++        warm-up tunes both ranges; the direct kernel is profiled only for
++        M <= 2 or M * N <= 4096, and never with bias.
+         Direct and warp Split-K reuse compiled kernels across M for matching
+         tactics, while each M bucket still tunes independently.
+         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
+@@ -2421,6 +2422,7 @@ def _cute_dsl_direct_bf16_gemm_runner(
+         DirectTactic,
+         autotune_tactics,
+         default_tactic,
++        is_direct_bf16_gemm_candidate_sm100,
+         run_direct_dense,
+         validate_tactic,
+     )
+@@ -2430,6 +2432,11 @@ def supports_inputs(self, inputs: List[torch.Tensor]) -> bool:
+             a, b, bias, *_ = inputs
+             if bias is not None:  # the Direct kernel has no bias epilogue
+                 return False
++            # Outside this M x N region warp / cluster Split-K matched or beat
++            # direct (cold-L2 B200/B300 sweep), so its tactics would only add
++            # autotune compiles.
++            if not is_direct_bf16_gemm_candidate_sm100(a.shape[0], b.shape[1]):
++                return False
+             try:
+                 default_tactic(a.shape[0], b.shape[1], a.shape[1])
+             except ValueError:
+diff --git a/flashinfer/gemm/kernels/dense_bf16_gemm_direct.py b/flashinfer/gemm/kernels/dense_bf16_gemm_direct.py
+index b0db5d7949..118ae87f70 100644
+--- a/flashinfer/gemm/kernels/dense_bf16_gemm_direct.py
++++ b/flashinfer/gemm/kernels/dense_bf16_gemm_direct.py
+@@ -67,17 +67,28 @@ def validate_tactic(tactic: DirectTactic, m: int, n: int, k: int) -> None:
+ 
+ def default_tactic(m: int, n: int, k: int) -> DirectTactic:
+     """Choose the measured register-prefetch fallback tactic."""
+-    block_size = next(
+-        (
+-            block
+-            for block in (256, 192, 128, 96, 64, 32)
+-            if k % (block * _VECTOR_WIDTH) == 0
+-        ),
+-        None,
+-    )
+-    if block_size is None:
++    blocks = [
++        block
++        for block in (256, 192, 128, 96, 64, 32)
++        if k % (block * _VECTOR_WIDTH) == 0
++    ]
++    if not blocks:
+         raise ValueError("direct GEMM requires a supported 16-byte K tiling")
+-    outputs_per_block = next(outputs for outputs in (2, 1) if n % outputs == 0)
++    # For M <= 4, keep at least two prefetched B vectors per thread: with one,
++    # a short-K CTA has too few loads in flight (cold-L2 B200/B300 sweep: up to
++    # 15% at M <= 2, K = 2048).  Larger M already issues a load per row.
++    block_size = blocks[0]
++    if m <= 4:
++        block_size = next(
++            (block for block in blocks if k // (block * _VECTOR_WIDTH) >= 2),
++            blocks[-1],
++        )
++    # Small weights (< 4 MiB): one output per CTA doubles the CTA count (up to
++    # 20% at M=8, N=128); larger weights already fill the SMs with two.
++    if n * k < 1 << 21:
++        outputs_per_block = 1
++    else:
++        outputs_per_block = next(outputs for outputs in (2, 1) if n % outputs == 0)
+     tactic = DirectTactic(
+         block_size,
+         outputs_per_block,
+@@ -114,17 +125,31 @@ def autotune_tactics(m: int, n: int, k: int) -> list[DirectTactic]:
+     return list(dict.fromkeys(tactics))
+ 
+ 
++def is_direct_bf16_gemm_candidate_sm100(m: int, n: int) -> bool:
++    """Return whether direct is worth profiling for public ``(M, N)``.
++
++    Direct splits N one to four outputs per CTA, so it wins while M * N is too
++    small for the 16-wide warp / tensor-core tiles to fill the SMs; above
++    M = 8 each row group also re-reads B.  In a cold-L2 CUPTI sweep on B200
++    and B300 (M in {1, 2, 3, 4, 6, 8, 12, 16, 24, 32}, N = 128..8192,
++    K = 768..40960, every tactic of all three runners), direct never beat warp /
++    cluster Split-K by more than 1% outside this region.
++    """
++    return m <= 2 or m * n <= 4096
++
++
+ def prefer_direct_bf16_gemm_sm100(m: int, n: int, k: int) -> bool:
+-    """Return the conservative B200 no-autotune crossover heuristic.
++    """Return the no-autotune crossover heuristic (B200 and B300).
+ 
+-    The three bands are a compact fit to a warm/cold sweep over M=1..16,24,32,
+-    18 N values, and 11 K values.  This is deliberately not a blanket rule for
+-    K=8192: direct wins only where public M and N leave the tensor-core path
+-    with too little independent output work.
++    True implies ``default_tactic(m, n, k)`` succeeds.  In the region the
++    default direct tactic ran within 5% of the best warp / cluster Split-K
++    tactic on every measured shape (cold L2) and was 12% faster at the median;
++    K only scales the margin.  M <= 2 was measured up to N = 7168 (N = 8192
++    only at K = 40960).
+     """
+-    return k == 8192 and (
+-        (m == 1 and n <= 4608) or (m <= 4 and n <= 512) or (m <= 8 and n <= 256)
+-    )
++    if k % (_SUPPORTED_BLOCK_SIZES[0] * _VECTOR_WIDTH):
++        return False
++    return (m <= 2 and n <= 8192) or m * n <= 2048
+ 
+ 
+ class DirectDenseGemmKernel:
+@@ -376,6 +401,7 @@ def run_direct_dense(a, b, out, pdl: bool, tactic: DirectTactic):
+     "DirectTactic",
+     "autotune_tactics",
+     "default_tactic",
++    "is_direct_bf16_gemm_candidate_sm100",
+     "prefer_direct_bf16_gemm_sm100",
+     "run_direct_dense",
+ ]
+diff --git a/flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py b/flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py
+index 2a5ff503cf..b0f9f836e7 100644
+--- a/flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py
++++ b/flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py
+@@ -197,7 +197,103 @@ def autotune_tactics(
+                         min(max_stages, stage_limit) + 1,
+                     )
+                 )
+-    return tactics
++    if not tactics:
++        return tactics
++    default = default_tactic(m, n, k)
++    return [
++        t
++        for t in tactics
++        if t == default or _keep_autotune_tactic(t, default, tactics, m, n, k)
++    ]
++
++
++@functools.cache
++def _max_active_clusters(device_index: int, split_k: int) -> int:
++    with _torch.cuda.device(device_index):
++        return utils.HardwareInfo().get_max_active_clusters(split_k)
++
++
++# Weight bytes the ring should keep in flight per CTA (9 stages of a 64-row
++# tile): with M <= 32 the weight stream is what the pipeline has to cover.
++_WEIGHT_BYTES_IN_FLIGHT = 9 * 64 * _CTA_K * 2
++
++
++def _keep_autotune_tactic(t, default, tactics, m, n, k) -> bool:
++    """Keep the tactics that can beat the default; see the rules below.
++
++    A cold-L2 CUPTI sweep of every tactic (B200 and B300, M=1..32,
++    N=128..8192, K=768..40960) kept the best tactic within 2.1% while
++    profiling about 8% of the space.  Winners fill one co-resident wave
++    (clusters must fit their GPC) and keep ~144 KB of weights in flight.
++    """
++    device = _torch.cuda.current_device()
++    sm_count = _torch.cuda.get_device_properties(device).multi_processor_count
++
++    def tiles(x):
++        return (m + x.mma_n - 1) // x.mma_n
++
++    def grid(x):
++        return (n + x.mma_m - 1) // x.mma_m * tiles(x) * x.split_k
++
++    def fits(x):
++        capacity = (
++            sm_count if x.split_k == 1 else _max_active_clusters(device, x.split_k)
++        )
++        return grid(x) // x.split_k <= capacity
++
++    def unpadded(x):
++        # A narrower mma_n covering M with as many token tiles is pure padding.
++        return not any(
++            w < x.mma_n and (m + w - 1) // w == tiles(x) for w in _SUPPORTED_MMA_N
++        )
++
++    if not unpadded(t):
++        return False
++    cands = [x for x in tactics if unpadded(x)]
++    # mma_m=128 halves the CTAs; it only won on long, wide shapes where the
++    # 64-row tile at the same (mma_n, split_k) cannot fit one wave.
++    if t.mma_m == 128 and (
++        n < 2048
++        or k < 2048
++        or any(
++            x.mma_m == 64 and (x.mma_n, x.split_k) == (t.mma_n, t.split_k) and fits(x)
++            for x in cands
++        )
++    ):
++        return False
++
++    def fullest(mma_n):
++        return max((grid(x) for x in cands if x.mma_n == mma_n and fits(x)), default=0)
++
++    # A coarser mma_n saves a weight pass but halves the CTAs; keep it only
++    # when its fullest one-wave grid still occupies >= 40% of the SMs.
++    if t.mma_n > min(x.mma_n for x in cands) and fullest(t.mma_n) < 0.4 * sm_count:
++        return False
++    # Grid fill per mma_n: one-wave grids within 0.75x of the fullest; split 1
++    # (no DSMEM reduction) down to 0.5x, and any split when the fullest grid
++    # leaves each CTA <= 2 K blocks.  Without a one-wave grid keep the smallest.
++    same_n = [x for x in cands if x.mma_n == t.mma_n]
++    fitting = [x for x in same_n if fits(x)]
++    if not fitting:
++        if grid(t) != min(grid(x) for x in same_n):
++            return False
++    else:
++        best = max(grid(x) for x in fitting)
++        split = min(x.split_k for x in fitting if grid(x) == best)
++        alpha = 0.5 if k // _CTA_K // split <= 2 else 0.75
++        if not fits(t) or not (
++            grid(t) >= alpha * best or (t.split_k == 1 and 2 * grid(t) >= best)
++        ):
++            return False
++    # ab_stages: the shallowest window stage reaching the in-flight target, else
++    # the deepest stage the window allows.
++    window = sorted(
++        x.ab_stages
++        for x in tactics
++        if x.mma_m == t.mma_m and (x.mma_n, x.split_k) == (t.mma_n, t.split_k)
++    )
++    deep = [s for s in window if t.mma_m * _CTA_K * 2 * s >= _WEIGHT_BYTES_IN_FLIGHT]
++    return t.ab_stages == (deep[0] if deep else window[-1])
+ 
+ 
+ def default_tactic(m: int, n: int, k: int) -> SplitKTactic:
+diff --git a/flashinfer/gemm/kernels/dense_bf16_gemm_warp_splitk.py b/flashinfer/gemm/kernels/dense_bf16_gemm_warp_splitk.py
+index bb0f68766b..8dfbb5b0c6 100644
+--- a/flashinfer/gemm/kernels/dense_bf16_gemm_warp_splitk.py
++++ b/flashinfer/gemm/kernels/dense_bf16_gemm_warp_splitk.py
+@@ -413,7 +413,117 @@ def autotune_tactics(m: int, n: int, k: int) -> list[WarpSplitKTactic]:
+                         )
+                     )
+     default = default_tactic(m, n, k)
+-    return [default, *(tactic for tactic in tactics if tactic != default)]
++    sm_count = _torch.cuda.get_device_properties(
++        _torch.cuda.current_device()
++    ).multi_processor_count
++    return [
++        default,
++        *(
++            tactic
++            for tactic in tactics
++            if tactic != default
++            and _keep_autotune_tactic(tactic, default, tactics, m, n, k, sm_count)
++        ),
++    ]
++
++
++# Below ~96 KB of A + B in flight per SM a cold read is latency-bound (see
++# _MAX_STAGES); a shallower ring is only worth profiling above it.
++_MIN_BYTES_IN_FLIGHT = 96 * 1024
++
++
++def _resident_ring(output_tile, token_tile, k_tile, stages, ctas_per_sm):
++    """Deepest legal ring that lets ``ctas_per_sm`` CTAs co-reside on one SM."""
++    fit = [
++        s
++        for s in stages
++        if ctas_per_sm
++        * (
++            _smem_bytes(WarpSplitKTactic(output_tile, token_tile, k_tile, s, 1))
++            + _CTA_RESERVED_SMEM
++        )
++        <= _SM_SMEM_BYTES
++    ]
++    return max(fit) if fit else min(stages)
++
++
++def _keep_autotune_tactic(t, default, tactics, m, n, k, sm_count) -> bool:
++    """Keep the tactics that can beat the default; see the rules below.
++
++    A cold-L2 CUPTI sweep of every legal tactic (B200 and B300, M=1..32,
++    N=128..8192, K=768..8192) kept the best tactic within 2.6% while profiling
++    about 4% of the space.  The rules follow from the kernel being bound by the
++    weight stream: what matters is how many CTAs co-reside (wave fill) and how
++    many bytes each SM keeps in flight.
++    """
++    ctas = (n // t.output_tile) * ((m + t.token_tile - 1) // t.token_tile)
++    default_ctas = (n // default.output_tile) * (
++        (m + default.token_tile - 1) // default.token_tile
++    )
++    same_grid = ctas == default_ctas
++    # Token tile: the default or one step finer.  A coarser tile re-streams
++    # fewer weights but halves the CTAs; it only won on tiny short-K grids.
++    if not default.token_tile // 2 <= t.token_tile <= 2 * default.token_tile:
++        return False
++    if t.token_tile > default.token_tile and not (
++        t.token_tile <= 16 and n // 16 <= 16 and k <= 2048
++    ):
++        return False
++
++    # Output tile: the default, or the other width when both deal the same work
++    # per SM wave (a tie the default breaks blindly), on a tiny short-K grid,
++    # or when it keeps the default CTA count.
++    def wave_work(tile):
++        return (n // tile + sm_count - 1) // sm_count * tile
++
++    if t.output_tile != default.output_tile:
++        if not (
++            (n % 32 == 0 and wave_work(16) == wave_work(32) and t.token_tile <= 16)
++            or (n // 16 <= 16 and k <= 1024)
++            or same_grid
++        ):
++            return False
++        if t.token_tile != default.token_tile and not same_grid:
++            return False
++
++    def legal(k_tile):
++        return [
++            x.stages
++            for x in tactics
++            if (x.output_tile, x.token_tile, x.k_tile, x.b_loader_warps)
++            == (t.output_tile, t.token_tile, k_tile, t.b_loader_warps)
++        ]
++
++    waves = (ctas + sm_count - 1) // sm_count
++    stages = legal(t.k_tile)
++    ring = _resident_ring(t.output_tile, t.token_tile, t.k_tile, stages, waves)
++    # 128-wide K tiles only when their co-resident ring holds at least as many
++    # K elements as the 256-wide one (fewer barriers otherwise win).
++    stages_256 = legal(256)
++    if t.k_tile == 128 and stages_256:
++        ring_256 = _resident_ring(t.output_tile, t.token_tile, 256, stages_256, waves)
++        if 128 * ring < 256 * ring_256:
++            return False
++    # Two B-loader warps only matter while one CTA per SM must keep a deep ring
++    # full; on >= 2-wave grids keep default_tactic()'s choice.
++    if ctas >= 2 * sm_count and t.b_loader_warps != (
++        2 if t.token_tile >= 16 or k // t.k_tile >= 8 else 1
++    ):
++        return False
++    # Stages: the deepest ring that keeps the grid in one wave, and on a
++    # half-filled default-token-tile grid one ring shallower (one more CTA per
++    # SM) if it still keeps enough bytes in flight.
++    if t.stages == ring:
++        return t.b_loader_warps == 1 or t.output_tile == default.output_tile
++    shallower = _resident_ring(t.output_tile, t.token_tile, t.k_tile, stages, waves + 1)
++    return (
++        t.stages == shallower
++        and t.token_tile == default.token_tile
++        and 2 * ctas >= waves * sm_count
++        and waves * shallower * (t.output_tile + t.token_tile) * t.k_tile * 2
++        >= _MIN_BYTES_IN_FLIGHT
++        and t.b_loader_warps == 1
++    )
+ 
+ 
+ def _make_smem_layout(dtype, rows: int, cols: int, stages: int):

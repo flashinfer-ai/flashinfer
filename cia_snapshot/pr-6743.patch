@@ -1,0 +1,1199 @@
+diff --git a/flashinfer/mla/_batch_mla/_backends/_fa_common.py b/flashinfer/mla/_batch_mla/_backends/_fa_common.py
+index 0f9d392b8e4..0f0cd76b9b0 100644
+--- a/flashinfer/mla/_batch_mla/_backends/_fa_common.py
++++ b/flashinfer/mla/_batch_mla/_backends/_fa_common.py
+@@ -990,6 +990,24 @@ def plan_from_wrapper(
+                 buffer.copy_(original)
+             raise
+ 
++    def _check_planned_geometry(self, q_nope, ckv_cache):
++        # Structural resolution already checked ranks, widths and matching
++        # prefix shapes/devices within each split pair. Only plan facts remain.
++        if q_nope.shape[:2] != self._planned_query_shape:
++            raise ValueError(
++                "q_nope rows and heads must match the planned query shape."
++            )
++        cache_shape = ckv_cache.shape
++        if cache_shape[1] != self._page_size:
++            raise ValueError("ckv_cache page size must match the planned page_size.")
++        if q_nope.device != self.device or ckv_cache.device != self.device:
++            raise ValueError(
++                "q_nope and ckv_cache must be on the planned workspace device."
++            )
++        page_min, required_pages = self._planned_kv_page_range
++        if page_min < 0 or cache_shape[0] < required_pages:
++            raise ValueError("KV cache does not cover the planned CSR page indices.")
++
+     def run_from_wrapper(
+         self,
+         *,
+@@ -1030,6 +1048,7 @@ def run_from_wrapper(
+             raise ValueError("BMM scales are not supported with an fa2/fa3 backend.")
+         q_nope, q_pe = cast(tuple[torch.Tensor, torch.Tensor], query)
+         ckv_cache, kpe_cache = cast(tuple[torch.Tensor, torch.Tensor], kv_cache)
++        self._check_planned_geometry(q_nope, ckv_cache)
+         return self._run_generated_fa(
+             q_nope=q_nope,
+             q_pe=q_pe,
+@@ -1059,6 +1078,9 @@ def configure_tuning(self, *, cache_key: tuple, run_options: dict) -> None:
+         self._planned_run_options = dict(run_options)
+ 
+     def get_valid_tactics(self, inputs, profile):
++        # Limit automatic profiling to validated native FA3 widths.
++        if self._backend == "fa3" and self._head_dim_ckv not in (128, 256, 512):
++            return []
+         return [-1] if self._prepare_planned_inputs(inputs) is not None else []
+ 
+     def _prepare_planned_inputs(self, inputs):
+@@ -1108,9 +1130,6 @@ def _prepare_planned_inputs(self, inputs):
+             check_shape_dtype_device(
+                 inputs[3], self._planned_query_shape, torch.float32, self.device, "lse"
+             )
+-        # Limit automatic profiling to validated native FA3 widths.
+-        if self._backend == "fa3" and self._head_dim_ckv not in (128, 256, 512):
+-            return None
+         # Native FA forwards only outer strides. Q/KV loads and output stores
+         # operate in 16-byte vectors, including for noncompact outer layouts.
+         for tensor in (*query, *cache, inputs[2]):
+@@ -1154,8 +1173,6 @@ def forward(
+         if tactic != -1:
+             raise ValueError(f"Unsupported {self._backend} MLA tactic: {tactic!r}.")
+         query, kv_cache, out, lse, sinks = inputs[:5]
+-        # Selection lasts for the plan. Validate current tensors here as well
+-        # as during profiling, before native code uses its fixed plan geometry.
+         prepared = self._prepare_planned_inputs(inputs)
+         if prepared is None:
+             raise ValueError(
+diff --git a/scripts/task_jit_run_tests_part4.sh b/scripts/task_jit_run_tests_part4.sh
+index 0e96e4a34bb..afc542a06f0 100755
+--- a/scripts/task_jit_run_tests_part4.sh
++++ b/scripts/task_jit_run_tests_part4.sh
+@@ -18,6 +18,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+ # Separate processes release CUDA memory between files.
+ pytest -s tests/attention/test_batch_prefill_kernels.py -k 'nvfp4 and not large_head_bf16'
+ pytest -s tests/attention/test_deepseek_mla.py
++pytest -s tests/attention/test_mla_paged_attention_fuzz.py
+ pytest -s tests/attention/test_rope.py
+ pytest -s tests/attention/test_mla_page.py
+ pytest -s tests/utils/test_quantization.py
+diff --git a/tests/attention/test_mla_paged_attention_fuzz.py b/tests/attention/test_mla_paged_attention_fuzz.py
+new file mode 100644
+index 00000000000..3039a1318b0
+--- /dev/null
++++ b/tests/attention/test_mla_paged_attention_fuzz.py
+@@ -0,0 +1,838 @@
++"""Seeded reject-or-correct checks for the public Batch MLA wrapper (#3605).
++
++FLASHINFER_MLA_FUZZ_NUM_TESTS controls the random cases (default 150).
++FLASHINFER_MLA_FUZZ_SEED sets the first seed (default 0).
++FLASHINFER_MLA_FUZZ_ONLY_SEED selects comma-separated seeds for reproduction.
++Valid cases must run; mutations must reject cleanly or preserve the oracle.
++"""
++
++import math
++import os
++import random
++import re
++import zlib
++from contextlib import contextmanager
++from dataclasses import dataclass, replace
++
++import pytest
++import torch
++
++from flashinfer.mla import BatchMLAPagedAttentionWrapper, MLAPlanMetadata
++from flashinfer.utils import get_compute_capability, get_indptr, is_sm90a_supported
++from tests.test_helpers.fuzz_ledger import Finding, FuzzLedger
++
++
++BACKENDS = ("fa2", "fa3", "cutlass", "auto")
++NUM_TESTS = int(os.environ.get("FLASHINFER_MLA_FUZZ_NUM_TESTS", "150"))
++START_SEED = int(os.environ.get("FLASHINFER_MLA_FUZZ_SEED", "0"))
++ONLY_SEED = os.environ.get("FLASHINFER_MLA_FUZZ_ONLY_SEED", "")
++SEEDS = (
++    [int(seed) for seed in ONLY_SEED.split(",") if seed.strip()]
++    if ONLY_SEED
++    else list(range(START_SEED, START_SEED + NUM_TESTS))
++)
++CKV, KPE = 512, 64
++CLEAN_ERRORS = (ValueError, TypeError)
++LEDGER = FuzzLedger(
++    "batch-mla",
++    [
++        Finding(
++            match=lambda mutation: (
++                mutation in ("page_id_out_of_pool", "page_id_negative", "kv_pool_short")
++            ),
++            backend="cutlass",
++            reason="#6741: CUTLASS does not validate page indices against the runtime KV pool",
++            quarantine=True,
++        ),
++        Finding(
++            match=lambda phase: phase == "poisoned_padding",
++            backend="cutlass",
++            reason="#6860: CUTLASS MLA propagates NaNs from last-page tails and dense-table padding",
++            quarantine=True,
++        ),
++        Finding(
++            match=lambda phase: phase == "poisoned_padding",
++            backend="cute-dsl-monolithic",
++            reason="#6861: CuTe DSL monolithic MLA propagates padding NaNs into valid output",
++            quarantine=True,
++        ),
++    ],
++)
++UNIT_ROUNDOFF = {torch.bfloat16: 2**-8, torch.float16: 2**-11}
++BOUND_FACTOR = 8
++
++
++@dataclass(frozen=True)
++class Config:
++    seed: int
++    q_lengths: tuple[int, ...]
++    kv_lengths: tuple[int, ...]
++    heads: int = 16
++    page_size: int = 16
++    dtype: torch.dtype = torch.bfloat16
++    causal: bool = False
++    metadata_form: str = "csr"
++    metadata_device: str = "cpu"
++    query_layout: str = "split"
++    kv_layout: str = "split"
++    lse_mode: str = "base2"
++    fp8_kv: bool = False
++
++
++@dataclass
++class Problem:
++    config: Config
++    query: object
++    kv_cache: object
++    q: torch.Tensor
++    cache: torch.Tensor
++    pages: tuple[tuple[int, ...], ...]
++    metadata: object
++    nan_page: int
++
++
++@dataclass
++class Reference:
++    out: torch.Tensor
++    lse: torch.Tensor
++    magnitude: torch.Tensor
++
++
++def sample_config(seed, backend):
++    rng = random.Random(seed)
++    page = rng.choice((1, 16, 32, 64))
++    batch = rng.randint(1, 8)
++    kv_lengths = tuple(
++        rng.choice((1, max(1, page - 1), page, page + 1, 127, 128, 129, 4096))
++        for _ in range(batch)
++    )
++    q_lengths = tuple(min(rng.choice((1, 8, 33)), length) for length in kv_lengths)
++    cfg = Config(
++        seed,
++        q_lengths,
++        kv_lengths,
++        heads=rng.choice((16, 32, 64, 128)),
++        page_size=page,
++        dtype=rng.choice((torch.float16, torch.bfloat16)),
++        causal=rng.choice((False, True)),
++        metadata_form=rng.choice(("csr", "dense")),
++        metadata_device=rng.choice(("cpu", "cuda")),
++        query_layout=rng.choice(("packed", "adjacent", "split")),
++        kv_layout=rng.choice(("packed", "adjacent", "split")),
++        lse_mode=rng.choice(("none", "base2", "basee")),
++    )
++    if backend == "cutlass":
++        cfg = replace(
++            cfg,
++            q_lengths=(1,) * batch,
++            heads=128,
++            query_layout="packed",
++            kv_layout="packed",
++            lse_mode="none",
++        )
++    return cfg
++
++
++def _structure(tensor, layout):
++    if layout == "packed":
++        return tensor
++    parts = tensor.split((CKV, KPE), dim=-1)
++    return tuple(part.contiguous() for part in parts) if layout == "split" else parts
++
++
++def make_problem(cfg, device="cuda", *, poison_padding=True):
++    generator = torch.Generator().manual_seed(cfg.seed)
++    counts = [
++        (length + cfg.page_size - 1) // cfg.page_size for length in cfg.kv_lengths
++    ]
++    pool_size = sum(counts) + 2
++    order = torch.randperm(pool_size, generator=generator).tolist()
++    pages, cursor = [], 0
++    for count in counts:
++        pages.append(tuple(order[cursor : cursor + count]))
++        cursor += count
++    q = torch.randn(sum(cfg.q_lengths), cfg.heads, CKV + KPE, generator=generator) * 0.5
++    cache = torch.randn(pool_size, cfg.page_size, CKV + KPE, generator=generator) * 0.5
++    # Three heads attend to the first, last and middle token; other heads stay random.
++    # Lost pages or split-KV chunks must affect out even when LSE is not requested.
++    anchors = min(3, cfg.heads)
++    q[..., CKV : CKV + anchors] = 0
++    cache[..., CKV : CKV + anchors] = 0
++    start = 0
++    for q_length, kv_length, ids in zip(
++        cfg.q_lengths, cfg.kv_lengths, pages, strict=True
++    ):
++        for head, token in enumerate((0, kv_length - 1, kv_length // 2)[:anchors]):
++            q[start : start + q_length, head] = 0
++            q[start : start + q_length, head, CKV + head] = 4
++            cache[ids[token // cfg.page_size], token % cfg.page_size, CKV + head] = 48
++        start += q_length
++    q = q.to(device=device, dtype=cfg.dtype)
++    cache = cache.to(
++        device=device, dtype=torch.float8_e4m3fn if cfg.fp8_kv else cfg.dtype
++    )
++    nan_page = order[cursor]
++    if poison_padding:
++        cache[nan_page].fill_(float("nan"))
++        for ids, length in zip(pages, cfg.kv_lengths, strict=True):
++            tail = length % cfg.page_size
++            if tail:
++                cache[ids[-1], tail:].fill_(float("nan"))
++    meta_device = "cpu" if str(device) == "cpu" else cfg.metadata_device
++
++    def indptr(lengths):
++        return get_indptr(torch.tensor(lengths)).to(
++            device=meta_device, dtype=torch.int32
++        )
++
++    qptr = indptr(cfg.q_lengths)
++    lengths = torch.tensor(cfg.kv_lengths, dtype=torch.int32, device=meta_device)
++    if cfg.metadata_form == "csr":
++        metadata = MLAPlanMetadata.csr(
++            qptr,
++            indptr(counts),
++            torch.tensor(
++                [page for ids in pages for page in ids],
++                dtype=torch.int32,
++                device=meta_device,
++            ),
++            lengths,
++        )
++    else:
++        table = torch.full(
++            (len(pages), max(counts) + 1),
++            nan_page,
++            dtype=torch.int32,
++            device=meta_device,
++        )
++        for row, ids in enumerate(pages):
++            table[row, : len(ids)] = torch.tensor(
++                ids, dtype=torch.int32, device=meta_device
++            )
++        metadata = MLAPlanMetadata.dense(qptr, table, lengths, max(cfg.q_lengths))
++    return Problem(
++        cfg,
++        _structure(q, cfg.query_layout),
++        _structure(cache, cfg.kv_layout),
++        q,
++        cache,
++        tuple(pages),
++        metadata,
++        nan_page,
++    )
++
++
++def reference_mla(p):
++    """Gather logical requests independently of the wrapper's metadata lowering."""
++    cfg = p.config
++    outputs, lses, magnitudes, start = [], [], [], 0
++    for q_length, kv_length, ids in zip(
++        cfg.q_lengths, cfg.kv_lengths, p.pages, strict=True
++    ):
++        query = p.q[start : start + q_length].float()
++        kv = p.cache[list(ids)].reshape(-1, CKV + KPE)[:kv_length].float()
++        ckv, kpe = kv.split((CKV, KPE), dim=-1)
++        if cfg.fp8_kv:
++            ckv, kpe = ckv * 0.5, kpe * 2.0
++        keys = torch.cat((ckv, kpe), dim=-1)
++        scores = torch.einsum("qhd,kd->hqk", query, keys) / math.sqrt(128 + KPE)
++        if cfg.causal:
++            qpos = torch.arange(q_length, device=query.device)[:, None]
++            kpos = torch.arange(kv_length, device=query.device)[None, :]
++            scores.masked_fill_(kpos > kv_length - q_length + qpos, -float("inf"))
++        lse = torch.logsumexp(scores, dim=-1).T
++        probs = scores.softmax(-1)
++        outputs.append(torch.einsum("hqk,kd->qhd", probs, ckv))
++        magnitudes.append(torch.einsum("hqk,kd->qhd", probs, ckv.abs()))
++        lses.append(lse / math.log(2) if cfg.lse_mode == "base2" else lse)
++        start += q_length
++    return Reference(torch.cat(outputs), torch.cat(lses), torch.cat(magnitudes))
++
++
++def _plan_kwargs(p):
++    cfg = p.config
++    return dict(
++        metadata=p.metadata,
++        num_heads=cfg.heads,
++        head_dim_ckv=CKV,
++        head_dim_kpe=KPE,
++        page_size=cfg.page_size,
++        causal=cfg.causal,
++        sm_scale=1 / math.sqrt(128 + KPE),
++        q_data_type=cfg.dtype,
++        kv_data_type=p.cache.dtype,
++        query_layout="split" if cfg.query_layout == "split" else "packed",
++        kv_cache_layout="split" if cfg.kv_layout == "split" else "packed",
++        lse_mode=cfg.lse_mode,
++        scale_mode="kv-per-tensor" if cfg.fp8_kv else "default",
++    )
++
++
++def _run_kwargs(p, out, lse):
++    kwargs = dict(
++        query=p.query,
++        kv_cache=p.kv_cache,
++        out=out,
++        return_lse=p.config.lse_mode != "none",
++    )
++    if p.config.lse_mode != "none":
++        kwargs.update(lse=lse, return_lse_base_on_e=p.config.lse_mode == "basee")
++    if p.config.fp8_kv:
++        kwargs.update(ckv_scale=0.5, kpe_scale=2.0)
++    return kwargs
++
++
++def _wrapper(p, backend, workspace, graph=False):
++    reserves = {}
++    if graph:
++        batch = len(p.config.q_lengths)
++        reserves = dict(
++            qo_indptr=torch.empty(batch + 1, dtype=torch.int32, device=p.q.device),
++            kv_indptr=torch.empty(batch + 1, dtype=torch.int32, device=p.q.device),
++            kv_len_arr=torch.empty(batch, dtype=torch.int32, device=p.q.device),
++            kv_indices=torch.empty(
++                sum(map(len, p.pages)) + 16, dtype=torch.int32, device=p.q.device
++            ),
++        )
++    wrapper = BatchMLAPagedAttentionWrapper(
++        workspace, backend=backend, use_cuda_graph=graph, **reserves
++    )
++    wrapper.plan(**_plan_kwargs(p))
++    return wrapper
++
++
++def _guarded(shape, dtype, device):
++    storage = torch.full((math.prod(shape) + 64,), -23, dtype=dtype, device=device)
++    return storage, storage[32:-32].view(shape)
++
++
++def _crc(tensor):
++    return zlib.crc32(
++        tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
++    )
++
++
++def _check_numeric(out, lse, p, reference):
++    assert torch.isfinite(reference.out).all()
++    assert torch.isfinite(out).all()
++    error = (out.float() - reference.out).abs()
++    bound = (
++        BOUND_FACTOR
++        * UNIT_ROUNDOFF[p.config.dtype]
++        * (reference.magnitude + reference.out.abs())
++    )
++    exceeded = error > bound
++    if exceeded.any():
++        ratio = torch.where(
++            bound > 0,
++            error / bound,
++            torch.where(error == 0, 0.0, float("inf")),
++        )
++        index = tuple(int(i) for i in torch.unravel_index(ratio.argmax(), ratio.shape))
++        raise AssertionError(
++            f"{int(exceeded.sum())}/{error.numel()} elements exceed the rounding bound; "
++            f"max ratio={float(ratio[index]):.6g} at {index}, "
++            f"error={float(error[index]):.6g}, bound={float(bound[index]):.6g}"
++        )
++    if p.config.lse_mode != "none":
++        assert torch.isfinite(reference.lse).all() and torch.isfinite(lse).all()
++        # FA2 also sums rounded exp(score - max) weights for the normalizer.
++        # Their relative sum error is at most u + N * eta: the sum is >= 1,
++        # and eta = tiny * u bounds subnormal rounding per weight.
++        u = UNIT_ROUNDOFF[p.config.dtype]
++        relative_sum_error = u * (
++            1 + max(p.config.kv_lengths) * torch.finfo(p.config.dtype).tiny
++        )
++        rounding_bound = -math.log1p(-relative_sum_error)
++        if p.config.lse_mode == "base2":
++            rounding_bound /= math.log(2)
++        torch.testing.assert_close(
++            lse, reference.lse, atol=1e-3 + rounding_bound, rtol=1e-3
++        )
++
++
++def _run_and_check(p, wrapper):
++    reference = reference_mla(p)
++    shape = (sum(p.config.q_lengths), p.config.heads)
++    out_storage, out = _guarded((*shape, CKV), p.config.dtype, p.q.device)
++    lse_storage, lse = _guarded(shape, torch.float32, p.q.device)
++    inputs = (p.query, p.kv_cache)
++    leaves = [
++        t for value in inputs for t in (value if isinstance(value, tuple) else (value,))
++    ]
++    input_crc = [_crc(t) for t in leaves]
++    previous = None
++    for poison in (float("nan"), 17.0):
++        out.fill_(poison)
++        lse.fill_(poison)
++        returned = wrapper.run(**_run_kwargs(p, out, lse))
++        torch.cuda.synchronize()
++        if p.config.lse_mode == "none":
++            assert returned is out
++        else:
++            assert returned[0] is out and returned[1] is lse
++        _check_numeric(out, lse, p, reference)
++        for storage in (out_storage, lse_storage):
++            assert (storage[:32] == -23).all() and (storage[-32:] == -23).all()
++        fingerprint = (_crc(out), _crc(lse) if p.config.lse_mode != "none" else None)
++        if previous is not None:
++            assert fingerprint == previous, "non-deterministic output/LSE bytes"
++        previous = fingerprint
++    assert [_crc(t) for t in leaves] == input_crc, "input storage was modified"
++
++
++def _require_backend(backend):
++    major, _ = get_compute_capability(torch.device("cuda"))
++    if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
++        pytest.skip("FA3 MLA requires SM90")
++    if backend == "cutlass" and major not in (10, 11):
++        pytest.skip("CUTLASS MLA requires SM100-family or SM110")
++    if major < 8:
++        pytest.skip("FA2 MLA requires SM80 or newer")
++
++
++@pytest.fixture(scope="module")
++def workspace():
++    if not torch.cuda.is_available():
++        pytest.skip("requires CUDA")
++    return torch.empty(128 << 20, dtype=torch.uint8, device="cuda")
++
++
++@pytest.fixture(autouse=True)
++def ieee_reference():
++    old = torch.backends.cuda.matmul.allow_tf32
++    torch.backends.cuda.matmul.allow_tf32 = False
++    yield
++    torch.backends.cuda.matmul.allow_tf32 = old
++
++
++@contextmanager
++def _case(cfg, backend, mutation="valid"):
++    try:
++        yield
++    except BaseException:
++        print(f"\n{cfg!r} backend={backend} mutation={mutation}")
++        print(
++            f"FLASHINFER_MLA_FUZZ_ONLY_SEED={cfg.seed} pytest -x -s "
++            f"tests/attention/test_mla_paged_attention_fuzz.py -k '{backend} and {mutation}'"
++        )
++        raise
++    finally:
++        values = torch.arange(128, device="cuda", dtype=torch.int32)
++        probe = values * 3 + 1
++        torch.cuda.synchronize()
++        assert torch.equal(probe.cpu(), torch.arange(128, dtype=torch.int32) * 3 + 1), (
++            "device-state probe failed"
++        )
++
++
++@pytest.mark.parametrize("backend", BACKENDS)
++@pytest.mark.parametrize("seed", SEEDS)
++def test_mla_fuzz_valid(seed, backend, workspace):
++    _require_backend(backend)
++    cfg = sample_config(seed, backend)
++    with _case(cfg, backend):
++        control = make_problem(cfg, poison_padding=False)
++        control_wrapper = _wrapper(control, backend, workspace)
++        _run_and_check(control, control_wrapper)
++        LEDGER.xfail_if_quarantined(
++            "poisoned_padding", control_wrapper._planned_backend_name
++        )
++        p = make_problem(cfg)
++        _run_and_check(p, _wrapper(p, backend, workspace))
++
++
++MUTATIONS = {
++    "qo_nonzero_start": ("plan", r"\bqo_indptr\b"),
++    "qo_nonmonotonic": ("plan", r"\bqo_indptr\b"),
++    "kv_indices_short": ("plan", r"\b(kv_indices|kv_indptr)\b"),
++    "kv_capacity": ("plan", r"\bkv_len_arr\b"),
++    "batch_short": ("plan", r"\b(batch|kv_len_arr)\b"),
++    **{
++        f"metadata_{change}_{field}": ("plan", rf"\b{field}\b")
++        for change in ("dtype", "rank", "device")
++        for field in (
++            "qo_indptr",
++            "kv_indptr",
++            "kv_indices",
++            "kv_len_arr",
++            "cum_seq_lens_q",
++            "block_tables",
++            "seq_lens",
++        )
++    },
++    "query_rows": ("run", r"\b(query|q_nope|q_nope_pe)\b"),
++    "query_heads": ("run", r"\b(query|q_nope|q_nope_pe)\b"),
++    "query_dtype": ("run", r"\b(query|q_nope|q_data_type)\b"),
++    "kv_page_size": ("run", r"\b(ckv_cache|kpe_cache|page_size|KV cache page size)\b"),
++    "kv_pool_short": ("run", r"\bKV cache\b.*\bpage indices\b"),
++    "independent_split": ("run", r"\b(packed|split|adjacent)\b"),
++    "lse_mode": ("run", r"\b(LSE mode|lse_mode|return_lse|return_lse_base_on_e)\b"),
++    "out_shape": ("run", r"\bout\b"),
++    "out_dtype": ("run", r"\b(out|output dtype)\b"),
++    "out_device": ("run", r"\bout\b"),
++    "lse_shape": ("run", r"\blse\b"),
++    "lse_dtype": ("run", r"\blse\b"),
++    "indices_nan_tail": ("plan", r"\b(kv_indices|kv_indptr)\b"),
++    "query_strided": ("run", r"\b(query|q_nope|q_nope_pe)\b"),
++    "page_id_out_of_pool": ("run", r"\bKV cache\b.*\bpage indices\b"),
++    "page_id_negative": ("run", r"\bKV cache\b.*\bpage indices\b"),
++}
++
++
++def mutate(p, name, plan, run):
++    metadata = plan["metadata"]
++    if name in ("qo_nonzero_start", "qo_nonmonotonic"):
++        qptr = metadata.qo_indptr.clone()
++        if name == "qo_nonzero_start":
++            qptr[0] = 1
++        else:
++            qptr[1], qptr[2] = qptr[2].clone(), qptr[1].clone()
++        plan["metadata"] = replace(metadata, qo_indptr=qptr)
++    elif name == "kv_indices_short":
++        plan["metadata"] = replace(metadata, kv_indices=metadata.kv_indices[:-1])
++    elif name == "kv_capacity":
++        lens = metadata.kv_len_arr.clone()
++        lens[0] = len(p.pages[0]) * p.config.page_size + 1
++        plan["metadata"] = replace(metadata, kv_len_arr=lens)
++    elif name == "batch_short":
++        plan["metadata"] = replace(metadata, kv_len_arr=metadata.kv_len_arr[:-1])
++    elif name.startswith("metadata_"):
++        _, change, field = name.split("_", 2)
++        tensor = getattr(metadata, field)
++        if change == "dtype":
++            value = tensor.long()
++        elif change == "rank":
++            value = tensor[None]
++        else:
++            value = torch.empty_like(tensor, device="meta")
++        plan["metadata"] = replace(metadata, **{field: value})
++    elif name == "query_rows":
++        run.update(query=p.q[:-1], out=None, lse=None)
++    elif name == "query_heads":
++        run.update(query=p.q[:, :-1].contiguous(), out=None, lse=None)
++    elif name == "kv_page_size":
++        run["kv_cache"] = p.cache[:, :-1].contiguous()
++    elif name == "kv_pool_short":
++        run["kv_cache"] = p.cache[: max(max(ids) for ids in p.pages)]
++    elif name == "query_dtype":
++        run["query"] = p.q.float()
++    elif name == "independent_split":
++        run["query"] = _structure(p.q, "split")
++    elif name == "lse_mode":
++        run.update(return_lse=True, return_lse_base_on_e=p.config.lse_mode != "basee")
++    elif name in ("out_shape", "out_dtype", "out_device", "lse_shape", "lse_dtype"):
++        target, change = name.split("_")
++        tensor = run[target]
++        if change == "shape":
++            run[target] = tensor[:-1]
++        elif change == "device":
++            run[target] = tensor.cpu()
++        else:
++            run[target] = tensor.to(torch.float16 if target == "lse" else torch.float32)
++    elif name == "indices_nan_tail":
++        p.cache[p.nan_page].fill_(float("nan"))
++        tail = torch.full(
++            (17,), p.nan_page, dtype=torch.int32, device=metadata.kv_indices.device
++        )
++        plan["metadata"] = replace(
++            metadata, kv_indices=torch.cat((metadata.kv_indices, tail))
++        )
++    elif name == "query_strided":
++        storage = torch.empty(
++            p.q.shape[0],
++            p.q.shape[1] * 2,
++            p.q.shape[2],
++            dtype=p.q.dtype,
++            device=p.q.device,
++        )
++        view = storage[:, : p.q.shape[1]]
++        view.copy_(p.q)
++        run["query"] = view
++    elif name in ("page_id_out_of_pool", "page_id_negative"):
++        indices = metadata.kv_indices.clone()
++        indices[0] = -1 if name == "page_id_negative" else p.cache.shape[0]
++        plan["metadata"] = replace(metadata, kv_indices=indices)
++    else:
++        raise AssertionError(name)
++
++
++@pytest.mark.parametrize(
++    "backend,mutation",
++    [
++        (backend, mutation)
++        for backend in BACKENDS
++        for mutation in MUTATIONS
++        if not (backend == "cutlass" and mutation in ("lse_shape", "lse_dtype"))
++    ],
++)
++@pytest.mark.parametrize("seed", SEEDS[:2])
++def test_mla_fuzz_mutation(seed, backend, mutation, workspace, monkeypatch):
++    _require_backend(backend)
++    cfg = replace(
++        sample_config(seed, backend),
++        q_lengths=(1, 1, 1),
++        kv_lengths=(31, 64, 129),
++        query_layout="packed",
++        kv_layout="packed",
++        metadata_form="csr",
++        lse_mode="none" if backend == "cutlass" else "base2",
++    )
++    if mutation.startswith("metadata_") and mutation.split("_", 2)[2] in (
++        "cum_seq_lens_q",
++        "block_tables",
++        "seq_lens",
++    ):
++        cfg = replace(cfg, metadata_form="dense")
++    with _case(cfg, backend, mutation):
++        LEDGER.xfail_if_quarantined(mutation, backend)
++        # Finite padding isolates contract checks from padding-read failures.
++        p = make_problem(cfg, poison_padding=False)
++        _run_and_check(p, _wrapper(p, backend, workspace))
++        out = torch.full(
++            (*p.q.shape[:2], CKV), float("nan"), dtype=cfg.dtype, device=p.q.device
++        )
++        lse = torch.full(
++            p.q.shape[:2], float("nan"), dtype=torch.float32, device=p.q.device
++        )
++        plan, run = _plan_kwargs(p), _run_kwargs(p, out, lse)
++        mutate(p, mutation, plan, run)
++        candidate = BatchMLAPagedAttentionWrapper(workspace, backend=backend)
++        phase, message = MUTATIONS[mutation]
++        if phase == "plan" and mutation != "indices_nan_tail":
++            with pytest.raises(CLEAN_ERRORS, match=message):
++                candidate.plan(**plan)
++            return
++        candidate.plan(**plan)
++        if mutation in ("indices_nan_tail", "query_strided"):
++            try:
++                candidate.run(**run)
++                torch.cuda.synchronize()
++            except CLEAN_ERRORS as error:
++                assert re.search(message, str(error), re.IGNORECASE)
++            else:
++                _check_numeric(out, lse, p, reference_mla(p))
++            return
++
++        # Invalid shapes/page IDs must fail before a native launch can corrupt CUDA.
++        def unexpected_launch(*args, **kwargs):
++            pytest.fail(f"{mutation} reached the native kernel without rejection")
++
++        implementation = candidate._planned_backend
++        entry = (
++            "cutlass_mla_paged_attention"
++            if implementation._backend == "cutlass"
++            else "run"
++        )
++        with monkeypatch.context() as patch:
++            patch.setattr(implementation._cached_module, entry, unexpected_launch)
++            with pytest.raises(CLEAN_ERRORS, match=message):
++                candidate.run(**run)
++
++
++@pytest.mark.parametrize(
++    "backend,lse_mode",
++    [
++        (backend, mode)
++        for backend in ("fa2", "fa3")
++        for mode in ("none", "base2", "basee")
++    ]
++    + [("cutlass", "none")],
++)
++def test_mla_fuzz_graph_replan(backend, lse_mode, workspace):
++    _require_backend(backend)
++    cfg = Config(
++        9001,
++        (1, 1, 1),
++        (31, 65, 129),
++        lse_mode=lse_mode,
++        query_layout="adjacent",
++        kv_layout="adjacent",
++    )
++    if backend == "cutlass":
++        cfg = replace(cfg, q_lengths=(1, 1, 1), heads=128)
++    with _case(cfg, backend, "graph_replan"):
++        p = make_problem(cfg, poison_padding=False)
++        wrapper = _wrapper(p, backend, workspace, graph=True)
++        out = torch.empty((*p.q.shape[:2], CKV), dtype=cfg.dtype, device=p.q.device)
++        lse = torch.empty(p.q.shape[:2], dtype=torch.float32, device=p.q.device)
++        kwargs = _run_kwargs(p, out, lse)
++        for _ in range(3):
++            wrapper.run(**kwargs)
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            wrapper.run(**kwargs)
++        graph.replay()
++        _check_numeric(out, lse, p, reference_mla(p))
++        p.q.mul_(0.5)
++        graph.replay()
++        _check_numeric(out, lse, p, reference_mla(p))
++        if backend in ("fa2", "fa3"):
++            updated = make_problem(replace(cfg, seed=9003, kv_lengths=(15, 32, 64)))
++            p.q.copy_(updated.q)
++            p.cache.fill_(float("nan"))
++            p.cache[: updated.cache.shape[0]].copy_(updated.cache)
++            wrapper.plan(**_plan_kwargs(updated))
++            graph.replay()
++            _check_numeric(out, lse, updated, reference_mla(updated))
++            p = updated
++        other = make_problem(
++            replace(cfg, q_lengths=cfg.q_lengths[:2], kv_lengths=(31, 65))
++        )
++        # Non-FA graph plans reject all replanning as a lifecycle error.
++        error = RuntimeError if backend == "cutlass" else CLEAN_ERRORS
++        message = (
++            r"CUDA graph.*replan"
++            if backend == "cutlass"
++            else "batch|shape|buffer|size|length|replan"
++        )
++        with pytest.raises(error, match=message):
++            wrapper.plan(**_plan_kwargs(other))
++        graph.replay()
++        _check_numeric(out, lse, p, reference_mla(p))
++
++
++@pytest.mark.parametrize("backend", ("fa2", "fa3"))
++def test_mla_fuzz_fp8_kv(backend, workspace):
++    _require_backend(backend)
++    cfg = Config(9002, (1, 8), (65, 129), fp8_kv=True)
++    with _case(cfg, backend, "fp8_kv"):
++        p = make_problem(cfg)
++        if torch.cuda.get_device_capability()[0] != 9:
++            with pytest.raises(CLEAN_ERRORS, match="SM90|Hopper"):
++                _wrapper(p, backend, workspace)
++        else:
++            _run_and_check(p, _wrapper(p, backend, workspace))
++
++
++@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
++@pytest.mark.parametrize("length", (128, 4096))
++@pytest.mark.parametrize("loss", ("first_page", "last_token", "last_chunk"))
++def test_mla_reference_detects_missing_kv(dtype, length, loss):
++    cfg = Config(19, (1,), (length,), heads=4, dtype=dtype, lse_mode="none")
++    p = make_problem(cfg, "cpu")
++    reference = reference_mla(p)
++    if loss == "first_page":
++        broken = replace(
++            p,
++            config=replace(cfg, kv_lengths=(length - cfg.page_size,)),
++            pages=(p.pages[0][1:],),
++        )
++    else:
++        removed = 1 if loss == "last_token" else length // 8
++        broken = replace(p, config=replace(cfg, kv_lengths=(length - removed,)))
++    broken_reference = reference_mla(broken)
++    with pytest.raises(AssertionError):
++        _check_numeric(
++            broken_reference.out.to(dtype), broken_reference.lse, p, reference
++        )
++
++
++@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
++@pytest.mark.parametrize("length", (128, 4096))
++def test_mla_reference_accepts_rounded_pv(dtype, length):
++    cfg = Config(79, (1,), (length,), heads=4, dtype=dtype, lse_mode="none")
++    p = make_problem(cfg, "cpu")
++    kv = p.cache[list(p.pages[0])].reshape(-1, CKV + KPE)[:length].float()
++    probs = (
++        torch.einsum("qhd,kd->hqk", p.q.float(), kv) / math.sqrt(128 + KPE)
++    ).softmax(-1)
++    out = torch.einsum(
++        "hqk,kd->qhd", probs.to(dtype).float(), kv[:, :CKV].to(dtype).float()
++    ).to(dtype)
++    _check_numeric(out, None, p, reference_mla(p))
++
++
++@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
++def test_mla_reference_zero_bound_requires_exact_output(dtype):
++    p = make_problem(
++        Config(0, (1,), (1,), heads=1, dtype=dtype, lse_mode="none"), "cpu"
++    )
++    p.cache.zero_()
++    reference = reference_mla(p)
++    out = reference.out.to(dtype)
++    _check_numeric(out, None, p, reference)
++    out[0, 0, 0] = torch.finfo(dtype).tiny
++    with pytest.raises(AssertionError, match="max ratio=inf"):
++        _check_numeric(out, None, p, reference)
++
++
++@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
++@pytest.mark.parametrize("lse_mode", ("base2", "basee"))
++def test_mla_reference_accepts_rounded_lse(dtype, lse_mode):
++    p = make_problem(
++        Config(0, (1,), (2,), heads=1, dtype=dtype, lse_mode=lse_mode), "cpu"
++    )
++    # Zero values and a score shift make the exact output and LSE both zero.
++    # The second exponential lies just below a dtype rounding midpoint.
++    weights = torch.tensor(
++        [1.0, 0.5 + 0.49 * UNIT_ROUNDOFF[dtype]], dtype=torch.float64
++    )
++    lse = weights.to(dtype).double().sum().log() - weights.sum().log()
++    if lse_mode == "base2":
++        lse /= math.log(2)
++    out = torch.zeros((1, 1, CKV), dtype=dtype)
++    reference = Reference(out.float(), torch.zeros((1, 1)), out.float())
++    _check_numeric(out, lse.float().reshape(1, 1), p, reference)
++    with pytest.raises(AssertionError):
++        _check_numeric(out, torch.full((1, 1), 0.1), p, reference)
++
++
++@pytest.mark.parametrize("causal", (False, True))
++@pytest.mark.parametrize("lse_mode", ("base2", "basee"))
++def test_mla_reference_uniform(causal, lse_mode):
++    cfg = Config(
++        7, (2, 1), (3, 2), heads=1, page_size=2, causal=causal, lse_mode=lse_mode
++    )
++    p = make_problem(cfg, "cpu", poison_padding=True)
++    p.q.zero_()
++    for ids, values in zip(p.pages, ((1, 2, 4), (8, 16)), strict=True):
++        for token, value in enumerate(values):
++            page, offset = ids[token // cfg.page_size], token % cfg.page_size
++            p.cache[page, offset].zero_()
++            p.cache[page, offset, 0] = value
++    reference = reference_mla(p)
++    expected_out = torch.zeros_like(reference.out)
++    expected_out[:, 0, 0] = torch.tensor([1.5 if causal else 7 / 3, 7 / 3, 12])
++    torch.testing.assert_close(reference.out, expected_out, atol=1e-6, rtol=1e-6)
++    lengths = [2, 3, 2] if causal else [3, 3, 2]
++    expected = torch.tensor(lengths, dtype=torch.float32).log()[:, None]
++    if lse_mode == "base2":
++        expected /= math.log(2)
++    torch.testing.assert_close(reference.lse, expected, atol=1e-6, rtol=1e-6)
++
++
++def test_mla_reference_pe_and_fp8_scales():
++    cfg = Config(8, (1,), (2,), heads=1, page_size=2, fp8_kv=True, lse_mode="basee")
++    p = make_problem(cfg, "cpu")
++    p.q.zero_()
++    p.q[..., CKV] = math.sqrt(128 + KPE)
++    page = p.pages[0][0]
++    p.cache[page].zero_()
++    p.cache[page, 0, :CKV] = 2
++    p.cache[page, 1, :CKV] = 4
++    p.cache[page, 1, CKV] = 1
++    reference = reference_mla(p)
++    logits = torch.tensor([0.0, float(p.q[0, 0, CKV]) * 2 / math.sqrt(128 + KPE)])
++    value = logits.softmax(0) @ torch.tensor([1.0, 2.0])
++    torch.testing.assert_close(
++        reference.out, value.expand_as(reference.out), atol=1e-6, rtol=1e-6
++    )
++    torch.testing.assert_close(
++        reference.lse,
++        logits.logsumexp(0).expand_as(reference.lse),
++        atol=1e-6,
++        rtol=1e-6,
++    )
++
++
++def test_mla_problem_seed_and_padding():
++    cfg = Config(9, (1, 8), (17, 33))
++    first = make_problem(cfg, "cpu", poison_padding=True)
++    second = make_problem(cfg, "cpu", poison_padding=True)
++    assert first.pages == second.pages
++    assert _crc(first.q) == _crc(second.q) and _crc(first.cache) == _crc(second.cache)
++    assert torch.isnan(first.cache[first.nan_page]).all()
++    assert all(first.nan_page not in ids for ids in first.pages)
++    for ids, length in zip(first.pages, cfg.kv_lengths, strict=True):
++        assert torch.isnan(first.cache[ids[-1], length % cfg.page_size :]).all()
+diff --git a/tests/attention/test_mla_wrapper.py b/tests/attention/test_mla_wrapper.py
+index f6bd7680465..3b6d47540ac 100644
+--- a/tests/attention/test_mla_wrapper.py
++++ b/tests/attention/test_mla_wrapper.py
+@@ -24,8 +24,8 @@
+ 
+ COMMON_PLAN_KWARGS = dict(
+     num_heads=16,
+-    head_dim_ckv=4,
+-    head_dim_kpe=2,
++    head_dim_ckv=8,
++    head_dim_kpe=8,
+     page_size=1,
+     causal=False,
+     sm_scale=0.125,
+@@ -157,7 +157,7 @@ def _patch_fake_fa_module(monkeypatch, fake_module):
+ 
+     import flashinfer.mla._batch_mla._backends._fa_common as fa_common
+ 
+-    # These tests model the native planner with tiny 4/2-dimensional CPU tensors.
++    # These tests model the native planner with tiny 8/8-dimensional CPU tensors.
+     # Keep metadata/transaction behavior real; mock the native support boundary
+     # alongside the native implementation. Native support has separate tests.
+     for module in (fa_common, fa2_backend, fa3_backend):
+@@ -365,10 +365,10 @@ def test_legacy_flat_plan_temporarily_keeps_dynamic_lse(monkeypatch):
+     with pytest.warns(DeprecationWarning):
+         wrapper.plan(*csr, **COMMON_PLAN_KWARGS)
+ 
+-    q_nope = torch.empty(2, 16, 4, dtype=torch.bfloat16)
+-    q_pe = torch.empty(2, 16, 2, dtype=torch.bfloat16)
+-    ckv_cache = torch.empty(2, 1, 4, dtype=torch.bfloat16)
+-    kpe_cache = torch.empty(2, 1, 2, dtype=torch.bfloat16)
++    q_nope = torch.empty(2, 16, 8, dtype=torch.bfloat16)
++    q_pe = torch.empty(2, 16, 8, dtype=torch.bfloat16)
++    ckv_cache = torch.empty(9, 1, 8, dtype=torch.bfloat16)
++    kpe_cache = torch.empty(9, 1, 8, dtype=torch.bfloat16)
+     with warnings.catch_warnings(record=True) as recorded:
+         warnings.simplefilter("always")
+         _, lse_base2 = wrapper.run(q_nope, q_pe, ckv_cache, kpe_cache, return_lse=True)
+@@ -452,10 +452,9 @@ def test_positional_run_arguments_warn_once_per_wrapper(monkeypatch):
+     _patch_fake_fa_module(monkeypatch, _FakeBatchMLAModule())
+     wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
+     wrapper.plan(metadata=_dense_metadata(), **COMMON_PLAN_KWARGS)
+-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
+-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
+-    q_nope, q_pe = query.split((4, 2), dim=-1)
+-    ckv_cache, kpe_cache = kv_cache.split((4, 2), dim=-1)
++    query, kv_cache = _packed_inputs()
++    q_nope, q_pe = query.split((8, 8), dim=-1)
++    ckv_cache, kpe_cache = kv_cache.split((8, 8), dim=-1)
+ 
+     with warnings.catch_warnings(record=True) as recorded:
+         warnings.simplefilter("always")
+@@ -484,10 +483,9 @@ def test_legacy_run_tensor_keywords_warn_once_at_caller(monkeypatch):
+     _patch_fake_fa_module(monkeypatch, _FakeBatchMLAModule())
+     wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
+     wrapper.plan(metadata=_dense_metadata(), **COMMON_PLAN_KWARGS)
+-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
+-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
+-    q_nope, q_pe = query.split((4, 2), dim=-1)
+-    ckv_cache, kpe_cache = kv_cache.split((4, 2), dim=-1)
++    query, kv_cache = _packed_inputs()
++    q_nope, q_pe = query.split((8, 8), dim=-1)
++    ckv_cache, kpe_cache = kv_cache.split((8, 8), dim=-1)
+ 
+     with warnings.catch_warnings(record=True) as recorded:
+         warnings.simplefilter("always")
+@@ -529,10 +527,9 @@ def test_each_legacy_run_tensor_group_warns(monkeypatch, legacy_group):
+         kv_cache_layout="split",
+         **COMMON_PLAN_KWARGS,
+     )
+-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
+-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
+-    q_nope, q_pe = query.split((4, 2), dim=-1)
+-    ckv_cache, kpe_cache = kv_cache.split((4, 2), dim=-1)
++    query, kv_cache = _packed_inputs()
++    q_nope, q_pe = query.split((8, 8), dim=-1)
++    ckv_cache, kpe_cache = kv_cache.split((8, 8), dim=-1)
+     run_kwargs = {"query": query, "kv_cache": kv_cache}
+     if legacy_group == "query":
+         run_kwargs.pop("query")
+@@ -565,10 +562,9 @@ def test_legacy_run_tensor_groups_share_one_warning_per_wrapper(monkeypatch):
+         kv_cache_layout="split",
+         **COMMON_PLAN_KWARGS,
+     )
+-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
+-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
+-    q_nope, q_pe = query.split((4, 2), dim=-1)
+-    ckv_cache, kpe_cache = kv_cache.split((4, 2), dim=-1)
++    query, kv_cache = _packed_inputs()
++    q_nope, q_pe = query.split((8, 8), dim=-1)
++    ckv_cache, kpe_cache = kv_cache.split((8, 8), dim=-1)
+ 
+     with warnings.catch_warnings(record=True) as recorded:
+         warnings.simplefilter("always")
+@@ -595,14 +591,13 @@ def test_structural_split_run_does_not_warn_for_legacy_tensor_arguments(monkeypa
+         kv_cache_layout="split",
+         **COMMON_PLAN_KWARGS,
+     )
+-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
+-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
++    query, kv_cache = _packed_inputs()
+ 
+     with warnings.catch_warnings(record=True) as recorded:
+         warnings.simplefilter("always")
+         wrapper.run(
+-            query=query.split((4, 2), dim=-1),
+-            kv_cache=kv_cache.split((4, 2), dim=-1),
++            query=query.split((8, 8), dim=-1),
++            kv_cache=kv_cache.split((8, 8), dim=-1),
+         )
+ 
+     assert not any(
+@@ -642,7 +637,7 @@ def test_plan_rejects_surplus_and_duplicate_legacy_arguments(monkeypatch):
+         torch.tensor([0], dtype=torch.int32),
+         torch.tensor([1], dtype=torch.int32),
+     )
+-    tail = (16, 4, 2, 1, False, 0.125, torch.bfloat16, torch.bfloat16, False)
++    tail = (16, 8, 8, 1, False, 0.125, torch.bfloat16, torch.bfloat16, False)
+ 
+     with pytest.raises(TypeError):
+         wrapper.plan(*csr, *tail, "surplus")
+@@ -756,12 +751,12 @@ def fail_plan(*args, **kwargs):
+         )
+         wrapper.plan(**plan_kwargs)
+         query = (
+-            torch.zeros(2, 16, 4, dtype=torch.bfloat16),
+-            torch.zeros(2, 16, 2, dtype=torch.bfloat16),
++            torch.zeros(2, 16, 8, dtype=torch.bfloat16),
++            torch.zeros(2, 16, 8, dtype=torch.bfloat16),
+         )
+         cache = (
+-            torch.zeros(9, 1, 4, dtype=torch.bfloat16),
+-            torch.zeros(9, 1, 2, dtype=torch.bfloat16),
++            torch.zeros(9, 1, 8, dtype=torch.bfloat16),
++            torch.zeros(9, 1, 8, dtype=torch.bfloat16),
+         )
+         old_indices = wrapper._kv_indices_buf.clone()
+         failing = _FakeBatchMLAModule()
+@@ -887,8 +882,7 @@ def test_run_rejects_planned_value_contract_mismatch(
+     _patch_fake_fa_module(monkeypatch, fake_module)
+     wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
+     wrapper.plan(metadata=_dense_metadata(), **COMMON_PLAN_KWARGS, **plan_kwargs)
+-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
+-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
++    query, kv_cache = _packed_inputs()
+ 
+     with pytest.raises(ValueError, match=match):
+         wrapper.run(query=query, kv_cache=kv_cache, **run_kwargs)
+@@ -901,9 +895,8 @@ def test_run_returns_caller_owned_output_and_lse_by_identity(monkeypatch):
+     _patch_fake_fa_module(monkeypatch, fake_module)
+     wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
+     wrapper.plan(metadata=_dense_metadata(), lse_mode="base2", **COMMON_PLAN_KWARGS)
+-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
+-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
+-    out = torch.empty(2, 16, 4, dtype=torch.bfloat16)
++    query, kv_cache = _packed_inputs()
++    out = torch.empty(2, 16, 8, dtype=torch.bfloat16)
+     lse = torch.empty(2, 16, dtype=torch.float32)
+ 
+     actual_out, actual_lse = wrapper.run(
+@@ -914,6 +907,22 @@ def test_run_returns_caller_owned_output_and_lse_by_identity(monkeypatch):
+     assert actual_lse is lse
+ 
+ 
++def test_explicit_fa2_run_does_not_prepare_tuning_inputs(monkeypatch):
++    import flashinfer.mla as mla
++
++    _patch_fake_fa_module(monkeypatch, _FakeBatchMLAModule())
++    wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
++    wrapper.plan(metadata=_dense_metadata(), **COMMON_PLAN_KWARGS)
++    query, kv_cache = _packed_inputs()
++    monkeypatch.setattr(
++        wrapper._planned_backend,
++        "_prepare_planned_inputs",
++        lambda *args: pytest.fail("eager run must not prepare tuning inputs"),
++    )
++    out = torch.empty(2, 16, 8, dtype=torch.bfloat16)
++    assert wrapper.run(query=query, kv_cache=kv_cache, out=out) is out
++
++
+ def _cutlass_plan_kwargs(page_size=64):
+     import flashinfer.mla as mla
+ 
+@@ -1151,17 +1160,20 @@ def test_batch_mla_wrapper_public_imports_remain_compatible():
+ 
+ 
+ def _packed_inputs():
+-    query = torch.empty(2, COMMON_PLAN_KWARGS["num_heads"], 6, dtype=torch.bfloat16)
+-    kv_cache = torch.empty(2, COMMON_PLAN_KWARGS["page_size"], 6, dtype=torch.bfloat16)
++    width = COMMON_PLAN_KWARGS["head_dim_ckv"] + COMMON_PLAN_KWARGS["head_dim_kpe"]
++    query = torch.empty(2, COMMON_PLAN_KWARGS["num_heads"], width, dtype=torch.bfloat16)
++    kv_cache = torch.empty(
++        9, COMMON_PLAN_KWARGS["page_size"], width, dtype=torch.bfloat16
++    )
+     return query, kv_cache
+ 
+ 
+ def _independent_split_inputs():
+-    q_nope = torch.empty(2, COMMON_PLAN_KWARGS["num_heads"], 4, dtype=torch.bfloat16)
+-    q_pe = torch.empty(2, COMMON_PLAN_KWARGS["num_heads"], 2, dtype=torch.bfloat16)
+-    ckv_cache = torch.empty(2, COMMON_PLAN_KWARGS["page_size"], 4, dtype=torch.bfloat16)
+-    kpe_cache = torch.empty(2, COMMON_PLAN_KWARGS["page_size"], 2, dtype=torch.bfloat16)
+-    return (q_nope, q_pe), (ckv_cache, kpe_cache)
++    widths = (COMMON_PLAN_KWARGS["head_dim_ckv"], COMMON_PLAN_KWARGS["head_dim_kpe"])
++    return tuple(
++        tuple(part.contiguous() for part in tensor.split(widths, dim=-1))
++        for tensor in _packed_inputs()
++    )
+ 
+ 
+ def test_packed_plan_rejects_independent_split_without_copy(monkeypatch):
+@@ -1202,13 +1214,13 @@ def run(self, *args):
+     query, kv_cache = _packed_inputs()
+ 
+     out = wrapper.run(
+-        query=(query[..., :4], query[..., 4:]),
+-        kv_cache=(kv_cache[..., :4], kv_cache[..., 4:]),
++        query=(query[..., :8], query[..., 8:]),
++        kv_cache=(kv_cache[..., :8], kv_cache[..., 8:]),
+     )
+ 
+-    assert out.shape == query[..., :4].shape
+-    assert fake_module.run_args[3].data_ptr() == query[..., :4].data_ptr()
+-    assert fake_module.run_args[4].data_ptr() == query[..., 4:].data_ptr()
++    assert out.shape == query[..., :8].shape
++    assert fake_module.run_args[3].data_ptr() == query[..., :8].data_ptr()
++    assert fake_module.run_args[4].data_ptr() == query[..., 8:].data_ptr()
+ 
+ 
+ def test_packed_plan_accepts_independent_zero_width_split_without_copy(monkeypatch):
+@@ -1223,10 +1235,10 @@ def test_packed_plan_accepts_independent_zero_width_split_without_copy(monkeypat
+         kv_cache_layout="packed",
+         **{**COMMON_PLAN_KWARGS, "head_dim_kpe": 0},
+     )
+-    q_nope = torch.empty(2, 16, 4, dtype=torch.bfloat16)
++    q_nope = torch.empty(2, 16, 8, dtype=torch.bfloat16)
+     q_pe = torch.empty(2, 16, 0, dtype=torch.bfloat16)
+-    ckv_cache = torch.empty(2, 1, 4, dtype=torch.bfloat16)
+-    kpe_cache = torch.empty(2, 1, 0, dtype=torch.bfloat16)
++    ckv_cache = torch.empty(9, 1, 8, dtype=torch.bfloat16)
++    kpe_cache = torch.empty(9, 1, 0, dtype=torch.bfloat16)
+ 
+     out = wrapper.run(
+         query=(q_nope, q_pe),
+@@ -1298,6 +1310,7 @@ def test_structural_parser_rejects_malformed_tuple_grammar(value, match):
+         ("rank", "rank 3"),
+         ("leading_shape", "shapes must match"),
+         ("dtype", "dtypes must match"),
++        ("device", "devices must match"),
+         ("width", "last dimensions"),
+     ],
+ )
+@@ -1312,6 +1325,8 @@ def test_split_structural_inputs_are_validated(mutation, match):
+         right = torch.empty(1, 3, 2, dtype=torch.bfloat16)
+     elif mutation == "dtype":
+         right = right.float()
++    elif mutation == "device":
++        right = torch.empty_like(right, device="meta")
+     elif mutation == "width":
+         right = torch.empty(2, 3, 3, dtype=torch.bfloat16)
+ 
+@@ -3051,9 +3066,11 @@ def test_cutile_availability_uses_planned_device(monkeypatch, planned_supported)
+     monkeypatch.setattr(
+         torch.cuda,
+         "get_device_capability",
+-        lambda device=None: (10, (0 if planned_supported else 7))
+-        if device == target
+-        else (10, current[0] - 100),
++        lambda device=None: (
++            (10, (0 if planned_supported else 7))
++            if device == target
++            else (10, current[0] - 100)
++        ),
+     )
+     monkeypatch.setattr(cutile_backend, "_get_compute_capability", lambda _: (10, 7))
+     kernel = _FakeCutileKernel()

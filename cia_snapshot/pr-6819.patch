@@ -1,0 +1,153 @@
+diff --git a/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_1703f20cc39512449eef_kernel.cu b/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_1703f20cc39512449eef_kernel.cu
+index 607516e435f..03d34dbdb25 100644
+--- a/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_1703f20cc39512449eef_kernel.cu
++++ b/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_1703f20cc39512449eef_kernel.cu
+@@ -188,6 +188,12 @@ kernel_cake_deepgemm_mixed_gemm_1703f20cc39512449eef(const __grid_constant__ CUt
+                     if (load_stage == 6) { load_stage = 0; _phase_mma_done ^= 1; }
+                 }
+             }
++            #pragma unroll 1
++            for (int _ = 0; _ < 6; _++) {
++                mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
++                load_stage += 1;
++                if (load_stage == 6) { load_stage = 0; _phase_mma_done ^= 1; }
++            }
+         }
+     }
+     // ---- Role: mma ----
+diff --git a/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_2960405c811f1c7d10f2_kernel.cu b/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_2960405c811f1c7d10f2_kernel.cu
+index 081a379add5..75616014d17 100644
+--- a/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_2960405c811f1c7d10f2_kernel.cu
++++ b/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_2960405c811f1c7d10f2_kernel.cu
+@@ -198,6 +198,12 @@ kernel_cake_deepgemm_mixed_gemm_2960405c811f1c7d10f2(const __grid_constant__ CUt
+                     if (stage == 7) { stage = 0; _phase_empty ^= 1; }
+                 }
+             }
++            #pragma unroll 1
++            for (int _ = 0; _ < 7; _++) {
++                mbarrier_wait(empty_addr + (stage) * 8, _phase_empty);
++                stage += 1;
++                if (stage == 7) { stage = 0; _phase_empty ^= 1; }
++            }
+         }
+     }
+     // ---- Role: mma ----
+diff --git a/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_717435d4482e8127d628_kernel.cu b/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_717435d4482e8127d628_kernel.cu
+index 0360160be1f..a8a3b3a415f 100644
+--- a/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_717435d4482e8127d628_kernel.cu
++++ b/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_717435d4482e8127d628_kernel.cu
+@@ -185,6 +185,12 @@ kernel_cake_deepgemm_mixed_gemm_717435d4482e8127d628(const __grid_constant__ CUt
+                     if (stage == 11) { stage = 0; _phase_empty ^= 1; }
+                 }
+             }
++            #pragma unroll 1
++            for (int _ = 0; _ < 11; _++) {
++                mbarrier_wait(empty_addr + (stage) * 8, _phase_empty);
++                stage += 1;
++                if (stage == 11) { stage = 0; _phase_empty ^= 1; }
++            }
+         }
+     }
+     // ---- Role: mma ----
+diff --git a/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_883f34018b1552e06e4b_kernel.cu b/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_883f34018b1552e06e4b_kernel.cu
+index fdabf618a27..d26548bd608 100644
+--- a/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_883f34018b1552e06e4b_kernel.cu
++++ b/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_883f34018b1552e06e4b_kernel.cu
+@@ -198,6 +198,12 @@ kernel_cake_deepgemm_mixed_gemm_883f34018b1552e06e4b(const __grid_constant__ CUt
+                     if (stage == 7) { stage = 0; _phase_empty ^= 1; }
+                 }
+             }
++            #pragma unroll 1
++            for (int _ = 0; _ < 7; _++) {
++                mbarrier_wait(empty_addr + (stage) * 8, _phase_empty);
++                stage += 1;
++                if (stage == 7) { stage = 0; _phase_empty ^= 1; }
++            }
+         }
+     }
+     // ---- Role: mma ----
+diff --git a/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_b50e49418a858200ba74_kernel.cu b/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_b50e49418a858200ba74_kernel.cu
+index 79e1fe9c8ef..7d469ba181e 100644
+--- a/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_b50e49418a858200ba74_kernel.cu
++++ b/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_b50e49418a858200ba74_kernel.cu
+@@ -183,6 +183,12 @@ kernel_cake_deepgemm_mixed_gemm_b50e49418a858200ba74(const __grid_constant__ CUt
+                     if (stage == 10) { stage = 0; _phase_empty ^= 1; }
+                 }
+             }
++            #pragma unroll 1
++            for (int _ = 0; _ < 10; _++) {
++                mbarrier_wait(empty_addr + (stage) * 8, _phase_empty);
++                stage += 1;
++                if (stage == 10) { stage = 0; _phase_empty ^= 1; }
++            }
+         }
+     }
+     // ---- Role: mma ----
+diff --git a/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_b5823a72a00441e5b2e6_kernel.cu b/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_b5823a72a00441e5b2e6_kernel.cu
+index 5b779c87dc7..4a5f19e6307 100644
+--- a/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_b5823a72a00441e5b2e6_kernel.cu
++++ b/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_b5823a72a00441e5b2e6_kernel.cu
+@@ -191,6 +191,12 @@ kernel_cake_deepgemm_mixed_gemm_b5823a72a00441e5b2e6(const __grid_constant__ CUt
+                         if (stage == 5) { stage = 0; _phase_empty ^= 1; }
+                     }
+                 }
++                #pragma unroll 1
++                for (int _ = 0; _ < 5; _++) {
++                    mbarrier_wait(empty_addr + (stage) * 8, _phase_empty);
++                    stage += 1;
++                    if (stage == 5) { stage = 0; _phase_empty ^= 1; }
++                }
+             }
+         }
+     }
+diff --git a/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_cf879c06884e138be329_kernel.cu b/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_cf879c06884e138be329_kernel.cu
+index cc1661a4db5..a8736428d24 100644
+--- a/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_cf879c06884e138be329_kernel.cu
++++ b/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_cf879c06884e138be329_kernel.cu
+@@ -185,6 +185,12 @@ kernel_cake_deepgemm_mixed_gemm_cf879c06884e138be329(const __grid_constant__ CUt
+                     if (stage == 12) { stage = 0; _phase_empty ^= 1; }
+                 }
+             }
++            #pragma unroll 1
++            for (int _ = 0; _ < 12; _++) {
++                mbarrier_wait(empty_addr + (stage) * 8, _phase_empty);
++                stage += 1;
++                if (stage == 12) { stage = 0; _phase_empty ^= 1; }
++            }
+         }
+     }
+     // ---- Role: mma ----
+diff --git a/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_efc6d85403b86b926c99_kernel.cu b/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_efc6d85403b86b926c99_kernel.cu
+index f23b7213fb9..e2b18d91335 100644
+--- a/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_efc6d85403b86b926c99_kernel.cu
++++ b/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_efc6d85403b86b926c99_kernel.cu
+@@ -194,6 +194,12 @@ kernel_cake_deepgemm_mixed_gemm_efc6d85403b86b926c99(const __grid_constant__ CUt
+                         if (stage == 6) { stage = 0; _phase_empty ^= 1; }
+                     }
+                 }
++                #pragma unroll 1
++                for (int _ = 0; _ < 6; _++) {
++                    mbarrier_wait(empty_addr + (stage) * 8, _phase_empty);
++                    stage += 1;
++                    if (stage == 6) { stage = 0; _phase_empty ^= 1; }
++                }
+             }
+         }
+     }
+diff --git a/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_f42c5a0f4063445c70e6_kernel.cu b/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_f42c5a0f4063445c70e6_kernel.cu
+index b77d14c6e62..6f382e413f9 100644
+--- a/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_f42c5a0f4063445c70e6_kernel.cu
++++ b/csrc/experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_f42c5a0f4063445c70e6_kernel.cu
+@@ -195,6 +195,12 @@ kernel_cake_deepgemm_mixed_gemm_f42c5a0f4063445c70e6(const __grid_constant__ CUt
+                     if (stage == 12) { stage = 0; _phase_empty ^= 1; }
+                 }
+             }
++            #pragma unroll 1
++            for (int _ = 0; _ < 12; _++) {
++                mbarrier_wait(empty_addr + (stage) * 8, _phase_empty);
++                stage += 1;
++                if (stage == 12) { stage = 0; _phase_empty ^= 1; }
++            }
+         }
+     }
+     // ---- Role: mma ----

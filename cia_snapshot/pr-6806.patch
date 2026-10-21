@@ -1,0 +1,84 @@
+diff --git a/csrc/cake_selective_state_update/cake_selective_state_update_c7e08dcbb58896052ee9_kernel.cu b/csrc/cake_selective_state_update/cake_selective_state_update_c7e08dcbb58896052ee9_kernel.cu
+index d807a00db78..94d454f1cce 100644
+--- a/csrc/cake_selective_state_update/cake_selective_state_update_c7e08dcbb58896052ee9_kernel.cu
++++ b/csrc/cake_selective_state_update/cake_selective_state_update_c7e08dcbb58896052ee9_kernel.cu
+@@ -560,6 +560,7 @@ __launch_bounds__(288, LAUNCH_MIN_BLOCKS) void kernel_cake_selective_state_updat
+                        "r"(*reinterpret_cast<uint32_t*>(&state_values_bf16[(4) + 2])),
+                        "r"(*reinterpret_cast<uint32_t*>(&state_values_bf16[(4) + 3])));
+           asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
++          __syncwarp();
+           if (elect_sync()) {
+             mbarrier_arrive(state_updated_addr + (stage_1) * 8);
+           }
+diff --git a/csrc/cake_selective_state_update/cake_selective_state_update_f79b459e051a3762d2f5_kernel.cu b/csrc/cake_selective_state_update/cake_selective_state_update_f79b459e051a3762d2f5_kernel.cu
+index ad09438bbaf..9f2722b1b23 100644
+--- a/csrc/cake_selective_state_update/cake_selective_state_update_f79b459e051a3762d2f5_kernel.cu
++++ b/csrc/cake_selective_state_update/cake_selective_state_update_f79b459e051a3762d2f5_kernel.cu
+@@ -472,6 +472,7 @@ __launch_bounds__(288, LAUNCH_MIN_BLOCKS) void kernel_cake_selective_state_updat
+               }
+             }
+           }
++          __syncwarp();
+           if (elect_sync()) {
+             if (cohort == 0) {
+               mbarrier_arrive(state_empty_0_addr + (barrier_state_stage) * 8);
+diff --git a/csrc/cake_selective_state_update/cuda/cake_selective_state_update_stp_bf16_direct.cu b/csrc/cake_selective_state_update/cuda/cake_selective_state_update_stp_bf16_direct.cu
+index 3d1ec16bc1d..9cbd3412585 100644
+--- a/csrc/cake_selective_state_update/cuda/cake_selective_state_update_stp_bf16_direct.cu
++++ b/csrc/cake_selective_state_update/cuda/cake_selective_state_update_stp_bf16_direct.cu
+@@ -490,6 +490,7 @@ kernel_cake_selective_state_update_stp_bf16_direct(CakeTensorMap const* state_tm
+                         asm volatile("st.shared.b32 [%0], %1;" :: "r"(s_state_addr + (unsigned int)(state_index * 2)), "r"((state_values_bf16[0])));
+                     }
+                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
++                    __syncwarp();
+                     if (elect_sync()) {
+                         mbarrier_arrive(state_updated_addr + (stage) * 8);
+                     }
+diff --git a/csrc/cake_selective_state_update/cuda/cake_selective_state_update_stp_bf16_persistent.cu b/csrc/cake_selective_state_update/cuda/cake_selective_state_update_stp_bf16_persistent.cu
+index f109703116e..79ec6433e63 100644
+--- a/csrc/cake_selective_state_update/cuda/cake_selective_state_update_stp_bf16_persistent.cu
++++ b/csrc/cake_selective_state_update/cuda/cake_selective_state_update_stp_bf16_persistent.cu
+@@ -481,6 +481,7 @@ kernel_cake_selective_state_update_stp_bf16_persistent(CakeTensorMap const* stat
+                             asm volatile("st.shared.b32 [%0], %1;" :: "r"(s_state_addr + (unsigned int)(state_index * 2)), "r"((state_values_bf16[0])));
+                         }
+                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
++                        __syncwarp();
+                         if (elect_sync()) {
+                             mbarrier_arrive(state_updated_addr + (stage) * 8);
+                         }
+diff --git a/csrc/cake_selective_state_update/cuda/cake_selective_state_update_stp_bf16_ratio16.cu b/csrc/cake_selective_state_update/cuda/cake_selective_state_update_stp_bf16_ratio16.cu
+index 1a37977e12a..854aa3337b9 100644
+--- a/csrc/cake_selective_state_update/cuda/cake_selective_state_update_stp_bf16_ratio16.cu
++++ b/csrc/cake_selective_state_update/cuda/cake_selective_state_update_stp_bf16_ratio16.cu
+@@ -486,6 +486,7 @@ kernel_cake_selective_state_update_stp_bf16_ratio16(CakeTensorMap const* state_t
+                         asm volatile("st.shared.b32 [%0], %1;" :: "r"(s_state_addr + (unsigned int)(state_index * 2)), "r"((state_values_bf16[0])));
+                     }
+                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
++                    __syncwarp();
+                     if (elect_sync()) {
+                         mbarrier_arrive(state_updated_addr + (stage) * 8);
+                     }
+diff --git a/csrc/cake_selective_state_update/cuda/cake_selective_state_update_stp_bf16_ratio8.cu b/csrc/cake_selective_state_update/cuda/cake_selective_state_update_stp_bf16_ratio8.cu
+index 584bdca7bd6..65e14f4bc9a 100644
+--- a/csrc/cake_selective_state_update/cuda/cake_selective_state_update_stp_bf16_ratio8.cu
++++ b/csrc/cake_selective_state_update/cuda/cake_selective_state_update_stp_bf16_ratio8.cu
+@@ -490,6 +490,7 @@ kernel_cake_selective_state_update_stp_bf16_ratio8(CakeTensorMap const* state_tm
+                         asm volatile("st.shared.b32 [%0], %1;" :: "r"(s_state_addr + (unsigned int)(state_index * 2)), "r"((state_values_bf16[0])));
+                     }
+                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
++                    __syncwarp();
+                     if (elect_sync()) {
+                         mbarrier_arrive(state_updated_addr + (stage) * 8);
+                     }
+diff --git a/csrc/cake_selective_state_update/cuda/cake_selective_state_update_stp_bf16_ratio8_saturated.cu b/csrc/cake_selective_state_update/cuda/cake_selective_state_update_stp_bf16_ratio8_saturated.cu
+index f1fd8fdd3ef..e6e68c402ce 100644
+--- a/csrc/cake_selective_state_update/cuda/cake_selective_state_update_stp_bf16_ratio8_saturated.cu
++++ b/csrc/cake_selective_state_update/cuda/cake_selective_state_update_stp_bf16_ratio8_saturated.cu
+@@ -490,6 +490,7 @@ kernel_cake_selective_state_update_stp_bf16_ratio8_saturated(CakeTensorMap const
+                         asm volatile("st.shared.b32 [%0], %1;" :: "r"(s_state_addr + (unsigned int)(state_index * 2)), "r"((state_values_bf16[0])));
+                     }
+                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
++                    __syncwarp();
+                     if (elect_sync()) {
+                         mbarrier_arrive(state_updated_addr + (stage) * 8);
+                     }

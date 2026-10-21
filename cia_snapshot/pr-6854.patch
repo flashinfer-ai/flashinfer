@@ -1,0 +1,912 @@
+diff --git a/flashinfer/prims_ts/gemm/api.py b/flashinfer/prims_ts/gemm/api.py
+index 7c7fdcaa137..faa9568450e 100644
+--- a/flashinfer/prims_ts/gemm/api.py
++++ b/flashinfer/prims_ts/gemm/api.py
+@@ -32,7 +32,12 @@
+ from .config import PrimsTsGemmConfig
+ from .support import nvfp4_128x4_numel as _nvfp4_128x4_numel
+ from .support import validate_dense_gemm
+-from .tactics import derived_ab_stages, fallback_cluster
++from .tactics import (
++    default_fp8_mma_k,
++    derived_ab_stages,
++    fallback_cluster,
++    loadable_ab_stages,
++)
+ 
+ _COMPILED: dict[tuple[PrimsTsGemmConfig, int, int, bool], object] = {}
+ _KERNEL_MODULES: dict[PrimsTsGemmConfig, ModuleType] = {}
+@@ -217,6 +222,21 @@ def _overlap_epilogue_supported(config: PrimsTsGemmConfig) -> bool:
+     return False
+ 
+ 
++def _fp8_mma_k(config: PrimsTsGemmConfig) -> int:
++    if config.operand_format != "fp8_e4m3":
++        if config.fp8_mma_k is not None:
++            raise ValueError("fp8_mma_k requires FP8 operands")
++        return 32
++    mma_k = (
++        default_fp8_mma_k(config.arch) if config.fp8_mma_k is None else config.fp8_mma_k
++    )
++    if mma_k not in (32, 64):
++        raise ValueError(f"fp8_mma_k must be 32 or 64, got {mma_k}")
++    if mma_k == 64 and config.arch != 107:
++        raise ValueError("fp8_mma_k=64 requires SM107")
++    return mma_k
++
++
+ def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
+     module = _KERNEL_MODULES.get(config)
+     if module is not None:
+@@ -256,14 +276,21 @@ def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
+                 "MMA-K=64 BF16 QKV/QKNorm/RoPE epilogues only"
+             )
+         module.use_nvfp4_tmem_overlap = config.tmem_overlap
++        module._MMA_K_BYTES = _fp8_mma_k(config)
+         module._tile_k_override = config.tile_k
+-        if config.nvfp4_mma_k not in (64, 96):
+-            raise ValueError("nvfp4_mma_k must be 64 or 96")
++        if config.nvfp4_mma_k not in (64, 96, 128):
++            raise ValueError("nvfp4_mma_k must be 64, 96 or 128")
+         if config.nvfp4_mma_k == 96 and (
+             config.arch != 103 or config.operand_format != "nvfp4_e2m1"
+         ):
+             raise ValueError("MMA-K=96 requires SM103 NVFP4 operands")
++        if config.nvfp4_mma_k == 128 and (
++            config.arch != 107 or config.operand_format != "nvfp4_e2m1"
++        ):
++            raise ValueError("MMA-K=128 requires SM107 NVFP4 operands")
+         module.nvfp4_mma_k = config.nvfp4_mma_k
++        module.tmem_capacity_cols = 576 if config.arch == 107 else 512
++        module.smem_capacity_bytes = 334848 if config.arch == 107 else None
+         module._tile_n_override = config.tile_n
+         default_epilogue_warps = (
+             8 if config.epilogue != "linear" or config.tmem_overlap else 4
+@@ -277,6 +304,10 @@ def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
+             raise ValueError("epilogue_warps must be 4 or 8")
+         if config.epilogue != "linear" and module.num_epilogue_warps != 8:
+             raise ValueError("fused epilogues require 8 epilogue warps")
++        # Each 4-warp epilogue group RMS-normalizes the half tile it drains,
++        # so that half must be exactly one head.
++        if config.epilogue == "qkv_qknorm_rope" and config.tile_n != 256:
++            raise ValueError("QK-norm/RoPE epilogue requires tile_n=256")
+         module.threads_in_epilogue = module.num_epilogue_warps * 32
+         forced_stages = derived_ab_stages(
+             config.operand_format,
+@@ -285,11 +316,13 @@ def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
+             config.tile_n,
+             config.tile_k,
+         )
++        loadable = loadable_ab_stages(config.arch, config.operand_format)
+         if config.ab_stages is None:
+             module.ab_stages = forced_stages
+-        elif config.ab_stages not in (1, 2, 4, 5, 6):
++        elif config.ab_stages not in loadable:
+             raise ValueError(
+-                f"ab_stages must be one of 1, 2, 4, 5, 6, got {config.ab_stages}"
++                f"ab_stages must be one of {', '.join(map(str, loadable))}, "
++                f"got {config.ab_stages}"
+             )
+         elif (
+             config.nvfp4_mma_k == 96
+@@ -424,6 +457,7 @@ def field(value: object) -> str:
+                 f"tm{config.tile_m}",
+                 f"tn{config.tile_n}",
+                 f"tk{config.tile_k}",
++                f"mk{module._MMA_K_BYTES}",
+                 f"f4mk{config.nvfp4_mma_k}",
+                 f"epiw{field(config.epilogue_warps)}",
+                 f"overlap{int(config.tmem_overlap)}",
+@@ -886,7 +920,8 @@ def prepare_fp4_linear(
+ 
+     On SM103, ``mma_k=96`` enables 3x NVFP4. ``tile_k=256`` uses separate
+     256-element data and 384-element scale pipelines; ``tile_k=768`` selects
+-    the large-tile baseline. The default K=64 path remains available on all
++    the large-tile baseline. On SM107, ``mma_k=128`` issues 64-byte
++    instructions. The default K=64 path remains available on all
+     supported devices. ``tmem_overlap=True`` uses eight epilogue warps and
+     alternating accumulator windows to overlap the next tile's MMA with
+     output stores. It requires ``tile_k=256`` and BF16 output and is opt-in.
+diff --git a/flashinfer/prims_ts/gemm/config.py b/flashinfer/prims_ts/gemm/config.py
+index ead10b953d3..96212b456e6 100644
+--- a/flashinfer/prims_ts/gemm/config.py
++++ b/flashinfer/prims_ts/gemm/config.py
+@@ -33,7 +33,8 @@ class PrimsTsGemmConfig:
+     scheduler: str = "clc_dynamic"
+     shape_bucket: Optional[tuple[int, int, int]] = None
+     has_qkv_scale: bool = False
+-    # 96 selects the SM103 NVFP4 instruction; 64 retains the reference path.
++    # 96 selects the SM103 NVFP4 instruction and 128 the SM107 64-byte one;
++    # 64 retains the reference path.
+     nvfp4_mma_k: int = 64
+     # None retains the epilogue default (8 for overlap/fused, otherwise 4).
+     epilogue_warps: Optional[int] = None
+@@ -44,3 +45,6 @@ class PrimsTsGemmConfig:
+     use_tma_store: bool = False
+     # Store Q, K, V as three contiguous [M, N/3] sections.
+     separate_qkv_output: bool = False
++    # Dense FP8 MMA instruction K. None picks the arch default (64 on SM107,
++    # otherwise 32); 64 requires SM107.
++    fp8_mma_k: Optional[int] = None
+diff --git a/flashinfer/prims_ts/gemm/kernel.py b/flashinfer/prims_ts/gemm/kernel.py
+index d4f3902387c..fa37cfe39ff 100644
+--- a/flashinfer/prims_ts/gemm/kernel.py
++++ b/flashinfer/prims_ts/gemm/kernel.py
+@@ -158,6 +158,8 @@ def _prims_ts_debug_checks_enabled() -> bool:
+ # independently sizes scale tiles to a multiple of MMA instruction K.
+ _K_TILE_BYTES = 128
+ # Ordinary MMA instructions consume 32 B of K; SM103 NVFP4 can consume 48 B.
++# SM107 dense FP8 can consume 64 B (instruction-descriptor k_dim=1);
++# _load_kernel sets this from config.fp8_mma_k.
+ _MMA_K_BYTES = 32
+ nvfp4_mma_k = 64
+ # Optional override for pipeline tile K in elements. None → one 128 B K-box.
+@@ -166,6 +168,8 @@ def _prims_ts_debug_checks_enabled() -> bool:
+ # MMA instruction N is always equal to tile N. The epilogue drains TMEM
+ # in 32-column chunks, so tile N is a power of 2 in [32, 256].
+ _tile_n_override = None
++tmem_capacity_cols = 512
++smem_capacity_bytes = None
+ _DEFAULT_TILE_N = 256
+ _EPILOGUE_TILE_N = 32
+ _TILE_N_MIN = 32
+@@ -247,8 +251,14 @@ def _refresh_input_dependent_config() -> None:
+     k_tile = k_box if _tile_k_override is None else int(_tile_k_override)
+     tile_n = _DEFAULT_TILE_N if _tile_n_override is None else int(_tile_n_override)
+     nvfp4 = _is_fp4(input_dtype)
++    if nvfp4 and nvfp4_mma_k not in (64, 96, 128):
++        raise ValueError(f"NVFP4 MMA-K must be 64, 96 or 128, got {nvfp4_mma_k}")
+     if nvfp4 and nvfp4_mma_k == 96 and k_tile not in (256, 768):
+         raise ValueError("NVFP4 MMA-K=96 supports tile_k=256 or tile_k=768")
++    if _MMA_K_BYTES not in (32, 64):
++        raise ValueError(f"MMA K must be 32 or 64 bytes, got {_MMA_K_BYTES}")
++    if _MMA_K_BYTES == 64 and not _is_fp8(input_dtype):
++        raise ValueError("64 B MMA K is only supported for dense FP8 inputs")
+     if k_tile <= 0:
+         raise ValueError(f"tile_k must be positive, got {k_tile}")
+     split_k = nvfp4 and nvfp4_mma_k == 96 and k_tile == 256
+@@ -309,13 +319,19 @@ def _refresh_input_dependent_config() -> None:
+     # The overlap path uses two physical accumulator windows in one 512-column
+     # allocation. It deliberately keeps one logical UMMA pipeline stage so an
+     # early consumer release can hand the retired scale-factor regions to MMA.
+-    # The regular NVFP4 path leaves TMEM columns for a single accumulator plus
+-    # its block scales. FP16/BF16/FP8 retain two ordinary pipeline stages.
+-    acc_stage_count = 2 if tmem_overlap or not nvfp4 else 1
+-    globals()["acc_stages"] = acc_stage_count
++    # The regular NVFP4 path keeps two accumulators when they fit next to its
++    # block scales, else one. FP16/BF16/FP8 retain two ordinary pipeline stages.
+     sf_k_per_tile = sf_tile_k // _SF_VEC_SIZE
+     sfa_cols = (mma_tiler_mnk_per_cta[0] * sf_k_per_tile) // 128
+     sfb_cols = ((tile_n + 127) // 128) * sf_k_per_tile
++    acc_stage_count = 2
++    if (
++        nvfp4
++        and not tmem_overlap
++        and 2 * tile_n + sfa_cols + sfb_cols > tmem_capacity_cols
++    ):
++        acc_stage_count = 1
++    globals()["acc_stages"] = acc_stage_count
+     globals()["sfa_stage_bytes"] = mma_tiler_mnk_per_cta[0] * sf_k_per_tile
+     globals()["sfb_stage_bytes"] = ((tile_n + 127) // 128) * 128 * sf_k_per_tile
+     globals()["tmem_sfa_cols_per_stage"] = sfa_cols
+@@ -323,9 +339,9 @@ def _refresh_input_dependent_config() -> None:
+     tmem_cols = tile_n * acc_stage_count
+     if nvfp4 and not tmem_overlap:
+         tmem_cols += sfa_cols + sfb_cols
+-    if tmem_cols > 512:
++    if tmem_cols > tmem_capacity_cols:
+         raise ValueError(
+-            f"TMEM column count {tmem_cols} exceeds 512 "
++            f"TMEM column count {tmem_cols} exceeds {tmem_capacity_cols} "
+             f"(tile_n={tile_n}, acc_stages={acc_stage_count})"
+         )
+     # tcgen05.alloc can reserve only 32, 64, 128, 256, or 512 columns.
+@@ -333,7 +349,10 @@ def _refresh_input_dependent_config() -> None:
+     # 256-column tile require 304 columns.  Reserve the next legal physical
+     # allocation; TmemAllocator still places the logical resources in their
+     # compact 304-column layout.
+-    globals()["num_tmem_alloc_cols"] = max(32, 1 << (tmem_cols - 1).bit_length())
++    if tmem_cols > 512:
++        globals()["num_tmem_alloc_cols"] = 576
++    else:
++        globals()["num_tmem_alloc_cols"] = max(32, 1 << (tmem_cols - 1).bit_length())
+     # Per-token/per-channel FP8 dequant replaces the single per-tensor scale.
+     # NVFP4 keeps that scalar for the product of the two global scales.
+     globals()["needs_epilogue_scale"] = not use_per_token_channel_scale and (
+@@ -1200,16 +1219,18 @@ def _init_tmem_state(self, stage_info: StageInfo) -> None:
+         context = stage_info.context
+         # PTX: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instruction-descriptor
+         if cutlass.const_expr(use_nvfp4_block_scale):
+-            # FP4 format encoding is 1 in both operand fields (E5M2 in the
+-            # generic MX builder). Bit 31 selects SM103's dense K=96 mode;
+-            # scale_format=0 selects E4M3 block scales.
+-            self.idesc = prims.Tcgen05MxInstrDesc.build(
+-                a_dtype=cutlass.Float8E5M2,
+-                b_dtype=cutlass.Float8E5M2,
++            # The 2-bit K field (bit 3 upper, bit 31 lower) selects dense
++            # K=64 (0), SM103's K=96 (1) or SM107's K=128 (2).
++            # scale_format=0 selects E4M3 block scales; sparsity_version=0
++            # keeps bit 12 clear as in the K=64/96 descriptors.
++            self.idesc = prims.Tcgen05MxOmmaInstrDesc.build(
++                a_dtype=cutlass.Float4E2M1FN,
++                b_dtype=cutlass.Float4E2M1FN,
+                 scale_format=0,
+                 n_dim=mma_inst_shape_mnk[1],
+                 m_dim=mma_inst_shape_mnk[0],
+-                k_dim=1 if nvfp4_mma_k == 96 else 0,
++                k_dim={64: 0, 96: 1, 128: 2}[nvfp4_mma_k],
++                sparsity_version=0,
+             )
+         else:
+             self.idesc = prims.Tcgen05InstrDesc.build(
+@@ -1218,6 +1239,7 @@ def _init_tmem_state(self, stage_info: StageInfo) -> None:
+                 c_dtype=cutlass.Float32,
+                 n_dim=mma_inst_shape_mnk[1],
+                 m_dim=mma_inst_shape_mnk[0],
++                k_dim=1 if _MMA_K_BYTES == 64 else 0,
+             )
+         self.tmem_raw_addr = context.tmem_ptr_i32.load()
+         self.cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
+@@ -3661,6 +3683,8 @@ def _create_gemm_pipeline(
+         skip_validation=not debug_checks,
+         exhaustive_deadlock_race_check=debug_checks,
+         verbose=False,
++        smem_capacity_bytes=smem_capacity_bytes,
++        tmem_capacity_columns=tmem_capacity_cols,
+     )
+     return task_manager, mma_task, store_task
+ 
+@@ -3701,11 +3725,18 @@ def _run_gemm_execution(
+     prims.barrier_cluster_wait()
+ 
+     num_tmem_cols = num_tmem_alloc_cols
++    # is_exclusive needs nvidia-cutlass-dsl 4.8; older releases reject the keyword.
++    tmem_alloc_kwargs = {"is_exclusive": True} if num_tmem_cols > 512 else {}
+     tmem_bar_id = 2
+     tmem_bar_threads = (num_epilogue_warps + num_mma_warps) * 32
+ 
+     if warp_idx == tmem_allocator_warp_id:
+-        prims.tcgen05_alloc(tmem_ptr_i32, num_tmem_cols, group="cta_2")
++        prims.tcgen05_alloc(
++            tmem_ptr_i32,
++            num_tmem_cols,
++            group="cta_2",
++            **tmem_alloc_kwargs,
++        )
+         prims.tcgen05_relinquish_alloc_permit(group="cta_2")
+ 
+     if store_task.is_selected() or mma_task.is_selected():
+@@ -3736,7 +3767,12 @@ def _run_gemm_execution(
+         ):
+             pass
+ 
+-        prims.tcgen05_dealloc(tmem_ptr, num_tmem_cols, group="cta_2")
++        prims.tcgen05_dealloc(
++            tmem_ptr,
++            num_tmem_cols,
++            group="cta_2",
++            **tmem_alloc_kwargs,
++        )
+ 
+ 
+ ########################################################
+diff --git a/flashinfer/prims_ts/gemm/tactics.py b/flashinfer/prims_ts/gemm/tactics.py
+index ef314c97b22..80c9a4a2ebe 100644
+--- a/flashinfer/prims_ts/gemm/tactics.py
++++ b/flashinfer/prims_ts/gemm/tactics.py
+@@ -23,6 +23,15 @@
+ _NVFP4_AB_STAGES = 5
+ _STAGE_CHOICES = (5, 6)
+ _CLUSTERS = ((2, 2), (4, 4))
++_SM107_FP8_STAGE_CHOICES = (5, 6, 7, 8)
++_SM107_FP8_CLUSTERS = ((2, 2), (2, 4), (4, 4))
++_LOADABLE_AB_STAGES = (1, 2, 4, 5, 6)
++_SM107_FP8_LOADABLE_AB_STAGES = (1, 2, 4, 5, 6, 7, 8)
++# Measured on SM107: deeper NVFP4 pipelines did not help.
++_SM107_NVFP4_STAGE_CHOICES = (4, 5, 6)
++_SM107_SMEM_BYTES = 334848
++# Kept free for the epilogue
++_SM107_EPILOGUE_SMEM_BYTES = 16 * 1024
+ MAX_PROFILED_TACTICS = 1024
+ 
+ # cluster_m, cluster_n, tile_n, tile_k, tmem_overlap, ab_stages, mma_k,
+@@ -49,8 +58,54 @@ def derived_ab_stages(
+     return stages
+ 
+ 
+-def stage_candidates(derived: int) -> tuple[int, ...]:
+-    """Derived count plus the nearest smaller and larger known counts."""
++def default_fp8_mma_k(arch: int) -> int:
++    """FP8 MMA instruction K used when ``fp8_mma_k`` is unset."""
++    return 64 if arch == 107 else 32
++
++
++def _is_sm107_fp8(arch: int, operand_format: str) -> bool:
++    return arch == 107 and operand_format == "fp8_e4m3"
++
++
++def _is_sm107_nvfp4(arch: int, operand_format: str) -> bool:
++    return arch == 107 and operand_format == "nvfp4_e2m1"
++
++
++def _nvfp4_stage_bytes(tile_n: int, tile_k: int) -> int:
++    """A, B and their E4M3 block scales for one stage of one CTA."""
++    a_bytes = 128 * tile_k // 2
++    b_bytes = (tile_n // 2) * tile_k // 2
++    sfa_bytes = 128 * tile_k // 16
++    sfb_bytes = ((tile_n + 127) // 128) * 128 * tile_k // 16
++    return a_bytes + b_bytes + sfa_bytes + sfb_bytes
++
++
++def loadable_ab_stages(arch: int, operand_format: str) -> tuple[int, ...]:
++    """Stage counts ``_load_kernel`` accepts for an explicit ``ab_stages``."""
++    if arch == 107 and operand_format in ("fp8_e4m3", "nvfp4_e2m1"):
++        return _SM107_FP8_LOADABLE_AB_STAGES
++    return _LOADABLE_AB_STAGES
++
++
++def _clusters(arch: int, operand_format: str) -> tuple[tuple[int, int], ...]:
++    if arch == 107:
++        return _SM107_FP8_CLUSTERS
++    return _CLUSTERS
++
++
++def stage_candidates(
++    derived: int, arch: int = 0, operand_format: str = ""
++) -> tuple[int, ...]:
++    """Derived count plus its nearest known neighbours; all choices on SM107."""
++    sm107_choices = None
++    if _is_sm107_fp8(arch, operand_format):
++        sm107_choices = _SM107_FP8_STAGE_CHOICES
++    elif _is_sm107_nvfp4(arch, operand_format):
++        sm107_choices = _SM107_NVFP4_STAGE_CHOICES
++    if sm107_choices is not None:
++        if derived not in sm107_choices:
++            return (derived,)
++        return (derived, *(s for s in sm107_choices if s != derived))
+     if derived not in _STAGE_CHOICES:
+         return (derived,)
+     index = _STAGE_CHOICES.index(derived)
+@@ -136,10 +191,12 @@ def tactic_is_legal(
+     # accumulator with a TMA output buffer.
+     if use_tma_store and (output_format == "nvfp4_e2m1" or overlap):
+         return False
+-    if warps not in (4, 8) or mma_k not in (64, 96):
++    if warps not in (4, 8) or mma_k not in (64, 96, 128):
+         return False
+     if epilogue != "linear" and warps != 8:
+         return False
++    if epilogue == "qkv_qknorm_rope" and tile_n != 256:
++        return False
+     if operand_format == "nvfp4_e2m1":
+         if tile_n not in (128, 256):
+             return False
+@@ -147,7 +204,20 @@ def tactic_is_legal(
+         if mma_k == 96:
+             if arch != 103 or tile_k != 256:
+                 return False
+-        elif tile_k not in (256, 512):
++        else:
++            if mma_k == 128 and arch != 107:
++                return False
++            if tile_k not in (256, 512):
++                return False
++        # Eight TMA-store warps stage twice the output tile.
++        epilogue_smem = _SM107_EPILOGUE_SMEM_BYTES * (
++            2 if use_tma_store and warps == 8 else 1
++        )
++        if (
++            arch == 107
++            and stages * _nvfp4_stage_bytes(tile_n, tile_k)
++            > _SM107_SMEM_BYTES - epilogue_smem
++        ):
+             return False
+     elif operand_format == "fp8_e4m3":
+         if tile_n not in (32, 64, 128, 256) or tile_k not in (128, 256) or mma_k != 64:
+@@ -173,20 +243,26 @@ def tactic_is_legal(
+     # QKV's derived depth is 4, which is outside _STAGE_CHOICES. The candidate
+     # list is the limit; an earlier membership test would drop that epilogue.
+     derived = derived_ab_stages(operand_format, epilogue, mma_k, tile_n, tile_k)
+-    return stages in stage_candidates(derived)
++    return stages in stage_candidates(derived, arch, operand_format)
+ 
+ 
+-def _tile_ns() -> tuple[int, ...]:
++def _tile_ns(arch: int, operand_format: str) -> tuple[int, ...]:
++    if _is_sm107_nvfp4(arch, operand_format):
++        return (256, 128)
+     return (256,)
+ 
+ 
+ def _mma_ks(arch: int, operand_format: str) -> tuple[int, ...]:
+     if arch == 103 and operand_format == "nvfp4_e2m1":
+         return (64, 96)
++    if arch == 107 and operand_format == "nvfp4_e2m1":
++        return (64, 128)
+     return (64,)
+ 
+ 
+-def _tile_ks(operand_format: str, mma_k: int) -> tuple[int, ...]:
++def _tile_ks(arch: int, operand_format: str, mma_k: int) -> tuple[int, ...]:
++    if _is_sm107_nvfp4(arch, operand_format):
++        return (256, 512)
+     if operand_format == "nvfp4_e2m1":
+         return (256,)
+     return (128,)
+@@ -269,36 +345,37 @@ def _with_derived_stages(
+ 
+ 
+ def _neighbors(
++    arch: int,
+     operand_format: str,
+     epilogue: str,
+     base: Tactic,
+ ) -> Iterator[Tactic]:
+     """One-axis steps around the default, so the cap still covers every axis."""
+-    for cluster_m, cluster_n in _CLUSTERS:
++    for cluster_m, cluster_n in _clusters(arch, operand_format):
+         if (cluster_m, cluster_n) != (base[0], base[1]):
+             yield _replace(base, cluster_m=cluster_m, cluster_n=cluster_n)
+-    for tile_n in _tile_ns():
++    for tile_n in _tile_ns(arch, operand_format):
+         if tile_n != base[2]:
+             yield _with_derived_stages(
+                 operand_format, epilogue, _replace(base, tile_n=tile_n, overlap=False)
+             )
+-    for mma_k in (64, 96):
++    for mma_k in _mma_ks(arch, operand_format):
+         if mma_k == base[6]:
+             continue
+-        for tile_k in _tile_ks(operand_format, mma_k):
++        for tile_k in _tile_ks(arch, operand_format, mma_k):
+             candidate = _with_derived_stages(
+                 operand_format,
+                 epilogue,
+                 _replace(base, tile_k=tile_k, mma_k=mma_k, overlap=False),
+             )
+             yield candidate
+-    for tile_k in _tile_ks(operand_format, base[6]):
++    for tile_k in _tile_ks(arch, operand_format, base[6]):
+         if tile_k != base[3]:
+             yield _with_derived_stages(
+                 operand_format, epilogue, _replace(base, tile_k=tile_k, overlap=False)
+             )
+     derived = derived_ab_stages(operand_format, epilogue, base[6], base[2], base[3])
+-    for stages in stage_candidates(derived):
++    for stages in stage_candidates(derived, arch, operand_format):
+         if stages != base[5]:
+             yield _replace(base, stages=stages)
+     yield _replace(base, use_clc=not base[7])
+@@ -319,14 +396,14 @@ def _product(
+     operand_format: str,
+     epilogue: str,
+ ) -> Iterator[Tactic]:
+-    for cluster_m, cluster_n in _CLUSTERS:
+-        for tile_n in _tile_ns():
++    for cluster_m, cluster_n in _clusters(arch, operand_format):
++        for tile_n in _tile_ns(arch, operand_format):
+             for mma_k in _mma_ks(arch, operand_format):
+-                for tile_k in _tile_ks(operand_format, mma_k):
++                for tile_k in _tile_ks(arch, operand_format, mma_k):
+                     derived = derived_ab_stages(
+                         operand_format, epilogue, mma_k, tile_n, tile_k
+                     )
+-                    for stages in stage_candidates(derived):
++                    for stages in stage_candidates(derived, arch, operand_format):
+                         # for use_clc in (True, False):
+                         for use_clc in (True,):
+                             for warps in _warps():
+@@ -364,7 +441,7 @@ def add(tactic: Tactic) -> None:
+             selected.append(tactic)
+             seen.add(tactic)
+ 
+-    for tactic in _neighbors(operand_format, epilogue, default):
++    for tactic in _neighbors(arch, operand_format, epilogue, default):
+         add(tactic)
+     for tactic in _product(arch, operand_format, epilogue):
+         if len(selected) >= MAX_PROFILED_TACTICS:
+diff --git a/tests/prims_ts/test_gemm_autotune.py b/tests/prims_ts/test_gemm_autotune.py
+index a8df0755df8..e10eeca0ef4 100644
+--- a/tests/prims_ts/test_gemm_autotune.py
++++ b/tests/prims_ts/test_gemm_autotune.py
+@@ -257,6 +257,41 @@ def test_legal_tactics_cover_each_axis_and_drop_illegal_ones():
+     assert narrowed.use_tma_store is True
+ 
+ 
++def test_sm107_fp8_tactics_use_deeper_stages_and_wide_clusters():
++    linear = legal_tactics(107, "fp8_e4m3", "bf16", "linear")
++    assert len(linear) <= MAX_PROFILED_TACTICS
++    assert {tactic[5] for tactic in linear} == {5, 6, 7, 8}
++    assert any((tactic[0], tactic[1]) == (2, 4) for tactic in linear)
++    assert (2, 4, 256, 128, False, 8, 64, True, 8, True) in linear
++
++    swiglu = legal_tactics(107, "fp8_e4m3", "bf16", "swiglu")
++    assert (2, 2, 256, 128, False, 5, 64, True, 8, True) in swiglu
++
++    qkv = legal_tactics(107, "fp8_e4m3", "bf16", "qkv_qknorm_rope")
++    assert all(tactic[5] == 4 for tactic in qkv)
++
++    sm100 = legal_tactics(100, "fp8_e4m3", "bf16", "linear")
++    assert {tactic[5] for tactic in sm100} <= {5, 6}
++    assert all((tactic[0], tactic[1]) != (2, 4) for tactic in sm100)
++
++
++@pytest.mark.parametrize(
++    "epilogue,output_format",
++    [
++        ("linear", "bf16"),
++        ("swiglu", "bf16"),
++        ("swiglu", "nvfp4_e2m1"),
++        ("qkv_qknorm_rope", "bf16"),
++    ],
++)
++def test_nvfp4_mma_k128_is_searched_on_sm107_only(epilogue, output_format):
++    sm107 = legal_tactics(107, "nvfp4_e2m1", output_format, epilogue)
++    assert {tactic[6] for tactic in sm107} == {64, 128}
++    for arch, mma_ks in ((100, {64}), (103, {64, 96})):
++        tactics = legal_tactics(arch, "nvfp4_e2m1", output_format, epilogue)
++        assert {tactic[6] for tactic in tactics} <= mma_ks
++
++
+ def test_explicit_config_does_not_call_the_tuner(monkeypatch):
+     _require_gemm_gpu()
+     from flashinfer.gemm import fp8_linear
+diff --git a/tests/prims_ts/test_gemm_fp4.py b/tests/prims_ts/test_gemm_fp4.py
+index 67bcd9e6157..1359ac57ac5 100644
+--- a/tests/prims_ts/test_gemm_fp4.py
++++ b/tests/prims_ts/test_gemm_fp4.py
+@@ -15,6 +15,7 @@
+ )
+ from flashinfer.prims_ts.gemm.api import PreparedFp4Linear, _launch, _load_kernel
+ from flashinfer.prims_ts.gemm.config import PrimsTsGemmConfig
++from flashinfer.prims_ts.gemm.tactics import tactic_is_legal
+ from flashinfer.utils import get_compute_capability
+ from tests.prims_ts.gemm_fp4_reference import (
+     dequantize_nvfp4,
+@@ -35,6 +36,11 @@ def _require_sm103(reason):
+         pytest.skip(reason)
+ 
+ 
++def _require_sm107(reason):
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
++        pytest.skip(reason)
++
++
+ def _fp4_problem(m=8192, n=8192, k=8192):
+     torch.manual_seed(11)
+     a = torch.randint(0, 256, (m, k // 2), device="cuda", dtype=torch.uint8)
+@@ -178,13 +184,26 @@ def test_fp4_qkv_qknorm_rope_bf16():
+         qkv_scale=qkv_scale,
+     )
+     prepared_actual = prepared(a, a_sf, cos_sin=cos_sin, positions=positions)
++    expected = _qkv_qknorm_rope_reference(
++        a, a_scale, w, w_scale, q_weight, k_weight, cos_sin, qkv_scale, head_dim
++    )
++    torch.testing.assert_close(actual.float(), expected, atol=1.0, rtol=8e-2)
++    torch.testing.assert_close(prepared_actual, actual)
++
++
++def _qkv_qknorm_rope_reference(
++    a, a_scale, w, w_scale, q_weight, k_weight, cos_sin, qkv_scale, head_dim
++):
++    m = a.shape[0]
++    num_heads = w.shape[0] // (3 * head_dim)
+     base = (
+         F.linear(dequantize_nvfp4(a, a_scale, 1.0), dequantize_nvfp4(w, w_scale, 1.0))
+         .bfloat16()
+         .float()
+     )
+     shaped = base.view(m, 3, num_heads, head_dim)
+-    shaped.mul_(qkv_scale.view(1, 3, 1, 1))
++    if qkv_scale is not None:
++        shaped.mul_(qkv_scale.view(1, 3, 1, 1))
+     half = head_dim // 2
+     cos, sin = cos_sin[:, None, :half], cos_sin[:, None, half:]
+     for part, norm_weight in ((0, q_weight), (1, k_weight)):
+@@ -202,10 +221,7 @@ def test_fp4_qkv_qknorm_rope_bf16():
+             ),
+             -1,
+         ).flatten(-2)
+-    torch.testing.assert_close(
+-        actual.float(), shaped.reshape_as(base), atol=1.0, rtol=8e-2
+-    )
+-    torch.testing.assert_close(prepared_actual, actual)
++    return shaped.reshape_as(base)
+ 
+ 
+ @pytest.mark.parametrize("scheduler", ["static", "clc_dynamic"])
+@@ -337,6 +353,222 @@ def test_nvfp4_3x_rejects_unsupported_config(arch, operand, tile_k):
+         _load_kernel(config)
+ 
+ 
++@pytest.mark.parametrize("epilogue", ["linear", "swiglu"])
++@pytest.mark.parametrize("tile_n", [128, 256])
++@pytest.mark.parametrize("tile_k", [256, 512])
++@pytest.mark.parametrize("k", [256, 1024, 1536, 9216])
++def test_nvfp4_mma_k128(epilogue, tile_n, tile_k, k):
++    _require_sm107("MMA-K=128 requires SM107")
++    m, n = 512, 512
++    a, a_scale, b, b_scale = _fp4_problem(m, n, k)
++    sfa, sfb = _swizzled(a_scale, b_scale)
++    logical_n = n // 2 if epilogue == "swiglu" else n
++    out = torch.empty((m, logical_n), device="cuda", dtype=torch.bfloat16)
++    # tile_k=512 spans two TMA K-boxes; five stages of it do not fit in SMEM.
++    config = PrimsTsGemmConfig(
++        107,
++        "nvfp4_e2m1",
++        "bf16",
++        epilogue,
++        False,
++        None,
++        None,
++        tile_n=tile_n,
++        tile_k=tile_k,
++        nvfp4_mma_k=128,
++        ab_stages=2 if tile_k == 512 else None,
++    )
++    _launch(config, a, b, out, (m, n, k), sfa=sfa, sfb=sfb)
++    expected = dequantize_nvfp4(a, a_scale, 1.0) @ dequantize_nvfp4(b, b_scale, 1.0).T
++    if epilogue == "swiglu":
++        expected = expected[:, 0::2] * F.silu(expected[:, 1::2])
++        torch.testing.assert_close(out.float(), expected, atol=1.0, rtol=6e-2)
++    else:
++        torch.testing.assert_close(out.float(), expected, atol=2e-3, rtol=4e-3)
++
++
++@pytest.mark.parametrize("scheduler", ["clc_dynamic", "static"])
++@pytest.mark.parametrize("cluster_shape", [(2, 1, 1), (4, 4, 1)])
++def test_nvfp4_mma_k128_persistent_tail_and_graph(scheduler, cluster_shape):
++    _require_sm107("MMA-K=128 requires SM107")
++    # Partial M and a K that ends mid-tile exercise persistent reuse, both
++    # AB/SF ring wraps and multicast scale delivery across pair rows.
++    m, n, k = 4097, 1024, 1280
++    a, a_scale, b, b_scale = _fp4_problem(m, n, k)
++    sfa, sfb = _swizzled(a_scale, b_scale)
++    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
++    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
++    config = PrimsTsGemmConfig(
++        107,
++        "nvfp4_e2m1",
++        "bf16",
++        "linear",
++        True,
++        None,
++        None,
++        tile_k=256,
++        nvfp4_mma_k=128,
++        scheduler=scheduler,
++        cluster_shape=cluster_shape,
++    )
++
++    def run():
++        _launch(config, a, b, out, (m, n, k), sfa=sfa, sfb=sfb, bias=bias, scale=0.375)
++
++    run()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        run()
++    a.bitwise_xor_(0x88)
++    for _ in range(3):
++        graph.replay()
++    expected = (
++        (dequantize_nvfp4(a, a_scale, 1.0) @ dequantize_nvfp4(b, b_scale, 1.0).T)
++        + bias.float()
++    ) * 0.375
++    torch.testing.assert_close(out.float(), expected, atol=2e-3, rtol=4e-3)
++
++
++@pytest.mark.parametrize(
++    "arch,operand",
++    [(100, "nvfp4_e2m1"), (103, "nvfp4_e2m1"), (107, "fp8_e4m3")],
++)
++def test_nvfp4_mma_k128_rejects_unsupported_config(arch, operand):
++    config = PrimsTsGemmConfig(
++        arch,
++        operand,
++        "bf16",
++        "linear",
++        False,
++        None,
++        None,
++        tile_k=256,
++        nvfp4_mma_k=128,
++    )
++    with pytest.raises(ValueError, match="MMA-K=128"):
++        _load_kernel(config)
++
++
++@pytest.mark.parametrize(
++    "epilogue,tile_n",
++    [
++        ("linear", 128),
++        ("linear", 256),
++        ("swiglu_nvfp4", 128),
++        ("swiglu_nvfp4", 256),
++        ("qkv_qknorm_rope", 256),
++    ],
++)
++@pytest.mark.parametrize("scheduler", ["clc_dynamic", "static"])
++def test_nvfp4_two_accumulators_persistent(epilogue, tile_n, scheduler):
++    _require_sm107("576-column TMEM requires SM107")
++    # Every CTA pair owns several output tiles, so the MMA warp alternates
++    # between both accumulators and wraps back to the first. tile_n=256 needs
++    # 560 columns, which only SM107's exclusive allocation provides.
++    head_dim = 128
++    m, n, k = 4097, 3072, 1280
++    a, a_scale, w, w_scale = _fp4_problem(m, n, k)
++    a_sf, w_sf = _swizzled(a_scale, w_scale)
++    kernel_epilogue = "swiglu" if epilogue == "swiglu_nvfp4" else epilogue
++    output_format = "nvfp4_e2m1" if epilogue == "swiglu_nvfp4" else "bf16"
++    is_qkv = epilogue == "qkv_qknorm_rope"
++    config = PrimsTsGemmConfig(
++        107,
++        "nvfp4_e2m1",
++        output_format,
++        kernel_epilogue,
++        False,
++        head_dim if is_qkv else None,
++        False if is_qkv else None,
++        tile_n=tile_n,
++        tile_k=256,
++        nvfp4_mma_k=128,
++        scheduler=scheduler,
++    )
++    assert _load_kernel(config).acc_stages == 2
++    linear = F.linear(
++        dequantize_nvfp4(a, a_scale, 1.0), dequantize_nvfp4(w, w_scale, 1.0)
++    )
++    if epilogue == "linear":
++        prepared = prepare_fp4_linear(w, w_sf, 1.0, 1.0, config=config)
++        actual = prepared(a, a_sf)
++        torch.testing.assert_close(actual.float(), linear, atol=2e-3, rtol=4e-3)
++    elif epilogue == "swiglu_nvfp4":
++        expected = linear[:, 0::2] * F.silu(linear[:, 1::2])
++        encode_scale = (448.0 * 6.0 / expected.abs().amax()).reshape(1)
++        prepared = prepare_fp4_linear_swiglu(
++            w,
++            w_sf,
++            1.0,
++            1.0,
++            out_dtype=torch.uint8,
++            output_quant_scale=encode_scale,
++            config=config,
++        )
++        payload, scales = prepared(a, a_sf)
++        dequantized = dequantize_nvfp4_128x4(payload, scales, encode_scale)
++        block_error = (
++            (dequantized - expected).reshape(m, -1, 16).abs()
++            / expected.reshape(m, -1, 16).abs().amax(-1, keepdim=True).clamp(min=1)
++        ).amax()
++        # Same bound as test_fp4_swiglu_and_packed_output_contract.
++        assert block_error < 0.2
++        actual = payload
++    else:
++        q_weight = torch.rand((head_dim,), device="cuda", dtype=torch.bfloat16)
++        k_weight = torch.rand((head_dim,), device="cuda", dtype=torch.bfloat16)
++        angles = torch.randn((m, head_dim // 2), device="cuda")
++        cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1).contiguous()
++        positions = torch.arange(m, device="cuda", dtype=torch.int64)
++        num_heads = n // (3 * head_dim)
++        prepared = prepare_fp4_qkv_qknorm_rope(
++            w,
++            w_sf,
++            1.0,
++            1.0,
++            q_weight,
++            k_weight,
++            num_q_heads=num_heads,
++            num_kv_heads=num_heads,
++            head_dim=head_dim,
++            config=config,
++        )
++        actual = prepared(a, a_sf, cos_sin=cos_sin, positions=positions)
++        expected = _qkv_qknorm_rope_reference(
++            a, a_scale, w, w_scale, q_weight, k_weight, cos_sin, None, head_dim
++        )
++        torch.testing.assert_close(actual.float(), expected, atol=1.0, rtol=8e-2)
++    # A second launch must start from fresh accumulator pipeline state.
++    if epilogue == "linear":
++        again = prepared(a, a_sf)
++    elif epilogue == "swiglu_nvfp4":
++        again = prepared(a, a_sf)[0]
++    else:
++        again = prepared(a, a_sf, cos_sin=cos_sin, positions=positions)
++    torch.testing.assert_close(again, actual, atol=0, rtol=0)
++
++
++@pytest.mark.parametrize("operand", ["nvfp4_e2m1", "fp8_e4m3"])
++def test_qkv_qknorm_rope_rejects_narrow_tile(operand):
++    # Each 4-warp epilogue group normalizes half the tile, which must be a
++    # whole 128-wide head.
++    config = PrimsTsGemmConfig(
++        100,
++        operand,
++        "bf16",
++        "qkv_qknorm_rope",
++        False,
++        128,
++        False,
++        tile_n=128,
++        tile_k=256 if operand == "nvfp4_e2m1" else 128,
++    )
++    with pytest.raises(ValueError, match="tile_n=256"):
++        _load_kernel(config)
++    tactic = (2, 2, 128, config.tile_k, False, 4, 64, True, 8, False)
++    assert not tactic_is_legal(100, operand, "bf16", "qkv_qknorm_rope", tactic)
++
++
+ @pytest.mark.parametrize(
+     "epilogue,out_dtype",
+     [
+diff --git a/tests/prims_ts/test_gemm_fp8.py b/tests/prims_ts/test_gemm_fp8.py
+index 9101dafcb80..3d30b1130bb 100644
+--- a/tests/prims_ts/test_gemm_fp8.py
++++ b/tests/prims_ts/test_gemm_fp8.py
+@@ -7,6 +7,7 @@
+ 
+ from flashinfer.gemm import fp8_linear, fp8_linear_swiglu, fp8_qkv_qknorm_rope
+ from flashinfer.prims_ts.gemm import PrimsTsGemmConfig
++from flashinfer.prims_ts.gemm.api import _fp8_mma_k
+ from flashinfer.utils import get_compute_capability
+ 
+ 
+@@ -38,6 +39,59 @@ def test_fp8_linear_per_token_per_channel_and_bias():
+     torch.testing.assert_close(actual.float(), expected, atol=0.2, rtol=2e-2)
+ 
+ 
++def _linear_config(arch, operand_format="fp8_e4m3", has_bias=False, **kwargs):
++    return PrimsTsGemmConfig(
++        arch, operand_format, "bf16", "linear", has_bias, None, None, **kwargs
++    )
++
++
++@pytest.mark.parametrize(
++    "arch,operand_format,fp8_mma_k,expected",
++    [
++        (100, "fp8_e4m3", None, 32),
++        (103, "fp8_e4m3", None, 32),
++        (107, "fp8_e4m3", None, 64),
++        (107, "fp8_e4m3", 32, 32),
++        (100, "nvfp4_e2m1", None, 32),
++        (107, "nvfp4_e2m1", None, 32),
++    ],
++)
++def test_fp8_mma_k_defaults(arch, operand_format, fp8_mma_k, expected):
++    config = _linear_config(arch, operand_format, fp8_mma_k=fp8_mma_k)
++    assert _fp8_mma_k(config) == expected
++
++
++@pytest.mark.parametrize(
++    "arch,operand_format,fp8_mma_k,match",
++    [
++        (100, "fp8_e4m3", 64, "requires SM107"),
++        (103, "fp8_e4m3", 64, "requires SM107"),
++        (107, "fp8_e4m3", 128, "32 or 64"),
++        (107, "nvfp4_e2m1", 32, "requires FP8"),
++    ],
++)
++def test_fp8_mma_k_rejects_unsupported_config(arch, operand_format, fp8_mma_k, match):
++    config = _linear_config(arch, operand_format, fp8_mma_k=fp8_mma_k)
++    with pytest.raises(ValueError, match=match):
++        _fp8_mma_k(config)
++
++
++@pytest.mark.parametrize("fp8_mma_k", [32, 64])
++def test_fp8_linear_mma_k_on_sm107(fp8_mma_k):
++    _require_gemm_gpu()
++    if get_compute_capability(torch.device("cuda")) != (10, 7):
++        pytest.skip("64 B FP8 MMA K requires SM107")
++    a, w, a_scale, w_scale = _fp8_problem(m=256, n=512, k=512)
++    bias = torch.randn((w.shape[0],), device="cuda", dtype=torch.bfloat16)
++    config = _linear_config(107, has_bias=True, fp8_mma_k=fp8_mma_k)
++    actual = fp8_linear(a, w, a_scale, w_scale, bias, config=config)
++    expected = (
++        F.linear(a.float(), w.float()) * a_scale[:, None] * w_scale[None, :]
++        + bias.float()
++    )
++    torch.testing.assert_close(actual.float(), expected, atol=0.2, rtol=2e-2)
++
++
+ def test_fp8_linear_qkv_scale_matches_three_scaled_output_groups():
+     _require_gemm_gpu()
+     m, n, k = 128, 1536, 128

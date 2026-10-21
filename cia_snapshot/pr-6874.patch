@@ -1,0 +1,3048 @@
+diff --git a/benchmarks/bench_cake_causal_conv1d_train.py b/benchmarks/bench_cake_causal_conv1d_train.py
+index d53cf6ca81..df16b97cdb 100644
+--- a/benchmarks/bench_cake_causal_conv1d_train.py
++++ b/benchmarks/bench_cake_causal_conv1d_train.py
+@@ -24,10 +24,11 @@
+ a multiple of 64).  Every row reports forward, backward (``dx`` and the
+ deterministic FP32 ``dweight``) and their sum in microseconds plus the achieved
+ GB/s over the logical byte volume (forward ``4SC + 16C``, backward ``6SC + 32C
+-+ 32 C rows`` (``rows`` the FP32 partial rows of the device's grid) for the partial workspace's round trip).  Timing uses CUPTI
+-kernel activity with a cold L2 (``flashinfer.testing.bench_gpu_time(
+-enable_cupti=True)``); multi-kernel comparators report the sum of their
+-kernels' GPU time.
+++ 32 C rows`` (``rows`` the FP32 partial rows of the grid of the backward
++program the row's channel count selects; the JSON names that program) for the
++partial workspace's round trip).  Timing uses CUPTI kernel activity with a
++cold L2 (``flashinfer.testing.bench_gpu_time(enable_cupti=True)``);
++multi-kernel comparators report the sum of their kernels' GPU time.
+ 
+ Example::
+ 
+@@ -232,8 +233,16 @@ def _bytes(mode: str, tokens: int, channels: int, *, partial_rows: int) -> int:
+     return {"fwd": fwd, "bwd": bwd, "step": fwd + bwd}[mode]
+ 
+ 
+-def _partial_rows(arch: str, channels: int, *, device_index: int) -> int:
+-    record = loader.workspace_record(arch)
++def _selected_program(arch: str, tokens: int, channels: int) -> str:
++    """The backward program the registry selects for the row (by channel count; ``tokens`` never enters)."""
++
++    return loader.selected_modules(arch, "bwd", C=channels, S=tokens)[0]
++
++
++def _partial_rows(program: str, channels: int, *, device_index: int) -> int:
++    """The FP32 partial rows of ``program``'s own grid (the public workspace is sized for the largest grid)."""
++
++    record = loader.MODULES[program]
+     return loader.workspace_layout(record, channels, device_index=device_index)["rows"]
+ 
+ 
+@@ -252,11 +261,13 @@ def bench_row(tokens: int, channels: int, *, comparators, device) -> dict:
+         tokens, channels, device=device, generator=generator, dtype=torch.bfloat16
+     )
+     arch = loader.arch_for_capability(torch.cuda.get_device_capability(device))
+-    partial_rows = _partial_rows(arch, channels, device_index=device.index)
++    program = _selected_program(arch, tokens, channels)
++    partial_rows = _partial_rows(program, channels, device_index=device.index)
+     result = {
+         "tokens": tokens,
+         "channels": channels,
+         "documents": list(lens),
++        "program": program,
+         "partial_rows": partial_rows,
+         "comparators": {},
+     }
+diff --git a/flashinfer/cake_causal_conv1d_train.py b/flashinfer/cake_causal_conv1d_train.py
+index c6a0447ffe..fe8231f655 100644
+--- a/flashinfer/cake_causal_conv1d_train.py
++++ b/flashinfer/cake_causal_conv1d_train.py
+@@ -44,6 +44,17 @@
+ launching, and the calls are CUDA Graph capturable once the libraries are
+ built.
+ 
++An architecture's backward may ship several programs of the kernel; every
++call runs exactly one, chosen by ``C`` through a host-side rule of the
++backend's registry (never the data), so a given ``(S, C, device)`` always
++runs the same program.  The workspace size is the maximum over the
++architecture's backward programs, so one buffer of
++``cake_causal_conv1d_train_backward_workspace_bytes(S, C, device)`` serves
++whichever program ``C`` selects.  Before capturing a CUDA Graph, build every
++library of the device's architecture (the backend's
++``cake_jit.specs_for_arch``) so that no JIT build happens inside the capture;
++the captured graph holds the program selected for its shape.
++
+ Usage::
+ 
+     y = cake_causal_conv1d_train_forward(x, weight, cu_seqlens)
+@@ -134,6 +145,14 @@ def cake_causal_conv1d_train_backward(
+     the SiLU derivative of the rounded value (policy A), then produces ``dx``
+     and the FP32 weight gradient in one cooperative launch.
+ 
++    The architecture's backward route may ship several programs of the kernel;
++    a call runs exactly one, chosen by ``C`` through a host-side rule of the
++    backend's registry (never the data), so a given ``(S, C, device)`` always
++    runs the same program.  Before capturing a CUDA Graph, build every library
++    of the device's architecture (the backend's ``cake_jit.specs_for_arch``)
++    so that no JIT build happens inside the capture; the captured graph holds
++    the program selected for its shape.
++
+     Parameters
+     ----------
+     x, weight, cu_seqlens
+@@ -145,7 +164,10 @@ def cake_causal_conv1d_train_backward(
+         Caller-owned ``uint8`` buffer from
+         :func:`cake_causal_conv1d_train_backward_workspace` (the per-CTA FP32
+         ``dweight`` partials; fully written by the kernel, so it needs no
+-        zeroing); allocated when omitted.
++        zeroing); allocated when omitted.  Its size
++        (:func:`cake_causal_conv1d_train_backward_workspace_bytes`) is the
++        maximum over the architecture's backward programs, so one buffer
++        serves whichever program ``C`` selects.
+     dx, dweight : torch.Tensor, optional
+         Preallocated outputs: BF16 of ``x``'s shape and FP32 ``[C, 4]``, both
+         contiguous.
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/__init__.py b/flashinfer/cake_causal_conv1d_train_backend/__init__.py
+index 5063073b4e..66fd2f23ac 100644
+--- a/flashinfer/cake_causal_conv1d_train_backend/__init__.py
++++ b/flashinfer/cake_causal_conv1d_train_backend/__init__.py
+@@ -44,8 +44,9 @@
+     route_applies,
+     route_modules,
+     run_module,
++    selected_modules,
+     workspace_layout,
+-    workspace_record,
++    workspace_owners,
+ )
+ 
+ SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
+@@ -221,8 +222,8 @@ def _launch(
+     """The kernel scalars and the grid of one launch of ``record`` (the host plan of ``cake_jit``).
+ 
+     CTA ``b`` owns channel tile ``b % n_ch_tiles``, so every channel tile needs
+-    a CTA of the device's grid: a ``C`` beyond ``grid x threads x vec``
+-    channels is refused rather than left partly unwritten.
++    a CTA of the launched program's grid on the device: a ``C`` beyond ``grid
++    x threads x vec`` channels is refused rather than left partly unwritten.
+     """
+ 
+     scalars = plan(S, C, num_docs, geometry=record["grid_rule"]["geometry"])
+@@ -241,9 +242,12 @@ def cake_causal_conv1d_train_backward_workspace_bytes(
+     """Bytes of the caller-owned backward workspace for ``C`` channels on ``device``.
+ 
+     The workspace holds the FP32 ``[rows, C, 4]`` ``dweight`` partials of the
+-    cooperative backward, one row per ``n_ch_tiles`` CTAs of the device's
+-    launch grid (``rows = ceil(grid / n_ch_tiles)``).  It depends on ``C`` and
+-    the device only, so it is independent of ``S`` and one buffer serves every
++    cooperative backward, one row per ``n_ch_tiles`` CTAs of a program's
++    launch grid (``rows = ceil(grid / n_ch_tiles)``), sized by the largest
++    grid of the architecture's backward programs: the channel count selects
++    the program a call runs, and every program writes and reduces the leading
++    rows of its own grid inside this buffer.  It depends on ``C`` and the
++    device only, so it is independent of ``S`` and one buffer serves every
+     token count; the kernel fully writes the rows it reduces, so the buffer
+     needs no zeroing between launches or CUDA Graph replays.
+     """
+@@ -257,9 +261,11 @@ def cake_causal_conv1d_train_backward_workspace_bytes(
+             f"C must be a positive multiple of {CHANNEL_MULTIPLE}, got {C}"
+         )
+     arch = _device_arch(device)
+-    record = workspace_record(arch)
+-    layout = workspace_layout(record, C, device_index=_device_index(device))
+-    return int(layout["total_bytes"])
++    device_index = _device_index(device)
++    return max(
++        int(workspace_layout(owner, C, device_index=device_index)["total_bytes"])
++        for owner in workspace_owners(arch)
++    )
+ 
+ 
+ def cake_causal_conv1d_train_backward_workspace(
+@@ -287,8 +293,9 @@ def _partial_view(
+     nbytes = partial_bytes(record, C, rows)
+     if ws.numel() < nbytes:
+         raise ValueError(
+-            f"workspace holds {ws.numel()} bytes; this call needs {nbytes} "
+-            "(cake_causal_conv1d_train_backward_workspace_bytes)"
++            f"workspace holds {ws.numel()} bytes; this call needs at least "
++            f"{nbytes}; allocate "
++            "cake_causal_conv1d_train_backward_workspace_bytes(S, C, device) bytes"
+         )
+     taps = int(record["workspace_rule"]["taps"])
+     return ws[:nbytes].view(torch.float32).view(rows, C, taps)
+@@ -385,6 +392,17 @@ def cake_causal_conv1d_train_backward(
+     weight gradient, accumulated in a fixed order, so ``dweight`` is bitwise
+     reproducible for a given ``(S, C, device)``.  ``S == 0`` returns the empty
+     ``dx`` and a zero ``dweight`` without launching.
++
++    The architecture's backward route may ship several programs of the
++    kernel; a call runs exactly one, chosen by ``C`` through the registry's
++    host-side rule (``cake_jit.selected_modules``; the data is never read),
++    so a given ``(S, C, device)`` always runs the same program.  The
++    ``workspace`` is sized for every program of the route
++    (:func:`cake_causal_conv1d_train_backward_workspace_bytes`); the selected
++    program uses the leading rows of its own grid.  Build every library of
++    the device's architecture (``cake_jit.specs_for_arch``) before capturing
++    a CUDA Graph: the capture holds the program selected for its shape, and
++    no JIT build may happen inside it.
+     """
+ 
+     x = _require_tensor(x, "x")
+@@ -403,7 +421,15 @@ def cake_causal_conv1d_train_backward(
+     if S == 0:
+         dw_out.zero_()
+         return dx_out, dw_out
+-    record = workspace_record(arch)
++    # The program is a pure function of the architecture and C (S never enters):
++    # its own grid sizes the partial rows this call writes inside the workspace.
++    names = selected_modules(arch, "bwd", C=C, S=S)
++    record = _loader.MODULES[names[0]]
++    if record["workspace_rule"] is None:
++        raise RuntimeError(
++            f"the backward program {names[0]} selected for C={C} on {arch} owns no "
++            "partial workspace"
++        )
+     device_index = _device_index(device)
+     scalars, grid_x = _launch(record, S, C, num_docs, device_index=device_index)
+     if workspace is None:
+@@ -420,7 +446,7 @@ def cake_causal_conv1d_train_backward(
+         "partial": partial,
+         **_scalars(scalars),
+     }
+-    for name in route_modules(arch, "bwd"):
++    for name in names:
+         run_module(name, values, device_index=device_index)
+     return dx_out, dw_out
+ 
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/build.json b/flashinfer/cake_causal_conv1d_train_backend/build.json
+index 26900f862f..5ac1f81a0e 100644
+--- a/flashinfer/cake_causal_conv1d_train_backend/build.json
++++ b/flashinfer/cake_causal_conv1d_train_backend/build.json
+@@ -55,14 +55,14 @@
+     }
+   },
+   "generator": {
+-    "cake_revision": "9a27fa8d4f0a83adedcfd8ab363ec3dc6be28bf7",
++    "cake_revision": "39e047a0ae6fc46050766e3cdb2fe6e6f6d4ed73",
+     "cuda": "13.4.92",
+-    "rendered_at": "2026-10-20T07:05:21Z"
++    "rendered_at": "2026-10-20T13:59:22Z"
+   },
+   "libraries": [
+     {
+       "arch": "sm_100a",
+-      "closure_sha256": "cb3d107730c6945fc2049661911ad3b2e36a49d46ea9bc443284a540263a1ba2",
++      "closure_sha256": "9049172f28b6aa53dd5cdc14da8a5bf2954c419de04a680f7120a24a66f211a1",
+       "entry": "run",
+       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
+       "min_cuda": "12.8",
+@@ -76,7 +76,7 @@
+       "path": "aot/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_sm_100a.so",
+       "sha256": {
+         "csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_binding.cu": "ec6574b45078c89c21f9750199b14cda45511c838eb3050a132c06b5c4361235",
+-        "csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_kernel.cu": "46cdd9c958519387ea73c86c9d7bcd1e4e08095f2734d147502c54343fb105d0"
++        "csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_kernel.cu": "24c82f43c60d911a3180fed8293445db03fbfcef8cfa3ea98481ff781c5adbcc"
+       },
+       "sources": [
+         "csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_kernel.cu",
+@@ -85,7 +85,7 @@
+     },
+     {
+       "arch": "sm_103a",
+-      "closure_sha256": "a31a46881557ad7a97c4be4cf8861aff328190f16dc4ab8ae3f238a01a437ebb",
++      "closure_sha256": "9699dbe608a6af7b0d1b23f9642dec7a5acd0a118425aeb13cd26557ac04f667",
+       "entry": "run",
+       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
+       "min_cuda": "12.9",
+@@ -99,16 +99,85 @@
+       "path": "aot/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_sm_103a.so",
+       "sha256": {
+         "csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_binding.cu": "ec6574b45078c89c21f9750199b14cda45511c838eb3050a132c06b5c4361235",
+-        "csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_kernel.cu": "46cdd9c958519387ea73c86c9d7bcd1e4e08095f2734d147502c54343fb105d0"
++        "csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_kernel.cu": "24c82f43c60d911a3180fed8293445db03fbfcef8cfa3ea98481ff781c5adbcc"
+       },
+       "sources": [
+         "csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_kernel.cu",
+         "csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_binding.cu"
+       ]
+     },
++    {
++      "arch": "sm_100a",
++      "closure_sha256": "42aad36aa107c15fc6ae8fb309a490811eb81acabb87ab887958c55c87a27fe6",
++      "entry": "run",
++      "gencode": "-gencode=arch=compute_100a,code=sm_100a",
++      "min_cuda": "12.8",
++      "name": "cake_causal_conv1d_train_90351ecca30604957251_sm_100a",
++      "nvcc_flags": [
++        "--prec-div=true",
++        "--prec-sqrt=true",
++        "--ftz=false"
++      ],
++      "nvcc_flags_if": [],
++      "path": "aot/cake_causal_conv1d_train_90351ecca30604957251_sm_100a.so",
++      "sha256": {
++        "csrc/cake_causal_conv1d_train_90351ecca30604957251_binding.cu": "34c8d3f1aceb3f8e9a8156add105ba9d9a51d381d81f8c7b5a11626de2fc0ec9",
++        "csrc/cake_causal_conv1d_train_90351ecca30604957251_kernel.cu": "19a386288c22f5f6c7b36c2f1813f6f9ffc26cbd271b9c3510946fe980445bd0"
++      },
++      "sources": [
++        "csrc/cake_causal_conv1d_train_90351ecca30604957251_kernel.cu",
++        "csrc/cake_causal_conv1d_train_90351ecca30604957251_binding.cu"
++      ]
++    },
++    {
++      "arch": "sm_103a",
++      "closure_sha256": "6f1dcee7a1fe08a3fa3f585ab764b9a356b9604b8aa769a1a9fd8c0299ca7adc",
++      "entry": "run",
++      "gencode": "-gencode=arch=compute_103a,code=sm_103a",
++      "min_cuda": "12.9",
++      "name": "cake_causal_conv1d_train_90351ecca30604957251_sm_103a",
++      "nvcc_flags": [
++        "--prec-div=true",
++        "--prec-sqrt=true",
++        "--ftz=false"
++      ],
++      "nvcc_flags_if": [],
++      "path": "aot/cake_causal_conv1d_train_90351ecca30604957251_sm_103a.so",
++      "sha256": {
++        "csrc/cake_causal_conv1d_train_90351ecca30604957251_binding.cu": "34c8d3f1aceb3f8e9a8156add105ba9d9a51d381d81f8c7b5a11626de2fc0ec9",
++        "csrc/cake_causal_conv1d_train_90351ecca30604957251_kernel.cu": "19a386288c22f5f6c7b36c2f1813f6f9ffc26cbd271b9c3510946fe980445bd0"
++      },
++      "sources": [
++        "csrc/cake_causal_conv1d_train_90351ecca30604957251_kernel.cu",
++        "csrc/cake_causal_conv1d_train_90351ecca30604957251_binding.cu"
++      ]
++    },
++    {
++      "arch": "sm_107a",
++      "closure_sha256": "0719826fb84fb9fab5ca2fc321f3310a6c1fcb9c3c7734390400bd324978f0e9",
++      "entry": "run",
++      "gencode": "-gencode=arch=compute_107a,code=sm_107a",
++      "min_cuda": "13.0",
++      "name": "cake_causal_conv1d_train_90351ecca30604957251_sm_107a",
++      "nvcc_flags": [
++        "--prec-div=true",
++        "--prec-sqrt=true",
++        "--ftz=false"
++      ],
++      "nvcc_flags_if": [],
++      "path": "aot/cake_causal_conv1d_train_90351ecca30604957251_sm_107a.so",
++      "sha256": {
++        "csrc/cake_causal_conv1d_train_90351ecca30604957251_binding.cu": "34c8d3f1aceb3f8e9a8156add105ba9d9a51d381d81f8c7b5a11626de2fc0ec9",
++        "csrc/cake_causal_conv1d_train_90351ecca30604957251_kernel.cu": "19a386288c22f5f6c7b36c2f1813f6f9ffc26cbd271b9c3510946fe980445bd0"
++      },
++      "sources": [
++        "csrc/cake_causal_conv1d_train_90351ecca30604957251_kernel.cu",
++        "csrc/cake_causal_conv1d_train_90351ecca30604957251_binding.cu"
++      ]
++    },
+     {
+       "arch": "sm_107a",
+-      "closure_sha256": "5c41802fb2dacae365267b410cf85dba50902a25ce86be8b8513b51766ae3c6a",
++      "closure_sha256": "1b154df5d880ca4c407b5aec80dea575fa4092a0f7cfa59d15aa925b58b9bbb8",
+       "entry": "run",
+       "gencode": "-gencode=arch=compute_107a,code=sm_107a",
+       "min_cuda": "13.0",
+@@ -122,7 +191,7 @@
+       "path": "aot/cake_causal_conv1d_train_a93b636beb1d573942bf_sm_107a.so",
+       "sha256": {
+         "csrc/cake_causal_conv1d_train_a93b636beb1d573942bf_binding.cu": "e04dbce5d529b09f546ad82ef82101ee1ecbe4af2e63f28dc44c0def1dd5f437",
+-        "csrc/cake_causal_conv1d_train_a93b636beb1d573942bf_kernel.cu": "baeef214b8af1ef9d0f69ec0e279acdad724eccefda6bc0d18bee257d8edb564"
++        "csrc/cake_causal_conv1d_train_a93b636beb1d573942bf_kernel.cu": "de4c1129e284c32cb96d8f0540927132afae72a559671909313c7082731f4b22"
+       },
+       "sources": [
+         "csrc/cake_causal_conv1d_train_a93b636beb1d573942bf_kernel.cu",
+@@ -131,7 +200,7 @@
+     },
+     {
+       "arch": "sm_100a",
+-      "closure_sha256": "e12466bc004c5a2e96fc8ef649ef84f8b3ae38964a84018d9b30342744bb7a1a",
++      "closure_sha256": "dd83361af73f4854c5f2fc4919a94e80fd2ad6ca25aa75d5c97f7146c9b17d6c",
+       "entry": "run",
+       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
+       "min_cuda": "12.8",
+@@ -145,7 +214,7 @@
+       "path": "aot/cake_causal_conv1d_train_f193c5247980992f4f81_sm_100a.so",
+       "sha256": {
+         "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_binding.cu": "df2fa5bcda4616a64a60faa70079ca36c9ae17165aba7fbb1570a4009cf0e6ba",
+-        "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu": "06c1a0874166b48a211e5e09097eda631b5f3cb00eccb7d8346aa60705510201"
++        "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu": "b75d692951cc641de2cf5f1ba83329e4b875ae2a5a54fecdd916398c95b59d0a"
+       },
+       "sources": [
+         "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu",
+@@ -154,7 +223,7 @@
+     },
+     {
+       "arch": "sm_103a",
+-      "closure_sha256": "c58a06d3890d10c61597da0693e5ea30912524da0905c5042b767f7ccb144bb8",
++      "closure_sha256": "7054533928c1906c7599d856c42db9b7ef68b481664d09b6451c056288ce2a8e",
+       "entry": "run",
+       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
+       "min_cuda": "12.9",
+@@ -168,7 +237,7 @@
+       "path": "aot/cake_causal_conv1d_train_f193c5247980992f4f81_sm_103a.so",
+       "sha256": {
+         "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_binding.cu": "df2fa5bcda4616a64a60faa70079ca36c9ae17165aba7fbb1570a4009cf0e6ba",
+-        "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu": "06c1a0874166b48a211e5e09097eda631b5f3cb00eccb7d8346aa60705510201"
++        "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu": "b75d692951cc641de2cf5f1ba83329e4b875ae2a5a54fecdd916398c95b59d0a"
+       },
+       "sources": [
+         "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu",
+@@ -177,7 +246,7 @@
+     },
+     {
+       "arch": "sm_107a",
+-      "closure_sha256": "865bf05fd2b0e00a18fb031ca9bb7b85aea370ede277c7d51b37552e34425039",
++      "closure_sha256": "8dc23015ece5dace03a47cb858f6ecda1147a7719409ef614289e81ec850afb6",
+       "entry": "run",
+       "gencode": "-gencode=arch=compute_107a,code=sm_107a",
+       "min_cuda": "13.0",
+@@ -191,7 +260,7 @@
+       "path": "aot/cake_causal_conv1d_train_f193c5247980992f4f81_sm_107a.so",
+       "sha256": {
+         "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_binding.cu": "df2fa5bcda4616a64a60faa70079ca36c9ae17165aba7fbb1570a4009cf0e6ba",
+-        "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu": "06c1a0874166b48a211e5e09097eda631b5f3cb00eccb7d8346aa60705510201"
++        "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu": "b75d692951cc641de2cf5f1ba83329e4b875ae2a5a54fecdd916398c95b59d0a"
+       },
+       "sources": [
+         "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu",
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/cake_jit.py b/flashinfer/cake_causal_conv1d_train_backend/cake_jit.py
+index de72511534..9a90ee1949 100644
+--- a/flashinfer/cake_causal_conv1d_train_backend/cake_jit.py
++++ b/flashinfer/cake_causal_conv1d_train_backend/cake_jit.py
+@@ -27,22 +27,37 @@
+ and otherwise through FlashInfer's JIT from the same sources and flags,
+ verifying every source digest before the first build.
+ 
+-A route is the module record one public call launches: ``fwd`` (``y`` from
++A route lists every program one public call may launch: ``fwd`` (``y`` from
+ ``x``, ``weight`` and ``cu_seqlens``) and ``bwd`` (``dx`` and the deterministic
+-FP32 ``dweight`` in one cooperative launch).  Token and channel counts are
+-runtime scalars, so a changed problem size never recompiles anything.
++FP32 ``dweight`` in one cooperative launch).  The forward launches its route in
++order.  The backward route of an architecture may carry several programs of
++the kernel and launches exactly one per call, chosen by the channel count: a
++record's ``select_rule`` (``channels_at_least``: ``C >= channels[arch]``)
++names the channel counts it owns, the record without a rule is the
++architecture's fallback, and :func:`selected_modules` applies that rule (a
++pure function of the architecture and ``C``; the host never reads the data).
++Token and channel counts are runtime scalars, so a changed problem size never
++recompiles anything; building every library of the architecture
++(:func:`specs_for_arch`) before a CUDA Graph capture keeps the JIT out of the
++capture.
+ 
+ The host plan is the three functions :func:`plan` (the kernel scalars),
+ :func:`launch_grid` (the grid) and :func:`partial_rows` (the backward
+-workspace rows); everything else derives from them.
++workspace rows); everything else derives from them.  The public workspace is
++sized by the largest grid of the architecture's backward programs
++(:func:`workspace_record`, the capacity owner); each program writes and
++reduces the leading rows of its own grid.
+ 
+ The program name ``cake_causal_conv1d_train_<20 hex>`` is the first twenty hex
+ digits of the SHA-256 of the compact JSON ``{"build": <build keywords, sorted>,
+ "module": <dotted kernel module>}`` of the kernel the program was rendered
+ from; the forward is built with its kernel file's default keywords; the
+-backward with ``vec=8`` (eight channels, 16-byte vectors, per thread) on
+-sm_100a and sm_103a, and with ``vec=8, min_blocks=2`` (two CTAs per SM) on
+-sm_107a.
++backward with ``vec=8, copy="tma2d"`` (eight channels, 16-byte vectors, per
++thread; 2-D TMA row copies) on sm_100a and sm_103a, with ``vec=8,
++min_blocks=2`` (two CTAs per SM) on sm_107a, and the big-channel backward
++(the program the ``channels_at_least`` rule selects) with ``vec=8,
++copy="tma2d", stage_tokens=8, min_blocks=2`` (eight-token stages, two CTAs
++per SM).
+ """
+ 
+ from __future__ import annotations
+@@ -279,12 +294,95 @@
+             "taps": 4,
+         },
+     },
++    # Rendered by the exporter from the family adapter's scaffold: the backward
++    # with stage_tokens 8, copy tma2d, min_blocks 2 (2 CTAs per SM); it runs when
++    # C >= select_rule.channels[arch], else the fallback record (no rule) runs.
++    "cake_causal_conv1d_train_90351ecca30604957251": {
++        "arches": [
++            "sm_100a",
++            "sm_103a",
++            "sm_107a",
++        ],
++        "arg_plan": [
++            ["buffer", "x"],
++            ["buffer", "w"],
++            ["buffer", "cu"],
++            ["buffer", "dy"],
++            ["buffer", "dx"],
++            ["buffer", "dw"],
++            ["buffer", "partial"],
++            ["parameter", "S"],
++            ["parameter", "C"],
++            ["parameter", "num_docs"],
++            ["parameter", "search_steps"],
++            ["parameter", "ct_vec"],
++            ["parameter", "n_sub"],
++            ["parameter", "n_ch_tiles"],
++            ["buffer", "x_map"],
++            ["buffer", "dy_map"],
++            ["grid", "grid_x"],
++            ["grid", "grid_y"],
++            ["grid", "grid_z"],
++        ],
++        "ffi_entry": "run",
++        "grid_rule": {
++            "cooperative": True,
++            "ctas_per_sm": 2,
++            "geometry": {
++                "threads": 128,
++                "vec": 8,
++            },
++            "kind": "co_resident",
++        },
++        "kernel": "cake_causal_conv1d_train_90351ecca30604957251",
++        "kernel_symbol": "kernel_cake_causal_conv1d_train_90351ecca30604957251",
++        "launch": {
++            "block": (128, 1, 1),
++            "cluster": (1, 1, 1),
++            "cooperative": True,
++            "dynamic_smem_bytes": 82944,
++            "use_pdl": False,
++        },
++        "library": "cake_causal_conv1d_train_90351ecca30604957251",
++        "logical": {
++            "C": "C",
++            "S": "S",
++            "ct_vec": "ct_vec",
++            "cu": "cu",
++            "dw": "dw",
++            "dx": "dx",
++            "dy": "dy",
++            "dy_map": "dy",
++            "n_ch_tiles": "n_ch_tiles",
++            "n_sub": "n_sub",
++            "num_docs": "num_docs",
++            "partial": "partial",
++            "search_steps": "search_steps",
++            "w": "w",
++            "x": "x",
++            "x_map": "x",
++        },
++        "role": "bwd",
++        "select_rule": {
++            "channels": {
++                "sm_100a": 512,
++                "sm_103a": 512,
++                "sm_107a": 1024,
++            },
++            "kind": "channels_at_least",
++        },
++        "workspace_rule": {
++            "kind": "partial_rows",
++            "taps": 4,
++        },
++    },
+ }
+ 
+ ROUTES: dict[str, dict[str, list[str]]] = {
+     "sm_100a": {
+         "bwd": [
+             "cake_causal_conv1d_train_21cc8e5b2b49282a47ef",
++            "cake_causal_conv1d_train_90351ecca30604957251",
+         ],
+         "fwd": [
+             "cake_causal_conv1d_train_f193c5247980992f4f81",
+@@ -293,6 +391,7 @@
+     "sm_103a": {
+         "bwd": [
+             "cake_causal_conv1d_train_21cc8e5b2b49282a47ef",
++            "cake_causal_conv1d_train_90351ecca30604957251",
+         ],
+         "fwd": [
+             "cake_causal_conv1d_train_f193c5247980992f4f81",
+@@ -301,6 +400,7 @@
+     "sm_107a": {
+         "bwd": [
+             "cake_causal_conv1d_train_a93b636beb1d573942bf",
++            "cake_causal_conv1d_train_90351ecca30604957251",
+         ],
+         "fwd": [
+             "cake_causal_conv1d_train_f193c5247980992f4f81",
+@@ -319,6 +419,10 @@
+     (10, 7): "sm_107a",
+ }
+ KINDS = ("fwd", "bwd")
++# The selection-rule vocabulary of a backward record (``record["select_rule"]
++# ["kind"]``); a backward record without a rule is its route's fallback and a
++# forward record never carries one.
++SELECT_KINDS = ("channels_at_least",)
+ # The convolution width: ``weight`` and ``dweight`` are ``[C, WIDTH]`` and tap
+ # ``WIDTH - 1`` multiplies the current token.
+ WIDTH = 4
+@@ -370,7 +474,11 @@ def route_applies(*, device_capability: Sequence[int], kind: str) -> bool:
+ 
+ 
+ def route_modules(arch: str, kind: str) -> tuple[str, ...]:
+-    """Ordered module names of one route on ``arch`` (every program the route launches)."""
++    """Ordered module names of one route on ``arch`` (every program the route may launch).
++
++    The forward launches them all, in order; the backward launches the one
++    :func:`selected_modules` picks for the call's channel count.
++    """
+ 
+     if kind not in KINDS:
+         raise ValueError(f"kind must be one of {KINDS}, got {kind!r}")
+@@ -383,20 +491,117 @@ def route_modules(arch: str, kind: str) -> tuple[str, ...]:
+     return tuple(names)
+ 
+ 
+-def workspace_record(arch: str) -> dict[str, Any]:
+-    """The backward module record that owns the ``partial`` workspace on ``arch``."""
++def select_rule(record: dict[str, Any]) -> dict[str, Any] | None:
++    """The selection rule of one module record, ``None`` when the record carries none.
++
++    A backward record without a rule (no ``select_rule`` key, or ``None``) is
++    its route's fallback program.  ``{"kind": "channels_at_least", "channels":
++    {arch: C_min, ...}}`` owns the calls whose channel count is at least
++    ``channels[arch]`` on the architectures it names and never hits on the
++    others.  Forward records carry no rule.
++    """
++
++    return record.get("select_rule")
++
++
++def _admits(rule: dict[str, Any], *, arch: str, C: int) -> bool:
++    """Whether a selection rule owns ``C`` channels on ``arch`` (``ValueError`` for an unknown kind)."""
++
++    kind = rule["kind"]
++    if kind == "channels_at_least":
++        channels = rule["channels"]
++        return arch in channels and int(C) >= int(channels[arch])
++    raise ValueError(
++        f"unknown Cake causal conv1d training selection rule: {kind!r} "
++        f"(known: {SELECT_KINDS})"
++    )
++
++
++def selected_modules(
++    arch: str, kind: str, *, C: int, S: int | None = None
++) -> tuple[str, ...]:
++    """Ordered module names one public call launches on ``arch`` for ``C`` channels.
++
++    The forward launches every program of its route (:func:`route_modules`).
++    The backward route may carry several programs of the kernel and launches
++    exactly one: the record whose :func:`select_rule` admits ``C`` on ``arch``
++    when one does, else the route's single fallback record (the one without a
++    rule).  The choice is a pure function of the architecture and the channel
++    count -- ``S`` is accepted and unused, and the host never reads the data --
++    so a given ``(S, C, device)`` always runs the same program and ``dweight``
++    stays bitwise reproducible.  Several admitting records, or zero or several
++    fallbacks, are registry errors (``RuntimeError``); an unknown rule kind is
++    a ``ValueError``.
++    """
++
++    names = route_modules(arch, kind)
++    if kind == "fwd":
++        return names
++    positive: list[str] = []
++    fallback: list[str] = []
++    for name in names:
++        rule = select_rule(MODULES[name])
++        if rule is None:
++            fallback.append(name)
++        elif _admits(rule, arch=arch, C=C):
++            positive.append(name)
++    if len(fallback) != 1:
++        raise RuntimeError(
++            f"the exported backward route on {arch} declares {len(fallback)} fallback "
++            "programs (records without a select_rule); expected exactly one"
++        )
++    if len(positive) > 1:
++        raise RuntimeError(
++            f"the exported backward route on {arch} selects {len(positive)} programs "
++            f"for C={int(C)} ({positive}); expected at most one"
++        )
++    if positive:
++        return (positive[0],)
++    return (fallback[0],)
++
+ 
+-    owners = [
++def workspace_owners(arch: str) -> tuple[dict[str, Any], ...]:
++    """The backward module records of ``arch`` that own a ``partial`` workspace, in route order.
++
++    Every backward program declares a ``workspace_rule``; a route without one
++    is a registry error (``RuntimeError``).
++    """
++
++    owners = tuple(
+         MODULES[name]
+         for name in route_modules(arch, "bwd")
+         if MODULES[name]["workspace_rule"] is not None
+-    ]
+-    if len(owners) != 1:
++    )
++    if not owners:
++        raise RuntimeError(
++            f"the exported backward route on {arch} declares no workspace owner; "
++            "expected at least one"
++        )
++    return owners
++
++
++def workspace_record(arch: str) -> dict[str, Any]:
++    """The capacity owner of the backward ``partial`` workspace on ``arch``.
++
++    The public workspace serves every backward program of the route
++    (:func:`workspace_owners`), each of which writes the leading rows of its
++    own grid.  The owners share one build geometry, so for every ``C`` their
++    rows, ``ceil(ctas_per_sm x SM count / n_ch_tiles)``, and bytes grow with
++    ``ctas_per_sm`` alone: the record with the largest ``ctas_per_sm`` (route
++    order breaks ties) bounds them all.  Owners of different geometries are a
++    registry error (``RuntimeError``).
++    """
++
++    owners = workspace_owners(arch)
++    geometries = {
++        tuple(sorted(owner["grid_rule"]["geometry"].items())) for owner in owners
++    }
++    if len(geometries) != 1:
+         raise RuntimeError(
+-            f"the exported backward route on {arch} declares {len(owners)} workspace "
+-            "owners; expected exactly one"
++            f"the backward programs on {arch} declare {len(geometries)} build "
++            "geometries; one workspace serves them only when they share one"
+         )
+-    return owners[0]
++    return max(owners, key=lambda owner: int(owner["grid_rule"]["ctas_per_sm"]))
+ 
+ 
+ def _ceil_div(numerator: int, denominator: int) -> int:
+@@ -605,6 +810,7 @@ def run_module(name: str, values: dict[str, Any], *, device_index: int) -> None:
+     "LOGICAL_TENSORS",
+     "MODULES",
+     "ROUTES",
++    "SELECT_KINDS",
+     "WIDTH",
+     "arch_for_capability",
+     "channel_split",
+@@ -618,8 +824,11 @@ def run_module(name: str, values: dict[str, Any], *, device_index: int) -> None:
+     "route_applies",
+     "route_modules",
+     "run_module",
++    "select_rule",
++    "selected_modules",
+     "sm_count",
+     "specs_for_arch",
+     "workspace_layout",
++    "workspace_owners",
+     "workspace_record",
+ ]
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_kernel.cu b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_kernel.cu
+index 85b0678c5b..1056237722 100644
+--- a/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_kernel.cu
++++ b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_kernel.cu
+@@ -374,18 +374,18 @@ kernel_cake_causal_conv1d_train_21cc8e5b2b49282a47ef(__nv_bfloat16* __restrict__
+                 if (interior == 2) {
+                     #pragma unroll
+                     for (int u = 0; u < 4; u++) {
+-                        __int128_t _smem_b128_2;
+-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_2) : "r"(sx0 + u * RS));
+-                        *reinterpret_cast<uint32_t*>(&pkx[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[0];
+-                        *reinterpret_cast<uint32_t*>(&pkx[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[1];
+-                        *reinterpret_cast<uint32_t*>(&pkx[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[2];
+-                        *reinterpret_cast<uint32_t*>(&pkx[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[3];
+-                        __int128_t _smem_b128_3;
+-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_3) : "r"(sx0 + 16384 + u * RS));
+-                        *reinterpret_cast<uint32_t*>(&pkd[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[0];
+-                        *reinterpret_cast<uint32_t*>(&pkd[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[1];
+-                        *reinterpret_cast<uint32_t*>(&pkd[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[2];
+-                        *reinterpret_cast<uint32_t*>(&pkd[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[3];
++                        __int128_t _smem_raw_2;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_2) : "r"(sx0 + u * RS));
++                        pkx[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[0];
++                        pkx[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[1];
++                        pkx[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[2];
++                        pkx[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[3];
++                        __int128_t _smem_raw_3;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_3) : "r"(sx0 + 16384 + u * RS));
++                        pkd[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[0];
++                        pkd[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[1];
++                        pkd[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[2];
++                        pkd[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[3];
+                         #pragma unroll
+                         for (int kk = 0; kk < 4; kk++) {
+                             win[u % 4 * 8 + 2 * kk] = __uint_as_float(pkx[kk] << 16);
+@@ -446,18 +446,18 @@ kernel_cake_causal_conv1d_train_21cc8e5b2b49282a47ef(__nv_bfloat16* __restrict__
+                 } else if (interior == 1) {
+                     #pragma unroll
+                     for (int u_1 = 0; u_1 < 4; u_1++) {
+-                        __int128_t _smem_b128_4;
+-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_4) : "r"(sx0 + u_1 * RS));
+-                        *reinterpret_cast<uint32_t*>(&pkx[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_4)[0];
+-                        *reinterpret_cast<uint32_t*>(&pkx[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_4)[1];
+-                        *reinterpret_cast<uint32_t*>(&pkx[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_4)[2];
+-                        *reinterpret_cast<uint32_t*>(&pkx[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_4)[3];
+-                        __int128_t _smem_b128_5;
+-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_5) : "r"(sx0 + 16384 + u_1 * RS));
+-                        *reinterpret_cast<uint32_t*>(&pkd[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_5)[0];
+-                        *reinterpret_cast<uint32_t*>(&pkd[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_5)[1];
+-                        *reinterpret_cast<uint32_t*>(&pkd[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_5)[2];
+-                        *reinterpret_cast<uint32_t*>(&pkd[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_5)[3];
++                        __int128_t _smem_raw_4;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_4) : "r"(sx0 + u_1 * RS));
++                        pkx[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_4)[0];
++                        pkx[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_4)[1];
++                        pkx[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_4)[2];
++                        pkx[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_4)[3];
++                        __int128_t _smem_raw_5;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_5) : "r"(sx0 + 16384 + u_1 * RS));
++                        pkd[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_5)[0];
++                        pkd[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_5)[1];
++                        pkd[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_5)[2];
++                        pkd[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_5)[3];
+                         #pragma unroll
+                         for (int kk_3 = 0; kk_3 < 4; kk_3++) {
+                             win[u_1 % 4 * 8 + 2 * kk_3] = __uint_as_float(pkx[kk_3] << 16);
+@@ -521,18 +521,18 @@ kernel_cake_causal_conv1d_train_21cc8e5b2b49282a47ef(__nv_bfloat16* __restrict__
+                         if (steps_k > u_2) {
+                             int tcur = tb + u_2;
+                             if (rows_k_1 > u_2) {
+-                                __int128_t _smem_b128_6;
+-                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_6) : "r"(sx0 + u_2 * RS));
+-                                *reinterpret_cast<uint32_t*>(&pkx[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_6)[0];
+-                                *reinterpret_cast<uint32_t*>(&pkx[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_6)[1];
+-                                *reinterpret_cast<uint32_t*>(&pkx[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_6)[2];
+-                                *reinterpret_cast<uint32_t*>(&pkx[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_6)[3];
+-                                __int128_t _smem_b128_7;
+-                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_7) : "r"(sx0 + 16384 + u_2 * RS));
+-                                *reinterpret_cast<uint32_t*>(&pkd[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_7)[0];
+-                                *reinterpret_cast<uint32_t*>(&pkd[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_7)[1];
+-                                *reinterpret_cast<uint32_t*>(&pkd[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_7)[2];
+-                                *reinterpret_cast<uint32_t*>(&pkd[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_7)[3];
++                                __int128_t _smem_raw_6;
++                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_6) : "r"(sx0 + u_2 * RS));
++                                pkx[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[0];
++                                pkx[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[1];
++                                pkx[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[2];
++                                pkx[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[3];
++                                __int128_t _smem_raw_7;
++                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_7) : "r"(sx0 + 16384 + u_2 * RS));
++                                pkd[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[0];
++                                pkd[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[1];
++                                pkd[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[2];
++                                pkd[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[3];
+                                 #pragma unroll
+                                 for (int kk_6 = 0; kk_6 < 4; kk_6++) {
+                                     win[u_2 % 4 * 8 + 2 * kk_6] = __uint_as_float(pkx[kk_6] << 16);
+@@ -873,18 +873,18 @@ kernel_cake_causal_conv1d_train_21cc8e5b2b49282a47ef(__nv_bfloat16* __restrict__
+                 if (interior_1 == 2) {
+                     #pragma unroll
+                     for (int u_3 = 0; u_3 < 4; u_3++) {
+-                        __int128_t _smem_b128_10;
+-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_10) : "r"(sx0_1 + u_3 * rstride));
+-                        *reinterpret_cast<uint32_t*>(&pkx_1[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_10)[0];
+-                        *reinterpret_cast<uint32_t*>(&pkx_1[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_10)[1];
+-                        *reinterpret_cast<uint32_t*>(&pkx_1[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_10)[2];
+-                        *reinterpret_cast<uint32_t*>(&pkx_1[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_10)[3];
+-                        __int128_t _smem_b128_11;
+-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_11) : "r"(sx0_1 + 2048 + u_3 * rstride));
+-                        *reinterpret_cast<uint32_t*>(&pkd_1[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_11)[0];
+-                        *reinterpret_cast<uint32_t*>(&pkd_1[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_11)[1];
+-                        *reinterpret_cast<uint32_t*>(&pkd_1[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_11)[2];
+-                        *reinterpret_cast<uint32_t*>(&pkd_1[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_11)[3];
++                        __int128_t _smem_raw_10;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_10) : "r"(sx0_1 + u_3 * rstride));
++                        pkx_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_10)[0];
++                        pkx_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_10)[1];
++                        pkx_1[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_10)[2];
++                        pkx_1[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_10)[3];
++                        __int128_t _smem_raw_11;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_11) : "r"(sx0_1 + 2048 + u_3 * rstride));
++                        pkd_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_11)[0];
++                        pkd_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_11)[1];
++                        pkd_1[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_11)[2];
++                        pkd_1[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_11)[3];
+                         #pragma unroll
+                         for (int kk_10 = 0; kk_10 < 4; kk_10++) {
+                             win_1[u_3 % 4 * 8 + 2 * kk_10] = __uint_as_float(pkx_1[kk_10] << 16);
+@@ -945,18 +945,18 @@ kernel_cake_causal_conv1d_train_21cc8e5b2b49282a47ef(__nv_bfloat16* __restrict__
+                 } else if (interior_1 == 1) {
+                     #pragma unroll
+                     for (int u_4 = 0; u_4 < 4; u_4++) {
+-                        __int128_t _smem_b128_12;
+-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_12) : "r"(sx0_1 + u_4 * rstride));
+-                        *reinterpret_cast<uint32_t*>(&pkx_1[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_12)[0];
+-                        *reinterpret_cast<uint32_t*>(&pkx_1[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_12)[1];
+-                        *reinterpret_cast<uint32_t*>(&pkx_1[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_12)[2];
+-                        *reinterpret_cast<uint32_t*>(&pkx_1[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_12)[3];
+-                        __int128_t _smem_b128_13;
+-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_13) : "r"(sx0_1 + 2048 + u_4 * rstride));
+-                        *reinterpret_cast<uint32_t*>(&pkd_1[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_13)[0];
+-                        *reinterpret_cast<uint32_t*>(&pkd_1[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_13)[1];
+-                        *reinterpret_cast<uint32_t*>(&pkd_1[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_13)[2];
+-                        *reinterpret_cast<uint32_t*>(&pkd_1[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_13)[3];
++                        __int128_t _smem_raw_12;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_12) : "r"(sx0_1 + u_4 * rstride));
++                        pkx_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_12)[0];
++                        pkx_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_12)[1];
++                        pkx_1[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_12)[2];
++                        pkx_1[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_12)[3];
++                        __int128_t _smem_raw_13;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_13) : "r"(sx0_1 + 2048 + u_4 * rstride));
++                        pkd_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_13)[0];
++                        pkd_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_13)[1];
++                        pkd_1[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_13)[2];
++                        pkd_1[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_13)[3];
+                         #pragma unroll
+                         for (int kk_13 = 0; kk_13 < 4; kk_13++) {
+                             win_1[u_4 % 4 * 8 + 2 * kk_13] = __uint_as_float(pkx_1[kk_13] << 16);
+@@ -1020,18 +1020,18 @@ kernel_cake_causal_conv1d_train_21cc8e5b2b49282a47ef(__nv_bfloat16* __restrict__
+                         if (steps_k_1 > u_5) {
+                             int tcur_1 = tb_1 + u_5;
+                             if (rows_k_4 > u_5) {
+-                                __int128_t _smem_b128_14;
+-                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_14) : "r"(sx0_1 + u_5 * rstride));
+-                                *reinterpret_cast<uint32_t*>(&pkx_1[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_14)[0];
+-                                *reinterpret_cast<uint32_t*>(&pkx_1[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_14)[1];
+-                                *reinterpret_cast<uint32_t*>(&pkx_1[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_14)[2];
+-                                *reinterpret_cast<uint32_t*>(&pkx_1[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_14)[3];
+-                                __int128_t _smem_b128_15;
+-                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_15) : "r"(sx0_1 + 2048 + u_5 * rstride));
+-                                *reinterpret_cast<uint32_t*>(&pkd_1[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_15)[0];
+-                                *reinterpret_cast<uint32_t*>(&pkd_1[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_15)[1];
+-                                *reinterpret_cast<uint32_t*>(&pkd_1[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_15)[2];
+-                                *reinterpret_cast<uint32_t*>(&pkd_1[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_15)[3];
++                                __int128_t _smem_raw_14;
++                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_14) : "r"(sx0_1 + u_5 * rstride));
++                                pkx_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_14)[0];
++                                pkx_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_14)[1];
++                                pkx_1[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_14)[2];
++                                pkx_1[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_14)[3];
++                                __int128_t _smem_raw_15;
++                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_15) : "r"(sx0_1 + 2048 + u_5 * rstride));
++                                pkd_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_15)[0];
++                                pkd_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_15)[1];
++                                pkd_1[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_15)[2];
++                                pkd_1[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_15)[3];
+                                 #pragma unroll
+                                 for (int kk_16 = 0; kk_16 < 4; kk_16++) {
+                                     win_1[u_5 % 4 * 8 + 2 * kk_16] = __uint_as_float(pkx_1[kk_16] << 16);
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_90351ecca30604957251_binding.cu b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_90351ecca30604957251_binding.cu
+new file mode 100644
+index 0000000000..e5bd04822c
+--- /dev/null
++++ b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_90351ecca30604957251_binding.cu
+@@ -0,0 +1,233 @@
++/*
++ * Copyright (c) 2026 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Generated by Cake: the tvm-ffi host binding of kernel_cake_causal_conv1d_train_90351ecca30604957251, for the device source that defines it. Do not edit.
++#include <cuda_runtime.h>
++#include <cuda.h>
++#include <cuda_bf16.h>
++
++#include "cake_ffi_checks.h"
++
++#include <cstdint>
++
++extern "C" __global__ void kernel_cake_causal_conv1d_train_90351ecca30604957251(__nv_bfloat16* __restrict__ x, float* __restrict__ w, int* __restrict__ cu, __nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ dx, float* __restrict__ dw, float* __restrict__ partial, int S, int C, int num_docs, int search_steps, int ct_vec, int n_sub, int n_ch_tiles, const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap dy_map);
++
++namespace cake_binding_kernel_cake_causal_conv1d_train_90351ecca30604957251 {
++
++using tvm::ffi::TensorView;
++
++constexpr const char* KERNEL_NAME = "kernel_cake_causal_conv1d_train_90351ecca30604957251";
++
++void CheckCuda(cudaError_t status, const char* what) {
++  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
++      << KERNEL_NAME << ": " << what << " failed: " << cudaGetErrorString(status);
++}
++
++void CheckCu(CUresult result, const char* what) {
++  if (result != CUDA_SUCCESS) {
++    const char* name = nullptr;
++    const char* message = nullptr;
++    cuGetErrorName(result, &name);
++    cuGetErrorString(result, &message);
++    TVM_FFI_THROW(RuntimeError) << KERNEL_NAME << ": " << what << " failed with "
++                                << (name ? name : "an unknown CUresult") << " (" << static_cast<int>(result)
++                                << "): " << (message ? message : "");
++  }
++}
++
++void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t.byte_offset(); }
++
++void CheckUnitInnerStride(const TensorView& t, const char* name) {
++  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
++      << KERNEL_NAME << ": '" << name << "' needs a unit innermost stride, got " << t.stride(-1);
++}
++
++// The product of the extents above the trailing `trailing` dims.
++int64_t NumelAbove(const TensorView& t, int trailing) {
++  int64_t product = 1;
++  for (int axis = 0; axis < t.ndim() - trailing; ++axis) product *= t.size(axis);
++  return product;
++}
++
++cuuint64_t Extent(int64_t value, const char* descriptor) {
++  TVM_FFI_CHECK(value > 0, ValueError)
++      << KERNEL_NAME << ": an extent of descriptor '" << descriptor << "' resolves to " << value;
++  return static_cast<cuuint64_t>(value);
++}
++
++cuuint64_t Stride(int64_t value, const char* descriptor) {
++  TVM_FFI_CHECK(value >= 0, ValueError)
++      << KERNEL_NAME << ": a stride of descriptor '" << descriptor << "' resolves to " << value;
++  return static_cast<cuuint64_t>(value);
++}
++
++CUtensorMap EncodeTma_x_map(const TensorView& t) {
++  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
++      << KERNEL_NAME << ": descriptor 'x_map' takes a source of at least 2 dims, got " << t.ndim();
++  CheckUnitInnerStride(t, "x_map");
++  int64_t d1 = t.size(-1);
++  int64_t outer1 = NumelAbove(t, 1);
++  check_dense_leading_dims(t, 1, "x_map");
++  int64_t s2 = t.stride(-2) * 2;
++  cuuint64_t global_dim[2] = {Extent(d1, "x_map"), Extent(outer1, "x_map")};
++  cuuint64_t global_strides[1] = {Stride(s2, "x_map")};
++  cuuint32_t box_dim[2] = {256u, 8u};
++  cuuint32_t elem_strides[2] = {1u, 1u};
++  TVM_FFI_CHECK(global_strides[0] % 16 == 0, ValueError)
++      << KERNEL_NAME << ": the strides of descriptor 'x_map' must be multiples of 16 bytes";
++  void* address = DataPtr(t);
++  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(address) % 16 == 0, ValueError)
++      << KERNEL_NAME << ": the address of descriptor 'x_map' must be 16-byte aligned";
++  CUtensorMap map{};
++  CheckCu(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, address, global_dim, global_strides,
++                                 box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
++                                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
++          "cuTensorMapEncodeTiled of x_map");
++  return map;
++}
++
++CUtensorMap EncodeTma_dy_map(const TensorView& t) {
++  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
++      << KERNEL_NAME << ": descriptor 'dy_map' takes a source of at least 2 dims, got " << t.ndim();
++  CheckUnitInnerStride(t, "dy_map");
++  int64_t d1 = t.size(-1);
++  int64_t outer1 = NumelAbove(t, 1);
++  check_dense_leading_dims(t, 1, "dy_map");
++  int64_t s2 = t.stride(-2) * 2;
++  cuuint64_t global_dim[2] = {Extent(d1, "dy_map"), Extent(outer1, "dy_map")};
++  cuuint64_t global_strides[1] = {Stride(s2, "dy_map")};
++  cuuint32_t box_dim[2] = {256u, 8u};
++  cuuint32_t elem_strides[2] = {1u, 1u};
++  TVM_FFI_CHECK(global_strides[0] % 16 == 0, ValueError)
++      << KERNEL_NAME << ": the strides of descriptor 'dy_map' must be multiples of 16 bytes";
++  void* address = DataPtr(t);
++  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(address) % 16 == 0, ValueError)
++      << KERNEL_NAME << ": the address of descriptor 'dy_map' must be 16-byte aligned";
++  CUtensorMap map{};
++  CheckCu(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, address, global_dim, global_strides,
++                                 box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
++                                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
++          "cuTensorMapEncodeTiled of dy_map");
++  return map;
++}
++
++void Run(TensorView a_x, TensorView a_w, TensorView a_cu, TensorView a_dy, TensorView a_dx, TensorView a_dw, TensorView a_partial, int64_t a_S, int64_t a_C, int64_t a_num_docs, int64_t a_search_steps, int64_t a_ct_vec, int64_t a_n_sub, int64_t a_n_ch_tiles, TensorView a_x_map, TensorView a_dy_map, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
++  DLDevice dev = a_x.device();
++  tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
++  check_cuda_tensor(a_x, "x");
++  check_dtype(a_x, DLDataType{kDLBfloat, 16, 1}, "x");
++  check_cuda_tensor(a_w, "w");
++  check_dtype(a_w, DLDataType{kDLFloat, 32, 1}, "w");
++  check_cuda_tensor(a_cu, "cu");
++  check_dtype(a_cu, DLDataType{kDLInt, 32, 1}, "cu");
++  check_cuda_tensor(a_dy, "dy");
++  check_dtype(a_dy, DLDataType{kDLBfloat, 16, 1}, "dy");
++  check_cuda_tensor(a_dx, "dx");
++  check_dtype(a_dx, DLDataType{kDLBfloat, 16, 1}, "dx");
++  check_cuda_tensor(a_dw, "dw");
++  check_dtype(a_dw, DLDataType{kDLFloat, 32, 1}, "dw");
++  check_cuda_tensor(a_partial, "partial");
++  check_dtype(a_partial, DLDataType{kDLFloat, 32, 1}, "partial");
++  TVM_FFI_CHECK(a_S >= -2147483648LL && a_S <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'S' = " << a_S
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_C >= -2147483648LL && a_C <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'C' = " << a_C
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_num_docs >= -2147483648LL && a_num_docs <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'num_docs' = " << a_num_docs
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_search_steps >= -2147483648LL && a_search_steps <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'search_steps' = " << a_search_steps
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_ct_vec >= -2147483648LL && a_ct_vec <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'ct_vec' = " << a_ct_vec
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_n_sub >= -2147483648LL && a_n_sub <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'n_sub' = " << a_n_sub
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_n_ch_tiles >= -2147483648LL && a_n_ch_tiles <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'n_ch_tiles' = " << a_n_ch_tiles
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  check_cuda_tensor(a_x_map, "x_map");
++  check_dtype(a_x_map, DLDataType{kDLBfloat, 16, 1}, "x_map");
++  check_cuda_tensor(a_dy_map, "dy_map");
++  check_dtype(a_dy_map, DLDataType{kDLBfloat, 16, 1}, "dy_map");
++  check_contiguous(a_x, "x");
++  check_contiguous(a_w, "w");
++  check_same_device(a_w, a_x, "w", "x");
++  check_contiguous(a_cu, "cu");
++  check_same_device(a_cu, a_x, "cu", "x");
++  check_contiguous(a_dy, "dy");
++  check_same_device(a_dy, a_x, "dy", "x");
++  check_contiguous(a_dx, "dx");
++  check_same_device(a_dx, a_x, "dx", "x");
++  check_contiguous(a_dw, "dw");
++  check_same_device(a_dw, a_x, "dw", "x");
++  check_contiguous(a_partial, "partial");
++  check_same_device(a_partial, a_x, "partial", "x");
++  check_same_device(a_x_map, a_x, "x_map", "x");
++  check_same_device(a_dy_map, a_x, "dy_map", "x");
++  TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
++      << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
++  TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)
++      << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") exceeds CUDA's limits";
++  cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(dev.device_type, dev.device_id));
++  {
++    // Once per thread per device: the kernel's function attributes hold per device; the tensor-map encoders need this thread's context of the device bound.
++    static thread_local uint64_t prepared_devices = 0;
++    const uint64_t device_bit = dev.device_id < 64 ? uint64_t{1} << dev.device_id : uint64_t{0};
++    if (device_bit == 0 || (prepared_devices & device_bit) == 0) {
++      CheckCuda(cudaSetDevice(dev.device_id), "cudaSetDevice");
++      CheckCuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_cake_causal_conv1d_train_90351ecca30604957251), cudaFuncAttributeMaxDynamicSharedMemorySize, 82944), "cudaFuncSetAttribute");
++      prepared_devices |= device_bit;
++    }
++  }
++  void* v_x = DataPtr(a_x);
++  void* v_w = DataPtr(a_w);
++  void* v_cu = DataPtr(a_cu);
++  void* v_dy = DataPtr(a_dy);
++  void* v_dx = DataPtr(a_dx);
++  void* v_dw = DataPtr(a_dw);
++  void* v_partial = DataPtr(a_partial);
++  int32_t v_S = static_cast<int32_t>(a_S);
++  int32_t v_C = static_cast<int32_t>(a_C);
++  int32_t v_num_docs = static_cast<int32_t>(a_num_docs);
++  int32_t v_search_steps = static_cast<int32_t>(a_search_steps);
++  int32_t v_ct_vec = static_cast<int32_t>(a_ct_vec);
++  int32_t v_n_sub = static_cast<int32_t>(a_n_sub);
++  int32_t v_n_ch_tiles = static_cast<int32_t>(a_n_ch_tiles);
++  CUtensorMap v_x_map = EncodeTma_x_map(a_x_map);
++  CUtensorMap v_dy_map = EncodeTma_dy_map(a_dy_map);
++  void* kernel_args[] = {&v_x, &v_w, &v_cu, &v_dy, &v_dx, &v_dw, &v_partial, &v_S, &v_C, &v_num_docs, &v_search_steps, &v_ct_vec, &v_n_sub, &v_n_ch_tiles, &v_x_map, &v_dy_map};
++  cudaLaunchConfig_t config{};
++  config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
++  config.blockDim = dim3(128, 1, 1);
++  config.dynamicSmemBytes = 82944;
++  config.stream = stream;
++  cudaLaunchAttribute attrs[1] = {};
++  attrs[0].id = cudaLaunchAttributeCooperative;
++  attrs[0].val.cooperative = 1;
++  config.attrs = attrs;
++  config.numAttrs = 1;
++  CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_causal_conv1d_train_90351ecca30604957251), kernel_args),
++            "cudaLaunchKernelExC");
++}
++
++}  // namespace cake_binding_kernel_cake_causal_conv1d_train_90351ecca30604957251
++
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_binding_kernel_cake_causal_conv1d_train_90351ecca30604957251::Run);
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, cake_ffi_build_cuda_version);
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_90351ecca30604957251_kernel.cu b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_90351ecca30604957251_kernel.cu
+new file mode 100644
+index 0000000000..0ff97c92c7
+--- /dev/null
++++ b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_90351ecca30604957251_kernel.cu
+@@ -0,0 +1,1324 @@
++/*
++ * Copyright (c) 2026 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++typedef signed char        int8_t;
++typedef unsigned char      uint8_t;
++typedef unsigned short     uint16_t;
++typedef unsigned int       uint32_t;
++#if defined(__CUDACC_RTC__)
++typedef unsigned long long uint64_t;
++#else
++typedef unsigned long      uint64_t;
++#endif
++static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
++typedef signed int         int32_t;
++typedef short int          int16_t;
++struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
++static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
++static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
++
++#if defined(__CUDACC_RTC__)
++typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
++#else
++#include <cuda.h>
++#endif
++
++static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++
++__device__ __forceinline__ int make_warp_uniform(int x) {
++    int result;
++    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
++                 : "=r"(result) : "r"(x));
++    return result;
++}
++
++#define CAKE_INF CUDART_INF_F
++#define NUM_MAIN_STAGES 1
++#define SMEM_RED_OFF 1024
++#define SMEM_RED_STAGE_BYTES 16384
++#define SMEM_RED_STRIDE 16384
++#define SMEM_STAGE_BUF_OFF 17408
++#define SMEM_STAGE_BUF_STAGE_BYTES 65536
++#define SMEM_STAGE_BUF_STRIDE 65536
++#define SMEM_TOTAL 82944
++#define THREADS 128
++#define LAUNCH_MIN_BLOCKS 2
++
++#include <math_constants.h>
++#include <cooperative_groups.h>
++
++__device__ __forceinline__ uint32_t elect_sync() {
++    uint32_t pred = 0;
++    asm volatile(
++        "{\n\t"
++        ".reg .pred %%px;\n\t"
++        "elect.sync _|%%px, %1;\n\t"
++        "@%%px mov.s32 %0, 1;\n\t"
++        "}\n"
++        : "+r"(pred)
++        : "r"(0xFFFFFFFF));
++    return pred;
++}
++
++
++__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
++    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
++        :: "r"(mbar_addr), "r"(count) : "memory");
++}
++
++
++
++// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
++// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
++// explicit loop still makes this helper blocking until acquire succeeds.
++__device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
++    asm volatile(
++        "{\n\t"
++        ".reg .pred P1;\n\t"
++        "LAB_WAIT:\n\t"
++        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
++        " P1, [%0], %1;\n\t"
++        "@P1 bra.uni DONE;\n\t"
++        "bra.uni LAB_WAIT;\n\t"
++        "DONE:\n\t"
++        "}\n"
++        :: "r"(mbar_addr), "r"(phase) : "memory");
++}
++
++
++__device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
++    asm volatile(
++        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
++        :: "r"(mbar_addr) : "memory");
++}
++
++
++__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
++    asm volatile(
++        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
++        :: "r"(mbar_addr), "r"(bytes) : "memory");
++}
++
++
++__device__ __forceinline__ float approx_exp2(float x) {
++    float y;
++    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
++    return y;
++}
++
++
++__device__ __forceinline__ float approx_rcp(float x) {
++    float y;
++    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
++    return y;
++}
++
++
++
++
++
++__device__ __forceinline__ void tma_2d_gmem2smem(
++    int dst, const void *tmap_ptr, int x, int y, int mbar_addr) {
++    asm volatile(
++        "cp.async.bulk.tensor.2d.shared::cta.global"
++        ".mbarrier::complete_tx::bytes"
++        " [%0], [%1, {%2, %3}], [%4];"
++        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y),
++           "r"(mbar_addr) : "memory");
++}
++
++
++__device__ __forceinline__ void cp_async_bulk_gmem2smem(
++    unsigned smem_addr, const void* gmem_ptr, unsigned bytes, int mbar_addr) {
++    asm volatile(
++        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
++        " [%0], [%1], %2, [%3];"
++        :: "r"(smem_addr), "l"(gmem_ptr), "r"(bytes), "r"(mbar_addr)
++        : "memory");
++}
++
++
++__device__ __forceinline__ unsigned int __as_u32(float v) {
++    unsigned int u;
++    asm("mov.b32 %0, %1;" : "=r"(u) : "f"(v));
++    return u;
++}
++__device__ __forceinline__ unsigned int __as_u32(__nv_bfloat162 v) {
++    return *reinterpret_cast<const unsigned int*>(&v);
++}
++__device__ __forceinline__ unsigned int __as_u32(unsigned int v) { return v; }
++__device__ __forceinline__ unsigned int __as_u32(int v) {
++    unsigned int u;
++    asm("mov.b32 %0, %1;" : "=r"(u) : "r"(v));
++    return u;
++}
++
++extern "C" {
++
++__global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
++kernel_cake_causal_conv1d_train_90351ecca30604957251(__nv_bfloat16* __restrict__ x, float* __restrict__ w, int* __restrict__ cu, __nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ dx, float* __restrict__ dw, float* __restrict__ partial, int S, int C, int num_docs, int search_steps, int ct_vec, int n_sub, int n_ch_tiles, const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap dy_map)
++{
++    const int tid = threadIdx.x;
++    const int warp = make_warp_uniform(tid / 32);
++    const int lane = tid % 32;
++
++    extern __shared__ __align__(1024) char smem_raw[];
++    int smem;
++#if __CUDA_ARCH__ == 1000
++    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
++    smem = make_warp_uniform(smem);
++#else
++    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
++#endif
++
++    const int mbar_base = smem;
++    #define stage_full_addr (mbar_base + 0)
++
++    const int bid = blockIdx.x;
++    const int num_bids = gridDim.x;
++
++    const int cta_rank = 0;
++
++    // Kernel setup ops
++    float* red = reinterpret_cast<float*>(smem_raw + 1024);
++    const int red_addr = smem + 1024;
++    uint8_t* stage_buf = reinterpret_cast<uint8_t*>(smem_raw + 17408);
++    const int stage_buf_addr = smem + 17408;
++
++    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 8 barriers)
++    // Mbarriers at smem_raw[0..64)
++
++    if (warp == 0) {
++        uint32_t leader = elect_sync();
++        if (leader) {
++            // stage_full: 8 barriers, init_count=32
++            mbarrier_init(smem + 0, 32);
++            mbarrier_init(smem + 8, 32);
++            mbarrier_init(smem + 16, 32);
++            mbarrier_init(smem + 24, 32);
++            mbarrier_init(smem + 32, 32);
++            mbarrier_init(smem + 40, 32);
++            mbarrier_init(smem + 48, 32);
++            mbarrier_init(smem + 56, 32);
++            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
++        }
++    }
++
++    __syncthreads();
++
++    // === Task calls (dependency order) ===
++    asm volatile("griddepcontrol.wait;" ::: "memory");
++    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
++    long long C64 = (long long)C;
++    int ct = bid % n_ch_tiles;
++    int rank = bid / n_ch_tiles;
++    int g_ct = (num_bids - ct + n_ch_tiles - 1) / n_ch_tiles;
++    int sub = tid / ct_vec;
++    int v = tid - sub * ct_vec;
++    int c0 = (ct * ct_vec + v) * 8;
++    int streams = g_ct * n_sub;
++    int L = (S + streams - 1) / streams;
++    int t0 = (rank * n_sub + sub) * L;
++    float acc[32];
++    #pragma unroll
++    for (int i = 0; i < 32; i++) {
++        acc[i] = 0.0f;
++    }
++    int grouped = 0;
++    if ((ct_vec & 31) == 0 && ct_vec > 32 && ct_vec * 8 == C) {
++        grouped = 1;
++    }
++    if (grouped != 0) {
++        int RS = ct_vec * 16;
++        long long c64 = (long long)c0;
++        int _min_0 = ((t0 + L) < (S) ? (t0 + L) : (S));
++        int t_end = _min_0;
++        int _min_1 = ((t_end + 3) < (S + 1) ? (t_end + 3) : (S + 1));
++        int t_stop = _min_1;
++        int _min_2 = ((t_stop) < (S) ? (t_stop) : (S));
++        int t_lim = _min_2;
++        int active = 0;
++        if (sub < n_sub && c0 < C && t0 < S) {
++            active = 1;
++        }
++        int my_rows = 0;
++        int my_steps = 0;
++        if (active != 0) {
++            my_rows = t_lim - t0;
++            my_steps = t_stop - t0;
++        }
++        int n_stages = (my_steps + 8 - 1) / 8;
++        int _min_3 = ((n_stages) < (2) ? (n_stages) : (2));
++        #pragma unroll 1
++        for (int k0 = 0; k0 < _min_3; k0++) {
++            int slot0 = k0;
++            int GWn = ct_vec >> 5;
++            int bslot = sub * 2 + slot0;
++            int rows_k = 0;
++            if (active != 0) {
++                int _max_0 = ((my_rows - k0 * 8) > (0) ? (my_rows - k0 * 8) : (0));
++                int _min_4 = ((_max_0) < (8) ? (_max_0) : (8));
++                rows_k = _min_4;
++            }
++            if (v == 0 && rows_k > 0) {
++                mbarrier_arrive_expect_tx(stage_full_addr + (bslot) * 8, rows_k * (2 * RS));
++                int sx = (int)stage_buf_addr + (sub * (GWn * 2) + slot0 * GWn) * 4096;
++                long long src0 = (long long)(t0 + k0 * 8) * C64 + c64;
++                cp_async_bulk_gmem2smem(sx, reinterpret_cast<const uint8_t*>(x + src0), rows_k * RS, stage_full_addr + (bslot) * 8);
++                cp_async_bulk_gmem2smem(sx + 32768, reinterpret_cast<const uint8_t*>(dy + src0), rows_k * RS, stage_full_addr + (bslot) * 8);
++            } else if (v < 32) {
++                mbarrier_arrive(stage_full_addr + (bslot) * 8);
++            }
++        }
++        float wr[32];
++        float w4[4];
++        int wsm_addr = 0;
++        float win[32];
++        float pend[32];
++        #pragma unroll
++        for (int i_1 = 0; i_1 < 32; i_1++) {
++            win[i_1] = 0.0f;
++            pend[i_1] = 0.0f;
++        }
++        int lo = 0;
++        int hi = num_docs - 1;
++        int doc_start = 0;
++        int doc_end = 0;
++        if (active != 0) {
++            #pragma unroll
++            for (int j = 0; j < 8; j++) {
++                {
++                    float4 _v4 = *reinterpret_cast<const float4*>(w + (c64 + (long long)j) * 4);
++                    wr[j * 4 + 0] = _v4.x;
++                    wr[j * 4 + 1] = _v4.y;
++                    wr[j * 4 + 2] = _v4.z;
++                    wr[j * 4 + 3] = _v4.w;
++                }
++            }
++            #pragma unroll 1
++            for (int step = 0; step < search_steps; step++) {
++                int mid = lo + hi + 1 >> 1;
++                if (t0 >= cu[mid]) {
++                    lo = mid;
++                } else {
++                    hi = mid - 1;
++                }
++            }
++            doc_start = cu[lo];
++            doc_end = cu[lo + 1];
++            #pragma unroll
++            for (int kh = 0; kh < 3; kh++) {
++                int tk = t0 - 3 + kh;
++                if (tk >= doc_start) {
++                    long long rowk = (long long)tk * C64 + c64;
++                    {
++                        const uint4* _vptr_1 = reinterpret_cast<const uint4*>(x + rowk);
++                        uint4 _vld_1[1];
++                        #pragma unroll
++                        for (int _blk = 0; _blk < 1; _blk++) {
++                            _vld_1[_blk] = _vptr_1[_blk];
++                            uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
++                            #pragma unroll
++                            for (int _pair = 0; _pair < 4; _pair++) {
++                                (&win[(kh + 1) * 8 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) << 16);
++                                (&win[(kh + 1) * 8 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) & 0xffff0000u);
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        unsigned int pkx[4];
++        unsigned int pkd[4];
++        float dyf[8];
++        float dp[8];
++        #pragma unroll 1
++        for (int k = 0; k < n_stages; k++) {
++            int slot = k % 2;
++            int parity = k / 2 & 1;
++            int bslot_1 = sub * 2 + slot;
++            mbarrier_wait(stage_full_addr + (bslot_1) * 8, parity);
++            if (active != 0) {
++                int tb = t0 + k * 8;
++                int _max_1 = ((my_rows - k * 8) > (0) ? (my_rows - k * 8) : (0));
++                int _min_5 = ((_max_1) < (8) ? (_max_1) : (8));
++                int rows_k_1 = _min_5;
++                int _max_2 = ((my_steps - k * 8) > (0) ? (my_steps - k * 8) : (0));
++                int _min_6 = ((_max_2) < (8) ? (_max_2) : (8));
++                int steps_k = _min_6;
++                int GWn_1 = ct_vec >> 5;
++                int sx0 = (int)stage_buf_addr + (sub * (GWn_1 * 2) + slot * GWn_1) * 4096 + v * 16;
++                int interior = 0;
++                if (steps_k == 8 && rows_k_1 == 8 && t_end >= tb + 8 && doc_end >= tb + 8) {
++                    if (k >= 1) {
++                        if (doc_start <= tb - 3) {
++                            interior = 2;
++                        }
++                    }
++                }
++                if (interior == 2) {
++                    #pragma unroll
++                    for (int u = 0; u < 8; u++) {
++                        __int128_t _smem_raw_2;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_2) : "r"(sx0 + u * RS));
++                        pkx[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[0];
++                        pkx[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[1];
++                        pkx[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[2];
++                        pkx[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[3];
++                        __int128_t _smem_raw_3;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_3) : "r"(sx0 + 32768 + u * RS));
++                        pkd[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[0];
++                        pkd[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[1];
++                        pkd[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[2];
++                        pkd[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[3];
++                        #pragma unroll
++                        for (int kk = 0; kk < 4; kk++) {
++                            win[u % 4 * 8 + 2 * kk] = __uint_as_float(pkx[kk] << 16);
++                            win[u % 4 * 8 + 2 * kk + 1] = __uint_as_float(pkx[kk] & 4294901760u);
++                            dyf[2 * kk] = __uint_as_float(pkd[kk] << 16);
++                            dyf[2 * kk + 1] = __uint_as_float(pkd[kk] & 4294901760u);
++                        }
++                        #pragma unroll
++                        for (int j_1 = 0; j_1 < 8; j_1++) {
++                            #pragma unroll
++                            for (int kk_1 = 0; kk_1 < 4; kk_1++) {
++                                w4[kk_1] = wr[j_1 * 4 + kk_1];
++                            }
++                            float _mul_0;
++                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_0) : "f"(w4[0]), "f"(win[(u % 4 + 1) % 4 * 8 + j_1]));
++                            float _mul_1;
++                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_1) : "f"(w4[1]), "f"(win[(u % 4 + 2) % 4 * 8 + j_1]));
++                            float _add_0;
++                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_0) : "f"(_mul_0), "f"(_mul_1));
++                            float _mul_2;
++                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_2) : "f"(w4[2]), "f"(win[(u % 4 + 3) % 4 * 8 + j_1]));
++                            float _add_1;
++                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_1) : "f"(_add_0), "f"(_mul_2));
++                            float _mul_3;
++                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_3) : "f"(w4[3]), "f"(win[u % 4 * 8 + j_1]));
++                            float _add_2;
++                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_2) : "f"(_add_1), "f"(_mul_3));
++                            __nv_bfloat162 _bf16x2_0 = __float22bfloat162_rn(make_float2(0.0f, _add_2));
++                            float p = __uint_as_float(__as_u32(_bf16x2_0));
++                            float e = (-p) * 1.4426950408889634f;
++                            float _exp2_0 = approx_exp2(e);
++                            float den = 1.0f + _exp2_0;
++                            float _rcp_0 = approx_rcp(den);
++                            float sg = _rcp_0;
++                            float g = sg * __fmaf_rn(p, 1.0f - sg, 1.0f);
++                            dp[j_1] = dyf[j_1] * g;
++                            #pragma unroll
++                            for (int kk_2 = 0; kk_2 < 4; kk_2++) {
++                                acc[j_1 * 4 + kk_2] = __fmaf_rn(dp[j_1], win[(u % 4 + 1 + kk_2) % 4 * 8 + j_1], acc[j_1 * 4 + kk_2]);
++                            }
++                            pend[(u % 4 + 1) % 4 * 8 + j_1] = __fmaf_rn(w4[0], dp[j_1], pend[(u % 4 + 1) % 4 * 8 + j_1]);
++                            pend[(u % 4 + 2) % 4 * 8 + j_1] = __fmaf_rn(w4[1], dp[j_1], pend[(u % 4 + 2) % 4 * 8 + j_1]);
++                            pend[(u % 4 + 3) % 4 * 8 + j_1] = __fmaf_rn(w4[2], dp[j_1], pend[(u % 4 + 3) % 4 * 8 + j_1]);
++                            pend[u % 4 * 8 + j_1] = w4[3] * dp[j_1];
++                        }
++                        if (u >= 0) {
++                            long long row3 = (long long)(tb + (u - 3)) * C64 + c64;
++                            {
++                                __nv_bfloat162 _pk[4];
++                                _pk[0] = __floats2bfloat162_rn(pend[(u % 4 + 1) % 4 * 8 + 0], pend[(u % 4 + 1) % 4 * 8 + 1]);
++                                _pk[1] = __floats2bfloat162_rn(pend[(u % 4 + 1) % 4 * 8 + 2], pend[(u % 4 + 1) % 4 * 8 + 3]);
++                                _pk[2] = __floats2bfloat162_rn(pend[(u % 4 + 1) % 4 * 8 + 4], pend[(u % 4 + 1) % 4 * 8 + 5]);
++                                _pk[3] = __floats2bfloat162_rn(pend[(u % 4 + 1) % 4 * 8 + 6], pend[(u % 4 + 1) % 4 * 8 + 7]);
++                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(dx))[row3 + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
++                            }
++                        }
++                    }
++                } else if (interior == 1) {
++                    #pragma unroll
++                    for (int u_1 = 0; u_1 < 8; u_1++) {
++                        __int128_t _smem_raw_4;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_4) : "r"(sx0 + u_1 * RS));
++                        pkx[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_4)[0];
++                        pkx[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_4)[1];
++                        pkx[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_4)[2];
++                        pkx[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_4)[3];
++                        __int128_t _smem_raw_5;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_5) : "r"(sx0 + 32768 + u_1 * RS));
++                        pkd[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_5)[0];
++                        pkd[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_5)[1];
++                        pkd[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_5)[2];
++                        pkd[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_5)[3];
++                        #pragma unroll
++                        for (int kk_3 = 0; kk_3 < 4; kk_3++) {
++                            win[u_1 % 4 * 8 + 2 * kk_3] = __uint_as_float(pkx[kk_3] << 16);
++                            win[u_1 % 4 * 8 + 2 * kk_3 + 1] = __uint_as_float(pkx[kk_3] & 4294901760u);
++                            dyf[2 * kk_3] = __uint_as_float(pkd[kk_3] << 16);
++                            dyf[2 * kk_3 + 1] = __uint_as_float(pkd[kk_3] & 4294901760u);
++                        }
++                        #pragma unroll
++                        for (int j_2 = 0; j_2 < 8; j_2++) {
++                            #pragma unroll
++                            for (int kk_4 = 0; kk_4 < 4; kk_4++) {
++                                w4[kk_4] = wr[j_2 * 4 + kk_4];
++                            }
++                            float _mul_4;
++                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_4) : "f"(w4[0]), "f"(win[(u_1 % 4 + 1) % 4 * 8 + j_2]));
++                            float _mul_5;
++                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_5) : "f"(w4[1]), "f"(win[(u_1 % 4 + 2) % 4 * 8 + j_2]));
++                            float _add_3;
++                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_3) : "f"(_mul_4), "f"(_mul_5));
++                            float _mul_6;
++                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_6) : "f"(w4[2]), "f"(win[(u_1 % 4 + 3) % 4 * 8 + j_2]));
++                            float _add_4;
++                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_4) : "f"(_add_3), "f"(_mul_6));
++                            float _mul_7;
++                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_7) : "f"(w4[3]), "f"(win[u_1 % 4 * 8 + j_2]));
++                            float _add_5;
++                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_5) : "f"(_add_4), "f"(_mul_7));
++                            __nv_bfloat162 _bf16x2_1 = __float22bfloat162_rn(make_float2(0.0f, _add_5));
++                            float p_1 = __uint_as_float(__as_u32(_bf16x2_1));
++                            float e_1 = (-p_1) * 1.4426950408889634f;
++                            float _exp2_1 = approx_exp2(e_1);
++                            float den_1 = 1.0f + _exp2_1;
++                            float _rcp_1 = approx_rcp(den_1);
++                            float sg_1 = _rcp_1;
++                            float g_1 = sg_1 * __fmaf_rn(p_1, 1.0f - sg_1, 1.0f);
++                            dp[j_2] = dyf[j_2] * g_1;
++                            #pragma unroll
++                            for (int kk_5 = 0; kk_5 < 4; kk_5++) {
++                                acc[j_2 * 4 + kk_5] = __fmaf_rn(dp[j_2], win[(u_1 % 4 + 1 + kk_5) % 4 * 8 + j_2], acc[j_2 * 4 + kk_5]);
++                            }
++                            pend[(u_1 % 4 + 1) % 4 * 8 + j_2] = __fmaf_rn(w4[0], dp[j_2], pend[(u_1 % 4 + 1) % 4 * 8 + j_2]);
++                            pend[(u_1 % 4 + 2) % 4 * 8 + j_2] = __fmaf_rn(w4[1], dp[j_2], pend[(u_1 % 4 + 2) % 4 * 8 + j_2]);
++                            pend[(u_1 % 4 + 3) % 4 * 8 + j_2] = __fmaf_rn(w4[2], dp[j_2], pend[(u_1 % 4 + 3) % 4 * 8 + j_2]);
++                            pend[u_1 % 4 * 8 + j_2] = w4[3] * dp[j_2];
++                        }
++                        if (u_1 >= 3) {
++                            long long row3_1 = (long long)(tb + (u_1 - 3)) * C64 + c64;
++                            {
++                                __nv_bfloat162 _pk[4];
++                                _pk[0] = __floats2bfloat162_rn(pend[(u_1 % 4 + 1) % 4 * 8 + 0], pend[(u_1 % 4 + 1) % 4 * 8 + 1]);
++                                _pk[1] = __floats2bfloat162_rn(pend[(u_1 % 4 + 1) % 4 * 8 + 2], pend[(u_1 % 4 + 1) % 4 * 8 + 3]);
++                                _pk[2] = __floats2bfloat162_rn(pend[(u_1 % 4 + 1) % 4 * 8 + 4], pend[(u_1 % 4 + 1) % 4 * 8 + 5]);
++                                _pk[3] = __floats2bfloat162_rn(pend[(u_1 % 4 + 1) % 4 * 8 + 6], pend[(u_1 % 4 + 1) % 4 * 8 + 7]);
++                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(dx))[row3_1 + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
++                            }
++                        }
++                    }
++                } else {
++                    #pragma unroll
++                    for (int u_2 = 0; u_2 < 8; u_2++) {
++                        if (steps_k > u_2) {
++                            int tcur = tb + u_2;
++                            if (rows_k_1 > u_2) {
++                                __int128_t _smem_raw_6;
++                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_6) : "r"(sx0 + u_2 * RS));
++                                pkx[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[0];
++                                pkx[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[1];
++                                pkx[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[2];
++                                pkx[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[3];
++                                __int128_t _smem_raw_7;
++                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_7) : "r"(sx0 + 32768 + u_2 * RS));
++                                pkd[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[0];
++                                pkd[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[1];
++                                pkd[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[2];
++                                pkd[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[3];
++                                #pragma unroll
++                                for (int kk_6 = 0; kk_6 < 4; kk_6++) {
++                                    win[u_2 % 4 * 8 + 2 * kk_6] = __uint_as_float(pkx[kk_6] << 16);
++                                    win[u_2 % 4 * 8 + 2 * kk_6 + 1] = __uint_as_float(pkx[kk_6] & 4294901760u);
++                                    dyf[2 * kk_6] = __uint_as_float(pkd[kk_6] << 16);
++                                    dyf[2 * kk_6 + 1] = __uint_as_float(pkd[kk_6] & 4294901760u);
++                                }
++                            }
++                            if (tcur >= doc_end) {
++                                #pragma unroll
++                                for (int m = 1; m < 4; m++) {
++                                    int tm = tcur - m;
++                                    if (tm >= t0 && tm < t_end && tm >= doc_start) {
++                                        long long rowm = (long long)tm * C64 + c64;
++                                        {
++                                            __nv_bfloat162 _pk[4];
++                                            _pk[0] = __floats2bfloat162_rn(pend[(u_2 % 4 + 4 - m) % 4 * 8 + 0], pend[(u_2 % 4 + 4 - m) % 4 * 8 + 1]);
++                                            _pk[1] = __floats2bfloat162_rn(pend[(u_2 % 4 + 4 - m) % 4 * 8 + 2], pend[(u_2 % 4 + 4 - m) % 4 * 8 + 3]);
++                                            _pk[2] = __floats2bfloat162_rn(pend[(u_2 % 4 + 4 - m) % 4 * 8 + 4], pend[(u_2 % 4 + 4 - m) % 4 * 8 + 5]);
++                                            _pk[3] = __floats2bfloat162_rn(pend[(u_2 % 4 + 4 - m) % 4 * 8 + 6], pend[(u_2 % 4 + 4 - m) % 4 * 8 + 7]);
++                                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(dx))[rowm + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
++                                        }
++                                    }
++                                }
++                                if (tcur < S) {
++                                    int lo2 = 0;
++                                    int hi2 = num_docs - 1;
++                                    #pragma unroll 1
++                                    for (int step2 = 0; step2 < search_steps; step2++) {
++                                        int mid2 = lo2 + hi2 + 1 >> 1;
++                                        if (tcur >= cu[mid2]) {
++                                            lo2 = mid2;
++                                        } else {
++                                            hi2 = mid2 - 1;
++                                        }
++                                    }
++                                    doc_start = cu[lo2];
++                                    doc_end = cu[lo2 + 1];
++                                } else {
++                                    doc_start = tcur + 8;
++                                    doc_end = tcur + 8;
++                                }
++                                #pragma unroll
++                                for (int m_1 = 1; m_1 < 4; m_1++) {
++                                    #pragma unroll
++                                    for (int j_3 = 0; j_3 < 8; j_3++) {
++                                        win[(u_2 % 4 + 4 - m_1) % 4 * 8 + j_3] = 0.0f;
++                                    }
++                                }
++                            }
++                            if (tcur < S) {
++                                if (tcur < t_end) {
++                                    #pragma unroll
++                                    for (int j_4 = 0; j_4 < 8; j_4++) {
++                                        #pragma unroll
++                                        for (int kk_7 = 0; kk_7 < 4; kk_7++) {
++                                            w4[kk_7] = wr[j_4 * 4 + kk_7];
++                                        }
++                                        float _mul_8;
++                                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_8) : "f"(w4[0]), "f"(win[(u_2 % 4 + 1) % 4 * 8 + j_4]));
++                                        float _mul_9;
++                                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_9) : "f"(w4[1]), "f"(win[(u_2 % 4 + 2) % 4 * 8 + j_4]));
++                                        float _add_6;
++                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_6) : "f"(_mul_8), "f"(_mul_9));
++                                        float _mul_10;
++                                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_10) : "f"(w4[2]), "f"(win[(u_2 % 4 + 3) % 4 * 8 + j_4]));
++                                        float _add_7;
++                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_7) : "f"(_add_6), "f"(_mul_10));
++                                        float _mul_11;
++                                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_11) : "f"(w4[3]), "f"(win[u_2 % 4 * 8 + j_4]));
++                                        float _add_8;
++                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_8) : "f"(_add_7), "f"(_mul_11));
++                                        __nv_bfloat162 _bf16x2_2 = __float22bfloat162_rn(make_float2(0.0f, _add_8));
++                                        float p_2 = __uint_as_float(__as_u32(_bf16x2_2));
++                                        float e_2 = (-p_2) * 1.4426950408889634f;
++                                        float _exp2_2 = approx_exp2(e_2);
++                                        float den_2 = 1.0f + _exp2_2;
++                                        float _rcp_2 = approx_rcp(den_2);
++                                        float sg_2 = _rcp_2;
++                                        float g_2 = sg_2 * __fmaf_rn(p_2, 1.0f - sg_2, 1.0f);
++                                        dp[j_4] = dyf[j_4] * g_2;
++                                        #pragma unroll
++                                        for (int kk_8 = 0; kk_8 < 4; kk_8++) {
++                                            acc[j_4 * 4 + kk_8] = __fmaf_rn(dp[j_4], win[(u_2 % 4 + 1 + kk_8) % 4 * 8 + j_4], acc[j_4 * 4 + kk_8]);
++                                        }
++                                        pend[(u_2 % 4 + 1) % 4 * 8 + j_4] = __fmaf_rn(w4[0], dp[j_4], pend[(u_2 % 4 + 1) % 4 * 8 + j_4]);
++                                        pend[(u_2 % 4 + 2) % 4 * 8 + j_4] = __fmaf_rn(w4[1], dp[j_4], pend[(u_2 % 4 + 2) % 4 * 8 + j_4]);
++                                        pend[(u_2 % 4 + 3) % 4 * 8 + j_4] = __fmaf_rn(w4[2], dp[j_4], pend[(u_2 % 4 + 3) % 4 * 8 + j_4]);
++                                        pend[u_2 % 4 * 8 + j_4] = w4[3] * dp[j_4];
++                                    }
++                                } else {
++                                    #pragma unroll
++                                    for (int j_5 = 0; j_5 < 8; j_5++) {
++                                        #pragma unroll
++                                        for (int kk_9 = 0; kk_9 < 4; kk_9++) {
++                                            w4[kk_9] = wr[j_5 * 4 + kk_9];
++                                        }
++                                        float _mul_12;
++                                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_12) : "f"(w4[0]), "f"(win[(u_2 % 4 + 1) % 4 * 8 + j_5]));
++                                        float _mul_13;
++                                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_13) : "f"(w4[1]), "f"(win[(u_2 % 4 + 2) % 4 * 8 + j_5]));
++                                        float _add_9;
++                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_9) : "f"(_mul_12), "f"(_mul_13));
++                                        float _mul_14;
++                                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_14) : "f"(w4[2]), "f"(win[(u_2 % 4 + 3) % 4 * 8 + j_5]));
++                                        float _add_10;
++                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_10) : "f"(_add_9), "f"(_mul_14));
++                                        float _mul_15;
++                                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_15) : "f"(w4[3]), "f"(win[u_2 % 4 * 8 + j_5]));
++                                        float _add_11;
++                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_11) : "f"(_add_10), "f"(_mul_15));
++                                        __nv_bfloat162 _bf16x2_3 = __float22bfloat162_rn(make_float2(0.0f, _add_11));
++                                        float p_3 = __uint_as_float(__as_u32(_bf16x2_3));
++                                        float e_3 = (-p_3) * 1.4426950408889634f;
++                                        float _exp2_3 = approx_exp2(e_3);
++                                        float den_3 = 1.0f + _exp2_3;
++                                        float _rcp_3 = approx_rcp(den_3);
++                                        float sg_3 = _rcp_3;
++                                        float g_3 = sg_3 * __fmaf_rn(p_3, 1.0f - sg_3, 1.0f);
++                                        dp[j_5] = dyf[j_5] * g_3;
++                                        pend[(u_2 % 4 + 1) % 4 * 8 + j_5] = __fmaf_rn(w4[0], dp[j_5], pend[(u_2 % 4 + 1) % 4 * 8 + j_5]);
++                                        pend[(u_2 % 4 + 2) % 4 * 8 + j_5] = __fmaf_rn(w4[1], dp[j_5], pend[(u_2 % 4 + 2) % 4 * 8 + j_5]);
++                                        pend[(u_2 % 4 + 3) % 4 * 8 + j_5] = __fmaf_rn(w4[2], dp[j_5], pend[(u_2 % 4 + 3) % 4 * 8 + j_5]);
++                                        pend[u_2 % 4 * 8 + j_5] = w4[3] * dp[j_5];
++                                    }
++                                }
++                                int t3 = tcur - 3;
++                                if (t3 >= t0 && t3 >= doc_start) {
++                                    long long row3_2 = (long long)t3 * C64 + c64;
++                                    {
++                                        __nv_bfloat162 _pk[4];
++                                        _pk[0] = __floats2bfloat162_rn(pend[(u_2 % 4 + 1) % 4 * 8 + 0], pend[(u_2 % 4 + 1) % 4 * 8 + 1]);
++                                        _pk[1] = __floats2bfloat162_rn(pend[(u_2 % 4 + 1) % 4 * 8 + 2], pend[(u_2 % 4 + 1) % 4 * 8 + 3]);
++                                        _pk[2] = __floats2bfloat162_rn(pend[(u_2 % 4 + 1) % 4 * 8 + 4], pend[(u_2 % 4 + 1) % 4 * 8 + 5]);
++                                        _pk[3] = __floats2bfloat162_rn(pend[(u_2 % 4 + 1) % 4 * 8 + 6], pend[(u_2 % 4 + 1) % 4 * 8 + 7]);
++                                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(dx))[row3_2 + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++            #pragma unroll
++            for (int s = 0; s < 2; s++) {
++                if (sub == s) {
++                    asm volatile("barrier.sync %0, %1;" :: "r"(1 + s), "r"(ct_vec) : "memory");
++                }
++            }
++            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
++            int kn = k + 2;
++            if (kn < n_stages) {
++                int GWn_2 = ct_vec >> 5;
++                int bslot_0 = sub * 2 + slot;
++                int rows_k_2 = 0;
++                if (active != 0) {
++                    int _max_3 = ((my_rows - kn * 8) > (0) ? (my_rows - kn * 8) : (0));
++                    int _min_7 = ((_max_3) < (8) ? (_max_3) : (8));
++                    rows_k_2 = _min_7;
++                }
++                if (v == 0 && rows_k_2 > 0) {
++                    mbarrier_arrive_expect_tx(stage_full_addr + (bslot_0) * 8, rows_k_2 * (2 * RS));
++                    int sx_1 = (int)stage_buf_addr + (sub * (GWn_2 * 2) + slot * GWn_2) * 4096;
++                    long long src0_1 = (long long)(t0 + kn * 8) * C64 + c64;
++                    cp_async_bulk_gmem2smem(sx_1, reinterpret_cast<const uint8_t*>(x + src0_1), rows_k_2 * RS, stage_full_addr + (bslot_0) * 8);
++                    cp_async_bulk_gmem2smem(sx_1 + 32768, reinterpret_cast<const uint8_t*>(dy + src0_1), rows_k_2 * RS, stage_full_addr + (bslot_0) * 8);
++                } else if (v < 32) {
++                    mbarrier_arrive(stage_full_addr + (bslot_0) * 8);
++                }
++            }
++        }
++    } else {
++        int warp_1 = tid >> 5;
++        int lane_1 = tid & 31;
++        int _min_8 = ((lane_1) < (v) ? (lane_1) : (v));
++        int li = _min_8;
++        int _min_9 = ((32 - (lane_1 - li)) < (ct_vec - (v - li)) ? (32 - (lane_1 - li)) : (ct_vec - (v - li)));
++        int seg_lanes = _min_9;
++        int rstride = seg_lanes * 16;
++        int seg_off = (lane_1 - li) * 128;
++        int whole_row = 0;
++        if (rstride == C * 2) {
++            whole_row = 1;
++        }
++        int full = 0;
++        if (seg_lanes == 32) {
++            full = 1;
++        }
++        long long c64_1 = (long long)c0;
++        int _min_10 = ((t0 + L) < (S) ? (t0 + L) : (S));
++        int t_end_1 = _min_10;
++        int _min_11 = ((t_end_1 + 3) < (S + 1) ? (t_end_1 + 3) : (S + 1));
++        int t_stop_1 = _min_11;
++        int _min_12 = ((t_stop_1) < (S) ? (t_stop_1) : (S));
++        int t_lim_1 = _min_12;
++        int active_1 = 0;
++        if (sub < n_sub && c0 < C && t0 < S) {
++            active_1 = 1;
++        }
++        int my_rows_1 = 0;
++        int my_steps_1 = 0;
++        if (active_1 != 0) {
++            my_rows_1 = t_lim_1 - t0;
++            my_steps_1 = t_stop_1 - t0;
++        }
++        int sub0 = warp_1 * 32 / ct_vec;
++        int t00 = (rank * n_sub + sub0) * L;
++        int steps0 = 0;
++        if (sub0 < n_sub && (ct * ct_vec + (warp_1 * 32 - sub0 * ct_vec)) * 8 < C && t00 < S) {
++            int _min_13 = ((t00 + L) < (S) ? (t00 + L) : (S));
++            int _min_14 = ((_min_13 + 3) < (S + 1) ? (_min_13 + 3) : (S + 1));
++            steps0 = _min_14 - t00;
++        }
++        int n_stages_1 = (steps0 + 8 - 1) / 8;
++        int _min_15 = ((n_stages_1) < (2) ? (n_stages_1) : (2));
++        #pragma unroll 1
++        for (int k0_1 = 0; k0_1 < _min_15; k0_1++) {
++            int slot0_1 = k0_1;
++            int bslot_2 = warp_1 * 2 + slot0_1;
++            int rows_k_3 = 0;
++            if (active_1 != 0) {
++                int _max_4 = ((my_rows_1 - k0_1 * 8) > (0) ? (my_rows_1 - k0_1 * 8) : (0));
++                int _min_16 = ((_max_4) < (8) ? (_max_4) : (8));
++                rows_k_3 = _min_16;
++            }
++            if (li == 0 && rows_k_3 > 0) {
++                int _min_17 = ((rstride) < ((int)(C64 - c64_1) * 2) ? (rstride) : ((int)(C64 - c64_1) * 2));
++                int cb = _min_17;
++                int sx_2 = (int)stage_buf_addr + bslot_2 * 8192 + seg_off;
++                long long src0_2 = (long long)(t0 + k0_1 * 8) * C64 + c64_1;
++                if (whole_row != 0) {
++                    mbarrier_arrive_expect_tx(stage_full_addr + (bslot_2) * 8, rows_k_3 * (2 * cb));
++                    cp_async_bulk_gmem2smem(sx_2, reinterpret_cast<const uint8_t*>(x + src0_2), rows_k_3 * cb, stage_full_addr + (bslot_2) * 8);
++                    cp_async_bulk_gmem2smem(sx_2 + 4096, reinterpret_cast<const uint8_t*>(dy + src0_2), rows_k_3 * cb, stage_full_addr + (bslot_2) * 8);
++                } else if (rstride == 512) {
++                    mbarrier_arrive_expect_tx(stage_full_addr + (bslot_2) * 8, 8192);
++                    int cc = (int)c64_1;
++                    tma_2d_gmem2smem(sx_2, (&x_map), cc, t0 + k0_1 * 8, stage_full_addr + (bslot_2) * 8);
++                    tma_2d_gmem2smem(sx_2 + 4096, (&dy_map), cc, t0 + k0_1 * 8, stage_full_addr + (bslot_2) * 8);
++                } else {
++                    mbarrier_arrive_expect_tx(stage_full_addr + (bslot_2) * 8, rows_k_3 * (2 * cb));
++                    #pragma unroll 1
++                    for (int i_2 = 0; i_2 < rows_k_3; i_2++) {
++                        long long src = src0_2 + (long long)i_2 * C64;
++                        cp_async_bulk_gmem2smem(sx_2 + i_2 * rstride, reinterpret_cast<const uint8_t*>(x + src), cb, stage_full_addr + (bslot_2) * 8);
++                        cp_async_bulk_gmem2smem(sx_2 + 4096 + i_2 * rstride, reinterpret_cast<const uint8_t*>(dy + src), cb, stage_full_addr + (bslot_2) * 8);
++                    }
++                }
++            } else {
++                mbarrier_arrive(stage_full_addr + (bslot_2) * 8);
++            }
++        }
++        float wr_1[32];
++        float w4_1[4];
++        int wsm_addr_1 = 0;
++        float win_1[32];
++        float pend_1[32];
++        #pragma unroll
++        for (int i_3 = 0; i_3 < 32; i_3++) {
++            win_1[i_3] = 0.0f;
++            pend_1[i_3] = 0.0f;
++        }
++        int lo_1 = 0;
++        int hi_1 = num_docs - 1;
++        int doc_start_1 = 0;
++        int doc_end_1 = 0;
++        if (active_1 != 0) {
++            #pragma unroll
++            for (int j_6 = 0; j_6 < 8; j_6++) {
++                {
++                    float4 _v4 = *reinterpret_cast<const float4*>(w + (c64_1 + (long long)j_6) * 4);
++                    wr_1[j_6 * 4 + 0] = _v4.x;
++                    wr_1[j_6 * 4 + 1] = _v4.y;
++                    wr_1[j_6 * 4 + 2] = _v4.z;
++                    wr_1[j_6 * 4 + 3] = _v4.w;
++                }
++            }
++            #pragma unroll 1
++            for (int step_1 = 0; step_1 < search_steps; step_1++) {
++                int mid_1 = lo_1 + hi_1 + 1 >> 1;
++                if (t0 >= cu[mid_1]) {
++                    lo_1 = mid_1;
++                } else {
++                    hi_1 = mid_1 - 1;
++                }
++            }
++            doc_start_1 = cu[lo_1];
++            doc_end_1 = cu[lo_1 + 1];
++            #pragma unroll
++            for (int kh_1 = 0; kh_1 < 3; kh_1++) {
++                int tk_1 = t0 - 3 + kh_1;
++                if (tk_1 >= doc_start_1) {
++                    long long rowk_1 = (long long)tk_1 * C64 + c64_1;
++                    {
++                        const uint4* _vptr_9 = reinterpret_cast<const uint4*>(x + rowk_1);
++                        uint4 _vld_9[1];
++                        #pragma unroll
++                        for (int _blk = 0; _blk < 1; _blk++) {
++                            _vld_9[_blk] = _vptr_9[_blk];
++                            uint32_t* _vpairs_9 = reinterpret_cast<uint32_t*>(&_vld_9[_blk]);
++                            #pragma unroll
++                            for (int _pair = 0; _pair < 4; _pair++) {
++                                (&win_1[(kh_1 + 1) * 8 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_9[_pair]) << 16);
++                                (&win_1[(kh_1 + 1) * 8 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_9[_pair]) & 0xffff0000u);
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        unsigned int pkx_1[4];
++        unsigned int pkd_1[4];
++        float dyf_1[8];
++        float dp_1[8];
++        #pragma unroll 1
++        for (int k_1 = 0; k_1 < n_stages_1; k_1++) {
++            int slot_1 = k_1 % 2;
++            int parity_1 = k_1 / 2 & 1;
++            int bslot_3 = warp_1 * 2 + slot_1;
++            mbarrier_wait(stage_full_addr + (bslot_3) * 8, parity_1);
++            if (active_1 != 0) {
++                int tb_1 = t0 + k_1 * 8;
++                int _max_5 = ((my_rows_1 - k_1 * 8) > (0) ? (my_rows_1 - k_1 * 8) : (0));
++                int _min_18 = ((_max_5) < (8) ? (_max_5) : (8));
++                int rows_k_4 = _min_18;
++                int _max_6 = ((my_steps_1 - k_1 * 8) > (0) ? (my_steps_1 - k_1 * 8) : (0));
++                int _min_19 = ((_max_6) < (8) ? (_max_6) : (8));
++                int steps_k_1 = _min_19;
++                int sx0_1 = (int)stage_buf_addr + bslot_3 * 8192 + seg_off + li * 16;
++                int interior_1 = 0;
++                if (steps_k_1 == 8 && rows_k_4 == 8 && t_end_1 >= tb_1 + 8 && doc_end_1 >= tb_1 + 8) {
++                    if (k_1 >= 1) {
++                        if (doc_start_1 <= tb_1 - 3) {
++                            interior_1 = 2;
++                        }
++                    }
++                }
++                if (interior_1 == 2) {
++                    #pragma unroll
++                    for (int u_3 = 0; u_3 < 8; u_3++) {
++                        __int128_t _smem_raw_10;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_10) : "r"(sx0_1 + u_3 * rstride));
++                        pkx_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_10)[0];
++                        pkx_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_10)[1];
++                        pkx_1[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_10)[2];
++                        pkx_1[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_10)[3];
++                        __int128_t _smem_raw_11;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_11) : "r"(sx0_1 + 4096 + u_3 * rstride));
++                        pkd_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_11)[0];
++                        pkd_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_11)[1];
++                        pkd_1[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_11)[2];
++                        pkd_1[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_11)[3];
++                        #pragma unroll
++                        for (int kk_10 = 0; kk_10 < 4; kk_10++) {
++                            win_1[u_3 % 4 * 8 + 2 * kk_10] = __uint_as_float(pkx_1[kk_10] << 16);
++                            win_1[u_3 % 4 * 8 + 2 * kk_10 + 1] = __uint_as_float(pkx_1[kk_10] & 4294901760u);
++                            dyf_1[2 * kk_10] = __uint_as_float(pkd_1[kk_10] << 16);
++                            dyf_1[2 * kk_10 + 1] = __uint_as_float(pkd_1[kk_10] & 4294901760u);
++                        }
++                        #pragma unroll
++                        for (int j_7 = 0; j_7 < 8; j_7++) {
++                            #pragma unroll
++                            for (int kk_11 = 0; kk_11 < 4; kk_11++) {
++                                w4_1[kk_11] = wr_1[j_7 * 4 + kk_11];
++                            }
++                            float _mul_16;
++                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_16) : "f"(w4_1[0]), "f"(win_1[(u_3 % 4 + 1) % 4 * 8 + j_7]));
++                            float _mul_17;
++                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_17) : "f"(w4_1[1]), "f"(win_1[(u_3 % 4 + 2) % 4 * 8 + j_7]));
++                            float _add_12;
++                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_12) : "f"(_mul_16), "f"(_mul_17));
++                            float _mul_18;
++                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_18) : "f"(w4_1[2]), "f"(win_1[(u_3 % 4 + 3) % 4 * 8 + j_7]));
++                            float _add_13;
++                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_13) : "f"(_add_12), "f"(_mul_18));
++                            float _mul_19;
++                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_19) : "f"(w4_1[3]), "f"(win_1[u_3 % 4 * 8 + j_7]));
++                            float _add_14;
++                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_14) : "f"(_add_13), "f"(_mul_19));
++                            __nv_bfloat162 _bf16x2_4 = __float22bfloat162_rn(make_float2(0.0f, _add_14));
++                            float p_4 = __uint_as_float(__as_u32(_bf16x2_4));
++                            float e_4 = (-p_4) * 1.4426950408889634f;
++                            float _exp2_4 = approx_exp2(e_4);
++                            float den_4 = 1.0f + _exp2_4;
++                            float _rcp_4 = approx_rcp(den_4);
++                            float sg_4 = _rcp_4;
++                            float g_4 = sg_4 * __fmaf_rn(p_4, 1.0f - sg_4, 1.0f);
++                            dp_1[j_7] = dyf_1[j_7] * g_4;
++                            #pragma unroll
++                            for (int kk_12 = 0; kk_12 < 4; kk_12++) {
++                                acc[j_7 * 4 + kk_12] = __fmaf_rn(dp_1[j_7], win_1[(u_3 % 4 + 1 + kk_12) % 4 * 8 + j_7], acc[j_7 * 4 + kk_12]);
++                            }
++                            pend_1[(u_3 % 4 + 1) % 4 * 8 + j_7] = __fmaf_rn(w4_1[0], dp_1[j_7], pend_1[(u_3 % 4 + 1) % 4 * 8 + j_7]);
++                            pend_1[(u_3 % 4 + 2) % 4 * 8 + j_7] = __fmaf_rn(w4_1[1], dp_1[j_7], pend_1[(u_3 % 4 + 2) % 4 * 8 + j_7]);
++                            pend_1[(u_3 % 4 + 3) % 4 * 8 + j_7] = __fmaf_rn(w4_1[2], dp_1[j_7], pend_1[(u_3 % 4 + 3) % 4 * 8 + j_7]);
++                            pend_1[u_3 % 4 * 8 + j_7] = w4_1[3] * dp_1[j_7];
++                        }
++                        if (u_3 >= 0) {
++                            long long row3_3 = (long long)(tb_1 + (u_3 - 3)) * C64 + c64_1;
++                            {
++                                __nv_bfloat162 _pk[4];
++                                _pk[0] = __floats2bfloat162_rn(pend_1[(u_3 % 4 + 1) % 4 * 8 + 0], pend_1[(u_3 % 4 + 1) % 4 * 8 + 1]);
++                                _pk[1] = __floats2bfloat162_rn(pend_1[(u_3 % 4 + 1) % 4 * 8 + 2], pend_1[(u_3 % 4 + 1) % 4 * 8 + 3]);
++                                _pk[2] = __floats2bfloat162_rn(pend_1[(u_3 % 4 + 1) % 4 * 8 + 4], pend_1[(u_3 % 4 + 1) % 4 * 8 + 5]);
++                                _pk[3] = __floats2bfloat162_rn(pend_1[(u_3 % 4 + 1) % 4 * 8 + 6], pend_1[(u_3 % 4 + 1) % 4 * 8 + 7]);
++                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(dx))[row3_3 + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
++                            }
++                        }
++                    }
++                } else if (interior_1 == 1) {
++                    #pragma unroll
++                    for (int u_4 = 0; u_4 < 8; u_4++) {
++                        __int128_t _smem_raw_12;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_12) : "r"(sx0_1 + u_4 * rstride));
++                        pkx_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_12)[0];
++                        pkx_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_12)[1];
++                        pkx_1[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_12)[2];
++                        pkx_1[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_12)[3];
++                        __int128_t _smem_raw_13;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_13) : "r"(sx0_1 + 4096 + u_4 * rstride));
++                        pkd_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_13)[0];
++                        pkd_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_13)[1];
++                        pkd_1[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_13)[2];
++                        pkd_1[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_13)[3];
++                        #pragma unroll
++                        for (int kk_13 = 0; kk_13 < 4; kk_13++) {
++                            win_1[u_4 % 4 * 8 + 2 * kk_13] = __uint_as_float(pkx_1[kk_13] << 16);
++                            win_1[u_4 % 4 * 8 + 2 * kk_13 + 1] = __uint_as_float(pkx_1[kk_13] & 4294901760u);
++                            dyf_1[2 * kk_13] = __uint_as_float(pkd_1[kk_13] << 16);
++                            dyf_1[2 * kk_13 + 1] = __uint_as_float(pkd_1[kk_13] & 4294901760u);
++                        }
++                        #pragma unroll
++                        for (int j_8 = 0; j_8 < 8; j_8++) {
++                            #pragma unroll
++                            for (int kk_14 = 0; kk_14 < 4; kk_14++) {
++                                w4_1[kk_14] = wr_1[j_8 * 4 + kk_14];
++                            }
++                            float _mul_20;
++                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_20) : "f"(w4_1[0]), "f"(win_1[(u_4 % 4 + 1) % 4 * 8 + j_8]));
++                            float _mul_21;
++                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_21) : "f"(w4_1[1]), "f"(win_1[(u_4 % 4 + 2) % 4 * 8 + j_8]));
++                            float _add_15;
++                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_15) : "f"(_mul_20), "f"(_mul_21));
++                            float _mul_22;
++                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_22) : "f"(w4_1[2]), "f"(win_1[(u_4 % 4 + 3) % 4 * 8 + j_8]));
++                            float _add_16;
++                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_16) : "f"(_add_15), "f"(_mul_22));
++                            float _mul_23;
++                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_23) : "f"(w4_1[3]), "f"(win_1[u_4 % 4 * 8 + j_8]));
++                            float _add_17;
++                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_17) : "f"(_add_16), "f"(_mul_23));
++                            __nv_bfloat162 _bf16x2_5 = __float22bfloat162_rn(make_float2(0.0f, _add_17));
++                            float p_5 = __uint_as_float(__as_u32(_bf16x2_5));
++                            float e_5 = (-p_5) * 1.4426950408889634f;
++                            float _exp2_5 = approx_exp2(e_5);
++                            float den_5 = 1.0f + _exp2_5;
++                            float _rcp_5 = approx_rcp(den_5);
++                            float sg_5 = _rcp_5;
++                            float g_5 = sg_5 * __fmaf_rn(p_5, 1.0f - sg_5, 1.0f);
++                            dp_1[j_8] = dyf_1[j_8] * g_5;
++                            #pragma unroll
++                            for (int kk_15 = 0; kk_15 < 4; kk_15++) {
++                                acc[j_8 * 4 + kk_15] = __fmaf_rn(dp_1[j_8], win_1[(u_4 % 4 + 1 + kk_15) % 4 * 8 + j_8], acc[j_8 * 4 + kk_15]);
++                            }
++                            pend_1[(u_4 % 4 + 1) % 4 * 8 + j_8] = __fmaf_rn(w4_1[0], dp_1[j_8], pend_1[(u_4 % 4 + 1) % 4 * 8 + j_8]);
++                            pend_1[(u_4 % 4 + 2) % 4 * 8 + j_8] = __fmaf_rn(w4_1[1], dp_1[j_8], pend_1[(u_4 % 4 + 2) % 4 * 8 + j_8]);
++                            pend_1[(u_4 % 4 + 3) % 4 * 8 + j_8] = __fmaf_rn(w4_1[2], dp_1[j_8], pend_1[(u_4 % 4 + 3) % 4 * 8 + j_8]);
++                            pend_1[u_4 % 4 * 8 + j_8] = w4_1[3] * dp_1[j_8];
++                        }
++                        if (u_4 >= 3) {
++                            long long row3_4 = (long long)(tb_1 + (u_4 - 3)) * C64 + c64_1;
++                            {
++                                __nv_bfloat162 _pk[4];
++                                _pk[0] = __floats2bfloat162_rn(pend_1[(u_4 % 4 + 1) % 4 * 8 + 0], pend_1[(u_4 % 4 + 1) % 4 * 8 + 1]);
++                                _pk[1] = __floats2bfloat162_rn(pend_1[(u_4 % 4 + 1) % 4 * 8 + 2], pend_1[(u_4 % 4 + 1) % 4 * 8 + 3]);
++                                _pk[2] = __floats2bfloat162_rn(pend_1[(u_4 % 4 + 1) % 4 * 8 + 4], pend_1[(u_4 % 4 + 1) % 4 * 8 + 5]);
++                                _pk[3] = __floats2bfloat162_rn(pend_1[(u_4 % 4 + 1) % 4 * 8 + 6], pend_1[(u_4 % 4 + 1) % 4 * 8 + 7]);
++                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(dx))[row3_4 + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
++                            }
++                        }
++                    }
++                } else {
++                    #pragma unroll
++                    for (int u_5 = 0; u_5 < 8; u_5++) {
++                        if (steps_k_1 > u_5) {
++                            int tcur_1 = tb_1 + u_5;
++                            if (rows_k_4 > u_5) {
++                                __int128_t _smem_raw_14;
++                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_14) : "r"(sx0_1 + u_5 * rstride));
++                                pkx_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_14)[0];
++                                pkx_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_14)[1];
++                                pkx_1[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_14)[2];
++                                pkx_1[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_14)[3];
++                                __int128_t _smem_raw_15;
++                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_15) : "r"(sx0_1 + 4096 + u_5 * rstride));
++                                pkd_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_15)[0];
++                                pkd_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_15)[1];
++                                pkd_1[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_15)[2];
++                                pkd_1[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_15)[3];
++                                #pragma unroll
++                                for (int kk_16 = 0; kk_16 < 4; kk_16++) {
++                                    win_1[u_5 % 4 * 8 + 2 * kk_16] = __uint_as_float(pkx_1[kk_16] << 16);
++                                    win_1[u_5 % 4 * 8 + 2 * kk_16 + 1] = __uint_as_float(pkx_1[kk_16] & 4294901760u);
++                                    dyf_1[2 * kk_16] = __uint_as_float(pkd_1[kk_16] << 16);
++                                    dyf_1[2 * kk_16 + 1] = __uint_as_float(pkd_1[kk_16] & 4294901760u);
++                                }
++                            }
++                            if (tcur_1 >= doc_end_1) {
++                                #pragma unroll
++                                for (int m_2 = 1; m_2 < 4; m_2++) {
++                                    int tm_1 = tcur_1 - m_2;
++                                    if (tm_1 >= t0 && tm_1 < t_end_1 && tm_1 >= doc_start_1) {
++                                        long long rowm_1 = (long long)tm_1 * C64 + c64_1;
++                                        {
++                                            __nv_bfloat162 _pk[4];
++                                            _pk[0] = __floats2bfloat162_rn(pend_1[(u_5 % 4 + 4 - m_2) % 4 * 8 + 0], pend_1[(u_5 % 4 + 4 - m_2) % 4 * 8 + 1]);
++                                            _pk[1] = __floats2bfloat162_rn(pend_1[(u_5 % 4 + 4 - m_2) % 4 * 8 + 2], pend_1[(u_5 % 4 + 4 - m_2) % 4 * 8 + 3]);
++                                            _pk[2] = __floats2bfloat162_rn(pend_1[(u_5 % 4 + 4 - m_2) % 4 * 8 + 4], pend_1[(u_5 % 4 + 4 - m_2) % 4 * 8 + 5]);
++                                            _pk[3] = __floats2bfloat162_rn(pend_1[(u_5 % 4 + 4 - m_2) % 4 * 8 + 6], pend_1[(u_5 % 4 + 4 - m_2) % 4 * 8 + 7]);
++                                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(dx))[rowm_1 + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
++                                        }
++                                    }
++                                }
++                                if (tcur_1 < S) {
++                                    int lo2_1 = 0;
++                                    int hi2_1 = num_docs - 1;
++                                    #pragma unroll 1
++                                    for (int step2_1 = 0; step2_1 < search_steps; step2_1++) {
++                                        int mid2_1 = lo2_1 + hi2_1 + 1 >> 1;
++                                        if (tcur_1 >= cu[mid2_1]) {
++                                            lo2_1 = mid2_1;
++                                        } else {
++                                            hi2_1 = mid2_1 - 1;
++                                        }
++                                    }
++                                    doc_start_1 = cu[lo2_1];
++                                    doc_end_1 = cu[lo2_1 + 1];
++                                } else {
++                                    doc_start_1 = tcur_1 + 8;
++                                    doc_end_1 = tcur_1 + 8;
++                                }
++                                #pragma unroll
++                                for (int m_3 = 1; m_3 < 4; m_3++) {
++                                    #pragma unroll
++                                    for (int j_9 = 0; j_9 < 8; j_9++) {
++                                        win_1[(u_5 % 4 + 4 - m_3) % 4 * 8 + j_9] = 0.0f;
++                                    }
++                                }
++                            }
++                            if (tcur_1 < S) {
++                                if (tcur_1 < t_end_1) {
++                                    #pragma unroll
++                                    for (int j_10 = 0; j_10 < 8; j_10++) {
++                                        #pragma unroll
++                                        for (int kk_17 = 0; kk_17 < 4; kk_17++) {
++                                            w4_1[kk_17] = wr_1[j_10 * 4 + kk_17];
++                                        }
++                                        float _mul_24;
++                                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_24) : "f"(w4_1[0]), "f"(win_1[(u_5 % 4 + 1) % 4 * 8 + j_10]));
++                                        float _mul_25;
++                                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_25) : "f"(w4_1[1]), "f"(win_1[(u_5 % 4 + 2) % 4 * 8 + j_10]));
++                                        float _add_18;
++                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_18) : "f"(_mul_24), "f"(_mul_25));
++                                        float _mul_26;
++                                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_26) : "f"(w4_1[2]), "f"(win_1[(u_5 % 4 + 3) % 4 * 8 + j_10]));
++                                        float _add_19;
++                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_19) : "f"(_add_18), "f"(_mul_26));
++                                        float _mul_27;
++                                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_27) : "f"(w4_1[3]), "f"(win_1[u_5 % 4 * 8 + j_10]));
++                                        float _add_20;
++                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_20) : "f"(_add_19), "f"(_mul_27));
++                                        __nv_bfloat162 _bf16x2_6 = __float22bfloat162_rn(make_float2(0.0f, _add_20));
++                                        float p_6 = __uint_as_float(__as_u32(_bf16x2_6));
++                                        float e_6 = (-p_6) * 1.4426950408889634f;
++                                        float _exp2_6 = approx_exp2(e_6);
++                                        float den_6 = 1.0f + _exp2_6;
++                                        float _rcp_6 = approx_rcp(den_6);
++                                        float sg_6 = _rcp_6;
++                                        float g_6 = sg_6 * __fmaf_rn(p_6, 1.0f - sg_6, 1.0f);
++                                        dp_1[j_10] = dyf_1[j_10] * g_6;
++                                        #pragma unroll
++                                        for (int kk_18 = 0; kk_18 < 4; kk_18++) {
++                                            acc[j_10 * 4 + kk_18] = __fmaf_rn(dp_1[j_10], win_1[(u_5 % 4 + 1 + kk_18) % 4 * 8 + j_10], acc[j_10 * 4 + kk_18]);
++                                        }
++                                        pend_1[(u_5 % 4 + 1) % 4 * 8 + j_10] = __fmaf_rn(w4_1[0], dp_1[j_10], pend_1[(u_5 % 4 + 1) % 4 * 8 + j_10]);
++                                        pend_1[(u_5 % 4 + 2) % 4 * 8 + j_10] = __fmaf_rn(w4_1[1], dp_1[j_10], pend_1[(u_5 % 4 + 2) % 4 * 8 + j_10]);
++                                        pend_1[(u_5 % 4 + 3) % 4 * 8 + j_10] = __fmaf_rn(w4_1[2], dp_1[j_10], pend_1[(u_5 % 4 + 3) % 4 * 8 + j_10]);
++                                        pend_1[u_5 % 4 * 8 + j_10] = w4_1[3] * dp_1[j_10];
++                                    }
++                                } else {
++                                    #pragma unroll
++                                    for (int j_11 = 0; j_11 < 8; j_11++) {
++                                        #pragma unroll
++                                        for (int kk_19 = 0; kk_19 < 4; kk_19++) {
++                                            w4_1[kk_19] = wr_1[j_11 * 4 + kk_19];
++                                        }
++                                        float _mul_28;
++                                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_28) : "f"(w4_1[0]), "f"(win_1[(u_5 % 4 + 1) % 4 * 8 + j_11]));
++                                        float _mul_29;
++                                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_29) : "f"(w4_1[1]), "f"(win_1[(u_5 % 4 + 2) % 4 * 8 + j_11]));
++                                        float _add_21;
++                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_21) : "f"(_mul_28), "f"(_mul_29));
++                                        float _mul_30;
++                                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_30) : "f"(w4_1[2]), "f"(win_1[(u_5 % 4 + 3) % 4 * 8 + j_11]));
++                                        float _add_22;
++                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_22) : "f"(_add_21), "f"(_mul_30));
++                                        float _mul_31;
++                                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_31) : "f"(w4_1[3]), "f"(win_1[u_5 % 4 * 8 + j_11]));
++                                        float _add_23;
++                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_23) : "f"(_add_22), "f"(_mul_31));
++                                        __nv_bfloat162 _bf16x2_7 = __float22bfloat162_rn(make_float2(0.0f, _add_23));
++                                        float p_7 = __uint_as_float(__as_u32(_bf16x2_7));
++                                        float e_7 = (-p_7) * 1.4426950408889634f;
++                                        float _exp2_7 = approx_exp2(e_7);
++                                        float den_7 = 1.0f + _exp2_7;
++                                        float _rcp_7 = approx_rcp(den_7);
++                                        float sg_7 = _rcp_7;
++                                        float g_7 = sg_7 * __fmaf_rn(p_7, 1.0f - sg_7, 1.0f);
++                                        dp_1[j_11] = dyf_1[j_11] * g_7;
++                                        pend_1[(u_5 % 4 + 1) % 4 * 8 + j_11] = __fmaf_rn(w4_1[0], dp_1[j_11], pend_1[(u_5 % 4 + 1) % 4 * 8 + j_11]);
++                                        pend_1[(u_5 % 4 + 2) % 4 * 8 + j_11] = __fmaf_rn(w4_1[1], dp_1[j_11], pend_1[(u_5 % 4 + 2) % 4 * 8 + j_11]);
++                                        pend_1[(u_5 % 4 + 3) % 4 * 8 + j_11] = __fmaf_rn(w4_1[2], dp_1[j_11], pend_1[(u_5 % 4 + 3) % 4 * 8 + j_11]);
++                                        pend_1[u_5 % 4 * 8 + j_11] = w4_1[3] * dp_1[j_11];
++                                    }
++                                }
++                                int t3_1 = tcur_1 - 3;
++                                if (t3_1 >= t0 && t3_1 >= doc_start_1) {
++                                    long long row3_5 = (long long)t3_1 * C64 + c64_1;
++                                    {
++                                        __nv_bfloat162 _pk[4];
++                                        _pk[0] = __floats2bfloat162_rn(pend_1[(u_5 % 4 + 1) % 4 * 8 + 0], pend_1[(u_5 % 4 + 1) % 4 * 8 + 1]);
++                                        _pk[1] = __floats2bfloat162_rn(pend_1[(u_5 % 4 + 1) % 4 * 8 + 2], pend_1[(u_5 % 4 + 1) % 4 * 8 + 3]);
++                                        _pk[2] = __floats2bfloat162_rn(pend_1[(u_5 % 4 + 1) % 4 * 8 + 4], pend_1[(u_5 % 4 + 1) % 4 * 8 + 5]);
++                                        _pk[3] = __floats2bfloat162_rn(pend_1[(u_5 % 4 + 1) % 4 * 8 + 6], pend_1[(u_5 % 4 + 1) % 4 * 8 + 7]);
++                                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(dx))[row3_5 + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++            __syncwarp();
++            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
++            int kn_1 = k_1 + 2;
++            if (kn_1 < n_stages_1) {
++                int bslot_0_1 = warp_1 * 2 + slot_1;
++                int rows_k_5 = 0;
++                if (active_1 != 0) {
++                    int _max_7 = ((my_rows_1 - kn_1 * 8) > (0) ? (my_rows_1 - kn_1 * 8) : (0));
++                    int _min_20 = ((_max_7) < (8) ? (_max_7) : (8));
++                    rows_k_5 = _min_20;
++                }
++                if (li == 0 && rows_k_5 > 0) {
++                    int _min_21 = ((rstride) < ((int)(C64 - c64_1) * 2) ? (rstride) : ((int)(C64 - c64_1) * 2));
++                    int cb_1 = _min_21;
++                    int sx_3 = (int)stage_buf_addr + bslot_0_1 * 8192 + seg_off;
++                    long long src0_3 = (long long)(t0 + kn_1 * 8) * C64 + c64_1;
++                    if (whole_row != 0) {
++                        mbarrier_arrive_expect_tx(stage_full_addr + (bslot_0_1) * 8, rows_k_5 * (2 * cb_1));
++                        cp_async_bulk_gmem2smem(sx_3, reinterpret_cast<const uint8_t*>(x + src0_3), rows_k_5 * cb_1, stage_full_addr + (bslot_0_1) * 8);
++                        cp_async_bulk_gmem2smem(sx_3 + 4096, reinterpret_cast<const uint8_t*>(dy + src0_3), rows_k_5 * cb_1, stage_full_addr + (bslot_0_1) * 8);
++                    } else if (rstride == 512) {
++                        mbarrier_arrive_expect_tx(stage_full_addr + (bslot_0_1) * 8, 8192);
++                        int cc_1 = (int)c64_1;
++                        tma_2d_gmem2smem(sx_3, (&x_map), cc_1, t0 + kn_1 * 8, stage_full_addr + (bslot_0_1) * 8);
++                        tma_2d_gmem2smem(sx_3 + 4096, (&dy_map), cc_1, t0 + kn_1 * 8, stage_full_addr + (bslot_0_1) * 8);
++                    } else {
++                        mbarrier_arrive_expect_tx(stage_full_addr + (bslot_0_1) * 8, rows_k_5 * (2 * cb_1));
++                        #pragma unroll 1
++                        for (int i_4 = 0; i_4 < rows_k_5; i_4++) {
++                            long long src_1 = src0_3 + (long long)i_4 * C64;
++                            cp_async_bulk_gmem2smem(sx_3 + i_4 * rstride, reinterpret_cast<const uint8_t*>(x + src_1), cb_1, stage_full_addr + (bslot_0_1) * 8);
++                            cp_async_bulk_gmem2smem(sx_3 + 4096 + i_4 * rstride, reinterpret_cast<const uint8_t*>(dy + src_1), cb_1, stage_full_addr + (bslot_0_1) * 8);
++                        }
++                    }
++                } else {
++                    mbarrier_arrive(stage_full_addr + (bslot_0_1) * 8);
++                }
++            }
++        }
++    }
++    #pragma unroll
++    for (int i_5 = 0; i_5 < 32; i_5++) {
++        red[tid * 32 + i_5] = acc[i_5];
++    }
++    __syncthreads();
++    int c0_0 = (ct * ct_vec + v) * 8;
++    if (sub == 0 && c0_0 < C) {
++        float tot[32];
++        #pragma unroll
++        for (int i_6 = 0; i_6 < 32; i_6++) {
++            tot[i_6] = red[v * 32 + i_6];
++        }
++        #pragma unroll 1
++        for (int s_1 = 1; s_1 < n_sub; s_1++) {
++            #pragma unroll
++            for (int i_7 = 0; i_7 < 32; i_7++) {
++                tot[i_7] = tot[i_7] + red[(s_1 * ct_vec + v) * 32 + i_7];
++            }
++        }
++        #pragma unroll
++        for (int j_12 = 0; j_12 < 8; j_12++) {
++            long long pidx = ((long long)rank * C64 + (long long)c0_0 + (long long)j_12) * 4;
++            {
++                float4 _v4 = make_float4(tot[j_12 * 4 + 0], tot[j_12 * 4 + 1], tot[j_12 * 4 + 2], tot[j_12 * 4 + 3]);
++                *reinterpret_cast<float4*>(partial + pidx) = _v4;
++            }
++        }
++    }
++    cooperative_groups::this_grid().sync();
++    int lane_2 = tid & 31;
++    int wch = tid >> 5;
++    int n_groups = (C + 4 - 1) / 4;
++    #pragma unroll 1
++    for (int cg = bid; cg < n_groups; cg += num_bids) {
++        int ch = cg * 4 + wch;
++        if (ch < C) {
++            int ctc = ch / 8 / ct_vec;
++            int G = (num_bids - ctc + n_ch_tiles - 1) / n_ch_tiles;
++            int n_trips = G + 31 >> 5;
++            float a4[4];
++            #pragma unroll
++            for (int e_8 = 0; e_8 < 4; e_8++) {
++                a4[e_8] = 0.0f;
++            }
++            #pragma unroll 4
++            for (int k_2 = 0; k_2 < n_trips; k_2++) {
++                int r = lane_2 + (k_2 << 5);
++                if (r < G) {
++                    float _vec_load_0[4];
++                    {
++                        float4 _v4 = *reinterpret_cast<const float4*>(partial + ((long long)r * C64 + (long long)ch) * 4);
++                        _vec_load_0[0 + 0] = _v4.x;
++                        _vec_load_0[0 + 1] = _v4.y;
++                        _vec_load_0[0 + 2] = _v4.z;
++                        _vec_load_0[0 + 3] = _v4.w;
++                    }
++                    #pragma unroll
++                    for (int e_9 = 0; e_9 < 4; e_9++) {
++                        a4[e_9] = a4[e_9] + _vec_load_0[e_9];
++                    }
++                }
++            }
++            #pragma unroll
++            for (int e_10 = 0; e_10 < 4; e_10++) {
++                float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, a4[e_10], 16);
++                float other = _shfl_xor_0;
++                a4[e_10] = a4[e_10] + other;
++            }
++            #pragma unroll
++            for (int e_11 = 0; e_11 < 4; e_11++) {
++                float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, a4[e_11], 8);
++                float other_1 = _shfl_xor_1;
++                a4[e_11] = a4[e_11] + other_1;
++            }
++            #pragma unroll
++            for (int e_12 = 0; e_12 < 4; e_12++) {
++                float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, a4[e_12], 4);
++                float other_2 = _shfl_xor_2;
++                a4[e_12] = a4[e_12] + other_2;
++            }
++            #pragma unroll
++            for (int e_13 = 0; e_13 < 4; e_13++) {
++                float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, a4[e_13], 2);
++                float other_3 = _shfl_xor_3;
++                a4[e_13] = a4[e_13] + other_3;
++            }
++            #pragma unroll
++            for (int e_14 = 0; e_14 < 4; e_14++) {
++                float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, a4[e_14], 1);
++                float other_4 = _shfl_xor_4;
++                a4[e_14] = a4[e_14] + other_4;
++            }
++            if (lane_2 == 0) {
++                {
++                    float4 _v4 = make_float4(a4[0 + 0], a4[0 + 1], a4[0 + 2], a4[0 + 3]);
++                    *reinterpret_cast<float4*>(dw + (long long)ch * 4) = _v4;
++                }
++            }
++        }
++    }
++
++    // Cleanup
++    __syncthreads();
++}
++
++} // extern "C"
++
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_a93b636beb1d573942bf_kernel.cu b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_a93b636beb1d573942bf_kernel.cu
+index 5dcc237fb7..0df108975d 100644
+--- a/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_a93b636beb1d573942bf_kernel.cu
++++ b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_a93b636beb1d573942bf_kernel.cu
+@@ -361,18 +361,18 @@ kernel_cake_causal_conv1d_train_a93b636beb1d573942bf(__nv_bfloat16* __restrict__
+                 if (interior == 2) {
+                     #pragma unroll
+                     for (int u = 0; u < 4; u++) {
+-                        __int128_t _smem_b128_2;
+-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_2) : "r"(sx0 + u * RS));
+-                        *reinterpret_cast<uint32_t*>(&pkx[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[0];
+-                        *reinterpret_cast<uint32_t*>(&pkx[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[1];
+-                        *reinterpret_cast<uint32_t*>(&pkx[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[2];
+-                        *reinterpret_cast<uint32_t*>(&pkx[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[3];
+-                        __int128_t _smem_b128_3;
+-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_3) : "r"(sx0 + 16384 + u * RS));
+-                        *reinterpret_cast<uint32_t*>(&pkd[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[0];
+-                        *reinterpret_cast<uint32_t*>(&pkd[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[1];
+-                        *reinterpret_cast<uint32_t*>(&pkd[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[2];
+-                        *reinterpret_cast<uint32_t*>(&pkd[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[3];
++                        __int128_t _smem_raw_2;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_2) : "r"(sx0 + u * RS));
++                        pkx[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[0];
++                        pkx[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[1];
++                        pkx[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[2];
++                        pkx[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[3];
++                        __int128_t _smem_raw_3;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_3) : "r"(sx0 + 16384 + u * RS));
++                        pkd[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[0];
++                        pkd[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[1];
++                        pkd[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[2];
++                        pkd[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[3];
+                         #pragma unroll
+                         for (int kk = 0; kk < 4; kk++) {
+                             win[u % 4 * 8 + 2 * kk] = __uint_as_float(pkx[kk] << 16);
+@@ -433,18 +433,18 @@ kernel_cake_causal_conv1d_train_a93b636beb1d573942bf(__nv_bfloat16* __restrict__
+                 } else if (interior == 1) {
+                     #pragma unroll
+                     for (int u_1 = 0; u_1 < 4; u_1++) {
+-                        __int128_t _smem_b128_4;
+-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_4) : "r"(sx0 + u_1 * RS));
+-                        *reinterpret_cast<uint32_t*>(&pkx[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_4)[0];
+-                        *reinterpret_cast<uint32_t*>(&pkx[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_4)[1];
+-                        *reinterpret_cast<uint32_t*>(&pkx[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_4)[2];
+-                        *reinterpret_cast<uint32_t*>(&pkx[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_4)[3];
+-                        __int128_t _smem_b128_5;
+-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_5) : "r"(sx0 + 16384 + u_1 * RS));
+-                        *reinterpret_cast<uint32_t*>(&pkd[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_5)[0];
+-                        *reinterpret_cast<uint32_t*>(&pkd[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_5)[1];
+-                        *reinterpret_cast<uint32_t*>(&pkd[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_5)[2];
+-                        *reinterpret_cast<uint32_t*>(&pkd[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_5)[3];
++                        __int128_t _smem_raw_4;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_4) : "r"(sx0 + u_1 * RS));
++                        pkx[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_4)[0];
++                        pkx[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_4)[1];
++                        pkx[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_4)[2];
++                        pkx[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_4)[3];
++                        __int128_t _smem_raw_5;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_5) : "r"(sx0 + 16384 + u_1 * RS));
++                        pkd[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_5)[0];
++                        pkd[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_5)[1];
++                        pkd[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_5)[2];
++                        pkd[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_5)[3];
+                         #pragma unroll
+                         for (int kk_3 = 0; kk_3 < 4; kk_3++) {
+                             win[u_1 % 4 * 8 + 2 * kk_3] = __uint_as_float(pkx[kk_3] << 16);
+@@ -508,18 +508,18 @@ kernel_cake_causal_conv1d_train_a93b636beb1d573942bf(__nv_bfloat16* __restrict__
+                         if (steps_k > u_2) {
+                             int tcur = tb + u_2;
+                             if (rows_k_1 > u_2) {
+-                                __int128_t _smem_b128_6;
+-                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_6) : "r"(sx0 + u_2 * RS));
+-                                *reinterpret_cast<uint32_t*>(&pkx[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_6)[0];
+-                                *reinterpret_cast<uint32_t*>(&pkx[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_6)[1];
+-                                *reinterpret_cast<uint32_t*>(&pkx[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_6)[2];
+-                                *reinterpret_cast<uint32_t*>(&pkx[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_6)[3];
+-                                __int128_t _smem_b128_7;
+-                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_7) : "r"(sx0 + 16384 + u_2 * RS));
+-                                *reinterpret_cast<uint32_t*>(&pkd[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_7)[0];
+-                                *reinterpret_cast<uint32_t*>(&pkd[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_7)[1];
+-                                *reinterpret_cast<uint32_t*>(&pkd[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_7)[2];
+-                                *reinterpret_cast<uint32_t*>(&pkd[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_7)[3];
++                                __int128_t _smem_raw_6;
++                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_6) : "r"(sx0 + u_2 * RS));
++                                pkx[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[0];
++                                pkx[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[1];
++                                pkx[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[2];
++                                pkx[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[3];
++                                __int128_t _smem_raw_7;
++                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_7) : "r"(sx0 + 16384 + u_2 * RS));
++                                pkd[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[0];
++                                pkd[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[1];
++                                pkd[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[2];
++                                pkd[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[3];
+                                 #pragma unroll
+                                 for (int kk_6 = 0; kk_6 < 4; kk_6++) {
+                                     win[u_2 % 4 * 8 + 2 * kk_6] = __uint_as_float(pkx[kk_6] << 16);
+@@ -854,18 +854,18 @@ kernel_cake_causal_conv1d_train_a93b636beb1d573942bf(__nv_bfloat16* __restrict__
+                 if (interior_1 == 2) {
+                     #pragma unroll
+                     for (int u_3 = 0; u_3 < 4; u_3++) {
+-                        __int128_t _smem_b128_10;
+-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_10) : "r"(sx0_1 + u_3 * rstride));
+-                        *reinterpret_cast<uint32_t*>(&pkx_1[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_10)[0];
+-                        *reinterpret_cast<uint32_t*>(&pkx_1[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_10)[1];
+-                        *reinterpret_cast<uint32_t*>(&pkx_1[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_10)[2];
+-                        *reinterpret_cast<uint32_t*>(&pkx_1[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_10)[3];
+-                        __int128_t _smem_b128_11;
+-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_11) : "r"(sx0_1 + 2048 + u_3 * rstride));
+-                        *reinterpret_cast<uint32_t*>(&pkd_1[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_11)[0];
+-                        *reinterpret_cast<uint32_t*>(&pkd_1[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_11)[1];
+-                        *reinterpret_cast<uint32_t*>(&pkd_1[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_11)[2];
+-                        *reinterpret_cast<uint32_t*>(&pkd_1[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_11)[3];
++                        __int128_t _smem_raw_10;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_10) : "r"(sx0_1 + u_3 * rstride));
++                        pkx_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_10)[0];
++                        pkx_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_10)[1];
++                        pkx_1[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_10)[2];
++                        pkx_1[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_10)[3];
++                        __int128_t _smem_raw_11;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_11) : "r"(sx0_1 + 2048 + u_3 * rstride));
++                        pkd_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_11)[0];
++                        pkd_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_11)[1];
++                        pkd_1[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_11)[2];
++                        pkd_1[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_11)[3];
+                         #pragma unroll
+                         for (int kk_10 = 0; kk_10 < 4; kk_10++) {
+                             win_1[u_3 % 4 * 8 + 2 * kk_10] = __uint_as_float(pkx_1[kk_10] << 16);
+@@ -926,18 +926,18 @@ kernel_cake_causal_conv1d_train_a93b636beb1d573942bf(__nv_bfloat16* __restrict__
+                 } else if (interior_1 == 1) {
+                     #pragma unroll
+                     for (int u_4 = 0; u_4 < 4; u_4++) {
+-                        __int128_t _smem_b128_12;
+-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_12) : "r"(sx0_1 + u_4 * rstride));
+-                        *reinterpret_cast<uint32_t*>(&pkx_1[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_12)[0];
+-                        *reinterpret_cast<uint32_t*>(&pkx_1[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_12)[1];
+-                        *reinterpret_cast<uint32_t*>(&pkx_1[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_12)[2];
+-                        *reinterpret_cast<uint32_t*>(&pkx_1[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_12)[3];
+-                        __int128_t _smem_b128_13;
+-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_13) : "r"(sx0_1 + 2048 + u_4 * rstride));
+-                        *reinterpret_cast<uint32_t*>(&pkd_1[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_13)[0];
+-                        *reinterpret_cast<uint32_t*>(&pkd_1[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_13)[1];
+-                        *reinterpret_cast<uint32_t*>(&pkd_1[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_13)[2];
+-                        *reinterpret_cast<uint32_t*>(&pkd_1[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_13)[3];
++                        __int128_t _smem_raw_12;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_12) : "r"(sx0_1 + u_4 * rstride));
++                        pkx_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_12)[0];
++                        pkx_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_12)[1];
++                        pkx_1[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_12)[2];
++                        pkx_1[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_12)[3];
++                        __int128_t _smem_raw_13;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_13) : "r"(sx0_1 + 2048 + u_4 * rstride));
++                        pkd_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_13)[0];
++                        pkd_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_13)[1];
++                        pkd_1[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_13)[2];
++                        pkd_1[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_13)[3];
+                         #pragma unroll
+                         for (int kk_13 = 0; kk_13 < 4; kk_13++) {
+                             win_1[u_4 % 4 * 8 + 2 * kk_13] = __uint_as_float(pkx_1[kk_13] << 16);
+@@ -1001,18 +1001,18 @@ kernel_cake_causal_conv1d_train_a93b636beb1d573942bf(__nv_bfloat16* __restrict__
+                         if (steps_k_1 > u_5) {
+                             int tcur_1 = tb_1 + u_5;
+                             if (rows_k_4 > u_5) {
+-                                __int128_t _smem_b128_14;
+-                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_14) : "r"(sx0_1 + u_5 * rstride));
+-                                *reinterpret_cast<uint32_t*>(&pkx_1[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_14)[0];
+-                                *reinterpret_cast<uint32_t*>(&pkx_1[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_14)[1];
+-                                *reinterpret_cast<uint32_t*>(&pkx_1[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_14)[2];
+-                                *reinterpret_cast<uint32_t*>(&pkx_1[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_14)[3];
+-                                __int128_t _smem_b128_15;
+-                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_15) : "r"(sx0_1 + 2048 + u_5 * rstride));
+-                                *reinterpret_cast<uint32_t*>(&pkd_1[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_15)[0];
+-                                *reinterpret_cast<uint32_t*>(&pkd_1[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_15)[1];
+-                                *reinterpret_cast<uint32_t*>(&pkd_1[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_15)[2];
+-                                *reinterpret_cast<uint32_t*>(&pkd_1[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_15)[3];
++                                __int128_t _smem_raw_14;
++                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_14) : "r"(sx0_1 + u_5 * rstride));
++                                pkx_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_14)[0];
++                                pkx_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_14)[1];
++                                pkx_1[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_14)[2];
++                                pkx_1[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_14)[3];
++                                __int128_t _smem_raw_15;
++                                asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_15) : "r"(sx0_1 + 2048 + u_5 * rstride));
++                                pkd_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_15)[0];
++                                pkd_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_15)[1];
++                                pkd_1[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_15)[2];
++                                pkd_1[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_15)[3];
+                                 #pragma unroll
+                                 for (int kk_16 = 0; kk_16 < 4; kk_16++) {
+                                     win_1[u_5 % 4 * 8 + 2 * kk_16] = __uint_as_float(pkx_1[kk_16] << 16);
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu
+index ac9438c878..8488710150 100644
+--- a/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu
++++ b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu
+@@ -320,12 +320,12 @@ kernel_cake_causal_conv1d_train_f193c5247980992f4f81(__nv_bfloat16* __restrict__
+             if (interior != 0) {
+                 #pragma unroll
+                 for (int u = 0; u < 8; u++) {
+-                    __int128_t _smem_b128_2;
+-                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_2) : "r"(sbase + u * 2048));
+-                    *reinterpret_cast<uint32_t*>(&pk[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[0];
+-                    *reinterpret_cast<uint32_t*>(&pk[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[1];
+-                    *reinterpret_cast<uint32_t*>(&pk[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[2];
+-                    *reinterpret_cast<uint32_t*>(&pk[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[3];
++                    __int128_t _smem_raw_2;
++                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_2) : "r"(sbase + u * 2048));
++                    pk[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[0];
++                    pk[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[1];
++                    pk[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[2];
++                    pk[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[3];
+                     #pragma unroll
+                     for (int kk = 0; kk < 4; kk++) {
+                         win[u % 4 * 8 + 2 * kk] = __uint_as_float(pk[kk] << 16);
+@@ -366,12 +366,12 @@ kernel_cake_causal_conv1d_train_f193c5247980992f4f81(__nv_bfloat16* __restrict__
+                 for (int u_1 = 0; u_1 < 8; u_1++) {
+                     if (rows_k_1 > u_1) {
+                         int tcur = tb + u_1;
+-                        __int128_t _smem_b128_3;
+-                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_3) : "r"(sbase + u_1 * 2048));
+-                        *reinterpret_cast<uint32_t*>(&pk[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[0];
+-                        *reinterpret_cast<uint32_t*>(&pk[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[1];
+-                        *reinterpret_cast<uint32_t*>(&pk[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[2];
+-                        *reinterpret_cast<uint32_t*>(&pk[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_3)[3];
++                        __int128_t _smem_raw_3;
++                        asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_3) : "r"(sbase + u_1 * 2048));
++                        pk[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[0];
++                        pk[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[1];
++                        pk[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[2];
++                        pk[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[3];
+                         #pragma unroll
+                         for (int kk_2 = 0; kk_2 < 4; kk_2++) {
+                             win[u_1 % 4 * 8 + 2 * kk_2] = __uint_as_float(pk[kk_2] << 16);
+diff --git a/tests/norm/test_cake_causal_conv1d_train.py b/tests/norm/test_cake_causal_conv1d_train.py
+index de4c6b0edd..32fc9fc5ca 100644
+--- a/tests/norm/test_cake_causal_conv1d_train.py
++++ b/tests/norm/test_cake_causal_conv1d_train.py
+@@ -22,11 +22,16 @@
+ element outside, FP32 ``dweight`` within ``atol 5e-2 + rtol 1e-4``.  The
+ matrix covers token counts 1, 5, 63, 64, 65, 1000 and 4097 with documents of
+ lengths 1, 2 and 3 and empty documents before, between and after others,
+-channel counts 128, 136, 256, 384, 512, 1024 and 2048, the ``[1, S, C]``
++channel counts 128, 136, 256, 384, 512, 768, 1024 and 2048, the ``[1, S, C]``
+ layout, document isolation (a change inside one document moves no output of
+ another), bitwise reproducibility of ``dweight``, CUDA Graph capture and
+ replay of changing shapes, argument validation, the workspace helpers and one
+-``S x C > 2^31`` case guarded by free device memory.
++``S x C > 2^31`` case guarded by free device memory.  An architecture whose
++backward route ships several programs selects one by the channel count: the
++suite checks that exactly one runs per call, that every program of the route
++runs for some channel count on both sides of its threshold (with a
++NaN-poisoned workspace), that the workspace is sized for the largest grid of
++the route, and that a routed row's ``dx`` equals the fallback program's bits.
+ 
+ This suite exercises the backend package alone: it names the package once,
+ through ``tests.test_helpers.cake_package``, and imports nothing else from
+@@ -78,7 +83,9 @@
+ # (S, C, documents): documents of lengths 1, 2 and 3; empty documents before,
+ # between and after others; C = 136 (forward: 17 channel vectors, 7 sub-tiles of 17
+ # threads, 9 threads idle); boundaries inside a sub-tile and at S = 64 and 65;
+-# the perf packing at S = 1000; 38 documents (a six-step device-side search).
++# the perf packing at S = 1000; 38 documents (a six-step device-side search);
++# S = 5 at the backward's channel thresholds 512 and 1024 (fewer tokens than
++# one eight-token stage of the big-channel backward program).
+ CASES = (
+     (1, 128, None),
+     (5, 136, (2, 0, 3)),
+@@ -90,6 +97,8 @@
+     (4097, 1024, (0, 4097, 0)),
+     (4097, 2048, (1000, 0, 3, 3094)),
+     (4097, 768, (1000, 0, 3, 3094)),
++    (5, 512, (2, 0, 3)),
++    (5, 1024, (2, 0, 3)),
+ )
+ LARGE_CASE = (262401, 8192, "perf")
+ LARGE_CASE_FREE_BYTES = 40 * 2**30
+@@ -144,6 +153,34 @@ def _case_id(case) -> str:
+     return f"S{S}-C{C}-{tag}"
+ 
+ 
++def _arch() -> str:
++    return loader.arch_for_capability(_capability())
++
++
++def _backward_thresholds(arch: str) -> tuple[int, ...]:
++    """The channel thresholds of the backward programs ``arch`` selects by channel count (empty when the
++    route ships the fallback program only)."""
++
++    thresholds = set()
++    for name in loader.route_modules(arch, "bwd"):
++        rule = loader.select_rule(loader.MODULES[name])
++        if rule is not None and arch in rule["channels"]:
++            thresholds.add(int(rule["channels"][arch]))
++    return tuple(sorted(thresholds))
++
++
++def _fallback_program(arch: str) -> str:
++    """The backward program of ``arch`` without a selection rule: the one every unrouted channel count runs."""
++
++    names = [
++        name
++        for name in loader.route_modules(arch, "bwd")
++        if loader.select_rule(loader.MODULES[name]) is None
++    ]
++    assert len(names) == 1, f"{arch}: fallback backward programs {names}"
++    return names[0]
++
++
+ def _generator(*keys: int) -> torch.Generator:
+     seed = SEED
+     for key in keys:
+@@ -305,7 +342,16 @@ def _assert_within(
+ 
+ 
+ def _check(
+-    S: int, C: int, docs, *, x=None, w=None, cu=None, dy=None, label: str = ""
++    S: int,
++    C: int,
++    docs,
++    *,
++    x=None,
++    w=None,
++    cu=None,
++    dy=None,
++    workspace=None,
++    label: str = "",
+ ) -> None:
+     if x is None:
+         x, w, cu, dy = _inputs(S, C, docs)
+@@ -319,7 +365,7 @@ def _check(
+     _assert_within(
+         y, reference_forward(x, w, cu), atol=Y_ATOL, rtol=Y_RTOL, label=f"y {label}"
+     )
+-    dx, dw = cake_causal_conv1d_train_backward(x, w, cu, dy)
++    dx, dw = cake_causal_conv1d_train_backward(x, w, cu, dy, workspace=workspace)
+     assert (
+         dx.dtype == torch.bfloat16
+         and tuple(dx.shape) == tuple(x.shape)
+@@ -422,6 +468,86 @@ def test_dweight_is_bitwise_identical_over_three_launches(case) -> None:
+     assert torch.isfinite(results[0][1]).all()
+ 
+ 
++def test_backward_programs_switch_on_channel_count() -> None:
++    """Exactly one backward program runs per call, every program of the route runs for some channel count,
++    and each matches the reference on both sides of its channel threshold with a NaN-poisoned workspace."""
++
++    arch = _arch()
++    names = loader.route_modules(arch, "bwd")
++    thresholds = _backward_thresholds(arch)
++    if not thresholds:
++        pytest.skip(
++            f"the backward route on {arch} ships one program ({names[0]}); nothing switches"
++        )
++    channels = sorted({C for T in thresholds for C in (T - 8, T, T + 8)} | {8192})
++    launched = set()
++    for S, docs in ((5, (2, 0, 3)), (1000, "perf")):
++        for C in channels:
++            selected = loader.selected_modules(arch, "bwd", C=C, S=S)
++            assert len(selected) == 1, f"S={S} C={C}: {selected}"
++            launched.add(selected[0])
++            workspace = cake_causal_conv1d_train_backward_workspace(S, C, _device())
++            # Poison the whole buffer (sized for the largest grid of the route): the selected program must
++            # rewrite every partial row it reduces.
++            workspace.view(torch.float32).fill_(float("nan"))
++            _check(
++                S,
++                C,
++                docs,
++                workspace=workspace,
++                label=f"S={S} C={C} docs={docs} program={selected[0]}",
++            )
++    assert launched == set(names), f"never launched {set(names) - launched}"
++
++
++@pytest.mark.parametrize("case", CASES, ids=_case_id)
++def test_routed_rows_match_fallback_dx_bitwise(case) -> None:
++    """A row the channel count routes to a selected program gets the same ``dx`` bits as the fallback program
++    launched on its own grid and partial rows; whether ``dweight`` agrees too (the fixed-order partition
++    follows each grid) is reported, not asserted."""
++
++    S, C, docs = case
++    arch = _arch()
++    fallback = _fallback_program(arch)
++    selected = loader.selected_modules(arch, "bwd", C=C, S=S)[0]
++    if selected == fallback:
++        pytest.skip(f"S={S} C={C} runs the fallback program {fallback} on {arch}")
++    device = _device()
++    x, w, cu, dy = _inputs(S, C, docs)
++    dx, dw = cake_causal_conv1d_train_backward(x, w, cu, dy)
++    record = loader.MODULES[fallback]
++    scalars = loader.plan(
++        S, C, int(cu.numel()) - 1, geometry=record["grid_rule"]["geometry"]
++    )
++    grid_x = loader.launch_grid(record, device_index=device.index)[0]
++    rows = loader.partial_rows(grid_x, scalars["n_ch_tiles"])
++    dx_fallback = torch.full_like(dx, float("nan"))
++    dw_fallback = torch.full_like(dw, float("nan"))
++    partial = torch.full(
++        (rows, C, WIDTH), float("nan"), dtype=torch.float32, device=device
++    )
++    values = {
++        "x": x,
++        "w": w,
++        "cu": cu,
++        "dy": dy,
++        "dx": dx_fallback,
++        "dw": dw_fallback,
++        "partial": partial,
++        **{key: int(scalars[key]) for key in loader.LOGICAL_SCALARS},
++    }
++    loader.run_module(fallback, values, device_index=device.index)
++    torch.cuda.synchronize(device)
++    assert torch.equal(dx, dx_fallback), (
++        f"dx of {selected} differs from the fallback program {fallback} at S={S} C={C}"
++    )
++    same_dw = torch.equal(dw, dw_fallback)
++    print(
++        f"dweight of {selected} vs {fallback} at S={S} C={C}: "
++        + ("identical" if same_dw else "differs (each grid's fixed-order partition)")
++    )
++
++
+ def test_preallocated_outputs_are_written_in_place() -> None:
+     S, C, docs = 1000, 512, "perf"
+     x, w, cu, dy = _inputs(S, C, docs)
+@@ -528,13 +654,19 @@ def test_autograd_end_to_end() -> None:
+ 
+ 
+ def test_changing_shapes_in_one_process_do_not_rebuild() -> None:
+-    _check(64, 128, None)
++    arch = _arch()
++    # One shape per backward program of the route: C = 128 runs the fallback program, each channel threshold
++    # its own program.  The shape loop below must then load nothing.
++    for C in (128, *_backward_thresholds(arch)):
++        _check(64, C, None)
+     loaded_before = loader.load.cache_info().misses
+     for S, C, docs in (
+         (1, 128, None),
+         (65, 256, (64, 1)),
+         (5, 136, (2, 0, 3)),
+         (1000, 512, "perf"),
++        (4097, 2048, (1000, 0, 3, 3094)),
++        (4097, 1024, (0, 4097, 0)),
+     ):
+         _check(S, C, docs)
+     assert loader.load.cache_info().misses == loaded_before, (
+@@ -544,9 +676,20 @@ def test_changing_shapes_in_one_process_do_not_rebuild() -> None:
+ 
+ def test_workspace_bytes_and_layout() -> None:
+     device = _device()
+-    arch = loader.arch_for_capability(_capability())
++    arch = _arch()
++    # The capacity owner: the backward program with the largest grid of the route sizes the public buffer.
+     record = loader.workspace_record(arch)
++    owners = loader.workspace_owners(arch)
++    assert record in owners
++    assert record is loader.MODULES[_fallback_program(arch)], (
++        "the public workspace size is the fallback program's, unchanged by the"
++        " programs a channel count selects"
++    )
++    assert record["grid_rule"]["ctas_per_sm"] == max(
++        owner["grid_rule"]["ctas_per_sm"] for owner in owners
++    )
+     geometry = record["grid_rule"]["geometry"]
++    assert all(owner["grid_rule"]["geometry"] == geometry for owner in owners)
+     grid = loader.launch_grid(record, device_index=device.index)[0]
+     assert grid == record["grid_rule"]["ctas_per_sm"] * loader.sm_count(device.index)
+     for C in (128, 136, 8192):
+@@ -562,6 +705,28 @@ def test_workspace_bytes_and_layout() -> None:
+             == -(-grid // n_ch_tiles)
+         )
+         assert small == layout["total_bytes"] == 4 * WIDTH * C * layout["rows"]
++        assert small == max(
++            loader.workspace_layout(owner, C, device_index=device.index)["total_bytes"]
++            for owner in owners
++        )
++    # The program a channel count selects writes the leading rows of its own grid inside that buffer, never
++    # more than the capacity owner's rows (both sides of every threshold and the widest perf row).
++    for T in _backward_thresholds(arch):
++        for C in (T - 8, T, 8192):
++            selected = loader.MODULES[loader.selected_modules(arch, "bwd", C=C)[0]]
++            _, _, n_ch_tiles = loader.channel_split(
++                C, geometry=selected["grid_rule"]["geometry"]
++            )
++            rows = loader.partial_rows(
++                loader.launch_grid(selected, device_index=device.index)[0], n_ch_tiles
++            )
++            capacity = loader.workspace_layout(record, C, device_index=device.index)
++            assert rows <= capacity["rows"], (C, selected["library"])
++            assert (
++                loader.partial_bytes(selected, C, rows)
++                <= cake_causal_conv1d_train_backward_workspace_bytes(1, C, device)
++                == capacity["total_bytes"]
++            )
+     # One channel tile holds up to threads x vec channels (a partial row per CTA): 1024 for the backward's eight
+     # channels per thread; 8192 channels are eight tiles; C = 136 is 17 channel vectors (seven sub-tiles of 17).
+     vec, threads = geometry["vec"], geometry["threads"]
+@@ -676,6 +841,18 @@ def test_registry_records_reference_the_build_manifest() -> None:
+         assert set(record["logical"].values()) <= set(loader.LOGICAL_TENSORS) | set(
+             loader.LOGICAL_SCALARS
+         )
++        # The selection vocabulary: forward records carry no rule; a backward rule is
++        # ``channels_at_least`` with one positive multiple-of-8 threshold per architecture it names.
++        rule = loader.select_rule(record)
++        if record["role"] == "fwd":
++            assert rule is None, name
++        if rule is not None:
++            assert record["role"] == "bwd", name
++            assert set(rule) == {"kind", "channels"}, name
++            assert rule["kind"] in loader.SELECT_KINDS, name
++            assert set(rule["channels"]) <= set(record["arches"]), name
++            for threshold in rule["channels"].values():
++                assert threshold > 0 and threshold % loader.CHANNEL_MULTIPLE == 0, name
+         for arch in record["arches"]:
+             library = loader.library_name(name, arch)
+             referenced.add(library)
+@@ -697,3 +874,35 @@ def test_registry_records_reference_the_build_manifest() -> None:
+     backward = loader.workspace_record("sm_100a")
+     assert backward["workspace_rule"] == {"kind": "partial_rows", "taps": WIDTH}
+     assert backward["launch"]["cooperative"] is True
++    # Every backward route: exactly one fallback record, at most one record whose rule names the
++    # architecture, one program selected per channel count, and the forward route selects nothing.
++    for arch in loader.ARCHES:
++        names = loader.route_modules(arch, "bwd")
++        rules = {name: loader.select_rule(loader.MODULES[name]) for name in names}
++        fallbacks = [name for name, rule in rules.items() if rule is None]
++        positives = [
++            name
++            for name, rule in rules.items()
++            if rule is not None and arch in rule["channels"]
++        ]
++        assert len(fallbacks) == 1, (arch, fallbacks)
++        assert len(positives) <= 1, (arch, positives)
++        for name in positives:
++            threshold = int(rules[name]["channels"][arch])
++            assert loader.selected_modules(arch, "bwd", C=threshold) == (name,)
++            assert loader.selected_modules(arch, "bwd", C=threshold - 8) == (
++                fallbacks[0],
++            )
++        for C in (8, 128, 512, 1024, 8192):
++            selected = loader.selected_modules(arch, "bwd", C=C, S=1)
++            assert len(selected) == 1 and selected[0] in names, (arch, C, selected)
++        assert loader.selected_modules(arch, "fwd", C=512) == loader.route_modules(
++            arch, "fwd"
++        )
++        owners = loader.workspace_owners(arch)
++        assert [owner["library"] for owner in owners] == list(names)
++        for owner in owners:
++            assert owner["role"] == "bwd"
++            assert owner["workspace_rule"] == {"kind": "partial_rows", "taps": WIDTH}
++            assert owner["launch"]["cooperative"] is True
++        assert loader.workspace_record(arch) in owners

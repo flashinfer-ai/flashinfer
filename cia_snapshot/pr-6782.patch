@@ -1,0 +1,4349 @@
+diff --git a/.pre-commit-config.yaml b/.pre-commit-config.yaml
+index 8ef107b6034..be359903f63 100644
+--- a/.pre-commit-config.yaml
++++ b/.pre-commit-config.yaml
+@@ -41,7 +41,7 @@ files: ^(?!(?:flashinfer/moe_ep/kernel_src/blackwell_bf16_rank_major/src/|csrc/c
+ # cake_lm_head_loss, dense_projection_gemm) are rendered by the Cake exporters and
+ # digest-checked by their build.json manifests; keep their bytes.  The package-root loaders,
+ # cake_build.py and build.json next to them stay checked.
+-exclude: ^(?:csrc/kda/ptx/|flashinfer/msa_ops/cute_dsl/sparse_decode_nvfp4_sm100\.py|csrc/(?:cake_trtllm_mla_blackwell/generated/|cake_dsv4/|cake_sampling/generated/|cake_minimax_h3_mxfp8_pre_attention/|cake_minimax_h3_nvfp4_pre_attention/|cake_minimax_h3_qkv_quantize_pack/|kda/flashkda_generated_.*|blackwell_msa/|concat_mla/|cake_all_gather_matmul/|cake_moe_finalize_allreduce_fusion/|cake_fp4_allreduce/.*_kernel\.cu|cake_nvfp4_svdquant_gemm/|cake_selective_state_update/(?:cuda|host)/|cake_mamba_ssd_combined/generated/|cake_trtllm_moe_allreduce_union/|cake_fused_norm_combine/|cake_msa_icp_indexer/|fused_moe/warp_decode/generated/|kda/cake_flashkda_blackwell_evolution_.*\.cu)|flashinfer/(?:cake_rmsnorm_train_backend/csrc/|experimental/nvfp4_sparse_mla_decode/csrc/cake_nvfp4_sparse_mla_decode/|experimental/(?:cake_mok_bf16|cake_mxfp8_megamoe_ep16|cake_moe_grouped_gemm|sm110_gqa_decode|nvfp4_attention|nvfp4_mla_decode|balanced_gqa_decode|minimax_h3_varlen_attention|kimi_k3_fused_router|msa_nvfp4_decode|cake_lm_head_loss|cake_dsa_train|cake_kda_train|cake_dsa_indexer|dense_projection_gemm)/csrc/|moe_ep/kernel_src/(?:(?:sm100/(?:cutedsl_megamoe|next_cutedsl_megamoe)|sm107/next_cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel|sm120/(?:swapab|split)_cutedsl_megakernel)/src/|sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_|sm120/cake_mxfp4_megamoe/src/cake_sm120_megamoe_(?:kernel.*\.cuh|m(?:128|64)_(?:no)?copier\.cu|geometry\.json)))|csrc/generated/dcp_alltoall/)
++exclude: ^(?:csrc/kda/ptx/|flashinfer/msa_ops/cute_dsl/sparse_decode_nvfp4_sm100\.py|csrc/(?:cake_trtllm_mla_blackwell/generated/|cake_dsv4/|cake_sampling/generated/|cake_minimax_h3_mxfp8_pre_attention/|cake_minimax_h3_nvfp4_pre_attention/|cake_minimax_h3_qkv_quantize_pack/|kda/flashkda_generated_.*|blackwell_msa/|concat_mla/|cake_all_gather_matmul/|cake_moe_finalize_allreduce_fusion/|cake_fp4_allreduce/.*_kernel\.cu|cake_nvfp4_svdquant_gemm/|cake_selective_state_update/(?:cuda|host)/|cake_mamba_ssd_combined/generated/|cake_trtllm_moe_allreduce_union/|cake_fused_norm_combine/|cake_msa_icp_indexer/|fused_moe/warp_decode/generated/|kda/cake_flashkda_blackwell_evolution_.*\.cu)|flashinfer/(?:cake_rmsnorm_train_backend/csrc/|cake_causal_conv1d_train_backend/csrc/|experimental/nvfp4_sparse_mla_decode/csrc/cake_nvfp4_sparse_mla_decode/|experimental/(?:cake_mok_bf16|cake_mxfp8_megamoe_ep16|cake_moe_grouped_gemm|sm110_gqa_decode|nvfp4_attention|nvfp4_mla_decode|balanced_gqa_decode|minimax_h3_varlen_attention|kimi_k3_fused_router|msa_nvfp4_decode|cake_lm_head_loss|cake_dsa_train|cake_kda_train|cake_dsa_indexer|dense_projection_gemm)/csrc/|moe_ep/kernel_src/(?:(?:sm100/(?:cutedsl_megamoe|next_cutedsl_megamoe)|sm107/next_cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel|sm120/(?:swapab|split)_cutedsl_megakernel)/src/|sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_|sm120/cake_mxfp4_megamoe/src/cake_sm120_megamoe_(?:kernel.*\.cuh|m(?:128|64)_(?:no)?copier\.cu|geometry\.json)))|csrc/generated/dcp_alltoall/)
+ 
+ repos:
+   # Standard hooks
+diff --git a/benchmarks/bench_cake_causal_conv1d_train.py b/benchmarks/bench_cake_causal_conv1d_train.py
+new file mode 100644
+index 00000000000..d53cf6ca81e
+--- /dev/null
++++ b/benchmarks/bench_cake_causal_conv1d_train.py
+@@ -0,0 +1,369 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++
++Benchmark of the Cake packed width-4 depthwise causal convolution + SiLU
++training kernels against the training-side comparators: flash-linear-attention's
++Triton ``causal_conv1d`` (when installed; the baseline of the kernels' claim)
++and eager FP32 autograd of the document-local formula.
++
++The rows are the kernels' performance matrix: ``C = 512`` over eight packed
++token counts and ``S = 250340`` over six channel counts, each packed as four
++unequal documents of 0.37 / 0.29 / 0.21 / rest of ``S`` tokens (each nudged off
++a multiple of 64).  Every row reports forward, backward (``dx`` and the
++deterministic FP32 ``dweight``) and their sum in microseconds plus the achieved
++GB/s over the logical byte volume (forward ``4SC + 16C``, backward ``6SC + 32C
+++ 32 C rows`` (``rows`` the FP32 partial rows of the device's grid) for the partial workspace's round trip).  Timing uses CUPTI
++kernel activity with a cold L2 (``flashinfer.testing.bench_gpu_time(
++enable_cupti=True)``); multi-kernel comparators report the sum of their
++kernels' GPU time.
++
++Example::
++
++    python benchmarks/bench_cake_causal_conv1d_train.py
++    python benchmarks/bench_cake_causal_conv1d_train.py --channels 512 --tokens 250340 --json out.json
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import statistics
++from typing import Callable, Optional
++
++import torch
++
++from flashinfer.cake_causal_conv1d_train import (
++    cake_causal_conv1d_train_backward,
++    cake_causal_conv1d_train_backward_workspace,
++    cake_causal_conv1d_train_forward,
++    is_cake_causal_conv1d_train_supported,
++)
++from flashinfer.cake_causal_conv1d_train_backend import cake_jit as loader
++from flashinfer.testing import bench_gpu_time
++
++WIDTH = 4
++# The performance matrix: P1 (C = 512 over the packed token counts) and P2 (S = 250340 over the channel counts).
++P1_TOKENS = (239718, 245028, 249866, 250340, 258574, 259042, 259584, 261393)
++P1_CHANNELS = 512
++P2_TOKENS = 250340
++P2_CHANNELS = (128, 256, 1024, 2048, 4096, 8192)
++# Four unequal documents: floor(fraction x S) tokens each, nudged off a multiple of 64, the rest last.
++PERF_FRACTIONS = (0.37, 0.29, 0.21)
++SEED = 0
++
++
++def perf_rows() -> list[tuple[int, int]]:
++    rows = [(tokens, P1_CHANNELS) for tokens in P1_TOKENS]
++    rows += [(P2_TOKENS, channels) for channels in P2_CHANNELS]
++    return rows
++
++
++def doc_lengths(tokens: int) -> tuple[int, ...]:
++    lens = []
++    for fraction in PERF_FRACTIONS:
++        n = int(fraction * tokens)
++        if n % 64 == 0:
++            n -= 1
++        lens.append(n)
++    lens.append(tokens - sum(lens))
++    if not all(n > 0 for n in lens):
++        raise ValueError(f"S={tokens} is too short for the perf packing")
++    return tuple(lens)
++
++
++def _median_ms(samples) -> float:
++    return float(statistics.median(list(samples)))
++
++
++def _time(fn: Callable[[], object]) -> float:
++    """Median GPU time (ms) of ``fn`` over its kernels, cold L2, CUPTI."""
++
++    times = bench_gpu_time(fn, enable_cupti=True, cold_l2_cache=True)
++    return _median_ms(times)
++
++
++def _doc_ids(tokens: int, cu: torch.Tensor) -> torch.Tensor:
++    return torch.bucketize(
++        torch.arange(tokens, device=cu.device), cu[1:].long(), right=True
++    )
++
++
++def _shift_down(v: torch.Tensor, ids: torch.Tensor, d: int) -> torch.Tensor:
++    out = torch.zeros_like(v)
++    if d == 0:
++        return v
++    if d < v.shape[0]:
++        same = (ids[d:] == ids[:-d]).unsqueeze(1)
++        out[d:] = torch.where(same, v[:-d], 0.0)
++    return out
++
++
++def _causal_conv1d_silu_fp32(
++    x: torch.Tensor, w: torch.Tensor, ids: torch.Tensor
++) -> torch.Tensor:
++    """The document-local formula in FP32 with one BF16 rounding (autograd gives the FP32 backward)."""
++
++    xf = x.float()
++    pre = torch.zeros_like(xf)
++    for k in range(WIDTH):
++        pre = pre + w[:, k] * _shift_down(xf, ids, WIDTH - 1 - k)
++    return (pre * torch.sigmoid(pre)).to(torch.bfloat16)
++
++
++class Comparator:
++    name = "base"
++
++    def available(self) -> tuple[bool, str]:
++        return True, ""
++
++    def make(self, x, w, cu):
++        """Return ``(fwd, bwd)``: ``fwd()`` returns ``y`` (keeping a graph when needed), ``bwd(dy)`` returns
++        ``(dx, dweight)``."""
++
++        raise NotImplementedError
++
++
++class Cake(Comparator):
++    name = "cake"
++
++    def make(self, x, w, cu):
++        tokens, channels = x.shape
++        y = torch.empty_like(x)
++        dx = torch.empty_like(x)
++        dw = torch.empty(channels, WIDTH, dtype=torch.float32, device=x.device)
++        workspace = cake_causal_conv1d_train_backward_workspace(
++            tokens, channels, x.device
++        )
++
++        def fwd():
++            cake_causal_conv1d_train_forward(x, w, cu, out=y)
++            return y
++
++        def bwd(dy):
++            cake_causal_conv1d_train_backward(
++                x, w, cu, dy, workspace=workspace, dx=dx, dweight=dw
++            )
++            return dx, dw
++
++        return fwd, bwd
++
++
++class _AutogradComparator(Comparator):
++    def _forward(self, x, w, cu):
++        raise NotImplementedError
++
++    def make(self, x, w, cu):
++        xl = x.detach().clone().requires_grad_(True)
++        wl = w.detach().clone().requires_grad_(True)
++        state: dict = {}
++
++        def fwd():
++            xl.grad = wl.grad = None
++            y = self._forward(xl, wl, cu)
++            state["y"] = y
++            return y
++
++        def bwd(dy):
++            xl.grad = wl.grad = None
++            torch.autograd.backward(
++                [state["y"]], [dy.view_as(state["y"])], retain_graph=True
++            )
++            return xl.grad, wl.grad
++
++        return fwd, bwd
++
++
++class EagerFp32(_AutogradComparator):
++    name = "eager_fp32"
++
++    def make(self, x, w, cu):
++        self._ids = _doc_ids(x.shape[0], cu)
++        return super().make(x, w, cu)
++
++    def _forward(self, x, w, cu):
++        return _causal_conv1d_silu_fp32(x, w, self._ids)
++
++
++class FlashLinearAttention(_AutogradComparator):
++    """flash-linear-attention's Triton ``causal_conv1d`` with ``activation="silu"`` over ``cu_seqlens``."""
++
++    name = "fla"
++
++    def available(self):
++        try:
++            import fla
++            from fla.modules.conv import causal_conv1d  # noqa: F401
++
++            return True, f"flash-linear-attention {getattr(fla, '__version__', '?')}"
++        except Exception as exc:  # pragma: no cover - environment dependent
++            return False, repr(exc)
++
++    def _forward(self, x, w, cu):
++        from fla.modules.conv import causal_conv1d
++
++        # FLA takes [B, T, D] packed activations with cu_seqlens and a [D, W] weight.
++        result = causal_conv1d(
++            x.unsqueeze(0), w, bias=None, activation="silu", cu_seqlens=cu
++        )
++        y = result[0] if isinstance(result, tuple) else result
++        return y
++
++
++COMPARATORS = (Cake(), FlashLinearAttention(), EagerFp32())
++
++
++def _bytes(mode: str, tokens: int, channels: int, *, partial_rows: int) -> int:
++    # Forward: x read, y written, w read.  Backward: x and dy read (twice for x: the recompute and the dweight
++    # taps are one pass), dx written, w read, dw written, and the FP32 [rows, C, 4] partials written then read.
++    fwd = 4 * tokens * channels + 16 * channels
++    bwd = 6 * tokens * channels + 32 * channels + 32 * channels * partial_rows
++    return {"fwd": fwd, "bwd": bwd, "step": fwd + bwd}[mode]
++
++
++def _partial_rows(arch: str, channels: int, *, device_index: int) -> int:
++    record = loader.workspace_record(arch)
++    return loader.workspace_layout(record, channels, device_index=device_index)["rows"]
++
++
++def bench_row(tokens: int, channels: int, *, comparators, device) -> dict:
++    generator = torch.Generator(device=device).manual_seed(SEED)
++    lens = doc_lengths(tokens)
++    cu = torch.tensor(
++        [0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32, device=device
++    )
++    x = torch.randn(
++        tokens, channels, device=device, generator=generator, dtype=torch.bfloat16
++    )
++    # N(0, 0.25): variance 0.25, standard deviation 0.5.
++    w = torch.randn(channels, WIDTH, device=device, generator=generator) * 0.5
++    dy = torch.randn(
++        tokens, channels, device=device, generator=generator, dtype=torch.bfloat16
++    )
++    arch = loader.arch_for_capability(torch.cuda.get_device_capability(device))
++    partial_rows = _partial_rows(arch, channels, device_index=device.index)
++    result = {
++        "tokens": tokens,
++        "channels": channels,
++        "documents": list(lens),
++        "partial_rows": partial_rows,
++        "comparators": {},
++    }
++    for comparator in comparators:
++        entry: dict = {}
++        try:
++            fwd, bwd = comparator.make(x, w, cu)
++            fwd()
++            bwd(dy)
++            torch.cuda.synchronize()
++            entry["fwd_ms"] = _time(fwd)
++            fwd()
++            torch.cuda.synchronize()
++            entry["bwd_ms"] = _time(lambda: bwd(dy))
++            entry["step_ms"] = entry["fwd_ms"] + entry["bwd_ms"]
++            for mode in ("fwd", "bwd", "step"):
++                nbytes = _bytes(mode, tokens, channels, partial_rows=partial_rows)
++                entry[f"{mode}_gbps"] = nbytes / (entry[f"{mode}_ms"] * 1e-3) / 1e9
++        except Exception as exc:  # keep the other comparators' rows
++            entry["error"] = repr(exc)[:200]
++        result["comparators"][comparator.name] = entry
++        torch.cuda.empty_cache()
++    return result
++
++
++def _format(result: dict, names) -> list[str]:
++    lines = []
++    for mode in ("fwd", "bwd", "step"):
++        cells = []
++        for name in names:
++            entry = result["comparators"].get(name, {})
++            value = entry.get(f"{mode}_ms")
++            cells.append("-" if value is None else f"{value * 1e3:9.2f}")
++        line = (
++            f"S={result['tokens']:6d} C={result['channels']:5d} {mode:4s} | "
++            + " | ".join(cells)
++        )
++        gbps = result["comparators"].get("cake", {}).get(f"{mode}_gbps")
++        if gbps is not None:
++            line += f" | cake {gbps:8.0f} GB/s"
++        lines.append(line)
++    return lines
++
++
++def main(argv: Optional[list[str]] = None) -> int:
++    parser = argparse.ArgumentParser(
++        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
++    )
++    parser.add_argument(
++        "--tokens",
++        type=int,
++        nargs="*",
++        default=None,
++        help="packed token counts S; with --channels the rows are their product (default: the perf matrix)",
++    )
++    parser.add_argument(
++        "--channels", type=int, nargs="*", default=None, help="channel counts C"
++    )
++    parser.add_argument(
++        "--skip", nargs="*", default=[], help="comparator names to skip"
++    )
++    parser.add_argument(
++        "--json", type=str, default=None, help="write all rows to this JSON file"
++    )
++    args = parser.parse_args(argv)
++
++    device = torch.device("cuda", torch.cuda.current_device())
++    if not is_cake_causal_conv1d_train_supported(device):
++        raise SystemExit(
++            "cake_causal_conv1d_train has no exported route on this device"
++        )
++    comparators = []
++    for comparator in COMPARATORS:
++        if comparator.name in args.skip:
++            continue
++        ok, note = comparator.available()
++        print(f"{comparator.name}: {'available' if ok else 'unavailable'} {note}")
++        if ok:
++            comparators.append(comparator)
++    names = [c.name for c in comparators]
++    print("columns (us): " + " | ".join(names))
++    if args.tokens is None and args.channels is None:
++        rows = perf_rows()
++    else:
++        tokens = args.tokens or [P2_TOKENS]
++        channels = args.channels or [P1_CHANNELS]
++        rows = [(s, c) for s in tokens for c in channels]
++    results = []
++    for tokens, channels in rows:
++        result = bench_row(tokens, channels, comparators=comparators, device=device)
++        results.append(result)
++        for line in _format(result, names):
++            print(line, flush=True)
++    if args.json:
++        with open(args.json, "w") as handle:
++            json.dump(
++                {
++                    "device": torch.cuda.get_device_name(device),
++                    "capability": list(torch.cuda.get_device_capability(device)),
++                    "torch": torch.__version__,
++                    "rows": results,
++                },
++                handle,
++                indent=1,
++            )
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/docs/api/mamba.rst b/docs/api/mamba.rst
+index e20b844f18b..6629d6b8ac9 100644
+--- a/docs/api/mamba.rst
++++ b/docs/api/mamba.rst
+@@ -15,3 +15,24 @@ state-update primitives used in SSM blocks.
+     checkpointing_ssu
+     ssd_combined_fwd
+     replayssm_materialize
++
++Training causal conv1d (Cake)
++-----------------------------
++
++Packed width-4 depthwise causal convolution + SiLU forward / backward for
++training on SM100, SM103 and SM107: documents delimited by ``cu_seqlens`` and
++convolved on their own, FP32 taps and arithmetic with one BF16 rounding, a
++fused ``dx`` + deterministic FP32 ``dweight`` backward in one cooperative
++launch, and an autograd wrapper that saves only the forward's inputs.
++
++.. currentmodule:: flashinfer.cake_causal_conv1d_train
++
++.. autosummary::
++    :toctree: ../generated
++
++    cake_causal_conv1d
++    cake_causal_conv1d_train_forward
++    cake_causal_conv1d_train_backward
++    cake_causal_conv1d_train_backward_workspace_bytes
++    cake_causal_conv1d_train_backward_workspace
++    CakeCausalConv1dFunction
+diff --git a/flashinfer/__init__.py b/flashinfer/__init__.py
+index ff3c67b8eb6..b1ba8f441d5 100644
+--- a/flashinfer/__init__.py
++++ b/flashinfer/__init__.py
+@@ -267,6 +267,19 @@ def __dir__() -> list[str]:
+ from .cake_rmsnorm_train import (
+     cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
+ )
++from .cake_causal_conv1d_train import (
++    CakeCausalConv1dFunction as CakeCausalConv1dFunction,
++)
++from .cake_causal_conv1d_train import cake_causal_conv1d as cake_causal_conv1d
++from .cake_causal_conv1d_train import (
++    cake_causal_conv1d_train_backward as cake_causal_conv1d_train_backward,
++)
++from .cake_causal_conv1d_train import (
++    cake_causal_conv1d_train_backward_workspace_bytes as cake_causal_conv1d_train_backward_workspace_bytes,
++)
++from .cake_causal_conv1d_train import (
++    cake_causal_conv1d_train_forward as cake_causal_conv1d_train_forward,
++)
+ from .norm import gated_residual_rmsnorm as gated_residual_rmsnorm
+ from .norm import gated_residual_next_rmsnorm as gated_residual_next_rmsnorm
+ from .norm import rmsnorm_sigmoid_gate as rmsnorm_sigmoid_gate
+diff --git a/flashinfer/cake_causal_conv1d_train.py b/flashinfer/cake_causal_conv1d_train.py
+new file mode 100644
+index 00000000000..c6a0447ffe7
+--- /dev/null
++++ b/flashinfer/cake_causal_conv1d_train.py
+@@ -0,0 +1,205 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++
++Cake packed width-4 depthwise causal convolution + SiLU training forward /
++backward (SM100 / SM103 / SM107).
++
++The input is one packed BF16 ``[S, C]`` (or ``[1, S, C]``) activation whose
++documents ``cu_seqlens`` (``int32 [num_docs + 1]`` device prefix sums)
++delimit; every document is convolved on its own, with zero history before its
++first token.  With FP32 taps ``w[C, 4]`` (``w[c, 3]`` multiplies the current
++token) the forward is, in FP32 with one BF16 rounding,
++
++    pre[t, c] = sum_k w[c, k] * x[t - 3 + k, c]      # x of another document is 0
++    y[t, c]   = bf16(pre * sigmoid(pre))
++
++The backward recomputes ``pre`` in FP32 from ``x``, rounds it to BF16 and
++evaluates the SiLU derivative in FP32 from the rounded value ``p`` (policy A),
++
++    dpre[t, c]    = dy[t, c] * s * (1 + p * (1 - s)),  s = sigmoid(p)
++    dx[t, c]      = bf16(sum_k w[c, k] * dpre[t + 3 - k, c])   # dpre of another document is 0
++    dweight[c, k] = sum_t dpre[t, c] * x[t - 3 + k, c]         # FP32, fixed order
++
++in one cooperative launch: ``dweight`` is reduced in a fixed order through a
++per-CTA FP32 partial workspace (no floating-point atomics), so it is bitwise
++reproducible for a given ``(S, C, device)``.  Nothing is saved from the
++forward but ``x``, ``w`` and ``cu_seqlens``.
++
++Inputs and outputs are contiguous (``C`` a multiple of 8); ``weight`` and
++``dweight`` are FP32 ``[C, 4]``.  ``S``, ``C`` and the document count are
++runtime scalars: they may change between calls, the host never reads
++``cu_seqlens`` (no synchronization), ``S == 0`` returns empty outputs without
++launching, and the calls are CUDA Graph capturable once the libraries are
++built.
++
++Usage::
++
++    y = cake_causal_conv1d_train_forward(x, weight, cu_seqlens)
++    dx, dweight = cake_causal_conv1d_train_backward(x, weight, cu_seqlens, dy)
++
++    # autograd (saves x, weight and cu_seqlens only)
++    y = cake_causal_conv1d(x, weight, cu_seqlens)
++
++    # caller-owned backward workspace (per-CTA FP32 partials, no zeroing needed)
++    ws = cake_causal_conv1d_train_backward_workspace(S, C, x.device)
++    dx, dweight = cake_causal_conv1d_train_backward(x, weight, cu_seqlens, dy, workspace=ws)
++"""
++
++from __future__ import annotations
++
++from typing import Optional
++
++import torch
++
++from . import cake_causal_conv1d_train_backend as _backend
++from .api_logging import flashinfer_api
++from .cake_causal_conv1d_train_backend import (  # noqa: F401
++    ARCHES,
++    SUPPORTED_COMPUTE_CAPABILITIES,
++    CakeCausalConv1dFunction,
++    cake_causal_conv1d_train_backward_workspace,
++    cake_causal_conv1d_train_backward_workspace_bytes,
++    is_cake_causal_conv1d_train_supported,
++)
++
++# The three stable entry points are real ``def``s here (public-API tooling reads the
++# decorated signatures of this module); their bodies live in the self-contained
++# backend package next to the generated CUDA sources.
++
++
++@flashinfer_api
++def cake_causal_conv1d_train_forward(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    cu_seqlens: torch.Tensor,
++    *,
++    out: Optional[torch.Tensor] = None,
++) -> torch.Tensor:
++    r"""Packed width-4 depthwise causal convolution + SiLU, training forward.
++
++    Parameters
++    ----------
++    x : torch.Tensor
++        BF16 ``[S, C]`` or ``[1, S, C]`` contiguous packed activations of every
++        document; ``C`` is a multiple of 8.
++    weight : torch.Tensor
++        FP32 ``[C, 4]`` contiguous taps; ``weight[c, 3]`` multiplies the current
++        token, ``weight[c, 0]`` the token three positions back.  Any other width
++        is rejected.
++    cu_seqlens : torch.Tensor
++        ``int32 [num_docs + 1]`` contiguous device prefix sums of the document
++        lengths (``cu_seqlens[0] == 0``, ``cu_seqlens[-1] == S``; a repeated
++        value is an empty document).  The host reads its metadata only: no
++        element is copied to the host and no stream is synchronized.
++    out : torch.Tensor, optional
++        Preallocated BF16 output of ``x``'s shape, contiguous.
++
++    Returns
++    -------
++    torch.Tensor
++        BF16 ``y`` of ``x``'s shape: ``y[t, c] = bf16(silu(sum_k weight[c, k] *
++        x[t - 3 + k, c]))`` with zero history before each document's first
++        token.  ``S == 0`` returns the empty output without launching.
++    """
++
++    return _backend.cake_causal_conv1d_train_forward(x, weight, cu_seqlens, out=out)
++
++
++@flashinfer_api
++def cake_causal_conv1d_train_backward(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    cu_seqlens: torch.Tensor,
++    dy: torch.Tensor,
++    *,
++    workspace: Optional[torch.Tensor] = None,
++    dx: Optional[torch.Tensor] = None,
++    dweight: Optional[torch.Tensor] = None,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    r"""Packed width-4 depthwise causal convolution + SiLU, training backward.
++
++    Recomputes the FP32 preactivation from ``x``, rounds it to BF16 and takes
++    the SiLU derivative of the rounded value (policy A), then produces ``dx``
++    and the FP32 weight gradient in one cooperative launch.
++
++    Parameters
++    ----------
++    x, weight, cu_seqlens
++        The forward's inputs (same contracts as
++        :func:`cake_causal_conv1d_train_forward`); nothing else is saved.
++    dy : torch.Tensor
++        BF16 gradient of ``y``, ``x``'s shape, contiguous.
++    workspace : torch.Tensor, optional
++        Caller-owned ``uint8`` buffer from
++        :func:`cake_causal_conv1d_train_backward_workspace` (the per-CTA FP32
++        ``dweight`` partials; fully written by the kernel, so it needs no
++        zeroing); allocated when omitted.
++    dx, dweight : torch.Tensor, optional
++        Preallocated outputs: BF16 of ``x``'s shape and FP32 ``[C, 4]``, both
++        contiguous.
++
++    Returns
++    -------
++    ``(dx, dweight)``: BF16 ``dx`` of ``x``'s shape, ``dx[t, c] =
++    bf16(sum_k weight[c, k] * dpre[t + 3 - k, c])`` over the tokens of the
++    same document, and the FP32 ``[C, 4]`` ``dweight[c, k] = sum_t dpre[t, c]
++    * x[t - 3 + k, c]`` reduced in a fixed order, so it is bitwise
++    reproducible for a given ``(S, C, device)``.  ``S == 0`` returns the empty
++    ``dx`` and a zero ``dweight`` without launching.
++    """
++
++    return _backend.cake_causal_conv1d_train_backward(
++        x, weight, cu_seqlens, dy, workspace=workspace, dx=dx, dweight=dweight
++    )
++
++
++@flashinfer_api
++def cake_causal_conv1d(
++    x: torch.Tensor, weight: torch.Tensor, cu_seqlens: torch.Tensor
++) -> torch.Tensor:
++    """Autograd-enabled packed width-4 depthwise causal convolution + SiLU.
++
++    Parameters
++    ----------
++    x : torch.Tensor
++        BF16 ``[S, C]`` or ``[1, S, C]`` contiguous packed activations on a
++        supported CUDA device.
++    weight : torch.Tensor
++        FP32 ``[C, 4]`` contiguous taps.
++    cu_seqlens : torch.Tensor
++        ``int32 [num_docs + 1]`` device prefix sums of the document lengths.
++
++    Returns
++    -------
++    torch.Tensor
++        BF16 ``y`` of ``x``'s shape.  The backward saves only ``x``, ``weight``
++        and ``cu_seqlens`` and launches the fused ``dx`` + deterministic FP32
++        ``dweight`` kernel of :func:`cake_causal_conv1d_train_backward`.
++    """
++
++    return _backend.cake_causal_conv1d(x, weight, cu_seqlens)
++
++
++__all__ = [
++    "ARCHES",
++    "SUPPORTED_COMPUTE_CAPABILITIES",
++    "CakeCausalConv1dFunction",
++    "cake_causal_conv1d",
++    "cake_causal_conv1d_train_backward",
++    "cake_causal_conv1d_train_backward_workspace",
++    "cake_causal_conv1d_train_backward_workspace_bytes",
++    "cake_causal_conv1d_train_forward",
++    "is_cake_causal_conv1d_train_supported",
++]
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/.gitignore b/flashinfer/cake_causal_conv1d_train_backend/.gitignore
+new file mode 100644
+index 00000000000..e5fd70b13ee
+--- /dev/null
++++ b/flashinfer/cake_causal_conv1d_train_backend/.gitignore
+@@ -0,0 +1,2 @@
++# Prebuilt libraries and their build_info.json sidecar (cake_build.py); built locally, never tracked.
++aot/
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/__init__.py b/flashinfer/cake_causal_conv1d_train_backend/__init__.py
+new file mode 100644
+index 00000000000..b88efc8730d
+--- /dev/null
++++ b/flashinfer/cake_causal_conv1d_train_backend/__init__.py
+@@ -0,0 +1,489 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++
++Backend of :mod:`flashinfer.cake_causal_conv1d_train`: the Cake packed width-4
++depthwise causal convolution + SiLU training forward / backward (SM100 / SM103 /
++SM107) as one self-contained package (host API bodies, the ``cake_jit`` registry,
++the pinned ``cake_build`` loader and the generated CUDA sources under ``csrc/``).
++The stable, ``@flashinfer_api``-decorated entry points and the full user-facing
++documentation live in :mod:`flashinfer.cake_causal_conv1d_train`; import that
++module.
++"""
++
++from __future__ import annotations
++
++import functools
++from typing import Optional
++
++import torch
++
++from . import cake_jit as _loader
++from .cake_jit import (
++    ARCH_BY_CAPABILITY,
++    ARCHES,
++    CHANNEL_MULTIPLE,
++    INT32_MAX,
++    WIDTH,
++    arch_for_capability,
++    launch_grid,
++    partial_bytes,
++    partial_rows,
++    plan,
++    route_applies,
++    route_modules,
++    run_module,
++    workspace_layout,
++    workspace_record,
++)
++
++SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
++    sorted(ARCH_BY_CAPABILITY)
++)
++
++
++def _device_index(device: torch.device) -> int:
++    return device.index if device.index is not None else torch.cuda.current_device()
++
++
++@functools.cache
++def _arch_of_index(device_index: int) -> Optional[str]:
++    """The exported architecture of one CUDA device index, queried once per process."""
++
++    return arch_for_capability(tuple(torch.cuda.get_device_capability(device_index)))
++
++
++def _device_arch(device: torch.device) -> str:
++    if device.type != "cuda":
++        raise ValueError(
++            f"Cake causal conv1d training requires CUDA tensors, got {device}"
++        )
++    arch = _arch_of_index(_device_index(device))
++    if arch is None:
++        raise ValueError(
++            "Cake causal conv1d training supports compute capability "
++            f"{sorted(ARCH_BY_CAPABILITY)} only, got "
++            f"{tuple(torch.cuda.get_device_capability(device))}"
++        )
++    return arch
++
++
++def is_cake_causal_conv1d_train_supported(device: torch.device) -> bool:
++    """Whether ``device`` has an exported forward and backward route."""
++
++    device = torch.device(device)
++    if device.type != "cuda":
++        return False
++    capability = tuple(torch.cuda.get_device_capability(device))
++    return all(
++        route_applies(device_capability=capability, kind=kind)
++        for kind in ("fwd", "bwd")
++    )
++
++
++def _require_tensor(tensor: object, name: str) -> torch.Tensor:
++    if not isinstance(tensor, torch.Tensor):
++        raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
++    return tensor
++
++
++def _check_placement(
++    tensor: torch.Tensor, name: str, *, device: torch.device, dtype: torch.dtype
++) -> None:
++    if tensor.device != device:
++        raise ValueError(f"{name} must live on {device}, got {tensor.device}")
++    if tensor.dtype != dtype:
++        raise ValueError(f"{name} must be {dtype}, got {tensor.dtype}")
++    if not tensor.is_contiguous():
++        raise ValueError(f"{name} must be contiguous")
++
++
++def _tokens(
++    tensor: object,
++    name: str,
++    *,
++    device: torch.device,
++    shape: Optional[tuple[int, ...]] = None,
++) -> tuple[int, int, torch.Tensor]:
++    """Validate a BF16 ``[S, C]`` or ``[1, S, C]`` token tensor; return ``(S, C, [S, C] view)``.
++
++    ``shape`` pins the exact shape another token tensor of the call has (``dy``
++    against ``x``).  The forward reads the packed rows as 16-byte vectors of eight
++    channels and the backward as 8-byte vectors of four, so ``C`` is a multiple of eight; ``S`` and ``C`` are 32-bit kernel
++    scalars (``S x C`` itself may exceed 2^31: the kernels address with 64-bit
++    offsets).
++    """
++
++    t = _require_tensor(tensor, name)
++    if t.ndim == 3 and t.shape[0] == 1:
++        S, C = int(t.shape[1]), int(t.shape[2])
++    elif t.ndim == 2:
++        S, C = int(t.shape[0]), int(t.shape[1])
++    else:
++        raise ValueError(
++            f"{name} must be a [S, C] or [1, S, C] tensor, got shape {tuple(t.shape)}"
++        )
++    if shape is not None and tuple(t.shape) != tuple(shape):
++        raise ValueError(f"{name} must have shape {tuple(shape)}, got {tuple(t.shape)}")
++    _check_placement(t, name, device=device, dtype=torch.bfloat16)
++    if C <= 0 or C % CHANNEL_MULTIPLE:
++        raise ValueError(
++            f"{name} must have a channel count C that is a positive multiple of "
++            f"{CHANNEL_MULTIPLE}, got C={C}"
++        )
++    if S > INT32_MAX or C > INT32_MAX:
++        raise ValueError(
++            f"{name}: S={S} and C={C} must each fit a 32-bit kernel scalar"
++        )
++    return S, C, t.view(S, C)
++
++
++def _weight(
++    weight: object, C: int, *, device: torch.device, name: str = "weight"
++) -> torch.Tensor:
++    w = _require_tensor(weight, name)
++    if w.ndim != 2 or int(w.shape[1]) != WIDTH:
++        raise ValueError(
++            f"{name} must be a [C, {WIDTH}] tensor of a width-{WIDTH} convolution "
++            f"(tap {WIDTH - 1} multiplies the current token), got shape {tuple(w.shape)}"
++        )
++    if int(w.shape[0]) != C:
++        raise ValueError(
++            f"{name} must have one row per channel ([{C}, {WIDTH}]), got shape {tuple(w.shape)}"
++        )
++    _check_placement(w, name, device=device, dtype=torch.float32)
++    return w
++
++
++def _cu_seqlens(
++    cu_seqlens: object, *, device: torch.device
++) -> tuple[torch.Tensor, int]:
++    """Validate the ``int32 [num_docs + 1]`` device prefix sums; return ``(cu_seqlens, num_docs)``.
++
++    The host reads the tensor's metadata only: no element is copied to the host
++    and no stream is synchronized, so the call is CUDA Graph capturable.
++    """
++
++    cu = _require_tensor(cu_seqlens, "cu_seqlens")
++    if cu.ndim != 1:
++        raise ValueError(
++            f"cu_seqlens must be a 1-D [num_docs + 1] tensor, got shape {tuple(cu.shape)}"
++        )
++    _check_placement(cu, "cu_seqlens", device=device, dtype=torch.int32)
++    num_docs = int(cu.numel()) - 1
++    if num_docs < 1:
++        raise ValueError(
++            "cu_seqlens must hold at least two prefix sums (one document), got "
++            f"{int(cu.numel())} elements"
++        )
++    return cu, num_docs
++
++
++def _output(
++    tensor: Optional[object],
++    name: str,
++    *,
++    shape: tuple[int, ...],
++    dtype: torch.dtype,
++    device: torch.device,
++) -> torch.Tensor:
++    """A caller-provided output (exact shape and dtype, contiguous) or a fresh one."""
++
++    if tensor is None:
++        return torch.empty(shape, dtype=dtype, device=device)
++    out = _require_tensor(tensor, name)
++    if tuple(out.shape) != tuple(shape):
++        raise ValueError(
++            f"{name} must have shape {tuple(shape)}, got {tuple(out.shape)}"
++        )
++    _check_placement(out, name, device=device, dtype=dtype)
++    return out
++
++
++def _scalars(scalars: dict[str, int]) -> dict[str, int]:
++    return {key: int(scalars[key]) for key in _loader.LOGICAL_SCALARS}
++
++
++def _launch(
++    record: dict, S: int, C: int, num_docs: int, *, device_index: int
++) -> tuple[dict[str, int], int]:
++    """The kernel scalars and the grid of one launch of ``record`` (the host plan of ``cake_jit``).
++
++    CTA ``b`` owns channel tile ``b % n_ch_tiles``, so every channel tile needs
++    a CTA of the device's grid: a ``C`` beyond ``grid x threads x vec``
++    channels is refused rather than left partly unwritten.
++    """
++
++    scalars = plan(S, C, num_docs, geometry=record["grid_rule"]["geometry"])
++    grid_x = launch_grid(record, device_index=device_index)[0]
++    if scalars["n_ch_tiles"] > grid_x:
++        raise ValueError(
++            f"C={C} spans {scalars['n_ch_tiles']} channel tiles but the launch grid on this "
++            f"device is {grid_x} CTAs; every channel tile needs a CTA"
++        )
++    return scalars, grid_x
++
++
++def cake_causal_conv1d_train_backward_workspace_bytes(
++    S: int, C: int, device: torch.device
++) -> int:
++    """Bytes of the caller-owned backward workspace for ``C`` channels on ``device``.
++
++    The workspace holds the FP32 ``[rows, C, 4]`` ``dweight`` partials of the
++    cooperative backward, one row per ``n_ch_tiles`` CTAs of the device's
++    launch grid (``rows = ceil(grid / n_ch_tiles)``).  It depends on ``C`` and
++    the device only, so it is independent of ``S`` and one buffer serves every
++    token count; the kernel fully writes the rows it reduces, so the buffer
++    needs no zeroing between launches or CUDA Graph replays.
++    """
++
++    device = torch.device(device)
++    S, C = int(S), int(C)
++    if S < 0:
++        raise ValueError("S must be non-negative")
++    if C <= 0 or C % CHANNEL_MULTIPLE:
++        raise ValueError(
++            f"C must be a positive multiple of {CHANNEL_MULTIPLE}, got {C}"
++        )
++    arch = _device_arch(device)
++    record = workspace_record(arch)
++    layout = workspace_layout(record, C, device_index=_device_index(device))
++    return int(layout["total_bytes"])
++
++
++def cake_causal_conv1d_train_backward_workspace(
++    S: int, C: int, device: torch.device
++) -> torch.Tensor:
++    """Allocate a backward workspace (see ``..._workspace_bytes``; no zeroing is needed)."""
++
++    nbytes = cake_causal_conv1d_train_backward_workspace_bytes(S, C, device)
++    return torch.empty(nbytes, dtype=torch.uint8, device=torch.device(device))
++
++
++def _partial_view(
++    workspace: object, record: dict, *, C: int, rows: int, device: torch.device
++) -> torch.Tensor:
++    """The FP32 ``[rows, C, taps]`` view of this launch's partial rows inside ``workspace``."""
++
++    ws = _require_tensor(workspace, "workspace")
++    if ws.ndim != 1:
++        raise ValueError(
++            f"workspace must be a 1-D uint8 CUDA tensor, got shape {tuple(ws.shape)}"
++        )
++    _check_placement(ws, "workspace", device=device, dtype=torch.uint8)
++    if ws.data_ptr() % 16 != 0:
++        raise ValueError("workspace must be 16-byte aligned")
++    nbytes = partial_bytes(record, C, rows)
++    if ws.numel() < nbytes:
++        raise ValueError(
++            f"workspace holds {ws.numel()} bytes; this call needs {nbytes} "
++            "(cake_causal_conv1d_train_backward_workspace_bytes)"
++        )
++    taps = int(record["workspace_rule"]["taps"])
++    return ws[:nbytes].view(torch.float32).view(rows, C, taps)
++
++
++def cake_causal_conv1d_train_forward(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    cu_seqlens: torch.Tensor,
++    *,
++    out: Optional[torch.Tensor] = None,
++) -> torch.Tensor:
++    r"""Packed width-4 depthwise causal convolution + SiLU, training forward.
++
++    Parameters
++    ----------
++    x : torch.Tensor
++        BF16 ``[S, C]`` or ``[1, S, C]`` contiguous packed activations of every
++        document; ``C`` is a multiple of 8.
++    weight : torch.Tensor
++        FP32 ``[C, 4]`` contiguous taps; ``weight[c, 3]`` multiplies the current
++        token, ``weight[c, 0]`` the token three positions back.
++    cu_seqlens : torch.Tensor
++        ``int32 [num_docs + 1]`` contiguous device prefix sums of the document
++        lengths (``cu_seqlens[0] == 0``, ``cu_seqlens[-1] == S``; a repeated
++        value is an empty document).  The host reads its metadata only.
++    out : torch.Tensor, optional
++        Preallocated BF16 output of ``x``'s shape, contiguous.
++
++    Returns
++    -------
++    torch.Tensor
++        BF16 ``y`` of ``x``'s shape: ``y[t, c] = bf16(silu(sum_k weight[c, k] *
++        x[t - 3 + k, c]))`` with zero history before each document's first
++        token.  ``S == 0`` returns the empty output without launching.
++    """
++
++    x = _require_tensor(x, "x")
++    device = x.device
++    arch = _device_arch(device)
++    S, C, x_flat = _tokens(x, "x", device=device)
++    w = _weight(weight, C, device=device)
++    cu, num_docs = _cu_seqlens(cu_seqlens, device=device)
++    y = _output(out, "out", shape=tuple(x.shape), dtype=torch.bfloat16, device=device)
++    if S == 0:
++        return y
++    names = route_modules(arch, "fwd")
++    device_index = _device_index(device)
++    scalars, _ = _launch(
++        _loader.MODULES[names[0]], S, C, num_docs, device_index=device_index
++    )
++    values: dict[str, object] = {
++        "x": x_flat,
++        "w": w,
++        "cu": cu,
++        "y": y.view(S, C),
++        **_scalars(scalars),
++    }
++    for name in names:
++        run_module(name, values, device_index=device_index)
++    return y
++
++
++def cake_causal_conv1d_train_backward(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    cu_seqlens: torch.Tensor,
++    dy: torch.Tensor,
++    *,
++    workspace: Optional[torch.Tensor] = None,
++    dx: Optional[torch.Tensor] = None,
++    dweight: Optional[torch.Tensor] = None,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    r"""Packed width-4 depthwise causal convolution + SiLU, training backward.
++
++    Parameters
++    ----------
++    x, weight, cu_seqlens
++        The forward's inputs (same contracts as
++        :func:`cake_causal_conv1d_train_forward`); nothing else is saved.
++    dy : torch.Tensor
++        BF16 gradient of ``y``, ``x``'s shape, contiguous.
++    workspace : torch.Tensor, optional
++        Caller-owned ``uint8`` buffer from
++        :func:`cake_causal_conv1d_train_backward_workspace`; allocated when
++        omitted.
++    dx, dweight : torch.Tensor, optional
++        Preallocated outputs: BF16 of ``x``'s shape and FP32 ``[C, 4]``, both
++        contiguous.
++
++    Returns
++    -------
++    ``(dx, dweight)``: BF16 ``dx`` of ``x``'s shape and the FP32 ``[C, 4]``
++    weight gradient, accumulated in a fixed order, so ``dweight`` is bitwise
++    reproducible for a given ``(S, C, device)``.  ``S == 0`` returns the empty
++    ``dx`` and a zero ``dweight`` without launching.
++    """
++
++    x = _require_tensor(x, "x")
++    device = x.device
++    arch = _device_arch(device)
++    S, C, x_flat = _tokens(x, "x", device=device)
++    w = _weight(weight, C, device=device)
++    cu, num_docs = _cu_seqlens(cu_seqlens, device=device)
++    _, _, dy_flat = _tokens(dy, "dy", device=device, shape=tuple(x.shape))
++    dx_out = _output(
++        dx, "dx", shape=tuple(x.shape), dtype=torch.bfloat16, device=device
++    )
++    dw_out = _output(
++        dweight, "dweight", shape=(C, WIDTH), dtype=torch.float32, device=device
++    )
++    if S == 0:
++        dw_out.zero_()
++        return dx_out, dw_out
++    record = workspace_record(arch)
++    device_index = _device_index(device)
++    scalars, grid_x = _launch(record, S, C, num_docs, device_index=device_index)
++    if workspace is None:
++        workspace = cake_causal_conv1d_train_backward_workspace(S, C, device)
++    rows = partial_rows(grid_x, scalars["n_ch_tiles"])
++    partial = _partial_view(workspace, record, C=C, rows=rows, device=device)
++    values: dict[str, object] = {
++        "x": x_flat,
++        "w": w,
++        "cu": cu,
++        "dy": dy_flat,
++        "dx": dx_out.view(S, C),
++        "dw": dw_out,
++        "partial": partial,
++        **_scalars(scalars),
++    }
++    for name in route_modules(arch, "bwd"):
++        run_module(name, values, device_index=device_index)
++    return dx_out, dw_out
++
++
++class CakeCausalConv1dFunction(torch.autograd.Function):
++    """Autograd wrapper saving only ``(x, weight, cu_seqlens)`` for the backward.
++
++    ``forward(x, weight, cu_seqlens)`` returns ``y``; the backward launches the
++    fused ``dx`` + deterministic FP32 ``dweight`` kernel of
++    :func:`cake_causal_conv1d_train_backward` on the incoming gradient
++    (materialized as a contiguous BF16 tensor when autograd hands over another
++    layout or dtype).
++    """
++
++    @staticmethod
++    def forward(ctx, x, weight, cu_seqlens):
++        y = cake_causal_conv1d_train_forward(x, weight, cu_seqlens)
++        ctx.save_for_backward(x, weight, cu_seqlens)
++        return y
++
++    @staticmethod
++    def backward(ctx, grad_y):
++        x, weight, cu_seqlens = ctx.saved_tensors
++        if grad_y is None:
++            grad_y = torch.zeros_like(x)
++        dy = grad_y.to(torch.bfloat16).contiguous()
++        dx, dweight = cake_causal_conv1d_train_backward(x, weight, cu_seqlens, dy)
++        return dx, dweight, None
++
++
++def cake_causal_conv1d(
++    x: torch.Tensor, weight: torch.Tensor, cu_seqlens: torch.Tensor
++) -> torch.Tensor:
++    """Autograd-enabled packed width-4 depthwise causal convolution + SiLU.
++
++    Parameters
++    ----------
++    x : torch.Tensor
++        BF16 ``[S, C]`` or ``[1, S, C]`` contiguous packed activations on a
++        supported CUDA device.
++    weight : torch.Tensor
++        FP32 ``[C, 4]`` contiguous taps.
++    cu_seqlens : torch.Tensor
++        ``int32 [num_docs + 1]`` device prefix sums of the document lengths.
++
++    Returns
++    -------
++    torch.Tensor
++        BF16 ``y`` of ``x``'s shape.  The backward saves only ``x``, ``weight``
++        and ``cu_seqlens`` and returns BF16 ``dx`` and the FP32 ``dweight``.
++    """
++
++    return CakeCausalConv1dFunction.apply(x, weight, cu_seqlens)
++
++
++__all__ = [
++    "ARCHES",
++    "SUPPORTED_COMPUTE_CAPABILITIES",
++    "CakeCausalConv1dFunction",
++    "cake_causal_conv1d",
++    "cake_causal_conv1d_train_backward",
++    "cake_causal_conv1d_train_backward_workspace",
++    "cake_causal_conv1d_train_backward_workspace_bytes",
++    "cake_causal_conv1d_train_forward",
++    "is_cake_causal_conv1d_train_supported",
++]
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/build.json b/flashinfer/cake_causal_conv1d_train_backend/build.json
+new file mode 100644
+index 00000000000..0e5f751fb32
+--- /dev/null
++++ b/flashinfer/cake_causal_conv1d_train_backend/build.json
+@@ -0,0 +1,204 @@
++{
++  "arch_flags": {
++    "sm_100a": [
++      "-gencode=arch=compute_100a,code=sm_100a"
++    ],
++    "sm_103a": [
++      "-gencode=arch=compute_103a,code=sm_103a"
++    ],
++    "sm_107a": [
++      "-gencode=arch=compute_107a,code=sm_107a"
++    ]
++  },
++  "common": {
++    "include_dirs": [
++      "csrc"
++    ],
++    "link": {
++      "cudart": "shared",
++      "host_linker": "c++",
++      "tvm_ffi_symbols": "resolved at load; do not pass --no-undefined"
++    },
++    "link_flags": [
++      "-shared",
++      "-lcudart",
++      "-lcuda"
++    ],
++    "nvcc_flags": [
++      "-std=c++17",
++      "-O3",
++      "-DNDEBUG",
++      "--compiler-options=-fPIC",
++      "--expt-relaxed-constexpr",
++      "-Xfatbin=-compress-all",
++      "--compress-mode=size"
++    ],
++    "nvcc_flags_if": [
++      {
++        "cuda": ">=12.8",
++        "flags": [
++          "-static-global-template-stub=false"
++        ]
++      }
++    ],
++    "requires": {
++      "cuda_toolkit": {
++        "min": "12.8"
++      },
++      "tvm_ffi": {
++        "include_dirs": [
++          "tvm_ffi.libinfo.find_include_path()",
++          "tvm_ffi.libinfo.find_dlpack_include_path()"
++        ],
++        "python": "apache-tvm-ffi>=0.1.11,<0.2"
++      }
++    }
++  },
++  "generator": {
++    "cake_revision": "9058dacb7354934698d58b6ee13a4dc17d10345b",
++    "cuda": "13.4.92",
++    "rendered_at": "2026-10-19T06:24:37Z"
++  },
++  "libraries": [
++    {
++      "arch": "sm_100a",
++      "closure_sha256": "8cf8a3abfca5cfe00e0bc8f8a4be6b26acd393065199528ad328307a4d6cf523",
++      "entry": "run",
++      "gencode": "-gencode=arch=compute_100a,code=sm_100a",
++      "min_cuda": "12.8",
++      "name": "cake_causal_conv1d_train_f193c5247980992f4f81_sm_100a",
++      "nvcc_flags": [
++        "--prec-div=true",
++        "--prec-sqrt=true",
++        "--ftz=false"
++      ],
++      "nvcc_flags_if": [],
++      "path": "aot/cake_causal_conv1d_train_f193c5247980992f4f81_sm_100a.so",
++      "sha256": {
++        "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_binding.cu": "7e02f86d3d5dbef16d6927e22af69f4f7194518309a7eca09291034cffc5a948",
++        "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu": "205bd8e98ccfaf468dd929c636789ec8fdac2147bf8ec8e7c420d2ca2dd06d37"
++      },
++      "sources": [
++        "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu",
++        "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_binding.cu"
++      ]
++    },
++    {
++      "arch": "sm_103a",
++      "closure_sha256": "e97af7ac3938a3b1e4b1c2bf21ac3a89f27be5692b3ad7741027a75d91eb65f0",
++      "entry": "run",
++      "gencode": "-gencode=arch=compute_103a,code=sm_103a",
++      "min_cuda": "12.9",
++      "name": "cake_causal_conv1d_train_f193c5247980992f4f81_sm_103a",
++      "nvcc_flags": [
++        "--prec-div=true",
++        "--prec-sqrt=true",
++        "--ftz=false"
++      ],
++      "nvcc_flags_if": [],
++      "path": "aot/cake_causal_conv1d_train_f193c5247980992f4f81_sm_103a.so",
++      "sha256": {
++        "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_binding.cu": "7e02f86d3d5dbef16d6927e22af69f4f7194518309a7eca09291034cffc5a948",
++        "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu": "205bd8e98ccfaf468dd929c636789ec8fdac2147bf8ec8e7c420d2ca2dd06d37"
++      },
++      "sources": [
++        "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu",
++        "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_binding.cu"
++      ]
++    },
++    {
++      "arch": "sm_107a",
++      "closure_sha256": "03d9a35e5e149499218de3c9e0a08fde46700064db7484071a74705db3631ae2",
++      "entry": "run",
++      "gencode": "-gencode=arch=compute_107a,code=sm_107a",
++      "min_cuda": "13.0",
++      "name": "cake_causal_conv1d_train_f193c5247980992f4f81_sm_107a",
++      "nvcc_flags": [
++        "--prec-div=true",
++        "--prec-sqrt=true",
++        "--ftz=false"
++      ],
++      "nvcc_flags_if": [],
++      "path": "aot/cake_causal_conv1d_train_f193c5247980992f4f81_sm_107a.so",
++      "sha256": {
++        "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_binding.cu": "7e02f86d3d5dbef16d6927e22af69f4f7194518309a7eca09291034cffc5a948",
++        "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu": "205bd8e98ccfaf468dd929c636789ec8fdac2147bf8ec8e7c420d2ca2dd06d37"
++      },
++      "sources": [
++        "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu",
++        "csrc/cake_causal_conv1d_train_f193c5247980992f4f81_binding.cu"
++      ]
++    },
++    {
++      "arch": "sm_100a",
++      "closure_sha256": "e2b52a60ee3a3f9e29105e5288e2ce21213e911d684ee266e9f01399358db0b2",
++      "entry": "run",
++      "gencode": "-gencode=arch=compute_100a,code=sm_100a",
++      "min_cuda": "12.8",
++      "name": "cake_causal_conv1d_train_fca4a5467470b5e55f31_sm_100a",
++      "nvcc_flags": [
++        "--prec-div=true",
++        "--prec-sqrt=true",
++        "--ftz=false"
++      ],
++      "nvcc_flags_if": [],
++      "path": "aot/cake_causal_conv1d_train_fca4a5467470b5e55f31_sm_100a.so",
++      "sha256": {
++        "csrc/cake_causal_conv1d_train_fca4a5467470b5e55f31_binding.cu": "9a7864871db7c2d4bb329e421c6f5d89a93b03ca4956d966bc11ee532a869830",
++        "csrc/cake_causal_conv1d_train_fca4a5467470b5e55f31_kernel.cu": "be2cad7731a8d5d61d7f085daee90e862657bb9df833eff45974eb1826e0d397"
++      },
++      "sources": [
++        "csrc/cake_causal_conv1d_train_fca4a5467470b5e55f31_kernel.cu",
++        "csrc/cake_causal_conv1d_train_fca4a5467470b5e55f31_binding.cu"
++      ]
++    },
++    {
++      "arch": "sm_103a",
++      "closure_sha256": "3c0a568f85b1aa59dd5b1aa4e286bc3491181c5728f01b39d4ecfa6578a04516",
++      "entry": "run",
++      "gencode": "-gencode=arch=compute_103a,code=sm_103a",
++      "min_cuda": "12.9",
++      "name": "cake_causal_conv1d_train_fca4a5467470b5e55f31_sm_103a",
++      "nvcc_flags": [
++        "--prec-div=true",
++        "--prec-sqrt=true",
++        "--ftz=false"
++      ],
++      "nvcc_flags_if": [],
++      "path": "aot/cake_causal_conv1d_train_fca4a5467470b5e55f31_sm_103a.so",
++      "sha256": {
++        "csrc/cake_causal_conv1d_train_fca4a5467470b5e55f31_binding.cu": "9a7864871db7c2d4bb329e421c6f5d89a93b03ca4956d966bc11ee532a869830",
++        "csrc/cake_causal_conv1d_train_fca4a5467470b5e55f31_kernel.cu": "be2cad7731a8d5d61d7f085daee90e862657bb9df833eff45974eb1826e0d397"
++      },
++      "sources": [
++        "csrc/cake_causal_conv1d_train_fca4a5467470b5e55f31_kernel.cu",
++        "csrc/cake_causal_conv1d_train_fca4a5467470b5e55f31_binding.cu"
++      ]
++    },
++    {
++      "arch": "sm_107a",
++      "closure_sha256": "bc6ee2b54bde46cc9696e406da450b9fe6f90285b74ee8db8fd4913bf42c3f48",
++      "entry": "run",
++      "gencode": "-gencode=arch=compute_107a,code=sm_107a",
++      "min_cuda": "13.0",
++      "name": "cake_causal_conv1d_train_fca4a5467470b5e55f31_sm_107a",
++      "nvcc_flags": [
++        "--prec-div=true",
++        "--prec-sqrt=true",
++        "--ftz=false"
++      ],
++      "nvcc_flags_if": [],
++      "path": "aot/cake_causal_conv1d_train_fca4a5467470b5e55f31_sm_107a.so",
++      "sha256": {
++        "csrc/cake_causal_conv1d_train_fca4a5467470b5e55f31_binding.cu": "9a7864871db7c2d4bb329e421c6f5d89a93b03ca4956d966bc11ee532a869830",
++        "csrc/cake_causal_conv1d_train_fca4a5467470b5e55f31_kernel.cu": "be2cad7731a8d5d61d7f085daee90e862657bb9df833eff45974eb1826e0d397"
++      },
++      "sources": [
++        "csrc/cake_causal_conv1d_train_fca4a5467470b5e55f31_kernel.cu",
++        "csrc/cake_causal_conv1d_train_fca4a5467470b5e55f31_binding.cu"
++      ]
++    }
++  ],
++  "package": "flashinfer.cake_causal_conv1d_train_backend",
++  "schema": "cake-build/1"
++}
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/cake_build.py b/flashinfer/cake_causal_conv1d_train_backend/cake_build.py
+new file mode 100644
+index 00000000000..00756137eb1
+--- /dev/null
++++ b/flashinfer/cake_causal_conv1d_train_backend/cake_build.py
+@@ -0,0 +1,324 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++
++Library loader of one Cake-generated FlashInfer package.
++
++``build.json`` (schema ``cake-build/1``) next to this file is the only record
++of what the package compiles: one entry per ``<program>[_<spec>]_<arch>``
++library with its package-relative CUDA sources, nvcc flags, toolkit-conditional
++flags and digests.  A library is served from ``aot/<name>.so`` when a builder
++(a vendoring consumer's build rules, or FlashInfer's
++``scripts/check_cake_build_manifests.py``) has compiled it from the manifest,
++and otherwise through FlashInfer's JIT from the same sources and flags.
++
++The prebuilt path never imports ``flashinfer``, so the package stays usable in
++a process without a FlashInfer installation.  A builder that fills ``aot/``
++also writes the sidecar ``aot/build_info.json`` (schema ``cake-build-info/1``:
++``{"schema", "cuda": "13.0.88", "cudart_version": 13000, "arches": [...]}``,
++``arches`` naming every architecture the builder compiled).  Every prebuilt
++library exports ``build_cuda_version()``, the ``CUDART_VERSION`` it was
++compiled against, and :func:`load_library` refuses a library whose value
++disagrees with the sidecar.
++
++Public surface (``__all__``): :func:`manifest`, :func:`libraries_by_name`,
++:func:`prebuilt_path`, :func:`library_path`, :func:`load_library`,
++:func:`jit_spec`, :func:`jit_specs` and :func:`record_cuda_version`.
++
++The Cake exporter writes this file byte-identically into every package from
++its loader template; do not edit it in place.
++"""
++
++from __future__ import annotations
++
++import functools
++import hashlib
++import json
++import re
++from pathlib import Path
++from typing import Any
++
++__all__ = [
++    "jit_spec",
++    "jit_specs",
++    "libraries_by_name",
++    "library_path",
++    "load_library",
++    "manifest",
++    "prebuilt_path",
++    "record_cuda_version",
++]
++
++_PACKAGE = Path(__file__).parent
++_MANIFEST_SCHEMA = "cake-build/1"
++_BUILD_INFO_SCHEMA = "cake-build-info/1"
++_MANIFEST_PATH = _PACKAGE / "build.json"
++_BUILD_INFO_PATH = _PACKAGE / "aot" / "build_info.json"
++_CUDA_CONSTRAINT = re.compile(r"(==|>=)([0-9]+)\.([0-9]+)")
++
++
++@functools.cache
++def manifest() -> dict[str, Any]:
++    """The parsed ``build.json`` of this package (read on first use, not at import).
++
++    One cached document shared by every caller: read it, do not modify it.
++    """
++    try:
++        text = _MANIFEST_PATH.read_text(encoding="utf-8")
++    except FileNotFoundError as exc:
++        raise RuntimeError(
++            f"{_MANIFEST_PATH} is missing: the package was not exported with its {_MANIFEST_SCHEMA} manifest",
++        ) from exc
++    document = json.loads(text)
++    schema = document.get("schema")
++    if schema != _MANIFEST_SCHEMA:
++        raise RuntimeError(
++            f"{_MANIFEST_PATH} has schema {schema!r}; this loader reads {_MANIFEST_SCHEMA!r}",
++        )
++    return document
++
++
++@functools.cache
++def libraries_by_name() -> dict[str, dict[str, Any]]:
++    """``name -> entry`` over the ``libraries`` of ``build.json``."""
++    index: dict[str, dict[str, Any]] = {}
++    for entry in manifest()["libraries"]:
++        if entry["name"] in index:
++            raise RuntimeError(f"{_MANIFEST_PATH} lists {entry['name']!r} twice")
++        index[entry["name"]] = entry
++    return index
++
++
++def _entry(name: str) -> dict[str, Any]:
++    try:
++        return libraries_by_name()[name]
++    except KeyError:
++        raise KeyError(f"{name!r} is not a library of {_MANIFEST_PATH}") from None
++
++
++def prebuilt_path(name: str) -> Path:
++    """Where a builder places the compiled library of ``name`` (``aot/<name>.so``)."""
++    return _PACKAGE / _entry(name)["path"]
++
++
++def _cuda_constraint_matches(constraint: str, cuda: tuple[int, int]) -> bool:
++    """Does toolkit ``cuda`` (major, minor) satisfy ``"==X.Y"`` or ``">=X.Y"``?"""
++    match = _CUDA_CONSTRAINT.fullmatch(constraint)
++    if match is None:
++        raise ValueError(
++            f"unsupported CUDA constraint {constraint!r}; expected '==X.Y' or '>=X.Y'",
++        )
++    operator, major, minor = match.groups()
++    version = (int(major), int(minor))
++    if operator == "==":
++        return tuple(cuda) == version
++    return tuple(cuda) >= version
++
++
++def _conditional_flags(items: list[Any], cuda: tuple[int, int]) -> list[str]:
++    """The flags of every ``nvcc_flags_if`` item whose ``cuda`` constraint matches."""
++    flags: list[str] = []
++    for item in items:
++        if _cuda_constraint_matches(item["cuda"], cuda):
++            flags.extend(item["flags"])
++    return flags
++
++
++def _jit_toolchain(name: str) -> tuple[Any, Any]:
++    """``(gen_jit_spec, get_cuda_version)`` of the local FlashInfer, or the error."""
++    try:
++        from flashinfer.jit.core import gen_jit_spec
++        from flashinfer.jit.cpp_ext import get_cuda_version
++    except ImportError as exc:
++        raise RuntimeError(
++            f"{name} is not prebuilt ({prebuilt_path(name)}) and flashinfer's JIT is not available",
++        ) from exc
++    return gen_jit_spec, get_cuda_version
++
++
++def _local_cuda_version(get_cuda_version: Any) -> tuple[int, int]:
++    version = get_cuda_version()
++    return (int(version.major), int(version.minor))
++
++
++def _version(text: str) -> tuple[int, int]:
++    """``(major, minor)`` of a dotted version such as ``"13.0"`` or ``"13.0.88"``."""
++    parts = str(text).split(".")
++    if len(parts) < 2 or not all(part.isdigit() for part in parts[:2]):
++        raise RuntimeError(f"malformed CUDA version {text!r}")
++    return (int(parts[0]), int(parts[1]))
++
++
++def _toolkit_builds(entry: dict[str, Any], cuda: tuple[int, int]) -> bool:
++    """Does toolkit ``cuda`` reach the entry's ``min_cuda`` floor?"""
++    return cuda >= _version(entry["min_cuda"])
++
++
++def _verified_sources(entry: dict[str, Any]) -> list[Path]:
++    """The entry's sources as package paths, each checked against its digest."""
++    sources: list[Path] = []
++    for relative in entry["sources"]:
++        path = _PACKAGE / relative
++        digest = hashlib.sha256(path.read_bytes()).hexdigest()
++        expected = entry["sha256"][relative]
++        if digest != expected:
++            raise RuntimeError(
++                f"{path} does not match its build.json digest for {entry['name']}: {digest} != {expected}",
++            )
++        sources.append(path)
++    return sources
++
++
++def jit_spec(name: str) -> Any:
++    """FlashInfer's ``JitSpecNvcc`` of ``name``, built from the manifest entry.
++
++    Sources are digest-verified here and only here, so a modified or partially
++    delivered source tree fails closed before anything compiles.  The spec name
++    carries the closure digest: a changed closure never reuses a stale JIT cache
++    entry.  Flags are ``arch_flags[arch]`` + the entry's ``nvcc_flags`` + the
++    ``nvcc_flags_if`` items matching the local toolkit; FlashInfer's JIT adds
++    its own defaults (``-O3``, ``-fPIC``, ...), so ``common.nvcc_flags`` are not
++    repeated here.  A toolkit below the entry's ``min_cuda`` raises.
++    """
++    entry = _entry(name)
++    gen_jit_spec, get_cuda_version = _jit_toolchain(name)
++    document = manifest()
++    cuda = _local_cuda_version(get_cuda_version)
++    if not _toolkit_builds(entry, cuda):
++        raise RuntimeError(
++            f"{name} needs CUDA {entry['min_cuda']} or newer; the local toolkit is {cuda[0]}.{cuda[1]}",
++        )
++    flags = [
++        *document["arch_flags"][entry["arch"]],
++        *entry["nvcc_flags"],
++        *_conditional_flags(entry["nvcc_flags_if"], cuda),
++    ]
++    include_dirs = [_PACKAGE / d for d in document["common"]["include_dirs"]]
++    return gen_jit_spec(
++        f"{name}_{entry['closure_sha256'][:20]}",
++        _verified_sources(entry),
++        extra_cuda_cflags=flags,
++        extra_ldflags=list(document["common"]["link_flags"]),
++        extra_include_paths=include_dirs,
++        use_fast_math=False,
++    )
++
++
++def _names_of(arch: str) -> list[str]:
++    index = libraries_by_name()
++    return [name for name in index if index[name]["arch"] == arch]
++
++
++def jit_specs(arch: str) -> list[Any]:
++    """JIT specifications of the ``arch`` libraries still to build locally.
++
++    The entries without a prebuilt file that the local toolkit can build: the
++    list feeds ``flashinfer.jit.build_jit_specs`` warm-ups, so an entry whose
++    ``min_cuda`` exceeds the local toolkit is left out (the manifest check
++    script's "skip min_cuda > toolkit" rule), while :func:`jit_spec` on that
++    entry by name still raises.  When every ``arch`` library is prebuilt the
++    list is empty and ``flashinfer`` is not imported.
++    """
++    pending = [name for name in _names_of(arch) if not prebuilt_path(name).is_file()]
++    if not pending:
++        return []
++    _, get_cuda_version = _jit_toolchain(pending[0])
++    cuda = _local_cuda_version(get_cuda_version)
++    return [jit_spec(name) for name in pending if _toolkit_builds(_entry(name), cuda)]
++
++
++def library_path(name: str) -> Path:
++    """The prebuilt library of ``name`` when present, else its JIT cache path."""
++    path = prebuilt_path(name)
++    if path.is_file():
++        return path
++    return jit_spec(name).get_library_path()
++
++
++@functools.cache
++def _build_info() -> dict[str, Any]:
++    """The builder-written ``aot/build_info.json`` sidecar (prebuilt path only)."""
++    try:
++        text = _BUILD_INFO_PATH.read_text(encoding="utf-8")
++    except FileNotFoundError as exc:
++        raise RuntimeError(
++            f"{_BUILD_INFO_PATH} is missing although prebuilt libraries exist under {_PACKAGE / 'aot'}: the builder must write the {_BUILD_INFO_SCHEMA} sidecar",
++        ) from exc
++    info = json.loads(text)
++    schema = info.get("schema")
++    if schema != _BUILD_INFO_SCHEMA:
++        raise RuntimeError(
++            f"{_BUILD_INFO_PATH} has schema {schema!r}; this loader reads {_BUILD_INFO_SCHEMA!r}",
++        )
++    return info
++
++
++def _prebuilt_info(path: Path, arch: str) -> dict[str, Any]:
++    """The sidecar, which must record a build of ``arch`` for the prebuilt ``path``."""
++    info = _build_info()
++    if arch not in info["arches"]:
++        raise RuntimeError(
++            f"{path} exists but {_BUILD_INFO_PATH} records no {arch} build (arches {info['arches']})",
++        )
++    return info
++
++
++def load_library(name: str) -> Any:
++    """The loaded tvm-ffi module of ``name``: the prebuilt library, else a JIT build."""
++    entry = _entry(name)
++    path = _PACKAGE / entry["path"]
++    if not path.is_file():
++        return jit_spec(name).build_and_load()
++    info = _prebuilt_info(path, entry["arch"])
++    import tvm_ffi
++
++    module = tvm_ffi.load_module(str(path))
++    built = int(module.build_cuda_version())
++    if built != int(info["cudart_version"]):
++        raise RuntimeError(
++            f"{path} was compiled against CUDART {built} but {_BUILD_INFO_PATH} records {info['cudart_version']}",
++        )
++    return module
++
++
++def record_cuda_version(arch: str) -> tuple[int, int]:
++    """``(major, minor)`` of the toolkit that builds the ``arch`` libraries.
++
++    Prebuilt path, taken as soon as any library of the manifest exists under
++    ``aot/``: the sidecar ``aot/build_info.json`` is mandatory (missing ->
++    ``RuntimeError``; no local nvcc is consulted) and its ``cuda`` is the
++    answer whenever its ``arches`` list ``arch`` -- the builder compiled that
++    architecture, whether or not every one of its libraries is present.  An
++    ``arch`` library under ``aot/`` that the sidecar does not list raises, as
++    :func:`load_library` does.
++
++    JIT path, when nothing is prebuilt or the builder did not compile
++    ``arch``: the local toolkit of FlashInfer's JIT (``RuntimeError`` in a
++    process without a FlashInfer installation).  Call it for the architecture
++    you are about to load.
++    """
++    names = _names_of(arch)
++    if not names:
++        raise KeyError(f"{arch!r} has no libraries in {_MANIFEST_PATH}")
++    index = libraries_by_name()
++    prebuilt = [name for name in index if (_PACKAGE / index[name]["path"]).is_file()]
++    if prebuilt:
++        of_arch = [name for name in prebuilt if index[name]["arch"] == arch]
++        if of_arch:
++            return _version(_prebuilt_info(prebuilt_path(of_arch[0]), arch)["cuda"])
++        info = _build_info()
++        if arch in info["arches"]:
++            return _version(info["cuda"])
++    _, get_cuda_version = _jit_toolchain(names[0])
++    return _local_cuda_version(get_cuda_version)
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/cake_jit.py b/flashinfer/cake_causal_conv1d_train_backend/cake_jit.py
+new file mode 100644
+index 00000000000..743047a36d2
+--- /dev/null
++++ b/flashinfer/cake_causal_conv1d_train_backend/cake_jit.py
+@@ -0,0 +1,545 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++
++Host plan and loader glue of the Cake packed width-4 depthwise causal
++convolution + SiLU training kernels (SM100 / SM103 / SM107).
++
++Every module below is one mechanically exported production build: a CUDA
++device translation unit plus a tvm-ffi binding compiled together for exactly
++one architecture.  ``MODULES`` and ``ROUTES`` carry the host plan only: the
++kernel's ``library`` stem, the architectures it is delivered for, its launch
++record, grid rule, workspace rule and the kernel-parameter -> logical-argument
++map.  What to compile -- sources, digests, nvcc flags -- is recorded once in
++``build.json`` next to this file; :mod:`.cake_build` serves the library
++``<library>_<arch>`` from a prebuilt ``aot/`` file when a builder compiled it
++and otherwise through FlashInfer's JIT from the same sources and flags,
++verifying every source digest before the first build.
++
++A route is the module record one public call launches: ``fwd`` (``y`` from
++``x``, ``weight`` and ``cu_seqlens``) and ``bwd`` (``dx`` and the deterministic
++FP32 ``dweight`` in one cooperative launch).  Token and channel counts are
++runtime scalars, so a changed problem size never recompiles anything.
++
++The host plan is the three functions :func:`plan` (the kernel scalars),
++:func:`launch_grid` (the grid) and :func:`partial_rows` (the backward
++workspace rows); everything else derives from them.
++
++The program name ``cake_causal_conv1d_train_<20 hex>`` is the first twenty hex
++digits of the SHA-256 of the compact JSON ``{"build": <build keywords, sorted>,
++"module": <dotted kernel module>}`` of the kernel the program was rendered
++from; the forward is built with its kernel file's default keywords and the
++backward with ``vec=4`` (four channels, 8-byte vectors, per thread).
++"""
++
++from __future__ import annotations
++
++import functools
++from typing import Any, Sequence
++
++import tvm_ffi
++
++from . import cake_build
++
++# The derived leaves of every record (``kernel_symbol``, ``launch.block``,
++# ``launch.cluster``, ``launch.cooperative``, ``launch.dynamic_smem_bytes``,
++# ``launch.use_pdl``, ``arg_plan`` and ``logical``) are rewritten by the
++# exporter from the rendered program; every other field is host plan.
++MODULES: dict[str, dict[str, Any]] = {
++    "cake_causal_conv1d_train_f193c5247980992f4f81": {
++        "arches": [
++            "sm_100a",
++            "sm_103a",
++            "sm_107a",
++        ],
++        "arg_plan": [
++            ["buffer", "x"],
++            ["buffer", "w"],
++            ["buffer", "cu"],
++            ["buffer", "y"],
++            ["parameter", "S"],
++            ["parameter", "C"],
++            ["parameter", "num_docs"],
++            ["parameter", "search_steps"],
++            ["parameter", "ct_vec"],
++            ["parameter", "n_sub"],
++            ["parameter", "n_ch_tiles"],
++            ["grid", "grid_x"],
++            ["grid", "grid_y"],
++            ["grid", "grid_z"],
++        ],
++        "ffi_entry": "run",
++        # The grid is the co-resident CTA count, ``ctas_per_sm x SM count``:
++        # CTA ``b`` owns channel tile ``b % n_ch_tiles`` and, with the other
++        # CTAs of that tile, an equal contiguous share of the token axis.  Any
++        # positive grid is correct; ``ctas_per_sm`` is the measured
++        # co-residency of the program: 4 CTAs per SM on B200 (sm_100a, 107
++        # registers) and GB300 (sm_103a, 109 registers), the register limit
++        # at 128 threads (ncu launch__occupancy_limit_registers); sm_107a is
++        # taken as the same launch bound.  ``geometry`` is the kernel's build
++        # geometry the host plan derives its scalars from.
++        "grid_rule": {
++            "cooperative": False,
++            "ctas_per_sm": 4,
++            "geometry": {
++                "threads": 128,
++                "vec": 8,
++            },
++            "kind": "co_resident",
++        },
++        "kernel": "cake_causal_conv1d_train_f193c5247980992f4f81",
++        "kernel_symbol": "kernel_cake_causal_conv1d_train_f193c5247980992f4f81",
++        "launch": {
++            "block": (128, 1, 1),
++            "cluster": (1, 1, 1),
++            "cooperative": False,
++            "dynamic_smem_bytes": 33792,
++            "use_pdl": False,
++        },
++        "library": "cake_causal_conv1d_train_f193c5247980992f4f81",
++        "logical": {
++            "C": "C",
++            "S": "S",
++            "ct_vec": "ct_vec",
++            "cu": "cu",
++            "n_ch_tiles": "n_ch_tiles",
++            "n_sub": "n_sub",
++            "num_docs": "num_docs",
++            "search_steps": "search_steps",
++            "w": "w",
++            "x": "x",
++            "y": "y",
++        },
++        "role": "fwd",
++        "workspace_rule": None,
++    },
++    "cake_causal_conv1d_train_fca4a5467470b5e55f31": {
++        "arches": [
++            "sm_100a",
++            "sm_103a",
++            "sm_107a",
++        ],
++        "arg_plan": [
++            ["buffer", "x"],
++            ["buffer", "w"],
++            ["buffer", "cu"],
++            ["buffer", "dy"],
++            ["buffer", "dx"],
++            ["buffer", "dw"],
++            ["buffer", "partial"],
++            ["parameter", "S"],
++            ["parameter", "C"],
++            ["parameter", "num_docs"],
++            ["parameter", "search_steps"],
++            ["parameter", "ct_vec"],
++            ["parameter", "n_sub"],
++            ["parameter", "n_ch_tiles"],
++            ["grid", "grid_x"],
++            ["grid", "grid_y"],
++            ["grid", "grid_z"],
++        ],
++        "ffi_entry": "run",
++        # Cooperative (a grid-wide barrier precedes the fixed-order dweight
++        # reduction): the grid is exactly the co-resident CTA count.
++        # ``ctas_per_sm``: 4 CTAs per SM measured on B200 and GB300 (128
++        # registers at 128 threads, the launch bound; ncu
++        # launch__occupancy_limit_registers); sm_107a is taken as the same.
++        "grid_rule": {
++            "cooperative": True,
++            "ctas_per_sm": 4,
++            "geometry": {
++                "threads": 128,
++                "vec": 4,
++            },
++            "kind": "co_resident",
++        },
++        "kernel": "cake_causal_conv1d_train_fca4a5467470b5e55f31",
++        "kernel_symbol": "kernel_cake_causal_conv1d_train_fca4a5467470b5e55f31",
++        "launch": {
++            "block": (128, 1, 1),
++            "cluster": (1, 1, 1),
++            "cooperative": True,
++            "dynamic_smem_bytes": 8192,
++            "use_pdl": False,
++        },
++        "library": "cake_causal_conv1d_train_fca4a5467470b5e55f31",
++        "logical": {
++            "C": "C",
++            "S": "S",
++            "ct_vec": "ct_vec",
++            "cu": "cu",
++            "dw": "dw",
++            "dx": "dx",
++            "dy": "dy",
++            "n_ch_tiles": "n_ch_tiles",
++            "n_sub": "n_sub",
++            "num_docs": "num_docs",
++            "partial": "partial",
++            "search_steps": "search_steps",
++            "w": "w",
++            "x": "x",
++        },
++        "role": "bwd",
++        # The FP32 ``partial`` workspace: ``[ceil(grid / n_ch_tiles), C, taps]``
++        # rows (row ``b // n_ch_tiles`` belongs to CTA ``b``) the kernel fully
++        # writes and reduces in a fixed order; nothing is zeroed by the host.
++        "workspace_rule": {
++            "kind": "partial_rows",
++            "taps": 4,
++        },
++    },
++}
++
++ROUTES: dict[str, dict[str, list[str]]] = {
++    "sm_100a": {
++        "bwd": [
++            "cake_causal_conv1d_train_fca4a5467470b5e55f31",
++        ],
++        "fwd": [
++            "cake_causal_conv1d_train_f193c5247980992f4f81",
++        ],
++    },
++    "sm_103a": {
++        "bwd": [
++            "cake_causal_conv1d_train_fca4a5467470b5e55f31",
++        ],
++        "fwd": [
++            "cake_causal_conv1d_train_f193c5247980992f4f81",
++        ],
++    },
++    "sm_107a": {
++        "bwd": [
++            "cake_causal_conv1d_train_fca4a5467470b5e55f31",
++        ],
++        "fwd": [
++            "cake_causal_conv1d_train_f193c5247980992f4f81",
++        ],
++    },
++}
++
++# One verified build per architecture: B200 (``sm_100a``), B300 (``sm_103a``)
++# and R200 (``sm_107a``).  Every architecture is compiled with its exact
++# ``-gencode`` flag set (``build.json`` ``arch_flags``); there is no family
++# fallback.
++ARCHES = ("sm_100a", "sm_103a", "sm_107a")
++ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
++    (10, 0): "sm_100a",
++    (10, 3): "sm_103a",
++    (10, 7): "sm_107a",
++}
++KINDS = ("fwd", "bwd")
++# The convolution width: ``weight`` and ``dweight`` are ``[C, WIDTH]`` and tap
++# ``WIDTH - 1`` multiplies the current token.
++WIDTH = 4
++# A forward thread owns one 16-byte vector of eight BF16 channels and a
++# backward thread one 8-byte vector of four, so ``C`` is a multiple of eight;
++# the ``vec`` of every record's geometry divides this.
++CHANNEL_MULTIPLE = 8
++# The kernels take ``S``, ``C`` and the plan scalars as 32-bit integers.
++INT32_MAX = 2**31 - 1
++# Logical argument names the public API binds; every module record maps its
++# kernel parameter names onto this vocabulary (``record["logical"]``).
++LOGICAL_TENSORS = (
++    "x",
++    "w",
++    "cu",
++    "y",
++    "dy",
++    "dx",
++    "dw",
++    "partial",
++)
++LOGICAL_SCALARS = (
++    "S",
++    "C",
++    "num_docs",
++    "search_steps",
++    "ct_vec",
++    "n_sub",
++    "n_ch_tiles",
++)
++
++
++def arch_for_capability(device_capability: Sequence[int]) -> str | None:
++    """Name the exported architecture for one device capability, if any."""
++
++    values = [int(value) for value in device_capability]
++    if len(values) != 2:
++        return None
++    return ARCH_BY_CAPABILITY.get((values[0], values[1]))
++
++
++def route_applies(*, device_capability: Sequence[int], kind: str) -> bool:
++    """Whether the verified export owns one training call on a device."""
++
++    arch = arch_for_capability(device_capability)
++    if arch is None:
++        return False
++    return kind in ROUTES.get(arch, {})
++
++
++def route_modules(arch: str, kind: str) -> tuple[str, ...]:
++    """Ordered module names of one route on ``arch`` (every program the route launches)."""
++
++    if kind not in KINDS:
++        raise ValueError(f"kind must be one of {KINDS}, got {kind!r}")
++    names = ROUTES.get(arch, {}).get(kind)
++    if not names:
++        raise ValueError(
++            f"unsupported Cake causal conv1d training route {kind!r} on {arch!r}; "
++            f"exported architectures: {ARCHES}"
++        )
++    return tuple(names)
++
++
++def workspace_record(arch: str) -> dict[str, Any]:
++    """The backward module record that owns the ``partial`` workspace on ``arch``."""
++
++    owners = [
++        MODULES[name]
++        for name in route_modules(arch, "bwd")
++        if MODULES[name]["workspace_rule"] is not None
++    ]
++    if len(owners) != 1:
++        raise RuntimeError(
++            f"the exported backward route on {arch} declares {len(owners)} workspace "
++            "owners; expected exactly one"
++        )
++    return owners[0]
++
++
++def _ceil_div(numerator: int, denominator: int) -> int:
++    if denominator <= 0:
++        raise ValueError("denominator must be positive")
++    return -(-int(numerator) // int(denominator))
++
++
++def channel_split(C: int, *, geometry: dict[str, int]) -> tuple[int, int, int]:
++    """``(ct_vec, n_sub, n_ch_tiles)`` of ``C`` channels under a record's build geometry.
++
++    ``ct_vec = min(C / vec, threads)`` channel vectors per channel tile (one
++    thread each), ``n_sub = threads // ct_vec`` token sub-tiles per CTA and
++    ``n_ch_tiles = ceil(C / vec / ct_vec)`` channel tiles.
++    """
++
++    C = int(C)
++    vec = int(geometry["vec"])
++    threads = int(geometry["threads"])
++    if C <= 0 or C % vec:
++        raise ValueError(f"C={C} must be a positive multiple of {vec}")
++    channel_vectors = C // vec
++    ct_vec = min(channel_vectors, threads)
++    return ct_vec, threads // ct_vec, _ceil_div(channel_vectors, ct_vec)
++
++
++def plan(S: int, C: int, num_docs: int, *, geometry: dict[str, int]) -> dict[str, int]:
++    """The kernel's launch scalars for one problem under a record's build geometry.
++
++    ``geometry`` is ``record["grid_rule"]["geometry"]``: ``threads`` per CTA
++    and ``vec`` BF16 channels per thread.  The scalars are ``S``, ``C``,
++    ``num_docs``, :func:`channel_split`'s ``ct_vec`` / ``n_sub`` /
++    ``n_ch_tiles`` and ``search_steps``, the number of halvings of the
++    device-side binary search over ``cu_seqlens`` (``max(1, ceil(log2
++    num_docs))``).  Every value is a pure function of ``(S, C, num_docs)`` and
++    the geometry: the host never reads ``cu_seqlens``, and the kernel derives
++    its token ranges from ``S`` and the grid.
++    """
++
++    S, C, num_docs = int(S), int(C), int(num_docs)
++    if S < 0 or num_docs < 0:
++        raise ValueError(f"S and num_docs must be non-negative, got {(S, num_docs)}")
++    ct_vec, n_sub, n_ch_tiles = channel_split(C, geometry=geometry)
++    return {
++        "S": S,
++        "C": C,
++        "num_docs": num_docs,
++        "search_steps": max(1, (num_docs - 1).bit_length()),
++        "ct_vec": ct_vec,
++        "n_sub": n_sub,
++        "n_ch_tiles": n_ch_tiles,
++    }
++
++
++@functools.cache
++def sm_count(device_index: int) -> int:
++    """Streaming multiprocessor count of one CUDA device (immutable per process)."""
++
++    import torch
++
++    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
++
++
++def launch_grid(record: dict[str, Any], *, device_index: int) -> tuple[int, int, int]:
++    """Launch grid of one module on ``device_index`` under its recorded grid rule.
++
++    ``co_resident`` modules launch exactly ``ctas_per_sm x SM count`` CTAs: the
++    co-resident CTA count of the program, which the cooperative backward never
++    exceeds.  The grid depends on the device only, so the deterministic
++    ``dweight`` order is a pure function of ``(S, C, device)`` and one
++    workspace serves every token count.
++    """
++
++    rule = record["grid_rule"]
++    if rule["kind"] != "co_resident":
++        raise ValueError(
++            f"unknown Cake causal conv1d training grid rule: {rule['kind']!r}"
++        )
++    return (max(1, int(rule["ctas_per_sm"]) * sm_count(device_index)), 1, 1)
++
++
++def partial_rows(grid_x: int, n_ch_tiles: int) -> int:
++    """Rows of the backward ``partial`` workspace for a grid: ``ceil(grid_x / n_ch_tiles)``.
++
++    CTA ``b`` of the grid owns channel tile ``b % n_ch_tiles`` and partial row
++    ``b // n_ch_tiles``; the kernel writes every row it reduces.
++    """
++
++    return _ceil_div(grid_x, n_ch_tiles)
++
++
++def partial_bytes(record: dict[str, Any], C: int, rows: int) -> int:
++    """Bytes of ``rows`` FP32 ``[C, taps]`` partial rows of the module's workspace rule."""
++
++    rule = record["workspace_rule"]
++    if rule is None or rule["kind"] != "partial_rows":
++        raise ValueError(f"module {record['kernel_symbol']} owns no backward workspace")
++    return 4 * int(rule["taps"]) * int(C) * int(rows)
++
++
++def workspace_layout(
++    record: dict[str, Any], C: int, *, device_index: int
++) -> dict[str, int]:
++    """Byte layout of the caller-owned backward workspace of one module for ``C`` channels.
++
++    The workspace is one CUDA ``uint8`` buffer holding the FP32 ``[rows, C, taps]``
++    ``dweight`` partials, ``rows = partial_rows(grid, n_ch_tiles)`` for the
++    device's launch grid; it depends on ``C`` and the device only, so one
++    buffer serves every token count.  The kernel fully writes the rows it
++    reduces, so nothing is zeroed between launches or CUDA Graph replays.
++    """
++
++    grid_x = launch_grid(record, device_index=device_index)[0]
++    _, _, n_ch_tiles = channel_split(C, geometry=record["grid_rule"]["geometry"])
++    rows = partial_rows(grid_x, n_ch_tiles)
++    return {
++        "grid": grid_x,
++        "rows": rows,
++        "taps": int(record["workspace_rule"]["taps"]),
++        "total_bytes": partial_bytes(record, C, rows),
++    }
++
++
++@functools.cache
++def device_arch(device_index: int) -> str:
++    """Exported architecture of one CUDA device (``RuntimeError`` when it is not an exported target)."""
++
++    import torch
++
++    capability = tuple(torch.cuda.get_device_capability(device_index))
++    arch = arch_for_capability(capability)
++    if arch is None:
++        raise RuntimeError(
++            f"device {device_index} (capability {capability}) is not an exported Cake causal conv1d training target"
++        )
++    return arch
++
++
++def library_name(name: str, arch: str) -> str:
++    """``build.json`` library of module record ``name`` built for ``arch``: ``<library>_<arch>``."""
++
++    record = MODULES[name]
++    if arch not in record["arches"]:
++        raise RuntimeError(
++            f"Cake causal conv1d training module {name} is not delivered for {arch}; "
++            f"its architectures: {record['arches']}"
++        )
++    return f"{record['library']}_{arch}"
++
++
++@functools.cache
++def load(name: str, arch: str) -> Any:
++    """The loaded tvm-ffi module of record ``name`` built for ``arch``.
++
++    The prebuilt ``aot/`` library when a builder compiled it, else FlashInfer's
++    JIT build of the same sources and flags (``cake_build.load_library``).
++    """
++
++    return cake_build.load_library(library_name(name, arch))
++
++
++def specs_for_arch(arch: str) -> list[Any]:
++    """JIT specifications of every ``arch`` library without a prebuilt file (for
++    ahead-of-time warm-up through FlashInfer's ``build_jit_specs``)."""
++
++    return cake_build.jit_specs(arch)
++
++
++def run_module(name: str, values: dict[str, Any], *, device_index: int) -> None:
++    """Launch one exported module with logical argument ``values``.
++
++    ``values`` maps the logical names in ``LOGICAL_TENSORS`` /
++    ``LOGICAL_SCALARS`` to tensors and Python scalars; the module record maps
++    its kernel parameter names onto that vocabulary.  The launch grid is the
++    module's :func:`launch_grid` on ``device_index``, and the kernel runs on
++    the current torch stream.
++    """
++
++    record = MODULES[name]
++    logical = record["logical"]
++    grid = launch_grid(record, device_index=device_index)
++    grid_values = {"grid_x": grid[0], "grid_y": grid[1], "grid_z": grid[2]}
++    args = []
++    for kind, key in record["arg_plan"]:
++        if kind == "grid":
++            args.append(grid_values[key])
++            continue
++        logical_name = logical[key]
++        if logical_name not in values:
++            raise ValueError(
++                f"module {name} needs {logical_name!r} (kernel parameter {key!r})"
++            )
++        args.append(values[logical_name])
++    module = load(name, device_arch(device_index))
++    with tvm_ffi.use_torch_stream():
++        getattr(module, record["ffi_entry"])(*args)
++
++
++__all__ = [
++    "ARCHES",
++    "ARCH_BY_CAPABILITY",
++    "CHANNEL_MULTIPLE",
++    "INT32_MAX",
++    "KINDS",
++    "LOGICAL_SCALARS",
++    "LOGICAL_TENSORS",
++    "MODULES",
++    "ROUTES",
++    "WIDTH",
++    "arch_for_capability",
++    "channel_split",
++    "device_arch",
++    "launch_grid",
++    "library_name",
++    "load",
++    "partial_bytes",
++    "partial_rows",
++    "plan",
++    "route_applies",
++    "route_modules",
++    "run_module",
++    "sm_count",
++    "specs_for_arch",
++    "workspace_layout",
++    "workspace_record",
++]
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/csrc/.clang-format b/flashinfer/cake_causal_conv1d_train_backend/csrc/.clang-format
+new file mode 100644
+index 00000000000..5b709a08807
+--- /dev/null
++++ b/flashinfer/cake_causal_conv1d_train_backend/csrc/.clang-format
+@@ -0,0 +1,4 @@
++# Receipt-bound generated sources (Cake export of cake_causal_conv1d_train): the source registry attests these bytes;
++# formatting them would break the receipts that bind them to the exporter.
++DisableFormat: true
++SortIncludes: Never
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_f193c5247980992f4f81_binding.cu b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_f193c5247980992f4f81_binding.cu
+new file mode 100644
+index 00000000000..49305ac0575
+--- /dev/null
++++ b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_f193c5247980992f4f81_binding.cu
+@@ -0,0 +1,108 @@
++/*
++ * Copyright (c) 2026 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Generated by rye-cuda: the tvm-ffi host binding of kernel_cake_causal_conv1d_train_f193c5247980992f4f81, for the device source that defines it. Do not edit.
++#include <cuda_runtime.h>
++#include <cuda_bf16.h>
++
++#include "cake_ffi_checks.h"
++
++#include <cstdint>
++
++extern "C" __global__ void kernel_cake_causal_conv1d_train_f193c5247980992f4f81(__nv_bfloat16* __restrict__ x, float* __restrict__ w, int* __restrict__ cu, __nv_bfloat16* __restrict__ y, int S, int C, int num_docs, int search_steps, int ct_vec, int n_sub, int n_ch_tiles);
++
++namespace cake_binding_kernel_cake_causal_conv1d_train_f193c5247980992f4f81 {
++
++using tvm::ffi::TensorView;
++
++constexpr const char* KERNEL_NAME = "kernel_cake_causal_conv1d_train_f193c5247980992f4f81";
++
++void CheckCuda(cudaError_t status, const char* what) {
++  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
++      << KERNEL_NAME << ": " << what << " failed: " << cudaGetErrorString(status);
++}
++
++void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t.byte_offset(); }
++
++void Run(TensorView a_x, TensorView a_w, TensorView a_cu, TensorView a_y, int64_t a_S, int64_t a_C, int64_t a_num_docs, int64_t a_search_steps, int64_t a_ct_vec, int64_t a_n_sub, int64_t a_n_ch_tiles, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
++  DLDevice dev = a_x.device();
++  tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
++  check_cuda_tensor(a_x, "x");
++  check_dtype(a_x, DLDataType{kDLBfloat, 16, 1}, "x");
++  check_cuda_tensor(a_w, "w");
++  check_dtype(a_w, DLDataType{kDLFloat, 32, 1}, "w");
++  check_cuda_tensor(a_cu, "cu");
++  check_dtype(a_cu, DLDataType{kDLInt, 32, 1}, "cu");
++  check_cuda_tensor(a_y, "y");
++  check_dtype(a_y, DLDataType{kDLBfloat, 16, 1}, "y");
++  TVM_FFI_CHECK(a_S >= -2147483648LL && a_S <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'S' = " << a_S
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_C >= -2147483648LL && a_C <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'C' = " << a_C
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_num_docs >= -2147483648LL && a_num_docs <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'num_docs' = " << a_num_docs
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_search_steps >= -2147483648LL && a_search_steps <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'search_steps' = " << a_search_steps
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_ct_vec >= -2147483648LL && a_ct_vec <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'ct_vec' = " << a_ct_vec
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_n_sub >= -2147483648LL && a_n_sub <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'n_sub' = " << a_n_sub
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_n_ch_tiles >= -2147483648LL && a_n_ch_tiles <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'n_ch_tiles' = " << a_n_ch_tiles
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  check_contiguous(a_x, "x");
++  check_contiguous(a_w, "w");
++  check_same_device(a_w, a_x, "w", "x");
++  check_contiguous(a_cu, "cu");
++  check_same_device(a_cu, a_x, "cu", "x");
++  check_contiguous(a_y, "y");
++  check_same_device(a_y, a_x, "y", "x");
++  TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
++      << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
++  TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)
++      << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") exceeds CUDA's limits";
++  cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(dev.device_type, dev.device_id));
++  void* v_x = DataPtr(a_x);
++  void* v_w = DataPtr(a_w);
++  void* v_cu = DataPtr(a_cu);
++  void* v_y = DataPtr(a_y);
++  int32_t v_S = static_cast<int32_t>(a_S);
++  int32_t v_C = static_cast<int32_t>(a_C);
++  int32_t v_num_docs = static_cast<int32_t>(a_num_docs);
++  int32_t v_search_steps = static_cast<int32_t>(a_search_steps);
++  int32_t v_ct_vec = static_cast<int32_t>(a_ct_vec);
++  int32_t v_n_sub = static_cast<int32_t>(a_n_sub);
++  int32_t v_n_ch_tiles = static_cast<int32_t>(a_n_ch_tiles);
++  void* kernel_args[] = {&v_x, &v_w, &v_cu, &v_y, &v_S, &v_C, &v_num_docs, &v_search_steps, &v_ct_vec, &v_n_sub, &v_n_ch_tiles};
++  cudaLaunchConfig_t config{};
++  config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
++  config.blockDim = dim3(128, 1, 1);
++  config.dynamicSmemBytes = 33792;
++  config.stream = stream;
++  CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_causal_conv1d_train_f193c5247980992f4f81), kernel_args),
++            "cudaLaunchKernelExC");
++}
++
++}  // namespace cake_binding_kernel_cake_causal_conv1d_train_f193c5247980992f4f81
++
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_binding_kernel_cake_causal_conv1d_train_f193c5247980992f4f81::Run);
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, cake_ffi_build_cuda_version);
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu
+new file mode 100644
+index 00000000000..6b10da28f1b
+--- /dev/null
++++ b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_f193c5247980992f4f81_kernel.cu
+@@ -0,0 +1,407 @@
++/*
++ * Copyright (c) 2026 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++typedef signed char        int8_t;
++typedef unsigned char      uint8_t;
++typedef unsigned short     uint16_t;
++typedef unsigned int       uint32_t;
++#if defined(__CUDACC_RTC__)
++typedef unsigned long long uint64_t;
++#else
++typedef unsigned long      uint64_t;
++#endif
++static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
++typedef signed int         int32_t;
++typedef short int          int16_t;
++struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
++static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
++static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
++
++#if defined(__CUDACC_RTC__)
++typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
++#else
++#include <cuda.h>
++#endif
++
++static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++
++__device__ __forceinline__ int make_warp_uniform(int x) {
++    int result;
++    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
++                 : "=r"(result) : "r"(x));
++    return result;
++}
++
++#define CAKE_INF CUDART_INF_F
++#define NUM_MAIN_STAGES 1
++#define SMEM_STAGE_BUF_OFF 1024
++#define SMEM_STAGE_BUF_STAGE_BYTES 32768
++#define SMEM_STAGE_BUF_STRIDE 32768
++#define SMEM_TOTAL 33792
++#define THREADS 128
++#define LAUNCH_MIN_BLOCKS 4
++
++#include <math_constants.h>
++
++__device__ __forceinline__ uint32_t elect_sync() {
++    uint32_t pred = 0;
++    asm volatile(
++        "{\n\t"
++        ".reg .pred %%px;\n\t"
++        "elect.sync _|%%px, %1;\n\t"
++        "@%%px mov.s32 %0, 1;\n\t"
++        "}\n"
++        : "+r"(pred)
++        : "r"(0xFFFFFFFF));
++    return pred;
++}
++
++
++__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
++    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
++        :: "r"(mbar_addr), "r"(count) : "memory");
++}
++
++
++
++// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
++// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
++// explicit loop still makes this helper blocking until acquire succeeds.
++__device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
++    asm volatile(
++        "{\n\t"
++        ".reg .pred P1;\n\t"
++        "LAB_WAIT:\n\t"
++        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
++        " P1, [%0], %1;\n\t"
++        "@P1 bra.uni DONE;\n\t"
++        "bra.uni LAB_WAIT;\n\t"
++        "DONE:\n\t"
++        "}\n"
++        :: "r"(mbar_addr), "r"(phase) : "memory");
++}
++
++
++
++__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
++    asm volatile(
++        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
++        :: "r"(mbar_addr), "r"(bytes) : "memory");
++}
++
++
++__device__ __forceinline__ float approx_exp2(float x) {
++    float y;
++    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
++    return y;
++}
++
++
++__device__ __forceinline__ float approx_rcp(float x) {
++    float y;
++    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
++    return y;
++}
++
++
++
++__device__ __forceinline__ void cp_async_bulk_gmem2smem(
++    unsigned smem_addr, const void* gmem_ptr, unsigned bytes, int mbar_addr) {
++    asm volatile(
++        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
++        " [%0], [%1], %2, [%3];"
++        :: "r"(smem_addr), "l"(gmem_ptr), "r"(bytes), "r"(mbar_addr)
++        : "memory");
++}
++
++extern "C" {
++
++__global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
++kernel_cake_causal_conv1d_train_f193c5247980992f4f81(__nv_bfloat16* __restrict__ x, float* __restrict__ w, int* __restrict__ cu, __nv_bfloat16* __restrict__ y, int S, int C, int num_docs, int search_steps, int ct_vec, int n_sub, int n_ch_tiles)
++{
++    const int tid = threadIdx.x;
++    const int warp = make_warp_uniform(tid / 32);
++    const int lane = tid % 32;
++
++    extern __shared__ __align__(1024) char smem_raw[];
++    int smem;
++#if __CUDA_ARCH__ == 1000
++    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
++    smem = make_warp_uniform(smem);
++#else
++    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
++#endif
++
++    const int mbar_base = smem;
++    #define stage_full_addr (mbar_base + 0)
++
++    const int bid = blockIdx.x;
++    const int num_bids = gridDim.x;
++
++    const int cta_rank = 0;
++
++    // Kernel setup ops
++    uint8_t* stage_buf = reinterpret_cast<uint8_t*>(smem_raw + 1024);
++    const int stage_buf_addr = smem + 1024;
++
++    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 2 barriers)
++    // Mbarriers at smem_raw[0..16)
++
++    if (warp == 0) {
++        uint32_t leader = elect_sync();
++        if (leader) {
++            // stage_full: 2 barriers, init_count=1
++            mbarrier_init(smem + 0, 1);
++            mbarrier_init(smem + 8, 1);
++            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
++        }
++    }
++
++    __syncthreads();
++
++    // === Task calls (dependency order) ===
++    asm volatile("griddepcontrol.wait;" ::: "memory");
++    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
++    long long C64 = (long long)C;
++    int ct = bid % n_ch_tiles;
++    int rank = bid / n_ch_tiles;
++    int g_ct = (num_bids - ct + n_ch_tiles - 1) / n_ch_tiles;
++    int sub = tid / ct_vec;
++    int v = tid - sub * ct_vec;
++    int c0 = (ct * ct_vec + v) * 8;
++    long long c64 = (long long)c0;
++    int streams = g_ct * n_sub;
++    int _max_0 = (((S + streams - 1) / streams) > (1) ? ((S + streams - 1) / streams) : (1));
++    int L = _max_0;
++    int base = rank * n_sub * L;
++    int t0 = base + sub * L;
++    int _min_0 = ((t0 + L) < (S) ? (t0 + L) : (S));
++    int t_end = _min_0;
++    int active = 0;
++    if (sub < n_sub && c0 < C && t0 < S) {
++        active = 1;
++    }
++    int my_rows = 0;
++    if (active != 0) {
++        my_rows = t_end - t0;
++    }
++    int _max_1 = ((S - base) > (0) ? (S - base) : (0));
++    int _min_1 = ((_max_1) < (L) ? (_max_1) : (L));
++    int rows0 = _min_1;
++    int n_stages = (rows0 + 8 - 1) / 8;
++    int _max_2 = (((S - base) / L) > (0) ? ((S - base) / L) : (0));
++    int _min_2 = ((_max_2) < (n_sub) ? (_max_2) : (n_sub));
++    int n_full = _min_2;
++    int straddle = 0;
++    if (n_full < n_sub) {
++        int _max_3 = ((S - base - n_full * L) > (0) ? (S - base - n_full * L) : (0));
++        int _min_3 = ((_max_3) < (L) ? (_max_3) : (L));
++        straddle = _min_3;
++    }
++    int row_bytes = ct_vec * 16;
++    long long cbase64 = (long long)(ct * ct_vec * 8);
++    int _min_4 = ((n_stages) < (2) ? (n_stages) : (2));
++    #pragma unroll 1
++    for (int k0 = 0; k0 < _min_4; k0++) {
++        int slot0 = k0;
++        if (tid == 0) {
++            int _max_4 = ((L - k0 * 8) > (0) ? (L - k0 * 8) : (0));
++            int _min_5 = ((_max_4) < (8) ? (_max_4) : (8));
++            int full_rows = _min_5;
++            int _max_5 = ((straddle - k0 * 8) > (0) ? (straddle - k0 * 8) : (0));
++            int _min_6 = ((_max_5) < (8) ? (_max_5) : (8));
++            int tail_rows = _min_6;
++            mbarrier_arrive_expect_tx(stage_full_addr + (slot0) * 8, (n_full * full_rows + tail_rows) * row_bytes);
++        }
++        if (tid - sub * ct_vec == 0) {
++            int _max_6 = ((my_rows - k0 * 8) > (0) ? (my_rows - k0 * 8) : (0));
++            int _min_7 = ((_max_6) < (8) ? (_max_6) : (8));
++            int rows_k = _min_7;
++            #pragma unroll 1
++            for (int i = 0; i < rows_k; i++) {
++                int tn = t0 + k0 * 8 + i;
++                long long src = (long long)tn * C64 + cbase64;
++                int saddr = (int)stage_buf_addr + ((slot0 * 8 + i) * 128 + sub * ct_vec) * 16;
++                cp_async_bulk_gmem2smem(saddr, reinterpret_cast<const uint8_t*>(x + src), row_bytes, stage_full_addr + (slot0) * 8);
++            }
++        }
++    }
++    float wr[32];
++    float win[32];
++    #pragma unroll
++    for (int i_1 = 0; i_1 < 32; i_1++) {
++        win[i_1] = 0.0f;
++    }
++    int lo = 0;
++    int hi = num_docs - 1;
++    int doc_start = 0;
++    int doc_end = 0;
++    if (active != 0) {
++        #pragma unroll
++        for (int j = 0; j < 8; j++) {
++            {
++                float4 _v4 = *reinterpret_cast<const float4*>(w + (c64 + (long long)j) * 4);
++                wr[j * 4 + 0] = _v4.x;
++                wr[j * 4 + 1] = _v4.y;
++                wr[j * 4 + 2] = _v4.z;
++                wr[j * 4 + 3] = _v4.w;
++            }
++        }
++        #pragma unroll 1
++        for (int step = 0; step < search_steps; step++) {
++            int mid = lo + hi + 1 >> 1;
++            if (t0 >= cu[mid]) {
++                lo = mid;
++            } else {
++                hi = mid - 1;
++            }
++        }
++        doc_start = cu[lo];
++        doc_end = cu[lo + 1];
++        #pragma unroll
++        for (int kh = 0; kh < 3; kh++) {
++            int tk = t0 - 3 + kh;
++            if (tk >= doc_start) {
++                long long rowk = (long long)tk * C64 + c64;
++                {
++                    const uint4* _vptr_1 = reinterpret_cast<const uint4*>(x + rowk);
++                    uint4 _vld_1[1];
++                    #pragma unroll
++                    for (int _blk = 0; _blk < 1; _blk++) {
++                        _vld_1[_blk] = _vptr_1[_blk];
++                        uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
++                        #pragma unroll
++                        for (int _pair = 0; _pair < 4; _pair++) {
++                            (&win[(kh + 1) * 8 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) << 16);
++                            (&win[(kh + 1) * 8 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) & 0xffff0000u);
++                        }
++                    }
++                }
++            }
++        }
++    }
++    unsigned int pk[4];
++    float out[8];
++    #pragma unroll 1
++    for (int k = 0; k < n_stages; k++) {
++        int slot = k % 2;
++        int parity = k / 2 & 1;
++        mbarrier_wait(stage_full_addr + (slot) * 8, parity);
++        if (active != 0) {
++            int _max_7 = ((my_rows - k * 8) > (0) ? (my_rows - k * 8) : (0));
++            int _min_8 = ((_max_7) < (8) ? (_max_7) : (8));
++            int rows_k_1 = _min_8;
++            int sbase = (int)stage_buf_addr + (slot * 8 * 128 + tid) * 16;
++            #pragma unroll
++            for (int u = 0; u < 8; u++) {
++                if (rows_k_1 > u) {
++                    int tcur = t0 + k * 8 + u;
++                    __int128_t _smem_b128_2;
++                    asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_b128_2) : "r"(sbase + (int)(u * 128 * 16)));
++                    *reinterpret_cast<uint32_t*>(&pk[0]) = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[0];
++                    *reinterpret_cast<uint32_t*>(&pk[(0) + 1]) = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[1];
++                    *reinterpret_cast<uint32_t*>(&pk[(0) + 2]) = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[2];
++                    *reinterpret_cast<uint32_t*>(&pk[(0) + 3]) = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[3];
++                    #pragma unroll
++                    for (int kk = 0; kk < 4; kk++) {
++                        win[u % 4 * 8 + 2 * kk] = __uint_as_float(pk[kk] << 16);
++                        win[u % 4 * 8 + 2 * kk + 1] = __uint_as_float(pk[kk] & 4294901760u);
++                    }
++                    if (tcur >= doc_end) {
++                        int lo2 = 0;
++                        int hi2 = num_docs - 1;
++                        #pragma unroll 1
++                        for (int step2 = 0; step2 < search_steps; step2++) {
++                            int mid2 = lo2 + hi2 + 1 >> 1;
++                            if (tcur >= cu[mid2]) {
++                                lo2 = mid2;
++                            } else {
++                                hi2 = mid2 - 1;
++                            }
++                        }
++                        doc_start = cu[lo2];
++                        doc_end = cu[lo2 + 1];
++                        #pragma unroll
++                        for (int m = 1; m < 4; m++) {
++                            #pragma unroll
++                            for (int j_1 = 0; j_1 < 8; j_1++) {
++                                win[(u % 4 + 4 - m) % 4 * 8 + j_1] = 0.0f;
++                            }
++                        }
++                    }
++                    #pragma unroll
++                    for (int j_2 = 0; j_2 < 8; j_2++) {
++                        float _mul_0;
++                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_0) : "f"(wr[j_2 * 4]), "f"(win[(u % 4 + 1) % 4 * 8 + j_2]));
++                        float _fma_0;
++                        asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_0) : "f"(wr[j_2 * 4 + 1]), "f"(win[(u % 4 + 2) % 4 * 8 + j_2]), "f"(_mul_0));
++                        float _fma_1;
++                        asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_1) : "f"(wr[j_2 * 4 + 2]), "f"(win[(u % 4 + 3) % 4 * 8 + j_2]), "f"(_fma_0));
++                        float _fma_2;
++                        asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_2) : "f"(wr[j_2 * 4 + 3]), "f"(win[u % 4 * 8 + j_2]), "f"(_fma_1));
++                        float e = (-_fma_2) * 1.4426950408889634f;
++                        float _exp2_0 = approx_exp2(e);
++                        float den = 1.0f + _exp2_0;
++                        float _rcp_0 = approx_rcp(den);
++                        out[j_2] = _fma_2 * _rcp_0;
++                    }
++                    long long row = (long long)tcur * C64 + c64;
++                    {
++                        __nv_bfloat162 _pk[4];
++                        _pk[0] = __floats2bfloat162_rn(out[0 + 0], out[0 + 1]);
++                        _pk[1] = __floats2bfloat162_rn(out[0 + 2], out[0 + 3]);
++                        _pk[2] = __floats2bfloat162_rn(out[0 + 4], out[0 + 5]);
++                        _pk[3] = __floats2bfloat162_rn(out[0 + 6], out[0 + 7]);
++                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(y))[row + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
++                    }
++                }
++            }
++        }
++        __syncthreads();
++        int kn = k + 2;
++        if (kn < n_stages) {
++            if (tid == 0) {
++                int _max_8 = ((L - kn * 8) > (0) ? (L - kn * 8) : (0));
++                int _min_9 = ((_max_8) < (8) ? (_max_8) : (8));
++                int full_rows_1 = _min_9;
++                int _max_9 = ((straddle - kn * 8) > (0) ? (straddle - kn * 8) : (0));
++                int _min_10 = ((_max_9) < (8) ? (_max_9) : (8));
++                int tail_rows_1 = _min_10;
++                mbarrier_arrive_expect_tx(stage_full_addr + (slot) * 8, (n_full * full_rows_1 + tail_rows_1) * row_bytes);
++            }
++            if (tid - sub * ct_vec == 0) {
++                int _max_10 = ((my_rows - kn * 8) > (0) ? (my_rows - kn * 8) : (0));
++                int _min_11 = ((_max_10) < (8) ? (_max_10) : (8));
++                int rows_k_2 = _min_11;
++                #pragma unroll 1
++                for (int i_2 = 0; i_2 < rows_k_2; i_2++) {
++                    int tn_1 = t0 + kn * 8 + i_2;
++                    long long src_1 = (long long)tn_1 * C64 + cbase64;
++                    int saddr_1 = (int)stage_buf_addr + ((slot * 8 + i_2) * 128 + sub * ct_vec) * 16;
++                    cp_async_bulk_gmem2smem(saddr_1, reinterpret_cast<const uint8_t*>(x + src_1), row_bytes, stage_full_addr + (slot) * 8);
++                }
++            }
++        }
++    }
++
++    // Cleanup
++    __syncthreads();
++}
++
++} // extern "C"
++
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_fca4a5467470b5e55f31_binding.cu b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_fca4a5467470b5e55f31_binding.cu
+new file mode 100644
+index 00000000000..9a6db43780e
+--- /dev/null
++++ b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_fca4a5467470b5e55f31_binding.cu
+@@ -0,0 +1,128 @@
++/*
++ * Copyright (c) 2026 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Generated by rye-cuda: the tvm-ffi host binding of kernel_cake_causal_conv1d_train_fca4a5467470b5e55f31, for the device source that defines it. Do not edit.
++#include <cuda_runtime.h>
++#include <cuda_bf16.h>
++
++#include "cake_ffi_checks.h"
++
++#include <cstdint>
++
++extern "C" __global__ void kernel_cake_causal_conv1d_train_fca4a5467470b5e55f31(__nv_bfloat16* __restrict__ x, float* __restrict__ w, int* __restrict__ cu, __nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ dx, float* __restrict__ dw, float* __restrict__ partial, int S, int C, int num_docs, int search_steps, int ct_vec, int n_sub, int n_ch_tiles);
++
++namespace cake_binding_kernel_cake_causal_conv1d_train_fca4a5467470b5e55f31 {
++
++using tvm::ffi::TensorView;
++
++constexpr const char* KERNEL_NAME = "kernel_cake_causal_conv1d_train_fca4a5467470b5e55f31";
++
++void CheckCuda(cudaError_t status, const char* what) {
++  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
++      << KERNEL_NAME << ": " << what << " failed: " << cudaGetErrorString(status);
++}
++
++void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t.byte_offset(); }
++
++void Run(TensorView a_x, TensorView a_w, TensorView a_cu, TensorView a_dy, TensorView a_dx, TensorView a_dw, TensorView a_partial, int64_t a_S, int64_t a_C, int64_t a_num_docs, int64_t a_search_steps, int64_t a_ct_vec, int64_t a_n_sub, int64_t a_n_ch_tiles, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
++  DLDevice dev = a_x.device();
++  tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
++  check_cuda_tensor(a_x, "x");
++  check_dtype(a_x, DLDataType{kDLBfloat, 16, 1}, "x");
++  check_cuda_tensor(a_w, "w");
++  check_dtype(a_w, DLDataType{kDLFloat, 32, 1}, "w");
++  check_cuda_tensor(a_cu, "cu");
++  check_dtype(a_cu, DLDataType{kDLInt, 32, 1}, "cu");
++  check_cuda_tensor(a_dy, "dy");
++  check_dtype(a_dy, DLDataType{kDLBfloat, 16, 1}, "dy");
++  check_cuda_tensor(a_dx, "dx");
++  check_dtype(a_dx, DLDataType{kDLBfloat, 16, 1}, "dx");
++  check_cuda_tensor(a_dw, "dw");
++  check_dtype(a_dw, DLDataType{kDLFloat, 32, 1}, "dw");
++  check_cuda_tensor(a_partial, "partial");
++  check_dtype(a_partial, DLDataType{kDLFloat, 32, 1}, "partial");
++  TVM_FFI_CHECK(a_S >= -2147483648LL && a_S <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'S' = " << a_S
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_C >= -2147483648LL && a_C <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'C' = " << a_C
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_num_docs >= -2147483648LL && a_num_docs <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'num_docs' = " << a_num_docs
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_search_steps >= -2147483648LL && a_search_steps <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'search_steps' = " << a_search_steps
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_ct_vec >= -2147483648LL && a_ct_vec <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'ct_vec' = " << a_ct_vec
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_n_sub >= -2147483648LL && a_n_sub <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'n_sub' = " << a_n_sub
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  TVM_FFI_CHECK(a_n_ch_tiles >= -2147483648LL && a_n_ch_tiles <= 2147483647LL, ValueError)
++      << KERNEL_NAME << ": 'n_ch_tiles' = " << a_n_ch_tiles
++      << " is outside the i32 range [-2147483648, 2147483647]";
++  check_contiguous(a_x, "x");
++  check_contiguous(a_w, "w");
++  check_same_device(a_w, a_x, "w", "x");
++  check_contiguous(a_cu, "cu");
++  check_same_device(a_cu, a_x, "cu", "x");
++  check_contiguous(a_dy, "dy");
++  check_same_device(a_dy, a_x, "dy", "x");
++  check_contiguous(a_dx, "dx");
++  check_same_device(a_dx, a_x, "dx", "x");
++  check_contiguous(a_dw, "dw");
++  check_same_device(a_dw, a_x, "dw", "x");
++  check_contiguous(a_partial, "partial");
++  check_same_device(a_partial, a_x, "partial", "x");
++  TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
++      << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
++  TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)
++      << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") exceeds CUDA's limits";
++  cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(dev.device_type, dev.device_id));
++  void* v_x = DataPtr(a_x);
++  void* v_w = DataPtr(a_w);
++  void* v_cu = DataPtr(a_cu);
++  void* v_dy = DataPtr(a_dy);
++  void* v_dx = DataPtr(a_dx);
++  void* v_dw = DataPtr(a_dw);
++  void* v_partial = DataPtr(a_partial);
++  int32_t v_S = static_cast<int32_t>(a_S);
++  int32_t v_C = static_cast<int32_t>(a_C);
++  int32_t v_num_docs = static_cast<int32_t>(a_num_docs);
++  int32_t v_search_steps = static_cast<int32_t>(a_search_steps);
++  int32_t v_ct_vec = static_cast<int32_t>(a_ct_vec);
++  int32_t v_n_sub = static_cast<int32_t>(a_n_sub);
++  int32_t v_n_ch_tiles = static_cast<int32_t>(a_n_ch_tiles);
++  void* kernel_args[] = {&v_x, &v_w, &v_cu, &v_dy, &v_dx, &v_dw, &v_partial, &v_S, &v_C, &v_num_docs, &v_search_steps, &v_ct_vec, &v_n_sub, &v_n_ch_tiles};
++  cudaLaunchConfig_t config{};
++  config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
++  config.blockDim = dim3(128, 1, 1);
++  config.dynamicSmemBytes = 8192;
++  config.stream = stream;
++  cudaLaunchAttribute attrs[1] = {};
++  attrs[0].id = cudaLaunchAttributeCooperative;
++  attrs[0].val.cooperative = 1;
++  config.attrs = attrs;
++  config.numAttrs = 1;
++  CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_causal_conv1d_train_fca4a5467470b5e55f31), kernel_args),
++            "cudaLaunchKernelExC");
++}
++
++}  // namespace cake_binding_kernel_cake_causal_conv1d_train_fca4a5467470b5e55f31
++
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_binding_kernel_cake_causal_conv1d_train_fca4a5467470b5e55f31::Run);
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, cake_ffi_build_cuda_version);
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_fca4a5467470b5e55f31_kernel.cu b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_fca4a5467470b5e55f31_kernel.cu
+new file mode 100644
+index 00000000000..8fb0d8c43db
+--- /dev/null
++++ b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_fca4a5467470b5e55f31_kernel.cu
+@@ -0,0 +1,443 @@
++/*
++ * Copyright (c) 2026 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++typedef signed char        int8_t;
++typedef unsigned char      uint8_t;
++typedef unsigned short     uint16_t;
++typedef unsigned int       uint32_t;
++#if defined(__CUDACC_RTC__)
++typedef unsigned long long uint64_t;
++#else
++typedef unsigned long      uint64_t;
++#endif
++static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
++typedef signed int         int32_t;
++typedef short int          int16_t;
++struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
++static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
++static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
++
++#if defined(__CUDACC_RTC__)
++typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
++#else
++#include <cuda.h>
++#endif
++
++static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++
++__device__ __forceinline__ int make_warp_uniform(int x) {
++    int result;
++    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
++                 : "=r"(result) : "r"(x));
++    return result;
++}
++
++#define CAKE_INF CUDART_INF_F
++#define NUM_MAIN_STAGES 1
++#define SMEM_RED_OFF 0
++#define SMEM_RED_STAGE_BYTES 8192
++#define SMEM_RED_STRIDE 8192
++#define SMEM_TOTAL 8192
++#define THREADS 128
++#define LAUNCH_MIN_BLOCKS 4
++
++#include <math_constants.h>
++#include <cooperative_groups.h>
++
++__device__ __forceinline__ float approx_exp2(float x) {
++    float y;
++    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
++    return y;
++}
++
++
++__device__ __forceinline__ float approx_rcp(float x) {
++    float y;
++    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
++    return y;
++}
++
++extern "C" {
++
++__global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
++kernel_cake_causal_conv1d_train_fca4a5467470b5e55f31(__nv_bfloat16* __restrict__ x, float* __restrict__ w, int* __restrict__ cu, __nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ dx, float* __restrict__ dw, float* __restrict__ partial, int S, int C, int num_docs, int search_steps, int ct_vec, int n_sub, int n_ch_tiles)
++{
++    const int tid = threadIdx.x;
++    const int warp = make_warp_uniform(tid / 32);
++    const int lane = tid % 32;
++
++    extern __shared__ __align__(1024) char smem_raw[];
++    int smem;
++#if __CUDA_ARCH__ == 1000
++    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
++    smem = make_warp_uniform(smem);
++#else
++    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
++#endif
++
++    const int bid = blockIdx.x;
++    const int num_bids = gridDim.x;
++
++    const int cta_rank = 0;
++
++    // Kernel setup ops
++    float* red = reinterpret_cast<float*>(smem_raw + 0);
++    const int red_addr = smem + 0;
++
++    // === Task calls (dependency order) ===
++    asm volatile("griddepcontrol.wait;" ::: "memory");
++    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
++    long long C64 = (long long)C;
++    int ct = bid % n_ch_tiles;
++    int rank = bid / n_ch_tiles;
++    int g_ct = (num_bids - ct + n_ch_tiles - 1) / n_ch_tiles;
++    int sub = tid / ct_vec;
++    int v = tid - sub * ct_vec;
++    int c0 = (ct * ct_vec + v) * 4;
++    int streams = g_ct * n_sub;
++    int L = (S + streams - 1) / streams;
++    int t0 = (rank * n_sub + sub) * L;
++    float acc[16];
++    #pragma unroll
++    for (int i = 0; i < 16; i++) {
++        acc[i] = 0.0f;
++    }
++    if (sub < n_sub && c0 < C && t0 < S) {
++        int _min_0 = ((t0 + L) < (S) ? (t0 + L) : (S));
++        int t_end = _min_0;
++        int _min_1 = ((t_end + 3) < (S + 1) ? (t_end + 3) : (S + 1));
++        int t_stop = _min_1;
++        int _min_2 = ((t_stop) < (S) ? (t_stop) : (S));
++        int t_lim = _min_2;
++        long long c64 = (long long)c0;
++        float wr[16];
++        #pragma unroll
++        for (int j = 0; j < 4; j++) {
++            {
++                float4 _v4 = *reinterpret_cast<const float4*>(w + (c64 + (long long)j) * 4);
++                wr[j * 4 + 0] = _v4.x;
++                wr[j * 4 + 1] = _v4.y;
++                wr[j * 4 + 2] = _v4.z;
++                wr[j * 4 + 3] = _v4.w;
++            }
++        }
++        int lo = 0;
++        int hi = num_docs - 1;
++        #pragma unroll 1
++        for (int step = 0; step < search_steps; step++) {
++            int mid = lo + hi + 1 >> 1;
++            if (t0 >= cu[mid]) {
++                lo = mid;
++            } else {
++                hi = mid - 1;
++            }
++        }
++        int doc_start = cu[lo];
++        int doc_end = cu[lo + 1];
++        float win[16];
++        float pend[16];
++        #pragma unroll
++        for (int i_1 = 0; i_1 < 16; i_1++) {
++            win[i_1] = 0.0f;
++            pend[i_1] = 0.0f;
++        }
++        #pragma unroll
++        for (int k = 0; k < 3; k++) {
++            int tk = t0 - 3 + k;
++            if (tk >= doc_start) {
++                long long rowk = (long long)tk * C64 + c64;
++                {
++                    uint2 _vld_1;
++                    _vld_1 = *reinterpret_cast<const uint2*>(x + rowk);
++                    uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1);
++                    #pragma unroll
++                    for (int _pair = 0; _pair < 2; _pair++) {
++                        (&win[(k + 1) * 4 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) << 16);
++                        (&win[(k + 1) * 4 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) & 0xffff0000u);
++                    }
++                }
++            }
++        }
++        unsigned int pkx[8];
++        unsigned int pkd[8];
++        #pragma unroll
++        for (int u = 0; u < 4; u++) {
++            int tu = t0 + u;
++            if (tu < t_lim) {
++                long long rowu = (long long)tu * C64 + c64;
++                {
++                    uint2 _vld_2;
++                    asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
++                        : "=r"(_vld_2.x), "=r"(_vld_2.y) : "l"((const void*)(x + rowu)), "l"(0x12F0000000000000ULL) : "memory");
++                    uint2* _vdst_2 = reinterpret_cast<uint2*>(&pkx[u * 2]);
++                    *_vdst_2 = _vld_2;
++                }
++                {
++                    uint2 _vld_3;
++                    asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
++                        : "=r"(_vld_3.x), "=r"(_vld_3.y) : "l"((const void*)(dy + rowu)), "l"(0x12F0000000000000ULL) : "memory");
++                    uint2* _vdst_3 = reinterpret_cast<uint2*>(&pkd[u * 2]);
++                    *_vdst_3 = _vld_3;
++                }
++            }
++        }
++        float dyf[4];
++        float dp[4];
++        #pragma unroll 1
++        for (int tb = t0; tb < t_stop; tb += 4) {
++            #pragma unroll
++            for (int u_1 = 0; u_1 < 4; u_1++) {
++                int tcur = tb + u_1;
++                if (tcur < t_stop) {
++                    if (tcur < t_lim) {
++                        #pragma unroll
++                        for (int k_1 = 0; k_1 < 2; k_1++) {
++                            win[u_1 % 4 * 4 + 2 * k_1] = __uint_as_float(pkx[u_1 * 2 + k_1] << 16);
++                            win[u_1 % 4 * 4 + 2 * k_1 + 1] = __uint_as_float(pkx[u_1 * 2 + k_1] & 4294901760u);
++                            dyf[2 * k_1] = __uint_as_float(pkd[u_1 * 2 + k_1] << 16);
++                            dyf[2 * k_1 + 1] = __uint_as_float(pkd[u_1 * 2 + k_1] & 4294901760u);
++                        }
++                    }
++                    if ((u_1 + 1) % 4 == 0) {
++                        #pragma unroll
++                        for (int g = 0; g < 4; g++) {
++                            int tn = tb + (u_1 + 1 - 4 + g) + 4;
++                            if (tn < t_lim) {
++                                long long rown = (long long)tn * C64 + c64;
++                                {
++                                    uint2 _vld_4;
++                                    asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
++                                        : "=r"(_vld_4.x), "=r"(_vld_4.y) : "l"((const void*)(x + rown)), "l"(0x12F0000000000000ULL) : "memory");
++                                    uint2* _vdst_4 = reinterpret_cast<uint2*>(&pkx[(u_1 + 1 - 4 + g) * 2]);
++                                    *_vdst_4 = _vld_4;
++                                }
++                                {
++                                    uint2 _vld_5;
++                                    asm volatile("ld.global.L2::cache_hint.v2.b32 {%0, %1}, [%2], %3;"
++                                        : "=r"(_vld_5.x), "=r"(_vld_5.y) : "l"((const void*)(dy + rown)), "l"(0x12F0000000000000ULL) : "memory");
++                                    uint2* _vdst_5 = reinterpret_cast<uint2*>(&pkd[(u_1 + 1 - 4 + g) * 2]);
++                                    *_vdst_5 = _vld_5;
++                                }
++                            }
++                        }
++                    }
++                    if (tcur >= doc_end) {
++                        #pragma unroll
++                        for (int m = 1; m < 4; m++) {
++                            int tm = tcur - m;
++                            if (tm >= t0 && tm < t_end && tm >= doc_start) {
++                                long long rowm = (long long)tm * C64 + c64;
++                                {
++                                    uint2 _pk2;
++                                    __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
++                                    _pk[0] = __floats2bfloat162_rn(pend[(u_1 % 4 + 4 - m) % 4 * 4 + 0], pend[(u_1 % 4 + 4 - m) % 4 * 4 + 1]);
++                                    _pk[1] = __floats2bfloat162_rn(pend[(u_1 % 4 + 4 - m) % 4 * 4 + 2], pend[(u_1 % 4 + 4 - m) % 4 * 4 + 3]);
++                                    *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(dx))[rowm]) = _pk2;
++                                }
++                            }
++                        }
++                        if (tcur < S) {
++                            int lo2 = 0;
++                            int hi2 = num_docs - 1;
++                            #pragma unroll 1
++                            for (int step2 = 0; step2 < search_steps; step2++) {
++                                int mid2 = lo2 + hi2 + 1 >> 1;
++                                if (tcur >= cu[mid2]) {
++                                    lo2 = mid2;
++                                } else {
++                                    hi2 = mid2 - 1;
++                                }
++                            }
++                            doc_start = cu[lo2];
++                            doc_end = cu[lo2 + 1];
++                        } else {
++                            doc_start = tcur + 4;
++                            doc_end = tcur + 4;
++                        }
++                        #pragma unroll
++                        for (int m_1 = 1; m_1 < 4; m_1++) {
++                            #pragma unroll
++                            for (int j_1 = 0; j_1 < 4; j_1++) {
++                                win[(u_1 % 4 + 4 - m_1) % 4 * 4 + j_1] = 0.0f;
++                            }
++                        }
++                    }
++                    if (tcur < S) {
++                        #pragma unroll
++                        for (int j_2 = 0; j_2 < 4; j_2++) {
++                            float _mul_0;
++                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_0) : "f"(wr[j_2 * 4]), "f"(win[(u_1 % 4 + 1) % 4 * 4 + j_2]));
++                            float _mul_1;
++                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_1) : "f"(wr[j_2 * 4 + 1]), "f"(win[(u_1 % 4 + 2) % 4 * 4 + j_2]));
++                            float _add_0;
++                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_0) : "f"(_mul_0), "f"(_mul_1));
++                            float _mul_2;
++                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_2) : "f"(wr[j_2 * 4 + 2]), "f"(win[(u_1 % 4 + 3) % 4 * 4 + j_2]));
++                            float _add_1;
++                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_1) : "f"(_add_0), "f"(_mul_2));
++                            float _mul_3;
++                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_3) : "f"(wr[j_2 * 4 + 3]), "f"(win[u_1 % 4 * 4 + j_2]));
++                            float _add_2;
++                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_2) : "f"(_add_1), "f"(_mul_3));
++                            __nv_bfloat16 _cvt_bf16_0 = (__nv_bfloat16)_add_2;
++                            float _cvt_f32_0 = (float)_cvt_bf16_0;
++                            float p = _cvt_f32_0;
++                            float e = (-p) * 1.4426950408889634f;
++                            float _exp2_0 = approx_exp2(e);
++                            float den = 1.0f + _exp2_0;
++                            float _rcp_0 = approx_rcp(den);
++                            float sg = _rcp_0;
++                            float g_1 = sg * __fmaf_rn(p, 1.0f - sg, 1.0f);
++                            dp[j_2] = dyf[j_2] * g_1;
++                        }
++                        if (tcur < t_end) {
++                            #pragma unroll
++                            for (int j_3 = 0; j_3 < 4; j_3++) {
++                                #pragma unroll
++                                for (int k_2 = 0; k_2 < 4; k_2++) {
++                                    acc[j_3 * 4 + k_2] = __fmaf_rn(dp[j_3], win[(u_1 % 4 + 1 + k_2) % 4 * 4 + j_3], acc[j_3 * 4 + k_2]);
++                                }
++                            }
++                        }
++                        #pragma unroll
++                        for (int j_4 = 0; j_4 < 4; j_4++) {
++                            pend[(u_1 % 4 + 1) % 4 * 4 + j_4] = __fmaf_rn(wr[j_4 * 4], dp[j_4], pend[(u_1 % 4 + 1) % 4 * 4 + j_4]);
++                            pend[(u_1 % 4 + 2) % 4 * 4 + j_4] = __fmaf_rn(wr[j_4 * 4 + 1], dp[j_4], pend[(u_1 % 4 + 2) % 4 * 4 + j_4]);
++                            pend[(u_1 % 4 + 3) % 4 * 4 + j_4] = __fmaf_rn(wr[j_4 * 4 + 2], dp[j_4], pend[(u_1 % 4 + 3) % 4 * 4 + j_4]);
++                            pend[u_1 % 4 * 4 + j_4] = wr[j_4 * 4 + 3] * dp[j_4];
++                        }
++                        int t3 = tcur - 3;
++                        if (t3 >= t0 && t3 >= doc_start) {
++                            long long row3 = (long long)t3 * C64 + c64;
++                            {
++                                uint2 _pk2;
++                                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
++                                _pk[0] = __floats2bfloat162_rn(pend[(u_1 % 4 + 1) % 4 * 4 + 0], pend[(u_1 % 4 + 1) % 4 * 4 + 1]);
++                                _pk[1] = __floats2bfloat162_rn(pend[(u_1 % 4 + 1) % 4 * 4 + 2], pend[(u_1 % 4 + 1) % 4 * 4 + 3]);
++                                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(dx))[row3]) = _pk2;
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++    #pragma unroll
++    for (int i_2 = 0; i_2 < 16; i_2++) {
++        red[tid * 16 + i_2] = acc[i_2];
++    }
++    __syncthreads();
++    int c0_0 = (ct * ct_vec + v) * 4;
++    if (sub == 0 && c0_0 < C) {
++        float tot[16];
++        #pragma unroll
++        for (int i_3 = 0; i_3 < 16; i_3++) {
++            tot[i_3] = red[v * 16 + i_3];
++        }
++        #pragma unroll 1
++        for (int s = 1; s < n_sub; s++) {
++            #pragma unroll
++            for (int i_4 = 0; i_4 < 16; i_4++) {
++                tot[i_4] = tot[i_4] + red[(s * ct_vec + v) * 16 + i_4];
++            }
++        }
++        #pragma unroll
++        for (int j_5 = 0; j_5 < 4; j_5++) {
++            long long pidx = ((long long)rank * C64 + (long long)c0_0 + (long long)j_5) * 4;
++            {
++                float4 _v4 = make_float4(tot[j_5 * 4 + 0], tot[j_5 * 4 + 1], tot[j_5 * 4 + 2], tot[j_5 * 4 + 3]);
++                *reinterpret_cast<float4*>(partial + pidx) = _v4;
++            }
++        }
++    }
++    cooperative_groups::this_grid().sync();
++    int lane_1 = tid & 31;
++    int wch = tid >> 5;
++    int n_groups = (C + 4 - 1) / 4;
++    #pragma unroll 1
++    for (int cg = bid; cg < n_groups; cg += num_bids) {
++        int ch = cg * 4 + wch;
++        if (ch < C) {
++            int ctc = ch / 4 / ct_vec;
++            int G = (num_bids - ctc + n_ch_tiles - 1) / n_ch_tiles;
++            int n_trips = G + 31 >> 5;
++            float a4[4];
++            #pragma unroll
++            for (int e_1 = 0; e_1 < 4; e_1++) {
++                a4[e_1] = 0.0f;
++            }
++            #pragma unroll 4
++            for (int k_3 = 0; k_3 < n_trips; k_3++) {
++                int r = lane_1 + (k_3 << 5);
++                if (r < G) {
++                    float _vec_load_0[4];
++                    {
++                        float4 _v4 = *reinterpret_cast<const float4*>(partial + ((long long)r * C64 + (long long)ch) * 4);
++                        _vec_load_0[0 + 0] = _v4.x;
++                        _vec_load_0[0 + 1] = _v4.y;
++                        _vec_load_0[0 + 2] = _v4.z;
++                        _vec_load_0[0 + 3] = _v4.w;
++                    }
++                    #pragma unroll
++                    for (int e_2 = 0; e_2 < 4; e_2++) {
++                        a4[e_2] = a4[e_2] + _vec_load_0[e_2];
++                    }
++                }
++            }
++            #pragma unroll
++            for (int e_3 = 0; e_3 < 4; e_3++) {
++                float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, a4[e_3], 16);
++                float other = _shfl_xor_0;
++                a4[e_3] = a4[e_3] + other;
++            }
++            #pragma unroll
++            for (int e_4 = 0; e_4 < 4; e_4++) {
++                float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, a4[e_4], 8);
++                float other_1 = _shfl_xor_1;
++                a4[e_4] = a4[e_4] + other_1;
++            }
++            #pragma unroll
++            for (int e_5 = 0; e_5 < 4; e_5++) {
++                float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, a4[e_5], 4);
++                float other_2 = _shfl_xor_2;
++                a4[e_5] = a4[e_5] + other_2;
++            }
++            #pragma unroll
++            for (int e_6 = 0; e_6 < 4; e_6++) {
++                float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, a4[e_6], 2);
++                float other_3 = _shfl_xor_3;
++                a4[e_6] = a4[e_6] + other_3;
++            }
++            #pragma unroll
++            for (int e_7 = 0; e_7 < 4; e_7++) {
++                float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, a4[e_7], 1);
++                float other_4 = _shfl_xor_4;
++                a4[e_7] = a4[e_7] + other_4;
++            }
++            if (lane_1 == 0) {
++                {
++                    float4 _v4 = make_float4(a4[0 + 0], a4[0 + 1], a4[0 + 2], a4[0 + 3]);
++                    *reinterpret_cast<float4*>(dw + (long long)ch * 4) = _v4;
++                }
++            }
++        }
++    }
++}
++
++} // extern "C"
++
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_ffi_checks.h b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_ffi_checks.h
+new file mode 100644
+index 00000000000..129288f9432
+--- /dev/null
++++ b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_ffi_checks.h
+@@ -0,0 +1,89 @@
++/*
++ * Copyright (c) 2026 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Host surface of the generated Cake launchers (``*_binding.cu``) for a package built without
++// FlashInfer's csrc: the TVM-FFI / DLPack headers the launchers use, the named tensor-argument
++// checks and the CUDA runtime version the library was compiled against.
++#pragma once
++
++#include <dlpack/dlpack.h>
++#include <tvm/ffi/container/tensor.h>
++#include <tvm/ffi/container/shape.h>
++#include <tvm/ffi/dtype.h>
++#include <tvm/ffi/error.h>
++#include <tvm/ffi/extra/c_env_api.h>
++#include <tvm/ffi/extra/cuda/base.h>
++#include <tvm/ffi/extra/cuda/device_guard.h>
++#include <tvm/ffi/function.h>
++#include <cuda_runtime_api.h>
++
++inline void check_cuda_tensor(const tvm::ffi::TensorView& t, const char* name) {
++  TVM_FFI_CHECK(t.device().device_type == kDLCUDA, ValueError)
++      << name << " must be a CUDA tensor, got device_type=" << static_cast<int>(t.device().device_type);
++}
++
++inline void check_dtype(const tvm::ffi::TensorView& t, DLDataType expected, const char* name) {
++  DLDataType d = t.dtype();
++  TVM_FFI_CHECK(d.code == expected.code && d.bits == expected.bits && d.lanes == expected.lanes, TypeError)
++      << name << " dtype mismatch: expected DLDataType(code=" << static_cast<int>(expected.code)
++      << ", bits=" << static_cast<int>(expected.bits) << ", lanes=" << static_cast<int>(expected.lanes)
++      << "), got (code=" << static_cast<int>(d.code) << ", bits=" << static_cast<int>(d.bits)
++      << ", lanes=" << static_cast<int>(d.lanes) << ")";
++}
++
++inline void check_contiguous(const tvm::ffi::TensorView& t, const char* name) {
++  TVM_FFI_CHECK(t.IsContiguous(), ValueError) << name << " must be contiguous";
++}
++
++inline void check_same_device(const tvm::ffi::TensorView& t, const tvm::ffi::TensorView& reference,
++                              const char* name, const char* reference_name) {
++  TVM_FFI_CHECK(t.device().device_type == reference.device().device_type &&
++                    t.device().device_id == reference.device().device_id,
++                ValueError)
++      << name << " must be on the same device as " << reference_name << ": got device_type="
++      << static_cast<int>(t.device().device_type) << " id=" << t.device().device_id
++      << " versus device_type=" << static_cast<int>(reference.device().device_type)
++      << " id=" << reference.device().device_id;
++}
++
++// Require the dimensions above the last `trailing` dimensions to form one dense
++// row-major chain, so they can be folded into a single logical dimension whose
++// step is stride(-(trailing + 1)). Shape products are stride-independent, so
++// this verifies the physical layout instead of inventing a folded stride.
++inline void check_dense_leading_dims(const tvm::ffi::TensorView& t, int trailing, const char* name) {
++  TVM_FFI_CHECK(trailing > 0 && t.ndim() >= trailing, ValueError)
++      << name << " cannot fold leading dimensions above " << trailing << " trailing dims from ndim=" << t.ndim();
++  int outer_last = t.ndim() - trailing - 1;
++  if (outer_last <= 0) {
++    return;
++  }
++  int64_t step = t.stride(outer_last);
++  TVM_FFI_CHECK(step > 0, ValueError) << name << " physical strides must be positive";
++  int64_t expected = step;
++  for (int axis = outer_last - 1; axis >= 0; --axis) {
++    expected *= t.size(axis + 1);
++    if (t.size(axis) > 1) {
++      TVM_FFI_CHECK(t.stride(axis) == expected, ValueError)
++          << name << " leading dims are not physically foldable above " << trailing
++          << " trailing dims: stride(" << axis << ")=" << t.stride(axis) << ", expected " << expected;
++    }
++  }
++}
++
++// The CUDA runtime this library was compiled against (``CUDART_VERSION``, e.g. 13000 for 13.0); every
++// binding exports it as ``build_cuda_version`` so the package loader can compare it with the prebuilt
++// sidecar before the first launch.
++inline int64_t cake_ffi_build_cuda_version() { return CUDART_VERSION; }
+diff --git a/pyproject.toml b/pyproject.toml
+index 950f545fa97..8a186819345 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -81,6 +81,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
+ # Cake-exported packages (flashinfer-ai/flashinfer#6553): the generated csrc tree plus the
+ # build manifest (build.json) their cake_build loader reads; prebuilt aot/ libraries never ship.
+ "flashinfer.cake_rmsnorm_train_backend" = ["csrc/**", "build.json"]
++"flashinfer.cake_causal_conv1d_train_backend" = ["csrc/**", "build.json"]
+ "flashinfer.experimental.cake_dsa_train" = ["csrc/**", "build.json"]
+ "flashinfer.experimental.cake_kda_train" = ["csrc/**", "build.json"]
+ "flashinfer.experimental.cake_lm_head_loss" = ["csrc/**", "build.json"]
+diff --git a/scripts/check_cake_build_manifests.py b/scripts/check_cake_build_manifests.py
+index c132196c5cd..a2ca507bb89 100755
+--- a/scripts/check_cake_build_manifests.py
++++ b/scripts/check_cake_build_manifests.py
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env python3
+ """Check the build manifests of the Cake-exported packages (flashinfer-ai/flashinfer#6553).
+ 
+-Seven packages ship generated CUDA sources under ``csrc/`` together with a build
++Eight packages ship generated CUDA sources under ``csrc/`` together with a build
+ manifest ``build.json`` (schema ``cake-build/1``) -- the only record of what to
+ compile -- and a byte-identical ``cake_build.py`` loader that loads the prebuilt
+ library under ``aot/`` when present and otherwise JIT-builds the manifest entry
+@@ -223,10 +223,10 @@ class Package:
+     refs: Callable[[Path, str], set[str]]
+ 
+ 
+-# dsa_train, kda_train, dsa_indexer and the rmsnorm backend are read with the generic walker (a mapping
++# dsa_train, kda_train, dsa_indexer, the rmsnorm and the causal conv1d backends are read with the generic walker (a mapping
+ # carrying ``library`` under an ``arches`` / ``arch`` scope).  Their exporters' registry shapes
+-# fit it: a record carries ``arches`` and either ``library`` itself (dsa_indexer PROGRAMS, rmsnorm
+-# MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
++# fit it: a record carries ``arches`` and either ``library`` itself (dsa_indexer PROGRAMS, rmsnorm and
++# causal conv1d MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
+ PACKAGES: tuple[Package, ...] = (
+     Package(
+         "flashinfer.cake_rmsnorm_train_backend",
+@@ -234,6 +234,12 @@ class Package:
+         "cake_jit.py",
+         refs_generic,
+     ),
++    Package(
++        "flashinfer.cake_causal_conv1d_train_backend",
++        "flashinfer/cake_causal_conv1d_train_backend",
++        "cake_jit.py",
++        refs_generic,
++    ),
+     Package(
+         "flashinfer.experimental.cake_dsa_train",
+         "flashinfer/experimental/cake_dsa_train",
+diff --git a/tests/norm/test_cake_causal_conv1d_train.py b/tests/norm/test_cake_causal_conv1d_train.py
+new file mode 100644
+index 00000000000..114a428a78c
+--- /dev/null
++++ b/tests/norm/test_cake_causal_conv1d_train.py
+@@ -0,0 +1,698 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++
++Tests for the Cake packed width-4 depthwise causal convolution + SiLU training
++forward / backward (SM100 / SM103 / SM107).
++
++Every kernel output is compared with a plain-torch reference of the same math
++in FP32 with document-local shifts (``dweight`` accumulated in FP64): BF16
++``y`` and ``dx`` within ``atol 1e-3 + rtol 2^-7`` (one BF16 ulp) with no
++element outside, FP32 ``dweight`` within ``atol 5e-2 + rtol 1e-4``.  The
++matrix covers token counts 1, 5, 63, 64, 65, 1000 and 4097 with documents of
++lengths 1, 2 and 3 and empty documents before, between and after others,
++channel counts 128, 136, 256, 384, 512, 1024 and 2048, the ``[1, S, C]``
++layout, document isolation (a change inside one document moves no output of
++another), bitwise reproducibility of ``dweight``, CUDA Graph capture and
++replay of changing shapes, argument validation, the workspace helpers and one
++``S x C > 2^31`` case guarded by free device memory.
++
++This suite exercises the backend package alone: it names the package once,
++through ``tests.test_helpers.cake_package``, and imports nothing else from
++flashinfer, so a build that vendors the package under another import path
++runs it unchanged after pointing that table entry at its package.  The
++``flashinfer.cake_causal_conv1d_train`` facade and the ``flashinfer``
++top-level exposure are covered by ``test_cake_causal_conv1d_train_api.py``.
++"""
++
++from __future__ import annotations
++
++import re
++from pathlib import Path
++
++import pytest
++import torch
++
++from tests.test_helpers.cake_package import cake_package
++
++pkg = cake_package("cake_causal_conv1d_train")
++cake_build = cake_package("cake_causal_conv1d_train", "cake_build")
++loader = cake_package("cake_causal_conv1d_train", "cake_jit")
++cake_causal_conv1d = pkg.cake_causal_conv1d
++cake_causal_conv1d_train_backward = pkg.cake_causal_conv1d_train_backward
++cake_causal_conv1d_train_backward_workspace = (
++    pkg.cake_causal_conv1d_train_backward_workspace
++)
++cake_causal_conv1d_train_backward_workspace_bytes = (
++    pkg.cake_causal_conv1d_train_backward_workspace_bytes
++)
++cake_causal_conv1d_train_forward = pkg.cake_causal_conv1d_train_forward
++is_cake_causal_conv1d_train_supported = pkg.is_cake_causal_conv1d_train_supported
++
++SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
++WIDTH = 4
++# The contract's tolerances: y / dx within one BF16 ulp of the FP32 reference
++# (no element outside), dweight within atol 5e-2 + rtol 1e-4 of the FP64 one.
++Y_ATOL, Y_RTOL = 1e-3, 2**-7
++DW_ATOL, DW_RTOL = 5e-2, 1e-4
++# The reference's token block (its FP32 temporaries stay bounded at S x C > 2^31).
++BLOCK = 8192
++# Elements compared per chunk (256 MiB of FP32 per temporary).
++COMPARE_CHUNK = 2**26
++# The perf packing: floor(fraction x S) tokens per document, nudged off a
++# multiple of 64, the rest in the fourth document.
++PERF_FRACTIONS = (0.37, 0.29, 0.21)
++SEED = 2033
++
++# (S, C, documents): documents of lengths 1, 2 and 3; empty documents before,
++# between and after others; C = 136 (forward: 17 channel vectors, 7 sub-tiles of 17
++# threads, 9 threads idle); boundaries inside a sub-tile and at S = 64 and 65;
++# the perf packing at S = 1000; 38 documents (a six-step device-side search).
++CASES = (
++    (1, 128, None),
++    (5, 136, (2, 0, 3)),
++    (63, 384, (1, 2, 3, 57)),
++    (64, 128, None),
++    (65, 256, (64, 1)),
++    (1000, 512, "perf"),
++    (1000, 256, (27,) * 37 + (1,)),
++    (4097, 1024, (0, 4097, 0)),
++    (4097, 2048, (1000, 0, 3, 3094)),
++)
++LARGE_CASE = (262401, 8192, "perf")
++LARGE_CASE_FREE_BYTES = 40 * 2**30
++GRAPH_CASES = (
++    (65, 256, (64, 1)),
++    (5, 136, (2, 0, 3)),
++    (1000, 512, "perf"),
++    (4097, 2048, (1000, 0, 3, 3094)),
++    (63, 384, (1, 2, 3, 57)),
++)
++GRAPH_REPLAYS = 4
++
++
++def _device() -> torch.device:
++    return torch.device("cuda:0")
++
++
++def _capability() -> tuple[int, int]:
++    return torch.cuda.get_device_capability(_device())
++
++
++def _supported() -> bool:
++    return (
++        torch.cuda.is_available()
++        and _capability() in SUPPORTED_CAPABILITIES
++        and is_cake_causal_conv1d_train_supported(_device())
++    )
++
++
++pytestmark = pytest.mark.skipif(
++    not _supported(),
++    reason="cake_causal_conv1d_train needs an SM100 / SM103 / SM107 device with exported routes",
++)
++
++
++@pytest.fixture(autouse=True, scope="module")
++def warmup_jit():
++    # Build the local architecture's libraries that have no prebuilt file before
++    # the first test, through the spec objects the package's loader itself builds
++    # on first use (``cake_build.load_library``); a prebuilt or already cached
++    # library loads without compiling.
++    if _supported():
++        arch = loader.arch_for_capability(_capability())
++        for spec in loader.specs_for_arch(arch):
++            spec.build_and_load()
++    yield
++
++
++def _case_id(case) -> str:
++    S, C, docs = case
++    tag = "one" if docs is None else ("perf" if docs == "perf" else f"{len(docs)}docs")
++    return f"S{S}-C{C}-{tag}"
++
++
++def _generator(*keys: int) -> torch.Generator:
++    seed = SEED
++    for key in keys:
++        seed = (seed * 1_000_003 + int(key)) % (2**31 - 1)
++    return torch.Generator(device=_device()).manual_seed(seed)
++
++
++def doc_lengths(S: int, docs) -> tuple[int, ...]:
++    if docs is None:
++        return (S,)
++    if docs == "perf":
++        lens = []
++        for fraction in PERF_FRACTIONS:
++            n = int(fraction * S)
++            if n % 64 == 0:
++                n -= 1
++            lens.append(n)
++        lens.append(S - sum(lens))
++        assert all(n > 0 for n in lens), f"S={S} is too short for the perf packing"
++        return tuple(lens)
++    lens = tuple(int(n) for n in docs)
++    assert sum(lens) == S and all(n >= 0 for n in lens)
++    return lens
++
++
++def _cu_seqlens(S: int, docs) -> torch.Tensor:
++    lens = doc_lengths(S, docs)
++    return torch.tensor(
++        [0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32, device=_device()
++    )
++
++
++def _doc_ids(S: int, cu: torch.Tensor) -> torch.Tensor:
++    """The document of each token as the kernels find it: the largest ``d`` with ``cu[d] <= t``."""
++
++    return torch.bucketize(torch.arange(S, device=cu.device), cu[1:].long(), right=True)
++
++
++def _inputs(S: int, C: int, docs, *, key: int = 0):
++    generator = _generator(S, C, key)
++    x = torch.randn(
++        S, C, dtype=torch.float32, device=_device(), generator=generator
++    ).to(torch.bfloat16)
++    # N(0, 0.25): variance 0.25, standard deviation 0.5.
++    w = 0.5 * torch.randn(
++        C, WIDTH, dtype=torch.float32, device=_device(), generator=generator
++    )
++    dy = torch.randn(
++        S, C, dtype=torch.float32, device=_device(), generator=generator
++    ).to(torch.bfloat16)
++    cu = _cu_seqlens(S, docs)
++    return x, w, cu, dy
++
++
++def _shift_down(v: torch.Tensor, ids: torch.Tensor, d: int) -> torch.Tensor:
++    """``out[t] = v[t - d]`` where token ``t - d`` exists and is of token ``t``'s document, else 0."""
++
++    out = torch.zeros_like(v)
++    if d == 0:
++        return v.clone()
++    if d < v.shape[0]:
++        same = (ids[d:] == ids[:-d]).unsqueeze(1)
++        out[d:] = torch.where(same, v[:-d], 0.0)
++    return out
++
++
++def _shift_up(v: torch.Tensor, ids: torch.Tensor, d: int) -> torch.Tensor:
++    """``out[t] = v[t + d]`` where token ``t + d`` exists and is of token ``t``'s document, else 0."""
++
++    out = torch.zeros_like(v)
++    if d == 0:
++        return v.clone()
++    if d < v.shape[0]:
++        same = (ids[:-d] == ids[d:]).unsqueeze(1)
++        out[:-d] = torch.where(same, v[d:], 0.0)
++    return out
++
++
++def _preactivation(x: torch.Tensor, ids: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
++    """``pre`` of a window of FP32 rows ``x`` in tap order 0..3 (tap ``k`` multiplies ``x[t - 3 + k]``)."""
++
++    pre = torch.zeros_like(x)
++    for k in range(WIDTH):
++        pre = pre + w[:, k] * _shift_down(x, ids, WIDTH - 1 - k)
++    return pre
++
++
++def reference_forward(
++    x: torch.Tensor, w: torch.Tensor, cu: torch.Tensor
++) -> torch.Tensor:
++    S = x.shape[0]
++    ids = _doc_ids(S, cu)
++    y = torch.empty_like(x)
++    for a in range(0, S, BLOCK):
++        b = min(a + BLOCK, S)
++        lo = max(a - (WIDTH - 1), 0)
++        pre = _preactivation(x[lo:b].float(), ids[lo:b], w)[a - lo :]
++        y[a:b] = (pre * torch.sigmoid(pre)).bfloat16()
++    return y
++
++
++def reference_backward(
++    x: torch.Tensor, w: torch.Tensor, cu: torch.Tensor, dy: torch.Tensor
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """``dx`` (BF16) and ``dweight`` accumulated in FP64 (policy A: the SiLU derivative of the BF16-rounded
++    preactivation)."""
++
++    S, C = x.shape
++    ids = _doc_ids(S, cu)
++    dx = torch.empty_like(x)
++    dw = torch.zeros(C, WIDTH, device=x.device, dtype=torch.float64)
++    for a in range(0, S, BLOCK):
++        b = min(a + BLOCK, S)
++        lo, hi = max(a - (WIDTH - 1), 0), min(b + (WIDTH - 1), S)
++        xf, win = x[lo:hi].float(), ids[lo:hi]
++        p = _preactivation(xf, win, w).bfloat16().float()
++        s = torch.sigmoid(p)
++        dpre = dy[lo:hi].float() * (s * (1.0 + p * (1.0 - s)))
++        dxw = torch.zeros_like(dpre)
++        for k in range(WIDTH):
++            dxw = dxw + w[:, k] * _shift_up(dpre, win, WIDTH - 1 - k)
++        dx[a:b] = dxw[a - lo : b - lo].bfloat16()
++        rows = slice(a - lo, b - lo)
++        for k in range(WIDTH):
++            xs = _shift_down(xf, win, WIDTH - 1 - k)[rows].double()
++            dw[:, k] += (dpre[rows].double() * xs).sum(dim=0)
++    return dx, dw
++
++
++def _assert_within(
++    actual: torch.Tensor,
++    expected: torch.Tensor,
++    *,
++    atol: float,
++    rtol: float,
++    label: str,
++) -> None:
++    """No element outside ``atol + rtol |expected|`` (an exact mismatch count of zero)."""
++
++    assert tuple(actual.shape) == tuple(expected.shape), label
++    flat_actual, flat_expected = actual.reshape(-1), expected.reshape(-1)
++    count, first = 0, None
++    # Chunked so the FP32 temporaries of the S x C > 2^31 case stay bounded.
++    for start in range(0, flat_actual.numel(), COMPARE_CHUNK):
++        a = flat_actual[start : start + COMPARE_CHUNK].float()
++        b = flat_expected[start : start + COMPARE_CHUNK].float()
++        assert torch.isfinite(a).all(), f"{label} has non-finite values"
++        outside = (a - b).abs() > atol + rtol * b.abs()
++        chunk_count = int(outside.sum().item())
++        if chunk_count and first is None:
++            index = int(outside.nonzero()[0].item())
++            first = (start + index, a[index].item(), b[index].item())
++        count += chunk_count
++    if count:
++        raise AssertionError(
++            f"{label}: {count} of {flat_actual.numel()} elements outside atol={atol} rtol={rtol}; first at flat "
++            f"index {first[0]}: got {first[1]!r}, expected {first[2]!r}"
++        )
++
++
++def _check(
++    S: int, C: int, docs, *, x=None, w=None, cu=None, dy=None, label: str = ""
++) -> None:
++    if x is None:
++        x, w, cu, dy = _inputs(S, C, docs)
++    label = label or f"S={S} C={C} docs={docs}"
++    y = cake_causal_conv1d_train_forward(x, w, cu)
++    assert (
++        y.dtype == torch.bfloat16
++        and tuple(y.shape) == tuple(x.shape)
++        and y.is_contiguous()
++    )
++    _assert_within(
++        y, reference_forward(x, w, cu), atol=Y_ATOL, rtol=Y_RTOL, label=f"y {label}"
++    )
++    dx, dw = cake_causal_conv1d_train_backward(x, w, cu, dy)
++    assert (
++        dx.dtype == torch.bfloat16
++        and tuple(dx.shape) == tuple(x.shape)
++        and dx.is_contiguous()
++    )
++    assert (
++        dw.dtype == torch.float32
++        and tuple(dw.shape) == (C, WIDTH)
++        and dw.is_contiguous()
++    )
++    dx_ref, dw_ref = reference_backward(x, w, cu, dy)
++    _assert_within(dx, dx_ref, atol=Y_ATOL, rtol=Y_RTOL, label=f"dx {label}")
++    _assert_within(
++        dw, dw_ref.float(), atol=DW_ATOL, rtol=DW_RTOL, label=f"dweight {label}"
++    )
++
++
++@pytest.mark.parametrize("case", CASES, ids=_case_id)
++def test_forward_backward_match_reference(case) -> None:
++    _check(*case)
++
++
++def test_large_case_over_two_to_the_31_elements() -> None:
++    free, _total = torch.cuda.mem_get_info(_device())
++    if free < LARGE_CASE_FREE_BYTES:
++        pytest.skip(
++            f"needs {LARGE_CASE_FREE_BYTES >> 30} GiB free, {free >> 30} GiB available"
++        )
++    S, C, docs = LARGE_CASE
++    assert S * C > 2**31
++    _check(S, C, docs)
++    torch.cuda.empty_cache()
++
++
++@pytest.mark.parametrize(
++    "case", ((65, 256, (64, 1)), (1000, 512, "perf")), ids=_case_id
++)
++def test_batched_layout_matches_the_packed_one(case) -> None:
++    """``[1, S, C]`` inputs produce the same bits as ``[S, C]`` inputs, with ``[1, S, C]`` outputs."""
++
++    S, C, docs = case
++    x, w, cu, dy = _inputs(S, C, docs)
++    y = cake_causal_conv1d_train_forward(x, w, cu)
++    dx, dw = cake_causal_conv1d_train_backward(x, w, cu, dy)
++    y3 = cake_causal_conv1d_train_forward(x.unsqueeze(0), w, cu)
++    dx3, dw3 = cake_causal_conv1d_train_backward(x.unsqueeze(0), w, cu, dy.unsqueeze(0))
++    assert tuple(y3.shape) == (1, S, C) and tuple(dx3.shape) == (1, S, C)
++    assert torch.equal(y3[0], y) and torch.equal(dx3[0], dx) and torch.equal(dw3, dw)
++
++
++def test_document_isolation() -> None:
++    """A change inside one document moves no ``y`` or ``dx`` element of another document."""
++
++    S, C, docs = 1000, 256, (301, 0, 257, 3, 439)
++    x, w, cu, dy = _inputs(S, C, docs)
++    lens = doc_lengths(S, docs)
++    starts = [0, *torch.tensor(lens).cumsum(0).tolist()]
++    y = cake_causal_conv1d_train_forward(x, w, cu)
++    dx, _dw = cake_causal_conv1d_train_backward(x, w, cu, dy)
++    # Perturb every token of document 2 (the 257-token one) in x and dy.
++    a, b = starts[2], starts[3]
++    x2 = x.clone()
++    x2[a:b] = (x2[a:b].float() * -1.5 + 0.25).to(torch.bfloat16)
++    dy2 = dy.clone()
++    dy2[a:b] = (dy2[a:b].float() * 2.0).to(torch.bfloat16)
++    y2 = cake_causal_conv1d_train_forward(x2, w, cu)
++    dx2, _dw2 = cake_causal_conv1d_train_backward(x2, w, cu, dy2)
++    assert not torch.equal(y2[a:b], y[a:b]), "the perturbed document did not change"
++    outside = torch.ones(S, dtype=torch.bool, device=_device())
++    outside[a:b] = False
++    assert torch.equal(y2[outside], y[outside]), "y of another document changed"
++    assert torch.equal(dx2[outside], dx[outside]), "dx of another document changed"
++    _check(S, C, docs, x=x2, w=w, cu=cu, dy=dy2, label="perturbed documents")
++
++
++@pytest.mark.parametrize(
++    "case", ((1000, 512, "perf"), (4097, 2048, (1000, 0, 3, 3094))), ids=_case_id
++)
++def test_dweight_is_bitwise_identical_over_three_launches(case) -> None:
++    S, C, docs = case
++    x, w, cu, dy = _inputs(S, C, docs)
++    workspace = cake_causal_conv1d_train_backward_workspace(S, C, _device())
++    results = []
++    for _repeat in range(3):
++        dx = torch.full((S, C), float("nan"), dtype=torch.bfloat16, device=_device())
++        dw = torch.full((C, WIDTH), float("nan"), dtype=torch.float32, device=_device())
++        # Poison the workspace: the kernel must rewrite every partial row it reduces.
++        workspace.view(torch.float32).fill_(float("nan"))
++        cake_causal_conv1d_train_backward(
++            x, w, cu, dy, workspace=workspace, dx=dx, dweight=dw
++        )
++        torch.cuda.synchronize()
++        results.append((dx.clone(), dw.clone()))
++    fresh_dx, fresh_dw = cake_causal_conv1d_train_backward(x, w, cu, dy)
++    for dx, dw in results[1:]:
++        assert torch.equal(dx, results[0][0])
++        assert torch.equal(dw, results[0][1])
++    assert torch.equal(fresh_dw, results[0][1]), "a fresh workspace changed dweight"
++    assert torch.equal(fresh_dx, results[0][0])
++    assert torch.isfinite(results[0][1]).all()
++
++
++def test_preallocated_outputs_are_written_in_place() -> None:
++    S, C, docs = 1000, 512, "perf"
++    x, w, cu, dy = _inputs(S, C, docs)
++    y_ref = cake_causal_conv1d_train_forward(x, w, cu)
++    dx_ref, dw_ref = cake_causal_conv1d_train_backward(x, w, cu, dy)
++    out = torch.full((S, C), float("nan"), dtype=torch.bfloat16, device=_device())
++    dx = torch.full((S, C), float("nan"), dtype=torch.bfloat16, device=_device())
++    dw = torch.full((C, WIDTH), float("nan"), dtype=torch.float32, device=_device())
++    assert cake_causal_conv1d_train_forward(x, w, cu, out=out) is out
++    got = cake_causal_conv1d_train_backward(x, w, cu, dy, dx=dx, dweight=dw)
++    assert got[0] is dx and got[1] is dw
++    assert (
++        torch.equal(out, y_ref) and torch.equal(dx, dx_ref) and torch.equal(dw, dw_ref)
++    )
++
++
++def test_cuda_graph_replays_match_eager() -> None:
++    """One forward + backward graph per shape, replayed four times each (twenty replays), equals eager."""
++
++    device = _device()
++    captured = []
++    for S, C, docs in GRAPH_CASES:
++        x, w, cu, dy = _inputs(S, C, docs, key=7)
++        eager_y = cake_causal_conv1d_train_forward(x, w, cu)
++        eager_dx, eager_dw = cake_causal_conv1d_train_backward(x, w, cu, dy)
++        y = torch.empty_like(x)
++        dx = torch.empty_like(x)
++        dw = torch.empty(C, WIDTH, dtype=torch.float32, device=device)
++        workspace = cake_causal_conv1d_train_backward_workspace(S, C, device)
++
++        def step(x=x, w=w, cu=cu, dy=dy, y=y, dx=dx, dw=dw, workspace=workspace):
++            cake_causal_conv1d_train_forward(x, w, cu, out=y)
++            cake_causal_conv1d_train_backward(
++                x, w, cu, dy, workspace=workspace, dx=dx, dweight=dw
++            )
++
++        side = torch.cuda.Stream(device=device)
++        side.wait_stream(torch.cuda.current_stream(device))
++        with torch.cuda.stream(side):
++            step()
++        torch.cuda.current_stream(device).wait_stream(side)
++        torch.cuda.synchronize(device)
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph, stream=side):
++            step()
++        torch.cuda.synchronize(device)
++        # The graph holds raw pointers to x, w, cu and dy: keep them alive until the replays, or the
++        # allocator hands their memory to the next shape's tensors and the replay reads those instead.
++        captured.append(
++            (
++                graph,
++                (x, w, cu, dy),
++                (y, dx, dw),
++                (eager_y, eager_dx, eager_dw),
++                workspace,
++            )
++        )
++    replays = 0
++    for graph, _inputs_alive, outputs, eager, workspace in captured:
++        for _replay in range(GRAPH_REPLAYS):
++            for tensor in outputs:
++                tensor.fill_(float("nan"))
++            workspace.view(torch.float32).fill_(float("nan"))
++            graph.replay()
++            torch.cuda.synchronize(device)
++            replays += 1
++            for got, expected, name in zip(
++                outputs, eager, ("y", "dx", "dweight"), strict=True
++            ):
++                assert torch.equal(got, expected), (
++                    f"{name} of replay {replays} differs from eager"
++                )
++    assert replays == GRAPH_REPLAYS * len(GRAPH_CASES) == 20
++
++
++def test_zero_tokens_return_empty_outputs() -> None:
++    C = 256
++    x = torch.empty(0, C, dtype=torch.bfloat16, device=_device())
++    w = torch.zeros(C, WIDTH, dtype=torch.float32, device=_device())
++    cu = torch.zeros(2, dtype=torch.int32, device=_device())
++    y = cake_causal_conv1d_train_forward(x, w, cu)
++    assert tuple(y.shape) == (0, C) and y.dtype == torch.bfloat16
++    dx, dw = cake_causal_conv1d_train_backward(x, w, cu, x)
++    assert tuple(dx.shape) == (0, C)
++    assert torch.equal(dw, torch.zeros_like(dw))
++
++
++def test_autograd_end_to_end() -> None:
++    S, C, docs = 1000, 512, "perf"
++    x0, w0, cu, dy = _inputs(S, C, docs, key=3)
++    x = x0.detach().clone().requires_grad_(True)
++    w = w0.detach().clone().requires_grad_(True)
++    y = cake_causal_conv1d(x, w, cu)
++    assert torch.equal(y.detach(), cake_causal_conv1d_train_forward(x0, w0, cu))
++    y.backward(dy)
++    dx_ref, dw_ref = cake_causal_conv1d_train_backward(x0, w0, cu, dy)
++    assert x.grad.dtype == torch.bfloat16 and torch.equal(x.grad, dx_ref)
++    assert w.grad.dtype == torch.float32 and torch.equal(w.grad, dw_ref)
++    # A non-contiguous incoming gradient is materialized by the wrapper.
++    x = x0.detach().clone().requires_grad_(True)
++    w = w0.detach().clone().requires_grad_(True)
++    cake_causal_conv1d(x, w, cu).backward(dy.t().contiguous().t())
++    assert torch.equal(x.grad, dx_ref) and torch.equal(w.grad, dw_ref)
++
++
++def test_changing_shapes_in_one_process_do_not_rebuild() -> None:
++    _check(64, 128, None)
++    loaded_before = loader.load.cache_info().misses
++    for S, C, docs in (
++        (1, 128, None),
++        (65, 256, (64, 1)),
++        (5, 136, (2, 0, 3)),
++        (1000, 512, "perf"),
++    ):
++        _check(S, C, docs)
++    assert loader.load.cache_info().misses == loaded_before, (
++        "a changed problem size rebuilt a module"
++    )
++
++
++def test_workspace_bytes_and_layout() -> None:
++    device = _device()
++    arch = loader.arch_for_capability(_capability())
++    record = loader.workspace_record(arch)
++    geometry = record["grid_rule"]["geometry"]
++    grid = loader.launch_grid(record, device_index=device.index)[0]
++    assert grid == record["grid_rule"]["ctas_per_sm"] * loader.sm_count(device.index)
++    for C in (128, 136, 8192):
++        small = cake_causal_conv1d_train_backward_workspace_bytes(1, C, device)
++        large = cake_causal_conv1d_train_backward_workspace_bytes(262401, C, device)
++        assert small == large > 0, "the workspace is independent of S"
++        layout = loader.workspace_layout(record, C, device_index=device.index)
++        _, _, n_ch_tiles = loader.channel_split(C, geometry=geometry)
++        assert layout["grid"] == grid
++        assert (
++            layout["rows"]
++            == loader.partial_rows(grid, n_ch_tiles)
++            == -(-grid // n_ch_tiles)
++        )
++        assert small == layout["total_bytes"] == 4 * WIDTH * C * layout["rows"]
++    # One channel tile holds up to threads x vec channels (a partial row per CTA): 512 for the backward's four
++    # channels per thread; 8192 channels are sixteen tiles; C = 136 is 34 channel vectors (three sub-tiles of 34).
++    vec, threads = geometry["vec"], geometry["threads"]
++    assert loader.channel_split(threads * vec, geometry=geometry) == (threads, 1, 1)
++    assert loader.channel_split(8192, geometry=geometry) == (
++        threads,
++        1,
++        8192 // (threads * vec),
++    )
++    assert loader.channel_split(136, geometry=geometry) == (
++        136 // vec,
++        threads // (136 // vec),
++        1,
++    )
++    workspace = cake_causal_conv1d_train_backward_workspace(65536, 512, device)
++    assert (
++        workspace.dtype == torch.uint8 and workspace.numel() == 4 * WIDTH * 512 * grid
++    )
++    with pytest.raises(ValueError):
++        cake_causal_conv1d_train_backward_workspace_bytes(-1, 512, device)
++    with pytest.raises(ValueError):
++        cake_causal_conv1d_train_backward_workspace_bytes(1, 130, device)
++
++
++def test_argument_validation() -> None:
++    S, C = 64, 256
++    x, w, cu, dy = _inputs(S, C, None)
++    with pytest.raises(ValueError, match="multiple of 8"):
++        cake_causal_conv1d_train_forward(
++            x[:, :130].contiguous(), w[:130].contiguous(), cu
++        )
++    with pytest.raises(ValueError, match="width-4"):
++        cake_causal_conv1d_train_forward(x, w[:, :3].contiguous(), cu)
++    with pytest.raises(ValueError, match="width-4"):
++        cake_causal_conv1d_train_forward(
++            x, torch.cat([w, w[:, :1]], dim=1).contiguous(), cu
++        )
++    with pytest.raises(ValueError, match="one row per channel"):
++        cake_causal_conv1d_train_forward(x, w[: C // 2].contiguous(), cu)
++    with pytest.raises(ValueError, match="torch.int32"):
++        cake_causal_conv1d_train_forward(x, w, cu.long())
++    with pytest.raises(ValueError, match="cu_seqlens"):
++        cake_causal_conv1d_train_forward(x, w, cu[:1])
++    with pytest.raises(ValueError, match="shape"):
++        cake_causal_conv1d_train_backward(x, w, cu, dy[: S - 1])
++    with pytest.raises(ValueError, match="contiguous"):
++        cake_causal_conv1d_train_forward(x.t().contiguous().t(), w, cu)
++    with pytest.raises(ValueError, match="torch.bfloat16"):
++        cake_causal_conv1d_train_forward(x.float(), w, cu)
++    with pytest.raises(ValueError, match="torch.float32"):
++        cake_causal_conv1d_train_forward(x, w.to(torch.bfloat16), cu)
++    with pytest.raises(ValueError, match="shape"):
++        cake_causal_conv1d_train_forward(
++            x, w, cu, out=torch.empty(S + 1, C, dtype=torch.bfloat16, device=_device())
++        )
++    with pytest.raises(ValueError, match="contiguous"):
++        cake_causal_conv1d_train_backward(
++            x,
++            w,
++            cu,
++            dy,
++            dx=torch.empty(C, S, dtype=torch.bfloat16, device=_device()).t(),
++        )
++    with pytest.raises(ValueError, match="workspace holds"):
++        cake_causal_conv1d_train_backward(
++            x, w, cu, dy, workspace=torch.empty(16, dtype=torch.uint8, device=_device())
++        )
++    with pytest.raises(ValueError, match="CUDA"):
++        cake_causal_conv1d_train_forward(x.cpu(), w.cpu(), cu.cpu())
++    with pytest.raises(TypeError):
++        cake_causal_conv1d_train_forward(x, w, [0, S])
++
++
++def test_registry_records_reference_the_build_manifest() -> None:
++    """Every ``MODULES`` record names its ``build.json`` library and nothing to compile.
++
++    The manifest (schema ``cake-build/1``) carries exactly one entry per (library,
++    architecture) the registry references, each with the kernel and binding
++    sources under ``csrc/`` of this package, their digests and a closure digest;
++    the registry itself records the host plan only.
++    """
++
++    manifest = cake_build.manifest()
++    assert manifest["schema"] == "cake-build/1"
++    assert manifest["package"] == pkg.__name__
++    libraries = cake_build.libraries_by_name()
++    package = Path(cake_build.__file__).parent
++    referenced = set()
++    assert set(loader.MODULES) == {
++        name
++        for route in loader.ROUTES.values()
++        for names in route.values()
++        for name in names
++    }
++    for name, record in loader.MODULES.items():
++        assert record["library"] == record["kernel"] == name
++        assert record["kernel_symbol"] == f"kernel_{name}"
++        assert not {"sources", "source_sha256", "compile_flags", "cache_names"} & set(
++            record
++        ), name
++        assert set(record["arches"]) <= set(manifest["arch_flags"]), name
++        assert record["grid_rule"]["kind"] == "co_resident"
++        assert record["grid_rule"]["ctas_per_sm"] >= 1
++        assert record["grid_rule"]["cooperative"] == record["launch"]["cooperative"]
++        assert set(record["grid_rule"]["geometry"]) == {"threads", "vec"}
++        assert (
++            record["grid_rule"]["geometry"]["threads"] == record["launch"]["block"][0]
++        )
++        assert loader.CHANNEL_MULTIPLE % record["grid_rule"]["geometry"]["vec"] == 0
++        plan = {key for kind, key in record["arg_plan"] if kind != "grid"}
++        assert plan == set(record["logical"])
++        assert set(record["logical"].values()) <= set(loader.LOGICAL_TENSORS) | set(
++            loader.LOGICAL_SCALARS
++        )
++        for arch in record["arches"]:
++            library = loader.library_name(name, arch)
++            referenced.add(library)
++            entry = libraries[library]
++            assert entry["arch"] == arch
++            assert entry["entry"] == "run"
++            assert entry["sources"] == [
++                f"csrc/{record['library']}_kernel.cu",
++                f"csrc/{record['library']}_binding.cu",
++            ]
++            assert set(entry["sha256"]) == set(entry["sources"])
++            for source in entry["sources"]:
++                assert (package / source).is_file(), source
++            assert re.fullmatch(r"[0-9a-f]{64}", entry["closure_sha256"])
++            assert "--use_fast_math" not in entry["nvcc_flags"]
++            assert "--prec-div=true" in entry["nvcc_flags"]
++    assert referenced == set(libraries)
++    assert (package / "csrc" / "cake_ffi_checks.h").is_file()
++    backward = loader.workspace_record("sm_100a")
++    assert backward["workspace_rule"] == {"kind": "partial_rows", "taps": WIDTH}
++    assert backward["launch"]["cooperative"] is True
+diff --git a/tests/norm/test_cake_causal_conv1d_train_api.py b/tests/norm/test_cake_causal_conv1d_train_api.py
+new file mode 100644
+index 00000000000..2d1ea5b245e
+--- /dev/null
++++ b/tests/norm/test_cake_causal_conv1d_train_api.py
+@@ -0,0 +1,114 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++
++Tests of the flashinfer public surface of the Cake packed width-4 depthwise
++causal convolution + SiLU training kernels (SM100 / SM103 / SM107): the
++``flashinfer.cake_causal_conv1d_train`` facade and its re-export from the
++``flashinfer`` top-level package.  The facade's three entry points are
++pass-throughs to ``flashinfer.cake_causal_conv1d_train_backend``; this module
++checks that identity (same objects at the top level, same bits as the backend)
++and leaves the numerical contract to ``test_cake_causal_conv1d_train.py``,
++which imports only the backend package.
++"""
++
++from __future__ import annotations
++
++import pytest
++import torch
++
++import flashinfer
++import flashinfer.cake_causal_conv1d_train_backend as backend
++from flashinfer.cake_causal_conv1d_train import (
++    CakeCausalConv1dFunction,
++    cake_causal_conv1d,
++    cake_causal_conv1d_train_backward,
++    cake_causal_conv1d_train_backward_workspace_bytes,
++    cake_causal_conv1d_train_forward,
++    is_cake_causal_conv1d_train_supported,
++)
++from flashinfer.cake_causal_conv1d_train_backend import cake_jit as loader
++from flashinfer.jit.env import has_flashinfer_jit_cache
++from flashinfer.utils import get_compute_capability
++
++SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
++SEED = 2033
++
++
++def _device() -> torch.device:
++    return torch.device("cuda:0")
++
++
++def _supported() -> bool:
++    return (
++        torch.cuda.is_available()
++        and get_compute_capability(_device()) in SUPPORTED_CAPABILITIES
++        and is_cake_causal_conv1d_train_supported(_device())
++    )
++
++
++pytestmark = pytest.mark.skipif(
++    not _supported(),
++    reason="cake_causal_conv1d_train needs an SM100 / SM103 / SM107 device with exported routes",
++)
++
++
++@pytest.fixture(autouse=not has_flashinfer_jit_cache(), scope="module")
++def warmup_jit():
++    if _supported():
++        arch = loader.arch_for_capability(get_compute_capability(_device()))
++        flashinfer.jit.build_jit_specs(loader.specs_for_arch(arch), verbose=False)
++    yield
++
++
++def test_function_signature_is_exported() -> None:
++    assert flashinfer.cake_causal_conv1d is cake_causal_conv1d
++    assert (
++        flashinfer.cake_causal_conv1d_train_forward is cake_causal_conv1d_train_forward
++    )
++    assert (
++        flashinfer.cake_causal_conv1d_train_backward
++        is cake_causal_conv1d_train_backward
++    )
++    assert (
++        flashinfer.cake_causal_conv1d_train_backward_workspace_bytes
++        is cake_causal_conv1d_train_backward_workspace_bytes
++    )
++    assert flashinfer.CakeCausalConv1dFunction is CakeCausalConv1dFunction
++
++
++def test_facade_entry_points_match_the_backend() -> None:
++    """The facade forwards every argument: its forward, backward and autograd
++    entry points return the same bits as the backend package's."""
++
++    S, C = 1000, 512
++    generator = torch.Generator(device=_device()).manual_seed(SEED)
++    x = torch.randn(
++        S, C, dtype=torch.float32, device=_device(), generator=generator
++    ).to(torch.bfloat16)
++    dy = torch.randn(
++        S, C, dtype=torch.float32, device=_device(), generator=generator
++    ).to(torch.bfloat16)
++    w = 0.5 * torch.randn(
++        C, 4, dtype=torch.float32, device=_device(), generator=generator
++    )
++    cu = torch.tensor([0, 369, 659, 868, S], dtype=torch.int32, device=_device())
++    y = cake_causal_conv1d_train_forward(x, w, cu)
++    assert torch.equal(y, backend.cake_causal_conv1d_train_forward(x, w, cu))
++    dx, dw = cake_causal_conv1d_train_backward(x, w, cu, dy)
++    dx_backend, dw_backend = backend.cake_causal_conv1d_train_backward(x, w, cu, dy)
++    assert torch.equal(dx, dx_backend) and torch.equal(dw, dw_backend)
++    assert torch.equal(
++        cake_causal_conv1d(x, w, cu), backend.cake_causal_conv1d(x, w, cu)
++    )
+diff --git a/tests/test_helpers/cake_package.py b/tests/test_helpers/cake_package.py
+index 5484f91167f..697ba035f8c 100644
+--- a/tests/test_helpers/cake_package.py
++++ b/tests/test_helpers/cake_package.py
+@@ -15,6 +15,7 @@
+ # suite / package name -> import path of the package
+ PACKAGES: dict[str, str] = {
+     "cake_rmsnorm_train": "flashinfer.cake_rmsnorm_train_backend",
++    "cake_causal_conv1d_train": "flashinfer.cake_causal_conv1d_train_backend",
+     "cake_dsa_train": "flashinfer.experimental.cake_dsa_train",
+     "cake_dsa_indexer": "flashinfer.experimental.cake_dsa_indexer",
+     "cake_lm_head_loss": "flashinfer.experimental.cake_lm_head_loss",

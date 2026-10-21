@@ -1,0 +1,210 @@
+diff --git a/flashinfer/cute_dsl/attention/scheduler/persistent.py b/flashinfer/cute_dsl/attention/scheduler/persistent.py
+index 4c9c05cdc20..c0a47334fbc 100644
+--- a/flashinfer/cute_dsl/attention/scheduler/persistent.py
++++ b/flashinfer/cute_dsl/attention/scheduler/persistent.py
+@@ -9,9 +9,11 @@
+ 
+ import cutlass
+ import cutlass.cute as cute
+-import cutlass.utils as utils
++import cutlass.utils  # noqa: F401 - cutlass.utils.HardwareInfo
+ from cutlass.cute.typing import Int32, Boolean
+ 
++from ...work_tile_info import WorkTileInfo
++
+ 
+ class FmhaStaticTileSchedulerParams:
+     def __init__(
+@@ -108,7 +110,7 @@ def check_valid_work_for_seqlen_q(
+     ) -> Boolean:
+         return current_idx * q_tiler < seqlen_q
+ 
+-    def get_current_work(self, *, loc=None, ip=None) -> utils.WorkTileInfo:
++    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+         is_valid = (
+             self._current_work_linear_idx < self._num_blocks
+             if self._is_persistent
+@@ -130,7 +132,10 @@ def get_current_work(self, *, loc=None, ip=None) -> utils.WorkTileInfo:
+             (blk_coord[1], blk_coord[2]),
+         )
+ 
+-        return utils.WorkTileInfo(cur_tile_coord, is_valid)
++        # FlashInfer-owned type: the nested coordinate does not fit the flat
++        # (m, n, l) form CUTLASS DSL 4.7 Task Scheduling installs on
++        # cutlass.utils.WorkTileInfo.
++        return WorkTileInfo(cur_tile_coord, is_valid)
+ 
+     def initial_work_tile_info(self, *, loc=None, ip=None):
+         return self.get_current_work(loc=loc, ip=ip)
+diff --git a/flashinfer/cute_dsl/sparse/sm100_blk128/tile_scheduler.py b/flashinfer/cute_dsl/sparse/sm100_blk128/tile_scheduler.py
+index b63dfd9581e..039821af6fc 100644
+--- a/flashinfer/cute_dsl/sparse/sm100_blk128/tile_scheduler.py
++++ b/flashinfer/cute_dsl/sparse/sm100_blk128/tile_scheduler.py
+@@ -14,6 +14,8 @@
+ 
+ from quack.cute_dsl_utils import ParamsBase
+ 
++from flashinfer.cute_dsl.work_tile_info import WorkTileInfo as _WorkTileInfoBase
++
+ 
+ class SchedulingMode(IntEnum):
+     NONE = 0
+@@ -33,7 +35,7 @@ def prefetch_next_work(self) -> None: ...
+     def consumer_advance(self) -> "WorkTileInfo": ...
+ 
+ 
+-class WorkTileInfo(cutlass.utils.WorkTileInfo):
++class WorkTileInfo(_WorkTileInfoBase):
+     """Altered WorkTileInfo which includes four axes: (block, head, batch, split)"""
+ 
+     @override
+diff --git a/flashinfer/cute_dsl/sparse/sm100_blk64/tile_scheduler.py b/flashinfer/cute_dsl/sparse/sm100_blk64/tile_scheduler.py
+index 3d861f380f7..2650257e93d 100644
+--- a/flashinfer/cute_dsl/sparse/sm100_blk64/tile_scheduler.py
++++ b/flashinfer/cute_dsl/sparse/sm100_blk64/tile_scheduler.py
+@@ -17,6 +17,8 @@
+     ClcDynamicPersistentTileSchedulerParams,
+ )
+ 
++from flashinfer.cute_dsl.work_tile_info import WorkTileInfo as _WorkTileInfoBase
++
+ from .cute_dsl_utils import ParamsBase
+ 
+ from . import kernel_utils as utils
+@@ -85,7 +87,7 @@ def producer_tail(self, *, loc=None, ip=None):
+         self._pipeline.producer_tail(self._producer_state, loc=loc, ip=ip)
+ 
+ 
+-class WorkTileInfo(cutlass.utils.WorkTileInfo):
++class WorkTileInfo(_WorkTileInfoBase):
+     """Altered WorkTileInfo which includes four axes: (block, head, batch, split)"""
+ 
+     @override
+diff --git a/flashinfer/cute_dsl/work_tile_info.py b/flashinfer/cute_dsl/work_tile_info.py
+new file mode 100644
+index 00000000000..3ac40f1ba65
+--- /dev/null
++++ b/flashinfer/cute_dsl/work_tile_info.py
+@@ -0,0 +1,58 @@
++# Copyright (c) 2026 by FlashInfer team.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""FlashInfer-owned work tile for persistent CuTe DSL schedulers.
++
++``cutlass.utils.WorkTileInfo`` is one process-global class shared by every
++CuTe DSL user in the process, and CUTLASS DSL 4.7 Task Scheduling rewrites it
++when it is first imported (the rewritten ``__init__`` accepts only a flat
++``(m, n, l)`` triple of scalars). Schedulers whose tile coordinate is nested,
++such as ``(m, 0, (batch, head))``, or has four axes, such as
++``(block, head, batch, split)``, therefore must not inherit from or construct
++that shared class. This type keeps the general contract instead: any
++``cute.Coord`` is stored unchanged and round-trips through MLIR values.
++"""
++
++import cutlass.cute as cute
++from cutlass.cutlass_dsl import Boolean, extract_mlir_values, new_from_mlir_values
++
++
++class WorkTileInfo:
++    """Tile coordinate plus validity flag of one persistent-scheduler step."""
++
++    def __init__(self, tile_idx: cute.Coord, is_valid_tile: Boolean):
++        self._tile_idx = tile_idx
++        self._is_valid_tile = Boolean(is_valid_tile)
++
++    def __extract_mlir_values__(self) -> list:
++        return extract_mlir_values(self._tile_idx) + extract_mlir_values(
++            self._is_valid_tile
++        )
++
++    def __new_from_mlir_values__(self, values: list) -> "WorkTileInfo":
++        # The validity flag is one i1 value; everything before it is tile_idx.
++        return type(self)(
++            new_from_mlir_values(self._tile_idx, values[:-1]),
++            new_from_mlir_values(self._is_valid_tile, values[-1:]),
++        )
++
++    @property
++    @cute.jit
++    def tile_idx(self) -> cute.Coord:
++        return self._tile_idx
++
++    @property
++    @cute.jit
++    def is_valid_tile(self) -> Boolean:
++        return self._is_valid_tile
+diff --git a/tests/test_prims_ts_import_isolation.py b/tests/test_prims_ts_import_isolation.py
+index 0f1c831acfc..28b87ca95c9 100644
+--- a/tests/test_prims_ts_import_isolation.py
++++ b/tests/test_prims_ts_import_isolation.py
+@@ -131,6 +131,59 @@ def test_prims_ts_bootstrap_scopes_work_tile_info_customization():
+     )
+ 
+ 
++def test_flashinfer_schedulers_own_their_work_tile_type():
++    """Nested / 4-axis FlashInfer schedulers must not use cutlass.utils.WorkTileInfo.
++
++    Task Scheduling is imported before FlashInfer, as the Prims-TS attention
++    tests and kernels do at module scope, so on CUTLASS DSL 4.7 the shared
++    class carries the flat (m, n, l) representation for the rest of the
++    process. The schedulers' own work-tile type must still accept their
++    coordinates.
++    """
++
++    from flashinfer.prims_ts import is_prims_ts_available
++
++    if not is_prims_ts_available():
++        pytest.skip("CUTLASS DSL is not installed")
++
++    _run_isolated(
++        """
++import importlib
++import importlib.util
++
++import cutlass.experimental.task_scheduling.enums  # noqa: F401
++from cutlass import Boolean, Int32
++from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo as Shared
++
++from flashinfer.cute_dsl.attention.scheduler import persistent
++from flashinfer.cute_dsl.work_tile_info import WorkTileInfo as Owned
++
++assert persistent.WorkTileInfo is Owned
++classes = [Owned]
++for name in (
++    "flashinfer.cute_dsl.sparse.sm100_blk64.tile_scheduler",
++    "flashinfer.cute_dsl.sparse.sm100_blk128.tile_scheduler",
++):
++    # Only sm100_blk128 has an optional dependency (quack-kernels); any other
++    # import failure must fail the test.
++    if name.endswith(".sm100_blk128.tile_scheduler") and (
++        importlib.util.find_spec("quack") is None
++    ):
++        continue
++    module = importlib.import_module(name)
++    assert issubclass(module.WorkTileInfo, Owned)
++    assert not issubclass(module.WorkTileInfo, Shared)
++    classes.append(module.WorkTileInfo)
++
++for cls in classes:
++    nested = cls((Int32(1), 0, (Int32(2), Int32(3))), Boolean(True))
++    assert isinstance(nested.tile_idx[2], tuple)
++    four = cls((Int32(1), Int32(2), Int32(3), Int32(0)), Boolean(True))
++    assert len(four.tile_idx) == 4
++"""
++    )
++
++
+ # Emulates a CUTLASS DSL 4.6 wheel: `cutlass.experimental` resolves as an empty
+ # package so the eager chain inside `import cutlass` is satisfied, while every
+ # submodule Prims-TS needs (`.primitives`, `.task_scheduling`) stays missing. A
