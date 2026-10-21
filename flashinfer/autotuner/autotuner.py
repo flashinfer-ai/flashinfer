@@ -1610,6 +1610,9 @@ class AutoTuner:
         # User-loaded configs from JSON files (populated by load_configs or autotune(cache=))
         self._file_configs: dict[str, tuple[str, Any]] = {}
         self._file_config_policies: dict[str, tuple[Any, ...]] = {}
+        # Keep disk merges from reviving superseded runners, including when
+        # exporting the same cache to more than one path. Reset by clear_cache.
+        self._invalidated_file_keys: set[str] = set()
         # AMBIENT managed store attached by autotune_v2 (ManagedAutotuneCache).
         # Design doc: docs/design_docs/autotuner_v2.md §2.1 -- process-lifetime
         # attach is forced by both consumers serving OUTSIDE any context; a
@@ -2396,14 +2399,13 @@ class AutoTuner:
                         require_profiling_policy=True,
                     )
                     if not _all_ranks_hit_cache(is_cache_hit):
-                        if _tune_process_group is not None:
-                            self._discard_profile_cache(
-                                custom_op,
-                                runners,
-                                p.get_opt_shapes(),
-                                tuning_config,
-                                inputs,
-                            )
+                        self._discard_profile_cache(
+                            custom_op,
+                            runners,
+                            p.get_opt_shapes(),
+                            tuning_config,
+                            inputs,
+                        )
                         input_preparation_oom = False
                         try:
                             # Active capture is safe for skipped operations and warm cache hits, but
@@ -2655,7 +2657,7 @@ class AutoTuner:
     def _discard_profile_cache(
         self, custom_op, runners, input_shapes, tuning_config, inputs
     ) -> None:
-        """Remove old candidates before a coordinated re-profile.
+        """Remove old candidates before re-profiling.
 
         Another runner may win this time. Its new entry must take precedence
         both now and after reloading the store, including on ranks that hit.
@@ -2673,13 +2675,18 @@ class AutoTuner:
             )
             winners.pop(key, None)
             self._profiling_cache_policies.pop((identity, key), None)
-            self._file_configs.pop(key.file_key, None)
-            self._file_config_policies.pop(key.file_key, None)
+            if identity is None:
+                self._file_configs.pop(key.file_key, None)
+                self._file_config_policies.pop(key.file_key, None)
+                self._invalidated_file_keys.add(key.file_key)
             if store is not None:
                 self._managed_decoded.pop(
                     (str(store.root), store.env_hash, key.key_fields), None
                 )
                 store.discard(key.file_key)
+        if identity is None:
+            self._dirty = True
+            self._dirty_seq += 1
 
     def rank_tactics(
         self,
@@ -3626,6 +3633,7 @@ class AutoTuner:
             configs: dict[str, Any] = {}
             namespaced_records = copy.deepcopy(self._namespaced_records)
             dirty_namespaces = frozenset(self._dirty_namespaces)
+            invalidated_file_keys = frozenset(self._invalidated_file_keys)
 
             # Include previously loaded file configs as a base
             for file_key, (runner_name, tactic) in self._file_configs.items():
@@ -3702,6 +3710,8 @@ class AutoTuner:
             if not soft:
                 # Same environment: merge on-disk entries and preserve the
                 # original "created by" record.
+                for file_key in invalidated_file_keys:
+                    disk_configs.pop(file_key, None)
                 disk_configs.update(configs)
                 configs = disk_configs
                 original_metadata = disk_meta
@@ -4039,6 +4049,7 @@ class AutoTuner:
             self._profiling_cache_policies.clear()
             self._file_configs.clear()
             self._file_config_policies.clear()
+            self._invalidated_file_keys.clear()
             self._namespaced_records.clear()
             self._dirty_namespaces.clear()
             self._observed_cache_generations.clear()
