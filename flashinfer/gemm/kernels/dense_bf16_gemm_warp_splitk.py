@@ -449,7 +449,12 @@ def _resident_ring(output_tile, token_tile, k_tile, stages, ctas_per_sm):
 
 # Stages below the co-resident ring that stay in the autotune space.  The best
 # ring depth moves with SM count and bandwidth, so keep a window instead of one.
-_RING_WINDOW = 3
+_RING_WINDOW = 1
+
+# The other output tile is profiled while its work per SM wave is within this
+# factor of the default's.  The default picks the smaller wave work, but whole
+# waves are a coarse model and the other width can win away from exact ties.
+_OUTPUT_TILE_WAVE_WORK_RATIO = 1.5
 
 
 def _keep_autotune_tactic(t, default, tactics, m, n, k, sm_count) -> bool:
@@ -458,13 +463,16 @@ def _keep_autotune_tactic(t, default, tactics, m, n, k, sm_count) -> bool:
     The rules are the same on every GPU and depend only on the shape, the SM
     count and shared memory.  The kernel is bound by the weight stream, so what
     matters is how many CTAs co-reside (wave fill) and how many bytes each SM
-    keeps in flight; output tile, K tile and B-loader count are all profiled
-    because their best value moves with the SM count.  The kept tactics
-    contain the narrower set fitted on B200 / B300 (cold-L2 CUPTI sweep of
-    every legal tactic, M=1..32, N=128..8192, K=768..8192), which kept the best
-    tactic within 2.6%.
+    keeps in flight; K tile and B-loader count are both profiled because their
+    best value moves with the SM count.  The kept tactics contain the narrower
+    set fitted on B200 / B300 (cold-L2 CUPTI sweep of every legal tactic,
+    M=1..32, N=128..8192, K=768..8192), which kept the best tactic within 2.6%.
     """
     ctas = (n // t.output_tile) * ((m + t.token_tile - 1) // t.token_tile)
+    default_ctas = (n // default.output_tile) * (
+        (m + default.token_tile - 1) // default.token_tile
+    )
+    same_grid = ctas == default_ctas
     # Token tile: the default or any finer one (more CTAs).  A coarser tile
     # re-streams fewer weights but halves the CTAs; it only won on tiny
     # short-K grids.
@@ -475,6 +483,27 @@ def _keep_autotune_tactic(t, default, tactics, m, n, k, sm_count) -> bool:
         and k <= 2048
     ):
         return False
+
+    # Output tile: the default, or the other width when its work per SM wave is
+    # close to the default's, on a tiny short-K grid, or when it keeps the
+    # default CTA count.
+    def wave_work(tile):
+        return (n // tile + sm_count - 1) // sm_count * tile
+
+    if t.output_tile != default.output_tile:
+        if not (
+            (
+                n % 32 == 0
+                and wave_work(t.output_tile)
+                <= _OUTPUT_TILE_WAVE_WORK_RATIO * wave_work(default.output_tile)
+                and t.token_tile <= 16
+            )
+            or (n // 16 <= 16 and k <= 1024)
+            or same_grid
+        ):
+            return False
+        if t.token_tile != default.token_tile and not same_grid:
+            return False
     stages = [
         x.stages
         for x in tactics
