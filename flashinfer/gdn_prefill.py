@@ -912,17 +912,11 @@ def _cp_delta_rule_rejection_reason(
             return "CP delta rule SM120 DSL kernel is unavailable"
     else:
         return "CP delta rule is currently implemented only for SM90, SM100, and SM120"
-    # The SM90/SM100 CuTe DSL CP backends implement head size 64 (DK=DV=64, or
-    # DV=64 with DK=128); every other CP route requires DK=DV=128.
+    # The SM90/SM100 CuTe DSL CP routes check their head sizes with
+    # check_head_sizes before this; the SM120 and Cake GDN CP routes need
+    # DK=DV=128.
     head_sizes = (q.shape[-1], v.shape[-1])
-    if arch_major in (9, 10) and not use_gdn_cp_backend:
-        if head_sizes not in CHUNKED_PREFILL_HEAD_SIZES:
-            return (
-                "CP delta rule supports (head_size, head_size_v) in "
-                f"{sorted(CHUNKED_PREFILL_HEAD_SIZES, reverse=True)}, "
-                f"got {head_sizes}"
-            )
-    elif head_sizes != (128, 128):
+    if (arch_major not in (9, 10) or use_gdn_cp_backend) and head_sizes != (128, 128):
         return (
             "CP delta rule only supports head_size == head_size_v == 128, "
             f"got {head_sizes}"
@@ -1667,6 +1661,10 @@ def chunk_gated_delta_rule(
         use_qk_l2norm_in_kernel = False
 
     if will_use_cp:
+        if _arch_major in (9, 10) and not use_gdn_cp_backend:
+            check_head_sizes(
+                "GDN CP prefill", head_size, head_size_v, CHUNKED_PREFILL_HEAD_SIZES
+            )
         cp_rejection_reason = _cp_delta_rule_rejection_reason(
             arch_major=_arch_major,
             use_gdn_cp_backend=use_gdn_cp_backend,

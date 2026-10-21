@@ -1123,7 +1123,7 @@ def cp_delta_rule_dsl_sm100(
     ):
         raise RuntimeError("q, k, v, and o must have the same total_seqlen")
     if k.shape[2] != q.shape[2] or o.shape[2] != v.shape[2]:
-        raise RuntimeError("q, k, v, and o must have the same D")
+        raise RuntimeError("q/k must share DimK and v/o must share DimV")
     if alpha.shape != beta.shape or alpha.shape[0] != total_seqlen:
         raise RuntimeError(
             "alpha and beta must have shape (total_seqlen, num_sab_heads), "
