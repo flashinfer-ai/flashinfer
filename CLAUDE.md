@@ -198,6 +198,19 @@ worker counts without GPU topology or measured memory capacity.
 Run the CPU-only coordinator suite with
 `pytest --confcutdir=tests/test_sharding tests/test_sharding/`.
 
+Communication-test wrappers optionally emit cache-publication completion reports
+when `UNIT_TEST_RUN_STATUS_DIR` is set to a fresh directory unique to that wrapper
+and container/rank. `test_run_status.sh` records each pytest invocation, and
+`test_run_status.py` atomically writes `script-result.json` (schema version 1,
+`complete`, `exit_code`, `tests_executed`, and `infrastructure_errors`). A small
+pytest plugin records execution and collection/internal errors inside each MPI
+or torchrun worker; launcher exit 1 alone is not evidence of an assertion failure.
+All local worker ranks must finish, and at least one test must execute, to allow
+publication. A completed run with assertion failures remains eligible, while
+crashes, timeouts, and unfinished invocations do not. With the variable unset,
+reporting is disabled. The CPU suite above covers this contract without GPU
+dependencies.
+
 ### Skipping Tests Based on CUDA Architecture
 
 Use `flashinfer.utils` functions to skip tests on unsupported GPU architectures:
