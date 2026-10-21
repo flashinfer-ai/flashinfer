@@ -132,11 +132,11 @@ def parse_sampling_args(line, parser):
         help="Pass top_k as a per-row tensor (filled with --top_k) instead of a scalar.",
     )
     parser.add_argument(
-        "--max_top_k",
+        "--top_k_max",
         type=int,
         required=False,
         default=None,
-        help="max_top_k bound passed to top_k_top_p_sampling_from_probs/logits.",
+        help="top_k_max bound passed to top_k_top_p_sampling_from_probs/logits.",
     )
     parser.add_argument(
         "--top_p",
@@ -768,7 +768,7 @@ def testTopKTopPSamplingFromProbs(args):
     vocab_size = args.vocab_size
     top_k = args.top_k
     top_p = args.top_p
-    max_top_k = args.max_top_k
+    top_k_max = args.top_k_max
     filter_apply_order = args.filter_apply_order
     # Use explicit seed/offset to enable CUDA graph compatibility
     seed = args.random_seed
@@ -804,7 +804,7 @@ def testTopKTopPSamplingFromProbs(args):
                 filter_apply_order=filter_apply_order,
                 seed=seed,
                 offset=offset,
-                max_top_k=max_top_k,
+                top_k_max=top_k_max,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -850,7 +850,7 @@ def testTopKTopPSamplingFromProbs(args):
                 cur_res["top_p"] = top_p
                 cur_res["filter_apply_order"] = filter_apply_order
                 cur_res["per_row_top_k"] = args.per_row_top_k
-                cur_res["max_top_k"] = max_top_k
+                cur_res["top_k_max"] = top_k_max
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
@@ -889,7 +889,7 @@ def testTopKTopPSamplingFromLogits(args):
     vocab_size = args.vocab_size
     top_k = args.top_k
     top_p = args.top_p
-    max_top_k = args.max_top_k
+    top_k_max = args.top_k_max
     filter_apply_order = args.filter_apply_order
     # Use explicit seed/offset to enable CUDA graph compatibility
     seed = args.random_seed
@@ -926,7 +926,7 @@ def testTopKTopPSamplingFromLogits(args):
                 filter_apply_order=filter_apply_order,
                 seed=seed,
                 offset=offset,
-                max_top_k=max_top_k,
+                top_k_max=top_k_max,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -972,7 +972,7 @@ def testTopKTopPSamplingFromLogits(args):
                 cur_res["top_p"] = top_p
                 cur_res["filter_apply_order"] = filter_apply_order
                 cur_res["per_row_top_k"] = args.per_row_top_k
-                cur_res["max_top_k"] = max_top_k
+                cur_res["top_k_max"] = top_k_max
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
