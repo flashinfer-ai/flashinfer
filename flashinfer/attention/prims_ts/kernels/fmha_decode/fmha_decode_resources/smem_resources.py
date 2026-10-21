@@ -73,10 +73,10 @@ from .helpers_common import (
     _clamp_valid_tile_idx,
     _decode_gen_task_cache,
     _kv_smem_swizzle,
+    _logical_cta_kv_domain_token_base,
     _logical_head_batch,
     _logical_q_group_idx,
     _major_k_stride_bytes,
-    _q_group_token_base,
     _qkv_smem_swizzle,
 )
 from .helpers_kv_tile_idx import (
@@ -368,7 +368,11 @@ def _issue_sparse_page_copies(
 
 @dataclass(kw_only=True)
 class SmemQResource(DecodeGenResourceBase):
-    """Q tile in SMEM. Loaded once in HEAD."""
+    """The CTA's Q tiles in SMEM, loaded once in HEAD.
+
+    A stage holds ``q_groups_per_cta`` consecutive tiles, each with its own
+    TMA load; the stage descriptor names the first tile.
+    """
 
     _task_local_specs: ClassVar[tuple[tuple, ...]] = (
         (
@@ -394,7 +398,7 @@ class SmemQResource(DecodeGenResourceBase):
         """Create placeholder Q SMEM and descriptor state for static analysis."""
         self._smem_base_q = _placeholder_smem_array(
             self.cfg.q_dtype,
-            self.cfg.smem_q_tile_elements * self.cfg.q_stages,
+            self.cfg.smem_q_stage_elements * self.cfg.q_stages,
         )
         self._q_descs = _placeholder_local_array(
             cutlass.Int64, self.cfg.q_stages, alignment=8
@@ -405,7 +409,7 @@ class SmemQResource(DecodeGenResourceBase):
         if self._alloc is None:
             self._alloc = SmemAllocation(
                 name=f"{self.name}",
-                size_bytes=self.cfg.smem_q_tile_bytes * self.cfg.q_stages,
+                size_bytes=self.cfg.smem_q_stage_bytes * self.cfg.q_stages,
                 alignment=self.cfg.stensor_align,
             )
         return [self._alloc]
@@ -425,7 +429,7 @@ class SmemQResource(DecodeGenResourceBase):
             self._smem_base_q = cutlass.Array(
                 context.smem_base.data_ptr() + self._alloc.offset,
                 dtype=self.cfg.q_dtype,
-                shape=(self.cfg.smem_q_tile_elements * self.cfg.q_stages,),
+                shape=(self.cfg.smem_q_stage_elements * self.cfg.q_stages,),
                 addrspace=3,
             )
             self._q_descs = cutlass.Array(
@@ -434,7 +438,7 @@ class SmemQResource(DecodeGenResourceBase):
                 space=cutlass.AddressSpace.rmem,
                 alignment=8,
             )
-            stage_elems = self.cfg.smem_q_tile_elements
+            stage_elems = self.cfg.smem_q_stage_elements
             q_head_dim_partition = min(self.cfg.headdim, 64)
             # 16-bit Q uses two 64-column TMA loads for headDim=128. FP8 Q
             # uses a descriptor stride based on the actual MMA K-major swizzle.
@@ -582,7 +586,7 @@ class SmemQResource(DecodeGenResourceBase):
     @producer_work
     @cute.jit
     def tma_load(self, stage_info: StageInfo) -> None:
-        """TMA load the current staged Q tile from GMEM to SMEM."""
+        """TMA load the current stage's Q tiles from GMEM to SMEM."""
         cfg = self.cfg
         # ProdWork: issue the Q TMA copies for the current pipeline stage. The
         # pipeline barrier in stage_info is the handoff to the MMA consumer.
@@ -591,11 +595,32 @@ class SmemQResource(DecodeGenResourceBase):
         logical_h_k_idx, logical_b_idx = _logical_head_batch(
             stage_info, self.h_k_idx, self.b_idx
         )
-        logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
         # Select the SMEM stage owned by this producer fire. The TS pipeline
         # barrier attached to stage_info protects this stage until QK consumes it.
-        stage_elems = cfg.smem_q_tile_elements
-        stage_base = self._smem_base_q.subview(stage_info.stage_idx * stage_elems)
+        stage_base = self._smem_base_q.subview(
+            stage_info.stage_idx * cfg.smem_q_stage_elements
+        )
+        first_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx, 0)
+        for tile_idx in cutlass.range_constexpr(cfg.q_groups_per_cta):
+            self._tma_load_tile(
+                stage_info,
+                stage_base.subview(tile_idx * cfg.smem_q_tile_elements),
+                first_q_group_idx + Int32(tile_idx),
+                logical_h_k_idx,
+                logical_b_idx,
+            )
+
+    @cute.jit
+    def _tma_load_tile(
+        self,
+        stage_info: StageInfo,
+        stage_base: cutlass.Array,
+        logical_q_group_idx: Int32,
+        logical_h_k_idx: Int32,
+        logical_b_idx: Int32,
+    ) -> None:
+        """Issue the TMA copies of one Q tile into ``stage_base``."""
+        cfg = self.cfg
         if cutlass.const_expr(cfg.q_dtype_bytes == 1):
             if _is_load_task_warp_leader(cfg):
                 if cutlass.const_expr(cfg.headdim <= 128):
@@ -678,14 +703,17 @@ class SmemQResource(DecodeGenResourceBase):
     @consumer_work(returns=q_desc_slot)
     @cute.jit
     def q_desc(self, stage_info: StageInfo) -> prims.Tcgen05SmemDesc:
-        """Build Q SMEM descriptor for tcgen05 MMA B operand."""
+        """Build the stage's first Q tile descriptor for the tcgen05 MMA B operand.
+
+        A paired instance advances it by its tile inside the QK MMA.
+        """
         # ConsWork: return the descriptor for the stage LoadTask committed.
         q_desc = prims.Tcgen05SmemDesc(self._q_descs[Int32(stage_info.stage_idx)])
         return q_desc
 
     @cute.jit
     def current_consumer_q_desc(self) -> prims.Tcgen05SmemDesc:
-        """Return Q's just-waited stage without creating a routed task local.
+        """Return the just-waited stage's first Q tile without a routed task local.
 
         Packed persistent skipping guards the complete data path. Routing a Q
         descriptor from guarded HEAD into LOOP would make that descriptor a
@@ -954,10 +982,10 @@ class SmemKvTileResource(DecodeGenResourceBase):
             self.h_k_idx,
             self.b_idx,
         )
-        logical_q_group_idx = _logical_q_group_idx(
+        # The ring's tiles serve every Q tile of the CTA.
+        q_token_base = _logical_cta_kv_domain_token_base(
             self.cfg, stage_info, self.q_group_idx
         )
-        q_token_base = _q_group_token_base(self.cfg, logical_q_group_idx)
         tile_idx = _runtime_split_kv_global_tile_idx(
             self.cfg,
             stage_info,
@@ -1652,11 +1680,8 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         # inert partner in odd-tail direct launches so lane-partitioned locator
         # reads remain in bounds; the producer fills that partner with -1.
         local_tiles = self.cfg.static_local_kv_tiles
-        return (
-            (local_tiles + self.cfg.num_insts_kv - 1)
-            // self.cfg.num_insts_kv
-            * self.cfg.num_insts_kv
-        )
+        tiles_per_loop = self.cfg.kv_tiles_per_loop
+        return (local_tiles + tiles_per_loop - 1) // tiles_per_loop * tiles_per_loop
 
     def _init_placeholder_state(self) -> None:
         """Create placeholder storage for per-stage page-offset windows."""
@@ -2199,14 +2224,13 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                 # The allocation covers the planned maximum, but a shorter
                 # runtime split may consume fewer tiles. Do not map a
                 # neighboring CTA's candidates just to fill unused SMEM.
-                runtime_q_group = _logical_q_group_idx(
-                    cfg, stage_info, self.q_group_idx
-                )
                 local_tiles = _runtime_local_kv_tiles(
                     cfg,
                     Int32(task_cache[_TASK_CACHE_SEQ_LEN_KV]),
                     self.seq_len_q,
-                    _q_group_token_base(cfg, runtime_q_group),
+                    _logical_cta_kv_domain_token_base(
+                        cfg, stage_info, self.q_group_idx
+                    ),
                 )
                 local_page_end = (
                     Int32(task_cache[_TASK_CACHE_KV_RAW_TILE_BASE]) + local_tiles
@@ -2796,10 +2820,10 @@ class SmemKvResource(DecodeGenResourceBase):
             self.h_k_idx,
             self.b_idx,
         )
-        logical_q_group_idx = _logical_q_group_idx(
+        # The ring's tiles serve every Q tile of the CTA.
+        q_token_base = _logical_cta_kv_domain_token_base(
             self.cfg, stage_info, self.q_group_idx
         )
-        q_token_base = _q_group_token_base(self.cfg, logical_q_group_idx)
         tile_idx = _runtime_split_kv_global_tile_idx(
             self.cfg,
             stage_info,

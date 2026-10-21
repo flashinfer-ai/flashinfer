@@ -173,6 +173,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         o_data_type: torch.dtype | None = None,
         sage_config: SageAttentionConfig | None = None,
         softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
+        query_paired: bool = False,
     ) -> None:
         """Choose a legal profile and allocate reusable routing capacity.
 
@@ -191,7 +192,9 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         ``use_block_sparse=False`` plans dense attention over the whole K/V
         sequence with the same Q-tile selection. Its route arguments must keep
         their defaults, and :meth:`run` takes Q/K/V only, plus the scales of a
-        Sage plan.
+        Sage plan. ``query_paired=True`` makes each CTA of such a dense plan
+        process two consecutive Q128 tiles over one K/V stream; it requires
+        ``head_dim=128`` and a Q128 tile (``q_block_size * Hq / Hkv >= 128``).
 
         ``share_pattern_across_kv_heads=False`` retains independent per-KV-head
         patterns. True uses a singleton head axis in BSR/bitmask inputs and
@@ -240,16 +243,16 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         ``torch.float16``. Every :meth:`run` then supplies the scale tensors as
         :class:`SageAttentionParams`.
 
-        ``softmax_rescale_threshold_log2`` (0 to 8, default 8) applies to
-        block-sparse plans on the Q64/KV256 and Q128/KV128 profiles and to
-        dense Q64/KV256 plans: a row keeps its softmax exponent anchor while a
-        tile raises the row maximum by at most this many binades, which skips
-        the rescale of the accumulated output. Probabilities then reach
-        ``2**threshold``, so Sage FP8 P is quantized at ``448 * 2**-threshold``
-        and probabilities far below the anchor lose E4M3 precision; rows whose
-        largest scores come first, such as attention sinks in the first
-        blocks, are the most exposed. 0 rescales on every new row maximum and
-        quantizes FP8 P at 448.
+        ``softmax_rescale_threshold_log2`` (0 to 8, default 8) applies to the
+        Q64/KV256 and Q128/KV128 profiles of dense and block-sparse plans: a
+        row keeps its softmax exponent anchor while a tile raises the row
+        maximum by at most this many binades, which skips the rescale of the
+        accumulated output. Probabilities then reach ``2**threshold``, so Sage
+        FP8 P is quantized at ``448 * 2**-threshold`` and probabilities far
+        below the anchor lose E4M3 precision; rows whose largest scores come
+        first, such as attention sinks in the first blocks, are the most
+        exposed. 0 rescales on every new row maximum and quantizes FP8 P at
+        448.
         """
 
         if use_block_sparse:
@@ -297,6 +300,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             sage=sage_config,
             use_block_sparse=use_block_sparse,
             softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+            query_paired=query_paired,
         )
         if use_proxy_routes and static.mask_type != "dense":
             raise ValueError("block-sparse proxy routes require mask_type='dense'")

@@ -366,16 +366,22 @@ def _local_kv_tile_idx_for_section(
     - HEAD produces only initial K tiles.
     - LOOP produces V for the current MMA iteration and K for the next one.
     - TAIL drains the final V tiles after the last loop iteration.
+
+    Each iteration advances ``kv_tiles_per_loop`` tiles and instance
+    ``inst_id`` takes the tile at ``kv_inst_tile_offset`` within the step:
+    its own tile, or the step's single tile when the instances are paired
+    Q tiles.
     """
-    num_insts_kv = Int32(cfg.num_insts_kv)
+    tiles_per_loop = Int32(cfg.kv_tiles_per_loop)
+    inst_offset = Int32(cfg.kv_inst_tile_offset(inst_id))
     if cutlass.const_expr(section == FmhaStage.Head):
-        return Int32(inst_id)
+        return inst_offset
     if cutlass.const_expr(section == FmhaStage.Loop):
-        base = stage_info.loop_offset * num_insts_kv + Int32(inst_id)
+        base = stage_info.loop_offset * tiles_per_loop + inst_offset
         if cutlass.const_expr(kv_kind == KV_KIND_V):
             return base
-        return base + num_insts_kv
-    return stage_info.loop_end * num_insts_kv + Int32(inst_id)
+        return base + tiles_per_loop
+    return stage_info.loop_end * tiles_per_loop + inst_offset
 
 
 @cute.jit
@@ -411,7 +417,7 @@ def resolve_keeps_tile_context(
             Int32(0),
         )
 
-    logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, q_group_idx)
+    logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, q_group_idx, inst_id)
     q_token_base = _q_group_token_base(cfg, logical_q_group_idx)
     element_mask_end_idx = seq_len_kv
     if cutlass.const_expr(cfg.uses_uniform_causal_mask):

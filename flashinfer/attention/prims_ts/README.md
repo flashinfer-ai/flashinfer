@@ -302,11 +302,24 @@ the whole contiguous K/V sequence with the same Q-tile selection. A dense plan
 owns no route workspace, and its `run` takes Q/K/V only, plus `sage=` for a
 Sage plan.
 
+A dense Q128 plan (`head_dim=128`, `q_block_size * Hq / Hkv >= 128`) accepts
+`query_paired=True`: each CTA then processes two consecutive Q128 tiles of one
+sequence and KV head over a single K/V stream, with each K/V instance of the
+kernel owning one Q tile for the whole sequence instead of alternating K/V
+tiles of one Q tile. Every K/V tile is loaded once for both tiles, which
+helps when K/V loads bound the kernel (16-bit K/V on long sequences). Pairing
+halves the CTA count, so it suits grids that still fill the GPU; a sequence
+with an odd number of Q tiles leaves the second instance of its last CTA idle.
+Causal plans pair too: the CTA streams the K/V range of its later Q tile, and
+the earlier tile masks the extra K/V tile that range can add. Paged decode
+plans pair the same way; see
+[Query pairing](kernels/fmha_decode/README.md#query-pairing).
+
 Every plan takes `softmax_rescale_threshold_log2` (0 to 8, default 8). On the
-Q64/KV256 and Q128/KV128 tiles of block-sparse plans, and on dense Q64/KV256
-plans, a row keeps its softmax exponent anchor while a tile raises the row
-maximum by at most that many binades, so the accumulated output is not
-rescaled; 0 rescales on every new maximum.
+Q64/KV256 and Q128/KV128 tiles of dense and block-sparse plans, a row keeps its
+softmax exponent anchor while a tile raises the row maximum by at most that
+many binades, so the accumulated output is not rescaled; 0 rescales on every
+new maximum.
 
 ## Sage attention
 
@@ -322,8 +335,7 @@ P       = softmax_row(S), quantized to E4M3 as C * p with C = 448 * 2**-h
 O[r][d] = sfV[d] * (sum_c P8[r][c] * V8[c][d]) / (C * l[r])  (+ v_mean[d])
 ```
 
-`h` is the plan's `softmax_rescale_threshold_log2` (default 8) on Q64/KV256
-tiles and block-sparse plans, and 0 elsewhere.
+`h` is the plan's `softmax_rescale_threshold_log2` (default 8).
 
 FlashInfer does not quantize: the 8-bit tensors and scales come from the
 caller, for example TensorRT-LLM's `sageQuant`. `v_mean` adds a per-channel
@@ -491,5 +503,6 @@ pytest -q \
   tests/attention/test_attention_ts_block_sparse.py \
   tests/attention/test_attention_ts_features.py \
   tests/attention/test_attention_ts_mla_decode.py \
+  tests/attention/test_attention_ts_query_paired.py \
   tests/attention/test_attention_ts_sage.py
 ```

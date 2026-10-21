@@ -63,6 +63,8 @@ from .fmha_decode_constants import (
 )
 from .fmha_decode_resources.helpers_common import (
     _assume_nonnegative_i32,
+    _q_cta_first_token,
+    _q_cta_kv_domain_token_base,
     _q_group_token_base,
     _q_seq_bounds,
     _warp_broadcast_i32,
@@ -131,18 +133,18 @@ def _schedule_with_optional_resources(
 def _loop_domain_after_head(
     total_kv_tiles: cutlass.Int32,
     *,
-    num_insts_kv: int,
+    kv_tiles_per_loop: int,
 ) -> cutlass.Int32:
-    """Return LOOP iterations after HEAD reserves one KV tile per instance.
+    """Return LOOP iterations after HEAD reserves one loop step of KV tiles.
 
     Dense tiles and block-sparse routes share this recurrence; only the tile
     count's source differs.
     """
 
-    remaining = total_kv_tiles - cutlass.Int32(num_insts_kv)
+    remaining = total_kv_tiles - cutlass.Int32(kv_tiles_per_loop)
     remaining = cute.math.max(remaining, cutlass.Int32(0))
-    insts = cutlass.Int32(num_insts_kv)
-    return (remaining + insts - cutlass.Int32(1)) // insts
+    tiles_per_loop = cutlass.Int32(kv_tiles_per_loop)
+    return (remaining + tiles_per_loop - cutlass.Int32(1)) // tiles_per_loop
 
 
 @dataclass(kw_only=True)
@@ -197,7 +199,7 @@ class PackedDecodeWorkQueue(WorkQueue):
             self.cu_seqlens_q,
             cutlass.Int32(b_idx),
         )
-        return _q_group_token_base(self.cfg, q_group_idx) >= seq_len_q
+        return _q_cta_first_token(self.cfg, q_group_idx) >= seq_len_q
 
 
 def _page_offsets_consume(
@@ -254,14 +256,14 @@ def _can_hold_native_page_window(
     if not cfg.use_split_kv:
         return False
     # Runtime ragged lengths can reduce the split-local span in
-    # ``num_insts_kv`` increments and therefore change every split rank's
+    # ``kv_tiles_per_loop`` increments and therefore change every split rank's
     # aligned starting page. Hold one stage only when every possible span
     # both fits and evenly partitions a 32-ID window; otherwise a shorter row
     # could straddle the next window even when the static maximum does not.
     for local_tiles in range(
-        cfg.num_insts_kv,
+        cfg.kv_tiles_per_loop,
         cfg.static_local_kv_tiles + 1,
-        cfg.num_insts_kv,
+        cfg.kv_tiles_per_loop,
     ):
         window_pages = local_tiles * pages_per_tile
         if window_pages <= 0 or window_pages > 32 or 32 % window_pages != 0:
@@ -400,6 +402,9 @@ def _consume_streamed_pv_fragments(
     v_desc_label: str,
     vp_mma_label: str,
     cfg: FmhaDecodeConfig,
+    *,
+    wait_kv: bool = True,
+    release_kv: bool = True,
 ) -> None:
     """Issue one PV wave as its K32 P fragments become ready.
 
@@ -407,13 +412,15 @@ def _consume_streamed_pv_fragments(
     correction credit before holding the V stage. Later fragments may become
     ready while the previous PV fragment is already executing; every slot
     stays live through the complete async UMMA wave so the producer cannot
-    overwrite an operand prematurely.
+    overwrite an operand prematurely. ``wait_kv`` and ``release_kv`` let two
+    waves share one V stage: the first waits for it, the last releases it.
     """
     assert cfg.num_head_dim_stages_kv == 1
     fragment_label = f"{vp_mma_label}_fragment"
     p_tmem_addr = tmem_p.wait_p_fragment(fragment_idx=0)
     tmem_o.acquire()
-    smem_kv.wait()
+    if wait_kv:
+        smem_kv.wait()
     v_desc = getattr(smem_kv, v_desc_label)()
     getattr(tmem_o, fragment_label)(
         v_desc=v_desc,
@@ -427,7 +434,8 @@ def _consume_streamed_pv_fragments(
             p_tmem_addr=p_tmem_addr,
             fragment_idx=fragment_idx,
         )
-    smem_kv.release()
+    if release_kv:
+        smem_kv.release()
     tmem_o.commit()
 
 
@@ -440,22 +448,38 @@ def _consume_staged_pv_mma(
     p_desc_idx: int,
     section: FmhaStage,
     cfg: FmhaDecodeConfig,
+    *,
+    wait_kv: bool = True,
+    release_kv: bool = True,
 ) -> None:
-    """Consume all V head-dim stages for one PV MMA wave."""
+    """Consume all V head-dim stages for one PV MMA wave.
+
+    ``wait_kv`` and ``release_kv`` let two waves share one V stage: the
+    first waits for it, the last releases it.
+    """
     _ = section
     if cutlass.const_expr(cfg.streams_tmem_p_fragments):
         _consume_streamed_pv_fragments(
-            smem_kv, tmem_p, tmem_o, v_desc_label, vp_mma_label, cfg
+            smem_kv,
+            tmem_p,
+            tmem_o,
+            v_desc_label,
+            vp_mma_label,
+            cfg,
+            wait_kv=wait_kv,
+            release_kv=release_kv,
         )
         return
 
+    assert (wait_kv and release_kv) or cfg.num_head_dim_stages_kv == 1
     tmem_p.wait()
     p_desc_0, p_desc_1, p_tmem_addr_0, p_tmem_addr_1 = tmem_p.p_operands()
     p_desc = p_desc_0 if p_desc_idx == KV_INST0 else p_desc_1
     p_tmem_addr = p_tmem_addr_0 if p_desc_idx == KV_INST0 else p_tmem_addr_1
     tmem_o.acquire()
     for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
-        smem_kv.wait()
+        if wait_kv:
+            smem_kv.wait()
         v_desc = getattr(smem_kv, v_desc_label)()
         getattr(tmem_o, vp_mma_label)(
             v_desc_0=v_desc,
@@ -467,7 +491,8 @@ def _consume_staged_pv_mma(
             inst_idx=p_desc_idx,
             head_dim_stage_idx=head_dim_stage_idx,
         )
-        smem_kv.release()
+        if release_kv:
+            smem_kv.release()
     tmem_o.commit()
     tmem_p.release()
 
@@ -822,7 +847,7 @@ class DecodeGenTask(Task):
                     cutlass.Int32(b_idx),
                 )
                 q_group_idx = cutlass.Int32(q_group_cta_idx)
-                if _q_group_token_base(self.cfg, q_group_idx) < seq_len_q:
+                if _q_cta_first_token(self.cfg, q_group_idx) < seq_len_q:
                     prims.barrier_cta_sync(12, thread_count=16 * 32)
             else:
                 prims.barrier_cta_sync(12, thread_count=16 * 32)
@@ -957,7 +982,7 @@ class DecodeGenTask(Task):
 
             loop_domain = _loop_domain_after_head(
                 route_count,
-                num_insts_kv=self.cfg.num_insts_kv,
+                kv_tiles_per_loop=self.cfg.kv_tiles_per_loop,
             )
             return loop_domain + cutlass.Int32(self.domain_bias)
 
@@ -1014,17 +1039,17 @@ class DecodeGenTask(Task):
             self._kv_raw_tile_base = cutlass.Int32(0)
             loop_domain = _loop_domain_after_head(
                 total_kv_tiles,
-                num_insts_kv=self.cfg.num_insts_kv,
+                kv_tiles_per_loop=self.cfg.kv_tiles_per_loop,
             )
             return loop_domain + cutlass.Int32(self.domain_bias)
 
-        # Decode the logical Q tile with the configured physical split fanout,
+        # Decode the logical Q group with the configured physical split fanout,
         # then derive its causal/window K union and useful runtime split prefix.
         q_group_cta_idx = cutlass.Int32(tile_coord[0])
         q_group_idx = q_group_cta_idx
         if self.cfg.use_split_kv:
             q_group_idx = q_group_cta_idx // cutlass.Int32(self.cfg.splits_kv)
-        q_token_base = _q_group_token_base(self.cfg, q_group_idx)
+        q_token_base = _q_cta_kv_domain_token_base(self.cfg, q_group_idx)
         seq_len_q = (
             cutlass.Int32(self.cfg.max_seq_len_q)
             if self.seq_len_q is None
@@ -1053,14 +1078,14 @@ class DecodeGenTask(Task):
             # task produces the same span but adds a runtime integer division
             # to each task warp.
             splits_kv = cutlass.Int32(self.cfg.splits_kv)
-            num_insts_kv = cutlass.Int32(self.cfg.num_insts_kv)
-            tiles_per_cta_group = splits_kv * num_insts_kv
+            tiles_per_loop = cutlass.Int32(self.cfg.kv_tiles_per_loop)
+            tiles_per_cta_group = splits_kv * tiles_per_loop
             num_groups = (
                 total_kv_tiles + tiles_per_cta_group - cutlass.Int32(1)
             ) // tiles_per_cta_group
             total_kv_tiles = cute.math.max(
-                num_groups * num_insts_kv,
-                num_insts_kv,
+                num_groups * tiles_per_loop,
+                tiles_per_loop,
             )
             # Physical split coordinates and page-cache strides are laid out with
             # the configured launch fanout.  Runtime pruning only shortens the
@@ -1071,7 +1096,7 @@ class DecodeGenTask(Task):
             self._kv_raw_tile_base = skipped_tiles
         loop_domain = _loop_domain_after_head(
             total_kv_tiles,
-            num_insts_kv=self.cfg.num_insts_kv,
+            kv_tiles_per_loop=self.cfg.kv_tiles_per_loop,
         )
         # All tasks share the MMA-loop domain; tail-only tasks add a bias.
         return loop_domain + cutlass.Int32(self.domain_bias)
@@ -1167,6 +1192,21 @@ def _publish_sparse_softmax_route(
         route_record_word_offset=route_record_word_offset,
     )
     sparse_softmax_metadata.commit()
+
+
+def _sage_rings_by_label(
+    cfg: FmhaDecodeConfig,
+    sage_k_scales0: MemoryResource | None,
+    sage_k_scales1: MemoryResource | None,
+) -> dict[str, tuple[MemoryResource | None, ...]]:
+    """Map each K load label to the ``sfK`` rings its tile fills.
+
+    A query-paired plan loads each K/V tile once for both instances, so the
+    first instance's tile also fills the second instance's ring.
+    """
+    if cfg.query_paired:
+        return {"load_k0": (sage_k_scales0, sage_k_scales1), "load_k1": ()}
+    return {"load_k0": (sage_k_scales0,), "load_k1": (sage_k_scales1,)}
 
 
 def _publish_k_scales(
@@ -1554,33 +1594,38 @@ def create_page_offsets_task_split_kv(
 ) -> Task:
     """Prefetch split-KV K/V page windows with independent consumer state."""
 
+    # One K and one V label per K/V tile of a loop step: both instances' tiles,
+    # or the single tile a query-paired CTA loads for both of its Q tiles.
+    kv_labels = (("load_k0", "load_v0"), ("load_k1", "load_v1"))[
+        : cfg.kv_tiles_per_loop
+    ]
+
     def page_offsets_schedule_body(
         smem_page_offsets_k: MemoryResource,
         smem_page_offsets_v: MemoryResource,
         membership_lifetime: MemoryResource | None,
     ) -> None:
-        """Publish one page-offset stage for every paired K/V tile."""
+        """Publish one page-offset stage for every K/V tile the loads issue."""
         if membership_lifetime is not None:
             membership_lifetime.acquire()
         smem_page_offsets_k.init_load_state()
         smem_page_offsets_v.init_load_state()
 
-        # HEAD: publish the initial K0/K1 pair as two independent stages.
-        _page_offsets_produce(smem_page_offsets_k, "load_k0", FmhaStage.Head)
-        if membership_lifetime is not None:
-            membership_lifetime.commit()
-        _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Head)
+        # HEAD: publish the initial K tiles as independent stages.
+        for tile_idx, (load_k, _) in enumerate(kv_labels):
+            _page_offsets_produce(smem_page_offsets_k, load_k, FmhaStage.Head)
+            if tile_idx == 0 and membership_lifetime is not None:
+                membership_lifetime.commit()
 
         # LOOP: mirror LoadTask's cross-resource consumption order exactly.
         with domain_loop(0, domain, 1, unroll=1):
-            _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Loop)
-            _page_offsets_produce(smem_page_offsets_k, "load_k0", FmhaStage.Loop)
-            _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Loop)
-            _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Loop)
+            for load_k, load_v in kv_labels:
+                _page_offsets_produce(smem_page_offsets_v, load_v, FmhaStage.Loop)
+                _page_offsets_produce(smem_page_offsets_k, load_k, FmhaStage.Loop)
 
-        # TAIL: drain V0/V1 through distinct page-offset stages.
-        _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Tail)
-        _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Tail)
+        # TAIL: drain the V tiles through distinct page-offset stages.
+        for _, load_v in kv_labels:
+            _page_offsets_produce(smem_page_offsets_v, load_v, FmhaStage.Tail)
 
     @_schedule_with_optional_resources
     def page_offsets_schedule(
@@ -1764,7 +1809,11 @@ def create_load_task_split_kv(
         """Build the split-resource K/V load cadence for all schedule phases."""
         if smem_q is not None:
             smem_q.init_load_state()
-        sage_k_scales_by_label = {"load_k0": sage_k_scales0, "load_k1": sage_k_scales1}
+        sage_rings_by_label = _sage_rings_by_label(cfg, sage_k_scales0, sage_k_scales1)
+        # A dense second instance without its own ring loads through the
+        # first ring; a query-paired plan has no second load at all.
+        if smem_k1 is None and not cfg.use_block_sparse and not cfg.query_paired:
+            smem_k1, smem_v1 = smem_k0, smem_v0
         active_instances = (
             (
                 smem_k0,
@@ -1775,8 +1824,8 @@ def create_load_task_split_kv(
                 "load_v0",
             ),
             (
-                smem_k0 if smem_k1 is None and not cfg.use_block_sparse else smem_k1,
-                smem_v0 if smem_v1 is None and not cfg.use_block_sparse else smem_v1,
+                smem_k1,
+                smem_v1,
                 sparse_kv_metadata1,
                 sparse_softmax_metadata1,
                 "load_k1",
@@ -1858,13 +1907,14 @@ def create_load_task_split_kv(
             )
             load_tile(smem_k, load_k, smem_page_offsets_k, FmhaStage.Head)
             head_routes.append(
-                (sparse_softmax_metadata, route, sage_k_scales_by_label[load_k])
+                (sparse_softmax_metadata, route, sage_rings_by_label[load_k])
             )
         # In the combined task, preserve both K issues ahead of Softmax
         # backpressure. A per-instance task naturally stages its sole route.
-        for sparse_softmax_metadata, route, sage_k_scales in head_routes:
+        for sparse_softmax_metadata, route, sage_rings in head_routes:
             _publish_sparse_softmax_route(sparse_softmax_metadata, route)
-            _publish_k_scales(sage_k_scales, route, FmhaStage.Head)
+            for sage_k_scales in sage_rings:
+                _publish_k_scales(sage_k_scales, route, FmhaStage.Head)
         # Successor record loads go out after the K copies and the route
         # publish, here and in the loop. Queued ahead of the copies, a record
         # load delays the shared-memory reads of the route origins that feed
@@ -1902,7 +1952,8 @@ def create_load_task_split_kv(
                 )
                 load_tile(smem_k, load_k, smem_page_offsets_k, FmhaStage.Loop)
                 _publish_sparse_softmax_route(sparse_softmax_metadata, route)
-                _publish_k_scales(sage_k_scales_by_label[load_k], route, FmhaStage.Loop)
+                for sage_k_scales in sage_rings_by_label[load_k]:
+                    _publish_k_scales(sage_k_scales, route, FmhaStage.Loop)
                 prefetch_by_label[load_k] = _prefetch_sparse_route(
                     sparse_kv_metadata, "next_loop"
                 )
@@ -1959,9 +2010,23 @@ def create_load_task_split_kv(
             lambda: _schedule_token_throttle_head(schedule_token_throttle),
         )
 
-    for smem_k, sparse_kv_metadata, sparse_softmax_metadata, sage_k_scales in (
-        (smem_k0, sparse_kv_metadata0, sparse_softmax_metadata0, sage_k_scales0),
-        (smem_k1, sparse_kv_metadata1, sparse_softmax_metadata1, sage_k_scales1),
+    # A dense second instance without its own ring loads through the first
+    # ring, as ``load_schedule_body`` resolves it.
+    shares_first_k_ring = smem_k1 is None and not cfg.use_block_sparse
+    sage_rings_by_label = _sage_rings_by_label(cfg, sage_k_scales0, sage_k_scales1)
+    for smem_k, sparse_kv_metadata, sparse_softmax_metadata, sage_rings in (
+        (
+            smem_k0,
+            sparse_kv_metadata0,
+            sparse_softmax_metadata0,
+            sage_rings_by_label["load_k0"],
+        ),
+        (
+            smem_k0 if shares_first_k_ring else smem_k1,
+            sparse_kv_metadata1,
+            sparse_softmax_metadata1,
+            sage_rings_by_label["load_k1"],
+        ),
     ):
         if smem_k is None and (
             sparse_kv_metadata is not None or sparse_softmax_metadata is not None
@@ -1969,8 +2034,8 @@ def create_load_task_split_kv(
             raise ValueError("inactive K/V instances cannot own sparse metadata")
         if sparse_softmax_metadata is not None and sparse_kv_metadata is None:
             raise ValueError("Softmax sparse metadata requires retained KV metadata")
-        if sage_k_scales is not None and smem_k is None:
-            raise ValueError("a Sage K scale ring follows its instance's K tiles")
+        if smem_k is None and any(ring is not None for ring in sage_rings):
+            raise ValueError("a Sage K scale ring follows the K tiles that fill it")
     if sparse_kv_metadata0 is not None or sparse_kv_metadata1 is not None:
         if smem_page_offsets is not None or smem_page_offsets_v is not None:
             raise ValueError(
@@ -2307,7 +2372,13 @@ def create_mma_task_split_kv(
         tmem_stats_done1: MemoryResource | None,
         q_desc: Any,
     ) -> None:
-        """Schedule split-resource QK and PV waves across HEAD/LOOP/TAIL."""
+        """Schedule split-resource QK and PV waves across HEAD/LOOP/TAIL.
+
+        A query-paired plan feeds both instances' waves from one K/V stage:
+        the first instance waits for the stage, the second releases it, and
+        the tcgen05 commit of that release covers both MMAs.
+        """
+        shares_kv_stage = cfg.query_paired
 
         def qk_mma(
             smem_kv: MemoryResource,
@@ -2316,6 +2387,9 @@ def create_mma_task_split_kv(
             q_desc,
             qk_mma_label: str,
             section: FmhaStage,
+            *,
+            wait_kv: bool,
+            release_kv: bool,
         ) -> None:
             """Issue one scheduled QK wave using the selected phase work."""
             if tmem_stats_done is not None:
@@ -2323,7 +2397,8 @@ def create_mma_task_split_kv(
             tmem_s.acquire()
             _issue_score_seed(tmem_s, section, cfg)
             for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
-                smem_kv.wait()
+                if wait_kv:
+                    smem_kv.wait()
                 kv_desc = smem_kv.kv_desc()
                 if cfg.uses_q_desc_ref:
                     getattr(tmem_s, f"{qk_mma_label}_from_q_ref")(
@@ -2336,7 +2411,8 @@ def create_mma_task_split_kv(
                         kv_desc=kv_desc,
                         head_dim_stage_idx=head_dim_stage_idx,
                     )
-                smem_kv.release()
+                if release_kv:
+                    smem_kv.release()
             tmem_s.commit()
             if tmem_stats_done is not None:
                 tmem_stats_done.commit()
@@ -2347,56 +2423,75 @@ def create_mma_task_split_kv(
             vp_mma_label: str,
             inst_idx: int,
             section: FmhaStage,
+            *,
+            wait_kv: bool,
+            release_kv: bool,
         ) -> None:
             """Issue one scheduled PV wave using the selected phase work."""
             _consume_staged_pv_mma(
-                smem_kv, tmem_p, tmem_o, "v_desc", vp_mma_label, inst_idx, section, cfg
+                smem_kv,
+                tmem_p,
+                tmem_o,
+                "v_desc",
+                vp_mma_label,
+                inst_idx,
+                section,
+                cfg,
+                wait_kv=wait_kv,
+                release_kv=release_kv,
             )
 
-        qk_mma(
-            smem_k0,
-            tmem_s0,
-            tmem_stats_done0,
-            q_desc,
-            "qk_mma_head",
-            FmhaStage.Head,
+        # Each instance's resources, and the stage protocol of its waves.
+        instances = (
+            (KV_INST0, smem_k0, smem_v0, tmem_s0, tmem_stats_done0, smem_p0),
+            (KV_INST1, smem_k1, smem_v1, tmem_s1, tmem_stats_done1, smem_p1),
         )
-        qk_mma(
-            smem_k1,
-            tmem_s1,
-            tmem_stats_done1,
-            q_desc,
-            "qk_mma_head",
-            FmhaStage.Head,
-        )
+        kv_stage_protocol = {
+            KV_INST0: dict(wait_kv=True, release_kv=not shares_kv_stage),
+            KV_INST1: dict(wait_kv=not shares_kv_stage, release_kv=True),
+        }
+
+        for inst_idx, smem_k, _, tmem_s, tmem_stats_done, _ in instances:
+            qk_mma(
+                smem_k,
+                tmem_s,
+                tmem_stats_done,
+                q_desc,
+                "qk_mma_head",
+                FmhaStage.Head,
+                **kv_stage_protocol[inst_idx],
+            )
 
         with domain_loop(0, domain, 1, unroll=1):
-            pv_mma(smem_v0, smem_p0, "vp_mma_loop", KV_INST0, FmhaStage.Loop)
-            qk_mma(
-                smem_k0,
-                tmem_s0,
-                tmem_stats_done0,
-                q_desc,
-                "qk_mma_loop",
-                FmhaStage.Loop,
-            )
-            pv_mma(smem_v1, smem_p1, "vp_mma_loop", KV_INST1, FmhaStage.Loop)
-            qk_mma(
-                smem_k1,
-                tmem_s1,
-                tmem_stats_done1,
-                q_desc,
-                "qk_mma_loop",
-                FmhaStage.Loop,
-            )
+            for inst_idx, smem_k, smem_v, tmem_s, tmem_stats_done, smem_p in instances:
+                protocol = kv_stage_protocol[inst_idx]
+                pv_mma(
+                    smem_v, smem_p, "vp_mma_loop", inst_idx, FmhaStage.Loop, **protocol
+                )
+                qk_mma(
+                    smem_k,
+                    tmem_s,
+                    tmem_stats_done,
+                    q_desc,
+                    "qk_mma_loop",
+                    FmhaStage.Loop,
+                    **protocol,
+                )
 
         # The last BMM1 has been issued once the loop ends, and BMM2 never reads
         # Q. Releasing it here lets a persistent CTA load the next work tile's
         # Q while the final softmax and BMM2 waves run, as the KV256 MMA does.
         smem_q.release()
 
-        pv_mma(smem_v0, smem_p0, "vp_mma_tail", KV_INST0, FmhaStage.Tail)
-        pv_mma(smem_v1, smem_p1, "vp_mma_tail", KV_INST1, FmhaStage.Tail)
+        for inst_idx, _, smem_v, _, _, smem_p in instances:
+            pv_mma(
+                smem_v,
+                smem_p,
+                "vp_mma_tail",
+                inst_idx,
+                FmhaStage.Tail,
+                **kv_stage_protocol[inst_idx],
+            )
 
     def mma_schedule_prelude(
         smem_q: MemoryResource,
@@ -3732,6 +3827,9 @@ def create_correction_task(
             tail_o_stage_idx_1=tail_1,
             inst_idx=KV_INST0,
         )
+        if sage_v_scales is not None and not cfg.merges_kv_instances:
+            # ConsWait: every lane reads the scales the other lanes staged.
+            sage_v_scales.wait()
         tmem_corr0.correction_tail_epilogue(
             o_stage_idx=o_stage_idx,
             tail_o_stage_idx_0=tail_0,
@@ -3761,9 +3859,14 @@ def create_correction_task(
             tail_o_stage_idx_1=tail_1,
             inst_idx=KV_INST1,
         )
-        if sage_v_scales is not None:
+        if sage_v_scales is not None and cfg.merges_kv_instances:
             # ConsWait: every lane reads the scales the other lanes staged.
             sage_v_scales.wait()
+        if not cfg.merges_kv_instances:
+            # The instance finalizes its own stats and O stage, in the slots
+            # the epilogue reads first.
+            inst0_new_max_arr, inst0_sum_arr = inst1_new_max_arr, inst1_sum_arr
+            tail_0 = tail_1
         tmem_corr1.correction_tail_epilogue(
             o_stage_idx=o_stage_idx,
             tail_o_stage_idx_0=tail_0,

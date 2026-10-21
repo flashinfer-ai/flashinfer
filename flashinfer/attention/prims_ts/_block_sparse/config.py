@@ -95,6 +95,7 @@ class _BlockSparseCompileKey:
     use_block_sparse: bool = True
     sage: SageAttentionConfig | None = None
     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2
+    query_paired: bool = False
 
 
 @dataclass(frozen=True)
@@ -144,6 +145,9 @@ class _BlockSparseStaticProfile:
     sage: SageAttentionConfig | None = None
     use_block_sparse: bool = True
     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2
+    # One CTA processes two consecutive Q128 tiles over one K/V stream
+    # (dense plans only).
+    query_paired: bool = False
 
 
 def _select_block_sparse_kv_route_size(
@@ -410,6 +414,25 @@ def _resolve_plan_dtypes(
     return kv_dtype, v_dtype, output_dtype, _plan_dtype_key(q_dtype)
 
 
+def _validate_query_paired_profile(
+    *,
+    use_block_sparse: bool,
+    q_tile_size: int,
+) -> None:
+    """Reject a query-paired plan outside the dense Q128 path."""
+
+    if use_block_sparse:
+        raise NotImplementedError(
+            "query_paired requires a dense, contiguous K/V plan "
+            "(use_block_sparse=False)"
+        )
+    if q_tile_size != 128:
+        raise NotImplementedError(
+            "query_paired requires a Q128 tile: q_block_size * Hq/Hkv of at "
+            f"least 128; got Q{q_tile_size}"
+        )
+
+
 def _validate_block_sparse_static_profile(
     *,
     batch_size: int,
@@ -432,11 +455,14 @@ def _validate_block_sparse_static_profile(
     sage: SageAttentionConfig | None = None,
     use_block_sparse: bool = True,
     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
+    query_paired: bool = False,
 ) -> _BlockSparseStaticProfile:
     """Validate static policy before any device work or BSR inspection."""
 
     if not isinstance(share_pattern_across_kv_heads, bool):
         raise TypeError("share_pattern_across_kv_heads must be a bool")
+    if not isinstance(query_paired, bool):
+        raise TypeError("query_paired must be a bool")
     batch_size = _validate_positive_int(batch_size, "batch_size")
     seq_len_q = _validate_positive_int(seq_len_q, "seq_len_q")
     seq_len_kv = _validate_positive_int(seq_len_kv, "seq_len_kv")
@@ -501,6 +527,11 @@ def _validate_block_sparse_static_profile(
             route_metadata_capacity=0,
             num_rows=1,
         )
+    if query_paired:
+        _validate_query_paired_profile(
+            use_block_sparse=use_block_sparse,
+            q_tile_size=q_tile_size,
+        )
     return _BlockSparseStaticProfile(
         batch_size=batch_size,
         seq_len_q=seq_len_q,
@@ -527,6 +558,7 @@ def _validate_block_sparse_static_profile(
         sage=sage,
         use_block_sparse=use_block_sparse,
         softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+        query_paired=query_paired,
     )
 
 
@@ -555,6 +587,7 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
         "groups_tokens_heads_q": True,
         "use_block_sparse": key.use_block_sparse,
         "softmax_rescale_threshold_log2": key.softmax_rescale_threshold_log2,
+        "query_paired": key.query_paired,
     }
     if key.use_block_sparse:
         config_args.update(
@@ -638,6 +671,7 @@ def _resolve_block_sparse_launch_spec(
     v_dtype_key: str,
     sage: SageAttentionConfig | None = None,
     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
+    query_paired: bool = False,
 ) -> _BlockSparseLaunchSpec:
     """Resolve and cache one validated static or CLC launch.
 
@@ -703,6 +737,7 @@ def _resolve_block_sparse_launch_spec(
         v_dtype_key=v_dtype_key,
         sage=sage,
         softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+        query_paired=query_paired,
     )
     try:
         config = _make_block_sparse_config(compile_key)

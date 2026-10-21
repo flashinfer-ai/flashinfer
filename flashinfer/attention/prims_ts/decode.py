@@ -238,6 +238,7 @@ def _decode_policy_from_config(
         ("use_cluster_smem_reduction", bool(config.use_cluster_smem_reduction)),
         ("use_persistent_scheduler", bool(config.use_persistent_scheduler)),
         ("groups_tokens_heads_q", bool(config.groups_tokens_heads_q)),
+        ("query_paired", bool(config.query_paired)),
     )
 
 
@@ -325,9 +326,8 @@ def _planned_kv_domain_has_unpaired_tail(
     """Return whether the planned K domain ends with one inactive KV instance."""
 
     tile_size_kv = int(config.tile_size_kv)
-    num_insts_kv = int(config.num_insts_kv)
     total_kv_tiles = (max_kv_len + tile_size_kv - 1) // tile_size_kv
-    return total_kv_tiles % num_insts_kv != 0
+    return total_kv_tiles % int(config.kv_tiles_per_loop) != 0
 
 
 def _align_up(value: int, alignment: int = _WORKSPACE_ALIGNMENT) -> int:
@@ -1228,6 +1228,45 @@ def _decode_launch_spec_from_config(
     )
 
 
+# Two consecutive grouped Keeps Q128 tiles of one request and KV head per CTA.
+_QUERY_PAIRED_DECODE_PROFILE = {
+    "use_keeps_mma_ab": True,
+    "tile_size_q": 128,
+    "tile_size_kv": 128,
+    "groups_tokens_heads_q": True,
+    "query_paired": True,
+}
+
+
+def _query_paired_decode_config(
+    make_config: Callable[..., "FmhaDecodeConfig"],
+    config_overrides: dict[str, object],
+    *,
+    batch_size: int,
+    num_kv_heads: int,
+    max_active_clusters: int,
+) -> Optional["FmhaDecodeConfig"]:
+    """Return the query-paired config of a launch, or None to plan it unpaired.
+
+    A launch stays unpaired when the paired profile does not support it, when
+    no request holds two Q tiles, or when its unpaired Q tiles would not fill
+    one wave of CTAs: such a grid splits K/V to fill the GPU, while pairing
+    halves its CTAs.
+    """
+    try:
+        cfg = make_config(
+            {**config_overrides, **_QUERY_PAIRED_DECODE_PROFILE}, split_kv=False
+        )
+    except ValueError:
+        return None
+    if (
+        cfg.num_q_tiles < 2
+        or batch_size * num_kv_heads * cfg.num_q_tiles < max_active_clusters
+    ):
+        return None
+    return cfg
+
+
 @functools.cache
 def _resolve_decode_launch_spec(
     device_index: int,
@@ -1251,9 +1290,12 @@ def _resolve_decode_launch_spec(
     use_pdl: bool = False,
     split_kv: bool = True,
     share_pattern_across_kv_heads: bool = True,
+    query_paired: Optional[bool] = None,
 ) -> _DecodeLaunchSpec:
     """Resolve automatic policy and workspace geometry without compiling."""
 
+    if query_paired is not None and not isinstance(query_paired, bool):
+        raise TypeError("query_paired must be a bool or None")
     seq_len_q = _validate_seq_len_q(seq_len_q)
     _validate_head_geometry(num_qo_heads, num_kv_heads)
     _validate_decode_query_head_extent(
@@ -1291,6 +1333,7 @@ def _resolve_decode_launch_spec(
         splits_kv: int = -1,
         max_splits_kv: int | None = None,
         min_loop_iters_per_split: int = MIN_LOOP_ITERS_PER_SPLIT,
+        split_kv: bool = split_kv,
     ) -> "FmhaDecodeConfig":
         return make_decode_config(
             headdim=head_dim,
@@ -1365,9 +1408,12 @@ def _resolve_decode_launch_spec(
                 share_pattern_across_kv_heads=share_pattern_across_kv_heads,
             )
         else:
-            config_overrides = {"use_pdl": use_pdl}
+            config_overrides: dict[str, object] = {"use_pdl": use_pdl}
             if use_packed_q:
                 config_overrides["use_variable_seqlens_q"] = True
+            if query_paired is False:
+                # The grouped-Q cost model may pair Q tiles unless told not to.
+                config_overrides["query_paired"] = False
             cfg = make_config(config_overrides)
 
             # A grouped fixed-Q launch can leave most of the first service wave
@@ -1450,6 +1496,17 @@ def _resolve_decode_launch_spec(
                     splits_kv=safe_splits,
                     max_splits_kv=safe_splits,
                 )
+
+            if query_paired:
+                paired_cfg = _query_paired_decode_config(
+                    make_config,
+                    config_overrides,
+                    batch_size=batch_size,
+                    num_kv_heads=num_kv_heads,
+                    max_active_clusters=max_active_clusters,
+                )
+                if paired_cfg is not None:
+                    cfg = paired_cfg
 
     _validate_decode_policy_kv_tile_size(cfg)
     return _decode_launch_spec_from_config(
@@ -2001,6 +2058,7 @@ def get_prims_ts_batch_decode_workspace_size(
     storage_page_size: Optional[int] = None,
     device: Optional[Union[int, str, torch.device]] = None,
     split_kv: bool = True,
+    query_paired: Optional[bool] = None,
 ) -> int:
     """Return caller-workspace bytes for one automatic FMHA policy.
 
@@ -2027,7 +2085,8 @@ def get_prims_ts_batch_decode_workspace_size(
 
     ``split_kv`` permits automatic split fanout when True (default), or forces
     nonsplit execution when False. It is independent of Q layout and must
-    match the value supplied to attention planning/launch.
+    match the value supplied to attention planning/launch, as must
+    ``query_paired``.
     """
 
     batch_size = _validate_positive_int(batch_size, "batch_size")
@@ -2095,6 +2154,7 @@ def get_prims_ts_batch_decode_workspace_size(
         storage_page_size,
         resolved_device,
         split_kv=split_kv,
+        query_paired=query_paired,
     ).total_bytes
 
 
@@ -2613,6 +2673,7 @@ def _resolve_decode_workspace_layout(
     use_pdl: bool = False,
     split_kv: bool = True,
     share_pattern_across_kv_heads: bool = True,
+    query_paired: Optional[bool] = None,
 ) -> _DecodeWorkspaceLayout:
     """Resolve the byte layout for one already-validated semantic key."""
 
@@ -2640,6 +2701,7 @@ def _resolve_decode_workspace_layout(
         use_pdl,
         split_kv,
         share_pattern_across_kv_heads,
+        query_paired,
     )
     return _make_decode_workspace_layout(
         spec.scratch_shapes,
@@ -3370,6 +3432,7 @@ def _prepare_prims_ts_batch_decode_plan(
     direct_q1_sparse_block_size: int = 4,
     share_pattern_across_kv_heads: bool = True,
     allow_head_aware_locators: bool = False,
+    query_paired: Optional[bool] = None,
 ) -> tuple[PrimsTSBatchDecodePlan, torch.Tensor]:
     """Validate and freeze one dense-block-table PrimTS launch contract."""
 
@@ -3477,7 +3540,7 @@ def _prepare_prims_ts_batch_decode_plan(
         split_kv,
         share_pattern_across_kv_heads,
     )
-    spec = _resolve_decode_launch_spec(*policy_args)
+    spec = _resolve_decode_launch_spec(*policy_args, query_paired)
     if query_major_memberships:
         if not spec.config.supports_query_major_memberships:
             raise ValueError(
@@ -3626,6 +3689,7 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
     kv_layout: Literal["HND"] = "HND",
     page_size: Optional[int] = None,
     split_kv: bool = True,
+    query_paired: Optional[bool] = None,
 ) -> PrimsTSBatchDecodePlan:
     """Validate and prepare a reusable dense-block-table PrimTS launch.
 
@@ -3678,6 +3742,11 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
     split_kv : bool
         Permit automatic split fanout (True, default), or force S1 (False).
         Independent of packed/fixed Q. Match workspace sizing's value.
+    query_paired : bool, optional
+        Run two consecutive grouped Keeps Q128 tiles of one request and KV
+        head per CTA over one K/V stream when the launch supports it (True),
+        never (False), or when the automatic tile selection prefers it
+        (``None``, default). Match workspace sizing's value.
 
     Returns
     -------
@@ -3707,6 +3776,7 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
         kv_scale_factors=kv_scale_factors,
         split_kv=split_kv,
         use_q_token_kv_block_sparse_route=False,
+        query_paired=query_paired,
     )
     return plan
 
@@ -3774,6 +3844,7 @@ class BatchDecodePagedTSWrapper:
         workspace_buffer: Optional[torch.Tensor] = None,
         storage_page_size: Optional[int] = None,
         split_kv: bool = True,
+        query_paired: Optional[bool] = None,
         validate: bool = True,
         initialize_workspace: bool = True,
     ) -> None:
@@ -3859,6 +3930,16 @@ class BatchDecodePagedTSWrapper:
             unsplit execution (False), independently of ``packed_query``.
             Typically False for prefill and True for decode. This choice is
             frozen for the lifetime of the plan.
+        query_paired : bool, optional
+            Run two consecutive grouped Keeps Q128 tiles of one request and KV
+            head per CTA over one K/V stream. True pairs when the launch
+            supports it: an FP16, BF16 or FP8 recipe with head dim 128 (64 or
+            128 for FP8, which pairs only fixed-Q page-32 launches) and no
+            sliding window, two Q tiles in a request, and enough Q tiles to
+            fill one wave of CTAs. ``None`` (default) pairs when the automatic
+            tile selection for fixed multi-token page-32 launches scores the
+            paired tile cheapest; False never pairs. The plan's policy records
+            the outcome.
         validate : bool
             Validate static geometry and caller scratch. Defaults to ``True``.
             Disable only for previously validated inputs and warmed topology.
@@ -3949,7 +4030,9 @@ class BatchDecodePagedTSWrapper:
             window_left,
             storage_page_size,
         )
-        spec = _resolve_decode_launch_spec(*policy_args, split_kv=split_kv)
+        spec = _resolve_decode_launch_spec(
+            *policy_args, split_kv=split_kv, query_paired=query_paired
+        )
         if specialization_seq_lens is None:
             kv_prefix_mode: Literal["dynamic", "planned_full"] = "dynamic"
             kv_lengths_mode: Literal["dynamic", "planned_uniform_max"] = "dynamic"
@@ -4277,6 +4360,7 @@ def batch_decode_with_paged_kv_cache(
     out_dtype: Optional[torch.dtype] = None,
     page_size: Optional[int] = None,
     split_kv: bool = True,
+    query_paired: Optional[bool] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
     max_kv_len: Optional[int] = None,
     validate: bool = True,
@@ -4339,6 +4423,10 @@ def batch_decode_with_paged_kv_cache(
     split_kv : bool
         Allow automatic split fanout (True, default), or force S1 (False),
         independently of packed/fixed query storage.
+    query_paired : bool, optional
+        Run two consecutive grouped Keeps Q128 tiles of one request and KV
+        head per CTA when the launch supports it (True), never (False), or
+        when the automatic tile selection prefers it (``None``, default).
     workspace_buffer : torch.Tensor, optional
         Zero-initialized caller-owned byte scratch; re-zero when layout inputs
         (including batch size) change. Exclusive to one in-flight launch/graph.
@@ -4498,6 +4586,7 @@ def batch_decode_with_paged_kv_cache(
             storage_page_size=storage_page_size,
             device=q.device,
             split_kv=split_kv,
+            query_paired=query_paired,
         )
         workspace_buffer = torch.empty(
             workspace_bytes, dtype=torch.int8, device=q.device
@@ -4515,6 +4604,7 @@ def batch_decode_with_paged_kv_cache(
         max_seq_len_q=resolved_seq_len_q,
         storage_page_size=storage_page_size,
         split_kv=split_kv,
+        query_paired=query_paired,
         packed_query=use_packed_q,
         q_data_type=q.dtype,
         k_data_type=k_cache.dtype,

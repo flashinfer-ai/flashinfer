@@ -1587,6 +1587,7 @@ def _plan_case(
     max_kv_len: int,
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
+    query_paired: Optional[bool] = None,
 ):
     wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
     seq_len_q = 1 if case.q.ndim == 3 else int(case.q.shape[1])
@@ -1612,6 +1613,7 @@ def _plan_case(
         mask_type=case.mask_type,
         window_left=case.window_left,
         seq_lens=seq_lens.cpu(),
+        query_paired=query_paired,
     )
     return wrapper
 
@@ -1689,6 +1691,7 @@ def _run_standalone(
     page_size: Optional[int] = None,
     storage_page_size: Optional[int] = None,
     validate: bool = True,
+    query_paired: Optional[bool] = None,
 ):
     """Run the caller-workspace public entry point for wrapper parity."""
 
@@ -1714,6 +1717,7 @@ def _run_standalone(
             kv_layout="HND",
             storage_page_size=storage_page_size,
             device=case.q.device,
+            query_paired=query_paired,
         )
         workspace = torch.zeros(workspace_size, dtype=torch.int8, device=case.q.device)
     else:
@@ -1740,6 +1744,7 @@ def _run_standalone(
         kv_layout="HND",
         page_size=page_size,
         validate=validate,
+        query_paired=query_paired,
     )
     assert result is output
     return output
@@ -1790,13 +1795,15 @@ def _exercise_public_paths(
 ):
     """Always check eager; reserve standalone/graph parity for anchor rows."""
 
+    policy = dict(wrapper._policy)
     if case.q.dtype == _FP8:
-        policy = dict(wrapper._policy)
+        # FP8 probabilities round per online-softmax stream; a query-paired
+        # instance folds every K/V tile of its rows into one stream.
         case = _with_reference(
             case,
             qo_indptr=qo_indptr,
             splits_kv=int(policy["splits_kv"]),
-            num_insts_kv=int(policy["num_insts_kv"]),
+            num_insts_kv=1 if policy["query_paired"] else int(policy["num_insts_kv"]),
         )
     eager = _run_case(
         wrapper,
@@ -1813,6 +1820,7 @@ def _exercise_public_paths(
         max_kv_len=max_kv_len,
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
+        query_paired=policy["query_paired"],
     )
     _assert_case_correct(standalone, case)
     torch.testing.assert_close(standalone, eager, rtol=0, atol=0)
@@ -1940,26 +1948,23 @@ def _exercise_auto_case(
     return policy
 
 
-def _exercise_explicit_kv256_case(
+def _exercise_explicit_profile_case(
     monkeypatch: pytest.MonkeyPatch,
     case: _DecodeCase,
+    explicit_profile: dict[str, object],
     *,
+    qo_indptr: Optional[torch.Tensor] = None,
+    max_seq_len_q: Optional[int] = None,
     exercise_all_paths: bool = False,
 ) -> dict[str, object]:
-    """Run a public path with the qualified logical KV256 profile pinned."""
+    """Run a public path with ``explicit_profile`` pinned over automatic selection."""
 
     from flashinfer.attention.prims_ts import decode as decode_module
     from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
 
     original_make_decode_config = fmha_decode_config.make_decode_config
-    explicit_profile = {
-        "use_keeps_mma_ab": True,
-        "tile_size_q": 64,
-        "tile_size_kv": 256,
-        "groups_tokens_heads_q": True,
-    }
 
-    def _make_explicit_kv256_config(*args, **kwargs):
+    def _make_explicit_config(*args, **kwargs):
         source = kwargs.get("args")
         kwargs["args"] = (
             explicit_profile if source is None else (source, explicit_profile)
@@ -1969,18 +1974,41 @@ def _exercise_explicit_kv256_case(
     monkeypatch.setattr(
         fmha_decode_config,
         "make_decode_config",
-        _make_explicit_kv256_config,
+        _make_explicit_config,
     )
     decode_module._resolve_decode_launch_spec.cache_clear()
     decode_module._get_compiled_decode.cache_clear()
     try:
         return _exercise_auto_case(
             case,
+            qo_indptr=qo_indptr,
+            max_seq_len_q=max_seq_len_q,
             exercise_all_paths=exercise_all_paths,
         )
     finally:
         decode_module._resolve_decode_launch_spec.cache_clear()
         decode_module._get_compiled_decode.cache_clear()
+
+
+def _exercise_explicit_kv256_case(
+    monkeypatch: pytest.MonkeyPatch,
+    case: _DecodeCase,
+    *,
+    exercise_all_paths: bool = False,
+) -> dict[str, object]:
+    """Run a public path with the qualified logical KV256 profile pinned."""
+
+    return _exercise_explicit_profile_case(
+        monkeypatch,
+        case,
+        {
+            "use_keeps_mma_ab": True,
+            "tile_size_q": 64,
+            "tile_size_kv": 256,
+            "groups_tokens_heads_q": True,
+        },
+        exercise_all_paths=exercise_all_paths,
+    )
 
 
 @torch.no_grad()
@@ -2589,6 +2617,7 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "out_dtype",
         "page_size",
         "split_kv",
+        "query_paired",
         "workspace_buffer",
         "max_kv_len",
         "validate",
@@ -2619,6 +2648,7 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "workspace_buffer",
         "storage_page_size",
         "split_kv",
+        "query_paired",
         "validate",
         "initialize_workspace",
     )
@@ -3869,14 +3899,15 @@ def test_attention_ts_decode_kv256_uses_fragment_ready_p_policy() -> None:
 def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
     persistent: bool,
 ) -> None:
-    """KV256 and FP8 Q128 stream score fragments; dense 16-bit Q128 does not.
+    """KV256 and BF16/FP8 Q128 stream score fragments; FP8 D64 Q128 does not.
 
     Streamed profiles share one rolled fragment loop whose geometry follows
     the fragment register count, so the profile property and the fragment
     count are pinned together. They also run their two softmax groups
-    unordered. KV256 tiles and block-sparse routes stream, as do profiles with
-    8-bit K and V and SMEM softmax stats such as FP8 Q128/KV128; dense 16-bit
-    Q128/KV128 keeps the complete P row.
+    unordered. KV256 tiles and block-sparse routes stream, as do Q128/KV128
+    profiles whose K and V share a width and whose softmax stats travel
+    through SMEM, such as BF16 and FP8 at head dim 128; FP8 at head dim 64
+    keeps its stats in TMEM and the complete P row.
     """
 
     kv256 = _make_contiguous_kv256_config(persistent=persistent)
@@ -3888,12 +3919,20 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
 
     q128 = _make_contiguous_keeps_config(dtype=BFloat16, tile_size_q=128)
     assert q128.tile_size_kv == 128 and q128.uses_two_inst_tmem_p
-    assert not q128.streams_tmem_p_fragments
-    assert q128.num_softmax_score_fragments == 1
+    assert q128.streams_tmem_p_fragments
+    assert q128.num_softmax_score_fragments == 4
+    assert not q128.uses_ordered_softmax_barrier
 
     q128_fp8 = _make_contiguous_keeps_config(dtype=Float8E4M3FN, tile_size_q=128)
     assert q128_fp8.uses_two_inst_tmem_p
     assert q128_fp8.streams_tmem_p_fragments
+
+    d64_fp8 = _make_contiguous_keeps_config(
+        dtype=Float8E4M3FN, tile_size_q=128, headdim=64
+    )
+    assert d64_fp8.uses_two_inst_tmem_p and not d64_fp8.keeps_stats_via_smem
+    assert not d64_fp8.streams_tmem_p_fragments
+    assert d64_fp8.num_softmax_score_fragments == 1
 
 
 def test_attention_ts_decode_arch_config_args_follow_softmax_hardware() -> None:
@@ -3905,13 +3944,16 @@ def test_attention_ts_decode_arch_config_args_follow_softmax_hardware() -> None:
     """
 
     arch_args = fmha_decode_config.arch_config_args
-    assert arch_args((10, 0)) == {"ex2_emulated_pairs": 4, "uses_ldtm_stat": False}
+    assert arch_args((10, 0)) == {"ex2_emulated_pairs": 6, "uses_ldtm_stat": False}
     assert arch_args((10, 3)) == {
         "ex2_emulated_pairs": 0,
         "uses_ldtm_stat": tcgen05_compat.dsl_supports_ldtm_stat(),
     }
     cfg = _make_contiguous_kv256_config(persistent=False)
-    assert cfg.ex2_emulated_pairs == 4 and not cfg.uses_ldtm_stat
+    assert cfg.ex2_emulated_pairs == 6 and not cfg.uses_ldtm_stat
+    assert cfg.fragment_ex2_emulated_pairs == 4
+    q128 = _make_contiguous_keeps_config(dtype=BFloat16, tile_size_q=128)
+    assert q128.fragment_ex2_emulated_pairs == 6
 
 
 def test_attention_ts_decode_kv256_static_skips_unmodeled_fragment_alias_check() -> (
@@ -7838,6 +7880,135 @@ def test_attention_ts_decode_q64_kv256_boundaries(
     assert policy["use_persistent_scheduler"] is persistent
     if persistent:
         assert policy["use_split_kv"] is False
+
+
+# Pins grouped Keeps Q128 on 16-bit paged K/V; automatic selection takes it only
+# for fixed multi-token page-32 launches.
+_EXPLICIT_PAGED_16BIT_Q128_PROFILE = {
+    "use_keeps_mma_ab": True,
+    "tile_size_q": 128,
+    "groups_tokens_heads_q": True,
+    "use_persistent_scheduler": False,
+}
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    (
+        "dtype",
+        "heads_q_per_kv",
+        "seq_len_q",
+        "q_lens",
+        "mask_type",
+        "page_size",
+        "kv_lens",
+    ),
+    (
+        pytest.param(
+            torch.bfloat16, 8, 48, None, "causal", 32, (1040, 300), id="bf16-group8"
+        ),
+        pytest.param(
+            torch.float16, 8, 17, None, "dense", 16, (777, 64), id="fp16-page16"
+        ),
+        # 96 heads leave 32 structural padding rows in the tile.
+        pytest.param(
+            torch.float16, 96, 3, None, "dense", 64, (900, 450), id="fp16-group96"
+        ),
+        pytest.param(
+            torch.bfloat16,
+            128,
+            5,
+            None,
+            "causal",
+            128,
+            (1000, 2048),
+            id="bf16-group128-page128",
+        ),
+        pytest.param(
+            torch.bfloat16,
+            8,
+            48,
+            (37, 5),
+            "causal",
+            32,
+            (1000, 300),
+            id="bf16-packed",
+        ),
+    ),
+)
+def test_attention_ts_decode_explicit_16bit_paged_keeps_q128(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+    heads_q_per_kv: int,
+    seq_len_q: int,
+    q_lens: tuple[int, ...] | None,
+    mask_type: str,
+    page_size: int,
+    kv_lens: tuple[int, ...],
+):
+    """A pinned grouped Keeps Q128 tile runs FP16/BF16 paged K/V."""
+
+    case = _make_decode_case(
+        kv_lens=kv_lens,
+        num_qo_heads=2 * heads_q_per_kv,
+        num_kv_heads=2,
+        head_dim=128,
+        seq_len_q=seq_len_q,
+        page_size=page_size,
+        qkv_dtype=dtype,
+        output_dtype=dtype,
+        cache_form="tuple",
+        mask_type=mask_type,
+        device="cuda",
+        seed=20261020 + heads_q_per_kv,
+    )
+    qo_indptr = None
+    if q_lens is not None:
+        case, qo_indptr = _pack_decode_case(case, q_lens)
+
+    policy = _exercise_explicit_profile_case(
+        monkeypatch,
+        case,
+        _EXPLICIT_PAGED_16BIT_Q128_PROFILE,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=None if q_lens is None else seq_len_q,
+    )
+
+    assert policy["mma_variant"] == "keeps_mma_ab"
+    assert policy["tile_size_q"] == 128
+    assert policy["groups_tokens_heads_q"] is True
+
+
+def test_attention_ts_decode_16bit_paged_keeps_q128_automatic_scope(
+    monkeypatch,
+) -> None:
+    """The grouped-Q cost model scores 16-bit paged Keeps Q128 for fixed multi-Q page 32."""
+
+    shape = dict(
+        seq_len_q=64,
+        seq_len_kv=8192,
+        batch_size=16,
+        num_heads_q=64,
+        num_heads_kv=8,
+        num_tokens_per_page=32,
+    )
+    pinned = _make_auto_kv_tile_config(
+        monkeypatch, args=_EXPLICIT_PAGED_16BIT_Q128_PROFILE, **shape
+    )
+    assert pinned.supports_auto_grouped_keeps
+    for changes in ({"seq_len_q": 1}, {"num_tokens_per_page": 64}):
+        other = _make_auto_kv_tile_config(
+            monkeypatch,
+            args=_EXPLICIT_PAGED_16BIT_Q128_PROFILE,
+            **{**shape, **changes},
+        )
+        assert other.supports_grouped_keeps
+        assert not other.supports_auto_grouped_keeps
+    # Dense multi-Q launches take the cost model's tile instead of a head band.
+    automatic = _make_auto_kv_tile_config(monkeypatch, **shape)
+    assert automatic.use_keeps_mma_ab
+    assert automatic.tile_size_q == 128
+    assert automatic.groups_tokens_heads_q
 
 
 @_REQUIRES_PRIMTS_GPU
