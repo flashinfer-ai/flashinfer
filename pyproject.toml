@@ -101,7 +101,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.experimental.cake_mla_nvfp4_paged_decode" = ["csrc/**"]
 "flashinfer.experimental.msa_nvfp4_decode" = ["csrc/**"]
 "flashinfer.experimental.nvfp4_mla_decode" = ["csrc/**"]
-"flashinfer.experimental.nvfp4_sparse_mla_decode" = ["csrc/**"]
+"flashinfer.experimental.nvfp4_sparse_mla_decode" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_dsa_indexer" = ["csrc/**", "build.json"]
 "flashinfer.experimental.deepgemm_batched_gemm" = ["csrc/**", "build.json", "DEEPGEMM_NOTICE.txt"]
 # Generated sources and the build manifest (build.json) of the experimental exact-SM100a/SM103a Kimi-K3
