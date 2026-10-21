@@ -145,7 +145,11 @@ def test_policy_separates_coalescing_and_persisted_selection_keys():
     for plan in plans:
         configuration = _tuning.TUNING.configure(plan.query, device=DEVICE)
         request = plan.request(name="gdn", prepare_call=lambda state: None)
-        obligation = SimpleNamespace(request=request, configuration=configuration)
+        obligation = SimpleNamespace(
+            request=request,
+            configuration=configuration,
+            candidate_program_identity="shared-programs",
+        )
         keys.append(job._choice_key(obligation, {}))
     assert keys[0] != keys[1]
 
