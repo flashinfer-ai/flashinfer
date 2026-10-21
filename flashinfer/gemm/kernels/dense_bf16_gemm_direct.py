@@ -140,17 +140,22 @@ def is_direct_bf16_gemm_candidate_sm100(m: int, n: int) -> bool:
 
 
 def prefer_direct_bf16_gemm_sm100(m: int, n: int, k: int) -> bool:
-    """Return the no-autotune crossover heuristic (B200 and B300).
+    """Return the no-autotune crossover heuristic (same rule on every GPU).
 
-    True implies ``default_tactic(m, n, k)`` succeeds.  In the region the
-    default direct tactic ran within 5% of the best warp / cluster Split-K
-    tactic on every measured shape (cold L2) and was 12% faster at the median;
-    K only scales the margin.  M <= 2 was measured up to N = 7168 (N = 8192
-    only at K = 40960).
+    True implies ``default_tactic(m, n, k)`` succeeds.  The region contains the
+    previous K == 8192 bands and only shapes where the default direct tactic
+    was no slower than the previous no-autotune choice (the warp / cluster
+    Split-K default, or direct inside those bands) in cold-L2 CUPTI sweeps
+    with interleaved re-timing (within 2%).  Direct wins while M * N is too
+    small to fill the SMs with Split-K tiles; at M = 1 it also wins on long K.
+    M = 2 with larger N, M = 1 with K < 5120, and K = 40960 are left out
+    because the Split-K default can be faster there.
     """
+    if not 1 <= m <= _MAX_M or n <= 0:
+        return False
     if k % (_SUPPORTED_BLOCK_SIZES[0] * _VECTOR_WIDTH):
         return False
-    return (m <= 2 and n <= 8192) or m * n <= 2048
+    return m * n <= 2048 or (m == 1 and n <= 8192 and 5120 <= k <= 16384)
 
 
 class DirectDenseGemmKernel:
