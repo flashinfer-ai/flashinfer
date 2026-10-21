@@ -130,7 +130,7 @@ python benchmarks/bench_sm110_gqa_decode.py
 ```
 
 `tests/experimental/test_cake_sm110_gqa_decode.py` is the backend suite: it
-imports the package alone (through `tests/test_helpers/cake_package.py`),
+imports the package alone (its `PACKAGE` constant names the import path),
 checks the `build.json` contract against the registry and the route table on
 the CPU, and on an SM110 device the FP32-oracle correctness of every record,
 the explicit split counts, the bitwise determinism of repeated launches,

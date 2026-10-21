@@ -23,9 +23,9 @@ bitwise determinism of two direct launches, a side-stream launch and two
 CUDA-graph replays, and the self-reset of the completion counters.
 
 This suite exercises the backend package alone: it names the package once,
-through ``tests.test_helpers.cake_package``, and imports nothing else from
-flashinfer, so a build that vendors the package under another import path runs
-it unchanged after pointing that table entry at its package.  The registry and
+in ``PACKAGE``, and imports nothing else from flashinfer, so a build that
+carries the package under another import path runs it unchanged after
+pointing ``PACKAGE`` at its package.  The registry and
 rule tests run on CPU; every kernel test skips without an SM110 device.  The
 public ``flashinfer.sm110_gqa_decode`` / ``prepare_sm110_gqa_decode`` surface is
 covered by ``tests/experimental/test_sm110_gqa_decode*.py``.
@@ -33,6 +33,7 @@ covered by ``tests/experimental/test_sm110_gqa_decode*.py``.
 
 from __future__ import annotations
 
+import importlib
 import math
 import re
 from pathlib import Path
@@ -40,12 +41,12 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+PACKAGE = "flashinfer.experimental.sm110_gqa_decode"
 
-pkg = cake_package("sm110_gqa_decode")
-backend = cake_package("sm110_gqa_decode", "backend")
-loader = cake_package("sm110_gqa_decode", "cake_jit")
-cake_build = cake_package("sm110_gqa_decode", "cake_build")
+pkg = importlib.import_module(PACKAGE)
+backend = importlib.import_module(f"{PACKAGE}.backend")
+loader = importlib.import_module(f"{PACKAGE}.cake_jit")
+cake_build = importlib.import_module(f"{PACKAGE}.cake_build")
 
 PACKAGE_DIR = Path(pkg.__file__).resolve().parent
 RECORDS = (

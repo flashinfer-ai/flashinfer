@@ -368,12 +368,6 @@ PACKAGES: tuple[Package, ...] = (
         "cake_jit.py",
         refs_generic,
     ),
-    Package(
-        "flashinfer.experimental.sm110_gqa_decode",
-        "flashinfer/experimental/sm110_gqa_decode",
-        "cake_jit.py",
-        refs_generic,
-    ),
 )
 
 

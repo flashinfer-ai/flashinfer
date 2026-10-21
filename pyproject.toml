@@ -143,8 +143,8 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.experimental.cake_stepfun_moe" = ["csrc/**", "build.json"]
 # Standalone cuDNN Frost Python sources and the native MoE adapter, compiled on first use.
 "flashinfer.fused_moe.backends.cudnn_frost" = ["artifacts/*/*.json", "artifacts/*/sources/*.py", "csrc/**"]
-# Generated sources and build manifest (cake-build/1) of the experimental exact-SM110a GQA decode backend.
-"flashinfer.experimental.sm110_gqa_decode" = ["csrc/**", "build.json"]
+# Generated sources for the experimental exact-SM110 GQA decode backend.
+"flashinfer.experimental.sm110_gqa_decode" = ["csrc/**"]
 # Frozen native sources and manifest for the exact-SM110 XQA backend.
 "flashinfer.experimental.sm110_xqa" = ["csrc/**"]
 # The Qwen 3.5 gated attention block: the feature README and the vendored cuDNN Frontend tree's provenance files.
