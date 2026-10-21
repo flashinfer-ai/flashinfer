@@ -154,17 +154,40 @@ def w8a16_fp8_gemm_workspace_bytes(
 ) -> int:
     """Workspace bytes :func:`w8a16_fp8_gemm` needs for an ``[M, K] x [N, K]`` problem.
 
-    ``0`` when the launcher's choice for this shape runs in a single pass;
-    otherwise the fp32 partials plus CUTLASS scratch of the split-K (or
-    stream-K) decomposition it would pick.  ``m`` is the flattened row count
-    (the product of ``act``'s leading dimensions).  The answer depends on the
-    device (SM count) and on ``algo`` exactly as the launch does, so size the
-    buffer with the arguments you will call with; a caller serving several
-    shapes from one buffer takes the maximum over them.  The size is the same
-    for fp16 and bf16; ``act_dtype`` only selects which JIT module answers
-    (pass the dtype you will call with to avoid compiling the other one).
-    ``m == 0`` needs no workspace (the call returns the empty output without
-    launching); ``device`` without an index means the current CUDA device.
+    Parameters
+    ----------
+    m, n, k: int
+        The problem: ``m`` is the flattened row count of ``act`` (the product
+        of its leading dimensions), ``n`` the weight's row count, ``k`` the
+        reduction depth.  Same bounds as the call: ``m >= 0``, ``n`` and ``k``
+        positive, ``k`` a multiple of 16, ``n`` a multiple of 8, all at most
+        ``2**31 - 1``.
+    device: Optional[torch.device]
+        The CUDA device the call will run on (current device when omitted or
+        given without an index).  The answer depends on it.
+    algo: Optional[str]
+        The ``algo`` the call will be made with (``None`` / ``"auto"`` = the
+        launcher's choice).  The answer depends on it exactly as the launch
+        does, so query with the arguments you will call with; a caller serving
+        several shapes from one buffer takes the maximum over them.
+    act_dtype: torch.dtype
+        The activation dtype the call will use.  The size is the same for
+        fp16 and bf16; passing the dtype you will call with avoids compiling
+        the other dtype's module.
+
+    Returns
+    -------
+    int
+        ``0`` when the call needs no workspace (every ``m == 0`` call, and
+        every shape whose variant runs in a single pass), otherwise the byte
+        count a ``workspace`` passed to :func:`w8a16_fp8_gemm` must reach.
+
+    Raises
+    ------
+    ValueError
+        A shape outside the bounds above, an unknown ``algo``, a non-CUDA
+        device, or (for ``m > 0``) a split-K ``algo`` on a ``k`` that cannot
+        be sliced.
     """
     device = _resolve_device(device)
     _check_dims(m, n, k)
@@ -208,11 +231,10 @@ W8A16_FP8_GEMM_ALGOS_SM100: dict[str, int] = {
 }
 
 
-# Hopper kernel variants selectable through ``algo``: the variants on CUTLASS's mixed-input
-# mainloop (weight rows x activation rows per CTA tile, plus the stream-K and split-K
-# decompositions).  The codes are the W8A16Sm90Algo enum values in
-# include/flashinfer/gemm/w8a16_sm90/dispatch.hpp; code 1 was the retired
-# hand-written kernel and stays reserved.
+# Hopper kernel variants selectable through ``algo`` (weight rows x activation rows per
+# CTA tile, plus the stream-K and split-K decompositions).  The codes are the
+# W8A16Sm90Algo enum values in include/flashinfer/gemm/w8a16_sm90/dispatch.hpp; code 1
+# is reserved.
 W8A16_FP8_GEMM_ALGOS_SM90: dict[str, int] = {
     "auto": 0,
     "128x256": 2,
@@ -256,22 +278,18 @@ def w8a16_fp8_gemm(
 ) -> torch.Tensor:
     r"""bf16 / fp16 GEMM whose ``[N, K]`` operand is stored as FP8 e4m3 (W8A16).
 
-    The math is a plain 16-bit GEMM: the tensor cores run bf16 x bf16 or fp16 x
-    fp16 with fp32 accumulation, and the result is in ``act``'s dtype.  Nothing
-    e4m3 reaches an MMA instruction.  "fp8" in the name says how the weight is
-    *stored* (e4m3 plus one per-tensor scale, as opposed to the int8 of a plain
-    W8A16 scheme); the kernel converts it to the activation dtype on the way from
-    memory to the MMA.  Same reading as vLLM's ``CompressedTensorsW8A16Fp8``.
-
-    ``out = act @ (weight.float() * weight_scale).T + bias``, computed with the
-    weight dequantized inside the kernel; no 16-bit copy of the weight is
-    materialised.  It consumes the same checkpoint tensors as TRT-LLM's
-    ``W8A16FP8LinearMethod`` (an FP8QDQ weight with one per-tensor scale) and
-    replaces its ``weight.to(dtype).mul_(scale)`` followed by ``F.linear``.
+    ``out = act @ (weight.float() * weight_scale).T + bias`` with the weight
+    dequantized inside the kernel; no 16-bit copy of the weight is
+    materialised.  "fp8" says how the weight is *stored* (e4m3 plus one
+    per-tensor scale, the reading of vLLM's ``CompressedTensorsW8A16Fp8``);
+    the arithmetic is a 16-bit GEMM in ``act``'s dtype.  It consumes the same
+    checkpoint tensors as TRT-LLM's ``W8A16FP8LinearMethod`` (an FP8QDQ weight
+    with one per-tensor scale) and replaces its
+    ``weight.to(dtype).mul_(scale)`` followed by ``F.linear``.
 
     Numerics.  Each e4m3 weight value is converted to ``act``'s dtype exactly
     (every finite e4m3 value is representable in both bf16 and fp16, denormals
-    included), the tensor cores accumulate the unscaled products in fp32, and
+    included), the unscaled products are accumulated in fp32, and
     ``weight_scale`` (fp32) and ``bias`` are applied to the fp32 accumulator
     before the single rounding to the output dtype.  The TRT-LLM path instead
     rounds ``weight * scale`` to the activation dtype first, so the two are
@@ -301,58 +319,59 @@ def w8a16_fp8_gemm(
         same dtype as ``act``, on ``act``'s device, contiguous.  Allocated when
         omitted.
     workspace: Optional[torch.Tensor]
-        Optional scratch for the split-K / stream-K decompositions: a
-        contiguous, 16-byte aligned buffer of any dtype on ``act``'s device,
-        at least :func:`w8a16_fp8_gemm_workspace_bytes` bytes for this call's
-        shape and ``algo`` (its byte size counts, not its dtype).  Allocated
-        per call when omitted (through the caching allocator, so the cost is a
-        few microseconds of host time).  A caller that wants a fixed memory
-        budget sizes one buffer once and passes it to every call, under these
-        rules: the call overwrites the buffer (nothing in it survives), it
-        must not share memory with any other argument (see the aliasing rule
-        under Notes), and two calls may share one buffer only if they are
-        ordered on one stream or synchronised, since a call still running on
-        another stream would be reading partials the next call overwrites.
+        Optional scratch buffer: contiguous, 16-byte aligned, of any dtype, on
+        ``act``'s device, at least :func:`w8a16_fp8_gemm_workspace_bytes` bytes
+        for this call's shape, device and ``algo`` (its byte size counts, not
+        its dtype).  Allocated per call when omitted and needed.  A caller
+        that wants a fixed memory budget sizes one buffer once and passes it to
+        every call, under these rules: the call overwrites the buffer (nothing
+        in it survives), it must not share memory with any other argument (the
+        aliasing rule under Notes), and two calls may share one buffer only if
+        they are ordered on one stream or synchronised, since a call still
+        running on another stream would be reading what the next call
+        overwrites.
     algo: Optional[str]
         Pins one kernel variant instead of the launcher's choice: a key of
         ``W8A16_FP8_GEMM_ALGOS_SM100`` on Blackwell or of
         ``W8A16_FP8_GEMM_ALGOS_SM90`` on Hopper
         (``<weight rows>x<activation rows>[_streamk|_splitk]``).
         ``None`` / ``"auto"`` = the launcher decides.  This is the only
-        override; there are no environment variables.
+        override; there are no environment variables.  A ``_splitk`` variant
+        is rejected on a ``K`` it cannot slice (Hopper: ``K`` a multiple of
+        64 whose 64-deep tile count divides into 2..8 equal slices of at least
+        8 tiles; Blackwell: ``K`` a multiple of 128 whose 128-deep tile count
+        has a divisor in 2..8).
 
     Notes
     -----
-    Hopper (``sm_90a``: wgmma + TMA) and Blackwell (``sm_100a``: tcgen05 + TMA,
-    a FlashInfer fork of CUTLASS's mixed-input mainloop); JIT-compiled on
-    first use, not part of the AOT packages.  One module per architecture and
-    activation dtype (the dtype is rendered through a Jinja config header), so
-    the first bf16 call compiles only the bf16 variants and the first fp16 call
-    only the fp16 ones.  ``K`` must be a multiple of 16
-    and ``N`` a multiple of 8 (16-byte TMA rows), both non-zero, and every
-    tensor (``act`` / ``weight`` / ``bias`` / ``out`` / ``workspace``) must
-    start at a 16-byte aligned address (a view into a larger buffer at an odd
-    storage offset does not; contiguity alone is not enough); anything else is
-    rejected with a ValueError before launch, and the C++ launcher checks the
-    same rules again.  The checks do not depend on the shape: a call with an
-    empty ``act`` (``M == 0``) validates every argument exactly like a
-    non-empty one (the only exception is the address alignment of the empty
-    ``act`` and ``out`` themselves, which have none) and then returns the
-    empty output without launching.
-    Nothing is copied on the caller's behalf: a non-contiguous ``act`` or
-    ``out`` is rejected (call ``.contiguous()`` yourself if a copy is
-    acceptable).  Aliasing: the two buffers the call writes, ``out`` and
-    ``workspace``, must not share any bytes with ``act`` / ``weight`` /
-    ``weight_scale`` / ``bias`` or with each other (tiles still reading an
-    input would see it overwritten; the split-K reduction reads the scale after
-    the partials are written), and a call whose buffers overlap is rejected
-    with a ValueError.  The inputs may alias one another freely (they are only
-    read).  On Hopper the launcher picks a CUTLASS tile and
-    decomposition (plain, stream-K or split-K) from a cost model; split-K and
-    stream-K runs go through scratch memory (``workspace``, or a buffer this
-    function allocates).  On Blackwell it picks from the same kind of model
-    among the 2SM tiles, their split-K and stream-K decompositions, and the
-    1SM tile for weights of at most 128 rows at large ``M``.
+    Runs on Hopper (``sm_90a``) and Blackwell (``sm_100a``).  The kernels are
+    JIT-compiled on first use (one module per architecture and activation
+    dtype, so the first bf16 call compiles only the bf16 module and the first
+    fp16 call only the fp16 one) and are not part of the AOT packages.
+
+    Shapes and layout: ``K`` must be a multiple of 16 and ``N`` a multiple of
+    8, both non-zero, and every dimension at most ``2**31 - 1``.  Every tensor
+    among ``act`` / ``weight`` / ``bias`` / ``out`` / ``workspace`` must start
+    at a 16-byte aligned address (a view into a larger buffer at an odd
+    storage offset does not; contiguity alone is not enough).  Nothing is
+    copied on the caller's behalf: a non-contiguous ``act``, ``weight``,
+    ``bias``, ``out`` or ``workspace`` is rejected (call ``.contiguous()``
+    yourself if a copy is acceptable).  Anything else is rejected with a
+    ValueError before launch.
+
+    Aliasing: the two buffers the call writes, ``out`` and ``workspace``,
+    must not share any bytes with ``act`` / ``weight`` / ``weight_scale`` /
+    ``bias`` or with each other; a call whose buffers overlap is rejected with
+    a ValueError.  The inputs may alias one another freely (they are only
+    read).
+
+    Empty calls: with ``M == 0`` the dtypes, shapes, devices, contiguity and
+    aliasing of every argument and the alignment of ``weight``, ``bias`` and
+    ``workspace`` are checked as for a non-empty call (the empty ``act`` and
+    ``out`` have no address to align), then the empty output is returned
+    without launching.  No kernel variant is resolved and no workspace is
+    sized or checked for such a call, so a split-K ``algo`` on an unsliceable
+    ``K`` or an undersized ``workspace`` is not reported there.
 
     Returns
     -------

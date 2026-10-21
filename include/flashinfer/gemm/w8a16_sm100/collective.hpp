@@ -58,9 +58,11 @@
 namespace cutlass::gemm::collective {
 using namespace cute;
 
-// L2 eviction hint carried as a plain integer and handed to whichever TMA copy traits the
-// variant uses: the 2SM tiles load through SM100_TMA_2SM_LOAD (CacheHintSm100), the 1SM
-// tile through SM90_TMA_LOAD (CacheHintSm90).  Both enums share the same encodings.
+// L2 eviction hint carried as a plain integer and handed to whichever TMA copy traits each
+// operand's load uses: the converted operand A always loads through SM90_TMA_LOAD
+// (CacheHintSm90), the operand B through SM100_TMA_2SM_LOAD on the 2SM tiles
+// (CacheHintSm100) and SM90_TMA_LOAD on the 1SM tile (see GmemTiledCopyA / GmemTiledCopyB in
+// builder.hpp).  Both enums share the same encodings.
 struct W8A16L2Hint {
   uint64_t v;
   CUTE_HOST_DEVICE operator cute::TMA::CacheHintSm90() const { return static_cast<cute::TMA::CacheHintSm90>(v); }
@@ -303,8 +305,8 @@ public:
   static_assert((size<2>(TileShape{}) % size<1>(SmemLayoutAtomScale{})) == 0, "SmemLayoutAtomScale must evenly divide tile k shape.");
 
   // Thread Counts
-  // FlashInfer: two transform warpgroups (upstream has one).  Both map onto the same 128 TMEM
-  // lanes (rows); warpgroup g converts k-blocks [g * K_BLOCK_MAX / 2, (g + 1) * K_BLOCK_MAX / 2).
+  // Two transform warpgroups.  Both map onto the same 128 TMEM lanes (rows); warpgroup g
+  // converts k-blocks [g * K_BLOCK_MAX / 2, (g + 1) * K_BLOCK_MAX / 2).
   static constexpr uint32_t NumTransformationGroups = 2;
   static constexpr uint32_t NumTransformationThreadsPerGroup = 128;
   static constexpr uint32_t NumTransformationThreads = NumTransformationGroups * NumTransformationThreadsPerGroup;
@@ -447,9 +449,9 @@ public:
     LayoutScale layout_S{};
     ElementZero const* ptr_Z{nullptr};
     // L2 eviction priority of the A (weight) and B (activation) TMA loads
-    // (cute::TMA::CacheHintSm100 values).  FlashInfer addition: the weight is re-read once
-    // per activation tile, the activation once per weight tile; the launcher passes the
-    // constants of tile_order.hpp (W8A16Sm100WeightCacheHint / W8A16Sm100ActCacheHint).
+    // (cute::TMA::CacheHintSm100 values).  The weight is re-read once per activation tile,
+    // the activation once per weight tile; the launcher passes the constants of
+    // tile_order.hpp (W8A16Sm100WeightCacheHint / W8A16Sm100ActCacheHint).
     uint64_t cache_hint_a{static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL)};
     uint64_t cache_hint_b{static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL)};
   };
@@ -843,7 +845,7 @@ public:
 
   }
 
-  /// Produce the inputs to the transform threads by loading inputs from gmem -> smem
+  /// Load B tiles from gmem -> smem for the MMA directly (Load2MmaPipeline; B is not transformed)
   template <
     class GTensorA, class GTensorB,
     class GTensorPartitionedA, class GTensorPartitionedB,

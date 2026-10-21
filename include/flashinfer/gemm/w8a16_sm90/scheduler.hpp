@@ -52,8 +52,7 @@ struct W8A16Sm90GroupedParams : cutlass::gemm::kernel::detail::PersistentTileSch
 };
 
 // Index map: FastDivmod (multiply-high + shift, precomputed on the host), as CUTLASS's own
-// scheduler does.  Measured equal to the stock scheduler and to a plain-division build
-// (same time within noise, same instruction count under ncu).
+// scheduler does.
 class W8A16Sm90GroupedTileScheduler
     : public cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90 {
   using Base = cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90;

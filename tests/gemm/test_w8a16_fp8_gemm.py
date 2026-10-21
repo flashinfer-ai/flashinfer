@@ -162,7 +162,7 @@ def test_w8a16_fp8_gemm_caller_workspace():
     )
     with pytest.raises(ValueError, match="workspace too small"):
         w8a16_fp8_gemm(act, w_fp8, scale, algo=algo, workspace=ws[: need - 4])
-    # A single-pass shape ignores the buffer entirely (0 bytes needed).
+    # A single-pass shape needs no scratch (0 bytes), so any valid buffer is accepted.
     plain = {9: "128x256", 10: "2sm256x128"}[major]
     assert w8a16_fp8_gemm_workspace_bytes(4096, 4096, 5120, dev, plain) == 0
     tiny = torch.empty(1, dtype=torch.uint8, device=dev)
@@ -177,7 +177,7 @@ def test_w8a16_fp8_gemm_caller_workspace():
 def test_w8a16_fp8_gemm_workspace_bytes_extreme_dims():
     """The workspace query runs the dispatch cost models without allocating anything,
     so it reaches dimensions the launcher admits (<= INT32_MAX) that no tensor would:
-    the tile-count ceil divisions must not overflow there (reviewer finding, UBSan)."""
+    the tile-count ceil divisions must not overflow there."""
     dev = torch.device("cuda")
     big = 2**31 - 1
     for m, n, k in [
@@ -197,7 +197,8 @@ def test_w8a16_fp8_gemm_workspace_bytes_splitk_overflow():
     ~2^64 bytes per slice); the query must say so instead of wrapping around and
     reporting a small number.  Smaller dimensions still report the exact size, and the
     split policies themselves must not overflow on the way there (the Blackwell long-K
-    rule multiplies tile counts by k-tile counts: large M, N and K together)."""
+    rule compares wave counts scaled by the split count, which stays bounded at large
+    M, N and K together)."""
     dev = torch.device("cuda")
     major = get_compute_capability(dev)[0]
     algo = {9: "128x128_splitk", 10: "2sm256x128_splitk"}[major]
@@ -520,8 +521,8 @@ def test_w8a16_fp8_gemm_device_resolution():
         w8a16_fp8_gemm_workspace_bytes(256, 1024, 5120, torch.device("cpu"))
 
 
-def test_w8a16_fp8_gemm_rejects_retired_hand_algo():
-    """The retired hand-written Hopper kernel is not selectable; its name is gone."""
+def test_w8a16_fp8_gemm_rejects_unknown_algo_name():
+    """An algo name outside the architecture's table is rejected ("hand" is not one)."""
     dev = torch.device("cuda")
     act = torch.randn(16, 256, device=dev, dtype=torch.bfloat16)
     w_fp8, scale = _quantize(torch.randn(128, 256, device=dev))

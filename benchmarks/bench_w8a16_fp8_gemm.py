@@ -141,7 +141,8 @@ DEFAULT_MS = [1024, 2048, 4096, 8192, 44160, 88320]
 DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
 # ---------------------------------------------------------------------------
-# Timing (pattern from bench_checkpointing_ssu.py::_time_kernel_cupti)
+# Timing: CUPTI kernel time per launch (CUDA events as the fallback), L2 flushed between
+# launches
 # ---------------------------------------------------------------------------
 
 _L2_FLUSH_SIZE = 32 * 1024 * 1024  # float32 elements -> 128 MB
@@ -465,10 +466,10 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
     # drifts between back-to-back measurements; interleaving keeps that drift out of the
     # per-row ratios.
     names = list(impls)
-    # Steady-state recipe (--warmup-seconds / --burst-seconds): a short burst never reaches
-    # the 700 W power cap and measures the boost clock instead (the recipe experiment in
-    # benchmarks/w8a16_fp8_gemm_ladder.md).  Heat the GPU with an untimed burst of the
-    # first column, then size each timed burst by time rather than by launch count.
+    # Steady-state protocol (--warmup-seconds / --burst-seconds): a short burst never
+    # reaches the power cap and measures the boost clock instead.  Heat the GPU with an
+    # untimed burst of the first column, then size each timed burst by time rather than
+    # by launch count.
     iters_by_name = {name: args.iters for name in names}
     if args.burst_seconds > 0:
         for name in names:

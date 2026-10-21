@@ -139,9 +139,9 @@ w8a16_sm100_compute_stage_count_or_override_mixed_input(StageCountAutoCarveout<c
   constexpr int TmemAccWordsPerDP = (CtaM == 64 && size(AtomThrID{}) == 2) ? CtaN/2 : CtaN;
   constexpr int TmemAWordsPerDP = CtaK / 2;
 
-  // TMEM-A path: upstream only handles CtaN <= 128 (2 accumulator stages at 128 columns
-  // leave 4 A stages; 3 stages below that).  FlashInfer generalises: keep 2 accumulator
-  // stages and give the rest to A, so CtaN = 192 fits as 2 x 192 + 2 x 64 = 512.
+  // TMEM-A path: 3 accumulator stages when one takes fewer than 128 columns, else 2, and
+  // the remaining columns go to the A stages (CtaN = 128: 2 x 128 + 4 x 64; CtaN = 192:
+  // 2 x 192 + 2 x 64 = 512).  Smem-A path: as many accumulator stages as fit in TMEM.
   constexpr int AccumulatorStageCount = (IsAComputeinTmem)
       ? ((TmemAccWordsPerDP < 128) ? 3 : 2)
       : (TmemColumns / TmemAccWordsPerDP);
@@ -288,10 +288,14 @@ struct CollectiveBuilder<
   using BlockTileA_M = decltype(cute::size<0,0>(MmaShapeA_MK{}) * cute::size<1>(MmaShapeA_MK{}));
   using BlockTileA_K = decltype(cute::size<0,1>(MmaShapeA_MK{}) * cute::size<2>(MmaShapeA_MK{}));
 
+  // A (the converted operand) is loaded per CTA with the SM90 TMA atom even on the 2SM
+  // tiles: each CTA transforms its own half, so the 2SM multicast load does not apply.  B
+  // goes straight to the MMA and takes the SM100 atom for the cluster shape.
   using GmemTiledCopyA = decltype(detail::sm90_cluster_shape_to_tma_atom(cute::size<1>(ClusterShape_MNK{})));
   using GmemTiledCopyB = decltype(detail::sm100_cluster_shape_to_tma_atom_B(ClusterShape_MNK{}, AtomThrID{}));
 
-  // Input transform kernel can not use TMA 2SM instructions.
+  // Smem layout of the A tile as loaded (fp8) and as converted (16-bit); the converted
+  // operand cannot use the 2SM TMA layouts.
   using SmemLayoutAtomA = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<UmmaMajorA, ElementA,
     BlockTileA_M, BlockTileA_K>());
   using SmemLayoutAtomACompute =  decltype(cutlass::gemm::collective::detail::sm100_smem_selector<UmmaMajorA, ElementAMma, BlockTileA_M, BlockTileA_K>());
@@ -308,7 +312,7 @@ struct CollectiveBuilder<
   using BlockTileB_N = decltype(cute::size<0,0>(MmaShapeB_NK{}) * cute::size<1>(MmaShapeB_NK{}));
   using BlockTileB_K = decltype(cute::size<0,1>(MmaShapeB_NK{}) * cute::size<2>(MmaShapeB_NK{}));
 
-  // Input transform kernel can not use TMA 2SM instructions.
+  // Smem layout of the B tile (loaded and consumed in the same 16-bit type).
   using SmemLayoutAtomB = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<UmmaMajorB, ElementB,
     BlockTileB_N, BlockTileB_K>());
   using SmemLayoutAtomBCompute = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<UmmaMajorB, ElementBMma, BlockTileB_N, BlockTileB_K>());

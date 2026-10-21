@@ -23,12 +23,9 @@
 //   out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
 //
 // TMA lands the fp8 weight tile and the 16-bit activation tile in smem, each consumer
-// warpgroup pulls its 64 weight rows into registers, converts them (convert.hpp) and issues
-// wgmma with A from registers and B from smem.  Operand mapping: the narrow operand must be
-// the builder's A, so the weight [N, K] is A with M' = N, the activation [M, K] is B with
-// N' = M, D is [M', N'] column-major, which is out[M, N] row-major.  Per-tensor scale =
-// epilogue alpha (device pointer), bias = per-row (M' = N) broadcast in the fused epilogue.
-// A split-K variant writes fp32 partials instead and applies scale and bias in its reduce.
+// warpgroup pulls its 64 weight rows into registers, converts them (w8a16_convert.hpp) and
+// issues wgmma with A from registers and B from smem.  The operand mapping, the fused
+// epilogue and the host-side lifecycle (arguments, workspace, run) are in w8a16_host.hpp.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -49,7 +46,8 @@
 #include "cutlass/numeric_types.h"
 #include "cutlass/util/packed_stride.hpp"
 #include "flashinfer/gemm/w8a16_common.hpp"
-#include "flashinfer/gemm/w8a16_sm90/convert.hpp"
+#include "flashinfer/gemm/w8a16_convert.hpp"
+#include "flashinfer/gemm/w8a16_host.hpp"
 #include "flashinfer/gemm/w8a16_sm90/scheduler.hpp"
 #include "flashinfer/gemm/w8a16_sm90/tile_order.hpp"
 
@@ -110,11 +108,9 @@ struct W8A16Sm90Cfg {
                          cutlass::epilogue::TmaWarpSpecialized>;
 };
 
-// The instantiated tiles.  Cooperative 128-row weight tiles at four activation heights (the
+// The instantiated tiles: cooperative 128-row weight tiles at four activation heights (the
 // dispatcher picks the height whose tile count best fills the SMs), and two ping-pong tiles
-// (two tiles in flight per SM) for short mainloops.  A cluster-2 multicast pair of the
-// 128x256 tile measured within 2% of the cluster-1 tile on every benchmark row, so it is
-// not instantiated.
+// (two tiles in flight per SM) for short mainloops.  All run at cluster size 1.
 using W8A16Sm90Cfg128x256 = W8A16Sm90Cfg<W8A16Sm90::CooperativeW, W8A16Sm90::TileA256>;
 using W8A16Sm90Cfg128x192 = W8A16Sm90Cfg<W8A16Sm90::CooperativeW, W8A16Sm90::TileA192>;
 using W8A16Sm90Cfg128x160 = W8A16Sm90Cfg<W8A16Sm90::CooperativeW, W8A16Sm90::TileA160>;
@@ -131,6 +127,8 @@ template <typename T, typename Cfg, W8A16Decomposition Decomp = W8A16Decompositi
 struct W8A16Sm90Gemm {
   static constexpr bool IsSplitK = Decomp == W8A16Decomposition::SplitK;
   static constexpr bool IsStreamK = Decomp == W8A16Decomposition::StreamK;
+  static constexpr int TileK = Cfg::K;
+  using ActType = T;
   using ElementW = cutlass::float_e4m3_t;
   using ElementAct = typename W8A16CutlassType<T>::type;
   using ElementD = std::conditional_t<IsSplitK, float, ElementAct>;
@@ -144,9 +142,11 @@ struct W8A16Sm90Gemm {
   using LayoutB = cutlass::layout::ColumnMajor;
   // D [M', N'] column-major == out[M, N] row-major.
   using LayoutD = cutlass::layout::ColumnMajor;
-  static constexpr int AlignA = 128 / cutlass::sizeof_bits<ElementW>::value;    // 16
-  static constexpr int AlignB = 128 / cutlass::sizeof_bits<ElementAct>::value;  // 8
-  static constexpr int AlignD = 128 / cutlass::sizeof_bits<ElementD>::value;    // 8
+  // Elements per 16-byte access: 16 fp8 weights, 8 16-bit activations, 8 16-bit outputs or
+  // 4 fp32 split-K partials.
+  static constexpr int AlignA = 128 / cutlass::sizeof_bits<ElementW>::value;
+  static constexpr int AlignB = 128 / cutlass::sizeof_bits<ElementAct>::value;
+  static constexpr int AlignD = 128 / cutlass::sizeof_bits<ElementD>::value;
 
   // D = alpha * acc + bias[row]; alpha is the per-tensor weight scale, bias is per M' (= N).
   // Split-K partials: D = acc (fp32); scale and bias are applied in the reduce.
@@ -184,116 +184,22 @@ struct W8A16Sm90Gemm {
   using StrideB = typename GemmKernel::StrideB;
   using StrideD = typename GemmKernel::StrideD;
 
-  // `splits` > 1 only with split-K: problem {N, M, K / splits, splits}; A and B batch stride
-  // = K / splits elements (the next K-slice, row strides stay K so TMA walks the slices in
-  // place), D batch stride = M * N (the next fp32 partial).
+  // The shared arguments (w8a16_host.hpp) plus the tile walk order (tile_order.hpp): raster
+  // "m" everywhere; the grouped scheduler takes its L2 group size through max_swizzle_size,
+  // CUTLASS's own schedulers get 1 (no grouping, no padding).
   static typename Gemm::Arguments MakeArguments(const T* act, const __nv_fp8_e4m3* weight,
                                                 const float* scale, const T* bias, void* out, int M,
                                                 int N, int K, int device_id, int num_sms,
-                                                int splits = 1) {
-    const int kc = K / splits;
-    StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(N, K, 1));
-    StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(M, K, 1));
-    StrideD stride_d = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(N, M, 1));
-    if (splits > 1) {
-      cute::get<2>(stride_a) = kc;
-      cute::get<2>(stride_b) = kc;
-      cute::get<2>(stride_d) = static_cast<int64_t>(M) * N;
-    }
-
-    cutlass::KernelHardwareInfo hw_info;
-    hw_info.device_id = device_id;
-    hw_info.sm_count = num_sms;
-
-    typename Gemm::Arguments args{
-        cutlass::gemm::GemmUniversalMode::kGemm,
-        {N, M, kc, splits},
-        {reinterpret_cast<const ElementW*>(weight), stride_a,
-         reinterpret_cast<const ElementAct*>(act), stride_b},
-        {{}, nullptr, stride_d, reinterpret_cast<ElementD*>(out), stride_d},
-        hw_info};
-    auto& fusion = args.epilogue.thread;
-    fusion.alpha = 1.0f;
-    fusion.beta = 0.0f;
-    if constexpr (!IsSplitK) {
-      fusion.alpha_ptr = scale;  // per-tensor weight scale, read on device
-      fusion.beta_ptr = nullptr;
-      fusion.bias_ptr = reinterpret_cast<const ElementBias*>(bias);  // nullptr -> 0
-      fusion.dBias = {cute::_1{}, cute::_0{}, 0};
-    } else {
-      (void)scale;
-      (void)bias;
-    }
-    // Tile walk order (tile_order.hpp): raster "m" everywhere; the grouped scheduler takes
-    // its L2 group size through max_swizzle_size, CUTLASS's own schedulers get 1 (no
-    // grouping, no padding).
+                                                int splits) {
+    auto args = W8A16BaseArguments<W8A16Sm90Gemm>(act, weight, scale, bias, out, M, N, K, device_id,
+                                                  num_sms, splits);
     args.scheduler.max_swizzle_size =
         IsGrouped ? W8A16Sm90PickGroup(M, N, K, Cfg::W) : W8A16Sm90CutlassSwizzle;
     args.scheduler.raster_order = W8A16Sm90Raster;
-    if constexpr (IsStreamK) {
-      // CUTLASS's heuristic decomposition (data-parallel full waves, stream-K tail) with
-      // the deterministic (K-ordered) peer reduction; the other modes never measured
-      // faster.
-      args.scheduler.decomposition_mode =
-          cutlass::gemm::kernel::detail::DecompositionMode::Heuristic;
-      args.scheduler.reduction_mode = cutlass::gemm::kernel::detail::ReductionMode::Deterministic;
-    }
     return args;
   }
 
-  // CUTLASS workspace (persistent scheduler: usually 0; stream-K: the peers' fp32
-  // partials plus per-tile barriers), rounded to 256 B, then the split-K fp32 partials
-  // (`splits` x M x N floats).  cudaErrorInvalidValue when the total leaves the signed
-  // 64-bit range the workspace query reports in (checked arithmetic: the admitted
-  // dimensions reach INT32_MAX each); `*bytes` is left untouched then.
-  static cudaError_t WorkspaceBytes(int M, int N, int K, int device_id, int num_sms, int splits,
-                                    size_t* bytes) {
-    auto args = MakeArguments(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, device_id,
-                              num_sms, splits);
-    uint64_t total = W8A16Align256(Gemm::get_workspace_size(args));
-    if (IsSplitK && splits > 1) {
-      uint64_t partials = static_cast<uint64_t>(splits) * sizeof(float);
-      if (!W8A16CheckedMul(partials, static_cast<uint64_t>(M), &partials) ||
-          !W8A16CheckedMul(partials, static_cast<uint64_t>(N), &partials) ||
-          !W8A16CheckedAdd(total, partials, &total)) {
-        return cudaErrorInvalidValue;
-      }
-    }
-    *bytes = static_cast<size_t>(total);
-    return cudaSuccess;
-  }
-
-  static cudaError_t Run(const T* act, const __nv_fp8_e4m3* weight, const float* scale,
-                         const T* bias, T* out, int M, int N, int K, void* workspace,
-                         size_t workspace_bytes, int device_id, int num_sms, cudaStream_t stream,
-                         int splits = 1) {
-    if (IsSplitK && (splits < 2 || K % (splits * Cfg::K) != 0)) return cudaErrorInvalidValue;
-    void* d_out = out;
-    if constexpr (IsSplitK) {
-      auto probe = MakeArguments(nullptr, nullptr, nullptr, nullptr, nullptr, M, N, K, device_id,
-                                 num_sms, splits);
-      const size_t cutlass_ws = W8A16Align256(Gemm::get_workspace_size(probe));
-      size_t need = 0;
-      if (WorkspaceBytes(M, N, K, device_id, num_sms, splits, &need) != cudaSuccess ||
-          need > workspace_bytes) {
-        return cudaErrorInvalidValue;
-      }
-      d_out = static_cast<char*>(workspace) + cutlass_ws;
-    }
-    auto args = MakeArguments(act, weight, scale, bias, d_out, M, N, K, device_id, num_sms, splits);
-    Gemm gemm;
-    if (Gemm::get_workspace_size(args) > workspace_bytes) return cudaErrorInvalidValue;
-    if (gemm.can_implement(args) != cutlass::Status::kSuccess) return cudaErrorNotSupported;
-    if (gemm.initialize(args, workspace, stream) != cutlass::Status::kSuccess) {
-      return cudaErrorUnknown;
-    }
-    if (gemm.run(stream) != cutlass::Status::kSuccess) return cudaErrorLaunchFailure;
-    if constexpr (IsSplitK) {
-      return W8A16SplitKReduce<T>(static_cast<const float*>(d_out), splits, scale, bias, out, M, N,
-                                  stream);
-    }
-    return cudaSuccess;
-  }
+  static cutlass::Status Launch(Gemm& gemm, cudaStream_t stream) { return gemm.run(stream); }
 };
 
 }  // namespace flashinfer::gemm

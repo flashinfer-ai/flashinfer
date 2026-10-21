@@ -230,7 +230,7 @@ public:
     MainloopLoad  = 2,
     EpilogueLoad  = 3,
     Epilogue      = 4,
-    // Transformation starts at 256 thread alignment; two warpgroups (FlashInfer: upstream has one)
+    // Transformation starts at 256 thread alignment and spans two warpgroups (8 warps)
     Transformation = 8,
     MainloopLoadB  = 16,
   };
@@ -250,7 +250,8 @@ public:
   // Methods
   //
 
-  // Convert to underlying arguments. In this case, a simple copy for the aliased type.
+  // Convert the host arguments to kernel params: builds the mainloop, epilogue and scheduler
+  // params and lays out the workspace they share.
   static
   Params
   to_underlying_arguments(Arguments const& args, void* workspace) {
@@ -1070,10 +1071,9 @@ public:
         cta_coord_mnkl = scheduler.work_tile_to_cta_coord(work_tile_info);
       } while (work_tile_info.is_valid());
 
-      // Only perform a tail load if one of the work units processed performed
-      // an epilogue load. An example of a case in which a tail load should not be
-      // performed is in split-K if a cluster is only assigned non-final splits (for which
-      // the cluster does not compute the epilogue).
+      // Only drain the epilogue store pipeline if one of the work units processed ran the
+      // epilogue.  Under stream-K a cluster assigned only non-final K fragments of its
+      // tiles never runs it, and then there is nothing to drain.
       if (do_tail_store) {
         collective_epilogue.store_tail(
           epi_load_pipeline, epi_load_pipe_consumer_state,

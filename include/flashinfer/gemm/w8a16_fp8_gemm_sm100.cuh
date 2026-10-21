@@ -18,18 +18,19 @@
 
 // W8A16 GEMM for Blackwell (sm_100a): FlashInfer's fork of CUTLASS's mixed-input kernel
 // with two transform warpgroups and a menu of tiles, picked per problem by a wave-fill cost
-// model fitted to measurements on the Cosmos3-Super shapes (benchmarks/bench_w8a16_fp8_gemm.py).
+// model.
 //
 //   out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
 //
-// The pieces (w8a16_sm100/, shared parts in w8a16_common.hpp):
+// The pieces (w8a16_sm100/; shared with Hopper: w8a16_common.hpp, w8a16_convert.hpp for the
+// e4m3 -> bf16 / f16 conversion the transform warps run, w8a16_host.hpp for the host-side
+// arguments / workspace / run sequence):
 //   policy.hpp, builder.hpp, collective.hpp, kernel.hpp
 //                   the forked CUTLASS mixed-input mainloop (transform warpgroups, A in
 //                   TMEM or smem)
-//   convert.hpp     e4m3 -> bf16 / f16 conversion the transform warps run
 //   tile_order.hpp  tile-group size, raster order and TMA cache hints per problem
-//   gemm.hpp        the tile configurations and the W8A16Sm100Gemm kernel wrapper
-//   dispatch.hpp    `algo` codes, split-K / stream-K rules, the cost model, the tables
+//   gemm.hpp        the tile configurations and the W8A16Sm100Gemm kernel variants
+//   dispatch.hpp    `algo` codes, split-K / stream-K rules, the cost model, the variant table
 // The launcher (csrc/w8a16_fp8_gemm_sm100.cu) calls W8A16Sm100Resolve, then
 // W8A16Fp8GemmSm100 / W8A16Fp8GemmSm100WorkspaceBytes with the resulting plan.
 

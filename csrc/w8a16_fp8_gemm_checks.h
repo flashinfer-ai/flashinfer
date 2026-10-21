@@ -16,18 +16,30 @@
 #ifndef FLASHINFER_CSRC_W8A16_FP8_GEMM_CHECKS_H_
 #define FLASHINFER_CSRC_W8A16_FP8_GEMM_CHECKS_H_
 
-// Argument validation shared by the Hopper and Blackwell w8a16_fp8_gemm launchers
-// (csrc/w8a16_fp8_gemm.cu, csrc/w8a16_fp8_gemm_sm100.cu).  Both launchers expose the same
-// contract; only the variant codes and the kernels behind them differ.
+// The FFI contract and the launch / query sequence shared by the Hopper and Blackwell
+// w8a16_fp8_gemm launchers (csrc/w8a16_fp8_gemm.cu, csrc/w8a16_fp8_gemm_sm100.cu).  Both
+// expose the same two functions; only the variant codes and the kernels behind them differ
+// (the W8A16Launcher traits each .cu defines).
 //
 //   out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])
 //
-// act [M, K] fp16/bf16, weight [N, K] fp8 e4m3, scale one fp32 value, bias [N] in act's
-// dtype, out [M, N] in act's dtype; everything contiguous, on one device, 16-byte aligned.
-// The workspace is a byte buffer of any dtype (the kernels take a void* and a byte count).
-// `out` and the workspace are written while the inputs are still being read (other tiles,
-// the split-K reduction), so neither may share bytes with act / weight / scale / bias, nor
-// with each other; the inputs may alias one another freely.
+// w8a16_fp8_gemm(out, act, weight, scale, bias, workspace, algo):
+//   act [M, K] fp16 or bf16 (the dtype the module was built for), weight [N, K] fp8 e4m3,
+//   scale one fp32 value, bias [N] in act's dtype (optional), out [M, N] in act's dtype;
+//   all contiguous and on one device; M, N, K positive 32-bit values with K % 16 == 0 and
+//   N % 8 == 0.  act, weight, out, bias and the workspace start at 16-byte aligned
+//   addresses (scale is one element and only needs to be contiguous).  The workspace is an
+//   optional contiguous buffer of any dtype, counted in bytes, that must hold at least what
+//   the query below reports for the same M, N, K, device and algo.  `algo` is 0 (the
+//   launcher's choice) or a variant code in the architecture's range.  `out` and the
+//   workspace are written while the inputs are still being read, so neither may share bytes
+//   with act / weight / scale / bias, nor with each other; the inputs may alias one another.
+//   Any violation raises before anything is launched.
+// w8a16_fp8_gemm_workspace_bytes(M, N, K, device_id, algo):
+//   the bytes the call needs for that problem (0 when none), rejecting the same shapes and
+//   algo codes the call would; the answer does not depend on the activation dtype.
+
+#include <cuda_fp8.h>
 
 #include <cstdint>
 
@@ -84,8 +96,9 @@ inline void W8A16CheckDims(int64_t M, int64_t N, int64_t K) {
   TVM_FFI_ICHECK(N % 8 == 0) << "N must be a multiple of 8 (16-byte output rows), got " << N;
 }
 
-// Validates every tensor argument of w8a16_fp8_gemm against the contract above.
-// `act_dtype_code` is the DLPack code the module was built for (W8A16_ACT_DTYPE_CODE).
+// Validates every tensor argument of w8a16_fp8_gemm against the contract above (the
+// 16-byte alignment applies to act, weight, out, bias and the workspace).  `act_dtype_code`
+// is the DLPack code the module was built for (W8A16_ACT_DTYPE_CODE).
 inline W8A16Operands W8A16CheckOperands(const TensorView& out, const TensorView& act,
                                         const TensorView& weight, const TensorView& scale,
                                         const ffi::Optional<TensorView>& bias,
@@ -182,6 +195,59 @@ inline void W8A16CheckPlan(cudaError_t status, int64_t algo, int first_code, int
 inline void W8A16CheckWorkspaceBytes(cudaError_t status, int64_t M, int64_t N, int splits) {
   TVM_FFI_ICHECK(status == cudaSuccess) << "the workspace for M=" << M << ", N=" << N << " in "
                                         << splits << " K-slices exceeds the 64-bit byte range";
+}
+
+// What a launcher .cu supplies to the two shared entry points below:
+//   using Plan = ...;                       W8A16Sm90Plan / W8A16Sm100Plan
+//   static constexpr const char* Name;      for the error message
+//   static constexpr int FirstAlgoCode, MaxAlgoCode;
+//   static constexpr const char* SliceRule; when the split-K variant can slice K
+//   static cudaError_t Resolve(int M, int N, int K, int num_sms, int64_t algo, Plan*);
+//   template <typename T> static cudaError_t WorkspaceBytes(const Plan&, int M, int N, int K,
+//                                                           int device_id, int num_sms, size_t*);
+//   template <typename T> static cudaError_t Run(const Plan&, const T* act, const
+//       __nv_fp8_e4m3* weight, const float* scale, const T* bias, T* out, int M, int N, int K,
+//       void* workspace, size_t workspace_bytes, int device_id, int num_sms, cudaStream_t);
+
+// The w8a16_fp8_gemm entry point: validate, plan, launch on the activation's stream.
+template <typename Launcher, typename T>
+void W8A16LaunchGemm(const TensorView& out, const TensorView& act, const TensorView& weight,
+                     const TensorView& scale, const ffi::Optional<TensorView>& bias,
+                     const ffi::Optional<TensorView>& workspace, int64_t algo, int act_dtype_code) {
+  const W8A16Operands ops =
+      W8A16CheckOperands(out, act, weight, scale, bias, workspace, act_dtype_code);
+  typename Launcher::Plan plan;
+  W8A16CheckPlan(Launcher::Resolve(ops.M, ops.N, ops.K, ops.num_sms, algo, &plan), algo,
+                 Launcher::FirstAlgoCode, Launcher::MaxAlgoCode, ops.K, Launcher::SliceRule);
+
+  ffi::CUDADeviceGuard device_guard(ops.device_id);
+  const cudaStream_t stream = get_stream(act.device());
+  const cudaError_t status = Launcher::template Run<T>(
+      plan, static_cast<const T*>(act.data_ptr()),
+      static_cast<const __nv_fp8_e4m3*>(weight.data_ptr()),
+      static_cast<const float*>(scale.data_ptr()), static_cast<const T*>(ops.bias),
+      static_cast<T*>(out.data_ptr()), ops.M, ops.N, ops.K, ops.workspace, ops.workspace_bytes,
+      ops.device_id, ops.num_sms, stream);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << Launcher::Name << " failed with error code " << cudaGetErrorString(status);
+}
+
+// The w8a16_fp8_gemm_workspace_bytes entry point: the bytes the plan's variant needs (0 when
+// none), rejecting the same requests the call would, so the caller learns before allocating.
+template <typename Launcher, typename T>
+int64_t W8A16QueryWorkspaceBytes(int64_t M, int64_t N, int64_t K, int64_t device_id, int64_t algo) {
+  W8A16CheckDims(M, N, K);
+  const int num_sms = W8A16NumSms(static_cast<int>(device_id));
+  typename Launcher::Plan plan;
+  W8A16CheckPlan(Launcher::Resolve(static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                                   num_sms, algo, &plan),
+                 algo, Launcher::FirstAlgoCode, Launcher::MaxAlgoCode, K, Launcher::SliceRule);
+  size_t bytes = 0;
+  W8A16CheckWorkspaceBytes(Launcher::template WorkspaceBytes<T>(
+                               plan, static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                               static_cast<int>(device_id), num_sms, &bytes),
+                           M, N, plan.splits);
+  return static_cast<int64_t>(bytes);
 }
 
 #endif  // FLASHINFER_CSRC_W8A16_FP8_GEMM_CHECKS_H_

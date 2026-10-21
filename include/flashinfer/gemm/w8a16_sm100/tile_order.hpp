@@ -17,8 +17,7 @@
 #define FLASHINFER_GEMM_W8A16_SM100_TILE_ORDER_HPP_
 
 // Tile walk order and TMA cache hints of the Blackwell W8A16 kernels.  Pure functions of the
-// problem shape; each rule was measured on the Cosmos3-Super shapes with
-// benchmarks/bench_w8a16_fp8_gemm.py (B200).
+// problem shape.
 
 #include <cstdint>
 
@@ -28,14 +27,11 @@
 
 namespace flashinfer::gemm {
 
-// Which axis consecutive clusters walk fastest: CUTLASS's heuristic.  Forcing "m" (weight
-// tiles fastest) or "n" never beat it on the benchmark grid.
+// Which axis consecutive clusters walk fastest: CUTLASS's heuristic.
 inline constexpr cutlass::gemm::kernel::detail::RasterOrderOptions W8A16Sm100Raster =
     cutlass::gemm::kernel::detail::RasterOrderOptions::Heuristic;
 
 // L2 eviction priority of the weight (A) and activation (B) TMA loads: normal for both.
-// Evict-last on the weight and evict-first on the activation did not move the time on the
-// rows whose weight fits L2 but is evicted by the activation stream.
 inline constexpr uint64_t W8A16Sm100WeightCacheHint =
     static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL);
 inline constexpr uint64_t W8A16Sm100ActCacheHint =
@@ -46,13 +42,12 @@ inline constexpr uint64_t W8A16Sm100ActCacheHint =
 // activation band) working set stays in L2 instead of a line of tiles.  It matters when the
 // weight does not fit L2 and there are many activation tiles to re-stream it for: an fp8
 // weight of >= 64 MB (half of L2) at M >= 4096 is grouped, anything else keeps the plain
-// raster (at M <= 2048 the group only scrambles the wave packing of a grid a couple of waves
-// deep and costs the long-K rows 15-21%).  The group size scales with 1/K so that the band
-// of S weight tiles (S x 256 rows x K bytes) stays around 10-26 MB, where the DRAM bytes
-// (and so the power-capped clock) are at their best: S = 24 MB / (256 K) rounded to the
-// nearest integer, clamped to [2, 16] (16 at K=5120, 8 at 12800, 4 at 25600).  The sm100
-// scheduler does not pad the tile grid to the group (residual tiles are simply not
-// remapped), so no padding guard is needed.
+// raster (on a grid only a couple of waves deep the group scrambles the wave packing).  The
+// group size scales with 1/K so that the band of S weight tiles (S x 256 rows x K bytes)
+// stays around 10-26 MB: S = 24 MB / (256 K) rounded to the nearest integer, clamped to
+// [2, 16] (16 at K=5120, 8 at 12800, 4 at 25600).  The sm100 scheduler does not pad the
+// tile grid to the group (residual tiles are simply not remapped), so no padding guard is
+// needed.
 inline int W8A16Sm100PickSwizzle(int M, int N, int K) {
   const long long weight_bytes = static_cast<long long>(N) * K;  // e4m3: one byte each
   constexpr long long HalfL2 = 64ll << 20;
