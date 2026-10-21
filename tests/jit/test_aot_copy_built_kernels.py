@@ -37,6 +37,7 @@ def _spec(tmp_path: pathlib.Path, name: str = "fi_copy_probe") -> jit_core.JitSp
         sources=[],
         extra_cflags=[],
         extra_cuda_cflags=[],
+        extra_ldflags=[],
         extra_include_dirs=[],
         artifact_version="copy-probe",
     )

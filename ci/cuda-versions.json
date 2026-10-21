@@ -29,7 +29,7 @@
       "version": "13.4",
       "image": "nvidia/cuda:13.4.1-devel-ubuntu24.04",
       "pytorch_index": "nightly/cu134",
-      "cudnn_version": "9.24.0.43"
+      "cudnn_version": "9.26.0.51"
     }
   ],
   "jit_cache": [

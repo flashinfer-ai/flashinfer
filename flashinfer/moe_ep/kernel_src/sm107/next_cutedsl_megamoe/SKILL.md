@@ -27,7 +27,9 @@ kernel_src/sm107/next_cutedsl_megamoe/
 └── TUNING.md               ← tuning and benchmark conventions
 ```
 
-**Keep `src/` byte-for-byte equal to the pinned upstream export.**
+**Keep `src/` byte-for-byte equal to the pinned upstream export, except for the
+explicit local patches inventoried in `VENDOR.md`.**
+Reapply and requalify those patches after an export until upstream absorbs them.
 Record the exporter revision, selected kernels and generated transformations in
 `VENDOR.md`. Fix device/exporter code upstream and re-export; put FlashInfer
 adaptation in `shim/` and the backend wrappers.
@@ -83,8 +85,10 @@ python next/export_src.py \
 sha256sum next/export_src.py
 ```
 
-The current selection includes the generic and GenPhase inference kernels;
-GenPhase is vendored for a separate FlashInfer integration. Select additional
+The current selection includes the generic and GenPhase inference kernels.
+Select GenPhase with `kernel_variant="genphase"` and preserve its admitted
+cluster/tile combinations and bulk-store requirements documented in `VENDOR.md`
+when adapting the launcher. Select additional
 kernels when their FlashInfer integration is included in the update.
 The export may include dependencies from other kernel families; record their
 source mappings rather than manually removing them.
@@ -131,16 +135,20 @@ layouts, ownership and reset semantics can change while names remain stable.
 
 Preserve the integration's correctness fixes when adapting: physical K-major
 weight concatenation, bounded preprocessing temporaries, padded physical router
-capacity, per-launch masked-slot clearing/output resets, validated routing and
-unit-normalization contract. Recheck warmed graph bindings across different
-weights/streams and safe workspace teardown if those contracts change.
+capacity, per-launch masked-slot handling/output resets, routing validation,
+and normalization and scalar-override semantics. Separate BF16 reduction masks
+invalid slots; quantized combine and in-kernel reduction still require their
+respective clears. Recheck warmed graph bindings
+across different weights/streams and safe workspace teardown if those contracts
+change.
 
 ### 5. Carry supported changes through the FlashInfer API
 
-New supported knobs may require changes in `Sm107BlockScaledMoeConfig`, both
+New supported knobs may require changes in `Sm107BlockScaledMoeConfig`, all three
 SM107 backend config dataclasses, workspace construction/pool keys, validation,
-and package exports. Inspect both NVFP4 and MXFP8 consumers. An optional upstream
-field need not become a public knob unless the integration intends to support it.
+and package exports. Inspect NVFP4, MXFP8, and MXFP4-weight consumers. An optional
+upstream field need not become a public knob unless the integration intends to
+support it.
 
 Update heuristic profiles, candidate enumeration and cache keys when kernel
 semantics or legal configurations change. Bump the backend revision in both
@@ -148,10 +156,10 @@ cache lookup and recording when old entries are no longer valid. Require rank
 agreement and numerical qualification of tuning winners; do not reuse a cache
 across incompatible precision, routing-weight or reduction policies.
 
-`+combine_nvfp4` and `+combine_mxfp8` are future integration work: the current
-wrapper selects BF16 combine. Exposing the existing quantized-combine paths
-requires configuration, correctly sized payload/scale buffers, reduction and
-output handling, cache/pool identities, numerical tests and benchmark variants.
+`combine_dtype="nvfp4"` and `combine_dtype="mxfp8"` select quantized combine
+with the generic inference kernel; BF16 remains the default. Preserve payload
+and scale slot clearing, separate reduction, and cache/pool identities. Add
+numerical and benchmark coverage when changing either format.
 Check those requirements against the upstream kernel interface. Report each
 combine format as a separate variant alongside BF16 combine and `+ikr`.
 
@@ -181,6 +189,14 @@ source/environment identity. Existing benchmark numerical and configuration
 checks validate measured points. Reuse existing results when the implementation,
 environment, and workload are unchanged. Check links and commands for documentation edits.
 
+Qualify scheduling modes independently at each admitted EP degree. EP1 and EP4
+passes do not establish EP2 liveness: N64 phase-interleave has stalled in an EP2
+dense/replay check. Keep multirank N64 grouped-only until that mode has its own
+qualified repair. Check both direct config construction and `is_valid_sm107`
+with `test_genphase_n64_multirank_schedule_admission`; native grouped route
+transitions must continue to pass at EP2 and EP4. A timeout is a failed gate,
+not a configuration to include in a performance baseline.
+
 ### 7. Update the record and review the diff
 
 Update `VENDOR.md` with the full upstream SHA, date, closure, any export/local
@@ -203,3 +219,73 @@ validation logs. The package-data rule already includes this directory's
   preserve process-group/NVSHMEM ownership semantics through the backend API.
 - The sibling SM90/SM100/SM120 drops have their own pins and policies; do not
   copy their files into the Rubin closure outside documented upstream exports.
+
+### Generic router async publication
+
+Before `cp.async.bulk` or `cp.reduce.async.bulk` reads histogram/size data from
+shared memory, every generic-proxy writer executes an async shared-memory proxy
+fence, followed by a CTA barrier before the elected lanes issue the transfer.
+A plain `sync_threads()` does not establish this cross-proxy ordering. Keep this
+contract when changing histogram/scatter work or moving publication.
+
+Detector: run `test_sm107_routing_graph_multirank.py` on native SM107 with EP2/EP4.
+It checks sparse/asymmetric/dense transitions, poisoned combine slots, early/late
+weights, and the Generic multi-CTA path at capacity 2048 and top-k 10. The test asserts the
+actual DATA CTA count: capacity alone does not select this path; the routed-token
+capacity must exceed 16384. Inspect all capacity rows
+after both the first and sixty-fifth graph replay.
+
+### GenPhase publication and sort reuse
+
+`_run_exchange` rewrites the shared-memory index plane before TMA copies it to
+peers. Every writer must execute the async shared-memory proxy fence before the
+existing CTA join; a successful numerical run does not replace this ordering
+contract. This is the same generic-to-async boundary as Generic size publication.
+
+`_run_sort` acquires one published route extent and passes it to the selected
+sort body. Do not repeat the ready poll/acquire there, but retain the CTA barrier
+after histogram initialization: it orders zero stores before other lanes perform
+histogram atomics. Keep the existing IKET range around that join for trace
+continuity. Validate empty, late-valid, holey and dense-restored captured graphs
+on EP4 plus repeated launches across supported quantization formats.
+
+
+### Generic tail reset ownership
+
+For small reset prefixes, CTA0 owns all clear stores. Preserve the first
+producer-drain grid join, both peer barriers, and the CTA0 rendezvous after the
+first peer wait/phase increment. Only the second barrier's grid prologue is
+removed. Its existing CTA rendezvous/fence publishes every reset writer before
+peer signaling. Do not clear the persistent grid/phase counters: they are
+`zero_on_first_allocate`, outside the reset prefix. EP1, prefixes above 16 KiB,
+and NCU mode retain the original path.
+
+Detector: `test_tail_reset_ownership_for_workspace` constructs real layouts for
+small/large prefixes and checks the generated name; the single/multirank graph
+tests assert which path ran and validate changing routes across repeated replay.
+
+### GenPhase tail reset ownership
+
+The GenPhase tail has one NVLink peer barrier, unlike Generic's two. Before
+reset, drain the preceding router with `griddepcontrol_wait`, join ALL local
+warp roles with a CTA barrier, then perform the local grid join. Epilogue
+completion alone is insufficient on empty work: gather warps can still be
+acquiring ready flags, and refinement can still claim its final work counter.
+Only after these drains may CTA0 clear all small reset prefixes.
+Its existing publication-barrier CTA rendezvous and system fence order those
+stores before peer notification/acquire; only the post-reset grid prologue is
+omitted. EP1, prefixes above 16 KiB and NCU mode keep the original path. The
+persistent grid/phase/signal counters remain outside the reset prefix.
+
+Detector: `test_tail_reset_ownership_for_workspace` checks both families using
+real layouts. GenPhase capacity cannot exceed 1024; its worst-case row count
+is bounded by local expert count as well as top-k. Use enough local experts to
+actually exceed 16 KiB, and assert the measured prefix size. An EP16 constructor
+case does not qualify EP16 execution. The multirank graph test asserts the
+selected ownership and checks every capacity row after changing-route replay.
+
+Detector: `test_sparse_to_dense_genphase_quiescence` uses seven pushers to
+stress relative payload/consumer progress and checks early/late weights across
+empty, sparse and restored graph replays. The default pusher count remains 27.
+A private delayed-gather diagnostic also times out without the drains and
+passes with them; delay instrumentation must never enter performance results.

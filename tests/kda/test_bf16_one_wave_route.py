@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from flashinfer import prepare_bf16_kda_prefill
+from flashinfer.kda_prefill import select_bf16_schedule_route
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -117,3 +118,18 @@ def test_multi_wave_grid_keeps_direct_tile():
     schedule = _prepare((128,) * 8, 12, active_beta=True)
     assert "m64" not in schedule
     assert schedule.startswith("fused_")
+
+
+def test_select_bf16_schedule_route_is_the_shared_planner_adapter():
+    """The prepared runtime shares the planner's metadata adapter, which takes
+    the compute capability directly (no device probe).  The packed H12 grid of
+    1025 + 33 tokens (24 tasks, one M64 chain wave on 148 SMs) takes the BT16
+    prepare-chain M64 split on both supported architectures."""
+    kwargs = dict(
+        sm_count=148, fixed_layout=False, sequence_lengths=(1025, 33), num_heads=12
+    )
+    for compute_capability in ((10, 0), (10, 3)):
+        assert (
+            select_bf16_schedule_route(compute_capability=compute_capability, **kwargs)
+            == "bt16_prepare_chain_m64"
+        )

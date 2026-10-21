@@ -535,6 +535,128 @@ def test_fused_add_rmsnorm_fi_trace():
     assert "residual" in defn["outputs"]
 
 
+def test_gated_residual_rmsnorm_fi_trace():
+    import flashinfer.norm
+
+    branch = torch.empty(2, 8192, dtype=torch.bfloat16)
+    residual = torch.empty(2, 8192, dtype=torch.float32)
+    weight = torch.empty(8192, dtype=torch.bfloat16)
+    gate = torch.empty(8192, dtype=torch.float32)
+    defn = flashinfer.norm.gated_residual_rmsnorm.fi_trace(
+        branch=branch,
+        residual=residual,
+        weight=weight,
+        alpha=gate,
+        beta=gate,
+        eps=1e-6,
+        gain_center=1.0,
+    )
+    _check_defn(
+        defn, "gated_residual_rmsnorm", "flashinfer.norm.gated_residual_rmsnorm"
+    )
+    assert defn["axes"]["hidden_size"]["value"] == 8192
+    assert defn["outputs"]["output"]["dtype"] == "float32"
+
+
+@pytest.mark.parametrize("post_input_scale", [False, True])
+@pytest.mark.parametrize("alpha", [None, 1.0, 0.5])
+def test_gated_residual_next_rmsnorm_fi_trace(post_input_scale, alpha):
+    import flashinfer.norm
+
+    branch = torch.empty(2, 8192, dtype=torch.bfloat16)
+    residual = torch.empty(2, 8192, dtype=torch.float32)
+    next_weight = torch.empty(8192, dtype=torch.bfloat16)
+    gate = torch.empty(8192, dtype=torch.float32)
+    kwargs = {}
+    if post_input_scale:
+        kwargs = {"post_weight": next_weight, "post_gain_center": 1.0}
+    defn = flashinfer.norm.gated_residual_next_rmsnorm.fi_trace(
+        branch=branch,
+        residual=residual,
+        next_weight=next_weight,
+        alpha=gate if alpha is None else alpha,
+        beta=gate,
+        post_eps=1e-8,
+        next_eps=1e-5,
+        next_gain_center=1.0,
+        **kwargs,
+    )
+    _check_defn(
+        defn,
+        "gated_residual_next_rmsnorm",
+        "flashinfer.norm.gated_residual_next_rmsnorm",
+    )
+    assert defn["axes"]["hidden_size"]["value"] == 8192
+    assert defn["outputs"]["residual_out"]["dtype"] == "float32"
+    assert defn["outputs"]["ffn_input"]["dtype"] == "bfloat16"
+    if alpha is not None:
+        assert defn["inputs"]["alpha"] == {"shape": None, "dtype": "float32"}
+        assert defn["name"] == "gated_residual_next_rmsnorm_scalar_alpha_h8192"
+    if post_input_scale:
+        assert defn["inputs"]["post_weight"]["dtype"] == "bfloat16"
+
+
+@pytest.mark.parametrize("alpha", [1.0, 0.5])
+def test_gated_residual_next_rmsnorm_scalar_init_standalone(alpha):
+    from flashinfer.norm import gated_residual_next_rmsnorm
+
+    inputs = gated_residual_next_rmsnorm.fi_init(num_rows=2, alpha=alpha, device="cpu")
+    assert inputs["alpha"] == alpha
+    defn = gated_residual_next_rmsnorm.fi_trace(**inputs)
+    namespace = {}
+    exec(defn["init"], namespace)
+    restored = namespace["_gated_residual_next_rmsnorm_scalar_init"](
+        num_rows=2, alpha=alpha, device="cpu"
+    )
+    assert restored["alpha"] == alpha
+    assert gated_residual_next_rmsnorm.fi_trace(**restored) == defn
+
+
+def test_rmsnorm_sigmoid_gate_fi_trace():
+    import flashinfer.norm
+
+    x = torch.empty(2, 32, 64, dtype=torch.bfloat16)
+    gate = torch.empty_like(x)
+    defn = flashinfer.norm.rmsnorm_sigmoid_gate.fi_trace(input=x, gate=gate, eps=1e-5)
+    _check_defn(defn, "rmsnorm_sigmoid_gate", "flashinfer.norm.rmsnorm_sigmoid_gate")
+    assert defn["axes"]["head_dim"]["value"] == 64
+    assert defn["outputs"]["output"]["dtype"] == "bfloat16"
+
+
+@pytest.mark.parametrize("expert_weights_dtype", [torch.bfloat16, torch.float32])
+def test_tp_moe_finalize_rmsnorm_fi_trace(expert_weights_dtype):
+    import flashinfer.comm
+
+    if not hasattr(flashinfer.comm, "tp_moe_finalize_rmsnorm"):
+        pytest.skip("TP MoE finalize dependencies are unavailable")
+    gemm2_permuted = torch.empty(19, 4128, dtype=torch.bfloat16)
+    expert_weights = torch.empty(2, 8, dtype=expert_weights_dtype)
+    expanded_idx_to_permuted_idx = torch.empty(2, 8, dtype=torch.int32)
+    norm_weight = torch.empty(4096, dtype=torch.bfloat16)
+    output = torch.empty(2, 4096, dtype=torch.bfloat16)
+    defn = flashinfer.comm.tp_moe_finalize_rmsnorm.fi_trace(
+        gemm2_permuted=gemm2_permuted,
+        expert_weights=expert_weights,
+        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+        norm_weight=norm_weight,
+        output=output,
+        eps=1e-8,
+        gain_center=1.0,
+        weight_before_norm=True,
+    )
+    _check_defn(
+        defn,
+        "tp_moe_finalize_rmsnorm",
+        "flashinfer.comm.tp_moe_finalize_rmsnorm",
+    )
+    assert defn["axes"]["num_experts"]["value"] == 8
+    assert defn["axes"]["hidden_size"]["value"] == 4096
+    assert defn["axes"]["hidden_size_padded"]["value"] == 4128
+    assert defn["inputs"]["expert_weights"]["dtype"] == str(
+        expert_weights_dtype
+    ).removeprefix("torch.")
+
+
 # ---------------------------------------------------------------------------
 # sampling
 # ---------------------------------------------------------------------------
@@ -1557,3 +1679,42 @@ def test_nvfp4_append_trace_json_init_is_self_contained():
                 pytest.skip(f"{filename} init unsupported on CPU: {exc}")
             raise
         assert isinstance(result, dict)
+
+
+def test_gdn_replayssm_commit_fi_trace():
+    from flashinfer.gdn_decode import gated_delta_rule_replayssm_commit
+    from flashinfer.trace.templates.gdn import gdn_replayssm_commit_trace
+
+    args = gdn_replayssm_commit_trace.init(device="cpu")
+    defn = gated_delta_rule_replayssm_commit.fi_trace(**args)
+    _check_defn(defn, "gdn", "gated_delta_rule_replayssm_commit")
+    assert defn["axes"]["num_k_heads"]["value"] == 2
+    assert defn["inputs"]["accept_lens"]["dtype"] == "int32"
+    assert defn["outputs"]["checkpoint_state"]["dtype"] == "float32"
+
+
+def test_gdn_mtp_replayssm_fi_trace():
+    from flashinfer.gdn_decode import gated_delta_rule_mtp
+    from flashinfer.trace.templates.gdn import gdn_mtp_trace
+
+    args = gdn_mtp_trace.init(
+        batch_size=2,
+        pool_size=4,
+        num_q_heads=2,
+        num_k_heads=2,
+        num_v_heads=8,
+        device="cpu",
+    )
+    t = args["q"].shape[1]
+    args.update(
+        cache_replayssm=True,
+        disable_state_update=True,
+        replayssm_rawv=torch.empty(4, 8, t, 128, dtype=torch.bfloat16),
+        replayssm_rawk=torch.empty(4, 2, t, 128, dtype=torch.bfloat16),
+        replayssm_g=torch.empty(4, 8, t),
+        replayssm_beta=torch.empty(4, 8, t),
+    )
+    defn = gated_delta_rule_mtp.fi_trace(**args)
+    _check_defn(defn, "gdn", "gated_delta_rule_mtp")
+    for name in ("replayssm_rawv", "replayssm_rawk", "replayssm_g", "replayssm_beta"):
+        assert defn["outputs"][name]["shape"] == defn["inputs"][name]["shape"]

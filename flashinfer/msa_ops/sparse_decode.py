@@ -203,7 +203,8 @@ def msa_sparse_decode_attention(
     KV blocks selected in ``q2k_indices``. Decode tokens are right-aligned:
     token ``i`` of a request sits at position ``seqlen_k - seqlen_q + i``.
     On compute capability 10.0/10.3/10.7, ``topk`` must be 16 and Q1 through
-    multi-token decode use the direct persistent M16 path.
+    multi-token decode use the direct persistent M16 path. On compute capability
+    9.0 (H100/H200) ``q`` must be bf16; fp16 ``q`` raises ``NotImplementedError``.
 
     Parameters
     ----------
@@ -341,22 +342,13 @@ def msa_sparse_decode_attention(
             "MSASparseAttentionWorkspace is only used by the compute "
             "capability 10.0/10.3/10.7 backend"
         )
-    if out is not None:
-        raise NotImplementedError(
-            "out= is implemented by the compute capability 10.0/10.3/10.7 "
-            "packed-NVFP4 paged-KV decode route; the SM120/SM121 backend "
-            "allocates its own output"
-        )
-    import cutlass
-    import cutlass.cute as cute
-
     from ..utils import is_sm12x_supported
-    from .cute_dsl.sparse_decode_sm12x import SparseDecodeForwardSm12x
-    from ._common import _q_offset_explicit
+    from ._sm90_dispatch import is_sm90a_device as is_sm90a_supported
 
-    if not is_sm12x_supported(q.device):
+    sm90 = is_sm90a_supported(q.device)
+    if not (sm90 or is_sm12x_supported(q.device)):
         raise RuntimeError(
-            "msa_sparse_decode_attention requires SM120 or SM121 and CUDA >= 12.8"
+            "msa_sparse_decode_attention requires SM90, SM120 or SM121 and CUDA >= 12.8"
         )
     if q.ndim != 3:
         raise ValueError("q must be 3D (total_q, num_qo_heads, head_dim)")
@@ -390,6 +382,97 @@ def msa_sparse_decode_attention(
     # of msa_topk_select's output).
     if not q2k_indices.is_contiguous():
         raise ValueError("q2k_indices must be contiguous")
+
+    if sm90:
+        if return_softmax_lse:
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention does not return an LSE"
+            )
+        if page_table is None or seqused_k is None:
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention requires the paged KV layout"
+            )
+        if k_scale is not None or v_scale is not None or k_global_scale is not None:
+            # Per-tensor k/v scale tensors have no SM90 path; a silently dropped
+            # scale would return plausible, wrong numbers. softmax_scale and
+            # v_global_scale ARE handled -- folded into q and the output below.
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention handles softmax_scale and "
+                "v_global_scale, but not per-tensor k_scale/v_scale/k_global_scale"
+            )
+        if k.dtype != torch.float8_e4m3fn or v.dtype != torch.float8_e4m3fn:
+            # The SM90 decode schedule views the cache as raw bytes and declares
+            # them e4m3, so any other dtype is read with both the wrong values and
+            # the wrong element stride -- silent garbage rather than a failure.
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention requires an fp8 e4m3 KV cache, "
+                f"got k={k.dtype} v={v.dtype}"
+            )
+        if not causal:
+            # The SM90 decode program is right-aligned causal with no mask
+            # switch; ignoring the flag would return plausible, wrong numbers.
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention is right-aligned causal; "
+                "causal=False is not supported"
+            )
+        if q_offset is not None:
+            # Query i of a sequence sits at seqused_k - seqlen_q + i; the program
+            # takes no offset input, so an explicit q_offset cannot be honoured.
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention derives query positions as "
+                "seqused_k - seqlen_q + i; q_offset is not supported"
+            )
+        # The paged-metadata checks of the SM120/SM121 path below: the program
+        # derives every query position from seqused_k and seqlen_q, so a
+        # seqused_k or page_table sized for another batch must fail here
+        # instead of shifting every position silently.
+        if seqused_k.dtype != torch.int32 or seqused_k.ndim != 1:
+            raise ValueError("seqused_k must be 1D int32")
+        if seqused_k.numel() != batch_size:
+            raise ValueError(f"seqused_k must have batch_size ({batch_size}) entries")
+        if page_table.ndim != 2:
+            raise ValueError("page_table must be int32 of shape (batch, max_pages)")
+        if page_table.shape[0] != batch_size:
+            raise ValueError("page_table batch dimension must match q batch_size")
+        from ._sm90_dispatch import sparse_decode_sm90
+
+        if out is None:
+            out = torch.empty(
+                (total_q, num_qo_heads, head_dim), dtype=compute_dtype, device=q.device
+            )
+        elif (
+            out.shape != q.shape
+            or out.dtype != compute_dtype
+            or out.device != q.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "out must be a contiguous tensor shaped like q in q's dtype on q's device"
+            )
+        return sparse_decode_sm90(
+            q,
+            k,
+            v,
+            q2k_indices,
+            page_table,
+            seqused_k,
+            out,
+            seqlen_q=seqlen_q,
+            softmax_scale=softmax_scale,
+            v_global_scale=v_global_scale,
+        )
+    import cutlass
+    import cutlass.cute as cute
+
+    from .cute_dsl.sparse_decode_sm12x import SparseDecodeForwardSm12x
+    from ._common import _q_offset_explicit
+
+    if out is not None:
+        raise NotImplementedError(
+            "out= is implemented by the compute capability 10.0/10.3/10.7 "
+            "packed-NVFP4 paged-KV decode route and on SM90; the SM120/SM121 "
+            "backend allocates its own output"
+        )
     topk = q2k_indices.shape[2]
     if topk <= 0:
         raise ValueError("q2k_indices topk dimension must be positive")
@@ -673,23 +756,28 @@ def prepare_msa_nvfp4_sparse_decode(
     seqused_k: torch.Tensor,
     k_global_scale: float,
     v_global_scale: float,
-    workspace_buffer: Optional[torch.Tensor] = None,
     seqlen_q: int = 1,
     softmax_scale: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
+    use_cache_hit: bool | str = "auto",
     backend: str = "cake",
 ):
-    r"""Prepare NVFP4 paged-KV sparse decode with the generated Cake program (SM100/SM103).
+    r"""Prepare NVFP4 paged-KV sparse decode with the generated Cake programs (SM100/SM103/SM107).
 
     The experimental Cake backend serves the same problem surface as the
     packed-NVFP4 paged-KV route of :func:`msa_sparse_decode_attention` -- the
     planar page pool of ``docs/design_docs/nvfp4_msa_paged_kv_layout.md``,
-    top-k 16, right-aligned causal decode tokens -- with one persistent kernel
+    top-k 16, right-aligned causal decode tokens -- with a persistent kernel
     that keeps the K tiles resident in tensor memory and runs both MMAs in the
-    swapped orientation.  Preparation validates and binds the tensors; the
-    returned runner launches with no allocation and no host synchronization
-    and can be captured into a CUDA Graph.
+    swapped orientation (small batches split each work item across a cluster
+    of CTAs that merge through distributed shared memory), a short-item
+    cluster program for batches of requests within four pages, and, on
+    request (``use_cache_hit=True``), a request-packed union program that
+    serves the ``seqlen_q`` tokens of a request from one CTA (or one cluster)
+    and streams every page of their top-k union once.  Preparation validates
+    and binds the tensors; the returned runner launches with no allocation
+    and no host synchronization and can be captured into a CUDA Graph.
 
     Parameters
     ----------
@@ -716,13 +804,6 @@ def prepare_msa_nvfp4_sparse_decode(
     k_global_scale, v_global_scale : float
         Positive per-side global scales; the K scale is folded into the
         softmax scale and the V scale is applied in the epilogue.
-    workspace_buffer : Optional[torch.Tensor]
-        Caller-owned CUDA bytes for the split-KV partials, at least
-        :func:`flashinfer.experimental.msa_nvfp4_decode.cake_backend.msa_nvfp4_decode_workspace_size`;
-        required only when the batch is small enough to split (the runner
-        reports the chosen factor as ``splits``).  The kernel resets its
-        completion counters after every merge, so the region must not be
-        shared with other work between launches.
     seqlen_q : int
         Query tokens per request, in ``[1, 32]``; token ``i`` sits at KV
         position ``seqused_k[b] - seqlen_q + i`` and attends causally.
@@ -731,6 +812,20 @@ def prepare_msa_nvfp4_sparse_decode(
     out, lse : Optional[torch.Tensor]
         Optional caller-owned BF16 output ``[batch * seqlen_q, num_q_heads, 128]``
         and float32 natural-log softmax normalizer ``[batch * seqlen_q, num_q_heads]``.
+    use_cache_hit : bool or str
+        Schedule for the ``seqlen_q`` tokens of a request (every token still
+        attends only its own sixteen selected pages).  ``False`` keeps the
+        per-(token, KV head) programs (persistent split-KV or short-item).
+        ``True`` requests the request-packed union program, which packs the
+        tokens of one request into one CTA (or one cluster of CTAs) and
+        streams each page of their top-k union once; it is available for a
+        uniform ``seqlen_q`` in ``[2, 4]`` and raises ``ValueError`` for a
+        larger ``seqlen_q`` (at ``seqlen_q == 1`` the switch is a no-op and the
+        per-token programs run).  ``"auto"`` (default) currently resolves to
+        the ``False`` programs on every shape; a measured device-side policy
+        is future work.  Under CUDA-graph capture ``True`` requires the union
+        program to have been built before capture (prepare the same shape
+        once eagerly first).
     backend : str
         Only ``"cake"`` is supported.
 
@@ -757,10 +852,10 @@ def prepare_msa_nvfp4_sparse_decode(
         seqused_k=seqused_k,
         k_global_scale=k_global_scale,
         v_global_scale=v_global_scale,
-        workspace_buffer=workspace_buffer,
         seqlen_q=seqlen_q,
         softmax_scale=softmax_scale,
         out=out,
         lse=lse,
+        use_cache_hit=use_cache_hit,
         backend="cake",
     )

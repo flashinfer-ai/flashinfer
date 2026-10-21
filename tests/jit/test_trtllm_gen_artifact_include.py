@@ -27,6 +27,7 @@ from concurrent.futures import ProcessPoolExecutor
 from typing import NamedTuple, Tuple
 
 import pytest
+from packaging.version import Version
 
 from flashinfer.artifacts import ArtifactPath, CheckSumHash
 from flashinfer.jit import core as jit_core
@@ -193,6 +194,7 @@ def _workspace(root, monkeypatch):
     monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", paths.jit)
     monkeypatch.setattr(cubin_loader, "FLASHINFER_CUBIN_DIR", paths.cubin)
     monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda")
+    monkeypatch.setattr(cpp_ext, "get_cuda_version", lambda: Version("12.9"))
     context = _StubCompilationContext()
     for module in (jit_core, fused_moe_jit, moe_utils_jit, gemm_core):
         monkeypatch.setattr(module, "current_compilation_context", context)

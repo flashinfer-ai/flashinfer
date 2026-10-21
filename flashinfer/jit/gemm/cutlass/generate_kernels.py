@@ -31,6 +31,7 @@ class TrtLlm_EpilogueTag(enum.Enum):
 class TrtLlm_EpilogueFusion(enum.Enum):
     epilogue_fusion_none = enum_auto()
     epilogue_fusion_finalize = enum_auto()
+    epilogue_fusion_activation = enum_auto()
 
 
 EpiTagNames = {
@@ -50,12 +51,14 @@ EpiTag = {
 EpiFusion = {
     TrtLlm_EpilogueFusion.epilogue_fusion_none: "tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE",
     TrtLlm_EpilogueFusion.epilogue_fusion_finalize: "tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE",
+    TrtLlm_EpilogueFusion.epilogue_fusion_activation: "tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::ACTIVATION",
 }
 
 EpiFusionSuffixes = {
     None: "",
     TrtLlm_EpilogueFusion.epilogue_fusion_none: "EpilogueFusion_NONE",
     TrtLlm_EpilogueFusion.epilogue_fusion_finalize: "EpilogueFusion_FINALIZE",
+    TrtLlm_EpilogueFusion.epilogue_fusion_activation: "EpilogueFusion_ACTIVATION",
 }
 
 
@@ -1032,6 +1035,47 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled, arch):
 
                 if is_op_valid(moe_gemm_operation):
                     operations.append(moe_gemm_operation)
+
+    # Keep activation fusion separate so existing NONE/FINALIZE instantiations retain their order.
+    if arch == 100:
+        activation_shapes_mn = [(128, n) for n in (64, 128, 256)]
+        activation_cga_shapes = [(1, 1, 1), (2, 1, 1)]
+        activation_types = [
+            (DataType.e4m3, DataType.f16, True),
+            (DataType.e4m3, DataType.bf16, True),
+            (DataType.bf16, DataType.bf16, False),
+        ]
+        for cta_shape_mn, cga_shape, dynamic_cga, activation_type in product(
+            activation_shapes_mn,
+            activation_cga_shapes,
+            [True, False],
+            activation_types,
+        ):
+            input_type, output_type, is_mx_fpx = activation_type
+            cta_shape_mnk = calc_shape_mnk_sm100_grouped_gemm(cta_shape_mn, input_type)
+            operation = TrtLlm_GemmLauncher(
+                GemmKind.Grouped,
+                arch,
+                input_type,
+                input_type,
+                output_type,
+                output_type,
+                output_type,
+                TrtLlm_QuantOp.none,
+                TrtLlm_EpilogueTag.epilogue_op_default,
+                cta_shape_mnk,
+                warp_shape,
+                stages,
+                cga_shape,
+                KernelScheduleType.TmaWarpSpecializedCooperative,
+                EpilogueScheduleType.PtrArrayTmaWarpSpecialized1Sm,
+                TrtLlm_EpilogueFusion.epilogue_fusion_activation,
+                is_mx_fpx=is_mx_fpx,
+                dynamic_cga=dynamic_cga,
+                swap_ab=False,
+            )
+            if is_op_valid(operation):
+                operations.append(operation)
     return operations
 
 

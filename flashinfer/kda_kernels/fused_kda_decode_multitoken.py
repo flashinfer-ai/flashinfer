@@ -46,6 +46,7 @@ import tvm_ffi  # noqa: F401 -- TVM FFI supplies the active PyTorch stream
 
 from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from ..norm import utils as norm_utils
+from .fused_kda_decode import _device_index, _device_sm_count
 
 _D = 128
 _W = 4
@@ -74,17 +75,18 @@ def _align_up(value, alignment):
     return (value + alignment - 1) // alignment * alignment
 
 
-def _required_smem_bytes(T, R, KQ, NCH, SPLIT=1):
+def _required_smem_bytes(T, R, KQ, NCH, SPLIT=1, norm_order=1):
     """Return the statically allocated shared memory for one packed CTA."""
     threads = (((_D // SPLIT) // NCH) // R) * KQ
     warps = threads // 32
+    norm_warps = 16 if norm_order == 3 else warps
     offset = 0
     for size, alignment in (
         (T * 3 * _D * 2, 16),
         (T * _D * 4, 16),
         (T * _D * 4, 16),
         (T * 4 * 4, 16),
-        (T * warps * 4, 16),
+        (T * norm_warps * 4, 16),
         (T * 4, 16),
         (T * 4, 16),
         (8, 8),
@@ -171,6 +173,7 @@ def _kda_kernel(
     SPLIT: cutlass.Constexpr,
     NCH: cutlass.Constexpr,
     SBF16: cutlass.Constexpr,
+    NORM_ORDER: cutlass.Constexpr,
 ):
     SDT = cutlass.BFloat16 if SBF16 else cutlass.Float32
     SW = SDT.width // 8
@@ -179,6 +182,7 @@ def _kda_kernel(
     JJ = _D // (KQ * 4)
     NT = (RC // R) * KQ
     NWARP = NT // 32
+    NORM_WARPS = 16 if NORM_ORDER == 3 else NWARP
     LOGKQ = int(math.log2(KQ))
 
     tid, _, _ = cute.arch.thread_idx()
@@ -204,7 +208,7 @@ def _kda_kernel(
         cutlass.Float32, cute.make_layout(T * 4), byte_alignment=16
     )
     sRed2 = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout(T * NWARP), byte_alignment=16
+        cutlass.Float32, cute.make_layout(T * NORM_WARPS), byte_alignment=16
     )
     sBeta = smem.allocate_tensor(
         cutlass.Float32, cute.make_layout(T), byte_alignment=16
@@ -504,14 +508,16 @@ def _kda_kernel(
                     # Match the composed vLLM path and the legacy fused kernel:
                     # recurrent output is materialized as BF16 before RMSNorm.
                     x = rec[r].to(cutlass.BFloat16).to(cutlass.Float32) * livef
-                    rsum = rsum + x * x
+                    if cutlass.const_expr(NORM_ORDER == 1):
+                        rsum = rsum + x * x
                     if kq == 0:
                         sOut[t * RB + ch * RC + rg * R + r] = x
                 # rsum is uniform inside each KQ-lane group, so only the groups of
                 # the warp still have to be combined to get this warp's row sum.
-                for off in cutlass.range_constexpr(LOGKQ, 5):
-                    rsum = rsum + cute.arch.shuffle_sync_bfly(rsum, 1 << off)
-                rtot[t] = rtot[t] + rsum
+                if cutlass.const_expr(NORM_ORDER == 1):
+                    for off in cutlass.range_constexpr(LOGKQ, 5):
+                        rsum = rsum + cute.arch.shuffle_sync_bfly(rsum, 1 << off)
+                    rtot[t] = rtot[t] + rsum
 
                 if live:
                     if slots[t] > 0:
@@ -521,11 +527,41 @@ def _kda_kernel(
                         for r in cutlass.range_constexpr(R):
                             _store_state(sfrg[r], dst_base + lane_off[r], JJ, KQ, SDT)
 
-    if lane == 0:
-        for t in cutlass.range_constexpr(T):
-            sRed2[t * NWARP + warp] = rtot[t]
+    if cutlass.const_expr(NORM_ORDER == 1):
+        if lane == 0:
+            for t in cutlass.range_constexpr(T):
+                sRed2[t * NWARP + warp] = rtot[t]
 
     cute.arch.barrier()
+
+    if cutlass.const_expr(NORM_ORDER == 3):
+        # Preserve the wide tile's summation order without KQ-fold work.
+        a_out = sOut.iterator.toint()
+        for i in cutlass.range_constexpr((T * NORM_WARPS + NT - 1) // NT):
+            idx = i * NT + tid
+            if idx < T * NORM_WARPS:
+                token = idx // NORM_WARPS
+                partial = cutlass.Float32(0.0)
+                if token < seq_len:
+                    for half in cutlass.range_constexpr(2):
+                        values = cute.make_rmem_tensor(
+                            cute.make_layout(4), cutlass.Float32
+                        )
+                        cute.autovec_copy(
+                            _svec(
+                                a_out, token * RB + half * 64 + (idx % NORM_WARPS) * 4
+                            ),
+                            values,
+                        )
+                        first = cutlass.Float32(0.0)
+                        second = cutlass.Float32(0.0)
+                        first = first + values[0] * values[0]
+                        first = first + values[1] * values[1]
+                        second = second + values[2] * values[2]
+                        second = second + values[3] * values[3]
+                        partial = partial + (first + second)
+                sRed2[idx] = partial
+        cute.arch.barrier()
 
     # ---- collapse the per-warp partials to one per token, then (when the
     # ---- head is spread over a cluster) add in the peer ranks' partials
@@ -536,8 +572,8 @@ def _kda_kernel(
         cute.arch.barrier()
         if tid < T:
             tot = cutlass.Float32(0.0)
-            for w in cutlass.range_constexpr(NWARP):
-                tot = tot + sRed2[tid * NWARP + w]
+            for w in cutlass.range_constexpr(NORM_WARPS):
+                tot = tot + sRed2[tid * NORM_WARPS + w]
             slot = mail_ptr + (rank * T + tid)
             for p in cutlass.range_constexpr(SPLIT):
                 norm_utils.store_shared_remote(tot, slot, mbar, cutlass.Int32(p))
@@ -554,8 +590,8 @@ def _kda_kernel(
     else:
         if tid < T:
             tot = cutlass.Float32(0.0)
-            for w in cutlass.range_constexpr(NWARP):
-                tot = tot + sRed2[tid * NWARP + w]
+            for w in cutlass.range_constexpr(NORM_WARPS):
+                tot = tot + sRed2[tid * NORM_WARPS + w]
             sTot[tid] = cute.rsqrt(tot * (1.0 / _D) + eps, approx=True, ftz=True)
         cute.arch.barrier()
 
@@ -613,6 +649,7 @@ def _kda_launch(
     SPLIT: cutlass.Constexpr,
     NCH: cutlass.Constexpr,
     SBF16: cutlass.Constexpr,
+    NORM_ORDER: cutlass.Constexpr,
 ):
     p_x = m_x.iterator.toint()
     p_w = m_w.iterator.toint()
@@ -677,6 +714,7 @@ def _kda_launch(
         SPLIT,
         NCH,
         SBF16,
+        NORM_ORDER,
     )
     if cutlass.const_expr(SPLIT > 1):
         kernel.launch(
@@ -719,6 +757,28 @@ def _pick_split(sequence_heads, sm_count):
     return 1
 
 
+def _pick_tile(T, sequence_heads, sm_count, capability):
+    if T == 1:
+        return (*_TILE_T1, 1)
+    SPLIT = _pick_split(sequence_heads, sm_count)
+    if SPLIT > 1:
+        tile = _TILE_SPLIT[SPLIT]
+    elif (
+        capability in ((10, 0), (10, 3), (10, 7))
+        and T in (5, 8)
+        and sm_count < sequence_heads < 2 * sm_count
+    ):
+        # Two CTAs per SM fit one wave without the tighter register budget of three.
+        tile = (2, 16, 2, 2)
+    elif 2 * sm_count > sequence_heads:
+        tile = _TILE_TALL
+    elif T <= 3:
+        tile = _TILE_WIDE_SHORT
+    else:
+        tile = _TILE_WIDE_LONG
+    return (*tile, SPLIT)
+
+
 def _compact_fake(shape, dtype):
     return cute.runtime.make_fake_compact_tensor(
         dtype,
@@ -740,6 +800,7 @@ def _get_compiled_kernel(
     NCH,
     SPLIT,
     state_is_bf16=False,
+    norm_order=1,
 ):
     dim = H * _D
     sequences = cute.sym_int()
@@ -793,6 +854,7 @@ def _get_compiled_kernel(
         f"_eps{str(norm_eps).replace('.', '_').replace('-', 'm')}"
         f"_r{R}_kq{KQ}_bpm{bpm}_nch{NCH}_split{SPLIT}"
         f"{'_sbf16' if state_is_bf16 else ''}"
+        f"{'_normorder' + str(norm_order) if norm_order > 1 else ''}"
     )
     return build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
@@ -814,6 +876,7 @@ def _get_compiled_kernel(
             SPLIT,
             NCH,
             state_is_bf16,
+            norm_order,
             options="--enable-tvm-ffi --generate-line-info",
         ),
         extra_key_files=_SOURCE_FILES,
@@ -846,21 +909,13 @@ def _run_fused_kda_decode_multitoken(
     )
     T, H, lower_bound, norm_eps = key
     N = state_indices.shape[0]
-    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count
-    SPLIT = _pick_split(N * H, sm_count)
-    if T == 1:
-        SPLIT = 1
-        R, KQ, bpm, NCH = _TILE_T1
-    elif SPLIT > 1:
-        R, KQ, bpm, NCH = _TILE_SPLIT[SPLIT]
-    elif 2 * sm_count > N * H:
-        R, KQ, bpm, NCH = _TILE_TALL
-    elif T <= 3:
-        R, KQ, bpm, NCH = _TILE_WIDE_SHORT
-    else:
-        R, KQ, bpm, NCH = _TILE_WIDE_LONG
+    sm_count = _device_sm_count(_device_index(x.device))
+    capability = torch.cuda.get_device_capability(x.device)
+    R, KQ, bpm, NCH, SPLIT = _pick_tile(T, N * H, sm_count, capability)
+    # Short-wide tiles use different float32 grouping and can differ by 1 BF16 ULP.
+    norm_order = 3 if (R, KQ, NCH, SPLIT) == (2, 16, 2, 1) else 1
     properties = torch.cuda.get_device_properties(x.device)
-    required_smem = _required_smem_bytes(T, R, KQ, NCH, SPLIT)
+    required_smem = _required_smem_bytes(T, R, KQ, NCH, SPLIT, norm_order)
     if required_smem > properties.shared_memory_per_block_optin:
         raise ValueError(
             f"T={T} requires {required_smem} bytes of shared memory, but "
@@ -877,6 +932,7 @@ def _run_fused_kda_decode_multitoken(
         NCH,
         SPLIT,
         state.dtype == torch.bfloat16,
+        norm_order,
     )
 
     entry(

@@ -30,7 +30,6 @@ def prepare_mega_mhc(
     scratch=None,
     split_barriers=None,
     launch_epochs=None,
-    descriptor_workspace=None,
 ):
     """Prepare a reusable mHC plan; plan.run() returns the output tensor dict.
 
@@ -38,9 +37,10 @@ def prepare_mega_mhc(
     projection fn[24,4H], mixing coefficients and optional shifted_prev_mix.
     Results include updated residual/mixing tensors, normalized BF16 and FP8
     E4M3 values, and exact packed UE8M0 scales. 'col' emits GEMM scale storage;
-    'extra' emits routed and padded shared-expert scale storage. See MegaMHCPlan
-    for caller-owned output/workspace layouts and invocation-state ownership.
-    The prepared plan follows the current PyTorch stream and CUDA Graph replay.
+    'extra' emits routed and padded shared-expert scale storage. Any token
+    count in [1, 2**20] is accepted. See MegaMHCPlan for caller-owned
+    output/workspace layouts and invocation-state ownership. The prepared plan
+    follows the current PyTorch stream and CUDA Graph replay.
     """
     from .experimental.deepgemm_mega_mhc.mega_mhc import MegaMHCPlan
 
@@ -69,5 +69,4 @@ def prepare_mega_mhc(
         scratch=scratch,
         split_barriers=split_barriers,
         launch_epochs=launch_epochs,
-        descriptor_workspace=descriptor_workspace,
     )

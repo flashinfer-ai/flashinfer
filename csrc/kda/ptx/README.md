@@ -1,9 +1,14 @@
 # Static PTX Kimi Delta Attention
 
-These four SM103a programs and their TVM FFI shims are imported from
+These four SM103a PTX programs are imported from
 [`NVlabs/kda`, branch `260927-kda-for-kda`](https://github.com/NVlabs/kda/tree/ea37ebaff74c88a2545751dcb8ea8ef6c6251b67),
-`ptx/kda_ptx/shims/`. `manifest.json` records the exact source
-revision and SHA-256 of each retained file. Their bytes are unchanged.
+`ptx/kda_ptx/shims/`. `manifest.json` records the exact source revision and
+the SHA-256 of each retained `.ptx` file; their bytes are unchanged. The
+imported per-program TVM FFI shims and argument plans are replaced by one
+shared host shim, `shim.cc`, and one argument plan, `programs.json`, whose
+per-program entries (kernel symbol, embedded-cubin identifier, dynamic shared
+memory, TMA box sizes, handoff-flag argument, cluster width) are prepended as
+`#define` lines when the shim is compiled for a program.
 The original kernel lineage is `humanfia/kda-for-kda` branch
 `yahui-2.89x-ptx`, revision `82a6a79`, including its slow-decay FTZ fix.
 The MIT license is shipped as `LICENSE.kda-for-kda.txt`.
