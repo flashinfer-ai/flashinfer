@@ -3261,7 +3261,7 @@ def _softmax_schedule_body(
             **softmax_loop_kwargs
         )
         if cutlass.const_expr(releases_sage_stage_after_max):
-            # Dequantized scores went back to TMEM; the P pass reads no words.
+            # The scores came back dequantized; the P pass reads no words.
             sage_k_scales.release()
         if cutlass.const_expr(not cfg.use_keeps_mma_ab or not cfg.uses_tmem_p):
             # ConsRelease: free S once the scores are in registers unless
@@ -3306,6 +3306,12 @@ def _softmax_schedule_body(
                     s_arr=s_arr,
                     keeps_route_flags=sparse_route_flags,
                     swaps_route_flags=sparse_token_word2,
+                )
+            elif cutlass.const_expr(use_sage):
+                smem_p.compute_sage_p(
+                    new_max_arr=new_max_arr,
+                    s_arr=s_arr,
+                    sage_q_scale=sage_q_scale,
                 )
             else:
                 smem_p.compute_p(

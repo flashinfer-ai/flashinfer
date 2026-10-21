@@ -743,10 +743,12 @@ def _build_decode_gen_schedule(
     # route when it starts that tile and the scales after the tile's last pass
     # that reads them. When the K/V ring frees a slot for an instance's next K
     # tile, the oldest buffered K tile's QK has run, after the previous tile's
-    # P left the TMEM columns it aliases, so the instance's Softmax has
-    # finished every tile older than the K tiles the ring buffers per
-    # instance; one stage more than those K tiles never stalls the load warp
-    # on either pipeline.
+    # P left the TMEM columns it aliases or, with SMEM P, after the previous
+    # tile's max pass released S. A route or ``sfK`` stage is read no later
+    # than that pass (an SMEM-P Sage row is dequantized there), so the
+    # instance's Softmax has released every stage older than the K tiles the
+    # ring buffers per instance; one stage more than those K tiles never
+    # stalls the load warp on either pipeline.
     if use_per_inst_kv_resources:
         inst_k_tiles = max(split_k0_stages, split_k1_stages)
     else:

@@ -1674,17 +1674,29 @@ class FmhaDecodeConfig:
         return self.num_softmax_scale_groups * 4
 
     @property
+    def keeps_score_chunk_regs(self) -> int:
+        """Return the scores of one Keeps K32 chunk, a native 32-register LDTM atom.
+
+        Streamed profiles publish P one chunk at a time
+        (``softmax_score_fragment_regs``). Keeps layout atoms and Sage ``sfK``
+        groups count in chunks whether the softmax streams the row or holds
+        it complete, so both forms read one scale layout.
+        """
+        return 32
+
+    @property
     def softmax_score_fragment_regs(self) -> int:
         """Return the maximum score fragment kept live in registers.
 
         Streamed profiles own 128 score values per lane but process them as
-        four native 32-register LDTM atoms. Other profiles retain their
-        complete score fragment, so this property is intentionally distinct
-        from ``num_s_regs_per_thread`` (the total logical ownership). The
-        selection of streamed profiles lives in ``streams_tmem_p_fragments``.
+        four K32 chunks (``keeps_score_chunk_regs``). Other profiles retain
+        their complete score fragment, so this property is intentionally
+        distinct from ``num_s_regs_per_thread`` (the total logical ownership).
+        The selection of streamed profiles lives in
+        ``streams_tmem_p_fragments``.
         """
         if self.streams_tmem_p_fragments:
-            return 32
+            return self.keeps_score_chunk_regs
         return self.num_s_regs_per_thread
 
     @property
@@ -1773,7 +1785,7 @@ class FmhaDecodeConfig:
 
     @property
     def keeps_fragments_per_atom(self) -> int:
-        """Return the K32 score fragments of one Keeps layout atom.
+        """Return the K32 score chunks of one Keeps layout atom.
 
         Fragment ``f`` of a thread is the low or high half of its spatial
         half's KV64 atom ``f // 2``. Block-sparse route atoms span the same
@@ -1784,7 +1796,7 @@ class FmhaDecodeConfig:
     @property
     def keeps_atom_tokens(self) -> int:
         """Return the K tokens of one Keeps layout atom."""
-        return self.keeps_fragments_per_atom * self.softmax_score_fragment_regs
+        return self.keeps_fragments_per_atom * self.keeps_score_chunk_regs
 
     @property
     def proxy_summary_geometry(self) -> tuple[int, int]:
@@ -2141,7 +2153,7 @@ class FmhaDecodeConfig:
             raise ValueError(
                 f"sage_q_block_size must be a power of two, got {q_block_size}"
             )
-        if not self.streams_tmem_p_fragments:
+        if not (self.streams_tmem_p_fragments or self.stages_q128_p_in_smem):
             raise ValueError(
                 "Sage attention requires a two-instance Keeps profile: "
                 "Q64/KV256 or Q128/KV128"
@@ -2602,10 +2614,11 @@ class FmhaDecodeConfig:
         may only overwrite S once PV has read the whole P. With P in SMEM,
         Softmax holds the complete score row in registers and releases S after
         the max pass, so the MMA warp issues the next QK before this tile's PV
-        and the exponentials overlap that QK. Plain 8-bit Q/K/V tiles take it;
-        an 8-bit P tile fits beside the K/V ring. Sage keeps the streamed TMEM
-        P, whose fragments carry its per-group scales, and so do block-sparse
-        routes.
+        and the exponentials overlap that QK. Dense 8-bit Q/K/V tiles take it,
+        Sage included; an 8-bit P tile fits beside the K/V ring. Sage's max
+        pass dequantizes the row in registers one K32 chunk of ``sfK`` groups
+        at a time, so its P pass reads no scale words. Block-sparse routes
+        keep the streamed TMEM P.
         """
         return (
             self.use_keeps_mma_ab
@@ -2616,7 +2629,6 @@ class FmhaDecodeConfig:
             and self.o_stages == 2
             and self.k_dtype.width == 8
             and self.v_dtype.width == 8
-            and not self.use_sage_attention
             and not self.use_block_sparse
         )
 
@@ -2634,9 +2646,10 @@ class FmhaDecodeConfig:
         A two-instance TMEM-P profile streams for KV256 tiles and block-sparse
         routes, whose loops wait on K/V loads that the earlier PV start hides.
         Dense KV128 tiles stream too when K and V share a width and the
-        softmax stats travel through SMEM (the 16-bit and 8-bit Q/K/V recipes,
-        including Sage): the PV MMA starts on the first fragment instead of
-        the complete row, and the exponentials share the FMA pipe
+        softmax stats travel through SMEM (the 16-bit recipes; dense 8-bit
+        tiles, Sage included, stage P in SMEM through
+        ``stages_q128_p_in_smem``): the PV MMA starts on the first fragment
+        instead of the complete row, and the exponentials share the FMA pipe
         (``fragment_ex2_emulated_pairs``). Q-token page membership keeps the
         complete row, since a dense fragment's keep word is one visible token
         range and cannot express per-page membership; so do FP8 D64 (softmax
@@ -2741,9 +2754,10 @@ class FmhaDecodeConfig:
         """Return the layout of the Sage scales a plan prepares before attention.
 
         Its K atoms are the plan's Keeps atoms, 64 K tokens of two K32 score
-        fragments, and its Q tiles the plan's grouped Q CTAs, so the softmax
-        reads a work tile's rows at ``q_group_idx * tile_size_q``. Every Sage
-        profile streams such fragments (``validate_sage_profile``).
+        chunks, and its Q tiles the plan's grouped Q CTAs, so the softmax
+        reads a work tile's rows at ``q_group_idx * tile_size_q``. Streamed
+        and complete-row softmax passes read the words per chunk alike
+        (``keeps_score_chunk_regs``).
         """
         assert self.use_sage_attention and self.groups_tokens_heads_q
         assert self.keeps_atom_tokens == _SAGE_ATOM_TOKENS
@@ -2780,26 +2794,31 @@ class FmhaDecodeConfig:
         return layout
 
     def sage_k_groups_per_fragment(self, proxy: bool = False) -> int:
-        """Return the ``sfK`` groups of one streamed K32 score fragment of a route kind."""
+        """Return the ``sfK`` groups of one K32 score chunk of a route kind."""
         if not self.use_sage_attention:
             return 1
         return max(
-            1, self.softmax_score_fragment_regs // self.sage_k_scale_block_size(proxy)
+            1, self.keeps_score_chunk_regs // self.sage_k_scale_block_size(proxy)
         )
 
     def sage_score_scaling(self, proxy: bool = False) -> SageScoreScaling | None:
         """Return how the softmax applies a route kind's ``sfK`` to its scores.
 
-        A kind with one scale per score (the one-token K block) is
-        dequantized: the max pass writes its scores back multiplied, so the P
-        pass reads neither its ``sfK`` nor the INT32 bias. Other geometries
-        scale blocks of ``sage_k_scale_block_size`` columns, avoiding a TMEM
-        round trip per tile. Every kind's words come through the
-        ``SageKScalesResource`` ring (``SageKTransport.RING``).
+        A complete-row SMEM-P tile (``stages_q128_p_in_smem``) dequantizes its
+        register-resident row in every geometry. A streamed kind is dequantized
+        only with one scale per score (the one-token K block): the max pass
+        writes its scores back multiplied. Either way the P pass reads neither
+        ``sfK`` nor the INT32 bias. Other streamed geometries scale blocks of
+        ``sage_k_scale_block_size`` columns, avoiding a TMEM round trip per
+        tile. Every kind's words come through the ``SageKScalesResource`` ring
+        (``SageKTransport.RING``).
         """
         if not self.use_sage_attention:
             return None
-        if self.sage_k_groups_per_fragment(proxy) == self.softmax_score_fragment_regs:
+        if (
+            self.stages_q128_p_in_smem
+            or self.sage_k_groups_per_fragment(proxy) == self.keeps_score_chunk_regs
+        ):
             return SageScoreScaling.DEQUANTIZED
         return SageScoreScaling.BLOCK
 

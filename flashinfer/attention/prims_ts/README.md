@@ -423,7 +423,7 @@ the scores in place in the max pass, which costs more per score.
 | Masks and routes | Dense and causal masks; exact and proxy block-sparse routes (BSR or bitmask) | `mask_type="dense"` and `window_left=-1`; no routes, so `k_summary_block_size` is unused |
 | Split-KV | Rejected: only the direct output store applies `sfV` and `v_mean` | No split-KV launch |
 | K transport | `RING` for every K block size: the load warp stages each K tile's scales in shared memory | `GLOBAL` for 4-token and coarser blocks: the softmax loads them before the score wait; `RING` for 1-token blocks |
-| Score scaling | `BLOCK` for 4-token and coarser blocks; `DEQUANTIZED` for 1-token blocks | `BLOCK` per 16-column block for 16-token and coarser blocks; `DEQUANTIZED` for 4- and 1-token blocks |
+| Score scaling | `DEQUANTIZED` on dense Q128/KV128 tiles, whose score row stays in registers; on Q64/KV256 tiles and block-sparse routes, `BLOCK` for 4-token and coarser blocks and `DEQUANTIZED` for 1-token blocks | `BLOCK` per 16-column block for 16-token and coarser blocks; `DEQUANTIZED` for 4- and 1-token blocks |
 | P scale `C` | `448 * 2**-h`, with `h` the plan's `softmax_rescale_threshold_log2` (default 8) | 1: the lazy correction lets `p` reach `2**8` |
 
 Masks and scheduling otherwise follow each kernel's 16-bit plans. In the

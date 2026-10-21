@@ -903,6 +903,17 @@ class TmemSResource(DecodeGenResourceBase):
             q_group_idx=self.q_group_idx,
         )
 
+    def _masked_score(self) -> Float32:
+        """Return the score a complete-row mask writes.
+
+        Sage writes ``-inf``: the max pass dequantizes the row with positive
+        ``sfK`` scales, which keep ``-inf`` but would move ``-FLT_MAX`` off
+        the fully masked row's sentinel. Other profiles write ``-FLT_MAX``.
+        """
+        if self.cfg.use_sage_attention:
+            return Float32(float("-inf"))
+        return _neg_max_f32()
+
     @cute.jit
     def _reduce_keeps_row_max(self, s_vals: cutlass.Array) -> Float32:
         """Reduce one Keeps score row while preserving its lane ownership."""
@@ -940,6 +951,76 @@ class TmemSResource(DecodeGenResourceBase):
                 ftz=True,
             )
         return tile_max
+
+    @cute.jit
+    def _dequantize_sage_keeps_row(
+        self,
+        stage_info: StageInfo,
+        s_vals: cutlass.Array,
+        sage_q_scale: Float32,
+        sage_k_stage_bytes: Int32,
+    ) -> Float32:
+        """Dequantize a complete Sage score row in place and return its tile max.
+
+        Each K32 chunk reads its ``sfK`` words from the waited stage and
+        becomes ``(s - bias) * sfK_g`` (``_dequantize_fragment_scores``), so
+        the row reaches the P pass without scale words or bias. ``sfQ``
+        applies once to the tile maximum; masked ``-inf`` scores stay
+        ``-inf``, and only the ``-inf`` identity maps to the finite sentinel.
+        """
+        cfg = self.cfg
+        assert cfg.use_sage_attention and cfg.tile_size_q == 128
+        chunk_regs = cfg.keeps_score_chunk_regs
+        groups: Constexpr[int] = cfg.sage_k_groups_per_fragment()
+        warp_grp_thread_idx = Int32(
+            _decode_gen_task_cache(stage_info)[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+        )
+        scales_view = sage_k_view(
+            cfg, stage_info.context, sage_k_stage_bytes, warp_grp_thread_idx, None
+        )
+        max_chains = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
+        for chain_idx in cutlass.range_constexpr(4):
+            max_chains[chain_idx] = Float32(float("-inf"))
+        chunk = cutlass.Array(Float32, chunk_regs, space=cutlass.AddressSpace.rmem)
+        for chunk_idx in cutlass.range_constexpr(
+            cfg.num_s_regs_per_thread // chunk_regs
+        ):
+            first: Constexpr[int] = chunk_idx * chunk_regs
+            chunk_scales = load_sage_k_fragment(cfg, scales_view, Int32(chunk_idx))
+            for score_idx in cutlass.range_constexpr(chunk_regs):
+                chunk[score_idx] = s_vals[first + score_idx]
+            self._dequantize_fragment_scores(chunk, chunk_scales, groups)
+            for score_idx in cutlass.range_constexpr(chunk_regs):
+                s_vals[first + score_idx] = chunk[score_idx]
+                chain_idx: Constexpr[int] = score_idx % 4
+                max_chains[chain_idx] = cute.math.max(
+                    max_chains[chain_idx], Float32(chunk[score_idx]), ftz=True
+                )
+        tile_max = cute.math.max(
+            cute.math.max(max_chains[0], max_chains[1], ftz=True),
+            cute.math.max(max_chains[2], max_chains[3], ftz=True),
+            ftz=True,
+        )
+        if tile_max == Float32(float("-inf")):
+            tile_max = _neg_max_f32()
+        else:
+            tile_max = tile_max * sage_q_scale
+        return tile_max
+
+    @cute.jit
+    def _reduce_keeps_tile_max(
+        self,
+        stage_info: StageInfo,
+        s_vals: cutlass.Array,
+        sage_q_scale: Float32 | None,
+        sage_k_stage_bytes: Int32 | None,
+    ) -> Float32:
+        """Return a complete row's tile maximum, dequantizing a Sage row first."""
+        if cutlass.const_expr(self.cfg.use_sage_attention):
+            return self._dequantize_sage_keeps_row(
+                stage_info, s_vals, sage_q_scale, sage_k_stage_bytes
+            )
+        return self._reduce_keeps_row_max(s_vals)
 
     @cute.jit
     def _publish_keeps_softmax_state(
@@ -1150,7 +1231,7 @@ class TmemSResource(DecodeGenResourceBase):
                     and not is_masked_final_wave
                 ):
                     for reg_idx in cutlass.range_constexpr(num_s_regs):
-                        s_vals[reg_idx] = _neg_max_f32()
+                        s_vals[reg_idx] = self._masked_score()
 
             # A per-row causal endpoint is always <= seq_len_kv and is
             # applied by the loop below. Avoid emitting a second,
@@ -1164,10 +1245,10 @@ class TmemSResource(DecodeGenResourceBase):
                         col_base,
                     )
                     if token_idx >= element_mask_end_idx:
-                        s_vals[reg_idx] = _neg_max_f32()
+                        s_vals[reg_idx] = self._masked_score()
                     if cutlass.const_expr(cfg.use_sliding_window_causal):
                         if token_idx < window_start_idx:
-                            s_vals[reg_idx] = _neg_max_f32()
+                            s_vals[reg_idx] = self._masked_score()
 
             if cutlass.const_expr(cfg.uses_per_row_causal_mask):
                 q_token_idx, _ = _q_row_token_and_local_head(
@@ -1221,7 +1302,7 @@ class TmemSResource(DecodeGenResourceBase):
                             )
                             reg = local_page_idx * page_span + token_in_span
                             s_vals[reg] = cutlass.select_(
-                                valid, s_vals[reg], _neg_max_f32()
+                                valid, s_vals[reg], self._masked_score()
                             )
                 else:
                     for reg_idx in cutlass.range_constexpr(num_s_regs):
@@ -1233,9 +1314,9 @@ class TmemSResource(DecodeGenResourceBase):
                         )
                         if cutlass.const_expr(cfg.use_sliding_window_causal):
                             if score_col < causal_start_rel:
-                                s_vals[reg_idx] = _neg_max_f32()
+                                s_vals[reg_idx] = self._masked_score()
                         if score_col >= causal_end_rel:
-                            s_vals[reg_idx] = _neg_max_f32()
+                            s_vals[reg_idx] = self._masked_score()
 
         if cutlass.const_expr(cfg.uses_q_token_kv_block_sparse_page_membership):
             # Q64 lanes own a contiguous 64-column half; Q128 lanes own the
@@ -1253,7 +1334,7 @@ class TmemSResource(DecodeGenResourceBase):
                     s_vals[membership_reg_idx] = cutlass.select_(
                         page_is_member,
                         s_vals[membership_reg_idx],
-                        _neg_max_f32(),
+                        self._masked_score(),
                     )
 
         if cutlass.const_expr(cfg.q_score_rows_need_mask):
@@ -1265,7 +1346,7 @@ class TmemSResource(DecodeGenResourceBase):
                 self.seq_len_q,
             ):
                 for invalid_q_reg_idx in cutlass.range_constexpr(num_s_regs):
-                    s_vals[invalid_q_reg_idx] = _neg_max_f32()
+                    s_vals[invalid_q_reg_idx] = self._masked_score()
 
     @cute.jit
     def _load_keeps_fragment(
@@ -1339,6 +1420,8 @@ class TmemSResource(DecodeGenResourceBase):
         sum_arr: cutlass.Array,
         new_max_arr: cutlass.Array,
         s_arr: cutlass.Array,
+        sage_q_scale: Float32 | None = None,
+        sage_k_stage_bytes: Int32 | None = None,
     ) -> tuple[object, object, object, object]:
         """Load and reduce the row-major Keeps S fragment.
 
@@ -1346,6 +1429,8 @@ class TmemSResource(DecodeGenResourceBase):
         assigns one row to a lane pair: lanes ``xor 16`` own the low/high
         64-column halves.  This path deliberately avoids the Swaps scratch
         reduction, whose 16x256b register mapping is unrelated to Keeps.
+        A Sage row is dequantized in registers before the maximum
+        (``_dequantize_sage_keeps_row``).
         """
         cfg = self.cfg
         if cutlass.const_expr(cfg.streams_tmem_p_fragments):
@@ -1358,6 +1443,8 @@ class TmemSResource(DecodeGenResourceBase):
                 new_max_arr=new_max_arr,
                 s_arr=s_arr,
                 use_sparse=False,
+                sage_q_scale=sage_q_scale,
+                sage_k_stage_bytes=sage_k_stage_bytes,
             )
         task_cache = _decode_gen_task_cache(stage_info)
         num_s_regs = cfg.num_s_regs_per_thread
@@ -1375,7 +1462,7 @@ class TmemSResource(DecodeGenResourceBase):
         )
         if cutlass.const_expr(not use_preload_mask_split):
             for reg_idx in cutlass.range_constexpr(num_s_regs):
-                s_vals[reg_idx] = _neg_max_f32()
+                s_vals[reg_idx] = self._masked_score()
 
         (
             seq_len_kv,
@@ -1406,7 +1493,9 @@ class TmemSResource(DecodeGenResourceBase):
                 is_masked_final_wave,
                 tile_is_unmasked,
             )
-            tile_max = self._reduce_keeps_row_max(s_vals)
+            tile_max = self._reduce_keeps_tile_max(
+                stage_info, s_vals, sage_q_scale, sage_k_stage_bytes
+            )
 
             self._publish_keeps_softmax_state(
                 s_vals,
@@ -1453,10 +1542,10 @@ class TmemSResource(DecodeGenResourceBase):
             # The per-row causal pass below subsumes seq_len_kv's upper bound.
             if cutlass.const_expr(not cfg.uses_per_row_causal_mask):
                 if token_idx >= element_mask_end_idx:
-                    s_vals[reg_idx] = _neg_max_f32()
+                    s_vals[reg_idx] = self._masked_score()
             if cutlass.const_expr(cfg.use_sliding_window_causal):
                 if token_idx < window_start_idx:
-                    s_vals[reg_idx] = _neg_max_f32()
+                    s_vals[reg_idx] = self._masked_score()
 
         if cutlass.const_expr(cfg.uses_per_row_causal_mask):
             q_token_idx, _ = _q_row_token_and_local_head(
@@ -1476,7 +1565,7 @@ class TmemSResource(DecodeGenResourceBase):
                     cfg, warp_grp_thread_idx, reg_idx, col_base
                 )
                 if token_idx < causal_start or token_idx >= causal_end:
-                    s_vals[reg_idx] = _neg_max_f32()
+                    s_vals[reg_idx] = self._masked_score()
 
         if cutlass.const_expr(cfg.q_score_rows_need_mask):
             if not _q_row_is_valid_for_seq(
@@ -1487,9 +1576,11 @@ class TmemSResource(DecodeGenResourceBase):
                 self.seq_len_q,
             ):
                 for reg_idx in cutlass.range_constexpr(num_s_regs):
-                    s_vals[reg_idx] = _neg_max_f32()
+                    s_vals[reg_idx] = self._masked_score()
 
-        tile_max = self._reduce_keeps_row_max(s_vals)
+        tile_max = self._reduce_keeps_tile_max(
+            stage_info, s_vals, sage_q_scale, sage_k_stage_bytes
+        )
         self._publish_keeps_softmax_state(
             s_vals,
             tile_max,
@@ -2253,17 +2344,18 @@ class TmemSResource(DecodeGenResourceBase):
         """Consume S with per-group Sage scales and publish the dequantized max.
 
         ``sage_k_stage_bytes`` is the waited ``sfK`` ring stage, routed from
-        ``SageKScalesResource.open_stage``.
+        ``SageKScalesResource.open_stage``. Streamed profiles fold the
+        fragments in TMEM; a complete-row SMEM-P tile returns its row
+        dequantized in ``s_arr``.
         """
 
         assert self.cfg.use_sage_attention
-        return self._compute_softmax_loop_keeps_fragments(
+        return self._compute_softmax_loop_keeps(
             stage_info,
             old_max_arr=old_max_arr,
             sum_arr=sum_arr,
             new_max_arr=new_max_arr,
             s_arr=s_arr,
-            use_sparse=False,
             sage_q_scale=sage_q_scale,
             sage_k_stage_bytes=sage_k_stage_bytes,
         )
@@ -2900,7 +2992,7 @@ class TmemSResource(DecodeGenResourceBase):
         masked ``-inf`` score stays ``-inf`` under any positive scale.
         """
         cfg = self.cfg
-        fragment_regs = cfg.softmax_score_fragment_regs
+        fragment_regs = cfg.keeps_score_chunk_regs
         group_regs = fragment_regs // groups
         group_addends = None
         if cutlass.const_expr(cfg.uses_int32_scores):
