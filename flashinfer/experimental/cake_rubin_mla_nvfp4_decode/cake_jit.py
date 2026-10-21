@@ -312,7 +312,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cluster": (0, 0, 0),
             "cooperative": False,
             "dynamic_smem_bytes": 0,
-            "use_pdl": False,
+            "use_pdl": True,
         },
         "library": "cake_rubin_mla_nvfp4_decode_3a007c4be08b7b22f587",
         "logical": {
@@ -393,7 +393,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cluster": (0, 0, 0),
             "cooperative": False,
             "dynamic_smem_bytes": 0,
-            "use_pdl": True,
+            "use_pdl": False,
         },
         "library": "cake_rubin_mla_nvfp4_decode_302684a62be285e34842",
         "logical": {
