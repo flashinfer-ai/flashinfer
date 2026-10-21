@@ -175,8 +175,8 @@ def _materialize_tuning(
 
 TUNING = TuningContract(
     component_id="attention.varlen",
-    query_schema_version=3,
-    config_schema_version=1,
+    query_schema_version=22,
+    config_schema_version=22,
     query_fields=frozenset(VarlenAttentionQuery.__dataclass_fields__),
     config_fields=frozenset(VarlenAttentionConfig.__dataclass_fields__),
     encode_query=_encode,

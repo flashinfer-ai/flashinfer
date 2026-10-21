@@ -269,8 +269,8 @@ def _materialize(
 
 TUNING = TuningContract(
     component_id="attention.compressed_sparse_mla",
-    query_schema_version=5,
-    config_schema_version=4,
+    query_schema_version=22,
+    config_schema_version=22,
     query_fields=frozenset(SparseMlaQuery.__dataclass_fields__),
     config_fields=frozenset(SparseMlaConfig.__dataclass_fields__),
     encode_query=SparseMlaQuery.to_dict,

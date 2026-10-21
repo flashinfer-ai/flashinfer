@@ -7,8 +7,8 @@ from collections.abc import Callable
 import torch
 import torch.nn.functional as F
 
-from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
-from b12x._lib.utils import convert_sf_to_mma_layout
+from b12x._lib.intrinsics.reference import quantize_grouped_nvfp4_torch
+from b12x._lib.utils.scale_layout import convert_sf_to_mma_layout
 
 
 def bench_events(fn, *, warmup, iters, l2_flush=None):

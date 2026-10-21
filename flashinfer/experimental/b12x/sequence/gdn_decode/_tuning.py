@@ -268,8 +268,8 @@ def _encode_query(query: GdnQuery) -> dict[str, object]:
 
 TUNING = TuningContract(
     component_id="attention.gdn",
-    query_schema_version=6,
-    config_schema_version=4,
+    query_schema_version=22,
+    config_schema_version=22,
     query_fields=_KEY_FIELDS,
     config_fields=frozenset({"backend", "recurrent_block_v"}),
     encode_query=_encode_query,

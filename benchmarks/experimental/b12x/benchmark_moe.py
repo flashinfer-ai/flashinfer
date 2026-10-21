@@ -48,7 +48,7 @@ from b12x.moe._shared.kernels.activations import (
     moe_activation_w1_rows,
     normalize_moe_activation,
 )
-from b12x._lib.intrinsics import as_grouped_scale_view, swizzle_block_scale
+from b12x._lib.intrinsics.reference import as_grouped_scale_view, swizzle_block_scale
 from benchmarks.experimental.b12x.common import (
     make_l2_flush_fn,
     resolve_l2_flush_bytes,

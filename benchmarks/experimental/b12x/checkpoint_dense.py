@@ -25,7 +25,7 @@ import sys
 import torch
 from safetensors import safe_open
 
-from b12x._lib.intrinsics import swizzle_block_scale
+from b12x._lib.intrinsics.reference import swizzle_block_scale
 from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.gemm import blockscaled
 from b12x.preparation import PreparationSession, PreparedCall, require_prepared

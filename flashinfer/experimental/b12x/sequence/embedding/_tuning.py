@@ -54,4 +54,4 @@ TUNING = make_fixed_contract(
     backend="cute",
 )
 
-TUNING = replace(TUNING, query_schema_version=2)
+TUNING = replace(TUNING, query_schema_version=22)

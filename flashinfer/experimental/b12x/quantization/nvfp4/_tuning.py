@@ -90,8 +90,8 @@ def _validate_config(
 
 TUNING = TuningContract(
     component_id="quantization.nvfp4",
-    query_schema_version=1,
-    config_schema_version=2,
+    query_schema_version=22,
+    config_schema_version=22,
     query_fields=frozenset(Nvfp4QuantizationQuery.__dataclass_fields__),
     config_fields=frozenset(Nvfp4QuantizationConfig.__dataclass_fields__),
     encode_query=_encode,

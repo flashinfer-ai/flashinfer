@@ -164,8 +164,8 @@ def _eligible(choice):
 
 TUNING = TuningContract(
     component_id="gemm.bf16_gemv",
-    query_schema_version=4,
-    config_schema_version=5,
+    query_schema_version=22,
+    config_schema_version=22,
     query_fields=frozenset(field.name for field in fields(GemvQuery)),
     config_fields=frozenset(field.name for field in fields(GemvConfig)),
     encode_query=asdict,

@@ -643,8 +643,8 @@ def _validate_query(query, device):
 
 TUNING = TuningContract(
     component_id="gemm.mm",
-    query_schema_version=7,
-    config_schema_version=2,
+    query_schema_version=22,
+    config_schema_version=22,
     query_fields=frozenset(field.name for field in fields(DenseGemmQuery)),
     config_fields=frozenset(field.name for field in fields(DenseGemmConfig)),
     encode_query=lambda query: {

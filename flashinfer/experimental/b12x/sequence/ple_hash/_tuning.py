@@ -98,7 +98,7 @@ TUNING = replace(
     make_fixed_contract(
         component_id="sequence.ple_hash", query_type=PleHashQuery, backend="triton"
     ),
-    query_schema_version=3,
+    query_schema_version=22,
     validate_query=_validate_query,
 )
 

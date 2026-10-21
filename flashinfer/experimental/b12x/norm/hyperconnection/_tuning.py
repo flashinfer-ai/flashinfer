@@ -223,8 +223,8 @@ def _materialize_tuning(
 
 TUNING = TuningContract(
     component_id="norm.hyperconnection",
-    query_schema_version=3,
-    config_schema_version=1,
+    query_schema_version=22,
+    config_schema_version=22,
     query_fields=frozenset(HyperConnectionQuery.__dataclass_fields__),
     config_fields=frozenset(HyperConnectionConfig.__dataclass_fields__),
     encode_query=_encode,

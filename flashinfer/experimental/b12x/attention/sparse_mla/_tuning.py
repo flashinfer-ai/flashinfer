@@ -53,7 +53,7 @@ TUNING = replace(
         query_type=SparseMlaQuery,
         backend="native",
     ),
-    query_schema_version=3,
+    query_schema_version=22,
     candidate_contract_version=3,
 )
 

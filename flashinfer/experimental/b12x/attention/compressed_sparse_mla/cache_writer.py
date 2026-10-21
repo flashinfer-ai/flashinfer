@@ -54,7 +54,7 @@ TUNING = replace(
         query_type=CacheWriterQuery,
         backend="cute",
     ),
-    query_schema_version=2,
+    query_schema_version=22,
     validate_query=_validate_query,
 )
 
