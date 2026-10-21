@@ -594,10 +594,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "fp8_sm90_hint": {
         "module": "cake_quant_lora_gemm_b24e291cc9bbcb6adad1",
-        "device": "cake_quant_lora_gemm_b24e291cc9bbcb6adad1_kernel.cu",
+        # Shares the fp8_sm90 kernel source; compile_flags select this program.
+        "device": "cake_quant_lora_gemm_58229fa296714c9ace87_kernel.cu",
         "binding": "cake_quant_lora_gemm_b24e291cc9bbcb6adad1_binding.cu",
         "arches": ["sm_90a"],
-        "compile_flags": _COMPILE_FLAGS_SM90,
+        "compile_flags": [
+            *_COMPILE_FLAGS_SM90,
+            "-DCAKE_QLG_PROGRAM_KERNEL=kernel_cake_quant_lora_gemm_b24e291cc9bbcb6adad1",
+            "-DCAKE_QLG_FP8_SM90_HINT=1",
+        ],
         "ffi_entry": "run",
         "arg_plan": _ARG_PLAN_FP8_SM90,
         "pdl": True,
@@ -647,10 +652,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "nvfp4_blackwell_n192h": {
         "module": "cake_quant_lora_gemm_1c144a4162f4ba39de6c",
-        "device": "cake_quant_lora_gemm_1c144a4162f4ba39de6c_kernel.cu",
+        # Shares the nvfp4_blackwell_n192 kernel source; compile_flags select this program.
+        "device": "cake_quant_lora_gemm_aa5410d8a8acee43d949_kernel.cu",
         "binding": "cake_quant_lora_gemm_1c144a4162f4ba39de6c_binding.cu",
         "arches": ["sm_100a"],
-        "compile_flags": _COMPILE_FLAGS_BLACKWELL,
+        "compile_flags": [
+            *_COMPILE_FLAGS_BLACKWELL,
+            "-DCAKE_QLG_PROGRAM_KERNEL=kernel_cake_quant_lora_gemm_1c144a4162f4ba39de6c",
+            "-DCAKE_QLG_NVFP4_N192_HINT=1",
+        ],
         "ffi_entry": "run",
         "arg_plan": _ARG_PLAN_NVFP4_BLACKWELL_WIDE,
         "pdl": True,
