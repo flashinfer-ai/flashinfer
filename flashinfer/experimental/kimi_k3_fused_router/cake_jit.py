@@ -52,8 +52,15 @@ from ...jit.utils import write_if_different
 # route block alignment on the compile line (``-DBLOCK_M=8`` / ``-DBLOCK_M=16``);
 # the source carries no default.
 #
-# Both literals are populated by the generated-program export; do not edit
-# them by hand.
+# The eight-token cluster program (``"LC:8"``) compiles the kernel source of
+# the four-token program: its ``compile_flags`` carry ``ROWS=8`` (the cluster
+# size) and its own kernel symbol through the ``CAKE_PROGRAM_KERNEL`` compile
+# definition; without them the source is the four-token kernel.
+#
+# Both literals are populated by the generated-program export; the records
+# that share a kernel source (``sources[0]`` and the compile definitions in
+# ``compile_flags``) were re-pointed by hand pending exporter support. Do not
+# edit the literals otherwise.
 MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_fused_router_045ff7650cba571a4f5a": {
         "arm": "M",
@@ -367,10 +374,13 @@ MODULES: dict[str, dict[str, Any]] = {
         "num_tokens": 8,
         "arches": ["sm_100a", "sm_103a"],
         "sources": [
-            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_962f15b28e84fee89ca4_kernel.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_57eabcfcbd9fb3d39f75_kernel.cu",
             "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_962f15b28e84fee89ca4_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DROWS=8",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_fused_router_962f15b28e84fee89ca4",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "logits"],

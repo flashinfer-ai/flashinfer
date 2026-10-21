@@ -70,6 +70,12 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
   programs of such an arm compile the same kernel source, the SM103
   program selecting its own kernel symbol through the `CAKE_PROGRAM_KERNEL`
   compile definition.
+- The four- and eight-token cluster kernels are one kernel source: the
+  eight-token program compiles it with the compile definitions `ROWS=8` (the
+  cluster size) and `CAKE_PROGRAM_KERNEL=<its kernel symbol>`; without them
+  the source is the four-token kernel. Each of the two programs keeps its own
+  registry record, kernel symbol and host launcher (the record's
+  `compile_flags` carries the definitions).
 - Nothing is planned on the host and nothing is allocated at launch: a
   prepared runner (or a CUDA Graph capturing it) replays for new `logits` /
   `bias` values written into the same buffers.
