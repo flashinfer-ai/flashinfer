@@ -9,10 +9,10 @@
 #include <cstdint>
 #include <mutex>
 
+#include "cake_moe_alltoall_dispatch.cuh"
 #include "flashinfer/exception.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
 
 // These entry points are frozen CUDA sources compiled as part of the same JIT
 // module. Keep this launch-only translation unit free of framework tensor

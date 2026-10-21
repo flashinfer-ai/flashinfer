@@ -12,6 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Multi-GPU tests of the Cake MoE all-to-all kernels over MNNVL memory.
+
+One MPI rank per GPU; the workspace is shared through ``MnnvlMemory`` and the
+received payloads and combined outputs are checked against a reference.
+``test_cake_moe_alltoall.py`` covers the same kernels with every rank simulated
+on one GPU.
+
+Run with: mpirun -n 4 python -m pytest tests/comm/test_cake_moe_alltoall_multi_gpu.py
+"""
 
 import traceback
 
@@ -21,9 +30,17 @@ from mpi4py import MPI
 
 from flashinfer.comm.mapping import Mapping
 from flashinfer.comm.mnnvl import MnnvlMemory
+from flashinfer.utils import get_compute_capability
 
 from .conftest import mnnvl_available
-from .moe_a2a_driver import MoeA2ADriver, metainfo_index, workspace_bytes_per_rank
+from .cake_a2a_driver import CakeA2ADriver, metainfo_index, workspace_bytes_per_rank
+
+# The Cake kernels are built only for SM100 and SM103.
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or get_compute_capability(torch.device("cuda:0")) not in ((10, 0), (10, 3)),
+    reason="Cake MoE all-to-all requires compute capability 10.0 or 10.3",
+)
 
 
 class MPIExit(Exception):
@@ -339,7 +356,7 @@ def run_moe_a2a_dispatch_single_rank(
         hidden_size,
         extra_payload_bytes_per_token=extra_payload_bytes,
     )
-    moe_a2a = MoeA2ADriver(
+    moe_a2a = CakeA2ADriver(
         mapping,
         max_num_tokens,
         top_k,
@@ -852,7 +869,7 @@ def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k, use_lora=False):
         hidden_size,
         extra_payload_bytes_per_token=extra_payload_bytes,
     )
-    moe_a2a = MoeA2ADriver(
+    moe_a2a = CakeA2ADriver(
         mapping=mapping,
         max_num_tokens=max_num_tokens,
         top_k=top_k,
@@ -955,5 +972,5 @@ def test_moe_a2a_dispatch_moe_combine(distribution, top_k, use_lora):
 
 
 if __name__ == "__main__":
-    # Run with: mpirun -n 4 python -m pytest tests/comm/test_mnnvl_moe_alltoall.py -v
+    # Run with: mpirun -n 4 python -m pytest tests/comm/test_cake_moe_alltoall_multi_gpu.py -v
     pytest.main([__file__, "-v", "-s"])

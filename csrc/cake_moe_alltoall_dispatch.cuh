@@ -18,6 +18,10 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <cstdint>
+
+#include "tensorrt_llm/common/NvInferRuntime.h"
+
 namespace tensorrt_llm::kernels::moe_alltoall {
 
 // Configuration constants
@@ -254,7 +258,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params);
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params);
 
 // True when combine and output block quantization run as one launch, so the caller must not
-// allocate the BF16/FP16 accumulation_data intermediate. The trtllm backend always returns false.
+// allocate the BF16/FP16 accumulation_data intermediate.
 bool moe_a2a_combine_fuses_quantization(MoeA2ACombineParams const& params);
 
 // Sanitize expert IDs for invalid tokens

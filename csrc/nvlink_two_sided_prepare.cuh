@@ -21,7 +21,7 @@
 
 #define DEBUG_PIPELINE 0
 
-namespace flashinfer::trtllm_alltoall {
+namespace flashinfer::nvlink_two_sided {
 
 namespace moe_prepare {
 
@@ -125,4 +125,4 @@ size_t getMoePrepareWorkspaceSize(int epSize);
 
 }  // namespace moe_prepare
 
-}  // namespace flashinfer::trtllm_alltoall
+}  // namespace flashinfer::nvlink_two_sided

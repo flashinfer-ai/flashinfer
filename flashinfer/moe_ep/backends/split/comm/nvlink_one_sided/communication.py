@@ -33,7 +33,7 @@ from ..nvlink_common import (
     unmap_mnnvl_memory,
 )
 from .config import NVLinkOneSidedConfig
-from .kernels import get_nvlink_one_sided_module, layout_constants
+from .kernels import get_nvlink_one_sided_alltoall_module, layout_constants
 
 if TYPE_CHECKING:
     import torch
@@ -166,7 +166,7 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
                 f"got {params.top_k}"
             )
 
-        self._module = get_nvlink_one_sided_module()
+        self._module = get_nvlink_one_sided_alltoall_module()
         self._index = index = layout_constants()
         if self.ep_size > index.MAX_RANKS:
             raise ValueError(

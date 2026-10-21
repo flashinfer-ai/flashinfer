@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
-"""Test driver for the functional MoE all-to-all ops of flashinfer.comm.
+"""Test driver for the kernel-level operations of the Cake MoE all-to-all.
 
-``MoeA2ADriver`` allocates and initializes an MNNVL workspace, shared by
-drivers with the same geometry and backend, and runs ``moe_a2a_dispatch``,
-``moe_a2a_sanitize_expert_ids`` and ``moe_a2a_combine`` on it, carrying the
+``CakeA2ADriver`` allocates and initializes an MNNVL workspace, shared by
+drivers with the same geometry, and runs the ``dispatch``,
+``sanitize_expert_ids`` and ``combine`` operations of
+:mod:`flashinfer.moe_ep.backends.split.comm.cake.kernels` on it, carrying the
 per-round state that combine needs from dispatch.
 """
 
@@ -14,17 +15,11 @@ import torch
 
 from flashinfer.comm.mapping import Mapping
 from flashinfer.comm.mnnvl import MnnvlConfig, MnnvlMemory
-from flashinfer.comm.trtllm_moe_alltoall import (
-    MoeAlltoAllBackend,
-    get_moe_alltoall_module,
-    moe_a2a_combine,
-    moe_a2a_dispatch,
-    moe_a2a_get_workspace_size_per_rank,
-    moe_a2a_initialize,
-    moe_a2a_sanitize_expert_ids,
-    moe_a2a_wrap_payload_tensor_in_workspace,
-)
+from flashinfer.moe_ep.backends.split.comm.cake import kernels as cake_kernels
+from flashinfer.moe_ep.backends.split.comm.cake.kernels import metainfo_index
 from flashinfer.tllm_enums import SfLayout
+
+__all__ = ["CakeA2ADriver", "metainfo_index", "workspace_bytes_per_rank"]
 
 
 def workspace_bytes_per_rank(
@@ -34,33 +29,21 @@ def workspace_bytes_per_rank(
     hidden_size: int,
     extra_payload_bytes_per_token: int = 0,
     eplb_stats_num_experts: int = 0,
-    *,
-    backend: MoeAlltoAllBackend = "trtllm",
 ) -> int:
     """Workspace bytes per rank for 16-bit hidden states, int32 expert ids and
     FP32 weights, plus ``extra_payload_bytes_per_token``."""
-    return moe_a2a_get_workspace_size_per_rank(
+    return cake_kernels.workspace_size_per_rank(
         ep_size,
         max_num_tokens,
         hidden_size * 2 + top_k * 4 + top_k * 4 + extra_payload_bytes_per_token,
         hidden_size * 2,
         eplb_stats_num_experts,
-        backend=backend,
     )
 
 
-def metainfo_index(backend: MoeAlltoAllBackend = "trtllm") -> dict:
-    """Metainfo field indices, keyed by name without the ``MOE_A2A_`` prefix."""
-    names, values = get_moe_alltoall_module(backend).moe_a2a_get_metainfo_index_pairs()
-    return {
-        name.removeprefix("MOE_A2A_"): int(value)
-        for name, value in zip(names, values, strict=True)
-    }
-
-
-class MoeA2ADriver:
+class CakeA2ADriver:
     # Workspaces keyed by (bytes per rank, ep_rank, ep_size, max tokens,
-    # EPLB experts, backend).
+    # EPLB experts).
     _WORKSPACES: dict = {}
 
     def __init__(
@@ -73,8 +56,6 @@ class MoeA2ADriver:
         mnnvl_config: Optional[MnnvlConfig] = None,
         eplb_stats_num_experts: int = 0,
         enable_rank_mask: bool = False,
-        *,
-        backend: MoeAlltoAllBackend = "trtllm",
     ):
         MnnvlMemory.initialize()
         if mnnvl_config:
@@ -85,25 +66,22 @@ class MoeA2ADriver:
         self.top_k = top_k
         self.num_experts = num_experts
         self.enable_rank_mask = enable_rank_mask
-        self.backend = backend
         key = (
             workspace_size_per_rank,
             self.ep_rank,
             self.ep_size,
             max_num_tokens,
             eplb_stats_num_experts,
-            backend,
         )
         if key not in self._WORKSPACES:
             mnnvl_mem = MnnvlMemory(mapping, workspace_size_per_rank)
             workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
-            metainfo = moe_a2a_initialize(
+            metainfo = cake_kernels.initialize(
                 workspace,
                 self.ep_rank,
                 self.ep_size,
                 max_num_tokens,
                 eplb_stats_num_experts,
-                backend=backend,
             )
             # No peer may publish into this workspace until every rank has
             # cleared its own slice.
@@ -125,7 +103,7 @@ class MoeA2ADriver:
         active_rank_mask: Optional[torch.Tensor] = None,
     ) -> list:
         assert self._round is None, "dispatch called twice without combine"
-        recv, combine_offset, self.eplb_gathered_stats = moe_a2a_dispatch(
+        recv, combine_offset, self.eplb_gathered_stats = cake_kernels.dispatch(
             token_selected_experts,
             input_payloads,
             self.workspace,
@@ -138,17 +116,15 @@ class MoeA2ADriver:
             eplb_local_stats=eplb_local_stats,
             enable_rank_mask=self.enable_rank_mask,
             active_rank_mask=active_rank_mask,
-            backend=self.backend,
             recv_view_cache=self._recv_view_cache,
         )
         if invalid_token_expert_id is not None:
-            moe_a2a_sanitize_expert_ids(
+            cake_kernels.sanitize_expert_ids(
                 recv[expert_id_payload_index],
                 self.workspace,
                 self.metainfo,
                 self.ep_rank,
                 invalid_token_expert_id,
-                backend=self.backend,
             )
         self._round = {
             "local_num_tokens": token_selected_experts.size(0),
@@ -165,7 +141,7 @@ class MoeA2ADriver:
             start
             + self.ep_size * runtime_max_tokens_per_rank * hidden_size * dtype.itemsize
         )
-        return moe_a2a_wrap_payload_tensor_in_workspace(
+        return cake_kernels.wrap_workspace(
             self.workspace[self.ep_rank, :],
             [self.ep_size, runtime_max_tokens_per_rank],
             start,
@@ -188,7 +164,7 @@ class MoeA2ADriver:
         active_rank_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert self._round is not None, "combine called before dispatch"
-        combined = moe_a2a_combine(
+        combined = cake_kernels.combine(
             payload,
             self._round["local_num_tokens"],
             self.workspace,
@@ -207,7 +183,6 @@ class MoeA2ADriver:
             use_low_precision=use_low_precision,
             enable_rank_mask=self.enable_rank_mask,
             active_rank_mask=active_rank_mask,
-            backend=self.backend,
         )
         self._round = None
         self.eplb_gathered_stats = None

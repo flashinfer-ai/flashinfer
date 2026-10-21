@@ -17,146 +17,14 @@
 
 #include <tvm/ffi/container/tuple.h>
 
-#include "flashinfer/comm/trtllm_alltoall.cuh"
-#include "flashinfer/comm/trtllm_alltoall_prepare.cuh"
+#include "nvlink_two_sided_alltoall.cuh"
+#include "nvlink_two_sided_prepare.cuh"
 #include "tvm_ffi_utils.h"
 
-using namespace flashinfer::trtllm_alltoall;
+using namespace flashinfer::nvlink_two_sided;
 
 using tvm::ffi::Optional;
 using tvm::ffi::Tuple;
-
-void moeCommPrepareIndicesOp(TensorView gatheredTargetRankIds,
-                             Optional<TensorView> realRankTokenCountCumSum,
-                             TensorView localGatherIndices, TensorView sendRankCountCumSum,
-                             TensorView sendRankLocalIndices, TensorView recvRankCountCumSum,
-                             TensorView recvRankLocalIndices,
-                             TensorView backwardRecvRankLocalIndices, int64_t maxTokenCountPerRank,
-                             int64_t expertCount, int64_t topK, int64_t epRank, int64_t epSize) {
-  CHECK_INPUT_TYPE(gatheredTargetRankIds, dl_int32);
-  TVM_FFI_ICHECK_EQ(gatheredTargetRankIds.ndim(), 2) << "gatheredTargetRankIds must be a 2D tensor";
-  TVM_FFI_ICHECK_EQ(gatheredTargetRankIds.size(1), topK)
-      << "gatheredTargetRankIds must have topK columns";
-
-  int const* realRankTokenCountCumSumPtr = nullptr;
-  if (realRankTokenCountCumSum.has_value()) {
-    TVM_FFI_ICHECK_EQ(realRankTokenCountCumSum.value().ndim(), 1)
-        << "realRankTokenCountCumSum must be a 1D tensor";
-    CHECK_INPUT_TYPE(realRankTokenCountCumSum.value(), dl_int32)
-    TVM_FFI_ICHECK_EQ(realRankTokenCountCumSum.value().size(0), epSize)
-        << "realRankTokenCountCumSum must have epSize elements";
-    realRankTokenCountCumSumPtr = static_cast<int*>(realRankTokenCountCumSum.value().data_ptr());
-  } else {
-    TVM_FFI_ICHECK_EQ(gatheredTargetRankIds.size(0), epSize * maxTokenCountPerRank)
-        << "gatheredTargetRankIds should have shape (epSize * maxTokenCountPerRank, topK)";
-  }
-  TVM_FFI_ICHECK_GT(maxTokenCountPerRank, 0) << "maxTokenCountPerRank must be greater than 0";
-  TVM_FFI_ICHECK_GT(expertCount, 0) << "expertCount must be greater than 0";
-  TVM_FFI_ICHECK_GT(topK, 0) << "topK must be greater than 0";
-  TVM_FFI_ICHECK_LE(topK, expertCount) << "topK must be less than or equal to expertCount";
-  TVM_FFI_ICHECK(epRank >= 0 && epRank < epSize) << "epRank must be in the range [0, epSize)";
-
-  auto stream = get_current_stream();
-
-  int maxSendRanksPerToken = std::max(static_cast<int>(epSize), static_cast<int>(topK));
-
-  CHECK_INPUT_TYPE(localGatherIndices, dl_int32);
-  TVM_FFI_ICHECK_EQ(localGatherIndices.ndim(), 1);
-  TVM_FFI_ICHECK_EQ(localGatherIndices.size(0), maxTokenCountPerRank * epSize);
-
-  CHECK_INPUT_TYPE(sendRankCountCumSum, dl_int32);
-  TVM_FFI_ICHECK_EQ(sendRankCountCumSum.ndim(), 1);
-  TVM_FFI_ICHECK_EQ(sendRankCountCumSum.size(0), epSize);
-
-  CHECK_INPUT_TYPE(sendRankLocalIndices, dl_int32);
-  TVM_FFI_ICHECK_EQ(sendRankLocalIndices.ndim(), 1);
-  TVM_FFI_ICHECK_EQ(sendRankLocalIndices.size(0), maxTokenCountPerRank * maxSendRanksPerToken);
-
-  CHECK_INPUT_TYPE(recvRankCountCumSum, dl_int32);
-  TVM_FFI_ICHECK_EQ(recvRankCountCumSum.ndim(), 1);
-  TVM_FFI_ICHECK_EQ(recvRankCountCumSum.size(0), epSize);
-
-  CHECK_INPUT_TYPE(recvRankLocalIndices, dl_int32);
-  TVM_FFI_ICHECK_EQ(recvRankLocalIndices.ndim(), 1);
-  TVM_FFI_ICHECK_EQ(recvRankLocalIndices.size(0), maxTokenCountPerRank * epSize);
-
-  CHECK_INPUT_TYPE(backwardRecvRankLocalIndices, dl_int32);
-  TVM_FFI_ICHECK_EQ(backwardRecvRankLocalIndices.ndim(), 1);
-  TVM_FFI_ICHECK_EQ(backwardRecvRankLocalIndices.size(0),
-                    maxTokenCountPerRank * maxSendRanksPerToken);
-
-  flashinfer::trtllm_alltoall::MoeExpertParallelInfo expertParallelInfo;
-  expertParallelInfo.expertCount = static_cast<int>(expertCount);
-  expertParallelInfo.topK = static_cast<int>(topK);
-
-  flashinfer::trtllm_alltoall::MoeEpWorldInfo worldInfo = {static_cast<int>(epSize),
-                                                           static_cast<int>(epRank)};
-
-  auto cudaResult = flashinfer::trtllm_alltoall::moeAllToAllPrepareIndices(
-      worldInfo, expertParallelInfo, static_cast<int>(maxTokenCountPerRank),
-      static_cast<int*>(gatheredTargetRankIds.data_ptr()), realRankTokenCountCumSumPtr,
-      static_cast<int*>(localGatherIndices.data_ptr()),
-      static_cast<int*>(sendRankCountCumSum.data_ptr()),
-      static_cast<int*>(sendRankLocalIndices.data_ptr()),
-      static_cast<int*>(recvRankCountCumSum.data_ptr()),
-      static_cast<int*>(recvRankLocalIndices.data_ptr()),
-      static_cast<int*>(backwardRecvRankLocalIndices.data_ptr()), stream);
-  TVM_FFI_ICHECK(cudaResult == cudaSuccess)
-      << "CUDA error in moeAllToAllPrepareIndices: " << cudaGetErrorString(cudaResult);
-}
-
-void moeLocalGatherOp(TensorView recvRankCumSum, TensorView localGatherIndices,
-                      TensorView gatheredExpertIds, TensorView gatheredScales,
-                      TensorView localExpertIds, TensorView localScales,
-                      int64_t maxTokenCountPerRank, int64_t expertCount, int64_t topK,
-                      int64_t epRank, int64_t epSize) {
-  CHECK_INPUT_TYPE(recvRankCumSum, dl_int32);
-  CHECK_INPUT_TYPE(localGatherIndices, dl_int32);
-  CHECK_INPUT_TYPE(gatheredExpertIds, dl_int32);
-  CHECK_INPUT_TYPE(gatheredScales, dl_float32);
-  CHECK_INPUT_TYPE(localExpertIds, dl_int32);
-  CHECK_INPUT_TYPE(localScales, dl_float32);
-
-  TVM_FFI_ICHECK_GT(maxTokenCountPerRank, 0) << "maxTokenCountPerRank must be greater than 0";
-  TVM_FFI_ICHECK_GT(expertCount, 0) << "expertCount must be greater than 0";
-  TVM_FFI_ICHECK_GT(topK, 0) << "topK must be greater than 0";
-  TVM_FFI_ICHECK_LE(topK, expertCount) << "topK must be less than or equal to expertCount";
-  TVM_FFI_ICHECK(epRank >= 0 && epRank < epSize) << "epRank must be in the range [0, epSize)";
-
-  TVM_FFI_ICHECK_EQ(recvRankCumSum.ndim(), 1) << "recvRankCumSum must be a 1D tensor";
-  TVM_FFI_ICHECK_EQ(recvRankCumSum.size(0), epSize) << "recvRankCumSum must have epSize elements";
-  TVM_FFI_ICHECK_EQ(localGatherIndices.ndim(), 1) << "localGatherIndices must be a 1D tensor";
-  TVM_FFI_ICHECK_EQ(gatheredExpertIds.ndim(), 2) << "gatheredExpertIds must be a 2D tensor";
-  TVM_FFI_ICHECK_EQ(gatheredScales.ndim(), 2) << "gatheredScales must be a 2D tensor";
-  TVM_FFI_ICHECK_EQ(localExpertIds.ndim(), 2) << "localExpertIds must be a 2D tensor";
-  TVM_FFI_ICHECK_EQ(localScales.ndim(), 2) << "localScales must be a 2D tensor";
-  TVM_FFI_ICHECK_EQ(gatheredExpertIds.size(1), topK) << "gatheredExpertIds must have topK columns";
-  TVM_FFI_ICHECK_EQ(gatheredScales.size(1), topK) << "gatheredScales must have topK columns";
-  TVM_FFI_ICHECK_EQ(localExpertIds.size(1), topK) << "localExpertIds must have topK columns";
-  TVM_FFI_ICHECK_EQ(localScales.size(1), topK) << "localScales must have topK columns";
-
-  int localMaxTokenCount = static_cast<int>(localGatherIndices.size(0));
-  TVM_FFI_ICHECK_EQ(localExpertIds.size(0), localMaxTokenCount)
-      << "localExpertIds must have localMaxTokenCount rows";
-  TVM_FFI_ICHECK_EQ(localScales.size(0), localMaxTokenCount)
-      << "localScales must have localMaxTokenCount rows";
-
-  auto stream = get_current_stream();
-
-  flashinfer::trtllm_alltoall::MoeExpertParallelInfo expertParallelInfo;
-  expertParallelInfo.expertCount = static_cast<int>(expertCount);
-  expertParallelInfo.topK = static_cast<int>(topK);
-
-  flashinfer::trtllm_alltoall::MoeEpWorldInfo worldInfo = {static_cast<int>(epSize),
-                                                           static_cast<int>(epRank)};
-  flashinfer::trtllm_alltoall::moeLocalGather(
-      worldInfo, expertParallelInfo, static_cast<int>(maxTokenCountPerRank), localMaxTokenCount,
-      static_cast<int*>(recvRankCumSum.data_ptr()),
-      static_cast<int*>(localGatherIndices.data_ptr()),
-      static_cast<int*>(gatheredExpertIds.data_ptr()),
-      static_cast<float*>(gatheredScales.data_ptr()), static_cast<int*>(localExpertIds.data_ptr()),
-      static_cast<float*>(localScales.data_ptr()), stream);
-}
 
 void moeCommOp(TensorView input, TensorView sendRankCumSum, TensorView sendIndices,
                TensorView output, TensorView recvRankCumSum, TensorView recvIndices,
@@ -184,9 +52,9 @@ void moeCommOp(TensorView input, TensorView sendRankCumSum, TensorView sendIndic
 
   TVM_FFI_ICHECK(epRank >= 0 && epRank < epSize) << "epRank must be in the range [0, epSize)";
 
-  flashinfer::trtllm_alltoall::MoeEpWorldInfo worldInfo = {static_cast<int>(epSize),
-                                                           static_cast<int>(epRank)};
-  flashinfer::trtllm_alltoall::SendRecvDataInfo sendRecvDataInfo;
+  flashinfer::nvlink_two_sided::MoeEpWorldInfo worldInfo = {static_cast<int>(epSize),
+                                                            static_cast<int>(epRank)};
+  flashinfer::nvlink_two_sided::SendRecvDataInfo sendRecvDataInfo;
 
   size_t eltSize = get_element_size(input);
   size_t eltCountPerU64 = sizeof(uint64_t) / eltSize;
@@ -195,7 +63,7 @@ void moeCommOp(TensorView input, TensorView sendRankCumSum, TensorView sendIndic
   sendRecvDataInfo.vectorSizeInU64 = input.size(1) / eltCountPerU64;
   sendRecvDataInfo.DoPreCompute();
 
-  flashinfer::trtllm_alltoall::SendRecvDispls sendDispls, recvDispls;
+  flashinfer::nvlink_two_sided::SendRecvDispls sendDispls, recvDispls;
   sendDispls.dataPtr = static_cast<uint64_t*>(input.data_ptr());
   sendDispls.rankCountCumSum = static_cast<int*>(sendRankCumSum.data_ptr());
   sendDispls.rankLocalIndices = static_cast<int*>(sendIndices.data_ptr());
@@ -206,24 +74,24 @@ void moeCommOp(TensorView input, TensorView sendRankCumSum, TensorView sendIndic
   recvDispls.rankLocalIndices = static_cast<int*>(recvIndices.data_ptr());
   recvDispls.vectorStrideInU64 = output.stride(0) / eltCountPerU64;
 
-  flashinfer::trtllm_alltoall::MoeCommWorkspace workspace;
+  flashinfer::nvlink_two_sided::MoeCommWorkspace workspace;
   workspace.workspacePtr = static_cast<uint64_t*>(allWorkspaces.data_ptr());
   workspace.rankStrideInU64 = allWorkspaces.stride(0);
 
   auto stream = get_current_stream();
 
-  flashinfer::trtllm_alltoall::moeAllToAll(worldInfo, sendRecvDataInfo, sendDispls, recvDispls,
-                                           workspace, stream);
+  flashinfer::nvlink_two_sided::moeAllToAll(worldInfo, sendRecvDataInfo, sendDispls, recvDispls,
+                                            workspace, stream);
 }
 
 int64_t getWorkspaceSizePerRank(int64_t epSize) {
   int epSize32 = static_cast<int>(epSize);
-  return flashinfer::trtllm_alltoall::getMoeCommWorkspaceSize(epSize32);
+  return flashinfer::nvlink_two_sided::getMoeCommWorkspaceSize(epSize32);
 }
 
 int64_t getPrepareWorkspaceSizePerRank(int64_t epSize) {
   int epSize32 = static_cast<int>(epSize);
-  return flashinfer::trtllm_alltoall::moe_prepare::getMoePrepareWorkspaceSize(epSize32);
+  return flashinfer::nvlink_two_sided::moe_prepare::getMoePrepareWorkspaceSize(epSize32);
 }
 
 void moePrepareOp(TensorView expertsIds, Optional<TensorView> scales,
@@ -315,13 +183,13 @@ void moePrepareOp(TensorView expertsIds, Optional<TensorView> scales,
     gatheredExpertStaticsPtr = static_cast<int*>(gatheredExpertStatics.value().data_ptr());
   }
 
-  flashinfer::trtllm_alltoall::moe_prepare::MoeCommWorkspace workspace;
+  flashinfer::nvlink_two_sided::moe_prepare::MoeCommWorkspace workspace;
   workspace.workspacePtr = static_cast<uint64_t*>(allWorkspaces.data_ptr());
   workspace.rankStrideInU64 = allWorkspaces.stride(0);
 
   auto stream = get_current_stream();
 
-  flashinfer::trtllm_alltoall::moe_prepare::computeCountAndIndice(
+  flashinfer::nvlink_two_sided::moe_prepare::computeCountAndIndice(
       static_cast<int*>(expertsIds.data_ptr()), static_cast<int*>(sendRankCountCumSum.data_ptr()),
       static_cast<int*>(recvRankCountCumSum.data_ptr()),
       static_cast<int*>(sendRankIndices.data_ptr()),
@@ -329,11 +197,11 @@ void moePrepareOp(TensorView expertsIds, Optional<TensorView> scales,
       static_cast<int*>(recvRankIndices.data_ptr()), workspace, tokenCount, maxTokenCountPerRank,
       topK, slotCount, epRank, epSize, stream);
 
-  flashinfer::trtllm_alltoall::moe_prepare::computeCumsum(
+  flashinfer::nvlink_two_sided::moe_prepare::computeCumsum(
       static_cast<int*>(sendRankCountCumSum.data_ptr()),
       static_cast<int*>(recvRankCountCumSum.data_ptr()), epRank, epSize, stream);
 
-  flashinfer::trtllm_alltoall::moe_prepare::moveIndice(
+  flashinfer::nvlink_two_sided::moe_prepare::moveIndice(
       static_cast<int*>(sendRankCountCumSum.data_ptr()),
       static_cast<int*>(recvRankCountCumSum.data_ptr()),
       static_cast<int*>(sendRankIndices.data_ptr()),
@@ -344,7 +212,7 @@ void moePrepareOp(TensorView expertsIds, Optional<TensorView> scales,
       static_cast<int*>(gatherRecvRankIndices.data_ptr()), epRank, epSize, maxTokenCountPerRank,
       stream);
 
-  flashinfer::trtllm_alltoall::moe_prepare::allToAllMetadata(
+  flashinfer::nvlink_two_sided::moe_prepare::allToAllMetadata(
       static_cast<int*>(expertsIds.data_ptr()),
       static_cast<int*>(preparedLocalExpertIds.data_ptr()), scalesPtr, preparedLocalScalesPtr,
       localExpertStaticsPtr, gatheredExpertStaticsPtr, workspace,
@@ -355,8 +223,6 @@ void moePrepareOp(TensorView expertsIds, Optional<TensorView> scales,
       expertCount, slotCount, epRank, epSize, stream);
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_comm_prepare_indices, moeCommPrepareIndicesOp);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_local_gather, moeLocalGatherOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_comm, moeCommOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(set_moe_max_usable_sm_count, setMaxUsableSmCount);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_moe_commworkspace_size_per_rank, getWorkspaceSizePerRank);

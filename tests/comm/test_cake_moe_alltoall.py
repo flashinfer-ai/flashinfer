@@ -27,11 +27,18 @@ from flashinfer import mxfp4_quantize, nvfp4_quantize
 from flashinfer.fp4_quantization import e2m1_and_ufp8sf_scale_to_float
 from tests.utils_fp8 import mxfp8_quantize_reference
 
-import flashinfer.comm.trtllm_moe_alltoall as trtllm_moe_alltoall
+from flashinfer.moe_ep.backends.split.comm.cake import kernels as cake_kernels
 
 from .conftest import mnnvl_available
 
 pynvml.nvmlInit()
+
+# The Cake kernels are built only for SM100 and SM103.
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or get_compute_capability(torch.device("cuda:0")) not in ((10, 0), (10, 3)),
+    reason="Cake MoE all-to-all requires compute capability 10.0 or 10.3",
+)
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -217,7 +224,7 @@ def test_moe_combine_rejects_invalid_output_scales(invalid_kind, error_match):
         output_scales = torch.empty(scale_extent + 1, dtype=torch.uint8, device="cuda")
     output = torch.empty((num_tokens, output_width), dtype=output_dtype, device="cuda")
     with pytest.raises(Exception, match=error_match):
-        trtllm_moe_alltoall.moe_a2a_combine(
+        cake_kernels.combine(
             combine_payload,
             num_tokens,
             workspaces,
@@ -262,14 +269,14 @@ def make_payload(num_tokens, vector_dim, dtype):
 
 def test_moe_a2a_combine_rejects_cpu_output_before_jit(monkeypatch):
     monkeypatch.setattr(
-        trtllm_moe_alltoall,
-        "get_moe_alltoall_module",
+        cake_kernels,
+        "current_module",
         lambda: pytest.fail("invalid output should be rejected before JIT loading"),
     )
     payload = torch.empty((1, 1, 1))
 
     with pytest.raises(ValueError, match="output must be a CUDA tensor"):
-        trtllm_moe_alltoall.moe_a2a_combine(
+        cake_kernels.combine(
             payload,
             1,
             torch.empty(0),
@@ -286,15 +293,15 @@ def test_moe_a2a_combine_rejects_cpu_output_before_jit(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_moe_a2a_combine_rejects_noncontiguous_output_before_jit(monkeypatch):
     monkeypatch.setattr(
-        trtllm_moe_alltoall,
-        "get_moe_alltoall_module",
+        cake_kernels,
+        "current_module",
         lambda: pytest.fail("invalid output should be rejected before JIT loading"),
     )
     payload = torch.empty((1, 1, 2), device="cuda")
     output = torch.empty((2, 2), device="cuda").T
 
     with pytest.raises(ValueError, match="output must be contiguous"):
-        trtllm_moe_alltoall.moe_a2a_combine(
+        cake_kernels.combine(
             payload,
             1,
             torch.empty(0, device="cuda"),
@@ -344,7 +351,7 @@ def test_moe_alltoall_single_gpu(
 
     payload_size_per_token = sum([x[0].numel() * x.itemsize for x in input_tensors])
 
-    workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+    workspace_size = cake_kernels.workspace_size_per_rank(
         1,
         num_tokens,
         payload_size_per_token,
@@ -353,9 +360,9 @@ def test_moe_alltoall_single_gpu(
     workspace = torch.zeros(
         1, workspace_size, dtype=torch.uint8, device=torch.device("cuda")
     )
-    metainfo = trtllm_moe_alltoall.moe_a2a_initialize(workspace, 0, 1, num_tokens)
+    metainfo = cake_kernels.initialize(workspace, 0, 1, num_tokens)
 
-    output_tensors, combine_payload_offset, _ = trtllm_moe_alltoall.moe_a2a_dispatch(
+    output_tensors, combine_payload_offset, _ = cake_kernels.dispatch(
         token_selected_experts,
         input_tensors,
         workspace,
@@ -367,9 +374,7 @@ def test_moe_alltoall_single_gpu(
         num_experts=num_experts,
     )
     # Tokens assigned to invalid experts are set to -3.
-    trtllm_moe_alltoall.moe_a2a_sanitize_expert_ids(
-        output_tensors[2], workspace, metainfo, 0, -3
-    )
+    cake_kernels.sanitize_expert_ids(output_tensors[2], workspace, metainfo, 0, -3)
 
     # Sort to undo the shuffling that happens in the dispatch kernel.
     for input_tensor, output_tensor in zip(input_tensors, output_tensors, strict=True):
@@ -379,7 +384,7 @@ def test_moe_alltoall_single_gpu(
 
     if payload_in_workspace:
         hidden_state = input_tensors[hidden_state_index]
-        combine_tensor = trtllm_moe_alltoall.moe_a2a_wrap_payload_tensor_in_workspace(
+        combine_tensor = cake_kernels.wrap_workspace(
             workspace[0, :],
             [1, num_tokens],
             combine_payload_offset,
@@ -396,7 +401,7 @@ def test_moe_alltoall_single_gpu(
         if use_output_buffer
         else None
     )
-    output = trtllm_moe_alltoall.moe_a2a_combine(
+    output = cake_kernels.combine(
         combine_tensor,
         num_tokens,
         workspace,
@@ -438,7 +443,7 @@ def dispatch_from_single_rank(
             * input_tensors[hidden_state_index].itemsize
         )
 
-    workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+    workspace_size = cake_kernels.workspace_size_per_rank(
         world_size,
         num_tokens * world_size,
         total_payload_size_per_element,
@@ -453,7 +458,7 @@ def dispatch_from_single_rank(
     metainfo = []
     for rank in range(world_size):
         metainfo.append(
-            trtllm_moe_alltoall.moe_a2a_initialize(
+            cake_kernels.initialize(
                 all_workspaces,
                 rank,
                 world_size,
@@ -476,7 +481,7 @@ def dispatch_from_single_rank(
             rank_token_selected_experts = token_selected_experts[
                 rank * num_tokens : (rank + 1) * num_tokens
             ]
-            output, offset, _ = trtllm_moe_alltoall.moe_a2a_dispatch(
+            output, offset, _ = cake_kernels.dispatch(
                 rank_token_selected_experts,
                 rank_payloads,
                 all_workspaces,
@@ -509,7 +514,7 @@ def sanitize_expert_ids_from_single_rank(
     enable_pdl=True,
 ):
     for rank in range(world_size):
-        trtllm_moe_alltoall.moe_a2a_sanitize_expert_ids(
+        cake_kernels.sanitize_expert_ids(
             output_tensors[rank][expert_ids_index],
             all_workspaces,
             metainfo[rank],
@@ -560,7 +565,7 @@ def combine_from_single_rank(
     cuda_streams_all_ranks = [torch.cuda.Stream() for _ in range(world_size)]
     for rank in range(world_size):
         with torch.cuda.stream(cuda_streams_all_ranks[rank]):
-            result = trtllm_moe_alltoall.moe_a2a_combine(
+            result = cake_kernels.combine(
                 combine_payload[rank],
                 num_tokens,
                 all_workspaces,
@@ -630,7 +635,7 @@ def test_moe_combine_k4_matches_source_reduction_tree(dtype, scalar_values):
     physical = torch.tensor(scalar_values, dtype=dtype, device="cuda")
     combine_payload = []
     for rank in range(world_size):
-        payload = trtllm_moe_alltoall.moe_a2a_wrap_payload_tensor_in_workspace(
+        payload = cake_kernels.wrap_workspace(
             all_workspaces[rank, :],
             [world_size, num_tokens],
             combine_payload_offsets[rank],
@@ -692,7 +697,7 @@ def test_moe_combine_rejects_unsupported_top_k():
         enable_pdl=False,
     )
     with pytest.raises(Exception, match="[Uu]nsupported top_k"):
-        trtllm_moe_alltoall.moe_a2a_combine(
+        cake_kernels.combine(
             received[0][0].clone(),
             num_tokens,
             workspace,
@@ -841,7 +846,7 @@ def test_moe_alltoall_active_rank_mask_single_gpu(
 
     num_experts = world_size  # top_k=1, one expert per rank: expert_id == target rank
     active_ranks = [r for r in range(world_size) if r != dead_rank]
-    active_mask = trtllm_moe_alltoall.moe_a2a_active_rank_mask(active_ranks, world_size)
+    active_mask = cake_kernels.active_rank_mask(active_ranks, world_size)
 
     total_tokens = num_tokens * world_size
     token_selected_experts = make_random_topk_ids(
@@ -850,7 +855,7 @@ def test_moe_alltoall_active_rank_mask_single_gpu(
     payload = make_payload(total_tokens, vector_dim, torch.bfloat16)
 
     total_payload_size = payload[0].numel() * payload.itemsize
-    workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+    workspace_size = cake_kernels.workspace_size_per_rank(
         world_size, total_tokens, total_payload_size, vector_dim * payload.itemsize
     )
     all_workspaces = torch.zeros(
@@ -861,7 +866,7 @@ def test_moe_alltoall_active_rank_mask_single_gpu(
     # a crashed rank; only active_ranks participate.
     metainfo = {}
     for rank in active_ranks:
-        metainfo[rank] = trtllm_moe_alltoall.moe_a2a_initialize(
+        metainfo[rank] = cake_kernels.initialize(
             all_workspaces, rank, world_size, total_tokens
         )
     torch.cuda.synchronize()
@@ -875,7 +880,7 @@ def test_moe_alltoall_active_rank_mask_single_gpu(
             rank_experts = token_selected_experts[
                 rank * num_tokens : (rank + 1) * num_tokens
             ]
-            out, offset, _ = trtllm_moe_alltoall.moe_a2a_dispatch(
+            out, offset, _ = cake_kernels.dispatch(
                 rank_experts,
                 [rank_payload],
                 all_workspaces,
@@ -916,7 +921,7 @@ def test_moe_alltoall_active_rank_mask_single_gpu(
                 world_size, num_tokens, vector_dim, dtype=torch.bfloat16, device="cuda"
             )
             combine_payload.copy_(output_tensors[rank][0])
-            combine_results[rank] = trtllm_moe_alltoall.moe_a2a_combine(
+            combine_results[rank] = cake_kernels.combine(
                 combine_payload,
                 num_tokens,
                 all_workspaces,
@@ -955,22 +960,22 @@ def test_moe_alltoall_active_rank_mask_rejects_self_inactive():
     world_size = 4
     num_tokens = 8
     local_rank = 2
-    mask = trtllm_moe_alltoall.moe_a2a_active_rank_mask(
+    mask = cake_kernels.active_rank_mask(
         [r for r in range(world_size) if r != local_rank], world_size
     )
 
-    workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+    workspace_size = cake_kernels.workspace_size_per_rank(
         world_size, num_tokens * world_size, 4 * 2, 0
     )
     ws = torch.zeros(world_size, workspace_size, dtype=torch.uint8, device="cuda")
-    metainfo = trtllm_moe_alltoall.moe_a2a_initialize(
+    metainfo = cake_kernels.initialize(
         ws, local_rank, world_size, num_tokens * world_size
     )
     experts = torch.zeros(num_tokens, 1, dtype=torch.int32, device="cuda")
     payload = torch.randn(num_tokens, 4, dtype=torch.bfloat16, device="cuda")
 
     with pytest.raises(Exception, match="active_rank_mask"):
-        trtllm_moe_alltoall.moe_a2a_dispatch(
+        cake_kernels.dispatch(
             experts,
             [payload],
             ws,
@@ -992,20 +997,20 @@ def test_moe_alltoall_active_rank_mask_requires_enable_rank_mask():
     world_size = 4
     num_tokens = 8
     local_rank = 0
-    mask = trtllm_moe_alltoall.moe_a2a_active_rank_mask(range(world_size), world_size)
+    mask = cake_kernels.active_rank_mask(range(world_size), world_size)
 
-    workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+    workspace_size = cake_kernels.workspace_size_per_rank(
         world_size, num_tokens * world_size, 4 * 2, 0
     )
     ws = torch.zeros(world_size, workspace_size, dtype=torch.uint8, device="cuda")
-    metainfo = trtllm_moe_alltoall.moe_a2a_initialize(
+    metainfo = cake_kernels.initialize(
         ws, local_rank, world_size, num_tokens * world_size
     )
     experts = torch.zeros(num_tokens, 1, dtype=torch.int32, device="cuda")
     payload = torch.randn(num_tokens, 4, dtype=torch.bfloat16, device="cuda")
 
     with pytest.raises(Exception, match="enable_rank_mask"):
-        trtllm_moe_alltoall.moe_a2a_dispatch(
+        cake_kernels.dispatch(
             experts,
             [payload],
             ws,
@@ -1021,7 +1026,7 @@ def test_moe_alltoall_active_rank_mask_requires_enable_rank_mask():
 
     # enable_rank_mask=True without a mask should also raise (no silent all-active default).
     with pytest.raises(Exception, match="active_rank_mask"):
-        trtllm_moe_alltoall.moe_a2a_dispatch(
+        cake_kernels.dispatch(
             experts,
             [payload],
             ws,
@@ -1071,7 +1076,7 @@ def test_moe_alltoall_eplb_stats_single_gpu(
     ]
 
     total_payload_size_per_element = payload[0].numel() * payload.itemsize
-    workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+    workspace_size = cake_kernels.workspace_size_per_rank(
         world_size,
         num_tokens * world_size,
         total_payload_size_per_element,
@@ -1085,7 +1090,7 @@ def test_moe_alltoall_eplb_stats_single_gpu(
     metainfo = []
     for rank in range(world_size):
         metainfo.append(
-            trtllm_moe_alltoall.moe_a2a_initialize(
+            cake_kernels.initialize(
                 all_workspaces,
                 rank,
                 world_size,
@@ -1103,7 +1108,7 @@ def test_moe_alltoall_eplb_stats_single_gpu(
             rank_experts = token_selected_experts[
                 rank * num_tokens : (rank + 1) * num_tokens
             ]
-            _, _, eplb_gathered = trtllm_moe_alltoall.moe_a2a_dispatch(
+            _, _, eplb_gathered = cake_kernels.dispatch(
                 rank_experts,
                 [rank_payload],
                 all_workspaces,
@@ -1441,7 +1446,7 @@ def test_moe_combine_multi_rank_single_gpu(
     for rank in range(world_size):
         if payload_in_workspace:
             inplace_combine_tensors.append(
-                trtllm_moe_alltoall.moe_a2a_wrap_payload_tensor_in_workspace(
+                cake_kernels.wrap_workspace(
                     all_workspaces[rank, :],
                     [world_size, num_tokens],
                     combine_payload_offsets[rank],
@@ -1684,7 +1689,7 @@ def test_moe_combine_fp8(
     for rank in range(world_size):
         if payload_in_workspace:
             inplace_combine_tensors.append(
-                trtllm_moe_alltoall.moe_a2a_wrap_payload_tensor_in_workspace(
+                cake_kernels.wrap_workspace(
                     all_workspaces[rank, :],
                     [world_size, num_tokens],
                     combine_payload_offsets[rank],
@@ -1747,7 +1752,7 @@ def test_moe_workspace_size_per_rank():
     num_tokens = 10
     hidden_size = 128
     topk = 2
-    raw_workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+    raw_workspace_size = cake_kernels.workspace_size_per_rank(
         ep_size,
         num_tokens,
         (hidden_size * torch.bfloat16.itemsize + topk * 4 + topk * 4),
@@ -1755,19 +1760,18 @@ def test_moe_workspace_size_per_rank():
     )
     assert raw_workspace_size > 0
 
-    empty_workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+    empty_workspace_size = cake_kernels.workspace_size_per_rank(
         ep_size, num_tokens, 0, 0
     )
 
     assert empty_workspace_size > 0
-    assert (
-        empty_workspace_size
-        == trtllm_moe_alltoall.get_moe_alltoall_module().moe_a2a_get_aux_data_size(
-            ep_size, num_tokens
-        )
+    aux_data_size = cake_kernels.current_module().moe_a2a_get_aux_data_size(
+        ep_size, num_tokens, 0
     )
+    # Each workspace region is padded to 128 bytes.
+    assert empty_workspace_size == (aux_data_size + 127) // 128 * 128
 
-    non_empty_workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+    non_empty_workspace_size = cake_kernels.workspace_size_per_rank(
         ep_size, num_tokens, hidden_size, hidden_size
     )
 
