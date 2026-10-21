@@ -362,6 +362,7 @@ def _candidate_tile_fits(
     scale_format: str = "e4m3_k16",
     weight_layout: str = "packed",
     allow_logical_tail: bool = False,
+    enforce_search_floor: bool = True,
 ) -> bool:
     if int(tile_k) == -1 or int(tile_n) == -1 or int(cta_threads) == -1:
         return False
@@ -382,7 +383,13 @@ def _candidate_tile_fits(
         or int(tile_k) % scale_group_size != 0
     ):
         return False
-    if int(tile_n) < 64 or int(tile_k) < 64 or int(cta_threads) < 128:
+    # Minimum-size floor that prunes the auto-selection search space; it is
+    # not a kernel correctness bound. Forced tiles replay geometries the
+    # selector itself produced (e.g. the TC-decode "ultra" fc2 tile with
+    # tile_k=32), so they validate without it.
+    if enforce_search_floor and (
+        int(tile_n) < 64 or int(tile_k) < 64 or int(cta_threads) < 128
+    ):
         return False
     smem_bytes = _shared_memory_footprint(
         cta_m_blocks=cta_m_blocks,
@@ -5512,15 +5519,7 @@ def compile_w4a16_fused_moe(
             fc2_tile_n = 512
             fc2_tile_k = ultra_fc2_tile_k
             fc2_cta_threads = 256
-    # The custom-op boundary re-pins the geometry selected above, including
-    # the validated TC-decode (tile_k=32, tile_n=512) override. Only alternate
-    # pins need the generic check, whose tile_k>=64 floor excludes that override.
-    if force_tile_config is not None and tuple(map(int, force_tile_config)) != (
-        fc1_tile_k,
-        fc1_tile_n,
-        fc2_tile_k,
-        fc2_tile_n,
-    ):
+    if force_tile_config is not None:
         # Explicit (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) pin. The
         # NF3 ("nf3_2p1") flat-span weight layout is packed for a specific CTA
         # N-tile, so hybrid deployments pin ONE tile config across every m
@@ -5541,6 +5540,11 @@ def compile_w4a16_fused_moe(
             ("fc1", fc1_cols, hidden_size, fc1_tile_n, fc1_tile_k),
             ("fc2", hidden_size, intermediate_size, fc2_tile_n, fc2_tile_k),
         ):
+            # The re-pin replays a geometry the auto-selector (or the
+            # TC-decode wide-N override) already chose, so validate it
+            # against the correctness constraints only — divisibility,
+            # scale alignment, and shared memory — not the search-space
+            # size floor, which would reject the ultra fc2 tile (tile_k=32).
             if not _candidate_tile_fits(
                 problem_n=forced_pn,
                 problem_k=forced_pk,
@@ -5552,6 +5556,7 @@ def compile_w4a16_fused_moe(
                 scale_format=scale_format,
                 weight_layout=weight_layout,
                 allow_logical_tail=allow_native_logical_tail,
+                enforce_search_floor=False,
             ):
                 raise ValueError(
                     f"force_tile_config {name} tile "

@@ -41,6 +41,24 @@ from flashinfer.comm.mnnvl_cutedsl.kernel_bt import (
     BT_FINALIZE_GB300_TP16_H8192_K10_PRESET_1,
     BT_FINALIZE_GB300_TP8_H8192_K10_PRESET_0,
     BT_FINALIZE_GB300_TP8_H8192_K10_PRESET_1,
+    BT_ALL_REDUCE_GB300_TP4_H7168_PRESET_0,
+    BT_ALL_REDUCE_GB300_TP4_H7168_PRESET_1,
+    BT_ALL_REDUCE_GB300_TP8_H7168_PRESET_0,
+    BT_ALL_REDUCE_GB300_TP8_H7168_PRESET_1,
+    BT_FINALIZE_GB300_TP4_H7168_K16_PRESET_0,
+    BT_FINALIZE_GB300_TP4_H7168_K16_PRESET_1,
+    BT_FINALIZE_GB300_TP8_H7168_K16_PRESET_0,
+    BT_FINALIZE_GB300_TP8_H7168_K16_PRESET_1,
+)
+from flashinfer.comm.mnnvl_cutedsl.kernel_ht import (
+    HT_ALL_REDUCE_GB300_TP4_H7168,
+    HT_FINALIZE_GB300_TP4_H7168_K16,
+)
+from flashinfer.comm.mnnvl_cutedsl.kernel_ll import (
+    LL_ALL_REDUCE_GB300_TP4_H7168,
+    LL_ALL_REDUCE_GB300_TP8_H7168,
+    LL_FINALIZE_GB300_TP4_H7168_K16,
+    LL_FINALIZE_GB300_TP8_H7168_K16,
 )
 
 
@@ -256,6 +274,83 @@ def test_default_finalize_presets_use_safe_shared_expert_ordering(tp_size):
     for target in profile.finalize_routes.targets:
         if target.protocol in (ProtocolKind.LL, ProtocolKind.BT):
             assert target.preset.load_shared_expert_before_pdl is False
+
+
+def test_kimi_k3_default_protocol_and_preset_boundaries():
+    expected = {
+        4: {
+            "finalize": (
+                (24, ProtocolKind.LL, LL_FINALIZE_GB300_TP4_H7168_K16),
+                (25, ProtocolKind.BT, BT_FINALIZE_GB300_TP4_H7168_K16_PRESET_0),
+                (512, ProtocolKind.BT, BT_FINALIZE_GB300_TP4_H7168_K16_PRESET_0),
+                (513, ProtocolKind.BT, BT_FINALIZE_GB300_TP4_H7168_K16_PRESET_1),
+                (768, ProtocolKind.BT, BT_FINALIZE_GB300_TP4_H7168_K16_PRESET_1),
+                (769, ProtocolKind.HT, HT_FINALIZE_GB300_TP4_H7168_K16),
+            ),
+            "all_reduce": (
+                (28, ProtocolKind.LL, LL_ALL_REDUCE_GB300_TP4_H7168),
+                (29, ProtocolKind.BT, BT_ALL_REDUCE_GB300_TP4_H7168_PRESET_0),
+                (512, ProtocolKind.BT, BT_ALL_REDUCE_GB300_TP4_H7168_PRESET_0),
+                (513, ProtocolKind.BT, BT_ALL_REDUCE_GB300_TP4_H7168_PRESET_1),
+                (2048, ProtocolKind.BT, BT_ALL_REDUCE_GB300_TP4_H7168_PRESET_1),
+                (2049, ProtocolKind.HT, HT_ALL_REDUCE_GB300_TP4_H7168),
+            ),
+        },
+        8: {
+            "finalize": (
+                (12, ProtocolKind.LL, LL_FINALIZE_GB300_TP8_H7168_K16),
+                (13, ProtocolKind.BT, BT_FINALIZE_GB300_TP8_H7168_K16_PRESET_0),
+                (512, ProtocolKind.BT, BT_FINALIZE_GB300_TP8_H7168_K16_PRESET_0),
+                (513, ProtocolKind.BT, BT_FINALIZE_GB300_TP8_H7168_K16_PRESET_1),
+            ),
+            "all_reduce": (
+                (12, ProtocolKind.LL, LL_ALL_REDUCE_GB300_TP8_H7168),
+                (13, ProtocolKind.BT, BT_ALL_REDUCE_GB300_TP8_H7168_PRESET_0),
+                (256, ProtocolKind.BT, BT_ALL_REDUCE_GB300_TP8_H7168_PRESET_0),
+                (257, ProtocolKind.BT, BT_ALL_REDUCE_GB300_TP8_H7168_PRESET_1),
+            ),
+        },
+    }
+
+    for tp_size, routes in expected.items():
+        profile = DEFAULT_CONFIG.resolve(
+            tp_size=tp_size,
+            hidden_size=7168,
+            top_k=16,
+            dtype=torch.bfloat16,
+            capacity_m=8192,
+        )
+        for path, route in (
+            ("finalize", profile.finalize_routes),
+            ("all_reduce", profile.all_reduce_routes),
+        ):
+            for m, protocol, expected_preset in routes[path]:
+                target = route.select(m)
+                assert target.protocol is protocol
+                assert target.preset is expected_preset
+
+
+@pytest.mark.parametrize(
+    "config,expected_protocol,tp_sizes",
+    [
+        (LL_ONLY_CONFIG, ProtocolKind.LL, (4, 8)),
+        (BT_ONLY_CONFIG, ProtocolKind.BT, (4, 8)),
+        (HT_ONLY_CONFIG, ProtocolKind.HT, (4,)),
+    ],
+)
+def test_kimi_k3_only_configs_select_one_protocol(config, expected_protocol, tp_sizes):
+    for tp_size in tp_sizes:
+        profile = config.resolve(
+            tp_size=tp_size,
+            hidden_size=7168,
+            top_k=16,
+            dtype=torch.bfloat16,
+            capacity_m=8192,
+        )
+        for routes in (profile.finalize_routes, profile.all_reduce_routes):
+            assert all(
+                target.protocol is expected_protocol for target in routes.targets
+            )
 
 
 @pytest.mark.parametrize(

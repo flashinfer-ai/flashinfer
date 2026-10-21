@@ -14,47 +14,87 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Cake SM90 VSA (``backend="cake"`` on Hopper): planning, numerics, lifetime, API."""
+"""Cake SM90 VSA (``backend="cake"`` on Hopper): planning, numerics, lifetime, package contract.
+
+This suite exercises the backend package alone: it names the package once,
+through ``tests.test_helpers.cake_package``, and imports nothing else from
+flashinfer, so a build that vendors the package under another import path
+runs it unchanged after pointing that table entry at its package.  The
+``flashinfer.cake_vsa_sm90`` facade and the ``flashinfer.sparse`` wrapper
+route (``backend="cake"`` / ``"cake_cute"``) are covered by
+``test_cake_vsa_sm90_api.py``.
+"""
 
 
-import warnings
+import ast
+import contextlib
+import hashlib
+import inspect
+from pathlib import Path
 
 import pytest
 import torch
 
-from flashinfer.cake_vsa_sm90 import (
-    MAX_NSPLIT,
-    PLAN_HALFWORDS,
-    REFERENCE_CLUSTER_CAPACITY_H100_SXM,
-    CLUSTER_VARIANTS,
-    PLAN_META_SPLIT,
-    PLAN_META_UNSPLIT,
-    SMALL_KMAX_VARIANTS,
-    SMALL_OCCUPANCY,
-    CakeVsaSm90Plan,
-    cluster_cost,
-    cluster_capacity,
-    cluster_variant_for,
-    split_cost,
-    MAX_OWN,
-    META_NOWN,
-    META_NSEQ,
-    META_NTILES,
-    META_OWN_OFF,
-    META_SEQ_OFF,
-    META_WORDS,
-    OWN_WORDS,
-    POOL_MIN_TILES,
-    POOL_ROUNDS,
-    _schedule_feasible,
-    plan_small,
-    plan_vsa_sm90,
-    small_route,
-    split_kmax,
-)
+from tests.test_helpers.cake_package import cake_package
+
+pkg = cake_package("cake_vsa_sm90")
+cake_build = cake_package("cake_vsa_sm90", "cake_build")
+loader = cake_package("cake_vsa_sm90", "cake_jit")
+# The host planner: the tests below monkeypatch its thresholds (``POOL_MIN_TILES``,
+# ``POOL_SMALL_TILE_POS``) on this module object.
+planner = cake_package("cake_vsa_sm90", "cake_planner")
+
+MAX_NSPLIT = planner.MAX_NSPLIT
+PLAN_HALFWORDS = planner.PLAN_HALFWORDS
+CLUSTER_VARIANTS = planner.CLUSTER_VARIANTS
+PLAN_META_SPLIT = planner.PLAN_META_SPLIT
+PLAN_META_UNSPLIT = planner.PLAN_META_UNSPLIT
+SMALL_KMAX_VARIANTS = planner.SMALL_KMAX_VARIANTS
+SPLIT_KMAX_VARIANTS = planner.SPLIT_KMAX_VARIANTS
+SPLIT_CLUSTER_VARIANTS = planner.SPLIT_CLUSTER_VARIANTS
+SPLIT_CLUSTER_MIN_SAVING_KB = planner.SPLIT_CLUSTER_MIN_SAVING_KB
+SMALL_OCCUPANCY = planner.SMALL_OCCUPANCY
+SMALL_ITEM_ELEMS = planner.SMALL_ITEM_ELEMS
+SMALL_STATS_FLOATS = planner.SMALL_STATS_FLOATS
+cluster_cost = planner.cluster_cost
+cluster_capacity = planner.cluster_capacity
+cluster_variant_for = planner.cluster_variant_for
+split_cost = planner.split_cost
+MAX_OWN = planner.MAX_OWN
+META_NOWN = planner.META_NOWN
+META_NSEQ = planner.META_NSEQ
+META_NTILES = planner.META_NTILES
+META_OWN_OFF = planner.META_OWN_OFF
+META_SEQ_OFF = planner.META_SEQ_OFF
+META_WORDS = planner.META_WORDS
+OWN_WORDS = planner.OWN_WORDS
+POOL_MIN_TILES = planner.POOL_MIN_TILES
+POOL_RAGGED_LONG_HEAD_MIN_TILES = planner.POOL_RAGGED_LONG_HEAD_MIN_TILES
+POOL_RAGGED_LONG_HEAD_WINDOWS = planner.POOL_RAGGED_LONG_HEAD_WINDOWS
+POOL_RAGGED_MIN_TILES = planner.POOL_RAGGED_MIN_TILES
+POOL_ROUNDS = planner.POOL_ROUNDS
+POOL_SMALL_MIN_TILES = planner.POOL_SMALL_MIN_TILES
+POOL_SMALL_TILE_POS = planner.POOL_SMALL_TILE_POS
+_schedule_feasible = planner._schedule_feasible
+_split_ingest_kb = planner._split_ingest_kb
+plan_small = planner.plan_small
+plan_vsa_sm90 = planner.plan_vsa_sm90
+small_route = planner.small_route
+split_cluster_variant_for = planner.split_cluster_variant_for
+split_kmax = planner.split_kmax
+CakeVsaSm90Plan = pkg.CakeVsaSm90Plan
+create_plan = pkg.create_plan
+
+REFERENCE_CLUSTER_CAPACITY_H100_SXM: dict[int, int] = {
+    2: 66,
+    3: 39,
+    4: 30,
+    6: 17,
+    8: 15,
+}
 
 
-CAP = REFERENCE_CLUSTER_CAPACITY_H100_SXM  # measured co-resident cluster capacity of the 132-SM H100 SXM
+CAP = REFERENCE_CLUSTER_CAPACITY_H100_SXM
 
 
 def _random_mask(h, mb, nb, capacity, seed=0, ragged=True, device="cpu"):
@@ -76,11 +116,6 @@ def _descriptors(h=2, mb=3, nb=5, device="cpu"):
     rows = torch.full((h, mb), 64, dtype=torch.int32, device=device)
     cols = torch.full((h, nb), 64, dtype=torch.int32, device=device)
     return mask, rows, cols
-
-
-# ---------------------------------------------------------------------------
-# Host planner (CPU only)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -119,8 +154,8 @@ def _descriptors(h=2, mb=3, nb=5, device="cpu"):
             8,
             64,
             64,
-            None,
-        ),  # 16 tiles x 64 blocks: no one-wave variant fits the plan budget
+            "split2",
+        ),  # 16 tiles x 64 blocks: no one-wave variant; the under-filled grid takes KMAX 6 split in two waves
     ],
 )
 def test_small_route_rule(h, mb, nb, capacity, expected):
@@ -146,9 +181,25 @@ def test_small_route_rule(h, mb, nb, capacity, expected):
         assert cluster_cost(counts, kmax, csize) < split_cost(
             counts, split_kmax(counts, sms=132)
         )
+    elif expected == "split2":
+        # A persistent grid of at most SMs / SPLIT_UNDERFILL_SMS
+        # CTAs whose selection no one-wave split / cluster variant holds takes the split-KV
+        # variant in up to SPLIT_UNDERFILL_WAVES waves of items (fewest items first).
+        assert route is not None and route[1] is True and route[2] == 0
+        kmax = route[0]
+        assert (
+            kmax in SPLIT_KMAX_VARIANTS and h * mb * planner.SPLIT_UNDERFILL_SMS <= 132
+        )
+        items = h * mb * -(-capacity // kmax)
+        assert SMALL_OCCUPANCY[kmax] * 132 < items
+        assert items <= planner.SPLIT_UNDERFILL_WAVES * SMALL_OCCUPANCY[kmax] * 132
+        assert items * (kmax + PLAN_META_SPLIT) <= PLAN_HALFWORDS
+        assert kmax == split_kmax(counts, sms=132, waves=planner.SPLIT_UNDERFILL_WAVES)
+        with pytest.raises(ValueError):
+            split_kmax(counts, sms=132)
     else:
         assert route == expected
-    if expected not in (None, "split", "cluster"):
+    if expected not in (None, "split", "split2", "cluster"):
         assert h * mb <= SMALL_OCCUPANCY[expected[0]] * 132
         assert h * mb * (expected[0] + PLAN_META_UNSPLIT) <= PLAN_HALFWORDS
 
@@ -192,14 +243,24 @@ def test_cluster_one_wave_uses_the_device_capacity():
         cluster_variant_for([8] * 16, sms=132, cluster_capacity={2: 66})
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
+    reason="thread block clusters need a Hopper or newer GPU",
+)
 def test_cluster_capacity_resolves_from_the_driver():
     cap = cluster_capacity(torch.cuda.current_device())
     sms = torch.cuda.get_device_properties(0).multi_processor_count
-    assert set(cap) == {2, 3, 4, 6}
+    assert set(cap) == {
+        2,
+        3,
+        4,
+        6,
+        8,
+    }  # the DSM-cluster sizes and the split-cluster size 8
     for csize, clusters in cap.items():
         assert 1 <= clusters <= sms // csize
     assert cap[4] <= cap[2] // 2 + 1
+    assert cap[8] <= cap[4] // 2 + 1
 
 
 def test_plan_small_cluster_rows_pad_every_query_block():
@@ -220,7 +281,8 @@ def test_plan_small_cluster_rows_pad_every_query_block():
             assert sorted(b for r in slices for b in r["blocks"]) == selected
     with pytest.raises(ValueError, match="cannot hold"):
         plan_small(torch.ones((1, 16, 16), dtype=torch.bool), kmax=4, cluster=2)
-    with pytest.raises(ValueError, match="exclusive"):
+    # split + cluster names the split-cluster variants only
+    with pytest.raises(ValueError, match="not a compiled split-cluster variant"):
         plan_small(
             torch.ones((1, 16, 16), dtype=torch.bool), kmax=4, split=True, cluster=4
         )
@@ -228,8 +290,21 @@ def test_plan_small_cluster_rows_pad_every_query_block():
 
 def _decode_small_rows(plan):
     stride, meta_halfwords = plan["stride"], plan["meta_halfwords"]
-    assert stride == plan["kmax"] + meta_halfwords
-    rows = plan["plan"][: plan["num_items"] * stride].view(-1, stride).int()
+    slots = (
+        plan["kmax"] * plan["cluster"]
+        if plan["split"] and plan["cluster"]
+        else plan["kmax"]
+    )
+    assert stride == slots + meta_halfwords
+    rows = plan["plan"][
+        : (
+            plan["num_tiles"]
+            if plan["split"] and plan["cluster"]
+            else plan["num_items"]
+        )
+        * stride
+    ]
+    rows = rows.view(-1, stride).int()
     out = []
     for i in range(rows.shape[0]):
         meta = int(rows[i, 0])
@@ -278,7 +353,7 @@ def test_plan_small_layout_and_padding():
         plan_small(_random_mask(2, 128, 32, 6, ragged=False))
 
 
-@pytest.mark.parametrize("kmax", [1, 3, 4, 6])
+@pytest.mark.parametrize("kmax", [4, 6])
 def test_plan_small_split_slices_cover_each_selection_once(kmax):
     mask = _random_mask(1, 16, 64, 16, seed=5, ragged=True)
     plan = plan_small(mask, kmax=kmax, split=True)
@@ -303,7 +378,408 @@ def test_plan_small_split_slices_cover_each_selection_once(kmax):
     )
     assert plan["max_nsplit"] == max(r["nsplit"] for r in rows) <= MAX_NSPLIT
     with pytest.raises(ValueError, match="slices"):
-        plan_small(torch.ones((1, 1, 64), dtype=torch.bool), kmax=1, split=True)
+        plan_small(torch.ones((1, 1, 200), dtype=torch.bool), kmax=4, split=True)
+
+
+def test_plan_small_split_cluster_rows_are_one_row_per_query_block():
+    """A split-cluster plan carries one ``[count, blk...]`` row per query block with ``kmax * cluster`` id slots
+    (ascending ids, ``-1`` padded) and launches ``cluster`` items per query block; the kernel derives each slice
+    (its cluster rank) and the balanced slice bounds itself, so tiles with at most ``kmax`` blocks leave the
+    other ranks idle (``max_nsplit`` counts the real slices)."""
+    mask = _random_mask(2, 8, 64, 24, seed=23, ragged=True)
+    counts = mask.sum(-1).reshape(-1).tolist()
+    for kmax, csize in SPLIT_CLUSTER_VARIANTS:
+        if kmax * csize < 24:
+            continue
+        plan = plan_small(mask, kmax=kmax, split=True, cluster=csize)
+        assert plan["split"] and plan["cluster"] == csize and plan["kmax"] == kmax
+        assert plan["stride"] == kmax * csize + PLAN_META_UNSPLIT
+        assert plan["meta_halfwords"] == PLAN_META_UNSPLIT
+        assert plan["num_tiles"] == 16 and plan["num_items"] == 16 * csize
+        assert plan["max_nsplit"] == max(-(-c // kmax) for c in counts) <= csize
+        rows = _decode_small_rows(plan)
+        assert len(rows) == 16
+        for tile, row in enumerate(rows):
+            selected = mask.reshape(16, 64)[tile].nonzero().flatten().tolist()
+            assert row["count"] == len(selected) == counts[tile]
+            assert row["blocks"] == selected  # ascending, no padding slot used
+            raw = plan["plan"][
+                tile * plan["stride"] : (tile + 1) * plan["stride"]
+            ].tolist()
+            assert all(v == -1 for v in raw[1 + len(selected) :])
+        assert bool((plan["plan"][16 * plan["stride"] :] == -1).all())
+    # the smallest variant that holds the selection is chosen when kmax is not given
+    inferred = plan_small(mask, split=True, cluster=4)
+    assert (inferred["kmax"], inferred["cluster"]) == (6, 4)
+    with pytest.raises(ValueError, match="cannot hold"):
+        plan_small(mask, kmax=6, split=True, cluster=3)
+    with pytest.raises(ValueError, match="no split-cluster-3 variant holds"):
+        plan_small(mask, split=True, cluster=3)
+    with pytest.raises(ValueError, match="exceed"):
+        plan_small(
+            _random_mask(2, 32, 64, 48, ragged=False), kmax=6, split=True, cluster=8
+        )
+
+
+def _uniform_mask(h, mb, nb, k, seed=42):
+    """``k`` selected KV blocks per query block, the same count on every row (a ``-ragged0`` benchmark row)."""
+    return _topk_mask(h, mb, nb, k, seed=seed)
+
+
+def test_small_route_rule_split_cluster_ingest():
+    """A split-KV route is upgraded to its split-cluster variant only when one holds the selection, fits the plan,
+    places in one wave of clusters and saves at least SPLIT_CLUSTER_MIN_SAVING_KB of per-CTA L2 ingest (the
+    longest slice's K/V bytes plus the merging CTA's partial reads): the 16-tile 24-block rows save 64 KB with
+    four slices of six (k6sc4), the 8-tile 48-block row 160 KB with eight (k6sc8), and the 32-tile 16-block row
+    would read 16 KB more as k6sc3 (one block more per slice), so it stays on k4s."""
+    k24 = _uniform_mask(1, 16, 64, 24)  # h1-m1024-n4096-k24
+    assert small_route(k24, sms=132, cluster_capacity=CAP) == (6, True, 4)
+    assert split_kmax([24] * 16, sms=132) == 4
+    assert (
+        _split_ingest_kb([24] * 16, 4, None) == 288
+        and _split_ingest_kb([24] * 16, 6, 4) == 224
+    )
+    assert small_route(_uniform_mask(4, 4, 128, 24), sms=132, cluster_capacity=CAP) == (
+        6,
+        True,
+        4,
+    )
+    k48 = _uniform_mask(1, 8, 128, 48)  # h1-m512-n8192-k48
+    assert small_route(k48, sms=132, cluster_capacity=CAP) == (6, True, 8)
+    assert split_kmax([48] * 8, sms=132) == 6
+    assert (
+        _split_ingest_kb([48] * 8, 6, None) == 416
+        and _split_ingest_kb([48] * 8, 6, 8) == 256
+    )
+    k16 = _uniform_mask(
+        8, 4, 64, 16
+    )  # h8-m256-n4096-k16: k6sc3 would cost 240 KB against 224 KB on k4s
+    assert small_route(k16, sms=132, cluster_capacity=CAP) == (4, True, 0)
+    assert (
+        _split_ingest_kb([16] * 32, 4, None) == 224
+        and _split_ingest_kb([16] * 32, 6, 3) == 240
+    )
+    assert (
+        split_cluster_variant_for([16] * 32, split_kmax=4, cluster_capacity=CAP) is None
+    )
+    # the rule's three refusals: capacity, one wave of clusters, the saving threshold
+    assert split_cluster_variant_for([24] * 16, split_kmax=4, cluster_capacity=CAP) == (
+        6,
+        4,
+    )
+    assert (
+        split_cluster_variant_for([24] * 31, split_kmax=4, cluster_capacity=CAP) is None
+    )  # 31 > 30 clusters
+    assert (
+        split_cluster_variant_for(
+            [24] * 16, split_kmax=4, cluster_capacity={2: 66, 3: 39, 6: 17}
+        )
+        is None
+    )
+    assert (
+        split_cluster_variant_for([48] * 16, split_kmax=6, cluster_capacity=CAP) is None
+    )  # 16 > 15 clusters
+    assert split_cluster_variant_for([48] * 8, split_kmax=6, cluster_capacity=CAP) == (
+        6,
+        8,
+    )
+    assert (
+        split_cluster_variant_for([49] * 8, split_kmax=6, cluster_capacity=CAP) is None
+    )  # no variant holds 49
+    assert SPLIT_CLUSTER_MIN_SAVING_KB == 48 and planner.SPLIT_CLUSTER_ROUTE is True
+    # with the route disabled the split-KV variant is kept
+    try:
+        planner.SPLIT_CLUSTER_ROUTE = False
+        assert small_route(k24, sms=132, cluster_capacity=CAP) == (4, True, 0)
+        assert small_route(k48, sms=132, cluster_capacity=CAP) == (6, True, 0)
+    finally:
+        planner.SPLIT_CLUSTER_ROUTE = True
+    # the DSM-cluster route still wins where it applies and the unsplit rule comes first
+    assert small_route(_uniform_mask(1, 16, 16, 16), sms=132, cluster_capacity=CAP) == (
+        4,
+        False,
+        4,
+    )
+    assert small_route(_uniform_mask(8, 16, 16, 4), sms=132, cluster_capacity=CAP) == (
+        4,
+        False,
+        0,
+    )
+
+
+def test_small_route_rule_underfilled_persistent_grid():
+    """h8-m128-n32768-k64 (16 query blocks of 64 KV blocks) would run 16
+    persistent CTAs on 132 SMs and no one-wave split or cluster variant holds 64 blocks, so the route
+    takes the KMAX 6 split-KV variant in two waves (176 items; the fewest items of the fitting variants):
+    35.2 us -> 29.2 us measured on H100.  h8-m256-n16384-k32 (32 query blocks of 32 blocks) stays on the
+    persistent kernel: 32 * SPLIT_UNDERFILL_SMS > 132 (both split variants measured slower there)."""
+    k64 = _uniform_mask(8, 2, 512, 64)  # h8-m128-n32768-k64
+    assert small_route(k64, sms=132, cluster_capacity=CAP) == (6, True, 0)
+    assert split_kmax([64] * 16, sms=132, waves=2) == 6
+    assert (
+        16 * -(-64 // 6) == 176 > SMALL_OCCUPANCY[6] * 132
+    )  # two waves of one CTA per SM
+    with pytest.raises(ValueError):
+        split_kmax([64] * 16, sms=132)
+    k32 = _uniform_mask(8, 4, 256, 32)  # h8-m256-n16384-k32: 32 tiles, 32 * 8 > 132
+    assert small_route(k32, sms=132, cluster_capacity=CAP) is None
+    assert planner.SPLIT_UNDERFILL_SMS == 8 and planner.SPLIT_UNDERFILL_WAVES == 2
+    try:
+        planner.SPLIT_UNDERFILL_SMS = 0  # disabled: the persistent kernel as before
+        assert small_route(k64, sms=132, cluster_capacity=CAP) is None
+    finally:
+        planner.SPLIT_UNDERFILL_SMS = 8
+
+
+def test_split_variants_are_the_shipped_ones():
+    """Only the KMAX 4 and 6 split-KV kernels ship: ``split_kmax`` never names
+    another variant and ``plan_small`` refuses to plan one.  The retired KMAX 1
+    split was the planner's choice only on a band of ragged masks whose grid
+    sits at the sliced-route edge (``2 * tiles`` within two of the SM count)
+    with one outlier selection; those masks now run the persistent kernel."""
+    for counts in ([2], [3] * 8, [7] * 65 + [13], [7] * 64 + [25], [9] * 40):
+        assert split_kmax(counts) in (4, 6)
+        # no shipped variant fits one wave: small_route falls through
+        with contextlib.suppress(ValueError):
+            assert split_kmax(counts, sms=132) in (4, 6)
+    for kmax in (1, 3):
+        with pytest.raises(ValueError, match="split-KV variant"):
+            plan_small(_random_mask(1, 4, 8, 6, seed=3), kmax=kmax, split=True)
+    # 66 tiles, 65 x 7 blocks + one 13-block selection: KMAX 3/4/6 exceed one wave
+    # of 132 SMs, no cluster variant holds 66 tiles -> persistent kernel.
+    mask = torch.zeros((6, 11, 16), dtype=torch.bool)
+    mask[:, :, :7] = True
+    mask[5, 10, :13] = True
+    assert small_route(mask, sms=132, cluster_capacity=CAP) is None
+
+
+def test_stage_table_builds_every_stage_from_the_shared_launcher():
+    """Every shipped stage is one ``MODULES`` record naming one ``build.json`` library whose two
+    sources are the stage's own kernel and binding units with verified digests; the unshipped
+    split variants (``small_k1s``, ``small_k3s``) are refused by name."""
+    manifest = cake_build.manifest()
+    assert manifest["schema"] == "cake-build/1"
+    assert manifest["package"] == pkg.__name__ == "flashinfer.cake_vsa_sm90_backend"
+    libraries = cake_build.libraries_by_name()
+    package = Path(cake_build.__file__).parent
+    assert len(loader.STAGES) == 17 and set(loader.STAGES) == set(loader.MODULES)
+    referenced = set()
+    for stage in loader.STAGES:
+        record = loader.stage_record(stage)
+        assert record["library"] == record["kernel"], stage
+        assert record["kernel_symbol"] == f"kernel_{record['library']}", stage
+        assert record["arches"] == ["sm_90a"] and record["ffi_entry"] == "run", stage
+        assert not {"sources", "source_sha256", "compile_flags", "cache_names"} & set(
+            record
+        ), stage
+        for arch in record["arches"]:
+            library = loader.library_name(stage, arch)
+            referenced.add(library)
+            entry = libraries[library]
+            assert entry["arch"] == arch and entry["entry"] == "run"
+            assert entry["sources"] == [
+                f"csrc/{record['library']}_kernel.cu",
+                f"csrc/{record['library']}_binding.cu",
+            ]
+            for source in entry["sources"]:
+                data = (package / source).read_bytes()
+                assert hashlib.sha256(data).hexdigest() == entry["sha256"][source], (
+                    source
+                )
+                assert data.startswith(
+                    b"/*\n * Copyright (c) 2026 by FlashInfer team."
+                ), source
+            binding = (package / entry["sources"][1]).read_text()
+            assert record["kernel_symbol"] in binding
+            assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run," in binding
+    assert referenced == set(libraries)
+    for name in ("small_k1s", "small_k3s", "small_k2", "attention_pdl"):
+        with pytest.raises(ValueError, match="unknown Cake SM90 VSA stage"):
+            loader.stage_record(name)
+    with pytest.raises(ValueError, match="unknown Cake SM90 VSA stage"):
+        loader.small_stage(1, split=True)
+    with pytest.raises(RuntimeError, match="not delivered for"):
+        loader.library_name("attention", "sm_100a")
+
+
+def test_stage_table_geometry_matches_the_stage_names():
+    """A record's route, launch record, grid rule, workspace rule and argument plan say what its
+    stage name says: persistent stages launch 384 threads with the by-value ``hdr`` and the device
+    ``meta`` table; small stages launch one CTA per plan item (128 threads for ``kmax`` 1, else 256),
+    a cluster of the name's size, and only the split and split-cluster variants carry the FP32
+    workspace buffers."""
+    for stage in loader.STAGES:
+        record = loader.stage_record(stage)
+        launch, route = record["launch"], record["route"]
+        plan = [tuple(pair) for pair in record["arg_plan"]]
+        buffers = [name for kind, name in plan if kind == "buffer"]
+        assert plan[-3:] == [("grid", "grid_x"), ("grid", "grid_y"), ("grid", "grid_z")]
+        assert set(record["logical"]) == {name for kind, name in plan if kind != "grid"}
+        assert route == loader.route_of(stage)
+        if stage.startswith("attention"):
+            assert route == {"kind": "persistent", "queue": stage == "attention_queue"}
+            assert stage == loader.persistent_stage(route["queue"])
+            assert (tuple(launch["block"]), tuple(launch["cluster"])) == (
+                (384, 1, 1),
+                (1, 1, 1),
+            )
+            assert record["grid_rule"] == {"count": "num_ctas", "kind": "plan_count"}
+            assert record["workspace_rule"] == {
+                "dbg_words": 64,
+                "kind": "persistent",
+                "tl_words": 8,
+            }
+            assert ("param_array", "hdr") in plan and buffers == [
+                "Q",
+                "K",
+                "Vt",
+                "O",
+                "meta",
+                "dbg",
+                "tl",
+            ]
+        else:
+            assert route["kind"] == "small"
+            assert stage == loader.small_stage(
+                route["kmax"], route["split"], route["cluster"]
+            )
+            assert tuple(launch["cluster"]) == (route["cluster"] or 1, 1, 1)
+            assert tuple(launch["block"]) == (128 if route["kmax"] == 1 else 256, 1, 1)
+            assert record["grid_rule"] == {"count": "num_items", "kind": "plan_count"}
+            assert ("param_array", "plan") in plan
+            if route["split"]:
+                if route["cluster"]:
+                    assert (route["kmax"], route["cluster"]) in SPLIT_CLUSTER_VARIANTS
+                    assert stage == f"small_k{route['kmax']}sc{route['cluster']}"
+                else:
+                    assert route["kmax"] in SPLIT_KMAX_VARIANTS
+                assert record["workspace_rule"] == {
+                    "counter_words": "num_tiles",
+                    "item_floats": SMALL_ITEM_ELEMS,
+                    "kind": "split",
+                    "stats_floats": SMALL_STATS_FLOATS,
+                }
+                assert buffers == ["Q", "K", "Vt", "O", "Wo", "Ws", "Wc"]
+            else:
+                assert record["workspace_rule"] is None and buffers == [
+                    "Q",
+                    "K",
+                    "Vt",
+                    "O",
+                ]
+                if route["cluster"]:
+                    assert (route["kmax"], route["cluster"]) in CLUSTER_VARIANTS
+                else:
+                    assert route["kmax"] in SMALL_KMAX_VARIANTS
+        assert launch["cooperative"] is False and launch["use_pdl"] is False
+        assert 0 < launch["dynamic_smem_bytes"] <= 232448
+        assert loader.launch_grid(stage, {"num_ctas": 7, "num_items": 9}) == (
+            (7, 1, 1) if route["kind"] == "persistent" else (9, 1, 1)
+        )
+    assert set(loader.PERSISTENT_STAGES) == {"attention", "attention_queue"}
+    assert set(loader.SMALL_STAGES) == (
+        {loader.small_stage(k) for k in SMALL_KMAX_VARIANTS}
+        | {loader.small_stage(k, split=True) for k in SPLIT_KMAX_VARIANTS}
+        | {loader.small_stage(k, cluster=c) for k, c in CLUSTER_VARIANTS}
+        | {
+            loader.small_stage(k, split=True, cluster=c)
+            for k, c in SPLIT_CLUSTER_VARIANTS
+        }
+    )
+    assert [loader.small_stage(k, True, c) for k, c in SPLIT_CLUSTER_VARIANTS] == [
+        "small_k6sc3",
+        "small_k6sc4",
+        "small_k6sc8",
+    ]
+    for stage in ("small_k6sc3", "small_k6sc4", "small_k6sc8"):
+        launch = loader.stage_record(stage)["launch"]
+        # no receive buffers: the split-cluster kernels compute the split kernel's shared memory
+        assert (
+            launch["dynamic_smem_bytes"]
+            == loader.stage_record("small_k6s")["launch"]["dynamic_smem_bytes"]
+        )
+        assert tuple(launch["cluster"]) == (int(stage.rsplit("c", 1)[1]), 1, 1)
+    with pytest.raises(ValueError, match="no num_items to launch"):
+        loader.launch_grid("small_k1", {"num_ctas": 1, "num_items": 0})
+
+
+def test_build_manifest_pins_the_numerics_flags():
+    """The flag contract: every entry compiles with ``--use_fast_math`` (the flag the kernels were
+    validated and measured with) and nothing else; no ``--fmad`` flag is recorded (nvcc's default
+    contraction applies), the common flags carry no numerics flag, and the loader lets the manifest
+    rather than itself state fast math (``use_fast_math=False``)."""
+    manifest = cake_build.manifest()
+    assert manifest["arch_flags"] == {
+        "sm_90a": ["-gencode=arch=compute_90a,code=sm_90a"]
+    }
+    assert manifest["common"]["requires"]["cuda_toolkit"]["min"] == "12.8"
+    numerics = (
+        "--fmad",
+        "--use_fast_math",
+        "-use_fast_math",
+        "--ftz",
+        "--prec-div",
+        "--prec-sqrt",
+    )
+    assert not any(
+        flag.startswith(numerics) for flag in manifest["common"]["nvcc_flags"]
+    )
+    assert len(manifest["libraries"]) == 17
+    for entry in manifest["libraries"]:
+        assert entry["nvcc_flags"] == ["--use_fast_math"], entry["name"]
+        assert entry["nvcc_flags_if"] == [], entry["name"]
+        assert entry["min_cuda"] == "12.8", entry["name"]
+    assert "use_fast_math=False" in inspect.getsource(cake_build.jit_spec)
+
+
+def test_package_imports_only_its_allowlist():
+    """The package imports itself, ``torch``, ``tvm_ffi`` and ``cuda.bindings`` (the cluster-capacity
+    probe) beside the standard library; the pinned loader reaches ``flashinfer.jit`` lazily on its JIT
+    path only; nothing reads the environment."""
+    package = Path(pkg.__file__).parent
+    allowed = {
+        "__future__",
+        "functools",
+        "hashlib",
+        "heapq",
+        "json",
+        "math",
+        "pathlib",
+        "re",
+        "typing",
+    }
+    allowed |= {"torch", "tvm_ffi", "cuda"}
+    for path in sorted(package.glob("*.py")):
+        source = path.read_text()
+        assert "os.environ" not in source and "import os" not in source, path.name
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and not node.level:
+                names = [node.module]
+            else:
+                continue
+            for name in names:
+                root = name.split(".")[0]
+                if path.name == "cake_build.py" and root == "flashinfer":
+                    continue  # the pinned loader's lazy JIT path
+                assert root in allowed, (path.name, name)
+    # The planner's probe reaches the driver through cuda.bindings only (no flashinfer.cuda_utils).
+    assert "cuda_utils" not in Path(planner.__file__).read_text()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _warm_jit():
+    """Build every ``sm_90a`` library once (FlashInfer's parallel ``build_jit_specs``) so that the
+    first plan of each stage does not pay a serial JIT compile."""
+    if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
+        arch = loader.arch_for_capability(torch.cuda.get_device_capability())
+        specs = loader.specs_for_arch(arch)
+        if specs:
+            from flashinfer.jit import build_jit_specs
+
+            build_jit_specs(specs, verbose=False)
+    yield
 
 
 def _tile_rows(plan):
@@ -476,51 +952,202 @@ def test_plan_ragged_tile_order_stays_head_major_above_l2_budget():
         assert heads == sorted(heads)
 
 
+def test_plan_static_uniform_tiles_in_lpt_order(monkeypatch):
+    """A static uniform plan lists its tiles costliest first - over all
+    heads when the plan has one round (no more tiles than CTAs: the CTAs launch in index order, so
+    the longest tiles start first), within each head otherwise (head-major kept: the concurrently
+    streaming CTAs share one head's K/V in L2).  The tile set is unchanged, only the CTA that runs a
+    tile moves, so the output bits are those of the legacy order.  Pair tiles of 16-block selections
+    have equal modelled cost and a load of 16..32 positions, so the order follows the positions."""
+    mask = _topk_mask(2, 64, 64, 16)  # 2 heads x 32 pair tiles: one round on 132 CTAs
+    plan = plan_vsa_sm90(mask, mode="pair", sms=132)
+    assert not plan["queue"] and plan["num_tiles"] == 64 == plan["num_ctas"]
+    tiles = _static_tiles(plan)
+    positions = [t[0][1] for t in tiles]
+    assert positions == sorted(positions, reverse=True) and positions[0] > positions[-1]
+    monkeypatch.setattr(planner, "UNIFORM_LPT", False)
+    legacy = _static_tiles(plan_vsa_sm90(mask, mode="pair", sms=132))
+    assert sorted(t[0] for t in legacy) == sorted(t[0] for t in tiles)
+    assert [t[0][0] for t in legacy] == sorted(
+        t[0][0] for t in legacy
+    )  # head-major, as planned
+    assert legacy != tiles
+    monkeypatch.setattr(planner, "UNIFORM_LPT", True)
+    # several rounds: 2 heads x 128 pair tiles on 132 CTAs keep the head-major order per CTA
+    multi = plan_vsa_sm90(_topk_mask(2, 256, 64, 16), mode="pair", sms=132)
+    assert not multi["queue"] and multi["num_tiles"] == 256
+    for cta in _static_tiles(multi):
+        heads = [h for h, _ in cta]
+        assert heads == sorted(heads)
+
+
 def test_plan_queue_layout_for_long_uniform_plans(monkeypatch):
-    """A uniform plan with >= POOL_MIN_TILES tiles per CTA takes the queue kernel:
-    every CTA's list minus its last POOL_ROUNDS tiles stays static (list-schedule
-    order), the removed tiles form the pool in round order, one all-zero sentinel
-    row per CTA follows; below the threshold the layout is the static one."""
-    import flashinfer.cake_vsa_sm90 as module
+    """A uniform plan with >= POOL_MIN_TILES tiles per CTA takes the queue kernel: every
+    CTA keeps its first (header) tile as its one static row (``tile_stride`` 1), every
+    other tile goes to the pool in ascending tile order (head-major, query-block order
+    within a head: the planner's tile order of a uniform plan), one all-zero sentinel row
+    per CTA follows; below the threshold the layout is the static one."""
+    module = planner
 
     mask = _topk_mask(7, 512, 512, 64)  # 1792 pair tiles = 14 x 128
     plan = plan_vsa_sm90(mask, mode="pair", sms=132)
     lists = plan["tile_lists"]
     g, stride = plan["num_ctas"], plan["tile_stride"]
-    assert plan["queue"] and g == 128 and stride == 14 - POOL_ROUNDS
-    assert len(plan["pool"]) == g * POOL_ROUNDS
+    assert (
+        POOL_ROUNDS >= 14
+    )  # the kernel's loop bound admits the whole list of every CTA here
+    assert plan["queue"] and g == 128 and stride == 1
+    assert len(plan["pool"]) == 1792 - g
     assert plan["num_rows"] == g * stride + len(plan["pool"]) + g
     meta = plan["meta"]
-    assert all(int(meta[c * stride, META_NTILES]) == stride for c in range(g))
-    for c, lst in enumerate(lists):
-        for i, t in enumerate(lst[:stride]):
-            assert int(meta[c * stride + i, 0]) == t // 256  # natural (head) order
-    pool_heads = [int(meta[g * stride + j, 0]) for j in range(len(plan["pool"]))]
-    assert pool_heads == [
-        lists[c][i] // 256 for i in range(stride, 14) for c in range(g)
+    assert all(int(meta[c * stride, META_NTILES]) == 1 for c in range(g))
+    firsts = [lst[0] for lst in lists]
+    for c, t in enumerate(firsts):
+        assert int(meta[c * stride, 0]) == t // 256  # 256 pair tiles per head
+    expected_pool = sorted(t for lst in lists for t in lst[1:])
+    assert plan["pool"] == expected_pool and sorted(firsts + expected_pool) == list(
+        range(1792)
+    )
+    pool_rows = [
+        tuple(int(v) for v in meta[g * stride + j, :2])
+        for j in range(len(plan["pool"]))
     ]
+    assert [head for head, _ in pool_rows] == [
+        t // 256 for t in expected_pool
+    ]  # head-major
+    for head in range(
+        7
+    ):  # query-block order within a head: a pair's first block only increases
+        qb0 = [qb for h, qb in pool_rows if h == head]
+        assert qb0 == sorted(qb0) and len(set(qb0)) == len(qb0)
+    assert all(
+        int(meta[g * stride + j, META_NTILES]) == 1 for j in range(len(plan["pool"]))
+    )
+    assert not meta[g * stride + len(plan["pool"]) :].any()
     assert sum(len(t) for t in _cta_tiles(plan)) == 1792
     monkeypatch.setattr(module, "POOL_MIN_TILES", 15)
+    # the static layout below the threshold; UNIFORM_LPT off so the per-CTA lists keep the
+    # legacy (head-major, query-block) order the queue plan above was built on
+    monkeypatch.setattr(module, "UNIFORM_LPT", False)
     static = plan_vsa_sm90(mask, mode="pair", sms=132)
-    assert not static["queue"] and static["tile_stride"] == 14
+    assert not static["queue"] and static["tile_stride"] == 14 and static["pool"] == []
     assert static["num_rows"] == 128 * 14 and static["tile_lists"] == lists
+    monkeypatch.setattr(module, "UNIFORM_LPT", True)
+    # with the LPT order the same tiles are listed, costliest first within each head
+    ordered = plan_vsa_sm90(mask, mode="pair", sms=132)
+    assert not ordered["queue"] and ordered["tile_stride"] == 14
+    assert sorted(t for lst in ordered["tile_lists"] for t in lst) == list(range(1792))
     assert all(int(static["meta"][c * 14, META_NTILES]) == 14 for c in range(128))
+    # the kernel's loop bound: a plan longer than POOL_ROUNDS + 1 tiles per CTA keeps the surplus static
+    monkeypatch.setattr(module, "POOL_MIN_TILES", 12)
+    monkeypatch.setattr(module, "POOL_ROUNDS", 10)
+    capped = plan_vsa_sm90(mask, mode="pair", sms=132)
+    assert (
+        capped["queue"]
+        and capped["tile_stride"] == 4
+        and len(capped["pool"]) == 128 * 10
+    )
+    assert all(int(capped["meta"][c * 4, META_NTILES]) == 4 for c in range(128))
 
 
 def test_plan_queue_threshold_and_tiny_tile_exception(monkeypatch):
-    """8 tiles per CTA of 16 positions keep the static kernel (measured 1 % slower on the
-    CuTe route with the queue); the tiny-tile exception is off by default."""
-    import flashinfer.cake_vsa_sm90 as module
+    """Uniform plans take the queue from POOL_MIN_TILES tiles per CTA, or from
+    POOL_SMALL_MIN_TILES tiles when no tile exceeds POOL_SMALL_TILE_POS ring positions
+    (the tiny-tile exception: measured +4.2 % / +4.3 % on h8-m8192-k2, whose split tiles
+    hold one position; six-position pair tiles at 7..8 per CTA (h16-m8192-k5) measured
+    -1.0 % against the static kernel, so the exception stops at one position);
+    8 tiles per CTA of 8 positions keep the static kernel."""
+    module = planner
 
-    big = _topk_mask(16, 64, 256, 16)  # split, 1024 tiles = 8 x 128
+    assert (POOL_MIN_TILES, POOL_SMALL_MIN_TILES, POOL_SMALL_TILE_POS) == (12, 7, 1)
+    big = _topk_mask(16, 64, 256, 16)  # split, 1024 tiles = 8 x 128 of 8 positions
     plan = plan_vsa_sm90(big, sms=132)
     assert plan["num_ctas"] == 128 and min(map(len, plan["tile_lists"])) == 8
-    assert not plan["queue"]
-    tiny = _topk_mask(8, 128, 128, 2)  # split, 1024 tiles of <= 2 positions
+    assert max(p for t in _cta_tiles(plan) for _, p in t) == 8 and not plan["queue"]
+    tiny = _topk_mask(8, 128, 128, 2)  # 1024 tiles of <= 2 positions, 8 per CTA
+    tiny_plan = plan_vsa_sm90(tiny, sms=132)
+    assert min(map(len, tiny_plan["tile_lists"])) == 8
+    tiny_pos = max(p for t in _cta_tiles(tiny_plan) for _, p in t)
+    assert tiny_pos <= 2 and tiny_plan["queue"] == (tiny_pos <= POOL_SMALL_TILE_POS)
+    # the boundary of the exception: one-position tiles join, two-position tiles do not
+    # (split tiles hold half of the query block's KV blocks per warpgroup: 1..2 blocks -> one
+    # ring position, 3..4 blocks -> two)
+    one = plan_vsa_sm90(_topk_mask(8, 128, 256, 2), mode="split", sms=132)
+    two = plan_vsa_sm90(_topk_mask(8, 128, 256, 4), mode="split", sms=132)
+    assert min(map(len, one["tile_lists"])) == min(map(len, two["tile_lists"])) == 8
+    assert max(p for t in _cta_tiles(one) for _, p in t) == 1 and one["queue"]
+    assert max(p for t in _cta_tiles(two) for _, p in t) == 2 and not two["queue"]
+    # six-position tiles at 8 per CTA stay static since the exception narrowed
+    six = plan_vsa_sm90(_topk_mask(8, 128, 256, 12), mode="split", sms=132)
+    assert min(map(len, six["tile_lists"])) == 8
+    assert max(p for t in _cta_tiles(six) for _, p in t) == 6 and not six["queue"]
+    # fewer than POOL_SMALL_MIN_TILES tiny tiles per CTA stay static
+    few = plan_vsa_sm90(_topk_mask(6, 128, 256, 1), mode="split", sms=132)
+    assert min(map(len, few["tile_lists"])) == 6 and not few["queue"]
+    monkeypatch.setattr(module, "POOL_SMALL_TILE_POS", 0)  # disables the exception
     assert not plan_vsa_sm90(tiny, sms=132)["queue"]
-    monkeypatch.setattr(module, "POOL_SMALL_TILE_POS", 4)
-    assert plan_vsa_sm90(tiny, sms=132)["queue"]
+    monkeypatch.setattr(module, "POOL_SMALL_TILE_POS", 8)
+    assert plan_vsa_sm90(big, sms=132)["queue"]
+    monkeypatch.setattr(module, "POOL_SMALL_MIN_TILES", 9)
     assert not plan_vsa_sm90(big, sms=132)["queue"]
+
+
+def test_plan_ragged_queue_threshold_and_pool_order():
+    """Ragged plans join the queue from POOL_RAGGED_MIN_TILES tiles per CTA (measured +0.7..+1.7 %
+    at >= 29 tiles per CTA, -1.3..-3.3 % at 12..25); their pool keeps the planner's tile order
+    above the L2 budget: head-major, cost-descending within a head."""
+    assert POOL_RAGGED_MIN_TILES == 28
+    long = _random_mask(
+        8, 1024, 128, 16, seed=5, ragged=True
+    )  # 8192 tiles; K+V = 33.5 MB > budget
+    plan = plan_vsa_sm90(long, mode="split", sms=132)
+    g, stride, lists = plan["num_ctas"], plan["tile_stride"], plan["tile_lists"]
+    assert (
+        min(map(len, lists)) >= POOL_RAGGED_MIN_TILES and plan["queue"] and stride == 1
+    )
+    assert plan["pool"] == sorted(t for lst in lists for t in lst[1:])
+    meta = plan["meta"]
+    assert all(int(meta[c, META_NTILES]) == 1 for c in range(g))
+    pool_rows = [meta[g * stride + j] for j in range(len(plan["pool"]))]
+    heads = [int(r[0]) for r in pool_rows]
+    assert heads == sorted(heads)
+    for head in range(8):
+        costs = [-(-int(r[META_NSEQ]) // 2) for r in pool_rows if int(r[0]) == head]
+        assert costs == sorted(costs, reverse=True), head
+    assert not meta[g * stride + len(plan["pool"]) :].any()
+    assert sum(len(t) for t in _cta_tiles(plan)) == 8192
+    # Long-head rule: ragged plans with >= POOL_RAGGED_LONG_HEAD_MIN_TILES tiles per CTA whose
+    # heads hold POOL_RAGGED_LONG_HEAD_WINDOWS grids' worth of tiles join the queue below the
+    # 28-tile threshold (h3-m109632-k64 ragged: +1.4..1.5 %); the same tiles spread over many
+    # short heads (h12-m32768: -2.8 %) and plans below the per-CTA floor stay static.
+    assert (POOL_RAGGED_LONG_HEAD_MIN_TILES, POOL_RAGGED_LONG_HEAD_WINDOWS) == (18, 4)
+    long_heads = _random_mask(
+        3, 1024, 128, 16, seed=5, ragged=True
+    )  # 3072 tiles: 18..28 per CTA, 1024 per head >= 4 x 132
+    joined = plan_vsa_sm90(long_heads, mode="split", sms=132)
+    assert (
+        POOL_RAGGED_LONG_HEAD_MIN_TILES
+        <= min(map(len, joined["tile_lists"]))
+        < POOL_RAGGED_MIN_TILES
+    )
+    assert joined["queue"] and joined["tile_stride"] == 1
+    many_heads = _random_mask(
+        12, 256, 128, 16, seed=5, ragged=True
+    )  # 3072 tiles over 12 heads: 256 per head < 4 x 132
+    static = plan_vsa_sm90(many_heads, mode="split", sms=132)
+    assert min(map(len, static["tile_lists"])) < POOL_RAGGED_MIN_TILES
+    assert (
+        not static["queue"]
+        and static["pool"] == []
+        and static["num_rows"] == static["num_ctas"] * static["tile_stride"]
+    )
+    few = plan_vsa_sm90(
+        _random_mask(3, 512, 128, 16, seed=5, ragged=True), mode="split", sms=132
+    )
+    assert (
+        min(map(len, few["tile_lists"])) < POOL_RAGGED_LONG_HEAD_MIN_TILES
+        and not few["queue"]
+    )
 
 
 def test_plan_mode_selection_prefers_split_below_full_occupancy():
@@ -530,36 +1157,10 @@ def test_plan_mode_selection_prefers_split_below_full_occupancy():
     assert plan_vsa_sm90(dense, sms=132)["mode"] == "pair"
 
 
-# ---------------------------------------------------------------------------
-# GPU coverage (Hopper only)
-# ---------------------------------------------------------------------------
-
 requires_hopper = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
     reason="Requires an SM90 GPU",
 )
-
-
-def _wrapper(mask, backend="cake", scale=None):
-    from flashinfer.sparse import VariableBlockSparseAttentionWrapper
-
-    h, mb, nb = mask.shape
-    workspace_size = 0 if backend == "cake" else 128 * 1024 * 1024
-    wrapper = VariableBlockSparseAttentionWrapper(
-        torch.empty(workspace_size, device="cuda", dtype=torch.uint8), backend=backend
-    )
-    wrapper.plan(
-        mask,
-        torch.full((h, mb), 64, dtype=torch.int32, device=mask.device),
-        torch.full((h, nb), 64, dtype=torch.int32, device=mask.device),
-        h,
-        h,
-        128,
-        q_data_type=torch.bfloat16,
-        sm_scale=scale,
-        non_blocking=False,
-    )
-    return wrapper
 
 
 def _inputs(h, mb, nb, seed=7):
@@ -629,7 +1230,7 @@ def test_small_and_persistent_routes_agree(h, mb, nb, capacity, scale):
         (1, 16, 16, 16, None, False),  # the benchmark's h1-m1024-k16 row
         (1, 16, 64, 16, 0.5, True),
         (2, 8, 64, 64, None, True),  # 64 blocks -> up to 11 slices at KMAX 6
-        (1, 1, 2, 2, 1e-7, False),  # two slices of one block
+        (1, 1, 8, 6, 1e-7, False),  # one query block, two slices of KMAX 4
         (3, 5, 10, 9, 0.0, True),
         (3, 5, 10, 9, -0.125, True),
     ],
@@ -677,7 +1278,7 @@ def _mode_of(rule):
     if rule is None:
         return "persistent"
     if rule[2]:
-        return "smallcluster"
+        return "smallsplitcluster" if rule[1] else "smallcluster"
     return "smallsplit" if rule[1] else "small"
 
 
@@ -732,6 +1333,146 @@ def test_cluster_route_against_persistent(h, mb, nb, capacity, scale, ragged):
         cluster_capacity=cluster_capacity(torch.cuda.current_device()),
     )
     assert auto.mode == _mode_of(rule)
+
+
+@requires_hopper
+@pytest.mark.parametrize(
+    "h,mb,nb,capacity,scale,ragged,stage",
+    [
+        (
+            1,
+            16,
+            64,
+            18,
+            None,
+            False,
+            "small_k6sc3",
+        ),  # 16 tiles x 18 blocks: three slices of six
+        (
+            1,
+            16,
+            64,
+            24,
+            None,
+            False,
+            "small_k6sc4",
+        ),  # the h1-m1024-n4096-k24 row (auto routes it here)
+        (
+            1,
+            16,
+            64,
+            24,
+            0.5,
+            True,
+            "small_k6sc4",
+        ),  # padded slices, one-slice tiles leave ranks idle
+        (1, 8, 128, 48, None, False, "small_k6sc8"),  # the h1-m512-n8192-k48 row
+        (
+            4,
+            8,
+            64,
+            30,
+            -0.125,
+            True,
+            "small_k6sc8",
+        ),  # 32 tiles x up to 30 blocks: five of eight ranks
+        (
+            2,
+            8,
+            64,
+            20,
+            0.0,
+            True,
+            "small_k6sc4",
+        ),  # scale 0: a uniform softmax over the selection
+        (
+            1,
+            1,
+            64,
+            7,
+            1e-7,
+            False,
+            "small_k6sc3",
+        ),  # one query block, two slices, one idle rank
+    ],
+)
+def test_split_cluster_route_against_persistent(
+    h, mb, nb, capacity, scale, ragged, stage
+):
+    """The split-cluster small kernel (slices of a query block in one thread-block cluster, merged
+    column-set by column-set from the workspace) matches the persistent kernel and the reference;
+    runs twice bit-exact and leaves the arrival counters it does not use at zero."""
+    mask = _random_mask(h, mb, nb, capacity, seed=29, ragged=ragged, device="cuda")
+    rows = torch.full((h, mb), 64, dtype=torch.int32, device="cuda")
+    cols = torch.full((h, nb), 64, dtype=torch.int32, device="cuda")
+    q, k, v = _inputs(h, mb, nb)
+    plan = CakeVsaSm90Plan(
+        "cuda", mask, rows, cols, h, h, 128, sm_scale=scale, route="smallsplitcluster"
+    )
+    assert plan.mode == "smallsplitcluster" and plan.small_split and plan.stage == stage
+    assert (plan.small_kmax, plan.small_cluster) in SPLIT_CLUSTER_VARIANTS
+    assert plan.num_items == plan.num_tiles * plan.small_cluster == plan.num_ctas
+    assert plan.partial_o.numel() == plan.num_items * SMALL_ITEM_ELEMS
+    first = plan.run(q, k, v).float()
+    second = plan.run(q, k, v).float()
+    torch.cuda.synchronize()
+    assert int(plan.counters.abs().sum()) == 0
+    torch.testing.assert_close(first, second, atol=0, rtol=0)
+    persistent = CakeVsaSm90Plan(
+        "cuda", mask, rows, cols, h, h, 128, sm_scale=scale, route="persistent"
+    )
+    reference = _reference(q, k, v, mask, 128**-0.5 if scale is None else scale).float()
+    for name, out in (
+        ("smallsplitcluster", first),
+        ("persistent", persistent.run(q, k, v).float()),
+    ):
+        torch.testing.assert_close(out, reference, atol=1e-2, rtol=1e-2)
+        assert float((out - reference).abs().max()) <= 0.03, name
+    auto = CakeVsaSm90Plan("cuda", mask, rows, cols, h, h, 128, sm_scale=scale)
+    rule = small_route(
+        mask,
+        sms=torch.cuda.get_device_properties(0).multi_processor_count,
+        cluster_capacity=cluster_capacity(torch.cuda.current_device()),
+    )
+    assert auto.mode == _mode_of(rule)
+    if auto.mode == "smallsplitcluster":
+        torch.testing.assert_close(auto.run(q, k, v).float(), first, atol=0, rtol=0)
+
+
+@requires_hopper
+def test_split_cluster_plan_stream_and_graph_lifetime():
+    """A split-cluster plan owns the split workspace: built on another stream, captured and replayed
+    bit-exactly, counters zero after every launch."""
+    h, mb, nb = 1, 16, 64
+    mask = _random_mask(h, mb, nb, 24, seed=17, ragged=False, device="cuda")
+    rows = torch.full((h, mb), 64, dtype=torch.int32, device="cuda")
+    cols = torch.full((h, nb), 64, dtype=torch.int32, device="cuda")
+    producer = torch.cuda.Stream()
+    with torch.cuda.stream(producer):
+        plan = CakeVsaSm90Plan(
+            "cuda", mask, rows, cols, h, h, 128, route="smallsplitcluster"
+        )
+    assert plan.mode == "smallsplitcluster" and plan.stage == "small_k6sc4"
+    q, k, v = _inputs(h, mb, nb)
+    expected = plan.run(q, k, v).clone()
+    out = torch.empty((h * mb * 64, 1, 128), device="cuda", dtype=q.dtype)
+    plan.run(q, k, v, out=out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan.run(q, k, v, out=out)
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.view_as(q), expected, atol=0, rtol=0)
+    assert int(plan.counters.abs().sum()) == 0
+    q.normal_()
+    graph.replay()
+    torch.testing.assert_close(
+        out.view_as(q).float(),
+        _reference(q, k, v, mask, 128**-0.5),
+        atol=0.01,
+        rtol=0.01,
+    )
 
 
 @requires_hopper
@@ -802,240 +1543,15 @@ def test_split_plan_stream_and_graph_lifetime():
     )
 
 
-@requires_hopper
-@pytest.mark.parametrize(
-    "h,mb,nb,capacity",
-    [(2, 1, 2, 1), (1, 16, 6, 3), (1, 128, 8, 4), (1, 128, 16, 12), (2, 160, 16, 12)],
-)
-def test_all_schedules_against_fa3(h, mb, nb, capacity):
-    torch.manual_seed(42)
-    mask = torch.zeros((h, mb, nb), dtype=torch.bool, device="cuda")
-    for head in range(h):
-        for row in range(mb):
-            count = capacity if row == 0 else 1 + row % capacity
-            mask[head, row, torch.randperm(nb, device="cuda")[:count]] = True
-    candidate = _wrapper(mask)
-    reference = _wrapper(mask, "fa3")
-    q, k, v = _inputs(h, mb, nb)
-    out = torch.empty((h * mb * 64, 1, 128), device="cuda", dtype=torch.bfloat16)
-    for _ in range(2):
-        expected = reference.run(q, k, v, enable_pdl=False)
-        actual = candidate.run(q, k, v, out=out, enable_pdl=False)
-        assert actual.data_ptr() == out.data_ptr()
-        assert actual.shape == q.shape
-        torch.testing.assert_close(actual, expected, atol=0.01, rtol=0.01)
-        assert float((actual.float() - expected.float()).abs().max()) <= 0.03
-        q.normal_()
-        v.normal_()
-
-
-@requires_hopper
-@pytest.mark.parametrize(
-    "h,mb,nb,capacity,ragged,scale",
-    [
-        # boundary / tail: one block, odd block counts, full 64-block capacity,
-        # unequal Q/KV lengths, lone tile of a pair plan, custom scale
-        (1, 1, 1, 1, False, None),
-        (2, 3, 5, 2, True, None),
-        (2, 3, 3, 3, False, 0.5),
-        (1, 1, 64, 64, False, None),
-        (2, 33, 64, 64, True, None),
-        (3, 7, 64, 64, False, None),
-        (4, 16, 8, 4, True, None),
-        (5, 17, 9, 5, True, None),
-        (8, 64, 64, 32, False, None),
-        (7, 64, 64, 16, True, 0.125),
-        (2, 64, 64, 3, True, None),
-    ],
-)
-def test_held_out_shapes_against_fp32_reference(h, mb, nb, capacity, ragged, scale):
-    mask = _random_mask(
-        h, mb, nb, capacity, seed=h * 1000 + mb, ragged=ragged, device="cuda"
-    )
-    torch.manual_seed(h * 31 + mb)
-    q, k, v = _inputs(h, mb, nb)
-    wrapper = _wrapper(mask, scale=scale)
-    actual = wrapper.run(q, k, v)
-    expected = _reference(q, k, v, mask, 128**-0.5 if scale is None else scale)
-    assert bool(torch.isfinite(actual).all())
-    torch.testing.assert_close(actual.float(), expected, atol=0.01, rtol=0.01)
-    assert float((actual.float() - expected.float()).abs().max()) <= 0.03
-
-
-@requires_hopper
-def test_replan_and_independent_wrappers():
-    mask, rows, cols = _descriptors(2, 2, 3, device="cuda")
-    mask[:, :, 1:] = False
-    first = _wrapper(mask)
-    q, k, v = _inputs(2, 2, 3)
-    expected_first = first.run(q, k, v).clone()
-    mask[:, :, 0] = False
-    mask[:, :, 2] = True
-    second = _wrapper(mask)
-    expected_second = second.run(q, k, v).clone()
-    torch.testing.assert_close(first.run(q, k, v), expected_first, atol=0, rtol=0)
-    first.plan(mask, rows, cols, 2, 2, 128, q_data_type=torch.bfloat16)
-    torch.testing.assert_close(first.run(q, k, v), expected_second, atol=0, rtol=0)
-    torch.testing.assert_close(second.run(q, k, v), expected_second, atol=0, rtol=0)
-
-
-@requires_hopper
-@pytest.mark.parametrize("scale", [0.0, -0.125, 1e-7, 128**-0.5])
-def test_padding_uses_attention_math(scale):
-    mask, _, _ = _descriptors(1, 1, 2, device="cuda")
-    mask[:, :, 1] = False
-    q, k, v = _inputs(1, 1, 2)
-    q.fill_(-32)
-    k.fill_(32)
-    actual = _wrapper(mask, scale=scale).run(q, k, v)
-    expected = v[:, :64].float().mean(dim=1, keepdim=True).expand_as(q).to(q.dtype)
-    assert bool(torch.isfinite(actual).all())
-    torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
-
-
-@requires_hopper
-@pytest.mark.parametrize("scale", [0.0, -0.125, 1e-7, 1e-4])
-def test_signed_and_tiny_scales_against_math(scale):
-    mask, _, _ = _descriptors(2, 2, 3, device="cuda")
-    mask[0, 0, 1] = False
-    mask[1, 1, 2] = False
-    q, k, v = _inputs(2, 2, 3)
-    actual = _wrapper(mask, scale=scale).run(q, k, v)
-    expected = _reference(q, k, v, mask, scale)
-    assert bool(torch.isfinite(actual).all())
-    torch.testing.assert_close(actual.float(), expected, atol=0.02, rtol=0.02)
-
-
-@requires_hopper
-def test_offset_views_and_rejected_output_alias():
-    mask, _, _ = _descriptors(1, 2, 3, device="cuda")
-    wrapper = _wrapper(mask)
-    q, k, v = _inputs(1, 2, 3)
-    expected = wrapper.run(q, k, v)
-    views = []
-    for tensor in (q, k, v):
-        storage = torch.empty(tensor.numel() + 1, device="cuda", dtype=tensor.dtype)
-        view = storage[1:].view_as(tensor)
-        view.copy_(tensor)
-        views.append(view)
-    storage = torch.full((q.numel() + 2,), 7, device="cuda", dtype=q.dtype)
-    out = storage[1:-1].view(-1, 1, 128)
-    actual = wrapper.run(*views, out=out)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    assert storage[0].item() == 7 and storage[-1].item() == 7
-    with pytest.raises(ValueError, match="overlap"):
-        wrapper.run(q, k, v, out=q.view(-1, 1, 128))
-    with pytest.raises(ValueError, match="log-sum-exp"):
-        wrapper.run(q, k, v, return_lse=True)
-    with pytest.raises(ValueError, match="PDL"):
-        wrapper.run(q, k, v, enable_pdl=True)
-
-
-@requires_hopper
-@pytest.mark.parametrize(
-    "kwargs,match",
-    [
-        ({"causal": True}, "noncausal"),
-        ({"pos_encoding_mode": "ALIBI"}, "positional"),
-        ({"use_fp16_qk_reduction": True}, "FP32"),
-        ({"logits_soft_cap": 2.0}, "logits_soft_cap"),
-        ({"q_data_type": torch.float16}, "BF16"),
-        ({"kv_data_type": torch.float16}, "BF16"),
-        ({"sm_scale": float("nan")}, "finite"),
-        ({"sm_scale": float("inf")}, "finite"),
-        ({"sm_scale": 1e39}, "finite"),
-    ],
-)
-def test_unsupported_options(kwargs, match):
-    from flashinfer.sparse import VariableBlockSparseAttentionWrapper
-
-    mask, rows, cols = _descriptors(device="cuda")
-    wrapper = VariableBlockSparseAttentionWrapper(
-        torch.empty(0, device="cuda", dtype=torch.uint8), backend="cake"
-    )
-    plan_kwargs = {"q_data_type": torch.bfloat16, **kwargs}
-    with pytest.raises(ValueError, match=match):
-        wrapper.plan(mask, rows, cols, 2, 2, 128, **plan_kwargs)
-
-
-@requires_hopper
-@pytest.mark.parametrize(
-    "mutation", ["gqa", "head64", "row32", "col63", "dtype", "shape", "empty"]
-)
-def test_invalid_sparse_metadata(mutation):
-    from flashinfer.sparse import VariableBlockSparseAttentionWrapper
-
-    mask, rows, cols = _descriptors(device="cuda")
-    h, kv_h, d = 2, 2, 128
-    if mutation == "gqa":
-        kv_h = 1
-    elif mutation == "head64":
-        d = 64
-    elif mutation == "row32":
-        rows[0, 0] = 32
-    elif mutation == "col63":
-        cols[1, 0] = 63
-    elif mutation == "dtype":
-        mask = mask.to(torch.int32)
-    elif mutation == "shape":
-        rows = rows[:, :1]
-    else:
-        mask[0, 1] = False
-    wrapper = VariableBlockSparseAttentionWrapper(
-        torch.empty(0, device="cuda", dtype=torch.uint8), backend="cake"
-    )
-    with pytest.raises(ValueError):
-        wrapper.plan(mask, rows, cols, h, kv_h, d, q_data_type=torch.bfloat16)
-
-
-@requires_hopper
-def test_plan_stream_and_graph_lifetime():
-    mask, rows, cols = _descriptors(1, 2, 3, device="cuda")
-    producer = torch.cuda.Stream()
-    with torch.cuda.stream(producer):
-        wrapper = _wrapper(mask)
-    # Deliberately no producer wait: plan's ready event owns that dependency.
-    q, k, v = _inputs(1, 2, 3)
-    expected = wrapper.run(q, k, v).clone()
-    out = torch.empty((128, 1, 128), device="cuda", dtype=q.dtype)
-    wrapper.run(q, k, v, out=out)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        wrapper.run(q, k, v, out=out)
-    graph.replay()
-    torch.testing.assert_close(out.view_as(q), expected, atol=0, rtol=0)
-    with pytest.raises(RuntimeError, match="captured"):
-        wrapper.plan(mask, rows, cols, 1, 1, 128, q_data_type=torch.bfloat16)
-    # Other wrappers must not disturb this graph's plan.
-    other = _wrapper(mask)
-    other.run(q, k, v)
-    q.normal_()
-    graph.replay()
-    torch.testing.assert_close(
-        out.view_as(q).float(),
-        _reference(q, k, v, mask, 128**-0.5),
-        atol=0.01,
-        rtol=0.01,
-    )
-    with warnings.catch_warnings():
-        # The capture is abandoned before any launch; torch warns about the empty graph.
-        warnings.simplefilter("ignore", UserWarning)
-        with pytest.raises(ValueError, match="preallocated"):
-            graph2 = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph2):
-                wrapper.run(q, k, v)
-
-
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
     reason="cake (SM90) VSA requires Hopper compute capability 9.0",
 )
-@pytest.mark.parametrize("engine", ["cuda", "cute"])
-def test_queue_kernel_matches_the_static_kernel_bit_exact(engine, monkeypatch):
+def test_queue_kernel_matches_the_static_kernel_bit_exact(monkeypatch):
     """The queue kernel only moves tiles between CTAs: its output is bit-identical
     to the static kernel's on the same plan, its queue words return to zero after
     every launch, and a captured graph replays it."""
-    import flashinfer.cake_vsa_sm90 as module
+    module = planner
 
     h, mb, nb = (
         8,
@@ -1047,9 +1563,7 @@ def test_queue_kernel_matches_the_static_kernel_bit_exact(engine, monkeypatch):
     rows = torch.full((h, mb), 64, dtype=torch.int32, device="cuda")
     cols = torch.full((h, nb), 64, dtype=torch.int32, device="cuda")
     q, k, v = _inputs(h, mb, nb)
-    queued = CakeVsaSm90Plan(
-        "cuda", mask, rows, cols, h, h, 128, route="persistent", engine=engine
-    )
+    queued = CakeVsaSm90Plan("cuda", mask, rows, cols, h, h, 128, route="persistent")
     if not queued.queue:
         pytest.skip(f"{sms} SMs: fewer than {POOL_MIN_TILES} tiles per CTA")
     out = torch.empty((h * mb * 64, 1, 128), device="cuda", dtype=q.dtype)
@@ -1057,9 +1571,7 @@ def test_queue_kernel_matches_the_static_kernel_bit_exact(engine, monkeypatch):
     torch.cuda.synchronize()
     assert int(queued.dbg[62:64].abs().sum()) == 0
     monkeypatch.setattr(module, "POOL_MIN_TILES", 10**9)
-    static = CakeVsaSm90Plan(
-        "cuda", mask, rows, cols, h, h, 128, route="persistent", engine=engine
-    )
+    static = CakeVsaSm90Plan("cuda", mask, rows, cols, h, h, 128, route="persistent")
     assert not static.queue and static.num_ctas == queued.num_ctas
     torch.testing.assert_close(static.run(q, k, v), first, atol=0, rtol=0)
     graph = torch.cuda.CUDAGraph()
@@ -1176,25 +1688,3 @@ def test_plan_odd_block_of_a_pair_plan_runs_alone_on_warpgroup_0():
         assert int(row[1]) == int(row[2]) == 128
         assert int(row[META_NSEQ]) == 1
         assert (int(row[META_NOWN]), int(row[META_NOWN + 1])) == (1, 0)
-
-
-@requires_hopper
-@pytest.mark.parametrize("backend", ["cake", "cake_cute"])
-def test_odd_single_block_tile_never_stores_from_the_idle_warpgroup(backend):
-    # On a mode-2 tile both warpgroups address the same 64 output rows; the
-    # idle warpgroup's accumulator is 0 x rcp(0) = NaN and its store must not
-    # happen (it raced the owner's store).  NaN-filled output, many runs.
-    mask = _odd_single_block_mask().cuda()
-    torch.manual_seed(11)
-    q, k, v = _inputs(2, 129, 1024)
-    wrapper = _wrapper(mask, backend=backend)
-    expected = _reference(q, k, v, mask, 128**-0.5)
-    for _ in range(20):
-        out = torch.full(
-            (2 * 129 * 64, 1, 128), float("nan"), dtype=torch.bfloat16, device="cuda"
-        )
-        actual = wrapper.run(q, k, v, out=out)
-        assert bool(torch.isfinite(actual).all()), (
-            "an output row was never written or holds NaN"
-        )
-        torch.testing.assert_close(actual.float(), expected, atol=0.01, rtol=0.01)

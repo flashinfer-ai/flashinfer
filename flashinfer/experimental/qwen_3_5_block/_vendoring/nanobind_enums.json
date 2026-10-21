@@ -1,0 +1,165 @@
+{
+ "data_type": {
+  "FLOAT": 1,
+  "DOUBLE": 2,
+  "HALF": 3,
+  "INT8": 4,
+  "INT32": 5,
+  "INT8x4": 6,
+  "UINT8": 7,
+  "UINT8x4": 8,
+  "INT8x32": 9,
+  "BFLOAT16": 10,
+  "INT64": 11,
+  "BOOLEAN": 12,
+  "FP8_E4M3": 14,
+  "FP8_E5M2": 15,
+  "FAST_FLOAT_FOR_FP8": 16,
+  "FP8_E8M0": 17,
+  "FP8_E5M3": 18,
+  "FP4_E2M1": 19,
+  "INT4": 20,
+  "NOT_SET": 0
+ },
+ "tensor_reordering": {
+  "NONE": 0,
+  "INT8x32": 1,
+  "F16x16": 2,
+  "F8_128x4": 3
+ },
+ "heur_mode": {
+  "A": 0,
+  "B": 1,
+  "FALLBACK": 2,
+  "OPENSOURCE": 3
+ },
+ "knob_type": {
+  "NOT_SET": 0,
+  "SWIZZLE": 1,
+  "TILE_SIZE": 2,
+  "EDGE": 3,
+  "MULTIPLY": 4,
+  "SPLIT_K_BUF": 5,
+  "TILEK": 6,
+  "STAGES": 7,
+  "REDUCTION_MODE": 8,
+  "SPLIT_K_SLC": 9,
+  "IDX_MODE": 10,
+  "SPECFILT": 11,
+  "KERNEL_CFG": 12,
+  "WORKSPACE": 13,
+  "TILE_CGA_M": 14,
+  "TILE_CGA_N": 15,
+  "BLOCK_SIZE": 16,
+  "OCCUPANCY": 17,
+  "ARRAY_SIZE_PER_THREAD": 18,
+  "SPLIT_COLS": 19,
+  "TILE_ROWS": 20,
+  "TILE_COLS": 21,
+  "LOAD_SIZE": 22,
+  "CTA_COUNT": 23,
+  "STREAM_K": 24,
+  "SPLIT_P_SLC": 25,
+  "TILE_M": 26,
+  "TILE_N": 27,
+  "WARP_SPEC_CFG": 28,
+  "SWAP_AB": 29,
+  "INPUT_TMA_ENABLE": 30,
+  "OUTPUT_TMA_ENABLE": 31,
+  "TILE_CGA": 32,
+  "SCHED_POLICY": 1000,
+  "PACK_GQA": 1001,
+  "SPLIT_KV": 1002,
+  "PIPELINE_ARCH": 1003,
+  "MMA_TILE_M": 1004,
+  "MMA_TILE_N": 1005,
+  "MMA_TILE_K": 1006,
+  "CTA_GROUP": 1007,
+  "WARPS_M": 1008,
+  "WARPS_N": 1009
+ },
+ "behavior_note": {
+  "RUNTIME_COMPILATION": 1,
+  "REQUIRES_FILTER_INT8x32_REORDER": 2,
+  "REQUIRES_BIAS_INT8x32_REORDER": 3,
+  "SUPPORTS_CUDA_GRAPH_NATIVE_API": 4,
+  "CUBLASLT_DEPENDENCY": 5
+ },
+ "numerical_note": {
+  "TENSOR_CORE": 1,
+  "DOWN_CONVERT_INPUTS": 2,
+  "REDUCED_PRECISION_REDUCTION": 3,
+  "FFT": 4,
+  "NONDETERMINISTIC": 5,
+  "WINOGRAD": 6,
+  "WINOGRAD_TILE_4x4": 7,
+  "WINOGRAD_TILE_6x6": 8,
+  "WINOGRAD_TILE_13x13": 9,
+  "STRICT_NAN_PROP": 10
+ },
+ "reduction_mode": {
+  "ADD": 1,
+  "MUL": 2,
+  "MIN": 3,
+  "MAX": 4,
+  "AMAX": 5,
+  "AVG": 6,
+  "NORM1": 7,
+  "NORM2": 8,
+  "MUL_NO_ZEROS": 9,
+  "NOT_SET": 0
+ },
+ "moe_grouped_matmul_mode": {
+  "NONE": 1,
+  "GATHER": 2,
+  "SCATTER": 3,
+  "COMBINE": 4
+ },
+ "scalar_type": {
+  "RUNTIME_PARAM": 0,
+  "COMPILE_TIME_CONST": 1
+ },
+ "diagonal_alignment": {
+  "TOP_LEFT": 0,
+  "BOTTOM_RIGHT": 1
+ },
+ "build_plan_policy": {
+  "HEURISTICS_CHOICE": 0,
+  "ALL": 1
+ },
+ "attention_implementation": {
+  "AUTO": 0,
+  "COMPOSITE": 1,
+  "UNIFIED": 2
+ },
+ "norm_forward_phase": {
+  "INFERENCE": 1,
+  "TRAINING": 2,
+  "NOT_SET": 0
+ },
+ "reshape_mode": {
+  "VIEW_ONLY": 1,
+  "LOGICAL": 2
+ },
+ "FRONTEND_KNOB_TYPE_BASE": 1000,
+ "binder_flags": {
+  "_SdpaDenseBinder": {
+   "supports_combine_q_lens": true,
+   "supports_epilogue_gate": true,
+   "supports_paged_epilogue_gate": true
+  },
+  "_SdpaThdBinder": {
+   "supports_epilogue_gate": true,
+   "supports_nonpaged_d128_packed_split": true,
+   "supports_nonpaged_d256_packed_split": true,
+   "supports_nonpaged_packed_split": true,
+   "supports_paged_d256_packed_split": true,
+   "supports_paged_d64_packed_split": true,
+   "supports_paged_epilogue_gate": true,
+   "supports_paged_packed_split": true,
+   "supports_paged_split_sink": true,
+   "supports_stats_stride_override": true
+  }
+ },
+ "backend_version": 92000
+}

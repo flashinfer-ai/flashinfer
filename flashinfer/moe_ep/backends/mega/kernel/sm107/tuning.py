@@ -1,4 +1,4 @@
-"""Offline tuning shared by the SM107 NVFP4 and MXFP8 backends.
+"""Offline tuning shared by the SM107 block-scaled backends.
 
 The core runtime owns torch.distributed and NVSHMEM initialization.
 Each candidate needs a new session because kernel knobs are fixed at
@@ -21,6 +21,8 @@ def _backend_module(quant_kind: str, name: str):
     backend = (
         "nvfp4_nvfp4_bf16_cutedsl"
         if quant_kind == "nvfp4"
+        else "mxfp8_mxfp4_bf16_cutedsl"
+        if quant_kind == "mxfp4_mxfp8"
         else "mxfp8_mxfp8_bf16_cutedsl"
     )
     return importlib.import_module(f".{backend}.{name}", __package__)
@@ -39,7 +41,7 @@ def _dummy_transformed_weights(args, rank: int, world_size: int, quant_kind: str
     )
 
     weights_mod = _backend_module(quant_kind, "weights")
-    extra = {} if quant_kind == "nvfp4" else {"kind": quant_kind}
+    extra = {} if quant_kind in ("nvfp4", "mxfp4_mxfp8") else {"kind": quant_kind}
 
     experts_per_rank = args.num_experts // world_size
     generator = torch.Generator(device="cuda").manual_seed(args.seed + 7 * rank)
@@ -159,6 +161,10 @@ def tune_one(
             rank,
             world_size,
             quant_kind=cast("Sm107QuantKind", quant_kind),
+            kernel_variant=args.kernel_variant,
+            cluster_shape_mn=(4, 1) if args.kernel_variant == "genphase" else (2, 1),
+            fc2_use_bulk=args.kernel_variant == "genphase",
+            combine_dtype=args.combine_dtype,
             gate_up_clamp=args.gate_up_clamp,
             activation=args.activation,
             situ_beta=args.situ_beta,
@@ -176,6 +182,8 @@ def tune_one(
             else:
                 base, src = resolve_knobs(
                     dtype=quant_kind,
+                    kernel_variant=args.kernel_variant,
+                    combine_dtype=args.combine_dtype,
                     world_size=world_size,
                     hidden=args.hidden,
                     intermediate=args.intermediate,
@@ -189,11 +197,15 @@ def tune_one(
                 )
                 if rank == 0:
                     print(f"[moe_ep-tune] schedule sweep base ({src}): {base}")
-            candidates = sm107_schedule_candidates(base)
+            candidates = sm107_schedule_candidates(
+                base, kernel_variant=args.kernel_variant
+            )
         else:
             candidates = sm107_candidates(
                 quant_kind,
-                allow_in_kernel_fc2_reduce=args.allow_nondeterministic,
+                allow_in_kernel_fc2_reduce=args.allow_nondeterministic
+                and args.combine_dtype == "bf16",
+                kernel_variant=args.kernel_variant,
             )
 
         return finish_sweep(
@@ -222,8 +234,10 @@ def run_tuning(args, quant_kind: str) -> int:
     """Initialize the runtime and tune each token-capacity bucket."""
     import torch
 
-    if args.combine_dtype != "bf16":
-        raise SystemExit("the SM107 backends are wired for bf16 combine only")
+    if args.combine_dtype not in ("bf16", "nvfp4", "mxfp8"):
+        raise SystemExit("SM107 supports bf16, nvfp4, or mxfp8 combine")
+    if args.kernel_variant == "genphase" and args.combine_dtype != "bf16":
+        raise SystemExit("GenPhase requires BF16 combine")
     from .validation import validate_input_norm_const
 
     for name in ("input_norm_const", "fc1_alpha", "fc2_alpha", "fc1_norm_const"):

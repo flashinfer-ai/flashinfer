@@ -933,7 +933,9 @@ class TestUnifiedB12xConformance:
             )
             updated_expected = _b12x_reference(
                 tensors,
-                quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+                quant=QuantConfig(
+                    weight=QuantFormat.NVFP4, activation=QuantFormat.BF16
+                ),
                 activation=activation,
                 intermediate_size=512,
                 num_experts=num_experts,
@@ -978,7 +980,9 @@ class TestUnifiedB12xConformance:
 
             layer, act_pack, weight_pack = _make_b12x_layer_and_packs(
                 tensors,
-                quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+                quant=QuantConfig(
+                    weight=QuantFormat.NVFP4, activation=QuantFormat.BF16
+                ),
                 activation="silu",
                 intermediate_size=512,
                 num_experts=8,
@@ -992,7 +996,9 @@ class TestUnifiedB12xConformance:
             actual = _run_b12x_unified(layer, act_pack, weight_pack)
             expected = _b12x_reference(
                 tensors,
-                quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+                quant=QuantConfig(
+                    weight=QuantFormat.NVFP4, activation=QuantFormat.BF16
+                ),
                 activation="silu",
                 intermediate_size=512,
                 num_experts=8,

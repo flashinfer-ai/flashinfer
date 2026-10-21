@@ -27,7 +27,8 @@
 //   warps) CAKE_SAMPLING_FUSED_BLOCK_TAIL_KCAP largest top-k the whole-CTA stage-2/3 tail serves
 //   (the slab row) CAKE_SAMPLING_STAGE1_TABLE(X)  X(symbol, cluster, ept, stream, threads,
 //   smem_bytes, fused_tail,
-//                                    fused_block_tail, coarse_sample, spec_sample) ...
+//                                    fused_block_tail, coarse_sample, spec_sample, slab_tail,
+//                                    coarse_push, leader_push) ...
 //   CAKE_SAMPLING_STAGE23_TABLE(X) X(symbol, threads, items, variant_flags, smem_bytes) ...
 // and then includes this header.  Every table entry is taken verbatim from manifest.json.
 #ifndef CAKE_SAMPLING_BODY_FILE
@@ -58,11 +59,9 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <limits>
-#include <mutex>
-#include <set>
-#include <utility>
 
 #include "tvm_ffi_utils.h"
 
@@ -84,6 +83,16 @@ constexpr int64_t kFlagCoarseSample =
 constexpr int64_t kFlagRowSpanDiet = 32;  // streaming variants: row-span filter-arm density switch
 constexpr int64_t kFlagSpecSample =
     64;  // host-side build selection (speculative sample); never forwarded to the kernel
+constexpr int64_t kFlagSlabTail = 128;    // host-side build selection (slab-tail form of a sample
+                                          // build); never forwarded to the kernel
+constexpr int64_t kFlagLeaderPush = 512;  // host-side build selection (leader-push exchange form of
+                                          // the default / sample builds of a multi-CTA stream)
+constexpr int64_t kFlagCoarsePush = 256;  // host-side build selection (pushed-coarse-sums form of
+                                          // the default build); never forwarded to the kernel
+constexpr int64_t kFlagLocalSelect = 1024;  // host-side build selection (CTA-local select form of
+                                            // a leader-push sample build); never forwarded
+constexpr int64_t kFlagIntTail = 2048;      // host-side build selection (integer-tested whole-CTA
+                                            // tail); never forwarded to the kernel
 constexpr int32_t kTopKScalar = 1;
 constexpr int32_t kTopKPerRow = 2;
 constexpr int32_t kTopPScalar = 1;
@@ -129,6 +138,21 @@ struct Stage1Variant {
   int32_t coarse_sample;  // 1: the coarse-sample build (1/8 sampled first pass; launch_flags bit 4)
   int32_t spec_sample;  // 1: the speculative-sample build (first chunk is the sample; launch_flags
                         // bit 6)
+  int32_t slab_tail;    // 1: the selected pairs of a fused launch are pushed into rank 0's shared
+                        // memory and the two-warp tail reads them there (every coarse-sample build;
+                        // the speculative-sample build's twin taken by launch_flags bit 7)
+  int32_t coarse_push;  // 1: each CTA stores its coarse histogram sums into every CTA's shared
+                        // memory for the two-level select (the default build's twin taken by
+                        // launch_flags bit 8 on a two-launch chain)
+  int32_t leader_push;  // 1: every CTA pushes its compacted candidate list into rank 0's receive
+                        // buffer and its length into every CTA before the single exchange barrier
+                        // (the default / sample builds' twin of a multi-CTA stream taken by
+                        // launch_flags bit 9)
+  int32_t local_select;  // 1: each CTA picks its filter bucket from its own sample and the leader
+                         // push is the only cluster round (the leader-push sample builds' twin
+                         // taken by launch_flags bit 10)
+  int32_t int_tail;      // 1: the whole-CTA tail's f64 target / sample tests run as the integer
+                         // emulation (the whole-CTA-tail build's twin taken by launch_flags bit 11)
 };
 
 struct Stage23Variant {
@@ -139,18 +163,23 @@ struct Stage23Variant {
   int32_t smem_bytes;
 };
 
-#define CAKE_SAMPLING_STAGE1_ENTRY(symbol, cluster, ept, stream, threads, smem, fused, \
-                                   fused_block, wide, spec)                            \
-  {reinterpret_cast<const void*>(&symbol),                                             \
-   cluster,                                                                            \
-   ept,                                                                                \
-   stream,                                                                             \
-   threads,                                                                            \
-   smem,                                                                               \
-   fused,                                                                              \
-   fused_block,                                                                        \
-   wide,                                                                               \
-   spec},
+#define CAKE_SAMPLING_STAGE1_ENTRY(symbol, cluster, ept, stream, threads, smem, fused,        \
+                                   fused_block, wide, spec, slab, push, leader, local, itail) \
+  {reinterpret_cast<const void*>(&symbol),                                                    \
+   cluster,                                                                                   \
+   ept,                                                                                       \
+   stream,                                                                                    \
+   threads,                                                                                   \
+   smem,                                                                                      \
+   fused,                                                                                     \
+   fused_block,                                                                               \
+   wide,                                                                                      \
+   spec,                                                                                      \
+   slab,                                                                                      \
+   push,                                                                                      \
+   leader,                                                                                    \
+   local,                                                                                     \
+   itail},
 #define CAKE_SAMPLING_STAGE23_ENTRY(symbol, threads, items, variant_flags, smem) \
   {reinterpret_cast<const void*>(&symbol), threads, items, variant_flags, smem},
 
@@ -161,21 +190,51 @@ struct Stage23Variant {
 // (coarse_sample = 1: the first pass reads 1/8 of the row) taken only by launch_flags bit 4 -- a
 // runtime rate switch cost the k > 64 launches 1-2 % -- and a speculative-sample twin
 // (spec_sample = 1: the first register chunk doubles as the sample) taken only by launch_flags
-// bit 6.  The three twins are exclusive.
+// bit 6.  The three twins are exclusive.  The slab tail (slab_tail = 1: a fused launch's selected
+// pairs are pushed into rank 0's shared memory and the two-warp tail reads them there) is a
+// second build of each sample twin taken only by launch_flags bit 7 -- the inactive slab code
+// moved the k > 64 chains of a single build by 1-14 %, and the slab form itself loses on Hopper's
+// single-row cluster-8 cells, so every sample twin keeps a plain form.  The pushed coarse sums
+// (coarse_push = 1: each CTA stores its coarse histogram sums into every CTA's shared memory so
+// the two-level select reads them locally) are a second build of the default build of the
+// streaming variants with the two-level select, taken only by launch_flags bit 8 on a two-launch
+// chain -- it wins those chains on GB300 / H100 and loses them on B200.  The leader-push exchange
+// (leader_push = 1: the CTAs store their candidate lists straight into rank 0's receive buffer
+// and their lengths into every CTA before one exchange barrier; rank 0 gathers locally) is a
+// third build of the default and sample builds of the multi-CTA streaming variants, taken only
+// by launch_flags bit 9 -- it is exclusive with the whole-CTA tail, the slab tail and the pushed
+// coarse sums, and the host selects it per capability, ept and row length.  The CTA-local select
+// (local_select = 1: each CTA picks its filter bucket from its own sample, so the cluster-wide
+// coarse-histogram round disappears and the leader push is the only round) is a second build of
+// the leader-push sample builds, taken only by launch_flags bit 10 with bits 0, 9 and 4 / 6 --
+// the per-CTA lists grow with k, so the host takes it for the smallest top-k per capability.  The
+// integer-tested whole-CTA tail (int_tail = 1: the tail's f64 target / sample tests run as the
+// stage-2/3 integer emulation) is a second build of the whole-CTA-tail build of the streaming
+// variants, taken only by launch_flags bit 11 with bit 3 -- it wins where the FP64 pipe is slow
+// (sm_103a) and loses on sm_100a, so the host selects it per capability.
+inline const Stage1Variant kStage1Table[] = {
+    CAKE_SAMPLING_STAGE1_TABLE(CAKE_SAMPLING_STAGE1_ENTRY)};
+inline const Stage23Variant kStage23Table[] = {
+    CAKE_SAMPLING_STAGE23_TABLE(CAKE_SAMPLING_STAGE23_ENTRY)};
+// Per table entry, one bit per device id: set once the kernel is prepared on that device.
+inline std::atomic<uint64_t> kStage1Prepared[sizeof(kStage1Table) / sizeof(Stage1Variant)]{};
+inline std::atomic<uint64_t> kStage23Prepared[sizeof(kStage23Table) / sizeof(Stage23Variant)]{};
+
 inline const Stage1Variant* FindStage1(int32_t cluster, int32_t ept, int32_t stream,
-                                       int32_t block_tail, int32_t wide, int32_t spec) {
-  static const Stage1Variant kTable[] = {CAKE_SAMPLING_STAGE1_TABLE(CAKE_SAMPLING_STAGE1_ENTRY)};
-  for (const Stage1Variant& v : kTable) {
+                                       int32_t block_tail, int32_t wide, int32_t spec, int32_t slab,
+                                       int32_t push, int32_t leader, int32_t local, int32_t itail) {
+  for (const Stage1Variant& v : kStage1Table) {
     if (v.cluster == cluster && v.ept == ept && v.stream == stream &&
-        v.fused_block_tail == block_tail && v.coarse_sample == wide && v.spec_sample == spec)
+        v.fused_block_tail == block_tail && v.coarse_sample == wide && v.spec_sample == spec &&
+        v.slab_tail == slab && v.coarse_push == push && v.leader_push == leader &&
+        v.local_select == local && v.int_tail == itail)
       return &v;
   }
   return nullptr;
 }
 
 inline const Stage23Variant* FindStage23(int32_t threads, int32_t items, int32_t variant_flags) {
-  static const Stage23Variant kTable[] = {CAKE_SAMPLING_STAGE23_TABLE(CAKE_SAMPLING_STAGE23_ENTRY)};
-  for (const Stage23Variant& v : kTable) {
+  for (const Stage23Variant& v : kStage23Table) {
     if (v.threads == threads && v.items == items && v.variant_flags == variant_flags) return &v;
   }
   return nullptr;
@@ -201,20 +260,17 @@ inline void EnsureClusterAttribute(const void* kernel, int32_t cluster) {
 //   non-portable cluster opt-in.  Function attributes persist for the process, and the runtime
 //   queries behind them (cudaDeviceGetAttribute x2, cudaFuncGetAttributes, cudaFuncSetAttribute)
 //   cost several microseconds each on Grace hosts -- for the stage-2/3 launch they sat between the
-//   two launches of the eager path, delaying the second kernel.
-inline void PrepareKernel(int32_t device_id, const void* kernel, int32_t smem_bytes,
-                          int32_t cluster) {
-  static std::mutex mutex;
-  static std::set<std::pair<int32_t, const void*>> prepared;
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    if (prepared.count({device_id, kernel}) != 0) return;
-  }
+//   two launches of the eager path, delaying the second kernel.  ``prepared`` is the table entry's
+//   device bit set (one atomic load per launch; the attribute calls are idempotent, so two threads
+//   preparing the same kernel at once are harmless).  Device ids beyond 63 are prepared every time.
+inline void PrepareKernel(int32_t device_id, std::atomic<uint64_t>& prepared, const void* kernel,
+                          int32_t smem_bytes, int32_t cluster) {
+  const uint64_t bit = device_id < 64 ? (uint64_t{1} << device_id) : 0;
+  if (bit != 0 && (prepared.load(std::memory_order_acquire) & bit) != 0) return;
   CheckTarget(device_id, kernel);
   EnsureSmemAttribute(kernel, smem_bytes);
   EnsureClusterAttribute(kernel, cluster);
-  std::lock_guard<std::mutex> lock(mutex);
-  prepared.insert({device_id, kernel});
+  if (bit != 0) prepared.fetch_or(bit, std::memory_order_release);
 }
 
 inline void CheckSlab(const TensorView& vals, const TensorView& idx, const TensorView& count,
@@ -282,7 +338,42 @@ inline void CheckSlab(const TensorView& vals, const TensorView& idx, const Tenso
 //   sampled-mass cap to the realised rate; the exact passes and the fallbacks are unchanged, so
 //   every output is bit-identical.  The host sets it for streams on a cluster of at least 4 CTAs
 //   or rows of at least 16 register chunks per CTA (round 7, lever SP); exclusive with bits 3 and
-//   4; the kernel itself never sees the bit.  Other bits are ignored.
+//   4; the kernel itself never sees the bit.
+//   launch_flags bit 7 (slab tail): with bit 0 and bit 4 or 6, selects the slab-tail form of a
+//   streaming variant's coarse- or speculative-sample build (manifest slab_tail): the selected
+//   pairs are pushed into rank 0's shared-memory slab (distributed shared memory stores) and the
+//   two-warp tail reads them there instead of re-reading the global slab row; every output is
+//   bit-identical (round 8, lever L-B).  The default and whole-CTA-tail builds never carry it.  The
+//   host sets it on compute capability 10.0 / 10.3, where the fused cells run 1-5 % faster with it
+//   (Hopper's single-row cluster-8 cells lose 2-5 %); the kernel itself never sees the bit.  Other
+//   bits are ignored.
+//   launch_flags bit 8 (pushed coarse sums): on a two-launch chain (no bit 0) without bits 3, 4,
+//   6 and 7, selects the pushed-coarse-sums form of a streaming variant's default build (manifest
+//   coarse_push; the variants whose cluster runs the two-level select): each CTA stores its
+//   coarse histogram sums into every CTA's shared memory as it builds them, so the cluster-wide
+//   lower-bucket select reads its peers' sums locally instead of over distributed shared memory
+//   inside the select loop; every output is bit-identical.  The host sets it on compute
+//   capability 9.0 / 10.3 (round 8, lever L-G(d): the cluster-8 k ~ 1000 chains run 0.6-1.5 %
+//   faster); B200 keeps the plain build.  The kernel itself never sees the bit.
+//   launch_flags bit 9 (leader-push exchange): on a multi-CTA stream without bits 3, 7 and 8,
+//   selects the leader-push exchange form of the default or sample build (manifest leader_push):
+//   every CTA stores its compacted candidate list straight into rank 0's receive buffer and its
+//   length into every CTA before the single exchange barrier, and rank 0 gathers locally; every
+//   output is bit-identical (round 9, lever L-P).  The kernel itself never sees the bit.
+//   launch_flags bit 10 (CTA-local select): with bits 0, 9 and 4 or 6, selects the CTA-local select
+//   form of a leader-push sample build (manifest local_select): each CTA picks its filter bucket
+//   from its own sample (sampled mass >= k) instead of the cluster-wide coarse histogram, so the
+//   leader push is the only cluster round; the row's exact top-k lies in the union of the per-CTA
+//   lists and every output is bit-identical (round 10, lever L1).  The host sets it for the
+//   smallest top-k per capability (10.3 up to k = 32, 10.0 up to k = 20, 9.0 up to k = 10); the
+//   kernel itself never
+//   sees the bit.
+//   launch_flags bit 11 (integer-tested tail): with bit 3, selects the integer-tested form of a
+//   streaming variant's whole-CTA tail build (manifest int_tail): the tail's f64 target product,
+//   cut tests and sample tests run as the stage-2/3 integer emulation; every output is
+//   bit-identical (round 10, lever L3-T).  The host sets it on compute capability 10.3, where
+//   the FP64 pipe is slow (the cluster-8 k ~ 1000 cells run 4-8 % faster); the kernel itself never
+//   sees the bit.
 void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64_t topk_kind,
                TensorView out_vals, TensorView out_idx, TensorView out_count, int64_t cluster,
                int64_t ept, int64_t stream_variant, TensorView topp_arr, double topp_scalar,
@@ -329,16 +420,55 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
       << "the speculative-sample build (launch_flags bit 6) exists for streaming variants only";
   TVM_FFI_ICHECK(!(want_spec && (want_block_tail || want_coarse)))
       << "launch_flags bit 6 (speculative sample) is exclusive with bits 3 and 4";
+  const int32_t want_slab = (launch_flags & kFlagSlabTail) != 0 ? 1 : 0;
+  TVM_FFI_ICHECK(!(want_slab && !(want_spec || want_coarse)))
+      << "launch_flags bit 7 (slab tail) selects a sample build's twin: it needs bit 4 or bit 6";
+  TVM_FFI_ICHECK(!(want_slab && (launch_flags & kFlagFuseTail) == 0))
+      << "launch_flags bit 7 (slab tail) is for launches whose two-warp tail fuses (bit 0)";
+  const int32_t want_push = (launch_flags & kFlagCoarsePush) != 0 ? 1 : 0;
+  TVM_FFI_ICHECK(!(want_push && stream_variant == 0))
+      << "the pushed-coarse-sums build (launch_flags bit 8) exists for streaming variants only";
+  TVM_FFI_ICHECK(!(want_push && (want_block_tail || want_coarse || want_spec || want_slab)))
+      << "launch_flags bit 8 (pushed coarse sums) selects the default build's twin: it excludes "
+         "bits 3, 4, 6 and 7";
+  TVM_FFI_ICHECK(!(want_push && (launch_flags & kFlagFuseTail) != 0))
+      << "launch_flags bit 8 (pushed coarse sums) is for two-launch chains (no bit 0)";
+  const int32_t want_leader = (launch_flags & kFlagLeaderPush) != 0 ? 1 : 0;
+  TVM_FFI_ICHECK(!(want_leader && (stream_variant == 0 || cluster < 2)))
+      << "the leader-push exchange build (launch_flags bit 9) exists for multi-CTA streaming "
+         "variants only";
+  TVM_FFI_ICHECK(!(want_leader && (want_block_tail || want_slab || want_push)))
+      << "launch_flags bit 9 (leader-push exchange) is exclusive with bits 3, 7 and 8";
+  const int32_t want_local = (launch_flags & kFlagLocalSelect) != 0 ? 1 : 0;
+  TVM_FFI_ICHECK(!(want_local && !want_leader)) << "launch_flags bit 10 (CTA-local select) selects "
+                                                   "a leader-push build's twin: it needs bit 9";
+  TVM_FFI_ICHECK(!(want_local && !(want_spec || want_coarse)))
+      << "launch_flags bit 10 (CTA-local select) selects a sample build's twin: it needs bit 4 or "
+         "bit 6";
+  TVM_FFI_ICHECK(!(want_local && (launch_flags & kFlagFuseTail) == 0))
+      << "launch_flags bit 10 (CTA-local select) is for launches whose two-warp tail fuses (bit 0)";
+  const int32_t want_itail = (launch_flags & kFlagIntTail) != 0 ? 1 : 0;
+  TVM_FFI_ICHECK(!(want_itail && !want_block_tail))
+      << "launch_flags bit 11 (integer-tested tail) selects the whole-CTA tail build's twin: it "
+         "needs bit 3";
+  TVM_FFI_ICHECK(!(want_itail && stream_variant == 0))
+      << "the integer-tested tail build (launch_flags bit 11) exists for streaming variants only";
   const Stage1Variant* v =
       FindStage1(static_cast<int32_t>(cluster), static_cast<int32_t>(ept),
-                 static_cast<int32_t>(stream_variant), want_block_tail, want_coarse, want_spec);
+                 static_cast<int32_t>(stream_variant), want_block_tail, want_coarse, want_spec,
+                 want_slab, want_push, want_leader, want_local, want_itail);
   TVM_FFI_ICHECK(v != nullptr)
       << "no frozen stage-1 variant for cluster=" << cluster << " ept=" << ept
       << " stream=" << stream_variant
       << (want_block_tail ? " with the whole-CTA tail build (launch_flags bit 3)" : "")
       << (want_coarse ? " with the coarse-sample build (launch_flags bit 4)" : "")
-      << (want_spec ? " with the speculative-sample build (launch_flags bit 6)" : "");
-  PrepareKernel(device_id, v->kernel, v->smem_bytes, v->cluster);
+      << (want_spec ? " with the speculative-sample build (launch_flags bit 6)" : "")
+      << (want_slab ? " with the slab tail (launch_flags bit 7)" : "")
+      << (want_push ? " with the pushed coarse sums (launch_flags bit 8)" : "")
+      << (want_leader ? " with the leader-push exchange (launch_flags bit 9)" : "")
+      << (want_local ? " with the CTA-local select (launch_flags bit 10)" : "")
+      << (want_itail ? " with the integer-tested tail (launch_flags bit 11)" : "");
+  PrepareKernel(device_id, kStage1Prepared[v - kStage1Table], v->kernel, v->smem_bytes, v->cluster);
   TVM_FFI_ICHECK(v->stream == 1 || static_cast<int64_t>(v->cluster) * v->ept * v->threads >= vocab)
       << "stage-1 variant cluster=" << cluster << " ept=" << ept
       << " does not cover vocab=" << vocab;
@@ -475,7 +605,7 @@ void SparseTopPSample(TensorView vals, TensorView idx, TensorView count, TensorV
                                         static_cast<int32_t>(variant_flags));
   TVM_FFI_ICHECK(v != nullptr) << "no frozen stage-2/3 variant for threads=" << threads
                                << " items=" << items << " variant_flags=" << variant_flags;
-  PrepareKernel(device_id, v->kernel, v->smem_bytes, 1);
+  PrepareKernel(device_id, kStage23Prepared[v - kStage23Table], v->kernel, v->smem_bytes, 1);
   if (batch == 0) return;
 
   float* vals_ptr = static_cast<float*>(vals.data_ptr());

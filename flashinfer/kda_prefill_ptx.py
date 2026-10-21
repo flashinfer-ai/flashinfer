@@ -180,7 +180,7 @@ def _launch_ptx_kda(
     workspace = prefill_workspace if explicit else _get_stream_workspace(q.device)
     out = torch.empty_like(v) if output is None else output
     _check_output_does_not_overlap_inputs(
-        out, q=q, k=k, v=v, g=g, beta=beta, initial_state=initial_state
+        output, q=q, k=k, v=v, g=g, beta=beta, initial_state=initial_state
     )
     for name, tensor in (
         ("A_log", A_log),
@@ -256,8 +256,13 @@ def _launch_ptx_kda(
                 > 16384
             ):
                 raise ValueError("PTX KDA supports sequence lengths up to 16384")
-            # The retained MMA kernels have a bounded state dynamic range.
-            # Capture/replay callers must preserve this value contract.
+            # The retained MMA kernels have a bounded state dynamic range: a
+            # B300 sweep of dense random FP32 state remained finite through
+            # scale 2^12 (observed max above 1.6e4) and became nonfinite at
+            # scale 2^16, so the 2^12 limit is conservative for dense inputs
+            # while retaining the sparse striped-state split case whose maximum
+            # is exactly 2^12. Capture/replay callers must preserve this value
+            # contract.
             if initial_state is not None:
                 state_max = float(initial_state.detach().abs().max())
                 if not math.isfinite(state_max) or state_max > 4096:

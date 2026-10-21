@@ -30,6 +30,9 @@ from flashinfer.diffusion_ops import (
     quantize_minimax_h3_qkv_weight_fp8,
     quantize_minimax_h3_qkv_weight_nvfp4,
 )
+from flashinfer.diffusion_ops import (
+    cake_minimax_h3_sm120_quant_pre_attention as pre_attention_sm120,
+)
 from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_pre_attention import (
     MINIMAX_H3_DEFAULT_EPS,
     MINIMAX_H3_HEAD_DIM,
@@ -57,12 +60,12 @@ ROWS = [1, 127, 128, 129, 257, 4097]
 def _supported() -> bool:
     if not torch.cuda.is_available():
         return False
-    major, _minor = get_compute_capability(torch.device("cuda:0"))
-    return major == 12
+    # The JIT module contains an sm_120a cubin, which cannot run on SM121.
+    return get_compute_capability(torch.device("cuda:0")) == (12, 0)
 
 
 requires_sm120 = pytest.mark.skipif(
-    not _supported(), reason="requires a CUDA GPU with compute capability 12.x (GB202)"
+    not _supported(), reason="requires a CUDA GPU with compute capability 12.0 (GB202)"
 )
 
 
@@ -688,3 +691,38 @@ def test_minimax_h3_quant_pre_attention_rejects_bad_inputs() -> None:
         minimax_h3_fp8_pre_attention(*good, out_mode="e4m3")  # descales are required
     with pytest.raises(ValueError):
         minimax_h3_fp8_pre_attention(*good[:5], w_q.view(torch.uint8), *good[6:])
+
+
+@requires_sm120
+@pytest.mark.parametrize("table_rows,index", [(8, 8), (10, 9)])
+def test_minimax_h3_quant_pre_attention_rejects_adaln_tables_without_nine_rows(
+    monkeypatch, table_rows: int, index: int
+) -> None:
+    """The norm/AdaLN kernels index a fixed 9-row table: with 8 rows, index 8 would read past
+    the table; with 10 rows, index 9 would silently zero the activation.  The wrapper and the
+    host both reject any other row count before the launch."""
+    device = torch.device("cuda:0")
+    rows = 8
+    inputs = make_inputs(rows, seed=1, device=device)
+    w_q, w_scale = model_tensors(device)["fp8"]
+    table = torch.zeros(
+        (table_rows, MINIMAX_H3_HIDDEN), dtype=torch.bfloat16, device=device
+    )
+    args = (
+        inputs["x"],
+        inputs["x_norm_weight"],
+        table,
+        table,
+        torch.full((rows,), index, dtype=torch.int32, device=device),
+        w_q,
+        w_scale,
+        inputs["q_norm_weight"],
+        inputs["k_norm_weight"],
+        inputs["rope_cos_sin"],
+    )
+    with pytest.raises(ValueError, match="adaln_scale"):
+        minimax_h3_fp8_pre_attention(*args)
+    # The host check backs the Python validation: skip the latter to reach it.
+    monkeypatch.setattr(pre_attention_sm120, "_check_common", lambda *_: (rows, device))
+    with pytest.raises(ValueError, match="exactly 9 rows"):
+        minimax_h3_fp8_pre_attention(*args)

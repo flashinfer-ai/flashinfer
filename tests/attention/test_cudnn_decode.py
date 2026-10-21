@@ -1,4 +1,5 @@
 import math
+from functools import partial
 import subprocess
 import sys
 from pathlib import Path
@@ -8,6 +9,14 @@ import torch
 
 import flashinfer
 import flashinfer.cudnn.decode as cudnn_decode
+from flashinfer.cudnn.utils import (
+    cudnn_frontend_accepts_cuda_graph_replay_hint,
+    cudnn_frontend_frost_runtime_available,
+    cudnn_frontend_leads_short_caches,
+    cudnn_frontend_serves_frost_decode,
+)
+from flashinfer.decode import _DECODE_AUTO_CUDNN_ENV
+from flashinfer.utils import get_compute_capability
 
 # The fallback (cubin) decode path is bf16-only and has no lse output; tests
 # exercising fp16 or return_lse need the cuDNN graph backend.
@@ -1299,3 +1308,937 @@ def test_cudnn_decode_standalone_q_len_per_req_matches_wrapper():
             block_tables=wrapper._block_tables,
             q_len_per_req=q_len_per_req,
         )
+
+
+# ------------------------------------------------------------- backend="auto" -> cudnn
+
+
+def _sm100_class():
+    return get_compute_capability(torch.device("cuda:0")) in ((10, 0), (10, 3))
+
+
+def _plan_auto(
+    dtype=torch.bfloat16,
+    kv_layout="HND",
+    num_qo_heads=64,
+    num_kv_heads=8,
+    head_dim=128,
+    batch_size=8,
+    page_size=16,
+    q_len_per_req=4,
+    use_tensor_cores=True,
+    **plan_kwargs,
+):
+    """Plan a backend="auto" decode wrapper; the defaults (64/8 at b=8 with
+    four query rows: 32 rows per CTA, 64 CTAs) sit inside the auto rule's
+    cudnn envelope. Returns (wrapper, run args)."""
+    torch.manual_seed(0)
+    device = "cuda:0"
+    q, kv_cache, indptr, indices, last_page_len = _wrapper_inputs(
+        batch_size,
+        2048,
+        page_size,
+        num_kv_heads,
+        num_qo_heads,
+        head_dim,
+        dtype,
+        kv_layout,
+        device,
+        q_len_per_req=q_len_per_req,
+    )
+    workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, kv_layout, use_tensor_cores=use_tensor_cores, backend="auto"
+    )
+    assert wrapper.resolved_backend != "cudnn"
+    wrapper.plan(
+        indptr,
+        indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        q_len_per_req=q_len_per_req,
+        **plan_kwargs,
+    )
+    args = (
+        q,
+        kv_cache,
+        indptr,
+        indices,
+        last_page_len,
+        page_size,
+        num_kv_heads,
+        num_qo_heads,
+        head_dim,
+        dtype,
+        kv_layout,
+    )
+    return wrapper, args
+
+
+def _lead_plan_name(wrapper):
+    """The cuDNN plan the prepared graph runs: a FROST engine's name starts with
+    ``sdpa_fwd`` (``sdpa_fwd_prefill_sm100[...]``), a backend engine's with ``eng``."""
+    graph = wrapper._cudnn_prepared.graph
+    return graph.get_plan_name_at_index(getattr(graph, "_plan_index", 0))
+
+
+def _auto_cudnn_available():
+    """Whether the no-flag auto rule can resolve to cudnn here: an SM100 / SM103
+    GPU, cudnn-frontend 1.30+, and a CuTe DSL its FROST engines accept."""
+    cc = get_compute_capability(torch.device("cuda:0"))
+    return (
+        cudnn_frontend_serves_frost_decode(cc)
+        and cudnn_frontend_frost_runtime_available()
+    )
+
+
+def _reference(args, q_len_per_req):
+    return _run_wrapper("fa2", *args, q_len_per_req=q_len_per_req)
+
+
+def test_auto_backend_keeps_fa2_on_an_older_frontend(monkeypatch):
+    """auto routes to cudnn only when the installed cudnn-frontend's default
+    SM100 engine serves paged decode (1.30+): an older frontend runs the
+    backend engine, ~8x slower than fa2 on multi-token rows."""
+    monkeypatch.delenv(_DECODE_AUTO_CUDNN_ENV, raising=False)
+    monkeypatch.setattr(
+        flashinfer.decode, "cudnn_frontend_serves_frost_decode", lambda cc: False
+    )
+    wrapper, _ = _plan_auto()
+    assert wrapper.resolved_backend in ("fa2", "fa3")
+
+
+def test_auto_backend_override_zero_keeps_fa2(monkeypatch):
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "0")
+    wrapper, _ = _plan_auto()
+    assert wrapper.resolved_backend in ("fa2", "fa3")
+
+
+@requires_cudnn_graph
+@pytest.mark.parametrize(
+    "num_qo_heads,num_kv_heads,batch_size,q_len_per_req",
+    [(64, 8, 8, 4), (64, 4, 16, 2)],
+)
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+def test_auto_backend_forced_cudnn_matches_fa2(
+    monkeypatch, kv_layout, num_qo_heads, num_kv_heads, batch_size, q_len_per_req
+):
+    """FLASHINFER_DECODE_AUTO_CUDNN=1 applies the auto rule on any frontend: on
+    SM100 the wrapper resolves to cudnn for multi-token rows, also without
+    use_tensor_cores, and matches fa2."""
+    if not _sm100_class():
+        pytest.skip("auto -> cudnn is an SM100 / SM103 rule")
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "1")
+    wrapper, args = _plan_auto(
+        kv_layout=kv_layout,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        batch_size=batch_size,
+        q_len_per_req=q_len_per_req,
+        use_tensor_cores=False,
+    )
+    assert wrapper.resolved_backend == "cudnn"
+    out, lse = wrapper.run(args[0], args[1], return_lse=True)
+    out_ref, lse_ref = _reference(args, q_len_per_req)
+    torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-2)
+
+
+@requires_cudnn_graph
+def test_auto_backend_replan_across_the_envelope_switches_backends(monkeypatch):
+    """The choice is per plan(): one wrapper goes cudnn (four rows) -> fa2 (one
+    row) -> cudnn as the planned q_len_per_req crosses the envelope, and the
+    cudnn side rebinds its per-batch KV-length storage as the batch grows and
+    shrinks."""
+    if not _sm100_class():
+        pytest.skip("auto -> cudnn is an SM100 / SM103 rule")
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "1")
+    wrapper, args = _plan_auto()
+    assert wrapper.resolved_backend == "cudnn"
+    out_first = wrapper.run(args[0], args[1])
+    q, kv_cache, indptr, indices, last_page_len = _wrapper_inputs(
+        8, 2048, 16, 8, 64, 128, torch.bfloat16, "HND", "cuda:0"
+    )
+    wrapper.plan(
+        indptr, indices, last_page_len, 64, 8, 128, 16, q_data_type=torch.bfloat16
+    )
+    assert wrapper.resolved_backend in ("fa2", "fa3")
+    assert wrapper.run(q, kv_cache).shape == (8, 64, 128)
+    indptr, indices, last_page_len = args[2:5]
+    wrapper.plan(
+        indptr,
+        indices,
+        last_page_len,
+        64,
+        8,
+        128,
+        16,
+        q_data_type=torch.bfloat16,
+        q_len_per_req=4,
+    )
+    assert wrapper.resolved_backend == "cudnn"
+    torch.testing.assert_close(wrapper.run(args[0], args[1]), out_first)
+
+    # Auto initially allocates only the first batch's KV-length storage.
+    # Growing must rebind its view, and shrinking must trim the retained buffer.
+    for batch_size in (16, 8):
+        q, kv_cache, indptr, indices, last_page_len = _wrapper_inputs(
+            batch_size, 2048, 16, 8, 64, 128, torch.bfloat16, "HND", "cuda:0", 4
+        )
+        wrapper.plan(
+            indptr,
+            indices,
+            last_page_len,
+            64,
+            8,
+            128,
+            16,
+            q_data_type=q.dtype,
+            q_len_per_req=4,
+        )
+        assert wrapper.resolved_backend == "cudnn"
+        actual, lse = wrapper.run(q, kv_cache, return_lse=True)
+        ref, ref_lse = _run_wrapper(
+            "fa2",
+            q,
+            kv_cache,
+            indptr,
+            indices,
+            last_page_len,
+            16,
+            8,
+            64,
+            128,
+            q.dtype,
+            "HND",
+            q_len_per_req=4,
+        )
+        torch.testing.assert_close(actual, ref, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(lse, ref_lse, rtol=1e-3, atol=1e-2)
+
+
+@requires_cudnn_graph
+@pytest.mark.parametrize(
+    "changes",
+    [
+        dict(q_len_per_req=1),  # single-token decode: backend engine, mixed vs fa2
+        dict(q_len_per_req=2),  # 16 rows per CTA: the tile loses to fa2
+        dict(q_len_per_req=8),
+        dict(batch_size=4),  # 32 CTAs
+        dict(num_qo_heads=96, num_kv_heads=8),  # GLM-4.5 group 12
+        dict(head_dim=64, num_qo_heads=32, num_kv_heads=8),
+        dict(head_dim=256, num_qo_heads=32, num_kv_heads=2, batch_size=32),
+        dict(page_size=24),
+        dict(window_left=128),
+        dict(
+            num_qo_heads=128, num_kv_heads=1, batch_size=64, q_len_per_req=2
+        ),  # 256 rows
+    ],
+)
+def test_auto_backend_gate_keeps_fa2_outside_the_envelope(monkeypatch, changes):
+    if not _sm100_class():
+        pytest.skip("auto -> cudnn is an SM100 / SM103 rule")
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "1")
+    wrapper, _ = _plan_auto(**changes)
+    assert wrapper.resolved_backend in ("fa2", "fa3")
+
+
+@requires_cudnn_graph
+@pytest.mark.parametrize(
+    "q_len_per_req,num_qo_heads,num_kv_heads,batch_size",
+    [(4, 64, 8, 8), (4, 64, 4, 16), (2, 64, 4, 16), (3, 64, 4, 16)],
+)
+def test_auto_backend_resolves_cudnn_on_frontend_1_30(
+    q_len_per_req, num_qo_heads, num_kv_heads, batch_size
+):
+    """No switch, no flag: with cudnn-frontend 1.30+ installed, auto resolves to
+    cudnn on SM100 for multi-token rows inside the envelope, the plan it runs is
+    the frontend's FROST engine (not a backend plan), and it matches fa2 on
+    output and LSE."""
+    if not _auto_cudnn_available():
+        pytest.skip("needs cudnn-frontend 1.30+, its CuTe DSL and an SM100 / SM103 GPU")
+    wrapper, args = _plan_auto(
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        batch_size=batch_size,
+        q_len_per_req=q_len_per_req,
+    )
+    assert wrapper.resolved_backend == "cudnn"
+    out, lse = wrapper.run(args[0], args[1], return_lse=True)
+    out_ref, lse_ref = _reference(args, q_len_per_req)
+    torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-2)
+    # The performance case: the frontend served the graph with its FROST
+    # engine, not with the backend's prefill-class plan.
+    assert _lead_plan_name(wrapper).startswith("sdpa_fwd"), _lead_plan_name(wrapper)
+
+
+@requires_cudnn_graph
+@pytest.mark.parametrize("q_len_per_req", [1, 2, 4])
+@pytest.mark.parametrize("use_tensor_cores", [False, True])
+@pytest.mark.parametrize("caller_block_table", [False, True])
+def test_auto_cudnn_fast_plan_capture_reuses_prepared(
+    monkeypatch, q_len_per_req, use_tensor_cores, caller_block_table
+):
+    """Fast planning must refresh cuDNN metadata, including for captured MTP.
+
+    Exercise the serving pattern that replaces the bound plan method, checks
+    changed sequence lengths, and replays the original capture with poisoned O/LSE.
+    """
+    if not _sm100_class():
+        pytest.skip("auto -> cudnn is an SM100 / SM103 rule")
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "1")
+    torch.manual_seed(73)
+    b, h, hk, d, page = 8, 64, 8, 128, 16
+    q, cache, indptr, indices, last = _wrapper_inputs(
+        b, 128, page, hk, h, d, torch.bfloat16, "HND", "cuda:0", q_len_per_req
+    )
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=q.device)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws,
+        "HND",
+        backend="auto",
+        use_tensor_cores=use_tensor_cores,
+        use_cuda_graph=True,
+        paged_kv_indptr_buffer=torch.empty_like(indptr),
+        paged_kv_indices_buffer=torch.empty_like(indices),
+        paged_kv_last_page_len_buffer=torch.empty_like(last),
+    )
+    kwargs = dict(q_data_type=q.dtype, q_len_per_req=q_len_per_req)
+    table = None
+    if caller_block_table:
+        # As wide as the wrapper's declared-cache bucket: a narrower caller
+        # table keeps fa2 on cudnn-frontend 1.30 (see
+        # test_auto_backend_short_caller_table_keeps_fa2).
+        table = torch.zeros((b, 2048 // page), dtype=torch.int32, device=q.device)
+        offsets = indptr.cpu().tolist()
+        for i in range(b):
+            table[i, : offsets[i + 1] - offsets[i]] = indices[
+                offsets[i] : offsets[i + 1]
+            ]
+    wrapper.plan(indptr, indices, last, h, hk, d, page, block_tables=table, **kwargs)
+    # Multi-token rows without tensor cores have no fa2 kernel: cudnn. With
+    # tensor cores, one row and two rows at 64/8 (16 per CTA) stay on fa2, and
+    # under CUDA graphs without a caller-owned table the auto-built one could
+    # not grow past its captured width, so auto keeps fa2 there as well (see
+    # test_auto_backend_cuda_graph_without_block_tables_keeps_fa2).
+    expect_cudnn = (q_len_per_req > 1 and not use_tensor_cores) or (
+        q_len_per_req == 4 and caller_block_table
+    )
+    if not expect_cudnn:
+        assert wrapper.resolved_backend in ("fa2", "fa3")
+        return
+    assert wrapper.resolved_backend == "cudnn"
+    out, lse = wrapper.run(q, cache, return_lse=True)
+    prepared = wrapper._cudnn_prepared
+    lengths_view = wrapper._cudnn_kv_lens_view
+    assert prepared is not None
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(q, cache, out=out, lse=lse, return_lse=True)
+
+    # Change lengths without changing the page counts or captured geometry.
+    new_last = torch.where(last == page, last - 1, last + 1)
+    wrapper.plan = partial(flashinfer.fast_decode_plan, wrapper)
+    wrapper.plan(
+        indptr,
+        indices,
+        new_last,
+        h,
+        hk,
+        d,
+        page,
+        global_override_indptr_cpu=indptr.cpu(),
+        **kwargs,
+    )
+    assert wrapper.resolved_backend == "cudnn"
+    assert wrapper._cudnn_kv_lens_view is lengths_view
+    wrapper.run(q, cache, out=out, lse=lse, return_lse=True)
+    assert wrapper._cudnn_prepared is prepared
+    if caller_block_table:
+        assert wrapper._block_tables is table
+    ref, ref_lse = _run_wrapper(
+        "fa2",
+        q,
+        cache,
+        indptr,
+        indices,
+        new_last,
+        page,
+        hk,
+        h,
+        d,
+        q.dtype,
+        "HND",
+        q_len_per_req=q_len_per_req,
+    )
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, ref_lse, rtol=1e-3, atol=1e-2)
+
+
+@requires_cudnn_graph
+def test_auto_cudnn_workspace_query_agrees_with_plan(monkeypatch):
+    if not _sm100_class():
+        pytest.skip("auto -> cudnn is an SM100 / SM103 rule")
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "1")
+    wrapper, args = _plan_auto()
+    assert wrapper.resolved_backend == "cudnn"
+    # A fresh query must not return an FA2 size for a cuDNN plan, either
+    # before or after the first plan on the wrapper.
+    fresh = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        wrapper._float_workspace_buffer, "HND", backend="auto", use_tensor_cores=True
+    )
+    _, _, indptr, indices, last, page, hk, h, d, dtype, _ = args
+    for w in (fresh, wrapper):
+        with pytest.raises(NotImplementedError, match="backend 'cudnn'"):
+            w.workspace_size(
+                indptr,
+                indices,
+                last,
+                h,
+                hk,
+                d,
+                page,
+                q_data_type=dtype,
+                q_len_per_req=4,
+            )
+
+
+@requires_cudnn_graph
+def test_auto_backend_cuda_graph_without_block_tables_keeps_fa2(monkeypatch):
+    """Under CUDA graphs the auto-built cuDNN block table is captured at its
+    first width and cannot grow, while fa2 replans inside its preallocated
+    buffers: without a caller-owned ``block_tables`` auto stays on fa2, so a
+    KV range that crosses cuDNN's declared-length bucket after capture keeps
+    working and the captured graph still replays correct results."""
+    if not _sm100_class():
+        pytest.skip("auto -> cudnn is an SM100 / SM103 rule")
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "1")
+    torch.manual_seed(0)
+    device = "cuda:0"
+    b, h, hk, d, page, s_kv = 8, 64, 8, 128, 16, 8192
+    q, cache, indptr, indices, last = _wrapper_inputs(
+        b, s_kv, page, hk, h, d, torch.bfloat16, "HND", device, 4
+    )
+    # The same cache, planned first over the first 512 tokens of every request.
+    small_pages = 512 // page
+    offsets = indptr.tolist()
+    indptr_small = torch.arange(b + 1, dtype=torch.int32, device=device) * small_pages
+    indices_small = torch.cat(
+        [indices[offsets[i] : offsets[i] + small_pages] for i in range(b)]
+    )
+    last_small = torch.full((b,), page, dtype=torch.int32, device=device)
+    ws = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws,
+        "HND",
+        backend="auto",
+        use_tensor_cores=True,
+        use_cuda_graph=True,
+        paged_kv_indptr_buffer=torch.zeros_like(indptr),
+        paged_kv_indices_buffer=torch.zeros_like(indices),
+        paged_kv_last_page_len_buffer=torch.zeros_like(last),
+    )
+    wrapper.plan(
+        indptr_small,
+        indices_small,
+        last_small,
+        h,
+        hk,
+        d,
+        page,
+        q_data_type=q.dtype,
+        q_len_per_req=4,
+    )
+    assert wrapper.resolved_backend in ("fa2", "fa3")
+    out = wrapper.run(q, cache)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(q, cache, out=out)
+    # Grow past the declared-length bucket: the cudnn path could not have, fa2 can.
+    wrapper.plan(
+        indptr, indices, last, h, hk, d, page, q_data_type=q.dtype, q_len_per_req=4
+    )
+    assert wrapper.resolved_backend in ("fa2", "fa3")
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    ref = _run_wrapper(
+        "fa2",
+        q,
+        cache,
+        indptr,
+        indices,
+        last,
+        page,
+        hk,
+        h,
+        d,
+        q.dtype,
+        "HND",
+        q_len_per_req=4,
+    )[0]
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+@requires_cudnn_graph
+def test_auto_backend_cuda_graph_resolution_is_frozen(monkeypatch):
+    """Once a CUDA-graph auto wrapper resolved to cudnn (caller-owned table), a
+    later plan that would resolve to fa2 (table dropped) raises instead of
+    silently leaving the captured cudnn kernels on stale metadata."""
+    if not _sm100_class():
+        pytest.skip("auto -> cudnn is an SM100 / SM103 rule")
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "1")
+    torch.manual_seed(0)
+    device = "cuda:0"
+    b, h, hk, d, page = 8, 64, 8, 128, 16
+    q, cache, indptr, indices, last = _wrapper_inputs(
+        b, 512, page, hk, h, d, torch.bfloat16, "HND", device, 4
+    )
+    offsets = indptr.tolist()
+    table = torch.zeros((b, 2048 // page), dtype=torch.int32, device=device)
+    for i in range(b):
+        table[i, : offsets[i + 1] - offsets[i]] = indices[offsets[i] : offsets[i + 1]]
+    ws = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws,
+        "HND",
+        backend="auto",
+        use_tensor_cores=True,
+        use_cuda_graph=True,
+        paged_kv_indptr_buffer=torch.zeros_like(indptr),
+        paged_kv_indices_buffer=torch.zeros_like(indices),
+        paged_kv_last_page_len_buffer=torch.zeros_like(last),
+    )
+    wrapper.plan(
+        indptr,
+        indices,
+        last,
+        h,
+        hk,
+        d,
+        page,
+        q_data_type=q.dtype,
+        q_len_per_req=4,
+        block_tables=table,
+    )
+    assert wrapper.resolved_backend == "cudnn"
+    wrapper.run(q, cache)
+    with pytest.raises(ValueError, match="frozen cudagraph shape"):
+        wrapper.plan(
+            indptr, indices, last, h, hk, d, page, q_data_type=q.dtype, q_len_per_req=4
+        )
+
+
+@requires_cudnn_graph
+def test_auto_backend_fast_plan_reevaluates_per_plan(monkeypatch):
+    """fast_decode_plan applies the per-plan auto rule too: an auto wrapper
+    that first resolved to fa2 (one row) moves to cudnn when a later plan
+    enters the envelope (four rows), leaves it again (two rows: 16 per CTA)
+    and comes back, matching fa2 at every step."""
+    if not _sm100_class():
+        pytest.skip("auto -> cudnn is an SM100 / SM103 rule")
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "1")
+    wrapper, args = _plan_auto(q_len_per_req=1)
+    assert wrapper.resolved_backend in ("fa2", "fa3")
+    wrapper.run(args[0], args[1])
+    for q_len_per_req, expect_cudnn in ((4, True), (2, False), (4, True)):
+        q, cache, indptr, indices, last = _wrapper_inputs(
+            8, 2048, 16, 8, 64, 128, torch.bfloat16, "HND", "cuda:0", q_len_per_req
+        )
+        flashinfer.fast_decode_plan(
+            wrapper,
+            indptr,
+            indices,
+            last,
+            64,
+            8,
+            128,
+            16,
+            q_data_type=q.dtype,
+            q_len_per_req=q_len_per_req,
+        )
+        assert (wrapper.resolved_backend == "cudnn") is expect_cudnn
+        out, lse = wrapper.run(q, cache, return_lse=True)
+        ref, ref_lse = _run_wrapper(
+            "fa2",
+            q,
+            cache,
+            indptr,
+            indices,
+            last,
+            16,
+            8,
+            64,
+            128,
+            q.dtype,
+            "HND",
+            q_len_per_req=q_len_per_req,
+        )
+        torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(lse, ref_lse, rtol=1e-3, atol=1e-2)
+
+
+@requires_cudnn_graph
+@pytest.mark.parametrize("table_tokens,expect_cudnn", [(512, False), (2048, True)])
+def test_auto_backend_short_caller_table_keeps_fa2(
+    monkeypatch, table_tokens, expect_cudnn
+):
+    """A caller-owned block table declares its own cache length to cuDNN. Below
+    2048 tokens cudnn-frontend 1.30 ranks the backend's prefill-class engine
+    ahead of the decode tile for multi-token rows (~8x fa2), so auto keeps fa2
+    there; a table as wide as the bucket takes cudnn."""
+    if not _sm100_class():
+        pytest.skip("auto -> cudnn is an SM100 / SM103 rule")
+    if cudnn_frontend_leads_short_caches():
+        pytest.skip(
+            "this cudnn-frontend ranks the decode tile first at every cache length"
+        )
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "1")
+    torch.manual_seed(0)
+    device = "cuda:0"
+    b, h, hk, d, page = 8, 64, 8, 128, 16
+    q, cache, indptr, indices, last = _wrapper_inputs(
+        b, 512, page, hk, h, d, torch.bfloat16, "HND", device, 4
+    )
+    offsets = indptr.tolist()
+    table = torch.zeros((b, table_tokens // page), dtype=torch.int32, device=device)
+    for i in range(b):
+        table[i, : offsets[i + 1] - offsets[i]] = indices[offsets[i] : offsets[i + 1]]
+    ws = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws, "HND", backend="auto", use_tensor_cores=True
+    )
+    wrapper.plan(
+        indptr,
+        indices,
+        last,
+        h,
+        hk,
+        d,
+        page,
+        q_data_type=q.dtype,
+        q_len_per_req=4,
+        block_tables=table,
+    )
+    assert (wrapper.resolved_backend == "cudnn") is expect_cudnn
+    out, lse = wrapper.run(q, cache, return_lse=True)
+    ref, ref_lse = _run_wrapper(
+        "fa2",
+        q,
+        cache,
+        indptr,
+        indices,
+        last,
+        page,
+        hk,
+        h,
+        d,
+        q.dtype,
+        "HND",
+        q_len_per_req=4,
+    )
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, ref_lse, rtol=1e-3, atol=1e-2)
+
+
+def test_auto_backend_keeps_fa2_without_the_frost_runtime(monkeypatch):
+    """A frontend new enough on paper whose FROST engines cannot run (CuTe DSL
+    below its floor, as the packages' dependency metadata allow) would serve the
+    graph with the backend engine: auto keeps fa2. The ``1`` override still
+    applies the rule (benchmarking), and multi-token rows without tensor cores,
+    which have no fa2 kernel, still go to cudnn."""
+    if not _auto_cudnn_available():
+        pytest.skip("needs cudnn-frontend 1.30+, its CuTe DSL and an SM100 / SM103 GPU")
+    monkeypatch.setattr(
+        flashinfer.decode, "cudnn_frontend_frost_runtime_available", lambda: False
+    )
+    wrapper, args = _plan_auto()
+    assert wrapper.resolved_backend in ("fa2", "fa3")
+    out, lse = wrapper.run(args[0], args[1], return_lse=True)
+    out_ref, lse_ref = _reference(args, 4)
+    torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-2)
+    wrapper, _ = _plan_auto(use_tensor_cores=False)
+    assert wrapper.resolved_backend == "cudnn"
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "1")
+    wrapper, _ = _plan_auto()
+    assert wrapper.resolved_backend == "cudnn"
+
+
+@requires_cudnn_graph
+@pytest.mark.parametrize(
+    "control",
+    [{"fixed_split_size": 128}, {"disable_split_kv": True}],
+    ids=["fixed", "nosplit"],
+)
+def test_auto_backend_split_controls_keep_fa2_batch_invariant(control):
+    """fa2's explicit split controls are its batch-invariance contract: a request
+    produces the same bits whatever else is in the batch. auto must not trade
+    that for cuDNN: with either control the plan stays on fa2 (where the same
+    shape without them resolves to cudnn), and the first four requests of a
+    b=8 batch match the b=4 batch of those requests bitwise, on O and LSE."""
+    if not _auto_cudnn_available():
+        pytest.skip("needs cudnn-frontend 1.30+, its CuTe DSL and an SM100 / SM103 GPU")
+    torch.manual_seed(0)
+    device = "cuda:0"
+    h, hk, d, page, qlen = 64, 8, 128, 16, 4
+    q8, cache, indptr8, indices8, last8 = _wrapper_inputs(
+        8, 2048, page, hk, h, d, torch.bfloat16, "HND", device, qlen
+    )
+    n4 = int(indptr8[4])
+    q4 = q8[: 4 * qlen]
+    indptr4, indices4, last4 = (
+        indptr8[:5].clone(),
+        indices8[:n4].clone(),
+        last8[:4].clone(),
+    )
+
+    def plan_auto(indptr, indices, last, **extra):
+        ws = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            ws, "HND", backend="auto", use_tensor_cores=True
+        )
+        wrapper.plan(
+            indptr,
+            indices,
+            last,
+            h,
+            hk,
+            d,
+            page,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+            q_len_per_req=qlen,
+            **extra,
+        )
+        return wrapper
+
+    # The premise: without the control the b=8 plan is inside the cudnn envelope.
+    assert plan_auto(indptr8, indices8, last8).resolved_backend == "cudnn"
+    w8 = plan_auto(indptr8, indices8, last8, **control)
+    w4 = plan_auto(indptr4, indices4, last4, **control)
+    assert w8.resolved_backend in ("fa2", "fa3") and w4.resolved_backend in (
+        "fa2",
+        "fa3",
+    )
+    out8, lse8 = w8.run(q8, cache, return_lse=True)
+    out4, lse4 = w4.run(q4, cache, return_lse=True)
+    assert torch.equal(out8[: 4 * qlen], out4)
+    assert torch.equal(lse8[: 4 * qlen], lse4)
+    # workspace_size agrees with plan: fa2's sizes, not cudnn's refusal.
+    sizes = w8.workspace_size(
+        indptr8,
+        indices8,
+        last8,
+        h,
+        hk,
+        d,
+        page,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        q_len_per_req=qlen,
+        **control,
+    )
+    assert isinstance(sizes, tuple) and len(sizes) == 2
+
+
+def _caller_block_table(indptr, indices, page_size, min_tokens=2048):
+    """A caller-owned block table, at least the wrapper's declared-cache bucket wide."""
+    batch_size = indptr.numel() - 1
+    pages = int((indptr[1:] - indptr[:-1]).max())
+    table = torch.zeros(
+        (batch_size, max(pages, min_tokens // page_size)),
+        dtype=torch.int32,
+        device=indices.device,
+    )
+    offsets = indptr.cpu().tolist()
+    for i in range(batch_size):
+        table[i, : offsets[i + 1] - offsets[i]] = indices[offsets[i] : offsets[i + 1]]
+    return table
+
+
+@pytest.mark.parametrize("frontend_accepts", [True, False])
+def test_cudnn_wrapper_cuda_graph_passes_the_replay_hint(monkeypatch, frontend_accepts):
+    """A ``use_cuda_graph=True`` cudnn wrapper declares CUDA-graph replay to
+    cudnn-frontend (1.31+ takes ``is_cuda_graph_replay_expected``): the built
+    graph carries the hint and the prepared key differs from an eager wrapper's,
+    so neither serves the other. On the d256 serving shape (32/2 at b=32 over
+    4096 keys) the frontend's leading plan then splits KV where the eager graph
+    does not; both match, and the hinted graph captures and replays. On a
+    frontend without the keyword (here: the probe says no) the graph is built
+    without it and nothing else changes."""
+    if not _auto_cudnn_available():
+        pytest.skip("needs cudnn-frontend 1.30+, its CuTe DSL and an SM100 / SM103 GPU")
+    if frontend_accepts and not cudnn_frontend_accepts_cuda_graph_replay_hint():
+        pytest.skip(
+            "needs a cudnn-frontend whose pygraph takes is_cuda_graph_replay_expected (1.31+)"
+        )
+    if not frontend_accepts:
+        monkeypatch.setattr(
+            cudnn_decode, "cudnn_frontend_accepts_cuda_graph_replay_hint", lambda: False
+        )
+    torch.manual_seed(0)
+    device = "cuda:0"
+    # Distinct shapes per case: the graph cache keys on the replay flag, not on
+    # whether the frontend was handed the hint.
+    b = 32 if frontend_accepts else 4
+    h, hk, d, page, s_kv = 32, 2, 256, 16, 4096
+    q, cache, indptr, indices, last = _wrapper_inputs(
+        b, s_kv, page, hk, h, d, torch.bfloat16, "HND", device
+    )
+    plan_kwargs = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
+    eager = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device),
+        "HND",
+        backend="cudnn",
+    )
+    eager.plan(indptr, indices, last, h, hk, d, page, **plan_kwargs)
+    out_eager = eager.run(q, cache)
+    captured = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device),
+        "HND",
+        backend="cudnn",
+        use_cuda_graph=True,
+        paged_kv_indptr_buffer=torch.empty_like(indptr),
+        paged_kv_indices_buffer=torch.empty_like(indices),
+        paged_kv_last_page_len_buffer=torch.empty_like(last),
+    )
+    captured.plan(
+        indptr,
+        indices,
+        last,
+        h,
+        hk,
+        d,
+        page,
+        block_tables=_caller_block_table(indptr, indices, page),
+        **plan_kwargs,
+    )
+    out_captured = captured.run(q, cache)  # warm-up builds the graph outside capture
+    g_eager = eager._cudnn_prepared.graph
+    g_captured = captured._cudnn_prepared.graph
+    assert getattr(g_eager, "is_cuda_graph_replay_expected", False) is False
+    assert (
+        bool(getattr(g_captured, "is_cuda_graph_replay_expected", False))
+        is frontend_accepts
+    )
+    assert eager._cudnn_prepared.key != captured._cudnn_prepared.key
+    torch.testing.assert_close(out_captured, out_eager, rtol=1e-2, atol=1e-2)
+    out = torch.empty_like(q)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured.run(q, cache, out=out)
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, out_eager, rtol=1e-2, atol=1e-2)
+    if (
+        frontend_accepts
+        and hasattr(g_captured, "plans")
+        and hasattr(g_captured, "_plan_index")
+    ):
+        # The hinted graph's leading plan is the GPU-time optimum: at 64 units
+        # over 4096 keys the decode tile splits KV, which the eager-safe lead
+        # does not (split 2 vs 1 on a 148-SM part; the model is SM-count aware).
+        split = lambda g: g.plans[g._plan_index].knobs.split_kv  # noqa: E731
+        assert split(g_captured) >= split(g_eager), (split(g_eager), split(g_captured))
+        if torch.cuda.get_device_properties(0).multi_processor_count == 148:
+            assert (split(g_eager), split(g_captured)) == (1, 2)
+
+
+@pytest.mark.parametrize(
+    "num_qo_heads,num_kv_heads,batch_size", [(32, 4, 32), (64, 8, 12), (16, 4, 64)]
+)
+def test_auto_backend_resolves_cudnn_for_single_token_d256(
+    num_qo_heads, num_kv_heads, batch_size
+):
+    """Single-token head_dim-256 GQA decode inside the d256 band (128 / 96 / 256
+    CTAs) resolves to cudnn on SM100 with cudnn-frontend 1.30+ and matches fa2
+    on output and LSE."""
+    if not _auto_cudnn_available():
+        pytest.skip("needs cudnn-frontend 1.30+, its CuTe DSL and an SM100 / SM103 GPU")
+    wrapper, args = _plan_auto(
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=256,
+        batch_size=batch_size,
+        q_len_per_req=1,
+    )
+    assert wrapper.resolved_backend == "cudnn"
+    out, lse = wrapper.run(args[0], args[1], return_lse=True)
+    out_ref, lse_ref = _reference(args, 1)
+    torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-2)
+
+
+def test_auto_backend_d256_band_starts_lower_under_cuda_graph_replay():
+    """64 CTAs of single-token d256 (32/4 at b=16) stay on fa2 for an eager
+    wrapper (the unsplit decode tile loses at 4k) but go to cudnn under
+    use_cuda_graph=True with a caller-owned block table on a frontend that takes
+    the replay hint (1.31+, the tile then splits KV); without that frontend the
+    CUDA-graph wrapper keeps fa2 too."""
+    if not _auto_cudnn_available():
+        pytest.skip("needs cudnn-frontend 1.30+, its CuTe DSL and an SM100 / SM103 GPU")
+    torch.manual_seed(0)
+    b, h, hk, d, page = 16, 32, 4, 256, 16
+    q, cache, indptr, indices, last = _wrapper_inputs(
+        b, 4096, page, hk, h, d, torch.bfloat16, "HND", "cuda:0"
+    )
+    plan_kwargs = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
+    eager = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=q.device),
+        "HND",
+        backend="auto",
+    )
+    eager.plan(indptr, indices, last, h, hk, d, page, **plan_kwargs)
+    assert eager.resolved_backend in ("fa2", "fa3")
+    captured = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=q.device),
+        "HND",
+        backend="auto",
+        use_cuda_graph=True,
+        paged_kv_indptr_buffer=torch.empty_like(indptr),
+        paged_kv_indices_buffer=torch.empty_like(indices),
+        paged_kv_last_page_len_buffer=torch.empty_like(last),
+    )
+    captured.plan(
+        indptr,
+        indices,
+        last,
+        h,
+        hk,
+        d,
+        page,
+        block_tables=_caller_block_table(indptr, indices, page, min_tokens=4096),
+        **plan_kwargs,
+    )
+    if not cudnn_frontend_accepts_cuda_graph_replay_hint():
+        assert captured.resolved_backend in ("fa2", "fa3")
+        return
+    assert captured.resolved_backend == "cudnn"
+    out_ref, lse_ref = _run_wrapper(
+        "fa2", q, cache, indptr, indices, last, page, hk, h, d, torch.bfloat16, "HND"
+    )
+    out = torch.empty_like(q)
+    lse = torch.empty(b, h, dtype=torch.float32, device=q.device)
+    captured.run(q, cache, out=out, lse=lse, return_lse=True)  # builds the graph
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured.run(q, cache, out=out, lse=lse, return_lse=True)
+    out.zero_()
+    lse.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-2)
+    assert captured._cudnn_prepared.graph.is_cuda_graph_replay_expected is True

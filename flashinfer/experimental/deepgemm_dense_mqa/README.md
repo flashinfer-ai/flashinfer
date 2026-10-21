@@ -2,24 +2,51 @@
 
 `from flashinfer.dense_mqa import prepare_dense_mqa_logits` prepares the dense
 DeepSeek-V3.2 lightning-indexer (`logits[q, k] = sum_h relu(Q[q,h] . KV[k]) * w[q,h]`
-inside each query's `[start, end)` window, `-inf` elsewhere) on SM100a (148 SMs) and
-SM103a (152 SMs). Each prepared call returns a plan; `plan.run()` submits on the current
-PyTorch stream and returns the logical `[Q, K]` view of the FP32 output.
+inside each query's `[start, end)` window, `-inf` elsewhere) on SM100a and SM103a. Each
+prepared call returns a plan; `plan.run()` submits on the current PyTorch stream and
+returns the logical `[Q, K]` view of the FP32 output.
 
-The exported routes use 32 heads and D = 128 for FP4 (packed E2M1 with UE8M0 scales per
-32 channels) and FP8 (E4M3 with one FP32 scale per KV token) inputs at Q in {1, 16, 128}
-with K in {4096, 32768, 131072} plus Q = 16 with K = 1048576. Every route generates the
-DeepGEMM-compatible schedule metadata (per-SM work headers and per-query-block spans) and
-consumes it in the same submission: most routes are a metadata program followed by the
-fused logits/cleanup program; the FP8 single-query rows and the FP8 Q = 128, K = 4096 row
-produce the metadata inside the logits launch.
+The generated programs use 32 heads and D = 128 for FP4 (packed E2M1 with UE8M0 scales
+per 32 channels) and FP8 (E4M3 with one FP32 scale per KV token) inputs. Any query count
+`1 <= Q <= max_queries()` is accepted; the KV length `K` must satisfy the served route record's
+K rule for the device's architecture (`kv_min`, `kv_alignment[arch]`: a multiple of 256 for FP4 and
+for the two-stage FP8 routes except where the catalog publishes 1, any `K >= 1` on the fused
+`fp8:qle128:short` and `fp8:qle2048:short` routes);
+the query count and the KV length are runtime arguments and every program takes the launch
+grid of the logits consumers (the device's SM count) as the compile-line definition
+`SM_COUNT`, so one program text per physical schedule serves both architectures and every
+SM count (one JIT build per device SM count). The schedule
+metadata producer is specialised on a query ceiling (tiers `le16`, `le128`, `le2048`,
+`any`), which bounds its prefix arrays and boundary search at compile time; a route name
+carries the tier of its query count. Routes are chosen from host-known scalars only. A
+32-head call takes ONE logits launch that computes the schedule in-kernel (a `:short`
+route) while its KV length is within the catalog policy's bound for its class: the fused
+single-query chain (`Q = 1`, `fused_q1_max_kv` / `fp4.fused_q1_max_kv`), the FP8 `Q = 128`
+text (`fused_q128_max_kv`), or -- on the overlap tier of the query count (`le128`:
+`1 < Q <= 128`, `le2048`: `128 < Q <= 2048`) -- the first of the two single-launch families
+in `policy.single_launch_precedence[arch][tier]` whose own bound admits the call: `le_class`,
+the scan class of the query count -- the smallest `fused_scan_ceilings` entry (query blocks
+of 4) covering `ceil(Q / 4)`, served while `K <= fused_scan<ceiling>_max_kv` of that class:
+FP8 `le32` (warp scan, `1 < Q < 128`) / `le768` (CTA scan, `128 < Q <= 3072`) qualified by
+`full` / `partial` block kind, FP4 `le32` / `le1024` (`1 < Q <= 4096`) -- or `qle`, the fused
+tiered texts `fp8:qle128:short` (`1 < Q <= 128`, `K <= fused_qle128_max_kv`) and
+`fp8:qle2048:short` (`128 < Q <= 2048`, `K <= policy.fused_qle2048_max_kv[arch]` -- 34048 on
+sm_100a, 65536 on sm_103a, the one per-architecture bound; every CTA recomputes the tiered
+schedule). The published order is `["qle", "le_class"]` on both tiers and both architectures
+(the fused tiered text while `K` is within its bound, the scan class of the query count above
+it -- the order the paired measurement adopted; `["le_class", "qle"]` would restore the v9
+routing; a device whose bound the K exceeds is served the next family or the two-launch tier
+route of the same query count). Above every bound the call runs the metadata program followed by the
+logits program (FP4 in one prepared submission; FP8 as two submissions, a `Q % 4 != 0` tail
+using the partial-block logits program). Their cost partition and metadata offsets fold on
+the compile-line SM count exactly as in the shipped kernels.
 
 `prepare_dense_mqa_logits(precision, q, kv, weights, starts, ends, q_scales=None,
 kv_scales=None, output=None, metadata=None)` binds FP4 `q` uint8/int8 `[Q, 32, 64]`,
 `kv` `[K, 64]`, `q_scales` uint8 `[Q, 32, 4]`, `kv_scales` uint8 `[K, 4]` and FP32 weights
 `[Q, 32]`, or FP8 `q` E4M3 `[Q_storage, 32, 128]` with `Q_storage >= max(4, Q)`, `kv`
 `[K, 128]`, `kv_scales` FP32 `[K]` and FP32 weights `[Q_storage, 32]`. `starts`/`ends` are
-int32 `[Q]` with `0 <= start <= end <= K`; K is a multiple of 256. The output is FP32
+int32 `[Q]` with `0 <= start <= end <= K`. The output is FP32
 `[Q, logits_stride(K)]` with `logits_stride(K) = align(K + 256, 8)`; consume
 `plan.logical_output` (`output[:, :K]`). Every cell of the padded output is written by each
 submission, and for FP4 the output storage must include the final four-row query tile
@@ -30,9 +57,13 @@ or tensor identities change. Do not use one plan's output/metadata concurrently 
 different streams.
 
 Generated CUDA and bindings live in `csrc/experimental/deepgemm_dense_mqa/generated`
-(one directory per architecture). The runtime and the per-architecture route catalog are in
-this directory. The public API is `flashinfer/dense_mqa.py`; see
-`examples/experimental/dense_mqa.py`. Build/install FlashInfer with its supported CUDA
+(one device/binding pair per program text, shared by both architectures; the paged `p32`/`p64`
+and `n1`/`n2` programs of one head count and scheduler are one text built with the compile-line
+definitions `K_BLOCK_KV` and `K_NEXT_N` that their catalog records fix in `fixed_definitions`; each definition
+set keeps the kernel symbol and host-shim namespace of the program it replaced through the text's
+`CAKE_PROGRAM_KERNEL` / `CAKE_PROGRAM_SHIM` ladder, so every JIT module exports its own symbols). The runtime and the
+program/route catalog are in this directory. The public API is `flashinfer/dense_mqa.py`;
+see `examples/experimental/dense_mqa.py`. Build/install FlashInfer with its supported CUDA
 toolchain before running:
 
 ```bash
@@ -40,11 +71,211 @@ python examples/experimental/dense_mqa.py
 pytest tests/experimental/test_dense_mqa_generated.py -q
 ```
 
-The test covers all twenty routes of the present architecture against the DeepGEMM oracle
-(values within the original FP4/FP8 tolerances, the FP4 cosine-distance gate, the `-inf`
-mask, exact schedule metadata) on a non-default stream and under changed-input graph
-replay; it skips on devices without catalogued programs or SM counts. Performance
-qualification measures the complete prepared submission with prepacked inputs over the
-twenty model rows. Per-row exported execution must remain within 3% of its source route.
-Performance results accompany the generated bundle; preparation is excluded from both
-timed arms.
+The test covers the twenty model rows (Q in {1, 16, 128} x K in {4096, 32768, 131072}
+plus Q = 16 with K = 1048576, FP4 and FP8) and rows outside that table against a PyTorch
+reference (values within the FP4/FP8 tolerances, the FP4 cosine-distance gate, the `-inf`
+mask, exact schedule metadata against a scalar specification of the DeepGEMM schedule) on
+a non-default stream and under changed-input graph replay; DeepGEMM is used as an
+additional oracle when its build exposes the dense MQA logits API. The test skips on devices without catalogued
+programs.
+
+## DeepGEMM-signature entries (ragged prefill and paged decode)
+
+Two further public entries mirror the `deep_gemm` calls that DeepSeek-V3.2 serving engines make, so a
+caller switches backends without re-shaping its tensors:
+
+```python
+from flashinfer.dense_mqa import fp8_mqa_logits
+logits = fp8_mqa_logits(q, (kv, kv_scales), weights, ks, ke, clean_logits=False)   # f32 [Q, K]
+
+from flashinfer.paged_mqa import (get_paged_mqa_logits_metadata, fp8_paged_mqa_logits, prepare_paged_mqa_logits,
+                                  prepare_paged_mqa_schedule_meta)
+meta = get_paged_mqa_logits_metadata(context_lens_2d, 64, num_sms)                 # int32 [num_sms + 1, 2] placeholder, no launch
+logits = fp8_paged_mqa_logits(q, kv_cache, weights, context_lens_2d, block_table, meta, max_context_len)  # one launch (default path)
+plan = prepare_paged_mqa_logits(q, kv_cache, weights, context_lens_2d, block_table, max_context_len)
+# optional table path: ONE producer launch per forward writes the schedule table the admitted static programs read
+sched = prepare_paged_mqa_schedule_meta(context_lens_2d, num_sms=num_sms)          # int32 [num_sms + 1, 2] table, nothing launched yet
+sched.run()                                                                        # one launch; rerun after context_lens_2d changes
+logits = fp8_paged_mqa_logits(q, kv_cache, weights, context_lens_2d, block_table, sched, max_context_len)  # one launch
+plan_t = prepare_paged_mqa_logits(q, kv_cache, weights, context_lens_2d, block_table, max_context_len, schedule_meta=sched)
+plan_t.schedule_meta_used                                                          # True inside the catalog's sched_meta_windows
+```
+
+`fp8_mqa_logits` takes E4M3 `q [Q, H, 128]` with `H` in the catalog's `policy["heads"]`, `kv` as the
+pair `(E4M3 [K, 128], FP32 scales [K])`, FP32 `weights [Q, H]` and int32 `ks` / `ke [Q]`
+(`0 <= ks <= ke <= K`); it returns the `[Q, K]` view of a `[align(Q, 128 / H), logits_stride(K)]` FP32
+buffer it allocates (row stride a multiple of 8 elements). Every cell of that buffer is written
+(`-inf` outside each row's window), so `clean_logits` changes nothing and is accepted for signature
+parity only; `max_seqlen_k` must be 0. Rows below the query block (`Q < 128 / H`) are padded by the
+entry. Which `(H, Q, K)` points have programs is a catalog property: `dense_route_available(H, Q, K)`
+answers it on the host (32 heads: `K >= kv_min` and a multiple of the served route record's `kv_alignment` for the
+device's architecture -- 256 for FP4, 256 or 1 per FP8 route and architecture as the catalog publishes it; pass
+`arch=device_arch(device)`, without it the architectures must agree -- and `Q <= max_queries()`; the 64-head routes --
+any `K >= 1`, any `Q`, `max_queries(64)` is `None` -- join as they are exported). The 64-head family is
+published per tier and per architecture: `dense_admission(arch)` returns the admitted `fp8:h64:*` routes, the
+withheld tier names and the producer's reason for that arch (`policy["dense_admission"]`, keyed by arch;
+`dense_admission()` gives every arch); a route withheld on an arch is not served there even when its record
+exists for another arch, so `dense_route_available(H, Q, K, arch=device_arch(device))` is `False` and the
+engine keeps its stock kernel -- except for the 64-head `:short` one-split routes, whose withheld calls are served
+by the tier route of the query count, and the 64-head `:kvsplit` in-kernel KV-split routes, whose withheld calls are
+served by the grid-stride `q1` / tier route of the query count (`served_route`; `dense_route_available` stays `True`
+there). Without `arch` the call answers only where the architectures agree and raises
+`ValueError` otherwise (no silent admit). `tests/experimental/test_dense_mqa_admission.py` pins this
+contract, host-only.
+
+The paged entries read the fused DeepGEMM cache layout in place: `kv_cache` uint8
+`[pages, block_kv, 1, 132]` (`block_kv` FP8 rows of 128 then `block_kv` FP32 scales per page), E4M3
+`q [B, next_n, H, 128]`, FP32 `weights [B * next_n, H]`, int32 `context_lens [B, next_n]` (two-dimensional;
+the schedule is sized from each request's last token, every token masks with its own length), int32
+`block_table [B, S]` with unit column stride (any row stride). Every logits call is ONE kernel launch on
+either of two paths. Default path: the logits program derives its (request, KV split) walk in-kernel from
+`context_lens` and the CTA budget, so `get_paged_mqa_logits_metadata` launches nothing and returns a
+`[num_sms + 1, 2]` placeholder that `fp8_paged_mqa_logits` accepts for DeepGEMM signature parity (`None`
+is accepted too; neither is read). Table path (opt-in): `prepare_paged_mqa_schedule_meta(context_lens,
+num_sms=)` returns a `PagedScheduleMetaPlan`; its `run()` is ONE launch of the catalogued one-CTA producer
+(`policy.paged.sched_meta`, version by batch and CTA budget) writing the int32 `[num_sms + 1, 2]` table
+`plan.table`. Passing that plan as `schedule_meta` makes a logits plan whose default route is the plain
+static route and whose call lies inside the catalog's `sched_meta_windows` serve the route's `:table`
+program (`policy.paged.sched_meta.consumer_routes`), which reads its walk bounds from the table instead of
+deriving them (bit-identical logits; `plan.schedule_meta_used` True); every other call keeps the default
+program (`schedule_meta_used` False). Run the meta plan before every logits launch whose `context_lens`
+contents changed, on the same `context_lens` tensor and CTA budget as the logits plan (a mismatch
+raises). The result is the
+`[B * next_n, max_context_len]` view of a `[B * next_n, paged_logits_stride(max_context_len)]` FP32
+buffer (`align(align(max_context_len, 256), 256)` elements per row, DeepGEMM's 1024-byte rule) with
+DeepGEMM's `clean_logits=False` semantics with one strictly-safer deviation: inside each request's
+computed aligned range (`ceil(ctx_last / 256) * 256` columns) positions at or past the row's own length
+are exact `-inf` where DeepGEMM writes finite don't-care values; columns beyond that range are left
+untouched in both;
+`clean_logits=True` is rejected as it is for two-dimensional context lengths in DeepGEMM. Any batch
+size is accepted (no `B <= num_sms` chunking is required). `paged_route_available(H, block_kv, next_n)`
+reports whether the catalog carries the `(H, block_kv, next_n)` program; `prepare_paged_mqa_logits`
+returns a `PagedMqaPlan` whose `run()` submits the logits program (one launch) on the current stream
+without allocating (CUDA Graph replay with changed contents is supported, on the table path as the pair
+`meta.run(); plan.run()`; `plan.logical_output`, `plan.schedule_meta`, `plan.schedule_meta_used`).
+
+Tests: `tests/experimental/test_dense_mqa_generated.py` (dense, including the one-shot entry) and
+`tests/experimental/test_paged_mqa_generated.py` (paged; skips while the catalog has no paged routes).
+
+## Catalog schema `dense_mqa.v11` (route records)
+
+`dense_mqa_catalog.json` carries `policy`, `programs`, the dense `routes` and the paged
+`paged_routes`. Policy keys: `heads` (exported head counts), `block_q` (`{"32": 4, "64": 2}`),
+`kv_alignment` (-- v10 -- keyed by precision then head count, `{"fp4": {"32": 256}, "fp8": {"32": 256 | 1, "64": 1}}`:
+the divisor the KV length must satisfy on those routes by default; 1 where the programs handle the KV tail in-kernel --
+the 64-head programs, and the FP8 32-head programs once the producer publishes their global any-K rule; the FP4 32-head
+programs keep 256 -- each route record refines it per architecture, see below), `max_q_blocks` and `metadata_tier_blocks` (`[4, 32, 512, null]`: the
+query-block ceilings of the 32-head metadata programs, named per head count by their token ceiling, so the
+32-head tiers are `le16 / le128 / le2048 / any` and the 64-head tier names `le8 / le64 / le1024 / any`
+are aliases -- the 64-head routes have no metadata stage and no query bound),
+the shipped 32-head `fused_q1_max_kv` / `fused_q128_max_kv`, -- v9 -- the FP8
+in-kernel scan classes `fused_scan_ceilings` (`[32, 768]` query blocks) with one KV bound each
+(`fused_scan32_max_kv`, `fused_scan768_max_kv`) and the `fp4` block (`fused_q1_max_kv`, `fused_scan_ceilings`
+`[32, 1024]`, `fused_scan32_max_kv`, `fused_scan1024_max_kv`) that bound the single-launch 32-head routes, -- v10 --
+`fused_qle128_max_kv` (the KV bound of the single-launch fused `fp8:qle128:short` route: `1 < Q <= 128`),
+`fused_qle2048_max_kv` (the KV bound of the single-launch fused `fp8:qle2048:short` route: `128 < Q <= 2048`; a
+PER-ARCHITECTURE map `{"sm_100a": 34048, "sm_103a": 65536}` -- the logical `route_name` applies the most permissive
+bound, `served_route` the device's own) and `single_launch_precedence` (per architecture and overlap tier `le128` /
+`le2048`, the consultation order of the two single-launch families `le_class` / `qle`; a reader must know every key --
+the schema version carries them together), and
+`paged` (`heads` -- the paged head counts, independent of the dense `heads`; `block_kv`, `split_kv`,
+`next_n_atoms` -- 1 for every exported `next_n`, the logits programs iterate the atoms in-kernel;
+`max_batch`, `metadata_program`, `admission` -- per architecture and route the ordered boxes a call must lie in to be served:
+`[max_batch, max_context_len]` (the box from batch 1) or, since the round-4 coverage-box adoption, `[min_batch, max_batch, max_context_len]`
+(an explicit lower batch bound, `min_batch >= 2`; the entry forms are distinguished by shape like the `static_windows` forms, read by
+`paged_admission_rule_bounds`); a route absent on an architecture is unbounded there; admitted iff some box has `min_batch <= batch <=
+max_batch` and `max_context_len <= max_context_len` (`null` = unbounded) -- `dynamic_scheduler` -- `max_batch`, the static -> dynamic route map and
+-- v8 -- `static_windows`: per architecture and static route the `[max_batch, max_context_len]` windows inside which the runtime
+keeps the static program for a batch the dynamic route would otherwise take; -- v10 -- an entry may also be
+`[min_batch, max_batch, max_context_len]`, a window that applies from `min_batch` upward only, or
+`[min_batch, max_batch, min_context_len, max_context_len]`, a window that applies from `min_context_len` upward as well;
+`static_window_routes`: per architecture and static route the `[window, route]` pairs of the windows that select a TEXT of
+the static program instead of the static route itself -- `paged:fp8:h64:p64:n2:hyb8c4` for the sm_100a window
+`[256, 256, 43008, 169728]`, the static program with a hybrid tail pool (its own program, catalogued for sm_100a only; a reader
+must know every key); `sched_state`: per such route `{base_words, words_per_sm, max_sms}`, the scheduler-state words its program
+binds -- `base_words + words_per_sm * num_sms` with `num_sms <= max_sms`; routes absent keep the `u32[2]` state); -- v11 -- `rect` (`routes`: the static -> rectangle-scheduled route map
+`paged:fp8:h<H>:p<page>:n<next_n>:rect`, `max_waves` 1, `split_kv` 256: the runtime serves the rect route FIRST when
+`batch * ceil(max_context_len / split_kv) <= max_waves * num_sms` with the device SM count and the route's admission rules -- the
+static route's -- admit the call; its program has no in-CTA schedule and launches `min(num_sms, batch * ceil(S * block_kv /
+split_kv))` CTAs, one per (request, KV split) cell, logits bit-identical to the static program's; `rect.compact` -- round-4
+compact-walk adoption, extending the unpublished v11 -- `routes`: the static -> compact-walk route map `paged:fp8:h<H>:p<page>:n<next_n>:compact`,
+`max_waves` 2, `max_batch` 160: above one wave the runtime serves the compact route while `batch * ceil(max_context_len / split_kv)
+<= 2 * num_sms` and `batch <= min(num_sms, 160)` (a single request takes the rect route at two waves instead); the compact program's
+warps scan the batch's context words once and walk only the real (request, KV split) units on the rect grid, logits bit-identical);
+`rect_atoms` -- round-4 multi-atom rect adoption, extending the unpublished v11 -- `routes`: the static -> multi-atom rect route map
+of the MULTI-atom geometries (`paged:fp8:h64:p64:n4` -> `paged:fp8:h64:p64:n4:rect`; the single-atom `rect.routes` never name
+them) and `windows`: per architecture and static route the `[min_batch, max_batch, min_context_len, max_context_len]` boxes (the
+`static_windows` entry forms) inside which the producer-side launcher runs the multi-atom rect text; the runtime serves the route
+FIRST (like `rect`) when a window of the device's architecture admits the call's `(batch, max_context_len)`, the rectangle fits
+`rect.max_waves` waves of the device SM count and the route's admission rules -- the static route's -- admit the call
+(`paged_rect_atoms_route`); its program executes each (request, KV split) cell atom by atom on the rect grid, logits bit-identical to
+the static program's; both maps are empty while the producer's adoption switch is off, and the route is catalogued only on the
+architectures whose windows name it (host-only readers `paged_rect_atoms`, `paged_rect_atoms_admitted`, `paged_rect_atoms_route`));
+`dynamic_scheduler.sched_meta_windows` and `sched_meta` -- extending the unpublished v11 -- the schedule-meta producer and its
+table-consuming routes: inside a `sched_meta_windows` box (per architecture and static route, `[min_batch, max_batch,
+min_context_len, max_context_len]`, the `static_windows` entry forms) a logits plan given a `PagedScheduleMetaPlan` serves the
+static route's `:table` route (`sched_meta.consumer_routes`: static route -> `paged:fp8:h<H>:p<page>:n<next_n>:table`, one
+`logits` stage, the static route's admission rules; a static route without an entry has no table program), whose program reads
+its walk bounds -- the `[num_sms + 1, 2]` int32 table (`table_shape`, `dtype`) -- instead of deriving them in its prologue
+(bit-identical logits); the table is written by the one-CTA producer `paged:fp8:meta:v<N>` (one `schedule_meta` stage; route
+record fields `threads`, `dynamic_smem_bytes`, `grid` `[1, 1, 1]` instead of the geometry fields), ONE launch per forward through
+`prepare_paged_mqa_schedule_meta(...).run()`; `selection` `[[max_batch, max_sms_plus_1, version], ...]` names the version (the
+first rule with `batch <= max_batch` and `num_sms + 1 <= max_sms_plus_1`, `null` = unbounded), `producer_programs` maps version ->
+route, `producer_args` fixes `num_next_n_atoms` 1 / `split_kv` / 2-D lengths; the host-only readers are `paged_sched_meta_windows`,
+`paged_sched_meta_admitted`, `paged_sched_meta` (requires `consumer_routes` whenever the record exists),
+`paged_sched_meta_consumer_route`, `paged_sched_meta_producer_route` and `schedule_meta_bindings`; the table program is launched
+WITHOUT the PDL attribute -- the producer releases its dependents before the table is complete, so the consumer must start after
+it (the production launcher's rule); the default programs keep the attribute), and -- v7 --
+`dense_short` (`max_kv` 256, `min_q_blocks` 2, `fallback`
+`"tier"`: the shape-only gate of the 64-head one-split `:short` routes and where a withheld one is served), and `dense_kvsplit`
+(`min_kv` 256, `max_sms` 256, `max_q_blocks` 512, `plans` -- the inclusive query bands of the three plan texts,
+`{"q1": [1, 1], "qle128": [2, 64], "qle2048": [65, 1024]}` --, `sm_count` -- per architecture the catalogued SM count the gate is
+applied at, `{"sm_100a": 148, "sm_103a": 152}` --, `fallback` `"tier"` and `unreached_routes` -- the grid-stride tier aliases the
+gate leaves without a domain, not catalogued: the shape-only gate of the 64-head in-kernel KV-split `:kvsplit` routes, `K > min_kv`
+and `ceil(Q / 2) < sm_count[arch]`, the one SM-count dependent route rule, applied at the catalogued count rather than the
+device's, and where a withheld `:kvsplit` route is served; absent while the producer's adoption switch is off). Every route record
+has `stages` (`[[stage, program], ...]`: the program the stage launches -- one name where the architectures share
+one text, a `{arch: program}` map where the production text is chosen per architecture, as for the 64-head tier and
+`q1` routes since v8 -- their `:short` routes share one text, or where the route is catalogued on some architectures
+only; the FP4 two-stage routes list no stages, their prepared sequence launches both kernels), `sequence` (a prepared sequence binding or `null`),
+`num_heads`, `block_q`, `clean_logits` (`"fused"`: the program writes `-inf` outside each window and in
+the padding, the shipped 32-head programs; `"raw"`: the program stores the computed tiles only, DeepGEMM's
+`clean_logits=False` semantics, the 64-head and paged programs), `kv_alignment` (-- v10 -- a map `{arch: 256 | 1}`:
+the divisor the KV length must satisfy on this route on each architecture; a 32-head FP8 route class is admitted for any
+K per architecture where the producer measured it, so the same route may read 1 on one architecture and 256 on the other;
+`route_kv_alignment(route, arch)`, `dense_route_available(..., arch=)`) and `kv_min` (-- v10 -- the smallest KV length the
+route's programs accept: 256 where the KV boxes are fitted to one 256-row block, the shipped two-stage 32-head programs and
+the v9 scan classes; 1 where they may extend past the tensor, the fused `fp8:qle128:short` / `fp8:qle2048:short` and the
+64-head programs). A paged route record carries `stages` and `sequence` only; its geometry is the route name (the
+schedule-meta producer routes `paged:fp8:meta:v<N>` add their launch geometry: `threads`, `dynamic_smem_bytes`, `grid`).
+Routes: 32 heads `fp8:q1:short`, `fp8:q1`, `fp8:q128:short`, `fp8:{full,partial}:le32:short`, `fp8:{full,partial}:le768:short`,
+`fp8:qle128:short` (one `logits` stage, the program `fp8_fused_qle128` writing the tiered schedule in-kernel for
+`1 < Q <= 128`, `K <= fused_qle128_max_kv`; catalogued where the `le128` tier's precedence reaches it -- under the
+published order on both architectures),
+`fp8:qle2048:short` (one `logits` stage, the program `fp8_fused_qle2048` writing the tiered `le2048` schedule in-kernel for
+`128 < Q <= 2048`), `fp8:{full,partial}:<tier>`, `fp4:q1:short`, `fp4:q1`, `fp4:le32:short`, `fp4:le1024:short`, `fp4:<tier>`
+(every 32-head `:short` route is one `logits` stage that writes the schedule metadata itself; the `le<N>:short` classes
+are named by query-block ceiling, the `<tier>` pairs by token ceiling);
+64 heads `fp8:h64:q1`, `fp8:h64:{full,partial}:<tier>`, the one-split `fp8:h64:{full,partial}:short` (a call with
+`K <= 256` and at least two query blocks; `served_route(precision, Q, K, H, arch=)` maps a `:short` route the device's
+arch withholds -- or the catalog does not carry -- to the tier route of the query count, never to the stock kernel) and
+the in-kernel KV-split `fp8:h64:q1:kvsplit` / `fp8:h64:{full,partial}:{qle128,qle2048}:kvsplit` (a call with `K > 256` and
+fewer query blocks than `policy.dense_kvsplit.sm_count[arch]`, the plan text of its query count; `served_route` maps a
+`:kvsplit` route the arch withholds -- or the catalog does not carry -- to the grid-stride `q1` / tier route of the query
+count; the tier aliases `partial:le8` and `{full,partial}:le64` have no domain under the gate and no record),
+each a single `logits` stage -- the
+gridDim-strided `fp8_h64_logits_full` program for `Q % 2 == 0`, `fp8_h64_logits_partial` otherwise (their `_short`
+variants -- the one-split text -- for the `:short` routes; their `_kvsplit_<plan>` variants -- the production text under
+the plan, `fp8_h64_logits_partial_kvsplit_q1` for `Q = 1` -- for the `:kvsplit` routes)
+(including `Q = 1`); no metadata program, launch grid = the SM count (the `SM_COUNT` compile-line
+definition, one device text per arch per program), the program's `ScheduleMeta` operand bound to `ks`
+and unused on the grid-stride and one-split routes and to the plan's own `metadata_words(Q, SM_COUNT, 64)` int32 buffer
+-- written in-kernel, `plan.metadata`, `route_owns_metadata` -- on the `:kvsplit` routes, `q [Q, 64, 128]` unpadded,
+output `[Q, align8(K + 256)]` with no padding rows; paged
+`paged:fp8:h<H>:p<page>:n<next_n>` (one logits program), `paged:fp8:h<H>:p<page>:n<next_n>:dyn` (its dynamic-scheduler
+program, served for `batch <= policy.paged.dynamic_scheduler.max_batch` outside the static-preferred windows),
+`paged:fp8:h64:p64:n2:hyb8c4` (the static program's hybrid-tail-pool text, served inside the sm_100a window
+`[256, 256, 43008, 169728]` by `static_window_routes`) and `paged:fp8:h64:p64:n{1,4}:table` (the static program's
+table-consuming text, served inside `sched_meta_windows` only to a plan given a `PagedScheduleMetaPlan`;
+`policy.paged.sched_meta.consumer_routes`). `fp8_mqa_logits(clean_logits=True)`
+is rejected on a `"raw"` route; the engines pass `clean_logits=False`.

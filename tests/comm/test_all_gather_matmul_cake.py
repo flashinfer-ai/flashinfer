@@ -1,1614 +1,3547 @@
-import copy
-import hashlib
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Behavioural tests of the Cake all-gather matmul backend that need no GPU:
+route-table coverage, launch geometry, the main tile-width rule and its
+delivered-class table, operand classification, input validation, the
+symmetric-memory rendezvous guard and the public dispatch. The multi-GPU
+numerical test lives in ``test_all_gather_matmul_cake_e2e.py``.
+"""
+
+from __future__ import annotations
+
+import gc
 import importlib
-import json
-from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
-from pathlib import Path
-from threading import Barrier
+import types
+import weakref
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from flashinfer.jit import cake_all_gather_matmul as loader
 
-def _backend():
-    return importlib.import_module(
-        "flashinfer.comm.all_gather_matmul.cake_all_gather_matmul"
+backend = importlib.import_module(
+    "flashinfer.comm.all_gather_matmul.cake_all_gather_matmul"
+)
+
+
+def _main_programs():
+    for world_size in loader.SUPPORTED_WORLD_SIZES:
+        for dtype_name in loader.SUPPORTED_DTYPES.values():
+            for b_layout in loader.B_LAYOUTS:
+                yield world_size, dtype_name, b_layout
+
+
+def _n128_classes(arch):
+    """``(world_size, dtype, b_layout)`` classes with a delivered ``_n128`` main on
+    ``arch``, read from the emitted table (three-element lists)."""
+
+    return {
+        (int(world_size), str(dtype_name), str(b_layout))
+        for world_size, dtype_name, b_layout in loader.N128_CLASSES[arch]
+    }
+
+
+def _n128_programs():
+    """Every class with a delivered ``_n128`` main (union over the architectures)."""
+
+    classes = set()
+    for arch in loader.ARCH_FLAGS:
+        classes |= _n128_classes(arch)
+    return sorted(classes)
+
+
+def _cg2_classes(arch):
+    """``(world_size, dtype, b_layout)`` classes with a delivered ``_cg2`` main (the
+    CTA-pair twin of the N256 main) on ``arch``, read from the emitted table."""
+
+    return {
+        (int(world_size), str(dtype_name), str(b_layout))
+        for world_size, dtype_name, b_layout in loader.CG2_CLASSES[arch]
+    }
+
+
+def _cg2_programs():
+    """Every class with a delivered ``_cg2`` main (union over the architectures)."""
+
+    classes = set()
+    for arch in loader.ARCH_FLAGS:
+        classes |= _cg2_classes(arch)
+    return sorted(classes)
+
+
+def _cg2s_classes(arch):
+    """``(world_size, dtype, b_layout, form)`` classes with a delivered spill-wave
+    N-split pair main on ``arch``, read from the emitted table."""
+
+    return {
+        (int(world_size), str(dtype_name), str(b_layout), str(form))
+        for world_size, dtype_name, b_layout, form in loader.CG2S_CLASSES[arch]
+    }
+
+
+def _cg2s_programs():
+    """Every class with a delivered spill-wave N-split pair main (union over the
+    architectures)."""
+
+    classes = set()
+    for arch in loader.ARCH_FLAGS:
+        classes |= _cg2s_classes(arch)
+    return sorted(classes)
+
+
+def _order_classes(arch):
+    """``(world_size, dtype, b_layout, form)`` classes with a delivered tile-order
+    twin of the one-CTA N256 main on ``arch``, read from the emitted table."""
+
+    return {
+        (int(world_size), str(dtype_name), str(b_layout), str(form))
+        for world_size, dtype_name, b_layout, form in loader.ORDER_CLASSES[arch]
+    }
+
+
+def _order_programs():
+    """Every class with a delivered tile-order twin (union over the architectures)."""
+
+    classes = set()
+    for arch in loader.ARCH_FLAGS:
+        classes |= _order_classes(arch)
+    return sorted(classes)
+
+
+def _spill_point_form(arch, world_size, dtype_name, b_layout, padded, n):
+    """Form of the emitted spill point naming the class, padded rows and ``n`` on
+    ``arch``, or ``None`` when no point does."""
+
+    for entry in loader.CG2_SPILL_POINTS[arch]:
+        if tuple(entry[:5]) == (world_size, dtype_name, b_layout, padded, n):
+            return str(entry[5])
+    return None
+
+
+def test_route_table_covers_every_world_size_dtype_layout_and_phase():
+    for phase in (0, 1):
+        assert loader.barrier_program(phase) in loader.PROGRAMS
+    assert loader.barrier_program(0) != loader.barrier_program(1)
+    mains = set()
+    for world_size, dtype_name, b_layout in _main_programs():
+        program = loader.main_program(world_size, dtype_name, b_layout)
+        assert program in loader.PROGRAMS
+        mains.add(program)
+    # One main kernel per (world size, dtype, weight layout): twelve distinct programs.
+    assert len(mains) == 12
+    # One ``_n128`` twin per class of the delivered-class table (union over the
+    # architectures), each a program of its own; no other ``_n128`` route exists.
+    twins = set()
+    for world_size, dtype_name, b_layout in _n128_programs():
+        program = loader.main_program(world_size, dtype_name, b_layout, block_n=128)
+        assert program in loader.PROGRAMS and program not in mains
+        twins.add(program)
+    assert len(twins) == len(_n128_programs())
+    assert {key for key in loader.ROUTES if key.endswith("_n128")} == {
+        f"main_{dtype_name}_ws{world_size}_{b_layout}_n128"
+        for world_size, dtype_name, b_layout in _n128_programs()
+    }
+    # One ``_cg2`` CTA-pair twin per class of the delivered-class table, each a
+    # program of its own; no other ``_cg2`` route exists.
+    pairs = set()
+    for world_size, dtype_name, b_layout in _cg2_programs():
+        program = loader.main_program(world_size, dtype_name, b_layout, form="cg2")
+        assert (
+            program in loader.PROGRAMS and program not in mains and program not in twins
+        )
+        pairs.add(program)
+    assert len(pairs) == len(_cg2_programs())
+    assert {key for key in loader.ROUTES if key.endswith("_cg2")} == {
+        f"main_{dtype_name}_ws{world_size}_{b_layout}_cg2"
+        for world_size, dtype_name, b_layout in _cg2_programs()
+    }
+    # One spill-wave N-split pair twin per class of the delivered spill-class
+    # table, each a program of its own; no other spill route exists.
+    spills = set()
+    for world_size, dtype_name, b_layout, form in _cg2s_programs():
+        program = loader.main_program(world_size, dtype_name, b_layout, form=form)
+        assert program in loader.PROGRAMS and program not in mains | twins | pairs
+        spills.add(program)
+    assert len(spills) == len(_cg2s_programs())
+    spill_keys = {key for key in loader.ROUTES if key.endswith(("_cg2s1", "_cg2s2"))}
+    assert spill_keys == {
+        f"main_{dtype_name}_ws{world_size}_{b_layout}_{form}"
+        for world_size, dtype_name, b_layout, form in _cg2s_programs()
+    }
+    # One tile-order twin of the one-CTA main per class of the delivered
+    # order-class table, each a program of its own; no other ``_po`` / ``_pi``
+    # route exists.
+    orders = set()
+    for world_size, dtype_name, b_layout, form in _order_programs():
+        program = loader.main_program(world_size, dtype_name, b_layout, form=form)
+        assert program in loader.PROGRAMS
+        assert program not in mains | twins | pairs | spills
+        orders.add(program)
+    assert len(orders) == len(_order_programs())
+    order_keys = {key for key in loader.ROUTES if key.endswith(("_po", "_pi"))}
+    assert order_keys == {
+        f"main_{dtype_name}_ws{world_size}_{b_layout}_{form}"
+        for world_size, dtype_name, b_layout, form in _order_programs()
+    }
+    kslice_routes = {key for key in loader.ROUTES if loader._is_kslice_stage(key)}
+    expected_routes = (
+        2
+        + 12
+        + 2
+        + len(twins)
+        + len(pairs)
+        + len(spills)
+        + len(orders)
+        + len(kslice_routes)
+    )
+    assert len(loader.ROUTES) == expected_routes
+    # ws2 never has a twin: asking for one names the missing route.
+    with pytest.raises(ValueError, match="main_bfloat16_ws2_n_major_n128"):
+        loader.main_program(2, "bfloat16", "n_major", block_n=128)
+    # The pair twin exists at the public width only, and only for the delivered forms.
+    with pytest.raises(ValueError, match="block_n=256 only"):
+        loader.main_program(8, "bfloat16", "n_major", block_n=128, form="cg2")
+    with pytest.raises(ValueError, match="form"):
+        loader.main_program(8, "bfloat16", "n_major", form="cg3")
+    # A spill twin exists only for the classes with a point, at the public width,
+    # and only at the form of that point (the four-tile form is delivered nowhere).
+    with pytest.raises(ValueError, match="no all-gather matmul main program"):
+        loader.main_program(8, "bfloat16", "n_major", form="cg2s2")
+    with pytest.raises(ValueError, match="no all-gather matmul main program"):
+        loader.main_program(4, "bfloat16", "k_major", form="cg2s1")
+    with pytest.raises(ValueError, match="block_n=256 only"):
+        loader.main_program(4, "bfloat16", "k_major", block_n=128, form="cg2s2")
+    assert loader.peer_push_program() in loader.PROGRAMS
+    assert loader.peer_push_wide_program() in loader.PROGRAMS
+    assert loader.peer_push_program() != loader.peer_push_wide_program()
+    assert set(loader.ROUTES.values()) == set(loader.PROGRAMS)
+
+
+def test_n128_table_lists_ws4_and_ws8_classes_per_architecture_under_the_frozen_rule():
+    """The table restricts the frozen rule to delivered programs: one entry per
+    exported architecture, classes of world sizes 4 and 8 only, and the rule
+    inputs copied from the kernel module (148 SMs; at most two N256 waves on
+    sm_100a, one on sm_103a)."""
+
+    assert set(loader.N128_CLASSES) == set(loader.ARCH_FLAGS)
+    assert loader.SM_COUNT_BY_ARCH == {"sm_100a": 148, "sm_103a": 148}
+    assert loader.N128_MAX_WAVES_BY_ARCH == {"sm_100a": 2, "sm_103a": 1}
+    assert loader.SM_PUSH_BANDS_BY_ARCH == {"sm_100a": [], "sm_103a": [[8, 1024, 1619]]}
+    assert loader.PUSH_LAUNCH_ROWS_BY_ARCH == {
+        "sm_100a": [[4, 512, 16, 8]],
+        "sm_103a": [[4, 512, 16, 8], [8, 1024, 16, 8]],
+    }
+    assert loader.PUSH_KSLICES_BY_ARCH == {"sm_100a": [], "sm_103a": [[8, 512, 4]]}
+    assert loader.MAIN_BLOCK_NS == (256, 128) and loader.BLOCK_N == 256
+    for arch in loader.ARCH_FLAGS:
+        classes = _n128_classes(arch)
+        assert len(classes) == len(loader.N128_CLASSES[arch]), arch
+        for world_size, dtype_name, b_layout in classes:
+            assert world_size in (4, 8)
+            assert dtype_name in loader.SUPPORTED_DTYPES.values()
+            assert b_layout in loader.B_LAYOUTS
+
+
+# ``[world_size, dtype, b_layout, min_padded_rows, max_padded_rows, min_cols,
+# max_cols]`` rectangles; a class may list several, pairwise disjoint.
+_CG2_REGIONS = {
+    "sm_100a": [
+        # The nine sm_100a rows measured on B200, as points on padded rows and exact N
+        # (M=1025 pads to 1152): the ws2 bf16 n_major perf rows, the ws4 bf16 k_major QKV rows and the ws4 / ws8
+        # bf16 k_major gate_up M=512 / M=1024 rows.
+        [2, "bfloat16", "n_major", 2048, 2048, 2048, 2048],
+        [2, "bfloat16", "n_major", 4096, 4096, 2048, 2048],
+        [4, "bfloat16", "k_major", 1024, 1024, 2560, 2560],
+        [4, "bfloat16", "k_major", 1152, 1152, 2560, 2560],
+        [4, "bfloat16", "k_major", 2048, 2048, 2560, 2560],
+        [4, "bfloat16", "k_major", 512, 512, 14336, 14336],
+        [4, "bfloat16", "k_major", 1024, 1024, 14336, 14336],
+        [8, "bfloat16", "k_major", 512, 512, 7168, 7168],
+        [8, "bfloat16", "k_major", 1024, 1024, 7168, 7168],
+        # The three measured ws2 M=1024 rows (N = 2048), as points: the bf16 n_major
+        # class (its M=1000 row pads to the same point), the bf16 k_major class and
+        # the fp16 k_major class at exactly 1024 padded rows.
+        [2, "bfloat16", "n_major", 1024, 1024, 2048, 2048],
+        [2, "bfloat16", "k_major", 1024, 1024, 2048, 2048],
+        [2, "float16", "k_major", 1024, 1024, 2048, 2048],
+    ],
+    "sm_103a": [
+        # The two measured rectangles (min_cols 1 keeps every call in them routed).
+        [2, "bfloat16", "n_major", 2048, 5760, 1, 2048],
+        [4, "bfloat16", "k_major", 1024, 1536, 1, 6058],
+        # The two measured gate_up M=512 rows, as points; the M=2048 gate_up rows are
+        # not routed.
+        [4, "bfloat16", "k_major", 512, 512, 14336, 14336],
+        [8, "bfloat16", "k_major", 512, 512, 7168, 7168],
+        # The three measured ws2 M=1024 rows (N = 2048), as points: the bf16 n_major
+        # class (its M=1000 row pads to the same point), the bf16 k_major class and
+        # the fp16 k_major class at exactly 1024 padded rows.
+        [2, "bfloat16", "n_major", 1024, 1024, 2048, 2048],
+        [2, "bfloat16", "k_major", 1024, 1024, 2048, 2048],
+        [2, "float16", "k_major", 1024, 1024, 2048, 2048],
+    ],
+}
+_CG2_CLASSES = {
+    "sm_100a": {
+        (2, "bfloat16", "n_major"),
+        (2, "bfloat16", "k_major"),
+        (2, "float16", "k_major"),
+        (4, "bfloat16", "k_major"),
+        (8, "bfloat16", "k_major"),
+    },
+    "sm_103a": {
+        (2, "bfloat16", "n_major"),
+        (2, "bfloat16", "k_major"),
+        (2, "float16", "k_major"),
+        (4, "bfloat16", "k_major"),
+        (8, "bfloat16", "k_major"),
+    },
+}
+
+
+def test_cg2_tables_list_the_measured_pair_regions_and_classes_per_architecture():
+    """The CTA-pair twin is delivered for the classes with a measured rectangle:
+    on sm_103a the ws2 bf16 n_major class at 2048..5760 padded rows / N <= 2048
+    and at its M=1024 point (exactly 1024 padded rows at N = 2048), the ws2 bf16
+    k_major and fp16 k_major classes at their M=1024 points (exactly 1024 padded
+    rows at N = 2048), the ws4 bf16 k_major class at 1024..1536 padded rows /
+    N <= 6058 and at its gate_up point (exactly 512 padded rows at N = 14336),
+    and the ws8 bf16 k_major class at its gate_up point (exactly 512 padded rows
+    at N = 7168; the M=2048 gate_up rows are not routed); on sm_100a
+    the ws2 bf16 n_major class at its three measured points (exactly 1024, 2048
+    or 4096 padded rows at N = 2048), the ws2 bf16 k_major and fp16 k_major
+    classes at their M=1024 points (exactly 1024 padded rows at N = 2048), the
+    ws4 bf16 k_major class at its five (exactly 1024, 1152 or 2048 padded rows
+    at N = 2560; exactly 512 or 1024 padded rows at N = 14336) and the ws8 bf16
+    k_major class at its two (exactly 512 or 1024 padded rows at N = 7168). The
+    rule inputs are the kernel module's (clusters of two)."""
+
+    assert set(loader.CG2_CLASSES) == set(loader.CG2_REGIONS) == set(loader.ARCH_FLAGS)
+    assert loader.CG2_REGIONS == _CG2_REGIONS
+    assert loader.MAIN_FORMS == ("cg1", "cg2", "cg2s1", "cg2s2", "po", "pi")
+    assert loader.PAIR_FORMS == ("cg2", "cg2s1", "cg2s2")
+    assert loader.ORDER_FORMS == ("po", "pi")
+    assert loader.CG2_CLUSTER_DIMS == (2, 1, 1)
+    for arch in loader.ARCH_FLAGS:
+        classes = _cg2_classes(arch)
+        assert len(classes) == len(loader.CG2_CLASSES[arch])
+        assert classes == _CG2_CLASSES[arch], arch
+        # every region belongs to a delivered class and every delivered class has a region
+        assert {tuple(entry[:3]) for entry in loader.CG2_REGIONS[arch]} == classes, arch
+    for retired in (
+        "CG2_MIN_M_TILES_BY_ARCH",
+        "CG2_MAX_M_TILES",
+        "CG2_WS2_MIN_PADDED_ROWS",
+        "chunk_m_tiles",
+    ):
+        assert not hasattr(loader, retired), retired
+
+
+# ``[world_size, dtype, b_layout, padded_rows, n, form]`` points: the spill-wave
+# N-split pair program of a measured row, on exact padded rows and exact N.
+_CG2_SPILL_POINTS = {
+    "sm_100a": [],
+    "sm_103a": [
+        # The two measured bf16 k_major gate_up rows -- the ws4 M=512 row and the
+        # ws8 M=512 row -- each to the form its entry names (``cg2s2``: two
+        # 256 x 128 spill tiles; ``cg2s1``, four 256 x 64, has no point).
+        [4, "bfloat16", "k_major", 512, 14336, "cg2s2"],
+        [8, "bfloat16", "k_major", 512, 7168, "cg2s2"],
+    ],
+}
+_CG2S_CLASSES = {
+    "sm_100a": set(),
+    "sm_103a": {
+        (4, "bfloat16", "k_major", "cg2s2"),
+        (8, "bfloat16", "k_major", "cg2s2"),
+    },
+}
+
+
+def test_cg2_spill_point_table_lists_the_measured_points_per_architecture():
+    """The spill-wave N-split pair twins are delivered for the classes with a
+    measured point: on sm_103a the ws4 bf16 k_major class at exactly 512 padded
+    rows / N = 14336 and the ws8 bf16 k_major class at exactly 512 padded rows /
+    N = 7168, each to the form its pinned entry names; sm_100a has no point.
+    Every point lies inside a pair rectangle of its class and names a delivered
+    spill class; the form order gives the host sequence's positional form
+    codes."""
+
+    assert set(loader.CG2_SPILL_POINTS) == set(loader.ARCH_FLAGS)
+    assert set(loader.CG2S_CLASSES) == set(loader.ARCH_FLAGS)
+    assert loader.CG2_SPILL_POINTS == _CG2_SPILL_POINTS
+    for arch in loader.ARCH_FLAGS:
+        classes = _cg2s_classes(arch)
+        assert len(classes) == len(loader.CG2S_CLASSES[arch])
+        assert classes == _CG2S_CLASSES[arch], arch
+        # every point belongs to a delivered spill class and every delivered
+        # spill class has a point
+        points = loader.CG2_SPILL_POINTS[arch]
+        assert {(*entry[:3], entry[5]) for entry in points} == classes, arch
+        assert len({tuple(entry[:5]) for entry in points}) == len(points), arch
+        for world_size, dtype_name, b_layout, padded, n, form in points:
+            assert (world_size, dtype_name, b_layout) in _cg2_classes(arch), arch
+            assert form in loader.PAIR_FORMS[1:] and b_layout == "k_major"
+            assert padded % loader.BLOCK_M == 0 and n % loader.BLOCK_N == 0
+            rectangles = [
+                entry[3:]
+                for entry in loader.CG2_REGIONS[arch]
+                if tuple(entry[:3]) == (world_size, dtype_name, b_layout)
+            ]
+            assert any(
+                min_rows <= padded <= max_rows and min_cols <= n <= max_cols
+                for min_rows, max_rows, min_cols, max_cols in rectangles
+            ), (arch, world_size, dtype_name, b_layout, padded, n)
+    assert [loader.main_form_code(form) for form in loader.MAIN_FORMS] == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+    ]
+    with pytest.raises(ValueError, match="form"):
+        loader.main_form_code("pair")
+
+
+# ``[world_size, dtype, b_layout, padded_rows, n, form]`` tile-order points: the
+# one-CTA N256 main's ``po`` / ``pi`` twins (another tile -> (peer, B panel) map
+# of the persistent walk; the one-CTA launch and grid) on exact padded rows
+# (always 128: one M tile, one chunk) and exact N. One point is delivered, on
+# sm_103a alone: the four-rank bf16 K-major calls of 128 padded rows at
+# N = 14336 (1..128 rows) run the ``po`` twin; sm_100a lists none, and no
+# ``pi`` twin is delivered anywhere.
+_TILE_ORDER_POINTS = {
+    "sm_100a": [],
+    "sm_103a": [[4, "bfloat16", "k_major", 128, 14336, "po"]],
+}
+_ORDER_CLASSES = {"sm_100a": set(), "sm_103a": {(4, "bfloat16", "k_major", "po")}}
+_ORDER_POINT_ROUTE = "main_bfloat16_ws4_k_major_po"
+# ``(rows, n, world_size)`` bf16 K-major calls at the point (1..128 rows pad to
+# the one 128-row tile) and off it (129 pads to 256; the neighbouring column
+# multiples; the eight-rank gate_up M=125 call; a two-rank call).
+_ORDER_POINT_CALLS = ((1, 14336, 4), (125, 14336, 4), (128, 14336, 4))
+_OFF_POINT_CALLS = (
+    (129, 14336, 4),
+    (256, 14336, 4),
+    (125, 14080, 4),
+    (125, 14592, 4),
+    (125, 7168, 8),
+    (1, 256, 2),
+)
+
+
+def test_tile_order_point_table_lists_the_ws4_bf16_k_major_point_on_sm_103a_and_the_forms_take_the_one_cta_grid():
+    """The tile-order twins of the one-CTA main are form codes 4 / 5 of the host
+    sequence. One point is delivered, on sm_103a alone: ``main_form`` selects
+    ``po`` for exactly the four-rank bf16 K-major calls of 128 padded rows at
+    N = 14336 there, one ``_po`` route ships (a program of its own next to the
+    one-CTA main of the class) and ``main_program`` refuses the form for every
+    other class and the ``pi`` form by name; sm_100a keeps every call on the
+    one-CTA program. The twins' grid is the one-CTA grid at the public width and
+    they exist at that width only."""
+
+    assert set(loader.TILE_ORDER_POINTS) == set(loader.ARCH_FLAGS)
+    assert set(loader.ORDER_CLASSES) == set(loader.ARCH_FLAGS)
+    assert loader.TILE_ORDER_POINTS == _TILE_ORDER_POINTS
+    for arch in loader.ARCH_FLAGS:
+        assert _order_classes(arch) == _ORDER_CLASSES[arch], arch
+        assert loader._order_classes(arch) == frozenset(_ORDER_CLASSES[arch]), arch
+        on_point = "po" if arch == "sm_103a" else None
+        for rows, n, world_size in _ORDER_POINT_CALLS:
+            assert (
+                loader._tile_order_point(
+                    arch, world_size, "bfloat16", "k_major", loader.padded_rows(rows), n
+                )
+                == on_point
+            ), (arch, rows)
+            assert loader.main_form(
+                rows,
+                n,
+                world_size=world_size,
+                arch=arch,
+                dtype_name="bfloat16",
+                b_layout="k_major",
+                block_n=256,
+            ) == (on_point or "cg1"), (arch, rows)
+        for rows, n, world_size in _OFF_POINT_CALLS:
+            assert (
+                loader._tile_order_point(
+                    arch, world_size, "bfloat16", "k_major", loader.padded_rows(rows), n
+                )
+                is None
+            ), (arch, rows, n, world_size)
+            assert (
+                loader.main_form(
+                    rows,
+                    n,
+                    world_size=world_size,
+                    arch=arch,
+                    dtype_name="bfloat16",
+                    b_layout="k_major",
+                    block_n=256,
+                )
+                == "cg1"
+            ), (arch, rows, n, world_size)
+        # The other layout and dtype of the point geometry, and the 128-wide call,
+        # stay on the one-CTA program on both architectures.
+        for dtype_name, b_layout, block_n in (
+            ("bfloat16", "n_major", 256),
+            ("float16", "k_major", 256),
+            ("bfloat16", "k_major", 128),
+        ):
+            assert (
+                loader.main_form(
+                    125,
+                    14336,
+                    world_size=4,
+                    arch=arch,
+                    dtype_name=dtype_name,
+                    b_layout=b_layout,
+                    block_n=block_n,
+                )
+                == "cg1"
+            ), (arch, dtype_name, b_layout, block_n)
+    # Exactly one order route: the ``_po`` twin of the ws4 bf16 k_major class, a
+    # program of its own next to the class's one-CTA main. The ``_po`` suffix is
+    # the route key's: a delivered program is named by the export's content
+    # fingerprint (``cake_all_gather_matmul_<hash>``), not by its kernel symbol.
+    assert {key for key in loader.ROUTES if key.endswith(("_po", "_pi"))} == {
+        _ORDER_POINT_ROUTE
+    }
+    twin = loader.main_program(4, "bfloat16", "k_major", form="po")
+    assert twin == loader.ROUTES[_ORDER_POINT_ROUTE]
+    assert twin in loader.PROGRAMS
+    assert twin != loader.main_program(4, "bfloat16", "k_major")
+    for form in loader.ORDER_FORMS:
+        assert loader.main_form_code(form) == 4 + loader.ORDER_FORMS.index(form)
+        assert form not in loader.PAIR_FORMS
+        assert (
+            loader.main_grid(125, 14336, world_size=4, sm_count=148, form=form)
+            == loader.main_grid(125, 14336, world_size=4, sm_count=148)
+            == (148, 1, 1)
+        )
+        with pytest.raises(ValueError, match="block_n=256 only"):
+            loader.main_grid(
+                125, 14336, world_size=4, sm_count=148, block_n=128, form=form
+            )
+        with pytest.raises(ValueError, match="block_n=256 only"):
+            loader._main_route_key(4, "bfloat16", "k_major", 128, form)
+    # The ``pi`` twin is delivered for no class; the ``po`` twin for the point's
+    # class alone.
+    with pytest.raises(
+        ValueError, match="no all-gather matmul main program is delivered"
+    ):
+        loader.main_program(4, "bfloat16", "k_major", block_n=256, form="pi")
+    for world_size, dtype_name, b_layout in (
+        (8, "bfloat16", "k_major"),
+        (4, "bfloat16", "n_major"),
+        (4, "float16", "k_major"),
+        (2, "bfloat16", "k_major"),
+    ):
+        with pytest.raises(
+            ValueError, match="no all-gather matmul main program is delivered"
+        ):
+            loader.main_program(world_size, dtype_name, b_layout, form="po")
+    with pytest.raises(ValueError, match="no entry for arch 'sm_90a'"):
+        loader._tile_order_point("sm_90a", 4, "bfloat16", "k_major", 128, 14336)
+    with pytest.raises(ValueError, match="no entry for arch 'sm_90a'"):
+        loader._order_classes("sm_90a")
+
+
+def test_every_program_lists_its_device_source_only():
+    for program, row in loader.PROGRAMS.items():
+        assert len(row["sources"]) == 1, program
+        assert row["sources"][0].startswith("csrc/cake_all_gather_matmul/")
+        assert row["sources"][0].endswith("_kernel.cu")
+        assert len(row["block"]) == 3 and row["block"][0] > 0
+        assert row["dynamic_smem_bytes"] >= 0
+        assert row["arches"] and set(row["arches"]) <= set(loader.ARCH_FLAGS), program
+
+
+def test_every_route_has_one_host_sequence_per_architecture():
+    expected = set()
+    for arch in loader.ARCH_FLAGS:
+        for world_size, dtype_name, b_layout in _main_programs():
+            name = loader.sequence_name(world_size, dtype_name, b_layout, arch)
+            expected.add(name)
+            row = loader.SEQUENCES[name]
+            assert row["arches"] == [arch]
+            assert (row["world_size"], row["dtype"], row["b_layout"]) == (
+                world_size,
+                dtype_name,
+                b_layout,
+            )
+            programs = loader.sequence_programs(name)
+            # The sequence compiles the route's device units (one each) with
+            # its launcher; the compile order carries no meaning.
+            assert len(row["sources"]) == len(programs) + 1
+            assert set(row["sources"][:-1]) == {
+                loader.PROGRAMS[program]["sources"][0] for program in programs
+            }
+            assert row["sources"][-1].startswith(
+                "csrc/cake_all_gather_matmul/cake_all_gather_matmul_sequence_"
+            )
+            assert row["sources"][-1].endswith(f"{name}.cu")
+            # Every sequence module compiles both SM push programs: the route and
+            # the push launch are decided per call (rows, world size).
+            assert loader.peer_push_program() in programs
+            assert loader.peer_push_wide_program() in programs
+            # The ``_n128`` twin travels with the sequence exactly for the classes
+            # with a delivered twin on this architecture (the per-call width is
+            # chosen by ``main_block_n``, so both mains are compiled in).
+            route = {
+                loader.barrier_program(0),
+                loader.barrier_program(1),
+                loader.peer_push_program(),
+                loader.peer_push_wide_program(),
+                loader.main_program(world_size, dtype_name, b_layout),
+            }
+            delivered = (world_size, dtype_name, b_layout) in _n128_classes(arch)
+            assert ("main_n128" in row["programs"]) is delivered
+            if delivered:
+                twin = loader.main_program(
+                    world_size, dtype_name, b_layout, block_n=128
+                )
+                assert row["programs"]["main_n128"] == twin
+                assert arch in loader.PROGRAMS[twin]["arches"]
+                route.add(twin)
+            # The ``_cg2`` CTA-pair twin likewise (the per-call form is chosen by
+            # ``main_form``, so the N256 main and its pair twin are compiled in).
+            pair_delivered = (world_size, dtype_name, b_layout) in _cg2_classes(arch)
+            assert ("main_cg2" in row["programs"]) is pair_delivered
+            if pair_delivered:
+                pair = loader.main_program(world_size, dtype_name, b_layout, form="cg2")
+                assert row["programs"]["main_cg2"] == pair
+                assert arch in loader.PROGRAMS[pair]["arches"]
+                route.add(pair)
+            # A spill-wave N-split pair twin likewise, for the classes with a
+            # delivered point on this architecture (the per-call form is chosen
+            # by ``main_form`` over the point table; its pair base travels too).
+            for form in loader.PAIR_FORMS[1:]:
+                spill_class = (world_size, dtype_name, b_layout, form)
+                spill_delivered = spill_class in _cg2s_classes(arch)
+                assert (f"main_{form}" in row["programs"]) is spill_delivered
+                if spill_delivered:
+                    assert pair_delivered
+                    spill = loader.main_program(
+                        world_size, dtype_name, b_layout, form=form
+                    )
+                    assert row["programs"][f"main_{form}"] == spill
+                    assert arch in loader.PROGRAMS[spill]["arches"]
+                    route.add(spill)
+            # A tile-order twin likewise, for the classes with a delivered point of
+            # that form on this architecture (the per-call form is chosen by
+            # ``main_form`` over the tile-order point table: the ws4 bf16 k_major
+            # ``po`` class on sm_103a, none on sm_100a).
+            for form in loader.ORDER_FORMS:
+                order_class = (world_size, dtype_name, b_layout, form)
+                order_delivered = order_class in loader._order_classes(arch)
+                assert (f"main_{form}" in row["programs"]) is order_delivered
+                if order_delivered:
+                    order_twin = loader.main_program(
+                        world_size, dtype_name, b_layout, form=form
+                    )
+                    assert row["programs"][f"main_{form}"] == order_twin
+                    assert arch in loader.PROGRAMS[order_twin]["arches"]
+                    route.add(order_twin)
+            # The per-K-slice readiness twins of the class's slice points on this
+            # architecture travel with the sequence under their ``_ks<S>`` stage
+            # names: the push twin of each point's launched program family and the
+            # main twin of every width and form a call at a point can resolve to
+            # (each a delivered program of this architecture); a class without a
+            # point carries none.
+            kslice_stages = {
+                stage: program
+                for stage, program in row["programs"].items()
+                if loader._is_kslice_stage(stage)
+            }
+            slice_rows = [
+                row_entry
+                for row_entry in loader.push_kslice_rows(arch)
+                if row_entry[0] == world_size
+            ]
+            assert bool(kslice_stages) is bool(slice_rows)
+            for stage, program in kslice_stages.items():
+                base, _separator, slices = stage.rpartition("_ks")
+                assert int(slices) in {k_slices for _ws, _rows, k_slices in slice_rows}
+                assert arch in loader.PROGRAMS[program]["arches"]
+                if base in ("peer_push", "peer_push_wide"):
+                    assert program == loader.ROUTES[stage]
+                else:
+                    block_n = 128 if base.startswith("main_n128") else 256
+                    if base in ("main", "main_n128"):
+                        form = "cg1"
+                    else:
+                        form = base[len("main_") :]
+                    assert program == loader.main_program(
+                        world_size,
+                        dtype_name,
+                        b_layout,
+                        block_n=block_n,
+                        form=form,
+                        k_slices=int(slices),
+                    )
+                route.add(program)
+            assert len(programs) == len(route) and set(programs) == route
+    assert set(loader.SEQUENCES) == expected
+    with pytest.raises(ValueError, match="host sequence"):
+        loader.sequence_name(16, "bfloat16", "n_major", "sm_100a")
+
+
+def test_every_program_is_delivered_for_both_architectures():
+    for push in (loader.peer_push_program(), loader.peer_push_wide_program()):
+        assert loader.PROGRAMS[push]["arches"] == ["sm_100a", "sm_103a"]
+    for phase in (0, 1):
+        assert loader.PROGRAMS[loader.barrier_program(phase)]["arches"] == [
+            "sm_100a",
+            "sm_103a",
+        ]
+    for world_size, dtype_name, b_layout in _main_programs():
+        assert loader.PROGRAMS[loader.main_program(world_size, dtype_name, b_layout)][
+            "arches"
+        ] == [
+            "sm_100a",
+            "sm_103a",
+        ]
+    # An ``_n128`` main is delivered for exactly the architectures whose table
+    # lists its class (a class routed on one architecture only ships one arch).
+    for world_size, dtype_name, b_layout in _n128_programs():
+        twin = loader.main_program(world_size, dtype_name, b_layout, block_n=128)
+        assert loader.PROGRAMS[twin]["arches"] == sorted(
+            arch
+            for arch in loader.ARCH_FLAGS
+            if (world_size, dtype_name, b_layout) in _n128_classes(arch)
+        ), twin
+    # A ``_cg2`` main likewise (every pair class -- ws2 bf16 n_major, ws2 bf16
+    # k_major, ws2 fp16 k_major, ws4 bf16 k_major and ws8 bf16 k_major -- has
+    # pair-routed rows on both architectures).
+    assert sorted(_cg2_programs()) == [
+        (2, "bfloat16", "k_major"),
+        (2, "bfloat16", "n_major"),
+        (2, "float16", "k_major"),
+        (4, "bfloat16", "k_major"),
+        (8, "bfloat16", "k_major"),
+    ]
+    for world_size, dtype_name, b_layout in _cg2_programs():
+        pair = loader.main_program(world_size, dtype_name, b_layout, form="cg2")
+        assert loader.PROGRAMS[pair]["arches"] == sorted(
+            arch
+            for arch in loader.ARCH_FLAGS
+            if (world_size, dtype_name, b_layout) in _cg2_classes(arch)
+        ), pair
+        assert loader.PROGRAMS[pair]["arches"] == ["sm_100a", "sm_103a"], pair
+    # A spill-wave N-split pair twin is delivered for exactly the architectures
+    # whose point table names its class (the pinned spill classes: the ws4 and
+    # ws8 bf16 k_major classes on sm_103a alone, each at the form of its points).
+    assert sorted(_cg2s_programs()) == sorted(
+        {cls for classes in _CG2S_CLASSES.values() for cls in classes}
+    )
+    for world_size, dtype_name, b_layout, form in _cg2s_programs():
+        spill = loader.main_program(world_size, dtype_name, b_layout, form=form)
+        assert loader.PROGRAMS[spill]["arches"] == sorted(
+            arch
+            for arch in loader.ARCH_FLAGS
+            if (world_size, dtype_name, b_layout, form) in _cg2s_classes(arch)
+        ), spill
+        assert loader.PROGRAMS[spill]["arches"] == ["sm_103a"], spill
+    # A tile-order twin of the one-CTA main is delivered for exactly the
+    # architectures whose point table names its class (the pinned order class:
+    # the ws4 bf16 k_major ``po`` twin on sm_103a alone).
+    assert sorted(_order_programs()) == sorted(
+        {cls for classes in _ORDER_CLASSES.values() for cls in classes}
+    )
+    for world_size, dtype_name, b_layout, form in _order_programs():
+        twin = loader.main_program(world_size, dtype_name, b_layout, form=form)
+        assert loader.PROGRAMS[twin]["arches"] == sorted(
+            arch
+            for arch in loader.ARCH_FLAGS
+            if (world_size, dtype_name, b_layout, form) in _order_classes(arch)
+        ), twin
+        assert loader.PROGRAMS[twin]["arches"] == ["sm_103a"], twin
+    sm103_sequence = loader.sequence_name(8, "bfloat16", "n_major", "sm_103a")
+    loader.spec.cache_clear()
+    try:
+        with pytest.raises(ValueError, match="sm_100a"):
+            loader.spec(sm103_sequence, "sm_100a")
+    finally:
+        loader.spec.cache_clear()
+
+
+def test_barrier_and_push_programs_use_static_shared_memory_only():
+    for phase in (0, 1):
+        program = loader.barrier_program(phase)
+        assert loader.launch_block(program) == (32, 1, 1)
+        assert loader.dynamic_smem_bytes(program) == 0
+    for push in (loader.peer_push_program(), loader.peer_push_wide_program()):
+        assert loader.launch_block(push) == (128, 1, 1)
+        assert loader.dynamic_smem_bytes(push) == 0
+
+
+def test_push_launch_follows_the_per_peer_payload():
+    # 128 padded rows x K x 2 B = 2 MiB per peer keep the 32-CTA launch; 512 rows
+    # (8 MiB) take the wide launch; the threshold itself is on the wide side. The
+    # eight-rank calls of these row counts have no launch row on either
+    # architecture (the eight-rank launch row sits at 1024 padded rows, below).
+    assert loader.push_payload_bytes(128, 2) == 2 * 1024 * 1024
+    assert loader.push_payload_bytes(512, 2) == 8 * 1024 * 1024
+    for arch in _BOTH:
+        rule = lambda rows, world_size=8, arch=arch: loader.push_launch(  # noqa: E731
+            rows, 2, world_size=world_size, arch=arch
+        )
+        assert rule(128) == ("peer_push", 32, 1)
+        assert rule(512) == ("peer_push_wide", 8, 8)
+        assert rule(128)[1:] == (loader.PUSH_CTAS_PER_PEER, loader.PUSH_UNROLL)
+        assert rule(512)[1:] == (
+            loader.PUSH_WIDE_CTAS_PER_PEER,
+            loader.PUSH_WIDE_UNROLL,
+        )
+        threshold_rows = loader.PUSH_PAYLOAD_THRESHOLD_BYTES // (loader.K * 2)
+        assert threshold_rows % loader.BLOCK_M == 0
+        assert rule(threshold_rows)[0] == "peer_push_wide"
+        assert rule(threshold_rows - loader.BLOCK_M)[0] == "peer_push"
+        assert rule(128, world_size=4) == ("peer_push", 32, 1)
+    for key in ("peer_push", "peer_push_wide"):
+        assert loader.ROUTES[key] in loader.PROGRAMS
+    assert loader.PUSH_CARVEOUT == -1
+
+
+def test_push_launch_rows_give_the_sm_103a_listed_calls_sixteen_wide_ctas():
+    """``PUSH_LAUNCH_ROWS_BY_ARCH`` replaces the payload rule for exactly the listed
+    (world size, padded rows): on ``sm_103a`` the four-rank calls of exactly 512
+    padded rows and the eight-rank calls of exactly 1024 padded rows (the SM push
+    band row) launch 16 CTAs per peer of the wide program (the rule's 8 x 8
+    elsewhere); the four-rank 128-row calls keep 32 x 1 and every other call of
+    either world size the payload rule (``sm_100a`` lists the four-rank 512-row
+    row too; its own test follows). An arch outside the table raises."""
+
+    assert loader.push_launch_rows("sm_103a") == ((4, 512, 16, 8), (8, 1024, 16, 8))
+    assert loader.push_launch_rows("sm_100a") == ((4, 512, 16, 8),)
+    assert loader.push_launch(512, 2, world_size=4, arch="sm_103a") == (
+        "peer_push_wide",
+        16,
+        8,
+    )
+    assert loader.push_launch(1024, 2, world_size=8, arch="sm_103a") == (
+        "peer_push_wide",
+        16,
+        8,
+    )
+    # Keyed on the padded row count, not the payload.
+    assert loader.push_launch(512, 4, world_size=4, arch="sm_103a") == (
+        "peer_push_wide",
+        16,
+        8,
+    )
+    assert loader.push_launch(1024, 4, world_size=8, arch="sm_103a") == (
+        "peer_push_wide",
+        16,
+        8,
+    )
+    assert loader.push_launch(512, 2, world_size=4, arch="sm_100a") == (
+        "peer_push_wide",
+        16,
+        8,
+    )
+    assert loader.push_launch(1024, 2, world_size=8, arch="sm_100a") == (
+        "peer_push_wide",
+        8,
+        8,
+    )
+    # Each row is keyed on its own world size: the other world size at the same
+    # row count keeps the payload rule.
+    assert loader.push_launch(512, 2, world_size=8, arch="sm_103a") == (
+        "peer_push_wide",
+        8,
+        8,
+    )
+    assert loader.push_launch(1024, 2, world_size=4, arch="sm_103a") == (
+        "peer_push_wide",
+        8,
+        8,
+    )
+    assert loader.push_launch(128, 2, world_size=4, arch="sm_103a") == (
+        "peer_push",
+        32,
+        1,
+    )
+    for rows in (256, 384, 640, 1024):
+        assert loader.push_launch(rows, 2, world_size=4, arch="sm_103a") == (
+            "peer_push_wide",
+            8,
+            8,
+        )
+    for rows in (256, 384, 512, 640, 1152, 2048):
+        assert loader.push_launch(rows, 2, world_size=8, arch="sm_103a") == (
+            "peer_push_wide",
+            8,
+            8,
+        )
+    for arch in ("sm_90a", "sm_120a", ""):
+        with pytest.raises(ValueError, match="no SM push launch rows"):
+            loader.push_launch(512, 2, world_size=4, arch=arch)
+        with pytest.raises(ValueError, match="no SM push launch rows"):
+            loader.push_launch_rows(arch)
+
+
+def test_push_kslices_table_lists_the_eight_rank_512_row_calls_at_four_slices_on_sm_103a():
+    """``PUSH_KSLICES_BY_ARCH`` (per-K-slice readiness on the SM push chain) lists one
+    row: on ``sm_103a`` the SM-push calls of world size 8 and exactly 512 padded rows
+    publish four readiness words per (peer, chunk) -- the host sequence launches their
+    ``_ks4`` push and main twins -- and every other call on either architecture
+    publishes one; the backend sizes a workspace by the widest call of its capacity
+    (the pitch's chunk count wherever the row is out of reach or narrower) and a
+    captured call clears ``world_size * num_chunks * k_slices`` words. An arch outside
+    the table raises."""
+
+    assert loader.PUSH_KSLICES_BY_ARCH == {"sm_100a": [], "sm_103a": [[8, 512, 4]]}
+    assert loader.push_kslice_rows("sm_103a") == ((8, 512, 4),)
+    assert loader.push_kslice_rows("sm_100a") == ()
+    assert loader.push_kslices(512, world_size=8, arch="sm_103a") == 4
+    assert loader.max_push_kslices(8, "sm_103a") == 4
+    for arch in _BOTH:
+        for world_size in (2, 4, 8):
+            for padded in (128, 256, 384, 512, 640, 1024, 2432, 65536):
+                listed = (arch, world_size, padded) == ("sm_103a", 8, 512)
+                assert loader.push_kslices(
+                    padded, world_size=world_size, arch=arch
+                ) == (4 if listed else 1)
+                chunks = loader.chunk_plan(padded)[2]
+                reached = (arch, world_size) == ("sm_103a", 8) and padded >= 512
+                assert loader.push_signal_slots(
+                    padded, world_size=world_size, arch=arch
+                ) == (max(chunks, 4) if reached else chunks)
+            if (arch, world_size) != ("sm_103a", 8):
+                assert loader.max_push_kslices(world_size, arch) == 1
+        assert backend._readiness_words(4, 512, arch) == 4 * loader.chunk_plan(512)[2]
+        assert (
+            backend._readiness_words(4, 65536, arch) == 4 * loader.chunk_plan(65536)[2]
+        )
+    assert backend._readiness_words(8, 512, "sm_100a") == 8
+    assert backend._readiness_words(8, 512, "sm_103a") == 32
+    for arch in ("sm_90a", "sm_120a", ""):
+        with pytest.raises(ValueError, match="no SM push readiness slice rows"):
+            loader.push_kslices(512, world_size=4, arch=arch)
+        with pytest.raises(ValueError, match="no SM push readiness slice rows"):
+            loader.push_kslice_rows(arch)
+        with pytest.raises(ValueError, match="no SM push readiness slice rows"):
+            loader.max_push_kslices(8, arch)
+        with pytest.raises(ValueError, match="no SM push readiness slice rows"):
+            loader.push_signal_slots(512, world_size=8, arch=arch)
+    with pytest.raises(ValueError, match="pitch must be positive"):
+        loader.push_signal_slots(0, world_size=8, arch="sm_103a")
+
+
+def test_push_signal_slots_size_the_readiness_pad_by_the_widest_call_of_the_capacity():
+    """With the ``sm_103a`` readiness slice row, a workspace is sized by the largest
+    words-per-rank-row count any call up to its pitch publishes: the row's chunk count
+    times its slice count once the pitch can serve the row, the pitch's own chunk count
+    wherever that is larger (a large workspace never grows past the one-word sizing) or
+    the row is out of reach; the other world sizes and the other architecture keep the
+    chunk count. ``_publish_scratch`` refuses a signal pad too small for the widened
+    view and sizes the generation's ticket counters by the same count."""
+
+    slots = loader.push_signal_slots
+    assert loader.max_push_kslices(8, "sm_103a") == 4
+    assert loader.max_push_kslices(4, "sm_103a") == 1
+    assert loader.max_push_kslices(8, "sm_100a") == 1
+    assert slots(128, world_size=8, arch="sm_103a") == 1
+    assert slots(384, world_size=8, arch="sm_103a") == 1
+    for pitch in (512, 640, 2048, 2432, 2560, 7296):
+        assert slots(pitch, world_size=8, arch="sm_103a") == 4, pitch
+    assert loader.chunk_plan(7296)[2] == 3 and loader.chunk_plan(7424)[2] == 4
+    assert slots(7424, world_size=8, arch="sm_103a") == 4
+    assert slots(9856, world_size=8, arch="sm_103a") == 5
+    assert loader.chunk_plan(65536)[2] == 27
+    assert slots(65536, world_size=8, arch="sm_103a") == 27
+    for pitch in (128, 512, 2048, 65536):
+        chunks = loader.chunk_plan(pitch)[2]
+        for world_size in (2, 4):
+            assert slots(pitch, world_size=world_size, arch="sm_103a") == chunks
+        assert slots(pitch, world_size=8, arch="sm_100a") == chunks
+    assert backend._readiness_words(8, 512, "sm_103a") == 32
+    assert backend._readiness_words(8, 512, "sm_100a") == 8
+    assert backend._readiness_words(8, 65536, "sm_103a") == 8 * 27
+    # Publication at 512 rows per peer on eight ranks: 32 words (128 bytes) must fit the pad.
+    call = backend._Call(0, 0, 8, "g", "bfloat16", "sm_103a", 512, 1280, "k_major")
+
+    class _PadHandle(_GrowthHandle):
+        def __init__(self, signal_pad_size):
+            self.signal_pad_size = signal_pad_size
+
+    workspace = _published_workspace(push_buffers=None)
+    workspace.world_size, workspace.arch = 8, "sm_103a"
+    scratch = torch.empty(8, 512, 8, dtype=torch.bfloat16)
+    backend._publish_scratch(workspace, call, 512, scratch, _PadHandle(2048))
+    assert workspace.max_chunks == 1 and workspace.signal_slots == 4
+    assert tuple(workspace.signal_pad.shape) == (32,)
+    workspace = _published_workspace(push_buffers=None)
+    workspace.world_size, workspace.arch = 8, "sm_103a"
+    with pytest.raises(RuntimeError, match="cannot hold 32 readiness words"):
+        backend._publish_scratch(workspace, call, 512, scratch, _PadHandle(64))
+    # The same pitch on the other architecture keeps the one-word view and never reads the pad size.
+    workspace = _published_workspace(push_buffers=None)
+    workspace.world_size = 8
+    backend._publish_scratch(
+        workspace,
+        backend._Call(0, 0, 8, "g", "bfloat16", "sm_100a", 512, 1280, "k_major"),
+        512,
+        scratch,
+        _GrowthHandle(),
+    )
+    assert workspace.max_chunks == 1 and workspace.signal_slots == 1
+    assert tuple(workspace.signal_pad.shape) == (8,)
+
+
+def test_push_launch_rows_give_the_sm_100a_four_rank_512_row_calls_sixteen_wide_ctas():
+    """The ``sm_100a`` four-rank row is the same: the four-rank calls of exactly 512
+    padded rows launch 16 CTAs per peer of the wide program (the payload rule's
+    8 x 8 there), keyed on the padded row count; the four-rank 128-row calls keep
+    32 x 1 and every two-rank and eight-rank call the payload rule (``sm_100a`` has
+    no eight-rank row: the ``sm_103a`` 1024-row band row has no counterpart)."""
+
+    assert loader.push_launch_rows("sm_100a") == ((4, 512, 16, 8),)
+    assert loader.push_launch_rows("sm_100a") == loader.push_launch_rows("sm_103a")[:1]
+    assert loader.push_launch(1024, 2, world_size=8, arch="sm_100a") == (
+        "peer_push_wide",
+        8,
+        8,
+    )
+    for arch in _BOTH:
+        assert loader.push_launch(512, 2, world_size=4, arch=arch) == (
+            "peer_push_wide",
+            16,
+            8,
+        )
+        assert loader.push_launch(512, 4, world_size=4, arch=arch) == (
+            "peer_push_wide",
+            16,
+            8,
+        )
+        assert loader.push_launch(512, 2, world_size=8, arch=arch) == (
+            "peer_push_wide",
+            8,
+            8,
+        )
+        assert loader.push_launch(512, 2, world_size=2, arch=arch) == (
+            "peer_push_wide",
+            8,
+            8,
+        )
+        assert loader.push_launch(128, 2, world_size=4, arch=arch) == (
+            "peer_push",
+            32,
+            1,
+        )
+        for rows in (256, 384, 640, 1024):
+            assert loader.push_launch(rows, 2, world_size=4, arch=arch) == (
+                "peer_push_wide",
+                8,
+                8,
+            )
+
+
+def test_main_programs_share_one_block_and_dynamic_shared_memory_contract():
+    blocks = set()
+    smem = set()
+    for world_size, dtype_name, b_layout in _main_programs():
+        program = loader.main_program(world_size, dtype_name, b_layout)
+        blocks.add(loader.launch_block(program))
+        smem.add(loader.dynamic_smem_bytes(program))
+    assert blocks == {(loader.MAIN_THREADS, 1, 1)}
+    assert len(smem) == 1 and smem.pop() > 0
+    # The ``_n128`` twins share the N256 block (one thread count per sequence)
+    # and one dynamic shared memory value of their own, read per program from
+    # the twin's build receipt (never assumed equal to the N256 value).
+    twin_blocks = set()
+    twin_smem = set()
+    for world_size, dtype_name, b_layout in _n128_programs():
+        program = loader.main_program(world_size, dtype_name, b_layout, block_n=128)
+        twin_blocks.add(loader.launch_block(program))
+        twin_smem.add(loader.dynamic_smem_bytes(program))
+    assert twin_blocks == {(loader.MAIN_THREADS, 1, 1)}
+    assert len(twin_smem) == 1 and twin_smem.pop() > 0
+    # The ``_cg2`` CTA-pair twins share the N256 block as well and one dynamic
+    # shared memory value of their own (six 32 KiB stages per CTA, read from the
+    # twin's build receipt).
+    pair_blocks = set()
+    pair_smem = set()
+    for world_size, dtype_name, b_layout in _cg2_programs():
+        program = loader.main_program(world_size, dtype_name, b_layout, form="cg2")
+        pair_blocks.add(loader.launch_block(program))
+        pair_smem.add(loader.dynamic_smem_bytes(program))
+    assert pair_blocks == {(loader.MAIN_THREADS, 1, 1)}
+    assert len(pair_smem) == 1 and pair_smem.pop() > 0
+    # The spill-wave N-split pair twins share the N256 block as well (one thread
+    # count per sequence) and, per form, one dynamic shared memory value of
+    # their own read from the twin's build receipt.
+    spill_blocks = set()
+    spill_smem = {}
+    for world_size, dtype_name, b_layout, form in _cg2s_programs():
+        program = loader.main_program(world_size, dtype_name, b_layout, form=form)
+        spill_blocks.add(loader.launch_block(program))
+        spill_smem.setdefault(form, set()).add(loader.dynamic_smem_bytes(program))
+    assert spill_blocks == {(loader.MAIN_THREADS, 1, 1)}
+    for form, values in spill_smem.items():
+        assert len(values) == 1 and values.pop() > 0, form
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected"),
+    [
+        (1, 128),
+        (125, 128),
+        (128, 128),
+        (129, 256),
+        (1025, 1152),
+        (19456, 19456),
+    ],
+)
+def test_padded_rows_rounds_up_to_the_mma_tile(rows, expected):
+    assert loader.padded_rows(rows) == expected
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected"),
+    [
+        (125, (128, 128, 1)),
+        (128, (128, 128, 1)),
+        (1025, (1152, 1152, 1)),
+        (2432, (2432, 2432, 1)),
+        (2433, (2560, 2432, 2)),
+        (2560, (2560, 2432, 2)),
+        (16384, (16384, 2432, 7)),
+        (19456, (19456, 2432, 8)),
+    ],
+)
+def test_chunk_plan_pads_rows_and_pushes_at_most_nineteen_row_blocks_per_chunk(
+    rows, expected
+):
+    assert loader.chunk_plan(rows) == expected
+
+
+@pytest.mark.parametrize(
+    ("rows", "n", "world_size", "sm_count", "expected"),
+    [
+        (125, 1280, 8, 148, (40, 1, 1)),  # 8 x 1 x 5 tiles < SM count
+        (512, 1280, 8, 148, (148, 1, 1)),  # 8 x 4 x 5 = 160 tiles: one CTA per SM
+        (512, 2560, 4, 148, (148, 1, 1)),
+        (125, 7168, 2, 148, (56, 1, 1)),  # 2 x 1 x 28
+        (1025, 14336, 4, 148, (148, 1, 1)),
+        (125, 1280, 8, 160, (40, 1, 1)),
+    ],
+)
+def test_main_grid_is_one_cta_per_sm_bounded_by_the_total_tiles(
+    rows, n, world_size, sm_count, expected
+):
+    assert (
+        loader.main_grid(rows, n, world_size=world_size, sm_count=sm_count) == expected
     )
 
 
-class _FakeDescriptorStorage:
-    def __init__(self, device):
-        self.device = device
-        self.copies = []
-
-    def copy_(self, source, *, non_blocking):
-        self.copies.append((source, non_blocking))
-        return self
+def test_main_grid_requires_a_positive_world_size_and_sm_count():
+    with pytest.raises(ValueError, match="sm_count"):
+        loader.main_grid(512, 1280, world_size=8, sm_count=0)
+    with pytest.raises(ValueError, match="world_size"):
+        loader.main_grid(512, 1280, world_size=0, sm_count=148)
 
 
-def _mock_descriptor_allocations(monkeypatch, backend):
-    allocations = []
+@pytest.mark.parametrize(
+    ("rows", "n", "world_size", "sm_count", "block_n", "tiles", "expected"),
+    [
+        (125, 1280, 8, 148, 256, 40, (40, 1, 1)),  # 8 x 1 x 5 N256 tiles
+        (125, 1280, 8, 148, 128, 80, (80, 1, 1)),  # the same call on the twin
+        (512, 1280, 8, 148, 256, 160, (148, 1, 1)),
+        (512, 1280, 8, 148, 128, 320, (148, 1, 1)),  # one CTA per SM either way
+        (125, 2560, 4, 148, 128, 80, (80, 1, 1)),
+        (125, 2048, 8, 148, 128, 128, (128, 1, 1)),
+        (125, 7168, 2, 148, 256, 56, (56, 1, 1)),  # ws2 only ever runs the N256 program
+        (1025, 14336, 4, 148, 256, 2016, (148, 1, 1)),
+    ],
+)
+def test_main_grid_and_main_tiles_count_the_tiles_of_the_selected_width(
+    rows, n, world_size, sm_count, block_n, tiles, expected
+):
+    assert loader.main_tiles(rows, n, world_size=world_size, block_n=block_n) == tiles
+    assert (
+        loader.main_grid(
+            rows, n, world_size=world_size, sm_count=sm_count, block_n=block_n
+        )
+        == expected
+    )
+    if block_n == 256:
+        # The public width is the default.
+        assert (
+            loader.main_grid(rows, n, world_size=world_size, sm_count=sm_count)
+            == expected
+        )
 
-    def allocate(*args, **kwargs):
-        storage = _FakeDescriptorStorage(kwargs["device"])
-        allocations.append((storage, args, kwargs))
-        return storage
 
-    monkeypatch.setattr(backend.torch, "empty", allocate)
-    monkeypatch.setattr(backend.torch.cuda, "stream", lambda stream: nullcontext())
-    return allocations
+def test_main_tiles_accepts_only_the_delivered_widths_and_a_width_multiple_n():
+    with pytest.raises(ValueError, match="block_n"):
+        loader.main_tiles(125, 1280, world_size=8, block_n=64)
+    with pytest.raises(ValueError, match="multiple of 256"):
+        loader.main_grid(125, 1152, world_size=8, sm_count=148)
+    with pytest.raises(ValueError, match="multiple of 128"):
+        loader.main_tiles(125, 1216, world_size=8, block_n=128)
+    with pytest.raises(ValueError, match="positive"):
+        loader.main_tiles(125, 0, world_size=8, block_n=256)
+
+
+@pytest.mark.parametrize(
+    ("rows", "n", "world_size", "sm_count", "pair_tiles", "expected"),
+    [
+        # 8 M tiles -> 4 pairs per peer; 8 N tiles; 2 peers: 64 pair tiles, every pair gets a cluster.
+        (1024, 2048, 2, 148, 64, (128, 1, 1)),
+        # 9 M tiles -> 5 pairs (the last pair's odd CTA idles); 4 x 5 x 8 = 160 > 74 clusters.
+        (1025, 2048, 4, 148, 160, (148, 1, 1)),
+        # 20 M tiles in two chunks (19 + 1): 10 + 1 pairs; 2 x 11 x 8 = 176.
+        (2433, 2048, 2, 148, 176, (148, 1, 1)),
+        # 512 M tiles in 27 chunks (26 x 19 + 18): 26 x 10 + 9 = 269 pairs; x 2 x 8.
+        (65536, 2048, 2, 148, 4304, (148, 1, 1)),
+        # One M tile: one pair per peer and N tile (the rule never selects the pair form here).
+        (125, 1280, 8, 148, 40, (80, 1, 1)),
+        # An odd SM count rounds down to whole clusters.
+        (65536, 2048, 2, 147, 4304, (146, 1, 1)),
+    ],
+)
+def test_main_grid_of_the_pair_main_is_even_and_bounded_by_the_pair_tiles(
+    rows, n, world_size, sm_count, pair_tiles, expected
+):
+    assert loader.main_pair_tiles(rows, n, world_size=world_size) == pair_tiles
+    grid = loader.main_grid(
+        rows, n, world_size=world_size, sm_count=sm_count, form="cg2"
+    )
+    assert grid == expected and grid[0] % 2 == 0 and grid[0] <= 2 * pair_tiles
+    assert grid[0] == 2 * max(1, min(pair_tiles, sm_count // 2))
+    # The spill-wave N-split pair twins launch the same even grid.
+    for form in loader.PAIR_FORMS[1:]:
+        spill_grid = loader.main_grid(
+            rows, n, world_size=world_size, sm_count=sm_count, form=form
+        )
+        assert spill_grid == grid, form
+    # The one-CTA grid of the same call is the default form.
+    assert loader.main_grid(
+        rows, n, world_size=world_size, sm_count=sm_count
+    ) == loader.main_grid(rows, n, world_size=world_size, sm_count=sm_count, form="cg1")
+
+
+def test_main_grid_of_the_pair_main_exists_at_the_public_width_only():
+    with pytest.raises(ValueError, match="block_n=256 only"):
+        loader.main_grid(
+            1024, 2048, world_size=2, sm_count=148, block_n=128, form="cg2"
+        )
+    with pytest.raises(ValueError, match="block_n=256 only"):
+        loader.main_grid(
+            1024, 2048, world_size=2, sm_count=148, block_n=128, form="cg2s1"
+        )
+    with pytest.raises(ValueError, match="form"):
+        loader.main_grid(1024, 2048, world_size=2, sm_count=148, form="pair")
+    with pytest.raises(ValueError, match="multiple of 256"):
+        loader.main_pair_tiles(1024, 1152, world_size=2)
+
+
+def _frozen_rule(rows, n, *, world_size, arch):
+    """The exporter's N128 rule without the delivered-class table: at world sizes
+    4 and 8 the twin is selected when ``2 * ceil(T256 / S) > ceil(2 * T256 / S)``
+    for ``T256`` N256 tiles and ``S`` SMs, within the architecture's
+    ``N128_MAX_WAVES_BY_ARCH`` N256 waves."""
+
+    if world_size not in (4, 8):
+        return 256
+    sm_count = loader.SM_COUNT_BY_ARCH[arch]
+    t256 = loader.main_tiles(rows, n, world_size=world_size, block_n=256)
+    w256 = -(-t256 // sm_count)
+    w128 = -(-(2 * t256) // sm_count)
+    cap = w256 <= loader.N128_MAX_WAVES_BY_ARCH[arch]
+    return 128 if 2 * w256 > w128 and cap else 256
+
+
+_BOTH = ("sm_100a", "sm_103a")
+# Rows of the Cake export inventory (``exports/all_gather_matmul/shapes.json`` of
+# the exporting Cake tree; it is not delivered with this test) with the tile
+# width the exporter resolved them to under the frozen rule (``_frozen_rule``
+# with S = 148 and the per-architecture wave cap ``N128_MAX_WAVES_BY_ARCH``:
+# two N256 waves on sm_100a, one on sm_103a), keyed by the architectures the
+# row is exported on. The rows the rule routes to the ``_n128`` main on some
+# architecture are embedded verbatim: their classes define ``N128_CLASSES``
+# per architecture (eight routed rows on sm_100a, the three one-wave M=125
+# rows on sm_103a). The other rows are at least one N256 row per
+# world-size-4/8 class (the wave cap or the fill test fails there) and two ws2
+# rows (always 256).
+_N256 = {"sm_100a": 256, "sm_103a": 256}
+# One N256 wave (40 or 64 tiles): within the cap of both architectures.
+_N128 = {"sm_100a": 128, "sm_103a": 128}
+# Two N256 waves (160 tiles against three on the twin): within the sm_100a cap
+# of two, beyond the sm_103a cap of one.
+_N128_SM100A = {"sm_100a": 128, "sm_103a": 256}
+_INVENTORY_ROWS = (
+    # (label, (rows, n, world_size, dtype, b_layout), {arch: block_n})
+    (
+        "tp8_correctness_llama_qkv_bf16_m512_n1280",
+        (512, 1280, 8, "bfloat16", "n_major"),
+        _N128_SM100A,
+    ),
+    # The sm_103a-only packed-QKV row: two waves, beyond the sm_103a cap.
+    (
+        "ws4_packed_qkv_bf16_m512_n2560",
+        (512, 2560, 4, "bfloat16", "n_major"),
+        {"sm_103a": 256},
+    ),
+    (
+        "llama_tp8_qkv_bf16_m125_kmajor",
+        (125, 1280, 8, "bfloat16", "k_major"),
+        _N128,
+    ),
+    (
+        "llama_tp8_qkv_bf16_m512_kmajor",
+        (512, 1280, 8, "bfloat16", "k_major"),
+        _N128_SM100A,
+    ),
+    (
+        "llama_tp4_qkv_bf16_m125_kmajor",
+        (125, 2560, 4, "bfloat16", "k_major"),
+        _N128,
+    ),
+    (
+        "llama_tp4_qkv_bf16_m512_kmajor",
+        (512, 2560, 4, "bfloat16", "k_major"),
+        _N128_SM100A,
+    ),
+    (
+        "kmajor_ws4_fp16_m512_n2560",
+        (512, 2560, 4, "float16", "k_major"),
+        _N128_SM100A,
+    ),
+    (
+        "kmajor_ws8_fp16_m512_n1280",
+        (512, 1280, 8, "float16", "k_major"),
+        _N128_SM100A,
+    ),
+    (
+        "tail_ws8_bf16_m125_n2048",
+        (125, 2048, 8, "bfloat16", "n_major"),
+        _N128,
+    ),
+    # The sm_103a-only ws8 512-row readiness-coverage rows: 32 / 64 N256 tiles
+    # (one wave on the twin too) route the two bf16 rows to the twin; the fp16
+    # n_major row (160 tiles, two waves) stays at 256, and its class has no
+    # delivered twin on sm_103a anyway.
+    (
+        "kmajor_ws8_bf16_m512_n256",
+        (512, 256, 8, "bfloat16", "k_major"),
+        {"sm_103a": 128},
+    ),
+    (
+        "tp8_correctness_bf16_m512_n512",
+        (512, 512, 8, "bfloat16", "n_major"),
+        {"sm_103a": 128},
+    ),
+    (
+        "tp8_correctness_fp16_m512_n1280",
+        (512, 1280, 8, "float16", "n_major"),
+        {"sm_103a": 256},
+    ),
+    # 320 N256 tiles = three waves: beyond the cap of both architectures.
+    (
+        "llama_tp8_qkv_bf16_m1024_kmajor",
+        (1024, 1280, 8, "bfloat16", "k_major"),
+        _N256,
+    ),
+    # 224 N256 tiles: 2 * ceil(224 / 148) = 4 = ceil(448 / 148), no idle slot saved.
+    (
+        "llama_tp8_gate_up_bf16_m125_kmajor",
+        (125, 7168, 8, "bfloat16", "k_major"),
+        _N256,
+    ),
+    (
+        "llama_tp4_gate_up_bf16_m125_kmajor",
+        (125, 14336, 4, "bfloat16", "k_major"),
+        _N256,
+    ),
+    # The gate_up rows (896 / 3584 N256 tiles: beyond the cap of both
+    # architectures); on sm_103a the M=512 rows run the spill-wave N-split pair
+    # twin of their point and the M=2048 rows (not routed) keep the one-CTA
+    # program; on sm_100a the M=512 and M=1024 rows (measured points) run the
+    # CTA-pair twin and the M=1025 (1152 padded rows) / M=2048 rows keep the
+    # one-CTA program.
+    (
+        "llama_tp4_gate_up_bf16_m512_kmajor",
+        (512, 14336, 4, "bfloat16", "k_major"),
+        _N256,
+    ),
+    (
+        "llama_tp8_gate_up_bf16_m512_kmajor",
+        (512, 7168, 8, "bfloat16", "k_major"),
+        _N256,
+    ),
+    (
+        "llama_tp4_gate_up_bf16_m1024_kmajor",
+        (1024, 14336, 4, "bfloat16", "k_major"),
+        _N256,
+    ),
+    (
+        "llama_tp8_gate_up_bf16_m1024_kmajor",
+        (1024, 7168, 8, "bfloat16", "k_major"),
+        _N256,
+    ),
+    (
+        "llama_tp4_gate_up_bf16_m1025_kmajor",
+        (1025, 14336, 4, "bfloat16", "k_major"),
+        _N256,
+    ),
+    (
+        "llama_tp8_gate_up_bf16_m1025_kmajor",
+        (1025, 7168, 8, "bfloat16", "k_major"),
+        _N256,
+    ),
+    (
+        "llama_tp4_gate_up_bf16_m2048_kmajor",
+        (2048, 14336, 4, "bfloat16", "k_major"),
+        _N256,
+    ),
+    (
+        "llama_tp8_gate_up_bf16_m2048_kmajor",
+        (2048, 7168, 8, "bfloat16", "k_major"),
+        _N256,
+    ),
+    # The pair-routed N256 rows (ws2 always 256; 320 / 360 / 640
+    # N256 tiles at ws4 = three to five waves, beyond the cap of both
+    # architectures): on sm_103a the measured rectangles route them, on sm_100a the
+    # measured points (the m2048 QKV row is pair-routed on sm_100a only).
+    (
+        "perf_bf16_m2048",
+        (2048, 2048, 2, "bfloat16", "n_major"),
+        _N256,
+    ),
+    (
+        "perf_bf16_m4096",
+        (4096, 2048, 2, "bfloat16", "n_major"),
+        _N256,
+    ),
+    (
+        "llama_tp4_qkv_bf16_m1024_kmajor",
+        (1024, 2560, 4, "bfloat16", "k_major"),
+        _N256,
+    ),
+    (
+        "llama_tp4_qkv_bf16_m1025_kmajor",
+        (1025, 2560, 4, "bfloat16", "k_major"),
+        _N256,
+    ),
+    (
+        "llama_tp4_qkv_bf16_m2048_kmajor",
+        (2048, 2560, 4, "bfloat16", "k_major"),
+        _N256,
+    ),
+    # The N256 coverage rows of the float16 k_major classes (640 tiles: five waves).
+    (
+        "kmajor_ws4_fp16_m2048_n2560",
+        (2048, 2560, 4, "float16", "k_major"),
+        _N256,
+    ),
+    (
+        "kmajor_ws8_fp16_m2048_n1280",
+        (2048, 1280, 8, "float16", "k_major"),
+        _N256,
+    ),
+    (
+        "ws4_perf_bf16_m1024",
+        (1024, 2048, 4, "bfloat16", "n_major"),
+        _N256,
+    ),
+    (
+        "tp8_perf_bf16_m1024",
+        (1024, 2048, 8, "bfloat16", "n_major"),
+        _N256,
+    ),
+    # Classes without any routed row (like the ws4 bfloat16 n_major class above):
+    # the float16 n_major mains have no twin.
+    (
+        "tail_ws4_fp16_m1025_n2048",
+        (1025, 2048, 4, "float16", "n_major"),
+        _N256,
+    ),
+    (
+        "tp8_correctness_fp16_m16384",
+        (16384, 2048, 8, "float16", "n_major"),
+        _N256,
+    ),
+    # The ws2 M=1024 rows (N = 2048; the M=1000 row pads to 1024): on both
+    # architectures the measured points route them to the CTA-pair twin (the ws2
+    # k_major classes' only twins).
+    (
+        "perf_bf16_m1024",
+        (1024, 2048, 2, "bfloat16", "n_major"),
+        _N256,
+    ),
+    (
+        "tail_ws2_bf16_m1000_n2048",
+        (1000, 2048, 2, "bfloat16", "n_major"),
+        _N256,
+    ),
+    (
+        "kmajor_ws2_bf16_m1024_n2048",
+        (1024, 2048, 2, "bfloat16", "k_major"),
+        _N256,
+    ),
+    (
+        "kmajor_ws2_fp16_m1024_n2048",
+        (1024, 2048, 2, "float16", "k_major"),
+        _N256,
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("label", "shape", "widths"),
+    _INVENTORY_ROWS,
+    ids=[row[0] for row in _INVENTORY_ROWS],
+)
+def test_main_block_n_routes_the_inventory_rows_like_the_exporter(label, shape, widths):
+    """The delivered loader resolves every inventory row to the width the
+    exporter built its route with; on the inventory the delivered-class table
+    never changes the outcome of the frozen rule."""
+
+    rows, n, world_size, dtype_name, b_layout = shape
+    for arch, expected in widths.items():
+        assert (
+            loader.main_block_n(
+                rows,
+                n,
+                world_size=world_size,
+                arch=arch,
+                dtype_name=dtype_name,
+                b_layout=b_layout,
+            )
+            == expected
+        ), (label, arch)
+        assert _frozen_rule(rows, n, world_size=world_size, arch=arch) == expected, (
+            label,
+            arch,
+        )
+
+
+@pytest.mark.parametrize(
+    ("label", "shape", "widths"),
+    _INVENTORY_ROWS,
+    ids=[row[0] for row in _INVENTORY_ROWS],
+)
+def test_main_form_routes_the_inventory_rows_by_the_region_table(label, shape, widths):
+    """The loader's ``main_form`` on the inventory is the frozen region rule:
+    the CTA-pair form for an N256 row whose padded rows and N lie inside some
+    measured rectangle of its class on the architecture -- on sm_103a
+    perf_bf16_m1024 / m2048 / m4096 and tail_ws2_bf16_m1000_n2048 (ws2 bf16
+    n_major), kmajor_ws2_bf16_m1024_n2048 (ws2 bf16 k_major),
+    kmajor_ws2_fp16_m1024_n2048 (ws2 fp16 k_major), llama_tp4_qkv_bf16_m1024 /
+    m1025_kmajor and llama_tp4_gate_up_bf16_m512_kmajor (ws4 bf16 k_major) and
+    llama_tp8_gate_up_bf16_m512_kmajor (ws8 bf16 k_major); on sm_100a
+    perf_bf16_m1024 / m2048 / m4096 and tail_ws2_bf16_m1000_n2048 (ws2 bf16
+    n_major), kmajor_ws2_bf16_m1024_n2048 (ws2 bf16 k_major),
+    kmajor_ws2_fp16_m1024_n2048 (ws2 fp16 k_major), llama_tp4_qkv_bf16_m1024 /
+    m1025 / m2048_kmajor and llama_tp4_gate_up_bf16_m512 / m1024_kmajor (ws4
+    bf16 k_major) and llama_tp8_gate_up_bf16_m512 / m1024_kmajor (ws8 bf16
+    k_major; the measured sm_100a points); the one-CTA form for every other row.
+    Of the pair rows, the two sm_103a spill points --
+    llama_tp4_gate_up_bf16_m512_kmajor and llama_tp8_gate_up_bf16_m512_kmajor --
+    run the spill-wave N-split pair twin of the form their point names instead;
+    llama_tp4_qkv_bf16_m1024_kmajor stays on the CTA-pair twin. Of the one-CTA
+    rows, llama_tp4_gate_up_bf16_m125_kmajor on sm_103a (128 padded rows at
+    N = 14336: the one tile-order point) runs the ``po`` tile-order twin of the
+    one-CTA program; every other row, and that row on sm_100a, runs the
+    one-CTA program itself."""
+
+    rows, n, world_size, dtype_name, b_layout = shape
+    for arch, block_n in widths.items():
+        form = loader.main_form(
+            rows,
+            n,
+            world_size=world_size,
+            arch=arch,
+            dtype_name=dtype_name,
+            b_layout=b_layout,
+            block_n=block_n,
+        )
+        padded = loader.padded_rows(rows)
+        delivered = (world_size, dtype_name, b_layout) in _cg2_classes(arch)
+        rectangles = [
+            entry[3:]
+            for entry in loader.CG2_REGIONS[arch]
+            if tuple(entry[:3]) == (world_size, dtype_name, b_layout)
+        ]
+        qualifies = block_n == 256 and any(
+            min_rows <= padded <= max_rows and min_cols <= n <= max_cols
+            for min_rows, max_rows, min_cols, max_cols in rectangles
+        )
+        point = _spill_point_form(arch, world_size, dtype_name, b_layout, padded, n)
+        order = loader._tile_order_point(
+            arch, world_size, dtype_name, b_layout, padded, n
+        )
+        order_delivered = (world_size, dtype_name, b_layout, order) in _order_classes(
+            arch
+        )
+        if qualifies and delivered:
+            expected_form = point or "cg2"
+        elif block_n == 256 and order is not None and order_delivered:
+            expected_form = order
+        else:
+            expected_form = "cg1"
+        assert form == expected_form, (label, arch)
+        expected_order = (
+            arch == "sm_103a" and label == "llama_tp4_gate_up_bf16_m125_kmajor"
+        )
+        assert (order is not None) is expected_order, (label, arch)
+        assert (form in loader.ORDER_FORMS) is expected_order, (label, arch)
+        assert (form == "po") is expected_order, (label, arch)
+        expected_pair = (
+            label
+            in {
+                "sm_103a": {
+                    "perf_bf16_m1024",
+                    "perf_bf16_m2048",
+                    "perf_bf16_m4096",
+                    "tail_ws2_bf16_m1000_n2048",
+                    "kmajor_ws2_bf16_m1024_n2048",
+                    "kmajor_ws2_fp16_m1024_n2048",
+                    "llama_tp4_qkv_bf16_m1024_kmajor",
+                    "llama_tp4_qkv_bf16_m1025_kmajor",
+                    "llama_tp4_gate_up_bf16_m512_kmajor",
+                    "llama_tp8_gate_up_bf16_m512_kmajor",
+                },
+                "sm_100a": {
+                    "perf_bf16_m1024",
+                    "perf_bf16_m2048",
+                    "perf_bf16_m4096",
+                    "tail_ws2_bf16_m1000_n2048",
+                    "kmajor_ws2_bf16_m1024_n2048",
+                    "kmajor_ws2_fp16_m1024_n2048",
+                    "llama_tp4_qkv_bf16_m1024_kmajor",
+                    "llama_tp4_qkv_bf16_m1025_kmajor",
+                    "llama_tp4_qkv_bf16_m2048_kmajor",
+                    "llama_tp4_gate_up_bf16_m512_kmajor",
+                    "llama_tp4_gate_up_bf16_m1024_kmajor",
+                    "llama_tp8_gate_up_bf16_m512_kmajor",
+                    "llama_tp8_gate_up_bf16_m1024_kmajor",
+                },
+            }[arch]
+        )
+        assert (form in loader.PAIR_FORMS) is expected_pair, (label, arch)
+        expected_spill = arch == "sm_103a" and label in {
+            "llama_tp4_gate_up_bf16_m512_kmajor",
+            "llama_tp8_gate_up_bf16_m512_kmajor",
+        }
+        assert (point is not None) is expected_spill, (label, arch)
+        assert (form in loader.PAIR_FORMS[1:]) is expected_spill, (label, arch)
+        # Every inventory row the rule qualifies belongs to a delivered class (the table is derived from the rows).
+        assert delivered or not qualifies, (label, arch)
+
+
+@pytest.mark.parametrize("arch", _BOTH)
+def test_main_form_selects_the_pair_twin_only_inside_a_measured_region_at_the_public_width(
+    arch,
+):
+    for world_size, dtype_name, b_layout in _main_programs():
+        n = {2: 2048, 4: 2560, 8: 1280}[world_size]
+        rule = lambda rows, n=n, block_n=256: loader.main_form(  # noqa: E731
+            rows,
+            n,
+            world_size=world_size,
+            arch=arch,
+            dtype_name=dtype_name,
+            b_layout=b_layout,
+            block_n=block_n,
+        )
+        if (world_size, dtype_name, b_layout) not in _cg2_classes(arch):
+            # No delivered pair twin: the one-CTA program whatever the row count.
+            assert (world_size, dtype_name, b_layout) not in _CG2_CLASSES[arch]
+            for rows in (1, 1024, 1025, 2048, 4096, 32768, 65536):
+                assert rule(rows) == "cg1", (
+                    arch,
+                    world_size,
+                    dtype_name,
+                    b_layout,
+                    rows,
+                )
+            continue
+        assert (world_size, dtype_name, b_layout) in _CG2_CLASSES[arch]
+        if arch == "sm_100a":
+            # The measured sm_100a points: exact padded rows at exact N.
+            assert world_size in (2, 4, 8)
+            if (world_size, b_layout) == (2, "n_major"):
+                # (2, bfloat16, n_major): exactly 1024, 2048 or 4096 padded rows at
+                # N = 2048 (897..1023, 1921..2047 and 3969..4095 pad onto the
+                # points; 1025 pads to 1152 and leaves).
+                assert dtype_name == "bfloat16"
+                assert [
+                    rule(rows)
+                    for rows in (897, 1000, 1023, 1024, 1921, 2048, 3969, 4096)
+                ] == ["cg2"] * 8
+                assert [
+                    rule(rows)
+                    for rows in (
+                        1,
+                        896,
+                        1025,
+                        1152,
+                        1920,
+                        2049,
+                        3000,
+                        3968,
+                        4097,
+                        5760,
+                        8192,
+                        65536,
+                    )
+                ] == ["cg1"] * 12
+                assert rule(1024, n=1792) == "cg1" and rule(1024, n=2304) == "cg1"
+                assert rule(2048, n=1792) == "cg1" and rule(2048, n=2304) == "cg1"
+                assert rule(4096, n=1792) == "cg1" and rule(4096, n=2304) == "cg1"
+            elif world_size == 2:
+                # (2, bfloat16, k_major) and (2, float16, k_major): exactly 1024
+                # padded rows at exactly N = 2048 (897..1023 pad onto the point;
+                # 1025 pads to 1152 and leaves); the classes have no other point.
+                assert dtype_name in ("bfloat16", "float16") and b_layout == "k_major"
+                assert [rule(rows) for rows in (897, 1000, 1023, 1024)] == ["cg2"] * 4
+                assert [
+                    rule(rows)
+                    for rows in (
+                        1,
+                        896,
+                        1025,
+                        1152,
+                        1921,
+                        2048,
+                        4096,
+                        5760,
+                        8192,
+                        65536,
+                    )
+                ] == ["cg1"] * 10
+                assert rule(1024, n=1792) == "cg1" and rule(1024, n=2304) == "cg1"
+                for cols in (2047, 2049):
+                    with pytest.raises(ValueError, match="multiple of 256"):
+                        rule(1024, n=cols)
+            elif world_size == 4:
+                # (4, bfloat16, k_major): exactly 1024, 1152 or 2048 padded rows
+                # at N = 2560 (897..1024, 1025..1152 and 1921..2048 pad onto the
+                # points; M = 1000 is inside the 1024 point); no spill point here.
+                cls = (4, "bfloat16", "k_major")
+                assert (dtype_name, b_layout) == cls[1:]
+                assert _spill_point_form(arch, *cls, 1024, 2560) is None
+                assert _spill_point_form(arch, *cls, 512, 14336) is None
+                # No tile-order point on sm_100a: the 1..128-row gate_up calls
+                # keep the one-CTA program (asserted below with rows 1 / 128).
+                assert loader._tile_order_point(arch, *cls, 128, 14336) is None
+                assert rule(128, n=14336) == "cg1"
+                assert [
+                    rule(rows)
+                    for rows in (897, 1000, 1024, 1025, 1100, 1152, 1921, 2048)
+                ] == ["cg2"] * 8
+                assert [
+                    rule(rows)
+                    for rows in (1, 512, 896, 1153, 1280, 1536, 1920, 2049, 4096, 65536)
+                ] == ["cg1"] * 10
+                assert rule(1024, n=2304) == "cg1" and rule(1024, n=2816) == "cg1"
+                assert rule(1024, n=5888) == "cg1" and rule(512, n=2560) == "cg1"
+                # ... and the gate_up points: exactly 512 or 1024 padded rows at
+                # N = 14336 (385..512 and 897..1024 pad onto them; 513 pads to 640,
+                # 1025 to 1152 and 2048 stays one-CTA).
+                assert [
+                    rule(rows, n=14336)
+                    for rows in (385, 500, 511, 512, 897, 1000, 1023, 1024)
+                ] == ["cg2"] * 8
+                assert [
+                    rule(rows, n=14336)
+                    for rows in (
+                        1,
+                        384,
+                        513,
+                        640,
+                        896,
+                        1025,
+                        1152,
+                        1921,
+                        2048,
+                        2049,
+                        4096,
+                    )
+                ] == ["cg1"] * 11
+                assert rule(512, n=14080) == "cg1" and rule(512, n=14592) == "cg1"
+                assert rule(1024, n=14080) == "cg1" and rule(1024, n=14592) == "cg1"
+            else:
+                # (8, bfloat16, k_major): exactly 512 or 1024 padded rows at
+                # N = 7168 (385..512 and 897..1024 pad onto the points; 513 pads
+                # to 640, 1025 to 1152); every N = 1280 call stays one-CTA; no
+                # spill point here.
+                cls = (8, "bfloat16", "k_major")
+                assert (dtype_name, b_layout) == cls[1:]
+                assert _spill_point_form(arch, *cls, 512, 7168) is None
+                assert [rule(rows) for rows in (1, 512, 1024, 1025, 2048, 4096)] == [
+                    "cg1"
+                ] * 6
+                assert [
+                    rule(rows, n=7168)
+                    for rows in (385, 500, 511, 512, 897, 1000, 1023, 1024)
+                ] == ["cg2"] * 8
+                assert [
+                    rule(rows, n=7168)
+                    for rows in (
+                        1,
+                        384,
+                        513,
+                        640,
+                        896,
+                        1025,
+                        1152,
+                        1921,
+                        2048,
+                        2049,
+                        4096,
+                    )
+                ] == ["cg1"] * 11
+                assert rule(512, n=6912) == "cg1" and rule(512, n=7424) == "cg1"
+                assert rule(1024, n=6912) == "cg1" and rule(1024, n=7424) == "cg1"
+            # The 128-wide program has no pair form, whatever the row count.
+            assert rule(1024, block_n=128) == "cg1" and rule(2048, block_n=128) == "cg1"
+            if world_size == 4:
+                assert rule(512, n=14336, block_n=128) == "cg1"
+            elif world_size == 8:
+                assert rule(512, n=7168, block_n=128) == "cg1"
+            continue
+        assert arch == "sm_103a"
+        if (world_size, b_layout) == (2, "n_major"):
+            # (2, bfloat16, n_major): 2048..5760 padded rows and N <= 2048, plus the
+            # M=1024 point (exactly 1024 padded rows at N = 2048; 897..1023 pad onto
+            # it, 1025 pads to 1152 and leaves, 1920 padded rows stay one-CTA).
+            assert [
+                rule(rows)
+                for rows in (1, 896, 1025, 1152, 1920, 5761, 6000, 8192, 65536)
+            ] == ["cg1"] * 9
+            assert [
+                rule(rows)
+                for rows in (897, 1000, 1023, 1024, 1921, 2048, 3000, 4096, 5760)
+            ] == ["cg2"] * 9
+            assert rule(2048, n=1792) == "cg2" and rule(2048, n=2304) == "cg1"
+            assert rule(1024, n=1792) == "cg1" and rule(1024, n=2304) == "cg1"
+        elif world_size == 2:
+            # (2, bfloat16, k_major) and (2, float16, k_major): exactly 1024 padded
+            # rows at exactly N = 2048 (897..1023 pad onto the point; 1025 pads to
+            # 1152 and leaves); the classes have no other rectangle.
+            assert dtype_name in ("bfloat16", "float16") and b_layout == "k_major"
+            assert [rule(rows) for rows in (897, 1000, 1023, 1024)] == ["cg2"] * 4
+            assert [
+                rule(rows)
+                for rows in (1, 896, 1025, 1152, 1921, 2048, 4096, 5760, 8192, 65536)
+            ] == ["cg1"] * 10
+            assert rule(1024, n=1792) == "cg1" and rule(1024, n=2304) == "cg1"
+            for cols in (2047, 2049):
+                with pytest.raises(ValueError, match="multiple of 256"):
+                    rule(1024, n=cols)
+        elif world_size == 4:
+            # (4, bfloat16, k_major) rectangle: 1024..1536 padded rows, N <= 6058;
+            # every call of the rectangle runs the CTA-pair twin (the QKV M=1024
+            # row at N = 2560 is no spill point: 897..1024 pad onto it and keep
+            # the twin like 1025..1536).
+            assert _spill_point_form(arch, 4, "bfloat16", "k_major", 1024, 2560) is None
+            assert [rule(rows) for rows in (1, 512, 896, 1537, 2048, 4096, 65536)] == [
+                "cg1"
+            ] * 7
+            assert [rule(rows) for rows in (897, 1000, 1024, 1025, 1100, 1536)] == [
+                "cg2"
+            ] * 6
+            assert rule(1024, n=2304) == "cg2" and rule(1024, n=2816) == "cg2"
+            assert (
+                rule(1024, n=5888) == "cg2"
+                and rule(1024, n=6144) == "cg1"
+                and rule(1024, n=14336) == "cg1"
+            )
+            # The gate_up point (llama_tp4_gate_up m512): exactly 512 padded rows at
+            # exactly N = 14336, the spill-wave N-split pair twin (385..511 pad to
+            # 512); 513 pads to 640 (cg1); the M=2048 row (not routed) and the
+            # neighbouring column multiples stay cg1.
+            p_gate = _spill_point_form(arch, 4, "bfloat16", "k_major", 512, 14336)
+            assert p_gate in loader.PAIR_FORMS[1:]
+            gate_rows = (385, 500, 511, 512)
+            assert [rule(rows, n=14336) for rows in gate_rows] == [p_gate] * 4
+            assert [
+                rule(rows, n=14336)
+                for rows in (129, 256, 513, 640, 1024, 1536, 1921, 2048, 2049, 4096)
+            ] == ["cg1"] * 10
+            assert rule(512, n=14080) == "cg1" and rule(512, n=14592) == "cg1"
+            assert rule(2048, n=14080) == "cg1" and rule(2048, n=14592) == "cg1"
+            assert rule(512, n=14336, block_n=128) == "cg1"
+            # The tile-order point (llama_tp4_gate_up m125): exactly 128 padded rows
+            # at exactly N = 14336 run the ``po`` tile-order twin of the one-CTA
+            # program (1..128 pad onto it; 129 pads to 256 and leaves); the
+            # neighbouring column multiples and the 128-wide call stay cg1.
+            p_order = loader._tile_order_point(
+                arch, 4, "bfloat16", "k_major", 128, 14336
+            )
+            assert p_order == "po" and p_order in loader.ORDER_FORMS
+            assert [rule(rows, n=14336) for rows in (1, 125, 128)] == ["po"] * 3
+            assert rule(128, n=14080) == "cg1" and rule(128, n=14592) == "cg1"
+            assert rule(125, n=14336, block_n=128) == "cg1"
+            for cols in (14335, 14337):
+                with pytest.raises(ValueError, match="multiple of 256"):
+                    rule(512, n=cols)
+        else:
+            # (8, bfloat16, k_major), the gate_up point (llama_tp8_gate_up m512):
+            # exactly 512 padded rows at exactly N = 7168, the spill-wave N-split
+            # pair twin; the class has no other rectangle, so the M=2048 row (not
+            # routed) and every N = 1280 call stay cg1.
+            p_ws8 = _spill_point_form(arch, 8, "bfloat16", "k_major", 512, 7168)
+            assert p_ws8 in loader.PAIR_FORMS[1:]
+            assert [rule(rows) for rows in (1, 512, 1024, 1025, 2048, 4096)] == [
+                "cg1"
+            ] * 6
+            assert [rule(rows, n=7168) for rows in (500, 511, 512)] == [p_ws8] * 3
+            assert [
+                rule(rows, n=7168)
+                for rows in (1, 513, 640, 1024, 1025, 1536, 1921, 2048, 2049, 4096)
+            ] == ["cg1"] * 10
+            assert rule(512, n=6912) == "cg1" and rule(512, n=7424) == "cg1"
+            assert rule(2048, n=6912) == "cg1" and rule(2048, n=7424) == "cg1"
+            assert rule(512, n=7168, block_n=128) == "cg1"
+            for cols in (7167, 7169):
+                with pytest.raises(ValueError, match="multiple of 256"):
+                    rule(512, n=cols)
+        # The 128-wide program has no pair form, whatever the row count.
+        assert rule(1024, block_n=128) == "cg1" and rule(2048, block_n=128) == "cg1"
+    with pytest.raises(ValueError, match="sm_90a"):
+        loader.main_form(
+            1024,
+            2048,
+            world_size=2,
+            arch="sm_90a",
+            dtype_name="bfloat16",
+            b_layout="n_major",
+            block_n=256,
+        )
+    with pytest.raises(ValueError, match="multiple of 256"):
+        loader.main_form(
+            1024,
+            1152,
+            world_size=2,
+            arch=arch,
+            dtype_name="bfloat16",
+            b_layout="n_major",
+            block_n=256,
+        )
+    with pytest.raises(ValueError, match="block_n"):
+        loader.main_form(
+            1024,
+            2048,
+            world_size=2,
+            arch=arch,
+            dtype_name="bfloat16",
+            b_layout="n_major",
+            block_n=64,
+        )
+
+
+def test_n128_classes_are_exactly_the_classes_of_the_routed_inventory_rows():
+    for arch in loader.ARCH_FLAGS:
+        routed = {
+            tuple(shape[2:])
+            for _label, shape, widths in _INVENTORY_ROWS
+            if widths.get(arch) == 128
+        }
+        assert _n128_classes(arch) == routed, arch
+    # Eight routed rows define five classes on sm_100a; the five one-wave rows
+    # (three M=125 rows, two ws8 512-row coverage rows) define three on sm_103a
+    # (a subset of the sm_100a classes).
+    assert len(_n128_classes("sm_100a")) == 5
+    assert len(_n128_classes("sm_103a")) == 3
+    assert _n128_classes("sm_103a") < _n128_classes("sm_100a")
+
+
+@pytest.mark.parametrize("arch", _BOTH)
+def test_main_block_n_selects_the_twin_only_inside_the_table_and_the_wave_cap(arch):
+    for world_size in (4, 8):
+        n = 2560 if world_size == 4 else 1280
+        for dtype_name in loader.SUPPORTED_DTYPES.values():
+            for b_layout in loader.B_LAYOUTS:
+                delivered = (world_size, dtype_name, b_layout) in _n128_classes(arch)
+                # 40 N256 tiles (one wave): the rule qualifies every class, the
+                # table alone decides.
+                assert _frozen_rule(125, n, world_size=world_size, arch=arch) == 128
+                assert loader.main_block_n(
+                    125,
+                    n,
+                    world_size=world_size,
+                    arch=arch,
+                    dtype_name=dtype_name,
+                    b_layout=b_layout,
+                ) == (128 if delivered else 256), (world_size, dtype_name, b_layout)
+                # 160 N256 tiles (two waves, three on the twin): within the
+                # sm_100a cap of two (the table decides), beyond the sm_103a
+                # cap of one (256 whatever the table says).
+                two_waves = 128 if arch == "sm_100a" else 256
+                assert (
+                    _frozen_rule(512, n, world_size=world_size, arch=arch) == two_waves
+                )
+                assert loader.main_block_n(
+                    512,
+                    n,
+                    world_size=world_size,
+                    arch=arch,
+                    dtype_name=dtype_name,
+                    b_layout=b_layout,
+                ) == (128 if delivered and arch == "sm_100a" else 256)
+                # 320 N256 tiles (three waves): beyond the cap for every class.
+                assert (
+                    loader.main_block_n(
+                        1024,
+                        n,
+                        world_size=world_size,
+                        arch=arch,
+                        dtype_name=dtype_name,
+                        b_layout=b_layout,
+                    )
+                    == 256
+                )
+    # ws2 always runs the N256 program, whatever the class and shape.
+    for dtype_name in loader.SUPPORTED_DTYPES.values():
+        for b_layout in loader.B_LAYOUTS:
+            assert (
+                loader.main_block_n(
+                    125,
+                    1280,
+                    world_size=2,
+                    arch=arch,
+                    dtype_name=dtype_name,
+                    b_layout=b_layout,
+                )
+                == 256
+            )
+
+
+def test_main_block_n_keeps_a_class_without_a_delivered_twin_on_the_n256_program():
+    # (4, bfloat16, n_major) has no routed inventory row on either architecture
+    # (its narrowest row, ws4_packed_qkv_bf16_m512_n2560, is sm_103a-only and
+    # spans two N256 waves, beyond the sm_103a cap of one): the two-wave call
+    # stays at 256 on both architectures although the sm_100a rule alone would
+    # select the twin.
+    assert _frozen_rule(512, 2560, world_size=4, arch="sm_100a") == 128
+    assert _frozen_rule(512, 2560, world_size=4, arch="sm_103a") == 256
+    for arch in _BOTH:
+        assert (4, "bfloat16", "n_major") not in _n128_classes(arch)
+    widths = [
+        loader.main_block_n(
+            512,
+            2560,
+            world_size=4,
+            arch=arch,
+            dtype_name="bfloat16",
+            b_layout="n_major",
+        )
+        for arch in _BOTH
+    ]
+    assert widths == [256, 256]
+    # (8, float16, k_major) is routed on sm_100a only (kmajor_ws8_fp16_m512_n1280,
+    # two waves): the one-wave call qualifies on both architectures but takes
+    # the twin only where the class delivers it.
+    for arch in _BOTH:
+        assert _frozen_rule(125, 1280, world_size=8, arch=arch) == 128
+    assert (8, "float16", "k_major") in _n128_classes("sm_100a")
+    assert (8, "float16", "k_major") not in _n128_classes("sm_103a")
+    widths = [
+        loader.main_block_n(
+            125,
+            1280,
+            world_size=8,
+            arch=arch,
+            dtype_name="float16",
+            b_layout="k_major",
+        )
+        for arch in _BOTH
+    ]
+    assert widths == [128, 256]
+
+
+def test_main_block_n_validates_the_architecture_before_the_world_size_shortcut():
+    for world_size in (2, 4, 8):
+        with pytest.raises(ValueError, match="sm_90a"):
+            loader.main_block_n(
+                125,
+                1280,
+                world_size=world_size,
+                arch="sm_90a",
+                dtype_name="bfloat16",
+                b_layout="n_major",
+            )
+    with pytest.raises(ValueError, match="multiple of 256"):
+        loader.main_block_n(
+            125,
+            1152,
+            world_size=8,
+            arch="sm_100a",
+            dtype_name="bfloat16",
+            b_layout="n_major",
+        )
+
+
+@pytest.mark.parametrize("arch", _BOTH)
+@pytest.mark.parametrize(
+    ("world_size", "rows", "cols", "expected"),
+    [
+        (8, 125, 1280, True),
+        (8, 125, 7168, True),  # 128 padded rows serve N up to 10240
+        (8, 125, 10240, True),
+        (8, 125, 10496, False),  # one tile too wide
+        (8, 512, 1280, True),
+        (8, 512, 4096, True),  # 512 padded rows serve N up to 4096
+        (8, 512, 7168, False),  # the GEMM would wait behind the SM push: copy engines
+        (8, 513, 1280, False),  # pads to 640 rows
+        (8, 1024, 2048, False),  # beyond the row cap and wider than the sm_103a band
+        (8, 1025, 1280, False),  # pads to 1152 rows: no band
+        (4, 500, 2560, True),
+        (4, 125, 14336, False),
+        (4, 512, 14336, False),
+        (4, 256, 8192, True),  # 256 padded rows serve N up to 8192
+        (4, 256, 8448, False),
+        (4, 1024, 1280, False),  # the band is an eight-rank band
+        (4, 1025, 2048, False),
+        (2, 125, 1280, False),  # a single peer: the copy engine wins
+        (2, 512, 2048, False),
+    ],
+)
+def test_sm_push_serves_at_most_512_padded_rows_within_the_width_ceiling_at_ws4_and_ws8(
+    arch, world_size, rows, cols, expected
+):
+    """The base rule is the same on both architectures; the rows outside every band keep it."""
+
+    assert (
+        loader.uses_sm_push(rows=rows, world_size=world_size, cols=cols, arch=arch)
+        is expected
+    )
+    assert loader.SM_PUSH_MAX_ROWS == 512
+    assert (loader.SM_PUSH_COLS_INTERCEPT, loader.SM_PUSH_COLS_PER_ROW) == (12288, 16)
+    assert [loader.sm_push_max_cols(rows) for rows in (128, 256, 384, 512)] == [
+        10240,
+        8192,
+        6144,
+        4096,
+    ]
+
+
+def test_sm_push_bands_route_the_sm_103a_eight_rank_1024_row_calls_up_to_n_1619():
+    """``SM_PUSH_BANDS_BY_ARCH`` adds, on ``sm_103a`` only, the eight-rank calls of exactly
+    1024 padded rows with ``N <= 1619`` (the ``llama_tp8_qkv_bf16_m1024_kmajor`` row, N=1280);
+    the N=2048 row of that row count, the 1025-row call (1152 padded) and every four-rank or
+    ``sm_100a`` call keep the copy engines. An architecture outside the table is an error."""
+
+    assert loader.sm_push_bands("sm_103a") == ((8, 1024, 1619),)
+    assert loader.sm_push_bands("sm_100a") == ()
+    for rows in (897, 1000, 1024):  # every M padding to 1024 rows
+        assert (
+            loader.uses_sm_push(rows=rows, world_size=8, cols=1280, arch="sm_103a")
+            is True
+        )
+        assert (
+            loader.uses_sm_push(rows=rows, world_size=8, cols=1536, arch="sm_103a")
+            is True
+        )
+        assert (
+            loader.uses_sm_push(rows=rows, world_size=8, cols=2048, arch="sm_103a")
+            is False
+        )
+        assert (
+            loader.uses_sm_push(rows=rows, world_size=8, cols=1280, arch="sm_100a")
+            is False
+        )
+        assert (
+            loader.uses_sm_push(rows=rows, world_size=4, cols=1280, arch="sm_103a")
+            is False
+        )
+    assert (
+        loader.uses_sm_push(rows=896, world_size=8, cols=1280, arch="sm_103a") is False
+    )
+    assert (
+        loader.uses_sm_push(rows=1025, world_size=8, cols=1280, arch="sm_103a") is False
+    )
+    # The band row's per-peer payload (1024 x 8192 x 2 B = 16 MiB) selects the wide
+    # push program; on sm_103a its launch row raises the CTAs per peer from the
+    # rule's 8 to 16, on sm_100a (no row, no band) the pure rule keeps 8 x 8.
+    assert loader.push_payload_bytes(1024, 2) == 16 * 1024 * 1024
+    assert loader.push_launch(1024, 2, world_size=8, arch="sm_103a") == (
+        "peer_push_wide",
+        16,
+        loader.PUSH_WIDE_UNROLL,
+    )
+    assert loader.push_launch(1024, 2, world_size=8, arch="sm_100a") == (
+        "peer_push_wide",
+        loader.PUSH_WIDE_CTAS_PER_PEER,
+        loader.PUSH_WIDE_UNROLL,
+    )
+    for arch in ("sm_90a", "sm_120a", ""):
+        with pytest.raises(ValueError, match="no SM push bands"):
+            loader.uses_sm_push(rows=125, world_size=8, cols=1280, arch=arch)
+        with pytest.raises(ValueError, match="no SM push bands"):
+            loader.sm_push_reachable(world_size=8, cols=1280, arch=arch)
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_barrier_flag_pad_has_two_epochs_and_two_mailbox_banks_per_phase(world_size):
+    assert loader.barrier_flag_words(world_size) == 2 + 4 * world_size
+
+
+def test_spec_names_carry_the_exact_architecture(monkeypatch):
+    # Build-target discovery reads FLASHINFER_CUDA_ARCH_LIST when set; pin it so
+    # the test does not depend on the visible devices of the test host.
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.0a 10.3a")
+    loader.spec.cache_clear()
+    try:
+        specs = {}
+        for arch in ("sm_100a", "sm_103a"):
+            sequence = loader.sequence_name(2, "bfloat16", "n_major", arch)
+            spec = loader.spec(sequence, arch)
+            assert spec.name == f"{loader.SOURCE_PACKAGE}_sequence_{sequence}"
+            assert sequence.endswith(arch)
+            assert loader.ARCH_FLAGS[arch][0] in spec.extra_cuda_cflags
+            assert [str(path).split("/")[-1] for path in spec.sources] == [
+                source.split("/")[-1]
+                for source in loader.SEQUENCES[sequence]["sources"]
+            ]
+            specs[arch] = spec
+        assert specs["sm_100a"] is not specs["sm_103a"]
+    finally:
+        loader.spec.cache_clear()
+
+
+@pytest.mark.parametrize("n", [256, 1280, 2048, 7168, 14336])
+def test_weight_layout_is_classified_from_strides_without_copies(n):
+    n_major = torch.empty(8192, n, dtype=torch.bfloat16, device="meta")
+    k_major = torch.empty(n, 8192, dtype=torch.bfloat16, device="meta").t()
+    assert loader.weight_layout(n_major) == "n_major"
+    assert loader.weight_layout(k_major) == "k_major"
+    assert loader.weight_tma_source(n_major, "n_major").shape == (1, 8192, n)
+    assert loader.weight_tma_source(k_major, "k_major").shape == (1, n, 8192)
+    assert loader.weight_tma_source(k_major, "k_major").is_contiguous()
+
+
+def test_weight_layout_rejects_other_stride_patterns():
+    padded = torch.empty(8192, 4096, dtype=torch.bfloat16, device="meta")[:, :2048]
+    with pytest.raises(ValueError, match="strides"):
+        loader.weight_layout(padded)
+    with pytest.raises(ValueError, match=r"\[8192, N\]"):
+        loader.weight_layout(
+            torch.empty(4096, 2048, dtype=torch.bfloat16, device="meta")
+        )
+
+
+def _fake_group(world_size, rank, name="fake_group"):
+    return SimpleNamespace(group_name=name, _world_size=world_size, _rank=rank)
+
+
+def _patch_distributed(
+    monkeypatch,
+    *,
+    world_size,
+    rank,
+    backend_name="nccl",
+    arch="sm_100a",
+    symm_backend="CUDA",
+):
+    monkeypatch.setattr(backend.dist, "is_available", lambda: True)
+    monkeypatch.setattr(backend.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(backend.dist, "get_backend", lambda group: backend_name)
+    monkeypatch.setattr(backend.dist, "get_world_size", lambda group: group._world_size)
+    monkeypatch.setattr(backend.dist, "get_rank", lambda group: group._rank)
+    monkeypatch.setattr(backend.symm_mem, "get_backend", lambda device: symm_backend)
+    monkeypatch.setattr(
+        loader,
+        "device_facts",
+        lambda index: loader.DeviceFacts(
+            capability={"sm_100a": (10, 0), "sm_103a": (10, 3)}[arch],
+            arch=arch,
+            sm_count=148,
+        ),
+    )
+
+
+def _meta_pair(rows, n, dtype=torch.bfloat16):
+    inp = torch.empty(rows, 8192, dtype=dtype, device="meta")
+    w = torch.empty(8192, n, dtype=dtype, device="meta")
+    return inp, w
+
+
+class _CudaLike:
+    """Tensor metadata stand-in: shape, strides, dtype and a CUDA device without a GPU."""
+
+    def __init__(self, shape, dtype, *, contiguous=True, index=0, stride=None):
+        self._shape = tuple(shape)
+        self.dtype = dtype
+        self.device = torch.device("cuda", index)
+        self._contiguous = contiguous
+        if stride is None:
+            stride = []
+            acc = 1
+            for dim in reversed(self._shape):
+                stride.append(acc)
+                acc *= dim
+            stride = tuple(reversed(stride))
+        self._stride = tuple(stride)
+
+    @property
+    def shape(self):
+        return self._shape
+
+    @property
+    def ndim(self):
+        return len(self._shape)
+
+    def stride(self):
+        return self._stride
+
+    def is_contiguous(self):
+        return self._contiguous
+
+    def t(self):
+        return _CudaLike(
+            self._shape[::-1],
+            self.dtype,
+            contiguous=self._contiguous and self.ndim < 2,
+            index=self.device.index,
+            stride=self._stride[::-1],
+        )
+
+    def view(self, *shape):
+        # Metadata-only reshape of a dense (possibly transposed-to-dense) view.
+        return _CudaLike(shape, self.dtype, index=self.device.index)
+
+
+def _k_major_weight(n, dtype=torch.bfloat16):
+    return _CudaLike((8192, n), dtype, contiguous=False, stride=(1, 8192))
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+@pytest.mark.parametrize("rows", [1, 125, 512, 1025, 16384])
+@pytest.mark.parametrize("n", [256, 1280, 2048, 7168, 14336])
+def test_validation_admits_any_rows_and_any_width_multiple_of_256_in_both_layouts(
+    monkeypatch, world_size, rows, n
+):
+    _patch_distributed(monkeypatch, world_size=world_size, rank=0)
+    for weight, layout in (
+        (_CudaLike((8192, n), torch.bfloat16), "n_major"),
+        (_k_major_weight(n), "k_major"),
+    ):
+        call = backend._validate(
+            _CudaLike((rows, 8192), torch.bfloat16), weight, _fake_group(world_size, 0)
+        )
+        assert (call.world_size, call.rows, call.n, call.b_layout, call.arch) == (
+            world_size,
+            rows,
+            n,
+            layout,
+            "sm_100a",
+        )
+
+
+@pytest.mark.parametrize("n", [128, 1000, 1281, 2049])
+def test_validation_rejects_widths_that_are_not_a_multiple_of_256(monkeypatch, n):
+    _patch_distributed(monkeypatch, world_size=2, rank=0)
+    with pytest.raises(ValueError, match="multiple of 256"):
+        backend._validate(
+            _CudaLike((256, 8192), torch.bfloat16),
+            _CudaLike((8192, n), torch.bfloat16),
+            _fake_group(2, 0),
+        )
+
+
+def test_validation_rejects_strided_inputs_and_padded_weights_instead_of_copying(
+    monkeypatch,
+):
+    _patch_distributed(monkeypatch, world_size=2, rank=0)
+    with pytest.raises(ValueError, match="contiguous"):
+        backend._validate(
+            _CudaLike((256, 8192), torch.bfloat16, contiguous=False),
+            _CudaLike((8192, 2048), torch.bfloat16),
+            _fake_group(2, 0),
+        )
+    with pytest.raises(ValueError, match="strides"):
+        backend._validate(
+            _CudaLike((256, 8192), torch.bfloat16),
+            _CudaLike((8192, 2048), torch.bfloat16, contiguous=False, stride=(4096, 1)),
+            _fake_group(2, 0),
+        )
+
+
+def test_validation_rejects_wrong_k_and_empty_inputs(monkeypatch):
+    _patch_distributed(monkeypatch, world_size=2, rank=0)
+    with pytest.raises(ValueError, match="K=8192"):
+        backend._validate(
+            _CudaLike((256, 4096), torch.bfloat16),
+            _CudaLike((4096, 2048), torch.bfloat16),
+            _fake_group(2, 0),
+        )
+    with pytest.raises(ValueError, match="positive"):
+        backend._validate(
+            _CudaLike((0, 8192), torch.bfloat16),
+            _CudaLike((8192, 2048), torch.bfloat16),
+            _fake_group(2, 0),
+        )
+
+
+def test_validation_rejects_unsupported_world_sizes_and_backends(monkeypatch):
+    _patch_distributed(monkeypatch, world_size=3, rank=0)
+    with pytest.raises(ValueError, match="world size 2, 4, or 8"):
+        backend._validate(
+            _CudaLike((256, 8192), torch.bfloat16),
+            _CudaLike((8192, 2048), torch.bfloat16),
+            _fake_group(3, 0),
+        )
+    _patch_distributed(monkeypatch, world_size=2, rank=0, backend_name="gloo")
+    with pytest.raises(ValueError, match="NCCL"):
+        backend._validate(
+            _CudaLike((256, 8192), torch.bfloat16),
+            _CudaLike((8192, 2048), torch.bfloat16),
+            _fake_group(2, 0),
+        )
+
+
+@pytest.mark.parametrize("symm_backend", ["CUDA", "NVSHMEM", "cuda", "nvshmem"])
+def test_validation_admits_the_cuda_and_nvshmem_symmetric_memory_backends(
+    monkeypatch, symm_backend
+):
+    _patch_distributed(monkeypatch, world_size=2, rank=0, symm_backend=symm_backend)
+    device = torch.device("cuda", 0)
+    assert backend.symmetric_memory_backend(device) == symm_backend.upper()
+    assert backend.supports_symmetric_memory_backend(device)
+    call = backend._validate(
+        _CudaLike((256, 8192), torch.bfloat16),
+        _CudaLike((8192, 2048), torch.bfloat16),
+        _fake_group(2, 0),
+    )
+    assert call.rows == 256
+
+
+@pytest.mark.parametrize("symm_backend", ["NCCL", None, "XPU"])
+def test_validation_rejects_other_symmetric_memory_backends_without_selecting_one(
+    monkeypatch, symm_backend
+):
+    _patch_distributed(monkeypatch, world_size=2, rank=0, symm_backend=symm_backend)
+    selected = []
+    monkeypatch.setattr(backend.symm_mem, "set_backend", selected.append)
+    device = torch.device("cuda", 0)
+    assert not backend.supports_symmetric_memory_backend(device)
+    with pytest.raises(ValueError, match=r"\['CUDA', 'NVSHMEM'\]"):
+        backend._validate(
+            _CudaLike((256, 8192), torch.bfloat16),
+            _CudaLike((8192, 2048), torch.bfloat16),
+            _fake_group(2, 0),
+        )
+    assert selected == []
+
+
+def test_capture_sentinel_is_above_every_eager_epoch():
+    assert backend._CAPTURE_READY_TARGET == 2**32 - 1
+    state = backend._LaunchState(rank=0, world_size=2)
+    assert state.ready_epoch < backend._CAPTURE_READY_TARGET - 1
+
+
+def test_captured_call_clears_only_its_readiness_words_with_a_stream_memset(
+    monkeypatch,
+):
+    """The clear is a ``memset32_`` on the pad's leading words (no kernel) on the
+    caller's current stream, so a captured call issues exactly the eager kernel
+    sequence."""
+    calls = []
+    monkeypatch.setattr(
+        backend.torch.ops.symm_mem,
+        "memset32_",
+        lambda pad, offset, val, count: calls.append((pad, offset, val, count)),
+    )
+    pad = torch.zeros(4 * 8, dtype=torch.uint32)
+    workspace = backend._Workspace(
+        dtype=torch.bfloat16,
+        rank=0,
+        world_size=4,
+        device_index=0,
+        arch="sm_100a",
+        signal_pad=pad,
+    )
+    backend._clear_readiness(workspace, 4 * 3)
+    assert calls == [(pad, 0, 0, 12)]
+
+
+def test_prepare_session_refuses_to_allocate_or_grow_inside_capture(monkeypatch):
+    _patch_distributed(monkeypatch, world_size=2, rank=0)
+    monkeypatch.setattr(backend.torch.cuda, "is_current_stream_capturing", lambda: True)
+    call = backend._Call(0, 0, 2, "g", "bfloat16", "sm_100a", 256, 2048, "n_major")
+    with pytest.raises(RuntimeError, match="inside CUDA-graph capture"):
+        backend._prepare_session(
+            call, _fake_group(2, 0, name="g"), torch.bfloat16, capacity_rows=256
+        )
+
+
+def test_workspace_materializes_the_sm_push_tables_at_prepare_time():
+    """The copy-engine route's peer tables are address tuples built when the
+    workspace grows; ``materialize`` resolves the SM push route's device tables,
+    and only when that route is reachable for the prepared group."""
+
+    workspace = backend._Workspace(
+        dtype=torch.bfloat16, rank=1, world_size=4, device_index=0, arch="sm_100a"
+    )
+    resolved = []
+    workspace.push_tables = lambda: resolved.append(True)
+    workspace.materialize(sm_push=False)
+    assert resolved == []
+    workspace.materialize(sm_push=True)
+    assert resolved == [True]
+
+
+def test_sm_push_tables_are_reachable_exactly_when_some_row_count_takes_that_route():
+    """``_prepare_session`` materializes by ``sm_push_reachable``: the widest ceiling of the base
+    rule (128 padded rows) or a band of the device's architecture; the sm_103a band (N <= 1619 at
+    eight ranks) is already reachable through the base rule at 128 rows, so the predicate agrees
+    with the 128-row probe on both architectures for every group."""
+
+    reachable = {
+        (2, 1280): False,
+        (4, 2560): True,
+        (4, 10240): True,
+        (4, 10496): False,
+        (8, 1280): True,
+        (8, 1619): True,
+        (8, 14336): False,
+    }
+    for arch in _BOTH:
+        for (world_size, cols), expected in reachable.items():
+            assert (
+                loader.sm_push_reachable(world_size=world_size, cols=cols, arch=arch)
+                is expected
+            ), (arch, world_size, cols)
+            assert loader.sm_push_reachable(
+                world_size=world_size, cols=cols, arch=arch
+            ) is (
+                loader.uses_sm_push(
+                    rows=loader.BLOCK_M, world_size=world_size, cols=cols, arch=arch
+                )
+                or any(
+                    world_size == band_ws and cols <= band_cols
+                    for band_ws, _band_rows, band_cols in loader.sm_push_bands(arch)
+                )
+            )
+
+
+def _published_workspace(push_buffers):
+    """A workspace one generation old, as ``_publish_scratch`` finds it at a growth (CPU stand-ins)."""
+
+    workspace = backend._Workspace(
+        dtype=torch.bfloat16,
+        rank=0,
+        world_size=2,
+        device_index=0,
+        arch="sm_100a",
+    )
+    workspace.pitch = 512
+    workspace.scratch = torch.empty(2, 512, 8, dtype=torch.bfloat16)
+    workspace.scratch_handle = object()
+    workspace.signal_pad = torch.zeros(8, dtype=torch.uint32)
+    workspace.peer_scratch = ("old peer slice",)
+    workspace.push_buffers = push_buffers
+    workspace.comm_stream = types.SimpleNamespace(cuda_stream=7)
+    return workspace
+
+
+class _GrowthHandle:
+    """Rendezvous handle of a grown scratch: CPU readiness pads and remote views."""
+
+    def get_signal_pad(self, peer, shape, dtype, offset):
+        return torch.zeros(shape, dtype=dtype)
+
+    def get_remote_tensor(self, peer, shape, dtype):
+        return torch.empty(shape, dtype=dtype)
+
+
+def test_growth_resolves_the_sm_push_tables_again_when_they_existed():
+    """A launcher prepared before the growth keeps both routes: the SM push
+    tables address the scratch generation, so they are resolved again."""
+
+    workspace = _published_workspace(push_buffers=("payload", "signals", "counters"))
+    resolved = []
+    workspace.push_tables = lambda: resolved.append(True)
+    call = backend._Call(0, 0, 2, "g", "bfloat16", "sm_100a", 1024, 2048, "n_major")
+    grown = torch.empty(2, 1024, 8, dtype=torch.bfloat16)
+    backend._publish_scratch(workspace, call, 1024, grown, _GrowthHandle())
+    assert workspace.pitch == 1024 and workspace.scratch is grown
+    assert workspace.max_chunks == loader.chunk_plan(1024)[2]
+    assert resolved == [True]
+
+
+def test_growth_without_push_tables_resolves_none():
+    workspace = _published_workspace(push_buffers=None)
+    resolved = []
+    workspace.push_tables = lambda: resolved.append(True)
+    call = backend._Call(0, 0, 2, "g", "bfloat16", "sm_100a", 1024, 2048, "n_major")
+    grown = torch.empty(2, 1024, 8, dtype=torch.bfloat16)
+    backend._publish_scratch(workspace, call, 1024, grown, _GrowthHandle())
+    assert workspace.push_buffers is None and resolved == []
+
+
+def test_prepare_session_refuses_to_grow_a_captured_workspace_before_any_collective(
+    monkeypatch,
+):
+    """A captured graph bakes this generation's addresses on every rank: a larger
+    call raises a named error before any synchronize or collective, without
+    poisoning the state."""
+
+    call, group, stream = _prepare_fixture(monkeypatch, "captured_growth")
+    state = backend._launch_state(call, group)
+    state.flags = torch.zeros(4, dtype=torch.uint32)
+    workspace = backend._workspace(call, group, torch.bfloat16)
+    workspace.pitch = 512
+    workspace.captured = True
+
+    def rendezvous(*args, **kwargs):
+        raise AssertionError("no collective may run for a refused growth")
+
+    monkeypatch.setattr(backend, "_rendezvous", rendezvous)
+    with pytest.raises(RuntimeError, match="captured into a CUDA graph"):
+        backend._prepare_session(call, group, torch.bfloat16, capacity_rows=1024)
+    assert stream.synchronized == 0
+    assert state.poisoned is False and workspace.pitch == 512
+
+
+def test_prepare_session_refuses_to_build_the_host_sequence_inside_capture(
+    monkeypatch,
+):
+    call, group, stream = _prepare_fixture(monkeypatch, "jit_capture")
+    state = backend._launch_state(call, group)
+    state.flags = torch.zeros(4, dtype=torch.uint32)
+    workspace = backend._workspace(call, group, torch.bfloat16)
+    workspace.pitch = 512
+    workspace.sequences = {}
+    monkeypatch.setattr(backend.torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    def load(*args):
+        raise AssertionError("no JIT build may run inside capture")
+
+    monkeypatch.setattr(backend.loader, "load", load)
+    with pytest.raises(RuntimeError, match="host sequence inside CUDA-graph capture"):
+        backend._prepare_session(call, group, torch.bfloat16, capacity_rows=512)
+    assert stream.synchronized == 0 and state.poisoned is False
+
+
+def test_prepare_session_refuses_to_resolve_push_tables_inside_capture(monkeypatch):
+    """Resolving the SM push tables allocates; under capture that is a named refusal."""
+
+    _patch_distributed(monkeypatch, world_size=8, rank=0)
+    call = backend._Call(0, 0, 8, "g8", "bfloat16", "sm_103a", 512, 1280, "n_major")
+    group = _fake_group(8, 0, name="g8")
+    state = backend._launch_state(call, group)
+    state.flags = torch.zeros(16, dtype=torch.uint32)
+    workspace = backend._workspace(call, group, torch.bfloat16)
+    workspace.pitch = 512
+    workspace.sequences = {"n_major": object()}
+    workspace.push_buffers = None
+    monkeypatch.setattr(backend.torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="SM push route's device tables inside"):
+        backend._prepare_session(call, group, torch.bfloat16, capacity_rows=512)
+    assert state.poisoned is False and workspace.push_buffers is None
+
+
+def test_validation_rejects_devices_outside_the_exported_architectures(monkeypatch):
+    _patch_distributed(monkeypatch, world_size=2, rank=0)
+    monkeypatch.setattr(
+        loader,
+        "device_facts",
+        lambda index: loader.DeviceFacts(capability=(9, 0), arch=None, sm_count=132),
+    )
+    with pytest.raises(ValueError, match="SM100 or SM103"):
+        backend._validate(
+            _CudaLike((256, 8192), torch.bfloat16),
+            _CudaLike((8192, 2048), torch.bfloat16),
+            _fake_group(2, 0),
+        )
+
+
+def test_out_must_match_the_gathered_output_contract():
+    call = backend._Call(0, 0, 2, "g", "bfloat16", "sm_100a", 250, 2048, "n_major")
+    like = _CudaLike((250, 8192), torch.bfloat16)
+    with pytest.raises(ValueError, match=r"\[500, 2048\]"):
+        backend._output(_CudaLike((250, 2048), torch.bfloat16), call, like)
+    with pytest.raises(ValueError, match="dtype"):
+        backend._output(_CudaLike((500, 2048), torch.float16), call, like)
+    out = _CudaLike((500, 2048), torch.bfloat16)
+    assert backend._output(out, call, like) is out
 
 
 def test_backend_entrypoint_rejects_non_cake_route():
-    backend = _backend()
-
+    inp, w = _meta_pair(256, 2048)
     with pytest.raises(ValueError, match="exactly 'cake'"):
-        backend.all_gather_matmul_cake(object(), object(), object(), backend="auto")
+        backend.all_gather_matmul_cake(inp, w, _fake_group(2, 0), backend="auto")
 
 
-def _manifest(backend, source: bytes, arch: str):
-    return {
-        "schema_version": 1,
-        "arch": arch,
-        "compile_flags": ["--use_fast_math"],
-        "tma_abi": "pointer",
-        "kernel_count": 13,
-        "launch": backend._launch_contract(source, arch),
-        "constraints": backend._constraints_for_arch(arch),
-        "kernel_symbols": list(backend._KERNEL_SYMBOLS),
-        "route_coverage": copy.deepcopy(backend._ROUTE_COVERAGE),
-        "source_sha256": hashlib.sha256(source).hexdigest(),
-    }
-
-
-def _write_bundle(tmp_path: Path, backend, arch: str = "sm_100a"):
-    source = (
-        b"#define SMEM_TOTAL 197632\n" * 6
-        + b'extern "C" __global__ void generated() {}\n'
+def test_public_entrypoint_routes_backend_cake_to_the_backend(monkeypatch):
+    dispatcher = importlib.import_module(
+        "flashinfer.comm.all_gather_matmul.all_gather_matmul"
     )
-    directory = tmp_path / arch.replace("sm_", "sm")
-    directory.mkdir(parents=True)
-    source_path = directory / "cake_all_gather_matmul_kernels.cu"
-    source_path.write_bytes(source)
-    manifest_path = directory / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(_manifest(backend, source, arch)), encoding="utf-8"
+    calls = []
+    result = object()
+
+    def fake_backend(inp, w, group, *, backend, verbose):
+        calls.append((inp, w, group, backend, verbose))
+        return result
+
+    monkeypatch.setattr(backend, "all_gather_matmul_cake", fake_backend)
+    inp, w, group = object(), object(), object()
+    assert dispatcher.all_gather_matmul(inp, w, group, backend="cake") is result
+    assert calls == [(inp, w, group, "cake", False)]
+
+
+def test_public_prepare_forwards_the_row_capacity(monkeypatch):
+    dispatcher = importlib.import_module(
+        "flashinfer.comm.all_gather_matmul.all_gather_matmul"
     )
-    return source_path, manifest_path
+    calls = []
+    launcher = object()
 
+    def fake_prepare(inp, w, group, *, max_rows, verbose):
+        calls.append((inp, w, group, max_rows, verbose))
+        return launcher
 
-def test_program_source_accepts_exact_ordered_manifest(tmp_path, monkeypatch):
-    backend = _backend()
-    source_path, _ = _write_bundle(tmp_path, backend)
-    monkeypatch.setattr(backend, "_source_dir", lambda: tmp_path)
-
-    actual_source, manifest = backend._program_source("sm_100a")
-
-    assert actual_source == source_path
-    assert manifest["kernel_symbols"] == list(backend._KERNEL_SYMBOLS)
-    assert manifest["launch"]["main"]["dynamic_smem_bytes"] == 197632
-
-
-def test_host_launch_consumes_manifest_smem(tmp_path, monkeypatch):
-    backend = _backend()
-    source_path, _ = _write_bundle(tmp_path, backend)
-    monkeypatch.setattr(backend, "_source_dir", lambda: tmp_path)
-    _, manifest = backend._program_source("sm_100a")
-
-    rendered = backend._render_host_source("test_module", manifest)
-
-    assert "constexpr int32_t kMainSmemBytes = 197632;" in rendered
-    assert "kSm103PackedQkvSpecialization =\n    false;" in rendered
-    assert "CAKE_MAIN_SMEM_BYTES" not in rendered
-    assert "CAKE_SM103_PACKED_QKV_SPECIALIZATION" not in rendered
-    assert "main_cuda_stream != 0" not in rendered
-    assert "comm_cuda_stream != 0 && bridge_cuda_event != 0" in rendered
-    assert source_path.read_bytes().count(b"#define SMEM_TOTAL 197632") == 6
-
-
-def test_host_descriptor_encoder_writes_cpu_staging_only(tmp_path, monkeypatch):
-    backend = _backend()
-    _write_bundle(tmp_path, backend)
-    monkeypatch.setattr(backend, "_source_dir", lambda: tmp_path)
-    _, manifest = backend._program_source("sm_100a")
-
-    rendered = backend._render_host_source("test_module", manifest)
-
-    assert "#include <cstring>" in rendered
+    monkeypatch.setattr(backend, "_prepare_all_gather_matmul_cake", fake_prepare)
+    inp, w, group = object(), object(), object()
+    assert dispatcher.prepare_all_gather_matmul(inp, w, group) is launcher
     assert (
-        'CheckCpuTensor(host_descriptor_storage, "host_descriptor_storage");'
-        in rendered
-    )
-    assert '<< name << " must be a CPU tensor";' in rendered
-    assert "host_descriptor_storage must have uint8 dtype" in rendered
-    assert (
-        "std::memcpy(host_descriptor_storage.data_ptr(), maps.data(), sizeof(maps));"
-        in rendered
-    )
-    assert "cuMemcpyHtoD" not in rendered
-
-
-def test_host_prepared_launcher_has_fixed_tp8_peer_abi(tmp_path, monkeypatch):
-    backend = _backend()
-    _write_bundle(tmp_path, backend, arch="sm_103a")
-    monkeypatch.setattr(backend, "_source_dir", lambda: tmp_path)
-    _, manifest = backend._program_source("sm_103a")
-
-    rendered = backend._render_host_source("test_module", manifest)
-
-    assert "TensorView peer_scratch_6, TensorView peer_signal_6" in rendered
-    assert "std::array<const TensorView*, 7> peer_scratch" in rendered
-    assert "std::array<const TensorView*, 7> peer_signal" in rendered
-    assert "std::array<int64_t, 7> expected_peer_scratch" in rendered
-    assert "std::array<int64_t, 7> expected_peer_signal" in rendered
-    normalized = " ".join(rendered.split())
-    assert "world_size == 4 && weight.size(1) == 2560" in normalized
-    assert "world_size == 8 && weight.size(1) == 1280" in normalized
-    assert "int64_t ready_target, int64_t main_cuda_stream" in rendered
-    assert "static_cast<uint32_t>(ready_target)" in rendered
-    assert "cuMemsetD32Async" not in rendered
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        b"#define SMEM_TOTAL 197632\n" * 5,
-        b"#define SMEM_TOTAL 197632\n" * 5 + b"#define SMEM_TOTAL 196608\n",
-    ],
-)
-def test_source_launch_contract_rejects_missing_or_divergent_main_smem(source):
-    backend = _backend()
-
-    with pytest.raises(RuntimeError, match="one uniform SMEM_TOTAL"):
-        backend._launch_contract(source, "sm_100a")
-
-
-@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
-def test_packaged_program_has_self_contained_pointer_abi(arch):
-    backend = _backend()
-
-    source_path, manifest = backend._program_source(arch)
-    source = source_path.read_bytes()
-
-    assert (
-        source.count(b"struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };")
-        == 1
-    )
-    assert source.count(b"FlashInferTensorMap const*") == 18
-    assert backend._resolved_main_smem_bytes(source) == 197632
-    if arch == "sm_103a":
-        assert manifest["launch"]["main"]["grid_y"] == (
-            "4 if world_size == 8 and M == 512 and N == 1280 else 1"
+        dispatcher.prepare_all_gather_matmul(
+            inp, w, group, backend="cake", max_rows=2048
         )
-    else:
-        assert "grid_y" not in manifest["launch"]["main"]
-
-
-def test_packaged_bf16_ws4_derives_private_packed_width_from_grid():
-    backend = _backend()
-
-    source_path, manifest = backend._program_source("sm_103a")
-    source = source_path.read_text(encoding="utf-8")
-    function = source.split("kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4", 1)[
-        1
-    ].split("} // extern", 1)[0]
-
-    n_tiles = "(num_bids / (((M < 2432) ? M : 2432) / 128))"
-    assert f"active_tiles = chunk_tiles_m * {n_tiles}" in function
-    assert f"active_tiles_1 = chunk_tiles_m_1 * {n_tiles}" in function
-    assert f"active_tiles_2 = chunk_tiles_m_2 * {n_tiles}" in function
-    packed_width = "(num_bids / (((M < 2432) ? M : 2432) / 128) * 256)"
-    assert f"(out_m + epi_tid) * {packed_width}" in function
-    assert manifest["constraints"]["n_by_world_size"] == {
-        "2": [2048],
-        "4": [2048],
-        "8": [2048],
-    }
-    assert manifest["constraints"]["prepared_packed_qkv"] == {
-        "dtypes": ["bfloat16"],
-        "n_by_world_size": {"4": [2560], "8": [1280]},
-    }
-    assert manifest["launch"]["main"]["grid_x"] == ("(min(M, 2432) / 128) * (N / 256)")
-    rendered = backend._render_host_source("test_module", manifest)
-    assert "kSm103PackedQkvSpecialization =\n    true;" in rendered
-    assert "world_size == 8 && dtype_code == 0" in rendered
-
-    _, sm100_manifest = backend._program_source("sm_100a")
-    assert sm100_manifest["constraints"]["prepared_packed_qkv"] == {
-        "dtypes": ["bfloat16"],
-        "n_by_world_size": {"8": [1280]},
-    }
-    sm100_rendered = backend._render_host_source("test_module", sm100_manifest)
-    assert "kSm103PackedQkvSpecialization =\n    false;" in sm100_rendered
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        lambda manifest: manifest.update(schema_version=2),
-        lambda manifest: manifest.update(compile_flags=[]),
-        lambda manifest: manifest.update(tma_abi="grid_constant"),
-        lambda manifest: manifest["kernel_symbols"].reverse(),
-        lambda manifest: manifest["constraints"].update(world_sizes=[2]),
-        lambda manifest: manifest["launch"]["main"].update(block_threads=128),
-        lambda manifest: manifest["launch"]["main"].update(dynamic_smem_bytes=196608),
-        lambda manifest: manifest["route_coverage"]["ws4"]["main"].update(
-            bfloat16=manifest["kernel_symbols"][5]
-        ),
-        lambda manifest: manifest.update(source_sha256="0" * 64),
-        lambda manifest: manifest.update(unexpected=True),
-    ],
-)
-def test_program_source_rejects_manifest_identity_drift(
-    tmp_path, monkeypatch, mutation
-):
-    backend = _backend()
-    _, manifest_path = _write_bundle(tmp_path, backend)
-    document = json.loads(manifest_path.read_text(encoding="utf-8"))
-    mutation(document)
-    manifest_path.write_text(json.dumps(document), encoding="utf-8")
-    monkeypatch.setattr(backend, "_source_dir", lambda: tmp_path)
-
-    with pytest.raises(RuntimeError, match="manifest identity is invalid"):
-        backend._program_source("sm_100a")
-
-
-def test_descriptor_cache_reuses_each_layer_mapping(monkeypatch):
-    backend = _backend()
-
-    class WeakTensor:
-        pass
-
-    inp = WeakTensor()
-    scratch = object()
-    weights = [WeakTensor() for _ in range(80)]
-    preparations = []
-    main_stream = object()
-    publication_streams = []
-    workspace = SimpleNamespace(
-        scratch=scratch,
-        descriptor_cache=OrderedDict(),
+        is launcher
     )
-
-    monkeypatch.setattr(backend, "_tensor_fingerprint", lambda tensor: id(tensor))
-
-    def prepare(*args):
-        preparations.append(args)
-
-    allocations = _mock_descriptor_allocations(monkeypatch, backend)
-    monkeypatch.setattr(
-        backend.torch.cuda,
-        "stream",
-        lambda stream: (
-            publication_streams.append(stream),
-            nullcontext(),
-        )[1],
-    )
-    module = SimpleNamespace(prepare_descriptors=prepare)
-    descriptors = [
-        backend._descriptor_storage(
-            workspace,
-            module,
-            inp,
-            weight,
-            device_index=3,
-            main_stream=main_stream,
-            world_size=4,
-            rows=128,
-        )
-        for weight in weights
-    ]
-
-    reused = backend._descriptor_storage(
-        workspace,
-        module,
-        inp,
-        weights[0],
-        device_index=3,
-        main_stream=main_stream,
-        world_size=4,
-        rows=128,
-    )
-    assert reused is descriptors[0]
-    assert len(set(descriptors)) == len(preparations) == 80
-    assert len(allocations) == 160
-    assert len(workspace.descriptor_cache) == 80
-    assert all(len(args) == 6 for args in preparations)
-    assert all(args[3].device == "cpu" for args in preparations)
-    assert all(args[3].copies == [] for args in preparations)
-    assert publication_streams == [main_stream] * 80
-    assert all(
-        kwargs["device"] == "cpu" and kwargs["pin_memory"] is True
-        for _, _, kwargs in allocations[::2]
-    )
-    assert all(kwargs["device"] == 3 for _, _, kwargs in allocations[1::2])
-    assert all(
-        descriptor.copies == [(preparation[3], True)]
-        for descriptor, preparation in zip(descriptors, preparations, strict=True)
-    )
+    assert calls == [(inp, w, group, None, False), (inp, w, group, 2048, False)]
+    with pytest.raises(ValueError, match="'auto' or 'cake'"):
+        dispatcher.prepare_all_gather_matmul(inp, w, group, backend="cutile")
 
 
-def test_descriptor_cache_is_bounded_lru(monkeypatch):
-    backend = _backend()
-
-    class WeakTensor:
-        def __init__(self, fingerprint):
-            self.fingerprint = fingerprint
-
-    inp = WeakTensor("input")
-    weights = [WeakTensor(f"weight-{index}") for index in range(3)]
-    workspace = SimpleNamespace(
-        scratch=WeakTensor("scratch"),
-        descriptor_cache=OrderedDict(),
-    )
-    monkeypatch.setattr(
-        backend, "_tensor_fingerprint", lambda tensor: tensor.fingerprint
-    )
-    preparations = []
-    main_stream = object()
-    allocations = _mock_descriptor_allocations(monkeypatch, backend)
-    monkeypatch.setattr(backend, "_DESCRIPTOR_CACHE_MAX_ENTRIES", 2)
-    module = SimpleNamespace(
-        prepare_descriptors=lambda *args: preparations.append(args)
-    )
-    descriptors = [
-        backend._descriptor_storage(
-            workspace,
-            module,
-            inp,
-            weight,
-            device_index=0,
-            main_stream=main_stream,
-            world_size=2,
-            rows=128,
-        )
-        for weight in weights[:2]
-    ]
-    assert (
-        backend._descriptor_storage(
-            workspace,
-            module,
-            inp,
-            weights[0],
-            device_index=0,
-            main_stream=main_stream,
-            world_size=2,
-            rows=128,
-        )
-        is descriptors[0]
-    )
-    third = backend._descriptor_storage(
-        workspace,
-        module,
-        inp,
-        weights[2],
+def test_prepared_launcher_serves_every_row_count_up_to_its_capacity(monkeypatch):
+    _patch_distributed(monkeypatch, world_size=8, rank=3, arch="sm_103a")
+    weight = _k_major_weight(1280)
+    weight.data_ptr = lambda: 0x1000
+    sample = _CudaLike((512, 8192), torch.bfloat16)
+    call = backend._validate(sample, weight, _fake_group(8, 3))
+    state = backend._LaunchState(rank=3, world_size=8)
+    workspace = backend._Workspace(
+        dtype=torch.bfloat16,
+        rank=3,
+        world_size=8,
         device_index=0,
-        main_stream=main_stream,
-        world_size=2,
-        rows=128,
+        arch="sm_103a",
+        pitch=2048,
     )
-
-    first_key = ("input", "scratch", "weight-0")
-    second_key = ("input", "scratch", "weight-1")
-    third_key = ("input", "scratch", "weight-2")
-    assert list(workspace.descriptor_cache) == [first_key, third_key]
-    assert second_key not in workspace.descriptor_cache
-    assert (
-        backend._descriptor_storage(
-            workspace,
-            module,
-            inp,
-            weights[0],
-            device_index=0,
-            main_stream=main_stream,
-            world_size=2,
-            rows=128,
+    group = _fake_group(8, 3)
+    launcher = backend._PreparedLauncher(
+        group=group,
+        group_id=id(group),
+        call=call,
+        max_rows=2048,
+        device=sample.device,
+        dtype=sample.dtype,
+        weight=weight,
+        weight_fingerprint=backend._fingerprint(weight),
+        state=state,
+        workspace=workspace,
+    )
+    # The frozen launcher resolves the weight's tensor-map source view once.
+    assert launcher.weight_source is not None
+    assert tuple(launcher.weight_source.shape) == (1, 1280, 8192)
+    for rows in (1, 125, 512, 1025, 2048):
+        bound = launcher._validate_input(_CudaLike((rows, 8192), torch.bfloat16))
+        assert (bound.rows, bound.n, bound.b_layout) == (rows, 1280, "k_major")
+    with pytest.raises(ValueError, match=r"\[1, 2048\]"):
+        launcher._validate_input(_CudaLike((2049, 8192), torch.bfloat16))
+    with pytest.raises(ValueError, match="contiguous"):
+        launcher._validate_input(
+            _CudaLike((512, 8192), torch.bfloat16, contiguous=False)
         )
-        is descriptors[0]
-    )
-    assert third is not descriptors[0]
-    assert len(allocations) == 6
-    assert len(preparations) == 3
+    with pytest.raises(ValueError, match="dtype"):
+        launcher._validate_input(_CudaLike((512, 8192), torch.float16))
+    with pytest.raises(ValueError, match=r"\[M, 8192\]"):
+        launcher._validate_input(_CudaLike((512, 4096), torch.bfloat16))
 
 
-def test_descriptor_cache_reuses_recycled_fingerprint(monkeypatch):
-    backend = _backend()
-
-    class TensorFingerprint:
-        def __init__(self, fingerprint):
-            self.fingerprint = fingerprint
-
-    first = TensorFingerprint("input")
-    replacement = TensorFingerprint("input")
-    weight = TensorFingerprint("weight")
-    workspace = SimpleNamespace(
-        scratch=TensorFingerprint("scratch"),
-        descriptor_cache=OrderedDict(),
-    )
-    monkeypatch.setattr(
-        backend, "_tensor_fingerprint", lambda tensor: tensor.fingerprint
-    )
-    preparations = []
-    main_stream = object()
-    allocations = _mock_descriptor_allocations(monkeypatch, backend)
-    module = SimpleNamespace(
-        prepare_descriptors=lambda *args: preparations.append(args)
-    )
-    descriptors = backend._descriptor_storage(
-        workspace,
-        module,
-        first,
-        weight,
+def test_launch_refuses_a_workspace_smaller_than_the_padded_rows():
+    state = backend._LaunchState(rank=0, world_size=2)
+    workspace = backend._Workspace(
+        dtype=torch.bfloat16,
+        rank=0,
+        world_size=2,
         device_index=0,
-        main_stream=main_stream,
-        world_size=2,
-        rows=128,
+        arch="sm_100a",
+        pitch=128,
     )
-
-    assert (
-        backend._descriptor_storage(
-            workspace,
-            module,
-            replacement,
-            weight,
-            device_index=0,
-            main_stream=main_stream,
-            world_size=2,
-            rows=128,
-        )
-        is descriptors
-    )
-    assert len(allocations) == 2
-    assert len(preparations) == 1
+    call = backend._Call(0, 0, 2, "g", "bfloat16", "sm_100a", 129, 2048, "n_major")
+    with pytest.raises(
+        RuntimeError, match="holds 128 rows per peer, the call needs 256"
+    ):
+        backend._launch(state, workspace, call, None, None, None)
+    # A capacity shortfall is a caller error, not a failed collective.
+    assert state.poisoned is False
 
 
-def test_descriptor_prepare_failure_does_not_install_cache_entry(monkeypatch):
-    backend = _backend()
-    workspace = SimpleNamespace(scratch="scratch", descriptor_cache=OrderedDict())
-    monkeypatch.setattr(backend, "_tensor_fingerprint", lambda tensor: tensor)
-    _mock_descriptor_allocations(monkeypatch, backend)
+def test_cross_stream_join_records_a_fresh_event_and_skips_capture(monkeypatch):
+    """The join must never reuse an event that a CUDA graph capture re-recorded."""
 
-    def prepare(*args):
-        raise RuntimeError("prepare failed")
+    assert not hasattr(backend._LaunchState, "tail_event")
 
-    module = SimpleNamespace(prepare_descriptors=prepare)
+    class _Stream:
+        def __init__(self, handle):
+            self.cuda_stream = handle
+            self.joined = []
 
-    with pytest.raises(RuntimeError, match="prepare failed"):
-        backend._descriptor_storage(
-            workspace,
-            module,
-            "input",
-            "weight",
-            device_index=0,
-            main_stream=object(),
-            world_size=2,
-            rows=128,
-        )
+        def wait_stream(self, other):
+            self.joined.append(other)
 
-    assert workspace.descriptor_cache == OrderedDict()
-
-
-def test_concurrent_descriptor_prepare_returns_one_cached_entry(monkeypatch):
-    backend = _backend()
-    workspace = SimpleNamespace(scratch="scratch", descriptor_cache=OrderedDict())
-    monkeypatch.setattr(backend, "_tensor_fingerprint", lambda tensor: tensor)
-    preparations = []
-    call_barrier = Barrier(2, timeout=30)
-    main_stream = object()
-
-    def prepare(*args):
-        preparations.append(args)
-
-    allocations = _mock_descriptor_allocations(monkeypatch, backend)
-    module = SimpleNamespace(prepare_descriptors=prepare)
-
-    def resolve():
-        call_barrier.wait()
-        return backend._descriptor_storage(
-            workspace,
-            module,
-            "input",
-            "weight",
-            device_index=0,
-            main_stream=main_stream,
-            world_size=2,
-            rows=128,
-        )
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(executor.map(lambda _: resolve(), range(2)))
-
-    assert results[0] is results[1]
-    assert len(workspace.descriptor_cache) == 1
-    assert len(allocations) == 2 * len(preparations)
-    assert len(preparations) in (1, 2)
-
-
-def test_prepared_descriptor_cache_preserves_ready_stream(monkeypatch):
-    backend = _backend()
-    workspace = SimpleNamespace(
-        scratch="scratch", prepared_descriptor_cache=OrderedDict()
-    )
-    monkeypatch.setattr(backend, "_tensor_fingerprint", lambda tensor: tensor)
-    allocations = _mock_descriptor_allocations(monkeypatch, backend)
-    preparations = []
-    events = []
-
-    class ReadyEvent:
-        def __init__(self, **kwargs):
-            self.recorded_streams = []
-            events.append(self)
-
-        def record(self, stream):
-            self.recorded_streams.append(stream)
-
-    monkeypatch.setattr(backend.torch.cuda, "Event", ReadyEvent)
-    module = SimpleNamespace(
-        prepare_descriptors=lambda *args: preparations.append(args)
-    )
-    first_stream = SimpleNamespace(cuda_stream=17)
-    second_stream = SimpleNamespace(cuda_stream=19)
-    kwargs = {
-        "device_index": 0,
-        "world_size": 4,
-        "rows": 128,
-        "scratch_fingerprint": "scratch",
-        "weight_fingerprint": "weight",
-    }
-
-    first = backend._prepared_descriptor_storage(
-        workspace, module, "input", "weight", main_stream=first_stream, **kwargs
-    )
-    second = backend._prepared_descriptor_storage(
-        workspace, module, "input", "weight", main_stream=second_stream, **kwargs
-    )
-
-    assert second is first
-    assert first.ready_stream == 17
-    assert first.ready_event.recorded_streams == [first_stream]
-    assert len(events) == len(preparations) == 1
-    assert len(allocations) == 2
-
-
-def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch):
-    backend = _backend()
-    backend._LAUNCH_STATES.clear()
-    backend._WORKSPACES.clear()
-    input_streams = []
-    weight_streams = []
-    descriptor_streams = []
-    inp = SimpleNamespace(
-        device=torch.device("cuda:0"),
-        dtype=torch.bfloat16,
-        shape=(128, 8192),
-        record_stream=lambda stream: input_streams.append(stream),
-    )
-    weight = SimpleNamespace(
-        shape=(8192, 2048),
-        record_stream=lambda stream: weight_streams.append(stream),
-    )
-    group = object()
-    lifecycle = []
-
-    class FakeOutput:
-        def __init__(self, pointer):
-            self.pointer = pointer
-            self.value = None
-
-        def data_ptr(self):
-            return self.pointer
-
-    class FakeEvent:
-        def record(self, stream):
-            lifecycle.append("tail-record")
-
-        def synchronize(self):
-            lifecycle.append("tail-sync")
-
-    initialization_event = object()
-
-    class FakeStream:
-        cuda_stream = 17
-
-        def synchronize(self):
-            lifecycle.append("current-sync")
-
-        def wait_event(self, event):
-            assert event is initialization_event
-            lifecycle.append("initialization-wait")
-
-        def wait_stream(self, stream):
-            pass
-
-    class FakeSignal:
-        def zero_(self):
-            pass
-
-    class FakeScratchHandle:
-        def get_signal_pad(self, *args):
-            return FakeSignal()
-
-    outputs = []
-    launches = []
-    barriers = []
-
-    def allocate(*shape, **kwargs):
-        output = FakeOutput(1000 + len(outputs))
-        outputs.append(output)
-        return output
-
-    def run_main(*args):
-        output = args[3]
-        output.value = len(launches) + 1
-        launches.append((output, args[6], args[-1]))
-
-    module = SimpleNamespace(
-        run_barrier=lambda *args: barriers.append(args[-1]), run_main=run_main
-    )
-    main_stream = FakeStream()
-    comm_stream = FakeStream()
-    descriptors = SimpleNamespace(
-        record_stream=lambda stream: descriptor_streams.append(stream)
-    )
-    workspace = SimpleNamespace(
-        scratch=SimpleNamespace(shape=(1, 128, 8192), dtype=torch.bfloat16),
-        scratch_handle=FakeScratchHandle(),
-        comm_stream=comm_stream,
-        descriptor_cache=OrderedDict(),
-    )
+    first, second, third = _Stream(11), _Stream(22), _Stream(33)
+    current = {11: first, 22: second, 33: third}
     monkeypatch.setattr(
-        backend, "_validate_inputs", lambda *args: (0, 0, 1, "tp-group")
+        backend.torch.cuda, "current_stream", lambda index: current[handles[-1]]
     )
-    monkeypatch.setattr(backend, "_target_arch", lambda device: "sm_100a")
-    monkeypatch.setattr(backend, "_load_program", lambda arch: module)
-
-    def ensure_launch_state(state, **kwargs):
-        if state.flags is None:
-            lifecycle.append("launch-state")
-            state.flags = object()
-            state.flag_peers = object()
-            state.initialization_event = initialization_event
-            state.initialization_stream = 23
-
-    monkeypatch.setattr(backend, "_ensure_launch_state", ensure_launch_state)
-    monkeypatch.setattr(
-        backend.symm_mem,
-        "rendezvous",
-        lambda *args, **kwargs: pytest.fail("input must not be rendezvoused"),
-    )
-
-    def create_workspace(**kwargs):
-        lifecycle.append("workspace")
-        key = (
-            kwargs["device_index"],
-            id(kwargs["group"]),
-            kwargs["group_name"],
-            kwargs["dtype"],
-            kwargs["world_size"],
-            kwargs["rows"],
-        )
-        backend._WORKSPACES[key] = workspace
-        return workspace
-
-    monkeypatch.setattr(backend, "_workspace", create_workspace)
-    monkeypatch.setattr(
-        backend,
-        "_descriptor_storage",
-        lambda *args, **kwargs: descriptors,
-    )
-    monkeypatch.setattr(backend.torch, "empty", allocate)
-    monkeypatch.setattr(
-        backend.torch.cuda, "current_stream", lambda device: main_stream
-    )
-    monkeypatch.setattr(backend.torch.cuda, "stream", lambda stream: nullcontext())
-    monkeypatch.setattr(backend.torch.cuda, "Event", lambda **kwargs: FakeEvent())
-
-    first = backend.all_gather_matmul_cake(inp, weight, group, backend="cake")
-    second = backend.all_gather_matmul_cake(inp, weight, group, backend="cake")
-
-    assert first.data_ptr() != second.data_ptr()
-    assert first.value == 1
-    assert second.value == 2
-    assert launches == [(first, 1, 17), (second, 2, 17)]
-    assert barriers == [17, 17]
-    assert input_streams == [main_stream, comm_stream, main_stream, comm_stream]
-    assert weight_streams == [main_stream, main_stream]
-    assert descriptor_streams == [main_stream, main_stream]
-    assert lifecycle == [
-        "current-sync",
-        "launch-state",
-        "workspace",
-        "initialization-wait",
-        "tail-record",
-        "initialization-wait",
-        "tail-record",
-    ]
+    handles = [11]
+    state = backend._LaunchState(rank=0, world_size=2)
+    assert backend._join_previous_tail(state, 11, 0, capturing=False) is False
+    backend._remember_tail(state, 11, 0)
+    assert state.tail_stream is first and state.tail_handle == 11
+    assert backend._join_previous_tail(state, 11, 0, capturing=False) is False
+    handles.append(22)
+    assert backend._join_previous_tail(state, 22, 0, capturing=True) is False
+    assert backend._join_previous_tail(state, 22, 0, capturing=False) is True
+    assert second.joined == [first] and first.joined == []
+    backend._remember_tail(state, 22, 0)
+    assert state.tail_stream is second
+    handles.append(33)
+    assert backend._join_previous_tail(state, 33, 0, capturing=True) is False
+    assert third.joined == []
+    # Re-remembering the same stream keeps the cached torch stream object.
+    backend._remember_tail(state, 22, 0)
+    assert state.tail_stream is second
 
 
-def test_ensure_launch_state_records_initialization_after_device_state(monkeypatch):
-    backend = _backend()
-    lifecycle = []
-
-    class FakeFlags:
-        def zero_(self):
-            lifecycle.append("flags-zero")
-
-    class FakePeer:
-        def __init__(self, pointer):
-            self.pointer = pointer
-
-        def data_ptr(self):
-            lifecycle.append(f"peer-{self.pointer}")
-            return self.pointer
-
-    class FakeHandle:
-        rank = 2
-        world_size = 4
-
-        def get_buffer(self, peer, shape, dtype, offset):
-            assert shape == (18,)
-            assert dtype == torch.uint32
-            assert offset == 0
-            return FakePeer(1000 + peer)
-
-    class FakeEvent:
-        def __init__(self, **kwargs):
-            assert kwargs == {"enable_timing": False}
-            lifecycle.append("event-create")
-
-        def record(self, stream):
-            lifecycle.append(("event-record", stream.cuda_stream))
-
-    class FakeStream:
-        cuda_stream = 29
-
-    flags = FakeFlags()
-    handle = FakeHandle()
-    peer_tensor = object()
-    monkeypatch.setattr(
-        backend.symm_mem,
-        "empty",
-        lambda *args, **kwargs: (lifecycle.append("flags-allocate"), flags)[1],
-    )
-    monkeypatch.setattr(
-        backend.symm_mem,
-        "rendezvous",
-        lambda value, *, group: (
-            lifecycle.append(("rendezvous", value is flags, group)),
-            handle,
-        )[1],
-    )
-    monkeypatch.setattr(
-        backend.torch,
-        "tensor",
-        lambda values, *, dtype, device: (
-            lifecycle.append(("peer-upload", tuple(values), dtype, device)),
-            peer_tensor,
-        )[1],
-    )
-    monkeypatch.setattr(backend.torch.cuda, "Event", FakeEvent)
-
-    state = backend._LaunchState()
-    stream = FakeStream()
-    backend._ensure_launch_state(
-        state,
-        device_index=3,
-        rank=2,
-        world_size=4,
-        group_name="tp-group",
-        main_stream=stream,
-    )
-
-    assert state.flags is flags
-    assert state.flag_handle is handle
-    assert state.flag_peers is peer_tensor
-    assert state.initialization_stream == 29
-    assert lifecycle == [
-        "flags-allocate",
-        ("rendezvous", True, "tp-group"),
-        "flags-zero",
-        "peer-1000",
-        "peer-1001",
-        "peer-1002",
-        "peer-1003",
-        ("peer-upload", (1000, 1001, 1002, 1003), torch.int64, 3),
-        "event-create",
-        ("event-record", 29),
-    ]
-
-
-def test_validate_inputs_uses_the_exact_passed_subgroup(monkeypatch):
-    backend = _backend()
-    subgroup = SimpleNamespace(group_name="tp-group")
-    device = torch.device("cuda:3")
-    inp = SimpleNamespace(
-        device=device,
-        dtype=torch.bfloat16,
-        ndim=2,
-        shape=(128, 8192),
-        is_contiguous=lambda: True,
-    )
-    weight = SimpleNamespace(
-        device=device,
-        dtype=torch.bfloat16,
-        ndim=2,
-        shape=(8192, 2048),
-        is_contiguous=lambda: True,
-    )
-    seen_groups = []
-    monkeypatch.setattr(backend.dist, "is_available", lambda: True)
-    monkeypatch.setattr(backend.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(backend.dist, "get_backend", lambda group: "nccl")
-
-    def get_world_size(group):
-        seen_groups.append(group)
-        return 4
-
-    def get_rank(group):
-        seen_groups.append(group)
-        return 2
-
-    monkeypatch.setattr(backend.dist, "get_world_size", get_world_size)
-    monkeypatch.setattr(backend.dist, "get_rank", get_rank)
-    monkeypatch.setattr(backend.symm_mem, "get_backend", lambda device: "NVSHMEM")
-    monkeypatch.setattr(backend, "_target_arch", lambda device: "sm_100a")
-
-    assert backend._validate_inputs(inp, weight, subgroup) == (
-        3,
-        2,
-        4,
-        "tp-group",
-    )
-    assert seen_groups == [subgroup, subgroup]
-
-
-def test_validate_inputs_accepts_exact_tp8_width(monkeypatch):
-    backend = _backend()
-    subgroup = SimpleNamespace(group_name="tp8-group")
-    device = torch.device("cuda:7")
-    inp = SimpleNamespace(
-        device=device,
-        dtype=torch.bfloat16,
-        ndim=2,
-        shape=(512, 8192),
-        is_contiguous=lambda: True,
-    )
-    weight = SimpleNamespace(
-        device=device,
-        dtype=torch.bfloat16,
-        ndim=2,
-        shape=(8192, 2048),
-        is_contiguous=lambda: True,
-    )
-    monkeypatch.setattr(backend.dist, "is_available", lambda: True)
-    monkeypatch.setattr(backend.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(backend.dist, "get_backend", lambda group: "nccl")
-    monkeypatch.setattr(backend.dist, "get_world_size", lambda group: 8)
-    monkeypatch.setattr(backend.dist, "get_rank", lambda group: 7)
-    monkeypatch.setattr(backend.symm_mem, "get_backend", lambda device: "NVSHMEM")
-    monkeypatch.setattr(backend, "_target_arch", lambda device: "sm_103a")
-
-    assert backend._validate_inputs(inp, weight, subgroup) == (
-        7,
-        7,
-        8,
-        "tp8-group",
-    )
-
-
-@pytest.mark.parametrize(
-    ("world_size", "rank", "n"),
-    [(4, 2, 2560), (8, 7, 1280)],
-)
-def test_validate_inputs_keeps_packed_qkv_routes_private(
-    monkeypatch, world_size, rank, n
-):
-    backend = _backend()
-    subgroup = SimpleNamespace(group_name="tp-group")
-    device = torch.device("cuda:3")
-    inp = SimpleNamespace(
-        device=device,
-        dtype=torch.bfloat16,
-        ndim=2,
-        shape=(128, 8192),
-        is_contiguous=lambda: True,
-    )
-    weight = SimpleNamespace(
-        device=device,
-        dtype=torch.bfloat16,
-        ndim=2,
-        shape=(8192, n),
-        is_contiguous=lambda: True,
-    )
-    monkeypatch.setattr(backend.dist, "is_available", lambda: True)
-    monkeypatch.setattr(backend.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(backend.dist, "get_backend", lambda group: "nccl")
-    monkeypatch.setattr(backend.dist, "get_world_size", lambda group: world_size)
-    monkeypatch.setattr(backend.dist, "get_rank", lambda group: rank)
-    monkeypatch.setattr(backend.symm_mem, "get_backend", lambda device: "NVSHMEM")
-    monkeypatch.setattr(backend, "_target_arch", lambda device: "sm_103a")
-
-    with pytest.raises(ValueError, match=f"an N supported by world_size={world_size}"):
-        backend._validate_inputs(inp, weight, subgroup)
-    assert backend._validate_inputs(
-        inp, weight, subgroup, packed_qkv_experiment=True
-    ) == (3, rank, world_size, "tp-group")
-    assert "_all_gather_matmul_cake_packed_qkv_sm103_tp4" not in backend.__all__
-    assert "_prepare_all_gather_matmul_cake_packed_qkv" not in backend.__all__
-
-
-@pytest.mark.parametrize(
-    ("arch", "dtype", "world_size", "n", "message"),
-    [
-        (
-            "sm_100a",
-            torch.bfloat16,
-            4,
-            2560,
-            "requires bfloat16 and SM100/SM103 TP8 or SM103 TP4",
-        ),
-        (
-            "sm_103a",
-            torch.float16,
-            4,
-            2560,
-            "requires bfloat16 and SM100/SM103 TP8 or SM103 TP4",
-        ),
-        ("sm_103a", torch.bfloat16, 2, 2560, "requires exact K=8192"),
-        ("sm_103a", torch.bfloat16, 4, 1280, "requires exact K=8192"),
-        ("sm_103a", torch.bfloat16, 8, 2560, "requires exact K=8192"),
-    ],
-)
-def test_validate_inputs_rejects_other_packed_qkv_routes(
-    monkeypatch, arch, dtype, world_size, n, message
-):
-    backend = _backend()
-    subgroup = SimpleNamespace(group_name="tp-group")
-    device = torch.device("cuda:0")
-    inp = SimpleNamespace(
-        device=device,
-        dtype=dtype,
-        ndim=2,
-        shape=(128, 8192),
-        is_contiguous=lambda: True,
-    )
-    weight = SimpleNamespace(
-        device=device,
-        dtype=dtype,
-        ndim=2,
-        shape=(8192, n),
-        is_contiguous=lambda: True,
-    )
-    monkeypatch.setattr(backend.dist, "is_available", lambda: True)
-    monkeypatch.setattr(backend.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(backend.dist, "get_backend", lambda group: "nccl")
-    monkeypatch.setattr(backend.dist, "get_world_size", lambda group: world_size)
-    monkeypatch.setattr(backend.dist, "get_rank", lambda group: 0)
-    monkeypatch.setattr(backend.symm_mem, "get_backend", lambda device: "NVSHMEM")
-    monkeypatch.setattr(backend, "_target_arch", lambda device: arch)
-
-    with pytest.raises(ValueError, match=message):
-        backend._validate_inputs(inp, weight, subgroup, packed_qkv_experiment=True)
-
-
-class _FakePreparedTensor:
-    def __init__(self, pointer, shape, dtype, device, *, contiguous=True):
-        self.pointer = pointer
-        self.shape = shape
-        self.dtype = dtype
-        self.device = device
-        self.ndim = len(shape)
-        self.contiguous = contiguous
-        self.recorded_streams = []
-
-    def data_ptr(self):
-        return self.pointer
-
-    def stride(self):
-        stride = 1
-        result = []
-        for dim in reversed(self.shape):
-            result.append(stride)
-            stride *= dim
-        return tuple(reversed(result))
-
-    def is_contiguous(self):
-        return self.contiguous
+class _Recording:
+    def __init__(self, *, index=0):
+        self.device = torch.device("cuda", index)
+        self.streams = []
 
     def record_stream(self, stream):
-        self.recorded_streams.append(stream)
-
-    def __getitem__(self, index):
-        if isinstance(index, int):
-            shape = self.shape[1:]
-        elif isinstance(index, slice):
-            start, stop, step = index.indices(self.shape[0])
-            shape = (len(range(start, stop, step)), *self.shape[1:])
-        else:
-            raise TypeError(f"unsupported fake tensor index {index!r}")
-        return _FakePreparedTensor(
-            self.pointer + 1,
-            shape,
-            self.dtype,
-            self.device,
-            contiguous=self.contiguous,
-        )
+        self.streams.append(stream)
 
 
-def _fake_prepared_packed_qkv(
+def _launch_fixture(
     monkeypatch,
-    backend,
     *,
-    world_size=4,
-    rank=2,
-    device_index=3,
-    n=None,
-    handle_world_size=None,
-    bad_peer_scratch=False,
+    rows,
+    n,
+    world_size,
+    arch,
+    b_layout="n_major",
+    dtype_name="bfloat16",
 ):
-    backend._LAUNCH_STATES.clear()
-    backend._WORKSPACES.clear()
-    if n is None:
-        n = 2560 if world_size == 4 else 1280
-    if handle_world_size is None:
-        handle_world_size = world_size
-    device = torch.device("cuda", device_index)
-    inp = _FakePreparedTensor(1001, (128, 8192), torch.bfloat16, device)
-    weight = _FakePreparedTensor(2001, (8192, n), torch.bfloat16, device)
-    scratch = _FakePreparedTensor(3001, (world_size, 128, 8192), torch.bfloat16, device)
-    group = SimpleNamespace(group_name="tp-group")
-    module = SimpleNamespace(name="bound-module")
-
-    class FakeEvent:
-        cuda_event = 29
-
-        def __init__(self, **kwargs):
-            self.recorded_streams = []
-
-        def record(self, stream):
-            self.recorded_streams.append(stream)
-
-    class FakeStream:
-        cuda_stream = 23
-
-    initialization_event = FakeEvent()
-    state = backend._LaunchState(
-        flags=object(),
-        flag_peers=object(),
-        initialization_event=initialization_event,
-        initialization_stream=0,
+    call = backend._Call(0, 1, world_size, "g", dtype_name, arch, rows, n, b_layout)
+    state = backend._LaunchState(rank=1, world_size=world_size, flag_peers=("flags",))
+    workspace = backend._Workspace(
+        dtype={"bfloat16": torch.bfloat16, "float16": torch.float16}[dtype_name],
+        rank=1,
+        world_size=world_size,
+        device_index=0,
+        arch=arch,
+        pitch=max(2048, backend.loader.padded_rows(rows)),
     )
+    # The launch reads the device facts once (the SM count bounds the grid);
+    # pin them to the call's architecture so no GPU is queried and the
+    # delivered-class table of that architecture decides the tile width.
+    monkeypatch.setattr(
+        loader,
+        "device_facts",
+        lambda index: loader.DeviceFacts(
+            capability={"sm_100a": (10, 0), "sm_103a": (10, 3)}[arch],
+            arch=arch,
+            sm_count=148,
+        ),
+    )
+    workspace.scratch = "scratch"
+    workspace.signal_pad = "signal_pad"
+    workspace.comm_stream = "comm_stream"
+    workspace.comm_handle = 77
+    workspace.peer_scratch_ptrs = ("peer_scratch",)
+    workspace.peer_signal_ptrs = ("peer_signals",)
+    workspace.push_buffers = ("payload", "signals", "counters")
 
-    class FakeScratchHandle:
+    class _Sequence:
         def __init__(self):
-            self.rank = rank
-            self.world_size = handle_world_size
             self.calls = []
 
-        def get_signal_pad(self, peer, shape, dtype, offset):
-            self.calls.append(("signal", peer, tuple(shape), dtype, offset))
-            return _FakePreparedTensor(4000 + peer, tuple(shape), dtype, device)
+        def run(self, *args):
+            self.calls.append(("run", args))
 
-        def get_remote_tensor(self, peer, shape, dtype):
-            self.calls.append(("remote", peer, tuple(shape), dtype))
-            remote_shape = tuple(shape)
-            if bad_peer_scratch:
-                remote_shape = (remote_shape[0], 127, remote_shape[2])
-            return _FakePreparedTensor(5000 + peer, remote_shape, dtype, device)
+        def run_push(self, *args):
+            self.calls.append(("run_push", args))
 
-    scratch_handle = FakeScratchHandle()
-    workspace = backend._Workspace(
-        scratch=scratch,
-        scratch_handle=scratch_handle,
-        comm_stream=FakeStream(),
-        bridge_event=FakeEvent(),
+    sequence = _Sequence()
+    workspace.sequences = {b_layout: sequence}
+    monkeypatch.setattr(backend, "_current_stream_handle", lambda index: 4242)
+    monkeypatch.setattr(
+        backend.torch.cuda, "is_current_stream_capturing", lambda: False
     )
-    state_key = (device_index, id(group), "tp-group")
-    workspace_key = (
-        device_index,
-        id(group),
-        "tp-group",
-        torch.bfloat16,
-        world_size,
-        128,
+    monkeypatch.setattr(backend, "_remember_tail", lambda state, handle, index: None)
+    return call, state, workspace, sequence
+
+
+def test_launch_is_one_host_sequence_call_with_the_workspace_tables(monkeypatch):
+    call, state, workspace, sequence = _launch_fixture(
+        monkeypatch, rows=1025, n=2048, world_size=4, arch="sm_100a"
     )
-    backend._LAUNCH_STATES[state_key] = state
-    backend._WORKSPACES[workspace_key] = workspace
-    validation_calls = []
-    arch_calls = []
-    module_calls = []
-    descriptor_calls = []
+    inp = _Recording()
+    backend._launch(state, workspace, call, inp, "w_source", "out")
+    # 288 N256 tiles: two waves, and halving the width saves no idle slot
+    # (2 * 2 = ceil(576 / 148)), so the call runs the N256 main; its class
+    # (4, bfloat16, n_major) has no measured pair region, so it runs the
+    # one-CTA form. The width and the form travel to the sequence right after
+    # grid_z.
+    grid = backend.loader.main_grid(
+        1025, 2048, world_size=4, sm_count=148, block_n=256, form="cg1"
+    )
+    assert grid == (148, 1, 1)
+    assert sequence.calls == [
+        (
+            "run",
+            (
+                inp,
+                "scratch",
+                "w_source",
+                "out",
+                "signal_pad",
+                ("flags",),
+                ("peer_scratch",),
+                ("peer_signals",),
+                1,
+                1025,
+                workspace.pitch,
+                0,
+                1,
+                *grid,
+                256,
+                0,
+                4242,
+                77,
+            ),
+        )
+    ]
+    # The pushes read ``inp`` on the communication stream.
+    assert inp.streams == ["comm_stream"]
+    assert (state.next_phase, state.ready_epoch) == (1, 1)
+    backend._launch(state, workspace, call, inp, "w_source", "out")
+    assert sequence.calls[-1][1][11:13] == (1, 2)
+    assert (state.next_phase, state.ready_epoch) == (0, 2)
+    assert state.poisoned is False
 
-    def validate(*args, **kwargs):
-        validation_calls.append((args, kwargs))
-        return device_index, rank, world_size, "tp-group"
 
-    monkeypatch.setattr(backend, "_validate_inputs", validate)
+def test_small_rows_use_the_sm_push_sequence_entry_on_the_callers_stream(monkeypatch):
+    call, state, workspace, sequence = _launch_fixture(
+        monkeypatch, rows=512, n=1280, world_size=8, arch="sm_100a"
+    )
+    inp = _Recording()
+    backend._launch(state, workspace, call, inp, "w_source", "out")
+    (entry, args) = sequence.calls[0]
+    assert entry == "run_push"
+    assert args[6:9] == ("payload", "signals", "counters")
+    assert args[12:14] == (0, 1)
+    # 160 N256 tiles at ws8 (two waves, three on the twin): within the sm_100a
+    # cap of two the rule selects the ``_n128`` main of the (8, bfloat16,
+    # n_major) class delivered on sm_100a; the SM push entry receives the width
+    # after grid_z like the copy-engine entry.
+    assert args[14:17] == backend.loader.main_grid(
+        512, 1280, world_size=8, sm_count=148, block_n=128
+    )
+    # Four M tiles per chunk and the 128-wide program: the one-CTA form (form code 0).
+    assert args[17:] == (128, 0, 4242, 77) and len(args) == 21
+    # No communication stream is involved on the SM push route.
+    assert inp.streams == []
+    assert state.next_phase == 1 and state.ready_epoch == 1
+
+
+def _pinned_spill_code(world_size, dtype_name, b_layout, padded, n):
+    """Host-sequence form code of the pinned sm_103a spill point naming the
+    class, padded rows and ``n`` (``_CG2_SPILL_POINTS``): the launch rows below
+    follow the pinned table when a point's form changes."""
+
+    [form] = [
+        entry[5]
+        for entry in _CG2_SPILL_POINTS["sm_103a"]
+        if tuple(entry[:5]) == (world_size, dtype_name, b_layout, padded, n)
+    ]
+    return loader.main_form_code(form)
+
+
+# The two sm_103a points: the ws4 gate_up M=512 row and the ws8 gate_up M=512 row.
+_GATE_WS4_CODE = _pinned_spill_code(4, "bfloat16", "k_major", 512, 14336)
+_GATE_WS8_CODE = _pinned_spill_code(8, "bfloat16", "k_major", 512, 7168)
+
+
+def _pinned_order_code(world_size, dtype_name, b_layout, padded, n):
+    """Host-sequence form code of the pinned sm_103a tile-order point naming the
+    class, padded rows and ``n`` (``_TILE_ORDER_POINTS``): the launch rows below
+    follow the pinned table when a point's form changes."""
+
+    [form] = [
+        entry[5]
+        for entry in _TILE_ORDER_POINTS["sm_103a"]
+        if tuple(entry[:5]) == (world_size, dtype_name, b_layout, padded, n)
+    ]
+    return loader.main_form_code(form)
+
+
+# The sm_103a tile-order point: the ws4 gate_up M=125 row (128 padded rows).
+_ORDER_WS4_CODE = _pinned_order_code(4, "bfloat16", "k_major", 128, 14336)
+
+
+@pytest.mark.parametrize(
+    (
+        "rows",
+        "n",
+        "world_size",
+        "arch",
+        "dtype_name",
+        "b_layout",
+        "entry",
+        "block_n",
+        "form_code",
+    ),
+    [
+        # Two N256 waves: within the sm_100a cap of two, beyond the sm_103a cap of one.
+        (512, 1280, 8, "sm_100a", "bfloat16", "n_major", "run_push", 128, 0),
+        (512, 1280, 8, "sm_103a", "bfloat16", "n_major", "run_push", 256, 0),
+        # One N256 wave: within the cap of both architectures.
+        (125, 1280, 8, "sm_100a", "bfloat16", "k_major", "run_push", 128, 0),
+        (125, 1280, 8, "sm_103a", "bfloat16", "k_major", "run_push", 128, 0),
+        # (8, float16, k_major) has a delivered twin on sm_100a only (two-wave row).
+        (512, 1280, 8, "sm_100a", "float16", "k_major", "run_push", 128, 0),
+        (125, 1280, 8, "sm_103a", "float16", "k_major", "run_push", 256, 0),
+        # (4, bfloat16, n_major) has no delivered twin: its sm_103a-only row spans
+        # two waves (beyond the sm_103a cap), so neither architecture ships one.
+        (512, 2560, 4, "sm_103a", "bfloat16", "n_major", "run_push", 256, 0),
+        (512, 2560, 4, "sm_100a", "bfloat16", "n_major", "run_push", 256, 0),
+        # The sm_103a band (eight ranks, exactly 1024 padded rows, N <= 1619) takes the
+        # SM push route beyond the base rule; three N256 waves keep the N256 main.
+        (1024, 1280, 8, "sm_103a", "bfloat16", "k_major", "run_push", 256, 0),
+        # Three N256 waves exceed the cap: the copy-engine route runs the N256 main;
+        # a call inside a measured pair rectangle of its class on the architecture
+        # selects its CTA-pair twin (form code 1): on sm_103a the ws2 bf16
+        # n_major calls of 2048..5760 padded rows (N <= 2048) and the ws4 bf16
+        # k_major calls of 1024..1536 padded rows (N <= 6058), the QKV M=1024
+        # and M=1025 (1152 padded) rows among them: that rectangle holds no
+        # spill point.
+        (2048, 2048, 2, "sm_103a", "bfloat16", "n_major", "run", 256, 1),
+        (4096, 2048, 2, "sm_103a", "bfloat16", "n_major", "run", 256, 1),
+        (1024, 2560, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 1),
+        (1025, 2560, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 1),
+        # The sm_103a gate_up points: ws4 bf16 k_major at exactly 512 padded rows
+        # and N = 14336, ws8 bf16 k_major at exactly 512 padded rows and N = 7168
+        # (500 pads to 512; 513 pads to 640 and leaves) select the spill-wave
+        # N-split pair twin of the form each pinned point names (the code derived
+        # from ``_CG2_SPILL_POINTS``); the M=2048 gate_up rows are not routed.
+        (512, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, _GATE_WS4_CODE),
+        (2048, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
+        (500, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, _GATE_WS4_CODE),
+        # The sm_103a tile-order point: ws4 bf16 k_major at exactly 128 padded rows
+        # and N = 14336 (125 pads to 128; 129 pads to 256 and leaves) selects the
+        # ``po`` tile-order twin of the one-CTA program (form code 4) on the
+        # copy-engine route with the one-CTA grid; sm_100a has no point.
+        (125, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, _ORDER_WS4_CODE),
+        (128, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, _ORDER_WS4_CODE),
+        (129, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
+        (125, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        (512, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, _GATE_WS8_CODE),
+        (2048, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
+        (513, 7168, 8, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
+        # The measured points on sm_100a: ws2 bf16 n_major at
+        # exactly 1024, 2048 or 4096 padded rows and N = 2048, ws4 bf16 k_major at
+        # exactly 1024, 1152 or 2048 padded rows and N = 2560 (1000 pads to 1024
+        # and takes the twin; 1153 pads to 1280 and leaves; 3000 pads to 3072 and
+        # leaves) and at exactly 512 or 1024 padded rows and N = 14336, ws8 bf16
+        # k_major at exactly 512 or 1024 padded rows and N = 7168 (500 / 1000 pad
+        # to 512 / 1024 and take the twin; 513 / 1025 pad to 640 / 1152 and
+        # leave; the M=2048 gate_up rows stay one-CTA).
+        (2048, 2048, 2, "sm_100a", "bfloat16", "n_major", "run", 256, 1),
+        (4096, 2048, 2, "sm_100a", "bfloat16", "n_major", "run", 256, 1),
+        (1024, 2560, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (1025, 2560, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (2048, 2560, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (1000, 2560, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (1153, 2560, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        (3000, 2048, 2, "sm_100a", "bfloat16", "n_major", "run", 256, 0),
+        (1024, 2048, 2, "sm_100a", "bfloat16", "n_major", "run", 256, 1),
+        (512, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (500, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (513, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        (1024, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (1000, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (1025, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        (2048, 14336, 4, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        (512, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (500, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (513, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        (1024, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (1000, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (1025, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        (2048, 7168, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        # The measured ws2 M=1024 points on both architectures: bf16 n_major, bf16
+        # k_major and fp16 k_major at exactly 1024 padded rows and N = 2048 (1000
+        # pads to 1024 and takes the twin; 1025 pads to 1152 and leaves).
+        (1024, 2048, 2, "sm_103a", "bfloat16", "n_major", "run", 256, 1),
+        (1000, 2048, 2, "sm_103a", "bfloat16", "n_major", "run", 256, 1),
+        (1024, 2048, 2, "sm_103a", "bfloat16", "k_major", "run", 256, 1),
+        (1024, 2048, 2, "sm_103a", "float16", "k_major", "run", 256, 1),
+        (1025, 2048, 2, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
+        (1536, 2048, 2, "sm_103a", "bfloat16", "n_major", "run", 256, 0),
+        (1000, 2048, 2, "sm_100a", "bfloat16", "n_major", "run", 256, 1),
+        (1024, 2048, 2, "sm_100a", "bfloat16", "k_major", "run", 256, 1),
+        (1024, 2048, 2, "sm_100a", "float16", "k_major", "run", 256, 1),
+        (1025, 2048, 2, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        (1536, 2048, 2, "sm_100a", "bfloat16", "n_major", "run", 256, 0),
+        # Outside every rectangle or another class: the one-CTA N256 main.
+        (8192, 2048, 2, "sm_103a", "bfloat16", "n_major", "run", 256, 0),
+        (2048, 2560, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
+        (1024, 14336, 4, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
+        # Outside the sm_103a band (N > 1619) the 1024-row eight-rank call keeps the copy engines.
+        (1024, 2048, 8, "sm_103a", "bfloat16", "k_major", "run", 256, 0),
+        (1025, 2048, 4, "sm_103a", "bfloat16", "n_major", "run", 256, 0),
+        (65536, 2048, 2, "sm_103a", "float16", "n_major", "run", 256, 0),
+        (2048, 2048, 2, "sm_100a", "float16", "n_major", "run", 256, 0),
+        (1024, 1280, 8, "sm_100a", "bfloat16", "k_major", "run", 256, 0),
+        (1025, 2048, 4, "sm_100a", "bfloat16", "n_major", "run", 256, 0),
+        (256, 2048, 2, "sm_100a", "bfloat16", "n_major", "run", 256, 0),
+        (896, 2048, 2, "sm_100a", "bfloat16", "n_major", "run", 256, 0),
+    ],
+)
+def test_launch_passes_the_loader_tile_width_and_form_after_grid_z_on_both_routes(
+    monkeypatch,
+    rows,
+    n,
+    world_size,
+    arch,
+    dtype_name,
+    b_layout,
+    entry,
+    block_n,
+    form_code,
+):
+    """Both host-sequence entries receive ``block_n`` (128 for a call the
+    loader routes to a delivered ``_n128`` main on that architecture within its
+    wave cap, 256 otherwise) and the form code (1 for an N256 call inside a
+    measured pair region of its class on that architecture, whose class
+    delivers the CTA-pair twin there; the point's form code -- 2 for the
+    four-tile split, 3 for the two-tile split -- when the call also names a
+    delivered spill-wave N-split point of its class; 4 / 5 for an N256 call the
+    pair rule leaves on the one-CTA program that names a delivered tile-order
+    point of its class; 0 otherwise) positionally after ``grid_z``, with the
+    grid of that width and form."""
+
+    call, state, workspace, sequence = _launch_fixture(
+        monkeypatch,
+        rows=rows,
+        n=n,
+        world_size=world_size,
+        arch=arch,
+        b_layout=b_layout,
+        dtype_name=dtype_name,
+    )
+    backend._launch(state, workspace, call, _Recording(), "w_source", "out")
+    [(name, args)] = sequence.calls
+    assert name == entry
+    grid_z = 16 if entry == "run_push" else 15
+    assert len(args) == grid_z + 5
+    form = backend.loader.MAIN_FORMS[form_code]
+    assert backend.loader.main_form_code(form) == form_code
+    grid = backend.loader.main_grid(
+        rows, n, world_size=world_size, sm_count=148, block_n=block_n, form=form
+    )
+    assert args[grid_z - 2 : grid_z + 1] == grid
+    if form in backend.loader.PAIR_FORMS:
+        assert grid[0] % 2 == 0
+    if form in backend.loader.ORDER_FORMS:
+        assert grid == backend.loader.main_grid(
+            rows, n, world_size=world_size, sm_count=148
+        )
+    assert args[grid_z + 1 :] == (block_n, form_code, 4242, 77)
+    assert block_n == backend.loader.main_block_n(
+        rows,
+        n,
+        world_size=world_size,
+        arch=arch,
+        dtype_name=dtype_name,
+        b_layout=b_layout,
+    )
+    assert form == backend.loader.main_form(
+        rows,
+        n,
+        world_size=world_size,
+        arch=arch,
+        dtype_name=dtype_name,
+        b_layout=b_layout,
+        block_n=block_n,
+    )
+
+
+@pytest.mark.parametrize(
+    "rows, n, world_size, arch, entry, target_index, k_slices",
+    [
+        (1025, 2048, 4, "sm_100a", "run", 12, 1),
+        (512, 1280, 8, "sm_103a", "run_push", 13, 4),
+    ],
+)
+def test_captured_launch_publishes_the_sentinel_and_clears_its_words_on_both_routes(
+    monkeypatch, rows, n, world_size, arch, entry, target_index, k_slices
+):
+    """Under capture both routes pass the sentinel as ``ready_target``, leave the
+    eager epoch untouched, skip ``record_stream`` and clear exactly the
+    ``world_size * num_chunks * k_slices`` words the peers wrote (the readiness
+    slice table's count of the SM push call -- four words per (peer, chunk) on
+    the eight-rank 512-row call of ``sm_103a`` -- and one word per (peer, chunk)
+    off the table), after the sequence."""
+
+    call, state, workspace, sequence = _launch_fixture(
+        monkeypatch, rows=rows, n=n, world_size=world_size, arch=arch
+    )
+    monkeypatch.setattr(backend.torch.cuda, "is_current_stream_capturing", lambda: True)
+    cleared = []
+    monkeypatch.setattr(
+        backend, "_clear_readiness", lambda ws, words: cleared.append((ws, words))
+    )
+    inp = _Recording()
+    backend._launch(state, workspace, call, inp, "w_source", "out")
+    (name, args) = sequence.calls[0]
+    assert name == entry
+    assert args[target_index] == backend._CAPTURE_READY_TARGET
+    assert state.ready_epoch == 0
+    assert inp.streams == []
+    assert (
+        loader.push_kslices(loader.padded_rows(rows), world_size=world_size, arch=arch)
+        == k_slices
+    )
+    assert cleared == [
+        (workspace, world_size * backend.loader.chunk_plan(rows)[2] * k_slices)
+    ]
+    assert state.next_phase == 1 and state.poisoned is False
+    assert workspace.captured is True
+
+
+def test_captured_sm_push_launch_refuses_unmaterialized_tables(monkeypatch):
+    call, state, workspace, sequence = _launch_fixture(
+        monkeypatch, rows=512, n=1280, world_size=8, arch="sm_103a"
+    )
+    monkeypatch.setattr(backend.torch.cuda, "is_current_stream_capturing", lambda: True)
+    workspace.push_buffers = None
+    with pytest.raises(RuntimeError, match="prepare the launcher eagerly"):
+        backend._launch(state, workspace, call, _Recording(), "w_source", "out")
+    assert sequence.calls == []
+    # A caller error before any submission: the group stays usable and uncaptured.
+    assert state.poisoned is False and workspace.captured is False
+
+
+def test_launch_refuses_an_unprepared_layout_without_poisoning(monkeypatch):
+    call, state, workspace, _sequence = _launch_fixture(
+        monkeypatch, rows=256, n=2048, world_size=2, arch="sm_100a"
+    )
+    workspace.sequences = {}
+    with pytest.raises(RuntimeError, match="host sequence"):
+        backend._launch(state, workspace, call, _Recording(), "w_source", "out")
+    assert state.poisoned is False
+
+
+def test_sequence_failure_poisons_the_launch_state(monkeypatch):
+    call, state, workspace, sequence = _launch_fixture(
+        monkeypatch, rows=256, n=2048, world_size=2, arch="sm_100a"
+    )
+
+    def failing(*args):
+        raise RuntimeError("boom")
+
+    sequence.run = failing
+    with pytest.raises(RuntimeError, match="boom"):
+        backend._launch(state, workspace, call, _Recording(), "w_source", "out")
+    assert state.poisoned is True
+
+
+class _FakeHandle:
+    """Symmetric-memory handle stand-in: topology, ``buffer_size`` and CPU peer buffers."""
+
+    def __init__(self, *, rank, world_size, buffer_size):
+        self.rank = rank
+        self.world_size = world_size
+        self.buffer_size = buffer_size
+
+    def get_buffer(self, peer, shape, dtype, offset):
+        return torch.empty(shape, dtype=dtype)
+
+
+def _patch_symmetric_memory(monkeypatch, handles):
+    """``symm_mem.empty`` hands out CPU tensors; ``rendezvous`` returns the scripted handles in order."""
+
+    allocated = []
+
+    def empty(*shape, dtype, device):
+        tensor = torch.empty(*shape, dtype=dtype)
+        allocated.append(weakref.ref(tensor))
+        return tensor
+
+    def rendezvous(tensor, group):
+        assert group == "g"
+        return handles.pop(0)
+
+    monkeypatch.setattr(backend.symm_mem, "empty", empty)
+    monkeypatch.setattr(backend.symm_mem, "rendezvous", rendezvous)
+    return allocated
+
+
+def _guard_call(rank=1, world_size=2):
+    return backend._Call(
+        0, rank, world_size, "g", "bfloat16", "sm_100a", 128, 2048, "n_major"
+    )
+
+
+def _allocate_words(words):
+    return lambda: backend.symm_mem.empty(words, dtype=torch.uint32, device=0)
+
+
+def test_rendezvous_reallocates_past_a_stale_handle_and_releases_the_parked_allocation(
+    monkeypatch,
+):
+    """A handle smaller than its tensor is torch's cached handle of a freed allocation (pre-pytorch#192579)."""
+
+    words = 64
+    stale = _FakeHandle(rank=1, world_size=2, buffer_size=4 * words - 4)
+    fresh = _FakeHandle(rank=1, world_size=2, buffer_size=4 * words)
+    allocated = _patch_symmetric_memory(monkeypatch, [stale, fresh])
+    votes = []
+    monkeypatch.setattr(
+        backend, "_group_max", lambda mask, call, group: votes.append(mask) or mask
+    )
+    monkeypatch.setitem(backend._RENDEZVOUS_STATS, "stale_retries", 0)
+    with pytest.warns(RuntimeWarning, match="pytorch#192579"):
+        [(tensor, handle)] = backend._rendezvous(
+            _guard_call(), "group", [("barrier flag", _allocate_words(words))]
+        )
+    assert handle is fresh and tensor.numel() == words
+    assert votes == [1, 0]
+    assert backend._RENDEZVOUS_STATS["stale_retries"] == 1
+    gc.collect()
+    # The parked (stale) allocation is released once the loop ends; the returned one lives on.
+    assert allocated[0]() is None
+    assert allocated[1]() is tensor
+
+
+def test_rendezvous_votes_once_per_round_and_retries_only_the_stale_allocations(
+    monkeypatch,
+):
+    """Flags and scratch of one growth round share one all-reduce; only the stale one is re-allocated."""
+
+    words, scratch_words = 32, 64
+    flags_ok = _FakeHandle(rank=1, world_size=2, buffer_size=4 * words)
+    scratch_stale = _FakeHandle(rank=1, world_size=2, buffer_size=4 * scratch_words - 4)
+    scratch_ok = _FakeHandle(rank=1, world_size=2, buffer_size=4 * scratch_words)
+    allocated = _patch_symmetric_memory(
+        monkeypatch, [flags_ok, scratch_stale, scratch_ok]
+    )
+    votes = []
+    monkeypatch.setattr(
+        backend, "_group_max", lambda mask, call, group: votes.append(mask) or mask
+    )
+    monkeypatch.setitem(backend._RENDEZVOUS_STATS, "stale_retries", 0)
+    with pytest.warns(RuntimeWarning, match="scratch"):
+        (flags, flag_handle), (scratch, scratch_handle) = backend._rendezvous(
+            _guard_call(),
+            "group",
+            [
+                ("barrier flag", _allocate_words(words)),
+                ("scratch", _allocate_words(scratch_words)),
+            ],
+        )
+    # One vote per round (a bitmask over the round's allocations), not one per allocation.
+    assert votes == [0b10, 0]
+    assert flag_handle is flags_ok and scratch_handle is scratch_ok
+    assert flags.numel() == words and scratch.numel() == scratch_words
+    assert len(allocated) == 3 and backend._RENDEZVOUS_STATS["stale_retries"] == 1
+    gc.collect()
+    assert allocated[1]() is None
+    assert allocated[0]() is flags and allocated[2]() is scratch
+
+
+def test_rendezvous_follows_a_peer_stale_vote_so_every_rank_reallocates(monkeypatch):
+    words = 64
+    first = _FakeHandle(rank=0, world_size=2, buffer_size=4 * words)
+    second = _FakeHandle(rank=0, world_size=2, buffer_size=4 * words)
+    allocated = _patch_symmetric_memory(monkeypatch, [first, second])
+    peer_votes = iter([1, 0])
+    local_masks = []
     monkeypatch.setattr(
         backend,
-        "_target_arch",
-        lambda bound_device: (arch_calls.append(bound_device), "sm_103a")[1],
+        "_group_max",
+        lambda mask, call, group: local_masks.append(mask) or next(peer_votes),
+    )
+    monkeypatch.setitem(backend._RENDEZVOUS_STATS, "stale_retries", 3)
+    [(tensor, handle)] = backend._rendezvous(
+        _guard_call(rank=0), "group", [("scratch", _allocate_words(words))]
+    )
+    # This rank's handles were fine; the peer's stale vote still made it re-allocate.
+    assert local_masks == [0, 0]
+    assert handle is second and len(allocated) == 2
+    assert backend._RENDEZVOUS_STATS["stale_retries"] == 4
+    gc.collect()
+    assert allocated[0]() is None and allocated[1]() is tensor
+
+
+def test_rendezvous_gives_up_after_the_bounded_attempts_with_a_named_error(monkeypatch):
+    words = 64
+    handles = [
+        _FakeHandle(rank=1, world_size=2, buffer_size=4)
+        for _ in range(backend._RENDEZVOUS_ATTEMPTS)
+    ]
+    allocated = _patch_symmetric_memory(monkeypatch, handles)
+    monkeypatch.setattr(backend, "_group_max", lambda mask, call, group: mask)
+    monkeypatch.setitem(backend._RENDEZVOUS_STATS, "stale_retries", 1)
+    with pytest.raises(backend.StaleSymmetricHandleError, match="max_rows"):
+        backend._rendezvous(
+            _guard_call(), "group", [("scratch", _allocate_words(words))]
+        )
+    assert issubclass(backend.StaleSymmetricHandleError, RuntimeError)
+    assert len(allocated) == backend._RENDEZVOUS_ATTEMPTS and not handles
+    gc.collect()
+    assert all(ref() is None for ref in allocated)
+
+
+def test_rendezvous_rejects_a_topology_mismatch_before_voting(monkeypatch):
+    _patch_symmetric_memory(
+        monkeypatch, [_FakeHandle(rank=0, world_size=4, buffer_size=4 * 64)]
     )
     monkeypatch.setattr(
         backend,
-        "_load_program",
-        lambda arch: (module_calls.append(arch), module)[1],
+        "_group_max",
+        lambda mask, call, group: pytest.fail("no vote on a topology mismatch"),
+    )
+    with pytest.raises(RuntimeError, match="topology"):
+        backend._rendezvous(_guard_call(), "group", [("scratch", _allocate_words(64))])
+
+
+def test_publish_flags_publishes_every_peer_pointer_of_the_cleared_pad():
+    call = _guard_call(rank=1, world_size=2)
+    words = backend.loader.barrier_flag_words(2)
+    fresh = _FakeHandle(rank=1, world_size=2, buffer_size=4 * words)
+    flags = torch.zeros(words, dtype=torch.uint32)
+    state = backend._LaunchState(rank=1, world_size=2)
+    backend._publish_flags(state, call, flags, fresh)
+    assert state.flag_handle is fresh and state.flags is flags
+    assert len(state.flag_peers) == 2
+
+
+def test_rendezvous_clears_fresh_allocations_before_the_single_vote(monkeypatch):
+    """The round zeroes the local pads, synchronizes and votes: the vote is also the post-allocation barrier."""
+
+    words = 64
+    fresh = _FakeHandle(rank=1, world_size=2, buffer_size=4 * words)
+    _patch_symmetric_memory(monkeypatch, [fresh])
+    order = []
+    monkeypatch.setattr(
+        backend, "_group_max", lambda mask, call, group: order.append("vote") or mask
     )
     monkeypatch.setattr(
         backend.torch.cuda,
         "current_stream",
-        lambda device_index: SimpleNamespace(cuda_stream=0),
+        lambda index: type(
+            "S", (), {"synchronize": lambda self: order.append("sync")}
+        )(),
     )
-    monkeypatch.setattr(backend.torch.cuda, "Event", FakeEvent)
-    descriptor = _FakePreparedTensor(
-        6001,
-        (backend._DESCRIPTOR_COUNT * backend._TENSOR_MAP_BYTES,),
-        torch.uint8,
-        device,
+    [(tensor, handle)] = backend._rendezvous(
+        _guard_call(),
+        "group",
+        [("barrier flag", _allocate_words(words))],
+        clear=lambda index, tensor, handle: order.append(("clear", index))
+        or tensor.zero_(),
     )
-    descriptor_entry = SimpleNamespace(
-        descriptors=descriptor,
-        ready_event=FakeEvent(),
-        ready_stream=0,
-    )
+    assert order == [("clear", 0), "sync", "vote"] and not tensor.any()
+
+
+class _SyncStream:
+    def __init__(self):
+        self.synchronized = 0
+
+    def synchronize(self):
+        self.synchronized += 1
+
+
+def _prepare_fixture(monkeypatch, name):
+    _patch_distributed(monkeypatch, world_size=2, rank=0)
+    stream = _SyncStream()
+    monkeypatch.setattr(backend.torch.cuda, "current_stream", lambda index: stream)
     monkeypatch.setattr(
-        backend,
-        "_prepared_descriptor_storage",
-        lambda *args, **kwargs: (
-            descriptor_calls.append((args, kwargs)),
-            descriptor_entry,
-        )[1],
+        backend.torch.cuda, "is_current_stream_capturing", lambda: False
     )
-    launcher = backend._prepare_all_gather_matmul_cake_packed_qkv(inp, weight, group)
-    calls = SimpleNamespace(
-        validation=validation_calls,
-        arch=arch_calls,
-        module=module_calls,
-        descriptor=descriptor_calls,
-        descriptor_entry=descriptor_entry,
-    )
-    return launcher, inp, weight, group, state, workspace, module, calls
+    monkeypatch.setattr(backend.loader, "load", lambda *a: object())
+    group = _fake_group(2, 0, name=name)
+    call = backend._Call(0, 0, 2, name, "bfloat16", "sm_100a", 512, 2048, "n_major")
+    return call, group, stream
 
 
-def test_prepare_packed_qkv_binds_host_identity_once(monkeypatch):
-    backend = _backend()
-    launcher, inp, weight, group, state, workspace, module, calls = (
-        _fake_prepared_packed_qkv(monkeypatch, backend)
-    )
-
-    assert launcher.group is group
-    assert launcher.group_id == id(group)
-    assert launcher.group_name == "tp-group"
-    assert launcher.rank == 2
-    assert launcher.world_size == 4
-    assert launcher.device_index == 3
-    assert launcher.device == torch.device("cuda:3")
-    assert launcher.arch == "sm_103a"
-    assert launcher.dtype == torch.bfloat16
-    assert launcher.rows == 128
-    assert launcher.output_n == 2560
-    assert launcher.module is module
-    assert launcher.state is state
-    assert launcher.workspace is workspace
-    assert launcher.weight is weight
-    assert launcher.weight_fingerprint == backend._tensor_fingerprint(weight)
-    assert launcher.scratch_fingerprint == backend._tensor_fingerprint(
-        workspace.scratch
-    )
-    assert launcher.chunk_size == 128
-    assert launcher.num_chunks == 1
-    assert launcher.chunk_plan == ((0, 128),)
-    assert launcher.signal_pad.shape == (4, 1)
-    assert launcher.signal_pad_ptr == 4002
-    assert len(launcher.peer_routes) == 3
-    assert launcher.peer_scratch_ptrs == (5004, 5001, 5002)
-    assert launcher.peer_signal_ptrs == (4004, 4001, 4002)
-    assert launcher.native_peer_args == (
-        launcher.peer_routes[0][0],
-        launcher.peer_routes[0][1],
-        launcher.peer_routes[1][0],
-        launcher.peer_routes[1][1],
-        launcher.peer_routes[2][0],
-        launcher.peer_routes[2][1],
-        launcher.peer_routes[2][0],
-        launcher.peer_routes[2][1],
-        launcher.peer_routes[2][0],
-        launcher.peer_routes[2][1],
-        launcher.peer_routes[2][0],
-        launcher.peer_routes[2][1],
-        launcher.peer_routes[2][0],
-        launcher.peer_routes[2][1],
-    )
-    assert launcher.native_expected_peer_args == (
-        5004,
-        4004,
-        5001,
-        4001,
-        5002,
-        4002,
-        5002,
-        4002,
-        5002,
-        4002,
-        5002,
-        4002,
-        5002,
-        4002,
-    )
-    assert [call[:2] for call in workspace.scratch_handle.calls] == [
-        ("signal", 2),
-        ("remote", 3),
-        ("signal", 3),
-        ("remote", 0),
-        ("signal", 0),
-        ("remote", 1),
-        ("signal", 1),
-    ]
-    assert len(calls.validation) == 1
-    assert calls.validation[0][0] == (inp, weight, group)
-    assert calls.validation[0][1] == {"packed_qkv_experiment": True}
-    assert calls.arch == [torch.device("cuda:3")]
-    assert calls.module == ["sm_103a"]
-    assert len(calls.descriptor) == 1
-    assert "_prepare_all_gather_matmul_cake_packed_qkv" not in backend.__all__
-    with pytest.raises(AttributeError):
-        launcher.peer_routes = ()
-
-
-def test_prepare_packed_qkv_tp8_binds_and_submits_all_seven_peers(monkeypatch):
-    backend = _backend()
-    launcher, inp, weight, _, state, workspace, module, _ = _fake_prepared_packed_qkv(
-        monkeypatch,
-        backend,
-        world_size=8,
-        rank=7,
-        device_index=7,
-    )
-
-    assert launcher.world_size == 8
-    assert launcher.rank == 7
-    assert launcher.device == torch.device("cuda:7")
-    assert launcher.output_n == 1280
-    assert launcher.signal_pad.shape == (8, 1)
-    assert launcher.signal_pad_ptr == 4007
-    assert len(launcher.peer_routes) == 7
-    assert launcher.peer_scratch_ptrs == tuple(range(5001, 5008))
-    assert launcher.peer_signal_ptrs == tuple(range(4001, 4008))
-    assert len(launcher.native_peer_args) == 14
-    assert launcher.native_expected_peer_args == tuple(
-        pointer
-        for pair in zip(
-            launcher.peer_scratch_ptrs,
-            launcher.peer_signal_ptrs,
-            strict=True,
-        )
-        for pointer in pair
-    )
-    assert [call[:2] for call in workspace.scratch_handle.calls] == [
-        ("signal", 7),
-        ("remote", 0),
-        ("signal", 0),
-        ("remote", 1),
-        ("signal", 1),
-        ("remote", 2),
-        ("signal", 2),
-        ("remote", 3),
-        ("signal", 3),
-        ("remote", 4),
-        ("signal", 4),
-        ("remote", 5),
-        ("signal", 5),
-        ("remote", 6),
-        ("signal", 6),
-    ]
-
-    output = _FakePreparedTensor(
-        7001,
-        (launcher.world_size * launcher.rows, launcher.output_n),
-        torch.bfloat16,
-        launcher.device,
-    )
-    allocations = []
-    monkeypatch.setattr(
-        backend.torch,
-        "empty",
-        lambda *args, **kwargs: (allocations.append((args, kwargs)), output)[1],
-    )
-    submissions = []
-    module.run_prepared_packed_qkv = lambda *args: submissions.append(args)
-
-    assert launcher(inp) is output
-    assert allocations == [((8 * 128, 1280), {"dtype": torch.bfloat16, "device": 7})]
-    assert len(submissions) == 1
-    submission = submissions[0]
-    assert submission[7:21] == launcher.native_peer_args
-    assert submission[21:31] == (8, 7, 128, 0, 1, 0, 23, 29, 3001, 4007)
-    assert submission[31:] == launcher.native_expected_peer_args
-    assert state.next_phase == 1
-    assert state.ready_epoch == 1
-
-    assert launcher(inp) is output
-    assert allocations == [
-        ((8 * 128, 1280), {"dtype": torch.bfloat16, "device": 7}),
-        ((8 * 128, 1280), {"dtype": torch.bfloat16, "device": 7}),
-    ]
-    assert len(submissions) == 2
-    second_submission = submissions[1]
-    assert second_submission[7:21] == launcher.native_peer_args
-    assert second_submission[21:31] == (
-        8,
-        7,
-        128,
-        1,
-        2,
-        0,
-        23,
-        29,
-        3001,
-        4007,
-    )
-    assert second_submission[31:] == launcher.native_expected_peer_args
-    assert state.next_phase == 0
-    assert state.ready_epoch == 2
-
-
-def test_prepared_packed_qkv_hot_path_uses_one_native_submission(monkeypatch):
-    backend = _backend()
-    launcher, inp, weight, _, state, workspace, module, _ = _fake_prepared_packed_qkv(
-        monkeypatch, backend
-    )
-    output = _FakePreparedTensor(
-        7001,
-        (launcher.world_size * launcher.rows, launcher.output_n),
-        torch.bfloat16,
-        launcher.device,
-    )
-    monkeypatch.setattr(backend.torch, "empty", lambda *args, **kwargs: output)
-    submissions = []
-    module.run_prepared_packed_qkv = lambda *args: submissions.append(args)
-
-    class TailEvent:
-        def __init__(self, **kwargs):
-            self.recorded_streams = []
-
-        def record(self, stream):
-            self.recorded_streams.append(stream)
-
-    monkeypatch.setattr(backend.torch.cuda, "Event", TailEvent)
-
-    result = launcher(inp)
-
-    assert result is output
-    assert len(submissions) == 1
-    submission = submissions[0]
-    assert submission[0] is inp
-    assert submission[1] is workspace.scratch
-    assert submission[2] is weight
-    assert submission[3] is output
-    descriptor = submission[4]
-    assert descriptor.data_ptr() == 6001
-    assert submission[5] is launcher.signal_pad
-    assert submission[6] is state.flag_peers
-    assert submission[7:21] == launcher.native_peer_args
-    assert submission[21:] == (
-        4,
-        2,
-        128,
-        0,
-        1,
-        0,
-        23,
-        29,
-        3001,
-        4002,
-        *launcher.native_expected_peer_args,
-    )
-    assert state.next_phase == 1
-    assert state.ready_epoch == 1
-    assert state.tail_stream == 0
-    assert state.tail_event.recorded_streams
-    main_stream = descriptor.recorded_streams[0]
-    assert inp.recorded_streams == [main_stream, workspace.comm_stream]
-    assert weight.recorded_streams == [main_stream]
-    assert descriptor.recorded_streams == [main_stream]
-
-
-def test_prepared_packed_qkv_first_other_stream_waits_for_initialization_and_descriptor(
+def test_prepare_session_rendezvous_plan_covers_flags_and_scratch_in_one_round(
     monkeypatch,
 ):
-    backend = _backend()
-    launcher, inp, _, _, state, _, module, calls = _fake_prepared_packed_qkv(
-        monkeypatch, backend
-    )
-    output = _FakePreparedTensor(
-        7001,
-        (launcher.world_size * launcher.rows, launcher.output_n),
-        torch.bfloat16,
-        launcher.device,
-    )
-    monkeypatch.setattr(backend.torch, "empty", lambda *args, **kwargs: output)
-    module.run_prepared_packed_qkv = lambda *args: None
+    call, group, stream = _prepare_fixture(monkeypatch, "one_round")
+    plans = []
 
-    class FirstCallStream:
-        cuda_stream = 19
+    def rendezvous(call, group, plan, *, clear):
+        plans.append([what for what, _ in plan])
+        flags = torch.full((4,), 7, dtype=torch.uint32)
+        clear(0, flags, None)
+        assert not flags.any()  # the barrier-flag pad is cleared before the vote
+        raise backend.StaleSymmetricHandleError("stop here")
 
-        def __init__(self):
-            self.waited_events = []
-
-        def wait_event(self, event):
-            self.waited_events.append(event)
-
-    class TailEvent:
-        def __init__(self, **kwargs):
-            pass
-
-        def record(self, stream):
-            pass
-
-    first_call_stream = FirstCallStream()
-    monkeypatch.setattr(
-        backend.torch.cuda, "current_stream", lambda device_index: first_call_stream
-    )
-    monkeypatch.setattr(backend.torch.cuda, "Event", TailEvent)
-
-    launcher(inp)
-
-    assert first_call_stream.waited_events == [
-        state.initialization_event,
-        calls.descriptor_entry.ready_event,
-    ]
-    assert state.tail_stream == 19
+    monkeypatch.setattr(backend, "_rendezvous", rendezvous)
+    with pytest.raises(backend.StaleSymmetricHandleError):
+        backend._prepare_session(call, group, torch.bfloat16, capacity_rows=512)
+    # First prepare of a group: barrier flags and the scratch growth share one rendezvous round.
+    assert plans == [["barrier flag", "scratch"]]
 
 
-def test_prepared_packed_qkv_first_call_waits_for_descriptor_and_tail(monkeypatch):
-    backend = _backend()
-    launcher, inp, _, _, state, _, module, calls = _fake_prepared_packed_qkv(
-        monkeypatch, backend
-    )
-    output = _FakePreparedTensor(
-        7001,
-        (launcher.world_size * launcher.rows, launcher.output_n),
-        torch.bfloat16,
-        launcher.device,
-    )
-    monkeypatch.setattr(backend.torch, "empty", lambda *args, **kwargs: output)
-    module.run_prepared_packed_qkv = lambda *args: None
-
-    class FirstCallStream:
-        cuda_stream = 19
-
-        def __init__(self):
-            self.waited_events = []
-
-        def wait_event(self, event):
-            self.waited_events.append(event)
-
-    class PriorTail:
-        def record(self, stream):
-            pass
-
-    first_call_stream = FirstCallStream()
-    prior_tail = PriorTail()
-    state.tail_event = prior_tail
-    state.tail_stream = 23
-    monkeypatch.setattr(
-        backend.torch.cuda, "current_stream", lambda device_index: first_call_stream
-    )
-
-    launcher(inp)
-
-    assert first_call_stream.waited_events == [
-        state.initialization_event,
-        calls.descriptor_entry.ready_event,
-        prior_tail,
-    ]
-    assert state.tail_stream == 19
-
-
-@pytest.mark.parametrize(
-    ("mutation", "message"),
-    [
-        (
-            lambda inp: setattr(inp, "device", torch.device("cuda:2")),
-            "inp device changed",
-        ),
-        (
-            lambda inp: setattr(inp, "dtype", torch.float16),
-            "inp dtype changed",
-        ),
-        (
-            lambda inp: setattr(inp, "shape", (256, 8192)),
-            "inp must have shape",
-        ),
-        (
-            lambda inp: setattr(inp, "contiguous", False),
-            "inp must be contiguous",
-        ),
-    ],
-)
-def test_prepared_packed_qkv_hot_input_misuse_fails_closed(
-    monkeypatch, mutation, message
+def test_prepare_session_keeps_the_state_usable_after_a_rank_uniform_stale_exhaustion(
+    monkeypatch,
 ):
-    backend = _backend()
-    launcher, inp, *_ = _fake_prepared_packed_qkv(monkeypatch, backend)
-    mutation(inp)
+    call, group, stream = _prepare_fixture(monkeypatch, "stale_exhaustion")
 
-    with pytest.raises(ValueError, match=message):
-        launcher._validate_hot_input(inp)
+    def exhausted(call, group, plan, *, clear):
+        raise backend.StaleSymmetricHandleError("stale")
 
-
-def test_prepared_packed_qkv_bound_weight_drift_fails_closed(monkeypatch):
-    backend = _backend()
-    launcher, inp, weight, *_ = _fake_prepared_packed_qkv(monkeypatch, backend)
-    weight.pointer += 1
-
-    with pytest.raises(RuntimeError, match="bound weight contract changed"):
-        launcher._validate_hot_input(inp)
+    monkeypatch.setattr(backend, "_rendezvous", exhausted)
+    with pytest.raises(backend.StaleSymmetricHandleError):
+        backend._prepare_session(call, group, torch.bfloat16, capacity_rows=512)
+    state = backend._launch_state(call, group)
+    assert state.poisoned is False and stream.synchronized == 1
 
 
-def test_prepared_packed_qkv_bound_group_drift_fails_closed(monkeypatch):
-    backend = _backend()
-    launcher, inp, *_ = _fake_prepared_packed_qkv(monkeypatch, backend)
-    object.__setattr__(launcher, "group", object())
+def test_prepare_session_poisons_the_state_when_a_growth_collective_fails(monkeypatch):
+    call, group, stream = _prepare_fixture(monkeypatch, "growth_failure")
 
-    with pytest.raises(RuntimeError, match="group identity changed"):
-        launcher._validate_hot_input(inp)
+    def failing(call, group, plan, *, clear):
+        raise RuntimeError("nvshmem_malloc failed")
 
-
-def test_prepared_packed_qkv_poisoned_state_fails_before_hot_submission(monkeypatch):
-    backend = _backend()
-    launcher, inp, _, _, state, *_ = _fake_prepared_packed_qkv(monkeypatch, backend)
-    state.poisoned = True
-
-    with pytest.raises(RuntimeError, match="state is poisoned"):
-        launcher(inp)
-
-
-@pytest.mark.parametrize(
-    ("kwargs", "message"),
-    [
-        ({"handle_world_size": 3}, "workspace topology does not match group"),
-        ({"bad_peer_scratch": True}, "peer 3 scratch rank slice shape"),
-    ],
-)
-def test_prepare_packed_qkv_prebound_views_and_topology_fail_closed(
-    monkeypatch, kwargs, message
-):
-    backend = _backend()
-
-    with pytest.raises(RuntimeError, match=message):
-        _fake_prepared_packed_qkv(monkeypatch, backend, **kwargs)
-
-    assert len(backend._LAUNCH_STATES) == 1
-    assert next(iter(backend._LAUNCH_STATES.values())).poisoned
-
-
-def test_validate_inputs_rejects_unsupported_subgroup_size(monkeypatch):
-    backend = _backend()
-    subgroup = SimpleNamespace(group_name="tp-group")
-    device = torch.device("cuda:0")
-    inp = SimpleNamespace(
-        device=device,
-        dtype=torch.float16,
-        ndim=2,
-        shape=(128, 8192),
-        is_contiguous=lambda: True,
-    )
-    weight = SimpleNamespace(
-        device=device,
-        dtype=torch.float16,
-        ndim=2,
-        shape=(8192, 2048),
-        is_contiguous=lambda: True,
-    )
-    monkeypatch.setattr(backend.dist, "is_available", lambda: True)
-    monkeypatch.setattr(backend.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(backend.dist, "get_backend", lambda group: "nccl")
-    monkeypatch.setattr(backend.dist, "get_world_size", lambda group: 3)
-    monkeypatch.setattr(backend.dist, "get_rank", lambda group: 0)
-
-    with pytest.raises(ValueError, match="world size 2, 4, or 8"):
-        backend._validate_inputs(inp, weight, subgroup)
+    monkeypatch.setattr(backend, "_rendezvous", failing)
+    with pytest.raises(RuntimeError, match="nvshmem_malloc"):
+        backend._prepare_session(call, group, torch.bfloat16, capacity_rows=512)
+    state = backend._launch_state(call, group)
+    assert state.poisoned is True
+    with pytest.raises(RuntimeError, match="poisoned"):
+        backend._prepare_session(call, group, torch.bfloat16, capacity_rows=512)

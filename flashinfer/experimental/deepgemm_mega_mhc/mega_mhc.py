@@ -1,91 +1,488 @@
-"""Prepared fused projection, Sinkhorn, residual mixing and RMSNorm on SM100a/SM103a."""
+"""Prepared fused projection, Sinkhorn, residual mixing and RMSNorm on SM100a/SM103a.
+
+One generated source per schedule class (shifted x shared scale layout x the
+unroll and partition choices of a split-count class) serves every supported
+architecture; the loader compiles it with the exact flag set of the device it
+runs on and passes the split count, its FP8 norm partition count and the device
+SM count on the compile line. The token count is a run-time argument: the split
+count and the launch grid are chosen here from the same rules the producer uses.
+"""
 
 from __future__ import annotations
 
 import functools
-import json
-from pathlib import Path
+from typing import Any
+
+GENERATED_ROOT = "csrc/experimental/deepgemm_mega_mhc/generated"
+CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+MAX_TOKENS = 1 << 20
+SPLIT_BARRIER_WORDS = 2 * (MAX_TOKENS // 64) * 16
+
+# Registry written by the exporter: one record per delivered source, and the
+# schedule keys (hidden, split count, shifted, shared scale layout) each source
+# serves with its compile-line defines.
+PROGRAMS: dict[str, dict[str, Any]] = {
+    "cake_mega_mhc_134570ae7cc112e9d84e": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_134570ae7cc112e9d84e",
+        "hidden": 5120,
+        "shifted": True,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": [16],
+    },
+    "cake_mega_mhc_1576b7789968f04c8419": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_1576b7789968f04c8419_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_1576b7789968f04c8419_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_1576b7789968f04c8419",
+        "hidden": 5120,
+        "shifted": False,
+        "shared_sf": True,
+        "shared_sf_block_m": 224,
+        "num_splits": [16, 20],
+    },
+    "cake_mega_mhc_2b99261aab173a941cb4": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_2b99261aab173a941cb4_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_2b99261aab173a941cb4_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_2b99261aab173a941cb4",
+        "hidden": 5120,
+        "shifted": False,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": [16, 20],
+    },
+    "cake_mega_mhc_407321791585dc9fc44b": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_407321791585dc9fc44b_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_407321791585dc9fc44b_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_407321791585dc9fc44b",
+        "hidden": 5120,
+        "shifted": False,
+        "shared_sf": True,
+        "shared_sf_block_m": 224,
+        "num_splits": [27],
+    },
+    "cake_mega_mhc_41df2a8c4d3c4849adbf": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_41df2a8c4d3c4849adbf_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_41df2a8c4d3c4849adbf_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_41df2a8c4d3c4849adbf",
+        "hidden": 5120,
+        "shifted": True,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": [40],
+    },
+    "cake_mega_mhc_43b829c4b071416a4595": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_43b829c4b071416a4595_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_43b829c4b071416a4595_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_43b829c4b071416a4595",
+        "hidden": 5120,
+        "shifted": True,
+        "shared_sf": True,
+        "shared_sf_block_m": 224,
+        "num_splits": [27],
+    },
+    "cake_mega_mhc_8fd99969edc5072d3477": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_8fd99969edc5072d3477_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_8fd99969edc5072d3477_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_8fd99969edc5072d3477",
+        "hidden": 5120,
+        "shifted": True,
+        "shared_sf": True,
+        "shared_sf_block_m": 224,
+        "num_splits": [16],
+    },
+    "cake_mega_mhc_a5521c9dfaf81d2c0f1f": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_a5521c9dfaf81d2c0f1f_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_a5521c9dfaf81d2c0f1f_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_a5521c9dfaf81d2c0f1f",
+        "hidden": 5120,
+        "shifted": True,
+        "shared_sf": True,
+        "shared_sf_block_m": 224,
+        "num_splits": [40],
+    },
+    "cake_mega_mhc_b52ed5c3afc2fcbd2d0f": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b52ed5c3afc2fcbd2d0f_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b52ed5c3afc2fcbd2d0f_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_b52ed5c3afc2fcbd2d0f",
+        "hidden": 5120,
+        "shifted": True,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": [20],
+    },
+    "cake_mega_mhc_b73ed09be74eaa063166": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b73ed09be74eaa063166_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b73ed09be74eaa063166_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_b73ed09be74eaa063166",
+        "hidden": 5120,
+        "shifted": True,
+        "shared_sf": True,
+        "shared_sf_block_m": 224,
+        "num_splits": [20],
+    },
+    "cake_mega_mhc_b8c6c9ebebc80eb063b8": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b8c6c9ebebc80eb063b8_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b8c6c9ebebc80eb063b8_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_b8c6c9ebebc80eb063b8",
+        "hidden": 5120,
+        "shifted": True,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": [27],
+    },
+    "cake_mega_mhc_c7892aa3a7b985dcac4a": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_c7892aa3a7b985dcac4a_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_c7892aa3a7b985dcac4a_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_c7892aa3a7b985dcac4a",
+        "hidden": 5120,
+        "shifted": False,
+        "shared_sf": True,
+        "shared_sf_block_m": 224,
+        "num_splits": [40],
+    },
+    "cake_mega_mhc_dc85bbfab3b20cf209fc": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_dc85bbfab3b20cf209fc_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_dc85bbfab3b20cf209fc_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_dc85bbfab3b20cf209fc",
+        "hidden": 5120,
+        "shifted": False,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": [27],
+    },
+    "cake_mega_mhc_f7107723c112a3b117a9": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_f7107723c112a3b117a9_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_f7107723c112a3b117a9_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_f7107723c112a3b117a9",
+        "hidden": 5120,
+        "shifted": False,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": [40],
+    },
+}
+ROUTES: list[dict[str, Any]] = [
+    {
+        "hidden": 5120,
+        "num_splits": 16,
+        "shifted": False,
+        "shared_sf": False,
+        "program": "cake_mega_mhc_2b99261aab173a941cb4",
+        "defines": {"NUM_SPLITS": 16, "FP8_NORM_PARTITIONS": 2},
+    },
+    {
+        "hidden": 5120,
+        "num_splits": 16,
+        "shifted": False,
+        "shared_sf": True,
+        "program": "cake_mega_mhc_1576b7789968f04c8419",
+        "defines": {"NUM_SPLITS": 16, "FP8_NORM_PARTITIONS": 2},
+    },
+    {
+        "hidden": 5120,
+        "num_splits": 16,
+        "shifted": True,
+        "shared_sf": False,
+        "program": "cake_mega_mhc_134570ae7cc112e9d84e",
+        "defines": {"NUM_SPLITS": 16, "FP8_NORM_PARTITIONS": 2},
+    },
+    {
+        "hidden": 5120,
+        "num_splits": 16,
+        "shifted": True,
+        "shared_sf": True,
+        "program": "cake_mega_mhc_8fd99969edc5072d3477",
+        "defines": {"NUM_SPLITS": 16, "FP8_NORM_PARTITIONS": 2},
+    },
+    {
+        "hidden": 5120,
+        "num_splits": 20,
+        "shifted": False,
+        "shared_sf": False,
+        "program": "cake_mega_mhc_2b99261aab173a941cb4",
+        "defines": {"NUM_SPLITS": 20, "FP8_NORM_PARTITIONS": 10},
+    },
+    {
+        "hidden": 5120,
+        "num_splits": 20,
+        "shifted": False,
+        "shared_sf": True,
+        "program": "cake_mega_mhc_1576b7789968f04c8419",
+        "defines": {"NUM_SPLITS": 20, "FP8_NORM_PARTITIONS": 10},
+    },
+    {
+        "hidden": 5120,
+        "num_splits": 20,
+        "shifted": True,
+        "shared_sf": False,
+        "program": "cake_mega_mhc_b52ed5c3afc2fcbd2d0f",
+        "defines": {"NUM_SPLITS": 20, "FP8_NORM_PARTITIONS": 10},
+    },
+    {
+        "hidden": 5120,
+        "num_splits": 20,
+        "shifted": True,
+        "shared_sf": True,
+        "program": "cake_mega_mhc_b73ed09be74eaa063166",
+        "defines": {"NUM_SPLITS": 20, "FP8_NORM_PARTITIONS": 10},
+    },
+    {
+        "hidden": 5120,
+        "num_splits": 27,
+        "shifted": False,
+        "shared_sf": False,
+        "program": "cake_mega_mhc_dc85bbfab3b20cf209fc",
+        "defines": {"NUM_SPLITS": 27, "FP8_NORM_PARTITIONS": 10},
+    },
+    {
+        "hidden": 5120,
+        "num_splits": 27,
+        "shifted": False,
+        "shared_sf": True,
+        "program": "cake_mega_mhc_407321791585dc9fc44b",
+        "defines": {"NUM_SPLITS": 27, "FP8_NORM_PARTITIONS": 10},
+    },
+    {
+        "hidden": 5120,
+        "num_splits": 27,
+        "shifted": True,
+        "shared_sf": False,
+        "program": "cake_mega_mhc_b8c6c9ebebc80eb063b8",
+        "defines": {"NUM_SPLITS": 27, "FP8_NORM_PARTITIONS": 10},
+    },
+    {
+        "hidden": 5120,
+        "num_splits": 27,
+        "shifted": True,
+        "shared_sf": True,
+        "program": "cake_mega_mhc_43b829c4b071416a4595",
+        "defines": {"NUM_SPLITS": 27, "FP8_NORM_PARTITIONS": 10},
+    },
+    {
+        "hidden": 5120,
+        "num_splits": 40,
+        "shifted": False,
+        "shared_sf": False,
+        "program": "cake_mega_mhc_f7107723c112a3b117a9",
+        "defines": {"NUM_SPLITS": 40, "FP8_NORM_PARTITIONS": 10},
+    },
+    {
+        "hidden": 5120,
+        "num_splits": 40,
+        "shifted": False,
+        "shared_sf": True,
+        "program": "cake_mega_mhc_c7892aa3a7b985dcac4a",
+        "defines": {"NUM_SPLITS": 40, "FP8_NORM_PARTITIONS": 10},
+    },
+    {
+        "hidden": 5120,
+        "num_splits": 40,
+        "shifted": True,
+        "shared_sf": False,
+        "program": "cake_mega_mhc_41df2a8c4d3c4849adbf",
+        "defines": {"NUM_SPLITS": 40, "FP8_NORM_PARTITIONS": 10},
+    },
+    {
+        "hidden": 5120,
+        "num_splits": 40,
+        "shifted": True,
+        "shared_sf": True,
+        "program": "cake_mega_mhc_a5521c9dfaf81d2c0f1f",
+        "defines": {"NUM_SPLITS": 40, "FP8_NORM_PARTITIONS": 10},
+    },
+]
+ARG_PLAN: list[list[str]] = [
+    ["tma_buffer", "residual_map"],
+    ["tma_buffer", "x_map"],
+    ["tma_buffer", "fn_map"],
+    ["tma_buffer", "post_map"],
+    ["tma_buffer", "comb_map"],
+    ["tma_buffer", "prev_map"],
+    ["tma_buffer", "new_residual_map"],
+    ["tma_buffer", "y_map"],
+    ["buffer", "mix_scales"],
+    ["buffer", "mix_bases"],
+    ["buffer", "new_prev_mix"],
+    ["buffer", "new_post_mix"],
+    ["buffer", "new_comb_res_mix"],
+    ["buffer", "rmsnorm_weight"],
+    ["buffer", "new_residual"],
+    ["buffer", "y_bf16"],
+    ["buffer", "y_fp8"],
+    ["buffer", "y_primary_sf"],
+    ["buffer", "y_shared_sf"],
+    ["buffer", "scratch"],
+    ["buffer", "split_barriers"],
+    ["buffer", "launch_epochs"],
+    ["parameter", "num_tokens"],
+    ["parameter", "hc_norm_eps"],
+    ["parameter", "hc_pre_eps"],
+    ["parameter", "hc_post_scale"],
+    ["parameter", "sinkhorn_eps"],
+    ["parameter", "num_sinkhorn_iters"],
+    ["parameter", "rmsnorm_eps"],
+    ["parameter", "rmsnorm_scale"],
+    ["parameter", "primary_sf_stride_token"],
+    ["parameter", "primary_sf_stride_word"],
+    ["parameter", "shared_sf_stride_word"],
+    ["grid", "grid_x"],
+    ["grid", "grid_y"],
+    ["grid", "grid_z"],
+]
+COMPILE_FLAGS: list[str] = ["--use_fast_math"]
+ARCHES: list[str] = ["sm_100a", "sm_103a"]
 
 
-_ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+def num_splits(num_tokens, hidden, num_sms, deterministic=False):
+    """Fewest splits reaching the shortest longest task (deterministic mode fixes 16)."""
+    if deterministic:
+        return 16
+    num_m_blocks = (num_tokens + 63) // 64
+    blocks = hidden // 64
+    max_splits = min(64, max(16, num_sms // num_m_blocks))
+    longest = (blocks + max_splits - 1) // max_splits
+    return (blocks + longest - 1) // longest
+
+
+def num_launch_sms(
+    num_tokens, hidden, num_sms, splits, shifted, store_fp8, has_gemm_sf, deterministic
+):
+    """Active CTAs of the launch; the kernel keeps its NUM_SMS scheduler stride."""
+    if (
+        num_sms in (148, 152)
+        and hidden == 5120
+        and not deterministic
+        and shifted
+        and store_fp8
+        and num_tokens in (1, 64, 65)
+    ):
+        # Shifted FP8 T1/T64/T65 launch only the CTAs some role can reach.
+        projection_ctas = ((num_tokens + 63) // 64) * splits
+        mix_ctas = (num_tokens + 3) // 4
+        norm_partitions = hidden // 512 if splits > 16 and hidden // 256 > 8 else 2
+        if norm_partitions > 2:
+            norm_partitions = min(
+                norm_partitions, max(2, num_sms * 4 // ((num_tokens + 1) // 2))
+            )
+        norm_ctas = (((num_tokens + 1) // 2) * norm_partitions + 3) // 4
+        return min(num_sms, max(projection_ctas, mix_ctas, norm_ctas))
+    if (
+        num_sms in (148, 152)
+        and hidden == 5120
+        and not deterministic
+        and not shifted
+        and num_tokens == 65
+        and store_fp8
+        and has_gemm_sf
+    ):
+        return 80
+    return num_sms
+
+
+def fp8_norm_partitions(hidden, splits):
+    """Hidden partitions the FP8 Norm workers split a token pair into."""
+    return hidden // 512 if splits > 16 and hidden // 256 > 8 else 2
 
 
 @functools.cache
-def _catalog():
-    return json.loads(Path(__file__).with_name("mega_mhc_catalog.json").read_text())
-
-
-def device_arch(device):
-    """Exact generated-program architecture for ``device`` (raises when none is catalogued)."""
+def device_facts(device_index):
+    """(architecture, SM count) of ``cuda:<device_index>``, queried once per process."""
     import torch
 
-    device = torch.device(device)
-    catalogued = sorted(_catalog()["arches"])
-    if device.type != "cuda":
-        raise RuntimeError("Mega mHC requires a CUDA device")
-    capability = tuple(torch.cuda.get_device_capability(device))
-    arch = _ARCHES.get(capability)
-    if arch is None or arch not in catalogued:
+    from ...utils import get_compute_capability, get_device_sm_count
+
+    device = torch.device("cuda", device_index)
+    capability = get_compute_capability(device)
+    arch = CAPABILITIES.get(capability)
+    if arch is None or arch not in ARCHES:
         raise RuntimeError(
-            f"Mega mHC has no exported programs for compute capability "
-            f"{capability}; catalogued architectures: {catalogued}"
+            f"Mega mHC has no exported programs for compute capability {capability}; "
+            f"supported: {ARCHES}"
         )
-    return arch
+    return arch, get_device_sm_count(device)
 
 
-def supported_num_sms(arch):
-    """SM counts with catalogued routes for ``arch``."""
-    routes = _catalog()["arches"][arch]["routes"].values()
-    return sorted({route["config"]["num_sms"] for route in routes})
-
-
-def _nvcc_flags(arch):
-    from flashinfer.jit.core import sm100a_nvcc_flags, sm103a_nvcc_flags
-
-    return {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}[arch]
+def select_program(hidden, splits, shifted, shared_sf):
+    """(source name, compile-line defines) serving the schedule key, or raise."""
+    for route in ROUTES:
+        if (
+            route["hidden"] == hidden
+            and route["num_splits"] == splits
+            and route["shifted"] == shifted
+            and route["shared_sf"] == shared_sf
+        ):
+            return route["program"], dict(route["defines"])
+    raise NotImplementedError(
+        f"No exported mHC program for hidden={hidden}, num_splits={splits}, "
+        f"shifted={shifted}, shared_sf={shared_sf}"
+    )
 
 
 @functools.cache
-def load_program(arch, name):
+def load_program(name, arch, num_sms, defines):
+    """Build ``name`` for ``arch`` with the route's defines and ``NUM_SMS`` on the compile line."""
     from flashinfer.jit import env
-    from flashinfer.jit.core import gen_jit_spec
+    from flashinfer.jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
-    record = _catalog()["arches"][arch]["programs"][name]
+    arch_flags = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}[arch]
+    values = (*defines, ("NUM_SMS", num_sms))
     spec = gen_jit_spec(
-        name=name,
+        name="_".join(
+            [name, arch, *(f"{key.lower()}{value}" for key, value in values)]
+        ),
         sources=[
-            env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/") for p in record["sources"]
+            env.FLASHINFER_CSRC_DIR / path.removeprefix("csrc/")
+            for path in PROGRAMS[name]["sources"]
         ],
         extra_cuda_cflags=[
-            *_nvcc_flags(arch),
-            *record["compile_flags"],
+            *arch_flags,
+            *COMPILE_FLAGS,
+            *(f"-D{key}={value}" for key, value in values),
             "--device-entity-has-hidden-visibility=false",
         ],
         extra_ldflags=["-lcuda"],
-        extra_include_paths=[env.FLASHINFER_CSRC_DIR, env.FLASHINFER_INCLUDE_DIR],
+        extra_include_paths=[
+            env.FLASHINFER_CSRC_DIR / GENERATED_ROOT.removeprefix("csrc/"),
+            env.FLASHINFER_CSRC_DIR,
+            env.FLASHINFER_INCLUDE_DIR,
+        ],
         use_fast_math=False,
     )
-    module = spec.build_and_load()
-    return module, {**record, "library_path": str(spec.get_library_path())}
-
-
-def route_key(config):
-    return ":".join(
-        str(config[key])
-        for key in (
-            "num_tokens",
-            "hidden",
-            "num_sms",
-            "shifted",
-            "store_fp8",
-            "shared_sf_block_m",
-            "deterministic",
-        )
-    )
+    return spec.build_and_load(), str(spec.get_library_path())
 
 
 def _new_outputs(
-    x, residual, post_mix, comb_res_mix, shifted_prev_mix, sf_layout, shared_sf_block_m
+    x, residual, post_mix, comb_res_mix, shifted_prev_mix, sf_layout, block_m
 ):
     import torch
 
@@ -113,20 +510,26 @@ def _new_outputs(
             outputs["y_routed_sf"] = torch.empty(
                 (tokens, hidden // 128), dtype=torch.int32, device=x.device
             )
-            rows = (
-                (tokens + shared_sf_block_m - 1)
-                // shared_sf_block_m
-                * ((shared_sf_block_m + 127) // 128 * 128)
-            )
+            rows = (tokens + block_m - 1) // block_m * ((block_m + 127) // 128 * 128)
             storage = torch.empty_strided(
                 (rows, hidden // 128), (1, rows), dtype=torch.int32, device=x.device
             )
             outputs.update(
                 y_shared_sf_storage=storage,
                 y_shared_sf=storage[:tokens],
-                shared_sf_block_m=shared_sf_block_m,
+                shared_sf_block_m=block_m,
             )
     return outputs
+
+
+def _raw_storage(tensor):
+    import torch
+
+    words = (
+        tensor.untyped_storage().nbytes() // tensor.element_size()
+        - tensor.storage_offset()
+    )
+    return tensor.as_strided((words,), (1,)).view(torch.uint32)
 
 
 class MegaMHCPlan:
@@ -136,7 +539,9 @@ class MegaMHCPlan:
     FP32. The four residual routes produce BF16 normalized output plus FP8
     E4M3 output and packed per-32 UE8M0 scales. ``sf_layout='col'`` stores
     column-major scale words; ``'extra'`` also stores the shared-expert padded
-    row permutation. Only shapes present in the exported catalog are accepted.
+    row permutation. Any token count in [1, 2**20] is accepted; the split
+    count follows the token count (or ``deterministic``), and the program for
+    that split count must be exported for ``hidden``.
 
     Scratch, split_barriers and launch_epochs may be caller-owned. Fresh
     barriers/epochs must be zeroed once before first use and retained across
@@ -173,40 +578,49 @@ class MegaMHCPlan:
         scratch=None,
         split_barriers=None,
         launch_epochs=None,
-        descriptor_workspace=None,
     ):
         import torch
 
-        arch = device_arch(x.device)
+        if x.device.type != "cuda":
+            raise RuntimeError("Mega mHC requires a CUDA device")
         if x.ndim != 2 or hc_mult != 4 or sf_layout not in ("bf16", "col", "extra"):
             raise ValueError(
                 "Expected x[T,H], four residual routes and col/extra/bf16 scale layout"
             )
         tokens, hidden = x.shape
-        if hidden % 1024 or not 1 <= tokens <= 1 << 20 or num_sinkhorn_iters < 1:
+        if hidden % 1024 or not 1 <= tokens <= MAX_TOKENS or num_sinkhorn_iters < 1:
             raise ValueError(
                 "Expected H divisible by 1024, 1 <= T <= 2**20 and positive Sinkhorn iterations"
             )
         if sf_layout == "extra" and shared_sf_block_m <= 0:
             raise ValueError("shared_sf_block_m must be positive")
-        shifted = shifted_prev_mix is not None
-        sms = torch.cuda.get_device_properties(x.device).multi_processor_count
-        self.options = dict(
-            num_tokens=tokens,
-            hidden=hidden,
-            num_sms=sms,
-            shifted=shifted,
-            store_fp8=sf_layout != "bf16",
-            shared_sf_block_m=shared_sf_block_m if sf_layout == "extra" else 0,
-            deterministic=bool(deterministic),
-        )
-        try:
-            route = _catalog()["arches"][arch]["routes"][route_key(self.options)]
-        except KeyError as error:
+        if sf_layout == "bf16":
             raise NotImplementedError(
-                f"No exported mHC schedule for {self.options}"
-            ) from error
-        cfg = self.config = route["config"]
+                "Exported mHC programs store the FP8 output; use sf_layout 'col' or 'extra'"
+            )
+        arch, sms = device_facts(x.device.index)
+        shifted = shifted_prev_mix is not None
+        splits = num_splits(tokens, hidden, sms, deterministic)
+        shared_sf = sf_layout == "extra"
+        program, defines = select_program(hidden, splits, shifted, shared_sf)
+        block_m = shared_sf_block_m if shared_sf else 0
+        if shared_sf and block_m != PROGRAMS[program]["shared_sf_block_m"]:
+            raise NotImplementedError(
+                f"Exported mHC programs use shared_sf_block_m={PROGRAMS[program]['shared_sf_block_m']}"
+            )
+        launch_sms = num_launch_sms(
+            tokens,
+            hidden,
+            sms,
+            splits,
+            shifted,
+            True,
+            sf_layout == "col",
+            deterministic,
+        )
+        self.config = dict(num_splits=splits, num_sms=sms, num_launch_sms=launch_sms)
+        self.program = program
+        self.defines = defines
 
         def require(name, tensor, dtype, shape, *, contiguous=True):
             if (
@@ -241,88 +655,72 @@ class MegaMHCPlan:
                 comb_res_mix,
                 shifted_prev_mix,
                 sf_layout,
-                shared_sf_block_m,
+                block_m,
             )
         for name, dtype, shape in (
             ("new_residual", torch.bfloat16, (tokens, 4, hidden)),
             ("new_post_mix", torch.float32, (tokens, 4, 1)),
             ("new_comb_res_mix", torch.float32, (tokens, 4, 4)),
             ("y_bf16", torch.bfloat16, (tokens, hidden)),
+            ("y_fp8", torch.float8_e4m3fn, (tokens, hidden)),
         ):
             require(name, out[name], dtype, shape)
         if shifted:
             require("new_prev_mix", out["new_prev_mix"], torch.float32, (tokens, 4, 1))
-        if sf_layout != "bf16":
-            require("y_fp8", out["y_fp8"], torch.float8_e4m3fn, (tokens, hidden))
-            primary = out["y_gemm_sf" if sf_layout == "col" else "y_routed_sf"]
+        primary = out["y_gemm_sf" if sf_layout == "col" else "y_routed_sf"]
+        require(
+            "primary scale words",
+            primary,
+            torch.int32,
+            (tokens, hidden // 128),
+            contiguous=False,
+        )
+        expected_stride = (
+            (1, (tokens + 3) // 4 * 4) if sf_layout == "col" else (hidden // 128, 1)
+        )
+        if primary.stride() != expected_stride:
+            raise ValueError(f"Primary scale strides must be {expected_stride}")
+        if shared_sf:
+            rows = (tokens + block_m - 1) // block_m * ((block_m + 127) // 128 * 128)
+            storage, shared = out["y_shared_sf_storage"], out["y_shared_sf"]
             require(
-                "primary scale words",
-                primary,
+                "shared scale storage",
+                storage,
+                torch.int32,
+                (rows, hidden // 128),
+                contiguous=False,
+            )
+            require(
+                "shared scale view",
+                shared,
                 torch.int32,
                 (tokens, hidden // 128),
                 contiguous=False,
             )
-            expected_stride = (
-                (1, (tokens + 3) // 4 * 4) if sf_layout == "col" else (hidden // 128, 1)
-            )
-            if primary.stride() != expected_stride:
-                raise ValueError(f"Primary scale strides must be {expected_stride}")
-            if sf_layout == "extra":
-                rows = (
-                    (tokens + shared_sf_block_m - 1)
-                    // shared_sf_block_m
-                    * ((shared_sf_block_m + 127) // 128 * 128)
+            if (
+                storage.stride() != (1, rows)
+                or shared.stride() != (1, rows)
+                or storage.data_ptr() != shared.data_ptr()
+                or out["shared_sf_block_m"] != block_m
+            ):
+                raise ValueError(
+                    "Shared scales require the padded column-major storage and its first-T-row view"
                 )
-                storage, shared = out["y_shared_sf_storage"], out["y_shared_sf"]
-                require(
-                    "shared scale storage",
-                    storage,
-                    torch.int32,
-                    (rows, hidden // 128),
-                    contiguous=False,
-                )
-                require(
-                    "shared scale view",
-                    shared,
-                    torch.int32,
-                    (tokens, hidden // 128),
-                    contiguous=False,
-                )
-                if (
-                    storage.stride() != (1, rows)
-                    or shared.stride() != (1, rows)
-                    or storage.data_ptr() != shared.data_ptr()
-                    or out["shared_sf_block_m"] != shared_sf_block_m
-                ):
-                    raise ValueError(
-                        "Shared scales require the padded column-major storage and its first-T-row view"
-                    )
-        scratch_shape = ((tokens + 63) // 64 * cfg["num_splits"] * (1536 + 128),)
-        barriers_shape = (2 * ((1 << 20) // 64) * 16,)
+        scratch_shape = ((tokens + 63) // 64 * splits * (1536 + 128),)
         if scratch is None:
             scratch = torch.empty(scratch_shape, dtype=torch.float32, device=x.device)
         if split_barriers is None:
             split_barriers = torch.zeros(
-                barriers_shape, dtype=torch.uint64, device=x.device
+                (SPLIT_BARRIER_WORDS,), dtype=torch.uint64, device=x.device
             )
         if launch_epochs is None:
             launch_epochs = torch.zeros((sms,), dtype=torch.uint64, device=x.device)
         require("scratch", scratch, torch.float32, scratch_shape)
-        require("split_barriers", split_barriers, torch.uint64, barriers_shape)
+        require("split_barriers", split_barriers, torch.uint64, (SPLIT_BARRIER_WORDS,))
         require("launch_epochs", launch_epochs, torch.uint64, (sms,))
         dummy_u32 = torch.empty(1, dtype=torch.uint32, device=x.device)
-        dummy_u8 = torch.empty(1, dtype=torch.uint8, device=x.device)
         dummy_float = torch.empty(1, dtype=torch.float32, device=x.device)
-        primary = out.get("y_gemm_sf", out.get("y_routed_sf", dummy_u32))
-        shared = out.get("y_shared_sf", dummy_u32)
-
-        def raw_storage(tensor):
-            words = (
-                tensor.untyped_storage().nbytes() // tensor.element_size()
-                - tensor.storage_offset()
-            )
-            return tensor.as_strided((words,), (1,)).view(torch.uint32)
-
+        shared = out["y_shared_sf"] if shared_sf else dummy_u32
         self.bindings = dict(
             residual_map=residual,
             x_map=x,
@@ -334,15 +732,15 @@ class MegaMHCPlan:
             y_map=out["y_bf16"] if shifted else x,
             mix_scales=mix_scales,
             mix_bases=mix_bases,
-            new_prev_mix=out.get("new_prev_mix", dummy_float),
+            new_prev_mix=out["new_prev_mix"] if shifted else dummy_float,
             new_post_mix=out["new_post_mix"],
             new_comb_res_mix=out["new_comb_res_mix"],
             rmsnorm_weight=rmsnorm_weight,
             new_residual=out["new_residual"],
             y_bf16=out["y_bf16"],
-            y_fp8=out["y_fp8"].view(torch.uint8) if "y_fp8" in out else dummy_u8,
-            y_primary_sf=raw_storage(primary),
-            y_shared_sf=raw_storage(shared),
+            y_fp8=out["y_fp8"].view(torch.uint8),
+            y_primary_sf=_raw_storage(primary),
+            y_shared_sf=_raw_storage(shared),
             scratch=scratch,
             split_barriers=split_barriers,
             launch_epochs=launch_epochs,
@@ -355,37 +753,19 @@ class MegaMHCPlan:
             rmsnorm_eps=rmsnorm_eps,
             rmsnorm_scale=rmsnorm_scale,
             primary_sf_stride_token=primary.stride(0),
-            primary_sf_stride_word=primary.stride(1) if primary.ndim == 2 else 0,
-            shared_sf_stride_word=shared.stride(1) if shared.ndim == 2 else 0,
-            grid_x=cfg["num_launch_sms"],
+            primary_sf_stride_word=primary.stride(1),
+            shared_sf_stride_word=shared.stride(1) if shared_sf else 0,
+            grid_x=launch_sms,
             grid_y=1,
             grid_z=1,
         )
-        module, record = load_program(arch, route["program"])
-        workspace_bytes = record["tma_workspace_bytes"]
-        if workspace_bytes:
-            if descriptor_workspace is None:
-                descriptor_workspace = torch.empty(
-                    workspace_bytes, dtype=torch.uint8, device=x.device
-                )
-            if (
-                descriptor_workspace.dtype != torch.uint8
-                or descriptor_workspace.device != x.device
-                or not descriptor_workspace.is_contiguous()
-                or descriptor_workspace.numel() < workspace_bytes
-                or descriptor_workspace.data_ptr() % 128
-            ):
-                raise ValueError(
-                    "Descriptor workspace must be aligned contiguous CUDA uint8 storage"
-                )
-        args = tuple(
-            descriptor_workspace if kind == "workspace" else self.bindings[name]
-            for kind, name in record["arg_plan"]
+        module, self.library_path = load_program(
+            program, arch, sms, tuple(sorted(defines.items()))
         )
-        self._submission = (module[record["ffi_entry"]], args)
+        args = tuple(self.bindings[name] for _kind, name in ARG_PLAN)
+        self._submission = (module["run"], args)
         self._retained = (
             module,
-            record,
             x,
             residual,
             post_mix,
@@ -396,9 +776,7 @@ class MegaMHCPlan:
             mix_bases,
             rmsnorm_weight,
             dummy_u32,
-            dummy_u8,
             dummy_float,
-            descriptor_workspace,
         )
         self.outputs, self.scratch, self.split_barriers, self.launch_epochs = (
             out,

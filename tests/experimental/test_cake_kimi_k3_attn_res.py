@@ -12,81 +12,80 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+Tests of the Cake Kimi-K3 AttnRes backend package (SM100 / SM103): the host policy
+and its route tables, the registry and the generated sources, the launch plans and,
+on a supported device, the numerical contract against the independent FP32 reference
+(output within atol 8e-2 / rtol 3e-2, prefix and snapshot bank bit-exact).
+
+This suite exercises the backend package alone: it names the package once, through
+``tests.test_helpers.cake_package``, and imports nothing else from flashinfer, so a
+build that vendors the package under another import path runs it unchanged after
+pointing that table entry at its package.  The ``flashinfer.kimi_k3_attn_res`` facade
+is covered by ``test_cake_kimi_k3_attn_res_api.py``.
 """
 
+import inspect
+import json
+import pathlib
 import re
 
 import pytest
 import torch
 
-from flashinfer.experimental.cake_kimi_k3_attn_res import cake_backend as cb
-from flashinfer.experimental.cake_kimi_k3_attn_res.cake_backend import (
-    ARCHES,
-    HIDDEN_SIZE,
-    MAX_BLOCKS,
-    NATIVE_GRID,
-    SUPPORTED_COMPUTE_CAPABILITIES,
-    common_path_eligible,
-    plan_route,
-    reference_kimi_k3_attn_res,
-)
-from flashinfer.experimental.cake_kimi_k3_attn_res.cake_jit import KERNELS, MODULES
-from flashinfer.kimi_k3_attn_res import kimi_k3_attn_res, prepare_kimi_k3_attn_res
+from tests.test_helpers.cake_package import cake_package
+
+cb = cake_package("cake_kimi_k3_attn_res", "cake_backend")
+cake_build = cake_package("cake_kimi_k3_attn_res", "cake_build")
+cake_jit = cake_package("cake_kimi_k3_attn_res", "cake_jit")
+ARCHES = cb.ARCHES
+HIDDEN_SIZE = cb.HIDDEN_SIZE
+MAX_BLOCKS = cb.MAX_BLOCKS
+NATIVE_SM_COUNTS = cb.NATIVE_SM_COUNTS
+SUPPORTED_COMPUTE_CAPABILITIES = cb.SUPPORTED_COMPUTE_CAPABILITIES
+common_path_eligible = cb.common_path_eligible
+plan_route = cb.plan_route
+prepare_kimi_k3_attn_res = cb.prepare_kimi_k3_attn_res
+reference_kimi_k3_attn_res = cb.reference_kimi_k3_attn_res
+KERNELS = cake_jit.KERNELS
+MODULES = cake_jit.MODULES
+ROUTES = cake_jit.ROUTES
 
 # The Kimi-K3 AttnRes evaluation contract: output within (atol 8e-2, rtol 3e-2)
 # of the independent FP32 reference; prefix / snapshot bank bit-exact.
 ATOL = 8e-2
 RTOL = 3e-2
+# Reference physical configuration of the measured policy (B200 / B300) and every SM count the
+# programs are qualified on (now including the 152-SM GB300 / GB200 parts).  All grids derive from
+# the count: the native ports launch one CTA per SM on NATIVE_SM_COUNTS, the K = 0 path 2x / 3x
+# the count at its promoted cells, the persistent programs min(M, SMs) (balanced 128 at M 256-512).
 SM_COUNT = 148
+SM_COUNTS = (148, 152)
+assert SM_COUNTS == NATIVE_SM_COUNTS
+#: POLICY_ROWS grid marker: the device's SM count.
+NATIVE = "sms"
 TOKEN_COUNTS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
 PRIMARY_K = (0, 1, 4, 8)
 
 # Representative cells of the measured policy per architecture:
 # (arch, M, K, pdl) -> (kind, schedule_id, grid_x)
 POLICY_ROWS = [
-    ("sm_100a", 1, 0, False, "k0_tma", "k0_tma_persistent_ws288_vec128_fp32x2", 1),
-    (
-        "sm_100a",
-        256,
-        0,
-        True,
-        "k0_tma",
-        "k0_tma_persistent_ws288_vec128_fp32x2",
-        2 * SM_COUNT,
-    ),
+    ("sm_100a", 1, 0, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 1),
+    ("sm_100a", 16, 0, True, "small_m", "small_m_direct_cta256_regres_fp32x2", 16),
+    ("sm_100a", 32, 0, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 32),
+    ("sm_100a", 8, 1, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 8),
+    ("sm_100a", 16, 4, True, "small_m", "small_m_cluster2_cta128_regres_fp32x2", 32),
+    ("sm_100a", 256, 0, True, "small_m", "small_m_direct_cta256_regres_fp32x2", 256),
+    ("sm_100a", 1024, 0, False, "k0_tma", "k0_tma_persistent_ws288_vec128_fp32x2", 444),
     ("sm_100a", 2048, 0, True, "k0_tma", "k0_tma_persistent_ws288_vec128_fp32x2", 148),
-    ("sm_100a", 256, 8, False, "native", "native_k8_nc3_d2_ws288_grid148", NATIVE_GRID),
-    ("sm_100a", 1, 5, False, "native", "native_k5_nc3_d2_ws288_grid148", NATIVE_GRID),
-    ("sm_100a", 64, 4, True, "native", "native_m128_nc3_d2_ws288_grid148", NATIVE_GRID),
-    ("sm_100a", 1, 7, False, "native", "native_k7_nc3_d2_ws288_grid148", NATIVE_GRID),
-    (
-        "sm_100a",
-        1,
-        7,
-        True,
-        "persistent",
-        "trtllm_persistent_ws288_nc4_d2_vec128_fp32x2_prefix_bf16_add_packed_inputs_prefix_shared_addr",
-        1,
-    ),
-    ("sm_100a", 16, 8, True, "native", "native_k8_nc3_d2_ws288_grid148", NATIVE_GRID),
-    (
-        "sm_100a",
-        16,
-        8,
-        False,
-        "persistent",
-        "trtllm_persistent_ws288_nc3_d2_vec128_fp32x2_prefix_bf16_add_packed_inputs_prefix_shared_addr_prefix_round_once",
-        16,
-    ),
-    (
-        "sm_100a",
-        512,
-        1,
-        False,
-        "persistent",
-        "trtllm_persistent_ws288_nc2_d2_vec128_fp32x2_early_consume",
-        128,
-    ),
+    ("sm_100a", 256, 8, False, "native", "native_k8_nc3_d2_ws288_grid148", NATIVE),
+    ("sm_100a", 1, 5, False, "small_m", "small_m_cluster4_cta64_regres_fp32x2", 4),
+    ("sm_100a", 64, 4, True, "small_m", "small_m_direct_cta256_regres_fp32x2", 64),
+    ("sm_100a", 1, 7, False, "small_m", "small_m_cluster4_cta64_regres_fp32x2", 4),
+    ("sm_100a", 1, 7, True, "small_m", "small_m_cluster4_cta64_regres_fp32x2", 4),
+    ("sm_100a", 16, 8, True, "small_m", "small_m_cluster4_cta64_regres_fp32x2", 64),
+    ("sm_100a", 16, 8, False, "small_m", "small_m_cluster4_cta64_regres_fp32x2", 64),
+    ("sm_100a", 512, 1, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 512),
     (
         "sm_100a",
         1024,
@@ -121,9 +120,12 @@ POLICY_ROWS = [
         False,
         "native",
         "native_m128_nc3_d2_ws288_grid148",
-        NATIVE_GRID,
+        NATIVE,
     ),
-    ("sm_103a", 4, 0, False, "k0_tma", "k0_tma_persistent_ws288_vec128_fp32x2", 4),
+    ("sm_103a", 4, 0, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 4),
+    ("sm_103a", 32, 0, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 32),
+    ("sm_103a", 1, 3, True, "small_m", "small_m_direct_cta256_regres_fp32x2", 1),
+    ("sm_103a", 16, 4, False, "small_m", "small_m_cluster2_cta128_regres_fp32x2", 32),
     (
         "sm_103a",
         1024,
@@ -131,10 +133,10 @@ POLICY_ROWS = [
         False,
         "k0_tma",
         "k0_tma_persistent_ws288_vec128_fp32x2",
-        3 * SM_COUNT,
+        444,
     ),
-    ("sm_103a", 1, 7, False, "native", "native_k7_nc3_d2_ws288_grid148", NATIVE_GRID),
-    ("sm_103a", 8, 8, True, "native", "native_k8_nc3_d2_ws288_grid148", NATIVE_GRID),
+    ("sm_103a", 1, 7, False, "small_m", "small_m_cluster2_cta128_regres_fp32x2", 2),
+    ("sm_103a", 8, 8, True, "small_m", "small_m_cluster2_cta128_regres_fp32x2", 16),
     (
         "sm_103a",
         1024,
@@ -151,18 +153,10 @@ POLICY_ROWS = [
         False,
         "native",
         "native_m128_nc3_d2_ws288_grid148",
-        NATIVE_GRID,
+        NATIVE,
     ),
-    ("sm_103a", 256, 8, True, "native", "native_k8_nc3_d2_ws288_grid148", NATIVE_GRID),
-    (
-        "sm_103a",
-        1,
-        7,
-        True,
-        "persistent",
-        "trtllm_persistent_ws288_nc4_d2_vec128_fp32x2",
-        1,
-    ),
+    ("sm_103a", 256, 8, True, "native", "native_k8_nc3_d2_ws288_grid148", NATIVE),
+    ("sm_103a", 1, 7, True, "small_m", "small_m_cluster2_cta128_regres_fp32x2", 2),
     (
         "sm_103a",
         4096,
@@ -172,15 +166,9 @@ POLICY_ROWS = [
         "trtllm_persistent_ws288_nc4_d3_vec128_fp32x2_early_consume_relaxed_producer_wait",
         148,
     ),
-    (
-        "sm_103a",
-        256,
-        1,
-        False,
-        "persistent",
-        "trtllm_persistent_ws288_nc2_d2_vec128_fp32x2",
-        128,
-    ),
+    ("sm_103a", 256, 1, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 256),
+    ("sm_103a", 512, 0, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 512),
+    ("sm_103a", 512, 1, True, "small_m", "small_m_direct_cta256_regres_fp32x2", 512),
     (
         "sm_103a",
         512,
@@ -202,30 +190,344 @@ POLICY_ROWS = [
 ]
 
 
+# Round 2 (the ``R2_*`` route tables): the POLICY_ROWS cells whose program depends on the SM count,
+# (arch, M, K, sm_count) -> (kind, schedule_id, grid_x).  Empty after the step-3 acceptance table: the
+# dense cluster-4 small-M cells of sm_103a (the only SM-count-dependent dense cells of round 2) were
+# withdrawn, so every POLICY_ROWS cell takes the same program at 148 and 152 SMs.
+_ROUND_2_ROWS: dict[tuple[str, int, int, int], tuple[str, str, int]] = {}
+
+
+def _expected_at(sm_count: int, grid_x, schedule_id: str) -> tuple[int, str]:
+    """The (grid, schedule id) a POLICY_ROWS cell takes on ``sm_count`` SMs: the native ports and the
+    SM-count-multiple grids scale with the count (148 -> sm_count, 444 -> 3 x sm_count); the token-bound,
+    balanced-128 and cluster grids do not."""
+    if grid_x == NATIVE:
+        return sm_count, schedule_id.replace("grid148", f"grid{sm_count}")
+    if grid_x % SM_COUNT == 0:
+        return grid_x // SM_COUNT * sm_count, schedule_id
+    return grid_x, schedule_id
+
+
+@pytest.mark.parametrize("sm_count", SM_COUNTS)
 @pytest.mark.parametrize("arch,M,K,pdl,kind,schedule_id,grid_x", POLICY_ROWS)
-def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x):
-    plan = plan_route(arch, SM_COUNT, M, K, pdl)
+def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x, sm_count):
+    grid_x, schedule_id = _expected_at(sm_count, grid_x, schedule_id)
+    kind, schedule_id, grid_x = _ROUND_2_ROWS.get(
+        (arch, M, K, sm_count), (kind, schedule_id, grid_x)
+    )
+    plan = plan_route(arch, sm_count, M, K, pdl)
     assert plan.kind == kind
-    assert plan.schedule_id == schedule_id
+    # Round r5: --use_fast_math is a program axis of the small-M / persistent programs (schedule id
+    # ``_fastmath``, kernel key ``_fm``); the rows pin the program apart from that axis.
+    assert plan.schedule_id.removesuffix("_fastmath") == schedule_id
+    assert plan.schedule_id.endswith("_fastmath") is ("_fm" in plan.kernel_key)
+    if kind in ("small_m", "persistent"):
+        assert plan.schedule_id.endswith("_fastmath") is cb._fast_math(
+            arch, M, K, kind, sm_count
+        )
     assert plan.grid_x == grid_x
     assert plan.use_pdl is pdl
     # PDL is a launch argument of every generated program, not a program axis.
     assert "pdl" not in plan.kernel_key
     assert f".pdl{int(pdl)}." in plan.route_id
-    assert plan.route_id.startswith(schedule_id + ".")
+    assert plan.route_id.startswith(plan.schedule_id + ".")
+
+
+@pytest.mark.parametrize("pdl", (False, True))
+@pytest.mark.parametrize(
+    "M,K,early",
+    (
+        # K2: the early-release band M768..2048 (+ the M4096 cell); held below, between and above.
+        # Round 2 at 148 SMs: M768 / M1536 run the early register-carry programs, M2048 the held one
+        # (``persistent:k2_nc4_d2_f011010000000000``; early again at 152 SMs), M3072 / M6144 the held
+        # register-carry program.
+        (767, 2, False),
+        (768, 2, True),
+        (1536, 2, True),
+        (2048, 2, False),
+        (2049, 2, False),
+        (3072, 2, False),
+        (4096, 2, True),
+        (4097, 2, False),
+        (6144, 2, False),
+        # K4: the nc5 band M513..1023 + the pow2 cells {512, 1024, 2048, 4096}; held at 1025..2047 and above 4096.
+        (512, 4, True),
+        (513, 4, True),
+        (768, 4, True),
+        (1023, 4, True),
+        (1024, 4, True),
+        (1025, 4, False),
+        (1536, 4, False),
+        (2048, 4, True),
+        (3072, 4, False),
+        (4096, 4, True),
+        (6144, 4, False),
+    ),
+)
+def test_plan_route_sm103_k2_k4_consumed_release_bands(M, K, pdl, early):
+    """Round r4 (K2 / K4 screening, Cake 9d069424c49): on sm_103a the early consumed-stage release
+    of the persistent K2 program wins only at M768..2048 (1.3-2.6 % vs the held program, bit-identical)
+    and loses from M12288 on; the K4 nc5 program releases early at M513..1023. The first persistent
+    flag is the release policy; the band edges are the dispatcher / evaluator / FI mirror constants."""
+    plan = plan_route("sm_103a", SM_COUNT, M, K, pdl)
+    assert plan.kind == "persistent", plan
+    # round r5: the fast-math axis (``_fm``) follows the flag tuple in the kernel key
+    flags = plan.kernel_key.removesuffix("_fm").rsplit("_f", 1)[1]
+    assert (flags[0] == "1") is early, (plan.kernel_key, early)
+    if (M, K) == (2048, 2):
+        at_152 = plan_route("sm_103a", 152, M, K, pdl)
+        assert at_152.kernel_key == "persistent:k2_nc4_d2_f111010000000000"
+
+
+def _r2_cells(table_name):
+    """(arch, sm_count, M, K, value) of every cell of a round-2 ``ROUTES`` table."""
+    for arch, by_sm in ROUTES[table_name].items():
+        for sm_count, pairs in by_sm.items():
+            for cell in pairs:
+                if isinstance(cell[0], (list, tuple)):
+                    (M, K), value = cell
+                else:
+                    (M, K), value = cell, None
+                yield arch, int(sm_count), int(M), int(K), value
+
+
+def test_round_2_cells_take_their_table_program():
+    """Every cell of the round-2 tables (``ROUTES["R2_*"]``) resolves to the program the table names,
+    exactly (no registered-variant fallback), with the launch geometry of its kind."""
+    seen = 0
+    for arch, sm_count, M, K, value in _r2_cells("R2_PERSISTENT_KEY_CELLS"):
+        for pdl in (False, True):
+            key = value[int(pdl)] if isinstance(value, (list, tuple)) else value
+            plan = plan_route(arch, sm_count, M, K, pdl)
+            assert plan.kind == "persistent" and plan.fallback_from is None, (plan, key)
+            assert plan.kernel_key == key, (
+                arch,
+                sm_count,
+                M,
+                K,
+                pdl,
+                plan.kernel_key,
+                key,
+            )
+            assert plan.threads == cb.PERSISTENT_THREADS and 1 <= plan.grid_x <= max(
+                M, sm_count
+            )
+            flags = key.removesuffix("_fm").rsplit("_f", 1)[1]
+            if flags[cb._PERSISTENT_FLAG_REGISTER_CARRY_ONLY] == "1":
+                assert flags[cb._PERSISTENT_FLAG_PREFIX_BF16_ADD] == "1"
+                assert plan.schedule_id.split("_fastmath")[0].endswith(
+                    "_register_carry_only"
+                )
+            seen += 1
+    for arch, sm_count, M, K, port in _r2_cells("R2_NATIVE_CELLS"):
+        for pdl in (False, True):
+            plan = plan_route(arch, sm_count, M, K, pdl)
+            assert (plan.kind, plan.kernel_key, plan.grid_x) == (
+                "native",
+                f"native_{port}",
+                sm_count,
+            )
+            assert plan.fallback_from is None and plan.threads == cb.PERSISTENT_THREADS
+            seen += 1
+    for arch, sm_count, M, K, key in _r2_cells("R2_PAIR_CELLS"):
+        for pdl in (False, True):
+            plan = plan_route(arch, sm_count, M, K, pdl)
+            assert (plan.kind, plan.kernel_key, plan.grid_x) == ("pair", key, sm_count)
+            assert plan.threads == cb.PAIR_THREADS == 320 and plan.fallback_from is None
+            assert (
+                plan.schedule_id
+                == f"pair_ws320_nc2_prefix_bf16_add_fastmath_grid{sm_count}"
+            )
+            seen += 1
+    for name, write in (
+        ("R2_SMALL_M_CLUSTER_CELLS", False),
+        ("R2_SMALL_M_WRITE_CLUSTER_CELLS", True),
+    ):
+        for arch, sm_count, M, K, cluster in _r2_cells(name):
+            for pdl in (False, True):
+                plan = plan_route(
+                    arch, sm_count, M, K, pdl, block_write_idx=K if write else -1
+                )
+                assert plan.kind == "small_m" and plan.fallback_from is None, plan
+                assert plan.kernel_key.startswith(f"small_m_cluster{cluster}:k{K}"), (
+                    plan
+                )
+                assert plan.kernel_key.endswith("_write") is write
+                assert (plan.grid_x, plan.threads) == (M * cluster, 256 // cluster)
+                seen += 1
+    for name, write in (
+        ("R2_SMALL_M_FAST_MATH_CELLS", False),
+        ("R2_SMALL_M_WRITE_FAST_MATH_CELLS", True),
+    ):
+        for arch, sm_count, M, K, _none in _r2_cells(name):
+            for pdl in (False, True):
+                plan = plan_route(
+                    arch, sm_count, M, K, pdl, block_write_idx=K if write else -1
+                )
+                assert plan.kind == "small_m" and plan.fallback_from is None, plan
+                assert "_fm" in plan.kernel_key and "_fastmath" in plan.schedule_id, (
+                    plan
+                )
+                seen += 1
+    assert seen > 0
+    if MODULES:
+        for arch, _sm, _m, _k, value in _r2_cells("R2_PERSISTENT_KEY_CELLS"):
+            for key in value if isinstance(value, (list, tuple)) else (value,):
+                assert key in KERNELS[arch], (arch, key)
+    # The K1 M6144 cell of sm_103a names one key per PDL mode (the packed output-norm cache at PDL off).
+    for sm_count in SM_COUNTS:
+        off = plan_route("sm_103a", sm_count, 6144, 1, False).kernel_key
+        on = plan_route("sm_103a", sm_count, 6144, 1, True).kernel_key
+        assert (off, on) == (
+            "persistent:k1_nc4_d2_f110000000000010",
+            "persistent:k1_nc4_d2_f110000000000000",
+        )
+    # Cells round 2 left alone keep the legacy program: the GB300 K6 M3 small-M cell, the B300 K6 M192
+    # (pair) and K5 M768 cells, the record-only K2 M8192 (152) / M4096 (148) cells.
+    assert (
+        plan_route("sm_103a", 152, 3, 6, False).kernel_key == "small_m_cluster2:k6_fm"
+    )
+    assert plan_route("sm_103a", 148, 192, 6, False).kind == "persistent"
+    assert plan_route("sm_103a", 148, 768, 5, False).kernel_key.startswith(
+        "persistent:k5_nc3_d3_f010"
+    )
+    assert (
+        plan_route("sm_103a", 152, 8192, 2, False).kernel_key
+        == "persistent:k2_nc4_d2_f011000000000000"
+    )
+    assert (
+        plan_route("sm_103a", 148, 4096, 2, False).kernel_key
+        == "persistent:k2_nc4_d2_f110000000000000"
+    )
+    for arch in ARCHES:
+        for sm_count in SM_COUNTS:
+            assert "native_k5" not in {
+                plan_route(arch, sm_count, M, 5, False).kernel_key
+                for M in (192, 256, 384, 768)
+            }
+
+
+@pytest.mark.parametrize("pdl", (False, True))
+@pytest.mark.parametrize(
+    "arch,M,nc,depth",
+    (
+        # sm_100a: nc4 depth 3 from the band edge (round r4 closing screening); the r1 M4096 cell keeps nc3 depth 3.
+        ("sm_100a", 1535, 4, 2),
+        ("sm_100a", 1536, 4, 3),
+        ("sm_100a", 3072, 4, 3),
+        ("sm_100a", 4096, 3, 3),
+        ("sm_100a", 8192, 4, 3),
+        ("sm_100a", 16384, 4, 3),
+        # sm_103a: nc4 depth 3 from M1536 (round r4 direction 2).
+        ("sm_103a", 1535, 4, 2),
+        ("sm_103a", 1536, 4, 3),
+        ("sm_103a", 4096, 4, 3),
+        ("sm_103a", 16384, 4, 3),
+    ),
+)
+def test_plan_route_k5_depth3_bands(arch, M, nc, depth, pdl):
+    """Round r4: the persistent K5 program runs four sources per chunk with a depth-3 pipeline from the
+    per-architecture band edge (same-GPU ABBA, bit-identical, 1.3-3.8 % faster than depth 2); the band
+    edges are the dispatcher / evaluator / FI mirror constants."""
+    plan = plan_route(arch, SM_COUNT, M, 5, pdl)
+    assert plan.kind == "persistent", plan
+    assert f"_nc{nc}_d{depth}_" in plan.schedule_id, (plan.schedule_id, nc, depth)
+
+
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
+@pytest.mark.parametrize("pdl", (False, True))
+@pytest.mark.parametrize(
+    "M,K",
+    ((1, 1), (16, 7), (64, 4), (256, 7), (256, 4), (1024, 1), (1024, 4), (4096, 4)),
+)
+def test_plan_route_snapshot_write_takes_the_write_variants(arch, M, K, pdl):
+    """Round r4 (direction 4 / 4b): the block-boundary snapshot write (block K written) runs
+    the write variant of the dense cell's program - the small-M write programs inside the
+    dense family's M table, the persistent write variant above it (also where the dense cell
+    runs a native port, e.g. sm_100a K4 M1024 / sm_103a K4 M256)."""
+    plan = cb._plan_route_exact(arch, SM_COUNT, M, K, pdl, block_write_idx=K)
+    dense = cb._persistent_plan_exact(arch, SM_COUNT, M, K, pdl, write=True)
+    max_m = cb._SMALL_M_DIRECT_MAX_M[arch].get(K)
+    assert plan.fallback_from is None
+    assert f".k{K}.delta1.write1.norm1.pdl{int(pdl)}." in plan.route_id
+    assert plan.schedule_id.endswith("_write") and plan.kernel_key.endswith("_write")
+    if max_m is not None and max_m >= M:
+        cluster = cb._small_m_cluster(arch, M, K, num_sms=SM_COUNT, write=True)
+        nc = cb._small_m_sources_per_chunk(arch, M, K)
+        nc_suffix = "" if nc is None else f"_nc{nc}"
+        fm = cb._fast_math(arch, M, K, "small_m_write", SM_COUNT)
+        family = "direct" if cluster == 1 else f"cluster{cluster}"
+        assert plan.kind == "small_m"
+        assert (
+            plan.kernel_key
+            == f"small_m_{family}:k{K}{nc_suffix}{'_fm' if fm else ''}_write"
+        )
+        assert plan.grid_x == M * cluster and plan.threads == 256 // cluster
+        assert plan.schedule_id.endswith(
+            f"_regres_fp32x2{nc_suffix}{'_fastmath' if fm else ''}_write"
+        )
+    else:
+        assert plan.kind == "persistent"
+        assert plan.kernel_key == f"{dense.kernel_key}_write"
+        assert plan.schedule_id == f"{dense.schedule_id}_write"
+        assert (plan.grid_x, plan.threads) == (dense.grid_x, dense.threads)
+        assert plan.route_id == dense.route_id.replace(
+            dense.schedule_id, plan.schedule_id, 1
+        ).replace(".write0.", ".write1.", 1)
+    for bad_idx in (K - 1, K + 1, MAX_BLOCKS):
+        with pytest.raises(ValueError):
+            cb._plan_route_exact(arch, SM_COUNT, M, K, pdl, block_write_idx=bad_idx)
+
+
+def test_snapshot_write_fallback_stays_in_the_write_family(monkeypatch):
+    """A registered-variant fallback of a snapshot-write plan only ever selects another
+    small-M write program (the snapshot store exists nowhere else)."""
+    # round r5: the write twin's fast-math class is part of the key; the fallback never crosses it either
+    fm = "_fm" if cb._fast_math("sm_100a", 64, 7, "small_m_write") else ""
+    table = {
+        f"small_m_direct:k7{fm}_write": "m1",
+        f"small_m_direct:k7{fm}": "m2",
+        "persistent:k7_nc4_d2_f110000000000000": "m3",
+    }
+    monkeypatch.setattr(cb, "KERNELS", {"sm_100a": table})
+    exact = cb._plan_route_exact("sm_100a", SM_COUNT, 64, 7, False, block_write_idx=7)
+    assert exact.kernel_key not in table
+    resolved = cb._resolve_registered(exact, SM_COUNT, 64)
+    assert resolved.kernel_key == f"small_m_direct:k7{fm}_write"
+    assert resolved.fallback_from == exact.kernel_key
+    assert (
+        resolved.route_id.endswith(".registered_fallback")
+        and ".write1." in resolved.route_id
+    )
+    monkeypatch.setattr(cb, "KERNELS", {"sm_100a": {f"small_m_direct:k7{fm}": "m2"}})
+    unresolved = cb._resolve_registered(exact, SM_COUNT, 64)
+    assert (
+        unresolved.kernel_key == exact.kernel_key and unresolved.fallback_from is None
+    )
 
 
 def test_plan_route_bootstrap_variants():
+    # The bootstrap key encodes the semantics (K, delta, snapshot write, output norm) and never
+    # substitutes; the three registered variants are K0 without delta with the write, K4
+    # without delta and K8 without the output norm.
     plan = plan_route(
-        None, 0, 17, 4, False, has_delta=False, block_write_idx=4, common_path=False
+        None, 0, 1, 0, False, has_delta=False, block_write_idx=0, common_path=False
     )
     assert plan.kind == "direct"
-    assert plan.kernel_key == "direct:k4_d0_w1_n1"
+    assert plan.kernel_key == "direct:k0_d0_w1_n1"
+    assert plan.grid_x == 1 and plan.threads == 256
+    plan = plan_route(None, 0, 17, 4, False, has_delta=False, common_path=False)
+    assert plan.kind == "direct"
+    assert plan.kernel_key == "direct:k4_d0_w0_n1"
     assert plan.grid_x == 17 and plan.threads == 256
     plan = plan_route(
         "sm_100a", SM_COUNT, 7, 8, True, apply_output_norm=False, common_path=False
     )
     assert plan.kernel_key == "direct:k8_d1_w0_n0"
+    if MODULES:
+        registered = ("direct:k0_d0_w1_n1", "direct:k4_d0_w0_n1", "direct:k8_d1_w0_n0")
+        for arch in ARCHES:
+            assert all(key in KERNELS[arch] for key in registered)
 
 
 def test_plan_route_rejects_bad_shapes():
@@ -237,32 +539,116 @@ def test_plan_route_rejects_bad_shapes():
         plan_route("sm_90a", SM_COUNT, 1, 4, False)
 
 
-def test_native_ports_require_148_sms():
-    plan = plan_route("sm_100a", 132, 1, 5, False)
+def test_native_ports_route_on_the_qualified_sm_counts():
+    # M = 256 / K = 8 is a native_k8 cell (M = 1 belongs to the small-M direct kernel); the port launches one
+    # CTA per SM on every qualified count and keeps its kernel key (one registered program)
+    keys = set()
+    for sm_count in SM_COUNTS:
+        plan = plan_route("sm_100a", sm_count, 256, 8, False)
+        assert plan.kind == "native"
+        assert plan.grid_x == sm_count
+        assert plan.schedule_id == f"native_k8_nc3_d2_ws288_grid{sm_count}"
+        keys.add(plan.kernel_key)
+    assert keys == {"native_k8"}
+    # any other count takes the persistent family with a grid derived from the actual count
+    plan = plan_route("sm_100a", 132, 256, 8, False)
     assert plan.kind == "persistent"
-    assert plan.grid_x == 1
+    assert plan.grid_x <= 132
+
+
+_CSRC = pathlib.Path(cake_build.__file__).resolve().parent / "csrc"
+_TMEM_PROGRAMS = sorted(
+    name
+    for name in MODULES
+    if "tcgen05.dealloc" in (_CSRC / f"{name}_kernel.cu").read_text()
+)
+
+
+@pytest.mark.parametrize("name", _TMEM_PROGRAMS)
+def test_tmem_programs_drain_loads_before_the_dealloc(name):
+    # The persistent and native programs read TMEM with tcgen05.ld and free the columns
+    # with tcgen05.dealloc after the cleanup barrier. A register dependency on a tcgen05.ld
+    # result does not complete the load; only tcgen05.wait::ld does (PTX ISA, tcgen05 memory
+    # consistency model), so a wait::ld must come before the barrier that precedes the dealloc.
+    text = (_CSRC / f"{name}_kernel.cu").read_text()
+    dealloc = text.index("tcgen05.dealloc")
+    cleanup = text.rindex("barrier.sync", 0, dealloc)
+    assert "tcgen05.ld." in text[:cleanup]
+    assert "tcgen05.wait::ld" in text[text.rindex("tcgen05.ld.", 0, cleanup) : cleanup]
+
+
+def test_small_m_table_boundary():
+    for arch in ("sm_100a", "sm_103a"):
+        for K in range(MAX_BLOCKS + 1):
+            max_m = cb._SMALL_M_DIRECT_MAX_M[arch].get(K)
+            if max_m is None:
+                assert plan_route(arch, SM_COUNT, 1, K, False).kind != "small_m"
+                continue
+            bands = cb._SMALL_M_CLUSTER[arch].get(K, ())
+            assert list(bands) == sorted(bands)
+            assert all(cs in (2, 4) and 1 <= mm <= max_m for mm, cs in bands)
+            chunk_bands = cb._SMALL_M_CHUNK_BANDS[arch].get(K, ())
+            assert list(chunk_bands) == sorted(chunk_bands)
+            assert all(1 <= nc <= 8 and 1 <= mm <= max_m for mm, nc in chunk_bands)
+            edges = {mm for mm, _cs in bands} | {
+                mm + 1 for mm, _cs in bands if mm < max_m
+            }
+            edges |= {mm for mm, _nc in chunk_bands} | {
+                mm + 1 for mm, _nc in chunk_bands if mm < max_m
+            }
+            for m in sorted({1, max_m} | edges):
+                at = cb._plan_route_exact(arch, SM_COUNT, m, K, False)
+                if (m, K) in cb._R5_SMALL_M_EXCLUDED_CELLS[arch]:
+                    # round r5: the dense cell left the table for its persistent program
+                    assert at.kind == "persistent"
+                    continue
+                cluster = cb._small_m_cluster(arch, m, K, num_sms=SM_COUNT)
+                nc = cb._small_m_sources_per_chunk(arch, m, K)
+                fm = cb._fast_math(arch, m, K, "small_m", SM_COUNT)
+                suffix = ("" if nc is None else f"_nc{nc}") + ("_fm" if fm else "")
+                key = (
+                    f"small_m_direct:k{K}{suffix}"
+                    if cluster == 1
+                    else f"small_m_cluster{cluster}:k{K}{suffix}"
+                )
+                assert at.schedule_id.endswith(
+                    ("" if nc is None else f"_nc{nc}") + ("_fastmath" if fm else "")
+                )
+                assert (at.kind, at.kernel_key, at.grid_x, at.threads) == (
+                    "small_m",
+                    key,
+                    m * cluster,
+                    cb.DIRECT_THREADS // cluster,
+                )
+            at = plan_route(arch, SM_COUNT, max_m, K, False)
+            # the direct kernel is SM-count agnostic and PDL only changes the launch argument
+            assert plan_route(arch, 132, max_m, K, True).kernel_key == at.kernel_key
+            assert plan_route(arch, SM_COUNT, max_m + 1, K, False).kind != "small_m"
 
 
 def test_persistent_key_is_the_complete_flag_tuple():
-    a = plan_route("sm_103a", SM_COUNT, 1, 1, True)
-    b = plan_route("sm_103a", SM_COUNT, 1, 1, False)
+    # M 1024 is the first K1 token count above the small-M table on both architectures
+    a = plan_route("sm_103a", SM_COUNT, 1024, 1, True)
+    b = plan_route("sm_103a", SM_COUNT, 1024, 1, False)
     for plan in (a, b):
         assert plan.kind == "persistent"
-        assert re.fullmatch(r"persistent:k1_nc\d_d\d_f[01]{15}", plan.kernel_key)
+        assert re.fullmatch(r"persistent:k1_nc\d_d\d_f[01]{15}(_fm)?", plan.kernel_key)
     # The PDL mode only changes the launch argument and the route id.
     assert a.route_id != b.route_id
 
 
+@pytest.mark.parametrize("sm_count", SM_COUNTS)
 @pytest.mark.parametrize("arch", ARCHES)
-def test_registered_keys_cover_the_measured_grid_when_programs_exist(arch):
+def test_registered_keys_cover_the_measured_grid_when_programs_exist(arch, sm_count):
     if not MODULES:
         pytest.skip("no generated programs registered in this checkout")
     for pdl in (False, True):
         for M in TOKEN_COUNTS:
             for K in PRIMARY_K:
-                plan = plan_route(arch, SM_COUNT, M, K, pdl)
+                plan = plan_route(arch, sm_count, M, K, pdl)
                 assert plan.kernel_key in KERNELS[arch], (
                     arch,
+                    sm_count,
                     M,
                     K,
                     pdl,
@@ -270,17 +656,272 @@ def test_registered_keys_cover_the_measured_grid_when_programs_exist(arch):
                 )
         for M in (1, 4096):
             for K in range(MAX_BLOCKS + 1):
-                plan = plan_route(arch, SM_COUNT, M, K, pdl)
+                plan = plan_route(arch, sm_count, M, K, pdl)
                 assert plan.kernel_key in KERNELS[arch], (
                     arch,
+                    sm_count,
                     M,
                     K,
                     pdl,
                     plan.kernel_key,
                 )
     for record in MODULES.values():
-        assert record["tma_workspace_bytes"] == 0
+        pairs = [tuple(pair) for pair in record["arg_plan"]]
+        assert pairs[-4:] == [
+            ("launch", cake_jit.LAUNCH_ARGUMENT),
+            ("grid", "grid_x"),
+            ("grid", "grid_y"),
+            ("grid", "grid_z"),
+        ], record["library"]
+        assert all(kind in ("buffer", "parameter") for kind, _ in pairs[:-4]), record[
+            "library"
+        ]
+        assert {name for kind, name in pairs[:-4]} <= set(record["logical"]), record[
+            "library"
+        ]
         assert record["arches"] and set(record["arches"]) <= set(ARCHES)
+
+
+def test_registry_records_reference_the_build_manifest():
+    """Every ``MODULES`` record names its ``build.json`` library and nothing to compile.
+
+    The manifest (schema ``cake-build/1``) carries exactly one entry per (library,
+    architecture) the registry references, each with the kernel and binding sources
+    under ``csrc/`` of this package, their digests and a closure digest; the registry
+    itself records the host plan only.  ``--use_fast_math`` is an entry flag exactly
+    for the fast-math programs (an ``_fm`` key, the native ports and the pair kernel).
+    """
+    if not MODULES:
+        pytest.skip("no generated programs registered in this checkout")
+    manifest = cake_build.manifest()
+    assert manifest["schema"] == "cake-build/1"
+    assert manifest["package"] == cake_jit.__name__.rsplit(".", 1)[0]
+    libraries = cake_build.libraries_by_name()
+    package = pathlib.Path(cake_build.__file__).parent
+    referenced = set()
+    for name, record in MODULES.items():
+        assert record["library"] == name
+        assert not {"sources", "source_sha256", "compile_flags", "cache_names"} & set(
+            record
+        ), name
+        assert set(record["arches"]) <= set(manifest["arch_flags"]), name
+        assert record["kind"] in (
+            "direct",
+            "small_m",
+            "persistent",
+            "k0_tma",
+            "native",
+            "pair",
+        )
+        assert record["ffi_entry"] == "run" and record["launch"]["use_pdl"] == "runtime"
+        fast_math = record["kernel_key"].endswith(("_fm", "_fm_write")) or record[
+            "kind"
+        ] in ("native", "pair")
+        for arch in record["arches"]:
+            library = cake_jit.library_name(name, arch)
+            referenced.add(library)
+            entry = libraries[library]
+            assert entry["arch"] == arch
+            assert entry["entry"] == "run"
+            assert entry["sources"] == [
+                f"csrc/{name}_kernel.cu",
+                f"csrc/{name}_binding.cu",
+            ]
+            assert set(entry["sha256"]) == set(entry["sources"])
+            for source in entry["sources"]:
+                assert (package / source).is_file(), source
+            assert re.fullmatch(r"[0-9a-f]{64}", entry["closure_sha256"])
+            assert ("--use_fast_math" in entry["nvcc_flags"]) is fast_math, (name, arch)
+    assert referenced == set(libraries)
+    assert (package / "csrc" / "cake_ffi_checks.h").is_file()
+    for arch, table in KERNELS.items():
+        for key, name in table.items():
+            assert (
+                MODULES[name]["kernel_key"] == key and arch in MODULES[name]["arches"]
+            )
+
+
+# Every token count a decoder step can present in the small / mid range, plus the measured
+# powers of two and a few large non-powers of two.
+DENSE_TOKEN_COUNTS = (
+    tuple(range(1, 601))
+    + TOKEN_COUNTS[10:]
+    + (
+        1000,
+        1536,
+        3000,
+        6144,
+        10000,
+        16383,
+    )
+)
+
+
+@pytest.mark.parametrize("sm_count", SM_COUNTS)
+@pytest.mark.parametrize("arch", ARCHES)
+def test_every_common_path_route_resolves_to_a_registered_program(arch, sm_count):
+    if not MODULES:
+        pytest.skip("no generated programs registered in this checkout")
+    registered = KERNELS[arch]
+    for pdl in (False, True):
+        for K in range(MAX_BLOCKS + 1):
+            for M in DENSE_TOKEN_COUNTS:
+                exact = cb._plan_route_exact(arch, sm_count, M, K, pdl)
+                plan = plan_route(arch, sm_count, M, K, pdl)
+                cell = (arch, sm_count, M, K, pdl, exact.kernel_key, plan.kernel_key)
+                assert plan.kernel_key in registered, cell
+                assert plan.kind in (
+                    "small_m",
+                    "native",
+                    "pair",
+                    "k0_tma",
+                    "persistent",
+                ), cell
+                if exact.kernel_key in registered:
+                    # a registered variant always runs exactly as the tables say
+                    assert plan == exact and plan.fallback_from is None, cell
+                    continue
+                assert plan.fallback_from == exact.kernel_key, cell
+                assert plan.route_id.endswith(".registered_fallback"), cell
+                assert plan.kind in ("small_m", "persistent"), cell
+                assert plan.kernel_key.split(":k", 1)[1].split("_", 1)[0] == str(K), (
+                    cell
+                )
+                assert (plan.arch, plan.use_pdl) == (arch, pdl), cell
+                if plan.kind == "small_m":
+                    cluster = cb.DIRECT_THREADS // plan.threads
+                    assert cluster in (1, 2, 4), cell
+                    assert plan.kernel_key.startswith(
+                        "small_m_direct:"
+                        if cluster == 1
+                        else f"small_m_cluster{cluster}:"
+                    ), cell
+                    assert plan.grid_x == M * cluster, cell
+                else:
+                    assert plan.threads == cb.PERSISTENT_THREADS and plan.grid_x >= 1, (
+                        cell
+                    )
+    # The measured cells never substitute.
+    for row_arch, M, K, pdl, _kind, _schedule_id, _grid_x in POLICY_ROWS:
+        if row_arch == arch:
+            assert plan_route(arch, sm_count, M, K, pdl).fallback_from is None, (
+                sm_count,
+                M,
+                K,
+                pdl,
+            )
+
+
+# First token count of every dense route band: the M at which ``plan_route`` changes its kernel
+# key on some architecture, SM count in SM_COUNTS or PDL setting, per K.  The bands follow the
+# route tables (the small-M table and its cluster / chunk / fast-math bands, the round-r5 cells,
+# the round-2 cells, the release bands, the nc / depth edges, the native and pair cells) and, for
+# K8 on sm_100a, the SM count itself (the release flips at M = SMs + 1).
+# ``test_gpu_rows_are_the_route_band_starts`` recomputes the set from the tables.
+# fmt: off
+_ROUTE_BAND_START_ROWS = {
+    0: (1, 6, 8, 9, 16, 17, 32, 33, 257, 513),
+    1: (
+        1, 513, 768, 1024, 1025, 1536, 1537, 2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145, 8192,
+        8193, 12288, 12289, 16384,
+    ),
+    2: (
+        1, 192, 193, 257, 384, 385, 512, 513, 768, 769, 1024, 1025, 1536, 1537, 2048, 2049, 3072,
+        3073, 4096, 4097, 6144, 6145, 8192, 8193, 12288, 12289,
+    ),
+    3: (
+        1, 9, 12, 13, 16, 17, 24, 25, 32, 33, 48, 49, 64, 65, 96, 97, 128, 129, 256, 257, 385, 769,
+        4096, 4097,
+    ),
+    4: (
+        1, 5, 17, 129, 192, 193, 256, 257, 384, 385, 512, 513, 1024, 1025, 1537, 2048, 2049, 4096,
+        4097,
+    ),
+    5: (
+        1, 5, 9, 12, 13, 16, 17, 33, 129, 192, 193, 256, 257, 384, 385, 512, 513, 768, 769, 1024,
+        1025, 1536, 4096, 4097,
+    ),
+    6: (1, 2, 5, 17, 33, 129, 192, 193, 384, 513),
+    7: (1, 5, 17, 33, 65, 129, 192, 193, 256, 257, 385, 513, 768, 769),
+    8: (1, 3, 6, 7, 17, 65, 149, 153, 192, 193, 256, 257, 384, 385, 512, 769, 1536, 1537),
+}
+# fmt: on
+
+# Every registered program is exercised at the edge of the band that selects it, plus a few
+# measured cells and off-grid token counts.
+GPU_ROWS = sorted(
+    {(M, K) for K, starts in _ROUTE_BAND_START_ROWS.items() for M in starts}
+    | {
+        (16, 8),
+        (64, 4),
+        (256, 1),
+        (512, 1),
+        # round-2 cells: the pair kernel, the native K7 / K8 / M128 ports, the register-carry and
+        # early + packed-add persistent programs, the per-PDL K1 M6144 cell
+        (192, 4),
+        (192, 6),
+        (192, 7),
+        (192, 8),
+        (384, 8),
+        (256, 5),
+        (256, 7),
+        (384, 4),
+        (384, 5),
+        (768, 2),
+        (768, 5),
+        (1024, 2),
+        (1536, 1),
+        (1536, 2),
+        (2048, 2),
+        (3072, 2),
+        (4096, 2),
+        (6144, 1),
+        (6144, 2),
+        (8192, 2),
+        (12288, 2),
+        # off-grid token counts (registered-variant fallback where this checkout lacks the exact program)
+        (7, 5),
+        (64, 6),
+        (128, 7),
+        (140, 4),
+        (200, 8),
+        (300, 3),
+        (300, 5),
+        (1000, 1),
+        (1000, 2),
+        (16384, 8),
+    }
+)
+
+
+def _table_edge_token_counts(m_max: int = TOKEN_COUNTS[-1]) -> list[int]:
+    """Every token count at which the route can change its kernel key, with its neighbours: the
+    small / mid range, every integer literal of the planner (table edges, cells, minimum /
+    maximum M, the balanced-grid bounds) and the SM counts.  A band can only start at one of
+    these, so sweeping them finds every band start of M 1..``m_max``."""
+    literals = {int(n) for n in re.findall(r"\b\d+\b", inspect.getsource(cb))}
+    literals |= {int(n) for n in re.findall(r"\b\d+\b", json.dumps(ROUTES))}
+    counts = set(range(1, 601)) | {m_max}
+    for edge in literals | set(TOKEN_COUNTS) | set(SM_COUNTS):
+        counts |= {edge - 1, edge, edge + 1}
+    return sorted(M for M in counts if 1 <= M <= m_max)
+
+
+def test_gpu_rows_are_the_route_band_starts():
+    rows = set()
+    token_counts = _table_edge_token_counts()
+    for arch in ARCHES:
+        for sm_count in SM_COUNTS:
+            for K in range(MAX_BLOCKS + 1):
+                for pdl in (False, True):
+                    previous = None
+                    for M in token_counts:
+                        key = plan_route(arch, sm_count, M, K, pdl).kernel_key
+                        if key != previous:
+                            rows.add((M, K))
+                            previous = key
+    expected = {(M, K) for K, starts in _ROUTE_BAND_START_ROWS.items() for M in starts}
+    assert rows == expected, (sorted(rows - expected), sorted(expected - rows))
 
 
 # ---------------------------------------------------------------------------
@@ -365,24 +1006,6 @@ def _check(inputs, expected):
     )
 
 
-GPU_ROWS = [
-    (1, 0),
-    (1, 4),
-    (1, 5),
-    (1, 6),
-    (1, 7),
-    (1, 8),
-    (16, 8),
-    (64, 4),
-    (256, 1),
-    (256, 8),
-    (512, 1),
-    (1024, 4),
-    (4096, 5),
-    (16384, 8),
-]
-
-
 @pytest.mark.parametrize("pdl", [False, True])
 @pytest.mark.parametrize("M,K", GPU_ROWS)
 def test_matches_reference(M, K, pdl):
@@ -403,7 +1026,10 @@ def test_matches_reference(M, K, pdl):
         num_blocks=K,
         enable_pdl=pdl,
     )
-    assert runner.plan.kind in ("native", "k0_tma", "persistent")
+    assert runner.plan.kind in ("small_m", "native", "pair", "k0_tma", "persistent")
+    assert runner.plan.kernel_key in KERNELS[arch]
+    if runner.plan.fallback_from is not None:
+        assert runner.plan.fallback_from not in KERNELS[arch]
     assert runner.launch() is inputs["out"]
     torch.cuda.synchronize()
     _check(inputs, expected)
@@ -415,8 +1041,6 @@ def test_matches_reference(M, K, pdl):
     "M,K,has_delta,write_idx,apply_output_norm",
     [
         (1, 0, False, 0, True),
-        (17, 4, True, 4, True),
-        (3, 7, True, 7, True),
         (17, 4, False, -1, True),
         (7, 8, True, -1, False),
     ],
@@ -455,24 +1079,70 @@ def test_semantic_variants_take_the_bootstrap(
     _check(inputs, expected)
 
 
-def test_row_padded_layout_takes_the_bootstrap():
+@pytest.mark.parametrize(
+    "M,K",
+    [
+        (17, 4),
+        (3, 7),
+        (1, 1),
+        (300, 4),
+        (1024, 1),
+        (1024, 4),
+        (1, 4),
+        (4, 7),
+        (16, 4),
+        (16, 7),
+    ],
+)
+@pytest.mark.parametrize("pdl", [False, True])
+def test_snapshot_write_matches_reference_on_the_write_variants(M, K, pdl):
+    """Round r4: the block-boundary snapshot write (delta + output norm, block K written) runs the
+    write variant of the dense program; the written snapshot and the prefix are bit-exact, the
+    output within tolerance, every other block byte preserved."""
     device, arch = _device_arch()
-    inputs = _make_inputs(5, 4, row_padding=64)
-    assert not common_path_eligible(
-        **{k: v for k, v in inputs.items() if k not in ("num_blocks",)},
-        block_write_idx=-1,
+    if not cb.generated_program_available(
+        device, M, K, enable_pdl=pdl, block_write_idx=K
+    ):
+        pytest.skip("small-M write program not registered for this cell")
+    inputs = _make_inputs(M, K)
+    assert common_path_eligible(
+        **{k: v for k, v in inputs.items() if k != "num_blocks"},
+        num_blocks=K,
+        block_write_idx=K,
     )
-    if not cb.generated_program_available(device, 5, 4, common_path=False):
-        pytest.skip("bootstrap program not registered")
     expected = _clone(inputs)
     reference_kimi_k3_attn_res(
-        **{k: v for k, v in expected.items() if k != "num_blocks"}, num_blocks=4
+        **{k: v for k, v in expected.items() if k != "num_blocks"},
+        num_blocks=K,
+        block_write_idx=K,
     )
-    kimi_k3_attn_res(
-        **{k: v for k, v in inputs.items() if k != "num_blocks"}, num_blocks=4
+    runner = prepare_kimi_k3_attn_res(
+        **{k: v for k, v in inputs.items() if k != "num_blocks"},
+        num_blocks=K,
+        block_write_idx=K,
+        enable_pdl=pdl,
     )
+    assert runner.plan.kind in ("small_m", "persistent")
+    assert runner.plan.kernel_key.endswith("_write")
+    assert ".write1." in runner.plan.route_id
+    runner.launch()
     torch.cuda.synchronize()
     _check(inputs, expected)
+    assert torch.equal(
+        inputs["blocks"][:, K, :].view(torch.int16), inputs["prefix"].view(torch.int16)
+    )
+
+
+def test_row_padded_layout_leaves_the_dense_path():
+    # A row-padded operand leaves the dense path for the bootstrap.  Its variant with
+    # delta and the output norm (direct:k4_d1_w0_n1) has no registered program, so
+    # preparing the call raises NotImplementedError instead of launching.
+    _device_arch()
+    inputs = _make_inputs(5, 4, row_padding=64)
+    kwargs = {k: v for k, v in inputs.items() if k != "num_blocks"}
+    assert not common_path_eligible(**kwargs, num_blocks=4, block_write_idx=-1)
+    with pytest.raises(NotImplementedError):
+        prepare_kimi_k3_attn_res(**kwargs, num_blocks=4)
 
 
 def test_launch_makes_no_allocation_and_replays_in_a_graph():
@@ -532,10 +1202,4 @@ def test_prepare_rejects_bad_bindings():
             **{k: v for k, v in inputs.items() if k != "num_blocks"},
             num_blocks=4,
             block_write_idx=8,
-        )
-    with pytest.raises(ValueError):
-        prepare_kimi_k3_attn_res(
-            **{k: v for k, v in inputs.items() if k != "num_blocks"},
-            num_blocks=4,
-            backend="triton",
         )

@@ -77,14 +77,14 @@ def test_sampled_oracle_matches_full_raw_scale_oracle(kind):
     torch.testing.assert_close(expected, full[indices], rtol=0.01, atol=0.001)
 
 
-@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
 def test_prequantized_metadata_rejects_wrong_encoding_and_oversized_scales(kind):
     fp = FleetParams(num_experts=4, max_tokens_per_rank=10, token_hidden_size=128)
     dtype = (
         torch.float4_e2m1fn_x2
         if kind == "nvfp4"
         else torch.float8_e4m3fn
-        if kind == "mxfp8_e4m3"
+        if kind in ("mxfp8_e4m3", "mxfp4_mxfp8")
         else torch.float8_e5m2
     )
     sf_dtype = torch.float8_e4m3fn if kind == "nvfp4" else torch.float8_e8m0fnu
@@ -169,6 +169,8 @@ def test_real_dlpack_binding_is_safe_in_a_new_capture_stream(kind):
     )
     ws = object.__new__(Sm107BlockScaledSymmBuffer)
     ws.config = cfg
+    # The dummy kernel retains launch-side clearing of invalid combine slots.
+    ws.kernel = SimpleNamespace(masks_invalid_combine_slots=False)
     ws.device = torch.device("cuda", torch.cuda.current_device())
     ws._destroyed = False
     ws._launch_key = None

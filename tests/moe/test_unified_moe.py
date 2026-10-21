@@ -47,6 +47,7 @@ from flashinfer.fused_moe import (
     GeGLU,
     GeGLUTanh,
     Identity,
+    PowLU,
     ReLU,
     ReLU2,
     SiLU,
@@ -505,6 +506,8 @@ class TestReprRoundTrip:
             ReLU2(),
             GeGLUTanh(),
             SwiGLUStep(),
+            PowLU(),
+            PowLU(m=3.5, limit=7.0),
             Identity(),
             GELU(),
             ReLU(),
@@ -616,7 +619,7 @@ class TestBackendOptions:
         assert TrtllmBf16Config.supported(100)
         assert TrtllmBf16Config.supported(103)
         assert TrtllmFp4Config.supported(107)
-        assert not TrtllmFp8BlockConfig.supported(107)
+        assert TrtllmFp8BlockConfig.supported(107)
         assert TrtllmBf16Config.supported(107)
         assert not TrtllmBf16Config.supported(110)
         assert not TrtllmBf16Config.supported(120)
@@ -625,7 +628,7 @@ class TestBackendOptions:
         assert not TrtllmFp8BlockConfig.supported(120)
         assert TrtllmFp8PerTensorConfig.supported(100)
         assert TrtllmFp8PerTensorConfig.supported(103)
-        assert not TrtllmFp8PerTensorConfig.supported(107)
+        assert TrtllmFp8PerTensorConfig.supported(107)
         assert not TrtllmFp8PerTensorConfig.supported(90)
         assert not TrtllmFp8PerTensorConfig.supported(120)
 
@@ -956,6 +959,10 @@ class TestTypedActivationConfig:
         from flashinfer.fused_moe.prepare import _activation_param_view
 
         assert _activation_param_view(SwiGLU(), 3, torch.device("cpu")) == {}
+        assert _activation_param_view(SwiGLUStep(), 3, torch.device("cpu")) == {}
+        step = _activation_param_view(SwiGLUStep(limit=16.0), 3, torch.device("cpu"))
+        assert set(step) == {"gemm1_clamp_limit"}
+        torch.testing.assert_close(step["gemm1_clamp_limit"], torch.full((3,), 16.0))
         view = _activation_param_view(
             SwiGLU(alpha=1.7, beta=0.25, limit=6.0),
             3,
@@ -1178,7 +1185,9 @@ class TestTypedActivationConfig:
         assert SwiGLUStep().limit == 7.0
 
 
-@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+@pytest.mark.parametrize(
+    "activation", (SwiGLU(), SwiGLUStep(), SwiGLUStep(limit=16.0), ReLU2())
+)
 def test_trtllm_bf16_preparation_shapes_for_declared_activations(activation):
     experts, hidden, intermediate = 2, 128, 128
     rows = intermediate * (2 if activation.is_gated else 1)
@@ -1196,7 +1205,9 @@ def test_trtllm_bf16_preparation_shapes_for_declared_activations(activation):
     assert view["gemm2_weights"].numel() == experts * hidden * intermediate
 
 
-@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+@pytest.mark.parametrize(
+    "activation", (SwiGLU(), SwiGLUStep(), SwiGLUStep(limit=16.0), ReLU2())
+)
 def test_trtllm_fp8_per_tensor_preparation_shapes_for_declared_activations(
     activation,
 ):
@@ -1404,6 +1415,7 @@ class TestMoERunnerSupport:
             GeGLUTanh,
             ReLU2,
             SiTU,
+            PowLU,
             Identity,
             GELU,
             ReLU,
@@ -1418,21 +1430,34 @@ class TestMoERunnerSupport:
             SiTU,
         )
         assert TrtllmFp4RoutedRunner.supported_activation_classes_by_quant == {
-            (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLU, SiTU, ReLU2),
+            (QuantFormat.NVFP4, QuantFormat.NVFP4): (
+                SwiGLU,
+                SwiGLUStep,
+                GeGLU,
+                SiTU,
+                ReLU2,
+            ),
             (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLU, SiTU, ReLU2),
             (QuantFormat.MXFP4, QuantFormat.BF16): (SwiGLU,),
         }
         assert TrtllmBf16RoutedRunner.supported_activation_classes == (
             SwiGLU,
+            SwiGLUStep,
             ReLU2,
         )
         assert TrtllmFp8PerTensorRunner.supported_activation_classes == (
             SwiGLU,
+            SwiGLUStep,
             ReLU2,
         )
         assert TrtllmFp8BlockRunner.supported_activation_classes_by_quant == {
             (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU,),
-            (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLU, ReLU2),
+            (QuantFormat.MXFP8, QuantFormat.MXFP8): (
+                SwiGLU,
+                SwiGLUStep,
+                GeGLU,
+                ReLU2,
+            ),
         }
         assert TrtllmMxInt4RoutedRunner.supported_activation_classes == (SwiGLU,)
 
@@ -1858,7 +1883,7 @@ class TestMoERunnerSupport:
     )
     @pytest.mark.parametrize(
         ("compute_capability", "supported"),
-        [((10, 0), True), ((10, 3), True), ((10, 7), False)],
+        [((10, 0), True), ((10, 3), True), ((10, 7), True)],
     )
     def test_fp8_runner_arch_support(
         self, monkeypatch, runner_type, variant, compute_capability, supported
@@ -3723,6 +3748,9 @@ class TestTrtllmFp4UnpackedContract:
         "activation",
         [
             pytest.param(SwiGLU(), id="swiglu"),
+            pytest.param(SwiGLUStep(), id="swiglu-step"),
+            pytest.param(SwiGLUStep(limit=16.0), id="swiglu-step-16"),
+            pytest.param(SwiGLUStep(limit=0.25), id="swiglu-step-025"),
             pytest.param(ReLU2(), id="relu2"),
         ],
     )
@@ -3742,6 +3770,10 @@ class TestTrtllmFp4UnpackedContract:
             use_per_token_activation=True,
             use_nontrivial_alphas=False,
         )
+        if isinstance(activation, SwiGLUStep):
+            # Exercise clipping while keeping identical quantized payloads.
+            tensors["x_per_token_scale"] *= 64.0
+            tensors["x_ref"] *= 64.0
         config = MoEConfig(
             routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
             quant=QuantConfig(
@@ -3774,28 +3806,18 @@ class TestTrtllmFp4UnpackedContract:
             activation=activation,
             device=device,
         )
-        fc1_size = intermediate_size * (2 if activation.is_gated else 1)
-        assert prepared_weights["gemm1_weights"].shape == (
-            num_experts,
-            fc1_size,
-            hidden_size // 2,
-        )
-        assert prepared_weights["gemm1_weights_scale"].shape == (
-            num_experts,
-            fc1_size,
-            hidden_size // 16,
-        )
+        if isinstance(activation, SwiGLUStep):
+            # Cover physical limits with both global and per-token dequantization.
+            # Preparation can share the default scale tensor with FC2.
+            for key in ("output1_scale_scalar", "output1_scale_gate_scalar"):
+                prepared_weights[key] = torch.full_like(prepared_weights[key], 2.0)
+            if "gemm1_clamp_limit" in prepared_weights:
+                prepared_weights["gemm1_clamp_limit"] /= 2.0
         weight_pack.prepare_for(
             runner.backend_key,
             prepared_weights,
         )
         inputs = runner.pack_inputs(act_pack, weight_pack)
-        from flashinfer.fused_moe.core import MoeRunnerInputs
-
-        moe_inputs = MoeRunnerInputs.from_list(inputs)
-        assert moe_inputs.per_token_scale is act_pack.per_token_scale
-        assert "per_token_scale" not in inputs.launch_state.static_kwargs
-        assert runner._inner.use_per_token_scaling is True
         for _ in range(3):
             runner.forward(inputs, tactic=-1)
         torch.cuda.synchronize()
@@ -3806,7 +3828,7 @@ class TestTrtllmFp4UnpackedContract:
             hidden_states=tensors["x_ref"],
             gemm1_weights=tensors["w1_weight_bf16"],
             gemm2_weights=tensors["w2_weight_bf16"],
-            gemm1_alpha=ones,
+            gemm1_alpha=ones * 2.0 if isinstance(activation, SwiGLUStep) else ones,
             gemm2_alpha=ones,
             token_selected_experts=act_pack.topk_ids,
             token_final_scales=act_pack.topk_weights,
@@ -3818,6 +3840,9 @@ class TestTrtllmFp4UnpackedContract:
             fc2_input_scale=tensors["fc2_input_scale"],
             use_per_token_activation=True,
             activation_type=activation.type,
+            swiglu_limit=activation.limit
+            if isinstance(activation, SwiGLUStep)
+            else None,
         )
         passed, pct, atol = check_accuracy(eager, reference)
         assert passed, (

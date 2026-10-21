@@ -17,42 +17,206 @@ limitations under the License.
 from __future__ import annotations
 
 import functools
-from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
-from ...jit import env as jit_env
-from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+from . import cake_build
 
 # Explicit target-owned registration of the generated chunked LM-head + loss
-# programs.  One record per architecture.  A record carries ``arch``, the host
-# binding profile ``abi`` (the keyword set its kernels expect, see
-# ``cake_backend``), the list of kernel ``stages`` it registers, the
-# ``geometry`` the kernels were built for (see ``cake_backend.Geometry``: the
-# vocabulary columns per row-statistics partial, the GEMM row tile and CTA
-# pair, the K block of the weight-gradient GEMM, the element vector of the
-# cast, the divisibility ``V`` / ``H`` / the row stride of ``X`` must satisfy
-# and the label element type) and one physical entry per stage (translation
-# units, compile flags, FFI entry, argument plan, grid rule, launch geometry
-# and closure identity).  Populated verbatim by the generated-program export;
-# do not edit by hand.
-MODULES: dict[str, dict[str, Any]] = {
+# programs, one record per architecture (the kernels take the call geometry
+# H / V as launch scalars; one record serves every admissible geometry).  The
+# generated-program export writes the compact tables between the two
+# ``generated registry`` markers; ``MODULES`` is their expansion.  A record
+# carries ``arch``, the host binding profile ``abi`` (the keyword set its
+# kernels expect, see ``cake_backend``), the list of kernel ``stages`` it
+# registers (launch order), the ``geometry`` the kernels were built for (see
+# ``cake_backend.Geometry``: the vocabulary columns per row-statistics
+# partial, the GEMM row tile and CTA pair, the K block of the weight-gradient
+# GEMM, the element vector of the cast, the divisibility ``V`` / ``H`` / the
+# row stride of ``X`` must satisfy, the label element type and, per GEMM, the
+# cluster width, the work item's columns and the default raster height) and
+# one physical entry per stage: ``module`` (the generated program),
+# ``library`` (the architecture-free stem of the stage's library; ``build.json``
+# names the per-architecture build ``<library>_<arch>``, see ``cake_build``),
+# ``ffi_entry``, ``arg_plan``, ``tma_workspace_bytes``, ``workspace_bytes``,
+# ``grid`` and ``launch``.  What to compile -- the translation units, the nvcc
+# flags (including the toolchain-conditional ``nvcc_flags_if``) and the
+# closure digest -- is recorded in ``build.json`` only, never here.
+#
+# Compact form: ``_ARG_PLANS`` and ``_LAUNCHES`` hold the distinct argument
+# plans and launch geometries by name; a stage row is
+# ``[unit, arg_plan, launch, grid_x, grid_y, grid_z]`` plus an optional
+# trailing mapping of the fields that differ from their defaults
+# (``ffi_entry`` ``"run"``, ``tma_workspace_bytes`` and ``workspace_bytes``
+# ``0``).  The unit names the stage's program and library stem
+# ``cake_lm_head_loss_<unit>`` (one architecture-neutral translation unit per
+# kernel, shared by the records of every architecture; the per-architecture
+# lowering sits under ``__CUDA_ARCH__`` guards) whose ``build.json`` entry
+# ``cake_lm_head_loss_<unit>_<arch>`` lists ``csrc/cake_lm_head_loss/
+# cake_lm_head_loss_<unit>_kernel.cu`` and the launch stub ``..._launch.cu``
+# that binds the shared launcher under ``csrc/cake_lm_head_loss/shim/`` to the
+# kernel.  Do not edit by hand.
+# --- generated registry (written by the Cake export; do not edit) ---
+_ARG_PLANS: dict[str, list[list[str]]] = {
+    "gather_rows_bf16": [
+        ["buffer", "x"],
+        ["buffer", "idx_lo"],
+        ["buffer", "count"],
+        ["buffer", "out"],
+        ["parameter", "ld_x_words"],
+        ["parameter", "row_vecs"],
+        ["parameter", "num_rows"],
+        ["parameter", "T"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "gemm_logits": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["buffer", "C"],
+        ["buffer", "STATS_OUT"],
+        ["parameter", "M"],
+        ["parameter", "m_tiles"],
+        ["parameter", "k_iters"],
+        ["parameter", "first_chunk"],
+        ["buffer", "WS"],
+        ["parameter", "ws_slab"],
+        ["parameter", "ldc"],
+        ["parameter", "k_slices"],
+        ["parameter", "k_slice_iters"],
+        ["parameter", "group_m"],
+        ["parameter", "group_n"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "row_finalize": [
+        ["buffer", "stats"],
+        ["buffer", "z"],
+        ["buffer", "labels"],
+        ["buffer", "infer_logp"],
+        ["buffer", "loss_weights"],
+        ["buffer", "d_in"],
+        ["buffer", "lse"],
+        ["buffer", "logp"],
+        ["buffer", "d"],
+        ["buffer", "term"],
+        ["parameter", "rows_c"],
+        ["parameter", "row0"],
+        ["parameter", "V"],
+        ["parameter", "num_tiles"],
+        ["parameter", "mode"],
+        ["parameter", "loss_div"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "loss_reduce": [
+        ["buffer", "term"],
+        ["buffer", "loss_acc"],
+        ["buffer", "loss_out"],
+        ["parameter", "rows_c"],
+        ["parameter", "first_chunk"],
+        ["parameter", "last_chunk"],
+        ["parameter", "mode"],
+        ["parameter", "loss_div"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "row_grad": [
+        ["buffer", "z"],
+        ["buffer", "labels"],
+        ["buffer", "lse"],
+        ["buffer", "d"],
+        ["parameter", "row0"],
+        ["parameter", "d_off"],
+        ["parameter", "V"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "gemm_dx": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["tma_buffer", "C"],
+        ["buffer", "STATS_OUT"],
+        ["parameter", "M"],
+        ["parameter", "m_tiles"],
+        ["parameter", "k_iters"],
+        ["parameter", "first_chunk"],
+        ["buffer", "WS"],
+        ["parameter", "ws_slab"],
+        ["parameter", "ldc"],
+        ["parameter", "k_slices"],
+        ["parameter", "k_slice_iters"],
+        ["parameter", "group_m"],
+        ["parameter", "group_n"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "gemm_dx_2": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["tma_buffer", "C"],
+        ["buffer", "STATS_OUT"],
+        ["parameter", "M"],
+        ["parameter", "m_tiles"],
+        ["parameter", "k_iters"],
+        ["parameter", "first_chunk"],
+        ["tma_buffer", "WS"],
+        ["parameter", "ws_slab"],
+        ["parameter", "ldc"],
+        ["parameter", "k_slices"],
+        ["parameter", "k_slice_iters"],
+        ["parameter", "group_m"],
+        ["parameter", "group_n"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "slab_sum": [
+        ["buffer", "dx"],
+        ["buffer", "ws"],
+        ["parameter", "ws_slab"],
+        ["parameter", "num_vecs"],
+        ["parameter", "n_slabs"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "scale_cast_bf16": [
+        ["buffer", "acc"],
+        ["buffer", "g"],
+        ["buffer", "out"],
+        ["parameter", "num_vecs"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "scale_cast_scatter_bf16": [
+        ["buffer", "acc"],
+        ["buffer", "g"],
+        ["buffer", "scan"],
+        ["buffer", "idx_lo"],
+        ["buffer", "out"],
+        ["parameter", "row_vecs"],
+        ["parameter", "num_rows"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+}
+_LAUNCHES: dict[str, dict[str, list[int]]] = {
+    "b256_c1": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
+    "b224_c2": {"block": [224, 1, 1], "cluster": [2, 1, 1]},
+    "b128_c1": {"block": [128, 1, 1], "cluster": [1, 1, 1]},
+}
+_REGISTRY: dict[str, dict[str, Any]] = {
     "cake_lm_head_loss_sm_100a": {
         "arch": "sm_100a",
         "abi": "lm_head_loss_v1",
-        "stages": [
-            "gemm_logits",
-            "gemm_logits_nostats",
-            "row_finalize",
-            "loss_reduce",
-            "row_grad",
-            "gemm_dx",
-            "gemm_dx_s2",
-            "gemm_dx_s3",
-            "gemm_dx_s4",
-            "gemm_dw_acc",
-            "scale_cast_bf16",
-            "scale_cast_f32",
-        ],
         "geometry": {
             "stats_tile": 256,
             "row_tile": 128,
@@ -63,368 +227,201 @@ MODULES: dict[str, dict[str, Any]] = {
             "hidden_multiple": 256,
             "ld_multiple": 8,
             "labels_dtype": "int64",
-            "hidden": 6144,
-            "vocab": 154880,
+            "hidden": None,
+            "vocab": None,
             "logits_cluster_ctas": 2,
             "dx_cluster_ctas": 2,
             "dw_cluster_ctas": 2,
+            "logits_item_cols": 256,
+            "dx_item_cols": 512,
+            "dw_item_cols": 512,
+            "logits_group_m": 32,
+            "dx_group_m": 16,
+            "dw_group_m": 8,
         },
-        "gemm_logits": {
-            "module": "cake_lm_head_loss_98495ee25c515bb14cae",
-            "sources": [
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_98495ee25c515bb14cae_kernel.cu",
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_98495ee25c515bb14cae_binding.cu",
+        "stages": {
+            "gather_rows_bf16": [
+                "7190e3804a8d4d9e457f",
+                "gather_rows_bf16",
+                "b256_c1",
+                "max(1, min(num_rows*row_vecs/2048, num_rows, 65535))",
+                1,
+                1,
             ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["tma_buffer", "A"],
-                ["tma_buffer", "B"],
-                ["buffer", "C"],
-                ["buffer", "STATS_OUT"],
-                ["parameter", "M"],
-                ["parameter", "m_tiles"],
-                ["parameter", "k_iters"],
-                ["parameter", "first_chunk"],
-                ["buffer", "WS"],
-                ["parameter", "ws_slab"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
+            "gemm_logits": [
+                "6d8eadbd70c6fdd0670f",
+                "gemm_logits",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
             ],
-            "closure_sha256": "3f63216ea318ed4fb12bccba5b34d4773d71d7ce4be6a3f1017ba3f7fc07ca34",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["max(1, m_tiles//2*605)*2", 1, 1],
-            "launch": {"block": [224, 1, 1], "cluster": [2, 1, 1]},
+            "gemm_logits_mcnt": [
+                "2cdcc0d4405930521761",
+                "gemm_logits",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
+            "gemm_logits_nostats": [
+                "2ea71b605b0ba9f4999e",
+                "gemm_logits",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
+            "gemm_logits_nostats_mcnt": [
+                "0805b3b9540e942e8454",
+                "gemm_logits",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
+            "row_finalize": [
+                "61ea8de378a85bd5c55c",
+                "row_finalize",
+                "b256_c1",
+                "rows_c/8",
+                1,
+                1,
+            ],
+            "loss_reduce": ["e03bef31303e0675324f", "loss_reduce", "b256_c1", 1, 1, 1],
+            "row_grad": [
+                "8eccf1c4d61d3cd4f354",
+                "row_grad",
+                "b128_c1",
+                "max(1, V//8/1024)",
+                "rows_c",
+                1,
+            ],
+            "gemm_dx": [
+                "962c476faea73269ee31",
+                "gemm_dx",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*2",
+                1,
+                1,
+            ],
+            "gemm_dx_s": [
+                "ab2405f84e01186198a2",
+                "gemm_dx_2",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512)*k_slices)*2",
+                1,
+                1,
+            ],
+            "gemm_dx_tn256": [
+                "a041856ad1ab94905b82",
+                "gemm_dx",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "gemm_dx_s_tn256": [
+                "1cc43cee29170c2dd18f",
+                "gemm_dx_2",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512)*k_slices)*4",
+                1,
+                1,
+            ],
+            "gemm_dx_st3": [
+                "d25c462221a5bc5ee763",
+                "gemm_dx",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*2",
+                1,
+                1,
+            ],
+            "gemm_dx_s_st3": [
+                "148ac7a6958d17343647",
+                "gemm_dx_2",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512)*k_slices)*2",
+                1,
+                1,
+            ],
+            "slab_sum": [
+                "dc45b3bd617f038cbddb",
+                "slab_sum",
+                "b256_c1",
+                "max(1, min(num_vecs/2048, 65535))",
+                1,
+                1,
+            ],
+            "gemm_dw_acc": [
+                "5d3dbf4fbe18c2482cc4",
+                "gemm_logits",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "gemm_dw_acc_gn": [
+                "25c7f195ad7707f95e1c",
+                "gemm_logits",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "gemm_dw_cast_bf16": [
+                "0a540692be2ea00ec27a",
+                "gemm_logits",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "gemm_dw_cast_f32": [
+                "d9f38f99742d43df9556",
+                "gemm_logits",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "gemm_dw_cast_f32_gn": [
+                "074c355c5fc9d8b80f4c",
+                "gemm_logits",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "scale_cast_bf16": [
+                "bcd42bd5bff332946d74",
+                "scale_cast_bf16",
+                "b256_c1",
+                "max(1, min(num_vecs/2048, 65535))",
+                1,
+                1,
+            ],
+            "scale_cast_f32": [
+                "6b467ba2de9494ed17b9",
+                "scale_cast_bf16",
+                "b256_c1",
+                "max(1, min(num_vecs/2048, 65535))",
+                1,
+                1,
+            ],
+            "scale_cast_scatter_bf16": [
+                "275a488848d6bb32998f",
+                "scale_cast_scatter_bf16",
+                "b256_c1",
+                "max(1, min(num_rows*row_vecs/2048, num_rows, 65535))",
+                1,
+                1,
+            ],
         },
-        "gemm_logits_nostats": {
-            "module": "cake_lm_head_loss_2b1925b64416e75c6091",
-            "sources": [
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_2b1925b64416e75c6091_kernel.cu",
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_2b1925b64416e75c6091_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["tma_buffer", "A"],
-                ["tma_buffer", "B"],
-                ["buffer", "C"],
-                ["buffer", "STATS_OUT"],
-                ["parameter", "M"],
-                ["parameter", "m_tiles"],
-                ["parameter", "k_iters"],
-                ["parameter", "first_chunk"],
-                ["buffer", "WS"],
-                ["parameter", "ws_slab"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "a0bb902d2a9fa6785f4ed1e872db1500b7903e0dbec83f1ec09ac3d6550cdd6b",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["max(1, m_tiles//2*605)*2", 1, 1],
-            "launch": {"block": [224, 1, 1], "cluster": [2, 1, 1]},
-        },
-        "row_finalize": {
-            "module": "cake_lm_head_loss_40e27be3789cda6512a1",
-            "sources": [
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_40e27be3789cda6512a1_kernel.cu",
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_40e27be3789cda6512a1_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "stats"],
-                ["buffer", "z"],
-                ["buffer", "labels"],
-                ["buffer", "infer_logp"],
-                ["buffer", "loss_weights"],
-                ["buffer", "d_in"],
-                ["buffer", "lse"],
-                ["buffer", "logp"],
-                ["buffer", "d"],
-                ["buffer", "term"],
-                ["parameter", "rows_c"],
-                ["parameter", "row0"],
-                ["parameter", "V"],
-                ["parameter", "num_tiles"],
-                ["parameter", "mode"],
-                ["parameter", "loss_div"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "1d478adedc66811ef8755312d4ba23cb1ecd6e24dc27cf2b539fc82bd1dd6dbc",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["rows_c/8", 1, 1],
-            "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
-        },
-        "loss_reduce": {
-            "module": "cake_lm_head_loss_f835250d89052888b6ae",
-            "sources": [
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_f835250d89052888b6ae_kernel.cu",
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_f835250d89052888b6ae_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "term"],
-                ["buffer", "loss_acc"],
-                ["buffer", "loss_out"],
-                ["parameter", "rows_c"],
-                ["parameter", "first_chunk"],
-                ["parameter", "last_chunk"],
-                ["parameter", "mode"],
-                ["parameter", "loss_div"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "361010297415b400c5963dfe841334eeb15d33f5bc0ae9bb5a501e9c560d0d3c",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": [1, 1, 1],
-            "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
-        },
-        "row_grad": {
-            "module": "cake_lm_head_loss_cef7772361b458bb1ee2",
-            "sources": [
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_cef7772361b458bb1ee2_kernel.cu",
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_cef7772361b458bb1ee2_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "z"],
-                ["buffer", "labels"],
-                ["buffer", "lse"],
-                ["buffer", "d"],
-                ["parameter", "row0"],
-                ["parameter", "d_off"],
-                ["parameter", "V"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "cfeea72e3619a459982c11d16dfa0db4d85f4d74027bb342a087f07051b6b01b",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["max(1, V//8/1024)", "rows_c", 1],
-            "launch": {"block": [128, 1, 1], "cluster": [1, 1, 1]},
-        },
-        "gemm_dx": {
-            "module": "cake_lm_head_loss_485bf80f49ec183cb77b",
-            "sources": [
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_485bf80f49ec183cb77b_kernel.cu",
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_485bf80f49ec183cb77b_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["tma_buffer", "A"],
-                ["tma_buffer", "B"],
-                ["buffer", "C"],
-                ["buffer", "STATS_OUT"],
-                ["parameter", "M"],
-                ["parameter", "m_tiles"],
-                ["parameter", "k_iters"],
-                ["parameter", "first_chunk"],
-                ["buffer", "WS"],
-                ["parameter", "ws_slab"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "c3936bc6264c477e5e28b00fdb47739790707db7fc94cef546cadfdddf256c2a",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["max(1, m_tiles//2*24)*2", 1, 1],
-            "launch": {"block": [224, 1, 1], "cluster": [2, 1, 1]},
-        },
-        "gemm_dx_s2": {
-            "module": "cake_lm_head_loss_0d2db191075f9ef7263b",
-            "sources": [
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_0d2db191075f9ef7263b_kernel.cu",
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_0d2db191075f9ef7263b_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["tma_buffer", "A"],
-                ["tma_buffer", "B"],
-                ["buffer", "C"],
-                ["buffer", "STATS_OUT"],
-                ["parameter", "M"],
-                ["parameter", "m_tiles"],
-                ["parameter", "k_iters"],
-                ["parameter", "first_chunk"],
-                ["buffer", "WS"],
-                ["parameter", "ws_slab"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "dfcec1c6b3fe6e62b133c7e02b268b786f734527e8d70f40c37374e2c207d18d",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["max(1, m_tiles//2*48)*2", 1, 1],
-            "launch": {"block": [224, 1, 1], "cluster": [2, 1, 1]},
-        },
-        "gemm_dx_s3": {
-            "module": "cake_lm_head_loss_6b4efd8d73871be4419d",
-            "sources": [
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_6b4efd8d73871be4419d_kernel.cu",
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_6b4efd8d73871be4419d_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["tma_buffer", "A"],
-                ["tma_buffer", "B"],
-                ["buffer", "C"],
-                ["buffer", "STATS_OUT"],
-                ["parameter", "M"],
-                ["parameter", "m_tiles"],
-                ["parameter", "k_iters"],
-                ["parameter", "first_chunk"],
-                ["buffer", "WS"],
-                ["parameter", "ws_slab"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "111988c30f357536151a9a329d0097f868ab0afb244a2009bbd05894949b4997",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["max(1, m_tiles//2*72)*2", 1, 1],
-            "launch": {"block": [224, 1, 1], "cluster": [2, 1, 1]},
-        },
-        "gemm_dx_s4": {
-            "module": "cake_lm_head_loss_6138e5261199cebb53c0",
-            "sources": [
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_6138e5261199cebb53c0_kernel.cu",
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_6138e5261199cebb53c0_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["tma_buffer", "A"],
-                ["tma_buffer", "B"],
-                ["buffer", "C"],
-                ["buffer", "STATS_OUT"],
-                ["parameter", "M"],
-                ["parameter", "m_tiles"],
-                ["parameter", "k_iters"],
-                ["parameter", "first_chunk"],
-                ["buffer", "WS"],
-                ["parameter", "ws_slab"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "746ed9df0ca9d15d05805c02670649852ee0aa6df28d81e17e0121fc71b4d0f6",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["max(1, m_tiles//2*96)*2", 1, 1],
-            "launch": {"block": [224, 1, 1], "cluster": [2, 1, 1]},
-        },
-        "gemm_dw_acc": {
-            "module": "cake_lm_head_loss_a6baf2d4cb7ab09d54cb",
-            "sources": [
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_a6baf2d4cb7ab09d54cb_kernel.cu",
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_a6baf2d4cb7ab09d54cb_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["tma_buffer", "A"],
-                ["tma_buffer", "B"],
-                ["buffer", "C"],
-                ["buffer", "STATS_OUT"],
-                ["parameter", "M"],
-                ["parameter", "m_tiles"],
-                ["parameter", "k_iters"],
-                ["parameter", "first_chunk"],
-                ["buffer", "WS"],
-                ["parameter", "ws_slab"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "b1a7c4ef5c44b46d2ac1f40c0deb2f5ce9715449d090f8d420299cf7593015d5",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["max(1, m_tiles//2*24)*2", 1, 1],
-            "launch": {"block": [224, 1, 1], "cluster": [2, 1, 1]},
-        },
-        "scale_cast_bf16": {
-            "module": "cake_lm_head_loss_2fbdae03f8d282f1b6ea",
-            "sources": [
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_2fbdae03f8d282f1b6ea_kernel.cu",
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_2fbdae03f8d282f1b6ea_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "acc"],
-                ["buffer", "g"],
-                ["buffer", "out"],
-                ["parameter", "num_vecs"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "22e9aa4b1aa89201095426489faa890e6f57196079d695e480cd16a237fda0bd",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["max(1, min(num_vecs/2048, 65535))", 1, 1],
-            "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
-        },
-        "scale_cast_f32": {
-            "module": "cake_lm_head_loss_809bf68f30658bb0d1d6",
-            "sources": [
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_809bf68f30658bb0d1d6_kernel.cu",
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_809bf68f30658bb0d1d6_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "acc"],
-                ["buffer", "g"],
-                ["buffer", "out"],
-                ["parameter", "num_vecs"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "135db3b48a996cfca75f20f13a894c3ce4a7781fd5c723fa9c3ac37bb0cc2a06",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["max(1, min(num_vecs/2048, 65535))", 1, 1],
-            "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
-        },
-        "closure_sha256": "b1442c09583f3b710f57e98156947b1c7ed00eef1bf410ba08e245ebfd982c0f",
     },
     "cake_lm_head_loss_sm_103a": {
         "arch": "sm_103a",
         "abi": "lm_head_loss_v1",
-        "stages": [
-            "gemm_logits",
-            "gemm_logits_nostats",
-            "row_finalize",
-            "loss_reduce",
-            "row_grad",
-            "gemm_dx",
-            "gemm_dx_s2",
-            "gemm_dx_s3",
-            "gemm_dx_s4",
-            "gemm_dw_acc",
-            "scale_cast_bf16",
-            "scale_cast_f32",
-        ],
         "geometry": {
             "stats_tile": 256,
             "row_tile": 128,
@@ -435,352 +432,265 @@ MODULES: dict[str, dict[str, Any]] = {
             "hidden_multiple": 256,
             "ld_multiple": 8,
             "labels_dtype": "int64",
-            "hidden": 6144,
-            "vocab": 154880,
+            "hidden": None,
+            "vocab": None,
             "logits_cluster_ctas": 2,
             "dx_cluster_ctas": 2,
             "dw_cluster_ctas": 2,
+            "logits_item_cols": 256,
+            "dx_item_cols": 512,
+            "dw_item_cols": 512,
+            "logits_group_m": 32,
+            "dx_group_m": 16,
+            "dw_group_m": 2,
         },
-        "gemm_logits": {
-            "module": "cake_lm_head_loss_10a742f15238dce376fa",
-            "sources": [
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_10a742f15238dce376fa_kernel.cu",
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_10a742f15238dce376fa_binding.cu",
+        "stages": {
+            "gather_rows_bf16": [
+                "7190e3804a8d4d9e457f",
+                "gather_rows_bf16",
+                "b256_c1",
+                "max(1, min(num_rows*row_vecs/2048, num_rows, 65535))",
+                1,
+                1,
             ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["tma_buffer", "A"],
-                ["tma_buffer", "B"],
-                ["tma_buffer", "C"],
-                ["buffer", "STATS_OUT"],
-                ["parameter", "M"],
-                ["parameter", "m_tiles"],
-                ["parameter", "k_iters"],
-                ["parameter", "first_chunk"],
-                ["buffer", "WS"],
-                ["parameter", "ws_slab"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
+            "gemm_logits": [
+                "248443ecff7fe356dfc3",
+                "gemm_dx",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
             ],
-            "closure_sha256": "11f62f83e4cd185046ff29491b3f6fabc5af933934f602b9f98ff52932383c72",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["max(1, m_tiles//2*605)*2", 1, 1],
-            "launch": {"block": [224, 1, 1], "cluster": [2, 1, 1]},
+            "gemm_logits_mcnt": [
+                "447c06e2b0318df9f18d",
+                "gemm_dx",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
+            "gemm_logits_nostats": [
+                "b2623ecbbf9efcbb6ae9",
+                "gemm_dx",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
+            "gemm_logits_nostats_mcnt": [
+                "f117e681253013a29176",
+                "gemm_dx",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
+            "row_finalize": [
+                "61ea8de378a85bd5c55c",
+                "row_finalize",
+                "b256_c1",
+                "rows_c/8",
+                1,
+                1,
+            ],
+            "loss_reduce": ["e03bef31303e0675324f", "loss_reduce", "b256_c1", 1, 1, 1],
+            "row_grad": [
+                "8eccf1c4d61d3cd4f354",
+                "row_grad",
+                "b128_c1",
+                "max(1, V//8/1024)",
+                "rows_c",
+                1,
+            ],
+            "gemm_dx": [
+                "962c476faea73269ee31",
+                "gemm_dx",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*2",
+                1,
+                1,
+            ],
+            "gemm_dx_s": [
+                "ab2405f84e01186198a2",
+                "gemm_dx_2",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512)*k_slices)*2",
+                1,
+                1,
+            ],
+            "gemm_dx_tn256": [
+                "a041856ad1ab94905b82",
+                "gemm_dx",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "gemm_dx_s_tn256": [
+                "1cc43cee29170c2dd18f",
+                "gemm_dx_2",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512)*k_slices)*4",
+                1,
+                1,
+            ],
+            "gemm_dx_st3": [
+                "d25c462221a5bc5ee763",
+                "gemm_dx",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*2",
+                1,
+                1,
+            ],
+            "gemm_dx_s_st3": [
+                "148ac7a6958d17343647",
+                "gemm_dx_2",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512)*k_slices)*2",
+                1,
+                1,
+            ],
+            "slab_sum": [
+                "dc45b3bd617f038cbddb",
+                "slab_sum",
+                "b256_c1",
+                "max(1, min(num_vecs/2048, 65535))",
+                1,
+                1,
+            ],
+            "gemm_dw_acc": [
+                "5d3dbf4fbe18c2482cc4",
+                "gemm_logits",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "gemm_dw_acc_gn": [
+                "25c7f195ad7707f95e1c",
+                "gemm_logits",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "gemm_dw_cast_bf16": [
+                "0a540692be2ea00ec27a",
+                "gemm_logits",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "gemm_dw_cast_f32": [
+                "d9f38f99742d43df9556",
+                "gemm_logits",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "gemm_dw_cast_f32_gn": [
+                "074c355c5fc9d8b80f4c",
+                "gemm_logits",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "scale_cast_bf16": [
+                "bcd42bd5bff332946d74",
+                "scale_cast_bf16",
+                "b256_c1",
+                "max(1, min(num_vecs/2048, 65535))",
+                1,
+                1,
+            ],
+            "scale_cast_f32": [
+                "6b467ba2de9494ed17b9",
+                "scale_cast_bf16",
+                "b256_c1",
+                "max(1, min(num_vecs/2048, 65535))",
+                1,
+                1,
+            ],
+            "scale_cast_scatter_bf16": [
+                "275a488848d6bb32998f",
+                "scale_cast_scatter_bf16",
+                "b256_c1",
+                "max(1, min(num_rows*row_vecs/2048, num_rows, 65535))",
+                1,
+                1,
+            ],
         },
-        "gemm_logits_nostats": {
-            "module": "cake_lm_head_loss_47fd8ba4f5d359a9292c",
-            "sources": [
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_47fd8ba4f5d359a9292c_kernel.cu",
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_47fd8ba4f5d359a9292c_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["tma_buffer", "A"],
-                ["tma_buffer", "B"],
-                ["tma_buffer", "C"],
-                ["buffer", "STATS_OUT"],
-                ["parameter", "M"],
-                ["parameter", "m_tiles"],
-                ["parameter", "k_iters"],
-                ["parameter", "first_chunk"],
-                ["buffer", "WS"],
-                ["parameter", "ws_slab"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "e6870b24239c203ca5f7a0c9382362551a6cee04ce929aa9fa30b97e1e1a1607",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["max(1, m_tiles//2*605)*2", 1, 1],
-            "launch": {"block": [224, 1, 1], "cluster": [2, 1, 1]},
-        },
-        "row_finalize": {
-            "module": "cake_lm_head_loss_eadb84f9fd90929a2ed2",
-            "sources": [
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_eadb84f9fd90929a2ed2_kernel.cu",
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_eadb84f9fd90929a2ed2_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "stats"],
-                ["buffer", "z"],
-                ["buffer", "labels"],
-                ["buffer", "infer_logp"],
-                ["buffer", "loss_weights"],
-                ["buffer", "d_in"],
-                ["buffer", "lse"],
-                ["buffer", "logp"],
-                ["buffer", "d"],
-                ["buffer", "term"],
-                ["parameter", "rows_c"],
-                ["parameter", "row0"],
-                ["parameter", "V"],
-                ["parameter", "num_tiles"],
-                ["parameter", "mode"],
-                ["parameter", "loss_div"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "f4d70a08579804822ed8c7f49b313c5b93bf4f29792a22d83d35c9187bf210fd",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["rows_c/8", 1, 1],
-            "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
-        },
-        "loss_reduce": {
-            "module": "cake_lm_head_loss_045eda29d291bc0ca03e",
-            "sources": [
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_045eda29d291bc0ca03e_kernel.cu",
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_045eda29d291bc0ca03e_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "term"],
-                ["buffer", "loss_acc"],
-                ["buffer", "loss_out"],
-                ["parameter", "rows_c"],
-                ["parameter", "first_chunk"],
-                ["parameter", "last_chunk"],
-                ["parameter", "mode"],
-                ["parameter", "loss_div"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "640bc9bc6efc821fd76dd6deca62175fbcf70f6349b96940a8e4d999654dde74",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": [1, 1, 1],
-            "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
-        },
-        "row_grad": {
-            "module": "cake_lm_head_loss_9fb02bcaacbe1871aae8",
-            "sources": [
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_9fb02bcaacbe1871aae8_kernel.cu",
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_9fb02bcaacbe1871aae8_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "z"],
-                ["buffer", "labels"],
-                ["buffer", "lse"],
-                ["buffer", "d"],
-                ["parameter", "row0"],
-                ["parameter", "d_off"],
-                ["parameter", "V"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "5d03137bc87ce5a00306435c35db2f54385c5bafb209f4aea6cd04e4ecafc19d",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["max(1, V//8/1024)", "rows_c", 1],
-            "launch": {"block": [128, 1, 1], "cluster": [1, 1, 1]},
-        },
-        "gemm_dx": {
-            "module": "cake_lm_head_loss_31237132a0cf5c909f23",
-            "sources": [
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_31237132a0cf5c909f23_kernel.cu",
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_31237132a0cf5c909f23_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["tma_buffer", "A"],
-                ["tma_buffer", "B"],
-                ["buffer", "C"],
-                ["buffer", "STATS_OUT"],
-                ["parameter", "M"],
-                ["parameter", "m_tiles"],
-                ["parameter", "k_iters"],
-                ["parameter", "first_chunk"],
-                ["buffer", "WS"],
-                ["parameter", "ws_slab"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "536bc3b65d7d53283cda758ab069fa976f06067ae2de72d215f8e25dcd307faf",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["max(1, m_tiles//2*24)*2", 1, 1],
-            "launch": {"block": [224, 1, 1], "cluster": [2, 1, 1]},
-        },
-        "gemm_dx_s2": {
-            "module": "cake_lm_head_loss_e91e55bd8eea8ce48c3a",
-            "sources": [
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_e91e55bd8eea8ce48c3a_kernel.cu",
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_e91e55bd8eea8ce48c3a_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["tma_buffer", "A"],
-                ["tma_buffer", "B"],
-                ["buffer", "C"],
-                ["buffer", "STATS_OUT"],
-                ["parameter", "M"],
-                ["parameter", "m_tiles"],
-                ["parameter", "k_iters"],
-                ["parameter", "first_chunk"],
-                ["buffer", "WS"],
-                ["parameter", "ws_slab"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "d96d2a73be22e9d1d03e513e562cad2361c8cb99367a32873cc097f7a981c570",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["max(1, m_tiles//2*48)*2", 1, 1],
-            "launch": {"block": [224, 1, 1], "cluster": [2, 1, 1]},
-        },
-        "gemm_dx_s3": {
-            "module": "cake_lm_head_loss_698bb599ab0d988b560e",
-            "sources": [
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_698bb599ab0d988b560e_kernel.cu",
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_698bb599ab0d988b560e_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["tma_buffer", "A"],
-                ["tma_buffer", "B"],
-                ["buffer", "C"],
-                ["buffer", "STATS_OUT"],
-                ["parameter", "M"],
-                ["parameter", "m_tiles"],
-                ["parameter", "k_iters"],
-                ["parameter", "first_chunk"],
-                ["buffer", "WS"],
-                ["parameter", "ws_slab"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "ee4d8df614ba16084993ab0c9ce25727384485b1d6ab5520f0fc97d60866b4f0",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["max(1, m_tiles//2*72)*2", 1, 1],
-            "launch": {"block": [224, 1, 1], "cluster": [2, 1, 1]},
-        },
-        "gemm_dx_s4": {
-            "module": "cake_lm_head_loss_b9eee151a0ed95d66320",
-            "sources": [
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_b9eee151a0ed95d66320_kernel.cu",
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_b9eee151a0ed95d66320_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["tma_buffer", "A"],
-                ["tma_buffer", "B"],
-                ["buffer", "C"],
-                ["buffer", "STATS_OUT"],
-                ["parameter", "M"],
-                ["parameter", "m_tiles"],
-                ["parameter", "k_iters"],
-                ["parameter", "first_chunk"],
-                ["buffer", "WS"],
-                ["parameter", "ws_slab"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "5a88c074bc3f4b8e611345ad9777c5b8ef60b6518d1aba61526d96aef663470b",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["max(1, m_tiles//2*96)*2", 1, 1],
-            "launch": {"block": [224, 1, 1], "cluster": [2, 1, 1]},
-        },
-        "gemm_dw_acc": {
-            "module": "cake_lm_head_loss_310d7c7d16f409e18c02",
-            "sources": [
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_310d7c7d16f409e18c02_kernel.cu",
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_310d7c7d16f409e18c02_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["tma_buffer", "A"],
-                ["tma_buffer", "B"],
-                ["tma_buffer", "C"],
-                ["buffer", "STATS_OUT"],
-                ["parameter", "M"],
-                ["parameter", "m_tiles"],
-                ["parameter", "k_iters"],
-                ["parameter", "first_chunk"],
-                ["buffer", "WS"],
-                ["parameter", "ws_slab"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "554b296002dbd0f94fda27cff3e7198c874f1db09dd2c29cf0827a1c79d4c3cd",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["max(1, m_tiles//2*24)*2", 1, 1],
-            "launch": {"block": [224, 1, 1], "cluster": [2, 1, 1]},
-        },
-        "scale_cast_bf16": {
-            "module": "cake_lm_head_loss_c98313fd7f02b0482483",
-            "sources": [
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_c98313fd7f02b0482483_kernel.cu",
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_c98313fd7f02b0482483_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "acc"],
-                ["buffer", "g"],
-                ["buffer", "out"],
-                ["parameter", "num_vecs"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "2b7c0982cde8dfc7c8affac27f5d812c633fcc34a65d2a3cd41e8471d4571e90",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["max(1, min(num_vecs/2048, 65535))", 1, 1],
-            "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
-        },
-        "scale_cast_f32": {
-            "module": "cake_lm_head_loss_8ea3692f8bbd9e79b4d6",
-            "sources": [
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_8ea3692f8bbd9e79b4d6_kernel.cu",
-                "cake_lm_head_loss/sm_103a/cake_lm_head_loss_8ea3692f8bbd9e79b4d6_binding.cu",
-            ],
-            "compile_flags": [],
-            "ffi_entry": "run",
-            "arg_plan": [
-                ["buffer", "acc"],
-                ["buffer", "g"],
-                ["buffer", "out"],
-                ["parameter", "num_vecs"],
-                ["grid", "grid_x"],
-                ["grid", "grid_y"],
-                ["grid", "grid_z"],
-            ],
-            "closure_sha256": "e06e926da9e457b15f3485090dbb1741bfacf2a77eb8398bd7de4a63522e0900",
-            "tma_workspace_bytes": 0,
-            "workspace_bytes": 0,
-            "grid": ["max(1, min(num_vecs/2048, 65535))", 1, 1],
-            "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
-        },
-        "closure_sha256": "f41f604111968dd454099418cb457e20bacba2616b8355da4bad38e0803fe149",
     },
 }
+# --- end generated registry ---
+
+STAGE_ROW_FIELDS = (
+    "unit",
+    "arg_plan",
+    "launch",
+    "grid_x",
+    "grid_y",
+    "grid_z",
+)
+
+
+def library_stem(unit: str) -> str:
+    """Architecture-free library stem of the generated program of ``unit``; ``build.json`` names the
+    per-architecture build ``<stem>_<arch>`` (:func:`library_name`)."""
+    return f"cake_lm_head_loss_{unit}"
+
+
+def _expand_registry(
+    registry: dict[str, dict[str, Any]],
+    arg_plans: dict[str, list[list[str]]],
+    launches: dict[str, dict[str, list[int]]],
+) -> dict[str, dict[str, Any]]:
+    """The per-stage physical records of every program from the compact tables.
+
+    Self-contained by contract with the Cake exporter: ``exports/lm_head_loss/export.py``
+    ``_scaffold_expansion`` executes only ``STAGE_ROW_FIELDS`` and this function (extracted from the
+    scaffold at ``TARGET_REVISION``) to check that the compact tables it renders expand to the physical
+    records, so this body may use its parameters, ``STAGE_ROW_FIELDS`` and builtins only -- no other
+    module-level name (``library_stem`` is spelled out as the f-string below for that reason).
+    """
+    modules: dict[str, dict[str, Any]] = {}
+    for name, compact in registry.items():
+        arch = compact["arch"]
+        record: dict[str, Any] = {
+            "arch": arch,
+            "abi": compact["abi"],
+            "stages": list(compact["stages"]),
+            "geometry": dict(compact["geometry"]),
+        }
+        for stage, row in compact["stages"].items():
+            if len(row) not in (len(STAGE_ROW_FIELDS), len(STAGE_ROW_FIELDS) + 1):
+                raise ValueError(f"{name}/{stage}: malformed registry row {row!r}")
+            unit, plan, launch, grid_x, grid_y, grid_z = row[: len(STAGE_ROW_FIELDS)]
+            extra = (
+                dict(row[len(STAGE_ROW_FIELDS)])
+                if len(row) > len(STAGE_ROW_FIELDS)
+                else {}
+            )
+            physical: dict[str, Any] = {
+                "module": f"cake_lm_head_loss_{unit}",
+                "library": f"cake_lm_head_loss_{unit}",
+                "ffi_entry": extra.pop("ffi_entry", "run"),
+                "arg_plan": [list(item) for item in arg_plans[plan]],
+                "tma_workspace_bytes": int(extra.pop("tma_workspace_bytes", 0)),
+                "workspace_bytes": int(extra.pop("workspace_bytes", 0)),
+                "grid": [grid_x, grid_y, grid_z],
+                "launch": {key: list(value) for key, value in launches[launch].items()},
+            }
+            physical.update(extra)
+            record[stage] = physical
+        modules[name] = record
+    return modules
+
+
+MODULES: dict[str, dict[str, Any]] = _expand_registry(_REGISTRY, _ARG_PLANS, _LAUNCHES)
 
 # Kernel stages of one token chunk of the training step, in launch order.
 #
@@ -799,61 +709,186 @@ MODULES: dict[str, dict[str, Any]] = {
 # ``row_grad``             dz_c = d_t * (1[v = y_t] - exp(z - lse_t)) in bf16,
 #                          in place over ``z_c``; ignored rows become zero.
 # ``gemm_dx``              dX_acc[rows] = fp32(dz_c @ W).
-# ``gemm_dx_s2`` .. ``_s4``  the same GEMM as 2 / 3 / 4 K-slice work items per output
-#                          tile (slice 0 writes dX_acc, slices >= 1 write FP32
-#                          workspace slabs the host adds in fixed order); the
-#                          host picks the slice count per chunk from its row
-#                          count and the SM count.  Optional (a contiguous
-#                          prefix may be registered).
+# ``gemm_dx_s``            the same GEMM as ``k_slices`` (2 .. 4, a launch scalar)
+#                          K-slice work items per output tile (slice 0 writes
+#                          dX_acc, slices >= 1 write FP32 workspace slabs the
+#                          host adds in fixed order); the host picks the slice
+#                          count per chunk from its row count and the SM count.
 # ``gemm_dw_acc``          dW_acc (=|+=) fp32(dz_c^T @ X_c): store on the first
 #                          chunk, accumulate afterwards (chunk order = the
 #                          reduction order, no atomics).
+# ``gemm_dw_cast_bf16``    the LAST chunk's dz_c^T @ X_c with the upstream scale
+# ``gemm_dw_cast_f32``     and the output cast fused into the epilogue:
+#                          dW = cast(g * (dW_acc + tile)) -- or cast(g * tile)
+#                          for a one-chunk plan -- run in the backward where
+#                          g is known (fuse_dw_cast; bitwise gemm_dw_acc +
+#                          scale_cast, one pass over dW fewer).
 # ``scale_cast_bf16``      out = bf16(g * acc) over a flat fp32 accumulator
 # ``scale_cast_f32``       out = g * acc (fp32) -- the single output cast of
 #                          ``dW`` (either) and ``dX`` (bf16) in the backward.
+# ``gather_rows_bf16``     chunk 0's row gather of the hidden valid-row count
+#                          path: out[r] = X[idx[r]] for r < min(count, num_rows)
+#                          with the count read from device memory, exact zeros
+#                          after (launched before chunk 0's logits GEMM).
+# ``gemm_logits_mcnt``     the logits GEMMs (with / without the statistics)
+# ``gemm_logits_nostats_mcnt``  whose valid-row bound is read from device
+#                          memory: chunk 0's GEMM of the hidden valid-row count
+#                          path, its stores bounded by min(count, M) while M is
+#                          the buffer extent min(chunk, T).
 #
 # A record registers the subset its program uses; the host refuses an entry
 # point whose stages are missing.
 STAGES = (
+    "gather_rows_bf16",
+    "gemm_logits",
+    "gemm_logits_mcnt",
+    "gemm_logits_nostats",
+    "gemm_logits_nostats_mcnt",
+    "row_finalize",
+    "loss_reduce",
+    "row_grad",
+    "gemm_dx",
+    "gemm_dx_s",
+    "gemm_dx_tn256",
+    "gemm_dx_s_tn256",
+    "gemm_dx_st3",
+    "gemm_dx_s_st3",
+    "slab_sum",
+    "gemm_dw_acc",
+    "gemm_dw_acc_gn",
+    "gemm_dw_cast_bf16",
+    "gemm_dw_cast_f32",
+    "gemm_dw_cast_f32_gn",
+    "scale_cast_bf16",
+    "scale_cast_f32",
+    "scale_cast_scatter_bf16",
+)
+# The base stages (one per kernel role of the chunk loop).  Every other name in
+# ``STAGES`` is a structural FORM of a base GEMM stage -- a distinct kernel body,
+# named by the outputs of the host's per-chunk instance rules that select one
+# (``cake_backend.stage_variant``): ``_mcnt`` the device-count form of the
+# logits GEMMs (the hidden valid-row count path's chunk 0), ``_s`` the K-sliced
+# dX GEMM (2 .. 4 K-slice work items per output tile), ``_tn256`` the narrow
+# tile and ``_st3`` the 3-deep operand ring of the dX GEMM, ``_gn`` the 2-D
+# blocked raster of the weight-gradient accumulate / fp32 fused cast.  The
+# call geometry (``H`` / ``V``) and the rules' numeric outputs -- the slice
+# count, the raster height ``group_m``, the block width ``group_n`` -- are
+# launch scalars of these kernels (``cake_backend.gemm_scalars``), so one
+# record per architecture serves every admissible geometry.  A record
+# registers the base stages plus the forms its architecture's rules can
+# reach.  ``slab_sum`` (the fixed-order slab reduction of a K-sliced dX GEMM)
+# and ``scale_cast_scatter_bf16`` (the one-pass scale, cast and scatter of a
+# compacted ``dX``) are the fused dX finalize's kernels
+# (``cake_backend.DX_FINALIZE_STAGES``); row kernels, geometry-generic.
+# ``gather_rows_bf16`` (chunk 0's row gather of the hidden valid-row count path,
+# ``cake_backend.HIDDEN_COUNT_STAGE``) is a row kernel too.
+BASE_STAGES = (
+    "gather_rows_bf16",
     "gemm_logits",
     "gemm_logits_nostats",
     "row_finalize",
     "loss_reduce",
     "row_grad",
     "gemm_dx",
-    "gemm_dx_s2",
-    "gemm_dx_s3",
-    "gemm_dx_s4",
+    "slab_sum",
     "gemm_dw_acc",
+    "gemm_dw_cast_bf16",
+    "gemm_dw_cast_f32",
     "scale_cast_bf16",
     "scale_cast_f32",
+    "scale_cast_scatter_bf16",
 )
-GEMM_STAGES = ("gemm_logits", "gemm_logits_nostats", "gemm_dx", "gemm_dx_s2", "gemm_dx_s3", "gemm_dx_s4", "gemm_dw_acc")
-ROW_STAGES = ("row_finalize", "loss_reduce", "row_grad", "scale_cast_bf16", "scale_cast_f32")
-ARCH_NVCC_FLAGS = {
-    "sm_100a": sm100a_nvcc_flags,
-    "sm_103a": sm103a_nvcc_flags,
-}
+GEMM_STAGES = tuple(stage for stage in STAGES if stage.startswith("gemm_"))
+ROW_STAGES = (
+    "gather_rows_bf16",
+    "row_finalize",
+    "loss_reduce",
+    "row_grad",
+    "slab_sum",
+    "scale_cast_bf16",
+    "scale_cast_f32",
+    "scale_cast_scatter_bf16",
+)
 
 
-def toolchain_supports(arch: str) -> bool:
-    """Can the nvcc this checkout invokes emit ``arch``?  (SM100 / SM103 only.)"""
-    return arch in ARCH_NVCC_FLAGS
+def toolchain_runs_hidden_count(arch: str) -> bool:
+    """Does the hidden valid-row count (``cake_backend.hidden_count_eligible``) run on ``arch`` with the CUDA
+    toolkit that built (or will build) this package's libraries?
+
+    On CUDA 13.0 the sm_103a programs are built at ptxas -O0 (``build.json`` carries ``["-Xptxas", "-O0"]``
+    under ``nvcc_flags_if`` for ``cuda == 13.0``: that toolchain's ptxas mis-schedules the sm_103a 2-CTA TMA
+    producer loops of these programs, see the package README).  The -O1 code completed the focused dW
+    accumulate calls and the test file's shipped call schedule, but with the hidden count's schedule -- the
+    compaction index, chunk 0's row gather and device-count logits GEMM queued before the count is read back --
+    the test file still reaches a ``cudaErrorIllegalInstruction`` from the cluster launch of the dW accumulate
+    GEMM at its shortest K schedule (the one-row tail chunk of a two-chunk call), in every run; with the host
+    count it passes, as does the -O0 code with the hidden count.  So on CUDA 13.0 the sm_103a calls take the
+    host-count path (the same kernels per row, so bitwise the same outputs; the count and the index are formed
+    on the host before the first launch).  Every other architecture / toolchain pair runs the hidden count.  A
+    mitigation of the ptxas 13.0 fault as observed, not a root-cause fix.
+
+    The toolkit version is :func:`cake_build.record_cuda_version`: the version that built the prebuilt
+    libraries (``aot/build_info.json``) when the package ships them, else the local toolkit of the JIT path.
+    """
+    if arch != "sm_103a":
+        return True
+    return tuple(cake_build.record_cuda_version(arch)) != (13, 0)
 
 
-def select_module(arch: str) -> str:
-    """Return the registered module name for ``arch``."""
+PRIMARY_RECORD = "cake_lm_head_loss_{arch}"  # the architecture's record (geometry-free: H / V are launch scalars)
+
+
+def record_geometry(record: dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
+    """``(hidden, vocab)`` a record's GEMM instances are specialized to (``None`` = any multiple)."""
+    geometry = record.get("geometry", {})
+    hidden, vocab = geometry.get("hidden"), geometry.get("vocab")
+    return (
+        None if hidden is None else int(hidden),
+        None if vocab is None else int(vocab),
+    )
+
+
+def select_module(
+    arch: str, hidden: Optional[int] = None, vocab: Optional[int] = None
+) -> str:
+    """Return the registered module name for ``arch`` -- the record specialized to the
+    ``(hidden, vocab)`` geometry when given (a record pinned to neither accepts any), else
+    the sole record of the architecture or its default-geometry record ``PRIMARY_RECORD``."""
     names = [name for name, record in MODULES.items() if record["arch"] == arch]
-    if len(names) > 1:
-        raise NotImplementedError(
-            f"{arch} registers more than one chunked LM-head program: {names}"
-        )
     if not names:
         raise NotImplementedError(
             f"The generated chunked LM-head + loss program for {arch} is not "
             "registered in this checkout yet (see flashinfer-ai/flashinfer#5680)"
         )
-    return names[0]
+    if hidden is None and vocab is None:
+        if len(names) == 1:
+            return names[0]
+        primary = PRIMARY_RECORD.format(arch=arch)
+        if primary in names:
+            return primary
+        raise NotImplementedError(
+            f"{arch} registers more than one chunked LM-head program and no default-geometry "
+            f"record {primary!r}: {names}; select by hidden= / vocab="
+        )
+
+    def matches(record):
+        pinned_h, pinned_v = record_geometry(record)
+        return (pinned_h is None or hidden is None or pinned_h == int(hidden)) and (
+            pinned_v is None or vocab is None or pinned_v == int(vocab)
+        )
+
+    found = [name for name in names if matches(MODULES[name])]
+    if len(found) > 1:
+        raise NotImplementedError(
+            f"{arch} registers more than one chunked LM-head program for H = {hidden}, V = {vocab}: {found}"
+        )
+    if not found:
+        registered = sorted(record_geometry(MODULES[name]) for name in names)
+        raise ValueError(
+            f"the registered chunked LM-head programs for {arch} are specialized to (H, V) in {registered}, "
+            f"got H = {hidden}, V = {vocab}"
+        )
+    return found[0]
 
 
 def registered_stages(name: str) -> tuple[str, ...]:
@@ -867,45 +902,21 @@ def registered_stages(name: str) -> tuple[str, ...]:
     return present
 
 
-def _header_dirs():
-    installed = [jit_env.FLASHINFER_CSRC_DIR, jit_env.FLASHINFER_INCLUDE_DIR]
-    if (installed[0] / "tvm_ffi_utils.h").is_file() and (
-        installed[1] / "flashinfer/layout.cuh"
-    ).is_file():
-        return installed
-    checkout = Path(__file__).resolve().parents[3]
-    source = [checkout / "csrc", checkout / "include"]
-    if (source[0] / "tvm_ffi_utils.h").is_file() and (
-        source[1] / "flashinfer/layout.cuh"
-    ).is_file():
-        return source
-    raise FileNotFoundError("FlashInfer binding headers were not found")
-
-
-@functools.cache
-def gen_cake_lm_head_loss_module(name: str, stage: str):
+def library_name(name: str, stage: str) -> str:
+    """``build.json`` entry of ``stage`` of record ``name``: the stage's library stem plus the record's
+    architecture (``cake_lm_head_loss_<unit>_<arch>``)."""
     record = MODULES[name]
-    if not toolchain_supports(record["arch"]):
-        raise RuntimeError(
-            f"generated chunked LM-head program {name!r} targets {record['arch']}, "
-            "which this checkout cannot compile"
-        )
-    physical = record[stage]
-    root = Path(__file__).resolve().parent / "csrc"
-    sources = [root / relative for relative in physical["sources"]]
-    return gen_jit_spec(
-        name=f"{name}_{stage}_" + physical["closure_sha256"][:20],
-        sources=sources,
-        extra_cuda_cflags=[
-            *ARCH_NVCC_FLAGS[record["arch"]],
-            *physical["compile_flags"],
-        ],
-        extra_ldflags=["-lcuda"],
-        extra_include_paths=[root, *[p.parent for p in sources], *_header_dirs()],
-        use_fast_math=False,
-    )
+    return f"{record[stage]['library']}_{record['arch']}"
 
 
 @functools.cache
 def load_cake_lm_head_loss_module(name: str, stage: str):
-    return gen_cake_lm_head_loss_module(name, stage).build_and_load()
+    """Load (once per record and stage) the generated program of ``stage``: the prebuilt library under
+    ``aot/`` when the package ships it, else FlashInfer's JIT build of its ``build.json`` entry."""
+    return cake_build.load_library(library_name(name, stage))
+
+
+def specs_for_arch(arch: str):
+    """JIT specs of every ``build.json`` entry of ``arch`` without a prebuilt library (the
+    ``flashinfer.jit.build_jit_specs`` warm-up)."""
+    return cake_build.jit_specs(arch)

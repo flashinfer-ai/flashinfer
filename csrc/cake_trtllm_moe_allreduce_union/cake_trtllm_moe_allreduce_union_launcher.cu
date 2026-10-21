@@ -22,15 +22,18 @@
 //
 //   CAKE_UNION_KERNEL      the extern "C" kernel symbol
 //   CAKE_UNION_DTYPE       __half or __nv_bfloat16
-//   CAKE_UNION_WORLD_SIZE  2, 4 or 8 (number of per-rank workspace parameters)
+//   CAKE_UNION_WORLD_SIZE  2, 4 or 8 (ranks of the collective)
 //   CAKE_UNION_BLOCK       threads per CTA (224 or 896)
 //   CAKE_UNION_CLUSTER     CTAs per cluster (4 or 1)
 //
 // PDL and the cooperative launch are runtime flags.  The kernels read every
 // workspace address from the device pointer table (``workspace_tensor``); the
-// remaining kernel parameters (``workspace_control``, ``workspace_payload_*``,
-// ``quant_out``, ``scale_out``, ``scale_factor``, ``layout_code``) are part of
-// the generated signature but never read, so the launcher passes null / zero.
+// typed control / per-peer payload origins are host-only resource arguments
+// of the Cake source program and are not part of the generated signature.  The
+// union builds emit no quant output, so the generated signature carries
+// neither the quant pointers nor their scalars.  Every union kernel stores the
+// all-reduce output; a caller without ``moe_allreduce_out`` is given a
+// loader-owned scratch tensor by ``run_cake_moe_allreduce_union``.
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -59,22 +62,12 @@ namespace {
 
 using T = CAKE_UNION_DTYPE;
 
-#if CAKE_UNION_WORLD_SIZE == 2
-#define CAKE_UNION_PAYLOAD_PARAMS T*, T*
-#elif CAKE_UNION_WORLD_SIZE == 4
-#define CAKE_UNION_PAYLOAD_PARAMS T*, T*, T*, T*
-#else
-#define CAKE_UNION_PAYLOAD_PARAMS T*, T*, T*, T*, T*, T*, T*, T*
-#endif
-
 }  // namespace
 
 extern "C" __global__ void CAKE_UNION_KERNEL(
     T* active_expert_tokens, float* expert_scales, T* token_input, T* residual, T* gamma,
-    T* moe_allreduce_out, T* residual_out, T* norm_out, T* quant_out, T* scale_out,
-    long long* workspace_tensor, int* workspace_control, CAKE_UNION_PAYLOAD_PARAMS, int world_rank,
-    int tokens, int active_experts, float epsilon, float weight_bias, float scale_factor,
-    int layout_code);
+    T* moe_allreduce_out, T* residual_out, T* norm_out, long long* workspace_tensor,
+    int world_rank, int tokens, int active_experts, float epsilon, float weight_bias);
 
 namespace cake_trtllm_moe_allreduce_union {
 
@@ -142,21 +135,15 @@ void Run(TensorView active_expert_tokens, TensorView expert_scales, TensorView t
   T* p_token_input = static_cast<T*>(token_input.data_ptr());
   T* p_residual = static_cast<T*>(residual.data_ptr());
   T* p_gamma = static_cast<T*>(gamma.data_ptr());
-  T* p_moe_allreduce_out = static_cast<T*>(moe_allreduce_out.data_ptr());
   T* p_residual_out = static_cast<T*>(residual_out.data_ptr());
   T* p_norm_out = static_cast<T*>(norm_out.data_ptr());
-  T* p_quant_out = nullptr;
-  T* p_scale_out = nullptr;
+  T* p_moe_allreduce_out = static_cast<T*>(moe_allreduce_out.data_ptr());
   long long* p_workspace_tensor = static_cast<long long*>(workspace_tensor.data_ptr());
-  int* p_workspace_control = nullptr;
-  T* p_payload[CAKE_UNION_WORLD_SIZE] = {};
   int32_t v_world_rank = static_cast<int32_t>(world_rank);
   int32_t v_tokens = static_cast<int32_t>(tokens);
   int32_t v_active_experts = static_cast<int32_t>(active_experts);
   float v_epsilon = static_cast<float>(epsilon);
   float v_weight_bias = static_cast<float>(weight_bias);
-  float v_scale_factor = 0.0f;
-  int32_t v_layout_code = 0;
 
   void* kargs[] = {
       &p_active_expert_tokens,
@@ -167,29 +154,12 @@ void Run(TensorView active_expert_tokens, TensorView expert_scales, TensorView t
       &p_moe_allreduce_out,
       &p_residual_out,
       &p_norm_out,
-      &p_quant_out,
-      &p_scale_out,
       &p_workspace_tensor,
-      &p_workspace_control,
-      &p_payload[0],
-      &p_payload[1],
-#if CAKE_UNION_WORLD_SIZE >= 4
-      &p_payload[2],
-      &p_payload[3],
-#endif
-#if CAKE_UNION_WORLD_SIZE == 8
-      &p_payload[4],
-      &p_payload[5],
-      &p_payload[6],
-      &p_payload[7],
-#endif
       &v_world_rank,
       &v_tokens,
       &v_active_experts,
       &v_epsilon,
       &v_weight_bias,
-      &v_scale_factor,
-      &v_layout_code,
   };
 
   cudaLaunchAttribute attrs[4]{};

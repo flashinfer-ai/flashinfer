@@ -1,5 +1,7 @@
 """Selected packed-input and workspace preparation; no compiler or oracle dependency."""
 
+import math
+
 BLOCK_M = 128
 BLOCK_N = 128
 BLOCK_K = 256
@@ -9,6 +11,29 @@ ALIGN_M = 256
 DISP_NUM_EXPERTS_MAX = 384
 
 
+def _source_block_m(num_tokens: int, num_experts: int, top_k: int) -> int:
+    """Expert tile height of the source schedule for a single-rank model row.
+
+    Mirrors the generator's heuristic: 16 rows up to ten expected tokens per
+    expert, 32 rows up to 24, then the smallest wide candidate whose tile
+    count covers the expected load plus one standard deviation.
+    """
+    expected = num_tokens * top_k / num_experts
+    if expected <= 10:
+        return 16
+    if expected <= 24:
+        return 32
+    covered = expected + math.sqrt(expected)
+    num_blocks = math.ceil(covered / 240)
+    if num_blocks == 1 and covered > 192 and num_experts < 14:
+        num_blocks = 2
+    return next(
+        candidate
+        for candidate in (64, 128, 192, 240)
+        if num_blocks * candidate >= covered
+    )
+
+
 def _mega_dispatch_reference(
     topk_idx, num_experts: int, align_m: int = ALIGN_M, block_m: int = BLOCK_M
 ):
@@ -16,7 +41,8 @@ def _mega_dispatch_reference(
     row offsets, tile list, and total M. Row assignment within an expert is
     runtime-nondeterministic (atomic claim order), so pool/metadata are checked
     via token_to_permuted, not by fixed row — this returns only the
-    order-independent quantities."""
+    order-independent quantities. A negative id routes its slot to no expert
+    (a masked token) and takes no row."""
     import torch
 
     T, TK = topk_idx.shape
@@ -24,7 +50,9 @@ def _mega_dispatch_reference(
     ids = topk_idx.cpu()
     for t in range(T):
         for k in range(TK):
-            counts[int(ids[t, k].item())] += 1
+            expert = int(ids[t, k].item())
+            if expert >= 0:
+                counts[expert] += 1
     pad = ((counts + align_m - 1) // align_m) * align_m
     offsets = torch.zeros(num_experts, dtype=torch.int64)
     running = 0
@@ -125,12 +153,15 @@ def prepare_pipeline_bindings(inputs, num_sms):
         and (not capture_l1)
         and ((E, TK, H, I) == (384, 6, 5120, 2304))
     )
-    source_blocks = E + (T * TK + 15) // 16
+    source_block_m = _source_block_m(T, E, TK)
+    source_blocks = E + (T * TK + source_block_m - 1) // source_block_m
     N1, K1, N2, K2 = (2 * I, H, H, I)
     grid_n1, K1_tiles = (N1 // BLOCK_N, K1 // BLOCK_K)
     grid_n2, K2_tiles = (N2 // BLOCK_N, K2 // BLOCK_K)
     ref = _mega_dispatch_reference(inputs["topk_idx"], E)
-    M_total = ref["M_total"]
+    # A batch whose every slot is -1 routes no row; its pools keep one aligned
+    # block so that their tensor maps stay valid.
+    M_total = max(ref["M_total"], ALIGN_M)
     total_m_tiles = ref["total_m_tiles"]
     topk_idx_i32 = inputs["topk_idx"].contiguous().view(torch.int32)
     topk_weights_flat = inputs["topk_weights"].contiguous().view(-1)
@@ -159,6 +190,10 @@ def prepare_pipeline_bindings(inputs, num_sms):
     persistent_grid = max(CTA_GROUP, min(num_sms - num_sms % CTA_GROUP, num_tiles))
     if persistent_grid % CTA_GROUP != 0:
         persistent_grid += CTA_GROUP - persistent_grid % CTA_GROUP
+    if source_schedule:
+        # The source schedule runs one CTA per SM (NUM_CTAS) however few tiles
+        # the routes fill, e.g. when -1 slots leave fewer routed tokens.
+        persistent_grid = num_sms
     grid = (persistent_grid, 1, 1)
     residual_readiness = (
         source_schedule
@@ -173,7 +208,7 @@ def prepare_pipeline_bindings(inputs, num_sms):
         )
         and (
             weight_fmt == "fp4"
-            and T in (16, 128, 512)
+            and T in (16, 128, 512, 1024, 4096)
             or (weight_fmt == "fp8" and T == 16)
         )
     )

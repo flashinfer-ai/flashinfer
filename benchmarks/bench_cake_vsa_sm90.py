@@ -19,9 +19,10 @@ limitations under the License.
 Run from an editable FlashInfer checkout on H100:
 
     python benchmarks/bench_cake_vsa_sm90.py --output /tmp/vsa-sm90-cake.json
-    python benchmarks/bench_cake_vsa_sm90.py --output ... --baseline vsa_sm90_blk64   # PR #5470 checkout
     python benchmarks/bench_cake_vsa_sm90.py --output ... --warm-l2                    # PR #5470 regime
 
+The Cake arm is ``backend="cake"`` of the wrapper, i.e. the self-contained package
+``flashinfer.cake_vsa_sm90_backend`` (its ``build.json`` names the compiled stages).
 Planning, host-to-device metadata copies, JIT compilation, input generation and output
 allocation happen before timing; the same prepared ``run`` is measured for both arms in
 alternating AB/BA order.  CUPTI measures kernel activity (a fallback to CUDA events is an
@@ -168,9 +169,7 @@ def make_inputs(axes, seed):
 
 def prepare(mask, backend, scale):
     h, mb, nb = mask.shape
-    workspace_size = (
-        0 if backend in ("cake", "cake_cute", "vsa_sm90_blk64") else 128 * 1024 * 1024
-    )
+    workspace_size = 0 if backend == "cake" else 128 * 1024 * 1024
     wrapper = VariableBlockSparseAttentionWrapper(
         torch.empty(workspace_size, dtype=torch.uint8, device="cuda"), backend=backend
     )
@@ -203,7 +202,7 @@ def main():
     parser.add_argument(
         "--baseline",
         default="fa3",
-        help="Reference backend: fa3 (main) or vsa_sm90_blk64 (a PR #5470 checkout)",
+        help="Reference backend (default: fa3)",
     )
     parser.add_argument(
         "--warm-l2",

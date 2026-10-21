@@ -46,6 +46,53 @@ def _config(**kw):
     )
 
 
+def test_mxfp4_weights_have_independent_dtype_and_packing():
+    cfg = _config(quant_kind="mxfp4_mxfp8", intermediate=128)
+    assert cfg.torch_act_data_dtype == torch.float8_e4m3fn
+    assert cfg.torch_weight_data_dtype == getattr(
+        torch, "float4_e2m1fn_x2", torch.uint8
+    )
+    assert cfg.torch_act_sf_dtype == torch.float8_e8m0fnu
+    assert cfg.sf_vec_size == 32
+    assert cfg.instruction_k == 64
+    shapes = block_scaled._expected_weight_shapes(cfg)
+    assert shapes[:2] == ((8, 64, 256), (8, 64, 128))
+    with pytest.raises(ValueError, match="multiple of 128"):
+        _config(quant_kind="mxfp4_mxfp8", intermediate=192)
+
+
+def test_mxfp4_weight_ingestion_rejects_nvfp4_scales():
+    from flashinfer.moe_ep import (
+        PrequantizedMoEWeights,
+        preprocess_sm107_mxfp4_mega_weights,
+    )
+
+    pack = PrequantizedMoEWeights(
+        torch.zeros(1, 256, 64, dtype=torch.uint8),
+        torch.zeros(1, 128, 64, dtype=torch.uint8),
+        torch.zeros(1, 256, 4, dtype=torch.float8_e4m3fn),
+        torch.zeros(1, 128, 4, dtype=torch.float8_e4m3fn),
+    )
+    with pytest.raises(ValueError, match="block scales"):
+        preprocess_sm107_mxfp4_mega_weights(
+            pack, intermediate_size=128, hidden_size=128
+        )
+
+
+@pytest.mark.parametrize("world", [-1, 0, 3, 5, 6])
+def test_k3_geometry_rejects_invalid_world_before_device_setup(monkeypatch, world):
+    from tests.moe_ep.sm107_test_utils import run_mxfp4_k3_geometry
+
+    def unexpected_device_setup(*args, **kwargs):
+        pytest.fail("Invalid K3 geometry reached device setup")
+
+    monkeypatch.setattr(
+        "flashinfer.moe_ep.ensure_moe_ep_cuda_device", unexpected_device_setup
+    )
+    with pytest.raises(ValueError, match="positive world size that divides 896"):
+        run_mxfp4_k3_geometry(0, world)
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -114,8 +161,12 @@ def _workspace():
     ws.device = torch.device("cpu")
     ws._destroyed = False
     ws._compiled = mock.Mock()
+    # Model a kernel that requires launch-side clearing. Native masked BF16
+    # reducers opt out via this capability; quantized combine still clears.
+    ws.kernel = SimpleNamespace(masks_invalid_combine_slots=False)
     ws._launch_key = None
     ws._launch_kwargs = None
+    ws._routing_checks = {}
     ws._runtime_kwargs = mock.Mock(side_effect=lambda a, b: {"weights": (a, b)})
     ws.topk_idx = torch.tensor([[0, 1], [2, -1], [-1, -1], [-1, -1]])
     ws._pre_reduced_activation = torch.full((4, 2, 128), 7.0)

@@ -61,8 +61,11 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_manifest() -> Dict[str, Any]:
     for key in (
         "identity",
         "entry",
+        "prefill_entry",
         "sources",
         "head_counts",
+        "prefill_head_counts",
+        "prefill_head_tiles",
         "heads_per_block",
         "candidates_per_chunk",
         "max_chunks_per_block",
@@ -76,11 +79,13 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_manifest() -> Dict[str, Any]:
 
 
 def gen_cake_sparse_mla_sm120_dsv4_nvfp4_module() -> JitSpec:
-    """JIT spec for the Cake SM120 (GB202) DeepSeek-V4 NVFP4 sparse-MLA decode family.
+    """JIT spec for the Cake SM120 (GB202) DeepSeek-V4 NVFP4 sparse-MLA decode + prefill families.
 
-    One translation unit per supported head count (single-cache decode, dual-cache decode and
-    split merge kernels) plus the TVM-FFI host binding; the module name carries the generated
-    family's identity so a regenerated kernel set never reuses a stale build.
+    One translation unit per supported head count for the decode family (single-cache decode,
+    dual-cache decode and split merge kernels), one per prefill head count (head tiles x single /
+    dual cache x one-item / persistent CTAs) plus the TVM-FFI host binding with both entries; the
+    module name carries the generated family's identity so a regenerated kernel set never reuses a
+    stale build.
     """
 
     manifest = cake_sparse_mla_sm120_dsv4_nvfp4_manifest()

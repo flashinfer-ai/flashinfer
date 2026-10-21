@@ -69,7 +69,8 @@ Host work is split exactly like the Cake production launcher:
 
 * :func:`prepare_kimi_k3_vision_weights` -- once per model: the patch
   projection is zero-padded / shifted for the pixel-row TMA maps and every
-  parameter copied contiguously.  The RMSNorm weights are NOT folded into the
+  other parameter is validated (contiguous bf16 ``[out, in]``) and referenced
+  as is.  The RMSNorm weights are NOT folded into the
   GEMM weights: the residual-stream producers (``patch_embed``,
   ``layer_out_proj``, ``layer_fc1``) also store ``xw = bf16(x * w_next)`` and
   the FP32 ``[T, 16]`` per-64-column row sums of squares of ``x``; the norm
@@ -81,37 +82,30 @@ Host work is split exactly like the Cake production launcher:
   ``rope_cs`` table (:func:`pack_rope_table`: one ``(cos, sin)`` word per pair,
   read by the ``*_cs`` QKV tiles), the merge table, the attention segment plan
   (unit layout + LPT unit table), the GEMM tile configurations for the token
-  counts and every workspace, including the attention kernel's TMA descriptor
-  workspace (``attn_tma_desc``, see below).  The positional
+  counts and every workspace.  The positional
   rows depend on the weights and are derived by
   :func:`prepare_kimi_k3_vision_tower` (or passed in by a serving runtime that
   caches them per grid).
 * :func:`prepare_kimi_k3_vision_tower` -- binds every launch of the sequence
-  to the generated argument plans and prepares the attention descriptor
-  workspace (below).  The returned runner's ``launch()`` performs no
-  allocation and no host synchronization and is CUDA-graph capturable.
+  to the generated argument plans.  The returned runner's ``launch()``
+  performs no allocation and no host synchronization and is CUDA-graph
+  capturable.
 
-TMA descriptor ABI: the GEMM family and the RMSNorm apply pass take their
-tensor maps as ``__grid_constant__`` kernel parameters, exactly as in Cake
-production.  The attention kernel is exported in its production *pointer*
-ABI: its four ``CUtensorMap``s (Q, K, V, O -- all plan workspaces) live in
-device memory owned by the plan (``workspace["attn_tma_desc"]``, 128 B per
-map) and the kernel receives their addresses.  The generated attention
-binding exports two entries: ``run_prepare_tma`` (same arguments as ``run``;
-validates, encodes the descriptors and copies them into the workspace once,
-synchronously, outside CUDA-graph capture) and ``run`` (launch-only).
-:func:`prepare_kimi_k3_vision_tower` calls ``run_prepare_tma`` once per plan
-(the descriptors depend only on plan-owned buffers); ``launch()`` and graph
-replays never touch the workspace again.
+TMA descriptor ABI: every generated kernel takes its tensor maps as
+``__grid_constant__`` kernel parameters, exactly as in Cake production; the
+generated binding encodes them from the bound tensors on each launch (inside
+a captured CUDA graph the encoded parameters are part of the graph).  No
+descriptor lives in device memory and no preparation entry exists.
 
 The host plan reproduces the Cake planner table for table (segment plan,
 unit table, merge table, tile selection, launch grids); the generated-program
 export checks that parity on every contract row.  See ``README.md`` in this
-package and flashinfer-ai/flashinfer#4568 (tracker #4254).
+package and flashinfer-ai/flashinfer#4568.
 """
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple, Optional, Sequence, Union
@@ -121,6 +115,7 @@ import tvm_ffi
 
 from ..minimax_h3_varlen_attention.cake_backend import assign_unit_slots
 from .cake_jit import (
+    ARG_PLANS,
     ATTENTION_MERGE_KERNEL_KEY,
     MERGE_KERNEL_KEY,
     MODULES,
@@ -174,7 +169,7 @@ ATTN_MAX_SEGMENT_CLUSTERS = 1 << 16
 MODE_TWO_TILE = 2
 MODE_SPLIT_KV = 1
 SPLIT_MARGIN = 0.05
-# Round 4 (CAKE-722 lever A): the SPLIT_KV layout is priced per architecture (Cake
+# Round 4 (lever A): the SPLIT_KV layout is priced per architecture (Cake
 # ``kimi_k3_vision_attention.SPLIT_COST_MODELS`` / ``split_cost_model``).  A split unit costs
 # ``iter_scale * stage_iters + unit_overhead`` K/V-block equivalents and the layout wins when its
 # LPT makespan is below ``(1 - margin)`` x the two-tile makespan (which keeps the H3 block model:
@@ -196,7 +191,7 @@ SPLIT_COST_MODELS: dict[str, dict[str, float]] = {
 # every SPLIT_KV row on sm_100a, segments of 576 .. 10764 tokens on sm_103a.
 RING3_MAX_SEGMENT_TOKENS: dict[str, Optional[int]] = {"sm_100a": None, "sm_103a": 10764}
 RING3_MIN_SEGMENT_TOKENS: dict[str, int] = {"sm_100a": 0, "sm_103a": 576}
-# Round 6 (CAKE-771) per-row attention rules of the Cake plan (``kimi_k3_vision_attention.build_segment_plan``):
+# Round 6 per-row attention rules of the Cake plan (``kimi_k3_vision_attention.build_segment_plan``):
 # * lever G grid shaping (Cake ``GRID_POLICIES`` / ``GRID_AUTO_MIN_FREED`` / ``_GRID_POLICY`` default "auto"):
 #   "min" = the smallest cluster count whose LPT makespan equals the full grid's, applied by "auto" only on the
 #   architectures listed and only when it frees at least that many clusters (sm_103a: img_1280x720 74 -> 60 on the
@@ -317,7 +312,6 @@ ATTENTION_KWARGS = (
     "softmax_scale_log2",
     "partial_O",
     "partial_ML",
-    "tma_descriptor_workspace",
     "grid",
 )
 ATTENTION_MERGE_KWARGS = (
@@ -418,7 +412,7 @@ def rope_cos_sin(
     cos, sin = torch.cos(ang), torch.sin(ang)
     if device is not None:
         cos, sin = cos.to(device), sin.to(device)
-    return cos.contiguous(), sin.contiguous()
+    return cos, sin
 
 
 def sincos_time_table(dtype: Optional[torch.dtype] = None) -> torch.Tensor:
@@ -463,7 +457,7 @@ def pos_emb_rows(
         else:
             emb3d = emb2d.unsqueeze(0).repeat(t, 1, 1) + time_weight[:t].unsqueeze(1)
         rows.append(emb3d.reshape(-1, HIDDEN))
-    return torch.cat(rows, dim=0).contiguous()
+    return torch.cat(rows, dim=0)
 
 
 def build_merge_table_host(grid_thws: Sequence[Sequence[int]]) -> list[int]:
@@ -494,9 +488,26 @@ def build_merge_table(
 # ---------------------------------------------------------------------------
 
 
+@functools.cache
+def _device_sm_count(index: int) -> int:
+    """SM count of CUDA device ``index`` (queried once per process)."""
+    return int(torch.cuda.get_device_properties(index).multi_processor_count)
+
+
+@functools.cache
+def _device_capability(index: int) -> tuple[int, int]:
+    """Compute capability of CUDA device ``index`` (queried once per process)."""
+    major, minor = torch.cuda.get_device_capability(index)
+    return int(major), int(minor)
+
+
+def _device_index(device: torch.device) -> int:
+    return torch.cuda.current_device() if device.index is None else int(device.index)
+
+
 def attention_grid_clusters(device: torch.device) -> int:
     """Persistent-grid capacity of ``device`` in 2-CTA clusters (``num_SMs / 2``)."""
-    return max(1, torch.cuda.get_device_properties(device).multi_processor_count // 2)
+    return max(1, _device_sm_count(_device_index(torch.device(device))) // 2)
 
 
 def _attention_unit_costs(
@@ -1082,74 +1093,46 @@ def _cfg(
     return TileConfig(name, cta_group, acc_n, num_stages, 32, **kw)
 
 
-# The Cake catalogue (``kimi_k3_vision_gemm.TILE_CONFIGS``): pair tile 256 x 256
-# (``l``), single-CTA 128 x 128 / 128 x 64 (``s`` / ``xs``) and their split-K
-# clusters, the wave-balance / epilogue-width tiles (``m`` 256 x 128 pair,
-# ``w``, ``l_g8``, ``l_e8`` / ``s_e8`` eight epilogue warps) and the twins:
-# ``*_t`` tail split-K (opt-in in Cake; never selected by the production
-# policy), ``*_p`` / ``*_pf`` packed residual epilogue (+ pre-mainloop
-# residual / norm-weight prefetch), ``*_cs`` packed f16x2 RoPE table,
-# ``l_sk`` the pieces-first stream-K twin of the pair tile (round 4), and
-# (round 5) ``m_sk`` the stream-K twin of the 256 x 128 pair tile for the FC1
-# census points and ``m_e8`` / ``m_e8_cs`` the eight-warp 256 x 128 pair
-# tile of the K = 1024 norm GEMMs where the 256-wide tile's round count is
-# worst.
+# The tile configurations the production rule (:func:`select_tile_config` /
+# :func:`launch_tile_config`) can launch -- the Cake catalogue
+# (``kimi_k3_vision_gemm.TILE_CONFIGS``) minus the configurations no form
+# reaches at any token count (the base tiles of the packed / RoPE twins, the
+# opt-in tail split-K ``*_t`` and the ``xs`` half twins): pair tiles 256 x 256
+# (``l``) and 256 x 128 (``m_*``), single-CTA 128 x 128 / 128 x 64 (``s*`` /
+# ``xs*``) and the split-K cluster ``xs_k4_pf``; ``*_e8`` eight epilogue
+# warps, ``*_p`` / ``*_pf`` packed residual epilogue (+ pre-mainloop residual /
+# norm-weight prefetch), ``*_cs`` packed f16x2 RoPE table, ``m_tma1`` the
+# one-buffer TMA-epilogue twin of the out-proj pair tile, ``l_sk`` / ``m_sk``
+# the pieces-first stream-K twins, ``m_e8`` / ``m_e8_cs`` the eight-warp
+# 256 x 128 pair tile of the K = 1024 norm GEMMs, and the half-N tail twins
+# ``*_h`` (same mainloop, the tiles past the last full round run as half-width
+# items when they fit one half-round, ``half_tail_split``; bitwise identical
+# per output element to the base tile).
 TILE_CONFIGS: dict[str, TileConfig] = {
     c.name: c
     for c in (
         _cfg("l", 2, 256, 7),
         _cfg("s", 1, 128, 7),
         _cfg("xs", 1, 64, 9),
-        _cfg("s_k2", 1, 128, 7, ksplit=2),
-        _cfg("s_k4", 1, 128, 7, ksplit=4),
-        _cfg("xs_k2", 1, 64, 9, ksplit=2),
-        _cfg("xs_k4", 1, 64, 9, ksplit=4),
-        _cfg("m", 2, 128, 9),
-        _cfg("w", 1, 256, 4),
-        TileConfig("l_g8", cta_group=2, acc_n=256, num_stages=7, group_m=8),
         _cfg("l_e8", 2, 256, 7, epi_warps=8),
-        _cfg("s_e8", 1, 128, 7, epi_warps=8),
-        _cfg("l_t", 2, 256, 7, tail=True),
-        _cfg("l_e8_t", 2, 256, 7, epi_warps=8, tail=True),
-        _cfg("m_t", 2, 128, 9, tail=True),
-        _cfg("s_t", 1, 128, 7, tail=True),
-        _cfg("xs_t", 1, 64, 9, tail=True),
-        _cfg("s_e8_t", 1, 128, 7, epi_warps=8, tail=True),
         _cfg("m_p", 2, 128, 9, packed=True),
-        _cfg("l_e8_p", 2, 256, 7, epi_warps=8, packed=True),
-        _cfg("s_e8_p", 1, 128, 7, epi_warps=8, packed=True),
-        _cfg("xs_p", 1, 64, 9, packed=True),
-        _cfg("xs_k4_p", 1, 64, 9, ksplit=4, packed=True),
-        _cfg("m_pf", 2, 128, 9, packed=True, prefetch=True),
-        _cfg("l_e8_pf", 2, 256, 7, epi_warps=8, packed=True, prefetch=True),
-        _cfg("s_e8_pf", 1, 128, 7, epi_warps=8, packed=True, prefetch=True),
         _cfg("xs_pf", 1, 64, 9, packed=True, prefetch=True),
         _cfg("xs_k4_pf", 1, 64, 9, ksplit=4, packed=True, prefetch=True),
+        _cfg("l_e8_pf", 2, 256, 7, epi_warps=8, packed=True, prefetch=True),
+        _cfg("s_e8_pf", 1, 128, 7, epi_warps=8, packed=True, prefetch=True),
         _cfg("l_e8_cs", 2, 256, 7, epi_warps=8, rope=True),
         _cfg("s_cs", 1, 128, 7, rope=True),
-        _cfg("xs_cs", 1, 64, 9, rope=True),
         _cfg("xs_cs_pf", 1, 64, 9, rope=True, prefetch=True),
-        # Round 3: the one-buffer TMA-epilogue pair tile of the K = 1536 residual out-proj at M > 6144.
         _cfg("m_tma1", 2, 128, 8, packed=True, tma_epi=True, tma_onebuf=True),
-        # Round 4: the pieces-first stream-K twin of the 256 x 256 pair tile (projector GEMMs, census window).
         _cfg("l_sk", 2, 256, 7, sk=True),
-        # Round 5 (Cake ``CFG_M_SK``): the stream-K twin of the 256 x 128 pair tile (residual_fc1 at M <= MID_M_LIMIT
-        # where the 256 x 256 tile leaves a tiny extra round).
         _cfg("m_sk", 2, 128, 9, sk=True),
-        # Round 5 (Cake ``CFG_M_E8`` / ``CFG_M_E8_CS``): the eight-warp 256 x 128 pair tile of norm_gelu /
-        # norm_qkv_rope for 1656 < M <= M_E8_MAX_M (bitwise identical to l_e8; paired > 1.00 at 2552).
         _cfg("m_e8", 2, 128, 9, epi_warps=8),
         _cfg("m_e8_cs", 2, 128, 9, epi_warps=8, rope=True),
-        # Round 6 (Cake ``CFG_*_H``, lever G1 / G2): the half-N tail twins of the plain persistent tiles -- same
-        # mainloop, the tiles past the last full round run as half-width (acc_n / 2) items when they fit one
-        # half-round (``half_tail_split``); bitwise identical per output element to the base tile.
         _cfg(
             "s_e8_pf_h", 1, 128, 7, epi_warps=8, packed=True, prefetch=True, half=True
         ),
         _cfg("m_e8_h", 2, 128, 9, epi_warps=8, half=True),
         _cfg("m_e8_cs_h", 2, 128, 9, epi_warps=8, rope=True, half=True),
-        _cfg("xs_h", 1, 64, 9, half=True),
-        _cfg("xs_cs_pf_h", 1, 64, 9, rope=True, prefetch=True, half=True),
         _cfg("s_h", 1, 128, 7, half=True),
         _cfg("s_cs_h", 1, 128, 7, rope=True, half=True),
         _cfg("m_p_h", 2, 128, 9, packed=True, half=True),
@@ -1173,8 +1156,6 @@ HALF_TWIN = {
     "s_e8_pf": "s_e8_pf_h",
     "m_e8": "m_e8_h",
     "m_e8_cs": "m_e8_cs_h",
-    "xs": "xs_h",
-    "xs_cs_pf": "xs_cs_pf_h",
     "s": "s_h",
     "s_cs": "s_cs_h",
     "m_p": "m_p_h",
@@ -1185,14 +1166,12 @@ HALF_TWIN = {
     "m_tma1": "m_tma1_h",
 }
 HALF_ROUND_MARGIN = 4
-# Round-6 routing limits from the paired B300 / B200 A/B (Cake ``HALF_MAX_ROUNDS`` / ``HALF_ROUTE_EXCLUDE``): no half twin past
-# 24 persistent rounds (the half-round saving is inside the twin's full-item overhead: out-proj 66564) and never at the
-# ``xs`` tile: gelu_erf 638 is a tie / loss on both arches, and the norm_gelu / norm_qkv_rope 576 twins, a per-kernel win,
-# cost the img_336 tower row ~1.6 % inside the PDL chain on B300 (the tower row is the acceptance unit).
+# Round-6 routing limits from the paired B300 / B200 A/B (Cake ``HALF_MAX_ROUNDS`` / ``HALF_ROUTE_EXCLUDE``): no half twin
+# past 24 persistent rounds (the half-round saving is inside the twin's full-item overhead: out-proj 66564).  Cake's
+# table also excludes the ``xs`` twins on every form that reaches the ``xs`` tile (gelu_erf 638 is a tie / loss on both
+# arches; the norm_gelu / norm_qkv_rope 576 twins cost the img_336 tower row ~1.6 % inside the PDL chain on B300), so
+# ``xs_h`` / ``xs_cs_pf_h`` are never launched and are not part of :data:`HALF_TWIN` or :data:`TILE_CONFIGS` here.
 HALF_MAX_ROUNDS = 24
-HALF_ROUTE_EXCLUDE = frozenset(
-    {("gelu_erf", "xs"), ("norm_gelu", "xs"), ("norm_qkv_rope", "xs_cs_pf")}
-)
 # Per-config minimum round count (Cake ``HALF_MIN_ROUNDS``): the TMA-epilogue twin m_tma1_h at the out-proj 8192 point
 # (4 rounds, tail 34 / 74) wins per kernel but costs the batch8_448 tower row 0.13 % on B200; 12288 (6 rounds) and the
 # 16508 .. 43056 points keep it.
@@ -1207,9 +1186,9 @@ def half_tail_split(cluster_tiles: int, clusters: int) -> int:
 
 
 def _half_twin(name: str, n_total: int, M: int, sm_count: int, variant: str) -> str:
-    """The half-N twin of ``name`` where the census tail fits one half-round, the grid runs at most
-    ``HALF_MAX_ROUNDS`` rounds and ``(variant, tile)`` is not excluded (Cake ``_half_twin``)."""
-    if name not in HALF_TWIN or (variant, name) in HALF_ROUTE_EXCLUDE:
+    """The half-N twin of ``name`` where the census tail fits one half-round and the grid runs at most
+    ``HALF_MAX_ROUNDS`` rounds (Cake ``_half_twin``; ``variant`` is part of the rule's signature)."""
+    if name not in HALF_TWIN:
         return name
     cfg = TILE_CONFIGS[name]
     m_tiles = (M + GEMM_BLOCK_M - 1) // GEMM_BLOCK_M
@@ -1224,11 +1203,9 @@ def _half_twin(name: str, n_total: int, M: int, sm_count: int, variant: str) -> 
 
 # norm_qkv_rope: the packed f16x2 cos/sin twin of each base tile (Cake
 # ``_ROPE_TWIN``; the pre-mainloop table prefetch only on the one-drain-group
-# ``xs`` tile) and the FP32-table config the launcher falls back to when no
-# table is passed (``_ROPE_BASE``).  The host always passes ``rope_cs``.
+# ``xs`` tile).  The host always passes ``rope_cs``, so the FP32-table base
+# configurations of Cake's ``_ROPE_BASE`` fallback are never launched.
 ROPE_TWIN = {"l_e8": "l_e8_cs", "s": "s_cs", "xs": "xs_cs_pf", "m_e8": "m_e8_cs"}
-ROPE_BASE = {twin: base for base, twin in ROPE_TWIN.items()}
-ROPE_BASE["xs_cs"] = "xs"
 # residual / pos forms: the packed epilogue twin everywhere, with the residual
 # prefetch on the one-drain-group configs and on ``l_e8`` (Cake ``_PACKED_TWIN``).
 PACKED_TWIN = {
@@ -1241,7 +1218,7 @@ PACKED_TWIN = {
 # Round 3 (G2): the TMA-epilogue twin of the 256 x 128 pair tile, taken by the K = 1536 residual
 # out-proj forms only (Cake ``_TMA_EPI_TWIN`` / ``_TMA_EPI_POLICY`` auto; ties ``m_p`` on the K = 4096 FC1).
 TMA_EPI_TWIN = {"m": "m_tma1"}
-# Round 4 (CAKE-722 lever C): the pieces-first stream-K twin of the 256 x 256 pair tile (Cake ``_SK_TWIN`` /
+# Round 4 (lever C): the pieces-first stream-K twin of the 256 x 256 pair tile (Cake ``_SK_TWIN`` /
 # ``_SK_POLICY`` auto), taken by the projector GEMMs ``gelu_erf`` / ``rmsnorm`` inside the census window of
 # ``_sk_twin``.  The full rounds stay data-parallel; the tail tiles' K-steps are cut into ranges of
 # ``tail_split`` (= q) k-steps, one per cluster; the non-owning pieces dump FP32 partials to ``WS`` and the
@@ -1252,7 +1229,7 @@ SK_TAIL_FRAC_MAX = (
     0.30  # stream-K twin only when the tail holds <= 30 % of the clusters
 )
 SK_MIN_SAVING = 0.065  # ... and removing that partial round is worth >= 6.5 % of the mainloop rounds
-# Round 5 (CAKE-749; Cake ``SK_MIN_SAVING_ANY`` / ``SK_TAIL_FRAC_ANY``): a removed partial round worth >= 9 % of the
+# Round 5 (Cake ``SK_MIN_SAVING_ANY`` / ``SK_TAIL_FRAC_ANY``): a removed partial round worth >= 9 % of the
 # rounds wins whatever the tail fraction up to 60 % (gelu_erf 2691 tail 28 / 74, rmsnorm 2835 tail 40 / 74 paired > 1.00 on
 # both arches); the round-4 window above stays as the second admission path.
 SK_MIN_SAVING_ANY = 0.09
@@ -1294,10 +1271,12 @@ PDL_EARLY_WINDOW: dict[str, tuple[tuple[int, int], ...]] = {
     "rmsnorm": ((144, 638), (1196, 1196)),
 }
 PDL_EARLY_DEFAULT_WINDOW: tuple[tuple[int, int], ...] = ((1, 43056),)
+# Every launched configuration is in the catalogue: the twins the rule maps to and the
+# bases it can return unchanged (``PACKED_TWIN`` keys are rule-internal names: the
+# residual / pos forms always launch the packed twin).
 for _name in (
     *ROPE_TWIN,
     *ROPE_TWIN.values(),
-    *PACKED_TWIN,
     *PACKED_TWIN.values(),
     *TMA_EPI_TWIN.values(),
     *SK_TWIN,
@@ -1511,19 +1490,17 @@ def _select_tile_config_base(
     return cfg[_rope_twin(_sk_twin(wide, n_total, M, sm_count), n_total)]
 
 
-def launch_tile_config(
-    variant: str, cfg: TileConfig, *, rope_table: bool = True
-) -> TileConfig:
-    """The physical config the launcher runs (``kimi_k3_vision_gemm._launch_gemm``): a ``*_cs``
-    tile without a packed table falls back to its FP32-table base (the host always passes the
-    table); ``pos`` requires single-CTA tiles and a K split of 10 K-steps."""
-    if cfg.rope and not rope_table:
-        cfg = TILE_CONFIGS[ROPE_BASE[cfg.name]]
+def launch_tile_config(variant: str, cfg: TileConfig) -> TileConfig:
+    """The physical config the launcher runs (``kimi_k3_vision_gemm._launch_gemm``).  The host always
+    passes the packed RoPE table, so a ``*_cs`` tile is launched as is; ``pos`` streams pixel row pairs and
+    requires a single-CTA tile whose K split divides its 10 K-steps -- true of every config the rule picks
+    for it, checked here instead of silently substituting another tile."""
     if GEMM_VARIANTS[variant][2]:
-        if cfg.cta_group != 1:
-            cfg = TILE_CONFIGS["s"]
-        if (PATCH_DIM_PAD // GEMM_BLOCK_K) % cfg.ksplit:
-            cfg = TILE_CONFIGS["s_k2"] if cfg.acc_n == 128 else TILE_CONFIGS["xs_k2"]
+        if cfg.cta_group != 1 or (PATCH_DIM_PAD // GEMM_BLOCK_K) % cfg.ksplit:
+            raise ValueError(
+                f"{variant} requires a single-CTA tile whose K split divides "
+                f"{PATCH_DIM_PAD // GEMM_BLOCK_K} K-steps, got {cfg.name!r}"
+            )
     return cfg
 
 
@@ -1852,7 +1829,7 @@ class PreparedWeights:
     weight shifted right by four elements (odd pixel rows are streamed by TMA
     from a 16-byte-aligned start four elements early).  Per layer the six
     checkpoint tensors ``norm0``, ``wqkv``, ``wo``, ``norm1``, ``fc0``, ``fc1``
-    as contiguous copies: the RMSNorm weights are NOT folded into the GEMM
+    as given (contiguous bf16): the RMSNorm weights are NOT folded into the GEMM
     weights (a folded ``bf16(W * w_norm)`` is a fixed weight perturbation the
     HF chain does not have); they are applied on the activation side by the
     residual epilogues (``xw = bf16(x * w_next)``).
@@ -1877,17 +1854,21 @@ class PreparedWeights:
 
 
 def _check_weight(t: torch.Tensor, shape: tuple[int, ...], name: str) -> torch.Tensor:
+    """``weights[name]`` as the kernels read it: a contiguous bf16 ``[out, in]`` parameter (no hidden copy)."""
     if (
         not isinstance(t, torch.Tensor)
         or tuple(t.shape) != shape
         or t.dtype != torch.bfloat16
+        or not t.is_contiguous()
     ):
-        raise ValueError(f"weights[{name!r}] must be a bf16 tensor of shape {shape}")
-    return t.contiguous()
+        raise ValueError(
+            f"weights[{name!r}] must be a contiguous bf16 tensor of shape {shape}"
+        )
+    return t
 
 
 def prepare_kimi_k3_vision_weights(weights: dict[str, Any]) -> PreparedWeights:
-    """Pad ``patch_proj`` and copy every parameter contiguously (once per model; no folding).
+    """Pad ``patch_proj`` and validate every other parameter (once per model; no folding, no copies).
 
     ``weights`` uses ``nn.Linear`` ``[out, in]`` BF16 tensors without biases:
     ``patch_proj [1024, 588]`` (the 14x14 Conv2d flattened), ``pos_emb [64, 64,
@@ -1895,7 +1876,8 @@ def prepare_kimi_k3_vision_weights(weights: dict[str, Any]) -> PreparedWeights:
     [1024]``, ``merger_proj0 [4096, 4096]``, ``merger_proj1 [7168, 4096]``,
     ``post_norm [7168]`` and ``layers`` = list of ``{"norm0": [1024], "wqkv":
     [4608, 1024], "wo": [1024, 1536], "norm1": [1024], "fc0": [4096, 1024],
-    "fc1": [1024, 4096]}``.  Every output tensor is a fresh contiguous copy.
+    "fc1": [1024, 4096]}``.  Every tensor must be contiguous; the padded patch
+    projection is the only new allocation, every other parameter is referenced.
     """
     missing = [k for k in WEIGHT_KEYS if k not in weights]
     if missing:
@@ -1954,7 +1936,7 @@ def prepare_kimi_k3_vision_weights(weights: dict[str, Any]) -> PreparedWeights:
 
 
 def _arch_for(device: torch.device) -> str:
-    capability = torch.cuda.get_device_capability(device)
+    capability = _device_capability(_device_index(torch.device(device)))
     arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
     if arch is None:
         raise ValueError(
@@ -1967,7 +1949,9 @@ def _arch_for(device: torch.device) -> str:
 def generated_program_available(device: torch.device) -> bool:
     """True when this checkout registers every kernel of the export's contract denominator for ``device``
     (``REGISTERED_KERNEL_KEYS``: the reachable keys minus the declared ``UNCOVERED_KERNEL_KEYS``)."""
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(device))
+    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(
+        _device_capability(_device_index(torch.device(device)))
+    )
     return arch is not None and route_available(arch, REGISTERED_KERNEL_KEYS[arch])
 
 
@@ -2004,30 +1988,15 @@ class VisionTowerPlan:
         torch.Tensor
     )  # pack_rope_table(cos, sin): u32 [T, 64] f16x2 (cos, sin) words
     workspace: dict[str, torch.Tensor] = field(repr=False)
-    # (module, workspace address) pairs whose TMA descriptor workspace has been
-    # prepared (``run_prepare_tma``); the descriptors depend on plan-owned
-    # buffers only, so one preparation per plan serves every runner.
-    prepared_tma: dict[tuple[str, int], bool] = field(
-        default_factory=dict, repr=False, compare=False
-    )
 
     @property
     def tiles_per_cta(self) -> int:
         return self.attention.tiles_per_cta
 
 
-def attention_tma_workspace_bytes(arch: str, key: str) -> int:
-    """Bytes of the caller-owned TMA descriptor workspace of the registered attention module ``key``
-    (``attention:<layout>[:wide][:split]``; 0 = by-value ABI / unregistered)."""
-    if not route_available(arch, (key,)):
-        return 0
-    return int(MODULES[kernel_module_name(arch, key)].get("tma_workspace_bytes", 0))
-
-
 def vision_workspace_shapes(
     total_tokens: int,
     merged: int,
-    attention_tma_bytes: int = 0,
     stream_k_ctas: int = 0,
     partial_slots: Optional[int] = None,
     part_rows: int = 0,
@@ -2080,11 +2049,6 @@ def vision_workspace_shapes(
             torch.float32,
         ),
     }
-    if attention_tma_bytes:
-        # Pointer-ABI attention: the plan owns the device bytes of the kernel's
-        # CUtensorMaps (prepared once by ``run_prepare_tma``; 128-byte aligned
-        # by the caching allocator's 512-byte granularity, verified by the binding).
-        shapes["attn_tma_desc"] = ((int(attention_tma_bytes),), torch.uint8)
     if stream_k_ctas:
         # Stream-K GEMM tiles (round 4): the FP32 partial workspace of SK_MAX_CONTRIB - 1
         # pieces per (tail tile, CTA) over every tail tile of the largest grid, 256 columns
@@ -2099,6 +2063,19 @@ def vision_workspace_shapes(
     return shapes
 
 
+# Workspaces whose initial contents matter.  Every token-sized buffer (``x``,
+# ``xw``, ``stats``, ``q``/``k``/``v``, ``attn_out``, ``ffn``, ``m``, ``h``,
+# ``rowsumsq``, the stream-K partials and the split-attention partials) is
+# written in full by its producer before any consumer reads it, so the plan
+# allocates it uninitialized.  The stream-K arrival counters must start at zero
+# (the last arriver resets them); the dummies bound to never-dereferenced
+# pointer parameters and the odd-row pixel map of a one-token batch are kept
+# zero so no launch can observe allocator garbage through them.
+ZEROED_WORKSPACES = frozenset(
+    {"sk_flags", "f32_dummy", "u32_dummy", "pixel_dummy", "probe_dummy"}
+)
+
+
 def pack_rope_table(cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """Pack the FP32 ``[T, 64]`` cos/sin tables into one ``uint32`` ``[T, 64]`` table of f16x2
     words (low half = cos, high half = sin) for the ``*_cs`` QKV tiles: half the table bytes per
@@ -2111,7 +2088,7 @@ def pack_rope_table(cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     packed = torch.stack([cos.float().half(), sin.float().half()], dim=-1).reshape(
         cos.shape[0], 2 * ROPE_PAIRS
     )
-    return packed.contiguous().view(torch.uint32)
+    return packed.view(torch.uint32)
 
 
 def build_kimi_k3_vision_plan(
@@ -2140,7 +2117,7 @@ def build_kimi_k3_vision_plan(
     total = cu[-1]
     merged = merged_tokens(grids)
     if sm_count is None:
-        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        sm_count = _device_sm_count(_device_index(device))
     sm_count = int(sm_count)
     if grid_clusters is None:
         grid_clusters = max(1, sm_count // 2)
@@ -2163,11 +2140,6 @@ def build_kimi_k3_vision_plan(
     attention = build_attention_plan(
         cu, device, HEADS, grid_clusters=grid_clusters, arch=arch
     )
-    tma_bytes = (
-        attention_tma_workspace_bytes(arch, attention.kernel_key)
-        if device.type == "cuda"
-        else 0
-    )
     gemm_configs = gemm_configs_for(total, merged, sm_count)
     gemm_kernel_keys = gemm_kernel_keys_for(total, merged, sm_count)
     stream_k_ctas = (
@@ -2176,11 +2148,12 @@ def build_kimi_k3_vision_plan(
         else 0
     )
     workspace = {
-        name: torch.zeros(shape, dtype=dtype, device=device)
+        name: (torch.zeros if name in ZEROED_WORKSPACES else torch.empty)(
+            shape, dtype=dtype, device=device
+        )
         for name, (shape, dtype) in vision_workspace_shapes(
             total,
             merged,
-            attention_tma_bytes=tma_bytes,
             stream_k_ctas=stream_k_ctas,
             partial_slots=attention.num_partial_slots
             if attention.kv_split is not None
@@ -2214,31 +2187,24 @@ def build_kimi_k3_vision_plan(
 
 
 def _bind(
-    module_name: str, kwargs: dict[str, Any]
-) -> tuple[Callable[..., Any], tuple, Optional[Callable[..., Any]]]:
-    """Order ``kwargs`` by the generated argument plan of ``module_name`` and load its entries.
-
-    Returns the launch entry, its positional arguments and the module's TMA
-    preparation entry (``tma_prepare_entry``; ``None`` for by-value descriptor
-    modules), which takes the same positional arguments.
-    """
+    module_name: str, arch: str, kwargs: dict[str, Any]
+) -> tuple[Callable[..., Any], tuple]:
+    """Order ``kwargs`` by the generated argument plan of ``module_name`` and load its entry for ``arch``."""
     record = MODULES[module_name]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
     arguments = []
-    for kind, name in record["arg_plan"]:
+    for kind, name in ARG_PLANS[record["arg_plan"]]:
         if kind == "grid":
             arguments.append(grid[name])
         elif name in kwargs:
             arguments.append(kwargs[name])
         else:
             raise KeyError(
-                f"generated module {module_name!r} expects argument {name!r} "
+                f"generated program {module_name!r} expects argument {name!r} "
                 f"({kind}); host binding provides {sorted(kwargs)}"
             )
-    module = load_cake_kimi_k3_vision_tower_module(module_name)
-    prepare_entry = record.get("tma_prepare_entry")
-    prepare = getattr(module, prepare_entry) if prepare_entry else None
-    return getattr(module, record["ffi_entry"]), tuple(arguments), prepare
+    module = load_cake_kimi_k3_vision_tower_module(module_name, arch)
+    return getattr(module, record["ffi_entry"]), tuple(arguments)
 
 
 @dataclass(frozen=True)
@@ -2249,23 +2215,9 @@ class _Launch:
     kwargs: dict[str, Any] = field(repr=False)
     entry: Callable[..., Any] = field(repr=False)
     arguments: tuple = field(repr=False)
-    # ``run_prepare_tma`` of a pointer-ABI module (same arguments); None otherwise.
-    prepare: Optional[Callable[..., Any]] = field(default=None, repr=False)
 
     def __call__(self) -> None:
         self.entry(*self.arguments)
-
-    def prepare_tma(self, plan: "VisionTowerPlan") -> bool:
-        """Prepare this launch's descriptor workspace once per plan; True if a copy was made."""
-        if self.prepare is None:
-            return False
-        key = (self.module, int(self.kwargs["tma_descriptor_workspace"].data_ptr()))
-        if key in plan.prepared_tma:
-            return False
-        with tvm_ffi.use_torch_stream():
-            self.prepare(*self.arguments)
-        plan.prepared_tma[key] = True
-        return True
 
 
 @dataclass(frozen=True)
@@ -2275,8 +2227,7 @@ class KimiK3VisionTowerRunner:
     ``launch()`` runs every kernel of the tower on the current torch stream into
     the caller-owned ``out`` with no CUDA allocation and no host
     synchronization and returns ``out``; it is CUDA-graph capturable (capture
-    belongs to the caller; the attention descriptor workspace was prepared by
-    :func:`prepare_kimi_k3_vision_tower`).  Prepare a new runner when ``grid_thws``, the layer
+    belongs to the caller).  Prepare a new runner when ``grid_thws``, the layer
     count or a tensor binding (``pixel_values``, ``out``, weights) changes;
     values may change freely.  ``stages`` exposes one launch per stage (layer
     stages use layer 0) for per-operator tests and timing.
@@ -2450,8 +2401,8 @@ def _gemm_launch(
     key = plan.gemm_kernel_keys[variant]
     assert key.split(":")[2] == cfg.name, (key, cfg.name)
     module = kernel_module_name(plan.arch, key)
-    entry, arguments, prepare = _bind(module, kwargs)
-    return _Launch(stage, layer, module, kwargs, entry, arguments, prepare)
+    entry, arguments = _bind(module, plan.arch, kwargs)
+    return _Launch(stage, layer, module, kwargs, entry, arguments)
 
 
 def _attention_launch(plan: VisionTowerPlan, layer: int) -> _Launch:
@@ -2473,15 +2424,13 @@ def _attention_launch(plan: VisionTowerPlan, layer: int) -> _Launch:
         # KV-split partial workspace (the split build writes it, the merge reads it; dummies otherwise).
         partial_O=ws["partial_O"],
         partial_ML=ws["partial_ML"],
-        # Pointer-ABI descriptor workspace (plan-owned; ignored by a by-value module).
-        tma_descriptor_workspace=ws.get("attn_tma_desc", ws["u32_dummy"]),
         # The lever-G shaped persistent grid (2 CTAs per cluster).
         grid=(2 * int(attn.num_clusters), 1, 1),
     )
     assert tuple(kwargs) == ATTENTION_KWARGS
     module = kernel_module_name(plan.arch, attn.kernel_key)
-    entry, arguments, prepare = _bind(module, kwargs)
-    return _Launch("layer_attention", layer, module, kwargs, entry, arguments, prepare)
+    entry, arguments = _bind(module, plan.arch, kwargs)
+    return _Launch("layer_attention", layer, module, kwargs, entry, arguments)
 
 
 def _attention_merge_launch(plan: VisionTowerPlan, layer: int) -> _Launch:
@@ -2510,10 +2459,8 @@ def _attention_merge_launch(plan: VisionTowerPlan, layer: int) -> _Launch:
     )
     assert tuple(kwargs) == ATTENTION_MERGE_KWARGS
     module = kernel_module_name(plan.arch, ATTENTION_MERGE_KERNEL_KEY)
-    entry, arguments, prepare = _bind(module, kwargs)
-    return _Launch(
-        "layer_attention_merge", layer, module, kwargs, entry, arguments, prepare
-    )
+    entry, arguments = _bind(module, plan.arch, kwargs)
+    return _Launch("layer_attention_merge", layer, module, kwargs, entry, arguments)
 
 
 def _merge_launch(plan: VisionTowerPlan, weights: PreparedWeights) -> _Launch:
@@ -2528,8 +2475,8 @@ def _merge_launch(plan: VisionTowerPlan, weights: PreparedWeights) -> _Launch:
     )
     assert tuple(kwargs) == MERGE_KWARGS
     module = kernel_module_name(plan.arch, MERGE_KERNEL_KEY)
-    entry, arguments, prepare = _bind(module, kwargs)
-    return _Launch("final_norm_merge", -1, module, kwargs, entry, arguments, prepare)
+    entry, arguments = _bind(module, plan.arch, kwargs)
+    return _Launch("final_norm_merge", -1, module, kwargs, entry, arguments)
 
 
 def _rmsnorm_apply_launch(
@@ -2546,10 +2493,8 @@ def _rmsnorm_apply_launch(
     )
     assert tuple(kwargs) == RMSNORM_APPLY_KWARGS
     module = kernel_module_name(plan.arch, RMSNORM_APPLY_KERNEL_KEY)
-    entry, arguments, prepare = _bind(module, kwargs)
-    return _Launch(
-        "merger_rmsnorm_apply", -1, module, kwargs, entry, arguments, prepare
-    )
+    entry, arguments = _bind(module, plan.arch, kwargs)
+    return _Launch("merger_rmsnorm_apply", -1, module, kwargs, entry, arguments)
 
 
 def _launch_sequence(
@@ -2771,11 +2716,6 @@ def prepare_kimi_k3_vision_tower(
         pos_rows = pos_emb_rows(prepared.pos_emb, prepared.time_weight, grids)
     _check_2d(pos_rows, (plan.total_tokens, HIDDEN), "pos_rows")
     launches = _launch_sequence(plan, prepared, pixel_values, pos_rows, out)
-    # Pointer-ABI modules (the attention kernel): encode the CUtensorMaps and
-    # copy them into the plan-owned workspace once, synchronously, before any
-    # launch or graph capture.  Idempotent per (module, workspace).
-    for item in launches:
-        item.prepare_tma(plan)
     return KimiK3VisionTowerRunner(
         plan, prepared, pixel_values, pos_rows, out, launches
     )

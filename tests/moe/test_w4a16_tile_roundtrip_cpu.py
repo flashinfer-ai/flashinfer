@@ -69,9 +69,20 @@ class TileRoundtripContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "thread counts must match"):
             validate_pin((64, 128, 64, 256))
 
-    def test_unselected_small_k_still_rejected(self):
+    def test_alternate_small_k_geometry_still_valid(self):
+        self.assertEqual(validate_pin((64, 256, 32, 512)), (64, 256, 32, 512))
+
+    def test_scale_misaligned_tile_still_rejected(self):
         with self.assertRaisesRegex(ValueError, "does not fit"):
-            validate_pin((64, 256, 32, 512))
+            validate_pin((32, 512, 16, 1024))
+
+    def test_nondivisible_tile_still_rejected(self):
+        with self.assertRaisesRegex(ValueError, "does not fit"):
+            validate_pin((128, 192, 64, 384))
+
+    def test_selected_shared_memory_overflow_still_rejected(self):
+        with self.assertRaisesRegex(ValueError, "does not fit"):
+            validate_pin((128, 128, 32, 512), memory=1024)
 
     def test_alternate_shared_memory_overflow_still_rejected(self):
         with self.assertRaisesRegex(ValueError, "does not fit"):

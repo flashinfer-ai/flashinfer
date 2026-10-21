@@ -41,7 +41,8 @@ class MoEWeightPack:
       scales with trailing dims ``hidden // 32`` / ``intermediate // 32``;
       NVFP4 CuTeDSL expects fp8-e4m3 per-16 scales (``hidden // 16`` /
       ``intermediate // 16``). SM107 MXFP8 expects typed E8M0 per-32 scales
-      with E4M3 or E5M2 data. These are canonical, unswizzled scale planes;
+      with E4M3 or E5M2 data; SM107 MXFP4/MXFP8 uses the same scale format
+      with packed E2M1 weights. These are canonical, unswizzled scale planes;
       backend preprocessing handles the physical layout.
 
     Supplying exactly one scale raises: that state used to silently select

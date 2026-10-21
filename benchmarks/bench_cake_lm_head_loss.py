@@ -66,6 +66,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import flashinfer  # noqa: E402
+from flashinfer import chunked_lm_head as public_lm_head  # noqa: E402
 from flashinfer.api_logging import ExperimentalWarning  # noqa: E402
 from flashinfer.chunked_lm_head import chunked_lm_head_logprob, chunked_lm_head_loss  # noqa: E402
 from flashinfer.experimental.cake_lm_head_loss import cake_backend  # noqa: E402
@@ -462,22 +463,39 @@ class ArmCake(ArmAutograd):
     def __init__(self, inp, *, entry, chunk):
         super().__init__(inp, entry=entry, chunk=chunk)
         device = inp.X.device
-        if not cake_backend.generated_program_available(device, entry=entry):
+        hidden, vocab = int(inp.X.shape[1]), int(inp.W.shape[0])
+        if not cake_backend.generated_program_available(
+            device, entry=entry, hidden=hidden, vocab=vocab
+        ):
             capability = torch.cuda.get_device_capability(device)
             raise RuntimeError(
-                f"generated chunked LM-head program ({entry} entry) not registered for compute capability "
-                f"{capability[0]}.{capability[1]} in this checkout"
+                f"generated chunked LM-head program ({entry} entry, H {hidden}, V {vocab}) not registered for "
+                f"compute capability {capability[0]}.{capability[1]} in this checkout"
             )
-        self.module_name, record = cake_backend.record_for(device)
+        self.module_name, record = cake_backend.record_for(device, hidden, vocab)
         self.abi = cake_backend.record_abi(record)
 
     def versions(self):
+        # the switches this arm runs with: the public module's resolution of its FLASHINFER_CAKE_LM_HEAD_LOSS_*
+        # variables (every keyword left at None), which it passes down to the backend
+        switches = public_lm_head._resolve_knobs(
+            compact_rows=None,
+            fuse_dw_cast=None,
+            dx_finalize=None,
+            dw_stream=None,
+            hidden_count=None,
+            gemm_tuning=None,
+        )
         return dict(
             module=self.module_name,
             abi=self.abi,
-            stages=list(cake_backend.stages_for_entry(self.entry)),
-            compact_rows=cake_backend.compact_rows_default(),
-        )  # valid-row compaction (the labels carry ignored rows)
+            stages=list(
+                cake_backend.stages_for_entry(
+                    self.entry, fuse_dw_cast=switches["fuse_dw_cast"]
+                )
+            ),
+            **switches,
+        )
 
     def forward(self):
         inp = self.inp
