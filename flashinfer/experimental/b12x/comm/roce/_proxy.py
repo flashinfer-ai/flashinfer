@@ -22,6 +22,8 @@ _LOCK = threading.Lock()
 _LIB: ctypes.CDLL | None = None
 
 BLOB_STRUCT_ERR = "roce proxy blob size mismatch"
+# Region layout and doorbell protocol of ``_roce_proxy.c``; native runtimes vendor the same file.
+ABI_VERSION = 10
 
 
 def _traffic_class() -> int:
@@ -105,7 +107,7 @@ def load() -> ctypes.CDLL:
         lib.roce_abi_version.restype = ctypes.c_int
         lib.roce_abi_version.argtypes = []
         lib.roce_layout.restype = ctypes.c_int
-        lib.roce_layout.argtypes = [ctypes.c_int, u64, ctypes.POINTER(u64)]
+        lib.roce_layout.argtypes = [ctypes.c_int, u64, u64, u64, ctypes.POINTER(u64)]
         lib.roce_blob_bytes.restype = u64
         lib.roce_blob_bytes.argtypes = []
         lib.roce_create.restype = p
@@ -119,9 +121,13 @@ def load() -> ctypes.CDLL:
             p,
             u64,
             u64,
+            u64,
+            u64,
             ctypes.c_char_p,
             u64,
         ]
+        lib.roce_enable_ring.restype = ctypes.c_int
+        lib.roce_enable_ring.argtypes = [p]
         lib.roce_local_blob.restype = ctypes.c_int
         lib.roce_local_blob.argtypes = [p, p, u64]
         lib.roce_connect.restype = ctypes.c_int
@@ -146,14 +152,14 @@ def load() -> ctypes.CDLL:
         lib.roce_hca_stat.argtypes = [p, ctypes.c_int, ctypes.c_int]
         lib.roce_destroy.restype = None
         lib.roce_destroy.argtypes = [p]
-        if lib.roce_abi_version() != 5:
+        if lib.roce_abi_version() != ABI_VERSION:
             raise RuntimeError("unexpected b12x RoCE proxy ABI version")
         _LIB = lib
         return lib
 
 
 class Layout:
-    """Byte offsets of the pinned region shared by the kernel and the proxy."""
+    """Byte offsets of the pinned region shared by the kernels and the proxy."""
 
     __slots__ = (
         "recv_off",
@@ -163,15 +169,42 @@ class Layout:
         "total_bytes",
         "flag_stride",
         "slots",
+        "pipe_send_off",
+        "pipe_recv_off",
+        "pipe_flag_off",
+        "shard_cap",
+        "max_chunks",
+        "pipe_bytes",
+        "varlen_recv_off",
+        "varlen_flag_off",
+        "varlen_bytes",
+        "varlen_max_chunks",
     )
 
-    def __init__(self, world_size: int, slot_bytes: int) -> None:
-        """Create the proxy context: open the HCAs, register the pinned region, create the queue pairs."""
-        out = (ctypes.c_uint64 * 7)()
-        if load().roce_layout(int(world_size), int(slot_bytes), out) != 0:
+    def __init__(
+        self,
+        world_size: int,
+        slot_bytes: int,
+        pipe_bytes: int = 0,
+        varlen_bytes: int = 0,
+    ) -> None:
+        """Ask the proxy library for the layout of ``world_size`` one-shot slots, a two-shot
+        area and a variable-length all-gather area of ``varlen_bytes`` per rank and slot."""
+        out = (ctypes.c_uint64 * 17)()
+        if (
+            load().roce_layout(
+                int(world_size),
+                int(slot_bytes),
+                int(pipe_bytes),
+                int(varlen_bytes),
+                out,
+            )
+            != 0
+        ):
             raise ValueError(
                 f"unsupported RoCE geometry: world_size={world_size} slot_bytes={slot_bytes} "
-                "(2..16 ranks, slot_bytes a positive multiple of 4096)"
+                f"pipe_bytes={pipe_bytes} varlen_bytes={varlen_bytes} (2..16 ranks, sizes "
+                "multiples of 4096, at most 4 GiB of variable-length capacity)"
             )
         (
             self.recv_off,
@@ -181,6 +214,16 @@ class Layout:
             self.total_bytes,
             self.flag_stride,
             self.slots,
+            self.pipe_send_off,
+            self.pipe_recv_off,
+            self.pipe_flag_off,
+            self.shard_cap,
+            self.max_chunks,
+            self.pipe_bytes,
+            self.varlen_recv_off,
+            self.varlen_flag_off,
+            self.varlen_bytes,
+            self.varlen_max_chunks,
         ) = (int(v) for v in out)
 
 
@@ -197,6 +240,9 @@ class Proxy:
         region_ptr: int,
         region_bytes: int,
         slot_bytes: int,
+        pipe_bytes: int = 0,
+        varlen_bytes: int = 0,
+        ring: bool = False,
     ) -> None:
         """Create the proxy context: open the HCAs, register the pinned region, create the queue pairs."""
         self.traffic_class = _traffic_class()
@@ -213,6 +259,8 @@ class Proxy:
             ctypes.c_void_p(int(region_ptr)),
             int(region_bytes),
             int(slot_bytes),
+            int(pipe_bytes),
+            int(varlen_bytes),
             err,
             len(err),
         )
@@ -220,6 +268,11 @@ class Proxy:
             raise RuntimeError(
                 f"RoCE proxy setup failed: {err.value.decode(errors='replace')}"
             )
+        self.ring = ring
+        if ring and self._lib.roce_enable_ring(self._ctx) != 0:
+            message = self.error()
+            self.close()
+            raise RuntimeError(f"RoCE ring setup failed: {message}")
         self.world_size = int(world_size)
         self.rank = int(rank)
         self.hca_names = tuple(hca_names)
@@ -246,12 +299,21 @@ class Proxy:
         rails = max(len(r) for r in routes)
         flat = []
         for peer, rail_links in enumerate(routes):
-            if peer != self.rank and len(rail_links) != rails:
+            relayed = getattr(self, "ring", False) and peer not in {
+                self.rank,
+                (self.rank + 1) % self.world_size,
+                (self.rank - 1) % self.world_size,
+            }
+            if relayed and rail_links:
+                raise RuntimeError("ring routes must leave non-neighbors unconnected")
+            if peer != self.rank and not relayed and len(rail_links) != rails:
                 raise RuntimeError(
                     f"RoCE routes to rank {peer} have {len(rail_links)} rails, expected {rails}"
                 )
             for k in range(rails):
-                flat.extend(rail_links[k] if peer != self.rank else (0, 0))
+                flat.extend(
+                    rail_links[k] if peer != self.rank and not relayed else (0, 0)
+                )
         table = (ctypes.c_int32 * len(flat))(*flat)
         joined = b"".join(blobs)
         buf = ctypes.create_string_buffer(joined, len(joined))
@@ -280,6 +342,8 @@ class Proxy:
         """Counters: ops posted, RDMA writes completed, last posted sequence."""
         return {
             "ops_posted": int(self._lib.roce_stat(self._ctx, 0)),
+            "ring_forwarded": int(self._lib.roce_stat(self._ctx, 3)),
+            "connected_peers": int(self._lib.roce_stat(self._ctx, 4)),
             "writes_completed": int(self._lib.roce_stat(self._ctx, 1)),
             "last_seq": int(self._lib.roce_stat(self._ctx, 2)),
             "writes_completed_per_hca": [
@@ -304,4 +368,4 @@ class Proxy:
             self.close()
 
 
-__all__ = ["Layout", "Proxy", "load"]
+__all__ = ["ABI_VERSION", "Layout", "Proxy", "load"]

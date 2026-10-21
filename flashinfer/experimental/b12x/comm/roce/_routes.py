@@ -133,12 +133,27 @@ def _best_matching(candidates: list, rails: int) -> Optional[list[tuple[int, int
 
 
 def plan_routes(
-    endpoints: Sequence[Sequence[Endpoint]], rank: int, rails: int
+    endpoints: Sequence[Sequence[Endpoint]],
+    rank: int,
+    rails: int,
+    *,
+    ring: bool = False,
 ) -> list[list[tuple[int, int]]]:
     """Per peer, the ``(local_device, remote_device)`` index pair carrying each rail; ``[]`` for ``rank``."""
     if not 1 <= rails <= MAX_RAILS:
         raise ValueError(f"rails must be 1..{MAX_RAILS}, got {rails}")
     world = len(endpoints)
+    if ring and not 2 <= world <= 16:
+        raise ValueError("experimental ring requires 2..16 ranks")
+    if not 0 <= rank < world:
+        raise ValueError("rank outside the endpoint list")
+    if ring:
+        # Rank order defines the cycle; the proxy relays all non-neighbors.
+        neighbors = {rank, (rank + 1) % world, (rank - 1) % world}
+        peers = [p for p in range(world) if p in neighbors]
+        subset = [endpoints[p] for p in peers]
+        planned = plan_routes(subset, peers.index(rank), rails)
+        return [planned[peers.index(p)] if p in peers else [] for p in range(world)]
     if _index_pairing_valid(endpoints, rails):
         return [
             [] if p == rank else [(h, h) for h in range(rails)] for p in range(world)
