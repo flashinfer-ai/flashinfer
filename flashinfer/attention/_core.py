@@ -525,6 +525,8 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
             q, paged_kv_cache, *args, q_scale=q_scale, k_scale=k_scale, **kwargs
         )
 
+    run_return_lse = functools.partialmethod(run, return_lse=True)
+
 
 class BatchDecodeWithAttentionSinkWrapper(BatchDecodeWithPagedKVCacheWrapper):
     r"""Decode counterpart of :class:`BatchAttentionWithAttentionSinkWrapper`.
@@ -591,6 +593,8 @@ class BatchDecodeWithAttentionSinkWrapper(BatchDecodeWithPagedKVCacheWrapper):
         return super().run(
             q, paged_kv_cache, *args, q_scale=q_scale, k_scale=k_scale, **kwargs
         )
+
+    run_return_lse = functools.partialmethod(run, return_lse=True)
 
 
 # The parent's ``run`` carries ``@flashinfer_api(trace=gqa_paged_prefill_trace)``.
