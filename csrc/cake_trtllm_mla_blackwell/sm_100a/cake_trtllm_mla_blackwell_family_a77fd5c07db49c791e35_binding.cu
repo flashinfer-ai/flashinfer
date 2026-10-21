@@ -365,11 +365,6 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k, TensorView arg_tmap_v, Te
 }
 }  // namespace CAKE_VARIANT_NS
 
-int SelectVariant(float softmax_scale_log2, float bmm2_scale, int32_t total_work_items, int32_t value_split_count, int32_t max_pages_per_seq, int32_t enable_sink, int32_t grid_x, int32_t grid_z) {
-  if ((((((total_work_items == 8192) && (value_split_count == 16)) && (max_pages_per_seq == 32)) && (grid_x == 32)) && (grid_z == 512))) return 0;
-  return -1;
-}
-
 void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages, tvm::ffi::TensorView arg_output, tvm::ffi::TensorView arg_seq_lens, tvm::ffi::TensorView arg_page_table, tvm::ffi::TensorView arg_sinks, float softmax_scale_log2, float bmm2_scale, int32_t total_work_items, int32_t value_split_count, int32_t max_pages_per_seq, int32_t enable_sink, int32_t grid_x, int32_t grid_z, int64_t cuda_stream_ptr) {
   check_cuda_tensor(arg_q_rows, "q_rows");
   check_cuda_tensor(arg_kv_pages, "kv_pages");
@@ -378,25 +373,17 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages
   check_cuda_tensor(arg_page_table, "page_table");
   check_cuda_tensor(arg_sinks, "sinks");
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream_ptr));
-  int v = SelectVariant(softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, grid_x, grid_z);
-  switch (v) {
-    case 0: {
-      {
-        int64_t gx = grid_x;
-        int64_t gy = 1;
-        int64_t gz = grid_z;
-        CAKE_PROGRAM_SHIM::CAKE_VARIANT_NS::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
-      }
-      return;
-    }
-    default:
-      TVM_FFI_CHECK(false, ValueError) << "no dispatch route for " CAKE_STR(CAKE_FAMILY_NAME) " shape (softmax_scale_log2=" << softmax_scale_log2 << ", bmm2_scale=" << bmm2_scale << ", total_work_items=" << total_work_items << ", value_split_count=" << value_split_count << ", max_pages_per_seq=" << max_pages_per_seq << ", enable_sink=" << enable_sink << ", grid_x=" << grid_x << ", grid_z=" << grid_z << ")";
+  if (!(((((total_work_items == 8192) && (value_split_count == 16)) && (max_pages_per_seq == 32)) && (grid_x == 32)) && (grid_z == 512))) {
+    TVM_FFI_CHECK(false, ValueError) << "no dispatch route for " CAKE_STR(CAKE_FAMILY_NAME) " shape (softmax_scale_log2=" << softmax_scale_log2 << ", bmm2_scale=" << bmm2_scale << ", total_work_items=" << total_work_items << ", value_split_count=" << value_split_count << ", max_pages_per_seq=" << max_pages_per_seq << ", enable_sink=" << enable_sink << ", grid_x=" << grid_x << ", grid_z=" << grid_z << ")";
+  }
+  {
+    int64_t gx = grid_x;
+    int64_t gy = 1;
+    int64_t gz = grid_z;
+    CAKE_PROGRAM_SHIM::CAKE_VARIANT_NS::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
   }
 }
-
-int64_t RouteOf(float softmax_scale_log2, float bmm2_scale, int32_t total_work_items, int32_t value_split_count, int32_t max_pages_per_seq, int32_t enable_sink, int32_t grid_x, int32_t grid_z) { return SelectVariant(softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, grid_x, grid_z); }
 
 }  // namespace CAKE_PROGRAM_SHIM
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_PROGRAM_SHIM::Dispatch);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(route_of, CAKE_PROGRAM_SHIM::RouteOf);

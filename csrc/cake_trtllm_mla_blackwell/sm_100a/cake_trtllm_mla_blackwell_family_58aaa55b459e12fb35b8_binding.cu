@@ -495,11 +495,6 @@ void Run(TensorView arg_partial_O, TensorView arg_partial_lse, TensorView arg_O,
 }
 }  // namespace CAKE_VARIANT_NS_1
 
-int SelectVariant(float softmax_scale_log2, float partial_bmm2_scale, float bmm2_scale, int32_t num_split, int32_t total_work_items, int32_t max_pages_per_seq, int32_t enable_sink, int32_t grid_x, int32_t num_rows) {
-  if (((((num_split == 8) && (total_work_items == (num_rows * num_split))) && (num_rows > 0)) && (grid_x > 0))) return 0;
-  return -1;
-}
-
 void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_half_pages, tvm::ffi::TensorView arg_output, tvm::ffi::TensorView arg_seq_lens, tvm::ffi::TensorView arg_page_table, tvm::ffi::TensorView arg_sinks, tvm::ffi::TensorView arg_ws_partial_output, tvm::ffi::TensorView arg_ws_partial_lse, float softmax_scale_log2, float partial_bmm2_scale, float bmm2_scale, int32_t num_split, int32_t total_work_items, int32_t max_pages_per_seq, int32_t enable_sink, int32_t grid_x, int32_t num_rows, int64_t cuda_stream_ptr) {
   check_cuda_tensor(arg_q_rows, "q_rows");
   check_cuda_tensor(arg_kv_half_pages, "kv_half_pages");
@@ -508,41 +503,33 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_half_
   check_cuda_tensor(arg_page_table, "page_table");
   check_cuda_tensor(arg_sinks, "sinks");
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream_ptr));
-  int v = SelectVariant(softmax_scale_log2, partial_bmm2_scale, bmm2_scale, num_split, total_work_items, max_pages_per_seq, enable_sink, grid_x, num_rows);
-  switch (v) {
-    case 0: {
-      check_cuda_tensor(arg_ws_partial_output, "partial_output");
-      check_dtype(arg_ws_partial_output, DLDataType{kDLBfloat, 16, 1}, "partial_output");
-      TVM_FFI_CHECK(arg_ws_partial_output.numel() == (int64_t)((num_rows) * (128) * (num_split) * (512)), ValueError)
-          << "workspace 'partial_output' numel " << arg_ws_partial_output.numel()
-          << " != expected " << (int64_t)((num_rows) * (128) * (num_split) * (512));
-      check_cuda_tensor(arg_ws_partial_lse, "partial_lse");
-      check_dtype(arg_ws_partial_lse, DLDataType{kDLFloat, 32, 1}, "partial_lse");
-      TVM_FFI_CHECK(arg_ws_partial_lse.numel() == (int64_t)((num_rows) * (128) * (num_split)), ValueError)
-          << "workspace 'partial_lse' numel " << arg_ws_partial_lse.numel()
-          << " != expected " << (int64_t)((num_rows) * (128) * (num_split));
-      {
-        int64_t gx = grid_x;
-        int64_t gy = 1;
-        int64_t gz = 1;
-        CAKE_PROGRAM_SHIM::CAKE_VARIANT_NS_0::Run(arg_q_rows, arg_kv_half_pages, arg_kv_half_pages, arg_kv_half_pages, arg_ws_partial_output, arg_ws_partial_lse, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, partial_bmm2_scale, num_split, total_work_items, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
-      }
-      {
-        int64_t gx = num_rows;
-        int64_t gy = 128;
-        int64_t gz = 1;
-        CAKE_PROGRAM_SHIM::CAKE_VARIANT_NS_1::Run(arg_ws_partial_output, arg_ws_partial_lse, arg_output, arg_sinks, 128, num_split, bmm2_scale, enable_sink, gx, gy, gz, stream);
-      }
-      return;
-    }
-    default:
-      TVM_FFI_CHECK(false, ValueError) << "no dispatch route for " CAKE_STR(CAKE_FAMILY_NAME) " shape (softmax_scale_log2=" << softmax_scale_log2 << ", partial_bmm2_scale=" << partial_bmm2_scale << ", bmm2_scale=" << bmm2_scale << ", num_split=" << num_split << ", total_work_items=" << total_work_items << ", max_pages_per_seq=" << max_pages_per_seq << ", enable_sink=" << enable_sink << ", grid_x=" << grid_x << ", num_rows=" << num_rows << ")";
+  if (!((((num_split == 8) && (total_work_items == (num_rows * num_split))) && (num_rows > 0)) && (grid_x > 0))) {
+    TVM_FFI_CHECK(false, ValueError) << "no dispatch route for " CAKE_STR(CAKE_FAMILY_NAME) " shape (softmax_scale_log2=" << softmax_scale_log2 << ", partial_bmm2_scale=" << partial_bmm2_scale << ", bmm2_scale=" << bmm2_scale << ", num_split=" << num_split << ", total_work_items=" << total_work_items << ", max_pages_per_seq=" << max_pages_per_seq << ", enable_sink=" << enable_sink << ", grid_x=" << grid_x << ", num_rows=" << num_rows << ")";
+  }
+  check_cuda_tensor(arg_ws_partial_output, "partial_output");
+  check_dtype(arg_ws_partial_output, DLDataType{kDLBfloat, 16, 1}, "partial_output");
+  TVM_FFI_CHECK(arg_ws_partial_output.numel() == (int64_t)((num_rows) * (128) * (num_split) * (512)), ValueError)
+      << "workspace 'partial_output' numel " << arg_ws_partial_output.numel()
+      << " != expected " << (int64_t)((num_rows) * (128) * (num_split) * (512));
+  check_cuda_tensor(arg_ws_partial_lse, "partial_lse");
+  check_dtype(arg_ws_partial_lse, DLDataType{kDLFloat, 32, 1}, "partial_lse");
+  TVM_FFI_CHECK(arg_ws_partial_lse.numel() == (int64_t)((num_rows) * (128) * (num_split)), ValueError)
+      << "workspace 'partial_lse' numel " << arg_ws_partial_lse.numel()
+      << " != expected " << (int64_t)((num_rows) * (128) * (num_split));
+  {
+    int64_t gx = grid_x;
+    int64_t gy = 1;
+    int64_t gz = 1;
+    CAKE_PROGRAM_SHIM::CAKE_VARIANT_NS_0::Run(arg_q_rows, arg_kv_half_pages, arg_kv_half_pages, arg_kv_half_pages, arg_ws_partial_output, arg_ws_partial_lse, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, partial_bmm2_scale, num_split, total_work_items, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
+  }
+  {
+    int64_t gx = num_rows;
+    int64_t gy = 128;
+    int64_t gz = 1;
+    CAKE_PROGRAM_SHIM::CAKE_VARIANT_NS_1::Run(arg_ws_partial_output, arg_ws_partial_lse, arg_output, arg_sinks, 128, num_split, bmm2_scale, enable_sink, gx, gy, gz, stream);
   }
 }
-
-int64_t RouteOf(float softmax_scale_log2, float partial_bmm2_scale, float bmm2_scale, int32_t num_split, int32_t total_work_items, int32_t max_pages_per_seq, int32_t enable_sink, int32_t grid_x, int32_t num_rows) { return SelectVariant(softmax_scale_log2, partial_bmm2_scale, bmm2_scale, num_split, total_work_items, max_pages_per_seq, enable_sink, grid_x, num_rows); }
 
 }  // namespace CAKE_PROGRAM_SHIM
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_PROGRAM_SHIM::Dispatch);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(route_of, CAKE_PROGRAM_SHIM::RouteOf);

@@ -167,11 +167,6 @@ void Run(TensorView arg_Q, TensorView arg_KV, TensorView arg_fp8_lut, TensorView
 }
 }  // namespace CAKE_VARIANT_NS
 
-int SelectVariant(int32_t num_heads, int32_t qk_dim, int32_t value_dim, int32_t kv_stride, int32_t page_size, int32_t page_table_width, int32_t sparse_width, int32_t use_sparse, float softmax_scale, float bmm2_scale, int32_t enable_sink, int32_t write_lse, int32_t num_rows) {
-  if ((num_rows > 0)) return 0;
-  return -1;
-}
-
 void Dispatch(tvm::ffi::TensorView arg_query, tvm::ffi::TensorView arg_kv, tvm::ffi::TensorView arg_fp8_lut, tvm::ffi::TensorView arg_page_table, tvm::ffi::TensorView arg_sparse_indices, tvm::ffi::TensorView arg_row_batches, tvm::ffi::TensorView arg_row_seq_lens, tvm::ffi::TensorView arg_output, tvm::ffi::TensorView arg_lse, tvm::ffi::TensorView arg_sinks, int32_t num_heads, int32_t qk_dim, int32_t value_dim, int32_t kv_stride, int32_t page_size, int32_t page_table_width, int32_t sparse_width, int32_t use_sparse, float softmax_scale, float bmm2_scale, int32_t enable_sink, int32_t write_lse, int32_t num_rows, int64_t cuda_stream_ptr) {
   check_cuda_tensor(arg_query, "query");
   check_cuda_tensor(arg_kv, "kv");
@@ -184,25 +179,17 @@ void Dispatch(tvm::ffi::TensorView arg_query, tvm::ffi::TensorView arg_kv, tvm::
   check_cuda_tensor(arg_lse, "lse");
   check_cuda_tensor(arg_sinks, "sinks");
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream_ptr));
-  int v = SelectVariant(num_heads, qk_dim, value_dim, kv_stride, page_size, page_table_width, sparse_width, use_sparse, softmax_scale, bmm2_scale, enable_sink, write_lse, num_rows);
-  switch (v) {
-    case 0: {
-      {
-        int64_t gx = num_rows;
-        int64_t gy = num_heads;
-        int64_t gz = 1;
-        CAKE_PROGRAM_SHIM::CAKE_VARIANT_NS::Run(arg_query, arg_kv, arg_fp8_lut, arg_page_table, arg_sparse_indices, arg_row_batches, arg_row_seq_lens, arg_output, arg_lse, arg_sinks, num_heads, qk_dim, value_dim, kv_stride, page_size, page_table_width, sparse_width, use_sparse, softmax_scale, bmm2_scale, enable_sink, write_lse, gx, gy, gz, stream);
-      }
-      return;
-    }
-    default:
-      TVM_FFI_CHECK(false, ValueError) << "no dispatch route for " CAKE_STR(CAKE_FAMILY_NAME) " shape (num_heads=" << num_heads << ", qk_dim=" << qk_dim << ", value_dim=" << value_dim << ", kv_stride=" << kv_stride << ", page_size=" << page_size << ", page_table_width=" << page_table_width << ", sparse_width=" << sparse_width << ", use_sparse=" << use_sparse << ", softmax_scale=" << softmax_scale << ", bmm2_scale=" << bmm2_scale << ", enable_sink=" << enable_sink << ", write_lse=" << write_lse << ", num_rows=" << num_rows << ")";
+  if (!(num_rows > 0)) {
+    TVM_FFI_CHECK(false, ValueError) << "no dispatch route for " CAKE_STR(CAKE_FAMILY_NAME) " shape (num_heads=" << num_heads << ", qk_dim=" << qk_dim << ", value_dim=" << value_dim << ", kv_stride=" << kv_stride << ", page_size=" << page_size << ", page_table_width=" << page_table_width << ", sparse_width=" << sparse_width << ", use_sparse=" << use_sparse << ", softmax_scale=" << softmax_scale << ", bmm2_scale=" << bmm2_scale << ", enable_sink=" << enable_sink << ", write_lse=" << write_lse << ", num_rows=" << num_rows << ")";
+  }
+  {
+    int64_t gx = num_rows;
+    int64_t gy = num_heads;
+    int64_t gz = 1;
+    CAKE_PROGRAM_SHIM::CAKE_VARIANT_NS::Run(arg_query, arg_kv, arg_fp8_lut, arg_page_table, arg_sparse_indices, arg_row_batches, arg_row_seq_lens, arg_output, arg_lse, arg_sinks, num_heads, qk_dim, value_dim, kv_stride, page_size, page_table_width, sparse_width, use_sparse, softmax_scale, bmm2_scale, enable_sink, write_lse, gx, gy, gz, stream);
   }
 }
-
-int64_t RouteOf(int32_t num_heads, int32_t qk_dim, int32_t value_dim, int32_t kv_stride, int32_t page_size, int32_t page_table_width, int32_t sparse_width, int32_t use_sparse, float softmax_scale, float bmm2_scale, int32_t enable_sink, int32_t write_lse, int32_t num_rows) { return SelectVariant(num_heads, qk_dim, value_dim, kv_stride, page_size, page_table_width, sparse_width, use_sparse, softmax_scale, bmm2_scale, enable_sink, write_lse, num_rows); }
 
 }  // namespace CAKE_PROGRAM_SHIM
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_PROGRAM_SHIM::Dispatch);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(route_of, CAKE_PROGRAM_SHIM::RouteOf);

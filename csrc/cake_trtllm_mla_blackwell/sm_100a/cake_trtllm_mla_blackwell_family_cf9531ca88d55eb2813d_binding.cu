@@ -297,11 +297,6 @@ void Run(TensorView arg_Q_map, TensorView arg_K_map, TensorView arg_V_map, Tenso
 }
 }  // namespace CAKE_VARIANT_NS
 
-int SelectVariant(int32_t batch, int32_t q_len, int32_t page_table_stride, int32_t max_num_ctas_q, int32_t max_num_ctas_kv, float bmm1_scale_log2, float bmm2_scale) {
-  if (((batch > 0) && (q_len > 0))) return 0;
-  return -1;
-}
-
 void Dispatch(tvm::ffi::TensorView arg_query, tvm::ffi::TensorView arg_kv, tvm::ffi::TensorView arg_page_table, tvm::ffi::TensorView arg_seq_lens, tvm::ffi::TensorView arg_output, tvm::ffi::TensorView arg_completion, tvm::ffi::TensorView arg_ws_partial_output, tvm::ffi::TensorView arg_ws_partial_stats, int32_t batch, int32_t q_len, int32_t page_table_stride, int32_t max_num_ctas_q, int32_t max_num_ctas_kv, float bmm1_scale_log2, float bmm2_scale, int64_t cuda_stream_ptr) {
   check_cuda_tensor(arg_query, "query");
   check_cuda_tensor(arg_kv, "kv");
@@ -310,35 +305,27 @@ void Dispatch(tvm::ffi::TensorView arg_query, tvm::ffi::TensorView arg_kv, tvm::
   check_cuda_tensor(arg_output, "output");
   check_cuda_tensor(arg_completion, "completion");
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream_ptr));
-  int v = SelectVariant(batch, q_len, page_table_stride, max_num_ctas_q, max_num_ctas_kv, bmm1_scale_log2, bmm2_scale);
-  switch (v) {
-    case 0: {
-      check_cuda_tensor(arg_ws_partial_output, "partial_output");
-      check_dtype(arg_ws_partial_output, DLDataType{kDLBfloat, 16, 1}, "partial_output");
-      TVM_FFI_CHECK(arg_ws_partial_output.numel() == (int64_t)((((batch * 32) * q_len)) * (2) * (16) * (128)), ValueError)
-          << "workspace 'partial_output' numel " << arg_ws_partial_output.numel()
-          << " != expected " << (int64_t)((((batch * 32) * q_len)) * (2) * (16) * (128));
-      check_cuda_tensor(arg_ws_partial_stats, "partial_stats");
-      check_dtype(arg_ws_partial_stats, DLDataType{kDLFloat, 32, 1}, "partial_stats");
-      TVM_FFI_CHECK(arg_ws_partial_stats.numel() == (int64_t)((((batch * 32) * q_len)) * (2) * (16) * (2)), ValueError)
-          << "workspace 'partial_stats' numel " << arg_ws_partial_stats.numel()
-          << " != expected " << (int64_t)((((batch * 32) * q_len)) * (2) * (16) * (2));
-      {
-        int64_t gx = (q_len * 2);
-        int64_t gy = 32;
-        int64_t gz = batch;
-        CAKE_PROGRAM_SHIM::CAKE_VARIANT_NS::Run(arg_query, arg_kv, arg_kv, arg_page_table, arg_seq_lens, arg_ws_partial_output, arg_ws_partial_stats, arg_output, arg_completion, q_len, page_table_stride, max_num_ctas_q, max_num_ctas_kv, bmm1_scale_log2, bmm2_scale, gx, gy, gz, stream);
-      }
-      return;
-    }
-    default:
-      TVM_FFI_CHECK(false, ValueError) << "no dispatch route for " CAKE_STR(CAKE_FAMILY_NAME) " shape (batch=" << batch << ", q_len=" << q_len << ", page_table_stride=" << page_table_stride << ", max_num_ctas_q=" << max_num_ctas_q << ", max_num_ctas_kv=" << max_num_ctas_kv << ", bmm1_scale_log2=" << bmm1_scale_log2 << ", bmm2_scale=" << bmm2_scale << ")";
+  if (!((batch > 0) && (q_len > 0))) {
+    TVM_FFI_CHECK(false, ValueError) << "no dispatch route for " CAKE_STR(CAKE_FAMILY_NAME) " shape (batch=" << batch << ", q_len=" << q_len << ", page_table_stride=" << page_table_stride << ", max_num_ctas_q=" << max_num_ctas_q << ", max_num_ctas_kv=" << max_num_ctas_kv << ", bmm1_scale_log2=" << bmm1_scale_log2 << ", bmm2_scale=" << bmm2_scale << ")";
+  }
+  check_cuda_tensor(arg_ws_partial_output, "partial_output");
+  check_dtype(arg_ws_partial_output, DLDataType{kDLBfloat, 16, 1}, "partial_output");
+  TVM_FFI_CHECK(arg_ws_partial_output.numel() == (int64_t)((((batch * 32) * q_len)) * (2) * (16) * (128)), ValueError)
+      << "workspace 'partial_output' numel " << arg_ws_partial_output.numel()
+      << " != expected " << (int64_t)((((batch * 32) * q_len)) * (2) * (16) * (128));
+  check_cuda_tensor(arg_ws_partial_stats, "partial_stats");
+  check_dtype(arg_ws_partial_stats, DLDataType{kDLFloat, 32, 1}, "partial_stats");
+  TVM_FFI_CHECK(arg_ws_partial_stats.numel() == (int64_t)((((batch * 32) * q_len)) * (2) * (16) * (2)), ValueError)
+      << "workspace 'partial_stats' numel " << arg_ws_partial_stats.numel()
+      << " != expected " << (int64_t)((((batch * 32) * q_len)) * (2) * (16) * (2));
+  {
+    int64_t gx = (q_len * 2);
+    int64_t gy = 32;
+    int64_t gz = batch;
+    CAKE_PROGRAM_SHIM::CAKE_VARIANT_NS::Run(arg_query, arg_kv, arg_kv, arg_page_table, arg_seq_lens, arg_ws_partial_output, arg_ws_partial_stats, arg_output, arg_completion, q_len, page_table_stride, max_num_ctas_q, max_num_ctas_kv, bmm1_scale_log2, bmm2_scale, gx, gy, gz, stream);
   }
 }
-
-int64_t RouteOf(int32_t batch, int32_t q_len, int32_t page_table_stride, int32_t max_num_ctas_q, int32_t max_num_ctas_kv, float bmm1_scale_log2, float bmm2_scale) { return SelectVariant(batch, q_len, page_table_stride, max_num_ctas_q, max_num_ctas_kv, bmm1_scale_log2, bmm2_scale); }
 
 }  // namespace CAKE_PROGRAM_SHIM
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_PROGRAM_SHIM::Dispatch);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(route_of, CAKE_PROGRAM_SHIM::RouteOf);
