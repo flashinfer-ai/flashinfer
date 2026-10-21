@@ -503,10 +503,22 @@ class MegaMoENvfp4Frontend:
             t.fc2_alpha.data_ptr(),
             t.fc1_norm_const.data_ptr(),
             t.output_activation.data_ptr(),
+            # The scale is the one input a caller may legitimately re-view
+            # between launches (the other tensors are session buffers), and the
+            # kernel reads it as a flat contiguous plane -- so key its full
+            # metadata, not just the pointer, or a cache hit on the same
+            # data_ptr would bypass _validate_inputs for a strided / reshaped
+            # view and launch with the stale arguments.
             (
-                t.fc1_activation_per_token_scale.data_ptr()
+                (
+                    t.fc1_activation_per_token_scale.data_ptr(),
+                    tuple(t.fc1_activation_per_token_scale.shape),
+                    tuple(t.fc1_activation_per_token_scale.stride()),
+                    t.fc1_activation_per_token_scale.dtype,
+                    t.fc1_activation_per_token_scale.device,
+                )
                 if t.fc1_activation_per_token_scale is not None
-                else 0
+                else None
             ),
             num_tokens,
             torch.cuda.current_stream().cuda_stream,

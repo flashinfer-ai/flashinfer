@@ -1525,6 +1525,45 @@ def test_nvfp4_kernel_per_token_scale_matches_torch_reference(
         assert rel_l2_unscaled.item() > 0.05, (
             "per-token scale had no observable effect -- test is not discriminating"
         )
+
+        if num_tokens == 192 and fc1_alpha is None and activation == "standard":
+            # Launch-cache path: a contiguous scale compiles/launches fine, then
+            # a strided re-view of the SAME storage (same data_ptr) must be
+            # rejected by run() rather than hit the cached launch arguments.
+            from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+                MegaMoENvfp4Inputs,
+            )
+
+            max_tokens = problem["max_tokens"]
+            storage = torch.ones(2 * max_tokens, dtype=torch.float32, device="cuda")
+            storage[:max_tokens].copy_(scale_buf)
+
+            def inputs_with(scale_view):
+                return MegaMoENvfp4Inputs(
+                    activation=symm_buffer.x,
+                    activation_sf=symm_buffer.x_sf,
+                    topk_idx=symm_buffer.topk_idx,
+                    topk_weights=symm_buffer.topk_weights,
+                    fc1_weight=transformed_l1[0],
+                    fc1_weight_sf=transformed_l1[1],
+                    fc2_weight=transformed_l2[0],
+                    fc2_weight_sf=transformed_l2[1],
+                    fc1_alpha=symm_buffer.fc1_alpha,
+                    fc2_alpha=symm_buffer.fc2_alpha,
+                    fc1_norm_const=symm_buffer.fc1_norm_const,
+                    output_activation=symm_buffer.output_activation,
+                    fc1_activation_per_token_scale=scale_view,
+                )
+
+            frontend = symm_buffer._frontend
+            y_contig = frontend.run(inputs_with(storage[:max_tokens]), sync=True)
+            torch.testing.assert_close(
+                y_contig[:num_tokens].to(torch.float32), yk, atol=0.0, rtol=0.0
+            )
+            strided = storage[::2]
+            assert strided.data_ptr() == storage[:max_tokens].data_ptr()
+            with pytest.raises(ValueError, match="contiguous"):
+                frontend.run(inputs_with(strided), sync=True)
     finally:
         symm_buffer.destroy()
 
@@ -1816,3 +1855,18 @@ def test_nvfp4_shim_per_token_scale_input_validation():
     assert strided.shape == (tokens,)
     with pytest.raises(ValueError, match="contiguous"):
         on._validate_inputs(make_inputs(strided), num_tokens=tokens)
+    # run() revalidates only on a launch-cache miss, so a re-view of the same
+    # storage (same data_ptr, different stride / shape / dtype) must change the
+    # launch key -- otherwise the strided view would reuse the cached launch
+    # arguments and be read as if it were contiguous.
+    storage = torch.ones(2 * tokens, dtype=torch.float32, device=dev)
+    key_contig = on._launch_cache_key(make_inputs(storage[:tokens]), tokens)
+    assert storage[::2].data_ptr() == storage[:tokens].data_ptr()
+    assert on._launch_cache_key(make_inputs(storage[::2]), tokens) != key_contig
+    assert (
+        on._launch_cache_key(make_inputs(storage[: tokens // 2]), tokens) != key_contig
+    )
+    assert (
+        on._launch_cache_key(make_inputs(storage[:tokens].view(torch.int32)), tokens)
+        != key_contig
+    )
