@@ -183,7 +183,7 @@ The registry holds the 6 programs for `sm_107a`, exported from the kernel
 snapshot named in the pull request.
 
 Tests: `tests/experimental/test_cake_rubin_mla_nvfp4_decode.py` (the backend
-suite: imports only this package through `tests/test_helpers/cake_package`;
+suite: imports only this package, `flashinfer.experimental.cake_rubin_mla_nvfp4_decode`;
 the plan and registry tests run everywhere, the kernel tests skip without a
 compute capability 10.7 device or before the package is exported) against an
 FP32 reference over the decoded NVFP4 operands, and

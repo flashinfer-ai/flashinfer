@@ -21,7 +21,7 @@ the single-buffer 352-byte cache layout, split / merge rows up to and past 32
 splits, CUDA-graph replay with a changed page table, the BF16 query quantizer
 bit for bit against its torch reference, and the host plan (no device).
 
-The suite imports only the package, through ``tests/test_helpers/cake_package``.
+The suite imports only the package, ``flashinfer.experimental.cake_rubin_mla_nvfp4_decode``.
 """
 
 import math
@@ -30,10 +30,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from flashinfer.experimental.cake_rubin_mla_nvfp4_decode import cake_backend, cake_jit
 
-cake_backend = cake_package("cake_rubin_mla_nvfp4_decode", "cake_backend")
-cake_jit = cake_package("cake_rubin_mla_nvfp4_decode", "cake_jit")
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 
 LATENT = cake_backend.LATENT
