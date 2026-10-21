@@ -14,7 +14,8 @@ Differences from the base kernel:
   as a rolled loop at T <= 4, and the flush RMW as loops (stochastic rounding everywhere, round
   to nearest on sm_107a at most T, with packed fp16 x fp32 FMAs), against SM instruction-cache
   thrash when flush and verify rows share an SM;
-* an opt-in persistent kernel for die-localized launches (``persistent=True``, sm_107a), with
+* a persistent kernel for die-localized launches (sm_107a; chosen automatically at T = 2-8 when
+  ``num_sms`` names a die-restricted stream, or forced with ``persistent``), with
   ``num_sms`` / ``grid_override`` / ``persistent_counter`` / ``flush_hint``;
 * the fp32 copies of bf16 ``A_log`` / ``dt_bias`` are safe across streams and re-made after an
   in-place update.
@@ -69,8 +70,8 @@ substitution per V row on CUDA cores.  Flush rows issue fold half 0 before the s
 lands, so each half's RMW follows its readout and the epilogue overlaps the next head's
 state load.
 
-Persistent variant (``persistent=True``, opt-in, sm_107a only, T >= 5 with all 4 value heads
-of a key head per CTA): ``kernel_persist``, at most 4 CTAs per SM of the launch's stream that
+Persistent variant (sm_107a only, any T, all 4 value heads of a key head per CTA; automatic at
+T = 2-8 on die-localized launches): ``kernel_persist``, at most 4 CTAs per SM of the launch's stream that
 loop over the (key head, row) items -- verify, flush and padded rows in any mix -- with the
 same per-row steps. Use it only on die-localized launches (see
 ``gated_delta_rule_mtp_ucache_flush_umma``).
@@ -165,11 +166,24 @@ _PZ_XPF = True
 # trace build: per-CTA end times p50 328-331 us, max 357-376 us; CUPTI 354 us static vs 333 us
 # dynamic (final4 373 us).
 _PZ_DYN = True
-# archs the persistent kernel is enabled on: sm_107a only (Rubin: spill-free at T = 5-8 in every
-# rounding mode, tested and measured there). Not sm_100a (B200): it compiles spill-free there too
+# archs the persistent kernel is enabled on: sm_107a only (Rubin: spill-free at T = 2-8 in every
+# rounding mode, tested and measured there; T = 1 keeps 60 B of STL in the 24-register warps). Not sm_100a (B200): it compiles spill-free there too
 # (offline ptxas), but it has never run there, and its speed-up comes from die-localized launches,
 # which B200 does not have.
 _PZ_CC = ((10, 7),)
+# Automatic choice (persistent=None, the default): the persistent kernel where it measured faster --
+# T in _PZ_AUTO_T, all 4 value heads per CTA, a die-localized launch (``num_sms`` below the device's
+# SMs) and at least _PZ_AUTO_MIN_ITEMS[hint] (key head, row) items per CTA slot (H x B / (4 x
+# num_sms)). Rubin, localized split (106 SMs per die), persistent vs non-persistent, B total:
+# * no flush rows: T = 2-8 1.03-1.18x at every B from 64 (T = 8, B = 256: 0.99x);
+# * 30 % flush rows, random order: 1.00-1.09x from B = 512 (9.7 items per slot; T = 2: 0.99x),
+#   0.92-0.99x at B = 256 (4.8) and 0.89-0.97x at B = 64; T = 4, B = 512-4096, 0-30 %:
+#   1.02-1.10x, flush-first 1.01-1.09x; Philox-5 / LCG at T = 4 the same picture;
+# * T = 1: 0.94-1.03x (its prologue reorder already starts the state stream early): not automatic;
+# * one whole-GPU launch over interleaved memory: T = 4 0.94-0.98x, T = 5-8 0.88-0.93x.
+_PZ_AUTO_T = (2, 3, 4, 5, 6, 7, 8)
+# flush_hint "none": any size; flush rows possible (None / "some" / "flush_first"): >= 8 items
+_PZ_AUTO_MIN_ITEMS = {"none": 0, "some": 8}
 
 
 # Stochastic rounding: its flush RMW runs as loops (one RMW body per head or per CTA, see
@@ -188,10 +202,12 @@ def _use_regsplit(T: int, hpc: int, sr: str, sr_rounds: int) -> bool:
 
 
 def _persist_ok(T: int, hpk: int, hpc: int, sr: str) -> bool:
-    """Persistent kernel scope: T >= 5, 4 value heads per key head and per CTA; round-to-nearest
-    and every stochastic-rounding mode (the persistent build always takes the register split)."""
+    """Persistent kernel scope: 1 <= T <= 8, 4 value heads per key head and per CTA;
+    round-to-nearest and every stochastic-rounding mode (the persistent build always takes the
+    register split; at T <= 4 it uses the T >= 5 row structure: v rows through SMEM on verify rows,
+    the D-build masks, no prologue reorder)."""
     return (
-        T >= 5
+        1 <= T <= 8
         and hpk == HPK
         and hpc == HPK
         and sr in ("", "philox", "lcg", "lcg_clock")
@@ -254,8 +270,9 @@ class GdnReplayMtpUmmaRubin:
         # d_mask, _u_window_head) T = 8 101.7 -> 100.8, but T = 4 87.3 -> 89.8; both together
         # T = 8 102.7 (the reorder alone 101.2). So T <= 4 builds take the reorder only and
         # T >= 5 builds the epi changes only (T = 5-7 not measured, taken as T = 8).
-        self.pro_reorder = T <= 4
-        self.epi = T >= 5
+        # (the persistent kernel at T <= 4: the T >= 5 row structure, see _persist_ok)
+        self.pro_reorder = T <= 4 and not persistent
+        self.epi = T >= 5 or persistent
         # D build (epi): clear the slots j >= P with uniform word masks instead of per-value
         # selects (_d_build). Not in the 2- and 3-head builds (at T >= 5: 192 threads, 80
         # registers, at their limit): there the masks' uniform registers moved ptxas into
@@ -272,7 +289,7 @@ class GdnReplayMtpUmmaRubin:
         # epilogue has read its v rows, so u_free[h] is arrived there (right after those
         # reads), and head h + 2's window goes behind its own state's second half (see
         # _u_window_head). Flush rows are unchanged (16-slot windows, v from global memory).
-        self.vsmem = T >= 5
+        self.vsmem = T >= 5 or persistent
         self.wv = W_RING - T  # u slots copied on verify rows (vsmem)
         # Math warps' per-head code (D build, readout / RMW waits, epilogue) as a rolled loop over
         # the heads (dynamic head index; the mbarriers of each kind in one array) instead of
@@ -4482,6 +4499,32 @@ def _pz_runs_plain(
     return n_items <= cap * _CTA_SLOTS_PER_SM * n_sms
 
 
+def _pz_auto(
+    T: int,
+    hpk: int,
+    heads_per_cta: Optional[int],
+    n_items: int,
+    num_sms: Optional[int],
+    grid_override: Optional[int],
+    target,
+    flush_hint: Optional[str] = None,
+) -> bool:
+    """persistent=None: the persistent kernel where it measured faster (see _PZ_AUTO_T)."""
+    return (
+        (target.major, target.minor) in _PZ_CC
+        and T in _PZ_AUTO_T
+        and hpk == HPK
+        and heads_per_cta in (None, hpk)
+        and grid_override is None
+        and num_sms is not None
+        and int(num_sms) < target.num_sms
+        and n_items
+        >= _PZ_AUTO_MIN_ITEMS["none" if flush_hint == "none" else "some"]
+        * _CTA_SLOTS_PER_SM
+        * int(num_sms)
+    )
+
+
 # Claim counters for launches captured into CUDA graphs: per device, chunks of int32[2] slots
 # zeroed eagerly (topped up by eager persistent launches), one slot per captured launch, never
 # reused (each graph replay's last CTA re-zeroes its slot).
@@ -4565,7 +4608,7 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
     stochastic_rounding: Optional[str] = None,
     rand_seed: Optional[torch.Tensor] = None,
     philox_rounds: int = 10,
-    persistent: bool = False,
+    persistent: Optional[bool] = None,
     num_sms: Optional[int] = None,
     grid_override: Optional[int] = None,
     persistent_counter: Optional[torch.Tensor] = None,
@@ -4573,7 +4616,7 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
 ) -> torch.Tensor:
     """Rubin (sm_107a) build of ``gated_delta_rule_mtp_ucache_flush_umma`` (the UMMA kernel
     behind ``gated_delta_rule_mtp_ucache_flush`` for the fp16-state arm), 1 <= T <= 8: same
-    tensors, contract and results, plus the opt-in persistent kernel (``persistent``,
+    tensors, contract and results, plus the persistent kernel (``persistent``,
     ``num_sms``, ``grid_override``, ``persistent_counter``, ``flush_hint``). Runs on sm_107a
     and sm_100a (there without the persistent kernel); any other arch raises
     ``NotImplementedError``.
@@ -4595,7 +4638,7 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
       not jointly independent (see ``_rmw``). With ``rand_seed`` it is reproducible per seed;
       without, the seed is %clock (not reproducible).
 
-    ``persistent`` (opt-in, never chosen automatically): one launch of G = min(H x B, 4 x
+    ``persistent`` (None = automatic, the default; True / False force it): one launch of G = min(H x B, 4 x
     ``num_sms``) CTAs (``num_sms``: the SMs the launch's stream can use, default the device's;
     ``grid_override`` forces G, for tests) that loop over the (key head, row) items -- verify,
     flush and padded rows in any mix and order -- claiming them from an int32[2] counter that the
@@ -4604,11 +4647,16 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
     zeroed pool, so separately captured graphs can be replayed concurrently), or the caller's
     ``persistent_counter`` (zeroed int32[2] CUDA tensor; give each concurrently running launch its
     own). ``persistent_counter_reset`` re-zeroes the cached
-    counters after an aborted launch. Only sm_107a, T >= 5 with all 4 value
-    heads of a key head per CTA; every rounding mode. Measured faster only on die-localized
-    launches (Rubin, each die's rows with its buffers in that die's memory, ``num_sms`` = the
-    die's 106 SMs, 0 % flush: 1.07-1.15x vs the non-persistent kernel); one whole-GPU launch over
-    die-interleaved memory measured 0.88-0.93x, so do not enable it there.
+    counters after an aborted launch. Only sm_107a, all 4 value heads of a key head per CTA;
+    every T and rounding mode. Measured faster only on die-localized launches (Rubin, each die's
+    rows with its buffers in that die's memory, ``num_sms`` = the die's 106 SMs): T = 2-8 1.03-1.18x
+    without flush rows, 1.00-1.09x with 30 % from B = 512, slower below that; T = 1 0.94-1.03x. One whole-GPU launch over
+    die-interleaved memory measured 0.88-0.93x (T = 5-8). Automatic (None): the persistent kernel
+    on sm_107a for T = 2-8 with all value heads per CTA when ``num_sms`` is given and below the
+    device's SM count (a die-restricted stream, e.g. a green context), ``grid_override`` is unset
+    and, unless ``flush_hint`` is "none", there are at least 8 (key head, row) items per CTA slot
+    (H x B >= 32 x ``num_sms``: B >= 212 per 106-SM die at H = 16); the non-persistent kernel
+    otherwise. Pass ``num_sms`` (and ``flush_hint``) on die-localized launches.
 
     ``flush_hint`` (with ``persistent=True``; performance only, never changes results: both
     kernels are bit-identical on every row mix) tells the host which flush rows the launch
@@ -4696,8 +4744,13 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
             f"only (got {target.arch}); use gated_delta_rule_mtp_ucache_flush_umma"
         )
     hpk = HV // H
+    nsm = int(num_sms) if num_sms is not None else target.num_sms
+    if persistent is None:
+        persistent = _pz_auto(
+            T, hpk, heads_per_cta, H * B, num_sms, grid_override, target, flush_hint
+        )
     hpc = (
-        (hpk if persistent else auto_heads_per_cta(B, H, target.num_sms, hpk))
+        (hpk if persistent else auto_heads_per_cta(B, H, nsm, hpk))
         if heads_per_cta is None
         else int(heads_per_cta)
     )
@@ -4752,7 +4805,7 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
             )
         if not _persist_ok(T, hpk, hpc, sr):
             raise ValueError(
-                f"persistent=True: T >= 5 and 4 value heads per key head and per CTA only "
+                f"persistent=True: 4 value heads per key head and per CTA only "
                 f"(T={T}, HV/H={hpk}, heads_per_cta={hpc}, "
                 f"stochastic_rounding={stochastic_rounding!r})"
             )
@@ -4767,7 +4820,6 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
                 "persistent_counter must be a contiguous int32 tensor of 2 elements on "
                 "the inputs' device (zeroed before its first launch)"
             )
-        nsm = int(num_sms) if num_sms is not None else target.num_sms
         if grid_override is None and _pz_runs_plain(T, sr, H * B, nsm, flush_hint):
             persistent = (
                 False  # measured dispatch rule: the non-persistent kernel is faster

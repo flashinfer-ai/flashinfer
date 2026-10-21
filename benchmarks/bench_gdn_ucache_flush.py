@@ -49,9 +49,11 @@ UMMA / Rubin arms only:
       by locality domain, with backfill so every SM is used); fork / join is
       captured in the graph and the time is the CUPTI span of both launches.
       Needs a driver and cuda-python with the CUDA 13.4 locality-domain APIs.
-  --persistent: ``persistent=True`` (Rubin arms, sm_107a, T >= 5) with
-      ``num_sms`` = the launch's SMs and ``flush_hint`` from the case ("none" at
-      0 % flush, "flush_first" with --row-order flush_first, else "some").
+  Rubin arms pass ``num_sms`` = the launch's SMs and ``flush_hint`` from the case
+      ("none" at 0 % flush, "flush_first" with --row-order flush_first, else "some")
+      on localized launches, so the kernel's automatic choice applies there
+      (persistent at T = 4-8 on sm_107a).
+  --persistent / --no-persistent: force ``persistent=True`` / ``False`` (Rubin arms).
 
 DRAM %: ``--dram-bytes`` (JSON list of {"T", "B", "rate", "bytes"}, e.g. ncu
 ``dram__bytes.sum`` per step, collected with ``--single-call`` under ncu) and
@@ -402,8 +404,9 @@ def bench_point(
     l2="zero",
     u_dtype=None,
     split=None,
-    persistent=False,
+    persistent=None,
     single_call=False,
+    rubin=False,
 ):
     q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, idx = make_case(
         B, seed, io_dtype, state_dtype, ring_dtype, u_dtype
@@ -443,13 +446,16 @@ def bench_point(
         kw = {}
         if ROW_ORDER != "none":
             kw["row_order"] = make_row_order(hl_src[rows], FLUSH_MIN, ROW_ORDER)
-        if split is not None:  # heads per CTA for the die's SMs, not the device's
+        if split is not None and not rubin:  # heads per CTA for the die's SMs
             from flashinfer.gdn_kernels.gdn_replay_mtp_umma import auto_heads_per_cta
 
             n = rows.stop - rows.start
             kw["heads_per_cta"] = auto_heads_per_cta(n, H, n_sms, HV // H)
-        if persistent:
-            kw.update(persistent=True, num_sms=n_sms)
+        if persistent is not None:
+            kw["persistent"] = persistent
+        if rubin and (split is not None or persistent):
+            # the launch's SMs: heads per CTA and the persistent choice follow them
+            kw["num_sms"] = n_sms
             kw["flush_hint"] = (
                 "none"
                 if rate_pct == 0
@@ -648,7 +654,12 @@ def main():
     ap.add_argument(
         "--persistent",
         action="store_true",
-        help="rubin arms: persistent=True with num_sms and flush_hint (sm_107a, T >= 5)",
+        help="rubin arms: force persistent=True (default: the kernel's automatic choice)",
+    )
+    ap.add_argument(
+        "--no-persistent",
+        action="store_true",
+        help="rubin arms: force persistent=False",
     )
     ap.add_argument(
         "--single-call",
@@ -670,8 +681,11 @@ def main():
     args = ap.parse_args()
     if (args.localized or args.persistent) and args.arm not in _UMMA_SR:
         ap.error("--localized / --persistent: umma or rubin arms only")
-    if args.persistent and not args.arm.startswith("rubin"):
-        ap.error("--persistent: rubin arms only")
+    if (args.persistent or args.no_persistent) and not args.arm.startswith("rubin"):
+        ap.error("--persistent / --no-persistent: rubin arms only")
+    if args.persistent and args.no_persistent:
+        ap.error("--persistent and --no-persistent")
+    pz = True if args.persistent else (False if args.no_persistent else None)
     split = DieSplit() if args.localized else None
     dram_bytes = {}
     if args.dram_bytes:
@@ -695,7 +709,7 @@ def main():
         f"ring={ring_dtype}), "
         f"T={T} W={W} ring={RING} base={args.base} fm={FLUSH_MIN} P_verify={P_VERIFY} "
         + (f"localized split {split.sms} SMs " if split else "")
-        + ("persistent " if args.persistent else "")
+        + {True: "persistent ", False: "non-persistent ", None: ""}[pz]
         + f"H={H} HV={HV} K=V={K} | "
         f"CUDA-graph replay, CUPTI ({args.l2} L2), median of {args.iters}",
         flush=True,
@@ -720,8 +734,9 @@ def main():
                 l2=args.l2,
                 u_dtype=torch.float16 if args.arm.endswith("_u16") else None,
                 split=split,
-                persistent=args.persistent,
+                persistent=pz,
                 single_call=args.single_call,
+                rubin=args.arm.startswith("rubin"),
             )
             for r in args.rates
         ]
@@ -754,7 +769,7 @@ def main():
                 p_verify=P_VERIFY,
                 row_order=args.row_order,
                 localized=args.localized,
-                persistent=args.persistent,
+                persistent={True: True, False: False, None: "auto"}[pz],
                 us=t,
                 dram_pct=p,
             )

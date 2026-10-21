@@ -21,9 +21,10 @@ Correctness tests for the Rubin (sm_107a) build of the UMMA MTP ReplaySSM kernel
    ``gated_delta_rule_mtp_ucache_flush_umma_rubin`` (same fp32 oracle, cases and
    tolerances; the base file's kernel entry is swapped by an autouse fixture).
 2. What only the Rubin build has: bit-identity with the base kernel, the fp32 gate-parameter
-   cache across streams and in-place updates, and the opt-in persistent kernel (sm_107a):
-   bit-identity with the non-persistent launch on any row mix and grid, the dispatch rule and
-   ``flush_hint``, a caller-owned claim counter, and concurrent replays of separately captured
+   cache across streams and in-place updates, and the persistent kernel (sm_107a):
+   bit-identity with the non-persistent launch at T = 1-8 on any row mix and grid, the automatic
+   choice, the dispatch rule and ``flush_hint``, a caller-owned claim counter, and concurrent
+   replays of separately captured
    CUDA graphs.
 
 Run:  pytest tests/gdn/test_mtp_umma_rubin.py -q
@@ -363,7 +364,7 @@ def test_persistent_graphs_concurrent(arena, monkeypatch):
     assert bool(M._PZ_ARENA) == arena
 
 
-@pytest.mark.parametrize("T", [5, 8])
+@pytest.mark.parametrize("T", [1, 2, 3, 4, 5, 8])
 @pytest.mark.parametrize("mode", ["none", "philox5", "lcg"])
 def test_persistent_bit_identical(T, mode):
     _skip_if_no_persistent()
@@ -528,6 +529,46 @@ def test_persistent_flush_hint(monkeypatch):
         _pz_call(case, fm, flush_hint="mixed")  # validated without persistent too
 
 
+def test_persistent_auto(monkeypatch):
+    """persistent=None (the default): the persistent kernel at T in _PZ_AUTO_T (2-8) with all value
+    heads per CTA when num_sms names fewer SMs than the device (a die-localized launch) and there are
+    enough items per CTA slot; the non-persistent kernel otherwise. Same bits either way."""
+    _skip_if_no_persistent()
+    M = _rubin_mod()
+    seen = []
+    real = M._get_kernel
+
+    def spy(*args, **kw):
+        seen.append(args[9] if len(args) > 9 else kw.get("persistent", False))
+        return real(*args, **kw)
+
+    monkeypatch.setattr(M, "_get_kernel", spy)
+    monkeypatch.setattr(M, "_PZ_AUTO_MIN_ITEMS", {"none": 0, "some": 0})
+    nsm = torch.cuda.get_device_properties(DEV).multi_processor_count
+    for T, pat in ((1, "FVVPF"), (2, "VFVVP"), (4, "FVVPFV"), (8, "VFVVF")):
+        case, fm = _pz_case(T, 400 + T, pat)
+        ref = _pz_call(case, fm, persistent=False)
+        auto = T in M._PZ_AUTO_T
+        for kw, want in (
+            (dict(), False),  # no num_sms: a whole-device launch
+            (dict(num_sms=nsm), False),
+            (dict(num_sms=nsm // 2), auto),
+            (dict(num_sms=nsm // 2, heads_per_cta=2), False),
+            (dict(num_sms=nsm // 2, grid_override=3), False),
+        ):
+            seen.clear()
+            got = _pz_call(case, fm, **kw)
+            assert seen == [want], (T, kw, seen)
+            assert all(torch.equal(x, y) for x, y in zip(ref, got, strict=True)), (T, kw)
+    # too few items per CTA slot: non-persistent, unless the launch has no flush rows
+    monkeypatch.setattr(M, "_PZ_AUTO_MIN_ITEMS", {"none": 0, "some": 10**6})
+    case, fm = _pz_case(4, 404, "VVVPVV")
+    for hint, want in ((None, False), ("some", False), ("flush_first", False), ("none", True)):
+        seen.clear()
+        _pz_call(case, fm, num_sms=nsm // 2, flush_hint=hint)
+        assert seen == [want], (hint, seen)
+
+
 def test_persistent_api():
     """Scope checks, and a caller-owned claim counter (zeroed again by the launch's last CTA)."""
     _skip_if_no_persistent()
@@ -539,6 +580,5 @@ def test_persistent_api():
     assert ctr.tolist() == [0, 0]
     with pytest.raises(ValueError):
         _pz_call(case, fm, persistent=True, persistent_counter=ctr.to(torch.int64))
-    case4, fm4 = _pz_case(4, 78, "FVVPF")
-    with pytest.raises(ValueError):
-        _pz_call(case4, fm4, persistent=True)
+    with pytest.raises(ValueError):  # the persistent kernel runs all 4 value heads per CTA
+        _pz_call(case, fm, persistent=True, heads_per_cta=2)
