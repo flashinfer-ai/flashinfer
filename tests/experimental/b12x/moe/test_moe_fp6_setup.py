@@ -11,7 +11,7 @@ import pytest
 
 from b12x._lib.utils.fp6_geometry import mxfp6_tile_k, mxfp6_num_k_blocks
 from b12x.moe._shared.kernels import mxfp6_moe
-from b12x.moe._shared.kernels.dynamic import MoEDynamicKernelBackend
+from b12x.moe._shared.kernels.dynamic.kernel import MoEDynamicKernelBackend
 
 
 def test_mxfp6_moe_helpers_import():
@@ -39,10 +39,8 @@ def test_moe_static_dynamic_init_tile_k_default():
 
 def test_micro_mxfp6_not_supported():
     pytest.skip("pending: FP6 micro kernel port (is_supported_mxfp6 not upstream)")
-    from b12x.moe._shared.kernels.micro import (
-        MXFP6_BLOCK_SIZE,
-        MoEMicroKernelBackend,
-    )
+    from b12x.moe._shared.kernels.micro.config import MXFP6_BLOCK_SIZE
+    from b12x.moe._shared.kernels.micro.kernel import MoEMicroKernelBackend
 
     assert MXFP6_BLOCK_SIZE == 32
     assert MoEMicroKernelBackend.is_supported_mxfp6(1, 128, 128, 8, 8) is False

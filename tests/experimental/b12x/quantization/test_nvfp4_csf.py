@@ -117,7 +117,10 @@ def _fixture(rows, columns, codec, device):
     [(c, g) for c in (0, 1, 2) for g in ((128, 16, 256, 8), (2048, 256, 4096, 64))]
     + [(0, (640, 160, 2560, 20))],
 )
-def test_pair_exact_routes_and_poisoned_graph(codec, ids_dtype, geometry):
+@pytest.mark.parametrize("compile_forward", [False, True])
+def test_pair_exact_routes_and_poisoned_graph(
+    codec, ids_dtype, geometry, compile_forward
+):
     device = require_b12x()
     r13, c13, r2, c2 = geometry
     first, expected13 = _fixture(r13, c13, codec, device)
@@ -147,12 +150,25 @@ def test_pair_exact_routes_and_poisoned_graph(codec, ids_dtype, geometry):
     out2.fill_(0xD6)
     run(routes)
     check({1, 3})
+    capture_call = lambda: run(routes)
+    if compile_forward:
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        captured = make_fx(capture_call)()
+        assert any(
+            node.target is torch.ops.b12x.nvfp4_csf_pair.default
+            for node in captured.graph.nodes
+        )
+        capture_call = torch.compile(
+            captured, fullgraph=True, options={"triton.cudagraphs": False}
+        )
+        capture_call()
     with kernel_resolution_guard("NVFP4-CSF retained decoder"):
         for count in (1, 3, 5):
             run(routes[:count])
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            run(routes)
+            capture_call()
         for values, active in [([2, 0, 2, -1, invalid], {0, 2}), ([-1] * 5, set())]:
             routes.copy_(torch.tensor(values, dtype=ids_dtype, device=device))
             out13.fill_(0xD6)

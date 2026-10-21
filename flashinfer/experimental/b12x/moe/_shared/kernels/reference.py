@@ -28,6 +28,7 @@ class OracleMetrics:
     rmse: float
     mean_abs: float
     cos: float
+    normalized_rmse: float
 
 
 @dataclass(frozen=True)
@@ -74,11 +75,14 @@ def compare_to_reference(
         torch.where(denom > 1e-24, dot / denom, torch.zeros_like(dot)),
     )
     cos = cos_rows.mean().item()
+    rmse = diff.square().mean().sqrt()
+    reference_rms = reference_fp32.square().mean().sqrt()
     return OracleMetrics(
         max_abs=diff.abs().max().item(),
-        rmse=diff.square().mean().sqrt().item(),
+        rmse=rmse.item(),
         mean_abs=diff.abs().mean().item(),
         cos=cos,
+        normalized_rmse=(rmse / reference_rms.clamp_min(1e-30)).item(),
     )
 
 
@@ -151,9 +155,16 @@ def _apply_gated_activation(
     *,
     activation: str,
     swiglu_limit: float | None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float,
     swiglu_beta: float,
 ) -> torch.Tensor:
+    if swiglu_clamp_after_silu:
+        gate = torch.nn.functional.silu(gate.float())
+        if swiglu_limit is not None:
+            gate = gate.clamp(max=float(swiglu_limit))
+            up = up.clamp(-float(swiglu_limit), float(swiglu_limit))
+        return gate * up.float()
     if swiglu_limit is not None:
         gate = torch.clamp(gate, max=float(swiglu_limit))
         up = torch.clamp(up, min=-float(swiglu_limit), max=float(swiglu_limit))
@@ -365,6 +376,7 @@ def _trace_nvfp4_route(
     router_weight: float,
     activation: str,
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     quant_scale_math: str = "direct_division",
@@ -419,6 +431,7 @@ def _trace_nvfp4_route(
                 up_out,
                 activation=activation,
                 swiglu_limit=swiglu_limit,
+                swiglu_clamp_after_silu=swiglu_clamp_after_silu,
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
             )
@@ -497,6 +510,7 @@ def trace_moe_reference_nvfp4_route(
     route_idx: int,
     activation: str = "silu",
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     quant_scale_math: str = "direct_division",
@@ -553,6 +567,7 @@ def trace_moe_reference_nvfp4_route(
         router_weight=router_weight,
         activation=activation,
         swiglu_limit=swiglu_limit,
+        swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         quant_scale_math=quant_scale_math,
@@ -746,6 +761,7 @@ def moe_reference_w4a16_f32(
     *,
     activation: str = "silu",
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
 ) -> torch.Tensor:
@@ -804,6 +820,7 @@ def moe_reference_w4a16_f32(
                     up_out,
                     activation=activation,
                     swiglu_limit=swiglu_limit,
+                    swiglu_clamp_after_silu=swiglu_clamp_after_silu,
                     swiglu_alpha=swiglu_alpha,
                     swiglu_beta=swiglu_beta,
                 )
@@ -980,6 +997,7 @@ def moe_reference_nvfp4(
     *,
     activation: str = "silu",
     swiglu_limit: float | None = None,
+    swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     quant_scale_math: str = "direct_division",
@@ -1030,6 +1048,7 @@ def moe_reference_nvfp4(
                 route_idx=k_idx,
                 activation=activation,
                 swiglu_limit=swiglu_limit,
+                swiglu_clamp_after_silu=swiglu_clamp_after_silu,
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 quant_scale_math=quant_scale_math,

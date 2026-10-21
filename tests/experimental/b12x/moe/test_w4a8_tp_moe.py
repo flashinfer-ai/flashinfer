@@ -24,7 +24,11 @@ from benchmarks.experimental.b12x.benchmark_moe import (
     load_expert_weights,
     make_routed_inputs,
 )
-from b12x.testing.reference.helpers import prepare_tp_moe_fp4_experts, run_tp_moe_fp4
+from b12x.testing.reference.helpers import (
+    make_tp_moe_fp4_binding,
+    prepare_tp_moe_fp4_experts,
+    run_tp_moe_fp4,
+)
 
 
 def _skip_if_unavailable() -> None:
@@ -193,12 +197,8 @@ def test_nvfp4_fused_micro_graph_replay_with_prequeued_aux_work() -> None:
     from benchmarks.experimental.b12x.benchmark_moe import (
         make_shape_only_expert_weights,
     )
-    from b12x.moe.fused_moe._impl import (
-        allocate_tp_moe_workspace_pool,
-        build_tp_moe_fp4_binding,
-        clear_tp_moe_caches,
-        b12x_moe_fp4,
-    )
+    from b12x.moe import fused_moe
+    from b12x.moe.fused_moe._impl import clear_tp_moe_caches
 
     clear_tp_moe_caches()
     device = torch.device("cuda")
@@ -236,8 +236,7 @@ def test_nvfp4_fused_micro_graph_replay_with_prequeued_aux_work() -> None:
         w13_layout=weights.w13_layout,
     )
     output = torch.empty_like(x)
-    binding = build_tp_moe_fp4_binding(
-        scratch=allocate_tp_moe_workspace_pool(),
+    with make_tp_moe_fp4_binding(
         a=x,
         experts=experts,
         topk_weights=topk_weights.contiguous(),
@@ -245,32 +244,33 @@ def test_nvfp4_fused_micro_graph_replay_with_prequeued_aux_work() -> None:
         output=output,
         input_scales_static=True,
         quant_mode="nvfp4",
-    )
+    ) as binding:
+        assert binding.implementation == "micro"
 
-    b12x_moe_fp4(binding=binding)
-    torch.cuda.synchronize()
-    expected = output.clone()
+        fused_moe.run(binding=binding)
+        torch.cuda.synchronize()
+        expected = output.clone()
 
-    graph = torch.cuda.CUDAGraph()
-    capture_stream = torch.cuda.Stream()
-    capture_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(capture_stream), torch.cuda.graph(graph):
-        b12x_moe_fp4(binding=binding)
-    torch.cuda.current_stream().wait_stream(capture_stream)
-    torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream), torch.cuda.graph(graph):
+            fused_moe.run(binding=binding)
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        torch.cuda.synchronize()
 
-    aux_stream = torch.cuda.Stream()
-    aux_a = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device)
-    aux_b = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device)
-    aux_out = torch.empty_like(aux_a)
-    output.zero_()
-    with torch.cuda.stream(aux_stream):
-        for _ in range(16):
-            torch.mm(aux_a, aux_b, out=aux_out)
-    graph.replay()
-    torch.cuda.current_stream().wait_stream(aux_stream)
-    torch.cuda.synchronize()
+        aux_stream = torch.cuda.Stream()
+        aux_a = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device)
+        aux_b = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device)
+        aux_out = torch.empty_like(aux_a)
+        output.zero_()
+        with torch.cuda.stream(aux_stream):
+            for _ in range(16):
+                torch.mm(aux_a, aux_b, out=aux_out)
+        graph.replay()
+        torch.cuda.current_stream().wait_stream(aux_stream)
+        torch.cuda.synchronize()
 
-    assert output.isfinite().all()
-    assert output.abs().sum().item() > 0
-    torch.testing.assert_close(output, expected, atol=2e-3, rtol=0.0)
+        assert output.isfinite().all()
+        assert output.abs().sum().item() > 0
+        torch.testing.assert_close(output, expected, atol=2e-3, rtol=0.0)

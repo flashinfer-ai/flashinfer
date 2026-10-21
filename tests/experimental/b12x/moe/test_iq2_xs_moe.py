@@ -90,6 +90,10 @@ def test_prepared_execution(
         ((128, 64, 128, 64), 16, 5, "packed"),
         ((128, 128, 128, 128), 32, 3, "packed"),
         ((64, 128, 64, 128), 48, 2, "packed"),
+        pytest.param((128, 64, 128, 64), 48, 3, "packed", id="cooperative-k128-k128"),
+        pytest.param((128, 64, 64, 128), 48, 3, "packed", id="cooperative-k128-k64"),
+        pytest.param((64, 128, 128, 64), 48, 3, "packed", id="cooperative-k64-k128"),
+        pytest.param((64, 128, 64, 128), 48, 5, "packed", id="cooperative-k64-k64"),
         ((64, 256, 64, 256), 64, 3, "packed"),
     ),
 )
@@ -119,8 +123,9 @@ def test_tuned_tiles_pipeline_and_route_blocks_replay(
         "relu2",
     )
     experts, _ = prepare_experts(layer, device, activation="relu2")
-    capacity = 8 if route == "direct" else 65
-    counts = (1, 3, 8) if route == "direct" else (1, 17, 65)
+    # M48 residency regressions cover full prefill as well as partial rows.
+    capacity = 8 if route == "direct" else 4096 if block == 48 else 65
+    counts = (1, 3, 8) if route == "direct" else (1, 17, capacity)
     config = MoeDecodeConfig(
         backend="w4a16",
         route_planner="internal",

@@ -9,11 +9,9 @@ from cutlass.cute.runtime import from_dlpack
 import pytest
 import torch
 
-from b12x.moe._shared.kernels.w4a16.kernel import (
-    MoEMicroKernelW4A16SmallMDirect,
-    W4A16GemmKernel,
-    _pack_modelopt_words,
-)
+from b12x.moe._shared.kernels.w4a16.kernel.direct import MoEMicroKernelW4A16SmallMDirect
+from b12x.moe._shared.kernels.w4a16.kernel.gemm import W4A16GemmKernel
+from b12x.moe._shared.kernels.w4a16.kernel.config import _pack_modelopt_words
 
 
 class _PackWords:

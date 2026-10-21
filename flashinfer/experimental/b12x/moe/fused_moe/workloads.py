@@ -8,8 +8,13 @@ import random
 import torch
 
 
-TUNING_WORKLOAD_VERSION = "shared_0_20_40_60_80_v1"
-ROUTING_WORKLOADS = ("disjoint", *(f"shared_{p}" for p in (0, 20, 40, 60, 80, 100)))
+TUNING_WORKLOAD_VERSION = "statistical_mix_v1"
+ROUTING_MIX = ("diffuse", "skewed", "correlated")
+ROUTING_WORKLOADS = (
+    *ROUTING_MIX,
+    "disjoint",
+    *(f"shared_{p}" for p in (0, 20, 40, 60, 80, 100)),
+)
 
 
 def make_routing_ids(
@@ -23,6 +28,8 @@ def make_routing_ids(
 ) -> torch.Tensor:
     """Build routes with distinct experts per token.
 
+    Statistical scenarios sample lognormal expert popularity; ``correlated``
+    also shares random preferences within four-token groups.
     ``shared_N`` reuses N% of the batch's token/expert assignments, rounded
     to the nearest realizable expert count. Reuse favors already popular
     experts, rather than giving every expert exactly one or two tokens.
@@ -39,6 +46,10 @@ def make_routing_ids(
         )
     if workload not in ROUTING_WORKLOADS:
         raise ValueError(f"unknown routing workload: {workload!r}")
+    if workload in ROUTING_MIX:
+        return _make_statistical_routing_ids(
+            tokens, top_k, num_experts, workload=workload, seed=seed, device=device
+        )
     return _make_shared_routing_ids(
         tokens,
         top_k,
@@ -86,29 +97,60 @@ def _make_shared_routing_ids(
     return torch.tensor(rows, dtype=torch.int32, device=device)
 
 
-def make_tuning_routes(
-    tokens: int, top_k: int, num_experts: int, *, device: torch.device | str
+def _make_statistical_routing_ids(
+    tokens: int,
+    top_k: int,
+    num_experts: int,
+    *,
+    workload: str,
+    seed: int,
+    device: torch.device | str,
 ) -> torch.Tensor:
-    """Cover route-sharing variation in small verification batches.
+    """Sample distinct experts with persistent popularity and group correlation."""
+    expert_std, group_std = {
+        "diffuse": (0.5, 0.0),
+        "skewed": (1.5, 0.0),
+        "correlated": (0.8, 2.0),
+    }[workload]
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    popularity = torch.randn(num_experts, generator=generator) * expert_std
+    logits = popularity.expand(tokens, -1).clone()
+    if group_std:
+        groups = torch.randn((tokens + 3) // 4, num_experts, generator=generator)
+        logits += groups.repeat_interleave(4, dim=0)[:tokens] * group_std
+    uniform = torch.rand(tokens, num_experts, generator=generator).clamp_min_(1e-7)
+    logits -= (-uniform.log()).log()
+    return logits.topk(top_k, dim=-1).indices.to(device=device, dtype=torch.int32)
 
-    Five equally weighted sharing levels retain a nominal 40% mean while
-    avoiding selection against a single distinct-expert count. Token and
-    expert-pool constraints can clamp the realizable sharing levels.
+
+def make_tuning_routes(
+    tokens: int,
+    top_k: int,
+    num_experts: int,
+    *,
+    device: torch.device | str,
+    seed: int = 104729,
+    samples_per_workload: int = 2,
+) -> torch.Tensor:
+    """Equally weight diffuse, skewed, and correlated synthetic route scenarios.
+
+    Each scenario uses independent seeds. Popularity varies across experts;
+    correlated scenarios also share preferences within groups of four tokens.
+    These weights provide workload coverage, not measured traffic frequencies.
     """
-    if 2 <= tokens <= 8:
-        return torch.stack(
-            [
-                _make_shared_routing_ids(
-                    tokens,
-                    top_k,
-                    num_experts,
-                    sharing_percent=sharing,
-                    seed=42 + index,
-                    device=device,
-                )
-                for index, sharing in enumerate((0, 20, 40, 60, 80))
-            ]
-        )
-    return make_routing_ids(
-        tokens, top_k, num_experts, workload="disjoint", device=device
-    ).unsqueeze(0)
+    if samples_per_workload < 1:
+        raise ValueError("samples_per_workload must be positive")
+    return torch.stack(
+        [
+            make_routing_ids(
+                tokens,
+                top_k,
+                num_experts,
+                workload=workload,
+                seed=seed + tokens + 1009 * index,
+                device=device,
+            )
+            for workload in ROUTING_MIX
+            for index in range(samples_per_workload)
+        ]
+    )

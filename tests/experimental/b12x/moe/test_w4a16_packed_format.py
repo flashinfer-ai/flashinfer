@@ -25,6 +25,33 @@ def _positive_fp8(shape: tuple[int, ...]) -> torch.Tensor:
     return (torch.rand(shape, device="cuda") * 1.75 + 0.03125).to(torch.float8_e4m3fn)
 
 
+@pytest.mark.parametrize(
+    "scale_factor,discarded_codes", [(1, 7), (2, 3), (4, 1), (8, 0)]
+)
+def test_nvfp4_packed_scale_boundary_preserves_normals_and_discards_subnormals(
+    scale_factor, discarded_codes
+):
+    """Packed BF16 scale bytes require normalized E4M3 values after rescaling."""
+    from b12x.moe._shared.kernels.w4a16.prepare import (
+        _process_nvfp4_packed_scales,
+    )
+
+    source = torch.arange(127, dtype=torch.uint8).view(torch.float8_e4m3fn).float()
+    source = source[source * scale_factor <= 448]
+    repeated = source[:, None].expand(-1, 4).contiguous()
+    packed = _process_nvfp4_packed_scales(repeated, scale_factor=scale_factor).view(
+        torch.uint8
+    )
+    assert torch.equal(packed, packed[:, :1].expand_as(packed))
+    raw = packed[:, 0].to(torch.int16) << 7
+    restored = raw.view(torch.float16).float() / (128 * scale_factor)
+    discarded = (source > 0) & (source * scale_factor < 1 / 64)
+    assert int(discarded.sum()) == discarded_codes
+    assert torch.count_nonzero(restored[discarded]) == 0
+    torch.testing.assert_close(restored[~discarded], source[~discarded], rtol=0, atol=0)
+    assert torch.count_nonzero(packed[source == 0]) == 0
+
+
 def _e8m0_scales(shape: tuple[int, ...]) -> torch.Tensor:
     storage = torch.randint(0, 256, shape, dtype=torch.uint8, device="cuda")
     flat = storage.flatten()

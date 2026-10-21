@@ -49,6 +49,7 @@ class Caps(_impl.TPMoEScratchCaps):
                 collect_activation_amax=self.collect_activation_amax,
                 deterministic_output=self.deterministic_output,
                 swiglu_limit=_codec_scalar(limit),
+                swiglu_clamp_after_silu=self.swiglu_clamp_after_silu,
                 swiglu_alpha=_codec_scalar(alpha),
                 swiglu_beta=_codec_scalar(beta),
                 w13_layout=weight.w13_layout,

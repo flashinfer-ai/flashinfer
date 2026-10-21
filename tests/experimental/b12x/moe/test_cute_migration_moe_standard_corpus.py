@@ -13,6 +13,10 @@ from dataclasses import dataclass, replace
 import pytest
 import torch
 
+from b12x.moe.fused_moe._compat import Caps
+from b12x.moe.fused_moe._impl import plan_tp_moe_scratch as plan
+from b12x.moe.fused_moe._tuning import MoeDecodeConfig
+
 from b12x.moe._shared.kernels.reference import (
     compare_to_reference,
     moe_reference_nvfp4,
@@ -292,10 +296,9 @@ def _prepare_and_bind(
     w13_layout: str = "w13",
     fast_math: bool | None = False,
     swiglu_limit: float | None = None,
+    decode_config: MoeDecodeConfig | None = None,
 ) -> _BoundCase:
     """Prepare checkpoint weights and bind caller-owned launch storage."""
-
-    from b12x.moe.fused_moe._impl import TPMoEScratchCaps, plan_tp_moe_scratch
 
     experts = prepare_tp_moe_fp4_experts(
         a=inputs.a,
@@ -311,14 +314,15 @@ def _prepare_and_bind(
         quant_mode=quant_mode,
         source_format=source_format,
         w13_layout=w13_layout,
-    )
-    scratch_plan = plan_tp_moe_scratch(
-        TPMoEScratchCaps(
+    )._impl
+    scratch_plan = plan(
+        Caps(
             max_tokens=int(inputs.a.shape[0]),
             num_topk=num_topk,
             device=inputs.a.device,
             weight_plan=experts.plan,
             quant_mode=quant_mode,
+            decode_config=decode_config,
             core_token_counts=(int(inputs.a.shape[0]),),
             route_num_experts=0,
             swiglu_limit=swiglu_limit,
@@ -890,23 +894,24 @@ def test_standard_moe_nvfp4_n16_tail_dynamic_live_graph_oracle(
     )
 
 
-@pytest.mark.parametrize("m", [4, 7])
+@pytest.mark.parametrize("share_input", [False, True])
+@pytest.mark.parametrize("topk", [8, 10])
+@pytest.mark.parametrize("m", [4, 7, 25])
 @pytest.mark.parametrize("work_source", ["materialized_queue", "persistent_grid"])
 def test_standard_moe_external_route_plan_live_graph_oracle(
     monkeypatch: pytest.MonkeyPatch,
     m: int,
     work_source: str,
+    share_input: bool,
+    topk: int,
 ) -> None:
     """Consume a Triton-planned grouped route layout under live replay."""
 
     num_experts = 32
     hidden_size = 512
     intermediate_size = 128
-    topk = 10
     device = require_b12x()
     _reset_dispatch_environment(monkeypatch)
-    monkeypatch.setenv("B12X_MICRO_DYNAMIC_CUTOVER_PAIRS", "0")
-    monkeypatch.setenv("B12X_DYNAMIC_EXTERNAL_ROUTE_PLAN", "1")
     monkeypatch.setenv("B12X_DYNAMIC_WORK_SOURCE", work_source)
     weights = _make_nvfp4_weights(
         device,
@@ -954,6 +959,14 @@ def test_standard_moe_external_route_plan_live_graph_oracle(
         quant_mode="nvfp4",
         source_format="modelopt_nvfp4",
         num_topk=topk,
+        decode_config=MoeDecodeConfig(
+            backend="dynamic",
+            route_planner="triton",
+            max_active_clusters=None,
+            dynamic_tile_m=16,
+            dynamic_route_mode="grouped",
+            nvfp4_share_input=share_input,
+        ),
     )
     launch_plan = case.scratch_plan.launch_plan
     assert launch_plan.implementation == "dynamic"

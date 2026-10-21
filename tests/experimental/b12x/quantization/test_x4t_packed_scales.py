@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from b12x.moe.fused_moe import CsfScalePlanes
+from b12x.moe.fused_moe import CsfBlockPlanes
 from b12x._lib.quant.x4t_scales import make_x4t_scale_batch
 from b12x._lib.quant.x4t_packed_scales import (
     decode_x4t_packed_scales,
@@ -48,9 +48,16 @@ def _batch(rows, columns, rotation, task_rows=64, raw=False, *, finite=False):
         exceptions.append(torch.from_numpy(words))
         logical.append(torch.from_numpy(values))
     if raw:
-        return CsfScalePlanes(tuple(fixed), tuple(exceptions)), torch.stack(logical).to(
-            device
-        )
+        from b12x.loader._csf_blocks import export_csf_blocks
+
+        return CsfBlockPlanes(
+            tuple(
+                export_csf_blocks(
+                    f, x, rows=rows, columns=columns, quantization="mxfp4"
+                )
+                for f, x in zip(fixed, exceptions, strict=True)
+            )
+        ), torch.stack(logical).to(device)
     batch = make_x4t_scale_batch(
         fixed,
         exceptions,
@@ -168,7 +175,7 @@ def test_packed_counts_retained_program_and_poisoned_graph():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("raw", [False, True])
+@pytest.mark.parametrize("raw", [True])
 @pytest.mark.parametrize(
     "layout,packing", [("w13", "mma_packed"), ("w31", "source_native")]
 )
@@ -178,8 +185,8 @@ def test_csf_preparation_preserves_scale_batches_and_shared_scratch(
     from b12x.moe import fused_moe
 
     rotation = 576 if layout == "w13" else 0
-    fc1, _ = _batch(1152, 160, rotation, raw=raw)
-    fc2, _ = _batch(5120, 18, 0, raw=raw)
+    fc1, logical1 = _batch(1152, 160, rotation, raw=raw)
+    fc2, logical2 = _batch(5120, 18, 0, raw=raw)
     device = require_b12x()
     w13 = torch.zeros((4, 1152, 2560), dtype=torch.uint8, device=device)
     w2 = torch.zeros((4, 5120, 288), dtype=torch.uint8, device=device)
@@ -219,14 +226,21 @@ def test_csf_preparation_preserves_scale_batches_and_shared_scratch(
         assert payload.w13 is w13 and payload.w2 is w2
         assert payload.micro_w13_scale.data_ptr() == scales13.data_ptr()
         assert payload.micro_w2_scale.data_ptr() == scales2.data_ptr()
-    assert len(payload.x4t_packed_pair_programs) == 4
-    for actual, reference in (
-        (payload.x4t_w13_scale, _batch(1152, 160, rotation)[0]),
-        (payload.x4t_w2_scale, _batch(5120, 18, 0)[0]),
+    experts._impl.nvfp4_csf.decode_all(scales13, scales2)
+    for actual, logical, rows, columns, rotation in (
+        (scales13, logical1, 1152, 160, rotation),
+        (scales2, logical2, 5120, 18, 0),
     ):
-        for name in actual.__dataclass_fields__:
-            a, r = getattr(actual, name), getattr(reference, name)
-            assert torch.equal(a, r) if isinstance(a, torch.Tensor) else a == r
+        reference = _pack_e8m0_k32_scales(
+            logical,
+            size_k=columns * 32,
+            size_n=rows,
+            row_rotation=rotation,
+            allow_k_tail=True,
+        )
+        torch.testing.assert_close(
+            actual.reshape(-1), reference.reshape(-1), rtol=0, atol=0
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -326,146 +340,3 @@ def test_packed_pair_rejects_conflicting_modes_and_aliases():
         decode_x4t_packed_scales(
             batch, ids, output, expert_counts=True, expert_ids_sorted=True
         )
-
-
-@pytest.mark.parametrize("tokens", [1, 129])
-@pytest.mark.parametrize("packing", ["packed", "modelopt"])
-def test_paired_x4t_moe_without_caller_counts_matches_dense_scales(
-    tokens, packing, monkeypatch
-):
-    from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
-    from b12x.moe._shared.kernels.w4a16.prepare import (
-        prepare_w4a16_fp4_e8m0_k32_weights,
-        prepare_w4a16_e8m0_native_weights,
-        prepare_w4a16_x4t_weights,
-        make_w4a16_packed_buffers,
-    )
-    from b12x._lib.quant.x4t_scales import X4TScaleBatch
-
-    hidden, intermediate, experts, topk = 3584, 192, 4, 2
-    first, logical_first = _batch(2 * intermediate, hidden // 32, 0, finite=True)
-    second, logical_second = _batch(hidden, intermediate // 32, 0, finite=True)
-    device = first.fixed.device
-    w13 = torch.randint(
-        256, (experts, 2 * intermediate, hidden // 2), dtype=torch.uint8, device=device
-    )
-    w2 = torch.randint(
-        256, (experts, hidden, intermediate // 2), dtype=torch.uint8, device=device
-    )
-    unit = torch.ones(experts, dtype=torch.float32, device=device)
-    scales = (
-        torch.empty(
-            (experts, hidden // 32, 2 * intermediate), dtype=torch.uint8, device=device
-        ),
-        torch.empty(
-            (experts, intermediate // 32, hidden), dtype=torch.uint8, device=device
-        ),
-    )
-    prepare_dense = (
-        prepare_w4a16_e8m0_native_weights
-        if packing == "modelopt"
-        else prepare_w4a16_fp4_e8m0_k32_weights
-    )
-    dense = prepare_dense(
-        w13,
-        logical_first,
-        unit,
-        w2,
-        logical_second,
-        unit,
-        activation="situ",
-        w13_layout="w31",
-    )
-    with pytest.raises(ValueError, match="must not overlap"):
-        prepare_w4a16_x4t_weights(
-            w13,
-            first,
-            unit,
-            w2,
-            second,
-            unit,
-            scales[0],
-            scales[0].reshape(-1)[: scales[1].numel()].reshape_as(scales[1]),
-            activation="situ",
-            w13_layout="w31",
-            weight_layout=packing,
-        )
-    nonpaired, _ = _batch(2 * intermediate, hidden // 32, 0, task_rows=32, finite=True)
-    with pytest.raises(ValueError, match="paired 64-row tasks"):
-        prepare_w4a16_x4t_weights(
-            w13,
-            nonpaired,
-            unit,
-            w2,
-            second,
-            unit,
-            *scales,
-            activation="situ",
-            w13_layout="w31",
-            weight_layout=packing,
-        )
-    compressed = prepare_w4a16_x4t_weights(
-        w13,
-        first,
-        unit,
-        w2,
-        second,
-        unit,
-        *scales,
-        activation="situ",
-        w13_layout="w31",
-        weight_layout=packing,
-    )
-    x = torch.randn((tokens, hidden), dtype=torch.bfloat16, device=device) * 0.125
-    ids = torch.randint(experts, (tokens, topk), dtype=torch.int32, device=device)
-    route_weights = torch.softmax(torch.randn(tokens, topk, device=device), -1)
-    buffers = [
-        make_w4a16_packed_buffers(p, m=tokens, topk=topk, dtype=x.dtype, device=device)
-        for p in (dense, compressed)
-    ]
-
-    def run(prepared, scratch):
-        return run_w4a16_moe(
-            x,
-            prepared,
-            route_weights,
-            ids,
-            activation="situ",
-            intermediate_cache13=scratch.intermediate_cache13,
-            intermediate_cache2=scratch.intermediate_cache2,
-            output=scratch.output,
-            fc1_c_tmp=scratch.fc1_c_tmp,
-            fc2_c_tmp=scratch.fc2_c_tmp,
-            packed_route_indices=scratch.packed_route_indices,
-            block_expert_ids=scratch.block_expert_ids,
-            packed_route_count=scratch.packed_route_count,
-            expert_offsets=scratch.expert_offsets,
-        )
-
-    monkeypatch.setattr(
-        X4TScaleBatch,
-        "validate",
-        lambda *_: pytest.fail("scale validation during execution"),
-    )
-    expected = run(dense, buffers[0]).clone()
-    actual = run(compressed, buffers[1]).clone()
-    assert torch.isfinite(actual).all() and actual.abs().any()
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    with kernel_resolution_guard("paired X4T MoE graph"):
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            run(compressed, buffers[1])
-        for _ in range(3):
-            ids.random_(0, experts)
-            ids[0, 0] = -1
-            x.mul_(-0.9)
-            expected = run(dense, buffers[0]).clone()
-            for scale in scales:
-                scale.fill_(0xD6)
-            buffers[1].output.fill_(float("nan"))
-            allocated = torch.cuda.memory_allocated()
-            graph.replay()
-            torch.cuda.synchronize()
-            assert torch.cuda.memory_allocated() == allocated
-            torch.testing.assert_close(buffers[1].output, expected, rtol=0, atol=0)
-        graph.reset()

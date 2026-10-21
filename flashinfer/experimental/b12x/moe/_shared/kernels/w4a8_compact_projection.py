@@ -7,7 +7,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
-from b12x._lib.intrinsics.atomics import ld_shared_u32, st_shared_u32
 from b12x._lib.intrinsics.memory import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
@@ -17,13 +16,7 @@ from b12x._lib.intrinsics.memory import (
     shared_ptr_to_u32,
 )
 from b12x._lib.intrinsics.mma import e2m1x8_to_qmma_e2m1x8, mxfp8_mma_m16n8k32_f32_e2m1
-from b12x._lib.quant.mxfp4_csf_inline import (
-    BASE_BYTES as _CSF_BASE_BYTES,
-    TILE_BYTES as _CSF_TILE_BYTES,
-    inline_row_bases,
-    inline_scale_words,
-    stage_inline_tile,
-)
+from b12x._lib.intrinsics.atomics import ld_shared_u32, st_shared_u32
 
 
 class W4A8CompactMicroProjectionKernel:
@@ -36,7 +29,12 @@ class W4A8CompactMicroProjectionKernel:
     num_warps = 4
     threads_per_cta = 128
 
-    def __init__(self, k: int, n: int, num_topk: int, csf_inline: bool = False):
+    def __init__(
+        self,
+        k: int,
+        n: int,
+        num_topk: int,
+    ):
         if k <= 0 or n < 64 or k % 128 or n % 64:
             raise ValueError(
                 "compact W4A8 projection requires K divisible by 128 and "
@@ -49,11 +47,6 @@ class W4A8CompactMicroProjectionKernel:
         self.num_topk = int(num_topk)
         self.n_tiles = (self.n + self.tile_n - 1) // self.tile_n
         self.n64_tail = self.n % self.tile_n == 64
-        # The SFB operand is inline MXFP4-CSF storage (mxfp4_csf_inline): stages
-        # copy compressed tile blocks and each thread rebuilds its scale words.
-        self.csf_inline = bool(csf_inline)
-        if self.csf_inline and not self.n64_tail:
-            raise ValueError("inline MXFP4-CSF scales require compact N64 W4A8 weights")
         self.b_payload_bytes = self.tile_n * self.tile_k // 2
         self.sfb_bytes = (self.tile_n // 8) * 8 * 4
         self.a_offset = 0
@@ -272,18 +265,7 @@ class W4A8CompactMicroProjectionKernel:
                 k64_slice,
                 tid,
             )
-            if cutlass.const_expr(self.csf_inline):
-                # Row block ``projection * n_tiles + output_tile``.
-                stage_inline_tile(
-                    get_ptr_as_int64(w13_sfb, Int32(0)),
-                    (Int64(expert) * Int64(2 * self.n_tiles) + Int64(projection_tile))
-                    * Int64(self.k // 128)
-                    + Int64(k128_slice),
-                    sfb_base,
-                    tid,
-                    0,
-                )
-            else:
+            if k64_slice & Int32(1) == Int32(0):
                 self._stage_n64_sfb(
                     w13_sfb,
                     sfb_base,
@@ -309,13 +291,14 @@ class W4A8CompactMicroProjectionKernel:
                 tid,
             )
             scale_word_base = packed_tile_index * Int64(256)
-            self._stage_sfb(
-                w13_sfb,
-                sfb_base,
-                scale_word_base,
-                packed_half,
-                tid,
-            )
+            if k64_slice & Int32(1) == Int32(0):
+                self._stage_sfb(
+                    w13_sfb,
+                    sfb_base,
+                    scale_word_base,
+                    packed_half,
+                    tid,
+                )
 
     @cute.jit
     def _run_task(
@@ -337,26 +320,6 @@ class W4A8CompactMicroProjectionKernel:
         lane = tid & Int32(31)
         q = lane >> Int32(2)
         c = lane & Int32(3)
-        if cutlass.const_expr(self.csf_inline):
-            # Row bases are constant over the K sweep: load them once per task.
-            csf_blocks = Int64(2 * self.n_tiles)
-            csf_experts = Int64(alpha.shape[0])
-            csf_tiles_bytes = (
-                csf_experts * csf_blocks * Int64(self.k // 128) * Int64(_CSF_TILE_BYTES)
-            )
-            csf_storage = get_ptr_as_int64(w13_sfb, Int32(0))
-            csf_raw = (
-                csf_storage
-                + csf_tiles_bytes
-                + csf_experts * csf_blocks * Int64(_CSF_BASE_BYTES)
-            )
-            csf_slot = warp * Int32(32) + q * Int32(4)
-            csf_bases = inline_row_bases(
-                csf_storage,
-                csf_tiles_bytes,
-                Int64(expert) * csf_blocks + Int64(projection_tile),
-                csf_slot,
-            )
         for preload in cutlass.range_constexpr(3):
             if cutlass.const_expr(preload < self.k // 64):
                 self._stage_slice(
@@ -378,6 +341,8 @@ class W4A8CompactMicroProjectionKernel:
             acc[nt].fill(0.0)
         k64_slice = Int32(0)
         k64_tiles = Int32(self.k // 64)
+        b_scale_words = cute.make_rmem_tensor((4,), Uint32)
+        b_scale_words.fill(Uint32(0))
         while k64_slice < k64_tiles:
             stage_base = smem_base + (k64_slice & Int32(3)) * Int32(self.stage_bytes)
             b_base = stage_base + Int32(self.b_offset)
@@ -398,11 +363,14 @@ class W4A8CompactMicroProjectionKernel:
                 )
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(3)
-            cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.sync_threads()
+            if k64_slice & Int32(1) == Int32(0):
+                for nt in cutlass.range_constexpr(4):
+                    n8 = warp * Int32(4) + Int32(nt)
+                    b_scale_words[nt] = ld_shared_u32(
+                        sfb_base + ((n8 * Int32(8) + q) << Int32(2))
+                    )
             scale_shift = Uint32(k64_slice & Int32(1)) * Uint32(16)
-            if cutlass.const_expr(self.csf_inline):
-                csf_scales = inline_scale_words(sfb_base, csf_bases, csf_slot, csf_raw)
             asc = ld_shared_u32(stage_base + Int32(self.sfa_offset)) >> scale_shift
             for kb in cutlass.range_constexpr(2):
                 # One routed token is replicated across the logical M16
@@ -422,14 +390,7 @@ class W4A8CompactMicroProjectionKernel:
                 b_words[3] = bw3
                 for nt in cutlass.range_constexpr(4):
                     b0, b1 = e2m1x8_to_qmma_e2m1x8(b_words[nt])
-                    n8 = warp * Int32(4) + Int32(nt)
-                    if cutlass.const_expr(self.csf_inline):
-                        sfb = csf_scales[nt] >> scale_shift
-                    else:
-                        sfb = (
-                            ld_shared_u32(sfb_base + ((n8 * Int32(8) + q) << Int32(2)))
-                            >> scale_shift
-                        )
+                    sfb = b_scale_words[nt] >> scale_shift
                     fragment = acc[nt]
                     x0, x1, x2, x3 = mxfp8_mma_m16n8k32_f32_e2m1(
                         cutlass.Float32(0.0),
@@ -511,8 +472,8 @@ class W4A8CompactMicroProjectionKernel:
 
         storage = smem.allocate(Storage)
         while task < num_pairs * projection_tiles:
-            pair = task // projection_tiles
-            projection_tile = task % projection_tiles
+            pair = task % num_pairs
+            projection_tile = task // num_pairs
             expert = topk_ids[Int64(pair)].to(Int32)
             if expert >= Int32(0) and expert < Int32(alpha.shape[0]):
                 self._run_task(

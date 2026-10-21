@@ -206,11 +206,11 @@ def _nvfp4_query():
     )
 
 
-def _nvfp4_auto_query(rows=1):
+def _nvfp4_a16_query(rows=1):
     return replace(
         _nvfp4_query(),
-        quant_mode="nvfp4_auto",
-        quant_modes=("nvfp4", "w4a16"),
+        quant_mode="w4a16",
+        quant_modes=("w4a16",),
         num_experts=256,
         hidden_size=6144,
         intermediate_size=256,
@@ -218,30 +218,122 @@ def _nvfp4_auto_query(rows=1):
         num_tokens=rows,
         routed_rows=rows * 8,
         route_num_experts=256,
-        weight_layouts=("mma_view", "source_native"),
+        weight_layouts=("source_native",),
         w4a16_weight_layout="modelopt",
         w4a16_scale_format="e4m3_k16",
     )
 
 
-@pytest.mark.parametrize("capability,sms", (((12, 0), 188), ((12, 1), 48)))
-@pytest.mark.parametrize("rows", (1, 2, 4, 8, 9, 16))
-def test_moe_auto_promotes_native_decode_and_races_both_precisions(
-    capability, sms, rows
-):
+def test_moe_a4_prefill_options_are_immutable_numerical_controls(monkeypatch):
+    import torch
+    from b12x.moe import fused_moe as moe
+    from b12x.moe.fused_moe import _preparation
     from b12x.moe.fused_moe._tuning import TUNING
 
-    query = _nvfp4_auto_query(rows)
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL", "1")
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_TERMS", "1")
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_WARPS", "8")
+    weight_plan = moe.plan_weights(
+        source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
+        activation=moe.ActivationSpec(
+            mode="a16", nonlinearity="silu", io_dtype=torch.bfloat16
+        ),
+        geometry=moe.MoEGeometry(
+            num_experts=32, hidden_size=512, intermediate_size=512
+        ),
+    )._impl
+    query = replace(
+        _nvfp4_query(),
+        quant_mode="w4a16",
+        quant_modes=("w4a16",),
+        weight_layouts=tuple(layout.value for layout in weight_plan.weight_layouts),
+        w4a16_weight_layout=weight_plan.w4a16_weight_layout,
+        w4a16_scale_format=weight_plan.w4a16_scale_format,
+        controls=_preparation._control_snapshot(),
+    )
+    config = TUNING.configure(query, device=DEVICE, search=False).default
+    for variable, value in (
+        ("B12X_W4A16_A4_PREFILL", "0"),
+        ("B12X_W4A16_A4_PREFILL_TERMS", "2"),
+        ("B12X_W4A16_A4_PREFILL_WARPS", "16"),
+    ):
+        with monkeypatch.context() as changed:
+            changed.setenv(variable, value)
+            different = replace(query, controls=_preparation._control_snapshot())
+            assert TUNING.encode_query(query) != TUNING.encode_query(different)
+            caps = _preparation._lower_caps(
+                query, config, weight_plan, torch.device("cuda", 0)
+            )
+            assert (
+                caps.w4a16_a4_prefill_enabled,
+                caps.w4a16_a4_prefill_terms,
+                caps.w4a16_a4_prefill_warps,
+            ) == (True, 1, 8)
+
+
+@pytest.mark.parametrize("enabled", (None, "0"))
+@pytest.mark.parametrize(
+    "variable,value",
+    (
+        ("B12X_W4A16_A4_PREFILL_TERMS", "3"),
+        ("B12X_W4A16_A4_PREFILL_WARPS", "4"),
+    ),
+)
+def test_disabled_moe_a4_prefill_ignores_inactive_controls(
+    monkeypatch, enabled, variable, value
+):
+    from b12x.moe.fused_moe import _preparation
+
+    if enabled is None:
+        monkeypatch.delenv("B12X_W4A16_A4_PREFILL", raising=False)
+    else:
+        monkeypatch.setenv("B12X_W4A16_A4_PREFILL", enabled)
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_TERMS", "1")
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_WARPS", "8")
+    baseline = _preparation._control_snapshot()
+    monkeypatch.setenv(variable, value)
+    assert _preparation._control_snapshot() == baseline
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL", "1")
+    with pytest.raises(ValueError, match=variable):
+        _preparation._control_snapshot()
+
+
+@pytest.mark.parametrize("enabled", ["0", "1"])
+def test_moe_a4_prefill_ignores_retired_token_threshold(enabled, monkeypatch):
+    from b12x.moe.fused_moe import _preparation
+
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL", enabled)
+    monkeypatch.delenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", raising=False)
+    baseline = _preparation._control_snapshot()
+    for value in ("1", "3072", "invalid"):
+        monkeypatch.setenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", value)
+        assert _preparation._control_snapshot() == baseline
+
+
+@pytest.mark.parametrize("value", ["-1", "2", "true"])
+def test_moe_a4_prefill_enable_rejects_non_boolean_controls(value, monkeypatch):
+    from b12x.moe.fused_moe import _preparation
+
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL", value)
+    with pytest.raises(ValueError, match="B12X_W4A16_A4_PREFILL"):
+        _preparation._control_snapshot()
+
+
+@pytest.mark.parametrize("capability,sms", (((12, 0), 188), ((12, 1), 48)))
+@pytest.mark.parametrize("rows", (1, 2, 4, 8, 9, 16, 128, 1024))
+def test_moe_candidates_preserve_declared_activation_precision(capability, sms, rows):
+    from b12x.moe.fused_moe._tuning import TUNING
+
+    query = _nvfp4_a16_query(rows)
     device = DeviceIdentity("nvidia", capability, sms, "synthetic Blackwell")
     default = TUNING.configure(query, device=device).default
     configs = [config for _, config in TUNING.eligible_plan(query, device).candidates]
-    assert (default.backend == "w4a16") is (rows <= 8)
+    assert default.backend == "w4a16"
     assert {
         config.w4a16_route_mode for config in configs if config.backend == "w4a16"
     } == ({"direct", "packed"} if rows <= 8 else {"packed"})
-    assert {config.backend for config in configs} >= {"dynamic", "w4a16"}
+    assert {config.backend for config in configs} == {"w4a16"}
     assert default in configs
-    assert configs[0].backend == "w4a16"
     pinned_a4 = replace(query, quant_mode="nvfp4", quant_modes=("nvfp4",))
     assert all(
         config.backend != "w4a16"
@@ -262,97 +354,16 @@ def test_moe_auto_promotes_native_decode_and_races_both_precisions(
 def test_moe_native_direct_rejects_unsupported_query_and_override(changes):
     from b12x.moe.fused_moe._tuning import TUNING
 
-    query = _nvfp4_auto_query()
+    query = _nvfp4_a16_query()
     direct = TUNING.configure(query, device=DEVICE).default
     query = replace(query, **changes)
-    assert TUNING.configure(query, device=DEVICE).default.backend != "w4a16"
+    assert TUNING.configure(query, device=DEVICE).default.w4a16_route_mode == "packed"
     with pytest.raises(ValueError, match="direct routing"):
         TUNING.configure(query, device=DEVICE, override=direct)
     assert not any(
         config.backend == "w4a16" and config.w4a16_route_mode == "direct"
         for _, config in TUNING.eligible_plan(query, DEVICE).candidates
     )
-
-
-def test_moe_auto_has_no_native_decode_default_on_other_architectures():
-    from b12x.moe.fused_moe._tuning import TUNING
-
-    for device in (None, replace(DEVICE, compute_capability=(10, 0))):
-        assert (
-            TUNING.configure(
-                _nvfp4_auto_query(), device=device, search=False
-            ).default.backend
-            != "w4a16"
-        )
-
-
-@pytest.mark.parametrize(
-    "a4_latency,a16_latency,old_backend,backend",
-    (
-        (6, 6, "micro", "w4a16"),
-        (5, 6, "micro", "micro"),
-        (6, 5, "w4a16", "w4a16"),
-    ),
-)
-def test_moe_precision_race_and_revision_invalidate_cached_choice(
-    tmp_path,
-    monkeypatch,
-    a4_latency,
-    a16_latency,
-    old_backend,
-    backend,
-):
-    from types import SimpleNamespace
-    from b12x.preparation import DetectedDevice, MemoryRequirements, Plan, PreparedCall
-    from b12x.moe.fused_moe._tuning import TUNING
-    from .test_session import _deterministic_timer, session
-
-    _deterministic_timer(monkeypatch)
-    old_contract = replace(
-        TUNING,
-        candidate_contract_version=4,
-        knobs=(
-            replace(TUNING.knobs[0], values=("micro", "dynamic", "w4a16")),
-            *TUNING.knobs[1:],
-        ),
-    )
-
-    def request(contract):
-        plan = Plan(
-            contract=contract,
-            query=_nvfp4_auto_query(),
-            _compile_jobs=lambda config, device: (),
-            _memory_requirements=lambda config, device: MemoryRequirements(),
-            _materialize=lambda selection, device: SimpleNamespace(
-                config=selection.config
-            ),
-        )
-
-        def call(state):
-            latency = a16_latency if state.config.backend == "w4a16" else a4_latency
-            # The shared timer measures abs(output - 6) + 1 microseconds.
-            return PreparedCall(run=lambda: latency + 5, produce=lambda: None)
-
-        return plan.request(
-            name="moe-precision",
-            prepare_call=call,
-            benchmark_call=call,
-        )
-
-    assert TUNING.candidate_contract_version > old_contract.candidate_contract_version
-    for contract, source, expected_backend in (
-        (old_contract, "tuned", old_backend),
-        (TUNING, "tuned", backend),
-        (TUNING, "cached", backend),
-    ):
-        with session(tmp_path, race_batch=2) as engine:
-            engine.device = DetectedDevice(ordinal=None, identity=DEVICE)
-            result = engine.prepare((request(contract),))
-            selection = result.selections["moe-precision"]
-            assert (selection.source, selection.config.backend) == (
-                source,
-                expected_backend,
-            )
 
 
 def test_nvfp4_split_materialization_is_a_real_candidate_and_default():
@@ -508,4 +519,96 @@ def test_compressed_mla_rejects_unaligned_q_before_preparation(mode):
             invocation=mla.invocation_from_tensors(
                 q=q, swa_k_cache=cache, out=torch.empty_like(q)
             ),
+        )
+
+
+def test_mxfp8_a16_races_compute_warps_without_merging_programs():
+    from b12x.gemm.blockscaled._tuning import (
+        BlockscaledConfig,
+        BlockscaledQuery,
+        TUNING,
+    )
+
+    query = BlockscaledQuery(
+        recipe="mxfp8",
+        num_tokens=4,
+        in_features=2560,
+        padded_in_features=2560,
+        out_features=512,
+        activation_mode="auto",
+    )
+    configs = [config for _, config in TUNING.eligible_plan(query, DEVICE).candidates]
+    a16 = [config for config in configs if config.mode == "a16"]
+    assert {config.mma_warps for config in a16} == {2, 4}
+    for config in a16:
+        assert replace(config, mma_warps=2) in a16
+        assert replace(config, mma_warps=4) in a16
+        assert BlockscaledConfig.from_config(FrozenMapping(config.to_dict())) == config
+    assert all(
+        config.mma_warps is None for config in configs if config.mode == "quantized"
+    )
+    for recipe in ("nvfp4", "mxfp4"):
+        restricted = replace(
+            query,
+            recipe=recipe,
+            global_scale_kind="multiplier" if recipe == "nvfp4" else "none",
+        )
+        assert all(
+            config.mma_warps is None
+            for _, config in TUNING.eligible_plan(restricted, DEVICE).candidates
+        )
+
+
+def test_nvfp4_m16_races_compute_warps_with_the_same_route_choices():
+    from b12x.moe.fused_moe._tuning import MoeDecodeConfig, TUNING
+
+    query = replace(_nvfp4_query(), num_tokens=4, routed_rows=16)
+    configs = [config for _, config in TUNING.eligible_plan(query, DEVICE).candidates]
+    m16 = [
+        config
+        for config in configs
+        if config.backend == "dynamic" and config.dynamic_tile_m == 16
+    ]
+    assert {config.dynamic_mma_warps for config in m16} == {None, 4}
+    for config in m16:
+        assert replace(config, dynamic_mma_warps=None) in m16
+        assert replace(config, dynamic_mma_warps=4) in m16
+        assert MoeDecodeConfig.from_config(FrozenMapping(config.to_dict())) == config
+    assert all(
+        config.dynamic_mma_warps is None for config in configs if config not in m16
+    )
+
+
+@pytest.mark.parametrize("tile", [16, 32, 64, 128])
+@pytest.mark.parametrize("warps", [None, 4])
+@pytest.mark.parametrize("clusters", [-1, 0, 1, 126, 188])
+def test_dynamic_launch_policy_preserves_compute_warps(tile, warps, clusters):
+    from b12x.moe.fused_moe._impl import (
+        _encode_dynamic_launch_policy,
+        _decode_dynamic_launch_policy,
+    )
+
+    for flags in range(32):
+        volatile, external, direct, n64, materialize = (
+            bool(flags & (1 << bit)) for bit in range(5)
+        )
+        policy = _encode_dynamic_launch_policy(
+            volatile_launch_state=volatile,
+            external_route_plan_requested=external,
+            planned_tile_m=tile,
+            planned_direct_routing=direct,
+            w4a8_n64_repacked=n64,
+            nvfp4_materialize_intermediate=materialize,
+            mma_warps=warps,
+            policy_max_active_clusters=clusters,
+        )
+        assert _decode_dynamic_launch_policy(policy) == (
+            volatile,
+            external,
+            tile,
+            direct,
+            n64,
+            materialize,
+            warps,
+            clusters,
         )

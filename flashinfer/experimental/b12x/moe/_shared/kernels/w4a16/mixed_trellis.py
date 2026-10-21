@@ -35,16 +35,16 @@ from .host import (
     packed_gemm_scratch_elements,
     route_pack_warmup_token_counts,
 )
-from .kernel import (
+from b12x.moe._shared.kernels.w4a16.kernel.config import (
     _LUT_E4M3_VALUE_TABLE_ENTRIES,
     _LUT_E4M3_SMEM_REGION_BYTES,
-    W4A16FusedMoeKernel,
     _cutlass_element_dtype,
     _fake_m_for_specialization,
     _trellis256_execution_lut,
-    compile_w4a16_topk_sum,
-    pack_topk_routes_by_expert,
 )
+from b12x.moe._shared.kernels.w4a16.kernel.fused import W4A16FusedMoeKernel
+from b12x.moe._shared.kernels.w4a16.kernel.sum_launch import compile_w4a16_topk_sum
+from b12x.moe._shared.kernels.w4a16.kernel.execution import pack_topk_routes_by_expert
 
 
 @dataclass(frozen=True)

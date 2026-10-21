@@ -68,10 +68,6 @@ class W4A16PackedWeights:
     w13_layout: str = "w13"
     weight_layout: str = "packed"
     scale_format: str = "e4m3_k16"
-    x4t_w13_scale: object | None = None
-    x4t_w2_scale: object | None = None
-    x4t_w13_row_rotation: int = 0
-    x4t_packed_pair_programs: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -99,10 +95,6 @@ class W4A16ModelOptWeights:
     # == "up_gate" physical) needs a row rotation before W4A16 SwiGLU; "w31"
     # (== "gate_up") is already in the kernel-native order.
     w13_layout: str = "w13"
-    x4t_w13_scale: object | None = None
-    x4t_w2_scale: object | None = None
-    x4t_w13_row_rotation: int = 0
-    x4t_packed_pair_programs: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -392,6 +384,8 @@ def _process_nvfp4_packed_scales(
     if scale_factor > 1.0:
         packed_scales = (packed_scales.float() * scale_factor).to(torch.float16)
     packed_scales = packed_scales * (2**7)
+    # Nonzero lifted bytes require bit 7 for the packed BF16 decoder.
+    # The discard is an encoding constraint, not an FP16 range limit.
     packed_scales[packed_scales < 2] = 0
     packed_scales = packed_scales.view(torch.int16) << 1
     packed_scales = packed_scales.view(torch.float8_e4m3fn)
@@ -1324,205 +1318,6 @@ def prepare_w4a16_fp4_e8m0_k32_weights(
         source_format="fp4_e8m0_k32",
         w13_layout=w13_layout,
         scale_format="e8m0_k32",
-    )
-
-
-def prepare_w4a16_x4t_weights(
-    w13_fp4: torch.Tensor,
-    w13_x4t,
-    w13_global_scale: torch.Tensor,
-    w2_fp4: torch.Tensor,
-    w2_x4t,
-    w2_global_scale: torch.Tensor,
-    w13_scale_scratch: torch.Tensor,
-    w2_scale_scratch: torch.Tensor,
-    *,
-    activation: str,
-    params_dtype: torch.dtype = torch.bfloat16,
-    w13_layout: str = "w13",
-    weight_layout: str = "packed",
-) -> W4A16PackedWeights | W4A16ModelOptWeights:
-    """Prepare exact-nibble/X4T weights for routed predecode.
-
-    The X4T payloads remain compressed and persistent. ``w13_scale_scratch``
-    and ``w2_scale_scratch`` are caller-owned reusable scale grids; they may be
-    shared by every MoE layer because each layer's decode and GEMM are ordered
-    on one CUDA stream. Only experts routed by the current call are expanded.
-    """
-
-    from b12x._lib.quant.x4t_scales import X4TScaleBatch
-
-    if not isinstance(w13_x4t, X4TScaleBatch) or not isinstance(w2_x4t, X4TScaleBatch):
-        raise TypeError("X4T preparation requires X4TScaleBatch scale planes")
-    w13_x4t.validate()
-    w2_x4t.validate()
-    w13_layout = _normalize_w13_layout(w13_layout)
-    shape = validate_w4a16_packed_inputs(
-        w13_fp4,
-        w13_global_scale,
-        w2_fp4,
-        w2_global_scale,
-        activation=activation,
-    )
-    num_experts = shape.num_experts
-    hidden_size = shape.hidden_size
-    intermediate_size = shape.intermediate_size
-    w13_rows = shape.w13_rows
-    kimi = hidden_size == 3584 and intermediate_size in (3072, 1536, 768, 384, 256, 192)
-    ds41 = hidden_size == 5120 and intermediate_size in (2304, 1152, 576, 288)
-    if not shape.is_gated or not (kimi or ds41):
-        raise ValueError(
-            "X4T W4A16 requires gated Kimi TP1/2/4/8/12/16 or DS4.1 TP1/2/4/8 geometry"
-        )
-    if weight_layout not in ("packed", "modelopt"):
-        raise ValueError("X4T requires packed or native FP4 weight storage")
-    if weight_layout == "modelopt" and w13_layout != "w31":
-        raise ValueError("Native X4T requires gate/up source order")
-    if w13_x4t.num_experts != num_experts or w2_x4t.num_experts != num_experts:
-        raise ValueError("X4T scale expert counts must match the weight tensors")
-    if (w13_x4t.rows, w13_x4t.columns) != (w13_rows, hidden_size // 32):
-        raise ValueError("X4T FC1 scale geometry does not match the weights")
-    if (w2_x4t.rows, w2_x4t.columns) != (hidden_size, intermediate_size // 32):
-        raise ValueError("X4T FC2 scale geometry does not match the weights")
-    device = w13_fp4.device
-    if w13_x4t.fixed.device != device or w2_x4t.fixed.device != device:
-        raise ValueError("X4T scales and FP4 weights must share one CUDA device")
-
-    def scale_scratch(
-        name: str,
-        tensor: torch.Tensor,
-        tail_shape: tuple[int, int],
-    ) -> torch.Tensor:
-        expected_tail = tuple(map(int, tail_shape))
-        if (
-            tensor.dtype != torch.uint8
-            or tensor.device != device
-            or tensor.ndim != 3
-            or tuple(tensor.shape[1:]) != expected_tail
-            or int(tensor.shape[0]) < num_experts
-            or not tensor.is_contiguous()
-        ):
-            raise ValueError(
-                f"{name} must be contiguous uint8 [>=E,{expected_tail[0]},"
-                f"{expected_tail[1]}] on {device}"
-            )
-        return tensor[:num_experts]
-
-    packed_w13_scale = scale_scratch(
-        "w13_scale_scratch", w13_scale_scratch, (hidden_size // 32, w13_rows)
-    )
-    packed_w2_scale = scale_scratch(
-        "w2_scale_scratch", w2_scale_scratch, (intermediate_size // 32, hidden_size)
-    )
-    lo13, lo2 = packed_w13_scale.data_ptr(), packed_w2_scale.data_ptr()
-    if lo13 < lo2 + packed_w2_scale.numel() and lo2 < lo13 + packed_w13_scale.numel():
-        raise ValueError("X4T scale pair destinations must not overlap")
-    w13_row_rotation = intermediate_size if w13_layout == "w13" else 0
-    packed_programs = None
-    if ds41 or (w13_x4t.exception_task_rows == 64 and w2_x4t.exception_task_rows == 64):
-        from b12x._lib.quant.x4t_packed_scales import _compiled_packed_scale_pair
-
-        for plane, rotation in ((w13_x4t, w13_row_rotation), (w2_x4t, 0)):
-            if (
-                plane.exception_task_rows != 64
-                or plane.task_exception_offsets is None
-                or plane.exception_row_rotation != rotation
-            ):
-                raise ValueError(
-                    "Paired X4T requires rotation-aligned 64-row exception tasks"
-                )
-        # Retain both routing ABIs independently of compiler cache lifetime.
-        packed_programs = tuple(
-            _compiled_packed_scale_pair(
-                *tuple(
-                    (
-                        plane.rows,
-                        plane.columns,
-                        64,
-                        plane.exception_row_rotation,
-                        True,
-                        False,
-                        counts,
-                        ids64,
-                        sorted_ids,
-                    )
-                    for plane in (w13_x4t, w2_x4t)
-                )
-            )
-            for counts, ids64, sorted_ids in (
-                (False, False, False),
-                (True, False, False),
-                (False, True, False),
-                (False, False, True),
-            )
-        )
-    elif (
-        weight_layout != "packed"
-        or not kimi
-        or intermediate_size != 256
-        or w13_x4t.exception_task_rows != 128
-        or w2_x4t.exception_task_rows != 896
-        or w13_x4t.exception_row_rotation != w13_row_rotation
-        or w2_x4t.exception_row_rotation != 0
-    ):
-        raise ValueError("X4T requires paired 64-row tasks or packed Kimi TP12 tasks")
-    if weight_layout == "modelopt":
-        return W4A16ModelOptWeights(
-            w13=w13_fp4,
-            w2=w2_fp4,
-            w13_scale=packed_w13_scale,
-            w2_scale=packed_w2_scale,
-            w13_global_scale=w13_global_scale,
-            w2_global_scale=w2_global_scale,
-            workspace=_make_workspace(device, max_blocks_per_sm=4),
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_experts=num_experts,
-            is_gated=True,
-            params_dtype=params_dtype,
-            source_format="fp4_e8m0_k32",
-            scale_format="e8m0_k32",
-            micro_w13_scale=packed_w13_scale,
-            micro_w2_scale=packed_w2_scale,
-            micro_w13_global_scale=w13_global_scale,
-            micro_w2_global_scale=w2_global_scale,
-            w13_layout=w13_layout,
-            x4t_w13_scale=w13_x4t,
-            x4t_w2_scale=w2_x4t,
-            x4t_packed_pair_programs=packed_programs,
-        )
-    packed_w13 = _repack_weight(
-        w13_fp4.contiguous(),
-        size_k=hidden_size,
-        size_n=w13_rows,
-        row_rotation=w13_row_rotation or None,
-    )
-    packed_w2 = _repack_weight(
-        w2_fp4.contiguous(),
-        size_k=intermediate_size,
-        size_n=hidden_size,
-    )
-    return W4A16PackedWeights(
-        w13=packed_w13,
-        w13_scale=packed_w13_scale,
-        w13_global_scale=w13_global_scale.contiguous(),
-        w2=packed_w2,
-        w2_scale=packed_w2_scale,
-        w2_global_scale=w2_global_scale.contiguous(),
-        workspace=_make_workspace(device, max_blocks_per_sm=4),
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        num_experts=num_experts,
-        is_gated=True,
-        params_dtype=params_dtype,
-        source_format="fp4_e8m0_k32",
-        w13_layout=w13_layout,
-        weight_layout="packed",
-        scale_format="e8m0_k32",
-        x4t_w13_scale=w13_x4t,
-        x4t_w2_scale=w2_x4t,
-        x4t_w13_row_rotation=w13_row_rotation,
-        x4t_packed_pair_programs=packed_programs,
     )
 
 
@@ -2558,7 +2353,6 @@ __all__ = [
     "prepare_w4a16_e8m0_native_weights",
     "prepare_w4a16_fc2_e8m0_weights",
     "prepare_w4a16_fp4_e8m0_k32_weights",
-    "prepare_w4a16_x4t_weights",
     "prepare_w4a16_modelopt_native_weights",
     "prepare_w4a16_modelopt_nvfp4_weights",
     "prepare_w4a16_packed_weights",

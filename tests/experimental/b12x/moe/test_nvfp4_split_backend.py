@@ -30,7 +30,7 @@ from cutlass.cute.runtime import make_ptr
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.utils.device import current_cuda_stream
-from b12x.moe._shared.kernels.dynamic import MoEDynamicKernelBackend
+from b12x.moe._shared.kernels.dynamic.kernel import MoEDynamicKernelBackend
 from b12x.moe._shared.kernels.reference import compare_to_reference
 from b12x.moe.fused_moe._impl import _DynamicMoELaunch
 

@@ -13,11 +13,9 @@ from b12x.moe._shared.kernels.w4a16.host import (
     make_w4a16_packed_buffers,
     max_packed_route_slots,
 )
-from b12x.moe._shared.kernels.w4a16.kernel import (
-    compile_w4a16_fused_moe,
-    compile_w4a16_topk_sum,
-    run_w4a16_moe,
-)
+from b12x.moe._shared.kernels.w4a16.kernel.fused_launch import compile_w4a16_fused_moe
+from b12x.moe._shared.kernels.w4a16.kernel.sum_launch import compile_w4a16_topk_sum
+from b12x.moe._shared.kernels.w4a16.kernel.execution import run_w4a16_moe
 from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
     MixedTrellisRotations,
     build_ordered_maps,

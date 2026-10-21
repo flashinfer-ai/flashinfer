@@ -19,11 +19,11 @@ from cutlass import Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import from_dlpack
 
 from b12x._lib.intrinsics.constants import MX_SF_VEC_SIZE
+from b12x._lib.intrinsics.packed import broadcast_f32_to_half2
 from b12x._lib.intrinsics.conversion import (
     e2m1x8_mul_residual_to_e4m3x8,
     e2m1x8_to_e4m3x8,
 )
-from b12x._lib.intrinsics.packed import broadcast_f32_to_half2
 from b12x._lib.intrinsics.quantization import (
     max_abs_32,
     quantize_block_fp8_mx,

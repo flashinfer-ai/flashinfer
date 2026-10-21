@@ -24,13 +24,13 @@ from cutlass.cute.runtime import from_dlpack
 
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
-from b12x._lib.intrinsics.atomics import st_shared_u32
 from b12x._lib.intrinsics.conversion import fp8_e4m3_to_f32
 from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
     ld_global_nc_u32,
     shared_ptr_to_u32,
 )
+from b12x._lib.intrinsics.atomics import st_shared_u32
 from b12x._lib.quant.lut_e4m3 import lut_e4m3_value_table
 from b12x._lib.utils.device import current_cuda_stream
 from b12x.moe._shared.kernels.w4a8_trellis_decode import (
