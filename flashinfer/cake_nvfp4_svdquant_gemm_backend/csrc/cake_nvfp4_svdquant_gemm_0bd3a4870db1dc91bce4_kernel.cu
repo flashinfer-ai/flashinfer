@@ -478,7 +478,6 @@ kernel_cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4(const __grid_constant__ CUt
             unsigned int load_thr_stage = 0;
             unsigned int load_valid = 1;
             unsigned int load_next = 0;
-            unsigned int load_tiles = 0;
             asm volatile("griddepcontrol.wait;" ::: "memory");
             int rank_chunks = 1;
             unsigned int load_lead = 0;
@@ -490,7 +489,7 @@ kernel_cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4(const __grid_constant__ CUt
             unsigned int _phase_tma_empty = 1;
             unsigned int _phase_clc_full = 0;
             #pragma unroll 1
-            for (unsigned int _p = 0; _p < num_units; _p++) {
+            for (unsigned int load_tiles = 0; load_tiles < num_units; load_tiles++) {
                 if (cta_rank == 0) {
                     mbarrier_wait(thr_empty_addr + (load_thr_stage) * 8, _phase_thr_empty);
                     mbarrier_arrive(thr_full_addr + (load_thr_stage) * 8);
@@ -735,7 +734,6 @@ kernel_cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4(const __grid_constant__ CUt
                         if (load_stage == 5) { load_stage = 0; _phase_tma_empty ^= 1; }
                     }
                 }
-                load_tiles = load_tiles + 1;
                 if (load_valid == 0) {
                     break;
                 }
@@ -767,7 +765,7 @@ kernel_cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4(const __grid_constant__ CUt
             unsigned int _phase_acc_empty = 1;
             unsigned int _phase_clc_full_1 = 0;
             #pragma unroll 1
-            for (unsigned int _p_1 = 0; _p_1 < num_units; _p_1++) {
+            for (unsigned int _p = 0; _p < num_units; _p++) {
                 int unit_i_1 = (int)unit_m;
                 unsigned int u_tile_1 = unit_m;
                 int u_half_1 = 0;
@@ -951,7 +949,7 @@ kernel_cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4(const __grid_constant__ CUt
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_8), "r"(_smem_desc_lo_9), "r"((tmem_accum + (192))), "r"(((init_c) ? 0 : 1)));
+                    :: "r"(_smem_desc_lo_8), "r"(_smem_desc_lo_9), "r"((tmem_accum + (192))), "r"(((init_c) ? 0 : 1)) : "memory");
                             } else {
                                 int _smem_desc_lo_10 = (((smem_d_addr) >> 4) & 0x3FFF) + (mma_stage) * 2432;
                                 int _smem_desc_lo_11 = (((smem_l1_tail_addr) >> 4) & 0x3FFF) + (mma_stage) * 2432;
@@ -988,7 +986,7 @@ kernel_cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4(const __grid_constant__ CUt
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_10), "r"(_smem_desc_lo_11), "r"((tmem_accum + (192))), "r"(((init_c) ? 0 : 1)));
+                    :: "r"(_smem_desc_lo_10), "r"(_smem_desc_lo_11), "r"((tmem_accum + (192))), "r"(((init_c) ? 0 : 1)) : "memory");
                             }
                         }
                         mma_stage += 1;
@@ -1030,7 +1028,7 @@ kernel_cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4(const __grid_constant__ CUt
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_12), "r"(_smem_desc_lo_13), "r"((tmem_accum + (buf * 256))), "r"(((init_c_1) ? 0 : 1)));
+                    :: "r"(_smem_desc_lo_12), "r"(_smem_desc_lo_13), "r"((tmem_accum + (buf * 256))), "r"(((init_c_1) ? 0 : 1)) : "memory");
                             } else {
                                 int _smem_desc_lo_14 = (((smem_d_addr) >> 4) & 0x3FFF) + (hs) * 2432;
                                 int _smem_desc_lo_15 = (((smem_l1_pre_addr) >> 4) & 0x3FFF) + (hs) * 2432;
@@ -1067,7 +1065,7 @@ kernel_cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4(const __grid_constant__ CUt
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_14), "r"(_smem_desc_lo_15), "r"((tmem_accum + (buf * 256))), "r"(((init_c_1) ? 0 : 1)));
+                    :: "r"(_smem_desc_lo_14), "r"(_smem_desc_lo_15), "r"((tmem_accum + (buf * 256))), "r"(((init_c_1) ? 0 : 1)) : "memory");
                             }
                         }
                         elect_commit_cg2_multicast(acc_full_addr + (accf_stage) * 8, (uint16_t)(3));
@@ -1256,7 +1254,7 @@ kernel_cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4(const __grid_constant__ CUt
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_24), "r"(_smem_desc_lo_25), "r"((tmem_accum + (col))), "r"(((init_c_2) ? 0 : 1)));
+                    :: "r"(_smem_desc_lo_24), "r"(_smem_desc_lo_25), "r"((tmem_accum + (col))), "r"(((init_c_2) ? 0 : 1)) : "memory");
                             } else {
                                 int _smem_desc_lo_26 = (((smem_d_addr) >> 4) & 0x3FFF) + (mma_stage) * 2432;
                                 int _smem_desc_lo_27 = (((smem_l1_tail_addr) >> 4) & 0x3FFF) + (mma_stage) * 2432;
@@ -1293,7 +1291,7 @@ kernel_cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4(const __grid_constant__ CUt
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_26), "r"(_smem_desc_lo_27), "r"((tmem_accum + (col))), "r"(((init_c_2) ? 0 : 1)));
+                    :: "r"(_smem_desc_lo_26), "r"(_smem_desc_lo_27), "r"((tmem_accum + (col))), "r"(((init_c_2) ? 0 : 1)) : "memory");
                             }
                         }
                         mma_stage += 1;
@@ -1335,7 +1333,7 @@ kernel_cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4(const __grid_constant__ CUt
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_28), "r"(_smem_desc_lo_29), "r"((tmem_accum + (buf_1 * 256))), "r"(((init_c_3) ? 0 : 1)), "r"(((0x10300490U & ~(0x3fU << 17)) | ((static_cast<uint32_t>(64) >> 3) << 17))));
+                    :: "r"(_smem_desc_lo_28), "r"(_smem_desc_lo_29), "r"((tmem_accum + (buf_1 * 256))), "r"(((init_c_3) ? 0 : 1)), "r"(((0x10300490U & ~(0x3fU << 17)) | ((static_cast<uint32_t>(64) >> 3) << 17))) : "memory");
                             } else {
                                 int _smem_desc_lo_30 = (((smem_d_addr) >> 4) & 0x3FFF) + (hs_2) * 2432;
                                 int _smem_desc_lo_31 = (((smem_l1_pre_addr) >> 4) & 0x3FFF) + (hs_2) * 2432;
@@ -1372,7 +1370,7 @@ kernel_cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4(const __grid_constant__ CUt
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_30), "r"(_smem_desc_lo_31), "r"((tmem_accum + (buf_1 * 256))), "r"(((init_c_3) ? 0 : 1)), "r"(((0x10300490U & ~(0x3fU << 17)) | ((static_cast<uint32_t>(64) >> 3) << 17))));
+                    :: "r"(_smem_desc_lo_30), "r"(_smem_desc_lo_31), "r"((tmem_accum + (buf_1 * 256))), "r"(((init_c_3) ? 0 : 1)), "r"(((0x10300490U & ~(0x3fU << 17)) | ((static_cast<uint32_t>(64) >> 3) << 17))) : "memory");
                             }
                         }
                         elect_commit_cg2_multicast(acc_full_addr + (accf_stage) * 8, (uint16_t)(3));
@@ -1439,7 +1437,7 @@ kernel_cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4(const __grid_constant__ CUt
                 unsigned int sched_clc_stage = 0;
                 unsigned int sched_thr_stage = 0;
                 #pragma unroll 1
-                for (unsigned int _p_2 = 0; _p_2 < num_units; _p_2++) {
+                for (unsigned int _p_1 = 0; _p_1 < num_units; _p_1++) {
                     mbarrier_wait(thr_full_addr + (sched_thr_stage) * 8, _phase_thr_full);
                     mbarrier_arrive(thr_empty_addr + (sched_thr_stage) * 8);
                     sched_thr_stage += 1;
@@ -1506,7 +1504,6 @@ kernel_cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4(const __grid_constant__ CUt
             int epi_tid = epi_warp * 32 + lane;
             unsigned int acc_stage_1 = 0;
             unsigned int accf_stage_1 = 0;
-            unsigned int tiles_done = 0;
             unsigned int store_stage = 0;
             asm volatile("griddepcontrol.wait;" ::: "memory");
             float alpha_value = alpha[0];
@@ -1525,7 +1522,7 @@ kernel_cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4(const __grid_constant__ CUt
             unsigned int _phase_acc_ovl_full = 0;
             unsigned int _phase_acc_full = 0;
             #pragma unroll 1
-            for (unsigned int _p_3 = 0; _p_3 < num_units; _p_3++) {
+            for (unsigned int tiles_done = 0; tiles_done < num_units; tiles_done++) {
                 mbarrier_wait(clc_full_addr + (epi_clc_stage) * 8, _phase_clc_full_3);
                 uint32_t _clc_valid_5 = 0;
                 asm volatile(
@@ -1924,7 +1921,6 @@ kernel_cake_nvfp4_svdquant_gemm_0bd3a4870db1dc91bce4(const __grid_constant__ CUt
                 _phase_acc_ovl_full ^= 1;
                 accf_stage_1 += 1;
                 if (accf_stage_1 == 2) { accf_stage_1 = 0; _phase_acc_full ^= 1; }
-                tiles_done = tiles_done + 1;
                 if (_clc_valid_5 == 0) {
                     break;
                 }
