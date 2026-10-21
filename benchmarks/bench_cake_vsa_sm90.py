@@ -21,6 +21,8 @@ Run from an editable FlashInfer checkout on H100:
     python benchmarks/bench_cake_vsa_sm90.py --output /tmp/vsa-sm90-cake.json
     python benchmarks/bench_cake_vsa_sm90.py --output ... --warm-l2                    # PR #5470 regime
 
+The Cake arm is ``backend="cake"`` of the wrapper, i.e. the self-contained package
+``flashinfer.cake_vsa_sm90_backend`` (its ``build.json`` names the compiled stages).
 Planning, host-to-device metadata copies, JIT compilation, input generation and output
 allocation happen before timing; the same prepared ``run`` is measured for both arms in
 alternating AB/BA order.  CUPTI measures kernel activity (a fallback to CUDA events is an

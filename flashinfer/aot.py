@@ -192,10 +192,9 @@ from .jit.cake_sparse_mla_sm120_dsv41_mixed import (
     cake_sparse_mla_sm120_dsv41_mixed_available,
     gen_cake_sparse_mla_sm120_dsv41_mixed_module,
 )
-from .jit.cake_concat_mla_kv_quant_fp8 import gen_concat_mla_kv_quant_fp8_aot_modules
-from .jit.cake_fused_qk_rope_fp8_append import (
+from .jit.cake_concat_mla_kv_quant_fp8 import (
     # Aliased to the gen_*_modules form the CPU AOT tests stub by name.
-    aot_specs as gen_cake_fused_qk_rope_fp8_append_aot_modules,
+    aot_specs as gen_cake_concat_mla_kv_quant_fp8_aot_modules,
 )
 from .jit.cake_grouped_mxfp8_quantize import (
     aot_specs as gen_cake_grouped_mxfp8_quantize_aot_modules,
@@ -730,27 +729,18 @@ def gen_all_modules(
     if has_sm103a_exact:
         jit_specs.append(gen_cake_fmha_compat_module("sm103a"))
     # Fused MLA context K/V pack (attention side, not MoE), two backends behind
-    # concat_mla_kv_quant_fp8: the Cake programs, one build per (exact target,
-    # head group) ...
+    # concat_mla_kv_quant_fp8: the Cake programs, one per head group, one
+    # library each per exact target (the loader spells the targets "sm_100a" /
+    # "sm_103a") ...
     if has_sm100a_exact:
-        jit_specs.extend(gen_concat_mla_kv_quant_fp8_aot_modules("sm100a"))
+        jit_specs.extend(gen_cake_concat_mla_kv_quant_fp8_aot_modules("sm_100a"))
     if has_sm103a_exact:
-        jit_specs.extend(gen_concat_mla_kv_quant_fp8_aot_modules("sm103a"))
+        jit_specs.extend(gen_cake_concat_mla_kv_quant_fp8_aot_modules("sm_103a"))
     # ... and the specialized kernel (auto's pick for 12 local heads), one
     # module, pre-built for the same exact Blackwell targets as the Cake
     # programs (other targets JIT it on first use).
     if has_sm100a_exact or has_sm103a_exact:
         jit_specs.append(gen_mla_kv_pack_fp8_module())
-    # Cake fused QK RMSNorm + NeoX RoPE + FP8 E4M3 quantize + paged KV append: one
-    # program, one library per exact target (module ``<program>_<target>_<digest>``).
-    # The sm_90a row follows the fa3 precedent (``has_sm90``: no exact sm90a flag
-    # exists); the Blackwell rows use the exact flags like the Cake programs above.
-    if has_sm90:
-        jit_specs.extend(gen_cake_fused_qk_rope_fp8_append_aot_modules("sm_90a"))
-    if has_sm100a_exact:
-        jit_specs.extend(gen_cake_fused_qk_rope_fp8_append_aot_modules("sm_100a"))
-    if has_sm103a_exact:
-        jit_specs.extend(gen_cake_fused_qk_rope_fp8_append_aot_modules("sm_103a"))
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
     blackwell_msa_targets: tuple[tuple[BlackwellMSATarget, bool], ...] = (
@@ -1055,11 +1045,11 @@ def gen_all_modules(
 
     if add_comm:
         from .jit.comm import (
-            gen_comm_alltoall_module,
             gen_dcp_alltoall_module,
             gen_dcp_lse_reduce_module,
-            gen_moe_alltoall_module,
-            gen_moe_ep_nvlink_one_sided_module,
+            gen_cake_alltoall_module,
+            gen_nvlink_one_sided_alltoall_module,
+            gen_nvlink_two_sided_alltoall_module,
             gen_pcie_ipc_ag_rs_module,
             gen_pcie_ipc_comm_module,
             gen_trtllm_comm_module,
@@ -1067,7 +1057,7 @@ def gen_all_modules(
             gen_vllm_comm_module,
         )
 
-        jit_specs.append(gen_comm_alltoall_module())
+        jit_specs.append(gen_nvlink_two_sided_alltoall_module())
         if (
             has_sm90
             or has_sm100
@@ -1098,9 +1088,9 @@ def gen_all_modules(
         ):
             jit_specs.append(gen_dcp_lse_reduce_module())
         if has_sm100a_exact:
-            jit_specs.append(gen_moe_alltoall_module("sm100a"))
+            jit_specs.append(gen_cake_alltoall_module("sm100a"))
         if has_sm103a_exact:
-            jit_specs.append(gen_moe_alltoall_module("sm103a"))
+            jit_specs.append(gen_cake_alltoall_module("sm103a"))
         # Cake NVFP4-transport tensor-parallel all-reduce: exact-architecture
         # programs, one module per (program, exact target); never a family
         # target.
@@ -1113,7 +1103,7 @@ def gen_all_modules(
         # NVLink one-sided MoE all-to-all behind flashinfer.moe_ep. The fence path
         # needs SM90+; the CFT path compiles only for SM100+ and traps elsewhere.
         if has_sm90 or has_sm100 or has_sm100f or has_sm103 or has_sm107:
-            jit_specs.append(gen_moe_ep_nvlink_one_sided_module())
+            jit_specs.append(gen_nvlink_one_sided_alltoall_module())
         jit_specs.append(gen_vllm_comm_module())
         # No architecture gate: the kernels use only plain PTX loads/stores
         # and CUDA IPC, and target PCIe machines without NVLink, which is

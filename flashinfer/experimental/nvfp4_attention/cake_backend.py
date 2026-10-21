@@ -23,13 +23,20 @@ from dataclasses import dataclass
 import torch
 import tvm_ffi
 
-from ...utils import get_compute_capability, get_device_sm_count
-from .cake_jit import ARCHES, PROGRAM, load_cake_nvfp4_attention_module
+from .cake_jit import (
+    ARCHES,
+    HEAD_DIM,
+    MODULES,
+    TILE_ROWS,
+    arch_for_capability,
+    launch_args,
+    launch_grid,
+    load,
+    record_for,
+)
+from .cake_jit import sm_count as _sm_count
 
-HEAD_DIM = 128
 SF_VEC = 16
-# Work-tile rows of the persistent kernel (four 128-row Q blocks per CTA pair).
-TILE_ROWS = 512
 # E2M1 magnitude thresholds (midpoints between representable values); the
 # code of ``|x|`` is the number of thresholds strictly below it.
 E2M1_BOUNDARIES = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
@@ -45,9 +52,10 @@ def _device_key(device):
 
 
 def _device_facts(device):
-    """``(compute_capability, multiprocessor_count)`` through FlashInfer's cached helpers."""
-    device = torch.device("cuda", _device_key(device)[1])
-    return get_compute_capability(device), int(get_device_sm_count(device))
+    """``(compute_capability, multiprocessor_count)`` of one CUDA device (the
+    SM count through the registry's per-device cache)."""
+    index = _device_key(device)[1]
+    return tuple(torch.cuda.get_device_capability(index)), _sm_count(index)
 
 
 @functools.cache
@@ -189,8 +197,8 @@ class NVFP4AttentionRunner:
 
 
 def _arch_of(capability):
-    arch = f"sm_{capability[0]}{capability[1]}a"
-    if arch not in ARCHES:
+    arch = arch_for_capability(capability)
+    if arch is None:
         raise ValueError(
             f"NVFP4 attention requires compute capability {[a[3:-1] for a in ARCHES]}, "
             f"got {capability[0]}.{capability[1]}"
@@ -199,15 +207,13 @@ def _arch_of(capability):
 
 
 def bind_attention_payload(main_kwargs, out):
-    """Bind prepacked buffers to the generated physical argument order."""
+    """Bind prepacked buffers to the generated program's physical argument order
+    (the registry record's ``arg_plan`` under its ``logical`` names)."""
     arch = _arch_of(_device_facts(out.device)[0])
-    grid = dict(zip(("grid_x", "grid_y", "grid_z"), main_kwargs["grid"], strict=True))
-    arguments = tuple(
-        grid[key] if kind == "grid" else main_kwargs[key]
-        for kind, key in PROGRAM["arg_plan"]
-    )
-    module = load_cake_nvfp4_attention_module(arch)
-    entry = getattr(module, PROGRAM["ffi_entry"])
+    name = record_for(arch)
+    record = MODULES[name]
+    arguments = launch_args(record, main_kwargs, main_kwargs["grid"])
+    entry = getattr(load(name, arch), record["ffi_entry"])
     return NVFP4AttentionRunner(main_kwargs, out, entry, arguments)
 
 
@@ -234,12 +240,10 @@ def prepare_nvfp4_attention(q, k, v, out, *, backend="cake"):
             f"This route requires positive extents and S divisible by {TILE_ROWS}"
         )
     capability, sm_count = _device_facts(q.device)
-    _arch_of(capability)
+    record = MODULES[record_for(_arch_of(capability))]
     bh = batch * heads
-    tiles = bh * (seqlen // TILE_ROWS)
-    grid_x = 2 * min(sm_count // 2, tiles)
     kwargs = dict(
-        grid=(grid_x, 1, 1),
+        grid=launch_grid(record, total_bh=bh, seqlen_q=seqlen, sm_count=sm_count),
         **pack_nvfp4_attention_inputs(q, k, v),
         O=out.reshape(bh, seqlen, dim),
         seqlen_q=seqlen,
