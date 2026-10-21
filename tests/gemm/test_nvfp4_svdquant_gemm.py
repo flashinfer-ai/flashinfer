@@ -5006,11 +5006,13 @@ def _run_prefix(inputs: list[torch.Tensor], *, dynamic: bool) -> None:
         (0, (64 * 3072,), "x must be 2-D"),
         (1, (1,), "pqs must have k elements"),
         (2, (0,), "global_scale must contain at least one element"),
-        (3, (1, 32), r"l2t_smoothed must be \[k, 32\]"),
+        # A wrong leading dimension fails the row check, which names the rank
+        # generically; only a wrong rank names the compiled rank.
+        (3, (1, 32), r"l2t_smoothed must be \[k, rank\]"),
         (3, (3072, 16), r"l2t_smoothed must be \[k, 32\]"),
         (4, (64, 1), r"xq must be \[m, k/2\]"),
         (5, (1,), "sf is smaller than"),
-        (6, (1, 32), r"down must be \[m, 32\]"),
+        (6, (1, 32), r"down must be \[m, rank\]"),
     ),
 )
 def test_prefix_rejects_invalid_shapes_before_launch(
