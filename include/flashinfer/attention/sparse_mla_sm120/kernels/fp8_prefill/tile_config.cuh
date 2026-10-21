@@ -33,6 +33,9 @@ struct PrefillTilePrimary<ModelType::DSV4_1> {
 };
 
 template <>
+struct PrefillTilePrimary<ModelType::DSV4_1_INLINE> : PrefillTilePrimary<ModelType::DSV4_1> {};
+
+template <>
 struct PrefillTilePrimary<ModelType::DOTS3_SWA> {
   static constexpr int CAND_WINDOW = 32;
   static constexpr int MATH_WARPS = 8;

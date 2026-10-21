@@ -18,8 +18,12 @@ from typing import Any, Optional, Tuple, Union
 
 import torch
 
-from flashinfer.sampling import get_sampling_module
-from flashinfer.utils import _get_cache_buf, device_support_pdl
+from flashinfer.sampling import (
+    get_sampling_module,
+    softmax as sampling_softmax,
+)
+from flashinfer.topk import _ROW_STATES_NBYTES
+from flashinfer.utils import device_support_pdl
 
 from .op import ParameterizedOp
 from .types import TaggedTensor, TensorType
@@ -129,12 +133,9 @@ class ProbsTopKOp(ParameterizedOp):
         ):
             raise ValueError("top_k must be a positive integer or a tensor array")
 
-        # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU)
-        row_states_buffer = _get_cache_buf(
-            f"top_k_renorm_probs_row_states_{tensor.data.device}",
-            1024 * 1024,
-            tensor.data.device,
-            zero_init=True,
+        # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
+        row_states_buffer = torch.zeros(
+            _ROW_STATES_NBYTES, dtype=torch.uint8, device=tensor.data.device
         )
         renorm_probs = get_sampling_module().top_k_renorm_probs(
             tensor.data, maybe_top_k_arr, top_k_val, row_states_buffer
@@ -175,12 +176,9 @@ class LogitsTopKOp(ParameterizedOp):
         ):
             raise ValueError("top_k must be a positive integer or a tensor array")
 
-        # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU)
-        row_states_buffer = _get_cache_buf(
-            f"top_k_mask_logits_row_states_{tensor.data.device}",
-            1024 * 1024,
-            tensor.data.device,
-            zero_init=True,
+        # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
+        row_states_buffer = torch.zeros(
+            _ROW_STATES_NBYTES, dtype=torch.uint8, device=tensor.data.device
         )
         masked_logits = get_sampling_module().top_k_mask_logits(
             tensor.data, maybe_top_k_arr, top_k_val, row_states_buffer
@@ -391,20 +389,14 @@ class FusedTemperatureSoftmaxOp(ParameterizedOp):
         ):
             raise ValueError("Temperature must be positive float or a tensor array")
 
-        workspace_buffer = _get_cache_buf(
-            "softmax_workspace", 1024 * 1024, tensor.data.device
-        )
-
         enable_pdl = self.default_params.get("enable_pdl", None)
         if enable_pdl is None:
             enable_pdl = device_support_pdl(tensor.data.device)
 
-        probs = get_sampling_module().softmax(
-            workspace_buffer,
-            tensor.data,
-            maybe_temperature_arr,
-            temperature_val,
-            enable_pdl,
+        # Keep fused pipelines on the public dispatch path so architecture-
+        # specific softmax routes match direct flashinfer.sampling.softmax.
+        probs = sampling_softmax(
+            logits=tensor.data, temperature=temperature, enable_pdl=enable_pdl
         )
 
         return TaggedTensor(probs, output_type)

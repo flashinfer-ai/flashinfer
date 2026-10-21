@@ -21,7 +21,7 @@ def test_grouped_cute_dsl_public_contract():
     assert not api.has_backend_choices()
     assert api.is_compute_capability_supported(100)
     assert api.is_compute_capability_supported(103)
-    assert not api.is_compute_capability_supported(107)
+    assert api.is_compute_capability_supported(107)
     assert group_deepgemm_fp8_nt_groupwise.is_compute_capability_supported(107)
     assert list(inspect.signature(group_deepgemm_fp8_nt_groupwise).parameters) == [
         "a",

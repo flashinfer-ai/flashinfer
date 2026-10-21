@@ -176,7 +176,7 @@ def clean_cpb_state(store, monkeypatch, tmp_path):
 
 def _skip_if_low_vram(needed_gib: int) -> None:
     """Skip when the GPU cannot fit the multi-GiB KV pool (mirrors the
-    torch.cuda.mem_get_info precedent in test_mla_decode_kernel.py)."""
+    torch.cuda.mem_get_info precedent in test_mla_wrapper.py)."""
     if torch.cuda.mem_get_info(torch.device("cuda"))[0] < needed_gib * (1 << 30):
         pytest.skip(f"needs >= {needed_gib} GiB free VRAM for the KV pool")
 
@@ -355,6 +355,7 @@ def test_model_cpb_accuracy_guard_dual_cache(
                 -1,  # model_type: legacy width inference (d_qk=512 -> DSV4)
                 cpb_override,
                 False,  # extra_fp4
+                1.0,
             )
 
         return cpb_mod._time_call_fresh_indices(
@@ -1895,7 +1896,7 @@ def test_public_profile_reuse_force_and_failure(
     assert cpb_mod.default_cache_path().read_bytes() == before
 
 
-def test_public_preflight_and_default_six_families(
+def test_public_preflight_and_default_families(
     store, monkeypatch, ordinary_format_facts
 ):
     from flashinfer.mla._sparse_mla_sm120 import _execution as execution
@@ -1914,7 +1915,7 @@ def test_public_preflight_and_default_six_families(
     def profile(request, device):
         requested.add(request.family)
         assert request.effective["compute_precision"] == (
-            "fp8" if request.family == "dsv4_1" else "default"
+            "fp8" if request.family in ("dsv4_1", "dsv4_1_inline") else "default"
         )
         assert request.extra_topk == 0
         return {
@@ -1939,6 +1940,7 @@ def test_public_preflight_and_default_six_families(
         "glm53_nope",
         "dots3_swa",
         "dsv4_1",
+        "dsv4_1_inline",
     }
 
 

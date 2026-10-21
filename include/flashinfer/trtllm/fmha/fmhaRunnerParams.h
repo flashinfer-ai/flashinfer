@@ -243,6 +243,8 @@ struct TllmGenFmhaRunnerParams {
   // The scratch space for each CtaKv when the multiCtasKv mode is enabled.
   // PartialO, partialMax and partialSum will be stored to the scratch space.
   void* multiCtasKvScratchPtr;
+  // The scratch space size in bytes. 0 (unknown) keeps the one-wave KV split rule.
+  size_t mMultiCtasKvScratchBytes;
   // The softmax stats buffer.
   // The softmax max/sum values will be stored to the buffer if it is not nullptr.
   float2* softmaxStatsPtr;
@@ -250,6 +252,9 @@ struct TllmGenFmhaRunnerParams {
   float* lsePtr;
   // Strides (in elements) for the LSE buffer laid out as [num_tokens, num_heads_q].
   int64_t lseStrideTokens;
+  // Multiplies the base-2 LSE; 1.0f keeps base 2. Set by launcher
+  // alongside lsePtr
+  float lseScale;
   int64_t lseStrideHeads;
 
   // SageAttention scaling factors (null when SageAttention is not used).

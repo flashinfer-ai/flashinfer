@@ -20,6 +20,83 @@ from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 
 @torch.no_grad()
+def _tp_moe_finalize_rmsnorm_reference(
+    gemm2_permuted,
+    expert_weights,
+    expanded_idx_to_permuted_idx,
+    norm_weight,
+    eps,
+    gain_center,
+    weight_before_norm,
+    **_unused,
+):
+    """Single-rank reference treating gathered GEMM2 rows as already reduced."""
+    num_tokens, num_experts = expanded_idx_to_permuted_idx.shape
+    hidden_size = norm_weight.shape[0]
+    indices = expanded_idx_to_permuted_idx.reshape(-1).to(torch.int64)
+    valid = (indices >= 0) & (indices < gemm2_permuted.shape[0])
+    if gemm2_permuted.shape[0] == 0:
+        rows = gemm2_permuted.new_zeros((num_tokens, num_experts, hidden_size))
+    else:
+        rows = gemm2_permuted.index_select(
+            0, indices.clamp(0, gemm2_permuted.shape[0] - 1)
+        )[:, :hidden_size]
+        rows = rows.reshape(num_tokens, num_experts, hidden_size)
+        rows = rows.masked_fill(~valid.reshape(num_tokens, num_experts, 1), 0)
+    rows = rows.to(torch.float32)
+    if weight_before_norm:
+        rows = rows * (norm_weight.to(torch.float32) + float(gain_center))
+    inv_rms = torch.rsqrt(rows.square().mean(dim=-1, keepdim=True) + float(eps))
+    normalized = rows * inv_rms
+    if not weight_before_norm:
+        normalized = normalized * (norm_weight.to(torch.float32) + float(gain_center))
+    return (
+        normalized.mul(expert_weights.to(torch.float32).unsqueeze(-1))
+        .sum(dim=1)
+        .to(torch.bfloat16)
+    )
+
+
+tp_moe_finalize_rmsnorm_trace = TraceTemplate(
+    op_type="tp_moe_finalize_rmsnorm",
+    name_prefix="tp_moe_finalize_rmsnorm",
+    description=(
+        "Gather raw permuted GEMM2 rows, reduce them across TP ranks, apply "
+        "per-expert RMSNorm, and perform the BF16- or FP32-routing-weighted "
+        "finalize. The trace reference treats the gathered rows as already "
+        "TP-reduced."
+    ),
+    axes={
+        "num_tokens": Var(),
+        "num_permuted_rows": Var(),
+        "num_experts": Const(abbrev="e"),
+        "hidden_size": Const(abbrev="h"),
+        "hidden_size_padded": Const(abbrev="hp"),
+    },
+    inputs={
+        "gemm2_permuted": Tensor(["num_permuted_rows", "hidden_size_padded"]),
+        "expert_weights": Tensor(["num_tokens", "num_experts"]),
+        "expanded_idx_to_permuted_idx": Tensor(
+            ["num_tokens", "num_experts"], dtype="int32"
+        ),
+        "norm_weight": Tensor(["hidden_size"]),
+        "eps": Scalar("float32"),
+        "gain_center": Scalar("float32"),
+        "weight_before_norm": Scalar("int32"),
+    },
+    outputs={
+        "output": Tensor(
+            ["num_tokens", "hidden_size"],
+            dtype_from="gemm2_permuted",
+            param="output",
+        )
+    },
+    tags=["status:verified", "stage:comm", "fused", "tp4"],
+    reference=_tp_moe_finalize_rmsnorm_reference,
+)
+
+
+@torch.no_grad()
 def _allreduce_fusion_reference(
     input: torch.Tensor,
     workspace,
@@ -359,4 +436,266 @@ pcie_ipc_all_reduce_trace = TraceTemplate(
     tags=["status:verified", "stage:comm"],
     reference=_pcie_ipc_all_reduce_reference,
     init=_pcie_ipc_all_reduce_init,
+)
+
+
+def _pcie_ipc_collective_templates(collective, input_rows, output_rows):
+    # The group size belongs to the workspace, not the call signature. Finite
+    # templates preserve it as a Const and remain discoverable by trace tooling.
+    operation = "all-gather" if collective == "all_gather" else "SUM reduce-scatter"
+    return {
+        world_size: TraceTemplate(
+            op_type="comm",
+            name_prefix=f"pcie_ipc_{collective}_tp{world_size}",
+            description=(
+                f"PCIe IPC {operation} with rank-major shards. "
+                "This is a per-rank metadata schema; "
+                "execution requires a collectively initialized workspace."
+            ),
+            axes={
+                "local_rows": Var(description="Rows in one rank's shard."),
+                "total_rows": Var(description="Rows across all rank-major shards."),
+                "hidden_dim": Const(abbrev="h"),
+                "world_size": Const(value=world_size, abbrev=""),
+            },
+            inputs={"inp": Tensor([input_rows, "hidden_dim"])},
+            outputs={
+                "output": Tensor(
+                    [output_rows, "hidden_dim"], param="out", dtype_from="inp"
+                )
+            },
+            constraints=["total_rows == world_size * local_rows"],
+            tags=["stage:comm"],
+            # A local tensor alone cannot define a distributed reference/init.
+        )
+        for world_size in (2, 4, 8)
+    }
+
+
+_pcie_ipc_all_gather_templates = _pcie_ipc_collective_templates(
+    "all_gather", "local_rows", "total_rows"
+)
+_pcie_ipc_reduce_scatter_templates = _pcie_ipc_collective_templates(
+    "reduce_scatter", "total_rows", "local_rows"
+)
+
+
+def _pcie_ipc_collective_trace_dispatch(templates, kwargs):
+    world_size = getattr(kwargs.get("self"), "world_size", None)
+    if world_size not in templates:
+        raise ValueError(
+            "PCIe IPC collective tracing requires a bound workspace with "
+            "world_size 2, 4, or 8; use fi_trace(workspace.all_gather, inp=...) "
+            "or fi_trace(workspace.reduce_scatter, inp=...)."
+        )
+    return templates[world_size]
+
+
+def pcie_ipc_all_gather_trace_dispatch(**kwargs):
+    return _pcie_ipc_collective_trace_dispatch(_pcie_ipc_all_gather_templates, kwargs)
+
+
+def pcie_ipc_reduce_scatter_trace_dispatch(**kwargs):
+    return _pcie_ipc_collective_trace_dispatch(
+        _pcie_ipc_reduce_scatter_templates, kwargs
+    )
+
+
+pcie_ipc_all_gather_trace_dispatch.templates = tuple(  # type: ignore[attr-defined]
+    _pcie_ipc_all_gather_templates.values()
+)
+pcie_ipc_reduce_scatter_trace_dispatch.templates = tuple(  # type: ignore[attr-defined]
+    _pcie_ipc_reduce_scatter_templates.values()
+)
+
+
+# ── Fused NCCL-LSA DCP all-to-all + LSE reduce ───────────────────────────────
+
+
+@torch.no_grad()
+def _decode_cp_a2a_lse_reduce_reference(
+    partial_o: torch.Tensor,
+    partial_lse: torch.Tensor,
+    workspace,
+    cp_rank: int,
+    cp_size: int,
+    lse_mode: str = "base2",
+    **_unused,
+):
+    """Local LSE merge reference; multi-rank exchange is tested under tests/comm."""
+    lse = torch.where(
+        torch.isnan(partial_lse) | torch.isposinf(partial_lse),
+        torch.full_like(partial_lse, float("-inf")),
+        partial_lse,
+    )
+    lse_max = lse.amax(dim=-1, keepdim=True)
+    lse_max = torch.where(torch.isneginf(lse_max), 0, lse_max)
+    weights = (
+        torch.exp(lse - lse_max) if lse_mode == "basee" else torch.exp2(lse - lse_max)
+    )
+    denom = weights.sum(dim=-1, keepdim=True)
+    output = (partial_o.float() * weights.unsqueeze(-1)).sum(dim=-2)
+    output = output / denom.clamp_min(1e-20)
+    output = torch.where(denom == 0, torch.zeros_like(output), output)
+    return output.to(partial_o.dtype)
+
+
+def _decode_cp_a2a_lse_reduce_init(
+    *,
+    batch_dim: int,
+    cp_size: int,
+    head_dim: int = 128,
+    workspace_bytes: int = 16,
+    cp_rank: int = 0,
+    lse_mode: str = "base2",
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build schema inputs; the real workspace must be rendezvoused collectively."""
+    torch.manual_seed(seed)
+    return {
+        "partial_o": torch.randn(
+            batch_dim, cp_size, head_dim, dtype=torch.bfloat16, device=device
+        ),
+        "partial_lse": torch.randn(
+            batch_dim, cp_size, dtype=torch.float32, device=device
+        ),
+        "workspace": torch.zeros(workspace_bytes, dtype=torch.uint8, device=device),
+        "cp_rank": int(cp_rank),
+        "cp_size": int(cp_size),
+        "lse_mode": lse_mode,
+    }
+
+
+decode_cp_a2a_lse_reduce_trace = TraceTemplate(
+    op_type="comm",
+    name_prefix="decode_cp_a2a_lse_reduce",
+    description=(
+        "Fused context-parallel NCCL-LSA all-to-all and LSE-weighted "
+        "attention-output reduction. The trace reference models the local "
+        "LSE merge; multi-rank exchange correctness is exercised by tests/comm."
+    ),
+    axes={
+        "batch_dim": Var(
+            description=(
+                "Flattened batch and head dimensions (batch * heads); heads may "
+                "be local or total."
+            )
+        ),
+        "cp_size": Var(description="Context-parallel group size."),
+        "head_dim": Const(abbrev="d"),
+        "workspace_bytes": Var(),
+    },
+    inputs={
+        "partial_o": Tensor(
+            ["batch_dim", "cp_size", "head_dim"],
+            description=(
+                "Per-rank partial attention outputs [batch, heads, cp_size, head_dim]."
+            ),
+        ),
+        "partial_lse": Tensor(
+            ["batch_dim", "cp_size"],
+            dtype="float32",
+            description="Per-rank log-sum-exp values [batch, heads, cp_size].",
+        ),
+        "workspace": Tensor(["workspace_bytes"], dtype="uint8"),
+        "cp_rank": Scalar("int32"),
+        "cp_size": Scalar("int32"),
+        "lse_mode": Scalar("str"),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_dim", "head_dim"],
+            dtype_from="partial_o",
+            description="Reduced output [batch, heads, head_dim].",
+        ),
+    },
+    tags=["status:experimental", "stage:comm"],
+    reference=_decode_cp_a2a_lse_reduce_reference,
+    init=_decode_cp_a2a_lse_reduce_init,
+)
+
+
+all_gather_gated_residual_next_rmsnorm_trace = TraceTemplate(
+    op_type="all_gather_gated_residual_next_rmsnorm",
+    name_prefix="all_gather_gated_residual_next_rmsnorm",
+    description="Gather TP column shards, combine the gated residual, and normalize it.",
+    axes={
+        "num_tokens": Var(),
+        "shard_hidden": Const(abbrev="sh"),
+        "hidden": Const(abbrev="h"),
+    },
+    inputs={
+        "branch_shard": Tensor(["num_tokens", "shard_hidden"]),
+        "residual": Tensor(["num_tokens", "hidden"], dtype="float32"),
+        "alpha": Tensor(["hidden"], dtype="float32"),
+        "beta": Tensor(["hidden"], dtype="float32"),
+        "next_weight": Tensor(["hidden"]),
+        "post_weight": Tensor(["hidden"], optional=True),
+        "post_eps": Scalar("float32"),
+        "next_eps": Scalar("float32"),
+        "next_gain_center": Scalar("float32"),
+        "post_gain_center": Scalar("float32"),
+        "workspace": Scalar("int64", description="Opaque collective workspace."),
+    },
+    outputs={
+        "residual_out": Tensor(["num_tokens", "hidden"], dtype="float32"),
+        "ffn_input": Tensor(["num_tokens", "hidden"], dtype="bfloat16"),
+    },
+    tags=["stage:comm", "fused"],
+)
+
+all_gather_rmsnorm_fp4_quantize_trace = TraceTemplate(
+    op_type="all_gather_rmsnorm_fp4_quantize",
+    name_prefix="all_gather_rmsnorm_fp4_quantize",
+    description="Gather TP column shards, normalize, and quantize to NVFP4.",
+    axes={
+        "num_tokens": Var(),
+        "shard_hidden": Const(abbrev="sh"),
+        "hidden": Const(abbrev="h"),
+        "packed_hidden": Var(),
+        "scale_hidden": Var(),
+        "one": Const(value=1),
+    },
+    inputs={
+        "shard": Tensor(["num_tokens", "shard_hidden"]),
+        "weight": Tensor(["hidden"]),
+        "global_scale": Tensor(["one"], dtype="float32"),
+        "eps": Scalar("float32"),
+        "gain_center": Scalar("float32"),
+        "workspace": Scalar("int64", description="Opaque collective workspace."),
+    },
+    outputs={
+        "packed": Tensor(["num_tokens", "packed_hidden"], dtype="uint8"),
+        "scales": Tensor(["num_tokens", "scale_hidden"], dtype="uint8"),
+    },
+    constraints=["packed_hidden == hidden // 2", "scale_hidden == hidden // 16"],
+    tags=["stage:comm", "fused"],
+)
+
+moe_finalize_rmsnorm_allreduce_trace = TraceTemplate(
+    op_type="moe_finalize_rmsnorm_allreduce",
+    name_prefix="moe_finalize_rmsnorm_allreduce",
+    description="Normalize and weight local expert rows, then all-reduce their BF16 partial sums.",
+    axes={
+        "num_tokens": Var(),
+        "num_rows": Var(),
+        "hidden_padded": Const(abbrev="hp"),
+        "hidden": Const(abbrev="h"),
+        "top_k": Const(abbrev="k"),
+    },
+    inputs={
+        "routed_rows": Tensor(["num_rows", "hidden_padded"]),
+        "route_weights": Tensor(["num_tokens", "top_k"]),
+        "permuted_idx": Tensor(["num_tokens", "top_k"], dtype="int32"),
+        "norm_weight": Tensor(["hidden"]),
+        "eps": Scalar("float32"),
+        "gain_center": Scalar("float32"),
+        "weight_before_norm": Scalar("int32"),
+        "workspace": Scalar("int64", description="Opaque collective workspace."),
+    },
+    outputs={
+        "output": Tensor(["num_tokens", "hidden"], dtype="bfloat16", param="output")
+    },
+    tags=["stage:comm", "fused"],
 )

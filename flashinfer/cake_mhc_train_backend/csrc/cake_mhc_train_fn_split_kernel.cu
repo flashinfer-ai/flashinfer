@@ -1,0 +1,180 @@
+/*
+ * Copyright (c) 2026 by FlashInfer team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+typedef signed char        int8_t;
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+#if defined(__CUDACC_RTC__)
+typedef unsigned long long uint64_t;
+#else
+typedef unsigned long      uint64_t;
+#endif
+static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
+typedef signed int         int32_t;
+typedef short int          int16_t;
+struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+
+#if defined(__CUDACC_RTC__)
+typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+#else
+#include <cuda.h>
+#endif
+
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
+
+#define CAKE_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 256
+
+#include <math_constants.h>
+
+__device__ __forceinline__ float2 sub_f32x2_noftz(float2 a, float2 b) {
+    float2 r;
+    asm("sub.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
+    return r;
+}
+
+
+// ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
+
+extern "C" {
+
+__global__ __launch_bounds__(256) void
+kernel_cake_mhc_train_fn_split(float* __restrict__ fn, __nv_bfloat16* __restrict__ fnp, __nv_bfloat16* __restrict__ fnTp, int want_t)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
+
+    // === Task calls (dependency order) ===
+    int nk[2];
+    if (want_t == 0) {
+        nk[0] = bid / 8;
+        nk[1] = bid % 8 * 2048 + tid * 8;
+    } else {
+        nk[0] = tid % 32;
+        nk[1] = (bid * 8 + tid / 32) * 8;
+    }
+    int n = nk[0];
+    int k0 = nk[1];
+    float p1[8];
+    float p2[8];
+    float p3[8];
+    if (n < 24) {
+        long long src = (long long)n * 16384 + (long long)k0;
+        #pragma unroll
+        for (int q = 0; q < 2; q++) {
+            float _vec_load_0[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(fn + (src + (long long)(4 * q)) + 0);
+                _vec_load_0[0 + 0] = _v4.x;
+                _vec_load_0[0 + 1] = _v4.y;
+                _vec_load_0[0 + 2] = _v4.z;
+                _vec_load_0[0 + 3] = _v4.w;
+            }
+            #pragma unroll
+            for (int j = 0; j < 4; j += 2) {
+                float2 _f2_0 = make_float2(_vec_load_0[j], _vec_load_0[j + 1]);
+                __nv_bfloat162 _bf16x2_0 = __float22bfloat162_rn(make_float2(_vec_load_0[j], _vec_load_0[j + 1]));
+                float2 _cvt_f32_0 = __bfloat1622float2(_bf16x2_0);
+                __nv_bfloat162 _bf16x2_1 = __float22bfloat162_rn(make_float2(sub_f32x2_noftz(_f2_0, _cvt_f32_0).x, sub_f32x2_noftz(_f2_0, _cvt_f32_0).y));
+                float2 _cvt_f32_1 = __bfloat1622float2(_bf16x2_1);
+                __nv_bfloat162 _bf16x2_2 = __float22bfloat162_rn(make_float2(sub_f32x2_noftz(sub_f32x2_noftz(_f2_0, _cvt_f32_0), _cvt_f32_1).x, sub_f32x2_noftz(sub_f32x2_noftz(_f2_0, _cvt_f32_0), _cvt_f32_1).y));
+                float2 _cvt_f32_2 = __bfloat1622float2(_bf16x2_2);
+                p1[4 * q + j] = _cvt_f32_0.x;
+                p1[4 * q + j + 1] = _cvt_f32_0.y;
+                p2[4 * q + j] = _cvt_f32_1.x;
+                p2[4 * q + j + 1] = _cvt_f32_1.y;
+                p3[4 * q + j] = _cvt_f32_2.x;
+                p3[4 * q + j + 1] = _cvt_f32_2.y;
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int j_1 = 0; j_1 < 8; j_1++) {
+            p1[j_1] = 0.0f;
+            p2[j_1] = 0.0f;
+            p3[j_1] = 0.0f;
+        }
+    }
+    if (want_t == 0) {
+        long long dst = (long long)n * 16384 + (long long)k0;
+        {
+            __nv_bfloat162 _pk[4];
+            _pk[0] = __floats2bfloat162_rn(p1[0 + 0], p1[0 + 1]);
+            _pk[1] = __floats2bfloat162_rn(p1[0 + 2], p1[0 + 3]);
+            _pk[2] = __floats2bfloat162_rn(p1[0 + 4], p1[0 + 5]);
+            _pk[3] = __floats2bfloat162_rn(p1[0 + 6], p1[0 + 7]);
+            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(fnp + dst))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+        }
+        long long dst_0 = (long long)(32 + n) * 16384 + (long long)k0;
+        {
+            __nv_bfloat162 _pk[4];
+            _pk[0] = __floats2bfloat162_rn(p2[0 + 0], p2[0 + 1]);
+            _pk[1] = __floats2bfloat162_rn(p2[0 + 2], p2[0 + 3]);
+            _pk[2] = __floats2bfloat162_rn(p2[0 + 4], p2[0 + 5]);
+            _pk[3] = __floats2bfloat162_rn(p2[0 + 6], p2[0 + 7]);
+            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(fnp + dst_0))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+        }
+        long long dst_1 = (long long)(64 + n) * 16384 + (long long)k0;
+        {
+            __nv_bfloat162 _pk[4];
+            _pk[0] = __floats2bfloat162_rn(p3[0 + 0], p3[0 + 1]);
+            _pk[1] = __floats2bfloat162_rn(p3[0 + 2], p3[0 + 3]);
+            _pk[2] = __floats2bfloat162_rn(p3[0 + 4], p3[0 + 5]);
+            _pk[3] = __floats2bfloat162_rn(p3[0 + 6], p3[0 + 7]);
+            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(fnp + dst_1))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+        }
+    } else {
+        long long dst_t = (long long)k0 * 32 + (long long)n;
+        #pragma unroll
+        for (int j_2 = 0; j_2 < 8; j_2++) {
+            *(reinterpret_cast<__nv_bfloat16*>(fnTp + (dst_t + (long long)(j_2 * 32))) + (0)) = __float2bfloat16_rn(p1[j_2]);
+        }
+        long long dst_t_0 = (16384 + (long long)k0) * 32 + (long long)n;
+        #pragma unroll
+        for (int j_3 = 0; j_3 < 8; j_3++) {
+            *(reinterpret_cast<__nv_bfloat16*>(fnTp + (dst_t_0 + (long long)(j_3 * 32))) + (0)) = __float2bfloat16_rn(p2[j_3]);
+        }
+        long long dst_t_1 = (32768 + (long long)k0) * 32 + (long long)n;
+        #pragma unroll
+        for (int j_4 = 0; j_4 < 8; j_4++) {
+            *(reinterpret_cast<__nv_bfloat16*>(fnTp + (dst_t_1 + (long long)(j_4 * 32))) + (0)) = __float2bfloat16_rn(p3[j_4]);
+        }
+    }
+}
+
+} // extern "C"

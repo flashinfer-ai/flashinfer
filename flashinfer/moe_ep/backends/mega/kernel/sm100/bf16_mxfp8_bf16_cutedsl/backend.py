@@ -101,8 +101,26 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             num_experts=fleet_params.num_experts,
         )
 
+    supports_live_token_tuning = True
+    _knob_cache_module = (
+        "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.knob_cache"
+    )
+
+    def _tuning_key(self, fleet_params: FleetParams) -> dict[str, Any]:
+        k = self._kernel_config
+        return dict(
+            dtype=k.kind,
+            world_size=self.ep_world_size,
+            hidden=fleet_params.token_hidden_size,
+            intermediate=k.intermediate_size,
+            num_experts=fleet_params.num_experts,
+            topk=k.top_k,
+            max_tokens=fleet_params.max_tokens_per_rank,
+            enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
+        )
+
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......kernel_src.cutedsl_megamoe import (
+        from ......kernel_src.sm100.cutedsl_megamoe import (
             get_symm_buffer_for_bf16_mxfp8_mega_moe,
         )
 
@@ -118,7 +136,7 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             kind=config.kind,
             gate_up_clamp=_clamp(config),
             enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
-            knobs=config.knobs if isinstance(config.knobs, dict) else None,
+            knobs=self._workspace_knobs(fleet_params),
         )
 
     def validate_forward(
@@ -142,7 +160,7 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
         del quantize_input
-        from ......kernel_src.cutedsl_megamoe import note_staged_tokens
+        from ......kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
 
         stage_mega_moe_inputs(
             t.hidden_states,
@@ -161,7 +179,7 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
-        from ......kernel_src.cutedsl_megamoe import (
+        from ......kernel_src.sm100.cutedsl_megamoe import (
             autotune_bf16_mxfp8_mega_moe,
             bf16_mxfp8_mega_moe,
             staged_tokens,
@@ -184,7 +202,7 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             num_tokens = staged
 
         if self._autotune_pending:
-            autotune_bf16_mxfp8_mega_moe(
+            self._autotune_winner = autotune_bf16_mxfp8_mega_moe(
                 output,
                 transformed_weights[0],
                 transformed_weights[1],
@@ -225,7 +243,7 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             config.kind,
             _clamp(config),
             config.enable_in_kernel_fc2_reduce,
-            knobs_pool_key(config.knobs),
+            knobs_pool_key(self._workspace_knobs(fleet_params)),
         )
 
     def _forget_workspace_state(self, workspace) -> None:
@@ -236,7 +254,7 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         import sys
 
         quant_stage = sys.modules.get(
-            "flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.quant_stage"
+            "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.quant_stage"
         )
         topk_idx = getattr(workspace, "topk_idx", None)
         if quant_stage is not None and topk_idx is not None:

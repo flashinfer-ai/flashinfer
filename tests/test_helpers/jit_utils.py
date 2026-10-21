@@ -20,6 +20,9 @@ import torch
 
 import flashinfer
 from flashinfer.jit import JitSpec
+from flashinfer.jit.attention.modules import (
+    _gen_batch_attention_primary_module,
+)
 from flashinfer.utils import (
     is_fa3_backend_supported,
     is_fa3_prefill_head_dim_supported,
@@ -108,8 +111,10 @@ def gen_persistent_batch_attention_modules(
             if kv_dtype.itemsize > 1:
                 continue  # skip fp16/bf16 mixed precision
 
+        # The baseline suite uses packed K/V with equal strides. Unequal-stride
+        # regression tests compile their own independent modules on demand.
         jit_specs.append(
-            flashinfer.attention.gen_batch_attention_module(
+            _gen_batch_attention_primary_module(
                 q_dtype,
                 kv_dtype,
                 q_dtype,

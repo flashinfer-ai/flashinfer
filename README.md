@@ -251,6 +251,13 @@ FlashInfer powers inference in:
 - [lorax](https://github.com/predibase/lorax)
 - [ScaleLLM](https://github.com/vectorch-ai/ScaleLLM)
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, pull request guidelines
+(PR template, performance numbers for optimizations), and how CI is triggered. Coding
+agents pick up the same guidance from [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md);
+the review guidance is in [docs/code_review_guidance_human.md](docs/code_review_guidance_human.md).
+
 ## Acknowledgement
 
 FlashInfer is inspired by [FlashAttention](https://github.com/dao-AILab/flash-attention/), [vLLM](https://github.com/vllm-project/vllm), [stream-K](https://arxiv.org/abs/2301.03598), [CUTLASS](https://github.com/nvidia/cutlass), and [AITemplate](https://github.com/facebookincubator/AITemplate).

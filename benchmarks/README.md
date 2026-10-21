@@ -53,9 +53,8 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `trtllm_fp8_per_tensor_scale_moe` - MOE with FP8 quantized weights and per-tensor scaling.
     - `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4 variants with optional TP/EP)
     - `cute_dsl_bf16_moe` - CuTe-DSL BF16/FP16 fused MoE for Hopper.
-    - `unified_moe` - Unified MoE API comparison between the CUTLASS and cuTile backends. It supports BF16, NVFP4 W4A4/W4A16, and MXFP4 W4A4/W4A16 with gated SwiGLU, SwiGLU-Step, GeGLU, GeGLU-Tanh, and SiTU or non-gated GELU, ReLU, SiLU, ReLU2, and Identity; filters unsupported backends at runtime; and can autotune each backend independently.
-- MOE Communication:
-    - `moe_a2a_dispatch_combine` - MoE All-to-All dispatch + combine benchmark for multi-GPU expert-parallel inference. Requires `mpirun` for multi-GPU execution. Supports optional quantization (FP8, NVFP4, FP8 block-scale) and real MoE kernel computation.
+    - `unified_moe` - Unified MoE API comparison between the CUTLASS, cuTile, b12x and cuDNN grouped-GEMM backends. It supports BF16, NVFP4 and MXFP4 W4A4/W4A16, per-tensor FP8 and MXFP8 W8A8/W8A16, and MXFP4 W4A8 with gated SwiGLU, SwiGLU-Step, GeGLU, GeGLU-Tanh, and SiTU or non-gated GELU, ReLU, SiLU, ReLU2, and Identity; filters unsupported backends at runtime; and can autotune each backend independently.
+- MOE Communication: no routine yet; standalone scripts cover it. `benchmarks/moe_ep/core/comm/bench_moe_ep_comm.py` times dispatch + combine of the `flashinfer.moe_ep` communication backends (launched with `torchrun`), and `benchmarks/moe_ep/bench_moe_ep.py` times dispatch + MoE + combine.
 - AllReduce Communication:
     - `allreduce_fusion` - AllReduce fusion benchmark for multi-GPU inference. Requires `mpirun` for multi-GPU execution. Supports TRTLLM and TRTLLM MNNVL backends with multiple fusion patterns (plain allreduce, allreduce + residual + RMSNorm).
 - Norm:
@@ -111,18 +110,38 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
 A test case is generally invoked as `python3 flashinfer_benchmark.py --routine <routine_name> <flags>`.
 
 The unified MoE comparison runs the selected backends from the same routing, activation,
-and weight inputs. Supported cuTile quantization modes are `bf16`, `nvfp4`,
-`nvfp4_w4a16`, `mxfp4`, and `mxfp4_w4a16`. This example uses the
+and weight inputs; backends without a config for the requested `--quant-variant`,
+without support for the GPU, or failing a first eager call are skipped.
+Supported cuTile quantization modes are `bf16`, `nvfp4`,
+`nvfp4_w4a16`, `mxfp4`, `mxfp4_w4a16`, `fp8`, `fp8_w8a16`, `mxfp8`,
+`mxfp8_w8a16`, and `mxfp4_w4a8`. `fp8` uses per-tensor E4M3 scaling;
+`mxfp8` uses E8M0 block scales. The W8A16 modes retain BF16 activations;
+`mxfp4_w4a8` uses MXFP4 weights with MXFP8 activations. A8 modes include
+BF16-to-FP8 quantization before both GEMMs in the timed region. The cuDNN
+grouped-GEMM backend (`cudnn`) supports `bf16`, `fp8`, `mxfp8` and `nvfp4`. This example uses the
 Nemotron-3.5-Lightning MoE shape:
 
 ```bash
-python3 flashinfer_benchmark.py --routine unified_moe --backends cutlass cutile --quant-variant bf16 --num_tokens 128 --hidden_size 2688 --intermediate_size 1856 --num_experts 128 --top_k 6 --activation-type Relu2 --input_dtype bfloat16 --autotune
+python3 flashinfer_benchmark.py --routine unified_moe --backends cutlass cutile cudnn --quant-variant bf16 --num_tokens 128 --hidden_size 2688 --intermediate_size 1856 --num_experts 128 --top_k 6 --activation-type Relu2 --input_dtype bfloat16 --autotune
 ```
 
 CUDA graph timing is enabled by default and captures one MoE invocation per
 graph replay with cold-L2 benchmarking enabled; pass `--no_cuda_graph` for eager
-timing. Without `--autotune`, results are named `cutlass` and `cutile`; autotuned
-results use `cutlass_autotune` and `cutile_autotune`.
+timing. Without `--autotune`, results are named after the backend (`cutlass`,
+`cutile`, `b12x`, `cudnn`); autotuned results append `_autotune`.
+CUTLASS comparisons also support `fp8` (per-tensor W8A8) and `mxfp4_w4a8`
+on supported architectures. These CUTLASS runners and the cuDNN `fp8` runner take
+prequantized activations, so the benchmark includes their public `prepare_activations`
+conversion in the main BF16-input latency. The additional CSV columns `prequantized_median_time`
+and `prequantized_std_time` (milliseconds) report the runner-only timing without
+that input conversion. Per-tensor CUTLASS uses its fixed GEMM2 activation scale,
+whereas cuTile dynamically scales GEMM2 input; equal precision pairs do not imply
+identical quantization policies. CUTLASS `mxfp4_w4a8` requires hidden and
+intermediate sizes divisible by 128; unsupported shapes are skipped.
+The cuDNN grouped-GEMM `mxfp8` and `nvfp4` runners take the pre-quantized
+activation pack of their config's `prepare_activations`, built once outside the
+timed region; these block-scaled formats require hidden and intermediate sizes
+divisible by 128.
 On SM120/SM121, `--backends b12x cutile` also compares NVFP4 W4A4 (`nvfp4`)
 and W4A16 (`nvfp4_w4a16`). The b12x runner exposes a single heuristic tactic;
 `--autotune` does not expand its search space. MXFP4 is not supported by b12x.
@@ -330,57 +349,6 @@ Notes:
 - FP8 MOE kernels require integer values for group parameters, while FP4 MOE kernels accept optional values.
 - CUTLASS fused MoE (`cutlass_fused_moe`) ignores `--routing_method`, `--n_group`, and `--topk_group`; it computes routing via softmax+top-k internally from the provided logits.
 
-### MoE Communication Flags (moe_a2a_dispatch_combine)
-The `moe_a2a_dispatch_combine` routine benchmarks MoE All-to-All communication for multi-GPU expert-parallel inference. It must be launched with `mpirun`.
-
-| Flag                     | Description                                                                                                 |
-|--------------------------|-------------------------------------------------------------------------------------------------------------|
-| `--num_tokens`           | Number of tokens per rank (local batch size)                                                               |
-| `--hidden_size`          | Hidden dimension size                                                                                      |
-| `--num_experts`          | Total number of experts across all ranks                                                                   |
-| `--top_k`                | Number of experts to route each token to                                                                   |
-| `--input_dtype`          | Data type for hidden states payload: `bfloat16` (default) or `float16`                                     |
-| `--quant_dtype`          | Quantization format: `fp8` (per-tensor), `nvfp4` (block-scale FP4), `fp8_block_scale` (block-scale FP8)    |
-| `--real_math`            | Run actual MoE kernels instead of fake computation. Requires `--intermediate_size` and `--quant_dtype` to be `nvfp4` or `fp8_block_scale` |
-| `--intermediate_size`    | Intermediate FFN size. Required if `--real_math` is set                                                    |
-| `--max_num_tokens`       | Max tokens per rank for workspace allocation. Defaults to `--num_tokens`                                   |
-| `--validate`             | Run correctness validation before benchmarking using deterministic fake MoE                                |
-| `--per_phase_timing`     | Enable per-phase timing (dispatch/combine/moe_kernel). Adds slight overhead from CUDA events               |
-| `--nvtx`                 | Enable NVTX markers for Nsight Systems profiling                                                           |
-| `--use_lora`             | Carry a per-token int32 LoRA adapter ID through dispatch as an extra payload.                                                                                                                  |
-
-**Launch Examples:**
-```bash
-# Basic (no quantization)
-mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
-    --routine moe_a2a_dispatch_combine \
-    --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8
-
-# With FP8 quantization
-mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
-    --routine moe_a2a_dispatch_combine \
-    --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 \
-    --quant_dtype fp8
-
-# With NVFP4 quantization and real MoE kernel
-mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
-    --routine moe_a2a_dispatch_combine \
-    --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 \
-    --quant_dtype nvfp4 --real_math --intermediate_size 18432
-
-# With validation and per-phase timing
-mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
-    --routine moe_a2a_dispatch_combine \
-    --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 \
-    --validate --per_phase_timing
-
-# Multi-tenant LoRA: carry per-token adapter ID through dispatch
-mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
-    --routine moe_a2a_dispatch_combine \
-    --num_tokens 2048 --hidden_size 7168 --num_experts 256 --top_k 8 \
-    --use_lora --validate
-```
-
 ### AllReduce Communication Flags (allreduce_fusion)
 The `allreduce_fusion` routine benchmarks AllReduce fusion operations for multi-GPU inference. It must be launched with `mpirun`. Both oneshot and twoshot strategies are benchmarked automatically and reported side by side.
 
@@ -567,8 +535,7 @@ Legend:
 | **trtllm_fp8_per_tensor_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **cutlass_fused_moe** |  |  |  |  |  | cutlass | cutlass |  |
 | **cute_dsl_bf16_moe** |  |  |  |  | cute-dsl |  |  |  |
-| **unified_moe** |  |  |  | cutlass (BF16), cutile (BF16, NVFP4/MXFP4 W4A16) | cutlass (BF16, MXFP4 W4A16), cutile (BF16, NVFP4/MXFP4 W4A16) | cutlass | cutlass | cutlass (BF16, NVFP4 W4A4), cutile (BF16, NVFP4/MXFP4 W4A4/W4A16) |
-| **moe_a2a_dispatch_combine** |  |  |  |  |  | moe_a2a | moe_a2a |  |
+| **unified_moe** |  | cudnn (BF16) | cudnn (BF16) | cutlass (BF16), cutile (BF16, NVFP4/MXFP4 W4A16), cudnn (BF16, FP8) | cutlass (BF16, MXFP4 W4A16), cutile (BF16, NVFP4/MXFP4 W4A16), cudnn (BF16, FP8) | cutlass, cudnn | cutlass, cudnn | cutlass (BF16, NVFP4 W4A4), cutile (BF16, NVFP4/MXFP4 W4A4/W4A16), b12x (NVFP4 W4A4/W4A16), cudnn |
 | **allreduce_fusion** |  |  |  |  |  | allreduce | allreduce |  |
 | **rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
 | **fused_add_rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |

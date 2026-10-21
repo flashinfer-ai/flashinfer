@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Curated re-exports of raw-kernel helpers/constants/reference from ``../src``.
 
-SM90 counterpart of ``kernel_src/cutedsl_megamoe/shim/kernel_helpers.py``:
+SM90 counterpart of ``kernel_src/sm100/cutedsl_megamoe/shim/kernel_helpers.py``:
 the SINGLE shim file that surfaces kernel-team utilities which are *not* part
 of the frontend / fused-launch surface (FP8 quant helpers, block constants,
 byte-reinterpret stacking, and the FP8 torch reference).  The FI backend glue
@@ -61,10 +61,23 @@ _LAZY = {
         "moe_hopper_fp8.hopper_moe_utils",
         "quantize_fp8_weight_block_nk",
     ),
+    "_swiglu_pair_hw_match_cuda": (
+        "moe_nvfp4_swapab.runner_common",
+        "_swiglu_pair_hw_match_cuda",
+    ),
     # ground-truth torch reference (moe_hopper_fp8/mega_reference_fp8.py)
     "compute_megamoe_reference_fp8": (
         "moe_hopper_fp8.mega_reference_fp8",
         "compute_megamoe_reference_fp8",
+    ),
+    # BF16 helpers (moe_hopper_bf16/hopper_moe_utils.py) + torch reference
+    # (moe_hopper_bf16/mega_reference_bf16.py)
+    "Bf16NonzeroValue": ("moe_hopper_bf16.hopper_moe_utils", "Bf16NonzeroValue"),
+    "create_bf16_tensor": ("moe_hopper_bf16.hopper_moe_utils", "create_bf16_tensor"),
+    "bf16_reference_mm": ("moe_hopper_bf16.hopper_moe_utils", "bf16_reference_mm"),
+    "compute_megamoe_reference_bf16": (
+        "moe_hopper_bf16.mega_reference_bf16",
+        "compute_megamoe_reference_bf16",
     ),
 }
 

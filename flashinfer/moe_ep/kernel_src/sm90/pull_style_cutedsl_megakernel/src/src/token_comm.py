@@ -372,6 +372,10 @@ class TokenCommArgs:
 class TokenInPullTokenBackPush:
     """Current implementation: token-in pull, token-back push."""
 
+    # Compile-time policy for the fused all-CTA completion protocol.
+    # Other communication layouts retain the original path.
+    _skip_zero_expert_counts: bool = False
+
     num_dispatch_warps: int = 4
     warp_threads: int = 32
     num_dispatch_threads: int = num_dispatch_warps * warp_threads
@@ -420,6 +424,11 @@ class TokenInPullTokenBackPush:
         grouped_token_back: bool = False,
         active_dispatch_warps: int = 4,
         compact_pull_buffer: bool = False,
+        # Tail-split pair tasks: an expert with an odd CTA token-tile count publishes
+        # fc2_done this many times for its last cluster tile (0 = off);
+        # cta_tile_tokens (cluster_tile_tokens / 2) detects the odd count.
+        fc2_publishes_per_split_tail_tile: int = 0,
+        cta_tile_tokens: Optional[int] = None,
     ) -> None:
         self.world_size = world_size
         self.num_topk = num_topk
@@ -620,10 +629,44 @@ class TokenInPullTokenBackPush:
             self.fc2_publishes_per_token_cluster_tile = (
                 fc2_publishes_per_token_cluster_tile
             )
+            if fc2_publishes_per_split_tail_tile < 0:
+                raise ValueError(
+                    "fc2_publishes_per_split_tail_tile must be >= 0, got "
+                    f"{fc2_publishes_per_split_tail_tile}."
+                )
+            if fc2_publishes_per_split_tail_tile > 0:
+                if (
+                    cta_tile_tokens is None
+                    or cta_tile_tokens * 2 != cluster_tile_tokens
+                ):
+                    raise ValueError(
+                        "fc2_publishes_per_split_tail_tile > 0 requires "
+                        "cta_tile_tokens * 2 == cluster_tile_tokens; got "
+                        f"cta_tile_tokens={cta_tile_tokens}, "
+                        f"cluster_tile_tokens={cluster_tile_tokens}."
+                    )
+                if (
+                    fc2_publishes_per_split_tail_tile
+                    > fc2_publishes_per_token_cluster_tile
+                ):
+                    raise ValueError(
+                        "fc2_publishes_per_split_tail_tile "
+                        f"({fc2_publishes_per_split_tail_tile}) cannot exceed "
+                        "fc2_publishes_per_token_cluster_tile "
+                        f"({fc2_publishes_per_token_cluster_tile})."
+                    )
+            self.fc2_publishes_per_split_tail_tile = (
+                fc2_publishes_per_split_tail_tile
+            )
+            self.cta_tile_tokens = (
+                cta_tile_tokens if fc2_publishes_per_split_tail_tile > 0 else None
+            )
         else:
             self.fc2_token_bytes = 0
             self.fc2_num_chunks = 0
             self.fc2_publishes_per_token_cluster_tile = 0
+            self.fc2_publishes_per_split_tail_tile = 0
+            self.cta_tile_tokens = None
 
     @property
     def enable_token_back(self) -> bool:
@@ -798,14 +841,28 @@ class TokenInPullTokenBackPush:
             if expert_id < Int32(self.num_total_experts):
                 slot_ptr = smem_count_ptr + expert_id
                 local_count = (slot_ptr).load()
-                delta = (Int64(1) << Int64(32)) | (Int64(local_count) & Int64(0xFFFFFFFF))
-                old_packed = cute.arch.atomic_add(
-                    expert_send_count.iterator + expert_id,
-                    delta,
-                    sem="relaxed",
-                    scope="gpu",
-                )
-                base_slot = Int32(old_packed & Int64(0xFFFFFFFF))
+                if cutlass.const_expr(self._skip_zero_expert_counts):
+                    # Zero contributors have no routes that use this base.
+                    # Completion is reconstructed after the existing grid
+                    # barrier, never inferred from a nonzero contribution.
+                    base_slot = Int32(0)
+                    if local_count > Int32(0):
+                        old_packed = cute.arch.atomic_add(
+                            expert_send_count.iterator + expert_id,
+                            Int64(local_count),
+                            sem="relaxed",
+                            scope="gpu",
+                        )
+                        base_slot = Int32(old_packed & Int64(0xFFFFFFFF))
+                else:
+                    delta = (Int64(1) << Int64(32)) | (Int64(local_count) & Int64(0xFFFFFFFF))
+                    old_packed = cute.arch.atomic_add(
+                        expert_send_count.iterator + expert_id,
+                        delta,
+                        sem="relaxed",
+                        scope="gpu",
+                    )
+                    base_slot = Int32(old_packed & Int64(0xFFFFFFFF))
                 (slot_ptr).store(base_slot)
         cute.arch.barrier(
             barrier_id=self.dispatch_intra_cta_bar_id,
@@ -993,6 +1050,18 @@ class TokenInPullTokenBackPush:
                         scope="gpu",
                     )
                     token_count_u32 = Int32(status_u64 & Int64(0xFFFFFFFF))
+                    if cutlass.const_expr(self._skip_zero_expert_counts):
+                        # Every CTA has completed prep at the grid barrier
+                        # above. Publish the same high32 completion count for
+                        # ALL experts/ranks, including entirely empty ones.
+                        status_u64 = (
+                            (Int64(num_sms) << Int64(32))
+                            | (status_u64 & Int64(0xFFFFFFFF))
+                        )
+                        cute.arch.store(
+                            expert_send_count.iterator + expert_id,
+                            status_u64, sem="relaxed", scope="gpu",
+                        )
                     erc_local_base = expert_recv_count.iterator.toint()
                     erc_elem_off = (
                         Int32(local_rank) * Int32(self.num_experts_per_rank) + dst_local_expert
@@ -1944,6 +2013,21 @@ class TokenInPullTokenBackPush:
                     cur_expert_expected = cluster_tile_cnt * Int32(
                         self.fc2_publishes_per_token_cluster_tile
                     )
+                    if cutlass.const_expr(
+                        self.fc2_publishes_per_split_tail_tile > 0
+                    ):
+                        # Tail-split pair tasks: the last cluster tile of an expert with an odd CTA
+                        # tile count publishes fc2_publishes_per_split_tail_tile times.
+                        cta_tile_cnt = (
+                            total_for_expert
+                            + Int32(self.cta_tile_tokens - 1)
+                        ) // Int32(self.cta_tile_tokens)
+                        if (cta_tile_cnt & Int32(1)) == Int32(1):
+                            cur_expert_expected = (
+                                cur_expert_expected
+                                - Int32(self.fc2_publishes_per_token_cluster_tile)
+                                + Int32(self.fc2_publishes_per_split_tail_tile)
+                            )
 
             if current_expert_idx < Int32(self.num_experts_per_rank):
                 # Wait once per processed expert (both indices monotonic; fc2

@@ -795,7 +795,7 @@ class FP4Moe(Moe):
         if (
             gemm1_clamp_limit is not None
             and self.quant_mode == QuantMode.FP4_NVFP4_NVFP4
-            and activation_type == ActivationType.Situ
+            and activation_type in (ActivationType.Situ, ActivationType.SwigluStep)
         ):
             kernel_gemm1_clamp_limit = gemm1_clamp_limit / static_data["scale_gate_fc1"]
         permute_info = kwargs.get("permute_info")
@@ -1895,6 +1895,12 @@ class FP8PerTensorMoe(Moe):
         enable_autotune = kwargs.get("enable_autotune", True)
         activation_type = kwargs["activation_type"]
         norm_topk_prob = kwargs.get("norm_topk_prob", True)
+        gemm1_clamp_limit = kwargs.get("gemm1_clamp_limit")
+        if (
+            gemm1_clamp_limit is not None
+            and activation_type == ActivationType.SwigluStep
+        ):
+            gemm1_clamp_limit = gemm1_clamp_limit / static_data["scale_gate_fc1"]
         moe_gemm_backend = kwargs.get("moe_gemm_backend", MoeGemmBackend.TRTLLM)
         moe_op = (
             prims_ts_fp8_per_tensor_scale_moe
@@ -1914,6 +1920,8 @@ class FP8PerTensorMoe(Moe):
                 op_kwargs["weight_layout"] = static_data.get(
                     "weight_layout", WeightLayout.MajorK
                 )
+            else:
+                op_kwargs["gemm1_clamp_limit"] = gemm1_clamp_limit
             output = moe_op(
                 expert_logits,
                 routing_bias,
@@ -2006,6 +2014,7 @@ class FP8PerChannelMoe(Moe):
         weight_processing,
     ):
         """Prepare quantized and shuffled weights for the kernel."""
+        del args_dequant
         del gemm1_weights_orig, gemm2_weights_orig, hidden_size, weight_processing
         epilogue_tile_m = 128
         gated = is_gated_activation(args.activation_type)
@@ -2053,22 +2062,18 @@ class FP8PerChannelMoe(Moe):
         ).squeeze(-1)
 
         gemm1_per_channel_weight_scale = 1.0 / gemm1_per_channel_scales
-        gemm2_per_channel_weight_scale = 1.0 / (
-            args_dequant.c_global_sf * gemm2_per_channel_scales
-        )
-        output1_scale_scalar = torch.full(
+        gemm2_per_channel_weight_scale = 1.0 / gemm2_per_channel_scales
+        unit_scale = torch.ones(
             (num_experts,),
-            args_dequant.c_global_sf,
             dtype=torch.float32,
             device=gemm1_per_channel_scales.device,
         )
-        unit_scale = torch.ones_like(output1_scale_scalar)
 
         return {
             "gemm1_weights": gemm1_weights_shuffled,
             "gemm2_weights": gemm2_weights_shuffled,
             "gemm1_per_channel_weight_scale": gemm1_per_channel_weight_scale,
-            "output1_scale_scalar": output1_scale_scalar,
+            "output1_scale_scalar": unit_scale,
             "output1_scale_gate_scalar": unit_scale,
             "gemm2_per_channel_weight_scale": gemm2_per_channel_weight_scale,
             "output2_scale_scalar": unit_scale,
@@ -3167,6 +3172,12 @@ def run_moe_dequant(args, quant_mode: QuantMode):
                     beta=1.0 if beta is None else beta,
                     clamp_limit=clamp_limit,
                 )
+            elif activation_type == ActivationType.SwigluStep:
+                assert alpha is None and beta is None
+                limit = 7.0 if clamp_limit is None else clamp_limit
+                activation_output[i : i + my_num_tokens] = torch.clamp(
+                    F.silu(my_x2), max=limit
+                ) * torch.clamp(my_x1, min=-limit, max=limit)
             else:
                 if clamp_limit is not None:
                     my_x1 = torch.clamp(my_x1, min=-clamp_limit, max=clamp_limit)
@@ -3201,12 +3212,18 @@ def run_moe_dequant(args, quant_mode: QuantMode):
         )
         activation_output = activation_output.to(torch.float)
         args.c_global_sf = c_global_sf
-    elif quant_mode in (QuantMode.FP8_PER_TENSOR, QuantMode.FP8_PER_CHANNEL):
+    elif quant_mode == QuantMode.FP8_PER_TENSOR:
         activation_output, c_global_sf = quant_dequant_per_tensor_fp8(
             activation_output.to(torch.bfloat16)
         )
         activation_output = activation_output.to(torch.float)
         args.c_global_sf = c_global_sf
+    elif quant_mode == QuantMode.FP8_PER_CHANNEL:
+        activation_output, per_token_scales = quant_fp8_per_token(
+            activation_output.to(torch.bfloat16)
+        )
+        activation_output = activation_output.float() * per_token_scales
+        args.c_global_sf = 1.0
     elif (
         quant_mode == QuantMode.FP4_MXFP4_MXFP8
         or quant_mode == QuantMode.FP8_BLOCK_SCALE_MXFP8
@@ -3841,6 +3858,7 @@ def run_moe_test(
     cache_permute_indices,
     routing_logits_dtype=torch.bfloat16,
     zero_hidden_states=False,
+    hidden_state_amplitude=2.0,
     gemm1_bias=None,
     gemm2_bias=None,
     gemm1_lora_delta=None,
@@ -3921,7 +3939,7 @@ def run_moe_test(
         routing_bias = None
 
     hidden_states_fn = torch.zeros if zero_hidden_states else torch.randn
-    hidden_states = 2 * hidden_states_fn(
+    hidden_states = hidden_state_amplitude * hidden_states_fn(
         (num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16
     )
     gemm1_weights = torch.randn(

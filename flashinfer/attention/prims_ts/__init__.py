@@ -27,7 +27,6 @@ from .decode import (
     get_prims_ts_batch_decode_workspace_size,
     make_q_token_kv_block_sparse_qo_indptr,
     prepare_prims_ts_batch_decode_with_kv_cache,
-    prims_ts_batch_decode_with_kv_cache,
     suggest_q_token_kv_block_sparse_group_size,
     validate_q_token_kv_block_sparse_group_size,
 )
@@ -38,19 +37,27 @@ from .context import (
     batch_prefill_with_paged_kv_cache,
 )
 from .mla_decode import (
+    BatchSparseMLADecodePagedTSWrapper,
+    batch_sparse_mla_decode_with_paged_kv_cache,
+    get_prims_ts_sparse_mla_decode_workspace_size,
     BatchMLADecodePagedTSWrapper,
     batch_mla_decode_with_paged_kv_cache,
     get_prims_ts_batch_mla_decode_workspace_size,
-    prims_ts_batch_mla_decode_with_kv_cache,
 )
 from .q_token_kv_block_sparse_metadata import (
     QTokenKvBlockSparsePagedTSWrapper,
     get_q_token_kv_block_sparse_workspace_size,
     q_token_kv_block_sparse_attention_with_paged_kv_cache,
 )
+from .sage import SageAttentionConfig, SageAttentionParams
 
 __all__ = [
+    "BatchSparseMLADecodePagedTSWrapper",
+    "batch_sparse_mla_decode_with_paged_kv_cache",
+    "get_prims_ts_sparse_mla_decode_workspace_size",
     "BlockSparseTSWrapper",
+    "SageAttentionConfig",
+    "SageAttentionParams",
     "BlockSparsePagedTSWrapper",
     "block_sparse_attention",
     "block_sparse_attention_with_paged_kv_cache",
@@ -64,7 +71,6 @@ __all__ = [
     "get_prims_ts_batch_decode_workspace_size",
     "make_q_token_kv_block_sparse_qo_indptr",
     "prepare_prims_ts_batch_decode_with_kv_cache",
-    "prims_ts_batch_decode_with_kv_cache",
     "suggest_q_token_kv_block_sparse_group_size",
     "validate_q_token_kv_block_sparse_group_size",
     "QTokenKvBlockSparsePagedTSWrapper",
@@ -73,5 +79,4 @@ __all__ = [
     "BatchMLADecodePagedTSWrapper",
     "batch_mla_decode_with_paged_kv_cache",
     "get_prims_ts_batch_mla_decode_workspace_size",
-    "prims_ts_batch_mla_decode_with_kv_cache",
 ]

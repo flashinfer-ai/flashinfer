@@ -15,7 +15,7 @@ from ...tuning import finish_sweep, run_tuning as _run_tuning, schedule_candidat
 
 
 def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
-    from ......kernel_src.cutedsl_megamoe import (
+    from ......kernel_src.sm100.cutedsl_megamoe import (
         autotune_mxfp8_mega_moe,
         create_dummy_mxfp8_inputs,
         mxfp8_candidates,
@@ -62,6 +62,7 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
                     num_experts=args.num_experts,
                     topk=args.topk,
                     max_tokens=max_tokens,
+                    live_tokens=live_tokens,
                     combine_dtype=args.combine_dtype,
                     enable_in_kernel_fc2_reduce=args.allow_nondeterministic,
                 )
@@ -87,4 +88,9 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
 
 
 def run_tuning(args) -> int:
+    """Dispatch offline MXFP8 tuning to the requested inference or GenPhase path."""
+    if args.kernel_variant == "genphase":
+        from .genphase_tuner import run_tuning as run_genphase_tuning
+
+        return run_genphase_tuning(args)
     return _run_tuning(args, tune_one)

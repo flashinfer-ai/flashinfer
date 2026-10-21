@@ -15,7 +15,7 @@ from ...tuning import finish_sweep, run_tuning as _run_tuning, schedule_candidat
 
 
 def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
-    from ......kernel_src.cutedsl_megamoe import (
+    from ......kernel_src.sm100.cutedsl_megamoe import (
         COMBINE_FORMAT_NAMES,
         autotune_nvfp4_mega_moe,
         create_dummy_nvfp4_inputs,
@@ -40,6 +40,8 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
             gate_up_clamp=args.gate_up_clamp,
             combine_dtype=args.combine_dtype,
             enable_in_kernel_fc2_reduce=args.allow_nondeterministic,
+            apply_topk_in_fc1=args.apply_topk_in_fc1,
+            defer_topk_reduce=not args.do_finalize,
             seed=args.seed,
         )
         candidates = nvfp4_candidates(
@@ -64,8 +66,11 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
                     num_experts=args.num_experts,
                     topk=args.topk,
                     max_tokens=max_tokens,
+                    live_tokens=live_tokens,
                     combine_dtype=args.combine_dtype,
                     enable_in_kernel_fc2_reduce=args.allow_nondeterministic,
+                    apply_topk_in_fc1=args.apply_topk_in_fc1,
+                    defer_topk_reduce=not args.do_finalize,
                 )
                 if rank == 0:
                     print(f"[moe_ep-tune] schedule sweep base ({src}): {base}")

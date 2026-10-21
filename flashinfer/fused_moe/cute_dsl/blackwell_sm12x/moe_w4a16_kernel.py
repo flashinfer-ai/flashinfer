@@ -361,6 +361,7 @@ def _candidate_tile_fits(
     scale_format: str = "e4m3_k16",
     weight_layout: str = "packed",
     allow_logical_tail: bool = False,
+    enforce_search_floor: bool = True,
 ) -> bool:
     if int(tile_k) == -1 or int(tile_n) == -1 or int(cta_threads) == -1:
         return False
@@ -381,7 +382,13 @@ def _candidate_tile_fits(
         or int(tile_k) % scale_group_size != 0
     ):
         return False
-    if int(tile_n) < 64 or int(tile_k) < 64 or int(cta_threads) < 128:
+    # Minimum-size floor that prunes the auto-selection search space; it is
+    # not a kernel correctness bound. Forced tiles replay geometries the
+    # selector itself produced (e.g. the TC-decode "ultra" fc2 tile with
+    # tile_k=32), so they validate without it.
+    if enforce_search_floor and (
+        int(tile_n) < 64 or int(tile_k) < 64 or int(cta_threads) < 128
+    ):
         return False
     smem_bytes = _shared_memory_footprint(
         cta_m_blocks=cta_m_blocks,
@@ -4942,6 +4949,7 @@ class W4A16TopKSumKernel:
     def __call__(
         self,
         fc2_ptr: cute.Pointer,
+        topk_ids_ptr: cute.Pointer,
         output_ptr: cute.Pointer,
         active_m: cutlass.Int32,
         stream: cuda.CUstream,
@@ -4952,13 +4960,17 @@ class W4A16TopKSumKernel:
                 (active_m * Int32(self.topk * self.hidden_size),), stride=(1,)
             ),
         )
+        topk_ids_flat = cute.make_tensor(
+            topk_ids_ptr,
+            layout=cute.make_layout((active_m * Int32(self.topk),), stride=(1,)),
+        )
         output_flat = cute.make_tensor(
             output_ptr,
             layout=cute.make_layout((active_m * Int32(self.hidden_size),), stride=(1,)),
         )
         total = active_m * Int32(self.hidden_size)
         grid = (_covering_count(total, self.cta_threads), 1, 1)
-        self.kernel(fc2_flat, output_flat, active_m).launch(
+        self.kernel(fc2_flat, topk_ids_flat, output_flat, active_m).launch(
             grid=grid,
             block=[self.cta_threads, 1, 1],
             stream=stream,
@@ -4968,6 +4980,7 @@ class W4A16TopKSumKernel:
     def kernel(
         self,
         fc2_flat: cute.Tensor,
+        topk_ids_flat: cute.Tensor,
         output_flat: cute.Tensor,
         active_m: cutlass.Int32,
     ):
@@ -4981,10 +4994,12 @@ class W4A16TopKSumKernel:
             acc = cutlass.Float32(0.0)
             for route in cutlass.range_constexpr(self.topk):
                 row = token * Int32(self.topk) + Int32(route)
-                route_value = fc2_flat[row * Int32(self.hidden_size) + col].to(
-                    cutlass.Float32
-                )
-                acc += _materialize_w4a16_topk_route_f32(route_value)
+                # An unrouted slot (negative id) never wrote its FC2 row.
+                if topk_ids_flat[row].to(Int32) >= Int32(0):
+                    route_value = fc2_flat[row * Int32(self.hidden_size) + col].to(
+                        cutlass.Float32
+                    )
+                    acc += _materialize_w4a16_topk_route_f32(route_value)
             output_flat[idx] = self._cast_elem(acc)
 
 
@@ -5492,6 +5507,11 @@ def compile_w4a16_fused_moe(
             ("fc1", fc1_cols, hidden_size, fc1_tile_n, fc1_tile_k),
             ("fc2", hidden_size, intermediate_size, fc2_tile_n, fc2_tile_k),
         ):
+            # The re-pin replays a geometry the auto-selector (or the
+            # TC-decode wide-N override) already chose, so validate it
+            # against the correctness constraints only — divisibility,
+            # scale alignment, and shared memory — not the search-space
+            # size floor, which would reject the ultra fc2 tile (tile_k=32).
             if not _candidate_tile_fits(
                 problem_n=forced_pn,
                 problem_k=forced_pk,
@@ -5503,6 +5523,7 @@ def compile_w4a16_fused_moe(
                 scale_format=scale_format,
                 weight_layout=weight_layout,
                 allow_logical_tail=allow_native_logical_tail,
+                enforce_search_floor=False,
             ):
                 raise ValueError(
                     f"force_tile_config {name} tile "
@@ -5858,6 +5879,7 @@ def compile_w4a16_topk_sum(
         return cached
 
     fc2_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    topk_ids_fake = make_ptr(Int32, 16, cute.AddressSpace.gmem, assumed_align=4)
     output_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     kernel = W4A16TopKSumKernel(
         topk=topk,
@@ -5870,6 +5892,7 @@ def compile_w4a16_topk_sum(
     compiled = cached_compile(
         kernel,
         fc2_fake,
+        topk_ids_fake,
         output_fake,
         1,
         current_cuda_stream(),
@@ -6419,6 +6442,7 @@ def _w4a16_fused_moe_calibrated_launch_fake(
 
 def _w4a16_topk_sum_launch_flat(
     fc2_out: torch.Tensor,
+    topk_ids: torch.Tensor,
     output: torch.Tensor,
     m: int,
     topk: int,
@@ -6440,6 +6464,12 @@ def _w4a16_topk_sum_launch_flat(
             assumed_align=16,
         ),
         make_ptr(
+            Int32,
+            topk_ids.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        make_ptr(
             _cutlass_element_dtype(element_dtype),
             output.data_ptr(),
             cute.AddressSpace.gmem,
@@ -6456,6 +6486,7 @@ def _w4a16_topk_sum_launch_flat(
 )
 def _w4a16_topk_sum_launch_op(
     fc2_out: torch.Tensor,
+    topk_ids: torch.Tensor,
     output: torch.Tensor,
     m: int,
     topk: int,
@@ -6465,6 +6496,7 @@ def _w4a16_topk_sum_launch_op(
 ) -> None:
     _w4a16_topk_sum_launch_flat(
         fc2_out=fc2_out,
+        topk_ids=topk_ids,
         output=output,
         m=m,
         topk=topk,
@@ -6477,6 +6509,7 @@ def _w4a16_topk_sum_launch_op(
 @_w4a16_topk_sum_launch_op.register_fake
 def _w4a16_topk_sum_launch_fake(
     fc2_out: torch.Tensor,
+    topk_ids: torch.Tensor,
     output: torch.Tensor,
     m: int,
     topk: int,
@@ -7164,8 +7197,13 @@ def run_w4a16_moe(
                 "preplanned W4A16 top-k sum launch does not match requested contract: "
                 f"requested={expected_sum}, planned={actual_sum}"
             )
+    # The sum skips unrouted (negative) slots, whose FC2 rows were never
+    # written; the packer already dropped them from the route list.
+    if topk_ids.dtype != torch.int32:
+        topk_ids = topk_ids.to(torch.int32)
     torch.ops.flashinfer.w4a16_topk_sum_launch(
         fc2_out,
+        topk_ids.view(-1),
         output,
         m,
         topk,

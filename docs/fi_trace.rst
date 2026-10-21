@@ -209,6 +209,51 @@ files when ``FLASHINFER_TRACE_DUMP=1``:
    * - ``flashinfer.fused_moe``
      - ``alphamoe_fused_router``
      - ``moe_routing``
+   * - ``flashinfer.fused_moe``
+     - ``alphamoe_nvfp4_aligned_moe``
+     - ``moe``
+   * - ``flashinfer.fused_moe``
+     - ``alphamoe_nvfp4_routed_moe``
+     - ``moe``
+
+AlphaMoE aligned and routed traces include the optional uint8
+``w1_scale_prepared`` and ``w2_scale_prepared`` tensors with their supplied
+physical dimensions. They retain every raw scale input. When generating or
+replaying inputs, prepare these derived panels from the matching raw scales
+before repeated requests; unrelated panel bytes do not represent those weights.
+The routed trace also records optional uint8 ``w1_data_prepared`` as
+``[E*(N/128)*(K/256),128,128]``. Generate it with
+``prepare_nvfp4_w1_data`` from the matching raw packed W1 weights. Together
+with ``w1_scale_prepared``, it selects the prepared-data routes for
+``M=8,128,512`` at ``N=1024, K=6144, E=256, top_k=8, block_m=8``.
+
+For the exact 512-token shape, routed traces additionally record the paired
+``w1_gate_up_data_prepared`` and ``w1_gate_up_scale_prepared`` tensors as
+``[E*(N/256)*(K/256),256,128]`` and
+``[E*(N/256)*(K/256),32,128]``. Generate the first with
+``prepare_nvfp4_w1_gate_up_data`` and the second with
+``prepare_nvfp4_w1_gate_up_scales`` from matching prepared W1 scales and the
+raw weight shape. Trace fields retain the supplied physical dimensions; the
+operator checks the required dtype, device, contiguous layout and alignment.
+Supply both adjacent carriers or neither. At that exact shape a valid pair
+takes precedence and does not require the other optional prepared tensors.
+Omitting both preserves the existing selection; a partial pair is rejected.
+The aligned trace does not accept these routed-only data carriers.
+
+Retain raw weights and scales, and prepare all derived buffers once after the
+final device-local weight load, before repeated requests or graph capture.
+Reuse immutable panels only with the corresponding weight values; replace
+them after a weight reload. The helpers perform no remote fetching or
+automatic caching, and must not write derived caches into the original
+read-only model checkpoint. Unrelated panel bytes do not represent a valid
+replay of the recorded weights.
+
+These prepared-data paths use BF16 expert-route storage while preserving the
+caller's initial BF16 output. The eight-token route also uses a separate FP32
+initial-output seed; the 128-token and 512-token routes finalize directly into
+caller output in route order. Routed traces also record expert IDs and mutated
+alignment workspaces. Trace launch observations establish execution, not the
+cold-L2 kernel-duration performance metric.
 
 MoE Routing Types
 -----------------

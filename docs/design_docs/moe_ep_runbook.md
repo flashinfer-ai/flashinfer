@@ -72,7 +72,7 @@ every 4-rank `deep_gemm.fp8_fp4_mega_moe` launch with
 `CUDA_ERROR_MISALIGNED_ADDRESS` (bisected 2026-08-05 on B200). The
 root cause was not deep_gemm or the dsl's bundled CUDA libs but the fused
 activation-quant staging (`DataPreprocess` in
-`kernel_src/cutedsl_megamoe/src/src/inputs_process.py`), shared by every mega
+`kernel_src/sm100/cutedsl_megamoe/src/src/inputs_process.py`), shared by every mega
 staging path — fixed by the upstream `50117315d` sync recorded in that drop's
 VENDOR.md, after which the pin was lifted. The vLLM e2e sections below keep
 their own separate **4.5.2** pin (vLLM 0.25.1's requirement) — that pin is for
@@ -240,7 +240,111 @@ device-side aborts):
 Hopper-only (`sm90_fp8_fp8_bf16_pull_cutedsl`) correctness targets run in their own pytest
 process (the SM90/SM100 kernel trees are mutually exclusive per process):
 `bash tests/moe_ep/run_tests.sh oracle_sm90` (1 GPU) and
-`bash tests/moe_ep/run_tests.sh mega_sm90` (4 GPUs).
+`bash tests/moe_ep/run_tests.sh mega_sm90` (4 GPUs).  The BF16 pull-style
+twin (`sm90_bf16_bf16_bf16_pull_cutedsl`) shares both targets, and its token
+sweep has its own bench script,
+`benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_bf16_pull_mega.py`
+(same CLI minus the FP8-only axes; see that tree's `TUNING.md`).
+
+The SM120 MXFP4 x MXFP8 MegaMoE backend (`sm120_mxfp4_mxfp8_bf16_cake`: one
+Cake-generated parametric persistent kernel per deployment, JIT-compiled from
+`flashinfer/moe_ep/kernel_src/sm120/cake_mxfp4_megamoe/`) has its own target,
+`bash tests/moe_ep/run_tests.sh mega_sm120_cake` (4 GPUs; `NPROC_CAKE_SM120=8`
+for a full host). It needs NCCL 2.30.7 with the Device API (`NCCL_HOME`), and on
+multi-GPU PCIe hosts a pinned `NCCL_TOPO_FILE`. Sixteen ranks over two hosts run
+the same modules under a two-node torchrun (`--nnodes 2 --nproc_per_node 8`,
+`NCCL_GIN_ENABLE=1`); cross-host pairs use GIN, the transport table may keep LSA
+inside each host. Each EP-rank pair moves dispatch payloads and expert results over
+GIN (default `transport_table="all_gin"`) or LSA (load/store over NVLink / PCIe peer
+mappings; the copier instances reserve one copier CTA per LSA destination of a rank).
+To pick the table per deployment offline, run
+`torchrun --nproc_per_node=<EP> -m flashinfer.moe_ep.tune --dtype sm120_mxfp4_mxfp8
+--hidden H --intermediate I --num-experts E --topk K --max-tokens <capacities>
+[--shared-expert]` once and configure `transport_table="tuned"`: the workspace looks
+the winner up in `FLASHINFER_MOE_EP_KNOB_CACHE` (keyed by GPU, geometry, variant,
+capacity and the gathered peer topology; all-GIN on a miss). Latency:
+`benchmarks/moe_ep/backends/mega/kernel/sm120/bench_moe_ep_sm120_w4a8_cake_mega.py`.
+Serving frameworks that know the largest per-rank token count of a call should pass it
+as the invocation's token bucket (`layer.stage_inputs(t, compile_tokens_per_rank=bucket)`
+then `layer.compute_staged(output=...)`, the same value on every rank): the call then skips
+the backend's per-call `[rows, expert histogram]` all-gather and its host read-back, and it
+can be captured into a CUDA graph -- one graph per bucket, after one eager call of the layer on
+that workspace; every rank replays the same bucket sequence in the same order (see "CUDA
+graphs" in the kernel package README).
+A rank that stalls or dies mid-call for longer than the kernel's 600 s wait deadline
+makes the call fail on every rank with `CUDA error: unspecified launch failure`
+(device `trap`) instead of hanging; restart the processes (see the wait-deadline
+paragraph in `flashinfer/moe_ep/kernel_src/sm120/cake_mxfp4_megamoe/README.md`).
+On a single host, `all_gin` sends same-host pairs through NIC loopback; with RoCE ECN / DCQCN congestion control
+this can throttle large calls (a tail of 10-100 ms at EP4 / 8192 tokens per rank on our PCIe host, CNPs rising on
+the NICs).  Prefer an LSA table for same-host pairs there (`lsa_where_reachable`, `all_lsa`, or `"tuned"`).
+
+The native BF16 Hopper backend (`sm90_bf16_bf16_bf16_push_cake`: bf16 dispatch
+payload, Cake-generated WGMMA FC1/FC2 with fp32 accumulation, bf16 combine
+wire — no FP8 anywhere) has its own target,
+`bash tests/moe_ep/run_tests.sh sm90_bf16_push_cake` (2 GPUs; set
+`NPROC_SM90_BF16_PUSH_CAKE` for larger worlds). It compares every output
+elementwise (atol = rtol = 1e-2) against the independent bf16 torch reference
+in `tests/moe_ep/_sm90_bf16_reference.py` over uniform / all-remote / hot /
+masked / duplicate / empty-rank routing, uneven token counts, repeated calls
+and CUDA-graph replay. Supported geometry: `hidden % 256 == 0`,
+`intermediate % 128 == 0`, `top_k in {1, 2, 4, 6, 8}`, experts divisible by
+the world size; anything else raises `MoEEpConfigError` at init. The expert
+GEMMs ship as generated sources sealed by
+`kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_manifest.json`;
+the target runs the CPU frozen-sources guard
+(`tests/moe_ep/test_sm90_bf16_push_cake_frozen_sources.py`) first, and a
+hand-edited generated file fails the JIT loader closed (sha256 mismatch).
+On the receiving rank the combine tail (wait for every source, fp32 top-k
+reduce, ack) runs as one fused kernel without a per-round combine-inbox fill;
+`FLASHINFER_SM90_CAKE_BF16_FUSED_TAIL=0` selects the vendored three-kernel
+tail (bit-identical output) for A/B checks, and peers may mix the two. Small
+dedup rounds (`T <= 128`, `T * top_k <= 1024`) dispatch through one cooperative
+kernel (count + reserve + store_publish); `FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH=0`
+selects the vendored dispatch kernels, which larger rounds and non-dedup pipes
+always use. The dispatch wire format is the vendored one in every combination.
+
+The combine wire (expert rank -> token owner) is selected by
+`combine_wire` on the config (`None` reads
+`FLASHINFER_SM90_CAKE_BF16_COMBINE_WIRE`, default `prereduced`) and must be
+the same on every EP rank (checked with an allgather at init; a mixed pipe
+raises on every rank). `prereduced`: the expert rank pre-reduces all routes
+of a token that landed on it in fp32 (`fmaf` in ascending route order), rounds
+once to bf16 and sends ONE row per (token, source rank) into the owner's
+top-k inbox (slot = the group's smallest route index); the owner sums the
+<= ep_size rows in ascending source-rank order in fp32 and rounds once.
+`prereduced_hilo`: as `prereduced`, but a source rank holding >= 2 routes of a
+token sends its fp32 partial as two bf16 rows (hi, and the residual `p - hi`
+in the slot of its second-smallest route index) so no group partial is rounded
+to bf16; single-route groups are `bf16(w * y)` exactly as the per-route wire.
+`per_route`: one `bf16(fp32(y_k) * w_k)` row per route, summed over k by the
+owner (the original wire, kept for A/B comparison; the only wire that also
+runs the vendored three-kernel tail). Both wires are deterministic (fixed
+reduction order, no floating-point atomics; repeated calls and CUDA-graph
+replay are bitwise identical) but not bitwise identical to each other: the
+pre-reduced wire rounds each element twice instead of top_k + 1 times. The
+section tests run every routing pattern under both wires, including the
+pre-reduce-specific cases (all K routes of a token on one remote rank, all on
+the local rank) and the wire-mismatch rejection.
+
+### SM107 (Rubin) mega tests
+
+The Rubin suites cover NVFP4 and MXFP8 E4M3/E5M2 on compute capability 10.7.
+Use the strict runner to collect per-rank results and fail on skips, OOMs,
+empty selections, or timeouts:
+
+```bash
+export CUTE_DSL_ARCH=sm_107a
+python tests/moe_ep/qualify_sm107.py --suite all --world-size 4 \
+  --output-dir "${FI_RESULTS:?}/sm107-ep4"
+```
+
+For individual suites, use `bash tests/moe_ep/run_tests.sh oracle_sm107`
+(single GPU) or `NPROC_MULTIRANK=4 bash tests/moe_ep/run_tests.sh mega_sm107`.
+The distributed target also accepts 2 or 8 ranks. See the
+[validation guide](moe_ep_sm107_qualification.md).
+
+### Hopper performance benchmark
 
 The perf microbenchmark reproduces the kernel drop's Hopper P03 multirank
 token sweep (`moe_hopper_fp8/run_token_sweep_benchmark.py`, DSV4 geometry:
@@ -248,7 +352,7 @@ topk 6, 384 experts EP4, hidden 7168, intermediate 3072 post-SwiGLU, tokens
 per rank 512..32768) through the FI `MoEEpLayer` mega path, on 4×H100:
 
 ```bash
-torchrun --nproc_per_node=4 benchmarks/bench_moe_ep_sm90_mega.py
+torchrun --nproc_per_node=4 benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py
 ```
 
 Rank 0 prints one `BENCH_CSV` row per (scale_mode, layout, tokens) point;
@@ -262,6 +366,20 @@ M256 N32), `--mma-tiler M,N`, `--tokens`, `--kind`. See the module docstring
 for the full timing/mapping notes. Measured results, comparison caveats,
 and the reproduce recipe live in
 [`kernel_src/sm90/pull_style_cutedsl_megakernel/TUNING.md`](../../flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/TUNING.md).
+
+The native BF16 backend is benchmarked against the same-precision split
+baseline (NCCL-EP + CUTLASS BF16 fused MoE through the same `MoEEpLayer`)
+with
+
+```bash
+python -m torch.distributed.run --nproc_per_node=8 \
+  benchmarks/bench_moe_ep_sm90_bf16_mega.py --geometry A --arms cand,b1
+```
+
+(`--geometry {A,B,C}` = DeepSeek-V3 7168/2048/256/top-8, DSV4-Pro
+7168/3072/384/top-6, DSV4-Flash 4096/2048/256/top-6; eager and CUDA-graph
+series per token count; `--check` compares both arms against the bf16 torch
+reference first). See the module docstring for the columns.
 
 ---
 
@@ -288,7 +406,7 @@ tree's `4_5_2-perf-fix` flashinfer branch, on **nvidia-cutlass-dsl 4.5.2**
 below only as a parity *reference*: the MR!27 mainloop WAR brings 4.5.2 to
 4.6.1 parity, so 4.5.2 is the runtime floor and versions below it are
 unsupported (4.5.0 fails at `cute.compile`) — see
-[`../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md`](../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md).
+[`../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md`](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md).
 
 ### 1. Microbenchmark
 
@@ -494,19 +612,139 @@ prefill chunks), per-role offline knob caches.
 
 ---
 
+## Blackwell GenPhase decoding (explicit opt-in)
+
+The existing SM100 MXFP8 config can select the independently owned GenPhase
+pipeline on SM100/SM103. Existing configurations keep `kernel_variant="inference"`,
+the legacy weight layout, workspace pool keys, knob cache and autotuner.
+
+```python
+from flashinfer.moe_ep import (
+    MegaConfig,
+    MoEEpLayer,
+    Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+)
+
+backend = MegaConfig(
+    megakernel=Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=3072,
+        top_k=6,
+        gate_up_clamp=10.0,
+        kernel_variant="genphase",
+        knobs=None,  # cached winner, otherwise geometry-based heuristics
+    ),
+    quantize_input=True,
+    preprocess_weights=True,
+)
+layer = MoEEpLayer(bootstrap, fleet_params, weights, backend=backend)
+layer.warmup(tensors)  # collective on every EP rank, before CUDA graph capture
+output = layer.forward(tensors)
+```
+
+GenPhase supports MXFP8 E4M3, SwiGLU and separate BF16 reduction, with physical
+capacity at most 1024 tokens per rank. Hidden size must be a multiple of 128;
+intermediate size must be a multiple of 64. N128 supports CGA4; N64 supports
+CGA2 or CGA4. In-kernel FC2 reduction remains unsupported.
+
+With `knobs=None` (the default), GenPhase uses an exact cache match, otherwise a
+host-side estimate based on EP size, expert count, top-k, intermediate width,
+SM count and the planned live-token bucket (capacity when no bucket is known).
+The estimate favors N64 for sparse expert batches and CGA2 when estimated FC1
+work underfills a CGA4 wave; the grouped hint starts at four resident-cluster
+waves. This is a starting estimate that assumes spread routing. Skew and masked
+routes can favor other candidates. No device routing readback occurs during
+selection, and a prepared workspace keeps its configuration for replay.
+
+Set `knobs="auto"` to collectively tune on the first `layer.warmup(tensors)`.
+All EP ranks must enter warmup together before CUDA graph capture. The sweep
+checks a sampled Torch oracle before and after timing warm CUDA graphs, selects
+by median of per-sample maximum-rank duration, and caches the winner. It covers
+the three admitted geometries and original/two/four/eight-wave grouped hints.
+The timed scope is dispatch + FC1/FC2 + reduction; input staging and weight
+preparation are outside it. Tuning creates temporary workspaces and compiles
+candidates; subsequent forward calls reuse the chosen configuration. Tuning
+preserves input/output pointers, and auto workspaces are excluded from pooling.
+
+An auto layer supports only its default capacity: `create_workspace()` rejects
+`knobs="auto"` even after warmup. For additional capacity or live-token profiles,
+construct a layer with fixed or offline-tuned knobs before creating handles.
+
+For serving, tune offline and use `knobs=None` when constructing layers:
+
+```bash
+torchrun --standalone --nproc_per_node=2 -m flashinfer.moe_ep.tune \
+  --arch sm100 --dtype mxfp8_e4m3 --kernel-variant genphase \
+  --hidden 4096 --intermediate 1024 --num-experts 256 --topk 8 \
+  --max-tokens 1024 --live-tokens 65
+```
+
+Prepare the matching profile before capture on every EP rank. For the bucket
+above, construct a layer with `knobs=None` and use its handle explicitly:
+
+```python
+workspace = layer.create_workspace(1024, live_tokens=65)
+layer.warmup(tensors, workspace=workspace)
+output = layer.forward(tensors, workspace=workspace)
+```
+
+Repeat for representative live-token buckets; use `--skew` for skewed routing.
+`layer.live_token_buckets(1024)` lists the cached buckets. Calls without a
+workspace handle use the layer's default capacity profile; they do not select
+a live-token profile from the incoming batch automatically.
+`FLASHINFER_MOE_EP_KNOB_CACHE` controls the cache path (`off` disables it).
+Entries require matching GPU/SM count, CUDA/Torch/DSL compiler stack, compiler
+options, implementation
+revision, operation attributes, EP geometry, capacity and live-token bucket.
+The native compiler target has the same cache identity before and after the
+first workspace configures CuTe DSL, including its bare architecture alias.
+Collective tuning waits for rank 0 to finish the cache write before returning.
+Distribute the same cache to every EP rank. Construction checks that ranks
+agree on the selected configuration before allocating collective storage.
+A warmup result is also available through `layer.get_tuned_knobs()`.
+
+Explicit `mma_tiler_mnk`, `cluster_shape_mn`, and `schedule_policy` fields or
+a GenPhase `knobs` dictionary constrain both heuristics and the tuning sweep.
+Conflicting explicit fields are rejected. `schedule_policy=("grouped", None)`
+retains the original grouped hint; a positive integer supplies a fixed hint.
+Legacy inference knob names are not accepted by GenPhase. The low-level
+`Sm100GenphaseMoeConfig` keeps its explicit N128/CGA4 defaults.
+
+`quantize_input=True` stages BF16 inputs with the fused MXFP8 quantizer;
+`False` accepts E4M3 activations and per-32 typed E8M0 scales in
+`MoEEpTensors.scales`. Routing accepts int32/int64 global expert IDs, with
+`-1` for masked slots, unique valid IDs per token and finite valid scores.
+As on the legacy SM100 path, callers provide valid routing; the backend checks
+metadata without scanning routing values on every forward.
+
+With `preprocess_weights=True`, canonical BF16 weights or canonical
+prequantized E4M3 weights plus E8M0 scales are converted to GenPhase's
+16-row gate/up stripes and physical K-major layout. Weight scales may use
+typed `torch.float8_e8m0fnu` or raw `torch.uint8` storage. The exported
+`preprocess_mxfp8_cutedsl_mega_weights(..., kernel_variant="genphase")` helper produces
+the same payload for `preprocess_weights=False` callers. Legacy transformed
+weights cannot be reused. GenPhase workspace pooling is isolated by pipeline
+and resolved configuration. Rubin source and frontend are independent.
+
+Native layer coverage is in the existing
+`test_moe_ep_mxfp8_cutedsl_mega_multirank.py::test_blackwell_genphase_layer_graph_and_weight_formats`
+test, runnable with `torchrun --nproc_per_node=<1|2|4> -m pytest`.
+
 ## Adding a new mega-kernel backend
 
 A mega kernel owns fused comm + local MoE. To wire a new one, add a subpackage
 under `flashinfer/moe_ep/backends/mega/kernel/sm<arch>/<act>_<weight>_<out>_<style>/`. Kernel-team drops are
 vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
 
-- `kernel_src/cutedsl_megamoe/` — Blackwell (NVFP4 + MXFP8 kernels)
+- `kernel_src/sm100/cutedsl_megamoe/` — Blackwell (NVFP4 + MXFP8 kernels)
 - `kernel_src/sm90/pull_style_cutedsl_megakernel/` — Hopper pull-style FP8
-  (a fork of the same kernel repo)
+  and BF16 (a fork of the same kernel repo)
 - `kernel_src/sm90/push_style_megamoe/` — Hopper push-style FP8 (raw CUDA,
   JIT-compiled; vendored from flashinfer PR #4069, see its VENDOR.md)
 - `kernel_src/sm120/swapab_cutedsl_megakernel/` — Blackwell-consumer
   (sm_120/sm_121) swap-AB MXFP8 (another fork snapshot of the same repo)
+- `kernel_src/sm107/next_cutedsl_megamoe/` — Rubin SM107, the kernel repo's `next/`
+  block-scaled inference export; generic inference is integrated, with
+  GenPhase included for future integration (see its `VENDOR.md`)
 
 Each tree exposes its kernels through its own package public API (e.g. the
 sm100 tree's `mxfp8_mega_moe`, `get_symm_buffer_for_mxfp8_mega_moe`). The
@@ -572,7 +810,7 @@ caller (the backend's `stage_inputs`) must have filled `symm_buffer.x` and the
 routing slices first.
 
 Add both functions under the owning tree's `shim/` — e.g.
-`kernel_src/cutedsl_megamoe/shim/` for Blackwell kernels (alongside
+`kernel_src/sm100/cutedsl_megamoe/shim/` for Blackwell kernels (alongside
 `nvfp4.py` / `mxfp8.py`), `kernel_src/sm90/pull_style_cutedsl_megakernel/shim/`
 for Hopper — and re-export them from that package's `__init__.py` (or point at
 your own kernel module). Raw kernel sources live under the tree's `src/` — see
@@ -663,6 +901,200 @@ layer.destroy()
 The raw megakernel config must be wrapped in `MegaConfig` — `MoEEpLayer` routes
 `MegaConfig` → `MoEEpMegaLayer` → `create_mega_kernel(cfg)`, which looks up
 `cfg.kernel_name` in `_MEGA_KERNEL_REGISTRY`.
+
+## CUDA graphs (split layer)
+
+`MoEEpSplitLayer.forward()` on its own is **not** capturable, by construction:
+it creates a `Handle` per call and destroys it in a `finally`, so a graph --
+which records the device pointers it sees at capture time -- would replay
+against freed memory. That failure is silent at capture and only surfaces at
+replay, as an illegal memory access, so `forward()` now refuses capture
+outright and points at the API below.
+
+Capture with `create_graph_state()`, which holds one long-lived handle across
+forwards (the allocating half outside the capture, `Handle.update()` recorded
+inside it). `MoEEpCommunication` backends (e.g. `nvlink_one_sided`) are
+long-lived already; their graph state carries no handle and only pins the
+bound buffers, and the same capture recipe applies:
+
+```python
+state = layer.create_graph_state(t)          # outside any capture, ALL ranks
+layer.forward(t, graph_state=state)          # warmup, still eager -- REQUIRED
+torch.cuda.synchronize()
+
+g = torch.cuda.CUDAGraph()
+with torch.cuda.graph(g):
+    y = layer.forward(t, graph_state=state)
+
+t.hidden_states.copy_(new_x)                 # in place -- same buffers
+t.topk_ids.copy_(new_ids)
+g.replay()                                   # y now holds this step's result
+```
+
+Rules, in rough order of how easily they are violated:
+
+- **Update the registered tensors in place, never rebind them.** `t`'s
+  tensors become the graph's bound buffers (`topk_weights` is bound into the
+  handle at creation; `out` is the address combine writes). `forward()`
+  re-checks their addresses and tensor metadata, including shape, dtype, device,
+  and strides, and also validates the state's output buffer. Only the contents
+  may change: rebinding or changing the layout would leave an existing graph
+  using its original pointers and layout.
+- **The warmup forward is not optional, and `forward()` enforces it.**
+  Capturing through a `graph_state` on a layer that has never completed an
+  eager forward raises instead of proceeding. The first round trip is what
+  builds and autotunes the inner MoE kernel — whose backend selection captures
+  a graph of its own, and nested capture is illegal — and what gives the
+  transport its steady state; neither can happen during capture, and the
+  symptom otherwise surfaces from inside the inner kernel and names nothing in
+  the EP layer. What satisfies the check is one *eager* (non-capturing)
+  forward on **this layer** that returns normally: `layer.forward(t)` and
+  `layer.forward(t, graph_state=state)` both count, since both run the same
+  round trip over the same fleet and kernel. `create_graph_state()` alone does
+  not — it builds the fleet and the handle but runs no round trip. Warm on
+  every EP rank.
+- **One shape per state and per graph — and one live state per layer.**
+  `top_k` and the token count are baked into the handle *and* into the graph,
+  so a different batch size needs its own state and its own graph, the usual
+  multi-size-graph pattern. But `create_graph_state()` refuses a second state
+  while the first is live, and destroying the live one to make room frees the
+  buffers every graph already captured from it replays against. So today a
+  second shape needs a second `MoEEpSplitLayer`, not a second state on this
+  one.
+- **Pass each layer the state its own `create_graph_state()` returned, and
+  keep that layer alive.** Fleets are per layer, so a state carries one
+  layer's handle: that layer's communicator, its transport buffers, its `out`.
+  `forward()` re-checks the owner on every call because the mixed-up case is
+  silent — with the usual homogeneous `FleetParams` no shape disagrees
+  anywhere, so the call just runs this layer's tokens over the other layer's
+  transport and writes the other state's `out`, and both forwards hand back
+  the same tensor. (A model with N MoE layers holds N layers and N states,
+  which is exactly the shape of code an off-by-one over `states[i]` lives in.)
+  The state holds only a weakref to its layer, so a `forward()` through a
+  state whose layer has already been collected is refused too, rather than
+  running on a handle whose fleet is gone — keep the layer alive at least as
+  long as the state and every graph captured from it.
+- **`enable_timing` is off-limits under capture.** It synchronizes the device
+  to read its CUDA events, which capture forbids. Time `g.replay()` instead
+  (`benchmarks/moe_ep/bench_moe_ep.py --cuda-graph` does exactly this).
+- **All EP ranks must run the same sequence of eager calls and replays.**
+  Ordinary collective discipline, but nixl_ep makes it sharper: its Buffer
+  toggles a *host-side* double-buffer index (`buffer_idx ^= 1`) on every
+  dispatch and combine. Replays run no host code, so every replay reuses the
+  slot that was current at capture. That stays consistent only while the ranks
+  agree on the call sequence.
+- **Retire the graphs before `state.destroy()` or `layer.destroy()`.** They
+  hold pointers into the handle's buffers. `layer.destroy()` tears down state
+  → fleet → comm runtime in that order (the handle borrows fleet buffers, the
+  fleet's group lives on the runtime) and is terminal: afterwards `forward()`
+  and `create_graph_state()` raise, rather than lazily rebuilding a second
+  fleet on an already-finalized comm runtime.
+
+Backend notes:
+
+- **nccl_ep** implements the real split: `ncclEpInitHandle` (via
+  `create_handle`) stays outside the capture and `ncclEpUpdateHandle` is
+  recorded inside, mirroring `contrib/nccl_ep/ep_test.cu --use_cuda_graph`.
+  Covered for LL *and* HT.
+- **nixl_ep** has no handle-init step at all — LL dispatch recomputes routing
+  in-kernel from `topk_idx`, and the recv buffers live in the Buffer's
+  persistent RDMA arena. Its `update()` therefore exists to guarantee the
+  *binding* (when this build's index width differs from the caller's, the ids
+  cast lands in a handle-owned buffer, so the
+  captured address keeps receiving new routing). Under capture the handle also
+  disables the recv hook (`return_recv_hook=False`) and records the combined
+  send/receive kernel. The hook only defers the receive-phase kernel launch;
+  it performs no host-side wait. A receive kernel launched through a hook on
+  a captured stream would also be recorded. Combining the phases avoids that
+  host orchestration, while retaining the same device-side arrival waits.
+
+### Scope of validation, and how a stall surfaces
+
+What is covered: 4xGB200, single node, 4 ranks, 64 tokens/rank, one
+dispatch/combine pair per replay. What is **not**: the sustained serving load
+(DP8, 2048-token, ~256 concurrent prompts) under which the nixl_ep combine
+deadlock of PR #4139 appeared, and multi-node. On one NVLink node `p2p_ptr_get`
+succeeds, so the LL transfers are plain stores and the `nixlPut` /
+`nixlAtomicAdd` network path is likely never exercised under capture at all.
+The argument that dropping the recv hook is safe (it defers a kernel launch
+rather than performing a wait) is a source-reading argument, not a measurement.
+
+Know how a stall ends, because **the two backends end it differently** and
+neither raises a Python exception. LL arrival is a device-side spin on a
+peer-written flag, bounded by a timeout:
+
+| backend | timeout | on expiry |
+|---|---|---|
+| `nixl_ep` | 30 s (`DEFAULT_TIMEOUT_MS`) | printf, then the **mask** branch -- `update_memory_buffers` always allocates the mask buffer, so `trap()` is never reached. The peer is masked, its tokens are dropped, and the mask is sticky device state every later replay inherits: **output silently degrades**. |
+| `nccl_ep` | ~97 s (compile-time default) | `rankMask` is null unless `FleetAlgoKnobFaultTolerance` set `enable_mask`, so the default path **`trap()`s** -- a hard CUDA error on the next sync. Loud, not silent. |
+
+So on nixl_ep treat an unexplained accuracy drop after a long run as a candidate
+symptom and check stderr for `NIXL-EP timeout`; on nccl_ep you will get an error
+instead.
+
+What actually causes a replay to stall: a replay runs no host code, so anything
+the transport keeps on the host freezes. Concretely, nixl_ep toggles a
+double-buffer index (`buffer_idx ^= 1`) per dispatch and per combine on the
+**host**, so under replay it stays at its capture-time value forever. If one
+rank's sequence of eager calls and replays diverges from its peers', the sender
+writes slot A while the receiver polls slot B, and the receiver spins to
+timeout. That is the concrete failure behind the lockstep rule above, and it is
+why the capture tests assert that output tracks in-place input rewrites --
+nothing weaker proves a replay actually ran.
+
+### Why this is opt-in rather than the default
+
+The explicit API makes the lifetime and buffer-reuse requirements visible to
+the caller. It avoids repeating `create_handle`, `empty_like(out)`, and
+`destroy()` on every forward, and eager forwards using a graph state were faster
+in the measured cases. Those measurements do not establish a performance
+guarantee for every backend or workload. The reasons to retain the opt-in are:
+
+* `out` is a **reused** buffer. A caller retaining the previous result observes
+  it change on the next forward or replay; retaining a snapshot requires a copy.
+* The input tensors, handle, and output remain live for the state's lifetime.
+  Every graph using them must be retired before destroying that state or layer.
+  An implicit cache miss cannot safely evict an old state while a graph still
+  refers to its buffers.
+* An address alone is not a binding contract: the shape, dtype, device, layout,
+  stream, and routing state also matter. Explicit state lets `forward()` reject
+  an incompatible binding rather than silently replace buffers that a graph
+  still uses.
+* State creation and transport calls must follow the same sequence on every EP
+  rank. Independent address-cache misses on different ranks cannot determine
+  when to rebuild collective resources safely. The caller also has to maintain
+  that ordering across eager forwards and replays.
+
+This is separate from the NCCL tensor-wrapper memo. That memo is cleared after
+passing its 256-entry threshold and bypasses tensors larger than 2 MiB. Caching
+a fresh eager output there retained it until a cache flush, causing bounded
+memory retention and allocation churn, rather than unbounded growth. Eager
+combine outputs bypass that memo; graph-state outputs may be cached because
+their addresses are reused.
+Wrapper eviction preserves the fleet's receive buffers, counters, and configs.
+Those allocations must retain their addresses when eager forwards interleave
+with replay of an existing graph.
+
+The smoke harness includes the layer graph tests for both available backends,
+the W4A16 graph tests on Blackwell, and the NCCL handle graph and output-memo
+regressions. `BACKEND` selects a backend; an unavailable backend is skipped only
+when selecting `both`.
+
+The checked-in CI workflows do not invoke this harness. A distributed run on a
+CUDA 13 host with at least four supported GPUs is still required to execute
+these regressions; ordinary pytest collection skips them without `torchrun`.
+
+```bash
+NPROC=4 BACKEND=both bash scripts/task_test_moe_ep_smoke.sh
+```
+
+To run just the layer graph tests (`--backend=nixl_ep` selects NIXL instead):
+
+```bash
+torchrun --nproc_per_node=4 -m pytest \
+    tests/moe_ep/test_split_layer_cudagraph_multirank.py \
+    -v -m "nvep and gpu_4" --backend=nccl_ep
+```
 
 ## Fault tolerance
 

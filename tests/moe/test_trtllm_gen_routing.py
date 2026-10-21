@@ -39,6 +39,10 @@ import pytest
 import torch
 
 from flashinfer.fused_moe import trtllm_gen_routing
+from flashinfer.fused_moe.trtllm_gen_routing import (
+    _max_num_ctas_in_batch_dim,
+    get_trtllm_gen_routing_module,
+)
 from flashinfer.tllm_enums import RoutingMethodType
 from flashinfer.utils import get_compute_capability
 
@@ -672,3 +676,168 @@ def test_ep_shard_deepseekv3(
         topk_group=topk_group,
         routed_scaling_factor=routed_scaling_factor,
     )
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize(
+    "num_tokens,num_experts,top_k,tile_tokens_dim,routing_method,local_offset,local_count",
+    [
+        pytest.param(1, 16, 2, 8, RoutingMethodType.Renormalize, 0, 16, id="block"),
+        pytest.param(
+            9, 128, 4, 32, RoutingMethodType.Renormalize, 32, 64, id="dynblock"
+        ),
+        pytest.param(
+            65, 128, 4, 64, RoutingMethodType.Renormalize, 32, 64, id="cluster"
+        ),
+        pytest.param(
+            8193, 128, 8, 128, RoutingMethodType.Renormalize, 32, 64, id="coop"
+        ),
+        pytest.param(
+            1025, 2048, 8, 128, RoutingMethodType.Renormalize, 512, 256, id="offsets"
+        ),
+        pytest.param(1, 128, 1, 32, RoutingMethodType.Llama4, 0, 128, id="llama4-warp"),
+        pytest.param(
+            3, 128, 1, 32, RoutingMethodType.Llama4, 32, 64, id="llama4-warp-ep"
+        ),
+        pytest.param(
+            65, 128, 1, 64, RoutingMethodType.Llama4, 32, 64, id="llama4-cluster"
+        ),
+        pytest.param(
+            1025, 128, 1, 128, RoutingMethodType.Llama4, 32, 64, id="llama4-offsets"
+        ),
+        pytest.param(
+            128, 16, 4, 32, RoutingMethodType.Renormalize, 0, 16, id="aligned"
+        ),
+        pytest.param(
+            4, 16, 2, 32, RoutingMethodType.Renormalize, 8, 8, id="empty-local"
+        ),
+    ],
+)
+def test_routing_tile_padding(
+    num_tokens,
+    num_experts,
+    top_k,
+    tile_tokens_dim,
+    routing_method,
+    local_offset,
+    local_count,
+    enable_pdl,
+):
+    """Routing owns padding inside active tiles, including on graph replay."""
+    device = torch.device("cuda")
+    max_ctas = _max_num_ctas_in_batch_dim(
+        num_tokens, top_k, num_experts, tile_tokens_dim
+    )
+    map_capacity = max_ctas * tile_tokens_dim
+    logits = torch.empty((num_tokens, num_experts), device=device, dtype=torch.float32)
+    topk_packed = torch.empty((num_tokens, top_k), device=device, dtype=torch.int32)
+    weights = torch.empty((num_tokens, top_k), device=device, dtype=torch.bfloat16)
+    histogram = torch.empty(max(2 * num_experts, 512), device=device, dtype=torch.int32)
+    padded_count = torch.empty(1, device=device, dtype=torch.int32)
+    expanded = torch.empty_like(topk_packed)
+    # Use a non-vector-aligned view, with canaries outside the declared map.
+    backing = torch.empty(map_capacity + 2, device=device, dtype=torch.int32)
+    route = backing[1:-1]
+    tile_experts = torch.empty(max_ctas, device=device, dtype=torch.int32)
+    tile_limits = torch.empty_like(tile_experts)
+    tile_count = torch.empty_like(padded_count)
+    module = get_trtllm_gen_routing_module()
+
+    def invoke():
+        module.trtllm_gen_routing(
+            logits,
+            None,
+            topk_packed,
+            weights,
+            histogram,
+            padded_count,
+            expanded,
+            route,
+            tile_experts,
+            tile_limits,
+            tile_count,
+            top_k,
+            0,
+            0,
+            0,
+            local_offset,
+            local_count,
+            1.0,
+            tile_tokens_dim,
+            int(routing_method),
+            True,
+            enable_pdl,
+        )
+
+    def set_routes(shift, skewed):
+        # Distinct, moderate logits preserve expert selection across fp32/bf16.
+        row = torch.arange(num_tokens, device=device)[:, None]
+        expert = torch.arange(num_experts, device=device)[None, :]
+        rank = (expert - (0 if skewed else row) - shift) % num_experts
+        logits.copy_((num_experts - rank).float() / num_experts)
+
+    set_routes(0, False)
+    invoke()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        invoke()
+
+    expected_tokens = torch.arange(num_tokens, device=device).repeat_interleave(top_k)
+    # Poison before every eager call/replay. Changing routes on fixed buffers
+    # catches padding left over from a previous invocation's valid entries.
+    for shift, skewed in ((0, False), (num_experts // 2, True), (0, True)):
+        set_routes(shift, skewed)
+        selected = logits.topk(top_k, dim=-1).indices
+        selected_is_local = (selected >= local_offset) & (
+            selected < local_offset + local_count
+        )
+        for replay in (False, True):
+            poison = num_tokens - 1 if replay else 0
+            backing.fill_(poison)
+            backing[0] = 123456789
+            backing[-1] = 123456789
+            if replay:
+                graph.replay()
+            else:
+                invoke()
+            torch.cuda.synchronize()
+
+            count = int(padded_count.item())
+            assert 0 <= count <= map_capacity
+            assert count == int(tile_count.item()) * tile_tokens_dim
+            inverse = expanded.flatten().long()
+            live = inverse >= 0
+            assert int(live.sum()) == int(selected_is_local.sum())
+            positions = inverse[live]
+            assert (positions < count).all()
+            assert positions.unique().numel() == positions.numel()
+            torch.testing.assert_close(
+                route[positions].long(), expected_tokens[live], rtol=0, atol=0
+            )
+
+            # Check selection without assuming the native top-k slot order.
+            got_experts = torch.full_like(inverse, -1)
+            local_experts = tile_experts[positions // tile_tokens_dim].long()
+            if routing_method == RoutingMethodType.Llama4 and num_tokens < 4:
+                # Llama4's warp path retains global expert indices in tiles.
+                got_experts[live] = local_experts
+            else:
+                got_experts[live] = local_experts + local_offset
+            wanted = torch.where(selected_is_local, selected, -1)
+            torch.testing.assert_close(
+                got_experts.view(num_tokens, top_k).sort(dim=-1).values,
+                wanted.sort(dim=-1).values,
+                rtol=0,
+                atol=0,
+            )
+
+            unused = torch.ones(count, device=device, dtype=torch.bool)
+            unused[positions] = False
+            assert (route[:count][unused] == -1).all(), (
+                "padding in active expert tiles must suppress TMA gathers"
+            )
+            # Allocation slack is not part of the active tile contract.
+            assert (route[count:] == poison).all()
+            assert backing[0].item() == 123456789
+            assert backing[-1].item() == 123456789

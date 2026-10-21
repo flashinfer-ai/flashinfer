@@ -27,9 +27,14 @@ def test_hangs():
         encoding="utf-8",
     )
 
+    # The isolated child does not load the FlashInfer plugins registering
+    # ``--full``, so it must not inherit the nightly PYTEST_ADDOPTS.
+    env = os.environ.copy()
+    env.pop("PYTEST_ADDOPTS", None)
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", str(test_file)],
         cwd=tmp_path,
+        env=env,
         text=True,
         capture_output=True,
         check=False,
@@ -331,6 +336,64 @@ def test_shell_prints_fallback_summary_for_dependency_setup_failure(
     assert result.stderr == ""
     assert result.stdout.count("TEST SUMMARY") == 1
     assert "phase=dependency-setup" in result.stdout
+
+
+@pytest.mark.parametrize("library_path", [None, "", "/existing/lib"])
+def test_shell_passes_nccl_wheel_library_to_test_runner(
+    tmp_path: Path, library_path: str | None
+) -> None:
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    entrypoint = scripts / "task_run_unit_tests.sh"
+    shutil.copy(REPO_ROOT / "scripts" / "task_run_unit_tests.sh", entrypoint)
+    (scripts / "test_utils.sh").write_text("install_and_verify() { :; }\n")
+    (scripts / "setup_test_env.sh").write_text("")
+    (scripts / "unit_test_runner.py").write_text(
+        "import os, sys\n"
+        "if sys.argv[1] == '__shell-settings':\n"
+        "    print('run\\ntests/moe_ep'); raise SystemExit(0)\n"
+        "assert os.environ['LD_LIBRARY_PATH'] == os.environ['EXPECTED_LIBRARY_PATH']\n"
+        "print('runner received NCCL library path')\n"
+    )
+
+    installer = tmp_path / "docker" / "install" / "build_flashinfer_ep_pytorch.sh"
+    installer.parent.mkdir(parents=True)
+    # A child shell's export cannot configure the subsequent test process.
+    installer.write_text("export LD_LIBRARY_PATH=/installer/only\n")
+    modules = tmp_path / "modules"
+    # Keep installed NVIDIA packages from overriding the NCCL stub.
+    for package in ("nvshmem", "nvidia", "nvidia/nccl"):
+        directory = modules / package
+        directory.mkdir(parents=True)
+        (directory / "__init__.py").write_text("")
+    (modules / "nvshmem" / "core.py").write_text("")
+    (modules / "torch.py").write_text(
+        "from types import SimpleNamespace\nversion = SimpleNamespace(cuda='13.0')\n"
+    )
+    wheel_lib = modules / "nvidia" / "nccl" / "lib"
+    env = os.environ.copy()
+    env.update(
+        PYTHONPATH=str(modules),
+        EXPECTED_LIBRARY_PATH=str(wheel_lib)
+        + (f":{library_path}" if library_path else ""),
+        PATH=f"{Path(sys.executable).parent}{os.pathsep}{env['PATH']}",
+    )
+    if library_path is None:
+        env.pop("LD_LIBRARY_PATH", None)
+    else:
+        env["LD_LIBRARY_PATH"] = library_path
+    result = subprocess.run(
+        ["bash", str(entrypoint)],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "runner received NCCL library path" in result.stdout
 
 
 def test_shell_preserves_abnormal_runner_exit_and_prints_fallback_summary(

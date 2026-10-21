@@ -34,6 +34,8 @@
 #   FP8_NON_SWAP_M=64 FP8_NON_SWAP_N=128 bash .../run_perf_test.sh P01 P02
 #   FP8_SWAP_AB_M=256 FP8_SWAP_AB_N=32 bash .../run_perf_test.sh --swapab P01
 #   FP8_SWAP_AB_N accepts 8/16/32/64/128 (default 32).
+#   FP8_TAIL_SPLIT=1 enables tail-split pair tasks where the token cluster is 2
+#   (swap-AB cga 1,2,1 / non-swap cga 2,1,1); other geometries ignore it.
 
 set -uo pipefail
 
@@ -116,7 +118,7 @@ while [ "$#" -gt 0 ]; do
             shift
             ;;
         -h|--help)
-            sed -n '2,34p' "${BASH_SOURCE[0]}"
+            sed -n '2,38p' "${BASH_SOURCE[0]}"
             exit 0
             ;;
         --*)
@@ -304,6 +306,29 @@ case "$FP8_IN_KERNEL_REDUCE" in
         ;;
 esac
 
+# FP8_TAIL_SPLIT: mega_runner reads the exported variable (heuristic_config
+# applies it per bucket); the standalone runner gets --tail_split_pairs only
+# when the manual geometry qualifies.  Not a manual-geometry request.
+FP8_TAIL_SPLIT="${FP8_TAIL_SPLIT:-0}"
+FC12_EXTRA_ARGS=""
+case "$FP8_TAIL_SPLIT" in
+    1)
+        if { [ "$SWAP_AB" -eq 1 ] && [ "$FP8_CLUSTER_SHAPE" = "1,2,1" ]; } \
+            || { [ "$SWAP_AB" -eq 0 ] && [ "$FP8_CLUSTER_SHAPE" = "2,1,1" ]; }; then
+            FC12_EXTRA_ARGS="$FC12_EXTRA_ARGS --tail_split_pairs"
+        else
+            echo "NOTE: FP8_TAIL_SPLIT=1 does not apply to the standalone fc12 geometry (swap_ab=$SWAP_AB, cluster $FP8_CLUSTER_SHAPE); the MegaMoE launches decide per selected config." >&2
+        fi
+        ;;
+    0)
+        ;;
+    *)
+        echo "ERROR: FP8_TAIL_SPLIT must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
+export FP8_TAIL_SPLIT
+
 PERF_WARMUP="${PERF_WARMUP:-3}"
 PERF_ITERS="${PERF_ITERS:-20}"
 FC12_WARMUP="${FC12_WARMUP:-$PERF_WARMUP}"
@@ -417,9 +442,9 @@ print_config() {
 run_fc12_case() {
     local args="$1"
     local scale_mode="$2"
-    echo "[CMD] timeout $TIMEOUT_SECONDS $PYTHON $FC12_RUNNER $args --fp8_scale_mode $scale_mode --fp8_accum_mode $FP8_ACCUM_MODE"
+    echo "[CMD] timeout $TIMEOUT_SECONDS $PYTHON $FC12_RUNNER $args --fp8_scale_mode $scale_mode --fp8_accum_mode $FP8_ACCUM_MODE $FC12_EXTRA_ARGS"
     # shellcheck disable=SC2086
-    timeout "$TIMEOUT_SECONDS" "$PYTHON" "$FC12_RUNNER" $args --fp8_scale_mode "$scale_mode" --fp8_accum_mode "$FP8_ACCUM_MODE"
+    timeout "$TIMEOUT_SECONDS" "$PYTHON" "$FC12_RUNNER" $args --fp8_scale_mode "$scale_mode" --fp8_accum_mode "$FP8_ACCUM_MODE" $FC12_EXTRA_ARGS
 }
 
 run_mega_single_case() {

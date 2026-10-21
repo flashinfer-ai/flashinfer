@@ -19,8 +19,8 @@ import torch
 
 import flashinfer.testing.utils as timing_utils
 from flashinfer.cutile import is_cuda_tile_available
-from flashinfer.jit.cake_grouped_mxfp8_quantize import (
-    get_cake_grouped_mxfp8_quantize_module,
+from flashinfer.quantization.fp8_quantization import (
+    cake_grouped_mxfp8_quantize_launch,
     is_cake_grouped_mxfp8_quantize_available,
 )
 from flashinfer.quantization.kernels.cutile.mxfp8_grouped_quantize_cutile import (
@@ -150,9 +150,6 @@ def _run_shape(shape: tuple[int, int, int], warmup_ms: int, benchmark_ms: int) -
     cake_q = torch.empty_like(cutile_q)
     cake_sf = torch.empty_like(cutile_sf)
 
-    cake_module = get_cake_grouped_mxfp8_quantize_module(x.dtype, x.device)
-    stream = int(torch.cuda.current_stream(x.device).cuda_stream)
-
     def run_cutile_kernel():
         mxfp8_grouped_quantize_cutile_with_prefix_schedule(
             input_tensor.view(batch * rows, padded_k),
@@ -165,7 +162,10 @@ def _run_shape(shape: tuple[int, int, int], warmup_ms: int, benchmark_ms: int) -
         )
 
     def run_cake_kernel():
-        cake_module.run(input_tensor, mask, cake_q, cake_sf, stream)
+        # The Cake program pads K to 128-column tiles itself: it reads the
+        # unpadded input and writes the preallocated padded outputs in exactly
+        # one kernel launch on the current stream.
+        cake_grouped_mxfp8_quantize_launch(x, mask, cake_q, cake_sf)
 
     run_cutile_kernel()
     run_cake_kernel()

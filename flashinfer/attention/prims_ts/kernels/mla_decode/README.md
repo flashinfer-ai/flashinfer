@@ -1,5 +1,19 @@
 # Task-Scheduled MLA Decode
 
+Native D512 two-source sparse MLA is available through
+`BatchSparseMLADecodePagedTSWrapper` (see its `plan()` / `run()` docstrings).
+Every sparse schedule consumes separate storage-row index lists and live lengths
+for the primary and optional extra pool. Pass `indices`, `lengths`, optional
+`extra_indices`/`extra_lengths`, and attention sinks directly to `run()`.
+The caller supplies two effective scales: `softmax_scale = attention_scale *
+q_descale * kv_descale` and `output_scale = output_multiplier * kv_descale`.
+Both pools share the KV descale. Sink logits retain their original scale;
+`output_scale` applies before output quantization, while `out_scale` holds its
+generated per-block scales. Dynamic scale composition belongs in upstream work.
+Index lists use `-1` for holes and need no 128-entry padding.
+The kernel keeps source boundaries aligned to its KV tiles internally.
+The dense API contract below retains its 512-latent plus 64-RoPE layout.
+
 This directory contains the CuTe DSL task-scheduled (TS) Multi-head Latent
 Attention (MLA) decode kernels used by FlashInfer's experimental Blackwell
 paged-cache APIs. The implementation accepts the post-matrix-absorption MLA
@@ -22,9 +36,8 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 | API | Use |
 | --- | --- |
 | `BatchMLADecodePagedTSWrapper` | Reusable static `plan()` plus per-run request-metadata `run()` interface. |
-| `batch_mla_decode_with_paged_kv_cache` | One-shot convenience interface. |
+| `batch_mla_decode_with_paged_kv_cache` | One-shot interface with optional caller scratch, explicit bounds, and trusted capture-safe execution. |
 | `get_prims_ts_batch_mla_decode_workspace_size` | Size caller-owned standalone scratch. |
-| `prims_ts_batch_mla_decode_with_kv_cache` | Standalone launch with caller-owned scratch. |
 
 Trace a planned stateful wrapper with `flashinfer.fi_trace(wrapper.run, ...)`.
 The unbound `wrapper.run.fi_trace(...)` form is rejected because it cannot

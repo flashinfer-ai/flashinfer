@@ -32,10 +32,10 @@ Wrap the portion of your code that you want to tune inside the
         # All FlashInfer ops executed here will be profiled.
         output = flashinfer.gemm.bmm_fp8(A, B, A_scale, B_scale, dtype=out_dtype)
 
-The first time an operation runs inside the context, the autotuner benchmarks
-all available runners and tactics for that ``(operation, backend, shape)``
-combination.  Subsequent calls with the same shape reuse the cached result
-without re-profiling.
+If no matching cached or loaded config exists, the first time an operation
+runs inside the context, the autotuner benchmarks all available runners and
+tactics for that ``(operation, backend, shape)`` combination. Subsequent calls
+with the same shape reuse the cached result without re-profiling.
 
 You can also pass ``tune_mode=True`` explicitly (the default):
 
@@ -115,8 +115,8 @@ repeated profiling.
 Saving Tuned Configs
 ^^^^^^^^^^^^^^^^^^^^
 
-Pass a file path to ``cache`` when tuning.  On exit, all profiled configs are
-written to that file:
+Pass a file path to ``cache`` when tuning. On exit, profiled configs are
+written to that file unless existing cache metadata definitely conflicts with the current environment:
 
 .. code-block:: python
 
@@ -207,9 +207,10 @@ The benchmark harness supports config caching via the ``--autotune_cache`` flag.
 Cache File Format
 ^^^^^^^^^^^^^^^^^
 
-The cache file is a plain JSON dictionary.  Each key is a string representation
-of ``(custom_op, runner_class_name, optimization_profile)`` and each value is
-``[runner_class_name, tactic]``:
+The cache file is a plain JSON dictionary. Each tuning-entry key is a string representation
+of ``(custom_op, runner_class_name, optimization_profile)``; its value starts with
+``[runner_class_name, tactic]`` and may include a measurement policy. The reserved
+``_metadata``, ``_records``, and ``_generation`` keys contain cache bookkeeping:
 
 .. code-block:: json
 

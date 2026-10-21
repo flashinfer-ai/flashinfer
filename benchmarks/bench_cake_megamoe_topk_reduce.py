@@ -7,7 +7,7 @@ kernel and not a claimed historical FlashInfer performance baseline.
 
 ``--baseline vendored-cutedsl-matched`` (the default) selects the exact vendored
 implementation at
-``flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/moe_nvfp4_swapab/topk_reduce.py``.
+``flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/topk_reduce.py``.
 Both kernels process the same live ``T x 6 x 4096`` elements in this primary
 comparison. ``--baseline vendored-cutedsl-fixed-capacity`` separately measures
 the serving scenario where the old reducer processes a prefill-sized ``C=4096``
@@ -34,6 +34,7 @@ from typing import Any
 import torch
 
 from flashinfer.jit.cake_megamoe_topk_reduce import (
+    resolve_arch,
     run_cake_megamoe_topk_reduce,
 )
 from flashinfer.testing import bench_gpu_time
@@ -54,24 +55,23 @@ _GRID_CTAS_PER_TOKEN = 4
 _LEGACY_BASELINE_CAPACITY = 4096
 _ATOL = 1e-2
 _RTOL = 1e-2
-_CUTEDSL_SOURCE = (
-    "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/moe_nvfp4_swapab/topk_reduce.py"
-)
+_CUTEDSL_SOURCE = "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/topk_reduce.py"
 _CUTEDSL_SOURCE_SHA256 = (
     "d7d1fc2361c30dcd8a37269edda27e75953dadf396014e47a3c3cbd7a2551184"
 )
 
 
-def _require_exact_sm100a() -> None:
+def _require_frozen_reducer_target() -> str:
+    """Return the frozen export arch (``sm_100a``/``sm_103a``) for this GPU."""
     if not torch.cuda.is_available():
         raise RuntimeError("this benchmark requires CUDA")
-    capability = torch.cuda.get_device_capability()
-    if capability != (10, 0):
-        raise RuntimeError(
-            f"frozen reducer requires exact SM100a, found capability {capability}"
-        )
+    try:
+        arch = resolve_arch()
+    except NotImplementedError as error:
+        raise RuntimeError(str(error)) from None
     if not is_sm100a_supported(torch.device("cuda")):
-        raise RuntimeError("frozen reducer requires SM100a with CUDA 12.8+")
+        raise RuntimeError("frozen reducer requires Blackwell with CUDA 12.8+")
+    return arch
 
 
 def _require_cupti() -> None:
@@ -145,7 +145,7 @@ def _make_vendored_cutedsl_runner(
         import cutlass.cute as cute
         import cutlass.torch as cutlass_torch
 
-        from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim._paths import (
+        from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim._paths import (
             bootstrap_paths,
         )
 
@@ -208,7 +208,7 @@ def _make_vendored_cutedsl_runner(
             scale_dtype=None,
             scale_block=None,
         ),
-        sm_arch="sm_100a",
+        sm_arch=resolve_arch(partials.device),
     )
     compile_kwargs = {
         "combine_quant": partials_cute,
@@ -408,7 +408,7 @@ def main() -> None:
     if args.dry_run_iters <= 0 or args.repeat_iters <= 0:
         parser.error("iteration counts must be positive")
 
-    _require_exact_sm100a()
+    arch = _require_frozen_reducer_target()
     _require_cupti()
 
     results = []
@@ -446,7 +446,7 @@ def main() -> None:
         [result["baseline_over_native_latency_ratio"] for result in results]
     )
     summary = {
-        "architecture": "sm_100a",
+        "architecture": arch,
         "dtype": "bfloat16",
         "comparison_kind": results[0]["comparison_kind"],
         "atol": _ATOL,
