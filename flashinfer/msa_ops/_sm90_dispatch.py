@@ -29,8 +29,8 @@ planner coordinates without a program, sparse prefill of GQA groups 1 / 2 /
 32 / 64 or above 4096 pages).  The fp8 proxy-score CuTe kernels re-view the
 index cache with a one-head page stride and select no KV head, so an fp8
 index cache with several heads raises in both regimes instead of scoring the
-wrong pages.  Both proxy-score prefill backends support f32 accumulation by default and
-explicit f16 accumulation through ``use_fp32_acc=False``.
+wrong pages. Both proxy-score prefill backends support f32 accumulation by
+default and explicit f16 accumulation through ``use_fp32_acc=False``.
 """
 
 import functools
@@ -406,6 +406,8 @@ def _as_packed_kv(
     vLLM stores MSA K and V interleaved in one allocation and hands out halves;
     when that is what we were given the packed view is free. Materializing it
     otherwise would copy the whole cache every call, so refuse instead.
+    ``require_dense`` applies the CuTe kernels' stricter stride contract; Cake
+    reads the tensor strides and also admits interleaved pool views.
     """
     if k.dim() != 4:
         raise NotImplementedError(
@@ -431,13 +433,6 @@ def _as_packed_kv(
             "SM90 sparse decode requires K and V interleaved in one cache "
             "(v must be the second half of k's last dim); separate allocations "
             "would need a full-cache copy per call"
-        )
-    # Cake reads the actual page/head strides, including views into pools.
-    # All routes still require K and V to be interleaved within each token.
-    if k.stride(2) != 2 * d:
-        raise NotImplementedError(
-            f"SM90 MSA needs K and V interleaved per token (stride {2 * d} "
-            f"between tokens of a page), got {k.stride(2)}"
         )
     if require_dense:
         # CuTe _views() reconstructs every stride from the shape and ignores
