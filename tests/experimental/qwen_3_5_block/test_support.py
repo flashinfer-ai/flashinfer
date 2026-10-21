@@ -148,11 +148,15 @@ def test_version_probe_and_vendored_manifest_digests():
     from flashinfer.experimental.qwen_3_5_block import support
 
     src = support.source()
-    assert src.origin == "https://github.com/NVIDIA/cudnn-frontend"
+    # the origin names the cuDNN Frontend repository the pin is reproducible from: NVIDIA's once the commit is on develop, the
+    # author's fork while the vendored commit is a PR branch (VENDOR.md names it)
+    assert src.origin.startswith("https://github.com/") and src.origin.endswith(
+        "/cudnn-frontend"
+    ), src.origin
     assert (
-        src.commit.startswith("d8b0a7ed5")
+        src.commit.startswith("b4664a2d4")
         and src.version == "1.32.0"
-        and src.files == 103
+        and src.files == 112
     )
     assert (
         src.validated_cutedsl == "4.8.0"

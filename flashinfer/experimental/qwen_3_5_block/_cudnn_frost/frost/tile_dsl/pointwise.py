@@ -810,6 +810,46 @@ def lane_group_sum(value: cutlass.Float32, lanes: cutlass.Constexpr[int]) -> cut
 
 
 @cute.jit
+def rmsnorm_rstd(sum_sq_partial: cutlass.Float32, lanes: cutlass.Constexpr[int], d: cutlass.Constexpr[int], eps: cutlass.Float32) -> cutlass.Float32:
+    """RMSNorm reciprocal scale of one ``d``-element row spread over ``lanes``
+    consecutive lanes: ``rsqrt(sum(x^2) / d + eps)``.
+
+    ``sum_sq_partial`` is the calling lane's partial sum of squares over the elements it
+    holds; the group total comes from :func:`lane_group_sum`, so every lane of
+    the group returns the same value.  ``1 / d`` is a trace-time constant (one
+    multiply, never a divide) and the rsqrt is the fast-math MUFU form.  This is
+    the reduction the gated attention block's norm kernels compute; spell it
+    through this helper rather than inline.
+    """
+    return cute.math.rsqrt(lane_group_sum(sum_sq_partial, lanes) * cutlass.Float32(1.0 / d) + eps, fastmath=True)
+
+
+@cute.jit
+def rope_rotate_half(
+    y: cutlass.Float32, cos_v: cutlass.Float32, sin_v: cutlass.Float32, lane: cutlass.Int32, half_lanes: cutlass.Constexpr[int]
+) -> cutlass.Float32:
+    """NeoX ``rotate_half`` RoPE for ONE element of a lane-distributed row.
+
+    A row's leading ``ROPE_DIM`` elements sit on lanes ``[0, 2 * half_lanes)``
+    of their lane group, ``ELEMS`` per lane, so element ``e`` and its partner
+    ``e +- ROPE_DIM / 2`` are the SAME sub-index on lanes ``lane`` and
+    ``lane ^ half_lanes``: one butterfly shuffle fetches the partner, the sign is
+    ``-`` on the first half and ``+`` on the second, and the result is
+    ``y * cos + rotate_half(y) * sin`` with duplicated-half tables
+    (``cos[e] == cos[e + ROPE_DIM / 2]``).
+
+    ``shfl.sync`` with the full mask: EVERY lane of the warp must reach this
+    call, lanes outside the rope band included; the caller keeps the result on
+    the rope lanes only.  ``half_lanes`` must be a power of two so the butterfly
+    stays inside an aligned lane group, and ``lane`` is the index WITHIN the
+    group (``tidx % lanes``), not the hardware lane id.
+    """
+    partner = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, y, cutlass.Int32(half_lanes), 31, kind=nvvm.Shfl.BFLY))
+    signed = -partner if lane < cutlass.Int32(half_lanes) else partner
+    return y * cos_v + signed * sin_v
+
+
+@cute.jit
 def l2norm_inv(sum_sq: cutlass.Float32) -> cutlass.Float32:
     """Inverse L2 norm, ``rsqrt(sum_sq + L2_NORM_EPS)``; a zero row normalizes to zero."""
     return cute.math.rsqrt(sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
