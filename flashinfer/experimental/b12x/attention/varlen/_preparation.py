@@ -102,6 +102,10 @@ def compile_varlen_attention(query_payload, invocation, config_payload, ordinal)
     config = VarlenAttentionConfig.from_config(FrozenMapping(config_payload))
     TUNING.validate_query(query, None)
     TUNING.validate_config(query, config, None)
+    if query.math_mode == "eager_bf16":
+        from ._eager_bf16 import compile_programs
+
+        return compile_programs(invocation, config, ordinal)
     (
         *shapes,
         dtype,
@@ -405,6 +409,7 @@ def _varlen_invocation(
     per_segment_tiles=False,
     num_q_tiles=0,
     total_blocks_cap=0,
+    math_mode="flash",
 ):
     from b12x.attention._shared.contiguous import api as contiguous
 
@@ -429,6 +434,10 @@ def _varlen_invocation(
     left, right = contiguous._normalize_window_size(window_size)
     total_q, q_heads, q_dim = q_shape
     total_k, kv_heads, _ = k_shape
+    if math_mode == "eager_bf16":
+        from ._eager_bf16 import validate_extents
+
+        validate_extents(q_shape, k_shape, v_shape, cu_q_shape, cu_k_shape)
     query = VarlenAttentionQuery(
         variant="varlen",
         dtype=_dtype_name(dtype),
@@ -444,7 +453,11 @@ def _varlen_invocation(
         max_seqlen_k=max_k,
         block_sparse=bool(block_sparse),
         per_segment_tiles=bool(per_segment_tiles),
+        math_mode=math_mode,
     )
+    TUNING.validate_query(query, None)
+    if math_mode == "eager_bf16" and (left != -1 or right != -1 or sink is not None):
+        raise ValueError("eager_bf16 does not support local windows or attention sinks")
     return query, FrozenMapping(
         {
             "q_shape": q_shape,
@@ -464,6 +477,7 @@ def _varlen_invocation(
             "per_segment_tiles": bool(per_segment_tiles),
             "num_q_tiles": int(num_q_tiles),
             "total_blocks_cap": int(total_blocks_cap),
+            "math_mode": math_mode,
         }
     )
 
@@ -543,6 +557,10 @@ def _batched_memory(invocation, device):
 
 
 def _varlen_memory(invocation, device):
+    if invocation.get("math_mode", "flash") == "eager_bf16":
+        from ._eager_bf16 import scratch_spec
+
+        return MemoryRequirements(scratch=(scratch_spec(invocation, device.ordinal),))
     from b12x.attention._shared.contiguous import api as contiguous
 
     values = dict(invocation)
@@ -638,6 +656,7 @@ def plan(
     num_q_tiles=0,
     total_blocks_cap=0,
     per_segment_tiles=False,
+    math_mode="flash",
 ):
     """Prepare row and segment capacities for packed varlen attention.
 
@@ -654,6 +673,13 @@ def plan(
     Head dimensions, dtype, and contiguous layouts remain fixed. GPU cumulative
     lengths must describe the bound tensors; supplied maximum lengths must not
     exceed the prepared limits. Live shapes never select or compile a program.
+
+    ``math_mode="eager_bf16"`` rounds QK and scaled scores to BF16, performs
+    FP32 softmax, and rounds normalized probabilities to BF16 before PV. Two
+    tiled passes retain linear-size row statistics without a score matrix.
+    This mode requires BF16, equal Q/KV heads, and dense noncausal attention
+    without local windows or attention sinks. The default ``"flash"`` retains
+    FP32 scores and rounds unnormalized tile probabilities before PV.
     """
     query, invocation = _varlen_invocation(
         q,
@@ -670,6 +696,7 @@ def plan(
         per_segment_tiles=per_segment_tiles,
         num_q_tiles=num_q_tiles,
         total_blocks_cap=total_blocks_cap,
+        math_mode=math_mode,
     )
 
     if block_sparse:
@@ -695,6 +722,10 @@ def plan(
             )
 
     def materialize(selection, device):
+        if query.math_mode == "eager_bf16":
+            from ._eager_bf16 import materialize
+
+            return materialize(invocation, selection.config, device.ordinal)
         _, values, contiguous = _varlen_payload(
             TUNING.encode_query(replace(query, exhaustive=False)), invocation
         )

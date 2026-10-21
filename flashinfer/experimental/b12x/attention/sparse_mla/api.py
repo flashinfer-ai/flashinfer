@@ -33,10 +33,11 @@ from ._scratch import (
 from ._scratch import (
     B12XSparseMLAScratchCaps as Caps,
 )
+from ._scratch import _materialize_sparse_mla_scratch
 from ._preparation import plan as _plan
 from ._preparation import state as _state
 from ._preparation import plan_cache_writer
-from ._preparation import writer_state as _writer_state
+from . import _ops
 from . import META
 
 
@@ -119,16 +120,34 @@ def bind(
 
 
 def run(binding: Binding) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Execute a complete binding through the route selected by its plan."""
+    """Execute a complete binding through the route selected by its plan.
+
+    Decode returns output, or (output, LSE) when return_lse is enabled.
+    Extend modes return (output, LSE). Both tensors alias planned scratch.
+    """
 
     if not isinstance(binding, Binding):
         raise TypeError("binding must be sparse_mla.Binding")
     state = _state(binding.plan, device=binding.kv_cache.device)
-    return state.run(
-        binding.runtime,
-        kv_cache=binding.kv_cache,
-        attention_sink=binding.attention_sink,
+    runtime = binding.runtime
+    _ops.attention(
+        runtime.q,
+        binding.kv_cache,
+        runtime.selected_indices,
+        runtime.cache_seqlens_int32,
+        runtime.nsa_cache_seqlens_int32,
+        binding.attention_sink,
+        runtime.scratch.shared_scratch,
+        binding.plan.handle,
     )
+    rows, heads = runtime.q.shape[:2]
+    views = _materialize_sparse_mla_scratch(
+        state.caps, runtime.scratch.shared_scratch, state.layout.layout
+    )
+    output = views.output_buffer[:rows, :heads]
+    if state.caps.mode != "decode" or state.caps.return_lse:
+        return output, views.final_lse[:rows, :heads]
+    return output
 
 
 def concat_and_cache_glm_next_mla(
@@ -139,7 +158,7 @@ def concat_and_cache_glm_next_mla(
     plan: Plan,
 ) -> None:
     """Write GLM_NEXT cache records through a prepared native writer."""
-    _writer_state(plan, device=kv_cache.device).run(kv_c, kv_cache, slot_mapping)
+    _ops.cache_write(kv_c, kv_cache, slot_mapping, plan.handle)
 
 
 def concat_and_cache_glm_next_mla_fp8(

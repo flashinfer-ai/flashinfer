@@ -70,6 +70,11 @@ TUNING_COMPONENTS = (
         variant="default",
     ),
     KernelTuningRegistration(
+        op_qualname="attention.paged_decode",
+        contract_ref="b12x.attention.paged_decode._tuning:TUNING",
+        variant="default",
+    ),
+    KernelTuningRegistration(
         op_qualname="attention.qsa",
         contract_ref="b12x.attention.qsa._tuning:TUNING",
         variant="default",

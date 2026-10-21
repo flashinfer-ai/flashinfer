@@ -24,7 +24,7 @@ from ._scratch import (
     B12XCompressedSparseMLAScratchCaps,
     plan_compressed_sparse_mla_scratch,
 )
-from ._tuning import SparseMlaConfig, SparseMlaQuery, TUNING
+from ._tuning import SparseMlaConfig, SparseMlaQuery, TUNING, contract_for_query
 
 
 def _alignment(tensor: torch.Tensor) -> int:
@@ -215,6 +215,7 @@ def _query(
         return_lse=bool(invocation["return_lse"]),
         lse_scale=str(invocation["lse_scale"]),
         output_mode=str(invocation["output_mode"]),
+        compute_mode=caps.compute_mode,
     )
 
 
@@ -245,6 +246,7 @@ def _caps(
         swa_page_size=query.swa_page_size,
         indexed_page_size=query.indexed_page_size,
         use_cuda_graph=query.use_cuda_graph,
+        compute_mode=query.compute_mode,
     )
 
 
@@ -560,6 +562,8 @@ def compile_compressed_sparse_mla(query_payload, config_payload, ordinal):
     query = SparseMlaQuery(**dict(query_payload))
     config = SparseMlaConfig.from_config(FrozenMapping(config_payload))
     TUNING.validate_query(query, None)
+    if query.compute_mode != "auto":
+        TUNING.validate_config(query, config, None)
     launch = _lower_launch(query, config, ordinal)
     mapper = _lower_indexed_mapper(query, config, ordinal)
     programs = _CompressedSparseMlaPrograms(launch, mapper)
@@ -657,7 +661,8 @@ def plan(
         raise TypeError("caps must be compressed_sparse_mla.Caps")
     invocation = FrozenMapping(invocation)
     query = _query(caps, invocation)
-    TUNING.validate_query(query, None)
+    contract = contract_for_query(query)
+    contract.validate_query(query, None)
 
     def state_caps(config, device):
         return _caps(query, config, device.ordinal)
@@ -703,7 +708,7 @@ def plan(
         )
 
     return Plan(
-        contract=TUNING,
+        contract=contract,
         query=query,
         invocation=invocation,
         override=override,

@@ -81,7 +81,7 @@ def _merge_backend_supports_split_kv(
         torch.float16,
         torch.bfloat16,
         torch.float32,
-    ) and head_dim_vo in (128, 256)
+    ) and head_dim_vo in (128, 192, 256)
 
 
 def _ceil_div(x: int, y: int) -> int:

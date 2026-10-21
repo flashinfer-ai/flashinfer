@@ -29,6 +29,7 @@ from b12x._lib.compiler import (
     launch as b12x_launch,
 )
 from b12x._lib.compile_plan import compile_only_launches_enabled
+from b12x._lib.intrinsics.packed import frag_layout_swizzle_16b_to_8b
 from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
     ld_shared_v4_u32,
@@ -40,7 +41,6 @@ from b12x._lib.intrinsics.memory import (
     st_global_v4_f32,
 )
 from b12x._lib.intrinsics.mma import mxfp8_mma_m16n8k32_f32_e4m3
-from b12x._lib.intrinsics.packed import frag_layout_swizzle_16b_to_8b
 from b12x._lib.utils.device import current_cuda_stream
 from .kernel import IndexerScoreMode
 
@@ -2994,8 +2994,8 @@ def run_contiguous_logits_kernel(
         out_view = staged_binding.out_view
     else:
         if _tiled_output and _use_prefill:
-            # In tiled mode, no need for the full scatter matrix
-            out_kernel = torch.empty((1, 1), dtype=torch.float32, device=q_fp8.device)
+            # The tiled specialization never reads or writes the scatter output.
+            out_kernel = tile_logits.as_strided((1, 1), (1, 1))
         elif preinitialize_invalid_logits:
             out_kernel = torch.full(
                 (q_rows_total, k_rows),
@@ -3076,15 +3076,8 @@ def run_contiguous_logits_kernel(
         tile_logits_kernel = torch.empty(
             (1, 1), dtype=torch.float32, device=q_fp8.device
         )
-    if staged_binding is not None:
-        # run_contiguous_logits_kernel always compiles BLOCK_SCORE_OUTPUT=False;
-        # this argument is therefore constexpr-dead.  Keep its rank/strides
-        # stable while aliasing caller-owned output storage for graph replay.
-        block_scores_kernel = out_kernel.as_strided((1, 1, 1), (1, 1, 1))
-    else:
-        block_scores_kernel = torch.empty(
-            (1, 1, 1), dtype=torch.float32, device=q_fp8.device
-        )
+    # BLOCK_SCORE_OUTPUT is always false; preserve its ABI with an unused alias.
+    block_scores_kernel = out_kernel.as_strided((1, 1, 1), (1, 1, 1))
 
     if _use_prefill and _prefill_block_k == _PREFILL_BLOCK_K:
         write_invalid_logits = 0 if preinitialize_invalid_logits else 1

@@ -758,9 +758,8 @@ def test_fp8_production_split_plan_handles_short_live_sequence() -> None:
         expected_lse,
     )
 
-    # The active prefix preserves the maximum-context split boundaries and
-    # only omits mathematically empty tail splits. It must therefore match a
-    # full-plan launch exactly, including the BF16 output bits.
+    # A full-plan launch spreads the same live chunks over every split, so it
+    # sums them in a different order but must still match the reference.
     full_output = torch.empty_like(output)
     full_binding = dense_mla.bind(
         plan,
@@ -777,8 +776,7 @@ def test_fp8_production_split_plan_handles_short_live_sequence() -> None:
     assert full_binding.active_splits > binding.active_splits
     full_actual, full_lse = dense_mla.run(binding=full_binding)
     torch.cuda.synchronize()
-    torch.testing.assert_close(full_actual, captured_output, rtol=0, atol=0)
-    torch.testing.assert_close(full_lse, captured_lse, rtol=0, atol=0)
+    _assert_matches(full_actual, full_lse, expected_output, expected_lse)
 
 
 @torch.inference_mode()

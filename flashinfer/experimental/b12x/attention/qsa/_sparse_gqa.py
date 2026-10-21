@@ -20,7 +20,7 @@ from b12x._lib.compile_plan import (
 )
 
 from ._sparse_gqa_cute_config import (
-    MAX_SPLIT_ROWS as _MAX_SPLIT_ROWS,
+    split_row_limit,
     _is_page_token_head_layout,
     is_candidate as _cute_is_candidate,
     is_qwen_geometry as _is_qwen_geometry,
@@ -50,19 +50,23 @@ def _validate_launch(
     softmax_scale: float,
     block_n: int,
     splits: int,
+    output_gate: torch.Tensor | None = None,
 ) -> tuple[int, int, int]:
     if not query.is_cuda:
         raise ValueError("QSA sparse GQA requires CUDA tensors")
     device = query.device
+    from ..paged._selected_forward import _output_gate_stride
+
     if query.ndim != 3:
         raise ValueError("query must have shape [rows, q_heads, head_dim]")
+    _output_gate_stride(output_gate, query)
     rows, q_heads, head_dim = map(int, query.shape)
     if rows <= 0:
         raise ValueError("query must contain at least one active row")
     if query.dtype != torch.bfloat16:
         raise TypeError(f"query must be torch.bfloat16, got {query.dtype}")
-    if head_dim < 16 or head_dim & (head_dim - 1):
-        raise ValueError("head_dim must be a power of two at least 16")
+    if head_dim not in (192, 256):
+        raise ValueError("head_dim must be 192 or 256")
     _require_unit_inner_stride(query, "query")
 
     if key_cache.ndim != 4:
@@ -121,14 +125,16 @@ def _validate_launch(
     if not query_positions.is_contiguous():
         raise ValueError("query_positions must be contiguous")
     if (
-        selected_positions.ndim != 2
+        selected_positions.ndim not in (2, 3)
         or int(selected_positions.shape[0]) < rows
-        or int(selected_positions.shape[1]) <= 0
+        or int(selected_positions.shape[-1]) <= 0
         or selected_positions.dtype != torch.int32
     ):
         raise TypeError(
-            "selected_positions must be int32 [capacity_rows, selection_width]"
+            "selected_positions must be int32 [rows, width] or [rows, kv_heads, width]"
         )
+    if selected_positions.ndim == 3 and selected_positions.shape[1] != kv_heads:
+        raise ValueError("selection groups must match KV heads")
     if not selected_positions.is_contiguous():
         raise ValueError("selected_positions must be contiguous")
     if (
@@ -150,7 +156,7 @@ def _validate_launch(
             "output_lse must be contiguous float32 [capacity_rows, q_heads]"
         )
 
-    if rows > _MAX_SPLIT_ROWS:
+    if rows > split_row_limit(int(key_cache.shape[2])):
         if not query.is_contiguous():
             raise ValueError("query must be contiguous for selected-position paging")
         if not (
@@ -167,7 +173,7 @@ def _validate_launch(
     splits = int(splits)
     if block_n not in (16, 64):
         raise ValueError("block_n must be 16 or 64")
-    key_tiles = math.ceil(int(selected_positions.shape[1]) / block_n)
+    key_tiles = math.ceil(int(selected_positions.shape[-1]) / block_n)
     if splits <= 0 or splits & (splits - 1) or splits > key_tiles:
         raise ValueError(
             "splits must be a positive power of two not exceeding key tiles"
@@ -215,6 +221,7 @@ def compile_sparse_paged_gqa(
     selected_positions: torch.Tensor,
     direct_kv_warps: int,
     return_lse: bool = False,
+    output_gate: torch.Tensor | None = None,
 ) -> dict[str, object]:
     """Compile both legal QSA sparse-GQA ABIs and retain their raw carriers."""
     from ..paged._selected_forward import _compile, launch_sparse_gqa_merge
@@ -227,9 +234,13 @@ def compile_sparse_paged_gqa(
             value_cache=value_cache,
             request_ids=request_ids,
             direct_output=direct,
+            output_gate=output_gate if direct else None,
             return_lse=return_lse if direct else True,
             kv_warps=int(direct_kv_warps) if direct else 2,
-            selection_width=int(selected_positions.shape[1]),
+            selection_width=int(selected_positions.shape[-1]),
+            selection_groups=int(selected_positions.shape[1])
+            if selected_positions.ndim == 3
+            else 1,
         )
     # Split merge is a distinct CuTe ABI; compile-only returns its carrier.
     partial_output = torch.empty(
@@ -257,6 +268,7 @@ def compile_sparse_paged_gqa(
         partial_lse=partial_lse,
         output=output,
         output_lse=output_lse,
+        output_gate=output_gate,
         rows=int(query.shape[0]),
         splits=1,
     )
@@ -276,6 +288,7 @@ def launch_sparse_paged_gqa(
     query_positions: torch.Tensor,
     output: torch.Tensor,
     output_lse: torch.Tensor | None = None,
+    output_gate: torch.Tensor | None = None,
     partial_output: torch.Tensor | None,
     partial_lse: torch.Tensor | None,
     softmax_scale: float,
@@ -288,16 +301,20 @@ def launch_sparse_paged_gqa(
     if compile_only_launches_enabled():
         from ..paged._selected_forward import _compile, launch_sparse_gqa_merge
 
-        direct = int(query.shape[0]) > _MAX_SPLIT_ROWS
+        direct = int(query.shape[0]) > split_row_limit(int(key_cache.shape[2]))
         _, raw = _compile(
             query=query,
             key_cache=key_cache,
             value_cache=value_cache,
             request_ids=request_ids,
             direct_output=direct,
+            output_gate=output_gate if direct else None,
             return_lse=output_lse is not None if direct else True,
             kv_warps=int(direct_kv_warps) if direct else 2,
-            selection_width=int(selected_positions.shape[1]),
+            selection_width=int(selected_positions.shape[-1]),
+            selection_groups=int(selected_positions.shape[1])
+            if selected_positions.ndim == 3
+            else 1,
         )
         for program in program_keys(raw):
             record_program(program)
@@ -307,6 +324,7 @@ def launch_sparse_paged_gqa(
                 partial_lse=partial_lse,
                 output=output,
                 output_lse=output_lse,
+                output_gate=output_gate,
                 rows=int(query.shape[0]),
                 splits=splits,
             )
@@ -323,6 +341,7 @@ def launch_sparse_paged_gqa(
         query_positions=query_positions,
         output=output,
         output_lse=output_lse,
+        output_gate=output_gate,
         partial_output=partial_output,
         partial_lse=partial_lse,
         softmax_scale=softmax_scale,
@@ -333,7 +352,7 @@ def launch_sparse_paged_gqa(
         q_heads=int(query.shape[1]),
         kv_heads=int(key_cache.shape[2]),
         head_dim=int(query.shape[2]),
-        selection_width=int(selected_positions.shape[1]),
+        selection_width=int(selected_positions.shape[-1]),
         block_n=block_n,
         splits=splits,
     ):
@@ -341,7 +360,7 @@ def launch_sparse_paged_gqa(
             "QSA sparse GQA has no CuTe implementation for q_heads="
             f"{int(query.shape[1])}, kv_heads={int(key_cache.shape[2])}, "
             f"head_dim={int(query.shape[2])}, page_size={int(key_cache.shape[1])}, "
-            f"selection_width={int(selected_positions.shape[1])}, "
+            f"selection_width={int(selected_positions.shape[-1])}, "
             f"block_n={int(block_n)}, splits={int(splits)}"
         )
     if _prepared is not None:
@@ -357,7 +376,7 @@ def launch_sparse_paged_gqa(
             run_compiled,
         )
 
-        direct = rows > _MAX_SPLIT_ROWS
+        direct = rows > split_row_limit(int(key_cache.shape[2]))
         raw = _prepared["direct" if direct else "split"]
         request_id_type = Int32 if request_ids.dtype == torch.int32 else Int64
         kv_type = Float8E4M3FN if key_cache.dtype == torch.float8_e4m3fn else BFloat16
@@ -386,6 +405,10 @@ def launch_sparse_paged_gqa(
                 if direct
                 else _pointer(partial_lse, Float32),
                 _pointer(output, BFloat16),
+                _pointer(output_gate, BFloat16)
+                if output_gate is not None
+                else _fake_pointer(BFloat16),
+                (),
                 int(key_cache.shape[0]),
                 int(block_table.shape[0]),
                 int(block_table.shape[1]),
@@ -412,13 +435,16 @@ def launch_sparse_paged_gqa(
                     _pointer(output_lse, Float32)
                     if output_lse is not None
                     else _fake_pointer(Float32),
+                    _pointer(output_gate, BFloat16)
+                    if output_gate is not None
+                    else _fake_pointer(BFloat16),
                     int(rows),
                     int(splits),
                     current_cuda_stream(),
                 ),
             )
         return output[:rows]
-    if rows > _MAX_SPLIT_ROWS:
+    if rows > split_row_limit(int(key_cache.shape[2])):
         from ..paged._selected_forward import launch_selected_paged_gqa_direct
 
         launch_selected_paged_gqa_direct(
@@ -433,6 +459,7 @@ def launch_sparse_paged_gqa(
             query_positions=query_positions,
             output=output,
             output_lse=output_lse,
+            output_gate=output_gate,
             softmax_scale=softmax_scale,
             kv_warps=int(direct_kv_warps),
         )
@@ -480,6 +507,7 @@ def launch_sparse_paged_gqa(
         partial_lse=partial_lse,
         output=output,
         output_lse=output_lse,
+        output_gate=output_gate,
         rows=rows,
         splits=splits,
     )

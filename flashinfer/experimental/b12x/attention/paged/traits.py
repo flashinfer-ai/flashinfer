@@ -117,6 +117,7 @@ def select_paged_forward_traits(
     exact_num_mma_kv: int | None = None,
     minimum_shared_storage_bytes: int = 0,
     compact_sync_rows: int = 0,
+    kv_tile_divisor: int | None = None,
 ) -> PagedForwardTraits:
     if head_dim_qk % 16 != 0 or head_dim_vo % 16 != 0:
         raise ValueError("head_dim_qk and head_dim_vo must be multiples of 16")
@@ -287,6 +288,8 @@ def select_paged_forward_traits(
         ):
             continue
         candidate_cta_tile_kv = candidate_mma_kv * num_warps_kv * 16
+        if kv_tile_divisor is not None and kv_tile_divisor % candidate_cta_tile_kv:
+            continue
         candidate_qkv_bytes = q_smem_bytes + candidate_mma_kv * kv_bytes_per_mma
         candidate_payload_bytes = _align_up(
             max(
@@ -515,6 +518,7 @@ def select_paged_forward_traits_from_plan(
         exact_num_mma_kv=exact_num_mma_kv,
         minimum_shared_storage_bytes=minimum_shared_storage_bytes,
         compact_sync_rows=compact_sync_rows,
+        kv_tile_divisor=128 if plan.page_size == 128 else None,
     )
     force_wide_bf16_extend = paged_control("B12X_PAGED_EXTEND_BF16_N32", "0") == "1"
     force_narrow_bf16_extend = paged_control("B12X_PAGED_EXTEND_BF16_N16", "0") == "1"
@@ -547,6 +551,7 @@ def select_paged_forward_traits_from_plan(
         exact_num_mma_kv=2,
         minimum_shared_storage_bytes=minimum_shared_storage_bytes,
         compact_sync_rows=compact_sync_rows,
+        kv_tile_divisor=128 if plan.page_size == 128 else None,
     )
     batch_capacity = max(int(plan.page_table_shape[0]), 1)
     average_q_len = (int(plan.total_q) + batch_capacity - 1) // batch_capacity

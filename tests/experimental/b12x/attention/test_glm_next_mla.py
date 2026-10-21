@@ -284,7 +284,8 @@ def test_pooled_topk_expands_to_physical_slots(rows: int, planned: bool) -> None
 
 
 @torch.inference_mode()
-def test_pooled_topk_physical_expansion_replays_live_inputs() -> None:
+@pytest.mark.parametrize("compiled", [False, True])
+def test_pooled_topk_physical_expansion_replays_live_inputs(compiled) -> None:
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.preparation import PreparedCall, PreparationSession
 
@@ -348,6 +349,10 @@ def test_pooled_topk_physical_expansion_replays_live_inputs() -> None:
     )
     session = PreparationSession(device=device, autotune=False, compile_workers=0)
     session.prepare((request,))
+    if compiled:
+        expand = torch.compile(expand, fullgraph=True, dynamic=False)
+        expand()
+        torch.cuda.synchronize(device)
     graph = torch.cuda.CUDAGraph()
     with kernel_resolution_guard("prepared C4 selection"), torch.cuda.graph(graph):
         expand()

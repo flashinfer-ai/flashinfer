@@ -20,8 +20,6 @@ from cutlass._mlir.dialects import llvm
 
 from ..._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from ..._lib.program_cache import program_cache
-from b12x._lib.intrinsics.atomics import ld_shared_u32
-from b12x._lib.intrinsics.constants import mma_m16n8k16_f32_bf16
 from b12x._lib.intrinsics.conversion import (
     cvt_fp32x2_to_e2m1x2,
     f16x2_to_f32x2,
@@ -37,6 +35,8 @@ from b12x._lib.intrinsics.memory import (
     shared_ptr_to_u32,
     u32_as_f32,
 )
+from b12x._lib.intrinsics.atomics import ld_shared_u32
+from b12x._lib.intrinsics.constants import mma_m16n8k16_f32_bf16
 from ..._lib.runtime_control import raise_if_kernel_resolution_frozen
 from ..._lib.scratch import scratch_buffer_spec, scratch_tensor
 from ..._lib.scratch_layout import (
@@ -1156,8 +1156,8 @@ def plan_mxfp4(caps, *, score_kind=None):
     width = caps.max_candidates or caps.max_page_table_width * caps.page_size
     rows = caps.max_q_rows
     index_mxfp4_page_bytes(caps.page_size)
-    if caps.num_q_heads > 32 or 32 % caps.num_q_heads:
-        raise ValueError("MXFP4 indexer requires a divisor of 32 global heads")
+    if caps.num_q_heads > 64 or 64 % caps.num_q_heads:
+        raise ValueError("MXFP4 indexer requires a divisor of 64 global heads")
     if rows * width > 2**31 - 1:
         raise ValueError("MXFP4 logits exceed the row selector's kernel tensor limit")
     shapes = [

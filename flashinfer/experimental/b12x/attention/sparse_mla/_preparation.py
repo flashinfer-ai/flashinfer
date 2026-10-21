@@ -97,6 +97,7 @@ def compile_sparse_mla(caps, ordinal, prefill_mg_enabled=True):
         state.prime(
             binding,
             kv_cache=cache,
+            q_alignment=16,
             attention_sink=(
                 empty((caps.num_q_heads,), torch.float32)
                 if caps.has_attention_sink
@@ -206,7 +207,14 @@ class _SparseMlaState:
     def bind(self, **kwargs) -> B12XSparseMLABinding:
         return self.bind_for_preparation(**kwargs)
 
-    def prime(self, binding: B12XSparseMLABinding, *, kv_cache, attention_sink=None):
+    def prime(
+        self,
+        binding: B12XSparseMLABinding,
+        *,
+        kv_cache,
+        attention_sink=None,
+        q_alignment=None,
+    ):
         """Resolve every declared launcher from this state's exact live ABI."""
         if self.caps.mode == "decode":
             from b12x.attention._shared.mla.kernel import (
@@ -216,6 +224,7 @@ class _SparseMlaState:
 
             prepared = prepare_unified_decode_launch(
                 q_all=binding.q,
+                q_alignment=q_alignment,
                 swa_k_cache=kv_cache,
                 swa_indices=binding.selected_indices,
                 workspace=binding.scratch,
@@ -254,6 +263,10 @@ class _SparseMlaState:
                     sm_scale=self.caps.softmax_scale,
                     page_block_size=self.caps.page_size,
                     topk_length=binding.nsa_cache_seqlens_int32,
+                    output=binding.scratch.output_buffer[: binding.q.shape[0]],
+                    lse_out=binding.scratch.final_lse[
+                        : binding.q.shape[0], : binding.q.shape[1]
+                    ],
                     model_type=self.caps.model_type,
                     scale_format=self.caps.scale_format,
                     fp8_rope=self.caps.fp8_rope,
@@ -300,8 +313,7 @@ class _SparseMlaState:
             ),
             lse_out=(
                 binding.scratch.final_lse[: binding.q.shape[0], : binding.q.shape[1]]
-                if self.caps.return_lse
-                and getattr(binding.scratch, "final_lse", None) is not None
+                if getattr(binding.scratch, "final_lse", None) is not None
                 else None
             ),
             model_type=self.caps.model_type,

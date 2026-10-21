@@ -37,6 +37,14 @@ from b12x._lib.scratch import (
 
 @dataclass(frozen=True, kw_only=True)
 class B12XCompressedSparseMLAScratchCaps:
+    """Compressed MLA storage capacities and optional arithmetic constraints.
+
+    ``compute_mode="auto"`` allows all supported arithmetic candidates.
+    ``"bf16"`` requires BF16 attention arithmetic while preserving the cache
+    storage format and tuning every compatible configuration. BF16 constraints
+    require ``cache_format="deepseek_v41"``.
+    """
+
     device: torch.device | str
     num_q_heads: int
     max_q_rows: int
@@ -61,6 +69,7 @@ class B12XCompressedSparseMLAScratchCaps:
     indexed_page_size: int | None = None
     shared_width_capacity: bool | None = field(default=None, repr=False)
     use_cuda_graph: bool = False
+    compute_mode: Literal["auto", "bf16"] = "auto"
 
     def __post_init__(self) -> None:
         device = torch.device(self.device)
@@ -78,6 +87,10 @@ class B12XCompressedSparseMLAScratchCaps:
             raise ValueError(
                 f"unsupported compressed MLA cache_format {self.cache_format!r}"
             )
+        if self.compute_mode not in ("auto", "bf16"):
+            raise ValueError("compute_mode must be 'auto' or 'bf16'")
+        if self.compute_mode != "auto" and self.cache_format != "deepseek_v41":
+            raise ValueError("compute_mode='bf16' requires cache_format='deepseek_v41'")
         if self.mode not in ("decode", "extend", "verify", "draft_extend"):
             raise ValueError(f"unsupported compressed sparse MLA mode {self.mode!r}")
         legacy_shared_width = (

@@ -358,7 +358,6 @@ class _B12XIndexerPagedScratchLayout:
     candidate_values_offset_bytes: int
     candidate_indices_offset_bytes: int
     merge_positions_offset_bytes: int
-    active_width_offset_bytes: int
     fused_pack_values_offset_bytes: int
     fused_pack_indices_offset_bytes: int
     fused_merge_state_offset_bytes: int
@@ -441,7 +440,6 @@ class B12XIndexerPagedScratch:
     indexer_contiguous_candidate_values: torch.Tensor | None = None
     indexer_contiguous_candidate_indices: torch.Tensor | None = None
     indexer_contiguous_topk_positions: torch.Tensor | None = None
-    paged_indexer_active_width_cap: torch.Tensor | None = None
     fused_indexer_pack_values: torch.Tensor | None = None
     fused_indexer_pack_indices: torch.Tensor | None = None
     fused_indexer_merge_state: torch.Tensor | None = None
@@ -558,11 +556,6 @@ class B12XIndexerPagedScratch:
                 f"{int(self.indexer_contiguous_topk_positions.shape[0])}"
             )
         return self.indexer_contiguous_topk_positions.narrow(0, 0, row_count)
-
-    def get_paged_indexer_active_width_cap(self) -> torch.Tensor:
-        if self.paged_indexer_active_width_cap is None:
-            raise RuntimeError("paged indexer scratch is missing active-width cap")
-        return self.paged_indexer_active_width_cap
 
     def get_fused_indexer_scratch(
         self,
@@ -711,7 +704,7 @@ class B12XIndexerPagedBinding:
     metadata: IndexerPagedDecodeMetadata
     real_page_table: torch.Tensor
     cache_seqlens_int32: torch.Tensor
-    active_width: torch.Tensor
+    active_width: torch.Tensor | None = None
     schedule_metadata: torch.Tensor | None = None
     expected_num_q_heads: int | None = None
     shared_page_table: bool = False
@@ -744,7 +737,7 @@ class B12XIndexerMSAPagedBinding:
     metadata: IndexerPagedDecodeMetadata
     real_page_table: torch.Tensor
     cache_seqlens_int32: torch.Tensor
-    active_width: torch.Tensor
+    active_width: torch.Tensor | None = None
     schedule_metadata: torch.Tensor | None = None
     page_scores: torch.Tensor | None = None
     block_scores: torch.Tensor | None = None
@@ -1052,10 +1045,6 @@ def _indexer_paged_scratch_layout(
     # compatibility but reserve no bytes.
     merge_positions_offset_bytes = cursor
 
-    active_width_offset_bytes = cursor
-    cursor += dtype_nbytes(torch.int32)
-    cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
-
     fused_pack_values_offset_bytes = cursor
     cursor += fused_pack_elements * dtype_nbytes(torch.float32)
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
@@ -1154,7 +1143,6 @@ def _indexer_paged_scratch_layout(
         candidate_values_offset_bytes=candidate_values_offset_bytes,
         candidate_indices_offset_bytes=candidate_indices_offset_bytes,
         merge_positions_offset_bytes=merge_positions_offset_bytes,
-        active_width_offset_bytes=active_width_offset_bytes,
         fused_pack_values_offset_bytes=fused_pack_values_offset_bytes,
         fused_pack_indices_offset_bytes=fused_pack_indices_offset_bytes,
         fused_merge_state_offset_bytes=fused_merge_state_offset_bytes,
@@ -1400,19 +1388,6 @@ def _materialize_indexer_paged_scratch(
         candidate_values = None
         candidate_indices = None
     merge_positions = None
-    active_width_cap, _ = materialize_scratch_view(
-        scratch_storage,
-        offset_bytes=layout.active_width_offset_bytes,
-        shape=(1,),
-        dtype=torch.int32,
-    )
-    if initialize:
-        width_cap = max(
-            int(caps.max_page_table_width) * int(caps.page_size),
-            int(layout.supertile_tokens),
-            1,
-        )
-        active_width_cap.fill_(int(width_cap))
     if int(layout.fused_pack_elements) > 0 and int(layout.fused_state_words) > 0:
         fused_pack_values, _ = materialize_scratch_view(
             scratch_storage,
@@ -1560,7 +1535,6 @@ def _materialize_indexer_paged_scratch(
         indexer_contiguous_candidate_values=candidate_values,
         indexer_contiguous_candidate_indices=candidate_indices,
         indexer_contiguous_topk_positions=merge_positions,
-        paged_indexer_active_width_cap=active_width_cap,
         fused_indexer_pack_values=fused_pack_values,
         fused_indexer_pack_indices=fused_pack_indices,
         fused_indexer_merge_state=fused_merge_state,
@@ -1856,18 +1830,17 @@ def build_indexer_paged_binding(
         name="cache_seqlens_int32",
         ndim=1,
     )
-    if active_width is None:
-        active_width = scratch.get_paged_indexer_active_width_cap()
-    _validate_i32_contiguous(
-        active_width,
-        scratch=scratch,
-        name="active_width",
-        ndim=1,
-    )
-    if active_width.shape != (1,):
-        raise ValueError(
-            f"active_width must have shape (1,), got {tuple(active_width.shape)}"
+    if active_width is not None:
+        _validate_i32_contiguous(
+            active_width,
+            scratch=scratch,
+            name="active_width",
+            ndim=1,
         )
+        if active_width.shape != (1,):
+            raise ValueError(
+                f"active_width must have shape (1,), got {tuple(active_width.shape)}"
+            )
     if int(real_page_table.shape[0]) != int(cache_seqlens_int32.shape[0]):
         raise ValueError(
             f"real_page_table rows {int(real_page_table.shape[0])} do not match "
@@ -2093,13 +2066,14 @@ def build_indexer_msa_paged_binding(
     )
     if int(real_page_table.shape[0]) != int(cache_seqlens_int32.shape[0]):
         raise ValueError("real_page_table rows must match cache_seqlens_int32")
-    if active_width is None:
-        active_width = scratch.get_paged_indexer_active_width_cap()
-    _validate_i32_contiguous(active_width, scratch=scratch, name="active_width", ndim=1)
-    if active_width.shape != (1,):
-        raise ValueError(
-            f"active_width must have shape (1,), got {tuple(active_width.shape)}"
+    if active_width is not None:
+        _validate_i32_contiguous(
+            active_width, scratch=scratch, name="active_width", ndim=1
         )
+        if active_width.shape != (1,):
+            raise ValueError(
+                f"active_width must have shape (1,), got {tuple(active_width.shape)}"
+            )
     if schedule_metadata is not None:
         _validate_i32_contiguous(
             schedule_metadata,

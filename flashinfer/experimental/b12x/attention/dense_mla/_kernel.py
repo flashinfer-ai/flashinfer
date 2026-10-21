@@ -107,6 +107,7 @@ def _signature(binding: Binding) -> tuple[object, ...]:
         scratch.head_dim,
         scratch.v_head_dim,
         scratch.window_size,
+        scratch.causal,
         str(scratch.partial_dtype),
         tuple(int(value) for value in binding.q.stride()),
         tuple(int(value) for value in binding.kv_cache.stride()),
@@ -170,6 +171,7 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
         qk_dim=scratch.head_dim,
         value_dim=scratch.v_head_dim,
         window_size=scratch.window_size,
+        causal=scratch.causal,
     )
 
     q_bytes = _byte_base_pointer(binding.q)
@@ -255,6 +257,7 @@ def _forward_launch(binding: Binding) -> _ForwardLaunch:
         key_field("head_dim", scratch.head_dim),
         key_field("v_head_dim", scratch.v_head_dim),
         key_field("window_size", scratch.window_size),
+        key_field("causal", scratch.causal),
         key_field("record_stride_bytes", layout.record_stride_bytes),
         *_partial_key_fields(scratch),
         tensor_key(

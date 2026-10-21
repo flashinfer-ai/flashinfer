@@ -62,7 +62,13 @@ from b12x._lib.intrinsics.atomics import (
     st_shared_u32,
     store_bf16x2,
 )
-from b12x._lib.intrinsics.constants import mma_m16n8k16_f32_bf16
+from b12x._lib.intrinsics.packed import (
+    byte_perm,
+    half2_mul,
+    mxfp8_pair_to_bf16x2_sm120,
+    nvfp4_pair_to_bf16x2_sm120,
+    pack_f32x2_to_bfloat2,
+)
 from b12x._lib.intrinsics.conversion import (
     cvt_f32_to_e4m3,
     cvt_e4m3_to_f32_via_f16,
@@ -86,14 +92,8 @@ from b12x._lib.intrinsics.memory import (
     st_shared_v4_u32,
     st_global_v4_u32,
 )
+from b12x._lib.intrinsics.constants import mma_m16n8k16_f32_bf16
 from b12x._lib.intrinsics.mma import mma_m16n8k32_f32_e4m3, mxfp8_mma_m16n8k32_f32_e4m3
-from b12x._lib.intrinsics.packed import (
-    byte_perm,
-    half2_mul,
-    mxfp8_pair_to_bf16x2_sm120,
-    nvfp4_pair_to_bf16x2_sm120,
-    pack_f32x2_to_bfloat2,
-)
 
 
 @dsl_user_op
