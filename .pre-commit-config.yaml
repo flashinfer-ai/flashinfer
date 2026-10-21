@@ -38,7 +38,7 @@ files: ^(?!(?:flashinfer/moe_ep/kernel_src/blackwell_bf16_rank_major/src/|csrc/c
 # and sealed by cake_sm120_megamoe_manifest.json; keep their bytes.
 # The csrc/ trees of the Cake-exported packages (flashinfer-ai/flashinfer#6553: the rmsnorm
 # training backend, the causal conv1d, ulysses and fused QK RoPE append (BF16 / FP8) backends, cake_dsa_train, cake_kda_train, cake_dsa_indexer, cake_mok_bf16, cake_moe_grouped_gemm,
-# cake_lm_head_loss, dense_projection_gemm, cake_stepfun_moe) are rendered by the Cake exporters and
+# cake_lm_head_loss, dense_projection_gemm, cake_stepfun_moe, nvfp4_attention) are rendered by the Cake exporters and
 # digest-checked by their build.json manifests; keep their bytes.  The package-root loaders,
 # cake_build.py and build.json next to them stay checked.
 # The Qwen 3.5 gated attention block's _cudnn_frost/ tree is cuDNN Frontend source vendored byte-faithfully
