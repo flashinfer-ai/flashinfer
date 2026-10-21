@@ -140,6 +140,83 @@ def test_chain_sampling_row_seed_offset(reject_at, dtype, seed_size, offset_size
     _assert_scalar_reference(sample, actual, seed, offset)
 
 
+@pytest.mark.parametrize(
+    "case", ["point_mass", "equal_distribution", "independent_count", "lower_ratio"]
+)
+@pytest.mark.parametrize("vocab_size", [257, 248320])
+@pytest.mark.parametrize("device_rng", [False, True])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_chain_sampling_uniform_endpoint(case, vocab_size, device_rng, deterministic):
+    # These Philox seeds produce FP32 uniform 1 at draw zero and draw two.
+    independent_case = case == "independent_count"
+    seed = 2871038 if independent_case else 16390493
+    k = 2 if independent_case else 1
+    draft = torch.zeros((1, k, vocab_size), device="cuda")
+    target = torch.zeros((1, k + 1, vocab_size), device="cuda")
+    draft_ids = torch.tensor(
+        [[7, 9]] if independent_case else [[7]], device="cuda", dtype=torch.int32
+    )
+    draft[0, 0, 7] = 1
+    target[0, 0, 7] = 1
+    target[0, 1, 11] = 1
+    expected_ids, expected_independent, expected_emitted = [7, 11], 1, 1
+    if case == "equal_distribution":
+        draft[0, 0, 7:9] = 0.5
+        target[0, 0, 7:9] = 0.5
+    elif independent_case:
+        draft[0, 1, 9] = 1
+        target.zero_()
+        target[0, 0, 11] = 1
+        target[0, 1, 9] = 1
+        target[0, 2, 13] = 1
+        expected_ids, expected_independent, expected_emitted = [11, -1, -1], 1, 0
+    elif case == "lower_ratio":
+        target[0, 0, 7] = 0.5
+        target[0, 0, 11] = 0.5
+        expected_ids, expected_independent, expected_emitted = [11, -1], 0, 0
+    offset = 0
+    if device_rng:
+        seed = torch.tensor([seed], dtype=torch.uint64, device="cuda")
+        offset = torch.zeros(1, dtype=torch.uint64, device="cuda")
+    independent = torch.zeros(1, dtype=torch.int32, device="cuda")
+    emitted = torch.zeros_like(independent)
+
+    def sample():
+        independent.zero_()
+        emitted.zero_()
+        return sampling.chain_speculative_sampling(
+            draft,
+            draft_ids,
+            target,
+            independent,
+            emitted,
+            deterministic=deterministic,
+            seed=seed,
+            offset=offset,
+        )[0]
+
+    def check(actual):
+        assert actual.tolist() == [expected_ids]
+        assert independent.item() == expected_independent
+        assert emitted.item() == expected_emitted
+
+    check(sample())
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            actual = sample()
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_stats()["allocation.all.allocated"]
+        for _ in range(3):
+            graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+        check(actual)
+    finally:
+        torch.cuda.synchronize()
+        graph.reset()
+
+
 @pytest.mark.parametrize("name", [*SAMPLERS, "chain"])
 @pytest.mark.parametrize("seed_size,offset_size", [(4, 4), (1, 1)])
 def test_sampling_rng_tensor_cuda_graph(name, seed_size, offset_size):

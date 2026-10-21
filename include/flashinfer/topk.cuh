@@ -1611,18 +1611,20 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKMaskLogitsKernel_Multi
     DType pivot = Traits::NegInf();
 
     if (k >= vocab_size) {
-      // k >= vocab_size: no masking needed, just copy
-      vec_t<DType, VEC_SIZE> logits_vec_copy;
-      const uint32_t aligned_size = (actual_chunk_size / VEC_SIZE) * VEC_SIZE;
+      // An exact in-place destination already contains every unmasked value.
+      if (logits != masked_logits) {
+        vec_t<DType, VEC_SIZE> logits_vec_copy;
+        const uint32_t aligned_size = (actual_chunk_size / VEC_SIZE) * VEC_SIZE;
 #pragma unroll 2
-      for (uint32_t i = tx * VEC_SIZE; i < aligned_size; i += BLOCK_THREADS * VEC_SIZE) {
-        logits_vec_copy.cast_load(logits + row_idx * vocab_size + chunk_start + i);
-        logits_vec_copy.store(masked_logits + row_idx * vocab_size + chunk_start + i);
-      }
-      // Handle tail
-      for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-        masked_logits[row_idx * vocab_size + chunk_start + i] =
-            logits[row_idx * vocab_size + chunk_start + i];
+        for (uint32_t i = tx * VEC_SIZE; i < aligned_size; i += BLOCK_THREADS * VEC_SIZE) {
+          logits_vec_copy.cast_load(logits + row_idx * vocab_size + chunk_start + i);
+          logits_vec_copy.store(masked_logits + row_idx * vocab_size + chunk_start + i);
+        }
+        // Handle tail
+        for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
+          masked_logits[row_idx * vocab_size + chunk_start + i] =
+              logits[row_idx * vocab_size + chunk_start + i];
+        }
       }
 
       // Clear histogram for next iteration (in case it's k < vocab_size)

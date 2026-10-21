@@ -350,7 +350,8 @@ void chain_speculative_sampling(TensorView draft_probs, TensorView draft_token_i
                                 TensorView output_accepted_token_num,
                                 TensorView output_emitted_draft_token_num, bool deterministic,
                                 Optional<TensorView> maybe_seed_arr, uint64_t seed_val,
-                                Optional<TensorView> maybe_offset_arr, uint64_t offset_val) {
+                                Optional<TensorView> maybe_offset_arr, uint64_t offset_val,
+                                bool row_independent_rng) {
   CHECK_INPUT(draft_probs);
   CHECK_INPUT(draft_token_ids);
   CHECK_INPUT(target_probs);
@@ -385,7 +386,7 @@ void chain_speculative_sampling(TensorView draft_probs, TensorView draft_token_i
       seed_val,
       maybe_offset_arr.has_value() ? static_cast<uint64_t*>(maybe_offset_arr.value().data_ptr())
                                    : nullptr,
-      offset_val, stream, rng_strides.seed, rng_strides.offset);
+      offset_val, stream, rng_strides.seed, rng_strides.offset, row_independent_rng);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "ChainSpeculativeSampling failed with error code " << cudaGetErrorString(status);

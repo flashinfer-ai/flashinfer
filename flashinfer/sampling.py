@@ -18,6 +18,7 @@ import functools
 from numbers import Real
 from types import SimpleNamespace
 from typing import Optional, Tuple, Union
+
 import torch
 
 from .api_logging import flashinfer_api
@@ -176,6 +177,173 @@ def _is_sm103(device_index: int) -> bool:
 def get_sampling_module():
     module = gen_sampling_module().build_and_load()
 
+    @torch.library.custom_op(
+        "flashinfer::softmax_out", mutates_args=("workspace_buffer", "probs")
+    )
+    def softmax_out(
+        workspace_buffer: torch.Tensor,
+        logits: torch.Tensor,
+        probs: torch.Tensor,
+        maybe_temperature_arr: Optional[torch.Tensor],
+        temperature_val: float,
+        enable_pdl: bool,
+    ) -> None:
+        module.softmax(
+            workspace_buffer,
+            logits,
+            probs,
+            maybe_temperature_arr,
+            temperature_val,
+            enable_pdl,
+        )
+
+    @softmax_out.register_fake
+    def _fake_softmax_out(*args):
+        pass
+
+    @torch.library.custom_op(
+        "flashinfer::sampling_from_probs_out", mutates_args=("samples", "valid")
+    )
+    def sampling_from_probs_out(
+        probs: torch.Tensor,
+        samples: torch.Tensor,
+        valid: torch.Tensor,
+        indices: Optional[torch.Tensor],
+        deterministic: bool,
+        maybe_seed_arr: Optional[torch.Tensor],
+        seed_val: int,
+        maybe_offset_arr: Optional[torch.Tensor],
+        offset_val: int,
+    ) -> None:
+        module.sampling_from_probs(
+            probs,
+            samples,
+            valid,
+            indices,
+            deterministic,
+            maybe_seed_arr,
+            seed_val,
+            maybe_offset_arr,
+            offset_val,
+        )
+
+    @sampling_from_probs_out.register_fake
+    def _fake_sampling_from_probs_out(*args):
+        pass
+
+    @torch.library.custom_op(
+        "flashinfer::min_p_sampling_from_probs_out", mutates_args=("samples", "valid")
+    )
+    def min_p_sampling_from_probs_out(
+        probs: torch.Tensor,
+        samples: torch.Tensor,
+        valid: torch.Tensor,
+        indices: Optional[torch.Tensor],
+        maybe_min_p_arr: Optional[torch.Tensor],
+        min_p_val: float,
+        deterministic: bool,
+        maybe_seed_arr: Optional[torch.Tensor],
+        seed_val: int,
+        maybe_offset_arr: Optional[torch.Tensor],
+        offset_val: int,
+    ) -> None:
+        module.min_p_sampling_from_probs(
+            probs,
+            samples,
+            valid,
+            indices,
+            maybe_min_p_arr,
+            min_p_val,
+            deterministic,
+            maybe_seed_arr,
+            seed_val,
+            maybe_offset_arr,
+            offset_val,
+        )
+
+    @min_p_sampling_from_probs_out.register_fake
+    def _fake_min_p_sampling_from_probs_out(*args):
+        pass
+
+    @torch.library.custom_op(
+        "flashinfer::chain_speculative_sampling_out",
+        mutates_args=(
+            "output_token_ids",
+            "output_accepted_token_num",
+            "output_emitted_draft_token_num",
+        ),
+    )
+    def chain_speculative_sampling_out(
+        draft_probs: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        target_probs: torch.Tensor,
+        output_token_ids: torch.Tensor,
+        output_accepted_token_num: torch.Tensor,
+        output_emitted_draft_token_num: torch.Tensor,
+        deterministic: bool,
+        maybe_seed_arr: Optional[torch.Tensor],
+        seed_val: int,
+        maybe_offset_arr: Optional[torch.Tensor],
+        offset_val: int,
+        row_independent_rng: bool = False,
+    ) -> None:
+        module.chain_speculative_sampling(
+            draft_probs,
+            draft_token_ids,
+            target_probs,
+            output_token_ids,
+            output_accepted_token_num,
+            output_emitted_draft_token_num,
+            deterministic,
+            maybe_seed_arr,
+            seed_val,
+            maybe_offset_arr,
+            offset_val,
+            row_independent_rng,
+        )
+
+    @chain_speculative_sampling_out.register_fake
+    def _fake_chain_speculative_sampling_out(*args):
+        pass
+
+    @torch.library.custom_op(
+        "flashinfer::top_p_renorm_probs_out", mutates_args=("renorm_probs", "workspace")
+    )
+    def top_p_renorm_probs_out(
+        probs: torch.Tensor,
+        renorm_probs: torch.Tensor,
+        maybe_top_p_arr: Optional[torch.Tensor],
+        top_p_val: float,
+        is_deterministic: bool,
+        workspace: torch.Tensor,
+    ) -> None:
+        module.top_p_renorm_probs(
+            probs, renorm_probs, maybe_top_p_arr, top_p_val, is_deterministic, workspace
+        )
+
+    @top_p_renorm_probs_out.register_fake
+    def _fake_top_p_renorm_probs_out(*args):
+        pass
+
+    @torch.library.custom_op(
+        "flashinfer::top_k_mask_logits_out",
+        mutates_args=("mask_logits", "row_states_buffer"),
+    )
+    def top_k_mask_logits_out(
+        logits: torch.Tensor,
+        mask_logits: torch.Tensor,
+        maybe_top_k_arr: Optional[torch.Tensor],
+        top_k_val: int,
+        row_states_buffer: torch.Tensor,
+    ) -> None:
+        module.top_k_mask_logits(
+            logits, mask_logits, maybe_top_k_arr, top_k_val, row_states_buffer
+        )
+
+    @top_k_mask_logits_out.register_fake
+    def _fake_top_k_mask_logits_out(*args):
+        pass
+
     @register_custom_op("flashinfer::softmax", mutates_args=("workspace_buffer",))
     def softmax(
         workspace_buffer: torch.Tensor,
@@ -189,7 +357,7 @@ def get_sampling_module():
         maybe_temperature_arr = (
             maybe_temperature_arr.float() if maybe_temperature_arr is not None else None
         )
-        module.softmax(
+        softmax_out(
             workspace_buffer,
             logits,
             probs,
@@ -283,7 +451,7 @@ def get_sampling_module():
             _validate_and_convert_seed_offset(seed, offset, device, batch_size)
         )
 
-        module.sampling_from_probs(
+        sampling_from_probs_out(
             probs,
             samples,
             valid,
@@ -483,7 +651,7 @@ def get_sampling_module():
             _validate_and_convert_seed_offset(seed, offset, device, batch_size)
         )
 
-        module.min_p_sampling_from_probs(
+        min_p_sampling_from_probs_out(
             probs,
             samples,
             valid,
@@ -508,6 +676,8 @@ def get_sampling_module():
         min_p_val: float,
         deterministic: bool,
         generator: Optional[torch.Generator],
+        seed: Optional[Union[int, torch.Tensor]] = None,
+        offset: Optional[Union[int, torch.Tensor]] = None,
         return_valid: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         batch_size = indices.size(0) if indices is not None else probs.size(0)
@@ -609,7 +779,7 @@ def get_sampling_module():
             maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
         )
         renorm_probs = torch.empty_like(probs)
-        module.top_p_renorm_probs(
+        top_p_renorm_probs_out(
             probs,
             renorm_probs,
             maybe_top_p_arr,
@@ -685,7 +855,7 @@ def get_sampling_module():
         maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
         mask_logits = torch.empty_like(logits)
 
-        module.top_k_mask_logits(
+        top_k_mask_logits_out(
             logits,
             mask_logits,
             maybe_top_k_arr,
@@ -722,6 +892,7 @@ def get_sampling_module():
         generator: Optional[torch.Generator],
         seed: Optional[Union[int, torch.Tensor]] = None,
         offset: Optional[Union[int, torch.Tensor]] = None,
+        row_independent_rng: bool = False,
     ) -> torch.Tensor:
         device = draft_probs.device
         draft_probs = draft_probs.float()
@@ -741,7 +912,7 @@ def get_sampling_module():
             _validate_and_convert_seed_offset(seed, offset, device, batch_size)
         )
 
-        module.chain_speculative_sampling(
+        chain_speculative_sampling_out(
             draft_probs,
             draft_token_ids,
             target_probs,
@@ -753,6 +924,7 @@ def get_sampling_module():
             seed_val,
             maybe_offset_arr,
             offset_val,
+            row_independent_rng,
         )
         return output_token_ids
 
@@ -765,6 +937,9 @@ def get_sampling_module():
         output_emitted_draft_token_num: torch.Tensor,
         deterministic: bool,
         generator: Optional[torch.Generator],
+        seed: Optional[Union[int, torch.Tensor]] = None,
+        offset: Optional[Union[int, torch.Tensor]] = None,
+        row_independent_rng: bool = False,
     ) -> torch.Tensor:
         b, n = draft_token_ids.shape
         device = draft_token_ids.device
@@ -2009,6 +2184,25 @@ def top_k_top_p_sampling_from_probs(
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
 
 
+def _top_p_renorm_workspace_size(batch_size, vocab_size, is_deterministic):
+    """Return the byte capacity consumed by the AIR top-p native workspace."""
+    # Workspace size for AIR Top-P radix algorithm.
+    # Match AirTopPRenormProb's workspace partition in air_top_p.cuh.
+    align256 = lambda x: ((x + 255) // 256) * 256
+    counter_size = 384  # sizeof(Counter<float>) with alignas(128) members
+    # buf_len = alignTo(vocab_size / (ratio * 8), 256), ratio = 4 for float32
+    buf_len = max(align256(vocab_size // 32), 256)
+    hist_entry_size = 8 if is_deterministic else 4  # uint64 vs float
+    ws_size = (
+        align256(counter_size * batch_size)  # counters
+        + align256(hist_entry_size * 2048 * batch_size)  # histogram
+        + align256(4 * 2048 * batch_size)  # countHistogram
+        + align256(4 * buf_len * batch_size)  # buf1
+        + align256(4 * buf_len * batch_size)  # buf2
+    )
+    return ws_size
+
+
 @flashinfer_api(trace=top_p_renorm_probs_trace)
 def top_p_renorm_probs(
     probs: torch.Tensor,
@@ -2025,7 +2219,8 @@ def top_p_renorm_probs(
         Probabilities, shape ``(batch_size, num_classes)``.
     top_p: Union[torch.Tensor, float]
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the top-p threshold for
-        re-normalizing probabilities, should be in ``(0, 1)``.
+        re-normalizing probabilities, should be in ``(0, 1]``.
+        A threshold of one retains every nonnegative probability and renormalizes the row.
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
         We mask out the probabilities less than `threshold` where the cumulative sum
@@ -2075,20 +2270,7 @@ def top_p_renorm_probs(
     """
     batch_size = probs.size(0)
     vocab_size = probs.size(1)
-    # Workspace size for AIR Top-P radix algorithm.
-    # Must match GetAirTopPRenormWorkspaceSize in air_top_p.cuh.
-    align256 = lambda x: ((x + 255) // 256) * 256
-    counter_size = 384  # sizeof(Counter<float>) with alignas(128) members
-    # buf_len = alignTo(vocab_size / (ratio * 8), 256), ratio = 4 for float32
-    buf_len = max(align256(vocab_size // 32), 256)
-    hist_entry_size = 8 if is_deterministic else 4  # uint64 vs float
-    ws_size = (
-        align256(counter_size * batch_size)  # counters
-        + align256(hist_entry_size * 2048 * batch_size)  # histogram
-        + align256(4 * 2048 * batch_size)  # countHistogram
-        + align256(4 * buf_len * batch_size)  # buf1
-        + align256(4 * buf_len * batch_size)  # buf2
-    )
+    ws_size = _top_p_renorm_workspace_size(batch_size, vocab_size, is_deterministic)
     workspace = torch.empty(ws_size, dtype=torch.uint8, device=probs.device)
     return get_sampling_module().top_p_renorm_probs(
         probs, *_to_tensor_scalar_tuple(top_p), is_deterministic, workspace
@@ -2258,6 +2440,7 @@ def chain_speculative_sampling(
     generator: Optional[torch.Generator] = None,
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
+    row_independent_rng: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Fused-GPU kernel for speculative sampling for sequence generation (proposed in
     paper `Accelerating Large Language Model Decoding with Speculative Sampling <https://arxiv.org/pdf/2302.01318>`_),
@@ -2320,6 +2503,11 @@ def chain_speculative_sampling(
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. The offset should be
         incremented based on the number of random values consumed by the operation.
+
+    row_independent_rng: bool
+        Draw every row from Philox subsequence zero, so each row's stream depends only on
+        its own seed and offset: a batch samples exactly as one launch per row would.
+        Rows stay independent of each other only through distinct per-row seeds or offsets.
 
     Returns
     -------
@@ -2388,5 +2576,6 @@ def chain_speculative_sampling(
         generator,
         seed,
         offset,
+        row_independent_rng,
     )
     return output_token_ids, output_accepted_token_num, output_emitted_draft_token_num
