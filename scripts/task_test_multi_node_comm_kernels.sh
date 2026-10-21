@@ -29,12 +29,14 @@ export FAIL_ON_DISTRIBUTED_SKIP=1
 
 # Main execution
 main() {
+    test_status_begin
     parse_args "$@"
     print_test_mode_banner
 
     TEST_FILES="$(filter_files_by_test_path "$TEST_FILES")"
     if [ -n "${TEST_PATH:-}" ] && [ -z "$TEST_FILES" ]; then
         echo "No multi-node files overlap TEST_PATH=${TEST_PATH}; skipping."
+        test_status_complete 0
         exit 0
     fi
 
@@ -54,6 +56,7 @@ main() {
         execute_tests "$TEST_FILES"
     fi
 
+    test_status_complete "$EXIT_CODE"
     exit "$EXIT_CODE"
 }
 

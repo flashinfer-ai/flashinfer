@@ -290,14 +290,15 @@ class PersistentDenseGemmKernel:
         c: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
-        output_scale_tensor: cute.Tensor,
+        a_scale_tensor: cute.Tensor,
+        b_scale_tensor: cute.Tensor,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
         """Execute the GEMM operation.
 
-        :param output_scale_tensor: 1-element Float32 tensor containing the scale to multiply
-                                    the output by (fused into epilogue). If None, no scaling.
-                                    Using a tensor enables CUDA graph capture.
+        :param a_scale_tensor: 1-element Float32 tensor; the kernel multiplies it with
+                               b_scale_tensor in the epilogue (no host-side product).
+        :param b_scale_tensor: 1-element Float32 tensor, see a_scale_tensor.
         """
         # Setup static attributes before smem/grid/tma computation
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
@@ -391,7 +392,8 @@ class PersistentDenseGemmKernel:
             self.epi_tile,
             self.tile_sched_params,
             epilogue_op,
-            output_scale_tensor,
+            a_scale_tensor,
+            b_scale_tensor,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -418,10 +420,11 @@ class PersistentDenseGemmKernel:
         epi_tile: cute.Tile,
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
-        output_scale_tensor: cute.Tensor,
+        a_scale_tensor: cute.Tensor,
+        b_scale_tensor: cute.Tensor,
     ):
         """GPU device kernel performing the Persistent batched GEMM computation."""
-        output_scale = output_scale_tensor[0]
+        output_scale = a_scale_tensor[0] * b_scale_tensor[0]
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -987,15 +990,14 @@ def bmm(
     c: cute.Tensor,  # (l, m, n)
     max_active_clusters: cutlass.Constexpr,
     stream: cuda.CUstream,
-    output_scale_tensor: cute.Tensor,
+    a_scale_tensor: cute.Tensor,
+    b_scale_tensor: cute.Tensor,
     epilogue_op: cutlass.Constexpr = lambda x: x,
 ):
     """Wrapper API for persistent GEMM kernel to follow the convention of PyTorch's batch matrix-multiply (bmm).
 
-    :param output_scale_tensor: 1-element Float32 tensor containing the scale to multiply
-                                the output by (fused into epilogue).
-                                For FP8 GEMM, this is typically a_scale * b_scale.
-    :type output_scale_tensor: cute.Tensor
+    :param a_scale_tensor: 1-element Float32 tensor; multiplied with b_scale_tensor in the epilogue.
+    :param b_scale_tensor: 1-element Float32 tensor.
     """
     # (l,m,k) -> (m,k,l)
     a = cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0]))
@@ -1004,8 +1006,17 @@ def bmm(
     # (l,m,n) -> (m,n,l)
     c = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0]))
 
-    # Pass the scale tensor directly to the kernel, the scalar is loaded inside kernel
-    gemm_op(a, b, c, max_active_clusters, stream, output_scale_tensor, epilogue_op)
+    # Both scale tensors go straight to the kernel; the product is formed on device.
+    gemm_op(
+        a,
+        b,
+        c,
+        max_active_clusters,
+        stream,
+        a_scale_tensor,
+        b_scale_tensor,
+        epilogue_op,
+    )
 
 
 def _is_fp8_dtype(dtype: Type[cutlass.Numeric]) -> bool:

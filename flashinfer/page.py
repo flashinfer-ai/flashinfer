@@ -29,6 +29,10 @@ from .trace.templates.page import (
     nvfp4_quantize_append_paged_mla_kv_cache_trace,
 )
 from .jit.page import gen_page_module
+from .quantization.nvfp4_quantization_utils import (
+    NVFP44Over6Config,
+    resolve_nvfp4_4over6,
+)
 from .utils import (
     TensorLayout,
     _check_kv_layout,
@@ -40,8 +44,8 @@ from .utils import (
 
 
 @functools.cache
-def get_page_module():
-    return gen_page_module().build_and_load()
+def get_page_module(nvfp4_4over6: bool = False):
+    return gen_page_module(nvfp4_4over6).build_and_load()
 
 
 @register_custom_op(
@@ -273,9 +277,11 @@ def _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kernel(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     layout: int,
+    nvfp4_4over6: bool,
 ) -> None:
     slot_mapping = slot_mapping.contiguous()
-    get_page_module().nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+    module = get_page_module(True) if nvfp4_4over6 else get_page_module()
+    module.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
         append_key,
         append_value,
         slot_mapping,
@@ -301,6 +307,7 @@ def _fake_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kernel(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     layout: int,
+    nvfp4_4over6: bool,
 ) -> None:
     pass
 
@@ -926,6 +933,7 @@ def nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
     k_scale: Union[float, torch.Tensor],
     v_scale: Union[float, torch.Tensor],
     kv_layout: str = "NHD",
+    nvfp4_4over6: Optional[NVFP44Over6Config] = None,
 ) -> None:
     r"""Quantize and write K/V rows into an NVFP4 paged KV cache by slot mapping.
 
@@ -968,6 +976,10 @@ def nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
         same device as ``append_key``.
     kv_layout : str
         Layout of the paged KV cache, either ``"NHD"`` or ``"HND"``.
+    nvfp4_4over6 : Optional[NVFP44Over6Config]
+        4over6 recipe for the block scales, or ``None`` (the default) for the
+        standard ``amax / 6`` scale. Only ``err_mode=MSE`` without
+        ``err_use_fast_math`` is supported.
 
     Returns
     -------
@@ -1008,6 +1020,12 @@ def nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
             "NVFP4 scale cache tensors must have dtype torch.float8_e4m3fn"
         )
 
+    nvfp4_4over6 = resolve_nvfp4_4over6(nvfp4_4over6)
+    if nvfp4_4over6 is not None and (
+        nvfp4_4over6.err_mode_name != "MSE" or nvfp4_4over6.err_use_fast_math
+    ):
+        raise ValueError("nvfp4_4over6 supports only err_mode=MSE without fast math")
+
     k_scale_tensor, v_scale_tensor = _as_float32_scalar_tensors(
         (("k_scale", k_scale), ("v_scale", v_scale)),
         device=append_key.device,
@@ -1024,4 +1042,5 @@ def nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
         k_scale_tensor,
         v_scale_tensor,
         TensorLayout[kv_layout].value,
+        nvfp4_4over6 is not None,
     )

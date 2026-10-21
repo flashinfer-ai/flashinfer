@@ -70,7 +70,8 @@ kind, and both paths hand the inner kernel the same `SplitKernelContext`:
   dispatch/combine object: long-lived instances of one EP group (e.g. one per
   MoE layer) share a workspace per layout, and per-step routing state lives in
   that workspace, so rounds on it must not interleave. The NVLink
-  backends implement it. `dispatch(hidden_states, topk_ids,
+  backends implement it, with the workspace in
+  [symmetric memory](./symmetric_memory.md). `dispatch(hidden_states, topk_ids,
   topk_weights, ...)` returns `ep_size * tokens_per_rank` receive rows with
   their GLOBAL top-k routing (rows without a token carry
   `MoEEpCommParams.invalid_expert_id`); the expert computation weights and

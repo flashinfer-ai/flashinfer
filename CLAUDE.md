@@ -36,6 +36,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Enable GDN strided QKV path | `export FLASHINFER_GDN_WY_STRIDED_QKV=1` |
 | Enable GDN native A/B tensors | `export FLASHINFER_GDN_WY_NATIVE_AB=1` |
 | GDN ReplaySSM u-cache flush kernel with an fp16 state pool (on SM100 served by the UMMA backend; `gated_delta_rule_mtp_ucache_flush(backend=...)`) | `export GDN_UCACHE_STATE_DTYPE=fp16` |
+| Opt in to multi-wave KV split in trtllm-gen GQA decode (long or mixed-length KV) | `export FLASHINFER_TRTLLM_GEN_MULTI_WAVE_KV_SPLIT=1` |
 | Let `backend="auto"` pick experimental backends | `export FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1` |
 | Override ragged-prefill `auto` backend order (Blackwell) | `export FLASHINFER_RAGGED_AUTO_BACKEND_ORDER=cutlass,cudnn` |
 | Override CuTe-DSL prefill scheduling | `export FLASHINFER_CUTE_PREFILL_PERSISTENT=0` (non-persistent) or `1` (persistent) |
@@ -197,6 +198,19 @@ worker counts without GPU topology or measured memory capacity.
 
 Run the CPU-only coordinator suite with
 `pytest --confcutdir=tests/test_sharding tests/test_sharding/`.
+
+Communication-test wrappers optionally emit cache-publication completion reports
+when `UNIT_TEST_RUN_STATUS_DIR` is set to a fresh directory unique to that wrapper
+and container/rank. `test_run_status.sh` records each pytest invocation, and
+`test_run_status.py` atomically writes `script-result.json` (schema version 1,
+`complete`, `exit_code`, `tests_executed`, and `infrastructure_errors`). A small
+pytest plugin records execution and collection/internal errors inside each MPI
+or torchrun worker; launcher exit 1 alone is not evidence of an assertion failure.
+All local worker ranks must finish, and at least one test must execute, to allow
+publication. A completed run with assertion failures remains eligible, while
+crashes, timeouts, and unfinished invocations do not. With the variable unset,
+reporting is disabled. The CPU suite above covers this contract without GPU
+dependencies.
 
 ### Skipping Tests Based on CUDA Architecture
 
