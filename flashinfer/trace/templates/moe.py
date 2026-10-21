@@ -220,10 +220,13 @@ def _fp8_moe_run_experts(
 
     is_step = int(activation_type) == 7
     if is_step:
-        if int(fp8_quantization_type) != 2:
-            raise ValueError("SwiGLUStep requires fused MXFP8 block scaling")
+        # DeepSeekFp8 (1) applies SwiGLUStep in its separate activation kernel, MXFP8 (2) in the
+        # fused FC1 epilogue.
+        if int(fp8_quantization_type) not in (1, 2):
+            raise ValueError("SwiGLUStep requires DeepSeekFp8 or MXFP8 block scaling")
         if gemm1_alpha is not None or gemm1_beta is not None:
             raise ValueError("SwiGLUStep accepts gemm1_clamp_limit only")
+    if is_step and int(fp8_quantization_type) == 2:
         # MXFP8 uses one UE8M0 scale per row and 32 values along K.
         a_exp = hidden_states_scale.view(torch.uint8).reshape(T, H // 32)
         a_scale = torch.exp2(a_exp.to(torch.float32) - 127.0)
@@ -1359,14 +1362,25 @@ def trtllm_fp8_block_scale_moe_trace_dispatch(**kwargs):
     """
     routing_method_type = int(kwargs.get("routing_method_type", 0))
     if int(kwargs.get("activation_type", 3)) == 7:
-        if int(kwargs.get("fp8_quantization_type", 1)) != 2:
-            raise ValueError("SwiGLUStep requires fused MXFP8 block scaling")
+        fp8_quantization_type = int(kwargs.get("fp8_quantization_type", 1))
+        if fp8_quantization_type not in (1, 2):
+            raise ValueError("SwiGLUStep requires DeepSeekFp8 or MXFP8 block scaling")
+        mxfp8 = fp8_quantization_type == 2
         if (
             routing_method_type == 2
             and int(kwargs.get("num_fused_shared_experts") or 0) > 0
         ):
-            return trtllm_mxfp8_step_shared_experts_trace
-        return _STEP_MXFP8_TRACE_BY_ROUTING_TYPE.get(routing_method_type)
+            return (
+                trtllm_mxfp8_step_shared_experts_trace
+                if mxfp8
+                else trtllm_dsfp8_step_shared_experts_trace
+            )
+        step_traces = (
+            _STEP_MXFP8_TRACE_BY_ROUTING_TYPE
+            if mxfp8
+            else _STEP_DSFP8_TRACE_BY_ROUTING_TYPE
+        )
+        return step_traces.get(routing_method_type)
     if (
         routing_method_type == 2
         and int(kwargs.get("num_fused_shared_experts") or 0) > 0
@@ -3858,7 +3872,7 @@ trtllm_fp4_block_scale_routed_moe_trace = TraceTemplate(
 
 # StepFun siblings preserve the existing activation's definition filenames.
 def _make_step_moe_trace(
-    base: TraceTemplate, *, mxfp8: bool = False, bf16: bool = False
+    base: TraceTemplate, *, mxfp8: bool = False, bf16: bool = False, dsfp8: bool = False
 ) -> TraceTemplate:
     axes = dict(base.axes)
     axes["activation_type"] = Const(abbrev="act", value=7)
@@ -3911,12 +3925,23 @@ def _make_step_moe_trace(
             optional=True,
             description="Per-expert physical StepFun limit; None uses 7.",
         )
+    if dsfp8:
+        # DeepSeekFp8 keeps the base 128x128 block scales and applies the limit in its separate
+        # activation kernel, in physical units. The suffix keeps the names apart from the MXFP8
+        # siblings built from the same bases.
+        rows = "num_weight_rows" if "num_weight_rows" in axes else "num_local_experts"
+        inputs["gemm1_clamp_limit"] = Tensor(
+            [rows],
+            dtype="float32",
+            optional=True,
+            description="Per-expert physical StepFun limit; None uses 7.",
+        )
     return TraceTemplate(
         op_type=base.op_type,
         axes=axes,
         inputs=inputs,
         outputs=dict(base.outputs),
-        name_prefix=f"{base.name_prefix}_swiglu_step",
+        name_prefix=f"{base.name_prefix}_swiglu_step" + ("_dsfp8" if dsfp8 else ""),
         reference=base.reference,
         check=base.check,
         constraints=list(base.constraints),
@@ -3960,10 +3985,24 @@ trtllm_fp8_per_tensor_scale_routed_moe_trace_dispatch = _make_step_moe_trace_dis
 trtllm_fp8_block_scale_routed_moe_step_trace = _make_step_moe_trace(
     trtllm_fp8_block_scale_routed_moe_trace, mxfp8=True
 )
-trtllm_fp8_block_scale_routed_moe_trace_dispatch = _make_step_moe_trace_dispatch(
+trtllm_fp8_block_scale_routed_moe_dsfp8_step_trace = _make_step_moe_trace(
+    trtllm_fp8_block_scale_routed_moe_trace, dsfp8=True
+)
+
+
+def trtllm_fp8_block_scale_routed_moe_trace_dispatch(**kwargs):
+    if int(kwargs.get("activation_type", 3)) != 7:
+        return trtllm_fp8_block_scale_routed_moe_trace
+    if int(kwargs.get("fp8_quantization_type", 1)) == 2:
+        return trtllm_fp8_block_scale_routed_moe_step_trace
+    return trtllm_fp8_block_scale_routed_moe_dsfp8_step_trace
+
+
+trtllm_fp8_block_scale_routed_moe_trace_dispatch.templates = [  # type: ignore[attr-defined]
     trtllm_fp8_block_scale_routed_moe_trace,
     trtllm_fp8_block_scale_routed_moe_step_trace,
-)
+    trtllm_fp8_block_scale_routed_moe_dsfp8_step_trace,
+]
 _STEP_MXFP8_TRACE_BY_ROUTING_TYPE = {
     routing: _make_step_moe_trace(base, mxfp8=True)
     for routing, base in _MOE_TRACE_BY_ROUTING_TYPE.items()
@@ -3971,9 +4010,18 @@ _STEP_MXFP8_TRACE_BY_ROUTING_TYPE = {
 trtllm_mxfp8_step_shared_experts_trace = _make_step_moe_trace(
     trtllm_fp8_block_scale_moe_ds_shared_experts_trace, mxfp8=True
 )
+_STEP_DSFP8_TRACE_BY_ROUTING_TYPE = {
+    routing: _make_step_moe_trace(base, dsfp8=True)
+    for routing, base in _MOE_TRACE_BY_ROUTING_TYPE.items()
+}
+trtllm_dsfp8_step_shared_experts_trace = _make_step_moe_trace(
+    trtllm_fp8_block_scale_moe_ds_shared_experts_trace, dsfp8=True
+)
 trtllm_fp8_block_scale_moe_trace_dispatch.templates += [  # type: ignore[attr-defined]
     *_STEP_MXFP8_TRACE_BY_ROUTING_TYPE.values(),
     trtllm_mxfp8_step_shared_experts_trace,
+    *_STEP_DSFP8_TRACE_BY_ROUTING_TYPE.values(),
+    trtllm_dsfp8_step_shared_experts_trace,
 ]
 
 for _fp8_reference in (

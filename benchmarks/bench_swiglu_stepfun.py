@@ -9,7 +9,8 @@ The default shape is H=4096, I=1536, E=64, top-k=8, with 8/64/512/2048
 tokens. Each precision uses identical native weights and prepared activations
 for OA (alpha=1.702, beta=1, limit=7) and Step limits 7 and 16. Preparation,
 quantization and independent tactic tuning precede timing. Timed GPU work
-includes precomputed routing, fused FC1 activation, FC2 and finalization.
+includes precomputed routing, FC1 and its activation (fused, or the separate
+activation kernel for dsfp8), FC2 and finalization.
 
 Alternating measurement order reduces drift. CUPTI reports the elapsed span
 from the first GPU activity to the last activity in one CUDA graph replay,
@@ -89,6 +90,9 @@ from flashinfer.testing.utils import bench_gpu_time
 MODES = {
     "bf16": (TrtllmBf16Config, TrtllmBf16RoutedRunner, QuantFormat.BF16),
     "mxfp8": (TrtllmFp8BlockConfig, TrtllmFp8BlockRunner, QuantFormat.MXFP8),
+    # DeepSeek FP8 (128x128 block scales) has no fused FC1 activation; both arms
+    # run the separate activation kernel.
+    "dsfp8": (TrtllmFp8BlockConfig, TrtllmFp8BlockRunner, QuantFormat.DeepSeekFp8),
     "nvfp4": (TrtllmFp4Config, TrtllmFp4RoutedRunner, QuantFormat.NVFP4),
     "fp8": (
         TrtllmFp8PerTensorConfig,
@@ -96,10 +100,12 @@ MODES = {
         QuantFormat.FP8PerTensor,
     ),
 }
-# The per-tensor FP8 mode is opt-in; the default precision set is unchanged.
+# The per-tensor and DeepSeek FP8 modes are opt-in; the default precision set is
+# unchanged.
 DEFAULT_PRECISIONS = ("bf16", "mxfp8", "nvfp4")
 # Alternative backends measured next to the native trtllm-gen kernels on the
-# same weights, activations and autotune policy. Cake serves every precision.
+# same weights, activations and autotune policy. Cake serves every precision
+# except dsfp8.
 BACKENDS = {
     "trtllm": None,
     "cake": (CakeStepFunConfig, CakeStepFunRunner),
@@ -137,7 +143,7 @@ def parse_args():
         nargs="+",
         choices=tuple(BACKENDS),
         default=["trtllm"],
-        help="FC1 backends measured on the same inputs (the cake arm serves every precision).",
+        help="FC1 backends measured on the same inputs (the cake arm serves every precision except dsfp8).",
     )
     parser.add_argument(
         "--full-path",
@@ -520,7 +526,7 @@ def main():
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
         "nvidia_smi": command_output("nvidia-smi"),
         "nvcc": command_output("nvcc", "--version"),
-        "timing_scope": "native unified runner forward: routing, fused FC1 activation, FC2, finalize; preparation and input quantization excluded",
+        "timing_scope": "native unified runner forward: routing, FC1 + activation (fused, or a separate kernel for dsfp8), FC2, finalize; preparation and input quantization excluded",
         "routing": "uniform round-robin expert ids; normalized FP32 weights; UnpackedPrecomputed; RoutingMethodType.Renormalize on both arms",
         "cold_l2_cache": args.cache_policy == "cold",
         "autotune": "independent per activation, precision, backend, token count",
@@ -670,7 +676,8 @@ def main():
                 # Alternative backends share the view, activations and tuning policy;
                 # each is paired with the native kernel on the same activation.
                 for arm in arms:
-                    if arm == "trtllm":
+                    # Cake StepFun has no DeepSeek FP8 (128x128 block) path.
+                    if arm == "trtllm" or (arm == "cake" and precision == "dsfp8"):
                         continue
                     arm_backend, arm_runner_cls = BACKENDS[arm]
                     candidates.update(

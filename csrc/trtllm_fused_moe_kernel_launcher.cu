@@ -1023,15 +1023,19 @@ inline void validateStepGemm1ActivationParams(Optional<TensorView> const& gemm1_
 // MxFp8 applies these in the fused FC1 epilogue of the trtllm-gen cubins; DeepSeekFp8 has no
 // fused activation and applies them in the separate activation kernel
 // (moe::dev::activation::run). Both consume the values as-is: FP8 block scaling carries no
-// scalar dequant factor, so no host-side rescaling of the limit is needed.
+// scalar dequant factor, so no host-side rescaling of the limit is needed. The same holds for
+// the SwigluStep limit.
 inline void validateFp8BlockScaleGemm1ActivationParams(
     Optional<TensorView> const& gemm1_alpha, Optional<TensorView> const& gemm1_beta,
     Optional<TensorView> const& gemm1_clamp_limit, Fp8QuantizationType quantization_type,
     ActivationType activation_type) {
   validateStepGemm1ActivationParams(gemm1_alpha, gemm1_beta, activation_type);
   TVM_FFI_ICHECK(activation_type != ActivationType::SwigluStep ||
-                 quantization_type == Fp8QuantizationType::MxFp8)
-      << "SwigluStep requires the fused MxFp8 GEMM1 epilogue.";
+                 quantization_type == Fp8QuantizationType::MxFp8 ||
+                 quantization_type == Fp8QuantizationType::DeepSeekFp8)
+      << "SwigluStep requires Fp8QuantizationType::MxFp8 or Fp8QuantizationType::DeepSeekFp8 "
+         "in FP8 block scale MoE, got "
+      << fp8QuantizationTypeToString(quantization_type) << ".";
   if (!hasOptionalGemm1ActivationParams(gemm1_alpha, gemm1_beta, gemm1_clamp_limit)) {
     return;
   }
@@ -1042,11 +1046,10 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
          "MoE, got "
       << fp8QuantizationTypeToString(quantization_type) << ".";
   TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu ||
-                 (activation_type == ActivationType::SwigluStep &&
-                  quantization_type == Fp8QuantizationType::MxFp8))
+                 activation_type == ActivationType::SwigluStep)
       << "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported for "
          "ActivationType::Swiglu, or gemm1_clamp_limit alone for "
-         "ActivationType::SwigluStep with MxFp8.";
+         "ActivationType::SwigluStep.";
 }
 
 std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& ascending_supported_tile_sizes,
@@ -1874,6 +1877,7 @@ void FusedMoeLauncher::init_common(
       << "the value of weight_layout is not recognized";
   this->weight_layout = static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout);
   this->activation_type = activation_type;
+  this->args->activation_type = activation_type;
   this->intermediate_size_factor = isGatedActivation(activation_type) ? 2 : 1;
   this->norm_topk_prob = norm_topk_prob;
   this->gemm1_bias_type = bias_type_enum;
@@ -3236,6 +3240,10 @@ void trtllm_moe_run_deepseek_fp8_activation(TensorView gemm1_output, TensorView 
       << "DeepSeek FP8 activation: total_num_padded_tokens must be int32.";
 
   auto const activation = validateAndCastActivationType(activation_type);
+  // No per-expert parameters reach this entry point, so it applies plain SwiGLU only.
+  TVM_FFI_ICHECK(activation == ActivationType::Swiglu)
+      << "DeepSeek FP8 activation: only ActivationType::Swiglu is supported, got "
+      << static_cast<int>(activation) << ".";
   moe::dev::activation::Data activationData;
   activationData.mDtypeElt = btg::Dtype::E4m3;
   activationData.mUsePdl = enable_pdl;
@@ -4517,9 +4525,13 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     workspace.gemm2_output_scale = nullptr;
     args->hidden_states_scale = static_cast<float*>(hidden_states_scale.data_ptr());
     args->gemm1_weights_scale = static_cast<float*>(gemm1_weights_scale.data_ptr());
-    args->gemm1_alpha = nullptr;
-    args->gemm1_beta = nullptr;
-    args->gemm1_clamp_limit = nullptr;
+    args->gemm1_alpha =
+        gemm1_alpha.has_value() ? static_cast<float*>(gemm1_alpha.value().data_ptr()) : nullptr;
+    args->gemm1_beta =
+        gemm1_beta.has_value() ? static_cast<float*>(gemm1_beta.value().data_ptr()) : nullptr;
+    args->gemm1_clamp_limit = gemm1_clamp_limit.has_value()
+                                  ? static_cast<float*>(gemm1_clamp_limit.value().data_ptr())
+                                  : nullptr;
     args->gemm2_weights_scale = static_cast<float*>(gemm2_weights_scale.data_ptr());
     // Launch the complete body after every dtype-specific scale pointer is bound.
     cudaStream_t stream = get_stream(hidden_states.device());
@@ -4657,9 +4669,10 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
       if (quantization_type == Fp8QuantizationType::DeepSeekFp8 && dtype_act == btg::Dtype::E4m3 &&
           dtype_weights == btg::Dtype::E4m3 &&
           gemm1_bias_type == batchedGemm::gemm::BiasType::None) {
-        TVM_FFI_ICHECK(static_cast<int>(activation_type) ==
-                       static_cast<int>(ActivationType::Swiglu))
-            << "DeepSeekFp8 only supports ActivationType::Swiglu, got "
+        TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu ||
+                       activation_type == ActivationType::SwigluStep)
+            << "DeepSeekFp8 only supports ActivationType::Swiglu and ActivationType::SwigluStep, "
+               "got "
             << static_cast<int>(activation_type) << ".";
         moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
             dtype_weights, true /* useDeepSeekFp8 */, tile_N, use_shuffled_weight,
@@ -5849,13 +5862,14 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   auto activation_type = validateAndCastActivationType(act_type);
   validateFp8BlockScaleGemm1ActivationParams(gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
                                              quantization_type, activation_type);
-  // DeepSeekFp8 currently uses a TRTLLM runner that hardwires Swiglu activation semantics.
-  // Fail for any other activation to avoid silently running incorrect activation behavior.
+  // DeepSeekFp8 runs FC1 without a fused activation; the separate activation kernel implements
+  // Swiglu and SwigluStep only. Fail for any other activation to avoid silently running
+  // incorrect activation behavior.
   if (quantization_type == Fp8QuantizationType::DeepSeekFp8 &&
-      activation_type != ActivationType::Swiglu) {
+      activation_type != ActivationType::Swiglu && activation_type != ActivationType::SwigluStep) {
     TVM_FFI_LOG_AND_THROW(NotImplementedError)
-        << "DeepSeekFp8 only supports ActivationType::Swiglu in this runner path. "
-        << "Received activation_type=" << static_cast<int>(activation_type);
+        << "DeepSeekFp8 only supports ActivationType::Swiglu and ActivationType::SwigluStep in "
+        << "this runner path. Received activation_type=" << static_cast<int>(activation_type);
   }
 
   // Basic type validation
@@ -6380,10 +6394,11 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
 
   } else if (fp8_quantization_type == Fp8QuantizationType::DeepSeekFp8 &&
              dtype_act == btg::Dtype::E4m3 && dtype_weights == btg::Dtype::E4m3) {
-    if (activation_type != ActivationType::Swiglu) {
+    if (activation_type != ActivationType::Swiglu &&
+        activation_type != ActivationType::SwigluStep) {
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
-          << "DeepSeekFp8 only supports ActivationType::Swiglu, " << "got act_type=" << act_type
-          << ".";
+          << "DeepSeekFp8 only supports ActivationType::Swiglu and ActivationType::SwigluStep, "
+          << "got act_type=" << act_type << ".";
     }
     // FP8 block scale (DeepSeek)
     return Fp8BlockScaleLauncher::getValidConfigs(
