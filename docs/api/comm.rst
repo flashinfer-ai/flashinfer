@@ -716,6 +716,12 @@ verified all-pairs NVLink P2P and owns the IPC workspace lifecycle.
 MNNVL (Multi-Node NVLink)
 -------------------------
 
+``MnnvlMemory`` and ``SymmDeviceMemory`` allocate the symmetric memory behind
+the NVLink collectives. The `symmetric memory design notes
+<https://github.com/flashinfer-ai/flashinfer/blob/main/docs/design_docs/symmetric_memory.md>`_
+describe how each lays out its memory and how the ranks choose between FABRIC
+handles and POSIX file descriptors to share it.
+
 .. currentmodule:: flashinfer.comm.mnnvl
 
 Core Classes
