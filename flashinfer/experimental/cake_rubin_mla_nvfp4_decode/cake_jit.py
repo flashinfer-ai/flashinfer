@@ -451,6 +451,8 @@ def select_record(stage: str, *, rows: int, n_full: int, items: int) -> str:
     ``always`` is the rule of a single-program stage.  Exactly one record
     admits every problem, or the registry is inconsistent.
     """
+    if stage in ("merge", "quantize") and int(rows) < 1:
+        raise ValueError(f"stage {stage!r}: rows must be at least 1, got {rows}")
     admitted = [
         name
         for name in records_of_stage(stage)

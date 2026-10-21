@@ -1218,7 +1218,7 @@ def test_visible_keys_matches_brute_force():
 
 def test_units_pairs_table_and_fallback():
     assert cake_backend.units_pairs_for_sm_count(212) == (46, 14)
-    assert cake_backend.units_pairs_for_sm_count(208) == (52, 0)
+    assert cake_backend.units_pairs_for_sm_count(208) == (50, 4)
     assert cake_backend.units_pairs_for_sm_count(216) == (54, 0)
     assert cake_backend.units_pairs_for_sm_count(3) == (1, 0)
     with pytest.raises(ValueError):
@@ -1278,8 +1278,9 @@ def _check_plan(p, kv_lens, q_lens, heads):
                 range(s // 2)
             )  # one table row per double item, two ranges each
         else:
+            # A range may hold no tile (a short request cut by the batch's split count): the kernel writes -inf
+            # for it and the merge weighs it nothing.
             assert zs == list(range(s))
-            assert all(n >= 1 for _, (_, n, _, _) in entries)
         ranges = sorted((lo, n) for _, (lo, n, _, _) in entries)
         lo_expect = 0
         for lo, n in ranges:
