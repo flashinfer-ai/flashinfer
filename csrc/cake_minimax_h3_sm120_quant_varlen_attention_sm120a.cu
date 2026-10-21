@@ -1289,6 +1289,7 @@ kernel_minimax_h3_sm120_varlen_attention_fp8(const __grid_constant__ CUtensorMap
                 : "+f"(s_acc[60]), "+f"(s_acc[(60) + 1]), "+f"(s_acc[(60) + 2]), "+f"(s_acc[(60) + 3])
                 : "r"(q_frags[12]), "r"(q_frags[(12) + 1]), "r"(q_frags[(12) + 2]), "r"(q_frags[(12) + 3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
             asm volatile("barrier.arrive %0, 256;" :: "r"(2 - warp / 4) : "memory");
+            __syncwarp();
             if (elect_sync()) {
                 mbarrier_arrive(k_empty_addr + (kv_stage) * 8);
             }
@@ -2329,6 +2330,7 @@ kernel_minimax_h3_sm120_varlen_attention_fp8(const __grid_constant__ CUtensorMap
                 : "+f"(o_acc[60]), "+f"(o_acc[(60) + 1]), "+f"(o_acc[(60) + 2]), "+f"(o_acc[(60) + 3])
                 : "r"(p_frag[12]), "r"(p_frag[(12) + 1]), "r"(p_frag[(12) + 2]), "r"(p_frag[(12) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
             asm volatile("barrier.arrive %0, 256;" :: "r"(2 - warp / 4) : "memory");
+            __syncwarp();
             if (elect_sync()) {
                 mbarrier_arrive(v_empty_addr + (kv_stage) * 8);
             }

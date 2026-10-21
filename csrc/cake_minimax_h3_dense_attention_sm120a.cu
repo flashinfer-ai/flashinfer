@@ -1064,6 +1064,7 @@ kernel_minimax_h3_dense_attention(const __grid_constant__ CUtensorMap Q_map, con
                 : "+f"(qk_acc[28]), "+f"(qk_acc[(28) + 1]), "+f"(qk_acc[(28) + 2]), "+f"(qk_acc[(28) + 3])
                 : "r"(q_frags[28]), "r"(q_frags[(28) + 1]), "r"(q_frags[(28) + 2]), "r"(q_frags[(28) + 3]), "r"(k_frag[2]), "r"(k_frag[(2) + 1]));
             asm volatile("barrier.arrive %0, 256;" :: "r"(2 - warp / 4) : "memory");
+            __syncwarp();
             if (elect_sync()) {
                 mbarrier_arrive(k_empty_addr + (kv_stage) * 8);
             }
@@ -1899,6 +1900,7 @@ kernel_minimax_h3_dense_attention(const __grid_constant__ CUtensorMap Q_map, con
                 : "+f"(out_acc[60]), "+f"(out_acc[(60) + 1]), "+f"(out_acc[(60) + 2]), "+f"(out_acc[(60) + 3])
                 : "r"(p_frag[12]), "r"(p_frag[(12) + 1]), "r"(p_frag[(12) + 2]), "r"(p_frag[(12) + 3]), "r"(v_frag[2]), "r"(v_frag[(2) + 1]));
             asm volatile("barrier.arrive %0, 256;" :: "r"(2 - warp / 4) : "memory");
+            __syncwarp();
             if (elect_sync()) {
                 mbarrier_arrive(v_empty_addr + (kv_stage) * 8);
             }
