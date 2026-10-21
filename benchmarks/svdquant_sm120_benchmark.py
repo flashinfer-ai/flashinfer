@@ -13,7 +13,13 @@ import torch
 from typing_extensions import assert_never
 
 import flashinfer
-from flashinfer import SfLayout, mm_nvfp4_svdquant, nvfp4_quantize, svdquant_linear
+from flashinfer import (
+    SfLayout,
+    mm_nvfp4_svdquant,
+    nvfp4_quantize,
+    prepare_svdquant_l2t,
+    svdquant_linear,
+)
 from flashinfer.autotune_cache import MeasurementPolicy
 from flashinfer.autotuner import AutoTuner, _tactic_to_json
 
@@ -261,7 +267,9 @@ def make_call(
                 case.w_sf,
                 case.alpha,
                 case.pqs,
-                case.l2t,
+                # Prepared once, as a model loader does; graph replay then
+                # reuses the derived layouts instead of re-laying them out.
+                prepare_svdquant_l2t(case.l2t),
                 case.l1,
                 case.global_sf,
             )
