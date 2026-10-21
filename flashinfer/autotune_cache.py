@@ -95,6 +95,10 @@ class MeasurementPolicy:
         cold_l2: Force cold-/hot-L2 profiling; ``None`` (default)
             inherits each op's ``TuningConfig.use_cold_l2_cache``.
             Orthogonal to ``execution_mode``.
+        graph_timing: Hot-L2 graph measurement objective: ``"amortized"``
+            averages a repeated replay window; ``"individual"`` takes the
+            median of instrumented per-call intervals. ``None`` inherits the
+            op's setting. Cold-L2 profiling retains its isolated-call timer.
     """
 
     execution_mode: str = "auto"
@@ -105,8 +109,20 @@ class MeasurementPolicy:
     # implementations; explicit values are identity-bearing (manifest) so
     # diagnostic runs never overwrite default entries.
     _timer: str = "auto"
+    graph_timing: Optional[str] = None
 
     def __post_init__(self):
+        if self.graph_timing not in (None, "amortized", "individual"):
+            raise ValueError(
+                "MeasurementPolicy.graph_timing must be None, 'amortized', "
+                f"or 'individual', got {self.graph_timing!r}"
+            )
+        if self.graph_timing is not None and (
+            self.execution_mode == "eager" or self._timer == "cupti"
+        ):
+            raise ValueError(
+                "MeasurementPolicy.graph_timing cannot override eager or CUPTI timing"
+            )
         if self.execution_mode not in ("auto", "cuda_graph", "eager"):
             raise ValueError(
                 f"MeasurementPolicy.execution_mode must be 'cuda_graph', "
@@ -154,6 +170,8 @@ class MeasurementPolicy:
             fields["measure_cold_l2"] = str(self.cold_l2)
         if self._timer != "auto":
             fields["measure_timer"] = self._timer
+        if self.graph_timing is not None:
+            fields["measure_graph_timing"] = self.graph_timing
         return fields
 
 
