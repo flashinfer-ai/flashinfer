@@ -21,6 +21,10 @@ SPLIT_BARRIER_WORDS = 2 * (MAX_TOKENS // 64) * 16
 # Registry written by the exporter: one record per delivered source, and the
 # schedule keys (hidden, split count, shifted, shared scale layout) each source
 # serves with its compile-line defines.
+# The second source of every record is the one shared host binding
+# (cake_mega_mhc_134570ae7cc112e9d84e_binding.cu): the exported bindings differed only in the
+# kernel symbol they launch and their host-shim namespace id, so load_program passes
+# the record's kernel_symbol as the CAKE_PROGRAM_KERNEL compile definition.
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_134570ae7cc112e9d84e": {
         "sources": [
@@ -37,7 +41,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_1576b7789968f04c8419": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_1576b7789968f04c8419_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_1576b7789968f04c8419_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_1576b7789968f04c8419",
         "hidden": 5120,
@@ -49,7 +53,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_2b99261aab173a941cb4": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_2b99261aab173a941cb4_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_2b99261aab173a941cb4_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_2b99261aab173a941cb4",
         "hidden": 5120,
@@ -61,7 +65,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_407321791585dc9fc44b": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_407321791585dc9fc44b_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_407321791585dc9fc44b_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_407321791585dc9fc44b",
         "hidden": 5120,
@@ -73,7 +77,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_41df2a8c4d3c4849adbf": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_41df2a8c4d3c4849adbf_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_41df2a8c4d3c4849adbf_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_41df2a8c4d3c4849adbf",
         "hidden": 5120,
@@ -85,7 +89,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_43b829c4b071416a4595": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_43b829c4b071416a4595_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_43b829c4b071416a4595_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_43b829c4b071416a4595",
         "hidden": 5120,
@@ -97,7 +101,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_8fd99969edc5072d3477": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_8fd99969edc5072d3477_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_8fd99969edc5072d3477_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_8fd99969edc5072d3477",
         "hidden": 5120,
@@ -109,7 +113,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_a5521c9dfaf81d2c0f1f": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_a5521c9dfaf81d2c0f1f_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_a5521c9dfaf81d2c0f1f_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_a5521c9dfaf81d2c0f1f",
         "hidden": 5120,
@@ -121,7 +125,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_b52ed5c3afc2fcbd2d0f": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b52ed5c3afc2fcbd2d0f_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b52ed5c3afc2fcbd2d0f_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_b52ed5c3afc2fcbd2d0f",
         "hidden": 5120,
@@ -133,7 +137,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_b73ed09be74eaa063166": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b73ed09be74eaa063166_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b73ed09be74eaa063166_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_b73ed09be74eaa063166",
         "hidden": 5120,
@@ -145,7 +149,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_b8c6c9ebebc80eb063b8": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b8c6c9ebebc80eb063b8_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_b8c6c9ebebc80eb063b8_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_b8c6c9ebebc80eb063b8",
         "hidden": 5120,
@@ -157,7 +161,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_c7892aa3a7b985dcac4a": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_c7892aa3a7b985dcac4a_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_c7892aa3a7b985dcac4a_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_c7892aa3a7b985dcac4a",
         "hidden": 5120,
@@ -169,7 +173,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_dc85bbfab3b20cf209fc": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_dc85bbfab3b20cf209fc_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_dc85bbfab3b20cf209fc_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_dc85bbfab3b20cf209fc",
         "hidden": 5120,
@@ -181,7 +185,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_mega_mhc_f7107723c112a3b117a9": {
         "sources": [
             "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_f7107723c112a3b117a9_kernel.cu",
-            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_f7107723c112a3b117a9_binding.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_134570ae7cc112e9d84e_binding.cu",
         ],
         "kernel_symbol": "kernel_cake_mega_mhc_f7107723c112a3b117a9",
         "hidden": 5120,
@@ -450,7 +454,8 @@ def select_program(hidden, splits, shifted, shared_sf):
 
 @functools.cache
 def load_program(name, arch, num_sms, defines):
-    """Build ``name`` for ``arch`` with the route's defines and ``NUM_SMS`` on the compile line."""
+    """Build ``name`` for ``arch`` with the route's defines, ``NUM_SMS`` and the program's
+    kernel symbol (``CAKE_PROGRAM_KERNEL``, read by the shared binding) on the compile line."""
     from flashinfer.jit import env
     from flashinfer.jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
@@ -468,6 +473,7 @@ def load_program(name, arch, num_sms, defines):
             *arch_flags,
             *COMPILE_FLAGS,
             *(f"-D{key}={value}" for key, value in values),
+            f"-DCAKE_PROGRAM_KERNEL={PROGRAMS[name]['kernel_symbol']}",
             "--device-entity-has-hidden-visibility=false",
         ],
         extra_ldflags=["-lcuda"],
