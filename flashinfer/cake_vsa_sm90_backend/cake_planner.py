@@ -53,13 +53,20 @@ TILE_FIXED_LOAD = 1.0
 SPLIT_MERGE_LOAD = 1.0
 LOAD_COST = 1.0
 # By-value first-tile header of the persistent kernel: per CTA ``[head, qb0,
-# qb1, mode, n_hdr, (blk_a, blk_b) x HDR_POS, pad]`` (int16) so the first Q
+# qb1, mode, n_hdr, (blk_a, blk_b) x HDR_POS, kv_hint]`` (int16) so the first Q
 # and ring positions are issued at CTA start, ahead of the plan row's load.
 HDR_POS = 3  # header slots (fixed kernel layout)
 HDR_ISSUE = 2  # positions the planner puts in the header (two measured best; three hurt the k12 row)
 HDR_WORDS = 12
 HDR_CTAS = 144
 HDR_HALFWORDS = HDR_CTAS * HDR_WORDS
+# Halfword HDR_KV_HINT = the launch's K / V^T L2 policy, 1 = evict_first when
+# the plan re-reads little (streamed block loads <= KV_HINT_REUSE_NUM /
+# KV_HINT_REUSE_DEN = 1.25 x the distinct (head, block) pairs it touches), else
+# 0 = evict_last.
+HDR_KV_HINT = 11
+KV_HINT_REUSE_NUM = 5
+KV_HINT_REUSE_DEN = 4
 # Ragged plans list-schedule costlier tiles first over all heads (LPT) when
 # every head's K and V fit this many bytes of L2; larger working sets keep the
 # head-major order so the CTAs running concurrently share one head's blocks.
@@ -104,6 +111,14 @@ POOL_SMALL_MIN_TILES = (
 # (static 1.0131 vs queue 1.0028 against the previous Cake, same process); 16-position
 # tiles at 7-8 per CTA -0.8 %, 8-position tiles at 4 per CTA -0.5 %.
 POOL_SMALL_TILE_POS = 1
+# Compact static program (``attention_compact``): the static kernel without the two
+# code-shape levers of its epilogue / first PV step, selected for uniform pair plans of
+# short tiles with many tiles per CTA.  h16-m8192-k5 (1024 pair tiles of <= 6 positions,
+# 7..8 per CTA) measured 0.967..0.970 x the previous Cake with the levers (9 x 256, two
+# processes) and 1.002..1.005 x without them; the queue program is -1.0 % there.  Every
+# other measured shape keeps the lever form.
+COMPACT_MAX_TILE_POS = 6
+COMPACT_MIN_TILES = 4
 # Tile ORDER of static UNIFORM plans before the
 # list schedule.  The queue kernel balances its pooled tiles at run time and ragged plans
 # are already list-scheduled costliest first, so both keep the legacy order; the mode and
@@ -1223,6 +1238,14 @@ def plan_vsa_sm90(
             and min_tiles >= POOL_SMALL_MIN_TILES
             and max(lens) <= POOL_SMALL_TILE_POS
         )
+    # Compact static program (COMPACT_MAX_TILE_POS / COMPACT_MIN_TILES).
+    compact = bool(
+        not queue
+        and not ragged
+        and mode == "pair"
+        and max(lens) <= COMPACT_MAX_TILE_POS
+        and min_tiles >= COMPACT_MIN_TILES
+    )
     if not queue and (
         max(len(lst) for lst in lists) <= RAGGED_LPT_MAX_TILES
         if ragged
@@ -1266,6 +1289,7 @@ def plan_vsa_sm90(
     # per CTA (a fetch past the pool stages a slot whose word META_NTILES is 0).
     n_rows = g * stride + len(pool) + (g if queue else 0)
     hdr = torch.zeros((HDR_HALFWORDS,), dtype=torch.int16)
+    kv_hint = kv_l2_hint(mask, seqs)
     for c, st in enumerate(static):
         t = st[0]
         n_hdr = min(HDR_ISSUE, lens[t])
@@ -1275,6 +1299,7 @@ def plan_vsa_sm90(
         hdr[c * HDR_WORDS + 5 : c * HDR_WORDS + 5 + 2 * n_hdr] = torch.tensor(
             seqs[t][: 2 * n_hdr], dtype=torch.int16
         )
+        hdr[c * HDR_WORDS + HDR_KV_HINT] = kv_hint
     # Plan rows laid out per CTA: row c * stride + i is CTA c's i-th (static)
     # tile; the first row of each CTA also carries its (static) tile count
     # (word META_NTILES).  Queue layout: the other static rows and the pool
@@ -1310,6 +1335,7 @@ def plan_vsa_sm90(
         "hdr": hdr,
         "tile_stride": stride,
         "queue": queue,
+        "compact": compact,
         "pool": pool,
         "num_rows": n_rows,
         "mode": mode,
@@ -1317,7 +1343,22 @@ def plan_vsa_sm90(
         "num_ctas": g,
         "num_tiles": len(infos),
         "tile_lists": lists,
+        "kv_hint": kv_hint,
         "H": h,
         "MB": mb,
         "NB": nb,
     }
+
+
+def kv_l2_hint(mask: torch.Tensor, seqs: Sequence[Sequence[int]]) -> int:
+    """The launch's K / V^T L2 policy word (header halfword ``HDR_KV_HINT``):
+    1 (evict_first) when the plan streams at most 1.25 x as many block loads as
+    the distinct (head, block) pairs it touches, 0 (evict_last) otherwise.
+
+    ``streamed`` counts the ring block loads of every tile (a pair tile loads a
+    shared block once); ``touched`` the (head, block) pairs any query block
+    selects.
+    """
+    streamed = sum(1 for seq in seqs for blk in seq if blk >= 0)
+    touched = int(mask.any(dim=1).sum())
+    return int(KV_HINT_REUSE_DEN * streamed <= KV_HINT_REUSE_NUM * touched)
