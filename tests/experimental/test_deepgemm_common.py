@@ -15,6 +15,9 @@ from flashinfer.experimental.deepgemm_common import (
 
 _EXPERIMENTAL = Path(__file__).resolve().parents[2] / "flashinfer" / "experimental"
 _FAMILIES = ("deepgemm_", "mega_moe_v3")
+# Families that ship their own architecture table instead of the shared loader's
+# ARCHES; their catalogs are checked against that table.
+_FAMILY_ARCHES = {"deepgemm_sm120_paged_mqa_logits": {"sm_120a"}}
 
 
 def _per_arch_catalog():
@@ -281,7 +284,8 @@ def _tree_catalogs():
 @pytest.mark.parametrize("path", _tree_catalogs(), ids=lambda p: p.parent.name)
 def test_every_family_catalog_in_the_tree_loads(path):
     catalog = Catalog(json.loads(path.read_text()), label=path.parent.name, path=path)
-    assert set(catalog.arches) <= set(ARCHES.values())
+    known = _FAMILY_ARCHES.get(path.parent.name, set(ARCHES.values()))
+    assert set(catalog.arches) <= known
     for arch in catalog.arches:
         programs = catalog.programs(arch)
         assert programs, f"{path.parent.name} has no {arch} programs"
