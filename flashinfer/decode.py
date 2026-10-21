@@ -5005,7 +5005,8 @@ def fast_decode_plan(
             if tensor.device != self.device:
                 raise ValueError(
                     f"{name} must be on the wrapper's device {self.device}, got "
-                    f"{tensor.device}; use plan() for host metadata"
+                    f"{tensor.device}; plan host metadata with "
+                    "BatchDecodeWithPagedKVCacheWrapper.plan(wrapper, ...)"
                 )
     is_causal = q_len_per_req > 1
     self._q_len_per_req = q_len_per_req
