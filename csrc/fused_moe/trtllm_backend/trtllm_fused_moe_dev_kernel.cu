@@ -56,6 +56,14 @@ inline __device__ float silu(float x) { return x / (1.0f + expf(-x)); }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+inline __device__ float tanhAccurate(float x) {
+  // Match the generated SiTU epilogue's expf-based tanh instead of tanh.approx.f32, whose error is
+  // amplified by the SiTU scale (25 for the canonical linear branch).
+  return 2.0f / (1.0f + expf(-2.0f * x)) - 1.0f;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Gated SwiGLU with the optional OAI controls, matching the fused FC1 epilogue of the trtllm-gen
 // cubins:
 //   xGlu    = clamp(xGlu, max=limit)
@@ -94,6 +102,48 @@ inline __device__ float gatedSilu(KernelParams const& params, int32_t permutedId
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// SiTU-GLU v2, matching the generated trtllm-gen epilogue and its per-expert parameter ABI:
+//   out = (alpha * tanh(xGlu / alpha) * sigmoid(xGlu))
+//         * (beta * tanh(xLinear / beta))
+// Optional clamp semantics match the other gated epilogues. With null parameter pointers the
+// low-level API intentionally uses alpha=1 and beta=1; the typed unified API materializes its
+// canonical alpha=4 and beta=25 defaults explicitly.
+template <typename KernelParams>
+inline __device__ float gatedSitu(KernelParams const& params, int32_t permutedIdx, float xLinear,
+                                  float xGlu) {
+  bool const hasPerExpertParams = params.gatedActAlphaPtr != nullptr ||
+                                  params.gatedActBetaPtr != nullptr ||
+                                  params.gatedActClampLimitPtr != nullptr;
+  int32_t localExpertIdx = 0;
+  if (hasPerExpertParams) {
+    localExpertIdx = params.ctaIdxXyToBatchIdx[permutedIdx / params.tileTokensDim];
+  }
+
+  if (params.gatedActClampLimitPtr != nullptr) {
+    float const limit = params.gatedActClampLimitPtr[localExpertIdx];
+    xGlu = fminf(xGlu, limit);
+    xLinear = fmaxf(fminf(xLinear, limit), -limit);
+  }
+  float const alpha =
+      params.gatedActAlphaPtr != nullptr ? params.gatedActAlphaPtr[localExpertIdx] : 1.0f;
+  float const beta =
+      params.gatedActBetaPtr != nullptr ? params.gatedActBetaPtr[localExpertIdx] : 1.0f;
+  float const gate = alpha * tanhAccurate(xGlu / alpha) / (1.0f + expf(-xGlu));
+  float const linear = beta * tanhAccurate(xLinear / beta);
+  return gate * linear;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename KernelParams>
+inline __device__ float gatedActivation(KernelParams const& params, int32_t permutedIdx,
+                                        float xLinear, float xGlu) {
+  return params.useSitu ? gatedSitu(params, permutedIdx, xLinear, xGlu)
+                        : gatedSilu(params, permutedIdx, xLinear, xGlu);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <typename KernelParams>
 __global__ void activationKernel(KernelParams params) {
   using Type = typename KernelParams::Type;
@@ -122,7 +172,7 @@ __global__ void activationKernel(KernelParams params) {
         float x1 = (float)params.inPtr[baseIdx];
         float x2 = (float)params.inPtr[baseIdx + params.innerDim / 2];
 
-        Type out = (Type)gatedSilu(params, permutedIdx, x1, x2);
+        Type out = (Type)gatedActivation(params, permutedIdx, x1, x2);
 
         int64_t const outIdx = (int64_t)permutedIdx * (params.innerDim / 2) + hiddenIdx;
         params.outPtr[outIdx] = out;
@@ -322,7 +372,7 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
           // Padding lanes keep permutedIdx == -1 and contribute a zeroed x1/x2, so skip the
           // per-expert lookup for them instead of indexing ctaIdxXyToBatchIdx out of range.
           int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
-          float out = permutedIdx == -1 ? silu(x2) * x1 : gatedSilu(params, permutedIdx, x1, x2);
+          float out = permutedIdx == -1 ? 0.0f : gatedActivation(params, permutedIdx, x1, x2);
           outArr[tokenInCtaIdx] = out;
           absOutArr[tokenInCtaIdx] = fabsf(out);
         }

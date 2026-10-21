@@ -1451,12 +1451,13 @@ class TestMoERunnerSupport:
             ReLU2,
         )
         assert TrtllmFp8BlockRunner.supported_activation_classes_by_quant == {
-            (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU,),
+            (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU, SiTU),
             (QuantFormat.MXFP8, QuantFormat.MXFP8): (
                 SwiGLU,
                 SwiGLUStep,
                 GeGLU,
                 ReLU2,
+                SiTU,
             ),
         }
         assert TrtllmMxInt4RoutedRunner.supported_activation_classes == (SwiGLU,)
@@ -1693,6 +1694,18 @@ class TestMoERunnerSupport:
         # silently dropping the parameter.
         runner = TrtllmFp4RoutedRunner.__new__(TrtllmFp4RoutedRunner)
         runner.config = self._nvfp4_swiglu(activation=SiTU(linear_scale=None))
+        with pytest.raises(NotImplementedError, match="linear_scale=None"):
+            runner.check_support()
+
+    def test_trtllm_fp8_block_rejects_unclamped_situ_linear_branch(self):
+        runner = TrtllmFp8BlockRunner.__new__(TrtllmFp8BlockRunner)
+        runner.config = self._nvfp4_swiglu(
+            quant=QuantConfig(
+                weight=QuantFormat.DeepSeekFp8,
+                activation=QuantFormat.DeepSeekFp8,
+            ),
+            activation=SiTU(linear_scale=None),
+        )
         with pytest.raises(NotImplementedError, match="linear_scale=None"):
             runner.check_support()
 

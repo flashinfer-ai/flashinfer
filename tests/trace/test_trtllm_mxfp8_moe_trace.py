@@ -49,6 +49,7 @@ def _mxfp8_trace_kwargs():
         local_num_experts=num_local_experts,
         routed_scaling_factor=1.0,
         routing_method_type=0,
+        activation_type=3,
         gemm1_alpha=torch.ones(num_local_experts, dtype=torch.float32),
         gemm1_beta=torch.zeros(num_local_experts, dtype=torch.float32),
         gemm1_clamp_limit=torch.full((num_local_experts,), 2.0, dtype=torch.float32),
@@ -118,6 +119,8 @@ def test_mxfp8_moe_trace_schema_includes_swiglu_oa_params():
 
     for defn in trace_defs:
         assert defn["axes"]["num_local_experts"]["value"] == 2
+        assert defn["axes"]["activation_type"]["value"] == 3
+        assert defn["inputs"]["activation_type"]["dtype"] == "int32"
         for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"):
             assert defn["inputs"][name]["shape"] == ["num_local_experts"]
             assert defn["inputs"][name]["dtype"] == "float32"
@@ -173,11 +176,23 @@ def test_mxfp8_moe_trace_reference_applies_swiglu_oa_params():
         gemm1_beta=torch.ones((1,), dtype=torch.float32),
         gemm1_clamp_limit=clamp_limit,
     ).to(torch.float32)
+    situ_alpha = torch.full((1,), 4.0, dtype=torch.float32)
+    situ_beta = torch.full((1,), 25.0, dtype=torch.float32)
+    situ_out = trtllm_fp8_block_scale_moe_default_routing_trace.reference(
+        **default_inputs,
+        activation_type=10,
+        gemm1_alpha=situ_alpha,
+        gemm1_beta=situ_beta,
+        gemm1_clamp_limit=clamp_limit,
+    ).to(torch.float32)
 
     x1 = hidden_states_bf16[:, :1].to(torch.float32).clamp(min=-2.0, max=2.0)
     x2 = hidden_states_bf16[:, 1:2].to(torch.float32).clamp(max=2.0)
     expected_clamp_only = x2 * torch.sigmoid(x2) * x1
     expected_oa = x2 * torch.sigmoid(1.702 * x2) * (x1 + 1.0)
+    expected_situ = (
+        25.0 * torch.tanh(x1 / 25.0) * 4.0 * torch.tanh(x2 / 4.0) * torch.sigmoid(x2)
+    )
 
     torch.testing.assert_close(default_out, noop_out, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(
@@ -189,6 +204,12 @@ def test_mxfp8_moe_trace_reference_applies_swiglu_oa_params():
     torch.testing.assert_close(
         oa_out[:, :1],
         expected_oa.to(torch.bfloat16).to(torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        situ_out[:, :1],
+        expected_situ.to(torch.bfloat16).to(torch.float32),
         atol=1e-2,
         rtol=1e-2,
     )
