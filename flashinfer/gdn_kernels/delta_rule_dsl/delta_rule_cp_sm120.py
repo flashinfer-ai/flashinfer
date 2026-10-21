@@ -2514,7 +2514,7 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
         self.rows_per_cta = rows_per_cta
         self.row_ctas = self.DV // self.rows_per_cta
         self.threads_per_cta = self.DK
-        self.num_warps = 4
+        self.num_warps = self.threads_per_cta // 32
         self.min_blocks_per_mp = 2
         self.registers_per_thread = 256
         self.manual_cache_key(
@@ -2759,7 +2759,10 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
                 seq_idx + cutlass.Int32(1), seq_end, 0, chunk_len
             )
 
-        cute.arch.setmaxregister_increase(self.registers_per_thread)
+        # setmaxnreg must be executed by a whole warpgroup; at DK = 64 the CTA
+        # has two warps, so it keeps its launch-time register budget.
+        if cutlass.const_expr(self.threads_per_cta % 128 == 0):
+            cute.arch.setmaxregister_increase(self.registers_per_thread)
         state_layout = cute.make_layout(
             (self.rows_per_cta, self.DK), stride=(self.DK, 1)
         )

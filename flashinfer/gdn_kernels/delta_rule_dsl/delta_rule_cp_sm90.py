@@ -645,11 +645,11 @@ class CPDeltaRuleMNPrecomputeSm90(KeyedCompileMixin):
         self.cu_seqlens_dtype = cu_seqlens_dtype
         self.BLK = 64
         # Both math warpgroups split a 128-row tile, so the kernel always works
-        # at D=128.  Smaller heads are zero-padded by the K/V TMA loads (OOB
-        # fill): padded K/V rows keep the extra transfer/state rows and columns
-        # decoupled from the real block, and the stores keep only the real
-        # (DK, DK) transfer and (DV, DK) state.
-        # ponytail: pads to 128 rows; the M=64 path would halve state MMA work.
+        # at D=128 (an M=64 path would halve the state MMA work at DV=64).
+        # Smaller heads are zero-padded by the K/V TMA loads (OOB fill): padded
+        # K/V rows keep the extra transfer/state rows and columns decoupled
+        # from the real block, and the stores keep only the real (DK, DK)
+        # transfer and (DV, DK) state.
         self.D = 128
         self.DK = head_size
         self.DV = head_size_v if head_size_v is not None else head_size
@@ -1124,7 +1124,6 @@ class CPDeltaRuleMNPrecomputeSm90(KeyedCompileMixin):
         chunk_len: cutlass.Int32,
         num_blocks: cutlass.Int32,
         num_heads: cutlass.Int32,
-        num_chunks: cutlass.Int32,
         wg_idx: cutlass.Int32,
         tidx: cutlass.Int32,
     ):
@@ -1622,7 +1621,6 @@ class CPDeltaRuleMNPrecomputeSm90(KeyedCompileMixin):
                     valid_chunk_len,
                     num_blocks,
                     num_sab_heads,
-                    total_cp_chunks,
                     self.WarpGroupRole.MATH0,
                     math_tidx,
                 )
@@ -1655,7 +1653,6 @@ class CPDeltaRuleMNPrecomputeSm90(KeyedCompileMixin):
                     valid_chunk_len,
                     num_blocks,
                     num_sab_heads,
-                    total_cp_chunks,
                     self.WarpGroupRole.MATH1,
                     math_tidx,
                 )
@@ -1687,7 +1684,8 @@ def cp_delta_rule_mn_precompute_dsl_sm90(
 ):
     """Run the SM90 CP preprocess kernel and return its native output layout.
 
-    Flat varlen input returns transfer/state workspaces with shape
+    Flat varlen input returns a transfer workspace of shape
+    `(total_cp_chunks, num_heads, DimK, DimK)` and a state workspace of shape
     `(total_cp_chunks, num_heads, DimV, DimK)`, where
     `total_cp_chunks = chunk_bound(num_seqs, total_seqlen, cp_chunk_len)`.
 
@@ -2440,7 +2438,7 @@ class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
         self.rows_per_cta = rows_per_cta
         self.row_ctas = self.DV // self.rows_per_cta
         self.threads_per_cta = self.DK
-        self.num_warps = 4
+        self.num_warps = self.threads_per_cta // 32
         self.min_blocks_per_mp = 2
         self.registers_per_thread = 256
         self.manual_cache_key(
@@ -2671,7 +2669,10 @@ class CPDeltaRuleFixupSimtSm90(KeyedCompileMixin):
                 seq_idx + cutlass.Int32(1), seq_end, 0, chunk_len
             )
 
-        cute.arch.setmaxregister_increase(self.registers_per_thread)
+        # setmaxnreg must be executed by a whole warpgroup; at DK = 64 the CTA
+        # has two warps, so it keeps its launch-time register budget.
+        if cutlass.const_expr(self.threads_per_cta % 128 == 0):
+            cute.arch.setmaxregister_increase(self.registers_per_thread)
         state_layout = cute.make_layout(
             (self.rows_per_cta, self.DK), stride=(self.DK, 1)
         )
@@ -2837,9 +2838,10 @@ def cp_delta_rule_fixup_dsl_sm90(
 ):
     """Fix CP precompute chunk artifacts into global chunk-boundary states.
 
-    Flat varlen workspaces use the native
-    `(total_cp_chunks, num_heads, DimV, DimK)` layout produced by
-    `cp_delta_rule_mn_precompute_dsl_sm90`.
+    Flat varlen workspaces use the native layouts produced by
+    `cp_delta_rule_mn_precompute_dsl_sm90`: transfer
+    `(total_cp_chunks, num_heads, DimK, DimK)`, state
+    `(total_cp_chunks, num_heads, DimV, DimK)`.
     """
     import cuda.bindings.driver as cuda_driver
 
@@ -4440,7 +4442,7 @@ def cp_delta_rule_prefill_dsl_sm90(
             )
         if k.ndim != 3 or v.ndim != 3 or o.ndim != 3:
             raise RuntimeError(
-                "k, v, and o must have shape (total_seqlen, num_heads, D), "
+                "k, v, and o must have shape (total_seqlen, num_heads, DimK/DimV), "
                 f"got k={tuple(k.shape)}, v={tuple(v.shape)}, o={tuple(o.shape)}"
             )
         if (
@@ -4840,7 +4842,7 @@ def cp_delta_rule_dsl_sm90(
         )
     if k.ndim != 3 or v.ndim != 3 or o.ndim != 3:
         raise RuntimeError(
-            "k, v, and o must have shape (total_seqlen, num_heads, D), "
+            "k, v, and o must have shape (total_seqlen, num_heads, DimK/DimV), "
             f"got k={tuple(k.shape)}, v={tuple(v.shape)}, o={tuple(o.shape)}"
         )
     if k.shape[0] != q.shape[0] or v.shape[0] != q.shape[0] or o.shape[0] != q.shape[0]:
