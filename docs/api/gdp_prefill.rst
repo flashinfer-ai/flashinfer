@@ -20,8 +20,8 @@ engine declines anything else it cannot serve.
 
     chunk_gated_delta_product
 
-Decode and MTP verification (Cake, SM100 / SM103)
--------------------------------------------------
+Decode and MTP verification (Cake, SM90 / SM100 / SM103)
+--------------------------------------------------------
 
 Gated DeltaProduct decode and multi-token (MTP) verification:
 K=128, V=64, one to four Householder steps per token, over an FP32

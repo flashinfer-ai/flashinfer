@@ -15,7 +15,7 @@ limitations under the License.
 
 Backend of :mod:`flashinfer.cake_gdp`: the Cake Gated DeltaProduct (GDP) decode
 and MTP-verification kernels (``K = 128``, ``V = 64``, up to four
-Householder updates per token, FP32 state pool; SM100 / SM103) as one
+Householder updates per token, FP32 state pool; SM90 / SM100 / SM103) as one
 self-contained package (the host API body, the ``cake_jit`` registry and loader
 glue and the generated CUDA sources under ``csrc/``).  The stable,
 ``@flashinfer_api``-decorated entry point and the full user-facing
