@@ -559,6 +559,15 @@ def test_dsv4_hca_rejects_backend_specific_metadata(monkeypatch):
         trtllm_batch_decode_sparse_mla_dsv4(**args)
 
 
+def test_hca_compile_rejects_arch_the_installed_dsl_cannot_target(monkeypatch):
+    pytest.importorskip("cutlass")
+    from flashinfer.cute_dsl.attention.wrappers import batch_hca
+
+    monkeypatch.setattr(batch_hca, "is_cute_dsl_arch_supported", lambda *_: False)
+    with pytest.raises(NotImplementedError, match="does not support sm_107"):
+        batch_hca._compile_hca_kernel(128, 1, True, False, True, (10, 7))
+
+
 def test_hca_rejects_nonpersistent_grid_overflow():
     pytest.importorskip("cutlass")
     from flashinfer.cute_dsl.attention.wrappers.batch_hca import (

@@ -24,6 +24,7 @@ from cutlass import Float32, Int32
 from flashinfer.cute_dsl.utils import (
     _as_cute_dsl_workspace_i8,
     get_max_active_clusters,
+    is_cute_dsl_arch_supported,
     require_cute_dsl_arch,
 )
 
@@ -222,6 +223,11 @@ def _compile_hca_kernel(
         raise ValueError(
             "CuTe DSL HCA compilation requires SM100/SM103/SM107, got "
             f"SM{compute_capability[0]}{compute_capability[1]}"
+        )
+    if not is_cute_dsl_arch_supported(*compute_capability):
+        raise NotImplementedError(
+            "the installed CuTe DSL does not support "
+            f"sm_{compute_capability[0]}{compute_capability[1]}"
         )
     kernel = BlackwellHeavilyCompressedAttentionForwardFP8(
         acc_dtype=cutlass.Float32,
