@@ -3998,3 +3998,52 @@ def test_moe_lora_delta(
     assert (real_reference - zero_reference).abs().max().item() > 0.05
     # Kernel matches the dequant reference (delta injected on both sides).
     check_accuracy(real_reference, real_actual, **moe_impl.get_tolerances())
+
+
+@pytest.mark.parametrize(
+    "moe_impl",
+    [
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFp4"),
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFp4xMxFp8"),
+    ],
+)
+@pytest.mark.parametrize("enable_autotune", [False, True], ids=["default", "autotune"])
+def test_moe_lora_delta_fp4_tile_192_window(
+    moe_impl, enable_autotune, cache_permute_indices
+):
+    """FP4 MoE with `gemm1_lora_delta` where the tile window reaches 192.
+
+    4096 tokens over 128 experts at top_k 8 average 256 tokens per expert, so the
+    default tactic is tile 192 and the autotuner's candidates include it. The FP4
+    artifact has no 192-tile kernel with an FC1 bias (`gemm1_lora_delta` selects
+    BiasType::Mn), so advertising that tile fails with "No kernel found".
+    """
+    test_moe_lora_delta(
+        num_tokens=4096,
+        hidden_size=1024,
+        intermediate_size=1024,
+        moe_impl=moe_impl,
+        routing_config={
+            "num_experts": 128,
+            "top_k": 8,
+            "padding": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RoutingMethodType.Renormalize,
+            "compatible_moe_impls": [FP4Moe],
+            "compatible_intermediate_size": [1024],
+            "enable_autotune": enable_autotune,
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [FP4Moe],
+            "compatible_gemm_backends": [MoeGemmBackend.TRTLLM],
+        },
+        activation_type=ActivationType.Swiglu,
+        delta_mode="fake",
+        moe_gemm_backend=MoeGemmBackend.TRTLLM,
+        cache_permute_indices=cache_permute_indices,
+    )

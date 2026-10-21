@@ -4927,12 +4927,17 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
  public:
   static constexpr std::array<int32_t, 4> mBaseSupportedTileNums = {8, 16, 32, 64};
 
-  static std::vector<int32_t> getSupportedTileNums(btg::Dtype dtype_act, btg::Dtype dtype_weights) {
+  static std::vector<int32_t> getSupportedTileNums(btg::Dtype dtype_act, btg::Dtype dtype_weights,
+                                                   batchedGemm::gemm::BiasType gemm1_bias_type) {
     std::vector<int32_t> tiles(mBaseSupportedTileNums.begin(), mBaseSupportedTileNums.end());
     if (dtype_act != btg::Dtype::Bfloat16) {
       tiles.push_back(128);
-      if ((dtype_weights == btg::Dtype::E2m1 && dtype_act == btg::Dtype::E2m1) ||
-          (dtype_weights == btg::Dtype::MxE2m1 && dtype_act == btg::Dtype::MxE4m3)) {
+      // The BMM artifact has no 192-tile FP4 kernel with an FC1 bias (gemm1_lora_delta selects
+      // BiasType::Mn), so advertising 192 there makes the default tactic or a tuned one name a
+      // kernel that does not exist; the adjacent 128 and 256 tiles have them.
+      if (gemm1_bias_type == batchedGemm::gemm::BiasType::None &&
+          ((dtype_weights == btg::Dtype::E2m1 && dtype_act == btg::Dtype::E2m1) ||
+           (dtype_weights == btg::Dtype::MxE2m1 && dtype_act == btg::Dtype::MxE4m3))) {
         tiles.push_back(192);
       }
       tiles.push_back(256);
@@ -5344,7 +5349,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     Array<Array<int64_t>> valid_configs;
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
-    std::vector<int32_t> tile_sizes = getSupportedTileNums(dtype_act, dtype_weights);
+    std::vector<int32_t> tile_sizes =
+        getSupportedTileNums(dtype_act, dtype_weights, gemm1_bias_type);
     std::set<int32_t> selected_tile_nums =
         computeSelectedTileN(tile_sizes, num_tokens, top_k, num_local_experts);
 
@@ -6126,7 +6132,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
 
   // Determine supported tile sizes
   std::vector<int32_t> mSupportedTileN =
-      FP4BlockScaleLauncher::getSupportedTileNums(mDtypeAct, mDtypeWeights);
+      FP4BlockScaleLauncher::getSupportedTileNums(mDtypeAct, mDtypeWeights, gemm1_bias_type_enum);
   // Build launchers for ALL supported tiles so autotuner-cached tactics always find their tile_N.
 
   // Create a map of launchers for each tile size
