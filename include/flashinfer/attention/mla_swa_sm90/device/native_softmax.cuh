@@ -100,6 +100,8 @@ __forceinline__ __device__ void register_fragment_softmax(
       plan.reduction[warp_in_group * T::BLOCK_M + n1] = sum1;
     }
   }
+  // Publish generic P stores to the WGMMA async proxy before the handoff.
+  cutlass::arch::fence_view_async_shared();
   role_barrier();
   if (idx_in_warpgroup < T::BLOCK_M) {
     const int row = idx_in_warpgroup;

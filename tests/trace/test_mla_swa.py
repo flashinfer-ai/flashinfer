@@ -2,6 +2,17 @@
 import torch
 
 from flashinfer.mla import batch_decode_with_kv_cache_mla_swa as run
+from tests.trace.template_registry import collect_registered_trace_templates
+
+
+def test_mla_swa_trace_registration():
+    entries = collect_registered_trace_templates()
+    assert any(
+        func.__module__ == run.__module__
+        and func.__qualname__ == run.__qualname__
+        and label == "mla_swa_decode"
+        for func, _, label in entries
+    )
 
 
 def test_mla_swa_trace(tmp_path):

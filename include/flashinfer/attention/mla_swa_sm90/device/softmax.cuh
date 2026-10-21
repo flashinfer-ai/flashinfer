@@ -65,6 +65,8 @@ __forceinline__ __device__ void run_m32_p0_softmax_helper(TensorSP const& sP, Pl
     softmax_one_row<T>(sP, plan, row, lane, physical_page, page_idx, m_block_idx, total_rows, s_q,
                        num_heads, cache_len, window_size, softmax_scale);
   }
+  // Every writer fences its P stores before the cross-WG publication barrier.
+  cutlass::arch::fence_view_async_shared();
 }
 
 template <typename T, typename TensorSP, typename Plan>
@@ -76,4 +78,5 @@ __forceinline__ __device__ void run_softmax_helper(
   const int row = pv_group * 4 + warp_in_group;
   softmax_one_row<T>(sP, plan, row, lane, physical_page, page_idx, m_block_idx, total_rows, s_q,
                      num_heads, cache_len, window_size, softmax_scale);
+  cutlass::arch::fence_view_async_shared();
 }
