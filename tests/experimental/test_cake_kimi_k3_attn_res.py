@@ -12,6 +12,17 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+Tests of the Cake Kimi-K3 AttnRes backend package (SM100 / SM103): the host policy
+and its route tables, the registry and the generated sources, the launch plans and,
+on a supported device, the numerical contract against the independent FP32 reference
+(output within atol 8e-2 / rtol 3e-2, prefix and snapshot bank bit-exact).
+
+This suite exercises the backend package alone: it names the package once, through
+``tests.test_helpers.cake_package``, and imports nothing else from flashinfer, so a
+build that vendors the package under another import path runs it unchanged after
+pointing that table entry at its package.  The ``flashinfer.kimi_k3_attn_res`` facade
+is covered by ``test_cake_kimi_k3_attn_res_api.py``.
 """
 
 import inspect
@@ -22,24 +33,23 @@ import re
 import pytest
 import torch
 
-from flashinfer.experimental.cake_kimi_k3_attn_res import cake_backend as cb
-from flashinfer.experimental.cake_kimi_k3_attn_res import cake_build, cake_jit
-from flashinfer.experimental.cake_kimi_k3_attn_res.cake_backend import (
-    ARCHES,
-    HIDDEN_SIZE,
-    MAX_BLOCKS,
-    NATIVE_SM_COUNTS,
-    SUPPORTED_COMPUTE_CAPABILITIES,
-    common_path_eligible,
-    plan_route,
-    reference_kimi_k3_attn_res,
-)
-from flashinfer.experimental.cake_kimi_k3_attn_res.cake_jit import (
-    KERNELS,
-    MODULES,
-    ROUTES,
-)
-from flashinfer.kimi_k3_attn_res import prepare_kimi_k3_attn_res
+from tests.test_helpers.cake_package import cake_package
+
+cb = cake_package("cake_kimi_k3_attn_res", "cake_backend")
+cake_build = cake_package("cake_kimi_k3_attn_res", "cake_build")
+cake_jit = cake_package("cake_kimi_k3_attn_res", "cake_jit")
+ARCHES = cb.ARCHES
+HIDDEN_SIZE = cb.HIDDEN_SIZE
+MAX_BLOCKS = cb.MAX_BLOCKS
+NATIVE_SM_COUNTS = cb.NATIVE_SM_COUNTS
+SUPPORTED_COMPUTE_CAPABILITIES = cb.SUPPORTED_COMPUTE_CAPABILITIES
+common_path_eligible = cb.common_path_eligible
+plan_route = cb.plan_route
+prepare_kimi_k3_attn_res = cb.prepare_kimi_k3_attn_res
+reference_kimi_k3_attn_res = cb.reference_kimi_k3_attn_res
+KERNELS = cake_jit.KERNELS
+MODULES = cake_jit.MODULES
+ROUTES = cake_jit.ROUTES
 
 # The Kimi-K3 AttnRes evaluation contract: output within (atol 8e-2, rtol 3e-2)
 # of the independent FP32 reference; prefix / snapshot bank bit-exact.
@@ -1192,10 +1202,4 @@ def test_prepare_rejects_bad_bindings():
             **{k: v for k, v in inputs.items() if k != "num_blocks"},
             num_blocks=4,
             block_write_idx=8,
-        )
-    with pytest.raises(ValueError):
-        prepare_kimi_k3_attn_res(
-            **{k: v for k, v in inputs.items() if k != "num_blocks"},
-            num_blocks=4,
-            backend="triton",
         )
