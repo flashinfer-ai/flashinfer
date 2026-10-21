@@ -474,6 +474,9 @@ class CutlassMoeFCRunnerInterface {
   // Returns 0 if the config is incompatible with the current device.
   virtual int queryOccupancyForConfig(cutlass_extensions::CutlassGemmConfig const& config) = 0;
 
+  // num_active_tokens_ptr: optional device int32 scalar, the number of leading rows that hold
+  // tokens. Rows at or beyond it are ignored by the expert-map build and left untouched by the
+  // finalize, so a CUDA graph captured over a fixed buffer pays for the live rows only.
   virtual void runMoe(void const* input_activations, void const* input_sf,
                       bool const swizzled_input_sf, int const* token_selected_experts,
                       float const* token_final_scales, void const* fc1_expert_weights,
@@ -486,8 +489,8 @@ class CutlassMoeFCRunnerInterface {
                       MOEParallelismConfig parallelism_config, bool const enable_alltoall,
                       bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
                       bool use_mxfp8_act_scaling, bool min_latency_mode,
-                      MoeMinLatencyParams& min_latency_params, bool enable_pdl,
-                      cudaStream_t stream) = 0;
+                      MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
+                      int const* num_active_tokens_ptr = nullptr) = 0;
 
   // Aliases for profiling the gemms
   virtual void gemm1(void const* const input, void* const output, void* const intermediate_result,
@@ -558,6 +561,10 @@ class CutlassMoeFCRunnerInterface {
 
   bool is_profiler = false;
   bool use_fused_finalize_ = true;
+  // Store the finalized output as fp32 instead of OutputType (bf16/fp16 runners). The finalize
+  // kernel converts on store; GEMM2 finalize fusion is disabled since that epilogue writes
+  // OutputType.
+  bool fp32_final_output_ = false;
 };
 
 // Assumes inputs activations are row major. Weights need to be preprocessed by
@@ -712,8 +719,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
               MOEParallelismConfig parallelism_config, bool const enable_alltoall, bool use_lora,
               LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
               bool use_mxfp8_act_scaling, bool min_latency_mode,
-              MoeMinLatencyParams& min_latency_params, bool enable_pdl,
-              cudaStream_t stream) override;
+              MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
+              int const* num_active_tokens_ptr = nullptr) override;
 
   // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
   static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
@@ -763,7 +770,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
       void* fc2_lora, cudaStream_t stream, MOEParallelismConfig parallelism_config,
       bool const enable_alltoall, cutlass_extensions::CutlassGemmConfig config,
       bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids,
-      bool enable_pdl);
+      bool enable_pdl, int const* num_active_tokens_ptr = nullptr, bool fp32_final_output = false);
 
   // Overrides to allow us to forward on to the internal functions with the pointers using the
   // correct type
@@ -949,7 +956,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 
   bool mayHaveFinalizeFused() const {
     return moe_gemm_runner_.supportsTmaWarpSpecialized() && moe_gemm_runner_.getSM() >= 90 &&
-           use_fused_finalize_ && !use_sm90_mixed_input_gemm;
+           use_fused_finalize_ && !fp32_final_output_ && !use_sm90_mixed_input_gemm;
   }
 
   static bool mayHaveFinalizeFused(int sm) {
@@ -1006,7 +1013,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
       int64_t const expanded_num_rows, int64_t const hidden_size,
       int64_t const unpadded_hidden_size, int64_t const inter_size,
       int64_t const num_experts_per_node, int64_t const k, MOEParallelismConfig parallelism_config,
-      bool const enable_alltoall, QuantParams& quant_params, bool enable_pdl, cudaStream_t stream);
+      bool const enable_alltoall, QuantParams& quant_params, bool enable_pdl, cudaStream_t stream,
+      int const* num_active_tokens_ptr = nullptr, bool fp32_final_output = false);
 
   T const* applyPrequantScale(void* smoothed_act, void const* permuted_data,
                               void const* prequant_scales, int64_t const* num_valid_tokens_ptr,
