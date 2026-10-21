@@ -57,6 +57,11 @@ DEFAULT_INTERMEDIATE_SIZE = 2048
 DS_R1_NUM_EXPERTS = DEFAULT_NUM_EXPERTS
 DS_R1_TOP_K = DEFAULT_TOP_K
 
+# trtllm-gen's ldgPlusSts route, which the TS kernel does not implement and
+# RouteImpl therefore omits. Generated configs may still request it, so it is
+# forwarded to trtllm-gen while the TS run is skipped.
+_ROUTE_LDG_PLUS_STS = 3
+
 # Module-level shape state, set by configure_shapes() before variant construction.
 _FC1_N = 2 * DEFAULT_INTERMEDIATE_SIZE
 _FC1_K = DEFAULT_HIDDEN_SIZE
@@ -130,9 +135,9 @@ def _ts_kwargs(kwargs: dict) -> dict:
 
 def _ts_unsupported_reason(kwargs: dict) -> str | None:
     reasons = []
-    if int(kwargs.get("route_act", int(RouteImpl.NONE))) == 3:
+    if int(kwargs.get("route_act", int(RouteImpl.NONE))) == _ROUTE_LDG_PLUS_STS:
         reasons.append("Kernel does not implement routeAct=LDG_PLUS_STS")
-    if int(kwargs.get("route_sfs_act", int(RouteImpl.NONE))) == int(3):
+    if int(kwargs.get("route_sfs_act", int(RouteImpl.NONE))) == _ROUTE_LDG_PLUS_STS:
         reasons.append("Kernel does not implement routeSfsAct=LDG_PLUS_STS")
     use_per_token_sf_b = int(kwargs.get("use_per_token_sf_b", 0))
     if use_per_token_sf_b and int(kwargs.get("transpose_mma_output", 1)) != 1:
@@ -170,7 +175,7 @@ def _route_arg(route: int) -> str:
         return "tma"
     if route == int(RouteImpl.LDGSTS):
         return "ldgsts"
-    if route == 3:
+    if route == _ROUTE_LDG_PLUS_STS:
         return "ldgPlusSts"
     raise ValueError(f"Unsupported generated route: {route}")
 
@@ -253,7 +258,7 @@ def _route_value(value: object) -> int:
         if lowered == "ldgsts":
             return int(RouteImpl.LDGSTS)
         if lowered == "ldgplussts":
-            return 3
+            return _ROUTE_LDG_PLUS_STS
     raise ValueError(f"Unsupported route value: {value}")
 
 

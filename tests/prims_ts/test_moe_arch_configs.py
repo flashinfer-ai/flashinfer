@@ -33,8 +33,13 @@ from flashinfer.tllm_enums import ActivationType
 
 
 def test_default_mapper_resource_follows_runtime_sm_arch(monkeypatch):
+    from flashinfer.prims_ts.batched_gemm import batched_gemm_run
+
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 7))
+    monkeypatch.setattr(
+        batched_gemm_run, "is_prims_ts_arch_available", lambda major, minor: True
+    )
 
     configs = _expanded_prims_ts_json_configs()
     assert any(cfg.options.get("mma_k") == 128 for cfg in configs)

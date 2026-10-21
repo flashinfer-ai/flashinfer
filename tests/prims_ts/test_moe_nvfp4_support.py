@@ -298,6 +298,7 @@ def test_nvfp4_tile128_fused_fc1_gpu_correctness(problem_k, dtype_c_override):
 
 def test_nvfp4_bs256_has_matching_gen_tile32_pair():
     tactics = valid_prims_ts_nvfp4_moe_tactics(
+        sm_arch=100,
         num_tokens=256,
         top_k=8,
         num_local_experts=256,
@@ -307,6 +308,7 @@ def test_nvfp4_bs256_has_matching_gen_tile32_pair():
     for tactic in tactics:
         pair = map_trtllm_nvfp4_moe_tactic(
             tactic,
+            sm_arch=100,
             num_tokens=256,
             top_k=8,
             num_local_experts=256,
