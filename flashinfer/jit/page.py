@@ -18,11 +18,12 @@ from . import env as jit_env
 from .core import JitSpec, gen_jit_spec
 
 
-def gen_page_module() -> JitSpec:
+def gen_page_module(nvfp4_4over6: bool = False) -> JitSpec:
     return gen_jit_spec(
-        "page",
+        "page_nvfp4_4over6" if nvfp4_4over6 else "page",
         [
             jit_env.FLASHINFER_CSRC_DIR / "page.cu",
             jit_env.FLASHINFER_CSRC_DIR / "flashinfer_page_binding.cu",
         ],
+        extra_cuda_cflags=["-DFLASHINFER_NVFP4_APPEND_4OVER6"] if nvfp4_4over6 else [],
     )
