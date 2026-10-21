@@ -712,6 +712,7 @@ cudaError_t NVFP4QuantizeAppendPagedKVCacheWithSlotMapping(
 // buffer per reduction.
 template <uint32_t kNumThreads>
 __device__ __forceinline__ float fp8_pth_block_max(float val, float* red) {
+  static_assert(kNumThreads % 32 == 0, "kNumThreads must be a multiple of 32");
 #pragma unroll
   for (uint32_t offset = 16; offset > 0; offset >>= 1) {
     val = fmaxf(val, __shfl_xor_sync(0xffffffffu, val, offset));

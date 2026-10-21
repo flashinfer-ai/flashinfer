@@ -58,6 +58,7 @@ gelu_and_mul_h16384.json
 gelu_tanh_and_mul_h16384.json
 fp8_paged_mqa_logits_nn2_H64_D128_bs64.json
 fp4_paged_mqa_logits_nn2_H64_Dp64_bs64.json
+fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_kv2_d128_sl144_ps4.json
 gqa_paged_decode_h32_kv8_d128_ps16.json
 gqa_paged_decode_h32_kv8_d128_ps64.json
 gqa_paged_prefill_h32_kv8_d128_ps16.json
@@ -2202,6 +2203,37 @@ with contextlib.suppress(Exception):
         (_nqsm_k_sf, _nqsm_v_sf),
         _nqsm_k_scale,
         _nqsm_v_scale,
+    )
+
+# fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping: flat slot mapping.
+with contextlib.suppress(Exception):
+    from flashinfer import (
+        fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping,
+    )
+
+    _fpth_H, _fpth_D, _fpth_PS = 2, 128, 4
+    _fpth_nnz = 4
+    _fpth_k_slot = torch.zeros(
+        4, _fpth_PS, _fpth_H, _fpth_D + 16, dtype=torch.uint8, device=device
+    )
+    _fpth_v_slot = torch.zeros_like(_fpth_k_slot)
+    _fpth_k_sf = (
+        _fpth_k_slot[..., _fpth_D : _fpth_D + 4].view(torch.float32).squeeze(-1)
+    )
+    _fpth_v_sf = (
+        _fpth_v_slot[..., _fpth_D : _fpth_D + 4].view(torch.float32).squeeze(-1)
+    )
+    _fpth_k = torch.randn(
+        _fpth_nnz, _fpth_H, _fpth_D, dtype=torch.float16, device=device
+    )
+    _fpth_v = torch.randn_like(_fpth_k)
+    _fpth_slots = torch.tensor([0, 1, 4, 5], dtype=torch.int32, device=device)
+    fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping(
+        _fpth_k,
+        _fpth_v,
+        _fpth_slots,
+        (_fpth_k_slot, _fpth_v_slot),
+        (_fpth_k_sf, _fpth_v_sf),
     )
 
 # nvfp4_quantize_append_paged_mla_kv_cache: packed ckv plus FP8 kpe cache.
