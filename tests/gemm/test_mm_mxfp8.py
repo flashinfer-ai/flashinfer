@@ -500,10 +500,11 @@ def test_mm_mxfp8_cute_dsl_waits_for_pdl_producer(m, n, k, auto_tuning):
 @pytest.mark.parametrize(
     "m,n,k",
     [
-        (1, 1536, 1024),  # M <= 32: a small-M runner is the untuned default
+        (1, 1536, 1024),  # M <= 16: a small-M runner is the untuned default
         (4, 6144, 4096),
         (16, 6144, 1536),
-        (64, 1536, 1024),  # M > 32: the SM107 kernel is the untuned default
+        (24, 6144, 4096),  # M > 16: the SM107 kernel is the untuned default
+        (64, 1536, 1024),
         (100, 4096, 1024),  # M % 8 != 0
         (256, 1536, 6144),
         (4096, 6144, 1536),
@@ -512,7 +513,7 @@ def test_mm_mxfp8_cute_dsl_waits_for_pdl_producer(m, n, k, auto_tuning):
     ],
 )
 def test_mm_mxfp8_cute_dsl_sm107(m, n, k, auto_tuning, monkeypatch):
-    """On SM107, mm_mxfp8(backend="cute-dsl") picks the SM107 kernel above M=32, a small-M runner below, and is correct."""
+    """On SM107, mm_mxfp8(backend="cute-dsl") picks the SM107 kernel above M=16, a small-M runner below, and is correct."""
     _skip_if_unsupported("cute-dsl")
     from flashinfer.cute_dsl.utils import is_rubin_cute_dsl_available
 
@@ -559,7 +560,7 @@ def test_mm_mxfp8_cute_dsl_sm107(m, n, k, auto_tuning, monkeypatch):
         assert sm107_tactics_run, "mm_mxfp8 did not profile the SM107 kernel"
         assert isinstance(sm107_tactics_run[-1], tuple), sm107_tactics_run[-1]
         return
-    if m <= 32:
+    if m <= 16:
         # A small-M runner is the untuned default; the SM107 kernel does not launch.
         assert sm107_tactics_run == [], sm107_tactics_run
     else:

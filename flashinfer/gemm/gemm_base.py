@@ -6969,14 +6969,12 @@ def _cute_dsl_mxfp8_runners_sm107(
 ) -> List[TunableRunner]:
     """SM107 ``mm_mxfp8(backend="cute-dsl")`` runners; ``[0]`` is the untuned default."""
     from ..cute_dsl.availability import is_cute_dsl_experimental_available
-    from .kernels.dense_blockscaled_gemm_sm100_splitk import (
-        Sm100BlockScaledSplitKGemmKernel,
-    )
 
     sm107 = _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype)
     low_m = _cute_dsl_gemm_mxfp8_runner(10, 7, True, out_dtype, low_m_only=True)
-    a, _, _, _, _, out, _ = inputs
+    a, b, _, _, _, out, _ = inputs
     m, k = a.shape
+    n = b.shape[1]
     warp = None
     if is_cute_dsl_experimental_available():
         warp = _cute_dsl_warp_splitk_mxfp8_gemm_runner(enable_pdl=True)
@@ -6984,9 +6982,20 @@ def _cute_dsl_mxfp8_runners_sm107(
         if not warp.supports_inputs(inputs, check_m=False):
             warp = None
     tail = [warp] if warp is not None else []
-    if warp is not None and warp.supports_inputs(inputs) and m <= 8 and k <= 2048:
+    # Untuned, warp split-K goes first only while its default grid (32-wide
+    # output tiles, 16-wide if N % 32) fits one wave; past that it falls behind.
+    warp_grid_fits = n // (32 if n % 32 == 0 else 16) <= get_device_sm_count(a.device)
+    if (
+        warp is not None
+        and warp.supports_inputs(inputs)
+        and m <= 8
+        and k <= 2048
+        and warp_grid_fits
+    ):
         return [warp, low_m, sm107]
-    if Sm100BlockScaledSplitKGemmKernel.supports_m(m) and out.is_contiguous():
+    # The low-M runner goes first only up to M=16: its 32-token tile with K split
+    # in 4 is slower than the SM107 kernel at M=17-32.
+    if m <= 16 and out.is_contiguous():
         return [low_m, sm107] + tail
     return [sm107, low_m] + tail
 
