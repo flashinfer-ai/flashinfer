@@ -17,6 +17,7 @@ from b12x._lib.compiler import DimKey, KernelCompileSpec, launch, tensor_key
 from b12x._lib.intrinsics.packed import bfloat2_to_float2_scaled
 from b12x._lib.utils.device import current_cuda_stream
 from ._kernels import _to_kernel_tensor, _warp_allreduce_sum, _compile_mhc_entry
+from ._alias import overlaps
 from b12x._lib.compiler import run_compiled
 
 
@@ -105,9 +106,9 @@ def prepare_lagged_prefill(
     if output.device != residual.device or partials.device != residual.device:
         raise ValueError("lagged MHC inputs and outputs must share a CUDA device")
     if (
-        torch._C._overlaps(residual, output)
-        or torch._C._overlaps(partials, output)
-        or torch._C._overlaps(residual, partials)
+        overlaps(residual, output)
+        or overlaps(partials, output)
+        or overlaps(residual, partials)
     ):
         raise ValueError(
             "lagged MHC preparation outputs must not alias inputs or scratch"

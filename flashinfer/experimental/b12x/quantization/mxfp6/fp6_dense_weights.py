@@ -38,7 +38,8 @@ from b12x._lib.fp6 import (
     mx_gs_numerator,
 )
 from b12x._lib.utils.fp6_geometry import mxfp6_packed_k_bytes
-from b12x._lib.dense_gemm import dense_gemm, _DENSE_FUSED_QUANT
+from b12x._lib.dense_gemm.execution import dense_gemm
+from b12x._lib.dense_gemm.config import _DENSE_FUSED_QUANT
 
 _TILE = 128  # MX-FP6 GPU quantizer tile (M and K must be multiples of this)
 
@@ -66,7 +67,7 @@ _PER_ROW_IN_KERNEL = os.getenv("B12X_DENSE_PER_ROW_IN_KERNEL", "1").lower() not 
 # Applies the per-row output correction inside the GEMM epilogue instead of as
 # a trailing ``result.mul_(inv_gs)``. Bit-identical by construction: the
 # epilogue reproduces both roundings to bf16 that the eager multiply performs
-# (see the row_scale application site in _lib/dense_gemm.py).
+# (see the row_scale application site in _lib/dense_gemm/kernel.py).
 _ROW_SCALE_EPILOGUE = True
 _QUANT_SCRATCH: dict[tuple, tuple] = {}
 # Captures claim prewarmed buckets with stable addresses. Claimed entries stay
@@ -364,7 +365,7 @@ class FP6DenseWeight:
         """
         if self._packed_expanded is None:
             # Lazy import: avoids any import cycle with ``b12x._lib.dense_gemm``.
-            from b12x._lib.dense_gemm import _expand_packed_mxfp6_ab
+            from b12x._lib.dense_gemm.execution import _expand_packed_mxfp6_ab
 
             self._packed_expanded = _expand_packed_mxfp6_ab(
                 self.packed.unsqueeze(-1), self.in_features

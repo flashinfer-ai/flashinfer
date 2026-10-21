@@ -43,7 +43,7 @@ def _assert_close_bf16(actual: torch.Tensor, expected: torch.Tensor) -> None:
 @pytest.mark.parametrize("block_size", (32, 128))
 def test_decode_wo_b_column_tiles_match_independent_quantized_oracle(rows, block_size):
     """Column tiling preserves MXFP8 group-major quantization and BF16 output."""
-    from b12x._lib.dense_gemm import dense_gemm_fused_quant_a
+    from b12x._lib.dense_gemm.execution import dense_gemm_fused_quant_a
 
     require_b12x()
     torch.manual_seed(41732 + rows)

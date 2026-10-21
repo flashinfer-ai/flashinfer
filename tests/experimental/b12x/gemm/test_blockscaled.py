@@ -690,3 +690,53 @@ def test_implicit_plan_reuses_capacity_under_compile_and_graph(recipe):
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(replayed, compiled, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("rows", [1, 17, 128])
+def test_packed_mxfp4_bf16_compiled_replay(rows):
+    from dataclasses import replace
+    from .test_blockscaled_a16 import make_workspace, prepared_execution
+
+    require_b12x()
+    torch.manual_seed(923)
+    logical_k, stored_k, n = 288, 512, 128
+    x = torch.randn(rows, logical_k, dtype=torch.bfloat16, device="cuda")
+    source = torch.randn(n, stored_k, device="cuda") * 0.25
+    source[:, logical_k:] = 0
+    values, scale_rows = _quantize_mxfp4_rows(source)
+    weight = replace(
+        blockscaled.pack_weight(
+            values, swizzle_block_scale(scale_rows), recipe="mxfp4"
+        ),
+        in_features=logical_k,
+    )
+    rhs = _dequantize_mxfp4_rows(values, scale_rows)[:, :logical_k]
+    output = torch.empty((rows, n), dtype=torch.bfloat16, device="cuda")
+    workspace = make_workspace(x, weight, activation_mode="auto", out=output)
+    with prepared_execution(
+        x, weight, activation_mode="auto", out=output, workspace=workspace
+    ) as (_, plan):
+        forward = torch.compile(
+            lambda a: blockscaled.mm(
+                a, weight, out=output, workspace=workspace, plan=plan
+            ),
+            fullgraph=True,
+            dynamic=False,
+        )
+        forward(x)
+        with kernel_resolution_guard("packed MXFP4 capture"):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                forward(x)
+            for scale in (1.0, -0.5):
+                x.mul_(scale)
+                lhs = _dequantize_mxfp4_rows(*_quantize_mxfp4_rows(x))
+                expected = (lhs @ rhs.T).to(torch.bfloat16)
+                workspace.fill_(255)
+                allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+                graph.replay()
+                torch.cuda.synchronize()
+                assert (
+                    torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+                )
+                torch.testing.assert_close(output, expected, rtol=0.015, atol=0.015)

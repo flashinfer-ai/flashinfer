@@ -26,11 +26,21 @@ from .._shared.delta_prefill.contract import (
 )
 from ._tuning import CHUNK_TOKENS, GdnPrefillConfig, GdnPrefillQuery, tiles_capacity
 from ._parallel import ParallelBinding, ParallelPlan
+from ._ops import gdn_prefill_out
 
 
 @dataclass(frozen=True, kw_only=True)
 class Caps:
-    """Static geometry and planned capacity of a GDN prefill plan."""
+    """Static geometry, precision, and planned capacity of GDN prefill.
+
+    ``intermediate_dtype=torch.bfloat16`` selects the tensor-core chunk
+    pipeline. Explicit ``torch.float32`` keeps normalized Q/K and recurrence
+    arithmetic in FP32 in a device-side sequential loop. Both consume and
+    produce BF16 activations and use the same FP32 state/checkpoint contract.
+    Precision is fixed during preparation and is never an autotuning choice.
+    ``recurrence_policy="sequential_k1"`` restricts tuning to the sequential
+    key-reduction schedule while retaining value grouping and pipeline choices.
+    """
 
     device: torch.device | str
     max_tokens: int
@@ -41,8 +51,10 @@ class Caps:
     head_dim: int = HEAD_DIM
     model_dtype: torch.dtype = torch.bfloat16
     state_dtype: torch.dtype = torch.float32
+    intermediate_dtype: torch.dtype = torch.bfloat16
     qk_l2norm: bool = True
     checkpoint_export: bool = False
+    recurrence_policy: str = "auto"
     null_state_index: int | None = None
     chunk_tokens: int = 16
     staging_key: Hashable | None = None
@@ -72,10 +84,16 @@ class Caps:
             raise ValueError("model_dtype must be torch.bfloat16")
         if self.state_dtype != torch.float32:
             raise ValueError("state_dtype must be torch.float32")
+        if self.intermediate_dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError(
+                "intermediate_dtype must be torch.bfloat16 or torch.float32"
+            )
         if self.chunk_tokens != CHUNK_TOKENS:
             raise ValueError(f"chunk_tokens must be {CHUNK_TOKENS}")
         object.__setattr__(self, "qk_l2norm", bool(self.qk_l2norm))
         object.__setattr__(self, "checkpoint_export", bool(self.checkpoint_export))
+        if self.recurrence_policy not in ("auto", "sequential_k1"):
+            raise ValueError("recurrence_policy must be 'auto' or 'sequential_k1'")
         if self.null_state_index is not None:
             null = int(self.null_state_index)
             if null < 0 or null >= self.max_state_slots:
@@ -170,8 +188,10 @@ def _query(caps: Caps, invocation: FrozenMapping) -> GdnPrefillQuery:
         head_dim=caps.head_dim,
         model_dtype=str(caps.model_dtype).removeprefix("torch."),
         state_dtype=str(caps.state_dtype).removeprefix("torch."),
+        intermediate_dtype=str(caps.intermediate_dtype).removeprefix("torch."),
         qk_l2norm=caps.qk_l2norm,
         checkpoint_export=caps.checkpoint_export,
+        recurrence_policy=caps.recurrence_policy,
         max_tokens=caps.max_tokens,
         max_seqs=caps.max_seqs,
         max_state_slots=caps.max_state_slots,
@@ -188,7 +208,10 @@ def _materialize_layout(caps: Caps, config: GdnPrefillConfig) -> _Layout:
         k_split=config.k_split,
         stages=config.stages,
         window_tiles=config.window_tiles,
-        workspace_windows=0 if config.algorithm == "chunk_parallel" else 2,
+        workspace_windows=0
+        if config.algorithm == "chunk_parallel"
+        or caps.intermediate_dtype == torch.float32
+        else 2,
     )
     if config.algorithm == "chunk_parallel":
         from ._parallel import materialize
@@ -292,7 +315,7 @@ def run(
     max_live_tokens: int | None = None,
     max_live_seqs: int | None = None,
 ) -> torch.Tensor:
-    """Run the prologue, prepare, and recurrence kernels; capture safe.
+    """Run the prepared precision variant; capture safe.
 
     ``max_live_tokens`` and ``max_live_seqs`` are optional host-side upper
     bounds on the device counts; they only limit how many pipeline windows are
@@ -303,19 +326,45 @@ def run(
     running state in its final state slot between windows, so such a
     sequence must have a non-null final slot. Packed metadata is not checked
     on the device; the caller supplies in-range, conflict-free slots.
+
+    FP32 intermediates use one device-side recurrence loop without pipeline
+    windows. Host-side upper bounds are validated but do not change that
+    launch. Zero-length sequences copy initial state to final state; a null
+    initial slot supplies zero state, and null destinations remain untouched.
     """
     if not isinstance(binding, Binding):
         raise TypeError("binding must be gdn_prefill.Binding")
     state = require_prepared(
         binding.plan, "sequence.gdn_prefill", binding.output.device
     )
-    return state.run(
-        binding,
-        scale=scale,
-        eps=eps,
-        max_live_tokens=max_live_tokens,
-        max_live_seqs=max_live_seqs,
+    state._check(binding)
+    scale, eps = _check_run_scalars(scale, eps)
+    state.layout.launched_windows(max_live_tokens, max_live_seqs)
+    gdn_prefill_out(
+        binding.scratch,
+        binding.q,
+        binding.k,
+        binding.v,
+        binding.a,
+        binding.b,
+        binding.A_log,
+        binding.dt_bias,
+        binding.recurrent_state,
+        binding.cu_seqlens,
+        binding.initial_state_indices,
+        binding.final_state_indices,
+        binding.checkpoint_state_indices,
+        binding.checkpoint_offsets,
+        binding.num_seqs,
+        binding.num_tokens,
+        binding.output,
+        binding.plan.handle,
+        scale,
+        eps,
+        max_live_tokens,
+        max_live_seqs,
     )
+    return binding.output
 
 
 __all__ = [

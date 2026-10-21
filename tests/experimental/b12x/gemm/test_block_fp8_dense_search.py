@@ -1,5 +1,8 @@
 """Ordinary dense MXFP8 choices execute through block-scaled linear plans."""
 
+import b12x._lib.dense_gemm.config as dense_config
+
+
 from dataclasses import replace
 
 import pytest
@@ -68,9 +71,8 @@ def test_block_scaled_linear_searches_the_complete_dense_domain(m, block, exhaus
 @pytest.mark.parametrize("m", (1, 6, 8))
 def test_fp32_reduction_has_a_legal_default_and_search(monkeypatch, m, n):
     """Disabling atomic BF16 must not leave an unsupported four-slice default."""
-    import b12x._lib.dense_gemm as dense
 
-    monkeypatch.setattr(dense, "_B12X_DENSE_SPLITK_TURBO", False)
+    monkeypatch.setattr(dense_config, "_B12X_DENSE_SPLITK_TURBO", False)
     declaration = replace(query(m), in_features=6144, out_features=n)
     device = replace(
         DEVICE, compute_capability=(12, 1), sm_count=48, product_name="NVIDIA GB10"
@@ -92,8 +94,6 @@ def test_fp32_reduction_has_a_legal_default_and_search(monkeypatch, m, n):
     ),
 )
 def test_dense_choices_preserve_quantization_and_allocation_free_replay(config):
-    import b12x._lib.dense_gemm as dense
-
     device = require_b12x()
     capacity, k, n = (64 if config.large_m_unroll else 8), 5120, 1792
     torch.manual_seed(414112)
@@ -129,7 +129,7 @@ def test_dense_choices_preserve_quantization_and_allocation_free_replay(config):
         assert state.dense.lowering.swap_ab == config.swap_ab
         assert state.dense.lowering.policy.large_m_unroll == config.large_m_unroll
         if config.split_k_slices > 1:
-            assert dense._B12X_DENSE_SPLITK_TURBO
+            assert dense_config._B12X_DENSE_SPLITK_TURBO
             assert state.dense.lowering.policy.split_k_atomic_bf16
             assert state.scratch.workspace_nbytes == 0
         session.freeze()

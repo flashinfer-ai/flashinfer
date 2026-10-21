@@ -1,8 +1,10 @@
 """CuTe KDA verification and accepted-prefix state recovery.
 
 Verification leaves the FP32 checkpoint unchanged and stores rank-one updates
-plus the original BF16 key/gate inputs. Recovery applies only accepted updates,
-in forward order, with the same FP32 recurrence. No state quantization is used.
+plus the original BF16 key/gate inputs. It loads every window token's inputs
+before the recurrence, which then reads only shared memory and registers.
+Recovery applies only accepted updates, in forward order, with the same FP32
+recurrence. No state quantization is used.
 """
 
 from __future__ import annotations
@@ -109,21 +111,29 @@ class _Verify:
         scale: Float32,
         lower: Float32,
     ):
+        # Every window token's normalized query and key, gate decay, value and beta
+        # are loaded before the recurrence, so the per-token chain reads only shared
+        # memory and registers. Each value keeps the per-token arithmetic: the same
+        # lanes, reductions and operation order.
         tile, request_head, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
         request = Int32(request_head) // self.heads
         head = Int32(request_head) % self.heads
         tid = Int32(tid)
         lane = tid % 32
+        warp = tid // 32
+        warps = self.block_v * 8 // 32
+        threads = self.block_v * 8
         key_lane = tid % 8
         row = Int32(tile) * self.block_v + tid // 8
         if request < live_seqs[0] and request < capacity:
             start = Int32(starts[request])
             end = Int32(starts[request + 1])
+            count = end - start
             source = Int64(indices[request.to(Int64) * index_stride])
             if source == self.null:
                 for pos in cutlass.range(self.window):
-                    if pos < end - start and key_lane == 0:
+                    if pos < count and key_lane == 0:
                         off = (
                             Int64(start + pos) * self.strides[9]
                             + head.to(Int64) * self.strides[10]
@@ -139,15 +149,38 @@ class _Verify:
                 s = cute.make_rmem_tensor((16,), Float32)
                 for j in cutlass.range_constexpr(16):
                     s[j] = Float32(state[base + Int64(key_lane + j * 8)])
+                values = cute.make_rmem_tensor((self.window,), Float32)
+                betas = cute.make_rmem_tensor((self.window,), Float32)
+                for pos in cutlass.range_constexpr(self.window):
+                    values[pos] = Float32(0.0)
+                    betas[pos] = Float32(0.0)
+                    if pos < count:
+                        token = Int64(start + pos)
+                        values[pos] = Float32(
+                            mixed[
+                                token * self.strides[0]
+                                + (2 * self.heads + head.to(Int64)) * 128
+                                + row.to(Int64)
+                            ]
+                        )
+                        betas[pos] = Float32(
+                            beta[
+                                token * beta_row_stride
+                                + head.to(Int64) * beta_head_stride
+                            ]
+                        )
                 smem = cutlass.utils.SmemAllocator()
                 vectors = smem.allocate_tensor(
                     Float32,
-                    cute.make_layout((3, 128), stride=(128, 1)),
+                    cute.make_layout(
+                        (3, self.window, 128), stride=(self.window * 128, 128, 1)
+                    ),
                     byte_alignment=16,
                 )
                 a = cute.math.exp(Float32(a_log[head]), fastmath=False)
-                for pos in cutlass.range(self.window):
-                    if pos < end - start:
+                for step in cutlass.range_constexpr((self.window + warps - 1) // warps):
+                    pos = warp + step * warps
+                    if pos < count:
                         token = Int64(start + pos)
                         q_base = token * self.strides[0] + head.to(Int64) * 128
                         k_base = q_base + self.heads * 128
@@ -155,74 +188,78 @@ class _Verify:
                             source * kg_stride
                             + (head.to(Int64) * self.window + Int64(pos)) * 256
                         )
-                        if tid < 32:
-                            qsum = Float32(0.0)
-                            ksum = Float32(0.0)
-                            for j in cutlass.range_constexpr(4):
-                                k = lane + j * 32
-                                qv = Float32(mixed[q_base + k.to(Int64)])
-                                kv = Float32(mixed[k_base + k.to(Int64)])
-                                vectors[0, k] = qv
-                                vectors[1, k] = kv
-                                qsum += qv * qv
-                                ksum += kv * kv
-                                if tile == 0:
-                                    kg[kg_base + k.to(Int64)] = BFloat16(kv)
-                            qinv = cute.math.rsqrt(
-                                warp_reduce(qsum, _add) + 1.0e-6, fastmath=False
-                            )
-                            kinv = cute.math.rsqrt(
-                                warp_reduce(ksum, _add) + 1.0e-6, fastmath=False
-                            )
-                            for j in cutlass.range_constexpr(4):
-                                k = lane + j * 32
-                                vectors[0, k] = Float32(vectors[0, k]) * qinv * scale
-                                vectors[1, k] = Float32(vectors[1, k]) * kinv
-                        if tid < 128:
-                            raw = Float32(
-                                gate[
-                                    token * self.strides[1]
-                                    + head.to(Int64) * self.strides[2]
-                                    + tid.to(Int64)
-                                ]
-                            )
-                            biased = raw + Float32(
-                                bias[head.to(Int64) * self.strides[5] + tid.to(Int64)]
-                            )
-                            activated = lower / (
-                                1.0 + cute.math.exp(-a * biased, fastmath=False)
-                            )
-                            vectors[2, tid] = cute.math.exp(activated, fastmath=False)
+                        qsum = Float32(0.0)
+                        ksum = Float32(0.0)
+                        for j in cutlass.range_constexpr(4):
+                            k = lane + j * 32
+                            qv = Float32(mixed[q_base + k.to(Int64)])
+                            kv = Float32(mixed[k_base + k.to(Int64)])
+                            vectors[0, pos, k] = qv
+                            vectors[1, pos, k] = kv
+                            qsum += qv * qv
+                            ksum += kv * kv
                             if tile == 0:
-                                kg[kg_base + 128 + tid.to(Int64)] = BFloat16(raw)
-                        cute.arch.sync_threads()
+                                kg[kg_base + k.to(Int64)] = BFloat16(kv)
+                        qinv = cute.math.rsqrt(
+                            warp_reduce(qsum, _add) + 1.0e-6, fastmath=False
+                        )
+                        kinv = cute.math.rsqrt(
+                            warp_reduce(ksum, _add) + 1.0e-6, fastmath=False
+                        )
+                        for j in cutlass.range_constexpr(4):
+                            k = lane + j * 32
+                            vectors[0, pos, k] = (
+                                Float32(vectors[0, pos, k]) * qinv * scale
+                            )
+                            vectors[1, pos, k] = Float32(vectors[1, pos, k]) * kinv
+                for step in cutlass.range_constexpr(
+                    (self.window * 128 + threads - 1) // threads
+                ):
+                    index = tid + step * threads
+                    pos = index // 128
+                    column = index % 128
+                    if index < self.window * 128 and pos < count:
+                        token = Int64(start + pos)
+                        raw = Float32(
+                            gate[
+                                token * self.strides[1]
+                                + head.to(Int64) * self.strides[2]
+                                + column.to(Int64)
+                            ]
+                        )
+                        biased = raw + Float32(
+                            bias[head.to(Int64) * self.strides[5] + column.to(Int64)]
+                        )
+                        activated = lower / (
+                            1.0 + cute.math.exp(-a * biased, fastmath=False)
+                        )
+                        vectors[2, pos, column] = cute.math.exp(
+                            activated, fastmath=False
+                        )
+                        if tile == 0:
+                            kg_base = (
+                                source * kg_stride
+                                + (head.to(Int64) * self.window + Int64(pos)) * 256
+                            )
+                            kg[kg_base + 128 + column.to(Int64)] = BFloat16(raw)
+                cute.arch.sync_threads()
+                for pos in cutlass.range_constexpr(self.window):
+                    if pos < count:
+                        token = Int64(start + pos)
                         dot = Float32(0.0)
                         for j in cutlass.range_constexpr(16):
                             k = key_lane + j * 8
-                            s[j] = s[j] * Float32(vectors[2, k])
-                            dot += s[j] * Float32(vectors[1, k])
+                            s[j] = s[j] * Float32(vectors[2, pos, k])
+                            dot += s[j] * Float32(vectors[1, pos, k])
                         dot = warp_reduce(dot, _add, 8)
-                        value = Float32(
-                            mixed[
-                                token * self.strides[0]
-                                + (2 * self.heads + head.to(Int64)) * 128
-                                + row.to(Int64)
-                            ]
-                        )
-                        b = Float32(
-                            beta[
-                                token * beta_row_stride
-                                + head.to(Int64) * beta_head_stride
-                            ]
-                        )
-                        delta = (value - dot) / (
-                            1.0 + cute.math.exp(-b, fastmath=False)
+                        delta = (values[pos] - dot) / (
+                            1.0 + cute.math.exp(-betas[pos], fastmath=False)
                         )
                         decoded = Float32(0.0)
                         for j in cutlass.range_constexpr(16):
                             k = key_lane + j * 8
-                            s[j] = s[j] + delta * Float32(vectors[1, k])
-                            decoded += s[j] * Float32(vectors[0, k])
+                            s[j] = s[j] + delta * Float32(vectors[1, pos, k])
+                            decoded += s[j] * Float32(vectors[0, pos, k])
                         decoded = warp_reduce(decoded, _add, 8)
                         if key_lane == 0:
                             out = (
@@ -237,7 +274,6 @@ class _Verify:
                                 + row.to(Int64)
                             )
                             corrections[record] = delta
-                        cute.arch.sync_threads()
 
 
 class _Commit:
@@ -453,7 +489,7 @@ def compile_recovery(query, config):
         Float32(-5.0),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "sequence.gdn_decode.kda_verify_records", 1, key
+            "sequence.gdn_decode.kda_verify_records", 2, key
         ),
     )
     ctypes = (Int64,) * 6 + (a_type, bias_type, index_type) + (Int32,) * 4

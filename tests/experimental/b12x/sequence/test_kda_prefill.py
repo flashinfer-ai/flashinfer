@@ -1228,6 +1228,67 @@ def test_op_cuda_graph_replay_uses_device_metadata() -> None:
     graph.reset()
 
 
+def test_compiled_graph_retains_cute_pipeline_and_device_metadata() -> None:
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    from b12x.sequence.kda_prefill import run
+
+    from ..conftest import require_b12x
+
+    device = require_b12x()
+    inputs = make_inputs(lengths=[64], heads=2, seed=91, device=device, state_slots=4)
+    binding, tensors = make_binding(inputs, max_tokens=64, max_seqs=1)
+    tensors["num_tokens"].zero_()
+    tensors["num_seqs"].zero_()
+    traced = make_fx(lambda: run(binding, lower_bound=-5.0))()
+    assert any(
+        node.op == "call_function" and node.target == torch.ops.b12x.kda_prefill.default
+        for node in traced.graph.nodes
+    )
+    compiled = torch.compile(
+        traced, fullgraph=True, dynamic=False, options={"triton.cudagraphs": False}
+    )
+    compiled()
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled()
+    torch.cuda.synchronize(device)
+    try:
+        for count in (17, 64, 0):
+            tensors["cu_seqlens"][1] = count
+            tensors["num_tokens"].fill_(count)
+            tensors["num_seqs"].fill_(1)
+            original = inputs["pool"]
+            tensors["recurrent_state"].copy_(original)
+            tensors["output"].fill_(-9)
+            run(binding, lower_bound=-5.0)
+            expected_output = tensors["output"].clone()
+            expected_state = tensors["recurrent_state"].clone()
+            tensors["recurrent_state"].copy_(original)
+            tensors["output"].fill_(-9)
+            torch.cuda.synchronize(device)
+            before = torch.cuda.memory_stats(device)
+            graph.replay()
+            torch.cuda.synchronize(device)
+            after = torch.cuda.memory_stats(device)
+            for key in (
+                "allocation.all.allocated",
+                "allocation.all.freed",
+                "segment.all.allocated",
+                "segment.all.freed",
+            ):
+                assert before[key] == after[key]
+            torch.testing.assert_close(
+                tensors["output"], expected_output, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                tensors["recurrent_state"], expected_state, rtol=0, atol=0
+            )
+    finally:
+        graph.reset()
+
+
 def test_op_read_only_inputs_are_immutable() -> None:
     from ..conftest import require_b12x
 

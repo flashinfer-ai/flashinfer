@@ -97,7 +97,7 @@ def _fused_b_tile(query: WoProjectionQuery, config, device):
     if override:
         return tuple(map(int, override.split("x")))
     if query.wo_b_tiled:
-        from b12x._lib.dense_gemm import _select_default_dense_gemm_plan
+        from b12x._lib.dense_gemm.policy import _select_default_dense_gemm_plan
 
         selected = _select_default_dense_gemm_plan(
             query.max_tokens,
@@ -133,7 +133,7 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
             return None
         key = (device.identity, config)
         if key not in fused:
-            from b12x._lib.dense_gemm import _lower_dense_gemm_fused_quant_a
+            from b12x._lib.dense_gemm.preparation import _lower_dense_gemm_fused_quant_a
             from b12x.gemm._preparation import _metadata_operands
             from b12x.gemm._tuning import DenseGemmQuery
 
@@ -256,7 +256,7 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
             caps, config=config
         ).scratch_specs()
         # Fused dense retains alpha-one; only its state may allocate that scalar.
-        from b12x._lib.dense_gemm import _ALPHA_ONE_CACHE
+        from b12x._lib.dense_gemm.buffers import _ALPHA_ONE_CACHE
 
         alpha = _ALPHA_ONE_CACHE.get(("cuda", device.ordinal))
         resident = 0 if alpha is None else alpha.numel() * alpha.element_size()
@@ -266,7 +266,7 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
         return MemoryRequirements(scratch=scratch, persistent=persistent)
 
     def materialize(selection, device):
-        from b12x._lib.dense_gemm import (
+        from b12x._lib.dense_gemm.preparation import (
             _materialize_dense,
             _materialize_dense_fused_quant,
         )
@@ -296,19 +296,19 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
         override=override,
         _compile_jobs=lambda config, device: (
             CompileJob.create(
-                "b12x._lib.dense_gemm:_compile_dense_lowering",
+                "b12x._lib.dense_gemm.preparation:_compile_dense_lowering",
                 ordinary_states(config, device)[0].to_dict(),
                 device.ordinal,
             ),
             CompileJob.create(
-                "b12x._lib.dense_gemm:_compile_dense_lowering",
+                "b12x._lib.dense_gemm.preparation:_compile_dense_lowering",
                 ordinary_states(config, device)[1].to_dict(),
                 device.ordinal,
             ),
             *(
                 (
                     CompileJob.create(
-                        "b12x._lib.dense_gemm:_compile_dense_fused_quant_lowering",
+                        "b12x._lib.dense_gemm.preparation:_compile_dense_fused_quant_lowering",
                         fused_b(config, device).to_dict(),
                         device.ordinal,
                     ),

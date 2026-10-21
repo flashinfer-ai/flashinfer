@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import b12x._lib.dense_gemm.preparation as _module__lib_dense_gemm_preparation
+
+
 from dataclasses import dataclass
 
 import torch
@@ -36,7 +39,7 @@ def _storage_nbytes(m: int, k: int) -> int:
 
 
 def _lowering(query, device):
-    from b12x._lib.dense_gemm import _lower_dense_gemm
+    from b12x._lib.dense_gemm.preparation import _lower_dense_gemm
 
     m, k, n = query.max_tokens, query.in_features, query.out_features
     a_dtype = torch.float8_e4m3fn if query.activation_format == "e4m3" else torch.uint8
@@ -102,7 +105,6 @@ class _CompiledMxfp6Dense:
 @program_cache(scope="preparation")
 def compile_mxfp6_dense(query_payload, config_payload, ordinal, sm_count):
     """Compile every launcher consumed by one exact prepared FP6 invocation."""
-    from b12x._lib import dense_gemm as dense
     from . import compile_bf16_to_fp6_tma
     from .bf16_to_fp6_small_m import compile_bf16_to_fp6_small_m
     from .fp6_row_gs import compile_fp6_row_gs
@@ -118,7 +120,9 @@ def compile_mxfp6_dense(query_payload, config_payload, ordinal, sm_count):
     lowering = _lowering(query, Device())
     padded_m = align_up(query.max_tokens, 128)
     with torch.cuda.device(ordinal):
-        programs = dense._compile_dense_lowering(lowering.to_dict(), ordinal)
+        programs = _module__lib_dense_gemm_preparation._compile_dense_lowering(
+            lowering.to_dict(), ordinal
+        )
         if query.max_tokens <= 16:
             quantize = compile_bf16_to_fp6_small_m(
                 query.max_tokens,
@@ -319,7 +323,7 @@ def plan(query: Mxfp6DenseQuery, *, invocation=FrozenMapping(), override=None) -
         return _Mxfp6DenseState(
             query,
             target,
-            dense._DenseExecutionState(
+            _module__lib_dense_gemm_preparation._DenseExecutionState(
                 compiled.lowering,
                 target,
                 compiled.dense_programs["gemm"],

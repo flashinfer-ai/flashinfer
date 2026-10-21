@@ -16,10 +16,10 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as compile_cute
 from b12x._lib.compiler import run_compiled
-from b12x._lib.intrinsics.math import fabs_f32, fmax_f32
-from b12x._lib.intrinsics.memory import ld_global_v4_u32, st_global_v4_u32, u32_as_f32
 from b12x._lib.intrinsics.packed import bfloat2_to_float2_scaled, pack_f32x2_to_bfloat2
 from b12x._lib.intrinsics.reduction import block_reduce, warp_reduce
+from b12x._lib.intrinsics.math import fabs_f32, fmax_f32
+from b12x._lib.intrinsics.memory import ld_global_v4_u32, st_global_v4_u32, u32_as_f32
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
@@ -81,9 +81,10 @@ class _GroupedRmsNorm:
         output: cute.Pointer,
         eps: Float32,
         rows: Int32,
+        state_row_stride: Int64,
         stream: cuda.CUstream,
     ) -> None:
-        self.kernel(state, weight, output, eps).launch(
+        self.kernel(state, weight, output, eps, state_row_stride).launch(
             grid=(rows, 1, 1),
             block=(_THREADS, 1, 1),
             stream=stream,
@@ -96,6 +97,7 @@ class _GroupedRmsNorm:
         weight: cute.Pointer,
         output: cute.Pointer,
         eps: Float32,
+        state_row_stride: Int64,
     ) -> None:
         row, _, _ = cute.arch.block_idx()
         thread, _, _ = cute.arch.thread_idx()
@@ -103,6 +105,7 @@ class _GroupedRmsNorm:
         thread_i = Int32(thread)
         base = row_i * Int64(self.hidden_size)
         weight_base = Int64(Int32(row) % Int32(self.streams)) * Int64(self.hidden_size)
+        source_base = (row_i // Int64(self.streams)) * state_row_stride + weight_base
 
         values = cute.make_rmem_tensor((self.items,), Float32)
         square_sum = Float32(0.0)
@@ -110,7 +113,7 @@ class _GroupedRmsNorm:
             column = thread_i + Int32(item * _THREADS)
             value = Float32(0.0)
             if column < Int32(self.hidden_size):
-                value = Float32(state[base + column.to(Int64)])
+                value = Float32(state[source_base + column.to(Int64)])
             values[item] = value
             square_sum += value * value
 
@@ -308,12 +311,17 @@ class _Pointwise:
         width: int = 1,
         limit: float = float("inf"),
         round_silu: bool = False,
+        clamp_after_silu: bool = False,
+        heads: int = 1,
+        gate_stride: int = 0,
     ) -> None:
         self.operation = operation
         self.output_dtype = output_dtype
         self.width = int(width)
         self.limit = float(limit)
         self.round_silu = bool(round_silu)
+        self.clamp_after_silu = bool(clamp_after_silu)
+        self.heads, self.gate_stride = int(heads), int(gate_stride)
 
     @cute.jit
     def __call__(
@@ -347,18 +355,34 @@ class _Pointwise:
                 source += offset % Int64(self.width)
                 gate = Float32(left[source])
                 up = Float32(left[source + Int64(self.width)])
-                if gate > Float32(self.limit):
-                    gate = Float32(self.limit)
+                if cutlass.const_expr(not self.clamp_after_silu):
+                    if gate > Float32(self.limit):
+                        gate = Float32(self.limit)
                 if up > Float32(self.limit):
                     up = Float32(self.limit)
                 if up < Float32(-self.limit):
                     up = Float32(-self.limit)
                 activated = gate * _sigmoid(gate)
+                if cutlass.const_expr(self.clamp_after_silu):
+                    if activated > Float32(self.limit):
+                        activated = Float32(self.limit)
                 if cutlass.const_expr(self.round_silu):
                     activated = Float32(BFloat16(activated))
                 value = activated * up
             elif cutlass.const_expr(self.operation == "add"):
                 value = Float32(left[offset]) + Float32(right[offset])
+            elif cutlass.const_expr(self.operation == "relu2"):
+                activated = Float32(left[offset])
+                if activated < Float32(0):
+                    activated = Float32(0)
+                value = activated * activated
+            elif cutlass.const_expr(self.operation == "head_gate"):
+                row = offset // Int64(self.width * self.heads)
+                head = (offset // Int64(self.width)) % Int64(self.heads)
+                gate = BFloat16(
+                    _sigmoid(Float32(right[row * Int64(self.gate_stride) + head]))
+                )
+                value = Float32(left[offset]) * Float32(gate)
             else:
                 value = _sigmoid(Float32(left[offset]))
             output[offset] = value.to(self.output_dtype)
@@ -467,9 +491,17 @@ class _Combine:
 
 
 class _CombineNorm:
-    def __init__(self, streams: int, hidden_size: int) -> None:
+    def __init__(
+        self,
+        streams: int,
+        hidden_size: int,
+        zero_centered: bool = True,
+        fp32_weight: bool = False,
+    ) -> None:
         self.streams = int(streams)
         self.hidden_size = int(hidden_size)
+        self.zero_centered = bool(zero_centered)
+        self.fp32_weight = bool(fp32_weight)
         self.items = (self.hidden_size + _THREADS - 1) // _THREADS
 
     @cute.jit
@@ -563,9 +595,11 @@ class _CombineNorm:
         for item in cutlass.range_constexpr(self.items):
             column = thread_i + Int32(item * _THREADS)
             if column < Int32(self.hidden_size):
-                learned = Float32(weight[weight_base + column.to(Int64)])
+                gain = Float32(weight[weight_base + column.to(Int64)])
+                if cutlass.const_expr(self.zero_centered):
+                    gain += Float32(1.0)
                 normalized[state_base + column.to(Int64)] = BFloat16(
-                    rounded[item] * inv_rms * (Float32(1.0) + learned)
+                    rounded[item] * inv_rms * gain
                 )
 
 
@@ -574,9 +608,17 @@ class _PackedCombineNorm:
     _THREADS = 256
     _WARPS = _THREADS // 32
 
-    def __init__(self, streams: int, hidden_size: int) -> None:
+    def __init__(
+        self,
+        streams: int,
+        hidden_size: int,
+        zero_centered: bool = True,
+        fp32_weight: bool = False,
+    ) -> None:
         self.streams = int(streams)
         self.hidden_size = int(hidden_size)
+        self.zero_centered = bool(zero_centered)
+        self.fp32_weight = bool(fp32_weight)
         self.packs = self.hidden_size // self._PACK_ELEMENTS
         self.items = (self.packs + self._THREADS - 1) // self._THREADS
 
@@ -653,7 +695,7 @@ class _PackedCombineNorm:
             self.hidden_size * 2
         )
         weight_base = Int64(weight.toint()) + Int64(residual_stream) * Int64(
-            self.hidden_size * 2
+            self.hidden_size * (4 if self.fp32_weight else 2)
         )
         combined_base = Int64(combined.toint()) + (
             (Int64(token) * Int64(self.streams) + Int64(residual_stream))
@@ -716,18 +758,31 @@ class _PackedCombineNorm:
             pack = thread_i + Int32(item * self._THREADS)
             if pack < Int32(self.packs):
                 byte_offset = pack.to(Int64) * Int64(16)
-                weight_words = ld_global_v4_u32(weight_base + byte_offset)
+                gains = cute.make_rmem_tensor((self._PACK_ELEMENTS,), Float32)
+                if cutlass.const_expr(self.fp32_weight):
+                    for half in cutlass.range_constexpr(2):
+                        words = ld_global_v4_u32(
+                            weight_base + byte_offset * Int64(2) + Int64(half * 16)
+                        )
+                        for word in cutlass.range_constexpr(4):
+                            gains[half * 4 + word] = u32_as_f32(words[word])
+                else:
+                    weight_words = ld_global_v4_u32(weight_base + byte_offset)
+                    for word in cutlass.range_constexpr(4):
+                        lo, hi = bfloat2_to_float2_scaled(
+                            weight_words[word], Float32(1.0)
+                        )
+                        gains[word * 2], gains[word * 2 + 1] = lo, hi
                 normalized_words = cute.make_rmem_tensor((4,), Uint32)
                 for word in cutlass.range_constexpr(4):
-                    weight_lo, weight_hi = bfloat2_to_float2_scaled(
-                        weight_words[word], Float32(1.0)
-                    )
                     element = word * 2
+                    weight_lo, weight_hi = gains[element], gains[element + 1]
+                    if cutlass.const_expr(self.zero_centered):
+                        weight_lo += Float32(1.0)
+                        weight_hi += Float32(1.0)
                     normalized_words[word] = pack_f32x2_to_bfloat2(
-                        rounded[item, element] * inv_rms * (Float32(1.0) + weight_lo),
-                        rounded[item, element + 1]
-                        * inv_rms
-                        * (Float32(1.0) + weight_hi),
+                        rounded[item, element] * inv_rms * weight_lo,
+                        rounded[item, element + 1] * inv_rms * weight_hi,
                     )
                 st_global_v4_u32(
                     normalized_base + byte_offset,
@@ -796,7 +851,7 @@ def _compile(
                 *args,
                 compile_spec=KernelCompileSpec.from_key(
                     "norm.hyperconnection.cute",
-                    7,
+                    9,
                     key,
                 ),
             )
@@ -873,6 +928,7 @@ def grouped_rmsnorm(
         (state, weight, output),
         eps=eps,
         runtime_ints=(rows,),
+        runtime_int64s=(int(state.stride(0)),),
     )
 
 
@@ -943,6 +999,7 @@ def combine_norm(
     eps: float,
     streams: int,
     hidden_size: int,
+    zero_centered: bool = True,
 ) -> None:
     tokens = int(state.shape[0])
     packed = int(hidden_size) % _PackedCombineNorm._PACK_ELEMENTS == 0
@@ -951,13 +1008,19 @@ def combine_norm(
         _device_index(state),
         int(streams),
         int(hidden_size),
+        str(weight.dtype),
+        bool(zero_centered),
     )
     _run(
         key,
         (
-            _PackedCombineNorm(streams, hidden_size)
+            _PackedCombineNorm(
+                streams, hidden_size, zero_centered, weight.dtype == torch.float32
+            )
             if packed
-            else _CombineNorm(streams, hidden_size)
+            else _CombineNorm(
+                streams, hidden_size, zero_centered, weight.dtype == torch.float32
+            )
         ),
         (state, block_output, logits, weight, combined, normalized),
         eps=eps,

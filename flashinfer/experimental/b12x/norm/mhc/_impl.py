@@ -20,6 +20,7 @@ from b12x._lib.scratch_layout import (
 )
 from b12x.preparation.types import Plan, plan_from_handle, require_prepared
 from ._tuning import MhcConfig, MhcQuery
+from ._alias import overlaps
 
 MHC_MULT = 4
 MHC_MIXES = (2 + MHC_MULT) * MHC_MULT
@@ -691,11 +692,11 @@ def _lagged_mix_views(
         name="pre_out",
     )
     assert pre_out is not None
-    if torch._C._overlaps(pre_mix, pre_out):
+    if overlaps(pre_mix, pre_out):
         raise ValueError("pre_mix and pre_out must not alias; use ping-pong buffers")
     for tensor in (*outputs, *inputs):
         if tensor is not None and (
-            torch._C._overlaps(pre_mix, tensor) or torch._C._overlaps(pre_out, tensor)
+            overlaps(pre_mix, tensor) or overlaps(pre_out, tensor)
         ):
             raise ValueError(
                 "lagged MHC coefficient buffers must not alias inputs, outputs, or scratch"
@@ -704,7 +705,7 @@ def _lagged_mix_views(
 
 
 def _validate_lagged_y_output(y, tensors):
-    if any(tensor is not None and torch._C._overlaps(y, tensor) for tensor in tensors):
+    if any(tensor is not None and overlaps(y, tensor) for tensor in tensors):
         raise ValueError(
             "lagged mHC y output must not alias inputs, residual output, or scratch"
         )
@@ -1729,7 +1730,26 @@ def b12x_mhc_pre(
     norm_eps=0.0,
     binding: B12XMHCBinding | None = None,
 ):
+    from . import _ops
+
     plan = _plan_from_binding(plan, binding)
+    if _ops.complete(binding, pre_mix):
+        return _ops.run(
+            binding,
+            (residual, fn, hc_scale, hc_base),
+            operation="pre",
+            rms_eps=rms_eps,
+            hc_eps=hc_eps,
+            sinkhorn_iters=sinkhorn_iters,
+            pre_mix=pre_mix,
+            pre_out=pre_out,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            residual_out=residual_out,
+            y_out=y_out,
+            post_out=post_out,
+            comb_out=comb_out,
+        )
     functional = binding is None and all(
         value is None for value in (residual_out, y_out, post_out, comb_out)
     )
@@ -1810,7 +1830,27 @@ def b12x_mhc_post_pre(
     norm_eps=0.0,
     binding: B12XMHCBinding | None = None,
 ):
+    from . import _ops
+
     plan = _plan_from_binding(plan, binding)
+    if _ops.complete(binding, pre_mix):
+        return _ops.run(
+            binding,
+            (x, residual, prev_post, prev_comb, fn, hc_scale, hc_base),
+            operation="post_pre",
+            rms_eps=rms_eps,
+            hc_eps=hc_eps,
+            sinkhorn_iters=sinkhorn_iters,
+            pre_mix=pre_mix,
+            pre_out=pre_out,
+            fn_bf16=fn_bf16,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            residual_out=residual_out,
+            y_out=y_out,
+            post_out=post_out,
+            comb_out=comb_out,
+        )
     functional = binding is None and all(
         value is None for value in (residual_out, y_out, post_out, comb_out)
     )
@@ -1884,16 +1924,10 @@ def b12x_mhc_post(x, residual, prev_post, prev_comb, *, plan: Plan, out=None):
         return torch.ops.b12x.mhc_post_planned_functional(
             x, residual, prev_post, prev_comb, plan.handle
         )
-    if torch.compiler.is_compiling():
-        raise RuntimeError("caller-owned MHC outputs are not supported inside Dynamo")
-    return _b12x_mhc_post_impl(
-        x,
-        residual,
-        prev_post,
-        prev_comb,
-        out=out,
-        _state=_prepared_state(plan, output_mode="provided"),
-    )
+    from . import _ops
+
+    _ops.post(x, residual, prev_post, prev_comb, out, plan.handle)
+    return out if out.shape[0] == residual.shape[0] else out[: residual.shape[0]]
 
 
 def run_collapse(state, pre_mix, *, out, plan: Plan):

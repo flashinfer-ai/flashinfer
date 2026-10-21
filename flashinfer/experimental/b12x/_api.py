@@ -22,6 +22,7 @@ import importlib
 import sys
 from typing import Any
 
+# Registry dispatch selects entrypoints; compiled targets supply their source roots.
 __b12x_source_dependencies__ = ()
 
 from ._lib.meta import OpMeta
@@ -45,6 +46,7 @@ _OPS: tuple[str, ...] = (
     "comm.pcie",
     "comm.roce",
     "gemm.bf16_gemv",
+    "gemm.hyperconnection_gate",
     "gemm.bf16_vocab_projection",
     "gemm.blockscaled",
     "gemm.block_fp8_linear",
@@ -63,6 +65,8 @@ _OPS: tuple[str, ...] = (
     "sequence.ple_hash",
     "sequence.ple_embedding",
     "sequence.ple",
+    "sequence.short_conv",
+    "sequence.mamba_ssd",
     "sequence.engram",
     "sequence.embedding",
     "sequence.gdn_decode",

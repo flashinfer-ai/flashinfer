@@ -104,10 +104,9 @@ from b12x._lib.intrinsics.quantization import (
 )
 from b12x._lib.intrinsics.reduction import warp_reduce
 from b12x._lib.smem import make_smem_memrange_alias
-from b12x._lib.dense_gemm import (
-    DenseGemmKernel,
-    _expand_packed_b_stage_smem,
-    _reshape_acc_to_mn,
+from b12x._lib.dense_gemm.config import _expand_packed_b_stage_smem, _reshape_acc_to_mn
+from b12x._lib.dense_gemm.kernel import DenseGemmKernel
+from b12x._lib.utils.scale_layout import (
     sm120_make_smem_layout_sfa,
     sm120_make_smem_layout_sfb,
 )

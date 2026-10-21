@@ -97,7 +97,7 @@ def _prepared(rhs, major, m):
 
 
 @pytest.mark.parametrize("major", ["n", "k"])
-@pytest.mark.parametrize("m", [1, 4, 16, 32])
+@pytest.mark.parametrize("m", [1, 4, 16, 32, 65, 4096])
 def test_bmm_preserves_qualified_layouts_and_numerics(major, m):
     require_b12x()
     rhs = _rhs_views(*_make_pack())[major]

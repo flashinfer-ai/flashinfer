@@ -47,9 +47,9 @@ class HyperConnectionCaps:
             raise ValueError(f"streams must be positive, got {streams}")
         if lowrank <= 0:
             raise ValueError(f"lowrank must be positive, got {lowrank}")
-        if self.dtype != torch.bfloat16:
+        if self.dtype not in (torch.bfloat16, torch.float32):
             raise TypeError(
-                f"HyperConnection kernels require torch.bfloat16, got {self.dtype}"
+                f"HyperConnection kernels require torch.bfloat16 or torch.float32, got {self.dtype}"
             )
         object.__setattr__(self, "device", device)
         object.__setattr__(self, "max_tokens", max_tokens)
@@ -152,7 +152,9 @@ class _HyperConnectionState:
                 tensor,
                 tokens=live_tokens,
                 tail=tails[name],
-                dtype=caps.dtype,
+                dtype=getattr(torch, self.query.output_dtype)
+                if name == "normalized"
+                else caps.dtype,
                 device=caps.device,
                 name=name,
             )
@@ -276,7 +278,15 @@ def _require_eps(eps: float) -> float:
 
 
 def run_grouped_rmsnorm_impl(
-    state, weight, *, eps, plan: _HyperConnectionState, out, zero_centered=True
+    state,
+    weight,
+    *,
+    eps,
+    plan: _HyperConnectionState,
+    out,
+    zero_centered=True,
+    residual=None,
+    paired=None,
 ):
     _require_cuda(plan)
     plan.require_operation("grouped_rmsnorm", eps=eps)
@@ -285,7 +295,37 @@ def run_grouped_rmsnorm_impl(
     caps = plan.caps
     tokens = plan._live_tokens(state.shape[0])
     width = caps.streams * caps.hidden_size
-    _validate_input(state, shape=(tokens, width), caps=caps, name="state")
+    _validate_input(
+        state,
+        shape=(tokens, caps.hidden_size if plan.query.paired else width),
+        caps=caps,
+        name="state",
+        row_strided=True,
+    )
+    if (paired is not None) != plan.query.paired:
+        raise ValueError("paired normalization differs from preparation")
+    if paired is not None:
+        _validate_input(
+            paired, shape=state.shape, caps=caps, name="paired", row_strided=True
+        )
+        _validate_output_disjoint("normalized", out, (("paired", paired),))
+    if (residual is not None) != plan.query.add_residual:
+        raise ValueError("residual addition differs from preparation")
+    if residual is not None:
+        if (
+            residual.shape != state.shape
+            or residual.dtype != getattr(torch, plan.query.right_dtype)
+            or residual.device != state.device
+            or residual.stride(-1) != 1
+        ):
+            raise ValueError(
+                "residual must match the prepared normalization geometry and dtype"
+            )
+        from ._kernels import _require_disjoint
+
+        _require_disjoint(
+            "state", state, (("residual", residual), ("weight", weight), ("out", out))
+        )
     if weight.dtype != getattr(torch, plan.query.weight_dtype):
         raise ValueError("affine weight dtype differs from preparation")
     if (
@@ -300,13 +340,19 @@ def run_grouped_rmsnorm_impl(
         out,
         tokens=tokens,
         tail=(width,),
-        dtype=caps.dtype,
+        dtype=getattr(torch, plan.query.output_dtype),
         device=caps.device,
         name="out",
     )
     _validate_output_disjoint("normalized", out, (("state", state), ("weight", weight)))
     if tokens:
-        plan.launch(state, weight, out, eps=eps)
+        if paired is not None:
+            plan.launch(state, weight, out, eps=eps, paired=paired)
+        elif residual is None:
+            plan.launch(state, weight, out, eps=eps)
+        else:
+            _validate_output_disjoint("normalized", out, (("residual", residual),))
+            plan.launch(state, weight, out, eps=eps, residual=residual)
     return out[:tokens]
 
 
@@ -421,9 +467,15 @@ def run_combine_norm_impl(
     *,
     eps: float,
     plan: _HyperConnectionState,
+    zero_centered: bool = True,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _require_cuda(plan)
     plan.require_operation("combine_norm", eps=eps)
+    if bool(zero_centered) != plan.query.zero_centered:
+        raise ValueError("normalization recipe differs from preparation")
+    if plan.query.output_mode != ("functional" if out is None else "provided"):
+        raise ValueError("output form differs from preparation")
     caps = plan.caps
     tokens = plan._live_tokens(state.shape[0])
     _validate_combine_inputs(
@@ -433,16 +485,14 @@ def run_combine_norm_impl(
         plan=plan,
         tokens=tokens,
     )
-    _validate_input(
-        next_norm_weight,
-        shape=(caps.streams * caps.hidden_size,),
-        caps=caps,
-        name="next_norm_weight",
-    )
+    if next_norm_weight.dtype != getattr(torch, plan.query.weight_dtype):
+        raise ValueError("affine weight dtype differs from preparation")
     eps = _require_eps(eps)
     from ._cute_config import require_cute_combine_norm
 
-    combined, normalized = torch.empty_like(state), torch.empty_like(state)
+    combined, normalized = (
+        out if out is not None else (torch.empty_like(state), torch.empty_like(state))
+    )
     require_cute_combine_norm(
         state=state,
         block_output=block_output,
@@ -453,6 +503,29 @@ def run_combine_norm_impl(
         streams=caps.streams,
         hidden_size=caps.hidden_size,
     )
+    _validate_output_disjoint(
+        "normalized",
+        normalized,
+        (
+            ("state", state),
+            ("block_output", block_output),
+            ("injection_logits", injection_logits),
+            ("next_norm_weight", next_norm_weight),
+            ("combined", combined),
+        ),
+    )
+    _validate_output_disjoint(
+        "combined",
+        combined,
+        (
+            ("block_output", block_output),
+            ("injection_logits", injection_logits),
+            ("next_norm_weight", next_norm_weight),
+        ),
+    )
+    if not torch.compiler.is_compiling() and _overlaps(combined, state):
+        if _byte_interval(combined) != _byte_interval(state):
+            raise ValueError("combined may only overlap state through an exact alias")
     if tokens:
         plan.launch(
             state,
@@ -560,9 +633,11 @@ def run_swiglu_impl(
     round_silu: bool = False,
     plan: _HyperConnectionState,
 ) -> torch.Tensor:
-    """Clamp gate above only and up symmetrically, then compute FP32 SiLU*up.
+    """Compute FP32 SiLU*up with the prepared gate-clamp placement.
 
     Inputs are BF16 FC1 outputs, with gate followed by up along the last axis.
+    The invocation's ``clamp_after_silu`` moves the upper clamp from gate to
+    SiLU(gate); up is always clamped symmetrically.
     ``round_silu=True`` rounds SiLU to BF16 before multiplying for vision.
     ``limit=inf`` disables clamping. No activation scaling is applied.
     Warm once before capture; ``out`` is disjoint caller-owned BF16 storage.
@@ -596,6 +671,25 @@ def run_swiglu_impl(
     _validate_output_disjoint("out", out, (("gate_up", gate_up),))
     if out.numel():
         plan.launch(gate_up, gate_up, out)
+    return out
+
+
+def run_relu2_impl(source, *, out, plan: _HyperConnectionState):
+    """Apply squared ReLU to BF16 input with one final BF16 rounding."""
+    _require_cuda(plan)
+    plan.require_operation("relu2")
+    if source.ndim != 2 or source.shape[1] != plan.query.hidden_size:
+        raise ValueError("ReLU-squared input must match the prepared matrix width")
+    plan._live_tokens(source.shape[0])
+    if source.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
+        raise TypeError("ReLU-squared operands must be BF16")
+    for name, tensor in (("source", source), ("out", out)):
+        _validate_pointwise_tensor(
+            tensor, name=name, shape=tuple(source.shape), device=plan.caps.device
+        )
+    _validate_output_disjoint("out", out, (("source", source),))
+    if out.numel():
+        plan.launch(source, source, out)
     return out
 
 
@@ -659,6 +753,7 @@ __all__ = [
     "run_combine_norm_impl",
     "run_engram_mix_impl",
     "run_swiglu_impl",
+    "run_relu2_impl",
     "run_add_impl",
     "run_sigmoid_impl",
 ]

@@ -29,13 +29,6 @@ from b12x._lib.compiler import (
 )
 from b12x._lib.compiler import run_compiled
 from b12x._lib.compile_plan import compile_only_launches_enabled
-from b12x._lib.intrinsics.atomics import st_shared_u32
-from b12x._lib.intrinsics.memory import (
-    get_ptr_as_int64,
-    ld_global_nc_u32,
-    ldmatrix_m8n8x4_b16,
-    shared_ptr_to_u32,
-)
 from b12x._lib.intrinsics.mma import bf16_mma_m16n8k16_f32, tf32_mma_m16n8k8_f32
 from b12x._lib.intrinsics.packed import (
     bfloat2_to_float2_scaled,
@@ -43,7 +36,15 @@ from b12x._lib.intrinsics.packed import (
     f32_to_tf32_bits,
     pack_f32x2_to_bfloat2,
 )
+from b12x._lib.intrinsics.memory import (
+    get_ptr_as_int64,
+    ld_global_nc_u32,
+    ldmatrix_m8n8x4_b16,
+    shared_ptr_to_u32,
+)
+from b12x._lib.intrinsics.atomics import st_shared_u32
 from b12x._lib.utils.device import current_cuda_stream
+from ._alias import overlaps
 
 _PREFILL_TF32_TMA_LONG_4096_K_SPLITS = (
     None  # placeholder: undefined in the b12x migration; set the real value
@@ -135,9 +136,7 @@ def _run_mhc_collapse_launch(
     *,
     _prepared=None,
 ):
-    if torch._C._overlaps(state, out) or (
-        pre_mix is not None and torch._C._overlaps(pre_mix, out)
-    ):
+    if overlaps(state, out) or (pre_mix is not None and overlaps(pre_mix, out)):
         raise ValueError("collapse out must not alias state or pre_mix")
     tokens, _, hidden = state.shape
     if not tokens:
@@ -848,6 +847,7 @@ class MHCPostPrePartialKernel:
             ),
             block=[self.num_threads, 1, 1],
             stream=stream,
+            use_pdl=_MHC_PDL,
         )
 
     @cute.kernel
@@ -863,6 +863,10 @@ class MHCPostPrePartialKernel:
         pre_mix: cute.Tensor,
         y: cute.Tensor,
     ):
+        # Launched early behind the one-shot all-reduce that produces x; wait
+        # for it to complete before any global read.
+        if const_expr(_MHC_PDL):
+            cute.arch.griddepcontrol_wait()
         hidden_tile, partial_group, token = cute.arch.block_idx()
         token = Int64(token)
         tidx = cute.arch.thread_idx()[0]
@@ -4524,7 +4528,7 @@ def _run_mhc_post_pre_partial_launch(
     return _compile_mhc_entry(
         kernel,
         compile_spec=KernelCompileSpec.from_key(
-            compile_name, 4 if split_n_abi else 5, compile_key
+            compile_name, 4 if split_n_abi else 6, compile_key
         ),
         compile_args=args,
         runtime_args=args,
@@ -5288,7 +5292,7 @@ def _run_mhc_post_launch(
             split_k=split_k,
             post_only=True,
         ),
-        compile_spec=KernelCompileSpec.from_key(compile_name, 3, compile_key),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 4, compile_key),
         compile_args=args,
         runtime_args=args,
     )
@@ -5443,7 +5447,7 @@ def _run_mhc_pre_partial_launch(
             lagged_mix=lagged_mix,
             partials_per_cta=partials_per_cta,
         ),
-        compile_spec=KernelCompileSpec.from_key(compile_name, 3, compile_key),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 4, compile_key),
         compile_args=args,
         runtime_args=args,
     )

@@ -49,6 +49,7 @@ from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
+from b12x._lib.intrinsics.reduction import block_reduce, warp_reduce
 from b12x._lib.intrinsics.math import (
     cvt_f32_to_bf16_bits,
     div_rn_f32,
@@ -63,7 +64,6 @@ from b12x._lib.intrinsics.memory import (
     st_global_u16,
     u32_as_f32,
 )
-from b12x._lib.intrinsics.reduction import block_reduce, warp_reduce
 from b12x._lib.fp6 import (
     mx_gs_numerator,
     quantize_block_fp6_e2m3_bytes,

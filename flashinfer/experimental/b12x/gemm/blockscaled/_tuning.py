@@ -57,12 +57,20 @@ class BlockscaledConfig:
     tile_n: int | None = None
     tile_k: int | None = None
     split_k: int | None = None
+    mma_warps: int | None = None
 
     @classmethod
     def from_config(cls, payload):
-        if set(payload) != {"mode", "tile_m", "tile_n", "tile_k", "split_k"}:
+        if set(payload) != {
+            "mode",
+            "tile_m",
+            "tile_n",
+            "tile_k",
+            "split_k",
+            "mma_warps",
+        }:
             raise ValueError(
-                "packed precision config requires mode and four nullable A16 knobs"
+                "packed precision config requires mode and five nullable A16 knobs"
             )
         return cls(**dict(payload))
 
@@ -73,6 +81,7 @@ class BlockscaledConfig:
 def _validate_query(query, device):
     if not isinstance(query, BlockscaledQuery) or query.recipe not in (
         "nvfp4",
+        "mxfp4",
         "mxfp8",
         "iq2_xs",
         "iq2_xxs",
@@ -105,6 +114,10 @@ def _validate_query(query, device):
             raise ValueError(
                 "IQ2_XS requires BF16 activations without activation scaling"
             )
+    if query.recipe == "mxfp4" and (
+        query.activation_mode == "a16" or query.activation_scale_available
+    ):
+        raise ValueError("MXFP4 requires quantized activations without a global scale")
     if query.activation_mode not in ("auto", "a16", "quantized"):
         raise ValueError("activation mode must be auto, a16, or quantized")
     if query.output_mode not in (
@@ -150,9 +163,11 @@ def _automatic_a16(query, device):
 
 
 def _default_config(query, device):
-    if query.activation_mode == "quantized":
+    if query.activation_mode == "quantized" or query.recipe == "mxfp4":
         return BlockscaledConfig(mode="quantized")
-    if _automatic_a16(query, device):
+    if _automatic_a16(query, device) or (
+        query.recipe == "nvfp4" and not query.activation_scale_available
+    ):
         return _a16_default_config(query, device)
     if query.activation_mode == "a16" or query.recipe in BLOCK_CODECS:
         return _a16_default_config(query, device)
@@ -229,6 +244,35 @@ def _a16_default_config(query, device):
     )
 
 
+# The A16 warp-MMA kernel converts each MXFP8 weight tile per 16-row M tile, which
+# caps it near 150 TFLOPS on SM120 (BF16 GEMM ~420). From this many rows a prepared
+# A16 call expands the weight into caller scratch once and runs a BF16 GEMM instead.
+MXFP8_A16_DEQUANT_MIN_ROWS = 128
+# The expanded weight lives in shared caller scratch; larger weights (e.g. an
+# A16 MXFP8 LM head) keep the warp-MMA lowering instead of reserving it.
+MXFP8_A16_DEQUANT_MAX_BYTES = 256 << 20
+
+
+def mxfp8_a16_dequant(query, config):
+    """Whether an A16 MXFP8 plan carries the expanded-weight lowering.
+
+    It needs the caller-provided workspace (a plan-owned copy per layer would
+    duplicate the weight in BF16), an unpadded K and a BF16 weight that fits both
+    the caller's workspace limit and MXFP8_A16_DEQUANT_MAX_BYTES.
+    """
+    limit = MXFP8_A16_DEQUANT_MAX_BYTES
+    if query.workspace_nbytes is not None:
+        limit = min(limit, query.workspace_nbytes)
+    return (
+        query.recipe == "mxfp8"
+        and config.mode == "a16"
+        and query.workspace_form == "provided"
+        and query.num_tokens >= MXFP8_A16_DEQUANT_MIN_ROWS
+        and query.in_features == query.padded_in_features
+        and query.out_features * query.padded_in_features * 2 <= limit
+    )
+
+
 def functional_mxfp8_quantization(query, config):
     return (
         query.recipe == "mxfp8"
@@ -256,7 +300,19 @@ def _validate_config(query, config, device):
         raise ValueError("configuration conflicts with caller activation precision")
     if query.recipe in BLOCK_CODECS and config.mode != "a16":
         raise ValueError("IQ2_XS supports only A16 execution")
+    if config.mma_warps is not None and not (
+        type(config.mma_warps) is int
+        and config.mma_warps in (2, 4)
+        and config.mode == "a16"
+        and query.recipe == "mxfp8"
+        and config.tile_m in (None, 16)
+    ):
+        raise ValueError(
+            "explicit compute warps require two- or four-warp MXFP8 A16 M16 execution"
+        )
     if config.mode == "a16":
+        if query.recipe == "mxfp4":
+            raise ValueError("MXFP4 does not support A16 execution")
         simt = query.recipe in BLOCK_CODECS and config.tile_n == 4
         row_tiles = (
             (1, 2, 4, 8)
@@ -310,8 +366,10 @@ def _validate_config(query, config, device):
             for value in (config.tile_m, config.tile_n, config.tile_k, config.split_k)
         ):
             raise ValueError("quantized execution has no A16 launch knobs")
-        if query.padded_in_features % 128:
-            raise ValueError("quantized execution requires stored K128")
+        if query.padded_in_features % (256 if query.recipe == "mxfp4" else 128):
+            raise ValueError(
+                "quantized execution requires K256 for MXFP4 or K128 otherwise"
+            )
         if query.workspace_nbytes is not None and not functional_mxfp8_quantization(
             query, config
         ):
@@ -321,8 +379,9 @@ def _validate_config(query, config, device):
                 query.num_tokens,
                 query.out_features,
                 query.padded_in_features,
-                query.recipe == "nvfp4",
+                query.recipe in ("nvfp4", "mxfp4"),
                 (64, 64, 1),
+                group=16 if query.recipe == "nvfp4" else 32,
             )[-1]
             if query.workspace_nbytes < needed:
                 raise ValueError(
@@ -380,11 +439,14 @@ def _tuning_parameters(query, device):
     return ParameterSpace.create(
         TUNING.knobs,
         values={
-            "mode": ("a16",)
+            "mode": ("quantized",)
+            if query.recipe == "mxfp4"
+            else ("a16",)
             if query.recipe in BLOCK_CODECS
             else ("a16", "quantized")
             if query.activation_mode == "auto"
-            else (query.activation_mode,)
+            else (query.activation_mode,),
+            "mma_warps": (2, 4) if query.recipe == "mxfp8" else (None,),
         },
         predicates=(eligible,),
     )
@@ -400,13 +462,14 @@ def _equivalence(query, device, config):
         "tile_n": n,
         "tile_k": k,
         "split_k": split,
+        "mma_warps": (config.mma_warps or 4) if query.recipe == "mxfp8" else None,
     }
 
 
 TUNING = TuningContract(
     component_id="gemm.blockscaled_precision",
     query_schema_version=22,
-    config_schema_version=22,
+    config_schema_version=23,
     query_fields=frozenset(BlockscaledQuery.__dataclass_fields__),
     config_fields=frozenset(BlockscaledConfig.__dataclass_fields__),
     encode_query=lambda query: {
@@ -417,7 +480,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=_validate_config,
     default_config=_default_config,
-    candidate_contract_version=19,
+    candidate_contract_version=21,
     knobs=(
         Knob(
             name="mode", values=("a16", "quantized"), binding=ParameterBinding.COMPILE
@@ -430,6 +493,12 @@ TUNING = TuningContract(
         Knob(name="tile_n", values=(4, 64, 128), when=FrozenMapping({"mode": "a16"})),
         Knob(name="tile_k", values=(64, 128, 256), when=FrozenMapping({"mode": "a16"})),
         Knob(name="split_k", values=(1, 2, 4, 8), when=FrozenMapping({"mode": "a16"})),
+        Knob(
+            name="mma_warps",
+            values=None,
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"mode": "a16"}),
+        ),
     ),
     parameters=_tuning_parameters,
     equivalence_key=_equivalence,

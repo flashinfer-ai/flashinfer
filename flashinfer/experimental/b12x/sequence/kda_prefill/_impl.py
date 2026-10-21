@@ -241,10 +241,9 @@ def run(
     """
     if not isinstance(binding, Binding):
         raise TypeError("binding must be kda_prefill.Binding")
-    state = require_prepared(
-        binding.plan, "sequence.kda_prefill", binding.output.device
-    )
-    return state.run(
+    from ._ops import run as run_pipeline
+
+    return run_pipeline(
         binding,
         lower_bound=lower_bound,
         scale=scale,

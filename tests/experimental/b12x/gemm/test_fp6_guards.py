@@ -11,7 +11,7 @@ import cutlass
 import pytest
 
 from b12x._lib.utils.fp6_geometry import mxfp6_packed_k_bytes, mxfp6_tile_k
-from b12x._lib.dense_gemm import DenseGemmKernel
+from b12x._lib.dense_gemm.kernel import DenseGemmKernel
 
 
 def test_dense_gemm_can_implement_mixed_fp6_requires_uniform_ab_dtype() -> None:

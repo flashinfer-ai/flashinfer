@@ -27,6 +27,12 @@ def _bound_plan_handle(binding):
 
 
 def run_grouped_rmsnorm(state, weight, *, eps, binding: Binding, zero_centered=True):
+    """Normalize each stream into caller-owned contiguous output.
+
+    Ordinary affine normalization (``zero_centered=False``) accepts disjoint
+    rows with unit column stride, including column slices of packed projections.
+    Zero-centered normalization requires contiguous input.
+    """
     if state.shape[0] != binding.tokens:
         raise ValueError("state rows differ from bound live rows")
     torch.ops.b12x.hyperconnection_grouped_rmsnorm(
@@ -70,8 +76,36 @@ def run_combine(state, block_output, injection_logits, *, plan: Plan):
 
 
 def run_combine_norm(
-    state, block_output, injection_logits, next_norm_weight, *, eps, plan: Plan
+    state,
+    block_output,
+    injection_logits,
+    next_norm_weight,
+    *,
+    eps,
+    plan: Plan,
+    zero_centered=True,
+    out=None,
 ):
+    """Inject a block and normalize its BF16 residual across four 2560-wide streams.
+
+    ``zero_centered=False`` accepts direct BF16 or FP32 gains. A plan declared
+    with ``output_mode="provided"`` requires ``out=(combined, normalized)``;
+    ``combined`` may alias ``state`` exactly. All other output aliases are rejected.
+    """
+    if out is not None:
+        if not isinstance(out, tuple) or len(out) != 2:
+            raise ValueError("out must be a (combined, normalized) tensor pair")
+        torch.ops.b12x.hyperconnection_combine_norm_out(
+            state,
+            block_output,
+            injection_logits,
+            next_norm_weight,
+            *out,
+            float(eps),
+            plan.handle,
+            bool(zero_centered),
+        )
+        return out
     return torch.ops.b12x.hyperconnection_combine_norm(
         state,
         block_output,
@@ -79,6 +113,7 @@ def run_combine_norm(
         next_norm_weight,
         float(eps),
         plan.handle,
+        bool(zero_centered),
     )
 
 
@@ -101,6 +136,12 @@ def run_swiglu(gate_up, *, limit, out, plan: Plan, round_silu=False):
     torch.ops.b12x.hyperconnection_swiglu(
         gate_up, out, float(limit), bool(round_silu), plan.handle
     )
+    return out
+
+
+def run_relu2(source, *, out, plan: Plan):
+    """Square positive BF16 values into disjoint caller-owned BF16 output."""
+    torch.ops.b12x.hyperconnection_relu2(source, out, plan.handle)
     return out
 
 
@@ -134,6 +175,7 @@ __all__ = [
     "run_combine_norm",
     "run_engram_mix",
     "run_swiglu",
+    "run_relu2",
     "run_add",
     "run_sigmoid",
     "reference",
