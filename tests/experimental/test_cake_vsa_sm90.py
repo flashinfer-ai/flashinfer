@@ -564,7 +564,7 @@ def test_stage_table_builds_every_stage_from_the_shared_launcher():
     assert manifest["package"] == pkg.__name__ == "flashinfer.cake_vsa_sm90_backend"
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
-    assert len(loader.STAGES) == 18 and set(loader.STAGES) == set(loader.MODULES)
+    assert len(loader.STAGES) == 19 and set(loader.STAGES) == set(loader.MODULES)
     referenced = set()
     for stage in loader.STAGES:
         record = loader.stage_record(stage)
@@ -623,8 +623,11 @@ def test_stage_table_geometry_matches_the_stage_names():
                 "compact": stage == "attention_compact",
                 "kind": "persistent",
                 "queue": stage == "attention_queue",
+                "tagged": stage == "attention_tagged",
             }
-            assert stage == loader.persistent_stage(route["queue"], route["compact"])
+            assert stage == loader.persistent_stage(
+                route["queue"], route["compact"], route["tagged"]
+            )
             assert (tuple(launch["block"]), tuple(launch["cluster"])) == (
                 (384, 1, 1),
                 (1, 1, 1),
@@ -686,6 +689,7 @@ def test_stage_table_geometry_matches_the_stage_names():
         "attention",
         "attention_queue",
         "attention_compact",
+        "attention_tagged",
     }
     assert set(loader.SMALL_STAGES) == (
         {loader.small_stage(k) for k in SMALL_KMAX_VARIANTS}
@@ -734,7 +738,7 @@ def test_build_manifest_pins_the_numerics_flags():
     assert not any(
         flag.startswith(numerics) for flag in manifest["common"]["nvcc_flags"]
     )
-    assert len(manifest["libraries"]) == 18
+    assert len(manifest["libraries"]) == 19
     for entry in manifest["libraries"]:
         assert entry["nvcc_flags"] == ["--use_fast_math"], entry["name"]
         assert entry["nvcc_flags_if"] == [], entry["name"]
@@ -889,6 +893,121 @@ def test_kv_hint_rule_threshold():
         planner.kv_l2_hint(mask, [[0, 1, -1, 2, 3, -1]]) == 1
     )  # empty slots do not stream
     assert planner.HDR_KV_HINT == 11 and planner.HDR_WORDS == 12
+
+
+TAG = 1 << planner.KV_TAG_BIT
+
+
+def _block_ids(plan):
+    """(head, raw int16 id) of every block slot of every tile row; -1 = no second block."""
+    meta, out = plan["meta"], []
+    for rows in _tile_rows(plan):
+        for r in rows:
+            head, n = int(meta[r, 0]), int(meta[r, META_NSEQ])
+            for pos in range(n):
+                w = int(meta[r, META_SEQ_OFF + pos]) & 0xFFFFFFFF
+                for half in (w & 0xFFFF, w >> 16):
+                    out.append((head, half - 0x10000 if half >= 0x8000 else half))
+    return out
+
+
+def _reader_counts(ids):
+    readers = {}
+    for head, blk in ids:
+        if blk >= 0:
+            key = (head, blk & ~TAG)
+            readers[key] = readers.get(key, 0) + 1
+    return readers
+
+
+@pytest.mark.parametrize(
+    "h,mb,nb,k,tagged",
+    [
+        (
+            32,
+            8,
+            128,
+            16,
+            True,
+        ),  # h32-m512-n8192-k16: 84.5 MiB footprint, 34.0 MiB re-read
+        (16, 16, 128, 12, True),  # h16-m1024-n8192-k12: 51.1 / 28.8 MiB
+        (
+            8,
+            16,
+            512,
+            64,
+            False,
+        ),  # h8-m1024-n32768-k64: 112.8 / 78.5 MiB, re-reads do not fit
+        (8, 8, 128, 16, False),  # ~21 MiB with single-reader blocks: resident untagged
+        (8, 32, 32, 16, False),  # h8-m2048-n2048-k16: no single-reader block
+    ],
+)
+def test_single_reader_tags_follow_the_l2_fit_rule(h, mb, nb, k, tagged):
+    """On an evict_last static launch the planner tags the blocks exactly one tile loads
+    (bit KV_TAG_BIT of the id, bit 1 of HDR_KV_HINT) only when the launch's K + V^T
+    footprint exceeds KV_TAG_L2_BYTES while the re-read blocks alone fit it; every other
+    launch carries the shipped rows (the kernel honours the tags only behind the flag)."""
+    assert (
+        planner.KV_TAG_SINGLE_READER,
+        planner.KV_TAG_BIT,
+        planner.HDR_KV_TAGGED,
+    ) == (
+        True,
+        14,
+        2,
+    )
+    assert (planner.KV_TAG_L2_BYTES, planner.KV_BLOCK_BYTES) == (40 << 20, 32768)
+    plan = plan_vsa_sm90(_topk_mask(h, mb, nb, k), sms=132)
+    assert plan["kv_hint"] == 0 and not plan["queue"] and not plan["compact"]
+    assert plan["tagged"] is tagged
+    ids = _block_ids(plan)
+    readers = _reader_counts(ids)
+    footprint = len(readers) * planner.KV_BLOCK_BYTES
+    reread = sum(1 for n in readers.values() if n > 1) * planner.KV_BLOCK_BYTES
+    fits = footprint > planner.KV_TAG_L2_BYTES and reread <= planner.KV_TAG_L2_BYTES
+    assert fits is tagged and planner.kv_tags_pay(readers) is tagged, (
+        footprint,
+        reread,
+    )
+    want = planner.HDR_KV_TAGGED if tagged else 0
+    assert set(int(w) for w in _hint_words(plan)) == {want}
+    tagged_ids = {(head, blk & ~TAG) for head, blk in ids if blk >= 0 and blk & TAG}
+    single = {key for key, n in readers.items() if n == 1}
+    assert tagged_ids == (single if tagged else set())
+    assert all(0 <= (blk & ~TAG) < nb for _, blk in ids if blk >= 0)
+    hdr = plan["hdr"].view(planner.HDR_CTAS, planner.HDR_WORDS)
+    for c in range(plan["num_ctas"]):  # header positions carry the same (tagged) ids
+        row = c * plan["tile_stride"]
+        for pos in range(int(hdr[c, 4])):
+            w = int(plan["meta"][row, META_SEQ_OFF + pos]) & 0xFFFFFFFF
+            assert int(hdr[c, 5 + 2 * pos]) & 0xFFFF == w & 0xFFFF
+            assert int(hdr[c, 6 + 2 * pos]) & 0xFFFF == w >> 16
+
+
+def test_tags_off_restores_the_shipped_rows(monkeypatch):
+    mask = _topk_mask(32, 8, 128, 16)
+    on = plan_vsa_sm90(mask, sms=132)
+    assert on["tagged"]
+    monkeypatch.setattr(planner, "KV_TAG_SINGLE_READER", False)
+    off = plan_vsa_sm90(mask, sms=132)
+    assert not off["tagged"] and set(int(w) for w in _hint_words(off)) == {0}
+    assert all(not (blk & TAG) for _, blk in _block_ids(off) if blk >= 0)
+    stripped = on["meta"].clone()
+    seq = stripped[:, META_SEQ_OFF : META_SEQ_OFF + planner.META_SEQ_WORDS]
+    seq = seq.to(torch.int64) & 0xFFFFFFFF
+    lo, hi = seq & 0xFFFF, seq >> 16
+    lo = torch.where(lo == 0xFFFF, lo, lo & ~TAG)
+    hi = torch.where(hi == 0xFFFF, hi, hi & ~TAG)
+    seq = lo | (hi << 16)
+    seq = torch.where(seq >= 2**31, seq - 2**32, seq).to(torch.int32)
+    stripped[:, META_SEQ_OFF : META_SEQ_OFF + planner.META_SEQ_WORDS] = seq
+    assert torch.equal(stripped, off["meta"])
+    hdr_on = on["hdr"].view(planner.HDR_CTAS, planner.HDR_WORDS).to(torch.int64).clone()
+    hdr_on[:, 5:11] = torch.where(
+        hdr_on[:, 5:11] >= 0, hdr_on[:, 5:11] & ~TAG, hdr_on[:, 5:11]
+    )
+    hdr_on[:, planner.HDR_KV_HINT] &= ~planner.HDR_KV_TAGGED
+    assert torch.equal(hdr_on.to(torch.int16).reshape(-1), off["hdr"].reshape(-1))
 
 
 @pytest.mark.parametrize(

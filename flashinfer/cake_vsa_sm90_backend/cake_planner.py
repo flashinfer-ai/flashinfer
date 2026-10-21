@@ -67,6 +67,25 @@ HDR_HALFWORDS = HDR_CTAS * HDR_WORDS
 HDR_KV_HINT = 11
 KV_HINT_REUSE_NUM = 5
 KV_HINT_REUSE_DEN = 4
+# On plans the static program runs with the evict_last launch policy (kv_hint 0,
+# not queue, not compact) bit KV_TAG_BIT of the int16 block id marks every K / V^T
+# block exactly one tile of the launch reads; the kernel loads it with evict_first
+# (its lines are dead after the load) and keeps evict_last for the re-read blocks.
+# Mirrors the Cake reference planner's ``KV_TAG_SINGLE_READER`` / ``kv_single_reader_tags``.
+KV_TAG_SINGLE_READER = True
+KV_TAG_BIT = 14
+# The tags pay only when evicting the single-reader blocks first lets the re-read
+# blocks stay resident: the launch's K + V^T footprint (distinct (head, block) pairs x
+# KV_BLOCK_BYTES) exceeds KV_TAG_L2_BYTES, the share of H100's 50 MB L2 the kernel holds
+# beside its Q / O traffic, while the re-read blocks alone fit it (measured on H100:
+# h32-m512-n8192-k16 84.5 / 34.0 MiB and h16-m1024-n8192-k12 51.1 / 28.8 MiB gain 3..4 %
+# tagged; h8-m1024-n32768-k64 112.8 / 78.5 MiB, h8-m256-n16384-k32 26.3 MiB and plans
+# without single-reader blocks lose 0.1..1.8 % tagged).
+KV_TAG_L2_BYTES = 40 << 20
+KV_BLOCK_BYTES = 2 * BLOCK * HEAD_DIM * 2  # one K block and one V^T block, bf16
+HDR_KV_TAGGED = (
+    2  # bit 1 of header halfword HDR_KV_HINT: the launch's block ids carry the tags
+)
 # Ragged plans list-schedule costlier tiles first over all heads (LPT) when
 # every head's K and V fit this many bytes of L2; larger working sets keep the
 # head-major order so the CTAs running concurrently share one head's blocks.
@@ -1290,6 +1309,16 @@ def plan_vsa_sm90(
     n_rows = g * stride + len(pool) + (g if queue else 0)
     hdr = torch.zeros((HDR_HALFWORDS,), dtype=torch.int16)
     kv_hint = kv_l2_hint(mask, seqs)
+    readers = kv_reader_counts(infos, seqs)
+    tagged = bool(
+        KV_TAG_SINGLE_READER
+        and not queue
+        and not compact
+        and kv_hint == 0
+        and nb < (1 << KV_TAG_BIT)
+        and kv_tags_pay(readers)
+    )
+    tseqs = kv_single_reader_tags(infos, seqs, readers) if tagged else seqs
     for c, st in enumerate(static):
         t = st[0]
         n_hdr = min(HDR_ISSUE, lens[t])
@@ -1297,9 +1326,9 @@ def plan_vsa_sm90(
             (*infos[t], n_hdr), dtype=torch.int16
         )
         hdr[c * HDR_WORDS + 5 : c * HDR_WORDS + 5 + 2 * n_hdr] = torch.tensor(
-            seqs[t][: 2 * n_hdr], dtype=torch.int16
+            tseqs[t][: 2 * n_hdr], dtype=torch.int16
         )
-        hdr[c * HDR_WORDS + HDR_KV_HINT] = kv_hint
+        hdr[c * HDR_WORDS + HDR_KV_HINT] = kv_hint | (HDR_KV_TAGGED if tagged else 0)
     # Plan rows laid out per CTA: row c * stride + i is CTA c's i-th (static)
     # tile; the first row of each CTA also carries its (static) tile count
     # (word META_NTILES).  Queue layout: the other static rows and the pool
@@ -1311,7 +1340,7 @@ def plan_vsa_sm90(
     def fill(r, t, nt):
         meta[r, 0:4] = torch.tensor(infos[t], dtype=torch.int64)
         meta[r, META_NSEQ] = lens[t]
-        sq = torch.tensor(seqs[t], dtype=torch.int64) & 0xFFFF
+        sq = torch.tensor(tseqs[t], dtype=torch.int64) & 0xFFFF
         meta[r, META_SEQ_OFF : META_SEQ_OFF + len(sq) // 2] = sq[0::2] | (
             sq[1::2] << 16
         )
@@ -1344,10 +1373,56 @@ def plan_vsa_sm90(
         "num_tiles": len(infos),
         "tile_lists": lists,
         "kv_hint": kv_hint,
+        "tagged": tagged,
         "H": h,
         "MB": mb,
         "NB": nb,
     }
+
+
+def kv_reader_counts(
+    infos: Sequence[tuple], seqs: Sequence[Sequence[int]]
+) -> dict[tuple[int, int], int]:
+    """The multiplicity of every (head, block) the plan loads: its occurrences over all
+    sequences (a pair tile lists a shared block once; the ring-fallback interleave may
+    list it twice, which counts as re-read).  Sentinels (-1) are skipped."""
+    readers: dict[tuple[int, int], int] = {}
+    for info, seq in zip(infos, seqs, strict=True):
+        for blk in seq:
+            if blk >= 0:
+                readers[(info[0], blk)] = readers.get((info[0], blk), 0) + 1
+    return readers
+
+
+def kv_tags_pay(readers: dict[tuple[int, int], int]) -> bool:
+    """Whether the single-reader tags can pay for a launch (``KV_TAG_L2_BYTES``): its
+    K + V^T footprint exceeds the L2 share while the re-read blocks alone fit it."""
+    reread = sum(1 for n in readers.values() if n > 1)
+    return (
+        len(readers) * KV_BLOCK_BYTES > KV_TAG_L2_BYTES
+        and reread * KV_BLOCK_BYTES <= KV_TAG_L2_BYTES
+    )
+
+
+def kv_single_reader_tags(
+    infos: Sequence[tuple],
+    seqs: Sequence[Sequence[int]],
+    readers: dict[tuple[int, int], int] | None = None,
+) -> list[list[int]]:
+    """The KV sequences with bit ``KV_TAG_BIT`` set on every block exactly one tile
+    of the plan loads (``readers`` = :func:`kv_reader_counts`); sentinels (-1) and
+    re-read blocks unchanged."""
+    if readers is None:
+        readers = kv_reader_counts(infos, seqs)
+    return [
+        [
+            blk | (1 << KV_TAG_BIT)
+            if blk >= 0 and readers[(info[0], blk)] == 1
+            else blk
+            for blk in seq
+        ]
+        for info, seq in zip(infos, seqs, strict=True)
+    ]
 
 
 def kv_l2_hint(mask: torch.Tensor, seqs: Sequence[Sequence[int]]) -> int:
