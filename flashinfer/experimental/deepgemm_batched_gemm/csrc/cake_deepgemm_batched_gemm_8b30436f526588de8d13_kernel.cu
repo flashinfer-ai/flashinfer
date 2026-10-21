@@ -1,6 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,12 +12,43 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Portions derived from DeepGEMM, Copyright (c) 2025 DeepSeek, MIT licensed;
+ * see DEEPGEMM_NOTICE.txt at the root of this package.
  */
-// Portions derived from DeepGEMM, Copyright (c) 2025 DeepSeek.
-// DeepGEMM portions are licensed under MIT; see DEEPGEMM_NOTICE.txt in this directory.
 
-// Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
-#include "cake_deepgemm_batched_gemm_device_common.cuh"
+typedef signed char        int8_t;
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+#if defined(__CUDACC_RTC__)
+typedef unsigned long long uint64_t;
+#else
+typedef unsigned long      uint64_t;
+#endif
+static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
+typedef signed int         int32_t;
+typedef short int          int16_t;
+struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+
+#if defined(__CUDACC_RTC__)
+typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+#else
+#include <cuda.h>
+#endif
+
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
 
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 512
@@ -46,10 +76,149 @@
 #define THREADS 256
 #define LAUNCH_MIN_BLOCKS 1
 
+#include <math_constants.h>
+
+__device__ __forceinline__ uint32_t elect_sync() {
+    uint32_t pred = 0;
+    asm volatile(
+        "{\n\t"
+        ".reg .pred %%px;\n\t"
+        "elect.sync _|%%px, %1;\n\t"
+        "@%%px mov.s32 %0, 1;\n\t"
+        "}\n"
+        : "+r"(pred)
+        : "r"(0xFFFFFFFF));
+    return pred;
+}
+
+
+__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+        :: "r"(mbar_addr), "r"(count) : "memory");
+}
+
+
+
+// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
+// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
+// explicit loop still makes this helper blocking until acquire succeeds.
+__device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+        " P1, [%0], %1;\n\t"
+        "@P1 bra.uni DONE;\n\t"
+        "bra.uni LAB_WAIT;\n\t"
+        "DONE:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase) : "memory");
+}
+
+
+__device__ __forceinline__ void tcgen05_mma_mxf8_bs_cta2(
+    int taddr, uint64_t a_desc, uint64_t b_desc, uint32_t i_desc,
+    int sfa_taddr, int sfb_taddr, int enable_input_d) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "setp.ne.b32 p, %6, 0;\n\t"
+        "tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale"
+        " [%0], %1, %2, %3, [%4], [%5], p;\n\t"
+        "}\n"
+        :: "r"(taddr), "l"(a_desc), "l"(b_desc),
+           "r"(i_desc), "r"(sfa_taddr), "r"(sfb_taddr),
+           "r"(enable_input_d));
+}
+
+
+__device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
+    return (x & 0x3FFFFULL) >> 4ULL;
+}
+
+
+union MmaSmemDesc {
+    uint64_t u64;
+    uint32_t u32[2];
+};
+
+
+__device__ __forceinline__ void elect_commit_cg2_multicast(int mbar_addr, uint16_t cta_mask) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred leader;\n\t"
+        "elect.sync _|leader, 0xFFFFFFFF;\n\t"
+        "@leader tcgen05.commit.cta_group::2.mbarrier::arrive::one"
+        ".shared::cluster.multicast::cluster.b64 [%0], %1;\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "h"(cta_mask) : "memory");
+}
+
+
+
+__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
+    asm volatile(
+        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+        :: "r"(mbar_addr), "r"(bytes) : "memory");
+}
+
+
+
+
+
+__device__ __forceinline__ uint64_t make_sf_cp_desc_lo_sbo128(int lo) {
+    const int SBO = 128;
+    return (uint64_t)(uint32_t)lo
+         | (desc_encode(SBO) << 32ULL)
+         | (1ULL << 46ULL);
+}
+
+
+__device__ __forceinline__ void tcgen05_cp_32x128b_warpx4_cta2(
+    int taddr, uint64_t s_desc) {
+    asm volatile(
+        "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
+        :: "r"(taddr), "l"(s_desc));
+}
+
+
+
+__device__ __forceinline__ void tma_3d_gmem2smem_cta2(
+    int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr) {
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cluster.global"
+        ".mbarrier::complete_tx::bytes.cta_group::2"
+        " [%0], [%1, {%2, %3, %4}], [%5];"
+        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z),
+           "r"(mbar_addr) : "memory");
+}
+
+
+__device__ __forceinline__ void tma_2d_gmem2smem(
+    int dst, const void *tmap_ptr, int x, int y, int mbar_addr) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cta.global"
+        ".mbarrier::complete_tx::bytes"
+        " [%0], [%1, {%2, %3}], [%4];"
+        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y),
+           "r"(mbar_addr) : "memory");
+}
+
+
+__device__ __forceinline__ void tma_store_3d(
+    const void *tmap, int x, int y, int z, unsigned smem_addr) {
+    asm volatile(
+        "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"
+        " [%0, {%1, %2, %3}], [%4];"
+        :: "l"(tmap), "r"(x), "r"(y), "r"(z), "r"(smem_addr) : "memory");
+}
+
+
 extern "C" {
 
-__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_deepgemm_batched_gemm_b679291b28fffdcd58c0(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap D, unsigned int* __restrict__ SFD, unsigned int M, unsigned int grid_m, unsigned long long sfd_stride, float alpha)
+__global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
+kernel_cake_deepgemm_batched_gemm_8b30436f526588de8d13(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap D, unsigned int* __restrict__ SFD, unsigned int M, unsigned int grid_m, unsigned long long sfd_stride, float alpha)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -82,16 +251,16 @@ kernel_cake_deepgemm_batched_gemm_b679291b28fffdcd58c0(const __grid_constant__ C
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
     // Kernel setup ops
-    uint8_t* cd = reinterpret_cast<uint8_t*>(smem_raw + SMEM_CD_OFF);
-    const int cd_addr = smem + SMEM_CD_OFF;
-    uint8_t* a = reinterpret_cast<uint8_t*>(smem_raw + SMEM_A_OFF);
-    const int a_addr = smem + SMEM_A_OFF;
-    uint8_t* b = reinterpret_cast<uint8_t*>(smem_raw + SMEM_B_OFF);
-    const int b_addr = smem + SMEM_B_OFF;
-    unsigned int* sfa = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SFA_OFF);
-    const int sfa_addr = smem + SMEM_SFA_OFF;
-    unsigned int* sfb = reinterpret_cast<unsigned int*>(smem_raw + SMEM_SFB_OFF);
-    const int sfb_addr = smem + SMEM_SFB_OFF;
+    uint8_t* cd = reinterpret_cast<uint8_t*>(smem_raw + 0);
+    const int cd_addr = smem + 0;
+    uint8_t* a = reinterpret_cast<uint8_t*>(smem_raw + 32768);
+    const int a_addr = smem + 32768;
+    uint8_t* b = reinterpret_cast<uint8_t*>(smem_raw + 114688);
+    const int b_addr = smem + 114688;
+    unsigned int* sfa = reinterpret_cast<unsigned int*>(smem_raw + 196608);
+    const int sfa_addr = smem + 196608;
+    unsigned int* sfb = reinterpret_cast<unsigned int*>(smem_raw + 199168);
+    const int sfb_addr = smem + 199168;
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory"); }
@@ -212,7 +381,6 @@ kernel_cake_deepgemm_batched_gemm_b679291b28fffdcd58c0(const __grid_constant__ C
                 #pragma unroll 1
                 for (int tile_1 = bid; tile_1 < 8 * grid_m * 4; tile_1 += num_bids) {
                     mbarrier_wait(acc_empty_addr + (acc_stage) * 8, _phase_acc_empty);
-                    asm volatile("tcgen05.fence::after_thread_sync;");
                     #pragma unroll 4
                     for (int kt_1 = 0; kt_1 < 32; kt_1++) {
                         mbarrier_wait(full_addr + (stage_1) * 8, _phase_full);
@@ -224,20 +392,21 @@ kernel_cake_deepgemm_batched_gemm_b679291b28fffdcd58c0(const __grid_constant__ C
                                 tcgen05_cp_32x128b_warpx4_cta2((tmem_sf_b + 4), make_sf_cp_desc_lo_sbo128((((sfb_addr) >> 4) + (stage_1) * 64 + 32)));
                             }
                         }
+                        asm volatile("tcgen05.fence::before_thread_sync;");
                         __syncwarp();
+                        asm volatile("tcgen05.fence::after_thread_sync;");
                         if (kt_1 == 0 && iteration > 0) {
                             unsigned int preceding_stage = (iteration - 1) % 2;
                             unsigned int preceding_phase = (iteration - 1) / 2 & 1;
-                            asm volatile("tcgen05.fence::before_thread_sync;");
                             mbarrier_wait(overlap_empty_addr + (preceding_stage) * 8, preceding_phase);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                         }
                         if (elect_sync()) {
-                            int _mma_a_lo_0 = (((a_addr) >> 4) & 0x3FFF) + (stage_1) * 1024;
-                            int _mma_b_lo_0 = (((b_addr) >> 4) & 0x3FFF) + (stage_1) * 1024;
+                            int _smem_desc_lo_0 = (((a_addr) >> 4) & 0x3FFF) + (stage_1) * 1024;
+                            int _smem_desc_lo_1 = (((b_addr) >> 4) & 0x3FFF) + (stage_1) * 1024;
                             {
-                                uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_0) | ((uint64_t)0x40004040 << 32);
-                                uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_0) | ((uint64_t)0x40004040 << 32);
+                                uint64_t a_desc = ((uint64_t)(uint32_t)_smem_desc_lo_0) | ((uint64_t)0x40004040 << 32);
+                                uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_1) | ((uint64_t)0x40004040 << 32);
 
                                 tcgen05_mma_mxf8_bs_cta2((tmem_acc + (acc_stage * 244)), a_desc + 0, b_desc + 0,
                                     (0x10c00000U | ((((uint32_t)(kt_1) % 4U)) << 29) | ((((uint32_t)(kt_1) % 4U)) << 4)), tmem_sf_a, tmem_sf_b, ((kt_1 == 0) ? 0 : 1));
@@ -249,6 +418,7 @@ kernel_cake_deepgemm_batched_gemm_b679291b28fffdcd58c0(const __grid_constant__ C
                                     (0x10c00000U | ((((uint32_t)(kt_1) % 4U)) << 29) | ((((uint32_t)(kt_1) % 4U)) << 4)), tmem_sf_a, tmem_sf_b, 1);
                             }
                         }
+                        asm volatile("tcgen05.fence::before_thread_sync;");
                         __syncwarp();
                         elect_commit_cg2_multicast(empty_addr + (stage_1) * 8, (uint16_t)(3));
                         if (kt_1 == 31) {
@@ -287,30 +457,30 @@ kernel_cake_deepgemm_batched_gemm_b679291b28fffdcd58c0(const __grid_constant__ C
                         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v[2])) : "r"(sfa_addr + stage_2 * 512 + (unsigned int)(((lane >> 3 ^ 2) * 32 + lane) * 4)));
                         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v[3])) : "r"(sfa_addr + stage_2 * 512 + (unsigned int)(((lane >> 3 ^ 3) * 32 + lane) * 4)));
                         __syncwarp();
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfa_addr + stage_2 * 512 + (unsigned int)((lane * 4 + (lane >> 3 ^ 0)) * 4)), "r"((_sf_v[0])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfa_addr + stage_2 * 512 + (unsigned int)((lane * 4 + (lane >> 3 ^ 1)) * 4)), "r"((_sf_v[1])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfa_addr + stage_2 * 512 + (unsigned int)((lane * 4 + (lane >> 3 ^ 2)) * 4)), "r"((_sf_v[2])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfa_addr + stage_2 * 512 + (unsigned int)((lane * 4 + (lane >> 3 ^ 3)) * 4)), "r"((_sf_v[3])));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfa_addr + stage_2 * 512 + (unsigned int)((lane * 4 + (lane >> 3 ^ 0)) * 4)), "r"(_sf_v[0]));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfa_addr + stage_2 * 512 + (unsigned int)((lane * 4 + (lane >> 3 ^ 1)) * 4)), "r"(_sf_v[1]));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfa_addr + stage_2 * 512 + (unsigned int)((lane * 4 + (lane >> 3 ^ 2)) * 4)), "r"(_sf_v[2]));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfa_addr + stage_2 * 512 + (unsigned int)((lane * 4 + (lane >> 3 ^ 3)) * 4)), "r"(_sf_v[3]));
                         unsigned int _sf_v_0[4];
                         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_0[0])) : "r"(sfb_addr + stage_2 * 1024 + (unsigned int)(((lane >> 3 ^ 0) * 32 + lane) * 4)));
                         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_0[1])) : "r"(sfb_addr + stage_2 * 1024 + (unsigned int)(((lane >> 3 ^ 1) * 32 + lane) * 4)));
                         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_0[2])) : "r"(sfb_addr + stage_2 * 1024 + (unsigned int)(((lane >> 3 ^ 2) * 32 + lane) * 4)));
                         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_0[3])) : "r"(sfb_addr + stage_2 * 1024 + (unsigned int)(((lane >> 3 ^ 3) * 32 + lane) * 4)));
                         __syncwarp();
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_addr + stage_2 * 1024 + (unsigned int)((lane * 4 + (lane >> 3 ^ 0)) * 4)), "r"((_sf_v_0[0])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_addr + stage_2 * 1024 + (unsigned int)((lane * 4 + (lane >> 3 ^ 1)) * 4)), "r"((_sf_v_0[1])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_addr + stage_2 * 1024 + (unsigned int)((lane * 4 + (lane >> 3 ^ 2)) * 4)), "r"((_sf_v_0[2])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_addr + stage_2 * 1024 + (unsigned int)((lane * 4 + (lane >> 3 ^ 3)) * 4)), "r"((_sf_v_0[3])));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_addr + stage_2 * 1024 + (unsigned int)((lane * 4 + (lane >> 3 ^ 0)) * 4)), "r"(_sf_v_0[0]));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_addr + stage_2 * 1024 + (unsigned int)((lane * 4 + (lane >> 3 ^ 1)) * 4)), "r"(_sf_v_0[1]));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_addr + stage_2 * 1024 + (unsigned int)((lane * 4 + (lane >> 3 ^ 2)) * 4)), "r"(_sf_v_0[2]));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_addr + stage_2 * 1024 + (unsigned int)((lane * 4 + (lane >> 3 ^ 3)) * 4)), "r"(_sf_v_0[3]));
                         unsigned int _sf_v_1[4];
                         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_1[0])) : "r"(sfb_addr + stage_2 * 1024 + 512 + (unsigned int)(((lane >> 3 ^ 0) * 32 + lane) * 4)));
                         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_1[1])) : "r"(sfb_addr + stage_2 * 1024 + 512 + (unsigned int)(((lane >> 3 ^ 1) * 32 + lane) * 4)));
                         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_1[2])) : "r"(sfb_addr + stage_2 * 1024 + 512 + (unsigned int)(((lane >> 3 ^ 2) * 32 + lane) * 4)));
                         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_1[3])) : "r"(sfb_addr + stage_2 * 1024 + 512 + (unsigned int)(((lane >> 3 ^ 3) * 32 + lane) * 4)));
                         __syncwarp();
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_addr + stage_2 * 1024 + 512 + (unsigned int)((lane * 4 + (lane >> 3 ^ 0)) * 4)), "r"((_sf_v_1[0])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_addr + stage_2 * 1024 + 512 + (unsigned int)((lane * 4 + (lane >> 3 ^ 1)) * 4)), "r"((_sf_v_1[1])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_addr + stage_2 * 1024 + 512 + (unsigned int)((lane * 4 + (lane >> 3 ^ 2)) * 4)), "r"((_sf_v_1[2])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_addr + stage_2 * 1024 + 512 + (unsigned int)((lane * 4 + (lane >> 3 ^ 3)) * 4)), "r"((_sf_v_1[3])));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_addr + stage_2 * 1024 + 512 + (unsigned int)((lane * 4 + (lane >> 3 ^ 0)) * 4)), "r"(_sf_v_1[0]));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_addr + stage_2 * 1024 + 512 + (unsigned int)((lane * 4 + (lane >> 3 ^ 1)) * 4)), "r"(_sf_v_1[1]));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_addr + stage_2 * 1024 + 512 + (unsigned int)((lane * 4 + (lane >> 3 ^ 2)) * 4)), "r"(_sf_v_1[2]));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_addr + stage_2 * 1024 + 512 + (unsigned int)((lane * 4 + (lane >> 3 ^ 3)) * 4)), "r"(_sf_v_1[3]));
                     }
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile(
@@ -336,7 +506,6 @@ kernel_cake_deepgemm_batched_gemm_b679291b28fffdcd58c0(const __grid_constant__ C
                 unsigned int off_m_1 = local_1 % grid_m * 128;
                 unsigned int off_n_1 = local_1 / grid_m * 256;
                 mbarrier_wait(acc_full_addr + (acc_stage_1) * 8, _phase_acc_full);
-                asm volatile("tcgen05.fence::after_thread_sync;");
                 #pragma unroll
                 for (int atom = 0; atom < 2; atom++) {
                     unsigned int store_idx = ((acc_stage_1 == 0) ? 1 - atom : atom);
@@ -344,6 +513,7 @@ kernel_cake_deepgemm_batched_gemm_b679291b28fffdcd58c0(const __grid_constant__ C
                         asm volatile("cp.async.bulk.wait_group 1;");
                     }
                     asm volatile("barrier.sync 8, 128;" ::: "memory");
+                    asm volatile("tcgen05.fence::after_thread_sync;");
                     unsigned int row = off_m_1 + warp_0 * 32 + (unsigned int)lane;
                     unsigned int sf_word = 0;
                     #pragma unroll
@@ -533,6 +703,7 @@ kernel_cake_deepgemm_batched_gemm_b679291b28fffdcd58c0(const __grid_constant__ C
                         SFD[word_col * sfd_stride + (unsigned long long)row] = sf_word;
                     }
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 8, 128;" ::: "memory");
                     if (warp == 4) {
                         if (elect_sync()) {
