@@ -303,7 +303,10 @@ def mla2_plan(
                 continue
             for f in (0.5, 0.6, 0.7, 0.85, 1.0, 1.2):
                 s_h = max(1, round(s_f * f))
-                if s_h <= cap:
+                # A half tile's items write two partials per split, and the merge takes at most MAX_SPLITS slots
+                # per row: the one bound this port adds to the kernel-tests planner (a 1-token request at 64K keys
+                # would otherwise plan 86 slots).
+                if s_h <= cap and 2 * s_h <= MAX_SPLITS:
                     cands.add((s_f if full_tiles else 1, s_h))
             if s_f <= 2:
                 cands |= {(s_f if full_tiles else 1, 1), (s_f if full_tiles else 1, 2)}

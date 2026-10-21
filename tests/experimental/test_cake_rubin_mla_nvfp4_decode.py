@@ -1323,6 +1323,15 @@ def test_plan_invariants(sm_count):
             assert (
                 p.n_full < p.items and p.decode_record == "decode"
             )  # 384 rows: one full and one half tile
+    # One-token requests (a half tile at H96): the planner keeps the merge's 64 partial slots per row.
+    for kv, batch in ((65536, 1), (131072, 1), (65536, 4), (32768, 16)):
+        p = cake_backend.plan(
+            seq_lens_host=[kv] * batch, num_heads=96, q_len=1, units=units, pairs=pairs
+        )
+        _check_plan(p, [kv] * batch, [1] * batch, 96)
+        assert (
+            p.n_full == 0 and p.decode_record == "decode" and p.max_splits <= MAX_SPLITS
+        )
     # Short and odd lengths, a request without keys, packed query lengths, a small head count.
     for kv_lens, q_lens, heads in (
         ([1, 64, 65, 200, 513, 1000], [1] * 6, 16),
