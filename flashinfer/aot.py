@@ -192,7 +192,10 @@ from .jit.cake_sparse_mla_sm120_dsv41_mixed import (
     cake_sparse_mla_sm120_dsv41_mixed_available,
     gen_cake_sparse_mla_sm120_dsv41_mixed_module,
 )
-from .jit.cake_concat_mla_kv_quant_fp8 import gen_concat_mla_kv_quant_fp8_aot_modules
+from .jit.cake_concat_mla_kv_quant_fp8 import (
+    # Aliased to the gen_*_modules form the CPU AOT tests stub by name.
+    aot_specs as gen_cake_concat_mla_kv_quant_fp8_aot_modules,
+)
 from .jit.cake_grouped_mxfp8_quantize import (
     aot_specs as gen_cake_grouped_mxfp8_quantize_aot_modules,
 )
@@ -726,12 +729,13 @@ def gen_all_modules(
     if has_sm103a_exact:
         jit_specs.append(gen_cake_fmha_compat_module("sm103a"))
     # Fused MLA context K/V pack (attention side, not MoE), two backends behind
-    # concat_mla_kv_quant_fp8: the Cake programs, one build per (exact target,
-    # head group) ...
+    # concat_mla_kv_quant_fp8: the Cake programs, one per head group, one
+    # library each per exact target (the loader spells the targets "sm_100a" /
+    # "sm_103a") ...
     if has_sm100a_exact:
-        jit_specs.extend(gen_concat_mla_kv_quant_fp8_aot_modules("sm100a"))
+        jit_specs.extend(gen_cake_concat_mla_kv_quant_fp8_aot_modules("sm_100a"))
     if has_sm103a_exact:
-        jit_specs.extend(gen_concat_mla_kv_quant_fp8_aot_modules("sm103a"))
+        jit_specs.extend(gen_cake_concat_mla_kv_quant_fp8_aot_modules("sm_103a"))
     # ... and the specialized kernel (auto's pick for 12 local heads), one
     # module, pre-built for the same exact Blackwell targets as the Cake
     # programs (other targets JIT it on first use).
