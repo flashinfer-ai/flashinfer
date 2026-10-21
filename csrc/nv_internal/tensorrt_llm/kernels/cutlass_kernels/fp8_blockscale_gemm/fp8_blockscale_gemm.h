@@ -19,6 +19,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
+#include <type_traits>
 #include <vector>
 
 // non-persistent-cooperative GEMM
@@ -42,6 +43,14 @@ class CutlassFp8BlockScaleGemmRunnerInterface {
                        int64_t const* problem_m_offsets, size_t num_problems, size_t shape_n,
                        size_t shape_k, cudaStream_t stream, float const* scales_a = nullptr,
                        float const* scales_b = nullptr) = 0;
+
+  // Leading dim of the per-token 1x128 activation scales the grouped GEMM consumes
+  // (set as a side effect of getWorkspaceSize).
+  virtual int64_t getActScaleLeadingDim() const = 0;
+
+  // True when ElementA is fp8: the caller must supply pre-quantized activations + scales and
+  // moeGemm launches no internal scale_1x128.
+  virtual bool isActivationPrequantized() const = 0;
 
   virtual void strideBatchGemm(__nv_bfloat16* mat_d, int ld_d, int stride_d, __nv_fp8_e4m3* mat_a,
                                int ld_a, int stride_a, __nv_fp8_e4m3* mat_b, int ld_b, int stride_b,
@@ -91,6 +100,10 @@ class CutlassFp8BlockScaleGemmRunner : public CutlassFp8BlockScaleGemmRunnerInte
   void moeGemm(void* mat_d, void const* mat_a, void const* mat_b, int64_t const* problem_m_offsets,
                size_t num_problems, size_t shape_n, size_t shape_k, cudaStream_t stream,
                float const* scales_a = nullptr, float const* scales_b = nullptr) override;
+
+  int64_t getActScaleLeadingDim() const override { return max_shape_m_32_align_padded_; }
+
+  bool isActivationPrequantized() const override { return std::is_same_v<ElementA, __nv_fp8_e4m3>; }
 
   void strideBatchGemm(__nv_bfloat16* mat_d, int ld_d, int stride_d, __nv_fp8_e4m3* mat_a, int ld_a,
                        int stride_a, __nv_fp8_e4m3* mat_b, int ld_b, int stride_b, int num_problems,
