@@ -5992,7 +5992,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
     supported_activation_classes_by_quant: ClassVar[
         dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
     ] = {
-        (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU,),
+        (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU, SwiGLUStep),
         (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, SwiGLUStep, GeGLU, ReLU2),
     }
 

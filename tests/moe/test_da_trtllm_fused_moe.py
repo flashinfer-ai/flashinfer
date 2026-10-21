@@ -8,7 +8,9 @@ from dataclasses import replace
 import pytest
 import torch
 
+import benchmarks.bench_trtllm_moe_da as bench_trtllm_moe_da
 from benchmarks.bench_trtllm_moe_da import (
+    PreparedPrecision,
     _canonical_inputs,
     _capture,
     _matching_diagnostic,
@@ -18,14 +20,17 @@ from benchmarks.bench_trtllm_moe_da import (
 )
 from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
+    ActivationType,
     QuantConfig,
     QuantFormat,
     TrtllmBf16Config,
     TrtllmFp4Config,
+    TrtllmFp8BlockConfig,
     TrtllmFp8PerTensorConfig,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
     trtllm_fp4_block_scale_routed_moe,
+    trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
     trtllm_moe_acquire_da_graph_leases,
     trtllm_moe_allocate_routing_metadata,
@@ -33,7 +38,12 @@ from flashinfer.fused_moe import (
     trtllm_moe_release_da_resources,
 )
 from flashinfer.fused_moe.da_tuner import DADistribution, RoutingRealizationFactory
-from flashinfer.tllm_enums import RoutingInputMode, RoutingMethodType
+from flashinfer.tllm_enums import (
+    Fp8QuantizationType,
+    RoutingInputMode,
+    RoutingMethodType,
+    WeightLayout,
+)
 
 from tests.moe.da_acceptance_utils import (
     PRODUCTION_PRECISIONS,
@@ -509,6 +519,114 @@ def test_public_routed_precision_matches_ordinary_graph(precision: str) -> None:
     require_sm100()
     rows = run_matched_public_graphs(precision)
     assert {str(row["distribution"]) for row in rows} == {"uniform", "ddist:4"}
+
+
+def test_deepseek_fp8_da_graph_keeps_swiglu_step_limit(monkeypatch) -> None:
+    """DeepSeekFp8 DA bodies apply the per-expert activation parameters.
+
+    The DeepSeekFp8 DA body used to pass null alpha, beta and limit pointers, so the
+    bodies of a DA SWITCH graph ran unclamped SwiGLU whatever the call requested.
+    These inputs make SwigluStep's limit move the output well past the NoDA/DA
+    tolerance, so a DA body that drops the limit fails the matched-graph comparison.
+    """
+    require_sm100()
+    shape = compact_shape()
+    quant = QuantConfig(
+        weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+    )
+    hidden, w1, w2, ids, routing_weights = _canonical_inputs(shape)
+    # The canonical inputs give FC1 outputs near 0.006; scale them to about 1.
+    hidden = (hidden.float() * 50).to(torch.bfloat16)
+    w1 = (w1.float() * 3).to(torch.bfloat16)
+    w2 = (w2.float() * 5).to(torch.bfloat16)
+    hidden_q, hidden_scale = TrtllmFp8BlockConfig.prepare_activations(
+        hidden, quant=quant
+    )
+    view = TrtllmFp8BlockConfig.prepare_weights(
+        w1,
+        w2,
+        quant=quant,
+        num_local_experts=shape.local_num_experts,
+        hidden_size=shape.hidden_size,
+        intermediate_size=shape.intermediate_size,
+        device=hidden.device,
+    )
+    output = torch.empty(
+        shape.num_tokens, shape.hidden_size, device=hidden.device, dtype=torch.bfloat16
+    )
+    packed = torch.empty_like(ids)
+
+    def prepare(limit: float) -> PreparedPrecision:
+        clamp_limit = torch.full(
+            (shape.local_num_experts,), limit, device=hidden.device, dtype=torch.float32
+        )
+
+        def invoke() -> torch.Tensor:
+            result = trtllm_fp8_block_scale_routed_moe(
+                topk_ids=packed,
+                routing_bias=None,
+                hidden_states=hidden_q,
+                hidden_states_scale=hidden_scale,
+                gemm1_weights=view["gemm1_weights"],
+                gemm1_weights_scale=view["gemm1_weights_scale"],
+                gemm2_weights=view["gemm2_weights"],
+                gemm2_weights_scale=view["gemm2_weights_scale"],
+                num_experts=shape.num_experts,
+                top_k=shape.top_k,
+                n_group=None,
+                topk_group=None,
+                intermediate_size=shape.intermediate_size,
+                local_expert_offset=shape.local_expert_offset,
+                local_num_experts=shape.local_num_experts,
+                routed_scaling_factor=1.0,
+                routing_method_type=RoutingMethodType.Renormalize.value,
+                weight_layout=WeightLayout.MajorK.value,
+                output=output,
+                tune_max_num_tokens=shape.tune_max_num_tokens,
+                fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
+                activation_type=ActivationType.SwigluStep.value,
+                gemm1_clamp_limit=clamp_limit,
+            )
+            return result[0] if isinstance(result, list) else result
+
+        return PreparedPrecision(
+            "fp8_block", shape, ids, routing_weights, packed, output, invoke
+        )
+
+    clamped, unclamped = prepare(0.5), prepare(1.0e9)
+    first_ids, first_weights = _realization(
+        RoutingRealizationFactory(), shape, "uniform"
+    )
+    clamped.stage(first_ids, first_weights)
+    with _temporary_environment(FLASHINFER_DIST_AWARE_AUTOTUNE="0"):
+        reference = clamped.invoke().clone()
+        without_limit = unclamped.invoke().clone()
+    # The limit must matter far beyond the 3e-2 NoDA/DA tolerance.
+    assert (reference.float() - without_limit.float()).abs().max() > 0.1
+
+    monkeypatch.setattr(
+        bench_trtllm_moe_da, "_prepare_precision", lambda name, shape: clamped
+    )
+    # Only SWITCH bodies reach run_deepseek_da_body; a single-body DA graph replays the
+    # ordinary launcher, which already forwarded the limit. With the baseline guard on,
+    # this shape practically never admits a SWITCH.
+    with _temporary_environment(FLASHINFER_DA_BASELINE_GUARD="0"):
+        rows = run_matched_public_graphs(
+            "fp8_block",
+            shape=shape,
+            distributions=(
+                "uniform",
+                "ddist:1.1",
+                "ddist:1.5",
+                "ddist:2",
+                "ddist:3",
+                "ddist:4",
+            ),
+        )
+    if {row["capture_policy"] for row in rows} != {"da_switch"}:
+        pytest.skip(
+            "no DA SWITCH graph was captured, so run_deepseek_da_body did not run"
+        )
 
 
 def test_live_distribution_selects_distinct_reachable_bodies() -> None:

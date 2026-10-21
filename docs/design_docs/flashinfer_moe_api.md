@@ -803,11 +803,11 @@ including `SwiGLUStep(limit=16)`, is materialized during weight preparation.
 An explicit tensor in the prepared view overrides that typed limit.
 
 The tensor contains raw FC1 accumulator limits: for NVFP4 and per-tensor FP8,
-divide physical limits by the FC1 gate dequantization scale. BF16 and MXFP8
-use physical limits directly. The FP8 preparation helper performs this
+divide physical limits by the FC1 gate dequantization scale. BF16, MXFP8 and
+DeepSeek FP8 use physical limits directly. The FP8 preparation helper performs this
 conversion, and the NVFP4 helper prepares unit global scales. With fused
-shared experts in NVFP4 or MXFP8, append the shared expert limits after the
-routed expert limits:
+shared experts in NVFP4, MXFP8 or DeepSeek FP8, append the shared expert limits
+after the routed expert limits:
 
 ```python
 limits = torch.full((num_local_experts + 1,), 7.0, device=device)
@@ -821,7 +821,8 @@ view["gemm1_clamp_limit"] = (
 ```
 
 The fused StepFun epilogue supports BF16, FP8 per tensor, MXFP8 block scale,
-and NVFP4. DeepSeek FP8 uses a separate activation kernel and rejects StepFun.
+and NVFP4. DeepSeek FP8 has no fused activation: its separate activation kernel
+applies StepFun after FC1 dequantization, with the same per-expert limits.
 NVFP4 also supports explicit per-token scaling through BF16-output FC1
 StepFun cubins followed by per-token requantization for FC2.
 The TRT-LLM backend requires batched-GEMM export `7.0.5.0.4.0` or later
@@ -937,7 +938,7 @@ python scripts/generate_moe_activation_matrix.py --write
 | `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4×BF16` | `SwiGLU` |
 | `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
 | `trtllm_fp4_routed` | `TrtllmFp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `SiTU`, `ReLU2` |
-| `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
+| `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU`, `SwiGLUStep` |
 | `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `MXFP8×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `ReLU2` |
 | `trtllm_fp8_per_tensor` | `TrtllmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `ReLU2` |
 | `trtllm_mxint4_routed` | `TrtllmMxInt4Config` | `MXINT4×BF16` | `SwiGLU` |

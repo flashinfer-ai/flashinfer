@@ -169,6 +169,14 @@ def _block_fp8_reference(
             up, gate = fc1[:, :INTERMEDIATE], fc1[:, INTERMEDIATE:]
             if isinstance(activation, GeGLU):
                 act = F.gelu(gate) * up
+            elif isinstance(activation, SwiGLUStep):
+                # StepFun caps the SiLU output; an explicit clamp tensor overrides the typed limit.
+                limit = (
+                    activation.limit
+                    if gemm1_clamp_limit is None
+                    else gemm1_clamp_limit[local_expert].float()
+                )
+                act = F.silu(gate).clamp(max=limit) * up.clamp(min=-limit, max=limit)
             else:
                 if gemm1_clamp_limit is not None:
                     limit = gemm1_clamp_limit[local_expert].float()
@@ -198,6 +206,13 @@ def _assert_fp8_close(actual, expected):
     check_accuracy(expected.float(), actual.float(), atol=0.05, rtol=0.3, percent=0.99)
 
 
+def _assert_fp8_close_to_scale(actual, expected):
+    # Scaled FC1 weights put outputs far above the absolute atol above, and the
+    # reference skips the kernel's E4M3 rounding of the FC1 output.
+    atol = 0.02 * expected.float().abs().max().item()
+    check_accuracy(expected.float(), actual.float(), atol=atol, rtol=0.3, percent=0.99)
+
+
 def _assert_closer_to(actual, expected, wrong, *, margin=1.25):
     """Assert the output is closer to the requested formula than a wrong one.
 
@@ -217,12 +232,19 @@ def _assert_closer_to(actual, expected, wrong, *, margin=1.25):
 
 
 def _make_block_fp8_case(
-    variant, *, activation=None, expert_offset=0, local_experts=NUM_EXPERTS
+    variant,
+    *,
+    activation=None,
+    expert_offset=0,
+    local_experts=NUM_EXPERTS,
+    tokens=TOKENS,
+    w1_scale=1.0,
+    up_scale=1.0,
 ):
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(20260717)
     x = torch.randn(
-        TOKENS, HIDDEN, device=device, dtype=torch.bfloat16, generator=generator
+        tokens, HIDDEN, device=device, dtype=torch.bfloat16, generator=generator
     )
     activation = activation or SwiGLU()
     gemm1_rows = INTERMEDIATE * (2 if activation.is_gated else 1)
@@ -237,6 +259,10 @@ def _make_block_fp8_case(
         )
         * 0.02
     )
+    w1 *= w1_scale
+    if up_scale != 1.0:
+        # Gated FC1 rows are [up; gate]; scaling up separates the two halves' ranges.
+        w1[:, :INTERMEDIATE] *= up_scale
     w2 = (
         torch.randn(
             local_experts,
@@ -251,14 +277,14 @@ def _make_block_fp8_case(
     ids = torch.randint(
         expert_offset,
         expert_offset + local_experts,
-        (TOKENS, TOP_K),
+        (tokens, TOP_K),
         device=device,
         dtype=torch.int32,
         generator=generator,
     )
     route_weights = torch.softmax(
         torch.randn(
-            TOKENS, TOP_K, device=device, dtype=torch.float32, generator=generator
+            tokens, TOP_K, device=device, dtype=torch.float32, generator=generator
         ),
         dim=-1,
     )
@@ -289,7 +315,7 @@ def _make_block_fp8_case(
         ),
         activation=activation,
         backend=BackendOptions(candidates=(TrtllmFp8BlockConfig(),)),
-        execution=ExecutionConfig(tune_max_num_tokens=TOKENS),
+        execution=ExecutionConfig(tune_max_num_tokens=tokens),
     )
     pack = MoEActivationPack(
         hidden_states_q=x_q,
@@ -458,6 +484,110 @@ def test_block_fp8_swiglu_oa_params_reach_the_kernel(variant):
     view["gemm1_clamp_limit"] = per_expert(1.0e9)
     noop = runner.forward(runner.pack_inputs(pack, weights), tactic=-1)
     torch.testing.assert_close(noop.float(), baseline.float(), atol=1e-2, rtol=1e-2)
+
+
+_DEEPSEEK_FP8 = QuantConfig(
+    weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+)
+
+
+@pytest.mark.parametrize("limits", ["default", "per_expert", "0.25"])
+@pytest.mark.parametrize("tokens", [64, 512, 2048])
+@pytest.mark.parametrize("expert_offset", [0, 8], ids=["offset0", "offset8"])
+def test_dsfp8_swiglu_step_matches_reference(limits, tokens, expert_offset):
+    """DeepSeekFp8 applies SwiGLUStep in its separate activation kernel.
+
+    FC1 weights are scaled so that gates and ups exceed every limit. The limit is
+    the kernel default 7 (no tensor), a per-local-expert tensor cycling 7/11/16,
+    or 0.25. The token counts reach the activation kernel's 1, 2 and 4
+    tokens-per-CTA variants. Neighbouring experts get different limits, and with
+    the expert offset of 8 a global expert index would read past the tensor.
+    Besides matching the dequantized reference, the output must be measurably
+    closer to it than to what a wrong kernel computes: no clamp, limits shifted
+    by one expert, or the clamp before SiLU.
+    """
+    activation = SwiGLUStep(limit=0.25) if limits == "0.25" else SwiGLUStep()
+    pack, weights, config, (x, w1, w2) = _make_block_fp8_case(
+        _DEEPSEEK_FP8,
+        activation=activation,
+        expert_offset=expert_offset,
+        tokens=tokens,
+        w1_scale=40.0,
+    )
+    device = x.device
+    clamp = None
+    if limits == "per_expert":
+        clamp = torch.tensor(
+            [(7.0, 11.0, 16.0)[expert % 3] for expert in range(NUM_EXPERTS)],
+            device=device,
+            dtype=torch.float32,
+        )
+        weights.get_view("trtllm_fp8_block")["gemm1_clamp_limit"] = clamp
+
+    def _reference(act, **activation_params):
+        return _block_fp8_reference(
+            x,
+            w1,
+            w2,
+            pack.topk_ids,
+            pack.topk_weights,
+            _DEEPSEEK_FP8,
+            expert_offset=expert_offset,
+            activation=act,
+            **activation_params,
+        )
+
+    reference = _reference(activation, gemm1_clamp_limit=clamp)
+    layer = MoELayer(config)
+    runner = layer.runners[0]
+    direct = runner.forward(runner.pack_inputs(pack, weights), tactic=-1)
+    _assert_fp8_close_to_scale(direct, reference)
+    _assert_fp8_close_to_scale(layer(pack, weights), reference)
+    if limits == "default":
+        wrong = _reference(SwiGLU())
+    elif limits == "per_expert":
+        wrong = _reference(activation, gemm1_clamp_limit=clamp.roll(1))
+    else:
+        pre_silu_clamp = torch.full(
+            (NUM_EXPERTS,), 0.25, device=device, dtype=torch.float32
+        )
+        wrong = _reference(SwiGLU(), gemm1_clamp_limit=pre_silu_clamp)
+    _assert_closer_to(direct, reference, wrong)
+
+
+def test_dsfp8_swiglu_step_equals_swiglu_while_gates_stay_below_limit():
+    """SwiGLUStep and SwiGLU's OA clamp differ only for gates above the limit.
+
+    For gate <= limit, min(silu(gate), limit) == silu(min(gate, limit)), and both
+    clamp up to [-limit, limit]. The DeepSeekFp8 activation kernel evaluates both
+    with the same float operations, so the outputs must match bit for bit, with
+    the up clamp engaged (the up rows are scaled 16x). Below the gates, the two
+    clamp orders must differ.
+    """
+
+    def run(activation):
+        pack, weights, config, dequant = _make_block_fp8_case(
+            _DEEPSEEK_FP8, activation=activation, up_scale=16.0
+        )
+        return MoELayer(config)(pack, weights), dequant
+
+    plain, (x, w1, _) = run(SwiGLU())
+    fc1 = torch.einsum("th,eoh->eto", x, w1)
+    gate_max = fc1[..., INTERMEDIATE:].max().item()
+    up_abs_max = fc1[..., :INTERMEDIATE].abs().max().item()
+    # 2x covers the E4M3 rounding of the kernel's FC1 output.
+    limit = 2.0 * gate_max
+    assert limit < 0.5 * up_abs_max, (gate_max, up_abs_max)
+
+    step = run(SwiGLUStep(limit=limit))[0]
+    oa = run(SwiGLU(alpha=1.0, beta=0.0, limit=limit))[0]
+    assert torch.equal(step, oa)
+    assert not torch.allclose(step.float(), plain.float(), atol=1e-3, rtol=1e-3)
+
+    low = 0.25 * gate_max
+    step_low = run(SwiGLUStep(limit=low))[0]
+    oa_low = run(SwiGLU(alpha=1.0, beta=0.0, limit=low))[0]
+    assert not torch.allclose(step_low.float(), oa_low.float(), atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.parametrize("key", ["gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"])

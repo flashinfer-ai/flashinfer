@@ -162,10 +162,21 @@ namespace tg = batchedGemm::trtllm::gen;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// The gated activation the kernel applies to the FC1 output.
+enum class GatedActType : int32_t {
+  // xGlu * sigmoid(alpha * xGlu) * (xLinear + beta), with the optional clamp before SiLU.
+  SwiGlu = 0,
+  // min(silu(xGlu), limit) * clamp(xLinear, -limit, limit): StepFun, clamp after SiLU.
+  SwiGluStep = 1,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 struct Data {
   tg::Dtype mDtypeElt{tg::Dtype::Fp16};
   bool mUsePdl{false};
   bool mUseDeepSeekFp8{false};
+  GatedActType mGatedActType{GatedActType::SwiGlu};
 
   void* inPtr;
   void* outPtr;
@@ -179,10 +190,11 @@ struct Data {
 
   int32_t const* totalNumPaddedTokens;
 
-  // Optional per-local-expert SwiGLU OAI controls, [localNumExperts] each. Null means the
-  // neutral value (alpha=1, beta=0, no clamp), which reduces the epilogue to plain SwiGLU.
-  // The trtllm-gen cubins apply these in the fused FC1 epilogue; the unfused activation
-  // kernel below (DeepSeek FP8) has to apply them itself.
+  // Optional per-local-expert gated-activation controls, [localNumExperts] each. For SwiGlu,
+  // null means the neutral value (alpha=1, beta=0, no clamp), which reduces the epilogue to
+  // plain SwiGLU; SwiGluStep reads only the clamp, and a null clamp means limit 7. The
+  // trtllm-gen cubins apply these in the fused FC1 epilogue; the unfused activation kernel
+  // below (DeepSeek FP8) has to apply them itself.
   float const* gatedActAlphaPtr = nullptr;
   float const* gatedActBetaPtr = nullptr;
   float const* gatedActClampLimitPtr = nullptr;
@@ -216,6 +228,7 @@ struct KernelParams {
   float const* gatedActClampLimitPtr = nullptr;
   int32_t const* ctaIdxXyToBatchIdx = nullptr;
   int32_t tileTokensDim{0};
+  GatedActType gatedActType{GatedActType::SwiGlu};
 
   static KernelParams setKernelParams(Data const& data) {
     KernelParams params;
@@ -237,6 +250,7 @@ struct KernelParams {
     params.gatedActClampLimitPtr = data.gatedActClampLimitPtr;
     params.ctaIdxXyToBatchIdx = data.ctaIdxXyToBatchIdx;
     params.tileTokensDim = data.tileTokensDim;
+    params.gatedActType = data.mGatedActType;
 
     return params;
   }

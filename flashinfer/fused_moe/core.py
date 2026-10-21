@@ -4820,8 +4820,15 @@ def _validate_fp8_block_scale_gemm1_activation_params(
     gemm1_clamp_limit: Optional[torch.Tensor],
 ) -> None:
     if int(activation_type) == int(ActivationType.SwigluStep):
-        if Fp8QuantizationType(fp8_quantization_type) != Fp8QuantizationType.MxFp8:
-            raise ValueError("SwigluStep requires the fused MxFp8 GEMM1 epilogue.")
+        if Fp8QuantizationType(fp8_quantization_type) not in (
+            Fp8QuantizationType.MxFp8,
+            Fp8QuantizationType.DeepSeekFp8,
+        ):
+            raise ValueError(
+                "SwigluStep requires Fp8QuantizationType.MxFp8 or "
+                "Fp8QuantizationType.DeepSeekFp8 in FP8 block scale MoE, got "
+                f"{Fp8QuantizationType(fp8_quantization_type)}."
+            )
         if gemm1_alpha is not None or gemm1_beta is not None:
             raise ValueError(
                 "ActivationType.SwigluStep accepts gemm1_clamp_limit only."
@@ -6046,7 +6053,7 @@ def trtllm_fp8_block_scale_moe(
         otherwise a ``ValueError`` is raised.
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
-        ``6`` Relu2; ``7`` SwigluStep (MxFp8 only); ``9`` Identity.
+        ``6`` Relu2; ``7`` SwigluStep (MxFp8 and DeepSeekFp8); ``9`` Identity.
     norm_topk_prob : bool
         Whether to normalize the top-k probabilities (default ``True``).
     routing_replay_out : Optional[torch.Tensor]
@@ -6078,10 +6085,12 @@ def trtllm_fp8_block_scale_moe(
         Optional ``[local_num_experts]`` float32 per-expert clamp limit.
         With ``Swiglu``, supported for MxFp8 and DeepSeekFp8 and clamps
         ``X1`` to ``[-limit, limit]`` and ``X2`` from above before SiLU.
-        With ``SwigluStep``, supported only for fused MxFp8 and clamps
-        ``X1`` and ``silu(X2)`` at the physical limit.  ``None`` uses
-        physical ``7`` for SwigluStep.  MXFP8 has no global FC1 dequant
-        scale, so raw accumulator and physical units coincide.
+        With ``SwigluStep``, supported for MxFp8 (in the fused FC1
+        epilogue) and DeepSeekFp8 (in the separate activation kernel) and
+        clamps ``X1`` and ``silu(X2)`` at the physical limit.  ``None`` uses
+        physical ``7`` for SwigluStep.  Neither block-scale recipe has a
+        global FC1 dequant scale, so raw accumulator and physical units
+        coincide.
     output : Optional[torch.Tensor]
         Optional in-place output tensor of shape ``[seq_len, hidden_size]``.
         Allocated internally when ``None`` (default).
@@ -6360,10 +6369,11 @@ def trtllm_fp8_block_scale_routed_moe(
         With ``ActivationType.Swiglu``, supported for MxFp8 and
         DeepSeekFp8; it clamps ``X1`` to ``[-limit, limit]`` and ``X2``
         from above before SiLU. ``None`` disables that clamp. With
-        ``ActivationType.SwigluStep``, supported only for fused MxFp8;
-        it caps ``X1`` and ``silu(X2)`` at the physical limit, with a
-        default of ``7`` when ``None``. MxFp8 has no global FC1 dequant
-        scale, so raw accumulator and physical limits coincide.
+        ``ActivationType.SwigluStep``, supported for MxFp8 and
+        DeepSeekFp8; it caps ``X1`` and ``silu(X2)`` at the physical limit,
+        with a default of ``7`` when ``None``. Neither block-scale recipe
+        has a global FC1 dequant scale, so raw accumulator and physical
+        limits coincide.
 
     valid_hidden_size : Optional[int]
         Valid (unpadded) hidden dimension.  When provided, the ``hidden_size``

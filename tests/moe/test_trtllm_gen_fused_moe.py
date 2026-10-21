@@ -2652,17 +2652,23 @@ def test_bf16_moe_swiglu_oa_activation_params(cache_permute_indices):
             WeightLayout.MajorK,
             id="mxfp8-block",
         ),
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
+            WeightLayout.MajorK,
+            id="dsfp8-block",
+        ),
     ],
 )
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 def test_swiglu_step_mixed_expert_limits(
     moe_impl, weight_layout, cache_permute_indices
 ):
-    """The fused GEMM caps SiLU and up independently for per-expert 7/16 limits.
+    """SwiGLUStep caps SiLU and up independently for per-expert 7/16 limits.
 
     The larger inputs make both limits effective. NVFP4 and per-tensor FP8
     have non-unit FC1 dequant scales, so this also checks their raw-limit
-    conversion; the reference consumes physical limits.
+    conversion; the reference consumes physical limits. DeepSeekFp8 applies
+    the limits in its separate activation kernel instead of the FC1 epilogue.
     """
     num_experts = 32
     intermediate_size = 512
@@ -2718,6 +2724,10 @@ def test_swiglu_step_mixed_expert_limits(
         pytest.param(
             FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8),
             id="mxfp8-block",
+        ),
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
+            id="dsfp8-block",
         ),
     ],
 )
@@ -3036,6 +3046,28 @@ def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
             activation_type=ActivationType.Geglu.value,
             gemm1_clamp_limit=per_expert,
         )
+
+    # SwigluStep is scoped to the two block-scale recipes and takes a limit only.
+    with pytest.raises(
+        ValueError, match=r"SwigluStep requires Fp8QuantizationType\.MxFp8"
+    ):
+        trtllm_fp8_block_scale_moe(
+            **kwargs,
+            fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+            activation_type=ActivationType.SwigluStep.value,
+            gemm1_clamp_limit=per_expert,
+        )
+    for quantization_type in (
+        Fp8QuantizationType.DeepSeekFp8,
+        Fp8QuantizationType.MxFp8,
+    ):
+        with pytest.raises(ValueError, match=r"gemm1_clamp_limit only"):
+            trtllm_fp8_block_scale_moe(
+                **kwargs,
+                fp8_quantization_type=quantization_type,
+                activation_type=ActivationType.SwigluStep.value,
+                gemm1_alpha=per_expert,
+            )
 
     routed_kwargs = {
         key: value for key, value in kwargs.items() if key != "routing_logits"

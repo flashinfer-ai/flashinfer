@@ -1451,7 +1451,7 @@ class TestMoERunnerSupport:
             ReLU2,
         )
         assert TrtllmFp8BlockRunner.supported_activation_classes_by_quant == {
-            (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU,),
+            (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU, SwiGLUStep),
             (QuantFormat.MXFP8, QuantFormat.MXFP8): (
                 SwiGLU,
                 SwiGLUStep,

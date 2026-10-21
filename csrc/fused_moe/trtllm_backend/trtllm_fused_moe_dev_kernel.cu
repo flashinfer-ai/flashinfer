@@ -94,6 +94,34 @@ inline __device__ float gatedSilu(KernelParams const& params, int32_t permutedId
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// SwiGLU-Step (StepFun), matching the CUTLASS SwigluStep activation and the fused SwiGluStep
+// epilogue of the trtllm-gen cubins:
+//   out = min(silu(xGlu), limit) * clamp(xLinear, -limit, limit)
+// The clamp applies to the SiLU output, unlike the OAI clamp in gatedSilu, which applies to its
+// input. limit is per local expert; without a clamp tensor it is 7, as in those epilogues.
+template <typename KernelParams>
+inline __device__ float gatedSiluStep(KernelParams const& params, int32_t permutedIdx,
+                                      float xLinear, float xGlu) {
+  float limit = 7.0f;
+  if (params.gatedActClampLimitPtr != nullptr) {
+    limit =
+        params.gatedActClampLimitPtr[params.ctaIdxXyToBatchIdx[permutedIdx / params.tileTokensDim]];
+  }
+  return fminf(silu(xGlu), limit) * fmaxf(fminf(xLinear, limit), -limit);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename KernelParams>
+inline __device__ float gatedActivation(KernelParams const& params, int32_t permutedIdx,
+                                        float xLinear, float xGlu) {
+  return params.gatedActType == GatedActType::SwiGluStep
+             ? gatedSiluStep(params, permutedIdx, xLinear, xGlu)
+             : gatedSilu(params, permutedIdx, xLinear, xGlu);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <typename KernelParams>
 __global__ void activationKernel(KernelParams params) {
   using Type = typename KernelParams::Type;
@@ -122,7 +150,7 @@ __global__ void activationKernel(KernelParams params) {
         float x1 = (float)params.inPtr[baseIdx];
         float x2 = (float)params.inPtr[baseIdx + params.innerDim / 2];
 
-        Type out = (Type)gatedSilu(params, permutedIdx, x1, x2);
+        Type out = (Type)gatedActivation(params, permutedIdx, x1, x2);
 
         int64_t const outIdx = (int64_t)permutedIdx * (params.innerDim / 2) + hiddenIdx;
         params.outPtr[outIdx] = out;
@@ -322,7 +350,8 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
           // Padding lanes keep permutedIdx == -1 and contribute a zeroed x1/x2, so skip the
           // per-expert lookup for them instead of indexing ctaIdxXyToBatchIdx out of range.
           int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
-          float out = permutedIdx == -1 ? silu(x2) * x1 : gatedSilu(params, permutedIdx, x1, x2);
+          float out =
+              permutedIdx == -1 ? silu(x2) * x1 : gatedActivation(params, permutedIdx, x1, x2);
           outArr[tokenInCtaIdx] = out;
           absOutArr[tokenInCtaIdx] = fabsf(out);
         }
