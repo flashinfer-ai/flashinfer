@@ -24,10 +24,11 @@ unequal documents of 0.37 / 0.29 / 0.21 / rest of ``S`` tokens (each nudged off
 a multiple of 64).  Every row reports forward, backward (``dx`` and the
 deterministic FP32 ``dweight``) and their sum in microseconds plus the achieved
 GB/s over the logical byte volume (forward ``4SC + 16C``, backward ``6SC + 32C
-+ 32 C rows`` (``rows`` the FP32 partial rows of the device's grid) for the partial workspace's round trip).  Timing uses CUPTI
-kernel activity with a cold L2 (``flashinfer.testing.bench_gpu_time(
-enable_cupti=True)``); multi-kernel comparators report the sum of their
-kernels' GPU time.
++ 32 C rows`` (``rows`` the FP32 partial rows of the grid of the backward
+program the row's channel count selects; the JSON names that program) for the
+partial workspace's round trip).  Timing uses CUPTI kernel activity with a
+cold L2 (``flashinfer.testing.bench_gpu_time(enable_cupti=True)``);
+multi-kernel comparators report the sum of their kernels' GPU time.
 
 Example::
 
@@ -232,8 +233,16 @@ def _bytes(mode: str, tokens: int, channels: int, *, partial_rows: int) -> int:
     return {"fwd": fwd, "bwd": bwd, "step": fwd + bwd}[mode]
 
 
-def _partial_rows(arch: str, channels: int, *, device_index: int) -> int:
-    record = loader.workspace_record(arch)
+def _selected_program(arch: str, tokens: int, channels: int) -> str:
+    """The backward program the registry selects for the row (by channel count; ``tokens`` never enters)."""
+
+    return loader.selected_modules(arch, "bwd", C=channels, S=tokens)[0]
+
+
+def _partial_rows(program: str, channels: int, *, device_index: int) -> int:
+    """The FP32 partial rows of ``program``'s own grid (the public workspace is sized for the largest grid)."""
+
+    record = loader.MODULES[program]
     return loader.workspace_layout(record, channels, device_index=device_index)["rows"]
 
 
@@ -252,11 +261,13 @@ def bench_row(tokens: int, channels: int, *, comparators, device) -> dict:
         tokens, channels, device=device, generator=generator, dtype=torch.bfloat16
     )
     arch = loader.arch_for_capability(torch.cuda.get_device_capability(device))
-    partial_rows = _partial_rows(arch, channels, device_index=device.index)
+    program = _selected_program(arch, tokens, channels)
+    partial_rows = _partial_rows(program, channels, device_index=device.index)
     result = {
         "tokens": tokens,
         "channels": channels,
         "documents": list(lens),
+        "program": program,
         "partial_rows": partial_rows,
         "comparators": {},
     }

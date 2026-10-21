@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union, cast
 
 import torch
 
+from ._compile_cache import build_and_load_attention_kernel
+
 from flashinfer.api_logging import flashinfer_experimental_api
 from flashinfer.trace.templates.attention import (
     attention_ts_decode_trace_dispatch,
@@ -697,8 +699,6 @@ def _validate_dtype_pair(
     k_dtype: torch.dtype,
     v_dtype: torch.dtype,
     output_dtype: torch.dtype,
-    *,
-    allow_fp8_bf16_output: bool = False,
 ) -> None:
     _dtype_key(q_dtype)
     _dtype_key(k_dtype)
@@ -726,25 +726,16 @@ def _validate_dtype_pair(
             q_dtype == torch.float8_e4m3fn
             and matching_kv
             and k_dtype in (torch.float8_e4m3fn, torch.uint8)
-            and output_dtype
-            in (
-                (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
-                if allow_fp8_bf16_output
-                else (torch.float16, torch.float8_e4m3fn)
-            )
+            and output_dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         )
     )
     if not supported:
         raise NotImplementedError(
             "attention-ts decode supports FP16->FP16, BF16->BF16, "
-            + (
-                "FP8-E4M3->FP16/BF16, and FP8-E4M3->FP8-E4M3; "
-                if allow_fp8_bf16_output
-                else "FP8-E4M3->FP16, and FP8-E4M3->FP8-E4M3; "
-            )
-            + "BF16 Q + FP8 K/V, BF16/FP8-E4M3 Q + NVFP4 K/V, "
-            + "and BF16 Q/K + FP8 V; got "
-            + f"Q_{q_dtype}_K_{k_dtype}_V_{v_dtype}->{output_dtype}"
+            "FP8-E4M3->FP16/BF16/FP8-E4M3; "
+            "BF16 Q + FP8 K/V, BF16/FP8-E4M3 Q + NVFP4 K/V, "
+            "and BF16 Q/K + FP8 V; got "
+            f"Q_{q_dtype}_K_{k_dtype}_V_{v_dtype}->{output_dtype}"
         )
 
 
@@ -1912,8 +1903,8 @@ def _get_compiled_decode(
             ),
         )
 
-    with torch.cuda.device(device_index):
-        compiled_main = cute.compile(
+    def compile_main():
+        return cute.compile(
             main_tensor_adapter,
             q_fake,
             k_fake,
@@ -1951,28 +1942,38 @@ def _get_compiled_decode(
             static_native_uniform_kv,
             options=_COMPILE_OPTIONS,
         )
+
+    def compile_reducer():
+        assert reduction_tensor_adapter is not None
+        return cute.compile(
+            reduction_tensor_adapter,
+            out_fake,
+            seq_lens_fake,
+            cu_seqlens_q_fake,
+            partial_o_fake,
+            partial_stats_fake,
+            attention_sinks_fake,
+            Float32(1.0),
+            Float32(1.0),
+            direct_q1_fake,
+            stream_fake,
+            cfg,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            max_kv_len,
+            static_full_split_prefix,
+            options=_COMPILE_OPTIONS,
+        )
+
+    with torch.cuda.device(device_index):
+        compiled_main = build_and_load_attention_kernel(
+            "decode", "main", compile_spec, _COMPILE_OPTIONS, compile_main
+        )
         compiled_reducer = None
         if cfg.use_separate_reduction_kernel:
-            assert reduction_tensor_adapter is not None
-            compiled_reducer = cute.compile(
-                reduction_tensor_adapter,
-                out_fake,
-                seq_lens_fake,
-                cu_seqlens_q_fake,
-                partial_o_fake,
-                partial_stats_fake,
-                attention_sinks_fake,
-                Float32(1.0),
-                Float32(1.0),
-                direct_q1_fake,
-                stream_fake,
-                cfg,
-                num_qo_heads,
-                num_kv_heads,
-                head_dim,
-                max_kv_len,
-                static_full_split_prefix,
-                options=_COMPILE_OPTIONS,
+            compiled_reducer = build_and_load_attention_kernel(
+                "decode", "reducer", compile_spec, _COMPILE_OPTIONS, compile_reducer
             )
 
     return compiled_main, compiled_reducer
@@ -3444,7 +3445,6 @@ def _prepare_prims_ts_batch_decode_plan(
         k_cache.dtype,
         v_cache.dtype,
         output_dtype,
-        allow_fp8_bf16_output=use_q_token_kv_block_sparse_route,
     )
     k_sf_cache, v_sf_cache = _normalize_paged_kv_scale_factors(
         kv_scale_factors,

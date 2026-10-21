@@ -658,6 +658,12 @@ kernel_minimax_h3_bf16_pre_attention_gemm(const __grid_constant__ CUtensorMap ac
                     }
                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
                 }
+                #pragma unroll 1
+                for (int _ = 0; _ < 7; _++) {
+                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
+                    load_stage += 1;
+                    if (load_stage == 7) { load_stage = 0; _phase_mma_done ^= 1; }
+                }
             }
         }
     }

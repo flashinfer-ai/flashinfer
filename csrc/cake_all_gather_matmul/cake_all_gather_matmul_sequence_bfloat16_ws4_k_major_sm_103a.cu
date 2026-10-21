@@ -86,6 +86,12 @@ extern "C" __global__ void kernel_cake_all_gather_matmul_b9a6204da826be87d972(
     __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready,
     unsigned int ready_target, int rank, int M, int scratch_pitch, int signal_rows, int n_tiles,
     int remote_order);
+extern "C" __global__ void kernel_cake_all_gather_matmul_ea2faa64e8c1ea61c8b8(
+    const __grid_constant__ CUtensorMap A_local, const __grid_constant__ CUtensorMap A_scratch,
+    const __grid_constant__ CUtensorMap B, __nv_bfloat16* __restrict__ C,
+    __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready,
+    unsigned int ready_target, int rank, int M, int scratch_pitch, int signal_rows, int n_tiles,
+    int remote_order);
 
 namespace cake_host_shim_seq_55b23c415ca3161a {
 
@@ -914,6 +920,30 @@ constexpr unsigned kMainCg2DynamicSmem = 197632u;
 constexpr unsigned kMainCg2s1DynamicSmem = 0u;
 constexpr unsigned kMainCg2s2DynamicSmem = 197632u;
 
+// Tile-order twins of this sequence's class: the one-CTA main with another tile -> (peer, B panel)
+// map of its persistent walk (the one-CTA launch, grid, ABI and tensor maps; own symbols and footprints).
+// Form codes 4 / 5 of Run / RunPush (the loader's main_form_code) name them; they take the one-CTA launch.
+// A call of exactly kOrderPaddedRows[i] padded rows and kOrderCols[i] columns at the public width whose
+// form code is kOrderForm[i] runs that twin; any other call of an order form code is refused (the
+// loader's point table names exactly these calls). A trailing 0 entry keeps the tables well-formed.
+constexpr int64_t kMainFormPo = 4;
+constexpr int64_t kMainFormPi = 5;
+constexpr bool kHasMainPo = true;
+constexpr unsigned kMainPoDynamicSmem = 197632u;
+constexpr bool kHasMainPi = false;
+constexpr unsigned kMainPiDynamicSmem = 0u;
+constexpr int kOrderPointCount = 1;
+constexpr int64_t kOrderPaddedRows[kOrderPointCount + 1] = {128, 0};
+constexpr int64_t kOrderCols[kOrderPointCount + 1] = {14336, 0};
+constexpr int64_t kOrderForm[kOrderPointCount + 1] = {4, 0};
+constexpr bool is_order_form(int64_t form) { return form == kMainFormPo || form == kMainFormPi; }
+constexpr int order_point(int64_t padded_rows, int64_t cols, int64_t form) {
+  for (int i = 0; i < kOrderPointCount; ++i) {
+    if (kOrderPaddedRows[i] == padded_rows && kOrderCols[i] == cols && kOrderForm[i] == form) return i;
+  }
+  return -1;
+}
+
 // A tensor map is a pure function of the source's address, extents and
 // strides, so the encoder output is cached on that key: the bound weight and
 // the symmetric scratch hit on every call, the activation hits whenever the
@@ -1055,6 +1085,23 @@ inline MainProgram main_program() {
       CakeSetMaxDynamicSmem(program.kernel, static_cast<int>(program.dynamic_smem));
   (void)smem_ready;
   return program;
+}
+
+// The tile-order twins (own symbols; the N256 main's width, launch and tensor maps), selected per call
+// by the form code; a form whose twin does not travel with this route is refused by resolve_call.
+inline MainProgram main_program_order_po() {
+  MainProgram program{};
+  program.kernel = reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_ea2faa64e8c1ea61c8b8);
+  program.dynamic_smem = kMainPoDynamicSmem;
+  static const bool smem_ready =
+      CakeSetMaxDynamicSmem(program.kernel, static_cast<int>(program.dynamic_smem));
+  (void)smem_ready;
+  return program;
+}
+inline MainProgram main_program_order(int64_t form) {
+  if (form == kMainFormPo) return main_program_order_po();
+  TVM_FFI_THROW(RuntimeError) << "this route ships no tile-order main of form " << form;
+  return MainProgram{};
 }
 
 inline void launch_main(const void* kernel, unsigned dynamic_smem, const CUtensorMap& a_local,
@@ -1204,18 +1251,22 @@ inline Call resolve_call(const TensorView& inp, const TensorView& scratch, const
   // class ships it, at the public width), whose even grid launches at most one cluster of
   // two CTAs per pair tile (per peer and N tile, ceil(M tiles / 2) pairs per readiness
   // chunk; the odd CTA of an odd chunk's last pair idles).
-  TVM_FFI_CHECK(main_form >= kMainFormCg1 && main_form <= kMainFormCg2s2, ValueError)
+  TVM_FFI_CHECK(main_form >= kMainFormCg1 && main_form <= kMainFormPi, ValueError)
       << "main_form=" << main_form
-      << " must be 0 (one-CTA main), 1 (CTA-pair main), 2 or 3 (spill-wave N-split pair mains)";
+      << " must be 0 (one-CTA main), 1 (CTA-pair main), 2 or 3 (spill-wave N-split pair mains), 4 or 5 (tile-order mains)";
   TVM_FFI_CHECK(main_form != kMainFormCg2 || kHasMainCg2, ValueError)
       << "main_form=1 selects the CTA-pair main, which this route does not ship";
   TVM_FFI_CHECK(main_form != kMainFormCg2s1 || kHasMainCg2s1, ValueError)
       << "main_form=2 selects the first spill-wave N-split pair main, which this route does not ship";
   TVM_FFI_CHECK(main_form != kMainFormCg2s2 || kHasMainCg2s2, ValueError)
       << "main_form=3 selects the second spill-wave N-split pair main, which this route does not ship";
+  TVM_FFI_CHECK(!is_order_form(main_form) || order_point(call.padded_rows, call.cols, main_form) >= 0,
+                ValueError)
+      << "main_form=" << main_form << " selects a tile-order main this route ships for no call of "
+      << call.padded_rows << " padded rows and N=" << call.cols << " (block_n=" << block_n << ")";
   TVM_FFI_CHECK(main_form == kMainFormCg1 || block_n == kBlockN, ValueError)
       << "a pair form needs block_n=" << kBlockN << ", got block_n=" << block_n;
-  if (main_form != kMainFormCg1) {
+  if (main_form != kMainFormCg1 && !is_order_form(main_form)) {
     const int64_t first_tiles_m = call.chunk_rows / kBlockM;
     const int64_t last_tiles_m = call.padded_rows / kBlockM - (call.num_chunks - 1) * first_tiles_m;
     const int64_t pair_tiles = kWorldSize *
@@ -1257,7 +1308,7 @@ inline void launch_main_for(const Call& call, const TensorView& inp, const Tenso
   static thread_local TensorMapCache<2> b_cg2s1_cache;
   static thread_local TensorMapCache<2> b_cg2s2_cache;
   const bool n128_main = call.block_n == 128;
-  const bool pair_main = call.form != kMainFormCg1;
+  const bool pair_main = call.form != kMainFormCg1 && !is_order_form(call.form);
   const CUtensorMap& a_local = a_local_cache.get(inp, EncodeTma_A_local);
   const CUtensorMap& a_scratch = a_scratch_cache.get(scratch, EncodeTma_A_scratch);
   const CUtensorMap& b = call.form == kMainFormCg2s1 ? b_cg2s1_cache.get(weight, cg2s1::EncodeTma_B)
@@ -1265,7 +1316,8 @@ inline void launch_main_for(const Call& call, const TensorView& inp, const Tenso
                          : call.form == kMainFormCg2   ? b_cg2_cache.get(weight, cg2::EncodeTma_B)
                          : n128_main                   ? b128_cache.get(weight, n128::EncodeTma_B)
                                                        : b_cache.get(weight, EncodeTma_B);
-  const MainProgram program = call.form == kMainFormCg2s1 ? main_program<kBlockN, kMainFormCg2s1>()
+  const MainProgram program = is_order_form(call.form) ? main_program_order(call.form)
+                              : call.form == kMainFormCg2s1 ? main_program<kBlockN, kMainFormCg2s1>()
                               : call.form == kMainFormCg2s2 ? main_program<kBlockN, kMainFormCg2s2>()
                               : call.form == kMainFormCg2   ? main_program<kBlockN, kMainFormCg2>()
                               : n128_main                   ? main_program<128>()

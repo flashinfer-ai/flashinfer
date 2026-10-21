@@ -1071,6 +1071,8 @@ kernel_cake_kimi_k3_attn_res_0d77890adbb0f7175149(__nv_bfloat16* __restrict__ ou
                     }
                 }
             }
+            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
+            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
             asm volatile("barrier.sync 9, 288;" ::: "memory");
             if (consumer_warp == 0) {
                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);

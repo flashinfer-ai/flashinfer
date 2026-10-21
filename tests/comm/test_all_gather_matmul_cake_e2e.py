@@ -262,6 +262,10 @@ def _run_cake_subgroup(
             )
             _check(prepared_first, prepared_expected)
             _check(prepared_second, -prepared_expected)
+            # The 125-row call pads to one 128-row tile; at the four-rank
+            # N = 14336 width, on an architecture whose tile-order point table
+            # lists that call, it runs the one-CTA main's tile-order twin (the
+            # same launch and grid; only the tile walk differs).
             for served_rows in (125, 1025, 2048):
                 served = torch.randn(served_rows, K, dtype=dtype, device=device)
                 served_out = launcher(served)
@@ -278,7 +282,9 @@ def _run_cake_subgroup(
             # graph, three replays with fresh static input, an eager call
             # between replays. 512 rows at world sizes 4 and 8 take the
             # PDL-chained SM push route (N within the route's width ceiling),
-            # 1024 rows the copy-engine route; both are captured.
+            # 1024 rows the copy-engine route -- except the eight-rank N = 1280
+            # call on an architecture whose SM push band lists it, which takes
+            # the SM push route at its launch row; both are captured.
             for static_rows in (512, 1024):
                 static = torch.randn(static_rows, K, dtype=dtype, device=device)
                 _replayed_launcher(

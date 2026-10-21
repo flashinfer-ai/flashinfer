@@ -1030,7 +1030,13 @@ _CHUNK_PARALLEL_WORKSPACE_BYTES_PER_TILE = _HEADDIM * _DSTATE * (4 + 2)
 # the item-major tile range is split into ``vcount`` virtual CTA ranges (V =
 # the SM count the program balances against per capability; the B200 value
 # for an unmeasured capability; every floating-point result depends on
-# (inputs, V) only, never on the launch grid).  ``grid_barrier`` is u32
+# (inputs, V) only, never on the launch grid).  The host passes the table
+# value capped at the device's SM count (``_chunk_parallel_vcount``): every
+# CTA claims ranges until none is left, so a board with fewer SMs than V
+# runs a second round of ranges on some CTAs -- the 208-SM R200 board
+# variant against 212 took 1.35-1.52x the 216-SM boards' time; capped at
+# 208 it measures 0.93-0.98x of those boards' times, and a board with at
+# least V SMs keeps the table value.  ``grid_barrier`` is u32
 # ``[TICKET, EPOCH, pad, pad, FLAG[0..SEGMENT_CAP)]`` (zeroed once per device;
 # the kernel's claim counter wraps itself, the epoch free-runs and the flags
 # carry the epoch).  ``agg_work`` holds V f32 [64, 128] range aggregates
@@ -1048,13 +1054,25 @@ _CHUNK_PARALLEL_AGG_ELEMS_PER_RANGE = _HEADDIM * _DSTATE + 1
 _CHUNKPAR3_GRID_BARRIER_WORDS = 2
 
 
-def _chunk_parallel_vcount(capability: tuple[int, int]) -> int:
-    """The look-back program's virtual CTA count V of a compute capability."""
+def _chunk_parallel_vcount(
+    capability: tuple[int, int], sm_count: Optional[int] = None
+) -> int:
+    """The look-back program's virtual CTA count V: the compute capability's
+    table value (the SM count of the part the program balances its tiles
+    against), capped at ``sm_count`` when the device's SM count is given.
+    The cap keeps one range per CTA on a board with fewer SMs than the table
+    value and leaves a board with at least that many SMs unchanged.  The
+    result depends on (inputs, V) only, so every board of one SM count
+    computes the same values; board variants of one capability differ within
+    the precision gate.  Mirrors the Cake kernel-tests host rule
+    ``chunk_parallel_vcount``."""
 
     key = (int(capability[0]), int(capability[1]))
     vcount = _CHUNK_PARALLEL_VCOUNT_BY_ARCH.get(
         key, _CHUNK_PARALLEL_VCOUNT_BY_ARCH[_CHUNK_PARALLEL_VCOUNT_DEFAULT]
     )
+    if sm_count is not None:
+        vcount = min(int(vcount), int(sm_count))
     return max(1, min(int(vcount), _CHUNK_PARALLEL_SEGMENT_CAP))
 
 
@@ -2600,7 +2618,7 @@ class CakeSSDCombined:
             )
         if chunk_parallel:
             self._chunk_parallel_workspace(
-                device, tile_count, _chunk_parallel_vcount(capability)
+                device, tile_count, _chunk_parallel_vcount(capability, sm_count)
             )
         return workspace
 
@@ -2621,8 +2639,10 @@ class CakeSSDCombined:
         allocated zeroed once per device and never re-zeroed: the kernel's
         claim counter wraps itself, its epoch word is free-running and the
         flags carry the epoch.  ``agg_work`` (f32, ``vcount`` range aggregates
-        plus ``vcount`` scalars) is per device too; the kernel writes every
-        slot it reads within one launch, so it needs no initial value.  A
+        plus ``vcount`` scalars) is per device too and grows only; the kernel
+        writes every slot it reads within one launch, so it needs no initial
+        value, and it indexes at most the bound ``vcount`` ranges, so a buffer
+        sized for a larger V (the uncapped table value) stays in bounds.  A
         workspace captured into a CUDA graph pins the buffers its graph
         recorded (``workspace["chunk_parallel"]``, see ``run``), so a later
         growth replaces the device's current buffers without freeing them; a
@@ -3545,8 +3565,10 @@ class CakeSSDCombined:
             # [tiles, 64, 128] tensor) and as the u32 word view the phase-2
             # chains store through.  A captured workspace binds the buffers
             # its graph recorded (pinned by ``run``); every other call binds
-            # the device's current grow-only buffers.
-            vcount = _chunk_parallel_vcount(_ARCH_CAPABILITIES[arch])
+            # the device's current grow-only buffers.  V is the capability's
+            # table value capped at this device's SM count (``_sm_count`` is
+            # fixed per device index, so a captured call replays its V).
+            vcount = _chunk_parallel_vcount(_ARCH_CAPABILITIES[arch], sm_count)
             chunk_parallel = workspace.get("chunk_parallel")
             if chunk_parallel is None:
                 chunk_parallel = self._chunk_parallel_workspace(
@@ -3569,7 +3591,7 @@ class CakeSSDCombined:
                 chunk_parallel = self._chunk_parallel_workspace(
                     x.device,
                     num_segments * self.nheads,
-                    _chunk_parallel_vcount(_ARCH_CAPABILITIES[arch]),
+                    _chunk_parallel_vcount(_ARCH_CAPABILITIES[arch], sm_count),
                 )
             main_values.update(
                 h_map=chunk_parallel["h_work"],
