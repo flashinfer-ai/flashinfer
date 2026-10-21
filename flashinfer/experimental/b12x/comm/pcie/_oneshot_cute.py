@@ -8,7 +8,7 @@ atomic operation.
 
 from __future__ import annotations
 
-import functools
+import os
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
@@ -19,6 +19,7 @@ from cutlass import Float32, Int32, Int64, Uint32
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
+from b12x._lib.program_cache import program_cache
 from b12x._lib.intrinsics.memory import (
     ld_global_v4_u32,
     st_global_v4_f32,
@@ -29,6 +30,7 @@ from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
 
+from ._dcp_cute_common import _membar_sys
 from ._cute_intrinsics import (
     add_bf16x2,
     add_f16x2,
@@ -190,6 +192,7 @@ class _OneshotLaunch(_PackedMath):
             "pull",
             "tp2_remote_push",
             "tp2_remote_push_stream",
+            "tp2_remote_push_simple",
         ):
             raise ValueError(f"invalid plain oneshot transport {transport!r}")
         if transport.startswith("tp2_remote_push") and (
@@ -209,6 +212,7 @@ class _OneshotLaunch(_PackedMath):
         self._slot_bias = int(slot_bias) & 1
         self._transport = transport
         self._threads = int(threads)
+        self._pdl = _ONESHOT_PDL and transport == "pull"
 
     @cute.jit
     def __call__(
@@ -343,6 +347,8 @@ class _OneshotLaunch(_PackedMath):
                     stage_index += stride
 
             self._multi_gpu_barrier(signal_ptrs)
+            if cutlass.const_expr(self._pdl):
+                cute.arch.griddepcontrol_launch_dependents()
 
             while index < size_packs:
                 accumulator = cute.make_rmem_tensor(
@@ -383,6 +389,86 @@ class _OneshotLaunch(_PackedMath):
             # records not touched by this shape.
             expected_generation = generation + Uint32(2)
 
+            if cutlass.const_expr(self._transport == "tp2_remote_push_simple"):
+                # Match NCCL Simple publication: the payload crosses PCIe once,
+                # 16 bytes per pack, and each CTA then raises one generation line
+                # after a system fence. LL records take 32 bytes per pack, so the
+                # last lines of the incoming capacity hold the CTA flags. A flag
+                # validates only on this generation in every lane, which neither
+                # an older flag nor an LL record carries.
+                flag_offset = (
+                    plain_capacity_packs * Int64(32)
+                    - Int64(_MAX_BLOCKS * 16)
+                    + Int64(bidx) * Int64(16)
+                )
+                publish_index = index
+                while publish_index < size_packs:
+                    words = ld_global_v4_u32(
+                        input_base + Int64(publish_index) * Int64(16)
+                    )
+                    st_global_v4_u32(
+                        peer_write_base + Int64(publish_index) * Int64(16),
+                        words[0],
+                        words[1],
+                        words[2],
+                        words[3],
+                    )
+                    publish_index += stride
+                cute.arch.sync_threads()
+                if Int32(tidx) == Int32(0):
+                    _membar_sys()
+                    st_relaxed_sys_global_v4_u32(
+                        peer_write_base + flag_offset,
+                        expected_generation,
+                        expected_generation,
+                        expected_generation,
+                        expected_generation,
+                    )
+                    flag = ld_relaxed_sys_global_v4_u32(local_poll_base + flag_offset)
+                    waiting = (
+                        (flag[0] ^ expected_generation)
+                        | (flag[1] ^ expected_generation)
+                        | (flag[2] ^ expected_generation)
+                        | (flag[3] ^ expected_generation)
+                    )
+                    while waiting != Uint32(0):
+                        flag = ld_relaxed_sys_global_v4_u32(
+                            local_poll_base + flag_offset
+                        )
+                        waiting = (
+                            (flag[0] ^ expected_generation)
+                            | (flag[1] ^ expected_generation)
+                            | (flag[2] ^ expected_generation)
+                            | (flag[3] ^ expected_generation)
+                        )
+                    _membar_sys()
+                cute.arch.sync_threads()
+                while index < size_packs:
+                    local_words = ld_global_v4_u32(
+                        input_base + Int64(index) * Int64(16)
+                    )
+                    peer_words = ld_relaxed_sys_global_v4_u32(
+                        local_poll_base + Int64(index) * Int64(16)
+                    )
+                    packed_sum = cute.make_rmem_tensor((4,), cutlass.Uint32)
+                    for word in cutlass.range_constexpr(4):
+                        if cutlass.const_expr(self._dtype_name == "float16"):
+                            packed_sum[word] = add_f16x2(
+                                local_words[word], peer_words[word]
+                            )
+                        else:
+                            packed_sum[word] = add_bf16x2(
+                                local_words[word], peer_words[word]
+                            )
+                    st_global_v4_u32(
+                        output_base + Int64(index) * Int64(16),
+                        packed_sum[0],
+                        packed_sum[1],
+                        packed_sum[2],
+                        packed_sum[3],
+                    )
+                    index += stride
+
             if cutlass.const_expr(self._transport == "tp2_remote_push"):
                 publish_index = index
                 while publish_index < size_packs:
@@ -411,34 +497,28 @@ class _OneshotLaunch(_PackedMath):
                     )
                     publish_index += stride
 
-            while index < size_packs:
-                local_words = ld_global_v4_u32(input_base + Int64(index) * Int64(16))
-                if cutlass.const_expr(self._transport == "tp2_remote_push_stream"):
-                    peer_line_address = peer_write_base + Int64(index) * Int64(32)
-                    st_relaxed_sys_global_v4_u32(
-                        peer_line_address,
-                        local_words[0],
-                        expected_generation,
-                        local_words[1],
-                        expected_generation,
+            if cutlass.const_expr(self._transport != "tp2_remote_push_simple"):
+                while index < size_packs:
+                    local_words = ld_global_v4_u32(
+                        input_base + Int64(index) * Int64(16)
                     )
-                    st_relaxed_sys_global_v4_u32(
-                        peer_line_address + Int64(16),
-                        local_words[2],
-                        expected_generation,
-                        local_words[3],
-                        expected_generation,
-                    )
-                line_address = local_poll_base + Int64(index) * Int64(32)
-                line0 = ld_relaxed_sys_global_v4_u32(line_address)
-                line1 = ld_relaxed_sys_global_v4_u32(line_address + Int64(16))
-                waiting = (
-                    (line0[1] ^ expected_generation)
-                    | (line0[3] ^ expected_generation)
-                    | (line1[1] ^ expected_generation)
-                    | (line1[3] ^ expected_generation)
-                )
-                while waiting != Uint32(0):
+                    if cutlass.const_expr(self._transport == "tp2_remote_push_stream"):
+                        peer_line_address = peer_write_base + Int64(index) * Int64(32)
+                        st_relaxed_sys_global_v4_u32(
+                            peer_line_address,
+                            local_words[0],
+                            expected_generation,
+                            local_words[1],
+                            expected_generation,
+                        )
+                        st_relaxed_sys_global_v4_u32(
+                            peer_line_address + Int64(16),
+                            local_words[2],
+                            expected_generation,
+                            local_words[3],
+                            expected_generation,
+                        )
+                    line_address = local_poll_base + Int64(index) * Int64(32)
                     line0 = ld_relaxed_sys_global_v4_u32(line_address)
                     line1 = ld_relaxed_sys_global_v4_u32(line_address + Int64(16))
                     waiting = (
@@ -447,25 +527,34 @@ class _OneshotLaunch(_PackedMath):
                         | (line1[1] ^ expected_generation)
                         | (line1[3] ^ expected_generation)
                     )
-                peer_words = (line0[0], line0[2], line1[0], line1[2])
-                packed_sum = cute.make_rmem_tensor((4,), cutlass.Uint32)
-                for word in cutlass.range_constexpr(4):
-                    if cutlass.const_expr(self._dtype_name == "float16"):
-                        packed_sum[word] = add_f16x2(
-                            local_words[word], peer_words[word]
+                    while waiting != Uint32(0):
+                        line0 = ld_relaxed_sys_global_v4_u32(line_address)
+                        line1 = ld_relaxed_sys_global_v4_u32(line_address + Int64(16))
+                        waiting = (
+                            (line0[1] ^ expected_generation)
+                            | (line0[3] ^ expected_generation)
+                            | (line1[1] ^ expected_generation)
+                            | (line1[3] ^ expected_generation)
                         )
-                    else:
-                        packed_sum[word] = add_bf16x2(
-                            local_words[word], peer_words[word]
-                        )
-                st_global_v4_u32(
-                    output_base + Int64(index) * Int64(16),
-                    packed_sum[0],
-                    packed_sum[1],
-                    packed_sum[2],
-                    packed_sum[3],
-                )
-                index += stride
+                    peer_words = (line0[0], line0[2], line1[0], line1[2])
+                    packed_sum = cute.make_rmem_tensor((4,), cutlass.Uint32)
+                    for word in cutlass.range_constexpr(4):
+                        if cutlass.const_expr(self._dtype_name == "float16"):
+                            packed_sum[word] = add_f16x2(
+                                local_words[word], peer_words[word]
+                            )
+                        else:
+                            packed_sum[word] = add_bf16x2(
+                                local_words[word], peer_words[word]
+                            )
+                    st_global_v4_u32(
+                        output_base + Int64(index) * Int64(16),
+                        packed_sum[0],
+                        packed_sum[1],
+                        packed_sum[2],
+                        packed_sum[3],
+                    )
+                    index += stride
 
             if generation == Uint32(_PLAIN_GRAPH_LAST_EPOCH):
                 # Matching CTAs finish reading before either rank clears records.
@@ -505,8 +594,25 @@ class _FusedOneshotLaunch(_PackedMath):
         device_slot_selection: bool,
         slot_bias: int,
         threads: int,
+        residual_dtype: str | None = None,
+        weight_dtype: str | None = None,
+        output_dtype: str | None = None,
+        zero_centered: bool = False,
+        reduction_dtype: str | None = None,
     ) -> None:
         super().__init__(dtype_name)
+        self._residual_dtype = residual_dtype or dtype_name
+        self._weight_dtype = weight_dtype or dtype_name
+        self._output_dtype = output_dtype or dtype_name
+        for dtype in (self._residual_dtype, self._weight_dtype, self._output_dtype):
+            if dtype not in _DTYPE_PACK_ELEMS:
+                raise ValueError(f"unsupported fused RMSNorm dtype {dtype!r}")
+        if reduction_dtype not in (None, "float32", "float16", "bfloat16"):
+            raise ValueError(
+                f"unsupported reduction rounding dtype {reduction_dtype!r}"
+            )
+        self._zero_centered = bool(zero_centered)
+        self._reduction_dtype = reduction_dtype
         if mode not in (
             "registered",
             "stage_pull",
@@ -536,6 +642,78 @@ class _FusedOneshotLaunch(_PackedMath):
         # phases. Keep their reusable barrier generations in separate rank
         # slots when one graph-owned channel alternates between those shapes.
         self._barrier_rank_offset = 8 if mode == "stage_tp8_owner" else 0
+
+    @cute.jit
+    def _load_operand(
+        self,
+        values: cute.Tensor,
+        pointer: cute.Pointer,
+        index: Int64,
+        dtype: cutlass.Constexpr[str],
+    ) -> None:
+        address = Int64(pointer.toint())
+        if cutlass.const_expr(dtype == self._dtype_name):
+            self._load_accumulate(values, address + index * Int64(16), True)
+        elif cutlass.const_expr(dtype == "float32"):
+            for pack in cutlass.range_constexpr(self._pack_elems // 4):
+                words = ld_global_v4_u32(
+                    address
+                    + (index * Int64(self._pack_elems) + Int64(pack * 4)) * Int64(4)
+                )
+                for lane in cutlass.range_constexpr(4):
+                    values[pack * 4 + lane] = u32_as_f32(words[lane])
+        else:
+            # Four FP32 transport lanes occupy two words in a 16-bit operand.
+            words = cute.recast_ptr(pointer, dtype=cutlass.Uint32)
+            for pair in cutlass.range_constexpr(self._pack_elems // 2):
+                packed = words[index * Int64(self._pack_elems // 2) + Int64(pair)]
+                if cutlass.const_expr(dtype == "float16"):
+                    low, high = unpack_f16x2(packed)
+                else:
+                    low, high = unpack_bf16x2(packed)
+                values[pair * 2] = low
+                values[pair * 2 + 1] = high
+
+    @cute.jit
+    def _store_operand(
+        self,
+        pointer: cute.Pointer,
+        index: Int64,
+        values: cute.Tensor,
+        dtype: cutlass.Constexpr[str],
+    ) -> None:
+        address = Int64(pointer.toint())
+        if cutlass.const_expr(dtype == self._dtype_name):
+            self._store_accumulator(address + index * Int64(16), values)
+        elif cutlass.const_expr(dtype == "float32"):
+            for pack in cutlass.range_constexpr(self._pack_elems // 4):
+                st_global_v4_f32(
+                    address
+                    + (index * Int64(self._pack_elems) + Int64(pack * 4)) * Int64(4),
+                    values[pack * 4],
+                    values[pack * 4 + 1],
+                    values[pack * 4 + 2],
+                    values[pack * 4 + 3],
+                )
+        else:
+            for pair in cutlass.range_constexpr(self._pack_elems // 2):
+                if cutlass.const_expr(dtype == "float16"):
+                    packed = pack_f32x2_to_f16x2(values[pair * 2], values[pair * 2 + 1])
+                else:
+                    packed = pack_f32x2_to_bf16x2(
+                        values[pair * 2], values[pair * 2 + 1]
+                    )
+                st_global_u32(
+                    address
+                    + (index * Int64(self._pack_elems // 2) + Int64(pair)) * Int64(4),
+                    packed,
+                )
+
+    @cute.jit
+    def _normalize(self, value: Float32, scale: Float32, inv_rms: Float32) -> Float32:
+        if cutlass.const_expr(self._zero_centered):
+            return (value * inv_rms) * (Float32(1.0) + scale)
+        return value * (inv_rms * scale)
 
     @cute.jit
     def __call__(
@@ -811,7 +989,7 @@ class _FusedOneshotLaunch(_PackedMath):
         self,
         peer_ptrs: cute.Pointer,
         input_base: Int64,
-        residual_base: Int64,
+        residual_ptr: cute.Pointer,
         index: Int64,
         total_packs: Int64,
         shard_packs: Int64,
@@ -875,11 +1053,15 @@ class _FusedOneshotLaunch(_PackedMath):
                     Int64(peer_ptrs[peer_rank]) + index * Int64(16),
                     peer_index == 0,
                 )
-        self._load_accumulate(
-            accumulator,
-            residual_base + index * Int64(16),
-            False,
-        )
+        for lane in cutlass.range_constexpr(self._pack_elems):
+            if cutlass.const_expr(self._reduction_dtype == "bfloat16"):
+                accumulator[lane] = accumulator[lane].to(cutlass.BFloat16).to(Float32)
+            elif cutlass.const_expr(self._reduction_dtype == "float16"):
+                accumulator[lane] = accumulator[lane].to(cutlass.Float16).to(Float32)
+        residual = cute.make_rmem_tensor((self._pack_elems,), Float32)
+        self._load_operand(residual, residual_ptr, index, self._residual_dtype)
+        for lane in cutlass.range_constexpr(self._pack_elems):
+            accumulator[lane] = accumulator[lane] + residual[lane]
 
     @cute.jit
     def _block_reduce(
@@ -933,10 +1115,6 @@ class _FusedOneshotLaunch(_PackedMath):
         total_packs = Int64(rows) * Int64(hidden_packs)
 
         input_base = Int64(input_ptr.toint())
-        residual_base = Int64(residual_ptr.toint())
-        weight_base = Int64(weight_ptr.toint())
-        output_base = Int64(output_ptr.toint())
-        residual_output_base = Int64(residual_output_ptr.toint())
         self_signal = Int64(signal_ptrs[self._rank])
         if cutlass.const_expr(self._device_slot_selection):
             generation = ld_relaxed_gpu_u32(self_signal + Int64(_GRAPH_EPOCH_OFFSET))
@@ -1024,14 +1202,14 @@ class _FusedOneshotLaunch(_PackedMath):
                     self._reduce_pack(
                         peer_ptrs,
                         input_base,
-                        residual_base,
+                        residual_ptr,
                         index,
                         total_packs,
                         shard_packs,
                         accumulator,
                     )
-                    self._store_accumulator(
-                        residual_output_base + index * Int64(16), accumulator
+                    self._store_operand(
+                        residual_output_ptr, index, accumulator, self._residual_dtype
                     )
                     for lane in cutlass.range_constexpr(self._pack_elems):
                         value = accumulator[lane]
@@ -1047,14 +1225,14 @@ class _FusedOneshotLaunch(_PackedMath):
                 self._reduce_pack(
                     peer_ptrs,
                     input_base,
-                    residual_base,
+                    residual_ptr,
                     index,
                     total_packs,
                     shard_packs,
                     accumulator,
                 )
-                self._store_accumulator(
-                    residual_output_base + index * Int64(16), accumulator
+                self._store_operand(
+                    residual_output_ptr, index, accumulator, self._residual_dtype
                 )
                 for lane in cutlass.range_constexpr(self._pack_elems):
                     value = accumulator[lane]
@@ -1114,19 +1292,21 @@ class _FusedOneshotLaunch(_PackedMath):
                 col = col0 + Int32(pack_number) * col_stride
                 if col < hidden_packs:
                     scale = cute.make_rmem_tensor((self._pack_elems,), cutlass.Float32)
-                    self._load_accumulate(
-                        scale, weight_base + Int64(col) * Int64(16), True
+                    self._load_operand(
+                        scale, weight_ptr, Int64(col), self._weight_dtype
                     )
                     normalized = cute.make_rmem_tensor(
                         (self._pack_elems,), cutlass.Float32
                     )
                     for lane in cutlass.range_constexpr(self._pack_elems):
-                        normalized[lane] = values[pack_number, lane] * (
-                            inv_rms * scale[lane]
+                        normalized[lane] = self._normalize(
+                            values[pack_number, lane], scale[lane], inv_rms
                         )
-                    self._store_accumulator(
-                        output_base + (row_offset + Int64(col)) * Int64(16),
+                    self._store_operand(
+                        output_ptr,
+                        row_offset + Int64(col),
                         normalized,
+                        self._output_dtype,
                     )
         else:
             col = col0
@@ -1134,15 +1314,13 @@ class _FusedOneshotLaunch(_PackedMath):
                 index = row_offset + Int64(col)
                 value = cute.make_rmem_tensor((self._pack_elems,), cutlass.Float32)
                 scale = cute.make_rmem_tensor((self._pack_elems,), cutlass.Float32)
-                self._load_accumulate(
-                    value,
-                    residual_output_base + index * Int64(16),
-                    True,
+                self._load_operand(
+                    value, residual_output_ptr, index, self._residual_dtype
                 )
-                self._load_accumulate(scale, weight_base + Int64(col) * Int64(16), True)
+                self._load_operand(scale, weight_ptr, Int64(col), self._weight_dtype)
                 for lane in cutlass.range_constexpr(self._pack_elems):
-                    value[lane] = value[lane] * (inv_rms * scale[lane])
-                self._store_accumulator(output_base + index * Int64(16), value)
+                    value[lane] = self._normalize(value[lane], scale[lane], inv_rms)
+                self._store_operand(output_ptr, index, value, self._output_dtype)
                 col += col_stride
 
         if cutlass.const_expr(self._device_slot_selection):
@@ -1152,6 +1330,13 @@ class _FusedOneshotLaunch(_PackedMath):
                     self_signal + Int64(_GRAPH_ARRIVED_OFFSET),
                     Uint32(gdim),
                 )
+
+
+# Release the dependent launch once this rank's input is published and every
+# peer has arrived. The dependent kernel (the mHC partial) waits in-kernel for
+# this grid to complete before reading its output, so the release only hides
+# the dependent's launch latency and can never expose a partial result.
+_ONESHOT_PDL = os.getenv("B12X_PCIE_ONESHOT_PDL", "0") != "0"
 
 
 def _dummy(dtype, alignment: int):
@@ -1211,7 +1396,7 @@ def is_oneshot_launcher_prepared(
     )
 
 
-@functools.cache
+@program_cache
 def get_oneshot_launcher(
     dtype_name: str,
     world_size: int,
@@ -1234,7 +1419,7 @@ def get_oneshot_launcher(
         threads,
         device_index,
     )
-    del device_index  # retained in the functools and preparation keys
+    del device_index  # Retained in the launcher and preparation keys.
     slot_bias = int(slot_bias) & 1 if device_slot_selection else 0
     launch = _OneshotLaunch(
         dtype_name,
@@ -1255,6 +1440,7 @@ def get_oneshot_launcher(
         slot_bias,
         str(transport),
         int(threads),
+        ("pdl", bool(launch._pdl)),
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=launch, cache_key=cache_key
@@ -1274,7 +1460,7 @@ def get_oneshot_launcher(
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 4, cache_key),
+        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 5, cache_key),
     )
 
     def run(
@@ -1342,6 +1528,11 @@ def _fused_oneshot_process_key(
     slot_bias: int,
     threads: int,
     device_index: int,
+    residual_dtype: str | None = None,
+    weight_dtype: str | None = None,
+    output_dtype: str | None = None,
+    zero_centered: bool = False,
+    reduction_dtype: str | None = None,
 ) -> tuple[object, ...]:
     return (
         str(dtype_name),
@@ -1354,6 +1545,11 @@ def _fused_oneshot_process_key(
         int(slot_bias) & 1 if device_slot_selection else 0,
         int(threads),
         int(device_index),
+        residual_dtype or dtype_name,
+        weight_dtype or dtype_name,
+        output_dtype or dtype_name,
+        bool(zero_centered),
+        reduction_dtype,
     )
 
 
@@ -1368,6 +1564,11 @@ def is_fused_oneshot_launcher_prepared(
     slot_bias: int,
     threads: int,
     device_index: int,
+    residual_dtype: str | None = None,
+    weight_dtype: str | None = None,
+    output_dtype: str | None = None,
+    zero_centered: bool = False,
+    reduction_dtype: str | None = None,
 ) -> bool:
     """Return whether this exact fused graph launcher is already loaded."""
 
@@ -1383,12 +1584,17 @@ def is_fused_oneshot_launcher_prepared(
             slot_bias,
             threads,
             device_index,
+            residual_dtype,
+            weight_dtype,
+            output_dtype,
+            zero_centered,
+            reduction_dtype,
         )
         in _PREPARED_FUSED_ONESHOT_LAUNCHERS
     )
 
 
-@functools.cache
+@program_cache
 def get_fused_oneshot_launcher(
     dtype_name: str,
     world_size: int,
@@ -1400,6 +1606,11 @@ def get_fused_oneshot_launcher(
     slot_bias: int,
     threads: int,
     device_index: int,
+    residual_dtype: str | None = None,
+    weight_dtype: str | None = None,
+    output_dtype: str | None = None,
+    zero_centered: bool = False,
+    reduction_dtype: str | None = None,
 ) -> Callable[..., None]:
     process_key = _fused_oneshot_process_key(
         dtype_name,
@@ -1412,6 +1623,11 @@ def get_fused_oneshot_launcher(
         slot_bias,
         threads,
         device_index,
+        residual_dtype,
+        weight_dtype,
+        output_dtype,
+        zero_centered,
+        reduction_dtype,
     )
     del device_index
     slot_bias = int(slot_bias) & 1 if device_slot_selection else 0
@@ -1425,6 +1641,11 @@ def get_fused_oneshot_launcher(
         device_slot_selection,
         slot_bias,
         threads,
+        residual_dtype,
+        weight_dtype,
+        output_dtype,
+        zero_centered,
+        reduction_dtype,
     )
     cache_key = (
         dtype_name,
@@ -1436,6 +1657,11 @@ def get_fused_oneshot_launcher(
         bool(device_slot_selection),
         slot_bias,
         int(threads),
+        residual_dtype or dtype_name,
+        weight_dtype or dtype_name,
+        output_dtype or dtype_name,
+        bool(zero_centered),
+        reduction_dtype,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=launch, cache_key=cache_key
@@ -1457,7 +1683,7 @@ def get_fused_oneshot_launcher(
         1,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "comm.pcie.oneshot_fused_rmsnorm", 1, cache_key
+            "comm.pcie.oneshot_fused_rmsnorm", 2, cache_key
         ),
     )
 

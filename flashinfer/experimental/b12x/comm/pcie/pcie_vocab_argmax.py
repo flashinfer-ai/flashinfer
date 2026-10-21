@@ -113,7 +113,9 @@ class PCIeVocabParallelArgmax:
         device: torch.device | int | str,
         local_vocab_size: int,
         max_batch_size: int = MAX_BATCH_SIZE,
+        ipc: object = None,
     ) -> None:
+        """``ipc`` supplies the CUDA IPC allocator for the exchange slabs, as other PCIe runtimes accept."""
         self.group = exchange_group
         self.rank = dist.get_rank(group=exchange_group)
         self.world_size = dist.get_world_size(group=exchange_group)
@@ -172,7 +174,7 @@ class PCIeVocabParallelArgmax:
         self._closed = True
 
         def prepare_runtime():
-            return CudaRTLibrary()
+            return CudaRTLibrary() if ipc is None else ipc
 
         self._ipc = _run_collective_preallocation_setup(
             owner="PCIe vocabulary argmax runtime preparation",
@@ -201,12 +203,14 @@ class PCIeVocabParallelArgmax:
         device: torch.device | int | str,
         local_vocab_size: int,
         max_batch_size: int = MAX_BATCH_SIZE,
+        ipc: object = None,
     ) -> "PCIeVocabParallelArgmax":
         return cls(
             exchange_group=exchange_group,
             device=device,
             local_vocab_size=local_vocab_size,
             max_batch_size=max_batch_size,
+            ipc=ipc,
         )
 
     @classmethod

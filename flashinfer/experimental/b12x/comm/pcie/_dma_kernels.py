@@ -271,6 +271,69 @@ def _wait_flag_sys(flag_addr: Int64, counter_addr: Int64, *, loc=None, ip=None) 
 
 
 @dsl_user_op
+def _wait_flag_read_sys(
+    flag_addr: Int64, counter_addr: Int64, *, loc=None, ip=None
+) -> Uint32:
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int64(flag_addr).ir_value(loc=loc, ip=ip),
+                Int64(counter_addr).ir_value(loc=loc, ip=ip),
+            ],
+            """{
+            .reg .pred pending;
+            .reg .u32 observed;
+            .reg .s32 delta;
+            ld.global.u32 $0, [$2];
+            add.u32 $0, $0, 1;
+        wait_reduce_again:
+            ld.acquire.sys.global.u32 observed, [$1];
+            sub.s32 delta, observed, $0;
+            setp.lt.s32 pending, delta, 0;
+            @pending bra wait_reduce_again;
+        }""",
+            "=r,l,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _finish_wait_reduce(
+    done: Int64, counter: Int64, expected: Uint32, blocks: Uint32, *, loc=None, ip=None
+):
+    llvm.inline_asm(
+        None,
+        [
+            Int64(done).ir_value(loc=loc, ip=ip),
+            Int64(counter).ir_value(loc=loc, ip=ip),
+            Uint32(expected).ir_value(loc=loc, ip=ip),
+            Uint32(blocks).ir_value(loc=loc, ip=ip),
+        ],
+        """{
+            .reg .u32 ticket;
+            .reg .pred last;
+            atom.acq_rel.gpu.global.add.u32 ticket, [$0], 1;
+            add.u32 ticket, ticket, 1;
+            setp.eq.u32 last, ticket, $3;
+            @last st.global.u32 [$0], 0;
+            @last st.global.u32 [$1], $2;
+        }""",
+        "l,l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _unpack_bf16x2(packed: Uint32, *, loc=None, ip=None) -> tuple[Float32, Float32]:
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32(), T.f32()]),
@@ -583,8 +646,9 @@ class _FlagLaunch:
 
 
 class _AddLaunch:
-    def __init__(self, dtype_name: str) -> None:
+    def __init__(self, dtype_name: str, wait=False) -> None:
         self._dtype_name = dtype_name
+        self.wait = bool(wait)
 
     @cute.jit
     def __call__(
@@ -592,6 +656,7 @@ class _AddLaunch:
         dst_ptr: cute.Pointer,
         a_ptr: cute.Pointer,
         b_ptr: cute.Pointer,
+        wait_pointers: tuple,
         packs: Int64,
         grid_x: Int32,
         stream: cuda.CUstream,
@@ -600,6 +665,7 @@ class _AddLaunch:
             _one_tensor(dst_ptr),
             _one_tensor(a_ptr),
             _one_tensor(b_ptr),
+            wait_pointers,
             packs,
         ).launch(
             grid=(grid_x, 1, 1),
@@ -614,11 +680,20 @@ class _AddLaunch:
         dst: cute.Tensor,
         a_src: cute.Tensor,
         b_src: cute.Tensor,
+        wait_pointers: tuple,
         packs: Int64,
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
+        expected = Uint32(0)
+        if cutlass.const_expr(self.wait):
+            if tidx == 0:
+                expected = _wait_flag_read_sys(
+                    get_ptr_as_int64(_one_tensor(wait_pointers[0]), Int64(0)),
+                    get_ptr_as_int64(_one_tensor(wait_pointers[1]), Int64(0)),
+                )
+            cute.arch.sync_threads()
         idx = Int64(bidx) * Int64(_THREADS) + Int64(tidx)
         step = Int64(gdim) * Int64(_THREADS)
         while idx < packs:
@@ -655,6 +730,18 @@ class _AddLaunch:
                     out[3],
                 )
             idx += step
+
+        if cutlass.const_expr(self.wait):
+            # The last CTA advances the counter only after every CTA has read
+            # the same expected value and completed its reduction.
+            cute.arch.sync_threads()
+            if tidx == 0:
+                _finish_wait_reduce(
+                    get_ptr_as_int64(_one_tensor(wait_pointers[2]), Int64(0)),
+                    get_ptr_as_int64(_one_tensor(wait_pointers[1]), Int64(0)),
+                    expected,
+                    Uint32(gdim),
+                )
 
 
 class _QuantLaunch:
@@ -1205,16 +1292,17 @@ def _compiled_flag(wait: bool) -> Callable:
 
 
 @functools.cache
-def _compiled_add(dtype_name: str) -> Callable:
+def _compiled_add(dtype_name: str, wait=False) -> Callable:
     dtype = _dtype_type(dtype_name)
-    launch = _AddLaunch(dtype_name)
+    launch = _AddLaunch(dtype_name, wait)
     return _compile(
         "comm.pcie_dma.add",
-        (dtype_name,),
+        (dtype_name, bool(wait)),
         launch,
         _fake_ptr(dtype, 16),
         _fake_ptr(dtype, 16),
         _fake_ptr(dtype, 16),
+        tuple(_fake_ptr(Uint32, 4) for _ in range(3)) if wait else (),
         Int64(1),
         Int32(1),
     )
@@ -1315,6 +1403,7 @@ class DmaLaunchers:
     set_flag: Callable
     wait_flag: Callable
     add: tuple[Callable, ...]
+    wait_add: tuple[Callable, ...]
     quant: Callable | None = None
     dequant_store: Callable | None = None
     dequant_accum: Callable | None = None
@@ -1327,6 +1416,7 @@ class DmaLaunchers:
             self.set_flag,
             self.wait_flag,
             self.add,
+            self.wait_add,
             self.quant,
             self.dequant_store,
             self.dequant_accum,
@@ -1344,7 +1434,7 @@ class DmaLaunchers:
 def compile_launchers(*, world_size: int, wire_mode: str) -> DmaLaunchers:
     """Resolve the primitive programs reachable by declaration metadata."""
 
-    if int(world_size) not in (2, 4, 6, 8, 10):
+    if int(world_size) not in (2, 3, 4, 6, 8, 10):
         raise ValueError(f"unsupported DMA world size {world_size}")
     mode = str(wire_mode)
     codec = "i8" if mode.startswith("i8") else "mx" if mode.startswith("mx") else "e4m3"
@@ -1354,6 +1444,7 @@ def compile_launchers(*, world_size: int, wire_mode: str) -> DmaLaunchers:
         set_flag=_compiled_flag(False),
         wait_flag=_compiled_flag(True),
         add=tuple(_compiled_add(dtype) for dtype in _DTYPES),
+        wait_add=tuple(_compiled_add(dtype, True) for dtype in _DTYPES),
         quant=_compiled_quant(codec) if compressed else None,
         dequant_store=_compiled_dequant_store(codec) if compressed else None,
         dequant_accum=_compiled_dequant_accum(codec, int(world_size) - 1)
@@ -1406,17 +1497,26 @@ class DmaKernels:
         )
 
     def dma_add(
-        self, dst_ptr: int, a_ptr: int, b_ptr: int, elems: int, dtype_code: int
+        self,
+        dst_ptr: int,
+        a_ptr: int,
+        b_ptr: int,
+        elems: int,
+        dtype_code: int,
+        *,
+        wait=None,
     ) -> None:
         dtype_name = _DTYPES[int(dtype_code)]
         dtype = _dtype_type(dtype_name)
         elems_per_pack = 4 if dtype_name == "fp32" else 8
         packs = int(elems) // elems_per_pack
-        raw = self._require_launchers().add[int(dtype_code)]
+        launchers = self._require_launchers()
+        raw = (launchers.add if wait is None else launchers.wait_add)[int(dtype_code)]
         raw(
             _ptr(dtype, dst_ptr, 16),
             _ptr(dtype, a_ptr, 16),
             _ptr(dtype, b_ptr, 16),
+            () if wait is None else tuple(_ptr(Uint32, p, 4) for p in wait),
             packs,
             _grid_for_packs(packs),
             current_cuda_stream(),

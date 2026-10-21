@@ -333,16 +333,17 @@ def _make_cute_state(
     ("rows", "expected"),
     (
         (1, ("tp2_remote_push", 64, 36)),
-        (2, ("tp2_remote_push_stream", 128, 36)),
-        (4, ("tp2_remote_push_stream", 256, 36)),
-        (6, ("tp2_remote_push", 64, 16)),
-        (8, ("tp2_remote_push", 256, 32)),
-        (16, ("tp2_remote_push_stream", 64, 36)),
-        (24, ("tp2_remote_push_stream", 128, 32)),
-        (32, ("tp2_remote_push", 128, 16)),
-        (128, ("tp2_remote_push", 128, 16)),
-        (256, ("tp2_remote_push", 128, 16)),
-        (512, ("tp2_remote_push", 128, 16)),
+        (2, ("tp2_remote_push_simple", 128, 8)),
+        (3, ("tp2_remote_push_simple", 128, 12)),
+        (4, ("tp2_remote_push_simple", 128, 16)),
+        (6, ("tp2_remote_push_simple", 128, 24)),
+        (8, ("tp2_remote_push_simple", 128, 32)),
+        (16, ("tp2_remote_push_simple", 128, 36)),
+        (24, ("tp2_remote_push_simple", 128, 36)),
+        (32, ("tp2_remote_push_simple", 128, 36)),
+        (128, ("tp2_remote_push_simple", 128, 36)),
+        (256, ("tp2_remote_push_simple", 128, 36)),
+        (512, ("tp2_remote_push_simple", 128, 36)),
     ),
 )
 def test_plain_tp2_remote_push_uses_qualified_geometry(
@@ -424,8 +425,8 @@ def test_plain_graph_plan_freezes_prepared_channel_contract(monkeypatch) -> None
     state.eager_buffer_bytes = 0
     state.plain_remote_push_region_packs = 0
 
-    assert plan.transport == "tp2_remote_push"
-    assert (plan.threads, plan.blocks) == (64, 16)
+    assert plan.transport == "tp2_remote_push_simple"
+    assert (plan.threads, plan.blocks) == (128, 24)
     assert plan.eager_buffer_bytes == TP2_PLAIN_REMOTE_PUSH_MAX_BYTES
     assert plan.transport_policy[2] is True
     assert plan.remote_push_region_packs > 0
@@ -459,14 +460,14 @@ def test_prepare_plain_graph_all_reduce_retains_immutable_plan(monkeypatch) -> N
 
     key = backend._plain_graph_plan_key(inp)
     plan = state.plain_graph_plans[key]
-    assert plan.transport == "tp2_remote_push"
-    assert (plan.threads, plan.blocks) == (64, 16)
+    assert plan.transport == "tp2_remote_push_simple"
+    assert (plan.threads, plan.blocks) == (128, 24)
     assert launchers[0]._transport == "pull"
     assert not launchers[0]._device_slot_selection
     assert [
         (launcher._device_slot_selection, launcher._slot_bias, launcher._transport)
         for launcher in launchers[1:]
-    ] == [(True, 0, "tp2_remote_push"), (True, 1, "tp2_remote_push")]
+    ] == [(True, 0, "tp2_remote_push_simple"), (True, 1, "tp2_remote_push_simple")]
 
 
 def test_capture_binds_unseen_shape_for_a_prepared_launcher(monkeypatch) -> None:
@@ -499,13 +500,13 @@ def test_capture_binds_unseen_shape_for_a_prepared_launcher(monkeypatch) -> None
     backend.all_reduce(7, inp, torch.empty_like(inp), 0, 0)
 
     key = backend._plain_graph_plan_key(inp)
-    assert state.plain_graph_plans[key].transport == "tp2_remote_push"
+    assert state.plain_graph_plans[key].transport == "tp2_remote_push_simple"
     assert (
         state.plain_graph_plans[key].threads,
         state.plain_graph_plans[key].blocks,
     ) == (
-        64,
-        16,
+        128,
+        20,
     )
     assert len(launches) == 1
 
@@ -620,7 +621,7 @@ def test_tp8_owner_reduce_can_be_disabled(monkeypatch) -> None:
             4,
             "B12X_PCIE_TP4_REMOTE_PUSH",
             (32, 6144),
-            "stage_pull",
+            "stage_remote_push",
             "stage_remote_push",
         ),
     ),
@@ -666,6 +667,24 @@ def test_topology_policy_is_immutable_after_channel_setup(monkeypatch) -> None:
     )
 
     assert mode == "stage_remote_push"
+
+
+@pytest.mark.parametrize("rows", (1, 4, 7, 32, 33))
+@pytest.mark.parametrize("hidden", (4096, 6144))
+def test_tp4_remote_push_float32_contract(monkeypatch, rows, hidden) -> None:
+    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
+    monkeypatch.delenv("B12X_PCIE_TP4_REMOTE_PUSH", raising=False)
+    monkeypatch.delenv("B12X_PCIE_FUSED_THREADS", raising=False)
+    monkeypatch.delenv("B12X_PCIE_FUSED_CTAS_PER_ROW", raising=False)
+    geometry = _CuTeOneshotBackend._fused_launch_config(
+        _make_cute_state(4), torch.empty((rows, hidden), dtype=torch.float32)
+    )
+    mode, single_cta, register_normalize, threads = geometry
+    assert mode == ("stage_remote_push" if rows <= 32 else "stage_pull")
+    if rows <= 32:
+        assert threads == 512
+        assert register_normalize
+        assert single_cta == (rows > 1)
 
 
 @pytest.mark.parametrize(
@@ -716,12 +735,12 @@ def test_topology_transport_storage_policy_matches_opt_in_defaults(
         monkeypatch.delenv(name, raising=False)
 
     assert not _uses_sharded_eager_storage(2)
-    assert not _uses_sharded_eager_storage(4)
+    assert _uses_sharded_eager_storage(4)
     assert _uses_sharded_eager_storage(8)
     assert _eager_storage_shards(2) == 3
-    assert _eager_storage_shards(4) == 1
+    assert _eager_storage_shards(4) == 4
     assert _eager_storage_shards(8) == 8
-    assert _transport_policy_contract() == (False, False, True, False, True)
+    assert _transport_policy_contract() == (False, False, True, True, True)
 
     monkeypatch.setenv("B12X_PCIE_TP8_OWNER_REDUCE", "0")
     monkeypatch.setenv("B12X_PCIE_TP2_REMOTE_PUSH", "0")

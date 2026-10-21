@@ -174,6 +174,7 @@ class PCIeHierarchicalAllReduce:
         max_elements: int,
         blocks: Optional[int] = None,
         ext_module=None,
+        ipc: Optional[CudaRTLibrary] = None,
     ) -> None:
         del ext_module  # native-extension injection is obsolete
         self.group = exchange_group
@@ -203,7 +204,7 @@ class PCIeHierarchicalAllReduce:
         self.vectorized_bf16x2 = _vectorized_bf16x2_from_env()
         self.vectorized_bf16x2_max_elements = _vectorized_bf16x2_max_elements_from_env()
         self._layout = _make_layout(self.max_elements)
-        self._ipc = CudaRTLibrary()
+        self._ipc = ipc if ipc is not None else CudaRTLibrary()
         self._ipc.cudaSetDevice(self.device.index or 0)
         self._slab_ptrs: tuple[int, ...] = ()
         self._local_ptr = 0

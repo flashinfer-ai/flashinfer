@@ -21,7 +21,7 @@ from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
 
-from ._dcp_cute_common import block_pair_barrier
+from ._dcp_cute_common import _membar_sys, block_pair_barrier
 from ._cute_intrinsics import (
     float_order_key,
     redux_max_u32,
@@ -608,7 +608,13 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
         # through the copy and barrier phases, which materially increases the
         # graph kernel's register footprint.  Only the local pointer is needed
         # before the barrier; form each remote address at its eventual use.
-        local_staging = staging[self._rank] + slot_offset
+        # Two ranks push only the peer's heads into the peer's staging, which the
+        # peer then reads from its own memory; wider worlds stage every head
+        # locally and pull.
+        if cutlass.const_expr(self._world_size == 2):
+            local_staging = staging[1 - self._rank] + slot_offset
+        else:
+            local_staging = staging[self._rank] + slot_offset
         local_stage_words = self._staging_words(local_staging)
         local_stage_lse = self._staging_lse(local_staging, lse_offset)
 
@@ -617,29 +623,37 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
             batch_index = row // heads_per_rank
             local_head = row - batch_index * heads_per_rank
             for destination in cutlass.range_constexpr(self._world_size):
-                source_row = (
-                    Int64(batch_index) * Int64(total_heads)
-                    + Int64(destination) * Int64(heads_per_rank)
-                    + Int64(local_head)
-                )
-                input_base = (
-                    Int64(batch_index) * input_stride_batch
-                    + (Int64(destination) * Int64(heads_per_rank) + Int64(local_head))
-                    * input_stride_head
-                )
-                staging_base = source_row * Int64(packs_per_head)
-                pack = lane
-                while pack < packs_per_head:
-                    _copy_16b(
-                        local_output + input_base * Int64(4) + Int64(pack) * Int64(4),
-                        local_stage_words
-                        + staging_base * Int64(4)
-                        + Int64(pack) * Int64(4),
+                if cutlass.const_expr(
+                    self._world_size != 2 or destination != self._rank
+                ):
+                    source_row = (
+                        Int64(batch_index) * Int64(total_heads)
+                        + Int64(destination) * Int64(heads_per_rank)
+                        + Int64(local_head)
                     )
-                    pack += Int32(32)
-                if lane == Int32(0):
-                    value = cute.arch.load(local_lse + source_row, Float32)
-                    cute.arch.store(local_stage_lse + source_row, value)
+                    input_base = (
+                        Int64(batch_index) * input_stride_batch
+                        + (
+                            Int64(destination) * Int64(heads_per_rank)
+                            + Int64(local_head)
+                        )
+                        * input_stride_head
+                    )
+                    staging_base = source_row * Int64(packs_per_head)
+                    pack = lane
+                    while pack < packs_per_head:
+                        _copy_16b(
+                            local_output
+                            + input_base * Int64(4)
+                            + Int64(pack) * Int64(4),
+                            local_stage_words
+                            + staging_base * Int64(4)
+                            + Int64(pack) * Int64(4),
+                        )
+                        pack += Int32(32)
+                    if lane == Int32(0):
+                        value = cute.arch.load(local_lse + source_row, Float32)
+                        cute.arch.store(local_stage_lse + source_row, value)
             row += warp_stride
 
         block_pair_barrier(
@@ -649,6 +663,11 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
             world_size=self._world_size,
             max_blocks=_MAX_BLOCKS,
         )
+        if cutlass.const_expr(self._world_size == 2):
+            # Acquire the peer's pushed partials before reading them locally.
+            if Int32(tidx) == Int32(0):
+                _membar_sys()
+            cute.arch.sync_threads()
 
         row = warp_first
         while row < rows:
@@ -664,8 +683,9 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
             lane_lse_base = Int64(local_lse.toint())
             for source_index in cutlass.range_constexpr(1, self._world_size):
                 source = (self._rank + source_index) % self._world_size
+                incoming = self._rank if self._world_size == 2 else source
                 source_lse_base = (
-                    Int64(staging[source].toint()) + slot_offset + lse_offset
+                    Int64(staging[incoming].toint()) + slot_offset + lse_offset
                 )
                 if lane == Int32(source_index):
                     lane_lse_base = source_lse_base
@@ -721,8 +741,9 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                 if cutlass.const_expr(source == self._rank):
                     source_address = local_output.toint() + local_base * Int64(16)
                 else:
+                    incoming = self._rank if self._world_size == 2 else source
                     source_address = _add_u64_opaque(
-                        staging[source].toint(),
+                        staging[incoming].toint(),
                         slot_offset + staging_base * Int64(16),
                     )
                 payload_row_addresses[source_index] = source_address
@@ -976,28 +997,34 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
             32
         )
         warp_stride = Int32(gdim) * Int32(self._warps_per_block)
-        total_heads = local_heads * Int32(self._world_size)
-        rows = batch * total_heads
-        local_stage = self._staging_words(staging[self._rank])
+        local_packs = local_heads * packs_per_head
+        tiles_per_rank = (local_packs + Int32(31)) // Int32(32)
+        tiles_per_batch = tiles_per_rank * Int32(self._world_size)
+        tiles = batch * tiles_per_batch
+        # Two ranks push each rank's segments into the peer's staging, where the
+        # peer reads them from its own memory after the barrier: PCIe carries
+        # posted writes instead of reads. Wider worlds stage locally and pull.
+        if cutlass.const_expr(self._world_size == 2):
+            local_stage = self._staging_words(staging[1 - self._rank])
+        else:
+            local_stage = self._staging_words(staging[self._rank])
 
-        row = warp_first
-        while row < rows:
-            batch_index = row // total_heads
-            global_head = row - batch_index * total_heads
-            source_rank = global_head // local_heads
-            if source_rank == Int32(self._rank):
-                local_head = global_head - source_rank * local_heads
-                base = (
-                    Int64(batch_index) * Int64(local_heads) + Int64(local_head)
-                ) * Int64(packs_per_head)
-                pack = lane
-                while pack < packs_per_head:
-                    _copy_16b(
-                        local_input + base * Int64(4) + Int64(pack) * Int64(4),
-                        local_stage + base * Int64(4) + Int64(pack) * Int64(4),
-                    )
-                    pack += Int32(32)
-            row += warp_stride
+        # Assign complete 512-byte segments to warps, independently of head
+        # boundaries. Each rank stages and reads the same CTA's segments.
+        tile = warp_first
+        while tile < tiles:
+            batch_index = tile // tiles_per_batch
+            batch_tile = tile - batch_index * tiles_per_batch
+            source_rank = batch_tile // tiles_per_rank
+            rank_tile = batch_tile - source_rank * tiles_per_rank
+            pack = rank_tile * Int32(32) + lane
+            if source_rank == Int32(self._rank) and pack < local_packs:
+                source_pack = Int64(batch_index) * Int64(local_packs) + Int64(pack)
+                _copy_16b(
+                    local_input + source_pack * Int64(4),
+                    local_stage + source_pack * Int64(4),
+                )
+            tile += warp_stride
 
         block_pair_barrier(
             signals,
@@ -1006,39 +1033,41 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
             world_size=self._world_size,
             max_blocks=_MAX_BLOCKS,
         )
+        if cutlass.const_expr(self._world_size == 2):
+            # Acquire the peer's pushed segments before reading them locally.
+            if Int32(tidx) == Int32(0):
+                _membar_sys()
+            cute.arch.sync_threads()
 
-        row = warp_first
-        while row < rows:
-            batch_index = row // total_heads
-            global_head = row - batch_index * total_heads
-            source_rank = global_head // local_heads
-            local_head = global_head - source_rank * local_heads
-            source_base = (
-                Int64(batch_index) * Int64(local_heads) + Int64(local_head)
-            ) * Int64(packs_per_head)
-            output_base = Int64(row) * Int64(packs_per_head)
-            # Resolve the peer's base address first and copy once. Cloning the
-            # whole pack loop into all sixteen arms of the constexpr chain
-            # bloats the kernel and pays the chain on every row.
-            source_address = Int64((local_input + source_base * Int64(4)).toint())
-            for source in cutlass.range_constexpr(self._world_size):
-                if source_rank == Int32(source):
-                    if cutlass.const_expr(source == self._rank):
-                        source_words = local_input
-                    else:
-                        source_words = self._staging_words(staging[source])
-                    source_address = Int64(
-                        (source_words + source_base * Int64(4)).toint()
-                    )
-            output_address = Int64((output + output_base * Int64(4)).toint())
-            pack = lane
-            while pack < packs_per_head:
+        tile = warp_first
+        while tile < tiles:
+            batch_index = tile // tiles_per_batch
+            batch_tile = tile - batch_index * tiles_per_batch
+            source_rank = batch_tile // tiles_per_rank
+            rank_tile = batch_tile - source_rank * tiles_per_rank
+            pack = rank_tile * Int32(32) + lane
+            if pack < local_packs:
+                source_pack = Int64(batch_index) * Int64(local_packs) + Int64(pack)
+                output_pack = (
+                    Int64(batch_index) * Int64(self._world_size) + Int64(source_rank)
+                ) * Int64(local_packs) + Int64(pack)
+                source_address = Int64((local_input + source_pack * Int64(4)).toint())
+                for source in cutlass.range_constexpr(self._world_size):
+                    if source_rank == Int32(source):
+                        if cutlass.const_expr(source == self._rank):
+                            source_words = local_input
+                        elif cutlass.const_expr(self._world_size == 2):
+                            source_words = self._staging_words(staging[self._rank])
+                        else:
+                            source_words = self._staging_words(staging[source])
+                        source_address = Int64(
+                            (source_words + source_pack * Int64(4)).toint()
+                        )
                 _copy_16b_addr(
-                    source_address + Int64(pack) * Int64(16),
-                    output_address + Int64(pack) * Int64(16),
+                    source_address,
+                    Int64((output + output_pack * Int64(4)).toint()),
                 )
-                pack += Int32(32)
-            row += warp_stride
+            tile += warp_stride
 
         if cutlass.const_expr(self._device_slot_selection):
             if Int32(tidx) == Int32(0):
@@ -1932,7 +1961,7 @@ def _get_compiled_all_gather_heads(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.dcp_a2a.all_gather_heads",
-            12,
+            13,
             key,
             labels=(
                 "world_size",
