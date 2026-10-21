@@ -18,7 +18,6 @@ import inspect
 import json
 import pathlib
 import re
-from pathlib import Path
 
 import pytest
 import torch
@@ -547,25 +546,21 @@ def test_native_ports_route_on_the_qualified_sm_counts():
     assert plan.grid_x <= 132
 
 
-_CSRC = Path(cb.__file__).resolve().parent / "csrc"
-_NATIVE_PROGRAMS = sorted(
-    {
-        name
-        for keys in KERNELS.values()
-        for key, name in keys.items()
-        if key.startswith("native")
-    }
+_CSRC = pathlib.Path(cake_build.__file__).resolve().parent / "csrc"
+_TMEM_PROGRAMS = sorted(
+    name
+    for name in MODULES
+    if "tcgen05.dealloc" in (_CSRC / f"{name}_kernel.cu").read_text()
 )
 
 
-@pytest.mark.parametrize("name", _NATIVE_PROGRAMS)
-def test_native_programs_drain_tmem_loads_before_the_dealloc(name):
-    # The native ports read TMEM with tcgen05.ld and free the columns with tcgen05.dealloc
-    # after the cleanup barrier. A register dependency on a tcgen05.ld result does not
-    # complete the load; only tcgen05.wait::ld does (PTX ISA, tcgen05 memory consistency
-    # model), so a wait::ld must come before the barrier that precedes the dealloc.
-    (kernel,) = [s for s in MODULES[name]["sources"] if s.endswith("_kernel.cu")]
-    text = (_CSRC / kernel).read_text()
+@pytest.mark.parametrize("name", _TMEM_PROGRAMS)
+def test_tmem_programs_drain_loads_before_the_dealloc(name):
+    # The persistent and native programs read TMEM with tcgen05.ld and free the columns
+    # with tcgen05.dealloc after the cleanup barrier. A register dependency on a tcgen05.ld
+    # result does not complete the load; only tcgen05.wait::ld does (PTX ISA, tcgen05 memory
+    # consistency model), so a wait::ld must come before the barrier that precedes the dealloc.
+    text = (_CSRC / f"{name}_kernel.cu").read_text()
     dealloc = text.index("tcgen05.dealloc")
     cleanup = text.rindex("barrier.sync", 0, dealloc)
     assert "tcgen05.ld." in text[:cleanup]

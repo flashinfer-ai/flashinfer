@@ -236,11 +236,11 @@ class Package:
 
 
 # dsa_train, kda_train, dsa_indexer, the rmsnorm, the causal conv1d, the ulysses, the NVFP4 SVDQuant GEMM, the Sage
-# block-sparse attention, the fused QK RoPE append (BF16 / FP8), the experimental NVFP4 attention and the SM90 VSA
-# backends are read with the generic walker (a mapping carrying ``library`` under an ``arches`` / ``arch`` scope).
-# Their exporters' registry shapes fit it: a record carries ``arches`` and either ``library`` itself (dsa_indexer
-# PROGRAMS, rmsnorm, causal conv1d, ulysses, svdquant, Sage block-sparse attention, fused QK RoPE append,
-# nvfp4_attention and vsa_sm90 MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
+# block-sparse attention, the fused QK RoPE append (BF16 / FP8), the experimental NVFP4 attention, the SM90 VSA and
+# the Kimi-K3 AttnRes backends are read with the generic walker (a mapping carrying ``library`` under an ``arches`` /
+# ``arch`` scope).  Their exporters' registry shapes fit it: a record carries ``arches`` and either ``library`` itself
+# (dsa_indexer PROGRAMS, rmsnorm, causal conv1d, ulysses, svdquant, Sage block-sparse attention, fused QK RoPE append,
+# nvfp4_attention, vsa_sm90 and Kimi-K3 AttnRes MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
 PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.cake_rmsnorm_train_backend",
@@ -341,6 +341,12 @@ PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.experimental.nvfp4_attention",
         "flashinfer/experimental/nvfp4_attention",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake_kimi_k3_attn_res",
+        "flashinfer/experimental/cake_kimi_k3_attn_res",
         "cake_jit.py",
         refs_generic,
     ),
