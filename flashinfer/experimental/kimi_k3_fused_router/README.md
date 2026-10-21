@@ -74,8 +74,15 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
   eight-token program compiles it with the compile definitions `ROWS=8` (the
   cluster size) and `CAKE_PROGRAM_KERNEL=<its kernel symbol>`; without them
   the source is the four-token kernel. Each of the two programs keeps its own
-  registry record, kernel symbol and host launcher (the record's
-  `compile_flags` carries the definitions).
+  registry record and kernel symbol (the record's `compile_flags` carries the
+  definitions).
+- Programs of one launcher shape share one host launcher source: the seven
+  cooperative plan-builder programs (arms L, LP, M and GW), the two-, four- and
+  eight-token cluster programs and the Q4S / Q4SP pair. A shared launcher names
+  its kernel `CAKE_PROGRAM_KERNEL`, its host-shim namespace `CAKE_PROGRAM_SHIM`
+  and the launch value its programs differ in (the dynamic shared memory
+  `CAKE_BINDING_SMEM` or the cluster size `CAKE_BINDING_CLUSTER`) and does not
+  build without them; each record's `compile_flags` carries its values.
 - Nothing is planned on the host and nothing is allocated at launch: a
   prepared runner (or a CUDA Graph capturing it) replays for new `logits` /
   `bias` values written into the same buffers.
