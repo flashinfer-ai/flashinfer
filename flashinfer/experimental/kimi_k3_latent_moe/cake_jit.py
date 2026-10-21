@@ -54,10 +54,10 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 #   instances; ``t1`` stages the final item through TMA stores.
 #
 # ``KERNEL_SYMBOLS`` names the kernel symbol of a key whose former program was
-# folded into the program it now shares (the ``e1`` variants): the shared source
-# keeps each variant's text behind ``#if`` arms on the knob definitions of
-# ``SPECIALIZATIONS`` and names its kernel ``CAKE_PROGRAM_KERNEL``, so every
-# former symbol stays defined for its key.
+# folded into the program it now shares (the ``e1`` and ``s6`` variants): the
+# shared source keeps each variant's text behind ``#if`` arms on the knob
+# definitions of ``SPECIALIZATIONS`` and names its kernel ``CAKE_PROGRAM_KERNEL``,
+# so every former symbol stays defined for its key.
 MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_latent_moe_0a25d70b85fa5e96860e": {
         "role": "kernel",
@@ -432,53 +432,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "closures": {
             "sm_100a": "18f27557527930903b8367daa21416a7a2d5c6e29f65ee2fb7e088175a652565",
             "sm_103a": "3f14b376a465a0f576082edd9de12c844aec8e6b25378de122799abe67526234",
-        },
-    },
-    "cake_kimi_k3_latent_moe_704a177ce25d48b0969e": {
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_704a177ce25d48b0969e_kernel.cu",
-            "cake_kimi_k3_latent_moe/cake_kimi_k3_latent_moe_704a177ce25d48b0969e_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "A1"],
-            ["tma_buffer", "B1"],
-            ["tma_buffer", "A2"],
-            ["tma_buffer", "B2"],
-            ["buffer", "out"],
-            ["tma_buffer", "out_map"],
-            ["buffer", "ws"],
-            ["buffer", "counters"],
-            ["parameter", "M"],
-            ["parameter", "m_tiles"],
-            ["parameter", "k0_blocks"],
-            ["parameter", "num_items"],
-            ["parameter", "full_items"],
-            ["parameter", "sk_ipc"],
-            ["parameter", "sk_max_seg"],
-            ["parameter", "sk_total"],
-            ["buffer", "routed"],
-            ["buffer", "norm_weight"],
-            ["buffer", "y_out"],
-            ["buffer", "norm_counter"],
-            ["parameter", "num_partials"],
-            ["parameter", "eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "launch": {
-            "block": [320, 1, 1],
-            "cluster": [2, 1, 1],
-            "cooperative": False,
-            "dynamic_smem_bytes": 197760,
-        },
-        "arches": ["sm_100a", "sm_103a"],
-        "closures": {
-            "sm_100a": "5842c8b124fadab702ae142a513ce81ea743480b89252bec02cd7fb25d941d98",
-            "sm_103a": "7cea4325bcfb705cc57f3b3fdd917f8a78fda7aa44e865bb2ca3c7d24d8551b3",
         },
     },
     "cake_kimi_k3_latent_moe_7088c5c21996824982b0": {
@@ -1337,7 +1290,7 @@ KERNELS: dict[str, str] = {
     "front:i768": "cake_kimi_k3_latent_moe_85546046418e8b56c00c",
     "front:i768e1": "cake_kimi_k3_latent_moe_85546046418e8b56c00c",
     "tail_gemm:tp1e0f0t1": "cake_kimi_k3_latent_moe_8a3e1501cab6a75cf180",
-    "tail_gemm:tp1e1f1s6t1": "cake_kimi_k3_latent_moe_704a177ce25d48b0969e",
+    "tail_gemm:tp1e1f1s6t1": "cake_kimi_k3_latent_moe_a3737025ddafbf1fa5af",
     "tail_gemm:tp1e1f1t1": "cake_kimi_k3_latent_moe_a3737025ddafbf1fa5af",
     "tail_gemm:tp8e0f0s9n128": "cake_kimi_k3_latent_moe_715f9200ec523324ea43",
     "tail_gemm:tp8e0f0t1": "cake_kimi_k3_latent_moe_8a3e1501cab6a75cf180",
@@ -1361,7 +1314,12 @@ SPECIALIZATIONS: dict[str, dict[str, int]] = {
         "B_EVICT_FIRST": 1,
     },
     "tail_gemm:tp1e0f0t1": {"K1_ITERS": 56, "K2_ITERS": 96, "NUM_K_ITERS": 152},
-    "tail_gemm:tp1e1f1s6t1": {"K1_ITERS": 56, "K2_ITERS": 96, "NUM_K_ITERS": 152},
+    "tail_gemm:tp1e1f1s6t1": {
+        "K1_ITERS": 56,
+        "K2_ITERS": 96,
+        "NUM_K_ITERS": 152,
+        "NUM_STAGES": 6,
+    },
     "tail_gemm:tp1e1f1t1": {"K1_ITERS": 56, "K2_ITERS": 96, "NUM_K_ITERS": 152},
     "tail_gemm:tp8e0f0s9n128": {"K1_ITERS": 7, "K2_ITERS": 12, "NUM_K_ITERS": 19},
     "tail_gemm:tp8e0f0t1": {"K1_ITERS": 7, "K2_ITERS": 12, "NUM_K_ITERS": 19},
@@ -1376,6 +1334,7 @@ SPECIALIZATIONS: dict[str, dict[str, int]] = {
 KERNEL_SYMBOLS: dict[str, str] = {
     "front:i6144e1": "kernel_cake_kimi_k3_latent_moe_f2749aaad466a0ec6dc5",
     "front:i768e1": "kernel_cake_kimi_k3_latent_moe_f2749aaad466a0ec6dc5",
+    "tail_gemm:tp1e1f1s6t1": "kernel_cake_kimi_k3_latent_moe_704a177ce25d48b0969e",
     "tail_gemm:tp8e1f0t1": "kernel_cake_kimi_k3_latent_moe_5672f5747ccf635abc4c",
     "tail_norm:e1": "kernel_cake_kimi_k3_latent_moe_bf078c28bb875c3ae557",
 }
