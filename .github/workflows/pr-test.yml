@@ -475,6 +475,12 @@ jobs:
 
       - name: Run Test
         if: matrix.kind != 'aot'
+        env:
+          # Kernel compile cache kept across this runner's jobs (see ci/bash.sh).
+          # runner.workspace is the parent of the checkout, so the Cleanup step's
+          # wipe of the checkout leaves it, and on the H100 hosts it sits on the
+          # large NVMe work volume rather than the small root filesystem.
+          CI_COMPILE_CACHE_DIR: ${{ runner.workspace }}/flashinfer-compile-cache
         run: |
           case "${TEST_SCRIPT}" in
             task_jit_run_tests_part[1-5].sh|task_jit_run_tests_t4.sh|task_run_unit_tests.sh) ;;

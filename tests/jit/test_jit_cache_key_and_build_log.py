@@ -59,7 +59,6 @@ def fake_package(tmp_path, monkeypatch):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
     monkeypatch.setattr(cute_dsl_core, "_PACKAGE_DIR", pkg.resolve())
-    monkeypatch.setattr(cute_dsl_core, "_TOP_LEVEL_INIT", pkg.resolve() / "__init__.py")
     cute_dsl_core._direct_package_imports.cache_clear()
     cute_dsl_core._package_import_closure.cache_clear()
     yield pkg.resolve()
@@ -67,14 +66,13 @@ def fake_package(tmp_path, monkeypatch):
     cute_dsl_core._package_import_closure.cache_clear()
 
 
-def test_import_closure_follows_helpers_but_not_top_level_init(fake_package):
+def test_import_closure_follows_helpers_but_not_unkeyed_files(fake_package):
     closure = cute_dsl_core._package_import_closure(
         fake_package / "kernels" / "kernel.py"
     )
     names = {str(p.relative_to(fake_package)) for p in closure}
     assert names == {
         "kernels/kernel.py",
-        "version.py",  # its missing ``_build_meta`` must not drag in __init__
         "helpers/deep.py",
         "helpers/math.py",  # transitively, via an absolute import
         "helpers/__init__.py",  # THING is defined by the package itself
@@ -138,6 +136,8 @@ def test_strict_closure_of_real_kernel_stays_small(monkeypatch):
         for p in closure
     )  # picks up at least one sibling helper
     assert len(closure) < 100
+    # jit/env.py imports version.py, whose git commit changes on every checkout.
+    assert not {"version.py", "_build_meta.py"} & {p.name for p in closure}
 
 
 class _FakeSpec(jit_core.JitSpec):

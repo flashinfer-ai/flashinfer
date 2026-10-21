@@ -64,7 +64,13 @@ def cute_dsl_strict_cache_key() -> bool:
 
 # The flashinfer package directory; only imports resolving inside it are followed.
 _PACKAGE_DIR = Path(__file__).resolve().parents[1]
-_TOP_LEVEL_INIT = _PACKAGE_DIR / "__init__.py"
+# Never followed by the strict key:
+# - ``__init__.py`` re-exports the whole public API and defines no kernels;
+#   following it would key every kernel on every file in the package.
+# - ``version.py`` / ``_build_meta.py`` carry the build's git commit, which
+#   differs on every CI checkout. The package version is already part of the
+#   cache directory path (``FLASHINFER_JIT_DIR``).
+_UNKEYED_PACKAGE_FILES = ("__init__.py", "version.py", "_build_meta.py")
 
 
 def _resolve_package_module(parts: Sequence[str]) -> Optional[Path]:
@@ -116,11 +122,9 @@ def _direct_package_imports(path: Path) -> tuple:
                     if submodule is not None
                     else _resolve_package_module(module)
                 )
+        unkeyed = {_PACKAGE_DIR / name for name in _UNKEYED_PACKAGE_FILES}
         for resolved in resolved_files:
-            # The top-level ``__init__`` re-exports the whole public API and
-            # defines no kernels; following it would key every kernel on
-            # every file in the package.
-            if resolved is not None and resolved not in (path, _TOP_LEVEL_INIT):
+            if resolved is not None and resolved != path and resolved not in unkeyed:
                 found.add(resolved)
     return tuple(sorted(found))
 

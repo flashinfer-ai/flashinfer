@@ -122,10 +122,13 @@ Caveats:
 - The cache is per-devcontainer by design: sccache's local storage supports a
   single server at a time, so two containers must not share one cache directory.
 
-GitHub PR Test GPU jobs keep a different, per-runner cache: `ci/bash.sh` mounts
-`~/.cache/flashinfer-ci/compile/$RUNNER_NAME` as the FlashInfer workspace base
-and Triton cache (`CI_COMPILE_CACHE_DIR=""` opts out; `CI_COMPILE_CACHE_MAX_MB`
-caps it). Only content-keyed artifacts survive between jobs: CuTe-DSL (with
+GitHub PR Test GPU jobs keep a different, per-runner cache: they set
+`CI_COMPILE_CACHE_DIR` to a directory under the runner's work directory, and
+`ci/bash.sh` mounts a per-CI-image subdirectory of it as the FlashInfer workspace
+base and Triton cache. Other `ci/bash.sh` callers leave it unset and run cold.
+Before each job the cache is cleared when it exceeds `CI_COMPILE_CACHE_MAX_MB`
+(default 40960) or its volume has less than `CI_COMPILE_CACHE_MIN_FREE_MB`
+(default 20480) free. Only content-keyed artifacts survive between jobs: CuTe-DSL (with
 `FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1`), TIRx, KDA PTX, Triton and downloaded
 cubins. nvcc modules, tuning results and the generated-source tree are pruned,
 since a fresh checkout rebuilds nvcc modules anyway. Each test job's
@@ -618,7 +621,8 @@ kernel-source SHA256 wipes and lazily rebuilds the module. Reference usage:
 `FLASHINFER_CUTE_DSL_DISABLE_CACHE=1`. The SHA256 covers only the files a caller
 passes as `extra_key_files` (often just `__file__`); with
 `FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1` it also covers every flashinfer module
-those files transitively import (not the top-level `flashinfer/__init__.py`), for
+those files transitively import (not the top-level `__init__.py`, `version.py` or
+`_build_meta.py`), for
 long-lived caches shared across commits such as CI's.
 Task-scheduled attention shares this cache through
 `flashinfer/attention/prims_ts/_compile_cache.py`; its keys cover compile specs,
