@@ -88,6 +88,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.cake_sage_block_sparse_attention_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_fused_qk_rope_fp8_append_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_vsa_sm90_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_mhc_train_backend" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_dsa_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_kda_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_lm_head_loss" = ["csrc/**", "build.json"]

@@ -280,6 +280,31 @@ from .cake_causal_conv1d_train import (
 from .cake_causal_conv1d_train import (
     cake_causal_conv1d_train_forward as cake_causal_conv1d_train_forward,
 )
+from .cake_mhc_train import CakeMHCTrainFinishFunction as CakeMHCTrainFinishFunction
+from .cake_mhc_train import CakeMHCTrainPrepareFunction as CakeMHCTrainPrepareFunction
+from .cake_mhc_train import (
+    cake_mhc_train_backward_finish as cake_mhc_train_backward_finish,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_backward_prepare as cake_mhc_train_backward_prepare,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_backward_workspace_bytes as cake_mhc_train_backward_workspace_bytes,
+)
+from .cake_mhc_train import cake_mhc_train_finish as cake_mhc_train_finish
+from .cake_mhc_train import (
+    cake_mhc_train_forward_finish as cake_mhc_train_forward_finish,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_forward_prepare as cake_mhc_train_forward_prepare,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_forward_stats as cake_mhc_train_forward_stats,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_forward_workspace_bytes as cake_mhc_train_forward_workspace_bytes,
+)
+from .cake_mhc_train import cake_mhc_train_prepare as cake_mhc_train_prepare
 from .norm import gated_residual_rmsnorm as gated_residual_rmsnorm
 from .norm import gated_residual_next_rmsnorm as gated_residual_next_rmsnorm
 from .norm import rmsnorm_sigmoid_gate as rmsnorm_sigmoid_gate

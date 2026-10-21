@@ -235,11 +235,11 @@ class Package:
     refs: Callable[[Path, str], set[str]]
 
 
-# dsa_train, kda_train, dsa_indexer, the rmsnorm, the causal conv1d, the ulysses, the NVFP4 SVDQuant GEMM, the Sage
+# dsa_train, kda_train, dsa_indexer, the rmsnorm, the mhc training, the causal conv1d, the ulysses, the NVFP4 SVDQuant GEMM, the Sage
 # block-sparse attention, the fused QK RoPE append (BF16 / FP8), the experimental NVFP4 attention, the SM90 VSA and
 # the Kimi-K3 AttnRes backends are read with the generic walker (a mapping carrying ``library`` under an ``arches`` /
 # ``arch`` scope).  Their exporters' registry shapes fit it: a record carries ``arches`` and either ``library`` itself
-# (dsa_indexer PROGRAMS, rmsnorm, causal conv1d, ulysses, svdquant, Sage block-sparse attention, fused QK RoPE append,
+# (dsa_indexer PROGRAMS, rmsnorm, mhc, causal conv1d, ulysses, svdquant, Sage block-sparse attention, fused QK RoPE append,
 # nvfp4_attention, vsa_sm90 and Kimi-K3 AttnRes MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
 PACKAGES: tuple[Package, ...] = (
     Package(
@@ -275,6 +275,12 @@ PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.cake_vsa_sm90_backend",
         "flashinfer/cake_vsa_sm90_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.cake_mhc_train_backend",
+        "flashinfer/cake_mhc_train_backend",
         "cake_jit.py",
         refs_generic,
     ),
