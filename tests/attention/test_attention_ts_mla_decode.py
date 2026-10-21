@@ -2956,3 +2956,190 @@ def test_attention_ts_mla_decode_runtime_k_pruning_product(
         case,
         expected_b200={"kernel": expected_kernel},
     )
+
+
+# Triggers its dependents first, spins, and only then copies the real query into
+# the buffer MLA decode reads, so a decode kernel that reads Q before the
+# preceding grid has completed sees the NaN left in the buffer.
+_PDL_EARLY_TRIGGER_PRIMARY_CUDA = r"""
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <torch/extension.h>
+
+#include <cstdint>
+
+__global__ void trigger_then_copy_kernel(uint8_t* dst, const uint8_t* src, int64_t n,
+                                         int64_t spin_cycles) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+  int64_t start = clock64();
+  while (clock64() - start < spin_cycles) {
+  }
+  int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += stride) {
+    dst[i] = src[i];
+  }
+}
+
+void pdl_early_trigger_copy(at::Tensor dst, at::Tensor src, int64_t spin_cycles) {
+  TORCH_CHECK(dst.numel() * dst.element_size() == src.numel() * src.element_size());
+  trigger_then_copy_kernel<<<132, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      static_cast<uint8_t*>(dst.data_ptr()), static_cast<const uint8_t*>(src.data_ptr()),
+      dst.numel() * dst.element_size(), spin_cycles);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+"""
+
+
+@pytest.mark.parametrize(
+    ("num_qo_heads", "batch_size", "max_seq_len", "expected_b200"),
+    (
+        pytest.param(
+            16,
+            1,
+            32768,
+            {"kernel": "throughput_latency_1cta", "separate_reducer_impl": "parallel"},
+            id="1cta-split",
+        ),
+        pytest.param(
+            128,
+            1,
+            32768,
+            {"kernel": "throughput_2cta", "use_persistent_scheduler": False},
+            id="2cta-split",
+        ),
+        pytest.param(
+            16,
+            128,
+            512,
+            {
+                "kernel": "throughput_latency_1cta",
+                "split_kv": 1,
+                "use_persistent_scheduler": False,
+            },
+            id="1cta-nosplit",
+        ),
+        pytest.param(
+            128,
+            64,
+            1024,
+            {
+                "kernel": "throughput_2cta",
+                "split_kv": 1,
+                "use_persistent_scheduler": False,
+            },
+            id="2cta-nosplit",
+        ),
+        pytest.param(
+            128,
+            128,
+            4096,
+            {"kernel": "throughput_2cta", "use_persistent_scheduler": True},
+            id="2cta-persistent",
+        ),
+    ),
+)
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_waits_for_early_triggering_predecessor(
+    num_qo_heads: int,
+    batch_size: int,
+    max_seq_len: int,
+    expected_b200: dict[str, object],
+):
+    """MLA decode must not read Q before the preceding grid has completed,
+    even when that grid executes griddepcontrol.launch_dependents early."""
+
+    from torch.utils.cpp_extension import load_inline
+
+    major, minor = torch.cuda.get_device_capability()
+    primary = load_inline(
+        name="test_attention_ts_mla_pdl_early_trigger_primary",
+        cpp_sources=[
+            "void pdl_early_trigger_copy(at::Tensor dst, at::Tensor src, "
+            "int64_t spin_cycles);"
+        ],
+        cuda_sources=[_PDL_EARLY_TRIGGER_PRIMARY_CUDA],
+        extra_cuda_cflags=[
+            f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
+        ],
+        functions=["pdl_early_trigger_copy"],
+        verbose=False,
+    )
+
+    case = _make_mla_case(
+        batch_size=batch_size,
+        num_qo_heads=num_qo_heads,
+        max_seq_len=max_seq_len,
+        qkv_dtype=torch.bfloat16,
+        page_size=64,
+        device="cuda",
+        seed=41000 + num_qo_heads + batch_size,
+    )
+    wrapper = _plan_case(case)
+    policy = _policy_dict(wrapper)
+    _assert_auto_policy(policy, expected_b200, device=case.query.device)
+
+    real_query = case.query
+    query_buffer = torch.empty_like(real_query)
+    staged = replace(case, query=query_buffer)
+    output = torch.empty(
+        (*real_query.shape[:3], _LATENT_DIM),
+        dtype=case.output_dtype,
+        device=real_query.device,
+    )
+    # Warm up so compilation does not run between the primary and the decode.
+    query_buffer.copy_(real_query)
+    _run_case(wrapper, staged, out=output, validate=False)
+    torch.cuda.synchronize()
+    _assert_case_correct(output, case, policy)
+
+    for _ in range(5):
+        query_buffer.fill_(float("nan"))
+        output.fill_(float("nan"))
+        torch.cuda.synchronize()
+        primary.pdl_early_trigger_copy(query_buffer, real_query, 20_000_000)
+        _run_case(wrapper, staged, out=output, validate=False)
+        torch.cuda.synchronize()
+        assert torch.isfinite(output).all(), (
+            "MLA decode read Q before the preceding kernel wrote it"
+        )
+        _assert_case_correct(output, case, policy)
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "max_kv_len"),
+    (
+        pytest.param(16, 32768, id="1cta"),
+        pytest.param(128, 32768, id="2cta"),
+    ),
+)
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_pdl_is_part_of_the_compile_identity(
+    num_heads: int,
+    max_kv_len: int,
+):
+    """PDL changes the launch attribute and the producer's wait, so a PDL and
+    a non-PDL kernel must never share a compiled entry."""
+
+    def signature(enable_pdl: bool) -> tuple[object, ...]:
+        spec = mla_decode_module._resolve_mla_decode_launch_spec(
+            torch.cuda.current_device(),
+            1,
+            num_heads,
+            _LATENT_DIM,
+            _ROPE_DIM,
+            _DEFAULT_PAGE_SIZE,
+            max_kv_len,
+            "bfloat16",
+            "bfloat16",
+            "bfloat16",
+            "causal",
+            1,
+            enable_pdl,
+        )
+        assert spec.kernel.enable_pdl is enable_pdl
+        return mla_decode_module._mla_kernel_compile_signature(spec.kernel)
+
+    assert signature(True) != signature(False)

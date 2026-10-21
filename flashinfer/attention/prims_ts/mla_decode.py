@@ -22,6 +22,7 @@ import struct
 import functools
 from typing import Any, Literal, Optional, cast
 
+from ...utils import device_support_pdl
 from ._compile_cache import build_and_load_attention_kernel
 from ._hardware import get_max_active_clusters
 
@@ -739,6 +740,7 @@ def _resolve_mla_decode_launch_spec(
     output_dtype_key: str,
     mask_type: str,
     seq_len_q: int = 1,
+    enable_pdl: bool = False,
 ):
     """Resolve and cache MLA policy/workspace without compiling."""
 
@@ -869,6 +871,7 @@ def _resolve_mla_decode_launch_spec(
                 explicit_split_kv=None,
                 explicit_persistent=None,
                 mask_type=mask_type,
+                enable_pdl=enable_pdl,
             )
             final_cfg = kernel._make_config()
             split_kv = int(final_cfg.num_ctas_per_seq_kv)
@@ -951,6 +954,7 @@ def _resolve_mla_decode_launch_spec(
                 seq_len_q=seq_len_q,
                 batch_size=batch_size,
                 mask_type=mask_type,
+                enable_pdl=enable_pdl,
             )
             workspace_size = compute_2cta_workspace_size(
                 tile_size_q=int(launch_shape.tile_size_q),
@@ -1576,6 +1580,7 @@ class BatchMLADecodePagedTSWrapper:
             _dtype_key(o_data_type),
             mask_type,
             max_seq_len_q,
+            device_support_pdl(device),
         )
         spec = _resolve_mla_decode_launch_spec(*spec_key)
         compile_spec = _make_mla_decode_compile_spec(
@@ -2189,6 +2194,7 @@ def _resolve_sparse_mla_plan(
             seq_len_q=1,
             batch_size=max_rows,
             mask_type="dense",
+            enable_pdl=device_support_pdl(device),
         )
         kernel.sparse_gather_warps = profile.gather_issue_warps
         kernel.sparse_kv_stages = profile.kv_pipeline_stages
@@ -2232,6 +2238,7 @@ def _resolve_sparse_mla_plan(
             tile_size_q=tile,
             sparse_profile=profile,
             mask_type="dense",
+            enable_pdl=device_support_pdl(device),
         )
         core_bytes = compute_workspace_size(
             cfg=kernel._make_config(),

@@ -1679,8 +1679,14 @@ class ThroughputLatencyMlaDecodeTs:
         mask_type: MaskType | str = MaskType.CAUSAL,
         sparse_profile=None,
         finalize_output: bool = False,
+        enable_pdl: bool = False,
     ):
-        """Initialize one selected physical tile profile over logical flat Q rows."""
+        """Initialize one selected physical tile profile over logical flat Q rows.
+
+        With ``enable_pdl`` every launch uses programmatic dependent launch:
+        the producer waits on the preceding grid before reading its inputs,
+        and a split-KV producer releases its standalone reducer early.
+        """
         import cutlass as _cutlass
 
         if acc_dtype is None:
@@ -1709,6 +1715,7 @@ class ThroughputLatencyMlaDecodeTs:
         self.mask_type = normalize_mask_type(mask_type)
         self.sparse_profile = sparse_profile
         self.finalize_output = finalize_output
+        self.enable_pdl = enable_pdl
         self.output_quant = None
         # Sparse attention binds separate source lists; dense attention uses
         # the ordinary page table. Both reuse the staged KV loaders.
@@ -1825,6 +1832,7 @@ class ThroughputLatencyMlaDecodeTs:
             self.parallel_reduction_elements_per_slice,
             self.compile_topology_signature(),
             self.output_quant,
+            self.enable_pdl,
         )
 
     def _make_config(self):
@@ -2258,7 +2266,7 @@ class ThroughputLatencyMlaDecodeTs:
             cluster=cluster_shape,
             stream=stream,
             min_blocks_per_mp=1,
-            use_pdl=acc_o is not None,
+            use_pdl=self.enable_pdl,
         )
         if cutlass.const_expr(acc_o is not None):
             if cutlass.const_expr(
@@ -2299,7 +2307,7 @@ class ThroughputLatencyMlaDecodeTs:
                         block=[reduction_threads, 1, 1],
                         stream=stream,
                         min_blocks_per_mp=1,
-                        use_pdl=True,
+                        use_pdl=self.enable_pdl,
                     )
                 else:
                     parallel_reducer.launch(
@@ -2308,7 +2316,7 @@ class ThroughputLatencyMlaDecodeTs:
                         cluster=reduction_cluster,
                         stream=stream,
                         min_blocks_per_mp=1,
-                        use_pdl=True,
+                        use_pdl=self.enable_pdl,
                     )
                 return
             (
@@ -2342,7 +2350,7 @@ class ThroughputLatencyMlaDecodeTs:
                 smem=reduction_smem,
                 stream=stream,
                 min_blocks_per_mp=1,
-                use_pdl=True,
+                use_pdl=self.enable_pdl,
             )
 
     @cute.kernel
@@ -2370,6 +2378,12 @@ class ThroughputLatencyMlaDecodeTs:
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self._make_config()
 
+        # With PDL the preceding grid may still be running. Sparse index
+        # binding reads request lengths and scales below, so sparse launches
+        # wait here; dense launches overlap barrier and TMEM setup and wait
+        # after it.
+        if cutlass.const_expr(self.enable_pdl and cfg.sparse_direct):
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         if cutlass.const_expr(cfg.sparse_direct):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
 
@@ -2420,36 +2434,6 @@ class ThroughputLatencyMlaDecodeTs:
             and runtime_split_pruning_is_profitable(cfg.num_ctas_per_seq_kv)
         )
         has_runtime_activity_guard = tile_sched_params is None
-        if cutlass.const_expr(has_runtime_activity_guard):
-            # Decode launch coordinates against the configured maximum grid,
-            # then independently drop compact-Q padding and profitable split
-            # suffixes. S2/S3 retain configured split work: too few mainloop
-            # CTAs can retire to amortize the activity branch plus mandatory
-            # neutral publication/reduction. Q padding remains prunable.
-            if cutlass.const_expr(cu_seqlens_q is not None):
-                query_tile_is_active = runtime_query_tile_is_active(
-                    cfg,
-                    cu_seqlens_q,
-                    batch_idx,
-                    cta_idx_q,
-                )
-                query_tile_is_active = cute.arch.make_warp_uniform(query_tile_is_active)
-            if cutlass.const_expr(enable_runtime_split_pruning):
-                split_tile_is_active = runtime_split_tile_is_active(
-                    cfg,
-                    cache_seqs,
-                    cu_seqlens_q,
-                    batch_idx,
-                    cta_idx_q,
-                    cta_idx_kv,
-                )
-                split_tile_is_active = cute.arch.make_warp_uniform(split_tile_is_active)
-            # An empty request publishes neither O/LSE nor split scratch.
-            # Cluster peers agree on this batch-owned predicate.
-            query_tile_is_active = query_tile_is_active & (
-                cache_seqs[batch_idx] > Int32(0)
-            )
-            run_task_graph = query_tile_is_active and split_tile_is_active
         if cutlass.const_expr(tile_sched_params is not None):
             cta_idx_q = None
             batch_idx = None
@@ -2569,7 +2553,38 @@ class ThroughputLatencyMlaDecodeTs:
                 barrier_id=TMEM_LIFECYCLE_BARRIER_ID,
                 thread_count=cfg.threads_per_cta,
             )
+        if cutlass.const_expr(self.enable_pdl and not cfg.sparse_direct):
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         if cutlass.const_expr(has_runtime_activity_guard):
+            # Decode launch coordinates against the configured maximum grid,
+            # then independently drop compact-Q padding and profitable split
+            # suffixes. S2/S3 retain configured split work: too few mainloop
+            # CTAs can retire to amortize the activity branch plus mandatory
+            # neutral publication/reduction. Q padding remains prunable.
+            if cutlass.const_expr(cu_seqlens_q is not None):
+                query_tile_is_active = runtime_query_tile_is_active(
+                    cfg,
+                    cu_seqlens_q,
+                    batch_idx,
+                    cta_idx_q,
+                )
+                query_tile_is_active = cute.arch.make_warp_uniform(query_tile_is_active)
+            if cutlass.const_expr(enable_runtime_split_pruning):
+                split_tile_is_active = runtime_split_tile_is_active(
+                    cfg,
+                    cache_seqs,
+                    cu_seqlens_q,
+                    batch_idx,
+                    cta_idx_q,
+                    cta_idx_kv,
+                )
+                split_tile_is_active = cute.arch.make_warp_uniform(split_tile_is_active)
+            # An empty request publishes neither O/LSE nor split scratch.
+            # Cluster peers agree on this batch-owned predicate.
+            query_tile_is_active = query_tile_is_active & (
+                cache_seqs[batch_idx] > Int32(0)
+            )
+            run_task_graph = query_tile_is_active and split_tile_is_active
             if run_task_graph:
                 task_manager.run()
             elif query_tile_is_active:
@@ -2616,7 +2631,7 @@ class ThroughputLatencyMlaDecodeTs:
                 cfg.tmem_alloc_cols,
                 group=prims.CTAGroup.CTA_1,
             )
-        if cutlass.const_expr(acc_o is not None):
+        if cutlass.const_expr(self.enable_pdl and acc_o is not None):
             # Every CTA in the producer grid must release the dependent
             # reducer, including runtime-padded Q/split CTAs that skipped the
             # task graph. One elected thread emits the convergent CTA signal.
