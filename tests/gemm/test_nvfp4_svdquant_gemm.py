@@ -1262,7 +1262,12 @@ def test_mm_nvfp4_svdquant_cake_general_shapes(m, n, k, rank, use_bias):
     [
         (65, 3072, 3072, 32),  # M below the 128-row tensor-map box
         (129, 3104, 3072, 32),  # N must be a multiple of 128
-        (129, 3072, 3200, 96),  # K must be a multiple of the 256-deep K tile at rank 96
+        (
+            333,
+            3072,
+            3200,
+            96,
+        ),  # K must be a multiple of the 256-deep K tile of the rank-96 program
         (129, 3072, 3072, 160),  # ranks above 128 are not supported
     ],
 )

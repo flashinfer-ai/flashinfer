@@ -874,25 +874,38 @@ def test_registry_records_reference_the_build_manifest() -> None:
     backward = loader.workspace_record("sm_100a")
     assert backward["workspace_rule"] == {"kind": "partial_rows", "taps": WIDTH}
     assert backward["launch"]["cooperative"] is True
-    # Every backward route: exactly one fallback record, at most one record whose rule names the
-    # architecture, one program selected per channel count, and the forward route selects nothing.
+    # Every backward route: exactly one fallback record, every routed record's rule names the
+    # architecture with its own threshold (distinct thresholds), one program selected per channel
+    # count -- the highest threshold at most C, the fallback below the lowest -- and the forward route
+    # selects nothing.
     for arch in loader.ARCHES:
         names = loader.route_modules(arch, "bwd")
         rules = {name: loader.select_rule(loader.MODULES[name]) for name in names}
         fallbacks = [name for name, rule in rules.items() if rule is None]
-        positives = [
-            name
-            for name, rule in rules.items()
-            if rule is not None and arch in rule["channels"]
-        ]
         assert len(fallbacks) == 1, (arch, fallbacks)
-        assert len(positives) <= 1, (arch, positives)
-        for name in positives:
-            threshold = int(rules[name]["channels"][arch])
+        positives = sorted(
+            (int(rule["channels"][arch]), name)
+            for name, rule in rules.items()
+            if rule is not None
+        )
+        assert all(
+            arch in rules[name]["channels"] for name in names if rules[name] is not None
+        ), (
+            arch,
+            names,
+        )
+        thresholds = [threshold for threshold, _ in positives]
+        assert thresholds == sorted(set(thresholds)), (arch, positives)
+        assert len(positives) <= 3, (
+            arch,
+            positives,
+        )  # sm_107a routes three programs beside its fallback
+        previous = fallbacks[0]
+        for threshold, name in positives:
             assert loader.selected_modules(arch, "bwd", C=threshold) == (name,)
-            assert loader.selected_modules(arch, "bwd", C=threshold - 8) == (
-                fallbacks[0],
-            )
+            assert loader.selected_modules(arch, "bwd", C=threshold - 8) == (previous,)
+            previous = name
+        assert loader.selected_modules(arch, "bwd", C=8192) == (previous,)
         for C in (8, 128, 512, 1024, 8192):
             selected = loader.selected_modules(arch, "bwd", C=C, S=1)
             assert len(selected) == 1 and selected[0] in names, (arch, C, selected)
