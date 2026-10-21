@@ -2152,6 +2152,86 @@ class TestCuteDslFusedMoeFunctional:
                 use_fused_finalize=use_fused_finalize,
             )
 
+    @pytest.mark.parametrize("hidden_size", [256, 768, 512])
+    def test_rubin_finalize_cluster_n_stays_in_output(self, hidden_size: int):
+        """Rubin finalize with cluster_shape_n=2 must stay inside the output.
+
+        With an odd N tile count (hidden 256 and 768 at mma N 256) the
+        persistent scheduler adds a padding CTA at coord_n == hidden. The
+        output is the head of a larger buffer whose tail holds a NaN payload.
+        An unclipped reduction for the last token row runs into that tail and
+        changes it. Overruns from earlier rows land in the next row and add
+        zeros, so neither the tail nor the result would show them.
+        """
+        if not is_sm107():
+            pytest.skip("Rubin (SM107) finalize kernel")
+        from flashinfer import cute_dsl_fused_moe
+
+        num_tokens, top_k, num_experts, intermediate_size = 97, 2, 8, 512
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        tactic = (
+            128,
+            ((128, 128, 256), (128, 128, 128), (1, 1), False),
+            ((128, 256, 256), (128, 256, 128), (1, 2), False),
+        )
+        canary = 4096
+        payload = 0x7FC1  # bf16 quiet NaN with a payload an add would canonicalize
+        buf = torch.empty(
+            num_tokens * hidden_size + canary, dtype=torch.bfloat16, device="cuda"
+        )
+        buf[num_tokens * hidden_size :].view(torch.int16).fill_(payload)
+        out = buf[: num_tokens * hidden_size].view(num_tokens, hidden_size)
+        result = cute_dsl_fused_moe(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_experts,
+            moe_output=out,
+            tactic=tactic,
+        )
+        torch.cuda.synchronize()
+        tail = buf[num_tokens * hidden_size :].view(torch.int16)
+        assert (tail == payload).all(), (
+            f"finalize wrote {(tail != payload).sum().item()} elements past the "
+            f"output (hidden={hidden_size}, cluster_shape_n=2)"
+        )
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_ref"].float(),
+            gemm1_weights=tensors["w1_weight_bf16"].float(),
+            gemm2_weights=tensors["w2_weight_bf16"].float(),
+            gemm1_alpha=tensors["w1_alpha"],
+            gemm2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+        )
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
     def _run_numerical_accuracy(
         self,
         activation_type: ActivationType,
