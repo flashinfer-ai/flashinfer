@@ -502,10 +502,12 @@ def qwen_3_8_block_workspace_size(
     fuse_prepare: Optional[bool] = None,
     ring_cap: Optional[int] = None,
 ) -> int:
-    """The workspace bytes a decode plan of this shape bucket needs, WITHOUT compiling it: what a serving stack sizes its ONE shared
+    """The workspace bytes a decode plan of this shape bucket needs, with no plan kept: what a serving stack sizes its ONE shared
     workspace with at init (before its memory profiling, when the caches do not exist yet), at the largest ``(batch_size,
-    q_len_per_req)`` bucket it will plan.  The carve depends on the bucket, ``max_pages x page_size`` (the block table's reach) and the
-    split -- never on the caches' page count or strides -- so the number equals the compiled plan's ``workspace_size``.  Typed errors as
+    q_len_per_req)`` bucket it will plan.  The bucket is declared on stand-in samples and its kernels compiled (the carve includes
+    the projection engines' scratch; the compile is served from the in-process memo or the compiled-plan cache after the first
+    process).  The carve depends on the bucket, ``max_pages x page_size`` (the block table's reach) and the split -- never on the
+    caches' page count or strides -- so the number equals the compiled plan's ``workspace_size``.  Typed errors as
     :func:`prepare_qwen_3_8_block_bf16`.
 
     Parameters

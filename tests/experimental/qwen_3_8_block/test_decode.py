@@ -632,9 +632,6 @@ def test_wrapper_over_a_shared_workspace_serves_two_buckets():
         )
         plan = w.plan_info
         assert plan.workspace_size <= ws.numel() and plan._workspace is None
-        assert (
-            plan.declaration["workspace_size_before_compile"] == plan.workspace_size
-        ), plan.declaration["workspace_size_before_compile"]
         from flashinfer.qwen_3_8_block import qwen_3_8_block_workspace_size
 
         sized = qwen_3_8_block_workspace_size(

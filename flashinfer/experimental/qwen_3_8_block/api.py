@@ -960,11 +960,6 @@ def prepare(
         if st is not None:
             st.capture_safe = True
     blk.check_support()
-    # the workspace carve is a host computation: readable before the compile (recorded; the sizing a serving stack does at init)
-    try:
-        size_before_compile: Optional[int] = int(blk.get_workspace_size())
-    except Exception:  # noqa: BLE001 - informational: the post-compile size is the plan's
-        size_before_compile = None
     blk.compile()
     size = int(blk.get_workspace_size())
     if workspace_buffer is not None:
@@ -1045,7 +1040,6 @@ def prepare(
         topk_knobs=tuple(ixd.topk_knobs) if ixd.topk_knobs is not None else None,
         indexer_launches=int(ixd.launches_per_execute()),
         launches_per_execute=launches,
-        workspace_size_before_compile=size_before_compile,
         capture_rows_max=DECODE_CAPTURE_ROWS_MAX,
         capture_safe_rows=bool(batch_size * q <= DECODE_CAPTURE_ROWS_MAX),
         position_table_rows=int(cos_pos.shape[1]),
@@ -1096,12 +1090,13 @@ def workspace_size(
     fuse_prepare: Optional[bool] = None,
     ring_cap: Optional[int] = None,
 ) -> int:
-    """The workspace bytes a plan of this shape bucket needs, WITHOUT compiling it -- what a serving stack sizes its one shared workspace
-    with at init (before its memory profiling run, when the caches do not exist yet): the vendored block is declared on stand-in
-    samples of the bucket's FORM (one page, a zeros table of ``max_pages`` columns, a ring of ``ring_cap`` rows), checked and its
-    workspace carve read.  The carve depends on the bucket (``batch_size x q_len_per_req`` rows, ``max_pages x page_size / block_size``
-    compressed rows, the split), never on the caches' page count or strides, so the number equals the compiled plan's
-    (``test_decode.py`` pins it).  Same typed declines as :func:`prepare`."""
+    """The workspace bytes a plan of this shape bucket needs, with no plan kept -- what a serving stack sizes its one shared
+    workspace with at init (before its memory profiling run, when the caches do not exist yet): the vendored block is declared on
+    stand-in samples of the bucket's FORM (one page, a zeros table of ``max_pages`` columns, a ring of ``ring_cap`` rows), checked,
+    COMPILED (the carve includes the projection engines' scratch, which is the compiled plan's; the kernels come from the in-process
+    memo or the compiled-plan cache after the first process) and its workspace carve read.  The carve depends on the bucket
+    (``batch_size x q_len_per_req`` rows, ``max_pages x page_size / block_size`` compressed rows, the split), never on the caches' page
+    count or strides, so the number equals the compiled plan's (``test_decode.py`` pins it).  Same typed declines as :func:`prepare`."""
     if form not in _support.ALL_FORMS:
         raise ValueError(
             f"{_PKG}: form must be one of {_support.ALL_FORMS}, got {form!r}"
@@ -1179,6 +1174,7 @@ def workspace_size(
         if st is not None:
             st.capture_safe = True
     blk.check_support()
+    blk.compile()
     return int(blk.get_workspace_size())
 
 
