@@ -1,9 +1,14 @@
 # CI workflow using AWS self-hosted runners.
-# Runs AOT build tests and GPU unit tests on push/PR to main.
+# Runs AOT build tests and GPU unit tests on PRs to main, and on main itself on
+# a schedule.
 # Uses ci/bash.sh for Docker execution (same as Jenkins).
 #
 # Permission Control:
-# - Push to main: Always runs
+# - main: a scheduled full-suite run three times a day (not per merge). Per-merge
+#   runs shared one cancel-in-progress group, so each merge cancelled the last:
+#   about 90% of them never finished. A scheduled run is never cancelled, runs
+#   every lane to completion (no fail-fast), and a failure opens or updates a
+#   tracking issue; the next green run closes it.
 # - PRs: run only when the 'run-ci' label is applied, for every contributor.
 #   Applying the label is the trigger, so new commits need a new trigger:
 #   @flashinfer-bot run.
@@ -20,8 +25,9 @@
 name: PR Test
 
 on:
-  push:
-    branches: [main]
+  # Off the 00:00 UTC nightly-release slot; one run per Asia / EU / US workday.
+  schedule:
+    - cron: '0 4,12,20 * * *'
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, labeled, ready_for_review]
@@ -39,8 +45,11 @@ on:
 concurrency:
   # A label other than run-ci can never start tests, so it gets its own group and
   # does not cancel - otherwise label churn would discard running GPU jobs.
-  group: pr-test-${{ github.ref }}${{ (github.event.action == 'labeled' && github.event.label.name != 'run-ci') && '-noop' || '' }}
-  cancel-in-progress: ${{ !(github.event.action == 'labeled' && github.event.label.name != 'run-ci') }}
+  # Scheduled runs on main get their own group and never cancel each other: at
+  # most one runs and one waits, so a slow run delays the next instead of wasting
+  # itself.
+  group: pr-test-${{ github.event_name == 'schedule' && 'scheduled-' || '' }}${{ github.ref }}${{ (github.event.action == 'labeled' && github.event.label.name != 'run-ci') && '-noop' || '' }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' && !(github.event.action == 'labeled' && github.event.label.name != 'run-ci') }}
 
 permissions:
   contents: read
@@ -69,7 +78,7 @@ jobs:
           EVENT_ACTION: ${{ github.event.action }}
           LABEL_NAME: ${{ github.event.label.name }}
         run: |
-          # Always allow push to main and workflow_dispatch
+          # Always allow scheduled runs on main and workflow_dispatch
           if [[ "${{ github.event_name }}" != "pull_request" ]]; then
             echo "authorized=true" >> "$GITHUB_OUTPUT"
             echo "Not a PR, authorized"
@@ -349,6 +358,8 @@ jobs:
   # them on the first failure. As separate jobs, fail-fast is scoped per group
   # and the other groups keep running on billed on-demand capacity long after
   # the result is known. Entries still start in parallel; nothing is serialized.
+  # Scheduled runs on main turn fail-fast off: they exist to report every broken
+  # lane, not the first one.
   # ---------------------------------------------------------------------------
   test:
     name: ${{ matrix.name }}
@@ -360,7 +371,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
-      fail-fast: true
+      fail-fast: ${{ github.event_name != 'schedule' }}
       matrix: ${{ fromJSON(needs.setup.outputs.test_matrix) }}
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
@@ -924,3 +935,41 @@ jobs:
           # cancelled test means "stopped early", not "flaky".
           echo "Result: Tests Failed" >> $GITHUB_STEP_SUMMARY
           exit 1
+
+  # ---------------------------------------------------------------------------
+  # Report scheduled main results - one open tracking issue while main is red
+  # ---------------------------------------------------------------------------
+  report-main-status:
+    name: Report Main Status
+    if: github.event_name == 'schedule' && !cancelled()
+    needs: [test-results-summary]
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RESULT: ${{ needs.test-results-summary.result }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      SHA: ${{ github.sha }}
+      TITLE: "Scheduled PR Test is failing on main"
+    steps:
+      - name: Open, update or close the tracking issue
+        run: |
+          ISSUE=$(gh issue list --state open --search "in:title \"$TITLE\"" \
+            --json number,title --jq "map(select(.title == \"$TITLE\"))[0].number // empty")
+
+          if [ "$RESULT" == "success" ]; then
+            if [ -n "$ISSUE" ]; then
+              gh issue close "$ISSUE" --comment "Green again at $SHA: $RUN_URL"
+            fi
+            exit 0
+          fi
+
+          BODY="Scheduled run on \`$SHA\` failed: $RUN_URL"
+          if [ -n "$ISSUE" ]; then
+            gh issue comment "$ISSUE" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" \
+              --body "$BODY. This issue gets a comment per failed run and closes on the next green one."
+          fi
