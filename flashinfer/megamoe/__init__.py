@@ -105,7 +105,8 @@ def _run_kernel(factory, entry, plan, y, w1, w2, b, m, stats, gs1, gs2):
 class MegaMoESymmBuffer:
     """Allocate symmetric input, expert-token and output-combine storage.
 
-    All ranks must use identical geometry and invoke kernels in matching order.
+    All ranks must use identical geometry and invoke kernels in matching order,
+    with the same token count on every rank (the plan is selected from it).
     Allocation and rendezvous are collective and must precede CUDA graph capture.
 
     Parameters
@@ -251,7 +252,8 @@ class MegaMoESymmBuffer:
             FP32 routing weights with shape ``[tokens, num_topk]``.
 
         All tensors must be on the buffer's CUDA device. The token count must
-        be positive and fit the allocated capacity.
+        be positive and fit the allocated capacity. Every rank must stage the
+        same token count; pad short ranks with rows routed to -1.
         """
         m = x_fp8.shape[0]
         for tensor, shape, dtype in (
@@ -286,7 +288,8 @@ class MegaMoESymmBuffer:
         Parameters
         ----------
         num_tokens : int
-            Number of staged rows; positive and at most the buffer capacity.
+            Number of staged rows; positive, at most the buffer capacity, and
+            equal on every rank (pad short ranks with rows routed to -1).
         """
         if self.buffer is None:
             raise ValueError("symmetric buffer has been destroyed")
@@ -387,7 +390,10 @@ def nvfp4_mega_moe(
     symm_buffer : MegaMoESymmBuffer
         Buffer populated by :meth:`MegaMoESymmBuffer.stage` on every rank.
     num_tokens : int, optional
-        Tokens on this rank. Defaults to ``y.shape[0]``.
+        Tokens on this rank. Defaults to ``y.shape[0]``. Must be equal on every
+        rank: the kernel family, tile and dispatch mode are selected from it, and
+        all ranks must launch the same kernel. Pad short ranks with rows routed
+        to -1.
     cumulative_local_expert_recv_stats : torch.Tensor, optional
         INT32 vector with one entry per local expert. Receive counts are
         accumulated in place; initialize the vector before first use.
@@ -551,7 +557,10 @@ def mxfp4_mega_moe(
     symm_buffer : MegaMoESymmBuffer
         Buffer populated by :meth:`MegaMoESymmBuffer.stage` on every rank.
     num_tokens : int, optional
-        Tokens on this rank. Defaults to ``y.shape[0]``.
+        Tokens on this rank. Defaults to ``y.shape[0]``. Must be equal on every
+        rank: the kernel family, tile and dispatch mode are selected from it, and
+        all ranks must launch the same kernel. Pad short ranks with rows routed
+        to -1.
     cumulative_local_expert_recv_stats : torch.Tensor, optional
         INT32 vector with one entry per local expert. Receive counts are
         accumulated in place; initialize the vector before first use.
