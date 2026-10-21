@@ -1745,15 +1745,35 @@ def _normalize_compile_target(func: Any, visited: set[int]) -> Any:
 
 def _explicit_spec_compile_target(func: Any) -> Any:
     if inspect.ismethod(func):
-        return ("method", _function_fingerprint(func.__func__))
+        instance_key = getattr(func.__self__, "__cache_key__", None)
+        # __cache_key__ may be a method (call it) or a property value.
+        if callable(instance_key):
+            instance_key = instance_key()
+        return (
+            "method",
+            _function_fingerprint(func.__func__),
+            None
+            if instance_key is None
+            else _structural_cache_key(instance_key, set()),
+        )
     if inspect.isfunction(func):
         return ("function", _function_fingerprint(func))
     if callable(func) and hasattr(func.__call__, "__func__"):
+        # The source fingerprint cannot distinguish instances whose variant
+        # identity lives in instance fields (kvarn record width / k_bits /
+        # v_bits) — every variant would share one disk-cache entry. Honor
+        # the instance's __cache_key__ when it provides one.
+        instance_key = getattr(func, "__cache_key__", None)
+        if callable(instance_key):
+            instance_key = instance_key()
         return (
             "callable_instance",
             type(func).__module__,
             type(func).__qualname__,
             _function_fingerprint(func.__call__.__func__),
+            None
+            if instance_key is None
+            else _structural_cache_key(instance_key, set()),
         )
     return ("callable", type(func).__module__, type(func).__qualname__)
 
@@ -1941,11 +1961,13 @@ def _structural_cache_key(value: Any, visited: set[int] | None = None) -> Any:
 
     cache_key_attr = getattr(value, "__cache_key__", None)
     if cache_key_attr is not None:
+        # __cache_key__ may be a method (called for the key) or a plain value.
+        key_value = cache_key_attr() if callable(cache_key_attr) else cache_key_attr
         return (
             "cache_key",
             type_module,
             type_name,
-            _structural_cache_key(cache_key_attr, visited),
+            _structural_cache_key(key_value, visited),
         )
 
     object_id = id(value)

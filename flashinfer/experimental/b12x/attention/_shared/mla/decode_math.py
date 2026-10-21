@@ -262,6 +262,10 @@ def _st_shared_u16(
 # ── DSV4 QK-path compile-time geometry (one CTA, one chunk) ──────────────────
 _FP8_MAX = 448.0
 _FP8_MIN = -448.0
+# KVarN reserved per-tile tail region (see _kvarn_writer._TILE_TAIL_BYTES):
+# 3072B of [S_c | rt_scale | rt_zp] fp16 x 512 plus slack; sized so
+# tile_stride = group*record_bytes + this is an exact multiple of the 8448B
+# C4 page (256*536 + 6400 = 143616 = 17 * 8448).
 # NVFP4 MLA latent record geometry inside the staged 288-byte smem row:
 # 256B packed E2M1 data, then 32 E4M3 group-16 scale bytes at offset 256.
 _NVFP4_SCALE_OFFSET = 256
@@ -719,9 +723,19 @@ def s1_qk_nope_block_scaled(
     q_nope_stride: cutlass.Constexpr,  # 464
     kv_smem_stride: cutlass.Constexpr,  # 464
     scale_bytes_per_token: cutlass.Constexpr,  # 8
-    scale_format: cutlass.Constexpr = 0,  # ScaleFormat.UE8M0_BYTE (0) / ARBITRARY_FP32 (1)
+    scale_format: cutlass.Constexpr = 0,  # UE8M0_BYTE (0) / ARBITRARY_FP32 (1) / KVARN_DUAL (3)
     valid_hpb: cutlass.Constexpr = 16,
     latent_scale_per_token: cutlass.Constexpr = False,  # NVFP4_E4M3 only
+    kvarn_k_bits: cutlass.Constexpr = 0,
+    kvarn_record_bytes: cutlass.Constexpr = 0,
+    kvarn_k_code_bytes: cutlass.Constexpr = 0,
+    kvarn_v_code_bytes: cutlass.Constexpr = 0,
+    kv_cache_u8: cute.Tensor = None,
+    tok_idx_base_addr: Int32 = Int32(0),
+    kv_block_stride: Int64 = Int64(0),
+    kv_entry_stride: Int64 = Int64(0),
+    kvarn_group: cutlass.Constexpr = 256,
+    kvarn_page_tokens: cutlass.Constexpr = 256,
 ):
     """S1: accumulate Q_nope . K_nope into qk[0..3] via NUM_SCALES*(QUANT_TILE/32)
     block-scaled MMAs (14 DSV4 / 16 GLM).
@@ -770,6 +784,27 @@ def s1_qk_nope_block_scaled(
             kv_smem_stride=kv_smem_stride,
             latent_scale_per_token=latent_scale_per_token,
             kv_sc_base_addr=kv_sc_base_addr,
+        )
+
+    if cutlass.const_expr(scale_format == 3):
+        return s1_qk_nope_kvarn_bf16(
+            qk,
+            q_fp8_base_addr,
+            kv_fp8_base_addr,
+            warp_first_cand,
+            lane,
+            k_bits=kvarn_k_bits,
+            record_bytes=kvarn_record_bytes,
+            k_code_bytes=kvarn_k_code_bytes,
+            v_code_bytes=kvarn_v_code_bytes,
+            quant_tile=quant_tile,
+            q_nope_bf16_stride=q_nope_stride,
+            kv_cache_u8=kv_cache_u8,
+            tok_idx_base=tok_idx_base_addr,
+            block_stride=kv_block_stride,
+            entry_stride=kv_entry_stride,
+            group=kvarn_group,
+            page_tokens=kvarn_page_tokens,
         )
 
     gid = lane >> Int32(2)
@@ -949,6 +984,158 @@ def s1_qk_nope_nvfp4_bf16(
                 b1,
             )
     return qk
+
+
+@cute.jit
+def s1_qk_nope_kvarn_bf16(
+    qk,
+    q_nope_bf16_base_addr: Int32,
+    kv_base_addr: Int32,
+    warp_first_cand: Int32,
+    lane: Int32,
+    *,
+    k_bits: cutlass.Constexpr,
+    record_bytes: cutlass.Constexpr,
+    k_code_bytes: cutlass.Constexpr,
+    v_code_bytes: cutlass.Constexpr,
+    quant_tile: cutlass.Constexpr,  # 64-dim MMA steps
+    q_nope_bf16_stride: cutlass.Constexpr,  # 520 elems
+    kv_cache_u8: cute.Tensor,
+    tok_idx_base: Int32,
+    block_stride: Int64,
+    entry_stride: Int64,
+    group: cutlass.Constexpr,
+    page_tokens: cutlass.Constexpr,
+):
+    """S1 (KVarN): BF16 QK-NoPE over in-register dequantized dual-rate codes.
+
+    Mirrors :func:`s1_qk_nope_nvfp4_bf16`; the per-pair dequant reads the
+    record's k_row_scale (smem) and the page tail's per-channel S_c /
+    rt_scale / rt_zp (gmem via the kv_sc-staged tail address).
+    """
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+    kv_gid_row = warp_first_cand + gid
+    # Raw slot index (io clamps the addressing copy to 0; the validity mask
+    # handles -1), hoisted per candidate row.
+    # io stages -1 for invalid entries; ld.shared.u32 yields an UNSIGNED bit
+    # pattern, so reinterpret as Int32 BEFORE the clamp (an unsigned max lets
+    # 0xFFFFFFFF through as slot ~4e9 -> wild page-tail address).
+    slot = Int64(
+        max(Int32(ld_shared_u32(tok_idx_base + kv_gid_row * Int32(4))), Int32(0))
+    )
+
+    for blk in cutlass.range_constexpr(512 // quant_tile):
+        for ks in cutlass.range_constexpr(quant_tile // 16):
+            ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(16)
+            b0 = _kvarn_k_pair_bf16(
+                kv_base_addr,
+                kv_gid_row,
+                ko + tid * Int32(2),
+                bits=k_bits,
+                record_bytes=record_bytes,
+                k_code_bytes=k_code_bytes,
+                v_code_bytes=v_code_bytes,
+            )
+            b1 = _kvarn_k_pair_bf16(
+                kv_base_addr,
+                kv_gid_row,
+                ko + tid * Int32(2) + Int32(8),
+                bits=k_bits,
+                record_bytes=record_bytes,
+                k_code_bytes=k_code_bytes,
+                v_code_bytes=v_code_bytes,
+            )
+            a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (ko + a_col) * Int32(2)
+            a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+                _smem_byte(q_nope_bf16_base_addr, a_byte)
+            )
+            qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(
+                qk[0],
+                qk[1],
+                qk[2],
+                qk[3],
+                a0,
+                a1,
+                a2,
+                a3,
+                b0,
+                b1,
+            )
+    return qk
+
+
+@cute.jit
+def s1_qk_nope_kvarn_bf16_mg2(
+    qk0,
+    qk1,
+    q_nope_bf16_g0_addr: Int32,
+    q_nope_bf16_g1_addr: Int32,
+    kv_base_addr: Int32,
+    warp_first_cand: Int32,
+    lane: Int32,
+    *,
+    num_scales: cutlass.Constexpr,  # 8 = 512 / 64 BF16 K steps
+    quant_tile: cutlass.Constexpr,  # 64
+    q_nope_bf16_stride: cutlass.Constexpr,  # 520 elems
+    kv_smem_stride: cutlass.Constexpr,  # = record_bytes (536/600/648)
+    n_hg: cutlass.Constexpr = 2,
+    k_bits: cutlass.Constexpr,
+    k_code_bytes: cutlass.Constexpr,
+    v_code_bytes: cutlass.Constexpr,
+):
+    """S1 (KVarN, MG): BF16 QK-NoPE, MG two-group packing.
+
+    Same MMA packing as ``prefill_mg.s1_qk_nope_nvfp4_bf16_mg2``; the K/B
+    operand is the KVarN record pair (``_kvarn_k_pair_bf16``): codes read
+    from the staged record, dequantized with the record's inline fp16
+    k_scale/k_zp (``code * scale + zp``) -- the same math as the validated
+    KVarN decode arm ``s1_qk_nope_kvarn_bf16``. No rope term: KVarN records
+    carry no RoPE payload (d_rope == 0).
+    """
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+    kv_gid_row = warp_first_cand + gid
+    for blk in cutlass.range_constexpr(num_scales):
+        for ks in cutlass.range_constexpr(quant_tile // 16):
+            ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(16)
+            b0 = _kvarn_k_pair_bf16(
+                kv_base_addr,
+                kv_gid_row,
+                ko + tid * Int32(2),
+                bits=k_bits,
+                record_bytes=kv_smem_stride,
+                k_code_bytes=k_code_bytes,
+                v_code_bytes=v_code_bytes,
+            )
+            b1 = _kvarn_k_pair_bf16(
+                kv_base_addr,
+                kv_gid_row,
+                ko + tid * Int32(2) + Int32(8),
+                bits=k_bits,
+                record_bytes=kv_smem_stride,
+                k_code_bytes=k_code_bytes,
+                v_code_bytes=v_code_bytes,
+            )
+            a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (ko + a_col) * Int32(2)
+            a00, a01, a02, a03 = ldmatrix_m8n8x4_b16(
+                _smem_byte(q_nope_bf16_g0_addr, a_byte)
+            )
+            qk0[0], qk0[1], qk0[2], qk0[3] = mma_m16n8k16_f32_bf16(
+                qk0[0], qk0[1], qk0[2], qk0[3], a00, a01, a02, a03, b0, b1
+            )
+            if cutlass.const_expr(n_hg == 2):
+                a10, a11, a12, a13 = ldmatrix_m8n8x4_b16(
+                    _smem_byte(q_nope_bf16_g1_addr, a_byte)
+                )
+                qk1[0], qk1[1], qk1[2], qk1[3] = mma_m16n8k16_f32_bf16(
+                    qk1[0], qk1[1], qk1[2], qk1[3], a10, a11, a12, a13, b0, b1
+                )
+    return qk0, qk1
 
 
 @cute.jit
@@ -1641,6 +1828,169 @@ def _nvfp4_scalar_bf16_u16(
     return _bf16x2_extract_lane_u16(pair, dim & Int32(1))
 
 
+# ---------------------------------------------------------------------------
+# KVarN dual-rate records (kvarn_mla_k*v*_g256; frozen layout in
+# vllm/v1/attention/ops/kvarn_mla.py). The record is staged verbatim into the
+# kv_fp8 smem row (kv_smem_stride == record_bytes); kv_sc holds the per-entry
+# PAGE TAIL gmem address (2 x u32, staged by the io gather). Tail layout,
+# fp16 x 512 each: [0:512) VarN S_c, [512:1024) per-channel RTN scale,
+# [1024:1536) per-channel RTN zero-point.
+#   k_hat[c] = (k_code[c] * rt_scale[c] + rt_zp[c]) * S_c[c] * S_r
+#   v_hat[c] = (v_code[c] * v_scale + v_zp) * S_c[c] * S_r
+# ---------------------------------------------------------------------------
+
+
+@cute.jit
+def _kvarn_code_u32(
+    kv_base_addr: Int32,
+    entry: Int32,
+    elem: Int32,
+    *,
+    bits: cutlass.Constexpr,
+    code_off: cutlass.Constexpr,
+    kv_smem_stride: cutlass.Constexpr,
+) -> Int32:
+    # (kv_base_addr anchors the staged-records smem region; see word_addr.)
+    """Extract the ``bits``-wide code of element ``elem`` from the smem record.
+
+    LSB-first dense little-endian stream, exactly like
+    ``pack_bits``/``unpack_bits`` in the vLLM reference codec. The containing
+    aligned u32 word is read (5-bit codes start at odd bytes; u16 smem loads
+    require 2-byte alignment). The read stays within the record + 3 bytes:
+    512*bits is a multiple of 8 and the code area start is 4B-aligned.
+    """
+    pos = elem * Int32(bits)
+    byte = code_off + pos // Int32(8)
+    word_addr = kv_base_addr + entry * Int32(kv_smem_stride) + byte - (byte & Int32(3))
+    word = ld_shared_u32(word_addr)
+    shift = ((byte & Int32(3)) * Int32(8) + pos % Int32(8)).to(Uint32)
+    # A ``bits``-wide code can span two u32 words (5e mod 32 + 5 > 32); merge
+    # the next word's low bits. The +4 read may overrun the record end by <=3
+    # bytes (masked out) — within the staged row's allocation except the very
+    # last record of the pool (2-3 bytes into the adjacent pool allocation).
+    value = word >> shift
+    if cutlass.const_expr(bits > 1):
+        nxt = ld_shared_u32(word_addr + Int32(4))
+        value = value | (nxt << (Uint32(32) - shift))
+    return (value & Uint32((1 << bits) - 1)).to(Int32)
+
+
+@cute.jit
+def _kvarn_f16_at_smem(base_addr: Int32, byte_off: Int32) -> Float32:
+    raw = _ld_u16_zext(base_addr, byte_off)
+    lo, _hi = f16x2_to_f32x2(raw)
+    return lo
+
+
+@cute.jit
+def _kvarn_k_pair_bf16(
+    kv_base_addr: Int32,
+    entry: Int32,
+    dim_even: Int32,
+    *,
+    bits: cutlass.Constexpr,
+    record_bytes: cutlass.Constexpr,
+    k_code_bytes: cutlass.Constexpr,
+    v_code_bytes: cutlass.Constexpr,
+) -> Uint32:
+    """Dequant two adjacent K channels to bf16x2 (score path).
+
+    Per-token record layout: [k_codes|v_codes|k_scale|k_zp|v_scale|v_zp]
+    (fp16 each, all inline) -- no tile-tail reads.
+    """
+    c0 = _kvarn_code_u32(
+        kv_base_addr,
+        entry,
+        dim_even,
+        bits=bits,
+        code_off=0,
+        kv_smem_stride=record_bytes,
+    )
+    c1 = _kvarn_code_u32(
+        kv_base_addr,
+        entry,
+        dim_even + Int32(1),
+        bits=bits,
+        code_off=0,
+        kv_smem_stride=record_bytes,
+    )
+    rec = kv_base_addr + entry * Int32(record_bytes)
+    scale_base = k_code_bytes + v_code_bytes
+    k_scale = _kvarn_f16_at_smem(rec, Int32(scale_base + 0))
+    k_zp = _kvarn_f16_at_smem(rec, Int32(scale_base + 2))
+    v0 = c0.to(Float32) * k_scale + k_zp
+    v1 = c1.to(Float32) * k_scale + k_zp
+    return pack_f32x2_to_bfloat2(v0, v1)
+
+
+@cute.jit
+def _kvarn_v_pair_bf16(
+    kv_base_addr: Int32,
+    entry: Int32,
+    dim_even: Int32,
+    *,
+    k_bits: cutlass.Constexpr,
+    v_bits: cutlass.Constexpr,
+    record_bytes: cutlass.Constexpr,
+    k_code_bytes: cutlass.Constexpr,
+    v_code_bytes: cutlass.Constexpr,
+) -> Uint32:
+    """Dequant two adjacent V channels to bf16x2 (value path).
+
+    Single-plane records (``v_bits == 0``) carry no v_codes plane: the value
+    path reads the SHARED k_codes with the k scale/zero-point (one RTN grid,
+    both attention paths consume the same dequantized latent).
+    """
+    if cutlass.const_expr(v_bits == 0):
+        c0 = _kvarn_code_u32(
+            kv_base_addr,
+            entry,
+            dim_even,
+            bits=k_bits,
+            code_off=0,
+            kv_smem_stride=record_bytes,
+        )
+        c1 = _kvarn_code_u32(
+            kv_base_addr,
+            entry,
+            dim_even + Int32(1),
+            bits=k_bits,
+            code_off=0,
+            kv_smem_stride=record_bytes,
+        )
+        rec = kv_base_addr + entry * Int32(record_bytes)
+        scale_base = k_code_bytes + v_code_bytes
+        k_scale = _kvarn_f16_at_smem(rec, Int32(scale_base + 0))
+        k_zp = _kvarn_f16_at_smem(rec, Int32(scale_base + 2))
+        v0 = c0.to(Float32) * k_scale + k_zp
+        v1 = c1.to(Float32) * k_scale + k_zp
+        return pack_f32x2_to_bfloat2(v0, v1)
+    code_off = k_code_bytes
+    c0 = _kvarn_code_u32(
+        kv_base_addr,
+        entry,
+        dim_even,
+        bits=v_bits,
+        code_off=code_off,
+        kv_smem_stride=record_bytes,
+    )
+    c1 = _kvarn_code_u32(
+        kv_base_addr,
+        entry,
+        dim_even + Int32(1),
+        bits=v_bits,
+        code_off=code_off,
+        kv_smem_stride=record_bytes,
+    )
+    rec = kv_base_addr + entry * Int32(record_bytes)
+    scale_base = k_code_bytes + v_code_bytes
+    v_scale = _kvarn_f16_at_smem(rec, Int32(scale_base + 4))
+    v_zp = _kvarn_f16_at_smem(rec, Int32(scale_base + 6))
+    v0 = c0.to(Float32) * v_scale + v_zp
+    v1 = c1.to(Float32) * v_scale + v_zp
+    return pack_f32x2_to_bfloat2(v0, v1)
+
+
 @cute.jit
 def _ue8m0_byte_to_fp32(byte: Uint32) -> Float32:
     """value = 2^(byte - 127) -- scale_convert.cuh ue8m0_to_fp32 (the V-scale).
@@ -2069,6 +2419,17 @@ def s6_xv_nope(
     sm_p_stride: cutlass.Constexpr = 0,  # NVFP4: bf16 elems per sm_p row (0 -> BI)
     latent_scale_per_token: cutlass.Constexpr = False,  # NVFP4_E4M3 only
     w_fp8_bufs: cutlass.Constexpr = 2,  # W staging buffers (GLM two-pass: 2 or 4)
+    kvarn_k_bits: cutlass.Constexpr = 0,
+    kvarn_v_bits: cutlass.Constexpr = 0,
+    kvarn_record_bytes: cutlass.Constexpr = 0,
+    kvarn_k_code_bytes: cutlass.Constexpr = 0,
+    kvarn_v_code_bytes: cutlass.Constexpr = 0,
+    kv_cache_u8: cute.Tensor = None,
+    tok_idx_base_addr: Int32 = Int32(0),
+    kv_block_stride: Int64 = Int64(0),
+    kv_entry_stride: Int64 = Int64(0),
+    kvarn_group: cutlass.Constexpr = 256,
+    kvarn_page_tokens: cutlass.Constexpr = 256,
 ):
     """S6: accumulate W . V_nope into acc_nope[vc*NT+nt][0..3] via PLAIN fp8 MMAs
     (14 DSV4 / 16 GLM = N_V_CHUNKS * NT_PER_WARP_XV * (BI/32)).
@@ -2124,6 +2485,32 @@ def s6_xv_nope(
             sm_p_stride=(sm_p_stride if sm_p_stride else bi),
             latent_scale_per_token=latent_scale_per_token,
             kv_sc_base_addr=kv_sc_base_addr,
+        )
+
+    if cutlass.const_expr(scale_format == 3):
+        return s6_xv_nope_kvarn_bf16(
+            acc_nope,
+            sm_p_full_addr,
+            kv_fp8_base_addr,
+            warp_id,
+            lane,
+            k_bits=kvarn_k_bits,
+            v_bits=kvarn_v_bits,
+            record_bytes=kvarn_record_bytes,
+            k_code_bytes=kvarn_k_code_bytes,
+            v_code_bytes=kvarn_v_code_bytes,
+            n_v_chunks=n_v_chunks,
+            v_chunk=v_chunk,
+            bi=bi,
+            n_warps=n_warps,
+            nt_per_warp_xv=nt_per_warp_xv,
+            sm_p_stride=(sm_p_stride if sm_p_stride else bi),
+            kv_cache_u8=kv_cache_u8,
+            tok_idx_base=tok_idx_base_addr,
+            block_stride=kv_block_stride,
+            entry_stride=kv_entry_stride,
+            group=kvarn_group,
+            page_tokens=kvarn_page_tokens,
         )
 
     bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
@@ -2489,6 +2876,124 @@ def s6_xv_nope_nvfp4_bf16(
                     kv_smem_stride=kv_smem_stride,
                     latent_scale_per_token=latent_scale_per_token,
                     kv_sc_base_addr=kv_sc_base_addr,
+                )
+                peer0 = cute.arch.shuffle_sync_bfly(pair0, offset=4)
+                peer8 = cute.arch.shuffle_sync_bfly(pair8, offset=4)
+                b0 = byte_perm(pair0, peer0, pair_selector)
+                b1 = byte_perm(pair8, peer8, pair_selector)
+                xv0, xv1, xv2, xv3 = mma_m16n8k16_f32_bf16(
+                    xv0,
+                    xv1,
+                    xv2,
+                    xv3,
+                    a0,
+                    a1,
+                    a2,
+                    a3,
+                    b0,
+                    b1,
+                )
+            at = vc * nt_per_warp_xv + nt
+            acc_nope[at][0] = acc_nope[at][0] + xv0
+            acc_nope[at][1] = acc_nope[at][1] + xv1
+            acc_nope[at][2] = acc_nope[at][2] + xv2
+            acc_nope[at][3] = acc_nope[at][3] + xv3
+    return acc_nope
+
+
+@cute.jit
+def s6_xv_nope_kvarn_bf16(
+    acc_nope,
+    sm_p_full_addr: Int32,
+    kv_base_addr: Int32,
+    warp_id: Int32,
+    lane: Int32,
+    *,
+    k_bits: cutlass.Constexpr,
+    v_bits: cutlass.Constexpr,
+    record_bytes: cutlass.Constexpr,
+    k_code_bytes: cutlass.Constexpr,
+    v_code_bytes: cutlass.Constexpr,
+    n_v_chunks: cutlass.Constexpr,  # 8
+    v_chunk: cutlass.Constexpr,  # 64
+    bi: cutlass.Constexpr,  # 64
+    n_warps: cutlass.Constexpr,  # 8
+    nt_per_warp_xv: cutlass.Constexpr,  # 1
+    sm_p_stride: cutlass.Constexpr = 0,  # bf16 elems per sm_p row (0 -> BI)
+    kv_cache_u8: cute.Tensor = None,
+    tok_idx_base: Int32 = Int32(0),
+    block_stride: Int64 = Int64(0),
+    entry_stride: Int64 = Int64(0),
+    group: cutlass.Constexpr = 256,
+    page_tokens: cutlass.Constexpr = 256,
+):
+    """S6 (KVarN): BF16 P.V over in-register dequantized dual-rate V codes.
+
+    Mirrors :func:`s6_xv_nope_nvfp4_bf16`; each pair dequant applies the
+    candidate's per-token scales (smem record) and page-tail S_c (gmem).
+    """
+    p_stride = cutlass.const_expr(sm_p_stride if sm_p_stride else bi)
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    entry_parity = gid & Int32(1)
+    pair_selector = Int32(0x5410 if entry_parity == Int32(0) else 0x3276)
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+    for vc in cutlass.range_constexpr(n_v_chunks):
+        for nt in cutlass.range_constexpr(nt_per_warp_xv):
+            dim_base = Int32(vc) * Int32(v_chunk) + (
+                Int32(nt) * Int32(n_warps) + warp_id
+            ) * Int32(8)
+            col = dim_base + gid
+            xv0 = Float32(0.0)
+            xv1 = Float32(0.0)
+            xv2 = Float32(0.0)
+            xv3 = Float32(0.0)
+            for ks in cutlass.range_constexpr(bi // 16):
+                k_base = Int32(ks) * Int32(16)
+                a_byte = (a_row * Int32(p_stride) + (k_base + a_col)) * Int32(2)
+                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sm_p_full_addr + a_byte)
+                ent0 = k_base + tid * Int32(2)
+                slot0 = Int64(
+                    max(
+                        Int32(
+                            ld_shared_u32(
+                                tok_idx_base + (ent0 + entry_parity) * Int32(4)
+                            )
+                        ),
+                        Int32(0),
+                    )
+                )
+                slot8 = Int64(
+                    max(
+                        Int32(
+                            ld_shared_u32(
+                                tok_idx_base
+                                + (ent0 + Int32(8) + entry_parity) * Int32(4)
+                            )
+                        ),
+                        Int32(0),
+                    )
+                )
+                pair0 = _kvarn_v_pair_bf16(
+                    kv_base_addr,
+                    ent0 + entry_parity,
+                    col & ~Int32(1),
+                    k_bits=k_bits,
+                    v_bits=v_bits,
+                    record_bytes=record_bytes,
+                    k_code_bytes=k_code_bytes,
+                    v_code_bytes=v_code_bytes,
+                )
+                pair8 = _kvarn_v_pair_bf16(
+                    kv_base_addr,
+                    ent0 + Int32(8) + entry_parity,
+                    col & ~Int32(1),
+                    k_bits=k_bits,
+                    v_bits=v_bits,
+                    record_bytes=record_bytes,
+                    k_code_bytes=k_code_bytes,
+                    v_code_bytes=v_code_bytes,
                 )
                 peer0 = cute.arch.shuffle_sync_bfly(pair0, offset=4)
                 peer8 = cute.arch.shuffle_sync_bfly(pair8, offset=4)

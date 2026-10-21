@@ -17,7 +17,7 @@ from b12x.attention.dsa_indexer.scratch import (
     B12XIndexerPagedScratchCaps,
     plan_indexer_paged_scratch,
 )
-from b12x.attention.dsa_indexer.tiled_topk import run_tiled_topk
+from b12x.attention.dsa_indexer.tiled_topk import _TIE_BREAK_EPS, run_tiled_topk
 
 
 def _make_real_page_table(
@@ -79,9 +79,15 @@ def _expected_paged_index_topk(
         ),
         seqlens_per_query=seqlens,
     )
-    raw = torch.topk(logits, k=topk, dim=1, largest=True, sorted=False).indices.to(
-        torch.int32
+    # Mirror the kernel's key-only tie-break so boundary ties resolve to the
+    # same candidates (higher logical token index wins); logits are unperturbed.
+    tie = (
+        torch.arange(logits.shape[1], device=logits.device, dtype=torch.float32)
+        * _TIE_BREAK_EPS
     )
+    raw = torch.topk(
+        logits + tie, k=topk, dim=1, largest=True, sorted=False
+    ).indices.to(torch.int32)
     return raw
 
 

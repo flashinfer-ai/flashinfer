@@ -105,6 +105,7 @@ from b12x._lib.intrinsics import (
     st_global_u8,
 )
 from b12x._lib.utils import current_cuda_stream
+from b12x.attention._shared.mla.traits import KVARN_RECORD_VARIANTS
 
 _KV_LORA_RANK = 512
 _PE_DIM = 64
@@ -806,13 +807,14 @@ def _validate_glm_next_mla_cache_writer_args(
     if kv_c.dtype != torch.bfloat16:
         raise TypeError(f"kv_c must be BF16, got {kv_c.dtype}")
     record_bytes = int(kv_cache.shape[2]) if kv_cache.ndim == 3 else -1
-    if kv_cache.ndim != 3 or record_bytes not in (
+    allowed_record_bytes = (
         _GLM_NEXT_RECORD_BYTES,
         _GLM_NEXT_NVFP4_RECORD_BYTES,
-    ):
+    ) + tuple(KVARN_RECORD_VARIANTS)
+    if kv_cache.ndim != 3 or record_bytes not in allowed_record_bytes:
         raise ValueError(
-            "kv_cache must be (num_pages, page_size, "
-            f"{_GLM_NEXT_RECORD_BYTES}|{_GLM_NEXT_NVFP4_RECORD_BYTES}) uint8, "
+            "kv_cache must be (num_pages, page_size, one of "
+            f"{sorted(allowed_record_bytes)}) uint8, "
             f"got {tuple(kv_cache.shape)}"
         )
     num_pages = int(kv_cache.shape[0])

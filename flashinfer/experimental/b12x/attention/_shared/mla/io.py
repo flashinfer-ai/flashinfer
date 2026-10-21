@@ -50,6 +50,7 @@ from b12x._lib.intrinsics import (
     cp_async_bulk_g2s_mbar,
     cvt_e4m3_to_f32_via_f16,
     get_ptr_as_int64,
+    ld_global_nc_u32,
     ld_global_nc_v4_u32,
     ld_global_nc_v2_u32,
     pack_f32x2_to_f16x2,
@@ -228,6 +229,11 @@ def io_issue_gather(
     io_threads: cutlass.Constexpr = _IO_THREADS,  # 32 (decode 1 IO warp) / 128 (prefill 4 IO warps)
     packed_glm: cutlass.Constexpr = False,
     packed_dsv4: cutlass.Constexpr = False,
+    kvarn: cutlass.Constexpr = False,
+    kvarn_record_bytes: cutlass.Constexpr = 0,
+    kvarn_group: cutlass.Constexpr = 0,
+    kvarn_tile_stride: cutlass.Constexpr = 0,
+    tail_fp8: cutlass.Constexpr = False,
     split_mbar_arrival: cutlass.Constexpr = False,
     overlap_footer_gather: cutlass.Constexpr = False,
     per_token_latent_scale: cutlass.Constexpr = False,
@@ -311,6 +317,23 @@ def io_issue_gather(
         _NOPE = Int32(_GLM_NOPE_SCALE_BYTES)  # 528 nope+inline-fp32 -> kv_fp8
         _ROPE = Int32(_GLM_ROPE_BYTES if rope_smem_stride else 0)
         _ROPE_SRC = Int64(_GLM_NOPE_SCALE_BYTES)  # rope follows nope+scales
+    if cutlass.const_expr(kvarn):
+        # KVarN dual-rate record: one contiguous gmem record per token
+        # (k_codes + v_codes + per-token scales), staged verbatim; page-tail
+        # scales are read from gmem at dequant time.
+        _IOS = Int64(kvarn_record_bytes)
+        _NOPE = Int32(kvarn_record_bytes)
+        _ROPE = Int32(0)
+        _ROPE_SRC = Int64(kvarn_record_bytes)
+    if cutlass.const_expr(tail_fp8):
+        # Precision-tail arm: GLM fp8 record content (512 E4M3 + 16B inline
+        # fp32 scales = 528B) living in a 536B-stride kvarn pool. Copy the
+        # 528B content [0,528); the 8B pad [528,536) is never read. The 536B
+        # row stride is not 16B-aligned, so this arm scalar-stages (no bulk).
+        _IOS = Int64(536)
+        _NOPE = Int32(528)
+        _ROPE = Int32(0)
+        _ROPE_SRC = Int64(528)
     _FOOT = Int32(scale_bytes_per_token)
 
     def _issue_payload_entry(entry: Int32, idx_raw: Int32):
@@ -320,10 +343,49 @@ def io_issue_gather(
             idx = Int32(0)
         block_idx = idx // _section_pbs
         local_idx = idx - block_idx * _section_pbs
-        data_base_off = Int64(block_idx) * _section_stride + Int64(local_idx) * _IOS
+        if cutlass.const_expr(kvarn):
+            # Per-tile layout: reserved tail region after each group of
+            # records (see _kvarn_writer._TILE_TAIL_BYTES) — records never
+            # overlap tails. tile_stride is an exact multiple of the 8448B
+            # C4 page. NOTE: unwrap Constexpr args with int() — wrapping a
+            # Constexpr in Int32 does not yield the value.
+            tile = local_idx // Int32(int(kvarn_group))
+            row = local_idx - tile * Int32(int(kvarn_group))
+            data_base_off = (
+                Int64(block_idx) * _section_stride
+                + Int64(tile) * Int64(int(kvarn_tile_stride))
+                + Int64(row) * _IOS
+            )
+        else:
+            data_base_off = Int64(block_idx) * _section_stride + Int64(local_idx) * _IOS
         data_base_i64 = get_ptr_as_int64(_section_kv, data_base_off)
 
-        if cutlass.const_expr(packed_glm):
+        if cutlass.const_expr(kvarn):
+            # Record width is 8B- but not 16B-aligned: cp.async.bulk is
+            # invalid, so copy u32 words with plain global->shared moves.
+            dst_row = kv_fp8_dst_addr + entry * Int32(kv_smem_stride)
+            for word in cutlass.range(kvarn_record_bytes // 4):
+                val = ld_global_nc_u32(data_base_i64 + Int64(word) * Int64(4))
+                st_shared_u32(dst_row + Int32(word) * Int32(4), val)
+        elif cutlass.const_expr(tail_fp8):
+            # 536B pool row stride is not 16B-aligned: scalar u32 copy of the
+            # 528B GLM fp8 content into the 528B smem row (132 words). A
+            # masked candidate (raw slot id < 0) stages a ZERO record, not
+            # slot 0: a kvarn pool's slot 0 holds a 4-bit record whose bytes
+            # are not a valid GLM fp8 record -- its fp32-interpreted scale
+            # words can be NaN, and the S3 softmax mask (exp(-1e30-m) -> 0)
+            # cannot protect 0 * NaN in the v accumulation. A zero record
+            # dequantizes to v = 0, so the masked weight contributes exactly
+            # zero.
+            dst_row = kv_fp8_dst_addr + entry * Int32(kv_smem_stride)
+            if idx_raw < Int32(0):
+                for word in cutlass.range(528 // 4):
+                    st_shared_u32(dst_row + Int32(word) * Int32(4), Uint32(0))
+            else:
+                for word in cutlass.range(528 // 4):
+                    val = ld_global_nc_u32(data_base_i64 + Int64(word) * Int64(4))
+                    st_shared_u32(dst_row + Int32(word) * Int32(4), val)
+        elif cutlass.const_expr(packed_glm):
             cp_async_bulk_g2s_mbar(
                 kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
                 data_base_i64,
@@ -366,13 +428,51 @@ def io_issue_gather(
                     idx = Int32(0)
                 block_idx = idx // _section_pbs
                 local_idx = idx - block_idx * _section_pbs
-                data_base_off = (
-                    Int64(block_idx) * _section_stride + Int64(local_idx) * _IOS
-                )
+                if cutlass.const_expr(kvarn):
+                    # Per-tile layout (see _issue_payload_entry): reserved
+                    # tail region after each group of records; unwrap
+                    # Constexpr args with int().
+                    tile = local_idx // Int32(int(kvarn_group))
+                    row = local_idx - tile * Int32(int(kvarn_group))
+                    data_base_off = (
+                        Int64(block_idx) * _section_stride
+                        + Int64(tile) * Int64(int(kvarn_tile_stride))
+                        + Int64(row) * _IOS
+                    )
+                else:
+                    data_base_off = (
+                        Int64(block_idx) * _section_stride + Int64(local_idx) * _IOS
+                    )
                 data_base_i64 = get_ptr_as_int64(_section_kv, data_base_off)
                 full_mbar_u32 = shared_ptr_to_u32(full_mbar_ptr)
 
-                if cutlass.const_expr(packed_glm):
+                if cutlass.const_expr(kvarn):
+                    dst_row = kv_fp8_dst_addr + entry * Int32(kv_smem_stride)
+                    for word in cutlass.range(kvarn_record_bytes // 4):
+                        val = ld_global_nc_u32(data_base_i64 + Int64(word) * Int64(4))
+                        st_shared_u32(dst_row + Int32(word) * Int32(4), val)
+                elif cutlass.const_expr(tail_fp8):
+                    # 536B pool row stride is not 16B-aligned: scalar u32 copy
+                    # of the 528B GLM fp8 content into the 528B smem row. A
+                    # masked candidate (raw slot id < 0) stages a ZERO record,
+                    # not slot 0: a kvarn pool's slot 0 holds a 4-bit record
+                    # whose bytes are not a valid GLM fp8 record -- its
+                    # fp32-interpreted scale words can be NaN, and the S3
+                    # softmax mask (exp(-1e30-m) -> 0) cannot protect
+                    # 0 * NaN in the v accumulation. A zero record
+                    # dequantizes to v = 0, so the masked weight contributes
+                    # exactly zero.
+                    dst_row = kv_fp8_dst_addr + entry * Int32(kv_smem_stride)
+                    if idx_raw < Int32(0):
+                        for word in cutlass.range(528 // 4):
+                            st_shared_u32(dst_row + Int32(word) * Int32(4), Uint32(0))
+                    else:
+                        for word in cutlass.range(528 // 4):
+                            val = ld_global_nc_u32(
+                                data_base_i64 + Int64(word) * Int64(4)
+                            )
+                            st_shared_u32(dst_row + Int32(word) * Int32(4), val)
+                elif cutlass.const_expr(packed_glm):
                     cp_async_bulk_g2s_mbar(
                         kv_fp8_dst_addr + entry * Int32(kv_smem_stride),
                         data_base_i64,
@@ -437,6 +537,7 @@ def io_issue_gather(
         st_shared_u32(kv_sc_dst_addr + overlap_s_byte, overlap_f0)
         st_shared_u32(kv_sc_dst_addr + overlap_s_byte + Int32(4), overlap_f1)
         cute.arch.fence_acq_rel_cta()
+        cute.arch.barrier(barrier_id=4, number_of_threads=io_threads)
         if (io_lane & Int32(31)) == Int32(0):
             cute.arch.mbarrier_arrive(full_mbar_ptr)
         return
@@ -529,10 +630,19 @@ def io_issue_gather(
     # == FlashInfer __threadfence_block() (issue_gather :281). try_wait.parity
     # has no implicit memory fence so this acq-rel is load-bearing.
     cute.arch.fence_acq_rel_cta()
+    cute.arch.barrier(barrier_id=4, number_of_threads=io_threads)
 
     # --- (3) Publish the footer stores, or start the conventional payload. ---
     if cutlass.const_expr(overlap_footer_gather):
         if (io_lane & Int32(31)) == Int32(0):
+            cute.arch.mbarrier_arrive(full_mbar_ptr)
+    elif cutlass.const_expr(kvarn or tail_fp8):
+        # Scalar record copies complete before the (zero-transaction)
+        # arrival: copy first, fence, then release the consumers.
+        _issue_payload()
+        cute.arch.fence_acq_rel_cta()
+        cute.arch.barrier(barrier_id=4, number_of_threads=io_threads)
+        if io_lane == Int32(0):
             cute.arch.mbarrier_arrive(full_mbar_ptr)
     else:
         if cutlass.const_expr(split_mbar_arrival):
@@ -729,5 +839,6 @@ def io_issue_gather_packed(
     token_idx_view[entry0] = idx0
     token_idx_view[entry1] = idx1
     cute.arch.fence_acq_rel_cta()
+    cute.arch.barrier(barrier_id=4, number_of_threads=Int32(32))
     if io_lane == Int32(0):
         cute.arch.mbarrier_arrive(full_mbar_ptr)
