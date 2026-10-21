@@ -135,6 +135,122 @@ CONTRACT_ROWS: tuple[tuple[int, int, int, int, bool], ...] = tuple(
     for rank in RANKS
     for bias in (False, True)
 )
+# The exact-dispatch rows of the convergence finals per architecture:
+# (M, N, K, rank, bias) -> the program it dispatches to there (the shipped
+# cake_r1 two-CTA r32 build on the held rows), the build keywords of those
+# programs, and the programs only one architecture's rows reach.
+_P = "cake_nvfp4_svdquant_gemm_"
+EXACT_ROWS: dict[str, dict[tuple[int, int, int, int, bool], str]] = {
+    "sm_100a": {
+        (129, 3072, 3072, 128, False): _P + "8c21118cf9b080867cf1",
+        (129, 3072, 3072, 128, True): _P + "2270204930b79b8caef7",
+        (4096, 3072, 3072, 32, True): _P + "1d78f2bd5722fb02b75a",
+        (4096, 12288, 3072, 32, True): _P + "2ca0cf40f7bbfca9df92",
+        (6889, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
+        (6912, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
+        (6912, 3072, 3072, 64, True): _P + "d16d801db12c7bdde4dc",
+        (6912, 3072, 3072, 96, True): _P + "96eddeb7b3a643b34a21",
+        (6912, 3072, 3072, 128, True): _P + "aa5225a75028cbb32391",
+        (9216, 3072, 3072, 32, True): _P + "b4be925d9e1e6959b702",
+        (16384, 3072, 3072, 32, True): _P + "c832b08a912e4c58112b",
+        (16384, 12288, 3072, 32, True): _P + "b4be925d9e1e6959b702",
+    },
+    "sm_103a": {
+        (129, 3072, 3072, 96, True): _P + "44ec820136bf5bcde86e",
+        (129, 3072, 3072, 128, False): _P + "fed389c9e9cb9293bd29",
+        (129, 3072, 3072, 128, True): _P + "44ec820136bf5bcde86e",
+        (4096, 3072, 3072, 32, True): _P + "b4be925d9e1e6959b702",
+        (6889, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
+        (6912, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
+        (6912, 3072, 3072, 64, True): _P + "d16d801db12c7bdde4dc",
+        (6912, 3072, 3072, 96, True): _P + "5dc32691ea15528b11be",
+        (6912, 3072, 3072, 128, True): _P + "aa5225a75028cbb32391",
+        (16384, 3072, 3072, 32, True): _P + "fdcf777b3acd972f8841",
+    },
+}
+EXACT_BUILDS: dict[str, dict[str, object]] = {
+    _P + "1d78f2bd5722fb02b75a": {
+        "clc_lead_kb": 8,
+        "rank": 32,
+    },
+    _P + "2270204930b79b8caef7": {
+        "bias": True,
+        "epi": "fused64",
+        "prologue": "overlap",
+        "stages": 15,
+    },
+    _P + "2ca0cf40f7bbfca9df92": {
+        "load_order": "b_first",
+        "out_store": "v8hint",
+        "rank": 32,
+    },
+    _P + "44ec820136bf5bcde86e": {
+        "bias": True,
+        "epi": "fused64",
+        "epi_alias": True,
+        "prologue": "overlap",
+        "stages": 16,
+    },
+    _P + "5dc32691ea15528b11be": {
+        "out_hint": "on",
+        "out_store": "v8hint",
+        "rank": 96,
+    },
+    _P + "8c21118cf9b080867cf1": {
+        "bias": False,
+        "epi": "fused64",
+        "prologue": "overlap",
+        "stages": 15,
+    },
+    _P + "96eddeb7b3a643b34a21": {
+        "bias_path": "regs",
+        "rank": 96,
+    },
+    _P + "aa5225a75028cbb32391": {
+        "out_hint": "on",
+        "out_store": "v8hint",
+        "rank": 128,
+    },
+    _P + "b4be925d9e1e6959b702": {
+        "rank": 32,
+    },
+    _P + "c832b08a912e4c58112b": {
+        "bias_path": "regs",
+        "rank": 32,
+    },
+    _P + "d16d801db12c7bdde4dc": {
+        "out_hint": "on",
+        "out_store": "v8hint",
+        "rank": 64,
+    },
+    _P + "fdcf777b3acd972f8841": {
+        "out_hint": "on",
+        "out_store": "v8hint",
+        "rank": 32,
+    },
+    _P + "fed389c9e9cb9293bd29": {
+        "bias": False,
+        "epi": "fused64",
+        "epi_alias": True,
+        "prologue": "overlap",
+        "stages": 16,
+    },
+}
+ARCH_ONLY: dict[str, set[str]] = {
+    "sm_100a": {
+        _P + "1d78f2bd5722fb02b75a",
+        _P + "2270204930b79b8caef7",
+        _P + "2ca0cf40f7bbfca9df92",
+        _P + "8c21118cf9b080867cf1",
+        _P + "96eddeb7b3a643b34a21",
+        _P + "c832b08a912e4c58112b",
+    },
+    "sm_103a": {
+        _P + "44ec820136bf5bcde86e",
+        _P + "5dc32691ea15528b11be",
+        _P + "fed389c9e9cb9293bd29",
+    },
+}
 # (M, N, K, rank, bias) -> the substring of the ValueError the shape rule raises.
 REJECTED_SHAPES = (
     ((65, 3072, 3072, 32, True), "M >= 128"),
@@ -357,6 +473,10 @@ def _arch() -> str:
     return loader.device_arch(_device().index)
 
 
+def _other_arch() -> str:
+    return next(arch for arch in loader.ARCHES if arch != _arch())
+
+
 def _route(row) -> str:
     m, n, k, rank, bias = row
     return loader.select_record(m=m, n=n, k=k, rank=rank, has_bias=bias, arch=_arch())
@@ -474,9 +594,12 @@ def test_perf_rows_route_to_an_admitting_program(row) -> None:
 
 
 def test_matrix_reaches_every_program() -> None:
-    """The perf, off-table and coverage rows together exercise every shipped program."""
+    """The perf, off-table and coverage rows together exercise every shipped program
+    this device's architecture routes to (the other architecture's exact rows
+    send their problems elsewhere here)."""
     reached = {_route(row) for row in (*PERF_ROWS, *CONTRACT_ROWS, *COVERAGE_ROWS)}
-    assert reached == set(loader.MODULES), sorted(set(loader.MODULES) - reached)
+    expected = set(loader.MODULES) - ARCH_ONLY[_other_arch()]
+    assert reached == expected, sorted(expected ^ reached)
 
 
 def test_route_rows_may_name_their_architectures(monkeypatch) -> None:
@@ -651,21 +774,25 @@ def test_raster_group_follows_its_table() -> None:
 
 
 def test_two_cta_routes_pick_the_store_form_of_the_launch() -> None:
-    """Every 2-CTA route (whole-tile and tail-split) lands on the build whose
-    ``out_store`` matches the kernel's hint rule for that launch, and both forms
-    are reached by the performance rows."""
+    """Every 2-CTA route (whole-tile and tail-split) outside the exact-dispatch rows
+    lands on the build whose ``out_store`` matches the kernel's hint rule for that
+    launch, and both forms are reached by the rows."""
     forms = set()
+    exact = EXACT_ROWS[_arch()]
     for row in (*PERF_ROWS, *CONTRACT_ROWS, *COVERAGE_ROWS):
         m, n, k, rank, bias = row
-        record = loader.MODULES[_route(row)]
+        name = _route(row)
+        if row in exact:  # the finals' own build; pinned by the exact-rows test
+            assert name == exact[row], _row_id(row)
+            continue
+        record = loader.MODULES[name]
         if record["plan"]["grid_rule"] not in ("pair_persistent", "pair_tailsplit"):
             continue
         build = record["build"]
         assert build["rank"] == rank, _row_id(row)
         expected = "v8hint" if _hinted_launch(n, k) else "v8"
         assert build["out_store"] == expected, (_row_id(row), build)
-        if row in PERF_ROWS:
-            forms.add(build["out_store"])
+        forms.add(build["out_store"])
     assert forms == {"v8", "v8hint"}
     # The boundary of the hint rule on the whole-tile program: 23 vs 24 tiles.
     for (n, k), form in (
@@ -684,6 +811,18 @@ def test_two_cta_routes_pick_the_store_form_of_the_launch() -> None:
     for record in loader.MODULES.values():
         if record["plan"]["grid_rule"] == "pair_tailsplit":
             assert record["build"]["out_store"] == "v8hint"
+
+
+def test_exact_rows_dispatch_per_architecture() -> None:
+    """The exact-dispatch rows of the convergence finals: on this device's
+    architecture each lands on its own build (the build the finals adopted, or
+    the shipped cake_r1 build on a held row); every exact row is a performance row."""
+    for row, name in EXACT_ROWS[_arch()].items():
+        assert row in PERF_ROWS, _row_id(row)
+        assert _route(row) == name, _row_id(row)
+        assert loader.MODULES[name]["build"] == EXACT_BUILDS[name], (_row_id(row), name)
+    reachable = set(loader.MODULES) - ARCH_ONLY[_other_arch()]
+    assert reachable >= set(EXACT_ROWS[_arch()].values())
 
 
 @pytest.mark.parametrize("bias", [False, True], ids=["nobias", "bias"])
