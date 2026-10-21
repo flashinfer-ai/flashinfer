@@ -4184,14 +4184,17 @@ def test_w4a8_fused_moe_tactics_and_apis(
 @cute_dsl_available
 @sm10x_required
 class TestRubinMultiCtaTacticRejected:
-    """A Rubin tactic with ``cluster_shape_m > 1`` must be refused.
+    """A Rubin tactic whose cluster spans several routing tiles must be refused.
 
     ``moe_sort`` leaves tile-metadata entries past ``num_non_exiting_tiles``
-    uninitialized. A multi-CTA cluster would require the tile count handed to
-    the kernel to be rounded up to a multiple of ``cluster_shape_m`` so every
-    cluster reaches its barrier uniformly, which widens the kernels' bounds
-    check past what routing wrote. Neither the rounding nor the matching
-    buffer initialization is implemented.
+    uninitialized. A cluster over several routing tiles (1-CTA MMA with
+    ``cluster_shape_m > 1``) would require the tile count handed to the kernel
+    to be rounded up to a multiple of ``cluster_shape_m`` so every cluster
+    reaches its barrier uniformly, which widens the kernels' bounds check past
+    what routing wrote. Neither the rounding nor the matching buffer
+    initialization is implemented. A 2-CTA MMA (``mma_inst_shape[0] == 256``)
+    with ``cluster_shape_m == 2`` covers exactly one routing tile and is
+    accepted (``test_two_cta_rubin_tactic_is_not_rejected``).
 
     ``get_valid_tactics`` filters these out during autotuning, but that path
     is bypassed by an explicitly supplied or cache-restored tactic, so
@@ -4311,6 +4314,60 @@ class TestRubinMultiCtaTacticRejected:
                 num_local_experts=num_experts,
                 output_dtype=torch.bfloat16,
                 **self._rubin_tactic_params(1, 1),
+            )
+
+    def test_two_cta_rubin_tactic_is_not_rejected(self, monkeypatch):
+        """A 2-CTA tile-256 tactic (cluster (2, 1)) covers one routing tile.
+
+        Both CTAs of the cluster map to the same moe_sort tile, so no tile
+        count rounding or metadata initialization is needed and the runtime
+        backstop must let it through to routing.
+        """
+        import flashinfer.fused_moe.cute_dsl.fused_moe as fused_moe_mod
+        from flashinfer.fused_moe.cute_dsl.fused_moe import _moe_core_impl
+
+        class _Reached(Exception):
+            pass
+
+        def _tripwire(*args, **kwargs):
+            raise _Reached
+
+        monkeypatch.setattr(fused_moe_mod, "moe_sort", _tripwire)
+
+        num_experts, top_k = 256, 8
+        tensors = create_moe_tensors(
+            num_tokens=64,
+            hidden_size=256,
+            intermediate_size=512,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+
+        with pytest.raises(_Reached):
+            _moe_core_impl(
+                x=tensors["x"],
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=num_experts,
+                output_dtype=torch.bfloat16,
+                tile_size=256,
+                gemm1_mma_tiler=(256, 256, 256),
+                gemm1_mma_inst_shape=(256, 256, 128),
+                gemm1_cluster_shape_mn=(2, 1),
+                gemm2_mma_tiler=(256, 256, 256),
+                gemm2_mma_inst_shape=(128, 256, 128),
+                gemm2_cluster_shape_mn=(1, 1),
             )
 
     def test_autotuner_filters_multi_cta_tactics(self):

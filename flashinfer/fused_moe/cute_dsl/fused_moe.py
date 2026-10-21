@@ -90,6 +90,7 @@ from .moe_utils import (
     moe_output_memset_inplace,
     moe_sort,
     normalize_cute_dsl_moe_activation_type,
+    rubin_moe_cluster_covers_one_tile,
     validate_cute_dsl_moe_situ_config,
 )
 from .blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
@@ -515,18 +516,33 @@ def _moe_core_impl(
             "gemm1_mma_inst_shape."
         )
 
-    # Multi-CTA Rubin tactics are filtered out in tuner.get_valid_tactics; this
-    # is the backstop for callers that pass tactic parameters directly.
-    cluster_m = max(gemm1_cluster_shape_mn[0], gemm2_cluster_shape_mn[0])
-    if is_rubin and cluster_m > 1:
-        raise NotImplementedError(
-            f"Rubin MoE with cluster_shape_m={cluster_m} is not supported. The "
-            "tile count handed to the kernel must be rounded up to a multiple "
-            "of cluster_shape_m so every cluster reaches the barrier "
-            "uniformly, and tile_idx_to_expert_idx / tile_idx_to_mn_limit must "
-            "be initialized past num_non_exiting_tiles to match, since the "
-            "kernel bounds-checks them against that same rounded count."
-        )
+    # Rubin clusters that span several routing tiles along M are filtered out
+    # in tuner.get_valid_tactics; this is the backstop for callers that pass
+    # tactic parameters directly. A 2-CTA MMA (mma_inst_shape[0] == 256) with
+    # cluster_shape_m == 2 covers exactly one routing tile and is supported.
+    if is_rubin:
+        for name, mma_tiler, mma_inst_shape, cluster_shape_mn in (
+            ("gemm1", gemm1_mma_tiler, gemm1_mma_inst_shape, gemm1_cluster_shape_mn),
+            ("gemm2", gemm2_mma_tiler, gemm2_mma_inst_shape, gemm2_cluster_shape_mn),
+        ):
+            if mma_tiler is None or mma_inst_shape is None:
+                continue
+            if not rubin_moe_cluster_covers_one_tile(
+                tile_size, mma_tiler, mma_inst_shape, cluster_shape_mn
+            ):
+                raise NotImplementedError(
+                    f"Rubin MoE {name} with mma_tiler={tuple(mma_tiler)}, "
+                    f"mma_inst_shape={tuple(mma_inst_shape)}, "
+                    f"cluster_shape_m={cluster_shape_mn[0]} at tile_size="
+                    f"{tile_size} is not supported. Each cluster must cover "
+                    "exactly one routing tile (mma_tiler[0] == tile_size and "
+                    "cluster_shape_m equal to the MMA CTA group size: 2 for a "
+                    "2-CTA mma_inst_shape[0] == 256, else 1). A cluster over "
+                    "several routing tiles would need the tile count rounded "
+                    "up to a multiple of the cluster and tile_idx_to_expert_idx "
+                    "/ tile_idx_to_mn_limit initialized past "
+                    "num_non_exiting_tiles to match."
+                )
 
     # Step 1: Sort tokens by expert
     moe_sort_kwargs = moe_sort_buffers or {}

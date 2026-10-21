@@ -107,6 +107,33 @@ def validate_cute_dsl_moe_situ_config(
         )
 
 
+def rubin_moe_cluster_covers_one_tile(
+    tile_size: int,
+    mma_tiler: Tuple[int, int, int],
+    mma_inst_shape: Tuple[int, int, int],
+    cluster_shape_mn: Tuple[int, int],
+) -> bool:
+    """Return whether a Rubin (SM107) MoE GEMM tactic maps one cluster to one
+    ``moe_sort`` routing tile along M.
+
+    ``moe_sort`` writes one metadata entry (expert index, M limit) per
+    ``tile_size``-row routing tile, for ``[0, num_non_exiting_tiles)`` only;
+    both Rubin GEMMs bound their metadata reads by that count. A CTA's routing
+    tile is its M tile coordinate divided by ``atom_cta_m``, the MMA CTA
+    group size along M (2 for the 2-CTA ``mma_inst_shape[0] == 256`` MMA,
+    else 1). With ``mma_tiler[0] == tile_size`` and ``cluster_shape_mn[0] ==
+    atom_cta_m`` every CTA of a cluster resolves to the same routing tile, so
+    the CTAs agree on whether the tile is valid and reach the cluster barrier
+    together: no rounding of the tile count and no initialization of the
+    metadata past the active prefix is needed. A cluster spanning several
+    routing tiles (``cluster_shape_mn[0] > atom_cta_m``) would need both, and
+    is not supported. Cluster N only multicasts A/SFA among CTAs of the same
+    routing tile and does not affect this property.
+    """
+    atom_cta_m = 2 if mma_inst_shape[0] == 256 else 1
+    return mma_tiler[0] == tile_size and cluster_shape_mn[0] == atom_cta_m
+
+
 def get_max_num_tiles(
     num_tokens: int,
     top_k: int,
@@ -684,8 +711,11 @@ def moe_sort(
     #
     # Entries outside the active prefix are intentionally uninitialized.
     # Routing writes [0, num_non_exiting_tiles), and both GEMMs consume exactly
-    # that count. Rubin multi-CTA tactics, which would require rounded/padded
-    # metadata entries, are rejected before moe_sort.
+    # that count. This also holds for Rubin 2-CTA and cluster_shape_n > 1
+    # tactics, whose clusters cover exactly one routing tile; tactics with a
+    # cluster spanning several routing tiles, which would require
+    # rounded/padded metadata entries, are rejected before moe_sort (see
+    # rubin_moe_cluster_covers_one_tile).
     if out_tile_idx_to_expert_idx is not None:
         tile_idx_to_expert_idx = out_tile_idx_to_expert_idx
     else:
