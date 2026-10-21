@@ -324,7 +324,8 @@ def test_nvfp4_quantize_smooth(m, n):
     assert torch.equal(sf, sf_ref.view(torch.uint8).reshape(-1))
 
 
-# n=3072 takes the fast-path kernel; n=4096 the legacy kernel.
+# n=3072 takes the fast-path kernel; n=4096 the legacy kernel. Only n=4096 guards
+# the fix: nvcc already ordered the fast path's __restrict__ load after the wait.
 @pytest.mark.parametrize("n", [3072, 4096])
 def test_nvfp4_quantize_smooth_pdl_waits_for_global_scale(n):
     _skip_unless_sm100()

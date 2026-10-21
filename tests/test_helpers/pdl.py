@@ -49,15 +49,21 @@ def _late_store_kernel(device_index: int):
     checkCudaErrors(nvrtc.nvrtcCompileProgram(program, 1, [arch]))
     cubin = bytes(checkCudaErrors(nvrtc.nvrtcGetCUBINSize(program)))
     checkCudaErrors(nvrtc.nvrtcGetCUBIN(program, cubin))
+    checkCudaErrors(nvrtc.nvrtcDestroyProgram(program))
     module = checkCudaErrors(driver.cuModuleLoadData(cubin))
     return checkCudaErrors(driver.cuModuleGetFunction(module, b"late_store"))
 
 
 def late_store(dst: torch.Tensor, value: float) -> None:
-    kernel = _late_store_kernel(dst.device.index)
-    args = (
-        (dst.data_ptr(), value, _LATE_STORE_SPIN_CYCLES),
-        (ctypes.c_void_p, ctypes.c_float, ctypes.c_longlong),
-    )
-    stream = torch.cuda.current_stream(dst.device).cuda_stream
-    checkCudaErrors(driver.cuLaunchKernel(kernel, 1, 1, 1, 1, 1, 1, 0, stream, args, 0))
+    # Driver calls act on the current context; pin it to dst's device for the
+    # module load and the launch alike.
+    with torch.cuda.device(dst.device):
+        kernel = _late_store_kernel(dst.device.index)
+        args = (
+            (dst.data_ptr(), value, _LATE_STORE_SPIN_CYCLES),
+            (ctypes.c_void_p, ctypes.c_float, ctypes.c_longlong),
+        )
+        stream = torch.cuda.current_stream(dst.device).cuda_stream
+        checkCudaErrors(
+            driver.cuLaunchKernel(kernel, 1, 1, 1, 1, 1, 1, 0, stream, args, 0)
+        )
