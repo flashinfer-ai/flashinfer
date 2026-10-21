@@ -208,9 +208,11 @@ collective, so agree on the result across ranks first:
 
 A workspace built with ``apply_rms_norm=False`` and ``add_residual=False``
 serves ``kAllReduce``; the default norm-on workspace serves
-``kARResidualRMSNorm`` and the MoE finalize pattern, an
-``output_dtype=torch.float8_e4m3fn`` workspace the static FP8 patterns, and one
-with ``dynamic_fp8=True`` as well the dynamic FP8 patterns.
+``kARResidualRMSNorm`` and the MoE finalize pattern. An
+``output_dtype=torch.float8_e4m3fn`` workspace serves the static FP8 patterns
+(2 and 12, or 4 with ``write_norm_output=True``); one that also sets
+``dynamic_fp8=True`` serves only the dynamic patterns (10, or 11 with
+``write_norm_output=True``), not the static ones.
 
 .. autosummary::
     :toctree: ../generated
