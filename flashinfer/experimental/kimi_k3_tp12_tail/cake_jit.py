@@ -75,8 +75,13 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # Every program is one source compiled for each architecture it lists (the
 # SM100-family lowering preferences are ``__CUDA_ARCH__`` guards inside the
 # source) and is launched with programmatic dependent launch.  Both literals
-# are populated verbatim by the generated-program export; do not edit them by
-# hand.
+# are populated verbatim by the generated-program export, except that the
+# ``sources[0]`` and ``compile_flags`` of record
+# ``cake_kimi_k3_tp12_tail_4dafdc41b373cd2ba5a5`` (key ``k23:c8``) are hand-set
+# pending exporter support: it compiles the ``k23:c4`` kernel source with the
+# ``K23_CAPACITY`` / ``CAKE_PROGRAM_KERNEL`` definitions that select the
+# eight-token variant and name its own kernel symbol.  Do not hand-edit the
+# literals otherwise.
 MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_tp12_tail_45df1981c8c6ea60f8e7": {
         "role": "kernel",
@@ -113,10 +118,13 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_kimi_k3_tp12_tail_4dafdc41b373cd2ba5a5": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_4dafdc41b373cd2ba5a5_kernel.cu",
+            "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_7919fc819bb5f04d4df0_kernel.cu",
             "cake_kimi_k3_tp12_tail/cake_kimi_k3_tp12_tail_4dafdc41b373cd2ba5a5_binding.cu",
         ],
-        "compile_flags": [],
+        "compile_flags": [
+            "-DK23_CAPACITY=8",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_kimi_k3_tp12_tail_4dafdc41b373cd2ba5a5",
+        ],
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "y"],
