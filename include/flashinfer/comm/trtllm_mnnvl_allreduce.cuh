@@ -1476,8 +1476,9 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(AllReduceKernelParams<T> 
       PackedVec<PackedType, T> out;
 #pragma unroll
       for (int j = 0; j < kELTS_PER_LOAD; j++) {
-        float normVal = (params.weightBias + toFloat<T>(gamma.elements[j])) *
-                        rInput[i * kELTS_PER_LOAD + j] * rcpRms;
+        // Same association as the one-shot kernel and the other fused RMSNorm epilogues.
+        float normVal = rInput[i * kELTS_PER_LOAD + j] * rcpRms *
+                        (params.weightBias + toFloat<T>(gamma.elements[j]));
         rNorm[i * kELTS_PER_LOAD + j] = normVal;
         threadMax = fmaxf(threadMax, fabsf(normVal));
         out.elements[j] = fromFloat<T>(normVal);
