@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import torch
 
-from b12x._lib.intrinsics import quantize_grouped_nvfp4_torch
+from b12x._lib.intrinsics.reference import quantize_grouped_nvfp4_torch
 from b12x.quantization import nvfp4
 from b12x.preparation import PreparationSession, PreparedCall
 

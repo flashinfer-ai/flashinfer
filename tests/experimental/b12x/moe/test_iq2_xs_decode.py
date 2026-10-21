@@ -8,18 +8,17 @@ import pytest
 import torch
 
 from b12x._lib.compiler import compile as b12x_compile
-from b12x._lib.intrinsics import (
-    cp_async4_shared_global,
+from b12x._lib.intrinsics.memory import cp_async4_shared_global, shared_ptr_to_u32
+from b12x._lib.intrinsics.trellis import (
     packed_decode_iq2_xs_to_bfloat2x4,
     iq2_xxs_descriptor_pair,
-    shared_ptr_to_u32,
 )
 from b12x._lib.quant.iq2_xs import (
     IQ2_XS_MAGNITUDE_LUT_BYTES,
     IQ2_XS_SELECTOR_LUT_BYTES,
     iq2_xs_execution_lut,
 )
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.utils.device import current_cuda_stream
 from b12x.testing.iq2_xs_reference import descriptor_vectors
 from b12x.testing.reference.helpers import require_b12x
 

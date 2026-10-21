@@ -91,7 +91,7 @@ def pack_nvfp4_weight(
         raise ValueError(
             "global_scale must be scalar, with kind 'multiplier' or 'reciprocal'"
         )
-    from b12x._lib.intrinsics import as_grouped_scale_view
+    from b12x._lib.intrinsics.reference import as_grouped_scale_view
 
     mma = as_grouped_scale_view(storage.view(1, -1), n, k)
     return NVFP4LinearWeight(weight, mma, global_scale, global_scale_kind, k, n)
@@ -101,7 +101,7 @@ def _stream_context(stream, device):
     if stream is None:
         return nullcontext()
     if not isinstance(stream, torch.cuda.Stream):
-        from b12x._lib.utils import cuda_stream_to_int
+        from b12x._lib.utils.device import cuda_stream_to_int
 
         stream = torch.cuda.ExternalStream(cuda_stream_to_int(stream), device=device)
     if stream.device != device:

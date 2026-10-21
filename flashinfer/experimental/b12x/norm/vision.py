@@ -15,7 +15,8 @@ from cutlass import BFloat16, Float32, Int32, Int64
 
 from .._lib.compiler import KernelCompileSpec, compile as compile_cute, run_compiled
 from .._lib.runtime_control import raise_if_kernel_resolution_frozen
-from .._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 
 
 class _Vision:

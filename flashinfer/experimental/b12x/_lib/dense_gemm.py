@@ -61,52 +61,59 @@ from b12x._lib.compiler import (
     compile as b12x_compile,
 )
 from b12x._lib.compile_plan import attach_programs
-from b12x._lib.utils import (
+from b12x._lib.utils.device import (
     cuda_stream_from_int_or_current,
     cuda_stream_to_int,
     current_cuda_stream,
-    cutlass_to_torch_dtype,
-    get_cutlass_dtype,
     get_max_active_clusters,
     get_num_sm,
+)
+from b12x._lib.utils.dtypes import cutlass_to_torch_dtype, get_cutlass_dtype
+from b12x._lib.utils.fp6_geometry import (
     is_mxfp6_ab_dtype,
-    make_ptr,
     mxfp6_logical_k_from_packed_bytes,
     mxfp6_tile_k,
+)
+from b12x._lib.utils.pointers import make_ptr
+from b12x._lib.utils.scale_layout import (
     sm120_make_smem_layout_sfa,
     sm120_make_smem_layout_sfb,
 )
-from b12x._lib.intrinsics import (
-    FLOAT8_E4M3_MAX,
-    bfloat2_to_float2_scaled,
+from b12x._lib.intrinsics.atomics import scatter_add_bf16, scatter_add_bf16x2
+from b12x._lib.intrinsics.constants import FLOAT8_E4M3_MAX
+from b12x._lib.intrinsics.conversion import (
+    cvt_f32x4_to_e4m3x4,
+    pow2_ceil_ue8m0,
+    ue8m0_to_output_scale,
+)
+from b12x._lib.intrinsics.math import fabs_f32, fmax_f32
+from b12x._lib.intrinsics.memory import (
     cp_async_bulk_g2s_mbar,
     cp_async4_shared_global,
-    cvt_f32x4_to_e4m3x4,
     elem_pointer,
-    fabs_f32,
-    fmax_f32,
-    nvfp4_pair_to_bf16x2_sm120,
-    iq2_xs_descriptor_pair_to_bf16x2x2,
-    iq2_xxs_descriptor_pair,
-    q8_0_pair_to_bf16x2,
-    mxfp8_pair_to_bf16x2_sm120,
     get_ptr_as_int64,
     ld_global_b16,
     ld_global_v4_u32,
     ld_shared_v4_u32,
-    mma_m16n8k32_f32_e4m3,
-    pow2_ceil_ue8m0,
-    quantize_block_fp8_mx,
-    scatter_add_bf16,
-    scatter_add_bf16x2,
     shared_ptr_to_u32,
     st_global_u64,
     st_shared_u16,
     st_shared_u8,
     st_shared_v4_u32,
     u32_as_f32,
-    ue8m0_to_output_scale,
-    warp_reduce,
+)
+from b12x._lib.intrinsics.mma import mma_m16n8k32_f32_e4m3
+from b12x._lib.intrinsics.packed import (
+    bfloat2_to_float2_scaled,
+    nvfp4_pair_to_bf16x2_sm120,
+    mxfp8_pair_to_bf16x2_sm120,
+)
+from b12x._lib.intrinsics.quantization import quantize_block_fp8_mx
+from b12x._lib.intrinsics.reduction import warp_reduce
+from b12x._lib.intrinsics.trellis import (
+    iq2_xs_descriptor_pair_to_bf16x2x2,
+    iq2_xxs_descriptor_pair,
+    q8_0_pair_to_bf16x2,
 )
 from b12x._lib.dense_gemm_mxfp6 import emit_mxfp6_dense_mma_k_block
 from b12x._lib.fp6 import (

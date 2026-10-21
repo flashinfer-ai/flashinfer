@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from cutlass.cutlass_dsl import Int32, Int64, Uint32, T, dsl_user_op
 from cutlass._mlir.dialects import llvm
-from b12x._lib.intrinsics import cp_async_bulk_g2s_mbar
+from b12x._lib.intrinsics.memory import cp_async_bulk_g2s_mbar
 
 _HEADER_BYTES = 1024
 

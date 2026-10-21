@@ -17,8 +17,11 @@ from b12x._lib.dense_gemm import (
     _dense_spark_policy_for_sm_count,
     dense_gemm,
 )
-from b12x._lib.intrinsics import as_grouped_scale_view, as_grouped_scale_view_mx
-from b12x._lib.utils import cuda_stream_to_int, get_num_sm
+from b12x._lib.intrinsics.reference import (
+    as_grouped_scale_view,
+    as_grouped_scale_view_mx,
+)
+from b12x._lib.utils.device import cuda_stream_to_int, get_num_sm
 from b12x.gemm._shared.wo_mxfp8 import (
     MXFP8Rows,
     MXFP8_SCALE_VEC_SIZE,

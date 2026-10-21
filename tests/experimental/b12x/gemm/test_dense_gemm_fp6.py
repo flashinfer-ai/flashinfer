@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import cutlass
 
-from b12x._lib.utils import mxfp6_tile_k
+from b12x._lib.utils.fp6_geometry import mxfp6_tile_k
 from b12x._lib.dense_gemm import DenseGemmKernel
 
 

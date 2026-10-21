@@ -15,26 +15,25 @@ from cutlass import Float32, Int32, Int64, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.atomics import (
     atomic_max_shared_f32,
-    byte_perm,
-    cp_async4_shared_global,
-    cvt_f32_to_e4m3,
-    fabs_f32,
-    fmax_f32,
-    fmin_f32,
-    fp8_e4m3_to_f32,
-    get_ptr_as_int64,
     ld_shared_f32,
     ld_shared_u32,
-    ldmatrix_m8n8x2_b16,
-    ldmatrix_m8n8x4_b16,
-    mma_m16n8k16_f32_bf16,
-    mma_m16n8k32_f32_e4m3,
     st_shared_bf16_from_f32,
     st_shared_f32,
+)
+from b12x._lib.intrinsics.constants import mma_m16n8k16_f32_bf16
+from b12x._lib.intrinsics.conversion import cvt_f32_to_e4m3, fp8_e4m3_to_f32
+from b12x._lib.intrinsics.math import fabs_f32, fmax_f32, fmin_f32
+from b12x._lib.intrinsics.memory import (
+    cp_async4_shared_global,
+    get_ptr_as_int64,
+    ldmatrix_m8n8x2_b16,
+    ldmatrix_m8n8x4_b16,
     st_shared_u8,
 )
+from b12x._lib.intrinsics.mma import mma_m16n8k32_f32_e4m3
+from b12x._lib.intrinsics.packed import byte_perm
 
 from ._layout import (
     CANDIDATES_PER_CHUNK,

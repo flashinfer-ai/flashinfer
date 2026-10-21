@@ -30,10 +30,7 @@ from typing import Any
 
 import torch
 
-from b12x._lib.intrinsics import (
-    swizzle_block_scale,
-    validate_e8m0_scale_grid,
-)
+from b12x._lib.intrinsics.reference import swizzle_block_scale, validate_e8m0_scale_grid
 
 _SF_BLOCK = 32  # K elements per UE8M0 block scale
 _TILE_K = 128  # kernel K-tile width (one E4M3 byte per element along K)

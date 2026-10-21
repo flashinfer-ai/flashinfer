@@ -263,7 +263,7 @@ def test_mhc_runtime_projection_splits_share_code_across_prepared_plans(monkeypa
 @pytest.mark.parametrize("provided", [False, True])
 def test_dense_prepared_plan_compiles_through_the_graph_cache(provided, monkeypatch):
     from b12x import gemm
-    from b12x._lib.intrinsics import as_grouped_scale_view_mx
+    from b12x._lib.intrinsics.reference import as_grouped_scale_view_mx
 
     device = require_b12x()
     rows, columns, width, batch = 3, 128, 256, 2

@@ -29,15 +29,15 @@ from b12x._lib.compiler import (
     tensor_compile_fact,
 )
 from b12x._lib.compile_plan import compile_only_launches_enabled
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.atomics import (
     atomic_add_shared_i32,
     ld_shared_i32,
     ld_shared_i32_relaxed,
     red_add_shared_i32,
-    shared_ptr_to_u32,
     st_shared_i32,
 )
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.intrinsics.memory import shared_ptr_to_u32
+from b12x._lib.utils.device import current_cuda_stream
 
 _THREADS_PER_CTA = 1024
 _DEFAULT_TOPK = 2048

@@ -465,7 +465,8 @@ class JitSpecNvcc(JitSpec):
 
     @property
     def jit_library_path(self) -> Path:
-        return jit_env.FLASHINFER_JIT_DIR / self.name / f"{self.name}.so"
+        suffix = ".dll" if os.name == "nt" else ".so"
+        return jit_env.FLASHINFER_JIT_DIR / self.name / f"{self.name}{suffix}"
 
     def get_library_path(self) -> Path:
         if self.is_aot:
@@ -724,15 +725,15 @@ def gen_jit_spec(
 
     # Only add default C++ standard if not specified in extra flags
     cflags_has_std = extra_cflags is not None and any(
-        f.startswith("-std=") for f in extra_cflags
+        f.startswith(("-std=", "/std:")) for f in extra_cflags
     )
     cuda_cflags_has_std = extra_cuda_cflags is not None and any(
         f.startswith("-std=") for f in extra_cuda_cflags
     )
 
-    cflags = ["-Wno-switch-bool"]
+    cflags = [] if os.name == "nt" else ["-Wno-switch-bool"]
     if not cflags_has_std:
-        cflags.insert(0, "-std=c++17")
+        cflags.insert(0, "/std:c++17" if os.name == "nt" else "-std=c++17")
 
     cuda_cflags = [
         *get_nvcc_parallelism_flags(),
@@ -749,7 +750,7 @@ def gen_jit_spec(
         cuda_cflags.insert(0, "-std=c++17")
 
     if debug:
-        cflags += ["-O0", "-g"]
+        cflags += ["/Od", "/Z7"] if os.name == "nt" else ["-O0", "-g"]
         cuda_cflags += [
             "-g",
             "-O0",
@@ -761,7 +762,7 @@ def gen_jit_spec(
     else:
         # non debug mode
         cuda_cflags += ["-DNDEBUG", "-O3"]
-        cflags += ["-DNDEBUG", "-O3"]
+        cflags += ["-DNDEBUG", "/O2" if os.name == "nt" else "-O3"]
 
     # useful for ncu source correlation
     if os.environ.get("FLASHINFER_JIT_LINEINFO", "0") == "1":

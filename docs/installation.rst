@@ -22,6 +22,21 @@ Prerequisites
    CUDA 13.4 wheels are built with the preview toolkit and PyTorch nightly;
    runtime CI currently covers CUDA 12.9 and 13.0.
 
+Triton compiler selection
+"""""""""""""""""""""""""
+
+FlashInfer preserves Triton's PTX assembler selection. If the assembler bundled
+with Triton does not support a Blackwell GPU, select a compatible CUDA toolkit
+before starting Python and its worker processes:
+
+.. code-block:: bash
+
+    export TRITON_PTXAS_BLACKWELL_PATH=/path/to/cuda/bin/ptxas
+
+For example, SM110 requires CUDA 13 or later; the CUDA 12.8 assembler bundled
+with Triton 3.6 does not support it. Keep the assembler selection fixed for the
+process lifetime so kernel planning and compilation use the same cache identity.
+
 Quick Start
 ^^^^^^^^^^^
 

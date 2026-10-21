@@ -12,10 +12,8 @@ from cutlass.cutlass_dsl import Int32, Int64, Uint8, Uint32, Uint64
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu import warp as _nvgpu_warp
 
-from b12x._lib.intrinsics import (
-    cvt_f32_to_bf16_bits,
-    fabs_f32,
-    fmax_f32,
+from b12x._lib.intrinsics.math import cvt_f32_to_bf16_bits, fabs_f32, fmax_f32
+from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
     shared_ptr_to_u32,
     st_global_u8,
@@ -30,7 +28,8 @@ from b12x._lib.fp6 import (
     quantize_block_fp6_e3m2_fast,
     quantize_block_fp8_e4m3_bytes,
 )
-from b12x._lib.utils import make_ptr, sm120_make_smem_layout_sfa
+from b12x._lib.utils.pointers import make_ptr
+from b12x._lib.utils.scale_layout import sm120_make_smem_layout_sfa
 
 # The pinned cutlass-dsl ships the native SM120 MXF8 block-scaled warp op.
 _MmaMXF8Op = _nvgpu_warp.MmaMXF8Op

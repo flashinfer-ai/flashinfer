@@ -29,20 +29,21 @@ from b12x._lib.compiler import (
 )
 from b12x._lib.compiler import run_compiled
 from b12x._lib.compile_plan import compile_only_launches_enabled
-from b12x._lib.intrinsics import (
-    bf16_mma_m16n8k16_f32,
-    bfloat2_to_float2_scaled,
-    f32_to_raw_bits,
-    f32_to_tf32_bits,
+from b12x._lib.intrinsics.atomics import st_shared_u32
+from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
     ld_global_nc_u32,
     ldmatrix_m8n8x4_b16,
-    pack_f32x2_to_bfloat2,
     shared_ptr_to_u32,
-    st_shared_u32,
-    tf32_mma_m16n8k8_f32,
 )
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.intrinsics.mma import bf16_mma_m16n8k16_f32, tf32_mma_m16n8k8_f32
+from b12x._lib.intrinsics.packed import (
+    bfloat2_to_float2_scaled,
+    f32_to_raw_bits,
+    f32_to_tf32_bits,
+    pack_f32x2_to_bfloat2,
+)
+from b12x._lib.utils.device import current_cuda_stream
 
 _PREFILL_TF32_TMA_LONG_4096_K_SPLITS = (
     None  # placeholder: undefined in the b12x migration; set the real value

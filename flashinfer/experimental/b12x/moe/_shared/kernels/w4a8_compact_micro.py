@@ -13,7 +13,8 @@ from cutlass.cutlass_dsl import Int32
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 from b12x.moe._shared.kernels.w4a8_compact_projection import (
     W4A8CompactMicroProjectionKernel,
 )

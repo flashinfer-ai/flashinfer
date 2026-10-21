@@ -8,8 +8,8 @@ import pytest
 import torch
 
 from b12x._lib.runtime_control import kernel_resolution_guard
-from b12x._lib.utils import convert_sf_from_mma_layout
-from b12x._lib.intrinsics import (
+from b12x._lib.utils.scale_layout import convert_sf_from_mma_layout
+from b12x._lib.intrinsics.reference import (
     fp4_quantize_values_torch,
     quantize_grouped_nvfp4_torch,
     swizzle_block_scale,

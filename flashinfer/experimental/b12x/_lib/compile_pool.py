@@ -15,6 +15,9 @@ from multiprocessing.pool import Pool
 from threading import Condition, Lock
 from typing import Any, Iterable
 
+# Job factories select entrypoints whose source dependencies are keyed separately.
+__b12x_source_dependencies__ = ()
+
 from .compile_plan import (
     ProgramKey,
     observe_programs,
@@ -193,8 +196,10 @@ def _initialize_worker(
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     import torch
     from triton import knobs
-    from . import compiler
+    from b12x._lib import compiler
+    from .race_fuzz import install_from_environment
 
+    install_from_environment()
     torch.set_num_threads(1)
     if torch.cuda.is_initialized():
         raise RuntimeError("compiler worker inherited an initialized CUDA runtime")

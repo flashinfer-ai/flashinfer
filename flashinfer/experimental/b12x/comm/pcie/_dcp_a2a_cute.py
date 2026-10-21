@@ -15,14 +15,11 @@ from cutlass._mlir.dialects import llvm
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.program_cache import program_cache
-from b12x._lib.intrinsics import (
-    fmax_f32,
-    ld_global_v4_u32,
-    st_global_v4_u32,
-    u32_as_f32,
-)
+from b12x._lib.intrinsics.math import fmax_f32
+from b12x._lib.intrinsics.memory import ld_global_v4_u32, st_global_v4_u32, u32_as_f32
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 
 from ._dcp_cute_common import block_pair_barrier
 from ._cute_intrinsics import (

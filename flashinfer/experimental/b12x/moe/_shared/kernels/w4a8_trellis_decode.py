@@ -14,10 +14,9 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
-from b12x._lib.intrinsics import (
-    cp_async4_shared_global,
-    get_ptr_as_int64,
-    ld_shared_u32,
+from b12x._lib.intrinsics.atomics import ld_shared_u32
+from b12x._lib.intrinsics.memory import cp_async4_shared_global, get_ptr_as_int64
+from b12x._lib.intrinsics.trellis import (
     packed_decode_lut_e4m3_to_e4m3x8,
     packed_decode_lut_e4m3_direct_to_e4m3x8,
 )

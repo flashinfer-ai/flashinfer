@@ -62,41 +62,47 @@ from cutlass.cutlass_dsl import (
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync
 from b12x._lib.quant.nvfp4_csf_inline import InlineNvfp4Reader
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.atomics import (
     atomic_add_global_i32,
-    bfloat2_to_float2_scaled,
-    broadcast_f32_to_half2,
-    cp_async4_shared_global,
-    cp_async_u32_shared_global,
-    cp_async_u64_shared_global,
-    e2m1x8_mul_residual_to_e4m3x8,
-    e2m1x8_to_qmma_e2m1x8,
-    fabs_f32,
-    fmax_f32,
-    fp8_e4m3_to_f32,
     ld_shared_f32,
     ld_shared_i32_relaxed,
     ld_shared_u32,
+    atomic_add_shared_i32,
+    st_global_i32,
+    st_shared_f32,
+    st_shared_u32,
+)
+from b12x._lib.intrinsics.conversion import (
+    e2m1x8_mul_residual_to_e4m3x8,
+    fp8_e4m3_to_f32,
+)
+from b12x._lib.intrinsics.math import fabs_f32, fmax_f32
+from b12x._lib.intrinsics.memory import (
+    cp_async4_shared_global,
+    cp_async_u32_shared_global,
+    cp_async_u64_shared_global,
     ld_shared_v2_u32,
     ld_shared_v4_u32,
     ld_global_v4_u32,
-    atomic_add_shared_i32,
+    get_ptr_as_int64,
+    st_global_f32,
+    shared_ptr_to_u32,
+    st_shared_u8,
+    st_global_u64,
+    st_global_v4_u32,
+)
+from b12x._lib.intrinsics.mma import (
+    e2m1x8_to_qmma_e2m1x8,
     mxfp8_mma_m16n8k32_f32_e4m3,
     mxfp8_mma_m16n8k32_f32_e2m1,
+)
+from b12x._lib.intrinsics.packed import bfloat2_to_float2_scaled, broadcast_f32_to_half2
+from b12x._lib.intrinsics.quantization import (
     quantize_block_fp4,
     quantize_block_fp4_fast,
     quantize_block_fp8_mx,
-    get_ptr_as_int64,
-    st_global_f32,
-    st_global_i32,
-    shared_ptr_to_u32,
-    st_shared_f32,
-    st_shared_u8,
-    st_shared_u32,
-    st_global_u64,
-    st_global_v4_u32,
-    warp_reduce,
 )
+from b12x._lib.intrinsics.reduction import warp_reduce
 from b12x._lib.smem import make_smem_memrange_alias
 from b12x._lib.dense_gemm import (
     DenseGemmKernel,
@@ -110,10 +116,7 @@ from b12x.moe._shared.kernels.mxfp6_moe import (
     moe_mxfp6_quantize_input_block_containers,
     moe_mxfp6_store_expanded_global,
 )
-from b12x._lib.intrinsics import (
-    scatter_add_bf16x2,
-    scatter_add_v4_bf16x2,
-)
+from b12x._lib.intrinsics.atomics import scatter_add_bf16x2, scatter_add_v4_bf16x2
 from b12x.moe._shared.kernels.activations import (
     SITU,
     SITU_DEFAULT_BETA,

@@ -27,13 +27,13 @@ from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass.cutlass_dsl import Int64, T, dsl_user_op
 
 from b12x.attention._shared.cute import ops as attention_ops
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
     ld_shared_v4_u32,
-    pack_f32x2_to_bfloat2,
     shared_ptr_to_u32,
     st_shared_v4_u32,
 )
+from b12x._lib.intrinsics.packed import pack_f32x2_to_bfloat2
 
 
 @dsl_user_op

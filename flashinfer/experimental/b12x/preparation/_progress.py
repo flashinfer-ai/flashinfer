@@ -117,6 +117,8 @@ class PreparationDisplay:
     Only the coordinator for global rank zero creates a live renderer. The
     refresh thread reads immutable frames, never a session, CUDA, a compiler,
     or a measurement object. Pipe output is plain milestone text.
+    Pass a shared Rich console to nest beneath another live display; transient
+    panels disappear on completion instead of remaining in terminal scrollback.
     """
 
     def __init__(
@@ -124,6 +126,8 @@ class PreparationDisplay:
         *,
         global_rank: int,
         stream=None,
+        console=None,
+        transient=False,
         title="b12x / kernel autotuning",
         cancel_available=False,
     ):
@@ -133,10 +137,15 @@ class PreparationDisplay:
         self._title = _plain(title)
         self._cancel_available = cancel_available
         self._tuning_stopped = False
-        self._stream = sys.stderr if stream is None else stream
+        self._stream = (
+            console.file
+            if console is not None
+            else (sys.stderr if stream is None else stream)
+        )
+        self._transient = transient
         self._frame = _Frame(PreparationProgress(False, False, (), False), "PLAN")
         self._live = None
-        self._console = None
+        self._console = console
         self._started = None
         self._ended = None
         self._closed = False
@@ -162,10 +171,19 @@ class PreparationDisplay:
             raise RuntimeError("preparation display is single-use")
         self._started = time.monotonic()
         self._request_started = self._started
-        if self._enabled and self._stream.isatty():
+        terminal = (
+            self._console.is_terminal
+            if self._console is not None
+            else self._stream.isatty()
+        )
+        if self._enabled and terminal:
             from rich.console import Console
 
-            self._attach(Console(file=self._stream))
+            self._attach(
+                self._console
+                if self._console is not None
+                else Console(file=self._stream)
+            )
         return self
 
     def _attach(self, console):
@@ -177,7 +195,7 @@ class PreparationDisplay:
             get_renderable=self._render,
             refresh_per_second=2,
             screen=False,
-            transient=False,
+            transient=self._transient,
             redirect_stdout=True,
             redirect_stderr=True,
             vertical_overflow="crop",

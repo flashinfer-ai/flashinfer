@@ -38,6 +38,8 @@ def parse_env_flags(env_var_name) -> List[str]:
 
 
 def _get_glibcxx_abi_build_flags() -> List[str]:
+    if os.name == "nt":
+        return []
     glibcxx_abi_cflags = [
         "-D_GLIBCXX_USE_CXX11_ABI=" + str(int(torch._C._GLIBCXX_USE_CXX11_ABI))
     ]
@@ -167,14 +169,17 @@ def build_common_cflags(
     common_cflags += _get_glibcxx_abi_build_flags()
     if extra_include_dirs is not None:
         for extra_dir in extra_include_dirs:
-            common_cflags.append(f"-I{extra_dir.resolve()}")
+            path = extra_dir.resolve()
+            common_cflags.append(f'-I"{path}"' if os.name == "nt" else f"-I{path}")
     # Vendored CCCL headers use -I (not -isystem) so they take precedence
     # over the CTK-bundled copy. CCCL headers use #pragma system_header
     # internally to suppress warnings. See https://github.com/NVIDIA/cccl/issues/527
     for cccl_dir in cccl_includes:
-        common_cflags.append(f"-I{cccl_dir}")
+        common_cflags.append(f'-I"{cccl_dir}"' if os.name == "nt" else f"-I{cccl_dir}")
     for sys_dir in system_includes:
-        common_cflags.append(f"-isystem {sys_dir}")
+        common_cflags.append(
+            f'-I"{sys_dir}"' if os.name == "nt" else f"-isystem {sys_dir}"
+        )
 
     return common_cflags
 
@@ -184,10 +189,11 @@ def build_cflags(
     extra_cflags: Optional[List[str]] = None,
 ) -> List[str]:
     """Build C++ compilation flags."""
-    cflags = [
-        "$common_cflags",
-        "-fPIC",
-    ]
+    cflags = ["$common_cflags"] + (
+        ["/MD", "/EHsc", "/bigobj", "/Zc:__cplusplus", "/Zc:preprocessor"]
+        if os.name == "nt"
+        else ["-fPIC"]
+    )
     if extra_cflags is not None:
         cflags += extra_cflags
 
@@ -209,9 +215,13 @@ def build_cuda_cflags(
         cuda_cflags += ["-ccbin", cc_env]
     cuda_cflags += [
         "$common_cflags",
-        "--compiler-options=-fPIC",
+        "--compiler-options=/MD,/EHsc,/bigobj,/Zc:__cplusplus,/Zc:preprocessor"
+        if os.name == "nt"
+        else "--compiler-options=-fPIC",
         "--expt-relaxed-constexpr",
     ]
+    if os.name == "nt":
+        cuda_cflags.append("--use-local-env")
     cuda_version = get_cuda_version()
     # enable -static-global-template-stub when cuda version >= 12.8
     if cuda_version >= Version("12.8"):
@@ -261,6 +271,12 @@ def generate_ninja_build_for_op(
     extra_cuda_cflags_by_source: Optional[Mapping[Path, List[str]]] = None,
 ) -> str:
     cuda_home = get_cuda_path()
+    if os.name == "nt":
+        cuda_home = Path(cuda_home).as_posix()
+        if needs_device_linking or embedded_cubins:
+            raise NotImplementedError(
+                "Windows JIT does not support device linking or embedded cubins"
+            )
     common_cflags = build_common_cflags(cuda_home, extra_include_dirs)
     cflags = build_cflags(common_cflags, extra_cflags)
     cuda_cflags = build_cuda_cflags(common_cflags, extra_cuda_cflags)
@@ -277,6 +293,14 @@ def generate_ninja_build_for_op(
         "-lcudart",
         "-lcuda",
     ]
+    if os.name == "nt":
+        ldflags = [
+            "/DLL",
+            f'/LIBPATH:"{cuda_home}/lib/x64"',
+            "cudart.lib",
+            "cuda.lib",
+            f'"{tvm_ffi.libinfo.find_windows_implib()}"',
+        ]
 
     env_extra_ldflags = parse_env_flags("FLASHINFER_EXTRA_LDFLAGS")
     if env_extra_ldflags is not None:
@@ -285,11 +309,16 @@ def generate_ninja_build_for_op(
     if extra_ldflags is not None:
         ldflags += extra_ldflags
 
-    cxx = os.environ.get("CXX", "c++")
-    nvcc = os.environ.get("FLASHINFER_NVCC", "$cuda_home/bin/nvcc")
+    cxx = os.environ.get("CXX", "cl" if os.name == "nt" else "c++")
+    nvcc = os.environ.get(
+        "FLASHINFER_NVCC",
+        '"$cuda_home/bin/nvcc.exe"' if os.name == "nt" else "$cuda_home/bin/nvcc",
+    )
     # Compiler launchers (e.g., sccache, ccache) — empty string when unset
     cxx_launcher = os.environ.get("FLASHINFER_CXX_LAUNCHER", "")
     nvcc_launcher = os.environ.get("FLASHINFER_NVCC_LAUNCHER", "")
+    cxx_command = "$cxx_launcher $cxx" if cxx_launcher else "$cxx"
+    nvcc_command = "$nvcc_launcher $nvcc" if nvcc_launcher else "$nvcc"
 
     lines = [
         "ninja_required_version = 1.3",
@@ -309,12 +338,16 @@ def generate_ninja_build_for_op(
         "ldflags = " + join_multiline(ldflags),
         "",
         "rule compile",
-        "  command = $cxx_launcher $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags",
-        "  depfile = $out.d",
-        "  deps = gcc",
+        (
+            f"  command = {cxx_command} /nologo /showIncludes $cflags /c $in /Fo$out $post_cflags"
+            if os.name == "nt"
+            else f"  command = {cxx_command} -MMD -MF $out.d $cflags -c $in -o $out $post_cflags"
+        ),
+        "  deps = msvc" if os.name == "nt" else "  depfile = $out.d",
+        "" if os.name == "nt" else "  deps = gcc",
         "",
         "rule cuda_compile",
-        "  command = $nvcc_launcher $nvcc --generate-dependencies-with-compile -MF $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags",
+        f"  command = {nvcc_command} --generate-dependencies-with-compile -MF $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags",
         "  depfile = $out.d",
         "  deps = gcc",
         "",
@@ -343,7 +376,9 @@ def generate_ninja_build_for_op(
         lines.extend(
             [
                 "rule link",
-                "  command = $cxx $in $ldflags -o $out",
+                "  command = link.exe /nologo $in $ldflags /OUT:$out"
+                if os.name == "nt"
+                else "  command = $cxx $in $ldflags -o $out",
                 "",
             ]
         )
@@ -353,6 +388,9 @@ def generate_ninja_build_for_op(
     # while still supporting subninja for parallel AOT builds
     output_dir = jit_env.FLASHINFER_JIT_DIR / name
 
+    def ninja_path(path):
+        return str(path).replace("$", "$$").replace(" ", "$ ").replace(":", "$:")
+
     objects = []
     for source in sources:
         is_cuda = source.suffix == ".cu"
@@ -361,7 +399,7 @@ def generate_ninja_build_for_op(
         obj_name = f"{source.parent.name}_{source.stem}{object_suffix}"
         obj = str((output_dir / obj_name).resolve())
         objects.append(obj)
-        lines.append(f"build {obj}: {cmd} {source.resolve()}")
+        lines.append(f"build {ninja_path(obj)}: {cmd} {ninja_path(source.resolve())}")
         if source.resolve() in cuda_cflags_by_source:
             lines.append(
                 "  cuda_cflags = "
@@ -393,9 +431,13 @@ def generate_ninja_build_for_op(
 
     lines.append("")
     link_rule = "nvcc_link" if needs_device_linking else "link"
-    output_so = str((output_dir / f"{name}.so").resolve())
-    lines.append(f"build {output_so}: {link_rule} " + " ".join(objects))
-    lines.append(f"default {output_so}")
+    suffix = ".dll" if os.name == "nt" else ".so"
+    output_so = str((output_dir / f"{name}{suffix}").resolve())
+    lines.append(
+        f"build {ninja_path(output_so)}: {link_rule} "
+        + " ".join(map(ninja_path, objects))
+    )
+    lines.append(f"default {ninja_path(output_so)}")
     lines.append("")
 
     return "\n".join(lines)

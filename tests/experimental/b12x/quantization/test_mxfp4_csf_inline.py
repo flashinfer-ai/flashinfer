@@ -13,9 +13,10 @@ import pytest
 import torch
 from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
-from b12x._lib.intrinsics import get_ptr_as_int64, shared_ptr_to_u32
+from b12x._lib.intrinsics.memory import get_ptr_as_int64, shared_ptr_to_u32
 from b12x._lib.quant import mxfp4_csf_inline as inline
-from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x._lib.utils.device import current_cuda_stream
+from b12x._lib.utils.pointers import make_ptr
 from b12x.moe.fused_moe._impl import _e8m0_scale_to_w4a8_n64_sfb_inplace
 from ..conftest import require_b12x
 

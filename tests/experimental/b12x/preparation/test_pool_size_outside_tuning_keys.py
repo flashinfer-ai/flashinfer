@@ -133,8 +133,8 @@ def test_pool_dependent_contracts_exclude_pool_size_fields():
     assert "max_state_slots" not in GDN_PREFILL.query_fields
     assert (
         "max_state_slots" not in GDN_DECODE.query_fields
-        and GDN_DECODE.query_schema_version == 6
+        and GDN_DECODE.query_schema_version >= 22
     )
-    assert "max_state_slots" not in PLE.query_fields and PLE.query_schema_version == 4
+    assert "max_state_slots" not in PLE.query_fields and PLE.query_schema_version >= 22
     assert not {"num_main_cache_pages", "num_compressed_cache_pages"} & QSA.query_fields
-    assert QSA.query_schema_version == 7
+    assert QSA.query_schema_version >= 22

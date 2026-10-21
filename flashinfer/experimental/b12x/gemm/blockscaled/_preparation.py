@@ -13,7 +13,8 @@ import triton
 from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
 from b12x._lib.scratch import scratch_buffer_spec
-from b12x._lib.utils import current_cuda_stream, cuda_stream_to_int, make_ptr
+from b12x._lib.utils.device import current_cuda_stream, cuda_stream_to_int
+from b12x._lib.utils.pointers import make_ptr
 from b12x.preparation import FrozenMapping, MemoryRequirements, PersistentMemory, Plan
 from b12x.preparation.types import _CompositePlan
 from ._tuning import (
@@ -489,7 +490,7 @@ class _PackedExecutionState:
                 m,
                 *constants,
             )
-            from b12x._lib.intrinsics import (
+            from b12x._lib.intrinsics.reference import (
                 as_grouped_scale_view,
                 as_grouped_scale_view_mx,
             )
@@ -893,7 +894,10 @@ class _FixedExecutionState:
         stream,
     ):
         from ._a16 import _stream_context, scale_storage
-        from b12x._lib.intrinsics import as_grouped_scale_view, as_grouped_scale_view_mx
+        from b12x._lib.intrinsics.reference import (
+            as_grouped_scale_view,
+            as_grouped_scale_view_mx,
+        )
         from b12x.gemm._tuning import DenseGemmQuery, operand_options
 
         q = self.query

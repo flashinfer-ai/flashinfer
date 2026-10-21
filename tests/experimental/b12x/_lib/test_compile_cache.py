@@ -21,22 +21,24 @@ def test_package_root_is_the_b12x_package():
     assert (root / "_lib" / "compiler.py").is_file()
 
 
-def test_fingerprint_tracks_source_edits(tmp_path, monkeypatch):
-    (tmp_path / "kernel.py").write_text("x = 1\n")
-    pycache = tmp_path / "__pycache__"
-    pycache.mkdir()
-    monkeypatch.setattr(compiler, "_PACKAGE_ROOT", tmp_path)
+def test_clear_compile_cache_resets_source_discovery(monkeypatch):
+    from b12x._lib import source_dependencies
 
-    before = compiler._compute_b12x_package_fingerprint()
+    compiler.clear_compile_cache()
+    discover = source_dependencies._discover_callable_sources
+    calls = []
 
-    (pycache / "kernel.cpython-312.pyc").write_bytes(b"ignored")
-    assert compiler._compute_b12x_package_fingerprint() == before, (
-        "__pycache__ must not affect the fingerprint"
-    )
+    def tracked(*args):
+        calls.append(args)
+        return discover(*args)
 
-    (tmp_path / "kernel.py").write_text("x = 2\n")
-    after = compiler._compute_b12x_package_fingerprint()
-    assert after != before, "editing any source must change the fingerprint"
+    monkeypatch.setattr(source_dependencies, "_discover_callable_sources", tracked)
+    before = compiler._target_source_fingerprint(compiler.compile)
+    assert compiler._target_source_fingerprint(compiler.compile) == before
+    assert len(calls) == 1
+    compiler.clear_compile_cache()
+    assert compiler._target_source_fingerprint(compiler.compile) == before
+    assert len(calls) == 2
 
 
 def test_cache_dir_resolution_order(monkeypatch):
@@ -69,9 +71,7 @@ def test_disk_cache_key_includes_device_arch_and_forwards_ordinal(monkeypatch):
         compiler,
         "_static_compile_cache_context",
         lambda _callable: (
-            "package",
             "toolchain",
-            (),
             (),
         ),
     )
@@ -89,7 +89,7 @@ def test_disk_cache_key_includes_device_arch_and_forwards_ordinal(monkeypatch):
         {},
     )
 
-    assert payload[0] == "b12x_cute_compile_cache_v4"
+    assert payload[0] == "b12x_cute_compile_cache_v5"
     assert payload[4] == ("cuda", (12, 1), 48)
     assert repeated_payload == payload
     assert seen["ordinal"] == 3
@@ -166,7 +166,7 @@ def test_disk_payload_retries_architecture_probe_failure(monkeypatch):
     monkeypatch.setattr(
         compiler,
         "_static_compile_cache_context",
-        lambda _callable: ("package", "toolchain", (), ()),
+        lambda _callable: ("toolchain", ()),
     )
     attempts = {"count": 0}
 
@@ -208,7 +208,6 @@ def test_explicit_cache_payload_includes_device_arch(monkeypatch):
     compile_callable = object()
     device_arch = ("cuda", (12, 1), 48)
     compile_options = ("--opt-level=2",)
-    compile_environment = (("CUTE_DSL_ARCH", "sm_120"),)
     monkeypatch.setattr(compiler, "_current_device_ordinal", lambda: 7)
     monkeypatch.setattr(
         compiler,
@@ -219,10 +218,8 @@ def test_explicit_cache_payload_includes_device_arch(monkeypatch):
         compiler,
         "_static_compile_cache_context",
         lambda _callable: (
-            "a" * 64,
             (("python", "cpython", (3, 12, 0)),),
             compile_options,
-            compile_environment,
         ),
     )
     compile_spec = compiler.KernelCompileSpec.from_facts(
@@ -241,23 +238,22 @@ def test_explicit_cache_payload_includes_device_arch(monkeypatch):
         compile_spec,
     )
 
-    assert len(payload) == 11
-    assert payload[0] == "b12x_cute_compile_cache_v7_explicit_spec"
+    assert len(payload) == 10
+    assert payload[0] == "b12x_cute_compile_cache_v8_explicit_spec"
     assert payload[4] == device_arch
-    assert payload[5:11] == (
+    assert payload[5:10] == (
         compile_spec.hash_key,
         compile_spec.json_key,
         kwargs_hash,
         kwargs_json,
         compile_options,
-        compile_environment,
     )
 
 
 def test_architecture_unavailable_disables_disk_cache(monkeypatch):
     monkeypatch.setenv("B12X_COMPILE_DISK_CACHE", "1")
     payload = (
-        "b12x_cute_compile_cache_v4",
+        "b12x_cute_compile_cache_v5",
         ("function", "test", "kernel"),
         "package",
         "toolchain",

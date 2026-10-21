@@ -21,11 +21,8 @@ from dataclasses import dataclass
 
 import torch
 
-from b12x._lib.intrinsics import (
-    align_up,
-    swizzle_block_scale,
-    validate_e8m0_scale_grid,
-)
+from b12x._lib.intrinsics.math import align_up
+from b12x._lib.intrinsics.reference import swizzle_block_scale, validate_e8m0_scale_grid
 
 _SF_BLOCK = 32  # K elements per UE8M0 block scale
 _TILE_K = 128  # kernel K-tile width (packed 3:4 along K)

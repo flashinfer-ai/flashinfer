@@ -101,7 +101,7 @@ def session(tmp_path, **kwargs):
     """Build a CPU preparation session with an isolated selection cache."""
     value = PreparationSession(device=DetectedDevice(None, None), **kwargs)
     value._cache = SelectionCache(
-        tmp_path, {"schema_version": 6, "tuning_cache_version": 1}
+        tmp_path, {"schema_version": 23, "tuning_cache_version": 1}
     )
     return value
 
@@ -228,6 +228,22 @@ def test_prepare_fills_plans_in_place_and_release_runs_closers(tmp_path):
     engine.close()
     assert sorted(closed) == ["a", "b"]
     assert b.plan.prepared is None
+
+
+def test_reprepared_plan_closes_in_reverse_acquisition_order(tmp_path):
+    closed = []
+    requests = tuple(
+        request(name=name, close=lambda name=name: closed.append(name))
+        for name in ("a", "b", "c")
+    )
+    with session(tmp_path) as engine:
+        engine.prepare(requests)
+        engine.release(requests[1].plan)
+        assert closed == ["b"]
+        engine.prepare(requests[:2])
+        engine.prepare(requests)
+    assert closed == ["b", "b", "c", "a"]
+    assert all(item.plan.prepared is None for item in requests)
 
 
 def test_job_bundle_memo_ends_at_completion_but_plan_programs_survive(tmp_path):
@@ -641,6 +657,26 @@ def test_persistent_memory_counts_shared_keys_once_and_rejects_conflicts():
                 ),
             )
         )
+
+
+@pytest.mark.parametrize("sizes", [(257, 321), (321, 257)])
+def test_sequential_scratch_covers_variants_with_equal_aligned_sizes(sizes):
+    requirements = tuple(
+        MemoryRequirements(
+            scratch=(
+                ScratchBufferSpec(
+                    name="workspace",
+                    shape=(size,),
+                    dtype=torch.uint8,
+                    device=torch.device("cpu"),
+                ),
+            )
+        )
+        for size in sizes
+    )
+    combined = MemoryRequirements.sequential(requirements)
+    assert combined.scratch_nbytes == 512
+    assert sum(spec.nbytes for spec in combined.scratch) >= max(sizes)
 
 
 def _deterministic_timer(monkeypatch, *, stop=None, batches=None):

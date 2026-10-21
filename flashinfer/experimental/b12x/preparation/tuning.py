@@ -428,8 +428,8 @@ def make_fixed_contract(*, component_id, query_type, backend) -> TuningContract:
 
     return TuningContract(
         component_id=component_id,
-        query_schema_version=1,
-        config_schema_version=1,
+        query_schema_version=22,
+        config_schema_version=22,
         query_fields=query_fields,
         config_fields=frozenset({"backend"}),
         encode_query=lambda query: {

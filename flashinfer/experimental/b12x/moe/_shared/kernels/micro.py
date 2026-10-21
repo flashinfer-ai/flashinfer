@@ -13,50 +13,52 @@ from cutlass import BFloat16, Float32, Uint32
 
 from cutlass.cutlass_dsl import Int32, Int64
 
-from b12x._lib.utils import (
+from b12x._lib.utils.device import (
     current_cuda_stream,
     get_num_sm,
     get_max_active_clusters,
-    make_ptr,
 )
-from b12x._lib.intrinsics import (
+from b12x._lib.utils.pointers import make_ptr
+from b12x._lib.intrinsics.atomics import (
     atomic_add_global_i32,
-    bfloat2_to_float2_scaled,
+    red_add_global_f32,
+    st_global_i32,
+)
+from b12x._lib.intrinsics.conversion import (
     cvt_e4m3_to_f32_via_f16,
     cvt_e4m3x4_to_f32x4,
     cvt_e8m0_to_f32,
     cvt_e8m0x4_to_f32x4,
     cvt_f32_to_e4m3,
     cvt_w4a16_packed_e4m3_scale_to_f32,
-    fmax_f32,
     f16x2_to_f32x2,
     fp4_decode_4bytes,
-    fp4_dot4_sum_f32acc,
-    fp4_dot8_sum_f32acc,
+    nvfp4_scale_from_amax,
+    pack_f32x2_to_f16x2,
+    quant_dequant_2,
+)
+from b12x._lib.intrinsics.dot import fp4_dot4_sum_f32acc, fp4_dot8_sum_f32acc
+from b12x._lib.intrinsics.math import fmax_f32
+from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
-    ld_global_acquire_i32,
     ld_global_cg_f32,
     ld_global_nc_u32,
     ld_global_nc_v4_u32,
-    mx_scale_from_amax32,
-    nvfp4_scale_from_amax,
-    quant_dequant_e4m3_2,
-    pack_f32x2_to_f16x2,
     prefetch_global_l2,
-    quant_dequant_2,
-    red_add_global_f32,
-    spin_wait_global_eq_i32,
     st_global_f32,
-    st_global_i32,
+)
+from b12x._lib.intrinsics.packed import bfloat2_to_float2_scaled
+from b12x._lib.intrinsics.quantization import mx_scale_from_amax32, quant_dequant_e4m3_2
+from b12x._lib.intrinsics.reduction import warp_reduce
+from b12x._lib.intrinsics.sync import (
+    ld_global_acquire_i32,
+    spin_wait_global_eq_i32,
     st_global_release_i32,
     threadfence,
-    warp_reduce,
 )
-from b12x._lib.intrinsics import (
-    _f16x2_dot_sum_f32acc,
-    fp8x4_e4m3_to_half2x2,
-    packed_decode_lut_e4m3_to_e4m3x8,
-)
+from b12x._lib.intrinsics.dot import _f16x2_dot_sum_f32acc
+from b12x._lib.intrinsics.packed import fp8x4_e4m3_to_half2x2
+from b12x._lib.intrinsics.trellis import packed_decode_lut_e4m3_to_e4m3x8
 from b12x.moe._shared.kernels.w4a8_trellis_decode import (
     _w4a8_had128_quad,
     _w4a8_trellis_lane_geom,

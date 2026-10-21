@@ -15,13 +15,13 @@ from cutlass.cute.runtime import from_dlpack
 from b12x._lib.compiler import KernelCompileSpec, compile as compile_cute
 from b12x._lib.compiler import key_field, run_compiled
 from b12x._lib.program_cache import register_program_cache
-from b12x._lib.intrinsics import (
-    bfloat2_to_float2_scaled,
-    cvt_f32x4_to_e4m3x4,
+from b12x._lib.intrinsics.conversion import cvt_f32x4_to_e4m3x4
+from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
     ld_global_v2_u32,
     st_global_u32,
 )
+from b12x._lib.intrinsics.packed import bfloat2_to_float2_scaled
 
 FP8 = torch.float8_e4m3fn
 _THREADS = 128

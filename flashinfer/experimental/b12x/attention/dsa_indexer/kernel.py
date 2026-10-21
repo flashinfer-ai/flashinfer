@@ -25,11 +25,10 @@ from b12x._lib.compiler import (
     tensor_compile_fact,
 )
 from b12x._lib.compile_plan import compile_only_launches_enabled
-from b12x._lib.intrinsics import get_sm_version
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.arch import get_sm_version
+from b12x._lib.intrinsics.memory import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
-    frag_layout_swizzle_16b_to_8b,
     get_ptr_as_int64,
     ld_global_v4_u32,
     ld_shared_v4_u32,
@@ -37,12 +36,13 @@ from b12x._lib.intrinsics import (
     ldmatrix_m8n8x4_b16,
     ldmatrix_m8n8x4_left_half_b16,
     ldmatrix_m8n8x4_right_half_b16,
-    mxfp8_mma_m16n8k32_f32_e4m3,
     shared_ptr_to_u32,
     st_shared_v4_u32,
 )
+from b12x._lib.intrinsics.mma import mxfp8_mma_m16n8k32_f32_e4m3
+from b12x._lib.intrinsics.packed import frag_layout_swizzle_16b_to_8b
 from cutlass import Int64
-from b12x._lib.utils import current_cuda_stream
+from b12x._lib.utils.device import current_cuda_stream
 
 
 _INDEX_HEAD_DIM = 128

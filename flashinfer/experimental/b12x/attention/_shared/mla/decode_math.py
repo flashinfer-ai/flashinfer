@@ -53,44 +53,46 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from b12x.attention._shared.cute.ops import LOG2_E
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.atomics import (
     atomic_max_shared_f32,
-    byte_perm,
+    ld_shared_f32,
+    ld_shared_u32,
+    st_shared_bf16_from_f32,
+    st_shared_f32,
+    st_shared_u32,
+    store_bf16x2,
+)
+from b12x._lib.intrinsics.constants import mma_m16n8k16_f32_bf16
+from b12x._lib.intrinsics.conversion import (
     cvt_f32_to_e4m3,
     cvt_e4m3_to_f32_via_f16,
-    fabs_f32,
     f16x2_to_f32x2,
-    fmax_f32,
-    fmin_f32,
     fp8_e4m3_to_f32,
     fp4_decode_2,
+    pow2_ceil_ue8m0,
+)
+from b12x._lib.intrinsics.math import fabs_f32, fmax_f32, fmin_f32, rcp_approx_ftz
+from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
-    half2_mul,
     ld_global_nc_v2_u32,
     ld_global_nc_v4_u32,
     ld_shared_v2_u32,
     ld_shared_v4_u32,
-    ld_shared_f32,
     ld_shared_u8_offset,
-    ld_shared_u32,
     ldmatrix_m8n8x2_b16,
     ldmatrix_m8n8x4_b16,
-    mma_m16n8k16_f32_bf16,
-    mma_m16n8k32_f32_e4m3,
-    mxfp8_mma_m16n8k32_f32_e4m3,
-    mxfp8_pair_to_bf16x2_sm120,
-    nvfp4_pair_to_bf16x2_sm120,
-    pack_f32x2_to_bfloat2,
-    pow2_ceil_ue8m0,
-    rcp_approx_ftz,
     shared_ptr_to_u32,
-    st_shared_bf16_from_f32,
-    st_shared_f32,
-    st_shared_u32,
     st_shared_u8,
     st_shared_v4_u32,
     st_global_v4_u32,
-    store_bf16x2,
+)
+from b12x._lib.intrinsics.mma import mma_m16n8k32_f32_e4m3, mxfp8_mma_m16n8k32_f32_e4m3
+from b12x._lib.intrinsics.packed import (
+    byte_perm,
+    half2_mul,
+    mxfp8_pair_to_bf16x2_sm120,
+    nvfp4_pair_to_bf16x2_sm120,
+    pack_f32x2_to_bfloat2,
 )
 
 

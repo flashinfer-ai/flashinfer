@@ -598,6 +598,34 @@ options, and embedded device-capacity constants. It hashes the attention source
 tree, including shared preparation, masks, and reductions. Occupancy queries
 are cached per device and cluster size by `_hardware.py`.
 
+The experimental b12x backend uses
+`flashinfer/experimental/b12x/_lib/compiler.py` and stores compiled objects in
+`$B12X_COMPILE_CACHE_DIR`, or `$XDG_CACHE_HOME/b12x/compile` (defaulting to
+`~/.cache/b12x/compile`). Its disk identity includes the callable's transitive
+local source files, compiler support files, resolved specialization, effective
+code-generation options, toolchain, and device architecture. AST import tracing
+includes nested and conditional imports, inherited callables, decorators, and
+callable defaults. External packages participate through toolchain identity.
+Raw environment variables and diagnostic output destinations do not participate;
+environment-selected code generation must be represented by resolved kernel
+parameters or compiler options. Computed imports in implementation modules
+declare local targets in `__b12x_source_dependencies__`. Shared helpers live in
+leaf modules under `_lib/intrinsics/`, `_lib/utils/`, `_lib/dense_gemm/`, and
+`moe/_shared/kernels/`; consumers import the defining module to keep dependency
+closures narrow. Callable source discovery is cached by function or class,
+including the owner class for bound methods, and cleared by
+`clear_compile_cache()`. Source and compiler configuration are process-immutable:
+restart after editing code or changing compiler defaults. Warm in-memory hits
+and prepared CUDA graph replay do not read or parse source files.
+
+b12x autotuning selection keys include the actual compile keys of every eligible
+candidate, including previously losing candidates. Preparation describes their
+programs without lowering or launching kernels and reuses those descriptions for
+compilation. Changes to relevant source, specialization, compiler options, or
+toolchain require a fresh race. Unrelated kernels retain their saved selections.
+The tuning contract's schema versions and `B12X_TUNING_CACHE_VERSION` remain
+explicit controls for changes to tuning semantics and manual retuning.
+
 ### Dispatch Macros
 
 Handle combinatorial parameter spaces:

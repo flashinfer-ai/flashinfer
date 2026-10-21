@@ -16,12 +16,9 @@ import torch
 from cutlass import Float32, Int32, Uint32
 from cutlass.cute.runtime import from_dlpack
 
-from b12x._lib.intrinsics import (
-    cvt_e8m0_to_f32,
-    fabs_f32,
-    fmax_f32,
-    swizzle_block_scale,
-)
+from b12x._lib.intrinsics.conversion import cvt_e8m0_to_f32
+from b12x._lib.intrinsics.math import fabs_f32, fmax_f32
+from b12x._lib.intrinsics.reference import swizzle_block_scale
 from b12x._lib.fp6 import (
     _decode_fp6_e2m3,
     _decode_fp6_e3m2,

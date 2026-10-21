@@ -14,15 +14,14 @@ from cutlass.cute.typing import AddressSpace
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
-from b12x._lib.intrinsics import align_up
-from b12x._lib.utils import (
-    MXFP6_SF_VEC_SIZE,
+from b12x._lib.intrinsics.math import align_up
+from b12x._lib.utils.device import (
     current_cuda_stream,
     get_max_active_clusters,
     get_num_sm,
-    make_ptr,
-    mxfp6_packed_k_bytes,
 )
+from b12x._lib.utils.fp6_geometry import MXFP6_SF_VEC_SIZE, mxfp6_packed_k_bytes
+from b12x._lib.utils.pointers import make_ptr
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x.quantization.mxfp6.bf16_to_fp6_tma import TestKernel as FP6TestKernel
 

@@ -46,11 +46,11 @@ import triton.language as tl
 from triton import cdiv as triton_cdiv
 from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
-from b12x._lib.intrinsics import (
+from b12x._lib.intrinsics.atomics import ld_shared_u32
+from b12x._lib.intrinsics.memory import (
     cp_async4_shared_global,
     ld_global_nc_u32,
     ld_global_nc_v4_u32,
-    ld_shared_u32,
 )
 
 TILE_BYTES = 96
