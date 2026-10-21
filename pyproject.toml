@@ -99,8 +99,9 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.experimental.nvfp4_mla_decode" = ["csrc/**"]
 "flashinfer.experimental.nvfp4_sparse_mla_decode" = ["csrc/**"]
 "flashinfer.experimental.cake_dsa_indexer" = ["csrc/**", "build.json"]
-# Generated sources for the experimental exact-SM100a/SM103a Kimi-K3 attention-residual (AttnRes) backend, compiled on demand.
-"flashinfer.experimental.cake_kimi_k3_attn_res" = ["csrc/**"]
+# Generated sources and the build manifest (build.json) of the experimental exact-SM100a/SM103a Kimi-K3
+# attention-residual (AttnRes) backend; its cake_build loader compiles them on demand, prebuilt aot/ libraries never ship.
+"flashinfer.experimental.cake_kimi_k3_attn_res" = ["csrc/**", "build.json"]
 # Generated sources for the experimental exact-SM100a/SM103a Kimi-K3 FP8 projection backend, compiled on demand.
 "flashinfer.experimental.kimi_k3_fp8_projection" = ["csrc/**"]
 # Generated sources for the experimental exact-SM100a/SM103a per-token NVFP4 quantizer and GEMM backend, compiled on demand.
