@@ -83,8 +83,9 @@ Specialised for K == V == 128, HV % H == 0, HV // H == 4 (Qwen3.5 GDN geometry).
 
 from __future__ import annotations
 
+import functools
 import math
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -211,6 +212,8 @@ class GdnReplayMtpUmmaRubin:
         sr_rounds: int = 0,
         mixed_fma: bool = False,
         persistent: bool = False,
+        h_io: Optional[int] = None,
+        hv_io: Optional[int] = None,
     ):
         assert 1 <= T <= 8
         assert hv % h == 0 and 1 <= hv // h <= HPK, (h, hv)
@@ -225,6 +228,13 @@ class GdnReplayMtpUmmaRubin:
         self.T = T
         self.h = h
         self.hv = hv
+        # Head counts of the q / k and v / a / b / out tensors' token rows (their strides) and of
+        # the logical state pool (the stochastic-rounding ids): above h / hv when the launch runs
+        # a slice of the heads (uGPU head split: the inputs are head-slice views of the full
+        # tensors, the state and rings the slice's own part, hv_base its first value head).
+        self.h_io = h if h_io is None else h_io
+        self.hv_io = hv if hv_io is None else hv_io
+        assert self.h_io >= h and self.hv_io >= hv and self.hv_io * h == self.h_io * hv
         # u ring dtype (bf16 / fp16): read and appended through dtype-aware conversions.
         # The k ring is bf16 by construction (the Gram runs bf16 mma.sync on it).
         self.u_bf16 = u_bf16
@@ -348,6 +358,7 @@ class GdnReplayMtpUmmaRubin:
         rand_seed,
         scale: Float32,
         flush_min: Int32,
+        hv_base: Int32,
         stream,
     ):
         """Non-persistent launch: one CTA per (key head x head slice, batch row)."""
@@ -375,6 +386,7 @@ class GdnReplayMtpUmmaRubin:
             rand_seed,
             scale,
             flush_min,
+            hv_base,
             tma_ld,
             tma_st,
         ).launch(
@@ -405,6 +417,7 @@ class GdnReplayMtpUmmaRubin:
         rand_seed: cute.Tensor,
         scale: Float32,
         flush_min: Int32,
+        hv_base: Int32,
         tma_ld: cpasync.TmaInfo,
         tma_st: cpasync.TmaInfo,
     ):
@@ -1302,6 +1315,7 @@ class GdnReplayMtpUmmaRubin:
                 f_epi_a=f_epi_a,
                 f_gdone=f_gdone,
                 rd0=rd0,
+                hv_base=hv_base,
             )
             if is_flush:
                 self._load_seed(ctx, rand_seed)
@@ -1375,6 +1389,7 @@ class GdnReplayMtpUmmaRubin:
         rand_seed: cute.Tensor,
         scale: Float32,
         flush_min: Int32,
+        hv_base: Int32,
         tma_ld: cpasync.TmaInfo,
         tma_st: cpasync.TmaInfo,
     ):
@@ -2132,6 +2147,7 @@ class GdnReplayMtpUmmaRubin:
                 f_epi_a=f_epi_a,
                 f_gdone=f_gdone,
                 rd0=rd0,
+                hv_base=hv_base,
             )
             if is_flush:
                 self._load_seed(ctx, rand_seed)
@@ -2238,6 +2254,7 @@ class GdnReplayMtpUmmaRubin:
         ctr,
         scale: Float32,
         flush_min: Int32,
+        hv_base: Int32,
         n_cta: Int32,
         stream,
     ):
@@ -2263,6 +2280,7 @@ class GdnReplayMtpUmmaRubin:
             ctr,
             scale,
             flush_min,
+            hv_base,
             tma_ld,
             tma_st,
         ).launch(
@@ -2294,6 +2312,7 @@ class GdnReplayMtpUmmaRubin:
         ctr: cute.Tensor,
         scale: Float32,
         flush_min: Int32,
+        hv_base: Int32,
         tma_ld: cpasync.TmaInfo,
         tma_st: cpasync.TmaInfo,
     ):
@@ -2448,6 +2467,7 @@ class GdnReplayMtpUmmaRubin:
                 rand_seed,
                 scale,
                 flush_min,
+                hv_base,
                 mbar,
                 sm,
             )
@@ -2566,8 +2586,10 @@ class GdnReplayMtpUmmaRubin:
             + Int64(cute.crd2idx((sidx, hv0, 0), g_cache.layout)) * 4,
             self.hpc * RING_SLOTS * 4,
         )
-        abn = T * self.hv * 2
-        if abn % 16 == 0:
+        # a / b of the row: the launch's heads of every token (one span; with a head slice its
+        # start is 16 B aligned when the slice's head count is a multiple of 8)
+        abn = ((T - 1) * self.hv_io + self.hv) * 2
+        if abn % 16 == 0 and (self.hv_io == self.hv or self.hv % 8 == 0):
             U.bulk_prefetch_l2(
                 a.iterator.toint() + Int64(cute.crd2idx((brow, 0, 0), a.layout)) * 2,
                 abn,
@@ -3027,6 +3049,7 @@ class GdnReplayMtpUmmaRubin:
         rand_seed,
         scale,
         flush_min,
+        hv_base,
         mbar,
         sm,
     ):
@@ -3064,6 +3087,7 @@ class GdnReplayMtpUmmaRubin:
                 out,
                 rand_seed,
                 scale,
+                hv_base,
                 mbar,
                 sm,
             )
@@ -3123,6 +3147,7 @@ class GdnReplayMtpUmmaRubin:
         out,
         rand_seed,
         scale,
+        hv_base,
         mbar,
         sm,
     ):
@@ -3449,6 +3474,7 @@ class GdnReplayMtpUmmaRubin:
             ph=ph,
             phf=nf & 1,
             xrow=True,
+            hv_base=hv_base,
         )
         if fl != 0:
             self._pz_flush_heads(ctx, rand_seed)
@@ -3880,7 +3906,9 @@ class GdnReplayMtpUmmaRubin:
             for s_ in range(t + 1):
                 y = y + s_coef[cb + _CO_BQ + t * 8 + s_] * uu[s_]
             if pz:
-                U.stg_u16(y_a + Int64(t * self.hv * V_DIM * 2), U.f32_to_u16(y, True))
+                U.stg_u16(
+                    y_a + Int64(t * self.hv_io * V_DIM * 2), U.f32_to_u16(y, True)
+                )
             else:
                 out[brow, t, hv, row] = BFloat16(y)
             if early_release and not pz:
@@ -3930,7 +3958,11 @@ class GdnReplayMtpUmmaRubin:
             # flat element offset of S[sidx, hv, row, 64 g] in the [pool, HV, V, K] state pool
             # (FlashInfer Mamba's Philox counter: state offset + row * K + column)
             off_row = (
-                (Int64(ctx["sidx"]) * self.hv + Int64(ctx["hv0"] + hh)) * V_DIM
+                (
+                    Int64(ctx["sidx"]) * self.hv_io
+                    + Int64(ctx["hv_base"] + ctx["hv0"] + hh)
+                )
+                * V_DIM
                 + Int64(row)
             ) * K_DIM + g * 64
             return (
@@ -3951,7 +3983,11 @@ class GdnReplayMtpUmmaRubin:
             # RXS-M-XS output fixes that but costs ~7 instructions per word -- as much as
             # 5-round Philox (measured), so use "philox" when that matters.
             cid = (
-                (Int64(ctx["sidx"]) * self.hv + Int64(ctx["hv0"] + hh)) * V_DIM
+                (
+                    Int64(ctx["sidx"]) * self.hv_io
+                    + Int64(ctx["hv_base"] + ctx["hv0"] + hh)
+                )
+                * V_DIM
                 + Int64(row)
             ) * 2 + g
             x0 = U.fmix32(
@@ -4048,7 +4084,11 @@ class GdnReplayMtpUmmaRubin:
             # flat element offset of S[sidx, hv, row, 64 g] in the [pool, HV, V, K] state pool
             # (FlashInfer Mamba's Philox counter: state offset + row * K + column)
             off_row = (
-                (Int64(ctx["sidx"]) * self.hv + Int64(ctx["hv0"] + hh)) * V_DIM
+                (
+                    Int64(ctx["sidx"]) * self.hv_io
+                    + Int64(ctx["hv_base"] + ctx["hv0"] + hh)
+                )
+                * V_DIM
                 + Int64(row)
             ) * K_DIM + g * 64
         ldn = self.ldn  # TMEM columns per load (see __init__)
@@ -4057,7 +4097,11 @@ class GdnReplayMtpUmmaRubin:
         if self.sr_lcg:
             # LCG dither: the same chains as _rmw_setup (see there)
             cid = (
-                (Int64(ctx["sidx"]) * self.hv + Int64(ctx["hv0"] + hh)) * V_DIM
+                (
+                    Int64(ctx["sidx"]) * self.hv_io
+                    + Int64(ctx["hv_base"] + ctx["hv0"] + hh)
+                )
+                * V_DIM
                 + Int64(row)
             ) * 2 + g
             x0 = U.fmix32(
@@ -4145,18 +4189,24 @@ class GdnReplayMtpUmmaRubin:
         sr: str = "",
         sr_rounds: int = 0,
         persistent: bool = False,
+        h_io: Optional[int] = None,
+        hv_io: Optional[int] = None,
     ):
-        """Compile one specialisation for ``device``'s architecture (callers use ``_get_kernel``)."""
+        """Compile one specialisation for ``device``'s architecture (callers use ``_get_kernel``).
+        ``h_io`` / ``hv_io``: head counts of the input / output tensors' token rows (see
+        ``__init__``); q / k / v / a / b / out are then head-slice views with those strides."""
+        h_io = h if h_io is None else h_io
+        hv_io = hv if hv_io is None else hv_io
         batch = cute.sym_int()
         pool = cute.sym_int()
         ft = U.make_fake_tensor_lead_dyn
         uring = BFloat16 if u_bf16 else Float16
         args = [
-            ft(BFloat16, (batch, T, h, K_DIM), 8),  # q
-            ft(BFloat16, (batch, T, h, K_DIM), 8),  # k
-            ft(BFloat16, (batch, T, hv, V_DIM), 8),  # v
-            ft(BFloat16, (batch, T, hv), 1),  # a
-            ft(BFloat16, (batch, T, hv), 1),  # b
+            ft(BFloat16, (batch, T, h, K_DIM), 8, (T, h_io, K_DIM)),  # q
+            ft(BFloat16, (batch, T, h, K_DIM), 8, (T, h_io, K_DIM)),  # k
+            ft(BFloat16, (batch, T, hv, V_DIM), 8, (T, hv_io, V_DIM)),  # v
+            ft(BFloat16, (batch, T, hv), 1, (T, hv_io)),  # a
+            ft(BFloat16, (batch, T, hv), 1, (T, hv_io)),  # b
             ft(Float32, (hv,), 1),  # A_log (fp32)
             ft(Float32, (hv,), 1),  # dt_bias (fp32)
             ft(Float16, (pool, hv, V_DIM, K_DIM), 8),  # state
@@ -4167,34 +4217,39 @@ class GdnReplayMtpUmmaRubin:
             ft(Int32, (batch,), 1),  # hist_len
             ft(Int32, (batch,), 1),  # cache_base
             ft(Int32, (batch,), 1),  # row order
-            ft(BFloat16, (batch, T, hv, V_DIM), 8),  # out
+            ft(BFloat16, (batch, T, hv, V_DIM), 8, (T, hv_io, V_DIM)),  # out
             ft(Int64, (1,), 1),  # rand_seed (read by "philox" / "lcg")
         ]
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         tgt = gdn_device_target(device)
         mixed_fma = (tgt.major, tgt.minor) in _FHFMA2_CC
+        obj = GdnReplayMtpUmmaRubin(
+            T,
+            h,
+            hv,
+            u_bf16,
+            use_row_order,
+            hpc,
+            sr,
+            sr_rounds,
+            mixed_fma,
+            persistent,
+            h_io,
+            hv_io,
+        )
+        opts = gdn_compile_options(device, cute.EnableTVMFFI(True))
         if persistent:
-            obj = GdnReplayMtpUmmaRubin(
-                T, h, hv, u_bf16, use_row_order, hpc, sr, sr_rounds, mixed_fma, True
-            )
-            return cute.compile[gdn_compile_options(device, cute.EnableTVMFFI(True))](
+            return cute.compile[opts](
                 obj.call_persist,
                 *args,
                 ft(Int32, (2,), 1),  # claim counter
-                Float32(1.0),
-                Int32(1),
-                Int32(1),
+                Float32(1.0),  # scale
+                Int32(1),  # flush_min
+                Int32(0),  # hv_base
+                Int32(1),  # n_cta
                 stream,
             )
-        return cute.compile[gdn_compile_options(device, cute.EnableTVMFFI(True))](
-            GdnReplayMtpUmmaRubin(
-                T, h, hv, u_bf16, use_row_order, hpc, sr, sr_rounds, mixed_fma
-            ),
-            *args,
-            Float32(1.0),
-            Int32(1),
-            stream,
-        )
+        return cute.compile[opts](obj, *args, Float32(1.0), Int32(1), Int32(0), stream)
 
 
 _KERNELS: dict = {}
@@ -4211,9 +4266,13 @@ def _get_kernel(
     sr: str,
     sr_rounds: int,
     persistent: bool = False,
+    h_io: Optional[int] = None,
+    hv_io: Optional[int] = None,
 ):
     """The compiled kernel for this specialisation on ``device``'s architecture: one per
     (compile target, parameters); batch and pool sizes are dynamic."""
+    h_io = h if h_io is None else h_io
+    hv_io = hv if hv_io is None else hv_io
     key = (
         gdn_device_target(device).compile_key,
         T,
@@ -4225,11 +4284,24 @@ def _get_kernel(
         sr,
         sr_rounds,
         persistent,
+        h_io,
+        hv_io,
     )
     fn = _KERNELS.get(key)
     if fn is None:
         fn = GdnReplayMtpUmmaRubin.compile(
-            device, T, h, hv, u_bf16, use_row_order, hpc, sr, sr_rounds, persistent
+            device,
+            T,
+            h,
+            hv,
+            u_bf16,
+            use_row_order,
+            hpc,
+            sr,
+            sr_rounds,
+            persistent,
+            h_io,
+            hv_io,
         )
         _KERNELS[key] = fn
     return fn
@@ -4466,6 +4538,16 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
     and sm_100a (there without the persistent kernel); any other arch raises
     ``NotImplementedError``.
 
+    uGPU localization (two-die GPUs: Rubin, and B200 on drivers that expose its locality
+    domains): with the state pool and rings from ``ugpu_ucache_buffers``
+    (5-D: ``[pool, dies, heads / dies, ...]``, part t in die t's memory) the call runs part t's
+    key heads on die t's SMs, one launch per die on green-context streams forked from and
+    joined back to the current stream (``num_sms`` = each die's SMs, so the automatic
+    persistent choice applies; a ``persistent_counter`` is then int32 [dies, 2]). Bitwise the
+    same results as the usual 4-D buffers. Small eager calls (B x HV < 8192) and devices
+    without that many locality domains run the per-die launches back to back on the current
+    stream.
+
     ``heads_per_cta`` (a divisor of HV / H; None = by batch size, see ``auto_heads_per_cta``)
     sets how many of a key head's 4 value heads one CTA runs.
 
@@ -4552,13 +4634,29 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
     assert u_cache.dtype in (torch.bfloat16, torch.float16), (
         "bf16 or fp16 u ring required"
     )
+    assert g_cache.dtype == torch.float32
     pool = h0.shape[0]
-    assert tuple(k_cache.shape) == (pool, H, RING_SLOTS, K_DIM)
-    assert tuple(u_cache.shape) == (pool, HV, RING_SLOTS, V_DIM)
-    assert (
-        tuple(g_cache.shape) == (pool, HV, RING_SLOTS)
-        and g_cache.dtype == torch.float32
-    )
+    # uGPU buffers (ugpu_ucache_buffers): [pool, parts, heads / parts, ...], one part per die
+    ugpu = h0.dim() == 5
+    n_parts = h0.shape[1] if ugpu else 1
+    if ugpu:
+        if not _ugpu_buffers_ok(h0, k_cache, u_cache, g_cache, n_parts, H, HV):
+            raise ValueError(
+                "5-D state pool: uGPU buffers [pool, parts, HV / parts, V, K] / k ring "
+                "[pool, parts, H / parts, 32, K] / u ring [pool, parts, HV / parts, 32, V] / "
+                "g ring [pool, parts, HV / parts, 32] with dense parts required (see "
+                f"ugpu_ucache_buffers); got state {tuple(h0.shape)}, k ring "
+                f"{tuple(k_cache.shape)}, u ring {tuple(u_cache.shape)}, g ring "
+                f"{tuple(g_cache.shape)} for H={H}, HV={HV}"
+            )
+        if n_parts == 1:
+            h0, k_cache, u_cache, g_cache = (
+                x.select(1, 0) for x in (h0, k_cache, u_cache, g_cache)
+            )
+    else:
+        assert tuple(k_cache.shape) == (pool, H, RING_SLOTS, K_DIM)
+        assert tuple(u_cache.shape) == (pool, HV, RING_SLOTS, V_DIM)
+        assert tuple(g_cache.shape) == (pool, HV, RING_SLOTS)
     if scale is None:
         scale = 1.0 / math.sqrt(K_)
     if flush_min is None:
@@ -4575,6 +4673,8 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
     a, b = a.contiguous().to(torch.bfloat16), b.contiguous().to(torch.bfloat16)
     if output is None:
         output = torch.empty(B, T, HV, V_, dtype=torch.bfloat16, device=q.device)
+    elif n_parts > 1:
+        assert output.is_contiguous(), "uGPU buffers: a contiguous output required"
     use_ro = row_order is not None
     if not use_ro:
         key = (B, str(q.device))
@@ -4589,17 +4689,9 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
             f"only (got {target.arch}); use gated_delta_rule_mtp_ucache_flush_umma"
         )
     hpk = HV // H
-    nsm = int(num_sms) if num_sms is not None else target.num_sms
-    if persistent is None:
-        persistent = _pz_auto(
-            T, hpk, heads_per_cta, H * B, num_sms, grid_override, target, flush_hint
-        )
-    hpc = (
-        (hpk if persistent else auto_heads_per_cta(B, H, nsm, hpk))
-        if heads_per_cta is None
-        else int(heads_per_cta)
-    )
-    if not (1 <= hpc <= hpk and hpk % hpc == 0):
+    if heads_per_cta is not None and not (
+        1 <= int(heads_per_cta) <= hpk and hpk % int(heads_per_cta) == 0
+    ):
         raise ValueError(
             f"heads_per_cta={heads_per_cta!r}: must divide the {hpk} value heads per key head"
         )
@@ -4643,6 +4735,141 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
         raise ValueError(
             f"flush_hint must be None, 'some', 'none' or 'flush_first' (got {flush_hint!r})"
         )
+    if n_parts > 1 and persistent_counter is not None:
+        if not (
+            isinstance(persistent_counter, torch.Tensor)
+            and persistent_counter.dtype == torch.int32
+            and tuple(persistent_counter.shape) == (n_parts, 2)
+            and persistent_counter.is_contiguous()
+        ):
+            raise ValueError(
+                f"uGPU buffers: persistent_counter must be a contiguous int32 [{n_parts}, 2] "
+                "tensor (one zeroed counter per die)"
+            )
+    common = dict(
+        T=T,
+        u_bf16=u_cache.dtype == torch.bfloat16,
+        use_ro=use_ro,
+        heads_per_cta=heads_per_cta,
+        sr=sr,
+        sr_rounds=sr_rounds,
+        persistent=persistent,
+        grid_override=grid_override,
+        flush_hint=flush_hint,
+        target=target,
+        scale=float(scale),
+        flush_min=int(flush_min),
+        h_io=H,
+        hv_io=HV,
+    )
+    tensors = dict(
+        state_idx=initial_state_indices,
+        hist_len=hist_len,
+        cache_base=cache_base,
+        row_order=row_order,
+        rand_seed=rand_seed,
+    )
+    a32, dt32 = _cached_f32(A_log), _cached_f32(dt_bias)
+    if n_parts == 1:
+        _launch(
+            q,
+            k,
+            v,
+            a,
+            b,
+            a32,
+            dt32,
+            h0,
+            k_cache,
+            u_cache,
+            g_cache,
+            output,
+            0,
+            num_sms,
+            persistent_counter,
+            **tensors,
+            **common,
+        )
+    else:
+        _launch_ugpu(
+            n_parts,
+            q,
+            k,
+            v,
+            a,
+            b,
+            a32,
+            dt32,
+            h0,
+            k_cache,
+            u_cache,
+            g_cache,
+            output,
+            num_sms,
+            persistent_counter,
+            tensors,
+            common,
+        )
+    if restart_hist_on_flush:
+        flushed = hist_len >= flush_min
+        cache_base.copy_((cache_base + hist_len * flushed) & RING_MASK)
+        hist_len.masked_fill_(flushed, 0)
+    return output
+
+
+def _launch(
+    q,
+    k,
+    v,
+    a,
+    b,
+    a32,
+    dt32,
+    h0,
+    k_cache,
+    u_cache,
+    g_cache,
+    output,
+    hv_base,
+    num_sms,
+    persistent_counter,
+    *,
+    state_idx,
+    hist_len,
+    cache_base,
+    row_order,
+    rand_seed,
+    T,
+    u_bf16,
+    use_ro,
+    heads_per_cta,
+    sr,
+    sr_rounds,
+    persistent,
+    grid_override,
+    flush_hint,
+    target,
+    scale,
+    flush_min,
+    h_io,
+    hv_io,
+):
+    """One kernel launch over q's key heads on the current stream: all of them, or a uGPU
+    head slice (q / k / v / a / b / output: head-slice views of the ``h_io`` / ``hv_io``-head
+    tensors; state and rings: the slice's own parts; ``hv_base``: its first value head).
+    Picks the persistent or the non-persistent kernel and the heads per CTA."""
+    B, H, HV = q.shape[0], q.shape[2], v.shape[2]
+    hpk = HV // H
+    nsm = int(num_sms) if num_sms is not None else target.num_sms
+    if persistent is None:
+        persistent = _pz_auto(
+            T, hpk, heads_per_cta, H * B, num_sms, grid_override, target, flush_hint
+        )
+    hpc = (
+        (hpk if persistent else auto_heads_per_cta(B, H, nsm, hpk))
+        if heads_per_cta is None
+        else int(heads_per_cta)
+    )
     if persistent:
         if (target.major, target.minor) not in _PZ_CC:
             raise ValueError(
@@ -4652,7 +4879,7 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
             raise ValueError(
                 f"persistent=True: 4 value heads per key head and per CTA only "
                 f"(T={T}, HV/H={hpk}, heads_per_cta={hpc}, "
-                f"stochastic_rounding={stochastic_rounding!r})"
+                f"stochastic_rounding={sr or None!r})"
             )
         if persistent_counter is not None and not (
             isinstance(persistent_counter, torch.Tensor)
@@ -4669,6 +4896,39 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
             persistent = (
                 False  # measured dispatch rule: the non-persistent kernel is faster
             )
+    args = (
+        q,
+        k,
+        v,
+        a,
+        b,
+        a32,
+        dt32,
+        h0,
+        state_idx,
+        k_cache,
+        u_cache,
+        g_cache,
+        hist_len,
+        cache_base,
+        row_order,
+        output,
+        rand_seed,
+    )
+    fn = _get_kernel(
+        q.device,
+        T,
+        H,
+        HV,
+        u_bf16,
+        use_ro,
+        hpc,
+        sr,
+        sr_rounds,
+        bool(persistent),
+        h_io,
+        hv_io,
+    )
     if persistent:
         ctr = (
             _pz_counter(q.device)
@@ -4680,72 +4940,216 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
             if grid_override is not None
             else min(H * B, _CTA_SLOTS_PER_SM * nsm)
         )
-        fn = _get_kernel(
-            q.device,
-            T,
-            H,
-            HV,
-            u_cache.dtype == torch.bfloat16,
-            use_ro,
-            hpc,
-            sr,
-            sr_rounds,
-            True,
-        )
-        fn(
-            q,
-            k,
-            v,
-            a,
-            b,
-            _cached_f32(A_log),
-            _cached_f32(dt_bias),
-            h0,
-            initial_state_indices,
-            k_cache,
-            u_cache,
-            g_cache,
-            hist_len,
-            cache_base,
-            row_order,
-            output,
-            rand_seed,
-            ctr,
-            float(scale),
-            int(flush_min),
-            max(1, n_cta),
-        )
-        if restart_hist_on_flush:
-            flushed = hist_len >= flush_min
-            cache_base.copy_((cache_base + hist_len * flushed) & RING_MASK)
-            hist_len.masked_fill_(flushed, 0)
-        return output
-    fn = _get_kernel(
-        q.device, T, H, HV, u_cache.dtype == torch.bfloat16, use_ro, hpc, sr, sr_rounds
+        fn(*args, ctr, scale, flush_min, int(hv_base), max(1, n_cta))
+    else:
+        fn(*args, scale, flush_min, int(hv_base))
+
+
+# ============================================================================ uGPU
+# uGPU localization (two-die GPUs, Rubin and B200: each die with its own memory and SMs). The
+# buffers of ugpu_ucache_buffers keep key heads [t H / 2, (t + 1) H / 2) of every slot (with their
+# value heads) in die t's memory, and a call with them runs one launch per die on that die's SMs
+# (green-context streams, forked from and joined back to the current stream): every row is
+# split the same way, whatever the batch order and slot indices, so no state or ring byte
+# crosses the die-to-die link. Each launch is the same kernel on its heads (heads are
+# independent; the stochastic-rounding ids use the global head), so the results are bitwise
+# equal to one launch over the whole pool.
+
+# Eager calls below this many (batch x value-head) states are host-bound: the per-die fork /
+# join costs more host time than the die-local traffic saves, so they run the per-die launches
+# back to back on the current stream (each over the whole GPU). Under CUDA graph capture the
+# per-die streams are always used: replay has no host cost.
+_UGPU_EAGER_MIN_STATES = 8192
+
+
+@functools.cache
+def _locality_domains(device_index: int) -> int:
+    """Locality domains (dies) of the device; 1 without the CUDA 13.4 locality-domain API."""
+    try:
+        from flashinfer.green_ctx import get_locality_domain_count
+    except ImportError:
+        return 1
+    return get_locality_domain_count(torch.device("cuda", device_index))
+
+
+@functools.cache
+def _ugpu_streams(device_index: int):
+    """One green-context stream per locality domain of the device and its SM count (each
+    domain's own SMs plus its share of the rest: 106 per die on Rubin VR200, 74 on B200).
+    Cached; the first uGPU call creates them, so make one eager call before CUDA graph
+    capture."""
+    from flashinfer.green_ctx import split_device_green_ctx_by_locality_domain
+
+    streams, resources = split_device_green_ctx_by_locality_domain(
+        torch.device("cuda", device_index)
     )
-    fn(
-        q,
-        k,
-        v,
-        a,
-        b,
-        _cached_f32(A_log),
-        _cached_f32(dt_bias),
-        h0,
-        initial_state_indices,
-        k_cache,
-        u_cache,
-        g_cache,
-        hist_len,
-        cache_base,
-        row_order,
-        output,
-        rand_seed,
-        float(scale),
-        int(flush_min),
+    return streams, [int(r.sm.smCount) for r in resources]
+
+
+def _ugpu_buffers_ok(h0, k_cache, u_cache, g_cache, n, H, HV) -> bool:
+    """The four buffers are [pool, n, heads / n, ...] with dense parts (any slot stride)."""
+    if H % n or HV % n:
+        return False
+    pool = h0.shape[0]
+    for t, heads, inner in (
+        (h0, HV, (V_DIM, K_DIM)),
+        (k_cache, H, (RING_SLOTS, K_DIM)),
+        (u_cache, HV, (RING_SLOTS, V_DIM)),
+        (g_cache, HV, (RING_SLOTS,)),
+    ):
+        shape = (pool, n, heads // n, *inner)
+        if tuple(t.shape) != shape:
+            return False
+        dense = torch.empty(shape[2:], device="meta").stride()
+        if tuple(t.stride()[2:]) != tuple(dense):
+            return False
+    return True
+
+
+def _launch_ugpu(
+    n,
+    q,
+    k,
+    v,
+    a,
+    b,
+    a32,
+    dt32,
+    h0,
+    k_cache,
+    u_cache,
+    g_cache,
+    output,
+    num_sms,
+    persistent_counter,
+    tensors,
+    common,
+):
+    """uGPU buffers: part t (key heads [t H / n, (t + 1) H / n)) on locality domain t's SMs,
+    one launch per part forked from and joined back to the current stream. Without n
+    locality domains (older drivers expose one), and for small eager calls
+    (``_UGPU_EAGER_MIN_STATES``), the launches run back to back on the current stream."""
+    B, H, HV = q.shape[0], q.shape[2], v.shape[2]
+    hl, hvl = H // n, HV // n
+
+    def part(t, sms):
+        _launch(
+            q.narrow(2, t * hl, hl),
+            k.narrow(2, t * hl, hl),
+            v.narrow(2, t * hvl, hvl),
+            a.narrow(2, t * hvl, hvl),
+            b.narrow(2, t * hvl, hvl),
+            a32.narrow(0, t * hvl, hvl),
+            dt32.narrow(0, t * hvl, hvl),
+            h0.select(1, t),
+            k_cache.select(1, t),
+            u_cache.select(1, t),
+            g_cache.select(1, t),
+            output.narrow(2, t * hvl, hvl),
+            t * hvl,
+            sms,
+            None if persistent_counter is None else persistent_counter[t],
+            **tensors,
+            **common,
+        )
+
+    with torch.cuda.device(q.device):  # streams and events of q's device
+        if _locality_domains(q.device.index) != n:
+            for t in range(n):
+                part(t, num_sms)
+            return
+        # created by the first call (make one eager call before CUDA graph capture)
+        streams, sm_counts = _ugpu_streams(q.device.index)
+        if (
+            B * HV < _UGPU_EAGER_MIN_STATES
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            for t in range(n):
+                part(t, num_sms)
+            return
+        main = torch.cuda.current_stream()
+        fork = torch.cuda.Event()
+        fork.record(main)
+        joins = []
+        for t in range(n):
+            stream = streams[t]
+            stream.wait_event(fork)
+            with torch.cuda.stream(stream):
+                part(t, sm_counts[t])
+            done = torch.cuda.Event()
+            done.record(stream)
+            joins.append(done)
+        for done in joins:
+            main.wait_event(done)
+
+
+class UgpuUcacheBuffers(NamedTuple):
+    """Die-split state pool and rings (see ``ugpu_ucache_buffers``)."""
+
+    state: torch.Tensor  # fp16 [pool, n, HV / n, V, K]
+    k_cache: torch.Tensor  # bf16 [pool, n, H / n, 32, K]
+    u_cache: torch.Tensor  # u dtype [pool, n, HV / n, 32, V]
+    g_cache: torch.Tensor  # fp32 [pool, n, HV / n, 32]
+
+
+def ugpu_ucache_buffers(
+    pool_size: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    u_dtype: torch.dtype = torch.bfloat16,
+    device: Optional[torch.device] = None,
+) -> UgpuUcacheBuffers:
+    r"""Allocate the state pool and the k / u / g rings of
+    :func:`gated_delta_rule_mtp_ucache_flush_umma_rubin` for uGPU localization (two-die GPUs).
+
+    Each buffer has a die dimension after the slot: ``[pool, n, heads / n, ...]`` with
+    ``n`` = the device's locality domains (2 on Rubin VR200 and B200). Element
+    ``[s, t, j, ...]`` is element ``[s, t * heads / n + j, ...]`` of the usual buffer (``heads`` = HV for the state,
+    u and g rings, H for the k ring), and part ``t`` lives in locality domain (die) ``t``'s
+    memory. Passed to the kernel (``initial_state_source`` = ``state``, and the rings), a call
+    runs the key heads of part ``t`` -- with their value heads -- on die ``t``'s SMs, one
+    launch per die, so no state or ring byte crosses the die-to-die link, whatever the batch
+    order and slot indices. That is for CUDA-graph captured decode (make one eager call before
+    capture); eager calls with ``B * HV < 8192`` are host-bound and run the per-die launches
+    back to back on the current stream. Results are bitwise equal to the usual buffers'.
+
+    The buffers are uninitialized and come from
+    :func:`flashinfer.green_ctx.empty_per_locality_domain`, outside PyTorch's caching
+    allocator.
+
+    Args:
+        pool_size: Number of state slots.
+        num_k_heads: Number of key heads (H), a multiple of the locality domain count.
+        num_v_heads: Number of value heads (HV).
+        u_dtype: u ring dtype (bfloat16 or float16).
+        device: CUDA device with at least two locality domains (default: the current device).
+    """
+    from flashinfer.green_ctx import empty_per_locality_domain
+
+    device = torch.device(device) if device is not None else torch.device("cuda")
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    n = _locality_domains(device.index)
+    if n < 2:
+        raise RuntimeError(
+            f"{device} exposes {n} locality domain(s); uGPU buffers need at least two "
+            "(e.g. Rubin) and a driver / cuda-python with the locality-domain API"
+        )
+    if num_k_heads % n or num_v_heads % num_k_heads:
+        raise ValueError(
+            f"H={num_k_heads} must be a multiple of the {n} locality domains and divide "
+            f"HV={num_v_heads}"
+        )
+
+    def alloc(heads, inner, dtype):
+        parts = empty_per_locality_domain(
+            (pool_size, heads // n, *inner), dtype, device
+        )
+        return parts.transpose(0, 1)
+
+    return UgpuUcacheBuffers(
+        alloc(num_v_heads, (V_DIM, K_DIM), torch.float16),
+        alloc(num_k_heads, (RING_SLOTS, K_DIM), torch.bfloat16),
+        alloc(num_v_heads, (RING_SLOTS, V_DIM), u_dtype),
+        alloc(num_v_heads, (RING_SLOTS,), torch.float32),
     )
-    if restart_hist_on_flush:
-        flushed = hist_len >= flush_min
-        cache_base.copy_((cache_base + hist_len * flushed) & RING_MASK)
-        hist_len.masked_fill_(flushed, 0)
-    return output

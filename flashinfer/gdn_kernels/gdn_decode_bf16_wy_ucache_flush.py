@@ -143,6 +143,19 @@ except ImportError:
         )
     except ImportError:  # keep the HMMA kernel usable without the UMMA module
         _UMMA = None
+# ... and its Rubin (sm_107a) build: same contract and bits, Rubin tunings, the persistent
+# kernel and uGPU buffers (one launch per die); "auto" runs it on sm_107
+try:
+    from .gdn_replay_mtp_umma_rubin import (
+        gated_delta_rule_mtp_ucache_flush_umma_rubin as _UMMA_RUBIN,
+    )
+except ImportError:
+    try:
+        from flashinfer.gdn_kernels.gdn_replay_mtp_umma_rubin import (
+            gated_delta_rule_mtp_ucache_flush_umma_rubin as _UMMA_RUBIN,
+        )
+    except ImportError:
+        _UMMA_RUBIN = None
 
 
 # Problem dimensions. One CTA processes a full V tile per (request, head).
@@ -3332,10 +3345,15 @@ def gated_delta_rule_mtp_ucache_flush(
     call — an SM100-class GPU, the fp16-state arm (bf16 IO and rings,
     ``GDN_UCACHE_STATE_DTYPE=fp16``), 1 <= T <= 8, HV / H in 1..4, contiguous
     pools, no ``pdl_trigger`` — and the HMMA kernel otherwise (any SM90+,
-    T in {4, 8}). With bf16 rings the UMMA backend also takes an fp16
-    ``u_cache`` (vLLM's u-cache dtype) next to the bf16 ``k_cache``; the HMMA
-    kernel does not, so such a call raises ``ValueError`` when the UMMA
-    backend cannot serve it. ``"umma"`` / ``"hmma"`` force one of them
+    T in {4, 8}). On Rubin (sm_107) the UMMA backend is its Rubin build
+    ``gated_delta_rule_mtp_ucache_flush_umma_rubin`` (same contract and
+    bits). uGPU buffers from ``ugpu_ucache_buffers`` (a 5-D state pool and
+    rings ``[pool, dies, heads / dies, ...]``, each die's part in its own
+    memory) always go to the Rubin build, which runs one launch per die on
+    that die's SMs (``backend`` "auto" or "umma"). With bf16 rings the UMMA
+    backend also takes an fp16 ``u_cache`` (vLLM's u-cache dtype) next to
+    the bf16 ``k_cache``; the HMMA kernel does not, so such a call raises
+    ``ValueError`` when the UMMA backend cannot serve it. ``"umma"`` / ``"hmma"`` force one of them
     (``"umma"`` raises ``ValueError`` when unavailable). Both implement the
     same contract; they
     differ in rounding only (fp32 accumulation in both, different summation
@@ -3421,6 +3439,50 @@ def gated_delta_rule_mtp_ucache_flush(
         "silently reinterpret bits."
     )
     HK = k.shape[2]
+
+    if initial_state_source.dim() == 5:
+        # uGPU buffers: the Rubin build of the UMMA kernel validates and runs them
+        if backend not in ("auto", "umma"):
+            raise ValueError(
+                "gated_delta_rule_mtp_ucache_flush: uGPU buffers (a 5-D state pool) need "
+                f"backend 'auto' or 'umma', got {backend!r}."
+            )
+        _why = _umma_unavailable_reason(device, T, H, HK, HV, True, pdl_trigger)
+        if _why is None and _UMMA_RUBIN is None:
+            _why = (
+                "flashinfer.gdn_kernels.gdn_replay_mtp_umma_rubin could not be imported"
+            )
+        if _why is not None:
+            raise ValueError(
+                "gated_delta_rule_mtp_ucache_flush: uGPU buffers are served by the UMMA "
+                f"backend only, unavailable: {_why}."
+            )
+        return _UMMA_RUBIN(
+            A_log,
+            a,
+            dt_bias,
+            softplus_beta,
+            softplus_threshold,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            scale=scale,
+            output=output,
+            k_cache=k_cache,
+            u_cache=u_cache,
+            g_cache=g_cache,
+            hist_len=hist_len,
+            cache_base=cache_base,
+            flush_min=flush_min,
+            restart_hist_on_flush=restart_hist_on_flush,
+            stochastic_rounding=stochastic_rounding,
+            rand_seed=rand_seed,
+            philox_rounds=philox_rounds,
+        )
 
     # A_log / dt_bias are read as bf16 by the kernel. They are per-layer constants, so
     # cache the bf16 cast by storage identity (one-time at warm-up; absent from the
@@ -3538,7 +3600,13 @@ def gated_delta_rule_mtp_ucache_flush(
             device, T, H, HK, HV, _pools_contig, pdl_trigger
         )
         if _why is None:
-            return _UMMA(
+            target = gdn_device_target(device)
+            umma = (
+                _UMMA_RUBIN
+                if _UMMA_RUBIN is not None and (target.major, target.minor) == (10, 7)
+                else _UMMA
+            )
+            return umma(
                 A_log_in,
                 a,
                 dt_bias_in,

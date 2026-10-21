@@ -702,13 +702,15 @@ def lds_u16(addr: Int32, *, loc=None, ip=None) -> Uint32:
     return Uint32(r)
 
 
-def make_fake_tensor_lead_dyn(dtype, shape, divisibility=1):
-    """Fake CuTe tensor whose inner dims are dense with STATIC strides and whose leading
-    stride is dynamic (paged / block-strided pools), so in-kernel addressing folds the
-    inner offsets into immediates."""
+def make_fake_tensor_lead_dyn(dtype, shape, divisibility=1, inner_shape=None):
+    """Fake CuTe tensor whose inner dims have STATIC strides and whose leading stride is
+    dynamic (paged / block-strided pools), so in-kernel addressing folds the inner offsets
+    into immediates. The inner strides are those of a dense ``inner_shape`` (default
+    ``shape[1:]``); a larger ``inner_shape`` describes a slice view of a wider tensor (e.g.
+    some heads of every token)."""
     inner = 1
     strides = []
-    for d in reversed(shape[1:]):
+    for d in reversed(shape[1:] if inner_shape is None else inner_shape):
         strides.append(inner)
         inner *= d
     strides = [cute.sym_int64(divisibility=divisibility)] + list(reversed(strides))

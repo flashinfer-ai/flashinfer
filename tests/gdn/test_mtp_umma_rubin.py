@@ -24,8 +24,9 @@ Correctness tests for the Rubin (sm_107a) build of the UMMA MTP ReplaySSM kernel
    cache across streams and in-place updates, and the persistent kernel (sm_107a):
    bit-identity with the non-persistent launch at T = 1-8 on any row mix and grid, the automatic
    choice, the dispatch rule and ``flush_hint``, a caller-owned claim counter, and concurrent
-   replays of separately captured
-   CUDA graphs.
+   replays of separately captured CUDA graphs; uGPU buffers (``ugpu_ucache_buffers``: one
+   launch per die) bit-identical to the 4-D buffers, eager and captured; the routing of
+   ``gated_delta_rule_mtp_ucache_flush`` to this build.
 
 Run:  pytest tests/gdn/test_mtp_umma_rubin.py -q
 """
@@ -559,11 +560,19 @@ def test_persistent_auto(monkeypatch):
             seen.clear()
             got = _pz_call(case, fm, **kw)
             assert seen == [want], (T, kw, seen)
-            assert all(torch.equal(x, y) for x, y in zip(ref, got, strict=True)), (T, kw)
+            assert all(torch.equal(x, y) for x, y in zip(ref, got, strict=True)), (
+                T,
+                kw,
+            )
     # too few items per CTA slot: non-persistent, unless the launch has no flush rows
     monkeypatch.setattr(M, "_PZ_AUTO_MIN_ITEMS", {"none": 0, "some": 10**6})
     case, fm = _pz_case(4, 404, "VVVPVV")
-    for hint, want in ((None, False), ("some", False), ("flush_first", False), ("none", True)):
+    for hint, want in (
+        (None, False),
+        ("some", False),
+        ("flush_first", False),
+        ("none", True),
+    ):
         seen.clear()
         _pz_call(case, fm, num_sms=nsm // 2, flush_hint=hint)
         assert seen == [want], (hint, seen)
@@ -580,5 +589,311 @@ def test_persistent_api():
     assert ctr.tolist() == [0, 0]
     with pytest.raises(ValueError):
         _pz_call(case, fm, persistent=True, persistent_counter=ctr.to(torch.int64))
-    with pytest.raises(ValueError):  # the persistent kernel runs all 4 value heads per CTA
+    with pytest.raises(
+        ValueError
+    ):  # the persistent kernel runs all 4 value heads per CTA
         _pz_call(case, fm, persistent=True, heads_per_cta=2)
+
+
+# ---------------------------------------------------------------------------
+# uGPU buffers ([pool, dies, heads / dies, ...], see ugpu_ucache_buffers): one launch per die's
+# key heads, bitwise the same as the 4-D buffers in every rounding mode. Without two locality
+# domains (older drivers), and for small eager calls, the per-die launches run back to back on
+# the current stream; otherwise (Rubin, B200 on recent drivers) on the dies' green contexts.
+def _sr_kw(mode):
+    if mode == "none":
+        return {}
+    kw = dict(
+        stochastic_rounding=mode.rstrip("5"),
+        rand_seed=torch.tensor([1234], dtype=torch.int64, device=DEV),
+    )
+    if mode == "philox5":
+        kw["philox_rounds"] = 5
+    return kw
+
+
+def _ugpu_split(x, n, layout):
+    """[pool, heads, ...] -> [pool, n, heads / n, ...]: a view of x ("view"), or a copy whose
+    parts are separate dense blocks, as ugpu_ucache_buffers allocates them ("parts")."""
+    v5 = x.view(x.shape[0], n, x.shape[1] // n, *x.shape[2:])
+    if layout == "view":
+        return v5
+    parts = torch.empty(
+        (n, x.shape[0], x.shape[1] // n, *x.shape[2:]), dtype=x.dtype, device=x.device
+    ).transpose(0, 1)
+    parts.copy_(v5)
+    return parts
+
+
+def _ugpu_logical(x):
+    return x.reshape(x.shape[0], x.shape[1] * x.shape[2], *x.shape[3:])
+
+
+def _ugpu_call(case, fm, bufs=None, layout="parts", **kw):
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = [
+        x.clone() for x in case
+    ]
+    if bufs is None:
+        bufs = [_ugpu_split(x, 2, layout) for x in (pool, kc, uc, gc)]
+    else:
+        for dst, src in zip(bufs, (pool, kc, uc, gc), strict=True):
+            dst.copy_(_ugpu_split(src, dst.shape[1], "view"))
+    out = torch.full(v.shape, -7.0, dtype=torch.bfloat16, device=DEV)
+    kw.setdefault("heads_per_cta", 4)
+    _umma()(
+        A_log,
+        a,
+        dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=bufs[0],
+        initial_state_indices=idx,
+        k_cache=bufs[1],
+        u_cache=bufs[2],
+        g_cache=bufs[3],
+        hist_len=hl,
+        cache_base=cb,
+        scale=SCALE,
+        flush_min=fm,
+        restart_hist_on_flush=False,
+        output=out,
+        **kw,
+    )
+    torch.cuda.synchronize()
+    return [_pz_bits(x) for x in [out] + [_ugpu_logical(y) for y in bufs]]
+
+
+def _ugpu_pattern(B, seed):
+    import random
+
+    rng = random.Random(seed)
+    return "".join(rng.choice("VVVVFFP") for _ in range(B))
+
+
+@pytest.mark.parametrize("T", [1, 4, 8])
+@pytest.mark.parametrize("mode", ["none", "philox5", "lcg"])
+@pytest.mark.parametrize("layout", ["view", "parts"])
+def test_ugpu_buffers_bit_identical(T, mode, layout):
+    """5-D uGPU buffers: same bits as the 4-D buffers (stochastic rounding included: its ids use
+    the global value head), for both kernels and every heads-per-CTA."""
+    from flashinfer.utils import get_compute_capability
+
+    _skip_if_no_rubin_build()
+    sr = _sr_kw(mode)
+    case, fm = _pz_case(T, 700 + 7 * T, _PZ_PATTERNS[0])
+    ref = _pz_call(case, fm, **sr)
+    runs = [dict(heads_per_cta=h) for h in (1, 2, 4)]
+    if get_compute_capability(torch.device("cuda")) == (10, 7):
+        runs += [dict(persistent=True), dict(persistent=True, grid_override=3)]
+    for kw in runs:
+        got = _ugpu_call(case, fm, layout=layout, **kw, **sr)
+        for name, x, y in zip(("y", "pool", "k", "u", "g"), ref, got, strict=True):
+            assert torch.equal(x, y), (kw, name)
+
+
+def test_ugpu_buffers_graph():
+    """A captured uGPU call (on Rubin: the per-die green-context launches) replays to the same bits
+    as the 4-D buffers, with a per-die caller-owned claim counter where persistent."""
+    from flashinfer.utils import get_compute_capability
+
+    _skip_if_no_rubin_build()
+    T, B = 4, 48
+    case, fm = _pz_case(T, 811, _ugpu_pattern(B, 811))
+    ref = _pz_call(case, fm)
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
+    bufs = [_ugpu_split(x.clone(), 2, "parts") for x in (pool, kc, uc, gc)]
+    out = torch.full(v.shape, -7.0, dtype=torch.bfloat16, device=DEV)
+    kw = {}
+    if get_compute_capability(torch.device("cuda")) == (10, 7):
+        kw = dict(
+            persistent=True,
+            persistent_counter=torch.zeros(2, 2, dtype=torch.int32, device=DEV),
+        )
+
+    def call():
+        _umma()(
+            A_log,
+            a,
+            dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=bufs[0],
+            initial_state_indices=idx,
+            k_cache=bufs[1],
+            u_cache=bufs[2],
+            g_cache=bufs[3],
+            hist_len=hl,
+            cache_base=cb,
+            scale=SCALE,
+            flush_min=fm,
+            restart_hist_on_flush=False,
+            output=out,
+            **kw,
+        )
+
+    call()  # eager warm-up: compile, green-context streams, fp32 parameter cache
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        call()
+    for _ in range(3):
+        for x, x0 in zip(bufs, (pool, kc, uc, gc), strict=True):
+            x.copy_(_ugpu_split(x0, 2, "view"))
+        out.fill_(-7.0)
+        torch.cuda.synchronize()
+        g.replay()
+        torch.cuda.synchronize()
+        got = [_pz_bits(x) for x in [out] + [_ugpu_logical(y) for y in bufs]]
+        for name, x, y in zip(("y", "pool", "k", "u", "g"), ref, got, strict=True):
+            assert torch.equal(x, y), name
+    if kw:
+        assert kw["persistent_counter"].tolist() == [[0, 0], [0, 0]]
+
+
+def test_ugpu_ucache_buffers():
+    """Buffers from ugpu_ucache_buffers (each die's part in its own memory) and an eager call large
+    enough for the per-die green-context launches: same bits as the 4-D buffers. Needs a device
+    with two locality domains (Rubin; B200 with a driver that exposes them)."""
+    from flashinfer.utils import get_compute_capability
+
+    _skip_if_no_rubin_build()
+    M = _rubin_mod()
+    if M._locality_domains(torch.cuda.current_device()) != 2:
+        pytest.skip("needs a device with two locality domains")
+    T, B = 8, 192  # B x HV = 12288: above the eager fork / join threshold
+    case, fm = _pz_case(T, 905, _ugpu_pattern(B, 905))
+    ref = _pz_call(case, fm)
+    runs = [{}, dict(persistent=False)]
+    if get_compute_capability(torch.device("cuda")) == (10, 7):
+        runs.append(dict(persistent=True))
+    for kw in runs:
+        bufs = list(M.ugpu_ucache_buffers(B, 16, 64, device=DEV))
+        assert [tuple(x.shape) for x in bufs] == [
+            (B, 2, 32, 128, 128),
+            (B, 2, 8, 32, 128),
+            (B, 2, 32, 32, 128),
+            (B, 2, 32, 32),
+        ]
+        got = _ugpu_call(case, fm, bufs=bufs, **kw)
+        for name, x, y in zip(("y", "pool", "k", "u", "g"), ref, got, strict=True):
+            assert torch.equal(x, y), (kw, name)
+
+
+def test_ugpu_buffers_rejected():
+    """Mismatched 5-D buffers: a ValueError naming the expected layout."""
+    _skip_if_no_rubin_build()
+    case, fm = _pz_case(4, 61, "FVVPF")
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
+    bufs = [_ugpu_split(x, 2, "view") for x in (pool, kc, uc, gc)]
+    bad = [bufs[0], kc, bufs[2], bufs[3]]  # a 4-D k ring next to a 5-D pool
+    with pytest.raises(ValueError, match="uGPU buffers"):
+        _umma()(
+            A_log,
+            a,
+            dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=bad[0],
+            initial_state_indices=idx,
+            k_cache=bad[1],
+            u_cache=bad[2],
+            g_cache=bad[3],
+            hist_len=hl,
+            cache_base=cb,
+            scale=SCALE,
+            flush_min=fm,
+            restart_hist_on_flush=False,
+        )
+
+
+def test_dispatcher_routes_rubin_build(monkeypatch):
+    """gated_delta_rule_mtp_ucache_flush (fp16-state arm, backend "auto"): 4-D buffers run the Rubin
+    build on sm_107a and the base UMMA kernel elsewhere; uGPU buffers always run the Rubin build.
+    Same bits as the Rubin build called directly."""
+    from flashinfer.utils import get_compute_capability
+
+    _skip_if_no_rubin_build()
+    mod = _base._flashinfer_fp16_state()
+    calls = []
+
+    def spy(name, real):
+        def wrapped(*args, **kw):
+            calls.append(name)
+            return real(*args, **kw)
+
+        return wrapped
+
+    for name in ("_UMMA", "_UMMA_RUBIN"):
+        monkeypatch.setattr(mod, name, spy(name, getattr(mod, name)))
+
+    def run(case, fm, ugpu):
+        q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = [
+            x.clone() for x in case
+        ]
+        bufs = [pool, kc, uc, gc]
+        if ugpu:
+            bufs = [_ugpu_split(x, 2, "parts") for x in bufs]
+        out = torch.full(v.shape, -7.0, dtype=torch.bfloat16, device=DEV)  # padded rows
+        y = mod.gated_delta_rule_mtp_ucache_flush(
+            A_log,
+            a,
+            dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=bufs[0],
+            initial_state_indices=idx,
+            k_cache=bufs[1],
+            u_cache=bufs[2],
+            g_cache=bufs[3],
+            hist_len=hl,
+            cache_base=cb,
+            scale=SCALE,
+            flush_min=fm,
+            restart_hist_on_flush=False,
+            output=out,
+        )
+        torch.cuda.synchronize()
+        assert y is out
+        if ugpu:
+            bufs = [_ugpu_logical(x) for x in bufs]
+        return [_pz_bits(x) for x in [y] + bufs]
+
+    case, fm = _pz_case(4, 123, _PZ_PATTERNS[0])
+    ref = _pz_call(case, fm, heads_per_cta=None)
+    on_rubin = get_compute_capability(torch.device("cuda")) == (10, 7)
+    for ugpu, want in (
+        (False, "_UMMA_RUBIN" if on_rubin else "_UMMA"),
+        (True, "_UMMA_RUBIN"),
+    ):
+        calls.clear()
+        got = run(case, fm, ugpu)
+        assert calls == [want], (ugpu, calls)
+        for name, x, y in zip(("y", "pool", "k", "u", "g"), ref, got, strict=True):
+            assert torch.equal(x, y), (ugpu, name)
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
+    with pytest.raises(ValueError, match="uGPU buffers"):
+        mod.gated_delta_rule_mtp_ucache_flush(
+            A_log,
+            a,
+            dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=_ugpu_split(pool.clone(), 2, "view"),
+            k_cache=kc,
+            u_cache=uc,
+            g_cache=gc,
+            hist_len=hl,
+            cache_base=cb,
+            restart_hist_on_flush=False,
+            backend="hmma",
+        )

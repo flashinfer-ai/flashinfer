@@ -78,14 +78,17 @@ except (ImportError, RuntimeError):
     gated_delta_rule_mtp_ucache_flush_umma = None  # type: ignore
     flush_first_row_order = None  # type: ignore
 
-# Rubin (sm_107a) build of the UMMA kernel: same contract and results, Rubin tunings and a
-# persistent kernel for die-localized launches (also runs on sm_100a); called directly.
+# Rubin (sm_107a) build of the UMMA kernel: same contract and results, Rubin tunings, a
+# persistent kernel for die-localized launches and uGPU buffers (ugpu_ucache_buffers: one launch
+# per die); also runs on sm_100a.
 try:
     from .gdn_replay_mtp_umma_rubin import (
         gated_delta_rule_mtp_ucache_flush_umma_rubin,
+        ugpu_ucache_buffers,
     )
 except (ImportError, RuntimeError):
     gated_delta_rule_mtp_ucache_flush_umma_rubin = None  # type: ignore
+    ugpu_ucache_buffers = None  # type: ignore
 
 try:
     from .gdn_decode_pretranspose import run_pretranspose_decode
@@ -141,6 +144,7 @@ __all__ = [
     "gated_delta_rule_mtp_ucache_flush",
     "gated_delta_rule_mtp_ucache_flush_umma",
     "gated_delta_rule_mtp_ucache_flush_umma_rubin",
+    "ugpu_ucache_buffers",
     "flush_first_row_order",
     "gated_delta_rule_mtp_wy_output_only",
     "gated_delta_rule_bf16state_cooprow",
