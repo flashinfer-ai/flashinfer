@@ -71,6 +71,30 @@ from .trtllm_gen_fused_moe_utils import (
 )
 
 
+_OUTPUT_ROW_SENTINEL = 7.0
+
+
+def _row_strided_output(num_tokens, hidden_size, row_padding, device):
+    """A finalized output that is a row view of a wider buffer; (None, None) without padding."""
+    if not row_padding:
+        return None, None
+    buffer = torch.full(
+        (num_tokens, hidden_size + row_padding),
+        _OUTPUT_ROW_SENTINEL,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    return buffer, buffer[:, :hidden_size]
+
+
+def _check_row_padding(buffer, hidden_size):
+    """Finalize must write each row at the buffer's row stride and leave its padding."""
+    if buffer is not None:
+        assert (buffer[:, hidden_size:] == _OUTPUT_ROW_SENTINEL).all(), (
+            "finalize wrote into the output's row padding"
+        )
+
+
 def _run_trtllm_gen_routed_fused_moe_case(
     num_tokens: int,
     hidden_size: int,
@@ -84,6 +108,7 @@ def _run_trtllm_gen_routed_fused_moe_case(
     gemm1_alpha: torch.Tensor | None = None,
     gemm1_beta: torch.Tensor | None = None,
     gemm1_clamp_limit: torch.Tensor | None = None,
+    output_row_padding: int = 0,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
@@ -96,6 +121,9 @@ def _run_trtllm_gen_routed_fused_moe_case(
     )
     hidden_states = (
         torch.randn(num_tokens, hidden_size, device=device).to(torch.bfloat16) * 0.1
+    )
+    output_buffer, routed_output = _row_strided_output(
+        num_tokens, hidden_size, output_row_padding, device
     )
     if quant_mode == "NvFP4xNvFP4":
         hidden_states, hidden_states_scale = fp4_quantize(
@@ -271,7 +299,9 @@ def _run_trtllm_gen_routed_fused_moe_case(
         enable_pdl,
         activation_type.value,  # act_type
         None,
+        output=routed_output,
     )[0].to(torch.float)
+    _check_row_padding(output_buffer, hidden_size)
 
     mask = torch.isclose(output, reference_output, rtol=1e-3, atol=1e-3)
 
@@ -348,6 +378,54 @@ def test_trtllm_gen_routed_fused_moe(
         quant_mode,
         routing_format,
     )
+
+
+@pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
+# 64 tokens take the small-batch finalize kernel and 512 the vectorized one.
+@pytest.mark.parametrize("num_tokens", [64, 512])
+def test_trtllm_gen_routed_fused_moe_row_strided_output(num_tokens, quant_mode):
+    """The finalized output may be a row view of a wider buffer (out[:, :hidden])."""
+    _run_trtllm_gen_routed_fused_moe_case(
+        num_tokens,
+        1024,
+        1024,
+        8,
+        128,
+        RoutingMethodType.Renormalize,
+        quant_mode,
+        "packed",
+        output_row_padding=64,
+    )
+
+
+def test_trtllm_gen_fp8_routed_fused_moe_row_strided_output():
+    """The FP8 block-scale launcher honors a row-strided finalized output too."""
+    _run_trtllm_gen_fp8_routed_fused_moe_case(
+        64,
+        1024,
+        1024,
+        4,
+        16,
+        RoutingMethodType.Renormalize,
+        "packed",
+        output_row_padding=64,
+    )
+
+
+def test_trtllm_gen_routed_fused_moe_rejects_unaligned_output_rows():
+    """Finalize stores 16 bytes at a time, so a row stride of 1028 bf16 values is refused."""
+    with pytest.raises(RuntimeError, match="multiple of 16 bytes"):
+        _run_trtllm_gen_routed_fused_moe_case(
+            64,
+            1024,
+            1024,
+            8,
+            128,
+            RoutingMethodType.Renormalize,
+            "NvFP4xNvFP4",
+            "packed",
+            output_row_padding=4,
+        )
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 1024])
@@ -621,6 +699,7 @@ def _run_trtllm_gen_fp8_routed_fused_moe_case(
     num_experts: int,
     routing_method_type: RoutingMethodType,
     routing_format: Literal["packed", "unpacked_fp32"],
+    output_row_padding: int = 0,
 ):
     """Test FP8 block scale routed MoE matches standard routing."""
     compute_capability = get_compute_capability(torch.device(device="cuda"))
@@ -719,9 +798,13 @@ def _run_trtllm_gen_fp8_routed_fused_moe_case(
     else:
         routing_input = (topk_ids, topk_weights.to(torch.float32))
 
-    output = torch.empty(
-        num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
+    output_buffer, output = _row_strided_output(
+        num_tokens, hidden_size, output_row_padding, hidden_states.device
     )
+    if output is None:
+        output = torch.empty(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
+        )
     trtllm_fp8_block_scale_routed_moe(
         topk_ids=routing_input,
         routing_bias=None,
@@ -745,6 +828,7 @@ def _run_trtllm_gen_fp8_routed_fused_moe_case(
         enable_pdl=enable_pdl,
         output=output,
     )
+    _check_row_padding(output_buffer, hidden_size)
     output = output.to(torch.float)
 
     mask = torch.isclose(output, reference_output, rtol=1e-2, atol=1e-2)
