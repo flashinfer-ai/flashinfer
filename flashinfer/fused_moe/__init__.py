@@ -25,6 +25,7 @@ from .api import (  # noqa: F401
     GeGLU,
     GeGLUTanh,
     Identity,
+    PowLU,
     ReLU,
     ReLU2,
     SiLU,
@@ -175,6 +176,7 @@ from .core import (
     trtllm_fp8_per_channel_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
     trtllm_fp8_per_tensor_scale_routed_moe,
+    trtllm_fused_moe_workspace_size,
     trtllm_moe_allocate_routing_metadata,
     trtllm_moe_allocate_routing_metadata_multi_tile,
     trtllm_bf16_moe,
@@ -247,7 +249,6 @@ from .alphamoe_nvfp4_sm100 import (  # noqa: F401
 )
 
 from .bgmv_moe import (  # noqa: F401
-    BGMVMoEBlackwellPlan as BGMVMoEBlackwellPlan,
     BGMVMoECakePlan as BGMVMoECakePlan,
     BGMVMoEPortablePlan as BGMVMoEPortablePlan,
     bgmv_moe as bgmv_moe,
@@ -326,6 +327,7 @@ __all__ = [
     "SiLU",
     "GeGLUTanh",
     "SwiGLUStep",
+    "PowLU",
     "Identity",
     # Unified configs, packs, and runners
     "B12xNvfp4Config",
@@ -464,6 +466,7 @@ __all__ = [
     "trtllm_fp8_per_channel_scale_routed_moe",
     "trtllm_fp8_per_tensor_scale_moe",
     "trtllm_fp8_per_tensor_scale_routed_moe",
+    "trtllm_fused_moe_workspace_size",
     "trtllm_mxint4_block_scale_moe",
     "trtllm_mxint4_block_scale_routed_moe",
     "fused_topk_deepseek",
@@ -492,7 +495,6 @@ __all__ = [
     "cudnn_frost_grouped_gemm1_swiglu",
     "cudnn_frost_grouped_gemm1_swiglu_workspace_size",
     "bgmv_moe",
-    "BGMVMoEBlackwellPlan",
     "BGMVMoECakePlan",
     "BGMVMoEPortablePlan",
     "bgmv_moe_shrink",

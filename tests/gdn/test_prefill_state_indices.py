@@ -512,44 +512,6 @@ def test_prefill_state_indices_requires_output_state_pool(backend, use_cp):
         )
 
 
-def test_prefill_state_indices_rejects_auto_pool_without_initial_state():
-    """output_final_state=False does not make the auto-allocation safe.
-
-    The kernel writes each final state to output_state[state_indices[i]]
-    whether or not the caller asked for it back -- output_final_state decides
-    only whether it is returned. With no initial_state to take a pool shape
-    from, the auto-allocation is a compact [num_seqs, ...] tensor, and any slot
-    id past num_seqs - 1 writes past its end.
-
-    Nothing about that failure is loud: the caching allocator serves
-    sub-allocations out of a much larger block, so the write lands in another
-    tensor rather than faulting, and compute-sanitizer reports no error. It has
-    to be refused here.
-    """
-    _skip_if_not_supported("flashinfer", False)
-    device = torch.device("cuda")
-    H, D = 16, 128
-    seq_lens = [64]
-    q, k, v, g, beta, cu_seqlens, _ = _make_inputs(
-        seq_lens, H, D, torch.bfloat16, device, seed=6
-    )
-    # One sequence, so the compact shape is [1, ...] and slot 5 is off the end.
-    state_indices = torch.tensor([5], dtype=torch.int32, device=device)
-    with pytest.raises(ValueError, match="explicit output_state pool"):
-        chunk_gated_delta_rule(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            initial_state=None,
-            output_final_state=False,
-            cu_seqlens=cu_seqlens,
-            state_indices=state_indices,
-            output_state=None,
-        )
-
-
 @pytest.mark.parametrize("backend,use_cp", BACKEND_CP_CASES)
 def test_prefill_state_indices_without_final_state(backend, use_cp):
     """Backends support read-only state pools or explicitly reject them."""
@@ -616,6 +578,52 @@ def test_prefill_state_indices_without_final_state(backend, use_cp):
     torch.cuda.synchronize()
 
     assert torch.equal(packed_output, indexed_output)
+
+
+def test_prefill_state_indices_read_only_pool_scratch_spans_pool(monkeypatch):
+    """SM90 stores every final state, to row state_indices[i] when indexed, so
+    the scratch it gets for a read-only pool must span the pool. A compact
+    [num_seqs, ...] scratch took writes past its end that only faulted when
+    the next page happened to be unmapped."""
+    import flashinfer.gdn_prefill as gdn_prefill
+
+    device = torch.device("cuda")
+    if get_compute_capability(device)[0] != 9:
+        pytest.skip("checks the SM90 dispatch")
+    H, D = 16, 128
+    seq_lens = [64, 512]
+    q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
+        seq_lens, H, D, torch.bfloat16, device, seed=4
+    )
+    slots = [3, 0]
+    pool = _make_pool(init_state, slots, 5, 96, init_state.dtype, device)
+    state_indices = torch.tensor(slots, dtype=torch.int32, device=device)
+
+    seen = []
+
+    def record(output, output_state, *args, state_indices=None):
+        seen.append((tuple(output_state.shape), state_indices))
+
+    monkeypatch.setattr(gdn_prefill, "chunk_gated_delta_rule_sm90", record)
+    for initial_state in (pool, None):
+        chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state=initial_state,
+            output_final_state=False,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            use_cp=False,
+            backend="flashinfer",
+            max_seqlen=max(seq_lens),
+        )
+    (pool_shape, pool_indices), (no_pool_shape, no_pool_indices) = seen
+    assert pool_shape == tuple(pool.shape) and pool_indices is state_indices
+    # Nothing to read or write through: the slot ids are dropped.
+    assert no_pool_shape == (len(seq_lens), H, D, D) and no_pool_indices is None
 
 
 @pytest.mark.parametrize("backend,use_cp", BACKEND_CP_CASES)

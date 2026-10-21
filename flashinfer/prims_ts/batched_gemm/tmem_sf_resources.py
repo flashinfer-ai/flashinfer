@@ -212,7 +212,14 @@ class TmemSfBResource(MemoryResource):
                 )
                 tmem_ptr = prims.make_tmem_ptr(tmem_addr, cutlass.Int32)
                 # SFB increment pattern differs from SFA (interleaved)
-                increment = 32 * (s2t_idx // 2) + 128 * (s2t_idx % 2)
+                # R128c4 stores each 128-row block's K groups contiguously,
+                # whereas TMEM interleaves row blocks within each K group.
+                # Descriptor address units are 16 bytes; one copy is 512 B.
+                row_blocks = (self.cfg.tile_n + 127) // 128
+                k_groups = self.cfg.tile_k // self.cfg.input_sf_block_size_b // 4
+                increment = 32 * (
+                    s2t_idx // row_blocks + k_groups * (s2t_idx % row_blocks)
+                )
                 desc_s2t = desc_s2t_base + increment
                 if prims.elect_sync():
                     prims.tcgen05_cp(

@@ -3362,6 +3362,27 @@ def test_topk_clusters_exact_correctness(
     assert accuracy >= acc, f"Accuracy {accuracy:.4f} < {acc}"
 
 
+@pytest.mark.parametrize("batch_size", [200, 252])
+def test_topk_clusters_exact_two_clusters_repeated(batch_size):
+    """Repeated calls with two clusters per row (128 <= batch_size < 256) stay exact."""
+    _require_sm100_or_sm103()
+
+    torch.manual_seed(42)
+    vocab_size, k = 248320, 20
+    logits = torch.randn(batch_size, vocab_size, device="cuda") * 3
+    ref_values = torch.topk(logits, k, dim=-1).values
+
+    for _ in range(200):
+        indices, values = flashinfer.topk.topk_clusters_exact(
+            logits, k, output_values=True, out_dtype=torch.int64
+        )
+        assert ((indices >= 0) & (indices < vocab_size)).all()
+        torch.testing.assert_close(logits.gather(1, indices), values)
+        torch.testing.assert_close(
+            values.sort(dim=-1, descending=True).values, ref_values
+        )
+
+
 @pytest.mark.parametrize("batch_size", [1, 16])
 @pytest.mark.parametrize("seq_len", [4096, 16384])
 @pytest.mark.parametrize("k", [256, 2048])

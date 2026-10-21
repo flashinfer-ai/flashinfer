@@ -22,13 +22,13 @@ from flashinfer.kda_prefill import (
     _wave_quantized_bt16_prepare_ctas,
 )
 
-"Canonical semantic and ABI compile axes shared by KDA schedules."
 from enum import Enum
 
 
 _COMPUTE_CAPABILITY = {"sm_100a": (10, 0), "sm_103a": (10, 3)}
 
 
+# Canonical semantic compile axis shared by KDA schedules.
 class KDAGateKind(str, Enum):
     """Gate algebra selected when a KDA schedule is traced."""
 
@@ -38,17 +38,6 @@ class KDAGateKind(str, Enum):
     @property
     def trace_value(self) -> int:
         return {KDAGateKind.LOWER_BOUND: 1, KDAGateKind.UNBOUNDED_SOFTPLUS: 2}[self]
-
-
-class KDAInputABI(str, Enum):
-    """Input addressing contract selected independently of gate algebra."""
-
-    GENERIC_STRIDED = "generic_strided"
-    PACKED_PROJECTION = "packed_projection"
-
-    @property
-    def trace_value(self) -> int:
-        return {KDAInputABI.GENERIC_STRIDED: 0, KDAInputABI.PACKED_PROJECTION: 1}[self]
 
 
 def gate_kind_from_lower_bound(lower_bound: float | None) -> KDAGateKind:
@@ -90,7 +79,27 @@ def _build_kda_module(factory, *args, **kwargs):
     return factory(*args, **kwargs)
 
 
-'FlashKDA-compatible runtime for Blackwell schedules.\n\nMinimum architecture: sm_100a.\n\nThe public ``fwd`` boundary adds ``compute_dtype="bf16"`` to the FlashKDA\narguments. BF16 compute retains BF16/FP32 external state support; TF32 compute\nrequires FP32 initial/final state. Checkpoints remain BF16. Families without\na validated TF32 implementation report an explicit unsupported request. BF16 H12 dispatches\nbetween the chunk-16 and chunk-32 direct M128 bodies at their measured sequence\nlength crossover; sequences that fit in one 16-token tile and checkpoint\nintervals that require a physical 16-token boundary retain chunk-16.\nActive-FP32-beta H12 checkpoint64 requests on 152-SM GB300 use the M64 value\nsplit for 129-256-token residuals whose doubled task grid fits one SM wave.\nOther head counts dispatch among those direct bodies, the source static-binned\npersistent M128 body, its cross-CTA recurrence-piece specialization for\nquantization-bound uniform grids, and the M64 value-row split. FP32 state\nreuses those physical schedules as state-I/O specializations where validated.\nUnder-parallelized ultra-long fixed layouts additionally use a split-sequence\naffine-prefix DAG derived from FlashInfer PR4779; its main, map, and correction\nwindows reuse the same variable-shape direct-M128 identity. Remaining regions\nretain the source-derived compatibility fallback.\n'
+# FlashKDA-compatible runtime for Blackwell schedules.
+#
+# Minimum architecture: sm_100a.
+#
+# The public ``fwd`` boundary adds ``compute_dtype="bf16"`` to the FlashKDA
+# arguments. BF16 compute retains BF16/FP32 external state support; TF32 compute
+# requires FP32 initial/final state. Checkpoints remain BF16. Families without
+# a validated TF32 implementation report an explicit unsupported request. BF16 H12 dispatches
+# between the chunk-16 and chunk-32 direct M128 bodies at their measured sequence
+# length crossover; sequences that fit in one 16-token tile and checkpoint
+# intervals that require a physical 16-token boundary retain chunk-16.
+# Active-FP32-beta H12 checkpoint64 requests on 152-SM GB300 use the M64 value
+# split for 129-256-token residuals whose doubled task grid fits one SM wave.
+# Other head counts dispatch among those direct bodies, the source static-binned
+# persistent M128 body, its cross-CTA recurrence-piece specialization for
+# quantization-bound uniform grids, and the M64 value-row split. FP32 state
+# reuses those physical schedules as state-I/O specializations where validated.
+# Under-parallelized ultra-long fixed layouts additionally use a split-sequence
+# affine-prefix DAG derived from FlashInfer PR4779; its main, map, and correction
+# windows reuse the same variable-shape direct-M128 identity. Remaining regions
+# retain the source-derived compatibility fallback.
 import heapq
 from dataclasses import dataclass, field
 from functools import cache
@@ -102,20 +111,13 @@ HEAD_DIM = 128
 BF16_M128_CHUNK = 32
 BF16_N16_M128_CHUNK = 16
 BF16_BETA_TMA_MIN_HEADS = 8
-BF16_PERSISTENT_MIN_BALANCED_CTAS = 128
-BF16_LPT_MAX_IMBALANCE_NUMERATOR = 21
-BF16_LPT_MAX_IMBALANCE_DENOMINATOR = 20
-BF16_GB200_LPT_MAX_IMBALANCE_NUMERATOR = 263
-BF16_GB200_LPT_MAX_IMBALANCE_DENOMINATOR = 250
 BF16_DIRECT_ORDER_MAX_PASSES = 1
 BF16_DIRECT_INSERTION_MAX_SEQUENCES = 16
 BF16_DIRECT_FIXED_CHUNK_COST = 6
-H12_DIRECT_N32_MIN_SEQ_LEN = 64
 H12_DIRECT_N32_MAX_SEQ_LEN = 256
 H12_DIRECT_N32_EARLY_STATE_PACK_MAX_SEQ_LEN = 128
 BF16_N32_REGISTER_INVERSE_MIN_SEQ_LEN = 256
 INDEPENDENT_DVSPLIT_CTAS = 2
-INDEPENDENT_DVSPLIT_MIN_SEQ_LEN = 512
 # Architectures whose one-wave BF16 grid sweep selected the M64 value split over
 # every direct M128 tile (see _should_use_bf16_one_wave_dvsplit).
 BF16_ONE_WAVE_DVSPLIT_ARCHES = ("sm_100a", "sm_103a")
@@ -148,19 +150,7 @@ BT16_GENERAL_HIGH_WORK_CHUNKS_PER_PREP_CTA = 8
 BT16_GENERAL_HIGH_WORK_MIN_CHUNK_HEADS = 16384
 BT16_H12_CHUNKS_PER_PREP_CTA = 4
 BT16_H12_CPC1_MAX_TOTAL_CHUNKS = 128
-BT16_PREP_WAVE_QUANT_MIN_WAVES = 8
-BT16_PREP_WAVE_QUANT_MIN_RETAINED_PERCENT = 98
 BT16_DENSE_PREP_WAVES = 5
-BT16_DENSE_MIN_HEADS = 60
-BT16_DENSE_MAX_HEADS = 64
-BT16_DENSE_MIN_SEQ_LEN = 4096
-BT16_N16_ONE_CHAIN_WAVE_MIN_SEQ_LEN = 512
-BT16_N16_TWO_CHAIN_WAVE_MIN_SEQ_LEN = 3072
-BT16_N16_MULTI_WAVE_MIN_SEQ_LEN = 512
-BT16_N16_MAX_DIRECT_WAVES = 3
-BT16_MID_MIN_SEQ_LEN = 4096
-BT16_LONG_MIN_SEQ_LEN = 65536
-BT16_MID_MAX_TASKS = 32
 # Sequence x head tasks the affine composite accepts.  The window budget
 # (``sm_count // num_heads`` windows) keeps the part grid to one wave; the cap
 # only bounds host-side plan size (8 sequences x 16 heads).
@@ -811,21 +801,9 @@ def _ffi_raw_pointer_carrier(tensor):
 # by the shim) and needs the strided view.  Mirrors the source runtime's table
 # of the same name.
 QKV_TMA_ONLY_RAW_POINTERS = {
-    "compiled_bf16_bt16_prepare": ("q", "k"),
-    "compiled_bf16_bt16_prepare_beta_tma": ("q", "k"),
     "compiled_tf32_bt16_prepare": ("q", "k"),
-    "compiled_tf32_bt16_prepare_beta_tma": ("q", "k"),
-    "compiled_bf16_bt16_chain_m64": ("v",),
-    "compiled_bf16_bt16_chain_m64_s7": ("v",),
-    "compiled_bf16_bt16_chain_m64_s9": ("v",),
-    "compiled_fp32_bt16_chain_m64": ("v",),
-    "compiled_tf32_bt16_chain_m64": ("v",),
-    "compiled_tf32_bt16_chain_m64_compact_output": ("v",),
-    "compiled_tf32_bt16_chain_m64_split_prediction": ("v",),
     "compiled_tf32_bt16_chain_m64_fp32_state": ("v",),
     "compiled_tf32_fused_n32": ("q", "k", "v"),
-    "compiled_tf32_fused": ("q", "k"),
-    "compiled_small_bh_m128": ("v",),
 }
 
 
@@ -878,7 +856,6 @@ def _should_use_bf16_one_wave_dvsplit(
     compute_dtype: str,
     force_direct_m128: bool = False,
     force_direct_m128_n32: bool = False,
-    n16_short_four_stage: bool = False,
     beta_tma_refresh: bool = False,
     num_heads: int = 0,
     max_seq_len: int = 0,
@@ -902,7 +879,6 @@ def _should_use_bf16_one_wave_dvsplit(
         and (0 < INDEPENDENT_DVSPLIT_CTAS * total_tasks <= sm_count)
         and (not force_direct_m128)
         and (not force_direct_m128_n32)
-        and (not n16_short_four_stage)
         # BF16 logit beta whose token pitch is not TMA-encodable is refreshed
         # into a padded carrier on every launch.  Only the short H12 direct
         # tiles avoid that carrier (scalar beta loads), so only those grids
@@ -930,7 +906,6 @@ def _should_use_h12_active_beta_m64(
     gate_kind: KDAGateKind,
     force_direct_m128: bool = False,
     force_direct_m128_n32: bool = False,
-    n16_short_four_stage: bool = False,
 ) -> bool:
     """Select the measured one-wave GB300 active-beta H12 value split."""
     return (
@@ -947,7 +922,6 @@ def _should_use_h12_active_beta_m64(
         and (gate_kind == KDAGateKind.LOWER_BOUND)
         and (not force_direct_m128)
         and (not force_direct_m128_n32)
-        and (not n16_short_four_stage)
     )
 
 
@@ -1346,36 +1320,6 @@ def _make_direct_sequence_order(
     return order
 
 
-def _validate_n16_short_four_stage_contract(
-    *,
-    enabled: bool,
-    state_dtype_is_fp32: bool,
-    num_heads: int,
-    max_seq_len: int,
-    checkpoint_every_n_tokens: int,
-    bounded_gate: bool,
-    indexed_state_pool: bool,
-    in_place_state_pool: bool,
-) -> None:
-    """Reject any input outside the private short-serving S4 experiment."""
-    if not enabled:
-        return
-    if not state_dtype_is_fp32:
-        raise ValueError("short N16 S4 requires FP32 state I/O")
-    if num_heads != 12:
-        raise ValueError("short N16 S4 requires exactly 12 heads")
-    if max_seq_len <= 0 or max_seq_len > 64:
-        raise ValueError("short N16 S4 requires 1 <= max_seq_len <= 64")
-    if checkpoint_every_n_tokens != 64:
-        raise ValueError("short N16 S4 requires checkpoint_every_n_tokens=64")
-    if not bounded_gate:
-        raise ValueError("short N16 S4 requires the bounded gate contract")
-    if not indexed_state_pool:
-        raise ValueError("short N16 S4 requires indexed state-pool routing")
-    if not in_place_state_pool:
-        raise ValueError("short N16 S4 requires one in-place initial/final state pool")
-
-
 def _constrained_direct_m128_route(
     *,
     gpu_arch: str,
@@ -1384,7 +1328,6 @@ def _constrained_direct_m128_route(
     force_direct_m128: bool,
     force_direct_m128_n32: bool,
     unbounded_softplus: bool,
-    n16_short_four_stage: bool,
     state_dtype_is_fp32: bool,
     indexed_state_pool: bool,
     checkpoint_every_n_tokens: int,
@@ -1394,16 +1337,15 @@ def _constrained_direct_m128_route(
 
     Indexed state, checkpoint output, and independently strided beta all force
     the direct kernel family, but they do not require its N16 physical tile.
-    Retain N16 for the qualified 64-token row and its private S4 experiment;
-    longer short residuals and dense grids retain the unconstrained N32
-    preference. Checkpoint and beta storage constraints select a legal family;
-    they must not reset its physical tile preference to N16.
+    Retain N16 for the qualified 64-token row; longer short residuals and
+    dense grids retain the unconstrained N32 preference. Checkpoint and beta
+    storage constraints select a legal family; they must not reset its
+    physical tile preference to N16.
     """
     if force_direct_m128_n32 or unbounded_softplus:
         return BF16_ROUTE_DIRECT_M128
     if (
-        not n16_short_four_stage
-        and (not force_direct_m128)
+        (not force_direct_m128)
         and state_dtype_is_fp32
         and indexed_state_pool
         and (checkpoint_every_n_tokens in (0, 64))
@@ -1514,11 +1456,8 @@ class FlashKDABlackwellBF16FusedLaunch:
     _force_direct_m128_n32 = False
     _force_independent_dvsplit = False
     _force_small_bh_owner_helper = False
-    _persistent_task_schedule: str | None = None
     _keepalive: tuple[Any, ...]
     _force_bt16_prepare_chain = False
-    _force_bt16_s7_chain = False
-    _force_bt16_beta_tma = False
     _state_dtype_is_fp32 = False
     _n32_ft_slab = False
     _affine_operator_export = False
@@ -1526,8 +1465,6 @@ class FlashKDABlackwellBF16FusedLaunch:
     _pdl_publish_final_state = False
     _checkpoint_accumulate = False
     _affine_main_indexed_initial = False
-    _affine_main_indexed_initial_bf16 = False
-    _n16_short_four_stage = False
     _active_beta_f32 = False
 
     def _build_body(self, factory, *args, **kwargs):
@@ -1585,9 +1522,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             self._active_beta_f32 = True
         validate_kda_state_tensors(compute_dtype, initial_state, final_state)
         validate_kda_state_dtype(
-            compute_dtype,
-            state_dtype_is_fp32=self._state_dtype_is_fp32
-            and (not self._affine_main_indexed_initial_bf16),
+            compute_dtype, state_dtype_is_fp32=self._state_dtype_is_fp32
         )
         self.compute_dtype = compute_dtype
         self._qkv_carrier_names: dict[int, tuple[str, ...]] = {}
@@ -1771,49 +1706,8 @@ class FlashKDABlackwellBF16FusedLaunch:
         max_seq_len = max(
             (end - start for start, end in zip(offsets, offsets[1:], strict=False))
         )
-        _validate_n16_short_four_stage_contract(
-            enabled=self._n16_short_four_stage,
-            state_dtype_is_fp32=self._state_dtype_is_fp32,
-            num_heads=num_heads,
-            max_seq_len=max_seq_len,
-            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-            bounded_gate=not unbounded_softplus,
-            indexed_state_pool=state_indices is not None,
-            in_place_state_pool=initial_state is not None
-            and initial_state is final_state,
-        )
         use_tf32_direct_m128 = compute_dtype == "tf32" and self._force_direct_m128
-        if self._persistent_task_schedule is not None:
-            if (
-                gate_kind != KDAGateKind.LOWER_BOUND
-                or checkpoint_every_n_tokens % BF16_M128_CHUNK
-            ):
-                raise ValueError(
-                    "persistent N32 tasks require bounded gates and N32-aligned checkpoints"
-                )
-            if self._persistent_task_schedule == "grouped":
-                route = BF16_ROUTE_HEAD_GROUPED_M128
-            elif self._persistent_task_schedule == "lpt":
-                route = BF16_ROUTE_LPT_M128
-            elif self._persistent_task_schedule == "piece":
-                if (
-                    len(
-                        set(
-                            (
-                                end - start
-                                for start, end in zip(
-                                    offsets, offsets[1:], strict=False
-                                )
-                            )
-                        )
-                    )
-                    != 1
-                ):
-                    raise ValueError("piece task bins require uniform sequence lengths")
-                route = BF16_ROUTE_PIECE_M128
-            else:
-                raise ValueError("unknown persistent task schedule")
-        elif self._force_independent_dvsplit:
+        if self._force_independent_dvsplit:
             if gate_kind != KDAGateKind.LOWER_BOUND:
                 raise ValueError("fused M64 requires bounded gates")
             route = BF16_ROUTE_M64
@@ -1877,7 +1771,6 @@ class FlashKDABlackwellBF16FusedLaunch:
             gate_kind=gate_kind,
             force_direct_m128=self._force_direct_m128,
             force_direct_m128_n32=force_direct_m128_n32,
-            n16_short_four_stage=self._n16_short_four_stage,
         ):
             route = BF16_ROUTE_M64
         elif needs_direct_m128:
@@ -1888,7 +1781,6 @@ class FlashKDABlackwellBF16FusedLaunch:
                 force_direct_m128=self._force_direct_m128,
                 force_direct_m128_n32=force_direct_m128_n32,
                 unbounded_softplus=unbounded_softplus,
-                n16_short_four_stage=self._n16_short_four_stage,
                 state_dtype_is_fp32=self._state_dtype_is_fp32,
                 indexed_state_pool=state_indices is not None,
                 checkpoint_every_n_tokens=checkpoint_every_n_tokens,
@@ -1989,7 +1881,6 @@ class FlashKDABlackwellBF16FusedLaunch:
                 compute_dtype=compute_dtype,
                 force_direct_m128=self._force_direct_m128,
                 force_direct_m128_n32=force_direct_m128_n32,
-                n16_short_four_stage=self._n16_short_four_stage,
                 # Logit beta whose token pitch the 8x32 TMA box cannot encode is
                 # refreshed into a padded carrier each launch (see
                 # _pad_beta_tma_source); active FP32 beta never uses that box.
@@ -2066,20 +1957,12 @@ class FlashKDABlackwellBF16FusedLaunch:
         use_small_bh_owner_helper = route == BF16_ROUTE_SMALL_BH_M128
         use_tf32_owner_helper = compute_dtype == "tf32" and use_small_bh_owner_helper
         use_bt16_prepare_chain = route == BF16_ROUTE_BT16_M64
-        use_bt16_s7_chain = self._force_bt16_s7_chain or (
+        use_bt16_s7_chain = (
             use_bt16_prepare_chain and BT16_VALUE_SPLITS * total_tasks > sm_count
         )
         use_independent_dvsplit = route == BF16_ROUTE_M64
         use_source_vtile_m128 = route == BF16_ROUTE_SOURCE_VTILE_M128
-        if self._force_bt16_beta_tma and (
-            not use_bt16_prepare_chain
-            or not fixed_layout
-            or num_heads % BF16_BETA_TMA_MIN_HEADS != 0
-        ):
-            raise ValueError(
-                "forced BT16 beta TMA requires a fixed, pitch-aligned BT16 route"
-            )
-        use_bt16_beta_tma = self._force_bt16_beta_tma or (
+        use_bt16_beta_tma = (
             use_bt16_prepare_chain
             and (not self._active_beta_f32)
             and (num_heads % BF16_BETA_TMA_MIN_HEADS == 0)
@@ -2712,15 +2595,13 @@ class FlashKDABlackwellBF16FusedLaunch:
                 pdl_wait_initial_state_f32=self._pdl_wait_initial_state_f32,
                 pdl_publish_final_state=self._pdl_publish_final_state,
                 affine_main_indexed_initial=self._affine_main_indexed_initial,
-                affine_main_indexed_initial_bf16=self._affine_main_indexed_initial_bf16,
+                affine_main_indexed_initial_bf16=False,
                 backend=backend,
-                n16_short_four_stage=self._n16_short_four_stage,
+                n16_short_four_stage=False,
             )
             self.schedule = (
                 (
-                    "fused_checkpoint_tma_direct_m128_n16_s4"
-                    if self._n16_short_four_stage
-                    else "fused_checkpoint_tma_direct_m128_n16"
+                    "fused_checkpoint_tma_direct_m128_n16"
                     if checkpoint_every_n_tokens
                     else "fused_h12_direct_m128_n16"
                     if num_heads == 12
@@ -2815,7 +2696,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 pdl_wait_initial_state_f32=self._pdl_wait_initial_state_f32,
                 pdl_publish_final_state=self._pdl_publish_final_state,
                 affine_main_indexed_initial=self._affine_main_indexed_initial,
-                affine_main_indexed_initial_bf16=self._affine_main_indexed_initial_bf16,
+                affine_main_indexed_initial_bf16=False,
                 affine_factor_cache=_affine_factor_cache_mode,
                 affine_map_only=_affine_map_only,
                 affine_map_output=_affine_map_output,
@@ -3255,58 +3136,10 @@ class FlashKDABlackwellBF16FusedLaunch:
         return None
 
 
-class FlashKDABlackwellBF16GroupedM128Launch(FlashKDABlackwellBF16FusedLaunch):
-    """Grouped persistent tasks with independent BF16/TF32 compute choice."""
-
-    _persistent_task_schedule = "grouped"
-
-
-class FlashKDABlackwellFP32GroupedM128Launch(FlashKDABlackwellBF16GroupedM128Launch):
-    """Grouped persistent tasks with FP32 external state."""
-
-    _state_dtype_is_fp32 = True
-
-
-class FlashKDABlackwellBF16LPTM128Launch(FlashKDABlackwellBF16FusedLaunch):
-    """LPT persistent tasks with independent BF16/TF32 compute choice."""
-
-    _persistent_task_schedule = "lpt"
-
-
-class FlashKDABlackwellFP32LPTM128Launch(FlashKDABlackwellBF16LPTM128Launch):
-    """LPT persistent tasks with FP32 external state."""
-
-    _state_dtype_is_fp32 = True
-
-
-class FlashKDABlackwellBF16PieceM128Launch(FlashKDABlackwellBF16FusedLaunch):
-    """Uniform recurrence pieces with BF16/TF32 compute and device handoffs."""
-
-    _persistent_task_schedule = "piece"
-
-
-class FlashKDABlackwellFP32PieceM128Launch(FlashKDABlackwellBF16PieceM128Launch):
-    """Uniform recurrence pieces with FP32 external state."""
-
-    _state_dtype_is_fp32 = True
-
-
 class FlashKDABlackwellBF16DirectM128Launch(FlashKDABlackwellBF16FusedLaunch):
     """Prepare the compatible direct-M128 seed without auto-route substitution."""
 
     _force_direct_m128 = True
-
-
-class FlashKDABlackwellBF16DirectM128N32Launch(FlashKDABlackwellBF16DirectM128Launch):
-    """Force N32 for explicit checkpoint A/B without changing production policy."""
-
-    _force_direct_m128_n32 = True
-
-
-class FlashKDABlackwellBF16SmallBHLaunch(FlashKDABlackwellBF16FusedLaunch):
-    """Prepare the owner/helper candidate independently of auto dispatch."""
-
-    _force_small_bh_owner_helper = True
 
 
 class FlashKDABlackwellFP32SmallBHLaunch(FlashKDABlackwellBF16FusedLaunch):
@@ -3314,12 +3147,6 @@ class FlashKDABlackwellFP32SmallBHLaunch(FlashKDABlackwellBF16FusedLaunch):
 
     _force_small_bh_owner_helper = True
     _state_dtype_is_fp32 = True
-
-
-class FlashKDABlackwellBF16BT16Launch(FlashKDABlackwellBF16FusedLaunch):
-    """Prepare the BT16 factor/chain family independently of auto dispatch."""
-
-    _force_bt16_prepare_chain = True
 
 
 class FlashKDABlackwellFP32BT16Launch(FlashKDABlackwellBF16FusedLaunch):
@@ -3361,12 +3188,6 @@ class FlashKDABlackwellFP32M64Launch(FlashKDABlackwellBF16M64Launch):
     _state_dtype_is_fp32 = True
 
 
-class FlashKDABlackwellBF16ActiveBetaM64Launch(FlashKDABlackwellBF16M64Launch):
-    """Fused M64 with active FP32 beta and BF16 external state."""
-
-    _active_beta_f32 = True
-
-
 class FlashKDABlackwellFP32ActiveBetaM64Launch(FlashKDABlackwellFP32M64Launch):
     """Fused M64 with active FP32 beta and FP32 external state."""
 
@@ -3377,26 +3198,6 @@ class FlashKDABlackwellFP32DirectM128Launch(FlashKDABlackwellFP32FusedM128Launch
     """Force the variable-shape direct M128 body with FP32 state I/O."""
 
     _force_direct_m128 = True
-
-
-class FlashKDABlackwellFP32DirectM128N32Launch(FlashKDABlackwellFP32DirectM128Launch):
-    """Force the FP32-state N32 body for explicit checkpoint A/B."""
-
-    _force_direct_m128_n32 = True
-
-
-class FlashKDABlackwellFP32ActiveBetaDirectM128Launch(
-    FlashKDABlackwellFP32DirectM128Launch
-):
-    """Explicit direct M128 with active FP32 beta and either compute precision."""
-
-    _active_beta_f32 = True
-
-
-class FlashKDABlackwellFP32DirectM128N16S4Launch(FlashKDABlackwellFP32DirectM128Launch):
-    """Private short-request N16 S4 candidate for explicit serving A/B."""
-
-    _n16_short_four_stage = True
 
 
 class FlashKDABlackwellFP32SlabM128Launch(FlashKDABlackwellFP32DirectM128Launch):
@@ -4635,18 +4436,6 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self._correction.close()
 
 
-class FlashKDABlackwellBF16BT16S7Launch(FlashKDABlackwellBF16BT16Launch):
-    """Force the lower-SMEM BT16 chain for focused validation."""
-
-    _force_bt16_s7_chain = True
-
-
-class FlashKDABlackwellBF16BT16BetaTMALaunch(FlashKDABlackwellBF16BT16Launch):
-    """Force the beta-TMA BT16 retrace for focused transport validation."""
-
-    _force_bt16_beta_tma = True
-
-
 def _launch_sequence_lengths(q, cu_seqlens, declared=None) -> tuple[int, ...]:
     """Resolve preparation metadata once; never inspect sequence values at launch."""
     if declared is not None:
@@ -4968,24 +4757,6 @@ REBIND_INPUT_NAMES = (
     "state_checkpoints",
     "checkpoint_cu_starts",
 )
-
-
-def _rebind_tensor_signature(tensor) -> tuple | None:
-    """Layout facts a prepared launch depends on, excluding the base address.
-
-    The low address bits are kept because preparation branches on 16-byte
-    alignment (pair-packed beta TMA, checkpoint TMA) and TMA descriptors
-    require 16-byte aligned bases.
-    """
-    if tensor is None:
-        return None
-    return (
-        tuple(tensor.shape),
-        tuple(tensor.stride()),
-        tensor.dtype,
-        tensor.data_ptr() & 0xFF,
-        tensor.device.index,
-    )
 
 
 def _storage_base_address(tensor) -> int:
@@ -5490,7 +5261,6 @@ class FlashKDABlackwellLaunch:
 
         initial_state = argument(10, "initial_state")
         final_state = argument(11, "final_state")
-        state_indices = argument(13, "state_indices")
         compute_dtype = argument(18, "compute_dtype", "bf16")
         validate_kda_state_tensors(compute_dtype, initial_state, final_state)
         q = argument(0, "q")
@@ -5503,11 +5273,6 @@ class FlashKDABlackwellLaunch:
                 state is not None and getattr(state, "dtype", None) == torch.float32
                 for state in (initial_state, final_state)
             )
-        )
-        checkpoint_request = (
-            argument(14, "state_checkpoints") is not None
-            or argument(15, "checkpoint_cu_starts") is not None
-            or argument(16, "checkpoint_every_n_tokens", 0) != 0
         )
         impl: type[FlashKDABlackwellBF16FusedLaunch]
         if _supports_affine_split_launch(args, kwargs):
@@ -5526,13 +5291,7 @@ class FlashKDABlackwellLaunch:
                         _supports_fp32_small_bh_launch,
                     ),
                 )
-            impl = (
-                FlashKDABlackwellFP32FusedM128Launch
-                if state_indices is not None
-                or checkpoint_request
-                or compute_dtype == "tf32"
-                else FlashKDABlackwellFP32FusedM128Launch
-            )
+            impl = FlashKDABlackwellFP32FusedM128Launch
             for launch_cls, supports in candidates:
                 if supports(args, kwargs):
                     impl = launch_cls
@@ -5549,52 +5308,6 @@ class FlashKDABlackwellLaunch:
 
     def close(self) -> None:
         self._impl.close()
-
-
-def prepare_fwd(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    scale,
-    out,
-    A_log,
-    dt_bias,
-    lower_bound,
-    initial_state=None,
-    final_state=None,
-    cu_seqlens=None,
-    state_indices=None,
-    state_checkpoints=None,
-    checkpoint_cu_starts=None,
-    checkpoint_every_n_tokens: int = 0,
-    use_qk_l2norm_in_kernel: bool = True,
-    compute_dtype: str = "bf16",
-) -> FlashKDABlackwellLaunch:
-    """Validate inputs and preallocate descriptors/workspace for repeated launch."""
-    if use_qk_l2norm_in_kernel is not True:
-        raise ValueError("FlashKDA requires use_qk_l2norm_in_kernel=True")
-    return FlashKDABlackwellLaunch(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        scale,
-        out,
-        A_log,
-        dt_bias,
-        lower_bound,
-        initial_state,
-        final_state,
-        cu_seqlens,
-        state_indices,
-        state_checkpoints,
-        checkpoint_cu_starts,
-        checkpoint_every_n_tokens,
-        compute_dtype=compute_dtype,
-    )
 
 
 def _should_use_bf16_active_beta_m64(*, sm_count, num_seqs, num_heads, max_seq_len):

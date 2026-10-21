@@ -51,19 +51,19 @@ def _cache_env(monkeypatch, tmp_path):
 def test_live_tokens_distinguish_workloads(monkeypatch, tmp_path, backend):
     import importlib.util
     import json
-    from pathlib import Path
+    from importlib import resources
 
     # Load the host-only cache without importing conflicting kernel namespaces.
-    source = (
-        Path(__file__).resolve().parents[2]
-        / "flashinfer/moe_ep/kernel_src"
-        / backend.replace(".", "/")
-        / "shim/knob_cache.py"
+    source = resources.files("flashinfer").joinpath(
+        "moe_ep", "kernel_src", *backend.split("."), "shim", "knob_cache.py"
     )
-    spec = importlib.util.spec_from_file_location("test_metadata_cache", source)
-    assert spec is not None and spec.loader is not None
-    cache = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cache)
+    with resources.as_file(source) as source_path:
+        spec = importlib.util.spec_from_file_location(
+            "test_metadata_cache", source_path
+        )
+        assert spec is not None and spec.loader is not None
+        cache = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cache)
     path = _cache_env(monkeypatch, tmp_path)
     key = dict(_KEY, max_tokens=512, device="testgpu")
     if backend.startswith("sm90."):

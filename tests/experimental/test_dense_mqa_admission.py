@@ -5,7 +5,10 @@ stock DeepGEMM by asking ``dense_route_available(H, Q, K, arch=device_arch)``; t
 64-head family per tier and per architecture (``policy.dense_admission``): an admitted tier is served on that
 arch, a withheld tier is not (its record may exist for another arch).  The one-split ``:short`` routes
 (K <= ``policy.dense_short.max_kv``, two or more query blocks) are the exception: a withheld ``:short`` call
-is served by the tier route of its query count, never by the stock kernel.  These tests pin that contract
+is served by the tier route of its query count, never by the stock kernel; so are the in-kernel KV-split ``:kvsplit``
+routes (K > ``policy.dense_kvsplit.min_kv`` and fewer query blocks than the architecture's catalogued SM count
+``policy.dense_kvsplit.sm_count[arch]``): a withheld ``:kvsplit`` call is served by the grid-stride ``q1`` / tier route of
+its query count.  These tests pin that contract
 against the shipped catalog itself and against a synthetic catalog whose architectures disagree.  The KV
 length rule is each route record's (``kv_min`` and the per-architecture ``kv_alignment``): the single-launch
 fused ``fp8:qle128:short`` and ``fp8:qle2048:short`` routes take any K on every architecture, the other 32-head
@@ -21,27 +24,53 @@ from flashinfer import dense_mqa
 from flashinfer.experimental.deepgemm_dense_mqa import dense_mqa as _runtime
 
 H64_TIERS = ("le8", "le64", "le1024", "any")
-H64_ROUTES = frozenset(
+# The in-kernel KV-split routes (``policy.dense_kvsplit``): the production text under the plan of its query count.
+H64_KVSPLIT_ROUTES = frozenset(
     {
-        "fp8:h64:q1",
+        "fp8:h64:q1:kvsplit",
         *(
-            f"fp8:h64:{kind}:{tier}"
+            f"fp8:h64:{kind}:{plan}:kvsplit"
             for kind in ("full", "partial")
-            for tier in (*H64_TIERS, "short")
+            for plan in ("qle128", "qle2048")
         ),
     }
 )
-# One or two (queries, keys) points per 64-head route.  K = 4137 is a legal 64-head KV length (any K >= 1)
-# that the one-split gate never accepts; a ``:short`` route needs K <= policy.dense_short.max_kv (256) and
-# at least two query blocks (block_q = 2 for 64 heads).
+# The grid-stride tier aliases the KV-split gate leaves without a domain at the catalogued SM counts (2..32 query blocks:
+# K > 256 is the plan, K <= 256 the one-split text): no record, neither admitted nor withheld
+# (``policy.dense_kvsplit.unreached_routes``).
+H64_UNREACHED_ROUTES = frozenset(
+    {"fp8:h64:partial:le8", "fp8:h64:full:le64", "fp8:h64:partial:le64"}
+)
+# Every 64-head route the shipped route rule reaches: the admission lists name exactly these per architecture.
+H64_ROUTES = (
+    frozenset(
+        {
+            "fp8:h64:q1",
+            *(
+                f"fp8:h64:{kind}:{tier}"
+                for kind in ("full", "partial")
+                for tier in (*H64_TIERS, "short")
+            ),
+        }
+    )
+    - H64_UNREACHED_ROUTES
+    | H64_KVSPLIT_ROUTES
+)
+# One to three (queries, keys) points per 64-head route.  K = 4137 is a legal 64-head KV length (any K >= 1)
+# that the one-split gate never accepts and the KV-split gate accepts for fewer query blocks than the catalogued
+# SM count (148 / 152: Q <= 294 on both); a ``:short`` route needs K <= policy.dense_short.max_kv (256) and at
+# least two query blocks (block_q = 2 for 64 heads); the grid-stride ``q1`` / ``full:le8`` routes keep the
+# one-block calls at K <= 256, the ``le1024`` / ``any`` tiers the calls of at least as many blocks as SMs.
 SHAPES_BY_ROUTE = {
-    "fp8:h64:q1": ((1, 4137),),
-    "fp8:h64:full:le8": ((2, 4137), (8, 4137)),
-    "fp8:h64:partial:le8": ((3, 4137), (7, 4137)),
-    "fp8:h64:full:le64": ((16, 4137), (64, 4137)),
-    "fp8:h64:partial:le64": ((37, 4137), (63, 4137)),
-    "fp8:h64:full:le1024": ((128, 4137), (1024, 4137)),
-    "fp8:h64:partial:le1024": ((129, 4137), (1023, 4137)),
+    "fp8:h64:q1": ((1, 1), (1, 256)),
+    "fp8:h64:q1:kvsplit": ((1, 257), (1, 4137)),
+    "fp8:h64:full:le8": ((2, 256), (2, 1)),
+    "fp8:h64:full:qle128:kvsplit": ((2, 4137), (16, 4137), (64, 4137)),
+    "fp8:h64:partial:qle128:kvsplit": ((3, 4137), (37, 4137), (63, 4137)),
+    "fp8:h64:full:qle2048:kvsplit": ((128, 4137), (294, 4137)),
+    "fp8:h64:partial:qle2048:kvsplit": ((129, 4137), (293, 4137)),
+    "fp8:h64:full:le1024": ((1024, 4137), (304, 4137)),
+    "fp8:h64:partial:le1024": ((1023, 4137), (305, 4137)),
     "fp8:h64:full:any": ((4096, 4137), (16232, 4137)),
     "fp8:h64:partial:any": ((1025, 4137), (16231, 4137)),
     "fp8:h64:full:short": ((16, 16), (256, 256)),
@@ -51,7 +80,7 @@ SHAPES_BY_ROUTE = {
 # ``policy.dense_admission``); one tier is therefore admitted on some architectures only.
 ADMITTED_FIXTURE = {
     "sm_100a": (),
-    "sm_103a": ("fp8:h64:partial:any", "fp8:h64:full:le64"),
+    "sm_103a": ("fp8:h64:partial:any", "fp8:h64:full:le1024"),
 }
 REASON_FIXTURE = {
     "sm_100a": "not converged: partial:any blocked by one row",
@@ -142,12 +171,29 @@ def test_dense_admission_is_per_arch_disjoint_and_complete(catalog_variant):
 def _served_route(route, queries, admitted):
     """The route the runtime serves for a 64-head point whose logical route is ``route`` on an arch that
     admits ``admitted``: the route itself, except a ``:short`` route the arch withholds (or the catalog does
-    not carry) is served by the tier route of the same query count -- never by the stock kernel
-    (``policy.dense_short.fallback == "tier"``)."""
+    not carry) is served by the grid-stride tier route of the same query count and a ``:kvsplit`` route the arch
+    withholds by the grid-stride ``q1`` / tier route of the same query count -- never by the stock kernel
+    (``policy.dense_short.fallback == policy.dense_kvsplit.fallback == "tier"``).  The tier route is one the
+    catalog ships: the query count's own tier when it has a record, else the next wider tier up to ``:any``
+    (the first of them the arch admits, else the first shipped one, which the admission check then refuses)."""
     if route.endswith(":short") and route not in admitted:
         kind = route.split(":")[-2]
-        return f"fp8:h64:{kind}:{_runtime.metadata_tier(queries, 64)}"
-    return route
+    elif route.endswith(":kvsplit") and route not in admitted:
+        parts = route.split(":")
+        if parts[-2] == "q1":
+            return "fp8:h64:q1"
+        kind = parts[-3]
+    else:
+        return route
+    routes = _runtime._catalog()["routes"]
+    start = H64_TIERS.index(_runtime.metadata_tier(queries, 64))
+    candidates = [
+        f"fp8:h64:{kind}:{tier}"
+        for tier in H64_TIERS[start:]
+        if f"fp8:h64:{kind}:{tier}" in routes
+    ]
+    assert candidates, (route, queries)
+    return next((c for c in candidates if c in admitted), candidates[0])
 
 
 @pytest.mark.parametrize("route", sorted(H64_ROUTES))
@@ -168,6 +214,17 @@ def test_dense_route_available_follows_the_per_arch_admission(catalog_variant, r
             available = dense_mqa.dense_route_available(64, queries, keys, arch=arch)
             served = _served_route(route, queries, admitted)
             assert available == (served in admitted), (arch, route, queries, keys)
+            # A withheld ``:short`` / ``:kvsplit`` call is served by a route the catalog carries (a grid-stride
+            # tier the catalog leaves unshipped is never selected), and the runtime names that route.
+            assert served in _runtime._catalog()["routes"], (arch, route, queries, keys)
+            assert (
+                _runtime.served_route("fp8", queries, keys, 64, arch=arch) == served
+            ), (
+                arch,
+                route,
+                queries,
+                keys,
+            )
             assert available == _runtime.dense_route_available(
                 64, queries, keys, arch=arch
             )
@@ -247,3 +304,64 @@ def test_plan_refuses_a_withheld_route_by_name(monkeypatch):
     )
     with pytest.raises(ValueError, match="sm_100a"):
         _runtime.route_record("fp8", 16231, 4137, 64, arch="sm_100a")
+
+
+def test_dense_kvsplit_gate_is_published_and_shape_only():
+    """``policy.dense_kvsplit`` (the shipped catalog): the shape-only gate of the 64-head in-kernel KV-split routes --
+    ``K > min_kv`` (the one-split routes' bound: the two gates partition K) and fewer query blocks than the
+    architecture's catalogued SM count ``sm_count[arch]`` (``<= max_sms``) -- its three plan bands, the ``"tier"``
+    fallback and the unreached tier aliases; the runtime applies it at the catalogued count (no device query), the
+    32-head routes never take it, and the plan routes own the metadata buffer their text writes."""
+    catalog = _runtime._catalog()
+    gate = catalog["policy"].get("dense_kvsplit")
+    if gate is None or 64 not in _runtime.heads():
+        pytest.skip("the catalog carries no 64-head in-kernel KV-split routes")
+    assert gate["fallback"] == "tier"
+    assert int(gate["min_kv"]) == int(catalog["policy"]["dense_short"]["max_kv"]) == 256
+    assert sorted(gate["plans"]) == ["q1", "qle128", "qle2048"]
+    bands = {plan: (int(low), int(high)) for plan, (low, high) in gate["plans"].items()}
+    assert bands["q1"] == (1, 1) and bands["qle128"][0] == 2
+    assert bands["qle2048"][0] == bands["qle128"][1] + 1
+    assert bands["qle2048"][1] == int(gate["max_q_blocks"]) * _runtime.block_q(64)
+    assert sorted(gate["sm_count"]) == sorted(catalog["arches"])
+    assert set(gate["unreached_routes"]) == H64_UNREACHED_ROUTES
+    assert not set(gate["unreached_routes"]) & set(catalog["routes"])
+    assert set(catalog["routes"]) >= H64_KVSPLIT_ROUTES
+    min_kv = int(gate["min_kv"])
+    for arch in sorted(catalog["arches"]):
+        sms = int(gate["sm_count"][arch])
+        assert 1 <= sms <= int(gate["max_sms"])
+        admitted = set(dense_mqa.dense_admission(arch)["admitted_routes"])
+        # the block-count boundary at this architecture's count, the K bound's two sides, the plan bands' edges
+        assert (
+            _runtime.h64_kvsplit_plan(2 * (sms - 1), min_kv + 1, 64, arch=arch)
+            == "qle2048"
+        )
+        assert _runtime.h64_kvsplit_plan(2 * sms - 1, min_kv + 1, 64, arch=arch) is None
+        assert _runtime.h64_kvsplit_plan(37, min_kv, 64, arch=arch) is None
+        assert _runtime.h64_kvsplit_plan(37, min_kv + 1, 64, arch=arch) == "qle128"
+        assert _runtime.h64_kvsplit_plan(1, min_kv + 1, 64, arch=arch) == "q1"
+        assert _runtime.h64_kvsplit_plan(64, 4137, 64, arch=arch) == "qle128"
+        assert _runtime.h64_kvsplit_plan(65, 4137, 64, arch=arch) == "qle2048"
+        assert _runtime.h64_kvsplit_plan(37, 4137, 32, arch=arch) is None
+        served = _runtime.served_route("fp8", 2 * (sms - 1), 4137, 64, arch=arch)
+        assert served == _served_route(
+            "fp8:h64:full:qle2048:kvsplit", 2 * (sms - 1), admitted
+        )
+        assert (
+            _runtime.served_route("fp8", 2 * sms - 1, 4137, 64, arch=arch)
+            == "fp8:h64:partial:le1024"
+        )
+        assert _runtime.served_route("fp8", 37, min_kv, 64, arch=arch) == _served_route(
+            "fp8:h64:partial:short", 37, admitted
+        )
+        assert not _runtime.served_route("fp8", 37, 4137, 32, arch=arch).endswith(
+            ":kvsplit"
+        )
+    assert _runtime.route_owns_metadata("fp8:h64:q1:kvsplit", 64)
+    assert _runtime.route_owns_metadata("fp8:h64:partial:qle128:kvsplit", 64)
+    assert not _runtime.route_owns_metadata("fp8:h64:q1", 64)
+    assert not _runtime.route_owns_metadata("fp8:h64:partial:short", 64)
+    assert _runtime.route_owns_metadata("fp8:q1", 32)
+    with pytest.raises(ValueError, match="arch must be one of"):
+        _runtime.h64_kvsplit_plan(37, 4137, 64, arch="sm_999x")

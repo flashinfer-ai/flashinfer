@@ -1,147 +1,102 @@
-"""Correctness tests for the Cake fused QK RMSNorm + NeoX RoPE + FP8 quantize + paged KV append kernel.
+"""
+Copyright (c) 2026 by FlashInfer team.
 
-Every case is checked against an independent fp32 reference (per-head RMSNorm, NeoX RoPE,
-``amax / upper_max`` or static Q scale, ``x / scale`` K/V payloads, last-page tail clear,
-device-side ``q_indptr`` validation).  FP8 payloads are compared against the *unrounded*
-fp32 payload with ``atol = rtol = 0.1``; ``q_scale`` with ``rtol = 1e-5``; flags, cleared
-tails and every untouched byte bitwise.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Correctness tests for the Cake fused QK RMSNorm + NeoX RoPE + FP8 quantize +
+paged KV append kernel.
+
+Every case is checked against an independent fp32 reference (per-head RMSNorm,
+NeoX RoPE, ``amax / upper_max`` or static Q scale, ``x / scale`` K/V payloads,
+last-page tail clear, device-side ``q_indptr`` validation).  FP8 payloads are
+compared against the *unrounded* fp32 payload with ``atol = rtol = 0.1``;
+``q_scale`` with ``rtol = 1e-5``; flags, cleared tails and every untouched byte
+bitwise.
+
+This suite exercises the backend package alone: it names the package once,
+through ``tests.test_helpers.cake_package``, and imports nothing else from
+flashinfer, so a build that vendors the package under another import path
+runs it unchanged after pointing that table entry at its package.  The
+``flashinfer.cake_fused_qk_rope_fp8_append`` facade is covered by
+``test_cake_fused_qk_rope_fp8_append_api.py``.
 """
 
+from __future__ import annotations
+
+import ast
+import re
+import sys
 from pathlib import Path
 
 import pytest
 import torch
 
-from flashinfer.cake_fused_qk_rope_fp8_append import (
-    cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache as fused_fp8,
-)
-from flashinfer.jit import cake_fused_qk_rope_fp8_append as jit_fp8
-from flashinfer.utils import get_compute_capability
+from tests.test_helpers.cake_package import cake_package
+
+pkg = cake_package("cake_fused_qk_rope_fp8_append")
+cake_build = cake_package("cake_fused_qk_rope_fp8_append", "cake_build")
+loader = cake_package("cake_fused_qk_rope_fp8_append", "cake_jit")
+fused_fp8 = pkg.cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache
 
 HEAD_DIM = 128
 FP8_MAX = 448.0
 AMAX_FLOOR = 1e-6
 EPS = 1e-6
 POISON_BYTE = 0xFF  # NaN in float8_e4m3fn: never produced by the kernel
+PACKAGE_DIR = Path(pkg.__file__).resolve().parent
+GRID_RULES = (
+    "rows_plus_requests_by_kv_heads",
+    "rows_by_kv_heads",
+    "kv_heads_by_rows",
+    "kv_heads_by_rows_plus_requests",
+)
+FOLD_GRID_RULES = ("rows_by_kv_heads", "kv_heads_by_rows")
+
+
+def _device() -> torch.device:
+    return torch.device("cuda:0")
+
+
+def _arch():
+    if not torch.cuda.is_available():
+        return None
+    return loader.arch_for_capability(torch.cuda.get_device_capability(_device()))
+
+
+def _supported() -> bool:
+    return _arch() is not None
 
 
 def _skip_unless_supported():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    cc = get_compute_capability(torch.device("cuda:0"))
-    if cc not in ((9, 0), (10, 0), (10, 3)):
+    if _arch() is None:
         pytest.skip(
-            f"cake_fused_qk_rope_fp8_append has no cubin for compute capability {cc}"
+            "cake_fused_qk_rope_fp8_append ships no build for compute capability "
+            f"{torch.cuda.get_device_capability(_device())}"
         )
 
 
-def test_shared_sources_bind_one_kernel_symbol_per_module(monkeypatch):
-    """CPU-only: every architecture compiles the same kernel and binding sources,
-    and the loader binds each module to its own kernel symbol through a define."""
-    import flashinfer.jit.core as jit_core
-
-    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
-    define = "-DCAKE_KERNEL_SYMBOL="
-    sources = set()
-    symbols = set()
-    for arch in jit_fp8.ARCHES:
-        spec = jit_fp8.gen_cake_fused_qk_rope_fp8_append_module(jit_fp8.STAGES[0], arch)
-        assert spec.name.endswith(f"_{arch}")
-        # _source_path() checked the manifest sha256 receipt of both sources.
-        sources.add(tuple(Path(source).resolve() for source in spec.sources))
-        flags = [flag for flag in spec.extra_cuda_cflags if flag.startswith(define)]
-        assert len(flags) == 1, spec.extra_cuda_cflags
-        symbol = flags[0][len(define) :]
-        assert symbol == "kernel_" + spec.name[: -len(f"_{arch}")]
-        symbols.add(symbol)
-    assert len(symbols) == len(jit_fp8.ARCHES)
-    [(kernel, binding)] = sources
-    assert kernel.name == "cake_fused_qk_rope_fp8_append_kernel.cu"
-    assert binding.name == "cake_fused_qk_rope_fp8_append_binding.cu"
-    assert kernel.parent == binding.parent
-    assert kernel.parent.name == "cake_fused_qk_rope_fp8_append"
-    kernel_text = kernel.read_text(encoding="utf-8")
-    binding_text = binding.read_text(encoding="utf-8")
-    assert "void CAKE_KERNEL_SYMBOL(" in kernel_text
-    assert "void CAKE_KERNEL_SYMBOL(" in binding_text
-    assert "namespace CAKE_HOST_SHIM_NAMESPACE {" in binding_text
-    default_symbol = "kernel_cake_fused_qk_rope_fp8_append_caf9bdb5445726a94bed"
-    for symbol in symbols - {default_symbol}:
-        assert symbol not in kernel_text and symbol not in binding_text
-
-
-# The 20-hex digest identifies the architecture's build in the Cake export: module
-# name ``cake_fused_qk_rope_fp8_append_<digest>``, spec name ``<module>_<arch>``,
-# kernel symbol ``kernel_<module>``.
-_MODULE_DIGESTS = {
-    "sm_90a": "31cb02d023f2ccb40a0b",
-    "sm_100a": "caf9bdb5445726a94bed",
-    "sm_103a": "f2873a52b7d6a3954655",
-}
-
-_ARG_NAMES = [
-    "qkv",
-    "cos_sin",
-    "seq_lens",
-    "q_indptr",
-    "page_indices",
-    "q_norm_weight",
-    "k_norm_weight",
-    "k_scale",
-    "v_scale",
-    "q_scale_inv",
-    "out_q",
-    "key_cache",
-    "value_cache",
-    "out_k",
-    "out_v",
-    "q_scale",
-    "split_k_flag",
-    "num_rows",
-    "num_requests",
-    "num_q_heads",
-    "num_kv_heads",
-    "page_size",
-    "max_pages_per_request",
-    "max_seqlen",
-    "max_seqlen_aligned",
-    "quant_policy",
-    "norm_policy",
-    "is_prefill",
-    "has_out_kv",
-    "upper_max",
-    "grid_x",
-    "grid_y",
-    "grid_z",
-]
-
-
-def test_jit_spec_matches_the_pinned_module_table(monkeypatch):
-    """CPU-only: spec name, sources and loader flags of every architecture's module
-    against the manifest's module table (``builds`` of the one stage record)."""
-    import flashinfer.jit.core as jit_core
-
-    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
-    arch_flags = {
-        "sm_90a": jit_core.sm90a_nvcc_flags,
-        "sm_100a": jit_core.sm100a_nvcc_flags,
-        "sm_103a": jit_core.sm103a_nvcc_flags,
-    }
-    assert set(_MODULE_DIGESTS) == set(jit_fp8.ARCHES)
-    csrc = jit_fp8._get_csrc_dir()
-    for arch, digest in sorted(_MODULE_DIGESTS.items()):
-        module = f"cake_fused_qk_rope_fp8_append_{digest}"
-        spec = jit_fp8.gen_cake_fused_qk_rope_fp8_append_module("fp8_e4m3", arch)
-        assert spec.name == f"{module}_{arch}"
-        assert spec.sources == [
-            csrc / "cake_fused_qk_rope_fp8_append_kernel.cu",
-            csrc / "cake_fused_qk_rope_fp8_append_binding.cu",
-        ]
-        added = [*arch_flags[arch], f"-DCAKE_KERNEL_SYMBOL=kernel_{module}"]
-        assert spec.extra_cuda_cflags[-len(added) :] == added
-        generic = spec.extra_cuda_cflags[: -len(added)]
-        assert not any(flag.startswith(("-gencode", "-DCAKE_")) for flag in generic)
-    assert [name for _kind, name in jit_fp8.arg_plan()] == _ARG_NAMES
+@pytest.fixture(autouse=True, scope="module")
+def warmup_jit():
+    # Build the local architecture's libraries that have no prebuilt file before
+    # the first test, through the spec objects the package's loader itself builds
+    # on first use (``cake_build.load_library``); a prebuilt or already cached
+    # library loads without compiling.
+    if _supported():
+        for spec in loader.specs_for_arch(_arch()):
+            spec.build_and_load()
+    yield
 
 
 def rotary_cos_sin_table(
@@ -637,6 +592,124 @@ def test_cuda_graph_replay_matches_eager():
             )
 
 
+def test_repeated_launches_and_buffer_reuse_are_bitwise_identical():
+    """Three launches of one problem on fresh poisoned buffers write the same
+    bytes, and a launch into the already written caller-owned buffers writes
+    them again."""
+    _skip_unless_supported()
+    case = make_case(
+        q_lens=[1] * 8 + [16, 0, 3],
+        ctx_lens=[2048 + 5 * i for i in range(8)] + [2047, 5, 0],
+        num_q_heads=8,
+        num_kv_heads=1,
+        page_size=64,
+        qk_norm_policy=2,
+        quant_policy=1,
+        seed=898,
+        is_prefill=True,
+        max_seqlen=16,
+    )
+
+    def bytes_of(bufs):
+        return [
+            t.view(torch.uint8).clone()
+            if t.dtype == torch.float8_e4m3fn
+            else t.view(torch.int32).clone()
+            for t in (
+                bufs["out_q"],
+                bufs["q_scale"],
+                bufs["flags"],
+                bufs["key_cache"],
+                bufs["value_cache"],
+            )
+        ]
+
+    snapshots = []
+    for _ in range(3):
+        bufs, ret = launch(case)
+        assert ret[0] is bufs["out_q"]
+        snapshots.append(bytes_of(bufs))
+    for later in snapshots[1:]:
+        for got, want in zip(later, snapshots[0], strict=True):
+            assert torch.equal(got, want)
+    # reuse: launch again into the buffers of the last launch without re-poisoning
+    fused_fp8(
+        case["qkv"],
+        case["cos_sin"],
+        case["seq_lens"],
+        case["q_indptr"],
+        case["page_indices"],
+        (bufs["key_cache"], bufs["value_cache"]),
+        case["is_prefill"],
+        case["k_scale"],
+        case["v_scale"],
+        case["quant_policy"],
+        max_seqlen=case["max_seqlen"],
+        q_norm_weight=case["q_norm_weight"],
+        k_norm_weight=case["k_norm_weight"],
+        qk_norm_policy=case["qk_norm_policy"],
+        out_q=bufs["out_q"],
+        q_scale=bufs["q_scale"],
+        split_k_flag=bufs["flags"],
+    )
+    torch.cuda.synchronize()
+    for got, want in zip(bytes_of(bufs), snapshots[0], strict=True):
+        assert torch.equal(got, want)
+
+
+def test_changing_shapes_in_one_process_does_not_rebuild():
+    """Shapes the policy maps onto one stage share one loaded library: no
+    second build, no second load."""
+    _skip_unless_supported()
+    arch = _arch()
+    num_sms = loader.sm_count(_device().index)
+
+    def pages(requests: int, page_size: int) -> int:
+        return max(1, -(-(2048 + requests) // page_size))
+
+    def stage_of(requests: int, page_size: int) -> str:
+        return loader.stage_for(
+            8,
+            1,
+            arch=arch,
+            num_rows=requests,
+            num_requests=requests,
+            page_size=page_size,
+            num_sms=num_sms,
+            is_prefill=False,
+            max_pages_per_request=pages(requests, page_size),
+            has_out_kv=False,
+        )
+
+    def decode_case(requests: int, page_size: int, seed: int):
+        return make_case(
+            q_lens=[1] * requests,
+            ctx_lens=[2048 + i for i in range(requests)],
+            num_q_heads=8,
+            num_kv_heads=1,
+            page_size=page_size,
+            qk_norm_policy=2,
+            quant_policy=1,
+            seed=seed,
+            is_prefill=False,
+        )
+
+    base = stage_of(32, 64)
+    same_stage = [
+        (requests, page_size)
+        for requests, page_size in ((40, 64), (16, 64), (33, 64), (8, 64), (48, 128))
+        if stage_of(requests, page_size) == base
+    ]
+    assert same_stage, "the policy left no second decode shape on the B32 stage"
+    run_and_compare(decode_case(32, 64, 899))
+    misses = loader.load.cache_info().misses
+    for requests, page_size in same_stage:
+        run_and_compare(decode_case(requests, page_size, 900 + requests))
+    assert loader.load.cache_info().misses == misses, (
+        "a changed shape on the same stage loaded another library"
+    )
+
+
 def test_rejects_bad_arguments():
     _skip_unless_supported()
     case = make_case(
@@ -703,3 +776,439 @@ def test_rejects_bad_arguments():
     torch.cuda.synchronize()
     assert out_q.shape == (T, 8, HEAD_DIM) and q_scale.shape == (2, 8, 128)
     assert bool((flags == 0).all())
+
+
+# ----------------------------------------------------------------------------------------------
+# Registry and build manifest (CPU): every module record names its ``build.json`` library
+# and the host plan only; the binding's argument order is one contract for every stage.
+
+_ARG_NAMES = [
+    "qkv",
+    "cos_sin",
+    "seq_lens",
+    "q_indptr",
+    "page_indices",
+    "q_norm_weight",
+    "k_norm_weight",
+    "k_scale",
+    "v_scale",
+    "q_scale_inv",
+    "out_q",
+    "key_cache",
+    "value_cache",
+    "out_k",
+    "out_v",
+    "q_scale",
+    "split_k_flag",
+    "num_rows",
+    "num_requests",
+    "num_q_heads",
+    "num_kv_heads",
+    "page_size",
+    "max_pages_per_request",
+    "max_seqlen",
+    "max_seqlen_aligned",
+    "quant_policy",
+    "norm_policy",
+    "is_prefill",
+    "has_out_kv",
+    "upper_max",
+    "grid_x",
+    "grid_y",
+    "grid_z",
+]
+
+
+def test_every_stage_binds_the_public_argument_plan():
+    """The binding's argument order (seventeen buffers, thirteen scalars, the grid)
+    is the same for every stage; the host binds it through the record's
+    ``logical`` names."""
+    for name, record in loader.MODULES.items():
+        plan = record["arg_plan"]
+        assert [key for _kind, key in plan] == _ARG_NAMES, name
+        assert [kind for kind, _key in plan] == (
+            ["buffer"] * 17 + ["parameter"] * 13 + ["grid"] * 3
+        ), name
+
+
+def test_registry_records_reference_the_build_manifest():
+    """Every ``MODULES`` record names its ``build.json`` library and nothing to compile.
+
+    The manifest (schema ``cake-build/1``) carries exactly one entry per (library,
+    architecture) the registry references, each with the kernel and binding
+    sources under ``csrc/`` of this package, their digests and a closure digest;
+    the registry itself records the host plan only (stage, knobs, launch record,
+    grid rule and the kernel-parameter -> logical-argument map).
+    """
+
+    manifest = cake_build.manifest()
+    assert manifest["schema"] == "cake-build/1"
+    assert manifest["package"] == pkg.__name__
+    libraries = cake_build.libraries_by_name()
+    logical_names = set(loader.LOGICAL_TENSORS) | set(loader.LOGICAL_SCALARS)
+    referenced = set()
+    assert loader.STAGE in loader.MODULES
+    assert list(loader.MODULES[loader.STAGE]["arches"]) == list(loader.ARCHES)
+    assert (
+        loader.MODULES[loader.STAGE]["grid_rule"]["kind"]
+        == "rows_plus_requests_by_kv_heads"
+    )
+    for name, record in loader.MODULES.items():
+        assert record["stage"] == name
+        assert name.startswith(loader.STAGE), name
+        assert record["library"] == record["kernel"], name
+        assert record["kernel_symbol"] == f"kernel_{record['library']}", name
+        assert record["ffi_entry"] == "run", name
+        assert not {"sources", "source_sha256", "compile_flags", "cache_names"} & set(
+            record
+        ), name
+        assert set(record["knobs"]) == set(loader.KNOB_KEYS), name
+        assert tuple(record["launch"]["block"]) == (loader.THREADS, 1, 1), name
+        kind = record["grid_rule"]["kind"]
+        assert kind in GRID_RULES, name
+        assert bool(record["knobs"]["fold"]) == (kind in FOLD_GRID_RULES), name
+        assert {key for kind_, key in record["arg_plan"] if kind_ != "grid"} == set(
+            record["logical"]
+        ), name
+        assert {key for kind_, key in record["arg_plan"] if kind_ == "grid"} == {
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        }, name
+        assert set(record["logical"].values()) <= logical_names, name
+        assert record["arches"], name
+        assert set(record["arches"]) <= set(loader.ARCHES), name
+        assert set(record["arches"]) <= set(manifest["arch_flags"]), name
+        for arch in record["arches"]:
+            library = loader.library_name(name, arch)
+            referenced.add(library)
+            entry = libraries[library]
+            assert entry["arch"] == arch
+            assert entry["entry"] == "run"
+            assert entry["sources"] == [
+                f"csrc/{record['library']}_kernel.cu",
+                f"csrc/{record['library']}_binding.cu",
+            ]
+            assert set(entry["sha256"]) == set(entry["sources"])
+            for source in entry["sources"]:
+                assert (PACKAGE_DIR / source).is_file(), source
+            assert re.fullmatch(r"[0-9a-f]{64}", entry["closure_sha256"])
+            assert not any("use_fast_math" in flag for flag in entry["nvcc_flags"])
+            assert "--prec-div=true" in entry["nvcc_flags"]
+    assert referenced == set(libraries)
+    assert (PACKAGE_DIR / "csrc" / "cake_ffi_checks.h").is_file()
+    for arch in loader.ARCHES:
+        shipped = {
+            name for name, record in loader.MODULES.items() if arch in record["arches"]
+        }
+        assert set(loader.stages_for(arch)) == shipped
+        assert loader.STAGE in shipped, arch
+
+
+def test_stage_policy_table_is_well_formed():
+    policy = loader.STAGE_POLICY
+    assert set(policy) == {"constants", "rule", "version"}
+    assert isinstance(policy["rule"], str) and isinstance(policy["version"], str)
+    assert {"ctas_per_sm", "fold_waves", "fold_min_kv_heads"} <= set(
+        policy["constants"]
+    )
+
+
+def test_default_launch_plan_is_the_default_builds_grid():
+    """The public ``launch_plan`` describes the default build: one CTA per (row,
+    kv head) plus one per (request, kv head)."""
+    assert pkg.launch_plan(40, 32, 8) == {"grid": (72, 8, 1)}
+    assert pkg.launch_plan(1, 1, 1) == {"grid": (2, 1, 1)}
+
+
+# ----------------------------------------------------------------------------------------------
+# Stage policy (CPU): the host mirrors the Cake policy and must only select shipped builds.
+# ``_POLICY_TABLE`` pins the policy's choice at representative problems (rows change when the
+# registry's policy changes; the structure does not); the scan covers the problem space.
+
+_POLICY_TABLE: dict[tuple[str, int, int, int, int, int, int, bool, int, bool], str] = {
+    # (arch, Hq, Hkv, num_rows, num_requests, page_size, num_sms, is_prefill,
+    #  max_pages_per_request, has_out_kv) -> stage
+    ("sm_90a", 8, 1, 32, 32, 64, 132, False, 33, False): "fp8_e4m3_scan_rounds3",
+    (
+        "sm_90a",
+        64,
+        8,
+        32,
+        32,
+        64,
+        132,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_grid_order2",
+    ("sm_90a", 8, 1, 128, 8, 64, 132, True, 33, False): "fp8_e4m3_scan_rounds3",
+    ("sm_90a", 64, 8, 128, 8, 64, 132, True, 33, False): "fp8_e4m3_scan_rounds3",
+    (
+        "sm_90a",
+        64,
+        8,
+        256,
+        256,
+        64,
+        132,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1",
+    ("sm_90a", 8, 1, 1024, 1, 64, 132, True, 48, False): "fp8_e4m3_scan_rounds3",
+    ("sm_90a", 8, 1, 32, 32, 16, 132, False, 129, False): "fp8_e4m3_scan_rounds3",
+    (
+        "sm_100a",
+        8,
+        1,
+        32,
+        32,
+        64,
+        148,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_early_rt21_page_prefetch1",
+    (
+        "sm_100a",
+        64,
+        8,
+        32,
+        32,
+        64,
+        148,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_early_rt21_page_prefetch1",
+    (
+        "sm_100a",
+        8,
+        1,
+        128,
+        8,
+        64,
+        148,
+        True,
+        33,
+        False,
+    ): "fp8_e4m3_early_rt21_page_prefetch1",
+    ("sm_100a", 64, 8, 128, 8, 64, 148, True, 33, False): "fp8_e4m3_grid_order2",
+    ("sm_100a", 64, 8, 256, 256, 64, 148, False, 33, False): "fp8_e4m3_scan_rounds3",
+    (
+        "sm_100a",
+        8,
+        1,
+        32,
+        32,
+        64,
+        148,
+        False,
+        33,
+        True,
+    ): "fp8_e4m3_grid_order3_zero_store_width256",
+    (
+        "sm_100a",
+        8,
+        1,
+        32,
+        32,
+        16,
+        148,
+        False,
+        129,
+        False,
+    ): "fp8_e4m3_grid_order3_zero_store_width256",
+    (
+        "sm_103a",
+        8,
+        1,
+        32,
+        32,
+        64,
+        148,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_early_rt21_page_prefetch1",
+    (
+        "sm_103a",
+        64,
+        8,
+        32,
+        32,
+        64,
+        148,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_early_rt21_page_prefetch1",
+    (
+        "sm_103a",
+        8,
+        1,
+        128,
+        8,
+        64,
+        148,
+        True,
+        33,
+        False,
+    ): "fp8_e4m3_early_rt21_page_prefetch1",
+    (
+        "sm_103a",
+        8,
+        1,
+        32,
+        32,
+        64,
+        152,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_clear_heads_per_cta2_zero_store_width256",
+    (
+        "sm_103a",
+        64,
+        8,
+        32,
+        32,
+        64,
+        152,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1",
+    (
+        "sm_103a",
+        8,
+        1,
+        128,
+        8,
+        64,
+        152,
+        True,
+        33,
+        False,
+    ): "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1",
+    ("sm_103a", 64, 8, 128, 8, 64, 152, True, 33, False): "fp8_e4m3_grid_order2",
+}
+
+
+def _stage(key):
+    arch, hq, hkv, rows, reqs, page, sms, prefill, pages, out_kv = key
+    return loader.stage_for(
+        hq,
+        hkv,
+        arch=arch,
+        num_rows=rows,
+        num_requests=reqs,
+        page_size=page,
+        num_sms=sms,
+        is_prefill=prefill,
+        max_pages_per_request=pages,
+        has_out_kv=out_kv,
+    )
+
+
+@pytest.mark.parametrize("key,expected", sorted(_POLICY_TABLE.items()))
+def test_stage_policy_table(key, expected):
+    stage = _stage(key)
+    assert stage == expected
+    assert stage in loader.stages_for(key[0])
+
+
+@pytest.mark.parametrize("arch", loader.ARCHES)
+def test_stage_policy_only_selects_shipped_builds(arch):
+    shipped = set(loader.stages_for(arch))
+    for hq, hkv in loader.SUPPORTED_HEADS:
+        for page in (4, 16, 64, 128):
+            for reqs in (1, 4, 8, 32, 96, 97, 128, 256, 512):
+                # rows < reqs: requests without rows in this step
+                for rows in sorted({reqs, 1, 128, 1024, 4096}):
+                    for prefill in (False, True):
+                        for pages in (1, 33, 48, 129, 513):
+                            for out_kv in (False, True):
+                                for sms in (132, 148, 152):
+                                    key = (
+                                        arch,
+                                        hq,
+                                        hkv,
+                                        rows,
+                                        reqs,
+                                        page,
+                                        sms,
+                                        prefill,
+                                        pages,
+                                        out_kv,
+                                    )
+                                    stage = _stage(key)
+                                    assert stage in shipped, (key, stage)
+                                    # a stage's grid serves the problem it was selected for
+                                    loader.launch_grid(
+                                        loader.MODULES[stage],
+                                        num_rows=rows,
+                                        num_requests=reqs,
+                                        num_kv_heads=hkv,
+                                    )
+
+
+def test_stage_policy_rejects_unsupported_heads():
+    with pytest.raises(ValueError):
+        _stage(("sm_100a", 16, 2, 1, 1, 64, 148, False, 1, False))
+
+
+# ----------------------------------------------------------------------------------------------
+# Package hygiene (CPU): the vendorable package imports itself, torch and tvm_ffi only at
+# module level and reads no environment variables.  Function-level lazy imports are the
+# documented exceptions: ``torch`` inside the registry's device helpers and FlashInfer's JIT
+# builder inside the byte-pinned ``cake_build.py`` JIT path (the shared-loader exception of
+# the Cake package form).
+
+
+def _module_level_imports(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                if node.module is None:
+                    names.update(f".{alias.name}" for alias in node.names)
+                else:
+                    names.add(f".{node.module.split('.')[0]}")
+            else:
+                assert node.module is not None
+                names.add(node.module.split(".")[0])
+    return names
+
+
+@pytest.mark.parametrize(
+    "filename,allowed",
+    [
+        (
+            "cake_jit.py",
+            {"__future__", "functools", "typing", "tvm_ffi", ".cake_build"},
+        ),
+        (
+            "__init__.py",
+            {"__future__", "functools", "typing", "math", "torch", ".cake_jit"},
+        ),
+    ],
+)
+def test_package_module_level_imports_are_whitelisted(filename, allowed):
+    assert _module_level_imports(PACKAGE_DIR / filename) <= allowed
+
+
+def test_cake_build_imports_only_the_standard_library():
+    names = _module_level_imports(PACKAGE_DIR / "cake_build.py")
+    assert names <= set(sys.stdlib_module_names) | {"__future__"}, names
+
+
+@pytest.mark.parametrize("filename", ["cake_jit.py", "__init__.py", "cake_build.py"])
+def test_package_reads_no_environment_variables(filename):
+    text = (PACKAGE_DIR / filename).read_text(encoding="utf-8")
+    assert "os.environ" not in text
+    assert "getenv" not in text
