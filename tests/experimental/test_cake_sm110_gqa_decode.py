@@ -422,8 +422,9 @@ def test_records_match_the_oracle_and_replay_bitwise(
             == tuple(partial_sum.shape)
             == (batch, 32, state["num_splits"])
         )
-        # The last CTA of every (request, KV head) resets its counter after the merge.
-        assert torch.equal(completed, torch.zeros_like(completed))
+        if loader.MODULES[record]["grid_rule"]["num_splits"] == "runtime":
+            # The last CTA of every (request, KV head) resets its counter after the merge.
+            assert torch.equal(completed, torch.zeros_like(completed))
     else:
         assert state["workspace"] == ()
 

@@ -138,9 +138,12 @@ def workspace_for(
 ) -> dict[str, torch.Tensor]:
     """The buffers the record's ``workspace`` leaf names: FP32 partials
     ``partial_O [B, 32, S, 128]``, ``partial_max`` / ``partial_sum [B, 32, S]`` and
-    the ``completed`` counters ``uint32 [B * 8]``, zero at prepare (the last CTA of
-    each (request, KV head) resets them, so a captured graph replays without a
-    reset node).  Empty for the one-CTA routes."""
+    the ``completed`` counters ``uint32 [B * 8]``.  The run-time-split programs get
+    the counters zeroed here (the last CTA of each (request, KV head) resets them
+    after its merge, so a captured graph replays without a reset node); the
+    one-split direct builds keep the counter pointer in their ABI but never read
+    or write it, so they take an uninitialised buffer and skip the fill kernel.
+    Empty for the one-CTA routes."""
     names = cake_jit.MODULES[record].get("workspace", [])
     buffers: dict[str, torch.Tensor] = {}
     for name in names:
@@ -155,7 +158,9 @@ def workspace_for(
                 (batch, NUM_Q_HEADS, splits), dtype=torch.float32, device=device
             )
         elif name == "completed":
-            buffers[name] = torch.zeros(
+            rule = cake_jit.MODULES[record]["grid_rule"]
+            fill = torch.zeros if rule.get("num_splits") == "runtime" else torch.empty
+            buffers[name] = fill(
                 (batch * NUM_KV_HEADS,), dtype=torch.uint32, device=device
             )
         else:
