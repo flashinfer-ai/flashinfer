@@ -480,7 +480,6 @@ def metadata_route_key(
     page_kv,
     num_sms,
     arch,
-    use_unaligned_ks=False,
 ):
     """``ROUTES`` key of the metadata program for one geometry: the exact-geometry program at the exported
     production geometry (capacity ``LIMITS["exact_capacity"]``, ``LIMITS["sparse_block_kv"]``-token blocks and,
@@ -490,8 +489,7 @@ def metadata_route_key(
     never substituted: a device whose (architecture, SM count) pair is not exported runs the runtime program."""
     layout = "paged" if paged else "contiguous"
     exact = (
-        not use_unaligned_ks
-        and num_sms in exported_exact_sms(arch, paged=paged)
+        num_sms in exported_exact_sms(arch, paged=paged)
         and capacity == LIMITS["exact_capacity"]
         and sparse_block_kv == LIMITS["sparse_block_kv"]
         and (not paged or page_kv == LIMITS["page_kv"])
@@ -549,7 +547,6 @@ class SparseMetadataPlan:
         fmt="mxfp4",
         sparse_block_kv=8,
         page_kv=64,
-        use_unaligned_ks=False,
         starts=None,
         ends=None,
         num_kv_tokens=0,
@@ -575,7 +572,7 @@ class SparseMetadataPlan:
             )
         nb = blocks_per_split(fmt, sparse_block_kv)
         paged = context_lens is not None
-        if paged and (use_unaligned_ks or page_kv % sparse_block_kv):
+        if paged and page_kv % sparse_block_kv:
             raise ValueError(
                 "paged sparse MQA requires aligned blocks dividing the page"
             )
@@ -613,12 +610,7 @@ class SparseMetadataPlan:
             num_max_sparse_blocks=capacity,
             sparse_block_kv=sparse_block_kv,
             page_kv=page_kv,
-            use_unaligned_ks=bool(use_unaligned_ks),
         )
-        if use_unaligned_ks:
-            raise NotImplementedError(
-                "unaligned contiguous windows are not an exported sparse MQA specialization"
-            )
         self.program = ROUTES[
             metadata_route_key(
                 paged=paged,
@@ -627,7 +619,6 @@ class SparseMetadataPlan:
                 page_kv=page_kv,
                 num_sms=self.num_sms,
                 arch=self.arch,
-                use_unaligned_ks=use_unaligned_ks,
             )
         ]
         size = metadata_size_bytes(
@@ -758,15 +749,10 @@ class SparseMqaPlan:
         fmt, paged, block = config["fmt"], config["paged"], config["sparse_block_kv"]
         queries, capacity = metadata_plan.queries, metadata_plan.capacity
         layout = "paged" if paged else "contiguous"
-        if (
-            block != LIMITS["sparse_block_kv"]
-            or config["page_kv"] != LIMITS["page_kv"]
-            or config["use_unaligned_ks"]
-        ):
+        if block != LIMITS["sparse_block_kv"] or config["page_kv"] != LIMITS["page_kv"]:
             raise NotImplementedError(
-                f"No exported {fmt} {layout} logits program for sparse_block_kv={block}, page_kv={config['page_kv']}, "
-                f"use_unaligned_ks={config['use_unaligned_ks']}; exported: sparse_block_kv={LIMITS['sparse_block_kv']}, "
-                f"page_kv={LIMITS['page_kv']}, aligned windows"
+                f"No exported {fmt} {layout} logits program for sparse_block_kv={block}, page_kv={config['page_kv']}; "
+                f"exported: sparse_block_kv={LIMITS['sparse_block_kv']}, page_kv={LIMITS['page_kv']}"
             )
         row = 64 if fmt == "mxfp4" else 128
         heads = LIMITS["heads"]

@@ -14,9 +14,38 @@
  * limitations under the License.
  */
 
-// Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
-#include "cake_rmsnorm_train_device_common.cuh"
-#include <cooperative_groups.h>
+typedef signed char        int8_t;
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+#if defined(__CUDACC_RTC__)
+typedef unsigned long long uint64_t;
+#else
+typedef unsigned long      uint64_t;
+#endif
+static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
+typedef signed int         int32_t;
+typedef short int          int16_t;
+struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+
+#if defined(__CUDACC_RTC__)
+typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+#else
+#include <cuda.h>
+#endif
+
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
@@ -45,10 +74,13 @@
 #define THREADS 256
 #define LAUNCH_MIN_BLOCKS 2
 
+#include <math_constants.h>
+#include <cooperative_groups.h>
+
 extern "C" {
 
-__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_rmsnorm_train_b32a9f113e2997aed735(__nv_bfloat16* __restrict__ g, __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ w, float* __restrict__ r, __nv_bfloat16* __restrict__ dx, float* __restrict__ dw, float* __restrict__ partial, unsigned int* __restrict__ counters, __nv_bfloat16* __restrict__ g_h, int T, long long g_stride, long long x_stride, long long gh_stride, int n_chunks, int rows_per_chunk)
+__global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
+kernel_cake_rmsnorm_train_b32a9f113e2997aed735(__nv_bfloat16* __restrict__ g, __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ w, float* __restrict__ r, __nv_bfloat16* __restrict__ dx, float* __restrict__ dw, float* __restrict__ partial, unsigned int* __restrict__ counters, __nv_bfloat16* __restrict__ g_h, int T, int n_chunks, int rows_per_chunk, long long g_stride_p0, long long x_stride_p0, long long g_h_stride_p0)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -69,24 +101,27 @@ kernel_cake_rmsnorm_train_b32a9f113e2997aed735(__nv_bfloat16* __restrict__ g, __
     const int cta_rank = 0;
 
     // Kernel setup ops
-    float* dot_slots = reinterpret_cast<float*>(smem_raw + SMEM_DOT_SLOTS_OFF);
-    const int dot_slots_addr = smem + SMEM_DOT_SLOTS_OFF;
-    int* flags = reinterpret_cast<int*>(smem_raw + SMEM_FLAGS_OFF);
-    const int flags_addr = smem + SMEM_FLAGS_OFF;
-    float* red_fold = reinterpret_cast<float*>(smem_raw + SMEM_RED_FOLD_OFF);
-    const int red_fold_addr = smem + SMEM_RED_FOLD_OFF;
-    float* row_fold = reinterpret_cast<float*>(smem_raw + SMEM_ROW_FOLD_OFF);
-    const int row_fold_addr = smem + SMEM_ROW_FOLD_OFF;
-    float* comp_smem = reinterpret_cast<float*>(smem_raw + SMEM_COMP_SMEM_OFF);
-    const int comp_smem_addr = smem + SMEM_COMP_SMEM_OFF;
-    unsigned int* w_sm = reinterpret_cast<unsigned int*>(smem_raw + SMEM_W_SM_OFF);
-    const int w_sm_addr = smem + SMEM_W_SM_OFF;
-    float* part_sm = reinterpret_cast<float*>(smem_raw + SMEM_PART_SM_OFF);
-    const int part_sm_addr = smem + SMEM_PART_SM_OFF;
+    float* dot_slots = reinterpret_cast<float*>(smem_raw + 0);
+    const int dot_slots_addr = smem + 0;
+    int* flags = reinterpret_cast<int*>(smem_raw + 128);
+    const int flags_addr = smem + 128;
+    float* red_fold = reinterpret_cast<float*>(smem_raw + 384);
+    const int red_fold_addr = smem + 384;
+    float* row_fold = reinterpret_cast<float*>(smem_raw + 4480);
+    const int row_fold_addr = smem + 4480;
+    float* comp_smem = reinterpret_cast<float*>(smem_raw + 20864);
+    const int comp_smem_addr = smem + 20864;
+    unsigned int* w_sm = reinterpret_cast<unsigned int*>(smem_raw + 20992);
+    const int w_sm_addr = smem + 20992;
+    float* part_sm = reinterpret_cast<float*>(smem_raw + 21120);
+    const int part_sm_addr = smem + 21120;
 
     // === Task calls (dependency order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    long long g_stride = g_stride_p0;
+    long long x_stride = x_stride_p0;
+    long long gh_stride = g_h_stride_p0;
     int c = bid;
     int rg = warp / 4;
     int tir = tid - rg * 128;
@@ -722,3 +757,4 @@ kernel_cake_rmsnorm_train_b32a9f113e2997aed735(__nv_bfloat16* __restrict__ g, __
 }
 
 } // extern "C"
+

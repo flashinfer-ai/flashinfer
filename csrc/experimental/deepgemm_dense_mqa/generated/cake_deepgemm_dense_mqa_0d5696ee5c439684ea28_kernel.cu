@@ -21,57 +21,92 @@
 #include "cake_deepgemm_dense_mqa_device_common.cuh"
 
 #define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 192
+#define TMEM_NCOLS (NUM_TMEM_PIPE_STAGES * K_UMMA_N)
+#define TMEM_ALLOC_COLS (4 * K_UMMA_N)
 #define TMEM_TMEM_ACC_OFFSET 0
 #define NUM_Q_PIPE_STAGES 3
 #define NUM_KV_PIPE_STAGES 5
 #define NUM_TMEM_PIPE_STAGES 3
 #define NUM_CLAIM_PIPE_STAGES 8
 #define SMEM_SMEM_Q_OFF 1024
-#define SMEM_SMEM_Q_STAGE_BYTES 8192
-#define SMEM_SMEM_Q_STRIDE 8192
-#define SMEM_SMEM_KV_OFF 25600
+#define SMEM_SMEM_Q_STAGE_BYTES (K_Q_TILE_ROWS * 128)
+#define SMEM_SMEM_Q_STRIDE SMEM_SMEM_Q_STAGE_BYTES
+#define SMEM_SMEM_KV_OFF (SMEM_SMEM_Q_OFF + NUM_Q_PIPE_STAGES * SMEM_SMEM_Q_STRIDE)
 #define SMEM_SMEM_KV_STAGE_BYTES 32768
 #define SMEM_SMEM_KV_STRIDE 32768
-#define SMEM_SMEM_KV_SCALES_OFF 189440
+#define SMEM_SMEM_KV_SCALES_OFF (SMEM_SMEM_KV_OFF + NUM_KV_PIPE_STAGES * SMEM_SMEM_KV_STRIDE)
 #define SMEM_SMEM_KV_SCALES_STAGE_BYTES 1024
 #define SMEM_SMEM_KV_SCALES_STRIDE 1024
-#define SMEM_SMEM_WEIGHTS_OFF 194560
-#define SMEM_SMEM_WEIGHTS_STAGE_BYTES 256
-#define SMEM_SMEM_WEIGHTS_STRIDE 256
-#define SMEM_SCHED_PREFIX_OFF 25600
+#define SMEM_SMEM_WEIGHTS_OFF (SMEM_SMEM_KV_SCALES_OFF + NUM_KV_PIPE_STAGES * SMEM_SMEM_KV_SCALES_STRIDE)
+#define SMEM_SMEM_WEIGHTS_STAGE_BYTES (K_Q_TILE_ROWS * 4)
+#define SMEM_SMEM_WEIGHTS_STRIDE SMEM_SMEM_WEIGHTS_STAGE_BYTES
+#define SMEM_SCHED_PREFIX_OFF SMEM_SMEM_KV_OFF
 #define SMEM_SCHED_PREFIX_STAGE_BYTES 16384
 #define SMEM_SCHED_PREFIX_STRIDE 16384
-#define SMEM_SCHED_WARP_SUMS_OFF 41984
+#define SMEM_SCHED_WARP_SUMS_OFF (SMEM_SCHED_PREFIX_OFF + SMEM_SCHED_PREFIX_STRIDE)
 #define SMEM_SCHED_WARP_SUMS_STAGE_BYTES 128
 #define SMEM_SCHED_WARP_SUMS_STRIDE 128
-#define SMEM_SCHED_BOUNDS_OFF 195328
+#define SMEM_SCHED_BOUNDS_OFF (SMEM_SMEM_WEIGHTS_OFF + NUM_Q_PIPE_STAGES * SMEM_SMEM_WEIGHTS_STRIDE)
 #define SMEM_SCHED_BOUNDS_STAGE_BYTES 16
 #define SMEM_SCHED_BOUNDS_STRIDE 16
-#define SMEM_DYN_PREFIX_OFF 195344
+#define SMEM_DYN_PREFIX_OFF (SMEM_SCHED_BOUNDS_OFF + SMEM_SCHED_BOUNDS_STRIDE)
 #define SMEM_DYN_PREFIX_STAGE_BYTES 1536
 #define SMEM_DYN_PREFIX_STRIDE 1536
-#define SMEM_DYN_CLAIM_OFF 196880
+#define SMEM_DYN_CLAIM_OFF (SMEM_DYN_PREFIX_OFF + SMEM_DYN_PREFIX_STRIDE)
 #define SMEM_DYN_CLAIM_STAGE_BYTES 32
 #define SMEM_DYN_CLAIM_STRIDE 32
-#define SMEM_TOTAL 196992
-#define K_NEXT_N 1
-#define K_NEXT_N_ATOM 1
+#define SMEM_TOTAL (SMEM_DYN_CLAIM_OFF + 112)
+// Shared text of the paged routes paged:fp8:h64:p{32,64}:n{1,2}:dyn: the tokens per request (K_NEXT_N)
+// and the KV rows per page (K_BLOCK_KV) are compile-line definitions fixed by each catalog record
+// (fixed_definitions); the TMEM/SMEM layout, the UMMA N extent and the page geometry derive from them.
+#ifndef K_NEXT_N
+#error "K_NEXT_N is a downstream specialization of this program; define it on the compile line"
+#endif
+#define K_NEXT_N_ATOM K_NEXT_N
 #define K_NUM_NEXT_N_ATOMS 1
 #define K_CHUNK_SPLITS 1048576
 #define K_NUM_HEADS 64
-#define K_UMMA_N 64
-#define K_Q_TILE_ROWS 64
-#define K_Q_TX_BYTES 8448
-#define K_BLOCK_KV 32
-#define K_NUM_BLOCKS_PER_SPLIT 8
-#define K_SCALE_TAIL_F32 1024
+#define K_UMMA_N (K_NUM_HEADS * K_NEXT_N)
+#define K_Q_TILE_ROWS K_UMMA_N
+#define K_Q_TX_BYTES (SMEM_SMEM_Q_STAGE_BYTES + SMEM_SMEM_WEIGHTS_STAGE_BYTES)
+#ifndef K_BLOCK_KV
+#error "K_BLOCK_KV is a downstream specialization of this program; define it on the compile line"
+#endif
+#define K_NUM_BLOCKS_PER_SPLIT (256 / K_BLOCK_KV)
+#define K_SCALE_TAIL_F32 (K_BLOCK_KV * 32)
+// Instruction descriptor of the kind::f8f6f4 UMMA with N = K_UMMA_N (0x08000010 | ((K_UMMA_N >> 3) << 17)),
+// spelled out per exported K_UMMA_N as the immediate of the "mov.b32 id, ..." in the MMA asm texts below.
+#if K_UMMA_N == 32
+#define K_UMMA_IDESC_LITERAL "134742032"
+#elif K_UMMA_N == 64
+#define K_UMMA_IDESC_LITERAL "135266320"
+#elif K_UMMA_N == 128
+#define K_UMMA_IDESC_LITERAL "136314896"
+#else
+#error "no UMMA instruction descriptor literal for K_UMMA_N"
+#endif
 #define LAUNCH_MIN_BLOCKS 1
+
+// Program identity: each define set of this shared text keeps the kernel symbol of the per-route
+// unit it replaced, so every JIT module built from the text exports its own kernel symbol (the
+// modules share one process; a shared symbol would resolve a launcher to another module's kernel).
+#if K_BLOCK_KV == 32 && K_NEXT_N == 1
+#define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_dense_mqa_0d5696ee5c439684ea28
+#elif K_BLOCK_KV == 64 && K_NEXT_N == 1
+#define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_dense_mqa_3a8b2f8c715da3853f6c
+#elif K_BLOCK_KV == 32 && K_NEXT_N == 2
+#define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_dense_mqa_a26c4ef6c57b381b5a9b
+#elif K_BLOCK_KV == 64 && K_NEXT_N == 2
+#define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_dense_mqa_bb7cdb92494fbb9d6d9d
+#else
+#error "no exported program for this K_BLOCK_KV / K_NEXT_N"
+#endif
+
 
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
-kernel_cake_deepgemm_dense_mqa_0d5696ee5c439684ea28(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights, float* __restrict__ Logits, int* __restrict__ context_lens, int* __restrict__ block_table, int block_table_stride, int batch_size, int num_sms, int stride_logits, unsigned int* __restrict__ sched_counters)
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KV_scales, const __grid_constant__ CUtensorMap Weights, float* __restrict__ Logits, int* __restrict__ context_lens, int* __restrict__ block_table, int block_table_stride, int batch_size, int num_sms, int stride_logits, unsigned int* __restrict__ sched_counters)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -187,11 +222,11 @@ kernel_cake_deepgemm_dense_mqa_0d5696ee5c439684ea28(const __grid_constant__ CUte
 
     __syncwarp();
 
-    // TMEM alloc (256 columns, 192 used)
+    // TMEM alloc (TMEM_ALLOC_COLS columns, TMEM_NCOLS used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 304);
     if (warp == 10) {
         int _tmem_hold = smem + 304;
-        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
+        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(TMEM_ALLOC_COLS) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
@@ -208,7 +243,7 @@ kernel_cake_deepgemm_dense_mqa_0d5696ee5c439684ea28(const __grid_constant__ CUte
     int dy_lane = lane;
     int dy_warp = warp;
     int dy_qc = ((dy_q < batch_size) ? dy_q : batch_size - 1);
-    int dy_ctx = context_lens[dy_qc];
+    int dy_ctx = context_lens[dy_qc * K_NEXT_N + (K_NEXT_N - 1)];
     int dy_n = 0;
     if (dy_q < batch_size) {
         int dy_seg = (dy_ctx + 256 - 1) / 256;
@@ -480,8 +515,8 @@ kernel_cake_deepgemm_dense_mqa_0d5696ee5c439684ea28(const __grid_constant__ CUte
                         int lq_tok = dl_req_1 * K_NEXT_N;
                         mbarrier_wait(q_empty_addr + (lq_stage) * 8, _phase_q_empty);
                         if (elect_sync()) {
-                            tma_2d_gmem2smem(smem_q_addr + lq_stage * 8192, (&Q), 0, lq_tok * K_NUM_HEADS, q_full_addr + (lq_stage) * 8);
-                            tma_2d_gmem2smem(smem_weights_addr + lq_stage * 256, (&Weights), 0, lq_tok, q_full_addr + (lq_stage) * 8);
+                            tma_2d_gmem2smem(smem_q_addr + lq_stage * SMEM_SMEM_Q_STRIDE, (&Q), 0, lq_tok * K_NUM_HEADS, q_full_addr + (lq_stage) * 8);
+                            tma_2d_gmem2smem(smem_weights_addr + lq_stage * SMEM_SMEM_WEIGHTS_STRIDE, (&Weights), 0, lq_tok, q_full_addr + (lq_stage) * 8);
                             mbarrier_arrive_expect_tx(q_full_addr + (lq_stage) * 8, K_Q_TX_BYTES);
                         }
                         lq_stage += 1;
@@ -650,7 +685,7 @@ kernel_cake_deepgemm_dense_mqa_0d5696ee5c439684ea28(const __grid_constant__ CUte
                             mbarrier_wait(umma_empty_addr + (mm_tmem_stage) * 8, _phase_umma_empty);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int _mma_a_lo_0 = (((smem_kv_addr) >> 4) & 0x3FFF) + (mm_kv_stage) * 2048;
-                            int _mma_b_lo_0 = (((smem_q_addr) >> 4) & 0x3FFF) + (mm_q_stage) * 512;
+                            int _mma_b_lo_0 = (((smem_q_addr) >> 4) & 0x3FFF) + (mm_q_stage) * (SMEM_SMEM_Q_STRIDE >> 4);
                             asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -662,7 +697,7 @@ kernel_cake_deepgemm_dense_mqa_0d5696ee5c439684ea28(const __grid_constant__ CUte
                     ""
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135266320;\n\t"
+                    "mov.b32 id, " K_UMMA_IDESC_LITERAL ";\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
@@ -684,14 +719,14 @@ kernel_cake_deepgemm_dense_mqa_0d5696ee5c439684ea28(const __grid_constant__ CUte
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_tmem_acc + (mm_tmem_stage * 64))), "r"(0));
+                    :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_tmem_acc + (mm_tmem_stage * K_UMMA_N))), "r"(0));
                             tcgen05_commit(umma_full_addr + (mm_tmem_stage) * 8);
                             mm_tmem_stage += 1;
                             if (mm_tmem_stage == 3) { mm_tmem_stage = 0; _phase_umma_empty ^= 1; }
                             mbarrier_wait(umma_empty_addr + (mm_tmem_stage) * 8, _phase_umma_empty);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int _mma_a_lo_1 = (((smem_kv_addr + 16384) >> 4) & 0x3FFF) + (mm_kv_stage) * 2048;
-                            int _mma_b_lo_1 = (((smem_q_addr) >> 4) & 0x3FFF) + (mm_q_stage) * 512;
+                            int _mma_b_lo_1 = (((smem_q_addr) >> 4) & 0x3FFF) + (mm_q_stage) * (SMEM_SMEM_Q_STRIDE >> 4);
                             asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -703,7 +738,7 @@ kernel_cake_deepgemm_dense_mqa_0d5696ee5c439684ea28(const __grid_constant__ CUte
                     ""
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135266320;\n\t"
+                    "mov.b32 id, " K_UMMA_IDESC_LITERAL ";\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
@@ -725,7 +760,7 @@ kernel_cake_deepgemm_dense_mqa_0d5696ee5c439684ea28(const __grid_constant__ CUte
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f8f6f4 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"((tmem_tmem_acc + (mm_tmem_stage * 64))), "r"(0));
+                    :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"((tmem_tmem_acc + (mm_tmem_stage * K_UMMA_N))), "r"(0));
                             tcgen05_commit(umma_full_addr + (mm_tmem_stage) * 8);
                             mm_tmem_stage += 1;
                             if (mm_tmem_stage == 3) { mm_tmem_stage = 0; _phase_umma_empty ^= 1; }
@@ -747,7 +782,7 @@ kernel_cake_deepgemm_dense_mqa_0d5696ee5c439684ea28(const __grid_constant__ CUte
     __syncthreads(); // barrier before TMEM dealloc
 
     if (warp == 10) {
-        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(256));
+        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(TMEM_ALLOC_COLS));
     }
 }
 

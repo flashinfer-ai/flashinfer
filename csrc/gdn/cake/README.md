@@ -37,7 +37,7 @@ with per-variant SASS equivalence checks against the generated originals.
   `cake_`) and are delivered as `sm_107a`-only outputs of the same records,
   while the SM100a/SM103a outputs keep the shipped text byte for byte. In the
   manifest this reads as follows: a decode record exported for SM107a together
-  with SM100a/SM103a (23 three-architecture decode records in the current
+  with SM100a/SM103a (16 three-architecture decode records in the current
   manifest) keeps its shipped body as `outputs[0]` with `architectures`
   reduced to `["sm_100a", "sm_103a"]` and gains an `sm_107a` output; a decode
   record exported for SM107a alone (the `_vpre` / `_pro` bodies; the fp32 T=1
@@ -127,21 +127,30 @@ capture.
   keep 128). `bound_tokens` is validated but does not change the grid.
   The host shim checks `0 < grid_x <= total_tiles` and the tensor-map
   workspace size (`512` bytes per CTA, cached per device, stream and grid).
-- Metadata dtypes. The kernels take int32 offsets and slots. Int32
-  `cu_seqlens`, `state_indices` and `checkpoint_cu_starts` reach the kernel
-  as is (zero-copy path); int64 metadata is cast on the caller's stream at
-  every call (one small device kernel, recorded into the graph under
-  capture). Nothing is cached by tensor identity, so a buffer rewritten in
-  place -- an inference-mode tensor without a version counter, a persistent
-  engine buffer, or the inputs of a captured graph between replays -- is
-  always what the kernel reads.
+- Metadata dtypes. A record whose manifest entry carries
+  `"metadata_i64": true` (every sm_107a non-CP prefill record; the field is
+  absent elsewhere) reads int32 or int64 `cu_seqlens`, `state_indices` and
+  `checkpoint_cu_starts` directly: its host shim accepts either width for
+  the three buffers, derives the kernel's trailing `metadata_i64_mask`
+  scalar from their dtypes (bit 0 / 1 / 2 = `cu_seqlens` / `state_indices`
+  / `checkpoint_cu_starts` is int64) and the TVM-FFI entry signature is
+  unchanged; int32 and int64 metadata are both zero-copy there
+  (`CakeGDNRoute.metadata_i64`). Every other record takes int32 offsets
+  and slots: int32 metadata reaches the kernel as is (zero-copy path) and
+  int64 metadata is cast on the caller's stream at every call (one small
+  device kernel, recorded into the graph under capture). Nothing is cached
+  by tensor identity, so a buffer rewritten in place -- an inference-mode
+  tensor without a version counter, a persistent engine buffer, or the
+  inputs of a captured graph between replays -- is always what the kernel
+  reads.
 - CUDA Graph. Capture needs no prior eager call for the same metadata; replay
   reads the live `cu_seqlens`, `state_indices`, `checkpoint_cu_starts` and
   data buffers. Tests: `tests/gdn/test_cake_gdn_prefill_gpu.py` (zero-sync
   proof under `torch.cuda.set_sync_debug_mode("error")` plus a profiler
   check, cold capture, in-place rewrite replay, chunked state carry, int64 /
-  int32 equivalence, malformed-metadata no-op) and the CPU contract tests in
-  `tests/gdn/test_cake_gdn_prefill.py`.
+  int32 equivalence per buffer and mixed widths -- zero-copy and one kernel
+  per call on a `metadata_i64` record -- malformed-metadata no-op) and the
+  CPU contract tests in `tests/gdn/test_cake_gdn_prefill.py`.
 
 Use the GDN prefill API with `backend="cake_gdn"` to select this backend
 explicitly; automatic prefill dispatch continues to select CuTe.  Under
