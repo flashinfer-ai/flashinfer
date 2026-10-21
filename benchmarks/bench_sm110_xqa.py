@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Native SM110 XQA ledger rows (tcgen05 and register-MMA routes) using FlashInfer's CUPTI cold-L2 timer.
+"""Native SM110 XQA ledger rows (the tmem / pair tree schedules and the D128 decode) using FlashInfer's CUPTI cold-L2 timer.
 
 This reports native latency samples, not a source/export equivalence audit.
 Compilation, allocation, and the FP32 oracle run outside measured replay.
@@ -19,7 +19,10 @@ import time
 import warnings
 
 
-def inputs_and_reference(shape, recipes):
+TREE_KERNELS = ("auto", "tmem", "pair")
+
+
+def inputs_and_reference(shape, recipes, kernel=None):
     import torch
 
     tree = shape["head_dim"] == 512
@@ -115,7 +118,7 @@ def inputs_and_reference(shape, recipes):
         outputs.append(value)
     expected = torch.stack(outputs).to(torch.float16)
     kwargs = dict(
-        kernel=shape.get("kernel", "tcgen05"),
+        kernel=(kernel if kernel is not None and tree else shape.get("kernel", "auto")),
         mask=mask,
         page_table=pages,
         page_size=shape["page_size"],
@@ -148,6 +151,11 @@ def main():
         "--warmup-iters", type=int, help="explicit warmup count instead of duration"
     )
     parser.add_argument("--repeat-iters", type=int, default=256)
+    parser.add_argument(
+        "--kernel",
+        choices=TREE_KERNELS,
+        help="run every tree row under this schedule instead of the ledger's (a row the schedule refuses is reported as unsupported)",
+    )
     args = parser.parse_args()
     if args.warmup_iters is not None:
         if args.warmup_iters < 1:
@@ -174,7 +182,7 @@ def main():
 
     import torch
     import flashinfer
-    from flashinfer.experimental.sm110_xqa.jit import require_sm110
+    from flashinfer.experimental.sm110_xqa.backend import require_sm110
     from flashinfer.sm110_xqa import prepare
     from flashinfer.testing import bench_gpu_time
 
@@ -211,13 +219,33 @@ def main():
             "repeat_iters": args.repeat_iters,
             "activity_identity_audit": False,
         },
+        "kernel_override": args.kernel,
         "rows": [],
         "complete": False,
     }
     for shape in ledger["shapes"]:
         row_started = time.monotonic()
-        inputs, kwargs, expected = inputs_and_reference(shape, ledger["inputs"])
-        plan = prepare(*inputs, **kwargs)
+        inputs, kwargs, expected = inputs_and_reference(
+            shape, ledger["inputs"], args.kernel
+        )
+        try:
+            plan = prepare(*inputs, **kwargs)
+        except ValueError as refused:
+            # A schedule override the row's shape does not admit (pair over FP16 KV).
+            row = {
+                "shape": shape,
+                "kernel": kwargs["kernel"],
+                "unsupported": str(refused),
+                "physical_seconds": time.monotonic() - row_started,
+            }
+            report["rows"].append(row)
+            report.update(
+                complete=len(report["rows"]) == len(ledger["shapes"]),
+                physical_seconds=time.monotonic() - started,
+            )
+            save(args.output, report)
+            print(json.dumps(row), flush=True)
+            continue
         torch.testing.assert_close(plan.run(), expected, atol=0.01, rtol=0.01)
         with warnings.catch_warnings():
             # The upstream CUPTI helper warns immediately before its fallback.
@@ -243,8 +271,10 @@ def main():
         torch.testing.assert_close(plan.run(), expected, atol=0.01, rtol=0.01)
         row = {
             "shape": shape,
+            "kernel": kwargs["kernel"],
             "route": plan.route,
             "program": plan.program,
+            "grid": list(plan.grid),
             "correct": True,
             "median_us": 1000 * statistics.median(samples),
             "samples_ms": list(samples),
