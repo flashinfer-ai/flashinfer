@@ -18,8 +18,6 @@ host planners of both implementations, the kernels against an exact reference
 through the public ``flashinfer.mla.nvfp4_sparse_mla_decode`` entry (both
 backends), the host plan of the generated program's registry records and the
 ``build.json`` contract of its package.
-
-The package is named once, through ``tests.test_helpers.cake_package``.
 """
 
 import math
@@ -30,13 +28,10 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
-
-pkg = cake_package("nvfp4_sparse_mla_decode")
-cuda_backend = cake_package("nvfp4_sparse_mla_decode", "backend")
-cake_backend = cake_package("nvfp4_sparse_mla_decode", "cake_backend")
-loader = cake_package("nvfp4_sparse_mla_decode", "cake_jit")
-cake_build = cake_package("nvfp4_sparse_mla_decode", "cake_build")
+from flashinfer.experimental import nvfp4_sparse_mla_decode as pkg
+from flashinfer.experimental.nvfp4_sparse_mla_decode import backend as cuda_backend
+from flashinfer.experimental.nvfp4_sparse_mla_decode import cake_backend, cake_build
+from flashinfer.experimental.nvfp4_sparse_mla_decode import cake_jit as loader
 
 HEAD_DIM = cuda_backend.HEAD_DIM
 NUM_HEADS = cuda_backend.NUM_HEADS
