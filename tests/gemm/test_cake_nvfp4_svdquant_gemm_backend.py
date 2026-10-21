@@ -353,9 +353,13 @@ def _check(reference: torch.Tensor, out: torch.Tensor, what: str) -> None:
     assert sqnr > MIN_SQNR_DB, f"{what}: SQNR {sqnr:.2f} dB <= {MIN_SQNR_DB} dB"
 
 
+def _arch() -> str:
+    return loader.device_arch(_device().index)
+
+
 def _route(row) -> str:
     m, n, k, rank, bias = row
-    return loader.select_record(m=m, n=n, k=k, rank=rank, has_bias=bias)
+    return loader.select_record(m=m, n=n, k=k, rank=rank, has_bias=bias, arch=_arch())
 
 
 # --------------------------------------------------------------------------- host plan
@@ -437,12 +441,15 @@ def test_registry_records_reference_the_build_manifest() -> None:
 
 
 def test_route_table_is_total_and_reaches_every_program() -> None:
-    """The last route row admits everything, every row names shipped records, and
-    every shipped record is the target of some row."""
+    """The last route row admits everything, every row names shipped records
+    (and, when it names architectures, some but not all of the exported ones),
+    and every shipped record is the target of some row."""
     table = loader.ROUTE_TABLE
     assert set(table[-1]) == {"record"}
     targets = set()
     for row in table:
+        arches = row.get("arches")
+        assert arches is None or (arches and set(arches) < set(loader.ARCHES))
         if "records_by_rank" in row:
             assert "record" not in row
             for rank, name in row["records_by_rank"].items():
@@ -472,11 +479,66 @@ def test_matrix_reaches_every_program() -> None:
     assert reached == set(loader.MODULES), sorted(set(loader.MODULES) - reached)
 
 
+def test_route_rows_may_name_their_architectures(monkeypatch) -> None:
+    """A row with ``arches`` applies on those architectures only: one problem
+    dispatches per architecture, an architecture-blind call that meets such a
+    row is refused, and an unexported architecture is refused."""
+    m, n, k, rank, bias = 4096, 3072, 3072, 32, True
+    before = {
+        arch: loader.select_record(m=m, n=n, k=k, rank=rank, has_bias=bias, arch=arch)
+        for arch in loader.ARCHES
+    }
+    beside = {
+        arch: loader.select_record(
+            m=m + 1, n=n, k=k, rank=rank, has_bias=bias, arch=arch
+        )
+        for arch in loader.ARCHES
+    }
+    other = next(
+        name
+        for name, record in loader.MODULES.items()
+        if name not in before.values()
+        and record["plan"]["variant"] == "bias"
+        and record["plan"]["rank_storage"] in (None, rank)
+        and k % record["plan"]["block_k"] == 0
+    )
+    scoped = {
+        "m_min": m,
+        "m_max": m,
+        "n_min": n,
+        "n_max": n,
+        "k_min": k,
+        "k_max": k,
+        "ranks": (rank,),
+        "bias": True,
+        "arches": ("sm_103a",),
+        "record": other,
+    }
+    monkeypatch.setattr(loader, "ROUTE_TABLE", (scoped, *loader.ROUTE_TABLE))
+    routed = {
+        arch: loader.select_record(m=m, n=n, k=k, rank=rank, has_bias=bias, arch=arch)
+        for arch in loader.ARCHES
+    }
+    assert routed == {"sm_100a": before["sm_100a"], "sm_103a": other}
+    # A neighbouring problem the scoped row does not admit routes as before.
+    for arch in loader.ARCHES:
+        assert (
+            loader.select_record(m=m + 1, n=n, k=k, rank=rank, has_bias=bias, arch=arch)
+            == beside[arch]
+        )
+    with pytest.raises(TypeError, match="per architecture"):
+        loader.select_record(m=m, n=n, k=k, rank=rank, has_bias=bias)
+    with pytest.raises(RuntimeError, match="not an exported"):
+        loader.select_record(m=m, n=n, k=k, rank=rank, has_bias=bias, arch="sm_120a")
+    assert pkg.is_supported(m=m, n=n, k=k, rank=rank, has_bias=bias, device=_device())
+    assert _route((m, n, k, rank, bias)) == routed[_arch()]
+
+
 @pytest.mark.parametrize("case", REJECTED_SHAPES, ids=lambda case: _row_id(case[0]))
 def test_shape_rule_names_the_violated_constraint(case) -> None:
     (m, n, k, rank, bias), message = case
     with pytest.raises(ValueError, match=re.escape(message)):
-        loader.select_record(m=m, n=n, k=k, rank=rank, has_bias=bias)
+        loader.select_record(m=m, n=n, k=k, rank=rank, has_bias=bias, arch=_arch())
     assert not pkg.is_supported(
         m=m, n=n, k=k, rank=rank, has_bias=bias, device=_device()
     )
@@ -612,7 +674,9 @@ def test_two_cta_routes_pick_the_store_form_of_the_launch() -> None:
         ((5888, 3072), "v8"),
         ((6016, 3072), "v8hint"),
     ):
-        name = loader.select_record(m=4096, n=n, k=k, rank=32, has_bias=True)
+        name = loader.select_record(
+            m=4096, n=n, k=k, rank=32, has_bias=True, arch=_arch()
+        )
         record = loader.MODULES[name]
         assert record["plan"]["grid_rule"] == "pair_persistent", (n, k)
         assert record["build"]["out_store"] == form, (n, k, record["build"])
@@ -636,7 +700,9 @@ def test_m129_rows_route_by_k_class(bias) -> None:
         (12416, M129_FORM_K3072),
         (24576, M129_FORM_K12288),
     ):
-        name = loader.select_record(m=129, n=3072, k=k, rank=32, has_bias=bias)
+        name = loader.select_record(
+            m=129, n=3072, k=k, rank=32, has_bias=bias, arch=_arch()
+        )
         record = loader.MODULES[name]
         assert record["build"] == {"bias": bias, **form}, (k, bias, record["build"])
         assert record["plan"]["variant"] == ("bias" if bias else "nobias")
