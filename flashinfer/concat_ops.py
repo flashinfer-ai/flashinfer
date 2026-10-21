@@ -146,7 +146,8 @@ def cake_concat_mla_k_target(device) -> str:
     from .jit.cake_concat_mla_k import ONE_CTA
     from .jit.cpp_ext import is_cuda_version_at_least
 
-    capability = tuple(int(value) for value in torch.cuda.get_device_capability(device))
+    major, minor = torch.cuda.get_device_capability(device)
+    capability = (int(major), int(minor))
     target = ONE_CTA.target_for(capability)
     if target is None:
         raise RuntimeError(
