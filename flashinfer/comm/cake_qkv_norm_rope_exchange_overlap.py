@@ -66,24 +66,37 @@ world size unless ``FLASHINFER_QKV_EXCHANGE_GROUP_M_SCALE`` overrides it --
 hidden size of at least ``plans.GROUP_M_SCALE_MIN_K`` take ``group_m`` times the
 scale (the tile order changes, the readiness words and the stored bits do not).
 
-Row-count gates (``plans.SHAPE_GATE_DEFAULT_BY_ARCH``, resolved once per session
-by :func:`resolve_shape_gates`: the architecture default unless
-``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` overrides it -- ``auto``, ``off`` or
-``gate=value,...`` with ``0`` = never; rank-uniform, checked collectively): a call
-with ``batch * s_local <= words_capacity_small_m`` rows publishes one readiness
-word per destination (``num_words = 1``); a call with ``batch * s_local >=
-reserved_sms_large_m`` rows runs the persistent producer grid over every SM
-(``reserved_sms = 0`` instead of ``plans.RESERVED_SMS``); a call with ``batch *
-s_local >= per_dest_large_m`` rows launches the producer once per destination
-run of its tile table (``plans.dest_parts``; on the folded path the first part
-carries the rendezvous and the later parts are the plain producer,
-stream-ordered behind it; on the barrier path every part is the plain producer)
-instead of one persistent grid.  SM100 / SM103 ship ``4096`` / off / ``16384``;
-SM90 ships off / ``16384`` / off.  The gates change the host plan only -- never
-the tile table or the stored bits -- and ``describe()`` reports them
-(``shape_gates``) beside the resolved build (``producer_variant``) and scale
-(``group_m_scale``), with every prepared row's verdict (``prepared_row_plans``,
-including its ``reserved_sms`` and ``part_grids``).
+Row-count gates (``plans.SHAPE_GATE_DEFAULT_BY_ARCH`` with the (architecture,
+world size) cells of ``plans.SHAPE_GATE_DEFAULT_BY_ARCH_WORLD`` on top, resolved
+once per session by :func:`resolve_shape_gates`: the default of the architecture
+and world size unless ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` overrides it --
+``auto``, ``off`` or ``gate=value,...`` with ``0`` = never and ``all`` = every row
+for the small-row word gate; rank-uniform, checked collectively): a call with
+``batch * s_local <= words_capacity_small_m`` rows publishes one readiness word
+per destination (``num_words = 1``; every call on SM90 with 8 ranks); a call
+with ``batch * s_local >= reserved_sms_large_m`` rows runs the persistent
+producer grid over every SM (``reserved_sms = 0`` instead of
+``plans.RESERVED_SMS``); a call with ``batch * s_local >= per_dest_large_m`` rows
+launches the producer once per destination run of its tile table
+(``plans.dest_parts``; on the folded path the first part carries the rendezvous
+and the later parts are the plain producer, stream-ordered behind it; on the
+barrier path every part is the plain producer) instead of one persistent grid;
+a 256-column call with ``batch * s_local >= pair_off_large_m`` rows runs the
+single-CTA producer instead of the 2-CTA pair tile (tile order unchanged; the
+single-CTA ``block_n = 256`` producer must be delivered for the architecture --
+no delivered Blackwell route ships it today, so the opt-in refuses at
+construction when a 256-column call can reach the gate (``max_tokens >= N``),
+naming the gate; SM90 builds no pair tile and refuses the gate).  SM100 / SM103
+ship ``4096`` / off / ``16384`` / off; SM90 ships ``4096`` / ``16384`` / off /
+off, with the word gate on every row (``all``) for an 8-rank group; the
+pair-tile gate ships nowhere.  The first three
+gates change the host plan only -- never the tile table or the stored bits; the
+pair-tile gate changes the producer program and the tile table (no lockstep
+pads) of the rows it selects; no gate changes the stored bits -- and
+``describe()`` reports them (``shape_gates``) beside the resolved build
+(``producer_variant``) and scale (``group_m_scale``), with every prepared row's
+verdict (``prepared_row_plans``, including its ``reserved_sms`` and
+``part_grids``).
 
 Eager calls publish a monotonic epoch; a call issued while the current stream
 is capturing publishes the sentinel ``0xFFFFFFFF``, clears its slot's words
@@ -101,7 +114,7 @@ import os
 import threading
 import warnings
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import torch
 import torch.distributed as dist
@@ -155,9 +168,10 @@ def fold_barrier_from_env() -> Optional[bool]:
         ) from None
 
 
-# Row-count gate override read once per session: ``auto`` (or unset) = the architecture default of
-# ``plans.SHAPE_GATE_DEFAULT_BY_ARCH``; ``off`` / ``0`` = every gate off; ``gate=value[,gate=value]`` with ``gate``
-# in ``plans.SHAPE_GATE_NAMES`` and ``value`` an int >= 0 (``0`` = never) or ``auto`` = that gate's default.
+# Row-count gate override read once per session: ``auto`` (or unset) = the (architecture, world size) default of
+# ``plans.default_shape_gates``; ``off`` / ``0`` = every gate off; ``gate=value[,gate=value]`` with ``gate`` in
+# ``plans.SHAPE_GATE_NAMES`` and ``value`` an int >= 0 (``0`` = never), ``auto`` = that gate's default or, for the
+# small-row word gate, ``all`` = every row.
 SHAPE_GATES_ENV = "FLASHINFER_QKV_EXCHANGE_SHAPE_GATES"
 
 
@@ -183,28 +197,51 @@ def shape_gates_from_env() -> Optional[dict[str, Optional[int]]]:
             )
         if value.lower() == "auto":
             override[name] = None
+        elif value.lower() == "all":
+            if name not in plans.SHAPE_GATE_ALL_ROWS_NAMES:
+                raise ValueError(
+                    f"{SHAPE_GATES_ENV}: {name}=all is not a spelling of this gate ('all' = every row for "
+                    f"{plans.SHAPE_GATE_ALL_ROWS_NAMES}; a large-row gate that never fires is {name}=0)"
+                )
+            override[name] = plans.SHAPE_GATE_ALL_ROWS
         elif value.isdigit():
+            if int(value) > plans.SHAPE_GATE_ALL_ROWS:
+                raise ValueError(
+                    f"{SHAPE_GATES_ENV}: {name}={value} is above SHAPE_GATE_ALL_ROWS "
+                    f"({plans.SHAPE_GATE_ALL_ROWS}); every row is spelled {name}=all (the "
+                    f"small-row word gate only), a gate that never fires {name}=0"
+                )
             override[name] = int(value)
         else:
             raise ValueError(
-                f"{SHAPE_GATES_ENV}: {name} must be an int >= 0 or auto, got {value!r}"
+                f"{SHAPE_GATES_ENV}: {name} must be an int >= 0 or `auto` (and `all` for "
+                f"{', '.join(plans.SHAPE_GATE_ALL_ROWS_NAMES)}), got {value!r}"
             )
     return override
 
 
-def resolve_shape_gates(arch: str) -> tuple[dict[str, int], str]:
-    """The row-count gates of a session on ``arch``: the architecture default
-    (``plans.SHAPE_GATE_DEFAULT_BY_ARCH``) with :data:`SHAPE_GATES_ENV` applied on top.  Returns ``(gates, source)``
-    with ``source`` ``"default"`` or ``"env"``."""
+def resolve_shape_gates(arch: str, world_size: int) -> tuple[dict[str, int], str]:
+    """The row-count gates of a session on ``arch`` with ``world_size`` ranks: the (architecture, world size) default
+    (``plans.default_shape_gates``) with :data:`SHAPE_GATES_ENV` applied on top.  Returns ``(gates, source)`` with
+    ``source`` ``"default"`` or ``"env"``."""
 
-    gates = plans.default_shape_gates(arch)
+    gates = plans.default_shape_gates(arch, world_size=world_size)
     override = shape_gates_from_env()
     if override is None:
         return plans.check_shape_gates(gates), "default"
     for name, value in override.items():
         if value is not None:
             gates[name] = int(value)
-    return plans.check_shape_gates(gates), "env"
+    checked = plans.check_shape_gates(gates)
+    if arch not in plans.PAIR_ARCHES:
+        for name in plans.SHAPE_GATE_BN:
+            if checked[name]:
+                raise ValueError(
+                    f"{SHAPE_GATES_ENV}: {name}={checked[name]} is refused on {arch}: the architecture builds no "
+                    f"2-CTA pair producer (pair architectures: {plans.PAIR_ARCHES}), so there is no pair tile to "
+                    "switch off; drop the gate (0 or auto)"
+                )
+    return checked, "env"
 
 
 def resolve_fold_barrier(
@@ -379,6 +416,61 @@ class _RowPlan:
         return len(self.parts)
 
 
+def reachable_pairs(
+    arch: str,
+    bn: int,
+    pair_available: bool,
+    shape_gates: Mapping[str, int],
+    max_tokens: int,
+) -> tuple[bool, ...]:
+    """The pair flags a session of tile width ``bn`` on ``arch`` can launch for row counts up to ``max_tokens``: the
+    policy's pair tile where the pair producer is delivered (``pair_available``) and the geometry pairs, the
+    single-CTA producer otherwise -- and BOTH on a 256-column session whose ``pair_off_large_m`` gate can fire below
+    ``max_tokens`` (the gate selects the single-CTA producer for its rows).  Off the pair architectures only the
+    single-CTA producer exists."""
+
+    if arch not in plans.PAIR_ARCHES:
+        return (False,)
+    if bn == plans.PAIR_BN:
+        if not pair_available:
+            return (False,)
+        pair_off = int(shape_gates["pair_off_large_m"])
+        return (False, True) if pair_off and max_tokens >= pair_off else (True,)
+    pairs = {False} if max_tokens < plans.PAIR_MIN_M else set()
+    if max_tokens >= plans.PAIR_MIN_M:
+        pairs.add(bool(pair_available))
+    return tuple(sorted(pairs))
+
+
+def undelivered_producer_error(
+    arch: str,
+    bn: int,
+    pair: bool,
+    variant: str,
+    variant_source: str,
+    shape_gates: Mapping[str, int],
+) -> str:
+    """The construction refusal for a reachable producer the route table does not deliver.  When the single-CTA
+    256-column producer is reachable only because the pair-tile gate is on, the message names the gate and its
+    opt-out (no delivered Blackwell route ships that producer today); otherwise it names the producer build and
+    :data:`PRODUCER_VARIANT_ENV`."""
+
+    delivered = loader.delivered_producer_variants(arch, bn, pair)
+    pair_off = int(shape_gates["pair_off_large_m"])
+    if not pair and bn == plans.PAIR_BN and arch in plans.PAIR_ARCHES and pair_off:
+        return (
+            f"{SHAPE_GATES_ENV}: pair_off_large_m={pair_off} requires the single-CTA block_n={bn} producer, which "
+            f"this delivery does not ship for {arch} (delivered builds for block_n={bn}, pair=False: {delivered}; "
+            "the delivered routes carry the 2-CTA pair producer for this tile width) -- drop the gate (0 or auto) on "
+            "every rank, or deliver that producer"
+        )
+    return (
+        f"producer build {variant or PRODUCER_VARIANT_SHIPPED!r} ({variant_source}) is not delivered for {arch} at "
+        f"block_n={bn}, pair={pair} (delivered: {delivered}; '' is the baseline build) -- set "
+        f"{PRODUCER_VARIANT_ENV}={PRODUCER_VARIANT_SHIPPED} or one of the delivered names on every rank"
+    )
+
+
 class CakeQkvExchangeSession:
     """One prepared session on one NCCL process group (collective constructor; see the module docstring)."""
 
@@ -440,7 +532,9 @@ class CakeQkvExchangeSession:
             arch, fold_barrier
         )
         self.fold_barrier_requested = fold_barrier
-        self.shape_gates, self.shape_gates_source = resolve_shape_gates(arch)
+        self.shape_gates, self.shape_gates_source = resolve_shape_gates(
+            arch, self.world_size
+        )
         if layout not in plans.LAYOUTS:
             raise ValueError(f"layout must be one of {plans.LAYOUTS}, got {layout!r}")
         if (
@@ -505,11 +599,14 @@ class CakeQkvExchangeSession:
         for pair in self._reachable_pairs():
             if not loader.has_producer(self.arch, self.bn, pair, self.producer_variant):
                 raise ValueError(
-                    f"producer build {self.producer_variant or PRODUCER_VARIANT_SHIPPED!r} "
-                    f"({self.producer_variant_source}) is not delivered for {self.arch} at block_n={self.bn}, "
-                    f"pair={pair} (delivered: {loader.delivered_producer_variants(self.arch, self.bn, pair)}; "
-                    f"'' is the baseline build) -- set {PRODUCER_VARIANT_ENV}={PRODUCER_VARIANT_SHIPPED} or one of "
-                    "the delivered names on every rank"
+                    undelivered_producer_error(
+                        self.arch,
+                        self.bn,
+                        pair,
+                        self.producer_variant,
+                        self.producer_variant_source,
+                        self.shape_gates,
+                    )
                 )
         self._barrier_names = tuple(
             loader.barrier_program(self.arch, phase) for phase in (0, 1)
@@ -521,7 +618,9 @@ class CakeQkvExchangeSession:
         self._wait = loader.load(self._wait_name, self.arch)
         self._producers: dict[str, Any] = {}
         per_dest_reachable = (
-            plans.gate_rows(self.shape_gates, self.max_tokens).producer_launches
+            plans.gate_rows(
+                self.shape_gates, self.max_tokens, bn=self.bn
+            ).producer_launches
             == "per_dest"
         )
         for pair in self._reachable_pairs():
@@ -612,16 +711,16 @@ class CakeQkvExchangeSession:
     # ------------------------------------------------------------------ preparation
 
     def _reachable_pairs(self) -> tuple[bool, ...]:
-        """Pair flags the policy can select for row counts up to ``max_tokens`` (programs to load eagerly)."""
+        """Pair flags the policy and the pair-tile gate can select for row counts up to ``max_tokens`` (programs to
+        load eagerly): :func:`reachable_pairs` on this session's tile width, pair delivery and gates."""
 
-        if self.arch not in plans.PAIR_ARCHES:
-            return (False,)
-        if self.bn == plans.PAIR_BN:
-            return (True,) if self.pair_available[self.bn] else (False,)
-        pairs = {False} if self.max_tokens < plans.PAIR_MIN_M else set()
-        if self.max_tokens >= plans.PAIR_MIN_M:
-            pairs.add(bool(self.pair_available[self.bn]))
-        return tuple(sorted(pairs))
+        return reachable_pairs(
+            self.arch,
+            self.bn,
+            self.pair_available[self.bn],
+            self.shape_gates,
+            self.max_tokens,
+        )
 
     def _fold_producer_names(
         self, pair: bool, variant: Optional[str] = None
@@ -747,9 +846,10 @@ class CakeQkvExchangeSession:
             raise ValueError(
                 "row geometry exceeds the receive slot capacity of the session"
             )
-        # Row-count gates of this call (the session's gates on ``rows = batch * s_local``): one readiness word per
-        # destination for a small row, one producer launch per destination run for a large row.
-        verdict = plans.gate_rows(self.shape_gates, int(geometry.rows))
+        # Row-count gates of this call (the session's gates on ``rows = batch * s_local`` and the session's tile
+        # width): one readiness word per destination for a small row, one producer launch per destination run for a
+        # large row, the single-CTA producer for a large 256-column row under the pair-tile gate.
+        verdict = plans.gate_rows(self.shape_gates, int(geometry.rows), bn=self.bn)
         words_capacity = (
             verdict.words_capacity_per_dest
             if verdict.words_capacity_per_dest is not None
@@ -763,6 +863,7 @@ class CakeQkvExchangeSession:
             pair_available=self.pair_available[self.bn],
             words_capacity_per_dest=words_capacity,
             group_m_scale=self.group_m_scale,
+            pair=verdict.pair,
         )
         if plan.bn != self.bn or plan.num_words > self.words_cap:
             raise RuntimeError("tile plan disagrees with the session capacity")
@@ -1145,10 +1246,12 @@ class CakeQkvExchangeSession:
                 else ["barrier_p<phase>", "producer (x parts)", "wait"]
             ),
             "shape_gates": {
-                "values": dict(self.shape_gates),
+                "values": plans.spell_shape_gates(self.shape_gates),
                 "source": self.shape_gates_source,
                 "env": SHAPE_GATES_ENV,
-                "default": plans.default_shape_gates(self.arch),
+                "default": plans.spell_shape_gates(
+                    plans.default_shape_gates(self.arch, world_size=self.world_size)
+                ),
             },
             "producer_variant": {
                 "value": self.producer_variant,
