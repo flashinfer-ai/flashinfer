@@ -33,9 +33,10 @@ FP32 ``dweight`` in one cooperative launch).  The forward launches its route in
 order.  The backward route of an architecture may carry several programs of
 the kernel and launches exactly one per call, chosen by the channel count: a
 record's ``select_rule`` (``channels_at_least``: ``C >= channels[arch]``)
-names the channel counts it owns, the record without a rule is the
-architecture's fallback, and :func:`selected_modules` applies that rule (a
-pure function of the architecture and ``C``; the host never reads the data).
+names the channel counts it owns, of several owners the one of the highest
+threshold runs, the record without a rule is the architecture's fallback, and
+:func:`selected_modules` applies that rule (a pure function of the
+architecture and ``C``; the host never reads the data).
 Token and channel counts are runtime scalars, so a changed problem size never
 recompiles anything; building every library of the architecture
 (:func:`specs_for_arch`) before a CUDA Graph capture keeps the JIT out of the
@@ -54,10 +55,15 @@ digits of the SHA-256 of the compact JSON ``{"build": <build keywords, sorted>,
 from; the forward is built with its kernel file's default keywords; the
 backward with ``vec=8, copy="tma2d"`` (eight channels, 16-byte vectors, per
 thread; 2-D TMA row copies) on sm_100a and sm_103a, with ``vec=8,
-min_blocks=2`` (two CTAs per SM) on sm_107a, and the big-channel backward
-(the program the ``channels_at_least`` rule selects) with ``vec=8,
-copy="tma2d", stage_tokens=8, min_blocks=2`` (eight-token stages, two CTAs
-per SM).
+min_blocks=2`` (two CTAs per SM) on sm_107a, and the backwards the
+``channels_at_least`` rules select, builds of ``vec=8, copy="tma2d",
+stage_tokens=8, min_blocks=2`` (eight-token stages, two CTAs per SM): as is
+on sm_100a from C = 512 and on sm_103a from 768, with ``fold_overlap=True,
+fast_roll=True`` (the dweight fold buffer over the stage slots, the stage body
+as two rolled passes of four tokens) on sm_103a for 512 <= C < 768 and on
+sm_107a for 512 <= C < 1024, as is on sm_107a for 1024 <= C < 2048, and
+with ``fast_roll=True, roll_prefetch=True`` (each rolled pass loads the
+next pass's rows before it computes) on sm_107a from 2048.
 """
 
 from __future__ import annotations
@@ -296,7 +302,8 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     # Rendered by the exporter from the family adapter's scaffold: the backward
     # with stage_tokens 8, copy tma2d, min_blocks 2 (2 CTAs per SM); it runs when
-    # C >= select_rule.channels[arch], else the fallback record (no rule) runs.
+    # C >= select_rule.channels[arch] and no routed record of a higher threshold
+    # admits C; below every threshold the fallback record (no select_rule) runs.
     "cake_causal_conv1d_train_90351ecca30604957251": {
         "arches": [
             "sm_100a",
@@ -366,7 +373,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "channels": {
                 "sm_100a": 512,
-                "sm_103a": 512,
+                "sm_103a": 768,
                 "sm_107a": 1024,
             },
             "kind": "channels_at_least",
@@ -420,8 +427,9 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
 }
 KINDS = ("fwd", "bwd")
 # The selection-rule vocabulary of a backward record (``record["select_rule"]
-# ["kind"]``); a backward record without a rule is its route's fallback and a
-# forward record never carries one.
+# ["kind"]``); of the records whose rule admits a call the one of the highest
+# threshold runs, a backward record without a rule is its route's fallback and
+# a forward record never carries one.
 SELECT_KINDS = ("channels_at_least",)
 # The convolution width: ``weight`` and ``dweight`` are ``[C, WIDTH]`` and tap
 # ``WIDTH - 1`` multiplies the current token.
@@ -498,23 +506,32 @@ def select_rule(record: dict[str, Any]) -> dict[str, Any] | None:
     its route's fallback program.  ``{"kind": "channels_at_least", "channels":
     {arch: C_min, ...}}`` owns the calls whose channel count is at least
     ``channels[arch]`` on the architectures it names and never hits on the
-    others.  Forward records carry no rule.
+    others; when several records own a call, the one of the highest threshold
+    runs.  Forward records carry no rule.
     """
 
     return record.get("select_rule")
 
 
-def _admits(rule: dict[str, Any], *, arch: str, C: int) -> bool:
-    """Whether a selection rule owns ``C`` channels on ``arch`` (``ValueError`` for an unknown kind)."""
+def _threshold(rule: dict[str, Any], *, arch: str) -> int | None:
+    """The channel count from which a selection rule owns the calls on ``arch``, ``None`` where it never does
+    (``ValueError`` for an unknown kind)."""
 
     kind = rule["kind"]
     if kind == "channels_at_least":
         channels = rule["channels"]
-        return arch in channels and int(C) >= int(channels[arch])
+        return int(channels[arch]) if arch in channels else None
     raise ValueError(
         f"unknown Cake causal conv1d training selection rule: {kind!r} "
         f"(known: {SELECT_KINDS})"
     )
+
+
+def _admits(rule: dict[str, Any], *, arch: str, C: int) -> bool:
+    """Whether a selection rule owns ``C`` channels on ``arch`` (``ValueError`` for an unknown kind)."""
+
+    threshold = _threshold(rule, arch=arch)
+    return threshold is not None and int(C) >= threshold
 
 
 def selected_modules(
@@ -524,40 +541,43 @@ def selected_modules(
 
     The forward launches every program of its route (:func:`route_modules`).
     The backward route may carry several programs of the kernel and launches
-    exactly one: the record whose :func:`select_rule` admits ``C`` on ``arch``
-    when one does, else the route's single fallback record (the one without a
-    rule).  The choice is a pure function of the architecture and the channel
-    count -- ``S`` is accepted and unused, and the host never reads the data --
-    so a given ``(S, C, device)`` always runs the same program and ``dweight``
-    stays bitwise reproducible.  Several admitting records, or zero or several
-    fallbacks, are registry errors (``RuntimeError``); an unknown rule kind is
-    a ``ValueError``.
+    exactly one: of the records whose :func:`select_rule` admits ``C`` on
+    ``arch`` the one of the highest threshold, else the route's single fallback
+    record (the one without a rule).  The choice is a pure function of the
+    architecture and the channel count -- ``S`` is accepted and unused, and the
+    host never reads the data -- so a given ``(S, C, device)`` always runs the
+    same program and ``dweight`` stays bitwise reproducible.  Two admitting
+    records of one threshold, or zero or several fallbacks, are registry errors
+    (``RuntimeError``); an unknown rule kind is a ``ValueError``.
     """
 
     names = route_modules(arch, kind)
     if kind == "fwd":
         return names
-    positive: list[str] = []
+    positive: list[tuple[int, str]] = []
     fallback: list[str] = []
     for name in names:
         rule = select_rule(MODULES[name])
         if rule is None:
             fallback.append(name)
         elif _admits(rule, arch=arch, C=C):
-            positive.append(name)
+            positive.append((_threshold(rule, arch=arch), name))
     if len(fallback) != 1:
         raise RuntimeError(
             f"the exported backward route on {arch} declares {len(fallback)} fallback "
             "programs (records without a select_rule); expected exactly one"
         )
-    if len(positive) > 1:
+    if not positive:
+        return (fallback[0],)
+    positive.sort(reverse=True)
+    if len(positive) > 1 and positive[0][0] == positive[1][0]:
+        tied = [name for threshold, name in positive if threshold == positive[0][0]]
         raise RuntimeError(
-            f"the exported backward route on {arch} selects {len(positive)} programs "
-            f"for C={int(C)} ({positive}); expected at most one"
+            f"the exported backward route on {arch} selects {len(tied)} programs "
+            f"for C={int(C)} at one threshold {positive[0][0]} ({tied}); thresholds "
+            "must be distinct"
         )
-    if positive:
-        return (positive[0],)
-    return (fallback[0],)
+    return (positive[0][1],)
 
 
 def workspace_owners(arch: str) -> tuple[dict[str, Any], ...]:
