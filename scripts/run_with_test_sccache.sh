@@ -68,6 +68,40 @@ JIT_CACHE_ROOT=$(cd "${JIT_CACHE_ROOT}" && pwd -P)
 export SCCACHE_BASEDIRS="${JIT_CACHE_ROOT}${SCCACHE_BASEDIRS:+:${SCCACHE_BASEDIRS}}"
 
 export SCCACHE_BUCKET="${SCCACHE_BUCKET:-flashinfer-build-cache}"
+
+# TEMPORARY (PR #6810): cache-key stability diagnostics. A debug-level server
+# log records every hit/miss with its output path, and the JIT workspace
+# (generated sources and build.ninja, no objects) is archived so two runs of
+# the same scope can be diffed. Both land in SCCACHE_STATS_DIR, which CI
+# uploads. The server reads SCCACHE_LOG/SCCACHE_ERROR_LOG at startup.
+SCCACHE_DIAG_DIR=""
+if [ "${FLASHINFER_SCCACHE_DIAGNOSTICS:-0}" = "1" ] && [ -n "${SCCACHE_STATS_DIR:-}" ]; then
+    SCCACHE_DIAG_DIR="${SCCACHE_STATS_DIR}/diagnostics"
+    mkdir -p "${SCCACHE_DIAG_DIR}"
+    # Debug only for sccache itself: the S3/HTTP client crates log request
+    # headers at debug level, and this log is uploaded as an artifact.
+    export SCCACHE_LOG="sccache=debug"
+    export SCCACHE_ERROR_LOG="${SCCACHE_DIAG_DIR}/sccache-server.log"
+fi
+
+collect_sccache_diagnostics() {
+    [ -n "${SCCACHE_DIAG_DIR}" ] || return 0
+    tar -czf "${SCCACHE_DIAG_DIR}/jit-workspace.tar.gz" \
+        --exclude='*.o' --exclude='*.so' --exclude='*.cubin' \
+        -C "${JIT_CACHE_ROOT}" . || true
+    [ -f "${SCCACHE_ERROR_LOG}" ] || return 0
+    # Never upload a log that contains the credentials.
+    local secret
+    for secret in "${AWS_ACCESS_KEY_ID:-}" "${AWS_SECRET_ACCESS_KEY:-}"; do
+        if [ -n "${secret}" ] && grep -qF -- "${secret}" "${SCCACHE_ERROR_LOG}"; then
+            rm -f "${SCCACHE_ERROR_LOG}"
+            echo "::warning::sccache diagnostics log contained AWS credentials; discarded"
+            return 0
+        fi
+    done
+    gzip -f "${SCCACHE_ERROR_LOG}" || true
+}
+
 # Same prefix as the AOT lanes, which build in this toolchain image.
 if ! setup_sccache "cuda${CUDA_TAG}-$(uname -m)" "$(pwd -P)"; then
     # sccache checks the S3 backend at startup; an outage or denied access
@@ -78,5 +112,6 @@ if ! setup_sccache "cuda${CUDA_TAG}-$(uname -m)" "$(pwd -P)"; then
 fi
 
 # Not exec: stats must be collected after the lane exits, from this shell.
-trap 'collect_sccache_stats || true' EXIT
+# Stats first: collecting them stops the server, which flushes its log.
+trap 'collect_sccache_stats || true; collect_sccache_diagnostics' EXIT
 "$@"

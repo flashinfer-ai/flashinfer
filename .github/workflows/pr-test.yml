@@ -475,6 +475,10 @@ jobs:
               -e AWS_SECRET_ACCESS_KEY
               -e SCCACHE_STATS_DIR /workspace/sccache-stats
             )
+            # TEMPORARY (PR #6810): cache-key stability diagnostics on H100 only.
+            if [ "${MATRIX_KIND}" = "h100" ]; then
+              DOCKER_ARGS+=(-e FLASHINFER_SCCACHE_DIAGNOSTICS 1)
+            fi
             LANE_COMMAND=(./scripts/run_with_test_sccache.sh "${LANE_COMMAND[@]}")
           fi
           TEST_RUNNER_ARGS=()
