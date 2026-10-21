@@ -22,6 +22,20 @@ import warnings
 TREE_KERNELS = ("auto", "tmem", "pair")
 
 
+def pair_refused(shape, kernel):
+    """Whether ``prepare`` refuses the ``pair`` schedule for this ledger row, by
+    the two rules the package documents (``cake_jit.select_record``): ``pair``
+    serves E4M3 KV only, and only KV heads with an even number of 128-row Q
+    tiles (``ceil(query_tokens * Hq / Hkv / 128)``).  Decode rows and the other
+    schedules never refuse."""
+    if kernel != "pair" or shape["head_dim"] != 512:
+        return False
+    if shape["kv_dtype"] != "float8_e4m3fn":
+        return True
+    ratio = shape["query_heads"] // shape["kv_heads"]
+    return (-(-shape["query_tokens"] * ratio // 128)) % 2 == 1
+
+
 def inputs_and_reference(shape, recipes, kernel=None):
     import torch
 
@@ -231,7 +245,10 @@ def main():
         try:
             plan = prepare(*inputs, **kwargs)
         except ValueError as refused:
-            # A schedule override the row's shape does not admit (pair over FP16 KV).
+            if not pair_refused(shape, kwargs["kernel"]):
+                # Only the documented ``pair`` refusals skip a row; anything else
+                # is a benchmark failure, not an unsupported shape.
+                raise
             row = {
                 "shape": shape,
                 "kernel": kwargs["kernel"],
