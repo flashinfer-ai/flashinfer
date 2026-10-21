@@ -196,7 +196,9 @@ def _block_fp8_reference(
                     act = F.silu(gate) * up
         inter = _requant_intermediate(act, variant)
         expert_out = inter @ w2[local_expert].t()
-        out[token] += weights[token, slot, None] * expert_out
+        # index_add_, not `out[token] +=`: a token that routes to this expert twice
+        # repeats in `token`, and indexed += would keep only one of its two slots.
+        out.index_add_(0, token, weights[token, slot, None] * expert_out)
     return out
 
 
