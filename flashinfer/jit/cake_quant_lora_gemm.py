@@ -457,9 +457,16 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "fp8_blackwell_n128": {
         "module": "cake_quant_lora_gemm_ca6afb23cac2aa9105fb",
         "device": "cake_quant_lora_gemm_ca6afb23cac2aa9105fb_kernel.cu",
-        "binding": "cake_quant_lora_gemm_ca6afb23cac2aa9105fb_binding.cu",
+        # Shares the fp8_blackwell_n256 binding source; compile_flags select it.
+        "binding": "cake_quant_lora_gemm_33d1d9e4954630ce127f_binding.cu",
         "arches": ["sm_100a", "sm_103a"],
-        "compile_flags": _COMPILE_FLAGS_BLACKWELL,
+        "compile_flags": [
+            *_COMPILE_FLAGS_BLACKWELL,
+            "-DCAKE_QLG_PROGRAM_KERNEL=kernel_cake_quant_lora_gemm_ca6afb23cac2aa9105fb",
+            "-DCAKE_QLG_PROGRAM_SHIM=cake_host_shim_274438e7451fb573",
+            "-DCAKE_QLG_SMEM_BYTES=230656",
+            "-DCAKE_QLG_B_BOX_ROWS=64",
+        ],
         "ffi_entry": "run",
         "arg_plan": _ARG_PLAN_FP8_BLACKWELL,
         "pdl": True,
@@ -513,9 +520,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "fp8_blackwell_n256_clc_blocked": {
         "module": "cake_quant_lora_gemm_79090638dfd94335349d",
         "device": "cake_quant_lora_gemm_79090638dfd94335349d_kernel.cu",
-        "binding": "cake_quant_lora_gemm_79090638dfd94335349d_binding.cu",
+        # Shares the fp8_blackwell_n256 binding source; compile_flags select it.
+        "binding": "cake_quant_lora_gemm_33d1d9e4954630ce127f_binding.cu",
         "arches": ["sm_100a", "sm_103a"],
-        "compile_flags": _COMPILE_FLAGS_BLACKWELL,
+        "compile_flags": [
+            *_COMPILE_FLAGS_BLACKWELL,
+            "-DCAKE_QLG_PROGRAM_KERNEL=kernel_cake_quant_lora_gemm_79090638dfd94335349d",
+            "-DCAKE_QLG_PROGRAM_SHIM=cake_host_shim_cb2ca2702b63865e",
+            "-DCAKE_QLG_SMEM_BYTES=231040",
+        ],
         "ffi_entry": "run",
         "arg_plan": _ARG_PLAN_FP8_BLACKWELL,
         "pdl": True,
@@ -541,9 +554,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "fp8_blackwell_n256_m256_clc_blocked": {
         "module": "cake_quant_lora_gemm_e58e380eacc1adcd5d34",
         "device": "cake_quant_lora_gemm_e58e380eacc1adcd5d34_kernel.cu",
-        "binding": "cake_quant_lora_gemm_e58e380eacc1adcd5d34_binding.cu",
+        # Shares the fp8_blackwell_n256 binding source; compile_flags select it.
+        "binding": "cake_quant_lora_gemm_33d1d9e4954630ce127f_binding.cu",
         "arches": ["sm_103a"],
-        "compile_flags": _COMPILE_FLAGS_BLACKWELL,
+        "compile_flags": [
+            *_COMPILE_FLAGS_BLACKWELL,
+            "-DCAKE_QLG_PROGRAM_KERNEL=kernel_cake_quant_lora_gemm_e58e380eacc1adcd5d34",
+            "-DCAKE_QLG_PROGRAM_SHIM=cake_host_shim_1b800b3c91215f9c",
+            "-DCAKE_QLG_SMEM_BYTES=231040",
+        ],
         "ffi_entry": "run",
         "arg_plan": _ARG_PLAN_FP8_BLACKWELL,
         "pdl": True,
@@ -594,14 +613,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "fp8_sm90_hint": {
         "module": "cake_quant_lora_gemm_b24e291cc9bbcb6adad1",
-        # Shares the fp8_sm90 kernel source; compile_flags select this program.
+        # Shares the fp8_sm90 kernel and binding sources; compile_flags select it.
         "device": "cake_quant_lora_gemm_58229fa296714c9ace87_kernel.cu",
-        "binding": "cake_quant_lora_gemm_b24e291cc9bbcb6adad1_binding.cu",
+        "binding": "cake_quant_lora_gemm_58229fa296714c9ace87_binding.cu",
         "arches": ["sm_90a"],
         "compile_flags": [
             *_COMPILE_FLAGS_SM90,
             "-DCAKE_QLG_PROGRAM_KERNEL=kernel_cake_quant_lora_gemm_b24e291cc9bbcb6adad1",
             "-DCAKE_QLG_FP8_SM90_HINT=1",
+            "-DCAKE_QLG_PROGRAM_SHIM=cake_host_shim_0e1d655d1be51ba6",
         ],
         "ffi_entry": "run",
         "arg_plan": _ARG_PLAN_FP8_SM90,
@@ -652,14 +672,17 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     },
     "nvfp4_blackwell_n192h": {
         "module": "cake_quant_lora_gemm_1c144a4162f4ba39de6c",
-        # Shares the nvfp4_blackwell_n192 kernel source; compile_flags select this program.
+        # Shares the nvfp4_blackwell_n192 kernel and binding sources; compile_flags select it.
         "device": "cake_quant_lora_gemm_aa5410d8a8acee43d949_kernel.cu",
-        "binding": "cake_quant_lora_gemm_1c144a4162f4ba39de6c_binding.cu",
+        "binding": "cake_quant_lora_gemm_aa5410d8a8acee43d949_binding.cu",
         "arches": ["sm_100a"],
         "compile_flags": [
             *_COMPILE_FLAGS_BLACKWELL,
             "-DCAKE_QLG_PROGRAM_KERNEL=kernel_cake_quant_lora_gemm_1c144a4162f4ba39de6c",
             "-DCAKE_QLG_NVFP4_N192_HINT=1",
+            "-DCAKE_QLG_PROGRAM_SHIM=cake_host_shim_46f9e11b6a394e8c",
+            "-DCAKE_QLG_SMEM_BYTES=226816",
+            "-DCAKE_QLG_TMA_L2_PROMOTION=CU_TENSOR_MAP_L2_PROMOTION_L2_256B",
         ],
         "ffi_entry": "run",
         "arg_plan": _ARG_PLAN_NVFP4_BLACKWELL_WIDE,
@@ -685,9 +708,16 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     "nvfp4_blackwell_n256": {
         "module": "cake_quant_lora_gemm_90d64729259715a65e04",
         "device": "cake_quant_lora_gemm_90d64729259715a65e04_kernel.cu",
-        "binding": "cake_quant_lora_gemm_90d64729259715a65e04_binding.cu",
+        # Shares the nvfp4_blackwell_n192 binding source; compile_flags select it.
+        "binding": "cake_quant_lora_gemm_aa5410d8a8acee43d949_binding.cu",
         "arches": ["sm_100a", "sm_103a"],
-        "compile_flags": _COMPILE_FLAGS_BLACKWELL,
+        "compile_flags": [
+            *_COMPILE_FLAGS_BLACKWELL,
+            "-DCAKE_QLG_PROGRAM_KERNEL=kernel_cake_quant_lora_gemm_90d64729259715a65e04",
+            "-DCAKE_QLG_PROGRAM_SHIM=cake_host_shim_f26d532da3f014db",
+            "-DCAKE_QLG_SMEM_BYTES=228992",
+            "-DCAKE_QLG_B_BOX_ROWS=128",
+        ],
         "ffi_entry": "run",
         "arg_plan": _ARG_PLAN_NVFP4_BLACKWELL_WIDE,
         "pdl": True,
