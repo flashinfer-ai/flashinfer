@@ -38,10 +38,15 @@ class CutlassFp8BlockScaleGemmRunnerInterface {
                     __nv_bfloat16* mat_d, int ld_d, int shape_m, int shape_n, int shape_k,
                     float const* scales_a, float const* scales_b, cudaStream_t stream) = 0;
 
+  /**
+   * @brief Execute grouped FP8 GEMMs with rows partitioned by problem_m_offsets.
+   * @param expected_m Expected tokens per expert for DeepGEMM configuration
+   * selection in this call, or -1 to use the runner's stored estimate.
+   */
   virtual void moeGemm(void* mat_d, void const* mat_a, void const* mat_b,
                        int64_t const* problem_m_offsets, size_t num_problems, size_t shape_n,
                        size_t shape_k, cudaStream_t stream, float const* scales_a = nullptr,
-                       float const* scales_b = nullptr) = 0;
+                       float const* scales_b = nullptr, int64_t expected_m = -1) = 0;
 
   virtual void strideBatchGemm(__nv_bfloat16* mat_d, int ld_d, int stride_d, __nv_fp8_e4m3* mat_a,
                                int ld_a, int stride_a, __nv_fp8_e4m3* mat_b, int ld_b, int stride_b,
@@ -88,9 +93,15 @@ class CutlassFp8BlockScaleGemmRunner : public CutlassFp8BlockScaleGemmRunnerInte
             __nv_bfloat16* mat_d, int ld_d, int shape_m, int shape_n, int shape_k,
             float const* scales_a, float const* scales_b, cudaStream_t stream) override;
 
+  /**
+   * @brief Run grouped FP8 expert GEMMs with optional input quantization.
+   * @param expected_m Per-call DeepGEMM token estimate, or -1 for the stored
+   * estimate. Explicit hints must be positive uint32 values and require DeepGEMM.
+   */
   void moeGemm(void* mat_d, void const* mat_a, void const* mat_b, int64_t const* problem_m_offsets,
                size_t num_problems, size_t shape_n, size_t shape_k, cudaStream_t stream,
-               float const* scales_a = nullptr, float const* scales_b = nullptr) override;
+               float const* scales_a = nullptr, float const* scales_b = nullptr,
+               int64_t expected_m = -1) override;
 
   void strideBatchGemm(__nv_bfloat16* mat_d, int ld_d, int stride_d, __nv_fp8_e4m3* mat_a, int ld_a,
                        int stride_a, __nv_fp8_e4m3* mat_b, int ld_b, int stride_b, int num_problems,

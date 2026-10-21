@@ -337,6 +337,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         << ", Output: " << DLDataTypeToString(mOutputDtype);
   }
 
+  /**
+   * @brief Validate tensor inputs, prepare workspace, and execute fused MoE.
+   * @param expected_m Expected tokens per local expert for both DeepSeek FP8 GEMMs;
+   * -1 uses the default estimate. Explicit hints require the OSS runner without
+   * minimum-latency mode and are validated before dispatch.
+   */
   void runMoe(TensorView output, TensorView input, TensorView token_selected_experts,
               Optional<TensorView> token_final_scales, TensorView fc1_expert_weights,
               Optional<TensorView> fc1_expert_biases, TensorView fc2_expert_weights,
@@ -349,9 +355,15 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
               int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
               Optional<Array<int64_t>> profile_ids, bool enable_pdl,
               ActivationType base_activation_type = ActivationType::Swiglu,
-              Optional<TensorView> workspace_buffer = Optional<TensorView>{}) {
+              Optional<TensorView> workspace_buffer = Optional<TensorView>{},
+              int64_t expected_m = -1) {
     std::lock_guard<std::mutex> lock(mMutex);
     ffi::CUDADeviceGuard device_guard(input.device().device_id);
+
+    TVM_FFI_ICHECK(expected_m == -1 || (expected_m > 0 && expected_m <= UINT32_MAX))
+        << "expected_m must be -1 or a positive uint32 value";
+    TVM_FFI_ICHECK(expected_m == -1 || (mUseDeepSeekFP8BlockScaling && !min_latency_mode))
+        << "expected_m requires DeepSeek FP8 block scaling without min-latency mode";
 
     TVM_FFI_ICHECK(cluster_size == 1 && cluster_rank == 0)
         << "smart_router is supported in min_latency mode";
@@ -483,8 +495,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace_ptr),
         output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
         enable_alltoall, use_lora, lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling,
-        min_latency_mode, min_latency_params, enable_pdl, stream);
+        min_latency_mode, min_latency_params, enable_pdl, stream, expected_m);
 #else
+    TVM_FFI_ICHECK_EQ(expected_m, -1) << "expected_m requires the OSS CUTLASS MoE runner";
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
         swizzled_input_sf, reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
@@ -778,6 +791,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   }
 
   const char* kind() const final { return "fused_moe_runner"; }
+  /** @brief Return a named MoE execution or profiling entry point for TVM FFI. */
   Optional<Function> GetFunction(const tvm::ffi::String& name) final {
     if (name == "run_gemm_profile") {
       return Function::FromTyped(
@@ -838,13 +852,15 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
                  int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
                  Optional<Array<int64_t>> profile_ids, bool enable_pdl,
-                 int64_t base_activation_type, Optional<TensorView> workspace_buffer) {
+                 int64_t base_activation_type, Optional<TensorView> workspace_buffer,
+                 int64_t expected_m) {
             runMoe(output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
                    fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
                    swiglu_alpha, swiglu_beta, swiglu_limit, clamped_relu2_limit, situ_beta,
                    situ_linear_beta, swizzled_input_sf, tp_size, tp_rank, ep_size, ep_rank,
                    cluster_size, cluster_rank, enable_alltoall, min_latency_mode, profile_ids,
-                   enable_pdl, static_cast<ActivationType>(base_activation_type), workspace_buffer);
+                   enable_pdl, static_cast<ActivationType>(base_activation_type), workspace_buffer,
+                   expected_m);
           });
     } else if (name == "run_moe_min_latency") {
       return Function::FromTyped(
