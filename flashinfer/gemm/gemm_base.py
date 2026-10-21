@@ -6388,7 +6388,10 @@ def _check_cute_dsl_availability():
 def _sm107_low_m_split_k(
     m: int, n: int, real_k: int, ab_dtype, split_k_kernel_cls, sm_count: int
 ) -> int:
-    """Most split-K slices that fit one wave with >= 8 K blocks per slice."""
+    """Most split-K slices that fill <= 3/4 of the SMs with >= 8 K blocks per slice.
+
+    A split that nearly fills the GPU (e.g. 4-way at N=6144) is slower than a 2-way one.
+    """
     tile_k = (
         split_k_kernel_cls.MMA_INST_BITS_K * split_k_kernel_cls.MMA_INST_TILE_K
     ) // ab_dtype.width
@@ -6397,7 +6400,7 @@ def _sm107_low_m_split_k(
         if (
             split_k_kernel_cls.is_valid_tactic(m, real_k, ab_dtype, slices)
             and real_k // (tile_k * slices) >= 8
-            and n_tiles * slices <= sm_count
+            and n_tiles * slices <= (3 * sm_count) // 4
         ):
             return slices
     return 1
@@ -6983,8 +6986,10 @@ def _cute_dsl_mxfp8_runners_sm107(
             warp = None
     tail = [warp] if warp is not None else []
     # Untuned, warp split-K goes first only while its default grid (32-wide
-    # output tiles, 16-wide if N % 32) fits one wave; past that it falls behind.
-    warp_grid_fits = n // (32 if n % 32 == 0 else 16) <= get_device_sm_count(a.device)
+    # output tiles, 16-wide if N % 32) fits two waves; past that it falls behind.
+    warp_grid_fits = n // (32 if n % 32 == 0 else 16) <= 2 * get_device_sm_count(
+        a.device
+    )
     if (
         warp is not None
         and warp.supports_inputs(inputs)
