@@ -13,10 +13,10 @@ PINNED_NUM_SMS = (148, 152)
 # Generated programs: one source pair per physical schedule, compiled for every
 # listed architecture with that architecture's exact flags.
 PROGRAMS: dict[str, dict[str, Any]] = {
-    "cake_deepgemm_batched_gemm_44b3db5dcd94945d6530": {
+    "cake_deepgemm_batched_gemm_1efd947b4839dee22567": {
         "sources": [
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_44b3db5dcd94945d6530_kernel.cu",
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_44b3db5dcd94945d6530_binding.cu",
+            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_1efd947b4839dee22567_kernel.cu",
+            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_1efd947b4839dee22567_binding.cu",
         ],
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -37,10 +37,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "compile_flags": [],
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_deepgemm_batched_gemm_4fed225332cf21378870": {
+    "cake_deepgemm_batched_gemm_6829670850e3066e93e7": {
         "sources": [
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_4fed225332cf21378870_kernel.cu",
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_4fed225332cf21378870_binding.cu",
+            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_6829670850e3066e93e7_kernel.cu",
+            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_6829670850e3066e93e7_binding.cu",
         ],
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -61,10 +61,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "compile_flags": [],
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_deepgemm_batched_gemm_9c78b5deea1e2a3f6d18": {
+    "cake_deepgemm_batched_gemm_987f610c37757ccda638": {
         "sources": [
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_9c78b5deea1e2a3f6d18_kernel.cu",
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_9c78b5deea1e2a3f6d18_binding.cu",
+            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_987f610c37757ccda638_kernel.cu",
+            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_987f610c37757ccda638_binding.cu",
         ],
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -85,10 +85,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "compile_flags": [],
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_deepgemm_batched_gemm_c1767ea2214a0b0df04b": {
+    "cake_deepgemm_batched_gemm_b2f37d6d976c59d38208": {
         "sources": [
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_c1767ea2214a0b0df04b_kernel.cu",
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_c1767ea2214a0b0df04b_binding.cu",
+            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_b2f37d6d976c59d38208_kernel.cu",
+            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_b2f37d6d976c59d38208_binding.cu",
         ],
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -109,10 +109,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "compile_flags": [],
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_deepgemm_batched_gemm_df7ac68be53c4ef83047": {
+    "cake_deepgemm_batched_gemm_b679291b28fffdcd58c0": {
         "sources": [
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_df7ac68be53c4ef83047_kernel.cu",
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_df7ac68be53c4ef83047_binding.cu",
+            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_b679291b28fffdcd58c0_kernel.cu",
+            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_b679291b28fffdcd58c0_binding.cu",
         ],
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -133,10 +133,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "compile_flags": [],
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_deepgemm_batched_gemm_ed2c9a5f2dfe74719dc3": {
+    "cake_deepgemm_batched_gemm_c23320671c92d0bbd890": {
         "sources": [
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_ed2c9a5f2dfe74719dc3_kernel.cu",
-            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_ed2c9a5f2dfe74719dc3_binding.cu",
+            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_c23320671c92d0bbd890_kernel.cu",
+            "experimental/deepgemm_batched_gemm/generated/cake_deepgemm_batched_gemm_c23320671c92d0bbd890_binding.cu",
         ],
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -160,12 +160,12 @@ PROGRAMS: dict[str, dict[str, Any]] = {
 }
 # Schedule key (route, tile, stage count, epilogue) -> program.
 ROUTES: dict[str, str] = {
-    "bf16_t128_bm64_bn128_s10_bf16": "cake_deepgemm_batched_gemm_c1767ea2214a0b0df04b",
-    "bf16_t4_bm16_bn128_s12_bf16": "cake_deepgemm_batched_gemm_df7ac68be53c4ef83047",
-    "general_bm128_bn128_s5_alpha": "cake_deepgemm_batched_gemm_ed2c9a5f2dfe74719dc3",
-    "n256_bm128_bn256_s5_fp8": "cake_deepgemm_batched_gemm_4fed225332cf21378870",
-    "swap_ab_bm16_bn128_s12_fp8": "cake_deepgemm_batched_gemm_44b3db5dcd94945d6530",
-    "swap_ab_bm64_bn128_s10_fp8": "cake_deepgemm_batched_gemm_9c78b5deea1e2a3f6d18",
+    "bf16_t128_bm64_bn128_s10_bf16": "cake_deepgemm_batched_gemm_987f610c37757ccda638",
+    "bf16_t4_bm16_bn128_s12_bf16": "cake_deepgemm_batched_gemm_c23320671c92d0bbd890",
+    "general_bm128_bn128_s5_alpha": "cake_deepgemm_batched_gemm_1efd947b4839dee22567",
+    "n256_bm128_bn256_s5_fp8": "cake_deepgemm_batched_gemm_b679291b28fffdcd58c0",
+    "swap_ab_bm16_bn128_s12_fp8": "cake_deepgemm_batched_gemm_b2f37d6d976c59d38208",
+    "swap_ab_bm64_bn128_s10_fp8": "cake_deepgemm_batched_gemm_6829670850e3066e93e7",
 }
 
 
@@ -412,8 +412,9 @@ class BatchedGemmPlan:
     ):
         import torch
 
-        # accepted for signature stability; tensor maps travel by value
-        del descriptor_workspace
+        del (
+            descriptor_workspace
+        )  # accepted for signature stability; tensor maps travel by value
 
         aq, asf = a
         bq, bsf = b

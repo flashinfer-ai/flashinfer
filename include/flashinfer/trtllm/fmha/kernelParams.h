@@ -660,10 +660,12 @@ struct KernelParams {
     return desc;
   }
 
-  // Setup the kernel parameters.
+  // Setup the kernel parameters. totalNumCtas is the launched CTA count when it can exceed the SM
+  // count (multi-wave KV split), else 0.
   template <class FmhaOptions_, class KernelMeta>
   static KernelParams setKernelParams(FmhaOptions_ const& options, KernelMeta const& kernelMeta,
-                                      int32_t maxNumCtasQ, int32_t maxNumCtasKv) {
+                                      int32_t maxNumCtasQ, int32_t maxNumCtasKv,
+                                      int32_t totalNumCtas) {
     // Create the return struct.
     KernelParams params;
     // Memset the kernel parameters to 0.
@@ -857,7 +859,10 @@ struct KernelParams {
     params.ptrAttentionSinks = options.ptrAttentionSinks;
 
     // The partial buffers' pointers when the multiCtasKv mode is enabled.
-    int64_t partialStatsBufferSize = options.mMultiProcessorCount * kernelMeta.mStepQ;
+    // Size the partial stats for every launched CTA when there are more CTAs than SMs.
+    int64_t partialStatsBufferSize =
+        static_cast<int64_t>(std::max(options.mMultiProcessorCount, totalNumCtas)) *
+        kernelMeta.mStepQ;
     params.ptrMultiCtasKvCounter = options.multiCtasKvCounterPtr;
     params.ptrPartialStats = reinterpret_cast<float2*>(options.multiCtasKvScratchPtr);
     params.ptrPartialO = params.ptrPartialStats + partialStatsBufferSize;

@@ -14,6 +14,11 @@
  * limitations under the License.
  */
 
+// Cake exporter output, hand-folded here pending exporter support: this one
+// source serves both the SM100 and the SM103 build of the program.  Every
+// region whose text differs between the two exports is wrapped in
+// `#if __CUDA_ARCH__ == 1000` (SM100 text) / `#else` (SM103 text) / `#endif`.
+
 // Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
 #include "cake_kimi_k3_vision_tower_device_common.cuh"
 
@@ -45,7 +50,11 @@
 #define SMEM_SMEM_O_STAGE_BYTES 16384
 #define SMEM_SMEM_O_STRIDE 16384
 #define SMEM_TOTAL 216064
+#if __CUDA_ARCH__ == 1000
+#define USE_TMEM_LD_RED 0
+#else
 #define USE_TMEM_LD_RED 1
+#endif
 #define BLOCK_M 128
 #define BLOCK_N 128
 #define HEAD_DIM 128
@@ -253,19 +262,42 @@ kernel_cake_kimi_k3_vision_tower_153c43aa8701296c68b2(const __grid_constant__ CU
                     float sv[128];
                     float tile_max = -CAKE_INF;
                     {
+#if __CUDA_ARCH__ == 1000
+                        asm volatile(
+                            "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                            : "=f"(sv[0]), "=f"(sv[1]), "=f"(sv[2]), "=f"(sv[3]), "=f"(sv[4]), "=f"(sv[5]), "=f"(sv[6]), "=f"(sv[7]), "=f"(sv[8]), "=f"(sv[9]), "=f"(sv[10]), "=f"(sv[11]), "=f"(sv[12]), "=f"(sv[13]), "=f"(sv[14]), "=f"(sv[15]), "=f"(sv[16]), "=f"(sv[17]), "=f"(sv[18]), "=f"(sv[19]), "=f"(sv[20]), "=f"(sv[21]), "=f"(sv[22]), "=f"(sv[23]), "=f"(sv[24]), "=f"(sv[25]), "=f"(sv[26]), "=f"(sv[27]), "=f"(sv[28]), "=f"(sv[29]), "=f"(sv[30]), "=f"(sv[31])
+                            : "r"(s_addr));
+                        asm volatile(
+                            "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                            : "=f"(sv[32]), "=f"(sv[33]), "=f"(sv[34]), "=f"(sv[35]), "=f"(sv[36]), "=f"(sv[37]), "=f"(sv[38]), "=f"(sv[39]), "=f"(sv[40]), "=f"(sv[41]), "=f"(sv[42]), "=f"(sv[43]), "=f"(sv[44]), "=f"(sv[45]), "=f"(sv[46]), "=f"(sv[47]), "=f"(sv[48]), "=f"(sv[49]), "=f"(sv[50]), "=f"(sv[51]), "=f"(sv[52]), "=f"(sv[53]), "=f"(sv[54]), "=f"(sv[55]), "=f"(sv[56]), "=f"(sv[57]), "=f"(sv[58]), "=f"(sv[59]), "=f"(sv[60]), "=f"(sv[61]), "=f"(sv[62]), "=f"(sv[63])
+                            : "r"(s_addr + 32));
+                        asm volatile(
+                            "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                            : "=f"(sv[64]), "=f"(sv[65]), "=f"(sv[66]), "=f"(sv[67]), "=f"(sv[68]), "=f"(sv[69]), "=f"(sv[70]), "=f"(sv[71]), "=f"(sv[72]), "=f"(sv[73]), "=f"(sv[74]), "=f"(sv[75]), "=f"(sv[76]), "=f"(sv[77]), "=f"(sv[78]), "=f"(sv[79]), "=f"(sv[80]), "=f"(sv[81]), "=f"(sv[82]), "=f"(sv[83]), "=f"(sv[84]), "=f"(sv[85]), "=f"(sv[86]), "=f"(sv[87]), "=f"(sv[88]), "=f"(sv[89]), "=f"(sv[90]), "=f"(sv[91]), "=f"(sv[92]), "=f"(sv[93]), "=f"(sv[94]), "=f"(sv[95])
+                            : "r"(s_addr + 64));
+                        asm volatile(
+                            "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                            : "=f"(sv[96]), "=f"(sv[97]), "=f"(sv[98]), "=f"(sv[99]), "=f"(sv[100]), "=f"(sv[101]), "=f"(sv[102]), "=f"(sv[103]), "=f"(sv[104]), "=f"(sv[105]), "=f"(sv[106]), "=f"(sv[107]), "=f"(sv[108]), "=f"(sv[109]), "=f"(sv[110]), "=f"(sv[111]), "=f"(sv[112]), "=f"(sv[113]), "=f"(sv[114]), "=f"(sv[115]), "=f"(sv[116]), "=f"(sv[117]), "=f"(sv[118]), "=f"(sv[119]), "=f"(sv[120]), "=f"(sv[121]), "=f"(sv[122]), "=f"(sv[123]), "=f"(sv[124]), "=f"(sv[125]), "=f"(sv[126]), "=f"(sv[127])
+                            : "r"(s_addr + 96));
+                        float2 _reg_reduce_max2_0 = {-CAKE_INF, -CAKE_INF};
+                        row_max_x32_accum(&sv[0], _reg_reduce_max2_0);
+                        row_max_x32_accum(&sv[32], _reg_reduce_max2_0);
+                        row_max_x32_accum(&sv[64], _reg_reduce_max2_0);
+                        row_max_x32_accum(&sv[96], _reg_reduce_max2_0);
+                        float sv_max = row_max_reduce(_reg_reduce_max2_0);
+                        tile_max = sv_max;
+#else
                         float tile_max_lo = -CAKE_INF;
                         float tile_max_hi = -CAKE_INF;
-                        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
-                        #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
-                        #endif
                         asm volatile(
                             "tcgen05.ld.red.sync.aligned.32x32b.x64.max.f32"
                             " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %64, [%65];"
                             : "=f"(sv[0]), "=f"(sv[1]), "=f"(sv[2]), "=f"(sv[3]), "=f"(sv[4]), "=f"(sv[5]), "=f"(sv[6]), "=f"(sv[7]), "=f"(sv[8]), "=f"(sv[9]), "=f"(sv[10]), "=f"(sv[11]), "=f"(sv[12]), "=f"(sv[13]), "=f"(sv[14]), "=f"(sv[15]), "=f"(sv[16]), "=f"(sv[17]), "=f"(sv[18]), "=f"(sv[19]), "=f"(sv[20]), "=f"(sv[21]), "=f"(sv[22]), "=f"(sv[23]), "=f"(sv[24]), "=f"(sv[25]), "=f"(sv[26]), "=f"(sv[27]), "=f"(sv[28]), "=f"(sv[29]), "=f"(sv[30]), "=f"(sv[31]), "=f"(sv[32]), "=f"(sv[33]), "=f"(sv[34]), "=f"(sv[35]), "=f"(sv[36]), "=f"(sv[37]), "=f"(sv[38]), "=f"(sv[39]), "=f"(sv[40]), "=f"(sv[41]), "=f"(sv[42]), "=f"(sv[43]), "=f"(sv[44]), "=f"(sv[45]), "=f"(sv[46]), "=f"(sv[47]), "=f"(sv[48]), "=f"(sv[49]), "=f"(sv[50]), "=f"(sv[51]), "=f"(sv[52]), "=f"(sv[53]), "=f"(sv[54]), "=f"(sv[55]), "=f"(sv[56]), "=f"(sv[57]), "=f"(sv[58]), "=f"(sv[59]), "=f"(sv[60]), "=f"(sv[61]), "=f"(sv[62]), "=f"(sv[63]), "=f"(tile_max_lo)
                             : "r"((unsigned int)tmem_scores + stage * 128 + (unsigned int)(warp % 4 * 32 << 16)));
-                        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
-                        #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
-                        #endif
                         asm volatile(
                             "tcgen05.ld.red.sync.aligned.32x32b.x64.max.f32"
                             " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %64, [%65];"
@@ -274,20 +306,31 @@ kernel_cake_kimi_k3_vision_tower_153c43aa8701296c68b2(const __grid_constant__ CU
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
                         float _max_0 = max_noftz(tile_max_lo, tile_max_hi);
                         tile_max = _max_0;
+#endif
                     }
                     int tail_valid = u_len - n_block * BLOCK_N;
                     if (tail_valid < BLOCK_N) {
                         uint32_t _slice_lo_mask_0;
                         {
+#if __CUDA_ARCH__ == 1000
+                            int _lim_1 = tail_valid;
+                            if (_lim_1 <= 0) { _slice_lo_mask_0 = 0u; }
+                            else if (_lim_1 >= 32) { _slice_lo_mask_0 = 0xFFFFFFFFu; }
+#else
                             int _lim_0 = tail_valid;
                             if (_lim_0 <= 0) { _slice_lo_mask_0 = 0u; }
                             else if (_lim_0 >= 32) { _slice_lo_mask_0 = 0xFFFFFFFFu; }
+#endif
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
+#if __CUDA_ARCH__ == 1000
+                                    "}" : "=r"(_slice_lo_mask_0) : "r"(_lim_1));
+#else
                                     "}" : "=r"(_slice_lo_mask_0) : "r"(_lim_0));
+#endif
                             }
                         }
                         if (!(_slice_lo_mask_0 & (1u << 0))) sv[0] = -CAKE_INF;
@@ -324,15 +367,25 @@ kernel_cake_kimi_k3_vision_tower_153c43aa8701296c68b2(const __grid_constant__ CU
                         if (!(_slice_lo_mask_0 & (1u << 31))) sv[31] = -CAKE_INF;
                         uint32_t _slice_lo_mask_1;
                         {
+#if __CUDA_ARCH__ == 1000
+                            int _lim_2 = tail_valid - 32;
+                            if (_lim_2 <= 0) { _slice_lo_mask_1 = 0u; }
+                            else if (_lim_2 >= 32) { _slice_lo_mask_1 = 0xFFFFFFFFu; }
+#else
                             int _lim_1 = tail_valid - 32;
                             if (_lim_1 <= 0) { _slice_lo_mask_1 = 0u; }
                             else if (_lim_1 >= 32) { _slice_lo_mask_1 = 0xFFFFFFFFu; }
+#endif
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
+#if __CUDA_ARCH__ == 1000
+                                    "}" : "=r"(_slice_lo_mask_1) : "r"(_lim_2));
+#else
                                     "}" : "=r"(_slice_lo_mask_1) : "r"(_lim_1));
+#endif
                             }
                         }
                         if (!(_slice_lo_mask_1 & (1u << 0))) sv[32] = -CAKE_INF;
@@ -369,15 +422,25 @@ kernel_cake_kimi_k3_vision_tower_153c43aa8701296c68b2(const __grid_constant__ CU
                         if (!(_slice_lo_mask_1 & (1u << 31))) sv[63] = -CAKE_INF;
                         uint32_t _slice_lo_mask_2;
                         {
+#if __CUDA_ARCH__ == 1000
+                            int _lim_3 = tail_valid - 64;
+                            if (_lim_3 <= 0) { _slice_lo_mask_2 = 0u; }
+                            else if (_lim_3 >= 32) { _slice_lo_mask_2 = 0xFFFFFFFFu; }
+#else
                             int _lim_2 = tail_valid - 64;
                             if (_lim_2 <= 0) { _slice_lo_mask_2 = 0u; }
                             else if (_lim_2 >= 32) { _slice_lo_mask_2 = 0xFFFFFFFFu; }
+#endif
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
+#if __CUDA_ARCH__ == 1000
+                                    "}" : "=r"(_slice_lo_mask_2) : "r"(_lim_3));
+#else
                                     "}" : "=r"(_slice_lo_mask_2) : "r"(_lim_2));
+#endif
                             }
                         }
                         if (!(_slice_lo_mask_2 & (1u << 0))) sv[64] = -CAKE_INF;
@@ -414,15 +477,25 @@ kernel_cake_kimi_k3_vision_tower_153c43aa8701296c68b2(const __grid_constant__ CU
                         if (!(_slice_lo_mask_2 & (1u << 31))) sv[95] = -CAKE_INF;
                         uint32_t _slice_lo_mask_3;
                         {
+#if __CUDA_ARCH__ == 1000
+                            int _lim_4 = tail_valid - 96;
+                            if (_lim_4 <= 0) { _slice_lo_mask_3 = 0u; }
+                            else if (_lim_4 >= 32) { _slice_lo_mask_3 = 0xFFFFFFFFu; }
+#else
                             int _lim_3 = tail_valid - 96;
                             if (_lim_3 <= 0) { _slice_lo_mask_3 = 0u; }
                             else if (_lim_3 >= 32) { _slice_lo_mask_3 = 0xFFFFFFFFu; }
+#endif
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
+#if __CUDA_ARCH__ == 1000
+                                    "}" : "=r"(_slice_lo_mask_3) : "r"(_lim_4));
+#else
                                     "}" : "=r"(_slice_lo_mask_3) : "r"(_lim_3));
+#endif
                             }
                         }
                         if (!(_slice_lo_mask_3 & (1u << 0))) sv[96] = -CAKE_INF;
@@ -457,6 +530,15 @@ kernel_cake_kimi_k3_vision_tower_153c43aa8701296c68b2(const __grid_constant__ CU
                         if (!(_slice_lo_mask_3 & (1u << 29))) sv[125] = -CAKE_INF;
                         if (!(_slice_lo_mask_3 & (1u << 30))) sv[126] = -CAKE_INF;
                         if (!(_slice_lo_mask_3 & (1u << 31))) sv[127] = -CAKE_INF;
+#if __CUDA_ARCH__ == 1000
+                        float2 _reg_reduce_max2_5 = {-CAKE_INF, -CAKE_INF};
+                        row_max_x32_accum(&sv[0], _reg_reduce_max2_5);
+                        row_max_x32_accum(&sv[32], _reg_reduce_max2_5);
+                        row_max_x32_accum(&sv[64], _reg_reduce_max2_5);
+                        row_max_x32_accum(&sv[96], _reg_reduce_max2_5);
+                        float sv_max_1 = row_max_reduce(_reg_reduce_max2_5);
+                        tile_max = sv_max_1;
+#else
                         float2 _reg_reduce_max2_4 = {-CAKE_INF, -CAKE_INF};
                         row_max_x32_accum(&sv[0], _reg_reduce_max2_4);
                         row_max_x32_accum(&sv[32], _reg_reduce_max2_4);
@@ -464,6 +546,7 @@ kernel_cake_kimi_k3_vision_tower_153c43aa8701296c68b2(const __grid_constant__ CU
                         row_max_x32_accum(&sv[96], _reg_reduce_max2_4);
                         float sv_max = row_max_reduce(_reg_reduce_max2_4);
                         tile_max = sv_max;
+#endif
                     }
                     float _max_1 = max_noftz(tile_max, row_max);
                     float new_max = _max_1;
@@ -472,6 +555,33 @@ kernel_cake_kimi_k3_vision_tower_153c43aa8701296c68b2(const __grid_constant__ CU
                     float _fma_0 = __fmaf_rn(row_max, softmax_scale_log2, -new_max_scaled);
                     float acc_scale_log2 = _fma_0;
                     float acc_scale;
+#if __CUDA_ARCH__ == 1000
+                    if (acc_scale_log2 >= -4.0f) {
+                        safe_max = ((row_max == -CAKE_INF) ? 0.0f : row_max);
+                        acc_scale = 1.0f;
+                        new_max_scaled = safe_max * softmax_scale_log2;
+                    } else {
+                        float _exp2_0 = approx_exp2(acc_scale_log2);
+                        acc_scale = ((row_max > -CAKE_INF) ? _exp2_0 : 1.0f);
+                        row_max = new_max;
+                    }
+                    const float2 _fma_b2_6 = {softmax_scale_log2, softmax_scale_log2};
+                    const float2 _fma_c2_7 = {-new_max_scaled, -new_max_scaled};
+                    #pragma unroll
+                    for (int _lf = 0; _lf < 8; _lf++)
+                        fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 0))[_lf], _fma_b2_6, _fma_c2_7);
+                    #pragma unroll
+                    for (int _le = 0; _le < 1; _le++) {
+                        if (1 && _le >= 0) {
+                            float2 _exp2_pair_8 = ex2_emulation_f32x2_value(make_float2(sv[_le*2], sv[_le*2 + 1]));
+                            sv[_le*2] = _exp2_pair_8.x;
+                            sv[_le*2 + 1] = _exp2_pair_8.y;
+                        } else {
+                            sv[_le*2] = approx_exp2(sv[_le*2]);
+                            sv[_le*2 + 1] = approx_exp2(sv[_le*2 + 1]);
+                        }
+                    }
+#else
                     if (acc_scale_log2 >= -8.0f) {
                         safe_max = ((row_max == -CAKE_INF) ? 0.0f : row_max);
                         acc_scale = 1.0f;
@@ -497,6 +607,7 @@ kernel_cake_kimi_k3_vision_tower_153c43aa8701296c68b2(const __grid_constant__ CU
                             sv[_le*2 + 1] = approx_exp2(sv[_le*2 + 1]);
                         }
                     }
+#endif
                     sv[2] = approx_exp2(sv[2]);
                     float scale_value[1];
                     scale_value[0] = acc_scale;
@@ -508,6 +619,36 @@ kernel_cake_kimi_k3_vision_tower_153c43aa8701296c68b2(const __grid_constant__ CU
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive(scale_full_addr + (stage) * 8);
+#if __CUDA_ARCH__ == 1000
+                    #pragma unroll
+                    for (int _le = 0; _le < 6; _le++) {
+                        if (1 && _le >= 4) {
+                            float2 _exp2_pair_9 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 3], sv[_le*2 + 1 + 3]));
+                            sv[_le*2 + 3] = _exp2_pair_9.x;
+                            sv[_le*2 + 1 + 3] = _exp2_pair_9.y;
+                        } else {
+                            sv[_le*2 + 3] = approx_exp2(sv[_le*2 + 3]);
+                            sv[_le*2 + 1 + 3] = approx_exp2(sv[_le*2 + 1 + 3]);
+                        }
+                    }
+                    sv[15] = approx_exp2(sv[15]);
+                    const float2 _fma_b2_10 = {softmax_scale_log2, softmax_scale_log2};
+                    const float2 _fma_c2_11 = {-new_max_scaled, -new_max_scaled};
+                    #pragma unroll
+                    for (int _lf = 0; _lf < 56; _lf++)
+                        fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 16))[_lf], _fma_b2_10, _fma_c2_11);
+                    #pragma unroll
+                    for (int _le = 0; _le < 56; _le++) {
+                        if (1 && _le >= 42) {
+                            float2 _exp2_pair_12 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 16], sv[_le*2 + 1 + 16]));
+                            sv[_le*2 + 16] = _exp2_pair_12.x;
+                            sv[_le*2 + 1 + 16] = _exp2_pair_12.y;
+                        } else {
+                            sv[_le*2 + 16] = approx_exp2(sv[_le*2 + 16]);
+                            sv[_le*2 + 1 + 16] = approx_exp2(sv[_le*2 + 1 + 16]);
+                        }
+                    }
+#else
                     #pragma unroll
                     for (int _le = 0; _le < 13; _le++) {
                         sv[_le + 3] = approx_exp2(sv[_le + 3]);
@@ -521,6 +662,7 @@ kernel_cake_kimi_k3_vision_tower_153c43aa8701296c68b2(const __grid_constant__ CU
                     for (int _le = 0; _le < 112; _le++) {
                         sv[_le + 16] = approx_exp2(sv[_le + 16]);
                     }
+#endif
                     int p_addr = taddr + (unsigned int)tmem_p_off + (unsigned int)(warp % 4 * 32 << 16);
                     float2 _f2_0 = make_float2(sv[0], sv[1]);
                     float2 partial = _f2_0;

@@ -727,6 +727,28 @@ def test_reload_converges_ranks_on_store_state(cache_root, monkeypatch):
     assert calls == []  # reload never re-profiles
 
 
+def test_reload_discards_tactic_shortlist_before_retuning(cache_root, monkeypatch):
+    """A new tuning pass after reload must not reuse a pre-reload shortlist."""
+    from flashinfer.autotune_cache import autotune_v2_reload
+
+    tuner = AutoTuner.get()
+    runners, inputs = [DummyRunner()], [torch.zeros(8, 16)]
+    _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+    with autotune_v2():
+        assert tuner.rank_tactics(_OP, runners, _CONFIG, inputs, k=2) == [1, 2]
+
+    calls = _install_fake_profile(monkeypatch, times={0: 1.0, 1: 2.0, 2: 3.0})
+    with autotune_v2():
+        assert tuner.rank_tactics(_OP, runners, _CONFIG, inputs, k=2) == [1, 2]
+    assert calls == []
+
+    autotune_v2_reload()
+    assert calls == []  # Reload itself does not profile.
+    with autotune_v2():
+        assert tuner.rank_tactics(_OP, runners, _CONFIG, inputs, k=2) == [0, 1]
+    assert calls == [0, 1, 2]
+
+
 def test_reload_rehydrates_store_into_memory(cache_root, monkeypatch):
     """autotune_v2_reload() bulk re-hydrates the attached store's final
     state at reload time, so post-reload serving is warm from memory (no

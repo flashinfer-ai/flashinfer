@@ -24,6 +24,7 @@ torch reference on the Blackwell datacenter parts, where the cache is consumed b
 import pytest
 import torch
 
+from flashinfer.jit.cpp_ext import get_cuda_version, is_cuda_version_at_least
 from flashinfer.mla import (
     nvfp4_quantize_append_sparse_mla_cache,
     nvfp4_quantize_pack_sparse_mla_cache,
@@ -133,6 +134,7 @@ _SM_SCALE = _HEAD_DIM**-0.5
 # route; the kernel quantizes P to NVFP4 and V^T to NVFP4 (fp32 softmax /
 # accumulation) while the reference uses the exact dequantized cache and the
 # NVFP4-rounded query.
+_CAKE_MIN_CUDA = "13.4"
 _OUT_ATOL = _OUT_RTOL = 5e-2
 _LSE_ATOL = 2e-2
 
@@ -144,6 +146,14 @@ def _require_cake_arch() -> None:
     if tuple(cc) not in _CAKE_CCS:
         pytest.skip(
             f"backend='cake' NVFP4 decode needs SM100/SM103, got SM{cc[0]}{cc[1]}"
+        )
+    if not is_cuda_version_at_least(_CAKE_MIN_CUDA):
+        # The generated kernels spell the Blackwell QMUL4 as the PTX ISA 9.4 packed
+        # multiply (mul.e4m3x4.e2m1x4); older nvcc/ptxas cannot assemble them and the
+        # loader refuses the build by name (see flashinfer.jit.cake_dsv4).
+        pytest.skip(
+            f"backend='cake' NVFP4 decode needs CUDA {_CAKE_MIN_CUDA} or newer, "
+            f"got {get_cuda_version()}"
         )
 
 

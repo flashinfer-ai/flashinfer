@@ -607,7 +607,7 @@ def allreduce_fusion(
     ----------
     input : torch.Tensor
         Input tensor of shape ``[token_num, hidden_dim]`` for standard
-        allreduce patterns. For ``kMoEFinalizeARResidualRMSNorm``, this is
+        allreduce patterns. For the MoE finalize patterns (7 and 12), this is
         the permuted/padded MoE expert output of shape
         ``[num_permuted_rows, hidden_dim]``; the token output shape is
         determined by ``residual_in``.
@@ -629,6 +629,7 @@ def allreduce_fusion(
         * ``kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9`` (TRT-LLM only)
         * ``kARResidualRMSNormDynamicFP8Quant = 10``
         * ``kARResidualRMSNormOutDynamicFP8Quant = 11``
+        * ``kMoEFinalizeARResidualRMSNormFP8Quant = 12`` (MNNVL CuTe DSL only)
 
         MNNVL supports the standard FP8/NVFP4 quant patterns (2-5) and
         dynamic FP8 patterns (10-11). Packed group quant patterns remain
@@ -636,6 +637,14 @@ def allreduce_fusion(
 
         ``kMoEFinalizeARResidualRMSNorm`` is available through TRT-LLM,
         Cake on a TRT-LLM workspace, and the explicit MNNVL CuTe DSL backend.
+
+        The MNNVL CuTe DSL backend supports static per-tensor E4M3 output
+        through patterns 2, 4 and 12 on a workspace constructed with
+        ``output_dtype=torch.float8_e4m3fn``. Patterns 2 and 12 require the
+        workspace's ``write_norm_output=False``; pattern 4 requires ``True``
+        and a caller-provided ``norm_out``. Patterns 1 and 7 require a BF16
+        workspace, so pattern 7 returns BF16 ``norm_out`` on every backend.
+        Communication and residual outputs stay BF16.
     launch_with_pdl : bool
         Use Programmatic Dependent Launch. MNNVL CuTe DSL presets determine
         their compiled PDL mode and warn when it differs from this value.
@@ -670,6 +679,13 @@ def allreduce_fusion(
         RMSNorm epsilon for numerical stability.
     scale_factor : Optional[Union[torch.Tensor, float]]
         Output scale used by FP8/NVFP4 quantization.
+        On the MNNVL CuTe DSL backend the static FP8 path computes
+        ``quant_out = FP8(norm_bf16 * (1 / scale))`` with a saturating E4M3
+        conversion. It accepts a Python float or a one-element tensor (cast
+        to FP32 on the input's device); the value must be positive, finite
+        and identical across ranks. An FP32 device tensor is read on the GPU
+        and is used in place, so it may be updated between CUDA Graph replays.
+        No per-token scale estimation or ``scale_out`` is used.
     layout_code : Optional[int]
         NVFP4 scale-factor layout (``QuantizationSFLayout``). MNNVL
         supports ``SWIZZLED_128x4`` and ``LINEAR``; ``SWIZZLED_8x4``
@@ -694,8 +710,8 @@ def allreduce_fusion(
         ``[token_num, hidden_dim]``.
     expanded_idx_to_permuted_idx : Optional[torch.Tensor]
         Mapping from ``(token, topk_idx)`` to permuted expert output row.
-        Shape ``[token_num, top_k]``, dtype ``int32``. Required for
-        ``pattern=kMoEFinalizeARResidualRMSNorm``.
+        Shape ``[token_num, top_k]``, dtype ``int32``. Required for the MoE
+        finalize patterns (7 and 12).
     expert_scale_factor : Optional[torch.Tensor]
         Router weights for each selected expert, shape
         ``[token_num, top_k]``.
@@ -725,7 +741,9 @@ def allreduce_fusion(
     torch.Tensor
         Output tensor for the selected pattern. Quant patterns return
         ``quant_out``, RMSNorm patterns return ``norm_out``, and
-        ``kAllReduce`` returns ``output``.
+        ``kAllReduce`` returns ``output``. ``kMoEFinalizeARResidualRMSNorm``
+        returns ``norm_out`` and ``kMoEFinalizeARResidualRMSNormFP8Quant``
+        returns ``quant_out``.
 
     Examples
     --------
@@ -763,6 +781,12 @@ def allreduce_fusion(
             for handle in workspace.mem_handles
         ):
             raise RuntimeError("TRT-LLM symmetric-memory handles are not attached")
+
+        if pattern == AllReduceFusionPattern.kMoEFinalizeARResidualRMSNormFP8Quant:
+            raise ValueError(
+                "kMoEFinalizeARResidualRMSNormFP8Quant requires an "
+                "MNNVLCuteDSLAllReduceFusionWorkspace with FP8 output"
+            )
 
         # ---- MOE Reduction pattern ----
         if pattern == AllReduceFusionPattern.kMoEReductionARResidualRMSNorm:

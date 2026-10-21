@@ -244,6 +244,8 @@ kernel_gdn_decode_pretranspose_t4_bf16state_tile16(__nv_bfloat16* __restrict__ q
     smem = make_warp_uniform(smem);
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1070
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 #elif defined(__CUDA_ARCH__)
 #error "unsupported architecture for the Cake GDN decode kernel"
 #endif

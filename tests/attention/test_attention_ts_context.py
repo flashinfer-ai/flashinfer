@@ -37,6 +37,7 @@ from cutlass import BFloat16, Float16, Float32, Float8E4M3FN
 from cutlass.experimental.task_scheduling.enums import TileSchedulerType
 
 import flashinfer.attention.prims_ts.context as context_module
+from flashinfer.attention.prims_ts.kernels import tcgen05_compat
 from flashinfer.attention.prims_ts import (
     BatchPrefillPagedTSWrapper,
     BatchPrefillTSWrapper,
@@ -2442,7 +2443,7 @@ def test_attention_ts_context_uses_ldtm_stat_default_is_off():
 def test_attention_ts_context_uses_ldtm_stat_default_follows_gpu():
     """Context attention enables LDTM.STAT on B300 (SM103) and Rubin (SM107)."""
     expected = (
-        context_module._dsl_supports_ldtm_stat()
+        tcgen05_compat.dsl_supports_ldtm_stat()
         and torch.cuda.get_device_capability() in ((10, 3), (10, 7))
     )
     if torch.cuda.get_device_capability() == (10, 7):
@@ -2821,7 +2822,6 @@ def test_attention_ts_context_d256_uniform_paged_static_scheduler_is_safe(
                 exhaustive_deadlock_race_check=True,
             )
         )
-
     tasks = {task.name: task for task in task_manager.tasks}
     epilogue_padding_task = tasks["EpiloguePaddingTask"]
     page_offsets_task = tasks["PageTableTask"]
@@ -3989,6 +3989,63 @@ def test_attention_ts_context_packed_dense_k_bounds_exclude_peer_requests():
         rtol=0.0,
         atol=1e-3,
     )
+
+
+@pytest.mark.parametrize("paged", (False, True), ids=("contiguous", "paged"))
+@pytest.mark.parametrize("window_left", (-1, 31), ids=("causal", "sliding-window"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_packed_query_tails(paged: bool, window_left: int) -> None:
+    """Partial packed Q tiles stay correct in eager launches and graph replay."""
+
+    # Cover a tile crossing into the next request, a partial second tile,
+    # and a final tile extending beyond the packed allocation.
+    case_args = dict(
+        q_lengths=(3, 130, 1),
+        k_lengths=(33, 160, 17),
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        mask_type="causal",
+        window_left=window_left,
+        output_dtype=torch.bfloat16,
+        output_scale=1.0,
+        seed=2026101401,
+    )
+    metadata = None
+    if paged:
+        case = _make_paged_context_case(qk_dtype=torch.bfloat16, **case_args)
+        reference = case.reference
+        wrapper = BatchPrefillPagedTSWrapper()
+        metadata = _plan_paged_wrapper(wrapper, case)
+        actual = _run_paged_wrapper(wrapper, case, metadata)
+        q, k, v = reference.q, case.k_cache, case.v_cache
+    else:
+        reference = _make_context_case(
+            qkv_dtype=torch.bfloat16, packed=True, **case_args
+        )
+        wrapper = BatchPrefillTSWrapper()
+        _plan_wrapper(wrapper, reference)
+        actual = _run_wrapper(wrapper, reference)
+        q, k, v = reference.q, reference.k, reference.v
+    _assert_context_correct(actual, reference)
+
+    graph_out = torch.full_like(q, float("nan"), dtype=reference.output_dtype)
+    graph = _capture_context_graph(
+        wrapper,
+        q,
+        k,
+        v,
+        graph_out,
+        metadata,
+        qo_indptr=reference.qo_indptr,
+        kv_indptr=reference.kv_indptr,
+    )
+    q.neg_()
+    graph_out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_context_correct(graph_out, reference)
 
 
 @pytest.mark.arch_blackwell
@@ -5405,14 +5462,18 @@ def test_attention_ts_context_mla_prefill(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("pv_dtype", (torch.bfloat16, _FP8), ids=("pv-bf16", "pv-fp8"))
+@pytest.mark.parametrize(
+    "qk_dtype,pv_dtype",
+    ((torch.bfloat16, torch.bfloat16), (torch.bfloat16, _FP8), (_FP8, _FP8)),
+    ids=("pv-bf16", "pv-fp8", "qkv-fp8"),
+)
 @pytest.mark.parametrize(
     "num_qo_heads,num_kv_heads", ((2, 2), (4, 2), (3, 1)), ids=("mha", "gqa2", "gqa3")
 )
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_two_cta_matches_single_cta(
-    monkeypatch, pv_dtype, num_qo_heads, num_kv_heads
+    monkeypatch, qk_dtype, pv_dtype, num_qo_heads, num_kv_heads
 ):
     """The paired kernel reproduces the single-CTA kernel and the reference.
 
@@ -5429,14 +5490,14 @@ def test_attention_ts_context_two_cta_matches_single_cta(
         k_lengths=(8200, 8200),
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
-        qkv_dtype=torch.bfloat16,
+        qkv_dtype=qk_dtype,
         packed=False,
         mask_type="dense",
         output_dtype=torch.bfloat16,
         output_scale=1.0,
         seed=2026092201,
     )
-    if pv_dtype is _FP8:
+    if pv_dtype is _FP8 and case.v.dtype is not _FP8:
         case = replace(case, v=case.v.to(_FP8))
 
     monkeypatch.setattr(

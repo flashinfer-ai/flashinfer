@@ -117,6 +117,36 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
             overrides=self._knob_overrides(fleet_params),
         )
 
+    supports_live_token_tuning = True
+    _knob_cache_module = (
+        "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.knob_cache"
+    )
+
+    def _tuning_key(self, fleet_params: FleetParams) -> dict:
+        k = self._kernel_config
+        return dict(
+            dtype="nvfp4",
+            world_size=self.ep_world_size,
+            hidden=fleet_params.token_hidden_size,
+            intermediate=k.intermediate_size,
+            num_experts=fleet_params.num_experts,
+            topk=k.top_k,
+            max_tokens=fleet_params.max_tokens_per_rank,
+            allow_nondeterministic=k.in_kernel_fc2_reduce,
+            apply_topk_at_fc1=k.apply_topk_in_fc1,
+            activation=k.activation,
+            kernel_variant=k.kernel_variant,
+            combine_dtype=k.combine_dtype,
+            situ_beta=k.situ_beta,
+            situ_linear_beta=k.situ_linear_beta,
+            gate_up_clamp=k.gate_up_clamp,
+        )
+
+    def live_token_buckets(self, fleet_params: FleetParams) -> list[int]:
+        if self._kernel_config.knobs != "cache":
+            return []
+        return super().live_token_buckets(fleet_params)
+
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
         from ......kernel_src.sm107.next_cutedsl_megamoe import (
             Sm107BlockScaledSymmBuffer,
@@ -133,7 +163,7 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         supported on the engine path — the SM107 session bakes knobs at
         construction; tune offline with ``python -m flashinfer.moe_ep.tune``.
         """
-        from ......kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS, resolve_knobs
+        from ......kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
 
         k = self._kernel_config
         if k.knobs is None:
@@ -147,23 +177,9 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
                 )
             return dict(k.knobs)
         if k.knobs == "cache":
-            knobs, source = resolve_knobs(
-                dtype="nvfp4",
-                world_size=self.ep_world_size,
-                hidden=fleet_params.token_hidden_size,
-                intermediate=k.intermediate_size,
-                num_experts=fleet_params.num_experts,
-                topk=k.top_k,
-                max_tokens=fleet_params.max_tokens_per_rank,
-                allow_nondeterministic=k.in_kernel_fc2_reduce,
-                apply_topk_at_fc1=k.apply_topk_in_fc1,
-                activation=k.activation,
-                kernel_variant=k.kernel_variant,
-                combine_dtype=k.combine_dtype,
-                situ_beta=k.situ_beta,
-                situ_linear_beta=k.situ_linear_beta,
-                gate_up_clamp=k.gate_up_clamp,
-            )
+            knobs = self._workspace_knobs(fleet_params)
+            assert knobs is not None
+            source = "offline cache or heuristic"
             if self.ep_rank == 0:
                 print(
                     f"[{self.kernel_name()}] knobs='cache' resolved via "
@@ -213,14 +229,12 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
         validate_routing_values(
-            t.topk_ids, t.topk_weights, workspace.config.num_total_experts
+            t.topk_ids,
+            t.topk_weights,
+            workspace.config.num_total_experts,
+            workspace=workspace,
         )
-        for name, value in self._scalar_values(t).items():
-            target = getattr(workspace, name)
-            if value is None:
-                target.fill_(1.0)
-            else:
-                target.copy_(value)
+        self._stage_scalars(t, workspace)
         if quantize_input:
             staged = stage_mega_moe_inputs(
                 t.hidden_states,
@@ -251,6 +265,36 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         if num_tokens < capacity:
             workspace.topk_idx[num_tokens:capacity].fill_(-1)
         workspace.note_staged_tokens(num_tokens)
+
+    def _stage_scalars(self, t: "MoEEpTensors", workspace: Any) -> None:
+        """Per-call NVFP4 epilogue scalars.
+
+        Contiguous fp32 ``[E_local]`` tensors on the workspace device are BOUND as
+        the launch arguments (``workspace.bind_scalars``): no per-call DtoD copies
+        into the pooled workspace tensors (3 launches per MoE layer). Any other
+        value is copied into the workspace tensor and ``None`` resets it to ones,
+        as before; the launch then uses the workspace tensor."""
+        values = self._scalar_values(t)
+        bind = hasattr(workspace, "bind_scalars")
+        bound = {}
+        for name, value in values.items():
+            target = getattr(workspace, name)
+            if (
+                bind
+                and isinstance(value, torch.Tensor)
+                and value.dtype == torch.float32
+                and value.is_contiguous()
+                and value.device == target.device
+                and value.shape == target.shape
+            ):
+                bound[name] = value
+                continue
+            if value is None:
+                target.fill_(1.0)
+            else:
+                target.copy_(value)
+        if bind:
+            workspace.bind_scalars(bound)
 
     def compute(
         self,
@@ -317,7 +361,7 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
             k.cluster_shape_mn,
             k.fallback_cluster_shape_mn,
             k.max_sm_count,
-            knobs_pool_key(k.knobs),
+            knobs_pool_key(self._knob_overrides(fleet_params)),
         )
 
     def _forget_workspace_state(self, workspace: Any) -> None:
