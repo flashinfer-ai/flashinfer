@@ -4311,6 +4311,8 @@ def trtllm_batch_decode_with_kv_cache(
     cp_rank: int = 0,
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     bf16q_fp8kv_transform_mode: Optional[Literal["k_only", "separate_kv"]] = None,
+    *,
+    sm_count: Optional[int] = None,
     request_order: Optional[torch.Tensor] = None,
     request_order_plan: Optional[Any] = None,
     sparse_top_k: int = 0,
@@ -4528,6 +4530,18 @@ def trtllm_batch_decode_with_kv_cache(
         ``"k_only"`` selects the optimized K-only transform cubins, and
         ``"separate_kv"`` selects the separate transformed-K/V cubins.
 
+    sm_count : Optional[int] = None
+        Number of SMs the ``trtllm-gen`` kernel selection plans for. If None, it is
+        inferred from the device. Values above the device's SM count let the multi-CTA
+        KV split use more CTAs per sequence (several waves). Their partial outputs are
+        carved from :attr:`workspace_buffer`, which must then hold at least
+        ``sm_count * 128 * (8 + 4 * head_dim)`` bytes after the LSE buffer, or a
+        ``ValueError`` is raised; a caller-owned :attr:`multi_ctas_kv_counter_buffer`
+        must be sized with
+        :func:`flashinfer.utils.get_trtllm_gen_multi_ctas_kv_counter_bytes` for this
+        value. Only supported by ``backend="trtllm-gen"`` (or ``"auto"`` resolving to
+        it), and not by DCP speculative decode.
+
     request_order : Optional[torch.Tensor] = None
         Optional contiguous int32 CUDA tensor of shape ``[batch_size]`` with
         ``request_order[launch_slot] = logical_request_index``. This is
@@ -4581,6 +4595,13 @@ def trtllm_batch_decode_with_kv_cache(
         raise ValueError("request_order_plan requires a device request_order tensor")
     if request_order is not None and causal_seqlens_kv_global is not None:
         raise ValueError("request_order is not supported by DCP speculative decode")
+    if sm_count is not None:
+        if sm_count <= 0:
+            raise ValueError(f"sm_count must be positive, got {sm_count}")
+        if backend not in ("auto", "trtllm-gen"):
+            raise ValueError(f"sm_count is not supported by backend={backend!r}")
+        if causal_seqlens_kv_global is not None:
+            raise ValueError("sm_count is not supported by DCP speculative decode")
     if causal_seqlens_kv_global is not None and enable_pdl is True:
         raise ValueError("DCP speculative decode does not support enable_pdl=True")
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
@@ -4809,6 +4830,9 @@ def trtllm_batch_decode_with_kv_cache(
                 "xqa backend does not support return_lse/lse output"
             )
 
+        if sm_count is not None:
+            raise ValueError("xqa backend does not support sm_count")
+
         # Handle out and out_dtype
         if out_dtype is None:
             out_dtype = out.dtype if out is not None else query.dtype
@@ -4858,7 +4882,9 @@ def trtllm_batch_decode_with_kv_cache(
             run_func = None
         else:
             run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
-        sm_count = get_device_sm_count(query.device)
+        device_sm_count = get_device_sm_count(query.device)
+        if sm_count is None:
+            sm_count = device_sm_count
 
         if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
             assert query.dtype == torch.float8_e4m3fn, (
@@ -4998,6 +5024,28 @@ def trtllm_batch_decode_with_kv_cache(
         else:
             lse_stride_tokens = 0
             lse_stride_heads = 0
+
+        if sm_count > device_sm_count:
+            # Without the multi-wave opt-in (which checks its own fit), the kernel
+            # splits a sequence's KV only when the split fits the planned SM count,
+            # so split CTAs never exceed it. Their partials (float2 stats and 2-byte
+            # O per row, at most 128 rows and 2 x head_dim per CTA) take the
+            # workspace left after the LSE stats, which the launcher does not check
+            # on this path.
+            scratch_bytes = sm_count * 128 * (8 + 4 * query.shape[-1])
+            if lse is not None:
+                scratch_bytes += (
+                    8 * num_qo_heads * batch_size * round_up(max_q_len, 256)
+                    + (1 << 20)
+                    + 16
+                )
+            workspace_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
+            if workspace_bytes < scratch_bytes:
+                raise ValueError(
+                    f"workspace_buffer has {workspace_bytes} bytes, but "
+                    f"sm_count={sm_count} needs up to {scratch_bytes} bytes of "
+                    "multi-CTA KV scratch"
+                )
 
         if request_order is not None:
             from .cake_fmha import (

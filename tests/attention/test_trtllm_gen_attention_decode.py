@@ -2498,3 +2498,39 @@ def test_trtllm_batch_decode_multi_wave_kv_split(case: str, multi_wave_runs) -> 
         _assert_multi_wave_matches_fp32_reference(
             inp, out.to(GPU_DEVICE), cfg["q_dtype"], cfg["window_left"]
         )
+
+
+def test_trtllm_batch_decode_sm_count() -> None:
+    """An explicit sm_count replaces the device SM count in the kernel selection."""
+    device_sm_count = _multi_wave_sm_count()
+    # One Q CTA per request and KV head fills one wave with a single KV split.
+    inp = _multi_wave_inputs(device_sm_count // 2, 1, 2, 16, 128, "fp8", "fp8", 8192)
+    workspace_buffer, _ = create_workspace_buffers(torch.device(GPU_DEVICE))
+
+    def decode(sm_count=None, workspace_buffer=workspace_buffer, backend="trtllm-gen"):
+        return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query=inp["q"],
+            kv_cache=inp["kv_cache"],
+            workspace_buffer=workspace_buffer,
+            block_tables=inp["page_table"],
+            seq_lens=inp["seq_lens"].to(GPU_DEVICE),
+            max_seq_len=int(inp["seq_lens"].max().item()),
+            bmm1_scale=inp["bmm1_scale"],
+            bmm2_scale=inp["bmm2_scale"],
+            out_dtype=torch.bfloat16,
+            kv_layout="HND",
+            backend=backend,
+            sm_count=sm_count,
+        )
+
+    assert torch.equal(decode(device_sm_count), decode())
+    # Four times the SM count: four KV splits per sequence instead of one.
+    _assert_multi_wave_matches_fp32_reference(inp, decode(4 * device_sm_count), "fp8")
+    with pytest.raises(ValueError, match="sm_count must be positive"):
+        decode(0)
+    with pytest.raises(ValueError, match="sm_count is not supported by backend"):
+        decode(device_sm_count, backend="cake")
+    # The multi-CTA partials of the extra splits must fit in the workspace.
+    small_workspace = torch.empty(1 << 20, dtype=torch.int8, device=GPU_DEVICE)
+    with pytest.raises(ValueError, match="multi-CTA KV scratch"):
+        decode(4 * device_sm_count, workspace_buffer=small_workspace)
