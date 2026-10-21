@@ -408,10 +408,7 @@ public:
 
     // Account for multiple epilogue and transformation warps
     int warp_idx = canonical_warp_idx_sync();
-    WarpCategory warp_category = warp_idx < static_cast<int>(WarpCategory::Epilogue)       ? WarpCategory(warp_idx)
-                               : warp_idx < static_cast<int>(WarpCategory::Transformation) ? WarpCategory::Epilogue
-                               : warp_idx < static_cast<int>(WarpCategory::MainloopLoadB)  ? WarpCategory::Transformation
-                               : WarpCategory::MainloopLoadB;
+    WarpCategory warp_category = warp_category_of(warp_idx);
 
     int thread_idx          = int(threadIdx.x);
     int thread_idx_in_warp  = thread_idx % 32;
@@ -423,7 +420,7 @@ public:
     bool is_mma_leader_cta          = (cta_rank_in_cluster % size<0>(TiledMma{}) == 0);
     // Even if this variable is unused, shape_div still performs useful compile-time checks.
     [[maybe_unused]] auto mma_leader_ctas = size(shape_div(cluster_shape, AtomThrShapeMNK{}));
-    constexpr bool has_mma_peer_cta = size(AtomThrShapeMNK{}) == 2;
+    constexpr bool has_mma_peer_cta = cute::size(AtomThrShapeMNK{}) == 2;
     uint32_t mma_peer_cta_rank = has_mma_peer_cta ? cta_rank_in_cluster ^ 1 : cta_rank_in_cluster;
 
     // Issue Tma Descriptor Prefetch from a single thread
@@ -441,31 +438,19 @@ public:
     CollectiveEpilogue collective_epilogue{params.epilogue, shared_storage.tensors.epilogue};
 
     bool is_epi_load_needed = collective_epilogue.is_producer_load_needed();
-    IsParticipant is_participant = {
-      (warp_category == WarpCategory::MMA),                                               // mma
-      (warp_category == WarpCategory::Sched) && (is_first_cta_in_cluster),                // sched
-      (warp_category == WarpCategory::MainloopLoad || warp_category == WarpCategory::MainloopLoadB), // main_load
-      (warp_category == WarpCategory::MainloopLoad),                                                 // main_loadA
-      (warp_category == WarpCategory::MainloopLoadB),                                                // main_loadB
-      (warp_category == WarpCategory::EpilogueLoad) && is_epi_load_needed,                // epi_load
-      (warp_category == WarpCategory::Epilogue),                                          // epilogue
-      (warp_category == WarpCategory::Transformation)                                     // transformation
-    };
+    IsParticipant is_participant;
+    is_participant.mma            = (warp_category == WarpCategory::MMA);
+    is_participant.sched          = (warp_category == WarpCategory::Sched) && is_first_cta_in_cluster;
+    is_participant.main_load      = (warp_category == WarpCategory::MainloopLoad || warp_category == WarpCategory::MainloopLoadB);
+    is_participant.main_loadA     = (warp_category == WarpCategory::MainloopLoad);
+    is_participant.main_loadB     = (warp_category == WarpCategory::MainloopLoadB);
+    is_participant.epi_load       = (warp_category == WarpCategory::EpilogueLoad) && is_epi_load_needed;
+    is_participant.epilogue       = (warp_category == WarpCategory::Epilogue);
+    is_participant.transformation = (warp_category == WarpCategory::Transformation);
 
     // MainloopLoad <--> Transformation Pipeline
-    typename Load2TransformPipeline::Params load2transform_pipeline_params;
-    if (warp_category == WarpCategory::MainloopLoad) {
-      load2transform_pipeline_params.role = Load2TransformPipeline::ThreadCategory::Producer;
-    }
-    else if (warp_category == WarpCategory::Transformation) {
-      load2transform_pipeline_params.role = Load2TransformPipeline::ThreadCategory::Consumer;
-    }
-    load2transform_pipeline_params.is_leader = (thread_idx_in_warp == 0);
-    load2transform_pipeline_params.num_consumers = NumTransformationThreads;
-    load2transform_pipeline_params.transaction_bytes = CollectiveMainloop::TmaTransactionBytes_A;
-    load2transform_pipeline_params.initializing_warp = 0;
     Load2TransformPipeline load2transform_pipeline(shared_storage.pipelines.mainloop.load2transform_pipeline,
-                                                   load2transform_pipeline_params,
+                                                   load2transform_params(warp_category, thread_idx_in_warp == 0),
                                                    cluster_shape,
                                                    McastDirection::kRow,
                                                    cute::true_type{},  // Perform barrier init
@@ -476,19 +461,8 @@ public:
     Load2TransformPipelineState load2transform_pipeline_producer_state = cutlass::make_producer_start_state<Load2TransformPipeline>();
 
     // MainloopLoad <--> MMA Pipeline
-    typename Load2MmaPipeline::Params load2mma_pipeline_params;
-    if (warp_category == WarpCategory::MainloopLoadB) {
-      load2mma_pipeline_params.role = Load2MmaPipeline::ThreadCategory::Producer;
-    }
-    else if (warp_category == WarpCategory::MMA) {
-      load2mma_pipeline_params.role = Load2MmaPipeline::ThreadCategory::Consumer;
-    }
-    load2mma_pipeline_params.is_leader = lane_predicate && is_mma_leader_cta && is_participant.main_loadB;
-    load2mma_pipeline_params.num_consumers = NumMMAThreads;
-    load2mma_pipeline_params.transaction_bytes = CollectiveMainloop::TmaTransactionBytes_B;
-    load2mma_pipeline_params.initializing_warp = 8;
     Load2MmaPipeline load2mma_pipeline(shared_storage.pipelines.mainloop.load2mma_pipeline,
-                                                   load2mma_pipeline_params,
+                                                   load2mma_params(warp_category, lane_predicate && is_mma_leader_cta && is_participant.main_loadB),
                                                    cluster_shape,
                                                    McastDirection::kCol,
                                                    cute::true_type{},  // Perform barrier init
@@ -500,18 +474,8 @@ public:
 
 
     // Transformation <--> MMA pipeline
-    typename Transform2MmaPipeline::Params transform2mma_pipeline_params;
-    if (warp_category == WarpCategory::Transformation) {
-      transform2mma_pipeline_params.role = Transform2MmaPipeline::ThreadCategory::Producer;
-    }
-    else if (warp_category == WarpCategory::MMA) {
-      transform2mma_pipeline_params.role = Transform2MmaPipeline::ThreadCategory::Consumer;
-    }
-    transform2mma_pipeline_params.consumer_arv_count = 1;
-    transform2mma_pipeline_params.producer_arv_count = size(AtomThrShapeMNK{}) * NumTransformationThreads;
-    transform2mma_pipeline_params.initializing_warp = 2;
     Transform2MmaPipeline transform2mma_pipeline(shared_storage.pipelines.mainloop.transform2mma_pipeline,
-                                                 transform2mma_pipeline_params,
+                                                 transform2mma_params(warp_category),
                                                  cluster_shape,
                                                  cute::true_type{},  // Perform barrier init
                                                  cute::false_type{}  // Delay mask calculation
@@ -521,18 +485,8 @@ public:
     Transform2MmaPipelineState transform2mma_pipeline_producer_state = cutlass::make_producer_start_state<Transform2MmaPipeline>();
 
     // MMA <--> Accumulator pipeline
-    typename Mma2AccumPipeline::Params mma2accum_pipeline_params;
-    if (warp_category == WarpCategory::MMA) {
-      mma2accum_pipeline_params.role = Mma2AccumPipeline::ThreadCategory::Producer;
-    }
-    else if (warp_category == WarpCategory::Epilogue) {
-      mma2accum_pipeline_params.role = Mma2AccumPipeline::ThreadCategory::Consumer;
-    }
-    mma2accum_pipeline_params.producer_arv_count = 1;
-    mma2accum_pipeline_params.consumer_arv_count = size(AtomThrShapeMNK{}) * NumEpilogueThreads;
-    mma2accum_pipeline_params.initializing_warp = 6;
     Mma2AccumPipeline mma2accum_pipeline(shared_storage.pipelines.mainloop.mma2accum_pipeline,
-                                         mma2accum_pipeline_params,
+                                         mma2accum_params(warp_category),
                                          cluster_shape,
                                          cute::true_type{},  // Perform barrier init
                                          cute::false_type{}  // Delay mask calculation
@@ -542,19 +496,7 @@ public:
     Mma2AccumPipelineState mma2accum_pipeline_producer_state = cutlass::make_producer_start_state<Mma2AccumPipeline>();
 
     // Epilogue Load pipeline
-    typename EpiLoadPipeline::Params epi_load_pipeline_params;
-    if (WarpCategory::EpilogueLoad == warp_category) {
-      epi_load_pipeline_params.role = EpiLoadPipeline::ThreadCategory::Producer;
-    }
-    if (WarpCategory::Epilogue == warp_category) {
-      epi_load_pipeline_params.role = EpiLoadPipeline::ThreadCategory::Consumer;
-    }
-    epi_load_pipeline_params.dst_blockid = cta_rank_in_cluster;
-    epi_load_pipeline_params.producer_arv_count = NumEpilogueLoadThreads;
-    epi_load_pipeline_params.consumer_arv_count = NumEpilogueThreads;
-    epi_load_pipeline_params.transaction_bytes = CollectiveEpilogue::TmaTransactionBytes;
-    epi_load_pipeline_params.initializing_warp = 4;
-    EpiLoadPipeline epi_load_pipeline(shared_storage.pipelines.epi_load, epi_load_pipeline_params);
+    EpiLoadPipeline epi_load_pipeline(shared_storage.pipelines.epi_load, epi_load_params(warp_category, cta_rank_in_cluster));
 
     // Epilogue Store pipeline
     typename EpiStorePipeline::Params epi_store_pipeline_params;
@@ -562,11 +504,7 @@ public:
     EpiStorePipeline epi_store_pipeline(epi_store_pipeline_params);
 
     // Load order barrier
-    typename LoadOrderBarrier::Params load_order_barrier_params;
-    load_order_barrier_params.group_id = (warp_category == WarpCategory::MainloopLoad) ? 0 : 1;
-    load_order_barrier_params.group_size = 1;
-    load_order_barrier_params.initializing_warp = 5;
-    LoadOrderBarrier load_order_barrier(shared_storage.pipelines.load_order, load_order_barrier_params);
+    LoadOrderBarrier load_order_barrier(shared_storage.pipelines.load_order, load_order_params(warp_category));
 
     EpiLoadPipelineState epi_load_pipe_consumer_state;
     EpiLoadPipelineState epi_load_pipe_producer_state = cutlass::make_producer_start_state<EpiLoadPipeline>();
@@ -576,41 +514,13 @@ public:
 
     // CLC pipeline
     // Operates Scheduling Warp <--> All Warps
-    typename CLCPipeline::Params clc_pipeline_params;
-    if (WarpCategory::Sched == warp_category) {
-      clc_pipeline_params.role = CLCPipeline::ThreadCategory::ProducerConsumer;
-    }
-    else {
-      clc_pipeline_params.role = CLCPipeline::ThreadCategory::Consumer;
-    }
-    clc_pipeline_params.producer_blockid = 0;
-    clc_pipeline_params.producer_arv_count = 1;
-    clc_pipeline_params.consumer_arv_count = NumSchedThreads + cluster_size *
-                                                 (NumMainloopLoadThreads + NumMainloopLoadBThreads + NumEpilogueThreads +
-                                                  NumMMAThreads + NumTransformationThreads);
-    if (is_epi_load_needed) {
-      clc_pipeline_params.consumer_arv_count += cluster_size * NumEpilogueLoadThreads;
-    }
-    clc_pipeline_params.transaction_bytes = CLCResponseSize;
-    clc_pipeline_params.initializing_warp = 1;
-    CLCPipeline clc_pipeline(shared_storage.pipelines.clc, clc_pipeline_params, cluster_shape);
+    CLCPipeline clc_pipeline(shared_storage.pipelines.clc, clc_params(warp_category, cluster_size, is_epi_load_needed), cluster_shape);
 
     CLCPipelineState clc_pipeline_consumer_state;
     CLCPipelineState clc_pipeline_producer_state = cutlass::make_producer_start_state<CLCPipeline>();
 
     // CLC throttle pipeline
-    typename CLCThrottlePipeline::Params clc_throttle_pipeline_params;
-    if (WarpCategory::MainloopLoad == warp_category) {
-      clc_throttle_pipeline_params.role = CLCThrottlePipeline::ThreadCategory::Producer;
-    }
-    if (WarpCategory::Sched == warp_category) {
-      clc_throttle_pipeline_params.role = CLCThrottlePipeline::ThreadCategory::Consumer;
-    }
-    clc_throttle_pipeline_params.producer_arv_count = NumMainloopLoadThreads;
-    clc_throttle_pipeline_params.consumer_arv_count = NumSchedThreads;
-    clc_throttle_pipeline_params.dst_blockid = 0;
-    clc_throttle_pipeline_params.initializing_warp = 3;
-    CLCThrottlePipeline clc_throttle_pipeline(shared_storage.pipelines.clc_throttle, clc_throttle_pipeline_params);
+    CLCThrottlePipeline clc_throttle_pipeline(shared_storage.pipelines.clc_throttle, clc_throttle_params(warp_category));
     CLCThrottlePipelineState clc_pipe_throttle_consumer_state;
     CLCThrottlePipelineState clc_pipe_throttle_producer_state = cutlass::make_producer_start_state<CLCThrottlePipeline>();
 
@@ -671,88 +581,233 @@ public:
     pipeline_init_wait(cluster_size);
 
     if (is_participant.main_load) {
+      run_main_load(params, shared_storage, is_participant, lane_predicate, is_first_cta_in_cluster,
+                    is_epi_load_needed, problem_shape_MNKL, gA_mkl, collective_mainloop, scheduler,
+                    work_tile_info,
+                    load2transform_pipeline, load2transform_pipeline_producer_state,
+                    load2mma_pipeline, load2mma_pipeline_producer_state,
+                    clc_pipeline, clc_pipeline_consumer_state,
+                    clc_throttle_pipeline, clc_pipe_throttle_producer_state,
+                    load_order_barrier, epilogue_throttle_barrier);
+    }
+    else if (is_participant.sched) {
+      run_sched(scheduler, work_tile_info,
+                clc_pipeline, clc_pipeline_producer_state, clc_pipeline_consumer_state,
+                clc_throttle_pipeline, clc_pipe_throttle_consumer_state,
+                epilogue_throttle_barrier);
+    }
+    else if (is_participant.transformation) {
+      run_transform(problem_shape_MNKL, gA_mkl, collective_mainloop, bulk_tmem, transform_inputs,
+                    scheduler, work_tile_info,
+                    load2transform_pipeline, load2transform_pipeline_consumer_state,
+                    transform2mma_pipeline, transform2mma_pipeline_producer_state,
+                    clc_pipeline, clc_pipeline_consumer_state,
+                    tmem_allocation_result_barrier, epilogue_throttle_barrier);
+    }
+    else if (is_participant.mma) {
+      run_mma(shared_storage, problem_shape_MNKL, collective_mainloop, bulk_tmem, scheduler,
+              work_tile_info, is_mma_leader_cta, mma_peer_cta_rank, dealloc_barrier_phase,
+              tmem_allocator, tmem_allocation_result_barrier, tmem_deallocation_result_barrier,
+              epilogue_throttle_barrier,
+              load2mma_pipeline, load2mma_pipeline_consumer_state,
+              transform2mma_pipeline, transform2mma_pipeline_consumer_state,
+              mma2accum_pipeline, mma2accum_pipeline_producer_state,
+              clc_pipeline, clc_pipeline_consumer_state);
+    }
+    else if (is_participant.epi_load) {
+      run_epilogue_load(params, shared_storage, problem_shape_MNKL, collective_epilogue, scheduler,
+                        work_tile_info, cta_coord_mnkl,
+                        epi_load_pipeline, epi_load_pipe_producer_state,
+                        epi_store_pipeline, epi_store_pipe_producer_state,
+                        clc_pipeline, clc_pipeline_consumer_state,
+                        load_order_barrier, epilogue_throttle_barrier);
+    }
+    else if (is_participant.epilogue) {
+      run_epilogue_store(shared_storage, problem_shape_MNKL, collective_mainloop, collective_epilogue,
+                         bulk_tmem, scheduler, work_tile_info, cta_coord_mnkl,
+                         epi_load_pipeline, epi_load_pipe_consumer_state,
+                         epi_store_pipeline, epi_store_pipe_producer_state,
+                         mma2accum_pipeline, mma2accum_pipeline_consumer_state,
+                         clc_pipeline, clc_pipeline_consumer_state,
+                         tmem_allocation_result_barrier, epilogue_throttle_barrier);
+    }
+  }
 
-      // Ensure that the prefetched kernel does not touch
-      // unflushed global memory prior to this instruction
-      cutlass::arch::wait_on_dependent_grids();
+  //
+  // The per-role loops of operator().  Each warp runs exactly one; a role receives the
+  // pipelines it produces or consumes, its own pipeline states (by value: nothing after the
+  // role reads them) and the barriers it arrives on or waits for.  Every role keeps its own
+  // fetch-next placement, tail drain and barrier sequence.
+  //
 
-      bool do_load_order_arrive = is_epi_load_needed;
-      auto load_inputs = collective_mainloop.load_init(problem_shape_MNKL, params.mainloop, shared_storage.tensors.mainloop);
+  // Which of the role groups a warp belongs to (the enumerators are the first warp of each).
+  static CUTLASS_DEVICE WarpCategory
+  warp_category_of(int warp_idx) {
+    if (warp_idx < static_cast<int>(WarpCategory::Epilogue))       return WarpCategory(warp_idx);
+    if (warp_idx < static_cast<int>(WarpCategory::Transformation)) return WarpCategory::Epilogue;
+    if (warp_idx < static_cast<int>(WarpCategory::MainloopLoadB))  return WarpCategory::Transformation;
+    return WarpCategory::MainloopLoadB;
+  }
 
-      // Signal the epilogue warps to proceed once the prologue is complete
-      epilogue_throttle_barrier.arrive();
+  // Main-load warps: the A warp feeds the transform pipeline (and the CLC throttle), the B
+  // warp the MMA pipeline, each in a prologue of up to Stages k-tiles followed by the rest.
+  template <class ProblemShapeMNKL, class TensorA>
+  CUTLASS_DEVICE void
+  run_main_load(Params const& params, SharedStorage& shared_storage, IsParticipant const& is_participant,
+                uint32_t lane_predicate, bool is_first_cta_in_cluster, bool is_epi_load_needed,
+                ProblemShapeMNKL const& problem_shape_MNKL, TensorA const& gA_mkl,
+                CollectiveMainloop& collective_mainloop, TileScheduler& scheduler,
+                typename TileScheduler::WorkTileInfo work_tile_info,
+                Load2TransformPipeline& load2transform_pipeline,
+                Load2TransformPipelineState load2transform_pipeline_producer_state,
+                Load2MmaPipeline& load2mma_pipeline, Load2MmaPipelineState load2mma_pipeline_producer_state,
+                CLCPipeline& clc_pipeline, CLCPipelineState clc_pipeline_consumer_state,
+                CLCThrottlePipeline& clc_throttle_pipeline,
+                CLCThrottlePipelineState clc_pipe_throttle_producer_state,
+                LoadOrderBarrier& load_order_barrier, arch::ClusterBarrier& epilogue_throttle_barrier) {
+    using namespace cute;
+
+    // Ensure that the prefetched kernel does not touch
+    // unflushed global memory prior to this instruction
+    cutlass::arch::wait_on_dependent_grids();
+
+    bool do_load_order_arrive = is_epi_load_needed;
+    auto load_inputs = collective_mainloop.load_init(problem_shape_MNKL, params.mainloop, shared_storage.tensors.mainloop);
+
+    // Signal the epilogue warps to proceed once the prologue is complete
+    epilogue_throttle_barrier.arrive();
+    bool requires_clc_query = true;
+
+    do {
+      auto cta_coord_mnkl = scheduler.work_tile_to_cta_coord(work_tile_info);
+      auto k_tile_iter = scheduler.get_k_tile_iterator(work_tile_info, problem_shape_MNKL, CtaShape_MNK{}, shape<3>(gA_mkl));
+      auto k_tile_count = TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, CtaShape_MNK{});
+      auto k_tile_prologue = min(Load2TransformPipeline::Stages, k_tile_count);
+
+      if(is_participant.main_loadA){
+        if constexpr (IsSchedDynamicPersistent) {
+          if (is_first_cta_in_cluster && requires_clc_query) {
+            clc_throttle_pipeline.producer_acquire(clc_pipe_throttle_producer_state);
+            clc_throttle_pipeline.producer_commit(clc_pipe_throttle_producer_state);
+            ++clc_pipe_throttle_producer_state;
+          }
+        }
+      }
+
+      if (lane_predicate) {
+        if(is_participant.main_loadA){
+          auto [load2transform_pipeline_producer_state_next, k_tile_iter_next] = collective_mainloop.load_A(
+            params.mainloop,
+            load2transform_pipeline,
+            load2transform_pipeline_producer_state,
+            load_inputs,
+            cta_coord_mnkl,
+            k_tile_iter, k_tile_prologue
+          );
+          load2transform_pipeline_producer_state = load2transform_pipeline_producer_state_next;
+
+          if (do_load_order_arrive) {
+            load_order_barrier.arrive();
+            do_load_order_arrive = false;
+          }
+
+          auto [load2transform_pipeline_producer_state_next_, unused_] = collective_mainloop.load_A(
+            params.mainloop,
+            load2transform_pipeline,
+            load2transform_pipeline_producer_state,
+            load_inputs,
+            cta_coord_mnkl,
+            k_tile_iter_next, k_tile_count - k_tile_prologue
+          );
+          load2transform_pipeline_producer_state = load2transform_pipeline_producer_state_next_;
+        }
+
+        if(is_participant.main_loadB){
+          auto [load2mma_pipeline_producer_state_next, k_tile_iter_next] = collective_mainloop.load_B(
+            params.mainloop,
+            load2mma_pipeline,
+            load2mma_pipeline_producer_state,
+            load_inputs,
+            cta_coord_mnkl,
+            k_tile_iter, k_tile_prologue
+          );
+          load2mma_pipeline_producer_state = load2mma_pipeline_producer_state_next;
+
+          auto [load2mma_pipeline_producer_state_next_, unused_] = collective_mainloop.load_B(
+            params.mainloop,
+            load2mma_pipeline,
+            load2mma_pipeline_producer_state,
+            load_inputs,
+            cta_coord_mnkl,
+            k_tile_iter_next, k_tile_count - k_tile_prologue
+          );
+          load2mma_pipeline_producer_state = load2mma_pipeline_producer_state_next_;
+
+        }
+      }
+
+      // Sync warp to prevent non-participating threads entering next wave early
+      __syncwarp();
+
+      // Fetch next work tile
+      auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(
+        work_tile_info,
+        clc_pipeline,
+        clc_pipeline_consumer_state
+      );
+
+      requires_clc_query = increment_pipe;
+      if (increment_pipe) {
+        ++clc_pipeline_consumer_state;
+      }
+      work_tile_info = next_work_tile_info;
+    } while (work_tile_info.is_valid());
+
+    if(is_participant.main_loadA){
+      if (lane_predicate) {
+        load2transform_pipeline.producer_tail(load2transform_pipeline_producer_state);
+      }
+    }
+    if(is_participant.main_loadB){
+      if (lane_predicate) {
+        load2mma_pipeline.producer_tail(load2mma_pipeline_producer_state);
+      }
+    }
+  }
+
+  // Scheduler warp of the cluster's first CTA: issues the CLC queries, throttled by the
+  // A-load warp, and drains the CLC pipeline.
+  CUTLASS_DEVICE void
+  run_sched(TileScheduler& scheduler, typename TileScheduler::WorkTileInfo work_tile_info,
+            CLCPipeline& clc_pipeline, CLCPipelineState clc_pipeline_producer_state,
+            CLCPipelineState clc_pipeline_consumer_state,
+            CLCThrottlePipeline& clc_throttle_pipeline,
+            CLCThrottlePipelineState clc_pipe_throttle_consumer_state,
+            arch::ClusterBarrier& epilogue_throttle_barrier) {
+    // Signal the epilogue warps to proceed once the prologue is complete
+    epilogue_throttle_barrier.arrive();
+
+    if constexpr (IsSchedDynamicPersistent) {
+      // Whether a new CLC query must be performed.
+      // See comment below where this variable is updated for a description of
+      // why this variable is needed.
       bool requires_clc_query = true;
 
+      cutlass::arch::wait_on_dependent_grids();
+
       do {
-        cta_coord_mnkl = scheduler.work_tile_to_cta_coord(work_tile_info);
-        auto k_tile_iter = scheduler.get_k_tile_iterator(work_tile_info, problem_shape_MNKL, CtaShape_MNK{}, shape<3>(gA_mkl));
-        auto k_tile_count = TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, CtaShape_MNK{});
-        auto k_tile_prologue = min(Load2TransformPipeline::Stages, k_tile_count);
+        if (requires_clc_query) {
+          // Throttle CLC query to mitigate workload imbalance caused by skews among persistent workers.
+          clc_throttle_pipeline.consumer_wait(clc_pipe_throttle_consumer_state);
+          clc_throttle_pipeline.consumer_release(clc_pipe_throttle_consumer_state);
+          ++clc_pipe_throttle_consumer_state;
 
-        if(is_participant.main_loadA){
-          if constexpr (IsSchedDynamicPersistent) {
-            if (is_first_cta_in_cluster && requires_clc_query) {
-              clc_throttle_pipeline.producer_acquire(clc_pipe_throttle_producer_state);
-              clc_throttle_pipeline.producer_commit(clc_pipe_throttle_producer_state);
-              ++clc_pipe_throttle_producer_state;
-            }
-          }
-        }
-
-        if (lane_predicate) {
-          if(is_participant.main_loadA){
-            auto [load2transform_pipeline_producer_state_next, k_tile_iter_next] = collective_mainloop.load_A(
-              params.mainloop,
-              load2transform_pipeline,
-              load2transform_pipeline_producer_state,
-              load_inputs,
-              cta_coord_mnkl,
-              k_tile_iter, k_tile_prologue
-            );
-            load2transform_pipeline_producer_state = load2transform_pipeline_producer_state_next;
-
-            if (do_load_order_arrive) {
-              load_order_barrier.arrive();
-              do_load_order_arrive = false;
-            }
-
-            auto [load2transform_pipeline_producer_state_next_, unused_] = collective_mainloop.load_A(
-              params.mainloop,
-              load2transform_pipeline,
-              load2transform_pipeline_producer_state,
-              load_inputs,
-              cta_coord_mnkl,
-              k_tile_iter_next, k_tile_count - k_tile_prologue
-            );
-            load2transform_pipeline_producer_state = load2transform_pipeline_producer_state_next_;
-          }
-
-          if(is_participant.main_loadB){
-            auto [load2mma_pipeline_producer_state_next, k_tile_iter_next] = collective_mainloop.load_B(
-              params.mainloop,
-              load2mma_pipeline,
-              load2mma_pipeline_producer_state,
-              load_inputs,
-              cta_coord_mnkl,
-              k_tile_iter, k_tile_prologue
-            );
-            load2mma_pipeline_producer_state = load2mma_pipeline_producer_state_next;
-
-            auto [load2mma_pipeline_producer_state_next_, unused_] = collective_mainloop.load_B(
-              params.mainloop,
-              load2mma_pipeline,
-              load2mma_pipeline_producer_state,
-              load_inputs,
-              cta_coord_mnkl,
-              k_tile_iter_next, k_tile_count - k_tile_prologue
-            );
-            load2mma_pipeline_producer_state = load2mma_pipeline_producer_state_next_;
-
-          }
-        }
-
-        // Sync warp to prevent non-participating threads entering next wave early
-        __syncwarp();
+          // Query next clcID and update producer state
+          clc_pipeline_producer_state = scheduler.advance_to_next_work(
+            clc_pipeline,
+            clc_pipeline_producer_state
+          );
+       }
 
         // Fetch next work tile
         auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(
@@ -761,328 +816,459 @@ public:
           clc_pipeline_consumer_state
         );
 
+        // Only perform a new CLC query if we consumed a new CLC query result in
+        // `fetch_next_work`. An example of a case in which CLC `fetch_next_work` does
+        // not consume a new CLC query response is when processing stream-K units.
+        // The current stream-K scheduler uses single WorkTileInfo to track multiple
+        // (potentially-partial) tiles to be computed via stream-K. In this case,
+        // `fetch_next_work` simply performs in-place updates on the existing WorkTileInfo,
+        // rather than consuming a CLC query response.
         requires_clc_query = increment_pipe;
         if (increment_pipe) {
           ++clc_pipeline_consumer_state;
         }
+
         work_tile_info = next_work_tile_info;
       } while (work_tile_info.is_valid());
-
-      if(is_participant.main_loadA){
-        if (lane_predicate) {
-          load2transform_pipeline.producer_tail(load2transform_pipeline_producer_state);
-        }
-      }
-      if(is_participant.main_loadB){
-        if (lane_predicate) {
-          load2mma_pipeline.producer_tail(load2mma_pipeline_producer_state);
-        }
-      }
-
+      clc_pipeline.producer_tail(clc_pipeline_producer_state);
     }
+  }
 
-    else if (is_participant.sched) {
+  // Transform warpgroups: convert each k-tile of A from the load pipeline into the MMA
+  // pipeline, then drain it.
+  template <class ProblemShapeMNKL, class TensorA, class BulkTmem, class TransformInputs>
+  CUTLASS_DEVICE void
+  run_transform(ProblemShapeMNKL const& problem_shape_MNKL, TensorA const& gA_mkl,
+                CollectiveMainloop& collective_mainloop, BulkTmem const& bulk_tmem,
+                TransformInputs const& transform_inputs, TileScheduler& scheduler,
+                typename TileScheduler::WorkTileInfo work_tile_info,
+                Load2TransformPipeline& load2transform_pipeline,
+                Load2TransformPipelineState load2transform_pipeline_consumer_state,
+                Transform2MmaPipeline& transform2mma_pipeline,
+                Transform2MmaPipelineState transform2mma_pipeline_producer_state,
+                CLCPipeline& clc_pipeline, CLCPipelineState clc_pipeline_consumer_state,
+                arch::NamedBarrier& tmem_allocation_result_barrier,
+                arch::ClusterBarrier& epilogue_throttle_barrier) {
+    using namespace cute;
 
-      // Signal the epilogue warps to proceed once the prologue is complete
-      epilogue_throttle_barrier.arrive();
+    // Signal the epilogue warps to proceed once the prologue is complete
+    epilogue_throttle_barrier.arrive();
 
-      if constexpr (IsSchedDynamicPersistent) {
-        // Whether a new CLC query must be performed.
-        // See comment below where this variable is updated for a description of
-        // why this variable is needed.
-        bool requires_clc_query = true;
+    // Wait for tmem allocation
+    tmem_allocation_result_barrier.arrive_and_wait_unaligned();
 
-        cutlass::arch::wait_on_dependent_grids();
+    do {
+      auto k_tile_count = TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, CtaShape_MNK{});
+      auto k_tile_start = TileScheduler::get_work_k_tile_start(work_tile_info);
+      auto k_tile_iter = cute::make_coord_iterator(idx2crd(k_tile_start, shape<3>(gA_mkl)), shape<3>(gA_mkl));
+      auto [load2transform_pipeline_consumer_state_next, transform2mma_pipeline_producer_state_next] = collective_mainloop.transform(
+        load2transform_pipeline,
+        load2transform_pipeline_consumer_state,
+        transform2mma_pipeline,
+        transform2mma_pipeline_producer_state,
+        bulk_tmem,
+        transform_inputs,
+        k_tile_iter, k_tile_count
+      );
+      transform2mma_pipeline_producer_state = transform2mma_pipeline_producer_state_next;
+      load2transform_pipeline_consumer_state = load2transform_pipeline_consumer_state_next;
 
-        do {
-          if (requires_clc_query) {
-            // Throttle CLC query to mitigate workload imbalance caused by skews among persistent workers.
-            clc_throttle_pipeline.consumer_wait(clc_pipe_throttle_consumer_state);
-            clc_throttle_pipeline.consumer_release(clc_pipe_throttle_consumer_state);
-            ++clc_pipe_throttle_consumer_state;
+      // Fetch next work tile
+      auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(
+        work_tile_info,
+        clc_pipeline,
+        clc_pipeline_consumer_state
+      );
+      work_tile_info = next_work_tile_info;
 
-            // Query next clcID and update producer state
-            clc_pipeline_producer_state = scheduler.advance_to_next_work(
-              clc_pipeline,
-              clc_pipeline_producer_state
-            );
-         }
-
-          // Fetch next work tile
-          auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(
-            work_tile_info,
-            clc_pipeline,
-            clc_pipeline_consumer_state
-          );
-
-          // Only perform a new CLC query if we consumed a new CLC query result in
-          // `fetch_next_work`. An example of a case in which CLC `fetch_next_work` does
-          // not consume a new CLC query response is when processing stream-K units.
-          // The current stream-K scheduler uses single WorkTileInfo to track multiple
-          // (potentially-partial) tiles to be computed via stream-K. In this case,
-          // `fetch_next_work` simply performs in-place updates on the existing WorkTileInfo,
-          // rather than consuming a CLC query response.
-          requires_clc_query = increment_pipe;
-          if (increment_pipe) {
-            ++clc_pipeline_consumer_state;
-          }
-
-          work_tile_info = next_work_tile_info;
-        } while (work_tile_info.is_valid());
-        clc_pipeline.producer_tail(clc_pipeline_producer_state);
+      if (increment_pipe) {
+        ++clc_pipeline_consumer_state;
       }
-    }
+    } while (work_tile_info.is_valid());
 
-    else if (is_participant.transformation) {
+    transform2mma_pipeline.producer_tail(transform2mma_pipeline_producer_state);
+  }
 
-      // Signal the epilogue warps to proceed once the prologue is complete
-      epilogue_throttle_barrier.arrive();
+  // MMA warp: owns the TMEM allocation for the CTA (and its release with the peer CTA), and
+  // on the leader CTA issues the MMAs of every work tile.
+  template <class ProblemShapeMNKL, class BulkTmem>
+  CUTLASS_DEVICE void
+  run_mma(SharedStorage& shared_storage, ProblemShapeMNKL const& problem_shape_MNKL,
+          CollectiveMainloop& collective_mainloop, BulkTmem const& bulk_tmem, TileScheduler& scheduler,
+          typename TileScheduler::WorkTileInfo work_tile_info, bool is_mma_leader_cta,
+          uint32_t mma_peer_cta_rank, uint32_t dealloc_barrier_phase,
+          TmemAllocator& tmem_allocator, arch::NamedBarrier& tmem_allocation_result_barrier,
+          arch::ClusterBarrier& tmem_deallocation_result_barrier,
+          arch::ClusterBarrier& epilogue_throttle_barrier,
+          Load2MmaPipeline& load2mma_pipeline, Load2MmaPipelineState load2mma_pipeline_consumer_state,
+          Transform2MmaPipeline& transform2mma_pipeline,
+          Transform2MmaPipelineState transform2mma_pipeline_consumer_state,
+          Mma2AccumPipeline& mma2accum_pipeline, Mma2AccumPipelineState mma2accum_pipeline_producer_state,
+          CLCPipeline& clc_pipeline, CLCPipelineState clc_pipeline_consumer_state) {
+    constexpr bool has_mma_peer_cta = cute::size(AtomThrShapeMNK{}) == 2;
 
-      // Wait for tmem allocation
-      tmem_allocation_result_barrier.arrive_and_wait_unaligned();
+    // Tmem allocation sequence
+    tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns, &shared_storage.tmem_base_ptr);
+    __syncwarp();
+    tmem_allocation_result_barrier.arrive();
+    uint32_t tmem_base_ptr = shared_storage.tmem_base_ptr;
 
-      do {
-        auto k_tile_count = TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, CtaShape_MNK{});
-        auto k_tile_start = TileScheduler::get_work_k_tile_start(work_tile_info);
-        auto k_tile_iter = cute::make_coord_iterator(idx2crd(k_tile_start, shape<3>(gA_mkl)), shape<3>(gA_mkl));
-        auto [load2transform_pipeline_consumer_state_next, transform2mma_pipeline_producer_state_next] = collective_mainloop.transform(
-          load2transform_pipeline,
-          load2transform_pipeline_consumer_state,
-          transform2mma_pipeline,
-          transform2mma_pipeline_producer_state,
-          bulk_tmem,
-          transform_inputs,
-          k_tile_iter, k_tile_count
-        );
-        transform2mma_pipeline_producer_state = transform2mma_pipeline_producer_state_next;
-        load2transform_pipeline_consumer_state = load2transform_pipeline_consumer_state_next;
+    auto mma_input_operands = collective_mainloop.mma_init(bulk_tmem, shared_storage.tensors.mainloop);
 
-        // Fetch next work tile
-        auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(
-          work_tile_info,
-          clc_pipeline,
-          clc_pipeline_consumer_state
-        );
-        work_tile_info = next_work_tile_info;
+    // Signal the epilogue warps to proceed once the prologue is complete
+    epilogue_throttle_barrier.arrive();
 
-        if (increment_pipe) {
-          ++clc_pipeline_consumer_state;
-        }
-      } while (work_tile_info.is_valid());
+    do {
+      auto k_tile_count = TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, CtaShape_MNK{});
+      // Fetch next work tile
+      auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(
+        work_tile_info,
+        clc_pipeline,
+        clc_pipeline_consumer_state
+      );
+      work_tile_info = next_work_tile_info;
 
-      transform2mma_pipeline.producer_tail(transform2mma_pipeline_producer_state);
-    }
+      if (increment_pipe) {
+        ++clc_pipeline_consumer_state;
+      }
 
-    else if (is_participant.mma) {
-
-      // Tmem allocation sequence
-      tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns, &shared_storage.tmem_base_ptr);
-      __syncwarp();
-      tmem_allocation_result_barrier.arrive();
-      uint32_t tmem_base_ptr = shared_storage.tmem_base_ptr;
-
-      auto mma_input_operands = collective_mainloop.mma_init(bulk_tmem, shared_storage.tensors.mainloop);
-
-      // Signal the epilogue warps to proceed once the prologue is complete
-      epilogue_throttle_barrier.arrive();
-
-      do {
-        auto k_tile_count = TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, CtaShape_MNK{});
-        // Fetch next work tile
-        auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(
-          work_tile_info,
-          clc_pipeline,
-          clc_pipeline_consumer_state
-        );
-        work_tile_info = next_work_tile_info;
-
-        if (increment_pipe) {
-          ++clc_pipeline_consumer_state;
-        }
-
-        if (is_mma_leader_cta) {
-            auto [load2mma_pipeline_consumer_state_next, transform2mma_pipeline_consumer_state_next, mma2accum_pipeline_producer_state_next] = collective_mainloop.mma(
-              load2mma_pipeline,
-              load2mma_pipeline_consumer_state,
-              transform2mma_pipeline,
-              transform2mma_pipeline_consumer_state,
-              mma2accum_pipeline,
-              mma2accum_pipeline_producer_state,
-              bulk_tmem,
-              mma_input_operands,
-              k_tile_count
-            );
-            // Advance the mm2accum pipe
-            load2mma_pipeline_consumer_state = load2mma_pipeline_consumer_state_next;
-            transform2mma_pipeline_consumer_state = transform2mma_pipeline_consumer_state_next;
-            mma2accum_pipeline_producer_state = mma2accum_pipeline_producer_state_next;
-        }
-      } while (work_tile_info.is_valid());
-
-      // leader MMA waits for leader + peer epilogues to release accumulator stage
       if (is_mma_leader_cta) {
-        mma2accum_pipeline.producer_tail(mma2accum_pipeline_producer_state);
-      }
-
-      // Hint on an early release of global memory resources.
-      // The timing of calling this function only influences performance,
-      // not functional correctness.
-      cutlass::arch::launch_dependent_grids();
-
-      // Signal to peer MMA that entire tmem allocation can be deallocated
-      if constexpr (has_mma_peer_cta) {
-        // Leader does wait + arrive, follower does arrive + wait
-        tmem_deallocation_result_barrier.arrive(mma_peer_cta_rank, not is_mma_leader_cta);
-        tmem_deallocation_result_barrier.wait(dealloc_barrier_phase);
-        tmem_deallocation_result_barrier.arrive(mma_peer_cta_rank, is_mma_leader_cta);
-      }
-
-      // Free entire tmem allocation
-      tmem_allocator.free(tmem_base_ptr, TmemAllocator::Sm100TmemCapacityColumns);
-    }
-
-    else if (is_participant.epi_load) {
-
-      // Ensure that the prefetched kernel does not touch
-      // unflushed global memory prior to this instruction
-      cutlass::arch::wait_on_dependent_grids();
-
-      bool do_load_order_wait = true;
-      bool do_tail_load = false;
-
-      // Signal the epilogue warps to proceed once the prologue is complete
-      epilogue_throttle_barrier.arrive();
-
-      do {
-        bool compute_epilogue = TileScheduler::compute_epilogue(work_tile_info, params.scheduler);
-        // Get current work tile and fetch next work tile
-        auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(
-          work_tile_info,
-          clc_pipeline,
-          clc_pipeline_consumer_state
-        );
-        work_tile_info = next_work_tile_info;
-
-        if (increment_pipe) {
-          ++clc_pipeline_consumer_state;
-        }
-
-        if (compute_epilogue) {
-          if (do_load_order_wait) {
-            load_order_barrier.wait();
-            do_load_order_wait = false;
-          }
-
-          epi_load_pipe_producer_state = collective_epilogue.load(
-            epi_load_pipeline,
-            epi_load_pipe_producer_state,
-            problem_shape_MNKL,
-            CtaShape_MNK{},
-            cta_coord_mnkl,
-            TileShape{},
-            TiledMma{},
-            shared_storage.tensors.epilogue
-          );
-
-          do_tail_load = true;
-        }
-
-        // Calculate the cta coordinates of the next work tile
-        cta_coord_mnkl = scheduler.work_tile_to_cta_coord(work_tile_info);
-      } while (work_tile_info.is_valid());
-
-      // Only perform a tail load if one of the work units processed performed
-      // an epilogue load. An example of a case in which a tail load should not be
-      // performed is in split-K if a cluster is only assigned non-final splits (for which
-      // the cluster does not compute the epilogue).
-      if (do_tail_load) {
-        collective_epilogue.load_tail(
-          epi_load_pipeline, epi_load_pipe_producer_state,
-          epi_store_pipeline, epi_store_pipe_producer_state);
-      }
-    }
-
-    else if (is_participant.epilogue) {
-
-      // Throttle the epilogue warps to improve prologue performance
-      static constexpr int epilogue_throttle_phase_bit = 0;
-      epilogue_throttle_barrier.wait(epilogue_throttle_phase_bit);
-
-      // Wait for tmem allocation
-      tmem_allocation_result_barrier.arrive_and_wait_unaligned();
-
-      auto accum_inputs = collective_mainloop.accum_init(bulk_tmem, typename CollectiveEpilogue::CopyOpT2R{}, typename CollectiveEpilogue::EpilogueTile{});
-      bool do_tail_store = false;
-      do {
-        // Fetch next work tile
-        auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(
-          work_tile_info,
-          clc_pipeline,
-          clc_pipeline_consumer_state
-        );
-
-        if (increment_pipe) {
-          ++clc_pipeline_consumer_state;
-        }
-
-        auto k_tile_count = TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, CtaShape_MNK{});
-          mma2accum_pipeline.consumer_wait(mma2accum_pipeline_consumer_state);
-
-          // Accumulators
-          Tensor accumulators = bulk_tmem(_,_,_,mma2accum_pipeline_consumer_state.index()); // ((MMA_TILE_M,MMA_TILE_N),MMA_M,MMA_N)
-
-          mma2accum_pipeline_consumer_state = scheduler.template fixup<IsComplex>(
-            TiledMma{},
-            work_tile_info,
-            accumulators,
+          auto [load2mma_pipeline_consumer_state_next, transform2mma_pipeline_consumer_state_next, mma2accum_pipeline_producer_state_next] = collective_mainloop.mma(
+            load2mma_pipeline,
+            load2mma_pipeline_consumer_state,
+            transform2mma_pipeline,
+            transform2mma_pipeline_consumer_state,
             mma2accum_pipeline,
-            mma2accum_pipeline_consumer_state,
-            typename CollectiveEpilogue::CopyOpT2R{}
+            mma2accum_pipeline_producer_state,
+            bulk_tmem,
+            mma_input_operands,
+            k_tile_count
           );
-
-          //
-          // Epilogue and write to gD
-          //
-          if (scheduler.compute_epilogue(work_tile_info)) {
-            auto [load_state_next, store_state_next, mma2accum_pipeline_state_next] = collective_epilogue.store(
-              epi_load_pipeline,
-              epi_load_pipe_consumer_state,
-              epi_store_pipeline,
-              epi_store_pipe_producer_state,
-              mma2accum_pipeline,
-              mma2accum_pipeline_consumer_state,
-              problem_shape_MNKL,
-              CtaShape_MNK{},
-              cta_coord_mnkl,
-              TileShape{},
-              TiledMma{},
-              accumulators,
-              shared_storage.tensors.epilogue
-            );
-            epi_load_pipe_consumer_state = load_state_next;
-            epi_store_pipe_producer_state = store_state_next;
-            do_tail_store = true;
-
-            // Advance the mma2accum pipe
-            mma2accum_pipeline_consumer_state = mma2accum_pipeline_state_next;
-          }
-
-        work_tile_info = next_work_tile_info;
-        cta_coord_mnkl = scheduler.work_tile_to_cta_coord(work_tile_info);
-      } while (work_tile_info.is_valid());
-
-      // Only drain the epilogue store pipeline if one of the work units processed ran the
-      // epilogue.  Under stream-K a cluster assigned only non-final K fragments of its
-      // tiles never runs it, and then there is nothing to drain.
-      if (do_tail_store) {
-        collective_epilogue.store_tail(
-          epi_load_pipeline, epi_load_pipe_consumer_state,
-          epi_store_pipeline, epi_store_pipe_producer_state,
-          CtaShape_MNK{});
+          // Advance the mm2accum pipe
+          load2mma_pipeline_consumer_state = load2mma_pipeline_consumer_state_next;
+          transform2mma_pipeline_consumer_state = transform2mma_pipeline_consumer_state_next;
+          mma2accum_pipeline_producer_state = mma2accum_pipeline_producer_state_next;
       }
+    } while (work_tile_info.is_valid());
+
+    // leader MMA waits for leader + peer epilogues to release accumulator stage
+    if (is_mma_leader_cta) {
+      mma2accum_pipeline.producer_tail(mma2accum_pipeline_producer_state);
+    }
+
+    // Hint on an early release of global memory resources.
+    // The timing of calling this function only influences performance,
+    // not functional correctness.
+    cutlass::arch::launch_dependent_grids();
+
+    // Signal to peer MMA that entire tmem allocation can be deallocated
+    if constexpr (has_mma_peer_cta) {
+      // Leader does wait + arrive, follower does arrive + wait
+      tmem_deallocation_result_barrier.arrive(mma_peer_cta_rank, not is_mma_leader_cta);
+      tmem_deallocation_result_barrier.wait(dealloc_barrier_phase);
+      tmem_deallocation_result_barrier.arrive(mma_peer_cta_rank, is_mma_leader_cta);
+    }
+
+    // Free entire tmem allocation
+    tmem_allocator.free(tmem_base_ptr, TmemAllocator::Sm100TmemCapacityColumns);
+  }
+
+  // Epilogue-load warp (only when the epilogue reads C): loads the source tile of every
+  // work tile that computes the epilogue, after the first A load has been issued.
+  template <class ProblemShapeMNKL, class CtaCoordMNKL>
+  CUTLASS_DEVICE void
+  run_epilogue_load(Params const& params, SharedStorage& shared_storage,
+                    ProblemShapeMNKL const& problem_shape_MNKL, CollectiveEpilogue& collective_epilogue,
+                    TileScheduler& scheduler, typename TileScheduler::WorkTileInfo work_tile_info,
+                    CtaCoordMNKL cta_coord_mnkl,
+                    EpiLoadPipeline& epi_load_pipeline, EpiLoadPipelineState epi_load_pipe_producer_state,
+                    EpiStorePipeline& epi_store_pipeline, EpiStorePipelineState epi_store_pipe_producer_state,
+                    CLCPipeline& clc_pipeline, CLCPipelineState clc_pipeline_consumer_state,
+                    LoadOrderBarrier& load_order_barrier, arch::ClusterBarrier& epilogue_throttle_barrier) {
+    // Ensure that the prefetched kernel does not touch
+    // unflushed global memory prior to this instruction
+    cutlass::arch::wait_on_dependent_grids();
+
+    bool do_load_order_wait = true;
+    bool do_tail_load = false;
+
+    // Signal the epilogue warps to proceed once the prologue is complete
+    epilogue_throttle_barrier.arrive();
+
+    do {
+      bool compute_epilogue = TileScheduler::compute_epilogue(work_tile_info, params.scheduler);
+      // Get current work tile and fetch next work tile
+      auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(
+        work_tile_info,
+        clc_pipeline,
+        clc_pipeline_consumer_state
+      );
+      work_tile_info = next_work_tile_info;
+
+      if (increment_pipe) {
+        ++clc_pipeline_consumer_state;
+      }
+
+      if (compute_epilogue) {
+        if (do_load_order_wait) {
+          load_order_barrier.wait();
+          do_load_order_wait = false;
+        }
+
+        epi_load_pipe_producer_state = collective_epilogue.load(
+          epi_load_pipeline,
+          epi_load_pipe_producer_state,
+          problem_shape_MNKL,
+          CtaShape_MNK{},
+          cta_coord_mnkl,
+          TileShape{},
+          TiledMma{},
+          shared_storage.tensors.epilogue
+        );
+
+        do_tail_load = true;
+      }
+
+      // Calculate the cta coordinates of the next work tile
+      cta_coord_mnkl = scheduler.work_tile_to_cta_coord(work_tile_info);
+    } while (work_tile_info.is_valid());
+
+    // Only perform a tail load if one of the work units processed performed
+    // an epilogue load. An example of a case in which a tail load should not be
+    // performed is in split-K if a cluster is only assigned non-final splits (for which
+    // the cluster does not compute the epilogue).
+    if (do_tail_load) {
+      collective_epilogue.load_tail(
+        epi_load_pipeline, epi_load_pipe_producer_state,
+        epi_store_pipeline, epi_store_pipe_producer_state);
+    }
+  }
+
+  // Epilogue warps: for every work tile, fetch the next one first, then wait for the
+  // accumulator stage, run the scheduler's fix-up, store the tile when this CTA computes
+  // its epilogue, and only then install the next tile's coordinates.
+  template <class ProblemShapeMNKL, class BulkTmem, class CtaCoordMNKL>
+  CUTLASS_DEVICE void
+  run_epilogue_store(SharedStorage& shared_storage, ProblemShapeMNKL const& problem_shape_MNKL,
+                     CollectiveMainloop& collective_mainloop, CollectiveEpilogue& collective_epilogue,
+                     BulkTmem const& bulk_tmem, TileScheduler& scheduler,
+                     typename TileScheduler::WorkTileInfo work_tile_info, CtaCoordMNKL cta_coord_mnkl,
+                     EpiLoadPipeline& epi_load_pipeline, EpiLoadPipelineState epi_load_pipe_consumer_state,
+                     EpiStorePipeline& epi_store_pipeline, EpiStorePipelineState epi_store_pipe_producer_state,
+                     Mma2AccumPipeline& mma2accum_pipeline,
+                     Mma2AccumPipelineState mma2accum_pipeline_consumer_state,
+                     CLCPipeline& clc_pipeline, CLCPipelineState clc_pipeline_consumer_state,
+                     arch::NamedBarrier& tmem_allocation_result_barrier,
+                     arch::ClusterBarrier& epilogue_throttle_barrier) {
+    using namespace cute;
+
+    // Throttle the epilogue warps to improve prologue performance
+    static constexpr int epilogue_throttle_phase_bit = 0;
+    epilogue_throttle_barrier.wait(epilogue_throttle_phase_bit);
+
+    // Wait for tmem allocation
+    tmem_allocation_result_barrier.arrive_and_wait_unaligned();
+
+    auto accum_inputs = collective_mainloop.accum_init(bulk_tmem, typename CollectiveEpilogue::CopyOpT2R{}, typename CollectiveEpilogue::EpilogueTile{});
+    bool do_tail_store = false;
+    do {
+      // Fetch next work tile
+      auto [next_work_tile_info, increment_pipe] = scheduler.fetch_next_work(
+        work_tile_info,
+        clc_pipeline,
+        clc_pipeline_consumer_state
+      );
+
+      if (increment_pipe) {
+        ++clc_pipeline_consumer_state;
+      }
+
+      auto k_tile_count = TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, CtaShape_MNK{});
+      mma2accum_pipeline.consumer_wait(mma2accum_pipeline_consumer_state);
+
+      // Accumulators
+      Tensor accumulators = bulk_tmem(_,_,_,mma2accum_pipeline_consumer_state.index()); // ((MMA_TILE_M,MMA_TILE_N),MMA_M,MMA_N)
+
+      mma2accum_pipeline_consumer_state = scheduler.template fixup<IsComplex>(
+        TiledMma{},
+        work_tile_info,
+        accumulators,
+        mma2accum_pipeline,
+        mma2accum_pipeline_consumer_state,
+        typename CollectiveEpilogue::CopyOpT2R{}
+      );
+
+      //
+      // Epilogue and write to gD
+      //
+      if (scheduler.compute_epilogue(work_tile_info)) {
+        auto [load_state_next, store_state_next, mma2accum_pipeline_state_next] = collective_epilogue.store(
+          epi_load_pipeline,
+          epi_load_pipe_consumer_state,
+          epi_store_pipeline,
+          epi_store_pipe_producer_state,
+          mma2accum_pipeline,
+          mma2accum_pipeline_consumer_state,
+          problem_shape_MNKL,
+          CtaShape_MNK{},
+          cta_coord_mnkl,
+          TileShape{},
+          TiledMma{},
+          accumulators,
+          shared_storage.tensors.epilogue
+        );
+        epi_load_pipe_consumer_state = load_state_next;
+        epi_store_pipe_producer_state = store_state_next;
+        do_tail_store = true;
+
+        // Advance the mma2accum pipe
+        mma2accum_pipeline_consumer_state = mma2accum_pipeline_state_next;
+      }
+
+      work_tile_info = next_work_tile_info;
+      cta_coord_mnkl = scheduler.work_tile_to_cta_coord(work_tile_info);
+    } while (work_tile_info.is_valid());
+
+    // Only drain the epilogue store pipeline if one of the work units processed ran the
+    // epilogue.  Under stream-K a cluster assigned only non-final K fragments of its
+    // tiles never runs it, and then there is nothing to drain.
+    if (do_tail_store) {
+      collective_epilogue.store_tail(
+        epi_load_pipeline, epi_load_pipe_consumer_state,
+        epi_store_pipeline, epi_store_pipe_producer_state,
+        CtaShape_MNK{});
+    }
+  }
+
+  //
+  // Pipeline parameters.  Each warp's role in a pipeline follows from its category; the
+  // arrival counts and initializing warps are the kernel's fixed wiring.
+  //
+
+  static CUTLASS_DEVICE typename Load2TransformPipeline::Params
+  load2transform_params(WarpCategory warp_category, bool is_leader) {
+    typename Load2TransformPipeline::Params p;
+    if (warp_category == WarpCategory::MainloopLoad) {
+      p.role = Load2TransformPipeline::ThreadCategory::Producer;
+    }
+    else if (warp_category == WarpCategory::Transformation) {
+      p.role = Load2TransformPipeline::ThreadCategory::Consumer;
+    }
+    p.is_leader = is_leader;
+    p.num_consumers = NumTransformationThreads;
+    p.transaction_bytes = CollectiveMainloop::TmaTransactionBytes_A;
+    p.initializing_warp = 0;
+    return p;
+  }
+
+  static CUTLASS_DEVICE typename Load2MmaPipeline::Params
+  load2mma_params(WarpCategory warp_category, bool is_leader) {
+    typename Load2MmaPipeline::Params p;
+    if (warp_category == WarpCategory::MainloopLoadB) {
+      p.role = Load2MmaPipeline::ThreadCategory::Producer;
+    }
+    else if (warp_category == WarpCategory::MMA) {
+      p.role = Load2MmaPipeline::ThreadCategory::Consumer;
+    }
+    p.is_leader = is_leader;
+    p.num_consumers = NumMMAThreads;
+    p.transaction_bytes = CollectiveMainloop::TmaTransactionBytes_B;
+    p.initializing_warp = 8;
+    return p;
+  }
+
+  static CUTLASS_DEVICE typename Transform2MmaPipeline::Params
+  transform2mma_params(WarpCategory warp_category) {
+    typename Transform2MmaPipeline::Params p;
+    if (warp_category == WarpCategory::Transformation) {
+      p.role = Transform2MmaPipeline::ThreadCategory::Producer;
+    }
+    else if (warp_category == WarpCategory::MMA) {
+      p.role = Transform2MmaPipeline::ThreadCategory::Consumer;
+    }
+    p.consumer_arv_count = 1;
+    p.producer_arv_count = cute::size(AtomThrShapeMNK{}) * NumTransformationThreads;
+    p.initializing_warp = 2;
+    return p;
+  }
+
+  static CUTLASS_DEVICE typename Mma2AccumPipeline::Params
+  mma2accum_params(WarpCategory warp_category) {
+    typename Mma2AccumPipeline::Params p;
+    if (warp_category == WarpCategory::MMA) {
+      p.role = Mma2AccumPipeline::ThreadCategory::Producer;
+    }
+    else if (warp_category == WarpCategory::Epilogue) {
+      p.role = Mma2AccumPipeline::ThreadCategory::Consumer;
+    }
+    p.producer_arv_count = 1;
+    p.consumer_arv_count = cute::size(AtomThrShapeMNK{}) * NumEpilogueThreads;
+    p.initializing_warp = 6;
+    return p;
+  }
+
+  static CUTLASS_DEVICE typename EpiLoadPipeline::Params
+  epi_load_params(WarpCategory warp_category, int cta_rank_in_cluster) {
+    typename EpiLoadPipeline::Params p;
+    if (WarpCategory::EpilogueLoad == warp_category) {
+      p.role = EpiLoadPipeline::ThreadCategory::Producer;
+    }
+    if (WarpCategory::Epilogue == warp_category) {
+      p.role = EpiLoadPipeline::ThreadCategory::Consumer;
+    }
+    p.dst_blockid = cta_rank_in_cluster;
+    p.producer_arv_count = NumEpilogueLoadThreads;
+    p.consumer_arv_count = NumEpilogueThreads;
+    p.transaction_bytes = CollectiveEpilogue::TmaTransactionBytes;
+    p.initializing_warp = 4;
+    return p;
+  }
+
+  static CUTLASS_DEVICE typename LoadOrderBarrier::Params
+  load_order_params(WarpCategory warp_category) {
+    typename LoadOrderBarrier::Params p;
+    p.group_id = (warp_category == WarpCategory::MainloopLoad) ? 0 : 1;
+    p.group_size = 1;
+    p.initializing_warp = 5;
+    return p;
+  }
+
+  static CUTLASS_DEVICE typename CLCPipeline::Params
+  clc_params(WarpCategory warp_category, int cluster_size, bool is_epi_load_needed) {
+    typename CLCPipeline::Params p;
+    if (WarpCategory::Sched == warp_category) {
+      p.role = CLCPipeline::ThreadCategory::ProducerConsumer;
     }
     else {
+      p.role = CLCPipeline::ThreadCategory::Consumer;
     }
+    p.producer_blockid = 0;
+    p.producer_arv_count = 1;
+    p.consumer_arv_count = NumSchedThreads + cluster_size *
+                               (NumMainloopLoadThreads + NumMainloopLoadBThreads + NumEpilogueThreads +
+                                NumMMAThreads + NumTransformationThreads);
+    if (is_epi_load_needed) {
+      p.consumer_arv_count += cluster_size * NumEpilogueLoadThreads;
+    }
+    p.transaction_bytes = CLCResponseSize;
+    p.initializing_warp = 1;
+    return p;
+  }
+
+  static CUTLASS_DEVICE typename CLCThrottlePipeline::Params
+  clc_throttle_params(WarpCategory warp_category) {
+    typename CLCThrottlePipeline::Params p;
+    if (WarpCategory::MainloopLoad == warp_category) {
+      p.role = CLCThrottlePipeline::ThreadCategory::Producer;
+    }
+    if (WarpCategory::Sched == warp_category) {
+      p.role = CLCThrottlePipeline::ThreadCategory::Consumer;
+    }
+    p.producer_arv_count = NumMainloopLoadThreads;
+    p.consumer_arv_count = NumSchedThreads;
+    p.dst_blockid = 0;
+    p.initializing_warp = 3;
+    return p;
   }
 };
 

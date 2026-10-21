@@ -58,15 +58,12 @@ inline bool W8A16Sm90IsSplitK(W8A16Sm90Algo a) {
 // W8A16Sm90::MinKTilesPerSplit k-tiles each, at most W8A16Sm90::MaxSplits slices.  The count
 // comes from the cost model (W8A16Sm90SplitUs).
 
-// Largest legal split <= want that divides the k-tile count (the batched problem needs
-// equal slices); 1 when K has fewer than 2 * W8A16Sm90::MinKTilesPerSplit k-tiles.
-inline int W8A16Sm90LegalSplits(int K, int want) {
+// Whether K can be cut into s equal slices under those rules (the batched problem needs
+// equal slices).
+inline bool W8A16Sm90IsLegalSplit(int K, int s) {
+  if (s < 2 || s > W8A16Sm90::MaxSplits || K % W8A16Sm90::TileK != 0) return false;
   const int ktiles = K / W8A16Sm90::TileK;
-  if (K % W8A16Sm90::TileK != 0) return 1;
-  for (int s = std::min(want, W8A16Sm90::MaxSplits); s >= 2; --s) {
-    if (ktiles % s == 0 && ktiles / s >= W8A16Sm90::MinKTilesPerSplit) return s;
-  }
-  return 1;
+  return ktiles % s == 0 && ktiles / s >= W8A16Sm90::MinKTilesPerSplit;
 }
 
 // Cost model for M <= 8192 over the CUTLASS menu.  Each candidate's time, in us, from three
@@ -147,7 +144,7 @@ inline int W8A16Sm90PickSplits(const W8A16Sm90TileCost& t, int M, int N, int K, 
   int best = 1;
   double best_us = 1e30;
   for (int s = 2; s <= W8A16Sm90::MaxSplits; ++s) {
-    if (W8A16Sm90LegalSplits(K, s) != s) continue;
+    if (!W8A16Sm90IsLegalSplit(K, s)) continue;
     const double us = W8A16Sm90SplitUs(t, M, N, K, num_sms, s);
     if (us < best_us) {
       best_us = us;
@@ -163,14 +160,40 @@ inline int W8A16Sm90SplitsFor(const W8A16Sm90TileCost& t, int M, int N, int K, i
   const int s = W8A16Sm90PickSplits(t, M, N, K, num_sms);
   if (s >= 2) return s;
   for (int c = 2; c <= W8A16Sm90::MaxSplits; ++c)
-    if (W8A16Sm90LegalSplits(K, c) == c) return c;
+    if (W8A16Sm90IsLegalSplit(K, c)) return c;
   return 1;
 }
 
-inline W8A16Sm90Algo W8A16Sm90PickByCost(int M, int N, int K, int num_sms) {
-  using A = W8A16Sm90Algo;
+// Modelled time of plain tile `t`: whole waves of one tile each.
+inline double W8A16Sm90PlainUs(const W8A16Sm90TileCost& t, int M, int N, int K, int num_sms) {
+  const double sms = std::max(num_sms, 1);
+  return std::ceil(W8A16Sm90TilesOf(t, M, N) / sms) * W8A16Sm90TileUs(t, K);
+}
+
+// Modelled time of tile `t` under stream-K (the decomposition rule in the cost-model
+// comment above).
+inline double W8A16Sm90StreamKUs(const W8A16Sm90TileCost& t, int M, int N, int K, int num_sms) {
   const double sms = std::max(num_sms, 1);
   const int ktiles = K / W8A16Sm90::TileK;
+  const double tiles = W8A16Sm90TilesOf(t, M, N);
+  const double tile_us = W8A16Sm90TileUs(t, K);
+  const double full_waves = std::floor(tiles / sms), total_waves = std::ceil(tiles / sms);
+  const double tail_tiles = tiles - full_waves * sms;
+  if (full_waves == total_waves || ktiles <= 8 || (full_waves >= 1 && 2 * tail_tiles >= sms)) {
+    return total_waves * tile_us;  // CUTLASS runs this data-parallel
+  }
+  const double dp_waves = full_waves > 1 ? full_waves - 1 : 0;
+  const double sk_tiles = tiles - dp_waves * sms;
+  const double units = std::max(1.0, std::min(sms, std::floor(sk_tiles * ktiles / 8.0)));
+  return dp_waves * tile_us + sk_tiles * ktiles / units * (tile_us / ktiles) * 1.1 + 8.0 +
+         2.0 * units / sk_tiles;
+}
+
+// The cost model's choice: the smallest modelled time over the plain tiles, then stream-K
+// over 128x256 / 128x192, then split-K over 128x128 / 128x256 at every legal split.  Ties
+// go to the earlier candidate.
+inline W8A16Sm90Algo W8A16Sm90PickByCost(int M, int N, int K, int num_sms) {
+  using A = W8A16Sm90Algo;
   A best = A::Tile128x256;
   double best_us = 1e30;
   auto consider = [&](A a, double us) {
@@ -179,33 +202,14 @@ inline W8A16Sm90Algo W8A16Sm90PickByCost(int M, int N, int K, int num_sms) {
       best = a;
     }
   };
-  for (const auto& t : W8A16Sm90TileCosts)
-    consider(t.algo, std::ceil(W8A16Sm90TilesOf(t, M, N) / sms) * W8A16Sm90TileUs(t, K));
-  // Stream-K over 128x256 / 128x192.
+  for (const auto& t : W8A16Sm90TileCosts) consider(t.algo, W8A16Sm90PlainUs(t, M, N, K, num_sms));
   for (A a : {A::Tile128x256StreamK, A::Tile128x192StreamK}) {
-    const auto& t = W8A16Sm90TileOf(a);
-    const double tiles = W8A16Sm90TilesOf(t, M, N);
-    const double per_tile = W8A16Sm90TileUs(t, K);
-    const double full = std::floor(tiles / sms), total = std::ceil(tiles / sms);
-    const double tail = tiles - full * sms;
-    double us;
-    if (full == total || ktiles <= 8 || (full >= 1 && 2 * tail >= sms)) {
-      us = total * per_tile;
-    } else {
-      const double dp_waves = full > 1 ? full - 1 : 0;
-      const double sk_tiles = tiles - dp_waves * sms;
-      const double units = std::max(1.0, std::min(sms, std::floor(sk_tiles * ktiles / 8.0)));
-      us = dp_waves * per_tile + sk_tiles * ktiles / units * (per_tile / ktiles) * 1.1 + 8.0 +
-           2.0 * units / sk_tiles;
-    }
-    consider(a, us);
+    consider(a, W8A16Sm90StreamKUs(W8A16Sm90TileOf(a), M, N, K, num_sms));
   }
-  // Split-K over 128x128 / 128x256.
   for (A a : {A::Tile128x128SplitK, A::Tile128x256SplitK}) {
     const auto& t = W8A16Sm90TileOf(a);
     for (int s = 2; s <= W8A16Sm90::MaxSplits; ++s) {
-      if (W8A16Sm90LegalSplits(K, s) != s) continue;
-      consider(a, W8A16Sm90SplitUs(t, M, N, K, num_sms, s));
+      if (W8A16Sm90IsLegalSplit(K, s)) consider(a, W8A16Sm90SplitUs(t, M, N, K, num_sms, s));
     }
   }
   return best;
@@ -255,7 +259,7 @@ struct W8A16Sm90Plan {
 // that variant) and the problem to the plan both the workspace query and the launch use.
 //   cudaErrorInvalidValue: `algo_code` is not a variant (1 is reserved).
 //   cudaErrorNotSupported: a forced split-K variant on a K that cannot be sliced (see
-//                          W8A16Sm90LegalSplits); the launcher's own choice never is.
+//                          W8A16Sm90IsLegalSplit); the launcher's own choice never is.
 inline cudaError_t W8A16Sm90Resolve(int M, int N, int K, int num_sms, int64_t algo_code,
                                     W8A16Sm90Plan* plan) {
   if (algo_code == 0) {

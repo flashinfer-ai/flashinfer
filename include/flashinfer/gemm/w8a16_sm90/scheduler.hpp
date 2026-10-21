@@ -117,28 +117,27 @@ class W8A16Sm90GroupedTileScheduler
 
   CUTLASS_DEVICE WorkTileInfo get_current_work() const { return work_for_linear_idx(linear_); }
 
-  CUTLASS_DEVICE WorkTileInfo work_for_linear_idx(uint64_t u64) const {
+  CUTLASS_DEVICE WorkTileInfo work_for_linear_idx(uint64_t linear_idx) const {
     Params const& p = *p_;
-    if (u64 >= p.blocks_per_problem_) return WorkTileInfo::invalid_work_tile();
+    if (linear_idx >= p.blocks_per_problem_) return WorkTileInfo::invalid_work_tile();
     // Tile counts here fit in int (CUTLASS's own FastDivmod paths assume the same).  The
     // batch (split-K slice) is the slowest index, as in CUTLASS's own scheduler
     // (blocks_per_problem_ counts all batches); the group map runs inside one batch.
-    int l, u;
-    p.div_batch_tiles_.fast_divmod(l, u, static_cast<int>(u64));
+    int batch, tile_in_batch;
+    p.div_batch_tiles_.fast_divmod(batch, tile_in_batch, static_cast<int>(linear_idx));
     int slow, fast;
-    if (static_cast<uint32_t>(u) < p.full_tiles_) {
-      int gi, in, q, r;
-      p.div_group_tiles_.fast_divmod(gi, in, u);
-      p.div_group_.fast_divmod(q, r, in);
-      slow = gi * static_cast<int>(p.group_) + r;
-      fast = q;
+    if (static_cast<uint32_t>(tile_in_batch) < p.full_tiles_) {
+      int group_idx, tile_in_group, offset_in_group;
+      p.div_group_tiles_.fast_divmod(group_idx, tile_in_group, tile_in_batch);
+      p.div_group_.fast_divmod(fast, offset_in_group, tile_in_group);
+      slow = group_idx * static_cast<int>(p.group_) + offset_in_group;
     } else {  // the remainder group, narrower, no padding
-      int q, r;
-      p.div_rem_.fast_divmod(q, r, u - static_cast<int>(p.full_tiles_));
-      slow = static_cast<int>(p.full_groups_ * p.group_) + r;
-      fast = q;
+      int offset_in_group;
+      p.div_rem_.fast_divmod(fast, offset_in_group,
+                             tile_in_batch - static_cast<int>(p.full_tiles_));
+      slow = static_cast<int>(p.full_groups_ * p.group_) + offset_in_group;
     }
-    return {along_m_ ? fast : slow, along_m_ ? slow : fast, l, true};
+    return {along_m_ ? fast : slow, along_m_ ? slow : fast, batch, true};
   }
 
   CUTLASS_DEVICE void advance_to_next_work(uint32_t advance_count = 1) {

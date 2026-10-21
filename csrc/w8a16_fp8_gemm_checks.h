@@ -96,6 +96,28 @@ inline void W8A16CheckDims(int64_t M, int64_t N, int64_t K) {
   TVM_FFI_ICHECK(N % 8 == 0) << "N must be a multiple of 8 (16-byte output rows), got " << N;
 }
 
+// Aliasing: the two buffers the call writes (out, workspace) against everything it reads
+// and against each other.  The inputs may alias one another.
+inline void W8A16CheckAliasing(const TensorView& out, const TensorView& act,
+                               const TensorView& weight, const TensorView& scale,
+                               const ffi::Optional<TensorView>& bias,
+                               const ffi::Optional<TensorView>& workspace) {
+  const W8A16ByteSpan out_span = W8A16SpanOf(out);
+  const W8A16ByteSpan ws_span =
+      workspace.has_value() ? W8A16SpanOf(workspace.value()) : W8A16ByteSpan{};
+  W8A16CheckDisjoint("out", out_span, "act", W8A16SpanOf(act));
+  W8A16CheckDisjoint("out", out_span, "weight", W8A16SpanOf(weight));
+  W8A16CheckDisjoint("out", out_span, "scale", W8A16SpanOf(scale));
+  W8A16CheckDisjoint("workspace", ws_span, "act", W8A16SpanOf(act));
+  W8A16CheckDisjoint("workspace", ws_span, "weight", W8A16SpanOf(weight));
+  W8A16CheckDisjoint("workspace", ws_span, "scale", W8A16SpanOf(scale));
+  W8A16CheckDisjoint("workspace", ws_span, "out", out_span);
+  if (bias.has_value()) {
+    W8A16CheckDisjoint("out", out_span, "bias", W8A16SpanOf(bias.value()));
+    W8A16CheckDisjoint("workspace", ws_span, "bias", W8A16SpanOf(bias.value()));
+  }
+}
+
 // Validates every tensor argument of w8a16_fp8_gemm against the contract above (the
 // 16-byte alignment applies to act, weight, out, bias and the workspace).  `act_dtype_code`
 // is the DLPack code the module was built for (W8A16_ACT_DTYPE_CODE).
@@ -155,21 +177,7 @@ inline W8A16Operands W8A16CheckOperands(const TensorView& out, const TensorView&
     ops.workspace = wsv.data_ptr();
     ops.workspace_bytes = static_cast<size_t>(wsv.numel()) * (wsv.dtype().bits / 8);
   }
-  // Aliasing: the two buffers the call writes against everything it reads.
-  const W8A16ByteSpan out_span = W8A16SpanOf(out);
-  const W8A16ByteSpan ws_span =
-      workspace.has_value() ? W8A16SpanOf(workspace.value()) : W8A16ByteSpan{};
-  W8A16CheckDisjoint("out", out_span, "act", W8A16SpanOf(act));
-  W8A16CheckDisjoint("out", out_span, "weight", W8A16SpanOf(weight));
-  W8A16CheckDisjoint("out", out_span, "scale", W8A16SpanOf(scale));
-  W8A16CheckDisjoint("workspace", ws_span, "act", W8A16SpanOf(act));
-  W8A16CheckDisjoint("workspace", ws_span, "weight", W8A16SpanOf(weight));
-  W8A16CheckDisjoint("workspace", ws_span, "scale", W8A16SpanOf(scale));
-  W8A16CheckDisjoint("workspace", ws_span, "out", out_span);
-  if (bias.has_value()) {
-    W8A16CheckDisjoint("out", out_span, "bias", W8A16SpanOf(bias.value()));
-    W8A16CheckDisjoint("workspace", ws_span, "bias", W8A16SpanOf(bias.value()));
-  }
+  W8A16CheckAliasing(out, act, weight, scale, bias, workspace);
   ops.device_id = act.device().device_id;
   ops.num_sms = W8A16NumSms(ops.device_id);
   return ops;

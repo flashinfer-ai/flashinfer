@@ -197,7 +197,7 @@ def _capture_graphs(args, run_fn: Callable[[], None]):
     return g_reset, g_run
 
 
-def _time_kernel_cupti(args, run_fn: Callable[[], None], tag: str):
+def _time_kernel_cupti(args, run_fn: Callable[[], None], tag: str, iters: int):
     from cupti import cupti
 
     def _buf_requested():
@@ -237,7 +237,7 @@ def _time_kernel_cupti(args, run_fn: Callable[[], None], tag: str):
     )
 
     torch.cuda.nvtx.range_push(tag)
-    for _ in range(args.iters):
+    for _ in range(iters):
         g_reset.replay()
         torch.cuda.synchronize()
         start_cpu = cupti.get_timestamp()
@@ -286,11 +286,11 @@ def _time_kernel_cupti(args, run_fn: Callable[[], None], tag: str):
     return _compute_stats(latencies_us)
 
 
-def _time_kernel_cuda_graph(args, run_fn: Callable[[], None], tag: str):
+def _time_kernel_cuda_graph(args, run_fn: Callable[[], None], tag: str, iters: int):
     """CUDA-event fallback (includes graph launch overhead; CUPTI preferred)."""
     g_reset, g_run = _capture_graphs(args, run_fn)
     latencies_us: list[float] = []
-    for _ in range(args.iters):
+    for _ in range(iters):
         g_reset.replay()
         torch.cuda.synchronize()
         start = torch.cuda.Event(enable_timing=True)
@@ -306,7 +306,8 @@ def _time_kernel_cuda_graph(args, run_fn: Callable[[], None], tag: str):
 _CUPTI_UNAVAILABLE_WARNED = False
 
 
-def _time_kernel(args, run_fn: Callable[[], None], tag: str):
+def _time_kernel(args, run_fn: Callable[[], None], tag: str, iters: int):
+    """Median / min / max latency of ``run_fn`` over ``iters`` timed replays."""
     if args.l2_flush:
         _init_l2_flush()
     if args.cupti:
@@ -322,8 +323,8 @@ def _time_kernel(args, run_fn: Callable[[], None], tag: str):
                 )
                 _CUPTI_UNAVAILABLE_WARNED = True
         else:
-            return _time_kernel_cupti(args, run_fn, tag)
-    return _time_kernel_cuda_graph(args, run_fn, tag)
+            return _time_kernel_cupti(args, run_fn, tag, iters)
+    return _time_kernel_cuda_graph(args, run_fn, tag, iters)
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +454,6 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
             kernel_out = torch.empty(m, n, dtype=dtype, device=dev)
         impls[name] = make_kernel(act, w_fp8, scale, bias, algo=algo, out=kernel_out)
 
-    us: dict[str, float] = {}
     max_abs: dict[str, float] = {}
     max_rel: dict[str, float] = {}
     for name, fn in impls.items():
@@ -461,33 +461,52 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
         torch.cuda.synchronize()
         max_abs[name], max_rel[name] = _errors(out, ref)
         del out
-    # --rounds R: R passes over the implementations (order rotated each pass), median per
-    # implementation across passes.  At large M the GPU sits on its power cap and the clock
-    # drifts between back-to-back measurements; interleaving keeps that drift out of the
-    # per-row ratios.
+    us = _time_columns(args, impls, f"w8a16[{layer} tp{tp} M={m} N={n} K={k}]")
+    passed = _kernel_gate(args, impls, max_abs, act, w_fp8, scale, bias, ref)
+
+    del act, w_fp8, w_deq, w_deq_f32, ref
+    torch.cuda.empty_cache()
+    return Row(layer, tp, m, n, k, us, max_abs, max_rel, passed)
+
+
+def _burst_iters(args, fn: Callable[[], torch.Tensor]) -> int:
+    """Timed-burst length for one column under --burst-seconds: the launch count
+    that fills the burst at the column's own per-call time (5 untimed calls),
+    clamped to 50..5000."""
+    torch.cuda.synchronize()
+    ev0, ev1 = (
+        torch.cuda.Event(enable_timing=True),
+        torch.cuda.Event(enable_timing=True),
+    )
+    ev0.record()
+    for _ in range(5):
+        fn()
+    ev1.record()
+    torch.cuda.synchronize()
+    call_s = max(ev0.elapsed_time(ev1) / 5 * 1e-3, 1e-6)
+    return int(min(5000, max(50, math.ceil(args.burst_seconds / call_s))))
+
+
+def _time_columns(
+    args, impls: dict[str, Callable[[], torch.Tensor]], tag_prefix: str
+) -> dict[str, float]:
+    """Median latency per implementation over --rounds passes.
+
+    --rounds R: R passes over the implementations (order rotated each pass), median per
+    implementation across passes.  At large M the GPU sits on its power cap and the clock
+    drifts between back-to-back measurements; interleaving keeps that drift out of the
+    per-row ratios.
+
+    Steady-state protocol (--warmup-seconds / --burst-seconds): a short burst never
+    reaches the power cap and measures the boost clock instead.  Heat the GPU with an
+    untimed burst of the first column, then size each timed burst by time rather than
+    by launch count.
+    """
     names = list(impls)
-    # Steady-state protocol (--warmup-seconds / --burst-seconds): a short burst never
-    # reaches the power cap and measures the boost clock instead.  Heat the GPU with an
-    # untimed burst of the first column, then size each timed burst by time rather than
-    # by launch count.
     iters_by_name = {name: args.iters for name in names}
     if args.burst_seconds > 0:
         for name in names:
-            fn = impls[name]
-            torch.cuda.synchronize()
-            ev0, ev1 = (
-                torch.cuda.Event(enable_timing=True),
-                torch.cuda.Event(enable_timing=True),
-            )
-            ev0.record()
-            for _ in range(5):
-                fn()
-            ev1.record()
-            torch.cuda.synchronize()
-            call_s = max(ev0.elapsed_time(ev1) / 5 * 1e-3, 1e-6)
-            iters_by_name[name] = int(
-                min(5000, max(50, math.ceil(args.burst_seconds / call_s)))
-            )
+            iters_by_name[name] = _burst_iters(args, impls[name])
     if args.warmup_seconds > 0 and not _HEATED[0]:
         fn = impls[names[0]]
         t_end = time.monotonic() + args.warmup_seconds
@@ -506,40 +525,47 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
         order = names[off:] + names[:off]
         for name in order:
             fn = impls[name]
-            tag = f"w8a16[{layer} tp{tp} M={m} N={n} K={k}] {name}"
-            saved = args.iters
-            args.iters = iters_by_name[name]
-            t, _, _ = _time_kernel(args, lambda: fn(), tag)
-            args.iters = saved
+            t, _, _ = _time_kernel(
+                args, lambda: fn(), f"{tag_prefix} {name}", iters_by_name[name]
+            )
             per_round[name].append(t)
-    for name in names:
-        us[name] = statistics.median(per_round[name])
+    return {name: statistics.median(per_round[name]) for name in names}
 
-    passed: bool | None = None
+
+def _kernel_gate(
+    args,
+    impls: dict[str, Callable[[], torch.Tensor]],
+    max_abs: dict[str, float],
+    act: torch.Tensor,
+    w_fp8: torch.Tensor,
+    scale: torch.Tensor,
+    bias,
+    ref: torch.Tensor,
+) -> bool | None:
+    """Correctness gate over the kernel columns; ``None`` when none was run.
+
+    Both accumulate in fp32 and differ from the fp32 reference by the reduction
+    order and the one output rounding (the cast-copy also by rounding the scaled
+    weight to 16 bits); demand the kernel be no worse than that path (with a
+    floor so an exactly-fp32-accumulating reference isn't penalised for a tiny
+    cast-copy error).
+    """
     kernel_cols = [c for c in impls if c.startswith("kernel")]
-    if kernel_cols:
-        # Both accumulate in fp32 and differ from the fp32 reference by the reduction
-        # order and the one output rounding (the cast-copy also by rounding the scaled
-        # weight to 16 bits); demand the kernel be no worse than that path (with a
-        # floor so an exactly-fp32-accumulating reference isn't penalised for a tiny
-        # cast-copy error).
-        cast_err = max_abs.get("cast")
-        if cast_err is None:
-            # cast column not requested: compute it once for the gate only.
-            out = make_cast_copy(act, w_fp8, scale, bias)()
-            torch.cuda.synchronize()
-            cast_err, _ = _errors(out, ref)
-            del out
-        floor = args.tol_floor * ref.abs().max().item()
-        passed = all(
-            max_abs[c] <= max(args.tol_mult * cast_err, floor)
-            and torch.isfinite(torch.tensor(max_abs[c]))
-            for c in kernel_cols
-        )
-
-    del act, w_fp8, w_deq, w_deq_f32, ref
-    torch.cuda.empty_cache()
-    return Row(layer, tp, m, n, k, us, max_abs, max_rel, passed)
+    if not kernel_cols:
+        return None
+    cast_err = max_abs.get("cast")
+    if cast_err is None:
+        # cast column not requested: compute it once for the gate only.
+        out = make_cast_copy(act, w_fp8, scale, bias)()
+        torch.cuda.synchronize()
+        cast_err, _ = _errors(out, ref)
+        del out
+    floor = args.tol_floor * ref.abs().max().item()
+    return all(
+        max_abs[c] <= max(args.tol_mult * cast_err, floor)
+        and torch.isfinite(torch.tensor(max_abs[c]))
+        for c in kernel_cols
+    )
 
 
 # ---------------------------------------------------------------------------

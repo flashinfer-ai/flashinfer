@@ -1068,48 +1068,50 @@ public:
       auto curr_load2transform_pipeline_consumer_state = load2transform_pipeline_consumer_state;
       auto curr_transform2mma_pipeline_producer_state = transform2mma_pipeline_producer_state;
 
+      // A chunk of the fragment (rank 3) re-expressed with a unit k-block mode appended, so
+      // the converter's k_block indexing applies to it.
+      auto as_rank4 = [](auto chunk) {
+        return make_tensor(chunk.data(), make_layout(append(chunk.shape(), _1{}), append(chunk.stride(), _0{})));
+      };
+      // This warpgroup's half: load its share of the fragment from smem, release the smem
+      // stage to the mainloop load as early as possible (all transform warps), then convert
+      // in registers and store to smem or TMEM.  Only the fragment indexing differs between
+      // the two partitionings.
       auto transform_half = [&](auto group) {
-        constexpr int FirstKBlock = decltype(group)::value * PerGroup;
+        constexpr int GroupOffset = decltype(group)::value * PerGroup;
         if constexpr (SplitOnK) {
-          // Copy this warpgroup's k-blocks of the input A matrix from SMEM
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < PerGroup; ++i) {
-            copy(AutoVectorizingCopy{}, tAsA(_,_,_,FirstKBlock + i,load2transform_consumer_index), tArA(_,_,_,FirstKBlock + i));
-          }
-
-          // Loads from SMEM are done (all transform warps). Signal the mainloop load as early as possible
-          transform_bar.sync();
-          load2transform_pipeline.consumer_release(curr_load2transform_pipeline_consumer_state);
-
-          // Dequantize this warpgroup's k-blocks in RF and store them into Smem or Tmem
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < PerGroup; ++i) {
-            Utils::dequantize_A_kblock_for_transform(tArA, tArACompute, partitioned_extra_info, FirstKBlock + i);
-            copy(dst_copy_A, tArACompute(_,_,_,FirstKBlock + i), tAsACompute(_,_,_,FirstKBlock + i,transform2mma_producer_index));
+            copy(AutoVectorizingCopy{}, tAsA(_,_,_,GroupOffset + i,load2transform_consumer_index), tArA(_,_,_,GroupOffset + i));
           }
         }
         else {
-          // Split along the chunk mode; each chunk still carries the (unit) k-block mode,
-          // re-expressed as a rank-4 view so the converter's k_block indexing applies.
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < PerGroup; ++i) {
-            copy(AutoVectorizingCopy{}, tAsA(_,FirstKBlock + i,_,_,load2transform_consumer_index), tArA(_,FirstKBlock + i,_,_));
+            copy(AutoVectorizingCopy{}, tAsA(_,GroupOffset + i,_,_,load2transform_consumer_index), tArA(_,GroupOffset + i,_,_));
           }
+        }
 
-          transform_bar.sync();
-          load2transform_pipeline.consumer_release(curr_load2transform_pipeline_consumer_state);
+        transform_bar.sync();
+        load2transform_pipeline.consumer_release(curr_load2transform_pipeline_consumer_state);
 
+        if constexpr (SplitOnK) {
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < PerGroup; ++i) {
-            auto src_chunk = tArA(_,FirstKBlock + i,_,_);
-            auto dst_chunk = tArACompute(_,FirstKBlock + i,_,_);
-            auto src4 = make_tensor(src_chunk.data(), make_layout(append(src_chunk.shape(), _1{}), append(src_chunk.stride(), _0{})));
-            auto dst4 = make_tensor(dst_chunk.data(), make_layout(append(dst_chunk.shape(), _1{}), append(dst_chunk.stride(), _0{})));
+            Utils::dequantize_A_kblock_for_transform(tArA, tArACompute, partitioned_extra_info, GroupOffset + i);
+            copy(dst_copy_A, tArACompute(_,_,_,GroupOffset + i), tAsACompute(_,_,_,GroupOffset + i,transform2mma_producer_index));
+          }
+        }
+        else {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < PerGroup; ++i) {
+            auto src4 = as_rank4(tArA(_,GroupOffset + i,_,_));
+            auto dst4 = as_rank4(tArACompute(_,GroupOffset + i,_,_));
             CUTLASS_PRAGMA_UNROLL
             for (int k_block = 0; k_block < K_BLOCK_MAX; ++k_block) {
               Utils::dequantize_A_kblock_for_transform(src4, dst4, partitioned_extra_info, k_block);
             }
-            copy(dst_copy_A, tArACompute(_,FirstKBlock + i,_,_), tAsACompute(_,FirstKBlock + i,_,_,transform2mma_producer_index));
+            copy(dst_copy_A, tArACompute(_,GroupOffset + i,_,_), tAsACompute(_,GroupOffset + i,_,_,transform2mma_producer_index));
           }
         }
       };
