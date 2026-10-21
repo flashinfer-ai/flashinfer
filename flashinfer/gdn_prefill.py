@@ -14,13 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import typing
 import math
 import os
 import warnings
 import collections
 import functools
 import weakref
-from typing import Any, Callable, Literal, Optional, Tuple, Union, cast
+from typing import Callable, Literal, Optional, Tuple, Union, cast
 import torch
 
 from .api_logging import flashinfer_api
@@ -1701,7 +1702,7 @@ def chunk_gated_delta_rule(
             sm120_pipeline32_prefill_enabled,
         )
 
-        sm120_prefill: Callable[..., Any] = chunk_gated_delta_rule_sm120
+        sm120_prefill: Callable[..., typing.Any] = chunk_gated_delta_rule_sm120
         sm120_kwargs = {"state_indices": state_indices}
         if (
             sm120_pipeline32_prefill_enabled()
