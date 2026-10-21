@@ -1446,24 +1446,10 @@ class TmemSResource(DecodeGenResourceBase):
                 sage_q_scale=sage_q_scale,
                 sage_k_stage_bytes=sage_k_stage_bytes,
             )
-        task_cache = _decode_gen_task_cache(stage_info)
         num_s_regs = cfg.num_s_regs_per_thread
         old_max = new_max_arr[0]
         running_sum = sum_arr[0]
         s_vals = cutlass.Array(Float32, num_s_regs, space=cutlass.AddressSpace.rmem)
-        use_runtime_paged_dense_load = (
-            self.seqlens_kv is not None
-            and cfg.use_paged_kv
-            and not cfg.use_sliding_window_causal
-            and cfg.tile_size_q in (64, 128)
-        )
-        use_preload_mask_split = (
-            use_runtime_paged_dense_load or cfg.uses_per_row_causal_mask
-        )
-        if cutlass.const_expr(not use_preload_mask_split):
-            for reg_idx in cutlass.range_constexpr(num_s_regs):
-                s_vals[reg_idx] = self._masked_score()
-
         (
             seq_len_kv,
             logical_q_group_idx,
@@ -1473,111 +1459,26 @@ class TmemSResource(DecodeGenResourceBase):
             is_valid_effective_tile,
             is_masked_final_wave,
             tile_is_unmasked,
-            tile_has_valid_scores,
+            _tile_has_valid_scores,
         ) = self._resolve_keeps_tile_context(stage_info)
 
-        if cutlass.const_expr(use_preload_mask_split):
-            # Select the complete unmasked/masked TMEM load+max path before any S
-            # registers are materialized. The shared predicate covers the
-            # intersection of all active grouped-Q causal/window intervals.
-            tile_max = _neg_max_f32()
-            self._load_keeps_fragment(
-                stage_info,
-                s_vals,
-                tile_offset_k,
-                element_mask_end_idx,
-                window_start_idx,
-                seq_len_kv,
-                logical_q_group_idx,
-                is_valid_effective_tile,
-                is_masked_final_wave,
-                tile_is_unmasked,
-            )
-            tile_max = self._reduce_keeps_tile_max(
-                stage_info, s_vals, sage_q_scale, sage_k_stage_bytes
-            )
-
-            self._publish_keeps_softmax_state(
-                s_vals,
-                tile_max,
-                old_max,
-                running_sum,
-                old_max_arr,
-                sum_arr,
-                new_max_arr,
-                s_arr,
-            )
-            return old_max_arr, sum_arr, new_max_arr, s_arr
-
-        if tile_has_valid_scores:
-            base_addr = self._softmax_loop_score_tmem_addr(stage_info)
-            # Keep each intrinsic result at the native 32-register atom. TQ128
-            # uses four consecutive atoms and TQ64 uses two atoms with the same
-            # half-split offset, avoiding a monolithic x64/x128 LLVM intrinsic
-            # result.
-            load_atom_regs = 32
-            for load_atom_idx in cutlass.range_constexpr(num_s_regs // load_atom_regs):
-                atom_col = load_atom_idx * load_atom_regs
-                loaded = _keeps_tcgen05_ld(
-                    cfg,
-                    prims.make_tmem_ptr(base_addr + Int32(atom_col), Float32),
-                    num=load_atom_regs,
-                    offset=cfg.tile_size_kv // 2,
-                )
-                prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-                for atom_reg_idx in cutlass.range_constexpr(load_atom_regs):
-                    s_vals[atom_col + atom_reg_idx] = loaded[atom_reg_idx]
-
-        warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
-        lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
-        tile_row_idx = _keeps_row_idx(cfg, warp_grp_thread_idx)
-        col_base = _keeps_col_base(cfg, lane_idx, num_s_regs)
-
-        # Tail/uniform-causal/window masks use each register's true logical K
-        # column. For q64, the paired lane owns the complementary 64-column half.
-        for reg_idx in cutlass.range_constexpr(num_s_regs):
-            token_idx = tile_offset_k + _keeps_score_col(
-                cfg, warp_grp_thread_idx, reg_idx, col_base
-            )
-            # The per-row causal pass below subsumes seq_len_kv's upper bound.
-            if cutlass.const_expr(not cfg.uses_per_row_causal_mask):
-                if token_idx >= element_mask_end_idx:
-                    s_vals[reg_idx] = self._masked_score()
-            if cutlass.const_expr(cfg.use_sliding_window_causal):
-                if token_idx < window_start_idx:
-                    s_vals[reg_idx] = self._masked_score()
-
-        if cutlass.const_expr(cfg.uses_per_row_causal_mask):
-            q_token_idx, _ = _q_row_token_and_local_head(
-                cfg,
-                self.h_r,
-                logical_q_group_idx,
-                tile_row_idx,
-            )
-            causal_end = seq_len_kv - self.seq_len_q + q_token_idx + Int32(1)
-            causal_start = Int32(0)
-            if cutlass.const_expr(cfg.use_sliding_window_causal):
-                causal_start = cute.math.max(
-                    causal_end - Int32(cfg.attention_window_size), Int32(0)
-                )
-            for reg_idx in cutlass.range_constexpr(num_s_regs):
-                token_idx = tile_offset_k + _keeps_score_col(
-                    cfg, warp_grp_thread_idx, reg_idx, col_base
-                )
-                if token_idx < causal_start or token_idx >= causal_end:
-                    s_vals[reg_idx] = self._masked_score()
-
-        if cutlass.const_expr(cfg.q_score_rows_need_mask):
-            if not _q_row_is_valid_for_seq(
-                cfg,
-                self.h_r,
-                logical_q_group_idx,
-                tile_row_idx,
-                self.seq_len_q,
-            ):
-                for reg_idx in cutlass.range_constexpr(num_s_regs):
-                    s_vals[reg_idx] = self._masked_score()
-
+        # Select the complete unmasked/masked TMEM load+max path before any S
+        # registers are materialized: fully visible tiles then skip the mask
+        # pass, and no loaded score crosses a post-load branch. The shared
+        # predicate covers the intersection of all active grouped-Q
+        # causal/window intervals.
+        self._load_keeps_fragment(
+            stage_info,
+            s_vals,
+            tile_offset_k,
+            element_mask_end_idx,
+            window_start_idx,
+            seq_len_kv,
+            logical_q_group_idx,
+            is_valid_effective_tile,
+            is_masked_final_wave,
+            tile_is_unmasked,
+        )
         tile_max = self._reduce_keeps_tile_max(
             stage_info, s_vals, sage_q_scale, sage_k_stage_bytes
         )
