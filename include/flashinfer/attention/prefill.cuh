@@ -2051,7 +2051,10 @@ __device__ __forceinline__ void update_mdo_states(
           // Per-row clamp: fully masked rows (m == -inf) yield exp2(-inf) = 0, not NaN.
           const float m_scaled =
               max(m[mma_q][j] * sm_scale, -cuda::std::numeric_limits<float>::max());
-          float o_scale = math::ptx_exp2(m_prev * sm_scale - m_scaled);
+          // Subtract before scaling so an unchanged maximum preserves the old state exactly.
+          // An empty previous state has no mass; avoid -inf - -inf for fully masked rows.
+          float o_scale =
+              m_prev == -math::inf ? 0.f : math::ptx_exp2((m_prev - m[mma_q][j]) * sm_scale);
           d[mma_q][j] *= o_scale;
 #pragma unroll
           for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO_TILE; ++mma_d) {
@@ -3864,9 +3867,8 @@ __device__ __forceinline__ void vosplit_softmax_store_p(
       }
       float m_prev = float(m[mma_q][j]);
       float m_new = max(m_prev, mt);
-      // Per-row clamp for fully masked rows (see update_mdo_states).
-      const float m_new_scaled = max(m_new * sm_scale, -cuda::std::numeric_limits<float>::max());
-      o_scale[mma_q][j] = math::ptx_exp2(m_prev * sm_scale - m_new_scaled);
+      // Preserve equal maxima exactly and keep empty-state handling (see update_mdo_states).
+      o_scale[mma_q][j] = m_prev == -math::inf ? 0.f : math::ptx_exp2((m_prev - m_new) * sm_scale);
       d[mma_q][j] *= o_scale[mma_q][j];
       m[mma_q][j] = typename KTraits::DTypeQKAccum(m_new);
     }
