@@ -227,20 +227,19 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
   int32_t ctaOffsetPerExpert[ExpertsPerThread];
   int32_t numNonExitingCtas;
   Scan(tempStorage).ExclusiveSum(numCtaPerExpert, ctaOffsetPerExpert, numNonExitingCtas);
-  __syncthreads();  // Required barrier before reusing TempStorage for the next BlockScan
 
-  // Compute padded expert scan counts (same array-overload pattern)
-  int32_t tmpCountPerExpert[ExpertsPerThread];
+  // All experts share one tile size, so the padded-row prefix is the CTA prefix
+  // times the tile size.
+  int32_t expertScanCountsPerExpert[ExpertsPerThread];
 #pragma unroll
   for (int e = 0; e < ExpertsPerThread; e++) {
     if (params.mIsPow2) {
-      tmpCountPerExpert[e] = divUpMulLog2<int32_t>(accExpertCount[e], params.mPaddingLog2);
+      expertScanCountsPerExpert[e] = mulLog2<int32_t>(ctaOffsetPerExpert[e], params.mPaddingLog2);
     } else {
-      tmpCountPerExpert[e] = divUpMulTileN<int32_t>(accExpertCount[e], params.mTileTokensDim);
+      expertScanCountsPerExpert[e] =
+          mulTileN<int32_t>(ctaOffsetPerExpert[e], params.mTileTokensDim);
     }
   }
-  int32_t expertScanCountsPerExpert[ExpertsPerThread];
-  Scan(tempStorage).ExclusiveSum(tmpCountPerExpert, expertScanCountsPerExpert);
   __syncthreads();
 
   // Write CTA configs for each expert this thread handles

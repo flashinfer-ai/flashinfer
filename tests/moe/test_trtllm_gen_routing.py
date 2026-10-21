@@ -291,6 +291,52 @@ def test_deepseekv3_routing(
     )
 
 
+@pytest.mark.parametrize("num_tokens", [2, 4])
+@pytest.mark.parametrize("tile_tokens_dim", [1, 2, 4])
+@pytest.mark.parametrize("routing_method", ["Renormalize", "DeepSeekV3"])
+def test_block_kernel_expert_spanning_several_ctas(
+    num_tokens, tile_tokens_dim, routing_method
+):
+    """The static block kernel (<= 4 tokens) with an expert that fills several CTAs.
+
+    Every token selects the boosted expert, so with tiles smaller than the token
+    count its rows span several CTAs, and each later expert's padded segment starts
+    after them. The other routing tests run the block kernel only with tiles of 8
+    or 32, so every expert there fits in one CTA.
+    """
+    num_experts, top_k = 64, 8
+    seed = stable_seed("block-multi-cta", num_tokens, tile_tokens_dim, routing_method)
+    logits = make_logits(num_tokens, num_experts, torch.float32, seed, hot_expert=3)
+    if routing_method == "Renormalize":
+        run_and_check(
+            RoutingMethodType.Renormalize,
+            lambda: routing_reference_renormalize(
+                logits, top_k, num_experts, tile_tokens_dim
+            ),
+            logits,
+            top_k,
+            tile_tokens_dim,
+        )
+        return
+    # DeepSeekV3 with one group runs on routingCustom (SigmoidBias); biases this
+    # small keep the boosted expert first for every token.
+    bias = make_bias(num_experts, torch.float32, seed + 1) / 64
+    routed_scaling = 2.5
+    run_and_check(
+        RoutingMethodType.DeepSeekV3,
+        lambda: routing_reference_no_aux(
+            logits, bias, top_k, 1, 1, routed_scaling, tile_tokens_dim
+        ),
+        logits,
+        top_k,
+        tile_tokens_dim,
+        routing_bias=bias,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=routed_scaling,
+    )
+
+
 @pytest.mark.parametrize("num_tokens", [1, 8, 150])
 @pytest.mark.parametrize("num_experts,top_k", [(64, 4), (256, 8)])
 @pytest.mark.parametrize("tile_tokens_dim", [8, 32])
