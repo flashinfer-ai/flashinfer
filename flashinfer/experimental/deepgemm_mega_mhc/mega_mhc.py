@@ -417,11 +417,6 @@ def num_launch_sms(
     return num_sms
 
 
-def fp8_norm_partitions(hidden, splits):
-    """Hidden partitions the FP8 Norm workers split a token pair into."""
-    return hidden // 512 if splits > 16 and hidden // 256 > 8 else 2
-
-
 @functools.cache
 def device_facts(device_index):
     """(architecture, SM count) of ``cuda:<device_index>``, queried once per process."""
