@@ -259,11 +259,13 @@ def prepare_sm110_gqa_decode(
         ``O`` must not alias any input storage. Optional ``q_scale`` defaults
         to 1.0 and must be finite and positive.
     num_splits : Optional[int]
-        ``None`` selects the prepared shape specialization. Above capacity 64,
-        ``1`` selects the original long kernel. B=1 with capacity 1024 or 4096
-        also supports its fixed split count of ``10``. Above capacity 64,
-        other split choices are rejected. Capacities up to 64 always use the
-        original short kernel; accepted explicit counts are 1, 2, 4, 8, 10, 16.
+        ``None`` (or ``1``) selects the size-based route with one split: one
+        request over a 64-key cache uses the short kernel, over 65..128 keys
+        the long kernel, one or two requests over more than 128 keys the
+        one-split 64-token-tile build of the split-KV kernel and every other
+        shape its one-split 32-token-tile build. An explicit count in
+        ``{2, 4, 8, 10, 16}`` launches the run-time-split program of the
+        shape's tile with that many splits; any other value is rejected.
 
     Returns
     -------
@@ -274,8 +276,9 @@ def prepare_sm110_gqa_decode(
     Notes
     -----
     This opt-in interface separates allocation and JIT compilation from
-    sustained decode. Default specializations cover B=4/capacity=256 and
-    B=1/capacity=1024 or 4096; other shapes use the original kernels.
+    sustained decode. The route is a pure function of the batch, the cache
+    capacity and ``num_splits``; a split route owns FP32 partial buffers and
+    self-resetting completion counters in the prepared state.
     Every sequence length must remain in ``[1, capacity]`` at every launch.
     GPU length values may change between launches; preparation does not read
     them back to the host. The caller is responsible for this precondition.
