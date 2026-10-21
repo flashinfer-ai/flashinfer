@@ -212,8 +212,12 @@ def autotune_tactics(
 
 @functools.cache
 def _max_active_clusters(device_index: int, split_k: int) -> int:
+    # HardwareInfo reads attributes of device_id (default 0) and loads its probe
+    # kernel in the current context, so both must name the same device.
     with _torch.cuda.device(device_index):
-        return utils.HardwareInfo().get_max_active_clusters(split_k)
+        return utils.HardwareInfo(device_id=device_index).get_max_active_clusters(
+            split_k
+        )
 
 
 # Weight bytes the ring should keep in flight per CTA (9 stages of a 64-row
