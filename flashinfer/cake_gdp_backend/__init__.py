@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Backend of :mod:`flashinfer.cake_gdp`: the Cake Gated DeltaProduct (GDP) decode
-and MTP-verification kernels for Nemotron 4 (``K = 128``, ``V = 64``, up to four
+and MTP-verification kernels (``K = 128``, ``V = 64``, up to four
 Householder updates per token, FP32 state pool; SM100 / SM103) as one
 self-contained package (the host API body, the ``cake_jit`` registry and loader
 glue and the generated CUDA sources under ``csrc/``).  The stable,

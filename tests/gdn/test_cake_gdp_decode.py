@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Tests for the Cake Gated DeltaProduct (GDP) decode / MTP-verification kernels
-for Nemotron 4 (``K = 128``, ``V = 64``, one to four Householder updates per
+(``K = 128``, ``V = 64``, one to four Householder updates per
 token, FP32 state pool; SM100 / SM103).
 
 Every output row and every pool slot the call may touch is compared with an
@@ -22,8 +22,8 @@ FP64 token-serial reference of the same math (inputs at their BF16 values,
 the state rounded to FP32 after each real token) at ``atol = 1e-2``,
 ``rtol = 5e-3`` with no mismatch allowed; every slot the call must not touch
 is checked bitwise.  The matrix covers ``num_householder`` 1 to 4, the head
-counts 1 to 80, batches 1 to 257 and token counts 1 to 16 (the 48 Nemotron 4
-decode shapes among them), distinct write slots, padding rows (negative read
+counts 1 to 80, batches 1 to 257 and token counts 1 to 16 (the 48 decode shapes
+of record among them), distinct write slots, padding rows (negative read
 slots, whose output rows keep the caller's values), rows without writeback,
 per-token state scatter with holes, ``disable_state_update``, the scale
 values, a padded pool, strided inputs and outputs, FP16 I/O, int64 indices,
@@ -67,7 +67,7 @@ NUM_HOUSEHOLDER = (1, 2, 3, 4)
 HEADS = (1, 2, 3, 6, 10, 12, 20, 24, 40, 80)
 BATCHES = (1, 2, 3, 7, 16, 64, 257)
 TOKENS = (1, 2, 3, 4, 5, 8, 16)
-# The Nemotron 4 decode shapes (num_householder = 3): every performance row is a correctness case.
+# The 48 decode shapes of record (num_householder = 3): every performance row is a correctness case.
 PERF_HEADS = (80, 20, 10, 24)
 PERF_BATCHES = (1, 16, 64, 256)
 PERF_TOKENS = (1, 4, 8)
@@ -441,8 +441,8 @@ def test_batch_sizes(B: int) -> None:
         for T in PERF_TOKENS
     ],
 )
-def test_nemotron4_decode_rows(H: int, B: int, T: int) -> None:
-    """The 48 Nemotron 4 decode shapes (num_householder = 3), each a full correctness case."""
+def test_decode_rows_of_record(H: int, B: int, T: int) -> None:
+    """The 48 decode shapes of record (num_householder = 3), each a full correctness case."""
     _skip_unless_route(3, T)
     c = _make(B, T, H, 3, generator=_generator(4, H, B, T))
     out, _ = _run(c)

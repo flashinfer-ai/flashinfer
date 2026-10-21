@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Host plan and loader glue of the Cake Gated DeltaProduct (GDP) decode kernels
-for Nemotron 4 (``K = 128``, ``V = 64``, ``n <= 4`` Householder updates per
+(``K = 128``, ``V = 64``, ``n <= 4`` Householder updates per
 token, FP32 state pool; SM100 / SM103).
 
 Every module below is one mechanically exported production build: a CUDA
