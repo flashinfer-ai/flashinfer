@@ -477,10 +477,7 @@ def _keep_autotune_tactic(t, default, tactics, m, n, k, sm_count) -> bool:
     # re-streams fewer weights but halves the CTAs; it only won on tiny
     # short-K grids.
     if t.token_tile > default.token_tile and not (
-        t.token_tile <= 2 * default.token_tile
-        and t.token_tile <= 16
-        and n // 16 <= 16
-        and k <= 2048
+        t.token_tile <= 16 and n // 16 <= 16 and k <= 2048
     ):
         return False
 

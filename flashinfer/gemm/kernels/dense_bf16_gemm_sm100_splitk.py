@@ -200,10 +200,13 @@ def autotune_tactics(
     if not tactics:
         return tactics
     default = default_tactic(m, n, k)
+    device = _torch.cuda.current_device()
+    sm_count = _torch.cuda.get_device_properties(device).multi_processor_count
     return [
         t
         for t in tactics
-        if t == default or _keep_autotune_tactic(t, default, tactics, m, n, k)
+        if t == default
+        or _keep_autotune_tactic(t, default, tactics, m, n, k, device, sm_count)
     ]
 
 
@@ -218,7 +221,7 @@ def _max_active_clusters(device_index: int, split_k: int) -> int:
 _WEIGHT_BYTES_IN_FLIGHT = 9 * 64 * _CTA_K * 2
 
 
-def _keep_autotune_tactic(t, default, tactics, m, n, k) -> bool:
+def _keep_autotune_tactic(t, default, tactics, m, n, k, device, sm_count) -> bool:
     """Keep the tactics that can beat the default; see the rules below.
 
     The rules are the same on every GPU; SM count and cluster capacity are
@@ -229,8 +232,6 @@ def _keep_autotune_tactic(t, default, tactics, m, n, k) -> bool:
     N=128..8192, K=768..40960) kept the best tactic within 2.1% with only the
     target stage per config; the deeper stages only add tactics.
     """
-    device = _torch.cuda.current_device()
-    sm_count = _torch.cuda.get_device_properties(device).multi_processor_count
 
     def tiles(x):
         return (m + x.mma_n - 1) // x.mma_n
