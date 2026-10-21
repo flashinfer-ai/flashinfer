@@ -120,10 +120,33 @@ def _store(
 
 
 class _Precompute32(KeyedCompileMixin):
-    def __init__(self, dtype, hk, heads, seqs, has_alpha, has_beta, use_ldmatrix, pad):
+    def __init__(
+        self,
+        dtype,
+        hk,
+        heads,
+        seqs,
+        has_alpha,
+        has_beta,
+        use_ldmatrix,
+        pad,
+        cu_seqlens_dtype,
+    ):
         self.dtype, self.hk, self.heads, self.seqs = dtype, hk, heads, seqs
         self.has_alpha, self.has_beta = has_alpha, has_beta
         self.use_ldmatrix, self.pad = use_ldmatrix, pad
+        self.cu_seqlens_dtype = cu_seqlens_dtype
+        self.manual_cache_key(
+            "dtype",
+            "hk",
+            "heads",
+            "seqs",
+            "has_alpha",
+            "has_beta",
+            "use_ldmatrix",
+            "pad",
+            "cu_seqlens_dtype",
+        )
 
     @cute.jit
     def __call__(self, k, alpha, beta, cu, matrix, logs, capacity: int, stream):
@@ -236,12 +259,30 @@ class _Pipeline32(KeyedCompileMixin):
         checkpoints,
         use_ldmatrix,
         pad,
+        cu_seqlens_dtype,
+        checkpoint_cu_starts_dtype,
     ):
         self.dtype = dtype
         self.hq, self.hk, self.hv = hq, hk, hv
         self.heads, self.seqs = heads, seqs
         self.has_initial, self.checkpoints = has_initial, checkpoints
         self.use_ldmatrix, self.pad = use_ldmatrix, pad
+        self.cu_seqlens_dtype = cu_seqlens_dtype
+        self.checkpoint_cu_starts_dtype = checkpoint_cu_starts_dtype
+        self.manual_cache_key(
+            "dtype",
+            "hq",
+            "hk",
+            "hv",
+            "heads",
+            "seqs",
+            "has_initial",
+            "checkpoints",
+            "use_ldmatrix",
+            "pad",
+            "cu_seqlens_dtype",
+            "checkpoint_cu_starts_dtype",
+        )
 
     @cute.jit
     def __call__(
@@ -570,8 +611,9 @@ def delta_rule_prefill_pipeline32(
 
     ``mma_load="generic", shared_padding=False`` reproduces the original
     pipeline32 data path. Default LDSM + eight-element row padding targets the
-    bank conflicts observed in fi-pipeline32-both.ncu-repz. Neither optimized
-    GPU correctness nor speedup has been verified locally.
+    bank conflicts observed in fi-pipeline32-both.ncu-repz. See
+    benchmarks/README_gdn_sm120_pipeline32.md for correctness and performance
+    evidence; speed depends on SKU and shape.
 
     Caller supplies valid monotonic cu_seqlens spanning [0,T]; metadata values
     remain on the GPU. Workspace is (matrix, logs), private to this invocation
@@ -643,6 +685,15 @@ def delta_rule_prefill_pipeline32(
             or state_checkpoints.dtype != torch.float32
         ):
             raise ValueError("invalid checkpoint buffer")
+        # Packed checkpoint starts must describe non-overlapping sequence ranges.
+        # Reserve a conservative token-count bound without reading GPU metadata,
+        # so validation also works during CUDA graph capture.
+        required_checkpoints = (t + interval - 1) // interval
+        if state_checkpoints.shape[0] < required_checkpoints:
+            raise ValueError(
+                f"checkpoint buffer needs at least {required_checkpoints} entries, "
+                f"got {state_checkpoints.shape[0]}"
+            )
         if (
             checkpoint_cu_starts.ndim != 1
             or checkpoint_cu_starts.numel() < seqs
@@ -721,6 +772,7 @@ def delta_rule_prefill_pipeline32(
             beta is not None,
             use_ldmatrix,
             pad,
+            cu_seqlens.dtype,
         )
         pre_args = (
             wrap(k),
@@ -745,6 +797,8 @@ def delta_rule_prefill_pipeline32(
             interval,
             use_ldmatrix,
             pad,
+            cu_seqlens.dtype,
+            checkpoint_cu_starts.dtype if interval else None,
         )
         args = (
             wrap(q),

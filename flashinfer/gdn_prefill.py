@@ -20,7 +20,7 @@ import warnings
 import collections
 import functools
 import weakref
-from typing import Callable, Literal, Optional, Tuple, Union, cast
+from typing import Any, Callable, Literal, Optional, Tuple, Union, cast
 import torch
 
 from .api_logging import flashinfer_api
@@ -44,6 +44,7 @@ from .gdn_kernels import (
     cp_delta_rule_dsl_sm100,
     cp_delta_rule_dsl_sm120,
 )
+from .gdn_kernels.delta_rule_dsl import delta_rule_prefill_pipeline32
 from .gdn_kernels.delta_rule_dsl.varlen_helper import (
     is_integer_dtype,
     should_use_cp_host,
@@ -1139,8 +1140,9 @@ def chunk_gated_delta_rule(
     - ``FLASHINFER_GDN_SM120_PIPELINE32=1`` opts the non-CP SM120 DSL path
       into 32-token chunks. Use ``backend="flashinfer", use_cp=False`` to
       select that path explicitly. It requires D=128, contiguous FP16/BF16
-      Q/K/V and FP32 state; state pools and in-kernel QK normalization are
-      unsupported. Default dispatch and CP implementations are unchanged.
+      Q/K/V and FP32 state. Q/K normalization is applied before dispatch.
+      State pools, other SM12x capabilities and unavailable p32 kernels keep
+      the official route. Default dispatch and CP implementations are unchanged.
     - Requires SM90 (Hopper) or SM100 (Blackwell) architecture. The SM100
       path requires ``head_size == 128``. On SM100/SM103, ``gdn_cp`` supports
       structurally legal equal-head, GQA, and GVA shapes on CUDA 12.8,
@@ -1699,17 +1701,14 @@ def chunk_gated_delta_rule(
             sm120_pipeline32_prefill_enabled,
         )
 
-        sm120_prefill = chunk_gated_delta_rule_sm120
+        sm120_prefill: Callable[..., Any] = chunk_gated_delta_rule_sm120
         sm120_kwargs = {"state_indices": state_indices}
-        if sm120_pipeline32_prefill_enabled():
-            if state_indices is not None or use_qk_l2norm_in_kernel:
-                raise NotImplementedError(
-                    "SM120 pipeline32 does not support state_indices or in-kernel QK normalization"
-                )
-            from .gdn_kernels.delta_rule_dsl.delta_rule_sm120_pipeline32 import (
-                delta_rule_prefill_pipeline32,
-            )
-
+        if (
+            sm120_pipeline32_prefill_enabled()
+            and _device_capability == (12, 0)
+            and state_indices is None
+            and delta_rule_prefill_pipeline32 is not None
+        ):
             sm120_prefill = delta_rule_prefill_pipeline32
             sm120_kwargs = {}
         sm120_prefill(

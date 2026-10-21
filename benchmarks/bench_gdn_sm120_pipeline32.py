@@ -6,6 +6,10 @@ FI timed callables. Imports are lazy so --help works without CUDA dependencies.
 """
 
 import argparse
+from contextlib import contextmanager
+import statistics
+import subprocess
+import sys
 import hashlib
 import importlib.metadata
 import inspect
@@ -15,12 +19,23 @@ import os
 from pathlib import Path
 
 MODELS = {"27B TP1": (16, 48), "27B TP2": (8, 24), "Sym h32": (32, 32)}
-PIPELINE_ENV = (
-    "FLASHINFER_GDN_SM120_PIPELINE32",
-    "VLLM_GDN_FLASHINFER_PIPELINE32",
-    "FLASHINFER_GDN_SM120_STAGED",
-    "VLLM_GDN_FLASHINFER_STAGED",
-)
+PIPELINE_ENV = ("FLASHINFER_GDN_SM120_PIPELINE32",)
+
+
+@contextmanager
+def official_routes():
+    """Disable the opt-in only for this benchmark, restoring embedded callers."""
+    previous = {key: os.environ.get(key) for key in PIPELINE_ENV}
+    try:
+        for key in PIPELINE_ENV:
+            os.environ[key] = "0"
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def parser():
@@ -37,6 +52,11 @@ def parser():
     )
     p.add_argument("--check-acc", action="store_true")
     p.add_argument(
+        "--fla",
+        action="store_true",
+        help="also time FLA and use it as the accuracy reference; requires FLA",
+    )
+    p.add_argument(
         "--rtol",
         type=float,
         default=0.02,
@@ -49,7 +69,9 @@ def parser():
         default=64,
         help="same FLA chunk size for accuracy and timing",
     )
-    p.add_argument("--backend", choices=["cudagraph", "event"], default="cudagraph")
+    p.add_argument(
+        "--backend", choices=["cupti", "cudagraph", "event"], default="cupti"
+    )
     p.add_argument("--warmup", type=int, default=10, help="number of untimed calls")
     p.add_argument(
         "--repeats", type=int, default=100, help="number of timed calls/replays"
@@ -109,27 +131,25 @@ def accepted(errors, threshold):
 
 
 def elapsed_ms(fn, args):
-    for _ in range(args.warmup):
-        fn()
-    torch.cuda.synchronize()
-    graph = None
-    if args.backend == "cudagraph":
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            _captured_output = fn()  # keep graph-owned outputs alive through replay
-        run = graph.replay
-    else:
-        run = fn
-    start, stop = (
-        torch.cuda.Event(enable_timing=True),
-        torch.cuda.Event(enable_timing=True),
+    """Measure independent cold-L2 iterations using the in-tree timing primitive."""
+    from flashinfer.testing import bench_gpu_time
+
+    if args.backend == "cupti":
+        # Fail instead of silently publishing event timings under a CUPTI label.
+        from cupti import cupti  # noqa: F401
+
+        if int(importlib.metadata.version("cupti-python").split(".")[0]) < 13:
+            raise RuntimeError("CUPTI >=13 is required")
+    samples = bench_gpu_time(
+        fn,
+        dry_run_iters=args.warmup,
+        repeat_iters=args.repeats,
+        enable_cupti=args.backend == "cupti",
+        cold_l2_cache=True,
+        use_cuda_graph=args.backend == "cudagraph",
+        num_iters_within_graph=1,
     )
-    start.record()
-    for _ in range(args.repeats):
-        run()
-    stop.record()
-    stop.synchronize()
-    return start.elapsed_time(stop) / args.repeats
+    return statistics.median(samples)
 
 
 def inputs(lengths, hq, hv):
@@ -159,10 +179,18 @@ def inputs(lengths, hq, hv):
 
 
 def run(args):
+    with official_routes():
+        return _run(args)
+
+
+def _run(args):
     global torch
     import torch
     import flashinfer
-    from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd as fla_fwd
+
+    fla_fwd = None
+    if args.fla:
+        from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd as fla_fwd
     from flashinfer.gdn_prefill import chunk_gated_delta_rule as fi_fwd
     from flashinfer.gdn_kernels.delta_rule_dsl import (
         delta_rule_sm120,
@@ -184,9 +212,6 @@ def run(args):
         )
 
         p32 = delta_rule_prefill_pipeline32
-    # Keep both official routes free from optional overlay dispatch.
-    for key in PIPELINE_ENV:
-        os.environ[key] = "0"
     torch.manual_seed(args.seed)
     sources = [Path(delta_rule_sm120.__file__), Path(delta_rule_cp_sm120.__file__)]
     if p32:
@@ -199,7 +224,20 @@ def run(args):
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "flashinfer": flashinfer.__version__,
-        "fla": importlib.metadata.version("flash-linear-attention"),
+        "source_version": (Path(flashinfer.__file__).parent.parent / "version.txt")
+        .read_text()
+        .strip(),
+        "fla": importlib.metadata.version("flash-linear-attention")
+        if args.fla
+        else None,
+        "cupti": importlib.metadata.version("cupti-python")
+        if args.backend == "cupti"
+        else None,
+        "command": sys.argv,
+        "base_pr_head": "38c70db5ecd10ca026d54cb8af5f423d6a6ce538",
+        "git_head": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip(),
         "triton": importlib.metadata.version("triton"),
         "config": {
             k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
@@ -207,7 +245,7 @@ def run(args):
         "source_sha256": {
             str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in sources
         },
-        "timing": "mean GPU ms; conversions included; warmup/repeats are call counts",
+        "timing": "median per-invocation GPU ms; cold L2; conversions included; CUPTI sums kernels, excludes CPU launch gaps; warmup/repeats are call counts",
     }
     print(json.dumps(metadata, indent=2))
     hq, hv = MODELS[args.model]
@@ -231,10 +269,14 @@ def run(args):
             )
             return result[1].squeeze(0), result[3]
 
-        reference = call_fla()
-        fla_ms = elapsed_ms(call_fla, args)
+        reference = call_fla() if args.fla else None
+        fla_ms = elapsed_ms(call_fla, args) if args.fla else None
         label = "+".join(map(str, lengths))
-        print(f"{label}: FLA Triton {fla_ms:.3f} ms")
+        print(
+            f"{label}: FLA Triton {fla_ms:.3f} ms"
+            if fla_ms is not None
+            else f"{label}: FI-only (no FLA import)"
+        )
         for path in paths(args.fi_path):
 
             def call_fi():
@@ -279,6 +321,21 @@ def run(args):
 
             row = {"seqlens": lengths, "path": path, "fla_ms": fla_ms}
             if args.check_acc:
+                if reference is None:
+                    ref_o, ref_s = fi_fwd(
+                        q.squeeze(0),
+                        k.squeeze(0),
+                        v.squeeze(0),
+                        g=g.squeeze(0).exp().contiguous(),
+                        beta=beta.squeeze(0).contiguous(),
+                        scale=scale,
+                        initial_state=h0.transpose(-1, -2).contiguous(),
+                        output_final_state=True,
+                        cu_seqlens=cu.to(torch.int64),
+                        use_cp=False,
+                        **backend_kwargs,
+                    )
+                    reference = ref_o, ref_s.transpose(-1, -2).contiguous()
                 actual = call_fi()
                 errors = [
                     relative_error(a, r)
@@ -291,11 +348,11 @@ def run(args):
                     f"[ACC {'OK' if ok else 'FAIL'}] {path}: o={errors[0]:.6f} final_state={errors[1]:.6f}"
                 )
             row["fi_ms"] = elapsed_ms(call_fi, args)
-            row["speedup_vs_fla"] = fla_ms / row["fi_ms"]
-            rows.append(row)
-            print(
-                f"  {path:5s}: {row['fi_ms']:.3f} ms; vs FLA {row['speedup_vs_fla']:.2f}x"
+            row["speedup_vs_fla"] = (
+                fla_ms / row["fi_ms"] if fla_ms is not None else None
             )
+            rows.append(row)
+            print(f"  {path:5s}: {row['fi_ms']:.3f} ms", flush=True)
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(
@@ -315,13 +372,4 @@ if __name__ == "__main__":
         or args.rtol <= 0
     ):
         raise SystemExit("warmup/repeats and finite rtol must be positive")
-    # Restore caller environment when used through runpy or embedded execution.
-    previous = {key: os.environ.get(key) for key in PIPELINE_ENV}
-    try:
-        raise SystemExit(run(args))
-    finally:
-        for key, value in previous.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+    raise SystemExit(run(args))

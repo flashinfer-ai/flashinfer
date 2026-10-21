@@ -2,6 +2,8 @@
 
 import importlib.util
 import math
+import sys
+from types import SimpleNamespace
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -46,6 +48,11 @@ class SubmissionTests(unittest.TestCase):
         ):
             self.assertFalse(dispatch.sm120_pipeline32_prefill_enabled())
 
+        with patch.dict(
+            "os.environ", {"VLLM_GDN_FLASHINFER_PIPELINE32": "1"}, clear=True
+        ):
+            self.assertFalse(dispatch.sm120_pipeline32_prefill_enabled())
+
     def test_paths_are_distinct_and_p32_is_not_cp(self):
         self.assertEqual(bench.paths("all"), ["fuse", "cp", "p32"])
         self.assertEqual(bench.paths("cp32"), ["p32"])
@@ -65,6 +72,48 @@ class SubmissionTests(unittest.TestCase):
         for value in (math.nan, math.inf, -math.inf, 0.03):
             self.assertFalse(bench.accepted([0.005, value], 0.02))
         self.assertTrue(bench.accepted([0.005, 0.006], 0.02))
+
+    def test_cupti_timing_uses_cold_l2_independent_iterations(self):
+        recorded = {}
+
+        def timing(fn, **kwargs):
+            recorded.update(kwargs)
+            return [3.0, 1.0, 2.0]
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "flashinfer.testing": SimpleNamespace(bench_gpu_time=timing),
+                    "cupti": SimpleNamespace(cupti=object()),
+                },
+            ),
+            patch.object(bench.importlib.metadata, "version", return_value="13.0.0"),
+        ):
+            result = bench.elapsed_ms(
+                lambda: None, SimpleNamespace(backend="cupti", warmup=2, repeats=3)
+            )
+        self.assertEqual(result, 2.0)
+        self.assertTrue(recorded["enable_cupti"])
+        self.assertTrue(recorded["cold_l2_cache"])
+        self.assertFalse(recorded["use_cuda_graph"])
+
+    def test_benchmark_restores_environment_on_failure(self):
+        for original in (None, "1"):
+            env = (
+                {}
+                if original is None
+                else {"FLASHINFER_GDN_SM120_PIPELINE32": original}
+            )
+            with patch.dict("os.environ", env, clear=True):
+                with self.assertRaises(RuntimeError), bench.official_routes():
+                    self.assertEqual(
+                        bench.os.environ["FLASHINFER_GDN_SM120_PIPELINE32"], "0"
+                    )
+                    raise RuntimeError("test failure")
+                self.assertEqual(
+                    bench.os.environ.get("FLASHINFER_GDN_SM120_PIPELINE32"), original
+                )
 
     def test_cases(self):
         self.assertEqual(bench.cases("2x4096"), [[4096, 4096]])

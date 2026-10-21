@@ -20,7 +20,13 @@ try:
 except (ImportError, RuntimeError):
     cp_delta_rule_dsl_sm120 = None  # type: ignore
 
+try:
+    from .delta_rule_sm120_pipeline32 import delta_rule_prefill_pipeline32
+except (ImportError, RuntimeError):
+    delta_rule_prefill_pipeline32 = None  # type: ignore
+
 __all__ = [
+    "delta_rule_prefill_pipeline32",
     "chunk_gated_delta_rule_sm90",
     "chunk_gated_delta_rule_sm120",
     "cp_delta_rule_dsl_sm90",

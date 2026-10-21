@@ -1,87 +1,1643 @@
 {
-  "provenance": "Extracted FI/FLA measurements from user-supplied historical log; not a new GPU run; log has no kernel source hash.",
-  "gpu": "NVIDIA RTX 6000D",
-  "model_config": "27B TP1",
-  "h_qk": 16,
-  "h_v": 48,
-  "head_dim": 128,
-  "dtype": "bfloat16 (per supplied benchmark source)",
-  "versions": {
-    "torch": "2.13.0+cu130",
-    "fla": "0.5.2",
-    "flashinfer": "0.6.18",
-    "tilelang_profiler": "0.1.9"
+  "date": "2026-10-21",
+  "provenance": "Fresh RTX 6000D GPU runs of the review fixes applied to PR head 38c70db5ec; source hashes identify the measured working tree. Replaces historical 0.6.18 measurements.",
+  "upstream_base": "3637083a3a3d08538cce60937cd876b17779c6f0",
+  "gpu_driver": "580.126.09",
+  "cutlass_dsl": "4.6.2",
+  "scope": "BF16 D128 batch1; TP1 and TP2 are per-rank head shapes, not distributed execution; no untested SKU or full-model claim; no length threshold selected.",
+  "validation": {
+    "pytest": {
+      "passed": 24,
+      "exit_code": 0,
+      "command": "CUDA_VISIBLE_DEVICES=0 python -m pytest -q -p no:cacheprovider -rA tests/gdn/test_prefill_pipeline32.py tests/gdn/test_pipeline32_host.py"
+    },
+    "memcheck": {
+      "passed": 17,
+      "errors": 0,
+      "exit_code": 0,
+      "command": "CUDA_VISIBLE_DEVICES=0 compute-sanitizer --tool memcheck --error-exitcode 99 --report-api-errors no --print-limit 50 python -m pytest -q -p no:cacheprovider tests/gdn/test_prefill_pipeline32.py",
+      "scope": "Device-memory errors; CUDA API reports disabled separately, not asserted clean."
+    },
+    "mypy": {
+      "exit_code": 0,
+      "result": "Success: no issues found in 4 source files"
+    },
+    "pre_commit": {
+      "scope": "All 9 changed files; original fixed-version hook configuration; upstream hook archives and wheelhouse staged offline, no hook logic modified. Full-repository --all-files not run.",
+      "command": "pre-commit run --files <all 9 changed files>",
+      "exit_code": 0
+    }
   },
-  "backend": "cudagraph",
-  "warmup_argument": 10,
-  "repeats_argument": 100,
-  "relative_l2_threshold": 0.02,
-  "original_method": "FI wrapper includes exp(g), initial-state transpose/contiguous, cu conversion and final-state transpose/contiguous. Original accuracy reference requests FLA chunk_size=32 on SM120; FLA timing uses its default. The new standalone harness fixes one explicit FLA chunk size for both and uses PyTorch events/CUDAGraph with call-count warmup/repeats; rerun before comparing new and historical numbers.",
-  "rows": [
+  "summary": [
     {
+      "tp_shape": 1,
       "tokens": 2048,
-      "fuse_ms": 0.391,
-      "fla_ms": 0.271,
-      "cp_ms": 0.362,
-      "p32_ms": 0.227,
-      "fuse_output_rel_l2": 0.00586,
-      "fuse_state_rel_l2": 0.005332,
-      "cp_output_rel_l2": 0.005856,
-      "cp_state_rel_l2": 0.005338,
-      "p32_output_rel_l2": 0.005657,
-      "p32_state_rel_l2": 0.005062
+      "median_ms": {
+        "fuse": 0.2440315,
+        "cp": 0.31272,
+        "p32": 0.3290395,
+        "fla": 0.333743
+      },
+      "speedup": {
+        "fuse": 0.7416480392171761,
+        "cp": 0.9504026112366448,
+        "fla": 1.0142946363582488
+      }
     },
     {
+      "tp_shape": 1,
       "tokens": 4096,
-      "fuse_ms": 0.778,
-      "fla_ms": 0.608,
-      "cp_ms": 0.552,
-      "p32_ms": 0.421,
-      "fuse_output_rel_l2": 0.006043,
-      "fuse_state_rel_l2": 0.005337,
-      "cp_output_rel_l2": 0.006018,
-      "cp_state_rel_l2": 0.00532,
-      "p32_output_rel_l2": 0.005828,
-      "p32_state_rel_l2": 0.005071
+      "median_ms": {
+        "fuse": 0.435055,
+        "cp": 0.4434555,
+        "p32": 0.5352635,
+        "fla": 0.660271
+      },
+      "speedup": {
+        "fuse": 0.812786599497257,
+        "cp": 0.8284807389257814,
+        "fla": 1.233543852700586
+      }
     },
     {
+      "tp_shape": 1,
       "tokens": 8192,
-      "fuse_ms": 1.547,
-      "fla_ms": 1.251,
-      "cp_ms": 1.093,
-      "p32_ms": 0.814,
-      "fuse_output_rel_l2": 0.006134,
-      "fuse_state_rel_l2": 0.005301,
-      "cp_output_rel_l2": 0.006129,
-      "cp_state_rel_l2": 0.00533,
-      "p32_output_rel_l2": 0.005933,
-      "p32_state_rel_l2": 0.005049
+      "median_ms": {
+        "fuse": 1.1602700000000001,
+        "cp": 0.8645430000000001,
+        "p32": 0.9524785,
+        "fla": 1.293134
+      },
+      "speedup": {
+        "fuse": 1.2181587300920704,
+        "cp": 0.9076771811647193,
+        "fla": 1.3576516425305138
+      }
     },
     {
+      "tp_shape": 1,
       "tokens": 16384,
-      "fuse_ms": 3.083,
-      "fla_ms": 2.538,
-      "cp_ms": 2.005,
-      "p32_ms": 1.618,
-      "fuse_output_rel_l2": 0.006185,
-      "fuse_state_rel_l2": 0.005334,
-      "cp_output_rel_l2": 0.006184,
-      "cp_state_rel_l2": 0.005337,
-      "p32_output_rel_l2": 0.005981,
-      "p32_state_rel_l2": 0.005056
+      "median_ms": {
+        "fuse": 2.8793385000000002,
+        "cp": 1.5415655,
+        "p32": 1.8006695000000001,
+        "fla": 2.5833555
+      },
+      "speedup": {
+        "fuse": 1.5990377467936232,
+        "cp": 0.8561068535897342,
+        "fla": 1.4346638847384263
+      }
     },
     {
+      "tp_shape": 1,
       "tokens": 32768,
-      "fuse_ms": 6.095,
-      "fla_ms": 5.148,
-      "cp_ms": 3.99,
-      "p32_ms": 3.272,
-      "fuse_output_rel_l2": 0.00621,
-      "fuse_state_rel_l2": 0.005331,
-      "cp_output_rel_l2": 0.006212,
-      "cp_state_rel_l2": 0.005311,
-      "p32_output_rel_l2": 0.006007,
-      "p32_state_rel_l2": 0.005063
+      "median_ms": {
+        "fuse": 5.997589,
+        "cp": 3.841561,
+        "p32": 3.485802,
+        "fla": 5.1864205000000005
+      },
+      "speedup": {
+        "fuse": 1.7205764986077807,
+        "cp": 1.1020594399796662,
+        "fla": 1.48787007982668
+      }
+    },
+    {
+      "tp_shape": 2,
+      "tokens": 2048,
+      "median_ms": {
+        "fuse": 0.2367035,
+        "cp": 0.2253595,
+        "p32": 0.311647,
+        "fla": 0.220831
+      },
+      "speedup": {
+        "fuse": 0.7595243977962246,
+        "cp": 0.7231242399253001,
+        "fla": 0.708593376480441
+      }
+    },
+    {
+      "tp_shape": 2,
+      "tokens": 4096,
+      "median_ms": {
+        "fuse": 0.4199355,
+        "cp": 0.32184,
+        "p32": 0.5079195000000001,
+        "fla": 0.35388699999999995
+      },
+      "speedup": {
+        "fuse": 0.8267756996925693,
+        "cp": 0.6336437171638418,
+        "fla": 0.6967383610985597
+      }
+    },
+    {
+      "tp_shape": 2,
+      "tokens": 8192,
+      "median_ms": {
+        "fuse": 1.0656305000000001,
+        "cp": 0.455327,
+        "p32": 0.9046225000000001,
+        "fla": 0.718303
+      },
+      "speedup": {
+        "fuse": 1.1779836340573002,
+        "cp": 0.5033337110231062,
+        "fla": 0.7940361863650307
+      }
+    },
+    {
+      "tp_shape": 2,
+      "tokens": 16384,
+      "median_ms": {
+        "fuse": 2.895706,
+        "cp": 0.8591664999999999,
+        "p32": 1.700701,
+        "fla": 1.404622
+      },
+      "speedup": {
+        "fuse": 1.7026543760484647,
+        "cp": 0.5051837448205181,
+        "fla": 0.82590766983732
+      }
+    },
+    {
+      "tp_shape": 2,
+      "tokens": 32768,
+      "median_ms": {
+        "fuse": 6.0203085000000005,
+        "cp": 1.507438,
+        "p32": 3.2847475,
+        "fla": 2.8041865
+      },
+      "speedup": {
+        "fuse": 1.832807087911628,
+        "cp": 0.4589205106328569,
+        "fla": 0.8536992569444075
+      }
+    }
+  ],
+  "runs": [
+    {
+      "metadata": {
+        "gpu": "NVIDIA RTX 6000D",
+        "torch": "2.13.0+cu130",
+        "cuda": "13.0",
+        "flashinfer": "0.0.0+unknown",
+        "source_version": "0.7.2",
+        "fla": "0.5.2",
+        "cupti": "13.0.1",
+        "command": [
+          "benchmarks/bench_gdn_sm120_pipeline32.py",
+          "--model",
+          "27B TP1",
+          "--seqlen",
+          "1x",
+          "--fi-path",
+          "all",
+          "--fla",
+          "--check-acc",
+          "--fla-chunk-size",
+          "64",
+          "--warmup",
+          "10",
+          "--repeats",
+          "100",
+          "--backend",
+          "cupti",
+          "--json",
+          "/nfs/dataset-ofs-heterogeneous-computing/cuihangbin/llm_model/flashinfer-pr6342-validation/tp1-round1.json"
+        ],
+        "base_pr_head": "38c70db5ecd10ca026d54cb8af5f423d6a6ce538",
+        "git_head": "38c70db5ecd10ca026d54cb8af5f423d6a6ce538",
+        "triton": "3.7.1",
+        "config": {
+          "mode": "fwd",
+          "model": "27B TP1",
+          "seqlen": "1x",
+          "fi_path": "all",
+          "check_acc": true,
+          "fla": true,
+          "rtol": 0.02,
+          "fla_chunk_size": 64,
+          "backend": "cupti",
+          "warmup": 10,
+          "repeats": 100,
+          "seed": 42,
+          "mma_load": "ldmatrix",
+          "no_shared_padding": false,
+          "json": "/nfs/dataset-ofs-heterogeneous-computing/cuihangbin/llm_model/flashinfer-pr6342-validation/tp1-round1.json"
+        },
+        "source_sha256": {
+          "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py": "94fad8696bed061c577603f82670f038f55497231a6775717f8bef65facddb51",
+          "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_cp_sm120.py": "76f00777b51a7676bda53cefb4bdd543ace5c40d6cd85587b10d09fd6a9576d9",
+          "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120_pipeline32.py": "4a5898e0aaf26895555ca99761240bc080d936191b1537d39a5efa39d1ed96b2",
+          "flashinfer/gdn_kernels/delta_rule_dsl/sm120_pipeline32_layout.py": "6fbcbcccb61a25454fa1d3ec8028dec23183747d0ea2b459d2375615040c0e05"
+        },
+        "timing": "median per-invocation GPU ms; cold L2; conversions included; CUPTI sums kernels, excludes CPU launch gaps; warmup/repeats are call counts"
+      },
+      "rows": [
+        {
+          "seqlens": [
+            32768
+          ],
+          "path": "fuse",
+          "fla_ms": 5.185203,
+          "output_rel_l2": 0.006282256024582596,
+          "state_rel_l2": 0.005394720869343643,
+          "passed": true,
+          "fi_ms": 6.000452,
+          "speedup_vs_fla": 0.864135401799731
+        },
+        {
+          "seqlens": [
+            32768
+          ],
+          "path": "cp",
+          "fla_ms": 5.185203,
+          "output_rel_l2": 0.006282522621549273,
+          "state_rel_l2": 0.005400433197711765,
+          "passed": true,
+          "fi_ms": 3.866073,
+          "speedup_vs_fla": 1.3412066973386172
+        },
+        {
+          "seqlens": [
+            32768
+          ],
+          "path": "p32",
+          "fla_ms": 5.185203,
+          "output_rel_l2": 0.006093755438526319,
+          "state_rel_l2": 0.005142768406417446,
+          "passed": true,
+          "fi_ms": 3.485802,
+          "speedup_vs_fla": 1.4875208058289024
+        },
+        {
+          "seqlens": [
+            16384
+          ],
+          "path": "fuse",
+          "fla_ms": 2.5833555,
+          "output_rel_l2": 0.006254381396615516,
+          "state_rel_l2": 0.005434545182211107,
+          "passed": true,
+          "fi_ms": 2.8793385000000002,
+          "speedup_vs_fla": 0.8972045141618465
+        },
+        {
+          "seqlens": [
+            16384
+          ],
+          "path": "cp",
+          "fla_ms": 2.5833555,
+          "output_rel_l2": 0.006251245149836705,
+          "state_rel_l2": 0.005436764093301359,
+          "passed": true,
+          "fi_ms": 1.5451815,
+          "speedup_vs_fla": 1.671878352154747
+        },
+        {
+          "seqlens": [
+            16384
+          ],
+          "path": "p32",
+          "fla_ms": 2.5833555,
+          "output_rel_l2": 0.006066822525420227,
+          "state_rel_l2": 0.0051611836413538665,
+          "passed": true,
+          "fi_ms": 1.8060125,
+          "speedup_vs_fla": 1.4304195015261523
+        },
+        {
+          "seqlens": [
+            8192
+          ],
+          "path": "fuse",
+          "fla_ms": 1.293694,
+          "output_rel_l2": 0.006204730119577162,
+          "state_rel_l2": 0.005407576690849867,
+          "passed": true,
+          "fi_ms": 1.07571,
+          "speedup_vs_fla": 1.2026419759972482
+        },
+        {
+          "seqlens": [
+            8192
+          ],
+          "path": "cp",
+          "fla_ms": 1.293694,
+          "output_rel_l2": 0.006196831923393098,
+          "state_rel_l2": 0.005399734722442713,
+          "passed": true,
+          "fi_ms": 0.9099505,
+          "speedup_vs_fla": 1.4217190935111303
+        },
+        {
+          "seqlens": [
+            8192
+          ],
+          "path": "p32",
+          "fla_ms": 1.293694,
+          "output_rel_l2": 0.006020040666592451,
+          "state_rel_l2": 0.005142043051851215,
+          "passed": true,
+          "fi_ms": 0.952302,
+          "speedup_vs_fla": 1.3584913189303391
+        },
+        {
+          "seqlens": [
+            4096
+          ],
+          "path": "fuse",
+          "fla_ms": 0.663232,
+          "output_rel_l2": 0.0060981163952493435,
+          "state_rel_l2": 0.005425135179415639,
+          "passed": true,
+          "fi_ms": 0.445631,
+          "speedup_vs_fla": 1.4882986147732093
+        },
+        {
+          "seqlens": [
+            4096
+          ],
+          "path": "cp",
+          "fla_ms": 0.663232,
+          "output_rel_l2": 0.006083040552254584,
+          "state_rel_l2": 0.005433322284977351,
+          "passed": true,
+          "fi_ms": 0.446047,
+          "speedup_vs_fla": 1.4869105722042744
+        },
+        {
+          "seqlens": [
+            4096
+          ],
+          "path": "p32",
+          "fla_ms": 0.663232,
+          "output_rel_l2": 0.005923740085889281,
+          "state_rel_l2": 0.005168221463627417,
+          "passed": true,
+          "fi_ms": 0.538879,
+          "speedup_vs_fla": 1.2307623789385003
+        },
+        {
+          "seqlens": [
+            2048
+          ],
+          "path": "fuse",
+          "fla_ms": 0.33462349999999996,
+          "output_rel_l2": 0.00589799390715295,
+          "state_rel_l2": 0.00542945367537356,
+          "passed": true,
+          "fi_ms": 0.24670399999999998,
+          "speedup_vs_fla": 1.3563764673454828
+        },
+        {
+          "seqlens": [
+            2048
+          ],
+          "path": "cp",
+          "fla_ms": 0.33462349999999996,
+          "output_rel_l2": 0.00588414007541836,
+          "state_rel_l2": 0.005419031705945761,
+          "passed": true,
+          "fi_ms": 0.315392,
+          "speedup_vs_fla": 1.0609764990868504
+        },
+        {
+          "seqlens": [
+            2048
+          ],
+          "path": "p32",
+          "fla_ms": 0.33462349999999996,
+          "output_rel_l2": 0.005734952167693089,
+          "state_rel_l2": 0.005183498047962426,
+          "passed": true,
+          "fi_ms": 0.33023899999999995,
+          "speedup_vs_fla": 1.0132767480521683
+        }
+      ],
+      "tp_shape": 1,
+      "round": 1
+    },
+    {
+      "metadata": {
+        "gpu": "NVIDIA RTX 6000D",
+        "torch": "2.13.0+cu130",
+        "cuda": "13.0",
+        "flashinfer": "0.0.0+unknown",
+        "source_version": "0.7.2",
+        "fla": "0.5.2",
+        "cupti": "13.0.1",
+        "command": [
+          "benchmarks/bench_gdn_sm120_pipeline32.py",
+          "--model",
+          "27B TP1",
+          "--seqlen",
+          "1x",
+          "--fi-path",
+          "all",
+          "--fla",
+          "--check-acc",
+          "--fla-chunk-size",
+          "64",
+          "--warmup",
+          "10",
+          "--repeats",
+          "100",
+          "--backend",
+          "cupti",
+          "--json",
+          "/nfs/dataset-ofs-heterogeneous-computing/cuihangbin/llm_model/flashinfer-pr6342-validation/tp1-round2.json"
+        ],
+        "base_pr_head": "38c70db5ecd10ca026d54cb8af5f423d6a6ce538",
+        "git_head": "38c70db5ecd10ca026d54cb8af5f423d6a6ce538",
+        "triton": "3.7.1",
+        "config": {
+          "mode": "fwd",
+          "model": "27B TP1",
+          "seqlen": "1x",
+          "fi_path": "all",
+          "check_acc": true,
+          "fla": true,
+          "rtol": 0.02,
+          "fla_chunk_size": 64,
+          "backend": "cupti",
+          "warmup": 10,
+          "repeats": 100,
+          "seed": 42,
+          "mma_load": "ldmatrix",
+          "no_shared_padding": false,
+          "json": "/nfs/dataset-ofs-heterogeneous-computing/cuihangbin/llm_model/flashinfer-pr6342-validation/tp1-round2.json"
+        },
+        "source_sha256": {
+          "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py": "94fad8696bed061c577603f82670f038f55497231a6775717f8bef65facddb51",
+          "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_cp_sm120.py": "76f00777b51a7676bda53cefb4bdd543ace5c40d6cd85587b10d09fd6a9576d9",
+          "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120_pipeline32.py": "4a5898e0aaf26895555ca99761240bc080d936191b1537d39a5efa39d1ed96b2",
+          "flashinfer/gdn_kernels/delta_rule_dsl/sm120_pipeline32_layout.py": "6fbcbcccb61a25454fa1d3ec8028dec23183747d0ea2b459d2375615040c0e05"
+        },
+        "timing": "median per-invocation GPU ms; cold L2; conversions included; CUPTI sums kernels, excludes CPU launch gaps; warmup/repeats are call counts"
+      },
+      "rows": [
+        {
+          "seqlens": [
+            32768
+          ],
+          "path": "fuse",
+          "fla_ms": 5.187925,
+          "output_rel_l2": 0.006282256024582596,
+          "state_rel_l2": 0.005394720869343643,
+          "passed": true,
+          "fi_ms": 5.997589,
+          "speedup_vs_fla": 0.865001753204496
+        },
+        {
+          "seqlens": [
+            32768
+          ],
+          "path": "cp",
+          "fla_ms": 5.187925,
+          "output_rel_l2": 0.006282522621549273,
+          "state_rel_l2": 0.005400433197711765,
+          "passed": true,
+          "fi_ms": 3.841561,
+          "speedup_vs_fla": 1.350473154012132
+        },
+        {
+          "seqlens": [
+            32768
+          ],
+          "path": "p32",
+          "fla_ms": 5.187925,
+          "output_rel_l2": 0.006093755438526319,
+          "state_rel_l2": 0.005142768406417446,
+          "passed": true,
+          "fi_ms": 3.5156105,
+          "speedup_vs_fla": 1.4756825308150603
+        },
+        {
+          "seqlens": [
+            16384
+          ],
+          "path": "fuse",
+          "fla_ms": 2.583243,
+          "output_rel_l2": 0.006254381396615516,
+          "state_rel_l2": 0.005434545182211107,
+          "passed": true,
+          "fi_ms": 2.86702,
+          "speedup_vs_fla": 0.901020223088782
+        },
+        {
+          "seqlens": [
+            16384
+          ],
+          "path": "cp",
+          "fla_ms": 2.583243,
+          "output_rel_l2": 0.006251245149836705,
+          "state_rel_l2": 0.005436764093301359,
+          "passed": true,
+          "fi_ms": 1.5415655,
+          "speedup_vs_fla": 1.6757270450071697
+        },
+        {
+          "seqlens": [
+            16384
+          ],
+          "path": "p32",
+          "fla_ms": 2.583243,
+          "output_rel_l2": 0.006066822525420227,
+          "state_rel_l2": 0.0051611836413538665,
+          "passed": true,
+          "fi_ms": 1.800365,
+          "speedup_vs_fla": 1.4348440455129932
+        },
+        {
+          "seqlens": [
+            8192
+          ],
+          "path": "fuse",
+          "fla_ms": 1.29251,
+          "output_rel_l2": 0.006204730119577162,
+          "state_rel_l2": 0.005407576690849867,
+          "passed": true,
+          "fi_ms": 1.22923,
+          "speedup_vs_fla": 1.051479381401365
+        },
+        {
+          "seqlens": [
+            8192
+          ],
+          "path": "cp",
+          "fla_ms": 1.29251,
+          "output_rel_l2": 0.006196831923393098,
+          "state_rel_l2": 0.005399734722442713,
+          "passed": true,
+          "fi_ms": 0.7888625,
+          "speedup_vs_fla": 1.6384477649780538
+        },
+        {
+          "seqlens": [
+            8192
+          ],
+          "path": "p32",
+          "fla_ms": 1.29251,
+          "output_rel_l2": 0.006020040666592451,
+          "state_rel_l2": 0.005142043051851215,
+          "passed": true,
+          "fi_ms": 0.9524785,
+          "speedup_vs_fla": 1.356996509632501
+        },
+        {
+          "seqlens": [
+            4096
+          ],
+          "path": "fuse",
+          "fla_ms": 0.659551,
+          "output_rel_l2": 0.0060981163952493435,
+          "state_rel_l2": 0.005425135179415639,
+          "passed": true,
+          "fi_ms": 0.4285755,
+          "speedup_vs_fla": 1.5389377134250557
+        },
+        {
+          "seqlens": [
+            4096
+          ],
+          "path": "cp",
+          "fla_ms": 0.659551,
+          "output_rel_l2": 0.006083040552254584,
+          "state_rel_l2": 0.005433322284977351,
+          "passed": true,
+          "fi_ms": 0.4434555,
+          "speedup_vs_fla": 1.487299176580288
+        },
+        {
+          "seqlens": [
+            4096
+          ],
+          "path": "p32",
+          "fla_ms": 0.659551,
+          "output_rel_l2": 0.005923740085889281,
+          "state_rel_l2": 0.005168221463627417,
+          "passed": true,
+          "fi_ms": 0.5352635,
+          "speedup_vs_fla": 1.2321987208169434
+        },
+        {
+          "seqlens": [
+            2048
+          ],
+          "path": "fuse",
+          "fla_ms": 0.33203150000000003,
+          "output_rel_l2": 0.00589799390715295,
+          "state_rel_l2": 0.00542945367537356,
+          "passed": true,
+          "fi_ms": 0.24344,
+          "speedup_vs_fla": 1.3639151330923434
+        },
+        {
+          "seqlens": [
+            2048
+          ],
+          "path": "cp",
+          "fla_ms": 0.33203150000000003,
+          "output_rel_l2": 0.00588414007541836,
+          "state_rel_l2": 0.005419031705945761,
+          "passed": true,
+          "fi_ms": 0.31272,
+          "speedup_vs_fla": 1.0617533256587364
+        },
+        {
+          "seqlens": [
+            2048
+          ],
+          "path": "p32",
+          "fla_ms": 0.33203150000000003,
+          "output_rel_l2": 0.005734952167693089,
+          "state_rel_l2": 0.005183498047962426,
+          "passed": true,
+          "fi_ms": 0.328768,
+          "speedup_vs_fla": 1.0099264526961262
+        }
+      ],
+      "tp_shape": 1,
+      "round": 2
+    },
+    {
+      "metadata": {
+        "gpu": "NVIDIA RTX 6000D",
+        "torch": "2.13.0+cu130",
+        "cuda": "13.0",
+        "flashinfer": "0.0.0+unknown",
+        "source_version": "0.7.2",
+        "fla": "0.5.2",
+        "cupti": "13.0.1",
+        "command": [
+          "benchmarks/bench_gdn_sm120_pipeline32.py",
+          "--model",
+          "27B TP1",
+          "--seqlen",
+          "1x",
+          "--fi-path",
+          "all",
+          "--fla",
+          "--check-acc",
+          "--fla-chunk-size",
+          "64",
+          "--warmup",
+          "10",
+          "--repeats",
+          "100",
+          "--backend",
+          "cupti",
+          "--json",
+          "/nfs/dataset-ofs-heterogeneous-computing/cuihangbin/llm_model/flashinfer-pr6342-validation/tp1-round3.json"
+        ],
+        "base_pr_head": "38c70db5ecd10ca026d54cb8af5f423d6a6ce538",
+        "git_head": "38c70db5ecd10ca026d54cb8af5f423d6a6ce538",
+        "triton": "3.7.1",
+        "config": {
+          "mode": "fwd",
+          "model": "27B TP1",
+          "seqlen": "1x",
+          "fi_path": "all",
+          "check_acc": true,
+          "fla": true,
+          "rtol": 0.02,
+          "fla_chunk_size": 64,
+          "backend": "cupti",
+          "warmup": 10,
+          "repeats": 100,
+          "seed": 42,
+          "mma_load": "ldmatrix",
+          "no_shared_padding": false,
+          "json": "/nfs/dataset-ofs-heterogeneous-computing/cuihangbin/llm_model/flashinfer-pr6342-validation/tp1-round3.json"
+        },
+        "source_sha256": {
+          "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py": "94fad8696bed061c577603f82670f038f55497231a6775717f8bef65facddb51",
+          "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_cp_sm120.py": "76f00777b51a7676bda53cefb4bdd543ace5c40d6cd85587b10d09fd6a9576d9",
+          "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120_pipeline32.py": "4a5898e0aaf26895555ca99761240bc080d936191b1537d39a5efa39d1ed96b2",
+          "flashinfer/gdn_kernels/delta_rule_dsl/sm120_pipeline32_layout.py": "6fbcbcccb61a25454fa1d3ec8028dec23183747d0ea2b459d2375615040c0e05"
+        },
+        "timing": "median per-invocation GPU ms; cold L2; conversions included; CUPTI sums kernels, excludes CPU launch gaps; warmup/repeats are call counts"
+      },
+      "rows": [
+        {
+          "seqlens": [
+            32768
+          ],
+          "path": "fuse",
+          "fla_ms": 5.1864205000000005,
+          "output_rel_l2": 0.006282256024582596,
+          "state_rel_l2": 0.005394720869343643,
+          "passed": true,
+          "fi_ms": 5.9930924999999995,
+          "speedup_vs_fla": 0.8653997080805946
+        },
+        {
+          "seqlens": [
+            32768
+          ],
+          "path": "cp",
+          "fla_ms": 5.1864205000000005,
+          "output_rel_l2": 0.006282522621549273,
+          "state_rel_l2": 0.005400433197711765,
+          "passed": true,
+          "fi_ms": 3.808617,
+          "speedup_vs_fla": 1.3617595310843806
+        },
+        {
+          "seqlens": [
+            32768
+          ],
+          "path": "p32",
+          "fla_ms": 5.1864205000000005,
+          "output_rel_l2": 0.006093755438526319,
+          "state_rel_l2": 0.005142768406417446,
+          "passed": true,
+          "fi_ms": 3.4810980000000002,
+          "speedup_vs_fla": 1.4898806353627505
+        },
+        {
+          "seqlens": [
+            16384
+          ],
+          "path": "fuse",
+          "fla_ms": 2.584939,
+          "output_rel_l2": 0.006254381396615516,
+          "state_rel_l2": 0.005434545182211107,
+          "passed": true,
+          "fi_ms": 2.9032910000000003,
+          "speedup_vs_fla": 0.890347884521393
+        },
+        {
+          "seqlens": [
+            16384
+          ],
+          "path": "cp",
+          "fla_ms": 2.584939,
+          "output_rel_l2": 0.006251245149836705,
+          "state_rel_l2": 0.005436764093301359,
+          "passed": true,
+          "fi_ms": 1.476461,
+          "speedup_vs_fla": 1.7507668675298567
+        },
+        {
+          "seqlens": [
+            16384
+          ],
+          "path": "p32",
+          "fla_ms": 2.584939,
+          "output_rel_l2": 0.006066822525420227,
+          "state_rel_l2": 0.0051611836413538665,
+          "passed": true,
+          "fi_ms": 1.8006695000000001,
+          "speedup_vs_fla": 1.4355432798745131
+        },
+        {
+          "seqlens": [
+            8192
+          ],
+          "path": "fuse",
+          "fla_ms": 1.293134,
+          "output_rel_l2": 0.006204730119577162,
+          "state_rel_l2": 0.005407576690849867,
+          "passed": true,
+          "fi_ms": 1.1602700000000001,
+          "speedup_vs_fla": 1.1145112775474673
+        },
+        {
+          "seqlens": [
+            8192
+          ],
+          "path": "cp",
+          "fla_ms": 1.293134,
+          "output_rel_l2": 0.006196831923393098,
+          "state_rel_l2": 0.005399734722442713,
+          "passed": true,
+          "fi_ms": 0.8645430000000001,
+          "speedup_vs_fla": 1.4957428375453852
+        },
+        {
+          "seqlens": [
+            8192
+          ],
+          "path": "p32",
+          "fla_ms": 1.293134,
+          "output_rel_l2": 0.006020040666592451,
+          "state_rel_l2": 0.005142043051851215,
+          "passed": true,
+          "fi_ms": 0.9531665,
+          "speedup_vs_fla": 1.3566716832788395
+        },
+        {
+          "seqlens": [
+            4096
+          ],
+          "path": "fuse",
+          "fla_ms": 0.660271,
+          "output_rel_l2": 0.0060981163952493435,
+          "state_rel_l2": 0.005425135179415639,
+          "passed": true,
+          "fi_ms": 0.435055,
+          "speedup_vs_fla": 1.5176724781924125
+        },
+        {
+          "seqlens": [
+            4096
+          ],
+          "path": "cp",
+          "fla_ms": 0.660271,
+          "output_rel_l2": 0.006083040552254584,
+          "state_rel_l2": 0.005433322284977351,
+          "passed": true,
+          "fi_ms": 0.443119,
+          "speedup_vs_fla": 1.4900534619368613
+        },
+        {
+          "seqlens": [
+            4096
+          ],
+          "path": "p32",
+          "fla_ms": 0.660271,
+          "output_rel_l2": 0.005923740085889281,
+          "state_rel_l2": 0.005168221463627417,
+          "passed": true,
+          "fi_ms": 0.535247,
+          "speedup_vs_fla": 1.23358187902034
+        },
+        {
+          "seqlens": [
+            2048
+          ],
+          "path": "fuse",
+          "fla_ms": 0.333743,
+          "output_rel_l2": 0.00589799390715295,
+          "state_rel_l2": 0.00542945367537356,
+          "passed": true,
+          "fi_ms": 0.2440315,
+          "speedup_vs_fla": 1.3676226224893098
+        },
+        {
+          "seqlens": [
+            2048
+          ],
+          "path": "cp",
+          "fla_ms": 0.333743,
+          "output_rel_l2": 0.00588414007541836,
+          "state_rel_l2": 0.005419031705945761,
+          "passed": true,
+          "fi_ms": 0.312415,
+          "speedup_vs_fla": 1.0682681689419522
+        },
+        {
+          "seqlens": [
+            2048
+          ],
+          "path": "p32",
+          "fla_ms": 0.333743,
+          "output_rel_l2": 0.005734952167693089,
+          "state_rel_l2": 0.005183498047962426,
+          "passed": true,
+          "fi_ms": 0.3290395,
+          "speedup_vs_fla": 1.0142946363582488
+        }
+      ],
+      "tp_shape": 1,
+      "round": 3
+    },
+    {
+      "metadata": {
+        "gpu": "NVIDIA RTX 6000D",
+        "torch": "2.13.0+cu130",
+        "cuda": "13.0",
+        "flashinfer": "0.0.0+unknown",
+        "source_version": "0.7.2",
+        "fla": "0.5.2",
+        "cupti": "13.0.1",
+        "command": [
+          "benchmarks/bench_gdn_sm120_pipeline32.py",
+          "--model",
+          "27B TP2",
+          "--seqlen",
+          "1x",
+          "--fi-path",
+          "all",
+          "--fla",
+          "--check-acc",
+          "--fla-chunk-size",
+          "64",
+          "--warmup",
+          "10",
+          "--repeats",
+          "100",
+          "--backend",
+          "cupti",
+          "--json",
+          "/nfs/dataset-ofs-heterogeneous-computing/cuihangbin/llm_model/flashinfer-pr6342-validation/tp2-round1.json"
+        ],
+        "base_pr_head": "38c70db5ecd10ca026d54cb8af5f423d6a6ce538",
+        "git_head": "38c70db5ecd10ca026d54cb8af5f423d6a6ce538",
+        "triton": "3.7.1",
+        "config": {
+          "mode": "fwd",
+          "model": "27B TP2",
+          "seqlen": "1x",
+          "fi_path": "all",
+          "check_acc": true,
+          "fla": true,
+          "rtol": 0.02,
+          "fla_chunk_size": 64,
+          "backend": "cupti",
+          "warmup": 10,
+          "repeats": 100,
+          "seed": 42,
+          "mma_load": "ldmatrix",
+          "no_shared_padding": false,
+          "json": "/nfs/dataset-ofs-heterogeneous-computing/cuihangbin/llm_model/flashinfer-pr6342-validation/tp2-round1.json"
+        },
+        "source_sha256": {
+          "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py": "94fad8696bed061c577603f82670f038f55497231a6775717f8bef65facddb51",
+          "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_cp_sm120.py": "76f00777b51a7676bda53cefb4bdd543ace5c40d6cd85587b10d09fd6a9576d9",
+          "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120_pipeline32.py": "4a5898e0aaf26895555ca99761240bc080d936191b1537d39a5efa39d1ed96b2",
+          "flashinfer/gdn_kernels/delta_rule_dsl/sm120_pipeline32_layout.py": "6fbcbcccb61a25454fa1d3ec8028dec23183747d0ea2b459d2375615040c0e05"
+        },
+        "timing": "median per-invocation GPU ms; cold L2; conversions included; CUPTI sums kernels, excludes CPU launch gaps; warmup/repeats are call counts"
+      },
+      "rows": [
+        {
+          "seqlens": [
+            32768
+          ],
+          "path": "fuse",
+          "fla_ms": 2.8050995,
+          "output_rel_l2": 0.006281876220555712,
+          "state_rel_l2": 0.005408058428423728,
+          "passed": true,
+          "fi_ms": 6.0225349999999995,
+          "speedup_vs_fla": 0.46576723921073104
+        },
+        {
+          "seqlens": [
+            32768
+          ],
+          "path": "cp",
+          "fla_ms": 2.8050995,
+          "output_rel_l2": 0.00627616276109644,
+          "state_rel_l2": 0.0054168460608586275,
+          "passed": true,
+          "fi_ms": 1.507438,
+          "speedup_vs_fla": 1.860839052750428
+        },
+        {
+          "seqlens": [
+            32768
+          ],
+          "path": "p32",
+          "fla_ms": 2.8050995,
+          "output_rel_l2": 0.0060910168403359895,
+          "state_rel_l2": 0.005141467749295097,
+          "passed": true,
+          "fi_ms": 3.2847475,
+          "speedup_vs_fla": 0.8539772082937882
+        },
+        {
+          "seqlens": [
+            16384
+          ],
+          "path": "fuse",
+          "fla_ms": 1.4031495,
+          "output_rel_l2": 0.006251774448114604,
+          "state_rel_l2": 0.005378488527906408,
+          "passed": true,
+          "fi_ms": 2.8233395,
+          "speedup_vs_fla": 0.49698220848041835
+        },
+        {
+          "seqlens": [
+            16384
+          ],
+          "path": "cp",
+          "fla_ms": 1.4031495,
+          "output_rel_l2": 0.00624208979460096,
+          "state_rel_l2": 0.005381597116843054,
+          "passed": true,
+          "fi_ms": 0.8591664999999999,
+          "speedup_vs_fla": 1.6331520141904976
+        },
+        {
+          "seqlens": [
+            16384
+          ],
+          "path": "p32",
+          "fla_ms": 1.4031495,
+          "output_rel_l2": 0.006064754831651856,
+          "state_rel_l2": 0.005111211429874677,
+          "passed": true,
+          "fi_ms": 1.704558,
+          "speedup_vs_fla": 0.8231749814321366
+        },
+        {
+          "seqlens": [
+            8192
+          ],
+          "path": "fuse",
+          "fla_ms": 0.718559,
+          "output_rel_l2": 0.00620105536998394,
+          "state_rel_l2": 0.005413286934144072,
+          "passed": true,
+          "fi_ms": 1.076559,
+          "speedup_vs_fla": 0.6674590059625157
+        },
+        {
+          "seqlens": [
+            8192
+          ],
+          "path": "cp",
+          "fla_ms": 0.718559,
+          "output_rel_l2": 0.006179712623756733,
+          "state_rel_l2": 0.005412254981537396,
+          "passed": true,
+          "fi_ms": 0.45596749999999997,
+          "speedup_vs_fla": 1.5758995981073212
+        },
+        {
+          "seqlens": [
+            8192
+          ],
+          "path": "p32",
+          "fla_ms": 0.718559,
+          "output_rel_l2": 0.006017141003555249,
+          "state_rel_l2": 0.005176007474492734,
+          "passed": true,
+          "fi_ms": 0.903823,
+          "speedup_vs_fla": 0.7950218128992069
+        },
+        {
+          "seqlens": [
+            4096
+          ],
+          "path": "fuse",
+          "fla_ms": 0.3557275,
+          "output_rel_l2": 0.00609784988235589,
+          "state_rel_l2": 0.005389006293516843,
+          "passed": true,
+          "fi_ms": 0.424367,
+          "speedup_vs_fla": 0.8382543883006925
+        },
+        {
+          "seqlens": [
+            4096
+          ],
+          "path": "cp",
+          "fla_ms": 0.3557275,
+          "output_rel_l2": 0.0060718133660686265,
+          "state_rel_l2": 0.005385991557726595,
+          "passed": true,
+          "fi_ms": 0.32184,
+          "speedup_vs_fla": 1.1052930027342778
+        },
+        {
+          "seqlens": [
+            4096
+          ],
+          "path": "p32",
+          "fla_ms": 0.3557275,
+          "output_rel_l2": 0.00591986947488311,
+          "state_rel_l2": 0.005157703920143313,
+          "passed": true,
+          "fi_ms": 0.508783,
+          "speedup_vs_fla": 0.6991733214356611
+        },
+        {
+          "seqlens": [
+            2048
+          ],
+          "path": "fuse",
+          "fla_ms": 0.220032,
+          "output_rel_l2": 0.005906517750264106,
+          "state_rel_l2": 0.0054064607133238905,
+          "passed": true,
+          "fi_ms": 0.2367035,
+          "speedup_vs_fla": 0.9295680038529215
+        },
+        {
+          "seqlens": [
+            2048
+          ],
+          "path": "cp",
+          "fla_ms": 0.220032,
+          "output_rel_l2": 0.005870572692133213,
+          "state_rel_l2": 0.005406822254841963,
+          "passed": true,
+          "fi_ms": 0.2245595,
+          "speedup_vs_fla": 0.9798383056606379
+        },
+        {
+          "seqlens": [
+            2048
+          ],
+          "path": "p32",
+          "fla_ms": 0.220032,
+          "output_rel_l2": 0.0057414445531747986,
+          "state_rel_l2": 0.005140844652071835,
+          "passed": true,
+          "fi_ms": 0.3099035,
+          "speedup_vs_fla": 0.7100016618076272
+        }
+      ],
+      "tp_shape": 2,
+      "round": 1
+    },
+    {
+      "metadata": {
+        "gpu": "NVIDIA RTX 6000D",
+        "torch": "2.13.0+cu130",
+        "cuda": "13.0",
+        "flashinfer": "0.0.0+unknown",
+        "source_version": "0.7.2",
+        "fla": "0.5.2",
+        "cupti": "13.0.1",
+        "command": [
+          "benchmarks/bench_gdn_sm120_pipeline32.py",
+          "--model",
+          "27B TP2",
+          "--seqlen",
+          "1x",
+          "--fi-path",
+          "all",
+          "--fla",
+          "--check-acc",
+          "--fla-chunk-size",
+          "64",
+          "--warmup",
+          "10",
+          "--repeats",
+          "100",
+          "--backend",
+          "cupti",
+          "--json",
+          "/nfs/dataset-ofs-heterogeneous-computing/cuihangbin/llm_model/flashinfer-pr6342-validation/tp2-round2.json"
+        ],
+        "base_pr_head": "38c70db5ecd10ca026d54cb8af5f423d6a6ce538",
+        "git_head": "38c70db5ecd10ca026d54cb8af5f423d6a6ce538",
+        "triton": "3.7.1",
+        "config": {
+          "mode": "fwd",
+          "model": "27B TP2",
+          "seqlen": "1x",
+          "fi_path": "all",
+          "check_acc": true,
+          "fla": true,
+          "rtol": 0.02,
+          "fla_chunk_size": 64,
+          "backend": "cupti",
+          "warmup": 10,
+          "repeats": 100,
+          "seed": 42,
+          "mma_load": "ldmatrix",
+          "no_shared_padding": false,
+          "json": "/nfs/dataset-ofs-heterogeneous-computing/cuihangbin/llm_model/flashinfer-pr6342-validation/tp2-round2.json"
+        },
+        "source_sha256": {
+          "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py": "94fad8696bed061c577603f82670f038f55497231a6775717f8bef65facddb51",
+          "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_cp_sm120.py": "76f00777b51a7676bda53cefb4bdd543ace5c40d6cd85587b10d09fd6a9576d9",
+          "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120_pipeline32.py": "4a5898e0aaf26895555ca99761240bc080d936191b1537d39a5efa39d1ed96b2",
+          "flashinfer/gdn_kernels/delta_rule_dsl/sm120_pipeline32_layout.py": "6fbcbcccb61a25454fa1d3ec8028dec23183747d0ea2b459d2375615040c0e05"
+        },
+        "timing": "median per-invocation GPU ms; cold L2; conversions included; CUPTI sums kernels, excludes CPU launch gaps; warmup/repeats are call counts"
+      },
+      "rows": [
+        {
+          "seqlens": [
+            32768
+          ],
+          "path": "fuse",
+          "fla_ms": 2.8041865,
+          "output_rel_l2": 0.006281876220555712,
+          "state_rel_l2": 0.005408058428423728,
+          "passed": true,
+          "fi_ms": 6.0203085000000005,
+          "speedup_vs_fla": 0.4657878412709249
+        },
+        {
+          "seqlens": [
+            32768
+          ],
+          "path": "cp",
+          "fla_ms": 2.8041865,
+          "output_rel_l2": 0.00627616276109644,
+          "state_rel_l2": 0.0054168460608586275,
+          "passed": true,
+          "fi_ms": 1.4955655,
+          "speedup_vs_fla": 1.8750007940140367
+        },
+        {
+          "seqlens": [
+            32768
+          ],
+          "path": "p32",
+          "fla_ms": 2.8041865,
+          "output_rel_l2": 0.0060910168403359895,
+          "state_rel_l2": 0.005141467749295097,
+          "passed": true,
+          "fi_ms": 3.285146,
+          "speedup_vs_fla": 0.8535957001606626
+        },
+        {
+          "seqlens": [
+            16384
+          ],
+          "path": "fuse",
+          "fla_ms": 1.4050055000000001,
+          "output_rel_l2": 0.006251774448114604,
+          "state_rel_l2": 0.005378488527906408,
+          "passed": true,
+          "fi_ms": 2.928395,
+          "speedup_vs_fla": 0.47978687984373697
+        },
+        {
+          "seqlens": [
+            16384
+          ],
+          "path": "cp",
+          "fla_ms": 1.4050055000000001,
+          "output_rel_l2": 0.00624208979460096,
+          "state_rel_l2": 0.005381597116843054,
+          "passed": true,
+          "fi_ms": 0.847214,
+          "speedup_vs_fla": 1.6583832420144144
+        },
+        {
+          "seqlens": [
+            16384
+          ],
+          "path": "p32",
+          "fla_ms": 1.4050055000000001,
+          "output_rel_l2": 0.006064754831651856,
+          "state_rel_l2": 0.005111211429874677,
+          "passed": true,
+          "fi_ms": 1.6990055000000002,
+          "speedup_vs_fla": 0.8269575937217389
+        },
+        {
+          "seqlens": [
+            8192
+          ],
+          "path": "fuse",
+          "fla_ms": 0.716367,
+          "output_rel_l2": 0.00620105536998394,
+          "state_rel_l2": 0.005413286934144072,
+          "passed": true,
+          "fi_ms": 1.053806,
+          "speedup_vs_fla": 0.679790208064862
+        },
+        {
+          "seqlens": [
+            8192
+          ],
+          "path": "cp",
+          "fla_ms": 0.716367,
+          "output_rel_l2": 0.006179712623756733,
+          "state_rel_l2": 0.005412254981537396,
+          "passed": true,
+          "fi_ms": 0.4544635,
+          "speedup_vs_fla": 1.5762916053764493
+        },
+        {
+          "seqlens": [
+            8192
+          ],
+          "path": "p32",
+          "fla_ms": 0.716367,
+          "output_rel_l2": 0.006017141003555249,
+          "state_rel_l2": 0.005176007474492734,
+          "passed": true,
+          "fi_ms": 0.9095825,
+          "speedup_vs_fla": 0.7875778172952975
+        },
+        {
+          "seqlens": [
+            4096
+          ],
+          "path": "fuse",
+          "fla_ms": 0.3528155,
+          "output_rel_l2": 0.00609784988235589,
+          "state_rel_l2": 0.005389006293516843,
+          "passed": true,
+          "fi_ms": 0.4199355,
+          "speedup_vs_fla": 0.8401659302440494
+        },
+        {
+          "seqlens": [
+            4096
+          ],
+          "path": "cp",
+          "fla_ms": 0.3528155,
+          "output_rel_l2": 0.0060718133660686265,
+          "state_rel_l2": 0.005385991557726595,
+          "passed": true,
+          "fi_ms": 0.3211195,
+          "speedup_vs_fla": 1.0987046878187092
+        },
+        {
+          "seqlens": [
+            4096
+          ],
+          "path": "p32",
+          "fla_ms": 0.3528155,
+          "output_rel_l2": 0.00591986947488311,
+          "state_rel_l2": 0.005157703920143313,
+          "passed": true,
+          "fi_ms": 0.507872,
+          "speedup_vs_fla": 0.6946937417301997
+        },
+        {
+          "seqlens": [
+            2048
+          ],
+          "path": "fuse",
+          "fla_ms": 0.220831,
+          "output_rel_l2": 0.005906517750264106,
+          "state_rel_l2": 0.0054064607133238905,
+          "passed": true,
+          "fi_ms": 0.23667149999999998,
+          "speedup_vs_fla": 0.9330696767460384
+        },
+        {
+          "seqlens": [
+            2048
+          ],
+          "path": "cp",
+          "fla_ms": 0.220831,
+          "output_rel_l2": 0.005870572692133213,
+          "state_rel_l2": 0.005406822254841963,
+          "passed": true,
+          "fi_ms": 0.2253595,
+          "speedup_vs_fla": 0.9799054399747958
+        },
+        {
+          "seqlens": [
+            2048
+          ],
+          "path": "p32",
+          "fla_ms": 0.220831,
+          "output_rel_l2": 0.0057414445531747986,
+          "state_rel_l2": 0.005140844652071835,
+          "passed": true,
+          "fi_ms": 0.3118875,
+          "speedup_vs_fla": 0.7080469720652479
+        }
+      ],
+      "tp_shape": 2,
+      "round": 2
+    },
+    {
+      "metadata": {
+        "gpu": "NVIDIA RTX 6000D",
+        "torch": "2.13.0+cu130",
+        "cuda": "13.0",
+        "flashinfer": "0.0.0+unknown",
+        "source_version": "0.7.2",
+        "fla": "0.5.2",
+        "cupti": "13.0.1",
+        "command": [
+          "benchmarks/bench_gdn_sm120_pipeline32.py",
+          "--model",
+          "27B TP2",
+          "--seqlen",
+          "1x",
+          "--fi-path",
+          "all",
+          "--fla",
+          "--check-acc",
+          "--fla-chunk-size",
+          "64",
+          "--warmup",
+          "10",
+          "--repeats",
+          "100",
+          "--backend",
+          "cupti",
+          "--json",
+          "/nfs/dataset-ofs-heterogeneous-computing/cuihangbin/llm_model/flashinfer-pr6342-validation/tp2-round3.json"
+        ],
+        "base_pr_head": "38c70db5ecd10ca026d54cb8af5f423d6a6ce538",
+        "git_head": "38c70db5ecd10ca026d54cb8af5f423d6a6ce538",
+        "triton": "3.7.1",
+        "config": {
+          "mode": "fwd",
+          "model": "27B TP2",
+          "seqlen": "1x",
+          "fi_path": "all",
+          "check_acc": true,
+          "fla": true,
+          "rtol": 0.02,
+          "fla_chunk_size": 64,
+          "backend": "cupti",
+          "warmup": 10,
+          "repeats": 100,
+          "seed": 42,
+          "mma_load": "ldmatrix",
+          "no_shared_padding": false,
+          "json": "/nfs/dataset-ofs-heterogeneous-computing/cuihangbin/llm_model/flashinfer-pr6342-validation/tp2-round3.json"
+        },
+        "source_sha256": {
+          "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py": "94fad8696bed061c577603f82670f038f55497231a6775717f8bef65facddb51",
+          "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_cp_sm120.py": "76f00777b51a7676bda53cefb4bdd543ace5c40d6cd85587b10d09fd6a9576d9",
+          "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120_pipeline32.py": "4a5898e0aaf26895555ca99761240bc080d936191b1537d39a5efa39d1ed96b2",
+          "flashinfer/gdn_kernels/delta_rule_dsl/sm120_pipeline32_layout.py": "6fbcbcccb61a25454fa1d3ec8028dec23183747d0ea2b459d2375615040c0e05"
+        },
+        "timing": "median per-invocation GPU ms; cold L2; conversions included; CUPTI sums kernels, excludes CPU launch gaps; warmup/repeats are call counts"
+      },
+      "rows": [
+        {
+          "seqlens": [
+            32768
+          ],
+          "path": "fuse",
+          "fla_ms": 2.803946,
+          "output_rel_l2": 0.006281876220555712,
+          "state_rel_l2": 0.005408058428423728,
+          "passed": true,
+          "fi_ms": 6.0102285,
+          "speedup_vs_fla": 0.466529017989915
+        },
+        {
+          "seqlens": [
+            32768
+          ],
+          "path": "cp",
+          "fla_ms": 2.803946,
+          "output_rel_l2": 0.00627616276109644,
+          "state_rel_l2": 0.0054168460608586275,
+          "passed": true,
+          "fi_ms": 1.5569415000000002,
+          "speedup_vs_fla": 1.8009321480607972
+        },
+        {
+          "seqlens": [
+            32768
+          ],
+          "path": "p32",
+          "fla_ms": 2.803946,
+          "output_rel_l2": 0.0060910168403359895,
+          "state_rel_l2": 0.005141467749295097,
+          "passed": true,
+          "fi_ms": 3.281738,
+          "speedup_vs_fla": 0.8544088528700341
+        },
+        {
+          "seqlens": [
+            16384
+          ],
+          "path": "fuse",
+          "fla_ms": 1.404622,
+          "output_rel_l2": 0.006251774448114604,
+          "state_rel_l2": 0.005378488527906408,
+          "passed": true,
+          "fi_ms": 2.895706,
+          "speedup_vs_fla": 0.4850706528908667
+        },
+        {
+          "seqlens": [
+            16384
+          ],
+          "path": "cp",
+          "fla_ms": 1.404622,
+          "output_rel_l2": 0.00624208979460096,
+          "state_rel_l2": 0.005381597116843054,
+          "passed": true,
+          "fi_ms": 0.8663190000000001,
+          "speedup_vs_fla": 1.6213681103611948
+        },
+        {
+          "seqlens": [
+            16384
+          ],
+          "path": "p32",
+          "fla_ms": 1.404622,
+          "output_rel_l2": 0.006064754831651856,
+          "state_rel_l2": 0.005111211429874677,
+          "passed": true,
+          "fi_ms": 1.700701,
+          "speedup_vs_fla": 0.82590766983732
+        },
+        {
+          "seqlens": [
+            8192
+          ],
+          "path": "fuse",
+          "fla_ms": 0.718303,
+          "output_rel_l2": 0.00620105536998394,
+          "state_rel_l2": 0.005413286934144072,
+          "passed": true,
+          "fi_ms": 1.0656305000000001,
+          "speedup_vs_fla": 0.6740638523390612
+        },
+        {
+          "seqlens": [
+            8192
+          ],
+          "path": "cp",
+          "fla_ms": 0.718303,
+          "output_rel_l2": 0.006179712623756733,
+          "state_rel_l2": 0.005412254981537396,
+          "passed": true,
+          "fi_ms": 0.455327,
+          "speedup_vs_fla": 1.5775541533886637
+        },
+        {
+          "seqlens": [
+            8192
+          ],
+          "path": "p32",
+          "fla_ms": 0.718303,
+          "output_rel_l2": 0.006017141003555249,
+          "state_rel_l2": 0.005176007474492734,
+          "passed": true,
+          "fi_ms": 0.9046225000000001,
+          "speedup_vs_fla": 0.7940361863650307
+        },
+        {
+          "seqlens": [
+            4096
+          ],
+          "path": "fuse",
+          "fla_ms": 0.35388699999999995,
+          "output_rel_l2": 0.00609784988235589,
+          "state_rel_l2": 0.005389006293516843,
+          "passed": true,
+          "fi_ms": 0.418352,
+          "speedup_vs_fla": 0.8459072742570848
+        },
+        {
+          "seqlens": [
+            4096
+          ],
+          "path": "cp",
+          "fla_ms": 0.35388699999999995,
+          "output_rel_l2": 0.0060718133660686265,
+          "state_rel_l2": 0.005385991557726595,
+          "passed": true,
+          "fi_ms": 0.323887,
+          "speedup_vs_fla": 1.092624896954802
+        },
+        {
+          "seqlens": [
+            4096
+          ],
+          "path": "p32",
+          "fla_ms": 0.35388699999999995,
+          "output_rel_l2": 0.00591986947488311,
+          "state_rel_l2": 0.005157703920143313,
+          "passed": true,
+          "fi_ms": 0.5079195000000001,
+          "speedup_vs_fla": 0.6967383610985597
+        },
+        {
+          "seqlens": [
+            2048
+          ],
+          "path": "fuse",
+          "fla_ms": 0.22140749999999998,
+          "output_rel_l2": 0.005906517750264106,
+          "state_rel_l2": 0.0054064607133238905,
+          "passed": true,
+          "fi_ms": 0.2375675,
+          "speedup_vs_fla": 0.9319772275248087
+        },
+        {
+          "seqlens": [
+            2048
+          ],
+          "path": "cp",
+          "fla_ms": 0.22140749999999998,
+          "output_rel_l2": 0.005870572692133213,
+          "state_rel_l2": 0.005406822254841963,
+          "passed": true,
+          "fi_ms": 0.22567949999999998,
+          "speedup_vs_fla": 0.9810705004220587
+        },
+        {
+          "seqlens": [
+            2048
+          ],
+          "path": "p32",
+          "fla_ms": 0.22140749999999998,
+          "output_rel_l2": 0.0057414445531747986,
+          "state_rel_l2": 0.005140844652071835,
+          "passed": true,
+          "fi_ms": 0.311647,
+          "speedup_vs_fla": 0.7104432258292234
+        }
+      ],
+      "tp_shape": 2,
+      "round": 3
     }
   ]
 }
