@@ -7,6 +7,39 @@ from flashinfer.mega_mhc import prepare_mega_mhc
 
 EXPORTED_TOKENS = (1, 64, 65, 200, 1025, 4096)
 HELD_OUT_TOKENS = (3, 100, 257, 384, 448, 1000, 2048, 5000)
+# The BF16-output route (hidden 4096): both sides of every split-count switch of
+# its rule on the SM counts it ships for, small and irregular counts, and the
+# large counts of its performance table.
+H4096_TOKENS = (
+    1,
+    2,
+    3,
+    7,
+    33,
+    64,
+    65,
+    127,
+    192,
+    193,
+    256,
+    384,
+    385,
+    576,
+    577,
+    1025,
+    4096,
+    8192,
+)
+H4096_SM_COUNTS = (148, 152, 208, 212, 216)
+H4096_CONSTANTS = dict(
+    hc_norm_eps=1e-5,
+    hc_pre_eps=1e-6,
+    hc_post_scale=2.0,
+    sinkhorn_eps=1e-6,
+    num_sinkhorn_iters=20,
+    rmsnorm_eps=1e-5,
+    rmsnorm_scale=1.0,
+)
 
 
 def inputs(tokens, shifted):
@@ -172,13 +205,17 @@ def poison(outputs):
             value.fill_(-559038737 if value.dtype == torch.int32 else float("nan"))
 
 
-def _skip_unless_exported():
+def _skip_unless_exported(hidden=5120, sf_layout="col"):
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required")
     try:
-        _runtime.device_facts(torch.cuda.current_device())
+        arch, _sms = _runtime.device_facts(torch.cuda.current_device())
     except RuntimeError as error:
         pytest.skip(str(error))
+    if not _runtime.supported(arch, hidden, sf_layout):
+        pytest.skip(
+            f"no exported mHC program for hidden={hidden} {sf_layout} on {arch}"
+        )
 
 
 def _replay_identical(plan, expected, stream, repeats):
@@ -285,3 +322,242 @@ def test_bf16_only_layout_is_not_exported():
     _skip_unless_exported()
     with pytest.raises(NotImplementedError):
         prepare_mega_mhc(**inputs(64, False), sf_layout="bf16")
+
+
+# ---------------------------------------------------------------------------- the BF16-output route (hidden 4096)
+
+
+def inputs_h4096(tokens, seed=2026):
+    hidden = 4096
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+
+    def randn(*shape):
+        return torch.randn(shape, device="cuda", generator=generator)
+
+    comb = torch.rand(tokens, 4, 4, device="cuda", generator=generator)
+    for _ in range(3):
+        comb /= comb.sum(-1, keepdim=True)
+        comb /= comb.sum(-2, keepdim=True)
+    return dict(
+        x=randn(tokens, hidden).bfloat16(),
+        residual=randn(tokens, 4, hidden).bfloat16(),
+        post_mix=randn(tokens, 4, 1).sigmoid(),
+        comb_res_mix=comb,
+        shifted_prev_mix=None,
+        fn=randn(24, 4 * hidden) * 0.01,
+        mix_scales=randn(3) * 0.1,
+        mix_bases=randn(24) * 0.1,
+        rmsnorm_weight=(1 + randn(hidden) * 0.1).bfloat16(),
+        hc_mult=4,
+        **H4096_CONSTANTS,
+    )
+
+
+def reference_h4096(values):
+    """The fused step in float64 with BF16 rounding only at its two output points."""
+    tokens, hidden = values["x"].shape
+    x, residual = values["x"].double(), values["residual"].double()
+    post, comb = values["post_mix"].double(), values["comb_res_mix"].double()
+    residual_cur = (
+        post * x.unsqueeze(1) + torch.einsum("tij,tih->tjh", comb, residual)
+    ).bfloat16()
+    u = residual_cur.double().reshape(tokens, 4 * hidden)
+    z = (u @ values["fn"].double().T) * torch.rsqrt(
+        u.square().mean(-1, keepdim=True) + values["hc_norm_eps"]
+    )
+    scales = torch.cat(
+        (
+            values["mix_scales"][0].expand(4),
+            values["mix_scales"][1].expand(4),
+            values["mix_scales"][2].expand(16),
+        )
+    ).double()
+    a = z * scales + values["mix_bases"].double()
+    pre = a[:, :4].sigmoid() + values["hc_pre_eps"]
+    eps = values["sinkhorn_eps"]
+    c = a[:, 8:].reshape(tokens, 4, 4).softmax(-1) + eps
+    c = c / (c.sum(-2, keepdim=True) + eps)
+    for _ in range(1, values["num_sinkhorn_iters"]):
+        c = c / (c.sum(-1, keepdim=True) + eps)
+        c = c / (c.sum(-2, keepdim=True) + eps)
+    w = (pre.unsqueeze(2) * residual_cur.double()).sum(1)
+    rstd = torch.rsqrt(w.square().mean(-1, keepdim=True) + values["rmsnorm_eps"])
+    rstd = rstd * values["rmsnorm_scale"]
+    layer_input = (
+        w.bfloat16().double() * rstd * values["rmsnorm_weight"].double()
+    ).bfloat16()
+    return dict(
+        new_residual=residual_cur,
+        new_post_mix=(values["hc_post_scale"] * a[:, 4:8].sigmoid())
+        .unsqueeze(2)
+        .float(),
+        new_comb_res_mix=c.float(),
+        y_bf16=layer_input,
+    )
+
+
+def check_h4096(outputs, expected):
+    for name, value in outputs.items():
+        if value.dtype == torch.bfloat16:
+            torch.testing.assert_close(
+                value.float(), expected[name].float(), atol=1e-2, rtol=1e-2
+            )
+        else:
+            torch.testing.assert_close(value, expected[name], atol=2e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("num_sms", H4096_SM_COUNTS)
+def test_h4096_host_rules(num_sms):
+    """The split and grid rules of the BF16-output program: the switch points of
+    its rule on every SM count it ships for, a resident grid, and the
+    deterministic mode's fixed split count."""
+    points = _runtime.mhc_infer_switch_points(num_sms)
+    assert points == ((129, 257, 385) if num_sms < 208 else (193, 385, 577))
+    expected = {
+        1: 64,
+        points[0] - 1: 64,
+        points[0]: 32,
+        points[1] - 1: 32,
+        points[1]: 22,
+        points[2] - 1: 22,
+        points[2]: 16,
+    }
+    for tokens, splits in expected.items():
+        assert _runtime.mhc_infer_num_splits(tokens, num_sms) == splits
+        assert _runtime.mhc_infer_num_splits(tokens, num_sms, deterministic=True) == 16
+        ctas = _runtime.mhc_infer_num_ctas(tokens, num_sms, splits)
+        m_blocks = (tokens + 63) // 64
+        assert m_blocks <= ctas <= num_sms
+        assert ctas == min(num_sms, max(m_blocks * splits, (tokens + 3) // 4))
+        assert (
+            _runtime.mhc_infer_scratch_floats(tokens, splits)
+            == m_blocks * splits * 1664
+        )
+    assert _runtime.mhc_infer_num_splits(1 << 20, num_sms) == 16
+    assert _runtime.mhc_infer_num_ctas(1, num_sms, 64) == 64
+    assert _runtime.mhc_infer_num_ctas(4096, num_sms, 16) == num_sms
+
+
+def test_split_fn_is_the_exact_three_way_split():
+    fn = torch.randn(24, 4 * 4096, generator=torch.Generator().manual_seed(7)) * 0.01
+    fnp = _runtime.split_fn(fn)
+    assert fnp.shape == (3, 32, 4 * 4096) and fnp.dtype == torch.bfloat16
+    assert not fnp[:, 24:].any()
+    pieces = fnp[:, :24].double()
+    assert torch.equal(fnp[0, :24], fn.bfloat16())
+    assert torch.equal(fnp[1, :24], (fn - fn.bfloat16().float()).bfloat16())
+    residual = (fn.double() - pieces.sum(0)).abs()
+    assert bool((residual <= fn.double().abs() * 2.0**-27 + 1e-30).all())
+    held = torch.full_like(fnp, float("nan"))
+    assert _runtime.split_fn(fn, out=held) is held and torch.equal(held, fnp)
+
+
+def test_h4096_unsupported_combinations_name_the_support_matrix():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    try:
+        _runtime.device_facts(torch.cuda.current_device())
+    except RuntimeError as error:
+        pytest.skip(str(error))
+    values = inputs_h4096(64)
+    with pytest.raises(NotImplementedError, match="hidden=4096"):
+        prepare_mega_mhc(**values, sf_layout="col")
+    shifted = dict(values, shifted_prev_mix=torch.full((64, 4, 1), 0.25, device="cuda"))
+    with pytest.raises(NotImplementedError, match="normal mode"):
+        prepare_mega_mhc(**shifted, sf_layout="bf16")
+
+
+@pytest.mark.parametrize("tokens", H4096_TOKENS)
+def test_h4096_values_and_replay(tokens):
+    _skip_unless_exported(4096, "bf16")
+    values = inputs_h4096(tokens)
+    plan = prepare_mega_mhc(**values, sf_layout="bf16")
+    _arch, sms = _runtime.device_facts(torch.cuda.current_device())
+    assert plan.config["num_splits"] == _runtime.mhc_infer_num_splits(tokens, sms)
+    assert plan.config["num_launch_sms"] == _runtime.mhc_infer_num_ctas(
+        tokens, sms, plan.config["num_splits"]
+    )
+    assert set(plan.outputs) == {
+        "new_residual",
+        "new_post_mix",
+        "new_comb_res_mix",
+        "y_bf16",
+    }
+    expected = reference_h4096(values)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    first = None
+    for _ in range(3):
+        with torch.cuda.stream(stream):
+            poison(plan.outputs)
+            before = torch.cuda.memory_allocated()
+            plan.run()
+            assert torch.cuda.memory_allocated() == before
+        stream.synchronize()
+        check_h4096(plan.outputs, expected)
+        current = {name: value.clone() for name, value in plan.outputs.items()}
+        if first is None:
+            first = current
+        for name, value in current.items():
+            torch.testing.assert_close(value, first[name], atol=0, rtol=0)
+    stream.wait_stream(torch.cuda.current_stream())
+
+
+@pytest.mark.parametrize("tokens", (1, 200, 1025))
+def test_h4096_graph_replay_changed_inputs_and_update_fn(tokens):
+    _skip_unless_exported(4096, "bf16")
+    values = inputs_h4096(tokens)
+    plan = prepare_mega_mhc(**values, sf_layout="bf16")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        plan.run()
+        plan.run()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        plan.run()
+    stream.synchronize()
+    previous = plan.launch_epochs.cpu().tolist()
+    active = plan.config["num_launch_sms"]
+    for repeat in range(6):
+        with torch.cuda.stream(stream):
+            values["x"].add_(0.015625)
+            values["post_mix"].mul_(0.5)
+            if repeat == 3:
+                values["fn"].mul_(2.0)
+                plan.update_fn()
+            expected = reference_h4096(values)
+            poison(plan.outputs)
+            if repeat == 4:
+                plan.run()
+            else:
+                graph.replay()
+        stream.synchronize()
+        check_h4096(plan.outputs, expected)
+        current = plan.launch_epochs.cpu().tolist()
+        assert len(current) == plan.config["num_sms"]
+        assert all(
+            after == before + 1
+            for before, after in zip(previous[:active], current[:active], strict=True)
+        )
+        assert current[active:] == previous[active:]
+        previous = current
+    stream.wait_stream(torch.cuda.current_stream())
+
+
+def test_h4096_caller_held_fnp_and_deterministic_splits():
+    _skip_unless_exported(4096, "bf16")
+    values = inputs_h4096(384)
+    fnp = _runtime.split_fn(values["fn"])
+    plan = prepare_mega_mhc(**values, sf_layout="bf16", fnp=fnp, deterministic=True)
+    assert plan.fnp is fnp and plan.config["num_splits"] == 16
+    plan.run()
+    torch.cuda.synchronize()
+    check_h4096(plan.outputs, reference_h4096(values))
+    replacement = values["fn"] * 0.5
+    plan.update_fn(replacement)
+    assert torch.equal(fnp, _runtime.split_fn(replacement))
+    plan.run()
+    torch.cuda.synchronize()
+    check_h4096(plan.outputs, reference_h4096(dict(values, fn=replacement)))
