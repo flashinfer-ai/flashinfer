@@ -1745,6 +1745,7 @@ kernel_cake_nvfp4_svdquant_gemm_4f451914c2d6580eb2de(const __grid_constant__ CUt
                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row * 128) + (112 ^ out_swz)))), "r"(result_bf16[28]), "r"(result_bf16[29]), "r"(result_bf16[30]), "r"(result_bf16[31]) : "memory");
                         prev_sub = sub;
                     }
+                    asm volatile("barrier.sync 1, 128;" ::: "memory");
                 } else {
                     int w_idx_3 = u_tile_2 / (unsigned int)tok_tiles;
                     int tok_idx_4 = u_tile_2 - (unsigned int)(w_idx_3 * tok_tiles);
@@ -1918,6 +1919,7 @@ kernel_cake_nvfp4_svdquant_gemm_4f451914c2d6580eb2de(const __grid_constant__ CUt
                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row_1 * 128) + (112 ^ out_swz_1)))), "r"(result_bf16_1[28]), "r"(result_bf16_1[29]), "r"(result_bf16_1[30]), "r"(result_bf16_1[31]) : "memory");
                         prev_sub_1 = sub_1;
                     }
+                    asm volatile("barrier.sync 1, 128;" ::: "memory");
                 }
                 _phase_acc_ovl_full ^= 1;
                 accf_stage_1 += 1;

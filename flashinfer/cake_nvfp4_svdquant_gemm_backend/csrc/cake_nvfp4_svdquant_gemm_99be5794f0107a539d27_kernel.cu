@@ -1291,6 +1291,7 @@ kernel_cake_nvfp4_svdquant_gemm_99be5794f0107a539d27(const __grid_constant__ CUt
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row * 128) + (112 ^ out_swz)))), "r"(result_bf16[28]), "r"(result_bf16[29]), "r"(result_bf16[30]), "r"(result_bf16[31]) : "memory");
                     prev_sub = sub;
                 }
+                asm volatile("barrier.sync 1, 128;" ::: "memory");
                 _phase_acc_ovl_full ^= 1;
                 accf_stage_1 += 1;
                 if (accf_stage_1 == 2) { accf_stage_1 = 0; _phase_acc_full ^= 1; }
