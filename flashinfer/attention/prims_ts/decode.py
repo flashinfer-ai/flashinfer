@@ -477,27 +477,6 @@ def _validate_head_dim(head_dim: int) -> int:
     return head_dim
 
 
-def _validate_h512_decode_route(
-    head_dim: int,
-    q_dtype_key: str,
-    k_dtype_key: str,
-    v_dtype_key: str,
-    *,
-    use_q_token_kv_block_sparse_route: bool,
-) -> None:
-    """Restrict H512 to the mixed-precision route qualified by this backend."""
-
-    if head_dim == 512 and not (
-        q_dtype_key == "float8_e4m3fn"
-        and k_dtype_key == v_dtype_key == "float4_e2m1fn"
-        and not use_q_token_kv_block_sparse_route
-    ):
-        raise ValueError(
-            "PrimTS head_dim=512 is currently supported only for dense paged "
-            "FP8-E4M3 Q with NVFP4 K/V"
-        )
-
-
 def _validate_seq_len_q(seq_len_q: int) -> int:
     return _validate_positive_int(seq_len_q, "seq_len_q")
 
@@ -1288,13 +1267,6 @@ def _resolve_decode_launch_spec(
     storage_page_size = _validate_storage_page_size(
         page_size,
         page_size if storage_page_size is None else storage_page_size,
-    )
-    _validate_h512_decode_route(
-        head_dim,
-        q_dtype_key,
-        k_dtype_key,
-        v_dtype_key,
-        use_q_token_kv_block_sparse_route=use_q_token_kv_block_sparse_route,
     )
 
     from .kernels.fmha_decode.fmha_decode_config import (

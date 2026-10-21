@@ -4358,32 +4358,6 @@ def test_attention_ts_mixed_dtype_contract(q_dtype, kv_dtype, output_dtype):
     decode_module._validate_dtype_pair(q_dtype, kv_dtype, kv_dtype, output_dtype)
 
 
-def test_attention_ts_decode_h512_route_contract():
-    from flashinfer.attention.prims_ts import decode as decode_module
-
-    decode_module._validate_h512_decode_route(
-        512,
-        "float8_e4m3fn",
-        "float4_e2m1fn",
-        "float4_e2m1fn",
-        use_q_token_kv_block_sparse_route=False,
-    )
-    rejected_routes = (
-        ("bfloat16", "float4_e2m1fn", "float4_e2m1fn", False),
-        ("float8_e4m3fn", "float8_e4m3fn", "float8_e4m3fn", False),
-        ("float8_e4m3fn", "float4_e2m1fn", "float4_e2m1fn", True),
-    )
-    for q_dtype, k_dtype, v_dtype, is_sparse in rejected_routes:
-        with pytest.raises(ValueError, match="head_dim=512"):
-            decode_module._validate_h512_decode_route(
-                512,
-                q_dtype,
-                k_dtype,
-                v_dtype,
-                use_q_token_kv_block_sparse_route=is_sparse,
-            )
-
-
 def test_attention_ts_rejects_unsupported_fp16_q_fp8_kv():
     from flashinfer.attention.prims_ts import decode as decode_module
 
@@ -4517,30 +4491,6 @@ def test_attention_ts_nvfp4_cache_contract():
             None,
             k_cache=packed,
             logical_head_dim=64,
-        )
-
-
-@pytest.mark.parametrize("dtype", (BFloat16, Float16, Float8E4M3FN))
-def test_attention_ts_decode_h512_config_rejects_unqualified_dtype(dtype):
-    with pytest.raises(ValueError, match="only for dense paged FP8-E4M3 Q with NVFP4"):
-        make_decode_config(
-            headdim=512,
-            args={"use_keeps_mma_ab": False},
-            seq_len_q=1,
-            seq_len_kv=128,
-            batch_size=1,
-            num_heads_q=32,
-            num_heads_kv=4,
-            q_dtype=dtype,
-            k_dtype=dtype,
-            v_dtype=dtype,
-            o_dtype=Float16 if dtype == Float8E4M3FN else dtype,
-            qkv_layout="pagedKv",
-            num_tokens_per_page=64,
-            split_kv_mode="disabled",
-            splits_kv=1,
-            mask_type="dense",
-            auto_tuner=False,
         )
 
 

@@ -1141,8 +1141,11 @@ class FmhaDecodeConfig:
     def smem_kv_sf_bytes_per_token(self) -> int:
         """SMEM bytes for one complete K or V scale row of a token."""
         if self.use_nvfp4_kv:
-            # The SF tensor map copies the complete D/16-byte row even when
-            # packed K/V is processed in 128-column head-dimension stages.
+            # Packed K/V still uses head_dim_kv_stage-column stages (two for
+            # H256, four for H512). Each stage's SF copy takes the complete
+            # D/16-byte row, because one stage's slice (8 B) is below TMA's
+            # 16-byte minimum box and is not contiguous across tokens. The
+            # transform then selects the 8-byte slice for its stage.
             return self.headdim // 16
         return 0
 
@@ -4889,6 +4892,25 @@ def _select_auto_split_kv_reduction_mode(
     return _config_with_split_kv_mode(cfg, "gmem_reduction"), "gmem_reduction"
 
 
+def _validate_headdim_512(cfg: FmhaDecodeConfig) -> None:
+    """Reject H512 profiles other than dense paged FP8-Q/NVFP4-KV decode.
+
+    Other H512 combinations can be enabled here as they are qualified.
+    """
+    if cfg.headdim != 512:
+        return
+    if not (
+        cfg.q_dtype == Float8E4M3FN
+        and cfg.use_nvfp4_kv
+        and cfg.use_paged_kv
+        and not cfg.use_block_sparse
+    ):
+        raise ValueError(
+            "PrimTS head_dim=512 is currently supported only for dense paged "
+            "FP8-E4M3 Q with NVFP4 K/V"
+        )
+
+
 def _validate_mixed_kv_dtype_profile(cfg: FmhaDecodeConfig) -> None:
     """Reject k_dtype != v_dtype profiles outside the supported combinations.
 
@@ -4924,16 +4946,7 @@ def _validate_profile_support(
     cfg.validate_boolean_fields()
     cfg.validate_dtypes()
     _validate_mixed_kv_dtype_profile(cfg)
-    if headdim == 512 and not (
-        cfg.q_dtype == Float8E4M3FN
-        and cfg.use_nvfp4_kv
-        and cfg.use_paged_kv
-        and not cfg.use_block_sparse
-    ):
-        raise ValueError(
-            "PrimTS head_dim=512 is currently supported only for dense paged "
-            "FP8-E4M3 Q with NVFP4 K/V"
-        )
+    _validate_headdim_512(cfg)
     if cfg.o_stages != cfg.num_insts_kv:
         raise ValueError("fmha_decode requires o_stages == num_insts_kv")
     _validate_kv256_static_config(cfg)
