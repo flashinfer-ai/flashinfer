@@ -62,7 +62,11 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_trtllm_mla_blackwell_6a2644cd7c80243f7cc3": {
-        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_6a2644cd7c80243f7cc3_kernel.cu",
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_5a25f65a14bfec7b2b1e_kernel.cu",
+        "source_flags": [
+            "-DV_QUARTER=0",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_6a2644cd7c80243f7cc3",
+        ],
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_100a", "sm_103a"],
     },
