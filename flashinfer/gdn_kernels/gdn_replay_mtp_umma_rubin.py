@@ -10,11 +10,13 @@ Differences from the base kernel:
 * named barriers 1-3 only (Rubin has 16 per SM, which capped the base kernel at 2 CTAs / SM),
   non-``.aligned`` syncs where a barrier has more than one sync site, and a proxy fence before
   the D-build buffer release;
-* T >= 5 verify rows read their v rows through SMEM (``vsmem``); the math warps' per-head code
-  as a rolled loop at T <= 4, and the flush RMW as loops (stochastic rounding everywhere, round
-  to nearest on sm_107a at most T, with packed fp16 x fp32 FMAs), against SM instruction-cache
-  thrash when flush and verify rows share an SM;
-* a persistent kernel for die-localized launches (sm_107a; chosen automatically at T = 2-8 when
+* T >= 5 verify rows read their v rows through SMEM (``vsmem``) and split the warpgroup
+  registers before any global load (``kernel_early``);
+* less code per CTA against SM instruction-cache thrash when flush and verify rows share an SM:
+  the math warps' per-head code as a rolled loop at T <= 4, and the flush RMW as loops
+  (stochastic rounding everywhere, round to nearest on sm_107a at most T, with packed
+  fp16 x fp32 FMAs);
+* a persistent kernel (``kernel_persist``, sm_107a; chosen automatically at T = 2-8 when
   ``num_sms`` names a die-restricted stream, or forced with ``persistent``), with
   ``num_sms`` / ``grid_override`` / ``persistent_counter`` / ``flush_hint``;
 * the fp32 copies of bf16 ``A_log`` / ``dt_bias`` are safe across streams and re-made after an
@@ -34,10 +36,7 @@ ring contract:
   default (round-to-nearest). "philox": FlashInfer's Mamba scheme, one Philox4x32 draw (key =
   seed, counter = flat state-pool offset of the 8-element chunk) feeds 4 ``cvt.rs.f16x2``
   pairs. "lcg": one LCG step per pair (s ^ (s >> 16) dither) from a hashed per-row seed
-  (``rand_seed`` or %clock). The stochastic-rounding builds run the flush RMW as loops (see
-  ``_rmw_group``): their unrolled RMW (~2x the round-to-nearest code) thrashed the SM
-  instruction cache when flush and verify rows share an SM. Most round-to-nearest builds on
-  sm_107a run it as loops as well (``_RN_RMW_LOOP_T``).
+  (``rand_seed`` or %clock).
 
 Math per (request, value head) with ``X = [k̂_0..k̂_{T-1}; s q̂_0..s q̂_{T-1}]``:
 
@@ -50,15 +49,17 @@ CTA = (key head, request): the key head's value heads in sequence (all HV / H of
 heads_per_cta, B), key head fastest; 4 CTAs / SM
 (SMEM ~56 KB, 80 registers, 128 TMEM columns); 192 threads in three roles -- 256 with the
 register split of the builds that would otherwise spill (``_use_regsplit``), where the
-math warps are warps 4-7 and warps 2-3 idle:
+math warps are warps 4-7 and warps 2-3 idle (setmaxnreg 24 / 104):
   warp 0   : TMA producer — each value head's fp16 state as two 16 KB 128B-swizzled K halves
              through two stages; per-head u windows bulk-copied into a two-head SMEM double
              buffer (T >= 5 verify rows: with the head's v rows in the window's never-live
              slots); flush rows TMA-store the folded halves.
   warp 1   : allocates TMEM at CTA entry (the next CTA on the SM is not launched before the
              allocation permit is relinquished), only UMMA issuer.
-  warps 2-5: the math warps ("consumers"): 128 lanes = 128 V rows (TMEM lane = row);
-             prologue + per-row math.
+  warps 2-5: the math warps ("consumers", warps 4-7 with the register split): 128 lanes =
+             128 V rows (TMEM lane = row); prologue + per-row math. Warps cw0 / cw0 + 1 are
+             the "ring-row" warps (Gram rows of the k̂ ring), cw0 + 2 / cw0 + 3 the "X-tile"
+             warps (X x X Gram, X tile, gates, coefficient tables).
 UMMAs (kind::f16, fp32 accumulate in TMEM):
   readout  R = S0 . X^T            M128 N16 K128  A: state stage   B: X tile (K-major)
   history  Y = D . C^T             M128 N16 K16   A: D (TMEM)      B: C tile
@@ -71,10 +72,11 @@ lands, so each half's RMW follows its readout and the epilogue overlaps the next
 state load.
 
 Persistent variant (sm_107a only, any T, all 4 value heads of a key head per CTA; automatic at
-T = 2-8 on die-localized launches): ``kernel_persist``, at most 4 CTAs per SM of the launch's stream that
-loop over the (key head, row) items -- verify, flush and padded rows in any mix -- with the
-same per-row steps. Use it only on die-localized launches (see
-``gated_delta_rule_mtp_ucache_flush_umma``).
+T = 2-8 on die-localized launches): ``kernel_persist``, at most 4 CTAs per SM of the launch's
+stream that loop over the (key head, row) items -- verify, flush and padded rows in any mix --
+with ``kernel_early``'s per-row steps; warp 2 is its scheduler (see the comment above
+``call_persist``). It only measured faster on die-localized launches (see
+``gated_delta_rule_mtp_ucache_flush_umma_rubin``).
 
 Specialised for K == V == 128, HV % H == 0, HV // H == 4 (Qwen3.5 GDN geometry).
 """
@@ -113,6 +115,8 @@ HPK = 4  # most value heads a CTA runs: per-head SMEM / TMEM / barrier arrays ar
 _EPS = 1e-6
 _TMEM_COLS = 128
 _COEF = 192  # fp32 coefficient words per head (see _CO_*)
+# per-head coefficient table offsets (words): intra-step solve A[t][s] / output Bq[t][s]
+# (8 x 8 each), beta_t, beta_t e^{g_t}, e^{g_t}, g_t, window weights w_j (16), e^{G_P}
 _CO_A, _CO_BQ, _CO_BETA, _CO_BG, _CO_EG, _CO_GAM, _CO_W, _CO_EGP = (
     0,
     64,
@@ -126,22 +130,12 @@ _CO_A, _CO_BQ, _CO_BETA, _CO_BG, _CO_EG, _CO_GAM, _CO_W, _CO_EGP = (
 _MIN_BLOCKS_PER_SM = (
     4  # 128 of the 512 TMEM columns, ~56 KB SMEM and 80 registers per CTA
 )
-# Register split: 256 threads, the math warps on warps 4-7 (one warpgroup, setmaxnreg.inc
-# 104), warps 0-3 (TMA producer, UMMA issuer, two idle warps) setmaxnreg.dec 24; the
-# 64-register launch budget keeps 4 CTAs/SM. It costs the two extra warps and the allocation
-# wait (+1-2 % median where nothing spills), so it is used only where the 192-thread,
-# 80-register layout spills on the math warps' path (B200, static STL / LDL): with 4 heads per
-# CTA, round-to-nearest at T >= 5 (T = 8: 20 / 26, +8 % kernel time at B = 512, 0 % fold);
-# with the unrolled stochastic-rounding RMW also LCG at T = 8 (16 / 16) and Philox-10 (T = 4:
-# 3 / 9, T = 8: 27 / 43), and with 2 heads per CTA the Philox-5 and LCG builds at T = 8 (1 / 1
-# each) -- the SR builds now follow the rule below. Every other 1- and 2-head build fits
-# without spilling. With 3 heads per CTA (HV / H = 3) round-to-nearest
-# spills at T = 5 / 6 (16 / 22, 19 / 27; the split measured 1-8 % faster at B = 64..512) and
-# only lightly at T = 7 / 8 (5 / 7, 3 / 5; the split measured 0-2.5 % slower at T = 8), so
-# the 3-head builds split at T = 5 and 6 only; their stochastic-rounding cells were not
-# swept (T = 8: Philox-5 7 / 13, Philox-10 3 / 5, LCG 1 / 1 in the 192-thread layout). The
-# 192-thread layout cannot split: setmaxnreg is warpgroup-wide and a 2-warp warpgroup
-# deadlocks.
+# Register split (setmaxnreg dec / inc): 256 threads, warps 0-3 (TMA producer, UMMA issuer,
+# two idle warps -- the persistent kernel's scheduler on warp 2) at 24 registers, the math
+# warps 4-7 (one warpgroup) at 104; the 64-register launch budget keeps 4 CTAs / SM. The two
+# extra warps cost 1-2 % where nothing spills, so builds take it only where the 192-thread,
+# 80-register layout spills on the math warps' path (``_use_regsplit``). The 192-thread layout
+# itself cannot split: setmaxnreg is warpgroup-wide and a 2-warp warpgroup deadlocks.
 _REGSPLIT = (24, 104)
 _FHFMA2_CC = (
     (10, 7),
@@ -149,51 +143,36 @@ _FHFMA2_CC = (
 # Round-to-nearest builds that run the flush RMW as the stochastic-rounding builds' loop (with
 # FHFMA2, so sm_107a only), 4 heads per CTA: the T where it measured faster (see rmw_loop).
 _RN_RMW_LOOP_T = (1, 2, 3, 5, 6, 8)
-# Early register split at T >= 5 (kernel_early; off: the base kernel's structure)
-_EARLY_SPLIT = True
-# Persistent kernel (``persistent``): mailbox words per entry, mailbox readers (warps 0,
-# 1 and the four math warps: one arrive each), the per-CTA init barrier (warps 0-2 + the math
-# warps), barrier 3 per row (the X-tile warps' arrive + the ring-row warps' sync), and the knob
-# for the next row's L2 prefetch
+# Persistent kernel: mailbox words per entry (6 used), mailbox readers (warps 0, 1 and the four
+# math warps: one arrive each), the per-CTA init barrier (warps 0-2 + the math warps) and
+# barrier 3 per row (the X-tile warps' arrive + the ring-row warps' sync)
 _PZ_RI = 8
 _PZ_READERS = 6
 _PZ_INIT = 224
 _PZ_B3 = 128
-_PZ_XPF = True
-# Item claim (compile time): dynamic by default -- after its first (static) item each CTA claims
-# items from a self-resetting int32[2] counter (_pz_sched_dyn). The static stride (_PZ_DYN = False,
-# item = CTA + n G) leaves a long tail: Rubin, localized split, T = 8, B = 2048, 0 % flush,
-# trace build: per-CTA end times p50 328-331 us, max 357-376 us; CUPTI 354 us static vs 333 us
-# dynamic (final4 373 us).
-_PZ_DYN = True
-# archs the persistent kernel is enabled on: sm_107a only (Rubin: spill-free at T = 2-8 in every
-# rounding mode, tested and measured there; T = 1 keeps 60 B of STL in the 24-register warps). Not sm_100a (B200): it compiles spill-free there too
-# (offline ptxas), but it has never run there, and its speed-up comes from die-localized launches,
-# which B200 does not have.
+# archs the persistent kernel is enabled on: sm_107a only (spill-free at T = 2-8 in every
+# rounding mode, tested and measured there). It compiles spill-free for sm_100a (B200) too, but
+# has never run there, and its speed-up comes from die-localized launches, which B200 lacks.
 _PZ_CC = ((10, 7),)
-# Automatic choice (persistent=None, the default): the persistent kernel where it measured faster --
-# T in _PZ_AUTO_T, all 4 value heads per CTA, a die-localized launch (``num_sms`` below the device's
-# SMs) and at least _PZ_AUTO_MIN_ITEMS[hint] (key head, row) items per CTA slot (H x B / (4 x
-# num_sms)). Rubin, localized split (106 SMs per die), persistent vs non-persistent, B total:
-# * no flush rows: T = 2-8 1.03-1.18x at every B from 64 (T = 8, B = 256: 0.99x);
-# * 30 % flush rows, random order: 1.00-1.09x from B = 512 (9.7 items per slot; T = 2: 0.99x),
-#   0.92-0.99x at B = 256 (4.8) and 0.89-0.97x at B = 64; T = 4, B = 512-4096, 0-30 %:
-#   1.02-1.10x, flush-first 1.01-1.09x; Philox-5 / LCG at T = 4 the same picture;
-# * T = 1: 0.94-1.03x (its prologue reorder already starts the state stream early): not automatic;
-# * one whole-GPU launch over interleaved memory: T = 4 0.94-0.98x, T = 5-8 0.88-0.93x.
+# Automatic choice (persistent=None, the default): the persistent kernel where it measured faster
+# -- T in _PZ_AUTO_T, all 4 value heads per CTA, a die-localized launch (``num_sms`` below the
+# device's SMs) and at least _PZ_AUTO_MIN_ITEMS[hint] (key head, row) items per CTA slot
+# (H x B / (4 x num_sms)). Rubin, 106 SMs per die, persistent vs non-persistent: no flush rows
+# T = 2-8 1.03-1.18x; 30 % flush rows 1.00-1.09x from 9.7 items per slot, 0.89-0.99x below 5;
+# T = 1 0.94-1.03x (its prologue reorder already starts the state stream early): not automatic;
+# one whole-GPU launch over die-interleaved memory: 0.88-0.98x.
 _PZ_AUTO_T = (2, 3, 4, 5, 6, 7, 8)
 # flush_hint "none": any size; flush rows possible (None / "some" / "flush_first"): >= 8 items
 _PZ_AUTO_MIN_ITEMS = {"none": 0, "some": 8}
 
 
-# Stochastic rounding: its flush RMW runs as loops (one RMW body per head or per CTA, see
-# GdnReplayMtpUmmaRubin.rmw_loop), which changed its register picture (sm_107a, STL / LDL): only
-# Philox at T >= 5 still takes the split (4 heads per CTA, and 2 at T = 8 as before; Philox-5
-# without it 3-17 STL). LCG never does (in the split its 64-register prologue spills 3-7 STL);
-# its 192-thread builds are clean at T = 1-4, 6 and 8 and keep 3-8 STL at T = 5 / 7 (4 heads),
-# where the split is no better. Philox-10 at T <= 4 no longer splits either (rolled: 0-4 STL in
-# the 192-thread layout, 8-16 in the split's prologue).
-def _use_regsplit(T: int, hpc: int, sr: str, sr_rounds: int) -> bool:
+def _use_regsplit(T: int, hpc: int, sr: str) -> bool:
+    """Builds that take the register split (_REGSPLIT): the ones whose 192-thread layout spills
+    on the math warps' path (sm_100a / sm_107a, static STL / LDL). Round to nearest: 4 heads
+    per CTA at T >= 5 (T = 8: 20 STL, +8 % kernel time), 3 heads at T = 5 / 6 (the split 1-8 %
+    faster; at T = 7 / 8 it spills lightly and the split measured up to 2.5 % slower).
+    Stochastic rounding (RMW loop): Philox at T >= 5 with 4 heads and at T = 8 with 2; never
+    LCG, whose 64-register prologue spills in the split."""
     if sr != "":
         return sr == "philox" and ((hpc == HPK and T >= 5) or (hpc == 2 and T == 8))
     if hpc == 3:
@@ -258,97 +237,70 @@ class GdnReplayMtpUmmaRubin:
         self.sr_lcg = sr in ("lcg", "lcg_clock")
         # the persistent kernel always splits (warp 2 is its scheduler; the math warps run at 104
         # registers from entry, so LCG's 64-register prologue spills do not arise there)
-        self.split = persistent or _use_regsplit(
-            T, hpc, self.sr, self.sr_rounds
-        )  # 256-thread layout
+        self.split = persistent or _use_regsplit(T, hpc, self.sr)  # 256-thread layout
         self.regsplit = _REGSPLIT  # (dec, inc) register counts, used when self.split
         self.cw0 = 4 if self.split else 2  # first consumer warp
         self.num_threads = 256 if self.split else 192
-        # Two Rubin tunings, each only on the side of T where it measured faster (localized
-        # split, B = 512, us, without -> with): the prologue reorder (``pro_reorder``) T = 1
-        # 80.7 -> 79.3, T = 4 87.3 -> 87.0; the D-build masks + earlier u windows (``epi``:
-        # d_mask, _u_window_head) T = 8 101.7 -> 100.8, but T = 4 87.3 -> 89.8; both together
-        # T = 8 102.7 (the reorder alone 101.2). So T <= 4 builds take the reorder only and
-        # T >= 5 builds the epi changes only (T = 5-7 not measured, taken as T = 8).
-        # (the persistent kernel at T <= 4: the T >= 5 row structure, see _persist_ok)
+        # Row structure, by T (each measured faster only on its side of T: Rubin, localized,
+        # B = 512):
+        # * T <= 4: the prologue reorder (``pro_reorder``): entry loads first, cursors last,
+        #   warp 0's mbarrier inits around head 0's state (T = 1: 80.7 -> 79.3 us).
+        # * T >= 5 (and the persistent kernel at every T): v rows through SMEM (``vsmem``) and
+        #   the D-build masks (``d_mask``). vsmem: a verify row has P < flush_min <= W_RING - T
+        #   + 1 live window slots, so slots wv = W_RING - T .. 15 of its u-window buffer are
+        #   never read as u; warp 0 bulk-copies the head's T v rows there, with its u window and
+        #   on the same u_full mbarrier, and the epilogue reads v from SMEM instead of global
+        #   memory (at T = 8 the consumer chain waited on the global v loads). The buffer then
+        #   stays in use until the head's epilogue has read its v rows, so u_free is arrived
+        #   there and head h + 2's window goes behind its own state's second half (see
+        #   _u_window_head). Flush rows keep 16-slot windows and v from global memory.
         self.pro_reorder = T <= 4 and not persistent
-        self.epi = T >= 5 or persistent
-        # D build (epi): clear the slots j >= P with uniform word masks instead of per-value
-        # selects (_d_build). Not in the 2- and 3-head builds (at T >= 5: 192 threads, 80
-        # registers, at their limit): there the masks' uniform registers moved ptxas into
-        # (more) spills (sm_100a T = 6 / 7 / 8, 2 heads: 0 / 5 / 0 -> 1 / 16 / 2 STL; 3 heads
-        # at T = 5-8).
-        self.d_mask = self.epi and hpc in (1, HPK)
-        # v rows through SMEM (T >= 5, verify rows): a verify row has P < flush_min <=
-        # W_RING - T + 1 live window slots, so slots wv = W_RING - T .. 15 of its u-window
-        # buffer are never read as u. Warp 0 bulk-copies head h's T v rows there, with its u
-        # window (wv slots) and on the same u_full mbarrier; the epilogue reads v from SMEM
-        # instead of global memory (at T = 8 the consumer chain waited on the global v loads
-        # -- L2 hits after the v prefetch -- in the D build and the epilogue). The D build reads
-        # only the wv slots that can be live. The buffer then stays in use until head h's
-        # epilogue has read its v rows, so u_free[h] is arrived there (right after those
-        # reads), and head h + 2's window goes behind its own state's second half (see
-        # _u_window_head). Flush rows are unchanged (16-slot windows, v from global memory).
         self.vsmem = T >= 5 or persistent
         self.wv = W_RING - T  # u slots copied on verify rows (vsmem)
-        # Math warps' per-head code (D build, readout / RMW waits, epilogue) as a rolled loop over
-        # the heads (dynamic head index; the mbarriers of each kind in one array) instead of
-        # unrolled HPC times: the unrolled code (~93 KB at T = 1, 4 heads) misses in the SM
-        # instruction cache (Rubin, T = 1, B = 2048, 20 % flush: ICC miss 17.5 -> 11.9 %,
-        # no-instruction stalls 8.1 -> 4.2 %). Localized split, T = 4: 0 % flush 1.03x, 20-30 %
-        # flush (rows flush-first per die) 1.02-1.03x; T = 1 neutral. Not at T >= 5 (the 64-register
-        # prologue of the register-split builds spills 7-30 STL with either loop rolled).
-        # Stochastic-rounding builds (Rubin, localized split, B = 2048, 30 % flush rows in
-        # random order, CUPTI us, unrolled -> rolled): the same rolled head loop, and the flush
-        # RMW as dynamic loops over (half, column group) (``rmw_loop``): one copy of its body per
-        # CTA (rolled heads) or per head. Unrolled (2 halves x 64 / ldn groups x 4 heads, ~2x the
-        # round-to-nearest code: ~7.0-8.9 K instructions vs 3.7-7.4 K) the flush path of these
-        # builds thrashed the SM instruction cache when flush and verify CTAs share an SM:
-        # LCG T = 1 / 4 / 8 582 / 675 / 811 -> 428 / 484 / 572 us, Philox-5 604 / 661 / 814 ->
-        # 438 / 485 / 566 (round-to-nearest 453 / 481 / 600). Without the RNG instructions
-        # (zero noise, DEBUG) the unrolled builds took 469 / 504 / 594 us: the RNG itself was
-        # not the cost. Bit-identical results (same noise bits per element).
-        # Round-to-nearest builds take the same RMW loop (+ FHFMA2; without it ptxas spills 2-4
-        # STL at T >= 4) where it measured faster (_RN_RMW_LOOP_T; sm_107a, 4 heads per CTA; Rubin
-        # localized split, B = 512 / 2048 / 8192, flush rows in random order, unrolled ->
-        # loop): 20-30 % flush 1.03-1.08x at T = 1 / 2 / 5 / 6 / 8 (T = 3: 1.02-1.03x), 0 % flush
-        # 0.996-1.026x. Not at T = 4 / 7, where the verify-only step (0 % flush: the flush code
-        # does not even run) measured 0.96-0.99x / 0.98-0.99x, nor with 1 / 2 heads per CTA
-        # (B = 64, 2 heads, 0 % flush: 0.98-0.99x). Bit-identical results.
-        # (the persistent kernel: always, T = 7 included -- one rolled flush path per kernel; the
-        # loop's FHFMA2 RMW is bit-identical to the unrolled one, see U.ffma_f16x2_f32)
+        # D build: clear the slots j >= P with uniform word masks instead of per-value selects
+        # (_d_build). Not in the 2- and 3-head builds (192 threads, 80 registers at their limit),
+        # where the masks' uniform registers pushed ptxas into spills.
+        self.d_mask = self.vsmem and hpc in (1, HPK)
+        # Less code per CTA against SM instruction-cache thrash (flush and verify CTAs share an
+        # SM; the unrolled T = 1, 4-head kernel is ~93 KB):
+        # * ``roll``: the math warps' per-head code (D build, waits, epilogue) as a rolled loop
+        #   over the heads (dynamic head index; the mbarriers of each kind in one array) at
+        #   T <= 4 (Rubin, T = 1, 20 % flush: ICC miss 17.5 -> 11.9 %; T = 4 1.02-1.03x). Not
+        #   at T >= 5: the register-split builds' 64-register prologue spills with it.
+        # * ``rmw_loop``: the flush RMW as dynamic loops over (half, column group), one copy of
+        #   its body per CTA (``roll_f``) or per head. Every stochastic-rounding build (its
+        #   unrolled RMW is ~2x the round-to-nearest code: T = 1 / 4 / 8, 30 % flush, 1.33-1.46x
+        #   with the loop; the RNG itself was not the cost), the round-to-nearest builds with 4
+        #   heads per CTA at _RN_RMW_LOOP_T on sm_107a (20-30 % flush 1.02-1.08x; at T = 4 / 7
+        #   the verify-only step measured 1-4 % slower) and the persistent kernel. Same bits.
         self.rmw_loop = (
             persistent
             or sr != ""
             or (mixed_fma and self.hpc == HPK and T in _RN_RMW_LOOP_T)
         )
         self.roll = T <= 4 and self.hpc > 1
-        # flush head loop rolled as well at T >= 5 in the register-split builds with the RMW loop
-        # (4 heads per CTA): Philox (T = 8: 583 -> 566 us) and round-to-nearest (30 % flush
-        # 1.03-1.07x vs 1.00-1.03x with one RMW loop per head); not in the 80-register LCG
-        # builds (spills)
+        # the flush head loop rolled as well in the register-split RMW-loop builds with 4 heads
+        # per CTA (T >= 5: Philox and round to nearest, 30 % flush 1.03-1.07x vs 1.00-1.03x with
+        # one RMW loop per head); not in the 80-register LCG builds (spills)
         self.roll_f = self.roll or (self.rmw_loop and self.split and self.hpc == HPK)
-        # the RMW's e^{G_P} S0 + F as packed fp16 x fp32 FMAs (FHFMA2; sm_107a), in the RMW loop
-        # only (Philox-5, T = 1 / 4: 458 / 498 -> 438 / 485 us; the unrolled round-to-nearest RMW
-        # unchanged with it)
+        # the RMW's e^{G_P} S0 + F as packed fp16 x fp32 FMAs (FHFMA2, sm_107a), in the RMW loop
+        # only (bit-identical to the fp32 FMAs, see U.ffma_f16x2_f32; without it the RN loop
+        # spills 2-4 STL at T >= 4)
         self.mixed_fma = mixed_fma and self.rmw_loop
         # RMW TMEM columns per load (and Philox streams per call = its 8-element chunks): 32 for
         # RN and for Philox with 4 heads per CTA (many CTAs, issue throughput); 16 for Philox
-        # with fewer heads per CTA (few CTAs, the RMW latency is the kernel time and the
-        # smaller live set halves it: B = 1, 5 rounds +8% vs +17%) and for LCG always (fewer
-        # spills; T = 8, B = 512, 100% fold +6% vs +9%; with the RMW loop LCG at 32 spills)
+        # with fewer heads per CTA (few CTAs: the RMW latency is the kernel time and the
+        # smaller live set halves it) and for LCG always (spills at 32)
         self.ldn = 16 if (self.sr_rounds > 0 and self.hpc < HPK) or self.sr_lcg else 32
         self.ngrp = 64 // self.ldn
         # vsmem's prologue copies are in the default (not pro_reorder) prologue order
         assert not (self.vsmem and self.pro_reorder)
-        # early_split: round-to-nearest / Philox register-split builds with 4
-        # heads per CTA (T >= 5) run kernel_early: the warpgroup register split before any global
-        # load, so the math warps issue their entry loads at 104 registers in the prologue reorder's
-        # order and run its consumer structure (x_ready not held to the ring rows).
-        self.early_split = (
-            _EARLY_SPLIT and self.split and self.hpc == HPK and not self.pro_reorder
-        )
-        # persistent (opt-in): kernel_persist, see call_persist
+        # early_split: the register-split builds with 4 heads per CTA (T >= 5) run kernel_early:
+        # the warpgroup register split before any global load, so the math warps issue their
+        # entry loads at 104 registers in the prologue reorder's order and run its consumer
+        # structure (x_ready not held to the ring rows)
+        self.early_split = self.split and self.hpc == HPK and not self.pro_reorder
+        # persistent: kernel_persist, see call_persist
         self.persistent = persistent
         if persistent:
             assert _persist_ok(T, self.hpk, hpc, self.sr), (T, self.hpk, hpc, self.sr)
@@ -356,6 +308,8 @@ class GdnReplayMtpUmmaRubin:
 
     @cute.jit
     def _make_state_tma(self, state: cute.Tensor, op):
+        """TMA atom for one 16 KB state stage: a value head's 128 V rows x one 64-element K half,
+        128B-swizzled (the readout UMMA's A operand)."""
         elems = 64
         smem_layout = cute.make_composed_layout(
             cute.make_swizzle(3, 4, 3),
@@ -396,6 +350,7 @@ class GdnReplayMtpUmmaRubin:
         flush_min: Int32,
         stream,
     ):
+        """Non-persistent launch: one CTA per (key head x head slice, batch row)."""
         tma_ld = self._make_state_tma(state, cpasync.CopyBulkTensorTileG2SOp())
         tma_st = self._make_state_tma(state, cpasync.CopyBulkTensorTileS2GOp())
         kern = (
@@ -453,6 +408,8 @@ class GdnReplayMtpUmmaRubin:
         tma_ld: cpasync.TmaInfo,
         tma_st: cpasync.TmaInfo,
     ):
+        """One (key head, row) CTA: the builds without ``early_split`` (T <= 4, and the T >= 5
+        builds with fewer heads per CTA or without the register split)."""
         T = self.T
         T2 = 2 * T
 
@@ -1349,8 +1306,8 @@ class GdnReplayMtpUmmaRubin:
             if is_flush:
                 self._load_seed(ctx, rand_seed)
                 if cutlass.const_expr(self.rmw_loop and self.roll_f):
-                    # SR builds: heads and the RMW as loops (one copy of the RMW body);
-                    # same steps as _head (flush)
+                    # RMW-loop builds: heads and the RMW as loops (one copy of the RMW
+                    # body); same steps as _head (flush)
                     for hh in cutlass.range(HPC, unroll=1):
                         vv = self._d_build(hh, 32, ctx, flush=True)
                         for g in cutlass.range(2, unroll=1):
@@ -1366,7 +1323,7 @@ class GdnReplayMtpUmmaRubin:
                             )
                         self._epilogue(hh, 0, ctx, vv, False)
                 elif cutlass.const_expr(self.rmw_loop):
-                    # SR builds, heads unrolled: one copy of the RMW loop per head
+                    # RMW-loop builds, heads unrolled: one copy of the RMW loop per head
                     for hh in cutlass.range_constexpr(HPC):
                         vv = self._d_build(hh, 32, ctx, flush=True)
                         for g in cutlass.range(2, unroll=1):
@@ -1421,6 +1378,9 @@ class GdnReplayMtpUmmaRubin:
         tma_ld: cpasync.TmaInfo,
         tma_st: cpasync.TmaInfo,
     ):
+        """One (key head, row) CTA, ``early_split`` builds (register split, 4 heads per CTA,
+        T >= 5): the same steps as ``kernel``, with warps 0 / 1 reading the cursors themselves
+        and the math warps issuing their entry loads after setmaxnreg.inc."""
         T = self.T
         T2 = 2 * T
 
@@ -1546,8 +1506,7 @@ class GdnReplayMtpUmmaRubin:
         u_g = u_cache.iterator.toint()
 
         if warp < CW0:
-            if cutlass.const_expr(self.split):
-                cute.arch.setmaxregister_decrease(self.regsplit[0])
+            cute.arch.setmaxregister_decrease(self.regsplit[0])
             if warp == 0:
                 # early_split: warp 0's prologue at 24 registers (no load outstanding at its
                 # setmaxnreg.dec, so the math warps' .inc does not wait for a round trip)
@@ -1854,7 +1813,6 @@ class GdnReplayMtpUmmaRubin:
             ab_off = Int64(cute.crd2idx((brow, tt, hv0 + ghc), a.layout)) * 2
             av_raw = U.ldg_u16_if(gate_pred, a.iterator.toint() + ab_off)
             bv_raw = U.ldg_u16_if(gate_pred, b.iterator.toint() + ab_off)
-            pre_gate = True
             alog_e = U.ldg_f32_if(
                 gate_pred,
                 a_log.iterator.toint()
@@ -1916,18 +1874,15 @@ class GdnReplayMtpUmmaRubin:
                 s_gram[(16 + grp) * 16 + gc + 1] = accx[1]
                 s_gram[(24 + grp) * 16 + gc] = accx[2]
                 s_gram[(24 + grp) * 16 + gc + 1] = accx[3]
-                if cutlass.const_expr(True):  # cons_reorder
-                    # The ring-row warps read the X x X diagonal (their rows' norms): arrive
-                    # only. A sync here waited for them, and they reach any barrier only once
-                    # their ring rows have landed (ptxas moves those registers into the mma
-                    # operands first), which put x_ready -- and the first readout -- a round
-                    # trip late. This warp's own diagonal (rn_x) needs a warp sync only.
-                    cute.arch.barrier_arrive(
-                        barrier_id=3, number_of_threads=160, aligned=False
-                    )
-                    cute.arch.sync_warp()
-                else:
-                    U.bar_sync_ua(1, 128)  # + the ring-row warps' (two sites)
+                # The ring-row warps read the X x X diagonal (their rows' norms): arrive
+                # only. A sync here waited for them, and they reach any barrier only once
+                # their ring rows have landed (ptxas moves those registers into the mma
+                # operands first), which put x_ready -- and the first readout -- a round
+                # trip late. This warp's own diagonal (rn_x) needs a warp sync only.
+                cute.arch.barrier_arrive(
+                    barrier_id=3, number_of_threads=160, aligned=False
+                )
+                cute.arch.sync_warp()
                 # X tile (fp16, SW128) and x_ready from these warps' own rows: they hold the
                 # same rows as the ring-row warps and have nothing in flight, so the readout
                 # can start once the X x X Gram is done instead of after the ring rows
@@ -1962,12 +1917,8 @@ class GdnReplayMtpUmmaRubin:
                     # gates: lane = head gh x token gt
                     av = U.u16_as_f32(av_raw, True)
                     bv = U.u16_as_f32(bv_raw, True)
-                    if cutlass.const_expr(pre_gate):
-                        alog = alog_e
-                        dtb = dtb_e
-                    else:
-                        alog = Float32(a_log[hv0 + ghc])
-                        dtb = Float32(dt_bias[hv0 + ghc])
+                    alog = alog_e
+                    dtb = dtb_e
                     xx = av + dtb
                     sp = xx
                     if xx <= Float32(20.0):
@@ -2021,12 +1972,9 @@ class GdnReplayMtpUmmaRubin:
             else:
                 wr0 = wo  # ring rows grp / grp + 8, issued when the cursors landed
                 wr1 = wr1_e
-                if cutlass.const_expr(True):  # cons_reorder
-                    # the X-tile warps' X x X Gram and warp 0's inits (before this role's first
-                    # mbarrier use)
-                    U.bar_sync_ua(3, 160)
-                else:
-                    U.bar_sync_ua(1, 128)  # + the X-tile warps' (two sites)
+                # the X-tile warps' X x X Gram and warp 0's inits (before this role's first
+                # mbarrier use)
+                U.bar_sync_ua(3, 160)
                 # norm of this lane's X row (for the k̂ ring append below)
                 rn_b = cute.math.rsqrt(s_gram[(16 + xr_b) * 16 + xr_b] + Float32(_EPS))
                 rn_b = _sel(xr_b >= T, rn_b * scale, rn_b, Float32)
@@ -2047,9 +1995,6 @@ class GdnReplayMtpUmmaRubin:
                 s_gram[grp * 16 + gc + 1] = accr[1]
                 s_gram[(grp + 8) * 16 + gc] = accr[2]
                 s_gram[(grp + 8) * 16 + gc + 1] = accr[3]
-                if cutlass.const_expr(False):  # cons_reorder
-                    # warp 0's inits, before this role's first mbarrier use (the coefficients)
-                    U.bar_sync_ua(3, 96)
                 # k̂ ring appends (bf16, 16 B per lane)
                 if xr_b < T:
                     if sub == 0:
@@ -2130,64 +2075,35 @@ class GdnReplayMtpUmmaRubin:
                     )
             # C / Kt are read by the history / fold UMMAs, which warp 1 issues only after
             # d_ready, arrived by these same threads after this fence
-            if cutlass.const_expr(True):  # cons_reorder
-                # Only their writers fence: the X-tile warps (C) and, on flush rows, everyone
-                # (Kt). The fence is also a CTA memory barrier (MEMBAR.ALL.CTA), which would hold
-                # the ring-row warps until their k-ring appends are acknowledged.
-                if mt == 1:
-                    cute.arch.fence_view_async_shared()
-                else:
-                    if is_flush:
-                        cute.arch.fence_view_async_shared()
-            else:
+            # Only their writers fence: the X-tile warps (C) and, on flush rows, everyone
+            # (Kt). The fence is also a CTA memory barrier (MEMBAR.ALL.CTA), which would hold
+            # the ring-row warps until their k-ring appends are acknowledged.
+            if mt == 1:
                 cute.arch.fence_view_async_shared()
-
-            # g appends (head gh x token gt) and window weights (head wh x slot wj): with
-            # pro_reorder on the ring-row lanes, which load their g values past the role split;
-            # else on the gate lanes / lanes 32-95, from the entry loads
-            if cutlass.const_expr(True):  # cons_reorder
-                if ct < 32:
-                    if gt < T:
-                        if gh < HPC:
-                            gnew = s_coef[gh * _COEF + _CO_GAM + gt]
-                            if not is_flush:
-                                if P > 0:
-                                    gnew = gnew + gp_g
-                            g_cache[sidx, hv0 + gh, (base + P + gt) & RING_MASK] = gnew
-                if ct < 64:
-                    w = Float32(0.0)
-                    if wj < P:
-                        w = cute.math.exp(gp_w - gj_w, fastmath=True)
-                    s_coef[wh * _COEF + _CO_W + wj] = w
-                    if wj == 0:
-                        egp = Float32(1.0)
-                        if P > 0:
-                            egp = cute.math.exp(gp_w, fastmath=True)
-                        s_coef[wh * _COEF + _CO_EGP] = egp
             else:
-                if ct >= 64:
-                    if ct < 96:
-                        # G_P needs the cursors: second round trip
-                        if gt < T:
-                            if gh < HPC:
-                                gnew = s_coef[gh * _COEF + _CO_GAM + gt]
-                                if not is_flush:
-                                    if P > 0:
-                                        gnew = gnew + gp_g
-                                g_cache[sidx, hv0 + gh, (base + P + gt) & RING_MASK] = (
-                                    gnew
-                                )
-                if ct >= 32:
-                    if ct < 96:
-                        w = Float32(0.0)
-                        if wj < P:
-                            w = cute.math.exp(gp_w - gj_w, fastmath=True)
-                        s_coef[wh * _COEF + _CO_W + wj] = w
-                        if wj == 0:
-                            egp = Float32(1.0)
+                if is_flush:
+                    cute.arch.fence_view_async_shared()
+
+            # g appends (head gh x token gt) and window weights (head wh x slot wj) on the
+            # ring-row lanes, which loaded their g values past the role split
+            if ct < 32:
+                if gt < T:
+                    if gh < HPC:
+                        gnew = s_coef[gh * _COEF + _CO_GAM + gt]
+                        if not is_flush:
                             if P > 0:
-                                egp = cute.math.exp(gp_w, fastmath=True)
-                            s_coef[wh * _COEF + _CO_EGP] = egp
+                                gnew = gnew + gp_g
+                        g_cache[sidx, hv0 + gh, (base + P + gt) & RING_MASK] = gnew
+            if ct < 64:
+                w = Float32(0.0)
+                if wj < P:
+                    w = cute.math.exp(gp_w - gj_w, fastmath=True)
+                s_coef[wh * _COEF + _CO_W + wj] = w
+                if wj == 0:
+                    egp = Float32(1.0)
+                    if P > 0:
+                        egp = cute.math.exp(gp_w, fastmath=True)
+                    s_coef[wh * _COEF + _CO_EGP] = egp
             cute.arch.barrier(barrier_id=1, number_of_threads=128)
 
             tbase = tmem_addr[0]
@@ -2220,8 +2136,8 @@ class GdnReplayMtpUmmaRubin:
             if is_flush:
                 self._load_seed(ctx, rand_seed)
                 if cutlass.const_expr(self.rmw_loop and self.roll_f):
-                    # SR builds: heads and the RMW as loops (one copy of the RMW body);
-                    # same steps as _head (flush)
+                    # RMW-loop builds: heads and the RMW as loops (one copy of the RMW
+                    # body); same steps as _head (flush)
                     for hh in cutlass.range(HPC, unroll=1):
                         vv = self._d_build(hh, 32, ctx, flush=True)
                         for g in cutlass.range(2, unroll=1):
@@ -2237,7 +2153,7 @@ class GdnReplayMtpUmmaRubin:
                             )
                         self._epilogue(hh, 0, ctx, vv, False)
                 elif cutlass.const_expr(self.rmw_loop):
-                    # SR builds, heads unrolled: one copy of the RMW loop per head
+                    # RMW-loop builds, heads unrolled: one copy of the RMW loop per head
                     for hh in cutlass.range_constexpr(HPC):
                         vv = self._d_build(hh, 32, ctx, flush=True)
                         for g in cutlass.range(2, unroll=1):
@@ -2271,11 +2187,14 @@ class GdnReplayMtpUmmaRubin:
     # ================================================================== persistent
     # kernel_persist: G = min(H * B, 4 x the stream's SMs) CTAs over the (key head, row) items
     # (item i: key head i % H, row i // H, through row_order): each CTA's first item is its own
-    # index, the next ones claimed from a counter (_PZ_DYN; else a static stride CTA + n G).
-    # Scope (``persistent``, opt-in): T >= 5, 4 heads per CTA = all of a key head's, every rounding
-    # mode; verify, flush and padded rows in any mix and order. Per CTA, once: warp 1 allocates TMEM,
-    # warp 0 initializes the mbarriers (published to warps 1 / 2 and the math warps through one
-    # barrier 1 instance of 224 threads), one setmaxnreg split. Warp 2 (idle in the split) is the
+    # index, the next ones claimed from a self-resetting counter (dynamic load balance: a flush row
+    # takes ~2x a verify row; a static stride CTA + n G measured 6 % slower at T = 8, B = 2048).
+    # Scope: 1 <= T <= 8, 4 heads per CTA = all of a key head's, every rounding mode (at T <= 4 with
+    # the T >= 5 row structure); verify, flush and padded rows in any mix and order. Per CTA, once:
+    # warp 1 allocates TMEM, warp 0 initializes the mbarriers (published to warps 1 / 2 and the
+    # math warps through one barrier 1 instance of 224 threads), one setmaxnreg split. This
+    # one-time set-up (and the TMEM release at the end) is what the persistent kernel saves per
+    # item over one CTA per item. Warp 2 (idle in the split) is the
     # scheduler: it loads each item's cursors, skips padded rows and publishes the rows through a
     # 2-entry SMEM mailbox (r_full / r_empty; readers: warps 0, 1 and the four math warps), then a
     # sentinel (valid = 0). Each row runs kernel_early's steps for its kind (flush: P >= flush_min).
@@ -2501,8 +2420,7 @@ class GdnReplayMtpUmmaRubin:
                 self._pz_mma(flush_min, mbar, sm)
             elif warp == 2:
                 U.bar_sync_ua(1, _PZ_INIT)
-                sched = self._pz_sched_dyn if _PZ_DYN else self._pz_sched
-                sched(
+                self._pz_sched(
                     cta,
                     n_cta,
                     n_items,
@@ -2559,53 +2477,7 @@ class GdnReplayMtpUmmaRubin:
         row_order,
         sm,
     ):
-        """Warp 2: static claim (item i = CTA + n G), cursors, padded rows skipped, then the
-        sentinel. The cursors of the next item load while the mailbox slot is still in use."""
-        ri = sm["rinfo"]
-        npub = Int32(0)
-        it = Int32(cta)
-        while it < n_items:
-            bx = it % self.h
-            blk_row = it // self.h
-            brow = blk_row
-            if cutlass.const_expr(self.use_row_order):
-                brow = Int32(row_order[blk_row])
-            sidx = Int32(state_idx_t[brow])
-            P = Int32(hist_len[brow])
-            base = Int32(cache_base[brow])
-            if sidx >= 0:
-                sl = npub & 1
-                cute.arch.mbarrier_wait(sm["r_empty"] + sl, ((npub >> 1) & 1) ^ 1)
-                with cute.arch.elect_one():
-                    o = sl * _PZ_RI
-                    ri[o] = brow
-                    ri[o + 1] = bx
-                    ri[o + 2] = sidx
-                    ri[o + 3] = P
-                    ri[o + 4] = base
-                    ri[o + 5] = Int32(1)
-                    cute.arch.mbarrier_arrive(sm["r_full"] + sl)
-                npub = npub + 1
-            it = it + n_cta
-        se = npub & 1
-        cute.arch.mbarrier_wait(sm["r_empty"] + se, ((npub >> 1) & 1) ^ 1)
-        with cute.arch.elect_one():
-            ri[se * _PZ_RI + 5] = Int32(0)
-            cute.arch.mbarrier_arrive(sm["r_full"] + se)
-
-    @cute.jit
-    def _pz_sched_dyn(
-        self,
-        cta,
-        n_cta,
-        n_items,
-        state_idx_t,
-        hist_len,
-        cache_base,
-        row_order,
-        sm,
-    ):
-        """Warp 2, _PZ_DYN: the CTA's first item static (item = CTA), then each next item claimed
+        """Warp 2: the CTA's first item static (item = CTA), then each next item claimed
         (G + an atomic count) once a mailbox slot is free, about two rows ahead of its use (dynamic
         load balance across CTAs: flush rows take ~2x a verify row); padded rows skipped; then the
         sentinel and the counter's done count (the launch's last CTA zeroes it)."""
@@ -2864,12 +2736,11 @@ class GdnReplayMtpUmmaRubin:
         nfl = Int32(flush_min <= nP)
         st_full, mma_slot, f_gdone = mbar["st_full"], mbar["mma_slot"], mbar["f_gdone"]
         u_full, u_free = mbar["u_full"], mbar["u_free"]
-        if cutlass.const_expr(_PZ_XPF):
-            if nvalid != 0:
-                with cute.arch.elect_one():
-                    self._pz_l2_prefetch(
-                        q, k, a, b, v, k_cache, g_cache, nbrow, nkh, nsidx, nbase
-                    )
+        if nvalid != 0:
+            with cute.arch.elect_one():
+                self._pz_l2_prefetch(
+                    q, k, a, b, v, k_cache, g_cache, nbrow, nkh, nsidx, nbase
+                )
         for gx in cutlass.range_constexpr(2):
             prev = 2 * HPC - 2 + gx
             if fl != 0:
@@ -2912,9 +2783,6 @@ class GdnReplayMtpUmmaRubin:
                         self._pz_v_rows_copy(
                             v, uw_addr, u_full[hx], nbrow, nhv0 + hx, hx
                         )
-            if cutlass.const_expr(not _PZ_XPF):
-                with cute.arch.elect_one():
-                    self._pz_v_prefetch(v, nbrow, nhv0)
 
     @cute.jit
     def _pz_producer(
@@ -3713,14 +3581,12 @@ class GdnReplayMtpUmmaRubin:
 
     def _u_window_head(self, slot):
         """Non-flush rows: the value head whose u window warp 0 bulk-copies right behind
-        state slot ``slot``'s load (heads 0 / 1: in the prologue), -1 for none. Head hh behind
-        its own state's first half (slot 2 hh, as on flush rows); with ``epi``, one head
-        earlier: head hh = slot // 2 + 1 behind head hh - 1's second half. Issued behind head
-        hh's own state the window could still be in flight when head hh's D build needed it
-        (Rubin, T = 1 / 4: head 3's D build 0.8 / 0.4 us vs 0.2 for head 1). u_free[hh - 2] is
-        arrived in head hh - 2's D build, ahead of the d_ready -> history -> readout chain that
-        mma_slot[2 hh - 2] (the next wait) depends on, so the earlier wait never delays the
-        state stream.
+        state slot ``slot``'s load (heads 0 / 1: in the prologue), -1 for none.
+
+        Without vsmem: head hh behind its own state's first half (slot 2 hh, as on flush
+        rows). u_free[hh - 2] is arrived in head hh - 2's D build, ahead of the d_ready ->
+        history -> readout chain that mma_slot[2 hh - 2] (the next wait) depends on, so the
+        wait never delays the state stream.
 
         With vsmem, u_free[hh - 2] is arrived in head hh - 2's epilogue instead (right after
         its v reads, ahead of its epi_done), so head hh goes behind its own state's second
@@ -3729,13 +3595,9 @@ class GdnReplayMtpUmmaRubin:
         wait (mma_slot[2 hh]: head hh's readout, which waits for epi_done[hh - 2]) returns
         later anyway. No cycle: head hh - 2's epilogue needs only its readout and D build,
         whose state and window were issued before this wait."""
-        if self.vsmem:
-            hh = slot // 2
-            return hh if slot % 2 == 1 and 2 <= hh < self.hpc else -1
-        if self.epi:
-            hh = slot // 2 + 1
-            return hh if slot % 2 == 1 and 2 <= hh < self.hpc else -1
         hh = slot // 2
+        if self.vsmem:
+            return hh if slot % 2 == 1 and 2 <= hh < self.hpc else -1
         return hh if slot % 2 == 0 and hh >= 2 else -1
 
     def _u_window_copy(
@@ -4146,7 +4008,7 @@ class GdnReplayMtpUmmaRubin:
         return lx
 
     def _rmw_group(self, hh, g, gq, ctx, egp, srow, r0, r1, r2, r3):
-        """RMW loop (SR builds): TMEM column group gq (dynamic) of half g (dynamic) of head hh;
+        """RMW loop (``rmw_loop``): TMEM column group gq (dynamic) of half g (dynamic) of head hh;
         the same steps as one group of _rmw. Returns the carried r0..r3 (LCG: advanced)."""
         ct, tbase = ctx["ct"], ctx["tbase"]
         ldn = self.ldn
@@ -4176,8 +4038,9 @@ class GdnReplayMtpUmmaRubin:
         return r0, r1, r2, r3
 
     def _rmw(self, hh, g, ctx):
-        """Flush rows: S_half = e^{G_P} S0_half + F (TMEM cols 64..127) in place on state stage
-        g (= half g of head hh), then publish it to warp 0's TMA store (f_gdone)."""
+        """Flush rows, unrolled RMW (builds without ``rmw_loop``): S_half = e^{G_P} S0_half + F
+        (TMEM cols 64..127) in place on state stage g (= half g of head hh), then publish it to
+        warp 0's TMA store (f_gdone). Same arithmetic and noise bits as the RMW loop."""
         ct, row, tbase, s_coef = ctx["ct"], ctx["row"], ctx["tbase"], ctx["s_coef"]
         egp = s_coef[hh * _COEF + _CO_EGP]
         srow = ctx["st_addr"] + g * 16384 + row * 128
@@ -4188,24 +4051,11 @@ class GdnReplayMtpUmmaRubin:
                 (Int64(ctx["sidx"]) * self.hv + Int64(ctx["hv0"] + hh)) * V_DIM
                 + Int64(row)
             ) * K_DIM + g * 64
-        # TMEM columns per load (and Philox streams per call = its 8-element chunks): 32 for
-        # RN and for Philox with 4 heads per CTA (many CTAs, issue throughput); 16 for Philox
-        # with fewer heads per CTA (few CTAs, the RMW latency is the kernel time and the
-        # smaller live set halves it: B = 1, 5 rounds +8% vs +17%) and for LCG always (fewer
-        # spills; T = 8, B = 512, 100% fold +6% vs +9%)
-        ldn = 16 if (self.sr_rounds > 0 and self.hpc < HPK) or self.sr_lcg else 32
+        ldn = self.ldn  # TMEM columns per load (see __init__)
         nch = ldn // 8  # 8-element chunks per load
         nst = nch  # Philox streams per call
         if self.sr_lcg:
-            # LCG dither (3 instructions per pair): this
-            # (state row, half)'s seed = murmur3 of its flat id and the per-flush key; pair n
-            # (= 4 chunk + i) takes LCG state n folded as s ^ (s >> 16), run as 4 jump-ahead
-            # chains (x_i -> A^4 x_i + C4) so the 4 pairs of a 16-B word are independent
-            # instructions. Known weakness: the two 13-bit fields of a
-            # word XOR to the state's low bits and consecutive words are consecutive LCG
-            # states, so dithers within one (row, half) are not jointly independent. A PCG
-            # RXS-M-XS output fixes that but costs ~7 instructions per word -- as much as
-            # 5-round Philox (measured), so use "philox" when that matters.
+            # LCG dither: the same chains as _rmw_setup (see there)
             cid = (
                 (Int64(ctx["sidx"]) * self.hv + Int64(ctx["hv0"] + hh)) * V_DIM
                 + Int64(row)
@@ -4330,7 +4180,7 @@ class GdnReplayMtpUmmaRubin:
             return cute.compile[gdn_compile_options(device, cute.EnableTVMFFI(True))](
                 obj.call_persist,
                 *args,
-                ft(Int32, (2,), 1),  # claim counter (_PZ_DYN)
+                ft(Int32, (2,), 1),  # claim counter
                 Float32(1.0),
                 Int32(1),
                 Int32(1),
@@ -4469,21 +4319,15 @@ def auto_heads_per_cta(
     return hpk
 
 
-_PZ_CTR: dict = {}
-# Dispatch rule for persistent=True: (rounding mode, T) -> the most (key head, row) items per CTA
-# slot (H x B / (4 x num_sms)) at which the launch runs the non-persistent kernel instead (a test's
-# ``grid_override`` always runs the persistent kernel), per ``flush_hint`` (the host cannot see the
-# flush rows: hist_len is a device tensor). Rubin, localized split (106 SMs per die), H = 16,
-# Philox 5 / 10 rounds, T = 6 / 8:
-# * flush rows in random order (None / "some"; the steady state at T >= 6 flushes 30-50 % of
-#   rows): B = 256 per die (9.7 items per slot) non-persistent 1-16 % faster, B = 512 per die
-#   (19.3) persistent 3-5 % faster. T = 5: within 1 %; round-to-nearest / LCG: persistent faster
-#   or equal.
-# * no flush rows ("none") or flush rows first ("flush_first"): persistent
-#   2-5 % faster at 0 % from B = 160 per die (6.0 items per slot) up (B = 256: 82.5 % DRAM at
-#   T = 8 vs 79.2 %), 2-5 % slower at B = 128 (4.8). Flush-first 20 / 30 %, B = 160-256 per die:
-#   Philox-10 persistent 1-6 % faster, Philox-5 -3 % to +2 % (30 % below B = 256: slower); B = 128:
-#   Philox-5 non-persistent 3-6 % faster, Philox-10 persistent 1-3 % faster.
+# Dispatch rule for a persistent launch: (rounding mode, T) -> the most (key head, row) items
+# per CTA slot (H x B / (4 x num_sms)) at which the launch runs the non-persistent kernel
+# instead (``grid_override`` always runs the persistent kernel), per ``flush_hint`` (the host
+# cannot see the flush rows: hist_len is a device tensor). Rubin, 106 SMs per die, H = 16,
+# Philox 5 / 10 rounds, T = 6 / 8: flush rows in random order ("some"; the steady state at
+# T >= 6 flushes 30-50 % of rows): at 9.7 items per slot the non-persistent kernel 1-16 %
+# faster, at 19.3 the persistent one 3-5 %; no flush rows or flush rows first ("few"): the
+# persistent kernel 2-5 % faster from 6.0 items per slot, 2-6 % slower at 4.8. T = 5: within
+# 1 %; round to nearest / LCG: the persistent kernel faster or equal.
 _PZ_PLAIN_MAX_ITEMS = {
     "some": {("philox", 6): 10, ("philox", 7): 10, ("philox", 8): 10},
     "few": {("philox", 6): 5, ("philox", 7): 5, ("philox", 8): 5},
@@ -4530,6 +4374,7 @@ def _pz_auto(
 # reused (each graph replay's last CTA re-zeroes its slot).
 _PZ_ARENA_SLOTS = 4096
 _PZ_ARENA: dict = {}  # device index -> {"chunks": [int32[slots, 2], ...], "next": free slot}
+_PZ_CTR: dict = {}  # eager launches' claim counters: (device index, stream) -> int32[2]
 
 
 def persistent_counter_reset() -> None:
@@ -4549,7 +4394,7 @@ def _pz_counter(device: torch.device) -> torch.Tensor:
     share one. Under graph capture: a slot of its own from the eagerly zeroed arena (graphs captured
     with torch.cuda.graph's defaults share one capture stream and may be replayed concurrently),
     or, if the arena has no free slot, a new zeroed counter in the graph (a memset node, ~1 us per
-    replay). Unused by the static-claim build."""
+    replay)."""
     a = _PZ_ARENA.get(device.index)
     if torch.cuda.is_current_stream_capturing():
         if a is not None and a["next"] < a["chunks"][-1].shape[0]:
@@ -4622,8 +4467,7 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
     ``NotImplementedError``.
 
     ``heads_per_cta`` (a divisor of HV / H; None = by batch size, see ``auto_heads_per_cta``)
-    sets how many
-    of a key head's 4 value heads one CTA runs.
+    sets how many of a key head's 4 value heads one CTA runs.
 
     ``stochastic_rounding`` rounds the fp16 state written by flush rows stochastically
     (``cvt.rs.f16x2``, sm_100a / sm_103a / sm_107a); outputs, rings and verify rows are unchanged:
@@ -4635,34 +4479,35 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
     * "lcg": an LCG dither -- one LCG step per pair, bits s ^ (s >> 16)
       -- started from a murmur3 hash of the (state row, half) id and the seed. Cheapest; each
       element is unbiased and flushes are independent, but dithers within one state row are
-      not jointly independent (see ``_rmw``). With ``rand_seed`` it is reproducible per seed;
-      without, the seed is %clock (not reproducible).
+      not jointly independent (see ``_rmw_setup``). With ``rand_seed`` it is reproducible per
+      seed; without, the seed is %clock (not reproducible).
 
-    ``persistent`` (None = automatic, the default; True / False force it): one launch of G = min(H x B, 4 x
-    ``num_sms``) CTAs (``num_sms``: the SMs the launch's stream can use, default the device's;
-    ``grid_override`` forces G, for tests) that loop over the (key head, row) items -- verify,
-    flush and padded rows in any mix and order -- claiming them from an int32[2] counter that the
-    launch's last CTA re-zeroes: by default one cached per (device, current stream) for eager
-    launches and one of its own per captured launch under CUDA graph capture (from an eagerly
-    zeroed pool, so separately captured graphs can be replayed concurrently), or the caller's
-    ``persistent_counter`` (zeroed int32[2] CUDA tensor; give each concurrently running launch its
-    own). ``persistent_counter_reset`` re-zeroes the cached
-    counters after an aborted launch. Only sm_107a, all 4 value heads of a key head per CTA;
-    every T and rounding mode. Measured faster only on die-localized launches (Rubin, each die's
-    rows with its buffers in that die's memory, ``num_sms`` = the die's 106 SMs): T = 2-8 1.03-1.18x
-    without flush rows, 1.00-1.09x with 30 % from B = 512, slower below that; T = 1 0.94-1.03x. One whole-GPU launch over
-    die-interleaved memory measured 0.88-0.93x (T = 5-8). Automatic (None): the persistent kernel
-    on sm_107a for T = 2-8 with all value heads per CTA when ``num_sms`` is given and below the
-    device's SM count (a die-restricted stream, e.g. a green context), ``grid_override`` is unset
-    and, unless ``flush_hint`` is "none", there are at least 8 (key head, row) items per CTA slot
-    (H x B >= 32 x ``num_sms``: B >= 212 per 106-SM die at H = 16); the non-persistent kernel
-    otherwise. Pass ``num_sms`` (and ``flush_hint``) on die-localized launches.
+    ``persistent`` (None = automatic, the default; True / False force it; sm_107a, all 4 value
+    heads of a key head per CTA, every T and rounding mode): one launch of G = min(H x B,
+    4 x ``num_sms``) CTAs (``num_sms``: the SMs the launch's stream can use, default the
+    device's; ``grid_override`` forces G, for tests) that loop over the (key head, row) items
+    -- verify, flush and padded rows in any mix and order -- claiming them from an int32[2]
+    counter that the launch's last CTA re-zeroes: by default one cached per (device, current
+    stream) for eager launches and one of its own per captured launch under CUDA graph capture
+    (from an eagerly zeroed pool, so separately captured graphs can be replayed concurrently),
+    or the caller's ``persistent_counter`` (zeroed int32[2] CUDA tensor; give each concurrently
+    running launch its own). ``persistent_counter_reset`` re-zeroes the cached counters after
+    an aborted launch. It measured faster only on die-localized launches (Rubin: each die's
+    rows with their buffers in that die's memory, ``num_sms`` = the die's 106 SMs): T = 2-8
+    1.03-1.18x without flush rows, 1.00-1.09x with 30 % from B = 512 (slower below); T = 1
+    0.94-1.03x; one whole-GPU launch over die-interleaved memory 0.88-0.98x. Automatic (None):
+    the persistent kernel on sm_107a for T = 2-8 with all value heads per CTA when ``num_sms``
+    is given and below the device's SM count (a die-restricted stream, e.g. a green context),
+    ``grid_override`` is unset and, unless ``flush_hint`` is "none", there are at least 8
+    (key head, row) items per CTA slot (H x B >= 32 x ``num_sms``: B >= 212 per 106-SM die at
+    H = 16); the non-persistent kernel otherwise.
 
-    ``flush_hint`` (with ``persistent=True``; performance only, never changes results: both
-    kernels are bit-identical on every row mix) tells the host which flush rows the launch
-    has, since it cannot read ``hist_len`` (a device tensor) without a sync. With Philox
-    rounding at T = 6-8 and few items per CTA slot the launch runs the non-persistent kernel
-    instead (measured faster there); how few depends on the hint:
+    ``flush_hint`` (performance only, never changes results: both kernels are bit-identical on
+    every row mix) tells the host which flush rows the launch has, since it cannot read
+    ``hist_len`` (a device tensor) without a sync. "none" lifts the automatic choice's
+    8-items-per-slot minimum. With Philox rounding at T = 6-8 and few items per CTA slot a
+    persistent launch (chosen or forced, without ``grid_override``) runs the non-persistent
+    kernel instead (measured faster there); how few depends on the hint:
 
     * None (default) or "some": flush rows may be present, in any order: H x B <= 40 x
       ``num_sms`` (B <= 265 per 106-SM die at H = 16).
@@ -4672,7 +4517,7 @@ def gated_delta_rule_mtp_ucache_flush_umma_rubin(
 
     A wrong hint only costs time. The hint is a host value: a captured CUDA graph keeps the
     kernel chosen at capture, so capture with the hint of the regime the graph replays in (e.g.
-    a no-flush graph and a flush graph). ``grid_override`` always runs the persistent kernel.
+    a no-flush graph and a flush graph).
 
     ``rand_seed`` is a single-element int64 CUDA tensor read on device, so a captured CUDA
     graph picks up updates; advance it every step (and use a different seed per layer), or

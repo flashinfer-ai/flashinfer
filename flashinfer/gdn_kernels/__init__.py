@@ -78,8 +78,8 @@ except (ImportError, RuntimeError):
     gated_delta_rule_mtp_ucache_flush_umma = None  # type: ignore
     flush_first_row_order = None  # type: ignore
 
-# Rubin (sm_107a) build of the UMMA kernel: same contract and results, Rubin tunings and an
-# opt-in persistent kernel for die-localized launches (also runs on sm_100a); called directly.
+# Rubin (sm_107a) build of the UMMA kernel: same contract and results, Rubin tunings and a
+# persistent kernel for die-localized launches (also runs on sm_100a); called directly.
 try:
     from .gdn_replay_mtp_umma_rubin import (
         gated_delta_rule_mtp_ucache_flush_umma_rubin,

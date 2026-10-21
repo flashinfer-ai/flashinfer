@@ -257,22 +257,6 @@ def ldg_v4(addr: Int64, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def ldg_u16(addr: Int64, *, loc=None, ip=None) -> Uint32:
-    """ld.global.u16 zero-extended to 32 bits (raw 16-bit payload)."""
-    r = llvm.inline_asm(
-        T.i32(),
-        [Int64(addr).ir_value(loc=loc, ip=ip)],
-        "ld.global.u16 $0, [$1];",
-        "=r,l",
-        has_side_effects=False,
-        is_align_stack=False,
-        loc=loc,
-        ip=ip,
-    )
-    return Uint32(r)
-
-
-@dsl_user_op
 def stg_u16(addr: Int64, w: Uint32, *, loc=None, ip=None) -> None:
     """st.global.u16 of the low half of ``w``."""
     llvm.inline_asm(
@@ -640,20 +624,6 @@ def f16x2_hi_f32(w: Uint32, *, loc=None, ip=None) -> Float32:
         ip=ip,
     )
     return Float32(r)
-
-
-def make_fake_tensor(dtype, shape, divisibility=1):
-    """Fake CuTe tensor with dynamic strides (last dim stride 1) for tensor-free compilation."""
-    stride = tuple(
-        cute.sym_int64(divisibility=divisibility) if i != len(shape) - 1 else 1
-        for i in range(len(shape))
-    )
-    return cute.runtime.make_fake_tensor(
-        dtype,
-        shape,
-        stride=stride,
-        assumed_align=max(divisibility * dtype.width // 8, 1),
-    )
 
 
 @dsl_user_op
