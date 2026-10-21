@@ -28,6 +28,8 @@ ROUTE_FLAG_UNMAPPED_OUTPUT = 2
 
 _ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
+# ``sources``: the program's kernel source and its host launcher. Programs of one
+# launch shape share a launcher; ``load_program`` passes the kernel symbol to it.
 PROGRAMS = {
     "cake_deepgemm_mega_gate_000e384816b058464abf": {
         "sources": [
@@ -106,7 +108,7 @@ PROGRAMS = {
     "cake_deepgemm_mega_gate_2bbda0d9a67fde11c2b7": {
         "sources": [
             "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_2bbda0d9a67fde11c2b7_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_2bbda0d9a67fde11c2b7_binding.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_033baaec07b91a11449f_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -291,7 +293,7 @@ PROGRAMS = {
     "cake_deepgemm_mega_gate_8c75f17983c041fded1a": {
         "sources": [
             "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_8c75f17983c041fded1a_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_8c75f17983c041fded1a_binding.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_033baaec07b91a11449f_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -402,7 +404,7 @@ PROGRAMS = {
     "cake_deepgemm_mega_gate_b3ee890a555900db536c": {
         "sources": [
             "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_b3ee890a555900db536c_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_b3ee890a555900db536c_binding.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_ad77d2315f108ecbdc22_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -439,7 +441,7 @@ PROGRAMS = {
     "cake_deepgemm_mega_gate_bb6f4a821ad79b0b49b4": {
         "sources": [
             "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_bb6f4a821ad79b0b49b4_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_bb6f4a821ad79b0b49b4_binding.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_000e384816b058464abf_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -476,7 +478,7 @@ PROGRAMS = {
     "cake_deepgemm_mega_gate_bc54b8669581659c9aa5": {
         "sources": [
             "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_bc54b8669581659c9aa5_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_bc54b8669581659c9aa5_binding.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_033baaec07b91a11449f_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -513,7 +515,7 @@ PROGRAMS = {
     "cake_deepgemm_mega_gate_e3322a9aaabc07544e16": {
         "sources": [
             "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_e3322a9aaabc07544e16_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_e3322a9aaabc07544e16_binding.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_442a43609681124bff50_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -587,7 +589,7 @@ PROGRAMS = {
     "cake_deepgemm_mega_gate_f8d08f26103e4d83c39e": {
         "sources": [
             "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_f8d08f26103e4d83c39e_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_f8d08f26103e4d83c39e_binding.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/cake_deepgemm_mega_gate_eb5548f456a99d16a7f5_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -1257,7 +1259,13 @@ def load_program(arch, name):
         sources=[
             env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/") for p in record["sources"]
         ],
-        extra_cuda_cflags=[*_nvcc_flags(arch), *record["compile_flags"]],
+        # One host launcher serves every program of its launch shape; this compile
+        # definition names the program's kernel there (the kernel source ignores it).
+        extra_cuda_cflags=[
+            *_nvcc_flags(arch),
+            *record["compile_flags"],
+            f"-DCAKE_PROGRAM_KERNEL=kernel_{name}",
+        ],
         extra_ldflags=["-lcuda"],
         extra_include_paths=[
             env.FLASHINFER_CSRC_DIR,
