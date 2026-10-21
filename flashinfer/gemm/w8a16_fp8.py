@@ -502,9 +502,10 @@ def _check_aliasing(
 def _select_workspace(
     workspace: Optional[torch.Tensor], ws_bytes: int, device: torch.device
 ) -> Optional[torch.Tensor]:
-    """The scratch buffer handed to the launcher: ``None`` for a single-pass
-    variant (0 bytes), the caller's buffer when it is large enough, else a
-    fresh one.  The launchers take any buffer by its byte size."""
+    """The scratch buffer handed to the launcher: ``None`` when the variant
+    needs no bytes; a fresh allocation when the caller passed none; otherwise
+    the caller's buffer, or a ValueError when it is too small (it is never
+    replaced).  The launchers take any buffer by its byte size."""
     if ws_bytes == 0:
         return None
     if workspace is None:

@@ -471,8 +471,9 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
 
 def _burst_iters(args, fn: Callable[[], torch.Tensor]) -> int:
     """Timed-burst length for one column under --burst-seconds: the launch count
-    that fills the burst at the column's own per-call time (5 untimed calls),
-    clamped to 50..5000."""
+    that fills the burst at the column's own per-call time, measured with CUDA
+    events over 5 calibration calls that do not enter the reported latency
+    samples; clamped to 50..5000."""
     torch.cuda.synchronize()
     ev0, ev1 = (
         torch.cuda.Event(enable_timing=True),
@@ -498,9 +499,10 @@ def _time_columns(
     per-row ratios.
 
     Steady-state protocol (--warmup-seconds / --burst-seconds): a short burst never
-    reaches the power cap and measures the boost clock instead.  Heat the GPU with an
-    untimed burst of the first column, then size each timed burst by time rather than
-    by launch count.
+    reaches the power cap and measures the boost clock instead.  In order: with
+    --burst-seconds, size every column's timed burst by time rather than by launch
+    count (_burst_iters); with --warmup-seconds, heat the GPU once per process with
+    calls of the first column that are not timed; then the rotated timing rounds.
     """
     names = list(impls)
     iters_by_name = {name: args.iters for name in names}
