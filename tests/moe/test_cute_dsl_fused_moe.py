@@ -66,11 +66,11 @@ def _skip_sm107_unimplemented_moe_features(request):
     ``fused_moe/cute_dsl/rubin/`` holds a narrower specialisation of the
     Blackwell kernels rather than a port of them: the gather kernel implements
     SwiGLU (including its SiTU variant and a clamp limit) and Relu2 but not
-    GeGLU-tanh or custom SwiGLU alpha/beta constants, its wrapper has no
-    ``a_per_token_scale_ptr``, and the finalize kernel implements no unfused
-    path. The wrappers raise ``NotImplementedError`` for these cases, which is
-    correct behaviour -- but on Rubin it reports as a test failure on every CI
-    sweep, for features the kernels were never built to have.
+    GeGLU-tanh or custom SwiGLU alpha/beta constants, and its wrapper has no
+    ``a_per_token_scale_ptr``. The wrappers raise ``NotImplementedError`` for
+    these cases, which is correct behaviour -- but on Rubin it reports as a
+    test failure on every CI sweep, for features the kernels were never built
+    to have.
 
     The decision is made from the parameterization alone, before the test body
     runs. It therefore cannot absorb a genuine regression: anything that fails
@@ -94,9 +94,6 @@ def _skip_sm107_unimplemented_moe_features(request):
             "(11 wrapper pointers vs Blackwell's 12)"
         )
 
-    if params.get("use_fused_finalize") is False:
-        pytest.skip("SM107 finalize kernel implements only the fused path")
-
     if params.get("activation_type") == ActivationType.GegluTanh:
         pytest.skip("SM107 gather grouped GEMM does not implement GeGLU-tanh")
 
@@ -107,12 +104,6 @@ def _skip_sm107_unimplemented_moe_features(request):
     # kernel, and passes on SM107 -- a substring match silently dropped it.
     if request.node.function.__name__ == "test_geglu_tanh_accuracy":
         pytest.skip("SM107 gather grouped GEMM does not implement GeGLU-tanh")
-
-    if (
-        request.node.function.__name__
-        == "test_deterministic_finalize_numerical_accuracy"
-    ):
-        pytest.skip("SM107 finalize kernel implements only the fused path")
 
 
 def is_sm100_family():
