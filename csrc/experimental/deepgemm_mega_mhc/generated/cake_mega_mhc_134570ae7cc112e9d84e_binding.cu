@@ -14,15 +14,10 @@
 
 #include <cstdint>
 
-#include "cake_mega_mhc_host_common.cuh"
+#include "experimental/cake_host_common.cuh"
 
 #ifndef CAKE_PROGRAM_KERNEL
 #define CAKE_PROGRAM_KERNEL kernel_cake_mega_mhc_134570ae7cc112e9d84e
-#endif
-// Stringise the expansion of a macro argument (the launch-error message names the selected kernel).
-#ifndef CAKE_STRINGIZE
-#define CAKE_STRINGIZE_(x) #x
-#define CAKE_STRINGIZE(x) CAKE_STRINGIZE_(x)
 #endif
 
 extern "C" __global__ void CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap residual_map, const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap fn_map, const __grid_constant__ CUtensorMap post_map, const __grid_constant__ CUtensorMap comb_map, const __grid_constant__ CUtensorMap prev_map, const __grid_constant__ CUtensorMap new_residual_map, const __grid_constant__ CUtensorMap y_map, float* __restrict__ mix_scales, float* __restrict__ mix_bases, float* __restrict__ new_prev_mix, float* __restrict__ new_post_mix, float* __restrict__ new_comb_res_mix, __nv_bfloat16* __restrict__ rmsnorm_weight, __nv_bfloat16* __restrict__ new_residual, __nv_bfloat16* __restrict__ y_bf16, uint8_t* __restrict__ y_fp8, unsigned int* __restrict__ y_primary_sf, unsigned int* __restrict__ y_shared_sf, float* __restrict__ scratch, unsigned long long* __restrict__ split_barriers, unsigned long long* __restrict__ launch_epochs, unsigned int num_tokens, float hc_norm_eps, float hc_pre_eps, float hc_post_scale, float sinkhorn_eps, unsigned int num_sinkhorn_iters, float rmsnorm_eps, float rmsnorm_scale, unsigned long long primary_sf_stride_token, unsigned long long primary_sf_stride_word, unsigned long long shared_sf_stride_word);

@@ -30,15 +30,10 @@
 
 #include <cstdint>
 
-#include "cake_deepgemm_mega_gate_host_common.cuh"
+#include "experimental/cake_host_common.cuh"
 
 #ifndef CAKE_PROGRAM_KERNEL
 #define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_mega_gate_000e384816b058464abf
-#endif
-// Stringise the expansion of a macro argument (the launch-error message names the selected kernel).
-#ifndef CAKE_STRINGIZE
-#define CAKE_STRINGIZE_(x) #x
-#define CAKE_STRINGIZE(x) CAKE_STRINGIZE_(x)
 #endif
 
 extern "C" __global__ void CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap W, float* __restrict__ bias, float* __restrict__ image_bias, uint8_t* __restrict__ image_mask, uint8_t* __restrict__ mask, int* __restrict__ physical_map, int* __restrict__ logical_count, long long* __restrict__ topk_idx, long long* __restrict__ unmapped_idx, float* __restrict__ topk_weights, float* __restrict__ scratch, unsigned long long* __restrict__ score_barriers, uint8_t* __restrict__ fixed_mask, uint8_t* __restrict__ random_mask, int num_tokens, int num_shared, int map_width, unsigned int ep_rank, float routed_scale, long long unmapped_stride, int num_workers, int route_flags, int num_split_k);

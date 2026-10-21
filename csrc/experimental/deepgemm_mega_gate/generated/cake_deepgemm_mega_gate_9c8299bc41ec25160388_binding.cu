@@ -30,15 +30,10 @@
 
 #include <cstdint>
 
-#include "cake_deepgemm_mega_gate_host_common.cuh"
+#include "experimental/cake_host_common.cuh"
 
 #ifndef CAKE_PROGRAM_KERNEL
 #define CAKE_PROGRAM_KERNEL kernel_cake_deepgemm_mega_gate_9c8299bc41ec25160388
-#endif
-// Stringise the expansion of a macro argument (the launch-error message names the selected kernel).
-#ifndef CAKE_STRINGIZE
-#define CAKE_STRINGIZE_(x) #x
-#define CAKE_STRINGIZE(x) CAKE_STRINGIZE_(x)
 #endif
 
 template <int kNumSplitK>
