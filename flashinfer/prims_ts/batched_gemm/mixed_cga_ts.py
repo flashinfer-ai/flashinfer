@@ -128,7 +128,7 @@ class CgaTask(Task):
         return super()._is_producer_signaling_cta(pipeline_config)
 
     @cute.jit
-    def run_body(self) -> None:
+    def run_body(self, context=None) -> None:
         """Run selected tasks and redistribute registers on skipped CTA ranks.
 
         ``Task.run_body()`` places ``setmaxregister`` inside ``is_selected()``.
@@ -156,10 +156,18 @@ class CgaTask(Task):
                 self.dummy = cutlass.Boolean(True)
             else:
                 self._set_max_register()
-                if cutlass.const_expr(self.is_persistent):
-                    self._run_task_body_persistent()
+                # Only TS 4.7 passes ``context``; its body helpers accept it,
+                # 4.8's take no argument.
+                if cutlass.const_expr(context is None):
+                    if cutlass.const_expr(self.is_persistent):
+                        self._run_task_body_persistent()
+                    else:
+                        self._run_task_body_non_persistent()
                 else:
-                    self._run_task_body_non_persistent()
+                    if cutlass.const_expr(self.is_persistent):
+                        self._run_task_body_persistent(context)
+                    else:
+                        self._run_task_body_non_persistent(context)
         else:
             if is_assigned_warp:
                 self._set_max_register()
