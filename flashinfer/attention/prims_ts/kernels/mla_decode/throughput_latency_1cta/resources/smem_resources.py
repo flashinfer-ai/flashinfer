@@ -2263,22 +2263,53 @@ class SmemRawKvResource(SmemKvResource):
         scale_row_bytes = cfg.nvfp4_scale_row_bytes
 
         def stage_scales(tile):
-            # The 40-byte scale row of each of the lane's four tokens lands
-            # token-major in the slot (40-byte pitch, five 8-byte copies: odd
-            # rows are only 8-byte aligned in the pool).  The dequant reads V
-            # scales as LDS.64 and the dequant warps write SFB with tcgen05.st,
-            # so no block order is needed.  Invalid rows zero-fill.
+            # The 40-byte scale row of each token lands token-major in the slot
+            # (40-byte pitch, five 8-byte copies: odd rows are only 8-byte aligned
+            # in the pool).  The dequant reads V scales as LDS.64 and the dequant
+            # warps write SFB with tcgen05.st, so no block order is needed.
+            # Invalid rows zero-fill.
+            #
+            # Coalesced mapping: five adjacent lanes copy the five pieces of ONE
+            # row, so a warp instruction touches 6 rows (6 cache lines) and a warp
+            # needs 8 instructions per tile.  The previous lane-per-quad mapping
+            # (each lane copying its own four rows) touched 32 different 128-byte
+            # lines per instruction, ~660 line requests per tile, which measured
+            # 4-6% of the kernel time on B200 (B148 / B256 / B16: -4.6 / -3.7 /
+            # -6.4% with this mapping, bit-identical output).  A warp stages the
+            # rows of the quads it owns, using the row indices its own lanes
+            # prefetched (hence the warp-level sync before the reads).
+            warp_sync_all()
             slot_base = self.scale_slot_byte_offset(tile % Int32(cfg.nvfp4_scale_slots))
             scale_pool_base = self.kv_scale_pool.iterator.toint()
-            for j in cutlass.range_constexpr(4):
-                row = Int32(words[slot_word(tile) + Int32(j)])
-                token = quad * Int32(4) + Int32(j)
-                dst = self.smem_byte_address(slot_base + token * Int32(scale_row_bytes))
-                src = scale_pool_base + Int64(row) * Int64(scale_row_bytes)
+            first_quad = warp_in_task * Int32(qpw)
+            ntok = cute.math.min(Int32(qpw), Int32(num_quads) - first_quad) * Int32(4)
+            lane5 = lane_idx // Int32(5)
+            piece = lane_idx - lane5 * Int32(5)
+            for i in cutlass.range_constexpr(8):
+                t_local = Int32(i * 6) + lane5
+                valid = (Int32(1) if lane_idx < Int32(30) else Int32(0)) & (
+                    Int32(1) if t_local < ntok else Int32(0)
+                )
+                token = first_quad * Int32(4) + cute.math.min(t_local, ntok - Int32(1))
+                row = Int32(
+                    words[
+                        Int32(self._ldidx_scratch_word_base)
+                        + (token >> Int32(2)) * Int32(self.LDIDX_TILE_SLOTS * 4)
+                        + (tile & Int32(self.LDIDX_TILE_SLOTS - 1)) * Int32(4)
+                        + (token & Int32(3))
+                    ]
+                )
+                dst = self.smem_byte_address(
+                    slot_base + token * Int32(scale_row_bytes) + piece * Int32(8)
+                )
+                src = (
+                    scale_pool_base
+                    + Int64(row) * Int64(scale_row_bytes)
+                    + Int64(piece) * Int64(8)
+                )
                 n8 = Int32(8) if row >= Int32(0) else Int32(0)
-                if lane_active:
-                    for k in cutlass.range_constexpr(scale_row_bytes // 8):
-                        cp_async_8b_zfill(dst + Int32(8 * k), src + Int64(8 * k), n8)
+                if valid != Int32(0):
+                    cp_async_8b_zfill(dst, src, n8)
             cp_async_commit_group()
 
         tile = local_tile_idx
