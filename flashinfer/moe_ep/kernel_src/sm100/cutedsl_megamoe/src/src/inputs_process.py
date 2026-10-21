@@ -129,9 +129,13 @@ class DataPreprocess:
         #   offline: runtime f32 scalar, read-only calibrated scale.
         online_norm_const: Optional[cute.Tensor] = None,
         offline_norm_const: Optional[cutlass.Float32] = None,
+        offline_scale_multiplier: Optional[cutlass.Float32] = None,
     ) -> None:
         # Mode invariants resolve at trace time (the scale args are None-or-not
         # when the kernel is compiled).
+        if cutlass.const_expr(offline_scale_multiplier is not None):
+            if cutlass.const_expr(not self.is_nvfp4 or offline_norm_const is None):
+                raise ValueError("offline_scale_multiplier requires NVFP4 offline normalization")
         if cutlass.const_expr(self.is_nvfp4):
             if cutlass.const_expr((online_norm_const is None) == (offline_norm_const is None)):
                 raise ValueError(
@@ -200,6 +204,7 @@ class DataPreprocess:
             topk_idx_output,
             topk_weights_output,
             norm_const,
+            offline_scale_multiplier,
         ).launch(grid=grid, block=block, stream=cuda_stream)
 
     # -- shared device helpers ------------------------------------------------
@@ -231,7 +236,7 @@ class DataPreprocess:
                 is_padding = token_padding_info[token_idx] != Int32(0)
             idx = Int64(-1) if is_padding else Int64(topk_idx[token_idx, tid])
             weight = Float32(0.0) if is_padding else Float32(topk_weights[token_idx, tid])
-            topk_idx_output[token_idx, tid] = idx
+            topk_idx_output[token_idx, tid] = idx.to(topk_idx_output.element_type)
             topk_weights_output[token_idx, tid] = weight
 
     # -- kernels --------------------------------------------------------------
@@ -323,6 +328,7 @@ class DataPreprocess:
         topk_idx_output: cute.Tensor,
         topk_weights_output: cute.Tensor,
         norm_const: Union[cute.Tensor, cutlass.Float32],  # online (1,) tensor or offline f32 scalar
+        scale_multiplier: Optional[cutlass.Float32] = None,
     ) -> None:
         threads: cutlass.Constexpr[int] = self._threads_per_cta
         sf_vec: cutlass.Constexpr[int] = self.sf_vec
@@ -393,7 +399,10 @@ class DataPreprocess:
                     absmax = cute.arch.fmax(absmax, cute.arch.fmax(vals[i], -vals[i]))
 
                 # Stored per-block E4M3 scale; .to() clamps to the E4M3 range.
-                sfc_e4m3 = (absmax * rcp_limit * nc).to(cutlass.Float8E4M3FN)
+                if cutlass.const_expr(scale_multiplier is not None):
+                    sfc_e4m3 = (absmax * scale_multiplier).to(cutlass.Float8E4M3FN)
+                else:
+                    sfc_e4m3 = (absmax * rcp_limit * nc).to(cutlass.Float8E4M3FN)
                 sfc_rt = Float32(sfc_e4m3)
                 # Per-element encode scale; the mask zeros the sfc==0 (all-zero
                 # block) case so its fp4 codes stay 0 instead of NaN.

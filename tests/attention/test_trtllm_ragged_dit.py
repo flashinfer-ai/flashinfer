@@ -275,6 +275,8 @@ def test_trtllm_ragged_dit_qk_bf16_v_fp8(
 
 @pytest.mark.skipif(
     (CC_MAJOR, CC_MINOR) != (10, 0),
+    # The int8 DiT tiles ship only for sm_100a: on SM103 and SM107 the launcher
+    # finds no matching kernel and raises (verified on an SM107 device).
     reason="DiT attention tests with int8 input require SM100.",
 )
 @pytest.mark.parametrize("causal", [False])
@@ -400,8 +402,8 @@ def test_trtllm_ragged_dit_sage_qdq(
 
 
 @pytest.mark.skipif(
-    (CC_MAJOR, CC_MINOR) != (10, 0),
-    reason="SageAttention quantization tests require SM100.",
+    CC_MAJOR != 10,
+    reason="SageAttention quantization tests require SM100-family (SM100/SM103/SM107).",
 )
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 def test_trtllm_sage_quant_qkv_error(head_dim: int):

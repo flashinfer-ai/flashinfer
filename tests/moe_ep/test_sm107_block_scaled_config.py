@@ -2,7 +2,7 @@
 
 No GPU / no kernel compile: config dataclass defaults, registry resolution via
 ``create_mega_kernel``, public re-exports, and runtime-requirement plumbing
-for BOTH sm107 backends (mxfp8 and nvfp4).
+for the SM107 block-scaled backends.
 
 Deliberately does NOT import ``flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe``
 internals that pull cutlass: the ``unit`` run_tests.sh target collects this
@@ -18,6 +18,7 @@ import pytest
 
 from flashinfer.moe_ep import (
     Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
     Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
 )
 from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl import (
@@ -31,7 +32,16 @@ from flashinfer.moe_ep.core.kernel.registry import (
     is_mega_kernel_config,
 )
 
+from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp4_bf16_cutedsl.backend import (
+    Sm107Mxfp8Mxfp4MegaKernelBackend,
+)
+
 _BACKENDS = (
+    (
+        Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm107Mxfp8Mxfp4MegaKernelBackend,
+        "sm107_mxfp8_mxfp4_bf16_cutedsl",
+    ),
     (
         Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
         Sm107Mxfp8BlockScaledMegaKernelBackend,
@@ -80,6 +90,8 @@ class TestSm107BlockScaledConfig:
         assert cfg.cluster_shape_mn is None
         assert cfg.fallback_cluster_shape_mn is None
         assert cfg.max_sm_count is None
+        assert cfg.activation == "swiglu"
+        assert cfg.situ_beta is None and cfg.situ_linear_beta is None
         # Tuner contract: the knobs field defaults to None (explicit fields
         # stand); "cache" / dict resolution happens at workspace allocation.
         assert cfg.knobs is None

@@ -55,6 +55,7 @@ output_column_dict = {
         "intermediate_size",
         "num_experts",
         "top_k",
+        "block_m",
         "n_group",
         "topk_group",
         "routed_scaling_factor",
@@ -82,13 +83,6 @@ output_column_dict = {
         "tp_rank",
         "ep_size",
         "ep_rank",
-    ],
-    "moe_comm": [
-        "num_tokens",
-        "num_experts",
-        "top_k",
-        "ep_size",
-        "max_num_tokens",
     ],
     "allreduce_comm": [
         "num_tokens",
@@ -216,7 +210,6 @@ full_output_columns = (
     + output_column_dict["dsv4_sparse_mla"]
     + output_column_dict["gemm"]
     + output_column_dict["moe"]
-    + output_column_dict["moe_comm"]
     + output_column_dict["allreduce_comm"]
     + output_column_dict["mixed_comm"]
     + output_column_dict["norm"]
@@ -260,6 +253,7 @@ benchmark_apis = {
         "cute_dsl_fp4_block_scale_moe",
         "cute_dsl_bf16_moe",
         "b12x_fused_moe",
+        "alphamoe_nvfp4_aligned_moe",
         "unified_nvfp4_moe",
         "bgmv_moe",
     ],
@@ -267,9 +261,6 @@ benchmark_apis = {
     # real runner construction/probe, like mm_fp4's runtime backend filtering.
     "unified_moe": [
         "unified_moe",
-    ],
-    "moe_comm": [
-        "moe_a2a_dispatch_combine",
     ],
     "allreduce_comm": [
         "allreduce_fusion",
@@ -584,9 +575,9 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cutlass"],
-        "10.3": ["cutlass"],
-        "10.7": ["cutlass"],
+        "10.0": ["cutlass", "auto"],
+        "10.3": ["cutlass", "auto"],
+        "10.7": ["cutlass", "cute-dsl", "auto"],
         "12.0": [],
         "12.1": [],
     },
@@ -724,6 +715,10 @@ routine_cc_to_supported_backends = {
         "12.0": ["b12x"],
         "12.1": ["b12x"],
     },
+    "alphamoe_nvfp4_aligned_moe": {
+        "10.0": ["alphamoe"],
+        "10.3": ["alphamoe"],
+    },
     # MoELayer cross-backend NVFP4: intersection of CuteDSL + TRTLLM FP4 support.
     # SM100 only (Blackwell); unlisted archs fall through to [] (skipped).
     "unified_nvfp4_moe": {
@@ -804,16 +799,16 @@ routine_cc_to_supported_backends = {
         "12.1": ["cute-dsl"],
     },
     "layernorm_quant": {
-        "7.5": ["cuda"],
-        "8.0": ["cuda"],
-        "8.6": ["cuda"],
-        "8.9": ["cuda"],
-        "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "10.7": ["cuda"],
-        "12.0": ["cuda"],
-        "12.1": ["cuda"],
+        "7.5": ["cuda", "cute-dsl"],
+        "8.0": ["cuda", "cute-dsl"],
+        "8.6": ["cuda", "cute-dsl"],
+        "8.9": ["cuda", "cute-dsl"],
+        "9.0": ["cuda", "cute-dsl"],
+        "10.0": ["cuda", "cute-dsl"],
+        "10.3": ["cuda", "cute-dsl"],
+        "10.7": ["cuda", "cute-dsl"],
+        "12.0": ["cuda", "cute-dsl"],
+        "12.1": ["cuda", "cute-dsl"],
     },
     # NORM - FP4 Quantization (Blackwell SM100+ only, CuTe-DSL kernels)
     "rmsnorm_fp4quant": {

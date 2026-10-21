@@ -25,6 +25,7 @@
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.h"
 #include "flashinfer/trtllm/fused_moe/runner.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/kernels/nvfp4Recipe.h"
 #include "tensorrt_llm/kernels/quantization.h"
 
 namespace tensorrt_llm {
@@ -114,6 +115,8 @@ static inline ActType activationTypeToGatedActType(ActivationType actType) {
   switch (actType) {
     case ActivationType::Swiglu:
       return ActType::SwiGlu;
+    case ActivationType::SwigluStep:
+      return ActType::SwiGluStep;
     case ActivationType::Geglu:
       return ActType::GeGlu;
     case ActivationType::Situ:
@@ -447,13 +450,13 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
       mUsePerTokenScalingGemm2(usePerTokenScalingGemm2),
       mUsePerChannelScalingGemm1(usePerChannelScalingGemm1),
       mUsePerChannelScalingGemm2(usePerChannelScalingGemm2),
-      mPermuteGemm1(PermuteGemm1::Runner(
+      mPermuteGemm1(Gemm1Runner(
           dtypeAct, dtypeWeights, usePerTokenScalingGemm2 ? btg::Dtype::Bfloat16 : dtypeAct,
           useDeepSeekFp8, tileTokensDim, activationType, useShuffledMatrix, weightLayout,
           gemm1BiasType, usePerTokenScalingGemm1, usePerChannelScalingGemm1)),
-      mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8,
-                           tileTokensDim, useShuffledMatrix, weightLayout, usePerTokenScalingGemm2,
-                           usePerChannelScalingGemm2)) {
+      mGemm2(Gemm2Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8,
+                         tileTokensDim, useShuffledMatrix, weightLayout, usePerTokenScalingGemm2,
+                         usePerChannelScalingGemm2)) {
   auto const& gemm1PassingIndices = mPermuteGemm1.getPassingConfigIndices();
   auto const& gemm2PassingIndices = mGemm2.getPassingConfigIndices();
 
@@ -722,8 +725,20 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
     moe::dev::activation::run(activationData, stream);
     gemm2_input = workspace.activation_output;
     gemm2_input_scale = workspace.activation_output_scale;
+  } else if (mUsePerTokenScalingGemm2 && mGemm2.mDtypeAct == btg::Dtype::E4m3) {
+    FLASHINFER_CHECK(
+        mPermuteGemm1.mDtypeOutput == btg::Dtype::Bfloat16,
+        "When using explicit quantization, PermuteGemm1 output dtype must be Bfloat16.");
+    invokePerTokenQuantization<__nv_bfloat16, __nv_fp8_e4m3>(
+        reinterpret_cast<__nv_fp8_e4m3*>(workspace.activation_output),
+        reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output),
+        workspace.total_max_padded_tokens, args.intermediate_size, nullptr,
+        workspace.activation_output_scale, nullptr, tensorrt_llm::common::QuantMode::fp8RowWise(),
+        stream);
+
+    gemm2_input = workspace.activation_output;
+    gemm2_input_scale = workspace.activation_output_scale;
   } else if (mUsePerTokenScalingGemm2) {
-    // TODO(siyuan): currently only support per-token nvfp4 quantization
     FLASHINFER_CHECK(
         mPermuteGemm1.mDtypeOutput == btg::Dtype::Bfloat16,
         "When using explicit quantization, PermuteGemm1 output dtype must be Bfloat16.");
@@ -732,6 +747,12 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
     FLASHINFER_CHECK(
         workspace.token_scales_fc2 != nullptr,
         "workspace.token_scales_fc2 must be provided When using explicit quantization.");
+    // One NVFP4RecipeSpec per launch feeds both the runtime globalScaleInv and the
+    // compile-time e4m3Max, so they cannot desync.
+    // TODO(aleozlx, #5141): thread a caller-supplied recipe code through the
+    // trtllm_fp4_block_scale_moe FFI; until then this runner resolves from the env.
+    auto const recipe =
+        tensorrt_llm::kernels::resolveNVFP4Recipe(tensorrt_llm::kernels::kNVFP44Over6FromEnv);
     auto const sfLayoutB = mGemm2.mRunner.getSfLayoutB(config.gemm2Config);
     auto sfLayout = QuantizationSFLayout::LINEAR;
     switch (sfLayoutB) {
@@ -745,19 +766,13 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
         FLASHINFER_CHECK(false, "Unsupported FC2 block scale layout ",
                          btg::sfLayoutToString(sfLayoutB));
     }
-
-    float globalScaleInv = 1.f / (448.f * 6.f);
-    if (tensorrt_llm::common::getEnvNVFP4Use4Over6() &&
-        tensorrt_llm::common::getEnvNVFP44Over6E4M3Use256()) {
-      globalScaleInv = 1.f / (256.f * 6.f);
-    }
     invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
         args.num_tokens * totalExpertsPerToken, args.intermediate_size,
-        reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output), globalScaleInv,
+        reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output), recipe.globalScaleInv(),
         workspace.expanded_idx_to_permuted_idx,
         reinterpret_cast<uint8_t*>(workspace.activation_output),
         reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
-        reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, stream, enable_pdl);
+        reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, recipe, stream, enable_pdl);
 
     gemm2_input = workspace.activation_output;
     gemm2_input_scale = workspace.activation_output_scale;

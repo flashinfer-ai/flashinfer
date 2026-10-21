@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Cake fused residual-add + RMSNorm + eight-peer BF16 combine (SM100).
+Cake fused residual-add + RMSNorm + eight-peer BF16 combine (SM100 / SM103).
 
 One launch per rank adds the residual to a two-track BF16 input, applies
 RMSNorm per track with per-track weights, averages the two normalized tracks
@@ -41,8 +41,10 @@ Usage protocol::
     # 3. Destroy collectively after the last launch completed
     cake_fused_norm_combine_destroy_workspace(workspace)
 
-Requirements: eight ranks on one node with CUDA IPC peer access, SM100
-devices, hidden size 2560, two tracks, contiguous BF16 tensors
+Requirements: eight ranks on one node with CUDA IPC peer access, SM100 (B200)
+or SM103 (B300) devices that are build targets of this process
+(``FLASHINFER_CUDA_ARCH_LIST`` when set, else the visible devices), hidden
+size 2560, two tracks, contiguous BF16 tensors
 (``x``/``residual``/``norm_out``/``residual_out`` are ``[T, 2, 2560]``,
 ``weight`` is ``[2, 2560]``, ``collective_out`` is ``[T, 2560]``) and
 ``T <= max_tokens``.  A workspace carries one ordered launch sequence; every
@@ -58,12 +60,14 @@ import torch
 import torch.distributed as dist
 
 from ..jit.cake_fused_norm_combine import (
-    DEVICE_CAPABILITY,
     HIDDEN_DIM,
     LARGE_MIN_TOKENS,
+    SUPPORTED_CAPABILITIES,
     TRACKS,
+    WIDE_MIN_TOKENS,
     WORKSPACE_TABLE_ENTRIES,
     WORLD_SIZE,
+    device_facts,
     route_applies,
     run_cake_fused_norm_combine,
     select_variant,
@@ -331,11 +335,11 @@ def cake_fused_norm_combine(
         )
     if not route_applies(
         world_size=workspace.world_size,
-        device_capability=tuple(torch.cuda.get_device_capability(device)),
+        device_capability=device_facts(device.index).capability,
         hidden_dim=workspace.hidden,
     ):
         raise ValueError(
-            "the Cake fused norm-combine export covers eight SM100 peers with hidden size 2560"
+            "the Cake fused norm-combine export covers eight SM100 or SM103 peers with hidden size 2560"
         )
     run_cake_fused_norm_combine(
         backend="cake",
@@ -354,12 +358,13 @@ def cake_fused_norm_combine(
 
 __all__ = [
     "CONTROL_WORDS",
-    "DEVICE_CAPABILITY",
     "HIDDEN_DIM",
     "LAMPORT_SENTINEL_U16",
     "LAMPORT_SLOTS",
     "LARGE_MIN_TOKENS",
+    "SUPPORTED_CAPABILITIES",
     "TRACKS",
+    "WIDE_MIN_TOKENS",
     "WORLD_SIZE",
     "CakeFusedNormCombineWorkspace",
     "cake_fused_norm_combine",

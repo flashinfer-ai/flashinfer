@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
+import functools
 import gc
-import hashlib
-import json
 import weakref
 from collections import OrderedDict
 from dataclasses import dataclass, replace
@@ -37,6 +36,16 @@ from flashinfer.fused_moe import (
 )
 from flashinfer.fused_moe.api import _DEFAULT_BACKEND
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+from tests.moe.cake_warp_decode_reference import (
+    TARGETS,
+    Fixture,
+    Geometry as _GpuGeometry,
+    assert_close,
+    prepare_fixture,
+    prepare_launch,
+    reference,
+    run_cake,
+)
 
 
 @dataclass
@@ -96,125 +105,16 @@ class _Module:
             raise self.run_error
 
 
-def _write_inventory(path, payload):
-    program = {key: payload[key] for key in ("modules", "sequences", "routes", "files")}
-    payload["program_hash"] = hashlib.sha256(
-        (
-            json.dumps(program, sort_keys=True, separators=(",", ":"), allow_nan=False)
-            + "\n"
-        ).encode()
-    ).hexdigest()
-    path.write_text(json.dumps(payload), encoding="utf-8")
-
-
-def _inventory_fixture(tmp_path):
-    prefix = "csrc/fused_moe/warp_decode/"
-    device = prefix + "generated/sm_100a/fc1_kernel.cu"
-    binding = prefix + "generated/sm_100a/fc1_binding.cu"
-    sequence_binding = prefix + "generated/sm_100a/sequence_binding.cu"
-    source_paths = [
-        device,
-        binding,
-        sequence_binding,
-        prefix + "generated/cake_warp_decode_generated_manifest.cuh",
-        prefix + "cake_warp_decode_binding.cu",
-        prefix + "cake_warp_decode_contract.cuh",
-    ]
-    files = {}
-    for name in source_paths:
-        path = tmp_path / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("// source inventory witness: fc1_symbol\n", encoding="utf-8")
-        files[name] = hashlib.sha256(path.read_bytes()).hexdigest()
-    payload = {
-        "schema": "flashinfer.warp_decode.inventory.v1",
-        "modules": [
-            {
-                "name": "fc1",
-                "role": "fc1",
-                "arch": "sm_100a",
-                "kernel_symbol": "fc1_symbol",
-                "ffi_entry": "fc1_run",
-                "compile_flags": [],
-                "device": device,
-                "binding": binding,
-            }
-        ],
-        "sequences": [
-            {
-                "name": "seq",
-                "role": "decode",
-                "arch": "sm_100a",
-                "ffi_entry": "sequence_run",
-                "binding": sequence_binding,
-                "devices": [device],
-                "modules": [{"name": "fc1", "role": "fc1"}],
-            }
-        ],
-        "routes": [
-            {
-                "shape": "T1",
-                "arch": "sm_100a",
-                "args": {"num_tokens": 1},
-                "stages": [
-                    {
-                        "name": "fc1",
-                        "template": "fc1_static",
-                        "module": {"name": "fc1", "role": "fc1"},
-                    }
-                ],
-                "sequence": {"name": "seq", "role": "decode"},
-            }
-        ],
-        "files": files,
-    }
-    csrc_dir = tmp_path / prefix
-    manifest = csrc_dir / "generated" / "cake_warp_decode_inventory.json"
-    _write_inventory(manifest, payload)
-    return csrc_dir, manifest, payload, tmp_path / device
-
-
-def test_jit_validates_compact_inventory_source_and_route_closure(tmp_path):
-    csrc_dir, _, _, device = _inventory_fixture(tmp_path)
-    assert cake_warp_decode_jit._load_exported_device_sources(csrc_dir, "sm100a") == (
-        [device],
-        False,
-        {device: []},
-    )
-    with pytest.raises(ValueError, match="no modules for exact target"):
-        cake_warp_decode_jit._load_exported_device_sources(csrc_dir, "sm103a")
-
-
-@pytest.mark.parametrize(
-    "failure",
-    [
-        "source_hash",
-        "program_hash",
-        "route_module",
-        "sequence_device",
-        "architecture",
-        "compile_flags",
-    ],
-)
-def test_jit_rejects_inconsistent_compact_inventory(tmp_path, failure):
-    csrc_dir, manifest, payload, device = _inventory_fixture(tmp_path)
-    if failure == "source_hash":
-        device.write_text("// changed source\n", encoding="utf-8")
-    elif failure == "program_hash":
-        payload["program_hash"] = "0" * 64
-        manifest.write_text(json.dumps(payload), encoding="utf-8")
-    else:
-        if failure == "route_module":
-            payload["routes"][0]["stages"][0]["module"]["name"] = "missing"
-        elif failure == "sequence_device":
-            payload["sequences"][0]["devices"] = []
-        elif failure == "compile_flags":
-            del payload["modules"][0]["compile_flags"]
-        else:
-            payload["modules"][0]["arch"] = "sm_103a"
-        _write_inventory(manifest, payload)
-    with pytest.raises(ValueError):
-        cake_warp_decode_jit._load_exported_device_sources(csrc_dir, "sm100a")
+@pytest.mark.parametrize("target", ["sm100a", "sm103a"])
+def test_jit_device_sources_resolve_and_share_common_kernels(target):
+    csrc_dir = cake_warp_decode_jit._get_cake_fused_moe_warp_decode_csrc_dir()
+    sources = cake_warp_decode_jit._device_sources(csrc_dir, target)
+    names = [source.name for source in sources]
+    assert sources and len(set(names)) == len(names)
+    assert set(cake_warp_decode_jit._COMMON_SOURCES) <= set(names)
+    assert set(cake_warp_decode_jit._NO_FAST_MATH_SOURCES) <= set(names)
+    with pytest.raises(FileNotFoundError, match="device sources not found"):
+        cake_warp_decode_jit._device_sources(csrc_dir / "missing", target)
 
 
 def test_jit_prefers_checkout_sources_when_editable_data_is_staged(
@@ -391,6 +291,10 @@ def test_runner_build_passes_its_explicit_target_and_device(
         (SwiGLU(), SwiGLU(), 2048, 512, 256),
         (SwiGLU(), SwiGLU(), 4096, 1024, 512),
         (SwiGLU(), SwiGLU(), 3072, 1536, 256),
+        (SwiGLU(), SwiGLU(), 4096, 512, 512),
+        (None, SwiGLU(), 4096, 256, 512),
+        (SwiGLU(), SwiGLU(), 3072, 768, 256),
+        (None, SwiGLU(), 3072, 384, 256),
         (
             SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
             SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
@@ -455,6 +359,10 @@ def test_config_preparation_delegates_to_trtllm_physical_view(
         (SiLU(), 2048, 512, 256),
         (SiLU(), 4096, 1024, 512),
         (SiLU(), 3072, 1536, 256),
+        (SiLU(), 4096, 512, 512),
+        (SwiGLU(alpha=2.0), 4096, 256, 512),
+        (SiLU(), 3072, 768, 256),
+        (SwiGLU(alpha=2.0), 3072, 384, 256),
         (SwiGLU(), 6144, 3072, 128),
         (SwiGLU(), 3584, 3072, 896),
         (SwiGLU(alpha=1.702, beta=0.0, limit=7.0), 6144, 3072, 128),
@@ -574,6 +482,10 @@ def test_support_accepts_exact_architectures(
         (2048, 512, 256, 8),
         (4096, 1024, 512, 10),
         (3072, 1536, 256, 8),
+        (4096, 512, 512, 10),
+        (4096, 256, 512, 10),
+        (3072, 768, 256, 8),
+        (3072, 384, 256, 8),
     ],
 )
 def test_pack_reuses_prepared_workspace_and_preserves_ffi_order(
@@ -1188,3 +1100,123 @@ def test_pack_rejects_mode_tokens_weights_and_extra_fields():
     )
     with pytest.raises(ValueError, match="does not accept bias"):
         runner.pack_inputs(_activation_pack(), weights_with_bias)
+
+
+# ---------------------------------------------------------------------------
+# GPU numerical parity on exact SM100 / SM103 devices.
+#
+# The fixture, the public TRT-LLM NVFP4 reference and the launch helpers live in
+# tests/moe/cake_warp_decode_reference.py and are shared with the clamped SM100
+# test. The TRT-LLM NVFP4 routed MoE is the public reference for the SwiGLU and
+# SiTU geometries. The standalone SiLU geometry has no public NVFP4 peer, so its
+# rows check finiteness and launch-to-launch repeatability only.
+# ---------------------------------------------------------------------------
+
+_GPU_SEED = 20260205
+
+
+# Token counts are the schedule / route-packer boundaries of each geometry plus
+# the rows that reach kernels no boundary row launches (named by the short hash
+# of their generated source file).
+_GPU_GEOMETRIES = (
+    _GpuGeometry("e512_i512_k10", 2048, 512, 512, 10, (1, 2, 22, 23, 32)),
+    _GpuGeometry("e60_i1536_k4", 2048, 1536, 60, 4, (1, 7, 8, 10, 11, 12, 16, 17, 32)),
+    _GpuGeometry("e192_i1536_k4_silu", 6144, 1536, 192, 4, (1, 2, 32), SiLU()),
+    _GpuGeometry("e384_i768_k4", 2560, 768, 384, 4, (1, 2, 32)),
+    # T7: sm100 FC2 5c23234a. T11: sm103 FC1 5304d683. T18: sm100 finalize
+    # f5eac8f9. T21: sm103 FC2 c5afe5ba.
+    _GpuGeometry(
+        "e128_i768_k8", 2048, 768, 128, 8, (1, 2, 7, 8, 9, 10, 11, 16, 18, 21, 32)
+    ),
+    _GpuGeometry("e128_i1536_k8", 4096, 1536, 128, 8, (1, 2, 32)),
+    # T16: sm103 FC1 57d9c60c and FC2 8acc0c77.
+    _GpuGeometry("e256_i512_k8", 2048, 512, 256, 8, (1, 2, 16, 32)),
+    _GpuGeometry("e512_i1024_k10", 4096, 1024, 512, 10, (1, 2, 32)),
+    _GpuGeometry("e256_i1536_k8", 3072, 1536, 256, 8, (1, 2, 32)),
+    _GpuGeometry(
+        "e128_i3072_k4_swiglu_oa",
+        6144,
+        3072,
+        128,
+        4,
+        # T5: sm100 FC1 5312a738 and FC2 8acc0c77; sm103 FC2 8acc0c77.
+        (1, 2, 5, 32),
+        SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
+    ),
+    _GpuGeometry(
+        "e896_i3072_k16_situ",
+        3584,
+        3072,
+        896,
+        16,
+        # T3: sm100 finalize fc64115f.
+        (1, 2, 3, 32),
+        SiTU(gate_scale=4.0, linear_scale=25.0),
+    ),
+    # Sharded per-partition slices (fused route packing on every token count).
+    _GpuGeometry("h4096_e512_i512_k10", 4096, 512, 512, 10, (1, 2, 16, 32)),
+    _GpuGeometry("h4096_e512_i256_k10", 4096, 256, 512, 10, (1, 2, 16, 32)),
+    _GpuGeometry("h3072_e256_i768_k8", 3072, 768, 256, 8, (1, 2, 16, 32)),
+    _GpuGeometry("h3072_e256_i384_k8", 3072, 384, 256, 8, (1, 2, 16, 32)),
+)
+_GPU_ROWS = [
+    pytest.param(geometry, num_tokens, id=f"{geometry.name}-t{num_tokens:02d}")
+    for geometry in _GPU_GEOMETRIES
+    for num_tokens in geometry.token_counts
+]
+
+
+def _gpu_target() -> str:
+    if not torch.cuda.is_available():
+        pytest.skip("Cake warp decode GPU parity requires a CUDA device")
+    capability = torch.cuda.get_device_capability(torch.device("cuda"))
+    if capability not in TARGETS:
+        pytest.skip(
+            "Cake warp decode GPU parity requires exact SM100 or SM103, "
+            f"got SM{capability[0]}{capability[1]}"
+        )
+    return TARGETS[capability]
+
+
+@functools.lru_cache(maxsize=1)
+def _gpu_fixture(geometry_name: str) -> Fixture:
+    """Prepare one geometry with the shared harness, seeded by its matrix index.
+
+    One geometry is cached at a time: the largest geometry holds tens of GB of
+    expert weights, and the parity rows are ordered geometry-major.
+    """
+    index, geometry = next(
+        (index, geometry)
+        for index, geometry in enumerate(_GPU_GEOMETRIES)
+        if geometry.name == geometry_name
+    )
+    return prepare_fixture(geometry, _GPU_SEED + index)
+
+
+@pytest.mark.parametrize("geometry,num_tokens", _GPU_ROWS)
+def test_gpu_output_matches_public_nvfp4_reference(geometry, num_tokens):
+    target = _gpu_target()
+    device = torch.device("cuda")
+    fixture = _gpu_fixture(geometry.name)
+    module = cake_warp_decode_jit.get_cake_fused_moe_warp_decode_module(
+        target, device=device
+    )
+    output, workspace, receipt = prepare_launch(module, fixture, num_tokens)
+    try:
+        first = run_cake(
+            module, fixture, num_tokens, output, workspace, receipt
+        ).clone()
+        output.fill_(float("nan"))
+        second = run_cake(
+            module, fixture, num_tokens, output, workspace, receipt
+        ).clone()
+        torch.cuda.synchronize(device)
+    finally:
+        module.cake_fused_moe_warp_decode_release_workspace(receipt)
+
+    assert torch.isfinite(first.float()).all()
+    assert torch.equal(second, first), "repeated launch changed the output"
+    if geometry.has_public_reference:
+        expected = reference(fixture, num_tokens)
+        torch.cuda.synchronize(device)
+        assert_close(first, expected)

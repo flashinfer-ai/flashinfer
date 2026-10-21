@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""SM100/SM103 Cake warp-decode correctness and cold-L2 CUPTI benchmark harness.
+"""SM100/SM103 Cake warp-decode cold-L2 CUPTI benchmark harness.
 
 The comparison arms share one prepared TRTLLM NVFP4 representation: activation,
 routing, packed-weight, and block-scale tensors. Parameterized SwiGLU uses
 separate official beta/clamp buffers divided by the gate scale; alpha remains
 shared. SwiGLU and SiTU rows use the public
 ``trtllm_fp4_block_scale_routed_moe`` baseline. Standalone SiLU has no supported
-official peer and reports exported Cake absolute timing only. Correctness and
-benchmark preparation stay outside timed or CUDA Graph capture regions.
+official peer and reports exported Cake absolute timing only. Benchmark
+preparation stays outside the timed regions. The correctness tests live in
+``tests/moe/test_cake_warp_decode.py``,
+``tests/moe/test_cake_warp_decode_clamped_gpu.py`` and
+``tests/moe/test_cake_warp_decode_workspace_gpu.py``.
 """
 
 from __future__ import annotations
@@ -16,7 +19,6 @@ import argparse
 import json
 import math
 import statistics
-import time
 import weakref
 from contextlib import suppress
 from dataclasses import dataclass
@@ -26,21 +28,11 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 import torch
 
-from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
     ActivationConfig,
-    BackendOptions,
     CakeWarpDecodeConfig,
-    ExecutionConfig,
-    ExpertConfig,
-    MoEActivationPack,
-    MoEConfig,
-    MoELayer,
-    MoEWeightPack,
     QuantConfig,
     QuantFormat,
-    RoutingConfig,
-    RoutingInputMode,
     RoutingMethodType,
     SiLU,
     SiTU,
@@ -57,15 +49,14 @@ from flashinfer.testing.utils import bench_gpu_time
 ATOL = 1e-2
 RTOL = 1e-2
 MAX_TOKENS = 32
-RETIREMENT_DELAY_CYCLES = 50_000_000
 PAIR_PATTERNS = (
     ("ABBA", ("exported", "baseline", "baseline", "exported")),
     ("BAAB", ("baseline", "exported", "exported", "baseline")),
 )
-# A failed same-address re-prepare can leave receipt ownership ambiguous: the
-# binding may have rejected the call before revoking the old generation, or
-# after synchronizing and erasing it.  Hold the backing allocation for process
-# lifetime on that exceptional path so neither case can be recycled unsafely.
+# A failed release leaves receipt ownership ambiguous: the binding may have
+# rejected the call outright or failed while waiting for the generation's
+# recorded submissions.  Hold the backing allocation for process lifetime on
+# that exceptional path so its address cannot be recycled unsafely.
 _WORKSPACE_QUARANTINE: dict[int, torch.Tensor] = {}
 
 
@@ -134,6 +125,15 @@ GEOMETRIES = (
     Geometry("e512_i512_k10", 2048, 512, 512, 10, (1, 2, 22, 23, 32)),
     Geometry("e60_i1536_k4", 2048, 1536, 60, 4, (1, 7, 8, 10, 11, 12, 16, 17, 32)),
     Geometry("e192_i1536_k4_silu", 6144, 1536, 192, 4, (1, 2, 32), SiLU()),
+    Geometry(
+        "e256_i2048_k6_clamp10",
+        4096,
+        2048,
+        256,
+        6,
+        (1, 6, 7, 8, 9, 10, 11, 12, 22, 23, 24, 32),
+        SwiGLU(limit=10.0),
+    ),
     Geometry("e384_i768_k4", 2560, 768, 384, 4, (1, 2, 32)),
     Geometry("e128_i768_k8", 2048, 768, 128, 8, (1, 2, 32)),
     Geometry("e128_i1536_k8", 4096, 1536, 128, 8, (1, 2, 32)),
@@ -158,6 +158,11 @@ GEOMETRIES = (
         (1, 2, 32),
         SiTU(gate_scale=4.0, linear_scale=25.0),
     ),
+    # Sharded per-partition slices (fused route packing on every token count).
+    Geometry("h4096_e512_i512_k10", 4096, 512, 512, 10, (1, 2, 16, 32)),
+    Geometry("h4096_e512_i256_k10", 4096, 256, 512, 10, (1, 2, 16, 32)),
+    Geometry("h3072_e256_i768_k8", 3072, 768, 256, 8, (1, 2, 16, 32)),
+    Geometry("h3072_e256_i384_k8", 3072, 384, 256, 8, (1, 2, 16, 32)),
 )
 
 
@@ -175,6 +180,18 @@ def _uses_activation_params(geometry: Geometry) -> bool:
 
 def _selector_bucket(geometry: Geometry, num_tokens: int) -> str:
     """Name the fixed schedule/route-packer bucket exercised by a row."""
+    if geometry.activation == SwiGLU(limit=10.0):
+        # Names describe the semantic selection; generated inventory supplies
+        # exact kernel identities, not a second heuristic selector.
+        if num_tokens <= 6:
+            return "direct"
+        if num_tokens in (7, 8):
+            return "direct_expert_order"
+        if num_tokens in (9, 10):
+            return "packed_sorted_short"
+        if num_tokens in (11, 23):
+            return "packed_count_rank"
+        return "packed_general"
     key = (
         geometry.hidden_size,
         geometry.intermediate_size,
@@ -206,46 +223,27 @@ def _selector_bucket(geometry: Geometry, num_tokens: int) -> str:
 
 @dataclass
 class PhysicalFixture:
-    """Graph-stable TRTLLM NVFP4 physical tensors for one geometry."""
+    """TRTLLM NVFP4 physical tensors for one geometry."""
 
     geometry: Geometry
     hidden_states_q: torch.Tensor
     hidden_states_scale: torch.Tensor
-    initial_topk_ids: torch.Tensor
-    initial_topk_weights: torch.Tensor
-    mutated_topk_ids: torch.Tensor
-    mutated_topk_weights: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
     weight_view: Mapping[str, torch.Tensor]
 
-    def case(self, num_tokens: int, *, mutated_routes: bool = False) -> "PhysicalCase":
+    def case(self, num_tokens: int) -> "PhysicalCase":
         if not 1 <= num_tokens <= MAX_TOKENS:
             raise ValueError(f"num_tokens must be in [1, {MAX_TOKENS}]")
-        ids = self.mutated_topk_ids if mutated_routes else self.initial_topk_ids
-        weights = (
-            self.mutated_topk_weights if mutated_routes else self.initial_topk_weights
-        )
         return PhysicalCase(
             geometry=self.geometry,
             num_tokens=num_tokens,
             hidden_states_q=self.hidden_states_q[:num_tokens],
             hidden_states_scale=self.hidden_states_scale[:num_tokens],
-            topk_ids=ids[:num_tokens],
-            topk_weights=weights[:num_tokens],
+            topk_ids=self.topk_ids[:num_tokens],
+            topk_weights=self.topk_weights[:num_tokens],
             weight_view=self.weight_view,
         )
-
-    def stage_routes(self, num_tokens: int, *, mutated: bool) -> "PhysicalCase":
-        """Copy routing into stable initial slots used by an already-captured graph."""
-        if mutated:
-            self.initial_topk_ids[:num_tokens].copy_(self.mutated_topk_ids[:num_tokens])
-            self.initial_topk_weights[:num_tokens].copy_(
-                self.mutated_topk_weights[:num_tokens]
-            )
-        else:
-            ids, weights = _make_routing(self.geometry, mutated=False)
-            self.initial_topk_ids[:num_tokens].copy_(ids[:num_tokens])
-            self.initial_topk_weights[:num_tokens].copy_(weights[:num_tokens])
-        return self.case(num_tokens)
 
 
 @dataclass(frozen=True)
@@ -292,7 +290,6 @@ class PreparedCall:
     workspace: Any = None
     workspace_receipt: Optional[int] = None
     receipt_releaser: Optional[weakref.finalize] = None
-    refresh_activation_parameters: Optional[Callable[[], None]] = None
 
     def close(self) -> None:
         """Release a public workspace receipt exactly once, if this call owns one."""
@@ -301,9 +298,7 @@ class PreparedCall:
             self.workspace_receipt = None
 
 
-def _make_routing(
-    geometry: Geometry, *, mutated: bool
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _make_routing(geometry: Geometry) -> tuple[torch.Tensor, torch.Tensor]:
     device = torch.device("cuda")
     tokens = torch.arange(MAX_TOKENS, device=device, dtype=torch.int64)[:, None]
     ranks = torch.arange(geometry.top_k, device=device, dtype=torch.int64)[None, :]
@@ -311,12 +306,6 @@ def _make_routing(
     ids[:, 0] = 0
     raw_weights = (geometry.top_k + 1 - ranks).expand(MAX_TOKENS, -1).float()
     raw_weights = raw_weights + (tokens % 5).float() * 0.03125
-    if mutated:
-        ids = ((tokens * 31 + ranks * 37 + 11) % (geometry.num_experts - 1) + 1).to(
-            torch.int32
-        )
-        ids[:, 0] = 0
-        raw_weights = torch.flip(raw_weights, dims=(1,))
     weights = (raw_weights / raw_weights.sum(dim=1, keepdim=True)).to(torch.bfloat16)
     return ids.contiguous(), weights.contiguous()
 
@@ -346,6 +335,8 @@ def _prepare_fixture(geometry: Geometry, seed: int) -> PhysicalFixture:
         )
         * 0.02
     ).to(torch.bfloat16)
+    if geometry.activation == SwiGLU(limit=10.0):
+        hidden.mul_(16.0)  # Exercise both upper-gate and symmetric-linear clamp.
     hidden_q, hidden_scale = TrtllmFp4Config.prepare_activations(
         hidden,
         quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
@@ -360,16 +351,23 @@ def _prepare_fixture(geometry: Geometry, seed: int) -> PhysicalFixture:
         activation=geometry.activation,
         device=device,
     )
-    initial_ids, initial_weights = _make_routing(geometry, mutated=False)
-    mutated_ids, mutated_weights = _make_routing(geometry, mutated=True)
+    if geometry.activation == SwiGLU(limit=10.0):
+        # Both arms consume these same physical tensors. Non-unit gate scales
+        # exercise the raw-accumulator clamp conversion used by calibrated views.
+        gate_scale = torch.linspace(
+            0.5, 1.5, geometry.num_experts, dtype=torch.float32, device=device
+        )
+        weight_view["output1_scale_gate_scalar"] = gate_scale
+        weight_view["gemm1_clamp_limit"] = (
+            torch.full_like(gate_scale, 10.0) / gate_scale
+        )
+    topk_ids, topk_weights = _make_routing(geometry)
     return PhysicalFixture(
         geometry=geometry,
         hidden_states_q=hidden_q,
         hidden_states_scale=hidden_scale,
-        initial_topk_ids=initial_ids,
-        initial_topk_weights=initial_weights,
-        mutated_topk_ids=mutated_ids,
-        mutated_topk_weights=mutated_weights,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
         weight_view=weight_view,
     )
 
@@ -395,29 +393,13 @@ def _prepare_baseline(case: PhysicalCase) -> PreparedCall:
     view = case.weight_view
     official_beta = view.get("gemm1_beta")
     official_clamp_limit = view.get("gemm1_clamp_limit")
-    refresh_activation_parameters = None
     if geometry.name == "e128_i3072_k4_swiglu_oa":
         # This baseline consumes beta and clamp in raw-accumulator units.
         # Keep the logical parameter tensors supplied to warp-decode intact.
-        official_beta = torch.empty(
-            geometry.num_experts, dtype=torch.float32, device=case.device
+        official_beta = view["gemm1_beta"] / view["output1_scale_gate_scalar"]
+        official_clamp_limit = (
+            view["gemm1_clamp_limit"] / view["output1_scale_gate_scalar"]
         )
-        official_clamp_limit = torch.empty_like(official_beta)
-
-        def refresh_parameter_buffers() -> None:
-            torch.div(
-                view["gemm1_beta"],
-                view["output1_scale_gate_scalar"],
-                out=official_beta,
-            )
-            torch.div(
-                view["gemm1_clamp_limit"],
-                view["output1_scale_gate_scalar"],
-                out=official_clamp_limit,
-            )
-
-        refresh_parameter_buffers()
-        refresh_activation_parameters = refresh_parameter_buffers
     output = torch.empty(
         case.num_tokens,
         geometry.hidden_size,
@@ -464,21 +446,7 @@ def _prepare_baseline(case: PhysicalCase) -> PreparedCall:
             raise RuntimeError("TRTLLM baseline did not honor its caller output tensor")
         return output
 
-    return PreparedCall(
-        "flashinfer_trtllm_nvfp4",
-        output,
-        invoke,
-        refresh_activation_parameters=refresh_activation_parameters,
-    )
-
-
-def _prepare_validation_reference(case: PhysicalCase) -> PreparedCall:
-    """Return the available numeric reference without inventing a SiLU peer."""
-    if _has_official_baseline(case.geometry):
-        return _prepare_baseline(case)
-    reference = _prepare_cake(case)
-    reference.name = "cake_export_repeatability"
-    return reference
+    return PreparedCall("flashinfer_trtllm_nvfp4", output, invoke)
 
 
 def _cake_target(device: torch.device) -> str:
@@ -530,7 +498,16 @@ def _invoke_cake(
         view["output1_scale_gate_scalar"],
         view["output2_scale_scalar"],
     )
-    if _uses_activation_params(case.geometry):
+    if case.geometry.activation == SwiGLU(limit=10.0):
+        module.cake_fused_moe_warp_decode_clamped_swiglu(
+            *inputs,
+            view["gemm1_alpha"],
+            view["gemm1_beta"],
+            view["gemm1_clamp_limit"],
+            workspace_receipt,
+            True,
+        )
+    elif _uses_activation_params(case.geometry):
         module.cake_fused_moe_warp_decode_with_activation_params(
             *inputs,
             view.get("gemm1_alpha"),
@@ -628,407 +605,6 @@ def _diagnostic(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, Any]:
     }
 
 
-def _correctness_case(fixture: PhysicalFixture, num_tokens: int) -> dict[str, Any]:
-    """Check parity and reuse after preparing and launching on distinct streams."""
-    case = fixture.stage_routes(num_tokens, mutated=False)
-    prepare_stream, run_stream = _distinct_nondefault_streams(case.device)
-    with torch.cuda.stream(prepare_stream):
-        cake = _prepare_cake(case)
-    with torch.cuda.stream(run_stream):
-        reference = _prepare_validation_reference(case)
-        output_ptr = cake.output.data_ptr()
-        workspace_ptr = cake.workspace.data_ptr()
-        workspace_bytes = cake.workspace.numel()
-        first = cake.invoke().clone()
-        expected = reference.invoke().clone()
-        cake.output.fill_(float("nan"))
-        second = cake.invoke().clone()
-    run_stream.synchronize()
-
-    first_diagnostic = _diagnostic(first, expected)
-    second_diagnostic = _diagnostic(second, expected)
-    _diagnostic(second, first)
-    if cake.output.data_ptr() != output_ptr:
-        raise AssertionError("Cake replaced the caller-owned output tensor")
-    if (
-        cake.workspace.data_ptr() != workspace_ptr
-        or cake.workspace.numel() != workspace_bytes
-    ):
-        raise AssertionError("Cake replaced or resized the caller-owned workspace")
-    reference.close()
-    cake.close()
-    return {
-        "geometry": fixture.geometry.name,
-        "activation": _activation_name(fixture.geometry),
-        "num_tokens": num_tokens,
-        "selector_bucket": _selector_bucket(fixture.geometry, num_tokens),
-        "numeric_reference": reference.name,
-        "official_baseline": (
-            "available" if _has_official_baseline(fixture.geometry) else "N/A"
-        ),
-        "prepare_stream": "non_default",
-        "run_stream": "different_non_default",
-        "cross_stream_prepare_run": True,
-        "workspace_receipt_valid": cake.workspace_receipt is not None,
-        "workspace_receipt_released": cake.workspace_receipt is None,
-        "output_reused": True,
-        "workspace_reused": True,
-        "first_launch": first_diagnostic,
-        "second_launch": second_diagnostic,
-        "status": "pass",
-    }
-
-
-def _expect_receipt_rejected(
-    module: Any,
-    case: PhysicalCase,
-    output: torch.Tensor,
-    workspace: torch.Tensor,
-    receipt: int,
-    *,
-    label: str,
-) -> None:
-    try:
-        _invoke_cake(module, case, output, workspace, receipt)
-    except Exception as error:
-        if "current preparation receipt" not in str(error):
-            raise AssertionError(f"{label} failed for an unexpected reason") from error
-    else:
-        raise AssertionError(f"{label} was accepted")
-
-
-def _expect_release_rejected(
-    module: Any,
-    receipt: int,
-    *,
-    label: str,
-    message: str,
-) -> None:
-    try:
-        module.cake_fused_moe_warp_decode_release_workspace(receipt)
-    except Exception as error:
-        if message not in str(error):
-            raise AssertionError(f"{label} failed for an unexpected reason") from error
-    else:
-        raise AssertionError(f"{label} was accepted")
-
-
-def _same_address_receipt_case(fixture: PhysicalFixture) -> dict[str, Any]:
-    """Model allocator reuse with a new tensor generation at one device address."""
-    num_tokens = fixture.geometry.selector_boundaries[0]
-    case = fixture.stage_routes(num_tokens, mutated=False)
-    shape = _cake_shape(case)
-    prepare_stream, run_stream = _distinct_nondefault_streams(case.device)
-    with torch.cuda.stream(prepare_stream):
-        module = _get_cake_module(case.device)
-        workspace_size = int(module.cake_fused_moe_warp_decode_workspace_size(*shape))
-        workspace_owner = torch.empty(
-            workspace_size, dtype=torch.uint8, device=case.device
-        )
-        workspace_replacement = workspace_owner.view(-1)
-        if workspace_replacement is workspace_owner:
-            raise AssertionError("workspace replacement must be a new tensor object")
-        if workspace_replacement.data_ptr() != workspace_owner.data_ptr():
-            raise AssertionError("workspace replacement did not preserve its address")
-        output = torch.empty(
-            case.num_tokens,
-            fixture.geometry.hidden_size,
-            dtype=torch.bfloat16,
-            device=case.device,
-        )
-        first_receipt = int(
-            module.cake_fused_moe_warp_decode_prepare_workspace(workspace_owner, *shape)
-        )
-        first_releaser = weakref.finalize(
-            output,
-            _finalize_workspace_receipt,
-            module,
-            workspace_owner,
-            first_receipt,
-        )
-        first_releaser.atexit = False
-        # A successful same-address re-prepare synchronously retires this
-        # generation. Disarm the fallback before crossing that transition: if
-        # re-prepare itself fails after revocation, a finalizer cannot issue an
-        # ambiguous stale second release while the harness unwinds.
-        quarantine_identity = _quarantine_workspace(workspace_owner)
-        first_releaser.detach()
-        replacement_receipt = int(
-            module.cake_fused_moe_warp_decode_prepare_workspace(
-                workspace_replacement, *shape
-            )
-        )
-        replacement_releaser = weakref.finalize(
-            output,
-            _finalize_workspace_receipt,
-            module,
-            workspace_replacement,
-            replacement_receipt,
-        )
-        replacement_releaser.atexit = False
-    if first_receipt <= 0 or replacement_receipt <= 0:
-        raise RuntimeError("Cake workspace preparation returned an invalid receipt")
-    if first_receipt == replacement_receipt:
-        raise AssertionError("same-address workspace generations reused a receipt")
-    _unquarantine_workspace(quarantine_identity, workspace_owner)
-    _expect_release_rejected(
-        module,
-        0,
-        label="non-positive workspace receipt release",
-        message="positive preparation receipt",
-    )
-    _expect_release_rejected(
-        module,
-        first_receipt,
-        label="stale same-address workspace receipt release",
-        message="unknown or already released receipt",
-    )
-
-    with torch.cuda.stream(run_stream):
-        reference = _prepare_validation_reference(case)
-        _expect_receipt_rejected(
-            module,
-            case,
-            output,
-            workspace_replacement,
-            first_receipt,
-            label="stale same-address workspace receipt",
-        )
-        actual = _invoke_cake(
-            module,
-            case,
-            output,
-            workspace_replacement,
-            replacement_receipt,
-        ).clone()
-        expected = reference.invoke().clone()
-    run_stream.synchronize()
-    replacement_diagnostic = _diagnostic(actual, expected)
-    reference.close()
-    _detach_and_release_workspace_receipt(replacement_releaser)
-    _expect_release_rejected(
-        module,
-        replacement_receipt,
-        label="repeated workspace receipt release",
-        message="unknown or already released receipt",
-    )
-    with torch.cuda.stream(run_stream):
-        _expect_receipt_rejected(
-            module,
-            case,
-            output,
-            workspace_replacement,
-            replacement_receipt,
-            label="released workspace receipt",
-        )
-
-    return {
-        "geometry": fixture.geometry.name,
-        "activation": _activation_name(fixture.geometry),
-        "num_tokens": num_tokens,
-        "selector_bucket": _selector_bucket(fixture.geometry, num_tokens),
-        "numeric_reference": reference.name,
-        "official_baseline": (
-            "available" if _has_official_baseline(fixture.geometry) else "N/A"
-        ),
-        "same_address_new_tensor_generation": True,
-        "receipt_advanced": True,
-        "stale_receipt_rejected": True,
-        "released_receipt_rejected": True,
-        "nonpositive_release_rejected": True,
-        "stale_release_rejected": True,
-        "double_release_rejected": True,
-        "replacement_launch": replacement_diagnostic,
-        "cross_stream_prepare_run": True,
-        "workspace_receipts_released": True,
-        "status": "pass",
-    }
-
-
-def _workspace_retirement_case(
-    fixture: PhysicalFixture,
-) -> dict[str, Any]:
-    """Re-prepare and release without caller-side stream synchronization."""
-    num_tokens = fixture.geometry.selector_boundaries[-1]
-    case = fixture.stage_routes(num_tokens, mutated=False)
-    shape = _cake_shape(case)
-    prepare_stream, first_stream = _distinct_nondefault_streams(case.device)
-    second_stream = torch.cuda.Stream(device=case.device)
-    if int(second_stream.cuda_stream) in {
-        int(prepare_stream.cuda_stream),
-        int(first_stream.cuda_stream),
-    }:
-        raise RuntimeError("failed to create a third distinct CUDA stream")
-    second_stream.wait_stream(torch.cuda.current_stream(case.device))
-    module = _get_cake_module(case.device)
-    workspace_size = int(module.cake_fused_moe_warp_decode_workspace_size(*shape))
-    workspace = torch.empty(workspace_size, dtype=torch.uint8, device=case.device)
-    output = torch.empty(
-        case.num_tokens,
-        fixture.geometry.hidden_size,
-        dtype=torch.bfloat16,
-        device=case.device,
-    )
-    first_receipt: Optional[int] = None
-    with torch.cuda.stream(prepare_stream):
-        first_receipt = int(
-            module.cake_fused_moe_warp_decode_prepare_workspace(workspace, *shape)
-        )
-    replacement_receipt: Optional[int] = None
-    try:
-        with torch.cuda.stream(first_stream):
-            _invoke_cake(module, case, output, workspace, first_receipt)
-
-        # Do not synchronize first_stream here. Re-preparation must retire the
-        # recorded submission before it clears and reinitializes the workspace.
-        with torch.cuda.stream(second_stream):
-            previous_receipt = first_receipt
-            # The C++ transition can fail either before or after revoking the
-            # old generation. Conservatively disarm cleanup before crossing it;
-            # on any exception the failing validation process retains storage
-            # until exit instead of attempting an unknowable second release.
-            quarantine_identity = _quarantine_workspace(workspace)
-            first_receipt = None
-            replacement_receipt = int(
-                module.cake_fused_moe_warp_decode_prepare_workspace(workspace, *shape)
-            )
-            if replacement_receipt <= 0 or replacement_receipt == previous_receipt:
-                raise AssertionError(
-                    "workspace re-preparation did not advance its receipt"
-                )
-            _unquarantine_workspace(quarantine_identity, workspace)
-            replacement = _invoke_cake(
-                module, case, output, workspace, replacement_receipt
-            ).clone()
-
-        # Release immediately, again without synchronizing second_stream. The
-        # binding must wait for its completion event before retiring the state.
-        retiring_receipt = replacement_receipt
-        replacement_receipt = None
-        _release_workspace_receipt_fail_closed(module, workspace, retiring_receipt)
-        with torch.cuda.stream(second_stream):
-            reference = _prepare_validation_reference(case)
-            expected = reference.invoke().clone()
-        second_stream.synchronize()
-        replacement_diagnostic = _diagnostic(replacement, expected)
-        reference.close()
-        return {
-            "geometry": fixture.geometry.name,
-            "activation": _activation_name(fixture.geometry),
-            "num_tokens": num_tokens,
-            "selector_bucket": _selector_bucket(fixture.geometry, num_tokens),
-            "numeric_reference": reference.name,
-            "official_baseline": (
-                "available" if _has_official_baseline(fixture.geometry) else "N/A"
-            ),
-            "reprepare_without_caller_stream_sync": True,
-            "release_without_caller_stream_sync": True,
-            "receipt_advanced": True,
-            "replacement_launch": replacement_diagnostic,
-            "status": "pass",
-        }
-    finally:
-        if first_receipt is not None:
-            retiring_receipt = first_receipt
-            first_receipt = None
-            _release_workspace_receipt_fail_closed(module, workspace, retiring_receipt)
-        if replacement_receipt is not None:
-            retiring_receipt = replacement_receipt
-            replacement_receipt = None
-            _release_workspace_receipt_fail_closed(module, workspace, retiring_receipt)
-
-
-def _layer_graph_case(fixture: PhysicalFixture) -> dict[str, Any]:
-    """Exercise the public MoELayer winner path and graph capture end to end."""
-    num_tokens = fixture.geometry.selector_boundaries[1]
-    case = fixture.stage_routes(num_tokens, mutated=False)
-    geometry = fixture.geometry
-    activations = MoEActivationPack(
-        hidden_states_q=case.hidden_states_q,
-        hidden_states_scale=case.hidden_states_scale,
-        topk_ids=case.topk_ids,
-        topk_weights=case.topk_weights,
-        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
-    )
-    weights = MoEWeightPack()
-    weights.prepare_for("cake", dict(case.weight_view))
-    config = MoEConfig(
-        routing=RoutingConfig(
-            num_experts=geometry.num_experts,
-            top_k=geometry.top_k,
-            method=RoutingMethodType.TopK,
-        ),
-        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
-        experts=ExpertConfig(intermediate_size=geometry.intermediate_size),
-        activation=geometry.activation,
-        backend=BackendOptions((CakeWarpDecodeConfig(),)),
-        execution=ExecutionConfig(
-            tune_max_num_tokens=MAX_TOKENS,
-            enable_pdl=True,
-        ),
-    )
-    layer = MoELayer(config, device=case.device)
-    layer.tuner.clear_cache()
-    layer.tuner.reset_statistics()
-    warmup_stream, capture_stream = _distinct_nondefault_streams(case.device)
-    replay_stream = torch.cuda.Stream(device=case.device)
-    if int(replay_stream.cuda_stream) in {
-        int(warmup_stream.cuda_stream),
-        int(capture_stream.cuda_stream),
-    }:
-        raise RuntimeError("failed to create a distinct CUDA Graph replay stream")
-    replay_stream.wait_stream(torch.cuda.current_stream(case.device))
-
-    # The first public call runs the real one-backend winner-selection path.
-    # Its timing helper uses its own warmup/capture streams, which is the exact
-    # framework path that a permanently stream-claimed workspace cannot serve.
-    with torch.cuda.stream(warmup_stream):
-        reference = _prepare_validation_reference(case)
-    with autotune(True, tuning_buckets=(num_tokens,)), torch.cuda.stream(warmup_stream):
-        eager = layer(activations, weights).clone()
-        expected_eager = reference.invoke().clone()
-    tuned_total = layer.tuner.stats.tuned_op_total_configs.get("moe_cake", 0)
-    tuned_successful = layer.tuner.stats.tuned_op_successful_configs.get("moe_cake", 0)
-    if tuned_total < 1 or tuned_successful < 1:
-        raise AssertionError(
-            "Cake MoELayer validation did not execute successful autotune profiling"
-        )
-    warmup_stream.synchronize()
-    eager_diagnostic = _diagnostic(eager, expected_eager)
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=capture_stream):
-        captured_output = layer(activations, weights)
-    with torch.cuda.stream(replay_stream):
-        graph.replay()
-        replayed = captured_output.clone()
-        expected_replay = reference.invoke().clone()
-    replay_stream.synchronize()
-    replay_diagnostic = _diagnostic(replayed, expected_replay)
-    reference.close()
-    return {
-        "geometry": geometry.name,
-        "activation": _activation_name(geometry),
-        "num_tokens": num_tokens,
-        "selector_bucket": _selector_bucket(geometry, num_tokens),
-        "numeric_reference": reference.name,
-        "official_baseline": (
-            "available" if _has_official_baseline(geometry) else "N/A"
-        ),
-        "winner_backend": layer.winner_backend,
-        "winner_selection_exercised": True,
-        "autotune_profiling_exercised": True,
-        "autotune_total_configs": tuned_total,
-        "autotune_successful_configs": tuned_successful,
-        "capture_stream": "non_default",
-        "replay_stream": "different_non_default",
-        "graph_replay_cross_stream": True,
-        "eager": eager_diagnostic,
-        "replay": replay_diagnostic,
-        "status": "pass",
-    }
-
-
 def run_sanitizer(
     geometries: Sequence[Geometry],
     *,
@@ -1045,7 +621,7 @@ def run_sanitizer(
             else geometry.selector_boundaries
         )
         for num_tokens in tokens:
-            case = fixture.stage_routes(num_tokens, mutated=False)
+            case = fixture.case(num_tokens)
             prepare_stream, run_stream = _distinct_nondefault_streams(case.device)
             with torch.cuda.stream(prepare_stream):
                 cake = _prepare_cake(case)
@@ -1067,274 +643,6 @@ def run_sanitizer(
                 }
             )
     return {"mode": "sanitizer", "rows": rows, "status": "pass"}
-
-
-def _graph_mutation_case(
-    fixture: PhysicalFixture, num_tokens: int, mutation_index: int
-) -> dict[str, Any]:
-    """Capture once, mutate live routing/model tensors, then replay and compare."""
-    case = fixture.stage_routes(num_tokens, mutated=False)
-    prepare_stream, capture_stream = _distinct_nondefault_streams(case.device)
-    replay_stream = torch.cuda.Stream(device=case.device)
-    if int(replay_stream.cuda_stream) in {
-        int(prepare_stream.cuda_stream),
-        int(capture_stream.cuda_stream),
-    }:
-        raise RuntimeError("failed to create a distinct CUDA Graph replay stream")
-    replay_stream.wait_stream(torch.cuda.current_stream(case.device))
-    with torch.cuda.stream(prepare_stream):
-        cake = _prepare_cake(case)
-    with torch.cuda.stream(capture_stream):
-        reference = _prepare_validation_reference(case)
-        warmup = cake.invoke().clone()
-        before = reference.invoke().clone()
-    capture_stream.synchronize()
-    warmup_diagnostic = _diagnostic(warmup, before)
-
-    output_ptr = cake.output.data_ptr()
-    workspace_ptr = cake.workspace.data_ptr()
-    workspace_bytes = cake.workspace.numel()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=capture_stream):
-        cake.invoke()
-
-    with torch.cuda.stream(capture_stream):
-        cake.output.fill_(float("nan"))
-        graph.replay()
-        initial_replay = cake.output.clone()
-    capture_stream.synchronize()
-    initial_replay_diagnostic = _diagnostic(initial_replay, before)
-
-    activation_parameter_replays = []
-    if _uses_activation_params(fixture.geometry):
-        parameter_expert = int(case.topk_ids[0, 0].item())
-        perturbations = (
-            (
-                "gemm1_alpha",
-                1.0 if isinstance(fixture.geometry.activation, SiTU) else 0.0,
-            ),
-            (
-                "gemm1_beta",
-                0.125 if isinstance(fixture.geometry.activation, SiTU) else 4.0,
-            ),
-            ("gemm1_clamp_limit", 0.0625),
-        )
-        for name, value in perturbations:
-            parameter = fixture.weight_view.get(name)
-            if parameter is None:
-                continue
-            with torch.cuda.stream(capture_stream):
-                saved = parameter[parameter_expert].clone()
-                parameter[parameter_expert].fill_(value)
-                if reference.refresh_activation_parameters is not None and name in (
-                    "gemm1_beta",
-                    "gemm1_clamp_limit",
-                ):
-                    reference.refresh_activation_parameters()
-                graph.replay()
-                actual_parameter_output = cake.output.clone()
-                expected_parameter_output = reference.invoke().clone()
-                parameter[parameter_expert].copy_(saved)
-                if reference.refresh_activation_parameters is not None and name in (
-                    "gemm1_beta",
-                    "gemm1_clamp_limit",
-                ):
-                    reference.refresh_activation_parameters()
-            capture_stream.synchronize()
-            delta = float(
-                (before.float() - expected_parameter_output.float()).abs().max().item()
-            )
-            if delta == 0.0:
-                raise AssertionError(
-                    f"{name} mutation did not change the reference output"
-                )
-            activation_parameter_replays.append(
-                {
-                    "parameter": name,
-                    "expert": parameter_expert,
-                    "value": value,
-                    "reference_mutation_max_abs": delta,
-                    "diagnostic": _diagnostic(
-                        actual_parameter_output, expected_parameter_output
-                    ),
-                }
-            )
-
-    mutated_expert = 0
-    saved_expert_tensors = []
-    replay_completion = torch.cuda.Event(enable_timing=False)
-    with torch.cuda.stream(replay_stream):
-        fixture.stage_routes(num_tokens, mutated=True)
-        # Make the replay perturbation observable even when random NVFP4
-        # quantization collapses a small multi-expert delta at BF16 output
-        # precision. Keep valid, unique top-k ids but route all weight through
-        # expert zero, whose packed weights and scales are zeroed below.
-        case.topk_weights.zero_()
-        case.topk_weights[:, 0].fill_(1.0)
-        for name in (
-            "gemm1_weights",
-            "gemm1_weights_scale",
-            "gemm2_weights",
-            "gemm2_weights_scale",
-        ):
-            tensor = fixture.weight_view[name][mutated_expert]
-            saved_expert_tensors.append((tensor, tensor.clone()))
-            tensor.zero_()
-        cake.output.fill_(float("nan"))
-        torch.cuda._sleep(RETIREMENT_DELAY_CYCLES)
-        graph.replay()
-        replay_completion.record()
-        replayed = cake.output.clone()
-        expected = reference.invoke().clone()
-
-    if replay_completion.query():
-        raise AssertionError(
-            "deterministic replay delay completed before workspace retirement"
-        )
-    # No replay-stream synchronization precedes release. The marker proves the
-    # replay was still in flight immediately before close, while the host block
-    # duration and destructive overwrite below prove that close waited for the
-    # graph-owned completion event before permitting storage reuse.
-    retirement_start_ns = time.monotonic_ns()
-    cake.close()
-    retirement_block_ms = (time.monotonic_ns() - retirement_start_ns) / 1e6
-    module = _get_cake_module(case.device)
-    replacement_stream = torch.cuda.Stream(device=case.device)
-    with torch.cuda.stream(replacement_stream):
-        cake.workspace.fill_(0xA5)
-    replacement_stream.synchronize()
-    replay_stream.synchronize()
-
-    # Reinitialize the deliberately overwritten storage and run a full launch
-    # at the same address after the delayed replay has been validated.
-    replacement_receipt: Optional[int] = None
-    try:
-        with torch.cuda.stream(replacement_stream):
-            replacement_receipt = int(
-                module.cake_fused_moe_warp_decode_prepare_workspace(
-                    cake.workspace, *_cake_shape(case)
-                )
-            )
-            if replacement_receipt <= 0:
-                raise AssertionError("post-graph workspace re-preparation failed")
-            replacement_output = torch.empty_like(cake.output)
-            replacement = _invoke_cake(
-                module,
-                case,
-                replacement_output,
-                cake.workspace,
-                replacement_receipt,
-            ).clone()
-        retiring_receipt = replacement_receipt
-        replacement_receipt = None
-        _release_workspace_receipt_fail_closed(module, cake.workspace, retiring_receipt)
-    finally:
-        if replacement_receipt is not None:
-            retiring_receipt = replacement_receipt
-            replacement_receipt = None
-            _release_workspace_receipt_fail_closed(
-                module, cake.workspace, retiring_receipt
-            )
-    replacement_stream.synchronize()
-
-    # Each selector boundary reuses this fixture. Restore the original expert
-    # after both replay and replacement finish, so later parameter mutations
-    # still exercise its nonzero weights through the same captured pointers.
-    with torch.cuda.stream(replay_stream):
-        for tensor, saved_tensor in saved_expert_tensors:
-            tensor.copy_(saved_tensor)
-    replay_stream.synchronize()
-
-    diagnostic = _diagnostic(replayed, expected)
-    replacement_diagnostic = _diagnostic(replacement, expected)
-    mutation_delta = float((before.float() - expected.float()).abs().max().item())
-    if mutation_delta == 0.0:
-        raise AssertionError("Graph mutation case did not change the reference output")
-    if cake.output.data_ptr() != output_ptr:
-        raise AssertionError("CUDA Graph replay replaced the caller output tensor")
-    if (
-        cake.workspace.data_ptr() != workspace_ptr
-        or cake.workspace.numel() != workspace_bytes
-    ):
-        raise AssertionError("CUDA Graph replay replaced the caller workspace")
-    reference.close()
-    return {
-        "geometry": fixture.geometry.name,
-        "activation": _activation_name(fixture.geometry),
-        "num_tokens": num_tokens,
-        "selector_bucket": _selector_bucket(fixture.geometry, num_tokens),
-        "numeric_reference": reference.name,
-        "official_baseline": (
-            "available" if _has_official_baseline(fixture.geometry) else "N/A"
-        ),
-        "prepare_stream": "non_default",
-        "capture_stream": "different_non_default",
-        "replay_stream": "third_non_default",
-        "cross_stream_prepare_capture": True,
-        "cross_stream_graph_replay": True,
-        "release_without_replay_stream_sync": True,
-        "replay_in_flight_before_release": True,
-        "workspace_overwritten_after_release": True,
-        "retirement_block_ms": retirement_block_ms,
-        "deterministic_replay_delay_cycles": RETIREMENT_DELAY_CYCLES,
-        "replacement_launch": replacement_diagnostic,
-        "workspace_receipt_valid": cake.workspace_receipt is not None,
-        "workspace_receipt_released": cake.workspace_receipt is None,
-        "mutated": [
-            "topk_ids",
-            "topk_weights",
-            "gemm1_weights",
-            "gemm1_weights_scale",
-            "gemm2_weights",
-            "gemm2_weights_scale",
-        ],
-        "mutated_expert": mutated_expert,
-        "reference_mutation_max_abs": mutation_delta,
-        "warmup": warmup_diagnostic,
-        "initial_replay": initial_replay_diagnostic,
-        "mutated_replay": diagnostic,
-        **(
-            {"activation_parameter_replays": activation_parameter_replays}
-            if activation_parameter_replays
-            else {}
-        ),
-        "output_reused": True,
-        "workspace_reused": True,
-        "status": "pass",
-    }
-
-
-def run_correctness(geometries: Sequence[Geometry], seed: int) -> dict[str, Any]:
-    rows: list[dict[str, Any]] = []
-    graph_rows: list[dict[str, Any]] = []
-    receipt_rows: list[dict[str, Any]] = []
-    workspace_retirement_rows: list[dict[str, Any]] = []
-    layer_graph_rows: list[dict[str, Any]] = []
-    for geometry_index, geometry in enumerate(geometries):
-        fixture = _prepare_fixture(geometry, seed + geometry_index)
-        for num_tokens in range(1, MAX_TOKENS + 1):
-            rows.append(_correctness_case(fixture, num_tokens))
-        receipt_rows.append(_same_address_receipt_case(fixture))
-        workspace_retirement_rows.append(_workspace_retirement_case(fixture))
-        layer_graph_rows.append(_layer_graph_case(fixture))
-        for mutation_index, num_tokens in enumerate(geometry.selector_boundaries):
-            graph_rows.append(_graph_mutation_case(fixture, num_tokens, mutation_index))
-    return {
-        "mode": "correctness",
-        "tolerance": {"atol": ATOL, "rtol": RTOL, "comparison_dtype": "bfloat16"},
-        "standalone_silu_reference": {
-            "official_baseline": "N/A",
-            "in_harness": "cake_export_repeatability",
-            "source_export_parity": "separate release validation receipt",
-        },
-        "matrix_rows": rows,
-        "workspace_receipt_rows": receipt_rows,
-        "workspace_retirement_rows": workspace_retirement_rows,
-        "layer_graph_rows": layer_graph_rows,
-        "graph_mutation_rows": graph_rows,
-        "status": "pass",
-    }
 
 
 def _require_cupti() -> str:
@@ -1480,10 +788,12 @@ def run_benchmark(
         tokens = (
             tuple(benchmark_tokens)
             if benchmark_tokens is not None
+            else tuple(range(1, MAX_TOKENS + 1))
+            if geometry.activation == SwiGLU(limit=10.0)
             else geometry.selector_boundaries
         )
         for num_tokens in tokens:
-            case = fixture.stage_routes(num_tokens, mutated=False)
+            case = fixture.case(num_tokens)
             prepare_stream, benchmark_stream = _distinct_nondefault_streams(case.device)
             with torch.cuda.stream(prepare_stream):
                 exported = _prepare_cake(case)
@@ -1597,10 +907,18 @@ def run_benchmark(
 
 def _selected_geometries(name: str) -> tuple[Geometry, ...]:
     if name == "all":
-        return GEOMETRIES
+        return tuple(
+            geometry
+            for geometry in GEOMETRIES
+            if geometry.activation != SwiGLU(limit=10.0)
+            or torch.cuda.get_device_capability() == (10, 0)
+        )
     selected = tuple(geometry for geometry in GEOMETRIES if geometry.name == name)
     if not selected:
         raise ValueError(f"unknown geometry {name!r}")
+    if any(g.activation == SwiGLU(limit=10.0) for g in selected):
+        if torch.cuda.get_device_capability() != (10, 0):
+            raise ValueError("Clamped E256 warp decode requires exact SM100.")
     return selected
 
 
@@ -1613,9 +931,7 @@ def _validate_environment(device: torch.device) -> str:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--mode",
-        choices=("correctness", "benchmark", "sanitizer", "all"),
-        default="correctness",
+        "--mode", choices=("benchmark", "sanitizer"), default="benchmark"
     )
     parser.add_argument(
         "--geometry",
@@ -1675,9 +991,7 @@ def main() -> None:
         "geometry": args.geometry,
         "seed": args.seed,
     }
-    if args.mode in ("correctness", "all"):
-        report["correctness"] = run_correctness(geometries, args.seed)
-    if args.mode in ("benchmark", "all"):
+    if args.mode == "benchmark":
         report["benchmark"] = run_benchmark(
             geometries,
             seed=args.seed,

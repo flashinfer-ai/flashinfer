@@ -18,13 +18,20 @@ instead split the K/V sequence and reduce partial outputs; other grids use the
 direct static launch.
 
 QToken-KvBlock-Sparse-Attention metadata uses one CUDA C++ CTA per route. Q1 maps its selected logical
-blocks and causal tail directly through the dense page table. Q2--Q8 sort at
-most ``group_size * (block_topk + 1)`` tagged selected/tail candidates in
-shared memory, unique equal logical IDs while OR-reducing query-membership
-bits, and map only the compact union. Work and temporary storage therefore do
-not scale with the configured model length or global cache capacity. Plain
+blocks and causal tail directly through the dense page table. Q2--Q8 union at
+most ``group_size * (block_topk + 1)`` selected/tail candidates with a shared
+byte/bit map and compact the sorted logical union. A cached occupancy check
+selects bounded radix sort when the map would exceed shared memory or add CTA
+waves. The map is sized by model context, never global cache capacity. Plain
 Int32 locators and packed membership words remain separate outputs; membership
 bits are never fused into a locator.
+
+Compatible FP8 G2–G8/page-4 Keeps plans instead use eight query words per
+32-fragment tile, emitted directly into the same workspace with unused slots
+and tail bits zero. The public
+standalone metadata format remains page-byte masks. Sparse FP8 D256 Keeps
+loads a full head stage as two SW128 planes and uses compact single-head
+TensorMaps when cache strides permit; other cache layouts retain their descriptors.
 
 Attention caches a grouped membership row in SMEM only when the complete
 resource layout, including barriers, fits the compilation budget. Larger rows
@@ -32,10 +39,19 @@ stay in the existing immutable metadata buffer; Softmax reads packed words for
 the current KV tile directly from GMEM. This does not change query grouping or
 the caller's split-KV permission.
 
+Packed QToken-KvBlock-Sparse-Attention uses an ordinary rank-3 Q TensorMap
+over `[D, Hq, total_q_tokens]`. A grouped box loads the configured query group,
+not spare token slots in `tileSizeQ`; the Q barrier credits rows outside that
+box separately. `qo_indptr` still supplies sequence starts and valid lengths.
+Loads across an internal sequence boundary occupy only inactive query rows:
+existing row masks and guarded stores discard those rows, and QK/softmax/PV
+do not mix different queries. TMA zero-fills beyond the packed allocation.
+Other packed attention paths retain their ragged Q descriptors.
+
 The combined QToken-KvBlock-Sparse-Attention metadata+attention API uses programmatic dependent launch
 (PDL) for its final metadata-to-attention handoff. QToken-KvBlock-Sparse-Attention metadata producers
-release only after their page indices, membership words, and sequence lengths
-are published. Every active attention CTA allocates and initializes its task
+release at entry to overlap the attention prologue; the dependency wait still
+covers completion of every metadata CTA. Attention allocates and initializes its task
 barriers, SMEM, and TMEM first, then waits immediately before TaskManager can
 read either output. Split-KV QToken-KvBlock-Sparse-Attention sends every configured split CTA through that
 initialization and acquire, then contracts the useful runtime prefix. Pruned
@@ -56,6 +72,11 @@ Independent query-offset metadata may be read before that wait. QToken-KvBlock-S
 lengths remain behind it because they originate in the metadata producer two
 PDL stages upstream. This preserves producer-to-reducer overlap while gating
 every producer-dependent global-memory read.
+
+The separate reducer uses one 512-thread CTA per 8 KiB output slice for
+S2--S4. S5--S16 use one 512-thread CTA per 2 KiB slice: four adjacent lanes
+fold interleaved split slots and merge through warp shuffles. Larger split
+counts retain clustered 128-thread CTAs and distributed-SMEM merging.
 
 ## Public APIs
 
@@ -121,7 +142,7 @@ supported. Rows may have padding between them; each row must be contiguous.
 | Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv`, with `1 <= Hq/Hkv <= 128`. Qualified fixed-Q FP8 D64/D128/D256 page-32 profiles use grouped Swaps Q8/Q16/Q32 through ratio 32, Keeps Q64 through ratio 64, and Keeps Q128 through ratio 128. |
 | Q/K dtype | Matching `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
 | V dtype | Equal to Q/K, or `torch.float8_e4m3fn` with `torch.bfloat16` Q/K (`v_data_type`; defaults to `k_data_type`) |
-| Output dtype | `torch.float16` for `torch.float16` input; `torch.bfloat16` for `torch.bfloat16` input; `torch.float16` or `torch.float8_e4m3fn` for `torch.float8_e4m3fn` input |
+| Output dtype | `torch.float16` for `torch.float16` input; `torch.bfloat16` for `torch.bfloat16` input; `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` for `torch.float8_e4m3fn` input |
 | K/V layout | HND paged cache, combined or separate K/V tensors; a V dtype that differs from K requires separate tensors |
 | Page size | 4, 8, 16, 32, 64, or 128 tokens; a logical fragment must divide the physical cache page |
 | Maximum K/V length | `2,147,483,392` (`INT32_MAX - 255`), reserving the padded endpoint of a 256-token K/V tile |
@@ -129,6 +150,13 @@ supported. Rows may have padding between them; each row must be contiguous.
 | Sliding window | Causal left window; `window_left=-1` disables it and non-negative values include the current token |
 | Scheduling | Automatic direct or CLC-persistent launch; `split_kv=True` permits eligible underfilled fixed/packed-Q grids to split. False disables splitting. Automatic sliding-window splits remain unqualified. |
 | Accumulation | FP32 QK/PV and softmax state |
+
+FP8-E4M3 Q with FP8-E4M3 or NVFP4 K/V can write BF16 directly. Set
+`o_data_type=torch.bfloat16` when planning a wrapper, or
+`out_dtype=torch.bfloat16` for one-shot execution and workspace sizing.
+Prepared launches also accept BF16 output buffers. Both 16-bit output types
+share split/reduction eligibility, including cluster SMEM reduction and the
+standalone reducer; the existing shape and layout restrictions still apply.
 
 Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
 admitted by the runtime architecture guard but remains to be qualified.
@@ -198,6 +226,13 @@ Q + paged K/V
     -> direct O, or split-KV partials -> reduction -> O
 ```
 
+Profiles that stream score fragments (KV256 tiles, block-sparse routes and
+8-bit Q128/KV128) choose their softmax arithmetic per architecture. SM100
+evaluates a quarter of each fragment's exponentials as FMA polynomials to
+offload MUFU. SM103, with twice the MUFU ex2 rate, keeps every exponential on
+MUFU, and its unmasked max pass takes fragment maxima (or Sage scale-group
+maxima) from LDTM.STAT instead of a register reduction.
+
 Eligible nonsplit work that exceeds one resident SM wave uses CLC-persistent
 scheduling. A scheduler warp discovers each schedule token once and broadcasts it to
 the worker tasks. Underfilled fixed- or packed-Q grids may instead split the
@@ -220,6 +255,9 @@ requires its captured address and shape to remain stable.
 | [`fmha_decode_tasks.py`](fmha_decode_tasks.py) | Ordered load, MMA, softmax, correction, store, and scheduler work |
 | [`fmha_decode_resources/`](fmha_decode_resources/) | GMEM/SMEM/TMEM resources and pipeline state |
 | [`reduction.py`](reduction.py) | Separate split-KV reduction |
+| [`block_sparse_prepare.py`](block_sparse_prepare.py) | Prepare of a block-sparse plan's compact route records from BSR or bitmask inputs |
+| [`block_sparse_inspect.py`](block_sparse_inspect.py) | One-shot validation of canonical BSR and live paged metadata |
+| [`sage_prepare.py`](sage_prepare.py) | Gather of a Sage plan's scales into the buffer the attention kernel reads |
 
 ## Example
 
@@ -349,6 +387,10 @@ plan-owned length storage and requires graph recapture.
 - Attention sinks and custom masks are not exposed.
 - Q and K must share one dtype; the only mixed combination is
   `torch.bfloat16` Q/K with `torch.float8_e4m3fn` V.
+- Sage attention (8-bit Q/K of one dtype with `torch.float8_e4m3fn` V and
+  dequantization scales) runs only through `BlockSparseTSWrapper` and
+  `block_sparse_attention`; see
+  [Sage attention](../../README.md#sage-attention).
 - Effective K/V lengths must be positive and no greater than the static plan
   bound.
 - Packed offsets are run-time wrapper inputs. Default wrapper validation checks

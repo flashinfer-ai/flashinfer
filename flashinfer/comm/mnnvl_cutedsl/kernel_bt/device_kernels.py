@@ -54,6 +54,7 @@ from ..cute_dsl_primitives import (
     store_global_u32x4,
     store_lamport_sentinel_u32x4,
 )
+from ..static_fp8_epilogue import store_rmsnorm_output
 
 LAMPORT_GENERATIONS = 3
 NEXT_STAGE = 0
@@ -1150,6 +1151,8 @@ class _MaterializeRMSNormDeviceKernel:
         prenorm_mailbox: cute.Tensor,
         residual_output: cute.Tensor,
         norm_output: cute.Tensor,
+        norm_output_bf16: cute.Tensor | None,
+        output_scale: cute.Tensor | None,
         gamma: cute.Tensor,
         stage_state: cute.Tensor,
         m: Int32,
@@ -1159,6 +1162,8 @@ class _MaterializeRMSNormDeviceKernel:
             prenorm_mailbox,
             residual_output,
             norm_output,
+            norm_output_bf16,
+            output_scale,
             gamma,
             stage_state,
         ).launch(
@@ -1175,6 +1180,8 @@ class _MaterializeRMSNormDeviceKernel:
         prenorm_mailbox: cute.Tensor,
         residual_output: cute.Tensor,
         norm_output: cute.Tensor,
+        norm_output_bf16: cute.Tensor | None,
+        output_scale: cute.Tensor | None,
         gamma: cute.Tensor,
         stage_state: cute.Tensor,
     ) -> None:
@@ -1274,9 +1281,12 @@ class _MaterializeRMSNormDeviceKernel:
                     output_offset = (
                         Int64(token) * self.hidden_size + Int64(fragment) * VEC_BF16
                     )
-                    store_global_u32x4(
-                        Int64((norm_output.iterator + output_offset).toint()),
+                    store_rmsnorm_output(
                         bf16x8_to_packed_u32x4(result),
+                        norm_output,
+                        Int64(output_offset),
+                        output_scale,
+                        norm_output_bf16,
                     )
 
         cute.arch.barrier()

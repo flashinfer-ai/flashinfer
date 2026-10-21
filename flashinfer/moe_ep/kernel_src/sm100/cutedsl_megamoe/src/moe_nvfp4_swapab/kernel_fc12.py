@@ -91,6 +91,8 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         apply_topk_in_fc1: bool = True,
         swiglu_alpha: Optional[float] = None,
         swiglu_beta: Optional[float] = None,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
         gate_up_clamp: Optional[float] = None,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
     ) -> None:
@@ -143,6 +145,8 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
         self.swiglu_alpha = None if swiglu_alpha is None else float(swiglu_alpha)
         self.swiglu_beta = None if swiglu_beta is None else float(swiglu_beta)
+        self.situ_beta = situ_beta
+        self.situ_linear_beta = situ_linear_beta
         self.gate_up_clamp = gate_up_clamp
         self.epi_flag_batch = epi_flag_batch
 
@@ -227,6 +231,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             f"_fc2out{self.fc2_output_dtype.__name__}_sfvec{self.sf_vec_size}"
             f"_acc{self.acc_dtype.__name__}_swiglua{self.swiglu_alpha}"
             f"_swiglub{self.swiglu_beta}_clamp{self.gate_up_clamp}_epiflag{epiflag}"
+            f"_situ{self.situ_beta}_linear{self.situ_linear_beta}"
         )
 
     def _validate_mma_tiler_and_cluster_shape(self) -> None:
@@ -399,6 +404,8 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             static_expert_shape=self.static_expert_shape,
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
+            situ_beta=self.situ_beta,
+            situ_linear_beta=self.situ_linear_beta,
             gate_up_clamp=self.gate_up_clamp,
         )
 

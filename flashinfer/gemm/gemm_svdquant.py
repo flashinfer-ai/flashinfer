@@ -647,11 +647,9 @@ def _cake_nvfp4_svdquant_requirement(
             "Cake NVFP4 SVDQuant requires CUDA 13.0 or later. "
             f"Current CUDA version: {cuda_version}."
         )
-    from ..jit.cake_nvfp4_svdquant import (
-        is_cake_nvfp4_svdquant_problem_supported,
-    )
+    from ..cake_nvfp4_svdquant_gemm_backend import is_supported
 
-    return is_cake_nvfp4_svdquant_problem_supported(
+    return is_supported(
         m=int(a.shape[0]),
         n=int(b.shape[0]),
         k=int(a.shape[1]) * 2,
@@ -829,13 +827,15 @@ def mm_nvfp4_svdquant(
     l1: torch.Tensor
         LoRA-up weight pre-divided by alpha, shape ``(n, r)`` bf16 (same rank as ``d``).
     bias: Optional[torch.Tensor]
-        Optional per-column bias, shape ``(n,)`` bf16. Fused by CUTLASS and the
-        SM120/SM121 CuTe DSL kernel.
+        Optional per-column bias, shape ``(n,)`` bf16. Fused by CUTLASS, by the
+        Cake SM100/SM103 programs and by the SM120/SM121 CuTe DSL kernel.
     out: Optional[torch.Tensor]
         Output tensor, shape ``(m, n)`` bf16; allocated when ``None``.
     backend: Literal["cutlass", "cake", "cute-dsl", "cute-dsl-unfused", "auto"]
         ``"cutlass"`` selects the existing fused SM100/SM103 implementation;
-        ``"cake"`` selects the generated fused SM100/SM103 implementation
+        ``"cake"`` selects the Cake fused SM100/SM103 programs (one program
+        per problem class, routed on ``(m, n, k, r, bias)``; ``m >= 128``, ``n``
+        a multiple of 128, ``k`` a multiple of the routed program's K tile)
         and requires CUDA 13.0 or later;
         ``"cute-dsl"`` selects the fused SM120/SM121 implementation;
         ``"cute-dsl-unfused"`` selects its compositional reference path;
@@ -858,28 +858,9 @@ def mm_nvfp4_svdquant(
     alpha_scalar = alpha.reshape(-1)[:1]
 
     if backend == "cake":
-        from ..jit.cake_nvfp4_svdquant import (
-            cake_nvfp4_svdquant_workspace_size,
-            run_cake_nvfp4_svdquant,
-        )
+        from ..cake_nvfp4_svdquant_gemm_backend import run as _run_cake
 
-        workspace_bytes = cake_nvfp4_svdquant_workspace_size(
-            m=int(a.shape[0]),
-            n=int(b.shape[0]),
-            k=int(a.shape[1]) * 2,
-            rank=int(d.shape[1]),
-            has_bias=bias is not None,
-            device=a.device,
-        )
-        workspace = None
-        if workspace_bytes:
-            workspace = _get_cache_buf(
-                "cake_nvfp4_svdquant_tma_workspace", workspace_bytes, a.device
-            )[:workspace_bytes]
-            if workspace.data_ptr() % 128:
-                raise RuntimeError("Cake descriptor workspace is not 128-byte aligned")
-        return run_cake_nvfp4_svdquant(
-            backend="cake",
+        return _run_cake(
             a=a,
             b=b,
             a_sf=a_sf,
@@ -889,7 +870,6 @@ def mm_nvfp4_svdquant(
             l1=l1,
             bias=bias,
             out=out,
-            workspace=workspace,
             enable_pdl=enable_pdl,
         )
 
@@ -991,7 +971,7 @@ def nvfp4_quantize_smooth(
     enable_pdl: Optional[bool] = None,
     backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Smooth + NVFP4 quantize: ``(xq, sf) = nvfp4-quantize(x * pre_quant_scale)``.
+    r"""Smooth + NVFP4 quantization: ``(xq, sf) = nvfp4-quantize(x * pre_quant_scale)``.
 
     The SM100/SM103 CUTLASS backend applies the SVDQuant per-input-channel smoothing scale
     and NVFP4-quantizes in one pass. The SM120/SM121 CuTe DSL backend also

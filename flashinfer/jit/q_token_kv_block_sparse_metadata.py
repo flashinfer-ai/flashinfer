@@ -45,7 +45,7 @@ def gen_prims_ts_q_token_kv_block_sparse_metadata_module() -> JitSpec:
 
     sources, include_paths = _q_token_kv_block_sparse_source_paths()
     return gen_jit_spec(
-        "prims_ts_q_token_kv_block_sparse_metadata",
+        "prims_ts_q_token_kv_block_sparse_metadata_head_aware",
         sources,
         extra_include_paths=include_paths,
         extra_cuda_cflags=["-lineinfo"],

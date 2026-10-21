@@ -20,8 +20,14 @@ Fused operators for diffusion-transformer inference.
     quantize_minimax_h3_o_weight_fp8
     quantize_minimax_h3_o_weight_nvfp4
     minimax_h3_sm120_varlen_attention_fp8
+    minimax_h3_sm120_varlen_attention_nvfp4
+    minimax_h3_sm120_varlen_attention_nvfp4_nodelta
     minimax_h3_fc1_swiglu_fp8
     prepare_minimax_h3_fc1_weight_fp8
+    minimax_h3_mlp_fp8_sm120
+    minimax_h3_mlp_nvfp4_sm120
+    prepare_minimax_h3_fc2_weight_fp8
+    prepare_minimax_h3_fc2_weight_nvfp4_sm120
     fused_qk_rmsnorm_rope
     fused_dit_residual_layernorm_scale_shift
     fused_dit_gate_residual_layernorm_scale_shift

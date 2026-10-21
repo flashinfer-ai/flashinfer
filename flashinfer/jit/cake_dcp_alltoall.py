@@ -1,77 +1,63 @@
 """JIT wiring for the generated SM100/SM103 DCP all-to-all kernels."""
 
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 from . import env as jit_env
-from .core import (
-    JitSpec,
-    current_compilation_context,
-    gen_jit_spec,
-    sm100a_nvcc_flags,
-    sm103a_nvcc_flags,
-)
+from .core import JitSpec, current_compilation_context, gen_jit_spec
 
-# Generated source inventory per exact target, relative to the csrc root.
-# Filled by the Cake source exporter; an empty entry keeps the portable helix
-# kernel for that target.
-GENERATED_SOURCES: Dict[str, List[str]] = {
-    "sm_100a": [
-        "generated/dcp_alltoall/sm_100a/cake_dcp_alltoall_4e05bb34258ed0b17208_kernel.cu",
-        "generated/dcp_alltoall/sm_100a/cake_dcp_alltoall_4e05bb34258ed0b17208_binding.cu",
-        "generated/dcp_alltoall/sm_100a/cake_dcp_alltoall_093259c7e2860c83269f_kernel.cu",
-        "generated/dcp_alltoall/sm_100a/cake_dcp_alltoall_093259c7e2860c83269f_binding.cu",
-    ],
-    "sm_103a": [
-        "generated/dcp_alltoall/sm_103a/cake_dcp_alltoall_3038adb817c49d1907b4_kernel.cu",
-        "generated/dcp_alltoall/sm_103a/cake_dcp_alltoall_3038adb817c49d1907b4_binding.cu",
-        "generated/dcp_alltoall/sm_103a/cake_dcp_alltoall_187a3dc44ec9fa42b278_kernel.cu",
-        "generated/dcp_alltoall/sm_103a/cake_dcp_alltoall_187a3dc44ec9fa42b278_binding.cu",
-    ],
-}
+# Generated kernel sources, one per CP size, relative to the csrc root. Both
+# Blackwell targets compile the same text. Filled by the Cake source exporter;
+# an empty list keeps the portable helix kernel everywhere.
+GENERATED_SOURCES: List[str] = [
+    "generated/dcp_alltoall/cake_dcp_alltoall_335c14a7e34177967411_kernel.cu",
+    "generated/dcp_alltoall/cake_dcp_alltoall_baedc53532c2be692cbd_kernel.cu",
+]
 
-_TARGETS = {
-    frozenset({(10, "0a")}): ("sm100a", "sm_100a", sm100a_nvcc_flags),
-    frozenset({(10, "3a")}): ("sm103a", "sm_103a", sm103a_nvcc_flags),
-}
+# (major, minor, define) of every target the generated kernels are built for.
+# The define tells the dispatcher which compute capabilities have a generated
+# kernel image; every other device runs the portable helix kernel.
+GENERATED_TARGETS: List[Tuple[int, str, str]] = [
+    (10, "0a", "CAKE_DCP_GENERATED_SM100A"),
+    (10, "3a", "CAKE_DCP_GENERATED_SM103A"),
+]
+
+MODULE_NAME = "dcp_alltoall_generated"
 
 
-def generated_module_name(arch: str) -> str:
-    """JIT module name of the generated route for ``arch`` (``sm_100a``/``sm_103a``)."""
-    for name, candidate, _flags in _TARGETS.values():
-        if candidate == arch:
-            return "dcp_alltoall_" + name
-    raise ValueError(f"no generated DCP all-to-all target for {arch!r}")
+def generated_targets() -> List[Tuple[int, str, str]]:
+    """Blackwell targets of the current build that have generated kernels."""
+    archs = current_compilation_context.TARGET_CUDA_ARCHS
+    return [t for t in GENERATED_TARGETS if (t[0], t[1]) in archs]
 
 
 def generated_dcp_alltoall_spec(
     helix_sources: Sequence[Path], extra_include_paths: Sequence[Union[str, Path]]
 ) -> Optional[JitSpec]:
-    """Return the generated-kernel module spec for an exact Blackwell target.
+    """Return the module spec with the generated kernels, or ``None``.
 
-    Target selection follows ``CompilationContext`` (``FLASHINFER_CUDA_ARCH_LIST``
-    or the visible GPUs). Any other target set, including multi-target AOT
-    builds, keeps the portable helix module.
+    The generated module is built whenever the compilation context
+    (``FLASHINFER_CUDA_ARCH_LIST`` or the visible GPUs) contains at least one
+    Blackwell target, including multi-target AOT builds; the dispatcher
+    selects the generated kernel per device capability at launch time. Builds
+    without a Blackwell target keep the portable helix module.
     """
-    selected = _TARGETS.get(frozenset(current_compilation_context.TARGET_CUDA_ARCHS))
-    if selected is None:
+    targets = generated_targets()
+    if not targets or not GENERATED_SOURCES:
         return None
-    name, arch, arch_flags = selected
-    generated = GENERATED_SOURCES.get(arch)
-    if not generated:
-        return None
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[9, 10, 11, 12]
+    )
     sources = [
         *helix_sources,
         jit_env.FLASHINFER_CSRC_DIR / "cake_dcp_alltoall_dispatch.cu",
-        *(jit_env.FLASHINFER_CSRC_DIR / path for path in generated),
+        *(jit_env.FLASHINFER_CSRC_DIR / path for path in GENERATED_SOURCES),
     ]
     return gen_jit_spec(
-        "dcp_alltoall_" + name,
+        MODULE_NAME,
         sources,
         extra_include_paths=list(extra_include_paths),
-        extra_cuda_cflags=arch_flags
-        + [
-            "-DFLASHINFER_DCP_GENERATED=1",
-            "-DCAKE_DCP_GENERATED_TARGET_" + name.upper() + "=1",
-        ],
+        extra_cuda_cflags=nvcc_flags
+        + ["-DFLASHINFER_DCP_GENERATED=1"]
+        + [f"-D{define}=1" for _major, _minor, define in targets],
     )

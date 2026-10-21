@@ -119,7 +119,7 @@ jobs:
           python3 scripts/pr_checks/targeted_lane_scope.py --coverage-only \
             --scripts scripts/task_jit_run_tests_part{1,2,3,4,5}.sh
           python3 scripts/pr_checks/targeted_lane_scope.py --coverage-only \
-            --scripts scripts/task_jit_run_tests_part3.sh
+            --scripts scripts/task_jit_run_tests_t4.sh
 
       - name: Get Docker Tag
         id: get-tag
@@ -219,7 +219,7 @@ jobs:
               --scripts scripts/task_jit_run_tests_part{1,2,3,4,5}.sh \
               --targets "${REQUESTED_TEST_PATH}")
             T4_SCOPE=$(python3 scripts/pr_checks/targeted_lane_scope.py \
-              --scripts scripts/task_jit_run_tests_part3.sh \
+              --scripts scripts/task_jit_run_tests_t4.sh \
               --targets "${REQUESTED_TEST_PATH}")
             echo "A10G targeted scope: ${A10G_SCOPE:-<none: lane not scheduled>}"
             echo "T4 targeted scope:   ${T4_SCOPE:-<none: lane not scheduled>}"
@@ -228,6 +228,13 @@ jobs:
             if [ "$SKIP_AOT" != "true" ]; then
               for arch in x64 arm64; do
                 for cuda in $(jq -r '.[].label' <<< "${RUNTIME_CUDA_MATRIX}"); do
+                  # Runtime entries land before their multi-arch image is
+                  # published. The release-ci-docker workflow adds the tag in
+                  # its generated follow-up PR; only then can AOT consume it.
+                  if ! grep -q "^flashinfer/flashinfer-ci-${cuda}:" ci/docker-tags.yml; then
+                    echo "::notice title=AOT image not published::Skipping ${cuda}; ci/docker-tags.yml has no published image yet" >&2
+                    continue
+                  fi
                   jq -nc --arg arch "$arch" --arg cuda "$cuda" '{
                     name: "AOT Build Import (\($arch), \($cuda))",
                     kind: "aot",
@@ -245,6 +252,7 @@ jobs:
                 jq -nc --arg shard "$shard" '{
                   name: "JIT Unittest \($shard) (A10G)",
                   kind: "gpu",
+                  gpu_name: "A10G",
                   runner: ["self-hosted", "linux", "x64", "gpu", "sm86", "on-demand"],
                   cuda: "cu129",
                   script: "task_jit_run_tests_part\($shard).sh",
@@ -255,15 +263,17 @@ jobs:
               jq -nc '{
                 name: "JIT Unittest (T4)",
                 kind: "gpu",
+                gpu_name: "T4",
                 runner: ["self-hosted", "linux", "x64", "gpu", "sm75", "on-demand"],
                 cuda: "cu129",
-                script: "task_jit_run_tests_part3.sh",
+                script: "task_jit_run_tests_t4.sh",
                 timeout: 360
               }'
 
               jq -nc '{
                 name: "JIT Unittest (H100)",
                 kind: "h100",
+                gpu_name: "H100",
                 runner: ["self-hosted", "linux", "x64", "gpu", "h100"],
                 cuda: "cu129",
                 script: "task_run_unit_tests.sh",
@@ -288,6 +298,7 @@ jobs:
                 jq -nc --arg test_path "${A10G_SCOPE}" '{
                   name: "Targeted Unittest (A10G)",
                   kind: "gpu",
+                  gpu_name: "A10G",
                   runner: ["self-hosted", "linux", "x64", "gpu", "sm86", "on-demand"],
                   cuda: "cu129",
                   script: "task_run_unit_tests.sh",
@@ -299,6 +310,7 @@ jobs:
                 jq -nc --arg test_path "${T4_SCOPE}" '{
                   name: "Targeted Unittest (T4)",
                   kind: "gpu",
+                  gpu_name: "T4",
                   runner: ["self-hosted", "linux", "x64", "gpu", "sm75", "on-demand"],
                   cuda: "cu129",
                   script: "task_run_unit_tests.sh",
@@ -309,6 +321,7 @@ jobs:
               jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
                 name: "Targeted Unittest (H100)",
                 kind: "h100",
+                gpu_name: "H100",
                 runner: ["self-hosted", "linux", "x64", "gpu", "h100"],
                 cuda: "cu129",
                 script: "task_run_unit_tests.sh",
@@ -346,6 +359,8 @@ jobs:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
       MATRIX_ARCH: ${{ matrix.runner[2] }}
       MATRIX_CUDA: ${{ matrix.cuda }}
+      CI_GPU_NAME: ${{ matrix.gpu_name }}
+      MATRIX_KIND: ${{ matrix.kind }}
       TEST_SCRIPT: ${{ matrix.script }}
       # Empty for every lane except the experimental one. Quoted at the use site and
       # never interpolated into script text - it originates from the PR body.
@@ -455,12 +470,16 @@ jobs:
         if: matrix.kind != 'aot'
         run: |
           case "${TEST_SCRIPT}" in
-            task_jit_run_tests_part[1-5].sh|task_run_unit_tests.sh) ;;
+            task_jit_run_tests_part[1-5].sh|task_jit_run_tests_t4.sh|task_run_unit_tests.sh) ;;
             *)
               echo "::error::Unexpected GPU test script: ${TEST_SCRIPT}"
               exit 1
               ;;
           esac
+          TEST_RUNNER_ARGS=()
+          if [ "${MATRIX_KIND}" = "h100" ]; then
+            TEST_RUNNER_ARGS+=(--workers-per-gpu 2)
+          fi
           if [ -n "${TEST_PATH_ARG:-}" ]; then
             # Read into an array and expand quoted, rather than relying on word
             # splitting: this keeps the shell safe on its own terms instead of
@@ -473,30 +492,48 @@ jobs:
             # to unit_test_runner.py, whose parser takes the scope as an option (or the
             # TEST_PATH env var, which ci/bash.sh does not forward into the container).
             # Bare paths fail argument-preflight with "unrecognized arguments".
-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" --test-path "${TEST_TARGETS[@]}"
+            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}" --test-path "${TEST_TARGETS[@]}"
           else
-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}"
+            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}"
           fi
 
       - name: Make JUnit XML readable
-        if: ${{ always() && matrix.kind == 'h100' }}
+        if: ${{ always() && (matrix.kind == 'h100' || startsWith(matrix.script, 'task_jit_run_tests_part')) }}
         run: |
           if [ -d junit ]; then
             sudo chmod -R a+rX junit
           fi
 
       - name: Upload JUnit XML and telemetry
-        if: ${{ always() && matrix.kind == 'h100' }}
+        if: ${{ always() && (matrix.kind == 'h100' || startsWith(matrix.script, 'task_jit_run_tests_part')) }}
         uses: actions/upload-artifact@v4
         with:
-          name: junit-h100-${{ github.run_id }}-${{ github.run_attempt }}
+          name: junit-${{ matrix.kind == 'h100' && 'h100' || matrix.script }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             junit/**/*.xml
             junit/**/*.telemetry.json
             junit/**/*.meta.json
             junit/**/*.memory.csv
+            junit/run-summary.json
           if-no-files-found: warn
           retention-days: 30
+
+      - name: Make shard JUnit XML readable
+        if: ${{ always() && matrix.kind == 'gpu' }}
+        run: |
+          if [ -d junit-shard ]; then
+            sudo chmod -R a+rX junit-shard
+          fi
+
+      - name: Upload shard JUnit XML
+        if: ${{ always() && matrix.kind == 'gpu' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-shard-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            junit-shard/**/*.xml
+          if-no-files-found: warn
+          retention-days: 14
 
 
   # ---------------------------------------------------------------------------
@@ -643,6 +680,154 @@ jobs:
           echo "::warning::CI skipped — pending authorization"
           exit 1
 
+      - name: Checkout (for skip-all analysis)
+        if: needs.gate.outputs.authorized == 'true' && github.event_name == 'pull_request'
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download H100 JUnit artifacts
+        if: needs.gate.outputs.authorized == 'true' && needs.test.result != 'cancelled'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: junit-h100-*
+          path: junit-h100
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Download shard JUnit artifacts (A10G/T4)
+        if: needs.gate.outputs.authorized == 'true' && needs.test.result != 'cancelled'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: junit-shard-*
+          path: junit-shards
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Check skip-all test files
+        id: skip-all
+        if: needs.gate.outputs.authorized == 'true' && github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          SUMMARY_ARGS=""
+          if [ -f junit-h100/run-summary.json ]; then
+            SUMMARY_ARGS="--summary junit-h100/run-summary.json"
+          fi
+
+          # A10G/T4 shard lanes produce raw JUnit XML (no run-summary.json).
+          # Discover them from the merged download directory.
+          SHARD_ARGS=""
+          if [ -d junit-shards ]; then
+            # The merged artifact flattens all shard uploads into one tree.
+            # Infer lane names from the XML paths: the shard scripts write
+            # junit-shard/tests/..., so after merge we get
+            # junit-shards/tests/... from each lane.  Since the download
+            # merges all lanes into one directory, we label the combined
+            # tree as "A10G+T4" — individual lane attribution would require
+            # per-lane artifact naming, which the shard scripts don't do.
+            SHARD_ARGS="--junit-xml-lane A10G+T4 junit-shards"
+          fi
+
+          if [ -z "$SUMMARY_ARGS" ] && [ -z "$SHARD_ARGS" ]; then
+            echo "No JUnit artifacts found; skipping skip-all check"
+            echo "skip_all_found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          SKIP_ALL_EXIT=0
+          REPORT=$(python3 scripts/pr_checks/check_skip_all.py \
+            --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
+            $SUMMARY_ARGS \
+            $SHARD_ARGS \
+            --junit-dir junit-h100 \
+            --github-actions 2>&1) || SKIP_ALL_EXIT=$?
+          echo "$REPORT"
+
+          if [ "$SKIP_ALL_EXIT" -ne 0 ]; then
+            echo "::error::check_skip_all.py failed with exit code $SKIP_ALL_EXIT"
+            exit "$SKIP_ALL_EXIT"
+          fi
+          echo "$REPORT"
+
+          if echo "$REPORT" | grep -qF "⚠️ **skip-all**"; then
+            echo "skip_all_found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_all_found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Append to step summary.
+          {
+            echo ""
+            echo "$REPORT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Save the report for the PR comment step.
+          echo "$REPORT" > "$RUNNER_TEMP/skip-all-report.md"
+
+      - name: Comment on PR about skip-all findings
+        if: steps.skip-all.outputs.skip_all_found == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Build comment body from the saved report.
+          {
+            echo "⚠️ **Skip-all detection (IKL-569)**"
+            echo ""
+            echo "Some changed test files had **all nodes skipped** on every CI lane."
+            echo "This means CI passed without executing any of the new or modified tests."
+            echo ""
+            echo "<details>"
+            echo "<summary>Full report</summary>"
+            echo ""
+            cat "$RUNNER_TEMP/skip-all-report.md"
+            echo ""
+            echo "</details>"
+            echo ""
+            echo "Please check whether the skipped tests are expected (e.g. SM arch not"
+            echo "available on any lane) or indicate a gap in CI coverage."
+          } > "$RUNNER_TEMP/skip-all-comment.md"
+
+          # Avoid duplicate comments on re-runs by deleting any prior bot comment
+          # with our marker.
+          EXISTING=$(gh api \
+            "/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --paginate --jq '.[] | select(.user.login == "github-actions[bot]") | select(.body | contains("Skip-all detection (IKL-569)")) | .id')
+          for ID in $EXISTING; do
+            gh api -X DELETE "/repos/${{ github.repository }}/issues/comments/${ID}" || true
+          done
+
+          gh pr comment "$PR_NUMBER" --body-file "$RUNNER_TEMP/skip-all-comment.md"
+
+      - name: Check trace reference coverage
+        id: trace-coverage
+        if: needs.gate.outputs.authorized == 'true' && github.event_name == 'pull_request'
+        run: |
+          TRACE_EXIT=0
+          REPORT=$(python3 scripts/pr_checks/check_trace_coverage.py \
+            --github-actions 2>&1) || TRACE_EXIT=$?
+          echo "$REPORT"
+
+          if [ "$TRACE_EXIT" -ne 0 ]; then
+            echo "::error::check_trace_coverage.py failed with exit code $TRACE_EXIT"
+            exit "$TRACE_EXIT"
+          fi
+          echo "$REPORT"
+          {
+            echo ""
+            echo "$REPORT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if echo "$REPORT" | grep -q "gap"; then
+            echo "trace_gaps=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "trace_gaps=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check Results
         if: needs.gate.outputs.authorized == 'true'
         env:
@@ -651,6 +836,8 @@ jobs:
           # TARGET_RE happens to exclude quotes and backticks, but that guarantee lives
           # in another file and must not be what keeps this step from being injectable.
           TEST_SCOPE: ${{ needs.setup.outputs.test_scope }}
+          SKIP_ALL_FOUND: ${{ steps.skip-all.outputs.skip_all_found }}
+          TRACE_GAPS: ${{ steps.trace-coverage.outputs.trace_gaps }}
         run: |
           echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -685,6 +872,20 @@ jobs:
             echo "> **Scoped run — NOT the full suite.**" >> $GITHUB_STEP_SUMMARY
             echo "> Tested only: \`${TEST_SCOPE}\`" >> $GITHUB_STEP_SUMMARY
             echo "> Comment \`@flashinfer-bot run\` with no paths for full coverage." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "$SKIP_ALL_FOUND" == "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> ⚠️ **Some changed test files had all nodes skipped on every lane.**" >> $GITHUB_STEP_SUMMARY
+            echo "> See the skip-all report above for details." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "$TRACE_GAPS" == "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> ⚠️ **Some GDN/KDA trace definitions are missing numerical coverage.**" >> $GITHUB_STEP_SUMMARY
+            echo "> See the trace coverage report above for details." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
 
