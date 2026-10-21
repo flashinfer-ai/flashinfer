@@ -18,6 +18,7 @@ import functools
 from typing import Literal
 
 import torch
+import tvm_ffi
 
 from .api_logging import flashinfer_api
 from .trace.templates.attention import concat_mla_k_trace
@@ -79,8 +80,6 @@ def _validate_cake_concat_mla_k(
         raise ValueError("k, k_nope, and k_rope must have the same dtype")
     if k_nope.device != k.device or k_rope.device != k.device:
         raise ValueError("k, k_nope, and k_rope must be on the same device")
-    from .jit.cake_concat_mla_k import cake_concat_mla_k_target
-
     cake_concat_mla_k_target(k.device)
 
     tokens = int(k.shape[0])
@@ -127,6 +126,86 @@ def _validate_cake_concat_mla_k(
     return tokens, element_bytes
 
 
+# The Cake backend: two generated programs (``flashinfer.jit.cake_concat_mla_k``): ``ONE_CTA`` (one CTA per token
+# window) for the exact targets sm_100a, sm_103a and sm_107a, and ``SPLIT`` (``gridDim.y`` CTAs share one token
+# window) for sm_107a.  The host owns the launch plan: one CTA copies two 1-byte tokens or one 2-byte token
+# (``_CAKE_TOKENS_PER_CTA``); on sm_107a a window is split over the largest admissible CTA count
+# (``_CAKE_SPLIT_CHOICES``) that keeps ``grid_x * split <= _CAKE_SPLIT_MAX_CTAS``, a single window over
+# ``_CAKE_ONE_WINDOW_SPLIT`` CTAs; every other target launches one CTA per window.
+_CAKE_TARGETS = ("sm_100a", "sm_103a", "sm_107a")
+_CAKE_SPLIT_TARGET = "sm_107a"
+_CAKE_TOKENS_PER_CTA = {1: 2, 2: 1}
+_CAKE_SPLIT_CHOICES = (1, 2, 3, 6)
+_CAKE_SPLIT_MAX_CTAS = 424
+_CAKE_ONE_WINDOW_SPLIT = 2
+
+
+def cake_concat_mla_k_target(device) -> str:
+    """The exact target of the generated programs on ``device``: ``"sm_100a"``, ``"sm_103a"`` or ``"sm_107a"``
+    (the sm_107a build needs CUDA 13.0); any other device is an error."""
+    from .jit.cake_concat_mla_k import ONE_CTA
+    from .jit.cpp_ext import is_cuda_version_at_least
+
+    capability = tuple(int(value) for value in torch.cuda.get_device_capability(device))
+    target = ONE_CTA.target_for(capability)
+    if target is None:
+        raise RuntimeError(
+            "the Cake concat_mla_k backend requires compute capability 10.0 "
+            "(sm_100a), 10.3 (sm_103a) or 10.7 (sm_107a), got "
+            f"{capability[0]}.{capability[1]}"
+        )
+    if target == _CAKE_SPLIT_TARGET and not is_cuda_version_at_least("13.0"):
+        raise RuntimeError(
+            "the Cake concat_mla_k backend on compute capability 10.7 requires "
+            "CUDA 13.0 or newer for the sm_107a target"
+        )
+    return target
+
+
+def cake_concat_mla_k_tokens_per_cta(element_bytes: int) -> int:
+    """The token window one CTA copies: two 1-byte tokens or one 2-byte token."""
+    try:
+        return _CAKE_TOKENS_PER_CTA[int(element_bytes)]
+    except KeyError:
+        raise ValueError(
+            f"the Cake concat_mla_k programs have no launch rule for {element_bytes}-byte elements"
+        ) from None
+
+
+def cake_concat_mla_k_split_ctas(tokens: int, element_bytes: int, target: str) -> int:
+    """``gridDim.y`` of one launch: 1 on every target but sm_107a and for no tokens; on sm_107a a single token
+    window takes two CTAs, otherwise the largest choice of ``(1, 2, 3, 6)`` with ``grid_x * choice <= 424``."""
+    if target not in _CAKE_TARGETS:
+        raise ValueError(f"unsupported Cake concat_mla_k target: {target!r}")
+    if target != _CAKE_SPLIT_TARGET or int(tokens) <= 0:
+        return 1
+    window = cake_concat_mla_k_tokens_per_cta(element_bytes)
+    grid_x = (int(tokens) + window - 1) // window
+    if grid_x == 1:
+        return _CAKE_ONE_WINDOW_SPLIT
+    best = 1
+    for choice in _CAKE_SPLIT_CHOICES:
+        if grid_x * choice <= _CAKE_SPLIT_MAX_CTAS:
+            best = choice
+    return best
+
+
+def cake_concat_mla_k_grid(
+    tokens: int, element_bytes: int, target: str
+) -> tuple[int, int, int]:
+    """The launch grid for ``tokens > 0``: ``(ceil(tokens / window), split_ctas, 1)``."""
+    window = cake_concat_mla_k_tokens_per_cta(element_bytes)
+    grid_x = (int(tokens) + window - 1) // window
+    return grid_x, cake_concat_mla_k_split_ctas(tokens, element_bytes, target), 1
+
+
+def _cake_program(target: str, split_ctas: int):
+    """``SPLIT`` when the host splits a window on sm_107a, else ``ONE_CTA``."""
+    from .jit.cake_concat_mla_k import ONE_CTA, SPLIT
+
+    return SPLIT if target == _CAKE_SPLIT_TARGET and int(split_ctas) > 1 else ONE_CTA
+
+
 def _concat_mla_k_cake(
     k: torch.Tensor,
     k_nope: torch.Tensor,
@@ -137,37 +216,36 @@ def _concat_mla_k_cake(
     tokens, element_bytes = _validate_cake_concat_mla_k(k, k_nope, k_rope)
     if not tokens:
         return None
-    from .jit.cake_concat_mla_k import (
-        cake_concat_mla_k_split_ctas,
-        cake_concat_mla_k_target,
-        cake_concat_mla_k_tokens_per_cta,
-        load_cake_concat_mla_k_module,
-    )
-
-    # One CTA copies two 1-byte tokens or one 2-byte token (the module's
-    # launch_policy); the kernel bounds the second token with ``tokens``.  On
-    # the split module (compute capability 10.7) ``grid_y`` CTAs share one
-    # token window (the module's split_rule); 1 elsewhere.
     target = cake_concat_mla_k_target(k.device)
-    window = cake_concat_mla_k_tokens_per_cta(element_bytes)
-    grid_x = (tokens + window - 1) // window
-    grid_y = cake_concat_mla_k_split_ctas(tokens, element_bytes, target)
-    with torch.cuda.device(k.device):
-        load_cake_concat_mla_k_module(target, grid_y > 1).run(
-            k.view(torch.uint8),
-            k_nope.view(torch.uint8),
-            k_rope.view(torch.uint8),
-            element_bytes,
-            int(k.stride(0)) * element_bytes,
-            int(k.stride(1)) * element_bytes,
-            int(k_nope.stride(0)) * element_bytes,
-            int(k_nope.stride(1)) * element_bytes,
-            int(k_rope.stride(0)) * element_bytes,
-            tokens,
-            grid_x,
-            grid_y,
-            1,
+    grid_x, grid_y, grid_z = cake_concat_mla_k_grid(tokens, element_bytes, target)
+    program = _cake_program(target, grid_y)
+    # The generated binding's arguments by name (``CakeProgram.args`` orders them): the three byte views, the
+    # element width, the five byte strides, the token count and the grid.  The kernel addresses the tensors
+    # through the byte strides alone; the binding checks their device and dtype and the strides' 16-byte
+    # multiples, the validation above the ranks, shapes, stride profiles, alignment and overlap.
+    values = {
+        "k": k.view(torch.uint8),
+        "k_nope": k_nope.view(torch.uint8),
+        "k_rope": k_rope.view(torch.uint8),
+        "element_bytes": element_bytes,
+        "k_stride_0_bytes": int(k.stride(0)) * element_bytes,
+        "k_stride_1_bytes": int(k.stride(1)) * element_bytes,
+        "k_nope_stride_0_bytes": int(k_nope.stride(0)) * element_bytes,
+        "k_nope_stride_1_bytes": int(k_nope.stride(1)) * element_bytes,
+        "k_rope_stride_0_bytes": int(k_rope.stride(0)) * element_bytes,
+        "tokens": tokens,
+        "grid_x": grid_x,
+        "grid_y": grid_y,
+        "grid_z": grid_z,
+    }
+    if set(program.args) != set(values):
+        raise RuntimeError(
+            f"the generated {program.name} binding takes {list(program.args)}; the host spells {sorted(values)}"
         )
+    entry = program.entry(target)
+    arguments = [values[name] for name in program.args]
+    with torch.cuda.device(k.device), tvm_ffi.use_torch_stream():
+        entry(*arguments)
     return None
 
 
@@ -207,9 +285,9 @@ def concat_mla_k(
         The rope part of k (shared), shape: ``[num_tokens, 1, rope_dim]``.
         This is broadcast to all heads.
     backend : {"default", "cake"}, optional
-        Backend implementation. The source-only ``"cake"`` backend is
-        available on the SM100f family and the exact SM103a target for the
-        documented fixed shape and layouts.
+        Backend implementation. The generated ``"cake"`` backend is available
+        on the exact sm_100a, sm_103a and sm_107a targets for the documented
+        fixed shape and layouts.
 
     Example
     -------
