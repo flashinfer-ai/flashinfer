@@ -581,8 +581,7 @@ kernel_cake_kda_train_612492edb453070b0d6a(const __grid_constant__ CUtensorMap w
                 mbarrier_wait(hs_ready_addr, _phase_hs_ready_0);
                 _phase_hs_ready_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
-                float _exp2_0 = approx_exp2(gk_pre);
-                float decay = _exp2_0;
+                float decay = approx_exp2(gk_pre);
                 float _tmem_load_0[16];
                 tmem_ld_x16(&_tmem_load_0[0], taddr + (unsigned int)h_row_base_1);
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
@@ -715,11 +714,11 @@ kernel_cake_kda_train_612492edb453070b0d6a(const __grid_constant__ CUtensorMap w
                     _phase_hs_ready_0_2 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
-                    int _mma_a_lo_0 = (((w_op_addr) >> 4) & 0x7FFF) + (stage_1) * 1024;
-                    int _mma_b_lo_0 = (((hs_mn_addr) >> 4) & 0x7FFF) | 0x4000000;
+                    int _smem_desc_lo_0 = (((w_op_addr) >> 4) & 0x7FFF) + (stage_1) * 1024;
+                    int _smem_desc_lo_1 = (((hs_mn_addr) >> 4) & 0x7FFF) | 0x4000000;
 #else
-                    int _mma_a_lo_0 = (((w_op_addr) >> 4) & 0x3FFF) + (stage_1) * 1024;
-                    int _mma_b_lo_0 = (((hs_mn_addr) >> 4) & 0x3FFF) | 0x4000000;
+                    int _smem_desc_lo_0 = (((w_op_addr) >> 4) & 0x3FFF) + (stage_1) * 1024;
+                    int _smem_desc_lo_1 = (((hs_mn_addr) >> 4) & 0x3FFF) | 0x4000000;
 #endif
                     asm volatile(
                     "{\n\t"
@@ -774,7 +773,7 @@ kernel_cake_kda_train_612492edb453070b0d6a(const __grid_constant__ CUtensorMap w
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"(tmem_acc_vp), "r"(0));
+                    :: "r"(_smem_desc_lo_0), "r"(_smem_desc_lo_1), "r"(tmem_acc_vp), "r"(0) : "memory");
                     tcgen05_commit(vp_ready_addr);
                     mbarrier_wait(bv_ready_addr, _phase_bv_ready_0_1);
                     _phase_bv_ready_0_1 ^= 1;
@@ -782,11 +781,11 @@ kernel_cake_kda_train_612492edb453070b0d6a(const __grid_constant__ CUtensorMap w
                     _phase_dec_done_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
-                    int _mma_a_lo_1 = ((((kg_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (stage_1) * 1024;
-                    int _mma_b_lo_1 = (((bv_mn_addr) >> 4) & 0x7FFF) | 0x2000000;
+                    int _smem_desc_lo_2 = ((((kg_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (stage_1) * 1024;
+                    int _smem_desc_lo_3 = (((bv_mn_addr) >> 4) & 0x7FFF) | 0x2000000;
 #else
-                    int _mma_a_lo_1 = ((((kg_mn_addr) >> 4) & 0x3FFF) | 0x2000000) + (stage_1) * 1024;
-                    int _mma_b_lo_1 = (((bv_mn_addr) >> 4) & 0x3FFF) | 0x2000000;
+                    int _smem_desc_lo_2 = ((((kg_mn_addr) >> 4) & 0x3FFF) | 0x2000000) + (stage_1) * 1024;
+                    int _smem_desc_lo_3 = (((bv_mn_addr) >> 4) & 0x3FFF) | 0x2000000;
 #endif
                     asm volatile(
                     "{\n\t"
@@ -821,7 +820,7 @@ kernel_cake_kda_train_612492edb453070b0d6a(const __grid_constant__ CUtensorMap w
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"(tmem_acc_h), "r"(1));
+                    :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"(tmem_acc_h), "r"(1) : "memory");
                     tcgen05_commit(h_ready_addr);
                     tcgen05_commit(tiles_empty_addr + (stage_1) * 8);
                     stage_1 += 1;
@@ -835,4 +834,3 @@ kernel_cake_kda_train_612492edb453070b0d6a(const __grid_constant__ CUtensorMap w
 }
 
 } // extern "C"
-

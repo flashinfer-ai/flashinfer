@@ -37,8 +37,9 @@ and the path of the call (:data:`cake_jit.PATHS`) through the rules of
 :mod:`.cake_jit`.  Every launch is ``cake_jit.run_module`` with a plan grid;
 nothing here synchronizes or reads device memory.
 
-Launch sequences.  Forward: table (+ seg_table), GLM prep (bulk | split),
-intra (``Aqk`` / ``Akk``), then on the serial route (more than eight heads)
+Launch sequences.  Forward: table (+ seg_table), intra (``Aqk`` / ``Akk`` and
+the GLM prep's outputs: the gated keys / queries, the gate row and the
+``v_new`` pads), then on the serial route (more than eight heads)
 the state recurrence, which forms the output itself and, from 32 heads, the
 WY representation too (below that ``wy_fwd`` runs first, forming the gated
 values from the user's ``v`` / ``beta`` token rows), and on the segmented
@@ -51,10 +52,13 @@ version-2 (tape) saved set there is no recurrence recompute; from a version-3
 set carrying the segment-boundary states the segmented recompute is pass 2
 alone; the serial recompute of the 64-column form from 64 heads forms the WY
 representation itself (no WY launch) and leaves the transposed ``w`` tile the
-matching adjoint recurrence reads; the saved-state pass 2 of the few-chain
-segmented rows does the same; the serial adjoint recurrence accumulates ``dv``
-itself, so ``dav`` computes ``dAqk`` alone there and from 16 heads the fused
-gradient hosts even that (no ``dav`` launch).  The fused gradient and the GLM
+matching adjoint recurrence reads; the saved-state pass 2 of the segmented
+rows with at most 32 (document, head) chains does the same; the serial adjoint
+recurrence accumulates ``dv`` itself, so ``dav`` computes ``dAqk`` alone there
+and from 16 heads the fused gradient hosts even that (no ``dav`` launch); the
+segmented adjoint recurrence accumulates ``dv`` too, with ``dav`` (``dAqk``
+alone) on the few-chain rows and the fused gradient hosting ``dAqk`` above four
+chains (no ``dav`` launch).  The fused gradient and the GLM
 intra kernel read the user's ``q`` / ``k`` / ``v`` token rows where they are;
 the backward programs of the saved-set paths read the saved ``Aqk`` / ``Akk``
 token rows and the user's ``dout``, the replay path's programs the internal
@@ -412,13 +416,15 @@ def seg_states_saved(S: int, NSEG: int) -> bool:
 # offsets) and seg_m (the transfers) are adjacent blocks, together the kernels' seg_state [2, NSEG, H, 128, 128];
 # their sub-offsets are in state blocks and they are absent (0 B) on the serial route.
 #
-# Launch steps: forward 1 prep, 2 intra, 3 wy, 4 the state recurrence (segmented: pass 1, carry, pass 2), 5 the
-# output (formed by the recurrence's last launch); backward 1 prep, (1b intra on the replay path), 2 wy, 3 the
+# Launch steps: forward 1 intra (the GLM prep's outputs and Aqk / Akk), 2 wy, 3 the state recurrence (segmented:
+# pass 1, carry, pass 2), 4 the output (formed by the recurrence's last launch); backward 1 prep, (1b intra on the
+# replay path), 2 wy, 3 the
 # recurrence recompute (idem), 4 dav, 5 dhu (segmented: pass 1, carry, pass 2), 6 dqkg, 7 glm intra, 8 gate
 # epilogue.  An occupant's lifetime is [first launch that writes it, last launch that reads it]; occupants of one
 # slot have disjoint lifetimes, so no launch has an input and an output in the same slot and no launch reads a
 # slot another live occupant holds.  Pad-chunk rows every consumer reads are written in the same call by their
-# producer (prep: all of its outputs and the v_new / dv2 pad rows; intra: Aqk / Akk pad rows; wy / dav: whole
+# producer (the forward intra / the backward prep: the prep outputs and the v_new / dv2 pad rows; intra: Aqk / Akk
+# pad rows; wy / dav: whole
 # pairs), so nothing depends on the arena's content from a previous call, and only the per-call outputs leave the
 # arena.  The fused gradient (6) and the GLM intra kernel (7) read the user's q / k / v token rows directly (TMA
 # boxes, zero-filled past the pack), so the backward prep writes no chunk-layout copies of them and the backward
@@ -440,29 +446,29 @@ SEG_KINDS = ("SEG",)
 Occupant = tuple[str, str, int, tuple[int, int]]
 # slot -> occupants: (buffer, kind, sub-slot offset in bytes per R*H (SEG kinds: in state blocks), [first write,
 # last read]).  The segmented route's blocks ride in a slot that is free during fwd_h / dhu: forward seg_b / seg_m
-# [4, 4] + hseg (the carried states) [4, 4] after akk_int [2, 3]; backward seg_b [3, 3], seg_m [3, 5] (the
+# [3, 3] + hseg (the carried states) [3, 3] after akk_int [1, 2]; backward seg_b [3, 3], seg_m [3, 5] (the
 # transfers are read again by dhu's reverse carry at 5), hseg [3, 3], then dseg (the reverse offsets) on seg_b's
 # block and dhseg (the carried adjoint states) on hseg's block at [5, 5], between kb [1, 2] and dAkk [6, 7]: three
 # state blocks in either mode.  From a version-3 saved set carrying the states (light, S >= 384 * NSEG) the
 # backward's seg_b / seg_m / hseg blocks stay unused: the states come from the set; the layouts are unchanged.
 FWD_SLOTS: tuple[tuple[Occupant, ...], ...] = (
-    (("gk", "F32", 0, (1, 4)),),
+    (("gk", "F32", 0, (1, 3)),),
     # no vb: the forward's WY forms the gated values
-    (("kb", "B16", 0, (1, 3)), ("h", "TAPE", 0, (4, 5))),
-    (("kg", "B16", 0, (1, 4)),),
-    (("qg", "B16", 0, (1, 5)),),
+    (("kb", "B16", 0, (1, 2)), ("h", "TAPE", 0, (3, 4))),
+    (("kg", "B16", 0, (1, 3)),),
+    (("qg", "B16", 0, (1, 4)),),
     (
-        ("v_new", "B16", 0, (1, 5)),
-    ),  # prep zero-fills the pad-chunk rows at 1, fwd_h writes the real rows at 4
-    (("aqk_int", "A16", 0, (2, 5)),),
+        ("v_new", "B16", 0, (1, 4)),
+    ),  # intra zero-fills the pad-chunk rows at 1, fwd_h writes the real rows at 3
+    (("aqk_int", "A16", 0, (1, 4)),),
     (
-        ("akk_int", "A16", 0, (2, 3)),
-        ("seg_b", "SEG", 0, (4, 4)),
-        ("seg_m", "SEG", 1, (4, 4)),
-        ("hseg", "SEG", 2, (4, 4)),
+        ("akk_int", "A16", 0, (1, 2)),
+        ("seg_b", "SEG", 0, (3, 3)),
+        ("seg_m", "SEG", 1, (3, 3)),
+        ("hseg", "SEG", 2, (3, 3)),
     ),
-    (("u", "B16", 0, (3, 4)),),
-    (("w", "B16", 0, (3, 4)),),
+    (("u", "B16", 0, (2, 3)),),
+    (("w", "B16", 0, (2, 3)),),
 )
 # The replay layout: akk_int holds the recomputed internal Akk rows (the saved-set paths read the saved token rows
 # and drop the slot: SLOTS["bwd"]); do_int is the replay prep's copy of dout (the saved-set paths pass the user's
@@ -492,27 +498,28 @@ BWD_SLOTS: tuple[tuple[Occupant, ...], ...] = (
     (("beta_int", "V32", 0, (1, 7)),),
     (("db_f", "V32", 0, (6, 7)),),
 )
-# save_mode="tape": h and v_new are per-call saved tensors written by the forward (prep zero-fills v_new's pad rows
-# there too); the backward reads them from the saved set, skips fwd_h and recomputes only w (wy, which also writes
+# save_mode="tape": h and v_new are per-call saved tensors written by the forward (the intra program zero-fills
+# v_new's pad rows there too); the backward reads them from the saved set, skips fwd_h and recomputes only w (wy,
+# which also writes
 # u).  On the segmented route the forward's seg_state is per-call too (its transfer half is the saved seg_m, read
 # by dhu's carry); the arena's seg_b / seg_m / hseg serve only the replay path (which recomputes fwd_h).
 # save_mode="light" (version 3): the forward with save_for_backward writes seg_state and hseg into per-call saved
 # tensors as well when S >= 384 * NSEG (seg_states_saved), so the backward from that set runs fwd_h pass 2 alone;
 # the arena's blocks then serve the replay path, the forward without save_for_backward and every shorter pack.
 FWD_TAPE_SLOTS: tuple[tuple[Occupant, ...], ...] = (
-    (("gk", "F32", 0, (1, 4)),),
-    (("kb", "B16", 0, (1, 3)),),
-    (("kg", "B16", 0, (1, 4)),),
-    (("qg", "B16", 0, (1, 5)),),
-    (("aqk_int", "A16", 0, (2, 5)),),
+    (("gk", "F32", 0, (1, 3)),),
+    (("kb", "B16", 0, (1, 2)),),
+    (("kg", "B16", 0, (1, 3)),),
+    (("qg", "B16", 0, (1, 4)),),
+    (("aqk_int", "A16", 0, (1, 4)),),
     (
-        ("akk_int", "A16", 0, (2, 3)),
-        ("seg_b", "SEG", 0, (4, 4)),
-        ("seg_m", "SEG", 1, (4, 4)),
-        ("hseg", "SEG", 2, (4, 4)),
+        ("akk_int", "A16", 0, (1, 2)),
+        ("seg_b", "SEG", 0, (3, 3)),
+        ("seg_m", "SEG", 1, (3, 3)),
+        ("hseg", "SEG", 2, (3, 3)),
     ),
-    (("u", "B16", 0, (3, 4)),),
-    (("w", "B16", 0, (3, 4)),),
+    (("u", "B16", 0, (2, 3)),),
+    (("w", "B16", 0, (2, 3)),),
 )
 BWD_TAPE_SLOTS: tuple[tuple[Occupant, ...], ...] = (
     (("gk", "F32", 0, (1, 7)),),
@@ -1292,10 +1299,20 @@ def _fwd_intra(
     path: str,
     write_ext: int,
     write_int: int,
+    write_prep: int,
 ) -> None:
+    """The intra-chunk program: ``Aqk`` / ``Akk`` on the internal rows (``write_int``) and on the token rows
+    (``write_ext``), and with ``write_prep`` the GLM prep's outputs the later programs read (``gk``, ``kb``, ``kg``,
+    ``qg`` and the ``v_new`` pad rows: the forward); the replay (``write_prep = 0``) has them from its own prep and
+    passes the same buffers untouched."""
     ws.run(
         "fwd_intra",
-        {**values, "write_ext": int(write_ext), "write_int": int(write_int)},
+        {
+            **values,
+            "write_ext": int(write_ext),
+            "write_int": int(write_int),
+            "write_prep": int(write_prep),
+        },
         path=path,
     )
 
@@ -1315,8 +1332,8 @@ def _forward_recurrence(
     ``fwdh`` stage, grid ``2 * NSEG * H``: the walk from zero gives the segment offsets, the walk from the identity
     the transfers, into ``seg_state[0]`` / ``[1]``; no tapes), seg_carry (the carried state of every segment into
     ``hseg``), pass 2 (the ``fwdh_p3`` stage, grid ``NSEG * H``: the walk from ``hseg``; the forward's forms the
-    output, the saved-state backward's of the few-chain rows the WY representation and the transposed ``w``
-    tile).  ``seg_state`` and ``hseg`` are the arena's blocks or per-call tensors (the light forward above the
+    output, the saved-state backward's of the rows with at most 32 (document, head) chains the WY representation
+    and the transposed ``w`` tile).  ``seg_state`` and ``hseg`` are the arena's blocks or per-call tensors (the light forward above the
     size rule saves both, the tape forward saves ``seg_state``'s transfer half).  On the ``light_states`` path
     (the backward from a version-3 saved set carrying the states) only pass 2 runs, from the saved ``hseg``; pass
     2 never writes ``seg_state`` (``write_ht = 0``).  ``write_tapes`` is 1 where the ``h`` / ``v_new`` tapes are
@@ -1422,10 +1439,10 @@ def chunk_kda_fwd(
     (version 3; shorter packs save neither and the backward recomputes them); with ``save_mode="tape"`` the fresh
     ``h`` tape, ``v_new`` and the segment transfers instead).
 
-    Launches (``Plan.launch_count("fwd")``): the table, the GLM prep, the intra-chunk program, then on the serial
-    route the state recurrence (which forms the output; ``wy_fwd`` before it below 32 heads: four or five
-    launches), on the segmented route ``seg_table`` after the table, ``wy_fwd``, pass 1, ``seg_carry`` and pass 2
-    (eight launches); saving the states moves two output pointers of the recurrence from the arena to the saved
+    Launches (``Plan.launch_count("fwd")``): the table, the intra-chunk program (which also writes the GLM prep's
+    outputs), then on the serial route the state recurrence (which forms the output; ``wy_fwd`` before it below 32
+    heads: three or four launches), on the segmented route ``seg_table`` after the table, ``wy_fwd``, pass 1,
+    ``seg_carry`` and pass 2 (seven launches); saving the states moves two output pointers of the recurrence from the arena to the saved
     tensors and adds no launch.  The token-row ``Aqk`` / ``Akk`` are written only with ``save_for_backward``; the
     ``h`` / ``v_new`` tapes only in tape mode.  ``workspace`` (:class:`KdaWorkspace`, the forward layout at least)
     is reused; without one a workspace is allocated for this call.  ``save_mode=None`` takes the workspace's
@@ -1454,7 +1471,7 @@ def chunk_kda_fwd(
         akk_ext = _alloc((S, H, BT), torch.bfloat16, ws.device)
     else:  # not written (write_ext = 0): any BF16 tensor serves as the unused pointer
         aqk_ext = akk_ext = a.aqk_int
-    if tape:  # the saved set owns h, v_new (and the segment states): fwd_h writes them, prep zero-fills v_new's pads
+    if tape:  # the saved set owns h, v_new (and the segment states): fwd_h writes them, intra zero-fills v_new's pads
         h = _alloc((p.NC_pad, H, D, D), torch.bfloat16, ws.device)
         v_new = _alloc((p.R, H, D), torch.bfloat16, ws.device)
         seg_state = (
@@ -1491,9 +1508,13 @@ def chunk_kda_fwd(
         out=out,
         scale=float(scale),
     )
-    ws.run("fwd_prep", values, path=path)
     _fwd_intra(
-        ws, values, path=path, write_ext=1 if save_for_backward else 0, write_int=1
+        ws,
+        values,
+        path=path,
+        write_ext=1 if save_for_backward else 0,
+        write_int=1,
+        write_prep=1,
     )
     if p.dispatched("wy_fwd", path):
         ws.run("wy_fwd", values, path=path)
@@ -1704,6 +1725,7 @@ def chunk_kda_bwd(
             path=path,
             write_ext=0,
             write_int=1,
+            write_prep=0,
         )
     if p.dispatched("wy", path):
         ws.run("wy", values, path=path)

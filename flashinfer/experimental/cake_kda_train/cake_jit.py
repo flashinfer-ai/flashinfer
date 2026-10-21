@@ -69,13 +69,17 @@ chains), the ``fwdh_v3`` launch walks every segment in parallel (pass 1: the
 per-segment transfer and offset), ``seg_carry`` chains the segments' states
 within each document, and the ``fwdh_p3`` stage walks again from the carried
 states (pass 2; the forward's ``fwdh_p3_o`` forms the output, the saved-state
-backward of the few-chain rows ``fwdh_p3_wy`` the WY representation, every
-other path ``fwdh_p3``).  The segmented adjoint recurrence is two passes of
-one record around ``seg_carry`` in reverse (``dhu_v3`` / ``dhu_v3r`` by the
-walk's wave count; the few-chain rows ``dhu_v3s_f*``, two CTAs per segment and
-head, which also accumulate ``dv``).  ``seg_carry`` is launched by the
-segmented recurrences between their passes; it is a stage of this registry for
-its record, not a step of the launch orders.
+backward of the rows with at most 32 (document, head) chains ``fwdh_p3_wy``
+the WY representation, every other path ``fwdh_p3``).  The segmented adjoint
+recurrence is two passes of one record around ``seg_carry`` in reverse, every
+form accumulating ``dv`` itself: the few-chain rows ``dhu_v3s_f*`` (two CTAs
+per segment and head), the other rows ``dhu_v3_f*`` / ``dhu_v3r_f*`` by the
+walk's wave count (one CTA; the ``_wt`` forms behind ``fwdh_p3_wy``, the
+``_replay`` forms on the replay); so ``dav_serial*`` runs on the few-chain rows
+alone and the fused gradient hosts ``dAqk`` above four chains (no ``dav``
+launch).  ``seg_carry`` is launched by the segmented recurrences between their
+passes; it is a stage of this registry for its record, not a step of the
+launch orders.
 
 The derived leaves of a record (``kernel_symbol``, ``launch``, ``arg_plan``,
 ``logical``) are rewritten by the exporter from the rendered binding; the
@@ -112,7 +116,9 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
 PATHS = ("fwd", "light", "light_states", "tape", "replay")
 
 # The launch orders.  The forward launches the table (the segmented route also
-# ``seg_table``), the GLM prep, the intra-chunk program and then either the
+# ``seg_table``), the intra-chunk program (which also writes the GLM prep's
+# outputs: the gated keys / queries, the gate row and the ``v_new`` pads; no
+# separate prep launch) and then either the
 # serial recurrence (with ``wy_fwd`` before it unless the recurrence forms the
 # WY representation itself) or the segmented pass 1, ``seg_carry`` and pass 2
 # (``fwdh_p3``).  The backward launches the prep, (the intra-chunk program on
@@ -127,7 +133,6 @@ PATHS = ("fwd", "light", "light_states", "tape", "replay")
 STAGES_FWD = (
     "table",
     "seg_table",
-    "fwd_prep",
     "fwd_intra",
     "wy_fwd",
     "fwdh",
@@ -147,7 +152,6 @@ STAGES_BWD = (
 STAGES = (
     "table",
     "seg_table",
-    "fwd_prep",
     "fwd_intra",
     "wy_fwd",
     "wy",
@@ -274,7 +278,9 @@ LOGICAL_TENSORS = (
 )
 # ``segments`` is the per-document segment count ``seg_table`` expands;
 # ``seg_arg`` the walk programs' segment scalar (``segments``, or
-# ``-num_seqs`` under a proportional table); ``proportional`` that switch.
+# ``-num_seqs`` under a proportional table); ``proportional`` that switch;
+# ``write_prep`` the forward intra program's switch for the GLM prep's outputs
+# (1 on the forward, 0 on the replay, whose prep writes them).
 LOGICAL_SCALARS = (
     "num_seqs",
     "num_chunks_pad",
@@ -283,6 +289,7 @@ LOGICAL_SCALARS = (
     "group",
     "write_ext",
     "write_int",
+    "write_prep",
     "scale",
     "num_segments",
     "segments",
@@ -414,110 +421,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "seg_table",
         "variant": None,
     },
-    "fwd_prep_bulk": {
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "arg_plan": [
-            ["buffer", "q"],
-            ["buffer", "k"],
-            ["buffer", "g"],
-            ["buffer", "beta"],
-            ["buffer", "chunk_bos"],
-            ["buffer", "chunk_len"],
-            ["buffer", "gk_out"],
-            ["buffer", "kb_out"],
-            ["buffer", "kg_out"],
-            ["buffer", "qg_out"],
-            ["buffer", "v_new"],
-            ["parameter", "num_qk_heads"],
-            ["parameter", "num_heads"],
-            ["parameter", "group"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_train_630cc47dfb122c210f63",
-        "launch": {
-            "block": (512, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 36864,
-            "use_pdl": False,
-        },
-        "library": "cake_kda_train_630cc47dfb122c210f63",
-        "logical": {
-            "beta": "beta",
-            "chunk_bos": "chunk_bos",
-            "chunk_len": "chunk_len",
-            "g": "g",
-            "gk_out": "gk",
-            "group": "group",
-            "k": "k",
-            "kb_out": "kb",
-            "kg_out": "kg",
-            "num_heads": "num_heads",
-            "num_qk_heads": "num_heads",
-            "q": "q",
-            "qg_out": "qg",
-            "v_new": "v_new",
-        },
-        "select_rule": {"kind": "ctas_at_least", "min": 256},
-        "stage": "fwd_prep",
-        "variant": "bulk",
-    },
-    "fwd_prep_split": {
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "arg_plan": [
-            ["buffer", "q"],
-            ["buffer", "k"],
-            ["buffer", "g"],
-            ["buffer", "beta"],
-            ["buffer", "chunk_bos"],
-            ["buffer", "chunk_len"],
-            ["buffer", "gk_out"],
-            ["buffer", "kb_out"],
-            ["buffer", "kg_out"],
-            ["buffer", "qg_out"],
-            ["buffer", "v_new"],
-            ["parameter", "num_qk_heads"],
-            ["parameter", "num_heads"],
-            ["parameter", "group"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {"kind": "chunks", "x_factor": 2},
-        "kernel_symbol": "kernel_cake_kda_train_05d0e54b6922a22ddb2b",
-        "launch": {
-            "block": (256, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 36864,
-            "use_pdl": False,
-        },
-        "library": "cake_kda_train_05d0e54b6922a22ddb2b",
-        "logical": {
-            "beta": "beta",
-            "chunk_bos": "chunk_bos",
-            "chunk_len": "chunk_len",
-            "g": "g",
-            "gk_out": "gk",
-            "group": "group",
-            "k": "k",
-            "kb_out": "kb",
-            "kg_out": "kg",
-            "num_heads": "num_heads",
-            "num_qk_heads": "num_heads",
-            "q": "q",
-            "qg_out": "qg",
-            "v_new": "v_new",
-        },
-        "select_rule": {"kind": "ctas_below", "max": 256},
-        "stage": "fwd_prep",
-        "variant": "split",
-    },
     "fwd_intra": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
@@ -537,13 +440,19 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "write_ext"],
             ["parameter", "write_int"],
             ["parameter", "scale"],
+            ["buffer", "gk_out"],
+            ["buffer", "kb_out"],
+            ["buffer", "kg_out"],
+            ["buffer", "qg_out"],
+            ["buffer", "v_new"],
+            ["parameter", "write_prep"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_train_290bdbd2c73c60bd6973",
+        "kernel_symbol": "kernel_cake_kda_train_c9395e21a813579c4bfc",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -551,7 +460,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 76160,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_290bdbd2c73c60bd6973",
+        "library": "cake_kda_train_c9395e21a813579c4bfc",
         "logical": {
             "akk_ext": "akk_ext",
             "akk_int": "akk_int",
@@ -561,14 +470,20 @@ MODULES: dict[str, dict[str, Any]] = {
             "chunk_bos": "chunk_bos",
             "chunk_len": "chunk_len",
             "g": "g",
+            "gk_out": "gk",
             "group": "group",
             "k": "k",
+            "kb_out": "kb",
+            "kg_out": "kg",
             "num_heads": "num_heads",
             "num_qk_heads": "num_heads",
             "q": "q",
+            "qg_out": "qg",
             "scale": "scale",
+            "v_new": "v_new",
             "write_ext": "write_ext",
             "write_int": "write_int",
+            "write_prep": "write_prep",
         },
         "select_rule": {"kind": "always"},
         "stage": "fwd_intra",
@@ -695,7 +610,7 @@ MODULES: dict[str, dict[str, Any]] = {
                     "kind": "all_of",
                     "rules": [
                         {"kind": "path_in", "paths": ["light_states"]},
-                        {"kind": "chains_above", "min": 4},
+                        {"kind": "chains_above", "min": 32},
                     ],
                 },
             ],
@@ -1477,7 +1392,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "docs_heads", "ctas_per_chain": 2},
-        "kernel_symbol": "kernel_cake_kda_train_da7ae1ebdf8647ca13c7",
+        "kernel_symbol": "kernel_cake_kda_train_0fb763e9a81e9066d776",
         "launch": {
             "block": (608, 1, 1),
             "cluster": (1, 1, 1),
@@ -1485,7 +1400,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 197632,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_da7ae1ebdf8647ca13c7",
+        "library": "cake_kda_train_0fb763e9a81e9066d776",
         "logical": {
             "b": "carry_b",
             "chain_seg_start": "seg_table",
@@ -1831,7 +1746,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "rules": [
                 {"kind": "heads_at_most", "max": 8},
                 {"kind": "path_in", "paths": ["light_states"]},
-                {"kind": "chains_at_most", "max": 4},
+                {"kind": "chains_at_most", "max": 32},
             ],
         },
         "stage": "fwdh_p3",
@@ -1901,7 +1816,7 @@ MODULES: dict[str, dict[str, Any]] = {
                             "kind": "all_of",
                             "rules": [
                                 {"kind": "path_in", "paths": ["light_states"]},
-                                {"kind": "chains_above", "min": 4},
+                                {"kind": "chains_above", "min": 32},
                             ],
                         },
                     ],
@@ -2026,108 +1941,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {"kind": "path_in", "paths": ["replay"]},
         "stage": "bwd_prep",
         "variant": "g8_replay",
-    },
-    "dav": {
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "arg_plan": [
-            ["buffer", "do_tma"],
-            ["buffer", "vnew_tma"],
-            ["buffer", "aqk_tma"],
-            ["buffer", "dAqk"],
-            ["buffer", "dv1"],
-            ["parameter", "num_heads"],
-            ["parameter", "scale"],
-            ["buffer", "chunk_bos"],
-            ["buffer", "chunk_len"],
-            ["parameter", "num_pairs"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {"kind": "pairs_bounded", "ctas_per_sm": 1},
-        "kernel_symbol": "kernel_cake_kda_train_86a233403779a9a08850",
-        "launch": {
-            "block": (320, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 197632,
-            "use_pdl": False,
-        },
-        "library": "cake_kda_train_86a233403779a9a08850",
-        "logical": {
-            "aqk_tma": "aqk_src",
-            "chunk_bos": "chunk_bos",
-            "chunk_len": "chunk_len",
-            "dAqk": "dAqk",
-            "do_tma": "dout",
-            "dv1": "dv1",
-            "num_heads": "num_heads",
-            "num_pairs": "num_pairs",
-            "scale": "scale",
-            "vnew_tma": "v_new",
-        },
-        "select_rule": {
-            "kind": "all_of",
-            "rules": [
-                {"kind": "heads_at_most", "max": 8},
-                {"kind": "chains_above", "min": 4},
-                {"kind": "path_in", "paths": ["light", "light_states", "tape"]},
-            ],
-        },
-        "stage": "dav",
-        "variant": None,
-    },
-    "dav_replay": {
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "arg_plan": [
-            ["buffer", "do_tma"],
-            ["buffer", "vnew_tma"],
-            ["buffer", "aqk_tma"],
-            ["buffer", "dAqk"],
-            ["buffer", "dv1"],
-            ["parameter", "num_heads"],
-            ["parameter", "scale"],
-            ["buffer", "chunk_bos"],
-            ["buffer", "chunk_len"],
-            ["parameter", "num_pairs"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {"kind": "pairs_bounded", "ctas_per_sm": 1},
-        "kernel_symbol": "kernel_cake_kda_train_e785b0a9c41c0ac2b8c1",
-        "launch": {
-            "block": (320, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 197632,
-            "use_pdl": False,
-        },
-        "library": "cake_kda_train_e785b0a9c41c0ac2b8c1",
-        "logical": {
-            "aqk_tma": "aqk_int",
-            "chunk_bos": "chunk_bos",
-            "chunk_len": "chunk_len",
-            "dAqk": "dAqk",
-            "do_tma": "do_int",
-            "dv1": "dv1",
-            "num_heads": "num_heads",
-            "num_pairs": "num_pairs",
-            "scale": "scale",
-            "vnew_tma": "v_new",
-        },
-        "select_rule": {
-            "kind": "all_of",
-            "rules": [
-                {"kind": "heads_at_most", "max": 8},
-                {"kind": "chains_above", "min": 4},
-                {"kind": "path_in", "paths": ["replay"]},
-            ],
-        },
-        "stage": "dav",
-        "variant": "replay",
     },
     "dav_serial": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -2614,14 +2427,14 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "dhu",
         "variant": "v1_wt_replay",
     },
-    "dhu_v3": {
+    "dhu_v3_f": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kg_tma"],
             ["buffer", "qg_tma"],
             ["buffer", "w_tma"],
             ["buffer", "do_tma"],
-            ["buffer", "dv1"],
+            ["buffer", "aqk_tma"],
             ["buffer", "gk"],
             ["buffer", "dh_out"],
             ["buffer", "dv2"],
@@ -2643,7 +2456,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [1, 1]},
-        "kernel_symbol": "kernel_cake_kda_train_1b46d9b792ba3d50ee57",
+        "kernel_symbol": "kernel_cake_kda_train_74e19f83f8d97e669d46",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -2651,14 +2464,14 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_1b46d9b792ba3d50ee57",
+        "library": "cake_kda_train_74e19f83f8d97e669d46",
         "logical": {
+            "aqk_tma": "aqk_src",
             "chunk_bos": "chunk_bos",
             "chunk_len": "chunk_len",
             "dh_out": "dh",
             "dht": "dhseg",
             "do_tma": "dout",
-            "dv1": "dv1",
             "dv2": "dv2",
             "gk": "gk",
             "ht_out": "dseg",
@@ -2677,8 +2490,13 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "all_of",
             "rules": [
-                {"kind": "heads_at_most", "max": 8},
-                {"kind": "chains_above", "min": 4},
+                {
+                    "kind": "all_of",
+                    "rules": [
+                        {"kind": "heads_at_most", "max": 8},
+                        {"kind": "chains_above", "min": 4},
+                    ],
+                },
                 {
                     "kind": "any_of",
                     "rules": [
@@ -2692,19 +2510,32 @@ MODULES: dict[str, dict[str, Any]] = {
                         },
                     ],
                 },
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "path_in", "paths": ["light", "tape"]},
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "path_in", "paths": ["light_states"]},
+                                {"kind": "chains_above", "min": 32},
+                            ],
+                        },
+                    ],
+                },
             ],
         },
         "stage": "dhu",
-        "variant": "v3",
+        "variant": "v3_f",
     },
-    "dhu_v3r": {
+    "dhu_v3_f_wt": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kg_tma"],
             ["buffer", "qg_tma"],
             ["buffer", "w_tma"],
             ["buffer", "do_tma"],
-            ["buffer", "dv1"],
+            ["buffer", "aqk_tma"],
             ["buffer", "gk"],
             ["buffer", "dh_out"],
             ["buffer", "dv2"],
@@ -2726,7 +2557,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [1, 1]},
-        "kernel_symbol": "kernel_cake_kda_train_52b098178540521cc4d4",
+        "kernel_symbol": "kernel_cake_kda_train_157990bf8c73b3dbc4fe",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -2734,14 +2565,104 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_52b098178540521cc4d4",
+        "library": "cake_kda_train_157990bf8c73b3dbc4fe",
         "logical": {
+            "aqk_tma": "aqk_src",
             "chunk_bos": "chunk_bos",
             "chunk_len": "chunk_len",
             "dh_out": "dh",
             "dht": "dhseg",
             "do_tma": "dout",
-            "dv1": "dv1",
+            "dv2": "dv2",
+            "gk": "gk",
+            "ht_out": "dseg",
+            "kg_tma": "kg",
+            "num_heads": "num_heads",
+            "num_seqs": "num_segments",
+            "qg_tma": "qg",
+            "scale": "scale",
+            "segments": "seg_arg",
+            "seq_chunk_start": "seg_table",
+            "use_dht": "use_dht",
+            "w_tma": "w_tk",
+            "write_ht": "write_ht",
+            "write_tapes": "write_tapes",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {
+                    "kind": "all_of",
+                    "rules": [
+                        {"kind": "heads_at_most", "max": 8},
+                        {"kind": "chains_above", "min": 4},
+                    ],
+                },
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "walk_ctas_below", "waves": 4},
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "heads_at_most", "max": 4},
+                                {"kind": "walk_ctas_at_most", "waves": 4},
+                            ],
+                        },
+                    ],
+                },
+                {"kind": "path_in", "paths": ["light_states"]},
+                {"kind": "chains_at_most", "max": 32},
+            ],
+        },
+        "stage": "dhu",
+        "variant": "v3_f_wt",
+    },
+    "dhu_v3_f_replay": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "kg_tma"],
+            ["buffer", "qg_tma"],
+            ["buffer", "w_tma"],
+            ["buffer", "do_tma"],
+            ["buffer", "aqk_tma"],
+            ["buffer", "gk"],
+            ["buffer", "dh_out"],
+            ["buffer", "dv2"],
+            ["parameter", "num_heads"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_seqs"],
+            ["parameter", "segments"],
+            ["parameter", "scale"],
+            ["buffer", "dht"],
+            ["buffer", "ht_out"],
+            ["parameter", "use_dht"],
+            ["parameter", "write_tapes"],
+            ["parameter", "write_ht"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "segments_heads", "passes": [1, 1]},
+        "kernel_symbol": "kernel_cake_kda_train_251cc1717dfc8e3ba24e",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 115712,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_251cc1717dfc8e3ba24e",
+        "logical": {
+            "aqk_tma": "aqk_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dh_out": "dh",
+            "dht": "dhseg",
+            "do_tma": "do_int",
             "dv2": "dv2",
             "gk": "gk",
             "ht_out": "dseg",
@@ -2760,8 +2681,102 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "all_of",
             "rules": [
-                {"kind": "heads_at_most", "max": 8},
-                {"kind": "chains_above", "min": 4},
+                {
+                    "kind": "all_of",
+                    "rules": [
+                        {"kind": "heads_at_most", "max": 8},
+                        {"kind": "chains_above", "min": 4},
+                    ],
+                },
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "walk_ctas_below", "waves": 4},
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "heads_at_most", "max": 4},
+                                {"kind": "walk_ctas_at_most", "waves": 4},
+                            ],
+                        },
+                    ],
+                },
+                {"kind": "path_in", "paths": ["replay"]},
+            ],
+        },
+        "stage": "dhu",
+        "variant": "v3_f_replay",
+    },
+    "dhu_v3r_f": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "kg_tma"],
+            ["buffer", "qg_tma"],
+            ["buffer", "w_tma"],
+            ["buffer", "do_tma"],
+            ["buffer", "aqk_tma"],
+            ["buffer", "gk"],
+            ["buffer", "dh_out"],
+            ["buffer", "dv2"],
+            ["parameter", "num_heads"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_seqs"],
+            ["parameter", "segments"],
+            ["parameter", "scale"],
+            ["buffer", "dht"],
+            ["buffer", "ht_out"],
+            ["parameter", "use_dht"],
+            ["parameter", "write_tapes"],
+            ["parameter", "write_ht"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "segments_heads", "passes": [1, 1]},
+        "kernel_symbol": "kernel_cake_kda_train_243fb0b23aea1b296ab6",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 115712,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_243fb0b23aea1b296ab6",
+        "logical": {
+            "aqk_tma": "aqk_src",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dh_out": "dh",
+            "dht": "dhseg",
+            "do_tma": "dout",
+            "dv2": "dv2",
+            "gk": "gk",
+            "ht_out": "dseg",
+            "kg_tma": "kg",
+            "num_heads": "num_heads",
+            "num_seqs": "num_segments",
+            "qg_tma": "qg",
+            "scale": "scale",
+            "segments": "seg_arg",
+            "seq_chunk_start": "seg_table",
+            "use_dht": "use_dht",
+            "w_tma": "w",
+            "write_ht": "write_ht",
+            "write_tapes": "write_tapes",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {
+                    "kind": "all_of",
+                    "rules": [
+                        {"kind": "heads_at_most", "max": 8},
+                        {"kind": "chains_above", "min": 4},
+                    ],
+                },
                 {
                     "kind": "any_of",
                     "rules": [
@@ -2775,10 +2790,202 @@ MODULES: dict[str, dict[str, Any]] = {
                         },
                     ],
                 },
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "path_in", "paths": ["light", "tape"]},
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "path_in", "paths": ["light_states"]},
+                                {"kind": "chains_above", "min": 32},
+                            ],
+                        },
+                    ],
+                },
             ],
         },
         "stage": "dhu",
-        "variant": "v3r",
+        "variant": "v3r_f",
+    },
+    "dhu_v3r_f_wt": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "kg_tma"],
+            ["buffer", "qg_tma"],
+            ["buffer", "w_tma"],
+            ["buffer", "do_tma"],
+            ["buffer", "aqk_tma"],
+            ["buffer", "gk"],
+            ["buffer", "dh_out"],
+            ["buffer", "dv2"],
+            ["parameter", "num_heads"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_seqs"],
+            ["parameter", "segments"],
+            ["parameter", "scale"],
+            ["buffer", "dht"],
+            ["buffer", "ht_out"],
+            ["parameter", "use_dht"],
+            ["parameter", "write_tapes"],
+            ["parameter", "write_ht"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "segments_heads", "passes": [1, 1]},
+        "kernel_symbol": "kernel_cake_kda_train_dec885b973bd44f88416",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 115712,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_dec885b973bd44f88416",
+        "logical": {
+            "aqk_tma": "aqk_src",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dh_out": "dh",
+            "dht": "dhseg",
+            "do_tma": "dout",
+            "dv2": "dv2",
+            "gk": "gk",
+            "ht_out": "dseg",
+            "kg_tma": "kg",
+            "num_heads": "num_heads",
+            "num_seqs": "num_segments",
+            "qg_tma": "qg",
+            "scale": "scale",
+            "segments": "seg_arg",
+            "seq_chunk_start": "seg_table",
+            "use_dht": "use_dht",
+            "w_tma": "w_tk",
+            "write_ht": "write_ht",
+            "write_tapes": "write_tapes",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {
+                    "kind": "all_of",
+                    "rules": [
+                        {"kind": "heads_at_most", "max": 8},
+                        {"kind": "chains_above", "min": 4},
+                    ],
+                },
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "walk_ctas_above", "waves": 4},
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "heads_above", "min": 4},
+                                {"kind": "walk_ctas_at_least", "waves": 4},
+                            ],
+                        },
+                    ],
+                },
+                {"kind": "path_in", "paths": ["light_states"]},
+                {"kind": "chains_at_most", "max": 32},
+            ],
+        },
+        "stage": "dhu",
+        "variant": "v3r_f_wt",
+    },
+    "dhu_v3r_f_replay": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "kg_tma"],
+            ["buffer", "qg_tma"],
+            ["buffer", "w_tma"],
+            ["buffer", "do_tma"],
+            ["buffer", "aqk_tma"],
+            ["buffer", "gk"],
+            ["buffer", "dh_out"],
+            ["buffer", "dv2"],
+            ["parameter", "num_heads"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_seqs"],
+            ["parameter", "segments"],
+            ["parameter", "scale"],
+            ["buffer", "dht"],
+            ["buffer", "ht_out"],
+            ["parameter", "use_dht"],
+            ["parameter", "write_tapes"],
+            ["parameter", "write_ht"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "segments_heads", "passes": [1, 1]},
+        "kernel_symbol": "kernel_cake_kda_train_909a0aa57efb3f353972",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 115712,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_909a0aa57efb3f353972",
+        "logical": {
+            "aqk_tma": "aqk_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dh_out": "dh",
+            "dht": "dhseg",
+            "do_tma": "do_int",
+            "dv2": "dv2",
+            "gk": "gk",
+            "ht_out": "dseg",
+            "kg_tma": "kg",
+            "num_heads": "num_heads",
+            "num_seqs": "num_segments",
+            "qg_tma": "qg",
+            "scale": "scale",
+            "segments": "seg_arg",
+            "seq_chunk_start": "seg_table",
+            "use_dht": "use_dht",
+            "w_tma": "w",
+            "write_ht": "write_ht",
+            "write_tapes": "write_tapes",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {
+                    "kind": "all_of",
+                    "rules": [
+                        {"kind": "heads_at_most", "max": 8},
+                        {"kind": "chains_above", "min": 4},
+                    ],
+                },
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "walk_ctas_above", "waves": 4},
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "heads_above", "min": 4},
+                                {"kind": "walk_ctas_at_least", "waves": 4},
+                            ],
+                        },
+                    ],
+                },
+                {"kind": "path_in", "paths": ["replay"]},
+            ],
+        },
+        "stage": "dhu",
+        "variant": "v3r_f_replay",
     },
     "dhu_v3s_f": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -3080,7 +3287,25 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "all_of",
             "rules": [
                 {"kind": "path_in", "paths": ["light", "light_states", "tape"]},
-                {"kind": "heads_below", "max": 16},
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "heads_above", "min": 8},
+                                {"kind": "heads_below", "max": 16},
+                            ],
+                        },
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "heads_at_most", "max": 8},
+                                {"kind": "chains_at_most", "max": 4},
+                            ],
+                        },
+                    ],
+                },
             ],
         },
         "stage": "dqkg",
@@ -3158,7 +3383,25 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "all_of",
             "rules": [
                 {"kind": "path_in", "paths": ["replay"]},
-                {"kind": "heads_below", "max": 16},
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "heads_above", "min": 8},
+                                {"kind": "heads_below", "max": 16},
+                            ],
+                        },
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "heads_at_most", "max": 8},
+                                {"kind": "chains_at_most", "max": 4},
+                            ],
+                        },
+                    ],
+                },
             ],
         },
         "stage": "dqkg",
@@ -3197,15 +3440,15 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "sm_bounded", "ctas_per_sm": 1},
-        "kernel_symbol": "kernel_cake_kda_train_3ec94087fe9dc1463d59",
+        "kernel_symbol": "kernel_cake_kda_train_cfa2684db4d92e37448d",
         "launch": {
-            "block": (576, 1, 1),
+            "block": (320, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 224384,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_3ec94087fe9dc1463d59",
+        "library": "cake_kda_train_cfa2684db4d92e37448d",
         "logical": {
             "akk_tma": "akk_src",
             "beta": "beta_int",
@@ -3236,7 +3479,25 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "all_of",
             "rules": [
                 {"kind": "path_in", "paths": ["light", "light_states", "tape"]},
-                {"kind": "heads_at_least", "min": 16},
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "heads_above", "min": 8},
+                                {"kind": "heads_at_least", "min": 16},
+                            ],
+                        },
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "heads_at_most", "max": 8},
+                                {"kind": "chains_above", "min": 4},
+                            ],
+                        },
+                    ],
+                },
             ],
         },
         "stage": "dqkg",
@@ -3275,15 +3536,15 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "sm_bounded", "ctas_per_sm": 1},
-        "kernel_symbol": "kernel_cake_kda_train_241cc4e01027931aeab3",
+        "kernel_symbol": "kernel_cake_kda_train_d098004ffe4a23d58ff4",
         "launch": {
-            "block": (576, 1, 1),
+            "block": (320, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 224384,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_241cc4e01027931aeab3",
+        "library": "cake_kda_train_d098004ffe4a23d58ff4",
         "logical": {
             "akk_tma": "akk_int",
             "beta": "beta_int",
@@ -3314,7 +3575,25 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "all_of",
             "rules": [
                 {"kind": "path_in", "paths": ["replay"]},
-                {"kind": "heads_at_least", "min": 16},
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "heads_above", "min": 8},
+                                {"kind": "heads_at_least", "min": 16},
+                            ],
+                        },
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "heads_at_most", "max": 8},
+                                {"kind": "chains_above", "min": 4},
+                            ],
+                        },
+                    ],
+                },
             ],
         },
         "stage": "dqkg",
@@ -3351,7 +3630,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_train_cc51220bb4a9a37152ad",
+        "kernel_symbol": "kernel_cake_kda_train_54786ffd01bd9b6bb416",
         "launch": {
             "block": (288, 1, 1),
             "cluster": (1, 1, 1),
@@ -3359,7 +3638,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115200,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_cc51220bb4a9a37152ad",
+        "library": "cake_kda_train_54786ffd01bd9b6bb416",
         "logical": {
             "beta": "beta_int",
             "chunk_bos": "chunk_bos",

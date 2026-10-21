@@ -246,8 +246,8 @@ kernel_cake_kda_train_98e6ba1f97af72fa2e32(float* __restrict__ g, __nv_bfloat16*
         float eg[4];
         #pragma unroll
         for (int e_8 = 0; e_8 < 4; e_8++) {
-            float _exp2_0 = approx_exp2(gkt[e_8]);
-            eg[e_8] = _exp2_0;
+            float _exp2_3 = approx_exp2(gkt[e_8]);
+            eg[e_8] = _exp2_3;
         }
         float kb[4];
         #pragma unroll
@@ -256,9 +256,7 @@ kernel_cake_kda_train_98e6ba1f97af72fa2e32(float* __restrict__ g, __nv_bfloat16*
             if (t_u_2 < clen) {
                 k_e = kv[e_9];
             }
-            __nv_bfloat16 _cvt_bf16_0 = (__nv_bfloat16)(k_e * bt);
-            float _cvt_f32_0 = (float)_cvt_bf16_0;
-            kb[e_9] = _cvt_f32_0 * eg[e_9];
+            kb[e_9] = (float)(__nv_bfloat16)(k_e * bt) * eg[e_9];
         }
         {
             uint2 _pk2;
@@ -274,8 +272,8 @@ kernel_cake_kda_train_98e6ba1f97af72fa2e32(float* __restrict__ g, __nv_bfloat16*
             if (t_u_2 < clen) {
                 k_e_1 = kv[e_10];
             }
-            float _exp2_1 = approx_exp2(gk_n[e_10] - gkt[e_10]);
-            kg[e_10] = k_e_1 * _exp2_1;
+            float _exp2_4 = approx_exp2(gk_n[e_10] - gkt[e_10]);
+            kg[e_10] = k_e_1 * _exp2_4;
         }
         {
             uint2 _pk2;
@@ -333,4 +331,3 @@ kernel_cake_kda_train_98e6ba1f97af72fa2e32(float* __restrict__ g, __nv_bfloat16*
 }
 
 } // extern "C"
-

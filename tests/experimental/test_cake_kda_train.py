@@ -53,7 +53,6 @@ ATOL = RTOL = 1e-2
 OUTPUT_NAMES = ("out",) + GRAD_NAMES
 
 # Dispatch constants the registry rules must reproduce (the kernels' validated regimes).
-FWD_BULK_MIN_CTAS = 256
 TABLE_V2_MAX_DOCS = 256  # the chunk-parallel layout table serves up to 256 documents
 RECUR_CTAS_PER_SM = (
     4  # the 32-column serial forms fit when num_docs * H * 4 <= 4 * sm_count
@@ -71,6 +70,9 @@ OV1_MAX_SEGMENT_HEADS = 8192
 PDL_RECORDS = ("fwdh_p3_o_ov", "fwdh_p3_o_ov_id")
 DAVQ_MIN_H = 16  # the fused gradient hosts dAqk on the serial route from 16 heads
 FEW_CHAINS = 4  # at most four (document, head) chains: the few-chain segmented rows
+# the saved-state pass 2 forms the WY representation itself (no WY launch) up to 32 (document, head) chains; above
+# four chains the segmented adjoint recurrence accumulates dv and the fused gradient hosts dAqk (no dav launch)
+FUSED_P3_MAX_CHAINS = 32
 DHU_TMA_WAVES = (
     4  # the segmented adjoint recurrence stores its tapes by TMA below four CTAs per SM
 )
@@ -102,7 +104,6 @@ PATH_STAGES = {
     "fwd": (
         "table",
         "seg_table",
-        "fwd_prep",
         "fwd_intra",
         "wy_fwd",
         "fwdh",
@@ -221,8 +222,12 @@ GRID_KINDS = (
 # The records of the segmented adjoint recurrence launch twice per stage (the carry between the passes); the
 # forward recurrence's passes are two stages (fwdh, fwdh_p3).
 TWO_PASS_RECORDS = (
-    "dhu_v3",
-    "dhu_v3r",
+    "dhu_v3_f",
+    "dhu_v3_f_wt",
+    "dhu_v3_f_replay",
+    "dhu_v3r_f",
+    "dhu_v3r_f_wt",
+    "dhu_v3r_f_replay",
     "dhu_v3s_f",
     "dhu_v3s_f_wt",
     "dhu_v3s_f_replay",
@@ -364,16 +369,18 @@ def _expected_records(
 ) -> dict[str, str | None]:
     """The record of every stage of ``path`` on (``nc_pad``, ``n``, ``h``, ``sm``, ``arch``): the dispatch of the
     kernels' composition, spelled independently of the registry's rules."""
-    ctas = nc_pad * h
     seg = h <= SEG_MAX_H
     _route, _p, nseg = _expected_segments(n, h, sm)
     v2 = n * h * RECUR_SLICES["v2"] <= sm * RECUR_CTAS_PER_SM
     few = n * h <= FEW_CHAINS
+    fused_p3 = seg and n * h <= FUSED_P3_MAX_CHAINS
     fused_fwd = (
         not seg and h >= FUSED_FWD_MIN_H and (arch != "sm_107a" or h <= FUSED_FWD_MIN_H)
     )
     fused_bwd = not seg and not v2 and h >= FUSED_BWD_MIN_H
-    davq = not seg and h >= DAVQ_MIN_H
+    # the fused gradient hosts dAqk on the serial rows from 16 heads and on the segmented rows above four chains
+    # (whose adjoint recurrence accumulates dv): no dav launch there
+    davq = (h >= DAVQ_MIN_H) if not seg else (not few)
     replay = path == "replay"
     walk = nseg * h
     tma = walk < DHU_TMA_WAVES * sm or (h <= 4 and walk <= DHU_TMA_WAVES * sm)
@@ -387,7 +394,6 @@ def _expected_records(
     out: dict[str, str | None] = {
         "table": "table_v2" if n <= TABLE_V2_MAX_DOCS else "table",
         "seg_table": "seg_table" if seg else None,
-        "fwd_prep": "fwd_prep_bulk" if ctas >= FWD_BULK_MIN_CTAS else "fwd_prep_split",
         "fwd_intra": "fwd_intra",
         "wy_fwd": None if fused_fwd else "wy_fwd",
         "seg_carry": None if not seg else ("seg_carry_ov" if ov1 else "seg_carry"),
@@ -399,7 +405,7 @@ def _expected_records(
     elif path == "light":
         out["wy"] = None if fused_bwd else "wy_bwd"
     elif path == "light_states":
-        out["wy"] = None if few else "wy_bwd"
+        out["wy"] = None if fused_p3 else "wy_bwd"
     elif replay:
         out["wy"] = None if fused_bwd else "wy_bwd_replay"
     else:
@@ -434,14 +440,12 @@ def _expected_records(
         else:
             out["fwdh_p3"] = "fwdh_p3_o"
     elif path == "light_states":
-        out["fwdh_p3"] = "fwdh_p3_wy" if few else "fwdh_p3"
+        out["fwdh_p3"] = "fwdh_p3_wy" if fused_p3 else "fwdh_p3"
     else:
         out["fwdh_p3"] = "fwdh_p3"
     out["bwd_prep"] = "bwd_prep_g8_replay" if replay else "bwd_prep_g8"
     if davq:
         out["dav"] = None
-    elif seg and not few:
-        out["dav"] = "dav_replay" if replay else "dav"
     else:  # the serial route below 16 heads and the few-chain segmented rows: dAqk alone
         out["dav"] = "dav_serial_replay" if replay else "dav_serial"
     if seg and few:
@@ -450,7 +454,12 @@ def _expected_records(
         else:
             out["dhu"] = "dhu_v3s_f_wt" if path == "light_states" else "dhu_v3s_f"
     elif seg:
-        out["dhu"] = "dhu_v3" if tma else "dhu_v3r"
+        # the dv-accumulating adjoint in the row's tape build; its w^T form behind the fused saved-state pass 2
+        base = "dhu_v3_f" if tma else "dhu_v3r_f"
+        if replay:
+            out["dhu"] = base + "_replay"
+        else:
+            out["dhu"] = base + ("_wt" if path == "light_states" and fused_p3 else "")
     elif v2:
         out["dhu"] = "dhu_v2t_replay" if replay else "dhu_v2t"
     elif fused_bwd and path in ("light", "replay"):
@@ -469,10 +478,7 @@ def _expected_grid(
         return (1, 1, 1)
     if name == "table_v2":
         return (max(1, -(-nc_pad // 256)), 1, 1)
-    if name == "fwd_prep_split":
-        return (2 * nc_pad, h, 1)
     if name in (
-        "fwd_prep_bulk",
         "fwd_intra",
         "bwd_prep_g8",
         "bwd_prep_g8_replay",
@@ -486,10 +492,10 @@ def _expected_grid(
         return (2 * nseg * h, 1, 1)
     if name.startswith("fwdh_p3"):
         return (nseg * h, 1, 1)
-    if name in ("dhu_v3", "dhu_v3r"):
-        return (nseg * h, 1, 1)
     if name.startswith("dhu_v3s_f"):
         return (2 * nseg * h, 1, 1)
+    if name.startswith(("dhu_v3_f", "dhu_v3r_f")):
+        return (nseg * h, 1, 1)
     if name.startswith("seg_carry"):  # two CTAs per (document, head) chain
         return (2 * n * h, 1, 1)
     if name.startswith("fwdh_") or name.startswith("dhu_"):
@@ -592,7 +598,7 @@ def test_segmented_grids_need_segments_and_a_known_launch() -> None:
         )
     with pytest.raises(ValueError, match="launch 2 of 2"):
         cake_jit.launch_grid(
-            "dhu_v3",
+            "dhu_v3_f",
             num_chunks_pad=4,
             num_seqs=1,
             num_heads=4,
@@ -651,8 +657,6 @@ def test_pair_kernels_walk_the_pairs_on_a_persistent_grid() -> None:
         "wy_fwd",
         "wy_bwd",
         "wy_bwd_replay",
-        "dav",
-        "dav_replay",
         "dav_serial",
         "dav_serial_replay",
     ):
@@ -706,8 +710,9 @@ def test_the_saved_set_paths_read_the_token_rows_and_the_replay_the_internal_row
     pairs = {
         "wy_bwd": "wy_bwd_replay",
         "fwdh_wy_bwd": "fwdh_wy_bwd_replay",
-        "dav": "dav_replay",
         "dav_serial": "dav_serial_replay",
+        "dhu_v3_f": "dhu_v3_f_replay",
+        "dhu_v3r_f": "dhu_v3r_f_replay",
         "dhu_v2t": "dhu_v2t_replay",
         "dhu_v1": "dhu_v1_replay",
         "dhu_v1_wt": "dhu_v1_wt_replay",
@@ -726,9 +731,9 @@ def test_the_saved_set_paths_read_the_token_rows_and_the_replay_the_internal_row
             cake_jit.MODULES[saved_name]["library"]
             != cake_jit.MODULES[replay_name]["library"]
         )
-    # the segmented adjoint recurrences of the many-chain rows read dout on every path (one build)
-    for name in ("dhu_v3", "dhu_v3r"):
-        assert "dout" in cake_jit.MODULES[name]["logical"].values()
+    # the segmented adjoint recurrences of the many-chain rows read dout on the saved-set paths (their w^T forms too)
+    for name in ("dhu_v3_f", "dhu_v3_f_wt", "dhu_v3r_f", "dhu_v3r_f_wt"):
+        assert "dout" in cake_jit.MODULES[name]["logical"].values(), name
     # the transposed w tile: the serial fused recompute writes w_t and its adjoint reads it, the segmented
     # saved-state pass 2 writes w_tk and its adjoint reads it
     assert cake_jit.MODULES["fwdh_wy_bwd"]["logical"]["w_out"] == "w_t"
@@ -753,9 +758,11 @@ def test_the_forward_wy_forms_the_gated_values_from_the_token_rows() -> None:
         fwd["logical"]["akk_tma"] == "akk_int"
         and bwd["logical"]["akk_tma"] == "akk_src"
     )
-    for name in ("fwd_prep_bulk", "fwd_prep_split"):
-        logical = set(cake_jit.MODULES[name]["logical"].values())
-        assert not logical & {"v", "vb"}, name
+    # the forward intra program writes the prep's outputs itself (no prep launch) and reads no v either
+    intra = set(cake_jit.MODULES["fwd_intra"]["logical"].values())
+    assert not intra & {"v", "vb"}
+    assert {"gk", "kb", "kg", "qg", "v_new", "write_prep"} <= intra
+    assert "fwd_prep" not in cake_jit.STAGES
     assert "wy_fwd" in cake_jit.STAGES_FWD and "wy_fwd" not in cake_jit.STAGES_BWD
     assert "wy" in cake_jit.STAGES_BWD and "wy" not in cake_jit.STAGES_FWD
     for mode, slots in cake_backend.SLOTS.items():
@@ -798,7 +805,8 @@ def test_the_serial_walk_orders_the_documents_and_the_carry_splits_the_chain() -
         "fwdh_p3",
         "fwdh_p3_o",
         "fwdh_p3_wy",
-        "dhu_v3",
+        "dhu_v3_f",
+        "dhu_v3r_f_wt",
         "dhu_v3s_f",
     ):
         logical = cake_jit.MODULES[name]["logical"]
@@ -890,22 +898,23 @@ def test_plan_follows_the_chunk_bound_formulas() -> None:
 def test_launch_counts_of_the_paths() -> None:
     # 148 SMs.  Serial rows: 16 heads in the 32-column form (no dav: the fused gradient hosts dAqk), 64 heads in
     # the 64-column form (the fused recompute: no WY launch on the light and replay paths).  Segmented rows: four
-    # documents at 2 heads (eight chains), one document at 4 heads (four chains: the fused saved-state pass 2).
+    # documents at 2 heads (eight chains: the dv-accumulating adjoint, no dav launch, the fused saved-state pass 2),
+    # one document at 4 heads (four chains: dav_serial beside the fused pair).  The forward has no prep launch.
     counts = {}
     for n, h in ((1, 16), (4, 64), (4, 2), (1, 4)):
         p = cake_backend.plan(4096, n, h, 148)
         counts[(n, h)] = {path: p.launch_count(path) for path in p.records}
-    assert counts[(1, 16)] == {"fwd": 5, "light": 7, "tape": 6, "replay": 9}
-    assert counts[(4, 64)] == {"fwd": 4, "light": 6, "tape": 6, "replay": 8}
+    assert counts[(1, 16)] == {"fwd": 4, "light": 7, "tape": 6, "replay": 9}
+    assert counts[(4, 64)] == {"fwd": 3, "light": 6, "tape": 6, "replay": 8}
     assert counts[(4, 2)] == {
-        "fwd": 8,
-        "light": 12,
-        "light_states": 10,
-        "tape": 9,
-        "replay": 15,
+        "fwd": 7,
+        "light": 11,
+        "light_states": 8,
+        "tape": 8,
+        "replay": 14,
     }
     assert counts[(1, 4)] == {
-        "fwd": 8,
+        "fwd": 7,
         "light": 12,
         "light_states": 9,
         "tape": 9,
@@ -913,15 +922,15 @@ def test_launch_counts_of_the_paths() -> None:
     }
     # a saved set whose tables the caller dropped adds the table launches to the saved-set paths
     p = cake_backend.plan(4096, 4, 2, 148)
-    assert p.launch_count("light", tables=False) == 14
-    assert p.launch_count("tape", tables=False) == 11
-    assert p.launch_count("replay") == p.launch_count("replay", tables=False) == 15
+    assert p.launch_count("light", tables=False) == 13
+    assert p.launch_count("tape", tables=False) == 10
+    assert p.launch_count("replay") == p.launch_count("replay", tables=False) == 14
     # the backward from this plan's own light set: the states-saved path above the size rule
-    assert p.launch_count("bwd") == p.launch_count("light") == 12
+    assert p.launch_count("bwd") == p.launch_count("light") == 11
     tall = cake_backend.plan(384 * p.NSEG, 4, 2, 148)
     assert tall.light_path == "light_states" and tall.NSEG == p.NSEG
     assert (
-        tall.launch_count("bwd") == 10 and tall.launch_count("bwd", tables=False) == 12
+        tall.launch_count("bwd") == 8 and tall.launch_count("bwd", tables=False) == 10
     )
     with pytest.raises(ValueError, match="path must be one of"):
         p.launch_count("sideways")
@@ -1138,7 +1147,8 @@ def test_run_module_names_a_missing_logical_argument() -> None:
 def _expected_launches(p, path: str, *, saved_tables: bool = True) -> list[str]:
     """The launch order of ``path`` on plan ``p`` (the records by name), spelled from the composition's rules:
     the tables (always on the forward and the replay; on a saved-set path only when the set carries none,
-    ``saved_tables=False``), the prep, the intra program (forward / replay), WY where
+    ``saved_tables=False``), the intra program (the forward: the prep folded in), the backward prep (and the
+    intra program on the replay), WY where
     a fused program does not form the representation, the recurrence (the segmented passes around the carry),
     dA / dv where the fused gradient does not host it, the adjoint recurrence, the fused gradient, GLM intra and
     the gate epilogue."""
@@ -1149,7 +1159,7 @@ def _expected_launches(p, path: str, *, saved_tables: bool = True) -> list[str]:
         if seg:
             seq.append("seg_table")
     if path == "fwd":
-        seq += [p.record("fwd_prep", path), "fwd_intra"]
+        seq.append("fwd_intra")
         if p.dispatched("wy_fwd", path):
             seq.append("wy_fwd")
         seq.append(p.record("fwdh", path))
@@ -1696,7 +1706,7 @@ def test_light_saved_set_carries_the_segment_states_above_the_size_rule(
         out, saved = cake_backend.chunk_kda_fwd(q, k, v, g, beta, cu, workspace=ws)
         # saving the states adds no launch
         assert launched == _expected_launches(p, "fwd")
-        assert len(launched) == p.launch_count("fwd") == 8
+        assert len(launched) == p.launch_count("fwd") == 7
         assert saved.version == cake_backend.SAVED_VERSION
         tables = p.table_words() * 4
         expected_bytes = 256 * S * heads + tables + (3 * block if saves else 0)

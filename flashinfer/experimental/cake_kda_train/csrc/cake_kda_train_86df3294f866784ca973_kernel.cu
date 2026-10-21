@@ -246,8 +246,8 @@ kernel_cake_kda_train_86df3294f866784ca973(float* __restrict__ g, __nv_bfloat16*
         float eg[4];
         #pragma unroll
         for (int e_8 = 0; e_8 < 4; e_8++) {
-            float _exp2_0 = approx_exp2(gkt[e_8]);
-            eg[e_8] = _exp2_0;
+            float _exp2_3 = approx_exp2(gkt[e_8]);
+            eg[e_8] = _exp2_3;
         }
         float kb[4];
         #pragma unroll
@@ -256,9 +256,7 @@ kernel_cake_kda_train_86df3294f866784ca973(float* __restrict__ g, __nv_bfloat16*
             if (t_u_2 < clen) {
                 k_e = kv[e_9];
             }
-            __nv_bfloat16 _cvt_bf16_0 = (__nv_bfloat16)(k_e * bt);
-            float _cvt_f32_0 = (float)_cvt_bf16_0;
-            kb[e_9] = _cvt_f32_0 * eg[e_9];
+            kb[e_9] = (float)(__nv_bfloat16)(k_e * bt) * eg[e_9];
         }
         {
             uint2 _pk2;
@@ -274,8 +272,8 @@ kernel_cake_kda_train_86df3294f866784ca973(float* __restrict__ g, __nv_bfloat16*
             if (t_u_2 < clen) {
                 k_e_1 = kv[e_10];
             }
-            float _exp2_1 = approx_exp2(gk_n[e_10] - gkt[e_10]);
-            kg[e_10] = k_e_1 * _exp2_1;
+            float _exp2_4 = approx_exp2(gk_n[e_10] - gkt[e_10]);
+            kg[e_10] = k_e_1 * _exp2_4;
         }
         {
             uint2 _pk2;
@@ -312,10 +310,10 @@ kernel_cake_kda_train_86df3294f866784ca973(float* __restrict__ g, __nv_bfloat16*
     }
     long long eidx_d = ebase + (long long)(t_c_2 * rs);
     {
-        uint2 _vld_3;
-        _vld_3 = *reinterpret_cast<const uint2*>(do_ + eidx_d);
-        uint2* _vdst_3 = reinterpret_cast<uint2*>(&dwa[0]);
-        *_vdst_3 = _vld_3;
+        uint2 _vld_5;
+        _vld_5 = *reinterpret_cast<const uint2*>(do_ + eidx_d);
+        uint2* _vdst_5 = reinterpret_cast<uint2*>(&dwa[0]);
+        *_vdst_5 = _vld_5;
     }
     int t_u_2_1 = warp_0 * 8 + 1;
     int t_c_3 = t_u_2_1;
@@ -324,10 +322,10 @@ kernel_cake_kda_train_86df3294f866784ca973(float* __restrict__ g, __nv_bfloat16*
     }
     long long eidx_d_4 = ebase + (long long)(t_c_3 * rs);
     {
-        uint2 _vld_4;
-        _vld_4 = *reinterpret_cast<const uint2*>(do_ + eidx_d_4);
-        uint2* _vdst_4 = reinterpret_cast<uint2*>(&dwa[2]);
-        *_vdst_4 = _vld_4;
+        uint2 _vld_6;
+        _vld_6 = *reinterpret_cast<const uint2*>(do_ + eidx_d_4);
+        uint2* _vdst_6 = reinterpret_cast<uint2*>(&dwa[2]);
+        *_vdst_6 = _vld_6;
     }
     int t_u_5 = warp_0 * 8 + 2;
     int t_c_6 = t_u_5;
@@ -336,10 +334,10 @@ kernel_cake_kda_train_86df3294f866784ca973(float* __restrict__ g, __nv_bfloat16*
     }
     long long eidx_d_7 = ebase + (long long)(t_c_6 * rs);
     {
-        uint2 _vld_5;
-        _vld_5 = *reinterpret_cast<const uint2*>(do_ + eidx_d_7);
-        uint2* _vdst_5 = reinterpret_cast<uint2*>(&dwa[4]);
-        *_vdst_5 = _vld_5;
+        uint2 _vld_7;
+        _vld_7 = *reinterpret_cast<const uint2*>(do_ + eidx_d_7);
+        uint2* _vdst_7 = reinterpret_cast<uint2*>(&dwa[4]);
+        *_vdst_7 = _vld_7;
     }
     int t_u_8 = warp_0 * 8 + 3;
     int t_c_9 = t_u_8;
@@ -348,10 +346,10 @@ kernel_cake_kda_train_86df3294f866784ca973(float* __restrict__ g, __nv_bfloat16*
     }
     long long eidx_d_10 = ebase + (long long)(t_c_9 * rs);
     {
-        uint2 _vld_6;
-        _vld_6 = *reinterpret_cast<const uint2*>(do_ + eidx_d_10);
-        uint2* _vdst_6 = reinterpret_cast<uint2*>(&dwa[6]);
-        *_vdst_6 = _vld_6;
+        uint2 _vld_8;
+        _vld_8 = *reinterpret_cast<const uint2*>(do_ + eidx_d_10);
+        uint2* _vdst_8 = reinterpret_cast<uint2*>(&dwa[6]);
+        *_vdst_8 = _vld_8;
     }
     int t_u_11 = warp_0 * 8 + 4;
     int t_c_12 = t_u_11;
@@ -360,10 +358,10 @@ kernel_cake_kda_train_86df3294f866784ca973(float* __restrict__ g, __nv_bfloat16*
     }
     long long eidx_d_13 = ebase + (long long)(t_c_12 * rs);
     {
-        uint2 _vld_7;
-        _vld_7 = *reinterpret_cast<const uint2*>(do_ + eidx_d_13);
-        uint2* _vdst_7 = reinterpret_cast<uint2*>(&dwa[8]);
-        *_vdst_7 = _vld_7;
+        uint2 _vld_9;
+        _vld_9 = *reinterpret_cast<const uint2*>(do_ + eidx_d_13);
+        uint2* _vdst_9 = reinterpret_cast<uint2*>(&dwa[8]);
+        *_vdst_9 = _vld_9;
     }
     int t_u_14 = warp_0 * 8 + 5;
     int t_c_15 = t_u_14;
@@ -372,10 +370,10 @@ kernel_cake_kda_train_86df3294f866784ca973(float* __restrict__ g, __nv_bfloat16*
     }
     long long eidx_d_16 = ebase + (long long)(t_c_15 * rs);
     {
-        uint2 _vld_8;
-        _vld_8 = *reinterpret_cast<const uint2*>(do_ + eidx_d_16);
-        uint2* _vdst_8 = reinterpret_cast<uint2*>(&dwa[10]);
-        *_vdst_8 = _vld_8;
+        uint2 _vld_10;
+        _vld_10 = *reinterpret_cast<const uint2*>(do_ + eidx_d_16);
+        uint2* _vdst_10 = reinterpret_cast<uint2*>(&dwa[10]);
+        *_vdst_10 = _vld_10;
     }
     int t_u_17 = warp_0 * 8 + 6;
     int t_c_18 = t_u_17;
@@ -384,10 +382,10 @@ kernel_cake_kda_train_86df3294f866784ca973(float* __restrict__ g, __nv_bfloat16*
     }
     long long eidx_d_19 = ebase + (long long)(t_c_18 * rs);
     {
-        uint2 _vld_9;
-        _vld_9 = *reinterpret_cast<const uint2*>(do_ + eidx_d_19);
-        uint2* _vdst_9 = reinterpret_cast<uint2*>(&dwa[12]);
-        *_vdst_9 = _vld_9;
+        uint2 _vld_11;
+        _vld_11 = *reinterpret_cast<const uint2*>(do_ + eidx_d_19);
+        uint2* _vdst_11 = reinterpret_cast<uint2*>(&dwa[12]);
+        *_vdst_11 = _vld_11;
     }
     int t_u_20 = warp_0 * 8 + 7;
     int t_c_21 = t_u_20;
@@ -396,10 +394,10 @@ kernel_cake_kda_train_86df3294f866784ca973(float* __restrict__ g, __nv_bfloat16*
     }
     long long eidx_d_22 = ebase + (long long)(t_c_21 * rs);
     {
-        uint2 _vld_10;
-        _vld_10 = *reinterpret_cast<const uint2*>(do_ + eidx_d_22);
-        uint2* _vdst_10 = reinterpret_cast<uint2*>(&dwa[14]);
-        *_vdst_10 = _vld_10;
+        uint2 _vld_12;
+        _vld_12 = *reinterpret_cast<const uint2*>(do_ + eidx_d_22);
+        uint2* _vdst_12 = reinterpret_cast<uint2*>(&dwa[14]);
+        *_vdst_12 = _vld_12;
     }
     int t_u_23 = warp_0 * 8;
     long long iidx_d = ibase + (long long)(t_u_23 * rs);
@@ -614,4 +612,3 @@ kernel_cake_kda_train_86df3294f866784ca973(float* __restrict__ g, __nv_bfloat16*
 }
 
 } // extern "C"
-

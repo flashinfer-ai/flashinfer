@@ -126,8 +126,7 @@ kernel_cake_kda_train_47a9c058e6d6c78c166d(float* __restrict__ dg_in, float* __r
         if (tok_b < clen) {
             long long ebeta = (ext0 + (long long)tok_b) * (long long)num_heads + (long long)head;
             long long ibeta = (row0 + (long long)tok_b) * (long long)num_heads + (long long)head;
-            __nv_bfloat16 _cvt_bf16_0 = (__nv_bfloat16)db_in[ibeta];
-            dbeta_out[ebeta] = _cvt_bf16_0;
+            dbeta_out[ebeta] = (__nv_bfloat16)db_in[ibeta];
         }
     }
     float suffix[4];
@@ -184,4 +183,3 @@ kernel_cake_kda_train_47a9c058e6d6c78c166d(float* __restrict__ dg_in, float* __r
 }
 
 } // extern "C"
-

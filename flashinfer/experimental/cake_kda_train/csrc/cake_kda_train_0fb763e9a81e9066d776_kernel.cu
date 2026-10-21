@@ -145,7 +145,7 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(608, LAUNCH_MIN_BLOCKS) void
-kernel_cake_kda_train_da7ae1ebdf8647ca13c7(const __grid_constant__ CUtensorMap m_k_tma, const __grid_constant__ CUtensorMap m_mn_tma, float* __restrict__ b, float* __restrict__ h_out, int num_heads, int* __restrict__ chain_seg_start, int reverse, unsigned int* flags, int epoch)
+kernel_cake_kda_train_0fb763e9a81e9066d776(const __grid_constant__ CUtensorMap m_k_tma, const __grid_constant__ CUtensorMap m_mn_tma, float* __restrict__ b, float* __restrict__ h_out, int num_heads, int* __restrict__ chain_seg_start, int reverse, unsigned int* flags, int epoch)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -552,9 +552,9 @@ kernel_cake_kda_train_da7ae1ebdf8647ca13c7(const __grid_constant__ CUtensorMap m
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     if (reverse == 1) {
 #if __CUDA_ARCH__ == 1070
-                        int _mma_b_lo_0 = ((((m_mn_addr) >> 4) & 0x7FFF) | 0x4000000) + (ms_1) * 4096;
+                        int _smem_desc_lo_0 = ((((m_mn_addr) >> 4) & 0x7FFF) | 0x4000000) + (ms_1) * 4096;
 #else
-                        int _mma_b_lo_0 = ((((m_mn_addr) >> 4) & 0x3FFF) | 0x4000000) + (ms_1) * 4096;
+                        int _smem_desc_lo_0 = ((((m_mn_addr) >> 4) & 0x3FFF) | 0x4000000) + (ms_1) * 4096;
 #endif
                         asm volatile(
                     "{\n\t"
@@ -632,12 +632,12 @@ kernel_cake_kda_train_da7ae1ebdf8647ca13c7(const __grid_constant__ CUtensorMap m
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"((tmem_st + (nxt_1 * 128))), "r"(_mma_b_lo_0), "r"(tmem_st + cur_1 * 128), "r"(1));
+                    :: "r"((tmem_st + (nxt_1 * 128))), "r"(_smem_desc_lo_0), "r"(tmem_st + cur_1 * 128), "r"(1) : "memory");
                     } else {
 #if __CUDA_ARCH__ == 1070
-                        int _mma_b_lo_1 = (((m_k_addr) >> 4) & 0x7FFF) + (ms_1) * 4096;
+                        int _smem_desc_lo_1 = (((m_k_addr) >> 4) & 0x7FFF) + (ms_1) * 4096;
 #else
-                        int _mma_b_lo_1 = (((m_k_addr) >> 4) & 0x3FFF) + (ms_1) * 4096;
+                        int _smem_desc_lo_1 = (((m_k_addr) >> 4) & 0x3FFF) + (ms_1) * 4096;
 #endif
                         asm volatile(
                     "{\n\t"
@@ -715,7 +715,7 @@ kernel_cake_kda_train_da7ae1ebdf8647ca13c7(const __grid_constant__ CUtensorMap m
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"((tmem_st + (nxt_1 * 128))), "r"(_mma_b_lo_1), "r"(tmem_st + cur_1 * 128), "r"(1));
+                    :: "r"((tmem_st + (nxt_1 * 128))), "r"(_smem_desc_lo_1), "r"(tmem_st + cur_1 * 128), "r"(1) : "memory");
                     }
                     tcgen05_commit(mma_done_addr + (cur_1) * 8);
                     tcgen05_commit(m_empty_addr + (ms_1) * 8);
@@ -749,7 +749,6 @@ kernel_cake_kda_train_da7ae1ebdf8647ca13c7(const __grid_constant__ CUtensorMap m
             rc += 1;
             if (rc == 3) { rc = 0; _phase_h_stored ^= 1; }
             if (elect_sync()) {
-                asm volatile("fence.acq_rel.gpu;" ::: "memory");
                 asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(flags) + ((first_1 * num_heads + head_4) * 2 + half_4))), "r"(static_cast<unsigned int>((unsigned int)epoch)) : "memory");
             }
             mbarrier_arrive(rel_ack_addr);
@@ -770,7 +769,6 @@ kernel_cake_kda_train_da7ae1ebdf8647ca13c7(const __grid_constant__ CUtensorMap m
                 rc += 1;
                 if (rc == 3) { rc = 0; _phase_h_stored ^= 1; }
                 if (elect_sync()) {
-                    asm volatile("fence.acq_rel.gpu;" ::: "memory");
                     asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(flags) + ((sout_1 * num_heads + head_4) * 2 + half_4))), "r"(static_cast<unsigned int>((unsigned int)epoch)) : "memory");
                 }
                 mbarrier_arrive(rel_ack_addr + (nxt_2) * 8);
@@ -782,4 +780,3 @@ kernel_cake_kda_train_da7ae1ebdf8647ca13c7(const __grid_constant__ CUtensorMap m
 }
 
 } // extern "C"
-

@@ -206,4 +206,3 @@ kernel_cake_kda_train_8d99ea1be1c1fef432a5(int* __restrict__ cu_seqlens, int num
 }
 
 } // extern "C"
-

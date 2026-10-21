@@ -531,9 +531,9 @@ kernel_cake_kda_train_184d5ccfffea932ff1d8(const __grid_constant__ CUtensorMap m
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     if (reverse == 1) {
 #if __CUDA_ARCH__ == 1070
-                        int _mma_b_lo_0 = ((((m_mn_addr) >> 4) & 0x7FFF) | 0x4000000) + (ms_1) * 4096;
+                        int _smem_desc_lo_0 = ((((m_mn_addr) >> 4) & 0x7FFF) | 0x4000000) + (ms_1) * 4096;
 #else
-                        int _mma_b_lo_0 = ((((m_mn_addr) >> 4) & 0x3FFF) | 0x4000000) + (ms_1) * 4096;
+                        int _smem_desc_lo_0 = ((((m_mn_addr) >> 4) & 0x3FFF) | 0x4000000) + (ms_1) * 4096;
 #endif
                         asm volatile(
                     "{\n\t"
@@ -611,12 +611,12 @@ kernel_cake_kda_train_184d5ccfffea932ff1d8(const __grid_constant__ CUtensorMap m
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"((tmem_st + (nxt_1 * 128))), "r"(_mma_b_lo_0), "r"(tmem_st + cur_1 * 128), "r"(1));
+                    :: "r"((tmem_st + (nxt_1 * 128))), "r"(_smem_desc_lo_0), "r"(tmem_st + cur_1 * 128), "r"(1) : "memory");
                     } else {
 #if __CUDA_ARCH__ == 1070
-                        int _mma_b_lo_1 = (((m_k_addr) >> 4) & 0x7FFF) + (ms_1) * 4096;
+                        int _smem_desc_lo_1 = (((m_k_addr) >> 4) & 0x7FFF) + (ms_1) * 4096;
 #else
-                        int _mma_b_lo_1 = (((m_k_addr) >> 4) & 0x3FFF) + (ms_1) * 4096;
+                        int _smem_desc_lo_1 = (((m_k_addr) >> 4) & 0x3FFF) + (ms_1) * 4096;
 #endif
                         asm volatile(
                     "{\n\t"
@@ -694,7 +694,7 @@ kernel_cake_kda_train_184d5ccfffea932ff1d8(const __grid_constant__ CUtensorMap m
                     "mov.b64 db, {blo, dhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"((tmem_st + (nxt_1 * 128))), "r"(_mma_b_lo_1), "r"(tmem_st + cur_1 * 128), "r"(1));
+                    :: "r"((tmem_st + (nxt_1 * 128))), "r"(_smem_desc_lo_1), "r"(tmem_st + cur_1 * 128), "r"(1) : "memory");
                     }
                     tcgen05_commit(mma_done_addr + (cur_1) * 8);
                     tcgen05_commit(m_empty_addr + (ms_1) * 8);
@@ -713,4 +713,3 @@ kernel_cake_kda_train_184d5ccfffea932ff1d8(const __grid_constant__ CUtensorMap m
 }
 
 } // extern "C"
-

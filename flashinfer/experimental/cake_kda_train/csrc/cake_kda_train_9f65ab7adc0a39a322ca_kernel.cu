@@ -551,11 +551,11 @@ kernel_cake_kda_train_9f65ab7adc0a39a322ca(const __grid_constant__ CUtensorMap a
                     mbarrier_wait(acc_empty_addr + (mma_buf) * 8, _phase_acc_empty);
                     asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
-                    int _mma_a_lo_0 = (((akk_k_addr) >> 4) & 0x7FFF) + (mma_stage) * 6144;
-                    int _mma_b_lo_0 = ((((vb_mn_addr) >> 4) & 0x7FFF) | 0x4000000) + (mma_stage) * 6144;
+                    int _smem_desc_lo_0 = (((akk_k_addr) >> 4) & 0x7FFF) + (mma_stage) * 6144;
+                    int _smem_desc_lo_1 = ((((vb_mn_addr) >> 4) & 0x7FFF) | 0x4000000) + (mma_stage) * 6144;
 #else
-                    int _mma_a_lo_0 = (((akk_k_addr) >> 4) & 0x3FFF) + (mma_stage) * 6144;
-                    int _mma_b_lo_0 = ((((vb_mn_addr) >> 4) & 0x3FFF) | 0x4000000) + (mma_stage) * 6144;
+                    int _smem_desc_lo_0 = (((akk_k_addr) >> 4) & 0x3FFF) + (mma_stage) * 6144;
+                    int _smem_desc_lo_1 = ((((vb_mn_addr) >> 4) & 0x3FFF) | 0x4000000) + (mma_stage) * 6144;
 #endif
                     asm volatile(
                     "{\n\t"
@@ -610,13 +610,13 @@ kernel_cake_kda_train_9f65ab7adc0a39a322ca(const __grid_constant__ CUtensorMap a
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_acc_u + (mma_buf * 128))), "r"(0));
+                    :: "r"(_smem_desc_lo_0), "r"(_smem_desc_lo_1), "r"((tmem_acc_u + (mma_buf * 128))), "r"(0) : "memory");
 #if __CUDA_ARCH__ == 1070
-                    int _mma_a_lo_1 = (((akk_k_addr) >> 4) & 0x7FFF) + (mma_stage) * 6144;
-                    int _mma_b_lo_1 = ((((kb_mn_addr) >> 4) & 0x7FFF) | 0x4000000) + (mma_stage) * 6144;
+                    int _smem_desc_lo_2 = (((akk_k_addr) >> 4) & 0x7FFF) + (mma_stage) * 6144;
+                    int _smem_desc_lo_3 = ((((kb_mn_addr) >> 4) & 0x7FFF) | 0x4000000) + (mma_stage) * 6144;
 #else
-                    int _mma_a_lo_1 = (((akk_k_addr) >> 4) & 0x3FFF) + (mma_stage) * 6144;
-                    int _mma_b_lo_1 = ((((kb_mn_addr) >> 4) & 0x3FFF) | 0x4000000) + (mma_stage) * 6144;
+                    int _smem_desc_lo_2 = (((akk_k_addr) >> 4) & 0x3FFF) + (mma_stage) * 6144;
+                    int _smem_desc_lo_3 = ((((kb_mn_addr) >> 4) & 0x3FFF) | 0x4000000) + (mma_stage) * 6144;
 #endif
                     asm volatile(
                     "{\n\t"
@@ -671,7 +671,7 @@ kernel_cake_kda_train_9f65ab7adc0a39a322ca(const __grid_constant__ CUtensorMap a
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"((tmem_acc_w + (mma_buf * 128))), "r"(0));
+                    :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"((tmem_acc_w + (mma_buf * 128))), "r"(0) : "memory");
                     tcgen05_commit(tiles_empty_addr + (mma_stage) * 8);
                     tcgen05_commit(acc_full_addr + (mma_buf) * 8);
                 }
@@ -790,4 +790,3 @@ kernel_cake_kda_train_9f65ab7adc0a39a322ca(const __grid_constant__ CUtensorMap a
 }
 
 } // extern "C"
-

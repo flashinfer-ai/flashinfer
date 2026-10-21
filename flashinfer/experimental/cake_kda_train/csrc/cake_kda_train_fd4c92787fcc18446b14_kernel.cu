@@ -336,4 +336,3 @@ kernel_cake_kda_train_fd4c92787fcc18446b14(int* __restrict__ seq_chunk_start, in
 }
 
 } // extern "C"
-
