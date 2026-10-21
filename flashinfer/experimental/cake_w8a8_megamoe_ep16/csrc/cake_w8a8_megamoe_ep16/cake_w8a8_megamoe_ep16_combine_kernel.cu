@@ -60,9 +60,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define THREADS 128
 
 #include <math_constants.h>
+
 extern "C" {
 
-__global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_combine(
+__global__ __launch_bounds__(128) void kernel_cake_w8a8_megamoe_ep16_combine(
     __nv_bfloat16* local_terms, __nv_bfloat16* __restrict__ output,
     unsigned int* __restrict__ push_generation, int tokens_per_rank, int source_rank,
     int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int, 32> pg_flags,
@@ -102,7 +103,7 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_combine
                      : "memory");
       } while (
           static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>(done_target)) >=
-          static_cast<unsigned int>(2147483648));
+          static_cast<unsigned int>(2147483648u));
     }
     asm volatile("fence.acquire.sys;" ::: "memory");
   }

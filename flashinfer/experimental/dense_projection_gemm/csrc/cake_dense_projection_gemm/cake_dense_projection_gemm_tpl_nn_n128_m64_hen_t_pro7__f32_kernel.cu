@@ -290,6 +290,12 @@ nn_n128_m64_hen_t_pro7__f32(const __grid_constant__ CUtensorMap A, const __grid_
                     }
                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
                 }
+                #pragma unroll
+                for (int _xs = 0; _xs < 12; _xs++) {
+                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
+                    load_stage += 1;
+                    if (load_stage == 12) { load_stage = 0; _phase_mma_done ^= 1; }
+                }
             }
         }
     }

@@ -154,7 +154,7 @@ def remap_mnnvl_memory(memory: "MnnvlMemory", comm_backend: "CommBackend") -> bo
             f"{record.comm_rank}/{record.comm_size}"
         )
     torch.cuda.synchronize()
-    record.mem_handles = MnnvlMemory._create_and_map_handles(
+    record.mem_handles, record.handle_type = MnnvlMemory._create_and_map_handles(
         comm_backend,
         record.aligned_size,
         record.start_address,

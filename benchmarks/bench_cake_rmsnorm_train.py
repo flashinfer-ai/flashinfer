@@ -52,7 +52,7 @@ from flashinfer.cake_rmsnorm_train import (
 from flashinfer.cake_rmsnorm_train_backend import cake_jit as loader
 from flashinfer.testing import bench_gpu_time
 
-WIDTHS = ((6144, 1e-5), (2048, 1e-6), (512, 1e-6))
+WIDTHS = ((6144, 1e-5), (4096, 1e-5), (2048, 1e-6), (1536, 1e-6), (512, 1e-6))
 EPS = {hidden: eps for hidden, eps in WIDTHS}
 ROWS = (256, 1024, 4096, 16172, 16231, 32768, 65536)
 

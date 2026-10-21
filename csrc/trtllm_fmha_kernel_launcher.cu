@@ -367,6 +367,7 @@ void trtllm_paged_attention_launcher(
     // scratch takes the rest of the workspace buffer
     runner_params.multiCtasKvScratchPtr =
         float_allocator.aligned_alloc<void>(0, 16, "trtllm_gen_scratch_workspace");
+    runner_params.mMultiCtasKvScratchBytes = float_allocator.remaining_space;
   }
 
   // Params for skipping softmax.

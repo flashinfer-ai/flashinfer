@@ -36,6 +36,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Enable GDN strided QKV path | `export FLASHINFER_GDN_WY_STRIDED_QKV=1` |
 | Enable GDN native A/B tensors | `export FLASHINFER_GDN_WY_NATIVE_AB=1` |
 | GDN ReplaySSM u-cache flush kernel with an fp16 state pool (on SM100 served by the UMMA backend; `gated_delta_rule_mtp_ucache_flush(backend=...)`) | `export GDN_UCACHE_STATE_DTYPE=fp16` |
+| Opt in to multi-wave KV split in trtllm-gen GQA decode (long or mixed-length KV) | `export FLASHINFER_TRTLLM_GEN_MULTI_WAVE_KV_SPLIT=1` |
 | Let `backend="auto"` pick experimental backends | `export FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1` |
 | Override ragged-prefill `auto` backend order (Blackwell) | `export FLASHINFER_RAGGED_AUTO_BACKEND_ORDER=cutlass,cudnn` |
 | Override CuTe-DSL prefill scheduling | `export FLASHINFER_CUTE_PREFILL_PERSISTENT=0` (non-persistent) or `1` (persistent) |
@@ -197,6 +198,19 @@ worker counts without GPU topology or measured memory capacity.
 
 Run the CPU-only coordinator suite with
 `pytest --confcutdir=tests/test_sharding tests/test_sharding/`.
+
+Communication-test wrappers optionally emit cache-publication completion reports
+when `UNIT_TEST_RUN_STATUS_DIR` is set to a fresh directory unique to that wrapper
+and container/rank. `test_run_status.sh` records each pytest invocation, and
+`test_run_status.py` atomically writes `script-result.json` (schema version 1,
+`complete`, `exit_code`, `tests_executed`, and `infrastructure_errors`). A small
+pytest plugin records execution and collection/internal errors inside each MPI
+or torchrun worker; launcher exit 1 alone is not evidence of an assertion failure.
+All local worker ranks must finish, and at least one test must execute, to allow
+publication. A completed run with assertion failures remains eligible, while
+crashes, timeouts, and unfinished invocations do not. With the variable unset,
+reporting is disabled. The CPU suite above covers this contract without GPU
+dependencies.
 
 ### Skipping Tests Based on CUDA Architecture
 
@@ -592,6 +606,11 @@ Invalidation is module-granular: a changed nvidia-cutlass-dsl version or
 kernel-source SHA256 wipes and lazily rebuilds the module. Reference usage:
 `flashinfer/quantization/kernels/nvfp4_quantize.py`. Disable with
 `FLASHINFER_CUTE_DSL_DISABLE_CACHE=1`.
+Task-scheduled attention shares this cache through
+`flashinfer/attention/prims_ts/_compile_cache.py`; its keys cover compile specs,
+options, and embedded device-capacity constants. It hashes the attention source
+tree, including shared preparation, masks, and reductions. Occupancy queries
+are cached per device and cluster size by `_hardware.py`.
 
 ### Dispatch Macros
 
@@ -769,6 +788,8 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_VALIDATE_INPUTS` | `0` | `flashinfer/mla/_core.py` (MLA wrapper) | Non-zero / non-empty value enables defensive input validation inside the MLA wrapper. Device-synchronizing checks are skipped during CUDA Graph capture. Adds host-side overhead; intended for debugging. |
 | `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
 | `FLASHINFER_DIST_AWARE_AUTOTUNE` | `0` | `flashinfer/fused_moe/da_config.py` | `1` enables experimental distribution-aware autotune and kernel dispatch (TRT-LLM MoE only). |
+| `FLASHINFER_SM107_FUSED_ROUTE_CHECK` | `1` | `flashinfer/moe_ep/backends/mega/kernel/sm107/validation.py` | `0` uses Torch routing checks instead of the fused checker. Both paths check expert IDs, duplicates, and finite scores, including during graph replay. |
+| `FLASHINFER_SM107_PREP_TVM_FFI` | `1` | `flashinfer/moe_ep/backends/mega/kernel/sm107/routing_validation.py` | `0` launches the fused routing checker through CuTe's DLPack bindings instead of TVM-FFI. Set before warmup; each mode needs its own compiled kernel. |
 | `FLASHINFER_MEGAMOE_LOG_COMPILE_SPEC` | unset | `flashinfer/moe_ep/kernel_src/sm120/split_cutedsl_megakernel/shim/runtime.py` | Exactly `1` prints MegaMoE split-kernel compile choices, workspace memory diagnostics, and frontend compile/capture timings; other values leave these diagnostics off. |
 | `FLASHINFER_DA_DISTRIBUTIONS` | built-in distribution catalog | `flashinfer/fused_moe/da_config.py` | Comma-separated training distributions used by the experimental TRT-LLM distribution-aware MoE autotuner. |
 | `FLASHINFER_PRIMS_TS_DEBUG_CHECKS` | `0` | `flashinfer/prims_ts/batched_gemm/batched_gemm_kernel.py`, `batched_gemm_run.py`, `flashinfer/prims_ts/gemm/kernel.py` | `1`/`true`/`yes`/`on` enables exhaustive deadlock/race checks and TaskManager verification in Prims-TS batched GEMM and dense GEMM. Production JIT leaves both off. `tests/prims_ts` turns the variable on for `test_batched_gemm_*` and `test_gemm_*`. |
@@ -794,6 +815,11 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_KDA_PTX_CACHE_DIR` | `FLASHINFER_JIT_DIR/kda_ptx` | `flashinfer/kda_kernels/ptx/static_runtime.py` | Override the cache directory for cubins assembled from retained KDA PTX. Defaults to `FLASHINFER_JIT_DIR/kda_ptx`; the selected directory is created on demand. |
 | `FLASHINFER_SM90_CAKE_BF16_DEV_LAUNCHER` | unset | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_gemm.py` | Development-only factory for building the SM90 BF16 CAKE grouped-GEMM kernels in process. Set to `module` or `module:attribute` (default attribute: `create_grouped_gemm`); unset, empty, or `0` selects the shipped launcher. |
 | `FLASHINFER_SM90_CAKE_BF16_COMBINE_WIRE` | shape-dependent | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | When `combine_wire=None`, select `per_route`, `prereduced`, or `prereduced_hilo`; unset chooses `per_route` for token capacities up to 8 and `prereduced` above. Every rank in a pipe must use the same value. |
+| `FLASHINFER_GDN_SM107_PREFILL_KERNEL` | `sm107` | `flashinfer/gdn_kernels/blackwell/gdn_prefill.py` | `sm100` makes `chunk_gated_delta_rule` on SM107 (Rubin) run the Blackwell chunked-prefill kernel class instead of the Rubin subclass. For A/B measurements and bisection. |
+| `FLASHINFER_QKV_EXCHANGE_FOLD_BARRIER` | `auto` | `flashinfer/comm/cake_qkv_norm_rope_exchange_overlap.py` | Launch path of the fused QKV exchange session: `1` the producer with the folded cross-rank rendezvous (two launches per call), `0` the separate barrier kernel before the producer (three launches), `auto` the architecture default (folded on SM90 / SM100 / SM103 / SM107). The `fold_barrier` keyword takes precedence. Every rank of a group must use the same value. |
+| `FLASHINFER_QKV_EXCHANGE_SHAPE_GATES` | `auto` | `flashinfer/comm/cake_qkv_norm_rope_exchange_overlap.py` | Row-count gates of the session's host plan: `auto` the architecture default, `off` every gate off, or `gate=value` pairs over `words_capacity_small_m`, `reserved_sms_large_m` and `per_dest_large_m` (`0` = never, `auto` = that gate's default). Changes the host plan only, never the stored bits. Every rank of a group must use the same value. |
+| `FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT` | `auto` | `flashinfer/comm/cake_qkv_norm_rope_exchange_overlap.py` | Producer build of the session: `auto` the per-(architecture, world size) default (`bulk_ow256` on SM100 with 8 ranks, `ow256` on SM100 with 4 ranks and on SM103 with 8 or 4 ranks, `bulk` on SM107 with 4 ranks, the baseline build otherwise), `shipped` the baseline build, or a delivered build name; a build that is not delivered for the session's tile width raises and names the delivered ones. Every build stores identical bits. Every rank of a group must use the same value. |
+| `FLASHINFER_QKV_EXCHANGE_GROUP_M_SCALE` | `auto` | `flashinfer/comm/cake_qkv_norm_rope_exchange_overlap.py` | Group scaling of the session's host plan: `auto` the per-(architecture, world size) default (`2` on SM100 with 4 or 2 ranks and on SM103, `1` otherwise), or `1` / `2` / `4`; applies to grouped rows with a hidden size of at least 6144 and changes the tile order only. Every rank of a group must use the same value. |
 | `FLASHINFER_TOPK_ALGO` | unset | `flashinfer/topk.py` | Force a specific top-k backend (otherwise the dispatcher chooses based on shape/dtype/mode via benefit gates): `default` (radix), `clusters` (SM100), `cub` (cub::DeviceBatchedTopK; bypasses the benefit gates). Used for benchmarking / regression bisection. |
 | `FLASHINFER_USE_CUDA_NORM` | `0` | `flashinfer/norm/__init__.py` | `1` switches the norm path from the default backend to the legacy CUDA-only kernels. Diagnostic toggle. |
 | `FLASHINFER_DISABLE_EAGLE_VERIFY_FP8KV_SM90` | `0` | `flashinfer/prefill.py` | `1` keeps `BatchPrefillWithPagedKVCacheWrapper.run` on the FA2 kernel for the speculative-decoding target-verify problems that the specialized SM90 fp8-KV split-KV kernel (`csrc/eagle_verify_fp8kv_sm90.cu`) would otherwise serve: `plan(..., uniform_q_len=4)` with a custom mask, 4 query heads per KV head, head_dim 256, page size 1, NHD, bf16 q/o, e4m3 KV, compute capability 9.0. Read at plan and run time. The `uniform_q_len` plan hint itself is unaffected. |

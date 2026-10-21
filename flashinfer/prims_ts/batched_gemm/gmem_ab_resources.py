@@ -130,9 +130,13 @@ class GmemAResource(MemoryResource):
         else:
             token_tile = tile_coord_m
             token_rows = self.cfg.tile_m
-        self.tile_expert_idx = self.tile_idx_view.load(idx=token_tile, vector_size=1)[0]
+        self.tile_expert_idx = self.tile_idx_view.load(
+            idx=token_tile // Int32(self.cfg.token_metadata_stride), vector_size=1
+        )[0]
         self.tile_mn_limit = self._local_tile_limit(
-            self.mn_limit_view.load(idx=token_tile, vector_size=1)[0],
+            self.mn_limit_view.load(
+                idx=token_tile // Int32(self.cfg.token_metadata_stride), vector_size=1
+            )[0],
             token_tile,
             token_rows,
         )
@@ -240,9 +244,13 @@ class GmemBResource(MemoryResource):
         else:
             token_tile = tile_coord_m
             token_rows = self.cfg.tile_m
-        self.tile_expert_idx = self.tile_idx_view.load(idx=token_tile, vector_size=1)[0]
+        self.tile_expert_idx = self.tile_idx_view.load(
+            idx=token_tile // Int32(self.cfg.token_metadata_stride), vector_size=1
+        )[0]
         self.tile_mn_limit = self._local_tile_limit(
-            self.mn_limit_view.load(idx=token_tile, vector_size=1)[0],
+            self.mn_limit_view.load(
+                idx=token_tile // Int32(self.cfg.token_metadata_stride), vector_size=1
+            )[0],
             token_tile,
             token_rows,
         )

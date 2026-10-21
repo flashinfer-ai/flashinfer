@@ -304,6 +304,12 @@ kk_n256_m256_cg_or_pro7__ht(const __grid_constant__ CUtensorMap A, const __grid_
                     }
                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
                 }
+                #pragma unroll
+                for (int _xs = 0; _xs < 4; _xs++) {
+                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
+                    load_stage += 1;
+                    if (load_stage == 4) { load_stage = 0; _phase_mma_done ^= 1; }
+                }
             }
         }
     }

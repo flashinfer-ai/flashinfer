@@ -1,3 +1,4 @@
+import dataclasses
 import gc
 
 import pytest
@@ -44,7 +45,7 @@ def is_cake_grouped_mxfp8_available(dtype):
     if not torch.cuda.is_available():
         return False
     try:
-        from flashinfer.jit.cake_grouped_mxfp8_quantize import (
+        from flashinfer.quantization.fp8_quantization import (
             is_cake_grouped_mxfp8_quantize_available,
         )
 
@@ -612,6 +613,46 @@ def test_mxfp8_grouped_quantize_cake_fake_op_metadata(batch_shape):
     assert out.stride() == (padded_k, 1, m * padded_k)
     assert sf.shape == (32, 4, padded_m // 128, 4, padded_k // 128, b)
     assert sf.dtype == torch.uint8
+
+
+@pytest.mark.parametrize(
+    ("b", "m", "blocks_per_row", "expected_x"),
+    [
+        (1, 1, 4, 1),  # K = 128: four blocks fill one partial CTA
+        (2, 120, 128, 1),  # exactly one CTA per row
+        (3, 200, 129, 2),  # one block past the CTA width
+        (4, 128, 255, 2),  # one block short of two full CTAs
+        (2, 256, 1000, 8),  # 1000 / 128 = 7.8125 rounds up
+        (65535, 65535, 4, 1),  # the CUDA grid.y / grid.z limits
+    ],
+)
+def test_cake_grouped_mxfp8_quantize_grid_formula(b, m, blocks_per_row, expected_x):
+    """The public grid helper spells the launch: ceil(blocks / CTA width) CTAs per
+    row, one CTA row per M and one grid slice per group, for both programs."""
+    from flashinfer.jit.cake_grouped_mxfp8_quantize import PROGRAMS
+    from flashinfer.quantization.fp8_quantization import (
+        cake_grouped_mxfp8_quantize_grid,
+    )
+
+    assert len(PROGRAMS) == 2
+    for program in PROGRAMS:
+        threads = program.block[0]
+        assert threads == 128
+        grid = cake_grouped_mxfp8_quantize_grid(program, b, m, blocks_per_row)
+        assert grid == (expected_x, m, b)
+        assert (grid[0] - 1) * threads < blocks_per_row <= grid[0] * threads
+
+
+def test_cake_grouped_mxfp8_quantize_grid_reads_the_program_block():
+    """The CTA width comes from the program's block, not from a constant."""
+    from flashinfer.jit.cake_grouped_mxfp8_quantize import BF16
+    from flashinfer.quantization.fp8_quantization import (
+        cake_grouped_mxfp8_quantize_grid,
+    )
+
+    narrow = dataclasses.replace(BF16, block=(64, 1, 1))
+    assert cake_grouped_mxfp8_quantize_grid(BF16, 2, 3, 129) == (2, 3, 2)
+    assert cake_grouped_mxfp8_quantize_grid(narrow, 2, 3, 129) == (3, 3, 2)
 
 
 @pytest.mark.parametrize("batch_shape", [(2, 256, 4096), (3, 200, 160)])

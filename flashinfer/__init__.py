@@ -267,6 +267,47 @@ from .cake_rmsnorm_train import (
 from .cake_rmsnorm_train import (
     cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
 )
+from .cake_causal_conv1d_train import (
+    CakeCausalConv1dFunction as CakeCausalConv1dFunction,
+)
+from .cake_causal_conv1d_train import cake_causal_conv1d as cake_causal_conv1d
+from .cake_causal_conv1d_train import (
+    cake_causal_conv1d_train_backward as cake_causal_conv1d_train_backward,
+)
+from .cake_causal_conv1d_train import (
+    cake_causal_conv1d_train_backward_workspace_bytes as cake_causal_conv1d_train_backward_workspace_bytes,
+)
+from .cake_causal_conv1d_train import (
+    cake_causal_conv1d_train_forward as cake_causal_conv1d_train_forward,
+)
+from .cake_mhc_train import CakeMHCTrainFinishFunction as CakeMHCTrainFinishFunction
+from .cake_mhc_train import CakeMHCTrainPrepareFunction as CakeMHCTrainPrepareFunction
+from .cake_mhc_train import (
+    cake_mhc_train_backward_finish as cake_mhc_train_backward_finish,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_backward_prepare as cake_mhc_train_backward_prepare,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_backward_workspace_bytes as cake_mhc_train_backward_workspace_bytes,
+)
+from .cake_mhc_train import cake_mhc_train_finish as cake_mhc_train_finish
+from .cake_mhc_train import (
+    cake_mhc_train_forward_finish as cake_mhc_train_forward_finish,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_forward_prepare as cake_mhc_train_forward_prepare,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_forward_stats as cake_mhc_train_forward_stats,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_forward_workspace_bytes as cake_mhc_train_forward_workspace_bytes,
+)
+from .cake_mhc_train import cake_mhc_train_prepare as cake_mhc_train_prepare
+from .cake_gdp import (
+    cake_gated_delta_product_mtp as cake_gated_delta_product_mtp,
+)
 from .norm import gated_residual_rmsnorm as gated_residual_rmsnorm
 from .norm import gated_residual_next_rmsnorm as gated_residual_next_rmsnorm
 from .norm import rmsnorm_sigmoid_gate as rmsnorm_sigmoid_gate
