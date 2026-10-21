@@ -20,8 +20,9 @@ limitations under the License.
 # ``trtllm_batch_decode_with_kv_cache_mla``): dispatcher + JIT loader.
 #
 # ``MODULES`` / ``FAMILIES`` / ``ROUTES`` are written by the Cake generated-program
-# exporter.  One generated device source per physical schedule serves every listed
-# architecture; one binding source per domain, compiled once per (domain,
+# exporter.  One generated device source per physical schedule -- or per pair of
+# schedules that differ only by compile definitions (``source_flags``) -- serves
+# every listed architecture; one binding source per domain, compiled once per (domain,
 # architecture) family with that family's compile definitions (``binding_flags``),
 # selects the kernel and launches it.  Route selection uses dtype, shapes, strides and cached
 # device facts; the request KV lengths are read once per input identity only for
@@ -101,7 +102,11 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_trtllm_mla_blackwell_d396fd37061fb32d5197": {
-        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_d396fd37061fb32d5197_kernel.cu",
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_c343762a5d3d9f326db2_kernel.cu",
+        "source_flags": [
+            "-DCAKE_ARCH_SM103=1",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_d396fd37061fb32d5197",
+        ],
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_103a"],
     },
