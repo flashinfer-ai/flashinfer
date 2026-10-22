@@ -2369,6 +2369,12 @@ class SmemRawKvResource(SmemKvResource):
             seq_len_kv,
             cta_idx_kv_for_stage(self.cta_idx_kv, stage_info),
         )
+        # Row-index and scale prefetches run up to three tiles ahead; tiles
+        # past this CTA's range (one-tile split CTAs, the last tiles of any
+        # CTA) only commit an empty group so the wait_group counts hold.  The
+        # HEAD tile is always processed (a zero-length token still runs one
+        # fully masked tile), so its rows and finite scales are always staged.
+        runtime_tiles = cute.math.max(runtime_local_kv_tiles(cfg, seq_len_kv), Int32(1))
         page_offsets_batch = self.page_offsets[None, batch_idx]
         page_offsets_flat = cute.flat_divide(page_offsets_batch, (1,))
         scratch_lane_base = Int32(self._ldidx_scratch_word_base) + (
@@ -2382,6 +2388,7 @@ class SmemRawKvResource(SmemKvResource):
 
         def prefetch_rows(tile):
             base = (tile_base + tile) * Int32(cfg.tile_size_kv) + quad * Int32(4)
+            live = lane_active & (tile < runtime_tiles)
             for j in cutlass.range_constexpr(4):
                 logical_idx = cute.math.min(base + Int32(j), last_valid)
                 gmem_ptr = page_offsets_flat[None, logical_idx].iterator.llvm_ptr
@@ -2390,7 +2397,7 @@ class SmemRawKvResource(SmemKvResource):
                     3,
                     cutlass.Int32,
                 )
-                if lane_active:
+                if live:
                     prims.cp_async_shared_global(
                         smem_ptr, gmem_ptr, PAGE_OFFSET_BYTES, CP_ASYNC_CACHE_CA
                     )
@@ -2423,8 +2430,10 @@ class SmemRawKvResource(SmemKvResource):
             piece = lane_idx - lane5 * Int32(5)
             for i in cutlass.range_constexpr(8):
                 t_local = Int32(i * 6) + lane5
-                valid = (Int32(1) if lane_idx < Int32(30) else Int32(0)) & (
-                    Int32(1) if t_local < ntok else Int32(0)
+                valid = (
+                    (Int32(1) if lane_idx < Int32(30) else Int32(0))
+                    & (Int32(1) if t_local < ntok else Int32(0))
+                    & (Int32(1) if tile < runtime_tiles else Int32(0))
                 )
                 token = first_quad * Int32(4) + cute.math.min(t_local, ntok - Int32(1))
                 row = Int32(
