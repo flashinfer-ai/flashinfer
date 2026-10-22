@@ -454,6 +454,11 @@ jobs:
           SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
           AWS_ACCESS_KEY_ID: ${{ env.GPU_TEST_SCCACHE == '1' && secrets.SCCACHE_AWS_ACCESS_KEY_ID || '' }}
           AWS_SECRET_ACCESS_KEY: ${{ env.GPU_TEST_SCCACHE == '1' && secrets.SCCACHE_AWS_SECRET_ACCESS_KEY || '' }}
+          # Kernel compile cache kept across this runner's jobs (see ci/bash.sh).
+          # runner.workspace is the parent of the checkout, so the Cleanup step's
+          # wipe of the checkout leaves it, and on the H100 hosts it sits on the
+          # large NVMe work volume rather than the small root filesystem.
+          CI_COMPILE_CACHE_DIR: ${{ runner.workspace }}/flashinfer-compile-cache
         run: |
           case "${TEST_SCRIPT}" in
             task_jit_run_tests_part[1-5].sh|task_jit_run_tests_t4.sh|task_run_unit_tests.sh) ;;
@@ -481,6 +486,10 @@ jobs:
           if [ "${MATRIX_KIND}" = "h100" ]; then
             TEST_RUNNER_ARGS+=(--workers-per-gpu 2)
           fi
+          # Per-build compile times, summarized by the "Summarize JIT build times"
+          # step. Appended: DOCKER_ARGS already carries the sccache settings.
+          mkdir -p junit
+          DOCKER_ARGS+=(-e FLASHINFER_JIT_BUILD_LOG /workspace/junit/jit-builds.jsonl)
           if [ "${MATRIX_KIND}" = "gpu" ] && [ "${TEST_SCRIPT}" = "task_run_unit_tests.sh" ]; then
             # Targeted T4 runs compile with the same Ninja parallelism as the
             # bare-run T4 script (MAX_JOBS=nproc) instead of test_utils.sh's
@@ -551,23 +560,36 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      - name: Summarize JIT build times
+        if: always() && matrix.kind != 'aot'
+        run: |
+          if command -v python3 >/dev/null; then
+            python3 scripts/summarize_jit_builds.py junit/jit-builds.jsonl || true
+            python3 scripts/summarize_jit_builds.py --markdown \
+              junit/jit-builds.jsonl >> "${GITHUB_STEP_SUMMARY}" || true
+          else
+            echo "::warning::python3 unavailable on runner; JIT build summary skipped"
+          fi
+
       - name: Make JUnit XML readable
-        if: ${{ always() && (matrix.kind == 'h100' || startsWith(matrix.script, 'task_jit_run_tests_part')) }}
+        if: ${{ always() && matrix.kind != 'aot' }}
         run: |
           if [ -d junit ]; then
             sudo chmod -R a+rX junit
           fi
 
       - name: Upload JUnit XML and telemetry
-        if: ${{ always() && (matrix.kind == 'h100' || startsWith(matrix.script, 'task_jit_run_tests_part')) }}
+        if: ${{ always() && matrix.kind != 'aot' }}
         uses: actions/upload-artifact@v4
         with:
-          name: junit-${{ matrix.kind == 'h100' && 'h100' || matrix.script }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # Non-H100 names add the runner SM: A10G and T4 rows can run the same script.
+          name: junit-${{ matrix.kind == 'h100' && 'h100' || format('{0}-{1}', matrix.script, matrix.runner[4]) }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             junit/**/*.xml
             junit/**/*.telemetry.json
             junit/**/*.meta.json
             junit/**/*.memory.csv
+            junit/jit-builds.jsonl
             junit/run-summary.json
           if-no-files-found: warn
           retention-days: 30
