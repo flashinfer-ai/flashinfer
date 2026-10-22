@@ -353,16 +353,17 @@ def inputs_h4096(tokens, seed=2026):
     )
 
 
-def reference_h4096(values):
-    """The fused step in float64 with BF16 rounding only at its two output points."""
+def reference_h4096(values, dtype=torch.float64):
+    """The fused step in ``dtype`` (float64, the oracle; float32, the IEEE
+    comparator) with BF16 rounding only at its two output points."""
     tokens, hidden = values["x"].shape
-    x, residual = values["x"].double(), values["residual"].double()
-    post, comb = values["post_mix"].double(), values["comb_res_mix"].double()
+    x, residual = values["x"].to(dtype), values["residual"].to(dtype)
+    post, comb = values["post_mix"].to(dtype), values["comb_res_mix"].to(dtype)
     residual_cur = (
         post * x.unsqueeze(1) + torch.einsum("tij,tih->tjh", comb, residual)
     ).bfloat16()
-    u = residual_cur.double().reshape(tokens, 4 * hidden)
-    z = (u @ values["fn"].double().T) * torch.rsqrt(
+    u = residual_cur.to(dtype).reshape(tokens, 4 * hidden)
+    z = (u @ values["fn"].to(dtype).T) * torch.rsqrt(
         u.square().mean(-1, keepdim=True) + values["hc_norm_eps"]
     )
     scales = torch.cat(
@@ -371,8 +372,8 @@ def reference_h4096(values):
             values["mix_scales"][1].expand(4),
             values["mix_scales"][2].expand(16),
         )
-    ).double()
-    a = z * scales + values["mix_bases"].double()
+    ).to(dtype)
+    a = z * scales + values["mix_bases"].to(dtype)
     pre = a[:, :4].sigmoid() + values["hc_pre_eps"]
     eps = values["sinkhorn_eps"]
     c = a[:, 8:].reshape(tokens, 4, 4).softmax(-1) + eps
@@ -380,11 +381,11 @@ def reference_h4096(values):
     for _ in range(1, values["num_sinkhorn_iters"]):
         c = c / (c.sum(-1, keepdim=True) + eps)
         c = c / (c.sum(-2, keepdim=True) + eps)
-    w = (pre.unsqueeze(2) * residual_cur.double()).sum(1)
+    w = (pre.unsqueeze(2) * residual_cur.to(dtype)).sum(1)
     rstd = torch.rsqrt(w.square().mean(-1, keepdim=True) + values["rmsnorm_eps"])
     rstd = rstd * values["rmsnorm_scale"]
     layer_input = (
-        w.bfloat16().double() * rstd * values["rmsnorm_weight"].double()
+        w.bfloat16().to(dtype) * rstd * values["rmsnorm_weight"].to(dtype)
     ).bfloat16()
     return dict(
         new_residual=residual_cur,
@@ -505,6 +506,9 @@ def test_h4096_values_and_replay(tokens):
 
 @pytest.mark.parametrize("tokens", (1, 200, 1025))
 def test_h4096_graph_replay_changed_inputs_and_update_fn(tokens):
+    """Six replays over inputs rewritten in place, the fourth after ``update_fn``
+    on a fresh projection; the replacement keeps fn's 0.01 scale, so the FP32
+    coefficients stay in the regime the ``atol=2e-5`` gate is written for."""
     _skip_unless_exported(4096, "bf16")
     values = inputs_h4096(tokens)
     plan = prepare_mega_mhc(**values, sf_layout="bf16")
@@ -525,15 +529,25 @@ def test_h4096_graph_replay_changed_inputs_and_update_fn(tokens):
             values["x"].add_(0.015625)
             values["post_mix"].mul_(0.5)
             if repeat == 3:
-                values["fn"].mul_(2.0)
+                fresh = torch.Generator(device="cuda").manual_seed(2027)
+                values["fn"].copy_(
+                    torch.randn(values["fn"].shape, device="cuda", generator=fresh)
+                    * 0.01
+                )
                 plan.update_fn()
             expected = reference_h4096(values)
+            comparator = reference_h4096(values, torch.float32)
             poison(plan.outputs)
             if repeat == 4:
                 plan.run()
             else:
                 graph.replay()
         stream.synchronize()
+        for name in ("new_post_mix", "new_comb_res_mix"):
+            error = (comparator[name].double() - expected[name].double()).abs().max()
+            print(
+                f"repeat {repeat} {name}: FP32 comparator max |error| {error.item():.3e}"
+            )
         check_h4096(plan.outputs, expected)
         current = plan.launch_epochs.cpu().tolist()
         assert len(current) == plan.config["num_sms"]
