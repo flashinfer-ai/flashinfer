@@ -52,19 +52,25 @@ collectives, the merge chain tables, the segment plan ``P`` / ``NSEG`` and the
 segment table) is derived on demand by ``ctx.heads(H)`` and cached.
 
 Segment plan rule.  ``kcp_plan(n_frag, NC_max_frag, H, sm_count)`` picks the
-segments per fragment ``P`` (``NSEG = n_frag * P``) with the shipped ``"wave"``
-rule (lever L-C, adopted in round 1; rulings P2-R7 / P2-R7a / P2-R9): on a rank
+segments per fragment ``P`` (``NSEG = n_frag * P``) with the shipped ``"wave_fill1"``
+rule (the one-wave fill on top of lever L-C, adopted in this revision): on a rank
 with at most ``WAVE_N_FRAG_MAX = 3`` fragments (N_MAX) whose longest fragment
 exceeds the chain cap (``NC_max_frag >= WAVE_MIN_NC_MAX_FRAG = 257`` chunks, i.e.
 ``P_chain >= 2``), the argmin over ``P in [P_chain, min(64, NC_max_frag)]`` of the
 equal-segment wave cost
 ``ceil(n_frag P H / SM) * ceil(NC_max_frag / P) * t_walk + (P - 1) * t_compose``
-(constants ``WAVE_RULE_10NS``, smallest ``P`` on ties); every other rank (more
-fragments, or no fragment above 256 chunks) keeps the round-0 ``"occ"`` rule
-``clamp(max(P_occ, P_chain), 1, ...)``.  ``"occ"``
-stays selectable through the private test knob ``_kcp_test_knobs={"p_rule":
-"occ"}`` (``CAKE_KCP_TEST_KNOBS=1``) for the A/B record.  Both rules are pure
-functions of (fragment table, H, SM count).
+(constants ``WAVE_RULE_10NS``, smallest ``P`` on ties; the earlier ``"wave"`` rule
+of lever L-C); on a one-fragment rank below the
+cap (``0 < NC_max_frag < 257``) the one-wave fill ``clamp(floor(SM / H), P_chain,
+min(64, NC_max_frag))`` -- the largest ``P`` whose ``P H`` CTAs run one CTA per SM
+instead of the occ ``ceil`` (the one-wave fill rule, :data:`WAVE_FILL_N_FRAG_MAX`; a rank with
+``H > SM`` keeps the occ ``P``); every other rank (two or three fragments below
+the cap, more than three fragments, or an empty longest fragment) keeps the
+earlier ``"occ"`` rule ``clamp(max(P_occ, P_chain), 1, ...)``.  ``"wave"`` (the
+earlier rule), ``"occ"`` and ``"wave_fill"`` (the fill on every rank with at most
+three fragments; implemented, not adopted) stay selectable through the private
+test knob ``_kcp_test_knobs={"p_rule": ...}`` (``CAKE_KCP_TEST_KNOBS=1``) for the
+A/B record.  Every rule is a pure function of (fragment table, H, SM count).
 
 Exchange layouts (one ``all_to_all_single`` per direction; ``s`` = one FP32
 ``[128, 128]`` state of one head = 16384 elements; owner ``j`` holds heads
@@ -97,28 +103,33 @@ STATE_TILE_BYTES = TILE * 4  # 65536 B
 MAX_FRAGS = 65536  # the layout table's 16-step document search (cake_backend.MAX_DOCS)
 MAX_CHAIN_STEPS = 256  # kcp_plan: no walk chain longer than 256 chunk steps
 MAX_SEGMENTS = 64  # kcp_plan: at most 64 segments per fragment
-P_BAL_INACTIVE = 64  # kcp_plan: P_bal until lane M1 measures t_step / t_compose
+P_BAL_INACTIVE = 64  # kcp_plan: P_bal until a measurement fixes t_step / t_compose
 P_RULES = (
     "occ",
     "wave",
-)  # kcp_plan P rules: "wave" = the shipped rule (lever L-C, round-1 adoption); "occ" = the round-0 §7.2 rule
-# Shipped P rule (round-1 adoption of lever L-C, rulings P2-R7 / P2-R7a / P2-R9): the public API plans with it; "occ"
-# stays selectable through the private test knob ``_kcp_test_knobs={"p_rule": "occ"}`` (P1-R15 class) for
-# the A/B record.  Both rules are pure functions of (fragment table, H, SM count), so G3 holds under either.
-P_RULE_DEFAULT = "wave"
-# Ruling P2-R3 (round-1 adoption point, FINAL_DESIGN §6.2): the shipped default of ``save_transfer`` -- the merge owner
+    "wave_fill1",
+    "wave_fill",
+)  # kcp_plan P rules: "wave_fill1" = the shipped rule = "wave" + the one-wave
+# fill on one-fragment ranks below the chain cap; "wave" = the earlier rule (lever L-C); "occ" = the design note §7.2 rule;
+# "wave_fill" = the fill on every rank with n_frag <= 3 (the second knob value; implemented, not adopted)
+# Shipped P rule (the one-wave fill on top of the earlier wave rule of lever L-C):
+# the public API plans with it; "wave", "occ" and "wave_fill" stay selectable through the private test
+# knob ``_kcp_test_knobs={"p_rule": ...}`` for the A/B record.  Every rule is a pure function of
+# (fragment table, H, SM count), so G3 holds under any of them.
+P_RULE_DEFAULT = "wave_fill1"
+# The shipped default of ``save_transfer`` (the design note §6.2) -- the merge owner
 # keeps its c1 receive tensor (and the home rank its M_seg at P > 1) for the backward instead of re-sending M_f^T in b1.
-# Default of the byte queries below and of ``cake_kcp.KcpOptions``; ``False`` (the round-0 recompute form) stays
+# Default of the byte queries below and of ``cake_kcp.KcpOptions``; ``False`` (the earlier recompute form) stays
 # selectable through the ``save_transfer`` argument; ``kcp_saved_bytes`` reports the delta.
 SAVE_TRANSFER_DEFAULT = True
-# Lever L-C wave-aware P rule (LEVERS.md §3 L-C / §5): per-CTA-step constants at one CTA per SM on GB300, H = 64, in 10 ns
+# Lever L-C wave-aware P rule: per-CTA-step constants at one CTA per SM on GB300, H = 64, in 10 ns
 # units (exact integer arithmetic keeps the argmin and its ties identical on every rank).  Sources (P2A / M1 generated files):
 # t_tape 2.85 us = P2A timeline.md "Q1 CP4 C B1" rank 3 #11 / #12 (64 CTAs x 244 steps 0.706 ms -> 2.893; 192 CTAs = 2 waves x 244
 # steps 1.378 ms -> 2.824); t_xfer 3.5 us = M1 k3_micro.md "t_step us (one chain, per wave)" tf32_hilo z-q6 3.515 / c-cp8 3.317;
 # t_offset 1.2 us = timeline.md rank 3 #5 (0.581 ms / (2 waves x 244 steps) = 1.19); t_compose 20.4 us = M1 refit.md P_bal table
 # "t_compose us/step" 20.389 (K4 map-mode c16 step).
 WAVE_RULE_10NS = {"tape": 285, "xfer": 350, "offset": 120, "compose": 2040}
-# N_MAX of ruling P2-R7a (a plan constant, part of the pure function of the fragment table, H and SM count): the
+# N_MAX (a plan constant, part of the pure function of the fragment table, H and SM count): the
 # wave rule applies to a rank with at most this many fragments; ranks with more keep P_occ (the measured
 # many-fragment D ranks lose 9-11 % at any P > 1: the compose / staging cost at P > 1 exceeds the model; D ranks
 # of a multi-document pack have >= 4 fragments, two per document, so D keeps the bitwise "occ" program).
@@ -127,6 +138,16 @@ WAVE_N_FRAG_MAX = 3
 # fragments of <= 256 chunks (Q1 CP16: 244) the extra segments' compose / staging cost exceeds the shorter walks
 # (measured CP16 C +5.0 % B1 / +6.4 % B3, CP16 Z +7.3 % B3 at the unconditioned wave P).
 WAVE_MIN_NC_MAX_FRAG = MAX_CHAIN_STEPS + 1
+# The one-wave fill rules: the "one-wave
+# fill" rules -- "wave_fill1" is the shipped default since this revision, "wave_fill" stays a test knob value.  Below
+# the chain cap (NC_max_frag < WAVE_MIN_NC_MAX_FRAG) the earlier "wave" rule keeps the occ P = ceil(SM / (n_frag H)), which on the one-fragment CP16 C ranks (NC 222-256, H = 64) launches 192 CTAs on
+# 152 SMs (40 SMs host two CTAs: 148-172 step-times for 74-86-step chains); the fill rule takes the LARGEST P whose
+# n_frag P H CTAs run one CTA per SM, floor(SM / (n_frag H)) (= 2 -> 128 CTAs, one wave of 111-128 steps, the floor's
+# min_P), clamped to [P_chain, min(64, NC_max_frag)]; a rank without a one-wave P (n_frag H > SM) keeps the occ P.
+# "wave_fill1" applies it to one-fragment ranks only (the shipped rule), "wave_fill" to every rank with
+# n_frag <= WAVE_N_FRAG_MAX (two-fragment H = 64 ranks move P 2 -> 1).  Above the cap both are the shipped wave argmin.
+# At H <= 4 on 152 SMs floor(SM / H) equals ceil(SM / H) (38; 64-cap at H = 1), so every H <= 4 row keeps its program.
+WAVE_FILL_N_FRAG_MAX = {"wave_fill1": 1, "wave_fill": WAVE_N_FRAG_MAX}
 ALIGN = 256  # every table starts on a 256 B boundary (cake_backend.ALIGN)
 LAYOUTS = ("contiguous", "zigzag", "zigzag_per_document")
 EXPLICIT_LAYOUT = "explicit"
@@ -141,7 +162,7 @@ COLLECTIVES = ("c1", "c2", "b1", "b2", "halo_fwd", "halo_bwd")
 TILE_B = 0  # half 0 of a c1 summary tile [2][128][128]: the offset B_f
 TILE_M = 1  # half 1: the transposed map M_f^T
 TILE_D = 0  # half 0 of a b1 pair tile [2][128][128]: the adjoint offset d_f (half 1 = the re-sent M_f^T, TILE_M)
-TILE_STRIDE_PLANE = 1  # P1-R3 kernel argument tile_stride: dense plane (c2 S_in, b2 dS_out, b1 offsets-only, carry, the P > 1 staging planes; P1-R11)
+TILE_STRIDE_PLANE = 1  # kernel argument tile_stride: dense plane (c2 S_in, b2 dS_out, b1 offsets-only, carry, the P > 1 staging planes)
 TILE_STRIDE_PAIR = 2  # interleaved pair (c1 [B_f | M_f^T], b1 [d_f | M_f^T] with maps)
 SUMMARY_TILE = 2 * TILE  # elements of one c1 summary tile of one head
 TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"
@@ -196,7 +217,7 @@ class KcpFragment:
     def as_tuple(
         self,
     ) -> tuple[int, int, int, tuple[int, int] | None, tuple[int, int] | None]:
-        """The GOAL §3.1 record ``(doc, offset, length, prev, next)``."""
+        """The KCP contract §3.1 record ``(doc, offset, length, prev, next)``."""
         return (self.doc, self.off, self.length, self.prev, self.next)
 
 
@@ -239,7 +260,7 @@ class KcpPartition:
     ) -> tuple[
         tuple[int, int, int, tuple[int, int] | None, tuple[int, int] | None], ...
     ]:
-        """The GOAL §3.1 per-rank table ``(doc, offset, length, prev, next)`` in local order."""
+        """The KCP contract §3.1 per-rank table ``(doc, offset, length, prev, next)`` in local order."""
         return tuple(f.as_tuple() for f in self.fragments[rank])
 
     def chains(self) -> tuple[tuple[tuple[int, int], ...], ...]:
@@ -481,7 +502,7 @@ def kcp_partition(
     *,
     cut_points=None,
 ) -> KcpPartition:
-    """The per-rank fragment tables of one packed batch (GOAL §3.1).
+    """The per-rank fragment tables of one packed batch (the KCP contract §3.1).
 
     ``cu_seqlens_global_cpu``: the packed documents' ``cu_seqlens`` (CPU int64 tensor or a sequence of ints);
     ``world_size``: ranks of the context-parallel group; ``layout``: ``"contiguous"``, ``"zigzag"`` or
@@ -617,7 +638,7 @@ def tables_bytes(NC_pad: int, N: int, NSEG: int) -> int:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Segment plan (FINAL_DESIGN §7.2) and head ownership (SPEC-5)
+# Segment plan (the design note §7.2) and head ownership (SPEC-5)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -671,8 +692,8 @@ def lpt_makespan(chains: "list[tuple[int, int]]", machines: int) -> int:
 def wave_rule_cost_10ns(
     n_frag: int, NC_max_frag: int, H: int, sm_count: int, P: int
 ) -> int:
-    """Lever L-C cost model of ``P`` segments per fragment (10 ns units, exact integers; the rule of record, ruling
-    P2-R7a): the three walks (K1 offset, K3 transfer, K1 tape; one CTA per SM, equal segments) each take
+    """Lever L-C cost model of ``P`` segments per fragment (10 ns units, exact integers; the rule of
+    record): the three walks (K1 offset, K3 transfer, K1 tape; one CTA per SM, equal segments) each take
     ``ceil(n_frag P H / SM)`` waves of ``ceil(NC_max_frag / P)`` CTA-steps, plus ``P - 1`` K4 compose steps."""
     waves = _ceil_div(n_frag * P * H, sm_count)
     steps = _ceil_div(NC_max_frag, P)
@@ -703,7 +724,7 @@ def _wave_rule_P(
 def wave_rule_lpt_cost_10ns(
     nc_frags: "list[int]", H: int, sm_count: int, P: int
 ) -> int:
-    """Information form (b) of ruling P2-R6 (NOT the rule of record, P2-R7a): the walks take the LPT makespan of
+    """Information form (b) (NOT the rule of record): the walks take the LPT makespan of
     ``P * H`` chains of ``ceil(NC_f / P)`` steps per fragment ``f`` with ``NC_f`` chunks (empty fragments: none) on
     ``sm_count`` SMs, plus ``P - 1`` compose steps.  Equal fragments reproduce :func:`wave_rule_cost_10ns`."""
     P, H = int(P), int(H)
@@ -739,8 +760,8 @@ def kcp_plan(
     P_bal: int = P_BAL_INACTIVE,
     p_rule: str = P_RULE_DEFAULT,
 ) -> KcpSegmentPlan:
-    """The KCP plan rule (``p_rule="wave"``, the shipped default since the round-1 adoption of lever L-C;
-    rulings P2-R7 / P2-R7a / P2-R9)::
+    """The KCP plan rule (``p_rule="wave_fill1"``, the shipped default since this revision: the one-wave fill
+    on the earlier ``"wave"`` rule of lever L-C).  The ``"wave"`` rule::
 
         P_occ   = ceil(SM / (n_frag * H))                 # one transfer-walk CTA per SM
         P_chain = ceil(NC_max_frag / 256)                 # no walk chain longer than 256 steps
@@ -754,10 +775,21 @@ def kcp_plan(
     (P - 1) x t_compose`` (:func:`wave_rule_cost_10ns`, constants :data:`WAVE_RULE_10NS`): the three equal-segment
     walks at one CTA per SM plus the K4 compose chain.  The wave line applies only to ranks with
     ``n_frag <= WAVE_N_FRAG_MAX`` (3) whose longest fragment exceeds the chain cap (``NC_max_frag >=
-    WAVE_MIN_NC_MAX_FRAG`` = 257 chunks, i.e. ``P_chain >= 2``; ruling P2-R9); every other rank keeps the occ ``P``
+    WAVE_MIN_NC_MAX_FRAG`` = 257 chunks, i.e. ``P_chain >= 2``); every other rank keeps the occ ``P``
     (many-fragment D ranks and short fragments measured slower at every ``P > 1``).  ``p_rule="occ"`` (the round-0
     §7.2 rule, selectable only through the ``p_rule`` test knob for the A/B record) uses the ``clamp`` line on every
-    rank.  ``P_occ`` / ``P_chain`` / ``P_bal`` are reported under both rules.
+    rank.  ``P_occ`` / ``P_chain`` / ``P_bal`` are reported under every rule.
+
+    The one-wave fill rule (``"wave_fill1"`` shipped, ``"wave_fill"`` test knob only; :data:`WAVE_FILL_N_FRAG_MAX`)::
+
+        P_fill  = floor(SM / (n_frag * H))
+        P       = clamp(P_fill, P_chain, min(64, NC_max_frag))   if p_rule in ("wave_fill1", "wave_fill") and
+                                                                  n_frag <= WAVE_FILL_N_FRAG_MAX[p_rule] (1 | 3) and
+                                                                  0 < NC_max_frag < WAVE_MIN_NC_MAX_FRAG and P_fill >= 1
+                = the "wave" rule above                           otherwise
+
+    i.e. below the chain cap the largest segment count that still runs one CTA per SM (``P_bal`` does not enter); ``p_rule="wave"`` (the earlier rule, selectable through the test knob) is the first
+    block alone.
 
     A pure function of ``(fragment table, H, SM count)``.  A rank without fragments has ``P = 1``, ``NSEG = 0``;
     when every fragment is empty (``NC_max_frag = 0``) the lower bound wins: ``P = 1``.
@@ -787,8 +819,17 @@ def kcp_plan(
         )
     p_occ = _ceil_div(sm_count, n_frag * H)
     p_chain = max(1, _ceil_div(NC_max_frag, MAX_CHAIN_STEPS))
+    fill_n_frag_max = WAVE_FILL_N_FRAG_MAX.get(p_rule)
+    p_fill = sm_count // (n_frag * H)
     if (
-        p_rule == "wave"
+        fill_n_frag_max is not None
+        and n_frag <= fill_n_frag_max
+        and 0 < NC_max_frag < WAVE_MIN_NC_MAX_FRAG
+        and p_fill >= 1
+    ):
+        P = max(p_chain, min(MAX_SEGMENTS, NC_max_frag, p_fill))
+    elif (
+        p_rule != "occ"
         and n_frag <= WAVE_N_FRAG_MAX
         and NC_max_frag >= WAVE_MIN_NC_MAX_FRAG
     ):
@@ -832,7 +873,7 @@ def owner_of_head(h: int, H: int, world_size: int) -> int:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Convolution halo plan (FINAL_DESIGN §8.2): history rows of continuing fragments and the reverse routing of dpre rows
+# Convolution halo plan (the design note §8.2): history rows of continuing fragments and the reverse routing of dpre rows
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1021,14 +1062,14 @@ def _halo_plan(
 class KcpHeadPlan:
     """Everything of one rank's context that depends on the head count ``H`` (``ctx.heads(H)``).
 
-    Ownership (SPEC-5, P1-R4): ``Hg = ceil(H / W)``, owner ``j`` holds the compact head set ``[j Hg, j Hg + Hg_j)``,
+    Ownership (SPEC-5): ``Hg = ceil(H / W)``, owner ``j`` holds the compact head set ``[j Hg, j Hg + Hg_j)``,
     ``Hg_j = clamp(H - j Hg, 0, Hg)``; ``Hg_r`` / ``head0`` are this rank's.  Every owner with heads holds ``Hg`` tile
     slots per fragment slot (``Hg_pad_by_rank``): the single partial owner (``padded_owner``, ``0 < Hg_j < Hg``, only
     when ``H % Hg != 0``) is padded by ``pad_tiles = n_owners Hg - H`` tiles per slot so that the kernels' two-integer
     addressing ``((h // Hg) * n + slot) * Hg + h % Hg`` is exact for every ``H``; the padding is counted in that
     owner's splits, never read, and reported in ``pad_numel`` (elements per split; all zero for ``H = 64``).
     ``full_groups`` (= no padding anywhere) and the explicit per-head tile tables are validation aids, not kernel ABI.
-    Buffer forms (P1-R3; the kernels' ``tile_stride`` argument per buffer is ``tile_stride``): c1 and the b1 buffer
+    Buffer forms (the kernels' ``tile_stride`` argument per buffer is ``tile_stride``): c1 and the b1 buffer
     with maps are interleaved PAIRS per ``(slot, head)`` — ``[B_f | M_f^T]`` (``TILE_B`` / ``TILE_M``) and
     ``[d_f | M_f^T]`` (``TILE_D`` / ``TILE_M``; the ``M`` half of a document's last fragment is never written or
     read); c2 (``S_in``), b2 (``dS_out``) and the offsets-only b1 buffer are dense planes.  Sender-side layout
@@ -1045,10 +1086,10 @@ class KcpHeadPlan:
     crossing-out fragment -> ``dS_out`` slot; segments ``< P - 1`` -> adjoint carry slot), ``out_index`` (``P = 1``:
     the c1 send element of a crossing-out fragment, else ``-1``; ``P > 1``: the staging slot ``= segment``),
     ``walk_seg_offset`` (segments the offset walks visit) and ``walk_seg_tape`` (all).  ``h0_index_fused`` /
-    ``dht_index_fused`` are the one-pool form of the same tables for the round-1 lever L-B (``fused_walks``; the shipped
-    form since the round-1 adoption, P2-R1 / P2-R4; ``fused_walks=0`` through the test knob): at ``P > 1`` every segment's initial state (final adjoint) sits in the carry plane -- segment 0 of a
+    ``dht_index_fused`` are the one-pool form of the same tables for lever L-B (``fused_walks``; the shipped
+    form since an earlier revision; ``fused_walks=0`` through the test knob): at ``P > 1`` every segment's initial state (final adjoint) sits in the carry plane -- segment 0 of a
     crossing-in fragment in the extra slot ``n_frag (P - 1) + in_slot`` that the ``carry_in`` merge fills with its
-    ``S_in`` tiles (P1-R1 ``write_states``), the last segment of a crossing-out fragment in ``n_frag (P - 1) + out_slot``
+    ``S_in`` tiles (``write_states``), the last segment of a crossing-out fragment in ``n_frag (P - 1) + out_slot``
     (``dcarry_cross`` publishes ``dS_out`` there), ``-1`` = the zero state of a document start (end); ``numel["carry_fused"]``
     is that plane (``+ max(n_in, n_out)`` tiles per head: the forward and the adjoint never hold the extra slots at the
     same time); at ``P = 1`` they equal ``h0_index`` / ``dht_index`` (``S_in`` / ``dS_out`` are read directly).  Merge chains of this rank as
@@ -1060,7 +1101,7 @@ class KcpHeadPlan:
     sent), ``adj_m_off_c1`` (``M^T`` in the c1 receive buffer: replay mode or ``save_transfer``) and ``adj_out_off``
     (``dS_out`` of the predecessor in the b2 send buffer).  ``hg_stride[table]`` is the element stride between
     consecutive heads of each offset table (``SUMMARY_TILE`` in the pair buffers, ``TILE`` in the planes).  Every
-    offset is ``-1`` or a non-negative multiple of 4 floats (P1-R1; checked here, before any launch).
+    offset is ``-1`` or a non-negative multiple of 4 floats (checked here, before any launch).
     ``device_tables`` holds the int32 / int64 device copies of the tables the kernels read."""
 
     H: int
@@ -1135,14 +1176,14 @@ def _prefix(values) -> list[int]:
 
 
 def _check_tile_offsets(name: str, values) -> None:
-    """P1-R1: every chain-table tile offset is ``-1`` (unused) or a non-negative multiple of 4 floats (16 B);
+    """Every chain-table tile offset is ``-1`` (unused) or a non-negative multiple of 4 floats (16 B);
     anything else is rejected here, before any launch."""
     for i, v in enumerate(values):
         if v == -1:
             continue
         if v < 0 or v % 4 != 0:
             raise ValueError(
-                f"{name}[{i}] = {v}: chain-table tile offsets must be -1 or non-negative multiples of 4 floats (P1-R1)"
+                f"{name}[{i}] = {v}: chain-table tile offsets must be -1 or non-negative multiples of 4 floats"
             )
 
 
@@ -1161,7 +1202,7 @@ def _build_head_plan(ctx: KcpContext, H: int) -> KcpHeadPlan:
         )
     Hg, n_owners, hg_by_rank = head_groups(H, W)
     Hg_r = hg_by_rank[r]
-    # P1-R4: every owner with heads holds Hg tile slots per fragment slot; the single partial owner (0 < Hg_j < Hg,
+    # every owner with heads holds Hg tile slots per fragment slot; the single partial owner (0 < Hg_j < Hg,
     # only when H % Hg != 0) is padded to Hg so that the kernels' two-integer addressing is exact for every H.  The
     # padding tiles are counted in that owner's splits, never read, and reported separately (pad_numel).
     hg_pad_by_rank = tuple(Hg if x > 0 else 0 for x in hg_by_rank)
@@ -1173,7 +1214,7 @@ def _build_head_plan(ctx: KcpContext, H: int) -> KcpHeadPlan:
     n_in, n_out = n_in_by[r], n_out_by[r]
 
     # -- split sizes (elements) per peer: sender side [dst owner j][slot][hg < Hg_pad_j], owner side
-    # [src rank i][slot][hg].  c1 and b1-with-maps are interleaved pairs (SUMMARY_TILE per (slot, head), P1-R3);
+    # [src rank i][slot][hg].  c1 and b1-with-maps are interleaved pairs (SUMMARY_TILE per (slot, head));
     # c2, b2 and the offsets-only b1 are dense planes (TILE).
     def _split_sizes(hg_owner, hg_self):
         return {
@@ -1194,7 +1235,7 @@ def _build_head_plan(ctx: KcpContext, H: int) -> KcpHeadPlan:
     pad_numel = {k: sum(splits[k]) - sum(compact[k]) for k in splits}
     bases = {k: _prefix(v) for k, v in splits.items()}
 
-    # sender side: the two-integer form ((h // Hg) * n + slot) * Hg + h % Hg (exact for every H under P1-R4)
+    # sender side: the two-integer form ((h // Hg) * n + slot) * Hg + h % Hg (exact for every H with the padding)
     def c1_send_tile(out_slot: int, h: int) -> int:  # units of SUMMARY_TILE
         j, hg = h // Hg, h % Hg
         return bases["c1_send"][j] // SUMMARY_TILE + out_slot * Hg + hg
@@ -1303,7 +1344,7 @@ def _build_head_plan(ctx: KcpContext, H: int) -> KcpHeadPlan:
                 out_index.append(s)
                 walk_offset.append(s)
     walk_tape = list(range(NSEG))
-    # the one-pool tables of lever L-B (fused_walks; the shipped form since the round-1 adoption, fused_walks=0 via the knob)
+    # the one-pool tables of lever L-B (fused_walks; the shipped form since an earlier revision, fused_walks=0 via the knob)
     extra = ctx.n_frag * (P - 1)
     h0_fused, dht_fused = [], []
     for f in mine:
@@ -1401,7 +1442,7 @@ def _build_head_plan(ctx: KcpContext, H: int) -> KcpHeadPlan:
     }
     numel = {k: sum(v) for k, v in splits.items()}
     # the P > 1 staging is two dense planes stage_b / stage_m of [NSEG, H, 128, 128] each (K1 / K2 write stage_b, K3 writes
-    # stage_m, both at tile_stride 1; P1-R11) -- counted together as one `staging` term of NSEG * H * SUMMARY_TILE elements;
+    # stage_m, both at tile_stride 1) -- counted together as one `staging` term of NSEG * H * SUMMARY_TILE elements;
     # the carry buffer holds the dense inter-segment states
     numel["staging"] = (NSEG * H * SUMMARY_TILE) if P > 1 else 0
     numel["carry"] = (ctx.n_frag * (P - 1) * H * TILE) if P > 1 else 0
@@ -1579,7 +1620,7 @@ class KcpContext:
     tables: dict[str, torch.Tensor]
     halo: KcpHaloPlan
     halo_tables: dict[str, torch.Tensor]
-    p_rule: str = P_RULE_DEFAULT  # plan rule: "wave" shipped, "occ" via the test knob
+    p_rule: str = P_RULE_DEFAULT  # plan rule: "wave_fill1" shipped; "wave" / "occ" / "wave_fill" via the test knob
     sequence: KcpSequence = dataclasses.field(default_factory=KcpSequence, repr=False)
     _head_plans: dict[int, KcpHeadPlan] = dataclasses.field(
         default_factory=dict, repr=False
@@ -1688,7 +1729,7 @@ def build_kcp_context(
     sm_count: int | None = None,
     _kcp_test_knobs: dict | None = None,
 ) -> KcpContext:
-    """The :class:`KcpContext` of ``rank`` (GOAL §3.1).
+    """The :class:`KcpContext` of ``rank`` (the KCP contract §3.1).
 
     ``group`` is the caller's ``torch.distributed`` process group (or ``None`` on the CPU / in a single process);
     when a group is given and the default process group is initialized, its size and this process's rank are
@@ -1698,7 +1739,8 @@ def build_kcp_context(
     Out-of-range problems are rejected here, before any launch: ``n_frag > 65536`` (the layout table's document
     search), int32 overflows of the kernels' offsets (``heads(H)``).  ``_kcp_test_knobs`` is the private test hook
     (SPEC-11; accepted only with ``CAKE_KCP_TEST_KNOBS=1``): its ``p_rule`` selects the plan's ``P`` rule for this
-    context (:data:`P_RULE_DEFAULT` = ``"wave"`` without the knob; ``"occ"`` = the round-0 rule, kept for the A/B
+    context (:data:`P_RULE_DEFAULT` = ``"wave_fill1"`` without the knob; ``"wave"`` = the earlier rule, ``"occ"`` = the
+    earlier rule, ``"wave_fill"`` = the unadopted fill on every rank with at most three fragments, kept for the A/B
     record); the public API never selects a rule other than the default.
     """
     if not isinstance(part, KcpPartition):
@@ -1839,7 +1881,7 @@ def build_kcp_context(
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Byte queries (FINAL_DESIGN §9; keyword-only beyond ``ctx``: the context carries no H)
+# Byte queries (the design note §9; keyword-only beyond ``ctx``: the context carries no H)
 
 
 def _check_save_mode(save_mode: str) -> None:
@@ -1856,7 +1898,7 @@ def kcp_saved_bytes(
     with_conv: bool = True,
     C: int = 8192,
 ) -> int:
-    """Saved-set bytes of one layer on this rank (GOAL §3.2 ``kcp_saved_bytes(ctx, ...)``)::
+    """Saved-set bytes of one layer on this rank (the KCP contract §3.2 ``kcp_saved_bytes(ctx, ...)``)::
 
     256 * T_r * H + tables_bytes(NC_pad, n_frag, NSEG)        # Aqk / Akk on the token rows + the int32 tables
     + n_in * s                                                 # S_in, s = H * 128 * 128 * 4
@@ -1865,10 +1907,10 @@ def kcp_saved_bytes(
     + [with_conv] * sum_cont hist_valid * C * 2                # the hist row pool (BF16)
     save_mode="tape": + NC_pad * H * 32768 + R * H * 256       # the forward's h tape and v_new
 
-    ``save_transfer`` defaults to :data:`SAVE_TRANSFER_DEFAULT` (``True`` since the round-1 adoption, ruling P2-R3);
-    the two ``[save_transfer]`` terms are the delta against the round-0 recompute form (``save_transfer=False``).
+    ``save_transfer`` defaults to :data:`SAVE_TRANSFER_DEFAULT` (``True`` since an earlier revision);
+    the two ``[save_transfer]`` terms are the delta against the earlier recompute form (``save_transfer=False``).
 
-    The retained ``S_in`` and c1 tensors are the padded receive buffers of P1-R4 (``s`` -> ``n_owners Hg`` tiles,
+    The retained ``S_in`` and c1 tensors are the padded receive buffers (``s`` -> ``n_owners Hg`` tiles,
     ``Hg_r`` -> ``Hg_pad_r``); identical to the formula for ``H = 64``, and the padding is reported by
     ``kcp_comm_bytes(...)["padding"]``.  ``M_seg`` stays the dense copy of §9 (``NSEG s``).
     """
@@ -1876,7 +1918,7 @@ def kcp_saved_bytes(
     H, C = int(H), int(C)
     hp = ctx.heads(H)
     s = H * STATE_TILE_BYTES
-    s_pad = hp.n_owners * hp.Hg * STATE_TILE_BYTES  # = s without padding (P1-R4)
+    s_pad = hp.n_owners * hp.Hg * STATE_TILE_BYTES  # = s without padding
     total = 256 * ctx.T_r * H + tables_bytes(ctx.NC_pad, ctx.n_frag, hp.NSEG)
     total += ctx.n_in * s_pad
     if save_transfer:
@@ -1898,13 +1940,13 @@ def kcp_comm_bytes(
     save_transfer: bool = SAVE_TRANSFER_DEFAULT,
     boundary_mode: str = "saved",
 ) -> dict:
-    """Bytes this rank moves per collective and per boundary (GOAL §3.2 ``kcp_comm_bytes(ctx)``; ``send`` / ``recv``
+    """Bytes this rank moves per collective and per boundary (the KCP contract §3.2 ``kcp_comm_bytes(ctx)``; ``send`` / ``recv``
     per collective, totals ``B1`` = forward (c1, c2, halo_fwd), ``B2`` = backward from the saved context (b1 with
     the re-sent maps unless ``save_transfer``, b2, halo_bwd), ``B3`` = the replayed forward + the backward with b1
     in its replay form (offsets only); plus the crossing-fragment counts and the per-fragment state bytes.
     Summed over the ranks, ``c2.recv`` = ``fwd_state_bytes``, ``c1.send`` = ``fwd_summary_bytes`` and ``b2.recv`` =
-    ``bwd_adjoint_bytes`` of the harness ``kcp_shapes.comm_bytes`` (plus the P1-R4 padding when ``H % Hg != 0``).
-    ``padding`` reports the P1-R4 padding bytes contained in c1 / c2 / b1 / b2 (``send`` / ``recv``), their ``B1`` /
+    ``bwd_adjoint_bytes`` of the harness ``kcp_shapes.comm_bytes`` (plus the padding when ``H % Hg != 0``).
+    ``padding`` reports the padding bytes contained in c1 / c2 / b1 / b2 (``send`` / ``recv``), their ``B1`` /
     ``B2`` sums, the padding retained inside the saved ``S_in`` (``s_in_saved``), the ``padded_owner`` and the
     ``pad_tiles_per_slot``; all zero for the production ``H = 64``."""
     if boundary_mode not in ("saved", "replay"):
@@ -1993,7 +2035,7 @@ def kcp_arena_layout(
     """The KCP arena's transient buffers in bytes (``KcpWorkspace``; SPEC-4: the saved-set tensors ``S_in``, the
     c1 receive tensor with ``save_transfer``, ``M_seg`` with ``save_transfer`` at ``P > 1`` and ``hist`` are NOT
     here).  ``forward`` / ``backward`` are the two lifetimes' sums; ``arena`` is their maximum (one reusable arena).
-    ``staging`` is the ``P > 1`` pair of dense planes ``stage_b`` / ``stage_m`` (``[NSEG, H, 128, 128]`` each, P1-R11; transient
+    ``staging`` is the ``P > 1`` pair of dense planes ``stage_b`` / ``stage_m`` (``[NSEG, H, 128, 128]`` each; transient
     in both lifetimes; the ``stage_m`` plane retained as ``M_seg`` with ``save_transfer`` is counted by :func:`kcp_saved_bytes`)."""
     _check_save_mode(save_mode)
     H, C = int(H), int(C)
@@ -2069,15 +2111,16 @@ def kcp_workspace_bytes(
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Private test knobs (FINAL_DESIGN §10.1, SPEC-11)
+# Private test knobs (the design note §10.1, SPEC-11)
 
 
 def validate_test_knobs(knobs) -> dict:
     """Normalize ``_kcp_test_knobs``: ``None`` -> the public defaults ``{"precision_mode": 0, "p_rule":
-    P_RULE_DEFAULT}`` (``"wave"``); a dict is accepted only when the environment variable ``CAKE_KCP_TEST_KNOBS=1``
+    P_RULE_DEFAULT}`` (``"wave_fill1"``); a dict is accepted only when the environment variable ``CAKE_KCP_TEST_KNOBS=1``
     is set, holds only known keys and selects a known ``precision_mode`` (0 shipped TF32 hi/lo; 1 the explicit
     three-MMA form of the R1 bitwise test; 2 plain TF32, the optional G2 cross-check) and a known ``p_rule``
-    (:data:`P_RULES`; ``"occ"`` = the round-0 rule, read by :func:`build_kcp_context`).  The public API can
+    (:data:`P_RULES`; ``"wave"`` = the earlier rule, ``"occ"`` = the occupancy rule, ``"wave_fill"`` = the unadopted
+    fill, read by :func:`build_kcp_context`).  The public API can
     therefore never select a non-zero mode or a P rule other than the shipped one."""
     if knobs is None:
         return {"precision_mode": 0, "p_rule": P_RULE_DEFAULT}
@@ -2155,6 +2198,7 @@ __all__ = [
     "table_words",
     "tables_bytes",
     "validate_test_knobs",
+    "WAVE_FILL_N_FRAG_MAX",
     "WAVE_MIN_NC_MAX_FRAG",
     "WAVE_N_FRAG_MAX",
     "WAVE_RULE_10NS",

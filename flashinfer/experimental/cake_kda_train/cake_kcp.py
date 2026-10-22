@@ -32,15 +32,59 @@ the forward's transfer was kept, ``M_f^T`` again go to the owners (``b1``), the
 owner walks each chain backwards (``X <- M_f^T X + d_f``) and returns every
 crossing-out fragment's ``dS_out`` (``b2``); the local adjoint recurrence runs
 from it.  One compute stream; the collectives are asynchronous on the caller's
-process group and waited at their first consumer.  Shipped schedule (round-1
-adoption of levers L-A + L-B, rulings P2-R1 / P2-R4): ``wait_first`` -- no merge
+process group and waited at their first consumer.  Shipped schedule (an earlier
+adoption of levers L-A + L-B): ``wait_first`` -- no merge
 or tape walk is issued while a collective is in flight, and the tape walks of a
-phase are one fused launch from the carry plane; the round-0 ``overlap`` form
+phase are one fused launch from the carry plane; the earlier ``overlap`` form
 (the document-start tape walk under ``c1``, the document-last adjoint tape walk
 under ``b2``: the two R7 overlaps) and the separate walks stay selectable through
 the test knobs ``schedule`` / ``fused_walks``.  Nothing launched between an issue
 and its wait reads that collective's buffers, so the bits are independent of the
 schedule and a checkpoint replay re-runs the same program order on every rank.
+CUDA-graph replay (adopted in this revision; keyword
+``graph="replay"`` of :func:`chunk_kda_kcp`, :func:`chunk_kda_kcp_fwd` and
+:func:`chunk_kda_kcp_bwd`, shipped default ``GRAPH_DEFAULT = "off"``): the
+first call of a validity key runs eagerly, the second is captured into a
+``torch.cuda.CUDAGraph`` and every later call of the key replays it -- the same
+launches and collectives, bitwise the eager result.  The key is the call's
+kind, its KcpContext / workspace / backend objects, every option and the
+shape / stride / dtype / data pointer of every operand and saved tensor: a
+framework gets the replay only with pointer-stable operands and the same
+objects per layer; anything else is a silent eager call (``GRAPH_STATS``,
+``LAST_CALL[kind]["graph_event"]``).  A replayed call returns the graph's static
+tensors, overwritten by the next replay of the key, so outputs and the saved
+set must be consumed before the next call of the same layer.  Each cached key
+pins a private memory pool (0.7-9.0 GiB per rank per key on the A/B
+rows; at most :data:`GRAPH_CACHE_MAX` keys); :func:`graph_cache_clear` releases
+them and must run before ``torch.distributed.destroy_process_group()``.
+``exchange="ring"``, ``debug_sequence`` and calls without a caller-owned
+workspace are never captured.
+
+Shipped walk-launch geometry (adopted in this revision;
+``WALK_GEOMETRY_DEFAULT = "lpt_tape_one_cta_per_sm"``): the offset walk lists of
+K1 / K2 / K3 launch in LPT order (longest segment first, ties by segment number;
+the tape lists already did) and the tape programs ``fwdh_tape`` / ``dhu_tape``
+run at one CTA per SM through the device cache-config preference that brackets
+each of their launches (``cudaFuncCachePreferL1`` before, ``cudaFuncCachePreferNone``
+after; the offset programs keep two CTAs per SM).  Order and placement never
+change a bit: every CTA walks its own (segment, head) chain into its own indexed
+tile.  The earlier geometry ``"shipped"`` and the other :data:`WALK_GEOMETRIES`
+stay selectable through the test knob ``walk_geometry`` for the A/B record.
+
+The bracket is host-side runtime state, so it is never issued inside a CUDA
+stream capture (``cudaDeviceSetCacheConfig`` would invalidate the capture,
+see below): under ``graph="replay"`` the tape one-CTA-per-SM launch cap
+(the walk-launch geometry) is not applied because ``cudaDeviceSetCacheConfig`` is incompatible
+with stream capture; at CP4 C B3 replay therefore gains about 2 pp less than the
+eager default, at CP8 / CP16 replay's own gain dominates.  The
+test knob ``graph_cap`` selects whether the preference is instead set once before
+the capture of a key and reset right after it ends (``"capture_pref"``: PreferL1
+for every kernel of the captured call, 6.8-18 % slower on every composition row
+of the gate -- rejected, a gated knob only) or left alone (``"none"``, the form of
+record); every call records its form as ``LAST_CALL[kind]["cache_config"]``
+(``"bracket"`` / ``"capture_pref"`` / ``"none"`` / ``"unavailable"``).  When no CUDA runtime soname loads, the
+shipped geometry keeps the LPT order, launches the tape programs without the
+cap after one ``RuntimeWarning`` and records ``"unavailable"``.
 
 The metadata (partition, context, head ownership, chain tables, split sizes,
 segment plan, compact-buffer addressing, byte queries) is
@@ -56,17 +100,19 @@ Semantics and contracts follow the KCP design note (its sections 3.5, 3.6, 6.4,
 6.5, 7.2-7.5, 9, 10 and 16).
 
 
-P > 1 staging (ruling P1-R11, 2026-10-21): the K1 ``_offset`` / K2 ``_offset`` / K3 passes of the segmented rank write two
+P > 1 staging: the K1 ``_offset`` / K2 ``_offset`` / K3 passes of the segmented rank write two
 dense planes ``stage_b`` / ``stage_m`` ([NSEG, H, 128, 128] FP32 each, ``tile_stride`` 1); K4 reads them element-wise through
-``elem_m`` / ``elem_c`` (map / carry / transposed-map / adjoint-carry families); the pair convention of P1-R1 / P1-R3 stays
+``elem_m`` / ``elem_c`` (map / carry / transposed-map / adjoint-carry families); the pair convention stays
 for K4's states (c1 / b1 pairs, ``tile_stride`` 2) and the carry plane; under ``save_transfer=True`` at ``P > 1`` the
 ``stage_m`` plane itself is the saved ``M_seg`` (no copy; ``kcp_saved_bytes`` keeps the ``NSEG * s`` term).
 """
 
 from __future__ import annotations
 
+import ctypes
 import dataclasses
 import os
+import warnings
 from collections.abc import Sequence
 from typing import Any
 
@@ -89,25 +135,74 @@ TRANSFER_WALKS = (
     "tf32_hilo",
     "bf16x3",
     "bf16x3_hw64",
-)  # K3 program family (P1-R15; non-default only via _kcp_test_knobs)  # exchange="auto" picks the ring when every chain has at most this many hops (SPEC-2)
+)  # K3 program family (non-default only via _kcp_test_knobs)  # exchange="auto" picks the ring when every chain has at most this many hops (SPEC-2)
 KCP_SAVED_VERSION = 1  # saved set {Aqk, Akk, tables, S_in [, c1 receive tensor, M_seg]}
 TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"
-# Round-1 host / plan levers (P2-R1, P2-R4; P1-R15 test knob class: reachable only through _kcp_test_knobs):
+# Host / plan levers (test knob class: reachable only through _kcp_test_knobs):
 SCHEDULES = (
     "overlap",
     "wait_first",
-)  # L-A: "wait_first" (shipped) = merges and tape walks after each wait; "overlap" = the round-0 R7 overlaps of FINAL_DESIGN §3.5 / §6.5 (test knob)
+)  # L-A: "wait_first" (shipped) = merges and tape walks after each wait; "overlap" = the earlier R7 overlaps of the design note §3.5 / §6.5 (test knob)
 COLS_RULES = (
     "fixed",
     "by_chains",
 )  # D1: K4 cols_per_cta of the 128-column state launches: the backend's, or 8 up to COLS_RULE_CHAINS chains else 16
 COLS_RULE_CHAINS = 24  # D1 threshold (DECISIONS.md D1: <= 24 concurrent chains -> c8, otherwise c16; map launches stay c16)
+# Walk-launch geometry: the launch geometry of the K1 / K2 / K3 walk kernels, a test
+# knob until this revision made "lpt_tape_one_cta_per_sm" the shipped default.  "shipped" =
+# the earlier lists and launches (the offset / staging lists in segment order, the runtime's own occupancy); "lpt_chains" =
+# every walk list in LPT order (longest segment first, ties by segment number; the tape lists already are); "one_cta_per_sm" =
+# the K1 / K2 kernels (115712 B of dynamic shared memory: two CTAs fit an SM only at the full 228 KiB carveout) launched at
+# one CTA per SM (the device cache-config preference bracketing the launch, see _FiPrograms; host side, no kernel change);
+# "tape_one_cta_per_sm" = the same cap for the tape kernels only (fwdh_tape / dhu_tape: the step-0 probe found co-resident
+# tape CTAs thrash while co-resident offset CTAs hide each other's latency); "lpt_*" = the LPT order plus that cap.  Order and
+# placement never touch a bit: every CTA walks its own (segment, head) chain (the kernels' map is walk_seg[b // H], head
+# b % H) into its own indexed tile.
+WALK_GEOMETRIES = (
+    "shipped",
+    "lpt_chains",
+    "one_cta_per_sm",
+    "lpt_one_cta_per_sm",
+    "tape_one_cta_per_sm",
+    "lpt_tape_one_cta_per_sm",
+)
+WALK_GEOMETRY_DEFAULT = "lpt_tape_one_cta_per_sm"  # shipped default: LPT offset lists + one CTA per SM for the tape programs; "shipped" = the earlier geometry, via _kcp_test_knobs
+WALK_LPT_GEOMETRIES = ("lpt_chains", "lpt_one_cta_per_sm", "lpt_tape_one_cta_per_sm")
+_WALK_K12 = (
+    "fwdh_offset",
+    "fwdh_tape",
+    "dhu_offset",
+    "dhu_tape",
+)  # K3 (193 KiB) is one CTA per SM by its footprint
+_WALK_TAPES = ("fwdh_tape", "dhu_tape")
+WALK_CAP_PROGRAMS: dict[
+    str, tuple[str, ...]
+] = {  # geometry -> the programs launched at one CTA per SM
+    "one_cta_per_sm": _WALK_K12,
+    "lpt_one_cta_per_sm": _WALK_K12,
+    "tape_one_cta_per_sm": _WALK_TAPES,
+    "lpt_tape_one_cta_per_sm": _WALK_TAPES,
+}
+WALK_CAP_GEOMETRIES = tuple(WALK_CAP_PROGRAMS)
+GRAPH_MODES = (
+    "off",
+    "replay",
+)  # graph replay: "replay" = keyed CUDA-graph capture / replay of the per-rank call; public keyword graph= since this revision
+GRAPH_DEFAULT = "off"  # shipped: the eager path; "replay" is opt-in per call (section "CUDA-graph replay of a call" below)
+GRAPH_CAPS = (
+    "none",
+    "capture_pref",
+)  # the cache-config form of a captured call -- "none" (no device preference under replay) | "capture_pref" (PreferL1 set before the capture of a key, PreferNone right after its end)
+GRAPH_CAP_DEFAULT = "none"  # of record ("capture_pref" lost 6.8-18 % on every row of the composition gate and stays a gated knob, recorded as rejected); _kcp_test_knobs only
 P2_KNOBS = {
     "schedule": SCHEDULES,
     "fused_walks": (0, 1),
     "cols_rule": COLS_RULES,
+    "walk_geometry": WALK_GEOMETRIES,
+    "graph": GRAPH_MODES,
+    "graph_cap": GRAPH_CAPS,
 }  # knob -> admitted values
-# Shipped defaults of the round-1 pair (adoption of levers L-A + L-B together, rulings P2-R1 / P2-R4, lane LAB's keep
+# Shipped defaults of the schedule / fused-walk pair (adoption of levers L-A + L-B together, the keep
 # rule): the "wait_first" schedule with the fused tape walks (one launch per phase).  "overlap" / fused_walks=0 stay
 # selectable through the test knobs for the A/B record; cols_rule stays "fixed" (D1 in band everywhere: not adopted,
 # knob kept).  The schedule and the walk grouping never change a published bit (the merges read c1_recv / the staging
@@ -115,7 +210,7 @@ P2_KNOBS = {
 SCHEDULE_DEFAULT = "wait_first"
 FUSED_WALKS_DEFAULT = 1
 
-# Program names of the dispatch table (the K1-K4 programs of FINAL_DESIGN §14) and the local chunk stages
+# Program names of the dispatch table (the K1-K4 programs of the design note §14) and the local chunk stages
 # (``cake_backend`` stages at the per-rank shape, launched through ``KdaWorkspace.run``).
 KCP_PROGRAMS = (
     "kcp_fwdh_offset",  # K1 ``_offset``: walk from zero, final state -> compact tiles (B_f / b_seg)
@@ -135,7 +230,7 @@ COLLECTIVES = ("c1", "c2", "b1", "b2")
 
 
 def tile_index(h: int, slot: int, hg: int, n: int) -> int:
-    """The kernels' head-group-major compact tile address (FINAL_DESIGN §7.3): tile ``((h // hg) * n + slot) * hg
+    """The kernels' head-group-major compact tile address (the design note §7.3): tile ``((h // hg) * n + slot) * hg
     + h % hg`` of a pool whose consecutive head groups each hold ``n`` slots of ``hg`` heads."""
     return ((h // hg) * n + slot) * hg + h % hg
 
@@ -245,7 +340,7 @@ class Backend:
     """A dispatch table for the KCP programs and the local chunk stages.
 
     ``run(name, args)`` launches program ``name`` (one of :data:`KCP_PROGRAMS`) with the logical arguments ``args``
-    (the ABI vocabulary of FINAL_DESIGN §14: pools, index tables, ``hg`` / ``n`` addressing scalars, modes; plus
+    (the ABI vocabulary of the design note §14: pools, index tables, ``hg`` / ``n`` addressing scalars, modes; plus
     ``_call``, the :class:`KcpCall` the launch belongs to).  ``stage(name, call, **extra)`` launches one local chunk
     stage of :mod:`.cake_backend` at the per-rank shape.  ``dtypes`` are the storage dtypes of the operands, outputs
     and states; ``local_stages`` says whether the local stages exist (the FP64 emulation folds them into its tape
@@ -293,7 +388,7 @@ _SPEC3_ROWS = (
     "qg",
     "w",
     "u",
-)  # the prep rows SPEC-3 compares (FINAL_DESIGN §6.4)
+)  # the prep rows SPEC-3 compares (the design note §6.4)
 SPEC3_ENV = "CAKE_KCP_SPEC3"  # "0": skip the debug assertion; "warn": record a failure without raising; default: assert
 _PROGRAM_OF = {
     "kcp_fwdh_offset": "fwdh_offset",
@@ -307,7 +402,7 @@ _PROGRAM_OF = {
 
 class KcpPreconditionError(RuntimeError):
     """SPEC-3 failed: ``bwd_prep`` + ``wy`` did not reproduce the forward's ``gk`` / ``kg`` / ``qg`` / ``w`` / ``u`` rows
-    bitwise (FINAL_DESIGN §6.4); saved mode and replay mode would differ.  Options (a) / (b) / (c) of §6.4 are a parent
+    bitwise (the design note §6.4); saved mode and replay mode would differ.  Options (a) / (b) / (c) of §6.4 are a parent
     decision (``NEED_PARENT``), never a silent relaxation."""
 
 
@@ -325,7 +420,7 @@ class _Block:
 
 class KernelBackend(Backend):
     """The shipped backend: the KCP programs K1-K4 through a program provider (``launch(program, args, *, grid,
-    device_index, precision_mode)`` with the positional ABI of FINAL_DESIGN §14 / rulings P1-R1, P1-R3) and the local
+    device_index, precision_mode)`` with the positional ABI of the design note §14) and the local
     chunk stages through :class:`cake_backend.KdaWorkspace` of the per-rank problem.  The default provider is H3's
     registry (:mod:`.cake_kcp_jit`, imported at the first launch so this module imports without it); a bring-up
     provider launching the source builds directly can be passed (``path="direct"``; never a gated row).
@@ -518,7 +613,7 @@ class KernelBackend(Backend):
                 f"SPEC-3: bwd_prep + wy differ from fwd_prep + wy on real rows: {result['rows']}"
             )
 
-    # -- KCP programs (positional ABI of FINAL_DESIGN §14 with rulings P1-R1 / P1-R3)
+    # -- KCP programs (positional ABI of the design note §14)
     def abi(
         self, name: str, args: dict[str, Any]
     ) -> tuple[str, list[Any], int, dict[str, Any]]:
@@ -737,7 +832,7 @@ class KernelBackend(Backend):
 
 
 def merge_cols_per_cta(ncols: int, n_chains: int, rule: str) -> int | None:
-    """D1 (DECISIONS.md D1, ruling P2-R4): the K4 ``cols_per_cta`` a launch asks for explicitly, ``None`` for the
+    """D1 (the column-rule decision): the K4 ``cols_per_cta`` a launch asks for explicitly, ``None`` for the
     registry's choice of record (``fixed``: the shipped rule, c8 state / c16 map).  ``by_chains`` keeps the 8-column
     program for 128-column state chains up to :data:`COLS_RULE_CHAINS` concurrent chains and takes the 16-column
     program beyond it; 256-column map chains stay with the registry's c16.  Bitwise per layout (K4 REPORT §3)."""
@@ -833,19 +928,248 @@ ABI_PARAMS["fwdh_tape"] = ABI_PARAMS["fwdh_offset"]
 ABI_PARAMS["dhu_tape"] = ABI_PARAMS["dhu_offset"]
 
 
+# Walk-launch geometry one_cta_per_sm / tape_one_cta_per_sm: the K1 / K2 walk kernels' occupancy capped from the host.
+# Their launch footprint (192 threads, 115712 B of dynamic shared memory) admits two CTAs per SM only at the full 228 KiB
+# carveout; the smallest configuration that fits one CTA admits exactly one.  The runtime picks a kernel's configuration at
+# launch from its function attribute (unset here) and otherwise from the device-wide preference (cudaDeviceSetCacheConfig):
+# cudaFuncCachePreferL1 selects the smallest fitting shared-memory configuration, i.e. one CTA per SM.  The generated
+# binding compiles the launch (cudaLaunchKernelExC with the fixed dynamic shared memory) and exports no symbol for the
+# kernel's registered host function (its wrapper survives only as the mangled `__device_stub__`, which the runtime does
+# not accept), so the per-function attribute cannot be set from the host; the knob brackets each capped launch with the
+# device-wide preference instead (PreferL1 before, PreferNone after).  The preference is host-side state read at launch:
+# launches already queued keep their configuration and only the bracketed launch takes PreferL1.  Host side only; no
+# kernel, launch-configuration or argument change.
+WALK_CACHE_CONFIG_CAP = 2  # cudaFuncCachePreferL1 (driver_types.h): the smallest shared-memory configuration that fits
+WALK_CACHE_CONFIG_DEFAULT = (
+    0  # cudaFuncCachePreferNone: the runtime's own choice (today's launches)
+)
+_CUDART_SONAMES = ("libcudart.so.13", "libcudart.so.12", "libcudart.so")
+_CUDART_CACHE: dict[
+    str, Any
+] = {}  # "rt": the loaded runtime, or None after a failed load (one RuntimeWarning)
+CACHE_CONFIG_STATS: dict[str, int] = {
+    "bracket": 0,
+    "capture_pref": 0,
+    "none": 0,
+    "unavailable": 0,
+    "capture_skips": 0,
+}  # calls recorded per cache-config form; capture_skips = capped launches issued bare inside a capture
+
+
+def _cudart() -> Any:
+    """The CUDA runtime of this process (the instance torch and the JIT libraries link), its cache-config entry points
+    typed."""
+    for soname in _CUDART_SONAMES:
+        try:
+            rt = ctypes.CDLL(soname)
+        except OSError:
+            continue
+        rt.cudaDeviceSetCacheConfig.argtypes = [ctypes.c_int]
+        rt.cudaDeviceGetCacheConfig.argtypes = [ctypes.c_void_p]
+        rt.cudaGetLastError.argtypes = []
+        for fn in (
+            rt.cudaDeviceSetCacheConfig,
+            rt.cudaDeviceGetCacheConfig,
+            rt.cudaGetLastError,
+        ):
+            fn.restype = ctypes.c_int
+        return rt
+    raise RuntimeError(
+        f"walk_geometry one_cta_per_sm: none of {_CUDART_SONAMES} is loadable in this process"
+    )
+
+
+def _cudart_available() -> Any | None:
+    """:func:`_cudart`'s runtime, or ``None`` when no soname of :data:`_CUDART_SONAMES` loads in this process (one
+    ``RuntimeWarning`` naming the sonames tried; the capped programs then launch without the bracket, the
+    LPT order stays, and the call records ``cache_config="unavailable"``)."""
+    if "rt" not in _CUDART_CACHE:
+        try:
+            _CUDART_CACHE["rt"] = _cudart()
+        except RuntimeError as exc:
+            _CUDART_CACHE["rt"] = None
+            warnings.warn(
+                f"{exc}: the one-CTA-per-SM programs of walk_geometry launch without the cache-config bracket (cache_config='unavailable')",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    return _CUDART_CACHE["rt"]
+
+
+def _capturing() -> bool:
+    """``True`` inside a CUDA stream capture of the current thread (the bracket is never issued there)."""
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+def walk_device_cache_config(device_index: int, config: int | None) -> dict[str, Any]:
+    """Set (``config`` not ``None``) and read back the device-wide cache-configuration preference of device
+    ``device_index`` through the CUDA runtime; returns the evidence record (``rc`` of the set, the read-back value)."""
+    rt = _cudart()
+    with torch.cuda.device(device_index):
+        rc = None
+        if config is not None:
+            rc = int(rt.cudaDeviceSetCacheConfig(int(config)))
+            if rc != 0:
+                raise RuntimeError(
+                    f"cudaDeviceSetCacheConfig({config}) failed with CUDA error {rc}"
+                )
+        got = ctypes.c_int(-1)
+        rc_get = int(rt.cudaDeviceGetCacheConfig(ctypes.byref(got)))
+        if rc_get != 0:
+            raise RuntimeError(
+                f"cudaDeviceGetCacheConfig failed with CUDA error {rc_get}"
+            )
+    return {
+        "device_index": int(device_index),
+        "set": config,
+        "rc": rc,
+        "readback": int(got.value),
+    }
+
+
 class _FiPrograms:
     """The FI-rendered program provider: H3's :mod:`.cake_kcp_jit` registry, through whichever entry it exports:
     ``launch_kcp(program, abi, *, grid, device_index, precision_mode, transfer_walk)`` (positional ABI), else
     ``run_program(name, args, device_index=)`` (the abstract launch ``args`` of :class:`KcpCall` — H3's 09:59Z form),
     else ``run_module(record, values, grid=(x, 1, 1), device_index=)`` with ``values`` keyed by :data:`ABI_PARAMS`
-    (record names ``kcp_<program>``; the merge record by ``ncols``: ``_c8`` / ``_c16``; K3 test variants by suffix)."""
+    (record names ``kcp_<program>``; the merge record by ``ncols``: ``_c8`` / ``_c16``; K3 test variants by suffix).
+    Under a ``walk_geometry`` in :data:`WALK_CAP_GEOMETRIES` (the shipped ``lpt_tape_one_cta_per_sm`` since this
+    revision) the programs of :data:`WALK_CAP_PROGRAMS` launch at one CTA per SM: the launch
+    is bracketed by the device cache-config preference (:func:`walk_device_cache_config`,
+    ``WALK_CACHE_CONFIG_CAP`` before, ``WALK_CACHE_CONFIG_DEFAULT`` after); ``carveout_log`` keeps the first brackets'
+    evidence per (program, device) and ``carveout_state`` the preference last set per device.  Inside a CUDA stream
+    capture the bracket is never issued (``cudaDeviceSetCacheConfig`` invalidates a capture; the
+    captured call's form is :func:`_graph_cap_bracket`'s; ``capture_skips`` counts such launches) and without a loadable
+    CUDA runtime the capped programs launch bare after one warning (``unavailable`` counts them)."""
 
     path = "fi-rendered"
 
     def __init__(self, jit: Any) -> None:
         self.jit = jit
+        self.carveout_state: dict[
+            int, int
+        ] = {}  # device -> the cache-config preference last set (never touched: absent)
+        self.carveout_log: dict[
+            tuple[str, int], list[dict[str, Any]]
+        ] = {}  # (program, device) -> evidence of the first brackets
+        self._rt: Any = None
+        self.capture_skips = (
+            0  # capped launches issued inside a stream capture (no bracket)
+        )
+        self.unavailable = (
+            0  # capped launches issued without a loadable CUDA runtime (no bracket)
+        )
+
+    def set_cache_config(self, program: str, device_index: int, config: int) -> None:
+        """One side of a capped launch's bracket.  The first brackets of a (program, device) go through
+        :func:`walk_device_cache_config` (set + read-back, kept as evidence); the later ones are the bare runtime call."""
+        key = (program, int(device_index))
+        log = self.carveout_log.setdefault(key, [])
+        if len(log) < 4:
+            log.append(walk_device_cache_config(device_index, config))
+        else:
+            if self._rt is None:
+                self._rt = _cudart()
+            if torch.cuda.current_device() != int(device_index):
+                with torch.cuda.device(device_index):
+                    rc = int(self._rt.cudaDeviceSetCacheConfig(int(config)))
+            else:
+                rc = int(self._rt.cudaDeviceSetCacheConfig(int(config)))
+            if rc != 0:
+                raise RuntimeError(
+                    f"cudaDeviceSetCacheConfig({config}) failed with CUDA error {rc}"
+                )
+        self.carveout_state[int(device_index)] = int(config)
 
     def launch(
+        self,
+        program: str,
+        abi: list[Any],
+        *,
+        grid: int,
+        device_index: int,
+        precision_mode: int = 0,
+        transfer_walk: str = "tf32_hilo",
+        name: str | None = None,
+        args: dict[str, Any] | None = None,
+        cols_per_cta: int | None = None,
+    ) -> None:
+        call = args.get("_call") if args is not None else None
+        geometry = (
+            getattr(call, "walk_geometry", WALK_GEOMETRY_DEFAULT)
+            if call is not None
+            else WALK_GEOMETRY_DEFAULT
+        )
+        if program in WALK_CAP_PROGRAMS.get(
+            geometry, ()
+        ):  # this launch at one CTA per SM (bracketed preference)
+            scratch = getattr(
+                call, "scratch", None
+            )  # the call's record of its cache-config form
+            if _capturing():  # never inside a stream capture; the capture's preference is _graph_cap_bracket's
+                self.capture_skips += 1
+                CACHE_CONFIG_STATS["capture_skips"] += 1
+                self._launch(
+                    program,
+                    abi,
+                    grid=grid,
+                    device_index=device_index,
+                    precision_mode=precision_mode,
+                    transfer_walk=transfer_walk,
+                    name=name,
+                    args=args,
+                    cols_per_cta=cols_per_cta,
+                )
+                return
+            if (
+                _cudart_available() is None
+            ):  # no CUDA runtime soname -> the LPT order stays, the cap is skipped
+                self.unavailable += 1
+                if scratch is not None:
+                    scratch["cache_config"] = "unavailable"
+                self._launch(
+                    program,
+                    abi,
+                    grid=grid,
+                    device_index=device_index,
+                    precision_mode=precision_mode,
+                    transfer_walk=transfer_walk,
+                    name=name,
+                    args=args,
+                    cols_per_cta=cols_per_cta,
+                )
+                return
+            if scratch is not None:
+                scratch["cache_config"] = "bracket"
+            self.set_cache_config(program, device_index, WALK_CACHE_CONFIG_CAP)
+            try:
+                self._launch(
+                    program,
+                    abi,
+                    grid=grid,
+                    device_index=device_index,
+                    precision_mode=precision_mode,
+                    transfer_walk=transfer_walk,
+                    name=name,
+                    args=args,
+                    cols_per_cta=cols_per_cta,
+                )
+            finally:
+                self.set_cache_config(program, device_index, WALK_CACHE_CONFIG_DEFAULT)
+            return
+        self._launch(
+            program,
+            abi,
+            grid=grid,
+            device_index=device_index,
+            precision_mode=precision_mode,
+            transfer_walk=transfer_walk,
+            name=name,
+            args=args,
+            cols_per_cta=cols_per_cta,
+        )
+
+    def _launch(
         self,
         program: str,
         abi: list[Any],
@@ -926,7 +1250,7 @@ class Indexed:
     """A compact state pool as a walk kernel reads or writes it: ``pool`` (a flat tensor of ``128 x 128`` tiles),
     ``index[seg]`` (the slot of segment ``seg``; ``-1`` = no tile: the zero state on input, not written on output) and
     ``tiles[slot][h]`` (the tile number of head ``h`` of that slot inside ``pool``).  :meth:`addressing` recovers the
-    kernels' two-integer form (ruling P1-R3 / P1-R4): ``tiles[slot][h] == base_tile + tile_index(h, slot, hg, n) * stride``."""
+    kernels' two-integer form: ``tiles[slot][h] == base_tile + tile_index(h, slot, hg, n) * stride``."""
 
     pool: torch.Tensor
     index: tuple[int, ...]
@@ -963,7 +1287,7 @@ class Indexed:
 
 
 class Chains:
-    """K4 chain tables of one launch (FINAL_DESIGN §14.4; ruling P1-R1): CSR over elements ``(elem_m, elem_c, elem_y)``
+    """K4 chain tables of one launch (the design note §14.4): CSR over elements ``(elem_m, elem_c, elem_y)``
     in application order (element offsets into the ``m`` / ``c`` / ``y`` pools; ``elem_c = -1`` no offset; ``elem_y`` =
     where the state ENTERING the element is published when ``write_states``, ``-1`` none), the initial state
     ``x0_index`` (``-1``: zero) and ``y_final`` (the state leaving the chain; an empty chain publishes its initial state).
@@ -1031,7 +1355,7 @@ def _prefix(values) -> list[int]:
 class _Tables:
     """Everything the launch sequences read for one ``(ctx, H)``: the segment plan, walk lists, the compact tile
     tables of every pool, the collective splits and the K4 chains, derived once from ``cake_kcp_plan.KcpContext`` /
-    ``KcpHeadPlan`` and cached by the workspace (FINAL_DESIGN §7.2, §10.3, §14.4; rulings P1-R1, P1-R3, P1-R4).
+    ``KcpHeadPlan`` and cached by the workspace (the design note §7.2, §10.3, §14.4).
 
     Pools (tile = 16384 floats; tile numbers pool-relative): ``c1_send`` = owner-major ``(out_slot, head)`` pairs
     ``[B_f | M_f^T]`` (B tile ``2 t``, M tile ``2 t + 1`` of ``hp.out_tile[out_slot][h] = t``); ``S_in`` (the c2
@@ -1045,19 +1369,31 @@ class _Tables:
     ``Mop`` (the c1 / staging ``M^T`` tiles under ``Mop = M^T``).  The segment compositions of a fragment (``P > 1``)
     therefore split into the forward family (``Mop = M_p``, segments in order, ``transpose_m = 0``: ``B_f``, ``M_f``,
     carries) and the adjoint family (``Mop = M_p^T``, segments in reverse, ``transpose_m = 1``: ``d_f``, ``M_f^T``,
-    adjoint carries); each is one launch (ruling P1-R3 fixes the pair orientations ``[B_f | M_f^T]`` and ``[d_f | M_f]``).
+    adjoint carries); each is one launch (the pair orientations are ``[B_f | M_f^T]`` and ``[d_f | M_f]``).
     """
 
     _ring: _Ring | None = None  # the ring-exchange tables, derived on first use
 
     def __init__(
-        self, ctx: Any, H: int, *, fused_walks: int = FUSED_WALKS_DEFAULT
+        self,
+        ctx: Any,
+        H: int,
+        *,
+        fused_walks: int = FUSED_WALKS_DEFAULT,
+        walk_geometry: str = WALK_GEOMETRY_DEFAULT,
     ) -> None:
         self.ctx = ctx
         self.H = H = int(H)
         self.fused_walks = int(
             fused_walks
-        )  # lever L-B (P2-R1 / P2-R4 bundle): one base pointer per tape phase
+        )  # lever L-B: one base pointer per tape phase
+        if walk_geometry not in WALK_GEOMETRIES:
+            raise ValueError(
+                f"walk_geometry must be one of {WALK_GEOMETRIES}, got {walk_geometry!r}"
+            )
+        self.walk_geometry = str(
+            walk_geometry
+        )  # walk-launch geometry: the walk lists' order (+ the launch-time occupancy cap)
         hp = self.hp = ctx.heads(H)
         self.P, self.NSEG = int(hp.P), int(hp.NSEG)
         self.Hg, self.Hg_r = int(hp.Hg), int(hp.Hg_r)
@@ -1124,6 +1460,18 @@ class _Tables:
         self.walk_live = segs(starts + ins, range(P))
         self.walk_in_fused = segs(ins, range(P))
         self.walk_cross_fused = segs(outs, range(P))
+        # walk geometry "lpt_chains": the offset walks too (K1 / K3 / K2 _offset, the P > 1 staging and re-walk lists) in LPT
+        # order; the tape lists above already are.  The order is the CTA issue order of a launch only -- never a bit.
+        if self.walk_geometry in WALK_LPT_GEOMETRIES:
+
+            def lpt(lst):
+                return sorted(
+                    (int(s) for s in lst),
+                    key=lambda s: (-(seg_table[s + 1] - seg_table[s]), s),
+                )
+
+            self.walk_offset, self.walk_all = lpt(self.walk_offset), lpt(self.walk_all)
+            self.walk_in, self.walk_m_b1 = lpt(self.walk_in), lpt(self.walk_m_b1)
         # -- per-segment slot tables
         self.h0_index = tuple(int(i) for i in hp.h0_index)
         self.carry_index = tuple(int(i) for i in hp.carry_index)
@@ -1382,9 +1730,7 @@ class _Tables:
 
             def copy_slot(
                 f, h: int, slot: int
-            ) -> (
-                int
-            ):  # elem_y of the first element = publish the entering state (P1-R1)
+            ) -> int:  # elem_y of the first element = publish the entering state
                 return (
                     self.carry_tiles[extra + slot][h] * TILE if self.fused_walks else -1
                 )
@@ -1490,7 +1836,7 @@ class _Tables:
                 )
 
     def _owner_fwd(self) -> Chains:
-        """The owner's forward chains (FINAL_DESIGN §3.5): per document and owned head, from ``X0 = B_{f1}`` (the
+        """The owner's forward chains (the design note §3.5): per document and owned head, from ``X0 = B_{f1}`` (the
         start fragment's offset: ``S_in(f2)``) over the fragments ``f2 .. f(n-1)`` with ``Mop = M_f`` (c1 ``M_f^T``
         tiles, ``transpose_m = 0``); the state entering each element and the final state are the ``S_in`` of the
         element's fragment and of ``fn``, published into the c2 send layout."""
@@ -1520,7 +1866,7 @@ class _Tables:
         return ch
 
     def _owner_adj(self, d_key: str, m_key: str) -> Chains:
-        """The owner's adjoint chains (FINAL_DESIGN §6.5): per document and owned head, from ``X0 = d_{fn}`` (the
+        """The owner's adjoint chains (the design note §6.5): per document and owned head, from ``X0 = d_{fn}`` (the
         last fragment's adjoint offset: ``dS_out(f(n-1))``) over ``f(n-1) .. f2`` with ``Mop = M_f^T``; the state
         entering each element and the final state are the ``dS_out`` of the element's predecessor, published into the
         b2 send layout.  ``d_key`` / ``m_key`` name the plan module's offset tables (``adj_d_off_dm`` +
@@ -1612,6 +1958,7 @@ class _Tables:
             "n_out": self.n_out,
             "max_hops": self.max_hops,
             "fused_walks": self.fused_walks,
+            "walk_geometry": self.walk_geometry,
             "walks": {
                 "live": len(self.walk_live),
                 "start": len(self.walk_start),
@@ -1630,11 +1977,11 @@ class _Tables:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Workspace (FINAL_DESIGN §7.4): transient buffers only; saved-set tensors are fresh per call (SPEC-4)
+# Workspace (the design note §7.4): transient buffers only; saved-set tensors are fresh per call (SPEC-4)
 
 
 class KcpWorkspace:
-    """The transient buffers of the KCP route on one rank (FINAL_DESIGN §7.4) plus the existing backend's local
+    """The transient buffers of the KCP route on one rank (the design note §7.4) plus the existing backend's local
     arena (``cake_backend.KdaWorkspace``) for the token-side stages.
 
     Pools (flat, ``state_dtype``): ``c1_send``, ``c1_recv``, ``c2_send``; ``b1_send``, ``b1_recv``, ``b2_send``,
@@ -1665,7 +2012,7 @@ class KcpWorkspace:
         self.save_mode = save_mode
         self.device: torch.device | None = None
         self._pools: dict[str, torch.Tensor] = {}
-        self._tables: dict[tuple[Any, int, int], _Tables] = {}
+        self._tables: dict[tuple[Any, int, int, str], _Tables] = {}
         self.local: Any | None = None
         if ctx is not None:
             if H is None:
@@ -1673,12 +2020,17 @@ class KcpWorkspace:
             self.ensure(ctx, H, device=device, backward=backward)
 
     def tables(
-        self, ctx: Any, H: int, *, fused_walks: int = FUSED_WALKS_DEFAULT
+        self,
+        ctx: Any,
+        H: int,
+        *,
+        fused_walks: int = FUSED_WALKS_DEFAULT,
+        walk_geometry: str = WALK_GEOMETRY_DEFAULT,
     ) -> _Tables:
-        key = (ctx, int(H), int(fused_walks))
+        key = (ctx, int(H), int(fused_walks), str(walk_geometry))
         tb = self._tables.get(key)
         if tb is None:
-            tb = _Tables(ctx, H, fused_walks=fused_walks)
+            tb = _Tables(ctx, H, fused_walks=fused_walks, walk_geometry=walk_geometry)
             self._tables[key] = tb
         return tb
 
@@ -1690,6 +2042,7 @@ class KcpWorkspace:
         device: torch.device | str | None = None,
         backward: bool = True,
         fused_walks: int = FUSED_WALKS_DEFAULT,
+        walk_geometry: str = WALK_GEOMETRY_DEFAULT,
     ) -> _Tables:
         """Size the pools (and the local arena) for ``(ctx, H)``; returns the tables."""
         device = (
@@ -1701,7 +2054,7 @@ class KcpWorkspace:
             raise ValueError(
                 f"KcpWorkspace: lives on {self.device}, the call is on {device}"
             )
-        tb = self.tables(ctx, H, fused_walks=fused_walks)
+        tb = self.tables(ctx, H, fused_walks=fused_walks, walk_geometry=walk_geometry)
         for name, n in tb.pool_sizes(backward).items():
             cur = self._pools.get(name)
             if cur is None or cur.numel() < n:
@@ -1751,12 +2104,12 @@ class KcpWorkspace:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Saved set (FINAL_DESIGN §16), options (§10.1), exchange scheme (SPEC-2)
+# Saved set (the design note §16), options (§10.1), exchange scheme (SPEC-2)
 
 
 @dataclasses.dataclass(frozen=True)
 class KcpSaved:
-    """The saved context of one forward (``boundary_mode="saved"``, FINAL_DESIGN §16): ``S_in`` (the fresh c2
+    """The saved context of one forward (``boundary_mode="saved"``, the design note §16): ``S_in`` (the fresh c2
     output), the owner's c1 receive tensor (``save_transfer``), ``M_seg`` (``save_transfer`` at ``P > 1``), the
     token-row ``Aqk`` / ``Akk`` of the existing version-1 set (kernel path), and the scalars of the call.  The int32
     tables are rebuilt from ``ctx`` (droppable, §16 item 3)."""
@@ -1831,31 +2184,40 @@ class KcpSaved:
 
 @dataclasses.dataclass
 class KcpOptions:
-    """The extra keywords of the entry points (FINAL_DESIGN §10.1): ``save_transfer`` (R6: keep the owner's c1
-    receive tensor / ``M_seg`` for the backward; default :data:`cake_kcp_plan.SAVE_TRANSFER_DEFAULT` = ``True`` since
-    the round-1 adoption, ruling P2-R3; ``False`` = the round-0 recompute form, which re-sends ``M_f^T`` in b1),
-    ``exchange`` (``auto`` | ``a2a`` | ``ring``; ring only when ``n_d_max - 1 <= 2``, SPEC-2, and only with
-    ``save_transfer=False``: the ring path receives no c1 tensor), ``head_groups`` (``G``; Phase 1 ships ``1``),
+    """The extra keywords of the entry points (the design note §10.1): ``save_transfer`` (R6: keep the owner's c1
+    receive tensor / ``M_seg`` for the backward; ``None`` = the default = resolve: :data:`cake_kcp_plan.SAVE_TRANSFER_DEFAULT`
+    = ``True`` since an earlier revision for the a2a exchange, ``False`` for ``exchange="ring"``, whose
+    path receives no c1 tensor; an explicit ``False`` = the earlier recompute form, which re-sends
+    ``M_f^T`` in b1; an explicit ``True`` with the ring is a ``ValueError`` -- there is no ring form of it),
+    ``exchange`` (``auto`` | ``a2a`` | ``ring``; ring only when ``n_d_max - 1 <= 2``, SPEC-2; ``auto`` is ``a2a``
+    today), ``head_groups`` (``G``; Phase 1 ships ``1``),
     ``offset_class`` (``fla``: K1 / K2 offsets; ``fp32`` is a Phase-2 knob), ``debug_sequence`` (R7: all-gather the
-    collective issue order and assert it), ``precision_mode`` (K3's static program; set only through ``_kcp_test_knobs``)."""
+    collective issue order and assert it), ``graph`` (``"off"`` shipped | ``"replay"``: keyed CUDA-graph capture / replay of the
+    per-rank call -- see "CUDA-graph replay of a call" below for the validity key, the
+    pointer-stability requirement, the private pools' memory, the eager fallback and :func:`graph_cache_clear`),
+    ``graph_cap`` (``"none"`` | ``"capture_pref"``: the device cache-config preference around a capture;
+    ``_kcp_test_knobs`` only), ``precision_mode`` (K3's static program; set only through ``_kcp_test_knobs``)."""
 
-    save_transfer: bool = (
-        cake_kcp_plan.SAVE_TRANSFER_DEFAULT
-    )  # P2-R3: True shipped; False = round-0 recompute form
+    save_transfer: bool | None = (
+        None  # None = resolve: SAVE_TRANSFER_DEFAULT (True) for a2a / auto, False for the ring; explicit False = the recompute form
+    )
     exchange: str = "auto"
     head_groups: int = 1
     offset_class: str = "fla"
     debug_sequence: bool = False
     precision_mode: int = 0
     transfer_walk: str = (
-        "tf32_hilo"  # K3 program family (P1-R15); set only through _kcp_test_knobs
+        "tf32_hilo"  # K3 program family; set only through _kcp_test_knobs
     )
     p_rule: str | None = (
-        None  # plan P rule named by _kcp_test_knobs (lever L-C); None = the context's; must equal ctx.p_rule
+        None  # plan P rule named by _kcp_test_knobs (the wave rules); None = the context's; must equal ctx.p_rule
     )
-    schedule: str = SCHEDULE_DEFAULT  # L-A (P2-R1): "wait_first" (shipped) issues the merges and tape walks after each wait; "overlap" via _kcp_test_knobs
+    schedule: str = SCHEDULE_DEFAULT  # L-A: "wait_first" (shipped) issues the merges and tape walks after each wait; "overlap" via _kcp_test_knobs
     fused_walks: int = FUSED_WALKS_DEFAULT  # L-B (shipped 1): one tape launch per phase from the carry plane (+ the S_in / dS_out copies); 0 via _kcp_test_knobs
-    cols_rule: str = "fixed"  # D1 (P2-R4): "by_chains" = c8 up to COLS_RULE_CHAINS state chains, c16 beyond; _kcp_test_knobs only
+    cols_rule: str = "fixed"  # D1: "by_chains" = c8 up to COLS_RULE_CHAINS state chains, c16 beyond; _kcp_test_knobs only
+    walk_geometry: str = WALK_GEOMETRY_DEFAULT  # walk geometry: shipped "lpt_tape_one_cta_per_sm"; "shipped" (the earlier geometry) and the other WALK_GEOMETRIES via _kcp_test_knobs only
+    graph: str = GRAPH_DEFAULT  # graph replay: public keyword; "replay" captures a call once per validity key and replays it (eager on a key miss); also reachable through _kcp_test_knobs for the A/B record
+    graph_cap: str = GRAPH_CAP_DEFAULT  # the cache-config form of a captured call ("none" of record | "capture_pref" rejected); _kcp_test_knobs only
 
     def check(self) -> KcpOptions:
         if self.exchange not in EXCHANGES:
@@ -1873,6 +2235,18 @@ class KcpOptions:
         if int(self.head_groups) != 1:
             raise NotImplementedError(
                 "head_groups > 1 (lever L3) is not part of Phase 1"
+            )
+        if (
+            self.save_transfer is None
+        ):  # the ring scheme has no save_transfer form -> it resolves to False there
+            self.save_transfer = (
+                False
+                if self.exchange == "ring"
+                else bool(cake_kcp_plan.SAVE_TRANSFER_DEFAULT)
+            )
+        elif self.save_transfer and self.exchange == "ring":
+            raise ValueError(
+                "exchange='ring' receives no c1 tensor: save_transfer=True has no ring form (leave save_transfer unset, or pass False)"
             )
         self.save_transfer = bool(self.save_transfer)
         self.debug_sequence = bool(self.debug_sequence)
@@ -1899,12 +2273,13 @@ _OPTION_KEYS = (
     "head_groups",
     "offset_class",
     "debug_sequence",
-)
+    "graph",
+)  # graph: a public keyword
 
 
 def _options(kwargs: dict[str, Any]) -> KcpOptions:
     """Validate the entry points' ``**options`` (unknown keywords are a ``TypeError``); ``_kcp_test_knobs`` goes
-    through the plan module's validator (``precision_mode``) and, for the P1-R15 knob ``transfer_walk`` (K3's
+    through the plan module's validator (``precision_mode``) and, for the test knob ``transfer_walk`` (K3's
     ``bf16x3`` / ``bf16x3_hw64`` candidates of ``build.test.json``), through the same environment gate here, so the
     public API can never select a non-zero ``precision_mode`` or a non-shipped transfer-walk program."""
     kwargs = dict(kwargs)
@@ -1924,7 +2299,7 @@ def _options(kwargs: dict[str, Any]) -> KcpOptions:
     p2: dict[str, Any] = {}
     if isinstance(raw, dict) and any(
         k in raw for k in P2_KNOBS
-    ):  # round-1 levers (P2-R1 / P2-R4): the same gate
+    ):  # the earlier levers: the same gate
         if os.environ.get(cake_kcp_plan.TEST_KNOBS_ENV) != "1":
             raise ValueError(
                 f"_kcp_test_knobs is a private test hook: it is accepted only with {cake_kcp_plan.TEST_KNOBS_ENV}=1 in the environment"
@@ -1935,6 +2310,14 @@ def _options(kwargs: dict[str, Any]) -> KcpOptions:
                 p2[key] = (
                     int(raw.pop(key)) if key == "fused_walks" else str(raw.pop(key))
                 )
+    if (
+        "graph" in p2
+    ):  # graph is a public keyword as well; the knob form (A/B record) may not contradict it
+        if "graph" in kwargs and str(kwargs["graph"]) != p2["graph"]:
+            raise ValueError(
+                f"graph given twice with different values: keyword {kwargs['graph']!r}, _kcp_test_knobs {p2['graph']!r}"
+            )
+        kwargs["graph"] = p2.pop("graph")
     knobs = cake_kcp_plan.validate_test_knobs(raw)
     p_rule = (
         knobs["p_rule"] if isinstance(raw, dict) and "p_rule" in raw else None
@@ -1961,7 +2344,7 @@ def _exchange_scheme(tb: _Tables, opts: KcpOptions) -> str:
             raise ValueError(
                 f"exchange='ring' needs n_d_max - 1 <= {RING_MAX_HOPS}, this partition has {tb.max_hops}"
             )
-        if opts.save_transfer:
+        if opts.save_transfer:  # unreachable through _options() (KcpOptions.check resolves / refuses it); kept as the guard of the contract
             raise NotImplementedError(
                 "exchange='ring' receives no c1 tensor: save_transfer=True has no ring form"
             )
@@ -2042,6 +2425,11 @@ class KcpCall:
         if int(tb.fused_walks) != int(opts.fused_walks):
             raise ValueError(
                 f"tables built with fused_walks={tb.fused_walks}, the call asks for {opts.fused_walks}"
+            )
+        self.walk_geometry = str(opts.walk_geometry)  # walk geometry
+        if tb.walk_geometry != self.walk_geometry:
+            raise ValueError(
+                f"tables built with walk_geometry={tb.walk_geometry!r}, the call asks for {self.walk_geometry!r}"
             )
 
     # -- buffers
@@ -2194,7 +2582,7 @@ LAST_CALL: dict[str, dict[str, Any]] = {}
 
 
 def _record(kind: str, call: KcpCall) -> None:
-    """The launch inventory of the last forward / backward (FINAL_DESIGN §10.5; M1 reads it)."""
+    """The launch inventory of the last forward / backward (the design note §10.5)."""
     LAST_CALL[kind] = {
         **{f"n_{k}": v for k, v in call.counters.items()},
         "sequence": list(call.sequence),
@@ -2213,19 +2601,31 @@ def _record(kind: str, call: KcpCall) -> None:
         "transfer_walk": call.transfer_walk,
         "schedule": call.schedule,
         "fused_walks": call.tb.fused_walks,
-        "cols_rule": call.cols_rule,  # round-1 knobs (P2-R1 / P2-R4)
+        "cols_rule": call.cols_rule,  # the earlier knobs
+        "walk_geometry": call.walk_geometry,  # walk-launch geometry
         "merges": list(
             call.merge_log
         ),  # D1 evidence: (family, ncols, n_chains, explicit cols_per_cta or None = registry)
         "spec3": call.scratch.get(
             "spec3"
         ),  # the SPEC-3 debug assertion's result (first saved-mode backward)
+        "graph": call.opts.graph,
+        "graph_event": "eager",
+        "graph_key": None,
+        "graph_fallback": None,  # the graph mode and how this call ran
+        "cache_config": call.scratch.get(
+            "cache_config", "none"
+        ),  # "bracket" (eager capped launches) / "capture_pref" / "none" / "unavailable"
+        "cache_config_bracket": call.scratch.get(
+            "cache_config_bracket"
+        ),  # the capture-wide preference's set / reset evidence (arm "capture_pref")
     }
+    CACHE_CONFIG_STATS[LAST_CALL[kind]["cache_config"]] += 1
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Launch sequences (FINAL_DESIGN §3.5 forward, §6.5 backward; one compute stream, waits at first consumption, R7;
-# shipped since round 1: schedule wait_first + fused tape walks, the R7 overlaps only under the overlap knob)
+# Launch sequences (the design note §3.5 forward, §6.5 backward; one compute stream, waits at first consumption, R7;
+# shipped: schedule wait_first + fused tape walks, the R7 overlaps only under the overlap knob)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -2601,7 +3001,7 @@ def _fwd_tapes(
     """The forward tape walk(s) after ``S_in`` is complete.  ``fused_walks`` (L-B): one launch from one pool -- the
     carry plane at ``P > 1`` (``h0_index_fused``: carries, the ``S_in`` copies of ``carry_in``, ``-1`` zero states),
     ``S_in`` itself at ``P = 1`` -- over every live segment (``wait_first``) or the crossing-in fragments' segments
-    (the document-start walk ran under c1); otherwise the three launches of FINAL_DESIGN §3.5 (the document-start
+    (the document-start walk ran under c1); otherwise the three launches of the design note §3.5 (the document-start
     walk here only under ``wait_first``)."""
     tb = call.tb
     h0_in = call.indexed("S_in", tb.h0_index, tb.s_in_tiles)
@@ -2652,9 +3052,9 @@ def _adj_tapes(call: KcpCall, *, dcarry: Indexed | None, wait_first: bool) -> No
 
 
 def _forward(call: KcpCall, *, save: bool, replay: bool) -> None:
-    """FINAL_DESIGN §3.5.  ``save``: the saved set is kept (fresh ``S_in``; with ``save_transfer`` also the c1 receive
+    """The design note §3.5.  ``save``: the saved set is kept (fresh ``S_in``; with ``save_transfer`` also the c1 receive
     tensor and ``M_seg``); ``replay``: the forward of a replay-mode backward (no ``fwd_o``, nothing kept).
-    ``schedule="wait_first"`` (L-A, P2-R1; the shipped default since the round-1 adoption): ``c1 -> wait -> fwd merge -> c2 -> wait -> carry merges -> tape walk(s)``
+    ``schedule="wait_first"`` (L-A; the shipped default since an earlier revision): ``c1 -> wait -> fwd merge -> c2 -> wait -> carry merges -> tape walk(s)``
     -- no merge or walk is issued while a collective is in flight (the R7 overlap of the document-start walk under c1
     is dropped); the merges read only ``c1_recv`` / the staging planes and the tapes read no collective buffer, so
     every published bit is the same."""
@@ -2698,17 +3098,17 @@ def _forward(call: KcpCall, *, save: bool, replay: bool) -> None:
             call.merge("carry_start")
         call.merge(
             "carry_in"
-        )  # with fused_walks also the S_in copies into the extra carry slots (P1-R1 write_states)
+        )  # with fused_walks also the S_in copies into the extra carry slots (write_states)
     _fwd_tapes(call, out=call.out, carry=carry, wait_first=wait_first)
     if not replay:
         call.stage("fwd_o")
 
 
 def _backward(call: KcpCall, saved: KcpSaved | None) -> None:
-    """FINAL_DESIGN §6.5.  ``saved=None`` is the replay mode (the forward sequence without ``fwd_o`` recomputes
+    """The design note §6.5.  ``saved=None`` is the replay mode (the forward sequence without ``fwd_o`` recomputes
     ``S_in``, the tapes and the owner's c1 receive tensor); otherwise the tapes come from K1 ``_tape`` over the saved
     ``S_in`` and the owner's adjoint reads ``M_f`` from b1 (``save_transfer=False``) or ``M_f^T`` from the saved c1
-    receive tensor.  ``schedule="wait_first"`` (L-A; the shipped default since round 1): ``b1 -> wait -> adjoint merge -> b2 -> wait -> dcarry merges ->
+    receive tensor.  ``schedule="wait_first"`` (L-A; the shipped default since an earlier revision): ``b1 -> wait -> adjoint merge -> b2 -> wait -> dcarry merges ->
     adjoint tape walk(s)`` (the R7 overlap of the document-last walk under b2 is dropped)."""
     tb = call.tb
     wait_first = call.schedule == "wait_first"
@@ -2841,7 +3241,192 @@ def _backward(call: KcpCall, saved: KcpSaved | None) -> None:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Entry points (GOAL §3.2 / FINAL_DESIGN §10.1)
+# CUDA-graph replay of a call (public keyword ``graph="replay"`` of the three entry points since this
+# revision; shipped default ``GRAPH_DEFAULT = "off"``)
+#
+# The first call of a validity key (kind; the context, workspace, backend and local-arena objects; the pool pointers;
+# every option; scale; the save flags; and the shape / stride / dtype / data pointer of every operand and saved
+# tensor) runs eagerly.  The second call is captured into a ``torch.cuda.CUDAGraph`` (nothing runs during a capture)
+# and the graph is replayed once; every later call of the key replays it: the same kernels and collectives with the
+# same arguments in the same order (bitwise the eager result) with no host work between them.  Any other key runs
+# eagerly (silent fallback) and starts its own entry; ``exchange="ring"``, ``debug_sequence`` and a call without a
+# caller-owned workspace are never captured.  A replayed call returns the graph's static tensors (detached, so every
+# call hands autograd fresh objects): the next replay of the same key overwrites them, so a framework must keep its
+# inputs pointer-stable and consume the outputs and the saved set before the next call of the same layer.
+# ``GRAPH_STATS`` counts the events; ``LAST_CALL[kind]["graph_event"]`` says how the last call ran.  Every captured graph
+# keeps its fresh tensors in a private pool (0.7-9.0 GiB per rank per key on the A/B rows;
+# at most GRAPH_CACHE_MAX keys, the oldest dropped first); ``graph_cache_clear()`` releases them and must run before
+# ``torch.distributed.destroy_process_group()`` (a graph holding a NCCL collective blocks ``ncclCommDestroy``).
+#
+# Cache-config preference under replay (a probe showed cudaDeviceSetCacheConfig inside a capture
+# invalidates it): the per-launch bracket of the capped tape programs (_FiPrograms.launch) is never issued inside a stream
+# capture.  The knob ``graph_cap`` selects the captured call's form: "capture_pref" sets PreferL1 once before the capture
+# of a key and resets PreferNone right after the capture ends (never around the replays), "none" (the default of record)
+# touches no preference.  Every call records the form as LAST_CALL[kind]["cache_config"] ("bracket" for an eager call
+# under a capped geometry, "capture_pref" / "none" for a captured call and its replays, "unavailable" without a loadable
+# CUDA runtime); CACHE_CONFIG_STATS counts them.
+
+GRAPH_STATS: dict[str, int] = {"eager": 0, "capture": 0, "replay": 0, "fallback": 0}
+GRAPH_CACHE_MAX = 64  # keys kept per process; the oldest entry goes when a new key arrives beyond this
+
+
+class _GraphEntry:
+    """One validity key: its graph (after the capture), the static results and the launch inventory of the capture."""
+
+    __slots__ = (
+        "key",
+        "pins",
+        "seen",
+        "graph",
+        "result",
+        "record",
+        "disabled",
+        "digest",
+    )
+
+    def __init__(self, key: tuple, pins: tuple) -> None:
+        self.key, self.pins = (
+            key,
+            pins,
+        )  # the pins keep the keyed objects alive so their ids cannot be reused
+        self.seen = 0
+        self.graph: torch.cuda.CUDAGraph | None = None
+        self.result: tuple | None = None
+        self.record: dict[str, Any] | None = None
+        self.disabled: str | None = None
+        self.digest = f"{key[0]}:{hash(key) & 0xFFFFFFFFFFFF:012x}"
+
+
+_GRAPHS: dict[tuple, _GraphEntry] = {}
+
+
+def _sig(t: Any) -> tuple:
+    return (
+        (t.data_ptr(), tuple(t.shape), tuple(t.stride()), str(t.dtype), t.device.index)
+        if isinstance(t, torch.Tensor)
+        else ("none",)
+    )
+
+
+def _graph_entry(
+    kind: str,
+    ctx: Any,
+    ws: KcpWorkspace | None,
+    opts: KcpOptions,
+    scale: float | None,
+    tensors: Sequence[Any],
+    flags: tuple,
+) -> _GraphEntry | None:
+    """The cache entry of this call's validity key, or ``None`` when the call is never captured."""
+    if (
+        not isinstance(ws, KcpWorkspace)
+        or opts.debug_sequence
+        or opts.exchange == "ring"
+    ):
+        return None
+    backend = get_backend()
+    key = (
+        kind,
+        id(ctx),
+        id(ws),
+        id(backend),
+        id(ws.local),
+        tuple((n, t.data_ptr(), t.numel()) for n, t in ws._pools.items()),
+        tuple(getattr(opts, f.name) for f in dataclasses.fields(opts)),
+        None if scale is None else float(scale),
+        flags,
+        tuple(_sig(t) for t in tensors),
+    )
+    e = _GRAPHS.get(key)
+    if e is None:
+        while len(_GRAPHS) >= GRAPH_CACHE_MAX:
+            del _GRAPHS[next(iter(_GRAPHS))]
+        e = _GRAPHS[key] = _GraphEntry(key, (ctx, ws, backend, ws.local))
+    return e
+
+
+def _graph_cap_bracket(call: KcpCall) -> tuple[str, int | None]:
+    """The device cache-config preference around a capture of ``call``: ``("capture_pref", WALK_CACHE_CONFIG_CAP)``
+    under ``graph_cap="capture_pref"`` with a capped geometry and a loadable CUDA runtime (PreferL1 for the whole capture,
+    PreferNone right after it ends), ``("unavailable", None)`` when no libcudart soname loads, ``("none", None)``
+    otherwise (``graph_cap="none"``, or a geometry without capped programs)."""
+    if call.opts.graph_cap != "capture_pref" or not WALK_CAP_PROGRAMS.get(
+        call.walk_geometry
+    ):
+        return "none", None
+    if _cudart_available() is None:
+        return "unavailable", None
+    return "capture_pref", WALK_CACHE_CONFIG_CAP
+
+
+def _graph_capture(kind: str, entry: _GraphEntry, call: KcpCall, body: Any) -> Any:
+    """Capture ``body()`` (the call's allocations, launches and collectives) into a CUDA graph on the capture's side
+    stream, replay it once and keep it for the key; returns the body's result, or ``None`` when the capture failed
+    (recorded in the entry; the key then runs eagerly for the rest of the process).  The cache-config preference of the
+    capture is :func:`_graph_cap_bracket`'s: set before the capture begins, reset right after it ends, never inside it
+    (the call records the form and the set / reset evidence)."""
+    g = torch.cuda.CUDAGraph()
+    cache_config, pref = _graph_cap_bracket(call)
+    dev = (
+        call.device.index
+        if call.device.index is not None
+        else torch.cuda.current_device()
+    )
+    bracket: list[dict[str, Any]] = []
+    try:
+        if pref is not None:
+            bracket.append(walk_device_cache_config(dev, pref))
+        try:
+            with torch.cuda.graph(g, capture_error_mode="thread_local"):
+                result = body()
+        finally:
+            if pref is not None:
+                bracket.append(walk_device_cache_config(dev, WALK_CACHE_CONFIG_DEFAULT))
+    except Exception as exc:  # noqa: BLE001 - the failure is recorded; the caller runs the eager path
+        entry.disabled = f"{type(exc).__name__}: {str(exc)[:200]}"
+        GRAPH_STATS["fallback"] += 1
+        return None
+    g.replay()
+    call.scratch["cache_config"] = cache_config
+    call.scratch["cache_config_bracket"] = bracket or None
+    _record(kind, call)
+    LAST_CALL[kind].update(graph_event="capture", graph_key=entry.digest)
+    entry.record = dict(LAST_CALL[kind])
+    entry.graph = g
+    entry.seen += 1
+    GRAPH_STATS["capture"] += 1
+    call.backend.end_call(call)
+    return result
+
+
+def _graph_replay(kind: str, entry: _GraphEntry) -> None:
+    entry.graph.replay()
+    GRAPH_STATS["replay"] += 1
+    LAST_CALL[kind] = {**entry.record, "graph_event": "replay"}
+
+
+def _graph_eager(kind: str, entry: _GraphEntry | None) -> None:
+    """Bookkeeping of an eager call under the knob (the first call of a key, a disabled key, or a call never captured)."""
+    GRAPH_STATS["eager"] += 1
+    if entry is not None:
+        entry.seen += 1
+        LAST_CALL[kind].update(graph_key=entry.digest, graph_fallback=entry.disabled)
+
+
+def graph_cache_clear() -> int:
+    """Drop every cached graph with its static buffers and private memory pool; returns the number of entries dropped.
+
+    A graph that captured a NCCL collective must be destroyed before the process group it used is destroyed
+    (``ncclCommDestroy`` waits for graph-captured work; ``torch.distributed.destroy_process_group()`` hangs while such a
+    graph is alive).  Call this before destroying the process group when the ``graph`` knob was on, and whenever the operands
+    of a key are gone for good to release its pool.  The knob setting and ``GRAPH_STATS`` are left as they are."""
+    n = len(_GRAPHS)
+    _GRAPHS.clear()
+    return n
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Entry points (the KCP contract §3.2 / the design note §10.1)
 
 
 def _prepare(
@@ -2875,7 +3460,12 @@ def _prepare(
             f"workspace state dtype {workspace.state_dtype} differs from the backend's {backend.dtypes['state']}"
         )
     tb = workspace.ensure(
-        ctx, H, device=device, backward=backward, fused_walks=opts.fused_walks
+        ctx,
+        H,
+        device=device,
+        backward=backward,
+        fused_walks=opts.fused_walks,
+        walk_geometry=opts.walk_geometry,
     )
     ops = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
     if dout is not None:
@@ -2910,14 +3500,28 @@ def chunk_kda_kcp_fwd(
     workspace: KcpWorkspace | None = None,
     **options: Any,
 ) -> tuple[torch.Tensor, KcpSaved | None]:
-    """The KCP forward of this rank's fragments (GOAL §3.2): ``out`` like ``v`` (fresh) and the saved set
+    """The KCP forward of this rank's fragments (the KCP contract §3.2): ``out`` like ``v`` (fresh) and the saved set
     (``None`` without ``save_for_backward`` or in ``boundary_mode="replay"``).  ``ctx`` is this rank's
     ``KcpContext``; the token operands are its ``T_r`` local tokens in fragment order; ``**options`` are the
-    keywords of :class:`KcpOptions` (+ ``_kcp_test_knobs``)."""
+    keywords of :class:`KcpOptions` (+ ``_kcp_test_knobs``), among them ``graph="replay"`` (keyed CUDA-graph
+    capture / replay of this call; module docstring and :func:`graph_cache_clear`)."""
     if boundary_mode not in BOUNDARY_MODES:
         raise ValueError(
             f"boundary_mode must be one of {BOUNDARY_MODES}, got {boundary_mode!r}"
         )
+    opts = _options(options)
+    save = bool(save_for_backward) and boundary_mode == "saved"
+    entry = (
+        _graph_entry(
+            "fwd", ctx, workspace, opts, scale, (q, k, v, g, beta), (save, save_mode)
+        )
+        if opts.graph != "off"
+        else None
+    )
+    if entry is not None and entry.graph is not None:
+        _graph_replay("fwd", entry)
+        out, saved, batched = entry.result
+        return _ranked(out.detach(), batched), saved
     call, batched = _prepare(
         q,
         k,
@@ -2928,10 +3532,44 @@ def chunk_kda_kcp_fwd(
         scale=scale,
         save_mode=save_mode,
         workspace=workspace,
-        options=options,
+        options=opts,
         backward=False,
     )
-    save = bool(save_for_backward) and boundary_mode == "saved"
+    if entry is not None and entry.seen > 0 and entry.disabled is None:
+        res = _graph_capture(
+            "fwd",
+            entry,
+            call,
+            lambda: _fwd_body(call, save=save, save_mode=save_mode, ctx=ctx),
+        )
+        if res is not None:
+            entry.result = (res[0], res[1], batched)
+            return _ranked(res[0].detach(), batched), res[1]
+        call, batched = _prepare(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ctx,
+            scale=scale,
+            save_mode=save_mode,
+            workspace=workspace,
+            options=opts,
+            backward=False,
+        )
+    out, saved = _fwd_body(call, save=save, save_mode=save_mode, ctx=ctx)
+    _record("fwd", call)
+    if opts.graph != "off":
+        _graph_eager("fwd", entry)
+    call.backend.end_call(call)
+    return _ranked(out, batched), saved
+
+
+def _fwd_body(
+    call: KcpCall, *, save: bool, save_mode: str, ctx: Any
+) -> tuple[torch.Tensor, KcpSaved | None]:
+    """The forward's allocations and launches (eagerly or inside a capture): ``out`` and the saved set."""
     call.out = _alloc((call.T_r, call.H, D), call.backend.dtypes["out"], call.device)
     _forward(call, save=save, replay=False)
     saved = None
@@ -2960,9 +3598,7 @@ def chunk_kda_kcp_fwd(
             ctx=ctx,
             transfer_walk=call.transfer_walk,
         )
-    _record("fwd", call)
-    call.backend.end_call(call)
-    return _ranked(call.out, batched), saved
+    return call.out, saved
 
 
 def _check_saved(saved: KcpSaved, call: KcpCall) -> None:
@@ -3033,7 +3669,28 @@ def chunk_kda_kcp_bwd(
     workspace: KcpWorkspace | None = None,
     **options: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The KCP backward (GOAL §3.2): ``(dq, dk, dv, dbeta, dg)``, fresh.  ``saved=None`` replays the forward."""
+    """The KCP backward (the KCP contract §3.2): ``(dq, dk, dv, dbeta, dg)``, fresh.  ``saved=None`` replays the forward."""
+    opts = _options(options)
+    entry = None
+    if opts.graph != "off":
+        kept = (
+            ()
+            if saved is None
+            else (saved.S_in, saved.c1_recv, saved.M_seg, saved.Aqk, saved.Akk)
+        )
+        entry = _graph_entry(
+            "bwd",
+            ctx,
+            workspace,
+            opts,
+            scale,
+            (q, k, v, g, beta, dout, *kept),
+            (save_mode, saved is not None),
+        )
+    if entry is not None and entry.graph is not None:
+        _graph_replay("bwd", entry)
+        grads, batched = entry.result
+        return tuple(_ranked(t.detach(), batched) for t in grads)
     call, batched = _prepare(
         q,
         k,
@@ -3044,12 +3701,48 @@ def chunk_kda_kcp_bwd(
         scale=scale,
         save_mode=save_mode,
         workspace=workspace,
-        options=options,
+        options=opts,
         backward=True,
         dout=dout,
     )
     if saved is not None:
         _check_saved(saved, call)
+    if (
+        entry is not None
+        and entry.seen > 0
+        and entry.disabled is None
+        and not (saved is not None and getattr(call.backend, "_spec3_pending", False))
+    ):  # SPEC-3's host compare stays eager
+        res = _graph_capture("bwd", entry, call, lambda: _bwd_body(call, saved))
+        if res is not None:
+            entry.result = (res, batched)
+            return tuple(_ranked(t.detach(), batched) for t in res)
+        call, batched = _prepare(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ctx,
+            scale=scale,
+            save_mode=save_mode,
+            workspace=workspace,
+            options=opts,
+            backward=True,
+            dout=dout,
+        )
+        if saved is not None:
+            _check_saved(saved, call)
+    grads = _bwd_body(call, saved)
+    _record("bwd", call)
+    if opts.graph != "off":
+        _graph_eager("bwd", entry)
+    call.backend.end_call(call)
+    return tuple(_ranked(t, batched) for t in grads)
+
+
+def _bwd_body(call: KcpCall, saved: KcpSaved | None) -> tuple[torch.Tensor, ...]:
+    """The backward's allocations and launches (eagerly or inside a capture): ``(dq, dk, dv, dbeta, dg)``."""
     dt = call.backend.dtypes
     T, H = call.T_r, call.H
     call.grads = {
@@ -3060,11 +3753,7 @@ def chunk_kda_kcp_bwd(
         "dbeta": _alloc((T, H), dt["dbeta"], call.device),
     }
     _backward(call, saved)
-    _record("bwd", call)
-    call.backend.end_call(call)
-    return tuple(
-        _ranked(call.grads[n], batched) for n in ("dq", "dk", "dv", "dbeta", "dg")
-    )
+    return tuple(call.grads[n] for n in ("dq", "dk", "dv", "dbeta", "dg"))
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -3148,7 +3837,7 @@ def chunk_kda_kcp(
     workspace: KcpWorkspace | None = None,
     **options: Any,
 ) -> torch.Tensor:
-    """The differentiable KCP forward (GOAL §3.2 signature): ``out`` like ``v``; gradients for ``q, k, v, g, beta``."""
+    """The differentiable KCP forward (the KCP contract §3.2 signature): ``out`` like ``v``; gradients for ``q, k, v, g, beta``."""
     _options(options)  # validate on the caller's frame
     if boundary_mode not in BOUNDARY_MODES:
         raise ValueError(
@@ -3159,7 +3848,7 @@ def chunk_kda_kcp(
     )
 
 
-# the plan module's byte queries, re-exported for the GOAL §3.2 literal forms
+# the plan module's byte queries, re-exported for the KCP contract §3.2 literal forms
 kcp_saved_bytes = cake_kcp_plan.kcp_saved_bytes
 kcp_comm_bytes = cake_kcp_plan.kcp_comm_bytes
 kcp_workspace_bytes = cake_kcp_plan.kcp_workspace_bytes
@@ -3167,12 +3856,25 @@ kcp_workspace_bytes = cake_kcp_plan.kcp_workspace_bytes
 __all__ = [
     "ABI_PARAMS",
     "TRANSFER_WALKS",
+    "WALK_GEOMETRIES",
+    "WALK_GEOMETRY_DEFAULT",
+    "WALK_CAP_PROGRAMS",
+    "WALK_CACHE_CONFIG_CAP",
+    "WALK_CACHE_CONFIG_DEFAULT",
+    "walk_device_cache_config",
     "SPEC3_ENV",
     "KcpPreconditionError",
     "BOUNDARY_MODES",
     "COLLECTIVES",
     "CONTRACT_DTYPES",
     "EXCHANGES",
+    "GRAPH_MODES",
+    "GRAPH_DEFAULT",
+    "GRAPH_CAPS",
+    "GRAPH_CAP_DEFAULT",
+    "GRAPH_STATS",
+    "CACHE_CONFIG_STATS",
+    "graph_cache_clear",
     "KCP_PROGRAMS",
     "KCP_SAVED_VERSION",
     "LAST_CALL",

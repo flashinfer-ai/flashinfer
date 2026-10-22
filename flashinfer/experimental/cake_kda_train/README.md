@@ -186,6 +186,35 @@ dq, dk, dv, dbeta, dg = chunk_kda_kcp_bwd(q_local, k_local, v_local, g_local, be
                                           dout_local, saved=saved)
 ```
 
+CUDA-graph replay: every KCP entry point -- `chunk_kda_kcp`,
+`chunk_kda_kcp_fwd`, `chunk_kda_kcp_bwd` and `cake_causal_conv1d_kcp` -- takes
+`graph="replay"` (default `"off"`, the eager path). The first call of a
+validity key runs eagerly, the second is captured into a CUDA graph and every
+later call of the key replays it: the same launches and collectives, bitwise
+the eager result, with no host work between them. The key is the call's kind,
+its `KcpContext` / workspace / backend objects, every option and the shape,
+stride, dtype and data pointer of every operand and saved tensor.
+Requirements: the operands of a layer must keep their data pointers, shapes,
+strides and dtypes across steps (static activation buffers), the same context,
+workspace and backend objects must be reused, and a layer's outputs and saved
+set must be consumed before its next call (a replay overwrites the graph's
+static tensors). Any other call runs eagerly without an error (`GRAPH_STATS`
+and `LAST_CALL[kind]["graph_event"]` say what happened; a capture failure
+disables that key for the process), `exchange="ring"`, `debug_sequence` and
+calls without a caller-owned workspace are never captured. Memory: every
+cached key pins a private memory pool -- 0.7-9.0 GiB per rank per key on the
+the A/B rows (the per-layer forward and backward of CP4-CP16 at the B1 /
+B3 batch sizes), at most `GRAPH_CACHE_MAX = 64` keys (LRU). Call
+`graph_cache_clear()` (both modules) before
+`torch.distributed.destroy_process_group()` and whenever a layer's operands
+are gone for good. A captured call runs its one-CTA-per-SM tape programs
+without the device cache-config bracket of the shipped walk geometry (the
+bracket cannot be issued inside a capture): on the CP8 / CP16 rows replay is
+still 1.9-9.1 % faster than the eager default, on the CP4 row 1.3-2.3 % slower
+(the eager default keeps the full geometry gain; `graph="off"` is the shipped
+default). The A/B record was taken with pointer-stable harness inputs; its
+gain is an upper bound of what a framework sees.
+
 Limits of a partition: at most 65536 fragments per rank (the layout table's
 document search), at most 64 segments per fragment and no walk chain longer
 than 256 chunk steps (the segment plan's bounds); the byte queries
@@ -193,6 +222,31 @@ than 256 chunk steps (the segment plan's bounds); the byte queries
 `kcp_comm_bytes(ctx, H=..., C=...)` size the rank's workspace, saved set and
 one step's traffic before any allocation.  Every rank of the group calls the
 same entry points in the same order; the collectives are issued inside them.
+
+Walk-launch geometry: the walk kernels' CTA lists are issued
+longest-segment-first and the two tape programs (`fwdh_tape`, `dhu_tape`) run
+at one CTA per SM. Because the JIT binding exposes no per-function carveout
+attribute, the host sets the device-wide cache-config preference around each
+tape launch (`cudaDeviceSetCacheConfig`: PreferL1 before, PreferNone after)
+and restores it before the next launch; a launch issued by another thread of
+the same process during that bracket would take the PreferL1 occupancy for
+itself (occupancy only -- results never depend on the geometry). The earlier
+geometry stays reachable for A/B records through the private test knob
+`walk_geometry` (`CAKE_KCP_TEST_KNOBS=1`).
+
+Options of the KDA entry points: `save_transfer` keeps the owner's c1 receive
+tensor (and `M_seg`) for the backward instead of re-sending it in the backward
+exchange -- the default with the all-to-all exchange (an earlier revision).
+`exchange="ring"` (available when every document spans at most three ranks)
+receives no such tensor, so `save_transfer` resolves to `False` there
+automatically; an explicit `save_transfer=True` together with the ring is a
+`ValueError`. `KcpSaved.save_transfer` always reports the value that was used.
+
+The segment plan splits every fragment into `P` segments: above the 256-chunk
+chain cap the equal-segment wave rule, below it on one-fragment ranks the
+largest `P` that runs one CTA per SM (`floor(SM / H)`), on every other rank
+one CTA-per-SM occupancy (`ceil(SM / (n_frag H))`);
+`ctx.describe(H)["p_rule"]` records the rule (`"wave_fill1"`).
 
 The KCP kernels live beside the single-rank programs:
 
