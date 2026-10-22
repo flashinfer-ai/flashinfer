@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Cake Gated DeltaProduct (GDP) decode and MTP verification for Nemotron 4
+Cake Gated DeltaProduct (GDP) decode and MTP verification
 (SM100 / SM103).
 
 GDP (arXiv:2502.10297) generalizes the gated delta rule from one Householder
@@ -109,7 +109,7 @@ def cake_gated_delta_product_mtp(
         ``k[:, t, 0 .. n - 1]``.
     v : torch.Tensor
         Values ``[B, T, num_householder, HV, 64]`` in ``q.dtype``.  ``HV``
-        must equal ``H`` (Nemotron 4 has no GQA / GVA).
+        must equal ``H`` (no GQA / GVA).
     initial_state : torch.Tensor
         FP32 state pool ``[pool_size, HV, 64, 128]`` (K-last), read and
         written in place.  Its rows must be dense, its strides multiples of
