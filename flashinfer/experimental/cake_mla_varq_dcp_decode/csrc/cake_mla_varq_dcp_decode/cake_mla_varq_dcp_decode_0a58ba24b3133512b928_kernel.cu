@@ -926,15 +926,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap tmap_q, const __grid_con
                                 }
                                 {
                                     const float2 _prescale2_6 = {inv_f, inv_f};
-                                    #if __CUDA_ARCH__ >= 1000
                                     #pragma unroll
                                     for (int _ps = 0; _ps < 8; _ps++)
                                         mul_f32x2_inplace(&reinterpret_cast<float2*>(&(acc_c + rf * 18)[0])[_ps], _prescale2_6);
-                                    #else
-                                    #pragma unroll
-                                    for (int _ps = 0; _ps < 16; _ps++)
-                                        (acc_c + rf * 18)[0 + _ps] *= inv_f;
-                                    #endif
                                     {
                                         __nv_bfloat162 _pk0 = __floats2bfloat162_rn((acc_c + rf * 18)[0 + 0], (acc_c + rf * 18)[0 + 1]);
                                         unsigned _pk_u0 = *reinterpret_cast<unsigned*>(&_pk0);
@@ -1327,15 +1321,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap tmap_q, const __grid_con
                                         for (int j = 0; j < 32; j += 16) {
                                             {
                                                 const float2 _prescale2_1 = {inv_sum, inv_sum};
-                                                #if __CUDA_ARCH__ >= 1000
                                                 #pragma unroll
                                                 for (int _ps = 0; _ps < 8; _ps++)
                                                     mul_f32x2_inplace(&reinterpret_cast<float2*>(&_tmem_load_5[j])[_ps], _prescale2_1);
-                                                #else
-                                                #pragma unroll
-                                                for (int _ps = 0; _ps < 16; _ps++)
-                                                    _tmem_load_5[j + _ps] *= inv_sum;
-                                                #endif
                                                 {
                                                     __nv_bfloat162 _pk0 = __floats2bfloat162_rn(_tmem_load_5[j + 0], _tmem_load_5[j + 1]);
                                                     unsigned _pk_u0 = *reinterpret_cast<unsigned*>(&_pk0);
@@ -1363,15 +1351,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap tmap_q, const __grid_con
                                         for (int j2 = 0; j2 < 32; j2 += 16) {
                                             {
                                                 const float2 _prescale2_2 = {inv_sum, inv_sum};
-                                                #if __CUDA_ARCH__ >= 1000
                                                 #pragma unroll
                                                 for (int _ps = 0; _ps < 8; _ps++)
                                                     mul_f32x2_inplace(&reinterpret_cast<float2*>(&_tmem_load_6[j2])[_ps], _prescale2_2);
-                                                #else
-                                                #pragma unroll
-                                                for (int _ps = 0; _ps < 16; _ps++)
-                                                    _tmem_load_6[j2 + _ps] *= inv_sum;
-                                                #endif
                                                 {
                                                     __nv_bfloat162 _pk0 = __floats2bfloat162_rn(_tmem_load_6[j2 + 0], _tmem_load_6[j2 + 1]);
                                                     unsigned _pk_u0 = *reinterpret_cast<unsigned*>(&_pk0);
@@ -1415,15 +1397,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap tmap_q, const __grid_con
                                         for (int j_1 = 0; j_1 < 32; j_1 += 16) {
                                             {
                                                 const float2 _prescale2_3 = {inv_sum, inv_sum};
-                                                #if __CUDA_ARCH__ >= 1000
                                                 #pragma unroll
                                                 for (int _ps = 0; _ps < 8; _ps++)
                                                     mul_f32x2_inplace(&reinterpret_cast<float2*>(&_tmem_load_7[j_1])[_ps], _prescale2_3);
-                                                #else
-                                                #pragma unroll
-                                                for (int _ps = 0; _ps < 16; _ps++)
-                                                    _tmem_load_7[j_1 + _ps] *= inv_sum;
-                                                #endif
                                                 {
                                                     __nv_bfloat162 _pk0 = __floats2bfloat162_rn(_tmem_load_7[j_1 + 0], _tmem_load_7[j_1 + 1]);
                                                     unsigned _pk_u0 = *reinterpret_cast<unsigned*>(&_pk0);
@@ -1451,15 +1427,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap tmap_q, const __grid_con
                                         for (int j2_1 = 0; j2_1 < 32; j2_1 += 16) {
                                             {
                                                 const float2 _prescale2_4 = {inv_sum, inv_sum};
-                                                #if __CUDA_ARCH__ >= 1000
                                                 #pragma unroll
                                                 for (int _ps = 0; _ps < 8; _ps++)
                                                     mul_f32x2_inplace(&reinterpret_cast<float2*>(&_tmem_load_8[j2_1])[_ps], _prescale2_4);
-                                                #else
-                                                #pragma unroll
-                                                for (int _ps = 0; _ps < 16; _ps++)
-                                                    _tmem_load_8[j2_1 + _ps] *= inv_sum;
-                                                #endif
                                                 {
                                                     __nv_bfloat162 _pk0 = __floats2bfloat162_rn(_tmem_load_8[j2_1 + 0], _tmem_load_8[j2_1 + 1]);
                                                     unsigned _pk_u0 = *reinterpret_cast<unsigned*>(&_pk0);
@@ -1654,15 +1624,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap tmap_q, const __grid_con
                                 }
                                 {
                                     const float2 _prescale2_5 = {inv_f_1, inv_f_1};
-                                    #if __CUDA_ARCH__ >= 1000
                                     #pragma unroll
                                     for (int _ps = 0; _ps < 8; _ps++)
                                         mul_f32x2_inplace(&reinterpret_cast<float2*>(&(acc_c_1 + rf_1 * 18)[0])[_ps], _prescale2_5);
-                                    #else
-                                    #pragma unroll
-                                    for (int _ps = 0; _ps < 16; _ps++)
-                                        (acc_c_1 + rf_1 * 18)[0 + _ps] *= inv_f_1;
-                                    #endif
                                     {
                                         __nv_bfloat162 _pk0 = __floats2bfloat162_rn((acc_c_1 + rf_1 * 18)[0 + 0], (acc_c_1 + rf_1 * 18)[0 + 1]);
                                         unsigned _pk_u0 = *reinterpret_cast<unsigned*>(&_pk0);
