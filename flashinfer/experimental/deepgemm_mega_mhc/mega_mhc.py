@@ -453,7 +453,7 @@ def mhc_infer_num_splits(
 
 def mhc_infer_num_ctas(num_tokens: int, num_sms: int, num_splits: int) -> int:
     """CTAs to launch: every projection task and every mix warp in one round, never more than the SMs; the kernel
-    strides tasks, tokens and m-block ownership by gridDim.x, so any grid >= m_blocks is correct and this one is fast."""
+    strides tasks, tokens and m-block ownership by the grid, so any grid >= m_blocks is correct and this one is fast."""
     m_blocks = (num_tokens + 63) // 64
     return min(num_sms, max(m_blocks * num_splits, (num_tokens + 3) // 4))
 
@@ -464,8 +464,8 @@ def mhc_infer_scratch_floats(num_tokens: int, num_splits: int) -> int:
 
 
 def mhc_infer_switch_points(num_sms: int, max_tokens: int = 1 << 20) -> tuple[int, ...]:
-    """Every T at which num_splits changes (spec section 4.5 tests both sides of each); the rule changes only at
-    m-block boundaries and never below 16, so the scan stops there."""
+    """Every T at which num_splits changes (the correctness tests cover both sides of each); the rule changes only
+    at m-block boundaries and never below 16, so the scan stops there."""
     points, previous, t = [], mhc_infer_num_splits(1, num_sms), 65
     while t <= max_tokens and previous != 16:
         current = mhc_infer_num_splits(t, num_sms)
