@@ -40,10 +40,15 @@ NVFP4_MODES = ("w4a4", "w4a16")
 
 
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
+@pytest.mark.parametrize(
+    "kind,intermediate",
+    [("nvfp4", 192), ("nvfp4", 96), ("mxfp8_e4m3", 192), ("mxfp8_e5m2", 192)],
+)
 @pytest.mark.parametrize("early", [True, False])
 @pytest.mark.parametrize("capacity", [1, 129])
-def test_blackwell_standard_provider_graph(kind, early, capacity, monkeypatch):
+def test_blackwell_standard_provider_graph(
+    kind, intermediate, early, capacity, monkeypatch
+):
     """Check the exported standard kernel against staged bytes and changing routes."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 0),
@@ -59,7 +64,7 @@ def test_blackwell_standard_provider_graph(kind, early, capacity, monkeypatch):
         max_tokens_per_rank=capacity,
         num_topk=3,
         hidden=384,
-        intermediate=192,
+        intermediate=intermediate,
         rank=0,
         world_size=1,
         quant_kind=kind,
@@ -69,10 +74,14 @@ def test_blackwell_standard_provider_graph(kind, early, capacity, monkeypatch):
     graph = None
     try:
         weights = pkg.preprocess_block_scaled_weights(
-            (torch.randn(8, 384, 384, device="cuda") / 384**0.5).bfloat16(),
-            (torch.randn(8, 384, 192, device="cuda") / 192**0.5).bfloat16(),
+            (
+                torch.randn(8, 2 * intermediate, 384, device="cuda") / 384**0.5
+            ).bfloat16(),
+            (
+                torch.randn(8, 384, intermediate, device="cuda") / intermediate**0.5
+            ).bfloat16(),
             quant_kind=kind,
-            intermediate_size=192,
+            intermediate_size=intermediate,
         )
         x = torch.randn(capacity, 384, device="cuda")
         data, scales = (
@@ -126,6 +135,146 @@ def test_blackwell_standard_provider_graph(kind, early, capacity, monkeypatch):
                 pkg.output_error(ws.output_activation[:capacity], indices, expected)
                 < 0.025
             ), state
+    finally:
+        if graph is not None:
+            graph.reset()
+        ws.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
+@pytest.mark.parametrize("scalar", ["fc1_alpha", "fc2_alpha", "fc1_norm_const"])
+def test_blackwell_standard_global_scales(kind, scalar, monkeypatch):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("requires SM100/SM103")
+    import cutlass.cute as cute
+
+    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    cfg = pkg.Sm100BlockScaledMoeConfig(
+        num_total_experts=8,
+        max_tokens_per_rank=1,
+        num_topk=3,
+        hidden=384,
+        intermediate=192,
+        rank=0,
+        world_size=1,
+        quant_kind=kind,
+    )
+    ws = pkg.Sm100BlockScaledSymmBuffer(cfg)
+    try:
+        weights = pkg.preprocess_block_scaled_weights(
+            torch.zeros(8, 384, 384, device="cuda", dtype=torch.bfloat16),
+            torch.zeros(8, 384, 192, device="cuda", dtype=torch.bfloat16),
+            quant_kind=kind,
+            intermediate_size=192,
+        )
+        kwargs = ws._runtime_kwargs(*weights)
+        if kind == "nvfp4":
+            kwargs[scalar] = None
+            message = f"requires {scalar}"
+        else:
+            from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.block_scaled import (
+                _to_cute,
+            )
+
+            scale = torch.ones(8, device="cuda", dtype=torch.float32)
+            kwargs[scalar] = _to_cute(scale, assumed_align=4)
+            message = f"{scalar} must be None"
+        with pytest.raises(Exception, match=message):
+            cute.compile(ws.kernel, **kwargs)
+    finally:
+        ws.destroy()
+
+
+@pytest.mark.arch_blackwell
+def test_blackwell_standard_nvfp4_padded_aot(monkeypatch):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("requires SM100/SM103")
+    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    cfg = pkg.Sm100BlockScaledMoeConfig(
+        num_total_experts=8,
+        max_tokens_per_rank=1,
+        num_topk=3,
+        hidden=384,
+        intermediate=96,
+        rank=0,
+        world_size=1,
+        quant_kind="nvfp4",
+    )
+    ws = pkg.Sm100BlockScaledSymmBuffer(cfg)
+    try:
+        assert callable(ws.kernel.aot_compile())
+    finally:
+        ws.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
+def test_blackwell_standard_max_topk(kind, monkeypatch):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("requires SM100/SM103")
+    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    torch.manual_seed(7731)
+    cfg = pkg.Sm100BlockScaledMoeConfig(
+        num_total_experts=512,
+        max_tokens_per_rank=1,
+        num_topk=256,
+        hidden=384,
+        intermediate=192,
+        rank=0,
+        world_size=1,
+        quant_kind=kind,
+    )
+    ws = pkg.Sm100BlockScaledSymmBuffer(cfg)
+    graph = None
+    try:
+        weights = pkg.preprocess_block_scaled_weights(
+            (torch.randn(512, 384, 384, device="cuda") / 384**0.5).bfloat16(),
+            (torch.randn(512, 384, 192, device="cuda") / 192**0.5).bfloat16(),
+            quant_kind=kind,
+            intermediate_size=192,
+        )
+        x = torch.randn(1, 384, device="cuda")
+        data, scales = (
+            pkg.quantize_nvfp4_block16(x)
+            if kind == "nvfp4"
+            else pkg.quantize_mxfp8_block32(
+                x, torch.float8_e5m2 if kind == "mxfp8_e5m2" else torch.float8_e4m3fn
+            )
+        )
+        ws.x[0].view(torch.uint8).copy_(data[0].view(torch.uint8))
+        ws.x_sf[0, : scales.shape[1]].view(torch.uint8).copy_(
+            scales[0].view(torch.uint8)
+        )
+        ws.topk_idx[0].copy_(torch.arange(256, device="cuda", dtype=torch.int32))
+        ws.topk_weights[0].fill_(1 / 256)
+        ws.note_staged_tokens(1)
+        thunk = pkg.sm100_block_scaled_mega_launch_thunk(*weights, ws)
+        thunk()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            thunk()
+        for _ in range(3):
+            graph.replay()
+        torch.cuda.synchronize()
+        indices, expected = pkg.sampled_reference(ws, *weights, 1, sample_size=1)
+        assert pkg.output_error(ws.output_activation[:1], indices, expected) < 0.025
     finally:
         if graph is not None:
             graph.reset()

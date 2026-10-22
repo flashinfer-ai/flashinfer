@@ -33,6 +33,10 @@ class Sm100BlockScaledMoeConfig(BlockScaledMoeConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.num_topk > 256 or self.world_size > 256:
+            raise ValueError(
+                "Routing metadata supports at most 256 ranks and routes per token."
+            )
         if self.kernel_variant != "inference":
             raise ValueError("Use Sm100GenphaseMoeConfig for GenPhase.")
         if self.quant_kind not in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"):

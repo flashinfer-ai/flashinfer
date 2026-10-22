@@ -695,17 +695,19 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 raise TypeError(
                     f"{self.quant_kind} requires {operand_name} to be {expected_dtype}, got {operand.element_type}."
                 )
-        if cutlass.const_expr(not self.quant_kind.uses_global_scale):
-            for scalar_name, scalar in (
-                ("fc1_alpha", fc1_alpha),
-                ("fc2_alpha", fc2_alpha),
-                ("fc1_norm_const", fc1_norm_const),
-            ):
-                if cutlass.const_expr(scalar is not None):
-                    raise ValueError(
-                        f"{self.quant_kind} folds its rescale into the e8m0 scale factors, "
-                        f"so {scalar_name} must be None."
-                    )
+        for scalar_name, scalar in (
+            ("fc1_alpha", fc1_alpha),
+            ("fc2_alpha", fc2_alpha),
+            ("fc1_norm_const", fc1_norm_const),
+        ):
+            if cutlass.const_expr(self.quant_kind.uses_global_scale):
+                if cutlass.const_expr(scalar is None):
+                    raise ValueError(f"{self.quant_kind} requires {scalar_name}.")
+            elif cutlass.const_expr(scalar is not None):
+                raise ValueError(
+                    f"{self.quant_kind} folds its rescale into the e8m0 scale factors, "
+                    f"so {scalar_name} must be None."
+                )
 
         router_topk_scores = topk_scores if cutlass.const_expr(self.apply_topk_at_fc1) else None
         local_rank = peer_rank_ptr_mapper_host.rank
@@ -762,14 +764,14 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
 
         sf_vec_size = self.sf_vec_size
         padded_token_rows = self.token_comm.worst_case_sf_token_count
-        padded_hidden = hidden
+        padded_hidden = cute.round_up(hidden, sf_vec_size * 4)
         fc1_sfb = cute.make_tensor(
             activation_sf_pool.iterator,
             blockscaled_utils.tile_atom_to_shape_SF(
-                (padded_token_rows, cutlass.Int32(padded_hidden), singleton), sf_vec_size
+                (padded_token_rows, cutlass.Int32(hidden), singleton), sf_vec_size
             ),
         )
-        padded_intermediate_gateup = cute.round_up(intermediate_gateup, sf_vec_size * 4)
+        padded_intermediate_gateup = cute.round_up(intermediate_gateup, 128)
         expected_fc1_weight_sf_columns = padded_intermediate_gateup * padded_hidden // sf_vec_size
         if cutlass.const_expr(
             isinstance(fc1_weight_sf.shape[1], int) and isinstance(expected_fc1_weight_sf_columns, int)

@@ -8,7 +8,8 @@ registering a global `sources` package or loading Rubin kernels.
 ## Source
 
 - Provider base: `228a02d`.
-- Reconciled source and exporter: `f2d13b3cb8277398ff281fc80ae5f725cf1b2f10`.
+- Source revision: `a4344fb82313149b853ad7a696b98738d50ceead`.
+- Exporter revision: `f2d13b3cb8277398ff281fc80ae5f725cf1b2f10`.
 - Exporter SHA-256: `0e578237d416970d099750606a2489c0bfe2c0fd39bc86fa7c83bc7343d87814`.
 - Entry points: `BlackwellInferenceMegaMoE` and `BlackwellInferenceGenphaseMegaMoE`.
 - Exported Python files: 45.
@@ -21,6 +22,10 @@ remapping. The shared BF16 reducer gains the route-mask interface already used
 by GenPhase while preserving the provider's current accumulation arithmetic.
 The exporter registers both entry points and generates lazy imports. The
 counted CTA barrier helper is retained for GenPhase.
+
+The standard router checks the packed rank and top-k bounds, and NVFP4 calls
+require all three global scales. FC1 scale views match AOT padding. Grid-stride
+scheduling requires one compute cluster per launched cluster.
 
 Export both entry points together from the reconciled revision. The generated
 Python files must match `src/sources/` byte for byte. Source changes belong in
