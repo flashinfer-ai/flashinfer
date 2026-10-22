@@ -181,7 +181,10 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         out.backward(dout)
         return {
             "out": out.detach(),
-            **{f"d{n}": lf.grad for n, lf in zip(("q", "k", "v", "g", "beta"), leaves, strict=True)},
+            **{
+                f"d{n}": lf.grad
+                for n, lf in zip(("q", "k", "v", "g", "beta"), leaves, strict=True)
+            },
         }
 
     res = saved_pass()
