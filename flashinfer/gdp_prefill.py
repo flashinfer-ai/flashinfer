@@ -124,9 +124,12 @@ def chunk_gated_delta_product(
         for q, k and v, ``num_householder`` in 1..4, an SM90 device (H100 /
         H200); the argument contract is this function's, with ``initial_state``
         / ``output_state`` in float32 (a bfloat16 per-sequence ``initial_state``
-        is converted) and contiguous state pools.  One kernel launch per call;
-        nothing is read on the host and no device-to-host synchronization is
-        issued.  ``g=None`` runs the kernel's unit-gate program and
+        is converted) and contiguous state pools.  One Cake kernel launch per
+        call; the split programs add a workspace clear and the item-table
+        upload.  With ``cu_seqlens_cpu`` given, no device-to-host
+        synchronization is issued (the split rule reads the host copy); without
+        it the sequence offsets are copied to the host once.  ``g=None`` runs
+        the kernel's unit-gate program and
         ``beta=None`` the unit-beta program, from a zero state; ``g=None``
         together with ``beta=None``, a unit-gate / unit-beta call with an
         ``initial_state`` or a ``state_indices`` pool, and a device without an
