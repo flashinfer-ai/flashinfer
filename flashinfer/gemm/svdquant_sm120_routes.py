@@ -411,12 +411,17 @@ def sm120_variant_packs_l2t(m: int, k: int, variant: int, rank: int = 32) -> boo
 
 
 def sm120_variant_reads_kmajor_l2t(m: int, k: int, variant: int, rank: int = 32) -> bool:
-    """Whether the chosen producer reads L2T K-major (wide-rank large-M only).
+    """Whether the chosen producer reads L2T K-major (every rank-128 family).
 
-    Mirrors large_m_kmajor_l2() in nvfp4_smooth_quantize_lora_down_sm120.cuh.
+    Mirrors large_m_kmajor_l2() and the Rank > 64 small-M path in
+    nvfp4_smooth_quantize_lora_down_sm120.cuh.
     """
     family, _, _ = sm120_decode_producer_variant(m, k, variant, rank)
-    return family in (SM120_FAMILY_LARGE_M, SM120_FAMILY_WS_RANK128) and rank > 64
+    return (
+        family
+        in (SM120_FAMILY_LARGE_M, SM120_FAMILY_WS_RANK128, SM120_FAMILY_SMALL_M)
+        and rank > 64
+    )
 
 
 def sm120_producer_variant_count(m: int, k: int, rank: int = 32) -> int:

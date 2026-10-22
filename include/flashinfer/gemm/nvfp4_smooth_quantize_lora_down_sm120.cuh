@@ -376,6 +376,48 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
   int const k_end = k_begin + kDownKPerWarp;
   int const a_row = tile_m * 16 + group;
   int const b_col = tile_n * DownTileCols + group;
+  if constexpr (Rank > 64) {
+    // Rank 128 reads K-major L2T (l2[rank][K]), so a B fragment is two 32-bit
+    // loads instead of four 16-bit ones. A warp owns only K / warps (a few
+    // k16 steps), so a step-by-step loop pays one global-load latency per step:
+    // issue every load of a kDownPrefetch-step group before its MMAs instead.
+    constexpr int kDownPrefetch = 4;
+    bool const has_low = a_row < M;
+    bool const has_high = a_row + 8 < M;
+    quant::Type const* const a_low = x + static_cast<std::int64_t>(a_row) * K + pair_col;
+    quant::Type const* const a_high = a_low + static_cast<std::int64_t>(8) * K;
+#pragma unroll 1
+    for (int group_base = k_begin; group_base < k_end; group_base += kDownPrefetch * 16) {
+      std::uint32_t a[kDownPrefetch][4];
+      std::uint32_t b[kDownPrefetch][kNFragments][2];
+#pragma unroll
+      for (int s = 0; s < kDownPrefetch; ++s) {
+        int const k_base = group_base + s * 16;
+        bool const live = k_base < k_end;
+        a[s][0] = live && has_low ? base::load_bf16_pair(a_low + k_base) : 0u;
+        a[s][2] = live && has_low ? base::load_bf16_pair(a_low + k_base + 8) : 0u;
+        a[s][1] = live && has_high ? base::load_bf16_pair(a_high + k_base) : 0u;
+        a[s][3] = live && has_high ? base::load_bf16_pair(a_high + k_base + 8) : 0u;
+#pragma unroll
+        for (int fragment = 0; fragment < kNFragments; ++fragment) {
+          quant::Type const* b_base = l2t_smoothed +
+                                      static_cast<std::int64_t>(b_col + fragment * kMmaN) * K +
+                                      k_base + pair_col;
+          b[s][fragment][0] = live ? base::load_bf16_pair(b_base) : 0u;
+          b[s][fragment][1] = live ? base::load_bf16_pair(b_base + 8) : 0u;
+        }
+      }
+#pragma unroll
+      for (int s = 0; s < kDownPrefetch; ++s) {
+#pragma unroll
+        for (int fragment = 0; fragment < kNFragments; ++fragment) {
+          base::mma_m16n8k16_row_col(d[fragment][0], d[fragment][1], d[fragment][2],
+                                     d[fragment][3], a[s][0], a[s][1], a[s][2], a[s][3],
+                                     b[s][fragment][0], b[s][fragment][1]);
+        }
+      }
+    }
+  } else {
 #pragma unroll 1
   for (int k_base = k_begin; k_base < k_end; k_base += 16) {
     std::uint32_t a0 = 0u;
@@ -417,6 +459,7 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
       base::mma_m16n8k16_row_col(d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3], a0,
                                  a1, a2, a3, b0, b1);
     }
+  }
   }
 
 #pragma unroll

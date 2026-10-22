@@ -5021,10 +5021,13 @@ def test_fused_prefix_observes_graph_weight_updates(
     family, tiling, address_policy = routes.sm120_decode_producer_variant(
         m, k, variant, rank
     )
+    kmajor = routes.sm120_variant_reads_kmajor_l2t(m, k, variant, rank)
+    # The layout the producer reads; a K-major copy is refreshed from l2t below.
+    l2t_read = backend._pack_sm120_kmajor_l2t(l2t) if kmajor else l2t
 
     def prefix() -> None:
         module.nvfp4_quantize_smooth_lora_down_dyn_sm120(
-            x, pqs, global_scale, l2t, xq, sf, down, family, *tiling, address_policy
+            x, pqs, global_scale, l2t_read, xq, sf, down, family, *tiling, address_policy
         )
 
     def check() -> None:
@@ -5049,6 +5052,8 @@ def test_fused_prefix_observes_graph_weight_updates(
     for _ in range(2):
         x.copy_(torch.randn_like(x))
         l2t.copy_(torch.randn_like(l2t))
+        if kmajor:
+            l2t_read.copy_(backend._pack_sm120_kmajor_l2t(l2t))
         down.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize()
