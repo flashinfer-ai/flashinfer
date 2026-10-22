@@ -233,9 +233,9 @@ and V4 varlen/PDL/RopeQuant features are out of scope.
 
 Native tests retain the independent represented-input FP64 oracle, componentwise
 FP8 output bound, LSE `rtol=0, atol=1e-5`, exact-empty/nonfinite checks and bitwise
-layout/replay parity. Host contracts cover sparse views, workspace, defaults,
-conversion lifetime and the positional TVM-FFI launcher ABI; static/CLC graph
-coverage remains in `tests/attention/test_attention_ts_sparse_mla.py`.
+layout/replay parity. Host contracts cover sparse views, workspace ownership,
+defaults and task control; static/CLC graph coverage remains in
+`tests/attention/test_attention_ts_sparse_mla.py`.
 The native finalizer retains ordinary-range arithmetic and uses two factors for
 extreme BMM2/sink combinations, avoiding premature underflow before PV scaling.
 Regression tests cover strong sinks with large signed BMM2, signed zero,
@@ -245,10 +245,11 @@ After backend-scope cleanup and finalizer changes, native-only frozen-source
 verification on **B200 (SM100) passed 197 host-contract and 100 GPU cases**, with
 no failures or skips. The run used PyTorch 2.11.0+cu128, CuTe-DSL 4.8.0 and bundled
 CUDA 13.4. JSON/JUnit results agreed; source fingerprints, Slurm visibility and
-GC policies stayed unchanged during testing. The Frost decoder, examples and
-benchmarks were not run. The generic sparse MLA suite, complete integration,
-checkpoint/full-model equivalence, rare-path cost, performance and backend
-crossovers remain unqualified by this run.
+GC policies stayed unchanged during testing. These historical counts predate
+the rebase and host-test cleanup; tests were not rerun for those changes.
+The Frost decoder, examples and benchmarks were not run. The generic sparse MLA
+suite, complete integration, checkpoint/full-model equivalence, rare-path cost,
+performance and backend crossovers remain unqualified by this run.
 
 Native commands below are usage examples, not executed results:
 
