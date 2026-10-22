@@ -2625,6 +2625,13 @@ class AutoTuner:
 
                         if runner_id is not None:
                             # At least one valid (runner, tactic) pair is found
+                            cache_key = self._get_cache_key(
+                                custom_op,
+                                runners[runner_id],
+                                p.get_opt_shapes(),
+                                tuning_config,
+                                runners[runner_id].get_cache_key_extras(tensors),
+                            )
                             if _tune_process_group is None:
                                 self._discard_profile_cache(
                                     custom_op,
@@ -2633,14 +2640,10 @@ class AutoTuner:
                                     tuning_config,
                                     inputs,
                                     profile_inputs=tensors,
+                                    republish_key=cache_key.file_key,
                                 )
-                            cache_key = self._cache_profile_result(
-                                custom_op,
-                                runners[runner_id],
-                                p,
-                                tuning_config,
-                                tensors,
-                                tactic,
+                            self._cache_profile_result(
+                                cache_key, p, tuning_config, tactic
                             )
                             self.stats.tuned_op_successful_configs[custom_op] = (
                                 self.stats.tuned_op_successful_configs.get(custom_op, 0)
@@ -2685,6 +2688,7 @@ class AutoTuner:
         inputs,
         *,
         profile_inputs=None,
+        republish_key: str | None = None,
     ) -> None:
         """Retire old winners and shortlists within the active identity.
 
@@ -2725,22 +2729,18 @@ class AutoTuner:
                     self._managed_decoded.pop(
                         (str(store.root), store.env_hash, key.key_fields), None
                     )
-                    store.discard(key.file_key)
+                    # Keep a successful same-key replacement visible to other
+                    # readers until publish atomically overwrites the file.
+                    if key.file_key != republish_key:
+                        store.discard(key.file_key)
         if identity is None:
             self._dirty = True
             self._dirty_seq += 1
 
     def _cache_profile_result(
-        self, custom_op, runner, profile, tuning_config, inputs, tactic
-    ) -> ProfilingCacheKey:
+        self, key: ProfilingCacheKey, profile, tuning_config, tactic
+    ) -> None:
         """Publish a winner and its provenance through one ownership path."""
-        key = self._get_cache_key(
-            custom_op,
-            runner,
-            profile.get_opt_shapes(),
-            tuning_config,
-            runner.get_cache_key_extras(inputs),
-        )
         policy = self._profiling_policy(tuning_config)
         self._winner_cache()[key] = (tactic, profile)
         self._profiling_cache_policies[(self._winner_cache_identity(), key)] = policy
@@ -2758,7 +2758,6 @@ class AutoTuner:
             self._managed_decoded[(str(store.root), store.env_hash, key.key_fields)] = (
                 ManagedCacheEntry(key.runner_class_name, tactic, policy)
             )
-        return key
 
     def rank_tactics(
         self,
@@ -2929,6 +2928,13 @@ class AutoTuner:
             if not ranked:
                 return [-1]
 
+            cache_key = self._get_cache_key(
+                custom_op,
+                runner,
+                profile.get_opt_shapes(),
+                tuning_config,
+                runner.get_cache_key_extras(tensors),
+            )
             if _tune_process_group is None:
                 self._discard_profile_cache(
                     custom_op,
@@ -2937,10 +2943,9 @@ class AutoTuner:
                     tuning_config,
                     inputs,
                     profile_inputs=tensors,
+                    republish_key=cache_key.file_key,
                 )
-            cache_key = self._cache_profile_result(
-                custom_op, runner, profile, tuning_config, tensors, ranked[0]
-            )
+            self._cache_profile_result(cache_key, profile, tuning_config, ranked[0])
             ranked_cache[cache_key] = (policy, tuple(ranked))
 
             return ranked[:k]

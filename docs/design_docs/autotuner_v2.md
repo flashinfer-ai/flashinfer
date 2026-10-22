@@ -173,8 +173,10 @@ and direct `search_cache` lookups still accept the winner, even inside a tuning 
 Entries without provenance are retuned by `choose_one` even under the default policy, including
 after a same-version build upgrade that leaves the environment directory unchanged.
 Successful retuning retires the previous candidates before publishing the new winner, including
-when the winning runner changes. Single-process retuning preserves the previous winner if no
-candidate succeeds. Coordinated tuning must retire rejected selections before profiling, so a
+when the winning runner changes. A single-process replacement keeps the entry being republished
+on disk until its atomic overwrite, avoiding a missing-file window for concurrent readers.
+Single-process retuning preserves the previous winner if no candidate succeeds.
+Coordinated tuning must retire rejected selections before profiling, so a
 failed retune cannot restore a selection that the group already rejected (§2.7).
 
 `rank_tactics` uses the same measurement overrides, store/policy partition, and winner publication

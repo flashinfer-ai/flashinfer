@@ -1342,6 +1342,51 @@ def test_failed_single_process_retune_preserves_previous_winner(
         assert tuner.choose_one(_OP, [runner], before, inputs)[1] == 0
 
 
+@pytest.mark.parametrize("method", ["choose_one", "rank_tactics"])
+@pytest.mark.parametrize("publish_fails", [False, True])
+def test_retune_keeps_entry_visible_until_atomic_replacement(
+    cache_root, monkeypatch, method, publish_fails
+):
+    """A reader between retirement and publication must not memoize a miss."""
+    tuner, runner, inputs = AutoTuner.get(), DummyRunner((0, 1)), [torch.ones(1)]
+    before = TuningConfig(use_cuda_graph=True)
+    after = replace(before, cuda_graph_profile_replays=2)
+    _install_fake_profile(monkeypatch, {-1: 5.0, 0: 1.0, 1: 2.0})
+    with autotune_v2():
+        assert tuner.choose_one(_OP, [runner], before, inputs)[1] == 0
+
+    store = tuner._managed_cache
+    key = tuner._get_cache_key(_OP, runner, ((1,),), before).file_key
+    reader = ManagedAutotuneCache(store.manifest, store.root)
+    observed = []
+    atomic_write = autotune_cache_module._atomic_write_json
+
+    def interleaved_write(path, payload):
+        if path == store._entry_path(key):
+            # Independent reader state, before the writer's atomic replace.
+            observed.append(reader.lookup(key))
+            if publish_fails:
+                raise OSError("simulated publication failure")
+        atomic_write(path, payload)
+
+    monkeypatch.setattr(autotune_cache_module, "_atomic_write_json", interleaved_write)
+    _install_fake_profile(monkeypatch, {-1: 5.0, 0: 2.0, 1: 1.0})
+    with autotune_v2():
+        if method == "choose_one":
+            assert tuner.choose_one(_OP, [runner], after, inputs)[1] == 1
+        else:
+            assert tuner.rank_tactics(_OP, [runner], after, inputs, k=2)[0] == 1
+
+    assert len(observed) == 1
+    assert observed[0] is not None
+    assert observed[0].tactic == 0
+    assert reader.lookup(key).tactic == 0
+    fresh_reader = ManagedAutotuneCache(store.manifest, store.root)
+    assert fresh_reader.lookup(key).tactic == (0 if publish_fails else 1)
+    # A failed disk write still leaves the newly measured winner in memory.
+    assert tuner.choose_one(_OP, [runner], after, inputs)[1] == 1
+
+
 @pytest.mark.parametrize("storage", ["legacy", "managed"])
 def test_replacement_discards_synthesized_bucket_extras(
     cache_root, monkeypatch, storage
