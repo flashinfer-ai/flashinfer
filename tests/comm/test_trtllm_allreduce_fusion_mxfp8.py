@@ -19,6 +19,9 @@ import torch.multiprocessing as mp
 import flashinfer.comm as comm
 from flashinfer import mxfp8_quantize
 from flashinfer.comm.mnnvl import TorchDistBackend
+from flashinfer.utils import get_compute_capability
+
+pytestmark = pytest.mark.node_exclusive
 
 MAX_TOKEN_NUM = 2048
 RMS_EPS = 1e-6
@@ -380,7 +383,7 @@ def _multi_process(world_size, target, *args):
 def test_trtllm_allreduce_fusion_mxfp8(world_size, dtype):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size} GPUs")
-    if torch.cuda.get_device_capability()[0] < 10:
+    if get_compute_capability(torch.device("cuda:0"))[0] < 10:
         pytest.skip("mxfp8_quantize(cute-dsl) reference needs SM100+")
     _multi_process(world_size, _run_worker, dtype, [6144, 2048, 7168, 1056])
 
@@ -390,7 +393,7 @@ def test_allreduce_fusion_mxfp8_unified_api(dtype):
     world_size = 2
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size} GPUs")
-    if torch.cuda.get_device_capability()[0] < 10:
+    if get_compute_capability(torch.device("cuda:0"))[0] < 10:
         pytest.skip("mxfp8_quantize(cute-dsl) reference needs SM100+")
     _multi_process(world_size, _run_unified_api_worker, dtype)
 
