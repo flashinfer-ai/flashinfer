@@ -26,8 +26,9 @@ name: PR Test
 
 on:
   # Off the 00:00 UTC nightly-release slot; one run per Asia / EU / US workday.
+  # Minute 17, not 0: GitHub delays or drops scheduled runs at the top of the hour.
   schedule:
-    - cron: '0 4,12,20 * * *'
+    - cron: '17 4,12,20 * * *'
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, labeled, ready_for_review]
@@ -946,16 +947,28 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       issues: write
+      actions: read
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
       RESULT: ${{ needs.test-results-summary.result }}
+      RUN_ID: ${{ github.run_id }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       SHA: ${{ github.sha }}
       TITLE: "Scheduled PR Test is failing on main"
     steps:
       - name: Open, update or close the tracking issue
         run: |
+          # A re-run keeps its run ID, so an old run re-run late must not override
+          # the result of a newer scheduled run that has already finished.
+          NEWER=$(gh run list --workflow pr-test.yml --event schedule --branch main \
+            --status completed --limit 20 --json databaseId \
+            --jq "map(select(.databaseId > $RUN_ID)) | length")
+          if [ "$NEWER" != "0" ]; then
+            echo "A newer scheduled run has already finished; leaving the issue to it"
+            exit 0
+          fi
+
           ISSUE=$(gh issue list --state open --search "in:title \"$TITLE\"" \
             --json number,title --jq "map(select(.title == \"$TITLE\"))[0].number // empty")
 
