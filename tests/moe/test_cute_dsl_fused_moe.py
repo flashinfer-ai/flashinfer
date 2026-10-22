@@ -3418,6 +3418,92 @@ class TestExpertParallelism:
             f"{percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
+    @pytest.mark.parametrize("use_per_token_activation", [False, True])
+    @pytest.mark.parametrize(
+        "activation_type", [ActivationType.Swiglu, ActivationType.Relu2]
+    )
+    @pytest.mark.parametrize("ep_size", [4, 16])
+    @pytest.mark.parametrize("last_rank", [False, True])
+    @pytest.mark.parametrize("num_tokens", [1, 4])
+    def test_functional_autotune_with_ep_small_batch(
+        self,
+        num_tokens: int,
+        last_rank: bool,
+        ep_size: int,
+        activation_type: ActivationType,
+        use_per_token_activation: bool,
+    ):
+        """Autotune under EP at decode sizes, then check the picked tactic's output.
+
+        Most local experts receive no tokens here, so the autotuner's synthetic
+        routing differs most from EP1 and can reach tactics that larger or
+        single-rank workloads never pick. The last rank covers the tail of the
+        global expert range, where the profile routing prioritizes tokens.
+        """
+        from flashinfer import autotune, cute_dsl_fused_moe
+        from flashinfer.autotuner import AutoTuner
+
+        _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        hidden_size, intermediate_size = 256, 512
+        num_experts, top_k = 256, 8
+        num_local_experts = num_experts // ep_size
+        ep_rank = ep_size - 1 if last_rank else 0
+        local_expert_offset = ep_rank * num_local_experts
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            top_k=top_k,
+            gated=gated,
+            use_per_token_activation=use_per_token_activation,
+        )
+        api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(tensors, "w4a4")
+
+        AutoTuner.get().clear_cache()
+        with autotune(True):
+            result = cute_dsl_fused_moe(
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=num_local_experts,
+                local_expert_offset=local_expert_offset,
+                activation_type=activation_type,
+                quant_mode="w4a4",
+                **api_inputs,
+            )
+
+        assert result.shape == (num_tokens, hidden_size)
+        assert torch.isfinite(result).all()
+
+        ref_output = compute_reference_moe_fp4(
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+            activation_type=activation_type,
+            **reference_inputs,
+        )
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"autotuned EP{ep_size} rank {ep_rank} T={num_tokens}: "
+            f"{percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
 
 # =============================================================================
 # Test Class: moe_sort buffer-init invariants (poisoning)
