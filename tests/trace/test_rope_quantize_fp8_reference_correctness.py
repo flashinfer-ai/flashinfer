@@ -194,12 +194,16 @@ def test_rope_quantize_fp8_reference_e5m2_kernel_consistency(shape_kwargs):
     # The scale puts the bulk of the magnitudes past 448 without nearing
     # the e5m2 max of 57344, so the kernel's saturation stays unclamped.
     assert (q_r_api.float().abs() > 448.0).any()
+    # e5m2 has a 2-bit mantissa: adjacent representable values at a binade
+    # start are 25% apart, so a rotate-side fp32 rounding difference that
+    # lands on an RN boundary can flip one e5m2 code point. The nope
+    # tensors, which skip the rotation, match the kernel bit-exact.
     _check(
         rope_quantize_fp8_trace,
         (q_r_ref.float(), k_r_ref.float(), q_n_ref.float(), k_n_ref.float()),
         (q_r_api.float(), k_r_api.float(), q_n_api.float(), k_n_api.float()),
         atol=1e-2,
-        rtol=2e-1,
+        rtol=3e-1,
     )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
