@@ -2319,9 +2319,7 @@ def qsa_sparse_paged_attention(
             v_sf=v_sf,
         )
     if backend != "default":
-        raise ValueError(
-            f"unsupported qsa_sparse_paged_attention backend: {backend!r}"
-        )
+        raise ValueError(f"unsupported qsa_sparse_paged_attention backend: {backend!r}")
     from .experimental.qsa_nvfp4.backend import qsa_sparse_paged_attention as run
 
     return run(

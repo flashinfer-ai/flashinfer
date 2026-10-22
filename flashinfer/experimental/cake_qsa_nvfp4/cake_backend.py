@@ -106,7 +106,10 @@ def num_splits(
         )
     tiles = num_tiles(selection_width)
     formula = max(
-        1, min(tiles, (CTAS_PER_SM * int(sm_count)) // (int(num_rows) * int(num_kv_heads)))
+        1,
+        min(
+            tiles, (CTAS_PER_SM * int(sm_count)) // (int(num_rows) * int(num_kv_heads))
+        ),
     )
     chosen = SPLIT_OVERRIDES.get((int(sm_count), int(num_rows)), formula)
     return max(1, min(tiles, MAX_SPLITS, chosen))
@@ -133,11 +136,13 @@ def fused_capacity(device_index: int) -> int:
     return CTAS_PER_SM * cake_jit.sm_count(device_index)
 
 
-def select_form(num_rows: int, num_kv_heads: int, splits: int, device_index: int) -> str:
+def select_form(
+    num_rows: int, num_kv_heads: int, splits: int, device_index: int
+) -> str:
     """``"fused"`` or ``"split"`` (module docstring, "Form rule")."""
-    if int(splits) > 1 and int(num_rows) * int(num_kv_heads) * int(splits) <= fused_capacity(
-        device_index
-    ):
+    if int(splits) > 1 and int(num_rows) * int(num_kv_heads) * int(
+        splits
+    ) <= fused_capacity(device_index):
         return "fused"
     return "split"
 
@@ -153,7 +158,10 @@ def _layout(
     256-byte boundary; the counters come first so that their slot is the same for every split count."""
     counters = (0, 4 * int(num_rows) * int(num_kv_heads))
     out_offset = _round_up(counters[0] + counters[1], ALIGN)
-    partial_out = (out_offset, 4 * int(splits) * int(num_rows) * int(num_qo_heads) * HEAD_DIM)
+    partial_out = (
+        out_offset,
+        4 * int(splits) * int(num_rows) * int(num_qo_heads) * HEAD_DIM,
+    )
     lse_offset = _round_up(partial_out[0] + partial_out[1], ALIGN)
     partial_lse = (lse_offset, 4 * int(splits) * int(num_rows) * int(num_qo_heads))
     return counters, partial_out, partial_lse
@@ -164,7 +172,9 @@ def qsa_workspace_bytes(
 ) -> int:
     """Bytes a ``workspace_buffer`` needs for a call of these sizes (``splits`` from :func:`num_splits`; a buffer
     sized for the largest split count a caller launches, ``MAX_SPLITS`` at most, serves every smaller one)."""
-    _counters, _partial_out, partial_lse = _layout(num_rows, num_qo_heads, num_kv_heads, splits)
+    _counters, _partial_out, partial_lse = _layout(
+        num_rows, num_qo_heads, num_kv_heads, splits
+    )
     return _round_up(partial_lse[0] + partial_lse[1], ALIGN)
 
 
@@ -195,8 +205,12 @@ def _carve(
         raw.numel() >= need,
         f"workspace_buffer needs at least {need} bytes for this call (qsa_workspace_bytes), got {raw.numel()}",
     )
-    _check(raw.data_ptr() % ALIGN == 0, f"workspace_buffer must be {ALIGN}-byte aligned")
-    slot_counters, slot_out, slot_lse = _layout(num_rows, num_qo_heads, num_kv_heads, splits)
+    _check(
+        raw.data_ptr() % ALIGN == 0, f"workspace_buffer must be {ALIGN}-byte aligned"
+    )
+    slot_counters, slot_out, slot_lse = _layout(
+        num_rows, num_qo_heads, num_kv_heads, splits
+    )
     partial_out = (
         raw[slot_out[0] : slot_out[0] + slot_out[1]]
         .view(torch.float32)
@@ -377,7 +391,12 @@ def qsa_sparse_paged_attention(
         partial_out = partial_lse = merge_counters = None
     elif workspace_buffer is not None:
         partial_out, partial_lse, merge_counters = _carve(
-            workspace_buffer, num_rows, num_qo_heads, num_kv_heads, splits, counters=fused
+            workspace_buffer,
+            num_rows,
+            num_qo_heads,
+            num_kv_heads,
+            splits,
+            counters=fused,
         )
     else:
         partial_out = q.new_empty(
