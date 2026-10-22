@@ -4,11 +4,13 @@ The engine (sglang ``supports_fp8_mqa_logits``) decides per request whether to t
 stock DeepGEMM by asking ``dense_route_available(H, Q, K, arch=device_arch)``; the producer publishes the
 64-head family per tier and per architecture (``policy.dense_admission``): an admitted tier is served on that
 arch, a withheld tier is not (its record may exist for another arch).  The one-split ``:short`` routes
-(K <= ``policy.dense_short.max_kv``, two or more query blocks) are the exception: a withheld ``:short`` call
-is served by the tier route of its query count, never by the stock kernel; so are the in-kernel KV-split ``:kvsplit``
-routes (K > ``policy.dense_kvsplit.min_kv`` and fewer query blocks than the architecture's catalogued SM count
-``policy.dense_kvsplit.sm_count[arch]``): a withheld ``:kvsplit`` call is served by the grid-stride ``q1`` / tier route of
-its query count.  These tests pin that contract
+(K <= ``policy.dense_short.max_kv``, two or more query blocks) and the tile-schedule-words ``:ts`` routes
+(``policy.dense_ts``: 256 < K <= 2048, Q <= 1536, two or more query blocks) are the exception: a withheld
+``:short`` / ``:ts`` call is served by the tier route of its query count, never by the stock kernel; so are the in-kernel
+KV-split ``:kvsplit`` routes (K > ``policy.dense_kvsplit.min_kv`` and fewer query blocks than the architecture's
+catalogued SM count ``policy.dense_kvsplit.sm_count[arch]``): a withheld ``:kvsplit`` call is served by the grid-stride
+``q1`` / tier route of its query count.  A call both the ``:ts`` gate and the KV-split gate accept (256 < K <= 2048,
+fewer query blocks than SMs) is named by the KV-split plan.  These tests pin that contract
 against the shipped catalog itself and against a synthetic catalog whose architectures disagree.  The KV
 length rule is each route record's (``kv_min`` and the per-architecture ``kv_alignment``): the single-launch
 fused ``fp8:qle128:short`` and ``fp8:qle2048:short`` routes take any K on every architecture, the other 32-head
@@ -49,24 +51,33 @@ H64_ROUTES = (
             *(
                 f"fp8:h64:{kind}:{tier}"
                 for kind in ("full", "partial")
-                for tier in (*H64_TIERS, "short")
+                for tier in (*H64_TIERS, "short", "ts")
             ),
         }
     )
     - H64_UNREACHED_ROUTES
     | H64_KVSPLIT_ROUTES
 )
-# One to three (queries, keys) points per 64-head route.  K = 4137 is a legal 64-head KV length (any K >= 1)
-# that the one-split gate never accepts and the KV-split gate accepts for fewer query blocks than the catalogued
-# SM count (148 / 152: Q <= 294 on both); a ``:short`` route needs K <= policy.dense_short.max_kv (256) and at
-# least two query blocks (block_q = 2 for 64 heads); the grid-stride ``q1`` / ``full:le8`` routes keep the
-# one-block calls at K <= 256, the ``le1024`` / ``any`` tiers the calls of at least as many blocks as SMs.
+# One to four (queries, keys) points per 64-head route.  K = 4137 is a legal 64-head KV length (any K >= 1)
+# that neither the one-split gate nor the tile-schedule-words gate accepts and the KV-split gate accepts for fewer
+# query blocks than the catalogued SM count (148 / 152: Q <= 294 on both); a ``:short`` route needs
+# K <= policy.dense_short.max_kv (256) and at least two query blocks (block_q = 2 for 64 heads); a ``:ts`` route
+# needs 256 < K <= policy.dense_ts.max_kv (2048), Q <= policy.dense_ts.max_queries (1536) and two or more blocks
+# the KV-split gate does not take (at least as many blocks as SMs: Q >= 303 on both; K = 257 at Q = 3 is the
+# KV-split plan's); the grid-stride ``q1`` / ``full:le8`` routes keep the one-block calls at K <= 256, the
+# ``le1024`` / ``any`` tiers the calls of at least as many blocks as SMs above K = 2048 (or above Q = 1536).
 SHAPES_BY_ROUTE = {
     "fp8:h64:q1": ((1, 1), (1, 256)),
     "fp8:h64:q1:kvsplit": ((1, 257), (1, 4137)),
     "fp8:h64:full:le8": ((2, 256), (2, 1)),
     "fp8:h64:full:qle128:kvsplit": ((2, 4137), (16, 4137), (64, 4137)),
-    "fp8:h64:partial:qle128:kvsplit": ((3, 4137), (37, 4137), (63, 4137)),
+    "fp8:h64:partial:qle128:kvsplit": (
+        (3, 4137),
+        (37, 4137),
+        (63, 4137),
+        # r15 pinned (3, 257) as ``fp8:h64:partial:ts``; the merged rule consults the KV-split gate first.
+        (3, 257),  # merge-forward: overlap domain, provisional A (card Q-MF-1)
+    ),
     "fp8:h64:full:qle2048:kvsplit": ((128, 4137), (294, 4137)),
     "fp8:h64:partial:qle2048:kvsplit": ((129, 4137), (293, 4137)),
     "fp8:h64:full:le1024": ((1024, 4137), (304, 4137)),
@@ -75,6 +86,12 @@ SHAPES_BY_ROUTE = {
     "fp8:h64:partial:any": ((1025, 4137), (16231, 4137)),
     "fp8:h64:full:short": ((16, 16), (256, 256)),
     "fp8:h64:partial:short": ((3, 256), (37, 37)),
+    "fp8:h64:full:ts": ((1024, 1024), (1536, 2048)),
+    "fp8:h64:partial:ts": (
+        (1023, 1023),
+        # the ``:ts`` lower K edge outside the KV-split gate (153 blocks >= 152 SMs), replacing r15's (3, 257)
+        (305, 257),  # merge-forward: overlap domain, provisional A (card Q-MF-1)
+    ),
 }
 # Synthetic per-arch admission: sm_100a admits nothing, sm_103a admits two tiers (the shape of the export's
 # ``policy.dense_admission``); one tier is therefore admitted on some architectures only.
@@ -170,13 +187,13 @@ def test_dense_admission_is_per_arch_disjoint_and_complete(catalog_variant):
 
 def _served_route(route, queries, admitted):
     """The route the runtime serves for a 64-head point whose logical route is ``route`` on an arch that
-    admits ``admitted``: the route itself, except a ``:short`` route the arch withholds (or the catalog does
-    not carry) is served by the grid-stride tier route of the same query count and a ``:kvsplit`` route the arch
+    admits ``admitted``: the route itself, except a ``:short`` / ``:ts`` route the arch withholds (or the catalog
+    does not carry) is served by the grid-stride tier route of the same query count and a ``:kvsplit`` route the arch
     withholds by the grid-stride ``q1`` / tier route of the same query count -- never by the stock kernel
-    (``policy.dense_short.fallback == policy.dense_kvsplit.fallback == "tier"``).  The tier route is one the
-    catalog ships: the query count's own tier when it has a record, else the next wider tier up to ``:any``
-    (the first of them the arch admits, else the first shipped one, which the admission check then refuses)."""
-    if route.endswith(":short") and route not in admitted:
+    (``policy.dense_short.fallback == policy.dense_ts.fallback == policy.dense_kvsplit.fallback == "tier"``).  The
+    tier route is one the catalog ships: the query count's own tier when it has a record, else the next wider tier up
+    to ``:any`` (the first of them the arch admits, else the first shipped one, which the admission check then refuses)."""
+    if route.endswith((":short", ":ts")) and route not in admitted:
         kind = route.split(":")[-2]
     elif route.endswith(":kvsplit") and route not in admitted:
         parts = route.split(":")
@@ -199,7 +216,7 @@ def _served_route(route, queries, admitted):
 @pytest.mark.parametrize("route", sorted(H64_ROUTES))
 def test_dense_route_available_follows_the_per_arch_admission(catalog_variant, route):
     """On every arch, every point of an admitted tier is available and every point of a withheld (or
-    unexported) tier is not -- a withheld one-split ``:short`` point follows the tier route it is served by;
+    unexported) tier is not -- a withheld one-split ``:short`` or tile-schedule-words ``:ts`` point follows the tier route it is served by;
     the engine-facing wrapper agrees with the backend; without ``arch`` the call answers only where the
     architectures agree and raises otherwise."""
     verdicts = {}
@@ -214,7 +231,7 @@ def test_dense_route_available_follows_the_per_arch_admission(catalog_variant, r
             available = dense_mqa.dense_route_available(64, queries, keys, arch=arch)
             served = _served_route(route, queries, admitted)
             assert available == (served in admitted), (arch, route, queries, keys)
-            # A withheld ``:short`` / ``:kvsplit`` call is served by a route the catalog carries (a grid-stride
+            # A withheld ``:short`` / ``:ts`` / ``:kvsplit`` call is served by a route the catalog carries (a grid-stride
             # tier the catalog leaves unshipped is never selected), and the runtime names that route.
             assert served in _runtime._catalog()["routes"], (arch, route, queries, keys)
             assert (

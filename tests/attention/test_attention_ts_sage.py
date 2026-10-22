@@ -36,13 +36,12 @@ from flashinfer.attention.prims_ts import (
     block_sparse_attention,
 )
 from flashinfer.attention.prims_ts._block_sparse import config as sparse_config
-from flashinfer.attention.prims_ts._block_sparse.plan import (
-    _INT8_QK_COMPUTE_CAPABILITIES,
-)
+from flashinfer.attention.prims_ts.sage.config import validate_sage_recipe
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_constants import (
     E4M3_MAX,
     SOFTMAX_RESCALE_THRESHOLD_LOG2,
 )
+from flashinfer.attention.prims_ts.sage.layout import _SageQSection
 
 from tests.attention.test_attention_ts_block_sparse import (
     _HEAD_DIM,
@@ -51,30 +50,23 @@ from tests.attention.test_attention_ts_block_sparse import (
     _make_exact_block_bits,
     _pack_token_mask,
 )
+from tests.attention.sage_test_utils import (
+    INT8_STD,
+    REQUIRES_INT8_QK_GPU,
+    dequantize,
+    fold,
+    ieee_float32_references,  # noqa: F401
+    random_qk,
+    random_qk_scales,
+    random_scales,
+    reference_sage_scales,
+    scale_slots,
+)
 
 _FP8 = torch.float8_e4m3fn
-# INT8 Q/K launch only where the tcgen05 MMA takes INT8 operands.
-_REQUIRES_INT8_QK_GPU = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in _INT8_QK_COMPUTE_CAPABILITIES,
-    reason="INT8 Q/K Sage attention requires SM100",
-)
-# INT8 Q/K are drawn with this standard deviation and their scales divided by
-# it, so dequantized INT8 and E4M3 inputs share one distribution.
-_INT8_STD = 40.0
 # Reciprocal power-of-two factors on the Q and K scales leave every logit
 # unchanged, so the output must not depend on either scale's magnitude.
 _SCALE_SHIFT = 2.0**24
-
-
-@pytest.fixture(autouse=True)
-def _ieee_float32_references(monkeypatch: pytest.MonkeyPatch):
-    """Keep FP32 references independent of the environment's TF32 preference."""
-    monkeypatch.setenv("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "0")
-    previous_precision = torch.get_float32_matmul_precision()
-    torch.set_float32_matmul_precision("highest")
-    yield
-    torch.set_float32_matmul_precision(previous_precision)
 
 
 @dataclass(frozen=True)
@@ -186,6 +178,12 @@ _DENSE_CASES = (
         **{**_KV256, "seq_len_q": 100, "num_qo_heads": 4, "q_block_size": 32},
         sage=SageAttentionConfig(q_block_size=2),
     ),
+    # One 256-token Q scale block spans every Q128 tile of a sequence.
+    _SageCase(
+        "q128_fp8_k16_q256",
+        **_Q128,
+        sage=SageAttentionConfig(q_block_size=256),
+    ),
 )
 _SPARSE_CASES = (
     _SageCase(
@@ -253,45 +251,27 @@ _SPARSE_CASES = (
 _CASES_BY_NAME = {case.name: case for case in _DENSE_CASES + _SPARSE_CASES}
 
 
-def _scale_slots(batch_size: int, seq_len: int, block_size: int) -> torch.Tensor:
-    """Return the trtllm-gen flat scale slot ``b * S // blk + b + t // blk`` ``[B, S]``."""
-
-    batch = torch.arange(batch_size, device="cuda")[:, None]
-    token = torch.arange(seq_len, device="cuda")
-    return batch * seq_len // block_size + batch + token // block_size
-
-
-def _random_scales(heads, batch_size, seq_len, block_size, low, high) -> torch.Tensor:
-    """Uniform ``[low, high)`` scales of ``ceil(B * S / blk) + B - 1`` slots per head."""
-
-    numel = -(-batch_size * seq_len // block_size) + batch_size - 1
-    return torch.empty((heads, numel), device="cuda").uniform_(low, high)
-
-
-def _random_qk(shape, dtype: torch.dtype) -> torch.Tensor:
-    values = torch.randn(shape, device="cuda")
-    if dtype == torch.int8:
-        return (values * _INT8_STD).round().clamp(-127, 127).to(torch.int8)
-    return values.to(dtype)
-
-
 def _random_inputs(case: _SageCase):
     """Random 8-bit Q/K, E4M3 V, proxy summaries and positive scales."""
 
-    unit = 1.0 / _INT8_STD if case.qk_dtype == torch.int8 else 1.0
     batch, hq, hkv = case.batch_size, case.num_qo_heads, case.num_kv_heads
-    q = _random_qk((batch, case.seq_len_q, hq, _HEAD_DIM), case.qk_dtype)
-    k = _random_qk((batch, case.seq_len_kv, hkv, _HEAD_DIM), case.qk_dtype)
+    q = random_qk((batch, case.seq_len_q, hq, _HEAD_DIM), case.qk_dtype)
+    k = random_qk((batch, case.seq_len_kv, hkv, _HEAD_DIM), case.qk_dtype)
     v = torch.randn(k.shape, device="cuda").to(_FP8)
-    q_scale = _random_scales(
-        hq, batch, case.seq_len_q, case.sage.q_block_size, 0.1 * unit, 0.4 * unit
+    q_scale, k_scale = random_qk_scales(
+        hq,
+        hkv,
+        batch,
+        case.seq_len_q,
+        case.seq_len_kv,
+        case.sage.q_block_size,
+        case.sage.k_block_size,
+        case.qk_dtype,
     )
     if case.tiny_q_scales:
-        second_batch = _scale_slots(batch, case.seq_len_q, case.sage.q_block_size)[1]
+        second_batch = scale_slots(batch, case.seq_len_q, case.sage.q_block_size)[1]
         q_scale[:, second_batch] *= 1e-8
-    k_scale = _random_scales(
-        hkv, batch, case.seq_len_kv, case.sage.k_block_size, 0.5 * unit, 2.0 * unit
-    )
+    unit = 1.0 / INT8_STD if case.qk_dtype == torch.int8 else 1.0
     params = SageAttentionParams(
         q_scale=q_scale / _SCALE_SHIFT,
         k_scale=k_scale * _SCALE_SHIFT,
@@ -306,10 +286,10 @@ def _random_inputs(case: _SageCase):
     if case.routes == "proxy":
         shape = (batch, case.num_kv_blocks, hkv, _HEAD_DIM)
         summaries = (
-            _random_qk(shape, case.qk_dtype),
+            random_qk(shape, case.qk_dtype),
             torch.randn(shape, device="cuda").to(_FP8),
         )
-        k_summary_scale = _random_scales(
+        k_summary_scale = random_scales(
             hkv,
             batch,
             case.num_kv_blocks,
@@ -472,13 +452,6 @@ def _run(case: _SageCase, q, k, v, params, *, sm_scale, patterns, summaries, val
     return actual
 
 
-def _dequantize(x: torch.Tensor, scales: torch.Tensor, block_size: int):
-    """Return FP32 ``[B, S, H, D]`` values of 8-bit data under flat-layout scales."""
-
-    slots = _scale_slots(x.shape[0], x.shape[1], block_size)
-    return x.float() * scales[:, slots].permute(1, 2, 0).unsqueeze(-1)
-
-
 def _row_folds(case: _SageCase, exact_blocks):
     """Yield the ``(stream, source, indices)`` column folds of one Q row in kernel order.
 
@@ -534,35 +507,6 @@ def _anchor_headroom_log2(case: _SageCase) -> float:
     return 0.0
 
 
-def _fold(state, logits: torch.Tensor, values: torch.Tensor, headroom: float):
-    """Fold one set of columns into an online-softmax stream ``(anchor, sum, acc)``.
-
-    The stream keeps its anchor while the columns raise the row maximum by at
-    most ``headroom`` binades, as the kernel does. The row sum takes FP32
-    probabilities; the PV operand quantizes them to E4M3 at
-    ``E4M3_MAX * 2**-headroom`` times their ratio to the anchor.
-    """
-
-    if state is None:
-        total = torch.zeros(logits.shape[:-1], device="cuda")
-        acc = torch.zeros((*logits.shape[:-1], values.shape[-1]), device="cuda")
-        state = (total - float("inf"), total, acc)
-    running_max, total, acc = state
-    new_max = torch.maximum(running_max, logits.amax(dim=-1))
-    lag_log2 = (new_max - running_max) * math.log2(math.e)
-    new_max = torch.where(
-        running_max.isfinite() & (lag_log2 <= headroom), running_max, new_max
-    )
-    anchor = torch.where(new_max.isfinite(), new_max, 0.0)
-    probabilities = torch.exp(logits - anchor.unsqueeze(-1)) * E4M3_MAX * 2.0**-headroom
-    correction = torch.exp(running_max - anchor)
-    return (
-        new_max,
-        total * correction + probabilities.sum(dim=-1),
-        acc * correction.unsqueeze(-1) + probabilities.to(_FP8).float() @ values,
-    )
-
-
 @torch.no_grad()
 def _reference(
     case: _SageCase, q, k, v, params, *, sm_scale, patterns, summaries, valid
@@ -575,10 +519,12 @@ def _reference(
     """
 
     headroom = _anchor_headroom_log2(case)
-    q_real = _dequantize(q, params.q_scale, case.sage.q_block_size)
-    k_real = _dequantize(k, params.k_scale, case.sage.k_block_size)
+    # The decode kernel's P scale.
+    p_scale = E4M3_MAX * 2.0**-headroom
+    q_real = dequantize(q, params.q_scale, case.sage.q_block_size)
+    k_real = dequantize(k, params.k_scale, case.sage.k_block_size)
     if summaries is not None:
-        k_summary = _dequantize(
+        k_summary = dequantize(
             summaries[0], params.k_summary_scale, case.sage.k_summary_block_size
         )
         block_begins = torch.arange(case.num_kv_blocks, device="cuda")
@@ -628,8 +574,12 @@ def _reference(
                     logits = (logits * sm_scale + bias).masked_fill(
                         ~visible.unsqueeze(1), float("-inf")
                     )
-                    streams[stream] = _fold(
-                        streams.get(stream), logits, values.float(), headroom
+                    streams[stream] = fold(
+                        streams.get(stream),
+                        logits,
+                        values.float(),
+                        headroom,
+                        p_scale=p_scale,
                     )
                 if not streams:
                     continue
@@ -679,7 +629,7 @@ def _check_case(case: _SageCase, q, k, v, params, summaries) -> None:
         pytest.param(
             case,
             id=case.name,
-            marks=_REQUIRES_INT8_QK_GPU if case.qk_dtype == torch.int8 else (),
+            marks=REQUIRES_INT8_QK_GPU if case.qk_dtype == torch.int8 else (),
         )
         for case in _DENSE_CASES + _SPARSE_CASES
     ],
@@ -692,47 +642,6 @@ def test_sage_matches_dequantized_reference(case: _SageCase) -> None:
     _check_case(case, *_random_inputs(case))
 
 
-def _reference_sage_scales(layout, case: _SageCase, params) -> torch.Tensor:
-    """Build the prepared scales from the flat tensors as ``_SageScaleLayout`` describes them.
-
-    Per sequence (batch entry and KV head): each K section's atoms in word
-    order, a token past the section's length taking its last scale and
-    padding words zero; each Q tile's rows, a row past the tile's valid rows
-    repeating the last valid row's; then the ``sfV`` row and, with a mean,
-    the ``v_mean`` row.
-    """
-
-    batch, hkv = case.batch_size, case.num_kv_heads
-    sequences = torch.zeros((batch, hkv, layout.sequence_words), device="cuda")
-    sources = (params.k_scale, params.k_summary_scale)[: len(layout.k_sections)]
-    for section, scales in zip(layout.k_sections, sources, strict=True):
-        atoms = torch.arange(section.atoms, device="cuda")[:, None]
-        words = torch.arange(section.words_per_atom, device="cuda")
-        tokens = (atoms * 64 + words * section.tokens_per_word).clamp(
-            max=section.length - 1
-        )
-        slots = _scale_slots(batch, section.length, section.source_block_size)
-        columns = section.word_offset + atoms * section.atom_words + words
-        sequences[:, :, columns] = scales[:, slots[:, tokens]].permute(1, 0, 2, 3)
-    q_rows = layout.q_rows
-    tiles = torch.arange(q_rows.tiles, device="cuda")[:, None]
-    rows = torch.arange(q_rows.tile_size_q, device="cuda")
-    valid_rows = torch.tensor(
-        [q_rows.valid_rows(tile) for tile in range(q_rows.tiles)], device="cuda"
-    )[:, None]
-    rows = torch.minimum(rows, valid_rows - 1)
-    tokens = tiles * q_rows.tokens_per_tile + rows // q_rows.heads_q_per_kv
-    kv_heads = torch.arange(hkv, device="cuda")[:, None, None]
-    heads = kv_heads * q_rows.heads_q_per_kv + rows % q_rows.heads_q_per_kv
-    slots = _scale_slots(batch, q_rows.seq_len_q, q_rows.q_block_size)
-    q_words = params.q_scale[heads[None], slots[:, tokens][:, None]]
-    v_rows = layout.v_rows
-    sequences[:, :, q_rows.word_offset : v_rows.word_offset] = q_words.flatten(2)
-    rows = (params.v_scale,) + ((params.v_mean,) if layout.v_mean else ())
-    sequences[:, :, v_rows.word_offset :] = torch.cat(rows, dim=-1)
-    return sequences.flatten()
-
-
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
@@ -742,7 +651,7 @@ def _reference_sage_scales(layout, case: _SageCase, params) -> torch.Tensor:
             _CASES_BY_NAME[name],
             id=name,
             marks=(
-                _REQUIRES_INT8_QK_GPU
+                REQUIRES_INT8_QK_GPU
                 if _CASES_BY_NAME[name].qk_dtype == torch.int8
                 else ()
             ),
@@ -784,13 +693,15 @@ def test_prepared_sage_scales_match_flat_scales(case: _SageCase) -> None:
     state = wrapper._plan_state
     layout = state.sage_scales_layout
     assert layout.q_rows.tiles > 1
-    expected = _reference_sage_scales(layout, case, params)
+    expected = reference_sage_scales(
+        layout, params, batch_size=case.batch_size, num_kv_heads=case.num_kv_heads
+    )
     assert state.sage_scales.shape == expected.shape
     assert torch.equal(state.sage_scales, expected)
 
 
 @_REQUIRES_PRIMTS_GPU
-@_REQUIRES_INT8_QK_GPU
+@REQUIRES_INT8_QK_GPU
 @pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_dense_int8_extreme_scores_stay_in_the_bias_binade() -> None:
@@ -810,8 +721,8 @@ def test_dense_int8_extreme_scores_stay_in_the_bias_binade() -> None:
     k[batch_idx, k_min_token] = 127
     # These scales put both extreme logits near +-2, so the two keys carry
     # visible weight in the softmax row.
-    q_slots = _scale_slots(case.batch_size, case.seq_len_q, case.sage.q_block_size)
-    k_slots = _scale_slots(case.batch_size, case.seq_len_kv, case.sage.k_block_size)
+    q_slots = scale_slots(case.batch_size, case.seq_len_q, case.sage.q_block_size)
+    k_slots = scale_slots(case.batch_size, case.seq_len_kv, case.sage.k_block_size)
     params.q_scale[:, q_slots[batch_idx, q_token]] = 1e-3 / _SCALE_SHIFT
     params.k_scale[:, k_slots[batch_idx, [k_max_token, k_min_token]]] = (
         1e-2 * _SCALE_SHIFT
@@ -847,10 +758,16 @@ def test_int8_qk_plans_only_on_sm100(monkeypatch: pytest.MonkeyPatch) -> None:
             id="kv-alias-conflict",
         ),
         pytest.param(
-            {"q_data_type": torch.bfloat16}, ValueError, "Int8 Q and K", id="16-bit-qk"
+            {"q_data_type": torch.bfloat16},
+            NotImplementedError,
+            "float8_e4m3fn or int8 Q/K",
+            id="16-bit-qk",
         ),
         pytest.param(
-            {"v_data_type": torch.bfloat16}, ValueError, "E4M3FN V", id="16-bit-v"
+            {"v_data_type": torch.bfloat16},
+            NotImplementedError,
+            "float8_e4m3fn V",
+            id="16-bit-v",
         ),
         pytest.param(
             {"sage_config": SageAttentionConfig(k_block_size=8)},
@@ -899,6 +816,123 @@ def test_sage_plan_rejects_unsupported_recipes(
     )
     with pytest.raises(error, match=match):
         BlockSparseTSWrapper().plan(**{**arguments, **overrides})
+
+
+@pytest.mark.parametrize("heads_interleaved", (True, False), ids=("decode", "context"))
+def test_sage_q_rows_round_trip(heads_interleaved: bool) -> None:
+    """A kernel's Q tile numbering and the prepare's row decoding agree.
+
+    Each (token, Q head) goes to the tile ``tile_index`` gives and to the row
+    of the documented order: token-major over the heads of a decode tile, the
+    token alone in a context tile of one head. ``row_token_and_head`` must
+    decode that tile and row back.
+    """
+
+    rows = _SageQSection(
+        seq_len_q=300,
+        q_block_size=2,
+        heads_q_per_kv=4,
+        rows_per_tile=64 if heads_interleaved else 128,
+        heads_interleaved=heads_interleaved,
+    )
+    for head in range(rows.heads_q_per_kv):
+        for token in range(rows.seq_len_q):
+            token_tile, token_in_tile = divmod(token, rows.tokens_per_tile)
+            row = token_in_tile
+            if heads_interleaved:
+                row = token_in_tile * rows.heads_q_per_kv + head
+            tile = rows.tile_index(head, token_tile)
+            assert 0 <= tile < rows.tiles and 0 <= row < rows.rows_per_tile
+            assert rows.row_token_and_head(tile, row) == (token, head)
+
+
+def test_sage_q_rows_pad_grouped_tiles() -> None:
+    """A grouped tile whose token rows do not fill it keeps its full row stride.
+
+    Seven Q heads per KV head put 18 tokens, 126 rows, in a Q128 tile; its two
+    padding rows decode to the tokens after the tile, whose scales stay
+    finite, and the next tile starts 128 words later.
+    """
+
+    rows = _SageQSection(
+        seq_len_q=40,
+        q_block_size=1,
+        heads_q_per_kv=7,
+        rows_per_tile=128,
+        heads_interleaved=True,
+    )
+    assert rows.tokens_per_tile == 18
+    assert rows.tiles == 3 and rows.words == 3 * 128
+    assert rows.row_token_and_head(1, 0) == (18, 0)
+    assert rows.row_token_and_head(0, 126) == (18, 0)
+    assert rows.row_token_and_head(0, 127) == (18, 1)
+
+
+@pytest.mark.parametrize(
+    ("config", "dtypes", "error", "match"),
+    (
+        pytest.param(SageAttentionConfig(), {}, None, None, id="fp8-recipe"),
+        pytest.param(
+            SageAttentionConfig(q_block_size=64, k_block_size=1, v_mean=True),
+            {
+                "q_dtype": torch.int8,
+                "k_dtype": torch.int8,
+                "output_dtype": torch.float16,
+            },
+            None,
+            None,
+            id="int8-recipe",
+        ),
+        pytest.param(
+            SageAttentionConfig(q_block_size=3),
+            {},
+            ValueError,
+            "q_block_size must be a power of two",
+            id="q-block-3",
+        ),
+        pytest.param(
+            SageAttentionConfig(k_summary_block_size=8),
+            {},
+            ValueError,
+            "k_summary_block_size",
+            id="summary-block-8",
+        ),
+        pytest.param(
+            SageAttentionConfig(),
+            {"output_dtype": _FP8},
+            NotImplementedError,
+            "float16 or bfloat16 output",
+            id="fp8-output",
+        ),
+        pytest.param(
+            SageAttentionConfig(),
+            {"k_dtype": torch.int8},
+            ValueError,
+            "one dtype",
+            id="mixed-qk",
+        ),
+    ),
+)
+def test_validate_sage_recipe(
+    config: SageAttentionConfig,
+    dtypes: dict[str, torch.dtype],
+    error: type[Exception] | None,
+    match: str | None,
+) -> None:
+    """Both wrappers check a Sage recipe with ``validate_sage_recipe`` at plan time."""
+
+    arguments = {
+        "q_dtype": _FP8,
+        "k_dtype": _FP8,
+        "v_dtype": _FP8,
+        "output_dtype": torch.bfloat16,
+        **dtypes,
+    }
+    if error is None:
+        validate_sage_recipe(config, **arguments)
+        return
+    with pytest.raises(error, match=match):
+        validate_sage_recipe(config, **arguments)
 
 
 def _sage_decode_config(

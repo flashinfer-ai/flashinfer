@@ -36,6 +36,9 @@ from flashinfer.fused_moe.shared.validation import (
     resolve_moe_act_sf_layout,
 )
 from flashinfer.jit.core import logger
+from flashinfer.quantization.nvfp4_quantization_utils import (
+    NVFP4_4OVER6_CODE_FROM_ENV,
+)
 from flashinfer.tllm_enums import (
     ActivationType,
     DtypeTrtllmGen,
@@ -76,6 +79,7 @@ class MoERunner(TunableRunner):
         use_per_token_scaling: bool = False,
         num_experts: Optional[int] = None,
         num_fused_shared_experts: int = 0,
+        nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
     ):
         self.moe_op = moe_op
         self.num_local_experts = num_local_experts
@@ -94,6 +98,9 @@ class MoERunner(TunableRunner):
         self.weight_layout = WeightLayout(weight_layout)
         self.use_packed_weights = use_packed_weights
         self.use_per_token_scaling = use_per_token_scaling
+        # 4over6 recipe (nvfp4_4over6_code()) for the per-token GEMM2-input
+        # requantization; the default reads FLASHINFER_NVFP4_4OVER6* per call.
+        self.nvfp4_4over6_code = int(nvfp4_4over6_code)
         self.num_experts = num_experts if num_experts is not None else num_local_experts
         # Runtime routing tensors and their initializer closures carry object
         # identity, so keep them in an attribute excluded by
@@ -649,6 +656,7 @@ class MoERunner(TunableRunner):
                 kwargs.get("valid_intermediate_size"),
                 workspace_buffer,
                 False,  # query_workspace_size
+                self.nvfp4_4over6_code,
             )
             if prepare_da_body or da_routing_metadata:
                 return list(result)
