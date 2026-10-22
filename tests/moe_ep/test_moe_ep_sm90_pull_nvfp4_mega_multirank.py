@@ -1,4 +1,4 @@
-"""Public SM90 NVFP4 x FP8 EP4 execution against a test-owned FP32 oracle.
+"""Public SM90 NVFP4 x FP8 EP4 execution with two independent references.
 
 Run in its own process, separate from the SM100 vendor imports::
 
@@ -7,7 +7,9 @@ Run in its own process, separate from the SM100 vendor imports::
 
 The caller supplies canonical packed E2M1/K16-E4M3 weights and natural BF16
 inputs. The reference decodes and promotes those raw weights mathematically;
-it does not read preprocessed weights or call a kernel/reference helper.
+neither oracle reads preprocessed weights or calls the production converter.
+The instruction-semantics oracle reuses the existing test-owned K32 WGMMA
+and SM90 activation helpers; the plain FP32 oracle retains its accuracy gate.
 """
 
 from __future__ import annotations
@@ -116,8 +118,95 @@ def _k64_order(width, device):
     return index // 64 * 64 + (p // 4 % 4) * 16 + p // 32 * 8 + p // 16 % 2 * 4 + p % 4
 
 
-def _reference(hidden, ids, route_weights, raw):
+def _instruction_mm(a, b):
+    """Independent RS K32 sequence, in bounded routed-row chunks."""
+    import torch
+    from tests.moe_ep._sm90_fp8_wgmma_reference import rs_k32_mm
+
+    assert a.dtype == b.dtype == torch.float8_e4m3fn
+    return torch.cat(
+        [rs_k32_mm(a[begin : begin + 64], b) for begin in range(0, a.shape[0], 64)],
+        dim=0,
+    )
+
+
+def _instruction_reference(
+    hidden,
+    ids,
+    route_weights,
+    raw,
+    *,
+    hidden_size=HIDDEN,
+    intermediate_size=INTERMEDIATE,
+):
+    """Raw-weight oracle with SM90 FP8 instruction and epilogue semantics.
+
+    PTX documents FP8 WGMMA accumulation below single precision even with F32
+    outputs. Keep the separate ideal FP32 oracle as the accuracy L2 gate.
+    See the wgmma.mma_async precision note in the PTX ISA:
+    https://docs.nvidia.com/cuda/parallel-thread-execution/index.html
+    No production weight layout, converter, dispatch or MegaMoE is reused.
+    """
+    import torch
+    from tests.moe_ep._sm90_fp8_wgmma_reference import fma_add
+
+    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        _swiglu_pair_hw_match_cuda,
+    )
+
+    ranks, tokens, width = hidden.shape
+    w13, w2, sf13, sf2, g13, g2 = (t.flatten(0, 1) for t in raw)
+    w13 = _promoted_weight(w13, sf13)
+    w2 = _promoted_weight(w2, sf2)
+    hidden = hidden.flatten(0, 1).float()
+    ids = ids.flatten(0, 1)
+    route_weights = route_weights.flatten(0, 1)
+    input_scale = (hidden.abs().amax(-1, keepdim=True) * (1.0 / FP8_MAX)).clamp_min(
+        1e-30
+    )
+    x = (hidden / input_scale).to(torch.float8_e4m3fn)
+    order = _k64_order(hidden_size, hidden.device)
+    group_order = _k64_order(64, hidden.device)
+    terms = torch.zeros(
+        hidden.shape[0],
+        WORLD_SIZE,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=hidden.device,
+    )
+    for expert in range(WORLD_SIZE * LOCAL_EXPERTS):
+        token, slot = (ids == expert).nonzero(as_tuple=True)
+        assert token.numel() > 0, f"global expert {expert} was not exercised"
+        fc1 = _instruction_mm(
+            x[token].index_select(1, order), w13[expert].index_select(1, order).T
+        )
+        # Native mainloop applies token SF first; epilogue restores 8G next.
+        fc1 *= input_scale[token]
+        fc1 *= 8 * g13[expert]
+        gate = fc1[:, :intermediate_size].clamp(max=CLAMP)
+        up = fc1[:, intermediate_size:].clamp(-CLAMP, CLAMP)
+        activated = _swiglu_pair_hw_match_cuda(gate, up)
+        activated *= route_weights[token, slot, None]
+        grouped = activated.reshape(-1, intermediate_size // 64, 64)
+        scale = (grouped.abs().amax(-1, keepdim=True) * (1.0 / FP8_MAX)).clamp_min(
+            1e-30
+        )
+        quantized = (grouped * torch.reciprocal(scale)).to(torch.float8_e4m3fn)
+        fc2 = torch.zeros(token.numel(), hidden_size, device=hidden.device)
+        for block in range(intermediate_size // 64):
+            a = quantized[:, block].index_select(1, group_order)
+            b = w2[expert, :, block * 64 : (block + 1) * 64].index_select(
+                1, group_order
+            )
+            fc2 = fma_add(fc2, _instruction_mm(a, b.T), scale[:, block])
+        terms[token, slot] = (fc2 * (8 * g2[expert])).to(torch.bfloat16)
+    return terms.float().sum(1).reshape(ranks, tokens, width)
+
+
+def _reference(hidden, ids, route_weights, raw, *, instruction_exact=False):
     """Global FP32 GEMMs with the public FP8/BF16 data-format contract."""
+    if instruction_exact:
+        return _instruction_reference(hidden, ids, route_weights, raw)
     import torch
     import torch.nn.functional as functional
 
@@ -251,11 +340,18 @@ def test_sm90_nvfp4_public_ep4_matches_fp32_reference():
             try:
                 torch.backends.cuda.matmul.allow_tf32 = False
                 expected = _reference(*gathered, raw)
+                instruction_expected = _reference(
+                    *gathered, raw, instruction_exact=True
+                )
             finally:
                 torch.backends.cuda.matmul.allow_tf32 = allow_tf32
             assert actual.dtype == torch.bfloat16 and torch.isfinite(actual).all()
             assert not torch.equal(expected[0], expected[1])
-            torch.testing.assert_close(actual.float(), expected, atol=0.02, rtol=0.02)
+            # Elementwise correctness follows the documented FP8 instruction
+            # semantics; the independent plain FP32 accuracy gate below is unchanged.
+            torch.testing.assert_close(
+                actual.float(), instruction_expected, atol=0.02, rtol=0.02
+            )
             for source in range(WORLD_SIZE):
                 norm = expected[source].norm()
                 assert norm > 1e-3
