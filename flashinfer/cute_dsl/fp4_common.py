@@ -1477,6 +1477,63 @@ def row_reduce(
 
 
 # =============================================================================
+# Swizzled Scale-Factor Padding
+# =============================================================================
+
+
+@cute.jit
+def zero_swizzled_sf_padding(
+    mS: cute.Tensor,
+    M: Int32,
+    row: Int32,
+    lane_in_row: Int32,
+    num_sf_blocks_per_row: cutlass.Constexpr[int],
+    num_k_tiles: cutlass.Constexpr[int],
+    threads_per_row: cutlass.Constexpr[int],
+):
+    """Zero the padding of a 128x4-tile swizzled scale-factor buffer for ``row``.
+
+    The swizzled layout covers ceil(M / 128) * 128 rows and num_k_tiles * 4
+    k-blocks. GEMMs that consume it read the entries past M rows and past
+    num_sf_blocks_per_row k-blocks, and fp4_quantize writes zeros there, so the
+    fused norm kernels do the same. Called by the threads of every row in
+    [0, ceil(M / 128) * 128); the kernels launch enough CTAs to cover the
+    padded rows, so each padded row is zeroed by its own CTA in parallel
+    instead of by the CTA that owns row M - 1:
+    - a row < M zeros its k-blocks [num_sf_blocks_per_row, num_k_tiles * 4);
+    - a row in [M, ceil(M / 128) * 128) zeros its 4 entries of every k tile
+      (contiguous and 4-byte aligned: one 32-bit store per k tile).
+    """
+    k_tile_stride = 512
+    m_tile_stride = num_k_tiles * k_tile_stride
+    row_offset = (
+        (row // Int32(128)) * m_tile_stride
+        + (row % Int32(32)) * Int32(16)
+        + ((row % Int32(128)) // Int32(32)) * Int32(4)
+    )
+    if row < M:
+        if cutlass.const_expr(num_k_tiles * 4 > num_sf_blocks_per_row):
+            if lane_in_row < num_k_tiles * 4 - num_sf_blocks_per_row:
+                sf_idx = lane_in_row + num_sf_blocks_per_row
+                mS[
+                    row_offset
+                    + (sf_idx // Int32(4)) * k_tile_stride
+                    + sf_idx % Int32(4)
+                ] = Uint8(0)
+    else:
+        if row < (M + Int32(127)) // Int32(128) * Int32(128):
+            for it in cutlass.range_constexpr(
+                (num_k_tiles + threads_per_row - 1) // threads_per_row
+            ):
+                k_tile = lane_in_row + it * threads_per_row
+                if k_tile < num_k_tiles:
+                    st_global_u32(
+                        get_ptr_as_int64(mS, row_offset + k_tile * k_tile_stride),
+                        Uint32(0),
+                    )
+
+
+# =============================================================================
 # Predicate Utility
 # =============================================================================
 
